@@ -1,0 +1,49 @@
+import { NestFactory } from '@nestjs/core';
+import { ValidationPipe, Logger } from '@nestjs/common';
+import helmet from 'helmet';
+import { AppModule } from './app.module';
+import { AllExceptionsFilter } from './common/filters/http-exception.filter';
+import { ResponseInterceptor } from './common/interceptors/response.interceptor';
+
+async function bootstrap() {
+  const logger = new Logger('Bootstrap');
+  const app = await NestFactory.create(AppModule);
+
+  // Security
+  app.use(helmet());
+
+  // CORS
+  app.enableCors({
+    origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : '*',
+    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: false,
+  });
+
+  // Global validation pipe
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true,
+      forbidNonWhitelisted: true,
+      transform: true,
+      transformOptions: { enableImplicitConversion: true },
+    }),
+  );
+
+  // Global exception filter
+  app.useGlobalFilters(new AllExceptionsFilter());
+
+  // Global response interceptor
+  app.useGlobalInterceptors(new ResponseInterceptor());
+
+  // Global prefix
+  app.setGlobalPrefix('api/v1', { exclude: ['health'] });
+
+  const port = process.env.PORT || 3000;
+  await app.listen(port);
+  logger.log(`🚀 Orbia Backend running on http://localhost:${port}`);
+  logger.log(`   Health:  GET /health`);
+  logger.log(`   API:     GET /api/v1`);
+}
+
+bootstrap();
