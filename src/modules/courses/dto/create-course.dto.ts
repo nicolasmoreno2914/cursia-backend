@@ -17,10 +17,11 @@ export class CreateCourseDto {
   @IsOptional()
   description?: string;
 
+  /** Sector / área temática del curso */
   @IsString()
   @IsOptional()
   @MaxLength(100)
-  subject?: string;
+  sector?: string;
 
   @IsString()
   @IsOptional()
@@ -29,7 +30,7 @@ export class CreateCourseDto {
 
   @IsString()
   @IsOptional()
-  @IsIn(['draft', 'published', 'archived'])
+  @IsIn(['draft', 'in_review', 'published', 'archived'])
   status?: string;
 
   @IsObject()

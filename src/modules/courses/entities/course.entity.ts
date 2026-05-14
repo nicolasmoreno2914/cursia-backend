@@ -20,13 +20,13 @@ export class Course {
   description: string;
 
   @Column({ length: 100, nullable: true })
-  subject: string;
+  sector: string;
 
   @Column({ length: 100, nullable: true })
   level: string;
 
   @Column({ default: 'draft' })
-  status: string; // draft | published | archived
+  status: string; // draft | in_review | published | archived
 
   @Column({ type: 'jsonb', nullable: true })
   metadata: Record<string, any>;
