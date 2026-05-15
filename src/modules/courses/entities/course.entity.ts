@@ -5,6 +5,7 @@ import {
   CreateDateColumn,
   UpdateDateColumn,
   OneToMany,
+  Index,
 } from 'typeorm';
 import { CourseVersion } from '../../course-versions/entities/course-version.entity';
 
@@ -12,6 +13,16 @@ import { CourseVersion } from '../../course-versions/entities/course-version.ent
 export class Course {
   @PrimaryGeneratedColumn()
   id: number;
+
+  // ── Ownership (Fase 6 — Supabase JWT Auth) ──────────────────────
+  /** UUID del usuario propietario — igual al auth.users.id de Supabase */
+  @Index()
+  @Column({ name: 'owner_id', length: 36, nullable: true })
+  ownerId: string;
+
+  /** Email del propietario al momento de crear el curso (denormalizado para consultas) */
+  @Column({ name: 'owner_email', length: 255, nullable: true })
+  ownerEmail: string;
 
   @Column({ length: 255 })
   title: string;
