@@ -26,10 +26,20 @@ export class CourseVersionsService {
 
     const version = this.versionRepo.create({
       courseId,
-      versionNumber: nextVersionNumber,
-      status: dto.status ?? 'draft',
-      notes: dto.notes,
-      snapshotJson: dto.snapshotJson,
+      versionNumber:     nextVersionNumber,
+      status:            dto.status           ?? 'draft',
+      notes:             dto.notes,
+      snapshotJson:      dto.snapshotJson,
+      // Storage fields (Fase 5 — Drive unificado)
+      storageProvider:   dto.storageProvider,
+      storageFileId:     dto.storageFileId,
+      storageFileUrl:    dto.storageFileUrl,
+      storageFolderId:   dto.storageFolderId,
+      storagePath:       dto.storagePath,
+      snapshotStrategy:  dto.snapshotStrategy,
+      snapshotSizeBytes: dto.snapshotSizeBytes,
+      snapshotSizeHuman: dto.snapshotSizeHuman,
+      manifestJson:      dto.manifestJson,
     });
 
     return this.versionRepo.save(version);

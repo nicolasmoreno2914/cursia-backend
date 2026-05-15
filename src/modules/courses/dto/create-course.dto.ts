@@ -36,4 +36,18 @@ export class CreateCourseDto {
   @IsObject()
   @IsOptional()
   metadata?: Record<string, any>;
+
+  // ── Storage (Fase 5 — Drive unificado) ──────────────────────────
+  @IsString()
+  @IsOptional()
+  @IsIn(['google_drive', 'postgres_json', 'external_url'])
+  storageProvider?: string;
+
+  @IsString()
+  @IsOptional()
+  storageFolderId?: string;
+
+  @IsString()
+  @IsOptional()
+  storageFolderUrl?: string;
 }

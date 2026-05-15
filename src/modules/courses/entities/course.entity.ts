@@ -31,6 +31,19 @@ export class Course {
   @Column({ type: 'jsonb', nullable: true })
   metadata: Record<string, any>;
 
+  // ── Storage (Fase 5 — Drive unificado) ──────────────────────────
+  /** null | 'google_drive' | 'postgres_json' | 'external_url' */
+  @Column({ name: 'storage_provider', length: 50, nullable: true })
+  storageProvider: string;
+
+  /** ID de la carpeta de Drive que agrupa los archivos de este curso */
+  @Column({ name: 'storage_folder_id', type: 'text', nullable: true })
+  storageFolderId: string;
+
+  /** URL de la carpeta de Drive (webViewLink) */
+  @Column({ name: 'storage_folder_url', type: 'text', nullable: true })
+  storageFolderUrl: string;
+
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
 
