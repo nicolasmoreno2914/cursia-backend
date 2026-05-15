@@ -13,11 +13,19 @@ export class CourseVersionsService {
     private readonly coursesService: CoursesService,
   ) {}
 
-  async create(courseId: number, dto: CreateCourseVersionDto): Promise<CourseVersion> {
-    // 404 if course doesn't exist
-    await this.coursesService.findOne(courseId);
+  /**
+   * Crea una versión del curso validando que el curso pertenece al usuario.
+   * Si el curso no existe o pertenece a otro usuario → 404.
+   */
+  async create(
+    courseId: number,
+    dto: CreateCourseVersionDto,
+    ownerId: string,
+  ): Promise<CourseVersion> {
+    // Valida existencia + ownership en un solo paso
+    await this.coursesService.findOne(courseId, ownerId);
 
-    // Auto-increment version_number per course
+    // Auto-incrementar version_number por curso
     const lastVersion = await this.versionRepo.findOne({
       where: { courseId },
       order: { versionNumber: 'DESC' },
@@ -45,9 +53,16 @@ export class CourseVersionsService {
     return this.versionRepo.save(version);
   }
 
-  async findAllForCourse(courseId: number): Promise<CourseVersion[]> {
-    // 404 if course doesn't exist
-    await this.coursesService.findOne(courseId);
+  /**
+   * Lista todas las versiones de un curso validando ownership.
+   * Si el curso no existe o no pertenece al usuario → 404.
+   */
+  async findAllForCourse(
+    courseId: number,
+    ownerId: string,
+  ): Promise<CourseVersion[]> {
+    // Valida existencia + ownership
+    await this.coursesService.findOne(courseId, ownerId);
 
     return this.versionRepo.find({
       where: { courseId },
@@ -55,9 +70,18 @@ export class CourseVersionsService {
     });
   }
 
-  async findOne(courseId: number, versionId: number): Promise<CourseVersion> {
-    // 404 if course doesn't exist
-    await this.coursesService.findOne(courseId);
+  /**
+   * Obtiene una versión específica validando que el curso pertenece al usuario
+   * y que la versión pertenece al curso.
+   * Si cualquiera falla → 404 (no revela existencia de recursos ajenos).
+   */
+  async findOne(
+    courseId: number,
+    versionId: number,
+    ownerId: string,
+  ): Promise<CourseVersion> {
+    // Valida existencia + ownership del curso
+    await this.coursesService.findOne(courseId, ownerId);
 
     const version = await this.versionRepo.findOne({
       where: { id: versionId, courseId },
