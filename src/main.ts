@@ -41,7 +41,7 @@ async function bootstrap() {
 
   const port = process.env.PORT || 3000;
   await app.listen(port);
-  logger.log(`🚀 Orbia Backend running on http://localhost:${port}`);
+  logger.log(`🚀 Cursia Backend running on http://localhost:${port}`);
   logger.log(`   Health:  GET /health`);
   logger.log(`   API:     GET /api/v1`);
 }

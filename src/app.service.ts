@@ -13,9 +13,9 @@ export class AppService {
 
   getRoot() {
     return {
-      name: 'Orbia Backend API',
+      name: 'Cursia Backend API',
       version: '1.0.0',
-      description: 'API REST para CampusCloud / Orbia',
+      description: 'API REST para CampusCloud / Cursia',
       endpoints: {
         health: 'GET /health',
         courses: 'GET /api/v1/courses',
