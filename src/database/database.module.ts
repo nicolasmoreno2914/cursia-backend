@@ -4,6 +4,9 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { Course } from '../modules/courses/entities/course.entity';
 import { CourseVersion } from '../modules/course-versions/entities/course-version.entity';
 import { YoutubeConnection } from '../youtube/entities/youtube-connection.entity';
+import { UsageEvent } from '../events/entities/usage-event.entity';
+import { CostRate } from '../admin/entities/cost-rate.entity';
+import { TraditionalCostBenchmark } from '../admin/entities/traditional-cost-benchmark.entity';
 
 @Module({
   imports: [
@@ -17,7 +20,7 @@ import { YoutubeConnection } from '../youtube/entities/youtube-connection.entity
         username: config.get<string>('DB_USER', 'postgres'),
         password: config.get<string>('DB_PASS', 'postgres'),
         database: config.get<string>('DB_NAME', 'orbia'),
-        entities: [Course, CourseVersion, YoutubeConnection],
+        entities: [Course, CourseVersion, YoutubeConnection, UsageEvent, CostRate, TraditionalCostBenchmark],
         synchronize: config.get<string>('NODE_ENV', 'development') === 'development',
         logging: config.get<string>('DB_LOGGING', 'false') === 'true',
         ssl: config.get<string>('DB_SSL', 'false') === 'true'
