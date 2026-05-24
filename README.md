@@ -62,7 +62,8 @@ orbia-backend/
 │   ├── ARQUITECTURA_V1.md
 │   ├── QA_V1_CHECKLIST.md
 │   ├── OPERACION_V1.md
-│   └── PRE_DEPLOY_BACKEND.md
+│   ├── PRE_DEPLOY_BACKEND.md
+│   └── DEPLOY_CONTABO_SUPABASE.md
 ├── docker-compose.yml                 # PostgreSQL 16 local (puerto 5432)
 ├── .env.example
 └── package.json
@@ -306,6 +307,14 @@ Ver `.env.example` para la lista completa con comentarios.
 
 ---
 
+## Deploy en Contabo
+
+Guía completa para desplegar en un VPS Contabo con Supabase como base de datos PostgreSQL (sin PostgreSQL local), Nginx, PM2 y SSL vía Certbot.
+
+Ver [docs/DEPLOY_CONTABO_SUPABASE.md](docs/DEPLOY_CONTABO_SUPABASE.md) para el proceso completo paso a paso.
+
+---
+
 ## Documentación
 
 | Archivo | Contenido |
@@ -314,6 +323,7 @@ Ver `.env.example` para la lista completa con comentarios.
 | [docs/QA_V1_CHECKLIST.md](docs/QA_V1_CHECKLIST.md) | Checklist de 81 puntos para validar v1 |
 | [docs/OPERACION_V1.md](docs/OPERACION_V1.md) | Cómo operar la plataforma |
 | [docs/PRE_DEPLOY_BACKEND.md](docs/PRE_DEPLOY_BACKEND.md) | Checklist de deploy paso a paso |
+| [docs/DEPLOY_CONTABO_SUPABASE.md](docs/DEPLOY_CONTABO_SUPABASE.md) | Deploy completo en Contabo VPS + Supabase |
 
 ---
 
@@ -327,7 +337,7 @@ Ver `.env.example` para la lista completa con comentarios.
 | Fase 4 | ✅ | Conexión con frontend (Cloud Save UI) |
 | Fase 5 | ✅ | Drive unificado — routing por tamaño, storage metadata |
 | Fase 6 | ✅ | Supabase JWT auth — owner_id, guard ES256/JWKS |
-| **Deploy** | 🔜 | Pendiente — ver `docs/PRE_DEPLOY_BACKEND.md` |
+| **Deploy** | 🔜 | Pendiente — ver `docs/DEPLOY_CONTABO_SUPABASE.md` |
 
 ---
 

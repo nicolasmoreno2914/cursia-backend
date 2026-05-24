@@ -7,6 +7,8 @@ import { AuthModule } from './auth/auth.module';
 import { CoursesModule } from './modules/courses/courses.module';
 import { CourseVersionsModule } from './modules/course-versions/course-versions.module';
 import { YoutubeModule } from './youtube/youtube.module';
+import { EventsModule } from './events/events.module';
+import { AdminModule } from './admin/admin.module';
 
 @Module({
   imports: [
@@ -19,6 +21,8 @@ import { YoutubeModule } from './youtube/youtube.module';
     CoursesModule,
     CourseVersionsModule,
     YoutubeModule,
+    EventsModule,
+    AdminModule,
   ],
   controllers: [AppController],
   providers: [AppService],
