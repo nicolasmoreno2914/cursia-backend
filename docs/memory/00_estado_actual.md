@@ -36,8 +36,15 @@ El usuario final es un docente, empresa o institución que necesita transformar 
 - Repo: `orbia-backend` / rama: `main`
 - Código: ✅ completo y compilando
 - Supabase schema: ✅ SQL corregido (`docs/SCHEMA_SUPABASE.sql`)
-- Deploy en Contabo: 🔄 pendiente ejecución en VPS
+- Deploy en Contabo: 🔄 VPS provisionado — **IP: 167.86.98.162** — pendiente configuración
 - CI/CD GitHub Actions: ✅ workflow listo, pendiente configurar secrets en GitHub
+
+### VPS Contabo
+- **IP pública**: `167.86.98.162`
+- **Tipo**: Cloud VPS 20 SSD
+- **Ubicación**: Hub Europe
+- **Usuario inicial**: `root`
+- **Estado**: ✅ Provisionado — ⏳ pendiente: SO actualizado, usuario `cursia`, Node.js, Nginx, PM2, SSL
 
 ### Base de datos (Supabase PostgreSQL)
 - **Estado: ✅ Proyecto activo** — `hriwbakbuypaiovvvkqh.supabase.co`
@@ -78,11 +85,11 @@ El usuario final es un docente, empresa o institución que necesita transformar 
 ## Prioridades inmediatas (en orden)
 
 1. **Ejecutar `docs/SCHEMA_SUPABASE.sql` en Supabase** (v1.1 — versión corregida)
-2. **Provisionar VPS Contabo**: usuario, firewall, Node.js 22, PM2, Nginx
+2. **Configurar VPS** `167.86.98.162`: usuario `cursia`, UFW, Node.js 22, PM2, Nginx
 3. **Clonar repo + crear `.env`** en `/var/www/cursia-backend`
-4. **DNS**: crear registro A `api.cursia → IP_VPS`
+4. **DNS**: crear registro A `api.cursia → 167.86.98.162` en panel de Cloudflare/Namecheap
 5. **Certbot SSL** para `api.cursia.nomaddi.com`
-6. **Configurar GitHub Actions secrets** (VPS_HOST, VPS_USER, VPS_SSH_KEY, VPS_PATH, HEALTH_URL)
+6. **Configurar GitHub Actions secrets** (VPS_HOST=167.86.98.162, VPS_USER, VPS_SSH_KEY, VPS_PATH, HEALTH_URL)
 7. **Validar endpoints**: `/health`, `/api/v1`, `/api/v1/auth/me`
 8. **Activar backend en frontend** vía `localStorage` y validar Cloud Save
 

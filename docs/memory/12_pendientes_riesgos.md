@@ -10,8 +10,8 @@
 | Tarea | Prioridad | Estado | Riesgo si no se hace | Próxima acción |
 |---|---|---|---|---|
 | Ejecutar SCHEMA_SUPABASE.sql v1.1 en Supabase | 🔴 Alta | ⏳ Pendiente | Backend no arranca | Abrir SQL Editor en Supabase y ejecutar el archivo |
-| Provisionar VPS Contabo (usuario, firewall, Node 22, PM2) | 🔴 Alta | ⏳ Pendiente | Backend no tiene dónde correr | Conectar por SSH y ejecutar pasos del doc 09 |
-| Crear DNS `api.cursia → IP_VPS` | 🔴 Alta | ⏳ Pendiente | Dominio no resuelve | Panel DNS de Cloudflare/Namecheap |
+| Configurar VPS `167.86.98.162` (usuario, firewall, Node 22, PM2) | 🔴 Alta | ⏳ Pendiente | Backend no tiene dónde correr | `ssh root@167.86.98.162` → ejecutar pasos del doc 09 |
+| Crear DNS `api.cursia → 167.86.98.162` | 🔴 Alta | ⏳ Pendiente | Dominio no resuelve | Panel DNS de Cloudflare/Namecheap |
 | Crear `.env` en VPS con valores reales | 🔴 Alta | ⏳ Pendiente | Backend arranca sin config | Seguir `.env.production.template` |
 | Certbot SSL para `api.cursia.nomaddi.com` | 🔴 Alta | ⏳ Pendiente | Sin HTTPS, browser bloquea | Después del DNS propagado |
 | Validar endpoints en producción | 🔴 Alta | ⏳ Pendiente | No sabemos si funciona | Checklist sección 18 del doc de deploy |
