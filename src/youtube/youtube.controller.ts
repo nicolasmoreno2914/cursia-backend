@@ -1,10 +1,13 @@
 import {
+  BadRequestException,
+  Body,
   Controller,
   Delete,
   Get,
   HttpCode,
   HttpStatus,
   Logger,
+  NotFoundException,
   Post,
   Query,
   Res,
@@ -15,6 +18,7 @@ import { SupabaseJwtGuard } from '../auth/supabase-jwt.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { AuthUser } from '../auth/auth.types';
 import { YoutubeService } from './youtube.service';
+import { YoutubeUploadService } from './youtube-upload.service';
 
 /**
  * Endpoints de YouTube OAuth.
@@ -31,7 +35,10 @@ import { YoutubeService } from './youtube.service';
 export class YoutubeController {
   private readonly logger = new Logger(YoutubeController.name);
 
-  constructor(private readonly youtubeService: YoutubeService) {}
+  constructor(
+    private readonly youtubeService:       YoutubeService,
+    private readonly youtubeUploadService: YoutubeUploadService,
+  ) {}
 
   // ── POST /api/v1/youtube/oauth/session ────────────────────────────
   /**
@@ -123,5 +130,75 @@ export class YoutubeController {
   @HttpCode(HttpStatus.NO_CONTENT)
   async revokeConnection(@CurrentUser() user: AuthUser) {
     await this.youtubeService.revokeConnection(user.id);
+  }
+
+  // ── POST /api/v1/youtube/upload-from-url ──────────────────────────
+  /**
+   * Descarga un MP4 desde download_url (Videogen) y lo sube a YouTube
+   * usando la cuenta conectada del usuario autenticado.
+   *
+   * El MP4 solo existe en memoria durante la operación (no se persiste en Cursia).
+   * Los tokens de YouTube del usuario nunca salen hacia Videogen.
+   *
+   * Body:
+   *   download_url    {string}  URL del MP4 en Videogen (requerido)
+   *   title           {string}  Título del video en YouTube (opcional)
+   *   description     {string}  Descripción (opcional)
+   *   privacy_status  {string}  'unlisted' | 'public' | 'private' (default: unlisted)
+   *   chapter_number  {number}  Número de capítulo para contexto (opcional)
+   *
+   * Devuelve:
+   *   { youtube_url, video_id, chapter_number }
+   */
+  @Post('upload-from-url')
+  @UseGuards(SupabaseJwtGuard)
+  @HttpCode(HttpStatus.OK)
+  async uploadFromUrl(
+    @CurrentUser() user: AuthUser,
+    @Body() body: Record<string, unknown>,
+  ) {
+    const downloadUrl = body['download_url'] as string | undefined;
+    if (!downloadUrl || typeof downloadUrl !== 'string' || !downloadUrl.startsWith('http')) {
+      throw new BadRequestException('download_url es requerido y debe ser una URL válida.');
+    }
+
+    const title         = (body['title']          as string  | undefined) ?? null;
+    const description   = (body['description']    as string  | undefined) ?? '';
+    const privacyStatus = (body['privacy_status'] as string  | undefined) ?? 'unlisted';
+    const chapterNumber = (body['chapter_number'] as number  | undefined) ?? null;
+
+    if (!['public', 'unlisted', 'private'].includes(privacyStatus)) {
+      throw new BadRequestException('privacy_status debe ser public, unlisted o private.');
+    }
+
+    // Verificar conexión YouTube del usuario
+    const connection = await this.youtubeService.getConnection(user.id);
+    if (!connection || connection.status === 'revoked') {
+      throw new NotFoundException(
+        'YouTube no está conectado. Ve a la sección Cuenta → conecta tu canal de YouTube.',
+      );
+    }
+
+    const videoTitle = title
+      ?? (chapterNumber != null ? `Capítulo ${chapterNumber}` : 'Video generado por IA');
+
+    this.logger.log(
+      `[YTUpload] user=${user.id} canal="${connection.channelTitle}" ` +
+      `cap=${chapterNumber} title="${videoTitle}"`,
+    );
+
+    const result = await this.youtubeUploadService.uploadFromUrl(connection, {
+      downloadUrl,
+      title:          videoTitle,
+      description:    description as string,
+      privacyStatus:  privacyStatus as 'public' | 'unlisted' | 'private',
+      chapterNumber:  chapterNumber ?? undefined,
+    });
+
+    return {
+      youtube_url:    result.youtubeUrl,
+      video_id:       result.videoId,
+      chapter_number: chapterNumber,
+    };
   }
 }
