@@ -2,13 +2,18 @@
 # deploy.yml — CI/CD: push a main → deploy automático en VPS Contabo
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# REQUISITOS (configurar en GitHub → Settings → Secrets and variables → Actions):
+# REQUISITOS (GitHub → Settings → Secrets and variables → Actions):
 #
 #   VPS_HOST        IP pública del VPS Contabo
-#   VPS_USER        Usuario SSH (cursia)
+#   VPS_USER        Usuario SSH (root)
 #   VPS_SSH_KEY     Clave privada SSH (contenido completo, con saltos de línea)
 #   VPS_PATH        /var/www/cursia-backend
 #   HEALTH_URL      https://api.cursia.nomaddi.com/health
+#
+# ESTRATEGIA:
+#   1. build-check  — Compila TypeScript en el runner de GitHub (con devDeps).
+#                     Nunca instala TypeScript en el VPS de producción.
+#   2. deploy       — Sube dist/ al VPS via SSH, instala solo prod deps, recarga PM2.
 #
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -17,19 +22,20 @@ name: Deploy to Contabo VPS
 on:
   push:
     branches: [main]
-  workflow_dispatch:           # permite lanzar el deploy manualmente desde GitHub UI
+  workflow_dispatch:
 
 concurrency:
   group: deploy-production
-  cancel-in-progress: false    # nunca cancelar un deploy en curso
+  cancel-in-progress: false
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
-  # JOB 1: build-check (corre en GitHub, no toca el VPS)
+  # JOB 1: build — compila en GitHub, sube dist/ como artifact
   # ────────────────────────────────────────────────────────────────────────────
-  build-check:
-    name: Build check
+  build:
+    name: Build TypeScript
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,30 +46,43 @@ jobs:
           node-version: '22'
           cache: 'npm'
 
-      - name: Install dependencies
+      - name: Install all dependencies (including devDeps for tsc)
         run: npm ci
 
-      - name: TypeScript build
+      - name: Compile TypeScript
         run: npm run build
 
-      - name: Verify dist/main.js exists
+      - name: Verify dist/main.js
         run: |
           if [ ! -f dist/main.js ]; then
-            echo "❌ dist/main.js no encontrado. El build falló."
+            echo "❌ dist/main.js no encontrado."
             exit 1
           fi
-          echo "✅ dist/main.js existe. Build OK."
+          echo "✅ dist/main.js OK — $(du -sh dist/ | cut -f1)"
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 1
 
   # ────────────────────────────────────────────────────────────────────────────
-  # JOB 2: deploy (solo si build-check pasa)
+  # JOB 2: deploy — solo si el build pasó
   # ────────────────────────────────────────────────────────────────────────────
   deploy:
     name: Deploy to VPS
     runs-on: ubuntu-latest
-    needs: build-check
+    needs: build
     environment: production
 
     steps:
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
@@ -71,28 +90,31 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
 
-      - name: Deploy
+      - name: Upload dist/ to VPS
+        run: |
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
+            dist/ \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:${{ secrets.VPS_PATH }}/dist/"
+
+      - name: Deploy on VPS
         run: |
           ssh -i ~/.ssh/deploy_key \
               -o StrictHostKeyChecking=no \
               "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" << 'ENDSSH'
             set -e
-            echo "━━━ [1/6] Entrar al directorio ━━━"
             cd ${{ secrets.VPS_PATH }}
 
-            echo "━━━ [2/6] Git pull ━━━"
+            echo "━━━ [1/4] Git pull (sincronizar package.json y fuentes) ━━━"
             git pull origin main
 
-            echo "━━━ [3/6] Instalar dependencias (sin devDependencies) ━━━"
+            echo "━━━ [2/4] Instalar dependencias de producción ━━━"
             npm ci --omit=dev
 
-            echo "━━━ [4/6] Build ━━━"
-            npm run build
-
-            echo "━━━ [5/6] Reiniciar PM2 (graceful reload) ━━━"
+            echo "━━━ [3/4] Recargar PM2 (graceful reload, zero downtime) ━━━"
             pm2 reload cursia-backend --update-env || pm2 restart cursia-backend --update-env
 
-            echo "━━━ [6/6] Guardar estado PM2 ━━━"
+            echo "━━━ [4/4] Guardar estado PM2 ━━━"
             pm2 save
 
             echo "✅ Deploy completado."
@@ -100,9 +122,9 @@ jobs:
 
       - name: Health check post-deploy
         run: |
-          echo "Esperando 8 segundos para que NestJS inicialice..."
-          sleep 8
-          RESPONSE=$(curl -sf --max-time 10 "${{ secrets.HEALTH_URL }}" || echo "FAILED")
+          echo "Esperando 10 segundos para que NestJS inicialice…"
+          sleep 10
+          RESPONSE=$(curl -sf --max-time 15 "${{ secrets.HEALTH_URL }}" || echo "FAILED")
           if echo "$RESPONSE" | grep -q '"status":"ok"'; then
             echo "✅ Health check OK: $RESPONSE"
           else
@@ -113,6 +135,9 @@ jobs:
       - name: Notify on failure
         if: failure()
         run: |
-          echo "⚠️  El deploy o health check fallaron."
-          echo "Revisar: pm2 logs cursia-backend en el VPS."
-          echo "Rollback manual: git checkout HEAD~1 && npm ci --omit=dev && npm run build && pm2 restart cursia-backend"
+          echo "⚠️  El deploy falló."
+          echo "Rollback manual en VPS:"
+          echo "  cd ${{ secrets.VPS_PATH }}"
+          echo "  git checkout HEAD~1"
+          echo "  npm ci --omit=dev"
+          echo "  pm2 restart cursia-backend"
