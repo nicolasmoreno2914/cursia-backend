@@ -17,9 +17,9 @@ import { SupabaseJwtGuard } from '../auth/supabase-jwt.guard';
  * Reemplaza la Cloudflare Pages Function (functions/api/video-engine.js)
  * para el hosting en VPS donde Cloudflare Workers no están disponibles.
  *
- * Variables de entorno requeridas:
- *   VIDEO_ENGINE_API_KEY   → API key de Video Engine IA
- *   VIDEO_ENGINE_BASE_URL  → URL base del API (ej: https://api.videoengine.io)
+ * Variables de entorno requeridas (Videogen External API):
+ *   VIDEOGEN_API_URL  → URL base de Videogen: https://videosb.nomaddi.com
+ *   VIDEOGEN_API_KEY  → API key de institución en Videogen (formato veia_live_...)
  *
  * Usa @Res() para pasar la respuesta del Video Engine tal cual,
  * evitando que el ResponseInterceptor global añada un envelope innecesario.
@@ -34,19 +34,19 @@ export class VideoEngineController {
     @Body() body: { action: string; payload?: Record<string, unknown> },
     @Res() res: Response,
   ): Promise<void> {
-    const veApiKey  = (process.env.VIDEO_ENGINE_API_KEY  ?? '').trim();
-    const veBaseUrl = (process.env.VIDEO_ENGINE_BASE_URL ?? '').replace(/\/$/, '');
+    const veApiKey  = (process.env.VIDEOGEN_API_KEY  ?? '').trim();
+    const veBaseUrl = (process.env.VIDEOGEN_API_URL ?? '').replace(/\/$/, '');
 
     // ── Verificar configuración ──────────────────────────────────────────
     if (!veApiKey) {
       res.status(HttpStatus.SERVICE_UNAVAILABLE).json({
-        error: 'VIDEO_ENGINE_API_KEY no configurado en el servidor.',
+        error: 'VIDEOGEN_API_KEY no configurado en el servidor.',
       });
       return;
     }
     if (!veBaseUrl) {
       res.status(HttpStatus.SERVICE_UNAVAILABLE).json({
-        error: 'VIDEO_ENGINE_BASE_URL no configurado en el servidor.',
+        error: 'VIDEOGEN_API_URL no configurado en el servidor.',
       });
       return;
     }
