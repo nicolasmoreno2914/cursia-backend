@@ -2,7 +2,7 @@
 
 > **Antes de trabajar en Cursia, leer este archivo primero.**
 > Actualizar este archivo cada vez que una fase termina o el estado cambia.
-> Fecha de última actualización: Mayo 2026
+> Fecha de última actualización: Mayo 2026 — QA producción completado
 
 ---
 
@@ -32,13 +32,16 @@ El usuario final es un docente, empresa o institución que necesita transformar 
 - Feature flags: backend desactivado por defecto en producción, activable por `localStorage`
 
 ### Backend (cursia-backend)
-- **Estado: ✅ EN PRODUCCIÓN** — `https://api.cursia.nomaddi.com`
+- **Estado: ✅ EN PRODUCCIÓN + QA VALIDADO** — `https://api.cursia.nomaddi.com`
 - Repo: `orbia-backend` / rama: `main`
-- PM2: ✅ `cursia-backend` online — `167.86.98.162:3000`
-- Nginx: ✅ reverse proxy activo
-- SSL: ✅ Let's Encrypt — expira 2026-08-22
-- Supabase DB: ✅ conectada — seeds corrieron al arrancar
-- CI/CD GitHub Actions: ✅ workflow listo, pendiente configurar secrets en GitHub
+- PM2: ✅ `cursia-backend` online — `167.86.98.162:3000` — 0 restarts, ~110MB RAM
+- Nginx: ✅ reverse proxy activo — syntax OK
+- SSL: ✅ Let's Encrypt — expira 2026-08-22, auto-renewal habilitado
+- Supabase DB: ✅ conectada — seeds corrieron (11 cost_rates, 7 benchmarks)
+- Auth: ✅ ES256/JWKS (SUPABASE_JWT_SECRET vacío → modo JWKS automático — correcto)
+- CORS: ✅ `access-control-allow-origin: https://cursia.nomaddi.com` verificado
+- JWT auth: ✅ token inválido → 401 en todos los endpoints protegidos
+- CI/CD GitHub Actions: ⏳ workflow listo, pendiente configurar secrets en GitHub
 
 ### VPS Contabo
 - **IP pública**: `167.86.98.162`
@@ -49,16 +52,18 @@ El usuario final es un docente, empresa o institución que necesita transformar 
 - **Estado**: ✅ Completamente configurado y en producción
 
 ### Base de datos (Supabase PostgreSQL)
-- **Estado: ✅ Proyecto activo** — `hriwbakbuypaiovvvkqh.supabase.co`
-- Schema ejecutado: 🔄 pendiente confirmar (hubo error `42703` corregido en v1.1 del SQL)
-- 6 tablas: `courses`, `course_versions`, `youtube_connections`, `usage_events`, `cost_rates`, `traditional_cost_benchmarks`
-- Auth: ES256/JWKS configurado en backend
+- **Estado: ✅ Proyecto activo y verificado** — `hriwbakbuypaiovvvkqh.supabase.co`
+- Schema ejecutado: ✅ v1.1 — 8 tablas presentes (6 NestJS + 2 Supabase-managed)
+- Tablas NestJS: `courses`, `course_versions`, `youtube_connections`, `usage_events`, `cost_rates`, `traditional_cost_benchmarks`
+- Tablas extra (Supabase-managed, sin entidad NestJS): `authorized_users`, `user_settings`
+- Seeds: ✅ 11 filas en `cost_rates`, 7 en `traditional_cost_benchmarks`
+- Auth: ✅ ES256/JWKS — backend valida contra `hriwbakbuypaiovvvkqh.supabase.co/auth/v1/.well-known/jwks.json`
 
 ### Deploy
 - Frontend: ✅ Cloudflare Pages — `https://cursia.nomaddi.com`
-- Backend: 🔄 VPS Contabo — dominio `api.cursia.nomaddi.com` pendiente de configurar
-- DNS: ⏳ pendiente crear registro A `api.cursia` → IP del VPS
-- Nginx + PM2 + SSL: ⏳ pendiente ejecutar en VPS
+- Backend: ✅ VPS Contabo — `https://api.cursia.nomaddi.com` — EN PRODUCCIÓN
+- DNS: ✅ registro A `api.cursia` → `167.86.98.162` creado
+- Nginx + PM2 + SSL: ✅ todo configurado y activo
 
 ---
 
@@ -66,6 +71,9 @@ El usuario final es un docente, empresa o institución que necesita transformar 
 
 | Fecha | Avance |
 |---|---|
+| Mayo 2026 | **QA producción completado** — backend validado: health, PM2, SSL, CORS, JWT, DB |
+| Mayo 2026 | **Backend en producción** — VPS Contabo configurado + Nginx + PM2 + SSL |
+| Mayo 2026 | **DNS**: registro A `api.cursia.nomaddi.com` → `167.86.98.162` creado |
 | Mayo 2026 | ElevenLabs: audio bienvenida + audiolibro implementados con guard MBZ/curso |
 | Mayo 2026 | MBZ: sanitización de `src="#audio"` — elimina placeholder falso del export |
 | Mayo 2026 | Admin Dashboard D0: UsageEvents, CostRates, Benchmarks, SuperAdminGuard |
@@ -86,14 +94,11 @@ El usuario final es un docente, empresa o institución que necesita transformar 
 
 ## Prioridades inmediatas (en orden)
 
-1. **Ejecutar `docs/SCHEMA_SUPABASE.sql` en Supabase** (v1.1 — versión corregida)
-2. **Configurar VPS** `167.86.98.162`: usuario `cursia`, UFW, Node.js 22, PM2, Nginx
-3. **Clonar repo + crear `.env`** en `/var/www/cursia-backend`
-4. **DNS**: crear registro A `api.cursia → 167.86.98.162` en panel de Cloudflare/Namecheap
-5. **Certbot SSL** para `api.cursia.nomaddi.com`
-6. **Configurar GitHub Actions secrets** (VPS_HOST=167.86.98.162, VPS_USER, VPS_SSH_KEY, VPS_PATH, HEALTH_URL)
-7. **Validar endpoints**: `/health`, `/api/v1`, `/api/v1/auth/me`
-8. **Activar backend en frontend** vía `localStorage` y validar Cloud Save
+1. **Configurar GitHub Actions secrets** — VPS_HOST, VPS_USER, VPS_SSH_KEY, VPS_PATH, HEALTH_URL
+2. **Agregar redirect URI de YouTube** en Google Cloud Console: `https://api.cursia.nomaddi.com/api/v1/youtube/oauth/callback`
+3. **Test Cloud Save** con sesión real en browser: activar `CURSIA_BACKEND_ENABLED=true` + `CURSIA_BACKEND_URL=https://api.cursia.nomaddi.com` en localStorage
+4. **Integrar POST `/api/v1/events`** en frontend tras generación de curso (`02-run.js`, `09-mbz.js`)
+5. **Primer cliente de Sprint** — agendar diagnóstico gratuito
 
 ---
 

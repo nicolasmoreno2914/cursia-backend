@@ -1,7 +1,7 @@
 # 12 — Pendientes y riesgos
 
 > Actualizar este archivo cuando una tarea se completa o cambia de prioridad.
-> Última actualización: Mayo 2026
+> Última actualización: Mayo 2026 — post QA producción
 
 ---
 
@@ -9,13 +9,13 @@
 
 | Tarea | Prioridad | Estado | Riesgo si no se hace | Próxima acción |
 |---|---|---|---|---|
-| Ejecutar SCHEMA_SUPABASE.sql v1.1 en Supabase | 🔴 Alta | ⏳ Pendiente | Backend no arranca | Abrir SQL Editor en Supabase y ejecutar el archivo |
-| Configurar VPS `167.86.98.162` (usuario, firewall, Node 22, PM2) | 🔴 Alta | ⏳ Pendiente | Backend no tiene dónde correr | `ssh root@167.86.98.162` → ejecutar pasos del doc 09 |
-| Crear DNS `api.cursia → 167.86.98.162` | 🔴 Alta | ⏳ Pendiente | Dominio no resuelve | Panel DNS de Cloudflare/Namecheap |
-| Crear `.env` en VPS con valores reales | 🔴 Alta | ⏳ Pendiente | Backend arranca sin config | Seguir `.env.production.template` |
-| Certbot SSL para `api.cursia.nomaddi.com` | 🔴 Alta | ⏳ Pendiente | Sin HTTPS, browser bloquea | Después del DNS propagado |
-| Validar endpoints en producción | 🔴 Alta | ⏳ Pendiente | No sabemos si funciona | Checklist sección 18 del doc de deploy |
-| Configurar GitHub Actions secrets | 🟡 Media | ⏳ Pendiente | Sin CI/CD automático | Después de deploy manual exitoso |
+| Ejecutar SCHEMA_SUPABASE.sql v1.1 en Supabase | 🔴 Alta | ✅ Completado | — | — |
+| Configurar VPS `167.86.98.162` (usuario, firewall, Node 22, PM2) | 🔴 Alta | ✅ Completado | — | — |
+| Crear DNS `api.cursia → 167.86.98.162` | 🔴 Alta | ✅ Completado | — | — |
+| Crear `.env` en VPS con valores reales | 🔴 Alta | ✅ Completado | — | — |
+| Certbot SSL para `api.cursia.nomaddi.com` | 🔴 Alta | ✅ Completado | — | — |
+| Validar endpoints en producción (QA) | 🔴 Alta | ✅ Completado | — | — |
+| Configurar GitHub Actions secrets | 🟡 Media | ⏳ Pendiente | Sin CI/CD automático | Agregar en repo: VPS_HOST, VPS_USER, VPS_SSH_KEY, VPS_PATH, HEALTH_URL |
 
 ---
 
@@ -23,8 +23,8 @@
 
 | Tarea | Prioridad | Estado | Riesgo | Próxima acción |
 |---|---|---|---|---|
-| Confirmar 6 tablas creadas (query verificación) | 🔴 Alta | ⏳ Pendiente | Backend crashea al arrancar | Ejecutar query de verificación del SQL |
-| Activar RLS (Row Level Security) | 🟡 Media | 📋 Diseñado | Sin RLS, usuarios podrían ver datos ajenos via Supabase directo | Agregar policies en Supabase después del primer deploy |
+| Confirmar tablas creadas (query verificación) | 🔴 Alta | ✅ Completado | — | 8 tablas verificadas vía psql: 6 NestJS + 2 Supabase-managed |
+| Activar RLS (Row Level Security) | 🟡 Media | 📋 Diseñado | Sin RLS, usuarios podrían ver datos ajenos via Supabase directo | Agregar policies en Supabase después del primer cliente |
 | Backup antes de cambios de schema | 🟡 Media | Continuo | Pérdida de datos | Hacer pg_dump antes de ALTER TABLE |
 
 ---
@@ -80,8 +80,8 @@
 
 | Tarea | Prioridad | Estado | Riesgo | Próxima acción |
 |---|---|---|---|---|
-| Validar OAuth callback en producción | 🔴 Alta | ⏳ Pendiente (depende de backend) | YouTube no se puede conectar | Configurar Google Cloud Console + probar flujo completo |
-| Agregar URI producción en Google Cloud Console | 🔴 Alta | ⏳ Pendiente | `redirect_uri_mismatch` | Agregar `https://api.cursia.nomaddi.com/api/v1/youtube/oauth/callback` |
+| Validar OAuth callback en producción | 🔴 Alta | ⏳ Pendiente | YouTube no se puede conectar | Probar flujo completo después de agregar redirect URI |
+| Agregar URI producción en Google Cloud Console | 🔴 Alta | ⏳ Pendiente | `redirect_uri_mismatch` | Ir a console.cloud.google.com → OAuth → agregar `https://api.cursia.nomaddi.com/api/v1/youtube/oauth/callback` |
 
 ---
 
@@ -128,4 +128,4 @@
 | Tarea | Prioridad | Estado | Riesgo | Próxima acción |
 |---|---|---|---|---|
 | Test end-to-end: brief → MBZ → Moodle | 🔴 Alta | 🔄 Continuo | Regresiones no detectadas | Correr tras cada cambio grande |
-| Test Cloud Save → Restore | 🟡 Media | ⏳ Pendiente (depende de backend) | Pérdida de trabajo del usuario | Probar tras deploy |
+| Test Cloud Save → Restore | 🟡 Media | ⏳ Pendiente | Pérdida de trabajo del usuario | Activar en browser: localStorage.setItem('CURSIA_BACKEND_ENABLED','true'); localStorage.setItem('CURSIA_BACKEND_URL','https://api.cursia.nomaddi.com') |
