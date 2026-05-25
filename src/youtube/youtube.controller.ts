@@ -4,6 +4,7 @@ import {
   Controller,
   Delete,
   Get,
+  Headers,
   HttpCode,
   HttpStatus,
   Logger,
@@ -18,6 +19,7 @@ import { SupabaseJwtGuard } from '../auth/supabase-jwt.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { AuthUser } from '../auth/auth.types';
 import { YoutubeService } from './youtube.service';
+import { YoutubeTokenService } from './youtube-token.service';
 import { YoutubeUploadService } from './youtube-upload.service';
 
 /**
@@ -37,6 +39,7 @@ export class YoutubeController {
 
   constructor(
     private readonly youtubeService:       YoutubeService,
+    private readonly youtubeTokenService:  YoutubeTokenService,
     private readonly youtubeUploadService: YoutubeUploadService,
   ) {}
 
@@ -120,6 +123,95 @@ export class YoutubeController {
     };
   }
 
+  // ── GET /api/v1/youtube/auth-test ────────────────────────────────
+  /**
+   * Valida la conexión de YouTube sin subir ni modificar nada.
+   * Flujo: JWT → buscar conexión → descifrar refresh_token → obtener
+   * access_token → llamar channels.list (read-only, 0 costo) → { ok, channel }.
+   *
+   * Uso QA: confirmar que tokens y cifrado funcionan antes de gastar créditos.
+   * NUNCA devuelve tokens en la respuesta.
+   */
+  @Get('auth-test')
+  @UseGuards(SupabaseJwtGuard)
+  async authTest(@CurrentUser() user: AuthUser) {
+    const connection = await this.youtubeService.getConnection(user.id);
+
+    if (!connection || connection.status === 'revoked') {
+      return {
+        ok:      false,
+        reason:  'no_connection',
+        message: 'YouTube no está conectado para este usuario.',
+      };
+    }
+
+    if (connection.status === 'reauth_required') {
+      return {
+        ok:      false,
+        reason:  'reauth_required',
+        message: 'El token de YouTube expiró. Reconecta el canal.',
+      };
+    }
+
+    // Obtener access_token fresco — valida que el refresh_token y el cifrado funcionan
+    let accessToken: string;
+    try {
+      accessToken = await this.youtubeTokenService.getAccessToken(
+        connection.encryptedRefreshToken,
+        connection.tokenIv,
+      );
+    } catch (err) {
+      return {
+        ok:      false,
+        reason:  'token_refresh_failed',
+        message: `No se pudo renovar el token: ${(err as Error).message}`,
+      };
+    }
+
+    // Llamar channels.list — read-only, no consume cuota de escritura
+    let channelVerified = false;
+    let channelPart: Record<string, unknown> = {};
+    try {
+      const ytRes = await fetch(
+        'https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true&maxResults=1',
+        {
+          headers: { Authorization: `Bearer ${accessToken}` },
+          signal: AbortSignal.timeout(10_000),
+        },
+      );
+
+      if (ytRes.ok) {
+        const ytData = (await ytRes.json()) as Record<string, unknown>;
+        const items = ytData['items'] as unknown[] | undefined;
+        if (items && items.length > 0) {
+          channelVerified = true;
+          const snippet = (items[0] as Record<string, unknown>)['snippet'] as Record<string, unknown> | undefined;
+          channelPart = {
+            channel_id:    (items[0] as Record<string, unknown>)['id'],
+            channel_title: snippet?.['title'] ?? connection.channelTitle,
+          };
+        }
+      } else {
+        this.logger.warn(`[YTAuthTest] channels.list HTTP ${ytRes.status}`);
+      }
+    } catch (err) {
+      this.logger.warn(`[YTAuthTest] channels.list error: ${(err as Error).message}`);
+    }
+
+    this.logger.log(
+      `[YTAuthTest] user=${user.id} canal="${connection.channelTitle}" verified=${channelVerified}`,
+    );
+
+    return {
+      ok:              true,
+      token_valid:     true,
+      channel_verified: channelVerified,
+      channel_id:      channelPart['channel_id']    ?? connection.channelId,
+      channel_title:   channelPart['channel_title'] ?? connection.channelTitle,
+      connection_status: connection.status,
+    };
+  }
+
   // ── DELETE /api/v1/youtube/connection ─────────────────────────────
   /**
    * Desconecta YouTube: revoca el token en Google y marca status=revoked.
@@ -156,6 +248,7 @@ export class YoutubeController {
   async uploadFromUrl(
     @CurrentUser() user: AuthUser,
     @Body() body: Record<string, unknown>,
+    @Headers('x-cursia-dry-run') dryRunHeader?: string,
   ) {
     const downloadUrl = body['download_url'] as string | undefined;
     if (!downloadUrl || typeof downloadUrl !== 'string' || !downloadUrl.startsWith('http')) {
@@ -167,11 +260,18 @@ export class YoutubeController {
     const privacyStatus = (body['privacy_status'] as string  | undefined) ?? 'unlisted';
     const chapterNumber = (body['chapter_number'] as number  | undefined) ?? null;
 
+    // dry-run: cuerpo JSON { dryRun: true } o header X-Cursia-Dry-Run: true
+    const isDryRun =
+      body['dryRun'] === true ||
+      body['dry_run'] === true ||
+      dryRunHeader === 'true' ||
+      dryRunHeader === '1';
+
     if (!['public', 'unlisted', 'private'].includes(privacyStatus)) {
       throw new BadRequestException('privacy_status debe ser public, unlisted o private.');
     }
 
-    // Verificar conexión YouTube del usuario
+    // Verificar conexión YouTube del usuario (también en dry-run — valida auth)
     const connection = await this.youtubeService.getConnection(user.id);
     if (!connection || connection.status === 'revoked') {
       throw new NotFoundException(
@@ -182,6 +282,31 @@ export class YoutubeController {
     const videoTitle = title
       ?? (chapterNumber != null ? `Capítulo ${chapterNumber}` : 'Video generado por IA');
 
+    // ── Modo dry-run: validar sin descargar ni subir ─────────────────
+    if (isDryRun) {
+      this.logger.log(
+        `[YTUpload][DRY-RUN] user=${user.id} canal="${connection.channelTitle}" ` +
+        `cap=${chapterNumber} title="${videoTitle}" download_url=${downloadUrl.slice(0, 60)}…`,
+      );
+      return {
+        dry_run:        true,
+        youtube_url:    'https://www.youtube.com/watch?v=dry_test_ok',
+        video_id:       'dry_test_ok',
+        chapter_number: chapterNumber,
+        channel_id:     connection.channelId,
+        channel_title:  connection.channelTitle,
+        validated: {
+          jwt:           true,
+          connection:    true,
+          payload:       true,
+          download_url:  downloadUrl,
+          title:         videoTitle,
+          privacy:       privacyStatus,
+        },
+      };
+    }
+
+    // ── Upload real ──────────────────────────────────────────────────
     this.logger.log(
       `[YTUpload] user=${user.id} canal="${connection.channelTitle}" ` +
       `cap=${chapterNumber} title="${videoTitle}"`,

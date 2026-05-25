@@ -74,6 +74,38 @@ export class VideoEngineController {
         });
 
       } else if (action === 'batch-create') {
+        // ── dry-run: no encolar jobs ni llamar Videogen ─────────────────
+        const isDryRun = payload?.['dryRun'] === true || payload?.['dry_run'] === true;
+        if (isDryRun) {
+          const videos = (payload?.['videos'] as unknown[]) ?? [];
+          const dryBatchId = 'dry_batch_' + Date.now();
+          const dryJobs = videos.map((v: unknown, idx: number) => {
+            const vObj = v as Record<string, unknown>;
+            const capNum = vObj['chapter_number'] ?? (idx + 1);
+            const jobId  = 'dry_job_cap' + capNum + '_' + Date.now();
+            return {
+              job_id:          jobId,
+              chapter_number:  capNum,
+              status:          'completed_local',
+              download_url:    `${veBaseUrl}/dry-run/cap${capNum}.mp4`,
+              client_reference_id: vObj['client_reference_id'] ?? null,
+            };
+          });
+
+          this.logger.log(
+            `[VideoEngine][DRY-RUN] batch-create simulado — ${dryJobs.length} jobs`,
+          );
+          res.status(HttpStatus.OK).json({
+            dry_run:   true,
+            batch_id:  dryBatchId,
+            status:    'completed_local',
+            jobs:      dryJobs,
+            videos:    dryJobs,  // alias — algunos parsers usan 'videos'
+            message:   'dry-run: batch simulado, no se encolan jobs ni se llama Videogen.',
+          });
+          return;
+        }
+
         veRes = await fetch(`${veBaseUrl}/api/external/videos/batch-create`, {
           method: 'POST',
           headers: veHeaders,
@@ -81,6 +113,23 @@ export class VideoEngineController {
         });
 
       } else if (action === 'create') {
+        // ── dry-run individual ──────────────────────────────────────────
+        const isDryRunCreate = payload?.['dryRun'] === true || payload?.['dry_run'] === true;
+        if (isDryRunCreate) {
+          const capNum  = payload?.['chapter_number'] ?? 1;
+          const dryJobId = 'dry_job_cap' + capNum + '_' + Date.now();
+          this.logger.log(`[VideoEngine][DRY-RUN] create simulado cap=${capNum}`);
+          res.status(HttpStatus.OK).json({
+            dry_run:         true,
+            job_id:          dryJobId,
+            status:          'completed_local',
+            chapter_number:  capNum,
+            download_url:    `${veBaseUrl}/dry-run/cap${capNum}.mp4`,
+            message:         'dry-run: job simulado, sin FFmpeg ni proveedor.',
+          });
+          return;
+        }
+
         veRes = await fetch(`${veBaseUrl}/api/external/videos/create`, {
           method: 'POST',
           headers: veHeaders,
