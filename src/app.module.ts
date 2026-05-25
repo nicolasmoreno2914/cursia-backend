@@ -9,6 +9,7 @@ import { CourseVersionsModule } from './modules/course-versions/course-versions.
 import { YoutubeModule } from './youtube/youtube.module';
 import { EventsModule } from './events/events.module';
 import { AdminModule } from './admin/admin.module';
+import { VideoEngineModule } from './video-engine/video-engine.module';
 
 @Module({
   imports: [
@@ -23,6 +24,7 @@ import { AdminModule } from './admin/admin.module';
     YoutubeModule,
     EventsModule,
     AdminModule,
+    VideoEngineModule,
   ],
   controllers: [AppController],
   providers: [AppService],
