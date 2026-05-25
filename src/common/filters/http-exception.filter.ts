@@ -17,15 +17,24 @@ export class AllExceptionsFilter implements ExceptionFilter {
     const response = ctx.getResponse<Response>();
     const request = ctx.getRequest<Request>();
 
-    const status =
-      exception instanceof HttpException
-        ? exception.getStatus()
-        : HttpStatus.INTERNAL_SERVER_ERROR;
+    // PayloadTooLargeError from body-parser — must be 413, not 500
+    const isPayloadTooLarge =
+      exception instanceof Error &&
+      ((exception as any).type === 'entity.too.large' ||
+        (exception as any).status === 413 ||
+        exception.message?.includes('request entity too large'));
 
-    const message =
-      exception instanceof HttpException
-        ? exception.getResponse()
-        : 'Internal server error';
+    const status = isPayloadTooLarge
+      ? HttpStatus.PAYLOAD_TOO_LARGE
+      : exception instanceof HttpException
+      ? exception.getStatus()
+      : HttpStatus.INTERNAL_SERVER_ERROR;
+
+    const message = isPayloadTooLarge
+      ? 'El payload es demasiado grande. Reduce el tamaño del contenido enviado.'
+      : exception instanceof HttpException
+      ? exception.getResponse()
+      : 'Internal server error';
 
     const errorResponse = {
       statusCode: status,
