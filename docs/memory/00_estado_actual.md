@@ -32,19 +32,21 @@ El usuario final es un docente, empresa o institución que necesita transformar 
 - Feature flags: backend desactivado por defecto en producción, activable por `localStorage`
 
 ### Backend (cursia-backend)
-- **Estado: 🔄 Deploy en progreso** — objetivo `https://api.cursia.nomaddi.com`
+- **Estado: ✅ EN PRODUCCIÓN** — `https://api.cursia.nomaddi.com`
 - Repo: `orbia-backend` / rama: `main`
-- Código: ✅ completo y compilando
-- Supabase schema: ✅ SQL corregido (`docs/SCHEMA_SUPABASE.sql`)
-- Deploy en Contabo: 🔄 VPS provisionado — **IP: 167.86.98.162** — pendiente configuración
+- PM2: ✅ `cursia-backend` online — `167.86.98.162:3000`
+- Nginx: ✅ reverse proxy activo
+- SSL: ✅ Let's Encrypt — expira 2026-08-22
+- Supabase DB: ✅ conectada — seeds corrieron al arrancar
 - CI/CD GitHub Actions: ✅ workflow listo, pendiente configurar secrets en GitHub
 
 ### VPS Contabo
 - **IP pública**: `167.86.98.162`
-- **Tipo**: Cloud VPS 20 SSD
-- **Ubicación**: Hub Europe
-- **Usuario inicial**: `root`
-- **Estado**: ✅ Provisionado — ⏳ pendiente: SO actualizado, usuario `cursia`, Node.js, Nginx, PM2, SSL
+- **Tipo**: Cloud VPS 20 SSD — Ubuntu 24.04.4 LTS
+- **Usuario app**: `cursia` (sudo, SSH key only)
+- **App path**: `/var/www/cursia-backend`
+- **SSH key local**: `orbia-backend/.cursia_vps_key` (en .gitignore)
+- **Estado**: ✅ Completamente configurado y en producción
 
 ### Base de datos (Supabase PostgreSQL)
 - **Estado: ✅ Proyecto activo** — `hriwbakbuypaiovvvkqh.supabase.co`
