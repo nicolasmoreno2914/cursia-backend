@@ -29,7 +29,7 @@ El usuario final es un docente, empresa o institución que necesita transformar 
 - Google Drive (archivos pesados): ✅ funcional
 - YouTube UI (conectar canal): ✅ funcional cuando backend activo
 - Admin sidebar: ✅ con ícono SVG
-- Feature flags: backend desactivado por defecto en producción, activable por `localStorage`
+- Feature flags: backend **activo por defecto en producción** (hostname detection automática), desactivable con `CURSIA_BACKEND_DISABLED=true`
 
 ### Backend (cursia-backend)
 - **Estado: ✅ EN PRODUCCIÓN + QA VALIDADO** — `https://api.cursia.nomaddi.com`

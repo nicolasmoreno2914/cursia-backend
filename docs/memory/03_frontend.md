@@ -68,11 +68,27 @@ fetch('/api/v1/courses', { headers: { Authorization: `Bearer ${token}` } })
 
 ## Feature flags actuales
 
-| Flag | Cómo activar | Qué hace |
+### Backend — resolución automática por hostname
+
+En producción (`cursia.nomaddi.com`) el backend se activa **automáticamente**.
+No requiere ningún flag manual. La lógica está en `_resolveConfig()` dentro de `24-backend-client.js`.
+
+Prioridad de resolución:
+1. `CURSIA_BACKEND_DISABLED=true` → forzado OFF (útil para QA en prod)
+2. `CURSIA_BACKEND_ENABLED=true`  → forzado ON  (útil en localhost)
+3. `hostname === 'cursia.nomaddi.com'` → ON automático
+4. Otros hosts → OFF por defecto
+
+| Flag | Acción | Cuándo usar |
 |---|---|---|
-| Backend activo | `localStorage.setItem('ORBIA_BACKEND_ENABLED','true')` | Activa Cloud Save/Restore |
-| URL del backend | `localStorage.setItem('ORBIA_BACKEND_URL','https://api.cursia.nomaddi.com')` | Apunta al backend de producción |
+| `localStorage.setItem('CURSIA_BACKEND_DISABLED','true')` | Fuerza backend OFF | QA en producción, para comparar sin backend |
+| `localStorage.removeItem('CURSIA_BACKEND_DISABLED')` | Restaura comportamiento normal | Tras QA en producción |
+| `localStorage.setItem('CURSIA_BACKEND_ENABLED','true')` | Fuerza backend ON | Desarrollo en localhost |
+| `localStorage.setItem('CURSIA_BACKEND_URL','http://localhost:3000')` | URL personalizada | Dev / staging |
 | ElevenLabs key | UI config card → guardar | Habilita generación de audio |
+
+> **Nota**: `CURSIA_BACKEND_ENABLED=false` ya NO desactiva el backend en producción.
+> Usar `CURSIA_BACKEND_DISABLED=true` para forzar OFF.
 
 ---
 
