@@ -1,5 +1,5 @@
 # deploy-videogen.yml — Deploys video-gen-ai-backend to /var/www/videogen on VPS
-# Uses same VPS SSH key as cursia-backend deploy (same VPS: 167.86.98.162)
+# Uses same VPS SSH key as cursia-backend deploy (same VPS)
 # Manual trigger only (workflow_dispatch)
 
 name: Deploy Videogen to VPS
@@ -20,7 +20,7 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
 
-      - name: Deploy Videogen on VPS
+      - name: Deploy Videogen on VPS via sudo
         run: |
           ssh -i ~/.ssh/deploy_key \
               -o StrictHostKeyChecking=no \
@@ -29,32 +29,26 @@ jobs:
                PROJECT_DIR="/var/www/videogen"
                BACKEND_DIR="${PROJECT_DIR}/backend"
 
-               echo "=== [0/6] Fix git safe.directory ==="
-               git config --global --add safe.directory /var/www/videogen
+               echo "=== Who am I? ==="
+               whoami
+               id
 
-               echo "=== [1/6] Git pull ==="
-               cd "${PROJECT_DIR}"
-               git fetch origin
-               git pull origin main
-               git log --oneline -3
-
-               echo "=== [2/6] npm install ==="
-               cd "${BACKEND_DIR}"
-               npm ci --omit=optional
-
-               echo "=== [3/6] Build TypeScript ==="
-               npm run build
-
-               echo "=== [4/6] Check OpenAI TTS ==="
-               ls dist/modules/voice/openai-tts.service.js 2>/dev/null && echo "openai-tts.service.js: PRESENTE" || echo "openai-tts.service.js: FALTA"
-
-               echo "=== [5/6] Check OPENAI_API_KEY ==="
-               grep -c "OPENAI_API_KEY" "${BACKEND_DIR}/.env" 2>/dev/null && echo "OPENAI_API_KEY: PRESENTE" || echo "OPENAI_API_KEY: FALTA"
-
-               echo "=== [6/6] PM2 reload ==="
-               cd "${PROJECT_DIR}"
-               pm2 reload ecosystem.config.js --env production 2>/dev/null || pm2 restart all
-               pm2 save'
+               echo "=== Try sudo su to videogen ==="
+               sudo -u videogen bash -c "
+                 cd ${PROJECT_DIR}
+                 git config --global --add safe.directory ${PROJECT_DIR}
+                 git fetch origin
+                 git pull origin main
+                 git log --oneline -3
+                 cd ${BACKEND_DIR}
+                 npm ci --omit=optional
+                 npm run build
+                 ls dist/modules/voice/openai-tts.service.js 2>/dev/null && echo openai-tts.service.js:_PRESENTE || echo openai-tts.service.js:_FALTA
+                 grep -c OPENAI_API_KEY ${BACKEND_DIR}/.env 2>/dev/null && echo OPENAI_API_KEY:_PRESENTE || echo OPENAI_API_KEY:_FALTA
+                 cd ${PROJECT_DIR}
+                 pm2 reload ecosystem.config.js --env production 2>/dev/null || pm2 restart all
+                 pm2 save
+               "'
 
       - name: Health check
         run: |
