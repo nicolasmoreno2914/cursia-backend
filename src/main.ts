@@ -1,3 +1,4 @@
+// P0.4 deploy trigger — force CI redeploy after events DTO fix (73c9ab3)
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe, Logger } from '@nestjs/common';
 import helmet from 'helmet';
