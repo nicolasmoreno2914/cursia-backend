@@ -4,16 +4,17 @@
 #
 # REQUISITOS (GitHub → Settings → Secrets and variables → Actions):
 #
-#   VPS_HOST        IP pública del VPS Contabo
-#   VPS_USER        Usuario SSH (root)
-#   VPS_SSH_KEY     Clave privada SSH (contenido completo, con saltos de línea)
+#   VPS_HOST        IP pública del VPS Contabo (167.86.98.162)
+#   VPS_USER        Usuario SSH (cursia)
+#   VPS_SSH_KEY     Clave privada SSH ed25519 del usuario cursia
 #   VPS_PATH        /var/www/cursia-backend
 #   HEALTH_URL      https://api.cursia.nomaddi.com/health
 #
 # ESTRATEGIA:
-#   1. build-check  — Compila TypeScript en el runner de GitHub (con devDeps).
-#                     Nunca instala TypeScript en el VPS de producción.
-#   2. deploy       — Sube dist/ al VPS via SSH, instala solo prod deps, recarga PM2.
+#   1. build-check  — Verifica que el TypeScript compila en el runner de GitHub.
+#                     Early-fail antes de tocar producción.
+#   2. deploy       — SSH al VPS: git pull + npm install + tsc + npm ci + pm2 reload.
+#                     Compila en el VPS para evitar diferencias entre plataformas.
 #
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -30,10 +31,10 @@ concurrency:
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
-  # JOB 1: build — compila en GitHub, sube dist/ como artifact
+  # JOB 1: build-check — verifica que el TS compila sin errores (early-fail)
   # ────────────────────────────────────────────────────────────────────────────
   build:
-    name: Build TypeScript
+    name: Build TypeScript (early check)
     runs-on: ubuntu-latest
 
     steps:
@@ -60,15 +61,10 @@ jobs:
           fi
           echo "✅ dist/main.js OK — $(du -sh dist/ | cut -f1)"
 
-      - name: Upload dist artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
-          retention-days: 1
-
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 2: deploy — solo si el build pasó
+  # Compila TypeScript directamente en el VPS para evitar diferencias
+  # entre el runner de GitHub y el servidor de producción.
   # ────────────────────────────────────────────────────────────────────────────
   deploy:
     name: Deploy to VPS
@@ -77,12 +73,6 @@ jobs:
     environment: production
 
     steps:
-      - name: Download dist artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
-
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
@@ -90,54 +80,54 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
 
-      - name: Upload dist/ to VPS
-        run: |
-          rsync -az --delete \
-            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
-            dist/ \
-            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:${{ secrets.VPS_PATH }}/dist/"
-
       - name: Deploy on VPS
         run: |
           ssh -i ~/.ssh/deploy_key \
               -o StrictHostKeyChecking=no \
-              "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" << 'ENDSSH'
-            set -e
-            cd ${{ secrets.VPS_PATH }}
+              "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+              'set -e
+               cd '"${{ secrets.VPS_PATH }}"'
 
-            echo "━━━ [1/4] Git pull (sincronizar package.json y fuentes) ━━━"
-            git pull origin main
+               echo "━━━ [1/5] Git pull ━━━"
+               git pull origin main
 
-            echo "━━━ [2/4] Instalar dependencias de producción ━━━"
-            npm ci --omit=dev
+               echo "━━━ [2/5] Instalar todas las dependencias (devDeps para tsc) ━━━"
+               npm install
 
-            echo "━━━ [3/4] Recargar PM2 (graceful reload, zero downtime) ━━━"
-            pm2 reload cursia-backend --update-env || pm2 restart cursia-backend --update-env
+               echo "━━━ [3/5] Compilar TypeScript en el VPS ━━━"
+               npm run build
 
-            echo "━━━ [4/4] Guardar estado PM2 ━━━"
-            pm2 save
+               echo "━━━ [4/5] Limpiar devDeps — dejar solo producción ━━━"
+               npm ci --omit=dev
 
-            echo "✅ Deploy completado."
-          ENDSSH
+               echo "━━━ [5/5] Recargar PM2 (zero-downtime) ━━━"
+               pm2 reload cursia-backend --update-env || pm2 restart cursia-backend --update-env
+               pm2 save
+
+               echo "✅ Deploy completado."'
 
       - name: Health check post-deploy
         run: |
-          echo "Esperando 10 segundos para que NestJS inicialice…"
-          sleep 10
-          RESPONSE=$(curl -sf --max-time 15 "${{ secrets.HEALTH_URL }}" || echo "FAILED")
-          if echo "$RESPONSE" | grep -q '"status":"ok"'; then
-            echo "✅ Health check OK: $RESPONSE"
-          else
-            echo "❌ Health check FALLÓ: $RESPONSE"
-            exit 1
-          fi
+          echo "Esperando 20 segundos para que NestJS inicialice…"
+          sleep 20
+          for i in 1 2 3 4 5; do
+            RESPONSE=$(curl -sf --max-time 15 "${{ secrets.HEALTH_URL }}" || echo "FAILED")
+            if echo "$RESPONSE" | grep -q '"status":"ok"'; then
+              echo "✅ Health check OK (intento $i): $RESPONSE"
+              exit 0
+            fi
+            echo "⏳ Intento $i: backend no disponible aún ($RESPONSE), esperando 8s…"
+            sleep 8
+          done
+          echo "❌ Health check FALLÓ tras 5 intentos"
+          exit 1
 
       - name: Notify on failure
         if: failure()
         run: |
           echo "⚠️  El deploy falló."
           echo "Rollback manual en VPS:"
+          echo "  ssh cursia@${{ secrets.VPS_HOST }}"
           echo "  cd ${{ secrets.VPS_PATH }}"
-          echo "  git checkout HEAD~1"
-          echo "  npm ci --omit=dev"
+          echo "  git checkout HEAD~1 && npm install && npm run build && npm ci --omit=dev"
           echo "  pm2 restart cursia-backend"
