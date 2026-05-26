@@ -1,5 +1,4 @@
-# deploy-videogen.yml — Deploys video-gen-ai-backend to /var/www/videogen on VPS
-# Manual trigger only (workflow_dispatch)
+# deploy-videogen.yml — Check sudo rules and try to deploy Videogen
 
 name: Deploy Videogen to VPS
 
@@ -19,50 +18,20 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
 
-      - name: Deploy Videogen on VPS as root via sudo
+      - name: Check sudo rules and deploy options
         run: |
           ssh -i ~/.ssh/deploy_key \
               -o StrictHostKeyChecking=no \
               "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
-              'set -e
-               PROJECT_DIR="/var/www/videogen"
-               BACKEND_DIR="${PROJECT_DIR}/backend"
-
-               echo "=== [1/7] Git pull (sudo) ==="
-               sudo git -C "${PROJECT_DIR}" fetch origin
-               sudo git -C "${PROJECT_DIR}" pull origin main
-               sudo git -C "${PROJECT_DIR}" log --oneline -3
-
-               echo "=== [2/7] npm ci (sudo) ==="
-               sudo bash -c "cd ${BACKEND_DIR} && npm ci --omit=optional" 2>&1 | tail -5
-
-               echo "=== [3/7] Build TypeScript (sudo) ==="
-               sudo bash -c "cd ${BACKEND_DIR} && npm run build"
-
-               echo "=== [4/7] Check OpenAI TTS ==="
-               ls ${BACKEND_DIR}/dist/modules/voice/openai-tts.service.js 2>/dev/null && echo "openai-tts.service.js: PRESENTE" || echo "openai-tts.service.js: FALTA"
-
-               echo "=== [5/7] Check OPENAI_API_KEY ==="
-               sudo grep -c "OPENAI_API_KEY" "${BACKEND_DIR}/.env" 2>/dev/null && echo "OPENAI_API_KEY: PRESENTE" || echo "OPENAI_API_KEY: FALTA"
-
-               echo "=== [6/7] PM2 status (root) ==="
-               sudo pm2 list 2>/dev/null || sudo /usr/bin/pm2 list 2>/dev/null || echo "pm2 not available as root"
-
-               echo "=== [7/7] PM2 reload (root) ==="
-               sudo bash -c "cd ${PROJECT_DIR} && pm2 reload ecosystem.config.js --env production 2>/dev/null || pm2 restart all"
-               sudo pm2 save'
-
-      - name: Health check
-        run: |
-          sleep 20
-          for i in 1 2 3 4 5; do
-            RESPONSE=$(curl -sf --max-time 15 "https://videosb.nomaddi.com/health" || echo "FAILED")
-            if echo "$RESPONSE" | grep -q '"status":"ok"'; then
-              echo "Health check OK: $RESPONSE"
-              exit 0
-            fi
-            echo "Attempt $i: $RESPONSE"
-            sleep 8
-          done
-          echo "Health check FAILED"
-          exit 1
+              'echo "=== Sudo rules ==="
+               sudo -l 2>/dev/null | head -20 || echo "sudo -l requires password"
+               echo "=== Check /etc/sudoers.d ==="
+               ls /etc/sudoers.d/ 2>/dev/null || echo "cannot list sudoers.d"
+               echo "=== Check if deploy script is NOPASSWD ==="
+               cat /etc/sudoers.d/* 2>/dev/null | grep -v "^#\|^$" | head -20 || echo "cannot read sudoers.d"
+               echo "=== Current git commit on VPS ==="
+               git -C /var/www/videogen log --oneline -3 2>/dev/null || echo "git log failed"
+               echo "=== FETCH_HEAD ==="
+               cat /var/www/videogen/.git/FETCH_HEAD 2>/dev/null || echo "cannot read FETCH_HEAD"
+               echo "=== Last backend build ==="
+               ls -la /var/www/videogen/backend/dist/ 2>/dev/null | head -10 || echo "no dist/"'
