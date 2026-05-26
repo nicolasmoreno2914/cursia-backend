@@ -1,5 +1,4 @@
 # deploy-videogen.yml — Deploys video-gen-ai-backend to /var/www/videogen on VPS
-# Uses same VPS SSH key as cursia-backend deploy (same VPS)
 # Manual trigger only (workflow_dispatch)
 
 name: Deploy Videogen to VPS
@@ -20,47 +19,20 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
 
-      - name: Deploy Videogen on VPS via sudo
+      - name: Investigate VPS state
         run: |
           ssh -i ~/.ssh/deploy_key \
               -o StrictHostKeyChecking=no \
               "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
-              'set -e
-               PROJECT_DIR="/var/www/videogen"
-               BACKEND_DIR="${PROJECT_DIR}/backend"
-
-               echo "=== Who am I? ==="
-               whoami
-               id
-
-               echo "=== Try sudo su to videogen ==="
-               sudo -u videogen bash -c "
-                 cd ${PROJECT_DIR}
-                 git config --global --add safe.directory ${PROJECT_DIR}
-                 git fetch origin
-                 git pull origin main
-                 git log --oneline -3
-                 cd ${BACKEND_DIR}
-                 npm ci --omit=optional
-                 npm run build
-                 ls dist/modules/voice/openai-tts.service.js 2>/dev/null && echo openai-tts.service.js:_PRESENTE || echo openai-tts.service.js:_FALTA
-                 grep -c OPENAI_API_KEY ${BACKEND_DIR}/.env 2>/dev/null && echo OPENAI_API_KEY:_PRESENTE || echo OPENAI_API_KEY:_FALTA
-                 cd ${PROJECT_DIR}
-                 pm2 reload ecosystem.config.js --env production 2>/dev/null || pm2 restart all
-                 pm2 save
-               "'
+              'echo "=== Who am I ===" && whoami && id
+               echo "=== Listing /var/www ===" && ls -la /var/www/
+               echo "=== ls /var/www/videogen ===" && ls -la /var/www/videogen/ 2>/dev/null || echo "dir not found"
+               echo "=== ls /var/www/videogen/.git ===" && ls -la /var/www/videogen/.git/ 2>/dev/null | head -5 || echo "git dir not found"
+               echo "=== who owns videogen dir ===" && stat -c "%U %G" /var/www/videogen 2>/dev/null || echo "stat failed"
+               echo "=== can sudo deploy script? ===" && sudo bash /var/www/videogen/scripts/deploy.sh --check 2>/dev/null || echo "deploy script sudo failed: $?"
+               echo "=== pm2 list ===" && pm2 list 2>/dev/null || echo "pm2 not in PATH for this user"
+               echo "=== find pm2 ===" && which pm2 2>/dev/null || find /usr -name pm2 2>/dev/null | head -3 || find /home -name pm2 2>/dev/null | head -3'
 
       - name: Health check
         run: |
-          sleep 20
-          for i in 1 2 3 4 5; do
-            RESPONSE=$(curl -sf --max-time 15 "https://videosb.nomaddi.com/health" || echo "FAILED")
-            if echo "$RESPONSE" | grep -q '"status":"ok"'; then
-              echo "Health check OK: $RESPONSE"
-              exit 0
-            fi
-            echo "Attempt $i: not ready yet"
-            sleep 8
-          done
-          echo "Health check failed"
-          exit 1
+          curl -sf "https://videosb.nomaddi.com/health" && echo "Health OK" || echo "Health failed"
