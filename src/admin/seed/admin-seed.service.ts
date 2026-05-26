@@ -17,7 +17,7 @@ import { TraditionalCostBenchmark } from '../entities/traditional-cost-benchmark
 // ── Datos de siembra ─────────────────────────────────────────────────────────
 
 const COST_RATES_SEED: Omit<CostRate, 'id' | 'createdAt' | 'updatedAt'>[] = [
-  // Anthropic — Claude 3.5 Sonnet
+  // ── Anthropic — Claude 3.5 Sonnet ────────────────────────────────────────
   {
     provider: 'anthropic',
     service:  'chat_completion',
@@ -38,7 +38,48 @@ const COST_RATES_SEED: Omit<CostRate, 'id' | 'createdAt' | 'updatedAt'>[] = [
     effectiveFrom: '2024-10-22',
     notes: 'Claude 3.5 Sonnet — precio salida Anthropic API',
   },
-  // Anthropic — Claude 3 Haiku (más económico)
+  // ── Anthropic — Claude Sonnet 4 / claude-sonnet-4-6 ──────────────────────
+  {
+    provider: 'anthropic',
+    service:  'chat_completion',
+    model:    'claude-sonnet-4-5',
+    unitType: 'per_1k_input_tokens',
+    rateUsd:  0.003,
+    isActive: true,
+    effectiveFrom: '2025-01-01',
+    notes: 'Claude Sonnet 4.5 — precio entrada (estimado)',
+  },
+  {
+    provider: 'anthropic',
+    service:  'chat_completion',
+    model:    'claude-sonnet-4-5',
+    unitType: 'per_1k_output_tokens',
+    rateUsd:  0.015,
+    isActive: true,
+    effectiveFrom: '2025-01-01',
+    notes: 'Claude Sonnet 4.5 — precio salida (estimado)',
+  },
+  {
+    provider: 'anthropic',
+    service:  'chat_completion',
+    model:    'claude-sonnet-4-6',
+    unitType: 'per_1k_input_tokens',
+    rateUsd:  0.003,
+    isActive: true,
+    effectiveFrom: '2025-01-01',
+    notes: 'Claude Sonnet 4.6 — precio entrada (estimado)',
+  },
+  {
+    provider: 'anthropic',
+    service:  'chat_completion',
+    model:    'claude-sonnet-4-6',
+    unitType: 'per_1k_output_tokens',
+    rateUsd:  0.015,
+    isActive: true,
+    effectiveFrom: '2025-01-01',
+    notes: 'Claude Sonnet 4.6 — precio salida (estimado)',
+  },
+  // ── Anthropic — Claude 3 Haiku (más económico) ────────────────────────────
   {
     provider: 'anthropic',
     service:  'chat_completion',
@@ -59,7 +100,29 @@ const COST_RATES_SEED: Omit<CostRate, 'id' | 'createdAt' | 'updatedAt'>[] = [
     effectiveFrom: '2024-03-07',
     notes: 'Claude 3 Haiku — precio salida',
   },
-  // Video Engine IA — por video generado
+  // ── Anthropic — fallback genérico sin modelo ──────────────────────────────
+  // Se aplica cuando ai_model no está en ninguna tarifa específica.
+  {
+    provider: 'anthropic',
+    service:  'chat_completion',
+    model:    null,
+    unitType: 'per_1k_input_tokens',
+    rateUsd:  0.003,
+    isActive: true,
+    effectiveFrom: '2024-01-01',
+    notes: 'Anthropic chat_completion — tarifa genérica entrada (fallback)',
+  },
+  {
+    provider: 'anthropic',
+    service:  'chat_completion',
+    model:    null,
+    unitType: 'per_1k_output_tokens',
+    rateUsd:  0.015,
+    isActive: true,
+    effectiveFrom: '2024-01-01',
+    notes: 'Anthropic chat_completion — tarifa genérica salida (fallback)',
+  },
+  // ── Video Engine IA — por video generado ──────────────────────────────────
   {
     provider: 'video_engine',
     service:  'video_generation',
@@ -69,6 +132,17 @@ const COST_RATES_SEED: Omit<CostRate, 'id' | 'createdAt' | 'updatedAt'>[] = [
     isActive: true,
     effectiveFrom: '2025-01-01',
     notes: 'Video Engine IA — coste estimado por video generado (ajustar según plan)',
+  },
+  // ── ElevenLabs — audio por job ────────────────────────────────────────────
+  {
+    provider: 'elevenlabs',
+    service:  'audio_generation',
+    model:    null,
+    unitType: 'per_job',
+    rateUsd:  0.03,
+    isActive: true,
+    effectiveFrom: '2025-01-01',
+    notes: 'ElevenLabs — coste estimado por audio generado (bienvenida o audiolibro cap.)',
   },
 ];
 

@@ -28,6 +28,14 @@ export interface DashboardSummary {
     failed: number;
     estimated_cost_usd: number;
   };
+  audio: {
+    welcome_generated: number;
+    audiobooks_generated: number;
+    estimated_cost_usd: number;
+  };
+  production: {
+    completed: number;
+  };
   exports: { mbz_total: number };
   total_estimated_cost_usd: number;
   traditional_equivalent_usd: number;
@@ -112,14 +120,43 @@ export class AdminDashboardService {
 
     const videosCostUsd = parseFloat(videoCostStats?.videosCost ?? '0');
 
-    // ── 5. Exports MBZ ────────────────────────────────────────────────────────
+    // ── 5. Audio ──────────────────────────────────────────────────────────────
+    const welcomeAudioCount = await this.eventRepo
+      .createQueryBuilder('e')
+      .where('e.created_at BETWEEN :from AND :to', { from, to })
+      .andWhere("e.event_type = 'welcome_audio_generated'")
+      .getCount();
+
+    const audiobookCount = await this.eventRepo
+      .createQueryBuilder('e')
+      .where('e.created_at BETWEEN :from AND :to', { from, to })
+      .andWhere("e.event_type = 'audiobook_generated'")
+      .getCount();
+
+    const audioCostStats = await this.eventRepo
+      .createQueryBuilder('e')
+      .select('COALESCE(SUM(e.estimated_cost_usd), 0)', 'audioCost')
+      .where('e.created_at BETWEEN :from AND :to', { from, to })
+      .andWhere("e.event_type IN ('welcome_audio_generated', 'audiobook_generated')")
+      .getRawOne<{ audioCost: string }>();
+
+    const audioCostUsd = parseFloat(audioCostStats?.audioCost ?? '0');
+
+    // ── 6. Producción completa ────────────────────────────────────────────────
+    const productionCompleted = await this.eventRepo
+      .createQueryBuilder('e')
+      .where('e.created_at BETWEEN :from AND :to', { from, to })
+      .andWhere("e.event_type = 'course_production_completed'")
+      .getCount();
+
+    // ── 7. Exports MBZ ────────────────────────────────────────────────────────
     const mbzTotal = await this.eventRepo
       .createQueryBuilder('e')
       .where('e.created_at BETWEEN :from AND :to', { from, to })
-      .andWhere("e.event_type = 'export_mbz'")
+      .andWhere("e.event_type IN ('export_mbz', 'mbz_exported')")
       .getCount();
 
-    // ── 6. Coste total ────────────────────────────────────────────────────────
+    // ── 8. Coste total ────────────────────────────────────────────────────────
     const totalCostStats = await this.eventRepo
       .createQueryBuilder('e')
       .select('COALESCE(SUM(e.estimated_cost_usd), 0)', 'totalCost')
@@ -128,7 +165,7 @@ export class AdminDashboardService {
 
     const totalCostUsd = parseFloat(totalCostStats?.totalCost ?? '0');
 
-    // ── 7. Ahorro vs. método tradicional ──────────────────────────────────────
+    // ── 9. Ahorro vs. método tradicional ──────────────────────────────────────
     let traditionalEquivalentUsd = 0;
 
     const benchmarks = await this.benchmarkRepo.find({ where: { isActive: true } });
@@ -147,7 +184,7 @@ export class AdminDashboardService {
 
     const savingsUsd = Math.max(0, traditionalEquivalentUsd - totalCostUsd);
 
-    // ── 8. Respuesta ──────────────────────────────────────────────────────────
+    // ── 10. Respuesta ─────────────────────────────────────────────────────────
     return {
       period: {
         from: from.toISOString(),
@@ -172,12 +209,20 @@ export class AdminDashboardService {
         failed:             videosFailed,
         estimated_cost_usd: Number(videosCostUsd.toFixed(6)),
       },
+      audio: {
+        welcome_generated:    welcomeAudioCount,
+        audiobooks_generated: audiobookCount,
+        estimated_cost_usd:   Number(audioCostUsd.toFixed(6)),
+      },
+      production: {
+        completed: productionCompleted,
+      },
       exports: {
         mbz_total: mbzTotal,
       },
-      total_estimated_cost_usd:  Number(totalCostUsd.toFixed(6)),
+      total_estimated_cost_usd:   Number(totalCostUsd.toFixed(6)),
       traditional_equivalent_usd: Number(traditionalEquivalentUsd.toFixed(2)),
-      savings_usd:               Number(savingsUsd.toFixed(2)),
+      savings_usd:                Number(savingsUsd.toFixed(2)),
       failures: {
         total: failedEvents,
       },

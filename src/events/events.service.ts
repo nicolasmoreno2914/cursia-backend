@@ -27,13 +27,53 @@ export class EventsService {
     private readonly costRatesService: CostRatesService,
   ) {}
 
+  /**
+   * Resuelve el proveedor y servicio correcto para el lookup de cost_rates,
+   * independientemente del event_type que llega del frontend.
+   *
+   * Las tarifas en cost_rates usan service='chat_completion' (IA) o
+   * service='video_generation' (video). El event_type no debe usarse
+   * directamente como service o nunca habrá match.
+   */
+  private _resolveCostServiceKey(dto: CreateEventDto): { provider?: string; service?: string } {
+    const et = dto.event_type ?? '';
+
+    // IA — cualquier evento ia_* o course_created con tokens
+    if (et.startsWith('ia_') || et === 'course_created') {
+      return {
+        provider: dto.ai_provider || 'anthropic',
+        service:  'chat_completion',
+      };
+    }
+
+    // Video — completados/fallidos/solicitados
+    if (et.startsWith('video_') || et === 'youtube_upload_completed' || et === 'youtube_upload_failed') {
+      return {
+        provider: 'video_engine',
+        service:  'video_generation',
+      };
+    }
+
+    // Audio — ElevenLabs (coste por job si hay tarifa)
+    if (et === 'welcome_audio_generated' || et === 'audiobook_generated') {
+      return {
+        provider: dto.ai_provider || 'elevenlabs',
+        service:  'audio_generation',
+      };
+    }
+
+    // Sin mapeo conocido → sin coste
+    return { provider: undefined, service: undefined };
+  }
+
   async create(dto: CreateEventDto, user: AuthUser): Promise<{ ok: boolean; id?: string }> {
     try {
       // ── 1. Calcular coste estimado ───────────────────────────────
+      const costKey = this._resolveCostServiceKey(dto);
       const estimatedCostUsd = await this.costRatesService.estimateCostFromEvent({
-        provider: dto.ai_provider,
-        service:  dto.event_type,
-        model:    dto.ai_model,
+        provider:    costKey.provider,
+        service:     costKey.service,
+        model:       dto.ai_model,
         tokensInput:  dto.tokens_input,
         tokensOutput: dto.tokens_output,
         videoCount:   dto.video_count,
