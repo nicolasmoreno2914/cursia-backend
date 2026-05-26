@@ -28,20 +28,29 @@ jobs:
               'set -e
                PROJECT_DIR="/var/www/videogen"
                BACKEND_DIR="${PROJECT_DIR}/backend"
+
+               echo "=== [0/6] Fix git safe.directory ==="
+               git config --global --add safe.directory /var/www/videogen
+
                echo "=== [1/6] Git pull ==="
                cd "${PROJECT_DIR}"
                git fetch origin
                git pull origin main
                git log --oneline -3
+
                echo "=== [2/6] npm install ==="
                cd "${BACKEND_DIR}"
                npm ci --omit=optional
+
                echo "=== [3/6] Build TypeScript ==="
                npm run build
+
                echo "=== [4/6] Check OpenAI TTS ==="
                ls dist/modules/voice/openai-tts.service.js 2>/dev/null && echo "openai-tts.service.js: PRESENTE" || echo "openai-tts.service.js: FALTA"
+
                echo "=== [5/6] Check OPENAI_API_KEY ==="
                grep -c "OPENAI_API_KEY" "${BACKEND_DIR}/.env" 2>/dev/null && echo "OPENAI_API_KEY: PRESENTE" || echo "OPENAI_API_KEY: FALTA"
+
                echo "=== [6/6] PM2 reload ==="
                cd "${PROJECT_DIR}"
                pm2 reload ecosystem.config.js --env production 2>/dev/null || pm2 restart all
