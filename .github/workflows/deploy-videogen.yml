@@ -1,5 +1,3 @@
-# deploy-videogen.yml — Check sudo rules and try to deploy Videogen
-
 name: Deploy Videogen to VPS
 
 on:
@@ -18,20 +16,25 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
 
-      - name: Check sudo rules and deploy options
+      - name: Check videogen deploy options
         run: |
           ssh -i ~/.ssh/deploy_key \
               -o StrictHostKeyChecking=no \
               "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
-              'echo "=== Sudo rules ==="
-               sudo -l 2>/dev/null | head -20 || echo "sudo -l requires password"
-               echo "=== Check /etc/sudoers.d ==="
-               ls /etc/sudoers.d/ 2>/dev/null || echo "cannot list sudoers.d"
-               echo "=== Check if deploy script is NOPASSWD ==="
-               cat /etc/sudoers.d/* 2>/dev/null | grep -v "^#\|^$" | head -20 || echo "cannot read sudoers.d"
-               echo "=== Current git commit on VPS ==="
-               git -C /var/www/videogen log --oneline -3 2>/dev/null || echo "git log failed"
-               echo "=== FETCH_HEAD ==="
-               cat /var/www/videogen/.git/FETCH_HEAD 2>/dev/null || echo "cannot read FETCH_HEAD"
-               echo "=== Last backend build ==="
-               ls -la /var/www/videogen/backend/dist/ 2>/dev/null | head -10 || echo "no dist/"'
+              'echo "=== pm2 ls as cursia user (finds videogen processes?) ==="
+               pm2 ls 2>/dev/null | head -20
+
+               echo "=== Check if deploy script is executable ==="
+               ls -la /var/www/videogen/scripts/deploy.sh 2>/dev/null
+
+               echo "=== Try to run deploy script without sudo ==="
+               bash /var/www/videogen/scripts/deploy.sh 2>&1 | tail -5 || echo "deploy.sh failed: $?"
+
+               echo "=== Check /var/www/videogen remote ==="
+               git -C /var/www/videogen remote -v 2>/dev/null || echo "no git access"
+
+               echo "=== Check pm2 list ALL ==="
+               pm2 list 2>/dev/null | grep -E "videogen|online|stopped|errored" | head -10
+
+               echo "=== Check ecosystem config ==="
+               cat /var/www/videogen/ecosystem.config.js 2>/dev/null | head -20'
