@@ -16,25 +16,30 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
 
-      - name: Check videogen deploy options
+      - name: Check cron, systemd, and root pm2
         run: |
           ssh -i ~/.ssh/deploy_key \
               -o StrictHostKeyChecking=no \
               "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
-              'echo "=== pm2 ls as cursia user (finds videogen processes?) ==="
-               pm2 ls 2>/dev/null | head -20
+              'echo "=== Crontabs ==="
+               crontab -l 2>/dev/null | grep -v "^#" || echo "no user crontab"
+               ls /etc/cron.d/ 2>/dev/null | head -10 || echo "cannot list /etc/cron.d"
 
-               echo "=== Check if deploy script is executable ==="
-               ls -la /var/www/videogen/scripts/deploy.sh 2>/dev/null
+               echo "=== Systemd videogen services ==="
+               systemctl list-units --type=service 2>/dev/null | grep -i "videogen\|video" | head -10 || echo "no systemctl access"
 
-               echo "=== Try to run deploy script without sudo ==="
-               bash /var/www/videogen/scripts/deploy.sh 2>&1 | tail -5 || echo "deploy.sh failed: $?"
+               echo "=== Check root pm2 service ==="
+               ls /etc/systemd/system/pm2* 2>/dev/null | head -5 || echo "no pm2 systemd found"
+               ls /etc/init.d/pm2* 2>/dev/null | head -5 || echo "no pm2 init.d"
 
-               echo "=== Check /var/www/videogen remote ==="
-               git -C /var/www/videogen remote -v 2>/dev/null || echo "no git access"
+               echo "=== Check if there is a deploy webhook service ==="
+               ls /etc/systemd/system/ 2>/dev/null | grep -i "webhook\|deploy" | head -10 || echo "no webhook service"
 
-               echo "=== Check pm2 list ALL ==="
-               pm2 list 2>/dev/null | grep -E "videogen|online|stopped|errored" | head -10
-
-               echo "=== Check ecosystem config ==="
-               cat /var/www/videogen/ecosystem.config.js 2>/dev/null | head -20'
+               echo "=== Check running webhook server ==="
+               ss -tlnp 2>/dev/null | grep -E "9000|4000|8080|8000|3000|3001" | head -10 || echo "cannot check sockets"
+               
+               echo "=== Check /root authorized_keys ==="
+               ls /root/.ssh/ 2>/dev/null || echo "no access to /root/.ssh"
+               
+               echo "=== Who manages root pm2? ==="
+               ls /root/.pm2/ 2>/dev/null | head -10 || echo "no access to /root/.pm2"'
