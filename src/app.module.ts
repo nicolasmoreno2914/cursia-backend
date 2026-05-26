@@ -10,6 +10,7 @@ import { YoutubeModule } from './youtube/youtube.module';
 import { EventsModule } from './events/events.module';
 import { AdminModule } from './admin/admin.module';
 import { VideoEngineModule } from './video-engine/video-engine.module';
+import { TtsModule } from './tts/tts.module';
 
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { VideoEngineModule } from './video-engine/video-engine.module';
     EventsModule,
     AdminModule,
     VideoEngineModule,
+    TtsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

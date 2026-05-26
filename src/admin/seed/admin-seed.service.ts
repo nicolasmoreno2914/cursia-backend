@@ -144,6 +144,17 @@ const COST_RATES_SEED: Omit<CostRate, 'id' | 'createdAt' | 'updatedAt'>[] = [
     effectiveFrom: '2025-01-01',
     notes: 'ElevenLabs — coste estimado por audio generado (bienvenida o audiolibro cap.)',
   },
+  // ── OpenAI TTS — audio por job ────────────────────────────────────────────
+  {
+    provider: 'openai_tts',
+    service:  'audio_generation',
+    model:    'gpt-4o-mini-tts',
+    unitType: 'per_job',
+    rateUsd:  0.005,
+    isActive: true,
+    effectiveFrom: '2025-01-01',
+    notes: 'OpenAI TTS gpt-4o-mini-tts — coste estimado por request (~4000 chars, $0.60/1M chars)',
+  },
 ];
 
 const BENCHMARKS_SEED: Omit<TraditionalCostBenchmark, 'id' | 'createdAt' | 'updatedAt'>[] = [
