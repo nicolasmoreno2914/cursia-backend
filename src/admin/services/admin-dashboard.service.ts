@@ -41,6 +41,10 @@ export interface DashboardSummary {
   traditional_equivalent_usd: number;
   savings_usd: number;
   failures: { total: number };
+  /** Desglose de costo estimado por proveedor de IA/servicio */
+  costByProvider: Array<{ provider: string; cost_usd: number }>;
+  /** Cursos completados por dia en el periodo */
+  productionTrend: Array<{ date: string; count: number }>;
 }
 
 @Injectable()
@@ -165,7 +169,38 @@ export class AdminDashboardService {
 
     const totalCostUsd = parseFloat(totalCostStats?.totalCost ?? '0');
 
-    // ── 9. Ahorro vs. método tradicional ──────────────────────────────────────
+    // ── 9a. Costo por proveedor ───────────────────────────────────────────────
+    const costByProviderRaw = await this.eventRepo
+      .createQueryBuilder('e')
+      .select("COALESCE(e.ai_provider, 'otros')", 'provider')
+      .addSelect('COALESCE(SUM(e.estimated_cost_usd), 0)', 'cost_usd')
+      .where('e.created_at BETWEEN :from AND :to', { from, to })
+      .andWhere('e.estimated_cost_usd IS NOT NULL')
+      .groupBy('e.ai_provider')
+      .getRawMany<{ provider: string; cost_usd: string }>();
+
+    const costByProvider = costByProviderRaw.map(r => ({
+      provider: r.provider ?? 'otros',
+      cost_usd: parseFloat(r.cost_usd ?? '0'),
+    }));
+
+    // ── 9b. Produccion por dia ────────────────────────────────────────────────
+    const productionTrendRaw = await this.eventRepo
+      .createQueryBuilder('e')
+      .select('DATE(e.created_at)', 'date')
+      .addSelect('COUNT(*)', 'count')
+      .where('e.created_at BETWEEN :from AND :to', { from, to })
+      .andWhere("e.event_type = 'course_production_completed'")
+      .groupBy('DATE(e.created_at)')
+      .orderBy('DATE(e.created_at)', 'ASC')
+      .getRawMany<{ date: string; count: string }>();
+
+    const productionTrend = productionTrendRaw.map(r => ({
+      date:  r.date,
+      count: parseInt(r.count ?? '0', 10),
+    }));
+
+    // ── 10. Ahorro vs. método tradicional ────────────────────────────────────
     let traditionalEquivalentUsd = 0;
 
     const benchmarks = await this.benchmarkRepo.find({ where: { isActive: true } });
@@ -226,6 +261,8 @@ export class AdminDashboardService {
       failures: {
         total: failedEvents,
       },
+      costByProvider,
+      productionTrend,
     };
   }
 }
