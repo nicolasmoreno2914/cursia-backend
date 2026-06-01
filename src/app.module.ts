@@ -12,6 +12,7 @@ import { AdminModule } from './admin/admin.module';
 import { VideoEngineModule } from './video-engine/video-engine.module';
 import { TtsModule } from './tts/tts.module';
 import { ProductionJobsModule } from './modules/production-jobs/production-jobs.module';
+import { ArtifactsModule } from './modules/artifacts/artifacts.module';
 
 @Module({
   imports: [
@@ -24,6 +25,7 @@ import { ProductionJobsModule } from './modules/production-jobs/production-jobs.
     CoursesModule,
     CourseVersionsModule,
     ProductionJobsModule,
+    ArtifactsModule,
     YoutubeModule,
     EventsModule,
     AdminModule,
