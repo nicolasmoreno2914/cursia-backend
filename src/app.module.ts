@@ -11,6 +11,7 @@ import { EventsModule } from './events/events.module';
 import { AdminModule } from './admin/admin.module';
 import { VideoEngineModule } from './video-engine/video-engine.module';
 import { TtsModule } from './tts/tts.module';
+import { ProductionJobsModule } from './modules/production-jobs/production-jobs.module';
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { TtsModule } from './tts/tts.module';
     AuthModule,
     CoursesModule,
     CourseVersionsModule,
+    ProductionJobsModule,
     YoutubeModule,
     EventsModule,
     AdminModule,

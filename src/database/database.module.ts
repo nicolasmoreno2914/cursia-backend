@@ -7,6 +7,8 @@ import { YoutubeConnection } from '../youtube/entities/youtube-connection.entity
 import { UsageEvent } from '../events/entities/usage-event.entity';
 import { CostRate } from '../admin/entities/cost-rate.entity';
 import { TraditionalCostBenchmark } from '../admin/entities/traditional-cost-benchmark.entity';
+import { ProductionJob } from '../modules/production-jobs/entities/production-job.entity';
+import { ProductionStep } from '../modules/production-jobs/entities/production-step.entity';
 
 @Module({
   imports: [
@@ -20,7 +22,7 @@ import { TraditionalCostBenchmark } from '../admin/entities/traditional-cost-ben
         username: config.get<string>('DB_USER', 'postgres'),
         password: config.get<string>('DB_PASS', 'postgres'),
         database: config.get<string>('DB_NAME', 'orbia'),
-        entities: [Course, CourseVersion, YoutubeConnection, UsageEvent, CostRate, TraditionalCostBenchmark],
+        entities: [Course, CourseVersion, YoutubeConnection, UsageEvent, CostRate, TraditionalCostBenchmark, ProductionJob, ProductionStep],
         synchronize: config.get<string>('NODE_ENV', 'development') === 'development',
         logging: config.get<string>('DB_LOGGING', 'false') === 'true',
         ssl: config.get<string>('DB_SSL', 'false') === 'true'
