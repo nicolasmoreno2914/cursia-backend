@@ -56,18 +56,44 @@ export interface VideoWorkerDryRunSummary {
   message: string;
 }
 
+export interface VideogenJobEntry {
+  cap: number;
+  title: string;
+  jobId: string;
+  status: string;
+  clientReferenceId?: string | null;
+  downloadUrl?: string | null;
+  error?: string | null;
+  progress?: number | null;
+}
+
 export interface VideoWorkerSubmitSummary {
   phase: 'submitted';
   submittedAt: string;
   total: number;
   batchId?: string | null;
-  videogenJobs: Array<{
-    cap: number;
-    title: string;
-    jobId: string;
-    status: string;
-    clientReferenceId?: string | null;
-  }>;
+  videogenJobs: VideogenJobEntry[];
+}
+
+export interface VideoWorkerPollingSummary {
+  phase: 'polling';
+  batchId: string;
+  total: number;
+  completed: number;
+  failed: number;
+  pending: number;
+  videogenJobs: VideogenJobEntry[];
+  lastPolledAt: string;
+}
+
+export interface VideoWorkerVideogenCompletedSummary {
+  phase: 'videogen_completed';
+  batchId: string;
+  total: number;
+  completed: number;
+  failed: number;
+  videogenJobs: VideogenJobEntry[];
+  completedAt: string;
 }
 
 export interface ContentWorkerProgressSummary {
@@ -515,6 +541,129 @@ export class ProductionJobsService {
       status: 'running',
       progress: 20,
       detail: `Videos enviados a Videogen (${summary.total} jobs)`,
+    });
+
+    return true;
+  }
+
+  async claimNextBackendVideoPollingJob(
+    workerId: string,
+    leaseSeconds: number,
+  ): Promise<ProductionJob | null> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      const candidates = await queryRunner.query(
+        `
+          SELECT id
+          FROM production_jobs
+          WHERE execution_mode = 'backend_videos'
+            AND worker_status = 'running'
+            AND (lease_until IS NULL OR lease_until < NOW())
+            AND output_summary->>'phase' IN ('submitted', 'polling')
+          ORDER BY created_at ASC
+          LIMIT 1
+          FOR UPDATE SKIP LOCKED
+        `,
+      );
+
+      if (!Array.isArray(candidates) || candidates.length === 0) {
+        await queryRunner.commitTransaction();
+        return null;
+      }
+
+      const jobId = candidates[0].id;
+
+      await queryRunner.query(
+        `
+          UPDATE production_jobs
+          SET worker_id = $1,
+              claimed_at = NOW(),
+              lease_until = NOW() + ($2 * INTERVAL '1 second'),
+              attempt_count = COALESCE(attempt_count, 0) + 1,
+              updated_at = NOW()
+          WHERE id = $3
+        `,
+        [workerId, leaseSeconds, jobId],
+      );
+
+      await queryRunner.commitTransaction();
+
+      this.logger.log(`Worker ${workerId} re-claimed backend_videos polling job ${jobId}`);
+      return this.jobRepo.findOne({ where: { id: jobId }, relations: ['steps'] });
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async markVideoWorkerPolling(
+    jobId: string,
+    workerId: string,
+    summary: VideoWorkerPollingSummary,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    const total = summary.total > 0 ? summary.total : 1;
+    const completedRatio = Math.min(summary.completed, total) / total;
+    const progress = Math.max(20, Math.min(95, Math.round(20 + completedRatio * 75)));
+
+    job.status = 'running';
+    job.workerStatus = 'running';
+    job.currentStep = 'videos';
+    job.progress = progress;
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      ...summary,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.jobRepo.save(job);
+
+    await this.upsertVideoWorkerStep(jobId, {
+      status: 'running',
+      progress,
+      detail: `Generando videos en Videogen: ${summary.completed}/${summary.total} listos`,
+    });
+
+    return true;
+  }
+
+  async completeVideoWorkerVideogen(
+    jobId: string,
+    workerId: string,
+    summary: VideoWorkerVideogenCompletedSummary,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    const now = new Date();
+    job.status = 'completed';
+    job.workerStatus = 'completed';
+    job.currentStep = 'videos';
+    job.progress = 100;
+    job.finishedAt = now;
+    job.leaseUntil = null;
+    job.nextRetryAt = null;
+    job.errorMessage = null;
+    job.errorStep = null;
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      ...summary,
+      completedAt: now.toISOString(),
+    };
+    await this.jobRepo.save(job);
+
+    await this.upsertVideoWorkerStep(jobId, {
+      status: 'completed',
+      progress: 100,
+      finishedAt: now,
+      detail: `Videos completados en Videogen: ${summary.completed}/${summary.total}`,
+      error: null,
     });
 
     return true;
