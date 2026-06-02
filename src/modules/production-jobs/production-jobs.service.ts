@@ -1,6 +1,12 @@
-import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { ProductionJob } from './entities/production-job.entity';
 import { ProductionStep } from './entities/production-step.entity';
 import { CreateJobDto } from './dto/create-job.dto';
@@ -25,13 +31,24 @@ export interface ContentJobCreatedResponse {
   currentStep: string;
 }
 
+export interface ContentWorkerDryRunSummary {
+  phase: 'dry_run';
+  done: number;
+  total: number;
+  filesGenerated: number;
+  message: string;
+}
+
 @Injectable()
 export class ProductionJobsService {
+  private readonly logger = new Logger(ProductionJobsService.name);
+
   constructor(
     @InjectRepository(ProductionJob)
     private readonly jobRepo: Repository<ProductionJob>,
     @InjectRepository(ProductionStep)
     private readonly stepRepo: Repository<ProductionStep>,
+    private readonly dataSource: DataSource,
   ) {}
 
   private sanitizePayload<T>(value: T): T {
@@ -49,6 +66,56 @@ export class ProductionJobsService {
     }
 
     return value;
+  }
+
+  private getRetryBaseMs(): number {
+    const raw = Number(process.env.CONTENT_WORKER_RETRY_BASE_MS ?? 30000);
+    return Number.isFinite(raw) && raw > 0 ? raw : 30000;
+  }
+
+  private buildRetryDate(attemptCount: number): Date {
+    const baseMs = this.getRetryBaseMs();
+    const exponent = Math.max(0, attemptCount - 1);
+    const delayMs = baseMs * Math.pow(2, exponent);
+    return new Date(Date.now() + delayMs);
+  }
+
+  private appendOutputError(
+    outputSummary: Record<string, any> | null | undefined,
+    errorEntry: Record<string, any>,
+  ): Record<string, any> {
+    const summary = outputSummary && typeof outputSummary === 'object' ? { ...outputSummary } : {};
+    const errors = Array.isArray(summary.errors) ? [...summary.errors] : [];
+    errors.push(errorEntry);
+    summary.errors = errors;
+    return summary;
+  }
+
+  private async findJobForWorker(jobId: string, workerId: string): Promise<ProductionJob | null> {
+    const job = await this.jobRepo.findOne({ where: { id: jobId } });
+    if (!job) return null;
+    if (job.workerId !== workerId) return null;
+    return job;
+  }
+
+  private async upsertWorkerStep(
+    jobId: string,
+    dto: Partial<ProductionStep>,
+  ): Promise<ProductionStep> {
+    let step = await this.stepRepo.findOne({ where: { jobId, stepKey: 'content' } });
+    if (!step) {
+      step = this.stepRepo.create({ jobId, stepKey: 'content' });
+    }
+
+    if (dto.status !== undefined) step.status = dto.status;
+    if (dto.progress !== undefined) step.progress = dto.progress;
+    if (dto.startedAt !== undefined) step.startedAt = dto.startedAt;
+    if (dto.finishedAt !== undefined) step.finishedAt = dto.finishedAt;
+    if (dto.error !== undefined) step.error = dto.error;
+    if (dto.detail !== undefined) step.detail = dto.detail;
+    if (dto.retries !== undefined) step.retries = dto.retries;
+
+    return this.stepRepo.save(step);
   }
 
   // ── CREATE ──────────────────────────────────────────────────────────────────
@@ -182,6 +249,208 @@ export class ProductionJobsService {
       executionMode: saved.executionMode,
       currentStep: saved.currentStep,
     };
+  }
+
+  async claimNextBackendContentJob(
+    workerId: string,
+    leaseSeconds: number,
+  ): Promise<ProductionJob | null> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      const candidates = await queryRunner.query(
+        `
+          SELECT id
+          FROM production_jobs
+          WHERE execution_mode = 'backend_content'
+            AND worker_status IN ('queued', 'retrying')
+            AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+            AND (lease_until IS NULL OR lease_until < NOW())
+          ORDER BY created_at ASC
+          LIMIT 1
+          FOR UPDATE SKIP LOCKED
+        `,
+      );
+
+      if (!Array.isArray(candidates) || candidates.length === 0) {
+        await queryRunner.commitTransaction();
+        return null;
+      }
+
+      const jobId = candidates[0].id;
+
+      await queryRunner.query(
+        `
+          UPDATE production_jobs
+          SET worker_status = 'running',
+              status = 'running',
+              current_step = 'content',
+              worker_id = $1,
+              claimed_at = NOW(),
+              lease_until = NOW() + ($2 * INTERVAL '1 second'),
+              attempt_count = COALESCE(attempt_count, 0) + 1,
+              started_at = COALESCE(started_at, NOW()),
+              updated_at = NOW()
+          WHERE id = $3
+        `,
+        [workerId, leaseSeconds, jobId],
+      );
+
+      await queryRunner.commitTransaction();
+
+      this.logger.log(`Worker ${workerId} claimed backend_content job ${jobId}`);
+      return this.jobRepo.findOne({ where: { id: jobId }, relations: ['steps'] });
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async heartbeatWorkerJob(
+    jobId: string,
+    workerId: string,
+    leaseSeconds: number,
+  ): Promise<boolean> {
+    const result = await this.jobRepo
+      .createQueryBuilder()
+      .update(ProductionJob)
+      .set({
+        leaseUntil: () => `NOW() + (${Math.max(1, leaseSeconds)} * INTERVAL '1 second')`,
+      })
+      .where('id = :jobId', { jobId })
+      .andWhere('worker_id = :workerId', { workerId })
+      .andWhere('worker_status = :workerStatus', { workerStatus: 'running' })
+      .execute();
+
+    return (result.affected ?? 0) > 0;
+  }
+
+  async markContentWorkerRunning(jobId: string, workerId: string): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    job.status = 'running';
+    job.workerStatus = 'running';
+    job.currentStep = 'content';
+    job.startedAt = job.startedAt ?? new Date();
+    await this.jobRepo.save(job);
+
+    await this.upsertWorkerStep(jobId, {
+      status: 'running',
+      progress: 10,
+      startedAt: new Date(),
+      detail: 'Content worker running',
+    });
+
+    return true;
+  }
+
+  async completeContentWorkerDryRun(
+    jobId: string,
+    workerId: string,
+    summary: ContentWorkerDryRunSummary,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    const now = new Date();
+    job.status = 'completed';
+    job.workerStatus = 'completed';
+    job.currentStep = 'content';
+    job.progress = 100;
+    job.finishedAt = now;
+    job.leaseUntil = null;
+    job.nextRetryAt = null;
+    job.errorMessage = null;
+    job.errorStep = null;
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      ...summary,
+      completedAt: now.toISOString(),
+    };
+    await this.jobRepo.save(job);
+
+    await this.upsertWorkerStep(jobId, {
+      status: 'completed',
+      progress: 100,
+      finishedAt: now,
+      detail: summary.message,
+      error: null,
+    });
+
+    return true;
+  }
+
+  async failContentWorkerJob(
+    jobId: string,
+    workerId: string,
+    error: Error | string,
+    retryable: boolean,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    const message =
+      typeof error === 'string'
+        ? error
+        : error?.message || 'Unknown content worker error';
+    const now = new Date();
+    const attemptsRemaining = (job.attemptCount ?? 0) < (job.maxAttempts ?? 3);
+
+    const errorEntry = {
+      phase: 'worker',
+      message,
+      retryable,
+      attempt: job.attemptCount ?? 0,
+      workerId,
+      at: now.toISOString(),
+    };
+
+    job.currentStep = 'content';
+    job.progress = Math.max(0, job.progress ?? 0);
+    job.errorMessage = message;
+    job.errorStep = 'content';
+    job.outputSummary = this.appendOutputError(job.outputSummary, errorEntry);
+
+    if (retryable && attemptsRemaining) {
+      job.workerStatus = 'retrying';
+      job.status = 'retrying';
+      job.nextRetryAt = this.buildRetryDate(job.attemptCount ?? 0);
+      job.leaseUntil = null;
+      job.workerId = null;
+      job.retryCount = (job.retryCount ?? 0) + 1;
+      await this.jobRepo.save(job);
+
+      const existingStep = await this.stepRepo.findOne({ where: { jobId, stepKey: 'content' } });
+      await this.upsertWorkerStep(jobId, {
+        status: 'retrying',
+        progress: existingStep?.progress ?? 10,
+        detail: `Content worker retry scheduled: ${message}`,
+        error: message,
+        retries: (existingStep?.retries ?? 0) + 1,
+      });
+      return true;
+    }
+
+    job.workerStatus = retryable ? 'failed_recoverable' : 'failed';
+    job.status = retryable ? 'failed_recoverable' : 'failed';
+    job.finishedAt = now;
+    job.nextRetryAt = null;
+    job.leaseUntil = null;
+    await this.jobRepo.save(job);
+
+    await this.upsertWorkerStep(jobId, {
+      status: 'failed',
+      finishedAt: now,
+      detail: `Content worker failed: ${message}`,
+      error: message,
+    });
+
+    return true;
   }
 
   // ── FIND ALL ────────────────────────────────────────────────────────────────
