@@ -19,6 +19,7 @@ import {
   isJobCompleted,
   isJobFailed,
 } from '../video-engine/videogen.service';
+import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -253,6 +254,98 @@ interface VideogenBatchResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Video state snapshot builder
+// ─────────────────────────────────────────────────────────────────────────────
+
+function buildVideoStateSnapshot(
+  job:           ProductionJob,
+  outputSummary: Record<string, any>,
+  reason:        string,
+): Record<string, any> {
+  const generatedAt      = new Date().toISOString();
+  const effectiveCourseId =
+    job.frontendCourseId ?? (job.courseId != null ? String(job.courseId) : 'unknown-course');
+  const inputPayload     = (job.inputPayload ?? {}) as Record<string, any>;
+  const courseData       = (inputPayload.courseData ?? {}) as Record<string, any>;
+  const isMock           = String(outputSummary?.batchId ?? '').startsWith('mock_');
+
+  // Build per-cap media map  { "1": { jobId, title, status, downloadUrl, error, progress } }
+  const mediaVideos: Record<string, any> = {};
+  const videogenJobs: any[] = Array.isArray(outputSummary?.videogenJobs)
+    ? outputSummary.videogenJobs
+    : [];
+  for (const vj of videogenJobs) {
+    const key = String(vj?.cap ?? vj?.chapter_number ?? '?');
+    mediaVideos[key] = {
+      jobId:       vj?.jobId ?? null,
+      title:       vj?.title ?? null,
+      status:      vj?.status ?? null,
+      downloadUrl: vj?.downloadUrl ?? null,
+      error:       vj?.error ?? null,
+      progress:    vj?.progress ?? null,
+    };
+  }
+
+  const bodyStr    = JSON.stringify({ mediaVideos, videogenJobs });
+  const sizeBytes  = Buffer.byteLength(bodyStr);
+
+  return {
+    schemaVersion: '1.0',
+    type:          'video_state_snapshot',
+    generatedAt,
+    reason,
+    course: {
+      id:               effectiveCourseId,
+      backendCourseId:  job.courseId ?? null,
+      frontendCourseId: job.frontendCourseId ?? null,
+      nombre:           courseData.nombre ?? null,
+      sector:           courseData.sector ?? null,
+      nivel:            courseData.nivel ?? null,
+    },
+    videoEngine: {
+      batchId:      outputSummary?.batchId ?? null,
+      total:        outputSummary?.total ?? 0,
+      completed:    outputSummary?.completed ?? 0,
+      failed:       outputSummary?.failed ?? 0,
+      pending:      outputSummary?.pending ?? 0,
+      submittedAt:  outputSummary?.submittedAt ?? null,
+      videogenJobs,
+    },
+    media:  { videos: mediaVideos },
+    youtube: {},
+    h5p:     {},
+    production: {
+      jobId:            job.id,
+      status:           job.status,
+      currentStep:      job.currentStep ?? 'videos',
+      progress:         job.progress ?? 0,
+      startedAt:        job.startedAt?.toISOString?.() ?? null,
+      videosCompletedAt: generatedAt,
+      executionMode:    job.executionMode,
+      workerStatus:     job.workerStatus,
+    },
+    metadata: {
+      reason,
+      batchId:      outputSummary?.batchId ?? null,
+      total:        outputSummary?.total ?? 0,
+      completed:    outputSummary?.completed ?? 0,
+      failed:       outputSummary?.failed ?? 0,
+      isMock,
+      generatedAt,
+      jobId:        job.id,
+      currentStep:  'videos',
+      source:       'video_worker',
+      backendCourseId:  job.courseId ?? null,
+      frontendCourseId: job.frontendCourseId ?? null,
+      sizeEstimate: {
+        bytes: sizeBytes,
+        human: `${(sizeBytes / 1024).toFixed(1)} KB`,
+      },
+    },
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Bootstrap
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -262,8 +355,9 @@ async function bootstrap() {
     logger: ['log', 'warn', 'error'],
   });
 
-  const jobsService     = app.get(ProductionJobsService);
-  const videogenService = app.get(VideogenService);
+  const jobsService      = app.get(ProductionJobsService);
+  const videogenService  = app.get(VideogenService);
+  const artifactsService = app.get(ArtifactsService);
 
   const workerId           = process.env.VIDEO_WORKER_ID || `video-worker-${process.pid}`;
   const pollMs             = readPositiveInt('VIDEO_WORKER_POLL_MS', 3000);
@@ -289,6 +383,47 @@ async function bootstrap() {
     logger.warn('VIDEO_WORKER_ENABLED is not true — exiting');
     await app.close();
     process.exit(0);
+  }
+
+  // ── Snapshot upload helper ─────────────────────────────────────────────────
+
+  async function uploadVideoStateSnapshot(
+    job:           ProductionJob,
+    outputSummary: Record<string, any>,
+    reason:        string,
+  ): Promise<string | null> {
+    const effectiveCourseId =
+      job.frontendCourseId ?? (job.courseId != null ? String(job.courseId) : 'unknown-course');
+    const timestamp     = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename      = `video_state_snapshot_backend_${reason}_${timestamp}.json`;
+    const storagePath   = `${job.ownerId}/${effectiveCourseId}/videos/${filename}`;
+    const snapshot      = buildVideoStateSnapshot(job, outputSummary, reason);
+    const metadataObj   = snapshot.metadata ?? {};
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const artifact = await artifactsService.uploadJsonArtifact({
+          ownerId:     job.ownerId,
+          courseId:    effectiveCourseId,
+          jobId:       job.id,
+          type:        'video_state_snapshot',
+          filename,
+          storagePath,
+          payload:     snapshot,
+          mimeType:    'application/json',
+          metadata:    metadataObj,
+        });
+        logger.log(`Video state snapshot uploaded for job ${job.id}: artifactId=${artifact.id}`);
+        return artifact.id;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn(`Snapshot upload attempt ${attempt} failed for job ${job.id}: ${msg}`);
+        if (attempt < 2) await sleep(1500);
+      }
+    }
+
+    logger.error(`Video state snapshot upload failed after 2 attempts for job ${job.id}`);
+    return null;
   }
 
   let shuttingDown = false;
@@ -377,18 +512,43 @@ async function bootstrap() {
             logger.warn(`Job ${jobId} could not be marked complete — ownership changed`);
           } else {
             logger.log(`Job ${jobId} completed: all ${total} videos ready${mockVideogen ? ' [MOCK]' : ''}`);
+            // Upload snapshot
+            const artifactId = await uploadVideoStateSnapshot(
+              job,
+              { ...finalSummary, batchId },
+              'videogen_completed',
+            );
+            if (artifactId) {
+              await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
+            }
           }
         } else {
           // ── Partial or total failure ──────────────────────────────────────
           const errorDetails = failed
             .map(j => `cap${j.chapter_number}(${j.job_id}): ${j.error ?? 'unknown'}`)
             .join(', ');
-          const errorMsg = failed.length === total
+          const isTotal  = failed.length === total;
+          const reason   = isTotal ? 'all_failed' : 'partial_failure';
+          const errorMsg = isTotal
             ? `Videogen all videos failed: ${errorDetails}`
             : `Videogen partial failure: ${completed.length}/${total} completed, ${failed.length} failed. ${errorDetails}`;
 
           await jobsService.failVideoWorkerJob(jobId, workerId, errorMsg);
-          logger.error(`Job ${jobId} ${failed.length === total ? 'total' : 'partial'} failure: ${errorMsg}`);
+          logger.error(`Job ${jobId} ${isTotal ? 'total' : 'partial'} failure: ${errorMsg}`);
+
+          // Upload snapshot even on failure
+          const failSummary = {
+            batchId,
+            total,
+            completed: completed.length,
+            failed:    failed.length,
+            pending:   0,
+            videogenJobs: entries,
+          };
+          const artifactId = await uploadVideoStateSnapshot(job, failSummary, reason);
+          if (artifactId) {
+            await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
+          }
         }
         return;
       }
@@ -560,6 +720,20 @@ async function bootstrap() {
       if (leaseLost) { logger.warn(`Job ${jobId} ended after lease loss: ${message}`); return; }
       await jobsService.failVideoWorkerJob(jobId, workerId, message);
       logger.error(`Job ${jobId} failed: ${message}`);
+
+      // Upload snapshot for timeout / unexpected errors
+      try {
+        const currentSummary = (job.outputSummary ?? {}) as Record<string, any>;
+        const reason = message.toLowerCase().includes('timeout') ? 'timeout' : 'failed_recoverable';
+        const artifactId = await uploadVideoStateSnapshot(job, currentSummary, reason);
+        if (artifactId) {
+          await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
+        }
+      } catch (snapErr) {
+        logger.warn(
+          `Could not upload error snapshot for job ${jobId}: ${snapErr instanceof Error ? snapErr.message : String(snapErr)}`,
+        );
+      }
     } finally {
       finalized = true;
       clearInterval(heartbeatTimer);

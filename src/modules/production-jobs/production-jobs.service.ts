@@ -711,6 +711,26 @@ export class ProductionJobsService {
     return true;
   }
 
+  async saveVideoSnapshotArtifactId(
+    jobId: string,
+    artifactId: string,
+  ): Promise<boolean> {
+    const job = await this.jobRepo.findOne({ where: { id: jobId } });
+    if (!job) return false;
+
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      videoStateSnapshotArtifactId: artifactId,
+      artifactIds: {
+        ...((job.outputSummary?.artifactIds ?? {}) as Record<string, any>),
+        videoStateSnapshot: artifactId,
+      },
+    };
+    await this.jobRepo.save(job);
+    this.logger.log(`Saved videoStateSnapshotArtifactId=${artifactId} for job ${jobId}`);
+    return true;
+  }
+
   private async upsertVideoWorkerStep(
     jobId: string,
     dto: Partial<ProductionStep>,
