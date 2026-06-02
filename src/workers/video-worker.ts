@@ -15,9 +15,14 @@ import {
   VideogenService,
   VideogenVideoPayload,
   VideogenBatchJob,
+  VideogenBatchStatus,
   isJobCompleted,
   isJobFailed,
 } from '../video-engine/videogen.service';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -32,13 +37,16 @@ function isTrueEnv(envKey: string): boolean {
   return String(process.env[envKey] || '').toLowerCase() === 'true';
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Payload builder
+// ─────────────────────────────────────────────────────────────────────────────
+
 function buildVideogenPayload(job: ProductionJob, logger: Logger): VideogenVideoPayload[] {
-  const payload = (job.inputPayload ?? {}) as Record<string, any>;
+  const payload    = (job.inputPayload ?? {}) as Record<string, any>;
   const courseData = (payload.courseData ?? {}) as Record<string, any>;
-  const timestamp = Date.now();
+  const timestamp  = Date.now();
   const videos: VideogenVideoPayload[] = [];
 
-  // Extract from courseData.mods[].caps
   const mods: Array<Record<string, any>> = Array.isArray(courseData.mods) ? courseData.mods : [];
   if (mods.length > 0) {
     let capIndex = 1;
@@ -57,11 +65,10 @@ function buildVideogenPayload(job: ProductionJob, logger: Logger): VideogenVideo
     }
   }
 
-  // Fallback: direct caps array
   if (videos.length === 0 && Array.isArray(courseData.caps)) {
     const caps = courseData.caps as Array<any>;
     for (let i = 0; i < caps.length; i++) {
-      const cap = caps[i];
+      const cap   = caps[i];
       const title = cap?.t ?? cap?.title ?? cap?.n ?? `Capítulo ${i + 1}`;
       videos.push({
         title: String(title),
@@ -72,7 +79,6 @@ function buildVideogenPayload(job: ProductionJob, logger: Logger): VideogenVideo
     }
   }
 
-  // Final fallback: 2 mock chapters for QA
   if (videos.length === 0) {
     logger.warn(`Job ${job.id}: no chapters found in courseData, generating 2 mock chapters for QA`);
     for (let i = 1; i <= 2; i++) {
@@ -90,16 +96,165 @@ function buildVideogenPayload(job: ProductionJob, logger: Logger): VideogenVideo
 
 function batchJobToEntry(j: VideogenBatchJob, idx: number, titles: Map<string, string>): VideogenJobEntry {
   return {
-    cap: j.chapter_number || idx + 1,
-    title: titles.get(j.job_id) ?? `Capítulo ${j.chapter_number || idx + 1}`,
-    jobId: j.job_id,
-    status: j.status,
+    cap:              j.chapter_number || idx + 1,
+    title:            titles.get(j.job_id) ?? `Capítulo ${j.chapter_number || idx + 1}`,
+    jobId:            j.job_id,
+    status:           j.status,
     clientReferenceId: j.client_reference_id ?? null,
-    downloadUrl: j.download_url ?? null,
-    error: j.error ?? null,
-    progress: j.progress ?? null,
+    downloadUrl:      j.download_url ?? null,
+    error:            j.error ?? null,
+    progress:         j.progress ?? null,
   };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mock Videogen — in-memory state
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface MockBatchState {
+  pollCount:   number;
+  jobIds:      string[];
+  chapternums: number[];
+  clientRefs:  Array<string | null>;
+}
+
+const mockState = new Map<string, MockBatchState>();
+
+function mockBatchCreate(videos: VideogenVideoPayload[]): VideogenBatchResult {
+  const ts      = Date.now();
+  const batchId = `mock_batch_${ts}`;
+  const jobs: VideogenBatchJob[] = videos.map(v => ({
+    job_id:              `mock_job_cap${v.chapter_number}_${ts}`,
+    chapter_number:      v.chapter_number,
+    status:              'queued',
+    client_reference_id: v.client_reference_id,
+    download_url:        null,
+    error:               null,
+    progress:            null,
+  }));
+  mockState.set(batchId, {
+    pollCount:   0,
+    jobIds:      jobs.map(j => j.job_id),
+    chapternums: jobs.map(j => j.chapter_number),
+    clientRefs:  jobs.map(j => j.client_reference_id ?? null),
+  });
+  return { batch_id: batchId, jobs };
+}
+
+// Rehydrate mock state for re-claimed jobs (lease expired between sessions)
+function rehydrateMockState(batchId: string, videogenJobs: any[]): void {
+  mockState.set(batchId, {
+    pollCount:   0,
+    jobIds:      videogenJobs.map((j: any) => String(j.jobId ?? '')),
+    chapternums: videogenJobs.map((j: any) => Number(j.cap ?? 0)),
+    clientRefs:  videogenJobs.map((j: any) => j.clientReferenceId ?? null),
+  });
+}
+
+function mockGetBatchStatus(
+  batchId:          string,
+  scenario:         string,
+  mockTimeoutPolls: number,
+  logger:           Logger,
+): VideogenBatchStatus {
+  const state = mockState.get(batchId);
+  if (!state) {
+    throw new Error(`Mock: no state for batch ${batchId} — did re-hydration run?`);
+  }
+
+  state.pollCount += 1;
+  const { pollCount, jobIds, chapternums, clientRefs } = state;
+
+  logger.log(`Mock poll #${pollCount} for batch ${batchId} [scenario=${scenario}]`);
+
+  const makeJobs = (statusFn: (idx: number) => Partial<VideogenBatchJob>): VideogenBatchJob[] =>
+    jobIds.map((id, idx) => ({
+      job_id:              id,
+      chapter_number:      chapternums[idx] ?? idx + 1,
+      status:              'queued',
+      client_reference_id: clientRefs[idx] ?? null,
+      download_url:        null,
+      error:               null,
+      progress:            null,
+      ...statusFn(idx),
+    } as VideogenBatchJob));
+
+  switch (scenario) {
+    case 'success':
+      if (pollCount >= 3) {
+        return {
+          batch_id: batchId,
+          jobs: makeJobs((idx) => ({
+            status:       'completed',
+            progress:     100,
+            download_url: `https://mock-cdn.cursia.local/videos/cap${chapternums[idx]}_${jobIds[idx]}.mp4`,
+          })),
+        };
+      }
+      return {
+        batch_id: batchId,
+        jobs: makeJobs(() => ({ status: 'processing', progress: pollCount === 2 ? 85 : 30 })),
+      };
+
+    case 'partial_failure':
+      if (pollCount >= 3) {
+        return {
+          batch_id: batchId,
+          jobs: makeJobs((idx) =>
+            idx === 0
+              ? { status: 'completed', progress: 100, download_url: `https://mock-cdn.cursia.local/videos/cap${chapternums[idx]}_${jobIds[idx]}.mp4` }
+              : { status: 'failed', error: `Mock partial failure: rendering error on cap ${chapternums[idx]}` },
+          ),
+        };
+      }
+      return {
+        batch_id: batchId,
+        jobs: makeJobs(() => ({ status: 'processing', progress: pollCount === 2 ? 85 : 30 })),
+      };
+
+    case 'all_failed':
+      if (pollCount >= 2) {
+        return {
+          batch_id: batchId,
+          jobs: makeJobs((idx) => ({
+            status: 'failed',
+            error:  `Mock total failure: rendering crashed on cap ${chapternums[idx]}`,
+          })),
+        };
+      }
+      return {
+        batch_id: batchId,
+        jobs: makeJobs(() => ({ status: 'processing', progress: 30 })),
+      };
+
+    case 'timeout':
+      if (pollCount >= mockTimeoutPolls) {
+        throw new Error(
+          `Mock timeout: batch ${batchId} exceeded ${mockTimeoutPolls} polls without completing (scenario=timeout)`,
+        );
+      }
+      return {
+        batch_id: batchId,
+        jobs: makeJobs(() => ({ status: 'processing', progress: Math.min(30 + pollCount * 10, 90) })),
+      };
+
+    default:
+      return {
+        batch_id: batchId,
+        jobs: makeJobs(() => ({ status: 'processing', progress: 50 })),
+      };
+  }
+}
+
+// Needed for return type of mockBatchCreate
+interface VideogenBatchResult {
+  batch_id?: string | null;
+  jobs: VideogenBatchJob[];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bootstrap
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function bootstrap() {
   const logger = new Logger('VideoWorker');
@@ -107,18 +262,28 @@ async function bootstrap() {
     logger: ['log', 'warn', 'error'],
   });
 
-  const jobsService = app.get(ProductionJobsService);
+  const jobsService     = app.get(ProductionJobsService);
   const videogenService = app.get(VideogenService);
-  const workerId = process.env.VIDEO_WORKER_ID || `video-worker-${process.pid}`;
-  const pollMs              = readPositiveInt('VIDEO_WORKER_POLL_MS', 3000);
-  const concurrency         = readPositiveInt('VIDEO_WORKER_CONCURRENCY', 1);
-  const leaseSeconds        = readPositiveInt('VIDEO_WORKER_LEASE_SECONDS', 60);
-  const heartbeatMs         = readPositiveInt('VIDEO_WORKER_HEARTBEAT_MS', 15000);
-  const videogenPollMs      = readPositiveInt('VIDEO_WORKER_VIDEOGEN_POLL_MS', 15000);
-  const maxPollMinutes      = readPositiveInt('VIDEO_WORKER_MAX_POLL_MINUTES', 60);
-  const dryRun              = isTrueEnv('VIDEO_WORKER_DRY_RUN');
-  const realVideogenEnabled = isTrueEnv('VIDEO_WORKER_ENABLE_REAL_VIDEOGEN');
-  const workerEnabled       = isTrueEnv('VIDEO_WORKER_ENABLED');
+
+  const workerId           = process.env.VIDEO_WORKER_ID || `video-worker-${process.pid}`;
+  const pollMs             = readPositiveInt('VIDEO_WORKER_POLL_MS', 3000);
+  const concurrency        = readPositiveInt('VIDEO_WORKER_CONCURRENCY', 1);
+  const leaseSeconds       = readPositiveInt('VIDEO_WORKER_LEASE_SECONDS', 60);
+  const heartbeatMs        = readPositiveInt('VIDEO_WORKER_HEARTBEAT_MS', 15000);
+  const videogenPollMs     = readPositiveInt('VIDEO_WORKER_VIDEOGEN_POLL_MS', 15000);
+  const maxPollMinutes     = readPositiveInt('VIDEO_WORKER_MAX_POLL_MINUTES', 60);
+  const dryRun             = isTrueEnv('VIDEO_WORKER_DRY_RUN');
+  const realVideogenEnabled= isTrueEnv('VIDEO_WORKER_ENABLE_REAL_VIDEOGEN');
+  const workerEnabled      = isTrueEnv('VIDEO_WORKER_ENABLED');
+
+  // Mock mode
+  const mockVideogen    = isTrueEnv('VIDEO_WORKER_MOCK_VIDEOGEN');
+  const mockScenario    = (process.env.VIDEO_WORKER_MOCK_SCENARIO ?? 'success').trim();
+  const mockPollDelayMs = readPositiveInt('VIDEO_WORKER_MOCK_POLL_DELAY_MS', 800);
+  const mockTimeoutPolls= readPositiveInt('VIDEO_WORKER_MOCK_TIMEOUT_POLLS', 5);
+
+  // Effective poll delay: fast for mock, real for production
+  const effectivePollDelayMs = mockVideogen ? mockPollDelayMs : videogenPollMs;
 
   if (!workerEnabled) {
     logger.warn('VIDEO_WORKER_ENABLED is not true — exiting');
@@ -127,7 +292,7 @@ async function bootstrap() {
   }
 
   let shuttingDown = false;
-  let idlePolls = 0;
+  let idlePolls    = 0;
   const activeJobs = new Set<Promise<void>>();
 
   const shutdown = async (signal: string) => {
@@ -140,42 +305,48 @@ async function bootstrap() {
     process.exit(0);
   };
 
-  process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('SIGINT',  () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
   logger.log(
     `Video worker started (workerId=${workerId}, pollMs=${pollMs}, concurrency=${concurrency}, ` +
     `leaseSeconds=${leaseSeconds}, dryRun=${dryRun}, realVideogenEnabled=${realVideogenEnabled}, ` +
-    `videogenPollMs=${videogenPollMs}, maxPollMinutes=${maxPollMinutes})`,
+    `videogenPollMs=${videogenPollMs}, maxPollMinutes=${maxPollMinutes}, ` +
+    `mockVideogen=${mockVideogen}, mockScenario=${mockScenario})`,
   );
 
-  // ── Polling loop against Videogen ─────────────────────────────────────────
+  if (mockVideogen) {
+    logger.log(
+      `[MOCK MODE] Videogen calls are SIMULATED. scenario=${mockScenario}, ` +
+      `pollDelayMs=${mockPollDelayMs}, timeoutPolls=${mockTimeoutPolls}`,
+    );
+  }
+
+  // ── Polling loop ────────────────────────────────────────────────────────────
 
   async function pollUntilDone(
-    job: ProductionJob,
-    batchId: string,
-    titleMap: Map<string, string>,
+    job:          ProductionJob,
+    batchId:      string,
+    titleMap:     Map<string, string>,
     leaseLostRef: { value: boolean },
-    heartbeatRef: { count: number },
   ): Promise<void> {
-    const jobId = job.id;
-    const maxPollMs = maxPollMinutes * 60 * 1000;
-    const pollStartAt = Date.now();
+    const jobId        = job.id;
+    const maxPollMs    = maxPollMinutes * 60 * 1000;
+    const pollStartAt  = Date.now();
 
-    logger.log(`Starting Videogen polling for job ${jobId}, batch ${batchId}`);
+    logger.log(`Starting ${mockVideogen ? 'MOCK ' : ''}Videogen polling for job ${jobId}, batch ${batchId}`);
 
     while (!leaseLostRef.value && !shuttingDown) {
-      // Timeout guard
       if (Date.now() - pollStartAt > maxPollMs) {
-        throw new Error(
-          `Videogen polling timeout: exceeded ${maxPollMinutes} minutes for batch ${batchId}`,
-        );
+        throw new Error(`Videogen polling timeout: exceeded ${maxPollMinutes} minutes for batch ${batchId}`);
       }
 
-      // Poll batch status
-      const batchStatus = await videogenService.getBatchStatus(batchId);
-      const jobs = batchStatus.jobs;
+      // Get batch status — real or mock
+      const batchStatus: VideogenBatchStatus = mockVideogen
+        ? mockGetBatchStatus(batchId, mockScenario, mockTimeoutPolls, logger)
+        : await videogenService.getBatchStatus(batchId);
 
+      const jobs      = batchStatus.jobs;
       const completed = jobs.filter(j => isJobCompleted(j.status));
       const failed    = jobs.filter(j => isJobFailed(j.status));
       const pending   = jobs.filter(j => !isJobCompleted(j.status) && !isJobFailed(j.status));
@@ -188,67 +359,48 @@ async function bootstrap() {
 
       const entries = jobs.map((j, idx) => batchJobToEntry(j, idx, titleMap));
 
-      // All done (completed or failed)
-      const allSettled = pending.length === 0;
-
-      if (allSettled) {
+      if (pending.length === 0) {
+        // All settled
         if (failed.length === 0) {
-          // All completed successfully
+          // ── Full success ───────────────────────────────────────────────────
           const finalSummary: VideoWorkerVideogenCompletedSummary = {
-            phase: 'videogen_completed',
+            phase:        'videogen_completed',
             batchId,
             total,
-            completed: completed.length,
-            failed: 0,
+            completed:    completed.length,
+            failed:       0,
             videogenJobs: entries,
-            completedAt: new Date().toISOString(),
+            completedAt:  new Date().toISOString(),
           };
           const ok = await jobsService.completeVideoWorkerVideogen(jobId, workerId, finalSummary);
           if (!ok) {
             logger.warn(`Job ${jobId} could not be marked complete — ownership changed`);
           } else {
-            logger.log(`Job ${jobId} completed: all ${total} videos ready from Videogen`);
+            logger.log(`Job ${jobId} completed: all ${total} videos ready${mockVideogen ? ' [MOCK]' : ''}`);
           }
-          return;
         } else {
-          // Some failed
+          // ── Partial or total failure ──────────────────────────────────────
           const errorDetails = failed
             .map(j => `cap${j.chapter_number}(${j.job_id}): ${j.error ?? 'unknown'}`)
             .join(', ');
+          const errorMsg = failed.length === total
+            ? `Videogen all videos failed: ${errorDetails}`
+            : `Videogen partial failure: ${completed.length}/${total} completed, ${failed.length} failed. ${errorDetails}`;
 
-          const partialSummary: VideoWorkerVideogenCompletedSummary = {
-            phase: 'videogen_completed',
-            batchId,
-            total,
-            completed: completed.length,
-            failed: failed.length,
-            videogenJobs: entries,
-            completedAt: new Date().toISOString(),
-          };
-
-          if (completed.length > 0) {
-            // Partial success → failed_recoverable
-            const errorMsg = `Videogen partial failure: ${completed.length}/${total} completed, ${failed.length} failed. ${errorDetails}`;
-            await jobsService.failVideoWorkerJob(jobId, workerId, errorMsg);
-            logger.error(`Job ${jobId} partial failure: ${errorMsg}`);
-          } else {
-            // Total failure
-            const errorMsg = `Videogen all videos failed: ${errorDetails}`;
-            await jobsService.failVideoWorkerJob(jobId, workerId, errorMsg);
-            logger.error(`Job ${jobId} total failure: ${errorMsg}`);
-          }
-          return;
+          await jobsService.failVideoWorkerJob(jobId, workerId, errorMsg);
+          logger.error(`Job ${jobId} ${failed.length === total ? 'total' : 'partial'} failure: ${errorMsg}`);
         }
+        return;
       }
 
-      // Still processing — update DB and wait
+      // Still processing — persist polling state
       const pollingSummary: VideoWorkerPollingSummary = {
-        phase: 'polling',
+        phase:        'polling',
         batchId,
         total,
-        completed: completed.length,
-        failed: failed.length,
-        pending: pending.length,
+        completed:    completed.length,
+        failed:       failed.length,
+        pending:      pending.length,
         videogenJobs: entries,
         lastPolledAt: new Date().toISOString(),
       };
@@ -259,40 +411,34 @@ async function bootstrap() {
         return;
       }
 
-      logger.log(
-        `Job ${jobId} polling: ${completed.length}/${total} done, waiting ${videogenPollMs}ms`,
-      );
-      await sleep(videogenPollMs);
+      logger.log(`Job ${jobId} polling: ${completed.length}/${total} done, waiting ${effectivePollDelayMs}ms`);
+      await sleep(effectivePollDelayMs);
     }
   }
 
-  // ── Main job handler ───────────────────────────────────────────────────────
+  // ── Main job handler ────────────────────────────────────────────────────────
 
   async function handleJob(job: ProductionJob): Promise<void> {
-    const jobId = job.id;
-    let leaseLost = false;
-    let heartbeatCount = 0;
-    let finalized = false;
-    const leaseLostRef = { value: false };
+    const jobId         = job.id;
+    let leaseLost       = false;
+    let heartbeatCount  = 0;
+    let finalized       = false;
+    const leaseLostRef  = { value: false };
 
     const sendHeartbeat = async () => {
       if (finalized || leaseLost) return;
       try {
         const ok = await jobsService.heartbeatWorkerJob(jobId, workerId, leaseSeconds);
         if (!ok) {
-          leaseLost = true;
-          leaseLostRef.value = true;
+          leaseLost = leaseLostRef.value = true;
           logger.warn(`Lease lost for job ${jobId}; stopping processing`);
           return;
         }
         heartbeatCount += 1;
         logger.log(`Heartbeat ${heartbeatCount} for job ${jobId}`);
       } catch (error) {
-        leaseLost = true;
-        leaseLostRef.value = true;
-        logger.error(
-          `Heartbeat failed for job ${jobId}: ${error instanceof Error ? error.message : String(error)}`,
-        );
+        leaseLost = leaseLostRef.value = true;
+        logger.error(`Heartbeat failed for job ${jobId}: ${error instanceof Error ? error.message : String(error)}`);
       }
     };
 
@@ -309,46 +455,36 @@ async function bootstrap() {
       await sendHeartbeat();
       if (leaseLost) return;
 
-      // ── dry-run ────────────────────────────────────────────────────────────
+      // ── Dry-run ─────────────────────────────────────────────────────────────
       if (dryRun) {
         const waitMs = 2000 + Math.floor(Math.random() * 3000);
         logger.log(`Job ${jobId} running in dry-run mode for ${waitMs}ms`);
         await sleep(waitMs);
 
-        if (leaseLost) {
-          logger.warn(`Skipping completion for job ${jobId} because lease was lost`);
-          return;
-        }
+        if (leaseLost) { logger.warn(`Skipping completion for job ${jobId} — lease lost`); return; }
 
         const summary: VideoWorkerDryRunSummary = {
-          phase: 'dry_run',
-          done: 1,
-          total: 1,
-          message: 'Video worker dry-run completed',
+          phase:         'dry_run',
+          done:          1,
+          total:         1,
+          message:       'Video worker dry-run completed',
         };
-
         finalized = true;
-        const completed = await jobsService.completeVideoWorkerDryRun(jobId, workerId, summary);
-        if (!completed) {
-          logger.warn(`Job ${jobId} could not be completed because worker ownership changed`);
-        } else {
-          logger.log(`Dry-run completed for job ${jobId}`);
-        }
+        const ok = await jobsService.completeVideoWorkerDryRun(jobId, workerId, summary);
+        if (!ok) logger.warn(`Job ${jobId} could not be completed — worker ownership changed`);
+        else logger.log(`Dry-run completed for job ${jobId}`);
         return;
       }
 
       if (!realVideogenEnabled) {
-        throw new Error(
-          'Real Videogen submit is disabled. Set VIDEO_WORKER_ENABLE_REAL_VIDEOGEN=true and VIDEO_WORKER_DRY_RUN=false.',
-        );
+        throw new Error('Set VIDEO_WORKER_ENABLE_REAL_VIDEOGEN=true and VIDEO_WORKER_DRY_RUN=false.');
       }
 
-      // ── Detect phase: submit or polling ───────────────────────────────────
+      // ── Detect phase: submit or resume polling ──────────────────────────────
       const currentSummary = (job.outputSummary ?? {}) as Record<string, any>;
-      const currentPhase = currentSummary?.phase as string | undefined;
+      const currentPhase   = currentSummary?.phase as string | undefined;
       let batchId: string | null = currentSummary?.batchId ?? null;
 
-      // Build title map from existing videogenJobs for display
       const titleMap = new Map<string, string>();
       if (Array.isArray(currentSummary?.videogenJobs)) {
         for (const vj of currentSummary.videogenJobs as any[]) {
@@ -357,75 +493,71 @@ async function bootstrap() {
       }
 
       if (currentPhase === 'submitted' || currentPhase === 'polling') {
-        // Re-claimed after lease expiry — skip submit, go straight to polling
-        if (!batchId) {
-          throw new Error(`Job ${jobId} is in phase=${currentPhase} but has no batchId in output_summary`);
-        }
+        // Re-claimed job — skip submit, resume polling
+        if (!batchId) throw new Error(`Job ${jobId} in phase=${currentPhase} has no batchId`);
+
         logger.log(`Job ${jobId} re-claimed in phase=${currentPhase}, batchId=${batchId} — entering polling`);
+
+        // Re-hydrate mock state so it can pick up where it left off
+        if (mockVideogen && Array.isArray(currentSummary?.videogenJobs)) {
+          rehydrateMockState(batchId, currentSummary.videogenJobs as any[]);
+          logger.log(`[MOCK] Re-hydrated batch ${batchId} with ${currentSummary.videogenJobs.length} jobs`);
+        }
       } else {
-        // ── Submit phase ─────────────────────────────────────────────────────
+        // ── Submit phase ──────────────────────────────────────────────────────
         const videos = buildVideogenPayload(job, logger);
-        logger.log(`Submitting ${videos.length} videos to Videogen for job ${jobId}`);
+        logger.log(`${mockVideogen ? '[MOCK] ' : ''}Submitting ${videos.length} videos for job ${jobId}`);
 
-        const batchResult = await videogenService.batchCreate(videos);
+        const batchResult: VideogenBatchResult = mockVideogen
+          ? mockBatchCreate(videos)
+          : await videogenService.batchCreate(videos);
+
         batchId = batchResult.batch_id ?? null;
-
         logger.log(
-          `Videogen batch submitted for job ${jobId}: batch_id=${batchId ?? 'n/a'}, jobs=${batchResult.jobs.length}`,
+          `${mockVideogen ? '[MOCK] ' : ''}Batch submitted for job ${jobId}: ` +
+          `batch_id=${batchId ?? 'n/a'}, jobs=${batchResult.jobs.length}`,
         );
 
-        if (leaseLost) {
-          logger.warn(`Skipping submit persistence for job ${jobId} because lease was lost`);
-          return;
-        }
+        if (leaseLost) { logger.warn(`Skipping submit persistence for job ${jobId} — lease lost`); return; }
+        if (!batchId)  { throw new Error(`Videogen returned no batch_id for job ${jobId}`); }
 
-        if (!batchId) {
-          throw new Error(`Videogen returned no batch_id for job ${jobId}`);
-        }
-
-        // Build title map from submitted jobs
         batchResult.jobs.forEach((j, idx) => {
           titleMap.set(j.job_id, videos[idx]?.title ?? `Capítulo ${j.chapter_number || idx + 1}`);
         });
 
         const submitSummary: VideoWorkerSubmitSummary = {
-          phase: 'submitted',
+          phase:       'submitted',
           submittedAt: new Date().toISOString(),
-          total: batchResult.jobs.length,
+          total:       batchResult.jobs.length,
           batchId,
           videogenJobs: batchResult.jobs.map((j, idx) => ({
-            cap: j.chapter_number || idx + 1,
-            title: titleMap.get(j.job_id) ?? `Capítulo ${j.chapter_number || idx + 1}`,
-            jobId: j.job_id,
-            status: j.status,
+            cap:               j.chapter_number || idx + 1,
+            title:             titleMap.get(j.job_id) ?? `Capítulo ${j.chapter_number || idx + 1}`,
+            jobId:             j.job_id,
+            status:            j.status,
             clientReferenceId: j.client_reference_id ?? null,
-            downloadUrl: null,
-            error: null,
+            downloadUrl:       null,
+            error:             null,
           })),
         };
 
         const saved = await jobsService.markVideoWorkerSubmitted(jobId, workerId, submitSummary);
         if (!saved) {
-          logger.warn(`Job ${jobId} could not be marked submitted because worker ownership changed`);
+          logger.warn(`Job ${jobId} could not be marked submitted — worker ownership changed`);
           finalized = true;
           return;
         }
 
-        logger.log(`Job ${jobId} submitted to Videogen. Now entering polling...`);
+        logger.log(`Job ${jobId} submitted. Entering polling...`);
       }
 
-      // ── Polling phase ─────────────────────────────────────────────────────
-      await pollUntilDone(job, batchId!, titleMap, leaseLostRef, { count: heartbeatCount });
-
+      // ── Polling phase ──────────────────────────────────────────────────────
+      await pollUntilDone(job, batchId!, titleMap, leaseLostRef);
       finalized = true;
 
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (leaseLost) {
-        logger.warn(`Job ${jobId} ended after lease loss: ${message}`);
-        return;
-      }
-
+      if (leaseLost) { logger.warn(`Job ${jobId} ended after lease loss: ${message}`); return; }
       await jobsService.failVideoWorkerJob(jobId, workerId, message);
       logger.error(`Job ${jobId} failed: ${message}`);
     } finally {
@@ -434,18 +566,14 @@ async function bootstrap() {
     }
   }
 
-  // ── Main loop ──────────────────────────────────────────────────────────────
+  // ── Main loop ───────────────────────────────────────────────────────────────
 
   while (!shuttingDown) {
     while (!shuttingDown && activeJobs.size < concurrency) {
-      // First: try queued/retrying jobs (submit path)
       let claimed = await jobsService.claimNextBackendVideoJob(workerId, leaseSeconds);
-
-      // Second: try orphaned running jobs (polling path)
       if (!claimed) {
         claimed = await jobsService.claimNextBackendVideoPollingJob(workerId, leaseSeconds);
       }
-
       if (!claimed) break;
 
       idlePolls = 0;
@@ -457,9 +585,7 @@ async function bootstrap() {
             `Unhandled worker error for job ${claimed.id}: ${error instanceof Error ? error.message : String(error)}`,
           );
         })
-        .finally(() => {
-          activeJobs.delete(promise);
-        });
+        .finally(() => { activeJobs.delete(promise); });
 
       activeJobs.add(promise);
     }
