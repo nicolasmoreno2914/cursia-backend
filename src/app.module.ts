@@ -13,6 +13,7 @@ import { VideoEngineModule } from './video-engine/video-engine.module';
 import { TtsModule } from './tts/tts.module';
 import { ProductionJobsModule } from './modules/production-jobs/production-jobs.module';
 import { ArtifactsModule } from './modules/artifacts/artifacts.module';
+import { ContentGenerationModule } from './modules/content-generation/content-generation.module';
 
 @Module({
   imports: [
@@ -26,6 +27,7 @@ import { ArtifactsModule } from './modules/artifacts/artifacts.module';
     CourseVersionsModule,
     ProductionJobsModule,
     ArtifactsModule,
+    ContentGenerationModule,
     YoutubeModule,
     EventsModule,
     AdminModule,
