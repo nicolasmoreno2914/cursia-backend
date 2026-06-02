@@ -549,14 +549,17 @@ async function bootstrap() {
   // ── YouTube upload phase ────────────────────────────────────────────────────
 
   async function youtubeUploadPhase(
-    job:          ProductionJob,
-    leaseLostRef: { value: boolean },
+    job:              ProductionJob,
+    leaseLostRef:     { value: boolean },
+    inlineVideogenJobs?: VideogenJobEntry[],   // passed from current session (avoid stale outputSummary)
   ): Promise<void> {
     const jobId = job.id;
     const currentSummary = (job.outputSummary ?? {}) as Record<string, any>;
-    const videogenJobs: VideogenJobEntry[] = Array.isArray(currentSummary.videogenJobs)
-      ? currentSummary.videogenJobs
-      : [];
+    // Prefer inline (fresh from Videogen phase), fall back to persisted outputSummary (re-claim path)
+    const videogenJobs: VideogenJobEntry[] =
+      (inlineVideogenJobs && inlineVideogenJobs.length > 0)
+        ? inlineVideogenJobs
+        : (Array.isArray(currentSummary.videogenJobs) ? currentSummary.videogenJobs : []);
 
     if (leaseLostRef.value) return;
 
@@ -709,7 +712,7 @@ async function bootstrap() {
               logger.warn(`Job ${jobId} could not be marked videogen_done — ownership changed`);
             } else {
               logger.log(`Job ${jobId} Videogen done. Continuing to YouTube phase...`);
-              await youtubeUploadPhase(job, leaseLostRef);
+              await youtubeUploadPhase(job, leaseLostRef, finalSummary.videogenJobs);
             }
           } else {
             // No YouTube — mark fully completed
