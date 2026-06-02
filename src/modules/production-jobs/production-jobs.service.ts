@@ -96,6 +96,32 @@ export interface VideoWorkerVideogenCompletedSummary {
   completedAt: string;
 }
 
+export interface YoutubeUploadEntry {
+  cap: number;
+  title: string;
+  downloadUrl: string | null;
+  youtubeVideoId: string | null;
+  youtubeUrl: string | null;
+  status: 'uploaded' | 'failed' | 'skipped' | 'quota_exceeded' | 'auth_required';
+  error?: string | null;
+}
+
+export interface VideoWorkerYoutubeCompletedSummary {
+  phase: 'youtube_completed';
+  uploadedCount: number;
+  failedUploadCount: number;
+  youtubeUploads: YoutubeUploadEntry[];
+  completedAt: string;
+}
+
+export interface VideoWorkerYoutubeBlockedSummary {
+  phase: 'blocked_quota' | 'blocked_auth';
+  reason: string;
+  detail: string;
+  youtubeUploads: YoutubeUploadEntry[];
+  blockedAt: string;
+}
+
 export interface ContentWorkerProgressSummary {
   phase: string;
   done: number;
@@ -562,7 +588,7 @@ export class ProductionJobsService {
           WHERE execution_mode = 'backend_videos'
             AND worker_status = 'running'
             AND (lease_until IS NULL OR lease_until < NOW())
-            AND output_summary->>'phase' IN ('submitted', 'polling')
+            AND output_summary->>'phase' IN ('submitted', 'polling', 'videogen_completed')
           ORDER BY created_at ASC
           LIMIT 1
           FOR UPDATE SKIP LOCKED
@@ -706,6 +732,130 @@ export class ProductionJobsService {
       finishedAt: now,
       detail: `Video worker failed: ${message}`,
       error: message,
+    });
+
+    return true;
+  }
+
+  async markVideogenDoneForYoutube(
+    jobId: string,
+    workerId: string,
+    summary: VideoWorkerVideogenCompletedSummary,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    job.status = 'running';
+    job.workerStatus = 'running';
+    job.currentStep = 'videos';
+    job.progress = 95;
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      ...summary,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.jobRepo.save(job);
+
+    await this.upsertVideoWorkerStep(jobId, {
+      status: 'running',
+      progress: 95,
+      detail: `Videogen completado (${summary.completed}/${summary.total}). Iniciando YouTube upload...`,
+    });
+
+    return true;
+  }
+
+  async markVideoWorkerYoutubeUploading(
+    jobId: string,
+    workerId: string,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    job.status = 'running';
+    job.workerStatus = 'running';
+    job.currentStep = 'videos';
+    job.progress = 96;
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      youtubePhase: 'uploading',
+      updatedAt: new Date().toISOString(),
+    };
+    await this.jobRepo.save(job);
+
+    await this.upsertVideoWorkerStep(jobId, {
+      status: 'running',
+      progress: 96,
+      detail: 'Subiendo videos a YouTube...',
+    });
+
+    return true;
+  }
+
+  async completeVideoWorkerYoutube(
+    jobId: string,
+    workerId: string,
+    summary: VideoWorkerYoutubeCompletedSummary,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    const now = new Date();
+    job.status = 'completed';
+    job.workerStatus = 'completed';
+    job.currentStep = 'videos';
+    job.progress = 100;
+    job.finishedAt = now;
+    job.leaseUntil = null;
+    job.nextRetryAt = null;
+    job.errorMessage = null;
+    job.errorStep = null;
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      ...summary,
+      completedAt: now.toISOString(),
+    };
+    await this.jobRepo.save(job);
+
+    await this.upsertVideoWorkerStep(jobId, {
+      status: 'completed',
+      progress: 100,
+      finishedAt: now,
+      detail: `YouTube upload completado: ${summary.uploadedCount} videos subidos`,
+      error: null,
+    });
+
+    return true;
+  }
+
+  async blockVideoWorkerYoutube(
+    jobId: string,
+    workerId: string,
+    summary: VideoWorkerYoutubeBlockedSummary,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    const now = new Date();
+    const newStatus = summary.phase === 'blocked_quota' ? 'failed_recoverable' : 'failed_recoverable';
+    job.status = newStatus;
+    job.workerStatus = newStatus;
+    job.currentStep = 'videos';
+    job.errorMessage = summary.detail;
+    job.errorStep = 'videos';
+    job.leaseUntil = null;
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      ...summary,
+      updatedAt: now.toISOString(),
+    };
+    await this.jobRepo.save(job);
+
+    await this.upsertVideoWorkerStep(jobId, {
+      status: 'failed',
+      finishedAt: now,
+      detail: summary.detail,
+      error: summary.reason,
     });
 
     return true;

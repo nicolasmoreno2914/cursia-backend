@@ -8,6 +8,9 @@ import {
   VideoWorkerSubmitSummary,
   VideoWorkerPollingSummary,
   VideoWorkerVideogenCompletedSummary,
+  VideoWorkerYoutubeCompletedSummary,
+  VideoWorkerYoutubeBlockedSummary,
+  YoutubeUploadEntry,
   VideogenJobEntry,
 } from '../modules/production-jobs/production-jobs.service';
 import { ProductionJob } from '../modules/production-jobs/entities/production-job.entity';
@@ -254,6 +257,80 @@ interface VideogenBatchResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Mock YouTube upload
+// ─────────────────────────────────────────────────────────────────────────────
+
+function mockYoutubeUploads(
+  videogenJobs: VideogenJobEntry[],
+  scenario: string,
+): YoutubeUploadEntry[] {
+  const ts = Date.now();
+  // Only attempt upload for jobs with a downloadUrl
+  const uploadable = videogenJobs.filter(j => j.downloadUrl);
+
+  const makeEntry = (
+    j: VideogenJobEntry,
+    idx: number,
+    overrides: Partial<YoutubeUploadEntry>,
+  ): YoutubeUploadEntry => ({
+    cap:            j.cap,
+    title:          j.title,
+    downloadUrl:    j.downloadUrl,
+    youtubeVideoId: null,
+    youtubeUrl:     null,
+    status:         'failed',
+    error:          null,
+    ...overrides,
+  });
+
+  switch (scenario) {
+    case 'success':
+      return uploadable.map((j, idx) => makeEntry(j, idx, {
+        youtubeVideoId: `mock_yt_cap${j.cap}_${ts}`,
+        youtubeUrl:     `https://youtube.com/watch?v=mock_cap${j.cap}_${ts}`,
+        status:         'uploaded',
+      }));
+
+    case 'partial_failure':
+      return uploadable.map((j, idx) => idx === 0
+        ? makeEntry(j, idx, {
+            youtubeVideoId: `mock_yt_cap${j.cap}_${ts}`,
+            youtubeUrl:     `https://youtube.com/watch?v=mock_cap${j.cap}_${ts}`,
+            status:         'uploaded',
+          })
+        : makeEntry(j, idx, {
+            status: 'failed',
+            error:  `Mock upload failed for cap ${j.cap}: network timeout`,
+          }),
+      );
+
+    case 'all_failed':
+      return uploadable.map((j, idx) => makeEntry(j, idx, {
+        status: 'failed',
+        error:  `Mock upload failed for cap ${j.cap}: file processing error`,
+      }));
+
+    case 'quota_exceeded':
+      return uploadable.map((j, idx) => makeEntry(j, idx, {
+        status: 'quota_exceeded',
+        error:  'YouTube quota exceeded: daily upload limit reached',
+      }));
+
+    case 'auth_required':
+      return uploadable.map((j, idx) => makeEntry(j, idx, {
+        status: 'auth_required',
+        error:  'YouTube auth required: OAuth token expired or missing',
+      }));
+
+    default:
+      return uploadable.map((j, idx) => makeEntry(j, idx, {
+        status: 'failed',
+        error:  `Unknown YouTube mock scenario: ${scenario}`,
+      }));
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Video state snapshot builder
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -312,7 +389,12 @@ function buildVideoStateSnapshot(
       videogenJobs,
     },
     media:  { videos: mediaVideos },
-    youtube: {},
+    youtube: {
+      uploads:       outputSummary?.youtubeUploads ?? [],
+      uploadedCount: outputSummary?.uploadedCount ?? 0,
+      failedCount:   outputSummary?.failedUploadCount ?? 0,
+      phase:         outputSummary?.youtubePhase ?? null,
+    },
     h5p:     {},
     production: {
       jobId:            job.id,
@@ -370,11 +452,17 @@ async function bootstrap() {
   const realVideogenEnabled= isTrueEnv('VIDEO_WORKER_ENABLE_REAL_VIDEOGEN');
   const workerEnabled      = isTrueEnv('VIDEO_WORKER_ENABLED');
 
-  // Mock mode
+  // Mock Videogen mode
   const mockVideogen    = isTrueEnv('VIDEO_WORKER_MOCK_VIDEOGEN');
   const mockScenario    = (process.env.VIDEO_WORKER_MOCK_SCENARIO ?? 'success').trim();
   const mockPollDelayMs = readPositiveInt('VIDEO_WORKER_MOCK_POLL_DELAY_MS', 800);
   const mockTimeoutPolls= readPositiveInt('VIDEO_WORKER_MOCK_TIMEOUT_POLLS', 5);
+
+  // YouTube upload mode
+  const youtubeEnabled    = isTrueEnv('YOUTUBE_UPLOAD_ENABLED');
+  const youtubeMock       = isTrueEnv('YOUTUBE_UPLOAD_MOCK');
+  const youtubeScenario   = (process.env.YOUTUBE_UPLOAD_MOCK_SCENARIO ?? 'success').trim();
+  const youtubeMockDelayMs= readPositiveInt('YOUTUBE_UPLOAD_MOCK_DELAY_MS', 500);
 
   // Effective poll delay: fast for mock, real for production
   const effectivePollDelayMs = mockVideogen ? mockPollDelayMs : videogenPollMs;
@@ -447,7 +535,8 @@ async function bootstrap() {
     `Video worker started (workerId=${workerId}, pollMs=${pollMs}, concurrency=${concurrency}, ` +
     `leaseSeconds=${leaseSeconds}, dryRun=${dryRun}, realVideogenEnabled=${realVideogenEnabled}, ` +
     `videogenPollMs=${videogenPollMs}, maxPollMinutes=${maxPollMinutes}, ` +
-    `mockVideogen=${mockVideogen}, mockScenario=${mockScenario})`,
+    `mockVideogen=${mockVideogen}, mockScenario=${mockScenario}, ` +
+    `youtubeEnabled=${youtubeEnabled}, youtubeMock=${youtubeMock}, youtubeScenario=${youtubeScenario})`,
   );
 
   if (mockVideogen) {
@@ -455,6 +544,112 @@ async function bootstrap() {
       `[MOCK MODE] Videogen calls are SIMULATED. scenario=${mockScenario}, ` +
       `pollDelayMs=${mockPollDelayMs}, timeoutPolls=${mockTimeoutPolls}`,
     );
+  }
+
+  // ── YouTube upload phase ────────────────────────────────────────────────────
+
+  async function youtubeUploadPhase(
+    job:          ProductionJob,
+    leaseLostRef: { value: boolean },
+  ): Promise<void> {
+    const jobId = job.id;
+    const currentSummary = (job.outputSummary ?? {}) as Record<string, any>;
+    const videogenJobs: VideogenJobEntry[] = Array.isArray(currentSummary.videogenJobs)
+      ? currentSummary.videogenJobs
+      : [];
+
+    if (leaseLostRef.value) return;
+
+    await jobsService.markVideoWorkerYoutubeUploading(jobId, workerId);
+    logger.log(`${youtubeMock ? '[MOCK] ' : ''}Starting YouTube upload for job ${jobId}: ${videogenJobs.filter(j => j.downloadUrl).length} videos`);
+
+    if (!youtubeMock) {
+      throw new Error('Real YouTube upload not implemented yet. Set YOUTUBE_UPLOAD_MOCK=true.');
+    }
+
+    // Simulate upload delay
+    await sleep(youtubeMockDelayMs);
+    if (leaseLostRef.value) return;
+
+    const uploads = mockYoutubeUploads(videogenJobs, youtubeScenario);
+    const uploadedCount    = uploads.filter(u => u.status === 'uploaded').length;
+    const failedCount      = uploads.filter(u => u.status === 'failed').length;
+    const quotaExceeded    = uploads.some(u => u.status === 'quota_exceeded');
+    const authRequired     = uploads.some(u => u.status === 'auth_required');
+
+    logger.log(
+      `[MOCK] YouTube upload result for job ${jobId}: ` +
+      `uploaded=${uploadedCount}, failed=${failedCount}, ` +
+      `quotaExceeded=${quotaExceeded}, authRequired=${authRequired}`,
+    );
+
+    if (quotaExceeded) {
+      const blocked: VideoWorkerYoutubeBlockedSummary = {
+        phase:          'blocked_quota',
+        reason:         'quota_exceeded',
+        detail:         'YouTube daily upload quota exceeded. Job will retry when quota resets.',
+        youtubeUploads: uploads,
+        blockedAt:      new Date().toISOString(),
+      };
+      await jobsService.blockVideoWorkerYoutube(jobId, workerId, blocked);
+      logger.warn(`Job ${jobId} blocked: YouTube quota exceeded`);
+
+      const snapshotSummary = { ...((job.outputSummary ?? {}) as Record<string, any>), ...blocked };
+      const artifactId = await uploadVideoStateSnapshot(job, snapshotSummary, 'blocked_quota');
+      if (artifactId) await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
+      return;
+    }
+
+    if (authRequired) {
+      const blocked: VideoWorkerYoutubeBlockedSummary = {
+        phase:          'blocked_auth',
+        reason:         'auth_required',
+        detail:         'YouTube OAuth token expired or missing. Re-authorize to continue.',
+        youtubeUploads: uploads,
+        blockedAt:      new Date().toISOString(),
+      };
+      await jobsService.blockVideoWorkerYoutube(jobId, workerId, blocked);
+      logger.warn(`Job ${jobId} blocked: YouTube auth required`);
+
+      const snapshotSummary = { ...((job.outputSummary ?? {}) as Record<string, any>), ...blocked };
+      const artifactId = await uploadVideoStateSnapshot(job, snapshotSummary, 'blocked_auth');
+      if (artifactId) await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
+      return;
+    }
+
+    if (uploadedCount === 0) {
+      const errorMsg = `All YouTube uploads failed: ${uploads.map(u => u.error).join(', ')}`;
+      await jobsService.failVideoWorkerJob(jobId, workerId, errorMsg);
+      logger.error(`Job ${jobId} YouTube all failed: ${errorMsg}`);
+
+      const snapshotSummary = {
+        ...((job.outputSummary ?? {}) as Record<string, any>),
+        youtubeUploads: uploads,
+        uploadedCount: 0,
+        failedUploadCount: failedCount,
+      };
+      const artifactId = await uploadVideoStateSnapshot(job, snapshotSummary, 'all_failed');
+      if (artifactId) await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
+      return;
+    }
+
+    const completedSummary: VideoWorkerYoutubeCompletedSummary = {
+      phase:             'youtube_completed',
+      uploadedCount,
+      failedUploadCount: failedCount,
+      youtubeUploads:    uploads,
+      completedAt:       new Date().toISOString(),
+    };
+
+    await jobsService.completeVideoWorkerYoutube(jobId, workerId, completedSummary);
+    logger.log(`Job ${jobId} YouTube phase complete: ${uploadedCount}/${uploads.length} uploaded${youtubeMock ? ' [MOCK]' : ''}`);
+
+    const snapshotSummary = {
+      ...((job.outputSummary ?? {}) as Record<string, any>),
+      ...completedSummary,
+    };
+    const artifactId = await uploadVideoStateSnapshot(job, snapshotSummary, 'youtube_completed');
+    if (artifactId) await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
   }
 
   // ── Polling loop ────────────────────────────────────────────────────────────
@@ -507,19 +702,26 @@ async function bootstrap() {
             videogenJobs: entries,
             completedAt:  new Date().toISOString(),
           };
-          const ok = await jobsService.completeVideoWorkerVideogen(jobId, workerId, finalSummary);
-          if (!ok) {
-            logger.warn(`Job ${jobId} could not be marked complete — ownership changed`);
+          if (youtubeEnabled) {
+            // Keep job running — pass to YouTube phase
+            const markedDone = await jobsService.markVideogenDoneForYoutube(jobId, workerId, finalSummary);
+            if (!markedDone) {
+              logger.warn(`Job ${jobId} could not be marked videogen_done — ownership changed`);
+            } else {
+              logger.log(`Job ${jobId} Videogen done. Continuing to YouTube phase...`);
+              await youtubeUploadPhase(job, leaseLostRef);
+            }
           } else {
-            logger.log(`Job ${jobId} completed: all ${total} videos ready${mockVideogen ? ' [MOCK]' : ''}`);
-            // Upload snapshot
-            const artifactId = await uploadVideoStateSnapshot(
-              job,
-              { ...finalSummary, batchId },
-              'videogen_completed',
-            );
-            if (artifactId) {
-              await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
+            // No YouTube — mark fully completed
+            const ok = await jobsService.completeVideoWorkerVideogen(jobId, workerId, finalSummary);
+            if (!ok) {
+              logger.warn(`Job ${jobId} could not be marked complete — ownership changed`);
+            } else {
+              logger.log(`Job ${jobId} completed: all ${total} videos ready${mockVideogen ? ' [MOCK]' : ''}`);
+              const artifactId = await uploadVideoStateSnapshot(
+                job, { ...finalSummary, batchId }, 'videogen_completed',
+              );
+              if (artifactId) await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
             }
           }
         } else {
@@ -652,8 +854,17 @@ async function bootstrap() {
         }
       }
 
-      if (currentPhase === 'submitted' || currentPhase === 'polling') {
-        // Re-claimed job — skip submit, resume polling
+      if (currentPhase === 'videogen_completed') {
+        // Re-claimed after lease expiry — Videogen done, go to YouTube
+        if (!youtubeEnabled) {
+          throw new Error(`Job ${jobId} in phase=videogen_completed but YOUTUBE_UPLOAD_ENABLED=false`);
+        }
+        logger.log(`Job ${jobId} re-claimed in phase=videogen_completed — entering YouTube upload`);
+        await youtubeUploadPhase(job, leaseLostRef);
+        finalized = true;
+        return;
+      } else if (currentPhase === 'submitted' || currentPhase === 'polling') {
+        // Re-claimed after lease expiry — skip submit, resume Videogen polling
         if (!batchId) throw new Error(`Job ${jobId} in phase=${currentPhase} has no batchId`);
 
         logger.log(`Job ${jobId} re-claimed in phase=${currentPhase}, batchId=${batchId} — entering polling`);
