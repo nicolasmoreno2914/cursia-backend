@@ -5,8 +5,13 @@ import { AppModule } from '../app.module';
 import {
   ProductionJobsService,
   VideoWorkerDryRunSummary,
+  VideoWorkerSubmitSummary,
 } from '../modules/production-jobs/production-jobs.service';
 import { ProductionJob } from '../modules/production-jobs/entities/production-job.entity';
+import {
+  VideogenService,
+  VideogenVideoPayload,
+} from '../video-engine/videogen.service';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -21,6 +26,63 @@ function isTrueEnv(envKey: string): boolean {
   return String(process.env[envKey] || '').toLowerCase() === 'true';
 }
 
+function buildVideogenPayload(job: ProductionJob, logger: Logger): VideogenVideoPayload[] {
+  const payload = (job.inputPayload ?? {}) as Record<string, any>;
+  const courseData = (payload.courseData ?? {}) as Record<string, any>;
+  const timestamp = Date.now();
+
+  // Try to extract chapters from courseData.mods (array of modules with caps)
+  const mods: Array<Record<string, any>> = Array.isArray(courseData.mods) ? courseData.mods : [];
+  const videos: VideogenVideoPayload[] = [];
+
+  if (mods.length > 0) {
+    let capIndex = 1;
+    for (const mod of mods) {
+      const caps: string[] = Array.isArray(mod.caps) ? mod.caps : [];
+      for (const cap of caps) {
+        const title = typeof cap === 'string' ? cap : `Capítulo ${capIndex}`;
+        videos.push({
+          title,
+          content_txt: title + '. ' + (courseData.nombre ?? 'Curso Cursia') + '.',
+          chapter_number: capIndex,
+          client_reference_id: `cursia_capitulo_${capIndex}_${timestamp}`,
+        });
+        capIndex += 1;
+      }
+    }
+  }
+
+  // Fallback: direct caps array
+  if (videos.length === 0 && Array.isArray(courseData.caps)) {
+    const caps = courseData.caps as Array<any>;
+    for (let i = 0; i < caps.length; i++) {
+      const cap = caps[i];
+      const title = cap?.t ?? cap?.title ?? cap?.n ?? `Capítulo ${i + 1}`;
+      videos.push({
+        title: String(title),
+        content_txt: String(title) + '. ' + (courseData.nombre ?? 'Curso Cursia') + '.',
+        chapter_number: i + 1,
+        client_reference_id: `cursia_capitulo_${i + 1}_${timestamp}`,
+      });
+    }
+  }
+
+  // Final fallback: generate 2 mock chapters for QA
+  if (videos.length === 0) {
+    logger.warn(`Job ${job.id}: no chapters found in courseData, generating 2 mock chapters for QA`);
+    for (let i = 1; i <= 2; i++) {
+      videos.push({
+        title: `Capítulo ${i} — ${courseData.nombre ?? 'Curso QA'}`,
+        content_txt: `Capítulo ${i} del curso ${courseData.nombre ?? 'Curso QA'}.`,
+        chapter_number: i,
+        client_reference_id: `cursia_qa_cap${i}_${timestamp}`,
+      });
+    }
+  }
+
+  return videos;
+}
+
 async function bootstrap() {
   const logger = new Logger('VideoWorker');
   const app = await NestFactory.createApplicationContext(AppModule, {
@@ -28,12 +90,14 @@ async function bootstrap() {
   });
 
   const jobsService = app.get(ProductionJobsService);
+  const videogenService = app.get(VideogenService);
   const workerId = process.env.VIDEO_WORKER_ID || `video-worker-${process.pid}`;
   const pollMs = readPositiveInt('VIDEO_WORKER_POLL_MS', 3000);
   const concurrency = readPositiveInt('VIDEO_WORKER_CONCURRENCY', 1);
   const leaseSeconds = readPositiveInt('VIDEO_WORKER_LEASE_SECONDS', 60);
   const heartbeatMs = readPositiveInt('VIDEO_WORKER_HEARTBEAT_MS', 15000);
   const dryRun = isTrueEnv('VIDEO_WORKER_DRY_RUN');
+  const realVideogenEnabled = isTrueEnv('VIDEO_WORKER_ENABLE_REAL_VIDEOGEN');
   const workerEnabled = isTrueEnv('VIDEO_WORKER_ENABLED');
 
   if (!workerEnabled) {
@@ -60,7 +124,7 @@ async function bootstrap() {
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
   logger.log(
-    `Video worker started (workerId=${workerId}, pollMs=${pollMs}, concurrency=${concurrency}, leaseSeconds=${leaseSeconds}, dryRun=${dryRun})`,
+    `Video worker started (workerId=${workerId}, pollMs=${pollMs}, concurrency=${concurrency}, leaseSeconds=${leaseSeconds}, dryRun=${dryRun}, realVideogenEnabled=${realVideogenEnabled})`,
   );
 
   async function handleJob(job: ProductionJob): Promise<void> {
@@ -131,9 +195,49 @@ async function bootstrap() {
         return;
       }
 
-      throw new Error(
-        'Real video generation is not yet implemented. Set VIDEO_WORKER_DRY_RUN=true to test.',
+      if (!realVideogenEnabled) {
+        throw new Error(
+          'Real Videogen submit is disabled. Set VIDEO_WORKER_ENABLE_REAL_VIDEOGEN=true and VIDEO_WORKER_DRY_RUN=false.',
+        );
+      }
+
+      const videos = buildVideogenPayload(job, logger);
+      logger.log(`Submitting ${videos.length} videos to Videogen for job ${jobId}`);
+
+      const batchResult = await videogenService.batchCreate(videos);
+      logger.log(
+        `Videogen batch submitted for job ${jobId}: batch_id=${batchResult.batch_id ?? 'n/a'}, jobs=${batchResult.jobs.length}`,
       );
+
+      if (leaseLost) {
+        logger.warn(`Skipping submit persistence for job ${jobId} because lease was lost`);
+        return;
+      }
+
+      const submitSummary: VideoWorkerSubmitSummary = {
+        phase: 'submitted',
+        submittedAt: new Date().toISOString(),
+        total: batchResult.jobs.length,
+        batchId: batchResult.batch_id ?? null,
+        videogenJobs: batchResult.jobs.map((j, idx) => ({
+          cap: j.chapter_number || idx + 1,
+          title: videos[idx]?.title ?? `Capítulo ${j.chapter_number || idx + 1}`,
+          jobId: j.job_id,
+          status: j.status,
+          clientReferenceId: j.client_reference_id ?? null,
+        })),
+      };
+
+      const saved = await jobsService.markVideoWorkerSubmitted(jobId, workerId, submitSummary);
+      if (!saved) {
+        logger.warn(`Job ${jobId} could not be marked submitted because worker ownership changed`);
+        finalized = true;
+        return;
+      }
+
+      // Job stays running — polling not yet implemented
+      finalized = true;
+      logger.log(`Job ${jobId} marked as submitted to Videogen. Polling not yet implemented.`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (leaseLost) {

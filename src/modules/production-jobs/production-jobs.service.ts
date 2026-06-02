@@ -56,6 +56,20 @@ export interface VideoWorkerDryRunSummary {
   message: string;
 }
 
+export interface VideoWorkerSubmitSummary {
+  phase: 'submitted';
+  submittedAt: string;
+  total: number;
+  batchId?: string | null;
+  videogenJobs: Array<{
+    cap: number;
+    title: string;
+    jobId: string;
+    status: string;
+    clientReferenceId?: string | null;
+  }>;
+}
+
 export interface ContentWorkerProgressSummary {
   phase: string;
   done: number;
@@ -473,6 +487,34 @@ export class ProductionJobsService {
       finishedAt: now,
       detail: summary.message,
       error: null,
+    });
+
+    return true;
+  }
+
+  async markVideoWorkerSubmitted(
+    jobId: string,
+    workerId: string,
+    summary: VideoWorkerSubmitSummary,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    job.status = 'running';
+    job.workerStatus = 'running';
+    job.currentStep = 'videos';
+    job.progress = 20;
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      ...summary,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.jobRepo.save(job);
+
+    await this.upsertVideoWorkerStep(jobId, {
+      status: 'running',
+      progress: 20,
+      detail: `Videos enviados a Videogen (${summary.total} jobs)`,
     });
 
     return true;
