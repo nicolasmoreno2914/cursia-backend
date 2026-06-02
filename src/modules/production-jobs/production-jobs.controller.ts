@@ -12,6 +12,7 @@ import {
 } from '@nestjs/common';
 import { ProductionJobsService } from './production-jobs.service';
 import { CreateJobDto } from './dto/create-job.dto';
+import { CreateContentJobDto } from './dto/create-content-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
 import { UpdateStepDto } from './dto/update-step.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
@@ -35,6 +36,19 @@ export class ProductionJobsController {
   ) {
     const job = await this.jobsService.create(dto, user.id);
     return { ok: true, data: job };
+  }
+
+  /**
+   * POST /api/v1/jobs/content
+   * Crea un production_job preparado para generación backend del paso content.
+   */
+  @Post('content')
+  @HttpCode(HttpStatus.CREATED)
+  async createContentJob(
+    @Body() dto: CreateContentJobDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.jobsService.createContentJob(user.id, dto);
   }
 
   /**

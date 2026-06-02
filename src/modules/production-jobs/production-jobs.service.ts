@@ -1,9 +1,10 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { ProductionJob } from './entities/production-job.entity';
 import { ProductionStep } from './entities/production-step.entity';
 import { CreateJobDto } from './dto/create-job.dto';
+import { CreateContentJobDto } from './dto/create-content-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
 import { UpdateStepDto } from './dto/update-step.dto';
 
@@ -13,6 +14,17 @@ const STANDARD_STEPS = [
   'audio', 'preflight', 'videos', 'multimedia', 'package', 'save',
 ];
 
+const SENSITIVE_KEY_RE = /(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|bearer|secret|password)/i;
+
+export interface ContentJobCreatedResponse {
+  ok: true;
+  jobId: string;
+  status: string;
+  workerStatus: string;
+  executionMode: string;
+  currentStep: string;
+}
+
 @Injectable()
 export class ProductionJobsService {
   constructor(
@@ -21,6 +33,23 @@ export class ProductionJobsService {
     @InjectRepository(ProductionStep)
     private readonly stepRepo: Repository<ProductionStep>,
   ) {}
+
+  private sanitizePayload<T>(value: T): T {
+    if (Array.isArray(value)) {
+      return value.map((item) => this.sanitizePayload(item)) as T;
+    }
+
+    if (value && typeof value === 'object') {
+      const out: Record<string, any> = {};
+      for (const [key, nestedValue] of Object.entries(value as Record<string, any>)) {
+        if (SENSITIVE_KEY_RE.test(key)) continue;
+        out[key] = this.sanitizePayload(nestedValue);
+      }
+      return out as T;
+    }
+
+    return value;
+  }
 
   // ── CREATE ──────────────────────────────────────────────────────────────────
 
@@ -53,6 +82,106 @@ export class ProductionJobsService {
 
     // Return with steps included
     return this.findOne(saved.id, ownerId);
+  }
+
+  async createContentJob(
+    ownerId: string,
+    dto: CreateContentJobDto,
+  ): Promise<ContentJobCreatedResponse> {
+    if (!dto.courseId) {
+      throw new BadRequestException('courseId is required');
+    }
+
+    const sanitizedPayload = this.sanitizePayload({
+      courseId: dto.courseId,
+      frontendJobId: dto.frontendJobId ?? null,
+      executionMode: 'backend_content',
+      contentConfig: dto.contentConfig ?? {},
+      courseData: dto.courseData,
+      options: dto.options ?? {},
+      metadata: dto.metadata ?? {},
+    });
+
+    const rawCourseId = dto.courseId;
+    const numericCourseId = rawCourseId ? parseInt(rawCourseId, 10) : NaN;
+
+    const existing = await this.jobRepo.findOne({
+      where: {
+        ownerId,
+        frontendCourseId: rawCourseId,
+        executionMode: 'backend_content',
+        workerStatus: 'queued',
+      },
+      order: { createdAt: 'DESC' },
+    });
+
+    if (existing) {
+      throw new ConflictException('A backend content job is already queued for this course');
+    }
+
+    const activeStatuses = ['queued', 'running', 'retrying'];
+    const qb = this.jobRepo
+      .createQueryBuilder('job')
+      .where('job.owner_id = :ownerId', { ownerId })
+      .andWhere('job.execution_mode = :executionMode', { executionMode: 'backend_content' })
+      .andWhere('job.worker_status IN (:...activeStatuses)', { activeStatuses });
+
+    if (!isNaN(numericCourseId)) {
+      qb.andWhere('(job.course_id = :courseId OR job.frontend_course_id = :frontendCourseId)', {
+        courseId: numericCourseId,
+        frontendCourseId: rawCourseId,
+      });
+    } else {
+      qb.andWhere('job.frontend_course_id = :frontendCourseId', {
+        frontendCourseId: rawCourseId,
+      });
+    }
+
+    const activeExisting = await qb.getOne();
+    if (activeExisting) {
+      throw new ConflictException('A backend content job is already active for this course');
+    }
+
+    const job = this.jobRepo.create({
+      ownerId,
+      courseId: !isNaN(numericCourseId) ? numericCourseId : null,
+      frontendCourseId: rawCourseId,
+      frontendJobId: dto.frontendJobId ?? null,
+      options: dto.options ?? {},
+      status: 'queued',
+      currentStep: 'content',
+      progress: 0,
+      executionMode: 'backend_content',
+      workerStatus: 'queued',
+      inputPayload: sanitizedPayload,
+      outputSummary: {},
+      maxAttempts: dto.contentConfig?.maxRetriesPerFile ?? 3,
+    });
+
+    const saved = await this.jobRepo.save(job);
+
+    let step = await this.stepRepo.findOne({
+      where: { jobId: saved.id, stepKey: 'content' },
+    });
+    if (!step) {
+      step = this.stepRepo.create({
+        jobId: saved.id,
+        stepKey: 'content',
+      });
+    }
+    step.status = 'queued';
+    step.progress = 0;
+    step.detail = 'Esperando worker';
+    await this.stepRepo.save(step);
+
+    return {
+      ok: true,
+      jobId: saved.id,
+      status: saved.status,
+      workerStatus: saved.workerStatus,
+      executionMode: saved.executionMode,
+      currentStep: saved.currentStep,
+    };
   }
 
   // ── FIND ALL ────────────────────────────────────────────────────────────────

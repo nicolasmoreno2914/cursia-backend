@@ -64,6 +64,42 @@ export class ProductionJob {
   @Column({ name: 'retry_count', default: 0 })
   retryCount: number;
 
+  @Index()
+  @Column({ name: 'execution_mode', type: 'text', default: 'frontend' })
+  executionMode: string;
+
+  @Index()
+  @Column({ name: 'worker_status', type: 'text', nullable: true })
+  workerStatus: string;
+
+  @Column({ name: 'worker_id', type: 'text', nullable: true })
+  workerId: string;
+
+  @Column({ name: 'lease_until', type: 'timestamptz', nullable: true })
+  leaseUntil: Date;
+
+  @Column({ name: 'claimed_at', type: 'timestamptz', nullable: true })
+  claimedAt: Date;
+
+  @Column({ name: 'attempt_count', default: 0 })
+  attemptCount: number;
+
+  @Column({ name: 'max_attempts', default: 3 })
+  maxAttempts: number;
+
+  @Column({ name: 'next_retry_at', type: 'timestamptz', nullable: true })
+  nextRetryAt: Date;
+
+  @Column({ name: 'input_payload', type: 'jsonb', nullable: false, default: '{}' })
+  inputPayload: Record<string, any>;
+
+  @Column({ name: 'output_summary', type: 'jsonb', nullable: false, default: '{}' })
+  outputSummary: Record<string, any>;
+
+  @Index()
+  @Column({ name: 'content_snapshot_artifact_id', type: 'uuid', nullable: true })
+  contentSnapshotArtifactId: string;
+
   /** Opciones del pipeline: generateVideos, maxVideoChapters, etc. */
   @Column({ type: 'jsonb', nullable: true, default: '{}' })
   options: Record<string, any>;
