@@ -39,6 +39,16 @@ export interface ContentWorkerDryRunSummary {
   message: string;
 }
 
+export interface ContentWorkerProgressSummary {
+  phase: string;
+  done: number;
+  total: number;
+  file?: string | null;
+  message?: string | null;
+  filesGenerated?: number;
+  progressMap?: Record<string, { done: number; total: number }>;
+}
+
 @Injectable()
 export class ProductionJobsService {
   private readonly logger = new Logger(ProductionJobsService.name);
@@ -379,6 +389,103 @@ export class ProductionJobsService {
       progress: 100,
       finishedAt: now,
       detail: summary.message,
+      error: null,
+    });
+
+    return true;
+  }
+
+  async updateContentWorkerProgress(
+    jobId: string,
+    workerId: string,
+    summary: ContentWorkerProgressSummary,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    const progressTotals = summary.progressMap
+      ? Object.values(summary.progressMap).reduce(
+          (acc, item) => {
+            acc.done += Number(item?.done ?? 0);
+            acc.total += Number(item?.total ?? 0);
+            return acc;
+          },
+          { done: 0, total: 0 },
+        )
+      : { done: Number(summary.filesGenerated ?? summary.done ?? 0), total: Number(summary.total ?? 1) };
+    const total = progressTotals.total > 0 ? progressTotals.total : 1;
+    const done = Math.min(progressTotals.done, total);
+    const ratio = Math.max(0, Math.min(1, done / total));
+    const approxProgress = Math.max(
+      Math.min(job.progress ?? 10, 95),
+      Math.min(95, Math.max(10, Math.round(ratio * 95))),
+    );
+
+    job.status = 'running';
+    job.workerStatus = 'running';
+    job.currentStep = 'content';
+    job.progress = approxProgress;
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      phase: summary.phase,
+      done: summary.done,
+      total: summary.total,
+      file: summary.file ?? null,
+      message: summary.message ?? null,
+      filesGenerated: summary.filesGenerated ?? summary.done,
+      progressMap: summary.progressMap ?? (job.outputSummary?.progressMap ?? {}),
+      updatedAt: new Date().toISOString(),
+    };
+    await this.jobRepo.save(job);
+
+    await this.upsertWorkerStep(jobId, {
+      status: 'running',
+      progress: approxProgress,
+      detail: summary.message ?? `Generating ${summary.phase}`,
+      error: null,
+    });
+
+    return true;
+  }
+
+  async completeContentWorkerJob(
+    jobId: string,
+    workerId: string,
+    summary: Record<string, any>,
+    artifactId: string,
+    completionMessage: string,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    const now = new Date();
+    job.status = 'completed';
+    job.workerStatus = 'completed';
+    job.currentStep = 'content';
+    job.progress = 100;
+    job.finishedAt = now;
+    job.leaseUntil = null;
+    job.nextRetryAt = null;
+    job.errorMessage = null;
+    job.errorStep = null;
+    job.contentSnapshotArtifactId = artifactId;
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      ...summary,
+      contentSnapshotArtifactId: artifactId,
+      artifactIds: {
+        ...((job.outputSummary?.artifactIds ?? {}) as Record<string, any>),
+        contentSnapshot: artifactId,
+      },
+      completedAt: now.toISOString(),
+    };
+    await this.jobRepo.save(job);
+
+    await this.upsertWorkerStep(jobId, {
+      status: 'completed',
+      progress: 100,
+      finishedAt: now,
+      detail: completionMessage,
       error: null,
     });
 
