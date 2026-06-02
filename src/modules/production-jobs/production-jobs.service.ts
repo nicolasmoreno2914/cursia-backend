@@ -11,6 +11,7 @@ import { ProductionJob } from './entities/production-job.entity';
 import { ProductionStep } from './entities/production-step.entity';
 import { CreateJobDto } from './dto/create-job.dto';
 import { CreateContentJobDto } from './dto/create-content-job.dto';
+import { CreateVideoJobDto } from './dto/create-video-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
 import { UpdateStepDto } from './dto/update-step.dto';
 
@@ -36,6 +37,22 @@ export interface ContentWorkerDryRunSummary {
   done: number;
   total: number;
   filesGenerated: number;
+  message: string;
+}
+
+export interface VideoJobCreatedResponse {
+  ok: true;
+  jobId: string;
+  status: string;
+  workerStatus: string;
+  executionMode: string;
+  currentStep: string;
+}
+
+export interface VideoWorkerDryRunSummary {
+  phase: 'dry_run';
+  done: number;
+  total: number;
   message: string;
 }
 
@@ -259,6 +276,267 @@ export class ProductionJobsService {
       executionMode: saved.executionMode,
       currentStep: saved.currentStep,
     };
+  }
+
+  async createVideoJob(
+    ownerId: string,
+    dto: CreateVideoJobDto,
+  ): Promise<VideoJobCreatedResponse> {
+    if (!dto.courseId) {
+      throw new BadRequestException('courseId is required');
+    }
+
+    const sanitizedPayload = this.sanitizePayload({
+      courseId: dto.courseId,
+      frontendJobId: dto.frontendJobId ?? null,
+      executionMode: 'backend_videos',
+      videoConfig: dto.videoConfig ?? {},
+      courseData: dto.courseData,
+      options: dto.options ?? {},
+      metadata: dto.metadata ?? {},
+    });
+
+    const rawCourseId = dto.courseId;
+    const numericCourseId = rawCourseId ? parseInt(rawCourseId, 10) : NaN;
+
+    const activeStatuses = ['queued', 'running', 'retrying'];
+    const qb = this.jobRepo
+      .createQueryBuilder('job')
+      .where('job.owner_id = :ownerId', { ownerId })
+      .andWhere('job.execution_mode = :executionMode', { executionMode: 'backend_videos' })
+      .andWhere('job.worker_status IN (:...activeStatuses)', { activeStatuses });
+
+    if (!isNaN(numericCourseId)) {
+      qb.andWhere('(job.course_id = :courseId OR job.frontend_course_id = :frontendCourseId)', {
+        courseId: numericCourseId,
+        frontendCourseId: rawCourseId,
+      });
+    } else {
+      qb.andWhere('job.frontend_course_id = :frontendCourseId', {
+        frontendCourseId: rawCourseId,
+      });
+    }
+
+    const activeExisting = await qb.getOne();
+    if (activeExisting) {
+      throw new ConflictException('A backend video job is already active for this course');
+    }
+
+    const job = this.jobRepo.create({
+      ownerId,
+      courseId: !isNaN(numericCourseId) ? numericCourseId : null,
+      frontendCourseId: rawCourseId,
+      frontendJobId: dto.frontendJobId ?? null,
+      options: dto.options ?? {},
+      status: 'queued',
+      currentStep: 'videos',
+      progress: 0,
+      executionMode: 'backend_videos',
+      workerStatus: 'queued',
+      inputPayload: sanitizedPayload,
+      outputSummary: {},
+    });
+
+    const saved = await this.jobRepo.save(job);
+
+    let step = await this.stepRepo.findOne({
+      where: { jobId: saved.id, stepKey: 'videos' },
+    });
+    if (!step) {
+      step = this.stepRepo.create({
+        jobId: saved.id,
+        stepKey: 'videos',
+      });
+    }
+    step.status = 'queued';
+    step.progress = 0;
+    step.detail = 'Esperando worker';
+    await this.stepRepo.save(step);
+
+    return {
+      ok: true,
+      jobId: saved.id,
+      status: saved.status,
+      workerStatus: saved.workerStatus,
+      executionMode: saved.executionMode,
+      currentStep: saved.currentStep,
+    };
+  }
+
+  async claimNextBackendVideoJob(
+    workerId: string,
+    leaseSeconds: number,
+  ): Promise<ProductionJob | null> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      const candidates = await queryRunner.query(
+        `
+          SELECT id
+          FROM production_jobs
+          WHERE execution_mode = 'backend_videos'
+            AND worker_status IN ('queued', 'retrying')
+            AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+            AND (lease_until IS NULL OR lease_until < NOW())
+          ORDER BY created_at ASC
+          LIMIT 1
+          FOR UPDATE SKIP LOCKED
+        `,
+      );
+
+      if (!Array.isArray(candidates) || candidates.length === 0) {
+        await queryRunner.commitTransaction();
+        return null;
+      }
+
+      const jobId = candidates[0].id;
+
+      await queryRunner.query(
+        `
+          UPDATE production_jobs
+          SET worker_status = 'running',
+              status = 'running',
+              current_step = 'videos',
+              worker_id = $1,
+              claimed_at = NOW(),
+              lease_until = NOW() + ($2 * INTERVAL '1 second'),
+              attempt_count = COALESCE(attempt_count, 0) + 1,
+              started_at = COALESCE(started_at, NOW()),
+              updated_at = NOW()
+          WHERE id = $3
+        `,
+        [workerId, leaseSeconds, jobId],
+      );
+
+      await queryRunner.commitTransaction();
+
+      this.logger.log(`Worker ${workerId} claimed backend_videos job ${jobId}`);
+      return this.jobRepo.findOne({ where: { id: jobId }, relations: ['steps'] });
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async markVideoWorkerRunning(jobId: string, workerId: string): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    job.status = 'running';
+    job.workerStatus = 'running';
+    job.currentStep = 'videos';
+    job.startedAt = job.startedAt ?? new Date();
+    await this.jobRepo.save(job);
+
+    await this.upsertVideoWorkerStep(jobId, {
+      status: 'running',
+      progress: 10,
+      startedAt: new Date(),
+      detail: 'Video worker running',
+    });
+
+    return true;
+  }
+
+  async completeVideoWorkerDryRun(
+    jobId: string,
+    workerId: string,
+    summary: VideoWorkerDryRunSummary,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    const now = new Date();
+    job.status = 'completed';
+    job.workerStatus = 'completed';
+    job.currentStep = 'videos';
+    job.progress = 100;
+    job.finishedAt = now;
+    job.leaseUntil = null;
+    job.nextRetryAt = null;
+    job.errorMessage = null;
+    job.errorStep = null;
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      ...summary,
+      completedAt: now.toISOString(),
+    };
+    await this.jobRepo.save(job);
+
+    await this.upsertVideoWorkerStep(jobId, {
+      status: 'completed',
+      progress: 100,
+      finishedAt: now,
+      detail: summary.message,
+      error: null,
+    });
+
+    return true;
+  }
+
+  async failVideoWorkerJob(
+    jobId: string,
+    workerId: string,
+    error: Error | string,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    const message =
+      typeof error === 'string' ? error : error?.message || 'Unknown video worker error';
+    const now = new Date();
+
+    const errorEntry = {
+      phase: 'worker',
+      message,
+      attempt: job.attemptCount ?? 0,
+      workerId,
+      at: now.toISOString(),
+    };
+
+    job.currentStep = 'videos';
+    job.progress = Math.max(0, job.progress ?? 0);
+    job.errorMessage = message;
+    job.errorStep = 'videos';
+    job.workerStatus = 'failed';
+    job.status = 'failed';
+    job.finishedAt = now;
+    job.nextRetryAt = null;
+    job.leaseUntil = null;
+    job.outputSummary = this.appendOutputError(job.outputSummary, errorEntry);
+    await this.jobRepo.save(job);
+
+    await this.upsertVideoWorkerStep(jobId, {
+      status: 'failed',
+      finishedAt: now,
+      detail: `Video worker failed: ${message}`,
+      error: message,
+    });
+
+    return true;
+  }
+
+  private async upsertVideoWorkerStep(
+    jobId: string,
+    dto: Partial<ProductionStep>,
+  ): Promise<ProductionStep> {
+    let step = await this.stepRepo.findOne({ where: { jobId, stepKey: 'videos' } });
+    if (!step) {
+      step = this.stepRepo.create({ jobId, stepKey: 'videos' });
+    }
+
+    if (dto.status !== undefined) step.status = dto.status;
+    if (dto.progress !== undefined) step.progress = dto.progress;
+    if (dto.startedAt !== undefined) step.startedAt = dto.startedAt;
+    if (dto.finishedAt !== undefined) step.finishedAt = dto.finishedAt;
+    if (dto.error !== undefined) step.error = dto.error;
+    if (dto.detail !== undefined) step.detail = dto.detail;
+
+    return this.stepRepo.save(step);
   }
 
   async claimNextBackendContentJob(

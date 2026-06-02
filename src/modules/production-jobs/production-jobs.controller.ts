@@ -13,6 +13,7 @@ import {
 import { ProductionJobsService } from './production-jobs.service';
 import { CreateJobDto } from './dto/create-job.dto';
 import { CreateContentJobDto } from './dto/create-content-job.dto';
+import { CreateVideoJobDto } from './dto/create-video-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
 import { UpdateStepDto } from './dto/update-step.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
@@ -49,6 +50,19 @@ export class ProductionJobsController {
     @CurrentUser() user: AuthUser,
   ) {
     return this.jobsService.createContentJob(user.id, dto);
+  }
+
+  /**
+   * POST /api/v1/jobs/videos
+   * Crea un production_job preparado para generación backend del paso videos.
+   */
+  @Post('videos')
+  @HttpCode(HttpStatus.CREATED)
+  async createVideoJob(
+    @Body() dto: CreateVideoJobDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.jobsService.createVideoJob(user.id, dto);
   }
 
   /**

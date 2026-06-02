@@ -9,6 +9,8 @@
     "start": "node dist/main.js",
     "start:content-worker": "node dist/workers/content-worker.js",
     "start:content-worker:dev": "ts-node src/workers/content-worker.ts",
+    "start:video-worker": "node dist/workers/video-worker.js",
+    "start:video-worker:dev": "ts-node src/workers/video-worker.ts",
     "start:dev": "ts-node-dev --respawn --transpile-only src/main.ts",
     "start:debug": "ts-node-dev --inspect --respawn --transpile-only src/main.ts",
     "start:prod": "node dist/main.js",
