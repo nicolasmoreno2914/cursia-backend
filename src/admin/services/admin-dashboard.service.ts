@@ -45,6 +45,26 @@ export interface DashboardSummary {
   costByProvider: Array<{ provider: string; cost_usd: number }>;
   /** Cursos completados por dia en el periodo */
   productionTrend: Array<{ date: string; count: number }>;
+  courseCostSummary: {
+    totalEstimatedCostUsd: number;
+    averageEstimatedCostUsd: number;
+    coursesWithCostCount: number;
+    coursesWithoutCostCount: number;
+  };
+  courseCosts: Array<{
+    courseId: string;
+    courseName: string;
+    status: string;
+    estimatedCostUsd: number;
+    realCostUsd: number | null;
+    costSource: 'estimated' | 'real' | null;
+    contentCostUsd: number;
+    audioCostUsd: number;
+    videoCostUsd: number;
+    packageCostUsd: number;
+    lastUpdatedAt: string | null;
+    eventsCount: number;
+  }>;
 }
 
 @Injectable()
@@ -219,6 +239,81 @@ export class AdminDashboardService {
 
     const savingsUsd = Math.max(0, traditionalEquivalentUsd - totalCostUsd);
 
+    // ── 11. Costos por curso ──────────────────────────────────────────────────
+    const courseCostRows = await this.eventRepo
+      .createQueryBuilder('e')
+      .select('e.course_id', 'courseId')
+      .addSelect("COALESCE(MAX(NULLIF(e.metadata->>'course_name', '')), 'Curso sin nombre')", 'courseName')
+      .addSelect('MAX(e.created_at)', 'lastUpdatedAt')
+      .addSelect('COUNT(*)', 'eventsCount')
+      .addSelect(
+        "COALESCE(SUM(CASE WHEN e.event_type LIKE 'ia_%' THEN COALESCE(e.estimated_cost_usd, 0) ELSE 0 END), 0)",
+        'contentCostUsd',
+      )
+      .addSelect(
+        "COALESCE(SUM(CASE WHEN e.event_type IN ('welcome_audio_generated', 'audiobook_generated') THEN COALESCE(e.estimated_cost_usd, 0) ELSE 0 END), 0)",
+        'audioCostUsd',
+      )
+      .addSelect(
+        "COALESCE(SUM(CASE WHEN e.event_type LIKE 'video_%' OR e.event_type IN ('youtube_upload_completed', 'youtube_upload_failed') THEN COALESCE(e.estimated_cost_usd, 0) ELSE 0 END), 0)",
+        'videoCostUsd',
+      )
+      .addSelect(
+        "COALESCE(SUM(CASE WHEN e.event_type IN ('export_mbz', 'mbz_exported') THEN COALESCE(e.estimated_cost_usd, 0) ELSE 0 END), 0)",
+        'packageCostUsd',
+      )
+      .addSelect('COALESCE(SUM(COALESCE(e.estimated_cost_usd, 0)), 0)', 'estimatedCostUsd')
+      .addSelect("MAX(CASE WHEN e.failed = true THEN 1 ELSE 0 END)", 'hasFailure')
+      .addSelect("MAX(CASE WHEN e.event_type = 'course_production_completed' THEN 1 ELSE 0 END)", 'hasCompletedProduction')
+      .where('e.created_at BETWEEN :from AND :to', { from, to })
+      .andWhere('e.course_id IS NOT NULL')
+      .groupBy('e.course_id')
+      .orderBy('MAX(e.created_at)', 'DESC')
+      .getRawMany<{
+        courseId: string;
+        courseName: string;
+        lastUpdatedAt: string;
+        eventsCount: string;
+        contentCostUsd: string;
+        audioCostUsd: string;
+        videoCostUsd: string;
+        packageCostUsd: string;
+        estimatedCostUsd: string;
+        hasFailure: string;
+        hasCompletedProduction: string;
+      }>();
+
+    const courseCosts = courseCostRows.map((row) => {
+      const estimatedCostUsd = parseFloat(row.estimatedCostUsd ?? '0');
+      const hasFailure = Number(row.hasFailure ?? '0') > 0;
+      const hasCompletedProduction = Number(row.hasCompletedProduction ?? '0') > 0;
+      let status = 'En proceso';
+      if (hasCompletedProduction) status = 'Listo';
+      else if (hasFailure) status = 'Con errores';
+      const costSource: 'estimated' | 'real' | null = estimatedCostUsd > 0 ? 'estimated' : null;
+
+      return {
+        courseId: row.courseId,
+        courseName: row.courseName || 'Curso sin nombre',
+        status,
+        estimatedCostUsd: Number(estimatedCostUsd.toFixed(6)),
+        realCostUsd: null,
+        costSource,
+        contentCostUsd: Number(parseFloat(row.contentCostUsd ?? '0').toFixed(6)),
+        audioCostUsd: Number(parseFloat(row.audioCostUsd ?? '0').toFixed(6)),
+        videoCostUsd: Number(parseFloat(row.videoCostUsd ?? '0').toFixed(6)),
+        packageCostUsd: Number(parseFloat(row.packageCostUsd ?? '0').toFixed(6)),
+        lastUpdatedAt: row.lastUpdatedAt || null,
+        eventsCount: parseInt(row.eventsCount ?? '0', 10),
+      };
+    });
+
+    const coursesWithCostCount = courseCosts.filter((course) => course.estimatedCostUsd > 0).length;
+    const coursesWithoutCostCount = Math.max(0, courseCosts.length - coursesWithCostCount);
+    const averageEstimatedCostUsd = coursesWithCostCount > 0
+      ? courseCosts.reduce((sum, course) => sum + course.estimatedCostUsd, 0) / coursesWithCostCount
+      : 0;
+
     // ── 10. Respuesta ─────────────────────────────────────────────────────────
     return {
       period: {
@@ -263,6 +358,13 @@ export class AdminDashboardService {
       },
       costByProvider,
       productionTrend,
+      courseCostSummary: {
+        totalEstimatedCostUsd: Number(totalCostUsd.toFixed(6)),
+        averageEstimatedCostUsd: Number(averageEstimatedCostUsd.toFixed(6)),
+        coursesWithCostCount,
+        coursesWithoutCostCount,
+      },
+      courseCosts,
     };
   }
 }

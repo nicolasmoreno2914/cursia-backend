@@ -113,8 +113,8 @@ export class UsageEvent {
 
   // ── Curso ────────────────────────────────────────────────────────────────────
   /** ID del curso relacionado (si aplica). */
-  @Column({ name: 'course_id', type: 'int', nullable: true })
-  courseId: number;
+  @Column({ name: 'course_id', type: 'varchar', length: 120, nullable: true })
+  courseId: string;
 
   // ── Performance ─────────────────────────────────────────────────────────────
   /** Duración de la operación en milisegundos. */

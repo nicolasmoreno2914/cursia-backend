@@ -82,8 +82,9 @@ export class CreateEventDto {
 
   /** ID del curso relacionado. */
   @IsOptional()
-  @IsNumber()
-  course_id?: number;
+  @IsString()
+  @MaxLength(120)
+  course_id?: string;
 
   /** Duración de la operación en milisegundos. */
   @IsOptional()
