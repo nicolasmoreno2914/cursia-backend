@@ -1011,12 +1011,13 @@ async function bootstrap() {
         }
       }
 
-      if (currentPhase === 'videogen_completed') {
-        // Re-claimed after lease expiry — Videogen done, go to YouTube
+      if (currentPhase === 'videogen_completed' || currentSummary?.youtubePhase === 'pending_retry') {
+        // Re-claimed after: (a) lease expiry, (b) user requeue after blocked_auth/blocked_quota
         if (!youtubeEnabled) {
-          throw new Error(`Job ${jobId} in phase=videogen_completed but YOUTUBE_UPLOAD_ENABLED=false`);
+          throw new Error(`Job ${jobId} in phase=${currentPhase}/youtubePhase=pending_retry but YOUTUBE_UPLOAD_ENABLED=false`);
         }
-        logger.log(`Job ${jobId} re-claimed in phase=videogen_completed — entering YouTube upload`);
+        const reason = currentSummary?.youtubePhase === 'pending_retry' ? 'requeue' : 'lease_expiry';
+        logger.log(`Job ${jobId} re-claimed (${reason}) in phase=${currentPhase ?? 'n/a'} — entering YouTube upload`);
         await youtubeUploadPhase(job, leaseLostRef);
         finalized = true;
         return;

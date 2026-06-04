@@ -861,6 +861,51 @@ export class ProductionJobsService {
     return true;
   }
 
+  /**
+   * Resets a blocked/failed_recoverable video job back to 'queued' so the worker
+   * can pick it up again. Preserves outputSummary (and youtubeUploads) so the worker
+   * skips videos already uploaded.
+   *
+   * Called after the user reconnects YouTube (blocked_auth) or when the user
+   * manually retries after a quota reset (blocked_quota).
+   */
+  async requeueVideoJob(
+    jobId:  string,
+    userId: string,
+  ): Promise<{ ok: boolean; reason?: string }> {
+    const job = await this.jobRepo.findOne({ where: { id: jobId } });
+
+    if (!job) return { ok: false, reason: 'not_found' };
+    if (job.ownerId !== userId) return { ok: false, reason: 'forbidden' };
+    if (job.executionMode !== 'backend_videos') return { ok: false, reason: 'not_a_video_job' };
+
+    const allowedStatuses = ['failed_recoverable', 'failed'];
+    if (!allowedStatuses.includes(job.status)) {
+      return { ok: false, reason: `status_not_retryable (current: ${job.status})` };
+    }
+
+    job.status       = 'queued';
+    job.workerStatus = 'queued';
+    job.workerId     = null as any;
+    job.leaseUntil   = null as any;
+    job.currentStep  = 'videos';
+    job.progress     = Math.min(job.progress ?? 90, 92); // keep progress near YouTube phase
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      youtubePhase:   'pending_retry',
+      requeuedAt:     new Date().toISOString(),
+    };
+    await this.jobRepo.save(job);
+
+    await this.upsertVideoWorkerStep(jobId, {
+      status: 'pending',
+      detail: 'En espera de continuar subida a YouTube…',
+    });
+
+    this.logger.log(`Video job ${jobId} requeued by user ${userId}`);
+    return { ok: true };
+  }
+
   async saveVideoSnapshotArtifactId(
     jobId: string,
     artifactId: string,

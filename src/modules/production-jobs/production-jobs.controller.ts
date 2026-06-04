@@ -119,4 +119,27 @@ export class ProductionJobsController {
     const step = await this.jobsService.updateStep(id, stepKey, dto, user.id);
     return { ok: true, data: step };
   }
+
+  /**
+   * POST /api/v1/jobs/:id/requeue
+   *
+   * Reactiva un job de video bloqueado (failed_recoverable) para que el worker
+   * lo retome. Conserva youtubeUploads para evitar duplicados.
+   *
+   * Casos de uso:
+   *  - Usuario reconectó YouTube (blocked_auth → requeue → worker sube pendientes)
+   *  - Cuota restablecida (blocked_quota → requeue → worker reintenta al día siguiente)
+   */
+  @Post(':id/requeue')
+  @HttpCode(HttpStatus.OK)
+  async requeue(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthUser,
+  ) {
+    const result = await this.jobsService.requeueVideoJob(id, user.id);
+    if (!result.ok) {
+      return { ok: false, reason: result.reason };
+    }
+    return { ok: true };
+  }
 }
