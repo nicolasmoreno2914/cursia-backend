@@ -490,22 +490,51 @@ export class MbzBuilderService {
       return questions;
     }
 
-    // HVP intro HTML (same as 09-mbz.js hvpIntroHtml)
+    // ── Chapter intro label HTML (shown as a separate label BEFORE the HVP) ───
     function hvpIntroHtml(capN: number, capName: string, modIdx: number, modName: string,
                            modHex: string, modAc: string, courseName: string): string {
       const modLabel = `MÓDULO ${modIdx + 1} · CAPÍTULO ${capN}`;
       const scormHref = `#scorm-cap-${capN}`;
-      return `<div style="font-family:'Segoe UI',Arial,sans-serif;padding:0 0 20px;color:#E2E6F3;">`
-        + `<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">`
-          + `<span style="display:inline-block;padding:4px 14px;border-radius:50px;background:${modHex};color:#fff;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;">${modLabel}</span>`
+      return `<div class="cc-responsive" style="width:100%;max-width:100%;overflow-x:auto;box-sizing:border-box;">`
+        + `<div style="background:linear-gradient(160deg,#0A1A28,#0E2337,#12284A);border-radius:20px;padding:36px 40px;color:#E2E6F3;font-family:'Segoe UI',Arial,sans-serif;box-sizing:border-box;width:100%;max-width:100%;">`
+        + `<div style="display:flex;align-items:center;gap:10px;margin-bottom:18px;">`
+          + `<span style="display:inline-block;padding:5px 16px;border-radius:50px;background:${modHex};color:#fff;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;">${xmlEsc(modLabel)}</span>`
         + `</div>`
-        + `<h2 style="font-size:26px;font-weight:800;color:#E2E6F3;margin:0 0 5px;">${esc(capName)}</h2>`
-        + `<div style="font-size:12px;color:rgba(226,230,243,.55);margin-bottom:18px;">${esc(modName)} &nbsp;·&nbsp; ${esc(courseName)}</div>`
-        + `<div style="background:rgba(37,99,235,.12);border:1px solid rgba(37,99,235,.25);border-radius:10px;padding:14px 18px;margin-bottom:4px;">`
-          + `<div style="font-size:10px;font-weight:700;color:${modAc};text-transform:uppercase;letter-spacing:1.5px;margin-bottom:8px;">📺 CÓMO APROVECHAR ESTE VIDEO</div>`
-          + `<p style="font-size:13px;color:rgba(226,230,243,.82);line-height:1.7;margin:0;">Mira el video completo antes de hacer clic en cualquier elemento interactivo. Cuando aparezca una pregunta o actividad, <strong>el video se pausará automáticamente</strong> — respóndela y continúa. Al terminar, usa el botón <a href="${scormHref}" style="color:${modAc};font-weight:600;">Practicar ahora</a> para reforzar lo aprendido con la actividad gamificada.</p>`
+        + `<h2 style="font-size:30px;font-weight:800;color:#FFFFFF;margin:0 0 8px;line-height:1.2;">${xmlEsc(capName)}</h2>`
+        + `<p style="font-size:13px;color:rgba(226,230,243,.5);margin:0 0 24px;font-family:'Segoe UI',Arial,sans-serif;">${xmlEsc(modName)} &nbsp;·&nbsp; ${xmlEsc(courseName)}</p>`
+        + `<div style="height:2px;background:linear-gradient(90deg,${modHex},transparent);border-radius:2px;margin-bottom:24px;"></div>`
+        + `<div style="background:rgba(37,99,235,.10);border:1px solid rgba(37,99,235,.22);border-radius:12px;padding:18px 22px;">`
+          + `<div style="font-size:11px;font-weight:700;color:${modAc};text-transform:uppercase;letter-spacing:1.5px;margin-bottom:12px;">📺 Cómo aprovechar este video</div>`
+          + `<ol style="margin:0;padding-left:20px;font-size:13px;color:rgba(226,230,243,.82);line-height:1.8;">`
+            + `<li>Mira el video completo sin pausarlo manualmente.</li>`
+            + `<li>Cuando aparezca una pregunta, <strong style="color:${modAc};">el video se pausará automáticamente</strong> — respóndela y continúa.</li>`
+            + `<li>Usa las notas de capítulo para repasar los conceptos clave.</li>`
+            + `<li>Al terminar, haz clic en <a href="${scormHref}" style="color:${modAc};font-weight:600;text-decoration:none;">Practicar ahora →</a> para la actividad gamificada.</li>`
+          + `</ol>`
         + `</div>`
-        + `</div>`;
+        + `</div></div>`;
+    }
+
+    // ── Chapter CTA label HTML (shown as a separate label AFTER the HVP, BEFORE SCORM) ─
+    function hvpCtaHtml(capN: number, capName: string, modHex: string, modAc: string): string {
+      const scormHref = `#scorm-cap-${capN}`;
+      return `<div class="cc-responsive" style="width:100%;max-width:100%;overflow-x:auto;box-sizing:border-box;">`
+        + `<div style="background:#0E1E33;border-radius:20px;padding:32px 40px;color:#E2E6F3;font-family:'Segoe UI',Arial,sans-serif;box-sizing:border-box;width:100%;max-width:100%;">`
+        + `<h3 style="font-size:18px;font-weight:700;color:#FFFFFF;margin:0 0 6px;">✅ Temas cubiertos en este capítulo</h3>`
+        + `<p style="font-size:13px;color:rgba(226,230,243,.5);margin:0 0 20px;">${xmlEsc(capName)}</p>`
+        + `<div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:28px;">`
+          + `<span style="background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:8px 14px;font-size:12px;color:rgba(226,230,243,.7);">📌 Conceptos clave</span>`
+          + `<span style="background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:8px 14px;font-size:12px;color:rgba(226,230,243,.7);">💡 Aplicaciones prácticas</span>`
+          + `<span style="background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:8px 14px;font-size:12px;color:rgba(226,230,243,.7);">🔬 Ejemplos del campo</span>`
+          + `<span style="background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:8px 14px;font-size:12px;color:rgba(226,230,243,.7);">📋 Puntos a recordar</span>`
+        + `</div>`
+        + `<div style="background:linear-gradient(135deg,${modHex},#1a3a6e);border-radius:14px;padding:24px 28px;text-align:center;">`
+          + `<p style="font-size:16px;font-weight:700;color:#FFFFFF;margin:0 0 6px;">¿Listo para poner a prueba lo aprendido?</p>`
+          + `<p style="font-size:13px;color:rgba(255,255,255,.6);margin:0 0 18px;">Accede a la actividad gamificada y refuerza tu aprendizaje</p>`
+          + `<a href="${scormHref}" style="display:inline-block;background:#FFFFFF;color:${modHex};font-size:15px;font-weight:700;padding:12px 32px;border-radius:50px;text-decoration:none;letter-spacing:.5px;">🎮 Practicar ahora →</a>`
+          + `<p style="font-size:11px;color:rgba(255,255,255,.4);margin:12px 0 0;">📊 Reporta calificación &nbsp;·&nbsp; Intentos ilimitados</p>`
+        + `</div>`
+        + `</div></div>`;
     }
 
     // ── Section map (same as 09-mbz.js) ──────────────────────────────────────
@@ -612,13 +641,40 @@ export class MbzBuilderService {
         const isGift     = fn.endsWith('.gift');
         const isHtml     = fn.endsWith('.html');
 
-        // ── SCORM ──────────────────────────────────────────────────────────────
+        // ── SCORM (preceded by a CTA label) ────────────────────────────────────
         if (isScormIdx) {
           const capNMatch = fn.match(/cap(\d+)/);
-          const aid = actId++; const mid = modId++;
-          const gradeItemId = 9000 + mid;
           const capNStr = capNMatch ? capNMatch[1] : 'X';
           const capIdx2 = capNMatch ? parseInt(capNMatch[1]) : 0;
+
+          // ── CTA label inserted before each SCORM ──────────────────────────
+          // Uses hvpCtaHtml() with the module colour palette.
+          const ctaModIdx = capIdx2 <= 3 ? 0 : capIdx2 <= 6 ? 1 : 2;
+          const ctaPal    = D.pal ?? {};
+          const ctaModHex = ctaModIdx === 0 ? (ctaPal.m1 ?? '#2563EB')
+                          : ctaModIdx === 1 ? (ctaPal.m2 ?? '#16A085')
+                                            : (ctaPal.m3 ?? '#7D3C98');
+          const ctaModAc  = ctaModIdx === 0 ? (ctaPal.m1a ?? '#93C5FD')
+                          : ctaModIdx === 1 ? (ctaPal.m2a ?? '#2DD4BF')
+                                            : (ctaPal.m3a ?? '#C084FC');
+          const ctaCapName = caps[capIdx2 - 1]?.t ?? `Capítulo ${capIdx2}`;
+          const ctaContent = hvpCtaHtml(capIdx2, ctaCapName, ctaModHex, ctaModAc);
+
+          const ctaAid = actId++; const ctaMid = modId++;
+          const ctaTitle = `🎯 Practicar — Cap ${capNStr}`;
+          const ctaDir   = `activities/label_${ctaMid}`;
+          zip.file(ctaDir + '/label.xml',  labelXml(ctaAid, ctaMid, ctaTitle, ctaContent));
+          zip.file(ctaDir + '/module.xml',  moduleXml(ctaMid, 'label', sec.num));
+          zip.file(ctaDir + '/grades.xml',  gradesXml(ctaAid));
+          zip.file(ctaDir + '/inforef.xml', inforefXml());
+          writeActFiles(ctaDir);
+          htmlActivities.push({ mid:ctaMid, dir:ctaDir, name:ctaTitle, content:ctaContent, isLabel:true, capNum:capIdx2 });
+          secActs.push({ mid: ctaMid });
+          mbzActivities.push({ mid:ctaMid, secnum:sec.num, modname:'label', title:ctaTitle, dir:ctaDir });
+          actSettings.push({ mid:ctaMid, modname:'label', title:ctaTitle });
+
+          const aid = actId++; const mid = modId++;
+          const gradeItemId = 9000 + mid;
           let actName = `🎮 Actividad Interactiva Cap ${capNStr}`;
           if (caps[capIdx2 - 1]) actName += ` — ${caps[capIdx2 - 1].t}`;
 
@@ -894,41 +950,45 @@ export class MbzBuilderService {
           const audioBuffer = isAudioBv ? (input.audioWelcome ?? null)
                             : isAudioAl ? effectiveAudiobook : null;
 
-          // ── Audio page (binary audio file in ZIP) ─────────────────────────
+          // ── Audio label (binary audio file in ZIP, shown inline on course page) ──
+          // Using a label (not a page) so the audio player appears inline without
+          // requiring the student to navigate to a separate page.
           if ((isAudioBv || isAudioAl) && audioBuffer) {
             const aid = actId++; const mid = modId++;
-            const audioPgName = friendlyName(fn);
-            const dir         = `activities/page_${mid}`;
-            const audioMime   = 'audio/mpeg';
-            const audioExt    = '.mp3';
-            const audioFilename = (isAudioBv ? 'audio_bienvenida' : 'audiolibro') + audioExt;
-            const audioHash     = sha1Buf(audioBuffer);
-            const audioFid      = fileId++;
-            const audioActCtx   = ctxId;
+            const audioLabelName = friendlyName(fn);
+            const dir            = `activities/label_${mid}`;
+            const audioMime      = 'audio/mpeg';
+            const audioExt       = '.mp3';
+            const audioFilename  = (isAudioBv ? 'audio_bienvenida' : 'audiolibro') + audioExt;
+            const audioHash      = sha1Buf(audioBuffer);
+            const audioFid       = fileId++;
+            // Capture ctxId BEFORE labelXml increments it
+            const audioLabelCtx  = ctxId;
 
             zip.file(`files/${audioHash.substring(0,2)}/${audioHash}`, audioBuffer);
-            filesXmlEntries.push({ id:audioFid, hash:audioHash, ctx:audioActCtx, comp:'mod_page', area:'content', item:0, path:'/', name:audioFilename, size:audioBuffer.length, mime:audioMime });
+            // File must be associated with mod_label / intro so @@PLUGINFILE@@ resolves
+            filesXmlEntries.push({ id:audioFid, hash:audioHash, ctx:audioLabelCtx, comp:'mod_label', area:'intro', item:0, path:'/', name:audioFilename, size:audioBuffer.length, mime:audioMime });
 
-            const audioPageContent = (F[fn] ?? '').replace(
-              /<source\b[^>]*\bsrc="data:[^"]*"[^>]*>/gi,
-              `<source src="@@PLUGINFILE@@/${audioFilename}" type="${audioMime}">`
-            );
-            zip.file(dir + '/page.xml',    pageXml(aid, mid, audioPgName, audioPageContent));
-            zip.file(dir + '/module.xml',  moduleXml(mid, 'page', sec.num));
+            // Replace both <audio src="data:..."> and <source src="data:..."> patterns
+            let audioLabelContent = (F[fn] ?? '');
+            audioLabelContent = audioLabelContent
+              .replace(/<source\b[^>]*\bsrc="data:[^"]*"[^>]*>/gi,
+                `<source src="@@PLUGINFILE@@/${audioFilename}" type="${audioMime}">`)
+              .replace(/(<audio\b[^>]*?)\s+src="data:[^"]*"/gi,
+                `$1 src="@@PLUGINFILE@@/${audioFilename}"`);
+
+            zip.file(dir + '/label.xml',   labelXml(aid, mid, audioLabelName, audioLabelContent));
+            zip.file(dir + '/module.xml',  moduleXml(mid, 'label', sec.num));
             zip.file(dir + '/grades.xml',  gradesXml(aid));
             zip.file(dir + '/inforef.xml', `<?xml version="1.0" encoding="UTF-8"?>\n<inforef>\n  <fileref>\n    <file><id>${audioFid}</id></file>\n  </fileref>\n</inforef>`);
             writeActFiles(dir);
             secActs.push({ mid });
-            mbzActivities.push({ mid, secnum:sec.num, modname:'page', title:audioPgName, dir });
-            actSettings.push({ mid, modname:'page', title:audioPgName });
+            mbzActivities.push({ mid, secnum:sec.num, modname:'label', title:audioLabelName, dir });
+            actSettings.push({ mid, modname:'label', title:audioLabelName });
 
-          // ── HVP sentinel with available data → create HVP directly ────────
+          // ── HVP sentinel: insert intro label BEFORE, then create HVP ────────
           } else if (hvpCapN !== null && hvpDataMap[hvpCapN]) {
-            const hd      = hvpDataMap[hvpCapN];
-            const aid     = actId++; const mid = modId++;
-            const hvpCtx  = ctxId++;
-            const hvpTitle = `🎥 Video Interactivo Cap ${hvpCapN}${hd.capName ? ' — ' + hd.capName : ''}`;
-            const dir = `activities/hvp_${mid}`;
+            const hd = hvpDataMap[hvpCapN];
 
             const hvpModIdx = hvpCapN <= 3 ? 0 : hvpCapN <= 6 ? 1 : 2;
             const hvpPal    = D.pal ?? {};
@@ -939,14 +999,38 @@ export class MbzBuilderService {
                             : hvpModIdx === 1 ? (hvpPal.m2a ?? '#2DD4BF')
                                               : (hvpPal.m3a ?? '#C084FC');
             const hvpModName = mods[hvpModIdx] ? mods[hvpModIdx].n : `Módulo ${hvpModIdx + 1}`;
-            const intro      = hvpIntroHtml(hvpCapN, hd.capName ?? `Capítulo ${hvpCapN}`, hvpModIdx, hvpModName, hvpModHex, hvpModAc, nombre);
+            const capNameStr  = hd.capName ?? `Capítulo ${hvpCapN}`;
 
-            zip.file(dir + '/hvp.xml',     hvpXml(aid, mid, hvpCtx, hvpCapN, hvpTitle, intro, hd.hvpJson));
+            // ── 1. Intro label (design context before the video) ────────────
+            const introAid  = actId++; const introMid = modId++;
+            const introTitle = `📖 Capítulo ${hvpCapN}${hd.capName ? ' — ' + hd.capName : ''}`;
+            const introContent = hvpIntroHtml(hvpCapN, capNameStr, hvpModIdx, hvpModName, hvpModHex, hvpModAc, nombre);
+            const introDir = `activities/label_${introMid}`;
+            zip.file(introDir + '/label.xml',  labelXml(introAid, introMid, introTitle, introContent));
+            zip.file(introDir + '/module.xml',  moduleXml(introMid, 'label', sec.num));
+            zip.file(introDir + '/grades.xml',  gradesXml(introAid));
+            zip.file(introDir + '/inforef.xml', inforefXml());
+            writeActFiles(introDir);
+            // Also track in htmlActivities so CTA links get rewritten
+            htmlActivities.push({ mid:introMid, dir:introDir, name:introTitle, content:introContent, isLabel:true, capNum:hvpCapN });
+            secActs.push({ mid: introMid });
+            mbzActivities.push({ mid:introMid, secnum:sec.num, modname:'label', title:introTitle, dir:introDir });
+            actSettings.push({ mid:introMid, modname:'label', title:introTitle });
+
+            // ── 2. HVP (minimal intro — design is in the preceding label) ───
+            const aid     = actId++; const mid = modId++;
+            const hvpCtx  = ctxId++;
+            const hvpTitle = `🎥 Video Interactivo Cap ${hvpCapN}${hd.capName ? ' — ' + hd.capName : ''}`;
+            const dir = `activities/hvp_${mid}`;
+            // Minimal intro: just the chapter name (the full design is in the intro label)
+            const minimalIntro = `<p style="font-family:'Segoe UI',Arial,sans-serif;font-size:13px;color:rgba(226,230,243,.6);margin:0;">${xmlEsc(capNameStr)}</p>`;
+
+            zip.file(dir + '/hvp.xml',     hvpXml(aid, mid, hvpCtx, hvpCapN, hvpTitle, minimalIntro, hd.hvpJson));
             zip.file(dir + '/module.xml',  hvpModuleXml(mid, sec.num));
             zip.file(dir + '/grades.xml',  hvpGradesXml(aid, hvpTitle));
             zip.file(dir + '/inforef.xml', hvpInforefXml(aid));
             writeActFiles(dir);
-            hvpActivities.push({ dir, aid, mid, hvpCtx, title:hvpTitle, capN:hvpCapN, rawIntro:intro, hvpJson:hd.hvpJson });
+            hvpActivities.push({ dir, aid, mid, hvpCtx, title:hvpTitle, capN:hvpCapN, rawIntro:minimalIntro, hvpJson:hd.hvpJson });
             secActs.push({ mid });
             mbzActivities.push({ mid, secnum:sec.num, modname:'hvp', title:hvpTitle, dir });
             actSettings.push({ mid, modname:'hvp', title:hvpTitle });
