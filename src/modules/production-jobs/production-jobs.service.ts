@@ -13,6 +13,7 @@ import { CreateJobDto } from './dto/create-job.dto';
 import { CreateContentJobDto } from './dto/create-content-job.dto';
 import { CreateVideoJobDto } from './dto/create-video-job.dto';
 import { CreateAudioJobDto } from './dto/create-audio-job.dto';
+import { CreatePackageJobDto } from './dto/create-package-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
 import { UpdateStepDto } from './dto/update-step.dto';
 
@@ -147,6 +148,15 @@ export interface AudioWorkerProgressSummary {
   message?: string | null;
   welcomeAudio?: Record<string, any>;
   audiobook?: Record<string, any>;
+}
+
+export interface PackageJobCreatedResponse {
+  ok: true;
+  jobId: string;
+  status: string;
+  workerStatus: string;
+  executionMode: string;
+  currentStep: string;
 }
 
 @Injectable()
@@ -1275,6 +1285,172 @@ export class ProductionJobsService {
     });
 
     return true;
+  }
+
+  // ── Package job methods ────────────────────────────────────────────────────
+
+  async createPackageJob(
+    ownerId: string,
+    dto: CreatePackageJobDto,
+  ): Promise<PackageJobCreatedResponse> {
+    if (!dto.courseId) throw new BadRequestException('courseId is required');
+    if (!dto.contentSnapshotArtifactId) throw new BadRequestException('contentSnapshotArtifactId is required');
+
+    const rawCourseId    = dto.courseId;
+    const numericCourseId = rawCourseId ? parseInt(rawCourseId, 10) : NaN;
+    const activeStatuses = ['queued', 'running', 'retrying'];
+
+    const qb = this.jobRepo.createQueryBuilder('job')
+      .where('job.owner_id = :ownerId', { ownerId })
+      .andWhere('job.execution_mode = :executionMode', { executionMode: 'backend_package' })
+      .andWhere('job.worker_status IN (:...activeStatuses)', { activeStatuses });
+    if (!isNaN(numericCourseId)) {
+      qb.andWhere('(job.course_id = :courseId OR job.frontend_course_id = :frontendCourseId)', { courseId: numericCourseId, frontendCourseId: rawCourseId });
+    } else {
+      qb.andWhere('job.frontend_course_id = :frontendCourseId', { frontendCourseId: rawCourseId });
+    }
+    const activeExisting = await qb.getOne();
+    if (activeExisting) {
+      return { ok:true, jobId:activeExisting.id, status:activeExisting.status, workerStatus:activeExisting.workerStatus, executionMode:activeExisting.executionMode, currentStep:activeExisting.currentStep };
+    }
+
+    const sanitized = this.sanitizePayload({
+      courseId: rawCourseId,
+      executionMode: 'backend_package',
+      contentSnapshotArtifactId: dto.contentSnapshotArtifactId,
+      h5pSnapshotArtifactId:    dto.h5pSnapshotArtifactId ?? null,
+      audioWelcomeArtifactId:   dto.audioWelcomeArtifactId ?? null,
+      audiobookArtifactId:      dto.audiobookArtifactId ?? null,
+      options: dto.options ?? {},
+      metadata: dto.metadata ?? {},
+    });
+
+    const job = this.jobRepo.create({
+      ownerId,
+      courseId: !isNaN(numericCourseId) ? numericCourseId : null,
+      frontendCourseId: rawCourseId,
+      frontendJobId: dto.frontendJobId ?? null,
+      options: dto.options ?? {},
+      status: 'queued',
+      currentStep: 'package',
+      progress: 0,
+      executionMode: 'backend_package',
+      workerStatus: 'queued',
+      inputPayload: sanitized,
+      outputSummary: {},
+    });
+    const saved = await this.jobRepo.save(job);
+
+    let step = await this.stepRepo.findOne({ where: { jobId: saved.id, stepKey: 'package' } });
+    if (!step) step = this.stepRepo.create({ jobId: saved.id, stepKey: 'package' });
+    step.status = 'queued'; step.progress = 0; step.detail = 'Esperando worker de empaquetado';
+    await this.stepRepo.save(step);
+
+    return { ok:true, jobId:saved.id, status:saved.status, workerStatus:saved.workerStatus, executionMode:saved.executionMode, currentStep:saved.currentStep };
+  }
+
+  async claimNextBackendPackageJob(workerId: string, leaseSeconds: number): Promise<ProductionJob | null> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      const candidates = await queryRunner.query(
+        `SELECT id FROM production_jobs WHERE execution_mode = 'backend_package'
+         AND worker_status IN ('queued','retrying')
+         AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+         AND (lease_until IS NULL OR lease_until < NOW())
+         ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED`,
+      );
+      if (!Array.isArray(candidates) || candidates.length === 0) { await queryRunner.commitTransaction(); return null; }
+      const jobId = candidates[0].id;
+      await queryRunner.query(
+        `UPDATE production_jobs SET worker_status='running', status='running', current_step='package',
+         worker_id=$1, claimed_at=NOW(), lease_until=NOW()+($2*INTERVAL '1 second'),
+         attempt_count=COALESCE(attempt_count,0)+1, started_at=COALESCE(started_at,NOW()), updated_at=NOW()
+         WHERE id=$3`,
+        [workerId, leaseSeconds, jobId],
+      );
+      await queryRunner.commitTransaction();
+      this.logger.log(`Worker ${workerId} claimed backend_package job ${jobId}`);
+      return this.jobRepo.findOne({ where: { id: jobId }, relations: ['steps'] });
+    } catch (error) {
+      await queryRunner.rollbackTransaction(); throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async markPackageWorkerRunning(jobId: string, workerId: string): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+    job.status = 'running'; job.workerStatus = 'running'; job.currentStep = 'package';
+    job.startedAt = job.startedAt ?? new Date();
+    await this.jobRepo.save(job);
+    await this.upsertPackageWorkerStep(jobId, { status:'running', progress:5, startedAt:new Date(), detail:'Iniciando empaquetado' });
+    return true;
+  }
+
+  async updatePackageWorkerProgress(jobId: string, workerId: string, phase: string, message: string): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+    const phaseProgress: Record<string, number> = { checking_existing_package:10, preparing_package:40, validating_package:80, uploading_package:90 };
+    job.status = 'running'; job.workerStatus = 'running'; job.currentStep = 'package';
+    job.progress = Math.min(95, phaseProgress[phase] ?? Math.max(job.progress ?? 10, 10));
+    job.outputSummary = { ...(job.outputSummary ?? {}), phase, message, updatedAt: new Date().toISOString() };
+    await this.jobRepo.save(job);
+    await this.upsertPackageWorkerStep(jobId, { status:'running', progress:job.progress, detail:message });
+    return true;
+  }
+
+  async completePackageWorkerJob(jobId: string, workerId: string, summary: Record<string, any>): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+    const now = new Date();
+    job.status = 'completed'; job.workerStatus = 'completed'; job.currentStep = 'package';
+    job.progress = 100; job.finishedAt = now; job.leaseUntil = null; job.nextRetryAt = null;
+    job.errorMessage = null; job.errorStep = null;
+    job.outputSummary = { ...(job.outputSummary ?? {}), ...summary, phase:'completed', completedAt:now.toISOString() };
+    await this.jobRepo.save(job);
+    await this.upsertPackageWorkerStep(jobId, { status:'completed', progress:100, finishedAt:now, detail:'Paquete Moodle listo.', error:null });
+    return true;
+  }
+
+  async failPackageWorkerJob(jobId: string, workerId: string, error: Error | string, retryable: boolean): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+    const message = typeof error === 'string' ? error : error?.message || 'Unknown package worker error';
+    const now     = new Date();
+    const attemptsRemaining = (job.attemptCount ?? 0) < (job.maxAttempts ?? 3);
+    job.currentStep = 'package'; job.errorMessage = message; job.errorStep = 'package';
+    job.outputSummary = this.appendOutputError(job.outputSummary, { phase:'worker', message, retryable, attempt:job.attemptCount??0, workerId, at:now.toISOString() });
+    if (retryable && attemptsRemaining) {
+      job.workerStatus = 'retrying'; job.status = 'retrying';
+      job.nextRetryAt = this.buildRetryDate(job.attemptCount ?? 0); job.leaseUntil = null; job.workerId = null;
+      job.retryCount = (job.retryCount ?? 0) + 1;
+      await this.jobRepo.save(job);
+      const existingStep = await this.stepRepo.findOne({ where: { jobId, stepKey: 'package' } });
+      await this.upsertPackageWorkerStep(jobId, { status:'retrying', progress: existingStep?.progress ?? 5, detail:`Reintentando: ${message}`, error:message, retries:(existingStep?.retries??0)+1 });
+      return true;
+    }
+    job.workerStatus = retryable ? 'failed_recoverable' : 'failed';
+    job.status = retryable ? 'failed_recoverable' : 'failed';
+    job.finishedAt = now; job.nextRetryAt = null; job.leaseUntil = null;
+    await this.jobRepo.save(job);
+    await this.upsertPackageWorkerStep(jobId, { status:'failed', finishedAt:now, detail:`Empaquetado falló: ${message}`, error:message });
+    return true;
+  }
+
+  private async upsertPackageWorkerStep(jobId: string, dto: Partial<ProductionStep>): Promise<ProductionStep> {
+    let step = await this.stepRepo.findOne({ where: { jobId, stepKey: 'package' } });
+    if (!step) step = this.stepRepo.create({ jobId, stepKey: 'package' });
+    if (dto.status !== undefined)    step.status    = dto.status;
+    if (dto.progress !== undefined)  step.progress  = dto.progress;
+    if (dto.startedAt !== undefined) step.startedAt = dto.startedAt;
+    if (dto.finishedAt !== undefined)step.finishedAt= dto.finishedAt;
+    if (dto.error !== undefined)     step.error     = dto.error;
+    if (dto.detail !== undefined)    step.detail    = dto.detail;
+    if (dto.retries !== undefined)   step.retries   = dto.retries;
+    return this.stepRepo.save(step);
   }
 
   private async upsertAudioWorkerStep(

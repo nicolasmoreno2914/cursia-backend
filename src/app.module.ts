@@ -14,6 +14,7 @@ import { TtsModule } from './tts/tts.module';
 import { ProductionJobsModule } from './modules/production-jobs/production-jobs.module';
 import { ArtifactsModule } from './modules/artifacts/artifacts.module';
 import { ContentGenerationModule } from './modules/content-generation/content-generation.module';
+import { PackageModule } from './package/package.module';
 
 @Module({
   imports: [
@@ -33,6 +34,7 @@ import { ContentGenerationModule } from './modules/content-generation/content-ge
     AdminModule,
     VideoEngineModule,
     TtsModule,
+    PackageModule,
   ],
   controllers: [AppController],
   providers: [AppService],

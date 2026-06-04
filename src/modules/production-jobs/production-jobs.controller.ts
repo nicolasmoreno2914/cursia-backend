@@ -15,6 +15,7 @@ import { CreateJobDto } from './dto/create-job.dto';
 import { CreateContentJobDto } from './dto/create-content-job.dto';
 import { CreateVideoJobDto } from './dto/create-video-job.dto';
 import { CreateAudioJobDto } from './dto/create-audio-job.dto';
+import { CreatePackageJobDto } from './dto/create-package-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
 import { UpdateStepDto } from './dto/update-step.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
@@ -78,6 +79,20 @@ export class ProductionJobsController {
     @CurrentUser() user: AuthUser,
   ) {
     return this.jobsService.createAudioJob(user.id, dto);
+  }
+
+  /**
+   * POST /api/v1/jobs/package
+   * Crea un production_job para generación backend del paquete Moodle.
+   * Idempotente — si ya hay un job activo para el curso, lo devuelve.
+   */
+  @Post('package')
+  @HttpCode(HttpStatus.CREATED)
+  async createPackageJob(
+    @Body() dto: CreatePackageJobDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.jobsService.createPackageJob(user.id, dto);
   }
 
   /**
