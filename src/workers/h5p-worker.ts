@@ -539,6 +539,9 @@ async function handleJob(
       activities: activityStatuses,
     });
 
+    await sendHeartbeat();
+    if (leaseLost) return;
+
     const generatedAt = new Date().toISOString();
     const snapshot = {
       type: 'h5p_snapshot',

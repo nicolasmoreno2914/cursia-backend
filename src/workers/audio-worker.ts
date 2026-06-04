@@ -370,6 +370,8 @@ async function handleAudioJob(
         }
 
         if (welcomeBuffer && welcomeBuffer.length > 0) {
+          await sendHeartbeat();
+          if (leaseLost) return;
           const artifact = await uploadMp3Artifact(
             artifactsService, job.ownerId, rawCourseId, jobId, 'audio_welcome',
             welcomeBuffer,
@@ -495,6 +497,8 @@ async function handleAudioJob(
           if (leaseLost) return;
 
           if (audiobookBuffer && audiobookBuffer.length > 0) {
+            await sendHeartbeat();
+            if (leaseLost) return;
             const caps = Array.isArray(courseData.caps) ? courseData.caps : [];
             const artifact = await uploadMp3Artifact(
               artifactsService, job.ownerId, rawCourseId, jobId, 'audiobook',
@@ -530,6 +534,9 @@ async function handleAudioJob(
       outputSummary.audiobook = { status: 'skipped_optional' };
     }
 
+    if (leaseLost) return;
+
+    await sendHeartbeat();
     if (leaseLost) return;
 
     finalized = true;

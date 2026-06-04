@@ -556,6 +556,7 @@ async function bootstrap() {
     job:              ProductionJob,
     leaseLostRef:     { value: boolean },
     inlineVideogenJobs?: VideogenJobEntry[],   // passed from current session (avoid stale outputSummary)
+    heartbeatFn?:     () => Promise<void>,
   ): Promise<void> {
     const jobId = job.id;
     const currentSummary = (job.outputSummary ?? {}) as Record<string, any>;
@@ -703,6 +704,7 @@ async function bootstrap() {
 
       // 3. Upload each pending video with retry + backoff
       for (const vj of uploadable) {
+        if (heartbeatFn) await heartbeatFn();
         if (leaseLostRef.value || authBlocked || quotaBlocked) break;
 
         let success    = false;
@@ -710,6 +712,7 @@ async function bootstrap() {
         const maxRetries = 3;
 
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
+          if (heartbeatFn) await heartbeatFn();
           if (leaseLostRef.value) break;
           logger.log(`[YT] Job ${jobId} cap${vj.cap} "${vj.title}" — intento ${attempt}/${maxRetries}`);
 
@@ -755,6 +758,7 @@ async function bootstrap() {
               const backoffMs = attempt * 2000; // 2 s, 4 s
               logger.warn(`[YT] Job ${jobId} cap${vj.cap} error temporal (intento ${attempt}), reintentando en ${backoffMs}ms: ${lastError}`);
               await sleep(backoffMs);
+              if (heartbeatFn) await heartbeatFn();
             } else {
               logger.error(`[YT] Job ${jobId} cap${vj.cap} falló tras ${maxRetries} intentos: ${lastError}`);
             }
@@ -784,7 +788,20 @@ async function bootstrap() {
         }
       }
 
-      if (leaseLostRef.value) return;
+      if (leaseLostRef.value) {
+        if (uploads.length > 0) {
+          const partialSummary = {
+            ...currentSummary,
+            youtubeUploads: uploads,
+            uploadedCount: uploads.filter(u => u.status === 'uploaded').length,
+            failedUploadCount: uploads.filter(u => u.status === 'failed').length,
+            youtubePhase: 'cancelled',
+          };
+          const artifactId = await uploadVideoStateSnapshot(job, partialSummary, 'cancelled');
+          if (artifactId) await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
+        }
+        return;
+      }
       await handleYoutubeResults(uploads, authBlocked, quotaBlocked);
       return;
     }
@@ -816,6 +833,7 @@ async function bootstrap() {
     batchId:      string,
     titleMap:     Map<string, string>,
     leaseLostRef: { value: boolean },
+    heartbeatFn?: () => Promise<void>,
   ): Promise<void> {
     const jobId        = job.id;
     const maxPollMs    = maxPollMinutes * 60 * 1000;
@@ -829,6 +847,8 @@ async function bootstrap() {
       }
 
       // Get batch status — real or mock
+      if (heartbeatFn) await heartbeatFn();
+      if (leaseLostRef.value) return;
       const batchStatus: VideogenBatchStatus = mockVideogen
         ? mockGetBatchStatus(batchId, mockScenario, mockTimeoutPolls, logger)
         : await videogenService.getBatchStatus(batchId);
@@ -865,8 +885,10 @@ async function bootstrap() {
             if (!markedDone) {
               logger.warn(`Job ${jobId} could not be marked videogen_done — ownership changed`);
             } else {
+              if (heartbeatFn) await heartbeatFn();
+              if (leaseLostRef.value) return;
               logger.log(`Job ${jobId} Videogen done. Continuing to YouTube phase...`);
-              await youtubeUploadPhase(job, leaseLostRef, finalSummary.videogenJobs);
+              await youtubeUploadPhase(job, leaseLostRef, finalSummary.videogenJobs, heartbeatFn);
             }
           } else {
             // No YouTube — mark fully completed
@@ -874,6 +896,8 @@ async function bootstrap() {
             if (!ok) {
               logger.warn(`Job ${jobId} could not be marked complete — ownership changed`);
             } else {
+              if (heartbeatFn) await heartbeatFn();
+              if (leaseLostRef.value) return;
               logger.log(`Job ${jobId} completed: all ${total} videos ready${mockVideogen ? ' [MOCK]' : ''}`);
               const artifactId = await uploadVideoStateSnapshot(
                 job, { ...finalSummary, batchId }, 'videogen_completed',
@@ -1018,7 +1042,7 @@ async function bootstrap() {
         }
         const reason = currentSummary?.youtubePhase === 'pending_retry' ? 'requeue' : 'lease_expiry';
         logger.log(`Job ${jobId} re-claimed (${reason}) in phase=${currentPhase ?? 'n/a'} — entering YouTube upload`);
-        await youtubeUploadPhase(job, leaseLostRef);
+        await youtubeUploadPhase(job, leaseLostRef, undefined, sendHeartbeat);
         finalized = true;
         return;
       } else if (currentPhase === 'submitted' || currentPhase === 'polling') {
@@ -1081,7 +1105,7 @@ async function bootstrap() {
       }
 
       // ── Polling phase ──────────────────────────────────────────────────────
-      await pollUntilDone(job, batchId!, titleMap, leaseLostRef);
+      await pollUntilDone(job, batchId!, titleMap, leaseLostRef, sendHeartbeat);
       finalized = true;
 
     } catch (error) {

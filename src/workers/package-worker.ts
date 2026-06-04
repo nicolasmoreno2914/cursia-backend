@@ -228,6 +228,11 @@ async function handlePackageJob(
 
     // ── Step 5: Upload mbz_final artifact ────────────────────────────────────
     await updateProgress('uploading_package', 'Guardando paquete Moodle…');
+    await sendHeartbeat();
+    if (leaseLost) {
+      logger.warn(`[PackageWorker] Skipping mbz_final upload for job ${jobId} because the job was cancelled`);
+      return;
+    }
 
     const courseName = String(D.nombre ?? 'curso').replace(/[^a-zA-Z0-9_\-]/g, '_');
     const timestamp  = new Date().toISOString().replace(/[:.]/g, '-');
@@ -259,6 +264,9 @@ async function handlePackageJob(
       storageProvider: 'supabase',
     });
 
+    if (leaseLost) return;
+
+    await sendHeartbeat();
     if (leaseLost) return;
 
     finalized = true;

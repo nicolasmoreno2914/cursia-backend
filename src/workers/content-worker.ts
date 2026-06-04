@@ -325,6 +325,12 @@ async function bootstrap() {
         return;
       }
 
+      await sendHeartbeat();
+      if (leaseLost) {
+        logger.warn(`Skipping content snapshot upload for job ${jobId} because the job was cancelled`);
+        return;
+      }
+
       const snapshot = buildContentSnapshot(job, generated);
       validateContentSnapshot(snapshot);
 
@@ -358,6 +364,12 @@ async function bootstrap() {
         filesGenerated: finalSummary.filesGenerated,
         progressMap: generated.summary?.progressMap ?? aggregatedProgressMap,
       });
+
+      await sendHeartbeat();
+      if (leaseLost) {
+        logger.warn(`Skipping content completion for job ${jobId} because the job was cancelled`);
+        return;
+      }
 
       finalized = true;
       const completed = await jobsService.completeContentWorkerJob(

@@ -26,6 +26,24 @@ const STANDARD_STEPS = [
 ];
 
 const SENSITIVE_KEY_RE = /(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|bearer|secret|password)/i;
+const CANCELLATION_TERMINAL_STATUSES = new Set(['cancelled', 'cancelling']);
+const CANCELLABLE_CHILD_EXECUTION_MODES = new Set([
+  'backend_content',
+  'backend_audio',
+  'backend_videos',
+  'backend_h5p',
+  'backend_package',
+]);
+const CANCELLABLE_ACTIVE_STATUSES = new Set([
+  'queued',
+  'running',
+  'retrying',
+  'waiting_child',
+  'failed_recoverable',
+  'failed_retryable',
+  'needs_reconnect',
+  'blocked_quota',
+]);
 
 export interface ContentJobCreatedResponse {
   ok: true;
@@ -242,6 +260,86 @@ export class ProductionJobsService {
     if (!job) return null;
     if (job.workerId !== workerId) return null;
     return job;
+  }
+
+  private isCancelledLike(job: Pick<ProductionJob, 'status' | 'workerStatus'> | null | undefined): boolean {
+    if (!job) return false;
+    return CANCELLATION_TERMINAL_STATUSES.has(String(job.workerStatus || '').trim())
+      || CANCELLATION_TERMINAL_STATUSES.has(String(job.status || '').trim());
+  }
+
+  private appendCancellationSummary(
+    target: ProductionJob,
+    reason?: string | null,
+    requestedBy?: string | null,
+  ): Record<string, any> {
+    const nowIso = new Date().toISOString();
+    return {
+      ...(target.outputSummary ?? {}),
+      cancellation: {
+        requestedAt: nowIso,
+        requestedBy: requestedBy ?? null,
+        reason: reason || 'user_cancelled',
+      },
+      userMessage: 'Preparación cancelada. Tu curso sigue guardado.',
+      cancelledAt: nowIso,
+    };
+  }
+
+  private async markJobCancelledEntity(
+    target: ProductionJob,
+    reason?: string | null,
+    requestedBy?: string | null,
+  ): Promise<void> {
+    const now = new Date();
+    target.status = 'cancelled';
+    target.workerStatus = 'cancelled';
+    target.finishedAt = target.finishedAt ?? now;
+    target.nextRetryAt = null;
+    target.leaseUntil = null;
+    target.errorMessage = target.errorMessage ?? 'Preparación cancelada por el usuario.';
+    target.outputSummary = this.appendCancellationSummary(target, reason, requestedBy);
+    await this.jobRepo.save(target);
+  }
+
+  private async markAllOpenStepsCancelled(jobId: string): Promise<void> {
+    const steps = await this.stepRepo.find({ where: { jobId } });
+    if (!steps.length) return;
+    const now = new Date();
+    for (const step of steps) {
+      if (['completed', 'failed', 'skipped', 'cancelled'].includes(String(step.status || ''))) continue;
+      step.status = 'cancelled';
+      step.finishedAt = step.finishedAt ?? now;
+      step.detail = step.detail || 'Cancelado por el usuario';
+    }
+    await this.stepRepo.save(steps);
+  }
+
+  private async findCancellableJobsForCourse(
+    ownerId: string,
+    courseId: number | null,
+    frontendCourseId: string | null,
+  ): Promise<ProductionJob[]> {
+    const qb = this.jobRepo
+      .createQueryBuilder('job')
+      .where('job.owner_id = :ownerId', { ownerId })
+      .andWhere('job.execution_mode IN (:...modes)', { modes: Array.from(CANCELLABLE_CHILD_EXECUTION_MODES) })
+      .andWhere('job.worker_status IN (:...statuses)', { statuses: Array.from(CANCELLABLE_ACTIVE_STATUSES) });
+
+    if (courseId !== null && courseId !== undefined && frontendCourseId) {
+      qb.andWhere('(job.course_id = :courseId OR job.frontend_course_id = :frontendCourseId)', {
+        courseId,
+        frontendCourseId,
+      });
+    } else if (courseId !== null && courseId !== undefined) {
+      qb.andWhere('job.course_id = :courseId', { courseId });
+    } else if (frontendCourseId) {
+      qb.andWhere('job.frontend_course_id = :frontendCourseId', { frontendCourseId });
+    } else {
+      return [];
+    }
+
+    return qb.getMany();
   }
 
   private async upsertWorkerStep(
@@ -544,6 +642,7 @@ export class ProductionJobsService {
   async markVideoWorkerRunning(jobId: string, workerId: string): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     job.status = 'running';
     job.workerStatus = 'running';
@@ -568,6 +667,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     const now = new Date();
     job.status = 'completed';
@@ -604,6 +704,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     job.status = 'running';
     job.workerStatus = 'running';
@@ -687,6 +788,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     const total = summary.total > 0 ? summary.total : 1;
     const completedRatio = Math.min(summary.completed, total) / total;
@@ -719,6 +821,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     const now = new Date();
     job.status = 'completed';
@@ -755,6 +858,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     const message =
       typeof error === 'string' ? error : error?.message || 'Unknown video worker error';
@@ -797,6 +901,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     job.status = 'running';
     job.workerStatus = 'running';
@@ -824,6 +929,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     job.status = 'running';
     job.workerStatus = 'running';
@@ -852,6 +958,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     const now = new Date();
     job.status = 'completed';
@@ -888,6 +995,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     const now = new Date();
     const newStatus = summary.phase === 'blocked_quota' ? 'failed_recoverable' : 'failed_recoverable';
@@ -931,6 +1039,7 @@ export class ProductionJobsService {
     if (!job) return { ok: false, reason: 'not_found' };
     if (job.ownerId !== userId) return { ok: false, reason: 'forbidden' };
     if (job.executionMode !== 'backend_videos') return { ok: false, reason: 'not_a_video_job' };
+    if (this.isCancelledLike(job)) return { ok: false, reason: 'job_cancelled' };
 
     const allowedStatuses = ['failed_recoverable', 'failed'];
     if (!allowedStatuses.includes(job.status)) {
@@ -1151,6 +1260,7 @@ export class ProductionJobsService {
   async markAudioWorkerRunning(jobId: string, workerId: string): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     job.status = 'running';
     job.workerStatus = 'running';
@@ -1175,6 +1285,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     const phaseProgress: Record<string, number> = {
       generating_welcome: 20,
@@ -1212,6 +1323,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     const now = new Date();
     const isPartial = summary.audiobook?.status === 'failed_retryable' || summary.audiobook?.status === 'skipped_optional';
@@ -1255,6 +1367,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     const message =
       typeof error === 'string' ? error : error?.message || 'Unknown audio worker error';
@@ -1442,6 +1555,7 @@ export class ProductionJobsService {
   async markH5PWorkerRunning(jobId: string, workerId: string): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     job.status = 'running';
     job.workerStatus = 'running';
@@ -1465,6 +1579,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     const phaseProgress: Record<string, number> = {
       checking_existing_h5p: 10,
@@ -1505,6 +1620,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     const now = new Date();
     const phase = summary.h5pSnapshot?.status === 'partial' ? 'partial' : 'completed';
@@ -1546,6 +1662,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     const message = typeof error === 'string' ? error : error?.message || 'Unknown h5p worker error';
     const now = new Date();
@@ -1711,6 +1828,7 @@ export class ProductionJobsService {
   async markPackageWorkerRunning(jobId: string, workerId: string): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
     job.status = 'running'; job.workerStatus = 'running'; job.currentStep = 'package';
     job.startedAt = job.startedAt ?? new Date();
     await this.jobRepo.save(job);
@@ -1721,6 +1839,7 @@ export class ProductionJobsService {
   async updatePackageWorkerProgress(jobId: string, workerId: string, phase: string, message: string): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
     const phaseProgress: Record<string, number> = { checking_existing_package:10, preparing_package:40, validating_package:80, uploading_package:90 };
     job.status = 'running'; job.workerStatus = 'running'; job.currentStep = 'package';
     job.progress = Math.min(95, phaseProgress[phase] ?? Math.max(job.progress ?? 10, 10));
@@ -1733,6 +1852,7 @@ export class ProductionJobsService {
   async completePackageWorkerJob(jobId: string, workerId: string, summary: Record<string, any>): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
     const now = new Date();
     job.status = 'completed'; job.workerStatus = 'completed'; job.currentStep = 'package';
     job.progress = 100; job.finishedAt = now; job.leaseUntil = null; job.nextRetryAt = null;
@@ -1746,6 +1866,7 @@ export class ProductionJobsService {
   async failPackageWorkerJob(jobId: string, workerId: string, error: Error | string, retryable: boolean): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
     const message = typeof error === 'string' ? error : error?.message || 'Unknown package worker error';
     const now     = new Date();
     const attemptsRemaining = (job.attemptCount ?? 0) < (job.maxAttempts ?? 3);
@@ -1882,6 +2003,7 @@ export class ProductionJobsService {
   async markContentWorkerRunning(jobId: string, workerId: string): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     job.status = 'running';
     job.workerStatus = 'running';
@@ -1906,6 +2028,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     const now = new Date();
     job.status = 'completed';
@@ -1942,6 +2065,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     const progressTotals = summary.progressMap
       ? Object.values(summary.progressMap).reduce(
@@ -1997,6 +2121,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     const now = new Date();
     job.status = 'completed';
@@ -2040,6 +2165,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     const message =
       typeof error === 'string'
@@ -2140,10 +2266,66 @@ export class ProductionJobsService {
     return job;
   }
 
+  async isJobCancelled(jobId: string): Promise<boolean> {
+    const job = await this.jobRepo.findOne({
+      where: { id: jobId },
+      select: { id: true, status: true, workerStatus: true } as any,
+    });
+    return this.isCancelledLike(job);
+  }
+
+  async isWorkerJobCancelled(jobId: string, workerId: string): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return true;
+    return this.isCancelledLike(job);
+  }
+
+  async cancelJob(
+    jobId: string,
+    ownerId: string,
+    reason?: string | null,
+  ): Promise<{ ok: true; cancelledJobIds: string[]; cascadedChildJobIds: string[]; job: ProductionJob }> {
+    const job = await this.findOne(jobId, ownerId);
+    if (job.executionMode !== 'course_full_generation') {
+      throw new BadRequestException('Solo se puede cancelar la preparación completa del curso');
+    }
+
+    const alreadyCancelled = this.isCancelledLike(job);
+    const cancelledJobIds: string[] = [];
+    const cascadedChildJobIds: string[] = [];
+
+    if (!alreadyCancelled) {
+      await this.markJobCancelledEntity(job, reason, ownerId);
+      await this.markAllOpenStepsCancelled(job.id);
+      cancelledJobIds.push(job.id);
+    }
+
+    const childJobs = await this.findCancellableJobsForCourse(
+      job.ownerId,
+      job.courseId ?? null,
+      job.frontendCourseId ?? null,
+    );
+
+    for (const child of childJobs) {
+      if (child.id === job.id) continue;
+      if (this.isCancelledLike(child)) continue;
+      await this.markJobCancelledEntity(child, reason || 'parent_cancelled', ownerId);
+      await this.markAllOpenStepsCancelled(child.id);
+      cascadedChildJobIds.push(child.id);
+    }
+
+    const fresh = await this.findOne(jobId, ownerId);
+    return { ok: true, cancelledJobIds, cascadedChildJobIds, job: fresh };
+  }
+
   // ── UPDATE JOB ──────────────────────────────────────────────────────────────
 
   async update(id: string, dto: UpdateJobDto, ownerId: string): Promise<ProductionJob> {
     const job = await this.findOne(id, ownerId);
+
+    if (this.isCancelledLike(job)) {
+      return job;
+    }
 
     if (dto.status)        job.status       = dto.status;
     if (dto.current_step)  job.currentStep  = dto.current_step;
@@ -2307,6 +2489,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     job.status = 'running';
     job.workerStatus = 'running';
@@ -2327,6 +2510,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     const now = new Date();
     job.status        = 'completed';
@@ -2353,6 +2537,7 @@ export class ProductionJobsService {
   ): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
 
     const message = typeof error === 'string' ? error : error?.message || 'Unknown full-course error';
     const now     = new Date();
@@ -2386,6 +2571,7 @@ export class ProductionJobsService {
   async blockFullCourseJobAuth(jobId: string, workerId: string, videoJobId: string): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
     const now = new Date();
     job.status       = 'needs_reconnect';
     job.workerStatus = 'needs_reconnect';
@@ -2405,6 +2591,7 @@ export class ProductionJobsService {
   async blockFullCourseJobQuota(jobId: string, workerId: string, videoJobId: string): Promise<boolean> {
     const job = await this.findJobForWorker(jobId, workerId);
     if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
     const now = new Date();
     job.status       = 'blocked_quota';
     job.workerStatus = 'blocked_quota';
@@ -2426,6 +2613,7 @@ export class ProductionJobsService {
     if (!job) return { ok: false, reason: 'not_found' };
     if (job.ownerId !== userId) return { ok: false, reason: 'forbidden' };
     if (job.executionMode !== 'course_full_generation') return { ok: false, reason: 'not_a_full_course_job' };
+    if (this.isCancelledLike(job)) return { ok: false, reason: 'job_cancelled' };
 
     const retryableStatuses = ['failed_retryable', 'failed', 'needs_reconnect', 'blocked_quota', 'failed_recoverable'];
     if (!retryableStatuses.includes(job.status)) {

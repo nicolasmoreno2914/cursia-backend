@@ -213,6 +213,9 @@ async function waitForChildJob(
   while (Date.now() < deadline) {
     await sleep(pollMs);
     await heartbeatFn();
+    if ((await jobsService.isJobCancelled(childJobId)) === true) {
+      return { ok: false, status: 'cancelled', outputSummary: {}, error: `Child job ${childJobId} cancelled` };
+    }
 
     const job = await jobsService.findJobByIdInternal(childJobId);
     if (!job) {
@@ -227,6 +230,10 @@ async function waitForChildJob(
 
     if (FAILED_STATUSES.has(ws)) {
       return { ok: false, status: ws, outputSummary: job.outputSummary ?? {}, error: job.errorMessage ?? 'job failed' };
+    }
+
+    if (ws === 'cancelled' || ws === 'cancelling') {
+      return { ok: false, status: 'cancelled', outputSummary: job.outputSummary ?? {}, error: job.errorMessage ?? 'job cancelled' };
     }
 
     if (BLOCKED_STATUSES.has(ws)) {
@@ -308,6 +315,8 @@ async function handleFullCourseJob(
       logger.log(`[FullCourseWorker] content_snapshot already exists (${contentSnapshotArtifactId})`);
       await updateStep('content', 'Contenido encontrado ✓', { steps: { content: { status: 'restored', artifactId: contentSnapshotArtifactId } } });
     } else {
+      await sendHeartbeat();
+      if (leaseLost) return;
       const contentJobId = await ensureChildJob('backend_content', job, courseId, {}, jobsService, logger);
       if (!contentJobId) throw new Error('No se pudo crear el job de contenido');
       if (leaseLost) return;
@@ -316,6 +325,7 @@ async function handleFullCourseJob(
       if (leaseLost) return;
 
       if (!contentResult.ok) {
+        if (contentResult.status === 'cancelled') return;
         throw new Error(`Generación de contenido falló: ${contentResult.error}`);
       }
 
@@ -364,6 +374,8 @@ async function handleFullCourseJob(
       }
 
       if (!audioWelcomeArtifactId) {
+        await sendHeartbeat();
+        if (leaseLost) return;
         const audioJobId = await ensureChildJob('backend_audio', job, courseId, {
           contentSnapshotArtifactId,
         }, jobsService, logger);
@@ -392,8 +404,10 @@ async function handleFullCourseJob(
           } else if (opts.audiobookOptional !== false) {
             // Audio failed but is optional — continue (no audiobook, no welcome audio)
             logger.warn(`[FullCourseWorker] Audio job failed but optional: ${audioResult.error}`);
+            if (audioResult.status === 'cancelled') return;
           } else {
             // Audio welcome is required — fail the job
+            if (audioResult.status === 'cancelled') return;
             throw new Error(`Generación de audio falló: ${audioResult.error}`);
           }
         }
@@ -422,6 +436,8 @@ async function handleFullCourseJob(
           steps: { video: { status: 'restored', artifactId: videoStateSnapshotArtifactId } },
         });
       } else {
+        await sendHeartbeat();
+        if (leaseLost) return;
         const videoJobId = await ensureChildJob('backend_videos', job, courseId, {}, jobsService, logger);
 
         if (videoJobId) {
@@ -444,6 +460,7 @@ async function handleFullCourseJob(
             return;
           }
           if (!videoResult.ok) {
+            if (videoResult.status === 'cancelled') return;
             // Video failed but not blocking — log and continue (videos are optional for package)
             logger.warn(`[FullCourseWorker] Video job failed (non-blocking): ${videoResult.error}`);
           } else {
@@ -481,6 +498,8 @@ async function handleFullCourseJob(
         steps: { h5p: { status: 'skipped' } },
       });
     } else {
+      await sendHeartbeat();
+      if (leaseLost) return;
       const latestVideoJob = await jobsService.findLatestChildJobForCourse(ownerId, courseId, 'backend_videos');
       const youtubeUploads = Array.isArray(latestVideoJob?.outputSummary?.youtubeUploads)
         ? latestVideoJob?.outputSummary?.youtubeUploads
@@ -501,6 +520,7 @@ async function handleFullCourseJob(
       if (leaseLost) return;
 
       if (!h5pResult.ok) {
+        if (h5pResult.status === 'cancelled') return;
         throw new Error(`Preparación de actividades falló: ${h5pResult.error}`);
       }
 
@@ -553,6 +573,7 @@ async function handleFullCourseJob(
     if (leaseLost) return;
 
     if (!packageResult.ok) {
+      if (packageResult.status === 'cancelled') return;
       throw new Error(`Empaquetado falló: ${packageResult.error}`);
     }
 

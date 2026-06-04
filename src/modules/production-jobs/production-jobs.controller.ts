@@ -226,4 +226,22 @@ export class ProductionJobsController {
     }
     return { ok: true };
   }
+
+  @Post(':id/cancel')
+  @HttpCode(HttpStatus.OK)
+  async cancelJob(
+    @Param('id') id: string,
+    @Body('reason') reason: string | undefined,
+    @CurrentUser() user: AuthUser,
+  ) {
+    const result = await this.jobsService.cancelJob(id, user.id, reason);
+    return {
+      ok: true,
+      data: {
+        job: result.job,
+        cancelledJobIds: result.cancelledJobIds,
+        cascadedChildJobIds: result.cascadedChildJobIds,
+      },
+    };
+  }
 }
