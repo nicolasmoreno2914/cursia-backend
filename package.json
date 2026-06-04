@@ -13,6 +13,8 @@
     "start:video-worker:dev": "ts-node src/workers/video-worker.ts",
     "start:audio-worker": "node dist/workers/audio-worker.js",
     "start:audio-worker:dev": "ts-node src/workers/audio-worker.ts",
+    "start:h5p-worker": "node dist/workers/h5p-worker.js",
+    "start:h5p-worker:dev": "ts-node src/workers/h5p-worker.ts",
     "start:package-worker": "node dist/workers/package-worker.js",
     "start:package-worker:dev": "ts-node src/workers/package-worker.ts",
     "start:full-worker": "node dist/workers/full-course-worker.js",

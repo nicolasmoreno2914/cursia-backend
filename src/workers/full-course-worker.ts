@@ -149,6 +149,21 @@ async function ensureChildJob(
         metadata: { source: 'full_course_worker', parentJobId: parentJob.id },
       } as any);
       res = r;
+    } else if (executionMode === 'backend_h5p') {
+      const r = await jobsService.createH5PJob(ownerId, {
+        courseId,
+        courseTitle: payload.courseTitle ?? input.courseData?.nombre ?? null,
+        courseData: payload.courseData ?? input.courseData ?? {},
+        contentSnapshotArtifactId: payload.contentSnapshotArtifactId ?? null,
+        videoStateSnapshotArtifactId: payload.videoStateSnapshotArtifactId ?? null,
+        youtubeUploads: payload.youtubeUploads ?? [],
+        options: {
+          restoreFirst: true,
+          requireYoutubeUrls: true,
+        },
+        metadata: { source: 'full_course_worker', parentJobId: parentJob.id },
+      } as any);
+      res = r;
     } else if (executionMode === 'backend_package') {
       const r = await jobsService.createPackageJob(ownerId, {
         courseId,
@@ -329,6 +344,8 @@ async function handleFullCourseJob(
     // ── 2. Audio ──────────────────────────────────────────────────────────────
     let audioWelcomeArtifactId: string | null = null;
     let audiobookArtifactId:    string | null = null;
+    let videoStateSnapshotArtifactId: string | null = null;
+    let h5pSnapshotArtifactId: string | null = null;
 
     if (opts.generateAudio !== false) {
       await updateStep('audio', 'Creando audios…');
@@ -399,8 +416,11 @@ async function handleFullCourseJob(
 
       const existingVideoArt = await findLatestArtifact(artifactsService, ownerId, courseId, 'video_state_snapshot');
       if (existingVideoArt) {
+        videoStateSnapshotArtifactId = existingVideoArt.id;
         logger.log(`[FullCourseWorker] video_state_snapshot already exists — skipping video step`);
-        await updateStep('video', 'Videos encontrados ✓', { steps: { video: { status: 'restored' } } });
+        await updateStep('video', 'Videos encontrados ✓', {
+          steps: { video: { status: 'restored', artifactId: videoStateSnapshotArtifactId } },
+        });
       } else {
         const videoJobId = await ensureChildJob('backend_videos', job, courseId, {}, jobsService, logger);
 
@@ -427,7 +447,17 @@ async function handleFullCourseJob(
             // Video failed but not blocking — log and continue (videos are optional for package)
             logger.warn(`[FullCourseWorker] Video job failed (non-blocking): ${videoResult.error}`);
           } else {
-            await updateStep('video', 'Videos listos ✓', { steps: { video: { status: 'completed' } } });
+            videoStateSnapshotArtifactId =
+              videoResult.outputSummary.videoStateSnapshotArtifactId
+              ?? (videoResult.outputSummary.artifactIds as Record<string, any> | undefined)?.videoStateSnapshot
+              ?? null;
+            if (!videoStateSnapshotArtifactId) {
+              const art = await findLatestArtifact(artifactsService, ownerId, courseId, 'video_state_snapshot');
+              videoStateSnapshotArtifactId = art?.id ?? null;
+            }
+            await updateStep('video', 'Videos listos ✓', {
+              steps: { video: { status: 'completed', artifactId: videoStateSnapshotArtifactId } },
+            });
           }
         }
       }
@@ -435,20 +465,68 @@ async function handleFullCourseJob(
 
     if (leaseLost) return;
 
-    // ── 4. H5P (detect from artifact — no backend worker yet) ────────────────
-    await updateStep('h5p', 'Verificando actividades interactivas…');
+    // ── 4. H5P ───────────────────────────────────────────────────────────────
+    await updateStep('h5p', 'Creando actividades…');
 
     const h5pArtifact = await findLatestArtifact(artifactsService, ownerId, courseId, 'h5p_snapshot');
-    const h5pSnapshotArtifactId = h5pArtifact?.id ?? null;
+    h5pSnapshotArtifactId = h5pArtifact?.id ?? null;
     if (h5pSnapshotArtifactId) {
       logger.log(`[FullCourseWorker] h5p_snapshot exists (${h5pSnapshotArtifactId})`);
-      await updateStep('h5p', 'Actividades interactivas encontradas ✓', {
+      await updateStep('h5p', 'Actividades listas ✓', {
         steps: { h5p: { status: 'restored', artifactId: h5pSnapshotArtifactId } },
       });
-    } else {
-      logger.log(`[FullCourseWorker] No h5p_snapshot found — paquete se creará sin actividades interactivas`);
-      await updateStep('h5p', 'Sin actividades interactivas — se incluirán si el usuario las genera', {
+    } else if (opts.generateVideos === false || opts.uploadToYoutube === false) {
+      logger.log('[FullCourseWorker] H5P skipped because videos/YouTube are disabled by options');
+      await updateStep('h5p', 'Actividades omitidas en esta preparación', {
         steps: { h5p: { status: 'skipped' } },
+      });
+    } else {
+      const latestVideoJob = await jobsService.findLatestChildJobForCourse(ownerId, courseId, 'backend_videos');
+      const youtubeUploads = Array.isArray(latestVideoJob?.outputSummary?.youtubeUploads)
+        ? latestVideoJob?.outputSummary?.youtubeUploads
+        : [];
+
+      const h5pJobId = await ensureChildJob('backend_h5p', job, courseId, {
+        courseTitle: input.courseData?.nombre ?? null,
+        courseData: input.courseData ?? {},
+        contentSnapshotArtifactId,
+        videoStateSnapshotArtifactId,
+        youtubeUploads,
+      }, jobsService, logger);
+
+      if (!h5pJobId) throw new Error('No se pudo crear el job de actividades interactivas');
+      if (leaseLost) return;
+
+      const h5pResult = await waitForChildJob(h5pJobId, jobsService, sendHeartbeat, logger);
+      if (leaseLost) return;
+
+      if (!h5pResult.ok) {
+        throw new Error(`Preparación de actividades falló: ${h5pResult.error}`);
+      }
+
+      h5pSnapshotArtifactId =
+        h5pResult.outputSummary.h5pSnapshotArtifactId
+        ?? (h5pResult.outputSummary.h5pSnapshot as Record<string, any> | undefined)?.artifactId
+        ?? (h5pResult.outputSummary.artifactIds as Record<string, any> | undefined)?.h5pSnapshot
+        ?? null;
+
+      if (!h5pSnapshotArtifactId) {
+        const art = await findLatestArtifact(artifactsService, ownerId, courseId, 'h5p_snapshot');
+        h5pSnapshotArtifactId = art?.id ?? null;
+      }
+
+      if (!h5pSnapshotArtifactId) {
+        throw new Error('Las actividades se generaron, pero no se encontró su copia guardada');
+      }
+
+      const h5pStatus = (h5pResult.outputSummary.h5pSnapshot as Record<string, any> | undefined)?.status ?? 'completed';
+      const h5pMessage = h5pStatus === 'partial'
+        ? 'Actividades listas con algunas omisiones'
+        : 'Actividades listas ✓';
+
+      await updateStep('h5p', h5pMessage, {
+        h5pSnapshotArtifactId,
+        steps: { h5p: { status: h5pStatus, artifactId: h5pSnapshotArtifactId } },
       });
     }
 

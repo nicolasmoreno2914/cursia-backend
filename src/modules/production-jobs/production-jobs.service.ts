@@ -13,6 +13,7 @@ import { CreateJobDto } from './dto/create-job.dto';
 import { CreateContentJobDto } from './dto/create-content-job.dto';
 import { CreateVideoJobDto } from './dto/create-video-job.dto';
 import { CreateAudioJobDto } from './dto/create-audio-job.dto';
+import { CreateH5PJobDto } from './dto/create-h5p-job.dto';
 import { CreatePackageJobDto } from './dto/create-package-job.dto';
 import { CreateFullCourseJobDto } from './dto/create-full-course-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
@@ -149,6 +150,30 @@ export interface AudioWorkerProgressSummary {
   message?: string | null;
   welcomeAudio?: Record<string, any>;
   audiobook?: Record<string, any>;
+}
+
+export interface H5PJobCreatedResponse {
+  ok: true;
+  jobId: string;
+  status: string;
+  workerStatus: string;
+  executionMode: string;
+  currentStep: string;
+}
+
+export interface H5PWorkerProgressSummary {
+  phase:
+    | 'checking_existing_h5p'
+    | 'reading_course_content'
+    | 'reading_video_urls'
+    | 'creating_activities'
+    | 'uploading_h5p_snapshot'
+    | string;
+  message?: string | null;
+  activityCount?: number;
+  chaptersWithActivities?: number[];
+  chaptersSkipped?: number[];
+  activities?: Array<Record<string, any>>;
 }
 
 export interface PackageJobCreatedResponse {
@@ -1286,6 +1311,308 @@ export class ProductionJobsService {
     });
 
     return true;
+  }
+
+  // ── H5P job methods ───────────────────────────────────────────────────────
+
+  async createH5PJob(
+    ownerId: string,
+    dto: CreateH5PJobDto,
+  ): Promise<H5PJobCreatedResponse> {
+    if (!dto.courseId) throw new BadRequestException('courseId is required');
+    if (!dto.contentSnapshotArtifactId) {
+      throw new BadRequestException('contentSnapshotArtifactId is required');
+    }
+
+    const rawCourseId = dto.courseId;
+    const numericCourseId = rawCourseId ? parseInt(rawCourseId, 10) : NaN;
+    const activeStatuses = ['queued', 'running', 'retrying'];
+
+    const qb = this.jobRepo.createQueryBuilder('job')
+      .where('job.owner_id = :ownerId', { ownerId })
+      .andWhere('job.execution_mode = :executionMode', { executionMode: 'backend_h5p' })
+      .andWhere('job.worker_status IN (:...activeStatuses)', { activeStatuses });
+
+    if (!isNaN(numericCourseId)) {
+      qb.andWhere('(job.course_id = :courseId OR job.frontend_course_id = :frontendCourseId)', {
+        courseId: numericCourseId,
+        frontendCourseId: rawCourseId,
+      });
+    } else {
+      qb.andWhere('job.frontend_course_id = :frontendCourseId', { frontendCourseId: rawCourseId });
+    }
+
+    const activeExisting = await qb.getOne();
+    if (activeExisting) {
+      return {
+        ok: true,
+        jobId: activeExisting.id,
+        status: activeExisting.status,
+        workerStatus: activeExisting.workerStatus,
+        executionMode: activeExisting.executionMode,
+        currentStep: activeExisting.currentStep,
+      };
+    }
+
+    const sanitized = this.sanitizePayload({
+      courseId: rawCourseId,
+      courseTitle: dto.courseTitle ?? null,
+      executionMode: 'backend_h5p',
+      contentSnapshotArtifactId: dto.contentSnapshotArtifactId,
+      videoStateSnapshotArtifactId: dto.videoStateSnapshotArtifactId ?? null,
+      youtubeUploads: dto.youtubeUploads ?? [],
+      courseData: dto.courseData ?? {},
+      options: {
+        restoreFirst: dto.options?.restoreFirst !== false,
+        requireYoutubeUrls: dto.options?.requireYoutubeUrls !== false,
+      },
+      metadata: dto.metadata ?? {},
+    });
+
+    const job = this.jobRepo.create({
+      ownerId,
+      courseId: !isNaN(numericCourseId) ? numericCourseId : null,
+      frontendCourseId: rawCourseId,
+      frontendJobId: dto.frontendJobId ?? null,
+      options: dto.options ?? {},
+      status: 'queued',
+      currentStep: 'h5p',
+      progress: 0,
+      executionMode: 'backend_h5p',
+      workerStatus: 'queued',
+      inputPayload: sanitized,
+      outputSummary: {},
+    });
+    const saved = await this.jobRepo.save(job);
+
+    let step = await this.stepRepo.findOne({ where: { jobId: saved.id, stepKey: 'h5p' } });
+    if (!step) step = this.stepRepo.create({ jobId: saved.id, stepKey: 'h5p' });
+    step.status = 'queued';
+    step.progress = 0;
+    step.detail = 'Esperando preparación de actividades';
+    await this.stepRepo.save(step);
+
+    return {
+      ok: true,
+      jobId: saved.id,
+      status: saved.status,
+      workerStatus: saved.workerStatus,
+      executionMode: saved.executionMode,
+      currentStep: saved.currentStep,
+    };
+  }
+
+  async claimNextBackendH5PJob(workerId: string, leaseSeconds: number): Promise<ProductionJob | null> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      const candidates = await queryRunner.query(
+        `SELECT id FROM production_jobs WHERE execution_mode = 'backend_h5p'
+         AND worker_status IN ('queued','retrying')
+         AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+         AND (lease_until IS NULL OR lease_until < NOW())
+         ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED`,
+      );
+      if (!Array.isArray(candidates) || candidates.length === 0) {
+        await queryRunner.commitTransaction();
+        return null;
+      }
+
+      const jobId = candidates[0].id;
+      await queryRunner.query(
+        `UPDATE production_jobs SET worker_status='running', status='running', current_step='h5p',
+         worker_id=$1, claimed_at=NOW(), lease_until=NOW()+($2*INTERVAL '1 second'),
+         attempt_count=COALESCE(attempt_count,0)+1, started_at=COALESCE(started_at,NOW()), updated_at=NOW()
+         WHERE id=$3`,
+        [workerId, leaseSeconds, jobId],
+      );
+
+      await queryRunner.commitTransaction();
+      this.logger.log(`Worker ${workerId} claimed backend_h5p job ${jobId}`);
+      return this.jobRepo.findOne({ where: { id: jobId }, relations: ['steps'] });
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async markH5PWorkerRunning(jobId: string, workerId: string): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    job.status = 'running';
+    job.workerStatus = 'running';
+    job.currentStep = 'h5p';
+    job.startedAt = job.startedAt ?? new Date();
+    await this.jobRepo.save(job);
+
+    await this.upsertH5PWorkerStep(jobId, {
+      status: 'running',
+      progress: 5,
+      startedAt: new Date(),
+      detail: 'Preparando actividades interactivas',
+    });
+    return true;
+  }
+
+  async updateH5PWorkerProgress(
+    jobId: string,
+    workerId: string,
+    summary: H5PWorkerProgressSummary,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    const phaseProgress: Record<string, number> = {
+      checking_existing_h5p: 10,
+      reading_course_content: 25,
+      reading_video_urls: 45,
+      creating_activities: 70,
+      uploading_h5p_snapshot: 90,
+    };
+
+    job.status = 'running';
+    job.workerStatus = 'running';
+    job.currentStep = 'h5p';
+    job.progress = Math.min(95, phaseProgress[summary.phase] ?? Math.max(job.progress ?? 10, 10));
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      phase: summary.phase,
+      message: summary.message ?? null,
+      activityCount: summary.activityCount ?? (job.outputSummary?.activityCount ?? 0),
+      chaptersWithActivities: summary.chaptersWithActivities ?? (job.outputSummary?.chaptersWithActivities ?? []),
+      chaptersSkipped: summary.chaptersSkipped ?? (job.outputSummary?.chaptersSkipped ?? []),
+      activities: summary.activities ?? (job.outputSummary?.activities ?? []),
+      updatedAt: new Date().toISOString(),
+    };
+    await this.jobRepo.save(job);
+
+    await this.upsertH5PWorkerStep(jobId, {
+      status: 'running',
+      progress: job.progress,
+      detail: summary.message ?? 'Creando actividades',
+    });
+    return true;
+  }
+
+  async completeH5PWorkerJob(
+    jobId: string,
+    workerId: string,
+    summary: Record<string, any>,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    const now = new Date();
+    const phase = summary.h5pSnapshot?.status === 'partial' ? 'partial' : 'completed';
+    const detail = summary.h5pSnapshot?.humanMessage
+      ?? (phase === 'partial' ? 'Actividades listas con algunas omisiones.' : 'Actividades listas.');
+
+    job.status = 'completed';
+    job.workerStatus = 'completed';
+    job.currentStep = 'h5p';
+    job.progress = 100;
+    job.finishedAt = now;
+    job.leaseUntil = null;
+    job.nextRetryAt = null;
+    job.errorMessage = null;
+    job.errorStep = null;
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      ...summary,
+      phase,
+      completedAt: now.toISOString(),
+    };
+    await this.jobRepo.save(job);
+
+    await this.upsertH5PWorkerStep(jobId, {
+      status: 'completed',
+      progress: 100,
+      finishedAt: now,
+      detail,
+      error: null,
+    });
+    return true;
+  }
+
+  async failH5PWorkerJob(
+    jobId: string,
+    workerId: string,
+    error: Error | string,
+    retryable: boolean,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    const message = typeof error === 'string' ? error : error?.message || 'Unknown h5p worker error';
+    const now = new Date();
+    const attemptsRemaining = (job.attemptCount ?? 0) < (job.maxAttempts ?? 3);
+
+    const errorEntry = {
+      phase: 'worker',
+      message,
+      retryable,
+      attempt: job.attemptCount ?? 0,
+      workerId,
+      at: now.toISOString(),
+    };
+
+    job.currentStep = 'h5p';
+    job.progress = Math.max(0, job.progress ?? 0);
+    job.errorMessage = message;
+    job.errorStep = 'h5p';
+    job.outputSummary = this.appendOutputError(job.outputSummary, errorEntry);
+
+    if (retryable && attemptsRemaining) {
+      job.workerStatus = 'retrying';
+      job.status = 'retrying';
+      job.nextRetryAt = this.buildRetryDate(job.attemptCount ?? 0);
+      job.leaseUntil = null;
+      job.workerId = null;
+      job.retryCount = (job.retryCount ?? 0) + 1;
+      await this.jobRepo.save(job);
+
+      const existingStep = await this.stepRepo.findOne({ where: { jobId, stepKey: 'h5p' } });
+      await this.upsertH5PWorkerStep(jobId, {
+        status: 'retrying',
+        progress: existingStep?.progress ?? 5,
+        detail: `Reintentando actividades: ${message}`,
+        error: message,
+        retries: (existingStep?.retries ?? 0) + 1,
+      });
+      return true;
+    }
+
+    job.workerStatus = retryable ? 'failed_recoverable' : 'failed';
+    job.status = retryable ? 'failed_retryable' : 'failed';
+    job.finishedAt = now;
+    job.nextRetryAt = null;
+    job.leaseUntil = null;
+    await this.jobRepo.save(job);
+
+    await this.upsertH5PWorkerStep(jobId, {
+      status: 'failed',
+      finishedAt: now,
+      detail: `Actividades no disponibles: ${message}`,
+      error: message,
+    });
+    return true;
+  }
+
+  private async upsertH5PWorkerStep(jobId: string, dto: Partial<ProductionStep>): Promise<ProductionStep> {
+    let step = await this.stepRepo.findOne({ where: { jobId, stepKey: 'h5p' } });
+    if (!step) step = this.stepRepo.create({ jobId, stepKey: 'h5p' });
+    if (dto.status !== undefined) step.status = dto.status;
+    if (dto.progress !== undefined) step.progress = dto.progress;
+    if (dto.startedAt !== undefined) step.startedAt = dto.startedAt;
+    if (dto.finishedAt !== undefined) step.finishedAt = dto.finishedAt;
+    if (dto.error !== undefined) step.error = dto.error;
+    if (dto.detail !== undefined) step.detail = dto.detail;
+    if (dto.retries !== undefined) step.retries = dto.retries;
+    return this.stepRepo.save(step);
   }
 
   // ── Package job methods ────────────────────────────────────────────────────
