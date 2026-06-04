@@ -1,5 +1,5 @@
 import 'reflect-metadata';
-import { Logger } from '@nestjs/common';
+import { Logger, UnauthorizedException } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from '../app.module';
 import {
@@ -23,6 +23,8 @@ import {
   isJobFailed,
 } from '../video-engine/videogen.service';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
+import { YoutubeService } from '../youtube/youtube.service';
+import { YoutubeUploadService, YoutubeQuotaException } from '../youtube/youtube-upload.service';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -437,9 +439,11 @@ async function bootstrap() {
     logger: ['log', 'warn', 'error'],
   });
 
-  const jobsService      = app.get(ProductionJobsService);
-  const videogenService  = app.get(VideogenService);
-  const artifactsService = app.get(ArtifactsService);
+  const jobsService         = app.get(ProductionJobsService);
+  const videogenService     = app.get(VideogenService);
+  const artifactsService    = app.get(ArtifactsService);
+  const youtubeService      = app.get(YoutubeService);
+  const youtubeUploadService = app.get(YoutubeUploadService);
 
   const workerId           = process.env.VIDEO_WORKER_ID || `video-worker-${process.pid}`;
   const pollMs             = readPositiveInt('VIDEO_WORKER_POLL_MS', 3000);
@@ -566,93 +570,243 @@ async function bootstrap() {
     await jobsService.markVideoWorkerYoutubeUploading(jobId, workerId);
     logger.log(`${youtubeMock ? '[MOCK] ' : ''}Starting YouTube upload for job ${jobId}: ${videogenJobs.filter(j => j.downloadUrl).length} videos`);
 
-    if (!youtubeMock) {
-      throw new Error('Real YouTube upload not implemented yet. Set YOUTUBE_UPLOAD_MOCK=true.');
+    // ── Shared result handler (used by both real and mock paths) ──────────────
+
+    async function handleYoutubeResults(
+      uploads:      YoutubeUploadEntry[],
+      authBlocked:  boolean,
+      quotaBlocked: boolean,
+    ): Promise<void> {
+      const uploadedCount     = uploads.filter(u => u.status === 'uploaded').length;
+      const failedUploadCount = uploads.filter(u => u.status === 'failed').length;
+
+      if (authBlocked) {
+        const blocked: VideoWorkerYoutubeBlockedSummary = {
+          phase:          'blocked_auth',
+          reason:         'auth_required',
+          detail:         'La conexión de YouTube expiró o fue revocada. Reconecta tu canal para continuar con los videos pendientes.',
+          youtubeUploads: uploads,
+          blockedAt:      new Date().toISOString(),
+        };
+        await jobsService.blockVideoWorkerYoutube(jobId, workerId, blocked);
+        logger.warn(`Job ${jobId} blocked_auth: ${uploadedCount} subidos, ${uploads.filter(u => u.status === 'auth_required').length} pendientes`);
+        const snapshotSummary = { ...currentSummary, ...blocked };
+        const artifactId = await uploadVideoStateSnapshot(job, snapshotSummary, 'blocked_auth');
+        if (artifactId) await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
+        return;
+      }
+
+      if (quotaBlocked) {
+        const blocked: VideoWorkerYoutubeBlockedSummary = {
+          phase:          'blocked_quota',
+          reason:         'quota_exceeded',
+          detail:         'YouTube no permitió subir más videos por ahora. Puedes intentarlo más tarde cuando la cuota se restablezca.',
+          youtubeUploads: uploads,
+          blockedAt:      new Date().toISOString(),
+        };
+        await jobsService.blockVideoWorkerYoutube(jobId, workerId, blocked);
+        logger.warn(`Job ${jobId} blocked_quota: ${uploadedCount} subidos`);
+        const snapshotSummary = { ...currentSummary, ...blocked };
+        const artifactId = await uploadVideoStateSnapshot(job, snapshotSummary, 'blocked_quota');
+        if (artifactId) await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
+        return;
+      }
+
+      if (uploadedCount === 0) {
+        const errorMsg = `Todos los uploads de YouTube fallaron: ${uploads.map(u => u.error ?? 'error desconocido').join('; ')}`;
+        await jobsService.failVideoWorkerJob(jobId, workerId, errorMsg);
+        logger.error(`Job ${jobId} YouTube all failed`);
+        const snapshotSummary = {
+          ...currentSummary,
+          youtubeUploads: uploads,
+          uploadedCount: 0,
+          failedUploadCount,
+        };
+        const artifactId = await uploadVideoStateSnapshot(job, snapshotSummary, 'all_failed');
+        if (artifactId) await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
+        return;
+      }
+
+      const completedSummary: VideoWorkerYoutubeCompletedSummary = {
+        phase:             'youtube_completed',
+        uploadedCount,
+        failedUploadCount,
+        youtubeUploads:    uploads,
+        completedAt:       new Date().toISOString(),
+      };
+      await jobsService.completeVideoWorkerYoutube(jobId, workerId, completedSummary);
+      logger.log(`Job ${jobId} YouTube phase complete: ${uploadedCount}/${uploads.length} uploaded`);
+      const snapshotSummary = { ...currentSummary, ...completedSummary };
+      const artifactId = await uploadVideoStateSnapshot(job, snapshotSummary, 'youtube_completed');
+      if (artifactId) await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
     }
+
+    // ── REAL YouTube upload ───────────────────────────────────────────────────
+
+    if (!youtubeMock) {
+      const ownerId    = job.ownerId;
+      const inputPayload = (job.inputPayload ?? {}) as Record<string, any>;
+      const courseName = (inputPayload.courseData ?? {}).nombre ?? 'Curso Cursia';
+
+      // 1. Obtain active YouTube connection for this user
+      const connection = await youtubeService.getConnection(ownerId);
+      if (!connection || connection.status !== 'active') {
+        logger.warn(`Job ${jobId} YouTube blocked: no active connection for user ${ownerId} (status=${connection?.status ?? 'none'})`);
+        const blocked: VideoWorkerYoutubeBlockedSummary = {
+          phase:          'blocked_auth',
+          reason:         'auth_required',
+          detail:         'No hay conexión activa de YouTube. Reconecta tu canal para continuar.',
+          youtubeUploads: [],
+          blockedAt:      new Date().toISOString(),
+        };
+        await jobsService.blockVideoWorkerYoutube(jobId, workerId, blocked);
+        const snapshotSummary = { ...currentSummary, ...blocked };
+        const artifactId = await uploadVideoStateSnapshot(job, snapshotSummary, 'blocked_auth');
+        if (artifactId) await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
+        return;
+      }
+
+      // 2. Build skip-set from already-uploaded entries (no-duplicate guarantee)
+      const existingUploads: YoutubeUploadEntry[] = Array.isArray(currentSummary.youtubeUploads)
+        ? (currentSummary.youtubeUploads as YoutubeUploadEntry[])
+        : [];
+      const alreadyDone = new Map<number, YoutubeUploadEntry>(
+        existingUploads
+          .filter(u => u.status === 'uploaded' && u.youtubeUrl)
+          .map(u => [u.cap, u] as [number, YoutubeUploadEntry]),
+      );
+
+      const uploads: YoutubeUploadEntry[] = [...alreadyDone.values()];
+      let authBlocked  = false;
+      let quotaBlocked = false;
+
+      const uploadable = videogenJobs.filter(j => j.downloadUrl && !alreadyDone.has(j.cap));
+      const noUrlJobs  = videogenJobs.filter(j => !j.downloadUrl && !alreadyDone.has(j.cap));
+
+      logger.log(
+        `Job ${jobId} YouTube: ${uploads.length} ya subidos, ${uploadable.length} pendientes, ` +
+        `${noUrlJobs.length} sin URL de video`,
+      );
+
+      // Videos without a downloadUrl cannot be uploaded
+      for (const vj of noUrlJobs) {
+        uploads.push({
+          cap:            vj.cap,
+          title:          vj.title,
+          downloadUrl:    null,
+          youtubeVideoId: null,
+          youtubeUrl:     null,
+          status:         'failed',
+          error:          'Sin URL de video generado',
+        });
+      }
+
+      // 3. Upload each pending video with retry + backoff
+      for (const vj of uploadable) {
+        if (leaseLostRef.value || authBlocked || quotaBlocked) break;
+
+        let success    = false;
+        let lastError  = '';
+        const maxRetries = 3;
+
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+          if (leaseLostRef.value) break;
+          logger.log(`[YT] Job ${jobId} cap${vj.cap} "${vj.title}" — intento ${attempt}/${maxRetries}`);
+
+          try {
+            const result = await youtubeUploadService.uploadFromUrl(connection, {
+              downloadUrl:   vj.downloadUrl!,
+              title:         vj.title,
+              description:   `Capítulo ${vj.cap} — ${courseName}`,
+              privacyStatus: 'unlisted',
+              chapterNumber: vj.cap,
+            });
+
+            uploads.push({
+              cap:            vj.cap,
+              title:          vj.title,
+              downloadUrl:    vj.downloadUrl ?? null,
+              youtubeVideoId: result.videoId,
+              youtubeUrl:     result.youtubeUrl,
+              status:         'uploaded',
+              error:          null,
+            });
+            logger.log(`[YT] Job ${jobId} cap${vj.cap} subido: ${result.youtubeUrl}`);
+            success = true;
+            break;
+
+          } catch (err) {
+            const error = err as Error;
+            lastError   = error.message;
+
+            if (err instanceof YoutubeQuotaException) {
+              logger.warn(`[YT] Job ${jobId} cap${vj.cap} cuota agotada — bloqueando`);
+              quotaBlocked = true;
+              break;
+            }
+            if (err instanceof UnauthorizedException) {
+              logger.warn(`[YT] Job ${jobId} cap${vj.cap} auth error — bloqueando: ${lastError}`);
+              authBlocked = true;
+              break;
+            }
+
+            // Temporary error — retry with backoff
+            if (attempt < maxRetries) {
+              const backoffMs = attempt * 2000; // 2 s, 4 s
+              logger.warn(`[YT] Job ${jobId} cap${vj.cap} error temporal (intento ${attempt}), reintentando en ${backoffMs}ms: ${lastError}`);
+              await sleep(backoffMs);
+            } else {
+              logger.error(`[YT] Job ${jobId} cap${vj.cap} falló tras ${maxRetries} intentos: ${lastError}`);
+            }
+          }
+        }
+
+        if (authBlocked || quotaBlocked) {
+          uploads.push({
+            cap:            vj.cap,
+            title:          vj.title,
+            downloadUrl:    vj.downloadUrl ?? null,
+            youtubeVideoId: null,
+            youtubeUrl:     null,
+            status:         authBlocked ? 'auth_required' : 'quota_exceeded',
+            error:          lastError,
+          });
+        } else if (!success && !leaseLostRef.value) {
+          uploads.push({
+            cap:            vj.cap,
+            title:          vj.title,
+            downloadUrl:    vj.downloadUrl ?? null,
+            youtubeVideoId: null,
+            youtubeUrl:     null,
+            status:         'failed',
+            error:          lastError || 'Upload fallido',
+          });
+        }
+      }
+
+      if (leaseLostRef.value) return;
+      await handleYoutubeResults(uploads, authBlocked, quotaBlocked);
+      return;
+    }
+
+    // ── MOCK YouTube upload ───────────────────────────────────────────────────
 
     // Simulate upload delay
     await sleep(youtubeMockDelayMs);
     if (leaseLostRef.value) return;
 
     const uploads = mockYoutubeUploads(videogenJobs, youtubeScenario);
-    const uploadedCount    = uploads.filter(u => u.status === 'uploaded').length;
-    const failedCount      = uploads.filter(u => u.status === 'failed').length;
-    const quotaExceeded    = uploads.some(u => u.status === 'quota_exceeded');
-    const authRequired     = uploads.some(u => u.status === 'auth_required');
+    const quotaExceeded = uploads.some(u => u.status === 'quota_exceeded');
+    const authRequired  = uploads.some(u => u.status === 'auth_required');
 
     logger.log(
       `[MOCK] YouTube upload result for job ${jobId}: ` +
-      `uploaded=${uploadedCount}, failed=${failedCount}, ` +
+      `uploaded=${uploads.filter(u => u.status === 'uploaded').length}, ` +
+      `failed=${uploads.filter(u => u.status === 'failed').length}, ` +
       `quotaExceeded=${quotaExceeded}, authRequired=${authRequired}`,
     );
 
-    if (quotaExceeded) {
-      const blocked: VideoWorkerYoutubeBlockedSummary = {
-        phase:          'blocked_quota',
-        reason:         'quota_exceeded',
-        detail:         'YouTube daily upload quota exceeded. Job will retry when quota resets.',
-        youtubeUploads: uploads,
-        blockedAt:      new Date().toISOString(),
-      };
-      await jobsService.blockVideoWorkerYoutube(jobId, workerId, blocked);
-      logger.warn(`Job ${jobId} blocked: YouTube quota exceeded`);
-
-      const snapshotSummary = { ...((job.outputSummary ?? {}) as Record<string, any>), ...blocked };
-      const artifactId = await uploadVideoStateSnapshot(job, snapshotSummary, 'blocked_quota');
-      if (artifactId) await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
-      return;
-    }
-
-    if (authRequired) {
-      const blocked: VideoWorkerYoutubeBlockedSummary = {
-        phase:          'blocked_auth',
-        reason:         'auth_required',
-        detail:         'YouTube OAuth token expired or missing. Re-authorize to continue.',
-        youtubeUploads: uploads,
-        blockedAt:      new Date().toISOString(),
-      };
-      await jobsService.blockVideoWorkerYoutube(jobId, workerId, blocked);
-      logger.warn(`Job ${jobId} blocked: YouTube auth required`);
-
-      const snapshotSummary = { ...((job.outputSummary ?? {}) as Record<string, any>), ...blocked };
-      const artifactId = await uploadVideoStateSnapshot(job, snapshotSummary, 'blocked_auth');
-      if (artifactId) await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
-      return;
-    }
-
-    if (uploadedCount === 0) {
-      const errorMsg = `All YouTube uploads failed: ${uploads.map(u => u.error).join(', ')}`;
-      await jobsService.failVideoWorkerJob(jobId, workerId, errorMsg);
-      logger.error(`Job ${jobId} YouTube all failed: ${errorMsg}`);
-
-      const snapshotSummary = {
-        ...((job.outputSummary ?? {}) as Record<string, any>),
-        youtubeUploads: uploads,
-        uploadedCount: 0,
-        failedUploadCount: failedCount,
-      };
-      const artifactId = await uploadVideoStateSnapshot(job, snapshotSummary, 'all_failed');
-      if (artifactId) await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
-      return;
-    }
-
-    const completedSummary: VideoWorkerYoutubeCompletedSummary = {
-      phase:             'youtube_completed',
-      uploadedCount,
-      failedUploadCount: failedCount,
-      youtubeUploads:    uploads,
-      completedAt:       new Date().toISOString(),
-    };
-
-    await jobsService.completeVideoWorkerYoutube(jobId, workerId, completedSummary);
-    logger.log(`Job ${jobId} YouTube phase complete: ${uploadedCount}/${uploads.length} uploaded${youtubeMock ? ' [MOCK]' : ''}`);
-
-    const snapshotSummary = {
-      ...((job.outputSummary ?? {}) as Record<string, any>),
-      ...completedSummary,
-    };
-    const artifactId = await uploadVideoStateSnapshot(job, snapshotSummary, 'youtube_completed');
-    if (artifactId) await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
+    await handleYoutubeResults(uploads, authRequired, quotaExceeded);
   }
 
   // ── Polling loop ────────────────────────────────────────────────────────────

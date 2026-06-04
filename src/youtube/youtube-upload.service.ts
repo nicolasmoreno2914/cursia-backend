@@ -8,6 +8,18 @@ import {
 import { YoutubeTokenService } from './youtube-token.service';
 import { YoutubeConnection } from './entities/youtube-connection.entity';
 
+/**
+ * Thrown when YouTube rejects upload due to daily quota or rate limit.
+ * Extends ServiceUnavailableException so NestJS HTTP layer returns 503.
+ * The worker catches this with instanceof to block the job (quota_blocked).
+ */
+export class YoutubeQuotaException extends ServiceUnavailableException {
+  constructor() {
+    super('YouTube no permitió subir más videos por ahora. La cuota diaria se restablece en 24 h.');
+    this.name = 'YoutubeQuotaException';
+  }
+}
+
 export interface YoutubeUploadOptions {
   downloadUrl:    string;
   title:          string;
@@ -132,9 +144,21 @@ export class YoutubeUploadService {
         },
       );
 
-      if (initResp.status === 401 || initResp.status === 403) {
+      if (initResp.status === 401) {
         throw new UnauthorizedException(
           'YouTube rechazó el token. Reconecta tu cuenta en la sección Cuenta.',
+        );
+      }
+      if (initResp.status === 403) {
+        let errBody: Record<string, any> = {};
+        try { errBody = await initResp.json() as Record<string, any>; } catch { /* ignore */ }
+        const errors = errBody?.error?.errors as Array<{ reason?: string }> | undefined;
+        const reason = errors?.[0]?.reason ?? '';
+        if (reason === 'quotaExceeded' || reason === 'rateLimitExceeded') {
+          throw new YoutubeQuotaException();
+        }
+        throw new UnauthorizedException(
+          'YouTube rechazó el acceso. Reconecta tu cuenta en la sección Cuenta.',
         );
       }
       if (!initResp.ok) {
@@ -150,6 +174,7 @@ export class YoutubeUploadService {
       uploadUrl = location;
     } catch (err) {
       if (err instanceof UnauthorizedException) throw err;
+      if (err instanceof YoutubeQuotaException) throw err;
       throw new ServiceUnavailableException(
         `No se pudo iniciar la subida a YouTube: ${(err as Error).message}`,
       );
@@ -173,6 +198,19 @@ export class YoutubeUploadService {
       if (!uploadResp.ok) {
         const errText = await uploadResp.text();
         this.logger.error(`[YTUpload] Upload fallido HTTP ${uploadResp.status}: ${errText.slice(0, 300)}`);
+        if (uploadResp.status === 401) {
+          throw new UnauthorizedException('Token expirado durante la subida. Reconecta tu cuenta.');
+        }
+        if (uploadResp.status === 403) {
+          let errBody: Record<string, any> = {};
+          try { errBody = JSON.parse(errText) as Record<string, any>; } catch { /* ignore */ }
+          const errors = errBody?.error?.errors as Array<{ reason?: string }> | undefined;
+          const reason = errors?.[0]?.reason ?? '';
+          if (reason === 'quotaExceeded' || reason === 'rateLimitExceeded') {
+            throw new YoutubeQuotaException();
+          }
+          throw new UnauthorizedException('YouTube rechazó el acceso durante la subida. Reconecta tu cuenta.');
+        }
         throw new Error(`HTTP ${uploadResp.status}`);
       }
 
@@ -183,6 +221,8 @@ export class YoutubeUploadService {
       }
       videoId = id;
     } catch (err) {
+      if (err instanceof UnauthorizedException) throw err;
+      if (err instanceof YoutubeQuotaException) throw err;
       throw new ServiceUnavailableException(
         `Fallo al subir video a YouTube: ${(err as Error).message}`,
       );
