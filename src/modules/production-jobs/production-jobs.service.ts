@@ -14,6 +14,7 @@ import { CreateContentJobDto } from './dto/create-content-job.dto';
 import { CreateVideoJobDto } from './dto/create-video-job.dto';
 import { CreateAudioJobDto } from './dto/create-audio-job.dto';
 import { CreatePackageJobDto } from './dto/create-package-job.dto';
+import { CreateFullCourseJobDto } from './dto/create-full-course-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
 import { UpdateStepDto } from './dto/update-step.dto';
 
@@ -1858,5 +1859,323 @@ export class ProductionJobsService {
     if (dto.detail)      step.detail     = dto.detail;
 
     return this.stepRepo.save(step);
+  }
+
+  // ── Full course orchestrator job methods ──────────────────────────────────
+
+  async createFullCourseJob(
+    ownerId: string,
+    dto: CreateFullCourseJobDto,
+  ): Promise<{ ok: true; jobId: string; status: string; workerStatus: string; executionMode: string; currentStep: string; resumed?: boolean }> {
+    if (!dto.courseId) throw new BadRequestException('courseId is required');
+
+    const rawCourseId    = dto.courseId;
+    const numericCourseId = rawCourseId ? parseInt(rawCourseId, 10) : NaN;
+    const activeStatuses = ['queued', 'running', 'retrying', 'needs_reconnect', 'blocked_quota'];
+
+    const qb = this.jobRepo.createQueryBuilder('job')
+      .where('job.owner_id = :ownerId', { ownerId })
+      .andWhere('job.execution_mode = :executionMode', { executionMode: 'course_full_generation' })
+      .andWhere('job.worker_status IN (:...activeStatuses)', { activeStatuses });
+
+    if (!isNaN(numericCourseId)) {
+      qb.andWhere('(job.course_id = :courseId OR job.frontend_course_id = :frontendCourseId)', {
+        courseId: numericCourseId, frontendCourseId: rawCourseId,
+      });
+    } else {
+      qb.andWhere('job.frontend_course_id = :frontendCourseId', { frontendCourseId: rawCourseId });
+    }
+
+    const existing = await qb.getOne();
+    if (existing) {
+      this.logger.log(`Full course job already active for course ${rawCourseId}: ${existing.id} (${existing.workerStatus})`);
+      return {
+        ok: true, jobId: existing.id, status: existing.status,
+        workerStatus: existing.workerStatus, executionMode: existing.executionMode,
+        currentStep: existing.currentStep, resumed: true,
+      };
+    }
+
+    const sanitized = this.sanitizePayload({
+      courseId: rawCourseId,
+      executionMode: 'course_full_generation',
+      courseData: dto.courseData ?? {},
+      options: dto.options ?? {},
+      metadata: dto.metadata ?? {},
+    });
+
+    const job = this.jobRepo.create({
+      ownerId,
+      courseId: !isNaN(numericCourseId) ? numericCourseId : null,
+      frontendCourseId: rawCourseId,
+      frontendJobId: dto.frontendJobId ?? null,
+      options: dto.options ?? {},
+      status: 'queued',
+      currentStep: 'checking_existing',
+      progress: 0,
+      executionMode: 'course_full_generation',
+      workerStatus: 'queued',
+      inputPayload: sanitized,
+      outputSummary: {},
+    });
+
+    const saved = await this.jobRepo.save(job);
+
+    const steps = ['content', 'audio', 'video', 'h5p', 'package'].map(key =>
+      this.stepRepo.create({ jobId: saved.id, stepKey: key, status: 'pending' }),
+    );
+    await this.stepRepo.save(steps);
+
+    return {
+      ok: true, jobId: saved.id, status: saved.status,
+      workerStatus: saved.workerStatus, executionMode: saved.executionMode,
+      currentStep: saved.currentStep,
+    };
+  }
+
+  async claimNextFullCourseJob(workerId: string, leaseSeconds: number): Promise<ProductionJob | null> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      const candidates = await queryRunner.query(
+        `SELECT id FROM production_jobs
+         WHERE execution_mode = 'course_full_generation'
+           AND worker_status IN ('queued', 'retrying')
+           AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+           AND (lease_until IS NULL OR lease_until < NOW())
+         ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED`,
+      );
+      if (!Array.isArray(candidates) || candidates.length === 0) {
+        await queryRunner.commitTransaction();
+        return null;
+      }
+      const jobId = candidates[0].id;
+      await queryRunner.query(
+        `UPDATE production_jobs
+         SET worker_status='running', status='running', current_step='checking_existing',
+             worker_id=$1, claimed_at=NOW(), lease_until=NOW()+($2*INTERVAL '1 second'),
+             attempt_count=COALESCE(attempt_count,0)+1, started_at=COALESCE(started_at,NOW()),
+             updated_at=NOW()
+         WHERE id=$3`,
+        [workerId, leaseSeconds, jobId],
+      );
+      await queryRunner.commitTransaction();
+      this.logger.log(`Worker ${workerId} claimed course_full_generation job ${jobId}`);
+      return this.jobRepo.findOne({ where: { id: jobId }, relations: ['steps'] });
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async updateFullCourseStep(
+    jobId: string,
+    workerId: string,
+    step: string,
+    message: string,
+    partialSummary?: Record<string, any>,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    job.status = 'running';
+    job.workerStatus = 'running';
+    job.currentStep = step;
+    if (partialSummary) {
+      job.outputSummary = { ...(job.outputSummary ?? {}), ...partialSummary, updatedAt: new Date().toISOString() };
+    }
+    await this.jobRepo.save(job);
+
+    await this.upsertStepByKey(jobId, step, { status: 'running', detail: message });
+    return true;
+  }
+
+  async completeFullCourseJob(
+    jobId: string,
+    workerId: string,
+    summary: Record<string, any>,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    const now = new Date();
+    job.status        = 'completed';
+    job.workerStatus  = 'completed';
+    job.currentStep   = 'completed';
+    job.progress      = 100;
+    job.finishedAt    = now;
+    job.leaseUntil    = null as any;
+    job.nextRetryAt   = null as any;
+    job.errorMessage  = null as any;
+    job.errorStep     = null as any;
+    job.outputSummary = { ...(job.outputSummary ?? {}), ...summary, phase: 'completed', completedAt: now.toISOString() };
+    await this.jobRepo.save(job);
+
+    await this.upsertStepByKey(jobId, 'package', { status: 'completed', progress: 100, finishedAt: now, detail: 'Curso listo.', error: null });
+    return true;
+  }
+
+  async failFullCourseJob(
+    jobId: string,
+    workerId: string,
+    error: Error | string,
+    retryable: boolean,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+
+    const message = typeof error === 'string' ? error : error?.message || 'Unknown full-course error';
+    const now     = new Date();
+    const attemptsRemaining = (job.attemptCount ?? 0) < (job.maxAttempts ?? 3);
+    const errorEntry = { phase: 'full_course_worker', message, retryable, attempt: job.attemptCount ?? 0, workerId, at: now.toISOString() };
+
+    job.errorMessage  = message;
+    job.errorStep     = job.currentStep;
+    job.outputSummary = this.appendOutputError(job.outputSummary, errorEntry);
+
+    if (retryable && attemptsRemaining) {
+      job.workerStatus = 'retrying';
+      job.status       = 'retrying';
+      job.nextRetryAt  = this.buildRetryDate(job.attemptCount ?? 0);
+      job.leaseUntil   = null as any;
+      job.workerId     = null as any;
+      job.retryCount   = (job.retryCount ?? 0) + 1;
+      await this.jobRepo.save(job);
+      return true;
+    }
+
+    job.workerStatus = retryable ? 'failed_retryable' : 'failed';
+    job.status       = retryable ? 'failed_retryable' : 'failed';
+    job.finishedAt   = now;
+    job.nextRetryAt  = null as any;
+    job.leaseUntil   = null as any;
+    await this.jobRepo.save(job);
+    return true;
+  }
+
+  async blockFullCourseJobAuth(jobId: string, workerId: string, videoJobId: string): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+    const now = new Date();
+    job.status       = 'needs_reconnect';
+    job.workerStatus = 'needs_reconnect';
+    job.leaseUntil   = null as any;
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      blockReason: 'blocked_auth',
+      blockedVideoJobId: videoJobId,
+      blockedAt: now.toISOString(),
+      userMessage: 'Necesita reconectar YouTube para continuar con los videos.',
+    };
+    await this.jobRepo.save(job);
+    this.logger.warn(`Full course job ${jobId} blocked (auth) by video job ${videoJobId}`);
+    return true;
+  }
+
+  async blockFullCourseJobQuota(jobId: string, workerId: string, videoJobId: string): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+    const now = new Date();
+    job.status       = 'blocked_quota';
+    job.workerStatus = 'blocked_quota';
+    job.leaseUntil   = null as any;
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      blockReason: 'blocked_quota',
+      blockedVideoJobId: videoJobId,
+      blockedAt: now.toISOString(),
+      userMessage: 'YouTube no permitió subir más videos por ahora. Puedes intentarlo más tarde.',
+    };
+    await this.jobRepo.save(job);
+    this.logger.warn(`Full course job ${jobId} blocked (quota) by video job ${videoJobId}`);
+    return true;
+  }
+
+  async requeueFullCourseJob(jobId: string, userId: string): Promise<{ ok: boolean; reason?: string }> {
+    const job = await this.jobRepo.findOne({ where: { id: jobId } });
+    if (!job) return { ok: false, reason: 'not_found' };
+    if (job.ownerId !== userId) return { ok: false, reason: 'forbidden' };
+    if (job.executionMode !== 'course_full_generation') return { ok: false, reason: 'not_a_full_course_job' };
+
+    const retryableStatuses = ['failed_retryable', 'failed', 'needs_reconnect', 'blocked_quota', 'failed_recoverable'];
+    if (!retryableStatuses.includes(job.status)) {
+      return { ok: false, reason: `status_not_retryable (current: ${job.status})` };
+    }
+
+    const prevStatus = job.status;
+    job.status       = 'queued';
+    job.workerStatus = 'queued';
+    job.workerId     = null as any;
+    job.leaseUntil   = null as any;
+    job.currentStep  = 'checking_existing';
+    job.nextRetryAt  = null as any;
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      requeuedAt: new Date().toISOString(),
+      previousStatus: prevStatus,
+    };
+    await this.jobRepo.save(job);
+    this.logger.log(`Full course job ${jobId} requeued by user ${userId} (was: ${prevStatus})`);
+    return { ok: true };
+  }
+
+  async findLatestChildJobForCourse(
+    ownerId: string,
+    courseId: string,
+    executionMode: string,
+  ): Promise<ProductionJob | null> {
+    const numericId = parseInt(courseId, 10);
+    const qb = this.jobRepo.createQueryBuilder('job')
+      .where('job.owner_id = :ownerId', { ownerId })
+      .andWhere('job.execution_mode = :executionMode', { executionMode })
+      .orderBy('job.created_at', 'DESC');
+
+    if (!isNaN(numericId)) {
+      qb.andWhere('(job.course_id = :courseId OR job.frontend_course_id = :frontendCourseId)', {
+        courseId: numericId, frontendCourseId: courseId,
+      });
+    } else {
+      qb.andWhere('job.frontend_course_id = :frontendCourseId', { frontendCourseId: courseId });
+    }
+
+    return qb.getOne();
+  }
+
+  async findJobByIdInternal(id: string): Promise<ProductionJob | null> {
+    return this.jobRepo.findOne({ where: { id } });
+  }
+
+  private async upsertStepByKey(
+    jobId: string,
+    stepContext: string,
+    dto: Partial<ProductionStep>,
+  ): Promise<void> {
+    // Map orchestrator step names to the DB step keys created for full-course jobs
+    const keyMap: Record<string, string> = {
+      checking_existing: 'content',
+      content: 'content',
+      audio: 'audio',
+      video: 'video',
+      h5p: 'h5p',
+      package: 'package',
+      completing: 'package',
+      completed: 'package',
+    };
+    const stepKey = keyMap[stepContext] ?? stepContext;
+
+    let step = await this.stepRepo.findOne({ where: { jobId, stepKey } });
+    if (!step) step = this.stepRepo.create({ jobId, stepKey });
+
+    if (dto.status !== undefined)     step.status     = dto.status;
+    if (dto.progress !== undefined)   step.progress   = dto.progress;
+    if (dto.startedAt !== undefined)  step.startedAt  = dto.startedAt;
+    if (dto.finishedAt !== undefined) step.finishedAt = dto.finishedAt;
+    if (dto.error !== undefined)      step.error      = dto.error;
+    if (dto.detail !== undefined)     step.detail     = dto.detail;
+
+    await this.stepRepo.save(step);
   }
 }

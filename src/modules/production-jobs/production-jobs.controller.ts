@@ -16,6 +16,7 @@ import { CreateContentJobDto } from './dto/create-content-job.dto';
 import { CreateVideoJobDto } from './dto/create-video-job.dto';
 import { CreateAudioJobDto } from './dto/create-audio-job.dto';
 import { CreatePackageJobDto } from './dto/create-package-job.dto';
+import { CreateFullCourseJobDto } from './dto/create-full-course-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
 import { UpdateStepDto } from './dto/update-step.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
@@ -151,6 +152,21 @@ export class ProductionJobsController {
   }
 
   /**
+   * POST /api/v1/jobs/full
+   * Crea (o reanuda) un job maestro course_full_generation para el curso.
+   * El full-course-worker coordina todos los pasos: content → audio → videos → h5p → package.
+   * Idempotente: si ya hay un job activo para el curso, lo devuelve.
+   */
+  @Post('full')
+  @HttpCode(HttpStatus.CREATED)
+  async createFullCourseJob(
+    @Body() dto: CreateFullCourseJobDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.jobsService.createFullCourseJob(user.id, dto);
+  }
+
+  /**
    * POST /api/v1/jobs/:id/requeue
    *
    * Reactiva un job de video bloqueado (failed_recoverable) para que el worker
@@ -167,6 +183,29 @@ export class ProductionJobsController {
     @CurrentUser() user: AuthUser,
   ) {
     const result = await this.jobsService.requeueVideoJob(id, user.id);
+    if (!result.ok) {
+      return { ok: false, reason: result.reason };
+    }
+    return { ok: true };
+  }
+
+  /**
+   * POST /api/v1/jobs/:id/retry
+   * Reactiva un job maestro course_full_generation que quedó en estado recuperable.
+   * Conserva el outputSummary para que el worker aplique restore-first y no repita pasos.
+   *
+   * Casos de uso:
+   *  - Job falló en un paso retryable (failed_retryable)
+   *  - YouTube se reconectó (needs_reconnect → retry + requeue video job)
+   *  - Cuota restablecida al día siguiente (blocked_quota)
+   */
+  @Post(':id/retry')
+  @HttpCode(HttpStatus.OK)
+  async retryFullCourseJob(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthUser,
+  ) {
+    const result = await this.jobsService.requeueFullCourseJob(id, user.id);
     if (!result.ok) {
       return { ok: false, reason: result.reason };
     }

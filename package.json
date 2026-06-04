@@ -15,6 +15,8 @@
     "start:audio-worker:dev": "ts-node src/workers/audio-worker.ts",
     "start:package-worker": "node dist/workers/package-worker.js",
     "start:package-worker:dev": "ts-node src/workers/package-worker.ts",
+    "start:full-worker": "node dist/workers/full-course-worker.js",
+    "start:full-worker:dev": "ts-node src/workers/full-course-worker.ts",
     "start:dev": "ts-node-dev --respawn --transpile-only src/main.ts",
     "start:debug": "ts-node-dev --inspect --respawn --transpile-only src/main.ts",
     "start:prod": "node dist/main.js",
