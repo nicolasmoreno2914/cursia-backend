@@ -5,3 +5,7 @@ dist/
 .DS_Store
 *.log
 .cursia_vps_key
+
+# QA outputs — pueden contener referencias a videos/URLs de prueba, nunca se versionan
+qa_youtube_real_snapshot.json
+qa_*.json
