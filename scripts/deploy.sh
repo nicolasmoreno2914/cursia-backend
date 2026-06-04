@@ -46,13 +46,14 @@ if [ "$CURRENT_BRANCH" != "$BRANCH" ]; then
 fi
 
 # ── 2. Git pull ───────────────────────────────────────────────────────────────
-info "[1/5] git pull origin $BRANCH..."
-git pull origin "$BRANCH"
+info "[1/6] Limpiar cambios rastreados y sincronizar con origin/$BRANCH..."
+git reset --hard HEAD
+git pull --ff-only origin "$BRANCH"
 success "Código actualizado."
 
 # ── 3. Instalar dependencias ──────────────────────────────────────────────────
-info "[2/6] npm install..."
-npm install
+info "[2/6] npm ci..."
+npm ci
 success "Dependencias instaladas (incluyendo devDeps para build)."
 
 # ── 4. Build ──────────────────────────────────────────────────────────────────
