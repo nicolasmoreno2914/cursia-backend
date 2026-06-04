@@ -110,7 +110,7 @@ jobs:
                }
 
                echo "━━━ [1/5] Instalar todas las dependencias (devDeps para tsc) ━━━"
-               npm ci
+               npm install
 
                echo "━━━ [2/5] Alinear restricciones de production_jobs ━━━"
                node scripts/migrate-production-jobs-constraints.js
@@ -119,7 +119,7 @@ jobs:
                npm run build
 
                echo "━━━ [4/5] Limpiar devDeps — dejar solo producción ━━━"
-               npm ci --omit=dev
+               npm install --omit=dev
 
                echo "━━━ [5/5] Recargar PM2 (zero-downtime) ━━━"
                pm2 reload cursia-backend --update-env || pm2 restart cursia-backend --update-env
