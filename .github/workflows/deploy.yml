@@ -98,20 +98,23 @@ jobs:
                  fi
                }
 
-               echo "━━━ [1/5] Sincronizar código limpio ━━━"
+               echo "━━━ [0/6] Recuperar permisos del repo ━━━"
+               sudo chown -R "${{ secrets.VPS_USER }}":"${{ secrets.VPS_USER }}" .git || true
+
+               echo "━━━ [1/6] Sincronizar código limpio ━━━"
                git reset --hard HEAD
                git pull --ff-only origin main
 
-               echo "━━━ [2/5] Instalar todas las dependencias (devDeps para tsc) ━━━"
+               echo "━━━ [2/6] Instalar todas las dependencias (devDeps para tsc) ━━━"
                npm ci
 
-               echo "━━━ [3/5] Alinear restricciones de production_jobs ━━━"
+               echo "━━━ [3/6] Alinear restricciones de production_jobs ━━━"
                node scripts/migrate-production-jobs-constraints.js
 
-               echo "━━━ [4/5] Compilar TypeScript en el VPS ━━━"
+               echo "━━━ [4/6] Compilar TypeScript en el VPS ━━━"
                npm run build
 
-               echo "━━━ [5/5] Limpiar devDeps — dejar solo producción ━━━"
+               echo "━━━ [5/6] Limpiar devDeps — dejar solo producción ━━━"
                npm ci --omit=dev
 
                echo "━━━ [6/6] Recargar PM2 (zero-downtime) ━━━"

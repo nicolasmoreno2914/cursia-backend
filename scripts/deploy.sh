@@ -46,7 +46,10 @@ if [ "$CURRENT_BRANCH" != "$BRANCH" ]; then
 fi
 
 # ── 2. Git pull ───────────────────────────────────────────────────────────────
-info "[1/6] Limpiar cambios rastreados y sincronizar con origin/$BRANCH..."
+info "[0/7] Recuperar permisos del repo..."
+sudo chown -R "$(id -un)":"$(id -gn)" "$APP_DIR/.git" 2>/dev/null || true
+
+info "[1/7] Limpiar cambios rastreados y sincronizar con origin/$BRANCH..."
 git reset --hard HEAD
 git pull --ff-only origin "$BRANCH"
 success "Código actualizado."
