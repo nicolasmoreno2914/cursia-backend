@@ -52,23 +52,28 @@ git pull --ff-only origin "$BRANCH"
 success "Código actualizado."
 
 # ── 3. Instalar dependencias ──────────────────────────────────────────────────
-info "[2/6] npm ci..."
+info "[2/7] npm ci..."
 npm ci
 success "Dependencias instaladas (incluyendo devDeps para build)."
 
-# ── 4. Build ──────────────────────────────────────────────────────────────────
-info "[3/6] npm run build..."
+# ── 4. Migrar restricciones de jobs ───────────────────────────────────────────
+info "[3/7] Alinear restricciones de production_jobs..."
+node scripts/migrate-production-jobs-constraints.js
+success "Restricciones de production_jobs actualizadas."
+
+# ── 5. Build ──────────────────────────────────────────────────────────────────
+info "[4/7] npm run build..."
 npm run build
 [ -f dist/main.js ] || error "dist/main.js no encontrado. Build falló."
 success "Build OK."
 
-# ── 5. Limpiar devDeps ────────────────────────────────────────────────────────
-info "[4/6] npm ci --omit=dev..."
+# ── 6. Limpiar devDeps ────────────────────────────────────────────────────────
+info "[5/7] npm ci --omit=dev..."
 npm ci --omit=dev
 success "Dependencias de producción listas."
 
-# ── 6. Reiniciar PM2 ─────────────────────────────────────────────────────────
-info "[5/6] Reiniciando PM2..."
+# ── 7. Reiniciar PM2 ─────────────────────────────────────────────────────────
+info "[6/7] Reiniciando PM2..."
 if pm2 describe "$APP_NAME" > /dev/null 2>&1; then
   pm2 reload "$APP_NAME" --update-env
   success "PM2 reload OK (graceful)."
@@ -87,8 +92,8 @@ ensure_pm2_process "cursia-full-worker" "start:full-worker"
 
 pm2 save
 
-# ── 7. Health check ───────────────────────────────────────────────────────────
-info "[6/6] Health check en $HEALTH_URL..."
+# ── 8. Health check ───────────────────────────────────────────────────────────
+info "[7/7] Health check en $HEALTH_URL..."
 sleep 5
 RESPONSE=$(curl -sf --max-time 10 "$HEALTH_URL" 2>/dev/null || echo "FAILED")
 if echo "$RESPONSE" | grep -q '"status":"ok"'; then
