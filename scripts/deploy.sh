@@ -20,6 +20,19 @@ success() { echo -e "${GREEN}[OK]${NC}    $1"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 error()   { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
+ensure_pm2_process() {
+  local name="$1"
+  local start_script="$2"
+
+  if pm2 describe "$name" > /dev/null 2>&1; then
+    pm2 restart "$name" --update-env
+    success "PM2 restart OK: $name"
+  else
+    pm2 start npm --name "$name" -- run "$start_script"
+    success "PM2 start OK: $name"
+  fi
+}
+
 # ── Verificar directorio ──────────────────────────────────────────────────────
 cd "$APP_DIR" || error "No se puede entrar a $APP_DIR"
 info "Directorio: $(pwd)"
@@ -38,32 +51,43 @@ git pull origin "$BRANCH"
 success "Código actualizado."
 
 # ── 3. Instalar dependencias ──────────────────────────────────────────────────
-info "[2/5] npm ci --omit=dev..."
-npm ci --omit=dev
-success "Dependencias instaladas."
+info "[2/6] npm install..."
+npm install
+success "Dependencias instaladas (incluyendo devDeps para build)."
 
 # ── 4. Build ──────────────────────────────────────────────────────────────────
-info "[3/5] npm run build..."
+info "[3/6] npm run build..."
 npm run build
 [ -f dist/main.js ] || error "dist/main.js no encontrado. Build falló."
 success "Build OK."
 
-# ── 5. Reiniciar PM2 ─────────────────────────────────────────────────────────
-info "[4/5] Reiniciando PM2..."
+# ── 5. Limpiar devDeps ────────────────────────────────────────────────────────
+info "[4/6] npm ci --omit=dev..."
+npm ci --omit=dev
+success "Dependencias de producción listas."
+
+# ── 6. Reiniciar PM2 ─────────────────────────────────────────────────────────
+info "[5/6] Reiniciando PM2..."
 if pm2 describe "$APP_NAME" > /dev/null 2>&1; then
   pm2 reload "$APP_NAME" --update-env
   success "PM2 reload OK (graceful)."
 else
   warn "Proceso PM2 no encontrado. Iniciando desde cero..."
   pm2 start dist/main.js --name "$APP_NAME" --env production --max-memory-restart 512M
-  pm2 save
   success "PM2 iniciado."
 fi
 
+ensure_pm2_process "cursia-content-worker" "start:content-worker"
+ensure_pm2_process "cursia-video-worker" "start:video-worker"
+ensure_pm2_process "cursia-audio-worker" "start:audio-worker"
+ensure_pm2_process "cursia-h5p-worker" "start:h5p-worker"
+ensure_pm2_process "cursia-package-worker" "start:package-worker"
+ensure_pm2_process "cursia-full-worker" "start:full-worker"
+
 pm2 save
 
-# ── 6. Health check ───────────────────────────────────────────────────────────
-info "[5/5] Health check en $HEALTH_URL..."
+# ── 7. Health check ───────────────────────────────────────────────────────────
+info "[6/6] Health check en $HEALTH_URL..."
 sleep 5
 RESPONSE=$(curl -sf --max-time 10 "$HEALTH_URL" 2>/dev/null || echo "FAILED")
 if echo "$RESPONSE" | grep -q '"status":"ok"'; then
