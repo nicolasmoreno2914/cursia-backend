@@ -80,7 +80,18 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
 
-      - name: Deploy on VPS
+      - name: Sync files to VPS
+        run: |
+          rsync -az --delete \
+            --exclude '.git' \
+            --exclude 'node_modules' \
+            --exclude 'dist' \
+            --exclude '.env' \
+            --exclude '.env.*' \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
+            ./ "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:${{ secrets.VPS_PATH }}/"
+
+      - name: Build and restart on VPS
         run: |
           ssh -i ~/.ssh/deploy_key \
               -o StrictHostKeyChecking=no \
@@ -98,26 +109,19 @@ jobs:
                  fi
                }
 
-               echo "━━━ [0/6] Recuperar permisos del repo ━━━"
-               sudo chown -R "${{ secrets.VPS_USER }}":"${{ secrets.VPS_USER }}" .git || true
-
-               echo "━━━ [1/6] Sincronizar código limpio ━━━"
-               git reset --hard HEAD
-               git pull --ff-only origin main
-
-               echo "━━━ [2/6] Instalar todas las dependencias (devDeps para tsc) ━━━"
+               echo "━━━ [1/5] Instalar todas las dependencias (devDeps para tsc) ━━━"
                npm ci
 
-               echo "━━━ [3/6] Alinear restricciones de production_jobs ━━━"
+               echo "━━━ [2/5] Alinear restricciones de production_jobs ━━━"
                node scripts/migrate-production-jobs-constraints.js
 
-               echo "━━━ [4/6] Compilar TypeScript en el VPS ━━━"
+               echo "━━━ [3/5] Compilar TypeScript en el VPS ━━━"
                npm run build
 
-               echo "━━━ [5/6] Limpiar devDeps — dejar solo producción ━━━"
+               echo "━━━ [4/5] Limpiar devDeps — dejar solo producción ━━━"
                npm ci --omit=dev
 
-               echo "━━━ [6/6] Recargar PM2 (zero-downtime) ━━━"
+               echo "━━━ [5/5] Recargar PM2 (zero-downtime) ━━━"
                pm2 reload cursia-backend --update-env || pm2 restart cursia-backend --update-env
                ensure_pm2_process cursia-content-worker start:content-worker
                ensure_pm2_process cursia-video-worker start:video-worker
