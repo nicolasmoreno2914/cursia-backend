@@ -19,6 +19,20 @@ export interface UploadJsonArtifactInput {
   storageProvider?: string;
 }
 
+export interface UploadBufferArtifactInput {
+  ownerId: string;
+  courseId?: string | null;
+  jobId?: string | null;
+  type: string;
+  filename: string;
+  storagePath: string;
+  buffer: Buffer;
+  mimeType: string;
+  metadata?: Record<string, any>;
+  storageBucket?: string;
+  storageProvider?: string;
+}
+
 @Injectable()
 export class ArtifactsService {
   private readonly logger = new Logger(ArtifactsService.name);
@@ -95,6 +109,55 @@ export class ArtifactsService {
         filename: input.filename,
         mime_type: input.mimeType ?? 'application/json',
         size_bytes: sizeBytes,
+        metadata: input.metadata ?? {},
+      },
+      input.ownerId,
+    );
+  }
+
+  async uploadBufferArtifact(input: UploadBufferArtifactInput): Promise<Artifact> {
+    const supabaseUrl = this.config.get<string>('SUPABASE_URL');
+    const serviceKey = this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY');
+    const bucket = input.storageBucket ?? 'cursia-artifacts';
+    const provider = input.storageProvider ?? 'supabase';
+
+    if (!supabaseUrl || !serviceKey) {
+      throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for server-side artifact upload');
+    }
+
+    const encodedPath = input.storagePath
+      .split('/')
+      .filter(Boolean)
+      .map((segment) => encodeURIComponent(segment))
+      .join('/');
+    const uploadUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/${bucket}/${encodedPath}`;
+
+    const response = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${serviceKey}`,
+        'Content-Type': input.mimeType,
+        'x-upsert': 'true',
+      },
+      body: input.buffer as unknown as BodyInit,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Supabase Storage upload failed: ${response.status} ${errorText}`);
+    }
+
+    return this.create(
+      {
+        course_id: input.courseId ?? null,
+        job_id: input.jobId ?? null,
+        type: input.type,
+        storage_path: input.storagePath,
+        storage_provider: provider,
+        storage_bucket: bucket,
+        filename: input.filename,
+        mime_type: input.mimeType,
+        size_bytes: input.buffer.length,
         metadata: input.metadata ?? {},
       },
       input.ownerId,

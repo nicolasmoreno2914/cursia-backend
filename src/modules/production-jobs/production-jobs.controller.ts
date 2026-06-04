@@ -14,6 +14,7 @@ import { ProductionJobsService } from './production-jobs.service';
 import { CreateJobDto } from './dto/create-job.dto';
 import { CreateContentJobDto } from './dto/create-content-job.dto';
 import { CreateVideoJobDto } from './dto/create-video-job.dto';
+import { CreateAudioJobDto } from './dto/create-audio-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
 import { UpdateStepDto } from './dto/update-step.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
@@ -63,6 +64,20 @@ export class ProductionJobsController {
     @CurrentUser() user: AuthUser,
   ) {
     return this.jobsService.createVideoJob(user.id, dto);
+  }
+
+  /**
+   * POST /api/v1/jobs/audio
+   * Crea un production_job preparado para generación backend del paso audio.
+   * Si ya existe un job activo para el curso, devuelve ese job (idempotente).
+   */
+  @Post('audio')
+  @HttpCode(HttpStatus.CREATED)
+  async createAudioJob(
+    @Body() dto: CreateAudioJobDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.jobsService.createAudioJob(user.id, dto);
   }
 
   /**
