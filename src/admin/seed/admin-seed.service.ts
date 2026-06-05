@@ -27,6 +27,7 @@ const COST_RATES_SEED: Omit<CostRate, 'id' | 'createdAt' | 'updatedAt'>[] = [
     isActive: true,
     effectiveFrom: '2024-10-22',
     notes: 'Claude 3.5 Sonnet — precio entrada Anthropic API',
+    source: 'configured_rate',
   },
   {
     provider: 'anthropic',
@@ -37,6 +38,7 @@ const COST_RATES_SEED: Omit<CostRate, 'id' | 'createdAt' | 'updatedAt'>[] = [
     isActive: true,
     effectiveFrom: '2024-10-22',
     notes: 'Claude 3.5 Sonnet — precio salida Anthropic API',
+    source: 'configured_rate',
   },
   // ── Anthropic — Claude Sonnet 4 / claude-sonnet-4-6 ──────────────────────
   {
@@ -48,6 +50,7 @@ const COST_RATES_SEED: Omit<CostRate, 'id' | 'createdAt' | 'updatedAt'>[] = [
     isActive: true,
     effectiveFrom: '2025-01-01',
     notes: 'Claude Sonnet 4.5 — precio entrada (estimado)',
+    source: 'configured_rate',
   },
   {
     provider: 'anthropic',
@@ -58,6 +61,7 @@ const COST_RATES_SEED: Omit<CostRate, 'id' | 'createdAt' | 'updatedAt'>[] = [
     isActive: true,
     effectiveFrom: '2025-01-01',
     notes: 'Claude Sonnet 4.5 — precio salida (estimado)',
+    source: 'configured_rate',
   },
   {
     provider: 'anthropic',
@@ -68,6 +72,7 @@ const COST_RATES_SEED: Omit<CostRate, 'id' | 'createdAt' | 'updatedAt'>[] = [
     isActive: true,
     effectiveFrom: '2025-01-01',
     notes: 'Claude Sonnet 4.6 — precio entrada (estimado)',
+    source: 'configured_rate',
   },
   {
     provider: 'anthropic',
@@ -78,6 +83,7 @@ const COST_RATES_SEED: Omit<CostRate, 'id' | 'createdAt' | 'updatedAt'>[] = [
     isActive: true,
     effectiveFrom: '2025-01-01',
     notes: 'Claude Sonnet 4.6 — precio salida (estimado)',
+    source: 'configured_rate',
   },
   // ── Anthropic — Claude 3 Haiku (más económico) ────────────────────────────
   {
@@ -89,6 +95,7 @@ const COST_RATES_SEED: Omit<CostRate, 'id' | 'createdAt' | 'updatedAt'>[] = [
     isActive: true,
     effectiveFrom: '2024-03-07',
     notes: 'Claude 3 Haiku — precio entrada',
+    source: 'configured_rate',
   },
   {
     provider: 'anthropic',
@@ -99,6 +106,7 @@ const COST_RATES_SEED: Omit<CostRate, 'id' | 'createdAt' | 'updatedAt'>[] = [
     isActive: true,
     effectiveFrom: '2024-03-07',
     notes: 'Claude 3 Haiku — precio salida',
+    source: 'configured_rate',
   },
   // ── Anthropic — fallback genérico sin modelo ──────────────────────────────
   // Se aplica cuando ai_model no está en ninguna tarifa específica.
@@ -111,6 +119,7 @@ const COST_RATES_SEED: Omit<CostRate, 'id' | 'createdAt' | 'updatedAt'>[] = [
     isActive: true,
     effectiveFrom: '2024-01-01',
     notes: 'Anthropic chat_completion — tarifa genérica entrada (fallback)',
+    source: 'configured_rate',
   },
   {
     provider: 'anthropic',
@@ -121,6 +130,30 @@ const COST_RATES_SEED: Omit<CostRate, 'id' | 'createdAt' | 'updatedAt'>[] = [
     isActive: true,
     effectiveFrom: '2024-01-01',
     notes: 'Anthropic chat_completion — tarifa genérica salida (fallback)',
+    source: 'configured_rate',
+  },
+  // ── OpenAI — gpt-4o-mini chat (audiobook script) ─────────────────────────
+  {
+    provider: 'openai',
+    service: 'chat_completion',
+    model: 'gpt-4o-mini',
+    unitType: 'per_1k_input_tokens',
+    rateUsd: 0.00015,
+    isActive: true,
+    effectiveFrom: '2025-01-01',
+    notes: 'OpenAI gpt-4o-mini — precio entrada estimado para guion de audiolibro',
+    source: 'configured_rate',
+  },
+  {
+    provider: 'openai',
+    service: 'chat_completion',
+    model: 'gpt-4o-mini',
+    unitType: 'per_1k_output_tokens',
+    rateUsd: 0.0006,
+    isActive: true,
+    effectiveFrom: '2025-01-01',
+    notes: 'OpenAI gpt-4o-mini — precio salida estimado para guion de audiolibro',
+    source: 'configured_rate',
   },
   // ── Video Engine IA — por video generado ──────────────────────────────────
   {
@@ -132,6 +165,7 @@ const COST_RATES_SEED: Omit<CostRate, 'id' | 'createdAt' | 'updatedAt'>[] = [
     isActive: true,
     effectiveFrom: '2025-01-01',
     notes: 'Video Engine IA — coste estimado por video generado (ajustar según plan)',
+    source: 'configured_rate',
   },
   // ── ElevenLabs — audio por job ────────────────────────────────────────────
   {
@@ -143,17 +177,19 @@ const COST_RATES_SEED: Omit<CostRate, 'id' | 'createdAt' | 'updatedAt'>[] = [
     isActive: true,
     effectiveFrom: '2025-01-01',
     notes: 'ElevenLabs — coste estimado por audio generado (bienvenida o audiolibro cap.)',
+    source: 'configured_rate',
   },
   // ── OpenAI TTS — audio por job ────────────────────────────────────────────
   {
     provider: 'openai_tts',
     service:  'audio_generation',
     model:    'gpt-4o-mini-tts',
-    unitType: 'per_job',
-    rateUsd:  0.005,
+    unitType: 'per_1k_characters',
+    rateUsd:  0.0006,
     isActive: true,
     effectiveFrom: '2025-01-01',
-    notes: 'OpenAI TTS gpt-4o-mini-tts — coste estimado por request (~4000 chars, $0.60/1M chars)',
+    notes: 'OpenAI TTS gpt-4o-mini-tts — coste estimado por 1000 caracteres',
+    source: 'configured_rate',
   },
 ];
 

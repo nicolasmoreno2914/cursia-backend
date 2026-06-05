@@ -18,6 +18,7 @@ import { CreatePackageJobDto } from './dto/create-package-job.dto';
 import { CreateFullCourseJobDto } from './dto/create-full-course-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
 import { UpdateStepDto } from './dto/update-step.dto';
+import { EventsService } from '../../events/events.service';
 
 /** Pasos estándar del pipeline (matching CP_STEP_DEFS en 31-course-production.js) */
 const STANDARD_STEPS = [
@@ -213,6 +214,7 @@ export class ProductionJobsService {
     @InjectRepository(ProductionStep)
     private readonly stepRepo: Repository<ProductionStep>,
     private readonly dataSource: DataSource,
+    private readonly eventsService: EventsService,
   ) {}
 
   private sanitizePayload<T>(value: T): T {
@@ -268,6 +270,12 @@ export class ProductionJobsService {
       || CANCELLATION_TERMINAL_STATUSES.has(String(job.status || '').trim());
   }
 
+  private buildUsageCourseId(job: ProductionJob): string | null {
+    if (job.frontendCourseId) return String(job.frontendCourseId);
+    if (job.courseId !== null && job.courseId !== undefined) return String(job.courseId);
+    return null;
+  }
+
   private appendCancellationSummary(
     target: ProductionJob,
     reason?: string | null,
@@ -300,6 +308,31 @@ export class ProductionJobsService {
     target.errorMessage = target.errorMessage ?? 'Preparación cancelada por el usuario.';
     target.outputSummary = this.appendCancellationSummary(target, reason, requestedBy);
     await this.jobRepo.save(target);
+
+    if (target.executionMode === 'course_full_generation') {
+      await this.eventsService.trackBackendEvent({
+        userId: target.ownerId,
+        userEmail: null,
+        eventType: 'full_course_generation_cancelled',
+        courseId: this.buildUsageCourseId(target),
+        jobId: target.id,
+        component: 'orchestration',
+        provider: 'internal',
+        model: 'full-course-worker',
+        mode: 'unknown',
+        costType: 'unknown',
+        costSource: 'not_tracked',
+        failed: false,
+        metadata: {
+          executionMode: target.executionMode,
+          status: target.status,
+          workerStatus: target.workerStatus,
+          reason: reason || 'user_cancelled',
+          requestedBy: requestedBy ?? null,
+          outputSummary: target.outputSummary ?? {},
+        },
+      });
+    }
   }
 
   private async markAllOpenStepsCancelled(jobId: string): Promise<void> {
@@ -2284,6 +2317,7 @@ export class ProductionJobsService {
     jobId: string,
     ownerId: string,
     reason?: string | null,
+    requestedByEmail?: string | null,
   ): Promise<{ ok: true; cancelledJobIds: string[]; cascadedChildJobIds: string[]; job: ProductionJob }> {
     const job = await this.findOne(jobId, ownerId);
     if (job.executionMode !== 'course_full_generation') {
@@ -2295,7 +2329,7 @@ export class ProductionJobsService {
     const cascadedChildJobIds: string[] = [];
 
     if (!alreadyCancelled) {
-      await this.markJobCancelledEntity(job, reason, ownerId);
+      await this.markJobCancelledEntity(job, reason, requestedByEmail ?? ownerId);
       await this.markAllOpenStepsCancelled(job.id);
       cancelledJobIds.push(job.id);
     }
@@ -2309,7 +2343,7 @@ export class ProductionJobsService {
     for (const child of childJobs) {
       if (child.id === job.id) continue;
       if (this.isCancelledLike(child)) continue;
-      await this.markJobCancelledEntity(child, reason || 'parent_cancelled', ownerId);
+      await this.markJobCancelledEntity(child, reason || 'parent_cancelled', requestedByEmail ?? ownerId);
       await this.markAllOpenStepsCancelled(child.id);
       cascadedChildJobIds.push(child.id);
     }

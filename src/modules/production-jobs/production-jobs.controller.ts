@@ -234,7 +234,7 @@ export class ProductionJobsController {
     @Body('reason') reason: string | undefined,
     @CurrentUser() user: AuthUser,
   ) {
-    const result = await this.jobsService.cancelJob(id, user.id, reason);
+    const result = await this.jobsService.cancelJob(id, user.id, reason, user.email);
     return {
       ok: true,
       data: {

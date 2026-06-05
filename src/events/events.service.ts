@@ -16,6 +16,40 @@ import { UsageEvent } from './entities/usage-event.entity';
 import { CreateEventDto } from './dto/create-event.dto';
 import { CostRatesService } from '../admin/services/cost-rates.service';
 import { AuthUser } from '../auth/auth.types';
+import {
+  UsageEventComponent,
+  UsageEventCostSource,
+  UsageEventCostType,
+  UsageEventMode,
+} from './entities/usage-event.entity';
+
+export interface BackendUsageEventInput {
+  userId: string;
+  userEmail?: string | null;
+  organizationId?: string | null;
+  eventType: string;
+  failed?: boolean;
+  errorMessage?: string | null;
+  courseId?: string | null;
+  jobId?: string | null;
+  parentJobId?: string | null;
+  component?: UsageEventComponent | null;
+  provider?: string | null;
+  model?: string | null;
+  service?: string | null;
+  mode?: UsageEventMode | null;
+  costType?: UsageEventCostType | null;
+  estimatedCostUsd?: number | null;
+  realCostUsd?: number | null;
+  costSource?: UsageEventCostSource | null;
+  tokensInput?: number | null;
+  tokensOutput?: number | null;
+  units?: number | null;
+  unitType?: string | null;
+  unitPriceUsd?: number | null;
+  durationMs?: number | null;
+  metadata?: Record<string, any> | null;
+}
 
 @Injectable()
 export class EventsService {
@@ -66,46 +100,136 @@ export class EventsService {
     return { provider: undefined, service: undefined };
   }
 
-  async create(dto: CreateEventDto, user: AuthUser): Promise<{ ok: boolean; id?: string }> {
+  private _inferLegacyComponent(eventType: string): UsageEventComponent | null {
+    const et = String(eventType || '');
+    if (et.startsWith('ia_')) return 'content';
+    if (et.startsWith('video_')) return 'video';
+    if (et.startsWith('youtube_')) return 'youtube';
+    if (et.includes('audio') || et.includes('audiobook')) return 'audio';
+    if (et.includes('mbz') || et.includes('export')) return 'package';
+    if (et.includes('cloud')) return 'storage';
+    return 'orchestration';
+  }
+
+  private async _persistEvent(input: BackendUsageEventInput): Promise<{ ok: boolean; id?: string }> {
     try {
-      // ── 1. Calcular coste estimado ───────────────────────────────
-      const costKey = this._resolveCostServiceKey(dto);
-      const estimatedCostUsd = await this.costRatesService.estimateCostFromEvent({
-        provider:    costKey.provider,
-        service:     costKey.service,
-        model:       dto.ai_model,
-        tokensInput:  dto.tokens_input,
-        tokensOutput: dto.tokens_output,
-        videoCount:   dto.video_count,
-      });
+      const normalizedMode: UsageEventMode = input.mode ?? 'unknown';
+      let normalizedCostType: UsageEventCostType = input.costType ?? 'unknown';
+      let estimatedCostUsd = input.estimatedCostUsd ?? null;
+      const realCostUsd = input.realCostUsd ?? null;
+      let costSource: UsageEventCostSource | null = input.costSource ?? null;
+      let unitPriceUsd = input.unitPriceUsd ?? null;
+      let unitType = input.unitType ?? null;
 
-      // ── 2. Construir entidad ─────────────────────────────────────
+      if (normalizedCostType === 'mock_zero') {
+        estimatedCostUsd = 0;
+        costSource = 'mock_zero';
+      } else if (normalizedCostType === 'estimated' && estimatedCostUsd == null) {
+        const resolved = await this.costRatesService.resolveCostEstimate({
+          provider: input.provider ?? undefined,
+          service: input.service ?? undefined,
+          model: input.model ?? undefined,
+          tokensInput: input.tokensInput ?? undefined,
+          tokensOutput: input.tokensOutput ?? undefined,
+          units: input.units ?? undefined,
+          unitType: input.unitType ?? undefined,
+        });
+        estimatedCostUsd = resolved.costUsd;
+        unitPriceUsd = unitPriceUsd ?? resolved.unitPriceUsd;
+        unitType = unitType ?? resolved.unitType;
+        costSource = (resolved.source as UsageEventCostSource | null) ?? costSource ?? 'configured_rate';
+        if (estimatedCostUsd == null) {
+          normalizedCostType = 'unknown';
+          costSource = 'not_tracked';
+        }
+      } else if (normalizedCostType === 'unknown') {
+        costSource = costSource ?? 'not_tracked';
+      } else if (normalizedCostType === 'real') {
+        costSource = costSource ?? 'provider_reported';
+      }
+
+      const provider = input.provider ?? null;
+      const model = input.model ?? null;
       const event = this.eventRepo.create({
-        userId:          user.id,
-        userEmail:       user.email || null,
-        eventType:       dto.event_type,
-        failed:          dto.failed ?? false,
-        errorMessage:    dto.error_message  ?? null,
-        tokensInput:     dto.tokens_input   ?? null,
-        tokensOutput:    dto.tokens_output  ?? null,
-        aiModel:         dto.ai_model       ?? null,
-        aiProvider:      dto.ai_provider    ?? null,
-        estimatedCostUsd: estimatedCostUsd   ?? null,
-        videoJobId:      dto.video_job_id   ?? null,
-        videoBatchId:    dto.video_batch_id ?? null,
-        videoCount:      dto.video_count    ?? null,
-        courseId:        dto.course_id      ?? null,
-        durationMs:      dto.duration_ms    ?? null,
-        metadata:        dto.metadata       ?? null,
+        userId: input.userId,
+        userEmail: input.userEmail ?? null,
+        organizationId: input.organizationId ?? null,
+        eventType: input.eventType,
+        failed: input.failed ?? false,
+        errorMessage: input.errorMessage ?? null,
+        component: input.component ?? this._inferLegacyComponent(input.eventType),
+        tokensInput: input.tokensInput ?? null,
+        tokensOutput: input.tokensOutput ?? null,
+        aiModel: model,
+        aiProvider: provider,
+        provider,
+        model,
+        mode: normalizedMode,
+        estimatedCostUsd,
+        realCostUsd,
+        costType: normalizedCostType,
+        costSource,
+        units: input.units ?? null,
+        unitType,
+        unitPriceUsd,
+        videoJobId: input.metadata?.videoJobId ?? null,
+        videoBatchId: input.metadata?.videoBatchId ?? null,
+        videoCount: input.metadata?.videoCount ?? null,
+        courseId: input.courseId ?? null,
+        jobId: input.jobId ?? null,
+        parentJobId: input.parentJobId ?? null,
+        durationMs: input.durationMs ?? null,
+        metadata: input.metadata ?? null,
       });
 
-      // ── 3. Guardar ───────────────────────────────────────────────
       const saved = await this.eventRepo.save(event);
       return { ok: true, id: saved.id };
     } catch (e) {
-      // Fire-and-forget: logueamos pero no rompemos el cliente
       this.logger.error('Error saving usage event', e);
       return { ok: false };
     }
+  }
+
+  async create(dto: CreateEventDto, user: AuthUser): Promise<{ ok: boolean; id?: string }> {
+    const costKey = this._resolveCostServiceKey(dto);
+    const costType: UsageEventCostType = dto.cost_type as UsageEventCostType
+      ?? ((dto.tokens_input || dto.tokens_output || dto.video_count) ? 'estimated' : 'unknown');
+    const mode: UsageEventMode = dto.mode as UsageEventMode ?? 'unknown';
+    return this._persistEvent({
+      userId: user.id,
+      userEmail: user.email || null,
+      organizationId: dto.organization_id ?? null,
+      eventType: dto.event_type,
+      failed: dto.failed ?? false,
+      errorMessage: dto.error_message ?? null,
+      courseId: dto.course_id ?? null,
+      jobId: dto.job_id ?? null,
+      parentJobId: dto.parent_job_id ?? null,
+      component: (dto.component as UsageEventComponent) ?? this._inferLegacyComponent(dto.event_type),
+      provider: dto.provider ?? dto.ai_provider ?? costKey.provider ?? null,
+      model: dto.model ?? dto.ai_model ?? null,
+      service: costKey.service ?? null,
+      mode,
+      costType,
+      estimatedCostUsd: undefined,
+      realCostUsd: dto.real_cost_usd ?? null,
+      costSource: (dto.cost_source as UsageEventCostSource) ?? null,
+      tokensInput: dto.tokens_input ?? null,
+      tokensOutput: dto.tokens_output ?? null,
+      units: dto.units ?? dto.video_count ?? null,
+      unitType: dto.unit_type ?? null,
+      unitPriceUsd: dto.unit_price_usd ?? null,
+      durationMs: dto.duration_ms ?? null,
+      metadata: {
+        ...(dto.metadata ?? {}),
+        videoJobId: dto.video_job_id ?? dto.metadata?.videoJobId ?? null,
+        videoBatchId: dto.video_batch_id ?? dto.metadata?.videoBatchId ?? null,
+        videoCount: dto.video_count ?? dto.metadata?.videoCount ?? null,
+      },
+    });
+  }
+
+  async trackBackendEvent(input: BackendUsageEventInput): Promise<{ ok: boolean; id?: string }> {
+    return this._persistEvent(input);
   }
 }

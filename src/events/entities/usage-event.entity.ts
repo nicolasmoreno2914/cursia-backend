@@ -45,6 +45,37 @@ export type EventType =
   // Auth
   | 'auth_signin';
 
+export type UsageEventComponent =
+  | 'content'
+  | 'audio'
+  | 'audiobook'
+  | 'video'
+  | 'youtube'
+  | 'h5p'
+  | 'package'
+  | 'storage'
+  | 'orchestration';
+
+export type UsageEventMode =
+  | 'real'
+  | 'mock'
+  | 'dry_run'
+  | 'mixed'
+  | 'unknown';
+
+export type UsageEventCostType =
+  | 'real'
+  | 'estimated'
+  | 'mock_zero'
+  | 'unknown';
+
+export type UsageEventCostSource =
+  | 'provider_reported'
+  | 'estimated_rate'
+  | 'configured_rate'
+  | 'mock_zero'
+  | 'not_tracked';
+
 @Entity('usage_events')
 @Index(['userId', 'createdAt'])
 @Index(['eventType', 'createdAt'])
@@ -62,11 +93,17 @@ export class UsageEvent {
   @Column({ name: 'user_email', length: 255, nullable: true })
   userEmail: string;
 
+  @Column({ name: 'organization_id', length: 120, nullable: true })
+  organizationId: string;
+
   // ── Qué ─────────────────────────────────────────────────────────────────────
   /** Tipo de evento. Enum de cadena para flexibilidad sin migraciones. */
   @Index()
   @Column({ name: 'event_type', length: 60 })
   eventType: string;
+
+  @Column({ length: 40, nullable: true })
+  component: string;
 
   /** ¿El evento terminó con error? */
   @Column({ default: false })
@@ -93,10 +130,37 @@ export class UsageEvent {
   @Column({ name: 'ai_provider', length: 50, nullable: true })
   aiProvider: string;
 
+  @Column({ length: 60, nullable: true })
+  provider: string;
+
+  @Column({ length: 120, nullable: true })
+  model: string;
+
+  @Column({ length: 20, nullable: true })
+  mode: string;
+
   // ── Coste calculado ─────────────────────────────────────────────────────────
   /** Coste estimado en USD, calculado al insertar con cost_rates. null si no hay tarifa. */
   @Column({ name: 'estimated_cost_usd', type: 'numeric', precision: 12, scale: 8, nullable: true })
   estimatedCostUsd: number;
+
+  @Column({ name: 'real_cost_usd', type: 'numeric', precision: 12, scale: 8, nullable: true })
+  realCostUsd: number;
+
+  @Column({ name: 'cost_type', length: 20, nullable: true })
+  costType: string;
+
+  @Column({ name: 'cost_source', length: 40, nullable: true })
+  costSource: string;
+
+  @Column({ type: 'numeric', precision: 14, scale: 4, nullable: true })
+  units: number;
+
+  @Column({ name: 'unit_type', length: 40, nullable: true })
+  unitType: string;
+
+  @Column({ name: 'unit_price_usd', type: 'numeric', precision: 12, scale: 8, nullable: true })
+  unitPriceUsd: number;
 
   // ── Video ────────────────────────────────────────────────────────────────────
   /** ID del job de Video Engine IA. */
@@ -115,6 +179,12 @@ export class UsageEvent {
   /** ID del curso relacionado (si aplica). */
   @Column({ name: 'course_id', type: 'varchar', length: 120, nullable: true })
   courseId: string;
+
+  @Column({ name: 'job_id', length: 120, nullable: true })
+  jobId: string;
+
+  @Column({ name: 'parent_job_id', length: 120, nullable: true })
+  parentJobId: string;
 
   // ── Performance ─────────────────────────────────────────────────────────────
   /** Duración de la operación en milisegundos. */

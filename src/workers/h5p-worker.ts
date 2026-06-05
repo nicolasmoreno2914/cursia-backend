@@ -10,6 +10,7 @@ import {
   ProductionJobsService,
 } from '../modules/production-jobs/production-jobs.service';
 import { ProductionJob } from '../modules/production-jobs/entities/production-job.entity';
+import { EventsService } from '../events/events.service';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -365,6 +366,7 @@ async function handleJob(
   job: ProductionJob,
   jobsService: ProductionJobsService,
   artifactsService: ArtifactsService,
+  eventsService: EventsService,
   workerId: string,
   leaseSeconds: number,
   heartbeatMs: number,
@@ -375,6 +377,7 @@ async function handleJob(
   const courseId = buildEffectiveCourseId(job);
   const courseTitle = String(payload.courseTitle ?? payload.courseData?.nombre ?? 'Curso Cursia');
   const options = (payload.options ?? {}) as Record<string, any>;
+  const parentJobId = payload?.metadata?.parentJobId ?? null;
 
   let leaseLost = false;
   let finalized = false;
@@ -406,9 +409,38 @@ async function handleJob(
     }).catch(() => {});
   };
 
+  const trackEvent = async (eventType: string, extra: Record<string, any> = {}) =>
+    eventsService.trackBackendEvent({
+      userId: job.ownerId,
+      eventType,
+      courseId,
+      jobId,
+      parentJobId,
+      component: 'h5p',
+      provider: 'internal',
+      model: 'deterministic_h5p_v1',
+      mode: 'real',
+      costType: extra.costType ?? 'unknown',
+      estimatedCostUsd: extra.estimatedCostUsd,
+      costSource: extra.costSource ?? 'not_tracked',
+      units: extra.units,
+      unitType: extra.unitType,
+      failed: extra.failed ?? false,
+      errorMessage: extra.errorMessage ?? null,
+      metadata: {
+        workerId,
+        courseTitle,
+        ...extra.metadata,
+      },
+    });
+
   try {
     const marked = await jobsService.markH5PWorkerRunning(jobId, workerId);
     if (!marked) return;
+    await trackEvent('h5p_generation_started', {
+      units: 1,
+      unitType: 'per_operation',
+    });
 
     await sendHeartbeat();
     if (leaseLost) return;
@@ -605,10 +637,26 @@ async function handleJob(
       chaptersSkipped,
       activityCount,
     });
+    await trackEvent('h5p_generation_completed', {
+      units: activityCount,
+      unitType: 'per_operation',
+      metadata: {
+        activityCount,
+        chaptersWithActivities,
+        chaptersSkipped,
+        artifactId: artifact.id,
+      },
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (!leaseLost) {
       await jobsService.failH5PWorkerJob(jobId, workerId, message, true);
+      await trackEvent('h5p_generation_failed', {
+        failed: true,
+        errorMessage: message,
+        units: 1,
+        unitType: 'per_operation',
+      });
       logger.error(`[H5PWorker] Job ${jobId} failed: ${message}`);
     }
   } finally {
@@ -623,6 +671,7 @@ async function bootstrap() {
 
   const jobsService = app.get(ProductionJobsService);
   const artifactsService = app.get(ArtifactsService);
+  const eventsService = app.get(EventsService);
   const workerId = process.env.H5P_WORKER_ID || `h5p-worker-${process.pid}`;
   const pollMs = readPositiveInt('H5P_WORKER_POLL_MS', 5000);
   const concurrency = readPositiveInt('H5P_WORKER_CONCURRENCY', 1);
@@ -658,6 +707,7 @@ async function bootstrap() {
         claimed,
         jobsService,
         artifactsService,
+        eventsService,
         workerId,
         leaseSeconds,
         heartbeatMs,

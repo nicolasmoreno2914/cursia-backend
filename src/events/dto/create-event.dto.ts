@@ -18,6 +18,7 @@ import {
   IsObject,
   Min,
   MaxLength,
+  IsIn,
 } from 'class-validator';
 
 export class CreateEventDto {
@@ -85,6 +86,69 @@ export class CreateEventDto {
   @IsString()
   @MaxLength(120)
   course_id?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
+  job_id?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
+  parent_job_id?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
+  organization_id?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  component?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  provider?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
+  model?: string;
+
+  @IsOptional()
+  @IsIn(['real', 'mock', 'dry_run', 'mixed', 'unknown'])
+  mode?: string;
+
+  @IsOptional()
+  @IsIn(['real', 'estimated', 'mock_zero', 'unknown'])
+  cost_type?: string;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  real_cost_usd?: number;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  cost_source?: string;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  units?: number;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  unit_type?: string;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  unit_price_usd?: number;
 
   /** Duración de la operación en milisegundos. */
   @IsOptional()

@@ -20,6 +20,7 @@ import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import { Artifact } from '../modules/artifacts/entities/artifact.entity';
 import { ProductionJobsService } from '../modules/production-jobs/production-jobs.service';
 import { ProductionJob } from '../modules/production-jobs/entities/production-job.entity';
+import { EventsService } from '../events/events.service';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -260,6 +261,7 @@ async function handleFullCourseJob(
   job: ProductionJob,
   jobsService: ProductionJobsService,
   artifactsService: ArtifactsService,
+  eventsService: EventsService,
   workerId: string,
   leaseSeconds: number,
   heartbeatMs: number,
@@ -270,6 +272,7 @@ async function handleFullCourseJob(
   const courseId = buildCourseId(job);
   const ownerId  = job.ownerId;
   const opts     = (input.options ?? {}) as Record<string, any>;
+  const parentJobId = input?.metadata?.parentJobId ?? null;
 
   let leaseLost = false;
   let finalized = false;
@@ -286,8 +289,36 @@ async function handleFullCourseJob(
 
   const updateStep = (step: string, message: string, partialSummary?: Record<string, any>) =>
     jobsService.updateFullCourseStep(jobId, workerId, step, message, partialSummary).catch(() => {});
+  const trackEvent = async (eventType: string, extra: Record<string, any> = {}) =>
+    eventsService.trackBackendEvent({
+      userId: ownerId,
+      eventType,
+      courseId,
+      jobId,
+      parentJobId,
+      component: 'orchestration',
+      provider: 'internal',
+      model: 'full-course-worker',
+      mode: extra.mode ?? 'mixed',
+      costType: extra.costType ?? 'unknown',
+      estimatedCostUsd: extra.estimatedCostUsd,
+      costSource: extra.costSource ?? 'not_tracked',
+      units: extra.units,
+      unitType: extra.unitType,
+      failed: extra.failed ?? false,
+      errorMessage: extra.errorMessage ?? null,
+      metadata: {
+        workerId,
+        ...extra.metadata,
+      },
+    });
 
   try {
+    await trackEvent('full_course_generation_started', {
+      units: 1,
+      unitType: 'per_operation',
+      mode: 'mixed',
+    });
     // ── 0. Check if mbz_final already exists (restore-first) ─────────────────
     await updateStep('checking_existing', 'Verificando trabajo previo…');
 
@@ -602,6 +633,18 @@ async function handleFullCourseJob(
       h5pSnapshotArtifactId,
       userMessage: 'Curso listo.',
     });
+    await trackEvent('full_course_generation_completed', {
+      units: 1,
+      unitType: 'per_operation',
+      mode: 'mixed',
+      metadata: {
+        mbzFinalArtifactId,
+        contentSnapshotArtifactId,
+        audioWelcomeArtifactId,
+        audiobookArtifactId,
+        h5pSnapshotArtifactId,
+      },
+    });
 
     logger.log(`[FullCourseWorker] Job ${jobId} completed — mbzFinal=${mbzFinalArtifactId}`);
 
@@ -613,6 +656,13 @@ async function handleFullCourseJob(
     }
     logger.error(`[FullCourseWorker] Job ${jobId} failed: ${message}`);
     await jobsService.failFullCourseJob(jobId, workerId, message, true);
+    await trackEvent('full_course_generation_failed', {
+      units: 1,
+      unitType: 'per_operation',
+      mode: 'mixed',
+      failed: true,
+      errorMessage: message,
+    });
   } finally {
     finalized = true;
     clearInterval(heartbeatTimer);
@@ -629,6 +679,7 @@ async function bootstrap() {
 
   const jobsService      = app.get(ProductionJobsService);
   const artifactsService = app.get(ArtifactsService);
+  const eventsService    = app.get(EventsService);
 
   const workerId     = process.env.FULL_COURSE_WORKER_ID     || `full-course-worker-${process.pid}`;
   const pollMs       = readPositiveInt('FULL_COURSE_WORKER_POLL_MS',       15_000);
@@ -676,12 +727,29 @@ async function bootstrap() {
         dryRun: true,
         userMessage: 'Curso listo (simulación).',
       });
+      await eventsService.trackBackendEvent({
+        userId: claimed.ownerId,
+        eventType: 'full_course_generation_completed',
+        courseId: buildCourseId(claimed),
+        jobId: claimed.id,
+        parentJobId: claimed.inputPayload?.metadata?.parentJobId ?? null,
+        component: 'orchestration',
+        provider: 'internal',
+        model: 'full-course-worker',
+        mode: 'dry_run',
+        costType: 'mock_zero',
+        estimatedCostUsd: 0,
+        costSource: 'mock_zero',
+        units: 1,
+        unitType: 'per_operation',
+        metadata: { workerId, dryRun: true },
+      });
       logger.log(`[FullCourseWorker] Dry-run completed for job ${claimed.id}`);
       continue;
     }
 
     const promise = handleFullCourseJob(
-      claimed, jobsService, artifactsService,
+      claimed, jobsService, artifactsService, eventsService,
       workerId, leaseSeconds, heartbeatMs, logger,
     )
       .catch(error => {

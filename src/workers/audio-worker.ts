@@ -10,6 +10,7 @@ import {
   AudioWorkerProgressSummary,
 } from '../modules/production-jobs/production-jobs.service';
 import { ProductionJob } from '../modules/production-jobs/entities/production-job.entity';
+import { EventsService } from '../events/events.service';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -108,7 +109,7 @@ async function generateAudiobookScript(
   bookExcerpts: Record<string, string>,
   apiKey: string,
   logger: Logger,
-): Promise<string> {
+): Promise<{ script: string; promptTokens: number; completionTokens: number; model: string }> {
   const nombre = courseData.nombre || 'este curso';
   const sector = courseData.sector || '';
   const nivel  = courseData.nivel  || '';
@@ -189,6 +190,10 @@ async function generateAudiobookScript(
 
   const data = await res.json() as {
     choices?: Array<{ message?: { content?: string } }>;
+    usage?: {
+      prompt_tokens?: number;
+      completion_tokens?: number;
+    };
   };
   const script = data?.choices?.[0]?.message?.content?.trim() ?? '';
 
@@ -199,7 +204,12 @@ async function generateAudiobookScript(
   const wordCount = script.split(/\s+/).length;
   logger.log(`[AudioWorker] Audiobook script: ${wordCount} words, ${script.length} chars`);
 
-  return script;
+  return {
+    script,
+    promptTokens: Number(data?.usage?.prompt_tokens ?? 0),
+    completionTokens: Number(data?.usage?.completion_tokens ?? 0),
+    model: 'gpt-4o-mini',
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -271,6 +281,7 @@ async function handleAudioJob(
   jobsService: ProductionJobsService,
   artifactsService: ArtifactsService,
   ttsService: TtsService,
+  eventsService: EventsService,
   workerId: string,
   leaseSeconds: number,
   heartbeatMs: number,
@@ -290,9 +301,14 @@ async function handleAudioJob(
 
   const rawCourseId = job.frontendCourseId || String(job.courseId ?? 'unknown');
   const apiKey = (process.env.OPENAI_API_KEY ?? '').trim();
+  const parentJobId = job.inputPayload?.metadata?.parentJobId ?? null;
 
   let leaseLost = false;
   let finalized = false;
+  let welcomeCharCount = 0;
+  let audiobookTtsChars = 0;
+  let audiobookPromptTokens = 0;
+  let audiobookCompletionTokens = 0;
 
   const outputSummary: Record<string, any> = {
     welcomeAudio: { status: 'pending' },
@@ -323,6 +339,37 @@ async function handleAudioJob(
     }).catch(() => {});
   };
 
+  const trackEvent = async (eventType: string, extra: Record<string, any> = {}) =>
+    eventsService.trackBackendEvent({
+      userId: job.ownerId,
+      eventType,
+      courseId: rawCourseId,
+      jobId,
+      parentJobId,
+      component: extra.component ?? 'audio',
+      provider: extra.provider ?? 'openai_tts',
+      model: extra.model ?? model,
+      mode: extra.mode ?? 'real',
+      costType: extra.costType ?? 'unknown',
+      estimatedCostUsd: extra.estimatedCostUsd,
+      realCostUsd: extra.realCostUsd,
+      costSource: extra.costSource ?? 'not_tracked',
+      tokensInput: extra.tokensInput,
+      tokensOutput: extra.tokensOutput,
+      units: extra.units,
+      unitType: extra.unitType,
+      unitPriceUsd: extra.unitPriceUsd,
+      durationMs: extra.durationMs,
+      failed: extra.failed ?? false,
+      errorMessage: extra.errorMessage ?? null,
+      metadata: {
+        workerId,
+        generateWelcome,
+        generateAudiobook,
+        ...extra.metadata,
+      },
+    });
+
   try {
     const marked = await jobsService.markAudioWorkerRunning(jobId, workerId);
     if (!marked) {
@@ -352,6 +399,13 @@ async function handleAudioJob(
           humanMessage: 'Audio de bienvenida ya guardado.',
         };
       } else {
+        await trackEvent('welcome_audio_started', {
+          component: 'audio',
+          provider: 'openai_tts',
+          model,
+          mode: 'real',
+          costType: 'unknown',
+        });
         const script = buildWelcomeScript(courseData);
         let welcomeBuffer: Buffer | null = null;
         let welcomeError = '';
@@ -361,6 +415,7 @@ async function handleAudioJob(
           try {
             const result = await ttsService.synthesize({ text: script, voice, model, format: 'mp3' });
             welcomeBuffer = result.audioBuffer;
+            welcomeCharCount = result.chars;
             break;
           } catch (e) {
             welcomeError = e instanceof Error ? e.message : String(e);
@@ -384,6 +439,21 @@ async function handleAudioJob(
             sizeBytes: welcomeBuffer.length,
             humanMessage: 'Audio de bienvenida listo.',
           };
+          await trackEvent('welcome_audio_completed', {
+            component: 'audio',
+            provider: 'openai_tts',
+            model,
+            mode: 'real',
+            costType: 'estimated',
+            costSource: 'configured_rate',
+            units: welcomeCharCount,
+            unitType: 'per_1k_characters',
+            metadata: {
+              artifactId: artifact.id,
+              sizeBytes: welcomeBuffer.length,
+              voice,
+            },
+          });
           logger.log(`[AudioWorker] Welcome audio uploaded: artifact ${artifact.id}`);
         } else {
           outputSummary.welcomeAudio = {
@@ -394,6 +464,16 @@ async function handleAudioJob(
           };
           logger.error(`[AudioWorker] Welcome audio failed after ${maxAttempts} attempts: ${welcomeError}`);
           // Welcome audio failure → fail the job so it can be retried
+          await trackEvent('audio_failed', {
+            component: 'audio',
+            provider: 'openai_tts',
+            model,
+            mode: 'real',
+            costType: 'unknown',
+            failed: true,
+            errorMessage: welcomeError,
+            metadata: { phase: 'welcome_audio' },
+          });
           finalized = true;
           clearInterval(heartbeatTimer);
           await jobsService.failAudioWorkerJob(jobId, workerId, welcomeError, true);
@@ -427,6 +507,13 @@ async function handleAudioJob(
           humanMessage: 'Audiolibro ya guardado.',
         };
       } else {
+        await trackEvent('audiobook_started', {
+          component: 'audiobook',
+          provider: 'openai',
+          model: 'gpt-4o-mini',
+          mode: 'real',
+          costType: 'unknown',
+        });
         const hasExcerpts = Object.keys(bookExcerpts).length > 0;
 
         if (!hasExcerpts && !courseData.nombre) {
@@ -441,7 +528,10 @@ async function handleAudioJob(
 
           try {
             // Generate script
-            const script = await generateAudiobookScript(courseData, bookExcerpts, apiKey, logger);
+            const scriptResult = await generateAudiobookScript(courseData, bookExcerpts, apiKey, logger);
+            audiobookPromptTokens = scriptResult.promptTokens;
+            audiobookCompletionTokens = scriptResult.completionTokens;
+            const script = scriptResult.script;
             const segments = splitText(script, TTS_MAX_CHARS);
 
             logger.log(`[AudioWorker] Audiobook: ${segments.length} TTS segments`);
@@ -466,6 +556,7 @@ async function handleAudioJob(
                 try {
                   const result = await ttsService.synthesize({ text: seg, voice, model, format: 'mp3' });
                   chunkBuffer = result.audioBuffer;
+                  audiobookTtsChars += result.chars;
                   break;
                 } catch (e) {
                   chunkError = e instanceof Error ? e.message : String(e);
@@ -518,6 +609,25 @@ async function handleAudioJob(
               sizeBytes: audiobookBuffer.length,
               humanMessage: 'Audiolibro listo.',
             };
+            await trackEvent('audiobook_completed', {
+              component: 'audiobook',
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              mode: 'real',
+              costType: 'estimated',
+              costSource: 'configured_rate',
+              tokensInput: audiobookPromptTokens,
+              tokensOutput: audiobookCompletionTokens,
+              units: audiobookTtsChars,
+              unitType: 'per_1k_characters',
+              metadata: {
+                artifactId: artifact.id,
+                sizeBytes: audiobookBuffer.length,
+                ttsModel: model,
+                ttsChars: audiobookTtsChars,
+                voice,
+              },
+            });
             logger.log(`[AudioWorker] Audiobook uploaded: artifact ${artifact.id}`);
           } else {
             outputSummary.audiobook = {
@@ -526,6 +636,19 @@ async function handleAudioJob(
               humanMessage: 'No pudimos crear el audiolibro, pero tu curso puede continuar.',
               retryCount: 3,
             };
+            await trackEvent('audio_failed', {
+              component: 'audiobook',
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              mode: 'real',
+              costType: 'unknown',
+              failed: true,
+              errorMessage: audiobookError || 'audiobook_failed',
+              metadata: {
+                phase: 'audiobook',
+                optional: audiobookOptional,
+              },
+            });
             logger.warn(`[AudioWorker] Audiobook failed: ${audiobookError}`);
           }
         }
@@ -553,6 +676,16 @@ async function handleAudioJob(
       return;
     }
     await jobsService.failAudioWorkerJob(jobId, workerId, message, true);
+    await trackEvent('audio_failed', {
+      component: 'audio',
+      provider: 'openai',
+      model: 'gpt-4o-mini',
+      mode: 'real',
+      costType: 'unknown',
+      failed: true,
+      errorMessage: message,
+      metadata: { phase: 'worker' },
+    });
     logger.error(`[AudioWorker] Job ${jobId} failed: ${message}`);
   } finally {
     finalized = true;
@@ -573,6 +706,7 @@ async function bootstrap() {
   const jobsService      = app.get(ProductionJobsService);
   const artifactsService = app.get(ArtifactsService);
   const ttsService       = app.get(TtsService);
+  const eventsService    = app.get(EventsService);
 
   const workerId     = process.env.AUDIO_WORKER_ID     || `audio-worker-${process.pid}`;
   const pollMs       = readPositiveInt('AUDIO_WORKER_POLL_MS',        5000);
@@ -624,6 +758,40 @@ async function bootstrap() {
         welcomeAudio: { status: 'completed', humanMessage: 'Audio de bienvenida listo (dry-run).' },
         audiobook:    { status: 'completed', humanMessage: 'Audiolibro listo (dry-run).' },
       });
+      await eventsService.trackBackendEvent({
+        userId: claimed.ownerId,
+        eventType: 'welcome_audio_completed',
+        courseId: claimed.frontendCourseId || String(claimed.courseId ?? 'unknown'),
+        jobId: claimed.id,
+        parentJobId: claimed.inputPayload?.metadata?.parentJobId ?? null,
+        component: 'audio',
+        provider: 'openai_tts',
+        model: process.env.OPENAI_TTS_MODEL || 'gpt-4o-mini-tts',
+        mode: 'dry_run',
+        costType: 'mock_zero',
+        estimatedCostUsd: 0,
+        costSource: 'mock_zero',
+        units: 1,
+        unitType: 'per_operation',
+        metadata: { workerId, dryRun: true },
+      });
+      await eventsService.trackBackendEvent({
+        userId: claimed.ownerId,
+        eventType: 'audiobook_completed',
+        courseId: claimed.frontendCourseId || String(claimed.courseId ?? 'unknown'),
+        jobId: claimed.id,
+        parentJobId: claimed.inputPayload?.metadata?.parentJobId ?? null,
+        component: 'audiobook',
+        provider: 'openai',
+        model: 'gpt-4o-mini',
+        mode: 'dry_run',
+        costType: 'mock_zero',
+        estimatedCostUsd: 0,
+        costSource: 'mock_zero',
+        units: 1,
+        unitType: 'per_operation',
+        metadata: { workerId, dryRun: true },
+      });
       logger.log(`[AudioWorker] Dry-run completed for job ${claimed.id}`);
       continue;
     }
@@ -633,6 +801,7 @@ async function bootstrap() {
       jobsService,
       artifactsService,
       ttsService,
+      eventsService,
       workerId,
       leaseSeconds,
       heartbeatMs,

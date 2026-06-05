@@ -64,6 +64,10 @@ info "[3/7] Alinear restricciones de production_jobs..."
 node scripts/migrate-production-jobs-constraints.js
 success "Restricciones de production_jobs actualizadas."
 
+info "[3.1/7] Migrar usage_events y cost_rates para tracking de costos..."
+node scripts/migrate-usage-events-costs.js
+success "Schema de costos actualizado."
+
 # ── 5. Build ──────────────────────────────────────────────────────────────────
 info "[4/7] npm run build..."
 npm run build

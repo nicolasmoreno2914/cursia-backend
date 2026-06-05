@@ -24,6 +24,15 @@ export interface EventCostInput {
   tokensInput?: number;
   tokensOutput?: number;
   videoCount?: number;
+  units?: number;
+  unitType?: string;
+}
+
+export interface ResolvedCostEstimate {
+  costUsd: number | null;
+  unitPriceUsd: number | null;
+  unitType: string | null;
+  source: string | null;
 }
 
 @Injectable()
@@ -70,12 +79,22 @@ export class CostRatesService {
    * NUNCA lanza excepción — el evento se guarda aunque el coste sea null.
    */
   async estimateCostFromEvent(input: EventCostInput): Promise<number | null> {
+    const resolved = await this.resolveCostEstimate(input);
+    return resolved.costUsd;
+  }
+
+  async resolveCostEstimate(input: EventCostInput): Promise<ResolvedCostEstimate> {
     try {
-      const { provider, service, model, tokensInput, tokensOutput, videoCount } = input;
-      if (!provider || !service) return null;
+      const { provider, service, model, tokensInput, tokensOutput, videoCount, units, unitType } = input;
+      if (!provider || !service) {
+        return { costUsd: null, unitPriceUsd: null, unitType: unitType ?? null, source: null };
+      }
 
       let total = 0;
       let hasValue = false;
+      let lastUnitPriceUsd: number | null = null;
+      let lastUnitType: string | null = unitType ?? null;
+      let source: string | null = null;
 
       // ── Tokens de entrada ──────────────────────────────────────────
       if (tokensInput && tokensInput > 0) {
@@ -83,6 +102,9 @@ export class CostRatesService {
         if (rate) {
           total += (tokensInput / 1000) * Number(rate.rateUsd);
           hasValue = true;
+          lastUnitPriceUsd = Number(rate.rateUsd);
+          lastUnitType = 'per_1k_input_tokens';
+          source = rate.source ?? 'configured_rate';
         }
       }
 
@@ -92,6 +114,9 @@ export class CostRatesService {
         if (rate) {
           total += (tokensOutput / 1000) * Number(rate.rateUsd);
           hasValue = true;
+          lastUnitPriceUsd = Number(rate.rateUsd);
+          lastUnitType = 'per_1k_output_tokens';
+          source = rate.source ?? 'configured_rate';
         }
       }
 
@@ -101,6 +126,23 @@ export class CostRatesService {
         if (rate) {
           total += videoCount * Number(rate.rateUsd);
           hasValue = true;
+          lastUnitPriceUsd = Number(rate.rateUsd);
+          lastUnitType = 'per_video';
+          source = rate.source ?? 'configured_rate';
+        }
+      }
+
+      // ── Unidades genéricas (caracteres, minutos, operaciones, etc.) ──────
+      if (unitType && units && units > 0) {
+        const rate = await this.getActiveRate(provider, service, model ?? null, unitType);
+        if (rate) {
+          const rateUsd = Number(rate.rateUsd);
+          const divisor = unitType.startsWith('per_1k_') ? 1000 : 1;
+          total += (units / divisor) * rateUsd;
+          hasValue = true;
+          lastUnitPriceUsd = rateUsd;
+          lastUnitType = unitType;
+          source = rate.source ?? 'configured_rate';
         }
       }
 
@@ -112,13 +154,21 @@ export class CostRatesService {
         if (rate) {
           total += Number(rate.rateUsd);
           hasValue = true;
+          lastUnitPriceUsd = Number(rate.rateUsd);
+          lastUnitType = rate.unitType;
+          source = rate.source ?? 'configured_rate';
         }
       }
 
-      return hasValue ? total : null;
+      return {
+        costUsd: hasValue ? total : null,
+        unitPriceUsd: lastUnitPriceUsd,
+        unitType: lastUnitType,
+        source,
+      };
     } catch {
       // No bloquear el guardado del evento si hay error de DB
-      return null;
+      return { costUsd: null, unitPriceUsd: null, unitType: input.unitType ?? null, source: null };
     }
   }
 }

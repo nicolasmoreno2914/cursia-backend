@@ -38,6 +38,12 @@ export interface DashboardSummary {
   };
   exports: { mbz_total: number };
   total_estimated_cost_usd: number;
+  costs: {
+    estimated_total_usd: number;
+    real_total_usd: number;
+    mock_total_usd: number;
+    unknown_events: number;
+  };
   traditional_equivalent_usd: number;
   savings_usd: number;
   failures: { total: number };
@@ -47,21 +53,33 @@ export interface DashboardSummary {
   productionTrend: Array<{ date: string; count: number }>;
   courseCostSummary: {
     totalEstimatedCostUsd: number;
+    totalRealCostUsd: number;
+    totalMockCostUsd: number;
     averageEstimatedCostUsd: number;
     coursesWithCostCount: number;
     coursesWithoutCostCount: number;
+    coursesWithUnknownCostCount: number;
   };
   courseCosts: Array<{
     courseId: string;
     courseName: string;
     status: string;
+    totalCostUsd: number | null;
     estimatedCostUsd: number;
     realCostUsd: number | null;
-    costSource: 'estimated' | 'real' | null;
+    mockCostUsd: number;
+    unknownCostUsd: number | null;
+    costStatus: 'real' | 'estimated' | 'mock' | 'mixed' | 'unknown';
+    costSource: 'estimated' | 'real' | 'mixed' | 'mock' | null;
     contentCostUsd: number;
     audioCostUsd: number;
     videoCostUsd: number;
     packageCostUsd: number;
+    h5pCostUsd: number;
+    youtubeCostUsd: number;
+    storageCostUsd: number;
+    hasMissingCostEvents: boolean;
+    mode: 'real' | 'mock' | 'dry_run' | 'mixed' | 'unknown';
     lastUpdatedAt: string | null;
     eventsCount: number;
   }>;
@@ -120,7 +138,7 @@ export class AdminDashboardService {
     const videosGenerated = await this.eventRepo
       .createQueryBuilder('e')
       .where('e.created_at BETWEEN :from AND :to', { from, to })
-      .andWhere("e.event_type = 'video_job_completed'")
+      .andWhere("e.event_type IN ('video_job_completed', 'video_generation_completed')")
       .getCount();
 
     const videosYouTube = await this.eventRepo
@@ -132,14 +150,13 @@ export class AdminDashboardService {
     const videosFailed = await this.eventRepo
       .createQueryBuilder('e')
       .where('e.created_at BETWEEN :from AND :to', { from, to })
-      .andWhere("e.event_type IN ('video_job_failed', 'youtube_upload_failed')")
+      .andWhere("e.event_type IN ('video_job_failed', 'video_generation_failed', 'youtube_upload_failed')")
       .getCount();
 
     const videoCostStats = await this.eventRepo
       .createQueryBuilder('e')
-      .select('COALESCE(SUM(e.estimated_cost_usd), 0)', 'videosCost')
+      .select("COALESCE(SUM(CASE WHEN COALESCE(e.component, '') = 'video' THEN COALESCE(e.real_cost_usd, e.estimated_cost_usd, 0) ELSE 0 END), 0)", 'videosCost')
       .where('e.created_at BETWEEN :from AND :to', { from, to })
-      .andWhere("e.event_type LIKE 'video_%'")
       .getRawOne<{ videosCost: string }>();
 
     const videosCostUsd = parseFloat(videoCostStats?.videosCost ?? '0');
@@ -148,20 +165,19 @@ export class AdminDashboardService {
     const welcomeAudioCount = await this.eventRepo
       .createQueryBuilder('e')
       .where('e.created_at BETWEEN :from AND :to', { from, to })
-      .andWhere("e.event_type = 'welcome_audio_generated'")
+      .andWhere("e.event_type IN ('welcome_audio_generated', 'welcome_audio_completed')")
       .getCount();
 
     const audiobookCount = await this.eventRepo
       .createQueryBuilder('e')
       .where('e.created_at BETWEEN :from AND :to', { from, to })
-      .andWhere("e.event_type = 'audiobook_generated'")
+      .andWhere("e.event_type IN ('audiobook_generated', 'audiobook_completed')")
       .getCount();
 
     const audioCostStats = await this.eventRepo
       .createQueryBuilder('e')
-      .select('COALESCE(SUM(e.estimated_cost_usd), 0)', 'audioCost')
+      .select("COALESCE(SUM(CASE WHEN COALESCE(e.component, '') IN ('audio', 'audiobook') THEN COALESCE(e.real_cost_usd, e.estimated_cost_usd, 0) ELSE 0 END), 0)", 'audioCost')
       .where('e.created_at BETWEEN :from AND :to', { from, to })
-      .andWhere("e.event_type IN ('welcome_audio_generated', 'audiobook_generated')")
       .getRawOne<{ audioCost: string }>();
 
     const audioCostUsd = parseFloat(audioCostStats?.audioCost ?? '0');
@@ -170,7 +186,7 @@ export class AdminDashboardService {
     const productionCompleted = await this.eventRepo
       .createQueryBuilder('e')
       .where('e.created_at BETWEEN :from AND :to', { from, to })
-      .andWhere("e.event_type = 'course_production_completed'")
+      .andWhere("e.event_type IN ('course_production_completed', 'full_course_generation_completed')")
       .getCount();
 
     // ── 7. Exports MBZ ────────────────────────────────────────────────────────
@@ -183,20 +199,29 @@ export class AdminDashboardService {
     // ── 8. Coste total ────────────────────────────────────────────────────────
     const totalCostStats = await this.eventRepo
       .createQueryBuilder('e')
-      .select('COALESCE(SUM(e.estimated_cost_usd), 0)', 'totalCost')
+      .select("COALESCE(SUM(CASE WHEN e.cost_type = 'estimated' THEN COALESCE(e.estimated_cost_usd, 0) ELSE 0 END), 0)", 'estimatedTotalCost')
+      .addSelect("COALESCE(SUM(CASE WHEN e.cost_type = 'real' THEN COALESCE(e.real_cost_usd, 0) ELSE 0 END), 0)", 'realTotalCost')
+      .addSelect("COALESCE(SUM(CASE WHEN e.cost_type = 'mock_zero' THEN COALESCE(e.estimated_cost_usd, 0) ELSE 0 END), 0)", 'mockTotalCost')
+      .addSelect("COALESCE(SUM(CASE WHEN e.cost_type = 'unknown' THEN 1 ELSE 0 END), 0)", 'unknownEvents')
       .where('e.created_at BETWEEN :from AND :to', { from, to })
-      .getRawOne<{ totalCost: string }>();
+      .getRawOne<{ estimatedTotalCost: string; realTotalCost: string; mockTotalCost: string; unknownEvents: string }>();
 
-    const totalCostUsd = parseFloat(totalCostStats?.totalCost ?? '0');
+    const estimatedTotalCostUsd = parseFloat(totalCostStats?.estimatedTotalCost ?? '0');
+    const realTotalCostUsd = parseFloat(totalCostStats?.realTotalCost ?? '0');
+    const mockTotalCostUsd = parseFloat(totalCostStats?.mockTotalCost ?? '0');
+    const totalCostUsd = estimatedTotalCostUsd + realTotalCostUsd + mockTotalCostUsd;
+    const unknownEvents = parseInt(totalCostStats?.unknownEvents ?? '0', 10);
 
     // ── 9a. Costo por proveedor ───────────────────────────────────────────────
     const costByProviderRaw = await this.eventRepo
       .createQueryBuilder('e')
-      .select("COALESCE(e.ai_provider, 'otros')", 'provider')
-      .addSelect('COALESCE(SUM(e.estimated_cost_usd), 0)', 'cost_usd')
+      .select("COALESCE(e.provider, e.ai_provider, 'otros')", 'provider')
+      .addSelect(
+        "COALESCE(SUM(COALESCE(e.real_cost_usd, e.estimated_cost_usd, CASE WHEN e.cost_type = 'mock_zero' THEN 0 ELSE NULL END)), 0)",
+        'cost_usd',
+      )
       .where('e.created_at BETWEEN :from AND :to', { from, to })
-      .andWhere('e.estimated_cost_usd IS NOT NULL')
-      .groupBy('e.ai_provider')
+      .groupBy("COALESCE(e.provider, e.ai_provider, 'otros')")
       .getRawMany<{ provider: string; cost_usd: string }>();
 
     const costByProvider = costByProviderRaw.map(r => ({
@@ -210,7 +235,7 @@ export class AdminDashboardService {
       .select('DATE(e.created_at)', 'date')
       .addSelect('COUNT(*)', 'count')
       .where('e.created_at BETWEEN :from AND :to', { from, to })
-      .andWhere("e.event_type = 'course_production_completed'")
+      .andWhere("e.event_type IN ('course_production_completed', 'full_course_generation_completed')")
       .groupBy('DATE(e.created_at)')
       .orderBy('DATE(e.created_at)', 'ASC')
       .getRawMany<{ date: string; count: string }>();
@@ -243,28 +268,45 @@ export class AdminDashboardService {
     const courseCostRows = await this.eventRepo
       .createQueryBuilder('e')
       .select('e.course_id', 'courseId')
-      .addSelect("COALESCE(MAX(NULLIF(e.metadata->>'course_name', '')), 'Curso sin nombre')", 'courseName')
+      .addSelect("COALESCE(MAX(NULLIF(e.metadata->>'course_name', '')), MAX(NULLIF(e.metadata->>'courseName', '')), 'Curso sin nombre')", 'courseName')
       .addSelect('MAX(e.created_at)', 'lastUpdatedAt')
       .addSelect('COUNT(*)', 'eventsCount')
+      .addSelect("COALESCE(SUM(CASE WHEN e.cost_type = 'real' THEN COALESCE(e.real_cost_usd, 0) ELSE 0 END), 0)", 'realCostUsd')
+      .addSelect("COALESCE(SUM(CASE WHEN e.cost_type = 'estimated' THEN COALESCE(e.estimated_cost_usd, 0) ELSE 0 END), 0)", 'estimatedCostUsd')
+      .addSelect("COALESCE(SUM(CASE WHEN e.cost_type = 'mock_zero' THEN COALESCE(e.estimated_cost_usd, 0) ELSE 0 END), 0)", 'mockCostUsd')
+      .addSelect("COALESCE(SUM(CASE WHEN e.cost_type = 'unknown' THEN 1 ELSE 0 END), 0)", 'unknownCostEvents')
       .addSelect(
-        "COALESCE(SUM(CASE WHEN e.event_type LIKE 'ia_%' THEN COALESCE(e.estimated_cost_usd, 0) ELSE 0 END), 0)",
+        "COALESCE(SUM(CASE WHEN COALESCE(e.component, '') = 'content' OR e.event_type LIKE 'ia_%' THEN COALESCE(e.real_cost_usd, e.estimated_cost_usd, CASE WHEN e.cost_type = 'mock_zero' THEN 0 ELSE NULL END) ELSE 0 END), 0)",
         'contentCostUsd',
       )
       .addSelect(
-        "COALESCE(SUM(CASE WHEN e.event_type IN ('welcome_audio_generated', 'audiobook_generated') THEN COALESCE(e.estimated_cost_usd, 0) ELSE 0 END), 0)",
+        "COALESCE(SUM(CASE WHEN COALESCE(e.component, '') IN ('audio', 'audiobook') OR e.event_type IN ('welcome_audio_generated', 'audiobook_generated') THEN COALESCE(e.real_cost_usd, e.estimated_cost_usd, CASE WHEN e.cost_type = 'mock_zero' THEN 0 ELSE NULL END) ELSE 0 END), 0)",
         'audioCostUsd',
       )
       .addSelect(
-        "COALESCE(SUM(CASE WHEN e.event_type LIKE 'video_%' OR e.event_type IN ('youtube_upload_completed', 'youtube_upload_failed') THEN COALESCE(e.estimated_cost_usd, 0) ELSE 0 END), 0)",
+        "COALESCE(SUM(CASE WHEN COALESCE(e.component, '') = 'video' OR e.event_type LIKE 'video_%' THEN COALESCE(e.real_cost_usd, e.estimated_cost_usd, CASE WHEN e.cost_type = 'mock_zero' THEN 0 ELSE NULL END) ELSE 0 END), 0)",
         'videoCostUsd',
       )
       .addSelect(
-        "COALESCE(SUM(CASE WHEN e.event_type IN ('export_mbz', 'mbz_exported') THEN COALESCE(e.estimated_cost_usd, 0) ELSE 0 END), 0)",
+        "COALESCE(SUM(CASE WHEN COALESCE(e.component, '') = 'package' OR e.event_type IN ('export_mbz', 'mbz_exported') THEN COALESCE(e.real_cost_usd, e.estimated_cost_usd, CASE WHEN e.cost_type = 'mock_zero' THEN 0 ELSE NULL END) ELSE 0 END), 0)",
         'packageCostUsd',
       )
-      .addSelect('COALESCE(SUM(COALESCE(e.estimated_cost_usd, 0)), 0)', 'estimatedCostUsd')
+      .addSelect(
+        "COALESCE(SUM(CASE WHEN COALESCE(e.component, '') = 'h5p' THEN COALESCE(e.real_cost_usd, e.estimated_cost_usd, CASE WHEN e.cost_type = 'mock_zero' THEN 0 ELSE NULL END) ELSE 0 END), 0)",
+        'h5pCostUsd',
+      )
+      .addSelect(
+        "COALESCE(SUM(CASE WHEN COALESCE(e.component, '') = 'youtube' THEN COALESCE(e.real_cost_usd, e.estimated_cost_usd, CASE WHEN e.cost_type = 'mock_zero' THEN 0 ELSE NULL END) ELSE 0 END), 0)",
+        'youtubeCostUsd',
+      )
+      .addSelect(
+        "COALESCE(SUM(CASE WHEN COALESCE(e.component, '') = 'storage' THEN COALESCE(e.real_cost_usd, e.estimated_cost_usd, CASE WHEN e.cost_type = 'mock_zero' THEN 0 ELSE NULL END) ELSE 0 END), 0)",
+        'storageCostUsd',
+      )
       .addSelect("MAX(CASE WHEN e.failed = true THEN 1 ELSE 0 END)", 'hasFailure')
-      .addSelect("MAX(CASE WHEN e.event_type = 'course_production_completed' THEN 1 ELSE 0 END)", 'hasCompletedProduction')
+      .addSelect("MAX(CASE WHEN e.event_type IN ('course_production_completed', 'full_course_generation_completed') THEN 1 ELSE 0 END)", 'hasCompletedProduction')
+      .addSelect("MAX(CASE WHEN e.event_type = 'full_course_generation_cancelled' THEN 1 ELSE 0 END)", 'hasCancelledProduction')
+      .addSelect("STRING_AGG(DISTINCT COALESCE(e.mode, 'unknown'), ',')", 'modes')
       .where('e.created_at BETWEEN :from AND :to', { from, to })
       .andWhere('e.course_id IS NOT NULL')
       .groupBy('e.course_id')
@@ -278,38 +320,94 @@ export class AdminDashboardService {
         audioCostUsd: string;
         videoCostUsd: string;
         packageCostUsd: string;
+        h5pCostUsd: string;
+        youtubeCostUsd: string;
+        storageCostUsd: string;
+        realCostUsd: string;
         estimatedCostUsd: string;
+        mockCostUsd: string;
+        unknownCostEvents: string;
         hasFailure: string;
         hasCompletedProduction: string;
+        hasCancelledProduction: string;
+        modes: string;
       }>();
 
     const courseCosts = courseCostRows.map((row) => {
       const estimatedCostUsd = parseFloat(row.estimatedCostUsd ?? '0');
+      const realCostUsd = parseFloat(row.realCostUsd ?? '0');
+      const mockCostUsd = parseFloat(row.mockCostUsd ?? '0');
+      const totalKnownCostUsd = estimatedCostUsd + realCostUsd + mockCostUsd;
+      const unknownCostEvents = parseInt(row.unknownCostEvents ?? '0', 10);
       const hasFailure = Number(row.hasFailure ?? '0') > 0;
       const hasCompletedProduction = Number(row.hasCompletedProduction ?? '0') > 0;
+      const hasCancelledProduction = Number(row.hasCancelledProduction ?? '0') > 0;
+      const modes = String(row.modes ?? '')
+        .split(',')
+        .map((value) => value.trim())
+        .filter(Boolean);
       let status = 'En proceso';
       if (hasCompletedProduction) status = 'Listo';
+      else if (hasCancelledProduction) status = 'Cancelado';
       else if (hasFailure) status = 'Con errores';
-      const costSource: 'estimated' | 'real' | null = estimatedCostUsd > 0 ? 'estimated' : null;
+      let costStatus: 'real' | 'estimated' | 'mock' | 'mixed' | 'unknown' = 'unknown';
+      if (unknownCostEvents > 0 && totalKnownCostUsd > 0) costStatus = 'mixed';
+      else if (realCostUsd > 0 && (estimatedCostUsd > 0 || mockCostUsd > 0)) costStatus = 'mixed';
+      else if (realCostUsd > 0) costStatus = 'real';
+      else if (estimatedCostUsd > 0) costStatus = 'estimated';
+      else if (
+        modes.length > 0
+        && modes.every((mode) => mode === 'mock' || mode === 'dry_run')
+        && (mockCostUsd > 0 || modes.some((mode) => mode === 'mock' || mode === 'dry_run'))
+      ) costStatus = 'mock';
+
+      const costSource: 'estimated' | 'real' | 'mixed' | 'mock' | null =
+        costStatus === 'real' ? 'real'
+          : costStatus === 'estimated' ? 'estimated'
+            : costStatus === 'mock' ? 'mock'
+              : costStatus === 'mixed' ? 'mixed'
+                : null;
+
+      let mode: 'real' | 'mock' | 'dry_run' | 'mixed' | 'unknown' = 'unknown';
+      if (modes.length === 1 && ['real', 'mock', 'dry_run', 'unknown'].includes(modes[0])) {
+        mode = modes[0] as typeof mode;
+      } else if (modes.length > 1) {
+        mode = 'mixed';
+      }
+
+      const totalCostUsd = unknownCostEvents > 0 && totalKnownCostUsd === 0
+        ? null
+        : Number(totalKnownCostUsd.toFixed(6));
+      const hasMissingCostEvents = unknownCostEvents > 0;
 
       return {
         courseId: row.courseId,
         courseName: row.courseName || 'Curso sin nombre',
         status,
+        totalCostUsd,
         estimatedCostUsd: Number(estimatedCostUsd.toFixed(6)),
-        realCostUsd: null,
+        realCostUsd: Number(realCostUsd.toFixed(6)),
+        mockCostUsd: Number(mockCostUsd.toFixed(6)),
+        unknownCostUsd: hasMissingCostEvents ? null : 0,
+        costStatus,
         costSource,
         contentCostUsd: Number(parseFloat(row.contentCostUsd ?? '0').toFixed(6)),
         audioCostUsd: Number(parseFloat(row.audioCostUsd ?? '0').toFixed(6)),
         videoCostUsd: Number(parseFloat(row.videoCostUsd ?? '0').toFixed(6)),
         packageCostUsd: Number(parseFloat(row.packageCostUsd ?? '0').toFixed(6)),
+        h5pCostUsd: Number(parseFloat(row.h5pCostUsd ?? '0').toFixed(6)),
+        youtubeCostUsd: Number(parseFloat(row.youtubeCostUsd ?? '0').toFixed(6)),
+        storageCostUsd: Number(parseFloat(row.storageCostUsd ?? '0').toFixed(6)),
+        hasMissingCostEvents,
+        mode,
         lastUpdatedAt: row.lastUpdatedAt || null,
         eventsCount: parseInt(row.eventsCount ?? '0', 10),
       };
     });
 
-    const coursesWithCostCount = courseCosts.filter((course) => course.estimatedCostUsd > 0).length;
+    const coursesWithCostCount = courseCosts.filter((course) => (course.totalCostUsd ?? 0) > 0).length;
     const coursesWithoutCostCount = Math.max(0, courseCosts.length - coursesWithCostCount);
+    const coursesWithUnknownCostCount = courseCosts.filter((course) => course.hasMissingCostEvents).length;
     const averageEstimatedCostUsd = coursesWithCostCount > 0
       ? courseCosts.reduce((sum, course) => sum + course.estimatedCostUsd, 0) / coursesWithCostCount
       : 0;
@@ -350,7 +448,13 @@ export class AdminDashboardService {
       exports: {
         mbz_total: mbzTotal,
       },
-      total_estimated_cost_usd:   Number(totalCostUsd.toFixed(6)),
+      total_estimated_cost_usd:   Number(estimatedTotalCostUsd.toFixed(6)),
+      costs: {
+        estimated_total_usd: Number(estimatedTotalCostUsd.toFixed(6)),
+        real_total_usd: Number(realTotalCostUsd.toFixed(6)),
+        mock_total_usd: Number(mockTotalCostUsd.toFixed(6)),
+        unknown_events: unknownEvents,
+      },
       traditional_equivalent_usd: Number(traditionalEquivalentUsd.toFixed(2)),
       savings_usd:                Number(savingsUsd.toFixed(2)),
       failures: {
@@ -359,10 +463,13 @@ export class AdminDashboardService {
       costByProvider,
       productionTrend,
       courseCostSummary: {
-        totalEstimatedCostUsd: Number(totalCostUsd.toFixed(6)),
+        totalEstimatedCostUsd: Number(estimatedTotalCostUsd.toFixed(6)),
+        totalRealCostUsd: Number(realTotalCostUsd.toFixed(6)),
+        totalMockCostUsd: Number(mockTotalCostUsd.toFixed(6)),
         averageEstimatedCostUsd: Number(averageEstimatedCostUsd.toFixed(6)),
         coursesWithCostCount,
         coursesWithoutCostCount,
+        coursesWithUnknownCostCount,
       },
       courseCosts,
     };

@@ -7,6 +7,7 @@ import { Artifact } from '../modules/artifacts/entities/artifact.entity';
 import { ProductionJobsService } from '../modules/production-jobs/production-jobs.service';
 import { ProductionJob } from '../modules/production-jobs/entities/production-job.entity';
 import { MbzBuilderService, HvpEntry } from '../package/mbz-builder.service';
+import { EventsService } from '../events/events.service';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -92,6 +93,7 @@ async function handlePackageJob(
   jobsService: ProductionJobsService,
   artifactsService: ArtifactsService,
   mbzBuilder: MbzBuilderService,
+  eventsService: EventsService,
   workerId: string,
   leaseSeconds: number,
   heartbeatMs: number,
@@ -101,6 +103,7 @@ async function handlePackageJob(
   const payload  = (job.inputPayload ?? {}) as Record<string, any>;
   const rawCourseId = job.frontendCourseId || String(job.courseId ?? 'unknown');
   const options  = (payload.options ?? {}) as Record<string, any>;
+  const parentJobId = payload?.metadata?.parentJobId ?? null;
 
   let leaseLost = false;
   let finalized = false;
@@ -120,9 +123,37 @@ async function handlePackageJob(
     await jobsService.updatePackageWorkerProgress(jobId, workerId, phase, message).catch(() => {});
   };
 
+  const trackEvent = async (eventType: string, extra: Record<string, any> = {}) =>
+    eventsService.trackBackendEvent({
+      userId: job.ownerId,
+      eventType,
+      courseId: rawCourseId,
+      jobId,
+      parentJobId,
+      component: 'package',
+      provider: 'internal',
+      model: 'mbz_builder_v1',
+      mode: 'real',
+      costType: extra.costType ?? 'unknown',
+      estimatedCostUsd: extra.estimatedCostUsd,
+      costSource: extra.costSource ?? 'not_tracked',
+      units: extra.units,
+      unitType: extra.unitType,
+      failed: extra.failed ?? false,
+      errorMessage: extra.errorMessage ?? null,
+      metadata: {
+        workerId,
+        ...extra.metadata,
+      },
+    });
+
   try {
     const marked = await jobsService.markPackageWorkerRunning(jobId, workerId);
     if (!marked) { logger.warn(`[PackageWorker] Job ${jobId} no longer owned by ${workerId}`); return; }
+    await trackEvent('package_generation_started', {
+      units: 1,
+      unitType: 'per_operation',
+    });
 
     await sendHeartbeat();
     if (leaseLost) return;
@@ -282,12 +313,32 @@ async function handlePackageJob(
     });
 
     if (!completed) logger.warn(`[PackageWorker] Job ${jobId} could not be completed — ownership changed`);
-    else logger.log(`[PackageWorker] Job ${jobId} completed. artifact=${artifact.id}`);
+    else {
+      await trackEvent('package_generation_completed', {
+        units: buildResult.sizeBytes,
+        unitType: 'bytes',
+        metadata: {
+          artifactId: artifact.id,
+          sizeBytes: buildResult.sizeBytes,
+          activityCount: buildResult.activityCount,
+          hasH5P: Object.keys(hvpData ?? {}).length > 0,
+          hasWelcomeAudio: !!audioWelcome,
+          hasAudiobook: !!audiobook,
+        },
+      });
+      logger.log(`[PackageWorker] Job ${jobId} completed. artifact=${artifact.id}`);
+    }
 
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (leaseLost) { logger.warn(`[PackageWorker] Job ${jobId} ended after lease loss: ${message}`); return; }
     await jobsService.failPackageWorkerJob(jobId, workerId, message, true);
+    await trackEvent('package_generation_failed', {
+      failed: true,
+      errorMessage: message,
+      units: 1,
+      unitType: 'per_operation',
+    });
     logger.error(`[PackageWorker] Job ${jobId} failed: ${message}`);
   } finally {
     finalized = true;
@@ -306,6 +357,7 @@ async function bootstrap() {
   const jobsService      = app.get(ProductionJobsService);
   const artifactsService = app.get(ArtifactsService);
   const mbzBuilder       = app.get(MbzBuilderService);
+  const eventsService    = app.get(EventsService);
 
   const workerId     = process.env.PACKAGE_WORKER_ID     || `package-worker-${process.pid}`;
   const pollMs       = readPositiveInt('PACKAGE_WORKER_POLL_MS',       10000);
@@ -351,12 +403,29 @@ async function bootstrap() {
       await jobsService.completePackageWorkerJob(claimed.id, workerId, {
         mbzFinal: { status:'completed', humanMessage:'Paquete Moodle listo (dry-run).' },
       });
+      await eventsService.trackBackendEvent({
+        userId: claimed.ownerId,
+        eventType: 'package_generation_completed',
+        courseId: claimed.frontendCourseId || String(claimed.courseId ?? 'unknown'),
+        jobId: claimed.id,
+        parentJobId: claimed.inputPayload?.metadata?.parentJobId ?? null,
+        component: 'package',
+        provider: 'internal',
+        model: 'mbz_builder_v1',
+        mode: 'dry_run',
+        costType: 'mock_zero',
+        estimatedCostUsd: 0,
+        costSource: 'mock_zero',
+        units: 1,
+        unitType: 'per_operation',
+        metadata: { workerId, dryRun: true },
+      });
       logger.log(`[PackageWorker] Dry-run completed for job ${claimed.id}`);
       continue;
     }
 
     const promise = handlePackageJob(
-      claimed, jobsService, artifactsService, mbzBuilder,
+      claimed, jobsService, artifactsService, mbzBuilder, eventsService,
       workerId, leaseSeconds, heartbeatMs, logger,
     )
       .catch(error => {

@@ -60,6 +60,10 @@ export class CostRate {
   @Column({ type: 'text', nullable: true })
   notes: string;
 
+  /** Fuente de esta tarifa: precio configurado, listado público del proveedor, etc. */
+  @Column({ length: 40, nullable: true, default: 'configured_rate' })
+  source: string;
+
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
 

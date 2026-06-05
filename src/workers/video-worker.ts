@@ -25,6 +25,7 @@ import {
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import { YoutubeService } from '../youtube/youtube.service';
 import { YoutubeUploadService, YoutubeQuotaException } from '../youtube/youtube-upload.service';
+import { EventsService } from '../events/events.service';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -444,6 +445,7 @@ async function bootstrap() {
   const artifactsService    = app.get(ArtifactsService);
   const youtubeService      = app.get(YoutubeService);
   const youtubeUploadService = app.get(YoutubeUploadService);
+  const eventsService       = app.get(EventsService);
 
   const workerId           = process.env.VIDEO_WORKER_ID || `video-worker-${process.pid}`;
   const pollMs             = readPositiveInt('VIDEO_WORKER_POLL_MS', 3000);
@@ -560,15 +562,47 @@ async function bootstrap() {
   ): Promise<void> {
     const jobId = job.id;
     const currentSummary = (job.outputSummary ?? {}) as Record<string, any>;
+    const courseId = job.frontendCourseId ?? (job.courseId != null ? String(job.courseId) : 'unknown-course');
+    const parentJobId = job.inputPayload?.metadata?.parentJobId ?? null;
     // Prefer inline (fresh from Videogen phase), fall back to persisted outputSummary (re-claim path)
     const videogenJobs: VideogenJobEntry[] =
       (inlineVideogenJobs && inlineVideogenJobs.length > 0)
         ? inlineVideogenJobs
         : (Array.isArray(currentSummary.videogenJobs) ? currentSummary.videogenJobs : []);
 
+    const trackYoutubeEvent = async (eventType: string, extra: Record<string, any> = {}) =>
+      eventsService.trackBackendEvent({
+        userId: job.ownerId,
+        eventType,
+        courseId,
+        jobId,
+        parentJobId,
+        component: 'youtube',
+        provider: 'youtube',
+        model: 'upload',
+        mode: youtubeMock ? 'mock' : 'real',
+        costType: extra.costType ?? 'unknown',
+        estimatedCostUsd: extra.estimatedCostUsd,
+        costSource: extra.costSource ?? 'not_tracked',
+        units: extra.units,
+        unitType: extra.unitType,
+        failed: extra.failed ?? false,
+        errorMessage: extra.errorMessage ?? null,
+        metadata: {
+          workerId,
+          youtubeEnabled,
+          youtubeMock,
+          ...extra.metadata,
+        },
+      });
+
     if (leaseLostRef.value) return;
 
     await jobsService.markVideoWorkerYoutubeUploading(jobId, workerId);
+    await trackYoutubeEvent('youtube_upload_started', {
+      units: videogenJobs.filter(j => j.downloadUrl).length,
+      unitType: 'per_operation',
+    });
     logger.log(`${youtubeMock ? '[MOCK] ' : ''}Starting YouTube upload for job ${jobId}: ${videogenJobs.filter(j => j.downloadUrl).length} videos`);
 
     // ── Shared result handler (used by both real and mock paths) ──────────────
@@ -594,6 +628,13 @@ async function bootstrap() {
         const snapshotSummary = { ...currentSummary, ...blocked };
         const artifactId = await uploadVideoStateSnapshot(job, snapshotSummary, 'blocked_auth');
         if (artifactId) await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
+        await trackYoutubeEvent('youtube_upload_failed', {
+          failed: true,
+          errorMessage: blocked.detail,
+          units: uploads.length,
+          unitType: 'per_operation',
+          metadata: { reason: 'auth_required', uploadedCount },
+        });
         return;
       }
 
@@ -610,6 +651,13 @@ async function bootstrap() {
         const snapshotSummary = { ...currentSummary, ...blocked };
         const artifactId = await uploadVideoStateSnapshot(job, snapshotSummary, 'blocked_quota');
         if (artifactId) await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
+        await trackYoutubeEvent('youtube_upload_failed', {
+          failed: true,
+          errorMessage: blocked.detail,
+          units: uploads.length,
+          unitType: 'per_operation',
+          metadata: { reason: 'quota_exceeded', uploadedCount },
+        });
         return;
       }
 
@@ -625,6 +673,13 @@ async function bootstrap() {
         };
         const artifactId = await uploadVideoStateSnapshot(job, snapshotSummary, 'all_failed');
         if (artifactId) await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
+        await trackYoutubeEvent('youtube_upload_failed', {
+          failed: true,
+          errorMessage: errorMsg,
+          units: uploads.length,
+          unitType: 'per_operation',
+          metadata: { uploadedCount: 0, failedUploadCount },
+        });
         return;
       }
 
@@ -640,6 +695,11 @@ async function bootstrap() {
       const snapshotSummary = { ...currentSummary, ...completedSummary };
       const artifactId = await uploadVideoStateSnapshot(job, snapshotSummary, 'youtube_completed');
       if (artifactId) await jobsService.saveVideoSnapshotArtifactId(jobId, artifactId);
+      await trackYoutubeEvent('youtube_upload_completed', {
+        units: uploadedCount,
+        unitType: 'per_operation',
+        metadata: { failedUploadCount, artifactId },
+      });
     }
 
     // ── REAL YouTube upload ───────────────────────────────────────────────────
@@ -836,8 +896,34 @@ async function bootstrap() {
     heartbeatFn?: () => Promise<void>,
   ): Promise<void> {
     const jobId        = job.id;
+    const courseId = job.frontendCourseId ?? (job.courseId != null ? String(job.courseId) : 'unknown-course');
+    const parentJobId = job.inputPayload?.metadata?.parentJobId ?? null;
     const maxPollMs    = maxPollMinutes * 60 * 1000;
     const pollStartAt  = Date.now();
+    const trackVideoEvent = async (eventType: string, extra: Record<string, any> = {}) =>
+      eventsService.trackBackendEvent({
+        userId: job.ownerId,
+        eventType,
+        courseId,
+        jobId,
+        parentJobId,
+        component: 'video',
+        provider: 'video_engine',
+        model: process.env.VIDEOGEN_MODEL || 'videogen_default',
+        mode: mockVideogen ? 'mock' : 'real',
+        costType: extra.costType ?? (mockVideogen ? 'mock_zero' : 'estimated'),
+        estimatedCostUsd: extra.estimatedCostUsd,
+        costSource: extra.costSource ?? (mockVideogen ? 'mock_zero' : 'configured_rate'),
+        units: extra.units,
+        unitType: extra.unitType,
+        failed: extra.failed ?? false,
+        errorMessage: extra.errorMessage ?? null,
+        metadata: {
+          workerId,
+          batchId,
+          ...extra.metadata,
+        },
+      });
 
     logger.log(`Starting ${mockVideogen ? 'MOCK ' : ''}Videogen polling for job ${jobId}, batch ${batchId}`);
 
@@ -885,6 +971,15 @@ async function bootstrap() {
             if (!markedDone) {
               logger.warn(`Job ${jobId} could not be marked videogen_done — ownership changed`);
             } else {
+              await trackVideoEvent('video_generation_completed', {
+                units: completed.length,
+                unitType: 'per_video',
+                estimatedCostUsd: mockVideogen ? 0 : undefined,
+                metadata: {
+                  completedCount: completed.length,
+                  failedCount: 0,
+                },
+              });
               if (heartbeatFn) await heartbeatFn();
               if (leaseLostRef.value) return;
               logger.log(`Job ${jobId} Videogen done. Continuing to YouTube phase...`);
@@ -896,6 +991,15 @@ async function bootstrap() {
             if (!ok) {
               logger.warn(`Job ${jobId} could not be marked complete — ownership changed`);
             } else {
+              await trackVideoEvent('video_generation_completed', {
+                units: completed.length,
+                unitType: 'per_video',
+                estimatedCostUsd: mockVideogen ? 0 : undefined,
+                metadata: {
+                  completedCount: completed.length,
+                  failedCount: 0,
+                },
+              });
               if (heartbeatFn) await heartbeatFn();
               if (leaseLostRef.value) return;
               logger.log(`Job ${jobId} completed: all ${total} videos ready${mockVideogen ? ' [MOCK]' : ''}`);
@@ -918,6 +1022,18 @@ async function bootstrap() {
 
           await jobsService.failVideoWorkerJob(jobId, workerId, errorMsg);
           logger.error(`Job ${jobId} ${isTotal ? 'total' : 'partial'} failure: ${errorMsg}`);
+          await trackVideoEvent('video_generation_failed', {
+            failed: true,
+            errorMessage: errorMsg,
+            units: completed.length,
+            unitType: 'per_video',
+            estimatedCostUsd: mockVideogen ? 0 : undefined,
+            metadata: {
+              completedCount: completed.length,
+              failedCount: failed.length,
+              reason,
+            },
+          });
 
           // Upload snapshot even on failure
           const failSummary = {
@@ -963,10 +1079,35 @@ async function bootstrap() {
 
   async function handleJob(job: ProductionJob): Promise<void> {
     const jobId         = job.id;
+    const courseId = job.frontendCourseId ?? (job.courseId != null ? String(job.courseId) : 'unknown-course');
+    const parentJobId = job.inputPayload?.metadata?.parentJobId ?? null;
     let leaseLost       = false;
     let heartbeatCount  = 0;
     let finalized       = false;
     const leaseLostRef  = { value: false };
+    const trackVideoLifecycleEvent = async (eventType: string, extra: Record<string, any> = {}) =>
+      eventsService.trackBackendEvent({
+        userId: job.ownerId,
+        eventType,
+        courseId,
+        jobId,
+        parentJobId,
+        component: 'video',
+        provider: 'video_engine',
+        model: process.env.VIDEOGEN_MODEL || 'videogen_default',
+        mode: dryRun ? 'dry_run' : (mockVideogen ? 'mock' : 'real'),
+        costType: extra.costType ?? (dryRun || mockVideogen ? 'mock_zero' : 'estimated'),
+        estimatedCostUsd: extra.estimatedCostUsd,
+        costSource: extra.costSource ?? (dryRun || mockVideogen ? 'mock_zero' : 'configured_rate'),
+        units: extra.units,
+        unitType: extra.unitType,
+        failed: extra.failed ?? false,
+        errorMessage: extra.errorMessage ?? null,
+        metadata: {
+          workerId,
+          ...extra.metadata,
+        },
+      });
 
     const sendHeartbeat = async () => {
       if (finalized || leaseLost) return;
@@ -995,6 +1136,10 @@ async function bootstrap() {
       }
 
       logger.log(`Job ${jobId} marked as running`);
+      await trackVideoLifecycleEvent('video_generation_started', {
+        units: 1,
+        unitType: 'per_operation',
+      });
       await sendHeartbeat();
       if (leaseLost) return;
 
@@ -1015,7 +1160,17 @@ async function bootstrap() {
         finalized = true;
         const ok = await jobsService.completeVideoWorkerDryRun(jobId, workerId, summary);
         if (!ok) logger.warn(`Job ${jobId} could not be completed — worker ownership changed`);
-        else logger.log(`Dry-run completed for job ${jobId}`);
+        else {
+          await trackVideoLifecycleEvent('video_generation_completed', {
+            mode: 'dry_run',
+            costType: 'mock_zero',
+            estimatedCostUsd: 0,
+            units: 1,
+            unitType: 'per_operation',
+            durationMs: waitMs,
+          });
+          logger.log(`Dry-run completed for job ${jobId}`);
+        }
         return;
       }
 
@@ -1112,6 +1267,12 @@ async function bootstrap() {
       const message = error instanceof Error ? error.message : String(error);
       if (leaseLost) { logger.warn(`Job ${jobId} ended after lease loss: ${message}`); return; }
       await jobsService.failVideoWorkerJob(jobId, workerId, message);
+      await trackVideoLifecycleEvent('video_generation_failed', {
+        failed: true,
+        errorMessage: message,
+        costType: dryRun || mockVideogen ? 'mock_zero' : 'unknown',
+        estimatedCostUsd: dryRun || mockVideogen ? 0 : undefined,
+      });
       logger.error(`Job ${jobId} failed: ${message}`);
 
       // Upload snapshot for timeout / unexpected errors

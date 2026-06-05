@@ -15,6 +15,7 @@ import {
   ProductionJobsService,
 } from '../modules/production-jobs/production-jobs.service';
 import { ProductionJob } from '../modules/production-jobs/entities/production-job.entity';
+import { EventsService } from '../events/events.service';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -154,6 +155,7 @@ async function bootstrap() {
   const jobsService = app.get(ProductionJobsService);
   const contentGenerationService = app.get(ContentGenerationService);
   const artifactsService = app.get(ArtifactsService);
+  const eventsService = app.get(EventsService);
   const workerId =
     process.env.CONTENT_WORKER_ID ||
     `content-worker-${process.pid}`;
@@ -190,6 +192,38 @@ async function bootstrap() {
     let leaseLost = false;
     let heartbeatCount = 0;
     let finalized = false;
+    const courseId = buildEffectiveCourseId(job);
+    const parentJobId = job.inputPayload?.metadata?.parentJobId ?? null;
+    const trackEvent = async (
+      eventType: string,
+      extra: Record<string, any> = {},
+    ) => eventsService.trackBackendEvent({
+      userId: job.ownerId,
+      userEmail: null,
+      eventType,
+      courseId,
+      jobId,
+      parentJobId,
+      component: 'content',
+      provider: extra.provider ?? 'internal',
+      model: extra.model ?? 'template_v1',
+      mode: extra.mode ?? (dryRun ? 'dry_run' : 'real'),
+      costType: extra.costType ?? (dryRun ? 'mock_zero' : 'unknown'),
+      costSource: extra.costSource ?? (dryRun ? 'mock_zero' : 'not_tracked'),
+      estimatedCostUsd: extra.estimatedCostUsd,
+      realCostUsd: extra.realCostUsd,
+      units: extra.units,
+      unitType: extra.unitType,
+      unitPriceUsd: extra.unitPriceUsd,
+      durationMs: extra.durationMs,
+      failed: extra.failed ?? false,
+      errorMessage: extra.errorMessage ?? null,
+      metadata: {
+        executionMode: job.executionMode,
+        workerId,
+        ...extra.metadata,
+      },
+    });
 
     const sendHeartbeat = async () => {
       if (finalized || leaseLost) return;
@@ -222,6 +256,12 @@ async function bootstrap() {
       }
 
       logger.log(`Job ${jobId} marked as running`);
+      await trackEvent('content_generation_started', {
+        metadata: {
+          dryRun,
+          realContentEnabled,
+        },
+      });
       await sendHeartbeat();
       if (leaseLost) return;
 
@@ -250,6 +290,18 @@ async function bootstrap() {
           return;
         }
 
+        await trackEvent('content_generation_completed', {
+          mode: 'dry_run',
+          costType: 'mock_zero',
+          units: 1,
+          unitType: 'per_operation',
+          estimatedCostUsd: 0,
+          durationMs: waitMs,
+          metadata: {
+            dryRun: true,
+            phase: 'dry_run',
+          },
+        });
         logger.log(`Dry-run completed for job ${jobId}`);
         return;
       }
@@ -384,6 +436,19 @@ async function bootstrap() {
         return;
       }
 
+      await trackEvent('content_generation_completed', {
+        mode: generated.summary?.mode === 'template' ? 'real' : 'unknown',
+        costType: 'unknown',
+        units: finalSummary.fileCount ?? Object.keys(generated.F || {}).length,
+        unitType: 'per_operation',
+        durationMs: generated.summary?.durationMs ?? null,
+        metadata: {
+          artifactId: artifact.id,
+          fileCount: finalSummary.fileCount ?? 0,
+          generationMode: generated.summary?.mode ?? 'template',
+          progressMap: generated.summary?.progressMap ?? aggregatedProgressMap,
+        },
+      });
       logger.log(`Real content generation completed for job ${jobId} with artifact ${artifact.id}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -394,6 +459,15 @@ async function bootstrap() {
 
       const retryable = !dryRun && realContentEnabled;
       await jobsService.failContentWorkerJob(jobId, workerId, message, retryable);
+      await trackEvent('content_generation_failed', {
+        failed: true,
+        errorMessage: message,
+        mode: dryRun ? 'dry_run' : 'real',
+        costType: dryRun ? 'mock_zero' : 'unknown',
+        metadata: {
+          retryable,
+        },
+      });
       logger.error(`Job ${jobId} failed${retryable ? ' (retryable)' : ''}: ${message}`);
     } finally {
       finalized = true;
