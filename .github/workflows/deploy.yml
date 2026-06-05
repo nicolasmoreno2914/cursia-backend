@@ -115,16 +115,19 @@ jobs:
                echo "━━━ [1/5] Instalar todas las dependencias (devDeps para tsc) ━━━"
                npm install
 
-               echo "━━━ [2/5] Alinear restricciones de production_jobs ━━━"
+               echo "━━━ [2/6] Alinear restricciones de production_jobs ━━━"
                node scripts/migrate-production-jobs-constraints.js
 
-               echo "━━━ [3/5] Compilar TypeScript en el VPS ━━━"
+               echo "━━━ [3/6] Migrar usage_events y cost_rates para tracking de costos ━━━"
+               node scripts/migrate-usage-events-costs.js
+
+               echo "━━━ [4/6] Compilar TypeScript en el VPS ━━━"
                npm run build
 
-               echo "━━━ [4/5] Limpiar devDeps — dejar solo producción ━━━"
+               echo "━━━ [5/6] Limpiar devDeps — dejar solo producción ━━━"
                npm install --omit=dev
 
-               echo "━━━ [5/5] Recargar PM2 (zero-downtime) ━━━"
+               echo "━━━ [6/6] Recargar PM2 (zero-downtime) ━━━"
                pm2 reload cursia-backend --update-env || pm2 restart cursia-backend --update-env
                ensure_pm2_process cursia-content-worker start:content-worker
                ensure_pm2_process cursia-video-worker start:video-worker
