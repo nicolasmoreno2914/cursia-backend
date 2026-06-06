@@ -909,6 +909,7 @@ async function bootstrap() {
         parentJobId,
         component: 'video',
         provider: 'video_engine',
+        service: 'video_generation',                   // requerido por resolveCostEstimate
         model: process.env.VIDEOGEN_MODEL || 'videogen_default',
         mode: mockVideogen ? 'mock' : 'real',
         costType: extra.costType ?? (mockVideogen ? 'mock_zero' : 'estimated'),
@@ -1094,6 +1095,7 @@ async function bootstrap() {
         parentJobId,
         component: 'video',
         provider: 'video_engine',
+        service: 'video_generation',                   // requerido por resolveCostEstimate
         model: process.env.VIDEOGEN_MODEL || 'videogen_default',
         mode: dryRun ? 'dry_run' : (mockVideogen ? 'mock' : 'real'),
         costType: extra.costType ?? (dryRun || mockVideogen ? 'mock_zero' : 'estimated'),

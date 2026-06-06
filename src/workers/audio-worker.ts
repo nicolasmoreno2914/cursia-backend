@@ -348,6 +348,7 @@ async function handleAudioJob(
       parentJobId,
       component: extra.component ?? 'audio',
       provider: extra.provider ?? 'openai_tts',
+      service: extra.service ?? 'audio_generation',   // requerido por resolveCostEstimate
       model: extra.model ?? model,
       mode: extra.mode ?? 'real',
       costType: extra.costType ?? 'unknown',
