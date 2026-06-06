@@ -579,15 +579,25 @@ export async function generateCourseContent(
   );
 
   for (const cap of normalized.caps) {
+    // Generate a placeholder with the "Video en preparación" div structure so that
+    // 16-mbz-patch.js PASO 1 can find it and replace it with the real H5P embed.
+    const videoPlaceholder =
+      `<div class="cc-responsive" style="width:100%;max-width:100%;overflow-x:auto;box-sizing:border-box;">` +
+      `<div style="background:#0A1628;border-radius:20px;padding:32px;color:#E2E6F3;font-family:'Segoe UI',Arial,sans-serif;box-sizing:border-box;width:100%;max-width:100%;">` +
+      `<div style="margin-bottom:16px;"><span style="font-size:11px;font-weight:700;color:#93C5FD;text-transform:uppercase;letter-spacing:1.5px;">Capítulo ${cap.n}</span></div>` +
+      `<h2 style="font-size:24px;font-weight:800;color:#FFFFFF;margin:0 0 20px;">${escapeHtml(cap.t)}</h2>` +
+      `<div style="position:relative;padding-bottom:56.25%;height:0;overflow:hidden;border-radius:12px;margin-bottom:20px;">` +
+        `<div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(255,255,255,0.03);border:2px dashed rgba(255,255,255,0.12);border-radius:12px;gap:12px;">` +
+          `<div style="width:64px;height:64px;border-radius:50%;background:rgba(255,255,255,0.07);display:flex;align-items:center;justify-content:center;font-size:26px;">▶</div>` +
+          `<p style="font-size:15px;font-weight:700;color:#E2E6F3;margin:0;">Video en preparación</p>` +
+          `<p style="font-size:12px;color:rgba(226,230,243,0.45);margin:0;text-align:center;max-width:260px;">El video interactivo de este capítulo estará disponible próximamente</p>` +
+        `</div>` +
+      `</div>` +
+      `</div></div>`;
     await addFile(
       'paginas',
       `cap${cap.n}_video_interactivo.html`,
-      createSimplePage(
-        `Video interactivo del capitulo ${cap.n}`,
-        `<p>Placeholder backend para el recurso multimedia del capitulo <strong>${cap.n}: ${escapeHtml(cap.t)}</strong>.</p>
-         <p>Estado actual: contenido base generado, multimedia pendiente de futuras fases.</p>`,
-        `Capitulo ${cap.n}`,
-      ),
+      videoPlaceholder,
       `Pagina: video placeholder capitulo ${cap.n}`,
     );
   }
