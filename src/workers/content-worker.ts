@@ -436,17 +436,26 @@ async function bootstrap() {
         return;
       }
 
+      const genMode    = generated.summary?.mode ?? 'template';
+      const tokInput   = (generated.summary as any)?.tokensInput  ?? 0;
+      const tokOutput  = (generated.summary as any)?.tokensOutput ?? 0;
+      const hasClaude  = genMode === 'claude' && (tokInput > 0 || tokOutput > 0);
+
       await trackEvent('content_generation_completed', {
-        mode: generated.summary?.mode === 'template' ? 'real' : 'unknown',
-        costType: 'unknown',
-        units: finalSummary.fileCount ?? Object.keys(generated.F || {}).length,
-        unitType: 'per_operation',
-        durationMs: generated.summary?.durationMs ?? null,
+        mode:          hasClaude ? 'real' : 'template',
+        provider:      hasClaude ? 'anthropic' : 'internal',
+        model:         hasClaude ? (process.env.CONTENT_MODEL ?? 'claude-sonnet-4-5') : 'template_v1',
+        component:     'content',
+        costType:      hasClaude ? 'estimated' : 'mock_zero',
+        costSource:    hasClaude ? 'configured_rate' : 'mock_zero',
+        tokensInput:   hasClaude ? tokInput  : undefined,
+        tokensOutput:  hasClaude ? tokOutput : undefined,
+        durationMs:    generated.summary?.durationMs ?? null,
         metadata: {
-          artifactId: artifact.id,
-          fileCount: finalSummary.fileCount ?? 0,
-          generationMode: generated.summary?.mode ?? 'template',
-          progressMap: generated.summary?.progressMap ?? aggregatedProgressMap,
+          artifactId:     artifact.id,
+          fileCount:      finalSummary.fileCount ?? 0,
+          generationMode: genMode,
+          progressMap:    generated.summary?.progressMap ?? aggregatedProgressMap,
         },
       });
       logger.log(`Real content generation completed for job ${jobId} with artifact ${artifact.id}`);
