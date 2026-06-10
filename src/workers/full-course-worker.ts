@@ -324,14 +324,31 @@ async function handleFullCourseJob(
 
     const existingMbz = await findLatestArtifact(artifactsService, ownerId, courseId, 'mbz_final');
     if (existingMbz) {
-      logger.log(`[FullCourseWorker] mbz_final already exists (${existingMbz.id}) — completing job`);
-      finalized = true;
-      await jobsService.completeFullCourseJob(jobId, workerId, {
-        mbzFinalArtifactId: existingMbz.id,
-        restoredFromCache: true,
-        userMessage: 'Curso listo.',
-      });
-      return;
+      // Fase 3: skip artifacts that previously failed deep validation so a fresh
+      // package job can re-run instead of restoring a broken MBZ from cache.
+      const prevValidationStatus =
+        (existingMbz.metadata as Record<string, any> | null)?.validationStatus as string | undefined;
+
+      if (prevValidationStatus === 'failed') {
+        logger.log(
+          `[FullCourseWorker] Existing mbz_final (${existingMbz.id}) has validationStatus=failed — ` +
+          `skipping restore-first cache, proceeding with full re-generation`,
+        );
+        // Fall through to re-run the full pipeline
+      } else {
+        logger.log(
+          `[FullCourseWorker] mbz_final already exists (${existingMbz.id}, ` +
+          `validationStatus=${prevValidationStatus ?? 'legacy'}) — completing job`,
+        );
+        finalized = true;
+        await jobsService.completeFullCourseJob(jobId, workerId, {
+          mbzFinalArtifactId:  existingMbz.id,
+          restoredFromCache:   true,
+          validationStatus:    prevValidationStatus ?? 'legacy',
+          userMessage:         'Curso listo.',
+        });
+        return;
+      }
     }
     if (leaseLost) return;
 
@@ -624,6 +641,13 @@ async function handleFullCourseJob(
     }
 
     // ── Complete ──────────────────────────────────────────────────────────────
+    // Propagate validationStatus from package job so the frontend can gate 'ready' state
+    const mbzFinalArt = await findLatestArtifact(artifactsService, ownerId, courseId, 'mbz_final');
+    const mbzValidationStatus =
+      (mbzFinalArt?.metadata as Record<string, any> | null)?.validationStatus as string | undefined
+      ?? ((packageResult.outputSummary.mbzFinal as Record<string, any> | undefined)?.validationStatus as string | undefined)
+      ?? 'legacy';
+
     finalized = true;
     await jobsService.completeFullCourseJob(jobId, workerId, {
       mbzFinalArtifactId,
@@ -631,7 +655,10 @@ async function handleFullCourseJob(
       audioWelcomeArtifactId,
       audiobookArtifactId,
       h5pSnapshotArtifactId,
-      userMessage: 'Curso listo.',
+      validationStatus: mbzValidationStatus,
+      userMessage: mbzValidationStatus === 'warning'
+        ? 'Curso listo (con advertencias menores).'
+        : 'Curso listo.',
     });
     await trackEvent('full_course_generation_completed', {
       units: 1,

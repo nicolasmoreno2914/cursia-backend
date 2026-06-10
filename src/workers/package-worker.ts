@@ -6,8 +6,9 @@ import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import { Artifact } from '../modules/artifacts/entities/artifact.entity';
 import { ProductionJobsService } from '../modules/production-jobs/production-jobs.service';
 import { ProductionJob } from '../modules/production-jobs/entities/production-job.entity';
-import { MbzBuilderService, HvpEntry } from '../package/mbz-builder.service';
+import { MbzBuilderService, HvpEntry, MbzBuildResult } from '../package/mbz-builder.service';
 import { EventsService } from '../events/events.service';
+import * as JSZip from 'jszip';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -82,6 +83,148 @@ async function findExistingMbzFinalArtifact(
     if (candidate.sizeBytes !== null && candidate.sizeBytes <= 0) return null;
     return candidate;
   } catch { return null; }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MBZ deep validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Thresholds for a standard Cursia course (3 modules, 9 chapters). */
+const MBZ_THRESHOLDS = {
+  /** Minimum size in bytes for a plausible MBZ. */
+  minSizeBytes: 50_000,
+  /** Hard-fail if fewer than this many SCORM activities (out of 9 expected). */
+  minScorm: 5,
+  /** Hard-fail if fewer than this many quiz activities (out of 4 expected). */
+  minQuiz: 2,
+  /** Hard-fail if fewer than this many total activities. */
+  minActivities: 15,
+  /** Hard-fail if fewer than this many sections. */
+  minSections: 4,
+  /** Warning if SCORM count is below this (complete set). */
+  warnScorm: 9,
+  /** Warning if quiz count is below this. */
+  warnQuiz: 4,
+};
+
+interface MbzActivityCounts {
+  sections:        number;
+  h5p:             number;
+  scorm:           number;
+  quiz:            number;
+  label:           number;
+  page:            number;
+  forum:           number;
+  totalActivities: number;
+  totalFiles:      number;
+}
+
+interface MbzValidationResult {
+  status:   'passed' | 'warning' | 'failed';
+  errors:   string[];
+  warnings: string[];
+  counts:   MbzActivityCounts;
+}
+
+async function validateFinalMoodlePackage(
+  buffer: Buffer,
+  buildResult: MbzBuildResult,
+  logger: Logger,
+): Promise<MbzValidationResult> {
+  const errors:   string[] = [];
+  const warnings: string[] = [];
+  const counts: MbzActivityCounts = {
+    sections: 0, h5p: 0, scorm: 0, quiz: 0, label: 0, page: 0, forum: 0,
+    totalActivities: 0, totalFiles: 0,
+  };
+
+  // 1. Basic structural checks
+  if (!buildResult.hasMoodleBackupXml) {
+    errors.push('moodle_backup.xml no encontrado en el paquete');
+  }
+  if (buildResult.sizeBytes < MBZ_THRESHOLDS.minSizeBytes) {
+    errors.push(`Paquete demasiado pequeño: ${Math.round(buildResult.sizeBytes / 1024)} KB (mínimo ${Math.round(MBZ_THRESHOLDS.minSizeBytes / 1024)} KB)`);
+  }
+
+  // 2. Parse ZIP to count activities and validate inner structure
+  try {
+    const zip = await JSZip.loadAsync(buffer);
+
+    counts.totalFiles = Object.keys(zip.files).filter(k => !zip.files[k].dir).length;
+
+    // Verify files.xml exists
+    if (!zip.files['files.xml']) {
+      warnings.push('files.xml no encontrado en el paquete');
+    }
+
+    // Parse moodle_backup.xml for structural counts
+    const backupFile = zip.files['moodle_backup.xml'];
+    if (backupFile) {
+      const xmlText = await backupFile.async('text');
+
+      // Count sections via <section id="…"> entries
+      counts.sections = (xmlText.match(/<section id="/g) || []).length;
+
+      // Count each activity type via <modulename>…</modulename> occurrences
+      const modMatches = xmlText.match(/<modulename>([^<]+)<\/modulename>/g) || [];
+      for (const m of modMatches) {
+        const name = m.replace(/<\/?modulename>/g, '').toLowerCase().trim();
+        counts.totalActivities++;
+        if      (name === 'hvp')   counts.h5p++;
+        else if (name === 'scorm') counts.scorm++;
+        else if (name === 'quiz')  counts.quiz++;
+        else if (name === 'label') counts.label++;
+        else if (name === 'page')  counts.page++;
+        else if (name === 'forum') counts.forum++;
+      }
+    } else {
+      // backupFile missing — already recorded above
+      errors.push('moodle_backup.xml ausente en el ZIP al inspeccionar estructura interna');
+    }
+
+  } catch (e) {
+    errors.push(`No se pudo abrir el ZIP como paquete Moodle válido: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  // 3. Structural quality thresholds
+  if (counts.sections < MBZ_THRESHOLDS.minSections) {
+    errors.push(`Secciones insuficientes: ${counts.sections} encontradas (mínimo ${MBZ_THRESHOLDS.minSections})`);
+  }
+
+  if (counts.scorm < MBZ_THRESHOLDS.minScorm) {
+    errors.push(`SCORMs insuficientes: ${counts.scorm} encontrados (mínimo ${MBZ_THRESHOLDS.minScorm}, esperados 9)`);
+  } else if (counts.scorm < MBZ_THRESHOLDS.warnScorm) {
+    warnings.push(`SCORMs incompletos: ${counts.scorm}/9 encontrados`);
+  }
+
+  if (counts.quiz < MBZ_THRESHOLDS.minQuiz) {
+    errors.push(`Quizzes insuficientes: ${counts.quiz} encontrados (mínimo ${MBZ_THRESHOLDS.minQuiz}, esperados 4)`);
+  } else if (counts.quiz < MBZ_THRESHOLDS.warnQuiz) {
+    warnings.push(`Quizzes incompletos: ${counts.quiz}/4 encontrados`);
+  }
+
+  if (counts.h5p === 0) {
+    warnings.push('No se encontraron actividades H5P — videos interactivos no incluidos en este paquete');
+  }
+
+  if (counts.totalActivities < MBZ_THRESHOLDS.minActivities) {
+    errors.push(`Actividades totales insuficientes: ${counts.totalActivities} encontradas (mínimo ${MBZ_THRESHOLDS.minActivities})`);
+  }
+
+  const status: 'passed' | 'warning' | 'failed' =
+    errors.length > 0   ? 'failed'  :
+    warnings.length > 0 ? 'warning' :
+    'passed';
+
+  logger.log(
+    `[PackageWorker] MBZ validation → ${status} | ` +
+    `sections=${counts.sections} scorm=${counts.scorm} quiz=${counts.quiz} h5p=${counts.h5p} ` +
+    `labels=${counts.label} pages=${counts.page} totalAct=${counts.totalActivities} totalFiles=${counts.totalFiles}` +
+    (errors.length   ? ` | errors: ${errors.join('; ')}`   : '') +
+    (warnings.length ? ` | warnings: ${warnings.join('; ')}` : ''),
+  );
+
+  return { status, errors, warnings, counts };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -245,17 +388,26 @@ async function handlePackageJob(
 
     if (leaseLost) return;
 
-    // ── Step 4: Validate ─────────────────────────────────────────────────────
+    // ── Step 4: Validate (basic + deep) ─────────────────────────────────────
     await updateProgress('validating_package', 'Validando paquete Moodle…');
 
-    if (!buildResult.buffer?.length || !buildResult.hasMoodleBackupXml) {
-      throw new Error('El paquete generado no es válido — no se encontró estructura Moodle');
-    }
-    if (buildResult.sizeBytes < 10 * 1024) {
-      throw new Error(`Paquete demasiado pequeño (${buildResult.sizeBytes} bytes) — puede estar incompleto`);
+    if (!buildResult.buffer?.length) {
+      throw new Error('El paquete generado está vacío — no se pudo construir el ZIP Moodle');
     }
 
     logger.log(`[PackageWorker] MBZ built: ${buildResult.filename}, ${buildResult.sizeBytes} bytes, ${buildResult.activityCount} activities`);
+
+    // Deep quality validation — counts SCORM, quizzes, sections, H5P
+    const validation = await validateFinalMoodlePackage(buildResult.buffer, buildResult, logger);
+
+    if (validation.status === 'failed') {
+      const errSummary = validation.errors.join(' | ');
+      throw new Error(`Paquete Moodle no pasa criterios mínimos de calidad: ${errSummary}`);
+    }
+
+    if (validation.status === 'warning') {
+      logger.warn(`[PackageWorker] MBZ validation warnings for job ${jobId}: ${validation.warnings.join(' | ')}`);
+    }
 
     // ── Step 5: Upload mbz_final artifact ────────────────────────────────────
     await updateProgress('uploading_package', 'Guardando paquete Moodle…');
@@ -281,8 +433,15 @@ async function handlePackageJob(
       mimeType:   'application/vnd.moodle.backup',
       metadata: {
         completionLevel:    'complete',
-        validationOk:       true,
+        validationOk:       validation.status !== 'failed',
+        // ── Fase 3: validation gate ──────────────────────────────
+        validationStatus:   validation.status,        // 'passed' | 'warning' | 'failed'
+        validationErrors:   validation.errors,
+        validationWarnings: validation.warnings,
+        counts:             validation.counts,
+        // ────────────────────────────────────────────────────────
         generatedBy:        'backend_package',
+        workerVersion:      '2.0',
         activityCount:      buildResult.activityCount,
         hasH5P:             Object.keys(hvpData ?? {}).length > 0,
         hasWelcomeAudio:    !!audioWelcome,
@@ -303,12 +462,16 @@ async function handlePackageJob(
     finalized = true;
     const completed = await jobsService.completePackageWorkerJob(jobId, workerId, {
       mbzFinal: {
-        status:        'completed',
-        artifactId:    artifact.id,
-        sizeBytes:     buildResult.sizeBytes,
-        filename:      buildResult.filename,
-        activityCount: buildResult.activityCount,
-        humanMessage:  'Paquete Moodle listo.',
+        status:            'completed',
+        artifactId:        artifact.id,
+        sizeBytes:         buildResult.sizeBytes,
+        filename:          buildResult.filename,
+        activityCount:     buildResult.activityCount,
+        validationStatus:  validation.status,
+        validationWarnings: validation.warnings,
+        humanMessage:      validation.status === 'warning'
+          ? `Paquete Moodle listo con advertencias: ${validation.warnings[0] ?? ''}`
+          : 'Paquete Moodle listo.',
       },
     });
 
