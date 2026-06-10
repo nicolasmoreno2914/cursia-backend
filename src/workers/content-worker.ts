@@ -348,6 +348,10 @@ async function bootstrap() {
         job.inputPayload as any,
         {
           onProgress: async (event: ContentGenerationProgressEvent) => {
+            // Abortar inmediatamente si el lease fue revocado (job cancelado)
+            if (leaseLost) {
+              throw new Error(`Job ${jobId} cancelled — aborting content generation`);
+            }
             aggregatedProgressMap[event.phase] = { done: event.done, total: event.total };
             const totalFilesGenerated = Object.values(aggregatedProgressMap).reduce(
               (sum, item) => sum + (item.done || 0),
