@@ -2514,6 +2514,16 @@ export class ProductionJobsService {
     }
   }
 
+  // Progress % assigned when each orchestrator step starts — never regresses.
+  private static readonly FULL_COURSE_STEP_PROGRESS: Record<string, number> = {
+    checking_existing: 2,
+    content:           5,
+    audio:             40,
+    video:             50,
+    h5p:               78,
+    package:           88,
+  };
+
   async updateFullCourseStep(
     jobId: string,
     workerId: string,
@@ -2528,6 +2538,12 @@ export class ProductionJobsService {
     job.status = 'running';
     job.workerStatus = 'running';
     job.currentStep = step;
+
+    const stepPct = ProductionJobsService.FULL_COURSE_STEP_PROGRESS[step] ?? -1;
+    if (stepPct > 0 && (job.progress ?? 0) < stepPct) {
+      job.progress = stepPct;
+    }
+
     if (partialSummary) {
       job.outputSummary = { ...(job.outputSummary ?? {}), ...partialSummary, updatedAt: new Date().toISOString() };
     }
