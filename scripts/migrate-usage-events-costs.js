@@ -100,6 +100,20 @@ async function main() {
       );
     `);
 
+    // Remove duplicate active rows before creating unique index.
+    // Keeps the row with the lowest id for each (provider, service, model, unit_type) where is_active.
+    // This is idempotent: if no duplicates exist, the DELETE is a no-op.
+    await client.query(`
+      delete from public.cost_rates
+      where is_active = true
+        and id not in (
+          select min(id)
+          from public.cost_rates
+          where is_active = true
+          group by provider, service, coalesce(model,''), unit_type
+        );
+    `);
+
     await client.query(`
       create unique index if not exists idx_cost_rates_unique
         on public.cost_rates (provider, service, coalesce(model,''), unit_type)
