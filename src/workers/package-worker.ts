@@ -190,7 +190,7 @@ function computeValidationProfile(courseData: Record<string, any>): ValidationPr
 // Scans activity XML files for content artifacts that must not appear in a
 // final Moodle backup (unresolved sentinels, temporary Moodle URLs, etc.).
 
-async function scanForSentinels(zip: JSZip): Promise<{ errors: string[]; warnings: string[]; found: number }> {
+async function scanForSentinels(zip: JSZip, mode: 'full' | 'base' = 'full'): Promise<{ errors: string[]; warnings: string[]; found: number }> {
   const errors:   string[] = [];
   const warnings: string[] = [];
   let found = 0;
@@ -222,7 +222,11 @@ async function scanForSentinels(zip: JSZip): Promise<{ errors: string[]; warning
     if (/127\.0\.0\.1|localhost(?:[\/:])/.test(text)){ localhostCount++;   found++; }
   }
 
-  if (hvpSentinelCount  > 0) errors  .push(`Sentinel HVP sin reemplazar en ${hvpSentinelCount} actividad(es) — H5P no inyectado`);
+  if (hvpSentinelCount  > 0) {
+    const msg = `Actividades H5P/video no incluidas en curso base (${hvpSentinelCount} sección(es))`;
+    if (mode === 'base') warnings.push(msg);
+    else errors.push(`Sentinel HVP sin reemplazar en ${hvpSentinelCount} actividad(es) — H5P no inyectado`);
+  }
   if (draftfileCount    > 0) errors  .push(`URL temporal draftfile.php en ${draftfileCount} actividad(es) — no funciona en export`);
   if (objectObjectCount > 0) errors  .push(`"[object Object]" visible en ${objectObjectCount} actividad(es) — error de serialización`);
   if (localhostCount    > 0) warnings.push(`URL local (localhost/127.0.0.1) en ${localhostCount} actividad(es)`);
@@ -521,7 +525,7 @@ async function validateFinalMoodlePackage(
   }
 
   // ── Step 4: Sentinel scan ───────────────────────────────────────────────────
-  const sentinelResult = await scanForSentinels(zip);
+  const sentinelResult = await scanForSentinels(zip, mode);
   errors.push(...sentinelResult.errors);
   warnings.push(...sentinelResult.warnings);
   counts.sentinelsFound = sentinelResult.found;
@@ -946,9 +950,12 @@ async function bootstrap() {
 
     if (dryRun) {
       logger.log(`[PackageWorker] Dry-run: simulating job ${claimed.id}`);
+      const dryIsBase = (claimed.executionMode ?? '') === 'backend_package_base';
+      const dryKey    = dryIsBase ? 'mbzBase' : 'mbzFinal';
+      const dryMsg    = dryIsBase ? 'Curso base listo (dry-run).' : 'Paquete Moodle listo (dry-run).';
       await sleep(3000);
       await jobsService.completePackageWorkerJob(claimed.id, workerId, {
-        mbzFinal: { status:'completed', humanMessage:'Paquete Moodle listo (dry-run).' },
+        [dryKey]: { status:'completed', humanMessage: dryMsg },
       });
       await eventsService.trackBackendEvent({
         userId: claimed.ownerId,
