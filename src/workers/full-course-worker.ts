@@ -182,6 +182,14 @@ async function ensureChildJob(
         metadata: { source: 'full_course_worker', parentJobId: parentJob.id },
       } as any);
       res = r;
+    } else if (executionMode === 'backend_package_base') {
+      const r = await jobsService.createPackageBaseJob(ownerId, {
+        courseId,
+        contentSnapshotArtifactId: payload.contentSnapshotArtifactId ?? null,
+        options: opts,
+        metadata: { source: 'full_course_worker', parentJobId: parentJob.id },
+      } as any);
+      res = r;
     }
 
     if (res?.jobId) {
@@ -402,6 +410,49 @@ async function handleFullCourseJob(
         steps: { content: { status: 'completed', artifactId: contentSnapshotArtifactId } },
       });
     }
+
+    if (leaseLost) return;
+
+    // ── 1.5. Package base (curso base: contenido sin multimedia) ─────────────
+    // Non-blocking: if it fails the full pipeline continues normally.
+    await updateStep('package_base', 'Generando curso base…');
+    let mbzContentBaseArtifactId: string | null = null;
+    try {
+      const existingBase = await findLatestArtifact(artifactsService, ownerId, courseId, 'mbz_content_base');
+      if (existingBase) {
+        mbzContentBaseArtifactId = existingBase.id;
+        logger.log(`[FullCourseWorker] mbz_content_base already exists (${mbzContentBaseArtifactId})`);
+      } else {
+        const baseJobId = await ensureChildJob('backend_package_base', job, courseId, {
+          contentSnapshotArtifactId,
+        }, jobsService, logger);
+
+        if (baseJobId) {
+          if (leaseLost) return;
+          const baseResult = await waitForChildJob(baseJobId, jobsService, sendHeartbeat, logger);
+          if (leaseLost) return;
+
+          if (baseResult.ok) {
+            mbzContentBaseArtifactId =
+              (baseResult.outputSummary.mbzBase as Record<string,any> | undefined)?.artifactId ?? null;
+            if (!mbzContentBaseArtifactId) {
+              const art = await findLatestArtifact(artifactsService, ownerId, courseId, 'mbz_content_base');
+              mbzContentBaseArtifactId = art?.id ?? null;
+            }
+          } else {
+            logger.warn(`[FullCourseWorker] Base package failed — continuing without mbz_content_base: ${baseResult.error}`);
+          }
+        }
+      }
+    } catch (baseErr) {
+      const msg = baseErr instanceof Error ? baseErr.message : String(baseErr);
+      logger.warn(`[FullCourseWorker] Base package step error (non-fatal): ${msg}`);
+    }
+
+    // Update outputSummary mid-run so frontend can discover the base artifact immediately
+    await updateStep('package_base', mbzContentBaseArtifactId ? 'Curso base listo ✓' : 'Curso base no disponible', {
+      mbzContentBaseArtifactId,
+    });
 
     if (leaseLost) return;
 
@@ -666,6 +717,7 @@ async function handleFullCourseJob(
     finalized = true;
     await jobsService.completeFullCourseJob(jobId, workerId, {
       mbzFinalArtifactId,
+      mbzContentBaseArtifactId,
       contentSnapshotArtifactId,
       audioWelcomeArtifactId,
       audiobookArtifactId,

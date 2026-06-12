@@ -429,6 +429,7 @@ async function validateFinalMoodlePackage(
   buildResult: MbzBuildResult,
   courseData: Record<string, any>,
   logger: Logger,
+  mode: 'full' | 'base' = 'full',
 ): Promise<MbzValidationResult> {
   const errors:   string[] = [];
   const warnings: string[] = [];
@@ -512,7 +513,7 @@ async function validateFinalMoodlePackage(
   } else if (counts.quiz < profile.expectedQuizzes) {
     warnings.push(`Quizzes incompletos: ${counts.quiz}/${profile.expectedQuizzes}`);
   }
-  if (counts.h5p === 0) {
+  if (counts.h5p === 0 && mode === 'full') {
     warnings.push('Sin actividades H5P — videos interactivos no incluidos');
   }
   if (counts.totalActivities < profile.minActivitiesFail) {
@@ -533,8 +534,8 @@ async function validateFinalMoodlePackage(
   counts.quizWithQuestions = quizResult.quizWithQuestions;
   counts.quizEmpty         = quizResult.quizEmpty;
 
-  // ── Step 6: H5P content depth ───────────────────────────────────────────────
-  if (counts.h5p > 0) {
+  // ── Step 6: H5P content depth (skipped in base mode) ───────────────────────
+  if (counts.h5p > 0 && mode === 'full') {
     const h5pResult = await validateH5PDepth(zip);
     errors.push(...h5pResult.errors);
     warnings.push(...h5pResult.warnings);
@@ -552,9 +553,10 @@ async function validateFinalMoodlePackage(
   counts.scormPlaceholder  = scormResult.scormPlaceholder;
   counts.scormEmpty        = scormResult.scormEmpty;
 
-  // ── Step 8: Mock content detection (P3) ─────────────────────────────────────
+  // ── Step 8: Mock content detection (P3, skipped in base mode) ──────────────
   // Detects courses packaged with simulated video/YouTube URLs (dev/test mode).
   // Always a warning — never a blocking error — so mock courses can still be downloaded.
+  if (mode === 'full') {
   const MOCK_URL_PATTERNS = [
     /youtube\.com\/watch\?v=mock_/i,
     /mock-cdn\.cursia\.local/i,
@@ -572,6 +574,7 @@ async function validateFinalMoodlePackage(
       `(${mockActivityCount} actividad(es) con contenido mock)`
     );
   }
+  } // end mode === 'full' mock scan
 
   // ── Determine status ─────────────────────────────────────────────────────────
   const status: 'passed' | 'warning' | 'failed' =
@@ -612,6 +615,7 @@ async function handlePackageJob(
   const rawCourseId = job.frontendCourseId || String(job.courseId ?? 'unknown');
   const options  = (payload.options ?? {}) as Record<string, any>;
   const parentJobId = payload?.metadata?.parentJobId ?? null;
+  const isBaseMode = (job.executionMode ?? '') === 'backend_package_base';
 
   let leaseLost = false;
   let finalized = false;
@@ -666,23 +670,25 @@ async function handlePackageJob(
     await sendHeartbeat();
     if (leaseLost) return;
 
-    // ── Step 1: Restore-first — check existing mbz_final ────────────────────
+    // ── Step 1: Restore-first — check existing artifact ─────────────────────
     await updateProgress('checking_existing_package', 'Verificando paquete existente…');
 
-    const existingMbz = await findExistingMbzFinalArtifact(artifactsService, job.ownerId, rawCourseId);
-    if (existingMbz) {
-      logger.log(`[PackageWorker] mbz_final artifact already exists (${existingMbz.id}) — marking completed`);
-      finalized = true;
-      await jobsService.completePackageWorkerJob(jobId, workerId, {
-        mbzFinal: {
-          status:     'skipped_existing',
-          artifactId: existingMbz.id,
-          sizeBytes:  existingMbz.sizeBytes,
-          filename:   existingMbz.filename,
-          humanMessage: 'Paquete Moodle ya guardado.',
-        },
-      });
-      return;
+    if (!isBaseMode) {
+      const existingMbz = await findExistingMbzFinalArtifact(artifactsService, job.ownerId, rawCourseId);
+      if (existingMbz) {
+        logger.log(`[PackageWorker] mbz_final artifact already exists (${existingMbz.id}) — marking completed`);
+        finalized = true;
+        await jobsService.completePackageWorkerJob(jobId, workerId, {
+          mbzFinal: {
+            status:     'skipped_existing',
+            artifactId: existingMbz.id,
+            sizeBytes:  existingMbz.sizeBytes,
+            filename:   existingMbz.filename,
+            humanMessage: 'Paquete Moodle ya guardado.',
+          },
+        });
+        return;
+      }
     }
 
     // ── Step 2: Download required artifacts ──────────────────────────────────
@@ -707,9 +713,9 @@ async function handlePackageJob(
     await sendHeartbeat();
     if (leaseLost) return;
 
-    // H5P data (optional)
+    // H5P data (optional, skipped in base mode)
     let hvpData: Record<number, HvpEntry> | undefined;
-    if (h5pSnapshotId) {
+    if (h5pSnapshotId && !isBaseMode) {
       const h5pSnapshot = await downloadArtifactJson(artifactsService, job.ownerId, h5pSnapshotId, logger);
       if (h5pSnapshot?.MEDIA_HVP && typeof h5pSnapshot.MEDIA_HVP === 'object') {
         hvpData = {} as Record<number, HvpEntry>;
@@ -723,16 +729,18 @@ async function handlePackageJob(
       }
     }
 
-    // Audio buffers (optional)
+    // Audio buffers (optional, skipped in base mode)
     let audioWelcome: Buffer | null = null;
     let audiobook:    Buffer | null = null;
-    if (audioWelcomeId) {
-      audioWelcome = await downloadArtifactBuffer(artifactsService, job.ownerId, audioWelcomeId, logger);
-      if (audioWelcome) logger.log(`[PackageWorker] Welcome audio: ${audioWelcome.length} bytes`);
-    }
-    if (audiobookId) {
-      audiobook = await downloadArtifactBuffer(artifactsService, job.ownerId, audiobookId, logger);
-      if (audiobook) logger.log(`[PackageWorker] Audiobook: ${audiobook.length} bytes`);
+    if (!isBaseMode) {
+      if (audioWelcomeId) {
+        audioWelcome = await downloadArtifactBuffer(artifactsService, job.ownerId, audioWelcomeId, logger);
+        if (audioWelcome) logger.log(`[PackageWorker] Welcome audio: ${audioWelcome.length} bytes`);
+      }
+      if (audiobookId) {
+        audiobook = await downloadArtifactBuffer(artifactsService, job.ownerId, audiobookId, logger);
+        if (audiobook) logger.log(`[PackageWorker] Audiobook: ${audiobook.length} bytes`);
+      }
     }
 
     await sendHeartbeat();
@@ -763,7 +771,7 @@ async function handlePackageJob(
     logger.log(`[PackageWorker] MBZ built: ${buildResult.filename}, ${buildResult.sizeBytes} bytes, ${buildResult.activityCount} activities`);
 
     // Deep quality validation — counts SCORM, quizzes, sections, H5P, sentinels
-    const validation = await validateFinalMoodlePackage(buildResult.buffer, buildResult, D, logger);
+    const validation = await validateFinalMoodlePackage(buildResult.buffer, buildResult, D, logger, isBaseMode ? 'base' : 'full');
 
     if (validation.status === 'failed') {
       const errSummary = validation.errors.join(' | ');
@@ -782,29 +790,28 @@ async function handlePackageJob(
       return;
     }
 
-    const courseName = String(D.nombre ?? 'curso').replace(/[^a-zA-Z0-9_\-]/g, '_');
-    const timestamp  = new Date().toISOString().replace(/[:.]/g, '-');
-    const filename   = `${courseName}_final_${timestamp}.mbz`;
+    const courseName  = String(D.nombre ?? 'curso').replace(/[^a-zA-Z0-9_\-]/g, '_');
+    const timestamp   = new Date().toISOString().replace(/[:.]/g, '-');
+    const fileSuffix  = isBaseMode ? 'base' : 'final';
+    const filename    = `${courseName}_${fileSuffix}_${timestamp}.mbz`;
     const storagePath = `${job.ownerId}/${rawCourseId}/package/${filename}`;
 
     const artifact = await artifactsService.uploadBufferArtifact({
       ownerId:    job.ownerId,
       courseId:   rawCourseId,
       jobId:      jobId,
-      type:       'mbz_final',
+      type:       isBaseMode ? 'mbz_content_base' : 'mbz_final',
       filename,
       storagePath,
       buffer:     buildResult.buffer,
       mimeType:   'application/vnd.moodle.backup',
       metadata: {
         completionLevel:    'complete',
-        validationOk:       true, // guaranteed: if failed we threw above; only passed/warning reach here
-        // ── Fase 3: validation gate ──────────────────────────────────────────
+        validationOk:       true,
         validationStatus:   validation.status,
         validationErrors:   validation.errors,
         validationWarnings: validation.warnings,
         counts:             validation.counts,
-        // ── Fase 3.1: deep content validation + checksum ─────────────────────
         checksumSha256:     validation.checksumSha256,
         validatedAt:        new Date().toISOString(),
         validatorVersion:   '3.1',
@@ -815,16 +822,15 @@ async function handlePackageJob(
           quizzes:      validation.counts.expectedQuizzes,
           questionsMin: validation.counts.expectedQuestionsMin,
         },
-        // ─────────────────────────────────────────────────────────────────────
-        generatedBy:        'backend_package',
-        workerVersion:      '3.1',
-        activityCount:      buildResult.activityCount,
-        hasH5P:             Object.keys(hvpData ?? {}).length > 0,
-        hasWelcomeAudio:    !!audioWelcome,
-        hasAudiobook:       !!audiobook,
-        courseName:         D.nombre ?? null,
-        filename:           buildResult.filename,
-        generatedAt:        new Date().toISOString(),
+        generatedBy:     isBaseMode ? 'backend_package_base' : 'backend_package',
+        workerVersion:   '3.1',
+        activityCount:   buildResult.activityCount,
+        hasH5P:          Object.keys(hvpData ?? {}).length > 0,
+        hasWelcomeAudio: !!audioWelcome,
+        hasAudiobook:    !!audiobook,
+        courseName:      D.nombre ?? null,
+        filename:        buildResult.filename,
+        generatedAt:     new Date().toISOString(),
       },
       storageBucket:   'cursia-artifacts',
       storageProvider: 'supabase',
@@ -836,8 +842,12 @@ async function handlePackageJob(
     if (leaseLost) return;
 
     finalized = true;
+    const outputKey = isBaseMode ? 'mbzBase' : 'mbzFinal';
+    const humanMsg  = validation.status === 'warning'
+      ? `Paquete Moodle listo con advertencias: ${validation.warnings[0] ?? ''}`
+      : isBaseMode ? 'Curso base listo.' : 'Paquete Moodle listo.';
     const completed = await jobsService.completePackageWorkerJob(jobId, workerId, {
-      mbzFinal: {
+      [outputKey]: {
         status:            'completed',
         artifactId:        artifact.id,
         sizeBytes:         buildResult.sizeBytes,
@@ -845,9 +855,7 @@ async function handlePackageJob(
         activityCount:     buildResult.activityCount,
         validationStatus:  validation.status,
         validationWarnings: validation.warnings,
-        humanMessage:      validation.status === 'warning'
-          ? `Paquete Moodle listo con advertencias: ${validation.warnings[0] ?? ''}`
-          : 'Paquete Moodle listo.',
+        humanMessage:      humanMsg,
       },
     });
 

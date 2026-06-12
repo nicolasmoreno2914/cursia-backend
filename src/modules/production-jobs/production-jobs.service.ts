@@ -34,6 +34,7 @@ const CANCELLABLE_CHILD_EXECUTION_MODES = new Set([
   'backend_videos',
   'backend_h5p',
   'backend_package',
+  'backend_package_base',
 ]);
 const CANCELLABLE_ACTIVE_STATUSES = new Set([
   'queued',
@@ -1827,13 +1828,70 @@ export class ProductionJobsService {
     return { ok:true, jobId:saved.id, status:saved.status, workerStatus:saved.workerStatus, executionMode:saved.executionMode, currentStep:saved.currentStep };
   }
 
+  async createPackageBaseJob(
+    ownerId: string,
+    dto: CreatePackageJobDto,
+  ): Promise<PackageJobCreatedResponse> {
+    if (!dto.courseId) throw new BadRequestException('courseId is required');
+    if (!dto.contentSnapshotArtifactId) throw new BadRequestException('contentSnapshotArtifactId is required');
+
+    const rawCourseId     = dto.courseId;
+    const numericCourseId = rawCourseId ? parseInt(rawCourseId, 10) : NaN;
+    const activeStatuses  = ['queued', 'running', 'retrying'];
+
+    const qb = this.jobRepo.createQueryBuilder('job')
+      .where('job.owner_id = :ownerId', { ownerId })
+      .andWhere('job.execution_mode = :executionMode', { executionMode: 'backend_package_base' })
+      .andWhere('job.worker_status IN (:...activeStatuses)', { activeStatuses });
+    if (!isNaN(numericCourseId)) {
+      qb.andWhere('(job.course_id = :courseId OR job.frontend_course_id = :frontendCourseId)', { courseId: numericCourseId, frontendCourseId: rawCourseId });
+    } else {
+      qb.andWhere('job.frontend_course_id = :frontendCourseId', { frontendCourseId: rawCourseId });
+    }
+    const activeExisting = await qb.getOne();
+    if (activeExisting) {
+      return { ok:true, jobId:activeExisting.id, status:activeExisting.status, workerStatus:activeExisting.workerStatus, executionMode:activeExisting.executionMode, currentStep:activeExisting.currentStep };
+    }
+
+    const sanitized = this.sanitizePayload({
+      courseId:                  rawCourseId,
+      executionMode:             'backend_package_base',
+      contentSnapshotArtifactId: dto.contentSnapshotArtifactId,
+      options:                   dto.options ?? {},
+      metadata:                  dto.metadata ?? {},
+    });
+
+    const job = this.jobRepo.create({
+      ownerId,
+      courseId:        !isNaN(numericCourseId) ? numericCourseId : null,
+      frontendCourseId: rawCourseId,
+      frontendJobId:    dto.frontendJobId ?? null,
+      options:          dto.options ?? {},
+      status:           'queued',
+      currentStep:      'package',
+      progress:         0,
+      executionMode:    'backend_package_base',
+      workerStatus:     'queued',
+      inputPayload:     sanitized,
+      outputSummary:    {},
+    });
+    const saved = await this.jobRepo.save(job);
+
+    let step = await this.stepRepo.findOne({ where: { jobId: saved.id, stepKey: 'package' } });
+    if (!step) step = this.stepRepo.create({ jobId: saved.id, stepKey: 'package' });
+    step.status = 'queued'; step.progress = 0; step.detail = 'Esperando worker de empaquetado (curso base)';
+    await this.stepRepo.save(step);
+
+    return { ok:true, jobId:saved.id, status:saved.status, workerStatus:saved.workerStatus, executionMode:saved.executionMode, currentStep:saved.currentStep };
+  }
+
   async claimNextBackendPackageJob(workerId: string, leaseSeconds: number): Promise<ProductionJob | null> {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
     try {
       const candidates = await queryRunner.query(
-        `SELECT id FROM production_jobs WHERE execution_mode = 'backend_package'
+        `SELECT id FROM production_jobs WHERE execution_mode IN ('backend_package','backend_package_base')
          AND worker_status IN ('queued','retrying')
          AND (next_retry_at IS NULL OR next_retry_at <= NOW())
          AND (lease_until IS NULL OR lease_until < NOW())
@@ -2518,6 +2576,7 @@ export class ProductionJobsService {
   private static readonly FULL_COURSE_STEP_PROGRESS: Record<string, number> = {
     checking_existing: 2,
     content:           5,
+    package_base:      12,
     audio:             40,
     video:             50,
     h5p:               78,
