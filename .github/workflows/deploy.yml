@@ -112,7 +112,10 @@ jobs:
                  fi
                }
 
-               echo "━━━ [1/5] Instalar todas las dependencias (devDeps para tsc) ━━━"
+               echo "━━━ [0/6] Limpiar dist/ (puede tener permisos de root de deploy anterior) ━━━"
+               sudo rm -rf dist 2>/dev/null || rm -rf dist 2>/dev/null || true
+
+               echo "━━━ [1/6] Instalar todas las dependencias (devDeps para tsc) ━━━"
                npm install
 
                echo "━━━ [2/6] Alinear restricciones de production_jobs ━━━"
