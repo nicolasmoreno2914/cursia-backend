@@ -552,6 +552,27 @@ async function validateFinalMoodlePackage(
   counts.scormPlaceholder  = scormResult.scormPlaceholder;
   counts.scormEmpty        = scormResult.scormEmpty;
 
+  // ── Step 8: Mock content detection (P3) ─────────────────────────────────────
+  // Detects courses packaged with simulated video/YouTube URLs (dev/test mode).
+  // Always a warning — never a blocking error — so mock courses can still be downloaded.
+  const MOCK_URL_PATTERNS = [
+    /youtube\.com\/watch\?v=mock_/i,
+    /mock-cdn\.cursia\.local/i,
+    /watch\?v=mock_cap\d/i,
+  ];
+  let mockActivityCount = 0;
+  for (const [filename, file] of Object.entries(zip.files)) {
+    if ((file as any).dir || !filename.startsWith('activities/')) continue;
+    const content = await (file as any).async('text').catch(() => '');
+    if (MOCK_URL_PATTERNS.some(re => re.test(content))) mockActivityCount++;
+  }
+  if (mockActivityCount > 0) {
+    warnings.push(
+      `Este curso usa videos simulados para pruebas. No es una versión final para estudiantes. ` +
+      `(${mockActivityCount} actividad(es) con contenido mock)`
+    );
+  }
+
   // ── Determine status ─────────────────────────────────────────────────────────
   const status: 'passed' | 'warning' | 'failed' =
     errors.length   > 0 ? 'failed'  :

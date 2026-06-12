@@ -619,7 +619,6 @@ async function handleFullCourseJob(
       h5pSnapshotArtifactId,
       audioWelcomeArtifactId,
       audiobookArtifactId,
-      options: { allowPartialMbz: true },
     }, jobsService, logger);
 
     if (!packageJobId) throw new Error('No se pudo crear el job de empaquetado');
@@ -649,12 +648,20 @@ async function handleFullCourseJob(
     }
 
     // ── Complete ──────────────────────────────────────────────────────────────
-    // Propagate validationStatus from package job so the frontend can gate 'ready' state
+    // Propagate validationStatus + warnings from package job so the frontend can gate 'ready' state
     const mbzFinalArt = await findLatestArtifact(artifactsService, ownerId, courseId, 'mbz_final');
-    const mbzValidationStatus =
-      (mbzFinalArt?.metadata as Record<string, any> | null)?.validationStatus as string | undefined
-      ?? ((packageResult.outputSummary.mbzFinal as Record<string, any> | undefined)?.validationStatus as string | undefined)
+    const mbzArtMeta  = (mbzFinalArt?.metadata as Record<string, any> | null) ?? {};
+    const mbzPkgMeta  = (packageResult.outputSummary.mbzFinal as Record<string, any> | undefined) ?? {};
+
+    const mbzValidationStatus: string =
+      (mbzArtMeta.validationStatus as string | undefined)
+      ?? (mbzPkgMeta.validationStatus  as string | undefined)
       ?? 'legacy';
+
+    const mbzValidationWarnings: string[] =
+      (mbzArtMeta.validationWarnings as string[] | undefined)
+      ?? (mbzPkgMeta.validationWarnings as string[] | undefined)
+      ?? [];
 
     finalized = true;
     await jobsService.completeFullCourseJob(jobId, workerId, {
@@ -663,7 +670,8 @@ async function handleFullCourseJob(
       audioWelcomeArtifactId,
       audiobookArtifactId,
       h5pSnapshotArtifactId,
-      validationStatus: mbzValidationStatus,
+      validationStatus:   mbzValidationStatus,
+      validationWarnings: mbzValidationWarnings,
       userMessage: mbzValidationStatus === 'warning'
         ? 'Curso listo (con advertencias menores).'
         : 'Curso listo.',
