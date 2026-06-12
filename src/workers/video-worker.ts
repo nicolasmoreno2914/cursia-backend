@@ -1176,8 +1176,8 @@ async function bootstrap() {
         return;
       }
 
-      if (!realVideogenEnabled) {
-        throw new Error('Set VIDEO_WORKER_ENABLE_REAL_VIDEOGEN=true and VIDEO_WORKER_DRY_RUN=false.');
+      if (!realVideogenEnabled && !mockVideogen) {
+        throw new Error('Set VIDEO_WORKER_ENABLE_REAL_VIDEOGEN=true (or VIDEO_WORKER_MOCK_VIDEOGEN=true for testing).');
       }
 
       // ── Detect phase: submit or resume polling ──────────────────────────────
