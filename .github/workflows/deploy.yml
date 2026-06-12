@@ -89,10 +89,10 @@ jobs:
                ensure_pm2_process() {
                  local name="$1"
                  local start_script="$2"
-                 if pm2 describe "$name" > /dev/null 2>&1; then
-                   pm2 restart "$name" --update-env
+                 if sudo pm2 describe "$name" > /dev/null 2>&1; then
+                   sudo pm2 restart "$name" --update-env
                  else
-                   pm2 start npm --name "$name" -- run "$start_script"
+                   sudo pm2 start npm --name "$name" -- run "$start_script"
                  fi
                }
 
@@ -106,15 +106,15 @@ jobs:
                node scripts/migrate-usage-events-costs.js
 
                echo "━━━ [4/4] Recargar PM2 (zero-downtime) ━━━"
-               pm2 reload cursia-backend --update-env || pm2 restart cursia-backend --update-env
+               sudo pm2 reload cursia-backend --update-env || sudo pm2 restart cursia-backend --update-env
                ensure_pm2_process cursia-content-worker start:content-worker
                ensure_pm2_process cursia-video-worker start:video-worker
                ensure_pm2_process cursia-audio-worker start:audio-worker
                ensure_pm2_process cursia-h5p-worker start:h5p-worker
                ensure_pm2_process cursia-package-worker start:package-worker
                ensure_pm2_process cursia-full-worker start:full-worker
-               pm2 save
-               pm2 status
+               sudo pm2 save
+               sudo pm2 status
 
                echo "✅ Deploy completado."'
 
