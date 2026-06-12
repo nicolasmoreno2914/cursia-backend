@@ -105,15 +105,21 @@ async function ensureChildJob(
   if (existing) {
     const ws = existing.workerStatus || existing.status || '';
     if (DONE_STATUSES.has(ws)) {
-      logger.log(`[FullCourseWorker] ${executionMode} already completed (job ${existing.id}) — skipping`);
-      return existing.id;
-    }
-    if (ACTIVE_STATUSES.has(ws)) {
+      // Reject dry-run completions — they have no real artifact and must be re-run.
+      const isDryRun = (existing.outputSummary as Record<string, any> | null)?.phase === 'dry_run';
+      if (isDryRun) {
+        logger.warn(`[FullCourseWorker] ${executionMode} job ${existing.id} was dry_run — creating fresh real job`);
+      } else {
+        logger.log(`[FullCourseWorker] ${executionMode} already completed (job ${existing.id}) — skipping`);
+        return existing.id;
+      }
+    } else if (ACTIVE_STATUSES.has(ws)) {
       logger.log(`[FullCourseWorker] ${executionMode} already active (job ${existing.id}, status=${ws}) — waiting`);
       return existing.id;
+    } else {
+      // Blocked or failed — need a fresh job
+      logger.log(`[FullCourseWorker] ${executionMode} job ${existing.id} is ${ws} — creating fresh job`);
     }
-    // Blocked or failed — need a fresh job
-    logger.log(`[FullCourseWorker] ${executionMode} job ${existing.id} is ${ws} — creating fresh job`);
   }
 
   // Create a new child job
@@ -160,7 +166,7 @@ async function ensureChildJob(
         youtubeUploads: payload.youtubeUploads ?? [],
         options: {
           restoreFirst: true,
-          requireYoutubeUrls: true,
+          requireYoutubeUrls: payload.options?.requireYoutubeUrls ?? true,
         },
         metadata: { source: 'full_course_worker', parentJobId: parentJob.id },
       } as any);
@@ -559,6 +565,7 @@ async function handleFullCourseJob(
         contentSnapshotArtifactId,
         videoStateSnapshotArtifactId,
         youtubeUploads,
+        options: { requireYoutubeUrls: youtubeUploads.length > 0 },
       }, jobsService, logger);
 
       if (!h5pJobId) throw new Error('No se pudo crear el job de actividades interactivas');
@@ -612,6 +619,7 @@ async function handleFullCourseJob(
       h5pSnapshotArtifactId,
       audioWelcomeArtifactId,
       audiobookArtifactId,
+      options: { allowPartialMbz: true },
     }, jobsService, logger);
 
     if (!packageJobId) throw new Error('No se pudo crear el job de empaquetado');

@@ -114,6 +114,108 @@ function escapeHtml(value: any): string {
     .replace(/"/g, '&quot;');
 }
 
+// ── SCORM game engine helpers ─────────────────────────────────────────────────
+
+function safeJsonEmbed(obj: unknown): string {
+  return JSON.stringify(obj)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e');
+}
+
+type ScormMechanic = 'quiz_clasico' | 'checklist' | 'secuencia_pro';
+
+type ScormPregunta = {
+  q: string;
+  opts?: string[];
+  correct?: string;
+  fb?: string;
+  scenario?: string;
+  items?: Array<{ label: string; required: boolean }>;
+  steps?: Array<{ id: string; label: string; order: number }>;
+  tolerance?: number;
+};
+
+type ScormSala = { name: string; preguntas: ScormPregunta[] };
+
+type ScormGameData = {
+  gameName: string;
+  tagline: string;
+  emoji: string;
+  scenario: { location: string; character: string; intro: string };
+  salas: ScormSala[];
+};
+
+function selectScormMechanic(cap: NormalizedChapter): ScormMechanic {
+  const mechs: ScormMechanic[] = ['quiz_clasico', 'checklist', 'secuencia_pro'];
+  return mechs[(cap.n - 1) % mechs.length];
+}
+
+function buildScormDataPrompt(D: NormalizedCourseData, ctx: string, cap: NormalizedChapter): string {
+  const mech = selectScormMechanic(cap);
+  const mechInstr = mech === 'quiz_clasico'
+    ? `Mecánica: QUIZ CLÁSICO. Cada pregunta: "q" (enunciado), "opts": array 4 strings (primera=correcta, otras 3 distractores plausibles), "correct": string igual al primer elemento de opts, "fb": feedback 1-2 líneas. Opcional: "scenario": oración de contexto situacional antes de la pregunta.`
+    : mech === 'checklist'
+    ? `Mecánica: CHECKLIST CRÍTICO. Cada pregunta: "q" (nombre del protocolo a verificar), "items": array 6-8 objetos {"label":string,"required":boolean} (mínimo 4 required), "fb": feedback sobre los pasos obligatorios.`
+    : `Mecánica: SECUENCIA DE PROCESO. Cada pregunta: "q" (procedimiento a ordenar), "steps": array 5-7 objetos {"id":"s1","label":"texto del paso","order":N} con orden 1..N correcto (el motor los mezcla al renderizar), "fb": feedback sobre el orden correcto, "tolerance": 0.`;
+
+  return `${ctx}
+
+Genera las interacciones para una actividad gamificada SCORM de práctica.
+Capítulo ${cap.n}: "${cap.t}" | Módulo ${cap.moduleNumber}: "${cap.moduleName}" | Sector: ${D.sector} | País: ${D.pais}
+
+${mechInstr}
+
+RESPONDE SOLO con JSON válido, sin texto adicional:
+{
+  "gameName": "Nombre narrativo con metáfora fuerte — NUNCA 'Quiz de…' ni 'Evaluación de…'",
+  "tagline": "Subtítulo motivador 5-9 palabras",
+  "emoji": "emoji representativo del tema",
+  "scenario": {
+    "location": "Lugar específico del sector y país",
+    "character": "Nombre y rol del protagonista",
+    "intro": "2-3 oraciones: contexto real, problema urgente, misión del aprendiz"
+  },
+  "salas": [
+    {"name": "Nombre evocador de la sala", "preguntas": [ /* 4 preguntas con el formato indicado */ ]},
+    {"name": "...", "preguntas": [ /* 4 preguntas */ ]},
+    {"name": "...", "preguntas": [ /* 4 preguntas */ ]}
+  ]
+}
+
+REGLAS:
+- Contenido basado en el capítulo, módulo, sector y país — NUNCA de exámenes externos
+- Lenguaje profesional del sector, situaciones realistas de ${D.pais}
+- gameName narrativo, nunca "Quiz de ${cap.t}" ni "Evaluación del capítulo"
+- Sin texto fuera del JSON`;
+}
+
+function parseScormGameData(raw: string, cap: NormalizedChapter): ScormGameData {
+  const fallback: ScormGameData = {
+    gameName: `Práctica — ${cap.t}`,
+    tagline: `Refuerzo del capítulo ${cap.n}`,
+    emoji: '🎮',
+    scenario: { location: '', character: '', intro: '' },
+    salas: Array.from({ length: 3 }, (_, i) => ({
+      name: `Sala ${i + 1}`,
+      preguntas: [{
+        q: `Pregunta de práctica sobre ${cap.t}`,
+        opts: ['Respuesta A', 'Respuesta B', 'Respuesta C', 'Respuesta D'],
+        correct: 'Respuesta A',
+        fb: 'Revisa el capítulo para más detalles.',
+      }],
+    })),
+  };
+  try {
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return fallback;
+    const data = JSON.parse(match[0]) as ScormGameData;
+    if (!Array.isArray(data.salas) || data.salas.length === 0) return fallback;
+    return data;
+  } catch {
+    return fallback;
+  }
+}
+
 // ── Normalise raw course data from the frontend payload ─────────────────────
 function buildNormalizedCourseData(raw: Record<string, any>): NormalizedCourseData {
   const rawMods: any[] = Array.isArray(raw.mods) ? raw.mods : [];
@@ -194,6 +296,10 @@ function buildGiftSystemPrompt(): string {
   return `Eres experto en evaluación educativa de CampusCloud. Generas exámenes GIFT para Moodle.\n\nTIPOS SOPORTADOS: Selección múltiple · Verdadero/Falso · Emparejamiento · Completar · Numérica\n\nREGLAS:\n(1) Selección múltiple: 4 opciones, misma longitud, 1 "=" + 3 "~"\n(2) V/F: ::ID::Enunciado. {TRUE} o {FALSE}\n(3) Emparejamiento: mínimo 4 pares "=Término -> Definición"\n(4) Completar: =respuesta =Variante =sin_tilde\n(5) Numérica: {#valor:tolerancia}\n(6) Preguntas sobre contenido REAL del sector y país\n(7) SOLO GIFT puro, sin texto explicativo ni bloques \`\`\``;
 }
 
+function buildScormSystemPrompt(): string {
+  return 'Eres diseñador de juegos educativos de CampusCloud. Generas JSON de contenido para actividades SCORM gamificadas.\n\nREGLAS:\n(1) Responde SOLO con JSON válido — sin texto adicional, sin bloques ```\n(2) Contenido basado en el sector, país y tema del capítulo — NUNCA reutilices preguntas de exámenes\n(3) Lenguaje profesional del sector, situaciones realistas y verificables\n(4) Nombres creativos con metáforas del sector — NUNCA "Quiz de…" ni "Evaluación del capítulo"\n(5) Feedback explicativo y formativo, no solo "Correcto" o "Incorrecto"\n(6) Para secuencia_pro: steps en el orden correcto (order:1..N); el motor los mezclará al renderizar\n(7) Para checklist: al menos 4 items required de 8 totales';
+}
+
 // ── Prompts por tipo de archivo ────────────────────────────────────────────────
 function buildLibroPrompt(type: string, D: NormalizedCourseData, ctx: string, modIdx?: number, capIdx?: number): string {
   const s = Math.random();
@@ -225,7 +331,14 @@ function buildVideoInteractivoPrompt(D: NormalizedCourseData, ctx: string, cap: 
 }
 
 function buildScormDescPrompt(D: NormalizedCourseData, ctx: string, cap: NormalizedChapter): string {
-  return `${ctx}\n\nGenera cap${cap.n}_descripcion_actividad.html. Cap ${cap.n}: "${cap.t}". Módulo ${cap.moduleNumber}.\n\nCOLORES: cap.hex=${cap.moduleHex} (solo fondos y border-left) · cap.ac=${cap.moduleAc} (números, labels, badges)\nREGLA: NUNCA cap.hex como color de texto.\n\nESTRUCTURA:\n(1) Contenedor raíz: <div style="background:#0B1929;border-radius:20px;padding:28px;box-sizing:border-box;width:100%;max-width:100%;overflow:hidden;font-family:'Segoe UI',Arial,sans-serif;">\n    NO uses position:relative. NO número decorativo absoluto.\n(2) Badge: <span style="display:inline-block;background:${cap.moduleHex};color:#fff;padding:4px 14px;border-radius:20px;font-size:11px;font-weight:700;text-transform:uppercase;margin-bottom:16px;">🎮 ACTIVIDAD INTERACTIVA · CAPÍTULO ${cap.n}</span>\n(3) Título h2 + Descripción de qué hace el estudiante (2 párrafos), color:#E2E6F3\n(4) STATS — 4 chips en flex-wrap (NO tabla):\n    <div style="display:flex;flex-wrap:wrap;gap:12px;margin:20px 0;">\n    Cada chip: <div style="background:rgba(255,255,255,0.06);border-radius:10px;padding:12px 16px;min-width:80px;text-align:center;">\n      Número grande color:${cap.moduleAc} · label pequeño color:rgba(226,230,243,0.6)\n    Valores: "4" SALAS · "280" PTS MÁX · "3" VIDAS · "∞" INTENTOS\n(5) GRID 4 SALAS — <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:20px;">\n    Cada sala: <div style="flex:1 1 180px;background:rgba(255,255,255,0.04);border-left:3px solid ${cap.moduleHex};border-radius:8px;padding:14px;">\n    con nombre de sala, mecánica y puntos, color:#E2E6F3\n(6) CTA: <a href="#scorm-cap-${cap.n}" style="display:inline-block;background:${cap.moduleAc};color:#000;padding:12px 24px;border-radius:10px;text-decoration:none;font-weight:700;">▶ Iniciar Actividad →</a>\n\nNUNCA sesskey. FRAGMENTO HTML sin DOCTYPE.`;
+  const mech = selectScormMechanic(cap);
+  const mechLabel = mech === 'quiz_clasico' ? 'Quiz Clásico' : mech === 'checklist' ? 'Checklist Crítico' : 'Secuencia de Proceso';
+  const mechDesc  = mech === 'quiz_clasico'
+    ? 'preguntas de opción múltiple con feedback inmediato sobre el tema del capítulo'
+    : mech === 'checklist'
+    ? 'verificación de protocolos y procedimientos paso a paso'
+    : 'ordenar correctamente los pasos de un procedimiento del sector';
+  return `${ctx}\n\nGenera cap${cap.n}_descripcion_actividad.html. Cap ${cap.n}: "${cap.t}". Módulo ${cap.moduleNumber}.\n\nCOLORES: cap.hex=${cap.moduleHex} (fondos y border-left solamente) · cap.ac=${cap.moduleAc} (números y badges destacados)\nREGLA: NUNCA cap.hex como color de texto directo.\n\nESTRUCTURA:\n(1) Contenedor raíz: <div style="background:#0B1929;border-radius:20px;padding:28px;box-sizing:border-box;width:100%;max-width:100%;overflow:hidden;font-family:'Segoe UI',Arial,sans-serif;">\n(2) Badge: <span style="display:inline-block;background:${cap.moduleHex};color:#fff;padding:4px 14px;border-radius:20px;font-size:11px;font-weight:700;text-transform:uppercase;margin-bottom:16px;">🎮 ACTIVIDAD INTERACTIVA · CAPÍTULO ${cap.n}</span>\n(3) Título h2 "${cap.t}" + Descripción: qué practica el aprendiz en esta actividad gamificada (2 párrafos). Mecánica: ${mechLabel} — ${mechDesc}. NUNCA usar palabras "evaluación", "examen" ni "prueba". Usar: "actividad de práctica", "refuerzo", "caso práctico".\n(4) STATS — 4 chips en flex-wrap:\n    <div style="display:flex;flex-wrap:wrap;gap:12px;margin:20px 0;">\n    Cada chip: <div style="background:rgba(255,255,255,0.06);border-radius:10px;padding:12px 16px;min-width:80px;text-align:center;">\n      Número grande color:${cap.moduleAc} · label pequeño color:rgba(226,230,243,0.6)\n    Valores: "3" SALAS · "3" VIDAS · "70%" PARA APROBAR · "∞" INTENTOS\n(5) DINÁMICA — 2 cards en flex-wrap:\n    Cada card: <div style="flex:1 1 180px;background:rgba(255,255,255,0.04);border-left:3px solid ${cap.moduleHex};border-radius:8px;padding:14px;">\n    Card 1: qué hace el aprendiz (mecánica ${mechLabel})\n    Card 2: cómo se califica (+10 pts por respuesta correcta, 3 vidas, 70% para aprobar)\n(6) CTA: <a href="#scorm-cap-${cap.n}" style="display:inline-block;background:${cap.moduleAc};color:#000;padding:12px 24px;border-radius:10px;text-decoration:none;font-weight:700;">▶ Iniciar Actividad →</a>\n\nNUNCA sesskey. NUNCA "evaluación", "examen", "prueba". FRAGMENTO HTML sin DOCTYPE.`;
 }
 
 function buildExamenDescPrompt(D: NormalizedCourseData, ctx: string, unitNum: number): string {
@@ -358,6 +471,7 @@ export async function generateCourseContent(
   const sysL = buildLibroSystemPrompt(D);
   const sysH = buildHtmlSystemPrompt(D);
   const sysG = buildGiftSystemPrompt();
+  const sysS = buildScormSystemPrompt();
 
   // ════════════════════════════════════════════════════════════════
   // FASE 1: LIBRO GUÍA
@@ -503,17 +617,24 @@ export async function generateCourseContent(
   }
 
   // ════════════════════════════════════════════════════════════════
-  // FASE 3: SCORMs (juegos gamificados — template por ahora)
+  // FASE 3: SCORMs — actividades gamificadas, una por capítulo
   // ════════════════════════════════════════════════════════════════
   for (const cap of D.caps) {
-    const indexHtml = createScormIndex(normalized, cap);
-    const manifestXml = createScormManifest(cap);
-    await addFile('scorms', `scorm_cap${cap.n}_index.html`,    indexHtml,    `SCORM: index capítulo ${cap.n}`);
-    await addFile('scorms', `scorm_cap${cap.n}_manifest.xml`,  manifestXml,  `SCORM: manifest capítulo ${cap.n}`);
+    const mechanic = selectScormMechanic(cap);
+    try {
+      const raw  = await callClaude(sysS, buildScormDataPrompt(D, ctx, cap), 6000, `scorm_cap${cap.n}`);
+      const data = parseScormGameData(raw, cap);
+      await addFile('scorms', `scorm_cap${cap.n}_index.html`,   createScormGameHtml(cap, data, mechanic), `SCORM: cap ${cap.n}`);
+      await addFile('scorms', `scorm_cap${cap.n}_manifest.xml`, createScormManifest(cap),                 `SCORM: manifest cap ${cap.n}`);
+    } catch (e: any) {
+      errors.push(`scorm_cap${cap.n}: ${e.message}`);
+      await addFile('scorms', `scorm_cap${cap.n}_index.html`,   createScormIndex(normalized, cap), `SCORM: cap ${cap.n} (fallback)`);
+      await addFile('scorms', `scorm_cap${cap.n}_manifest.xml`, createScormManifest(cap),          `SCORM: manifest cap ${cap.n}`);
+    }
   }
 
   // ════════════════════════════════════════════════════════════════
-  // FASE 4: EXÁMENES GIFT
+  // FASE 4: EXÁMENES GIFT — evaluaciones formales por módulo
   // ════════════════════════════════════════════════════════════════
   for (let unit = 1; unit <= 3; unit++) {
     const u = unit;
@@ -622,8 +743,8 @@ function generateFromTemplates(
     await addFile('paginas', 'examen_final_descripcion.html', createSimplePage('Examen Final', `<p>Evaluacion integradora.</p><p><a href="#exam-final" style="color:#4A7DFF;">Ir al examen final →</a></p>`, 'Cierre'), 'Pagina: examen final desc');
 
     for (const cap of normalized.caps) {
-      await addFile('scorms', `scorm_cap${cap.n}_index.html`,   createScormIndex(normalized, cap),   `SCORM: index cap ${cap.n}`);
-      await addFile('scorms', `scorm_cap${cap.n}_manifest.xml`, createScormManifest(cap),             `SCORM: manifest cap ${cap.n}`);
+      await addFile('scorms', `scorm_cap${cap.n}_index.html`,   createScormIndex(normalized, cap), `SCORM: index cap ${cap.n}`);
+      await addFile('scorms', `scorm_cap${cap.n}_manifest.xml`, createScormManifest(cap),          `SCORM: manifest cap ${cap.n}`);
     }
 
     for (let unit = 1; unit <= 3; unit++) {
@@ -688,6 +809,275 @@ function createScormIndex(D: NormalizedCourseData, cap: NormalizedChapter): stri
   const hex = cap.moduleHex;
   return `<!doctype html><html lang="es"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>SCORM Cap ${cap.n}</title><style>body{font-family:Arial,sans-serif;background:#08111c;color:#e5eef8;margin:0;padding:24px}.card{max-width:880px;margin:0 auto;background:#0f1d2d;border-radius:18px;padding:24px}.badge{display:inline-block;padding:4px 14px;border-radius:50px;background:${hex};color:#fff;font-size:11px;font-weight:700;text-transform:uppercase;margin-bottom:16px}h2{margin:0 0 12px;font-size:22px}p{color:rgba(229,238,248,.7);line-height:1.6}.btn{display:inline-block;margin-top:20px;padding:12px 28px;background:${hex};color:#fff;border-radius:10px;text-decoration:none;font-weight:700}</style></head><body><div class="card" id="scorm-cap-${cap.n}"><span class="badge">Módulo ${cap.moduleNumber} · Capítulo ${cap.n}</span><h2>${escapeHtml(cap.t)}</h2><p>Actividad gamificada del capítulo ${cap.n}. Completa las preguntas para ganar puntos y avanzar al siguiente capítulo.</p><a class="btn" href="#" onclick="top.API&&(top.API.LMSSetValue('cmi.core.lesson_status','completed'),top.API.LMSCommit(''));return false;">Completar actividad ✓</a></div><script>try{var api=top.API||parent.API;if(api){api.LMSInitialize('');api.LMSSetValue('cmi.core.lesson_status','incomplete');}}catch(e){}</script></body></html>`;
 }
+
+function createScormGameHtml(cap: NormalizedChapter, data: ScormGameData, mechanic: ScormMechanic): string {
+  const hex      = cap.moduleHex;
+  const ac       = cap.moduleAc;
+  const gameName = data.gameName || cap.t;
+  const tagline  = data.tagline  || `Refuerzo del capítulo ${cap.n}`;
+  const emoji    = data.emoji    || '🎮';
+  const sc       = data.scenario || { location: '', character: '', intro: '' };
+  const salas    = (data.salas ?? []).slice(0, 5);
+  const numSalas = Math.max(1, salas.length);
+  const maxPts   = salas.reduce((sum, s) => sum + (s.preguntas?.length ?? 0) * 10, 0) || numSalas * 40;
+
+  // Build embedded PREGUNTAS JS object
+  let pregJs = 'var PREGUNTAS={\n';
+  for (let i = 0; i < salas.length; i++) {
+    const pqs = salas[i]?.preguntas ?? [];
+    pregJs += `  sala${i + 1}:${safeJsonEmbed(pqs)}${i < salas.length - 1 ? ',' : ''}\n`;
+  }
+  pregJs += '};';
+
+  // Build sala + between-sala screens HTML
+  let salaHtml = '';
+  for (let i = 1; i <= numSalas; i++) {
+    const salaName = salas[i - 1]?.name ?? `Sala ${i}`;
+    salaHtml += `\n<div id="s-sala${i}" class="screen"><div class="gwrap"><div id="sn${i}" class="sala-badge">${escapeHtml(salaName)}</div><div id="area${i}" class="game-area"></div></div></div>`;
+    if (i < numSalas) {
+      salaHtml += `\n<div id="s-bt${i}" class="screen"><div class="gwrap"><div class="card"><div id="btt${i}" class="tran-title"></div><div id="btp${i}" class="tran-pts"></div><button class="btn-p" onclick="showScreen('s-sala${i + 1}');startSala(${i + 1})">Siguiente sala &#8594;</button></div></div></div>`;
+    }
+  }
+
+  const scenarioHtml = sc.intro
+    ? `<div class="mission-box">${sc.location ? `<div class="mission-loc">${escapeHtml(sc.location)}</div>` : ''}${sc.character ? `<div class="mission-char">${escapeHtml(sc.character)}</div>` : ''}<div class="mission-intro">${escapeHtml(sc.intro)}</div></div>`
+    : '';
+
+  return `<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>${escapeHtml(gameName)}</title>
+<!-- scormEngine:game_v1 salas:${numSalas} mechanic:${mechanic} -->
+<style>
+:root{--hex:${hex};--ac:${ac}}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:#08111c;color:#e5eef8;line-height:1.5}
+.screen{display:none;position:fixed;top:0;left:0;width:100%;height:100%;overflow-y:auto;background:#08111c}
+.screen.active{display:flex;flex-direction:column;align-items:center}
+.gwrap{width:100%;max-width:780px;padding:60px 16px 80px;box-sizing:border-box}
+.hud{position:fixed;top:0;left:0;width:100%;z-index:999;height:48px;display:flex;align-items:center;justify-content:space-between;padding:0 16px;background:rgba(8,17,28,.96);border-bottom:1px solid rgba(255,255,255,.08);backdrop-filter:blur(8px)}
+.hud-n{color:var(--hex);font-size:12px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
+.hud-r{display:flex;align-items:center;gap:12px;flex-shrink:0;font-size:13px;font-weight:700}
+#hud-pts{color:var(--ac)}
+.sala-badge{display:inline-block;padding:4px 14px;border-radius:50px;background:var(--hex);color:#fff;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:18px}
+.game-area{animation:aIn .2s ease-out both}
+@keyframes aIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.game-q{font-size:16px;font-weight:700;margin-bottom:18px;color:#e5eef8;line-height:1.5}
+.btn-op{display:flex;align-items:center;gap:12px;width:100%;text-align:left;padding:13px 16px;background:rgba(255,255,255,.06);border:1.5px solid rgba(255,255,255,.1);border-radius:10px;color:#e5eef8;font-size:14px;cursor:pointer;margin-bottom:10px;font-family:inherit;font-weight:600;transition:border-color .15s}
+.btn-op:hover:not([disabled]){border-color:rgba(255,255,255,.25)}
+.btn-op.ok{background:rgba(16,185,129,.16);border-color:#10b981;color:#6ee7b7}
+.btn-op.ko{background:rgba(239,68,68,.14);border-color:#ef4444;color:#fca5a5}
+.opt-key{min-width:26px;height:26px;border-radius:6px;background:rgba(255,255,255,.1);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:900;flex-shrink:0}
+.btn-p{background:var(--hex);color:#fff;border:none;cursor:pointer;font-weight:800;font-family:inherit;font-size:15px;padding:13px 28px;border-radius:12px;width:100%;margin-top:10px;transition:opacity .15s}
+.btn-p:hover{opacity:.85}
+.btn-p:disabled{opacity:.45;cursor:default}
+.card{background:#0f1d2d;border-radius:18px;padding:28px}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:1000;padding:11px 22px;border-radius:10px;font-weight:700;font-size:14px;pointer-events:none;max-width:90vw;text-align:center;display:none;box-shadow:0 4px 24px rgba(0,0,0,.5)}
+.ititle{font-size:24px;font-weight:900;margin-bottom:6px;line-height:1.2}
+.itagline{font-size:14px;color:rgba(229,238,248,.55);margin-bottom:18px}
+.mission-box{background:rgba(255,255,255,.05);border-left:3px solid var(--hex);border-radius:0 12px 12px 0;padding:14px 16px;margin-bottom:20px}
+.mission-loc{font-size:10px;text-transform:uppercase;letter-spacing:1.2px;opacity:.5;margin-bottom:4px}
+.mission-char{font-size:13px;font-weight:800;color:var(--hex);margin-bottom:6px}
+.mission-intro{font-size:13px;line-height:1.6;opacity:.8}
+.stats-row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:20px}
+.stat-chip{background:rgba(255,255,255,.06);border-radius:10px;padding:10px 14px;text-align:center;flex:1 1 60px}
+.stat-v{font-size:20px;font-weight:800;color:var(--ac)}
+.stat-l{font-size:10px;opacity:.5;text-transform:uppercase;letter-spacing:.5px}
+.r-circle{width:100px;height:100px;border-radius:50%;border:4px solid var(--hex);display:flex;align-items:center;justify-content:center;flex-direction:column;margin:0 auto 16px}
+.r-pct{font-size:26px;font-weight:800}
+.r-lbl{font-size:10px;opacity:.5;text-transform:uppercase}
+.r-verd{font-size:18px;font-weight:800;text-align:center;margin-bottom:6px}
+.r-stats{font-size:13px;color:rgba(229,238,248,.55);text-align:center;margin-bottom:20px}
+.tran-title{font-size:20px;font-weight:900;text-align:center;margin-bottom:8px}
+.tran-pts{font-size:13px;opacity:.6;text-align:center;margin-bottom:22px}
+.scenario-box{background:rgba(255,255,255,.04);border-left:3px solid var(--hex);border-radius:0 10px 10px 0;padding:12px 14px;margin-bottom:14px;font-size:13px;line-height:1.55;opacity:.82}
+.seq-list{display:flex;flex-direction:column;gap:8px;margin-bottom:12px}
+.seq-card{display:flex;align-items:center;gap:10px;background:rgba(255,255,255,.06);border:1.5px solid rgba(255,255,255,.1);border-radius:10px;padding:11px 14px;font-size:13px;font-weight:600}
+.seq-num{min-width:24px;height:24px;border-radius:6px;background:var(--hex);color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:800;flex-shrink:0}
+.seq-btns{display:flex;flex-direction:column;gap:2px;margin-left:auto}
+.seq-btn{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);border-radius:5px;color:#e5eef8;cursor:pointer;font-size:11px;padding:2px 7px;font-family:inherit}
+.seq-btn:hover{background:rgba(255,255,255,.14)}
+.ck-items{display:flex;flex-direction:column;gap:8px;margin-bottom:12px}
+.ck-item{display:flex;align-items:center;gap:12px;background:rgba(255,255,255,.05);border:1.5px solid rgba(255,255,255,.1);border-radius:10px;padding:11px 14px;cursor:pointer;transition:border-color .15s;font-size:13px;font-weight:600;user-select:none}
+.ck-item.req::before{content:"*";color:var(--ac);font-weight:900;font-size:14px;flex-shrink:0}
+.ck-item.checked{background:rgba(16,185,129,.1);border-color:rgba(16,185,129,.5);color:#6ee7b7}
+.ck-note{font-size:11px;opacity:.5;margin-bottom:12px}
+</style>
+</head>
+<body>
+<div id="hud" class="hud">
+  <span class="hud-n">${escapeHtml(gameName)}</span>
+  <div class="hud-r"><span id="hud-pts">0 pts</span><span id="hud-hearts"></span></div>
+</div>
+
+<div id="s-intro" class="screen active">
+  <div class="gwrap">
+    <span style="display:inline-block;background:var(--hex);color:#fff;padding:3px 12px;border-radius:50px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:16px;">CAP ${cap.n} &middot; ${escapeHtml(cap.moduleName)}</span>
+    <div style="font-size:36px;margin-bottom:8px;">${escapeHtml(emoji)}</div>
+    <h1 class="ititle">${escapeHtml(gameName)}</h1>
+    <p class="itagline">${escapeHtml(tagline)}</p>
+    ${scenarioHtml}
+    <div class="stats-row">
+      <div class="stat-chip"><div class="stat-v">${numSalas}</div><div class="stat-l">Salas</div></div>
+      <div class="stat-chip"><div class="stat-v">3</div><div class="stat-l">Vidas</div></div>
+      <div class="stat-chip"><div class="stat-v">${maxPts}</div><div class="stat-l">Pts m&aacute;x</div></div>
+      <div class="stat-chip"><div class="stat-v">70%</div><div class="stat-l">Aprobar</div></div>
+    </div>
+    <button class="btn-p" onclick="startGame()">&#9654; Iniciar actividad</button>
+  </div>
+</div>
+${salaHtml}
+<div id="s-result" class="screen">
+  <div class="gwrap" style="display:flex;flex-direction:column;align-items:center;">
+    <span style="display:inline-block;background:var(--hex);color:#fff;padding:3px 12px;border-radius:50px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:18px;">Resultado final</span>
+    <div class="r-circle"><div class="r-pct" id="r-pct">0%</div><div class="r-lbl">Score</div></div>
+    <div class="r-verd" id="r-verd"></div>
+    <div class="r-stats" id="r-stats"></div>
+    <button class="btn-p" onclick="retry()" style="max-width:320px;margin:0 auto;">&#8635; Intentar de nuevo</button>
+  </div>
+</div>
+<div id="toast" class="toast"></div>
+
+<script>
+var MECH=${safeJsonEmbed(mechanic)};
+var NUM_SALAS=${numSalas};
+var MAX_PTS=${maxPts};
+${pregJs}
+var G={score:0,correct:0,wrong:0,lives:3,sala:1,idx:0,curOpts:[],_ck:[],_ss:[],_so:[]};
+var done=false,_api=null;
+
+function _sf(w){var t=0;while(!w.API&&w.parent&&w.parent!==w&&t<7){t++;w=w.parent;}return w.API||null;}
+function _init(){_api=_sf(window);if(!_api)_api=_sf(top);if(_api){try{_api.LMSInitialize('');}catch(e){}}}
+function sc(k,v){try{if(_api){_api.LMSSetValue(k,String(v));_api.LMSCommit('');}}catch(e){}}
+
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function shuf(a){var b=a.slice();for(var i=b.length-1;i>0;i--){var j=Math.floor(Math.random()*(i+1));var t=b[i];b[i]=b[j];b[j]=t;}return b;}
+function show(id){document.querySelectorAll('.screen').forEach(function(s){s.classList.remove('active');});var e=document.getElementById(id);if(e)e.classList.add('active');}
+function toast(msg,ok){var t=document.getElementById('toast');if(!t)return;t.textContent=msg;t.style.background=ok?'rgba(16,185,129,.95)':'rgba(220,38,38,.92)';t.style.display='block';clearTimeout(t._t);t._t=setTimeout(function(){t.style.display='none';},2200);}
+function updHUD(){document.getElementById('hud-pts').textContent=G.score+' pts';var h='';for(var i=0;i<3;i++)h+=i<G.lives?'&#10084;&#65039;':'&#128420;';document.getElementById('hud-hearts').innerHTML=h;}
+
+function startGame(){
+  done=false;G.score=0;G.correct=0;G.wrong=0;G.lives=3;G.idx=0;G.sala=1;G.curOpts=[];G._ck=[];G._ss=[];G._so=[];
+  _init();sc('cmi.core.lesson_status','incomplete');updHUD();show('s-sala1');startSala(1);
+}
+function startSala(n){
+  G.sala=n;G.idx=0;G.curOpts=[];G._ck=[];G._ss=[];G._so=[];
+  var pqs=PREGUNTAS['sala'+n];
+  if(!pqs||!pqs.length){compSala(n);return;}
+  renderArea(n);
+}
+function compSala(n){
+  if(n>=NUM_SALAS){endGame();return;}
+  var bt=document.getElementById('btt'+n),bp=document.getElementById('btp'+n);
+  if(bt)bt.textContent='\\u2705 Sala '+n+' completada';
+  if(bp)bp.textContent='Correctas: '+G.correct+' \\u00b7 '+G.score+' pts';
+  show('s-bt'+n);
+}
+function gameOver(){
+  done=true;show('s-result');
+  document.getElementById('r-pct').textContent='0%';
+  var v=document.getElementById('r-verd');v.textContent='Sin vidas \\u2014 no aprobado';v.style.color='#ef4444';
+  document.getElementById('r-stats').textContent='Correctas: '+G.correct+' \\u00b7 Fallidas: '+G.wrong;
+  sc('cmi.core.lesson_status','failed');
+  try{_api.LMSCommit('');_api.LMSFinish('');}catch(e){}
+}
+function endGame(){
+  done=true;
+  var pct=MAX_PTS>0?Math.round(G.score/MAX_PTS*100):0,passed=pct>=70;
+  show('s-result');
+  document.getElementById('r-pct').textContent=pct+'%';
+  var v=document.getElementById('r-verd');
+  v.textContent=passed?'\\u2713 Actividad aprobada':'\\u2717 Necesitas repasar el cap\\u00edtulo';
+  v.style.color=passed?'#10b981':'#ef4444';
+  document.getElementById('r-stats').textContent='Correctas: '+G.correct+' \\u00b7 Fallidas: '+G.wrong+' \\u00b7 '+G.score+' pts';
+  sc('cmi.core.score.raw',pct);sc('cmi.core.score.min','0');sc('cmi.core.score.max','100');
+  sc('cmi.core.lesson_status',passed?'passed':'failed');
+  try{_api.LMSCommit('');_api.LMSFinish('');}catch(e){}
+}
+function retry(){
+  done=false;G.score=0;G.correct=0;G.wrong=0;G.lives=3;G.idx=0;G.sala=1;G.curOpts=[];G._ck=[];G._ss=[];G._so=[];
+  updHUD();show('s-intro');
+}
+
+// ── Answer checking ──────────────────────────────────────────────────────────
+function checkSala(n,i){
+  if(done)return;
+  var q=PREGUNTAS['sala'+n][G.idx];if(!q)return;
+  var ok=(G.curOpts[i]===q.correct);
+  if(ok){G.score+=10;G.correct++;toast('\\u2705 '+(q.fb||'Correcto'),true);}
+  else{G.lives--;G.wrong++;toast('\\u274c '+(q.correct?'Correcto: '+q.correct:'Incorrecto'),false);if(G.lives<=0){updHUD();setTimeout(gameOver,600);return;}}
+  updHUD();
+  setTimeout(function(){if(done)return;G.idx++;var pqs=PREGUNTAS['sala'+n];if(G.idx>=pqs.length)compSala(n);else renderArea(n);},450);
+}
+function checkCk(n){
+  if(done)return;
+  var q=PREGUNTAS['sala'+n][G.idx],items=q.items||[],sel=G._ck||[];
+  var ok=items.every(function(it,k){return !it.required||!!sel[k];});
+  var btn=document.getElementById('ckbtn'+n);if(btn)btn.disabled=true;
+  if(ok){G.score+=10;G.correct++;toast('\\u2705 '+(q.fb||'\\u00a1Protocolo correcto!'),true);}
+  else{G.lives--;G.wrong++;toast('\\u274c Marca todos los pasos obligatorios (*)',false);if(G.lives<=0){updHUD();setTimeout(gameOver,800);return;}}
+  updHUD();
+  setTimeout(function(){if(done)return;G.idx++;G._ck=[];var pqs=PREGUNTAS['sala'+n];if(G.idx>=pqs.length)compSala(n);else renderArea(n);},1500);
+}
+function checkSeq(n){
+  if(done)return;
+  var q=PREGUNTAS['sala'+n][G.idx],steps=G._ss||[],order=G._so||[];
+  var correct=steps.slice().sort(function(a,b){return a.order-b.order;}).map(function(s){return s.id;});
+  var wrongs=0;for(var k=0;k<order.length;k++)if(order[k]!==correct[k])wrongs++;
+  var tol=q.tolerance!=null?Number(q.tolerance):0,ok=wrongs<=tol;
+  var btn=document.getElementById('seqbtn'+n);if(btn)btn.disabled=true;
+  if(ok){G.score+=10;G.correct++;toast('\\u2705 '+(q.fb||'\\u00a1Secuencia correcta!'),true);}
+  else{G.lives--;G.wrong++;toast('\\u274c Orden incorrecto',false);if(G.lives<=0){updHUD();setTimeout(gameOver,800);return;}}
+  updHUD();
+  setTimeout(function(){if(done)return;G.idx++;G._ss=[];G._so=[];var pqs=PREGUNTAS['sala'+n];if(G.idx>=pqs.length)compSala(n);else renderArea(n);},1800);
+}
+
+// ── Render area ──────────────────────────────────────────────────────────────
+function renderArea(n){
+  if(MECH==='secuencia_pro')renderSeq(n);
+  else if(MECH==='checklist')renderCk(n);
+  else renderQuiz(n);
+}
+function renderQuiz(n){
+  var q=PREGUNTAS['sala'+n][G.idx];if(!q){compSala(n);return;}
+  var opts=(q.opts&&q.opts.length)?q.opts.slice():['A','B','C','D'];
+  if(opts.length>2)opts=shuf(opts);
+  G.curOpts=opts;
+  var keys=['A','B','C','D'],h='';
+  if(q.scenario)h+='<div class="scenario-box">'+esc(q.scenario)+'</div>';
+  h+='<p class="game-q">'+esc(q.q)+'</p>';
+  opts.forEach(function(o,i){h+='<button class="btn-op" onclick="checkSala('+n+','+i+')"><span class="opt-key">'+keys[i]+'</span><span>'+esc(o)+'</span></button>';});
+  setArea(n,h);
+}
+function renderCk(n){
+  var q=PREGUNTAS['sala'+n][G.idx];if(!q){compSala(n);return;}
+  G._ck=[];var items=q.items||[];
+  var h='<p class="game-q">'+esc(q.q)+'</p><p class="ck-note">Marca los pasos obligatorios (*) antes de verificar.</p><div class="ck-items">';
+  items.forEach(function(it,k){h+='<div class="ck-item'+(it.required?' req':'')+'" id="cki'+n+'_'+k+'" onclick="ckTog('+n+','+k+')"><span id="ckc'+n+'_'+k+'">&#9744;</span><span>'+esc(it.label)+'</span></div>';});
+  h+='</div><button class="btn-p" id="ckbtn'+n+'" onclick="checkCk('+n+')">&#10003; Verificar</button>';
+  setArea(n,h);
+}
+function renderSeq(n){
+  var q=PREGUNTAS['sala'+n][G.idx];if(!q){compSala(n);return;}
+  var steps=(q.steps||[]).slice(),shuf_steps=shuf(steps);
+  G._ss=steps;G._so=shuf_steps.map(function(s){return s.id;});
+  var h='<p class="game-q">'+esc(q.q)+'</p><p style="font-size:11px;opacity:.5;margin-bottom:10px;text-transform:uppercase;letter-spacing:1px;">Ordena los pasos de arriba a abajo</p><div class="seq-list" id="seql'+n+'">';
+  shuf_steps.forEach(function(s,k){h+='<div class="seq-card" id="sqc'+n+'_'+k+'"><div class="seq-num">'+(k+1)+'</div><span style="flex:1;line-height:1.4;">'+esc(s.label)+'</span><div class="seq-btns"><button class="seq-btn" onclick="seqMv('+n+','+k+',-1)">&#9650;</button><button class="seq-btn" onclick="seqMv('+n+','+k+',1)">&#9660;</button></div></div>';});
+  h+='</div><button class="btn-p" id="seqbtn'+n+'" onclick="checkSeq('+n+')">&#10003; Validar secuencia</button>';
+  setArea(n,h);
+}
+function setArea(n,h){var a=document.getElementById('area'+n);if(a){a.innerHTML=h;a.style.animation='none';void a.offsetWidth;a.style.animation='aIn .2s ease-out both';}}
+function ckTog(n,k){if(!G._ck)G._ck=[];G._ck[k]=!G._ck[k];var e=document.getElementById('cki'+n+'_'+k),c=document.getElementById('ckc'+n+'_'+k);if(e)e.classList.toggle('checked',!!G._ck[k]);if(c)c.innerHTML=G._ck[k]?'&#9745;':'&#9744;';}
+function seqMv(n,k,d){var l=document.getElementById('seql'+n);if(!l)return;var cs=Array.from(l.children),ni=k+d;if(ni<0||ni>=cs.length)return;var t=G._so[k];G._so[k]=G._so[ni];G._so[ni]=t;if(d>0)l.insertBefore(cs[ni],cs[k]);else l.insertBefore(cs[k],cs[ni]);Array.from(l.children).forEach(function(c,i){var nm=c.querySelector('.seq-num');if(nm)nm.textContent=String(i+1);});}
+
+updHUD();_init();
+</script>
+</body>
+</html>`;
+}
+
 
 function createScormManifest(cap: NormalizedChapter): string {
   return `<?xml version="1.0" encoding="UTF-8"?>

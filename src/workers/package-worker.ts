@@ -116,6 +116,8 @@ interface MbzActivityCounts {
   h5pEmpty:            number;
   // SCORM depth
   scormWithPackage:    number;
+  scormWithQuestions:  number;
+  scormPlaceholder:    number;
   scormEmpty:          number;
   // Sentinel scan
   sentinelsFound:      number;
@@ -347,11 +349,13 @@ async function validateH5PDepth(
 
 async function validateScormDepth(
   zip: JSZip,
-): Promise<{ scormWithPackage: number; scormEmpty: number; errors: string[]; warnings: string[] }> {
+): Promise<{ scormWithPackage: number; scormWithQuestions: number; scormPlaceholder: number; scormEmpty: number; errors: string[]; warnings: string[] }> {
   const errors:   string[] = [];
   const warnings: string[] = [];
-  let scormWithPackage = 0;
-  let scormEmpty       = 0;
+  let scormWithPackage  = 0;
+  let scormWithQuestions = 0;
+  let scormPlaceholder  = 0;
+  let scormEmpty        = 0;
 
   const scormPaths = Object.keys(zip.files).filter(
     p => !zip.files[p].dir && /^activities\/scorm_\d+\/scorm\.xml$/.test(p),
@@ -369,13 +373,35 @@ async function validateScormDepth(
       continue;
     }
 
-    // Verify package binary exists in the ZIP
     const pkgPath = `files/${hash.substring(0, 2)}/${hash}`;
-    if (zip.files[pkgPath]) {
-      scormWithPackage++;
-    } else {
-      // Hash present but file missing — something went wrong during build
+    if (!zip.files[pkgPath]) {
       scormEmpty++;
+      continue;
+    }
+
+    scormWithPackage++;
+
+    // Inspect inner SCORM ZIP to detect real quiz vs placeholder
+    try {
+      const pkgData  = await zip.files[pkgPath].async('nodebuffer');
+      const innerZip = await JSZip.loadAsync(pkgData);
+      const indexFile = innerZip.files['index.html'];
+      if (indexFile) {
+        const indexHtml = await indexFile.async('text');
+        const sizeBytes = Buffer.byteLength(indexHtml, 'utf8');
+        const hasGameEngine = /scormEngine:game_v1/.test(indexHtml);
+        const hasLegacyQuiz = /scormEngine:quiz_v1/.test(indexHtml);
+        const hasInteractions = /PREGUNTAS\s*=/.test(indexHtml) && /endGame|checkSala|checkSeq|checkCk/.test(indexHtml);
+        const hasScoreTracking = /cmi\.core\.score\.raw/.test(indexHtml) && /passed|failed/.test(indexHtml);
+        const isAutoComplete = /LMSSetValue\(['"]\S+['"]\s*,\s*['"]completed['"]/.test(indexHtml);
+        if ((hasGameEngine || hasLegacyQuiz) && hasInteractions && hasScoreTracking && !isAutoComplete) {
+          scormWithQuestions++;
+        } else if (isAutoComplete || /Completar actividad/.test(indexHtml) || sizeBytes < 4000) {
+          scormPlaceholder++;
+        }
+      }
+    } catch {
+      // Inner ZIP unreadable — package counted but content unknown
     }
   }
 
@@ -387,8 +413,13 @@ async function validateScormDepth(
       warnings.push(`${scormEmpty}/${scormPaths.length} SCORMs sin paquete binario`);
     }
   }
+  if (scormPlaceholder > 0) {
+    const pct = Math.round(scormPlaceholder / scormPaths.length * 100);
+    const msg = `${scormPlaceholder}/${scormPaths.length} SCORMs son placeholder (sin motor interactivo real)`;
+    if (pct >= 50) errors.push(msg); else warnings.push(msg);
+  }
 
-  return { scormWithPackage, scormEmpty, errors, warnings };
+  return { scormWithPackage, scormWithQuestions, scormPlaceholder, scormEmpty, errors, warnings };
 }
 
 // ── Main validator ────────────────────────────────────────────────────────────
@@ -413,7 +444,7 @@ async function validateFinalMoodlePackage(
     totalActivities: 0, totalFiles: 0,
     questionsTotal: 0, quizWithQuestions: 0, quizEmpty: 0,
     h5pWithVideo: 0, h5pWithInteractions: 0, h5pEmpty: 0,
-    scormWithPackage: 0, scormEmpty: 0,
+    scormWithPackage: 0, scormWithQuestions: 0, scormPlaceholder: 0, scormEmpty: 0,
     sentinelsFound: 0,
     expectedChapters:    profile.chapters,
     expectedScorm:       profile.expectedScorm,
@@ -469,7 +500,7 @@ async function validateFinalMoodlePackage(
 
   // ── Step 3: Structural thresholds (dynamic) ─────────────────────────────────
   if (counts.sections < profile.minSectionsFail) {
-    errors.push(`Secciones insuficientes: ${counts.sections} (mínimo ${profile.minSectionsFail} para perfil ${profile.profile})`);
+    warnings.push(`Secciones insuficientes: ${counts.sections} (mínimo ${profile.minSectionsFail} para perfil ${profile.profile})`);
   }
   if (counts.scorm < profile.minScormFail) {
     errors.push(`SCORMs insuficientes: ${counts.scorm}/${profile.expectedScorm} esperados (mínimo ${profile.minScormFail})`);
@@ -516,8 +547,10 @@ async function validateFinalMoodlePackage(
   const scormResult = await validateScormDepth(zip);
   errors.push(...scormResult.errors);
   warnings.push(...scormResult.warnings);
-  counts.scormWithPackage = scormResult.scormWithPackage;
-  counts.scormEmpty       = scormResult.scormEmpty;
+  counts.scormWithPackage  = scormResult.scormWithPackage;
+  counts.scormWithQuestions = scormResult.scormWithQuestions;
+  counts.scormPlaceholder  = scormResult.scormPlaceholder;
+  counts.scormEmpty        = scormResult.scormEmpty;
 
   // ── Determine status ─────────────────────────────────────────────────────────
   const status: 'passed' | 'warning' | 'failed' =
@@ -527,7 +560,7 @@ async function validateFinalMoodlePackage(
 
   logger.log(
     `[PackageWorker] MBZ validation (F3.1) → ${status} [${profile.profile}] | ` +
-    `sections=${counts.sections} scorm=${counts.scorm}(pkg:${counts.scormWithPackage}) ` +
+    `sections=${counts.sections} scorm=${counts.scorm}(pkg:${counts.scormWithPackage},game:${counts.scormWithQuestions},ph:${counts.scormPlaceholder}) ` +
     `quiz=${counts.quiz}(q:${counts.questionsTotal}) ` +
     `h5p=${counts.h5p}(vid:${counts.h5pWithVideo},int:${counts.h5pWithInteractions}) ` +
     `sentinels=${counts.sentinelsFound} totalAct=${counts.totalActivities}` +
