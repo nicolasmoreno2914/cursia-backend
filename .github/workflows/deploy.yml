@@ -10,11 +10,13 @@
 #   VPS_PATH        /var/www/cursia-backend
 #   HEALTH_URL      https://api.cursia.nomaddi.com/health
 #
-# ESTRATEGIA:
-#   1. build-check  — Verifica que el TypeScript compila en el runner de GitHub.
-#                     Early-fail antes de tocar producción.
-#   2. deploy       — SSH al VPS: git pull + npm install + tsc + npm ci + pm2 reload.
-#                     Compila en el VPS para evitar diferencias entre plataformas.
+# ESTRATEGIA (una sola fase):
+#   1. Compilar TypeScript en el runner de GitHub (Ubuntu, Node 22).
+#   2. rsync de todo — incluido dist/ — al VPS con la clave SSH.
+#      Esto reemplaza cualquier dist/ antiguo (incluso si era de root),
+#      porque rsync crea los archivos como el usuario SSH (cursia).
+#   3. SSH al VPS: npm install --omit=dev, migraciones, pm2 reload.
+#      No se compila en el VPS → sin problema de permisos.
 #
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -30,12 +32,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ────────────────────────────────────────────────────────────────────────────
-  # JOB 1: build-check — verifica que el TS compila sin errores (early-fail)
-  # ────────────────────────────────────────────────────────────────────────────
-  build:
-    name: Build TypeScript (early check)
+  deploy:
+    name: Build & Deploy to VPS
     runs-on: ubuntu-latest
+    environment: production
 
     steps:
       - name: Checkout
@@ -50,7 +50,7 @@ jobs:
       - name: Install all dependencies (including devDeps for tsc)
         run: npm ci
 
-      - name: Compile TypeScript
+      - name: Compile TypeScript on runner
         run: npm run build
 
       - name: Verify dist/main.js
@@ -61,21 +61,6 @@ jobs:
           fi
           echo "✅ dist/main.js OK — $(du -sh dist/ | cut -f1)"
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # JOB 2: deploy — solo si el build pasó
-  # Compila TypeScript directamente en el VPS para evitar diferencias
-  # entre el runner de GitHub y el servidor de producción.
-  # ────────────────────────────────────────────────────────────────────────────
-  deploy:
-    name: Deploy to VPS
-    runs-on: ubuntu-latest
-    needs: build
-    environment: production
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
@@ -83,18 +68,17 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
 
-      - name: Sync files to VPS
+      - name: Sync source + dist to VPS
         run: |
           rsync -az --delete \
             --exclude '.git' \
             --exclude 'node_modules' \
-            --exclude 'dist' \
             --exclude '.env' \
             --exclude '.env.*' \
             -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
             ./ "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:${{ secrets.VPS_PATH }}/"
 
-      - name: Build and restart on VPS
+      - name: Install prod deps + migrate + restart on VPS
         run: |
           ssh -i ~/.ssh/deploy_key \
               -o StrictHostKeyChecking=no \
@@ -112,25 +96,16 @@ jobs:
                  fi
                }
 
-               echo "━━━ [0/6] Limpiar dist/ (puede tener permisos de root de deploy anterior) ━━━"
-               sudo rm -rf dist 2>/dev/null || rm -rf dist 2>/dev/null || true
-
-               echo "━━━ [1/6] Instalar todas las dependencias (devDeps para tsc) ━━━"
-               npm install
-
-               echo "━━━ [2/6] Alinear restricciones de production_jobs ━━━"
-               node scripts/migrate-production-jobs-constraints.js
-
-               echo "━━━ [3/6] Migrar usage_events y cost_rates para tracking de costos ━━━"
-               node scripts/migrate-usage-events-costs.js
-
-               echo "━━━ [4/6] Compilar TypeScript en el VPS ━━━"
-               npm run build
-
-               echo "━━━ [5/6] Limpiar devDeps — dejar solo producción ━━━"
+               echo "━━━ [1/4] Instalar dependencias de producción ━━━"
                npm install --omit=dev
 
-               echo "━━━ [6/6] Recargar PM2 (zero-downtime) ━━━"
+               echo "━━━ [2/4] Alinear restricciones de production_jobs ━━━"
+               node scripts/migrate-production-jobs-constraints.js
+
+               echo "━━━ [3/4] Migrar usage_events y cost_rates ━━━"
+               node scripts/migrate-usage-events-costs.js
+
+               echo "━━━ [4/4] Recargar PM2 (zero-downtime) ━━━"
                pm2 reload cursia-backend --update-env || pm2 restart cursia-backend --update-env
                ensure_pm2_process cursia-content-worker start:content-worker
                ensure_pm2_process cursia-video-worker start:video-worker
@@ -162,9 +137,8 @@ jobs:
       - name: Notify on failure
         if: failure()
         run: |
-          echo "⚠️  El deploy falló."
-          echo "Rollback manual en VPS:"
+          echo "⚠️  El deploy falló. Último commit desplegado: $(git rev-parse --short HEAD)"
+          echo "Para rollback manual en VPS:"
           echo "  ssh cursia@${{ secrets.VPS_HOST }}"
           echo "  cd ${{ secrets.VPS_PATH }}"
-          echo "  git checkout HEAD~1 && npm install && npm run build && npm ci --omit=dev"
-          echo "  pm2 restart cursia-backend"
+          echo "  git checkout HEAD~1 && npm install --omit=dev && pm2 restart cursia-backend"
