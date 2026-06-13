@@ -2575,12 +2575,12 @@ export class ProductionJobsService {
   // Progress % assigned when each orchestrator step starts — never regresses.
   private static readonly FULL_COURSE_STEP_PROGRESS: Record<string, number> = {
     checking_existing: 2,
-    content:           5,
-    package_base:      12,
-    audio:             40,
-    video:             50,
-    h5p:               78,
-    package:           88,
+    content:           3,   // range 3–35; updated granularly by child progress
+    package_base:      35,  // range 35–42
+    audio:             42,  // range 42–55; updated granularly by child progress
+    video:             55,  // range 55–78
+    h5p:               78,  // range 78–88
+    package:           88,  // range 88–96
   };
 
   async updateFullCourseStep(
