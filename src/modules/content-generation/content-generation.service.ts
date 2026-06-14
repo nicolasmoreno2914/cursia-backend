@@ -98,13 +98,60 @@ const DEFAULT_PALETTE = {
 
 const PHASE_TOTALS: Record<PhaseKey, number> = {
   libro:    14,
-  paginas:  21,
-  scorms:    9,
+  paginas:  28,  // 6 intro + 9 video + 9 desc actividad + 4 desc examen
+  scorms:    9,  // 9 actividades IA (manifests son determinísticos, no se cuentan)
   examenes:  4,
 };
 
 const DEFAULT_MODEL = 'claude-sonnet-4-5';
 const MAX_RETRIES   = 3;
+
+const LIBRO_CONCURRENCY   = 3;
+const PAGINAS_CONCURRENCY = 3;
+const SCORM_CONCURRENCY   = 3;
+const EXAMEN_CONCURRENCY  = 3;
+
+// ── Concurrency helpers ────────────────────────────────────────────────────────
+
+function createLimiter(concurrency: number) {
+  let running = 0;
+  const queue: Array<() => void> = [];
+  return function limit<T>(fn: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const attempt = () => {
+        running++;
+        fn().then(resolve, reject).finally(() => {
+          running--;
+          if (queue.length > 0) queue.shift()!();
+        });
+      };
+      if (running < concurrency) attempt();
+      else queue.push(attempt);
+    });
+  };
+}
+
+type TaskResult<T> = { ok: true; value: T } | { ok: false; error: Error };
+
+async function gatherParallel<T>(
+  tasks: Array<() => Promise<T>>,
+  concurrency: number,
+): Promise<Array<TaskResult<T>>> {
+  const limit = createLimiter(concurrency);
+  const results: Array<TaskResult<T>> = tasks.map(() => ({ ok: false as const, error: new Error('pending') }));
+  await Promise.all(
+    tasks.map((fn, i) =>
+      limit(async () => {
+        try {
+          results[i] = { ok: true, value: await fn() };
+        } catch (err) {
+          results[i] = { ok: false, error: err instanceof Error ? err : new Error(String(err)) };
+        }
+      })
+    )
+  );
+  return results;
+}
 
 function escapeHtml(value: any): string {
   return String(value ?? '')
@@ -474,50 +521,47 @@ export async function generateCourseContent(
   const sysS = buildScormSystemPrompt();
 
   // ════════════════════════════════════════════════════════════════
-  // FASE 1: LIBRO GUÍA
+  // FASE 1: LIBRO GUÍA — 14 archivos, concurrencia 3
   // ════════════════════════════════════════════════════════════════
 
-  // 1a. Inicio del libro
-  try {
-    const text = await callClaude(sysL, buildLibroPrompt('ini', D, ctx), 4096, 'libro_inicio');
-    await addFile('libro', 'libro_inicio.md', text, 'Libro: portada e introducción');
-  } catch (e: any) {
-    errors.push(`libro_inicio: ${e.message}`);
-    await addFile('libro', 'libro_inicio.md', `# Introducción\nContenido del curso ${D.nombre}`, 'Libro: fallback');
-  }
+  const libroTaskDefs = [
+    {
+      filename: 'libro_inicio.md',
+      fn: () => callClaude(sysL, buildLibroPrompt('ini', D, ctx), 4096, 'libro_inicio'),
+      message: 'Libro: portada e introducción',
+      fallback: `# Introducción\nContenido del curso ${D.nombre}`,
+    },
+    ...D.mods.map((mod, mi) => ({
+      filename: `libro_mod${mi + 1}.md`,
+      fn: () => callClaude(sysL, buildLibroPrompt('mod', D, ctx, mi), 2048, `libro_mod${mi + 1}`),
+      message: `Libro: módulo ${mi + 1}`,
+      fallback: `# Módulo ${mi + 1}: ${mod.n}\n\nContenido del módulo.`,
+    })),
+    ...D.caps.map((cap, ci) => ({
+      filename: `libro_cap${cap.n}.md`,
+      fn: () => callClaude(sysL, buildLibroPrompt('cap', D, ctx, undefined, ci), 8192, `libro_cap${cap.n}`),
+      message: `Libro: capítulo ${cap.n}`,
+      fallback: `# Capítulo ${cap.n}: ${cap.t}\n\nContenido del capítulo.`,
+    })),
+    {
+      filename: 'libro_biblio.md',
+      fn: () => callClaude(sysL, buildLibroPrompt('bib', D, ctx), 2048, 'libro_biblio'),
+      message: 'Libro: evaluación y bibliografía',
+      fallback: `# Evaluación y Bibliografía\nRecursos del curso ${D.nombre}`,
+    },
+  ];
 
-  // 1b. Módulos
-  for (let mi = 0; mi < D.mods.length; mi++) {
-    const filename = `libro_mod${mi + 1}.md`;
-    try {
-      const text = await callClaude(sysL, buildLibroPrompt('mod', D, ctx, mi), 2048, filename);
-      await addFile('libro', filename, text, `Libro: módulo ${mi + 1}`);
-    } catch (e: any) {
-      errors.push(`${filename}: ${e.message}`);
-      await addFile('libro', filename, `# Módulo ${mi + 1}: ${D.mods[mi].n}\n\nContenido del módulo.`, `Libro: módulo ${mi + 1} (fallback)`);
+  const libroResults = await gatherParallel(libroTaskDefs.map(t => t.fn), LIBRO_CONCURRENCY);
+
+  for (let i = 0; i < libroTaskDefs.length; i++) {
+    const { filename, message, fallback } = libroTaskDefs[i];
+    const result = libroResults[i];
+    if (!result.ok) {
+      errors.push(`${filename}: ${(result as { ok: false; error: Error }).error.message}`);
+      await addFile('libro', filename, fallback, `${message} (fallback)`);
+    } else {
+      await addFile('libro', filename, result.value, message);
     }
-  }
-
-  // 1c. Capítulos (9)
-  for (let ci = 0; ci < D.caps.length; ci++) {
-    const cap = D.caps[ci];
-    const filename = `libro_cap${cap.n}.md`;
-    try {
-      const text = await callClaude(sysL, buildLibroPrompt('cap', D, ctx, undefined, ci), 8192, filename);
-      await addFile('libro', filename, text, `Libro: capítulo ${cap.n}`);
-    } catch (e: any) {
-      errors.push(`${filename}: ${e.message}`);
-      await addFile('libro', filename, `# Capítulo ${cap.n}: ${cap.t}\n\nContenido del capítulo.`, `Libro: capítulo ${cap.n} (fallback)`);
-    }
-  }
-
-  // 1d. Bibliografía
-  try {
-    const text = await callClaude(sysL, buildLibroPrompt('bib', D, ctx), 2048, 'libro_biblio');
-    await addFile('libro', 'libro_biblio.md', text, 'Libro: evaluación y bibliografía');
-  } catch (e: any) {
-    errors.push(`libro_biblio: ${e.message}`);
-    await addFile('libro', 'libro_biblio.md', `# Evaluación y Bibliografía\nRecursos del curso ${D.nombre}`, 'Libro: fallback');
   }
 
   // ════════════════════════════════════════════════════════════════
@@ -600,67 +644,103 @@ export async function generateCourseContent(
     message: 'Página: descripción examen final',
   });
 
-  for (const page of htmlPages) {
-    try {
+  // ── Páginas: correr en paralelo, escribir en orden de definición ───────────
+  const paginaResults = await gatherParallel(
+    htmlPages.map(page => async () => {
       let html = await page.prompt();
-      // Sanitize: strip any <style> or <script> tags
       html = html.replace(/<style[\s\S]*?<\/style>/gi, '');
       html = html.replace(/<script[\s\S]*?<\/script>/gi, '');
-      // Strip markdown wrappers if model added them
       html = html.replace(/^```html\s*/i, '').replace(/\s*```$/, '');
-      await addFile('paginas', page.filename, html, page.message);
-    } catch (e: any) {
-      errors.push(`${page.filename}: ${e.message}`);
-      const fallback = `<div style="background:#0A1628;border-radius:20px;padding:32px;color:#E2E6F3;font-family:'Segoe UI',Arial,sans-serif;"><p style="color:#E2E6F3;">${escapeHtml(page.filename)}</p></div>`;
-      await addFile('paginas', page.filename, fallback, `${page.message} (fallback)`);
+      return html;
+    }),
+    PAGINAS_CONCURRENCY,
+  );
+
+  for (let i = 0; i < htmlPages.length; i++) {
+    const { filename, message } = htmlPages[i];
+    const result = paginaResults[i];
+    if (!result.ok) {
+      errors.push(`${filename}: ${(result as { ok: false; error: Error }).error.message}`);
+      const fallback = `<div style="background:#0A1628;border-radius:20px;padding:32px;color:#E2E6F3;font-family:'Segoe UI',Arial,sans-serif;"><p style="color:#E2E6F3;">${escapeHtml(filename)}</p></div>`;
+      await addFile('paginas', filename, fallback, `${message} (fallback)`);
+    } else {
+      await addFile('paginas', filename, result.value, message);
     }
   }
 
   // ════════════════════════════════════════════════════════════════
-  // FASE 3: SCORMs — actividades gamificadas, una por capítulo
+  // FASE 3: SCORMs — 9 actividades IA, concurrencia 3
+  // Manifests son determinísticos — van directo a F sin evento de progreso.
+  // Un fallo tras retry es fatal (no hay fallback: propaga error al job).
   // ════════════════════════════════════════════════════════════════
-  for (const cap of D.caps) {
-    const mechanic = selectScormMechanic(cap);
-    const scormPrompt = buildScormDataPrompt(D, ctx, cap);
-    let raw = '';
-    try {
-      raw = await callClaude(sysS, scormPrompt, 6000, `scorm_cap${cap.n}`);
-    } catch (firstErr: any) {
-      logger.warn(`[scorm_cap${cap.n}] attempt 1 failed (${firstErr.message}), retrying after 5s`);
-      await new Promise(r => setTimeout(r, 5000));
+  const scormTaskResults = await gatherParallel(
+    D.caps.map(cap => async () => {
+      const mechanic = selectScormMechanic(cap);
+      const scormPrompt = buildScormDataPrompt(D, ctx, cap);
+      let raw = '';
       try {
-        raw = await callClaude(sysS, scormPrompt, 6000, `scorm_cap${cap.n}_retry`);
-      } catch (retryErr: any) {
-        throw new Error(`SCORM cap ${cap.n} falló tras 2 intentos: ${retryErr.message}`);
+        raw = await callClaude(sysS, scormPrompt, 6000, `scorm_cap${cap.n}`);
+      } catch (firstErr: any) {
+        logger.warn(`[scorm_cap${cap.n}] attempt 1 failed (${firstErr.message}), retrying after 5s`);
+        await new Promise(r => setTimeout(r, 5000));
+        try {
+          raw = await callClaude(sysS, scormPrompt, 6000, `scorm_cap${cap.n}_retry`);
+        } catch (retryErr: any) {
+          throw new Error(`SCORM cap ${cap.n} falló tras 2 intentos: ${retryErr.message}`);
+        }
       }
-    }
+      return { cap, raw, mechanic };
+    }),
+    SCORM_CONCURRENCY,
+  );
+
+  for (let i = 0; i < scormTaskResults.length; i++) {
+    const result = scormTaskResults[i];
+    if (!result.ok) throw (result as { ok: false; error: Error }).error;
+    const { cap, raw, mechanic } = result.value;
     const data = parseScormGameData(raw, cap);
-    await addFile('scorms', `scorm_cap${cap.n}_index.html`,   createScormGameHtml(cap, data, mechanic), `SCORM: cap ${cap.n}`);
-    await addFile('scorms', `scorm_cap${cap.n}_manifest.xml`, createScormManifest(cap),                 `SCORM: manifest cap ${cap.n}`);
+    await addFile('scorms', `scorm_cap${cap.n}_index.html`, createScormGameHtml(cap, data, mechanic), `SCORM: cap ${cap.n}`);
+    F[`scorm_cap${cap.n}_manifest.xml`] = createScormManifest(cap);
   }
 
   // ════════════════════════════════════════════════════════════════
-  // FASE 4: EXÁMENES GIFT — evaluaciones formales por módulo
+  // FASE 4: EXÁMENES GIFT — 3 unidades + final, concurrencia 3
+  // Fallback a gift vacío si IA falla (no es fatal para el job).
   // ════════════════════════════════════════════════════════════════
-  for (let unit = 1; unit <= 3; unit++) {
-    const u = unit;
-    const filename = `examen_unidad${u}.gift`;
-    try {
-      const gift = await callClaude(sysG, buildGiftPrompt(D, ctx, u), 4096, `examen_u${u}`);
-      await addFile('examenes', filename, gift.trim(), `Examen: unidad ${u}`);
-    } catch (e: any) {
-      errors.push(`${filename}: ${e.message}`);
-      await addFile('examenes', filename, createFallbackGift(u, D), `Examen: unidad ${u} (fallback)`);
-    }
-  }
+  type ExamenTask = { filename: string; content: string; message: string; error?: string };
 
-  // Examen final
-  try {
-    const gift = await callClaude(sysG, buildGiftPrompt(D, ctx, 'final'), 6144, 'examen_final');
-    await addFile('examenes', 'examen_final.gift', gift.trim(), 'Examen: final');
-  } catch (e: any) {
-    errors.push(`examen_final.gift: ${e.message}`);
-    await addFile('examenes', 'examen_final.gift', createFallbackGift('final', D), 'Examen: final (fallback)');
+  const examenTaskDefs: Array<{ fn: () => Promise<ExamenTask> }> = [
+    ...([1, 2, 3] as const).map(u => ({
+      fn: async (): Promise<ExamenTask> => {
+        const filename = `examen_unidad${u}.gift`;
+        try {
+          const gift = await callClaude(sysG, buildGiftPrompt(D, ctx, u), 4096, `examen_u${u}`);
+          return { filename, content: gift.trim(), message: `Examen: unidad ${u}` };
+        } catch (e: any) {
+          return { filename, content: createFallbackGift(u, D), message: `Examen: unidad ${u} (fallback)`, error: e.message };
+        }
+      },
+    })),
+    {
+      fn: async (): Promise<ExamenTask> => {
+        try {
+          const gift = await callClaude(sysG, buildGiftPrompt(D, ctx, 'final'), 6144, 'examen_final');
+          return { filename: 'examen_final.gift', content: gift.trim(), message: 'Examen: final' };
+        } catch (e: any) {
+          return { filename: 'examen_final.gift', content: createFallbackGift('final', D), message: 'Examen: final (fallback)', error: e.message };
+        }
+      },
+    },
+  ];
+
+  const examenResults = await gatherParallel(examenTaskDefs.map(t => t.fn), EXAMEN_CONCURRENCY);
+
+  for (let i = 0; i < examenResults.length; i++) {
+    const result = examenResults[i];
+    if (!result.ok) throw (result as { ok: false; error: Error }).error;
+    const { filename, content, message, error } = result.value;
+    if (error) errors.push(`${filename}: ${error}`);
+    await addFile('examenes', filename, content, message);
   }
 
   // Also generate the compiled book HTML
