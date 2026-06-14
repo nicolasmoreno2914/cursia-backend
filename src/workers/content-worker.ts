@@ -191,6 +191,7 @@ async function bootstrap() {
     const jobId = job.id;
     let leaseLost = false;
     let heartbeatCount = 0;
+    let consecutiveHeartbeatFailures = 0;
     let finalized = false;
     const courseId = buildEffectiveCourseId(job);
     const parentJobId = job.inputPayload?.metadata?.parentJobId ?? null;
@@ -234,13 +235,18 @@ async function bootstrap() {
           logger.warn(`Lease lost for job ${jobId}; stopping processing`);
           return;
         }
+        consecutiveHeartbeatFailures = 0;
         heartbeatCount += 1;
         logger.log(`Heartbeat ${heartbeatCount} for job ${jobId}`);
       } catch (error) {
-        leaseLost = true;
-        logger.error(
-          `Heartbeat failed for job ${jobId}: ${error instanceof Error ? error.message : String(error)}`,
+        consecutiveHeartbeatFailures += 1;
+        logger.warn(
+          `Heartbeat failed (${consecutiveHeartbeatFailures}/5) for job ${jobId}: ${error instanceof Error ? error.message : String(error)}`,
         );
+        if (consecutiveHeartbeatFailures >= 5) {
+          leaseLost = true;
+          logger.error(`Heartbeat failed 5 consecutive times for job ${jobId}; declaring lease lost`);
+        }
       }
     };
 

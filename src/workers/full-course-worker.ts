@@ -290,14 +290,23 @@ async function handleFullCourseJob(
 
   let leaseLost = false;
   let finalized = false;
+  let consecutiveHeartbeatFailures = 0;
 
   // ── Heartbeat ─────────────────────────────────────────────────────────────
   const sendHeartbeat = async () => {
     if (finalized || leaseLost) return;
     try {
       const ok = await jobsService.heartbeatWorkerJob(jobId, workerId, leaseSeconds);
-      if (!ok) { leaseLost = true; logger.warn(`[FullCourseWorker] Lease lost for job ${jobId}`); }
-    } catch { leaseLost = true; }
+      if (!ok) { leaseLost = true; logger.warn(`[FullCourseWorker] Lease lost for job ${jobId}`); return; }
+      consecutiveHeartbeatFailures = 0;
+    } catch (error) {
+      consecutiveHeartbeatFailures += 1;
+      logger.warn(`[FullCourseWorker] Heartbeat failed (${consecutiveHeartbeatFailures}/5) for job ${jobId}: ${error instanceof Error ? error.message : String(error)}`);
+      if (consecutiveHeartbeatFailures >= 5) {
+        leaseLost = true;
+        logger.error(`[FullCourseWorker] Heartbeat failed 5 consecutive times for job ${jobId}; declaring lease lost`);
+      }
+    }
   };
   const heartbeatTimer = setInterval(() => { void sendHeartbeat(); }, heartbeatMs);
 

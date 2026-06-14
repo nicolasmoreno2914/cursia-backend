@@ -398,7 +398,7 @@ export async function generateCourseContent(
     return generateFromTemplates(inputPayload, callbacks);
   }
 
-  const anthropic  = new Anthropic({ apiKey });
+  const anthropic  = new Anthropic({ apiKey, timeout: 120_000 });
   const model      = inputPayload.contentConfig?.model ?? DEFAULT_MODEL;
   const maxRetries = inputPayload.contentConfig?.maxRetriesPerFile ?? MAX_RETRIES;
   const startedAt  = Date.now();
@@ -621,16 +621,22 @@ export async function generateCourseContent(
   // ════════════════════════════════════════════════════════════════
   for (const cap of D.caps) {
     const mechanic = selectScormMechanic(cap);
+    const scormPrompt = buildScormDataPrompt(D, ctx, cap);
+    let raw = '';
     try {
-      const raw  = await callClaude(sysS, buildScormDataPrompt(D, ctx, cap), 6000, `scorm_cap${cap.n}`);
-      const data = parseScormGameData(raw, cap);
-      await addFile('scorms', `scorm_cap${cap.n}_index.html`,   createScormGameHtml(cap, data, mechanic), `SCORM: cap ${cap.n}`);
-      await addFile('scorms', `scorm_cap${cap.n}_manifest.xml`, createScormManifest(cap),                 `SCORM: manifest cap ${cap.n}`);
-    } catch (e: any) {
-      errors.push(`scorm_cap${cap.n}: ${e.message}`);
-      await addFile('scorms', `scorm_cap${cap.n}_index.html`,   createScormIndex(normalized, cap), `SCORM: cap ${cap.n} (fallback)`);
-      await addFile('scorms', `scorm_cap${cap.n}_manifest.xml`, createScormManifest(cap),          `SCORM: manifest cap ${cap.n}`);
+      raw = await callClaude(sysS, scormPrompt, 6000, `scorm_cap${cap.n}`);
+    } catch (firstErr: any) {
+      logger.warn(`[scorm_cap${cap.n}] attempt 1 failed (${firstErr.message}), retrying after 5s`);
+      await new Promise(r => setTimeout(r, 5000));
+      try {
+        raw = await callClaude(sysS, scormPrompt, 6000, `scorm_cap${cap.n}_retry`);
+      } catch (retryErr: any) {
+        throw new Error(`SCORM cap ${cap.n} falló tras 2 intentos: ${retryErr.message}`);
+      }
     }
+    const data = parseScormGameData(raw, cap);
+    await addFile('scorms', `scorm_cap${cap.n}_index.html`,   createScormGameHtml(cap, data, mechanic), `SCORM: cap ${cap.n}`);
+    await addFile('scorms', `scorm_cap${cap.n}_manifest.xml`, createScormManifest(cap),                 `SCORM: manifest cap ${cap.n}`);
   }
 
   // ════════════════════════════════════════════════════════════════
