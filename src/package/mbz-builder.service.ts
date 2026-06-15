@@ -549,7 +549,7 @@ export class MbzBuilderService {
     ];
 
     const secFiles: Record<number, string[]> = { 0:[], 1:[], 2:[], 3:[], 4:[], 5:[] };
-    secFiles[0] = ['seccion0_bienvenida.html','seccion0_audio_bienvenida.html','seccion0_introduccion.html','seccion0_metodologia.html'];
+    secFiles[0] = ['seccion0_bienvenida.html','seccion0_audio_bienvenida.html','seccion0_metodologia.html'];
     secFiles[1] = ['seccion1_ruta_aprendizaje.html','seccion1_libro_guia.html','seccion1_audiolibro.html'];
     for (let ci = 0; ci < 9; ci++) {
       const sec = ci < 3 ? 2 : ci < 6 ? 3 : 4;

@@ -224,44 +224,69 @@ async function waitForChildJob(
   maxWaitMs = 4 * 60 * 60 * 1000, // 4 hours max
 ): Promise<ChildJobResult> {
   const deadline = Date.now() + maxWaitMs;
+  const MAX_DB_ERRORS = 10;      // tolerate up to 10 consecutive DB failures (~5 min at 30s poll)
+  const DB_RETRY_MS  = 10_000;   // retry after 10s on DB error (faster than normal poll)
+  let consecutiveDbErrors = 0;
 
   while (Date.now() < deadline) {
     await sleep(pollMs);
     await heartbeatFn();
-    if ((await jobsService.isJobCancelled(childJobId)) === true) {
-      return { ok: false, status: 'cancelled', outputSummary: {}, error: `Child job ${childJobId} cancelled` };
+
+    try {
+      if ((await jobsService.isJobCancelled(childJobId)) === true) {
+        return { ok: false, status: 'cancelled', outputSummary: {}, error: `Child job ${childJobId} cancelled` };
+      }
+
+      const job = await jobsService.findJobByIdInternal(childJobId);
+      if (!job) {
+        return { ok: false, status: 'not_found', outputSummary: {}, error: `Child job ${childJobId} not found` };
+      }
+
+      // Reset counter on any successful DB round-trip
+      consecutiveDbErrors = 0;
+
+      const ws = job.workerStatus || job.status || '';
+
+      if (DONE_STATUSES.has(ws)) {
+        return { ok: true, status: ws, outputSummary: job.outputSummary ?? {} };
+      }
+
+      if (FAILED_STATUSES.has(ws)) {
+        return { ok: false, status: ws, outputSummary: job.outputSummary ?? {}, error: job.errorMessage ?? 'job failed' };
+      }
+
+      if (ws === 'cancelled' || ws === 'cancelling') {
+        return { ok: false, status: 'cancelled', outputSummary: job.outputSummary ?? {}, error: job.errorMessage ?? 'job cancelled' };
+      }
+
+      if (BLOCKED_STATUSES.has(ws)) {
+        const phase = (job.outputSummary ?? {}).phase as string | undefined;
+        const blockStatus = phase === 'blocked_auth'  ? 'blocked_auth'
+                          : phase === 'blocked_quota' ? 'blocked_quota'
+                          : ws;
+        return { ok: false, status: blockStatus, outputSummary: job.outputSummary ?? {}, error: job.errorMessage ?? ws };
+      }
+
+      // Still running/queued/retrying — continue waiting
+      logger.log(`[FullCourseWorker] Waiting for child job ${childJobId} (${ws})...`);
+
+    } catch (dbErr: any) {
+      consecutiveDbErrors += 1;
+      logger.warn(
+        `[FullCourseWorker] DB error polling child job ${childJobId} ` +
+        `(${consecutiveDbErrors}/${MAX_DB_ERRORS}): ${dbErr?.message ?? dbErr}`,
+      );
+      if (consecutiveDbErrors >= MAX_DB_ERRORS) {
+        return {
+          ok: false,
+          status: 'db_error',
+          outputSummary: {},
+          error: `Lost DB connectivity while waiting for child job ${childJobId} after ${consecutiveDbErrors} consecutive errors`,
+        };
+      }
+      // Short retry delay instead of the full pollMs to recover faster
+      await sleep(DB_RETRY_MS);
     }
-
-    const job = await jobsService.findJobByIdInternal(childJobId);
-    if (!job) {
-      return { ok: false, status: 'not_found', outputSummary: {}, error: `Child job ${childJobId} not found` };
-    }
-
-    const ws = job.workerStatus || job.status || '';
-
-    if (DONE_STATUSES.has(ws)) {
-      return { ok: true, status: ws, outputSummary: job.outputSummary ?? {} };
-    }
-
-    if (FAILED_STATUSES.has(ws)) {
-      return { ok: false, status: ws, outputSummary: job.outputSummary ?? {}, error: job.errorMessage ?? 'job failed' };
-    }
-
-    if (ws === 'cancelled' || ws === 'cancelling') {
-      return { ok: false, status: 'cancelled', outputSummary: job.outputSummary ?? {}, error: job.errorMessage ?? 'job cancelled' };
-    }
-
-    if (BLOCKED_STATUSES.has(ws)) {
-      // Detect YouTube block reason from outputSummary
-      const phase = (job.outputSummary ?? {}).phase as string | undefined;
-      const blockStatus = phase === 'blocked_auth'  ? 'blocked_auth'
-                        : phase === 'blocked_quota' ? 'blocked_quota'
-                        : ws;
-      return { ok: false, status: blockStatus, outputSummary: job.outputSummary ?? {}, error: job.errorMessage ?? ws };
-    }
-
-    // Still running/queued/retrying — continue waiting
-    logger.log(`[FullCourseWorker] Waiting for child job ${childJobId} (${ws})...`);
   }
 
   return { ok: false, status: 'timeout', outputSummary: {}, error: `Child job ${childJobId} timed out after ${maxWaitMs / 60000} min` };
@@ -810,12 +835,25 @@ async function bootstrap() {
 
   logger.log(`Full course worker started (workerId=${workerId}, pollMs=${pollMs}, leaseSeconds=${leaseSeconds}, dryRun=${dryRun})`);
 
-  // Recover any zombie jobs left by a previous crashed/aborted worker.
-  await jobsService.recoverZombieJobs(workerId).catch((err) =>
-    logger.warn(`Zombie recovery skipped (DB unavailable at startup): ${err.message}`),
-  );
+  // Recover zombie jobs at startup and then every ZOMBIE_RECOVERY_MS milliseconds.
+  const ZOMBIE_RECOVERY_MS = readPositiveInt('FULL_COURSE_ZOMBIE_RECOVERY_MS', 10 * 60 * 1000); // 10 min
+  let lastZombieRecovery = 0;
+
+  const runZombieRecovery = async () => {
+    lastZombieRecovery = Date.now();
+    await jobsService.recoverZombieJobs(workerId).catch((err) =>
+      logger.warn(`Zombie recovery skipped (DB unavailable): ${err.message}`),
+    );
+  };
+
+  await runZombieRecovery();
 
   while (!shuttingDown) {
+    // Periodic zombie recovery (every ZOMBIE_RECOVERY_MS) without interrupting active jobs
+    if (activeJobs.size === 0 && Date.now() - lastZombieRecovery >= ZOMBIE_RECOVERY_MS) {
+      await runZombieRecovery();
+    }
+
     const claimed = await jobsService.claimNextFullCourseJob(workerId, leaseSeconds);
 
     if (!claimed) {

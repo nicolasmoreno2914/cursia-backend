@@ -494,12 +494,25 @@ async function bootstrap() {
     }
   }
 
-  // Recover any zombie jobs left by a previous crashed/aborted worker.
-  await jobsService.recoverZombieJobs(workerId).catch((err) =>
-    logger.warn(`Zombie recovery skipped (DB unavailable at startup): ${err.message}`),
-  );
+  // Recover zombie jobs at startup and then every ZOMBIE_RECOVERY_MS milliseconds.
+  const ZOMBIE_RECOVERY_MS = readPositiveInt('CONTENT_ZOMBIE_RECOVERY_MS', 10 * 60 * 1000); // 10 min
+  let lastZombieRecovery = 0;
+
+  const runZombieRecovery = async () => {
+    lastZombieRecovery = Date.now();
+    await jobsService.recoverZombieJobs(workerId).catch((err) =>
+      logger.warn(`Zombie recovery skipped (DB unavailable): ${err.message}`),
+    );
+  };
+
+  await runZombieRecovery();
 
   while (!shuttingDown) {
+    // Periodic zombie recovery (every ZOMBIE_RECOVERY_MS) when worker is idle
+    if (activeJobs.size === 0 && Date.now() - lastZombieRecovery >= ZOMBIE_RECOVERY_MS) {
+      await runZombieRecovery();
+    }
+
     while (!shuttingDown && activeJobs.size < concurrency) {
       const claimed = await jobsService.claimNextBackendContentJob(workerId, leaseSeconds);
       if (!claimed) break;
