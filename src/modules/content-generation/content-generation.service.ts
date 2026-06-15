@@ -263,6 +263,22 @@ function parseScormGameData(raw: string, cap: NormalizedChapter): ScormGameData 
   }
 }
 
+// Returns null if content is acceptable, or a reason string if placeholder detected
+function isScormPlaceholder(data: ScormGameData): string | null {
+  const MARKERS = ['Respuesta A', 'Respuesta B', 'Pregunta de práctica', 'Revisa el capítulo para más detalles'];
+  const salas = data.salas ?? [];
+  if (salas.length < 3) return `solo ${salas.length} sala(s) (mínimo 3)`;
+  for (let i = 0; i < salas.length; i++) {
+    const pqs = salas[i]?.preguntas ?? [];
+    if (pqs.length < 3) return `sala ${i + 1} tiene ${pqs.length} pregunta(s) (mínimo 3)`;
+    const txt = JSON.stringify(pqs);
+    for (const m of MARKERS) {
+      if (txt.includes(m)) return `sala ${i + 1} contiene placeholder "${m}"`;
+    }
+  }
+  return null;
+}
+
 // ── Normalise raw course data from the frontend payload ─────────────────────
 function buildNormalizedCourseData(raw: Record<string, any>): NormalizedCourseData {
   const rawMods: any[] = Array.isArray(raw.mods) ? raw.mods : [];
@@ -678,6 +694,8 @@ export async function generateCourseContent(
       const mechanic = selectScormMechanic(cap);
       const scormPrompt = buildScormDataPrompt(D, ctx, cap);
       let raw = '';
+
+      // Attempt 1: API call (retry on API error)
       try {
         raw = await callClaude(sysS, scormPrompt, 6000, `scorm_cap${cap.n}`);
       } catch (firstErr: any) {
@@ -689,7 +707,29 @@ export async function generateCourseContent(
           throw new Error(`SCORM cap ${cap.n} falló tras 2 intentos: ${retryErr.message}`);
         }
       }
-      return { cap, raw, mechanic };
+
+      // Parse and validate content quality
+      let data = parseScormGameData(raw, cap);
+      const placeholderReason = isScormPlaceholder(data);
+      if (placeholderReason) {
+        logger.warn(`[scorm_cap${cap.n}] placeholder detectado (${placeholderReason}) — reintentando con prompt reforzado`);
+        await new Promise(r => setTimeout(r, 3000));
+        const reinforcedPrompt = scormPrompt + `\n\n⚠️ RECHAZO PREVIO: El intento anterior devolvió contenido placeholder (${placeholderReason}). Preguntas genéricas como "Pregunta de práctica sobre..." y opciones "Respuesta A/B/C/D" NO son aceptables. GENERA contenido REAL y ESPECÍFICO sobre "${cap.t}" en el sector ${D.sector}, ${D.pais}. Cada pregunta debe citar conceptos técnicos reales con opciones que sean términos del campo profesional. Mínimo 3 salas con mínimo 3 preguntas cada una.`;
+        let retryRaw = '';
+        try {
+          retryRaw = await callClaude(sysS, reinforcedPrompt, 6000, `scorm_cap${cap.n}_content_retry`);
+        } catch (retryErr: any) {
+          throw new Error(`SCORM cap ${cap.n}: placeholder + retry API falló: ${retryErr.message}`);
+        }
+        const retryData = parseScormGameData(retryRaw, cap);
+        const retryPlaceholder = isScormPlaceholder(retryData);
+        if (retryPlaceholder) {
+          throw new Error(`SCORM cap ${cap.n}: contenido placeholder tras 2 generaciones (${retryPlaceholder})`);
+        }
+        data = retryData;
+      }
+
+      return { cap, data, mechanic };
     }),
     SCORM_CONCURRENCY,
   );
@@ -697,8 +737,7 @@ export async function generateCourseContent(
   for (let i = 0; i < scormTaskResults.length; i++) {
     const result = scormTaskResults[i];
     if (!result.ok) throw (result as { ok: false; error: Error }).error;
-    const { cap, raw, mechanic } = result.value;
-    const data = parseScormGameData(raw, cap);
+    const { cap, data, mechanic } = result.value;
     await addFile('scorms', `scorm_cap${cap.n}_index.html`, createScormGameHtml(cap, data, mechanic), `SCORM: cap ${cap.n}`);
     F[`scorm_cap${cap.n}_manifest.xml`] = createScormManifest(cap);
   }
@@ -921,7 +960,7 @@ function createScormGameHtml(cap: NormalizedChapter, data: ScormGameData, mechan
     const salaName = salas[i - 1]?.name ?? `Sala ${i}`;
     salaHtml += `\n<div id="s-sala${i}" class="screen"><div class="gwrap"><div id="sn${i}" class="sala-badge">${escapeHtml(salaName)}</div><div id="area${i}" class="game-area"></div></div></div>`;
     if (i < numSalas) {
-      salaHtml += `\n<div id="s-bt${i}" class="screen"><div class="gwrap"><div class="card"><div id="btt${i}" class="tran-title"></div><div id="btp${i}" class="tran-pts"></div><button class="btn-p" onclick="showScreen('s-sala${i + 1}');startSala(${i + 1})">Siguiente sala &#8594;</button></div></div></div>`;
+      salaHtml += `\n<div id="s-bt${i}" class="screen"><div class="gwrap"><div class="card"><div id="btt${i}" class="tran-title"></div><div id="btp${i}" class="tran-pts"></div><button class="btn-p" onclick="show('s-sala${i + 1}');startSala(${i + 1})">Siguiente sala &#8594;</button></div></div></div>`;
     }
   }
 
