@@ -494,6 +494,11 @@ async function bootstrap() {
     }
   }
 
+  // Recover any zombie jobs left by a previous crashed/aborted worker.
+  await jobsService.recoverZombieJobs(workerId).catch((err) =>
+    logger.warn(`Zombie recovery skipped (DB unavailable at startup): ${err.message}`),
+  );
+
   while (!shuttingDown) {
     while (!shuttingDown && activeJobs.size < concurrency) {
       const claimed = await jobsService.claimNextBackendContentJob(workerId, leaseSeconds);

@@ -2802,4 +2802,41 @@ export class ProductionJobsService {
 
     await this.stepRepo.save(step);
   }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Zombie-job recovery
+  // Called at worker startup. Finds jobs that are still marked `running` but
+  // whose lease expired (+ 5 min grace), meaning no worker is actually
+  // processing them. Marks them as `failed` so the UI shows an honest state
+  // instead of a perpetual "Generating…" spinner.
+  // Returns the number of jobs recovered.
+  // ────────────────────────────────────────────────────────────────────────────
+  async recoverZombieJobs(recoveringWorkerId: string): Promise<number> {
+    const GRACE_MINUTES = 5; // extra buffer on top of expired lease
+    const result: { count: string }[] = await this.dataSource.query(
+      `
+      UPDATE production_jobs
+      SET
+        status        = 'failed',
+        worker_status = 'failed',
+        finished_at   = COALESCE(finished_at, NOW()),
+        lease_until   = NULL,
+        error_message = 'Job recovered from zombie state: lease expired with no active worker (DB connection loss or worker crash)',
+        updated_at    = NOW()
+      WHERE status = 'running'
+        AND (lease_until IS NOT NULL AND lease_until < NOW() - ($1 * INTERVAL '1 minute'))
+        AND finished_at IS NULL
+      RETURNING id
+      `,
+      [GRACE_MINUTES],
+    );
+
+    const count = Array.isArray(result) ? result.length : 0;
+    if (count > 0) {
+      this.logger.warn(
+        `[${recoveringWorkerId}] Recovered ${count} zombie job(s) with expired lease (grace ${GRACE_MINUTES}min)`,
+      );
+    }
+    return count;
+  }
 }

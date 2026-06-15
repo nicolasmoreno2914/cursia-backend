@@ -810,6 +810,11 @@ async function bootstrap() {
 
   logger.log(`Full course worker started (workerId=${workerId}, pollMs=${pollMs}, leaseSeconds=${leaseSeconds}, dryRun=${dryRun})`);
 
+  // Recover any zombie jobs left by a previous crashed/aborted worker.
+  await jobsService.recoverZombieJobs(workerId).catch((err) =>
+    logger.warn(`Zombie recovery skipped (DB unavailable at startup): ${err.message}`),
+  );
+
   while (!shuttingDown) {
     const claimed = await jobsService.claimNextFullCourseJob(workerId, leaseSeconds);
 
