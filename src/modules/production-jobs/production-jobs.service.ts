@@ -2812,8 +2812,11 @@ export class ProductionJobsService {
   // Returns the number of jobs recovered.
   // ────────────────────────────────────────────────────────────────────────────
   async recoverZombieJobs(recoveringWorkerId: string): Promise<number> {
-    const GRACE_MINUTES = 5; // extra buffer on top of expired lease
-    const result: { count: string }[] = await this.dataSource.query(
+    const GRACE_MINUTES = 5;
+    const STALE_MINUTES = 30; // for null-lease zombies: no update in 30 min = dead
+
+    // Case A: lease expired — worker crashed mid-flight, never wrote final status.
+    const expiredLease: { id: string }[] = await this.dataSource.query(
       `
       UPDATE production_jobs
       SET
@@ -2824,19 +2827,55 @@ export class ProductionJobsService {
         error_message = 'Job recovered from zombie state: lease expired with no active worker (DB connection loss or worker crash)',
         updated_at    = NOW()
       WHERE status = 'running'
-        AND (lease_until IS NOT NULL AND lease_until < NOW() - ($1 * INTERVAL '1 minute'))
         AND finished_at IS NULL
+        AND lease_until IS NOT NULL
+        AND lease_until < NOW() - ($1 * INTERVAL '1 minute')
       RETURNING id
       `,
       [GRACE_MINUTES],
     );
 
-    const count = Array.isArray(result) ? result.length : 0;
-    if (count > 0) {
+    // Case B: finished_at set but status still running — cancel/fail wrote partial fields.
+    const partialCancel: { id: string }[] = await this.dataSource.query(
+      `
+      UPDATE production_jobs
+      SET
+        status        = 'cancelled',
+        worker_status = 'cancelled',
+        lease_until   = NULL,
+        updated_at    = NOW()
+      WHERE status = 'running'
+        AND finished_at IS NOT NULL
+      RETURNING id
+      `,
+    );
+
+    // Case C: lease is NULL and no update for > STALE_MINUTES — frontend zombie or very old orphan.
+    const nullLease: { id: string }[] = await this.dataSource.query(
+      `
+      UPDATE production_jobs
+      SET
+        status        = 'failed',
+        worker_status = 'failed',
+        finished_at   = COALESCE(finished_at, NOW()),
+        error_message = 'Job recovered from zombie state: no lease and no heartbeat for ${STALE_MINUTES}+ minutes',
+        updated_at    = NOW()
+      WHERE status = 'running'
+        AND finished_at IS NULL
+        AND lease_until IS NULL
+        AND updated_at < NOW() - ($1 * INTERVAL '1 minute')
+      RETURNING id
+      `,
+      [STALE_MINUTES],
+    );
+
+    const total = expiredLease.length + partialCancel.length + nullLease.length;
+    if (total > 0) {
       this.logger.warn(
-        `[${recoveringWorkerId}] Recovered ${count} zombie job(s) with expired lease (grace ${GRACE_MINUTES}min)`,
+        `[${recoveringWorkerId}] Recovered ${total} zombie job(s): ` +
+        `${expiredLease.length} expired-lease, ${partialCancel.length} partial-cancel, ${nullLease.length} null-lease-stale`,
       );
     }
-    return count;
+    return total;
   }
 }
