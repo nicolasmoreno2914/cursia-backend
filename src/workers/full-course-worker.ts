@@ -105,21 +105,15 @@ async function ensureChildJob(
   if (existing) {
     const ws = existing.workerStatus || existing.status || '';
     if (DONE_STATUSES.has(ws)) {
-      // Reject dry-run completions — they have no real artifact and must be re-run.
-      const isDryRun = (existing.outputSummary as Record<string, any> | null)?.phase === 'dry_run';
-      if (isDryRun) {
-        logger.warn(`[FullCourseWorker] ${executionMode} job ${existing.id} was dry_run — creating fresh real job`);
-      } else {
-        logger.log(`[FullCourseWorker] ${executionMode} already completed (job ${existing.id}) — skipping`);
-        return existing.id;
-      }
-    } else if (ACTIVE_STATUSES.has(ws)) {
+      logger.log(`[FullCourseWorker] ${executionMode} already completed (job ${existing.id}) — skipping`);
+      return existing.id;
+    }
+    if (ACTIVE_STATUSES.has(ws)) {
       logger.log(`[FullCourseWorker] ${executionMode} already active (job ${existing.id}, status=${ws}) — waiting`);
       return existing.id;
-    } else {
-      // Blocked or failed — need a fresh job
-      logger.log(`[FullCourseWorker] ${executionMode} job ${existing.id} is ${ws} — creating fresh job`);
     }
+    // Blocked or failed — need a fresh job
+    logger.log(`[FullCourseWorker] ${executionMode} job ${existing.id} is ${ws} — creating fresh job`);
   }
 
   // Create a new child job
@@ -166,7 +160,7 @@ async function ensureChildJob(
         youtubeUploads: payload.youtubeUploads ?? [],
         options: {
           restoreFirst: true,
-          requireYoutubeUrls: payload.options?.requireYoutubeUrls ?? true,
+          requireYoutubeUrls: true,
         },
         metadata: { source: 'full_course_worker', parentJobId: parentJob.id },
       } as any);
@@ -178,14 +172,6 @@ async function ensureChildJob(
         h5pSnapshotArtifactId:      payload.h5pSnapshotArtifactId ?? null,
         audioWelcomeArtifactId:     payload.audioWelcomeArtifactId ?? null,
         audiobookArtifactId:        payload.audiobookArtifactId ?? null,
-        options: opts,
-        metadata: { source: 'full_course_worker', parentJobId: parentJob.id },
-      } as any);
-      res = r;
-    } else if (executionMode === 'backend_package_base') {
-      const r = await jobsService.createPackageBaseJob(ownerId, {
-        courseId,
-        contentSnapshotArtifactId: payload.contentSnapshotArtifactId ?? null,
         options: opts,
         metadata: { source: 'full_course_worker', parentJobId: parentJob.id },
       } as any);
@@ -224,69 +210,44 @@ async function waitForChildJob(
   maxWaitMs = 4 * 60 * 60 * 1000, // 4 hours max
 ): Promise<ChildJobResult> {
   const deadline = Date.now() + maxWaitMs;
-  const MAX_DB_ERRORS = 10;      // tolerate up to 10 consecutive DB failures (~5 min at 30s poll)
-  const DB_RETRY_MS  = 10_000;   // retry after 10s on DB error (faster than normal poll)
-  let consecutiveDbErrors = 0;
 
   while (Date.now() < deadline) {
     await sleep(pollMs);
     await heartbeatFn();
-
-    try {
-      if ((await jobsService.isJobCancelled(childJobId)) === true) {
-        return { ok: false, status: 'cancelled', outputSummary: {}, error: `Child job ${childJobId} cancelled` };
-      }
-
-      const job = await jobsService.findJobByIdInternal(childJobId);
-      if (!job) {
-        return { ok: false, status: 'not_found', outputSummary: {}, error: `Child job ${childJobId} not found` };
-      }
-
-      // Reset counter on any successful DB round-trip
-      consecutiveDbErrors = 0;
-
-      const ws = job.workerStatus || job.status || '';
-
-      if (DONE_STATUSES.has(ws)) {
-        return { ok: true, status: ws, outputSummary: job.outputSummary ?? {} };
-      }
-
-      if (FAILED_STATUSES.has(ws)) {
-        return { ok: false, status: ws, outputSummary: job.outputSummary ?? {}, error: job.errorMessage ?? 'job failed' };
-      }
-
-      if (ws === 'cancelled' || ws === 'cancelling') {
-        return { ok: false, status: 'cancelled', outputSummary: job.outputSummary ?? {}, error: job.errorMessage ?? 'job cancelled' };
-      }
-
-      if (BLOCKED_STATUSES.has(ws)) {
-        const phase = (job.outputSummary ?? {}).phase as string | undefined;
-        const blockStatus = phase === 'blocked_auth'  ? 'blocked_auth'
-                          : phase === 'blocked_quota' ? 'blocked_quota'
-                          : ws;
-        return { ok: false, status: blockStatus, outputSummary: job.outputSummary ?? {}, error: job.errorMessage ?? ws };
-      }
-
-      // Still running/queued/retrying — continue waiting
-      logger.log(`[FullCourseWorker] Waiting for child job ${childJobId} (${ws})...`);
-
-    } catch (dbErr: any) {
-      consecutiveDbErrors += 1;
-      logger.warn(
-        `[FullCourseWorker] DB error polling child job ${childJobId} ` +
-        `(${consecutiveDbErrors}/${MAX_DB_ERRORS}): ${dbErr?.message ?? dbErr}`,
-      );
-      if (consecutiveDbErrors >= MAX_DB_ERRORS) {
-        return {
-          ok: false,
-          status: 'db_error',
-          outputSummary: {},
-          error: `Lost DB connectivity while waiting for child job ${childJobId} after ${consecutiveDbErrors} consecutive errors`,
-        };
-      }
-      // Short retry delay instead of the full pollMs to recover faster
-      await sleep(DB_RETRY_MS);
+    if ((await jobsService.isJobCancelled(childJobId)) === true) {
+      return { ok: false, status: 'cancelled', outputSummary: {}, error: `Child job ${childJobId} cancelled` };
     }
+
+    const job = await jobsService.findJobByIdInternal(childJobId);
+    if (!job) {
+      return { ok: false, status: 'not_found', outputSummary: {}, error: `Child job ${childJobId} not found` };
+    }
+
+    const ws = job.workerStatus || job.status || '';
+
+    if (DONE_STATUSES.has(ws)) {
+      return { ok: true, status: ws, outputSummary: job.outputSummary ?? {} };
+    }
+
+    if (FAILED_STATUSES.has(ws)) {
+      return { ok: false, status: ws, outputSummary: job.outputSummary ?? {}, error: job.errorMessage ?? 'job failed' };
+    }
+
+    if (ws === 'cancelled' || ws === 'cancelling') {
+      return { ok: false, status: 'cancelled', outputSummary: job.outputSummary ?? {}, error: job.errorMessage ?? 'job cancelled' };
+    }
+
+    if (BLOCKED_STATUSES.has(ws)) {
+      // Detect YouTube block reason from outputSummary
+      const phase = (job.outputSummary ?? {}).phase as string | undefined;
+      const blockStatus = phase === 'blocked_auth'  ? 'blocked_auth'
+                        : phase === 'blocked_quota' ? 'blocked_quota'
+                        : ws;
+      return { ok: false, status: blockStatus, outputSummary: job.outputSummary ?? {}, error: job.errorMessage ?? ws };
+    }
+
+    // Still running/queued/retrying — continue waiting
+    logger.log(`[FullCourseWorker] Waiting for child job ${childJobId} (${ws})...`);
   }
 
   return { ok: false, status: 'timeout', outputSummary: {}, error: `Child job ${childJobId} timed out after ${maxWaitMs / 60000} min` };
@@ -315,23 +276,14 @@ async function handleFullCourseJob(
 
   let leaseLost = false;
   let finalized = false;
-  let consecutiveHeartbeatFailures = 0;
 
   // ── Heartbeat ─────────────────────────────────────────────────────────────
   const sendHeartbeat = async () => {
     if (finalized || leaseLost) return;
     try {
       const ok = await jobsService.heartbeatWorkerJob(jobId, workerId, leaseSeconds);
-      if (!ok) { leaseLost = true; logger.warn(`[FullCourseWorker] Lease lost for job ${jobId}`); return; }
-      consecutiveHeartbeatFailures = 0;
-    } catch (error) {
-      consecutiveHeartbeatFailures += 1;
-      logger.warn(`[FullCourseWorker] Heartbeat failed (${consecutiveHeartbeatFailures}/5) for job ${jobId}: ${error instanceof Error ? error.message : String(error)}`);
-      if (consecutiveHeartbeatFailures >= 5) {
-        leaseLost = true;
-        logger.error(`[FullCourseWorker] Heartbeat failed 5 consecutive times for job ${jobId}; declaring lease lost`);
-      }
-    }
+      if (!ok) { leaseLost = true; logger.warn(`[FullCourseWorker] Lease lost for job ${jobId}`); }
+    } catch { leaseLost = true; }
   };
   const heartbeatTimer = setInterval(() => { void sendHeartbeat(); }, heartbeatMs);
 
@@ -372,31 +324,14 @@ async function handleFullCourseJob(
 
     const existingMbz = await findLatestArtifact(artifactsService, ownerId, courseId, 'mbz_final');
     if (existingMbz) {
-      // Fase 3: skip artifacts that previously failed deep validation so a fresh
-      // package job can re-run instead of restoring a broken MBZ from cache.
-      const prevValidationStatus =
-        (existingMbz.metadata as Record<string, any> | null)?.validationStatus as string | undefined;
-
-      if (prevValidationStatus === 'failed') {
-        logger.log(
-          `[FullCourseWorker] Existing mbz_final (${existingMbz.id}) has validationStatus=failed — ` +
-          `skipping restore-first cache, proceeding with full re-generation`,
-        );
-        // Fall through to re-run the full pipeline
-      } else {
-        logger.log(
-          `[FullCourseWorker] mbz_final already exists (${existingMbz.id}, ` +
-          `validationStatus=${prevValidationStatus ?? 'legacy'}) — completing job`,
-        );
-        finalized = true;
-        await jobsService.completeFullCourseJob(jobId, workerId, {
-          mbzFinalArtifactId:  existingMbz.id,
-          restoredFromCache:   true,
-          validationStatus:    prevValidationStatus ?? 'legacy',
-          userMessage:         'Curso listo.',
-        });
-        return;
-      }
+      logger.log(`[FullCourseWorker] mbz_final already exists (${existingMbz.id}) — completing job`);
+      finalized = true;
+      await jobsService.completeFullCourseJob(jobId, workerId, {
+        mbzFinalArtifactId: existingMbz.id,
+        restoredFromCache: true,
+        userMessage: 'Curso listo.',
+      });
+      return;
     }
     if (leaseLost) return;
 
@@ -444,49 +379,6 @@ async function handleFullCourseJob(
         steps: { content: { status: 'completed', artifactId: contentSnapshotArtifactId } },
       });
     }
-
-    if (leaseLost) return;
-
-    // ── 1.5. Package base (curso base: contenido sin multimedia) ─────────────
-    // Non-blocking: if it fails the full pipeline continues normally.
-    await updateStep('package_base', 'Generando curso base…');
-    let mbzContentBaseArtifactId: string | null = null;
-    try {
-      const existingBase = await findLatestArtifact(artifactsService, ownerId, courseId, 'mbz_content_base');
-      if (existingBase) {
-        mbzContentBaseArtifactId = existingBase.id;
-        logger.log(`[FullCourseWorker] mbz_content_base already exists (${mbzContentBaseArtifactId})`);
-      } else {
-        const baseJobId = await ensureChildJob('backend_package_base', job, courseId, {
-          contentSnapshotArtifactId,
-        }, jobsService, logger);
-
-        if (baseJobId) {
-          if (leaseLost) return;
-          const baseResult = await waitForChildJob(baseJobId, jobsService, sendHeartbeat, logger);
-          if (leaseLost) return;
-
-          if (baseResult.ok) {
-            mbzContentBaseArtifactId =
-              (baseResult.outputSummary.mbzBase as Record<string,any> | undefined)?.artifactId ?? null;
-            if (!mbzContentBaseArtifactId) {
-              const art = await findLatestArtifact(artifactsService, ownerId, courseId, 'mbz_content_base');
-              mbzContentBaseArtifactId = art?.id ?? null;
-            }
-          } else {
-            logger.warn(`[FullCourseWorker] Base package failed — continuing without mbz_content_base: ${baseResult.error}`);
-          }
-        }
-      }
-    } catch (baseErr) {
-      const msg = baseErr instanceof Error ? baseErr.message : String(baseErr);
-      logger.warn(`[FullCourseWorker] Base package step error (non-fatal): ${msg}`);
-    }
-
-    // Update outputSummary mid-run so frontend can discover the base artifact immediately
-    await updateStep('package_base', mbzContentBaseArtifactId ? 'Curso base listo ✓' : 'Curso base no disponible', {
-      mbzContentBaseArtifactId,
-    });
 
     if (leaseLost) return;
 
@@ -650,7 +542,6 @@ async function handleFullCourseJob(
         contentSnapshotArtifactId,
         videoStateSnapshotArtifactId,
         youtubeUploads,
-        options: { requireYoutubeUrls: youtubeUploads.length > 0 },
       }, jobsService, logger);
 
       if (!h5pJobId) throw new Error('No se pudo crear el job de actividades interactivas');
@@ -733,34 +624,14 @@ async function handleFullCourseJob(
     }
 
     // ── Complete ──────────────────────────────────────────────────────────────
-    // Propagate validationStatus + warnings from package job so the frontend can gate 'ready' state
-    const mbzFinalArt = await findLatestArtifact(artifactsService, ownerId, courseId, 'mbz_final');
-    const mbzArtMeta  = (mbzFinalArt?.metadata as Record<string, any> | null) ?? {};
-    const mbzPkgMeta  = (packageResult.outputSummary.mbzFinal as Record<string, any> | undefined) ?? {};
-
-    const mbzValidationStatus: string =
-      (mbzArtMeta.validationStatus as string | undefined)
-      ?? (mbzPkgMeta.validationStatus  as string | undefined)
-      ?? 'legacy';
-
-    const mbzValidationWarnings: string[] =
-      (mbzArtMeta.validationWarnings as string[] | undefined)
-      ?? (mbzPkgMeta.validationWarnings as string[] | undefined)
-      ?? [];
-
     finalized = true;
     await jobsService.completeFullCourseJob(jobId, workerId, {
       mbzFinalArtifactId,
-      mbzContentBaseArtifactId,
       contentSnapshotArtifactId,
       audioWelcomeArtifactId,
       audiobookArtifactId,
       h5pSnapshotArtifactId,
-      validationStatus:   mbzValidationStatus,
-      validationWarnings: mbzValidationWarnings,
-      userMessage: mbzValidationStatus === 'warning'
-        ? 'Curso listo (con advertencias menores).'
-        : 'Curso listo.',
+      userMessage: 'Curso listo.',
     });
     await trackEvent('full_course_generation_completed', {
       units: 1,
@@ -835,25 +706,7 @@ async function bootstrap() {
 
   logger.log(`Full course worker started (workerId=${workerId}, pollMs=${pollMs}, leaseSeconds=${leaseSeconds}, dryRun=${dryRun})`);
 
-  // Recover zombie jobs at startup and then every ZOMBIE_RECOVERY_MS milliseconds.
-  const ZOMBIE_RECOVERY_MS = readPositiveInt('FULL_COURSE_ZOMBIE_RECOVERY_MS', 10 * 60 * 1000); // 10 min
-  let lastZombieRecovery = 0;
-
-  const runZombieRecovery = async () => {
-    lastZombieRecovery = Date.now();
-    await jobsService.recoverZombieJobs(workerId).catch((err) =>
-      logger.warn(`Zombie recovery skipped (DB unavailable): ${err.message}`),
-    );
-  };
-
-  await runZombieRecovery();
-
   while (!shuttingDown) {
-    // Periodic zombie recovery (every ZOMBIE_RECOVERY_MS) without interrupting active jobs
-    if (activeJobs.size === 0 && Date.now() - lastZombieRecovery >= ZOMBIE_RECOVERY_MS) {
-      await runZombieRecovery();
-    }
-
     const claimed = await jobsService.claimNextFullCourseJob(workerId, leaseSeconds);
 
     if (!claimed) {

@@ -191,7 +191,6 @@ async function bootstrap() {
     const jobId = job.id;
     let leaseLost = false;
     let heartbeatCount = 0;
-    let consecutiveHeartbeatFailures = 0;
     let finalized = false;
     const courseId = buildEffectiveCourseId(job);
     const parentJobId = job.inputPayload?.metadata?.parentJobId ?? null;
@@ -235,18 +234,13 @@ async function bootstrap() {
           logger.warn(`Lease lost for job ${jobId}; stopping processing`);
           return;
         }
-        consecutiveHeartbeatFailures = 0;
         heartbeatCount += 1;
         logger.log(`Heartbeat ${heartbeatCount} for job ${jobId}`);
       } catch (error) {
-        consecutiveHeartbeatFailures += 1;
-        logger.warn(
-          `Heartbeat failed (${consecutiveHeartbeatFailures}/5) for job ${jobId}: ${error instanceof Error ? error.message : String(error)}`,
+        leaseLost = true;
+        logger.error(
+          `Heartbeat failed for job ${jobId}: ${error instanceof Error ? error.message : String(error)}`,
         );
-        if (consecutiveHeartbeatFailures >= 5) {
-          leaseLost = true;
-          logger.error(`Heartbeat failed 5 consecutive times for job ${jobId}; declaring lease lost`);
-        }
       }
     };
 
@@ -354,10 +348,6 @@ async function bootstrap() {
         job.inputPayload as any,
         {
           onProgress: async (event: ContentGenerationProgressEvent) => {
-            // Abortar inmediatamente si el lease fue revocado (job cancelado)
-            if (leaseLost) {
-              throw new Error(`Job ${jobId} cancelled — aborting content generation`);
-            }
             aggregatedProgressMap[event.phase] = { done: event.done, total: event.total };
             const totalFilesGenerated = Object.values(aggregatedProgressMap).reduce(
               (sum, item) => sum + (item.done || 0),
@@ -446,26 +436,17 @@ async function bootstrap() {
         return;
       }
 
-      const genMode    = generated.summary?.mode ?? 'template';
-      const tokInput   = (generated.summary as any)?.tokensInput  ?? 0;
-      const tokOutput  = (generated.summary as any)?.tokensOutput ?? 0;
-      const hasClaude  = genMode === 'claude' && (tokInput > 0 || tokOutput > 0);
-
       await trackEvent('content_generation_completed', {
-        mode:          hasClaude ? 'real' : 'template',
-        provider:      hasClaude ? 'anthropic' : 'internal',
-        model:         hasClaude ? (process.env.CONTENT_MODEL ?? 'claude-sonnet-4-5') : 'template_v1',
-        component:     'content',
-        costType:      hasClaude ? 'estimated' : 'mock_zero',
-        costSource:    hasClaude ? 'configured_rate' : 'mock_zero',
-        tokensInput:   hasClaude ? tokInput  : undefined,
-        tokensOutput:  hasClaude ? tokOutput : undefined,
-        durationMs:    generated.summary?.durationMs ?? null,
+        mode: generated.summary?.mode === 'template' ? 'real' : 'unknown',
+        costType: 'unknown',
+        units: finalSummary.fileCount ?? Object.keys(generated.F || {}).length,
+        unitType: 'per_operation',
+        durationMs: generated.summary?.durationMs ?? null,
         metadata: {
-          artifactId:     artifact.id,
-          fileCount:      finalSummary.fileCount ?? 0,
-          generationMode: genMode,
-          progressMap:    generated.summary?.progressMap ?? aggregatedProgressMap,
+          artifactId: artifact.id,
+          fileCount: finalSummary.fileCount ?? 0,
+          generationMode: generated.summary?.mode ?? 'template',
+          progressMap: generated.summary?.progressMap ?? aggregatedProgressMap,
         },
       });
       logger.log(`Real content generation completed for job ${jobId} with artifact ${artifact.id}`);
@@ -494,25 +475,7 @@ async function bootstrap() {
     }
   }
 
-  // Recover zombie jobs at startup and then every ZOMBIE_RECOVERY_MS milliseconds.
-  const ZOMBIE_RECOVERY_MS = readPositiveInt('CONTENT_ZOMBIE_RECOVERY_MS', 10 * 60 * 1000); // 10 min
-  let lastZombieRecovery = 0;
-
-  const runZombieRecovery = async () => {
-    lastZombieRecovery = Date.now();
-    await jobsService.recoverZombieJobs(workerId).catch((err) =>
-      logger.warn(`Zombie recovery skipped (DB unavailable): ${err.message}`),
-    );
-  };
-
-  await runZombieRecovery();
-
   while (!shuttingDown) {
-    // Periodic zombie recovery (every ZOMBIE_RECOVERY_MS) when worker is idle
-    if (activeJobs.size === 0 && Date.now() - lastZombieRecovery >= ZOMBIE_RECOVERY_MS) {
-      await runZombieRecovery();
-    }
-
     while (!shuttingDown && activeJobs.size < concurrency) {
       const claimed = await jobsService.claimNextBackendContentJob(workerId, leaseSeconds);
       if (!claimed) break;

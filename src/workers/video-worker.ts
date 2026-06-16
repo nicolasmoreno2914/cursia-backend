@@ -909,7 +909,6 @@ async function bootstrap() {
         parentJobId,
         component: 'video',
         provider: 'video_engine',
-        service: 'video_generation',                   // requerido por resolveCostEstimate
         model: process.env.VIDEOGEN_MODEL || 'videogen_default',
         mode: mockVideogen ? 'mock' : 'real',
         costType: extra.costType ?? (mockVideogen ? 'mock_zero' : 'estimated'),
@@ -1095,7 +1094,6 @@ async function bootstrap() {
         parentJobId,
         component: 'video',
         provider: 'video_engine',
-        service: 'video_generation',                   // requerido por resolveCostEstimate
         model: process.env.VIDEOGEN_MODEL || 'videogen_default',
         mode: dryRun ? 'dry_run' : (mockVideogen ? 'mock' : 'real'),
         costType: extra.costType ?? (dryRun || mockVideogen ? 'mock_zero' : 'estimated'),
@@ -1176,8 +1174,8 @@ async function bootstrap() {
         return;
       }
 
-      if (!realVideogenEnabled && !mockVideogen) {
-        throw new Error('Set VIDEO_WORKER_ENABLE_REAL_VIDEOGEN=true (or VIDEO_WORKER_MOCK_VIDEOGEN=true for testing).');
+      if (!realVideogenEnabled) {
+        throw new Error('Set VIDEO_WORKER_ENABLE_REAL_VIDEOGEN=true and VIDEO_WORKER_DRY_RUN=false.');
       }
 
       // ── Detect phase: submit or resume polling ──────────────────────────────

@@ -26,7 +26,7 @@ export class Artifact {
   @Column({ type: 'text' })
   type: string;
   // content_snapshot | audio_welcome | audiobook | h5p_snapshot
-  // mbz_final | mbz_content_base | diagnostic | video_manifest
+  // mbz_final | diagnostic | video_manifest
 
   @Column({ name: 'storage_provider', length: 50, default: 'supabase' })
   storageProvider: string;

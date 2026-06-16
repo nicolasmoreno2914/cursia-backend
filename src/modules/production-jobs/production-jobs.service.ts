@@ -34,7 +34,6 @@ const CANCELLABLE_CHILD_EXECUTION_MODES = new Set([
   'backend_videos',
   'backend_h5p',
   'backend_package',
-  'backend_package_base',
 ]);
 const CANCELLABLE_ACTIVE_STATUSES = new Set([
   'queued',
@@ -1828,70 +1827,13 @@ export class ProductionJobsService {
     return { ok:true, jobId:saved.id, status:saved.status, workerStatus:saved.workerStatus, executionMode:saved.executionMode, currentStep:saved.currentStep };
   }
 
-  async createPackageBaseJob(
-    ownerId: string,
-    dto: CreatePackageJobDto,
-  ): Promise<PackageJobCreatedResponse> {
-    if (!dto.courseId) throw new BadRequestException('courseId is required');
-    if (!dto.contentSnapshotArtifactId) throw new BadRequestException('contentSnapshotArtifactId is required');
-
-    const rawCourseId     = dto.courseId;
-    const numericCourseId = rawCourseId ? parseInt(rawCourseId, 10) : NaN;
-    const activeStatuses  = ['queued', 'running', 'retrying'];
-
-    const qb = this.jobRepo.createQueryBuilder('job')
-      .where('job.owner_id = :ownerId', { ownerId })
-      .andWhere('job.execution_mode = :executionMode', { executionMode: 'backend_package_base' })
-      .andWhere('job.worker_status IN (:...activeStatuses)', { activeStatuses });
-    if (!isNaN(numericCourseId)) {
-      qb.andWhere('(job.course_id = :courseId OR job.frontend_course_id = :frontendCourseId)', { courseId: numericCourseId, frontendCourseId: rawCourseId });
-    } else {
-      qb.andWhere('job.frontend_course_id = :frontendCourseId', { frontendCourseId: rawCourseId });
-    }
-    const activeExisting = await qb.getOne();
-    if (activeExisting) {
-      return { ok:true, jobId:activeExisting.id, status:activeExisting.status, workerStatus:activeExisting.workerStatus, executionMode:activeExisting.executionMode, currentStep:activeExisting.currentStep };
-    }
-
-    const sanitized = this.sanitizePayload({
-      courseId:                  rawCourseId,
-      executionMode:             'backend_package_base',
-      contentSnapshotArtifactId: dto.contentSnapshotArtifactId,
-      options:                   dto.options ?? {},
-      metadata:                  dto.metadata ?? {},
-    });
-
-    const job = this.jobRepo.create({
-      ownerId,
-      courseId:        !isNaN(numericCourseId) ? numericCourseId : null,
-      frontendCourseId: rawCourseId,
-      frontendJobId:    dto.frontendJobId ?? null,
-      options:          dto.options ?? {},
-      status:           'queued',
-      currentStep:      'package',
-      progress:         0,
-      executionMode:    'backend_package_base',
-      workerStatus:     'queued',
-      inputPayload:     sanitized,
-      outputSummary:    {},
-    });
-    const saved = await this.jobRepo.save(job);
-
-    let step = await this.stepRepo.findOne({ where: { jobId: saved.id, stepKey: 'package' } });
-    if (!step) step = this.stepRepo.create({ jobId: saved.id, stepKey: 'package' });
-    step.status = 'queued'; step.progress = 0; step.detail = 'Esperando worker de empaquetado (curso base)';
-    await this.stepRepo.save(step);
-
-    return { ok:true, jobId:saved.id, status:saved.status, workerStatus:saved.workerStatus, executionMode:saved.executionMode, currentStep:saved.currentStep };
-  }
-
   async claimNextBackendPackageJob(workerId: string, leaseSeconds: number): Promise<ProductionJob | null> {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
     try {
       const candidates = await queryRunner.query(
-        `SELECT id FROM production_jobs WHERE execution_mode IN ('backend_package','backend_package_base')
+        `SELECT id FROM production_jobs WHERE execution_mode = 'backend_package'
          AND worker_status IN ('queued','retrying')
          AND (next_retry_at IS NULL OR next_retry_at <= NOW())
          AND (lease_until IS NULL OR lease_until < NOW())
@@ -2572,17 +2514,6 @@ export class ProductionJobsService {
     }
   }
 
-  // Progress % assigned when each orchestrator step starts — never regresses.
-  private static readonly FULL_COURSE_STEP_PROGRESS: Record<string, number> = {
-    checking_existing: 2,
-    content:           3,   // range 3–35; updated granularly by child progress
-    package_base:      35,  // range 35–42
-    audio:             42,  // range 42–55; updated granularly by child progress
-    video:             55,  // range 55–78
-    h5p:               78,  // range 78–88
-    package:           88,  // range 88–96
-  };
-
   async updateFullCourseStep(
     jobId: string,
     workerId: string,
@@ -2597,12 +2528,6 @@ export class ProductionJobsService {
     job.status = 'running';
     job.workerStatus = 'running';
     job.currentStep = step;
-
-    const stepPct = ProductionJobsService.FULL_COURSE_STEP_PROGRESS[step] ?? -1;
-    if (stepPct > 0 && (job.progress ?? 0) < stepPct) {
-      job.progress = stepPct;
-    }
-
     if (partialSummary) {
       job.outputSummary = { ...(job.outputSummary ?? {}), ...partialSummary, updatedAt: new Date().toISOString() };
     }
@@ -2801,81 +2726,5 @@ export class ProductionJobsService {
     if (dto.detail !== undefined)     step.detail     = dto.detail;
 
     await this.stepRepo.save(step);
-  }
-
-  // ────────────────────────────────────────────────────────────────────────────
-  // Zombie-job recovery
-  // Called at worker startup. Finds jobs that are still marked `running` but
-  // whose lease expired (+ 5 min grace), meaning no worker is actually
-  // processing them. Marks them as `failed` so the UI shows an honest state
-  // instead of a perpetual "Generating…" spinner.
-  // Returns the number of jobs recovered.
-  // ────────────────────────────────────────────────────────────────────────────
-  async recoverZombieJobs(recoveringWorkerId: string): Promise<number> {
-    const GRACE_MINUTES = 5;
-    const STALE_MINUTES = 30; // for null-lease zombies: no update in 30 min = dead
-
-    // Case A: lease expired — worker crashed mid-flight, never wrote final status.
-    const expiredLease: { id: string }[] = await this.dataSource.query(
-      `
-      UPDATE production_jobs
-      SET
-        status        = 'failed',
-        worker_status = 'failed',
-        finished_at   = COALESCE(finished_at, NOW()),
-        lease_until   = NULL,
-        error_message = 'Job recovered from zombie state: lease expired with no active worker (DB connection loss or worker crash)',
-        updated_at    = NOW()
-      WHERE status = 'running'
-        AND finished_at IS NULL
-        AND lease_until IS NOT NULL
-        AND lease_until < NOW() - ($1 * INTERVAL '1 minute')
-      RETURNING id
-      `,
-      [GRACE_MINUTES],
-    );
-
-    // Case B: finished_at set but status still running — cancel/fail wrote partial fields.
-    const partialCancel: { id: string }[] = await this.dataSource.query(
-      `
-      UPDATE production_jobs
-      SET
-        status        = 'cancelled',
-        worker_status = 'cancelled',
-        lease_until   = NULL,
-        updated_at    = NOW()
-      WHERE status = 'running'
-        AND finished_at IS NOT NULL
-      RETURNING id
-      `,
-    );
-
-    // Case C: lease is NULL and no update for > STALE_MINUTES — frontend zombie or very old orphan.
-    const nullLease: { id: string }[] = await this.dataSource.query(
-      `
-      UPDATE production_jobs
-      SET
-        status        = 'failed',
-        worker_status = 'failed',
-        finished_at   = COALESCE(finished_at, NOW()),
-        error_message = 'Job recovered from zombie state: no lease and no heartbeat for ${STALE_MINUTES}+ minutes',
-        updated_at    = NOW()
-      WHERE status = 'running'
-        AND finished_at IS NULL
-        AND lease_until IS NULL
-        AND updated_at < NOW() - ($1 * INTERVAL '1 minute')
-      RETURNING id
-      `,
-      [STALE_MINUTES],
-    );
-
-    const total = expiredLease.length + partialCancel.length + nullLease.length;
-    if (total > 0) {
-      this.logger.warn(
-        `[${recoveringWorkerId}] Recovered ${total} zombie job(s): ` +
-        `${expiredLease.length} expired-lease, ${partialCancel.length} partial-cancel, ${nullLease.length} null-lease-stale`,
-      );
-    }
-    return total;
   }
 }

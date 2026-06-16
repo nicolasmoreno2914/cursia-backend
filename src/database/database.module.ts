@@ -29,17 +29,6 @@ import { Artifact } from '../modules/artifacts/entities/artifact.entity';
         ssl: config.get<string>('DB_SSL', 'false') === 'true'
           ? { rejectUnauthorized: false }
           : false,
-        retryAttempts: 10,
-        retryDelay: 3000,
-        extra: {
-          family: 4,                       // Forzar IPv4 — evita ETIMEDOUT en IPv6 hacia Supabase
-          keepAlive: true,
-          keepAliveInitialDelayMillis: 10000,
-          max: 5,
-          min: 0,
-          idleTimeoutMillis: 30000,        // Liberar conexiones idle antes de que Supabase las cierre (~60s)
-          connectionTimeoutMillis: 10000,
-        },
       }),
     }),
   ],
