@@ -348,6 +348,7 @@ async function handleAudioJob(
       parentJobId,
       component: extra.component ?? 'audio',
       provider: extra.provider ?? 'openai_tts',
+      service: extra.service ?? undefined,
       model: extra.model ?? model,
       mode: extra.mode ?? 'real',
       costType: extra.costType ?? 'unknown',
@@ -442,6 +443,7 @@ async function handleAudioJob(
           await trackEvent('welcome_audio_completed', {
             component: 'audio',
             provider: 'openai_tts',
+            service: 'audio_generation',
             model,
             mode: 'real',
             costType: 'estimated',
@@ -535,6 +537,22 @@ async function handleAudioJob(
             const segments = splitText(script, TTS_MAX_CHARS);
 
             logger.log(`[AudioWorker] Audiobook: ${segments.length} TTS segments`);
+            // Registro de costo del guion (OpenAI chat) — independiente del TTS
+            await trackEvent('audiobook_script_completed', {
+              component: 'audiobook',
+              provider: 'openai',
+              service: 'chat_completion',
+              model: scriptResult.model,
+              mode: 'real',
+              costType: 'estimated',
+              costSource: 'configured_rate',
+              tokensInput: audiobookPromptTokens,
+              tokensOutput: audiobookCompletionTokens,
+              metadata: {
+                scriptChars: script.length,
+                segments: segments.length,
+              },
+            });
             await updateProgress({
               phase: 'generating_audiobook',
               message: `Generando audiolibro (${segments.length} segmentos)…`,
@@ -611,13 +629,12 @@ async function handleAudioJob(
             };
             await trackEvent('audiobook_completed', {
               component: 'audiobook',
-              provider: 'openai',
-              model: 'gpt-4o-mini',
+              provider: 'openai_tts',
+              service: 'audio_generation',
+              model,
               mode: 'real',
               costType: 'estimated',
               costSource: 'configured_rate',
-              tokensInput: audiobookPromptTokens,
-              tokensOutput: audiobookCompletionTokens,
               units: audiobookTtsChars,
               unitType: 'per_1k_characters',
               metadata: {
