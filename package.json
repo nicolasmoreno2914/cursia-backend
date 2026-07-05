@@ -19,6 +19,8 @@
     "start:package-worker:dev": "ts-node src/workers/package-worker.ts",
     "start:full-worker": "node dist/workers/full-course-worker.js",
     "start:full-worker:dev": "ts-node src/workers/full-course-worker.ts",
+    "start:brand-worker": "node dist/workers/brand-extraction-worker.js",
+    "start:brand-worker:dev": "ts-node src/workers/brand-extraction-worker.ts",
     "start:dev": "ts-node-dev --respawn --transpile-only src/main.ts",
     "start:debug": "ts-node-dev --inspect --respawn --transpile-only src/main.ts",
     "start:prod": "node dist/main.js",
@@ -30,6 +32,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.110.0",
     "@nestjs/common": "^11.1.21",
     "@nestjs/config": "^4.0.4",
     "@nestjs/core": "^11.1.21",

@@ -5,9 +5,12 @@ import {
   CreateDateColumn,
   UpdateDateColumn,
   OneToMany,
+  ManyToOne,
+  JoinColumn,
   Index,
 } from 'typeorm';
 import { CourseVersion } from '../../course-versions/entities/course-version.entity';
+import { Institution } from '../../institutions/entities/institution.entity';
 
 @Entity('courses')
 export class Course {
@@ -23,6 +26,15 @@ export class Course {
   /** Email del propietario al momento de crear el curso (denormalizado para consultas) */
   @Column({ name: 'owner_email', length: 255, nullable: true })
   ownerEmail: string;
+
+  /** Institución a la que pertenece el curso (opcional — habilita el brand kit "Mi Marca") */
+  @Index()
+  @Column({ name: 'institution_id', type: 'uuid', nullable: true })
+  institutionId: string;
+
+  @ManyToOne(() => Institution, { onDelete: 'SET NULL', nullable: true })
+  @JoinColumn({ name: 'institution_id' })
+  institution: Institution;
 
   @Column({ length: 255 })
   title: string;

@@ -15,6 +15,8 @@ import { ProductionJobsModule } from './modules/production-jobs/production-jobs.
 import { ArtifactsModule } from './modules/artifacts/artifacts.module';
 import { ContentGenerationModule } from './modules/content-generation/content-generation.module';
 import { PackageModule } from './package/package.module';
+import { InstitutionsModule } from './modules/institutions/institutions.module';
+import { BrandProfilesModule } from './modules/brand-profiles/brand-profiles.module';
 
 @Module({
   imports: [
@@ -35,6 +37,8 @@ import { PackageModule } from './package/package.module';
     VideoEngineModule,
     TtsModule,
     PackageModule,
+    InstitutionsModule,
+    BrandProfilesModule,
   ],
   controllers: [AppController],
   providers: [AppService],

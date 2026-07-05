@@ -10,6 +10,8 @@ import { TraditionalCostBenchmark } from '../admin/entities/traditional-cost-ben
 import { ProductionJob } from '../modules/production-jobs/entities/production-job.entity';
 import { ProductionStep } from '../modules/production-jobs/entities/production-step.entity';
 import { Artifact } from '../modules/artifacts/entities/artifact.entity';
+import { Institution } from '../modules/institutions/entities/institution.entity';
+import { BrandProfile } from '../modules/brand-profiles/entities/brand-profile.entity';
 
 @Module({
   imports: [
@@ -23,7 +25,7 @@ import { Artifact } from '../modules/artifacts/entities/artifact.entity';
         username: config.get<string>('DB_USER', 'postgres'),
         password: config.get<string>('DB_PASS', 'postgres'),
         database: config.get<string>('DB_NAME', 'orbia'),
-        entities: [Course, CourseVersion, YoutubeConnection, UsageEvent, CostRate, TraditionalCostBenchmark, ProductionJob, ProductionStep, Artifact],
+        entities: [Course, CourseVersion, YoutubeConnection, UsageEvent, CostRate, TraditionalCostBenchmark, ProductionJob, ProductionStep, Artifact, Institution, BrandProfile],
         synchronize: config.get<string>('NODE_ENV', 'development') === 'development',
         logging: config.get<string>('DB_LOGGING', 'false') === 'true',
         ssl: config.get<string>('DB_SSL', 'false') === 'true'
