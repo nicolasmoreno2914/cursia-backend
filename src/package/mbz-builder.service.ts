@@ -943,8 +943,20 @@ export class MbzBuilderService {
 
         // ── HTML activities (labels, pages, audio, HVP) ───────────────────────
         } else if (isHtml) {
-          const hvpSentinel = F[fn] && F[fn].match(/^<!-- HVP:(\d+) -->$/);
-          const hvpCapN     = hvpSentinel ? parseInt(hvpSentinel[1]) : null;
+          // Acepta tanto el sentinel "bare" (sin diseño, se usa la intro genérica)
+          // como el sentinel seguido del HTML de diseño generado por IA (caso normal
+          // cuando ya hay un video real: processMedia antepone el sentinel al diseño
+          // existente en vez de reemplazarlo). Antes solo se aceptaba el match exacto,
+          // por lo que el diseño real nunca se detectaba ni se preservaba.
+          const hvpSentinelMatch = F[fn] && F[fn].match(/^<!-- HVP:(\d+) -->/);
+          const hvpCapN          = hvpSentinelMatch ? parseInt(hvpSentinelMatch[1]) : null;
+          const hvpDesignHtml    = hvpCapN !== null
+            ? (F[fn] ?? '')
+                .replace(/^<!-- HVP:\d+ -->/, '')
+                .replace(/<iframe\b[\s\S]*?<\/iframe>/gi, '')
+                .replace(/<script\b[\s\S]*?<\/script>/gi, '')
+                .trim()
+            : '';
           const isAudioBv   = fn === 'seccion0_audio_bienvenida.html';
           const isAudioAl   = fn === 'seccion1_audiolibro.html';
           const audioBuffer = isAudioBv ? (input.audioWelcome ?? null)
@@ -1002,9 +1014,13 @@ export class MbzBuilderService {
             const capNameStr  = hd.capName ?? `Capítulo ${hvpCapN}`;
 
             // ── 1. Intro label (design context before the video) ────────────
+            // Preferir el diseño real generado por IA (cap{N}_video_interactivo.html,
+            // capturado en hvpDesignHtml) — solo cae al template genérico cuando el
+            // sentinel vino "bare" (sin diseño, p.ej. video subido antes de generar contenido).
             const introAid  = actId++; const introMid = modId++;
             const introTitle = `📖 Capítulo ${hvpCapN}${hd.capName ? ' — ' + hd.capName : ''}`;
-            const introContent = hvpIntroHtml(hvpCapN, capNameStr, hvpModIdx, hvpModName, hvpModHex, hvpModAc, nombre);
+            const introContent = hvpDesignHtml
+              || hvpIntroHtml(hvpCapN, capNameStr, hvpModIdx, hvpModName, hvpModHex, hvpModAc, nombre);
             const introDir = `activities/label_${introMid}`;
             zip.file(introDir + '/label.xml',  labelXml(introAid, introMid, introTitle, introContent));
             zip.file(introDir + '/module.xml',  moduleXml(introMid, 'label', sec.num));
