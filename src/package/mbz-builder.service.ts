@@ -111,6 +111,21 @@ export class MbzBuilderService {
         .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
+    /**
+     * Recorta un nombre de actividad para que quepa en la columna `name`
+     * (VARCHAR(255)) que Moodle usa en scorm/label/quiz/resource. Sin este
+     * recorte, capítulos con títulos muy detallados generan nombres de
+     * actividad >255 caracteres que Moodle rechaza al restaurar (MySQL en
+     * modo estricto) — el import se queda "procesando" sin completar nunca.
+     */
+    function safeActivityName(name: string, max = 240): string {
+      if (!name || name.length <= max) return name;
+      let cut = name.substring(0, max);
+      const lastSpace = cut.lastIndexOf(' ');
+      if (lastSpace > max * 0.6) cut = cut.substring(0, lastSpace);
+      return cut.replace(/[\s—\-:,]+$/, '') + '…';
+    }
+
     function friendlyName(fn: string): string {
       const capMap: Record<number, string> = {};
       caps.forEach((c: any) => { if (c.n != null && c.t) capMap[Number(c.n)] = c.t; });
@@ -123,7 +138,7 @@ export class MbzBuilderService {
       if (fn === 'seccion1_audiolibro.html')        return '📻 Audiolibro del Curso';
       if (fn === 'examen_final_descripcion.html')   return 'ℹ️ Información: Examen Final';
       const vm = fn.match(/^cap(\d+)_video_interactivo\.html$/);
-      if (vm) { const n = parseInt(vm[1]); return `▶️ Cap. ${n} — Video: ${capMap[n] ?? 'Capítulo ' + n}`; }
+      if (vm) { const n = parseInt(vm[1]); return safeActivityName(`▶️ Cap. ${n} — Video: ${capMap[n] ?? 'Capítulo ' + n}`); }
       const sm = fn.match(/^cap(\d+)_descripcion_actividad\.html$/);
       if (sm) { const n = parseInt(sm[1]); return `🎮 Cap. ${n} — Actividad Gamificada`; }
       const em = fn.match(/^examen_unidad(\d+)_descripcion\.html$/);
@@ -677,6 +692,7 @@ export class MbzBuilderService {
           const gradeItemId = 9000 + mid;
           let actName = `🎮 Actividad Interactiva Cap ${capNStr}`;
           if (caps[capIdx2 - 1]) actName += ` — ${caps[capIdx2 - 1].t}`;
+          actName = safeActivityName(actName);
 
           const xmlFn        = fn.replace('_index.html', '_manifest.xml');
           const scormZipName = `scorm_cap${capNStr}.zip`;
@@ -1003,7 +1019,7 @@ export class MbzBuilderService {
 
             // ── 1. Intro label (design context before the video) ────────────
             const introAid  = actId++; const introMid = modId++;
-            const introTitle = `📖 Capítulo ${hvpCapN}${hd.capName ? ' — ' + hd.capName : ''}`;
+            const introTitle = safeActivityName(`📖 Capítulo ${hvpCapN}${hd.capName ? ' — ' + hd.capName : ''}`);
             const introContent = hvpIntroHtml(hvpCapN, capNameStr, hvpModIdx, hvpModName, hvpModHex, hvpModAc, nombre);
             const introDir = `activities/label_${introMid}`;
             zip.file(introDir + '/label.xml',  labelXml(introAid, introMid, introTitle, introContent));
@@ -1020,7 +1036,7 @@ export class MbzBuilderService {
             // ── 2. HVP (minimal intro — design is in the preceding label) ───
             const aid     = actId++; const mid = modId++;
             const hvpCtx  = ctxId++;
-            const hvpTitle = `🎥 Video Interactivo Cap ${hvpCapN}${hd.capName ? ' — ' + hd.capName : ''}`;
+            const hvpTitle = safeActivityName(`🎥 Video Interactivo Cap ${hvpCapN}${hd.capName ? ' — ' + hd.capName : ''}`);
             const dir = `activities/hvp_${mid}`;
             // Minimal intro: just the chapter name (the full design is in the intro label)
             const minimalIntro = `<p style="font-family:'Segoe UI',Arial,sans-serif;font-size:13px;color:rgba(226,230,243,.6);margin:0;">${xmlEsc(capNameStr)}</p>`;
