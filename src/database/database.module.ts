@@ -31,6 +31,21 @@ import { BrandProfile } from '../modules/brand-profiles/entities/brand-profile.e
         ssl: config.get<string>('DB_SSL', 'false') === 'true'
           ? { rejectUnauthorized: false }
           : false,
+        // Resiliencia de conexión: los crashes observados en producción ("Fatal
+        // bootstrap error: ECONNRESET/ETIMEDOUT") ocurren durante el arranque del
+        // proceso — retryAttempts/retryDelay reintentan el bootstrap en vez de
+        // matar el proceso al primer timeout transitorio de Supabase. El resto de
+        // `extra` reduce conexiones idle que Supabase puede cortar del lado servidor.
+        retryAttempts: 10,
+        retryDelay: 3000,
+        extra: {
+          max: 5,
+          min: 0,
+          keepAlive: true,
+          keepAliveInitialDelayMillis: 10000,
+          idleTimeoutMillis: 20000,
+          connectionTimeoutMillis: 10000,
+        },
       }),
     }),
   ],
