@@ -164,7 +164,7 @@ function buildNormalizedCourseData(rawCourseData: Record<string, any>): Normaliz
     nombre: normalizeText(rawCourseData?.nombre, 'Curso Cursia'),
     comp: normalizeText(rawCourseData?.comp, 'Competencia principal del curso'),
     pais: normalizeText(rawCourseData?.pais, 'Colombia'),
-    ciudad: normalizeText(rawCourseData?.ciudad, 'Bogota'),
+    ciudad: String(rawCourseData?.ciudad ?? '').trim(),
     sector: normalizeText(rawCourseData?.sector, 'Formacion'),
     mid: normalizeText(rawCourseData?.mid, 'MID'),
     lms: normalizeText(rawCourseData?.lms, 'Moodle'),
