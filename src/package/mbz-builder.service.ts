@@ -534,6 +534,12 @@ export class MbzBuilderService {
             }
             if (opts.length) questions.push({ type:'multichoice', name, text:qText, options:opts });
           }
+        } else if (ansBlock.length > 0 && ansBlock.indexOf('\n') < 0 && ansBlock.length < 150) {
+          // Fallback: a veces la IA omite el "=" delante de la respuesta en completar
+          // (ej. "{precisión}" en vez de "{=precisión}") — sin esto la pregunta no
+          // matchea ninguna rama y se pierde en silencio. Se toma como respuesta única.
+          if (qTextAfter) qText = (qText + ' _____ ' + qTextAfter).trim();
+          questions.push({ type:'shortanswer', name, text:qText, answers:[ansBlock] });
         }
         i++;
       }
