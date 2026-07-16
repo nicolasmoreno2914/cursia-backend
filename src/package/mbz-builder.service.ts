@@ -498,9 +498,30 @@ export class MbzBuilderService {
           if (ansBlock.indexOf('~') < 0) {
             // Completar: el blank puede ir a mitad de frase — reconstruye el texto completo
             // en vez de descartar todo lo que sigue después de "}".
-            if (qTextAfter) qText = (qText + ' _____ ' + qTextAfter).trim();
-            const saAnswers = ansBlock.split('=').map(l => l.trim().replace(/\}+$/, '')).filter(l => l.length > 0);
-            if (saAnswers.length) questions.push({ type:'shortanswer', name, text:qText, answers:saAnswers });
+            // Si hay más de un blank en la misma pregunta (ej. "El {=a =b} de {=c =d}."),
+            // solo el primero queda interactivo; los siguientes se resuelven con su
+            // primera respuesta como texto fijo — Moodle shortanswer no soporta 2+ blanks.
+            const braceGroups: Array<{start:number;end:number;inner:string}> = [];
+            const bgRe = /\{([^{}]*)\}/g;
+            let bgm: RegExpExecArray | null;
+            while ((bgm = bgRe.exec(fullLine))) braceGroups.push({ start: bgm.index, end: bgRe.lastIndex, inner: bgm[1] });
+            if (braceGroups.length > 1) {
+              let rebuilt = '', cursor = 0, firstAnswers: string[] | null = null;
+              for (let gi = 0; gi < braceGroups.length; gi++) {
+                const g = braceGroups[gi];
+                rebuilt += fullLine.substring(cursor, g.start);
+                const alts = g.inner.split('=').map(s => s.trim()).filter(s => s.length > 0);
+                if (gi === 0) { rebuilt += '_____'; firstAnswers = alts; }
+                else { rebuilt += (alts[0] || ''); }
+                cursor = g.end;
+              }
+              rebuilt += fullLine.substring(cursor);
+              if (firstAnswers && firstAnswers.length) questions.push({ type:'shortanswer', name, text: rebuilt.trim(), answers: firstAnswers });
+            } else {
+              if (qTextAfter) qText = (qText + ' _____ ' + qTextAfter).trim();
+              const saAnswers = ansBlock.split('=').map(l => l.trim().replace(/\}+$/, '')).filter(l => l.length > 0);
+              if (saAnswers.length) questions.push({ type:'shortanswer', name, text:qText, answers:saAnswers });
+            }
           } else {
             const opts: Array<{text:string;correct:boolean}> = [];
             for (const ol of ansBlock.split('\n')) {
