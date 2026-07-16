@@ -467,6 +467,9 @@ export class MbzBuilderService {
         while (i + 1 < lines.length && lines[i + 1].trim() && lines[i + 1].trim().charAt(0) !== ':') {
           i++; fullLine += '\n' + lines[i].trim();
         }
+        // Normalizar llaves dobles ({{...}}) que la IA a veces genera en vez de {...} —
+        // sin esto ansBlock empieza con "{" y la pregunta se descarta en ninguna rama.
+        fullLine = fullLine.replace(/\{\{+/g, '{').replace(/\}\}+/g, '}');
         const braceStart = fullLine.indexOf('{');
         const braceEnd   = fullLine.lastIndexOf('}');
         if (braceStart < 0 || braceEnd < 0) { i++; continue; }
