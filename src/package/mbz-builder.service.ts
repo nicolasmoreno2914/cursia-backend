@@ -471,12 +471,15 @@ export class MbzBuilderService {
         const braceEnd   = fullLine.lastIndexOf('}');
         if (braceStart < 0 || braceEnd < 0) { i++; continue; }
         let qText = fullLine.substring(0, braceStart).trim();
+        const qTextAfter = fullLine.substring(braceEnd + 1).trim();
         if (!qText && name) qText = name;
         const ansBlock = fullLine.substring(braceStart + 1, braceEnd).trim();
+        // Tolerar variantes de flecha del modelo (→, ⟶, -->) en emparejamiento
+        const ansBlockArrows = ansBlock.replace(/→|⟶|-{1,2}>/g, '->');
 
-        if (ansBlock.indexOf('->') >= 0) {
+        if (ansBlockArrows.indexOf('->') >= 0) {
           const pairs: Array<{q:string;a:string}> = [];
-          for (const ml of ansBlock.split('\n')) {
+          for (const ml of ansBlockArrows.split('\n')) {
             const m = ml.trim();
             if (m.charAt(0) === '=') {
               const parts = m.substring(1).split('->');
@@ -486,9 +489,17 @@ export class MbzBuilderService {
           if (pairs.length) questions.push({ type:'match', name, text:qText, pairs });
         } else if (['TRUE','FALSE','T','F','VERDADERO','FALSO'].includes(ansBlock)) {
           questions.push({ type:'truefalse', name, text:qText, answer: ['TRUE','T','VERDADERO'].includes(ansBlock) });
+        } else if (/^#/.test(ansBlock)) {
+          // Numérica {#valor:tolerancia} — sin tipo 'numerical' propio todavía, se guarda
+          // como shortanswer con el valor exacto para reusar el XML ya probado en Moodle.
+          const numMatch = ansBlock.match(/^#\s*([\d.\-]+)/);
+          if (numMatch) questions.push({ type:'shortanswer', name, text:qText, answers:[numMatch[1]] });
         } else if (ansBlock.indexOf('~') >= 0 || ansBlock.indexOf('=') === 0) {
           if (ansBlock.indexOf('~') < 0) {
-            const saAnswers = ansBlock.split('\n').map(l => l.trim()).filter(l => l.charAt(0) === '=').map(l => l.substring(1).trim());
+            // Completar: el blank puede ir a mitad de frase — reconstruye el texto completo
+            // en vez de descartar todo lo que sigue después de "}".
+            if (qTextAfter) qText = (qText + ' _____ ' + qTextAfter).trim();
+            const saAnswers = ansBlock.split('=').map(l => l.trim().replace(/\}+$/, '')).filter(l => l.length > 0);
             if (saAnswers.length) questions.push({ type:'shortanswer', name, text:qText, answers:saAnswers });
           } else {
             const opts: Array<{text:string;correct:boolean}> = [];
