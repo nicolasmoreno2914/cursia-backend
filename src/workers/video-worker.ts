@@ -913,6 +913,7 @@ async function bootstrap() {
         mode: mockVideogen ? 'mock' : 'real',
         costType: extra.costType ?? (mockVideogen ? 'mock_zero' : 'estimated'),
         estimatedCostUsd: extra.estimatedCostUsd,
+        realCostUsd: extra.realCostUsd,
         costSource: extra.costSource ?? (mockVideogen ? 'mock_zero' : 'configured_rate'),
         units: extra.units,
         unitType: extra.unitType,
@@ -924,6 +925,24 @@ async function bootstrap() {
           ...extra.metadata,
         },
       });
+
+    // Costo real por video (no tarifa configurada) — consulta Videogen
+    // GET /api/costs/videos/:jobId por cada video del batch y suma el total.
+    // Si CUALQUIER lookup falla, no se reporta un total parcial que
+    // parecería preciso sin serlo: se devuelve null y el llamador cae al
+    // comportamiento actual (estimado vía cost_rates).
+    const resolveRealVideoCost = async (jobs: VideogenJobEntry[]): Promise<number | null> => {
+      if (mockVideogen) return null;
+      try {
+        const costs = await Promise.all(jobs.map((j) => videogenService.getVideoCost(j.jobId)));
+        return costs.reduce((sum, c) => sum + c.estimated_total_cost, 0);
+      } catch (err) {
+        logger.warn(
+          `Job ${jobId}: no se pudo obtener costo real de Videogen, usando tarifa configurada — ${(err as Error).message}`,
+        );
+        return null;
+      }
+    };
 
     logger.log(`Starting ${mockVideogen ? 'MOCK ' : ''}Videogen polling for job ${jobId}, batch ${batchId}`);
 
@@ -971,10 +990,14 @@ async function bootstrap() {
             if (!markedDone) {
               logger.warn(`Job ${jobId} could not be marked videogen_done — ownership changed`);
             } else {
+              const realVideoCost = await resolveRealVideoCost(finalSummary.videogenJobs);
               await trackVideoEvent('video_generation_completed', {
                 units: completed.length,
                 unitType: 'per_video',
+                costType: mockVideogen ? undefined : (realVideoCost != null ? 'real' : undefined),
+                costSource: (mockVideogen || realVideoCost == null) ? undefined : 'provider_reported',
                 estimatedCostUsd: mockVideogen ? 0 : undefined,
+                realCostUsd: realVideoCost != null ? realVideoCost : undefined,
                 metadata: {
                   completedCount: completed.length,
                   failedCount: 0,
@@ -991,10 +1014,14 @@ async function bootstrap() {
             if (!ok) {
               logger.warn(`Job ${jobId} could not be marked complete — ownership changed`);
             } else {
+              const realVideoCost = await resolveRealVideoCost(finalSummary.videogenJobs);
               await trackVideoEvent('video_generation_completed', {
                 units: completed.length,
                 unitType: 'per_video',
+                costType: mockVideogen ? undefined : (realVideoCost != null ? 'real' : undefined),
+                costSource: (mockVideogen || realVideoCost == null) ? undefined : 'provider_reported',
                 estimatedCostUsd: mockVideogen ? 0 : undefined,
+                realCostUsd: realVideoCost != null ? realVideoCost : undefined,
                 metadata: {
                   completedCount: completed.length,
                   failedCount: 0,

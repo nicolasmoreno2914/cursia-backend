@@ -29,6 +29,12 @@ export interface VideogenBatchStatus {
   jobs: VideogenBatchJob[];
 }
 
+export interface VideogenCostBreakdown {
+  job_id: string;
+  estimated_total_cost: number;
+  breakdown: Record<string, number> | null;
+}
+
 const COMPLETED_STATUSES = new Set(['completed', 'done', 'success', 'finished']);
 const FAILED_STATUSES    = new Set(['failed', 'error', 'cancelled', 'canceled']);
 
@@ -166,5 +172,45 @@ export class VideogenService {
     }
 
     return this.parseJobs([parsed])[0];
+  }
+
+  /**
+   * Costo real por video, calculado por Videogen a partir de sus logs de uso
+   * reales (OpenAI texto/imágenes, voz, render, YouTube) — no una tarifa
+   * configurada. Mismo baseUrl/apiKey que el resto de este servicio; el
+   * endpoint acepta la misma API key vía DualAuthGuard (confirmado contra
+   * el código de video-engine-ia).
+   */
+  async getVideoCost(jobId: string): Promise<VideogenCostBreakdown> {
+    const { apiKey, baseUrl } = this.getConfig();
+
+    const url = `${baseUrl}/api/costs/videos/${encodeURIComponent(jobId)}`;
+    this.logger.log(`Fetching Videogen real cost: ${jobId}`);
+
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+
+    const text = await response.text();
+
+    let parsed: Record<string, any>;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new Error(`Videogen returned non-JSON on cost lookup (HTTP ${response.status}): ${text.slice(0, 200)}`);
+    }
+
+    if (!response.ok) {
+      const msg = parsed?.error ?? parsed?.message ?? JSON.stringify(parsed);
+      throw new Error(`Videogen cost lookup failed (HTTP ${response.status}): ${msg}`);
+    }
+
+    const totalCost = Number(parsed.estimated_total_cost);
+    if (!Number.isFinite(totalCost)) {
+      throw new Error(`Videogen cost lookup returned invalid estimated_total_cost for job ${jobId}`);
+    }
+
+    return { job_id: jobId, estimated_total_cost: totalCost, breakdown: parsed.breakdown ?? null };
   }
 }
