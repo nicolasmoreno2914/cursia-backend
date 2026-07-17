@@ -49,6 +49,16 @@ export class CoursesController {
     return this.coursesService.findOne(id, user.id);
   }
 
+  // GET /api/v1/courses/:id/cost
+  // Costo real+estimado del curso (misma fuente que el panel Admin).
+  @Get(':id/cost')
+  getCost(
+    @Param('id', ParseIntPipe) id: number,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.coursesService.getCourseCost(id, user.id);
+  }
+
   // PATCH /api/v1/courses/:id
   @Patch(':id')
   update(

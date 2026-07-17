@@ -4,12 +4,14 @@ import { Repository } from 'typeorm';
 import { Course } from './entities/course.entity';
 import { CreateCourseDto } from './dto/create-course.dto';
 import { UpdateCourseDto } from './dto/update-course.dto';
+import { AdminDashboardService } from '../../admin/services/admin-dashboard.service';
 
 @Injectable()
 export class CoursesService {
   constructor(
     @InjectRepository(Course)
     private readonly courseRepo: Repository<Course>,
+    private readonly adminDashboardService: AdminDashboardService,
   ) {}
 
   // ── Leer flag de compatibilidad desde env ─────────────────────────────────
@@ -89,6 +91,17 @@ export class CoursesService {
       throw new NotFoundException(`Course #${id} not found`);
     }
     return course;
+  }
+
+  // ── COST ──────────────────────────────────────────────────────────────────
+  /**
+   * Costo real+estimado del curso (tokens reales de Claude, videos/audio con
+   * tarifa configurada en cost_rates) — misma agregación que usa el panel
+   * Admin, filtrada a este curso. Verifica ownership antes de calcular.
+   */
+  async getCourseCost(id: number, ownerId?: string) {
+    await this.findOne(id, ownerId); // 404 si no existe o no es del usuario
+    return this.adminDashboardService.getCourseCost(String(id));
   }
 
   // ── UPDATE ────────────────────────────────────────────────────────────────

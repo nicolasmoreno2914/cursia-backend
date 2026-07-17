@@ -14,6 +14,6 @@ import { AdminSeedService } from './seed/admin-seed.service';
   ],
   controllers: [AdminDashboardController],
   providers: [CostRatesService, AdminDashboardService, AdminSeedService],
-  exports: [CostRatesService],
+  exports: [CostRatesService, AdminDashboardService],
 })
 export class AdminModule {}
