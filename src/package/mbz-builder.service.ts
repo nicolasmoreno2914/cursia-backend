@@ -813,7 +813,7 @@ export class MbzBuilderService {
     <timeopen>0</timeopen>
     <timeclose>0</timeclose>
     <timemodified>${ts}</timemodified>
-    <completionstatusrequired>4</completionstatusrequired>
+    <completionstatusrequired>6</completionstatusrequired>
     <completionscorerequired>$@NULL@$</completionscorerequired>
     <completionstatusallscos>0</completionstatusallscos>
     <autocommit>0</autocommit>
@@ -975,7 +975,7 @@ export class MbzBuilderService {
     <timecreated>${ts}</timecreated><timemodified>${ts}</timemodified>
     <password></password><subnet></subnet><browsersecurity>-</browsersecurity>
     <delay1>0</delay1><delay2>0</delay2><showuserpicture>0</showuserpicture><showblocks>0</showblocks>
-    <completionattemptsexhausted>0</completionattemptsexhausted><completionminattempts>0</completionminattempts>
+    <completionattemptsexhausted>0</completionattemptsexhausted><completionminattempts>1</completionminattempts>
     <allowofflineattempts>0</allowofflineattempts>
     <subplugin_quizaccess_seb_quiz></subplugin_quizaccess_seb_quiz>
     <quiz_grade_items></quiz_grade_items>
@@ -1229,7 +1229,7 @@ export class MbzBuilderService {
     <hidetoc>0</hidetoc><nav>1</nav><navpositionleft>-100</navpositionleft><navpositiontop>-100</navpositiontop>
     <auto>0</auto><popup>0</popup><options></options><width>100</width><height>500</height>
     <timeopen>0</timeopen><timeclose>0</timeclose><timemodified>${ts}</timemodified>
-    <completionstatusrequired>4</completionstatusrequired><completionscorerequired>$@NULL@$</completionscorerequired>
+    <completionstatusrequired>6</completionstatusrequired><completionscorerequired>$@NULL@$</completionscorerequired>
     <completionstatusallscos>0</completionstatusallscos><autocommit>0</autocommit>
     <scoes>
       <sco id="${si.scoOrg}"><manifest>cap${si.capLabel}_juego</manifest><organization></organization>
