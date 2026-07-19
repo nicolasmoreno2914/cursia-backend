@@ -44,15 +44,86 @@ function isTrueEnv(envKey: string): boolean {
   return String(process.env[envKey] || '').toLowerCase() === 'true';
 }
 
+// Límite real de Videogen para content_txt (ver video_gen_ai/backend/.../create-video.dto.ts)
+const CONTENT_TXT_MAX_CHARS = 80000;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Artifact download helper (mismo patrón que package-worker.ts)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function downloadArtifactJson(
+  artifactsService: ArtifactsService,
+  ownerId: string,
+  artifactId: string,
+  logger: Logger,
+): Promise<Record<string, any> | null> {
+  try {
+    const urlRes = await artifactsService.getDownloadUrl(artifactId, ownerId, 3600);
+    const url    = urlRes.url;
+    if (!url) { logger.warn(`[VideoWorker] No URL for artifact ${artifactId}`); return null; }
+    const res = await fetch(url);
+    if (!res.ok) { logger.warn(`[VideoWorker] Artifact ${artifactId} download HTTP ${res.status}`); return null; }
+    return res.json() as Promise<Record<string, any>>;
+  } catch (e) {
+    logger.warn(`[VideoWorker] Artifact ${artifactId} download error: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  }
+}
+
+// Convierte el markdown del capítulo a texto plano razonable para narración —
+// quita marcado que no aporta a un guion hablado (encabezados #, énfasis, links).
+function bookMarkdownToNarrationText(md: string): string {
+  return md
+    .replace(/^#+\s*/gm, '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Payload builder
 // ─────────────────────────────────────────────────────────────────────────────
 
-function buildVideogenPayload(job: ProductionJob, logger: Logger): VideogenVideoPayload[] {
+async function buildVideogenPayload(
+  job: ProductionJob,
+  logger: Logger,
+  artifactsService: ArtifactsService,
+): Promise<VideogenVideoPayload[]> {
   const payload    = (job.inputPayload ?? {}) as Record<string, any>;
   const courseData = (payload.courseData ?? {}) as Record<string, any>;
   const timestamp  = Date.now();
   const videos: VideogenVideoPayload[] = [];
+
+  // Descargar el content_snapshot (si existe) para poder mandarle a Videogen el
+  // texto real del capítulo en vez de solo el título — Videogen espera esto
+  // explícitamente en su prompt de generación de guion ("Texto del capítulo:").
+  let chapterBookText: Record<string, string> = {};
+  const contentSnapshotArtifactId = payload.contentSnapshotArtifactId as string | null | undefined;
+  if (contentSnapshotArtifactId) {
+    const snapshot = await downloadArtifactJson(artifactsService, job.ownerId, contentSnapshotArtifactId, logger);
+    const F = (snapshot?.F ?? {}) as Record<string, string>;
+    for (const key of Object.keys(F)) {
+      const m = key.match(/^libro_cap(\d+)\.md$/);
+      if (m) chapterBookText[m[1]] = F[key];
+    }
+    logger.log(`[VideoWorker] Job ${job.id}: content_snapshot con ${Object.keys(chapterBookText).length} capítulo(s) de libro disponibles`);
+  } else {
+    logger.warn(`[VideoWorker] Job ${job.id}: sin contentSnapshotArtifactId — content_txt caerá a solo-título`);
+  }
+
+  function buildContentTxt(capIndex: number, title: string): string {
+    const bookText = chapterBookText[String(capIndex)];
+    if (bookText && bookText.trim().length > 0) {
+      const plain = bookMarkdownToNarrationText(bookText);
+      const header = `Capítulo: ${title}\nCurso: ${courseData.nombre ?? 'Curso Cursia'}\n\n`;
+      return (header + plain).slice(0, CONTENT_TXT_MAX_CHARS);
+    }
+    // Fallback: comportamiento anterior si no hay snapshot o falta ese capítulo
+    return title + '. ' + (courseData.nombre ?? 'Curso Cursia') + '.';
+  }
 
   const mods: Array<Record<string, any>> = Array.isArray(courseData.mods) ? courseData.mods : [];
   if (mods.length > 0) {
@@ -63,7 +134,7 @@ function buildVideogenPayload(job: ProductionJob, logger: Logger): VideogenVideo
         const title = typeof cap === 'string' ? cap : `Capítulo ${capIndex}`;
         videos.push({
           title,
-          content_txt: title + '. ' + (courseData.nombre ?? 'Curso Cursia') + '.',
+          content_txt: buildContentTxt(capIndex, title),
           chapter_number: capIndex,
           client_reference_id: `cursia_capitulo_${capIndex}_${timestamp}`,
         });
@@ -79,7 +150,7 @@ function buildVideogenPayload(job: ProductionJob, logger: Logger): VideogenVideo
       const title = cap?.t ?? cap?.title ?? cap?.n ?? `Capítulo ${i + 1}`;
       videos.push({
         title: String(title),
-        content_txt: String(title) + '. ' + (courseData.nombre ?? 'Curso Cursia') + '.',
+        content_txt: buildContentTxt(i + 1, String(title)),
         chapter_number: i + 1,
         client_reference_id: `cursia_capitulo_${i + 1}_${timestamp}`,
       });
@@ -1240,7 +1311,7 @@ async function bootstrap() {
         }
       } else {
         // ── Submit phase ──────────────────────────────────────────────────────
-        const videos = buildVideogenPayload(job, logger);
+        const videos = await buildVideogenPayload(job, logger, artifactsService);
         logger.log(`${mockVideogen ? '[MOCK] ' : ''}Submitting ${videos.length} videos for job ${jobId}`);
 
         const batchResult: VideogenBatchResult = mockVideogen

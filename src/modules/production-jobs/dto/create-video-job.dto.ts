@@ -49,6 +49,10 @@ export class CreateVideoJobDto {
   executionMode?: 'backend_videos';
 
   @IsOptional()
+  @IsString()
+  contentSnapshotArtifactId?: string;
+
+  @IsOptional()
   @ValidateNested()
   @Type(() => VideoConfigDto)
   videoConfig?: VideoConfigDto;

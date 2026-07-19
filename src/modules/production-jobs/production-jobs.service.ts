@@ -542,6 +542,7 @@ export class ProductionJobsService {
       executionMode: 'backend_videos',
       videoConfig: dto.videoConfig ?? {},
       courseData: dto.courseData,
+      contentSnapshotArtifactId: dto.contentSnapshotArtifactId ?? null,
       options: dto.options ?? {},
       metadata: dto.metadata ?? {},
     });

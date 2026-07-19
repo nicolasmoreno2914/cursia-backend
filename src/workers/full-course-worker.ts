@@ -146,6 +146,7 @@ async function ensureChildJob(
         courseId,
         courseData: payload.courseData ?? input.courseData ?? {},
         videoConfig: { maxChapters: opts.maxVideoChapters ?? 9 },
+        contentSnapshotArtifactId: payload.contentSnapshotArtifactId ?? null,
         options: opts,
         metadata: { source: 'full_course_worker', parentJobId: parentJob.id },
       } as any);
