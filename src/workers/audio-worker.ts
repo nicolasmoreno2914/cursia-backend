@@ -35,6 +35,8 @@ function isTrueEnv(envKey: string): boolean {
 
 const TTS_MAX_CHARS = 3900;
 const AUDIOBOOK_TARGET_WORDS = 4200;
+const AUDIOBOOK_MIN_WORDS_PER_CAP = 400; // mínimo duro por bloque de capítulo — evita que el modelo cierre antes de tiempo
+const AUDIOBOOK_EXCERPT_CHARS = 2200; // chars de extracto por cap — suficiente material real para no rellenar con paja
 const OPENAI_CHAT_URL = 'https://api.openai.com/v1/chat/completions';
 
 function cleanAudioText(raw: string): string {
@@ -124,7 +126,7 @@ async function generateAudiobookScript(
     if (!excerpt || excerpt.length < 10) continue;
     const capObj = caps[i - 1] ?? {};
     const capName = capObj.t || `Capítulo ${i}`;
-    capContexts.push(`Capítulo ${i} — ${capName}:\n${cleanAudioText(excerpt).slice(0, 600)}`);
+    capContexts.push(`Capítulo ${i} — ${capName}:\n${cleanAudioText(excerpt).slice(0, AUDIOBOOK_EXCERPT_CHARS)}`);
   }
 
   if (capContexts.length === 0) {
@@ -142,19 +144,21 @@ async function generateAudiobookScript(
     'Eres un narrador experto en educación. Tu tarea es escribir el guion completo de un ' +
     'audiolibro narrativo resumido para un curso de formación.\n\n' +
     'REGLAS OBLIGATORIAS:\n' +
-    `- El guion debe tener entre 4000 y 4800 palabras en total.\n` +
+    `- El guion debe tener entre 4000 y 4800 palabras en total. Este es un MÍNIMO, no una sugerencia — un guion de menos de 4000 palabras es un guion INCOMPLETO e inaceptable.\n` +
     '- NO leas el contenido literalmente. Resume, explica y conecta las ideas principales.\n' +
     '- El tono debe ser natural, conversacional y educativo — como una clase narrada en voz alta.\n' +
-    '- Cubre todos los capítulos del curso de forma proporcional.\n' +
+    '- Cubre todos los capítulos del curso de forma proporcional — con el MISMO nivel de detalle en el último capítulo que en el primero. PROHIBIDO acortar o resumir de más los capítulos finales por cansancio narrativo.\n' +
     '- ESTRUCTURA DEL GUION:\n' +
     '  1. Introducción general del curso (100–150 palabras)\n' +
-    '  2. Un bloque narrativo por capítulo (~350–450 palabras cada uno), comenzando con una frase de transición\n' +
+    `  2. Un bloque narrativo por capítulo — MÍNIMO ${AUDIOBOOK_MIN_WORDS_PER_CAP} palabras cada uno, comenzando con una frase de transición. No pases al siguiente capítulo hasta haber completado el mínimo de palabras de este.\n` +
     '  3. Conexiones entre capítulos cuando sea relevante\n' +
     '  4. Ejemplos o aplicaciones prácticas concretas\n' +
     '  5. Cierre con conclusiones y reflexión final (100–150 palabras)\n' +
+    '- PROHIBIDO resumir de forma breve o genérica. Si sientes que ya cubriste la idea central de un capítulo antes de llegar al mínimo de palabras, sigue desarrollando con más ejemplos concretos, matices, aplicaciones prácticas o contraejemplos — nunca cierres el bloque antes de cumplir el mínimo.\n' +
     '- Usa solo texto plano. Sin markdown, sin títulos, sin listas, sin asteriscos.\n' +
     '- El texto debe sonar natural al ser leído en voz alta.\n' +
     '- No inventes datos técnicos, estadísticas o citas que no estén en el contenido original.\n' +
+    '- Antes de responder, verifica mentalmente que cada bloque de capítulo cumple el mínimo de palabras y que el total supera las 4000 — si no, sigue escribiendo.\n' +
     '- Responde SOLO con el guion. Sin explicaciones, sin preámbulos.';
 
   const userPrompt =
@@ -162,8 +166,9 @@ async function generateAudiobookScript(
     `El curso está organizado en: ${modLine}.\n\n` +
     'A continuación tienes un extracto del contenido de cada capítulo como referencia:\n\n' +
     capContexts.join('\n\n---\n\n') + '\n\n' +
-    `Escribe el guion completo de ${AUDIOBOOK_TARGET_WORDS} palabras aproximadamente. ` +
-    `Cubre los ${capContexts.length} capítulos. Solo el guion, sin más texto.`;
+    `Escribe el guion completo de MÍNIMO ${AUDIOBOOK_TARGET_WORDS} palabras (nunca menos de 4000) — ` +
+    `eso significa mínimo ${AUDIOBOOK_MIN_WORDS_PER_CAP} palabras por cada uno de los ${capContexts.length} capítulos, con el mismo detalle en todos, incluidos los últimos. ` +
+    'Solo el guion, sin más texto.';
 
   logger.log(`[AudioWorker] Generating audiobook script via OpenAI chat (${capContexts.length} caps)`);
 
@@ -175,7 +180,7 @@ async function generateAudiobookScript(
     },
     body: JSON.stringify({
       model: 'gpt-4o-mini',
-      max_tokens: 6500,
+      max_tokens: 8500,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user',   content: userPrompt   },
