@@ -118,6 +118,7 @@ jobs:
                ensure_pm2_process cursia-video-worker start:video-worker
                ensure_pm2_process cursia-audio-worker start:audio-worker
                ensure_pm2_process cursia-h5p-worker start:h5p-worker
+               ensure_pm2_process cursia-gamma-worker start:gamma-worker
                ensure_pm2_process cursia-package-worker start:package-worker
                ensure_pm2_process cursia-full-worker start:full-worker
                sudo pm2 save
