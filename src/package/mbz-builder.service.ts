@@ -669,7 +669,16 @@ export class MbzBuilderService {
         // placeholder truthy para que no caiga en la rama de "contenido faltante" del loop principal.
         if (!F[gammaFn]) F[gammaFn] = `<!-- GAMMA:${cn} -->`;
       }
-      secFiles[sec].push(`cap${cn}_video_interactivo.html`);
+      const videoFn = `cap${cn}_video_interactivo.html`;
+      if (hvpDataMap[cn]) {
+        // El contenido local genera una tarjeta "video en preparación" como placeholder en este
+        // archivo (pensada para ser reemplazada por el patch local del navegador). El content-worker
+        // del backend en cambio deja aquí el sentinel <!-- HVP:N -->. Si ya tenemos datos H5P reales
+        // para este capítulo, forzamos el sentinel para que se embeba como actividad hvp nativa en
+        // vez de caer en la tarjeta estática — igual que ya hacemos con Gamma arriba.
+        F[videoFn] = `<!-- HVP:${cn} -->`;
+      }
+      secFiles[sec].push(videoFn);
       secFiles[sec].push(`scorm_cap${cn}_index.html`);
     }
     secFiles[2].push('examen_unidad1_descripcion.html', 'examen_unidad1.gift');
