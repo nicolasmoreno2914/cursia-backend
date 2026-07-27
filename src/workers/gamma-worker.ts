@@ -142,7 +142,12 @@ async function createGammaGeneration(chapter: ChapterInfo, themeId: string, apiK
     format: 'presentation',
     numCards: NUM_CARDS,
     additionalInstructions,
-    cardOptions: { dimensions: '16x9' },
+    cardOptions: {
+      dimensions: '16x9',
+      headerFooter: {
+        bottomRight: { type: 'image', source: 'themeLogo', size: 'sm' },
+      },
+    },
     textOptions: { amount: 'brief' },
     sharingOptions: { externalAccess: 'view' },
     themeId,
