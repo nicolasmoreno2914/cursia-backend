@@ -14,6 +14,7 @@ import { CreateContentJobDto } from './dto/create-content-job.dto';
 import { CreateVideoJobDto } from './dto/create-video-job.dto';
 import { CreateAudioJobDto } from './dto/create-audio-job.dto';
 import { CreateH5PJobDto } from './dto/create-h5p-job.dto';
+import { CreateGammaJobDto } from './dto/create-gamma-job.dto';
 import { CreatePackageJobDto } from './dto/create-package-job.dto';
 import { CreateFullCourseJobDto } from './dto/create-full-course-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
@@ -33,6 +34,7 @@ const CANCELLABLE_CHILD_EXECUTION_MODES = new Set([
   'backend_audio',
   'backend_videos',
   'backend_h5p',
+  'backend_gamma',
   'backend_package',
 ]);
 const CANCELLABLE_ACTIVE_STATUSES = new Set([
@@ -193,6 +195,28 @@ export interface H5PWorkerProgressSummary {
   chaptersWithActivities?: number[];
   chaptersSkipped?: number[];
   activities?: Array<Record<string, any>>;
+}
+
+export interface GammaJobCreatedResponse {
+  ok: true;
+  jobId: string;
+  status: string;
+  workerStatus: string;
+  executionMode: string;
+  currentStep: string;
+}
+
+export interface GammaWorkerProgressSummary {
+  phase:
+    | 'checking_existing_gamma'
+    | 'reading_course_content'
+    | 'generating_chapter'
+    | 'uploading_gamma_snapshot'
+    | string;
+  message?: string | null;
+  chaptersCompleted?: number;
+  chaptersTotal?: number;
+  currentChapter?: number | null;
 }
 
 export interface PackageJobCreatedResponse {
@@ -1766,6 +1790,301 @@ export class ProductionJobsService {
     return this.stepRepo.save(step);
   }
 
+  // ── Gamma job methods ───────────────────────────────────────────────────────
+
+  async createGammaJob(
+    ownerId: string,
+    dto: CreateGammaJobDto,
+  ): Promise<GammaJobCreatedResponse> {
+    if (!dto.courseId) throw new BadRequestException('courseId is required');
+    if (!dto.contentSnapshotArtifactId) {
+      throw new BadRequestException('contentSnapshotArtifactId is required');
+    }
+
+    const rawCourseId = dto.courseId;
+    const numericCourseId = rawCourseId ? parseInt(rawCourseId, 10) : NaN;
+    const activeStatuses = ['queued', 'running', 'retrying'];
+
+    const qb = this.jobRepo.createQueryBuilder('job')
+      .where('job.owner_id = :ownerId', { ownerId })
+      .andWhere('job.execution_mode = :executionMode', { executionMode: 'backend_gamma' })
+      .andWhere('job.worker_status IN (:...activeStatuses)', { activeStatuses });
+
+    if (!isNaN(numericCourseId)) {
+      qb.andWhere('(job.course_id = :courseId OR job.frontend_course_id = :frontendCourseId)', {
+        courseId: numericCourseId,
+        frontendCourseId: rawCourseId,
+      });
+    } else {
+      qb.andWhere('job.frontend_course_id = :frontendCourseId', { frontendCourseId: rawCourseId });
+    }
+
+    const activeExisting = await qb.getOne();
+    if (activeExisting) {
+      return {
+        ok: true,
+        jobId: activeExisting.id,
+        status: activeExisting.status,
+        workerStatus: activeExisting.workerStatus,
+        executionMode: activeExisting.executionMode,
+        currentStep: activeExisting.currentStep,
+      };
+    }
+
+    const sanitized = this.sanitizePayload({
+      courseId: rawCourseId,
+      courseTitle: dto.courseTitle ?? null,
+      executionMode: 'backend_gamma',
+      contentSnapshotArtifactId: dto.contentSnapshotArtifactId,
+      paletteId: dto.paletteId ?? null,
+      courseData: dto.courseData ?? {},
+      options: {
+        restoreFirst: dto.options?.restoreFirst !== false,
+      },
+      metadata: dto.metadata ?? {},
+    });
+
+    const job = this.jobRepo.create({
+      ownerId,
+      courseId: !isNaN(numericCourseId) ? numericCourseId : null,
+      frontendCourseId: rawCourseId,
+      frontendJobId: dto.frontendJobId ?? null,
+      options: dto.options ?? {},
+      status: 'queued',
+      currentStep: 'gamma',
+      progress: 0,
+      executionMode: 'backend_gamma',
+      workerStatus: 'queued',
+      inputPayload: sanitized,
+      outputSummary: {},
+    });
+    const saved = await this.jobRepo.save(job);
+
+    let step = await this.stepRepo.findOne({ where: { jobId: saved.id, stepKey: 'gamma' } });
+    if (!step) step = this.stepRepo.create({ jobId: saved.id, stepKey: 'gamma' });
+    step.status = 'queued';
+    step.progress = 0;
+    step.detail = 'Esperando generación de presentaciones';
+    await this.stepRepo.save(step);
+
+    return {
+      ok: true,
+      jobId: saved.id,
+      status: saved.status,
+      workerStatus: saved.workerStatus,
+      executionMode: saved.executionMode,
+      currentStep: saved.currentStep,
+    };
+  }
+
+  async claimNextBackendGammaJob(workerId: string, leaseSeconds: number): Promise<ProductionJob | null> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      const candidates = await queryRunner.query(
+        `SELECT id FROM production_jobs WHERE execution_mode = 'backend_gamma'
+         AND worker_status IN ('queued','retrying')
+         AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+         AND (lease_until IS NULL OR lease_until < NOW())
+         ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED`,
+      );
+      if (!Array.isArray(candidates) || candidates.length === 0) {
+        await queryRunner.commitTransaction();
+        return null;
+      }
+
+      const jobId = candidates[0].id;
+      await queryRunner.query(
+        `UPDATE production_jobs SET worker_status='running', status='running', current_step='gamma',
+         worker_id=$1, claimed_at=NOW(), lease_until=NOW()+($2*INTERVAL '1 second'),
+         attempt_count=COALESCE(attempt_count,0)+1, started_at=COALESCE(started_at,NOW()), updated_at=NOW()
+         WHERE id=$3`,
+        [workerId, leaseSeconds, jobId],
+      );
+
+      await queryRunner.commitTransaction();
+      this.logger.log(`Worker ${workerId} claimed backend_gamma job ${jobId}`);
+      return this.jobRepo.findOne({ where: { id: jobId }, relations: ['steps'] });
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async markGammaWorkerRunning(jobId: string, workerId: string): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
+
+    job.status = 'running';
+    job.workerStatus = 'running';
+    job.currentStep = 'gamma';
+    job.startedAt = job.startedAt ?? new Date();
+    await this.jobRepo.save(job);
+
+    await this.upsertGammaWorkerStep(jobId, {
+      status: 'running',
+      progress: 5,
+      startedAt: new Date(),
+      detail: 'Generando presentaciones',
+    });
+    return true;
+  }
+
+  async updateGammaWorkerProgress(
+    jobId: string,
+    workerId: string,
+    summary: GammaWorkerProgressSummary,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
+
+    const chaptersTotal = summary.chaptersTotal ?? (job.outputSummary?.chaptersTotal ?? 9);
+    const chaptersCompleted = summary.chaptersCompleted ?? (job.outputSummary?.chaptersCompleted ?? 0);
+    const pctByChapters = chaptersTotal > 0 ? Math.round((chaptersCompleted / chaptersTotal) * 85) + 5 : 10;
+
+    job.status = 'running';
+    job.workerStatus = 'running';
+    job.currentStep = 'gamma';
+    job.progress = Math.min(95, Math.max(job.progress ?? 5, pctByChapters));
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      phase: summary.phase,
+      message: summary.message ?? null,
+      chaptersCompleted,
+      chaptersTotal,
+      currentChapter: summary.currentChapter ?? null,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.jobRepo.save(job);
+
+    await this.upsertGammaWorkerStep(jobId, {
+      status: 'running',
+      progress: job.progress,
+      detail: summary.message ?? 'Generando presentaciones',
+    });
+    return true;
+  }
+
+  async completeGammaWorkerJob(
+    jobId: string,
+    workerId: string,
+    summary: Record<string, any>,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
+
+    const now = new Date();
+
+    job.status = 'completed';
+    job.workerStatus = 'completed';
+    job.currentStep = 'gamma';
+    job.progress = 100;
+    job.finishedAt = now;
+    job.leaseUntil = null;
+    job.nextRetryAt = null;
+    job.errorMessage = null;
+    job.errorStep = null;
+    job.outputSummary = {
+      ...(job.outputSummary ?? {}),
+      ...summary,
+      completedAt: now.toISOString(),
+    };
+    await this.jobRepo.save(job);
+
+    await this.upsertGammaWorkerStep(jobId, {
+      status: 'completed',
+      progress: 100,
+      finishedAt: now,
+      detail: 'Presentaciones listas.',
+      error: null,
+    });
+    return true;
+  }
+
+  async failGammaWorkerJob(
+    jobId: string,
+    workerId: string,
+    error: Error | string,
+    retryable: boolean,
+  ): Promise<boolean> {
+    const job = await this.findJobForWorker(jobId, workerId);
+    if (!job) return false;
+    if (this.isCancelledLike(job)) return false;
+
+    const message = typeof error === 'string' ? error : error?.message || 'Unknown gamma worker error';
+    const now = new Date();
+    const attemptsRemaining = (job.attemptCount ?? 0) < (job.maxAttempts ?? 3);
+
+    const errorEntry = {
+      phase: 'worker',
+      message,
+      retryable,
+      attempt: job.attemptCount ?? 0,
+      workerId,
+      at: now.toISOString(),
+    };
+
+    job.currentStep = 'gamma';
+    job.progress = Math.max(0, job.progress ?? 0);
+    job.errorMessage = message;
+    job.errorStep = 'gamma';
+    job.outputSummary = this.appendOutputError(job.outputSummary, errorEntry);
+
+    if (retryable && attemptsRemaining) {
+      job.workerStatus = 'retrying';
+      job.status = 'retrying';
+      job.nextRetryAt = this.buildRetryDate(job.attemptCount ?? 0);
+      job.leaseUntil = null;
+      job.workerId = null;
+      job.retryCount = (job.retryCount ?? 0) + 1;
+      await this.jobRepo.save(job);
+
+      const existingStep = await this.stepRepo.findOne({ where: { jobId, stepKey: 'gamma' } });
+      await this.upsertGammaWorkerStep(jobId, {
+        status: 'retrying',
+        progress: existingStep?.progress ?? 5,
+        detail: `Reintentando presentaciones: ${message}`,
+        error: message,
+        retries: (existingStep?.retries ?? 0) + 1,
+      });
+      return true;
+    }
+
+    job.workerStatus = retryable ? 'failed_recoverable' : 'failed';
+    job.status = retryable ? 'failed_retryable' : 'failed';
+    job.finishedAt = now;
+    job.nextRetryAt = null;
+    job.leaseUntil = null;
+    await this.jobRepo.save(job);
+
+    await this.upsertGammaWorkerStep(jobId, {
+      status: 'failed',
+      finishedAt: now,
+      detail: `Presentaciones no disponibles: ${message}`,
+      error: message,
+    });
+    return true;
+  }
+
+  private async upsertGammaWorkerStep(jobId: string, dto: Partial<ProductionStep>): Promise<ProductionStep> {
+    let step = await this.stepRepo.findOne({ where: { jobId, stepKey: 'gamma' } });
+    if (!step) step = this.stepRepo.create({ jobId, stepKey: 'gamma' });
+    if (dto.status !== undefined) step.status = dto.status;
+    if (dto.progress !== undefined) step.progress = dto.progress;
+    if (dto.startedAt !== undefined) step.startedAt = dto.startedAt;
+    if (dto.finishedAt !== undefined) step.finishedAt = dto.finishedAt;
+    if (dto.error !== undefined) step.error = dto.error;
+    if (dto.detail !== undefined) step.detail = dto.detail;
+    if (dto.retries !== undefined) step.retries = dto.retries;
+    return this.stepRepo.save(step);
+  }
+
   // ── Package job methods ────────────────────────────────────────────────────
 
   async createPackageJob(
@@ -1800,6 +2119,7 @@ export class ProductionJobsService {
       h5pSnapshotArtifactId:    dto.h5pSnapshotArtifactId ?? null,
       audioWelcomeArtifactId:   dto.audioWelcomeArtifactId ?? null,
       audiobookArtifactId:      dto.audiobookArtifactId ?? null,
+      gammaSnapshotArtifactId:  dto.gammaSnapshotArtifactId ?? null,
       options: dto.options ?? {},
       metadata: dto.metadata ?? {},
     });

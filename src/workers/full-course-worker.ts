@@ -166,6 +166,17 @@ async function ensureChildJob(
         metadata: { source: 'full_course_worker', parentJobId: parentJob.id },
       } as any);
       res = r;
+    } else if (executionMode === 'backend_gamma') {
+      const r = await jobsService.createGammaJob(ownerId, {
+        courseId,
+        courseTitle: payload.courseTitle ?? input.courseData?.nombre ?? null,
+        courseData: payload.courseData ?? input.courseData ?? {},
+        contentSnapshotArtifactId: payload.contentSnapshotArtifactId ?? null,
+        paletteId: payload.paletteId ?? input.courseData?.pal?.id ?? null,
+        options: { restoreFirst: true },
+        metadata: { source: 'full_course_worker', parentJobId: parentJob.id },
+      } as any);
+      res = r;
     } else if (executionMode === 'backend_package') {
       const r = await jobsService.createPackageJob(ownerId, {
         courseId,
@@ -173,6 +184,7 @@ async function ensureChildJob(
         h5pSnapshotArtifactId:      payload.h5pSnapshotArtifactId ?? null,
         audioWelcomeArtifactId:     payload.audioWelcomeArtifactId ?? null,
         audiobookArtifactId:        payload.audiobookArtifactId ?? null,
+        gammaSnapshotArtifactId:    payload.gammaSnapshotArtifactId ?? null,
         options: opts,
         metadata: { source: 'full_course_worker', parentJobId: parentJob.id },
       } as any);
@@ -383,16 +395,20 @@ async function handleFullCourseJob(
 
     if (leaseLost) return;
 
-    // ── 2. Audio ──────────────────────────────────────────────────────────────
-    let audioWelcomeArtifactId: string | null = null;
-    let audiobookArtifactId:    string | null = null;
-    let videoStateSnapshotArtifactId: string | null = null;
-    let h5pSnapshotArtifactId: string | null = null;
+    // ── 2-4. Audio / Video+H5P / Gamma — corren en paralelo ──────────────────
+    // Los tres dependen solo de `content` (ya listo), no entre sí. `videos` es el
+    // paso más lento (hasta 8h); antes `gamma` (~10-30 min) esperaba a que
+    // terminaran video+h5p antes de arrancar, sumándose al tiempo total en vez
+    // de solaparse. Ahora arrancan juntos apenas termina `content`.
 
-    if (opts.generateAudio !== false) {
+    async function runAudioBranch(): Promise<{ audioWelcomeArtifactId: string | null; audiobookArtifactId: string | null }> {
+      let audioWelcomeArtifactId: string | null = null;
+      let audiobookArtifactId:    string | null = null;
+
+      if (opts.generateAudio === false) return { audioWelcomeArtifactId, audiobookArtifactId };
+
       await updateStep('audio', 'Creando audios…');
 
-      // Restore-first: check existing audio artifacts
       const existingWelcome  = await findLatestArtifact(artifactsService, ownerId, courseId, 'audio_welcome');
       const existingAudiobook = await findLatestArtifact(artifactsService, ownerId, courseId, 'audiobook');
 
@@ -407,24 +423,22 @@ async function handleFullCourseJob(
 
       if (!audioWelcomeArtifactId) {
         await sendHeartbeat();
-        if (leaseLost) return;
+        if (leaseLost) return { audioWelcomeArtifactId, audiobookArtifactId };
         const audioJobId = await ensureChildJob('backend_audio', job, courseId, {
           contentSnapshotArtifactId,
         }, jobsService, logger);
 
         if (audioJobId) {
-          if (leaseLost) return;
+          if (leaseLost) return { audioWelcomeArtifactId, audiobookArtifactId };
           const audioResult = await waitForChildJob(audioJobId, jobsService, sendHeartbeat, logger);
-          if (leaseLost) return;
+          if (leaseLost) return { audioWelcomeArtifactId, audiobookArtifactId };
 
           if (audioResult.ok) {
-            // Extract artifact IDs from outputSummary
             const ws = (audioResult.outputSummary.welcomeAudio ?? {}) as Record<string,any>;
             const ab = (audioResult.outputSummary.audiobook ?? {}) as Record<string,any>;
             audioWelcomeArtifactId = ws.artifactId ?? null;
             audiobookArtifactId    = ab.artifactId ?? null;
 
-            // Re-check artifacts if not found in summary
             if (!audioWelcomeArtifactId) {
               const art = await findLatestArtifact(artifactsService, ownerId, courseId, 'audio_welcome');
               audioWelcomeArtifactId = art?.id ?? null;
@@ -434,155 +448,234 @@ async function handleFullCourseJob(
               audiobookArtifactId = art?.id ?? null;
             }
           } else if (opts.audiobookOptional !== false) {
-            // Audio failed but is optional — continue (no audiobook, no welcome audio)
             logger.warn(`[FullCourseWorker] Audio job failed but optional: ${audioResult.error}`);
-            if (audioResult.status === 'cancelled') return;
-          } else {
-            // Audio welcome is required — fail the job
-            if (audioResult.status === 'cancelled') return;
+          } else if (audioResult.status !== 'cancelled') {
             throw new Error(`Generación de audio falló: ${audioResult.error}`);
           }
         }
       }
 
-      const audioSummary: Record<string,any> = {
-        audioWelcomeArtifactId,
-        audiobookArtifactId,
-      };
       await updateStep('audio', audioWelcomeArtifactId ? 'Audio listo ✓' : 'Sin audio de bienvenida', {
-        steps: { audio: audioSummary },
+        steps: { audio: { audioWelcomeArtifactId, audiobookArtifactId } },
       });
+      return { audioWelcomeArtifactId, audiobookArtifactId };
     }
 
-    if (leaseLost) return;
+    async function runVideoAndH5pBranch(): Promise<{
+      videoStateSnapshotArtifactId: string | null;
+      h5pSnapshotArtifactId: string | null;
+      blockStatus?: 'auth' | 'quota';
+      blockedVideoJobId?: string | null;
+    }> {
+      let videoStateSnapshotArtifactId: string | null = null;
+      let h5pSnapshotArtifactId: string | null = null;
 
-    // ── 3. Videos + YouTube ───────────────────────────────────────────────────
-    if (opts.generateVideos !== false && opts.uploadToYoutube !== false) {
-      await updateStep('video', 'Generando y subiendo videos…');
+      // ── Videos ────────────────────────────────────────────────────────────
+      if (opts.generateVideos !== false && opts.uploadToYoutube !== false) {
+        await updateStep('video', 'Generando y subiendo videos…');
 
-      const existingVideoArt = await findLatestArtifact(artifactsService, ownerId, courseId, 'video_state_snapshot');
-      if (existingVideoArt) {
-        videoStateSnapshotArtifactId = existingVideoArt.id;
-        logger.log(`[FullCourseWorker] video_state_snapshot already exists — skipping video step`);
-        await updateStep('video', 'Videos encontrados ✓', {
-          steps: { video: { status: 'restored', artifactId: videoStateSnapshotArtifactId } },
-        });
-      } else {
-        await sendHeartbeat();
-        if (leaseLost) return;
-        const videoJobId = await ensureChildJob('backend_videos', job, courseId, {}, jobsService, logger);
+        const existingVideoArt = await findLatestArtifact(artifactsService, ownerId, courseId, 'video_state_snapshot');
+        if (existingVideoArt) {
+          videoStateSnapshotArtifactId = existingVideoArt.id;
+          logger.log(`[FullCourseWorker] video_state_snapshot already exists — skipping video step`);
+          await updateStep('video', 'Videos encontrados ✓', {
+            steps: { video: { status: 'restored', artifactId: videoStateSnapshotArtifactId } },
+          });
+        } else {
+          await sendHeartbeat();
+          if (leaseLost) return { videoStateSnapshotArtifactId, h5pSnapshotArtifactId };
+          const videoJobId = await ensureChildJob('backend_videos', job, courseId, {}, jobsService, logger);
 
-        if (videoJobId) {
-          if (leaseLost) return;
-          const videoResult = await waitForChildJob(
-            videoJobId, jobsService, sendHeartbeat, logger,
-            30_000,
-            8 * 60 * 60 * 1000, // videos can take up to 8 hours
-          );
-          if (leaseLost) return;
+          if (videoJobId) {
+            if (leaseLost) return { videoStateSnapshotArtifactId, h5pSnapshotArtifactId };
+            const videoResult = await waitForChildJob(
+              videoJobId, jobsService, sendHeartbeat, logger,
+              30_000,
+              8 * 60 * 60 * 1000, // videos can take up to 8 hours
+            );
+            if (leaseLost) return { videoStateSnapshotArtifactId, h5pSnapshotArtifactId };
 
-          if (videoResult.status === 'blocked_auth') {
-            finalized = true;
-            await jobsService.blockFullCourseJobAuth(jobId, workerId, videoJobId);
-            return;
-          }
-          if (videoResult.status === 'blocked_quota') {
-            finalized = true;
-            await jobsService.blockFullCourseJobQuota(jobId, workerId, videoJobId);
-            return;
-          }
-          if (!videoResult.ok) {
-            if (videoResult.status === 'cancelled') return;
-            // Video failed but not blocking — log and continue (videos are optional for package)
-            logger.warn(`[FullCourseWorker] Video job failed (non-blocking): ${videoResult.error}`);
-          } else {
-            videoStateSnapshotArtifactId =
-              videoResult.outputSummary.videoStateSnapshotArtifactId
-              ?? (videoResult.outputSummary.artifactIds as Record<string, any> | undefined)?.videoStateSnapshot
-              ?? null;
-            if (!videoStateSnapshotArtifactId) {
-              const art = await findLatestArtifact(artifactsService, ownerId, courseId, 'video_state_snapshot');
-              videoStateSnapshotArtifactId = art?.id ?? null;
+            if (videoResult.status === 'blocked_auth') {
+              return { videoStateSnapshotArtifactId, h5pSnapshotArtifactId, blockStatus: 'auth', blockedVideoJobId: videoJobId };
             }
-            await updateStep('video', 'Videos listos ✓', {
-              steps: { video: { status: 'completed', artifactId: videoStateSnapshotArtifactId } },
-            });
+            if (videoResult.status === 'blocked_quota') {
+              return { videoStateSnapshotArtifactId, h5pSnapshotArtifactId, blockStatus: 'quota', blockedVideoJobId: videoJobId };
+            }
+            if (!videoResult.ok) {
+              // Video failed but not blocking — log and continue (videos are optional for package)
+              logger.warn(`[FullCourseWorker] Video job failed (non-blocking): ${videoResult.error}`);
+            } else {
+              videoStateSnapshotArtifactId =
+                videoResult.outputSummary.videoStateSnapshotArtifactId
+                ?? (videoResult.outputSummary.artifactIds as Record<string, any> | undefined)?.videoStateSnapshot
+                ?? null;
+              if (!videoStateSnapshotArtifactId) {
+                const art = await findLatestArtifact(artifactsService, ownerId, courseId, 'video_state_snapshot');
+                videoStateSnapshotArtifactId = art?.id ?? null;
+              }
+              await updateStep('video', 'Videos listos ✓', {
+                steps: { video: { status: 'completed', artifactId: videoStateSnapshotArtifactId } },
+              });
+            }
           }
         }
       }
+
+      if (leaseLost) return { videoStateSnapshotArtifactId, h5pSnapshotArtifactId };
+
+      // ── H5P (depende de video) ───────────────────────────────────────────
+      await updateStep('h5p', 'Creando actividades…');
+
+      const h5pArtifact = await findLatestArtifact(artifactsService, ownerId, courseId, 'h5p_snapshot');
+      h5pSnapshotArtifactId = h5pArtifact?.id ?? null;
+      if (h5pSnapshotArtifactId) {
+        logger.log(`[FullCourseWorker] h5p_snapshot exists (${h5pSnapshotArtifactId})`);
+        await updateStep('h5p', 'Actividades listas ✓', {
+          steps: { h5p: { status: 'restored', artifactId: h5pSnapshotArtifactId } },
+        });
+      } else if (opts.generateVideos === false || opts.uploadToYoutube === false) {
+        logger.log('[FullCourseWorker] H5P skipped because videos/YouTube are disabled by options');
+        await updateStep('h5p', 'Actividades omitidas en esta preparación', {
+          steps: { h5p: { status: 'skipped' } },
+        });
+      } else {
+        await sendHeartbeat();
+        if (leaseLost) return { videoStateSnapshotArtifactId, h5pSnapshotArtifactId };
+        const latestVideoJob = await jobsService.findLatestChildJobForCourse(ownerId, courseId, 'backend_videos');
+        const youtubeUploads = Array.isArray(latestVideoJob?.outputSummary?.youtubeUploads)
+          ? latestVideoJob?.outputSummary?.youtubeUploads
+          : [];
+
+        const h5pJobId = await ensureChildJob('backend_h5p', job, courseId, {
+          courseTitle: input.courseData?.nombre ?? null,
+          courseData: input.courseData ?? {},
+          contentSnapshotArtifactId,
+          videoStateSnapshotArtifactId,
+          youtubeUploads,
+        }, jobsService, logger);
+
+        if (!h5pJobId) throw new Error('No se pudo crear el job de actividades interactivas');
+        if (leaseLost) return { videoStateSnapshotArtifactId, h5pSnapshotArtifactId };
+
+        const h5pResult = await waitForChildJob(h5pJobId, jobsService, sendHeartbeat, logger);
+        if (leaseLost) return { videoStateSnapshotArtifactId, h5pSnapshotArtifactId };
+
+        if (!h5pResult.ok) {
+          if (h5pResult.status !== 'cancelled') {
+            throw new Error(`Preparación de actividades falló: ${h5pResult.error}`);
+          }
+          return { videoStateSnapshotArtifactId, h5pSnapshotArtifactId };
+        }
+
+        h5pSnapshotArtifactId =
+          h5pResult.outputSummary.h5pSnapshotArtifactId
+          ?? (h5pResult.outputSummary.h5pSnapshot as Record<string, any> | undefined)?.artifactId
+          ?? (h5pResult.outputSummary.artifactIds as Record<string, any> | undefined)?.h5pSnapshot
+          ?? null;
+
+        if (!h5pSnapshotArtifactId) {
+          const art = await findLatestArtifact(artifactsService, ownerId, courseId, 'h5p_snapshot');
+          h5pSnapshotArtifactId = art?.id ?? null;
+        }
+
+        if (!h5pSnapshotArtifactId) {
+          throw new Error('Las actividades se generaron, pero no se encontró su copia guardada');
+        }
+
+        const h5pStatus = (h5pResult.outputSummary.h5pSnapshot as Record<string, any> | undefined)?.status ?? 'completed';
+        const h5pMessage = h5pStatus === 'partial'
+          ? 'Actividades listas con algunas omisiones'
+          : 'Actividades listas ✓';
+
+        await updateStep('h5p', h5pMessage, {
+          h5pSnapshotArtifactId,
+          steps: { h5p: { status: h5pStatus, artifactId: h5pSnapshotArtifactId } },
+        });
+      }
+
+      return { videoStateSnapshotArtifactId, h5pSnapshotArtifactId };
     }
 
-    if (leaseLost) return;
+    async function runGammaBranch(): Promise<{ gammaSnapshotArtifactId: string | null }> {
+      await updateStep('gamma', 'Creando presentaciones…');
 
-    // ── 4. H5P ───────────────────────────────────────────────────────────────
-    await updateStep('h5p', 'Creando actividades…');
+      const gammaArtifact = await findLatestArtifact(artifactsService, ownerId, courseId, 'gamma_snapshot');
+      let gammaSnapshotArtifactId: string | null = gammaArtifact?.id ?? null;
+      if (gammaSnapshotArtifactId) {
+        logger.log(`[FullCourseWorker] gamma_snapshot exists (${gammaSnapshotArtifactId})`);
+        await updateStep('gamma', 'Presentaciones listas ✓', {
+          steps: { gamma: { status: 'restored', artifactId: gammaSnapshotArtifactId } },
+        });
+        return { gammaSnapshotArtifactId };
+      }
 
-    const h5pArtifact = await findLatestArtifact(artifactsService, ownerId, courseId, 'h5p_snapshot');
-    h5pSnapshotArtifactId = h5pArtifact?.id ?? null;
-    if (h5pSnapshotArtifactId) {
-      logger.log(`[FullCourseWorker] h5p_snapshot exists (${h5pSnapshotArtifactId})`);
-      await updateStep('h5p', 'Actividades listas ✓', {
-        steps: { h5p: { status: 'restored', artifactId: h5pSnapshotArtifactId } },
-      });
-    } else if (opts.generateVideos === false || opts.uploadToYoutube === false) {
-      logger.log('[FullCourseWorker] H5P skipped because videos/YouTube are disabled by options');
-      await updateStep('h5p', 'Actividades omitidas en esta preparación', {
-        steps: { h5p: { status: 'skipped' } },
-      });
-    } else {
       await sendHeartbeat();
-      if (leaseLost) return;
-      const latestVideoJob = await jobsService.findLatestChildJobForCourse(ownerId, courseId, 'backend_videos');
-      const youtubeUploads = Array.isArray(latestVideoJob?.outputSummary?.youtubeUploads)
-        ? latestVideoJob?.outputSummary?.youtubeUploads
-        : [];
+      if (leaseLost) return { gammaSnapshotArtifactId: null };
 
-      const h5pJobId = await ensureChildJob('backend_h5p', job, courseId, {
+      const gammaJobId = await ensureChildJob('backend_gamma', job, courseId, {
+        contentSnapshotArtifactId,
         courseTitle: input.courseData?.nombre ?? null,
         courseData: input.courseData ?? {},
-        contentSnapshotArtifactId,
-        videoStateSnapshotArtifactId,
-        youtubeUploads,
+        paletteId: input.courseData?.pal?.id ?? null,
       }, jobsService, logger);
 
-      if (!h5pJobId) throw new Error('No se pudo crear el job de actividades interactivas');
-      if (leaseLost) return;
+      if (!gammaJobId) throw new Error('No se pudo crear el job de presentaciones');
+      if (leaseLost) return { gammaSnapshotArtifactId: null };
 
-      const h5pResult = await waitForChildJob(h5pJobId, jobsService, sendHeartbeat, logger);
-      if (leaseLost) return;
+      const gammaResult = await waitForChildJob(gammaJobId, jobsService, sendHeartbeat, logger);
+      if (leaseLost) return { gammaSnapshotArtifactId: null };
 
-      if (!h5pResult.ok) {
-        if (h5pResult.status === 'cancelled') return;
-        throw new Error(`Preparación de actividades falló: ${h5pResult.error}`);
+      if (!gammaResult.ok) {
+        if (gammaResult.status === 'cancelled') return { gammaSnapshotArtifactId: null };
+        // Obligatorio y bloqueante — a diferencia del audiolibro, NO se continúa sin esto.
+        throw new Error(`Generación de presentaciones falló: ${gammaResult.error}`);
       }
 
-      h5pSnapshotArtifactId =
-        h5pResult.outputSummary.h5pSnapshotArtifactId
-        ?? (h5pResult.outputSummary.h5pSnapshot as Record<string, any> | undefined)?.artifactId
-        ?? (h5pResult.outputSummary.artifactIds as Record<string, any> | undefined)?.h5pSnapshot
+      gammaSnapshotArtifactId =
+        gammaResult.outputSummary.gammaSnapshotArtifactId
+        ?? (gammaResult.outputSummary.artifactIds as Record<string, any> | undefined)?.gammaSnapshot
         ?? null;
 
-      if (!h5pSnapshotArtifactId) {
-        const art = await findLatestArtifact(artifactsService, ownerId, courseId, 'h5p_snapshot');
-        h5pSnapshotArtifactId = art?.id ?? null;
+      if (!gammaSnapshotArtifactId) {
+        const art = await findLatestArtifact(artifactsService, ownerId, courseId, 'gamma_snapshot');
+        gammaSnapshotArtifactId = art?.id ?? null;
       }
 
-      if (!h5pSnapshotArtifactId) {
-        throw new Error('Las actividades se generaron, pero no se encontró su copia guardada');
+      if (!gammaSnapshotArtifactId) {
+        throw new Error('Las presentaciones se generaron, pero no se encontró su copia guardada');
       }
 
-      const h5pStatus = (h5pResult.outputSummary.h5pSnapshot as Record<string, any> | undefined)?.status ?? 'completed';
-      const h5pMessage = h5pStatus === 'partial'
-        ? 'Actividades listas con algunas omisiones'
-        : 'Actividades listas ✓';
-
-      await updateStep('h5p', h5pMessage, {
-        h5pSnapshotArtifactId,
-        steps: { h5p: { status: h5pStatus, artifactId: h5pSnapshotArtifactId } },
+      await updateStep('gamma', 'Presentaciones listas ✓', {
+        gammaSnapshotArtifactId,
+        steps: { gamma: { status: 'completed', artifactId: gammaSnapshotArtifactId } },
       });
+      return { gammaSnapshotArtifactId };
     }
 
+    const [audioBranchRes, videoBranchRes, gammaBranchRes] = await Promise.all([
+      runAudioBranch(),
+      runVideoAndH5pBranch(),
+      runGammaBranch(),
+    ]);
+
     if (leaseLost) return;
+
+    if (videoBranchRes.blockStatus === 'auth') {
+      finalized = true;
+      await jobsService.blockFullCourseJobAuth(jobId, workerId, videoBranchRes.blockedVideoJobId as string);
+      return;
+    }
+    if (videoBranchRes.blockStatus === 'quota') {
+      finalized = true;
+      await jobsService.blockFullCourseJobQuota(jobId, workerId, videoBranchRes.blockedVideoJobId as string);
+      return;
+    }
+
+    const audioWelcomeArtifactId = audioBranchRes.audioWelcomeArtifactId;
+    const audiobookArtifactId    = audioBranchRes.audiobookArtifactId;
+    const videoStateSnapshotArtifactId = videoBranchRes.videoStateSnapshotArtifactId;
+    const h5pSnapshotArtifactId  = videoBranchRes.h5pSnapshotArtifactId;
+    const gammaSnapshotArtifactId = gammaBranchRes.gammaSnapshotArtifactId;
 
     // ── 5. Package ────────────────────────────────────────────────────────────
     await updateStep('package', 'Preparando paquete Moodle…');
@@ -596,6 +689,7 @@ async function handleFullCourseJob(
       h5pSnapshotArtifactId,
       audioWelcomeArtifactId,
       audiobookArtifactId,
+      gammaSnapshotArtifactId,
     }, jobsService, logger);
 
     if (!packageJobId) throw new Error('No se pudo crear el job de empaquetado');
@@ -632,6 +726,7 @@ async function handleFullCourseJob(
       audioWelcomeArtifactId,
       audiobookArtifactId,
       h5pSnapshotArtifactId,
+      gammaSnapshotArtifactId,
       userMessage: 'Curso listo.',
     });
     await trackEvent('full_course_generation_completed', {
@@ -644,6 +739,7 @@ async function handleFullCourseJob(
         audioWelcomeArtifactId,
         audiobookArtifactId,
         h5pSnapshotArtifactId,
+        gammaSnapshotArtifactId,
       },
     });
 

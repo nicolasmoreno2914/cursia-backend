@@ -34,6 +34,11 @@ export class CreatePackageJobDto {
   @IsString()
   audiobookArtifactId?: string | null;
 
+  /** UUID del gamma_snapshot artifact (presentaciones por capítulo, obligatorio para completar el paquete). */
+  @IsOptional()
+  @IsString()
+  gammaSnapshotArtifactId?: string | null;
+
   @IsOptional()
   @IsObject()
   options?: {

@@ -23,6 +23,15 @@ export interface HvpEntry {
   h5p_status?: string;
 }
 
+export interface GammaEntry {
+  embedUrl:   string;
+  viewUrl:    string;
+  pdfArtifactId?: string | null;
+  pdfStatus?: string;
+  cardCount?: number;
+  status?: string;
+}
+
 export interface MbzBuildInput {
   /** Course config object (D from frontend state). */
   courseData: Record<string, any>;
@@ -34,6 +43,10 @@ export interface MbzBuildInput {
   audiobook?: Buffer | null;
   /** H5P activity data keyed by cap number 1-9 (MEDIA_HVP). */
   hvpData?: Record<number, HvpEntry>;
+  /** Gamma presentation data keyed by cap number 1-9 (GAMMA_SNAPSHOT). */
+  gammaData?: Record<number, GammaEntry>;
+  /** Gamma presentation PDFs keyed by cap number 1-9, for @@PLUGINFILE@@ attachment. */
+  gammaPdfs?: Record<number, Buffer>;
   /** Moodle version string, default '4.1'. */
   moodleVersion?: string;
 }
@@ -56,6 +69,8 @@ export class MbzBuilderService {
     const D    = input.courseData  ?? {};
     const F    = input.courseFiles ?? {};
     const hvpDataMap: Record<number, HvpEntry> = input.hvpData ?? {};
+    const gammaDataMap: Record<number, GammaEntry> = input.gammaData ?? {};
+    const gammaPdfMap: Record<number, Buffer> = input.gammaPdfs ?? {};
 
     const keys = Object.keys(F);
     if (!keys.length) throw new Error('Sin archivos de curso en F — genera el contenido primero');
@@ -593,6 +608,42 @@ export class MbzBuilderService {
         + `</div></div>`;
     }
 
+    // ── Gamma presentation label HTML (shown BEFORE the video, after chapter text) ─
+    // Preview: iframe de Gamma a su ancho nativo (700x450) escalado hacia abajo con
+    // transform:scale (NO max-width:100%, que corta el texto de Gamma letra por letra).
+    // No interactivo (pointer-events:none) — la interacción real pasa por el botón.
+    function gammaLabelHtml(capN: number, capName: string, modHex: string,
+                             gamma: GammaEntry, pdfFilename: string | null): string {
+      const scale = 0.4;
+      const clipW = Math.round(700 * scale);
+      const clipH = Math.round(450 * scale);
+      const pdfButton = pdfFilename
+        ? `<a href="@@PLUGINFILE@@/${pdfFilename}" style="display:inline-flex;align-items:center;gap:8px;padding:14px 24px;border-radius:12px;background:rgba(255,255,255,.06);border:1px solid rgba(226,230,243,.16);color:#E2E6F3;font-family:'Segoe UI',Arial,sans-serif;font-size:14.5px;font-weight:600;text-decoration:none;white-space:nowrap;">⬇ Descargar PDF</a>`
+        : '';
+      return `<div class="cc-responsive" style="width:100%;max-width:100%;overflow-x:auto;box-sizing:border-box;">`
+        + `<div style="background:#0A1628;border-radius:20px;padding:32px;color:#E2E6F3;font-family:'Segoe UI',Arial,sans-serif;box-sizing:border-box;width:100%;max-width:100%;">`
+        + `<h3 style="font-size:18px;font-weight:700;color:#E2E6F3;margin:0 0 16px;display:flex;align-items:center;gap:9px;">`
+          + `<span style="width:30px;height:30px;border-radius:9px;background:rgba(232,105,42,.16);display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;">📊</span>`
+          + `Presentación del capítulo`
+        + `</h3>`
+        + `<div style="border-radius:14px;overflow:hidden;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);margin-bottom:20px;display:flex;align-items:center;justify-content:center;height:${clipH}px;">`
+          + `<div style="width:${clipW}px;height:${clipH}px;overflow:hidden;position:relative;border-radius:10px;">`
+            + `<div style="width:700px;height:450px;transform:scale(${scale});transform-origin:top left;pointer-events:none;">`
+              + `<iframe src="${xmlEsc(gamma.embedUrl)}" style="width:700px;height:450px;border:none;" scrolling="no" title="${xmlEsc(capName)}"></iframe>`
+            + `</div>`
+            + `<div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;background:linear-gradient(180deg,rgba(10,22,40,0) 0%,rgba(10,22,40,.55) 78%,rgba(10,22,40,.85) 100%);">`
+              + `<div style="width:40px;height:40px;border-radius:50%;background:rgba(232,105,42,.94);display:flex;align-items:center;justify-content:center;color:#fff;font-size:14px;">▶</div>`
+              + `<span style="font-size:11px;font-weight:600;color:#fff;font-family:'Segoe UI',Arial,sans-serif;">Vista previa · 10 diapositivas</span>`
+            + `</div>`
+          + `</div>`
+        + `</div>`
+        + `<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;">`
+          + `<a href="${xmlEsc(gamma.viewUrl)}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:8px;padding:15px 28px;border-radius:12px;background:${modHex};color:#fff;font-family:'Segoe UI',Arial,sans-serif;font-size:15px;font-weight:700;text-decoration:none;white-space:nowrap;">▶ Ver presentación completa</a>`
+          + pdfButton
+        + `</div>`
+        + `</div></div>`;
+    }
+
     // ── Section map (same as 09-mbz.js) ──────────────────────────────────────
 
     const sections = [
@@ -610,6 +661,14 @@ export class MbzBuilderService {
     for (let ci = 0; ci < 9; ci++) {
       const sec = ci < 3 ? 2 : ci < 6 ? 3 : 4;
       const cn  = ci + 1;
+      // Orden dentro del capítulo: texto (ya en secFiles vía otro archivo) → Gamma → video → scorm.
+      if (gammaDataMap[cn]) {
+        const gammaFn = `cap${cn}_presentacion_gamma.html`;
+        secFiles[sec].push(gammaFn);
+        // El content-worker no conoce Gamma, así que F[gammaFn] nunca existe — sembramos un
+        // placeholder truthy para que no caiga en la rama de "contenido faltante" del loop principal.
+        if (!F[gammaFn]) F[gammaFn] = `<!-- GAMMA:${cn} -->`;
+      }
       secFiles[sec].push(`cap${cn}_video_interactivo.html`);
       secFiles[sec].push(`scorm_cap${cn}_index.html`);
     }
@@ -1091,6 +1150,48 @@ export class MbzBuilderService {
             secActs.push({ mid });
             mbzActivities.push({ mid, secnum:sec.num, modname:'hvp', title:hvpTitle, dir });
             actSettings.push({ mid, modname:'hvp', title:hvpTitle });
+
+          // ── Gamma presentation label (iframe preview + PDF adjunto) ──────────
+          } else if (/^cap(\d+)_presentacion_gamma\.html$/.test(fn) && gammaDataMap[parseInt(fn.match(/^cap(\d+)_presentacion_gamma\.html$/)![1])]) {
+            const gammaCapN = parseInt(fn.match(/^cap(\d+)_presentacion_gamma\.html$/)![1]);
+            const gamma = gammaDataMap[gammaCapN];
+            const gammaModIdx = gammaCapN <= 3 ? 0 : gammaCapN <= 6 ? 1 : 2;
+            const gammaPal = D.pal ?? {};
+            const gammaModHex = gammaModIdx === 0 ? (gammaPal.m1 ?? '#2563EB')
+                              : gammaModIdx === 1 ? (gammaPal.m2 ?? '#16A085')
+                                                   : (gammaPal.m3 ?? '#7D3C98');
+            const gammaCapName = caps[gammaCapN - 1]?.t ?? `Capítulo ${gammaCapN}`;
+
+            const aid = actId++; const mid = modId++;
+            const gammaTitle = safeActivityName(`📊 Presentación Cap ${gammaCapN}${gammaCapName ? ' — ' + gammaCapName : ''}`);
+            const dir = `activities/label_${mid}`;
+            // ctxId capturado ANTES de labelXml() (que lo incrementa) — mismo patrón que el audio.
+            const gammaLabelCtx = ctxId;
+
+            const pdfBuffer = gamma.pdfStatus === 'ok' ? gammaPdfMap[gammaCapN] : undefined;
+            let pdfFilename: string | null = null;
+            let gammaFid: number | null = null;
+            if (pdfBuffer) {
+              pdfFilename = `cap${gammaCapN}_presentacion.pdf`;
+              const pdfHash = sha1Buf(pdfBuffer);
+              gammaFid = fileId++;
+              zip.file(`files/${pdfHash.substring(0,2)}/${pdfHash}`, pdfBuffer);
+              filesXmlEntries.push({ id:gammaFid, hash:pdfHash, ctx:gammaLabelCtx, comp:'mod_label', area:'intro', item:0, path:'/', name:pdfFilename, size:pdfBuffer.length, mime:'application/pdf' });
+            }
+
+            const gammaContent = gammaLabelHtml(gammaCapN, gammaCapName, gammaModHex, gamma, pdfFilename);
+
+            zip.file(dir + '/label.xml',   labelXml(aid, mid, gammaTitle, gammaContent));
+            zip.file(dir + '/module.xml',  moduleXml(mid, 'label', sec.num));
+            zip.file(dir + '/grades.xml',  gradesXml(aid));
+            zip.file(dir + '/inforef.xml', gammaFid !== null
+              ? `<?xml version="1.0" encoding="UTF-8"?>\n<inforef>\n  <fileref>\n    <file><id>${gammaFid}</id></file>\n  </fileref>\n</inforef>`
+              : inforefXml());
+            writeActFiles(dir);
+            htmlActivities.push({ mid, dir, name:gammaTitle, content:gammaContent, isLabel:true, capNum:gammaCapN });
+            secActs.push({ mid });
+            mbzActivities.push({ mid, secnum:sec.num, modname:'label', title:gammaTitle, dir });
+            actSettings.push({ mid, modname:'label', title:gammaTitle });
 
           // ── Standard label/page ───────────────────────────────────────────
           } else {

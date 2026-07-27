@@ -52,6 +52,7 @@ export type UsageEventComponent =
   | 'video'
   | 'youtube'
   | 'h5p'
+  | 'gamma'
   | 'package'
   | 'storage'
   | 'orchestration';

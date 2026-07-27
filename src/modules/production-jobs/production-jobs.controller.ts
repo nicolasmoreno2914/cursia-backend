@@ -16,6 +16,7 @@ import { CreateContentJobDto } from './dto/create-content-job.dto';
 import { CreateVideoJobDto } from './dto/create-video-job.dto';
 import { CreateAudioJobDto } from './dto/create-audio-job.dto';
 import { CreateH5PJobDto } from './dto/create-h5p-job.dto';
+import { CreateGammaJobDto } from './dto/create-gamma-job.dto';
 import { CreatePackageJobDto } from './dto/create-package-job.dto';
 import { CreateFullCourseJobDto } from './dto/create-full-course-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
@@ -95,6 +96,20 @@ export class ProductionJobsController {
     @CurrentUser() user: AuthUser,
   ) {
     return this.jobsService.createH5PJob(user.id, dto);
+  }
+
+  /**
+   * POST /api/v1/jobs/gamma
+   * Crea un production_job para generar las presentaciones Gamma por capítulo.
+   * Idempotente — si ya hay un job activo para el curso, lo devuelve.
+   */
+  @Post('gamma')
+  @HttpCode(HttpStatus.CREATED)
+  async createGammaJob(
+    @Body() dto: CreateGammaJobDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.jobsService.createGammaJob(user.id, dto);
   }
 
   /**

@@ -6,7 +6,7 @@ import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import { Artifact } from '../modules/artifacts/entities/artifact.entity';
 import { ProductionJobsService } from '../modules/production-jobs/production-jobs.service';
 import { ProductionJob } from '../modules/production-jobs/entities/production-job.entity';
-import { MbzBuilderService, HvpEntry } from '../package/mbz-builder.service';
+import { MbzBuilderService, HvpEntry, GammaEntry } from '../package/mbz-builder.service';
 import { EventsService } from '../events/events.service';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -227,12 +227,35 @@ async function handlePackageJob(
       if (audiobook) logger.log(`[PackageWorker] Audiobook: ${audiobook.length} bytes`);
     }
 
+    // Gamma presentations (obligatorio en el flujo normal — el orquestador no llega a este
+    // paso sin gammaSnapshotArtifactId; si falta acá, el paquete simplemente sale sin ellas).
+    const gammaSnapshotId = payload.gammaSnapshotArtifactId as string | null ?? null;
+    let gammaData: Record<number, GammaEntry> | undefined;
+    let gammaPdfs: Record<number, Buffer> | undefined;
+    if (gammaSnapshotId) {
+      const gammaSnapshot = await downloadArtifactJson(artifactsService, job.ownerId, gammaSnapshotId, logger);
+      if (gammaSnapshot?.GAMMA_SNAPSHOT && typeof gammaSnapshot.GAMMA_SNAPSHOT === 'object') {
+        gammaData = {};
+        gammaPdfs = {};
+        for (const [k, v] of Object.entries(gammaSnapshot.GAMMA_SNAPSHOT as Record<string, any>)) {
+          const capN = parseInt(k);
+          if (isNaN(capN) || !v || typeof v !== 'object') continue;
+          gammaData[capN] = v as GammaEntry;
+          if (v.pdfStatus === 'ok' && v.pdfArtifactId) {
+            const buf = await downloadArtifactBuffer(artifactsService, job.ownerId, v.pdfArtifactId, logger);
+            if (buf) gammaPdfs[capN] = buf;
+          }
+        }
+        logger.log(`[PackageWorker] Gamma data loaded: ${Object.keys(gammaData).length} caps, ${Object.keys(gammaPdfs).length} PDFs`);
+      }
+    }
+
     await sendHeartbeat();
     if (leaseLost) return;
 
     // ── Step 3: Build MBZ ────────────────────────────────────────────────────
     await updateProgress('preparing_package', 'Preparando paquete Moodle…');
-    logger.log(`[PackageWorker] Building MBZ for job ${jobId}: F=${Object.keys(F).length} files, hvp=${Object.keys(hvpData ?? {}).length} caps`);
+    logger.log(`[PackageWorker] Building MBZ for job ${jobId}: F=${Object.keys(F).length} files, hvp=${Object.keys(hvpData ?? {}).length} caps, gamma=${Object.keys(gammaData ?? {}).length} caps`);
 
     const buildResult = await mbzBuilder.buildMbz({
       courseData:    D,
@@ -240,6 +263,8 @@ async function handlePackageJob(
       audioWelcome,
       audiobook,
       hvpData,
+      gammaData,
+      gammaPdfs,
       moodleVersion: options.moodleVersion ?? '4.1',
     });
 
