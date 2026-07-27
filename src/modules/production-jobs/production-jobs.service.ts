@@ -4,6 +4,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  OnModuleInit,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
@@ -229,7 +230,7 @@ export interface PackageJobCreatedResponse {
 }
 
 @Injectable()
-export class ProductionJobsService {
+export class ProductionJobsService implements OnModuleInit {
   private readonly logger = new Logger(ProductionJobsService.name);
 
   constructor(
@@ -240,6 +241,54 @@ export class ProductionJobsService {
     private readonly dataSource: DataSource,
     private readonly eventsService: EventsService,
   ) {}
+
+  /**
+   * Reaper de jobs huérfanos — corre en cada proceso que carga este servicio
+   * (backend + los 7 workers), cada 5 min. Un job que se quedó en
+   * worker_status='running' con el lease vencido hace rato significa que el
+   * worker que lo tenía murió sin marcarlo failed (crash, OOM, deploy a mitad
+   * de camino) — sin esto, el frontend lo encuentra como "activo" para
+   * siempre y nunca crea un job nuevo (bug real detectado el 2026-07-27:
+   * un backend_audio de una semana atrás bloqueó una generación nueva).
+   */
+  onModuleInit(): void {
+    const REAP_INTERVAL_MS = 5 * 60 * 1000;
+    setInterval(() => {
+      this.reapStaleJobs().catch((e) => {
+        this.logger.warn(`[Reaper] falló: ${e instanceof Error ? e.message : String(e)}`);
+      });
+    }, REAP_INTERVAL_MS);
+  }
+
+  /**
+   * Marca como failed_retryable cualquier job atascado en worker_status='running'
+   * cuyo lease venció hace más de 5 minutos (el worker que lo tenía ya no existe).
+   * Público para poder llamarlo manualmente/desde un script si hace falta.
+   */
+  async reapStaleJobs(): Promise<number> {
+    const stale: Array<{ id: string; execution_mode: string }> = await this.jobRepo.query(`
+      SELECT id, execution_mode FROM production_jobs
+      WHERE worker_status = 'running'
+        AND lease_until IS NOT NULL
+        AND lease_until < NOW() - INTERVAL '5 minutes'
+    `);
+    if (!stale.length) return 0;
+
+    await this.jobRepo.query(`
+      UPDATE production_jobs
+      SET worker_status = 'failed_retryable',
+          status = 'failed_retryable',
+          error_message = 'Job abandonado — el worker dejó de responder (lease vencido)',
+          lease_until = NULL,
+          updated_at = NOW()
+      WHERE worker_status = 'running'
+        AND lease_until IS NOT NULL
+        AND lease_until < NOW() - INTERVAL '5 minutes'
+    `);
+
+    this.logger.warn(`[Reaper] ${stale.length} job(s) huérfano(s) marcados como failed_retryable: ${stale.map((r) => `${r.execution_mode}/${r.id}`).join(', ')}`);
+    return stale.length;
+  }
 
   private sanitizePayload<T>(value: T): T {
     if (Array.isArray(value)) {
