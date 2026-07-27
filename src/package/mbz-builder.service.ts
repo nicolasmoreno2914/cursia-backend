@@ -202,8 +202,13 @@ export class MbzBuilderService {
     }
 
     function pageXml(aid: number, mid: number, pgName: string, content: string): string {
+      return pageXmlWithCtx(aid, mid, ctxId++, pgName, content);
+    }
+
+    // Variante que NO consume un contextid nuevo — mismo motivo que labelXmlWithCtx.
+    function pageXmlWithCtx(aid: number, mid: number, ctx: number, pgName: string, content: string): string {
       return `<?xml version="1.0" encoding="UTF-8"?>
-<activity id="${aid}" moduleid="${mid}" modulename="page" contextid="${ctxId++}">
+<activity id="${aid}" moduleid="${mid}" modulename="page" contextid="${ctx}">
   <page id="${aid}">
     <name>${esc(pgName)}</name>
     <intro></intro>
@@ -221,8 +226,15 @@ export class MbzBuilderService {
     }
 
     function labelXml(aid: number, mid: number, name: string, content: string): string {
+      return labelXmlWithCtx(aid, mid, ctxId++, name, content);
+    }
+
+    // Variante que NO consume un contextid nuevo — para reescribir un label ya creado
+    // (p. ej. el segundo paso que reescribe los CTA links) sin romper los <file> que ya
+    // quedaron registrados en files.xml apuntando al contextid original de ese label.
+    function labelXmlWithCtx(aid: number, mid: number, ctx: number, name: string, content: string): string {
       return `<?xml version="1.0" encoding="UTF-8"?>
-<activity id="${aid}" moduleid="${mid}" modulename="label" contextid="${ctxId++}">
+<activity id="${aid}" moduleid="${mid}" modulename="label" contextid="${ctx}">
   <label id="${aid}">
     <name>${xmlEsc(name)}</name>
     <intro>${xmlEsc(content)}</intro>
@@ -697,7 +709,7 @@ export class MbzBuilderService {
     const mbzActivities: Array<{mid:number;secnum:number;modname:string;title:string;dir:string}> = [];
     const secSettings:   Array<{num:number}> = [];
     const actSettings:   Array<{mid:number;modname:string;title:string}> = [];
-    const htmlActivities: Array<{mid:number;dir:string;name:string;content:string;isLabel:boolean;capNum:number|null}> = [];
+    const htmlActivities: Array<{mid:number;ctx:number;dir:string;name:string;content:string;isLabel:boolean;capNum:number|null}> = [];
     const scormIntros:   Array<Record<string, any>> = [];
     const hvpActivities: Array<{dir:string;aid:number;mid:number;hvpCtx:number;title:string;capN:number;rawIntro:string;hvpJson:Record<string,any>}> = [];
     let   libroMid:      number | null = null;
@@ -785,6 +797,7 @@ export class MbzBuilderService {
           const ctaContent = hvpCtaHtml(capIdx2, ctaCapName, ctaModHex, ctaModAc);
 
           const ctaAid = actId++; const ctaMid = modId++;
+          const ctaCtx = ctxId; // capturado antes de labelXml() — ver labelXmlWithCtx
           const ctaTitle = `🎯 Practicar — Cap ${capNStr}`;
           const ctaDir   = `activities/label_${ctaMid}`;
           zip.file(ctaDir + '/label.xml',  labelXml(ctaAid, ctaMid, ctaTitle, ctaContent));
@@ -792,7 +805,7 @@ export class MbzBuilderService {
           zip.file(ctaDir + '/grades.xml',  gradesXml(ctaAid));
           zip.file(ctaDir + '/inforef.xml', inforefXml());
           writeActFiles(ctaDir);
-          htmlActivities.push({ mid:ctaMid, dir:ctaDir, name:ctaTitle, content:ctaContent, isLabel:true, capNum:capIdx2 });
+          htmlActivities.push({ mid:ctaMid, ctx:ctaCtx, dir:ctaDir, name:ctaTitle, content:ctaContent, isLabel:true, capNum:capIdx2 });
           secActs.push({ mid: ctaMid });
           mbzActivities.push({ mid:ctaMid, secnum:sec.num, modname:'label', title:ctaTitle, dir:ctaDir });
           actSettings.push({ mid:ctaMid, modname:'label', title:ctaTitle });
@@ -1130,6 +1143,7 @@ export class MbzBuilderService {
 
             // ── 1. Intro label (design context before the video) ────────────
             const introAid  = actId++; const introMid = modId++;
+            const introCtx  = ctxId; // capturado antes de labelXml() — ver labelXmlWithCtx
             const introTitle = safeActivityName(`📖 Capítulo ${hvpCapN}${hd.capName ? ' — ' + hd.capName : ''}`);
             const introContent = hvpIntroHtml(hvpCapN, capNameStr, hvpModIdx, hvpModName, hvpModHex, hvpModAc, nombre);
             const introDir = `activities/label_${introMid}`;
@@ -1139,7 +1153,7 @@ export class MbzBuilderService {
             zip.file(introDir + '/inforef.xml', inforefXml());
             writeActFiles(introDir);
             // Also track in htmlActivities so CTA links get rewritten
-            htmlActivities.push({ mid:introMid, dir:introDir, name:introTitle, content:introContent, isLabel:true, capNum:hvpCapN });
+            htmlActivities.push({ mid:introMid, ctx:introCtx, dir:introDir, name:introTitle, content:introContent, isLabel:true, capNum:hvpCapN });
             secActs.push({ mid: introMid });
             mbzActivities.push({ mid:introMid, secnum:sec.num, modname:'label', title:introTitle, dir:introDir });
             actSettings.push({ mid:introMid, modname:'label', title:introTitle });
@@ -1199,7 +1213,7 @@ export class MbzBuilderService {
               ? `<?xml version="1.0" encoding="UTF-8"?>\n<inforef>\n  <fileref>\n    <file><id>${gammaFid}</id></file>\n  </fileref>\n</inforef>`
               : inforefXml());
             writeActFiles(dir);
-            htmlActivities.push({ mid, dir, name:gammaTitle, content:gammaContent, isLabel:true, capNum:gammaCapN });
+            htmlActivities.push({ mid, ctx:gammaLabelCtx, dir, name:gammaTitle, content:gammaContent, isLabel:true, capNum:gammaCapN });
             secActs.push({ mid });
             mbzActivities.push({ mid, secnum:sec.num, modname:'label', title:gammaTitle, dir });
             actSettings.push({ mid, modname:'label', title:gammaTitle });
@@ -1207,6 +1221,7 @@ export class MbzBuilderService {
           // ── Standard label/page ───────────────────────────────────────────
           } else {
             const aid = actId++; const mid = modId++;
+            const pgCtx = ctxId; // capturado antes de labelXml()/pageXml() — ver labelXmlWithCtx
             const pgName    = friendlyName(fn);
             const useLabel  = true; // same as PAGE_FILES=[] in 09-mbz.js
             const modtype   = useLabel ? 'label' : 'page';
@@ -1241,7 +1256,7 @@ export class MbzBuilderService {
             zip.file(dir + '/grades.xml',  gradesXml(aid));
             writeActFiles(dir);
 
-            htmlActivities.push({ mid, dir, name:pgName, content:fnContent, isLabel:useLabel,
+            htmlActivities.push({ mid, ctx:pgCtx, dir, name:pgName, content:fnContent, isLabel:useLabel,
               capNum: (() => { const m = pgName.match(/Cap\.\s*(\d+)/i); return m ? parseInt(m[1]) : null; })() });
             secActs.push({ mid });
             mbzActivities.push({ mid, secnum:sec.num, modname:modtype, title:pgName, dir });
@@ -1320,8 +1335,11 @@ export class MbzBuilderService {
 
     for (const h of htmlActivities) {
       const remapped = rewriteCtaLinks(h.content, { capNum: h.capNum });
-      if (h.isLabel) zip.file(h.dir + '/label.xml', labelXml(h.mid, h.mid, h.name, remapped));
-      else           zip.file(h.dir + '/page.xml',  pageXml(h.mid, h.mid, h.name, remapped));
+      // Reescribe el label/page con los CTA links ya resueltos, pero SIN pedir un
+      // contextid nuevo — debe seguir siendo el mismo que quedó registrado en
+      // files.xml para cualquier archivo adjunto a esta actividad (ej. el PDF de Gamma).
+      if (h.isLabel) zip.file(h.dir + '/label.xml', labelXmlWithCtx(h.mid, h.mid, h.ctx, h.name, remapped));
+      else           zip.file(h.dir + '/page.xml',  pageXmlWithCtx(h.mid, h.mid, h.ctx, h.name, remapped));
     }
     for (const si of scormIntros) {
       const fixedIntro = rewriteCtaLinks(si.introHtml, { capNum: si.capNum });
