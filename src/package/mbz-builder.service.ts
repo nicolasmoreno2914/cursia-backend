@@ -1094,12 +1094,14 @@ export class MbzBuilderService {
             // File must be associated with mod_label / intro so @@PLUGINFILE@@ resolves
             filesXmlEntries.push({ id:audioFid, hash:audioHash, ctx:audioLabelCtx, comp:'mod_label', area:'intro', item:0, path:'/', name:audioFilename, size:audioBuffer.length, mime:audioMime });
 
-            // Replace both <audio src="data:..."> and <source src="data:..."> patterns
+            // Replace <audio src="..."> / <source src="..."> placeholders. El content-worker del
+            // backend deja un data: URI; el pipeline local en cambio deja un ancla literal "#audio"
+            // (ver seccion0_audio_bienvenida.html / seccion1_audiolibro.html) — hay que cubrir ambos.
             let audioLabelContent = (F[fn] ?? '');
             audioLabelContent = audioLabelContent
-              .replace(/<source\b[^>]*\bsrc="data:[^"]*"[^>]*>/gi,
+              .replace(/<source\b[^>]*\bsrc="(?:data:[^"]*|#audio)"[^>]*>/gi,
                 `<source src="@@PLUGINFILE@@/${audioFilename}" type="${audioMime}">`)
-              .replace(/(<audio\b[^>]*?)\s+src="data:[^"]*"/gi,
+              .replace(/(<audio\b[^>]*?)\s+src="(?:data:[^"]*|#audio)"/gi,
                 `$1 src="@@PLUGINFILE@@/${audioFilename}"`);
 
             zip.file(dir + '/label.xml',   labelXml(aid, mid, audioLabelName, audioLabelContent));
