@@ -52,6 +52,7 @@ async function main() {
             'backend_audio',
             'backend_videos',
             'backend_h5p',
+            'backend_gamma',
             'backend_package',
             'backend_package_base',
             'course_full_generation',
