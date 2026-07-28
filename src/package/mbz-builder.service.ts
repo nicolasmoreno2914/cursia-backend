@@ -635,15 +635,16 @@ export class MbzBuilderService {
         : '';
       return `<div class="cc-responsive" style="width:100%;max-width:100%;overflow-x:auto;box-sizing:border-box;">`
         + `<div style="background:#0A1628;border-radius:20px;padding:28px;color:#E2E6F3;font-family:'Segoe UI',Arial,sans-serif;box-sizing:border-box;width:100%;max-width:100%;display:flex;gap:24px;flex-wrap:wrap;">`
-          + `<a href="${xmlEsc(gamma.viewUrl)}" target="_blank" rel="noopener" style="flex:0 0 auto;display:block;border-radius:14px;overflow:hidden;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);width:${clipW}px;height:${clipH}px;position:relative;text-decoration:none;">`
+          + `<div style="flex:0 0 auto;display:block;border-radius:14px;overflow:hidden;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);width:${clipW}px;height:${clipH}px;position:relative;">`
             + `<div style="width:700px;height:450px;transform:scale(${scale});transform-origin:top left;pointer-events:none;">`
               + `<iframe src="${xmlEsc(gamma.embedUrl)}" style="width:700px;height:450px;border:none;" scrolling="no" title="${xmlEsc(capName)}"></iframe>`
             + `</div>`
-            + `<div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;background:linear-gradient(180deg,rgba(10,22,40,0) 0%,rgba(10,22,40,.55) 78%,rgba(10,22,40,.85) 100%);">`
+            + `<div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;background:linear-gradient(180deg,rgba(10,22,40,0) 0%,rgba(10,22,40,.55) 78%,rgba(10,22,40,.85) 100%);pointer-events:none;">`
               + `<div style="width:44px;height:44px;border-radius:50%;background:rgba(232,105,42,.94);display:flex;align-items:center;justify-content:center;color:#fff;font-size:15px;">▶</div>`
               + `<span style="font-size:11px;font-weight:600;color:#fff;font-family:'Segoe UI',Arial,sans-serif;">Vista previa · 10 diapositivas</span>`
             + `</div>`
-          + `</a>`
+            + `<a href="${xmlEsc(gamma.viewUrl)}" target="_blank" rel="noopener" aria-label="Ver presentación completa" style="position:absolute;inset:0;display:block;"></a>`
+          + `</div>`
           + `<div style="flex:1 1 220px;min-width:220px;display:flex;flex-direction:column;justify-content:center;gap:12px;">`
             + `<h3 style="font-size:11px;font-weight:700;color:rgba(226,230,243,.5);text-transform:uppercase;letter-spacing:1.5px;margin:0;display:flex;align-items:center;gap:8px;">`
               + `<span style="width:26px;height:26px;border-radius:8px;background:rgba(232,105,42,.16);display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;font-size:13px;">📊</span>`
