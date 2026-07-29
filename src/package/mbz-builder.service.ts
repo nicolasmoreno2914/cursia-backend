@@ -621,12 +621,12 @@ export class MbzBuilderService {
     }
 
     // ── Gamma presentation label HTML (shown BEFORE the video, after chapter text) ─
-    // Iframe a su tamaño nativo (700x450), SIN escalar/recortar: Moodle sanea el HTML
-    // del label con HTMLPurifier, que por defecto NO permite position/overflow/transform
-    // — cualquier truco de "escalar+recortar" con esas propiedades se rompe en producción
-    // (confirmado: el <div> recortado dejaba salir el texto de la diapositiva hacia
-    // afuera de la tarjeta). El wrapper cc-responsive ya maneja el overflow horizontal
-    // en pantallas angostas (mismo patrón que el resto del curso usa para tablas anchas).
+    // Iframe a ancho completo (CSS width:100%, SIN atributos width/height fijos en el
+    // <iframe> — esa combinación es la que rompía el reflow de Gamma). Sin escalar ni
+    // recortar: Moodle sanea el HTML del label con HTMLPurifier, que por defecto NO
+    // permite position/overflow/transform — el truco viejo de "escalar+recortar" con
+    // esas propiedades dejaba salir el texto de la diapositiva fuera de la tarjeta.
+    // El wrapper cc-responsive maneja el overflow horizontal en pantallas muy angostas.
     function gammaLabelHtml(capN: number, capName: string, modHex: string,
                              gamma: GammaEntry, pdfFilename: string | null): string {
       const pdfButton = pdfFilename
@@ -639,8 +639,8 @@ export class MbzBuilderService {
             + `Presentación del capítulo`
           + `</h3>`
           + `<p style="font-size:14px;color:rgba(226,230,243,.65);margin:0 0 16px;line-height:1.5;">10 diapositivas con lo esencial de este capítulo</p>`
-          + `<div style="border-radius:14px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);margin-bottom:20px;line-height:0;">`
-            + `<iframe src="${xmlEsc(gamma.embedUrl)}" width="700" height="450" style="width:700px;height:450px;max-width:none;border:none;border-radius:14px;display:block;" scrolling="no" title="${xmlEsc(capName)}"></iframe>`
+          + `<div style="border-radius:14px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);margin-bottom:20px;min-width:480px;line-height:0;">`
+            + `<iframe src="${xmlEsc(gamma.embedUrl)}" style="width:100%;height:450px;border:none;border-radius:14px;display:block;" scrolling="no" title="${xmlEsc(capName)}"></iframe>`
           + `</div>`
           + `<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;">`
             + `<a href="${xmlEsc(gamma.viewUrl)}" target="_blank" rel="noopener" style="display:flex;align-items:center;justify-content:center;gap:8px;padding:14px 28px;border-radius:12px;background:${modHex};color:#fff;font-family:'Segoe UI',Arial,sans-serif;font-size:14.5px;font-weight:700;text-decoration:none;white-space:nowrap;">▶ Ver presentación completa</a>`
