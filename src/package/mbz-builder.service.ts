@@ -639,6 +639,10 @@ export class MbzBuilderService {
             + `Presentación del capítulo`
           + `</h3>`
           + `<p style="font-size:14px;color:rgba(226,230,243,.65);margin:0 0 16px;line-height:1.5;">10 diapositivas con lo esencial de este capítulo</p>`
+          + `<div style="display:flex;align-items:center;justify-content:center;gap:8px;padding:14px;margin-bottom:2px;">`
+            + `<div style="width:32px;height:32px;border-radius:50%;background:rgba(232,105,42,.94);display:flex;align-items:center;justify-content:center;color:#fff;font-size:12px;flex-shrink:0;">▶</div>`
+            + `<span style="font-size:12px;font-weight:600;color:rgba(226,230,243,.7);font-family:'Segoe UI',Arial,sans-serif;">Vista previa · 10 diapositivas</span>`
+          + `</div>`
           + `<div style="border-radius:14px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);margin-bottom:20px;min-width:480px;line-height:0;">`
             + `<iframe src="${xmlEsc(gamma.embedUrl)}" style="width:100%;height:450px;border:none;border-radius:14px;display:block;" scrolling="no" title="${xmlEsc(capName)}"></iframe>`
           + `</div>`
