@@ -103,6 +103,9 @@ jobs:
                  fi
                }
 
+               echo "━━━ [0/4] Verificar poppler-utils (pdftoppm — portadas de Gamma) ━━━"
+               command -v pdftoppm > /dev/null 2>&1 || sudo apt-get install -y poppler-utils
+
                echo "━━━ [1/4] Instalar dependencias de producción ━━━"
                npm install --omit=dev
 

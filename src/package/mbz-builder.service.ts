@@ -28,6 +28,7 @@ export interface GammaEntry {
   viewUrl:    string;
   pdfArtifactId?: string | null;
   pdfStatus?: string;
+  slideImageArtifactId?: string | null;
   cardCount?: number;
   status?: string;
 }
@@ -47,6 +48,8 @@ export interface MbzBuildInput {
   gammaData?: Record<number, GammaEntry>;
   /** Gamma presentation PDFs keyed by cap number 1-9, for @@PLUGINFILE@@ attachment. */
   gammaPdfs?: Record<number, Buffer>;
+  /** Gamma slide-1 cover images (PNG) keyed by cap number 1-9, for @@PLUGINFILE@@ attachment. */
+  gammaSlideImages?: Record<number, Buffer>;
   /** Moodle version string, default '4.1'. */
   moodleVersion?: string;
 }
@@ -71,6 +74,7 @@ export class MbzBuilderService {
     const hvpDataMap: Record<number, HvpEntry> = input.hvpData ?? {};
     const gammaDataMap: Record<number, GammaEntry> = input.gammaData ?? {};
     const gammaPdfMap: Record<number, Buffer> = input.gammaPdfs ?? {};
+    const gammaSlideImageMap: Record<number, Buffer> = input.gammaSlideImages ?? {};
 
     const keys = Object.keys(F);
     if (!keys.length) throw new Error('Sin archivos de curso en F — genera el contenido primero');
@@ -621,39 +625,32 @@ export class MbzBuilderService {
     }
 
     // ── Gamma presentation label HTML (shown BEFORE the video, after chapter text) ─
-    // Preview: iframe de Gamma a su ancho nativo (700x450) escalado hacia abajo con
-    // transform:scale (NO max-width:100%, que corta el texto de Gamma letra por letra).
-    // No interactivo (pointer-events:none) — la interacción real pasa por el botón.
-    // Layout C: preview grande a la izquierda + panel con título/botones a la derecha.
+    // Sin iframe en vivo de gamma.app: si Gamma cae o el usuario borra la
+    // presentación en su cuenta, este bloque debe seguir funcionando para
+    // siempre en cursos ya entregados. La portada es una imagen estática
+    // (página 1 del PDF, renderizada al generar) embebida como archivo real
+    // en el .mbz, y el único botón abre el PDF adjunto (también embebido) en
+    // una pestaña nueva — cero dependencias externas.
     function gammaLabelHtml(capN: number, capName: string, modHex: string,
-                             gamma: GammaEntry, pdfFilename: string | null): string {
-      const scale = 0.6;
-      const clipW = Math.round(700 * scale);
-      const clipH = Math.round(450 * scale);
-      const pdfButton = pdfFilename
-        ? `<a href="@@PLUGINFILE@@/${pdfFilename}" style="display:flex;align-items:center;justify-content:center;gap:8px;padding:13px 20px;border-radius:12px;background:rgba(255,255,255,.06);border:1px solid rgba(226,230,243,.16);color:#E2E6F3;font-family:'Segoe UI',Arial,sans-serif;font-size:13.5px;font-weight:600;text-decoration:none;white-space:nowrap;">⬇ Descargar PDF</a>`
+                             gamma: GammaEntry, pdfFilename: string | null, coverFilename: string | null): string {
+      const coverImg = coverFilename
+        ? `<div style="border-radius:14px;overflow:hidden;border:1px solid rgba(255,255,255,.08);position:relative;margin-bottom:20px;">`
+          + `<img src="@@PLUGINFILE@@/${coverFilename}" style="width:100%;display:block;" alt="${xmlEsc(capName)}">`
+          + `<div style="position:absolute;left:16px;top:16px;background:rgba(10,22,40,.75);border-radius:8px;padding:6px 12px;font-size:11px;font-weight:600;color:#fff;">Diapositiva 1 de 10</div>`
+        + `</div>`
         : '';
+      // Si el PDF falló al subir (raro, best-effort), el botón cae de último recurso
+      // al link externo de Gamma — mejor eso que un botón muerto.
+      const buttonHref = pdfFilename ? `@@PLUGINFILE@@/${pdfFilename}` : gamma.viewUrl;
       return `<div class="cc-responsive" style="width:100%;max-width:100%;overflow-x:auto;box-sizing:border-box;">`
-        + `<div style="background:#0A1628;border-radius:20px;padding:28px;color:#E2E6F3;font-family:'Segoe UI',Arial,sans-serif;box-sizing:border-box;width:100%;max-width:100%;display:flex;gap:24px;flex-wrap:wrap;">`
-          + `<div style="flex:0 0 auto;display:block;border-radius:14px;overflow:hidden;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);width:${clipW}px;height:${clipH}px;position:relative;">`
-            + `<div style="width:700px;height:450px;transform:scale(${scale});transform-origin:top left;pointer-events:none;">`
-              + `<iframe src="${xmlEsc(gamma.embedUrl)}" style="width:700px;height:450px;border:none;" scrolling="no" title="${xmlEsc(capName)}"></iframe>`
-            + `</div>`
-            + `<div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;background:linear-gradient(180deg,rgba(10,22,40,0) 0%,rgba(10,22,40,.55) 78%,rgba(10,22,40,.85) 100%);pointer-events:none;">`
-              + `<div style="width:44px;height:44px;border-radius:50%;background:rgba(232,105,42,.94);display:flex;align-items:center;justify-content:center;color:#fff;font-size:15px;">▶</div>`
-              + `<span style="font-size:11px;font-weight:600;color:#fff;font-family:'Segoe UI',Arial,sans-serif;">Vista previa · 10 diapositivas</span>`
-            + `</div>`
-            + `<a href="${xmlEsc(gamma.viewUrl)}" target="_blank" rel="noopener" aria-label="Ver presentación completa" style="position:absolute;inset:0;display:block;"></a>`
-          + `</div>`
-          + `<div style="flex:1 1 220px;min-width:220px;display:flex;flex-direction:column;justify-content:center;gap:12px;">`
-            + `<h3 style="font-size:11px;font-weight:700;color:rgba(226,230,243,.5);text-transform:uppercase;letter-spacing:1.5px;margin:0;display:flex;align-items:center;gap:8px;">`
-              + `<span style="width:26px;height:26px;border-radius:8px;background:rgba(232,105,42,.16);display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;font-size:13px;">📊</span>`
-              + `Presentación del capítulo`
-            + `</h3>`
-            + `<p style="font-size:14px;color:rgba(226,230,243,.65);margin:0;line-height:1.5;">10 diapositivas con lo esencial de este capítulo</p>`
-            + `<a href="${xmlEsc(gamma.viewUrl)}" target="_blank" rel="noopener" style="display:flex;align-items:center;justify-content:center;gap:8px;padding:14px 20px;border-radius:12px;background:${modHex};color:#fff;font-family:'Segoe UI',Arial,sans-serif;font-size:14.5px;font-weight:700;text-decoration:none;white-space:nowrap;">▶ Ver presentación completa</a>`
-            + pdfButton
-          + `</div>`
+        + `<div style="background:#0A1628;border-radius:20px;padding:28px;color:#E2E6F3;font-family:'Segoe UI',Arial,sans-serif;box-sizing:border-box;width:100%;max-width:100%;">`
+          + `<h3 style="font-size:11px;font-weight:700;color:rgba(226,230,243,.5);text-transform:uppercase;letter-spacing:1.5px;margin:0 0 12px;display:flex;align-items:center;gap:8px;">`
+            + `<span style="width:26px;height:26px;border-radius:8px;background:rgba(232,105,42,.16);display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;font-size:13px;">📊</span>`
+            + `Presentación del capítulo`
+          + `</h3>`
+          + `<p style="font-size:14px;color:rgba(226,230,243,.65);margin:0 0 16px;line-height:1.5;">10 diapositivas con lo esencial de este capítulo</p>`
+          + coverImg
+          + `<a href="${xmlEsc(buttonHref)}" target="_blank" rel="noopener" style="display:flex;align-items:center;justify-content:center;gap:8px;padding:14px 28px;border-radius:12px;background:${modHex};color:#fff;font-family:'Segoe UI',Arial,sans-serif;font-size:14.5px;font-weight:700;text-decoration:none;white-space:nowrap;">▶ Ver presentación completa</a>`
         + `</div></div>`;
     }
 
@@ -1205,13 +1202,28 @@ export class MbzBuilderService {
               filesXmlEntries.push({ id:gammaFid, hash:pdfHash, ctx:gammaLabelCtx, comp:'mod_label', area:'intro', item:0, path:'/', name:pdfFilename, size:pdfBuffer.length, mime:'application/pdf' });
             }
 
-            const gammaContent = gammaLabelHtml(gammaCapN, gammaCapName, gammaModHex, gamma, pdfFilename);
+            // Portada estática (página 1 del PDF) — reemplaza al iframe en vivo de
+            // gamma.app: el label queda funcionando aunque Gamma deje de estar
+            // disponible o la presentación se borre en la cuenta del usuario.
+            const coverBuffer = gammaSlideImageMap[gammaCapN];
+            let coverFilename: string | null = null;
+            let coverFid: number | null = null;
+            if (coverBuffer) {
+              coverFilename = `cap${gammaCapN}_portada.png`;
+              const coverHash = sha1Buf(coverBuffer);
+              coverFid = fileId++;
+              zip.file(`files/${coverHash.substring(0,2)}/${coverHash}`, coverBuffer);
+              filesXmlEntries.push({ id:coverFid, hash:coverHash, ctx:gammaLabelCtx, comp:'mod_label', area:'intro', item:0, path:'/', name:coverFilename, size:coverBuffer.length, mime:'image/png' });
+            }
 
+            const gammaContent = gammaLabelHtml(gammaCapN, gammaCapName, gammaModHex, gamma, pdfFilename, coverFilename);
+
+            const gammaFileIds = [gammaFid, coverFid].filter((id): id is number => id !== null);
             zip.file(dir + '/label.xml',   labelXml(aid, mid, gammaTitle, gammaContent));
             zip.file(dir + '/module.xml',  moduleXml(mid, 'label', sec.num));
             zip.file(dir + '/grades.xml',  gradesXml(aid));
-            zip.file(dir + '/inforef.xml', gammaFid !== null
-              ? `<?xml version="1.0" encoding="UTF-8"?>\n<inforef>\n  <fileref>\n    <file><id>${gammaFid}</id></file>\n  </fileref>\n</inforef>`
+            zip.file(dir + '/inforef.xml', gammaFileIds.length
+              ? `<?xml version="1.0" encoding="UTF-8"?>\n<inforef>\n  <fileref>\n${gammaFileIds.map((id) => `    <file><id>${id}</id></file>`).join('\n')}\n  </fileref>\n</inforef>`
               : inforefXml());
             writeActFiles(dir);
             htmlActivities.push({ mid, ctx:gammaLabelCtx, dir, name:gammaTitle, content:gammaContent, isLabel:true, capNum:gammaCapN });

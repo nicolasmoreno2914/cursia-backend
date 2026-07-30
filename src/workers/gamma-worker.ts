@@ -12,6 +12,13 @@ import { ProductionJob } from '../modules/production-jobs/entities/production-jo
 import { EventsService } from '../events/events.service';
 import { assertGammaThemesConfigured, resolveGammaThemeId } from '../config/gamma-themes.config';
 import { PDFParse } from 'pdf-parse';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
+
+const execFileAsync = promisify(execFile);
 
 const GAMMA_API_BASE = 'https://public-api.gamma.app/v1.0';
 const NUM_CARDS = 10;
@@ -253,6 +260,35 @@ async function downloadAndValidatePdf(exportUrl: string): Promise<{ buffer: Buff
   return { buffer, pageCount };
 }
 
+// ── Render de la portada (página 1 del PDF) a imagen ─────────────────────────
+// Usa pdftoppm (poppler-utils, ya instalado en el VPS vía deploy.yml) para no
+// depender de un iframe en vivo de gamma.app en el paquete final: si Gamma cae
+// o el usuario borra la presentación en su cuenta, la portada ya embebida en
+// el .mbz sigue funcionando. Best-effort: si falla, el label queda sin imagen
+// pero el botón "Ver presentación completa" (el PDF adjunto) sigue intacto.
+async function renderPdfFirstPageToPng(pdfBuffer: Buffer, logger: Logger): Promise<Buffer | null> {
+  let dir: string | null = null;
+  try {
+    dir = await mkdtemp(join(tmpdir(), 'gamma-cover-'));
+    const pdfPath = join(dir, 'in.pdf');
+    const outPrefix = join(dir, 'out');
+    await writeFile(pdfPath, pdfBuffer);
+    await execFileAsync('pdftoppm', ['-png', '-f', '1', '-l', '1', '-r', '150', pdfPath, outPrefix]);
+    // pdftoppm nombra el archivo con el número de página con padding variable
+    // (ej. "out-01.png", no necesariamente "out-1.png") — buscamos el .png real
+    // en vez de asumir el sufijo exacto.
+    const files = await readdir(dir);
+    const pngName = files.find((f) => f.endsWith('.png'));
+    if (!pngName) throw new Error('pdftoppm no generó ningún archivo .png');
+    return await readFile(join(dir, pngName));
+  } catch (e) {
+    logger.warn(`[GammaWorker] No se pudo renderizar la portada del PDF (no bloqueante): ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  } finally {
+    if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 // ── Handler principal ────────────────────────────────────────────────────────
 
 async function generateChapterWithRetries(
@@ -442,6 +478,31 @@ async function handleJob(
         logger.warn(`[GammaWorker] Cap ${chapter.n}: falló subida de PDF (no bloqueante): ${e instanceof Error ? e.message : String(e)}`);
       }
 
+      // Portada (página 1 del PDF) como imagen — reemplaza al iframe en vivo de
+      // gamma.app en el paquete final, para no depender de que Gamma siga
+      // disponible. Best-effort: si falla, el label simplemente no tendrá imagen.
+      let slideImageArtifactId: string | null = null;
+      const coverPng = await renderPdfFirstPageToPng(generated.pdfBuffer, logger);
+      if (coverPng) {
+        try {
+          const coverFilename = `cap${chapter.n}_portada.png`;
+          const coverArtifact = await artifactsService.uploadBufferArtifact({
+            ownerId: job.ownerId,
+            courseId,
+            jobId,
+            type: 'gamma_slide_image',
+            filename: coverFilename,
+            storagePath: `${job.ownerId}/${courseId}/gamma/${coverFilename}`,
+            buffer: coverPng,
+            mimeType: 'image/png',
+            metadata: { chapter: chapter.n },
+          });
+          slideImageArtifactId = coverArtifact.id;
+        } catch (e) {
+          logger.warn(`[GammaWorker] Cap ${chapter.n}: falló subida de portada (no bloqueante): ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+
       gammaSnapshotEntries[chapter.n] = {
         generationId: generated.gammaId,
         docSlug: generated.gammaUrl.split('/docs/')[1] ?? '',
@@ -450,6 +511,7 @@ async function handleJob(
         cardCount: generated.pageCount,
         pdfArtifactId,
         pdfStatus,
+        slideImageArtifactId,
         status: 'completed',
         generatedAt: new Date().toISOString(),
       };

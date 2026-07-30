@@ -232,11 +232,13 @@ async function handlePackageJob(
     const gammaSnapshotId = payload.gammaSnapshotArtifactId as string | null ?? null;
     let gammaData: Record<number, GammaEntry> | undefined;
     let gammaPdfs: Record<number, Buffer> | undefined;
+    let gammaSlideImages: Record<number, Buffer> | undefined;
     if (gammaSnapshotId) {
       const gammaSnapshot = await downloadArtifactJson(artifactsService, job.ownerId, gammaSnapshotId, logger);
       if (gammaSnapshot?.GAMMA_SNAPSHOT && typeof gammaSnapshot.GAMMA_SNAPSHOT === 'object') {
         gammaData = {};
         gammaPdfs = {};
+        gammaSlideImages = {};
         for (const [k, v] of Object.entries(gammaSnapshot.GAMMA_SNAPSHOT as Record<string, any>)) {
           const capN = parseInt(k);
           if (isNaN(capN) || !v || typeof v !== 'object') continue;
@@ -245,8 +247,12 @@ async function handlePackageJob(
             const buf = await downloadArtifactBuffer(artifactsService, job.ownerId, v.pdfArtifactId, logger);
             if (buf) gammaPdfs[capN] = buf;
           }
+          if (v.slideImageArtifactId) {
+            const img = await downloadArtifactBuffer(artifactsService, job.ownerId, v.slideImageArtifactId, logger);
+            if (img) gammaSlideImages[capN] = img;
+          }
         }
-        logger.log(`[PackageWorker] Gamma data loaded: ${Object.keys(gammaData).length} caps, ${Object.keys(gammaPdfs).length} PDFs`);
+        logger.log(`[PackageWorker] Gamma data loaded: ${Object.keys(gammaData).length} caps, ${Object.keys(gammaPdfs).length} PDFs, ${Object.keys(gammaSlideImages).length} portadas`);
       }
     }
 
@@ -265,6 +271,7 @@ async function handlePackageJob(
       hvpData,
       gammaData,
       gammaPdfs,
+      gammaSlideImages,
       moodleVersion: options.moodleVersion ?? '4.1',
     });
 
