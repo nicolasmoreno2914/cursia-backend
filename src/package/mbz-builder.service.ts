@@ -644,6 +644,8 @@ export class MbzBuilderService {
       const buttonHref = pdfFilename ? `@@PLUGINFILE@@/${pdfFilename}` : gamma.viewUrl;
       return `<div class="cc-responsive" style="width:100%;max-width:100%;overflow-x:auto;box-sizing:border-box;">`
         + `<div style="background:#0A1628;border-radius:20px;padding:28px;color:#E2E6F3;font-family:'Segoe UI',Arial,sans-serif;box-sizing:border-box;width:100%;max-width:100%;">`
+          + `<span style="display:inline-block;padding:5px 16px;border-radius:50px;background:${modHex};color:#fff;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:12px;">Capítulo ${capN}</span>`
+          + `<h2 style="font-size:22px;font-weight:800;color:#fff;margin:0 0 16px;line-height:1.3;">${xmlEsc(capName)}</h2>`
           + `<h3 style="font-size:11px;font-weight:700;color:rgba(226,230,243,.5);text-transform:uppercase;letter-spacing:1.5px;margin:0 0 12px;display:flex;align-items:center;gap:8px;">`
             + `<span style="width:26px;height:26px;border-radius:8px;background:rgba(232,105,42,.16);display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;font-size:13px;">📊</span>`
             + `Presentación del capítulo`
