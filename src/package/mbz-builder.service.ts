@@ -73,6 +73,11 @@ export class MbzBuilderService {
     const F    = input.courseFiles ?? {};
     const hvpDataMap: Record<number, HvpEntry> = input.hvpData ?? {};
     const gammaDataMap: Record<number, GammaEntry> = input.gammaData ?? {};
+    // Contenido real de cap{N}_video_interactivo.html generado por el content-worker (con
+    // descripción e instrucciones específicas del capítulo) — se guarda antes de que el
+    // sentinel <!-- HVP:N --> lo sobreescriba, para usarlo como intro real de la actividad hvp
+    // en vez de una plantilla genérica. Ver uso más abajo, junto a "const minimalIntro".
+    const videoIntroContentMap: Record<number, string> = {};
     const gammaPdfMap: Record<number, Buffer> = input.gammaPdfs ?? {};
     const gammaSlideImageMap: Record<number, Buffer> = input.gammaSlideImages ?? {};
 
@@ -688,6 +693,11 @@ export class MbzBuilderService {
         // del backend en cambio deja aquí el sentinel <!-- HVP:N -->. Si ya tenemos datos H5P reales
         // para este capítulo, forzamos el sentinel para que se embeba como actividad hvp nativa en
         // vez de caer en la tarjeta estática — igual que ya hacemos con Gamma arriba.
+        // Antes de sobreescribir, guardar el contenido real (descripción + instrucciones
+        // específicas del capítulo) para usarlo como intro de la actividad hvp más abajo.
+        if (F[videoFn] && !/^<!-- HVP:\d+ -->$/.test(F[videoFn])) {
+          videoIntroContentMap[cn] = F[videoFn];
+        }
         F[videoFn] = `<!-- HVP:${cn} -->`;
       }
       secFiles[sec].push(videoFn);
@@ -1163,8 +1173,22 @@ export class MbzBuilderService {
             const hvpCtx  = ctxId++;
             const hvpTitle = safeActivityName(`🎥 Video Interactivo Cap ${hvpCapN}${hd.capName ? ' — ' + hd.capName : ''}`);
             const dir = `activities/hvp_${mid}`;
-            // Minimal intro: just the chapter name (the full design is in the intro label)
-            const minimalIntro = `<p style="font-family:'Segoe UI',Arial,sans-serif;font-size:13px;color:rgba(226,230,243,.6);margin:0;">${xmlEsc(capNameStr)}</p>`;
+            // Preferir el contenido REAL generado para este capítulo (descripción e
+            // instrucciones específicas, no genéricas) sobre la plantilla estática — así, quien
+            // entra directo a la actividad H5P (no solo quien la ve desde la tarjeta anterior en
+            // la página del curso) también ve el contexto completo, no un encabezado genérico de
+            // Moodle con una línea gris. Se limpia el bloque "Video en preparación" (el reproductor
+            // nativo de mod_hvp ya aparece automáticamente debajo del intro — no hace falta
+            // insertar nada en ese slot). Si no hay contenido real (curso solo local, por ejemplo),
+            // se usa la plantilla estática como respaldo.
+            const realVideoIntro = videoIntroContentMap[hvpCapN];
+            const minimalIntro = realVideoIntro
+              ? realVideoIntro
+                  .replace(/<!--\s*CC_VIDEO_SLOT_START\s*-->[\s\S]*?<!--\s*CC_VIDEO_SLOT_END\s*-->/gi, '')
+                  .replace(/<div[^>]*>[^<]*Video en preparaci[oó]n[^<]*<\/div>/gi, '')
+                  .replace(/<p[^>]*>[^<]*Video en preparaci[oó]n[^<]*<\/p>/gi, '')
+                  .replace(/<p[^>]*>[^<]*El video interactivo[^<]*pr[oó]ximamente[^<]*<\/p>/gi, '')
+              : hvpIntroHtml(hvpCapN, capNameStr, hvpModIdx, hvpModName, hvpModHex, hvpModAc, nombre);
 
             zip.file(dir + '/hvp.xml',     hvpXml(aid, mid, hvpCtx, hvpCapN, hvpTitle, minimalIntro, hd.hvpJson));
             zip.file(dir + '/module.xml',  hvpModuleXml(mid, sec.num));
