@@ -499,8 +499,10 @@ export async function generateCourseContent(
     'seccion0_audio_bienvenida.html',
     createSimplePage(
       'Audio de bienvenida',
-      `<p>Esta pagina queda lista para enlazar el audio de bienvenida cuando la fase de audio este activa.</p>
-       <audio controls style="width:100%;"><source src="#audio" type="audio/mpeg" />Tu navegador no soporta audio.</audio>`,
+      `<p style="color:rgba(229,238,248,.7);line-height:1.6;margin:0 0 20px;">Un mensaje de bienvenida antes de comenzar el curso.</p>
+       <div style="background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:20px;">
+         <audio controls style="width:100%;height:48px;border-radius:10px;outline:none;" preload="metadata"><source src="#audio" type="audio/mpeg" />Tu navegador no soporta audio.</audio>
+       </div>`,
       'Audio',
     ),
     'Pagina: audio bienvenida',
@@ -571,8 +573,11 @@ export async function generateCourseContent(
     'seccion1_audiolibro.html',
     createSimplePage(
       'Audiolibro del curso',
-      `<p>Placeholder backend para enlazar el audiolibro cuando la fase de audio este disponible.</p>
-       <audio controls style="width:100%;"><source src="#audio" type="audio/mpeg" />Tu navegador no soporta audio.</audio>`,
+      `<p style="color:rgba(229,238,248,.7);line-height:1.6;margin:0 0 20px;">Escucha el contenido completo del libro guía narrado. Ideal para repasar mientras te desplazas o realizas otras actividades.</p>
+       <div style="background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:20px;">
+         <audio controls style="width:100%;height:48px;border-radius:10px;outline:none;" preload="metadata"><source src="#audio" type="audio/mpeg" />Tu navegador no soporta audio.</audio>
+         <p style="font-size:12px;color:rgba(229,238,248,.4);margin:14px 0 0;">💡 Puedes aumentar la velocidad a 1.25x o 1.5x desde los controles del reproductor.</p>
+       </div>`,
       'Audiolibro',
     ),
     'Pagina: audiolibro',
