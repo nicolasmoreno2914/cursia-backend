@@ -1345,6 +1345,16 @@ export class MbzBuilderService {
         return match;
       });
       if (libroMid) html = html.replace(/#libro-guia/g, `$@RESOURCEVIEWBYID*${libroMid}@$`);
+      // ── SANEAMIENTO: tokens $@...VIEWBYID*N@$ que la IA a veces alucina directamente,
+      // sin pasar por ningún placeholder conocido de arriba. Si el id no corresponde a
+      // una actividad real del tipo esperado en este paquete, Moodle rompe la restauración
+      // con "falta el parámetro contextid". Se neutraliza a un ancla vacía en vez de dejarlo.
+      const tokenModname: Record<string, string> = { SCORM: 'scorm', QUIZ: 'quiz', RESOURCE: 'resource', PAGE: 'page' };
+      html = html.replace(/\$@(SCORM|QUIZ|RESOURCE|PAGE)VIEWBYID\*(\d+)@\$/g, (match, kind: string, idStr: string) => {
+        const mid = parseInt(idStr);
+        if (ctaMap[mid] === tokenModname[kind]) return match;
+        return '#';
+      });
       return html;
     }
 

@@ -69,10 +69,27 @@ async function downloadArtifactBuffer(
   }
 }
 
+/**
+ * Restore-first: solo reutiliza un mbz_final ya guardado si se construyó con
+ * EXACTAMENTE los mismos artifact ids de origen que se están pidiendo ahora.
+ * Antes solo miraba "¿existe algún mbz_final para este curso?" — eso hacía que
+ * un empaquetado viejo e incompleto (ej. sin el gammaSnapshotArtifactId con
+ * portadas/PDF ya listos) quedara pegado para siempre, sin poder regenerarse
+ * aunque se pidiera explícitamente con los ids correctos.
+ */
+function sourceIdsMatch(
+  a: Record<string, string | null>,
+  b: Record<string, string | null>,
+): boolean {
+  const keys = ['contentSnapshotArtifactId', 'h5pSnapshotArtifactId', 'audioWelcomeArtifactId', 'audiobookArtifactId', 'gammaSnapshotArtifactId'];
+  return keys.every((k) => (a[k] ?? null) === (b[k] ?? null));
+}
+
 async function findExistingMbzFinalArtifact(
   artifactsService: ArtifactsService,
   ownerId: string,
   courseId: string,
+  requestedSourceIds: Record<string, string | null>,
 ): Promise<Artifact | null> {
   try {
     const list = await artifactsService.findAll(ownerId, { courseId, type: 'mbz_final' });
@@ -80,6 +97,10 @@ async function findExistingMbzFinalArtifact(
     list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
     const candidate = list[0];
     if (candidate.sizeBytes !== null && candidate.sizeBytes <= 0) return null;
+    const candidateSourceIds = (candidate.metadata as Record<string, any> | null)?.sourceArtifactIds as Record<string, string | null> | undefined;
+    // Paquetes viejos (previos a este fix) no tienen sourceArtifactIds guardado —
+    // se siguen reutilizando tal cual para no romper el comportamiento existente.
+    if (candidateSourceIds && !sourceIdsMatch(candidateSourceIds, requestedSourceIds)) return null;
     return candidate;
   } catch { return null; }
 }
@@ -104,6 +125,22 @@ async function handlePackageJob(
   const rawCourseId = job.frontendCourseId || String(job.courseId ?? 'unknown');
   const options  = (payload.options ?? {}) as Record<string, any>;
   const parentJobId = payload?.metadata?.parentJobId ?? null;
+
+  // Extraídos temprano (antes del chequeo de "ya existe") para poder comparar
+  // contra los ids con los que se construyó cualquier mbz_final ya guardado —
+  // ver findExistingMbzFinalArtifact más abajo.
+  const contentSnapshotId = payload.contentSnapshotArtifactId as string;
+  const h5pSnapshotId     = payload.h5pSnapshotArtifactId    as string | null ?? null;
+  const audioWelcomeId    = payload.audioWelcomeArtifactId   as string | null ?? null;
+  const audiobookId       = payload.audiobookArtifactId      as string | null ?? null;
+  const gammaSnapshotId   = payload.gammaSnapshotArtifactId  as string | null ?? null;
+  const requestedSourceIds = {
+    contentSnapshotArtifactId: contentSnapshotId ?? null,
+    h5pSnapshotArtifactId:     h5pSnapshotId,
+    audioWelcomeArtifactId:    audioWelcomeId,
+    audiobookArtifactId:       audiobookId,
+    gammaSnapshotArtifactId:   gammaSnapshotId,
+  };
 
   let leaseLost = false;
   let finalized = false;
@@ -161,7 +198,7 @@ async function handlePackageJob(
     // ── Step 1: Restore-first — check existing mbz_final ────────────────────
     await updateProgress('checking_existing_package', 'Verificando paquete existente…');
 
-    const existingMbz = await findExistingMbzFinalArtifact(artifactsService, job.ownerId, rawCourseId);
+    const existingMbz = await findExistingMbzFinalArtifact(artifactsService, job.ownerId, rawCourseId, requestedSourceIds);
     if (existingMbz) {
       logger.log(`[PackageWorker] mbz_final artifact already exists (${existingMbz.id}) — marking completed`);
       finalized = true;
@@ -179,11 +216,6 @@ async function handlePackageJob(
 
     // ── Step 2: Download required artifacts ──────────────────────────────────
     await updateProgress('preparing_package', 'Descargando datos del curso…');
-
-    const contentSnapshotId   = payload.contentSnapshotArtifactId as string;
-    const h5pSnapshotId       = payload.h5pSnapshotArtifactId    as string | null ?? null;
-    const audioWelcomeId      = payload.audioWelcomeArtifactId   as string | null ?? null;
-    const audiobookId         = payload.audiobookArtifactId       as string | null ?? null;
 
     if (!contentSnapshotId) {
       throw new Error('contentSnapshotArtifactId is required but missing from job payload');
@@ -229,7 +261,6 @@ async function handlePackageJob(
 
     // Gamma presentations (obligatorio en el flujo normal — el orquestador no llega a este
     // paso sin gammaSnapshotArtifactId; si falta acá, el paquete simplemente sale sin ellas).
-    const gammaSnapshotId = payload.gammaSnapshotArtifactId as string | null ?? null;
     let gammaData: Record<number, GammaEntry> | undefined;
     let gammaPdfs: Record<number, Buffer> | undefined;
     let gammaSlideImages: Record<number, Buffer> | undefined;
@@ -322,6 +353,7 @@ async function handlePackageJob(
         courseName:         D.nombre ?? null,
         filename:           buildResult.filename,
         generatedAt:        new Date().toISOString(),
+        sourceArtifactIds:  requestedSourceIds,
       },
       storageBucket:   'cursia-artifacts',
       storageProvider: 'supabase',
