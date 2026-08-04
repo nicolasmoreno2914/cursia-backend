@@ -1177,18 +1177,20 @@ export class MbzBuilderService {
             // instrucciones específicas, no genéricas) sobre la plantilla estática — así, quien
             // entra directo a la actividad H5P (no solo quien la ve desde la tarjeta anterior en
             // la página del curso) también ve el contexto completo, no un encabezado genérico de
-            // Moodle con una línea gris. Se limpia el bloque "Video en preparación" (el reproductor
-            // nativo de mod_hvp ya aparece automáticamente debajo del intro — no hace falta
-            // insertar nada en ese slot). Si no hay contenido real (curso solo local, por ejemplo),
-            // se usa la plantilla estática como respaldo.
+            // Moodle con una línea gris.
+            //
+            // IMPORTANTE: el marcador "Video en preparación" / CC_VIDEO_SLOT NO se limpia aquí —
+            // se conserva a propósito. mbzPatchToBlob() en el navegador (16-mbz-patch.js) es lo que
+            // busca ese marcador y lo reemplaza por el <iframe> real de $@HVPEMBEDBYID*mid@$
+            // (makeH5PEmbed) cuando arma el paquete final — es el mecanismo real y probado con el
+            // que este video queda embebido dentro del propio texto de introducción, no algo que
+            // dependa de que Moodle renderice el reproductor nativo por su cuenta. Si se limpia el
+            // marcador aquí, el navegador nunca tiene dónde insertar el iframe y el video queda sin
+            // embeber. Si no hay contenido real (curso solo local, por ejemplo), se usa la plantilla
+            // estática como respaldo — esa sí sin marcador, porque nunca pasó por el content-worker.
             const realVideoIntro = videoIntroContentMap[hvpCapN];
             const minimalIntro = realVideoIntro
-              ? realVideoIntro
-                  .replace(/<!--\s*CC_VIDEO_SLOT_START\s*-->[\s\S]*?<!--\s*CC_VIDEO_SLOT_END\s*-->/gi, '')
-                  .replace(/<div[^>]*>[^<]*Video en preparaci[oó]n[^<]*<\/div>/gi, '')
-                  .replace(/<p[^>]*>[^<]*Video en preparaci[oó]n[^<]*<\/p>/gi, '')
-                  .replace(/<p[^>]*>[^<]*El video interactivo[^<]*pr[oó]ximamente[^<]*<\/p>/gi, '')
-              : hvpIntroHtml(hvpCapN, capNameStr, hvpModIdx, hvpModName, hvpModHex, hvpModAc, nombre);
+              ?? hvpIntroHtml(hvpCapN, capNameStr, hvpModIdx, hvpModName, hvpModHex, hvpModAc, nombre);
 
             zip.file(dir + '/hvp.xml',     hvpXml(aid, mid, hvpCtx, hvpCapN, hvpTitle, minimalIntro, hd.hvpJson));
             zip.file(dir + '/module.xml',  hvpModuleXml(mid, sec.num));
