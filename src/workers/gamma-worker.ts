@@ -155,7 +155,14 @@ async function createGammaGeneration(chapter: ChapterInfo, themeId: string, apiK
         bottomRight: { type: 'image', source: 'themeLogo', size: 'sm' },
       },
     },
-    textOptions: { amount: 'brief' },
+    // language: 'es-419' fuerza español latinoamericano explícitamente — sin esto, Gamma
+    // decide el idioma de salida por su cuenta (según su documentación, "regardless of the
+    // language of the inputText") y puede caer a inglés cuando el capítulo trae mucha
+    // densidad de siglas técnicas en inglés (ANSI, NIOSH, ASTM, SCBA, etc. — comunes en
+    // contenido de seguridad industrial incluso en español). Confirmado en un curso real:
+    // el capítulo de EPP salió 100% en inglés mientras los otros 8 capítulos del mismo
+    // curso salieron bien en español.
+    textOptions: { amount: 'brief', language: 'es-419' },
     sharingOptions: { externalAccess: 'view' },
     themeId,
     exportAs: 'pdf',
