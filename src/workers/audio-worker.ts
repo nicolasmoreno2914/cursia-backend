@@ -34,10 +34,20 @@ function isTrueEnv(envKey: string): boolean {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const TTS_MAX_CHARS = 3900;
-const AUDIOBOOK_TARGET_WORDS = 4200;
-const AUDIOBOOK_MIN_WORDS_PER_CAP = 400; // mínimo duro por bloque de capítulo — evita que el modelo cierre antes de tiempo
 const AUDIOBOOK_EXCERPT_CHARS = 2200; // chars de extracto por cap — suficiente material real para no rellenar con paja
 const OPENAI_CHAT_URL = 'https://api.openai.com/v1/chat/completions';
+
+// El guion narrativo se genera POR CAPÍTULO (una llamada corta por capítulo) en vez de una
+// sola llamada pidiendo 4000+ palabras de una vez — los modelos cumplen objetivos cortos de
+// forma mucho más confiable que objetivos largos en una sola respuesta. Ver
+// generateAudiobookScript() más abajo para el diagnóstico completo. Mismo fix aplicado en
+// campuscloud-gen/src/js/35-tts-audio.js (frontend) — este worker es la ruta que de verdad
+// corre en la generación normal de un curso (P10 — ruta backend), el frontend es fallback.
+const AUDIOBOOK_MODEL_OVERRIDE        = 'gpt-4o'; // forzado para el guion narrativo — gpt-4o-mini no cumple objetivos de longitud de forma confiable
+const AUDIOBOOK_WORDS_PER_CHAPTER     = 480;  // objetivo por bloque narrado de capítulo (~30 min total en 9 caps + intro/cierre)
+const AUDIOBOOK_MIN_WORDS_PER_CHAPTER = 350;  // umbral real (conteo de palabras) — por debajo dispara 1 continuación acotada a ese capítulo
+const AUDIOBOOK_INTRO_WORDS           = 140;  // objetivo del bloque de introducción
+const AUDIOBOOK_CLOSING_WORDS         = 140;  // objetivo del bloque de cierre
 
 function cleanAudioText(raw: string): string {
   return (raw || '')
@@ -106,72 +116,24 @@ function buildWelcomeScript(courseData: Record<string, any>): string {
   return parts;
 }
 
-async function generateAudiobookScript(
-  courseData: Record<string, any>,
-  bookExcerpts: Record<string, string>,
+function wordCount(text: string): number {
+  const t = (text || '').trim();
+  return t ? t.split(/\s+/).filter(Boolean).length : 0;
+}
+
+interface ChatCallResult {
+  text: string;
+  promptTokens: number;
+  completionTokens: number;
+}
+
+async function callOpenAiChat(
+  systemPrompt: string,
+  userPrompt: string,
+  maxTokens: number,
   apiKey: string,
-  logger: Logger,
-): Promise<{ script: string; promptTokens: number; completionTokens: number; model: string }> {
-  const nombre = courseData.nombre || 'este curso';
-  const sector = courseData.sector || '';
-  const nivel  = courseData.nivel  || '';
-  const mods: any[] = Array.isArray(courseData.mods) ? courseData.mods : [];
-  const caps: any[] = Array.isArray(courseData.caps) ? courseData.caps : [];
-
-  const capContexts: string[] = [];
-  const maxCap = Object.keys(bookExcerpts).length || caps.length || 9;
-
-  for (let i = 1; i <= Math.min(maxCap, 9); i++) {
-    const excerpt = bookExcerpts[`cap${i}`];
-    if (!excerpt || excerpt.length < 10) continue;
-    const capObj = caps[i - 1] ?? {};
-    const capName = capObj.t || `Capítulo ${i}`;
-    capContexts.push(`Capítulo ${i} — ${capName}:\n${cleanAudioText(excerpt).slice(0, AUDIOBOOK_EXCERPT_CHARS)}`);
-  }
-
-  if (capContexts.length === 0) {
-    throw new Error('Sin extractos de capítulos disponibles para generar el guion del audiolibro');
-  }
-
-  const modLine = mods.length > 0
-    ? mods.map((m: any) => m.n).filter(Boolean).join(', ')
-    : `${capContexts.length} capítulos`;
-
-  const sectorLine = sector ? ` orientado a ${sector}` : '';
-  const nivelLine  = nivel  ? `, nivel ${nivel}`        : '';
-
-  const systemPrompt =
-    'Eres un narrador experto en educación. Tu tarea es escribir el guion completo de un ' +
-    'audiolibro narrativo resumido para un curso de formación.\n\n' +
-    'REGLAS OBLIGATORIAS:\n' +
-    `- El guion debe tener entre 4000 y 4800 palabras en total. Este es un MÍNIMO, no una sugerencia — un guion de menos de 4000 palabras es un guion INCOMPLETO e inaceptable.\n` +
-    '- NO leas el contenido literalmente. Resume, explica y conecta las ideas principales.\n' +
-    '- El tono debe ser natural, conversacional y educativo — como una clase narrada en voz alta.\n' +
-    '- Cubre todos los capítulos del curso de forma proporcional — con el MISMO nivel de detalle en el último capítulo que en el primero. PROHIBIDO acortar o resumir de más los capítulos finales por cansancio narrativo.\n' +
-    '- ESTRUCTURA DEL GUION:\n' +
-    '  1. Introducción general del curso (100–150 palabras)\n' +
-    `  2. Un bloque narrativo por capítulo — MÍNIMO ${AUDIOBOOK_MIN_WORDS_PER_CAP} palabras cada uno, comenzando con una frase de transición. No pases al siguiente capítulo hasta haber completado el mínimo de palabras de este.\n` +
-    '  3. Conexiones entre capítulos cuando sea relevante\n' +
-    '  4. Ejemplos o aplicaciones prácticas concretas\n' +
-    '  5. Cierre con conclusiones y reflexión final (100–150 palabras)\n' +
-    '- PROHIBIDO resumir de forma breve o genérica. Si sientes que ya cubriste la idea central de un capítulo antes de llegar al mínimo de palabras, sigue desarrollando con más ejemplos concretos, matices, aplicaciones prácticas o contraejemplos — nunca cierres el bloque antes de cumplir el mínimo.\n' +
-    '- Usa solo texto plano. Sin markdown, sin títulos, sin listas, sin asteriscos.\n' +
-    '- El texto debe sonar natural al ser leído en voz alta.\n' +
-    '- No inventes datos técnicos, estadísticas o citas que no estén en el contenido original.\n' +
-    '- Antes de responder, verifica mentalmente que cada bloque de capítulo cumple el mínimo de palabras y que el total supera las 4000 — si no, sigue escribiendo.\n' +
-    '- Responde SOLO con el guion. Sin explicaciones, sin preámbulos.';
-
-  const userPrompt =
-    `Escribe el guion narrativo del audiolibro del curso "${nombre}"${sectorLine}${nivelLine}.\n\n` +
-    `El curso está organizado en: ${modLine}.\n\n` +
-    'A continuación tienes un extracto del contenido de cada capítulo como referencia:\n\n' +
-    capContexts.join('\n\n---\n\n') + '\n\n' +
-    `Escribe el guion completo de MÍNIMO ${AUDIOBOOK_TARGET_WORDS} palabras (nunca menos de 4000) — ` +
-    `eso significa mínimo ${AUDIOBOOK_MIN_WORDS_PER_CAP} palabras por cada uno de los ${capContexts.length} capítulos, con el mismo detalle en todos, incluidos los últimos. ` +
-    'Solo el guion, sin más texto.';
-
-  logger.log(`[AudioWorker] Generating audiobook script via OpenAI chat (${capContexts.length} caps)`);
-
+  model: string = AUDIOBOOK_MODEL_OVERRIDE,
+): Promise<ChatCallResult> {
   const res = await fetch(OPENAI_CHAT_URL, {
     method: 'POST',
     headers: {
@@ -179,8 +141,8 @@ async function generateAudiobookScript(
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      max_tokens: 8500,
+      model,
+      max_tokens: maxTokens,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user',   content: userPrompt   },
@@ -195,25 +157,202 @@ async function generateAudiobookScript(
 
   const data = await res.json() as {
     choices?: Array<{ message?: { content?: string } }>;
-    usage?: {
-      prompt_tokens?: number;
-      completion_tokens?: number;
-    };
+    usage?: { prompt_tokens?: number; completion_tokens?: number };
   };
-  const script = data?.choices?.[0]?.message?.content?.trim() ?? '';
+  const text = data?.choices?.[0]?.message?.content?.trim() ?? '';
+
+  return {
+    text,
+    promptTokens: Number(data?.usage?.prompt_tokens ?? 0),
+    completionTokens: Number(data?.usage?.completion_tokens ?? 0),
+  };
+}
+
+async function generateAudiobookIntroBlock(
+  nombre: string, modLine: string, sectorLine: string, nivelLine: string, apiKey: string,
+): Promise<ChatCallResult> {
+  const system =
+    'Eres un narrador experto en educación. Escribe SOLO la introducción de un audiolibro ' +
+    'narrativo para un curso de formación, estilo clase hablada — tono natural, conversacional, cercano.\n\n' +
+    'REGLAS:\n' +
+    `- Entre ${AUDIOBOOK_INTRO_WORDS} y ${AUDIOBOOK_INTRO_WORDS + 40} palabras.\n` +
+    '- Da la bienvenida y explica brevemente qué recorrido narrado va a cubrir el audiolibro.\n' +
+    '- Texto plano, sin markdown, sin títulos, sin listas.\n' +
+    '- Responde SOLO con el texto de la introducción, sin preámbulos ni explicaciones.';
+  const user =
+    `Curso: "${nombre}"${sectorLine}${nivelLine}. Organizado en: ${modLine}.\n\n` +
+    `Escribe la introducción del audiolibro (${AUDIOBOOK_INTRO_WORDS}-${AUDIOBOOK_INTRO_WORDS + 40} palabras).`;
+  return callOpenAiChat(system, user, 700, apiKey);
+}
+
+async function generateAudiobookClosingBlock(
+  nombre: string, apiKey: string,
+): Promise<ChatCallResult> {
+  const system =
+    'Eres un narrador experto en educación. Escribe SOLO el cierre de un audiolibro narrativo ' +
+    'para un curso de formación, estilo clase hablada — tono natural, conversacional, cercano.\n\n' +
+    'REGLAS:\n' +
+    `- Entre ${AUDIOBOOK_CLOSING_WORDS} y ${AUDIOBOOK_CLOSING_WORDS + 40} palabras.\n` +
+    '- Conclusiones y una reflexión final que invite a seguir aplicando lo aprendido.\n' +
+    '- Texto plano, sin markdown, sin títulos, sin listas.\n' +
+    '- Responde SOLO con el texto del cierre, sin preámbulos ni explicaciones.';
+  const user = `Curso: "${nombre}". Escribe el cierre del audiolibro (${AUDIOBOOK_CLOSING_WORDS}-${AUDIOBOOK_CLOSING_WORDS + 40} palabras).`;
+  return callOpenAiChat(system, user, 700, apiKey);
+}
+
+async function generateChapterNarrationBlock(
+  capN: number, capName: string, excerpt: string,
+  nombre: string, sectorLine: string, nivelLine: string, apiKey: string,
+): Promise<ChatCallResult> {
+  const system =
+    'Eres un narrador experto en educación. Escribe un bloque narrado de audiolibro para UN ' +
+    'capítulo de un curso de formación, estilo clase hablada.\n\n' +
+    'REGLAS:\n' +
+    `- Entre ${AUDIOBOOK_MIN_WORDS_PER_CHAPTER} y ${AUDIOBOOK_WORDS_PER_CHAPTER + 120} palabras.\n` +
+    '- NO leas el contenido literalmente — resume, explica y conecta las ideas principales, con ejemplos prácticos y cotidianos.\n' +
+    '- Tono natural, conversacional y educativo, como una clase narrada en voz alta.\n' +
+    '- Empieza con una frase de transición hacia este capítulo.\n' +
+    '- No inventes datos técnicos, estadísticas o citas que no estén en el extracto de referencia.\n' +
+    '- Texto plano, sin markdown, sin títulos, sin listas, sin asteriscos.\n' +
+    '- Responde SOLO con el bloque narrado, sin preámbulos ni explicaciones.';
+  const user =
+    `Capítulo ${capN} — ${capName} del curso "${nombre}"${sectorLine}${nivelLine}.\n\n` +
+    `Extracto de referencia:\n${excerpt}\n\n` +
+    `Escribe el bloque narrado de este capítulo (${AUDIOBOOK_MIN_WORDS_PER_CHAPTER}-${AUDIOBOOK_WORDS_PER_CHAPTER + 120} palabras).`;
+  return callOpenAiChat(system, user, 1500, apiKey);
+}
+
+async function continueChapterNarrationBlock(
+  existingText: string, capName: string, wordsNeeded: number, apiKey: string,
+): Promise<ChatCallResult> {
+  const system =
+    'Eres un narrador experto en educación. Vas a CONTINUAR (no repetir ni resumir) un bloque ' +
+    'narrado de audiolibro que quedó corto. Sigue de forma natural desde donde se detuvo, mismo ' +
+    'tono y estilo, desarrollando con más ejemplos concretos, matices o aplicaciones prácticas.\n\n' +
+    'REGLAS:\n' +
+    `- Añade aproximadamente ${wordsNeeded} palabras más.\n` +
+    '- NO repitas ni resumas lo ya escrito — continúa la idea.\n' +
+    '- Mismo tono conversacional, estilo clase hablada.\n' +
+    '- Texto plano, sin markdown.\n' +
+    '- Responde SOLO con el texto de continuación, sin preámbulos.';
+  const user =
+    `Capítulo: ${capName}.\n\n` +
+    `Texto ya escrito (continúa desde aquí, NO lo repitas):\n"""\n${existingText.slice(-700)}\n"""\n\n` +
+    `Continúa añadiendo aproximadamente ${wordsNeeded} palabras más.`;
+  return callOpenAiChat(system, user, 900, apiKey);
+}
+
+/**
+ * Genera el guion narrativo del audiolibro, estilo clase hablada, ~30 minutos de audio.
+ * NO lee el contenido literalmente — lo resume y narra como una clase guiada.
+ *
+ * Antes esto era UNA sola llamada a gpt-4o-mini pidiendo 4000-4800 palabras de golpe. El
+ * único chequeo automático era `script.length < 500` (~80-100 palabras) — pasaba de largo
+ * un guion de ~1100-1200 palabras (audiolibros de ~7 minutos en vez de ~30). La causa real:
+ * un modelo no cumple de forma confiable "escribe 4000+ palabras" en una sola respuesta — sí
+ * cumple de forma confiable "escribe 480 palabras". Por eso ahora se genera un bloque corto
+ * por capítulo (+ intro/cierre) con gpt-4o (no -mini), cada uno validado con conteo real de
+ * palabras, con 1 continuación acotada por capítulo si hace falta. Mismo fix que
+ * campuscloud-gen/src/js/35-tts-audio.js (frontend) — este worker es la ruta que corre por
+ * defecto en la generación normal de un curso (ver 31-course-production.js, paso 'audio',
+ * P10 — ruta backend); el frontend solo corre como fallback si el job del backend falla al
+ * crearse.
+ */
+async function generateAudiobookScript(
+  courseData: Record<string, any>,
+  bookExcerpts: Record<string, string>,
+  apiKey: string,
+  logger: Logger,
+): Promise<{ script: string; promptTokens: number; completionTokens: number; model: string }> {
+  const nombre = courseData.nombre || 'este curso';
+  const sector = courseData.sector || '';
+  const nivel  = courseData.nivel  || '';
+  const mods: any[] = Array.isArray(courseData.mods) ? courseData.mods : [];
+  const caps: any[] = Array.isArray(courseData.caps) ? courseData.caps : [];
+
+  const capContexts: Array<{ capN: number; capName: string; excerpt: string }> = [];
+  const maxCap = Object.keys(bookExcerpts).length || caps.length || 9;
+
+  for (let i = 1; i <= Math.min(maxCap, 9); i++) {
+    const excerpt = bookExcerpts[`cap${i}`];
+    if (!excerpt || excerpt.length < 10) continue;
+    const capObj = caps[i - 1] ?? {};
+    const capName = capObj.t || `Capítulo ${i}`;
+    capContexts.push({ capN: i, capName, excerpt: cleanAudioText(excerpt).slice(0, AUDIOBOOK_EXCERPT_CHARS) });
+  }
+
+  if (capContexts.length === 0) {
+    throw new Error('Sin extractos de capítulos disponibles para generar el guion del audiolibro');
+  }
+
+  const modLine = mods.length > 0
+    ? mods.map((m: any) => m.n).filter(Boolean).join(', ')
+    : `${capContexts.length} capítulos`;
+
+  const sectorLine = sector ? ` orientado a ${sector}` : '';
+  const nivelLine  = nivel  ? `, nivel ${nivel}`        : '';
+
+  logger.log(`[AudioWorker] Generating audiobook script por capítulo via OpenAI chat (${capContexts.length} caps, `
+    + `~${AUDIOBOOK_WORDS_PER_CHAPTER} palabras c/u, modelo ${AUDIOBOOK_MODEL_OVERRIDE})`);
+
+  let promptTokens = 0;
+  let completionTokens = 0;
+  const blocks: string[] = [];
+
+  const introResult = await generateAudiobookIntroBlock(nombre, modLine, sectorLine, nivelLine, apiKey);
+  promptTokens += introResult.promptTokens;
+  completionTokens += introResult.completionTokens;
+  if (introResult.text) blocks.push(introResult.text);
+
+  for (const cc of capContexts) {
+    const chapterResult = await generateChapterNarrationBlock(
+      cc.capN, cc.capName, cc.excerpt, nombre, sectorLine, nivelLine, apiKey,
+    );
+    promptTokens += chapterResult.promptTokens;
+    completionTokens += chapterResult.completionTokens;
+    let block = chapterResult.text;
+    const wc = wordCount(block);
+    logger.log(`[AudioWorker] Cap ${cc.capN} — ${cc.capName}: ${wc} palabras`);
+
+    if (wc < AUDIOBOOK_MIN_WORDS_PER_CHAPTER) {
+      const needed = AUDIOBOOK_WORDS_PER_CHAPTER - wc;
+      try {
+        const contResult = await continueChapterNarrationBlock(block, cc.capName, needed, apiKey);
+        promptTokens += contResult.promptTokens;
+        completionTokens += contResult.completionTokens;
+        if (contResult.text) {
+          block = `${block} ${contResult.text}`.replace(/\s+/g, ' ').trim();
+          logger.log(`[AudioWorker] Cap ${cc.capN} tras continuación: ${wordCount(block)} palabras`);
+        }
+      } catch (e) {
+        logger.warn(`[AudioWorker] Continuación falló para cap ${cc.capN}: `
+          + `${e instanceof Error ? e.message : String(e)} — se usa el bloque tal cual.`);
+      }
+    }
+
+    blocks.push(block);
+  }
+
+  const closingResult = await generateAudiobookClosingBlock(nombre, apiKey);
+  promptTokens += closingResult.promptTokens;
+  completionTokens += closingResult.completionTokens;
+  if (closingResult.text) blocks.push(closingResult.text);
+
+  const script = blocks.filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
 
   if (!script || script.length < 500) {
     throw new Error(`Guion del audiolibro demasiado corto (${script.length} chars)`);
   }
 
-  const wordCount = script.split(/\s+/).length;
-  logger.log(`[AudioWorker] Audiobook script: ${wordCount} words, ${script.length} chars`);
+  const totalWords = wordCount(script);
+  logger.log(`[AudioWorker] Audiobook script completo: ${totalWords} words, ${script.length} chars `
+    + `(${capContexts.length} capítulos + intro/cierre)`);
 
   return {
     script,
-    promptTokens: Number(data?.usage?.prompt_tokens ?? 0),
-    completionTokens: Number(data?.usage?.completion_tokens ?? 0),
-    model: 'gpt-4o-mini',
+    promptTokens,
+    completionTokens,
+    model: AUDIOBOOK_MODEL_OVERRIDE,
   };
 }
 
