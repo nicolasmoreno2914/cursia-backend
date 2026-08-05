@@ -1,9 +1,15 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { transcodeMp3Bitrate } from './mp3-transcode.util';
 
 const MAX_CHARS = 4000;
 const DEFAULT_VOICE = 'marin';
 const DEFAULT_MODEL = 'gpt-4o-mini-tts';
 const OPENAI_TTS_URL = 'https://api.openai.com/v1/audio/speech';
+// OpenAI TTS entrega mp3 a 128 kbps por defecto — de sobra para voz hablada. Recodificar a
+// 64 kbps (mono, sin música de por medio) reduce el peso ~50% sin pérdida perceptible, y deja
+// margen cómodo bajo el límite de 30 MB que mbz-builder.service.ts/09-mbz.js usan para decidir
+// si el audiolibro se embebe en el paquete final. Ver mp3-transcode.util.ts para el detalle.
+const TTS_TARGET_BITRATE_KBPS = 64;
 
 export interface TtsSpeechOpts {
   text: string;
@@ -77,9 +83,20 @@ export class TtsService {
     }
 
     const arrayBuffer = await res.arrayBuffer();
-    const audioBuffer = Buffer.from(arrayBuffer);
+    const rawAudioBuffer = Buffer.from(arrayBuffer);
 
-    this.logger.log(`[TTS] OK — ${audioBuffer.length} bytes`);
+    let audioBuffer: Buffer = rawAudioBuffer;
+    if (format === 'mp3') {
+      audioBuffer = await transcodeMp3Bitrate(rawAudioBuffer, TTS_TARGET_BITRATE_KBPS);
+      if (audioBuffer !== rawAudioBuffer) {
+        this.logger.log(`[TTS] OK — ${rawAudioBuffer.length} bytes → recodificado a `
+          + `${TTS_TARGET_BITRATE_KBPS}kbps: ${audioBuffer.length} bytes`);
+      } else {
+        this.logger.log(`[TTS] OK — ${audioBuffer.length} bytes (sin recodificar)`);
+      }
+    } else {
+      this.logger.log(`[TTS] OK — ${audioBuffer.length} bytes`);
+    }
 
     return { audioBuffer, chars: text.length, voice, model, format };
   }
