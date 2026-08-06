@@ -159,7 +159,6 @@ export class MbzBuilderService {
       if (fn === 'seccion0_metodologia.html')       return '⚙️ Metodología del Curso';
       if (fn === 'seccion1_ruta_aprendizaje.html')  return '🗺️ Ruta de Aprendizaje';
       if (fn === 'seccion1_libro_guia.html')        return '📚 Libro Guía del Curso';
-      if (fn === 'libro_guia_completo.html')        return '📖 Libro Guía Completo';
       if (fn === 'seccion1_audiolibro.html')        return '📻 Audiolibro del Curso';
       if (fn === 'examen_final_descripcion.html')   return 'ℹ️ Información: Examen Final';
       const vm = fn.match(/^cap(\d+)_video_interactivo\.html$/);
@@ -675,7 +674,7 @@ export class MbzBuilderService {
 
     const secFiles: Record<number, string[]> = { 0:[], 1:[], 2:[], 3:[], 4:[], 5:[] };
     secFiles[0] = ['seccion0_bienvenida.html','seccion0_audio_bienvenida.html','seccion0_introduccion.html','seccion0_metodologia.html'];
-    secFiles[1] = ['seccion1_ruta_aprendizaje.html','seccion1_libro_guia.html','libro_guia_completo.html','seccion1_audiolibro.html'];
+    secFiles[1] = ['seccion1_ruta_aprendizaje.html','seccion1_libro_guia.html','seccion1_audiolibro.html'];
     for (let ci = 0; ci < 9; ci++) {
       const sec = ci < 3 ? 2 : ci < 6 ? 3 : 4;
       const cn  = ci + 1;
@@ -1265,10 +1264,7 @@ export class MbzBuilderService {
             const aid = actId++; const mid = modId++;
             const pgCtx = ctxId; // capturado antes de labelXml()/pageXml() — ver labelXmlWithCtx
             const pgName    = friendlyName(fn);
-            // libro_guia_completo.html se sirve como 'page' (URL propia en Moodle) para que
-            // el botón "Descargar Libro Guía" de la tarjeta pueda apuntarle con
-            // $@PAGEVIEWBYID@$ — todo lo demás sigue siendo 'label', igual que siempre.
-            const useLabel  = fn !== 'libro_guia_completo.html'; // same as PAGE_FILES=[] in 09-mbz.js
+            const useLabel  = true; // same as PAGE_FILES=[] in 09-mbz.js
             const modtype   = useLabel ? 'label' : 'page';
             const dir       = `activities/${modtype}_${mid}`;
 
@@ -1283,13 +1279,6 @@ export class MbzBuilderService {
                 + '<div style="font-size:12px;color:rgba(226,230,243,.5);font-family:\'Segoe UI\',sans-serif;margin-top:3px;">El audio se agregará próximamente a este recurso.</div>'
                 + '</div></div>'
               );
-            }
-
-            // Track libro_guia_completo.html (el libro real, no la tarjeta promocional
-            // seccion1_libro_guia.html) para que el botón "Descargar Libro Guía" apunte
-            // al contenido de verdad y no se autorreferencie.
-            if (fn === 'libro_guia_completo.html') {
-              libroMid = mid;
             }
 
             if (useLabel) {
@@ -1311,6 +1300,37 @@ export class MbzBuilderService {
           }
         } // isHtml
       } // fileList
+
+      // ── Libro Guía resource activity — solo en sección 1, si el libro compilado
+      // existe. Mismo patrón ya probado en 09-mbz.js (frontend) — una actividad
+      // 'resource' real, no un label ni un page, para que el botón "Descargar Libro
+      // Guía" de la tarjeta promocional (seccion1_libro_guia.html) tenga un destino
+      // real al que apuntar con $@RESOURCEVIEWBYID*mid@$.
+      if (sec.num === 1 && F['libro_guia_completo.html']) {
+        const libroContent = F['libro_guia_completo.html'];
+        const libroCtx  = ctxId++;
+        const libroHash = sha1Buf(libroContent);
+        const libroAid  = actId++;
+        libroMid = modId++;
+        const libroFid  = fileId++;
+        const libroBytes = textBytes(libroContent);
+
+        filesXmlEntries.push({ id: libroFid, hash: libroHash, ctx: libroCtx, comp: 'mod_resource', area: 'content', item: 0, path: '/', name: 'libro_guia_completo.html', size: libroBytes, mime: 'text/html' });
+        zip.file(`files/${libroHash.substring(0,2)}/${libroHash}`, libroContent);
+
+        const libroDir = `activities/resource_${libroMid}`;
+        zip.file(`${libroDir}/resource.xml`,
+          `<?xml version="1.0" encoding="UTF-8"?>\n<activity id="${libroAid}" moduleid="${libroMid}" modulename="resource" contextid="${libroCtx}">\n  <resource id="${libroAid}">\n    <name>${xmlEsc('📖 Libro Guía Completo')}</name>\n    <intro></intro>\n    <introformat>1</introformat>\n    <tobemigrated>0</tobemigrated>\n    <legacyfiles>0</legacyfiles>\n    <legacyfileslast>$@NULL@$</legacyfileslast>\n    <display>5</display>\n    <displayoptions>a:1:{s:10:"printintro";s:1:"0";}</displayoptions>\n    <filterfiles>0</filterfiles>\n    <revision>1</revision>\n    <timemodified>${ts}</timemodified>\n  </resource>\n</activity>`);
+        zip.file(`${libroDir}/module.xml`, moduleXml(libroMid, 'resource', 1));
+        zip.file(`${libroDir}/inforef.xml`,
+          `<?xml version="1.0" encoding="UTF-8"?>\n<inforef>\n  <fileref>\n    <file><id>${libroFid}</id></file>\n  </fileref>\n</inforef>`);
+        zip.file(`${libroDir}/grades.xml`, gradesXml(libroAid));
+        writeActFiles(libroDir);
+
+        secActs.push({ mid: libroMid });
+        mbzActivities.push({ mid: libroMid, secnum: 1, modname: 'resource', title: '📖 Libro Guía Completo', dir: libroDir });
+        actSettings.push({ mid: libroMid, modname: 'resource', title: '📖 Libro Guía Completo' });
+      }
 
       // Write section XML
       const seqStr = (sec.num === 0
@@ -1376,7 +1396,7 @@ export class MbzBuilderService {
         if (m) { const mid = scormCapMap[parseInt(m[1])]; if (mid) return `href="$@SCORMVIEWBYID*${mid}@$"`; }
         return match;
       });
-      if (libroMid) html = html.replace(/#libro-guia/g, `$@PAGEVIEWBYID*${libroMid}@$`);
+      if (libroMid) html = html.replace(/#libro-guia/g, `$@RESOURCEVIEWBYID*${libroMid}@$`);
       // ── SANEAMIENTO: tokens $@...VIEWBYID*N@$ que la IA a veces alucina directamente,
       // sin pasar por ningún placeholder conocido de arriba. Si el id no corresponde a
       // una actividad real del tipo esperado en este paquete, Moodle rompe la restauración
