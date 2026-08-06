@@ -159,6 +159,7 @@ export class MbzBuilderService {
       if (fn === 'seccion0_metodologia.html')       return '⚙️ Metodología del Curso';
       if (fn === 'seccion1_ruta_aprendizaje.html')  return '🗺️ Ruta de Aprendizaje';
       if (fn === 'seccion1_libro_guia.html')        return '📚 Libro Guía del Curso';
+      if (fn === 'libro_guia_completo.html')        return '📖 Libro Guía Completo';
       if (fn === 'seccion1_audiolibro.html')        return '📻 Audiolibro del Curso';
       if (fn === 'examen_final_descripcion.html')   return 'ℹ️ Información: Examen Final';
       const vm = fn.match(/^cap(\d+)_video_interactivo\.html$/);
@@ -674,7 +675,7 @@ export class MbzBuilderService {
 
     const secFiles: Record<number, string[]> = { 0:[], 1:[], 2:[], 3:[], 4:[], 5:[] };
     secFiles[0] = ['seccion0_bienvenida.html','seccion0_audio_bienvenida.html','seccion0_introduccion.html','seccion0_metodologia.html'];
-    secFiles[1] = ['seccion1_ruta_aprendizaje.html','seccion1_libro_guia.html','seccion1_audiolibro.html'];
+    secFiles[1] = ['seccion1_ruta_aprendizaje.html','seccion1_libro_guia.html','libro_guia_completo.html','seccion1_audiolibro.html'];
     for (let ci = 0; ci < 9; ci++) {
       const sec = ci < 3 ? 2 : ci < 6 ? 3 : 4;
       const cn  = ci + 1;
@@ -1264,7 +1265,10 @@ export class MbzBuilderService {
             const aid = actId++; const mid = modId++;
             const pgCtx = ctxId; // capturado antes de labelXml()/pageXml() — ver labelXmlWithCtx
             const pgName    = friendlyName(fn);
-            const useLabel  = true; // same as PAGE_FILES=[] in 09-mbz.js
+            // libro_guia_completo.html se sirve como 'page' (URL propia en Moodle) para que
+            // el botón "Descargar Libro Guía" de la tarjeta pueda apuntarle con
+            // $@PAGEVIEWBYID@$ — todo lo demás sigue siendo 'label', igual que siempre.
+            const useLabel  = fn !== 'libro_guia_completo.html'; // same as PAGE_FILES=[] in 09-mbz.js
             const modtype   = useLabel ? 'label' : 'page';
             const dir       = `activities/${modtype}_${mid}`;
 
@@ -1281,8 +1285,10 @@ export class MbzBuilderService {
               );
             }
 
-            // Track libro_guia for CTA rewriting
-            if (fn === 'seccion1_libro_guia.html' || fn.startsWith('libro_guia')) {
+            // Track libro_guia_completo.html (el libro real, no la tarjeta promocional
+            // seccion1_libro_guia.html) para que el botón "Descargar Libro Guía" apunte
+            // al contenido de verdad y no se autorreferencie.
+            if (fn === 'libro_guia_completo.html') {
               libroMid = mid;
             }
 
@@ -1370,7 +1376,7 @@ export class MbzBuilderService {
         if (m) { const mid = scormCapMap[parseInt(m[1])]; if (mid) return `href="$@SCORMVIEWBYID*${mid}@$"`; }
         return match;
       });
-      if (libroMid) html = html.replace(/#libro-guia/g, `$@RESOURCEVIEWBYID*${libroMid}@$`);
+      if (libroMid) html = html.replace(/#libro-guia/g, `$@PAGEVIEWBYID*${libroMid}@$`);
       // ── SANEAMIENTO: tokens $@...VIEWBYID*N@$ que la IA a veces alucina directamente,
       // sin pasar por ningún placeholder conocido de arriba. Si el id no corresponde a
       // una actividad real del tipo esperado en este paquete, Moodle rompe la restauración
