@@ -1306,8 +1306,17 @@ export class MbzBuilderService {
       // 'resource' real, no un label ni un page, para que el botón "Descargar Libro
       // Guía" de la tarjeta promocional (seccion1_libro_guia.html) tenga un destino
       // real al que apuntar con $@RESOURCEVIEWBYID*mid@$.
-      if (sec.num === 1 && F['libro_guia_completo.html']) {
-        const libroContent = F['libro_guia_completo.html'];
+      // Defense-in-depth: si el snapshot llegó truncado (p.ej. por un sanitizador
+      // de diagnóstico corriendo sobre el contenido real), no incrustar HTML roto
+      // en el .mbz final — mejor omitir la actividad que entregar una página en blanco.
+      const libroRaw = F['libro_guia_completo.html'];
+      const libroLooksTruncated = !!libroRaw && !/<\/html>\s*$/i.test(libroRaw.trim());
+      if (libroLooksTruncated) {
+        this.logger.warn(`[MbzBuilder] libro_guia_completo.html parece truncado (${libroRaw.length} chars, sin </html> de cierre) — se omite del MBZ`);
+      }
+
+      if (sec.num === 1 && libroRaw && !libroLooksTruncated) {
+        const libroContent = libroRaw;
         const libroCtx  = ctxId++;
         const libroHash = sha1Buf(libroContent);
         const libroAid  = actId++;
