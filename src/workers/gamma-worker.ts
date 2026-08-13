@@ -163,6 +163,21 @@ async function createGammaGeneration(chapter: ChapterInfo, themeId: string, apiK
     // el capítulo de EPP salió 100% en inglés mientras los otros 8 capítulos del mismo
     // curso salieron bien en español.
     textOptions: { amount: 'brief', language: 'es-419' },
+    // Sin imageOptions, Gamma decide el estilo de imagen por su cuenta — y los modelos de
+    // imagen por IA son notoriamente malos renderizando texto legible dentro de la imagen
+    // (títulos, letreros, logos salen como garabatos sin sentido). Se fuerza estilo
+    // fotográfico/ilustrativo de apoyo educativo, explícitamente sin texto — el texto real
+    // de cada diapositiva ya lo pone Gamma como capa tipográfica aparte, no hace falta que
+    // la imagen intente llevar texto también.
+    imageOptions: {
+      source: 'aiGenerated',
+      style:
+        'Fotografía realista o ilustración editorial que funcione como apoyo visual ' +
+        'educativo del contenido de la diapositiva — personas, escenas, objetos y entornos ' +
+        'reales del sector y contexto del curso. Sin ningún texto, letra, palabra, número, ' +
+        'letrero, cartel, señalización, logo, marca de agua ni tipografía dentro de la ' +
+        'imagen: ningún elemento gráfico debe intentar representar texto legible.',
+    },
     sharingOptions: { externalAccess: 'view' },
     themeId,
     exportAs: 'pdf',
