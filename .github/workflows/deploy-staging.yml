@@ -1,0 +1,157 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# deploy-staging.yml — CI/CD: push a staging → deploy automático a la instancia
+# de staging, en el MISMO VPS que producción pero en directorio/puerto/procesos
+# pm2 completamente separados. Nunca toca los procesos ni el directorio de
+# producción (cursia-backend en VPS_PATH) — ver deploy.yml para ese workflow.
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# REQUISITOS ADICIONALES (GitHub → Settings → Secrets and variables → Actions),
+# sobre los que ya existen para producción (VPS_HOST, VPS_USER, VPS_SSH_KEY):
+#
+#   VPS_PATH_STAGING     Directorio staging en el VPS, ej. /var/www/cursia-backend-staging
+#   HEALTH_URL_STAGING   URL de health check de staging, ej. https://api-staging.cursia.nomaddi.com/health
+#
+# El puerto y las credenciales de Supabase de staging viven en el .env propio
+# de VPS_PATH_STAGING en el VPS (nunca se sincronizan por rsync — ver el paso
+# de sync abajo, que excluye .env igual que el workflow de producción). Ese
+# .env se crea UNA sola vez a mano en el VPS; los deploys siguientes lo dejan
+# intacto.
+#
+# ══════════════════════════════════════════════════════════════════════════════
+
+name: Deploy to Staging (Contabo VPS)
+
+on:
+  push:
+    branches: [staging]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build & Deploy to Staging
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install all dependencies (including devDeps for tsc)
+        run: npm ci
+
+      - name: Compile TypeScript on runner
+        run: npm run build
+
+      - name: Verify dist/main.js
+        run: |
+          if [ ! -f dist/main.js ]; then
+            echo "❌ dist/main.js no encontrado."
+            exit 1
+          fi
+          echo "✅ dist/main.js OK — $(du -sh dist/ | cut -f1)"
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Fix VPS staging file ownership (heals stale root-owned files)
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+              "sudo mkdir -p ${{ secrets.VPS_PATH_STAGING }} && sudo chown -R ${{ secrets.VPS_USER }}:${{ secrets.VPS_USER }} ${{ secrets.VPS_PATH_STAGING }}"
+
+      - name: Sync source + dist to VPS (staging path only — nunca toca VPS_PATH de producción)
+        run: |
+          rsync -az --delete \
+            --exclude '.git' \
+            --exclude 'node_modules' \
+            --exclude '.env' \
+            --exclude '.env.*' \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
+            ./ "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:${{ secrets.VPS_PATH_STAGING }}/"
+
+      - name: Install prod deps + migrate + restart staging processes on VPS
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+              'set -e
+               cd '"${{ secrets.VPS_PATH_STAGING }}"'
+
+               if [ ! -f .env ]; then
+                 echo "❌ Falta .env en '"${{ secrets.VPS_PATH_STAGING }}"' — créalo a mano una sola vez"
+                 echo "   (PORT distinto al de producción + credenciales del proyecto de Supabase de staging)."
+                 exit 1
+               fi
+
+               ensure_pm2_process() {
+                 local name="$1"
+                 local start_script="$2"
+                 if sudo pm2 describe "$name" > /dev/null 2>&1; then
+                   sudo pm2 restart "$name" --update-env
+                 else
+                   sudo pm2 start npm --name "$name" -- run "$start_script"
+                 fi
+               }
+
+               echo "━━━ [0/4] Verificar poppler-utils (pdftoppm — portadas de Gamma) ━━━"
+               command -v pdftoppm > /dev/null 2>&1 || sudo apt-get install -y poppler-utils
+
+               echo "━━━ [1/4] Instalar dependencias de producción ━━━"
+               npm install --omit=dev
+
+               echo "━━━ [2/4] Alinear restricciones de production_jobs (staging) ━━━"
+               node scripts/migrate-production-jobs-constraints.js
+
+               echo "━━━ [3/4] Migrar usage_events y cost_rates (staging) ━━━"
+               node scripts/migrate-usage-events-costs.js
+
+               echo "━━━ [4/4] Recargar PM2 staging (zero-downtime) ━━━"
+               ensure_pm2_process cursia-backend-staging start:prod
+               ensure_pm2_process cursia-content-worker-staging start:content-worker
+               ensure_pm2_process cursia-video-worker-staging start:video-worker
+               ensure_pm2_process cursia-audio-worker-staging start:audio-worker
+               ensure_pm2_process cursia-h5p-worker-staging start:h5p-worker
+               ensure_pm2_process cursia-gamma-worker-staging start:gamma-worker
+               ensure_pm2_process cursia-package-worker-staging start:package-worker
+               ensure_pm2_process cursia-full-worker-staging start:full-worker
+               sudo pm2 save
+               sudo pm2 status
+
+               echo "✅ Deploy a staging completado."'
+
+      - name: Health check post-deploy
+        run: |
+          echo "Esperando 20 segundos para que NestJS inicialice…"
+          sleep 20
+          for i in 1 2 3 4 5; do
+            RESPONSE=$(curl -sf --max-time 15 "${{ secrets.HEALTH_URL_STAGING }}" || echo "FAILED")
+            if echo "$RESPONSE" | grep -q '"status":"ok"'; then
+              echo "✅ Health check OK (intento $i): $RESPONSE"
+              exit 0
+            fi
+            echo "⏳ Intento $i: staging no disponible aún ($RESPONSE), esperando 8s…"
+            sleep 8
+          done
+          echo "❌ Health check FALLÓ tras 5 intentos"
+          exit 1
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "⚠️  El deploy de STAGING falló. Último commit: $(git rev-parse --short HEAD)"
+          echo "Esto NO afecta producción — cursia-backend sigue corriendo con su propio código."
