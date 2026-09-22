@@ -17,6 +17,7 @@ import { ContentGenerationModule } from './modules/content-generation/content-ge
 import { PackageModule } from './package/package.module';
 import { InstitutionsModule } from './modules/institutions/institutions.module';
 import { BrandProfilesModule } from './modules/brand-profiles/brand-profiles.module';
+import { CourseSetupModule } from './modules/course-setup/course-setup.module';
 
 @Module({
   imports: [
@@ -39,6 +40,7 @@ import { BrandProfilesModule } from './modules/brand-profiles/brand-profiles.mod
     PackageModule,
     InstitutionsModule,
     BrandProfilesModule,
+    CourseSetupModule,
   ],
   controllers: [AppController],
   providers: [AppService],
