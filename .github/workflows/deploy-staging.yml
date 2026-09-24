@@ -108,19 +108,25 @@ jobs:
                  fi
                }
 
-               echo "━━━ [0/4] Verificar poppler-utils (pdftoppm — portadas de Gamma) ━━━"
+               echo "━━━ [0/6] Verificar poppler-utils (pdftoppm — portadas de Gamma) ━━━"
                command -v pdftoppm > /dev/null 2>&1 || sudo apt-get install -y poppler-utils
 
-               echo "━━━ [1/4] Instalar dependencias de producción ━━━"
+               echo "━━━ [1/6] Instalar dependencias de producción ━━━"
                npm install --omit=dev
 
-               echo "━━━ [2/4] Alinear restricciones de production_jobs (staging) ━━━"
+               echo "━━━ [2/6] Alinear restricciones de production_jobs (staging) ━━━"
                node scripts/migrate-production-jobs-constraints.js
 
-               echo "━━━ [3/4] Migrar usage_events y cost_rates (staging) ━━━"
+               echo "━━━ [3/6] Aplicar modelo de estructura dinámica de cursos (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-dynamic-course-structure.js
+
+               echo "━━━ [4/6] Verificar esquema de estructura dinámica de cursos (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-dynamic-course-structure-schema.js
+
+               echo "━━━ [5/6] Migrar usage_events y cost_rates (staging) ━━━"
                node scripts/migrate-usage-events-costs.js
 
-               echo "━━━ [4/4] Recargar PM2 staging (zero-downtime) ━━━"
+               echo "━━━ [6/6] Recargar PM2 staging (zero-downtime) ━━━"
                ensure_pm2_process cursia-backend-staging start:prod
                ensure_pm2_process cursia-content-worker-staging start:content-worker
                ensure_pm2_process cursia-video-worker-staging start:video-worker

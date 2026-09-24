@@ -51,6 +51,12 @@ export class Course {
   @Column({ default: 'draft' })
   status: string; // draft | in_review | published | archived
 
+  @Column({ name: 'structure_version', default: 'legacy' })
+  structureVersion: string; // legacy | dynamic
+
+  @Column({ name: 'structure_version_counter', default: 0 })
+  structureVersionCounter: number; // optimistic concurrency para ediciones de estructura
+
   @Column({ type: 'jsonb', nullable: true })
   metadata: Record<string, any>;
 
