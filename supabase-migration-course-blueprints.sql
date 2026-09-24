@@ -37,10 +37,20 @@ create trigger course_blueprints_immutable before update on public.course_bluepr
   for each row execute function public.course_blueprints_forbid_update();
 
 -- Reapuntar las 3 FKs de Fase 1 (vacías) de course_versions a course_blueprints.
+--
+-- Nota (fix ronda 1): los nombres de variables PL/pgSQL declaradas acá (r,
+-- old_fk, has_old_fk, has_new_fk, n) deben ser distintos de CUALQUIER alias
+-- usado dentro de las queries del bloque (variable_conflict = error por
+-- default) — de lo contrario Postgres tira "column reference ... is
+-- ambiguous" en vez de resolver el alias de tabla. Antes había un alias
+-- "c" en la subquery de "ya existe la FK nueva" que colisionaba con el
+-- loop variable "c" usado para dropear FKs viejas.
 do $$
 declare
   r record;
-  c record;
+  old_fk record;
+  has_old_fk boolean;
+  has_new_fk boolean;
   n bigint;
 begin
   for r in select * from (values
@@ -48,14 +58,44 @@ begin
       ('artifacts',       'generated_with_version_id'),
       ('production_jobs', 'blueprint_version_id')) as t(tbl, col)
   loop
-    -- Solo reapuntar columnas vacías: si hay datos, abortar toda la migración.
+    select exists (
+      select 1
+        from pg_constraint fk
+        join pg_class t on t.oid = fk.conrelid
+        join pg_namespace ns on ns.oid = t.relnamespace and ns.nspname = 'public'
+        join pg_attribute a on a.attrelid = t.oid and a.attnum = any (fk.conkey)
+       where t.relname = r.tbl and a.attname = r.col and fk.contype = 'f'
+         and fk.confrelid = 'public.course_versions'::regclass
+    ) into has_old_fk;
+
+    select exists (
+      select 1
+        from pg_constraint fk
+        join pg_class t on t.oid = fk.conrelid
+        join pg_namespace ns on ns.oid = t.relnamespace and ns.nspname = 'public'
+        join pg_attribute a on a.attrelid = t.oid and a.attnum = any (fk.conkey)
+       where t.relname = r.tbl and a.attname = r.col and fk.contype = 'f'
+         and fk.confrelid = 'public.course_blueprints'::regclass
+    ) into has_new_fk;
+
+    -- Ya reapuntada (no hay FK vieja y ya existe la nueva): no-op puro, sin
+    -- importar los datos que haya en la columna a esta altura — una fase
+    -- posterior va a escribir ids de blueprint ahí de verdad, y un
+    -- re-deploy no debe abortar por eso.
+    if not has_old_fk and has_new_fk then
+      continue;
+    end if;
+
+    -- Solo cuando de verdad se va a reapuntar: si hay datos, abortar toda
+    -- la migración (evita reapuntar una FK que ya tiene filas apuntando a
+    -- course_versions con contenido real).
     execute format('select count(*) from public.%I where %I is not null', r.tbl, r.col) into n;
     if n > 0 then
       raise exception '%.% tiene % filas no nulas — no se reapunta la FK', r.tbl, r.col, n;
     end if;
 
     -- Quitar toda FK de esa columna que apunte a course_versions (0 o 1).
-    for c in
+    for old_fk in
       select con.conname
         from pg_constraint con
         join pg_class t on t.oid = con.conrelid
@@ -64,17 +104,11 @@ begin
        where t.relname = r.tbl and a.attname = r.col and con.contype = 'f'
          and con.confrelid = 'public.course_versions'::regclass
     loop
-      execute format('alter table public.%I drop constraint %I', r.tbl, c.conname);
+      execute format('alter table public.%I drop constraint %I', r.tbl, old_fk.conname);
     end loop;
 
     -- Agregar la FK a course_blueprints si todavía no existe.
-    if not exists (
-      select 1 from pg_constraint c
-        join pg_class t on t.oid = c.conrelid
-        join pg_attribute a on a.attrelid = t.oid and a.attnum = any (c.conkey)
-       where t.relname = r.tbl and a.attname = r.col and c.contype = 'f'
-         and c.confrelid = 'public.course_blueprints'::regclass
-    ) then
+    if not has_new_fk then
       execute format(
         'alter table public.%I add constraint %I foreign key (%I) references public.course_blueprints(id) on delete set null',
         r.tbl, r.tbl || '_' || r.col || '_blueprint_fk', r.col);
