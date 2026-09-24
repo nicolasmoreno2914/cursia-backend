@@ -340,4 +340,182 @@ export class CourseStructureService {
       await queryRunner.release();
     }
   }
+
+  async reorderModules(courseId: number, ownerId: string, dto: ReorderDto) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
+
+      const existingRows = await queryRunner.query(
+        `select id from public.course_modules where course_id = $1`,
+        [courseId],
+      );
+      const existingIds = existingRows.map((r: any) => r.id).sort();
+      const requestedIds = [...dto.order].sort();
+      if (JSON.stringify(existingIds) !== JSON.stringify(requestedIds)) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException(
+          'El set de ids en "order" no coincide exactamente con los módulos existentes del curso.',
+        );
+      }
+
+      for (let position = 0; position < dto.order.length; position++) {
+        await queryRunner.query(
+          `update public.course_modules set position = $1, updated_at = now() where id = $2 and course_id = $3`,
+          [position, dto.order[position], courseId],
+        );
+      }
+
+      const newCounter = await this.bumpCounter(queryRunner, courseId);
+      await queryRunner.commitTransaction();
+      return { structureVersionCounter: newCounter };
+    } catch (err) {
+      if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async reorderChapters(courseId: number, moduleId: string, ownerId: string, dto: ReorderDto) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
+
+      const moduleRows = await queryRunner.query(
+        `select id from public.course_modules where id = $1 and course_id = $2`,
+        [moduleId, courseId],
+      );
+      if (moduleRows.length === 0) {
+        await queryRunner.rollbackTransaction();
+        throw new NotFoundException(`Module ${moduleId} not found in course #${courseId}`);
+      }
+
+      const existingRows = await queryRunner.query(
+        `select id from public.course_chapters where module_id = $1`,
+        [moduleId],
+      );
+      const existingIds = existingRows.map((r: any) => r.id).sort();
+      const requestedIds = [...dto.order].sort();
+      if (JSON.stringify(existingIds) !== JSON.stringify(requestedIds)) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException(
+          'El set de ids en "order" no coincide exactamente con los capítulos existentes del módulo.',
+        );
+      }
+
+      for (let position = 0; position < dto.order.length; position++) {
+        await queryRunner.query(
+          `update public.course_chapters set position = $1, updated_at = now() where id = $2 and module_id = $3`,
+          [position, dto.order[position], moduleId],
+        );
+      }
+
+      const newCounter = await this.bumpCounter(queryRunner, courseId);
+      await queryRunner.commitTransaction();
+      return { structureVersionCounter: newCounter };
+    } catch (err) {
+      if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async moveChapter(courseId: number, sourceModuleId: string, chapterId: string, ownerId: string, dto: MoveChapterDto) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
+
+      // El capítulo debe existir en el módulo origen indicado.
+      const chapterRows = await queryRunner.query(
+        `select id from public.course_chapters where id = $1 and module_id = $2 and course_id = $3`,
+        [chapterId, sourceModuleId, courseId],
+      );
+      if (chapterRows.length === 0) {
+        await queryRunner.rollbackTransaction();
+        throw new NotFoundException(`Chapter ${chapterId} not found in module ${sourceModuleId}`);
+      }
+
+      // El módulo destino debe ser del MISMO curso.
+      const targetModuleRows = await queryRunner.query(
+        `select id from public.course_modules where id = $1 and course_id = $2`,
+        [dto.targetModuleId, courseId],
+      );
+      if (targetModuleRows.length === 0) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException('El módulo destino no existe o no pertenece a este curso.');
+      }
+
+      // Mover dentro del mismo módulo no es "move" — usar reorderChapters,
+      // porque la resecuenciación de abajo asume origen != destino (si no,
+      // se contaría el capítulo movido dos veces).
+      if (dto.targetModuleId === sourceModuleId) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException(
+          'El módulo destino es igual al origen — usar reorder para mover dentro del mismo módulo.',
+        );
+      }
+
+      // Nunca dejar el módulo origen con 0 capítulos.
+      const sourceCountRows = await queryRunner.query(
+        `select count(*)::int as n from public.course_chapters where module_id = $1`,
+        [sourceModuleId],
+      );
+      if (sourceCountRows[0].n <= 1) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException('No se puede mover el último capítulo del módulo origen.');
+      }
+
+      // Resequenciar el módulo origen (sin el capítulo movido), por orden actual.
+      const remainingSource = await queryRunner.query(
+        `select id from public.course_chapters where module_id = $1 and id != $2 order by position asc`,
+        [sourceModuleId, chapterId],
+      );
+      for (let i = 0; i < remainingSource.length; i++) {
+        await queryRunner.query(
+          `update public.course_chapters set position = $1 where id = $2`,
+          [i, remainingSource[i].id],
+        );
+      }
+
+      // Insertar el capítulo movido en targetPosition dentro del destino,
+      // desplazando lo que ya estaba desde esa posición en adelante.
+      const targetExisting = await queryRunner.query(
+        `select id from public.course_chapters where module_id = $1 order by position asc`,
+        [dto.targetModuleId],
+      );
+      const clampedPosition = Math.min(dto.targetPosition, targetExisting.length);
+      const finalOrder = [...targetExisting.map((r: any) => r.id)];
+      finalOrder.splice(clampedPosition, 0, chapterId);
+
+      // Mover el capítulo de módulo primero (fuera del rango de la unique
+      // constraint del módulo origen, ya resequenciado arriba).
+      await queryRunner.query(
+        `update public.course_chapters set module_id = $1 where id = $2`,
+        [dto.targetModuleId, chapterId],
+      );
+      for (let i = 0; i < finalOrder.length; i++) {
+        await queryRunner.query(
+          `update public.course_chapters set position = $1 where id = $2`,
+          [i, finalOrder[i]],
+        );
+      }
+
+      const newCounter = await this.bumpCounter(queryRunner, courseId);
+      await queryRunner.commitTransaction();
+      return { structureVersionCounter: newCounter };
+    } catch (err) {
+      if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
 }
