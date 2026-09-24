@@ -225,4 +225,119 @@ export class CourseStructureService {
     }
   }
 
+  async createChapter(courseId: number, moduleId: string, ownerId: string, dto: CreateChapterDto) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
+
+      const moduleRows = await queryRunner.query(
+        `select id from public.course_modules where id = $1 and course_id = $2`,
+        [moduleId, courseId],
+      );
+      if (moduleRows.length === 0) {
+        await queryRunner.rollbackTransaction();
+        throw new NotFoundException(`Module ${moduleId} not found in course #${courseId}`);
+      }
+
+      const maxRows = await queryRunner.query(
+        `select coalesce(max(position), -1) as max_pos from public.course_chapters where module_id = $1`,
+        [moduleId],
+      );
+      const nextPosition = Number(maxRows[0].max_pos) + 1;
+
+      const inserted = await queryRunner.query(
+        `insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled)
+         values ($1, $2, $3, $4, $5, $6)
+         returning id, position, title, objective, video_enabled as "videoEnabled"`,
+        [courseId, moduleId, nextPosition, dto.title, dto.objective || null, dto.videoEnabled ?? false],
+      );
+      const newCounter = await this.bumpCounter(queryRunner, courseId);
+      await queryRunner.commitTransaction();
+      return { chapter: inserted[0], structureVersionCounter: newCounter };
+    } catch (err) {
+      if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async updateChapter(courseId: number, moduleId: string, chapterId: string, ownerId: string, dto: UpdateChapterDto) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
+
+      const existing = await queryRunner.query(
+        `select id from public.course_chapters where id = $1 and module_id = $2 and course_id = $3`,
+        [chapterId, moduleId, courseId],
+      );
+      if (existing.length === 0) {
+        await queryRunner.rollbackTransaction();
+        throw new NotFoundException(`Chapter ${chapterId} not found in module ${moduleId}`);
+      }
+
+      const sets: string[] = [];
+      const params: any[] = [];
+      let i = 1;
+      if (dto.title !== undefined) { sets.push(`title = $${i++}`); params.push(dto.title); }
+      if (dto.objective !== undefined) { sets.push(`objective = $${i++}`); params.push(dto.objective); }
+      if (dto.videoEnabled !== undefined) { sets.push(`video_enabled = $${i++}`); params.push(dto.videoEnabled); }
+      if (sets.length > 0) {
+        params.push(chapterId);
+        await queryRunner.query(
+          `update public.course_chapters set ${sets.join(', ')}, updated_at = now() where id = $${i}`,
+          params,
+        );
+      }
+
+      const newCounter = await this.bumpCounter(queryRunner, courseId);
+      await queryRunner.commitTransaction();
+      return { structureVersionCounter: newCounter };
+    } catch (err) {
+      if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async deleteChapter(courseId: number, moduleId: string, chapterId: string, ownerId: string, expectedCounter: number) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      await this.lockAndVerify(queryRunner, courseId, ownerId, expectedCounter);
+
+      const countRows = await queryRunner.query(
+        `select count(*)::int as n from public.course_chapters where module_id = $1`,
+        [moduleId],
+      );
+      if (countRows[0].n <= 1) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException('No se puede eliminar el último capítulo del módulo.');
+      }
+
+      const deleted = await queryRunner.query(
+        `delete from public.course_chapters where id = $1 and module_id = $2 and course_id = $3 returning id`,
+        [chapterId, moduleId, courseId],
+      );
+      if (deleted.length === 0) {
+        await queryRunner.rollbackTransaction();
+        throw new NotFoundException(`Chapter ${chapterId} not found in module ${moduleId}`);
+      }
+
+      const newCounter = await this.bumpCounter(queryRunner, courseId);
+      await queryRunner.commitTransaction();
+      return { structureVersionCounter: newCounter };
+    } catch (err) {
+      if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
 }
