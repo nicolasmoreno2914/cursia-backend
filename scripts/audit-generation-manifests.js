@@ -171,7 +171,9 @@ async function main() {
           cgm.module_count, cgm.chapter_count, cgm.content_count, cgm.scorm_count,
           cgm.video_count, cgm.exam_count, cgm.total_jobs,
           cb.snapshot_sha256 as blueprint_snapshot_sha256,
-          cb.snapshot_json   as blueprint_snapshot_json
+          cb.snapshot_json   as blueprint_snapshot_json,
+          cb.module_count    as blueprint_module_count,
+          cb.chapter_count   as blueprint_chapter_count
         from public.course_generation_manifests cgm
         left join public.course_blueprints cb
           on cb.id = cgm.blueprint_id and cb.course_id = cgm.course_id
@@ -184,6 +186,9 @@ async function main() {
     let checkedTypeCounts = 0;
     let checkedVideoInvariant = 0;
     let checkedExamInvariant = 0;
+    let checkedChapterCoverage = 0;
+    let checkedModuleExamCoverage = 0;
+    let checkedBlueprintCounts = 0;
 
     for (const row of all.rows) {
       const label = `Manifest id=${row.id} (course_id=${row.course_id}, blueprint_id=${row.blueprint_id})`;
@@ -271,6 +276,77 @@ async function main() {
           failures.push(`${label}: item exam key=${item.key} existe pero el módulo tiene examEnabled=false en el snapshot del Blueprint.`);
         }
       }
+
+      // 3g. FIX M2 — cobertura en AMBAS direcciones contra el snapshot del
+      // Blueprint (3e/3f de arriba solo miran "¿todo item que existe está
+      // permitido?"; esto agrega "¿todo lo que el snapshot exige está
+      // presente?"): cada capítulo del snapshot debe tener EXACTAMENTE un
+      // item content y un item scorm, y un item video si y solo si
+      // videoEnabled=true (nunca menos, nunca de más).
+      checkedChapterCoverage += 1;
+      const contentByChapter = new Map();
+      const scormByChapter = new Map();
+      const videoByChapter = new Map();
+      for (const item of items) {
+        if (!item || !item.chapterId) continue;
+        const bucket =
+          item.type === 'content' ? contentByChapter :
+          item.type === 'scorm' ? scormByChapter :
+          item.type === 'video' ? videoByChapter :
+          null;
+        if (!bucket) continue;
+        bucket.set(item.chapterId, (bucket.get(item.chapterId) || 0) + 1);
+      }
+      const snapshotModules = Array.isArray(row.blueprint_snapshot_json && row.blueprint_snapshot_json.modules)
+        ? row.blueprint_snapshot_json.modules
+        : [];
+      for (const smod of snapshotModules) {
+        const schapters = Array.isArray(smod && smod.chapters) ? smod.chapters : [];
+        for (const schap of schapters) {
+          const cCount = contentByChapter.get(schap.id) || 0;
+          const sCount = scormByChapter.get(schap.id) || 0;
+          const vCount = videoByChapter.get(schap.id) || 0;
+          if (cCount !== 1) {
+            failures.push(`${label}: capítulo ${schap.id} del snapshot tiene ${cCount} items content (esperado exactamente 1).`);
+          }
+          if (sCount !== 1) {
+            failures.push(`${label}: capítulo ${schap.id} del snapshot tiene ${sCount} items scorm (esperado exactamente 1).`);
+          }
+          const expectedVideo = schap.videoEnabled === true ? 1 : 0;
+          if (vCount !== expectedVideo) {
+            failures.push(`${label}: capítulo ${schap.id} del snapshot (videoEnabled=${schap.videoEnabled === true}) tiene ${vCount} items video (esperado ${expectedVideo}).`);
+          }
+        }
+      }
+
+      // 3h. FIX M2 — misma cobertura en ambas direcciones para exam, por
+      // módulo: exactamente un item exam si examEnabled=true, ninguno si
+      // examEnabled=false.
+      checkedModuleExamCoverage += 1;
+      const examByModule = new Map();
+      for (const item of items) {
+        if (!item || item.type !== 'exam' || !item.moduleId) continue;
+        examByModule.set(item.moduleId, (examByModule.get(item.moduleId) || 0) + 1);
+      }
+      for (const smod of snapshotModules) {
+        const eCount = examByModule.get(smod.id) || 0;
+        const expectedExam = smod.examEnabled === true ? 1 : 0;
+        if (eCount !== expectedExam) {
+          failures.push(`${label}: módulo ${smod.id} del snapshot (examEnabled=${smod.examEnabled === true}) tiene ${eCount} items exam (esperado ${expectedExam}).`);
+        }
+      }
+
+      // 3i. FIX M2 — module_count/chapter_count de course_generation_manifests
+      // deben coincidir con los del course_blueprints referenciado (no solo
+      // con lo recontado desde items — ambas columnas describen el MISMO
+      // snapshot, así que deben ser idénticas entre las dos tablas).
+      checkedBlueprintCounts += 1;
+      if (row.blueprint_module_count !== undefined && row.module_count !== row.blueprint_module_count) {
+        failures.push(`${label}: module_count=${row.module_count} no coincide con course_blueprints.module_count=${row.blueprint_module_count}.`);
+      }
+      if (row.blueprint_chapter_count !== undefined && row.chapter_count !== row.blueprint_chapter_count) {
+        failures.push(`${label}: chapter_count=${row.chapter_count} no coincide con course_blueprints.chapter_count=${row.blueprint_chapter_count}.`);
+      }
     }
 
     if (failures.length === 0) {
@@ -280,6 +356,9 @@ async function main() {
       console.log(`✅ (d) conteos por type en items = columnas (${checkedTypeCounts} Manifests revisados).`);
       console.log(`✅ (e) ningún item video para capítulo con videoEnabled=false (${checkedVideoInvariant} Manifests revisados).`);
       console.log(`✅ (f) ningún item exam para módulo con examEnabled=false (${checkedExamInvariant} Manifests revisados).`);
+      console.log(`✅ (g) cada capítulo del snapshot tiene exactamente 1 content + 1 scorm, y video sii videoEnabled (${checkedChapterCoverage} Manifests revisados).`);
+      console.log(`✅ (h) cada módulo del snapshot tiene exam sii examEnabled (${checkedModuleExamCoverage} Manifests revisados).`);
+      console.log(`✅ (i) module_count/chapter_count = course_blueprints.module_count/chapter_count (${checkedBlueprintCounts} Manifests revisados).`);
     } else {
       console.log(`❌ ${failures.length} violaciones de invariantes encontradas (detalle abajo).`);
     }

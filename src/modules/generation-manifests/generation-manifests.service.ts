@@ -185,6 +185,20 @@ export class GenerationManifestsService {
       );
     }
 
+    // FIX M1: las columnas rules_version/manifest_schema_version deben
+    // coincidir con lo que dice el propio manifest_json (ahora que
+    // canonicalManifestJson ya no las hardcodea a 1) — una discrepancia acá
+    // es integridad rota, igual que el sha256.
+    if (
+      row.rules_version !== manifest.rulesVersion ||
+      row.manifest_schema_version !== manifest.manifestSchemaVersion
+    ) {
+      throw new InternalServerErrorException(
+        `${where}: columnas rules_version/manifest_schema_version (${row.rules_version}/${row.manifest_schema_version}) ` +
+          `no coinciden con manifest_json (${manifest.rulesVersion}/${manifest.manifestSchemaVersion})`,
+      );
+    }
+
     const errors = validateGenerationManifest(manifest, bp.snapshot, sourceOf(bp));
     if (errors.length > 0) {
       throw new InternalServerErrorException(

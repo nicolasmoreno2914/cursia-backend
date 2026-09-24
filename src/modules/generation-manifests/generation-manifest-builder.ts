@@ -279,6 +279,58 @@ export function validateGenerationManifest(
     if (mod.examEnabled) expectedExamKeys.add(`exam:${mod.id}`);
   });
 
+  // --- FIX M4: canonical order ---
+  // `items[]` must appear in canonical order (design spec §2.3): module
+  // (position) -> chapter (position) -> content, scorm, video; the module's
+  // `exam` after all of its chapters. Computed independently from the
+  // snapshot (never from `m.items` itself) — includes only the keys the
+  // snapshot says SHOULD exist; unknown/extra items in `m.items` are simply
+  // skipped for this check (they're already caught by the other checks
+  // above/below) so a single stray item can't mask a genuine ordering bug
+  // in the rest of the array.
+  const canonicalOrderKeys: string[] = [];
+  modulesSorted.forEach((mod) => {
+    const chaptersSorted = [...mod.chapters].sort((a, b) => a.position - b.position);
+    for (const c of chaptersSorted) {
+      canonicalOrderKeys.push(`content:${c.id}`);
+      canonicalOrderKeys.push(`scorm:${c.id}`);
+      if (c.videoEnabled) canonicalOrderKeys.push(`video:${c.id}`);
+    }
+    if (mod.examEnabled) canonicalOrderKeys.push(`exam:${mod.id}`);
+  });
+  const canonicalIndex = new Map<string, number>();
+  canonicalOrderKeys.forEach((k, idx) => canonicalIndex.set(k, idx));
+
+  const orderedIndices: number[] = [];
+  for (const item of m.items) {
+    const idx = canonicalIndex.get(item.key);
+    if (idx !== undefined) orderedIndices.push(idx);
+  }
+  for (let i = 1; i < orderedIndices.length; i++) {
+    if (orderedIndices[i] <= orderedIndices[i - 1]) {
+      errors.push({
+        code: 'ORDER_MISMATCH',
+        message:
+          'items no está en el orden canónico esperado (módulo → capítulo → content/scorm/video; exam al final de su módulo)',
+      });
+      break;
+    }
+  }
+
+  // `modules[].chapters` must also be in position-sorted order.
+  for (const mm of m.modules) {
+    for (let i = 1; i < mm.chapters.length; i++) {
+      if (mm.chapters[i].position <= mm.chapters[i - 1].position) {
+        errors.push({
+          code: 'ORDER_MISMATCH',
+          message: `módulo ${mm.moduleId}: chapters no está en orden ascendente de position`,
+          key: mm.moduleId,
+        });
+        break;
+      }
+    }
+  }
+
   // --- modules[] mirror check ---
   if (m.modules.length !== expectedModules.size) {
     errors.push({
@@ -356,7 +408,75 @@ export function validateGenerationManifest(
   const presentVideoKeys = new Set<string>();
   const presentExamKeys = new Set<string>();
 
+  const KNOWN_ITEM_TYPES: ManifestItemType[] = ['content', 'scorm', 'video', 'exam'];
+
   for (const item of m.items) {
+    // --- FIX I1: per-item identity/consistency checks, independent of
+    // whether the referenced moduleId/chapterId actually exist (those are
+    // handled separately below). Each check is computed from the item's
+    // own claimed fields, so a swapped/forged id or number is caught even
+    // when every key involved is otherwise present in the manifest. ---
+    if (!KNOWN_ITEM_TYPES.includes(item.type)) {
+      errors.push({
+        code: 'UNKNOWN_TYPE',
+        message: `item ${item.key}: type desconocido: ${String(item.type)}`,
+        key: item.key,
+      });
+    } else {
+      const expectedKey = item.type === 'exam' ? `exam:${item.moduleId}` : `${item.type}:${item.chapterId}`;
+      if (item.key !== expectedKey) {
+        errors.push({
+          code: 'KEY_MISMATCH',
+          message: `item ${item.key}: key esperada ${expectedKey} según type/${item.type === 'exam' ? 'moduleId' : 'chapterId'}`,
+          key: item.key,
+        });
+      }
+
+      const expectedScope = item.type === 'exam' ? 'module' : 'chapter';
+      if (item.scope !== expectedScope) {
+        errors.push({
+          code: 'SCOPE_MISMATCH',
+          message: `item ${item.key}: scope esperado '${expectedScope}' para type=${item.type}, encontrado '${item.scope}'`,
+          key: item.key,
+        });
+      }
+
+      const expectedModuleForItem = expectedModules.get(item.moduleId);
+      if (expectedModuleForItem && item.moduleNumber !== expectedModuleForItem.moduleNumber) {
+        errors.push({
+          code: 'NUMBERING_MISMATCH',
+          message: `item ${item.key}: moduleNumber esperado ${expectedModuleForItem.moduleNumber} para moduleId ${item.moduleId}, encontrado ${item.moduleNumber}`,
+          key: item.key,
+        });
+      }
+
+      if (item.type === 'exam') {
+        if (item.chapterId !== null) {
+          errors.push({
+            code: 'NUMBERING_MISMATCH',
+            message: `item ${item.key}: chapterId esperado null para un item de tipo exam, encontrado ${item.chapterId}`,
+            key: item.key,
+          });
+        }
+        if (item.chapterNumber !== null) {
+          errors.push({
+            code: 'NUMBERING_MISMATCH',
+            message: `item ${item.key}: chapterNumber esperado null para un item de tipo exam, encontrado ${item.chapterNumber}`,
+            key: item.key,
+          });
+        }
+      } else {
+        const expectedChapterForItem = item.chapterId ? expectedChapters.get(item.chapterId) : undefined;
+        if (expectedChapterForItem && item.chapterNumber !== expectedChapterForItem.chapterNumber) {
+          errors.push({
+            code: 'NUMBERING_MISMATCH',
+            message: `item ${item.key}: chapterNumber esperado ${expectedChapterForItem.chapterNumber} para chapterId ${item.chapterId}, encontrado ${item.chapterNumber}`,
+            key: item.key,
+          });
+        }
+      }
+    }
+
     if (item.type === 'exam') {
       const expectedModule = expectedModules.get(item.moduleId);
       if (!expectedModule) {
@@ -507,8 +627,15 @@ export function validateGenerationManifest(
  */
 export function canonicalManifestJson(m: GenerationManifestV1): string {
   const canonical: GenerationManifestV1 = {
-    manifestSchemaVersion: 1,
-    rulesVersion: 1,
+    // FIX M1: copy the manifest's own values through instead of hardcoding
+    // 1 — a stored manifest whose rulesVersion/manifestSchemaVersion drifted
+    // (e.g. tampered or from a future rules generation) must survive
+    // canonicalization unchanged, so `validateGenerationManifest` can catch
+    // it as VERSION_MISMATCH on the read path. For any manifest actually
+    // produced by `buildGenerationManifest` today, both are still 1, so the
+    // pinned acceptance-fixture hash is unaffected.
+    manifestSchemaVersion: m.manifestSchemaVersion,
+    rulesVersion: m.rulesVersion,
     source: {
       courseId: m.source.courseId,
       blueprintId: m.source.blueprintId,
