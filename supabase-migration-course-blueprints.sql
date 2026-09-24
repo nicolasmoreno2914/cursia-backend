@@ -17,7 +17,35 @@ create table if not exists public.course_blueprints (
 );
 create index if not exists idx_course_blueprints_course on public.course_blueprints(course_id);
 
-alter table if exists public.courses add column if not exists current_blueprint_id integer;
+-- `alter table ... add column if not exists` toma un lock ACCESS EXCLUSIVE
+-- sobre `courses` ANTES de evaluar el "if not exists" (el chequeo IF NOT
+-- EXISTS solo evita el error de "la columna ya existe", no evita adquirir el
+-- lock) — en cada deploy, incluso cuando la columna ya está, con
+-- lock_timeout=5s eso puede tirar el deploy abajo de tráfico concurrente en
+-- `courses` (tabla caliente). Se reemplaza por un DO block que primero
+-- chequea information_schema.columns (sin tomar lock fuerte) y solo corre el
+-- ALTER cuando la columna de verdad falta.
+--
+-- Nombre de variable ("col_exists", no "column_exists" ni nada que
+-- colisione con nombres de columnas/alias reales de esta query) — ver la
+-- nota de la ronda anterior más abajo sobre colisiones de alias en PL/pgSQL
+-- bajo variable_conflict = error (default).
+do $$
+declare
+  col_exists boolean;
+begin
+  select exists (
+    select 1
+      from information_schema.columns
+     where table_schema = 'public'
+       and table_name = 'courses'
+       and column_name = 'current_blueprint_id'
+  ) into col_exists;
+
+  if not col_exists then
+    alter table public.courses add column current_blueprint_id integer;
+  end if;
+end $$;
 
 do $$ begin
   if not exists (select 1 from pg_constraint where conname = 'courses_current_blueprint_fk') then

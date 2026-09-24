@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException, NotFoundException, ConflictException } from '@nestjs/common';
+import { Injectable, BadRequestException, NotFoundException, ConflictException, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
 import { CourseModule as CourseModuleEntity } from './entities/course-module.entity';
@@ -22,6 +22,8 @@ import {
 
 @Injectable()
 export class CourseStructureService {
+  private readonly logger = new Logger(CourseStructureService.name);
+
   constructor(
     @InjectRepository(CourseModuleEntity)
     private readonly moduleRepo: Repository<CourseModuleEntity>,
@@ -181,7 +183,12 @@ export class CourseStructureService {
         rawChapters,
       );
       return snapshotSha256(snapshot) === currentBlueprint.sha256;
-    } catch {
+    } catch (err) {
+      this.logger.warn(
+        `computeLiveMatchesCurrentBlueprint: fallo al comparar el hash del curso #${course.id} — ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
       return false;
     }
   }

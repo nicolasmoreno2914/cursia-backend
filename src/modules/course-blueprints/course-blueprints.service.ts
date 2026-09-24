@@ -64,37 +64,6 @@ function isBlueprintNumberConflict(err: any): boolean {
     (err?.constraint === BLUEPRINT_NUMBER_UNIQUE || e?.constraint === BLUEPRINT_NUMBER_UNIQUE);
 }
 
-/**
- * Misma forma que `CourseStructureService.getStructure`, construida desde
- * las filas crudas ya leídas en la transacción (no se llama a
- * `CoursesService.findOne` ni a los repos: otra conexión del pool). Se usa
- * en el cuerpo del 409 para que el cliente reconcilie sin otro GET.
- */
-function toStructure(course: any, modules: RawModuleRow[], chapters: RawChapterRow[]) {
-  const byPos = (a: { position: number }, b: { position: number }) => Number(a.position) - Number(b.position);
-  return {
-    structureVersion: course.structure_version,
-    structureVersionCounter: course.structure_version_counter,
-    modules: [...modules].sort(byPos).map((m) => ({
-      id: m.id,
-      position: m.position,
-      title: m.title,
-      objective: m.objective,
-      examEnabled: m.exam_enabled,
-      chapters: chapters
-        .filter((c) => c.module_id === m.id)
-        .sort(byPos)
-        .map((c) => ({
-          id: c.id,
-          position: c.position,
-          title: c.title,
-          objective: c.objective,
-          videoEnabled: c.video_enabled,
-        })),
-    })),
-  };
-}
-
 @Injectable()
 export class CourseBlueprintsService {
   constructor(private readonly dataSource: DataSource) {}
@@ -150,11 +119,16 @@ export class CourseBlueprintsService {
 
       if (course.structure_version_counter !== expectedCounter) {
         await qr.rollbackTransaction();
-        throw new ConflictException({
-          message: 'expectedCounter desactualizado',
-          currentCounter: course.structure_version_counter,
-          structure: toStructure(course, modules, chapters),
-        });
+        // El filtro global (AllExceptionsFilter) reduce cualquier body de
+        // HttpException a { error: <string> } — currentCounter/structure acá
+        // se pierden en el cliente real. El texto del mensaje es la única
+        // información que llega, así que tiene que ser autocontenido; el
+        // cliente reconcilia con un GET en vez de leer `structure`.
+        throw new ConflictException(
+          `La estructura del curso #${courseId} cambió desde que se leyó: ` +
+            `expectedCounter=${expectedCounter}, actual=${course.structure_version_counter}. ` +
+            'Volvé a leer la estructura (GET) antes de reintentar el lock.',
+        );
       }
 
       const courseRef = { id: course.id, title: course.title };
@@ -163,8 +137,16 @@ export class CourseBlueprintsService {
       const errors = validateBlueprintInput(courseRef, modules, chapters);
       if (errors.length > 0) {
         await qr.rollbackTransaction();
+        // Igual que el 409: el filtro global colapsa el body de la excepción
+        // a { error: <string> } (ver AllExceptionsFilter.catch — usa
+        // `message.message` cuando getResponse() es un objeto), así que el
+        // `errors` array nunca llega al cliente si no está también dentro
+        // del mensaje. Lo embebemos como texto humano-legible y dejamos
+        // `errors` en la excepción igual (inofensivo, útil si algo lee
+        // getResponse() directamente, p.ej. tests).
+        const detail = errors.map((e) => e.message).join('; ');
         throw new BadRequestException({
-          message: 'La estructura no cumple las validaciones para crear un Blueprint',
+          message: `La estructura no cumple las validaciones para crear un Blueprint: ${detail}`,
           errors,
         });
       }
