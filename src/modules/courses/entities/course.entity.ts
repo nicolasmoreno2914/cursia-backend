@@ -57,6 +57,15 @@ export class Course {
   @Column({ name: 'structure_version_counter', default: 0 })
   structureVersionCounter: number; // optimistic concurrency para ediciones de estructura
 
+  /**
+   * Blueprint congelado vigente (Fase 3). Columna plana: la FK compuesta
+   * (current_blueprint_id, id) → course_blueprints(id, course_id) la crea
+   * supabase-migration-course-blueprints.sql; solo la escribe
+   * CourseBlueprintsService.lock().
+   */
+  @Column({ name: 'current_blueprint_id', type: 'int', nullable: true })
+  currentBlueprintId: number | null;
+
   @Column({ type: 'jsonb', nullable: true })
   metadata: Record<string, any>;
 

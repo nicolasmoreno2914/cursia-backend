@@ -11,25 +11,7 @@ import { UpdateChapterDto } from './dto/update-chapter.dto';
 import { ReorderDto } from './dto/reorder.dto';
 import { MoveChapterDto } from './dto/move-chapter.dto';
 import type { QueryRunner } from 'typeorm';
-
-/**
- * Filas devueltas por un `UPDATE ... RETURNING` / `DELETE ... RETURNING`
- * ejecutado con `queryRunner.query()`.
- *
- * Con el driver de Postgres de TypeORM (0.3.x), `query()` NO devuelve las
- * filas para UPDATE/DELETE: devuelve `[rows, rowCount]`
- * (PostgresQueryRunner.query → `result.raw = [raw.rows, raw.rowCount]`).
- * Para SELECT/INSERT sí devuelve `rows` directo. Leer `result[0].col` en un
- * UPDATE daba `undefined` (el counter nunca llegaba al cliente) y
- * `result.length === 0` en un DELETE nunca era cierto (siempre largo 2).
- * Acepta ambas formas por si una versión futura del driver cambia.
- */
-function returningRows(result: any): any[] {
-  if (Array.isArray(result) && result.length === 2 && Array.isArray(result[0]) && typeof result[1] === 'number') {
-    return result[0];
-  }
-  return result;
-}
+import { returningRows } from '../../common/db/returning-rows';
 
 @Injectable()
 export class CourseStructureService {
