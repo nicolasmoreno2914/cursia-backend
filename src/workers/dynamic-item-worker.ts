@@ -236,13 +236,16 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
       return;
     } else {
       mode = runHead.videoMode;
-      const marked = await scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
-        externalSubmitStartedAt: new Date().toISOString(),
-      });
-      if (!marked) {
-        logger.error(`Item ${item.itemKey}: lease perdida antes de someter el video a Videogen — se detiene sin someter`);
-        return;
-      }
+      // Toda precondición que pueda fallar SIN llamar a Videogen debe
+      // resolverse ANTES de marcar externalSubmitStartedAt (fix round 1,
+      // task-4-review.md hallazgo Important): el marcador solo se escribe
+      // inmediatamente antes de un intento real de submit. Si no, un fallo
+      // 'videogen_not_configured' deja el item envenenado — un retryItem
+      // manual posterior (tras configurar la key) vería
+      // externalSubmitStartedAt sin external y caería en
+      // 'ambiguous_video_submission' para siempre, sin ninguna forma de
+      // recuperarlo salvo un UPDATE manual (retryItem nunca limpia
+      // marcadores, a propósito — ver R3/R15).
       if (mode === 'real' && !(process.env.VIDEOGEN_API_KEY ?? '').trim()) {
         await scheduler.failItem(item.itemRunId, deps.executorId, 'videogen_not_configured', false);
         return;
@@ -250,6 +253,15 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
 
       const contentTxt = buildContentTxt(item, markdown);
       const chapterTitle = item.blueprint.chapter?.title ?? `Capítulo ${item.chapterNumber ?? '?'}`;
+
+      const marked = await scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
+        externalSubmitStartedAt: new Date().toISOString(),
+      });
+      if (!marked) {
+        logger.error(`Item ${item.itemKey}: lease perdida antes de someter el video a Videogen — se detiene sin someter`);
+        return;
+      }
+
       let batchId: string;
       if (mode === 'mock') {
         batchId = mockBatchId(item.idempotencyKey);
