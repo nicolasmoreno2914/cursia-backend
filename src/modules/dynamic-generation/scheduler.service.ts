@@ -107,6 +107,20 @@ export interface ClaimedItem {
     chapter: { id: string; title: string; objective: string | null; position: number; videoEnabled: boolean } | null;
     /** Capítulos del módulo del item, en orden del Manifest (para exam: exactamente los que evalúa). */
     moduleChapters: Array<{ id: string; title: string; objective: string | null; chapterNumber: number }>;
+    /**
+     * R18: outline del curso COMPLETO (todos los módulos, en orden del
+     * Manifest), con numeración global — para que los builders dynamic
+     * puedan reproducir la línea "Estructura: N módulos · M capítulos" +
+     * listado por módulo/capítulo de `ctx()` legacy sin leer la estructura
+     * viva (condición 1: se arma acá, del snapshot congelado del Blueprint +
+     * numeración del Manifest, igual que `moduleChapters`).
+     */
+    outline: Array<{
+      moduleNumber: number;
+      id: string;
+      title: string;
+      chapters: Array<{ chapterNumber: number; id: string; title: string }>;
+    }>;
   };
   dependencyArtifacts: Array<{ itemKey: string; artifactId: string; type: string; storagePath: string }>;
 }
@@ -780,6 +794,25 @@ export class SchedulerService {
       return { id: sc.id, title: sc.title, objective: sc.objective ?? null, chapterNumber: mc.chapterNumber };
     });
 
+    // Outline del curso completo (R18), en el mismo orden en que el Manifest
+    // enumera sus módulos (manifest.modules ya está en orden de moduleNumber
+    // — ver generation-manifest-builder.ts), resuelto contra el snapshot
+    // congelado del Blueprint (misma fuente que moduleChapters arriba).
+    const outline = manifest.modules.map((mm) => {
+      const sm = snapshot.modules.find((m) => m.id === mm.moduleId);
+      if (!sm) throw fail(`módulo ${mm.moduleId} del Manifest ausente en el Blueprint`);
+      return {
+        moduleNumber: mm.moduleNumber,
+        id: sm.id,
+        title: sm.title,
+        chapters: mm.chapters.map((mc) => {
+          const sc = sm.chapters.find((c) => c.id === mc.chapterId);
+          if (!sc) throw fail(`capítulo ${mc.chapterId} del Manifest ausente en el Blueprint`);
+          return { chapterNumber: mc.chapterNumber, id: sc.id, title: sc.title };
+        }),
+      };
+    });
+
     const deps: string[] = row.depends_on ?? [];
     const depArtifacts =
       deps.length === 0
@@ -828,6 +861,7 @@ export class SchedulerService {
             }
           : null,
         moduleChapters,
+        outline,
       },
       dependencyArtifacts: depArtifacts.map((a: any) => ({
         itemKey: a.item_key,

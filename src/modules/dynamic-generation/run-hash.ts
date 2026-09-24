@@ -32,7 +32,7 @@ export function plainContext<T>(context: T): T {
 }
 
 /** Campos string del contexto (orden fijo de construcción; el hash ordena claves igual). */
-export const CONTEXT_STRING_FIELDS = ['nombre', 'sector', 'pais', 'ciudad', 'contexto', 'nivel', 'tono', 'obj'] as const;
+export const CONTEXT_STRING_FIELDS = ['nombre', 'sector', 'pais', 'ciudad', 'contexto', 'nivel', 'tono', 'obj', 'comp'] as const;
 /** Obligatorios: vacíos tras normalizar → 400 (lo decide el servicio). */
 export const REQUIRED_CONTEXT_FIELDS = ['nombre', 'sector', 'pais', 'contexto', 'nivel', 'tono'] as const;
 

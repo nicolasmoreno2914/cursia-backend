@@ -73,6 +73,19 @@ export class CourseContextDto {
   @MaxLength(4000)
   obj?: string;
 
+  /**
+   * R18: legacy `ctx()` (02-run.js:19) también lee `D.comp` (competencia a
+   * desarrollar) y la inyecta en TODOS los prompts — omitirla degradaba el
+   * contexto en silencio (spec §3.5 la había dejado fuera por descuido).
+   * Mismo tratamiento que `obj`: opcional, se normaliza/descarta si viene
+   * vacía (run-hash.ts CONTEXT_STRING_FIELDS) — contextos ya congelados sin
+   * `comp` no cambian su hash.
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(4000)
+  comp?: string;
+
   @IsOptional()
   @ValidateNested()
   @Type(() => PrevCourseDto)
