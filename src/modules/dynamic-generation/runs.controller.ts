@@ -60,6 +60,19 @@ export class RunsController {
     return this.runs.getCurrentRun(courseId, user.id, number);
   }
 
+  // GET /api/v1/courses/:courseId/blueprints/:number/manifest/runs/estimate
+  // R17: videoCount/ids del Manifest + costo estimado de video (best-effort,
+  // desde cost_rates; null + nota si no hay tarifa configurada). Declarado
+  // ANTES de ':runId' — si no, Nest intentaría parsear "estimate" como UUID.
+  @Get('estimate')
+  estimate(
+    @Param('courseId', ParseIntPipe) courseId: number,
+    @Param('number', ParseIntPipe) number: number,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.runs.estimateRun(courseId, user.id, number);
+  }
+
   // GET /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId
   @Get(':runId')
   get(

@@ -372,6 +372,23 @@ async function main() {
       }
     }
 
+    // 3f. R17 (Fase 5A Task 4): todo job dynamic_generation con
+    // input_payload.videoMode presente debe tener 'mock' o 'real' — un run
+    // creado ANTES de esta feature no tiene la clave (ausente = 'mock' por
+    // convención del código, no es una violación estructural).
+    const videoModeRows = await client.query(
+      `select id, input_payload->>'videoMode' as video_mode
+         from public.production_jobs
+        where execution_mode = 'dynamic_generation' and input_payload ? 'videoMode'`,
+    );
+    let checkedVideoMode = 0;
+    for (const row of videoModeRows.rows) {
+      checkedVideoMode += 1;
+      if (row.video_mode !== 'mock' && row.video_mode !== 'real') {
+        failures.push(`Run job_id=${row.id}: input_payload.videoMode="${row.video_mode}" inválido (esperado 'mock' o 'real').`);
+      }
+    }
+
     if (failures.length === 0) {
       if (hasRuns) {
         console.log(`✅ (a) cada item run matchea type/module_id/chapter_id/depends_on de su item en el Manifest (${checkedItemMatch} item runs revisados).`);
@@ -382,11 +399,12 @@ async function main() {
         console.log('⚠️  (a)-(d) omitido — 0 generation_item_runs.');
       }
       console.log(`✅ (e) todo artifact con manifest_id no nulo tiene manifest_item_key/item_run_id consistentes con su Manifest (${checkedArtifacts} artifacts revisados).`);
+      console.log(`✅ (f2) input_payload.videoMode ∈ {'mock','real'} en runs que lo declaran (${checkedVideoMode} revisados; ausente = 'mock' por convención, no falla).`);
     } else {
       console.log(`❌ ${failures.length} violaciones de invariantes encontradas (detalle abajo).`);
     }
 
-    // 3f. Inmutabilidad sobre datos reales — UPDATE real sobre el contexto más
+    // 3g. Inmutabilidad sobre datos reales — UPDATE real sobre el contexto más
     // reciente, en savepoint dentro de una transacción siempre revertida. Un
     // UPDATE que no afecta ninguna fila (borrada entre el SELECT y el UPDATE)
     // cuenta como "⚠️ omitido", nunca como ❌.
@@ -398,7 +416,7 @@ async function main() {
       );
 
       if (latest.rows.length === 0) {
-        console.log('⚠️  (f) omitido — no hay filas reales en generation_run_contexts.');
+        console.log('⚠️  (g) omitido — no hay filas reales en generation_run_contexts.');
       } else {
         const latestJobId = latest.rows[0].job_id;
 
@@ -419,15 +437,15 @@ async function main() {
           await client.query('rollback to savepoint s1');
         }
         if (immutableRejected) {
-          console.log(`✅ (f) UPDATE sobre generation_run_contexts (job_id=${latestJobId}) rechazado con P0001.`);
+          console.log(`✅ (g) UPDATE sobre generation_run_contexts (job_id=${latestJobId}) rechazado con P0001.`);
         } else if (immutableRowCount === 0) {
           console.log(
-            `⚠️  (f) omitido (fila ya no existe) — el UPDATE sobre generation_run_contexts (job_id=${latestJobId}) ` +
+            `⚠️  (g) omitido (fila ya no existe) — el UPDATE sobre generation_run_contexts (job_id=${latestJobId}) ` +
             `no afectó ninguna fila (borrada entre el SELECT y el UPDATE).`,
           );
         } else {
           console.log(
-            `❌ (f) UPDATE sobre generation_run_contexts (job_id=${latestJobId}) NO fue rechazado con P0001 ` +
+            `❌ (g) UPDATE sobre generation_run_contexts (job_id=${latestJobId}) NO fue rechazado con P0001 ` +
             `(código real: ${immutableCode || 'ninguno — se permitió el UPDATE'}).`,
           );
           failures.push('El trigger de inmutabilidad no rechazó un UPDATE real sobre generation_run_contexts.');

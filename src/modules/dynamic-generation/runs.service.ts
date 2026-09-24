@@ -11,7 +11,8 @@ import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
 import { GenerationManifestsService, ManifestDto } from '../generation-manifests/generation-manifests.service';
 import type { ManifestItemType } from '../generation-manifests/generation-manifest-builder';
-import { CourseContextDto } from './dto/course-context.dto';
+import { CostRatesService } from '../../admin/services/cost-rates.service';
+import { CourseContextDto, RUN_VIDEO_MODES, RunVideoMode } from './dto/course-context.dto';
 import { REQUIRED_CONTEXT_FIELDS, canonicalContextHash, itemIdempotencyKey, normalizeCourseContext } from './run-hash';
 import {
   ACTIVE_RUN_WORKER_STATUSES,
@@ -32,6 +33,16 @@ const FAILED_LIKE = new Set(['failed', 'failed_retryable', 'failed_recoverable']
 const ACTIVE_RUN_INDEX = 'uq_dynamic_generation_active_run';
 /** 5A solo siembra generation 1 (Fase 8 creará generation 2… para regenerar). */
 const GENERATION = 1;
+/** R17: default cuando el body no manda videoMode. */
+const DEFAULT_VIDEO_MODE: RunVideoMode = 'mock';
+
+export interface RunVideoEstimate {
+  videoCount: number;
+  videoChapterIds: Array<string | null>;
+  estimatedVideoCostUsd: number | null;
+  costSource: string | null;
+  note: string;
+}
 
 export interface StatusCounts {
   total: number;
@@ -78,6 +89,8 @@ export interface RunDto {
   blueprintNumber: number;
   status: string;
   workerStatus: string;
+  /** R17: fijado al crear el run, nunca se actualiza (ni al reabrir). */
+  videoMode: RunVideoMode;
   courseContextSha256: string;
   courseContext: Record<string, any>;
   createdAt: string;
@@ -156,6 +169,7 @@ export class RunsService {
   constructor(
     private readonly dataSource: DataSource,
     private readonly manifests: GenerationManifestsService,
+    private readonly costRates: CostRatesService,
   ) {}
 
   /**
@@ -186,14 +200,15 @@ export class RunsService {
     const context = normalizeCourseContext(courseContext);
     this.assertRequiredContext(context);
     const contextHash = canonicalContextHash(context);
+    const videoMode = this.normalizeVideoMode((courseContext as any)?.videoMode);
 
     const active = await this.findActiveRunRow(manifest.id);
-    if (active) return this.existingRunOrConflict(active, manifest, contextHash);
+    if (active) return this.existingRunOrConflict(active, manifest, contextHash, videoMode);
 
     const latest = await this.findLatestRunRow(manifest.id);
     if (latest) {
       // Carrera: el run pudo commitearse entre las dos lecturas → es el activo.
-      if (isActive(latest)) return this.existingRunOrConflict(latest, manifest, contextHash);
+      if (isActive(latest)) return this.existingRunOrConflict(latest, manifest, contextHash, videoMode);
       if (!isReopenable(latest)) {
         throw new ConflictException(
           `La ejecución anterior de este Manifest ya terminó (${latest.worker_status}); re-ejecutar un Manifest ` +
@@ -204,6 +219,13 @@ export class RunsService {
       if (ctx.context_hash !== contextHash) {
         throw new ConflictException(
           `La ejecución anterior usó otro contexto; cambiar el contexto requiere regeneración (Fase 8). runId=${latest.id}`,
+        );
+      }
+      const latestVideoMode = this.videoModeOf(latest);
+      if (latestVideoMode !== videoMode) {
+        throw new ConflictException(
+          `La ejecución anterior usó otro modo de video (${latestVideoMode}); cambiarlo requiere regeneración ` +
+            `(Fase 8). runId=${latest.id}`,
         );
       }
       return this.reopenRun(latest.id, manifest, contextHash);
@@ -222,14 +244,14 @@ export class RunsService {
     let jobId: string;
     try {
       jobId = await this.tx((qr) =>
-        this.insertRun(qr, manifest, ownerId, courseId, frontendCourseId, blueprintNumber, context, contextHash),
+        this.insertRun(qr, manifest, ownerId, courseId, frontendCourseId, blueprintNumber, context, contextHash, videoMode),
       );
     } catch (err) {
       if (isActiveRunConflict(err)) {
         // Carrera: otro POST creó el run activo primero (y ya commiteó — el
         // índice único espera al otro insert antes de fallar).
         const winner = await this.findActiveRunRow(manifest.id);
-        if (winner) return this.existingRunOrConflict(winner, manifest, contextHash);
+        if (winner) return this.existingRunOrConflict(winner, manifest, contextHash, videoMode);
         throw new ConflictException(
           `Otra ejecución del Manifest #${manifest.id} se creó y terminó mientras se procesaba esta; reintentá la consulta`,
         );
@@ -249,6 +271,49 @@ export class RunsService {
     const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
     const job = (await this.findActiveRunRow(manifest.id)) ?? (await this.findLatestRunRow(manifest.id));
     return job ? this.buildRunDto(job, manifest) : null;
+  }
+
+  /**
+   * R17: estimación de costo de video del Manifest — videoCount/ids salen
+   * SIEMPRE del Manifest (totals.videoCount + items type='video', en orden);
+   * el costo es best-effort desde la tarifa configurada
+   * (video_engine/video_generation/per_video en cost_rates) — si no hay
+   * tarifa activa, null + nota explicando por qué (nunca un número
+   * inventado). El costo REAL de un video real lo informa Videogen
+   * (getVideoCost) recién cuando termina — esto es solo una estimación para
+   * decidir si autorizar el modo 'real' (condición 7).
+   */
+  async estimateRun(courseId: number, ownerId: string, blueprintNumber: number): Promise<RunVideoEstimate> {
+    const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
+    const videoItems = manifest.manifest.items.filter((it) => it.type === 'video');
+    if (videoItems.length !== manifest.totals.videoCount) {
+      throw new InternalServerErrorException(
+        `Manifest #${manifest.id}: ${videoItems.length} items type=video pero totals.videoCount=${manifest.totals.videoCount}`,
+      );
+    }
+    const videoChapterIds = videoItems.map((it) => it.chapterId);
+    const videoCount = manifest.totals.videoCount;
+
+    const rate = await this.costRates.getActiveRate('video_engine', 'video_generation', null, 'per_video');
+    if (!rate) {
+      return {
+        videoCount,
+        videoChapterIds,
+        estimatedVideoCostUsd: null,
+        costSource: null,
+        note: 'Sin tarifa activa configurada (cost_rates: video_engine/video_generation/per_video); ' +
+          'no se puede estimar el costo. El costo real lo informa Videogen por video una vez generado.',
+      };
+    }
+    const estimatedVideoCostUsd = videoCount * Number(rate.rateUsd);
+    return {
+      videoCount,
+      videoChapterIds,
+      estimatedVideoCostUsd,
+      costSource: rate.source ?? 'configured_rate',
+      note: `Estimado con la tarifa configurada (${rate.rateUsd} USD/video); es orientativo — el costo real de un ` +
+        'video en modo real lo informa Videogen (getVideoCost) al completarse.',
+    };
   }
 
   async getRun(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<RunDto> {
@@ -424,8 +489,9 @@ export class RunsService {
     blueprintNumber: number,
     context: Record<string, any>,
     contextHash: string,
+    videoMode: RunVideoMode,
   ): Promise<string> {
-    const inputPayload = { manifestId: manifest.id, blueprintNumber, contextHash };
+    const inputPayload = { manifestId: manifest.id, blueprintNumber, contextHash, videoMode };
     const [job] = await qr.query(
       `insert into public.production_jobs
          (owner_id, course_id, frontend_course_id, execution_mode, status, worker_status, current_step,
@@ -497,6 +563,7 @@ export class RunsService {
     job: any,
     manifest: ManifestDto,
     contextHash: string,
+    videoMode: RunVideoMode,
   ): Promise<StartRunResult> {
     const ctx = await this.loadContextRow(job.id);
     if (ctx.context_hash !== contextHash) {
@@ -507,7 +574,25 @@ export class RunsService {
           `runId=${job.id}`,
       );
     }
+    const existingVideoMode = this.videoModeOf(job);
+    if (existingVideoMode !== videoMode) {
+      throw new ConflictException(
+        `Ya hay una ejecución activa para este Manifest con otro modo de video (guardado ${existingVideoMode}, ` +
+          `enviado ${videoMode}). El modo de video de una ejecución iniciada no cambia. runId=${job.id}`,
+      );
+    }
     return { created: false, reopened: false, run: await this.buildRunDto(job, manifest) };
+  }
+
+  /** R17: 'mock' si se omite o viene vacío; cualquier otro valor ya fue rechazado por el DTO (400). */
+  private normalizeVideoMode(v: unknown): RunVideoMode {
+    return v === 'real' ? 'real' : DEFAULT_VIDEO_MODE;
+  }
+
+  /** videoMode congelado de un run ya existente; ausente (runs previos a esta feature) → 'mock'. */
+  private videoModeOf(job: any): RunVideoMode {
+    const v = job?.input_payload?.videoMode;
+    return (RUN_VIDEO_MODES as readonly string[]).includes(v) ? v : DEFAULT_VIDEO_MODE;
   }
 
   /**
@@ -592,11 +677,13 @@ export class RunsService {
     } catch (err) {
       if (isActiveRunConflict(err)) {
         const winner = await this.findActiveRunRow(manifest.id);
-        if (winner) return this.existingRunOrConflict(winner, manifest, contextHash);
+        if (winner) return this.existingRunOrConflict(winner, manifest, contextHash, this.videoModeOf(winner));
       }
       throw err;
     }
-    if (outcome.kind === 'active') return this.existingRunOrConflict(outcome.row, manifest, contextHash);
+    if (outcome.kind === 'active') {
+      return this.existingRunOrConflict(outcome.row, manifest, contextHash, this.videoModeOf(outcome.row));
+    }
     return { created: false, reopened: true, run: await this.buildRunDto(await this.loadJobById(jobId), manifest) };
   }
 
@@ -848,6 +935,7 @@ export class RunsService {
       blueprintNumber: manifest.blueprintNumber,
       status: job.status,
       workerStatus: job.worker_status,
+      videoMode: this.videoModeOf(job),
       courseContextSha256: ctx.context_hash,
       courseContext: ctx.context,
       createdAt: toIso(job.created_at),
