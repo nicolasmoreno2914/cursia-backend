@@ -59,9 +59,9 @@ function extractSupabaseProjectRef() {
   const host = String(process.env.DB_HOST || '');
   const user = String(process.env.DB_USER || '');
   let m = host.match(/^db\.([a-z0-9]+)\.supabase\.co$/i);
-  if (m) return m[1];
+  if (m) return m[1].toLowerCase();
   m = user.match(/^postgres\.([a-z0-9]+)$/i);
-  if (m) return m[1];
+  if (m) return m[1].toLowerCase();
   return null;
 }
 
