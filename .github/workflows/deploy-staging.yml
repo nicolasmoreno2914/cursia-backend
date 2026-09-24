@@ -125,6 +125,12 @@ jobs:
                echo "━━━ [4/6] Verificar esquema de estructura dinámica de cursos (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-dynamic-course-structure-schema.js
 
+               echo "━━━ [4b] Blueprints: migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-course-blueprints.js
+
+               echo "━━━ [4c] Blueprints: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-course-blueprints-schema.js
+
                echo "━━━ [5/6] Migrar usage_events y cost_rates (staging) ━━━"
                node scripts/migrate-usage-events-costs.js
 
