@@ -186,6 +186,22 @@ export function buildGenerationManifest(
  *  - UNKNOWN_MODULE: an `exam` item (or any item) references a `moduleId`
  *    that doesn't exist in the snapshot at all (distinct from
  *    UNKNOWN_CHAPTER, which is chapter-scoped).
+ *  - WRONG_DEPENDENCIES: an item's `dependsOn` doesn't equal (order-
+ *    sensitive) the exact expected edge for its type, derived independently
+ *    from the snapshot: `content` -> `[]`; `scorm:X`/`video:X` ->
+ *    `[content:X]`; `exam:M` -> `content:*` keys of M's chapters in
+ *    position order. This is a stronger check than DANGLING_DEPENDENCY
+ *    (which only asks "does this key exist anywhere in the manifest") — it
+ *    catches a misdirected edge to a key that does exist (e.g.
+ *    `scorm:X.dependsOn=[content:Y]`), and a cycle between two existing
+ *    keys (e.g. `content:A.dependsOn=[scorm:A]`,
+ *    `scorm:A.dependsOn=[content:A]`), which DANGLING_DEPENDENCY alone
+ *    cannot see since every key involved is present. With the exact edge
+ *    enforced per item, a cycle is structurally impossible to pass
+ *    validation: `content` items are the only ones every edge points to,
+ *    and they are the only items required to have zero outgoing edges, so
+ *    nothing content depends on (per this check) can ever depend back on
+ *    it.
  */
 export function validateGenerationManifest(
   m: GenerationManifestV1,
@@ -392,6 +408,39 @@ export function validateGenerationManifest(
         errors.push({
           code: 'DANGLING_DEPENDENCY',
           message: `item ${item.key} depende de una key inexistente: ${dep}`,
+          key: item.key,
+        });
+      }
+    }
+
+    // --- exact edges (independent of whether the dep key even exists) ---
+    // The DAG has exactly one edge shape per rule (content -> [];
+    // scorm:X/video:X -> [content:X]; exam:M -> content keys of M's
+    // chapters in position order) — computed here from the snapshot, not
+    // from `item` itself beyond identifying which chapter/module it claims
+    // to belong to. Because every expected edge points strictly from a
+    // non-content item to a content item, and content items always expect
+    // `[]`, no cycle can ever satisfy this check: a cycle (e.g.
+    // content:A.dependsOn=[scorm:A] / scorm:A.dependsOn=[content:A]) is
+    // caught here as WRONG_DEPENDENCIES on the content item alone (expects
+    // []), independent of anything else being wrong.
+    let expectedDeps: string[] | undefined;
+    if (item.type === 'content') {
+      expectedDeps = [];
+    } else if (item.type === 'scorm' || item.type === 'video') {
+      if (item.chapterId) expectedDeps = [`content:${item.chapterId}`];
+    } else if (item.type === 'exam') {
+      const chapterIds = moduleChapterOrder.get(item.moduleId);
+      if (chapterIds) expectedDeps = chapterIds.map((cid) => `content:${cid}`);
+    }
+    if (expectedDeps) {
+      const same =
+        item.dependsOn.length === expectedDeps.length &&
+        item.dependsOn.every((dep, idx) => dep === expectedDeps![idx]);
+      if (!same) {
+        errors.push({
+          code: 'WRONG_DEPENDENCIES',
+          message: `item ${item.key}: dependsOn esperado ${JSON.stringify(expectedDeps)}, encontrado ${JSON.stringify(item.dependsOn)}`,
           key: item.key,
         });
       }
