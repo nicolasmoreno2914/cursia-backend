@@ -134,6 +134,15 @@ jobs:
                echo "━━━ [4d] Blueprints: auditoría de datos (solo lectura, staging) ━━━"
                MIGRATION_ENV=staging node scripts/audit-course-blueprints.js
 
+               echo "━━━ [4e] Generation Manifests: migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-generation-manifests.js
+
+               echo "━━━ [4f] Generation Manifests: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-generation-manifests-schema.js
+
+               echo "━━━ [4g] Generation Manifests: auditoría (solo lectura, staging) ━━━"
+               MIGRATION_ENV=staging node scripts/audit-generation-manifests.js
+
                echo "━━━ [5/6] Migrar usage_events y cost_rates (staging) ━━━"
                node scripts/migrate-usage-events-costs.js
 
