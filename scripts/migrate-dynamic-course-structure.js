@@ -37,9 +37,70 @@ function assertExplicitStagingIntent() {
   }
 }
 
+// Guardarraíl de identidad de proyecto — MIGRATION_ENV=staging demuestra
+// intención, no demuestra que la conexión efectiva sea staging (un .env mal
+// puesto con MIGRATION_ENV=staging + DB_HOST de producción pasaría el check
+// anterior). Este check inspecciona el ref de proyecto de Supabase que
+// DB_HOST/DB_USER van a resolver en la conexión real.
+//
+// El ref de PRODUCCIÓN está documentado (no es secreto — es la parte pública
+// de la URL del proyecto) en orbia-backend/docs/DEPLOY_CONTABO_SUPABASE.md y
+// docs/memory/00_estado_actual.md. No hay (todavía) un ref de staging
+// confirmado para esta base — el único ref de staging conocido en el repo
+// (campuscloud-gen/src/js/20-supabase.js) es el de Supabase Auth/Storage del
+// FRONTEND, sin confirmar que el backend use el mismo proyecto. Por eso este
+// guardarraíl es una lista NEGRA dura contra el ref de producción (aborta
+// siempre, sin bypass), no una lista blanca contra un ref de staging que
+// todavía no está verificado para este contexto.
+const KNOWN_PRODUCTION_SUPABASE_REF = 'hriwbakbuypaiovvvkqh';
+const KNOWN_STAGING_SUPABASE_REF_FRONTEND_ONLY = 'ljdtmkwuhkvtmlhugjrv';
+
+function extractSupabaseProjectRef() {
+  const host = String(process.env.DB_HOST || '');
+  const user = String(process.env.DB_USER || '');
+  let m = host.match(/^db\.([a-z0-9]+)\.supabase\.co$/i);
+  if (m) return m[1];
+  m = user.match(/^postgres\.([a-z0-9]+)$/i);
+  if (m) return m[1];
+  return null;
+}
+
+function assertNotProductionProject() {
+  const ref = extractSupabaseProjectRef();
+  if (ref === KNOWN_PRODUCTION_SUPABASE_REF) {
+    console.error(
+      '❌ La conexión efectiva (DB_HOST/DB_USER) apunta al proyecto de Supabase\n' +
+      '   de PRODUCCIÓN (ref conocido: ' + KNOWN_PRODUCTION_SUPABASE_REF + '). Abortando —\n' +
+      '   esto nunca debe correr contra producción, sin importar MIGRATION_ENV.'
+    );
+    process.exit(1);
+  }
+  if (ref === null) {
+    console.error(
+      '❌ No se pudo determinar el ref de proyecto de Supabase desde DB_HOST/\n' +
+      '   DB_USER (formato inesperado: ni "db.<ref>.supabase.co" ni pooler\n' +
+      '   "postgres.<ref>"). Abortando por seguridad — no se puede confirmar\n' +
+      '   que la conexión NO sea producción.'
+    );
+    process.exit(1);
+  }
+  if (ref === KNOWN_STAGING_SUPABASE_REF_FRONTEND_ONLY) {
+    console.log('✅ Ref de proyecto (' + ref + ') coincide con el de staging conocido (frontend Auth/Storage).');
+  } else {
+    console.warn(
+      '⚠️  El ref de proyecto detectado (' + ref + ') no coincide con el único ref de\n' +
+      '   staging conocido en este repo (' + KNOWN_STAGING_SUPABASE_REF_FRONTEND_ONLY + ', confirmado\n' +
+      '   solo para Auth/Storage del frontend, no para esta base). Continuando\n' +
+      '   porque definitivamente NO es el proyecto de producción — pero esto no\n' +
+      '   es una confirmación positiva de que sea staging.'
+    );
+  }
+}
+
 async function main() {
   loadEnvFile(path.resolve(process.cwd(), '.env'));
   assertExplicitStagingIntent();
+  assertNotProductionProject();
 
   const client = new Client({
     host: process.env.DB_HOST || '127.0.0.1',

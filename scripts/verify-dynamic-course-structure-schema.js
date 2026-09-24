@@ -21,6 +21,66 @@ function loadEnvFile(envPath) {
   }
 }
 
+// Mismos guardarraíles que migrate-dynamic-course-structure.js — este script
+// también se conecta a una base real (deploy-staging.yml lo corre justo
+// después de la migración), así que necesita la misma protección. Ver ese
+// archivo para la explicación completa de por qué es lista negra (ref de
+// producción conocido) y no lista blanca (ref de staging sin confirmar para
+// el backend).
+function assertExplicitStagingIntent() {
+  if (process.env.MIGRATION_ENV !== 'staging') {
+    console.error(
+      '❌ MIGRATION_ENV no es "staging" — este verificador es para el entorno de\n' +
+      '   staging únicamente (spec: 2026-09-23-dynamic-course-structure-design.md).\n' +
+      '   deploy-staging.yml lo setea automáticamente; si lo corrés a mano contra\n' +
+      '   staging, usá: MIGRATION_ENV=staging node scripts/verify-dynamic-course-structure-schema.js'
+    );
+    process.exit(1);
+  }
+}
+
+const KNOWN_PRODUCTION_SUPABASE_REF = 'hriwbakbuypaiovvvkqh';
+const KNOWN_STAGING_SUPABASE_REF_FRONTEND_ONLY = 'ljdtmkwuhkvtmlhugjrv';
+
+function extractSupabaseProjectRef() {
+  const host = String(process.env.DB_HOST || '');
+  const user = String(process.env.DB_USER || '');
+  let m = host.match(/^db\.([a-z0-9]+)\.supabase\.co$/i);
+  if (m) return m[1];
+  m = user.match(/^postgres\.([a-z0-9]+)$/i);
+  if (m) return m[1];
+  return null;
+}
+
+function assertNotProductionProject() {
+  const ref = extractSupabaseProjectRef();
+  if (ref === KNOWN_PRODUCTION_SUPABASE_REF) {
+    console.error(
+      '❌ La conexión efectiva (DB_HOST/DB_USER) apunta al proyecto de Supabase\n' +
+      '   de PRODUCCIÓN (ref conocido: ' + KNOWN_PRODUCTION_SUPABASE_REF + '). Abortando —\n' +
+      '   esto nunca debe correr contra producción, sin importar MIGRATION_ENV.'
+    );
+    process.exit(1);
+  }
+  if (ref === null) {
+    console.error(
+      '❌ No se pudo determinar el ref de proyecto de Supabase desde DB_HOST/\n' +
+      '   DB_USER (formato inesperado). Abortando por seguridad — no se puede\n' +
+      '   confirmar que la conexión NO sea producción.'
+    );
+    process.exit(1);
+  }
+  if (ref === KNOWN_STAGING_SUPABASE_REF_FRONTEND_ONLY) {
+    console.log('✅ Ref de proyecto (' + ref + ') coincide con el de staging conocido (frontend Auth/Storage).');
+  } else {
+    console.warn(
+      '⚠️  El ref de proyecto detectado (' + ref + ') no coincide con el único ref de\n' +
+      '   staging conocido en este repo. Continuando porque definitivamente NO\n' +
+      '   es el proyecto de producción — pero no es confirmación positiva de staging.'
+    );
+  }
+}
+
 const EXPECTED_COLUMNS = {
   course_modules: ['id', 'course_id', 'position', 'title', 'objective', 'exam_enabled', 'status', 'created_at', 'updated_at'],
   course_chapters: ['id', 'course_id', 'module_id', 'position', 'title', 'objective', 'video_enabled', 'status', 'context_summary', 'generated_with_version_id', 'created_at', 'updated_at'],
@@ -66,6 +126,8 @@ async function columnDetails(client, table, column) {
 
 async function main() {
   loadEnvFile(path.resolve(process.cwd(), '.env'));
+  assertExplicitStagingIntent();
+  assertNotProductionProject();
 
   const client = new Client({
     host: process.env.DB_HOST || '127.0.0.1',
@@ -189,7 +251,7 @@ async function main() {
       return;
     }
 
-    console.log('✅ Esquema de estructura dinámica verificado correctamente contra', process.env.DB_NAME);
+    console.log('✅ Esquema de estructura dinámica verificado correctamente (ref de proyecto:', extractSupabaseProjectRef(), ')');
   } finally {
     await client.end();
   }
