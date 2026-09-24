@@ -57,6 +57,7 @@ export class CoursesService {
       .where('course.owner_id = :ownerId', { ownerId })
       .andWhere(`course.metadata->>'courseId' = :frontendCourseId`, { frontendCourseId })
       .andWhere('course.structure_version = :sv', { sv: 'dynamic' })
+      .orderBy('course.id', 'ASC')
       .getOne();
     if (existing) return existing;
 

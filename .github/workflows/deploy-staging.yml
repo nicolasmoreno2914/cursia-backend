@@ -98,6 +98,8 @@ jobs:
                  exit 1
                fi
 
+               if grep -q "^NODE_ENV=production" .env; then echo "✓ NODE_ENV=production en el .env de staging"; else echo "⚠️ El .env de staging NO tiene NODE_ENV=production — TypeORM synchronize estaría activo en staging"; fi
+
                ensure_pm2_process() {
                  local name="$1"
                  local start_script="$2"

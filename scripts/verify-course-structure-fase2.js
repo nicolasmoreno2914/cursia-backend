@@ -38,6 +38,10 @@ function assertSafeToRun() {
     console.error('❌ MIGRATION_ENV no es "staging" — este harness es para staging únicamente.');
     process.exit(1);
   }
+  if (process.env.NODE_ENV !== 'production') {
+    console.error('❌ NODE_ENV no es "production" — este harness exige NODE_ENV=production para que TypeORM no sincronice el esquema (ver src/database/database.module.ts: synchronize se activa si NODE_ENV está vacío o es "development", y las entidades no declaran los constraints/FKs deferrable de Fase 1).');
+    process.exit(1);
+  }
   const ref = extractSupabaseProjectRef();
   if (ref === KNOWN_PRODUCTION_SUPABASE_REF) {
     console.error('❌ La conexión apunta al proyecto de Supabase de PRODUCCIÓN. Abortando.');
@@ -192,6 +196,9 @@ async function main() {
     }
   } finally {
     await app.close();
+    // ProductionJobsService.onModuleInit arranca un setInterval (reaper) que
+    // app.close() no limpia — sin esto el proceso queda colgado y nunca sale.
+    process.exit(process.exitCode ?? 0);
   }
 }
 
