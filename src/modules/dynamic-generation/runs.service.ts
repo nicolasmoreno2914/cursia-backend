@@ -1,7 +1,9 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   InternalServerErrorException,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { DataSource } from 'typeorm';
@@ -10,7 +12,7 @@ import { returningRows } from '../../common/db/returning-rows';
 import { GenerationManifestsService, ManifestDto } from '../generation-manifests/generation-manifests.service';
 import type { ManifestItemType } from '../generation-manifests/generation-manifest-builder';
 import { CourseContextDto } from './dto/course-context.dto';
-import { canonicalContextHash, itemIdempotencyKey, plainContext } from './run-hash';
+import { REQUIRED_CONTEXT_FIELDS, canonicalContextHash, itemIdempotencyKey, normalizeCourseContext } from './run-hash';
 
 export type ItemRunStatus = 'pending' | 'running' | 'retrying' | 'completed' | 'failed' | 'blocked' | 'cancelled';
 
@@ -21,6 +23,8 @@ const NON_TERMINAL_ITEM_STATUSES = ['pending', 'running', 'retrying', 'blocked']
 /** worker_status "activo" del run — el mismo set que el predicado de uq_dynamic_generation_active_run. */
 const ACTIVE_RUN_WORKER_STATUSES = ['queued', 'running', 'retrying'];
 const CANCELLED_LIKE = new Set(['cancelled', 'cancelling']);
+/** worker_status de un run terminado en fallo (reabrible por startRun con el mismo contexto, R10). */
+const FAILED_LIKE = new Set(['failed', 'failed_retryable', 'failed_recoverable']);
 const ACTIVE_RUN_INDEX = 'uq_dynamic_generation_active_run';
 /** 5A solo siembra generation 1 (Fase 8 creará generation 2… para regenerar). */
 const GENERATION = 1;
@@ -100,6 +104,24 @@ function isCancelledLike(job: { status?: string | null; worker_status?: string |
   return CANCELLED_LIKE.has(String(job.worker_status ?? '').trim()) || CANCELLED_LIKE.has(String(job.status ?? '').trim());
 }
 
+function isActive(job: { status?: string | null; worker_status?: string | null }): boolean {
+  return ACTIVE_RUN_WORKER_STATUSES.includes(String(job.worker_status ?? '')) && !isCancelledLike(job);
+}
+
+function isReopenable(job: { status?: string | null; worker_status?: string | null }): boolean {
+  return isCancelledLike(job) || FAILED_LIKE.has(String(job.worker_status ?? '').trim());
+}
+
+function isActiveRunConflict(err: any): boolean {
+  return pgCode(err) === '23505' && pgConstraint(err) === ACTIVE_RUN_INDEX;
+}
+
+export interface StartRunResult {
+  created: boolean;
+  reopened: boolean;
+  run: RunDto;
+}
+
 /**
  * Runs de generación dinámica (Fase 5A, Task 2): crear/sembrar, leer
  * progreso, cancelar, reintentar un item. Sin claim/complete (Task 3).
@@ -129,39 +151,66 @@ function isCancelledLike(job: { status?: string | null; worker_status?: string |
  */
 @Injectable()
 export class RunsService {
+  private readonly logger = new Logger(RunsService.name);
+
   constructor(
     private readonly dataSource: DataSource,
     private readonly manifests: GenerationManifestsService,
   ) {}
 
   /**
-   * Get-or-create del run de un Manifest.
+   * Get-or-create (y reapertura) del run de un Manifest.
    *
-   * - Si hay un run activo → se devuelve (`created:false`) y su contexto NO
-   *   cambia nunca (condición §7.2). Si el contexto enviado tiene otro hash →
-   *   409 explícito para que la UI se lo diga al usuario.
-   * - Concurrencia: la garantiza el índice único parcial; el perdedor de una
+   * - Run ACTIVO: se devuelve (`created:false`); su contexto NO cambia nunca
+   *   (condición §7.2) — si el contexto enviado tiene otro hash → 409 con el
+   *   runId.
+   * - Sin activo, último run TERMINADO en cancelled/failed (R10): con el MISMO
+   *   hash de contexto se REABRE (items cancelled → pending, o blocked si
+   *   alguna dependencia está failed; failed/completed intactos; mismas filas
+   *   e idempotency keys) → `{created:false, reopened:true}`. Con otro hash →
+   *   409: cambiar el contexto es regeneración (Fase 8).
+   * - Último run completed → 409 (re-ejecutar un Manifest completo es
+   *   regeneración, generation 2 = Fase 8). Los items failed de un run se
+   *   reintentan con `retryItem`.
+   * - Sin runs → se crea (job + contexto + items en una transacción). La
+   *   concurrencia la garantiza el índice único parcial: el perdedor de una
    *   carrera recibe 23505, re-selecciona el run activo y lo devuelve.
-   * - Si ya existen items generation 1 para el Manifest (un run anterior
-   *   terminó: completed/failed/cancelled) → 409. En 5A no se "re-adjuntan"
-   *   esos items a un run nuevo ni se crea generation 2: re-ejecutar un
-   *   Manifest completo es regeneración (Fase 8, generation 2). Reintentar
-   *   items `failed` va por `retryItem` sobre el run existente, que reabre el
-   *   run si había terminado en failed. Un run cancelado no se reabre.
    */
   async startRun(
     courseId: number,
     ownerId: string,
     blueprintNumber: number,
     courseContext: CourseContextDto,
-  ): Promise<{ created: boolean; run: RunDto }> {
+  ): Promise<StartRunResult> {
     const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
-    const context = plainContext(courseContext) as Record<string, any>;
+    const context = normalizeCourseContext(courseContext);
+    this.assertRequiredContext(context);
     const contextHash = canonicalContextHash(context);
 
     const active = await this.findActiveRunRow(manifest.id);
     if (active) return this.existingRunOrConflict(active, manifest, contextHash);
 
+    const latest = await this.findLatestRunRow(manifest.id);
+    if (latest) {
+      // Carrera: el run pudo commitearse entre las dos lecturas → es el activo.
+      if (isActive(latest)) return this.existingRunOrConflict(latest, manifest, contextHash);
+      if (!isReopenable(latest)) {
+        throw new ConflictException(
+          `La ejecución anterior de este Manifest ya terminó (${latest.worker_status}); re-ejecutar un Manifest ` +
+            `completo es regeneración (Fase 8). runId=${latest.id}`,
+        );
+      }
+      const ctx = await this.loadContextRow(latest.id);
+      if (ctx.context_hash !== contextHash) {
+        throw new ConflictException(
+          `La ejecución anterior usó otro contexto; cambiar el contexto requiere regeneración (Fase 8). runId=${latest.id}`,
+        );
+      }
+      return this.reopenRun(latest.id, manifest, contextHash);
+    }
+
+    // Respaldo: items generation 1 sin run visible no deberían existir (FK
+    // cascade), pero nunca se siembra encima de items ajenos.
     await this.assertNoPreviousItems(manifest);
 
     const [course] = await this.dataSource.query(
@@ -170,16 +219,13 @@ export class RunsService {
     );
     const frontendCourseId: string | null = course?.frontend_course_id ?? null;
 
-    const qr = this.dataSource.createQueryRunner();
-    await qr.connect();
-    await qr.startTransaction();
     let jobId: string;
     try {
-      jobId = await this.insertRun(qr, manifest, ownerId, courseId, frontendCourseId, blueprintNumber, context, contextHash);
-      await qr.commitTransaction();
+      jobId = await this.tx((qr) =>
+        this.insertRun(qr, manifest, ownerId, courseId, frontendCourseId, blueprintNumber, context, contextHash),
+      );
     } catch (err) {
-      await qr.rollbackTransaction();
-      if (pgCode(err) === '23505' && pgConstraint(err) === ACTIVE_RUN_INDEX) {
+      if (isActiveRunConflict(err)) {
         // Carrera: otro POST creó el run activo primero (y ya commiteó — el
         // índice único espera al otro insert antes de fallar).
         const winner = await this.findActiveRunRow(manifest.id);
@@ -189,11 +235,20 @@ export class RunsService {
         );
       }
       throw err;
-    } finally {
-      await qr.release();
     }
 
-    return { created: true, run: await this.buildRunDto(await this.loadJobById(jobId), manifest) };
+    return { created: true, reopened: false, run: await this.buildRunDto(await this.loadJobById(jobId), manifest) };
+  }
+
+  /**
+   * R11: el run "actual" de un Manifest para que la UI reanude tras recargar
+   * sin reenviar contexto: el activo si hay, si no el más reciente, si no
+   * `null`.
+   */
+  async getCurrentRun(courseId: number, ownerId: string, blueprintNumber: number): Promise<RunDto | null> {
+    const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
+    const job = (await this.findActiveRunRow(manifest.id)) ?? (await this.findLatestRunRow(manifest.id));
+    return job ? this.buildRunDto(job, manifest) : null;
   }
 
   async getRun(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<RunDto> {
@@ -212,10 +267,7 @@ export class RunsService {
     const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
     const job = await this.loadRunRow(courseId, manifest, runId);
 
-    const qr = this.dataSource.createQueryRunner();
-    await qr.connect();
-    await qr.startTransaction();
-    try {
+    await this.tx(async (qr) => {
       const [locked] = await qr.query(
         `select id, status, worker_status from public.production_jobs where id = $1 for update`,
         [job.id],
@@ -225,13 +277,7 @@ export class RunsService {
       }
       await this.markRunCancelled(qr, job.id, ownerId, 'user_cancelled');
       await this.cancelOpenItems(qr, job.id);
-      await qr.commitTransaction();
-    } catch (err) {
-      await qr.rollbackTransaction();
-      throw err;
-    } finally {
-      await qr.release();
-    }
+    });
     return this.buildRunDto(await this.loadJobById(job.id), manifest);
   }
 
@@ -260,11 +306,7 @@ export class RunsService {
       throw new ConflictException(`La ejecución ${job.id} está cancelada; no se pueden reintentar items`);
     }
 
-    const qr = this.dataSource.createQueryRunner();
-    await qr.connect();
-    await qr.startTransaction();
-    let targetId: string;
-    try {
+    const targetId = await this.tx(async (qr) => {
       const [locked] = await qr.query(
         `select id, status, worker_status from public.production_jobs where id = $1 for update`,
         [job.id],
@@ -290,7 +332,6 @@ export class RunsService {
           `Solo se puede reintentar un item en estado "failed"; "${itemKey}" está en "${target.status}"`,
         );
       }
-      targetId = target.id;
 
       const updated = returningRows(
         await qr.query(
@@ -351,7 +392,7 @@ export class RunsService {
             [job.id],
           );
         } catch (err) {
-          if (pgCode(err) === '23505' && pgConstraint(err) === ACTIVE_RUN_INDEX) {
+          if (isActiveRunConflict(err)) {
             throw new ConflictException(
               `Ya hay otra ejecución activa para el Manifest #${manifest.id}; no se puede reabrir ${job.id}`,
             );
@@ -359,13 +400,8 @@ export class RunsService {
           throw err;
         }
       }
-      await qr.commitTransaction();
-    } catch (err) {
-      await qr.rollbackTransaction();
-      throw err;
-    } finally {
-      await qr.release();
-    }
+      return target.id;
+    });
 
     const [row] = await this.dataSource.query(`select * from public.generation_item_runs where id = $1`, [targetId]);
     return this.toItemDto(row);
@@ -428,7 +464,14 @@ export class RunsService {
        returning id`,
       params,
     );
-    if (!Array.isArray(inserted) || inserted.length !== items.length) {
+    const insertedCount = Array.isArray(inserted) ? inserted.length : 0;
+    if (insertedCount === items.length && insertedCount !== manifest.totals.totalJobs) {
+      // Falla fuerte ANTES del commit: nada queda escrito.
+      throw new InternalServerErrorException(
+        `Manifest #${manifest.id}: se sembraron ${insertedCount} items pero totals.totalJobs = ${manifest.totals.totalJobs}`,
+      );
+    }
+    if (insertedCount !== items.length) {
       throw new ConflictException(
         `El Manifest #${manifest.id} ya tiene items sembrados de otra ejecución ` +
           `(${Array.isArray(inserted) ? inserted.length : 0}/${items.length} nuevos); usar reintentar items`,
@@ -454,16 +497,160 @@ export class RunsService {
     job: any,
     manifest: ManifestDto,
     contextHash: string,
-  ): Promise<{ created: boolean; run: RunDto }> {
+  ): Promise<StartRunResult> {
     const ctx = await this.loadContextRow(job.id);
     if (ctx.context_hash !== contextHash) {
       throw new ConflictException(
-        `Ya hay una ejecución activa (${job.id}) para este Manifest con OTRO contexto de curso ` +
+        'Ya hay una ejecución activa para este Manifest con otro contexto de curso ' +
           `(guardado ${ctx.context_hash.slice(0, 12)}…, enviado ${contextHash.slice(0, 12)}…). ` +
-          'El contexto de una ejecución iniciada no cambia: reanudala con el mismo contexto o cancelala primero.',
+          'El contexto de una ejecución iniciada no cambia; cambiarlo requiere regeneración (Fase 8). ' +
+          `runId=${job.id}`,
       );
     }
-    return { created: false, run: await this.buildRunDto(job, manifest) };
+    return { created: false, reopened: false, run: await this.buildRunDto(job, manifest) };
+  }
+
+  /**
+   * R10: reabre un run terminado en cancelled/failed (el caller ya verificó
+   * que el hash de contexto es el mismo). En una transacción con la fila del
+   * job bloqueada FOR UPDATE:
+   * - items `cancelled` → `pending`, o `blocked` si alguna de sus
+   *   dependencias está failed (o queda blocked) — punto fijo; con lease,
+   *   worker, next_retry_at y finished_at en NULL;
+   * - items failed/completed/pending/blocked: intactos (failed se reintenta
+   *   con retryItem); mismas filas, mismas idempotency keys;
+   * - run → status = worker_status = 'queued'.
+   * Si mientras tanto el run ya volvió a estar activo (otra reapertura
+   * concurrente) → se devuelve como existente. Si otro run del Manifest
+   * quedara activo, el índice único parcial da 23505 → se devuelve ese.
+   */
+  private async reopenRun(jobId: string, manifest: ManifestDto, contextHash: string): Promise<StartRunResult> {
+    let outcome: { kind: 'reopened' } | { kind: 'active'; row: any };
+    try {
+      outcome = await this.tx(async (qr) => {
+        const [locked] = await qr.query(`select * from public.production_jobs where id = $1 for update`, [jobId]);
+        if (isActive(locked)) return { kind: 'active' as const, row: locked };
+        if (!isReopenable(locked)) {
+          throw new ConflictException(
+            `La ejecución anterior de este Manifest ya terminó (${locked.worker_status}); re-ejecutar un Manifest ` +
+              `completo es regeneración (Fase 8). runId=${jobId}`,
+          );
+        }
+
+        const items: Array<{ id: string; item_key: string; status: ItemRunStatus; depends_on: string[] }> =
+          await qr.query(
+            `select id, item_key, status, depends_on from public.generation_item_runs
+              where job_id = $1 and generation = $2 order by id for update`,
+            [jobId, GENERATION],
+          );
+        const status = new Map<string, ItemRunStatus>(items.map((i) => [i.item_key, i.status]));
+        const reopen = items.filter((i) => i.status === 'cancelled');
+        for (const i of reopen) status.set(i.item_key, 'pending');
+        let changed = true;
+        while (changed) {
+          changed = false;
+          for (const i of reopen) {
+            if (status.get(i.item_key) !== 'pending') continue;
+            const bad = (i.depends_on ?? []).some((d) => !status.has(d) || ['failed', 'blocked'].includes(status.get(d)));
+            if (bad) {
+              status.set(i.item_key, 'blocked');
+              changed = true;
+            }
+          }
+        }
+        for (const target of ['pending', 'blocked'] as const) {
+          const ids = reopen.filter((i) => status.get(i.item_key) === target).map((i) => i.id);
+          if (ids.length === 0) continue;
+          const rows = returningRows(
+            await qr.query(
+              `update public.generation_item_runs
+                  set status = $2, lease_until = null, worker_id = null, next_retry_at = null,
+                      finished_at = null, updated_at = now()
+                where id = any($1::uuid[]) and status = 'cancelled'
+                returning id`,
+              [ids, target],
+            ),
+          );
+          if (rows.length !== ids.length) {
+            throw new InternalServerErrorException(
+              `Reapertura inconsistente de la ejecución ${jobId} (${rows.length}/${ids.length} items → ${target})`,
+            );
+          }
+        }
+
+        await qr.query(
+          `update public.production_jobs
+              set status = 'queued', worker_status = 'queued', finished_at = null, error_message = null,
+                  next_retry_at = null, lease_until = null, worker_id = null,
+                  output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('lastReopenedAt', now()),
+                  updated_at = now()
+            where id = $1`,
+          [jobId],
+        );
+        return { kind: 'reopened' as const };
+      });
+    } catch (err) {
+      if (isActiveRunConflict(err)) {
+        const winner = await this.findActiveRunRow(manifest.id);
+        if (winner) return this.existingRunOrConflict(winner, manifest, contextHash);
+      }
+      throw err;
+    }
+    if (outcome.kind === 'active') return this.existingRunOrConflict(outcome.row, manifest, contextHash);
+    return { created: false, reopened: true, run: await this.buildRunDto(await this.loadJobById(jobId), manifest) };
+  }
+
+  /** Run más reciente del Manifest (cualquier estado; reconciliado). */
+  private async findLatestRunRow(manifestId: number): Promise<any | null> {
+    const [row] = await this.dataSource.query(
+      `select * from public.production_jobs
+        where execution_mode = 'dynamic_generation' and input_payload->>'manifestId' = $1
+        order by created_at desc, id desc
+        limit 1`,
+      [String(manifestId)],
+    );
+    return row ? this.reconcileCancellation(row) : null;
+  }
+
+  private assertRequiredContext(context: Record<string, any>): void {
+    const missing = REQUIRED_CONTEXT_FIELDS.filter((k) => !context[k]);
+    if (context.prevCourse && !context.prevCourse.nombre) missing.push('prevCourse.nombre' as any);
+    if (missing.length > 0) {
+      throw new BadRequestException(`Contexto de curso incompleto: ${missing.join(', ')} vacío(s) o solo espacios`);
+    }
+  }
+
+  /**
+   * Transacción con manejo seguro: connect/startTransaction dentro del try;
+   * un fallo del rollback se registra pero NUNCA reemplaza al error original
+   * (así el 23505 del índice de run activo sigue llegando al caller).
+   */
+  async tx<T>(fn: (qr: QueryRunner) => Promise<T>): Promise<T> {
+    const qr = this.dataSource.createQueryRunner();
+    try {
+      await qr.connect();
+      await qr.startTransaction();
+      const out = await fn(qr);
+      await qr.commitTransaction();
+      return out;
+    } catch (err) {
+      if (qr.isTransactionActive) {
+        try {
+          await qr.rollbackTransaction();
+        } catch (rollbackErr) {
+          this.logger.warn(
+            `rollback falló (se conserva el error original): ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
+          );
+        }
+      }
+      throw err;
+    } finally {
+      try {
+        await qr.release();
+      } catch {
+        /* conexión ya liberada o nunca obtenida */
+      }
+    }
   }
 
   /** Run activo del Manifest (después de reconciliar un cancel legacy). */
@@ -535,19 +722,10 @@ export class RunsService {
       );
       if (n === 0) return job;
     }
-    const qr = this.dataSource.createQueryRunner();
-    await qr.connect();
-    await qr.startTransaction();
-    try {
+    await this.tx(async (qr) => {
       await this.markRunCancelled(qr, job.id, null, 'reconciled_from_job_status');
       await this.cancelOpenItems(qr, job.id);
-      await qr.commitTransaction();
-    } catch (err) {
-      await qr.rollbackTransaction();
-      throw err;
-    } finally {
-      await qr.release();
-    }
+    });
     return this.loadJobById(job.id);
   }
 

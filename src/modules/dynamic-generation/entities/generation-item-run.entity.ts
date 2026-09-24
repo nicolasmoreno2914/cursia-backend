@@ -8,7 +8,10 @@ import { Entity, PrimaryGeneratedColumn, Column } from 'typeorm';
  * TODAS las escrituras (siembra, transiciones de estado, claim/lease) se
  * hacen con SQL explícito en `RunsService` (y en Task 3), nunca con `save()`.
  */
-@Entity('generation_item_runs')
+// synchronize:false — la tabla la gobierna la migración SQL (FK compuesta,
+// CHECKs, índices); TypeORM synchronize (NODE_ENV=development) nunca debe
+// intentar alinearla con esta entidad.
+@Entity({ name: 'generation_item_runs', synchronize: false })
 export class GenerationItemRun {
   @PrimaryGeneratedColumn('uuid')
   id: string;

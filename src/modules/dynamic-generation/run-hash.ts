@@ -31,6 +31,46 @@ export function plainContext<T>(context: T): T {
   return JSON.parse(JSON.stringify(context));
 }
 
+/** Campos string del contexto (orden fijo de construcción; el hash ordena claves igual). */
+export const CONTEXT_STRING_FIELDS = ['nombre', 'sector', 'pais', 'ciudad', 'contexto', 'nivel', 'tono', 'obj'] as const;
+/** Obligatorios: vacíos tras normalizar → 400 (lo decide el servicio). */
+export const REQUIRED_CONTEXT_FIELDS = ['nombre', 'sector', 'pais', 'contexto', 'nivel', 'tono'] as const;
+
+/**
+ * Normalización del contexto ANTES de hashear Y de guardar (fix ronda 1):
+ * la auditoría recalcula el hash sobre el jsonb guardado, así que lo que se
+ * guarda debe ser exactamente lo normalizado.
+ *
+ * - Todos los strings se recortan (`trim`).
+ * - Un campo opcional (o cualquiera) `null`, `""` o solo espacios se trata
+ *   como AUSENTE (la clave no se guarda) → `ciudad: ""`, `ciudad: "  "`,
+ *   `ciudad: null` y sin `ciudad` producen el mismo contexto y el mismo hash.
+ * - `prevCourse` null/ausente → ausente; si viene: `nombre` recortado y
+ *   `caps` con cada entrada recortada, descartando las vacías (orden
+ *   conservado).
+ * - Solo se copian las claves conocidas (el DTO ya rechazó las demás).
+ *
+ * Luego `canonicalContextHash` aplica la forma canónica de la auditoría.
+ */
+export function normalizeCourseContext(input: any): Record<string, any> {
+  const clean = (v: any) => (typeof v === 'string' ? v.trim() : v);
+  const out: Record<string, any> = {};
+  for (const k of CONTEXT_STRING_FIELDS) {
+    const v = clean(input?.[k]);
+    if (v === undefined || v === null || v === '') continue;
+    out[k] = v;
+  }
+  const pc = input?.prevCourse;
+  if (pc !== undefined && pc !== null) {
+    const nombre = clean(pc.nombre);
+    const caps = Array.isArray(pc.caps)
+      ? pc.caps.map(clean).filter((c: any) => c !== undefined && c !== null && c !== '')
+      : [];
+    out.prevCourse = { nombre: nombre ?? '', caps };
+  }
+  return out;
+}
+
 export function canonicalContextHash(context: unknown): string {
   const plainJson = plainContext(context);
   return createHash('sha256').update(JSON.stringify(sortKeysDeep(plainJson))).digest('hex');
