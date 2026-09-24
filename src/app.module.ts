@@ -20,6 +20,7 @@ import { BrandProfilesModule } from './modules/brand-profiles/brand-profiles.mod
 import { CourseSetupModule } from './modules/course-setup/course-setup.module';
 import { CourseStructureModule } from './modules/course-structure/course-structure.module';
 import { CourseBlueprintsModule } from './modules/course-blueprints/course-blueprints.module';
+import { GenerationManifestsModule } from './modules/generation-manifests/generation-manifests.module';
 
 @Module({
   imports: [
@@ -45,6 +46,7 @@ import { CourseBlueprintsModule } from './modules/course-blueprints/course-bluep
     CourseSetupModule,
     CourseStructureModule,
     CourseBlueprintsModule,
+    GenerationManifestsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
