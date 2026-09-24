@@ -21,17 +21,17 @@ function loadEnvFile(envPath) {
   }
 }
 
-function assertLooksLikeStaging() {
-  if (process.env.I_KNOW_WHAT_IM_DOING === 'yes') return;
-  const host = String(process.env.DB_HOST || '');
-  const name = String(process.env.DB_NAME || '');
-  const looksLikeStaging = host.includes('staging') || name.includes('staging');
-  if (!looksLikeStaging) {
+// Guardarraíl de intención explícita: esta migración es solo para staging
+// (spec: 2026-09-23-dynamic-course-structure-design.md). No se infiere nada
+// de DB_HOST/DB_NAME (los hosts reales de Supabase nunca contienen "staging"
+// y DB_NAME siempre es "postgres") — el operador tiene que declararlo.
+function assertExplicitStagingIntent() {
+  if (process.env.MIGRATION_ENV !== 'staging') {
     console.error(
-      '❌ DB_HOST/DB_NAME no contienen "staging" — esta migración es para el\n' +
-      '   entorno de staging únicamente (spec: 2026-09-23-dynamic-course-structure-design.md).\n' +
-      '   Si estás seguro de que este .env apunta a staging bajo otro nombre,\n' +
-      '   volvé a correr con I_KNOW_WHAT_IM_DOING=yes.'
+      '❌ MIGRATION_ENV no es "staging" — esta migración es para el entorno de\n' +
+      '   staging únicamente (spec: 2026-09-23-dynamic-course-structure-design.md).\n' +
+      '   deploy-staging.yml lo setea automáticamente; si la corrés a mano contra\n' +
+      '   staging, usá: MIGRATION_ENV=staging node scripts/migrate-dynamic-course-structure.js'
     );
     process.exit(1);
   }
@@ -39,7 +39,7 @@ function assertLooksLikeStaging() {
 
 async function main() {
   loadEnvFile(path.resolve(process.cwd(), '.env'));
-  assertLooksLikeStaging();
+  assertExplicitStagingIntent();
 
   const client = new Client({
     host: process.env.DB_HOST || '127.0.0.1',
@@ -71,4 +71,7 @@ async function main() {
   }
 }
 
-main();
+main().catch((err) => {
+  console.error('❌ Error inesperado:', err.message);
+  process.exitCode = 1;
+});

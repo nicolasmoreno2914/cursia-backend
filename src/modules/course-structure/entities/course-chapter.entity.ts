@@ -30,7 +30,7 @@ export class CourseChapter {
   @Column()
   position: number;
 
-  @Column({ length: 255 })
+  @Column({ type: 'text' })
   title: string;
 
   @Column({ type: 'text', nullable: true })

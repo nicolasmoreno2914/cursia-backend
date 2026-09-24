@@ -8,6 +8,10 @@
 -- para el guardarraíl que lo exige.
 -- ══════════════════════════════════════════════════════════════════════════
 
+-- Falla rápido si otra transacción tiene tomada alguna tabla (los ALTER TABLE
+-- de abajo piden ACCESS EXCLUSIVE sobre courses/artifacts/production_jobs).
+set lock_timeout = '5s';
+
 create table if not exists public.course_modules (
   id            uuid primary key default gen_random_uuid(),
   course_id     integer not null references public.courses(id) on delete cascade,
@@ -18,7 +22,7 @@ create table if not exists public.course_modules (
   status        text not null default 'draft',
   created_at    timestamptz not null default now(),
   updated_at    timestamptz not null default now(),
-  unique (course_id, position)
+  unique (course_id, position) deferrable initially deferred
 );
 
 create table if not exists public.course_chapters (
@@ -34,7 +38,7 @@ create table if not exists public.course_chapters (
   generated_with_version_id   integer references public.course_versions(id) on delete set null,
   created_at                  timestamptz not null default now(),
   updated_at                  timestamptz not null default now(),
-  unique (module_id, position)
+  unique (module_id, position) deferrable initially deferred
 );
 
 alter table if exists public.courses

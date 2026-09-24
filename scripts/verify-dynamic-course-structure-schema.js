@@ -41,6 +41,29 @@ async function tableColumns(client, table) {
   return res.rows.map((r) => r.column_name);
 }
 
+// Columnas donde tipo/nullable/default importan de verdad (no solo que existan).
+const EXPECTED_COLUMN_DETAILS = [
+  { table: 'course_chapters', column: 'status', defaultIncludes: "'not_generated'", isNullable: 'NO' },
+  { table: 'courses', column: 'structure_version', defaultIncludes: "'legacy'", isNullable: 'NO' },
+  { table: 'course_modules', column: 'id', dataType: 'uuid' },
+  { table: 'course_chapters', column: 'id', dataType: 'uuid' },
+];
+
+const EXPECTED_CHECK_CONSTRAINTS = [
+  'courses_structure_version_check',
+  'course_modules_status_check',
+  'course_chapters_status_check',
+];
+
+async function columnDetails(client, table, column) {
+  const res = await client.query(
+    `select data_type, is_nullable, column_default from information_schema.columns
+      where table_schema='public' and table_name=$1 and column_name=$2`,
+    [table, column],
+  );
+  return res.rows[0] || null;
+}
+
 async function main() {
   loadEnvFile(path.resolve(process.cwd(), '.env'));
 
@@ -79,6 +102,28 @@ async function main() {
       }
     }
 
+    // 2b. Tipo / nullable / default de las columnas críticas
+    for (const exp of EXPECTED_COLUMN_DETAILS) {
+      const det = await columnDetails(client, exp.table, exp.column);
+      if (!det) continue; // la ausencia ya quedó reportada arriba
+      const label = `${exp.table}.${exp.column}`;
+      if (exp.dataType && det.data_type !== exp.dataType) {
+        failures.push(`Columna "${label}" tiene data_type="${det.data_type}", esperado "${exp.dataType}".`);
+      }
+      if (exp.isNullable && det.is_nullable !== exp.isNullable) {
+        failures.push(`Columna "${label}" tiene is_nullable="${det.is_nullable}", esperado "${exp.isNullable}".`);
+      }
+      if (exp.defaultIncludes && !String(det.column_default || '').includes(exp.defaultIncludes)) {
+        failures.push(`Columna "${label}" tiene column_default=${JSON.stringify(det.column_default)}, esperado que contenga ${exp.defaultIncludes}.`);
+      }
+    }
+
+    // 2c. CHECK constraints con nombre
+    for (const conname of EXPECTED_CHECK_CONSTRAINTS) {
+      const res = await client.query(`select conname from pg_constraint where conname = $1`, [conname]);
+      if (res.rows.length === 0) failures.push(`Falta el CHECK constraint "${conname}".`);
+    }
+
     if (failures.length > 0) {
       console.error('❌ Verificación de esquema FALLÓ:');
       failures.forEach((f) => console.error('  - ' + f));
@@ -102,13 +147,18 @@ async function main() {
     } else {
       const courseId = existing.rows[0].id;
       let fkRejected = false;
+      // Transacción local solo para este check: si la FK faltara, el huérfano
+      // igual se descarta con el rollback en vez de quedar commiteado.
+      await client.query('begin');
       try {
         await client.query(
           `insert into public.course_chapters (course_id, module_id, position, title) values ($1, gen_random_uuid(), 1, 'test')`,
           [courseId],
         );
       } catch (e) {
-        fkRejected = /foreign key/i.test(e.message);
+        fkRejected = e.code === '23503'; // SQLSTATE foreign_key_violation (independiente del idioma del servidor)
+      } finally {
+        await client.query('rollback');
       }
       if (!fkRejected) failures.push('Insertar un course_chapter con module_id inexistente NO fue rechazado por la FK — se insertó un huérfano.');
 
@@ -145,4 +195,7 @@ async function main() {
   }
 }
 
-main();
+main().catch((err) => {
+  console.error('❌ Error inesperado:', err.message);
+  process.exitCode = 1;
+});
