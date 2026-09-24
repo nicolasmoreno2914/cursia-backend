@@ -18,6 +18,7 @@ import { PackageModule } from './package/package.module';
 import { InstitutionsModule } from './modules/institutions/institutions.module';
 import { BrandProfilesModule } from './modules/brand-profiles/brand-profiles.module';
 import { CourseSetupModule } from './modules/course-setup/course-setup.module';
+import { CourseStructureModule } from './modules/course-structure/course-structure.module';
 
 @Module({
   imports: [
@@ -41,6 +42,7 @@ import { CourseSetupModule } from './modules/course-setup/course-setup.module';
     InstitutionsModule,
     BrandProfilesModule,
     CourseSetupModule,
+    CourseStructureModule,
   ],
   controllers: [AppController],
   providers: [AppService],
