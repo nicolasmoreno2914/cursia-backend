@@ -12,6 +12,25 @@ import { ReorderDto } from './dto/reorder.dto';
 import { MoveChapterDto } from './dto/move-chapter.dto';
 import type { QueryRunner } from 'typeorm';
 
+/**
+ * Filas devueltas por un `UPDATE ... RETURNING` / `DELETE ... RETURNING`
+ * ejecutado con `queryRunner.query()`.
+ *
+ * Con el driver de Postgres de TypeORM (0.3.x), `query()` NO devuelve las
+ * filas para UPDATE/DELETE: devuelve `[rows, rowCount]`
+ * (PostgresQueryRunner.query → `result.raw = [raw.rows, raw.rowCount]`).
+ * Para SELECT/INSERT sí devuelve `rows` directo. Leer `result[0].col` en un
+ * UPDATE daba `undefined` (el counter nunca llegaba al cliente) y
+ * `result.length === 0` en un DELETE nunca era cierto (siempre largo 2).
+ * Acepta ambas formas por si una versión futura del driver cambia.
+ */
+function returningRows(result: any): any[] {
+  if (Array.isArray(result) && result.length === 2 && Array.isArray(result[0]) && typeof result[1] === 'number') {
+    return result[0];
+  }
+  return result;
+}
+
 @Injectable()
 export class CourseStructureService {
   constructor(
@@ -77,12 +96,18 @@ export class CourseStructureService {
   }
 
   private async bumpCounter(queryRunner: QueryRunner, courseId: number): Promise<number> {
-    const rows = await queryRunner.query(
+    const rows = returningRows(await queryRunner.query(
       `update public.courses set structure_version_counter = structure_version_counter + 1
        where id = $1 returning structure_version_counter`,
       [courseId],
-    );
-    return rows[0].structure_version_counter;
+    ));
+    const counter = rows[0]?.structure_version_counter;
+    if (typeof counter !== 'number') {
+      // Nunca responder 200 sin counter: el cliente lo necesita para su
+      // próximo expectedCounter (sin él, cada escritura siguiente da 409).
+      throw new Error(`bumpCounter: no se pudo leer structure_version_counter del curso #${courseId}`);
+    }
+    return counter;
   }
 
   async getStructure(courseId: number, ownerId: string) {
@@ -216,10 +241,10 @@ export class CourseStructureService {
         throw new BadRequestException('No se puede eliminar el último módulo del curso.');
       }
 
-      const deleted = await queryRunner.query(
+      const deleted = returningRows(await queryRunner.query(
         `delete from public.course_modules where id = $1 and course_id = $2 returning id`,
         [moduleId, courseId],
-      );
+      ));
       if (deleted.length === 0) {
         await queryRunner.rollbackTransaction();
         throw new NotFoundException(`Module ${moduleId} not found in course #${courseId}`);
@@ -332,10 +357,10 @@ export class CourseStructureService {
         throw new BadRequestException('No se puede eliminar el último capítulo del módulo.');
       }
 
-      const deleted = await queryRunner.query(
+      const deleted = returningRows(await queryRunner.query(
         `delete from public.course_chapters where id = $1 and module_id = $2 and course_id = $3 returning id`,
         [chapterId, moduleId, courseId],
-      );
+      ));
       if (deleted.length === 0) {
         await queryRunner.rollbackTransaction();
         throw new NotFoundException(`Chapter ${chapterId} not found in module ${moduleId}`);
