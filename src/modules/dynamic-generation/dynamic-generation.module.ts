@@ -3,6 +3,8 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { GenerationItemRun } from './entities/generation-item-run.entity';
 import { RunsController } from './runs.controller';
 import { RunsService } from './runs.service';
+import { SchedulerService } from './scheduler.service';
+import { ExecutorController } from './executor.controller';
 import { GenerationManifestsModule } from '../generation-manifests/generation-manifests.module';
 import { AuthModule } from '../../auth/auth.module';
 
@@ -18,8 +20,8 @@ import { AuthModule } from '../../auth/auth.module';
     GenerationManifestsModule, // expone GenerationManifestsService.get (ownership + dynamic + Manifest verificado)
     AuthModule,                // expone SupabaseJwtGuard para el controlador
   ],
-  controllers: [RunsController],
-  providers: [RunsService],
-  exports: [RunsService],
+  controllers: [RunsController, ExecutorController],
+  providers: [RunsService, SchedulerService],
+  exports: [RunsService, SchedulerService],
 })
 export class DynamicGenerationModule {}

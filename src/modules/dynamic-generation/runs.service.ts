@@ -13,6 +13,13 @@ import { GenerationManifestsService, ManifestDto } from '../generation-manifests
 import type { ManifestItemType } from '../generation-manifests/generation-manifest-builder';
 import { CourseContextDto } from './dto/course-context.dto';
 import { REQUIRED_CONTEXT_FIELDS, canonicalContextHash, itemIdempotencyKey, normalizeCourseContext } from './run-hash';
+import {
+  ACTIVE_RUN_WORKER_STATUSES,
+  isActiveRun,
+  isCancelledLike,
+  recomputeRunStatus,
+  sweepRunExpiredLeases,
+} from './item-transitions';
 
 export type ItemRunStatus = 'pending' | 'running' | 'retrying' | 'completed' | 'failed' | 'blocked' | 'cancelled';
 
@@ -20,9 +27,6 @@ const ITEM_STATUSES: ItemRunStatus[] = ['pending', 'running', 'retrying', 'compl
 const ITEM_TYPES: ManifestItemType[] = ['content', 'scorm', 'video', 'exam'];
 /** Estados de item que un cancel (o la reconciliación de un cancel legacy) pasa a `cancelled`. */
 const NON_TERMINAL_ITEM_STATUSES = ['pending', 'running', 'retrying', 'blocked'];
-/** worker_status "activo" del run — el mismo set que el predicado de uq_dynamic_generation_active_run. */
-const ACTIVE_RUN_WORKER_STATUSES = ['queued', 'running', 'retrying'];
-const CANCELLED_LIKE = new Set(['cancelled', 'cancelling']);
 /** worker_status de un run terminado en fallo (reabrible por startRun con el mismo contexto, R10). */
 const FAILED_LIKE = new Set(['failed', 'failed_retryable', 'failed_recoverable']);
 const ACTIVE_RUN_INDEX = 'uq_dynamic_generation_active_run';
@@ -100,13 +104,7 @@ function emptyCounts(): StatusCounts {
   return { total: 0, pending: 0, running: 0, retrying: 0, completed: 0, failed: 0, blocked: 0, cancelled: 0 };
 }
 
-function isCancelledLike(job: { status?: string | null; worker_status?: string | null }): boolean {
-  return CANCELLED_LIKE.has(String(job.worker_status ?? '').trim()) || CANCELLED_LIKE.has(String(job.status ?? '').trim());
-}
-
-function isActive(job: { status?: string | null; worker_status?: string | null }): boolean {
-  return ACTIVE_RUN_WORKER_STATUSES.includes(String(job.worker_status ?? '')) && !isCancelledLike(job);
-}
+const isActive = isActiveRun;
 
 function isReopenable(job: { status?: string | null; worker_status?: string | null }): boolean {
   return isCancelledLike(job) || FAILED_LIKE.has(String(job.worker_status ?? '').trim());
@@ -124,7 +122,9 @@ export interface StartRunResult {
 
 /**
  * Runs de generación dinámica (Fase 5A, Task 2): crear/sembrar, leer
- * progreso, cancelar, reintentar un item. Sin claim/complete (Task 3).
+ * progreso, cancelar, reintentar un item. Claim/complete/fail por item viven
+ * en SchedulerService (Task 3); toda lectura del run barre leases vencidos y
+ * recalcula su estado (R12) con las transiciones de item-transitions.ts.
  *
  * Modelo (spec §3.2–§3.5, §7):
  * - 1 run = 1 fila de `production_jobs` con execution_mode
@@ -713,7 +713,7 @@ export class RunsService {
    * normaliza el run a status = worker_status = 'cancelled'. Idempotente.
    * Devuelve la fila del job actualizada.
    */
-  private async reconcileCancellation(job: any): Promise<any> {
+  async reconcileCancellation(job: any): Promise<any> {
     if (!isCancelledLike(job)) return job;
     if (job.status === 'cancelled' && job.worker_status === 'cancelled') {
       const [{ n }] = await this.dataSource.query(
@@ -727,6 +727,25 @@ export class RunsService {
       await this.cancelOpenItems(qr, job.id);
     });
     return this.loadJobById(job.id);
+  }
+
+  /**
+   * Task 3 (R12 + barrido en lectura): en un run activo, barre los leases
+   * vencidos de sus items y recalcula su estado (p.ej. un run reabierto con
+   * solo items failed queda `failed`). Runs terminales/cancelados: intactos.
+   * Fila del run bloqueada primero (mismo orden de locks que el scheduler).
+   */
+  private async sweepAndRecompute(job: any): Promise<any> {
+    if (!isActive(job)) return job;
+    let changed = false;
+    await this.tx(async (qr) => {
+      const [locked] = await qr.query(`select * from public.production_jobs where id = $1 for update`, [job.id]);
+      if (!locked || !isActive(locked)) return;
+      const swept = await sweepRunExpiredLeases(qr, job.id);
+      const status = await recomputeRunStatus(qr, job.id);
+      changed = swept > 0 || status !== locked.worker_status;
+    });
+    return changed ? this.loadJobById(job.id) : job;
   }
 
   private async markRunCancelled(qr: QueryRunner, jobId: string, requestedBy: string | null, reason: string) {
@@ -810,6 +829,7 @@ export class RunsService {
 
   private async buildRunDto(job: any, manifest: ManifestDto): Promise<RunDto> {
     job = await this.reconcileCancellation(job);
+    job = await this.sweepAndRecompute(job);
     const ctx = await this.loadContextRow(job.id);
     const rows = await this.dataSource.query(`select * from public.generation_item_runs where job_id = $1`, [job.id]);
     const progress = await this.progress(job.id, manifest);
