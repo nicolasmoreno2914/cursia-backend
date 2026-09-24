@@ -193,15 +193,30 @@ async function main() {
       return;
     }
 
-    // 3. Cursos existentes no fueron tocados: structure_version debe ser 'legacy' por default
-    const existing = await client.query(
-      `select id, structure_version from public.courses order by id limit 5`,
+    // 3. Cursos legacy intactos. Desde Fase 2 existen cursos 'dynamic'
+    // legítimos (POST /courses/dynamic), así que ya no se puede exigir que
+    // los primeros N cursos sean 'legacy' — eso rompía todo deploy en cuanto
+    // alguien creaba un curso dynamic. El invariante que sí importa: la
+    // migración solo agrega columnas (default 'legacy') y nunca muta filas,
+    // y ningún curso legacy tiene filas de estructura dinámica.
+    const legacyWithStructure = await client.query(
+      `select c.id from public.courses c
+        where c.structure_version = 'legacy'
+          and (exists (select 1 from public.course_modules m where m.course_id = c.id)
+            or exists (select 1 from public.course_chapters ch where ch.course_id = c.id))
+        order by c.id limit 5`,
     );
-    for (const row of existing.rows) {
-      if (row.structure_version !== 'legacy') {
-        failures.push(`Curso id=${row.id} tiene structure_version="${row.structure_version}", esperado "legacy" (no debería haber sido tocado por esta migración).`);
-      }
+    for (const row of legacyWithStructure.rows) {
+      failures.push(`Curso legacy id=${row.id} tiene filas en course_modules/course_chapters — la estructura dinámica nunca debe tocar cursos legacy.`);
     }
+    const byVersion = await client.query(
+      `select structure_version, count(*)::int as n from public.courses group by structure_version order by structure_version`,
+    );
+    console.log('ℹ️  Cursos por structure_version:', byVersion.rows.map((r) => `${r.structure_version}=${r.n}`).join(', ') || '(ninguno)');
+
+    const existing = await client.query(
+      `select id from public.courses order by id limit 1`,
+    );
 
     // 4. FK real: insertar course_chapter con module_id inexistente debe fallar
     if (existing.rows.length === 0) {
