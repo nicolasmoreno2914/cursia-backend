@@ -101,4 +101,22 @@ export class CourseContextDto {
   @IsOptional()
   @IsIn(RUN_VIDEO_MODES as unknown as string[])
   videoMode?: RunVideoMode;
+
+  /**
+   * R19 (Fase 5A Task 6a): ids de plantilla SCORM v2 activos, congelados al
+   * iniciar el run — resueltos en el navegador vía
+   * `sv2ResolveActiveTemplateIds(SEL.scormTemplates, SCORM_V2_TEMPLATES)`
+   * ANTES de llamar a este endpoint (freeze point único, condición 1: el
+   * ejecutor nunca relee `SEL`). SÍ forma parte del contexto congelado
+   * (normalizeCourseContext lo copia, orden preservado, vacío → ausente) —
+   * dos runs con distinta selección de plantillas son contextos distintos.
+   * Ausente → el ejecutor usa el catálogo completo por defecto (mismo
+   * fallback que `sv2ResolveActiveTemplateIds(undefined, ...)`).
+   */
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(32)
+  @IsString({ each: true })
+  @MaxLength(64, { each: true })
+  scormTemplateIds?: string[];
 }

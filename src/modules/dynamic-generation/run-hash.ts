@@ -68,6 +68,16 @@ export function normalizeCourseContext(input: any): Record<string, any> {
       : [];
     out.prevCourse = { nombre: nombre ?? '', caps };
   }
+  // R19 (Task 6a): scormTemplateIds — array, no string field, así que no
+  // entra en el loop de CONTEXT_STRING_FIELDS. Orden preservado (sortKeysDeep
+  // no reordena arrays); vacío/ausente → clave omitida por completo, así el
+  // hash de un contexto sin esta selección (todos los runs anteriores a esta
+  // Task) no cambia.
+  const templateIds = input?.scormTemplateIds;
+  if (Array.isArray(templateIds)) {
+    const cleaned = templateIds.map(clean).filter((id: any) => typeof id === 'string' && id !== '');
+    if (cleaned.length > 0) out.scormTemplateIds = cleaned;
+  }
   return out;
 }
 
