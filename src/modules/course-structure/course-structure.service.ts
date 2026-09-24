@@ -30,6 +30,15 @@ export class CourseStructureService {
    * caller lo incremente al terminar su mutación). Si algo falla, hace
    * rollback y tira la excepción correspondiente — el caller nunca llega
    * a mutar nada.
+   *
+   * Ownership + structureVersion + lock + counter salen de UNA sola query
+   * FOR UPDATE en la conexión del queryRunner (misma conexión que ya
+   * retiene la transacción de escritura) — nunca se pide una segunda
+   * conexión del pool acá (antes se llamaba a `CoursesService.findOne`,
+   * que usa su propio repo/conexión; con pool `max: 5`, varias escrituras
+   * concurrentes se trababan esperando esa segunda conexión). El filtro de
+   * ownership replica exactamente `CoursesService.findOne`: coincide con
+   * `owner_id`, o el curso no tiene owner y `ALLOW_UNOWNED_COURSES=true`.
    */
   private async lockAndVerify(
     queryRunner: QueryRunner,
@@ -37,24 +46,26 @@ export class CourseStructureService {
     ownerId: string,
     expectedCounter: number,
   ): Promise<number> {
-    // Ownership fuera de la transacción de escritura (ya usa su propia
-    // conexión vía el repo inyectado normal) — 404 si no es del usuario.
-    const course = await this.coursesService.findOne(courseId, ownerId);
-    if (course.structureVersion !== 'dynamic') {
-      await queryRunner.rollbackTransaction();
-      throw new BadRequestException(
-        `El curso #${courseId} es "${course.structureVersion}" — esta API solo admite cursos "dynamic".`,
-      );
-    }
+    const allowUnowned = process.env.ALLOW_UNOWNED_COURSES === 'true';
     const rows = await queryRunner.query(
-      `select structure_version_counter from public.courses where id = $1 for update`,
-      [courseId],
+      `select structure_version, structure_version_counter
+       from public.courses
+       where id = $1 and (owner_id = $2 OR ($3 = true AND owner_id IS NULL))
+       for update`,
+      [courseId, ownerId, allowUnowned],
     );
     if (rows.length === 0) {
       await queryRunner.rollbackTransaction();
       throw new NotFoundException(`Course #${courseId} not found`);
     }
+    const structureVersion = rows[0].structure_version;
     const actualCounter = rows[0].structure_version_counter;
+    if (structureVersion !== 'dynamic') {
+      await queryRunner.rollbackTransaction();
+      throw new BadRequestException(
+        `El curso #${courseId} es "${structureVersion}" — esta API solo admite cursos "dynamic".`,
+      );
+    }
     if (actualCounter !== expectedCounter) {
       await queryRunner.rollbackTransaction();
       throw new ConflictException({
@@ -104,9 +115,9 @@ export class CourseStructureService {
 
   async createModule(courseId: number, ownerId: string, dto: CreateModuleDto) {
     const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
-    await queryRunner.startTransaction();
     try {
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
       await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
 
       const maxRows = await queryRunner.query(
@@ -150,9 +161,9 @@ export class CourseStructureService {
 
   async updateModule(courseId: number, moduleId: string, ownerId: string, dto: UpdateModuleDto) {
     const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
-    await queryRunner.startTransaction();
     try {
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
       await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
 
       const existing = await queryRunner.query(
@@ -191,9 +202,9 @@ export class CourseStructureService {
 
   async deleteModule(courseId: number, moduleId: string, ownerId: string, expectedCounter: number) {
     const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
-    await queryRunner.startTransaction();
     try {
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
       await this.lockAndVerify(queryRunner, courseId, ownerId, expectedCounter);
 
       const countRows = await queryRunner.query(
@@ -227,9 +238,9 @@ export class CourseStructureService {
 
   async createChapter(courseId: number, moduleId: string, ownerId: string, dto: CreateChapterDto) {
     const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
-    await queryRunner.startTransaction();
     try {
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
       await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
 
       const moduleRows = await queryRunner.query(
@@ -266,9 +277,9 @@ export class CourseStructureService {
 
   async updateChapter(courseId: number, moduleId: string, chapterId: string, ownerId: string, dto: UpdateChapterDto) {
     const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
-    await queryRunner.startTransaction();
     try {
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
       await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
 
       const existing = await queryRunner.query(
@@ -307,9 +318,9 @@ export class CourseStructureService {
 
   async deleteChapter(courseId: number, moduleId: string, chapterId: string, ownerId: string, expectedCounter: number) {
     const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
-    await queryRunner.startTransaction();
     try {
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
       await this.lockAndVerify(queryRunner, courseId, ownerId, expectedCounter);
 
       const countRows = await queryRunner.query(
@@ -343,9 +354,9 @@ export class CourseStructureService {
 
   async reorderModules(courseId: number, ownerId: string, dto: ReorderDto) {
     const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
-    await queryRunner.startTransaction();
     try {
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
       await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
 
       const existingRows = await queryRunner.query(
@@ -381,9 +392,9 @@ export class CourseStructureService {
 
   async reorderChapters(courseId: number, moduleId: string, ownerId: string, dto: ReorderDto) {
     const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
-    await queryRunner.startTransaction();
     try {
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
       await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
 
       const moduleRows = await queryRunner.query(
@@ -428,9 +439,9 @@ export class CourseStructureService {
 
   async moveChapter(courseId: number, sourceModuleId: string, chapterId: string, ownerId: string, dto: MoveChapterDto) {
     const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
-    await queryRunner.startTransaction();
     try {
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
       await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
 
       // El capítulo debe existir en el módulo origen indicado.
