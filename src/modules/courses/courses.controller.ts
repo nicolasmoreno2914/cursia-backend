@@ -13,6 +13,7 @@ import {
 } from '@nestjs/common';
 import { CoursesService } from './courses.service';
 import { CreateCourseDto } from './dto/create-course.dto';
+import { CreateDynamicCourseDto } from './dto/create-dynamic-course.dto';
 import { UpdateCourseDto } from './dto/update-course.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
@@ -22,6 +23,21 @@ import { AuthUser } from '../../auth/auth.types';
 @UseGuards(SupabaseJwtGuard)   // todos los endpoints requieren JWT
 export class CoursesController {
   constructor(private readonly coursesService: CoursesService) {}
+
+  // POST /api/v1/courses/dynamic
+  @Post('dynamic')
+  @HttpCode(HttpStatus.CREATED)
+  createOrGetDynamic(
+    @Body() dto: CreateDynamicCourseDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.coursesService.findOrCreateDynamic(
+      user.id,
+      user.email,
+      dto.frontendCourseId,
+      dto.title,
+    );
+  }
 
   // POST /api/v1/courses
   @Post()
