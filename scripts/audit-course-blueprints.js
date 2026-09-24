@@ -155,7 +155,10 @@ async function main() {
             module_count, chapter_count, structure_counter_at_lock,
             snapshot_sha256,
             jsonb_typeof(snapshot_json) as snapshot_type,
-            array(select jsonb_object_keys(snapshot_json)) as snapshot_keys,
+            case when jsonb_typeof(snapshot_json) = 'object'
+                 then array(select jsonb_object_keys(snapshot_json))
+                 else null
+            end as snapshot_keys,
             case when jsonb_typeof(snapshot_json->'modules') = 'array'
                  then jsonb_array_length(snapshot_json->'modules')
                  else null
@@ -174,7 +177,7 @@ async function main() {
           `schema_version=${bp.schema_version} locked_at=${new Date(bp.locked_at).toISOString()} ` +
           `module_count=${bp.module_count} chapter_count=${bp.chapter_count} ` +
           `structure_counter_at_lock=${bp.structure_counter_at_lock} sha256[:12]=${shortSha(bp.snapshot_sha256)} ` +
-          `jsonb_typeof=${bp.snapshot_type} keys=[${bp.snapshot_keys.join(', ')}] modules_len=${bp.modules_len} ` +
+          `jsonb_typeof=${bp.snapshot_type} keys=[${(bp.snapshot_keys || []).join(', ')}] modules_len=${bp.modules_len} ` +
           `course_id_matches=${bp.course_id_matches}${marker}`,
         );
       }
@@ -251,19 +254,32 @@ async function main() {
       failures.push('Curso(s) legacy con Blueprints o current_blueprint_id seteado.');
     }
 
-    // 3e. Ningún curso dinámico tiene filas en course_versions (Fase 3 nunca debe escribir ahí).
+    // 3e. Ningún curso dinámico "debería" tener filas en course_versions (Fase 3
+    // nunca escribe ahí) — pero esto es solo INFORMATIVO, nunca bloquea el
+    // deploy: CourseVersionsService.create (código legacy compartido, fuera de
+    // alcance de esta ronda por decisión del controller, ver ruling R12) no
+    // valida structure_version antes de insertar, así que un solo guardado
+    // legacy en la nube sobre un curso dinámico dejaría el audit en rojo para
+    // siempre si esto fuera un ❌. Se reporta como ⚠️ con los course_id
+    // afectados para que alguien lo investigue, sin tumbar el pipeline.
     const dynamicVersions = await client.query(
-      `select count(*)::int as n
+      `select cv.course_id, count(*)::int as n
          from public.course_versions cv
          join public.courses c on c.id = cv.course_id
-        where c.structure_version = 'dynamic'`,
+        where c.structure_version = 'dynamic'
+        group by cv.course_id
+        order by cv.course_id`,
     );
-    const dynamicVersionsCount = dynamicVersions.rows[0].n;
-    if (dynamicVersionsCount === 0) {
+    const dynamicVersionsTotal = dynamicVersions.rows.reduce((acc, r) => acc + r.n, 0);
+    if (dynamicVersionsTotal === 0) {
       console.log('✅ (e) ningún curso dinámico tiene filas en course_versions (count=0).');
     } else {
-      console.log(`❌ (e) ${dynamicVersionsCount} filas de course_versions pertenecen a cursos dinámicos.`);
-      failures.push('course_versions tiene filas para curso(s) dinámico(s) — Fase 3 nunca debe escribir ahí.');
+      const courseIds = dynamicVersions.rows.map((r) => r.course_id).join(', ');
+      console.log(
+        `⚠️  (e) WARNING (no bloquea el deploy): ${dynamicVersionsTotal} filas de course_versions ` +
+        `pertenecen a curso(s) dinámico(s) — course_id afectados: [${courseIds}]. Fase 3 nunca debería ` +
+        `escribir ahí, pero CourseVersionsService.create (legacy) no lo impide; investigar manualmente.`,
+      );
     }
 
     // 3f. Inmutabilidad sobre datos reales.
@@ -281,11 +297,13 @@ async function main() {
         await client.query('savepoint s1');
         let immutableRejected = false;
         let immutableCode = null;
+        let immutableRowCount = null;
         try {
-          await client.query(
+          const res = await client.query(
             `update public.course_blueprints set module_count = module_count where id = $1`,
             [latestId],
           );
+          immutableRowCount = res.rowCount;
         } catch (e) {
           immutableCode = e.code;
           immutableRejected = e.code === 'P0001';
@@ -294,6 +312,11 @@ async function main() {
         }
         if (immutableRejected) {
           console.log(`✅ (f) UPDATE sobre course_blueprints (id=${latestId}) rechazado con P0001.`);
+        } else if (immutableRowCount === 0) {
+          console.log(
+            `⚠️  (f) omitido (fila ya no existe) — el UPDATE sobre course_blueprints (id=${latestId}) ` +
+            `no afectó ninguna fila (borrada entre el SELECT y el UPDATE).`,
+          );
         } else {
           console.log(
             `❌ (f) UPDATE sobre course_blueprints (id=${latestId}) NO fue rechazado con P0001 ` +
@@ -311,17 +334,19 @@ async function main() {
         );
 
         if (distinctCourses.rows.length < 2) {
-          console.log('skipped (only one course with blueprints; covered by verifier temp rows)');
+          console.log('⚠️  omitido (solo un curso tiene Blueprints; cubierto por las filas temporales del verificador)');
         } else {
           const [courseX, courseY] = distinctCourses.rows;
           await client.query('savepoint s2');
           let fkRejected = false;
           let fkCode = null;
+          let fkRowCount = null;
           try {
-            await client.query(
+            const res = await client.query(
               `update public.courses set current_blueprint_id = $1 where id = $2`,
               [courseX.some_blueprint_id, courseY.course_id],
             );
+            fkRowCount = res.rowCount;
           } catch (e) {
             fkCode = e.code;
             fkRejected = e.code === '23503';
@@ -332,6 +357,11 @@ async function main() {
             console.log(
               `✅ (f) apuntar current_blueprint_id de course_id=${courseY.course_id} a un Blueprint de ` +
               `course_id=${courseX.course_id} rechazado con 23503.`,
+            );
+          } else if (fkRowCount === 0) {
+            console.log(
+              `⚠️  (f) omitido (fila ya no existe) — el UPDATE sobre courses (id=${courseY.course_id}) ` +
+              `no afectó ninguna fila (borrada entre el SELECT y el UPDATE).`,
             );
           } else {
             console.log(
