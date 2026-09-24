@@ -471,6 +471,73 @@ async function main() {
         if (!statusRejected) {
           failures.push(`Insertar item run con status='succeeded' (fuera del set válido) NO fue rechazado con 23514 (código real: ${statusCode || 'ninguno — se insertó'}).`);
         }
+
+        // 4i-bis (fix ronda 1, M7). Los 7 valores del set de status SÍ deben
+        // aceptarse — no alcanza con probar que uno inválido se rechaza; hay
+        // que probar que ninguno de los 7 válidos se rechaza por error (p.ej.
+        // un typo en el propio CHECK constraint que excluyera alguno).
+        const validStatuses = ['pending', 'running', 'retrying', 'completed', 'failed', 'blocked', 'cancelled'];
+        for (const validStatus of validStatuses) {
+          await client.query('savepoint sp_status_valid');
+          let accepted = false;
+          let code = null;
+          try {
+            await client.query(
+              `insert into public.generation_item_runs
+                 (job_id, course_id, blueprint_id, manifest_id, item_key, generation, type, module_id, chapter_id, depends_on, idempotency_key, status)
+               values ($1, $2, $3, $4, $5, 1, 'content', $6, $7, '{}', $8, $9)`,
+              [jobId, courseId, blueprintId, manifestId, `content-status-ok-${validStatus}`, moduleId, chapterId, idempotencyKey(manifestId, `content-status-ok-${validStatus}`, 1), validStatus],
+            );
+            accepted = true;
+          } catch (e) {
+            code = e.code;
+          } finally {
+            await client.query('rollback to savepoint sp_status_valid');
+          }
+          if (!accepted) {
+            failures.push(`Insertar item run con status='${validStatus}' (parte del set válido) fue rechazado inesperadamente (código: ${code || 'desconocido'}).`);
+          }
+        }
+
+        // 4i-ter (fix ronda 1, M7). type fuera del set permitido → 23514.
+        await client.query('savepoint sp_check_type');
+        let typeRejected = false, typeCode = null;
+        try {
+          await client.query(
+            `insert into public.generation_item_runs
+               (job_id, course_id, blueprint_id, manifest_id, item_key, generation, type, module_id, chapter_id, depends_on, idempotency_key)
+             values ($1, $2, $3, $4, $5, 1, 'bogus_type', $6, $7, '{}', $8)`,
+            [jobId, courseId, blueprintId, manifestId, 'content-type-bad', moduleId, chapterId, idempotencyKey(manifestId, 'content-type-bad', 1)],
+          );
+        } catch (e) {
+          typeCode = e.code;
+          typeRejected = e.code === '23514';
+        } finally {
+          await client.query('rollback to savepoint sp_check_type');
+        }
+        if (!typeRejected) {
+          failures.push(`Insertar item run con type='bogus_type' (fuera del set válido) NO fue rechazado con 23514 (código real: ${typeCode || 'ninguno — se insertó'}).`);
+        }
+
+        // 4i-quater (fix ronda 1, M7). generation = 0 → 23514 (CHECK generation >= 1).
+        await client.query('savepoint sp_check_generation_zero');
+        let generationRejected = false, generationCode = null;
+        try {
+          await client.query(
+            `insert into public.generation_item_runs
+               (job_id, course_id, blueprint_id, manifest_id, item_key, generation, type, module_id, chapter_id, depends_on, idempotency_key)
+             values ($1, $2, $3, $4, $5, 0, 'content', $6, $7, '{}', $8)`,
+            [jobId, courseId, blueprintId, manifestId, 'content-generation-zero', moduleId, chapterId, idempotencyKey(manifestId, 'content-generation-zero', 0)],
+          );
+        } catch (e) {
+          generationCode = e.code;
+          generationRejected = e.code === '23514';
+        } finally {
+          await client.query('rollback to savepoint sp_check_generation_zero');
+        }
+        if (!generationRejected) {
+          failures.push(`Insertar item run con generation=0 NO fue rechazado con 23514 (código real: ${generationCode || 'ninguno — se insertó'}).`);
+        }
       }
 
       // 4j. Índice parcial: dos runs activos del mismo Manifest → 23505.

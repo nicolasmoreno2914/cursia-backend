@@ -56,7 +56,14 @@ async function main() {
             'backend_package',
             'backend_package_base',
             'course_full_generation',
-            'backend_full_future'
+            'backend_full_future',
+            -- Fase 5A (ejecución dinámica real): el "run" de generación es un
+            -- production_job normal con este execution_mode (spec §3.2) —
+            -- sin esto, insertar la fila del run se rechaza con 23514 antes
+            -- de siquiera llegar al índice único parcial de Task 1
+            -- (uq_dynamic_generation_active_run en
+            -- supabase-migration-dynamic-generation.sql).
+            'dynamic_generation'
           )
         );
     `);

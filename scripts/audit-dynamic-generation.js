@@ -93,15 +93,34 @@ function shortSha(sha) {
 }
 
 // ── Forma canónica del contexto congelado (Task 2 DEBE usar exactamente esta
-// misma forma al escribir generation_run_contexts.context_hash) ──
+// misma forma al escribir generation_run_contexts.context_hash — fix ronda
+// 1, M5) ──
 //
-//   context_hash = sha256(JSON.stringify(sortKeysDeep(context))) en hex
+//   context_hash = sha256(JSON.stringify(sortKeysDeep(JSON.parse(JSON.stringify(context))))) en hex
 //
-// sortKeysDeep ordena las claves de cualquier objeto de forma recursiva
-// (alfabético, vía Object.keys(...).sort()) y preserva el orden de los
-// arrays tal cual vienen (el orden de un array es significativo — p.ej.
-// dependsOn — y no se reordena). Esto hace que el hash sea estable sin
-// importar en qué orden se construyó el objeto `context` en JS.
+// Paso 1 — `JSON.parse(JSON.stringify(context))`: `context` DEBE ser JSON
+// plano (nada de Date, Map, Set, undefined, funciones, símbolos, claves no
+// enumerables ni referencias circulares). Este roundtrip lo fuerza: cualquier
+// valor que no sobreviva un roundtrip JSON tal cual (p.ej. una Date se
+// convierte en string ISO, un `undefined` desaparece de un objeto o se
+// convierte en `null` dentro de un array) queda normalizado ANTES de
+// calcular el hash, así que el hash nunca depende de cómo Node serializa
+// tipos no-JSON — depende únicamente del JSON resultante. Task 2 debe hacer
+// este mismo roundtrip antes de hashear lo que va a `context`.
+//
+// Paso 2 — `sortKeysDeep`: ordena las claves de cualquier objeto plano de
+// forma recursiva llamando `Object.keys(value).sort()` — el `.sort()` es
+// obligatorio (nunca confiar en el orden de inserción/orden de motor de
+// Object.keys): el default de `.sort()` compara los elementos como strings
+// por unidad de código UTF-16, así que una clave como "10" queda ANTES que
+// "9" (orden lexicográfico, no numérico) — es la única fuente de orden que
+// importa acá. Los arrays preservan su propio orden tal cual vienen (el
+// orden de un array es significativo — p.ej. dependsOn — y nunca se
+// reordena).
+//
+// El resultado: el hash es estable sin importar en qué orden se construyó
+// el objeto `context` en JS, y sin importar qué tipos no-JSON pudieran
+// haberse colado antes del roundtrip.
 function sortKeysDeep(value) {
   if (Array.isArray(value)) return value.map(sortKeysDeep);
   if (value !== null && typeof value === 'object') {
@@ -115,7 +134,8 @@ function sortKeysDeep(value) {
 }
 
 function canonicalContextHash(context) {
-  return crypto.createHash('sha256').update(JSON.stringify(sortKeysDeep(context))).digest('hex');
+  const plainJson = JSON.parse(JSON.stringify(context));
+  return crypto.createHash('sha256').update(JSON.stringify(sortKeysDeep(plainJson))).digest('hex');
 }
 
 function idempotencyKey(manifestId, itemKey, generation) {
@@ -163,165 +183,205 @@ async function main() {
     );
     console.log(`artifacts con manifest_item_key: ${artifactCount.rows[0].n} filas totales.`);
 
-    if (totalRuns === 0) {
+    const hasRuns = totalRuns > 0;
+    if (!hasRuns) {
       console.log('');
-      console.log('(sin generation_item_runs todavía — nada más que auditar; se considera pasado)');
-      console.log('');
-      console.log('✅ Auditoría de dynamic-generation: todos los invariantes se cumplen (tabla vacía).');
-      return;
+      console.log('(sin generation_item_runs todavía — se saltan los checks 3a-3d; el check de artifacts (3e) y la sonda de inmutabilidad (3f) SÍ corren igual, más abajo — fix ronda 1)');
     }
-
-    console.log('');
-    console.log('=== 2. Item runs (hasta 10 más recientes, por created_at desc) ===');
-    const recent = await client.query(
-      `select id, job_id, manifest_id, item_key, generation, type, status
-         from public.generation_item_runs
-        order by created_at desc, id desc
-        limit 10`,
-    );
-    for (const row of recent.rows) {
-      console.log(
-        `id=${row.id} job_id=${row.job_id} manifest_id=${row.manifest_id} ` +
-        `item_key=${row.item_key} generation=${row.generation} type=${row.type} status=${row.status}`,
-      );
-    }
-
-    console.log('');
-    console.log('=== 3. Invariantes estructurales (sobre TODAS las filas, no solo las recientes) ===');
-
-    // 3a/3b/3c: cada item run contra su item de Manifest + idempotency_key.
-    const runsWithManifest = await client.query(
-      `select gir.id, gir.job_id, gir.manifest_id, gir.item_key, gir.generation, gir.type,
-              gir.module_id, gir.chapter_id, gir.depends_on, gir.idempotency_key,
-              cgm.manifest_json
-         from public.generation_item_runs gir
-         left join public.course_generation_manifests cgm on cgm.id = gir.manifest_id
-        order by gir.id`,
-    );
 
     let checkedItemMatch = 0;
     let checkedIdempotency = 0;
+    let checkedJobLink = 0;
 
-    for (const row of runsWithManifest.rows) {
-      const label = `Item run id=${row.id} (manifest_id=${row.manifest_id}, item_key=${row.item_key}, generation=${row.generation})`;
+    if (hasRuns) {
+      console.log('');
+      console.log('=== 2. Item runs (hasta 10 más recientes, por created_at desc) ===');
+      const recent = await client.query(
+        `select id, job_id, manifest_id, item_key, generation, type, status
+           from public.generation_item_runs
+          order by created_at desc, id desc
+          limit 10`,
+      );
+      for (const row of recent.rows) {
+        console.log(
+          `id=${row.id} job_id=${row.job_id} manifest_id=${row.manifest_id} ` +
+          `item_key=${row.item_key} generation=${row.generation} type=${row.type} status=${row.status}`,
+        );
+      }
+
+      console.log('');
+      console.log('=== 3. Invariantes estructurales (sobre TODAS las filas, no solo las recientes) ===');
+
+      // 3a/3c: cada item run contra su item de Manifest + idempotency_key.
+      const runsWithManifest = await client.query(
+        `select gir.id, gir.job_id, gir.manifest_id, gir.item_key, gir.generation, gir.type,
+                gir.module_id, gir.chapter_id, gir.depends_on, gir.idempotency_key,
+                cgm.manifest_json
+           from public.generation_item_runs gir
+           left join public.course_generation_manifests cgm on cgm.id = gir.manifest_id
+          order by gir.id`,
+      );
+
+      for (const row of runsWithManifest.rows) {
+        const label = `Item run id=${row.id} (manifest_id=${row.manifest_id}, item_key=${row.item_key}, generation=${row.generation})`;
+
+        if (row.manifest_json === null) {
+          failures.push(`${label}: no se encontró el Manifest referenciado (manifest_id=${row.manifest_id}) — la FK debería impedir esto.`);
+          continue;
+        }
+
+        const items = Array.isArray(row.manifest_json.items) ? row.manifest_json.items : [];
+        const item = items.find((it) => it && it.key === row.item_key);
+
+        checkedItemMatch += 1;
+        if (!item) {
+          failures.push(`${label}: no existe ningún item con key="${row.item_key}" en manifest_json.items del Manifest ${row.manifest_id}.`);
+        } else {
+          if (item.type !== row.type) {
+            failures.push(`${label}: type="${row.type}" no coincide con el type="${item.type}" del item del Manifest.`);
+          }
+          if (item.moduleId !== row.module_id) {
+            failures.push(`${label}: module_id="${row.module_id}" no coincide con moduleId="${item.moduleId}" del item del Manifest.`);
+          }
+          const itemChapterId = item.chapterId === undefined ? null : item.chapterId;
+          const rowChapterId = row.chapter_id === undefined ? null : row.chapter_id;
+          if (itemChapterId !== rowChapterId) {
+            failures.push(`${label}: chapter_id="${rowChapterId}" no coincide con chapterId="${itemChapterId}" del item del Manifest.`);
+          }
+          if (!arraysEqual(item.dependsOn, row.depends_on)) {
+            failures.push(`${label}: depends_on=${JSON.stringify(row.depends_on)} no coincide con dependsOn=${JSON.stringify(item.dependsOn)} del item del Manifest (el orden importa).`);
+          }
+        }
+
+        // 3c. idempotency_key = sha256(manifestId:itemKey:generation) — ver
+        // canonicalContextHash/idempotencyKey arriba para la forma exacta.
+        checkedIdempotency += 1;
+        const expectedIdemKey = idempotencyKey(row.manifest_id, row.item_key, row.generation);
+        if (row.idempotency_key !== expectedIdemKey) {
+          failures.push(`${label}: idempotency_key[:12]=${shortSha(row.idempotency_key)} no coincide con sha256(manifestId:itemKey:generation)[:12]=${shortSha(expectedIdemKey)}.`);
+        }
+      }
+
+      // 3b. Ningún item del Manifest duplicado por (manifest_id, item_key,
+      // generation) — sanity check de solo lectura (ya lo garantiza
+      // gir_item_generation_key, pero se re-verifica sin asumir el constraint).
+      const dupes = await client.query(
+        `select manifest_id, item_key, generation, count(*)::int as n
+           from public.generation_item_runs
+          group by manifest_id, item_key, generation
+         having count(*) > 1`,
+      );
+      for (const d of dupes.rows) {
+        failures.push(`Item duplicado: manifest_id=${d.manifest_id} item_key=${d.item_key} generation=${d.generation} aparece ${d.n} veces.`);
+      }
+
+      // 3d. Cada item run pertenece a un production_job dynamic_generation cuyo
+      // input_payload->>'manifestId' = su manifest_id, y ese job tiene una fila
+      // en generation_run_contexts con el mismo manifest_id y un context_hash
+      // igual al sha256 canónico del context guardado.
+      const runsWithJob = await client.query(
+        `select gir.id, gir.job_id, gir.manifest_id,
+                pj.execution_mode, pj.input_payload,
+                grc.manifest_id as ctx_manifest_id, grc.context, grc.context_hash
+           from public.generation_item_runs gir
+           left join public.production_jobs pj on pj.id = gir.job_id
+           left join public.generation_run_contexts grc on grc.job_id = gir.job_id
+          order by gir.id`,
+      );
+
+      for (const row of runsWithJob.rows) {
+        const label = `Item run id=${row.id} (job_id=${row.job_id})`;
+        checkedJobLink += 1;
+
+        if (row.execution_mode === null) {
+          failures.push(`${label}: no se encontró el production_job referenciado — la FK debería impedir esto.`);
+          continue;
+        }
+        if (row.execution_mode !== 'dynamic_generation') {
+          failures.push(`${label}: el job tiene execution_mode="${row.execution_mode}", esperado "dynamic_generation".`);
+        }
+        const jobManifestId = row.input_payload && row.input_payload.manifestId;
+        if (String(jobManifestId) !== String(row.manifest_id)) {
+          failures.push(`${label}: input_payload.manifestId="${jobManifestId}" no coincide con manifest_id="${row.manifest_id}" del item run.`);
+        }
+
+        if (row.context === null) {
+          failures.push(`${label}: no existe generation_run_contexts para job_id="${row.job_id}".`);
+          continue;
+        }
+        if (String(row.ctx_manifest_id) !== String(row.manifest_id)) {
+          failures.push(`${label}: generation_run_contexts.manifest_id="${row.ctx_manifest_id}" no coincide con manifest_id="${row.manifest_id}" del item run.`);
+        }
+        const expectedHash = canonicalContextHash(row.context);
+        if (row.context_hash !== expectedHash) {
+          failures.push(`${label}: generation_run_contexts.context_hash[:12]=${shortSha(row.context_hash)} no coincide con sha256(canónico(context))[:12]=${shortSha(expectedHash)}.`);
+        }
+      }
+    }
+
+    // 3e. Todo artifact con manifest_id no nulo: si tiene manifest_item_key,
+    // esa key debe existir entre los items del Manifest referenciado (contra
+    // manifest_json.items — NUNCA contra generation_item_runs: un artifact
+    // dynamic puede legítimamente no tener ningún item run vivo todavía, o
+    // el run pudo borrarse, y eso no lo invalida); si además tiene
+    // item_run_id, ese run debe pertenecer al MISMO manifest_id/item_key que
+    // el artifact (fix ronda 1, Important #3). Corre siempre, incluso con 0
+    // generation_item_runs. Un artifact con manifest_id NULL (p.ej. porque
+    // su Manifest se borró y el FK hizo ON DELETE SET NULL) queda
+    // deliberadamente FUERA de este check — dejó de ser "un artifact
+    // dynamic vinculado", así que no hay nada estructural que auditar sobre
+    // él.
+    const artifactsWithManifest = await client.query(
+      `select a.id, a.manifest_id, a.manifest_item_key, a.item_run_id,
+              cgm.manifest_json,
+              gir.manifest_id as run_manifest_id, gir.item_key as run_item_key
+         from public.artifacts a
+         left join public.course_generation_manifests cgm on cgm.id = a.manifest_id
+         left join public.generation_item_runs gir on gir.id = a.item_run_id
+        where a.manifest_id is not null`,
+    );
+    let checkedArtifacts = 0;
+    for (const row of artifactsWithManifest.rows) {
+      checkedArtifacts += 1;
+      const label = `Artifact id=${row.id} (manifest_id=${row.manifest_id}, manifest_item_key=${row.manifest_item_key === null ? '(null)' : row.manifest_item_key})`;
 
       if (row.manifest_json === null) {
         failures.push(`${label}: no se encontró el Manifest referenciado (manifest_id=${row.manifest_id}) — la FK debería impedir esto.`);
         continue;
       }
 
-      const items = Array.isArray(row.manifest_json.items) ? row.manifest_json.items : [];
-      const item = items.find((it) => it && it.key === row.item_key);
-
-      checkedItemMatch += 1;
-      if (!item) {
-        failures.push(`${label}: no existe ningún item con key="${row.item_key}" en manifest_json.items del Manifest ${row.manifest_id}.`);
-      } else {
-        if (item.type !== row.type) {
-          failures.push(`${label}: type="${row.type}" no coincide con el type="${item.type}" del item del Manifest.`);
-        }
-        if (item.moduleId !== row.module_id) {
-          failures.push(`${label}: module_id="${row.module_id}" no coincide con moduleId="${item.moduleId}" del item del Manifest.`);
-        }
-        const itemChapterId = item.chapterId === undefined ? null : item.chapterId;
-        const rowChapterId = row.chapter_id === undefined ? null : row.chapter_id;
-        if (itemChapterId !== rowChapterId) {
-          failures.push(`${label}: chapter_id="${rowChapterId}" no coincide con chapterId="${itemChapterId}" del item del Manifest.`);
-        }
-        if (!arraysEqual(item.dependsOn, row.depends_on)) {
-          failures.push(`${label}: depends_on=${JSON.stringify(row.depends_on)} no coincide con dependsOn=${JSON.stringify(item.dependsOn)} del item del Manifest (el orden importa).`);
+      if (row.manifest_item_key !== null) {
+        const items = Array.isArray(row.manifest_json.items) ? row.manifest_json.items : [];
+        const item = items.find((it) => it && it.key === row.manifest_item_key);
+        if (!item) {
+          failures.push(`${label}: manifest_item_key="${row.manifest_item_key}" no existe entre manifest_json.items del Manifest ${row.manifest_id}.`);
         }
       }
 
-      // 3c. idempotency_key = sha256(manifestId:itemKey:generation) — ver
-      // canonicalContextHash/idempotencyKey arriba para la forma exacta.
-      checkedIdempotency += 1;
-      const expectedIdemKey = idempotencyKey(row.manifest_id, row.item_key, row.generation);
-      if (row.idempotency_key !== expectedIdemKey) {
-        failures.push(`${label}: idempotency_key[:12]=${shortSha(row.idempotency_key)} no coincide con sha256(manifestId:itemKey:generation)[:12]=${shortSha(expectedIdemKey)}.`);
-      }
-    }
-
-    // 3b. Ningún item del Manifest duplicado por (manifest_id, item_key,
-    // generation) — sanity check de solo lectura (ya lo garantiza
-    // gir_item_generation_key, pero se re-verifica sin asumir el constraint).
-    const dupes = await client.query(
-      `select manifest_id, item_key, generation, count(*)::int as n
-         from public.generation_item_runs
-        group by manifest_id, item_key, generation
-       having count(*) > 1`,
-    );
-    for (const d of dupes.rows) {
-      failures.push(`Item duplicado: manifest_id=${d.manifest_id} item_key=${d.item_key} generation=${d.generation} aparece ${d.n} veces.`);
-    }
-
-    // 3d. Cada item run pertenece a un production_job dynamic_generation cuyo
-    // input_payload->>'manifestId' = su manifest_id, y ese job tiene una fila
-    // en generation_run_contexts con el mismo manifest_id y un context_hash
-    // igual al sha256 canónico del context guardado.
-    const runsWithJob = await client.query(
-      `select gir.id, gir.job_id, gir.manifest_id,
-              pj.execution_mode, pj.input_payload,
-              grc.manifest_id as ctx_manifest_id, grc.context, grc.context_hash
-         from public.generation_item_runs gir
-         left join public.production_jobs pj on pj.id = gir.job_id
-         left join public.generation_run_contexts grc on grc.job_id = gir.job_id
-        order by gir.id`,
-    );
-
-    let checkedJobLink = 0;
-    for (const row of runsWithJob.rows) {
-      const label = `Item run id=${row.id} (job_id=${row.job_id})`;
-      checkedJobLink += 1;
-
-      if (row.execution_mode === null) {
-        failures.push(`${label}: no se encontró el production_job referenciado — la FK debería impedir esto.`);
-        continue;
-      }
-      if (row.execution_mode !== 'dynamic_generation') {
-        failures.push(`${label}: el job tiene execution_mode="${row.execution_mode}", esperado "dynamic_generation".`);
-      }
-      const jobManifestId = row.input_payload && row.input_payload.manifestId;
-      if (String(jobManifestId) !== String(row.manifest_id)) {
-        failures.push(`${label}: input_payload.manifestId="${jobManifestId}" no coincide con manifest_id="${row.manifest_id}" del item run.`);
-      }
-
-      if (row.context === null) {
-        failures.push(`${label}: no existe generation_run_contexts para job_id="${row.job_id}".`);
-        continue;
-      }
-      if (String(row.ctx_manifest_id) !== String(row.manifest_id)) {
-        failures.push(`${label}: generation_run_contexts.manifest_id="${row.ctx_manifest_id}" no coincide con manifest_id="${row.manifest_id}" del item run.`);
-      }
-      const expectedHash = canonicalContextHash(row.context);
-      if (row.context_hash !== expectedHash) {
-        failures.push(`${label}: generation_run_contexts.context_hash[:12]=${shortSha(row.context_hash)} no coincide con sha256(canónico(context))[:12]=${shortSha(expectedHash)}.`);
-      }
-    }
-
-    // 3e. Todo artifact con manifest_item_key referencia un item run real con
-    // el mismo manifest_id/item_key.
-    const artifactsWithKey = await client.query(
-      `select a.id, a.manifest_id, a.manifest_item_key, gir.id as item_run_id
-         from public.artifacts a
-         left join public.generation_item_runs gir
-           on gir.manifest_id = a.manifest_id and gir.item_key = a.manifest_item_key
-        where a.manifest_item_key is not null`,
-    );
-    let checkedArtifacts = 0;
-    for (const row of artifactsWithKey.rows) {
-      checkedArtifacts += 1;
-      if (row.item_run_id === null) {
-        failures.push(`Artifact id=${row.id}: manifest_item_key="${row.manifest_item_key}" (manifest_id=${row.manifest_id}) no referencia ningún generation_item_runs existente.`);
+      if (row.item_run_id !== null) {
+        if (row.run_manifest_id === null) {
+          failures.push(`${label}: item_run_id="${row.item_run_id}" no referencia ningún generation_item_runs existente — la FK debería impedir esto.`);
+        } else {
+          if (String(row.run_manifest_id) !== String(row.manifest_id)) {
+            failures.push(`${label}: item_run_id="${row.item_run_id}" pertenece a manifest_id=${row.run_manifest_id}, distinto del manifest_id=${row.manifest_id} del artifact.`);
+          }
+          if (row.run_item_key !== row.manifest_item_key) {
+            failures.push(`${label}: item_run_id="${row.item_run_id}" tiene item_key="${row.run_item_key}", distinto del manifest_item_key="${row.manifest_item_key}" del artifact.`);
+          }
+        }
       }
     }
 
     if (failures.length === 0) {
-      console.log(`✅ (a) cada item run matchea type/module_id/chapter_id/depends_on de su item en el Manifest (${checkedItemMatch} item runs revisados).`);
-      console.log(`✅ (b) ningún item del Manifest aparece duplicado por (manifest_id, item_key, generation).`);
-      console.log(`✅ (c) idempotency_key = sha256(manifestId:itemKey:generation) (${checkedIdempotency} item runs revisados).`);
-      console.log(`✅ (d) cada item run tiene un job dynamic_generation con manifestId consistente y un context_hash canónico correcto (${checkedJobLink} item runs revisados).`);
-      console.log(`✅ (e) todo artifact con manifest_item_key referencia un item run existente (${checkedArtifacts} artifacts revisados).`);
+      if (hasRuns) {
+        console.log(`✅ (a) cada item run matchea type/module_id/chapter_id/depends_on de su item en el Manifest (${checkedItemMatch} item runs revisados).`);
+        console.log(`✅ (b) ningún item del Manifest aparece duplicado por (manifest_id, item_key, generation).`);
+        console.log(`✅ (c) idempotency_key = sha256(manifestId:itemKey:generation) (${checkedIdempotency} item runs revisados).`);
+        console.log(`✅ (d) cada item run tiene un job dynamic_generation con manifestId consistente y un context_hash canónico correcto (${checkedJobLink} item runs revisados).`);
+      } else {
+        console.log('⚠️  (a)-(d) omitido — 0 generation_item_runs.');
+      }
+      console.log(`✅ (e) todo artifact con manifest_id no nulo tiene manifest_item_key/item_run_id consistentes con su Manifest (${checkedArtifacts} artifacts revisados).`);
     } else {
       console.log(`❌ ${failures.length} violaciones de invariantes encontradas (detalle abajo).`);
     }

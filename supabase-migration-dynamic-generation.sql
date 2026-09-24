@@ -51,8 +51,38 @@ create table if not exists public.generation_item_runs (
   -- es de alcance capítulo (chapter_id obligatorio).
   constraint gir_chapter_scope check ((type = 'exam') = (chapter_id is null))
 );
-create index if not exists idx_gir_claim on public.generation_item_runs (job_id, status, type);
-create index if not exists idx_gir_manifest on public.generation_item_runs (manifest_id);
+-- Índices de generation_item_runs — envueltos en DO blocks que chequean
+-- pg_indexes primero (fix ronda 1, R7): igual que `create unique index if
+-- not exists` más abajo, un `create index if not exists` sobre una tabla que
+-- ya tiene filas reales todavía necesita abrir la relación y evaluar el
+-- "if not exists" antes de decidir no hacer nada; el chequeo de catálogo
+-- previo evita que un re-run del deploy tome ningún lock de escritura sobre
+-- generation_item_runs cuando el índice ya está.
+do $$
+declare
+  idx_exists boolean;
+begin
+  select exists (
+    select 1 from pg_indexes
+     where schemaname = 'public' and tablename = 'generation_item_runs' and indexname = 'idx_gir_claim'
+  ) into idx_exists;
+  if not idx_exists then
+    create index idx_gir_claim on public.generation_item_runs (job_id, status, type);
+  end if;
+end $$;
+
+do $$
+declare
+  idx_exists boolean;
+begin
+  select exists (
+    select 1 from pg_indexes
+     where schemaname = 'public' and tablename = 'generation_item_runs' and indexname = 'idx_gir_manifest'
+  ) into idx_exists;
+  if not idx_exists then
+    create index idx_gir_manifest on public.generation_item_runs (manifest_id);
+  end if;
+end $$;
 
 -- Contexto congelado del run: 1:1 con el production_job, inmutable (spec
 -- §3.5 y condición vinculante §7 — el ejecutor nunca lee `D`, siempre lee
@@ -66,22 +96,69 @@ create table if not exists public.generation_run_contexts (
   context_hash  char(64) not null,
   created_at    timestamptz not null default now()
 );
-create index if not exists idx_grc_manifest on public.generation_run_contexts (manifest_id);
+do $$
+declare
+  idx_exists boolean;
+begin
+  select exists (
+    select 1 from pg_indexes
+     where schemaname = 'public' and tablename = 'generation_run_contexts' and indexname = 'idx_grc_manifest'
+  ) into idx_exists;
+  if not idx_exists then
+    create index idx_grc_manifest on public.generation_run_contexts (manifest_id);
+  end if;
+end $$;
 
+-- `create or replace function` no toma lock sobre generation_run_contexts
+-- (solo reemplaza la definición de la función en pg_proc), así que puede
+-- correr en cada deploy sin condición.
 create or replace function public.generation_run_contexts_forbid_update() returns trigger
 language plpgsql as $$
 begin
   raise exception 'generation_run_contexts es inmutable (job_id=%)', old.job_id using errcode = 'P0001';
 end $$;
 
-drop trigger if exists generation_run_contexts_immutable on public.generation_run_contexts;
-create trigger generation_run_contexts_immutable before update on public.generation_run_contexts
-  for each row execute function public.generation_run_contexts_forbid_update();
+-- El trigger sí se crea solo si falta (fix ronda 1, R7): un `drop trigger if
+-- exists` + `create trigger` incondicional en cada re-deploy tomaría un lock
+-- de escritura sobre generation_run_contexts aunque el trigger ya esté
+-- idéntico. El chequeo de pg_trigger evita tocar la tabla en el caso común.
+do $$
+declare
+  trg_exists boolean;
+begin
+  select exists (
+    select 1 from pg_trigger t
+      join pg_class c on c.oid = t.tgrelid
+      join pg_namespace ns on ns.oid = c.relnamespace and ns.nspname = 'public'
+     where c.relname = 'generation_run_contexts'
+       and t.tgname = 'generation_run_contexts_immutable'
+       and not t.tgisinternal
+  ) into trg_exists;
+  if not trg_exists then
+    create trigger generation_run_contexts_immutable before update on public.generation_run_contexts
+      for each row execute function public.generation_run_contexts_forbid_update();
+  end if;
+end $$;
 
 -- A lo sumo un run activo por Manifest (spec §3.3). Envuelto en un DO block
 -- que chequea pg_indexes primero — lección de Fase 3: un re-run del deploy
 -- no debe tomar ningún lock fuerte sobre production_jobs (tabla caliente)
 -- cuando el índice ya existe.
+--
+-- worker_status en ('queued','running','retrying') (fix ronda 1, R6):
+-- 'waiting_child' se sacó del predicado — ningún código de Fase 5A escribe
+-- ese valor todavía (queda reservado para cuando el run dynamic_generation
+-- tenga sub-jobs propios, fuera de alcance acá) y dejarlo adentro solo
+-- agrandaba la superficie sin necesidad real.
+--
+-- IMPORTANTE: esta es una unique index sobre una expresión
+-- (input_payload->>'manifestId'), así que Postgres solo la evalúa — y por lo
+-- tanto solo bloquea un segundo run activo — para las filas donde esa
+-- expresión da un valor no nulo. Todo run dynamic_generation real DEBE
+-- setear input_payload.manifestId al crearse (Task 2): una fila
+-- dynamic_generation con manifestId ausente/null en input_payload NO está
+-- protegida por este índice (Postgres nunca compara NULLs como iguales) y
+-- podría coexistir con otro run "activo" duplicado sin violar nada acá.
 do $$
 declare
   idx_exists boolean;
@@ -97,7 +174,7 @@ begin
     create unique index uq_dynamic_generation_active_run
       on public.production_jobs ((input_payload->>'manifestId'))
       where execution_mode = 'dynamic_generation'
-        and worker_status in ('queued','running','retrying','waiting_child');
+        and worker_status in ('queued','running','retrying');
   end if;
 end $$;
 
