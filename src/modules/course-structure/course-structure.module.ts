@@ -6,12 +6,14 @@ import { CourseStructureController } from './course-structure.controller';
 import { CourseStructureService } from './course-structure.service';
 import { CoursesModule } from '../courses/courses.module';
 import { AuthModule } from '../../auth/auth.module';
+import { CourseBlueprintsModule } from '../course-blueprints/course-blueprints.module';
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([CourseModuleEntity, CourseChapter]),
-    CoursesModule,   // expone CoursesService para ownership checks
-    AuthModule,      // expone SupabaseJwtGuard para el controlador
+    CoursesModule,           // expone CoursesService para ownership checks
+    AuthModule,              // expone SupabaseJwtGuard para el controlador
+    CourseBlueprintsModule,  // expone CourseBlueprintsService.currentInfo() para getStructure
   ],
   controllers: [CourseStructureController],
   providers: [CourseStructureService],

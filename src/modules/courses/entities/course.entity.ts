@@ -57,6 +57,21 @@ export class Course {
   @Column({ name: 'structure_version_counter', default: 0 })
   structureVersionCounter: number; // optimistic concurrency para ediciones de estructura
 
+  /**
+   * Blueprint congelado vigente (Fase 3). Columna plana: la FK compuesta
+   * (current_blueprint_id, id) → course_blueprints(id, course_id) la crea
+   * supabase-migration-course-blueprints.sql; solo la escribe
+   * CourseBlueprintsService.lock().
+   *
+   * Solo lectura para el ORM (insert/update: false): CoursesService.update
+   * hace findOne → Object.assign → save(); con la columna escribible, una
+   * entidad cargada antes de un lock() concurrente reescribía el puntero
+   * viejo (o NULL) y revertía el Blueprint vigente en silencio — la FK
+   * compuesta no lo ataja porque el viejo es un Blueprint válido del curso.
+   */
+  @Column({ name: 'current_blueprint_id', type: 'int', nullable: true, insert: false, update: false })
+  currentBlueprintId: number | null;
+
   @Column({ type: 'jsonb', nullable: true })
   metadata: Record<string, any>;
 

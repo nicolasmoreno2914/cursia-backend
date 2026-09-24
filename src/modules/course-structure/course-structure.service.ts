@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException, NotFoundException, ConflictException } from '@nestjs/common';
+import { Injectable, BadRequestException, NotFoundException, ConflictException, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
 import { CourseModule as CourseModuleEntity } from './entities/course-module.entity';
@@ -11,28 +11,19 @@ import { UpdateChapterDto } from './dto/update-chapter.dto';
 import { ReorderDto } from './dto/reorder.dto';
 import { MoveChapterDto } from './dto/move-chapter.dto';
 import type { QueryRunner } from 'typeorm';
-
-/**
- * Filas devueltas por un `UPDATE ... RETURNING` / `DELETE ... RETURNING`
- * ejecutado con `queryRunner.query()`.
- *
- * Con el driver de Postgres de TypeORM (0.3.x), `query()` NO devuelve las
- * filas para UPDATE/DELETE: devuelve `[rows, rowCount]`
- * (PostgresQueryRunner.query → `result.raw = [raw.rows, raw.rowCount]`).
- * Para SELECT/INSERT sí devuelve `rows` directo. Leer `result[0].col` en un
- * UPDATE daba `undefined` (el counter nunca llegaba al cliente) y
- * `result.length === 0` en un DELETE nunca era cierto (siempre largo 2).
- * Acepta ambas formas por si una versión futura del driver cambia.
- */
-function returningRows(result: any): any[] {
-  if (Array.isArray(result) && result.length === 2 && Array.isArray(result[0]) && typeof result[1] === 'number') {
-    return result[0];
-  }
-  return result;
-}
+import { returningRows } from '../../common/db/returning-rows';
+import { CourseBlueprintsService } from '../course-blueprints/course-blueprints.service';
+import {
+  RawChapterRow,
+  RawModuleRow,
+  buildBlueprintSnapshot,
+  snapshotSha256,
+} from '../course-blueprints/blueprint-snapshot';
 
 @Injectable()
 export class CourseStructureService {
+  private readonly logger = new Logger(CourseStructureService.name);
+
   constructor(
     @InjectRepository(CourseModuleEntity)
     private readonly moduleRepo: Repository<CourseModuleEntity>,
@@ -40,6 +31,7 @@ export class CourseStructureService {
     private readonly chapterRepo: Repository<CourseChapter>,
     private readonly coursesService: CoursesService,
     private readonly dataSource: DataSource,
+    private readonly blueprintsService: CourseBlueprintsService,
   ) {}
 
   /**
@@ -118,6 +110,16 @@ export class CourseStructureService {
       order: { position: 'ASC' },
     });
     modules.forEach((m) => m.chapters.sort((a, b) => a.position - b.position));
+
+    // Task 4 / Ruling R1: currentInfo no verifica ownership ni "dynamic" —
+    // ya lo hizo coursesService.findOne arriba, así que se llama después.
+    const currentBlueprint = await this.blueprintsService.currentInfo(courseId);
+    const liveMatchesCurrentBlueprint = this.computeLiveMatchesCurrentBlueprint(
+      course,
+      modules,
+      currentBlueprint,
+    );
+
     return {
       structureVersion: course.structureVersion,
       structureVersionCounter: course.structureVersionCounter,
@@ -135,7 +137,60 @@ export class CourseStructureService {
           videoEnabled: c.videoEnabled,
         })),
       })),
+      currentBlueprint,
+      liveMatchesCurrentBlueprint,
     };
+  }
+
+  /**
+   * Ruling R1: reusa el MISMO snapshot builder que el lock (Task 3) — mapea
+   * las entidades de TypeORM a RawModuleRow/RawChapterRow (snake_case) y
+   * llama a buildBlueprintSnapshot/snapshotSha256, nunca una segunda
+   * canonicalización. El título del curso en el snapshot es `course.title`,
+   * igual que usa el lock. Si no hay Blueprint vigente, o si construir el
+   * snapshot tirara (no debería pasar con datos de getStructure, pero se
+   * cubre por las dudas), el resultado es `false` en vez de propagar el
+   * error — este campo es informativo, no debe romper la lectura de la
+   * estructura.
+   */
+  private computeLiveMatchesCurrentBlueprint(
+    course: { id: number; title: string },
+    modules: CourseModuleEntity[],
+    currentBlueprint: { sha256: string } | null,
+  ): boolean {
+    if (!currentBlueprint) return false;
+    try {
+      const rawModules: RawModuleRow[] = modules.map((m) => ({
+        id: m.id,
+        position: m.position,
+        title: m.title,
+        objective: m.objective,
+        exam_enabled: m.examEnabled,
+      }));
+      const rawChapters: RawChapterRow[] = modules.flatMap((m) =>
+        m.chapters.map((c) => ({
+          id: c.id,
+          module_id: m.id,
+          position: c.position,
+          title: c.title,
+          objective: c.objective,
+          video_enabled: c.videoEnabled,
+        })),
+      );
+      const snapshot = buildBlueprintSnapshot(
+        { id: course.id, title: course.title },
+        rawModules,
+        rawChapters,
+      );
+      return snapshotSha256(snapshot) === currentBlueprint.sha256;
+    } catch (err) {
+      this.logger.warn(
+        `computeLiveMatchesCurrentBlueprint: fallo al comparar el hash del curso #${course.id} — ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return false;
+    }
   }
 
   async createModule(courseId: number, ownerId: string, dto: CreateModuleDto) {

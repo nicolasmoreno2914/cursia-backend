@@ -19,6 +19,7 @@ import { InstitutionsModule } from './modules/institutions/institutions.module';
 import { BrandProfilesModule } from './modules/brand-profiles/brand-profiles.module';
 import { CourseSetupModule } from './modules/course-setup/course-setup.module';
 import { CourseStructureModule } from './modules/course-structure/course-structure.module';
+import { CourseBlueprintsModule } from './modules/course-blueprints/course-blueprints.module';
 
 @Module({
   imports: [
@@ -43,6 +44,7 @@ import { CourseStructureModule } from './modules/course-structure/course-structu
     BrandProfilesModule,
     CourseSetupModule,
     CourseStructureModule,
+    CourseBlueprintsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
