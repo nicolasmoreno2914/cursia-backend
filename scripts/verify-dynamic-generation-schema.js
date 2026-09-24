@@ -209,6 +209,16 @@ async function main() {
       failures.push(`Índice "uq_dynamic_generation_active_run" no es UNIQUE (indexdef: ${idx.rows[0].indexdef}).`);
     }
 
+    // 3c. Un artifact por item y rol (R16): índice único parcial (item_run_id, type).
+    const artIdx = await client.query(
+      `select indexdef from pg_indexes where schemaname = 'public' and tablename = 'artifacts' and indexname = 'uq_artifacts_item_run_type'`,
+    );
+    if (artIdx.rows.length === 0) {
+      failures.push('Falta el índice "uq_artifacts_item_run_type" en artifacts.');
+    } else if (!/unique/i.test(artIdx.rows[0].indexdef) || !/item_run_id IS NOT NULL/i.test(artIdx.rows[0].indexdef)) {
+      failures.push(`Índice "uq_artifacts_item_run_type" no es UNIQUE parcial sobre item_run_id IS NOT NULL (indexdef: ${artIdx.rows[0].indexdef}).`);
+    }
+
     if (failures.length > 0) {
       console.error('❌ Verificación de esquema FALLÓ:');
       failures.forEach((f) => console.error('  - ' + f));
@@ -370,6 +380,37 @@ async function main() {
         }
         if (!fkBpRejected) {
           failures.push(`Insertar generation_item_runs con blueprint de OTRO curso NO fue rechazado con 23503 (código real: ${fkBpCode || 'ninguno — se insertó'}).`);
+        }
+
+        // 4d-bis. Un artifact por item y rol (R16): segundo artifact del MISMO
+        // type vinculado al mismo item run → 23505; otro type → permitido.
+        await client.query('savepoint sp_artifact_role');
+        let dupRoleRejected = false, dupRoleCode = null, otherRoleOk = false;
+        try {
+          const insArt = (type) => client.query(
+            `insert into public.artifacts (owner_id, course_id, type, storage_path, manifest_id, manifest_item_key, item_run_id)
+             values ($1, $2, $3, $4, $5, $6, $7) returning id`,
+            [ownerId, String(courseId), type, `verify/${type}/${crypto.randomUUID()}`, manifestId, itemKey, itemRunId],
+          );
+          await insArt('dynamic_content_md');
+          await insArt('dynamic_other_role');
+          otherRoleOk = true;
+          await client.query('savepoint sp_artifact_role_dup');
+          try {
+            await insArt('dynamic_content_md');
+          } catch (e) {
+            dupRoleCode = e.code;
+            dupRoleRejected = e.code === '23505';
+          } finally {
+            await client.query('rollback to savepoint sp_artifact_role_dup');
+          }
+        } catch (e) {
+          failures.push(`Insert válido de artifacts vinculados a un item run falló inesperadamente: ${e.message} (código: ${e.code || 'ninguno'}).`);
+        } finally {
+          await client.query('rollback to savepoint sp_artifact_role');
+        }
+        if (otherRoleOk && !dupRoleRejected) {
+          failures.push(`Vincular un segundo artifact del mismo type al mismo item run NO fue rechazado con 23505 (código real: ${dupRoleCode || 'ninguno — se insertó'}).`);
         }
 
         // 4e. UNIQUE(manifest_id, item_key, generation) → 23505.

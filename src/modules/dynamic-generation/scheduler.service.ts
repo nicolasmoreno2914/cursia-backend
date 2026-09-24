@@ -36,8 +36,41 @@ export const MAX_LEASE_SECONDS = 3600;
 export const DEFAULT_LEASE_SECONDS = 120;
 const MAX_ERROR_LENGTH = 4000;
 const MAX_EXECUTOR_ID_LENGTH = 200;
-/** Runs candidatos que prueba un claim global (sin runId) antes de rendirse. */
-const GLOBAL_CLAIM_MAX_RUNS = 25;
+/**
+ * Reintentos del claim global SOLO por carreras (candidato elegido sin lock
+ * que otro tomó antes de bloquear su run). No limita cuántos runs se miran:
+ * el candidato se elige entre TODOS los runs elegibles en una sola consulta.
+ */
+const GLOBAL_CLAIM_RACE_RETRIES = 50;
+/** Tipos que puede reclamar el camino navegador (ownerId); video solo el worker. */
+export const BROWSER_CLAIMABLE_TYPES: ItemType[] = ['content', 'scorm', 'exam'];
+
+/**
+ * Predicado de "item reclamable" (spec §3.4, condición 6, R16), compartido
+ * por el claim por run y el global. `typesParam` = placeholder del array de
+ * tipos. Dependencias literales del Manifest (mismo manifest_id+generation):
+ * - ninguna dependencia existente en estado distinto de `completed`
+ *   (NOT EXISTS literal por clave);
+ * - y TODAS las claves de depends_on existen como fila: una dependencia
+ *   ausente nunca vuelve reclamable al dependiente (se reporta con
+ *   logger.error vía reportMissingDependencies).
+ */
+function claimablePredicate(g: string, typesParam: string): string {
+  return `${g}.status in ('pending', 'retrying')
+            and (${g}.next_retry_at is null or ${g}.next_retry_at <= now())
+            and (${g}.lease_until is null or ${g}.lease_until < now())
+            and ${g}.type = any(${typesParam}::text[])
+            and not exists (
+              select 1 from public.generation_item_runs d
+               where d.manifest_id = ${g}.manifest_id and d.generation = ${g}.generation
+                 and d.item_key = any(${g}.depends_on) and d.status <> 'completed')
+            and not exists (
+              select 1 from unnest(${g}.depends_on) as dk(key)
+               where not exists (
+                 select 1 from public.generation_item_runs d2
+                  where d2.manifest_id = ${g}.manifest_id and d2.generation = ${g}.generation
+                    and d2.item_key = dk.key))`;
+}
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface ClaimedItem {
@@ -153,7 +186,8 @@ export function mergeOutputSummary(
  *   una sola sentencia, así que created_at empata dentro de un run), luego id.
  *   Los claims concurrentes sobre el mismo run se serializan en el lock del
  *   run (cada uno toma un item distinto); el claim global (worker, sin runId)
- *   prueba los runs candidatos de a uno, una transacción por run.
+ *   elige el item candidato entre TODOS los runs elegibles sin tomar locks y
+ *   luego lo re-selecciona bajo el lock de su run (siempre run → item, R16).
  * - El payload (ClaimedItem) se arma DENTRO de la transacción del claim desde
  *   el backend: contexto congelado (generation_run_contexts, hash
  *   verificado), porción del snapshot del Blueprint leída por
@@ -183,48 +217,82 @@ export class SchedulerService {
     const executorId = this.checkExecutorId(opts.executorId);
     const types = this.checkTypes(opts.types);
     const leaseSeconds = this.clampLease(opts.leaseSeconds);
+    if (opts.ownerId !== undefined && opts.ownerId !== null) {
+      // Defensa en profundidad (R16): el camino navegador (ownerId) nunca
+      // reclama tipos fuera de content/scorm/exam, aunque el DTO lo deje pasar.
+      const bad = types.filter((t) => !BROWSER_CLAIMABLE_TYPES.includes(t));
+      if (bad.length > 0) {
+        throw new BadRequestException(`browser_type_not_allowed: el navegador no puede reclamar items ${bad.join(', ')}`);
+      }
+    }
 
     if (opts.runId) {
       if (!UUID_RE.test(opts.runId)) throw new BadRequestException('runId inválido');
-      return this.claimInRun(opts.runId, executorId, types, leaseSeconds, opts.ownerId);
+      const item = await this.claimInRun(opts.runId, executorId, types, leaseSeconds, opts.ownerId);
+      if (!item) await this.reportMissingDependencies(opts.runId, opts.ownerId);
+      return item;
     }
 
-    // Global (worker): runs candidatos = activos con algún item de un tipo
-    // pedido en pending/retrying, o con un lease vencido que barrer.
+    // Global (worker, R16). Orden de locks: el candidato se ELIGE sin tomar
+    // ningún lock (lectura simple sobre TODOS los runs elegibles, mismo
+    // predicado que el claim por run, sin tope de runs); después
+    // claimInRun bloquea la fila del run (FOR UPDATE) y re-selecciona ESE item
+    // con el predicado completo FOR UPDATE SKIP LOCKED — siempre run → item,
+    // igual que cancel/retry/reopen. Si el item se esfumó (lo tomó otro, se
+    // canceló el run…) se prueba el siguiente candidato. Los reintentos solo
+    // se consumen en carreras; al agotarlos se registra un warn (nunca un
+    // null silencioso por "demasiados runs").
+    await this.sweepExpiredLeases();
     const tried: string[] = [];
-    for (let i = 0; i < GLOBAL_CLAIM_MAX_RUNS; i++) {
+    for (let attempt = 0; attempt < GLOBAL_CLAIM_RACE_RETRIES; attempt++) {
       const [cand] = await this.dataSource.query(
-        `select pj.id
-           from public.production_jobs pj
+        `select g.id, g.job_id
+           from public.generation_item_runs g
+           join public.production_jobs pj on pj.id = g.job_id
+           join public.course_generation_manifests m on m.id = g.manifest_id
+           left join lateral (
+             select e.ord
+               from jsonb_array_elements(m.manifest_json->'items') with ordinality as e(it, ord)
+              where e.it->>'key' = g.item_key
+              limit 1
+           ) mo on true
           where pj.execution_mode = 'dynamic_generation'
             and pj.worker_status = any($1::text[])
             and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
             and ($2::text is null or pj.owner_id = $2)
-            and not (pj.id = any($3::uuid[]))
-            and exists (
-              select 1 from public.generation_item_runs g
-               where g.job_id = pj.id
-                 and ((g.status in ('pending', 'retrying') and g.type = any($4::text[])
-                       and (g.next_retry_at is null or g.next_retry_at <= now()))
-                      or (g.status = 'running' and g.lease_until < now())))
-          order by pj.created_at, pj.id
+            and not (g.id = any($3::uuid[]))
+            and ${claimablePredicate('g', '$4')}
+          order by g.created_at, mo.ord nulls last, g.id
           limit 1`,
         [ACTIVE_RUN_WORKER_STATUSES, opts.ownerId ?? null, tried, types],
       );
-      if (!cand) return null;
+      if (!cand) {
+        await this.reportMissingDependencies(null, opts.ownerId);
+        return null;
+      }
       tried.push(cand.id);
-      const item = await this.claimInRun(cand.id, executorId, types, leaseSeconds, opts.ownerId);
+      const item = await this.claimInRun(cand.job_id, executorId, types, leaseSeconds, opts.ownerId, cand.id);
       if (item) return item;
     }
+    this.logger.warn(
+      `claim global: ${GLOBAL_CLAIM_RACE_RETRIES} candidatos seguidos se esfumaron por carreras ` +
+        `(executor ${executorId}, tipos ${types.join(',')}); se devuelve null y el próximo poll reintenta`,
+    );
     return null;
   }
 
+  /**
+   * Claim dentro de UN run, en una transacción: fila del run FOR UPDATE →
+   * barrido de leases del run → item FOR UPDATE SKIP LOCKED con el predicado
+   * completo (si `itemId` viene del claim global, solo ese item).
+   */
   private async claimInRun(
     runId: string,
     executorId: string,
     types: ItemType[],
     leaseSeconds: number,
     ownerId?: string,
+    itemId?: string,
   ): Promise<ClaimedItem | null> {
     let cancelledJob: any = null;
     const claimed = await this.runs.tx(async (qr) => {
@@ -251,17 +319,12 @@ export class SchedulerService {
               limit 1
            ) mo on true
           where g.job_id = $1
-            and g.status in ('pending', 'retrying')
-            and (g.next_retry_at is null or g.next_retry_at <= now())
-            and (g.lease_until is null or g.lease_until < now())
-            and g.type = any($2::text[])
-            and (select count(*) from public.generation_item_runs d
-                  where d.manifest_id = g.manifest_id and d.generation = g.generation
-                    and d.item_key = any(g.depends_on) and d.status = 'completed') = cardinality(g.depends_on)
+            and ($3::uuid is null or g.id = $3)
+            and ${claimablePredicate('g', '$2')}
           order by g.created_at, mo.ord nulls last, g.id
           limit 1
           for update of g skip locked`,
-        [job.id, types],
+        [job.id, types, itemId ?? null],
       );
       if (!cand) return null;
 
@@ -350,17 +413,33 @@ export class SchedulerService {
       const merged = mergeOutputSummary(item.output_summary ?? {}, { ...summary, artifactIds: ids });
       if (merged.ok === false) throw new GuardRejection(merged.reason);
 
-      const linked = returningRows(
-        await qr.query(
-          `update public.artifacts
-              set manifest_id = $2, manifest_item_key = $3, item_run_id = $4, module_id = $5, chapter_id = $6,
-                  status = 'ready', generated_with_version_id = $7, updated_at = now()
-            where id = any($1::uuid[]) and owner_id = $8 and course_id = $9 and item_run_id is null
-            returning id`,
-          [ids, item.manifest_id, item.item_key, item.id, item.module_id, item.chapter_id, item.blueprint_id,
-            job.owner_id, this.artifactCourseId(job)],
-        ),
+      // Spec §3.3 / R16: un artifact por item y rol (type). Se rechaza antes
+      // del UPDATE; el índice único parcial uq_artifacts_item_run_type es la
+      // red de seguridad (23505 → mismo rechazo, rollback de todo).
+      const dupTypes = await qr.query(
+        `select type from public.artifacts where id = any($1::uuid[]) group by type having count(*) > 1`,
+        [ids],
       );
+      if (dupTypes.length > 0) throw new GuardRejection('duplicate_artifact_type');
+
+      let linked: any[];
+      try {
+        linked = returningRows(
+          await qr.query(
+            `update public.artifacts
+                set manifest_id = $2, manifest_item_key = $3, item_run_id = $4, module_id = $5, chapter_id = $6,
+                    status = 'ready', generated_with_version_id = $7, updated_at = now()
+              where id = any($1::uuid[]) and owner_id = $8 and course_id = $9 and item_run_id is null
+              returning id`,
+            [ids, item.manifest_id, item.item_key, item.id, item.module_id, item.chapter_id, item.blueprint_id,
+              job.owner_id, this.artifactCourseId(job)],
+          ),
+        );
+      } catch (err) {
+        const code = (err as any)?.code ?? (err as any)?.driverError?.code;
+        if (code === '23505') throw new GuardRejection('duplicate_artifact_type');
+        throw err;
+      }
       if (linked.length !== ids.length) throw new GuardRejection('artifacts_not_linkable');
 
       const done = returningRows(
@@ -533,6 +612,42 @@ export class SchedulerService {
     return result;
   }
 
+  /**
+   * R16: un item pending/retrying con una clave de depends_on sin fila
+   * (integridad rota: la siembra copia el Manifest completo) nunca es
+   * reclamable; se registra con logger.error en cada claim vacío para que no
+   * quede atascado en silencio. Solo lectura, sin locks.
+   */
+  private async reportMissingDependencies(runId: string | null, ownerId?: string): Promise<void> {
+    const rows = await this.dataSource.query(
+      `select g.job_id, g.item_key,
+              array(select dk.key from unnest(g.depends_on) as dk(key)
+                     where not exists (select 1 from public.generation_item_runs d2
+                                        where d2.manifest_id = g.manifest_id and d2.generation = g.generation
+                                          and d2.item_key = dk.key)) as missing
+         from public.generation_item_runs g
+         join public.production_jobs pj on pj.id = g.job_id
+        where g.status in ('pending', 'retrying')
+          and pj.execution_mode = 'dynamic_generation'
+          and pj.worker_status = any($1::text[])
+          and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+          and ($2::uuid is null or g.job_id = $2)
+          and ($3::text is null or pj.owner_id = $3)
+          and exists (select 1 from unnest(g.depends_on) as dk(key)
+                       where not exists (select 1 from public.generation_item_runs d2
+                                          where d2.manifest_id = g.manifest_id and d2.generation = g.generation
+                                            and d2.item_key = dk.key))
+        limit 50`,
+      [ACTIVE_RUN_WORKER_STATUSES, runId, ownerId ?? null],
+    );
+    for (const r of rows) {
+      this.logger.error(
+        `Item ${r.item_key} (run ${r.job_id}) NO reclamable: dependencia(s) sin fila en generation_item_runs ` +
+          `(${(r.missing ?? []).join(', ')}) — integridad rota, requiere intervención`,
+      );
+    }
+  }
+
   private async lockRun(
     qr: QueryRunner,
     runId: string,
@@ -674,6 +789,7 @@ export class SchedulerService {
                from public.generation_item_runs d
                join public.artifacts a on a.item_run_id = d.id
               where d.manifest_id = $1 and d.generation = $2 and d.item_key = any($3::text[])
+                and d.status = 'completed'
               order by array_position($3::text[], d.item_key), a.created_at, a.id`,
             [row.manifest_id, row.generation, deps],
           );

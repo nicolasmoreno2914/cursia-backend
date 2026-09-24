@@ -243,3 +243,26 @@ do $$ begin
       foreign key (item_run_id) references public.generation_item_runs(id) on delete set null;
   end if;
 end $$;
+
+-- Un artifact por item y rol (spec §3.3; Fase 5A Task 3 fix ronda 1, R16):
+-- a lo sumo un artifact de cada `type` vinculado al mismo item run. Índice
+-- único PARCIAL (solo filas vinculadas: los artifacts legacy y los huérfanos
+-- sin item_run_id quedan fuera). Envuelto en un DO block que chequea
+-- pg_indexes primero — artifacts es tabla caliente: un re-run del deploy no
+-- debe pedir ningún lock sobre ella cuando el índice ya existe. La primera
+-- creación sí toma SHARE sobre artifacts (bloquea escrituras mientras se
+-- construye; lock_timeout=5s de arriba acota la espera por el lock).
+do $$
+declare
+  idx_exists boolean;
+begin
+  select exists (
+    select 1 from pg_indexes
+     where schemaname = 'public' and tablename = 'artifacts' and indexname = 'uq_artifacts_item_run_type'
+  ) into idx_exists;
+  if not idx_exists then
+    create unique index uq_artifacts_item_run_type
+      on public.artifacts (item_run_id, type)
+      where item_run_id is not null;
+  end if;
+end $$;
