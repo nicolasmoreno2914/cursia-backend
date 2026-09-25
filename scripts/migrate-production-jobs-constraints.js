@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { Client } = require('pg');
+const { APPLY_STATEMENTS } = require('./lib/production-jobs-constraints');
 
 function loadEnvFile(envPath) {
   if (!fs.existsSync(envPath)) return;
@@ -38,56 +39,18 @@ async function main() {
   await client.connect();
   try {
     await client.query('begin');
-    await client.query(`
-      alter table if exists public.production_jobs
-        drop constraint if exists production_jobs_execution_mode_check;
-    `);
-    await client.query(`
-      alter table if exists public.production_jobs
-        add constraint production_jobs_execution_mode_check
-        check (
-          execution_mode in (
-            'frontend',
-            'backend_content',
-            'backend_audio',
-            'backend_videos',
-            'backend_h5p',
-            'backend_gamma',
-            'backend_package',
-            'backend_package_base',
-            'course_full_generation',
-            'backend_full_future'
-          )
-        );
-    `);
-
-    await client.query(`
-      alter table if exists public.production_jobs
-        drop constraint if exists production_jobs_worker_status_check;
-    `);
-    await client.query(`
-      alter table if exists public.production_jobs
-        add constraint production_jobs_worker_status_check
-        check (
-          worker_status is null
-          or worker_status in (
-            'queued',
-            'running',
-            'waiting_external',
-            'retrying',
-            'paused',
-            'pausing',
-            'cancelling',
-            'completed',
-            'failed',
-            'failed_recoverable',
-            'failed_retryable',
-            'needs_reconnect',
-            'blocked_quota',
-            'cancelled'
-          )
-        );
-    `);
+    // Release review Minor 5: sin esto, el ADD CONSTRAINT (ACCESS EXCLUSIVE +
+    // full scan) podía quedar encolado sin límite detrás del tráfico de los
+    // workers, bloqueando a todos los writers de production_jobs. Con
+    // lock_timeout falla rápido (55P03, rollback, deploy.yml aborta en [2/4]
+    // antes de pm2 reload) y basta re-correr el deploy. Solo SET LOCAL: el SQL
+    // de las constraints no cambia (probado contra main en
+    // scripts/prod/test/run-local-pg-tests.js).
+    await client.query("set local lock_timeout = '5s'");
+    await client.query("set local statement_timeout = '300s'");
+    // Listas y SQL: scripts/lib/production-jobs-constraints.js (fuente única,
+    // compartida con el paso 0 de scripts/prod/migrate-v2-production.js).
+    for (const stmt of APPLY_STATEMENTS) await client.query(stmt);
     await client.query('commit');
     console.log('production_jobs constraints migrated');
   } catch (err) {
