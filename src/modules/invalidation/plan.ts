@@ -25,7 +25,8 @@ import {
  *    módulo, `own` de un content) o si un content del módulo genera salida
  *    nueva; si no REUSE. Reordenar no cambia el conjunto ⇒ REUSE.
  *  - module_intro / course_plan / course_intro: REGENERATE si cambió su
- *    huella; si no REUSE. `course_plan` NO encadena a los content.
+ *    huella; si no REUSE. Las huellas no dependen del orden: reordenar
+ *    nunca las regenera. `course_plan` NO encadena a los content.
  *  - item nuevo en el destino ⇒ GENERATE, salvo que exista un artifact
  *    `disabled` de esa misma key cuya huella coincida ⇒ REUSE (toggle ON).
  *  - item del origen ausente del destino ⇒ SOFT_DISABLE.
@@ -35,7 +36,8 @@ import {
  */
 
 export const INVALIDATION_PLAN_VERSION = 1;
-export const REUSABLE_ITEM_STATUSES: readonly string[] = ['completed', 'completed_local'];
+/** Solo un item run `completed` es reutilizable (estados: pending|running|completed|retrying|failed|blocked|cancelled). */
+export const REUSABLE_ITEM_STATUSES: readonly string[] = ['completed'];
 
 export type InvalidationActionType =
   | 'REUSE'

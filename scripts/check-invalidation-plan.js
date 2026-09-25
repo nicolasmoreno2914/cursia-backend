@@ -467,6 +467,60 @@ check('reordenar módulos: content de los módulos movidos REVIEW, nada se regen
   });
 });
 
+check('v2 reordenar dentro del módulo: course_plan/course_intro/module_intro REUSE, solo REVIEW de los afectados', () => {
+  const to = baseSpec();
+  const [a, b] = to[0].chapters;
+  to[0].chapters[0] = b;
+  to[0].chapters[1] = a;
+  const r = plan(baseSpec(), to, { v2From: true, v2To: true });
+  expectActions(r, { [`content:${C1}`]: 'REVIEW', [`content:${C2}`]: 'REVIEW' });
+  assert(r.p.totals.REGENERATE === 0 && r.p.totals.GENERATE === 0, 'sin regeneración');
+});
+
+check('v2 reordenar módulos: course_plan/course_intro REUSE, content de los módulos movidos REVIEW', () => {
+  const to = baseSpec();
+  [to[0], to[1]] = [to[1], to[0]];
+  const r = plan(baseSpec(), to, { v2From: true, v2To: true });
+  expectActions(r, {
+    [`content:${C1}`]: 'REVIEW',
+    [`content:${C2}`]: 'REVIEW',
+    [`content:${C3}`]: 'REVIEW',
+    [`content:${C4}`]: 'REVIEW',
+    [`content:${C5}`]: 'REVIEW',
+  });
+});
+
+check('huella del outline (course_plan/course_intro): independiente del orden, sensible a membresía/título/objetivo/altas/bajas', () => {
+  const fp = (spec) => computeFingerprints(buildBp(spec)).courseOutline;
+  const base = fp(baseSpec());
+  const r1 = baseSpec();
+  r1[0].chapters.reverse();
+  const r2 = baseSpec();
+  r2.reverse();
+  assert(fp(r1) === base && fp(r2) === base, 'reorden no cambia la huella');
+  const moved = baseSpec();
+  moved[1].chapters.push(moved[0].chapters.pop());
+  const titled = baseSpec();
+  titled[2].chapters[0].title = 'Otro';
+  const obj = baseSpec();
+  obj[1].objective = 'Otro objetivo';
+  const added = baseSpec();
+  added[2].chapters.push({ id: C7, title: 'Siete', objective: 'x' });
+  const removed = baseSpec();
+  removed[0].chapters.pop();
+  for (const [n, s] of Object.entries({ moved, titled, obj, added, removed })) assert(fp(s) !== base, `${n} debe cambiar la huella`);
+});
+
+check('solo item runs "completed" son reutilizables (completed_local y otros estados ⇒ GENERATE)', () => {
+  for (const status of ['completed_local', 'pending', 'running', 'retrying', 'failed', 'blocked', 'cancelled']) {
+    const r = plan(baseSpec(), baseSpec(), {
+      mutateItems: (items) => items.map((it) => (it.itemKey === `scorm:${C2}` ? { ...it, status } : it)),
+    });
+    expectActions(r, { [`scorm:${C2}`]: 'GENERATE' });
+    assertDeepEqual(act(r, `scorm:${C2}`).reasons, ['content_reused', 'previous_output_missing'], `motivo (${status})`);
+  }
+});
+
 check('salida previa faltante / artifact stale: GENERATE o STALE_NO_AUTO, nunca REUSE a ciegas', () => {
   const r = plan(baseSpec(), baseSpec(), {
     mutateItems: (items) =>

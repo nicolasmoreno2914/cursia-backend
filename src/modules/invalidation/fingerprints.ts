@@ -17,7 +17,9 @@ import { Outline, buildOutline } from '../coherence/coherence-types';
  *   ORDENADO de chapterIds, `own` de esos content). Incluye título/objetivo
  *   del módulo porque la tabla pide REGENERATE del examen al editarlos.
  * - `module_intro:<m>`: sha(module.id, title, objective, conjunto ordenado de chapterIds).
- * - `course_plan` / `course_intro`: sha(outline completo, en orden de curso).
+ * - `course_plan` / `course_intro`: sha(outline como CONJUNTO: módulos y capítulos
+ *   ordenados por UUID con título, objetivo y membresía). Un reorder puro no
+ *   la cambia (Ruling A de la fix wave: reordenar nunca regenera).
  */
 
 export const INVALIDATION_FINGERPRINT_VERSION = 1;
@@ -79,17 +81,25 @@ export function computeFingerprints(
     );
   }
 
+  // Independiente del orden (Ruling A, fix wave): conjunto de módulos
+  // ordenado por UUID, cada uno con su conjunto de capítulos ordenado por
+  // UUID. Un reorder puro no cambia la huella; membresía, títulos,
+  // objetivos, altas y bajas sí.
   const courseOutline = sha256Canonical({
     v,
     kind: 'outline',
     courseTitle: bp.course?.title ?? null,
     courseContextSha256: ctx,
-    modules: outline.modules.map((m) => ({
-      id: m.id,
-      title: m.title,
-      objective: m.objective,
-      chapters: m.chapters.map((c) => ({ id: c.id, title: c.title, objective: c.objective })),
-    })),
+    modules: [...outline.modules]
+      .sort((a, b) => cmpStr(a.id, b.id))
+      .map((m) => ({
+        id: m.id,
+        title: m.title,
+        objective: m.objective,
+        chapters: [...m.chapters]
+          .sort((a, b) => cmpStr(a.id, b.id))
+          .map((c) => ({ id: c.id, title: c.title, objective: c.objective })),
+      })),
   });
 
   return { outline, content, exam, moduleIntro, courseOutline };
