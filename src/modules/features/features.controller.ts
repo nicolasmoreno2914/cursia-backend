@@ -7,9 +7,9 @@ import { DynamicFeatures, resolveDynamicFeatures, toHttpConfigError } from './dy
 @Controller('features')
 @UseGuards(SupabaseJwtGuard)
 export class FeaturesController {
-  // GET /api/v1/features → { dynamicCourseStructure, realVideo } para el
-  // usuario autenticado. Nunca gateado por el flag (con el flag OFF responde
-  // false/false). Lista de owners inválida con el flag ON → 500 ruidoso.
+  // GET /api/v1/features → { dynamicCourseStructure, realVideo, coherenceLlm }
+  // para el usuario autenticado. Nunca gateado por el flag (con el flag OFF
+  // responde todo false). Lista de owners inválida con el flag ON → 500 ruidoso.
   @Get()
   get(@CurrentUser() user: AuthUser): DynamicFeatures {
     try {

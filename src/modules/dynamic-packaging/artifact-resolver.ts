@@ -18,6 +18,7 @@
  */
 
 import type { ManifestItemType, GenerationManifestV1 } from '../generation-manifests/generation-manifest-builder';
+import { effectiveOutputRowsSql } from '../dynamic-generation/item-generations';
 import type { ResolvedArtifact } from './packaging-types';
 import { PackagingNotReadyError } from './packaging-types';
 import type { ArtifactsService } from '../artifacts/artifacts.service';
@@ -120,9 +121,12 @@ export async function resolveRunArtifacts(
     );
   }
 
-  // 2) Todos los item runs de generation=1 de este run, con su(s)
-  // artifact(s) enlazado(s) por item_run_id (LEFT JOIN: un item sin
-  // artifact todavía aparece, para poder reportarlo como faltante).
+  // 2) Una fila por item_key del run — F78-BE2: la generación COMPLETED más
+  // alta (una regeneración explícita reemplaza a la anterior al completarse;
+  // si ninguna completó, la más alta, para reportarla con su estado real) —
+  // con su(s) artifact(s) enlazado(s) por item_run_id (LEFT JOIN: un item
+  // sin artifact todavía aparece, para poder reportarlo como faltante). Sin
+  // regeneraciones es exactamente generation = 1.
   const rows: ItemRunRow[] = await q.query(
     `select gir.item_key       as item_key,
             gir.id              as item_run_id,
@@ -134,11 +138,11 @@ export async function resolveRunArtifacts(
             a.storage_path      as storage_path,
             a.mime_type         as mime_type,
             a.status            as artifact_status
-       from public.generation_item_runs gir
+       from ${effectiveOutputRowsSql('$1')} gir
        -- Fase 8: un artifact 'disabled' (SOFT_DISABLE) nunca se empaqueta; su
        -- ausencia cuenta como faltante. 'stale' sí (STALE_NO_AUTO, con aviso).
        left join public.artifacts a on a.item_run_id = gir.id and a.status is distinct from 'disabled'
-      where gir.job_id = $1 and gir.generation = 1`,
+      where gir.job_id = $1`,
     [runId],
   );
 

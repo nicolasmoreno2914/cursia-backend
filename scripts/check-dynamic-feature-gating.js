@@ -17,7 +17,9 @@
 //  I1  DYNAMIC_REAL_VIDEO_OWNERS (fail closed): sin lista → nadie inicia un
 //      run con videoMode 'real' (403); 'mock' siempre permitido; un run 'real'
 //      ya existente (activo) se sigue devolviendo.
-//      GET /api/v1/features → { dynamicCourseStructure, realVideo } por usuario.
+//      GET /api/v1/features → { dynamicCourseStructure, realVideo, coherenceLlm } por usuario.
+//  F78-BE2 DYNAMIC_COHERENCE_LLM (solo 'true' exacto; fail closed): coherenceLlm
+//      solo para owners que ya tienen V2; regenerateItem hereda G3 + video real.
 //  G4  dynamic-item-worker / dynamic-package-worker con el flag OFF: log claro,
 //      quedan inactivos sin abrir ninguna conexión a la DB (sin reclamar) y
 //      terminan limpio con SIGTERM; con el flag ON intentan conectar como hoy.
@@ -171,6 +173,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const FLAG = 'DYNAMIC_COURSE_STRUCTURE';
 const ALLOW = 'DYNAMIC_V2_ALLOWED_OWNERS';
 const REAL = 'DYNAMIC_REAL_VIDEO_OWNERS';
+const COH_LLM = 'DYNAMIC_COHERENCE_LLM';
 const OWNER_A = 'aa2fa9a1-afb1-4b01-8646-94a0cb272b57';
 const OWNER_B = '11111111-2222-4333-8444-555555555555';
 const OWNER_C = '99999999-8888-4777-8666-555555555555';
@@ -192,7 +195,7 @@ async function withEnv(vars, fn) {
     }
   }
 }
-const ENV_CLEAN = { [FLAG]: undefined, [ALLOW]: undefined, [REAL]: undefined };
+const ENV_CLEAN = { [FLAG]: undefined, [ALLOW]: undefined, [REAL]: undefined, [COH_LLM]: undefined };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // App Nest HTTP real con servicios falsos
@@ -414,7 +417,19 @@ async function runWorkerProcess(script, env, { waitMs }) {
     try { features.resolveDynamicFeatures(OWNER_A, { [FLAG]: 'true', [REAL]: 'xyz' }); } catch (e) { err = e; }
     assert(err instanceof features.DynamicFeatureConfigError && /DYNAMIC_REAL_VIDEO_OWNERS/.test(err.message), `real inválida: ${err}`);
     // Flag OFF: la lista ni se parsea (legacy/boot nunca se ven afectados).
-    eq(features.resolveDynamicFeatures(OWNER_A, { [ALLOW]: 'basura' }), { dynamicCourseStructure: false, realVideo: false }, 'off ignora lista inválida');
+    eq(features.resolveDynamicFeatures(OWNER_A, { [ALLOW]: 'basura' }), { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false }, 'off ignora lista inválida');
+  });
+
+  await check('F78-BE2 matriz coherenceLlm (fail closed): solo "true" exacto y solo con V2 permitida', () => {
+    const r = features.resolveDynamicFeatures;
+    eq(r(OWNER_A, { [FLAG]: 'true' }).coherenceLlm, false, 'env ausente');
+    eq(r(OWNER_A, { [FLAG]: 'true', [COH_LLM]: '' }).coherenceLlm, false, 'env vacío');
+    eq(r(OWNER_A, { [FLAG]: 'true', [COH_LLM]: 'true' }).coherenceLlm, true, 'true + V2 sin lista');
+    for (const v of ['TRUE', 'True', '1', 'yes', 'on', ' true']) eq(r(OWNER_A, { [FLAG]: 'true', [COH_LLM]: v }).coherenceLlm, false, `valor "${v}" no activa`);
+    eq(r(OWNER_A, { [COH_LLM]: 'true' }).coherenceLlm, false, 'flag V2 OFF');
+    eq(r(OWNER_C, { [FLAG]: 'true', [ALLOW]: OWNER_A, [COH_LLM]: 'true' }).coherenceLlm, false, 'owner fuera de la allow-list V2');
+    eq(r(OWNER_A, { [FLAG]: 'true', [ALLOW]: OWNER_A, [COH_LLM]: 'true' }).coherenceLlm, true, 'owner en la allow-list V2');
+    eq(r(OWNER_A, { [FLAG]: 'true', [COH_LLM]: 'true' }).realVideo, false, 'coherenceLlm no habilita video real');
   });
 
   await check('G1 set de rutas: los 8 controllers dynamic (incl. Coherence/Invalidation, Fase 7/8) + solo POST /courses/dynamic de CoursesController', () => {
@@ -540,12 +555,13 @@ async function runWorkerProcess(script, env, { waitMs }) {
 
     // ── /features ────────────────────────────────────────────────────────────
     const featureMatrix = [
-      { label: 'flag OFF', env: {}, user: OWNER_A, want: { dynamicCourseStructure: false, realVideo: false } },
-      { label: 'flag OFF aunque esté en ambas listas', env: { [ALLOW]: OWNER_A, [REAL]: OWNER_A }, user: OWNER_A, want: { dynamicCourseStructure: false, realVideo: false } },
-      { label: 'ON + lista vacía', env: { [FLAG]: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false } },
-      { label: 'ON + listado + real', env: { [FLAG]: 'true', [ALLOW]: `${OWNER_B},${OWNER_A}`, [REAL]: OWNER_A }, user: OWNER_A, want: { dynamicCourseStructure: true, realVideo: true } },
-      { label: 'ON + listado sin real', env: { [FLAG]: 'true', [ALLOW]: `${OWNER_B},${OWNER_A}`, [REAL]: OWNER_A }, user: OWNER_B, want: { dynamicCourseStructure: true, realVideo: false } },
-      { label: 'ON + no listado', env: { [FLAG]: 'true', [ALLOW]: OWNER_A, [REAL]: OWNER_C }, user: OWNER_C, want: { dynamicCourseStructure: false, realVideo: false } },
+      { label: 'flag OFF', env: {}, user: OWNER_A, want: { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false } },
+      { label: 'flag OFF aunque esté en ambas listas', env: { [ALLOW]: OWNER_A, [REAL]: OWNER_A, [COH_LLM]: 'true' }, user: OWNER_A, want: { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false } },
+      { label: 'ON + lista vacía', env: { [FLAG]: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false } },
+      { label: 'ON + lista vacía + coherencia IA', env: { [FLAG]: 'true', [COH_LLM]: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: true } },
+      { label: 'ON + listado + real', env: { [FLAG]: 'true', [ALLOW]: `${OWNER_B},${OWNER_A}`, [REAL]: OWNER_A }, user: OWNER_A, want: { dynamicCourseStructure: true, realVideo: true, coherenceLlm: false } },
+      { label: 'ON + listado sin real', env: { [FLAG]: 'true', [ALLOW]: `${OWNER_B},${OWNER_A}`, [REAL]: OWNER_A }, user: OWNER_B, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false } },
+      { label: 'ON + no listado', env: { [FLAG]: 'true', [ALLOW]: OWNER_A, [REAL]: OWNER_C, [COH_LLM]: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false } },
     ];
     for (const m of featureMatrix) {
       await check(`GET /api/v1/features — ${m.label}`, () =>
@@ -623,6 +639,52 @@ async function runWorkerProcess(script, env, { waitMs }) {
         else {
           await rejects(p, ForbiddenException, /no está habilitad/, 'debería ser 403');
           assert(!manifestsCalled && !dbCalled, 'consultó la DB/el manifest antes del 403');
+        }
+      }));
+  }
+
+  for (const m of allowMatrix) {
+    await check(`G3 RunsService.regenerateItem (F78-BE2) — ${m.label} → ${m.allowed ? 'permitido' : '403'}`, () =>
+      withEnv({ ...ENV_CLEAN, ...m.env }, async () => {
+        let touched = false;
+        const svc = new RunsService({ query: async () => { touched = true; throw new Error(SENTINEL); } }, { async get() { touched = true; throw new Error(SENTINEL); }, async getById() { touched = true; throw new Error(SENTINEL); }, async assertBlueprintAccessible() { touched = true; throw new Error(SENTINEL); } }, {});
+        const p = svc.regenerateItem(1, m.owner, 1, PARAM_VALUES.runId, 'video:x', true);
+        if (m.allowed) await rejects(p, null, new RegExp(SENTINEL), 'debería llegar a la DB/manifest');
+        else {
+          await rejects(p, ForbiddenException, /no está habilitad/, 'debería ser 403');
+          assert(!touched, 'tocó la DB/el manifest antes del 403');
+        }
+      }));
+  }
+  const cohLlmMatrix = [
+    { label: 'V2 permitida sin DYNAMIC_COHERENCE_LLM → 403', env: { [FLAG]: 'true' }, owner: OWNER_A, allowed: false },
+    { label: 'DYNAMIC_COHERENCE_LLM=TRUE (no exacto) → 403', env: { [FLAG]: 'true', [COH_LLM]: 'TRUE' }, owner: OWNER_A, allowed: false },
+    { label: 'owner fuera de la allow-list V2 → 403', env: { [FLAG]: 'true', [ALLOW]: OWNER_B, [COH_LLM]: 'true' }, owner: OWNER_A, allowed: false },
+    { label: 'V2 + DYNAMIC_COHERENCE_LLM=true → permitido', env: { [FLAG]: 'true', [COH_LLM]: 'true' }, owner: OWNER_A, allowed: true },
+  ];
+  for (const m of cohLlmMatrix) {
+    await check(`F78-BE2 CoherenceService.mergeLlm (llm-findings) — ${m.label}`, () =>
+      withEnv({ ...ENV_CLEAN, ...m.env }, async () => {
+        let touched = false;
+        const boom = async () => { touched = true; throw new Error(SENTINEL); };
+        const svc = new CoherenceService({ query: boom }, { getByNumber: boom }, { getById: boom, assertBlueprintAccessible: boom }, {});
+        const p = svc.mergeLlm(1, m.owner, 1, PARAM_VALUES.runId, { model: 'm', promptSha256: 'a'.repeat(64), findings: [] });
+        if (m.allowed) await rejects(p, null, new RegExp(SENTINEL), 'debería llegar a la DB');
+        else {
+          await rejects(p, ForbiddenException, /no está habilitad/, 'debería ser 403');
+          assert(!touched, 'tocó la DB antes del 403');
+        }
+      }));
+    await check(`F78-BE2 CoherenceService.llmInput — ${m.label}`, () =>
+      withEnv({ ...ENV_CLEAN, ...m.env }, async () => {
+        let touched = false;
+        const boom = async () => { touched = true; throw new Error(SENTINEL); };
+        const svc = new CoherenceService({ query: boom }, { getByNumber: boom }, { getById: boom, assertBlueprintAccessible: boom }, {});
+        const p = svc.llmInput(1, m.owner, 1, PARAM_VALUES.runId);
+        if (m.allowed) await rejects(p, null, new RegExp(SENTINEL), 'debería llegar a la DB');
+        else {
+          await rejects(p, ForbiddenException, /no está habilitad/, 'debería ser 403');
+          assert(!touched, 'tocó la DB antes del 403');
         }
       }));
   }

@@ -55,6 +55,19 @@ export class CoherenceController {
     return this.coherence.latest(courseId, user.id, number, runId);
   }
 
+  // GET /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/coherence/llm-input
+  // F78-BE2: entrada compacta (acotada) para la revisión con IA del navegador.
+  // Gate extra: DYNAMIC_COHERENCE_LLM (403 fail closed). Solo lectura.
+  @Get('blueprints/:number/manifest/runs/:runId/coherence/llm-input')
+  llmInput(
+    @Param('courseId', ParseIntPipe) courseId: number,
+    @Param('number', ParseIntPipe) number: number,
+    @Param('runId', ParseUUIDPipe) runId: string,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.coherence.llmInput(courseId, user.id, number, runId);
+  }
+
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/coherence/llm-findings
   @Post('blueprints/:number/manifest/runs/:runId/coherence/llm-findings')
   async llm(
