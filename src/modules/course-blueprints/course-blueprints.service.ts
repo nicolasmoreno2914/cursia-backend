@@ -2,6 +2,7 @@ import { Injectable, BadRequestException, NotFoundException, ConflictException }
 import { DataSource } from 'typeorm';
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
+import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import {
   BlueprintSnapshotV1,
   RawChapterRow,
@@ -85,6 +86,7 @@ export class CourseBlueprintsService {
     ownerId: string,
     expectedCounter: number,
   ): Promise<{ created: boolean; blueprint: BlueprintDto }> {
+    assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     const qr: QueryRunner = this.dataSource.createQueryRunner();
     try {
       await qr.connect();

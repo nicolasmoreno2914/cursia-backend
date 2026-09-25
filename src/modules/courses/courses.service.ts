@@ -5,7 +5,7 @@ import { Course } from './entities/course.entity';
 import { CreateCourseDto } from './dto/create-course.dto';
 import { UpdateCourseDto } from './dto/update-course.dto';
 import { AdminDashboardService } from '../../admin/services/admin-dashboard.service';
-import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
+import { assertDynamicCreationAllowed, assertDynamicOwnerAllowed } from '../features/dynamic-features';
 
 @Injectable()
 export class CoursesService {
@@ -30,6 +30,9 @@ export class CoursesService {
     ownerId: string,
     ownerEmail: string,
   ): Promise<Course> {
+    // Release-fix I4 (defensa en profundidad; el controller ya lo chequea con el
+    // mensaje 404 exacto de la ruta): un curso dynamic exige flag + allow-list.
+    if (dto?.structureVersion === 'dynamic') assertDynamicCreationAllowed(ownerId);
     const course = this.courseRepo.create({
       ...dto,
       ownerId,

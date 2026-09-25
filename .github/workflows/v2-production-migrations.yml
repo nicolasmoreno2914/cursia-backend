@@ -22,7 +22,10 @@
 #            db.<ref>.supabase.co puede resolver solo a IPv6)
 #     Sin ese environment configurado con reviewers, este workflow NO debe usarse.
 #   - Default: mode=dry-run → solo el job `plan` (sin secretos, sin red a la DB).
-#   - Precondiciones (backup/PITR, deploy.yml ya corrido): docs/v2-production-migrations.md.
+#   - Precondiciones (backup/PITR, DN-6): docs/v2-production-migrations.md.
+#   - Schema-first (release-fix C1): el apply INICIAL se hace ANTES del merge,
+#     desde un checkout del commit de release (este workflow solo corre desde
+#     main); acá sirve para re-verificar/re-aplicar (idempotente) después.
 #
 # Este archivo no modifica deploy.yml ni deploy-staging.yml y no los dispara.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -50,7 +53,7 @@ on:
         default: 'no'
         options: ['no', 'yes']
       skip_unresolved_placeholders:
-        description: 'apply: omitir pasos placeholder sin resolver (p. ej. Fase 8 aún no integrada)'
+        description: 'apply: omitir pasos placeholder sin resolver (hoy no hay ninguno: Fase 8 ya está integrada)'
         type: boolean
         required: false
         default: false

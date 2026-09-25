@@ -4,15 +4,32 @@
 -- docs/SCHEMA_SUPABASE.sql y las entities TypeORM pre-V2), más stubs mínimos
 -- de lo que Supabase provee (schema storage/auth, rol authenticated) para que
 -- supabase-migration-storage-artifacts-policies.sql pueda correr en un
--- Postgres 16 desechable. La restricción de production_jobs.execution_mode la
--- aplica el harness corriendo el script REAL scripts/migrate-production-jobs-
--- constraints.js (lo que haría deploy.yml).
+-- Postgres 16 desechable. Las restricciones de production_jobs son las de
+-- `main` ANTES de V2 (execution_mode sin dynamic_generation/dynamic_package):
+-- es lo que producción tiene hoy. Desde el release-fix C1 el runner
+-- (paso 0) las ensancha él mismo; el harness también puede correr el script
+-- REAL scripts/migrate-production-jobs-constraints.js (lo que haría deploy.yml).
+--
+-- Fidelidad (release review Minor 6): las 4 tablas compartidas (courses,
+-- course_versions, artifacts, production_jobs) tienen EXACTAMENTE las columnas
+-- que mapean las entities de `origin/main` (incluida courses.institution_id →
+-- institutions). scripts/prod/test/run-legacy-app-compat-test.js lo exige.
 -- ══════════════════════════════════════════════════════════════════════════
+
+create table public.institutions (
+  id         uuid primary key default gen_random_uuid(),
+  owner_id   varchar(36) not null,
+  name       varchar(255) not null,
+  slug       varchar(120) not null unique,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
 
 create table public.courses (
   id                 serial primary key,
   owner_id           varchar(36),
   owner_email        varchar(255),
+  institution_id     uuid references public.institutions(id) on delete set null,
   title              varchar(255) not null,
   description        text,
   sector             varchar(100),
@@ -97,6 +114,18 @@ alter table public.production_jobs
   add column input_payload jsonb not null default '{}'::jsonb,
   add column output_summary jsonb not null default '{}'::jsonb,
   add column content_snapshot_artifact_id uuid null references public.artifacts(id) on delete set null;
+
+-- CHECKs de `main` pre-V2 (scripts/migrate-production-jobs-constraints.js de
+-- origin/main): SIN 'dynamic_generation' / 'dynamic_package'.
+alter table public.production_jobs
+  add constraint production_jobs_execution_mode_check
+  check (execution_mode in ('frontend','backend_content','backend_audio','backend_videos','backend_h5p',
+    'backend_gamma','backend_package','backend_package_base','course_full_generation','backend_full_future'));
+alter table public.production_jobs
+  add constraint production_jobs_worker_status_check
+  check (worker_status is null or worker_status in ('queued','running','waiting_external','retrying','paused',
+    'pausing','cancelling','completed','failed','failed_recoverable','failed_retryable','needs_reconnect',
+    'blocked_quota','cancelled'));
 
 create table public.usage_events (
   id                 uuid primary key default gen_random_uuid(),
