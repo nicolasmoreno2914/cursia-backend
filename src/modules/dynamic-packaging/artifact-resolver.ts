@@ -288,6 +288,13 @@ export async function loadRunVideoDelivery(q: QueryExecutor, runId: string): Pro
   return frozenVideoDeliveryOf(payload);
 }
 
+/**
+ * Prefijo estable (DN-1 refinado) de TODO rechazo por videos simulados: un
+ * `.mbz` final nunca presenta videos mock como reales. Lo usan el 409 de
+ * PackagingService.assertRunReady y los errores del parser del worker.
+ */
+export const MOCK_VIDEO_NOT_PACKAGEABLE = 'mock_video_not_packageable';
+
 /** Hosts de video que NUNCA son un download real de Videogen — I4, integral-review. */
 const MOCK_VIDEO_HOST_PATTERNS = [/\.local$/i, /^mock-cdn/i, /mock-cdn\./i];
 
@@ -344,7 +351,7 @@ export function parseDynamicVideo(
   }
   if (mode !== 'real') {
     throw new Error(
-      `dynamic_video: run con videos simulados: no empaquetable (mode=${mode ?? 'undefined'}, videogenJobId=${videogenJobId}). ` +
+      `${MOCK_VIDEO_NOT_PACKAGEABLE}: dynamic_video: run con videos simulados: no empaquetable (mode=${mode ?? 'undefined'}, videogenJobId=${videogenJobId}). ` +
         `Solo se empaquetan runs con videoMode='real'.`,
     );
   }
@@ -359,7 +366,7 @@ export function parseDynamicVideo(
   }
   if (isMockVideoHost(url)) {
     throw new Error(
-      `dynamic_video: run con videos simulados: no empaquetable (downloadUrl apunta a un host mock/local: ${url}).`,
+      `${MOCK_VIDEO_NOT_PACKAGEABLE}: dynamic_video: run con videos simulados: no empaquetable (downloadUrl apunta a un host mock/local: ${url}).`,
     );
   }
   return { url, videogenJobId };
@@ -380,7 +387,7 @@ function parseYoutubeDynamicVideo(data: Record<string, any>): ParsedDynamicVideo
   }
   if (data.mode !== 'real') {
     throw new Error(
-      `dynamic_video: run con videos simulados: no empaquetable (mode=${data.mode ?? 'undefined'}, videogenJobId=${videogenJobId}). ` +
+      `${MOCK_VIDEO_NOT_PACKAGEABLE}: dynamic_video: run con videos simulados: no empaquetable (mode=${data.mode ?? 'undefined'}, videogenJobId=${videogenJobId}). ` +
         `Solo se empaquetan runs con videoMode='real'.`,
     );
   }

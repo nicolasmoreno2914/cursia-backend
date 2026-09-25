@@ -1,5 +1,6 @@
 import 'reflect-metadata';
 import { Logger } from '@nestjs/common';
+import { isLegacyAudioBlockedForJob } from '../modules/production-jobs/legacy-audio-guard';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from '../app.module';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
@@ -446,6 +447,16 @@ async function handleAudioJob(
   const rawCourseId = job.frontendCourseId || String(job.courseId ?? 'unknown');
   const apiKey = (process.env.OPENAI_API_KEY ?? '').trim();
   const parentJobId = job.inputPayload?.metadata?.parentJobId ?? null;
+
+  // Decisión del owner (V2): un curso dynamic nunca genera audio legacy. Un
+  // job encolado antes de la regla (o por un camino no guardado) se falla NO
+  // reintentable ANTES de cualquier llamada a OpenAI o artifact.
+  const v2Blocked = await isLegacyAudioBlockedForJob(job, jobsService);
+  if (v2Blocked) {
+    logger.warn(`[AudioWorker] Job ${jobId}: ${v2Blocked}`);
+    await jobsService.failAudioWorkerJob(jobId, workerId, v2Blocked, false);
+    return;
+  }
 
   let leaseLost = false;
   let finalized = false;
