@@ -132,10 +132,18 @@ export class PackagingService {
       .map((it) => it.key);
 
     if (run.worker_status !== RUN_DONE_STATUS || missing.length > 0) {
-      throw new ConflictException({
-        message: `La ejecución ${run.id} no está lista para empaquetar (worker_status=${run.worker_status}, ${missing.length} item(s) sin completar)`,
-        missing,
-      });
+      // El filtro global de excepciones (AllExceptionsFilter) aplana
+      // `exception.getResponse()` a un string (`error: message.message`) y
+      // descarta cualquier otro campo — así que `missing` viaja también
+      // serializado dentro del propio mensaje (mismo truco que RunsService
+      // usa para "runId=<uuid>" en sus 409). El body estructurado
+      // ({message, missing}) queda además disponible para quien llame al
+      // servicio directamente (tests) o a un cliente HTTP que sí lea el
+      // JSON crudo sin pasar por ese filtro.
+      const message =
+        `La ejecución ${run.id} no está lista para empaquetar (worker_status=${run.worker_status}, ` +
+        `${missing.length} item(s) sin completar) missingJson=${JSON.stringify(missing)}`;
+      throw new ConflictException({ message, missing });
     }
   }
 
