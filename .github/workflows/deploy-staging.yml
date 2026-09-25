@@ -163,6 +163,9 @@ jobs:
                echo "━━━ [4h] Dynamic Generation: migración (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-dynamic-generation.js
 
+               echo "━━━ [4h2] Dynamic Generation: migración rulesVersion 2 (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-dynamic-generation-v2.js
+
                echo "━━━ [4i] Dynamic Generation: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-dynamic-generation-schema.js
 
