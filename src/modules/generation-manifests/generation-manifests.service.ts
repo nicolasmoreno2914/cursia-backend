@@ -4,8 +4,8 @@ import { returningRows } from '../../common/db/returning-rows';
 import { BlueprintDto, CourseBlueprintsService } from '../course-blueprints/course-blueprints.service';
 import {
   GenerationManifestV1,
-  MANIFEST_RULES_VERSION,
   MANIFEST_SCHEMA_VERSION,
+  ManifestRulesVersion,
   ManifestSource,
   ManifestTotals,
   ManifestValidationError,
@@ -14,6 +14,7 @@ import {
   manifestSha256,
   validateGenerationManifest,
 } from './generation-manifest-builder';
+import { readManifestRulesVersionConfig } from './manifest-rules-config';
 
 export interface ManifestDto {
   id: number;
@@ -63,7 +64,16 @@ export class GenerationManifestsService {
   constructor(
     private readonly dataSource: DataSource,
     private readonly blueprints: CourseBlueprintsService,
-  ) {}
+  ) {
+    // Spec v2 §3: fail-fast al arrancar — un DYNAMIC_MANIFEST_RULES_VERSION
+    // desconocido aborta el boot en vez de caer en silencio a otra versión.
+    readManifestRulesVersionConfig();
+  }
+
+  /** rulesVersion configurado (DYNAMIC_MANIFEST_RULES_VERSION, default 1); lanza si es inválido. */
+  configuredRulesVersion(): ManifestRulesVersion {
+    return readManifestRulesVersionConfig();
+  }
 
   /**
    * Get-or-create idempotente. La idempotencia la garantiza la base con
@@ -75,9 +85,10 @@ export class GenerationManifestsService {
     ownerId: string,
     blueprintNumber: number,
   ): Promise<{ created: boolean; manifest: ManifestDto }> {
+    const rulesVersion = this.configuredRulesVersion();
     const bp = await this.blueprints.getByNumber(courseId, ownerId, blueprintNumber);
     const source = sourceOf(bp);
-    const m = buildGenerationManifest(bp.snapshot, source);
+    const m = buildGenerationManifest(bp.snapshot, source, { rulesVersion });
 
     const errors = validateGenerationManifest(m, bp.snapshot, source);
     if (errors.length > 0) {
@@ -92,25 +103,43 @@ export class GenerationManifestsService {
     const sha = manifestSha256(m);
     const t = m.totals;
 
+    // v1: exactamente el INSERT de siempre (no depende de la migración v2).
+    // v2: además las columnas de conteo v2 (supabase-migration-dynamic-
+    // generation-v2.sql); sin esa migración el CHECK cgm_counts_consistent
+    // viejo rechaza el total (falla fuerte, nunca un Manifest v2 a medias).
     const inserted = returningRows(
-      await this.dataSource.query(
-        `insert into public.course_generation_manifests
-           (course_id, blueprint_id, rules_version, manifest_schema_version, manifest_json,
-            manifest_sha256, blueprint_sha256, module_count, chapter_count, content_count,
-            scorm_count, video_count, exam_count, total_jobs, created_by)
-         values ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-         on conflict (blueprint_id, rules_version) do nothing
-         returning *`,
-        [courseId, bp.id, MANIFEST_RULES_VERSION, MANIFEST_SCHEMA_VERSION, canonical, sha, bp.sha256,
-          t.moduleCount, t.chapterCount, t.contentCount, t.scormCount, t.videoCount, t.examCount,
-          t.totalJobs, ownerId],
-      ),
+      rulesVersion === 2
+        ? await this.dataSource.query(
+            `insert into public.course_generation_manifests
+               (course_id, blueprint_id, rules_version, manifest_schema_version, manifest_json,
+                manifest_sha256, blueprint_sha256, module_count, chapter_count, content_count,
+                scorm_count, video_count, exam_count, total_jobs, created_by,
+                course_plan_count, course_intro_count, module_intro_count)
+             values ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+             on conflict (blueprint_id, rules_version) do nothing
+             returning *`,
+            [courseId, bp.id, rulesVersion, MANIFEST_SCHEMA_VERSION, canonical, sha, bp.sha256,
+              t.moduleCount, t.chapterCount, t.contentCount, t.scormCount, t.videoCount, t.examCount,
+              t.totalJobs, ownerId, t.coursePlanCount, t.courseIntroCount, t.moduleIntroCount],
+          )
+        : await this.dataSource.query(
+            `insert into public.course_generation_manifests
+               (course_id, blueprint_id, rules_version, manifest_schema_version, manifest_json,
+                manifest_sha256, blueprint_sha256, module_count, chapter_count, content_count,
+                scorm_count, video_count, exam_count, total_jobs, created_by)
+             values ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+             on conflict (blueprint_id, rules_version) do nothing
+             returning *`,
+            [courseId, bp.id, rulesVersion, MANIFEST_SCHEMA_VERSION, canonical, sha, bp.sha256,
+              t.moduleCount, t.chapterCount, t.contentCount, t.scormCount, t.videoCount, t.examCount,
+              t.totalJobs, ownerId],
+          ),
     );
     if (inserted.length === 1) {
       return { created: true, manifest: this.toDto(inserted[0], bp) };
     }
 
-    const existing = await this.findRow(courseId, bp.id);
+    const existing = await this.findRow(courseId, bp.id, rulesVersion);
     if (!existing) {
       // ON CONFLICT sin fila visible después: no debería ocurrir (el UNIQUE
       // solo choca con filas commiteadas o en curso que luego se commitean).
@@ -122,31 +151,64 @@ export class GenerationManifestsService {
     if (existing.manifest_sha256 !== sha) {
       throw new InternalServerErrorException(
         `Generation Manifest no determinístico: el guardado #${existing.id} del Blueprint v${bp.blueprintNumber} ` +
-          `(curso #${courseId}, rulesVersion ${MANIFEST_RULES_VERSION}) tiene sha256 ${existing.manifest_sha256} ` +
+          `(curso #${courseId}, rulesVersion ${rulesVersion}) tiene sha256 ${existing.manifest_sha256} ` +
           `pero el recién calculado es ${sha}`,
       );
     }
     return { created: false, manifest: this.toDto(existing, bp) };
   }
 
-  /** Lee el Manifest (rulesVersion actual) de un Blueprint; 404 si no se creó. */
-  async get(courseId: number, ownerId: string, blueprintNumber: number): Promise<ManifestDto> {
+  /**
+   * Lee el Manifest de un Blueprint para `rulesVersion` (default: el
+   * configurado, DYNAMIC_MANIFEST_RULES_VERSION); 404 si no se creó.
+   */
+  async get(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+    rulesVersion: ManifestRulesVersion = this.configuredRulesVersion(),
+  ): Promise<ManifestDto> {
     const bp = await this.blueprints.getByNumber(courseId, ownerId, blueprintNumber);
-    const row = await this.findRow(courseId, bp.id);
+    const row = await this.findRow(courseId, bp.id, rulesVersion);
     if (!row) {
       throw new NotFoundException(
         `El Blueprint v${bp.blueprintNumber} del curso #${courseId} no tiene Generation Manifest ` +
-          `(rulesVersion ${MANIFEST_RULES_VERSION}); crealo con POST`,
+          `(rulesVersion ${rulesVersion}); crealo con POST`,
       );
     }
     return this.toDto(row, bp);
   }
 
-  private async findRow(courseId: number, blueprintId: number): Promise<any | undefined> {
+  /**
+   * Lee un Manifest concreto por id (el congelado en un run:
+   * input_payload.manifestId), verificando que sea de ESE Blueprint/curso y
+   * del dueño (mismas garantías que `get`). Así un run v1 sigue legible
+   * aunque la config pase a crear Manifests v2 (y viceversa). 404 si no es de
+   * este Blueprint.
+   */
+  async getById(courseId: number, ownerId: string, blueprintNumber: number, manifestId: number): Promise<ManifestDto> {
+    const bp = await this.blueprints.getByNumber(courseId, ownerId, blueprintNumber);
+    const id = Number(manifestId);
+    const [row] = Number.isInteger(id)
+      ? await this.dataSource.query(
+          `select * from public.course_generation_manifests
+            where id = $1 and blueprint_id = $2 and course_id = $3`,
+          [id, bp.id, courseId],
+        )
+      : [];
+    if (!row) {
+      throw new NotFoundException(
+        `El Generation Manifest #${manifestId} no pertenece al Blueprint v${bp.blueprintNumber} del curso #${courseId}`,
+      );
+    }
+    return this.toDto(row, bp);
+  }
+
+  private async findRow(courseId: number, blueprintId: number, rulesVersion: ManifestRulesVersion): Promise<any | undefined> {
     const [row] = await this.dataSource.query(
       `select * from public.course_generation_manifests
         where blueprint_id = $1 and course_id = $2 and rules_version = $3`,
-      [blueprintId, courseId, MANIFEST_RULES_VERSION],
+      [blueprintId, courseId, rulesVersion],
     );
     return row;
   }
@@ -211,6 +273,10 @@ export class GenerationManifestsService {
       row.video_count, row.exam_count, row.total_jobs];
     const fromJson = [t.moduleCount, t.chapterCount, t.contentCount, t.scormCount,
       t.videoCount, t.examCount, t.totalJobs];
+    // v2: columnas de conteo nuevas (ausentes antes de la migración v2 → 0,
+    // que es lo que declara un Manifest v1).
+    cols.push(row.course_plan_count ?? 0, row.course_intro_count ?? 0, row.module_intro_count ?? 0);
+    fromJson.push(t.coursePlanCount ?? 0, t.courseIntroCount ?? 0, t.moduleIntroCount ?? 0);
     if (cols.some((v, i) => v !== fromJson[i])) {
       throw new InternalServerErrorException(
         `${where}: columnas de conteo [${cols.join(',')}] no coinciden con totals del manifest [${fromJson.join(',')}]`,

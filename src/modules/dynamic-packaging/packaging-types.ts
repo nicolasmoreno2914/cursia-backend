@@ -45,10 +45,19 @@ export interface PackagingModulePlan {
   colorIndex: number;
   chapters: PackagingChapterPlan[]; // orden del Manifest
   examItemKey: string | null; // 'exam:<moduleId>' si existe en el Manifest
+  /**
+   * rulesVersion 2 (5B.2.B): 'module_intro:<moduleId>'. Ausente en planes v1
+   * (la forma canónica v1 no cambia).
+   */
+  moduleIntroItemKey?: string;
 }
 
 export interface PackagingPlan {
   planVersion: 1;
+  /** Presente SOLO en planes de Manifests rulesVersion 2 (v1: ausente, canónico intacto). */
+  rulesVersion?: 2;
+  /** rulesVersion 2: 'course_intro:<courseId>' (sección 0 + bibliografía en el Libro Guía). */
+  courseIntroItemKey?: string;
   manifestId: number | null; // null en tests puros
   course: { id: number; title: string; summary: string | null };
   /** Secciones de Moodle en orden: 0 welcome, 1 route_and_book, luego una por módulo. */
@@ -71,7 +80,12 @@ export interface ResolvedArtifact {
     | 'dynamic_scorm_html'
     | 'dynamic_scorm_manifest'
     | 'dynamic_exam_gift'
-    | 'dynamic_video';
+    | 'dynamic_video'
+    // rulesVersion 2 (5B.2.B + Fase 6):
+    | 'dynamic_course_plan_json'
+    | 'dynamic_course_intro_md'
+    | 'dynamic_module_intro_md'
+    | 'dynamic_context_package_json';
   storageBucket: string;
   storagePath: string;
   mimeType: string | null;
@@ -92,6 +106,10 @@ export interface DynamicPackageContents {
    * directo (5B.1, byte-idéntico).
    */
   videos: Map<string, { url: string; videogenJobId: string; delivery?: 'youtube' }>;
+  /** rulesVersion 2: markdown del item course_intro (obligatorio si el plan es v2). */
+  courseIntroMd?: string;
+  /** rulesVersion 2: moduleId -> markdown del item module_intro (obligatorio por módulo si el plan es v2). */
+  moduleIntroMd?: Map<string, string>;
 }
 
 export interface BuildDynamicMbzInput {

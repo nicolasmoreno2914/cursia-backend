@@ -1,10 +1,49 @@
 import { createHash } from 'crypto';
 import type { BlueprintSnapshotV1 } from '../course-blueprints/blueprint-snapshot';
 
+/**
+ * rulesVersion por defecto (y el único que existía hasta 5B.2.B/Fase 6). La
+ * versión que efectivamente crea `POST …/manifest` sale de config
+ * (`DYNAMIC_MANIFEST_RULES_VERSION`, ver manifest-rules-config.ts); esta
+ * constante queda como el default y como el valor de los Manifests v1.
+ */
 export const MANIFEST_RULES_VERSION = 1;
 export const MANIFEST_SCHEMA_VERSION = 1;
 
-export type ManifestItemType = 'content' | 'scorm' | 'video' | 'exam';
+/** rulesVersion soportados por este builder/validador (spec v2 §3). */
+export type ManifestRulesVersion = 1 | 2;
+export const SUPPORTED_RULES_VERSIONS: readonly ManifestRulesVersion[] = [1, 2];
+
+export type ManifestItemType =
+  | 'content'
+  | 'scorm'
+  | 'video'
+  | 'exam'
+  // rulesVersion 2 (5B.2.B + Fase 6):
+  | 'course_plan'
+  | 'course_intro'
+  | 'module_intro';
+
+export type ManifestItemScope = 'chapter' | 'module' | 'course';
+
+/** Tipos de item por rulesVersion (v1 queda exactamente como antes). */
+export const MANIFEST_ITEM_TYPES_V1: readonly ManifestItemType[] = ['content', 'scorm', 'video', 'exam'];
+export const MANIFEST_ITEM_TYPES_V2: readonly ManifestItemType[] = [
+  'content', 'scorm', 'video', 'exam', 'course_plan', 'course_intro', 'module_intro',
+];
+/** Todos los tipos que existen en algún rulesVersion soportado. */
+export const ALL_MANIFEST_ITEM_TYPES: readonly ManifestItemType[] = MANIFEST_ITEM_TYPES_V2;
+
+/** Scope de cada tipo (spec v2 §3); en v1 solo existen chapter y module. */
+export function scopeOfItemType(type: ManifestItemType): ManifestItemScope {
+  if (type === 'course_plan' || type === 'course_intro') return 'course';
+  if (type === 'exam' || type === 'module_intro') return 'module';
+  return 'chapter';
+}
+
+export function itemTypesForRulesVersion(rv: number): readonly ManifestItemType[] {
+  return rv === 2 ? MANIFEST_ITEM_TYPES_V2 : MANIFEST_ITEM_TYPES_V1;
+}
 
 export interface ManifestSource {
   courseId: number;
@@ -28,17 +67,25 @@ export interface ManifestModule {
   chapters: ManifestChapter[];
 }
 
+/**
+ * Item del Manifest. `moduleId`/`moduleNumber` son null SOLO en items de
+ * scope 'course' (rulesVersion 2: course_plan, course_intro); en v1 nunca.
+ */
 export interface ManifestItem {
   key: string;
   type: ManifestItemType;
-  scope: 'chapter' | 'module';
-  moduleId: string;
+  scope: ManifestItemScope;
+  moduleId: string | null;
   chapterId: string | null;
-  moduleNumber: number;
+  moduleNumber: number | null;
   chapterNumber: number | null;
   dependsOn: string[];
 }
 
+/**
+ * Totales. Los tres conteos de v2 existen SOLO en Manifests rulesVersion 2
+ * (en v1 están ausentes: la forma canónica de v1 no cambia).
+ */
 export interface ManifestTotals {
   moduleCount: number;
   chapterCount: number;
@@ -46,12 +93,20 @@ export interface ManifestTotals {
   scormCount: number;
   videoCount: number;
   examCount: number;
+  coursePlanCount?: number;
+  courseIntroCount?: number;
+  moduleIntroCount?: number;
   totalJobs: number;
 }
 
+/**
+ * Manifest con `manifestSchemaVersion: 1` (la forma JSON), para cualquier
+ * rulesVersion soportado. El nombre se conserva por compatibilidad: "V1" es
+ * el schema, no las reglas.
+ */
 export interface GenerationManifestV1 {
   manifestSchemaVersion: 1;
-  rulesVersion: 1;
+  rulesVersion: ManifestRulesVersion;
   source: ManifestSource;
   modules: ManifestModule[];
   items: ManifestItem[];
@@ -79,20 +134,69 @@ export interface ManifestValidationError {
  * Input arrays (`snapshot.modules`, `.chapters`) are never mutated — sorted
  * copies are made instead.
  */
+/**
+ * rulesVersion 2 (spec `2026-09-25-cursia-v2-rules-v2-and-context-package-design.md` §3),
+ * además de todo lo de v1:
+ *  - `course_plan:<courseId>` (scope course, sin deps) y
+ *    `course_intro:<courseId>` (scope course, deps [course_plan]) al inicio;
+ *  - `module_intro:<moduleId>` (scope module, deps [course_plan]) al inicio de
+ *    cada módulo, antes de sus capítulos;
+ *  - `content:<chapterId>` depende de `course_plan`.
+ *  Orden canónico v2: course_plan, course_intro, luego por módulo:
+ *  module_intro → capítulos (content, scorm, video) → exam.
+ *  Totales v2 += coursePlanCount, courseIntroCount, moduleIntroCount.
+ * Con `rulesVersion` 1 (default) el resultado es byte-idéntico al de antes.
+ */
+export function coursePlanKey(courseId: number): string {
+  return `course_plan:${courseId}`;
+}
+export function courseIntroKey(courseId: number): string {
+  return `course_intro:${courseId}`;
+}
+export function moduleIntroKey(moduleId: string): string {
+  return `module_intro:${moduleId}`;
+}
+
 export function buildGenerationManifest(
   snapshot: BlueprintSnapshotV1,
   source: ManifestSource,
+  opts?: { rulesVersion?: ManifestRulesVersion },
 ): GenerationManifestV1 {
+  const rulesVersion: ManifestRulesVersion = opts?.rulesVersion ?? 1;
+  if (!SUPPORTED_RULES_VERSIONS.includes(rulesVersion)) {
+    throw new Error(`buildGenerationManifest: rulesVersion no soportado: ${String(rulesVersion)}`);
+  }
+  const v2 = rulesVersion === 2;
+  const planKey = coursePlanKey(source.courseId);
   const modulesSorted = [...snapshot.modules].sort((a, b) => a.position - b.position);
   let chapterNumber = 0;
   const modules: ManifestModule[] = [];
   const items: ManifestItem[] = [];
+
+  if (v2) {
+    const courseBase = { scope: 'course' as const, moduleId: null, chapterId: null, moduleNumber: null, chapterNumber: null };
+    items.push({ key: planKey, type: 'course_plan', ...courseBase, dependsOn: [] });
+    items.push({ key: courseIntroKey(source.courseId), type: 'course_intro', ...courseBase, dependsOn: [planKey] });
+  }
 
   modulesSorted.forEach((m, mi) => {
     const moduleNumber = mi + 1;
     const chaptersSorted = [...m.chapters].sort((a, b) => a.position - b.position);
     const chapters: ManifestChapter[] = [];
     const contentKeys: string[] = [];
+
+    if (v2) {
+      items.push({
+        key: moduleIntroKey(m.id),
+        type: 'module_intro',
+        scope: 'module',
+        moduleId: m.id,
+        chapterId: null,
+        moduleNumber,
+        chapterNumber: null,
+        dependsOn: [planKey],
+      });
+    }
 
     for (const c of chaptersSorted) {
       chapterNumber += 1;
@@ -113,7 +217,7 @@ export function buildGenerationManifest(
       const contentKey = `content:${c.id}`;
       contentKeys.push(contentKey);
 
-      items.push({ key: contentKey, type: 'content', ...base, dependsOn: [] });
+      items.push({ key: contentKey, type: 'content', ...base, dependsOn: v2 ? [planKey] : [] });
       items.push({ key: `scorm:${c.id}`, type: 'scorm', ...base, dependsOn: [contentKey] });
       if (c.videoEnabled) {
         items.push({ key: `video:${c.id}`, type: 'video', ...base, dependsOn: [contentKey] });
@@ -143,19 +247,32 @@ export function buildGenerationManifest(
   });
 
   const count = (t: ManifestItemType) => items.filter((i) => i.type === t).length;
-  const totals: ManifestTotals = {
-    moduleCount: modules.length,
-    chapterCount: chapterNumber,
-    contentCount: count('content'),
-    scormCount: count('scorm'),
-    videoCount: count('video'),
-    examCount: count('exam'),
-    totalJobs: items.length,
-  };
+  const totals: ManifestTotals = v2
+    ? {
+        moduleCount: modules.length,
+        chapterCount: chapterNumber,
+        contentCount: count('content'),
+        scormCount: count('scorm'),
+        videoCount: count('video'),
+        examCount: count('exam'),
+        coursePlanCount: count('course_plan'),
+        courseIntroCount: count('course_intro'),
+        moduleIntroCount: count('module_intro'),
+        totalJobs: items.length,
+      }
+    : {
+        moduleCount: modules.length,
+        chapterCount: chapterNumber,
+        contentCount: count('content'),
+        scormCount: count('scorm'),
+        videoCount: count('video'),
+        examCount: count('exam'),
+        totalJobs: items.length,
+      };
 
   return {
     manifestSchemaVersion: 1,
-    rulesVersion: 1,
+    rulesVersion,
     source: {
       courseId: source.courseId,
       blueprintId: source.blueprintId,
@@ -210,12 +327,24 @@ export function validateGenerationManifest(
 ): ManifestValidationError[] {
   const errors: ManifestValidationError[] = [];
 
-  if (m.rulesVersion !== 1) {
+  // Despacho por rulesVersion (spec v2 §3): v1 se valida exactamente como
+  // antes; v2 agrega los items de scope curso/módulo y la arista
+  // content → course_plan. Un rulesVersion no soportado es VERSION_MISMATCH y
+  // el resto se valida con las reglas v1 (igual que antes de v2).
+  const rv: ManifestRulesVersion = m.rulesVersion === 2 ? 2 : 1;
+  const v2 = rv === 2;
+  if (!SUPPORTED_RULES_VERSIONS.includes(m.rulesVersion)) {
     errors.push({
       code: 'VERSION_MISMATCH',
-      message: `rulesVersion esperado 1, encontrado ${m.rulesVersion}`,
+      message: `rulesVersion esperado 1 o 2, encontrado ${m.rulesVersion}`,
     });
   }
+  const knownTypes = itemTypesForRulesVersion(rv);
+  const planKey = coursePlanKey(source.courseId);
+  const expectedCourseKeys = new Map<string, ManifestItemType>(
+    v2 ? [[planKey, 'course_plan'], [courseIntroKey(source.courseId), 'course_intro']] : [],
+  );
+  const expectedModuleIntroKeys = new Set<string>();
   if (m.manifestSchemaVersion !== 1) {
     errors.push({
       code: 'VERSION_MISMATCH',
@@ -277,6 +406,7 @@ export function validateGenerationManifest(
     }
     moduleChapterOrder.set(mod.id, chapterIds);
     if (mod.examEnabled) expectedExamKeys.add(`exam:${mod.id}`);
+    if (v2) expectedModuleIntroKeys.add(moduleIntroKey(mod.id));
   });
 
   // --- FIX M4: canonical order ---
@@ -288,8 +418,9 @@ export function validateGenerationManifest(
   // skipped for this check (they're already caught by the other checks
   // above/below) so a single stray item can't mask a genuine ordering bug
   // in the rest of the array.
-  const canonicalOrderKeys: string[] = [];
+  const canonicalOrderKeys: string[] = [...expectedCourseKeys.keys()];
   modulesSorted.forEach((mod) => {
+    if (v2) canonicalOrderKeys.push(moduleIntroKey(mod.id));
     const chaptersSorted = [...mod.chapters].sort((a, b) => a.position - b.position);
     for (const c of chaptersSorted) {
       canonicalOrderKeys.push(`content:${c.id}`);
@@ -407,32 +538,44 @@ export function validateGenerationManifest(
   const presentScormKeys = new Set<string>();
   const presentVideoKeys = new Set<string>();
   const presentExamKeys = new Set<string>();
-
-  const KNOWN_ITEM_TYPES: ManifestItemType[] = ['content', 'scorm', 'video', 'exam'];
+  const presentCourseKeys = new Set<string>();
+  const presentModuleIntroKeys = new Set<string>();
 
   for (const item of m.items) {
+    const isKnown = knownTypes.includes(item.type);
+    // Solo en v2 los tipos nuevos tienen reglas propias; en v1 un tipo v2 es
+    // UNKNOWN_TYPE y sigue el camino de "capítulo" exactamente como antes.
+    const isCourseType = isKnown && (item.type === 'course_plan' || item.type === 'course_intro');
+    const isModuleIntro = isKnown && item.type === 'module_intro';
+    const isModuleScoped = item.type === 'exam' || isModuleIntro;
+    const itemModuleId = item.moduleId ?? '';
+
     // --- FIX I1: per-item identity/consistency checks, independent of
     // whether the referenced moduleId/chapterId actually exist (those are
     // handled separately below). Each check is computed from the item's
     // own claimed fields, so a swapped/forged id or number is caught even
     // when every key involved is otherwise present in the manifest. ---
-    if (!KNOWN_ITEM_TYPES.includes(item.type)) {
+    if (!isKnown) {
       errors.push({
         code: 'UNKNOWN_TYPE',
         message: `item ${item.key}: type desconocido: ${String(item.type)}`,
         key: item.key,
       });
     } else {
-      const expectedKey = item.type === 'exam' ? `exam:${item.moduleId}` : `${item.type}:${item.chapterId}`;
+      const expectedKey = isCourseType
+        ? `${item.type}:${source.courseId}`
+        : isModuleScoped
+          ? `${item.type}:${item.moduleId}`
+          : `${item.type}:${item.chapterId}`;
       if (item.key !== expectedKey) {
         errors.push({
           code: 'KEY_MISMATCH',
-          message: `item ${item.key}: key esperada ${expectedKey} según type/${item.type === 'exam' ? 'moduleId' : 'chapterId'}`,
+          message: `item ${item.key}: key esperada ${expectedKey} según type/${isCourseType ? 'courseId' : isModuleScoped ? 'moduleId' : 'chapterId'}`,
           key: item.key,
         });
       }
 
-      const expectedScope = item.type === 'exam' ? 'module' : 'chapter';
+      const expectedScope = scopeOfItemType(item.type);
       if (item.scope !== expectedScope) {
         errors.push({
           code: 'SCOPE_MISMATCH',
@@ -441,44 +584,62 @@ export function validateGenerationManifest(
         });
       }
 
-      const expectedModuleForItem = expectedModules.get(item.moduleId);
-      if (expectedModuleForItem && item.moduleNumber !== expectedModuleForItem.moduleNumber) {
-        errors.push({
-          code: 'NUMBERING_MISMATCH',
-          message: `item ${item.key}: moduleNumber esperado ${expectedModuleForItem.moduleNumber} para moduleId ${item.moduleId}, encontrado ${item.moduleNumber}`,
-          key: item.key,
-        });
-      }
-
-      if (item.type === 'exam') {
-        if (item.chapterId !== null) {
-          errors.push({
-            code: 'NUMBERING_MISMATCH',
-            message: `item ${item.key}: chapterId esperado null para un item de tipo exam, encontrado ${item.chapterId}`,
-            key: item.key,
-          });
-        }
-        if (item.chapterNumber !== null) {
-          errors.push({
-            code: 'NUMBERING_MISMATCH',
-            message: `item ${item.key}: chapterNumber esperado null para un item de tipo exam, encontrado ${item.chapterNumber}`,
-            key: item.key,
-          });
+      if (isCourseType) {
+        // Scope curso: sin módulo ni capítulo (identidad = el curso del source).
+        for (const [field, value] of [
+          ['moduleId', item.moduleId],
+          ['chapterId', item.chapterId],
+          ['moduleNumber', item.moduleNumber],
+          ['chapterNumber', item.chapterNumber],
+        ] as const) {
+          if (value !== null) {
+            errors.push({
+              code: 'NUMBERING_MISMATCH',
+              message: `item ${item.key}: ${field} esperado null para un item de scope course, encontrado ${value}`,
+              key: item.key,
+            });
+          }
         }
       } else {
-        const expectedChapterForItem = item.chapterId ? expectedChapters.get(item.chapterId) : undefined;
-        if (expectedChapterForItem && item.chapterNumber !== expectedChapterForItem.chapterNumber) {
+        const expectedModuleForItem = expectedModules.get(itemModuleId);
+        if (expectedModuleForItem && item.moduleNumber !== expectedModuleForItem.moduleNumber) {
           errors.push({
             code: 'NUMBERING_MISMATCH',
-            message: `item ${item.key}: chapterNumber esperado ${expectedChapterForItem.chapterNumber} para chapterId ${item.chapterId}, encontrado ${item.chapterNumber}`,
+            message: `item ${item.key}: moduleNumber esperado ${expectedModuleForItem.moduleNumber} para moduleId ${item.moduleId}, encontrado ${item.moduleNumber}`,
             key: item.key,
           });
+        }
+
+        if (isModuleScoped) {
+          if (item.chapterId !== null) {
+            errors.push({
+              code: 'NUMBERING_MISMATCH',
+              message: `item ${item.key}: chapterId esperado null para un item de tipo ${item.type}, encontrado ${item.chapterId}`,
+              key: item.key,
+            });
+          }
+          if (item.chapterNumber !== null) {
+            errors.push({
+              code: 'NUMBERING_MISMATCH',
+              message: `item ${item.key}: chapterNumber esperado null para un item de tipo ${item.type}, encontrado ${item.chapterNumber}`,
+              key: item.key,
+            });
+          }
+        } else {
+          const expectedChapterForItem = item.chapterId ? expectedChapters.get(item.chapterId) : undefined;
+          if (expectedChapterForItem && item.chapterNumber !== expectedChapterForItem.chapterNumber) {
+            errors.push({
+              code: 'NUMBERING_MISMATCH',
+              message: `item ${item.key}: chapterNumber esperado ${expectedChapterForItem.chapterNumber} para chapterId ${item.chapterId}, encontrado ${item.chapterNumber}`,
+              key: item.key,
+            });
+          }
         }
       }
     }
 
     if (item.type === 'exam') {
-      const expectedModule = expectedModules.get(item.moduleId);
+      const expectedModule = expectedModules.get(itemModuleId);
       if (!expectedModule) {
         errors.push({
           code: 'UNKNOWN_MODULE',
@@ -493,6 +654,17 @@ export function validateGenerationManifest(
         });
       }
       presentExamKeys.add(item.key);
+    } else if (isModuleIntro) {
+      if (!expectedModules.has(itemModuleId)) {
+        errors.push({
+          code: 'UNKNOWN_MODULE',
+          message: `module_intro ${item.key} referencia un moduleId inexistente en el snapshot: ${item.moduleId}`,
+          key: item.key,
+        });
+      }
+      presentModuleIntroKeys.add(item.key);
+    } else if (isCourseType) {
+      presentCourseKeys.add(item.key);
     } else {
       // content | scorm | video: chapter-scoped
       const expectedChapter = item.chapterId ? expectedChapters.get(item.chapterId) : undefined;
@@ -544,14 +716,22 @@ export function validateGenerationManifest(
     // content:A.dependsOn=[scorm:A] / scorm:A.dependsOn=[content:A]) is
     // caught here as WRONG_DEPENDENCIES on the content item alone (expects
     // []), independent of anything else being wrong.
+    // v2: content/course_intro/module_intro -> [course_plan:<courseId>] y
+    // course_plan -> []. Sigue siendo acíclico: course_plan es la única
+    // raíz, no depende de nada, y todo lo demás apunta "hacia" content o
+    // hacia course_plan.
     let expectedDeps: string[] | undefined;
     if (item.type === 'content') {
-      expectedDeps = [];
+      expectedDeps = v2 ? [planKey] : [];
     } else if (item.type === 'scorm' || item.type === 'video') {
       if (item.chapterId) expectedDeps = [`content:${item.chapterId}`];
     } else if (item.type === 'exam') {
-      const chapterIds = moduleChapterOrder.get(item.moduleId);
+      const chapterIds = moduleChapterOrder.get(itemModuleId);
       if (chapterIds) expectedDeps = chapterIds.map((cid) => `content:${cid}`);
+    } else if (isKnown && item.type === 'course_plan') {
+      expectedDeps = [];
+    } else if (isKnown && (item.type === 'course_intro' || item.type === 'module_intro')) {
+      expectedDeps = [planKey];
     }
     if (expectedDeps) {
       const same =
@@ -568,6 +748,16 @@ export function validateGenerationManifest(
   }
 
   // --- missing items (recounted from the snapshot) ---
+  for (const [key, type] of expectedCourseKeys) {
+    if (!presentCourseKeys.has(key)) {
+      errors.push({ code: type === 'course_plan' ? 'MISSING_COURSE_PLAN' : 'MISSING_COURSE_INTRO', message: `falta el item ${key}`, key });
+    }
+  }
+  for (const key of expectedModuleIntroKeys) {
+    if (!presentModuleIntroKeys.has(key)) {
+      errors.push({ code: 'MISSING_MODULE_INTRO', message: `falta el item ${key}`, key });
+    }
+  }
   for (const key of expectedContentKeys) {
     if (!presentContentKeys.has(key)) {
       errors.push({ code: 'MISSING_CONTENT', message: `falta el item ${key}`, key });
@@ -590,16 +780,29 @@ export function validateGenerationManifest(
   }
 
   // --- totals recount ---
-  const expectedTotals: ManifestTotals = {
-    moduleCount: expectedModules.size,
-    chapterCount: expectedChapters.size,
-    contentCount: expectedContentKeys.size,
-    scormCount: expectedScormKeys.size,
-    videoCount: expectedVideoKeys.size,
-    examCount: expectedExamKeys.size,
-    totalJobs:
-      expectedContentKeys.size + expectedScormKeys.size + expectedVideoKeys.size + expectedExamKeys.size,
-  };
+  const v1Jobs = expectedContentKeys.size + expectedScormKeys.size + expectedVideoKeys.size + expectedExamKeys.size;
+  const expectedTotals: ManifestTotals = v2
+    ? {
+        moduleCount: expectedModules.size,
+        chapterCount: expectedChapters.size,
+        contentCount: expectedContentKeys.size,
+        scormCount: expectedScormKeys.size,
+        videoCount: expectedVideoKeys.size,
+        examCount: expectedExamKeys.size,
+        coursePlanCount: 1,
+        courseIntroCount: 1,
+        moduleIntroCount: expectedModuleIntroKeys.size,
+        totalJobs: v1Jobs + expectedCourseKeys.size + expectedModuleIntroKeys.size,
+      }
+    : {
+        moduleCount: expectedModules.size,
+        chapterCount: expectedChapters.size,
+        contentCount: expectedContentKeys.size,
+        scormCount: expectedScormKeys.size,
+        videoCount: expectedVideoKeys.size,
+        examCount: expectedExamKeys.size,
+        totalJobs: v1Jobs,
+      };
   (Object.keys(expectedTotals) as (keyof ManifestTotals)[]).forEach((field) => {
     if (m.totals[field] !== expectedTotals[field]) {
       errors.push({
@@ -664,15 +867,31 @@ export function canonicalManifestJson(m: GenerationManifestV1): string {
       chapterNumber: i.chapterNumber,
       dependsOn: [...i.dependsOn],
     })),
-    totals: {
-      moduleCount: m.totals.moduleCount,
-      chapterCount: m.totals.chapterCount,
-      contentCount: m.totals.contentCount,
-      scormCount: m.totals.scormCount,
-      videoCount: m.totals.videoCount,
-      examCount: m.totals.examCount,
-      totalJobs: m.totals.totalJobs,
-    },
+    // v1: exactamente las claves de siempre (el hash fijado no cambia). v2:
+    // + los tres conteos nuevos, antes de totalJobs.
+    totals:
+      m.rulesVersion === 2
+        ? {
+            moduleCount: m.totals.moduleCount,
+            chapterCount: m.totals.chapterCount,
+            contentCount: m.totals.contentCount,
+            scormCount: m.totals.scormCount,
+            videoCount: m.totals.videoCount,
+            examCount: m.totals.examCount,
+            coursePlanCount: m.totals.coursePlanCount,
+            courseIntroCount: m.totals.courseIntroCount,
+            moduleIntroCount: m.totals.moduleIntroCount,
+            totalJobs: m.totals.totalJobs,
+          }
+        : {
+            moduleCount: m.totals.moduleCount,
+            chapterCount: m.totals.chapterCount,
+            contentCount: m.totals.contentCount,
+            scormCount: m.totals.scormCount,
+            videoCount: m.totals.videoCount,
+            examCount: m.totals.examCount,
+            totalJobs: m.totals.totalJobs,
+          },
   };
   return JSON.stringify(canonical);
 }

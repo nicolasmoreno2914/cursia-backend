@@ -10,6 +10,7 @@ import {
   snapshotSha256,
 } from '../course-blueprints/blueprint-snapshot';
 import {
+  ALL_MANIFEST_ITEM_TYPES,
   GenerationManifestV1,
   ManifestItemType,
   canonicalManifestJson,
@@ -30,7 +31,8 @@ import {
 
 export type ItemType = ManifestItemType;
 
-const ALL_ITEM_TYPES: ItemType[] = ['content', 'scorm', 'video', 'exam'];
+/** content/scorm/video/exam (v1) + course_plan/course_intro/module_intro (rulesVersion 2). */
+const ALL_ITEM_TYPES: readonly ItemType[] = ALL_MANIFEST_ITEM_TYPES;
 export const MIN_LEASE_SECONDS = 15;
 export const MAX_LEASE_SECONDS = 3600;
 export const DEFAULT_LEASE_SECONDS = 120;
@@ -42,8 +44,12 @@ const MAX_EXECUTOR_ID_LENGTH = 200;
  * el candidato se elige entre TODOS los runs elegibles en una sola consulta.
  */
 const GLOBAL_CLAIM_RACE_RETRIES = 50;
-/** Tipos que puede reclamar el camino navegador (ownerId); video solo el worker. */
-export const BROWSER_CLAIMABLE_TYPES: ItemType[] = ['content', 'scorm', 'exam'];
+/**
+ * Tipos que puede reclamar el camino navegador (ownerId); video solo el worker.
+ * rulesVersion 2 (spec v2 §3): course_plan, course_intro y module_intro son
+ * items LLM del ejecutor del navegador, igual que content/scorm/exam.
+ */
+export const BROWSER_CLAIMABLE_TYPES: ItemType[] = ['content', 'scorm', 'exam', 'course_plan', 'course_intro', 'module_intro'];
 
 /**
  * Predicado de "item reclamable" (spec §3.4, condición 6, R16), compartido
@@ -91,9 +97,13 @@ export interface ClaimedItem {
   blueprintNumber: number;
   itemKey: string;
   type: ItemType;
-  moduleId: string;
+  /** rulesVersion del Manifest del item (contrato R2: el ejecutor despacha por esto). */
+  rulesVersion: number;
+  /** null solo en items de scope course (rulesVersion 2: course_plan, course_intro). */
+  moduleId: string | null;
   chapterId: string | null;
-  moduleNumber: number;
+  /** null solo en items de scope course. */
+  moduleNumber: number | null;
   chapterNumber: number | null;
   idempotencyKey: string;
   generation: number;
@@ -103,9 +113,13 @@ export interface ClaimedItem {
   context: { courseContext: Record<string, any>; contextHash: string };
   blueprint: {
     course: { id: number; title: string };
-    module: { id: string; title: string; objective: string | null; position: number };
+    /** null solo en items de scope course (rulesVersion 2). */
+    module: { id: string; title: string; objective: string | null; position: number } | null;
     chapter: { id: string; title: string; objective: string | null; position: number; videoEnabled: boolean } | null;
-    /** Capítulos del módulo del item, en orden del Manifest (para exam: exactamente los que evalúa). */
+    /**
+     * Capítulos del módulo del item, en orden del Manifest (para exam:
+     * exactamente los que evalúa). Vacío en items de scope course.
+     */
     moduleChapters: Array<{ id: string; title: string; objective: string | null; chapterNumber: number }>;
     /**
      * R18: outline del curso COMPLETO (todos los módulos, en orden del
@@ -119,7 +133,13 @@ export interface ClaimedItem {
       moduleNumber: number;
       id: string;
       title: string;
-      chapters: Array<{ chapterNumber: number; id: string; title: string }>;
+      /**
+       * Objetivo del snapshot congelado (null si no tiene). Contrato R2 punto
+       * 5: el plan de conceptos y el Context Package lo usan; los prompts v1
+       * no lo leen (sin cambio de comportamiento en v1).
+       */
+      objective: string | null;
+      chapters: Array<{ chapterNumber: number; id: string; title: string; objective: string | null }>;
     }>;
   };
   dependencyArtifacts: Array<{ itemKey: string; artifactId: string; type: string; storagePath: string }>;
@@ -725,6 +745,8 @@ export class SchedulerService {
   }
 
   private checkTypes(types: ItemType[]): ItemType[] {
+    // Tipos de v1 y v2 se aceptan siempre: un tipo que no existe en el
+    // Manifest del run simplemente no matchea ningún item.
     if (!Array.isArray(types) || types.length === 0 || types.some((t) => !ALL_ITEM_TYPES.includes(t))) {
       throw new BadRequestException(`types debe ser un subconjunto no vacío de ${ALL_ITEM_TYPES.join(', ')}`);
     }
@@ -794,22 +816,31 @@ export class SchedulerService {
     if (
       !mItem ||
       mItem.type !== row.type ||
-      mItem.moduleId !== row.module_id ||
+      (mItem.moduleId ?? null) !== (row.module_id ?? null) ||
       (mItem.chapterId ?? null) !== (row.chapter_id ?? null) ||
       !sameJson(mItem.dependsOn, row.depends_on ?? [])
     ) {
       throw fail('el item no coincide con su entrada del Manifest');
     }
-    const mModule = manifest.modules.find((m) => m.moduleId === row.module_id);
-    const sModule = snapshot.modules.find((m) => m.id === row.module_id);
-    if (!mModule || !sModule) throw fail('módulo ausente en Manifest/Blueprint');
-    const sChapter = row.chapter_id ? sModule.chapters.find((c) => c.id === row.chapter_id) : null;
+    // rulesVersion 2: items de scope course (course_plan, course_intro) no
+    // tienen módulo ni capítulo — module/chapter null y moduleChapters vacío.
+    // Cualquier otro item exige su módulo (como siempre).
+    const courseScope = mItem.scope === 'course';
+    if (courseScope && (row.module_id !== null || row.chapter_id !== null)) {
+      throw fail('item de scope course con module_id/chapter_id');
+    }
+    const mModule = courseScope ? null : manifest.modules.find((m) => m.moduleId === row.module_id);
+    const sModule = courseScope ? null : snapshot.modules.find((m) => m.id === row.module_id);
+    if (!courseScope && (!mModule || !sModule)) throw fail('módulo ausente en Manifest/Blueprint');
+    const sChapter = row.chapter_id && sModule ? sModule.chapters.find((c) => c.id === row.chapter_id) : null;
     if (row.chapter_id && !sChapter) throw fail('capítulo ausente en el Blueprint');
-    const moduleChapters = mModule.chapters.map((mc) => {
-      const sc = sModule.chapters.find((c) => c.id === mc.chapterId);
-      if (!sc) throw fail(`capítulo ${mc.chapterId} del Manifest ausente en el Blueprint`);
-      return { id: sc.id, title: sc.title, objective: sc.objective ?? null, chapterNumber: mc.chapterNumber };
-    });
+    const moduleChapters = !mModule
+      ? []
+      : mModule.chapters.map((mc) => {
+          const sc = sModule!.chapters.find((c) => c.id === mc.chapterId);
+          if (!sc) throw fail(`capítulo ${mc.chapterId} del Manifest ausente en el Blueprint`);
+          return { id: sc.id, title: sc.title, objective: sc.objective ?? null, chapterNumber: mc.chapterNumber };
+        });
 
     // Outline del curso completo (R18), en el mismo orden en que el Manifest
     // enumera sus módulos (manifest.modules ya está en orden de moduleNumber
@@ -822,10 +853,11 @@ export class SchedulerService {
         moduleNumber: mm.moduleNumber,
         id: sm.id,
         title: sm.title,
+        objective: sm.objective ?? null,
         chapters: mm.chapters.map((mc) => {
           const sc = sm.chapters.find((c) => c.id === mc.chapterId);
           if (!sc) throw fail(`capítulo ${mc.chapterId} del Manifest ausente en el Blueprint`);
-          return { chapterNumber: mc.chapterNumber, id: sc.id, title: sc.title };
+          return { chapterNumber: mc.chapterNumber, id: sc.id, title: sc.title, objective: sc.objective ?? null };
         }),
       };
     });
@@ -855,9 +887,10 @@ export class SchedulerService {
       blueprintNumber: bp.blueprint_number,
       itemKey: row.item_key,
       type: row.type,
-      moduleId: row.module_id,
+      rulesVersion: manifest.rulesVersion,
+      moduleId: row.module_id ?? null,
       chapterId: row.chapter_id ?? null,
-      moduleNumber: mItem.moduleNumber,
+      moduleNumber: mItem.moduleNumber ?? null,
       chapterNumber: mItem.chapterNumber ?? null,
       idempotencyKey: row.idempotency_key,
       generation: row.generation,
@@ -867,7 +900,9 @@ export class SchedulerService {
       context: { courseContext: ctx.context, contextHash: ctx.context_hash },
       blueprint: {
         course: { id: snapshot.course.id, title: snapshot.course.title },
-        module: { id: sModule.id, title: sModule.title, objective: sModule.objective ?? null, position: sModule.position },
+        module: sModule
+          ? { id: sModule.id, title: sModule.title, objective: sModule.objective ?? null, position: sModule.position }
+          : null,
         chapter: sChapter
           ? {
               id: sChapter.id,

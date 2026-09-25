@@ -10,6 +10,7 @@ import { DataSource } from 'typeorm';
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
 import { GenerationManifestsService, ManifestDto } from '../generation-manifests/generation-manifests.service';
+import { itemTypesForRulesVersion } from '../generation-manifests/generation-manifest-builder';
 import type { ManifestItemType } from '../generation-manifests/generation-manifest-builder';
 import { CostRatesService } from '../../admin/services/cost-rates.service';
 import { CourseContextDto, RUN_VIDEO_MODES, RunVideoMode } from './dto/course-context.dto';
@@ -26,7 +27,6 @@ import {
 export type ItemRunStatus = 'pending' | 'running' | 'retrying' | 'completed' | 'failed' | 'blocked' | 'cancelled';
 
 const ITEM_STATUSES: ItemRunStatus[] = ['pending', 'running', 'retrying', 'completed', 'failed', 'blocked', 'cancelled'];
-const ITEM_TYPES: ManifestItemType[] = ['content', 'scorm', 'video', 'exam'];
 /** Estados de item que un cancel (o la reconciliación de un cancel legacy) pasa a `cancelled`. */
 const NON_TERMINAL_ITEM_STATUSES = ['pending', 'running', 'retrying', 'blocked'];
 /** worker_status de un run terminado en fallo (reabrible por startRun con el mismo contexto, R10). */
@@ -59,14 +59,16 @@ export interface StatusCounts {
 export interface RunProgress extends StatusCounts {
   /** completed / total (fracción 0..1). */
   pct: number;
-  byType: Record<ManifestItemType, StatusCounts>;
+  /** Claves = tipos del rulesVersion del Manifest del run (v1: content/scorm/video/exam, igual que antes). */
+  byType: Partial<Record<ManifestItemType, StatusCounts>>;
 }
 
 export interface ItemRunDto {
   id: string;
   itemKey: string;
   type: ManifestItemType;
-  moduleId: string;
+  /** null solo en items de scope course (rulesVersion 2). */
+  moduleId: string | null;
   chapterId: string | null;
   dependsOn: string[];
   status: ItemRunStatus;
@@ -88,6 +90,8 @@ export interface RunDto {
   manifestId: number;
   blueprintId: number;
   blueprintNumber: number;
+  /** rulesVersion del Manifest congelado del run (contrato R2: el ejecutor decide los tipos a reclamar con esto). */
+  rulesVersion: number;
   status: string;
   workerStatus: string;
   /** R17: fijado al crear el run, nunca se actualiza (ni al reabrir). */
@@ -355,7 +359,7 @@ export class RunsService {
   }
 
   async getRun(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<RunDto> {
-    const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
+    const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     const job = await this.loadRunRow(courseId, manifest, runId);
     return this.buildRunDto(job, manifest);
   }
@@ -367,7 +371,7 @@ export class RunsService {
    * Idempotente sobre un run ya cancelado; 409 si el run ya está completed.
    */
   async cancelRun(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<RunDto> {
-    const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
+    const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     const job = await this.loadRunRow(courseId, manifest, runId);
 
     await this.tx(async (qr) => {
@@ -403,7 +407,7 @@ export class RunsService {
     itemKey: string,
     resubmitVideo = false,
   ): Promise<ItemRunDto> {
-    const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
+    const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     let job = await this.loadRunRow(courseId, manifest, runId);
     job = await this.reconcileCancellation(job);
     if (isCancelledLike(job)) {
@@ -559,6 +563,26 @@ export class RunsService {
   }
 
   // ── internals ────────────────────────────────────────────────────────────
+
+  /**
+   * Manifest congelado de un run (input_payload.manifestId), no el "actual"
+   * de la config: un run v1 sigue siendo legible/cancelable/reintentable
+   * aunque DYNAMIC_MANIFEST_RULES_VERSION pase a 2 (y viceversa). Ownership,
+   * `dynamic` y pertenencia al Blueprint se verifican en
+   * GenerationManifestsService.getById. Si el run no existe para este curso
+   * se cae al Manifest configurado para conservar exactamente los mismos
+   * 404/400 de antes (loadRunRow después da el 404 del run).
+   */
+  private async manifestOfRun(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<ManifestDto> {
+    const [row] = await this.dataSource.query(
+      `select input_payload->>'manifestId' as manifest_id from public.production_jobs
+        where id = $1 and execution_mode = 'dynamic_generation' and course_id = $2`,
+      [runId, courseId],
+    );
+    const manifestId = Number(row?.manifest_id);
+    if (!row || !Number.isInteger(manifestId)) return this.manifests.get(courseId, ownerId, blueprintNumber);
+    return this.manifests.getById(courseId, ownerId, blueprintNumber, manifestId);
+  }
 
   /**
    * Inserta job + contexto + items (dentro de la transacción del caller).
@@ -1024,6 +1048,7 @@ export class RunsService {
       manifestId: manifest.id,
       blueprintId: manifest.blueprintId,
       blueprintNumber: manifest.blueprintNumber,
+      rulesVersion: manifest.rulesVersion,
       status: job.status,
       workerStatus: job.worker_status,
       videoMode: this.videoModeOf(job),
@@ -1050,7 +1075,9 @@ export class RunsService {
       [jobId],
     );
     const all = emptyCounts();
-    const byType = Object.fromEntries(ITEM_TYPES.map((t) => [t, emptyCounts()])) as Record<ManifestItemType, StatusCounts>;
+    const byType = Object.fromEntries(
+      itemTypesForRulesVersion(manifest.rulesVersion).map((t) => [t, emptyCounts()]),
+    ) as Partial<Record<ManifestItemType, StatusCounts>>;
     for (const r of rows) {
       if (!ITEM_STATUSES.includes(r.status) || !byType[r.type]) {
         throw new InternalServerErrorException(`La ejecución ${jobId}: estado/tipo de item desconocido (${r.status}/${r.type})`);

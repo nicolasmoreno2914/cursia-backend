@@ -32,12 +32,38 @@ export interface QueryExecutor {
   query(sql: string, params?: any[]): Promise<any[]>;
 }
 
-const ARTIFACT_TYPES_BY_ITEM_TYPE: Record<ManifestItemType, ResolvedArtifact['type'][]> = {
+const ARTIFACT_TYPES_BY_ITEM_TYPE: Partial<Record<ManifestItemType, ResolvedArtifact['type'][]>> = {
   content: ['dynamic_content_md'],
   scorm: ['dynamic_scorm_html', 'dynamic_scorm_manifest'],
   exam: ['dynamic_exam_gift'],
   video: ['dynamic_video'],
 };
+
+/**
+ * rulesVersion 2 (spec v2 §3, contrato R2 punto 6): roles obligatorios por
+ * tipo. `content` exige además el Context Package congelado
+ * (`dynamic_context_package_json`, el ejecutor v2 siempre lo sube; es
+ * auditoría, no se empaqueta). El orden importa: el primero es el artifact
+ * principal del item.
+ *
+ * `dynamic_context_summary_json` es OPCIONAL (su ausencia = marca
+ * `contextSummary:'missing'` en output_summary): nunca se exige ni entra en
+ * la resolución (ni, por lo tanto, en la clave de reuse del .mbz).
+ */
+const ARTIFACT_TYPES_BY_ITEM_TYPE_V2: Partial<Record<ManifestItemType, ResolvedArtifact['type'][]>> = {
+  ...ARTIFACT_TYPES_BY_ITEM_TYPE,
+  content: ['dynamic_content_md', 'dynamic_context_package_json'],
+  course_plan: ['dynamic_course_plan_json'],
+  course_intro: ['dynamic_course_intro_md'],
+  module_intro: ['dynamic_module_intro_md'],
+};
+
+export const OPTIONAL_ARTIFACT_TYPES_V2 = ['dynamic_context_summary_json'] as const;
+
+/** Roles obligatorios de un tipo de item según el rulesVersion del Manifest (v1: exactamente los de 5B.1). */
+export function requiredArtifactTypes(rulesVersion: number, type: ManifestItemType): ResolvedArtifact['type'][] | undefined {
+  return (rulesVersion === 2 ? ARTIFACT_TYPES_BY_ITEM_TYPE_V2 : ARTIFACT_TYPES_BY_ITEM_TYPE)[type];
+}
 
 interface ItemRunRow {
   item_key: string;
@@ -137,7 +163,11 @@ export async function resolveRunArtifacts(
       continue;
     }
 
-    const expectedTypes = ARTIFACT_TYPES_BY_ITEM_TYPE[item.type];
+    const expectedTypes = requiredArtifactTypes(manifest.rulesVersion, item.type);
+    if (!expectedTypes) {
+      missing.push(`${item.key}:unknown_item_type=${item.type}`);
+      continue;
+    }
     const found: ResolvedArtifact[] = [];
     for (const expectedType of expectedTypes) {
       const match = itemRows.find((r) => r.artifact_type === expectedType && r.artifact_id);
