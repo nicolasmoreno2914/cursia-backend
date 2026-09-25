@@ -9,7 +9,8 @@ import { CourseBlueprintsService } from '../modules/course-blueprints/course-blu
 import { buildPackagingPlan } from '../modules/dynamic-packaging/packaging-plan';
 import { loadArtifactText, loadRunVideoDelivery, parseDynamicVideo, resolveRunArtifacts } from '../modules/dynamic-packaging/artifact-resolver';
 import type { VideoDeliveryStrategy } from '../modules/dynamic-generation/dynamic-video-delivery';
-import { sortedArtifactIds, sourceIdsHash as computeSourceIdsHash } from '../modules/dynamic-packaging/packaging-reuse-key';
+import { packageReuseHash, resolveDynamicMoodleVersion, sortedArtifactIds } from '../modules/dynamic-packaging/packaging-reuse-key';
+import { reportVideoDeliveryConfigAtStartup } from '../modules/dynamic-generation/dynamic-video-delivery';
 import { buildDynamicMbz, DYNAMIC_MBZ_BUILDER_VERSION } from '../package/dynamic-mbz-builder';
 import type { DynamicPackageContents, PackagingPlan, ResolvedArtifact } from '../modules/dynamic-packaging/packaging-types';
 
@@ -37,51 +38,45 @@ function readPositiveInt(envKey: string, fallback: number): number {
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
 }
 
-// M11 (fase5b-audit integral-review.md): buildDynamicMbz() nunca recibía
-// moodleVersion y caía siempre al default del builder (4.1, mbz-common.ts
-// resolveMoodleVersion). Se hace configurable por env var, sin cambiar el
-// default para despliegues que no la seteen.
-function resolveDynamicMoodleVersion(): string | undefined {
-  const raw = process.env.DYNAMIC_MBZ_MOODLE_VERSION;
-  return raw && raw.trim() ? raw.trim() : undefined;
+// I1 (review-it2): serialización por runId SIN fijar conexiones del pool.
+// Antes (M9) cada job tomaba una conexión dedicada con pg_advisory_lock
+// durante TODO el build; con el pool de 5 (database.module.ts extra.max) y
+// sin tope de concurrencia, 5 jobs agotaban el pool y todo lo demás (queries
+// del build, failJob, claimNext, heartbeat) moría por timeout. Ahora:
+//  - la exclusión por run se decide al RECLAMAR (claimNext): no se reclama un
+//    job si otro job dynamic_package del mismo runId está 'running' con lease
+//    vigente; la lease/heartbeat ya existente es el "lock" por run;
+//  - el claim se serializa entre workers con un advisory lock de
+//    TRANSACCIÓN (pg_advisory_xact_lock), que dura solo lo que dura el claim;
+//  - el loop tiene un tope de concurrencia validado
+//    (DYNAMIC_PACKAGE_WORKER_CONCURRENCY, default 1, máx. MAX_CONCURRENCY);
+//  - el heartbeat nunca lanza: tras HEARTBEAT_MAX_CONSECUTIVE_FAILURES fallos
+//    seguidos se trata como lease perdida.
+// Gap que sigue documentado: PackagingService.requestPackage puede crear dos
+// jobs para el mismo runId en una carrera; ahora se ejecutan uno tras otro
+// y el segundo reusa el .mbz del primero (restore-first).
+
+/** Clave fija del advisory lock (de transacción) que serializa los claims de dynamic_package entre workers. */
+const CLAIM_LOCK_KEY = 'cursia:dynamic_package:claim';
+
+export const CONCURRENCY_ENV = 'DYNAMIC_PACKAGE_WORKER_CONCURRENCY';
+/** Pool de TypeORM = 5 (database.module.ts); se dejan 2 conexiones libres para claim/heartbeat/failJob. */
+export const MAX_CONCURRENCY = 3;
+/** Heartbeats fallidos (excepción, p.ej. timeout del pool) seguidos antes de tratar la lease como perdida. */
+export const HEARTBEAT_MAX_CONSECUTIVE_FAILURES = 3;
+
+export function resolveDynamicPackageWorkerConcurrency(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = (env[CONCURRENCY_ENV] ?? '').trim();
+  if (raw === '') return 1;
+  const n = /^\d+$/.test(raw) ? Number(raw) : NaN;
+  if (!Number.isInteger(n) || n < 1 || n > MAX_CONCURRENCY) {
+    throw new Error(`${CONCURRENCY_ENV} inválido: "${raw}". Debe ser un entero entre 1 y ${MAX_CONCURRENCY} (o sin definir = 1).`);
+  }
+  return n;
 }
 
-// M9 (fase5b-audit integral-review.md): lock consultivo de Postgres por
-// runId alrededor de todo el ciclo de build de un job `dynamic_package`
-// (restore-first + build + upload + completeJob). No reemplaza el sistema de
-// lease/heartbeat (eso serializa por *job*, no por *run*) — este lock cubre
-// el caso en que `requestPackage` (sin lock propio, gap documentado abajo)
-// dejó pasar la carrera y creó dos jobs `dynamic_package` para el MISMO
-// runId: sin este lock, dos workers podrían construir el mismo .mbz en
-// paralelo (duplicando trabajo/memoria) y competir al subir a la misma
-// `sourceIdsHash` (mitigado además por `upsert:false`, ver abajo). Usa una
-// conexión dedicada (no el pool) porque los advisory locks de Postgres son
-// por-sesión: pg_advisory_lock/unlock deben correr en la misma conexión.
-//
-// Gap documentado, no cerrado en este cambio: `PackagingService.requestPackage`
-// (packaging.service.ts) sigue sin advisory lock propio, así que dos POST
-// simultáneos a …/runs/:runId/package todavía pueden crear dos jobs para el
-// mismo runId (I2/I3 ya aceptan eso como posible); este lock en el worker
-// evita que ambos *construyan* en paralelo, pero no evita que ambos jobs
-// existan. Tampoco hay cap de concurrencia global del worker (N jobs de
-// runs distintos sí corren en paralelo sin límite) — eso requiere una
-// decisión de producto/ops sobre paralelismo objetivo (ver audit item 5-M9).
-async function withRunPackagingLock<T>(dataSource: DataSource, runId: string, fn: () => Promise<T>): Promise<T> {
-  const queryRunner = dataSource.createQueryRunner();
-  await queryRunner.connect();
-  try {
-    // hashtext() es determinístico e independiente del formato del uuid;
-    // pg_advisory_lock toma un solo bigint (usamos hashtextextended con seed
-    // fijo para reducir colisiones vs. un solo hashtext de 32 bits).
-    await queryRunner.query('select pg_advisory_lock(hashtextextended($1, 0))', [runId]);
-    try {
-      return await fn();
-    } finally {
-      await queryRunner.query('select pg_advisory_unlock(hashtextextended($1, 0))', [runId]);
-    }
-  } finally {
-    await queryRunner.release();
-  }
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 export interface DynamicPackageWorkerDeps {
@@ -123,13 +118,18 @@ async function findExistingDynamicMbz(
   courseId: string,
   runId: string,
   sourceIdsHash: string,
+  moodleVersion: string,
 ): Promise<{ id: string } | null> {
   const list = await artifacts.findAll(ownerId, { courseId, type: 'dynamic_mbz' });
   const match = list.find((a) => {
     const meta = a.metadata as Record<string, any> | null;
+    // I3: la clave ya incluye la versión (salvo el default, byte-idéntico);
+    // además se exige que la versión registrada coincida — sin campo (.mbz
+    // anteriores a M11) = 4.1, el default del builder.
     return meta?.runId === runId
       && meta?.sourceIdsHash === sourceIdsHash
-      && meta?.builderVersion === DYNAMIC_MBZ_BUILDER_VERSION;
+      && meta?.builderVersion === DYNAMIC_MBZ_BUILDER_VERSION
+      && (meta?.moodleVersion ?? '4.1') === moodleVersion;
   });
   return match ? { id: match.id } : null;
 }
@@ -231,96 +231,122 @@ async function loadContentsForPlan(
 export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJobRow): Promise<void> {
   const { logger } = deps;
   let leaseLost = false;
+  let heartbeatInFlight = false;
+  let heartbeatFailures = 0;
+  // I1: el heartbeat NUNCA lanza (antes, un timeout del pool era una unhandled
+  // rejection que tumbaba el proceso en Node ≥15). Un fallo aislado se tolera;
+  // HEARTBEAT_MAX_CONSECUTIVE_FAILURES seguidos = lease perdida (otro worker
+  // la re-reclamará al vencer). Sin solapar heartbeats si uno se cuelga.
   const heartbeatTimer = setInterval(() => {
+    if (heartbeatInFlight || leaseLost) return;
+    heartbeatInFlight = true;
     void (async () => {
-      const ok = await heartbeatJob(deps.dataSource, job.id, deps.workerId, deps.leaseSeconds);
-      if (!ok) {
-        leaseLost = true;
-        logger.warn(`Job ${job.id}: heartbeat rechazado — lease perdida, abortando`);
+      try {
+        const ok = await heartbeatJob(deps.dataSource, job.id, deps.workerId, deps.leaseSeconds);
+        heartbeatFailures = 0;
+        if (!ok) {
+          leaseLost = true;
+          logger.warn(`Job ${job.id}: heartbeat rechazado — lease perdida, abortando`);
+        }
+      } catch (err) {
+        heartbeatFailures++;
+        if (heartbeatFailures >= HEARTBEAT_MAX_CONSECUTIVE_FAILURES) {
+          leaseLost = true;
+          logger.error(
+            `Job ${job.id}: heartbeat falló ${heartbeatFailures} veces seguidas (${errMessage(err)}) — se trata como lease perdida, abortando`,
+          );
+        } else {
+          logger.warn(`Job ${job.id}: heartbeat falló (${heartbeatFailures}/${HEARTBEAT_MAX_CONSECUTIVE_FAILURES}): ${errMessage(err)}`);
+        }
+      } finally {
+        heartbeatInFlight = false;
       }
     })();
   }, deps.heartbeatMs);
 
   try {
+    // I3: versión de Moodle validada ANTES de cualquier trabajo — un valor
+    // desconocido falla este job ruidoso (nunca un .mbz 4.1 mal etiquetado).
+    const moodle = resolveDynamicMoodleVersion();
     const { runId, manifestId, blueprintNumber } = job.input_payload;
     const manifest: ManifestDto = await deps.manifests.get(job.course_id, job.owner_id, blueprintNumber);
     if (manifest.id !== manifestId) {
       throw new Error(`el Manifest actual del Blueprint v${blueprintNumber} (#${manifest.id}) no coincide con el del job (#${manifestId})`);
     }
 
-    await withRunPackagingLock(deps.dataSource, runId, async () => {
-      const byItem = await deps.resolveArtifacts({ query: deps.dataSource.query.bind(deps.dataSource) }, runId, manifest.manifest);
-      const ids = sortedArtifactIds(byItem);
-      const sourceIdsHash = computeSourceIdsHash(DYNAMIC_MBZ_BUILDER_VERSION, ids);
-      if (leaseLost) return;
+    const byItem = await deps.resolveArtifacts({ query: deps.dataSource.query.bind(deps.dataSource) }, runId, manifest.manifest);
+    const ids = sortedArtifactIds(byItem);
+    const sourceIdsHash = packageReuseHash(DYNAMIC_MBZ_BUILDER_VERSION, ids, moodle.resolved);
+    if (leaseLost) return;
 
-      // Restore-first: mismo runId + mismo set de artifacts de origen -> reusar.
-      const existing = await findExistingDynamicMbz(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash);
-      if (existing) {
-        logger.log(`Job ${job.id}: dynamic_mbz ya existe (${existing.id}) para runId=${runId} — reutilizando sin reconstruir`);
-        const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
-          artifactId: existing.id,
-          sourceArtifactIds: ids,
-          sourceIdsHash,
-          builderVersion: DYNAMIC_MBZ_BUILDER_VERSION,
-          reused: true,
-        });
-        if (!ok) logger.warn(`Job ${job.id}: completeJob devolvió false (lease perdida) tras reutilizar ${existing.id}`);
-        return;
-      }
-      if (leaseLost) return;
-
-      const blueprint = await deps.blueprints.getByNumber(job.course_id, job.owner_id, blueprintNumber);
-      const plan = deps.buildPlan(manifest.manifest, blueprint.snapshot, { manifestId: manifest.id });
-      if (leaseLost) return;
-
-      const videoDelivery = await loadRunVideoDelivery({ query: deps.dataSource.query.bind(deps.dataSource) }, runId);
-      const contents = await loadContentsForPlan(deps, job.owner_id, plan, byItem, videoDelivery);
-      if (leaseLost) return;
-
-      const moodleVersion = resolveDynamicMoodleVersion();
-      const buffer = await deps.buildMbz({ plan, contents, moodleVersion });
-      if (leaseLost) return;
-
-      const storagePath = `${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${sourceIdsHash}.mbz`;
-      const artifact = await deps.artifacts.uploadBufferArtifact({
-        ownerId: job.owner_id,
-        courseId: artifactCourseId(job),
-        jobId: job.id,
-        type: 'dynamic_mbz',
-        filename: `${sourceIdsHash}.mbz`,
-        storagePath,
-        buffer,
-        mimeType: 'application/vnd.moodle.backup',
-        // M9: el path incluye sourceIdsHash (contenido) -> es inmutable por
-        // construcción; upsert:false evita pisar un objeto existente en una
-        // carrera entre dos workers para el mismo runId (mitigado también
-        // por el advisory lock, pero esto es la defensa a nivel storage).
-        upsert: false,
-        metadata: {
-          runId,
-          manifestId: manifest.id,
-          sourceArtifactIds: ids,
-          sourceIdsHash,
-          builderVersion: DYNAMIC_MBZ_BUILDER_VERSION,
-          moodleVersion: moodleVersion ?? '4.1',
-        },
-      });
-      if (leaseLost) return;
-
+    // Restore-first: mismo runId + mismo set de artifacts de origen + misma versión -> reusar.
+    const existing = await findExistingDynamicMbz(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash, moodle.resolved);
+    if (existing) {
+      logger.log(`Job ${job.id}: dynamic_mbz ya existe (${existing.id}) para runId=${runId} — reutilizando sin reconstruir`);
       const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
-        artifactId: artifact.id,
+        artifactId: existing.id,
         sourceArtifactIds: ids,
         sourceIdsHash,
         builderVersion: DYNAMIC_MBZ_BUILDER_VERSION,
-        reused: false,
+        reused: true,
       });
-      if (!ok) {
-        logger.warn(`Job ${job.id}: el .mbz se generó y el artifact ${artifact.id} se subió, pero completeJob devolvió false (lease perdida)`);
-      }
+      if (!ok) logger.warn(`Job ${job.id}: completeJob devolvió false (lease perdida) tras reutilizar ${existing.id}`);
+      return;
+    }
+    if (leaseLost) return;
+
+    const blueprint = await deps.blueprints.getByNumber(job.course_id, job.owner_id, blueprintNumber);
+    const plan = deps.buildPlan(manifest.manifest, blueprint.snapshot, { manifestId: manifest.id });
+    if (leaseLost) return;
+
+    const videoDelivery = await loadRunVideoDelivery({ query: deps.dataSource.query.bind(deps.dataSource) }, runId);
+    const contents = await loadContentsForPlan(deps, job.owner_id, plan, byItem, videoDelivery);
+    if (leaseLost) return;
+
+    // Sin env se pasa undefined (el builder aplica su default: mismo .mbz que antes).
+    const buffer = await deps.buildMbz({ plan, contents, moodleVersion: moodle.requested });
+    if (leaseLost) return;
+
+    const storagePath = `${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${sourceIdsHash}.mbz`;
+    const artifact = await deps.artifacts.uploadBufferArtifact({
+      ownerId: job.owner_id,
+      courseId: artifactCourseId(job),
+      jobId: job.id,
+      type: 'dynamic_mbz',
+      filename: `${sourceIdsHash}.mbz`,
+      storagePath,
+      buffer,
+      mimeType: 'application/vnd.moodle.backup',
+      // M9: el path incluye la clave de reuse (contenido) -> inmutable por
+      // construcción; upsert:false nunca pisa un objeto existente.
+      upsert: false,
+      // I2 (review-it2): si un intento previo subió el objeto y murió antes de
+      // insertar el row, el reintento adopta el objeto verificado en vez de
+      // fallar para siempre con "already exists".
+      adoptExistingOnConflict: true,
+      metadata: {
+        runId,
+        manifestId: manifest.id,
+        sourceArtifactIds: ids,
+        sourceIdsHash,
+        builderVersion: DYNAMIC_MBZ_BUILDER_VERSION,
+        moodleVersion: moodle.resolved,
+      },
     });
+    if (leaseLost) return;
+
+    const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
+      artifactId: artifact.id,
+      sourceArtifactIds: ids,
+      sourceIdsHash,
+      builderVersion: DYNAMIC_MBZ_BUILDER_VERSION,
+      reused: false,
+    });
+    if (!ok) {
+      logger.warn(`Job ${job.id}: el .mbz se generó y el artifact ${artifact.id} se subió, pero completeJob devolvió false (lease perdida)`);
+    }
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = errMessage(err);
     if (leaseLost) {
       logger.warn(`Job ${job.id}: terminó tras perder la lease — ${message}`);
       return;
@@ -332,50 +358,144 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
   }
 }
 
-/** Exportado (además de usarse en `bootstrap`) para poder probarlo directo desde tests/harnesses. */
-export async function claimNext(dataSource: DataSource, workerId: string, leaseSeconds: number): Promise<PackageJobRow | null> {
+/**
+ * Reclama el próximo job `dynamic_package`. Exportado (además de usarse en
+ * `bootstrap`) para poder probarlo directo desde tests/harnesses.
+ *
+ * I1: nunca reclama un job si OTRO job dynamic_package del mismo runId está
+ * 'running' con lease vigente (exclusión por run sin fijar conexiones). El
+ * claim entero corre bajo un advisory lock de transacción para que dos
+ * workers no reclamen a la vez dos jobs del mismo run (la subconsulta sola no
+ * alcanza en READ COMMITTED).
+ *
+ * M7: si la query falla, un fallo del rollback/release se loguea aparte y se
+ * propaga el error ORIGINAL (nunca lo enmascara la limpieza).
+ */
+export async function claimNext(
+  dataSource: DataSource,
+  workerId: string,
+  leaseSeconds: number,
+  logger: Pick<Logger, 'warn'> = new Logger('DynamicPackageWorker'),
+): Promise<PackageJobRow | null> {
   const queryRunner = dataSource.createQueryRunner();
   await queryRunner.connect();
-  await queryRunner.startTransaction();
+  let claimedId: string | null = null;
   try {
-    // También reclama jobs 'running' cuya lease venció (crash o reload del
-    // worker, I3 integral-review) — mismo patrón de lease/heartbeat que
-    // 'queued'/'retrying'; el heartbeat del worker original (si sigue vivo)
-    // fallará porque worker_id ya no coincide tras este UPDATE.
-    const candidates = await queryRunner.query(
-      `select id from public.production_jobs
-        where execution_mode = 'dynamic_package'
-          and worker_status in ('queued', 'retrying', 'running')
-          and (next_retry_at is null or next_retry_at <= now())
-          and (lease_until is null or lease_until < now())
-        order by created_at asc limit 1 for update skip locked`,
-    );
-    if (!Array.isArray(candidates) || candidates.length === 0) {
+    try {
+      await queryRunner.startTransaction();
+      await queryRunner.query('select pg_advisory_xact_lock(hashtextextended($1, 0))', [CLAIM_LOCK_KEY]);
+      // También reclama jobs 'running' cuya lease venció (crash o reload del
+      // worker, I3 integral-review) — mismo patrón de lease/heartbeat que
+      // 'queued'/'retrying'; el heartbeat del worker original (si sigue vivo)
+      // fallará porque worker_id ya no coincide tras este UPDATE.
+      const candidates = await queryRunner.query(
+        `select j.id from public.production_jobs j
+          where j.execution_mode = 'dynamic_package'
+            and j.worker_status in ('queued', 'retrying', 'running')
+            and (j.next_retry_at is null or j.next_retry_at <= now())
+            and (j.lease_until is null or j.lease_until < now())
+            and not exists (
+              select 1 from public.production_jobs p2
+               where p2.execution_mode = 'dynamic_package'
+                 and p2.worker_status = 'running'
+                 and p2.lease_until > now()
+                 and p2.id <> j.id
+                 and p2.input_payload->>'runId' = j.input_payload->>'runId'
+            )
+          order by j.created_at asc limit 1 for update of j skip locked`,
+      );
+      if (Array.isArray(candidates) && candidates.length > 0) {
+        claimedId = candidates[0].id;
+        await queryRunner.query(
+          `update public.production_jobs
+              set worker_status = 'running', status = 'running', current_step = 'package',
+                  worker_id = $1, lease_until = now() + ($2 * interval '1 second'),
+                  attempt_count = coalesce(attempt_count, 0) + 1, started_at = coalesce(started_at, now()), updated_at = now()
+            where id = $3`,
+          [workerId, leaseSeconds, claimedId],
+        );
+      }
       await queryRunner.commitTransaction();
-      return null;
+    } catch (error) {
+      try {
+        if (queryRunner.isTransactionActive !== false) await queryRunner.rollbackTransaction();
+      } catch (rollbackError) {
+        logger.warn(`claimNext: rollback falló tras un error (se propaga el original): ${errMessage(rollbackError)}`);
+      }
+      throw error;
     }
-    const jobId = candidates[0].id;
-    await queryRunner.query(
-      `update public.production_jobs
-          set worker_status = 'running', status = 'running', current_step = 'package',
-              worker_id = $1, lease_until = now() + ($2 * interval '1 second'),
-              attempt_count = coalesce(attempt_count, 0) + 1, started_at = coalesce(started_at, now()), updated_at = now()
-        where id = $3`,
-      [workerId, leaseSeconds, jobId],
-    );
-    await queryRunner.commitTransaction();
-    const [row] = await dataSource.query(`select * from public.production_jobs where id = $1`, [jobId]);
-    return row as PackageJobRow;
-  } catch (error) {
-    await queryRunner.rollbackTransaction();
-    throw error;
   } finally {
-    await queryRunner.release();
+    try {
+      await queryRunner.release();
+    } catch (releaseError) {
+      logger.warn(`claimNext: release del queryRunner falló: ${errMessage(releaseError)}`);
+    }
   }
+  if (!claimedId) return null;
+  const [row] = await dataSource.query(`select * from public.production_jobs where id = $1`, [claimedId]);
+  return row as PackageJobRow;
+}
+
+export interface PackageWorkerLoopOptions {
+  concurrency: number;
+  pollMs: number;
+  /** Espera tras un error de claim (p.ej. timeout del pool) antes de reintentar. */
+  claimErrorBackoffMs?: number;
+  isStopping: () => boolean;
+  /** Set de jobs activos (compartido con el handler de shutdown). */
+  activeJobs?: Set<Promise<void>>;
+}
+
+/**
+ * Loop del worker con tope de concurrencia (I1). Un error de claim (pool
+ * agotado, DB caída) se loguea y se reintenta con backoff — nunca sale del
+ * loop ni tumba el proceso. Al detenerse espera a los jobs activos.
+ * Exportado para harnesses.
+ */
+export async function runPackageWorkerLoop(deps: DynamicPackageWorkerDeps, opts: PackageWorkerLoopOptions): Promise<void> {
+  const { logger } = deps;
+  const active = opts.activeJobs ?? new Set<Promise<void>>();
+  const backoffMs = opts.claimErrorBackoffMs ?? Math.max(opts.pollMs, 1000);
+  while (!opts.isStopping()) {
+    let waitMs = opts.pollMs;
+    while (!opts.isStopping() && active.size < opts.concurrency) {
+      let job: PackageJobRow | null;
+      try {
+        job = await claimNext(deps.dataSource, deps.workerId, deps.leaseSeconds, logger);
+      } catch (err) {
+        logger.error(`claimNext falló (reintento en ${backoffMs}ms): ${errMessage(err)}`);
+        waitMs = backoffMs;
+        break;
+      }
+      if (!job) break;
+      logger.log(`Job reclamado: ${job.id} (run ${job.input_payload?.runId})`);
+      const claimed = job;
+      const promise: Promise<void> = processItem(deps, claimed)
+        .catch((err) => logger.error(`Error no manejado en job ${claimed.id}: ${errMessage(err)}`))
+        .finally(() => { active.delete(promise); });
+      active.add(promise);
+    }
+    if (opts.isStopping()) break;
+    // Despierta antes si termina un job (hay cupo para reclamar otro).
+    await Promise.race([sleep(waitMs), ...Array.from(active)]);
+  }
+  await Promise.allSettled(Array.from(active));
 }
 
 async function bootstrap() {
   const logger = new Logger('DynamicPackageWorker');
+  // Config propia de este worker: inválida → no arranca (no afecta a otros procesos).
+  const concurrency = resolveDynamicPackageWorkerConcurrency();
+  // I3: una versión de Moodle inválida no detiene el worker (los jobs fallan
+  // ruidosos, uno por uno, con el mensaje de config) pero se avisa ya.
+  try {
+    resolveDynamicMoodleVersion();
+  } catch (err) {
+    logger.error(`${errMessage(err)} Todos los jobs dynamic_package van a fallar hasta corregirlo.`);
+  }
+  // M6: DYNAMIC_VIDEO_DELIVERY inválido → error claro en el log de arranque.
+  reportVideoDeliveryConfigAtStartup(logger);
+
   const app = await NestFactory.createApplicationContext(AppModule, { logger: ['log', 'warn', 'error'] });
 
   const deps: DynamicPackageWorkerDeps = {
@@ -409,21 +529,11 @@ async function bootstrap() {
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
-  logger.log(`dynamic-package-worker iniciado (workerId=${deps.workerId}, pollMs=${pollMs}, leaseSeconds=${deps.leaseSeconds})`);
+  logger.log(
+    `dynamic-package-worker iniciado (workerId=${deps.workerId}, pollMs=${pollMs}, leaseSeconds=${deps.leaseSeconds}, concurrency=${concurrency})`,
+  );
 
-  while (!shuttingDown) {
-    const job = await claimNext(deps.dataSource, deps.workerId, deps.leaseSeconds);
-    if (!job) {
-      await sleep(pollMs);
-      continue;
-    }
-    logger.log(`Job reclamado: ${job.id} (run ${job.input_payload?.runId})`);
-    const promise = processItem(deps, job)
-      .catch((err) => logger.error(`Error no manejado en job ${job.id}: ${err instanceof Error ? err.message : String(err)}`))
-      .finally(() => { activeJobs.delete(promise); });
-    activeJobs.add(promise);
-    await sleep(500);
-  }
+  await runPackageWorkerLoop(deps, { concurrency, pollMs, isStopping: () => shuttingDown, activeJobs });
 }
 
 if (require.main === module) {
