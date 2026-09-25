@@ -101,7 +101,12 @@ jobs:
                  exit 1
                fi
 
-               if grep -q "^NODE_ENV=production" .env; then echo "✓ NODE_ENV=production en el .env de staging"; else echo "⚠️ El .env de staging NO tiene NODE_ENV=production — TypeORM synchronize estaría activo en staging"; fi
+               if grep -q "^NODE_ENV=production" .env; then
+                 echo "✓ NODE_ENV=production en el .env de staging"
+               else
+                 echo "✗ El .env de staging NO tiene NODE_ENV=production — TypeORM synchronize quedaría activo y borraría columnas (I5, Fase 5A)."
+                 exit 1
+               fi
 
                ensure_pm2_process() {
                  local name="$1"
@@ -146,6 +151,15 @@ jobs:
                echo "━━━ [4g] Generation Manifests: auditoría (solo lectura, staging) ━━━"
                MIGRATION_ENV=staging node scripts/audit-generation-manifests.js
 
+               echo "━━━ [4h] Dynamic Generation: migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-dynamic-generation.js
+
+               echo "━━━ [4i] Dynamic Generation: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-dynamic-generation-schema.js
+
+               echo "━━━ [4j] Dynamic Generation: auditoría (solo lectura, staging) ━━━"
+               MIGRATION_ENV=staging node scripts/audit-dynamic-generation.js
+
                echo "━━━ [5/6] Migrar usage_events y cost_rates (staging) ━━━"
                node scripts/migrate-usage-events-costs.js
 
@@ -158,6 +172,7 @@ jobs:
                ensure_pm2_process cursia-gamma-worker-staging start:gamma-worker
                ensure_pm2_process cursia-package-worker-staging start:package-worker
                ensure_pm2_process cursia-full-worker-staging start:full-worker
+               ensure_pm2_process cursia-dynamic-item-worker-staging start:dynamic-item-worker
                sudo pm2 save
                sudo pm2 status
 

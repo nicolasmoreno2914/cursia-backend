@@ -21,6 +21,7 @@ import { CourseSetupModule } from './modules/course-setup/course-setup.module';
 import { CourseStructureModule } from './modules/course-structure/course-structure.module';
 import { CourseBlueprintsModule } from './modules/course-blueprints/course-blueprints.module';
 import { GenerationManifestsModule } from './modules/generation-manifests/generation-manifests.module';
+import { DynamicGenerationModule } from './modules/dynamic-generation/dynamic-generation.module';
 
 @Module({
   imports: [
@@ -47,6 +48,7 @@ import { GenerationManifestsModule } from './modules/generation-manifests/genera
     CourseStructureModule,
     CourseBlueprintsModule,
     GenerationManifestsModule,
+    DynamicGenerationModule,
   ],
   controllers: [AppController],
   providers: [AppService],

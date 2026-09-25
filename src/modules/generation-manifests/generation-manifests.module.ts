@@ -14,5 +14,6 @@ import { AuthModule } from '../../auth/auth.module';
   ],
   controllers: [GenerationManifestsController],
   providers: [GenerationManifestsService],
+  exports: [GenerationManifestsService],
 })
 export class GenerationManifestsModule {}

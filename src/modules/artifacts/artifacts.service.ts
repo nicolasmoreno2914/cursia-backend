@@ -17,6 +17,8 @@ export interface UploadJsonArtifactInput {
   metadata?: Record<string, any>;
   storageBucket?: string;
   storageProvider?: string;
+  /** I1: false para paths inmutables por-intento (nunca sobreescribir). Default true (comportamiento legacy). */
+  upsert?: boolean;
 }
 
 export interface UploadBufferArtifactInput {
@@ -88,7 +90,7 @@ export class ArtifactsService {
       headers: {
         Authorization: `Bearer ${serviceKey}`,
         'Content-Type': input.mimeType ?? 'application/json',
-        'x-upsert': 'true',
+        'x-upsert': input.upsert === false ? 'false' : 'true',
       },
       body,
     });
