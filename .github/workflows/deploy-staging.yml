@@ -176,6 +176,14 @@ jobs:
                sudo pm2 save
                sudo pm2 status
 
+               echo "━━━ [6b] Fase 5A: preflight (solo lectura, staging) ━━━"
+               MIGRATION_ENV=staging node scripts/preflight-dynamic-generation.js
+
+               echo "━━━ [6c] Estabilidad PM2 staging (ventana de 45 s) ━━━"
+               PM2_BEFORE=$(sudo pm2 jlist | node scripts/pm2-staging-stability.js snapshot)
+               sleep 45
+               sudo pm2 jlist | node scripts/pm2-staging-stability.js compare "$PM2_BEFORE"
+
                echo "✅ Deploy a staging completado."'
 
       - name: Health check post-deploy
