@@ -78,6 +78,20 @@ export function tokenJaccard(a: string, b: string): number {
   return jaccard(tokenSet(a), tokenSet(b));
 }
 
+/**
+ * Coeficiente de contención (overlap): |A∩B| / min(|A|,|B|) sobre tokens
+ * normalizados. 0 si alguno de los dos no tiene tokens.
+ */
+export function tokenContainment(a: string, b: string): number {
+  const sa = tokenSet(a);
+  const sb = tokenSet(b);
+  const min = Math.min(sa.size, sb.size);
+  if (min === 0) return 0;
+  let inter = 0;
+  for (const x of sa) if (sb.has(x)) inter += 1;
+  return inter / min;
+}
+
 /** Trigramas de caracteres del texto normalizado, con un espacio de borde. */
 export function trigrams(s: string): Set<string> {
   const n = norm(s);

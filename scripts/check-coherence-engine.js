@@ -175,13 +175,38 @@ check('norm: minúsculas, sin acentos/puntuación, sin stopwords, plurales', () 
   assert(normalize.tokenJaccard('', '') === 0, 'vacíos = 0');
 });
 
-check('INFO: ejemplo del brief "Tipos de bombas" vs "Tipos y características de bombas" (solo se informa)', () => {
-  const a = 'Tipos de bombas';
-  const b = 'Tipos y características de bombas';
-  console.log(
-    `   token=${normalize.round4(normalize.tokenJaccard(a, b))} trigram=${normalize.round4(normalize.trigramJaccard(a, b))} ` +
-      `(umbrales S1: token≥${COHERENCE_THRESHOLDS.S1_TOKEN_JACCARD_MIN} o trigram≥${COHERENCE_THRESHOLDS.S1_TRIGRAM_JACCARD_MIN})`,
-  );
+check('S1 (contención): ejemplo de la spec "Tipos de bombas" vs "Tipos y características de bombas" SE detecta', () => {
+  const spec = cleanSpec();
+  spec[1].chapters[0].title = 'Tipos de bombas';
+  spec[1].chapters[1].title = 'Tipos y características de bombas';
+  spec[1].chapters[1].objective = 'Seleccionar una bomba centrífuga usando su curva característica';
+  const r = report({ spec, layers: { structural: true, content: false } });
+  assertDeepEqual(rulesFired(r), ['S1'], 'reglas');
+  const f = byRule(r, 'S1')[0];
+  assertDeepEqual(f.evidence.chapterIds, [C3, C4], 'evidencia chapterIds');
+  assert(f.evidence.tokenJaccard < COHERENCE_THRESHOLDS.S1_TOKEN_JACCARD_MIN, 'no entra por tokens');
+  assert(f.evidence.trigramJaccard < COHERENCE_THRESHOLDS.S1_TRIGRAM_JACCARD_MIN, 'no entra por trigramas');
+  assert(f.evidence.tokenContainment === 1, `contención esperada 1, fue ${f.evidence.tokenContainment}`);
+});
+
+check('S1 (negativo): "Tipos de bombas" vs "Mantenimiento de bombas" NO es casi duplicado', () => {
+  assert(normalize.tokenContainment('Tipos de bombas', 'Mantenimiento de bombas') === 0.5, 'contención 0.5');
+  const spec = cleanSpec();
+  spec[1].chapters[0].title = 'Tipos de bombas';
+  spec[1].chapters[1].title = 'Mantenimiento de bombas';
+  spec[1].chapters[1].objective = 'Seleccionar una bomba centrífuga usando su curva característica';
+  const r = report({ spec, layers: { structural: true, content: false } });
+  assertDeepEqual(rulesFired(r), [], 'reglas');
+});
+
+check('S1 (contención): exige min(|A|,|B|) ≥ 2 tokens', () => {
+  assert(normalize.tokenContainment('Bombas', 'Bombas de agua') === 1, 'contención 1');
+  const spec = cleanSpec();
+  spec[1].chapters[0].title = 'Bombas';
+  spec[1].chapters[1].title = 'Bombas de agua potable industrial';
+  spec[1].chapters[1].objective = 'Seleccionar una bomba centrífuga usando su curva característica';
+  const r = report({ spec, layers: { structural: true, content: false } });
+  assertDeepEqual(rulesFired(r), [], 'un título de 1 token no dispara por contención');
 });
 
 // ---------------------------------------------------------------------------

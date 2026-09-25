@@ -14,6 +14,9 @@ export const COHERENCE_THRESHOLDS = Object.freeze({
   S1_TRIGRAM_JACCARD_MIN: 0.6,
   /** …o token-Jaccard ≥ esto. */
   S1_TOKEN_JACCARD_MIN: 0.75,
+  /** …o contención de tokens |A∩B|/min(|A|,|B|) ≥ esto, si min(|A|,|B|) ≥ S1_CONTAINMENT_MIN_TOKENS. */
+  S1_TOKEN_CONTAINMENT_MIN: 0.8,
+  S1_CONTAINMENT_MIN_TOKENS: 2,
   /** S2: fracción de tokens del objetivo del módulo cubiertos por títulos/objetivos de sus capítulos. */
   S2_MIN_OBJECTIVE_COVERAGE: 0.3,
   /** C4: fracción de tokens del objetivo del capítulo cubiertos por sus concepts_introduced reales. */

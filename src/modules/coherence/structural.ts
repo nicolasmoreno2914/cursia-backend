@@ -1,7 +1,7 @@
 import type { BlueprintSnapshotV1 } from '../course-blueprints/blueprint-snapshot';
 import { cmpStr } from './canonical-json';
 import { COHERENCE_THRESHOLDS as T, CoherenceFindingDraft, buildOutline } from './coherence-types';
-import { normTokens, round4, tokenJaccard, trigramJaccard } from './normalize';
+import { normTokens, round4, tokenContainment, tokenJaccard, tokenSet, trigramJaccard } from './normalize';
 
 /**
  * Fase 7 — capa estructural (pre-generación). Función pura sobre el
@@ -20,7 +20,10 @@ export function runStructuralRules(bp: BlueprintSnapshotV1): CoherenceFindingDra
       const b = chs[j];
       const tri = trigramJaccard(a.title, b.title);
       const tok = tokenJaccard(a.title, b.title);
-      if (tri >= T.S1_TRIGRAM_JACCARD_MIN || tok >= T.S1_TOKEN_JACCARD_MIN) {
+      const cont = tokenContainment(a.title, b.title);
+      const minTokens = Math.min(tokenSet(a.title).size, tokenSet(b.title).size);
+      const byContainment = minTokens >= T.S1_CONTAINMENT_MIN_TOKENS && cont >= T.S1_TOKEN_CONTAINMENT_MIN;
+      if (tri >= T.S1_TRIGRAM_JACCARD_MIN || tok >= T.S1_TOKEN_JACCARD_MIN || byContainment) {
         out.push({
           rule: 'S1',
           severity: 'warning',
@@ -31,6 +34,7 @@ export function runStructuralRules(bp: BlueprintSnapshotV1): CoherenceFindingDra
             titles: [a.title, b.title],
             trigramJaccard: round4(tri),
             tokenJaccard: round4(tok),
+            tokenContainment: round4(cont),
           },
           message: `Los capítulos "${a.title}" y "${b.title}" tienen títulos casi duplicados.`,
           suggestion: 'Diferenciá los títulos o fusioná los capítulos si cubren lo mismo.',
