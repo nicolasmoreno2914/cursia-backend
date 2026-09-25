@@ -3,6 +3,7 @@ import { CourseBlueprintsController } from '../course-blueprints/course-blueprin
 import { GenerationManifestsController } from '../generation-manifests/generation-manifests.controller';
 import { RunsController } from '../dynamic-generation/runs.controller';
 import { ExecutorController } from '../dynamic-generation/executor.controller';
+import { DynamicYoutubeController } from '../dynamic-generation/dynamic-youtube.controller';
 import { PackagingController } from '../dynamic-packaging/packaging.controller';
 import { CoursesController } from '../courses/courses.controller';
 import { CoherenceController } from '../coherence/coherence.controller';
@@ -28,6 +29,7 @@ export const DYNAMIC_CONTROLLERS: ReadonlySet<Function> = new Set<Function>([
   PackagingController,
   CoherenceController,      // Fase 7 (F7-BE)
   InvalidationController,   // Fase 8 (F8-BE)
+  DynamicYoutubeController, // DN-1: GET /dynamic/youtube/preflight
 ]);
 
 export const DYNAMIC_HANDLERS: ReadonlySet<Function> = new Set<Function>([

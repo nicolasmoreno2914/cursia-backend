@@ -142,7 +142,10 @@ function makeDeps({ videoMode = 'real' } = {}) {
   return { deps, calls };
 }
 
-const ENV_ON = { [FLAG]: 'true', [ALLOW]: undefined, [REAL]: OWNER, VIDEOGEN_API_KEY: 'k' };
+// DN-1: estos items son de runs `videogen_direct` (sin input_payload.videoDelivery) con video real:
+// desde DN-1 solo se envían con el permiso de staging DYNAMIC_ALLOW_VIDEOGEN_DIRECT=true (el camino
+// youtube y el bloqueo sin el permiso se prueban en check-dynamic-youtube-delivery.js).
+const ENV_ON = { [FLAG]: 'true', [ALLOW]: undefined, [REAL]: OWNER, VIDEOGEN_API_KEY: 'k', DYNAMIC_ALLOW_VIDEOGEN_DIRECT: 'true' };
 
 async function main() {
   stubFetch();

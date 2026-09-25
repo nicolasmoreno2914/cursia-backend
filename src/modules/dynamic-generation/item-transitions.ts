@@ -49,13 +49,22 @@ export async function applyItemFailure(
   itemRunId: string,
   error: string,
   retryable: boolean,
+  /**
+   * DN-1: espera explícita antes del próximo intento (p.ej. cuota diaria de
+   * YouTube). Ausente → backoff estándar. Solo cambia `next_retry_at`.
+   */
+  retryAfterSeconds?: number | null,
 ): Promise<FailedTransition | null> {
+  const retryAfter =
+    typeof retryAfterSeconds === 'number' && Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+      ? Math.floor(retryAfterSeconds)
+      : null;
   const [row] = returningRows(
     await qr.query(
       `update public.generation_item_runs
           set status = case when $3::boolean and attempt_count < max_attempts then 'retrying' else 'failed' end,
               next_retry_at = case when $3::boolean and attempt_count < max_attempts
-                then now() + make_interval(secs => least($5::int, $4::int * power(2, greatest(attempt_count, 1) - 1)))
+                then now() + make_interval(secs => coalesce($6::int, least($5::int, $4::int * power(2, greatest(attempt_count, 1) - 1))))
                 else null end,
               finished_at = case when $3::boolean and attempt_count < max_attempts then null else now() end,
               worker_id = null,
@@ -64,7 +73,7 @@ export async function applyItemFailure(
               updated_at = now()
         where id = $1 and status = 'running'
         returning id, status, job_id, manifest_id, generation, item_key`,
-      [itemRunId, error, retryable, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS],
+      [itemRunId, error, retryable, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS, retryAfter],
     ),
   );
   if (!row) return null;

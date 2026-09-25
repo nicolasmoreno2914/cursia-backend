@@ -109,25 +109,28 @@ function assertThrows(fn, pred, msg) {
 
 const VIDEOGEN_STATUSES = [null, 'queued', 'processing', 'completed', 'completed_local', 'done', 'success', 'finished', 'failed', 'COMPLETED_LOCAL'];
 const READY = new Set(['completed', 'completed_local', 'done', 'success', 'finished', 'COMPLETED_LOCAL']);
-const DELIVERY_STATES = [null, 'pending', 'completed_local', 'uploading_youtube', 'completed', 'blocked_auth', 'blocked_quota'];
+const DELIVERY_STATES = [null, 'pending', 'completed_local', 'uploading_youtube', 'completed', 'blocked_auth', 'blocked_quota', 'upload_failed', 'ambiguous'];
 
 // Tabla esperada escrita a mano desde el spec §2 (no derivada del código).
 function expected(strategy, vg, st) {
   const ready = READY.has(vg);
   const s = st === null ? 'pending' : st;
   if (strategy === 'videogen_direct') {
-    if (s === 'uploading_youtube' || s === 'blocked_auth' || s === 'blocked_quota') return 'THROW';
+    if (s === 'uploading_youtube' || s === 'blocked_auth' || s === 'blocked_quota' || s === 'upload_failed' || s === 'ambiguous') return 'THROW';
     if (s === 'completed_local' || s === 'completed') return { itemTerminal: true, next: 'done' };
     return ready ? { itemTerminal: true, next: 'done' } : { itemTerminal: false, next: 'poll_videogen' };
   }
   if (s === 'completed') return { itemTerminal: true, next: 'done' };
   if (s === 'completed_local' || s === 'uploading_youtube') return { itemTerminal: false, next: 'publish_youtube' };
+  // DN-1: upload_failed → se reintenta SOLO la subida; ambiguous → nunca re-sube solo (resolución explícita).
+  if (s === 'upload_failed') return { itemTerminal: false, next: 'publish_youtube' };
+  if (s === 'ambiguous') return { itemTerminal: false, next: 'resolve_ambiguous' };
   if (s === 'blocked_auth') return { itemTerminal: false, next: 'wait_auth' };
   if (s === 'blocked_quota') return { itemTerminal: false, next: 'wait_quota' };
   return ready ? { itemTerminal: false, next: 'publish_youtube' } : { itemTerminal: false, next: 'poll_videogen' };
 }
 
-check('Tabla de verdad completa de dynamicVideoDeliveryPhase (2 × 7 × 10 = 140 combinaciones)', () => {
+check('Tabla de verdad completa de dynamicVideoDeliveryPhase (2 × 9 × 10 = 180 combinaciones)', () => {
   let n = 0;
   for (const strategy of ['videogen_direct', 'youtube']) {
     for (const st of DELIVERY_STATES) {
@@ -143,7 +146,7 @@ check('Tabla de verdad completa de dynamicVideoDeliveryPhase (2 × 7 × 10 = 140
       }
     }
   }
-  assert(n === 140, `combinaciones ${n}`);
+  assert(n === 180, `combinaciones ${n}`);
 });
 
 check('Spec: completed_local terminal SIN YouTube; completed_local y uploading_youtube intermedios CON YouTube; completed terminal', () => {
@@ -413,34 +416,46 @@ async function readActivities(buf) {
     }
   });
 
-  await checkAsync('.mbz youtube: la URL de YouTube de cada capítulo cae en la actividad url de ESE capítulo (UUID) y su sección; texto "se abre en YouTube"', async () => {
+  await checkAsync('.mbz youtube (DN-1): cada video es un LABEL (no url) en el lugar del capítulo, con el link embebible de SU id (UUID) + respaldo nomediaplugin', async () => {
     const buf = await withFrozenClock(() => buildDynamicMbz({ plan, contents: buildContents(plan, 'youtube') }));
     const acts = await readActivities(buf);
     const chapters = plan.modules.flatMap((m) => m.chapters.map((c) => ({ ...c, sectionNum: m.sectionNum })));
     const chapterByYtId = Object.fromEntries(chapters.filter((c) => c.videoItemKey).map((c) => [ytIdFor(c.chapterId), c]));
-    const urls = acts.filter((a) => a.modname === 'url');
-    assert(urls.length === 6, `esperado 6 url, encontrado ${urls.length}`);
+    assert(acts.filter((a) => a.modname === 'url').length === 0, 'un run youtube no debe tener actividades url');
+    const videoLabels = acts.filter((a) => a.modname === 'label' && /<name>🎬 Video del capítulo/.test(a.xml));
+    assert(videoLabels.length === 6, `esperado 6 labels de video, encontrado ${videoLabels.length}`);
     const got = [];
-    for (const u of urls) {
-      const ext = (u.xml.match(/<externalurl>([^<]*)<\/externalurl>/) || [])[1] || '';
-      const m = ext.match(/^https:\/\/www\.youtube\.com\/watch\?v=([A-Za-z0-9_-]{11})$/);
-      assert(m, `url ${u.mid}: externalurl no es YouTube: ${ext}`);
-      const ch = chapterByYtId[m[1]];
-      assert(ch, `url ${u.mid}: id ${m[1]} no corresponde a ningún capítulo`);
-      const name = (u.xml.match(/<name>([^<]*)<\/name>/) || [])[1] || '';
-      assert(name.includes(`Video del capítulo ${ch.chapterNumber} `), `url ${u.mid}: nombre "${name}" no es del capítulo ${ch.chapterNumber} (${ch.chapterId})`);
-      assert(u.section === ch.sectionNum, `video del cap ${ch.chapterNumber} en sección ${u.section}, esperado ${ch.sectionNum}`);
-      assert(u.xml.includes('se abre en YouTube'), `url ${u.mid}: falta texto YouTube`);
-      assert(!u.xml.includes('pestaña externa'), `url ${u.mid}: conserva el texto de Videogen`);
-      assert(!ext.includes('videosb'), `url ${u.mid}: cayó a Videogen`);
+    for (const l of videoLabels) {
+      const hrefs = [...l.xml.matchAll(/&lt;a (class=&quot;nomediaplugin&quot; )?href=&quot;([^&]*)&quot;/g)];
+      assert(hrefs.length === 2, `label ${l.mid}: esperado 2 links, ${hrefs.length}`);
+      assert(!hrefs[0][1] && hrefs[1][1], `label ${l.mid}: el 1º link debe ser plano (embebible) y el 2º nomediaplugin`);
+      const m0 = hrefs[0][2].match(/^https:\/\/www\.youtube\.com\/watch\?v=([A-Za-z0-9_-]{11})$/);
+      assert(m0 && hrefs[1][2] === hrefs[0][2], `label ${l.mid}: links no son el watch de YouTube: ${hrefs.map((h) => h[2])}`);
+      const ch = chapterByYtId[m0[1]];
+      assert(ch, `label ${l.mid}: id ${m0[1]} no corresponde a ningún capítulo`);
+      const name = (l.xml.match(/<name>([^<]*)<\/name>/) || [])[1] || '';
+      assert(name.includes(`Video del capítulo ${ch.chapterNumber} `), `label ${l.mid}: nombre "${name}" no es del capítulo ${ch.chapterNumber}`);
+      assert(l.section === ch.sectionNum, `video del cap ${ch.chapterNumber} en sección ${l.section}, esperado ${ch.sectionNum}`);
+      // Mismo lugar que la url de videogen_direct: justo después de la tarjeta del capítulo.
+      const intro = acts.find((a) => a.section === l.section && a.index === l.index - 1);
+      assert(intro && intro.modname === 'label' && intro.xml.includes(`Capítulo ${ch.chapterNumber}`), `label ${l.mid}: no está justo después de la intro del cap ${ch.chapterNumber}`);
+      assert(!l.xml.includes('videosb') && !/\.mp4/i.test(l.xml), `label ${l.mid}: cayó a Videogen / MP4`);
       got.push([ch.chapterNumber, ch.chapterId]);
     }
     got.sort((a, b) => a[0] - b[0]);
     assertDeepEqual(got, VIDEO_CHAPTER_NUMBERS.map((n) => [n, chapterUuid(n)]), 'capítulos con video (por UUID)');
-    // Label de intro de cada capítulo con video: aviso de YouTube.
-    const labels = acts.filter((a) => a.modname === 'label' && /Este capítulo incluye un video/.test(a.xml));
-    assert(labels.length === 6, `esperado 6 labels con aviso de video, encontrado ${labels.length}`);
-    assert(labels.every((l) => l.xml.includes('se abre en YouTube') && !l.xml.includes('pestaña externa')), 'aviso de intro no cambió a YouTube');
+    const intros = acts.filter((a) => a.modname === 'label' && /Este capítulo incluye un video/.test(a.xml));
+    assert(intros.length === 6 && intros.every((l) => l.xml.includes('justo debajo') && !l.xml.includes('pestaña externa')), 'aviso de intro no cambió a YouTube');
+    // Mismos mids que videogen_direct (la url se reemplaza por el label en el mismo lugar).
+    const vdActs = await readActivities(vdBuf);
+    const vdUrlMids = vdActs.filter((a) => a.modname === 'url').map((a) => a.mid).sort();
+    assertDeepEqual(videoLabels.map((l) => l.mid).sort(), vdUrlMids, 'mids de los videos youtube = mids de las url de videogen_direct');
+    // Ningún archivo de video en el .mbz.
+    const zip = await JSZip.loadAsync(buf);
+    const filesXml = await zip.file('files.xml').async('string');
+    assert(!/video\/mp4|\.mp4/i.test(filesXml), 'files.xml no debe tener MP4');
+    const mb = await zip.file('moodle_backup.xml').async('string');
+    assert(!/<modulename>url<\/modulename>/.test(mb), 'moodle_backup.xml no debe listar actividades url');
     assert(!buf.equals(vdBuf), 'el .mbz youtube no debería ser igual al de videogen_direct');
   });
 

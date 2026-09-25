@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
@@ -13,7 +14,7 @@ import {
   ValidationPipe,
 } from '@nestjs/common';
 import type { Response } from 'express';
-import { RunsService } from './runs.service';
+import { RunsService, YoutubeResolutionAction } from './runs.service';
 import { CourseContextDto } from './dto/course-context.dto';
 import { RetryItemDto } from './dto/executor.dto';
 import { parseRegenerateItemBody } from './dto/regenerate-item.dto';
@@ -130,6 +131,28 @@ export class RunsController {
     @CurrentUser() user: AuthUser,
   ) {
     return this.runs.retryItem(courseId, user.id, number, runId, itemKey, dto?.resubmitVideo === true);
+  }
+
+  // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/items/:itemKey/youtube-resolution
+  // DN-1: resolución explícita de una subida a YouTube ambigua (nunca automática).
+  // Body: {"action":"confirm_existing","youtubeVideoId":"<11 chars>"} | {"action":"authorize_reupload"}.
+  // 200 con el item (vuelve a pending; el worker solo finaliza o re-sube UNA vez, sin Videogen).
+  @Post(':runId/items/:itemKey/youtube-resolution')
+  @HttpCode(HttpStatus.OK)
+  resolveYoutube(
+    @Param('courseId', ParseIntPipe) courseId: number,
+    @Param('number', ParseIntPipe) number: number,
+    @Param('runId', ParseUUIDPipe) runId: string,
+    @Param('itemKey') itemKey: string,
+    @Body() body: Record<string, unknown>,
+    @CurrentUser() user: AuthUser,
+  ) {
+    const b = body && typeof body === 'object' ? body : {};
+    const extra = Object.keys(b).filter((k) => k !== 'action' && k !== 'youtubeVideoId');
+    if (extra.length > 0) throw new BadRequestException(`campos no permitidos: ${extra.join(', ')}`);
+    const action = b.action as YoutubeResolutionAction;
+    const videoId = b.youtubeVideoId === undefined ? undefined : String(b.youtubeVideoId);
+    return this.runs.resolveYoutubeUpload(courseId, user.id, number, runId, itemKey, action, videoId);
   }
 
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/items/:itemKey/regenerate

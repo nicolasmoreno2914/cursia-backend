@@ -20,6 +20,31 @@ export class YoutubeQuotaException extends ServiceUnavailableException {
   }
 }
 
+/**
+ * DN-1: error de transporte de la subida (5xx, red, timeout, respuesta sin
+ * id). Extiende ServiceUnavailableException con el MISMO mensaje de siempre
+ * (el legacy lo sigue viendo igual, instanceof incluido); solo agrega en qué
+ * fase ocurrió para que el worker dynamic distinga un fallo SIN video creado
+ * (`init`, o `upload` con respuesta HTTP 5xx explícita) de uno ambiguo
+ * (`upload` sin respuesta, timeout o 2xx sin id: el video puede existir).
+ */
+export class YoutubeUploadTransportError extends ServiceUnavailableException {
+  constructor(
+    message: string,
+    public readonly phase: 'init' | 'upload',
+    /** Status HTTP de una respuesta de error explícita de YouTube; ausente = sin respuesta (red/timeout) o 2xx sin id. */
+    public readonly httpStatus?: number,
+  ) {
+    super(message);
+    // `name` se deja como el de ServiceUnavailableException (paridad legacy).
+  }
+}
+
+function httpStatusOf(err: unknown): number | undefined {
+  const m = /^HTTP (\d{3})$/.exec(err instanceof Error ? err.message : '');
+  return m ? Number(m[1]) : undefined;
+}
+
 export interface YoutubeUploadOptions {
   downloadUrl:    string;
   title:          string;
@@ -185,8 +210,10 @@ export class YoutubeUploadService {
     } catch (err) {
       if (err instanceof UnauthorizedException) throw err;
       if (err instanceof YoutubeQuotaException) throw err;
-      throw new ServiceUnavailableException(
+      throw new YoutubeUploadTransportError(
         `No se pudo iniciar la subida a YouTube: ${(err as Error).message}`,
+        'init',
+        httpStatusOf(err),
       );
     }
 
@@ -233,8 +260,10 @@ export class YoutubeUploadService {
     } catch (err) {
       if (err instanceof UnauthorizedException) throw err;
       if (err instanceof YoutubeQuotaException) throw err;
-      throw new ServiceUnavailableException(
+      throw new YoutubeUploadTransportError(
         `Fallo al subir video a YouTube: ${(err as Error).message}`,
+        'upload',
+        httpStatusOf(err),
       );
     }
 

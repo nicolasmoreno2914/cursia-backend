@@ -5,6 +5,7 @@ import {
   InternalServerErrorException,
   Logger,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import type { QueryRunner } from 'typeorm';
@@ -15,7 +16,22 @@ import type { ManifestItemType } from '../generation-manifests/generation-manife
 import { CostRatesService } from '../../admin/services/cost-rates.service';
 import { CourseContextDto, RUN_VIDEO_MODES, RunVideoMode } from './dto/course-context.dto';
 import { REQUIRED_CONTEXT_FIELDS, canonicalContextHash, itemIdempotencyKey, normalizeCourseContext } from './run-hash';
-import { VideoDeliveryStrategy, frozenVideoDeliveryOf, readVideoDeliveryConfig } from './dynamic-video-delivery';
+import {
+  VideoDeliveryGateResult,
+  VideoDeliveryStrategy,
+  VideoDeliveryView,
+  YOUTUBE_PREFLIGHT_FAILED,
+  YoutubePreflightResult,
+  canonicalYoutubeWatchUrl,
+  deliveryViewOf,
+  frozenRunVideoGate,
+  frozenVideoDeliveryOf,
+  normalizeDeliveryState,
+  readVideoDeliveryConfig,
+  resolveRunVideoDelivery,
+  youtubePreflightFailedMessage,
+} from './dynamic-video-delivery';
+import { DynamicYoutubePreflightService } from './dynamic-youtube';
 import { assertDynamicOwnerAllowed, assertRealVideoAllowed } from '../features/dynamic-features';
 import { FromRunDto, isFromRunRequest } from '../invalidation/dto/from-run.dto';
 import { computePlanFromDb, executeApplyWrites, planApplyWrites } from '../invalidation/invalidation-apply';
@@ -93,9 +109,23 @@ export interface ItemRunDto {
   error: string | null;
   idempotencyKey: string;
   outputSummary: Record<string, any>;
+  /**
+   * DN-1: SOLO en items `video` — estado de entrega legible por la UI
+   * (pending|rendering|completed_local|uploading_youtube|completed|
+   * blocked_auth|blocked_quota|upload_failed|ambiguous) + acciones posibles.
+   */
+  delivery?: VideoDeliveryView;
   createdAt: string;
   updatedAt: string;
   finishedAt: string | null;
+}
+
+/** DN-1: resumen de entrega de los videos del run (conteo por estado de `ItemRunDto.delivery`). */
+export interface RunVideoDeliverySummary {
+  total: number;
+  byState: Record<string, number>;
+  /** true si algún video espera una acción del usuario (reconectar, reintentar subida, resolver ambigua). */
+  needsAttention: boolean;
 }
 
 export interface RunDto {
@@ -116,6 +146,8 @@ export interface RunDto {
    * 'videogen_direct'. Nunca cambia (ni al reabrir).
    */
   videoDelivery: VideoDeliveryStrategy;
+  /** DN-1: resumen de la entrega de videos (null si el Manifest no tiene videos). */
+  videoDeliverySummary: RunVideoDeliverySummary | null;
   courseContextSha256: string;
   courseContext: Record<string, any>;
   createdAt: string;
@@ -152,6 +184,33 @@ function isActiveRunConflict(err: any): boolean {
   return pgCode(err) === '23505' && pgConstraint(err) === ACTIVE_RUN_INDEX;
 }
 
+/** Señal interna de startRunFromPrevious: el plan va a generar videos reales → correr el preflight fuera de la tx. */
+class NeedsYoutubePreflight extends Error {
+  constructor(public readonly gate: VideoDeliveryGateResult) {
+    super('needs_youtube_preflight');
+  }
+}
+
+/** `output_summary.delivery` tolerante (lectura): desconocido → 'pending' (el worker es el que valida fuerte). */
+function deliveryStateOrPending(v: unknown): string {
+  try {
+    return normalizeDeliveryState(v);
+  } catch {
+    return 'pending';
+  }
+}
+
+/** DN-1: la subida a YouTube de este item video quedó ambigua (empezó y no registró id). */
+function isAmbiguousYoutubeUpload(row: { error?: string | null; output_summary?: Record<string, any> | null }): boolean {
+  const os = row.output_summary ?? {};
+  if (os.external?.youtubeVideoId) return false;
+  return (
+    os.delivery === 'ambiguous' ||
+    String(row.error ?? '').startsWith('ambiguous_youtube_upload') ||
+    (!!os.youtubeUploadStartedAt && os.delivery !== 'blocked_auth' && os.delivery !== 'blocked_quota')
+  );
+}
+
 export interface StartRunResult {
   created: boolean;
   reopened: boolean;
@@ -159,6 +218,12 @@ export interface StartRunResult {
   /** Fase 8: solo en runs creados con `{fromRun}` (resumen del plan aplicado). */
   invalidation?: { fromRunId: string; planSha256: string; totals: Record<string, number> };
 }
+
+/** DN-1: acción explícita sobre una subida a YouTube ambigua. */
+export type YoutubeResolutionAction = 'confirm_existing' | 'authorize_reupload';
+
+/** Código estable del 409 de un retry sobre una subida ambigua. */
+export const YOUTUBE_UPLOAD_AMBIGUOUS = 'youtube_upload_ambiguous';
 
 /** F78-BE2: qué cuesta regenerar un item. */
 export type RegenerationCostKind = 'videogen' | 'llm' | 'none';
@@ -278,6 +343,12 @@ export class RunsService {
     private readonly dataSource: DataSource,
     private readonly manifests: GenerationManifestsService,
     private readonly costRates: CostRatesService,
+    /**
+     * DN-1: preflight de YouTube (gate de runs reales con video). @Optional:
+     * si falta (harness sin el módulo), todo camino que lo necesite falla
+     * CERRADO con 409 `youtube_preflight_failed:preflight_unavailable`.
+     */
+    @Optional() private readonly youtubePreflight?: DynamicYoutubePreflightService,
   ) {
     // M6 (review-it2): NO se valida DYNAMIC_VIDEO_DELIVERY acá. RunsService
     // vive en AppModule, que arranca la API y todos los workers legacy — un
@@ -367,6 +438,7 @@ export class RunsService {
     blueprintNumber: number,
     manifestB: ManifestDto,
     fromRunId: string,
+    youtubePreflightPassed = false,
   ): Promise<StartRunResult> {
     const [rowA] = await this.dataSource.query(
       `select * from public.production_jobs
@@ -394,117 +466,130 @@ export class RunsService {
       [courseId],
     );
 
-    const outcome = await this.tx(async (qr) => {
-      await this.lockCourseRuns(qr, courseId);
-      // Idempotencia: ¿Mb ya tiene un run? Si sale de A → es "el" B.
-      const [existing] = await qr.query(
-        `select id, input_payload from public.production_jobs
-          where execution_mode = 'dynamic_generation' and input_payload->>'manifestId' = $1
-          order by created_at desc, id desc limit 1`,
-        [String(manifestB.id)],
-      );
-      if (existing) {
-        if (existing.input_payload?.fromRunId === rowA.id) return { kind: 'existing' as const, jobId: existing.id as string };
-        throw new ConflictException(
-          `El Manifest #${manifestB.id} ya tiene una ejecución que no sale de ${rowA.id}; ` +
-            `no se puede crear otra. runId=${existing.id}`,
+    let outcome: { kind: 'existing' | 'created'; jobId: string };
+    try {
+      outcome = await this.tx(async (qr) => {
+        await this.lockCourseRuns(qr, courseId);
+        // Idempotencia: ¿Mb ya tiene un run? Si sale de A → es "el" B.
+        const [existing] = await qr.query(
+          `select id, input_payload from public.production_jobs
+            where execution_mode = 'dynamic_generation' and input_payload->>'manifestId' = $1
+            order by created_at desc, id desc limit 1`,
+          [String(manifestB.id)],
         );
-      }
-      // Fix wave (review F78 M5, promovido): A ya reemplazado por otro B (otro
-      // Manifest) → se aplica desde el más reciente, nunca desde A.
-      const superseding = await this.findSupersedingRun(qr, rowA.id);
-      if (superseding) throw this.supersededConflict(rowA.id, superseding);
-      const other = await this.findActiveRunOnOtherManifest(qr, courseId, manifestB.id);
-      if (other) throw this.otherActiveRunConflict(other, manifestB);
+        if (existing) {
+          if (existing.input_payload?.fromRunId === rowA.id) return { kind: 'existing' as const, jobId: existing.id as string };
+          throw new ConflictException(
+            `El Manifest #${manifestB.id} ya tiene una ejecución que no sale de ${rowA.id}; ` +
+              `no se puede crear otra. runId=${existing.id}`,
+          );
+        }
+        // Fix wave (review F78 M5, promovido): A ya reemplazado por otro B (otro
+        // Manifest) → se aplica desde el más reciente, nunca desde A.
+        const superseding = await this.findSupersedingRun(qr, rowA.id);
+        if (superseding) throw this.supersededConflict(rowA.id, superseding);
+        const other = await this.findActiveRunOnOtherManifest(qr, courseId, manifestB.id);
+        if (other) throw this.otherActiveRunConflict(other, manifestB);
 
-      const { plan } = await computePlanFromDb(qr, {
-        runA: rowA,
-        manifestA,
-        blueprintA: bpA.snapshot,
-        manifestB,
-        blueprintB: bpB.snapshot,
-        contextHash: ctxA.context_hash,
-      });
-      const fromArtifactIds = [...new Set(plan.actions.flatMap((a) => a.fromArtifactIds))];
-      const srcRows: any[] = fromArtifactIds.length
-        ? await qr.query(`select * from public.artifacts where id = any($1::uuid[]) for update`, [fromArtifactIds])
-        : [];
-      if (srcRows.length !== fromArtifactIds.length) {
-        // Un artifact de A se borró entre el plan y el lock (fix wave I2): nunca
-        // se aplica un plan sobre salida que ya no existe.
-        throw new ConflictException(
-          `Los artifacts de la ejecución ${rowA.id} cambiaron mientras se aplicaba el plan ` +
-            `(${fromArtifactIds.length - srcRows.length} ya no existen); reintentá. runId=${rowA.id}`,
+        const { plan } = await computePlanFromDb(qr, {
+          runA: rowA,
+          manifestA,
+          blueprintA: bpA.snapshot,
+          manifestB,
+          blueprintB: bpB.snapshot,
+          contextHash: ctxA.context_hash,
+        });
+        const fromArtifactIds = [...new Set(plan.actions.flatMap((a) => a.fromArtifactIds))];
+        const srcRows: any[] = fromArtifactIds.length
+          ? await qr.query(`select * from public.artifacts where id = any($1::uuid[]) for update`, [fromArtifactIds])
+          : [];
+        if (srcRows.length !== fromArtifactIds.length) {
+          // Un artifact de A se borró entre el plan y el lock (fix wave I2): nunca
+          // se aplica un plan sobre salida que ya no existe.
+          throw new ConflictException(
+            `Los artifacts de la ejecución ${rowA.id} cambiaron mientras se aplicaba el plan ` +
+              `(${fromArtifactIds.length - srcRows.length} ya no existen); reintentá. runId=${rowA.id}`,
+          );
+        }
+        const sources = new Map(srcRows.map((r) => [r.id, r]));
+        const writes = planApplyWrites(
+          plan,
+          manifestB.manifest.items,
+          bpA.snapshot,
+          ctxA.context_hash,
+          (id) => sources.get(id)?.status ?? null,
+          (id) => sources.get(id)?.metadata?.inputFingerprint ?? null,
+          { required: (t) => requiredArtifactTypes(manifestB.rulesVersion, t as ManifestItemType), typeOf: (id) => sources.get(id)?.type },
         );
-      }
-      const sources = new Map(srcRows.map((r) => [r.id, r]));
-      const writes = planApplyWrites(
-        plan,
-        manifestB.manifest.items,
-        bpA.snapshot,
-        ctxA.context_hash,
-        (id) => sources.get(id)?.status ?? null,
-        (id) => sources.get(id)?.metadata?.inputFingerprint ?? null,
-        { required: (t) => requiredArtifactTypes(manifestB.rulesVersion, t as ManifestItemType), typeOf: (id) => sources.get(id)?.type },
-      );
-      if (writes.missingRoles.length > 0) {
-        const message =
-          `No se puede reutilizar la salida de ${rowA.id} en el Manifest #${manifestB.id} (rulesVersion ` +
-          `${manifestB.rulesVersion}): faltan roles de artifact obligatorios (${writes.missingRoles.length}) ` +
-          `missingJson=${JSON.stringify(writes.missingRoles)}. Pasar a rulesVersion ${manifestB.rulesVersion} requiere una ` +
-          'generación completa nueva (POST …/runs con el contexto del curso, sin fromRun).';
-        throw new ConflictException({ message, code: 'reuse_missing_roles', missing: writes.missingRoles });
-      }
-      // Gate de video real (review 5C I1): B va a pagar Videogen solo si
-      // GENERA/REGENERA algún video (STALE_NO_AUTO nunca regenera solo).
-      if (videoMode === 'real' && writes.videoItemsToGenerate.length > 0) assertRealVideoAllowed(ownerId);
+        if (writes.missingRoles.length > 0) {
+          const message =
+            `No se puede reutilizar la salida de ${rowA.id} en el Manifest #${manifestB.id} (rulesVersion ` +
+            `${manifestB.rulesVersion}): faltan roles de artifact obligatorios (${writes.missingRoles.length}) ` +
+            `missingJson=${JSON.stringify(writes.missingRoles)}. Pasar a rulesVersion ${manifestB.rulesVersion} requiere una ` +
+            'generación completa nueva (POST …/runs con el contexto del curso, sin fromRun).';
+          throw new ConflictException({ message, code: 'reuse_missing_roles', missing: writes.missingRoles });
+        }
+        // Gate de video real (review 5C I1): B va a pagar Videogen solo si
+        // GENERA/REGENERA algún video (STALE_NO_AUTO nunca regenera solo).
+        if (videoMode === 'real' && writes.videoItemsToGenerate.length > 0) assertRealVideoAllowed(ownerId);
+        // DN-1: B hereda la estrategia de A; si va a GENERAR videos reales,
+        // entrega YouTube + preflight OK. El preflight hace red → se corre FUERA
+        // de la tx (rollback: nada escrito) y se reintenta una sola vez.
+        const gate = frozenRunVideoGate({ videoWork: writes.videoItemsToGenerate.length, videoMode, strategy: videoDelivery });
+        if (gate.ok === false) throw new ConflictException({ message: gate.message, code: gate.code });
+        if (gate.requiresYoutubePreflight && !youtubePreflightPassed) throw new NeedsYoutubePreflight(gate);
 
-      const invalidation = { fromRunId: rowA.id, planSha256: plan.planSha256, totals: plan.totals, plan };
-      const inputPayload = {
-        manifestId: manifestB.id,
-        blueprintNumber,
-        contextHash: ctxA.context_hash,
-        videoMode,
-        videoDelivery,
-        fromRunId: rowA.id,
-        invalidationPlanSha256: plan.planSha256,
-      };
-      const [job] = await qr.query(
-        `insert into public.production_jobs
-           (owner_id, course_id, frontend_course_id, execution_mode, status, worker_status, current_step,
-            progress, blueprint_version_id, input_payload, output_summary, options, result,
-            lease_until, worker_id, created_at, updated_at)
-         values ($1, $2, $3, 'dynamic_generation', 'queued', 'queued', 'dynamic_generation',
-                 0, $4, $5::jsonb, $6::jsonb, '{}'::jsonb, '{}'::jsonb,
-                 null, null, now(), now())
-         returning id`,
-        [ownerId, courseId, course?.frontend_course_id ?? null, manifestB.blueprintId, JSON.stringify(inputPayload),
-          JSON.stringify({ invalidation })],
-      );
-      await qr.query(
-        `insert into public.generation_run_contexts (job_id, manifest_id, context, context_hash)
-         values ($1, $2, $3::jsonb, $4)`,
-        [job.id, manifestB.id, JSON.stringify(ctxA.context), ctxA.context_hash],
-      );
-      const seeded = await executeApplyWrites(qr, {
-        jobB: job.id,
-        runA: rowA.id,
-        courseId,
-        manifestB: { id: manifestB.id, blueprintId: manifestB.blueprintId },
-        planSha256: plan.planSha256,
-        writes,
-        sourceArtifacts: sources,
-        idempotencyKey: (key) => itemIdempotencyKey(manifestB.id, key, GENERATION),
-      });
-      if (seeded.size !== manifestB.totals.totalJobs) {
-        throw new InternalServerErrorException(
-          `Manifest #${manifestB.id}: se sembraron ${seeded.size} items pero totals.totalJobs = ${manifestB.totals.totalJobs}`,
+        const invalidation = { fromRunId: rowA.id, planSha256: plan.planSha256, totals: plan.totals, plan };
+        const inputPayload = {
+          manifestId: manifestB.id,
+          blueprintNumber,
+          contextHash: ctxA.context_hash,
+          videoMode,
+          videoDelivery,
+          fromRunId: rowA.id,
+          invalidationPlanSha256: plan.planSha256,
+        };
+        const [job] = await qr.query(
+          `insert into public.production_jobs
+             (owner_id, course_id, frontend_course_id, execution_mode, status, worker_status, current_step,
+              progress, blueprint_version_id, input_payload, output_summary, options, result,
+              lease_until, worker_id, created_at, updated_at)
+           values ($1, $2, $3, 'dynamic_generation', 'queued', 'queued', 'dynamic_generation',
+                   0, $4, $5::jsonb, $6::jsonb, '{}'::jsonb, '{}'::jsonb,
+                   null, null, now(), now())
+           returning id`,
+          [ownerId, courseId, course?.frontend_course_id ?? null, manifestB.blueprintId, JSON.stringify(inputPayload),
+            JSON.stringify({ invalidation })],
         );
-      }
-      // Todo reutilizado (p.ej. reorder puro) → el run nace completed.
-      await recomputeRunStatus(qr, job.id);
-      return { kind: 'created' as const, jobId: job.id as string };
-    });
+        await qr.query(
+          `insert into public.generation_run_contexts (job_id, manifest_id, context, context_hash)
+           values ($1, $2, $3::jsonb, $4)`,
+          [job.id, manifestB.id, JSON.stringify(ctxA.context), ctxA.context_hash],
+        );
+        const seeded = await executeApplyWrites(qr, {
+          jobB: job.id,
+          runA: rowA.id,
+          courseId,
+          manifestB: { id: manifestB.id, blueprintId: manifestB.blueprintId },
+          planSha256: plan.planSha256,
+          writes,
+          sourceArtifacts: sources,
+          idempotencyKey: (key) => itemIdempotencyKey(manifestB.id, key, GENERATION),
+        });
+        if (seeded.size !== manifestB.totals.totalJobs) {
+          throw new InternalServerErrorException(
+            `Manifest #${manifestB.id}: se sembraron ${seeded.size} items pero totals.totalJobs = ${manifestB.totals.totalJobs}`,
+          );
+        }
+        // Todo reutilizado (p.ej. reorder puro) → el run nace completed.
+        await recomputeRunStatus(qr, job.id);
+        return { kind: 'created' as const, jobId: job.id as string };
+      });
+    } catch (err) {
+      if (!(err instanceof NeedsYoutubePreflight) || youtubePreflightPassed) throw err;
+      await this.enforceVideoGate(ownerId, err.gate); // 409 si no pasa
+      return this.startRunFromPrevious(courseId, ownerId, blueprintNumber, manifestB, fromRunId, true);
+    }
 
     const job = await this.loadJobById(outcome.jobId);
     const inv = job.output_summary?.invalidation;
@@ -563,6 +648,14 @@ export class RunsService {
       // Fix wave (M5): un run reemplazado por uno creado desde él no se reabre.
       const superseding = await this.findSupersedingRun(this.dataSource, latest.id);
       if (superseding) throw this.supersededConflict(latest.id, superseding);
+      // DN-1: reabrir re-encola los items cancelled; si alguno es un video sin
+      // job de Videogen (envío NUEVO), aplica el gate de entrega (YouTube +
+      // preflight) ANTES de escribir nada.
+      const videoWork = await this.videoSubmissionsIfReopened(this.dataSource, latest.id, ['cancelled']);
+      await this.enforceVideoGate(
+        ownerId,
+        frozenRunVideoGate({ videoWork, videoMode: latestVideoMode, strategy: frozenVideoDeliveryOf(latest.input_payload) }),
+      );
       return this.reopenRun(latest.id, manifest, contextHash);
     }
 
@@ -577,6 +670,12 @@ export class RunsService {
     // I1 (5C): un run NUEVO con video real requiere DYNAMIC_REAL_VIDEO_OWNERS (fail closed). Un run
     // 'real' ya activo se devuelve arriba sin pasar por acá (reanudar no se bloquea).
     if (videoMode === 'real') assertRealVideoAllowed(ownerId);
+    // DN-1: ≥1 video + videoMode real → se congela 'youtube' (o videogen_direct
+    // solo con el permiso de staging) y el preflight de YouTube tiene que pasar
+    // en el servidor. Si no → 409 sin escribir nada ni llamar a Videogen.
+    const gate = resolveRunVideoDelivery({ videoCount: this.videoCountOf(manifest), videoMode, configured: videoDelivery });
+    await this.enforceVideoGate(ownerId, gate);
+    const frozenDelivery: VideoDeliveryStrategy = gate.ok ? gate.strategy : videoDelivery;
 
     const [course] = await this.dataSource.query(
       `select metadata->>'courseId' as frontend_course_id from public.courses where id = $1`,
@@ -587,7 +686,7 @@ export class RunsService {
     let jobId: string;
     try {
       jobId = await this.tx((qr) =>
-        this.insertRun(qr, manifest, ownerId, courseId, frontendCourseId, blueprintNumber, context, contextHash, videoMode, videoDelivery),
+        this.insertRun(qr, manifest, ownerId, courseId, frontendCourseId, blueprintNumber, context, contextHash, videoMode, frozenDelivery),
       );
     } catch (err) {
       if (isActiveRunConflict(err)) {
@@ -853,6 +952,40 @@ export class RunsService {
       throw new ConflictException(`La ejecución ${job.id} está cancelada; no se pueden reintentar items`);
     }
 
+    // DN-1 (antes de la tx: el preflight hace red y nunca corre con locks
+    // tomados). Un video de un run youtube en fase de SUBIDA se reintenta sin
+    // gasto de Videogen (el worker solo re-sube); una subida AMBIGUA no se
+    // reintenta a ciegas (409 → endpoint de resolución explícita); cualquier
+    // otro retry que pueda enviar un video NUEVO a Videogen pasa por el gate.
+    const frozenDelivery = frozenVideoDeliveryOf(job.input_payload);
+    const preRows: Array<{ item_key: string; type: string; status: string; error: string | null; output_summary: Record<string, any> | null }> =
+      await this.dataSource.query(
+        `select item_key, type, status, error, output_summary from public.generation_item_runs g
+          where g.job_id = $1 and ${latestGenerationPredicate('g')}`,
+        [job.id],
+      );
+    const preTarget = preRows.find((i) => i.item_key === itemKey);
+    let uploadPhaseRetry = false;
+    if (preTarget && preTarget.status === 'failed') {
+      if (preTarget.type === 'video' && frozenDelivery === 'youtube' && !resubmitVideo) {
+        if (isAmbiguousYoutubeUpload(preTarget)) {
+          const message =
+            `${YOUTUBE_UPLOAD_AMBIGUOUS}: la subida a YouTube de "${itemKey}" quedó sin confirmar (puede existir ya un video en el canal). ` +
+            'No se re-sube a ciegas: confirmá el video existente o autorizá una nueva subida con ' +
+            'POST …/items/:itemKey/youtube-resolution {"action":"confirm_existing","youtubeVideoId":"…"} | {"action":"authorize_reupload"}.';
+          throw new ConflictException({ message, code: YOUTUBE_UPLOAD_AMBIGUOUS });
+        }
+        uploadPhaseRetry = deliveryStateOrPending(preTarget.output_summary?.delivery) !== 'pending';
+      }
+      let videoWork = 0;
+      if (preTarget.type === 'video') {
+        videoWork = !uploadPhaseRetry && (resubmitVideo || !preTarget.output_summary?.external?.videogenJobId) ? 1 : 0;
+      } else {
+        videoWork = preRows.filter((i) => i.type === 'video' && i.status === 'blocked' && !i.output_summary?.external?.videogenJobId).length;
+      }
+      await this.enforceVideoGate(ownerId, frozenRunVideoGate({ videoWork, videoMode: this.videoModeOf(job), strategy: frozenDelivery }));
+    }
+
     const targetId = await this.tx(async (qr) => {
       // I1: lock del curso primero — este reintento puede reabrir el run.
       await this.lockCourseRuns(qr, courseId);
@@ -908,8 +1041,10 @@ export class RunsService {
       // está TERMINADO y este retry lo va a reabrir (mismo gasto que reabrir
       // desde startRun, I1 original). Un retry de un item NO-video dentro de
       // un run 'real' ya ACTIVO no es gasto nuevo → no requiere la lista.
+      // DN-1: un retry de SUBIDA a YouTube (render ya hecho) no gasta Videogen.
       if (
         this.videoModeOf(job) === 'real' &&
+        !uploadPhaseRetry &&
         (target.type === 'video' || resubmitVideo || !isActive(locked))
       ) {
         assertRealVideoAllowed(ownerId);
@@ -1025,7 +1160,146 @@ export class RunsService {
     });
 
     const [row] = await this.dataSource.query(`select * from public.generation_item_runs where id = $1`, [targetId]);
-    return this.toItemDto(row);
+    return this.toItemDto(row, frozenDelivery);
+  }
+
+  /**
+   * DN-1 (follow-up 5B.2.A): resolución EXPLÍCITA de una subida a YouTube
+   * ambigua (`youtubeUploadStartedAt` sin `youtubeVideoId`: crash, lease
+   * perdida, red/timeout a mitad del PUT). Nunca es automática:
+   * - `confirm_existing` + `youtubeVideoId` (11 chars): el usuario encontró el
+   *   video en su canal → se registra ese id (URL canónica) y el item vuelve a
+   *   pending; el worker SOLO finaliza (artifact + complete), sin subir nada.
+   * - `authorize_reupload`: el usuario verificó que NO hay video (o acepta un
+   *   duplicado) → se archiva el marcador y el item vuelve a pending; el worker
+   *   sube UNA vez más (si vuelve a quedar ambigua, se pide de nuevo).
+   * Ninguna de las dos vuelve a enviar nada a Videogen (el MP4 ya existe).
+   * Solo items `video` `failed` de un run `youtube` en estado ambiguo; si no → 409.
+   */
+  async resolveYoutubeUpload(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+    runId: string,
+    itemKey: string,
+    action: YoutubeResolutionAction,
+    youtubeVideoId?: string,
+  ): Promise<ItemRunDto> {
+    assertDynamicOwnerAllowed(ownerId);
+    if (action !== 'confirm_existing' && action !== 'authorize_reupload') {
+      throw new BadRequestException('action debe ser "confirm_existing" o "authorize_reupload"');
+    }
+    if (action === 'confirm_existing' && !(typeof youtubeVideoId === 'string' && /^[A-Za-z0-9_-]{11}$/.test(youtubeVideoId))) {
+      throw new BadRequestException('confirm_existing requiere youtubeVideoId (id de YouTube de 11 caracteres)');
+    }
+    if (action === 'authorize_reupload' && youtubeVideoId !== undefined) {
+      throw new BadRequestException('authorize_reupload no admite youtubeVideoId');
+    }
+    const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
+    let job = await this.loadRunRow(courseId, manifest, runId);
+    job = await this.reconcileCancellation(job);
+    if (isCancelledLike(job)) {
+      throw new ConflictException(`La ejecución ${job.id} está cancelada; no se pueden resolver subidas`);
+    }
+    const strategy = frozenVideoDeliveryOf(job.input_payload);
+    if (strategy !== 'youtube') {
+      throw new ConflictException({ message: `La ejecución ${job.id} no entrega sus videos por YouTube (videoDelivery=${strategy})`, code: 'not_youtube_run' });
+    }
+
+    const targetId = await this.tx(async (qr) => {
+      await this.lockCourseRuns(qr, courseId);
+      const [locked] = await qr.query(`select id, status, worker_status from public.production_jobs where id = $1 for update`, [job.id]);
+      if (isCancelledLike(locked)) {
+        throw new ConflictException(`La ejecución ${job.id} está cancelada; no se pueden resolver subidas`);
+      }
+      const superseding = await this.findSupersedingRun(qr, job.id);
+      if (superseding) throw this.supersededConflict(job.id, superseding);
+      if (!ACTIVE_RUN_WORKER_STATUSES.includes(String(locked.worker_status))) {
+        const other = await this.findActiveRunOnOtherManifest(qr, courseId, manifest.id);
+        if (other) throw this.otherActiveRunConflict(other, manifest);
+      }
+      const items: Array<{ id: string; item_key: string; status: ItemRunStatus; depends_on: string[]; type: string; error: string | null; output_summary: Record<string, any> | null }> =
+        await qr.query(
+          `select id, item_key, status, depends_on, type, error, output_summary
+              from public.generation_item_runs g
+              where g.job_id = $1 and ${latestGenerationPredicate('g')}
+              order by id
+              for update`,
+          [job.id],
+        );
+      const target = items.find((i) => i.item_key === itemKey);
+      if (!target) throw new NotFoundException(`El item "${itemKey}" no existe en la ejecución ${job.id}`);
+      if (target.type !== 'video') throw new BadRequestException(`"${itemKey}" no es un item de video`);
+      if (target.status !== 'failed' || !isAmbiguousYoutubeUpload(target)) {
+        throw new ConflictException({
+          message: `"${itemKey}" no tiene una subida a YouTube ambigua pendiente de resolución (estado ${target.status})`,
+          code: 'not_ambiguous',
+        });
+      }
+      const os = target.output_summary ?? {};
+      if (!os.external?.videogenJobId || !os.videogenDownloadUrl) {
+        throw new ConflictException({ message: `"${itemKey}" no tiene el render de Videogen registrado; no se puede resolver la subida`, code: 'not_ambiguous' });
+      }
+      const at = new Date().toISOString();
+      const resolution: Record<string, any> = { action, at, by: ownerId };
+      if (action === 'confirm_existing') resolution.youtubeVideoId = youtubeVideoId;
+      const next: Record<string, any> = {
+        ...os,
+        delivery: 'completed_local',
+        youtubeUploadStartedAt: null,
+        youtubeResolution: resolution,
+        previousYoutubeUploads: [
+          ...(Array.isArray(os.previousYoutubeUploads) ? os.previousYoutubeUploads : []),
+          { youtubeUploadStartedAt: os.youtubeUploadStartedAt ?? null, error: target.error, resolvedAt: at, action },
+        ],
+        previousErrors: [
+          ...(Array.isArray(os.previousErrors) ? os.previousErrors : []),
+          { error: target.error, retriedAt: at, resolution: action },
+        ],
+      };
+      if (action === 'confirm_existing') {
+        next.external = { ...(os.external ?? {}), youtubeVideoId, youtubeUrl: canonicalYoutubeWatchUrl(youtubeVideoId as string) };
+      }
+      const updated = returningRows(
+        await qr.query(
+          `update public.generation_item_runs
+              set status = 'pending', max_attempts = attempt_count + 3, output_summary = $2::jsonb, error = null,
+                  next_retry_at = null, worker_id = null, lease_until = null, finished_at = null, updated_at = now()
+            where id = $1 and status = 'failed'
+            returning id`,
+          [target.id, JSON.stringify(next)],
+        ),
+      );
+      if (updated.length !== 1) throw new InternalServerErrorException(`No se pudo reabrir el item "${itemKey}" (fila no actualizada)`);
+      const toUnblock = this.dependentsToUnblock(items, itemKey);
+      if (toUnblock.length > 0) {
+        await qr.query(
+          `update public.generation_item_runs set status = 'pending', finished_at = null, updated_at = now()
+            where id = any($1::uuid[]) and status = 'blocked'`,
+          [toUnblock],
+        );
+      }
+      if (!ACTIVE_RUN_WORKER_STATUSES.includes(String(locked.worker_status))) {
+        try {
+          await qr.query(
+            `update public.production_jobs
+                set status = 'queued', worker_status = 'queued', finished_at = null,
+                    error_message = null, next_retry_at = null, updated_at = now()
+              where id = $1`,
+            [job.id],
+          );
+        } catch (err) {
+          if (isActiveRunConflict(err)) {
+            throw new ConflictException(`Ya hay otra ejecución activa para el Manifest #${manifest.id}; no se puede reabrir ${job.id}`);
+          }
+          throw err;
+        }
+      }
+      this.logger.warn(`resolveYoutubeUpload: ${action} en "${itemKey}" (run ${job.id})${youtubeVideoId ? ` id=${youtubeVideoId}` : ''}`);
+      return target.id;
+    });
+    const [row] = await this.dataSource.query(`select * from public.generation_item_runs where id = $1`, [targetId]);
+    return this.toItemDto(row, strategy);
   }
 
   /**
@@ -1084,12 +1358,24 @@ export class RunsService {
       const plan = await this.planRegeneration(this.dataSource, false, {
         courseId, ownerId, job, manifest, mItem, itemKey, videoMode, costKind, expectedGeneration: o.expectedGeneration,
       });
+      const blockers = plan.blockers.map((b) => ({ code: b.code, message: b.message }));
+      // DN-1: el gate de entrega va justo después del 403 de video real (mismo orden que la llamada real).
+      if (mItem.type === 'video') {
+        const gb = await this.videoGateBlocker(
+          ownerId,
+          frozenRunVideoGate({ videoWork: 1, videoMode, strategy: frozenVideoDeliveryOf(job.input_payload) }),
+        );
+        if (gb) {
+          const at = blockers.findIndex((b) => b.code !== 'real_video_not_allowed');
+          blockers.splice(at === -1 ? blockers.length : at, 0, { code: gb.code, message: gb.message });
+        }
+      }
       return {
         dryRun: true,
         costKind,
         currentGeneration: plan.currentGeneration,
         affected: plan.affected,
-        blockers: plan.blockers.map((b) => ({ code: b.code, message: b.message })),
+        blockers,
       };
     }
 
@@ -1104,6 +1390,10 @@ export class RunsService {
     }
     // Video real = gasto en Videogen → allow-list de video real (fail closed).
     if (mItem.type === 'video' && videoMode === 'real') assertRealVideoAllowed(ownerId);
+    // DN-1: regenerar un video real = envío NUEVO a Videogen → entrega YouTube + preflight OK.
+    if (mItem.type === 'video') {
+      await this.enforceVideoGate(ownerId, frozenRunVideoGate({ videoWork: 1, videoMode, strategy: frozenVideoDeliveryOf(job.input_payload) }));
+    }
     if (isCancelledLike(job)) {
       throw new ConflictException(`La ejecución ${job.id} está cancelada; no se pueden regenerar items`);
     }
@@ -1138,7 +1428,7 @@ export class RunsService {
       costKind,
       previousItemRunId: outcome.previousItemRunId,
       previousGeneration: outcome.previousGeneration,
-      item: this.toItemDto(row),
+      item: this.toItemDto(row, frozenVideoDeliveryOf(job.input_payload)),
       affected,
       run: await this.buildRunDto(await this.loadJobById(job.id), manifest),
     };
@@ -1435,6 +1725,63 @@ export class RunsService {
       }
     }
     return { kind: 'created', itemRunId: primary.id, previousItemRunId: latest.id, previousGeneration: Number(latest.generation), affected };
+  }
+
+  // ── DN-1: gate de entrega de video ──────────────────────────────────────
+
+  private videoCountOf(manifest: ManifestDto): number {
+    return manifest.manifest.items.filter((it) => it.type === 'video').length;
+  }
+
+  /**
+   * Items `video` (generación vigente) en `statuses` que, si vuelven a
+   * pending, ENVIARÍAN un video nuevo a Videogen: los que no tienen un job
+   * registrado (`external.videogenJobId`). Un video en fase de subida o con
+   * job ya enviado se re-pollea/re-sube sin gasto de Videogen.
+   */
+  private async videoSubmissionsIfReopened(
+    q: { query: (sql: string, params?: any[]) => Promise<any> },
+    jobId: string,
+    statuses: string[],
+  ): Promise<number> {
+    const rows: Array<{ output_summary: Record<string, any> | null }> = await q.query(
+      `select g.output_summary from public.generation_item_runs g
+        where g.job_id = $1 and g.type = 'video' and g.status = any($2::text[]) and ${latestGenerationPredicate('g')}`,
+      [jobId, statuses],
+    );
+    return rows.filter((r) => !r.output_summary?.external?.videogenJobId).length;
+  }
+
+  /** Preflight de YouTube del servidor; sin el servicio (harness) → falla cerrado. */
+  private async serverYoutubePreflight(ownerId: string): Promise<{ ok: boolean; reason?: string }> {
+    if (!this.youtubePreflight) return { ok: false, reason: 'preflight_unavailable' };
+    try {
+      const r: YoutubePreflightResult = await this.youtubePreflight.check(ownerId);
+      return r.ok ? { ok: true } : { ok: false, reason: r.reason ?? 'channel_unresolved' };
+    } catch (err) {
+      // Error inesperado (DB, config): nunca se deja pasar un run con gasto.
+      this.logger.warn(`preflight de YouTube falló con error inesperado para owner=${ownerId}: ${err instanceof Error ? err.message : String(err)}`);
+      return { ok: false, reason: 'preflight_unavailable' };
+    }
+  }
+
+  /** Traba del gate (o null): mismo criterio que enforceVideoGate, sin lanzar (dryRun). */
+  private async videoGateBlocker(ownerId: string, gate: VideoDeliveryGateResult): Promise<{ code: string; message: string; reason?: string } | null> {
+    if (gate.ok === false) return { code: gate.code, message: gate.message };
+    if (!gate.requiresYoutubePreflight) return null;
+    const pre = await this.serverYoutubePreflight(ownerId);
+    if (pre.ok) return null;
+    return { code: YOUTUBE_PREFLIGHT_FAILED, message: youtubePreflightFailedMessage(pre.reason as string), reason: pre.reason };
+  }
+
+  /**
+   * DN-1: 409 `video_delivery_not_youtube` o `youtube_preflight_failed:<reason>`
+   * si el camino va a enviar video real sin una entrega YouTube verificada.
+   * Se llama SIEMPRE antes de cualquier escritura del camino.
+   */
+  private async enforceVideoGate(ownerId: string, gate: VideoDeliveryGateResult): Promise<void> {
+    const b = await this.videoGateBlocker(ownerId, gate);
+    if (b) throw new ConflictException({ message: b.message, code: b.code, ...(b.reason ? { reason: b.reason } : {}) });
   }
 
   // ── internals ────────────────────────────────────────────────────────────
@@ -1939,6 +2286,8 @@ export class RunsService {
 
     const order = new Map(manifest.manifest.items.map((it, i) => [it.key, i]));
     rows.sort((a: any, b: any) => (order.get(a.item_key) ?? 1e9) - (order.get(b.item_key) ?? 1e9));
+    const strategy = frozenVideoDeliveryOf(job.input_payload);
+    const itemDtos = rows.map((r: any) => this.toItemDto(r, strategy));
 
     return {
       id: job.id,
@@ -1950,14 +2299,15 @@ export class RunsService {
       status: job.status,
       workerStatus: job.worker_status,
       videoMode: this.videoModeOf(job),
-      videoDelivery: frozenVideoDeliveryOf(job.input_payload),
+      videoDelivery: strategy,
+      videoDeliverySummary: this.videoDeliverySummaryOf(itemDtos),
       courseContextSha256: ctx.context_hash,
       courseContext: ctx.context,
       createdAt: toIso(job.created_at),
       updatedAt: toIso(job.updated_at),
       finishedAt: toIso(job.finished_at),
       progress,
-      items: rows.map((r: any) => this.toItemDto(r)),
+      items: itemDtos,
     };
   }
 
@@ -1994,7 +2344,21 @@ export class RunsService {
     return { ...all, total, pct: total > 0 ? all.completed / total : 0, byType };
   }
 
-  private toItemDto(r: any): ItemRunDto {
+  /** DN-1: conteo por estado de entrega de los items video (null si no hay videos). */
+  private videoDeliverySummaryOf(items: ItemRunDto[]): RunVideoDeliverySummary | null {
+    const videos = items.filter((i) => i.delivery);
+    if (videos.length === 0) return null;
+    const byState: Record<string, number> = {};
+    for (const v of videos) byState[v.delivery!.state] = (byState[v.delivery!.state] ?? 0) + 1;
+    const needsAttention = videos.some((v) => (v.delivery!.actions ?? []).length > 0);
+    return { total: videos.length, byState, needsAttention };
+  }
+
+  private toItemDto(r: any, strategy?: VideoDeliveryStrategy): ItemRunDto {
+    const delivery =
+      r.type === 'video' && strategy
+        ? deliveryViewOf({ strategy, itemStatus: r.status, error: r.error ?? null, outputSummary: r.output_summary ?? {} })
+        : undefined;
     return {
       id: r.id,
       itemKey: r.item_key,
@@ -2010,6 +2374,7 @@ export class RunsService {
       error: r.error ?? null,
       idempotencyKey: r.idempotency_key,
       outputSummary: r.output_summary ?? {},
+      ...(delivery ? { delivery } : {}),
       createdAt: toIso(r.created_at),
       updatedAt: toIso(r.updated_at),
       finishedAt: toIso(r.finished_at),

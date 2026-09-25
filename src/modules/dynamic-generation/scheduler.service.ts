@@ -571,8 +571,15 @@ export class SchedulerService {
     });
   }
 
-  async failItem(itemRunId: string, executorId: string, error: string, retryable: boolean, ownerId?: string): Promise<boolean> {
-    return (await this.failItemDetailed(itemRunId, executorId, error, retryable, ownerId)).ok;
+  async failItem(
+    itemRunId: string,
+    executorId: string,
+    error: string,
+    retryable: boolean,
+    ownerId?: string,
+    opts?: { retryAfterSeconds?: number },
+  ): Promise<boolean> {
+    return (await this.failItemDetailed(itemRunId, executorId, error, retryable, ownerId, opts)).ok;
   }
 
   /**
@@ -585,11 +592,12 @@ export class SchedulerService {
     error: string,
     retryable: boolean,
     ownerId?: string,
+    opts?: { retryAfterSeconds?: number },
   ): Promise<ItemOpResult> {
     executorId = this.checkExecutorId(executorId);
     const msg = String(error ?? '').trim().slice(0, MAX_ERROR_LENGTH) || 'unknown_error';
     return this.guardedItemOp(itemRunId, executorId, ownerId, 'update', async (qr, job, item) => {
-      const t = await applyItemFailure(qr, item.id, msg, !!retryable);
+      const t = await applyItemFailure(qr, item.id, msg, !!retryable, opts?.retryAfterSeconds ?? null);
       if (!t) throw new GuardRejection('not_running');
       await recomputeRunStatus(qr, job.id);
     });
