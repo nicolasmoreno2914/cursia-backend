@@ -69,6 +69,9 @@ jobs:
       - name: Check Packaging exam/video mapping by UUID (Fase 5B.1)
         run: node scripts/check-packaging-exam-video-mapping.js
 
+      - name: Check dynamic video delivery (Fase 5B.2.A)
+        run: node scripts/check-dynamic-video-delivery.js
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh

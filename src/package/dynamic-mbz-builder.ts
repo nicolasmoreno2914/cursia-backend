@@ -261,12 +261,19 @@ function libroCardHtml(libroMid: number): string {
     + `</div>`;
 }
 
-function chapterIntroHtml(ch: PackagingChapterPlan, color: ModuleColor, hasVideo: boolean): string {
+/**
+ * 5B.2.A: `videoDelivery` solo cambia el TEXTO del aviso de video. Con
+ * `undefined` (Videogen directo) el HTML es exactamente el de 5B.1.
+ */
+function chapterIntroHtml(ch: PackagingChapterPlan, color: ModuleColor, hasVideo: boolean, videoDelivery?: 'youtube'): string {
+  const videoNotice = videoDelivery === 'youtube'
+    ? `<p>🎬 Este capítulo incluye un video que se abre en YouTube.</p>`
+    : `<p>🎬 Este capítulo incluye un video que se abre en una pestaña externa.</p>`;
   return `<div style="border-left:4px solid #${color.main};padding:16px 20px;font-family:'Segoe UI',Arial,sans-serif;">`
     + `<span style="text-transform:uppercase;font-size:11px;font-weight:700;color:#${color.main};">Capítulo ${ch.chapterNumber}</span>`
     + `<h2 style="margin:6px 0;">${esc(ch.title)}</h2>`
     + (ch.objective ? `<p>${esc(ch.objective)}</p>` : '')
-    + (hasVideo ? `<p>🎬 Este capítulo incluye un video que se abre en una pestaña externa.</p>` : '')
+    + (hasVideo ? videoNotice : '')
     + `</div>`;
 }
 
@@ -277,7 +284,10 @@ function ctaLabelHtml(ch: PackagingChapterPlan, color: ModuleColor, scormMid: nu
     + `</div>`;
 }
 
-function videoUrlIntroHtml(ch: PackagingChapterPlan): string {
+function videoUrlIntroHtml(ch: PackagingChapterPlan, videoDelivery?: 'youtube'): string {
+  if (videoDelivery === 'youtube') {
+    return `<p>Video del capítulo ${ch.chapterNumber} — ${esc(ch.title)}. Este video se abre en YouTube (no está embebido en el curso).</p>`;
+  }
   return `<p>Video del capítulo ${ch.chapterNumber} — ${esc(ch.title)}. Este video se abre en una pestaña externa (no está embebido en el curso).</p>`;
 }
 
@@ -684,7 +694,8 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
 
       // 1. Intro
       const introName = safeActivityName(`📖 Capítulo ${ch.chapterNumber} — ${ch.title}`);
-      const introContent = sanitizeTokens(chapterIntroHtml(ch, color, !!ch.videoItemKey));
+      const chapterVideoDelivery = ch.videoItemKey ? contents.videos.get(ch.chapterId)?.delivery : undefined;
+      const introContent = sanitizeTokens(chapterIntroHtml(ch, color, !!ch.videoItemKey, chapterVideoDelivery));
       const introDir = `activities/label_${introMid}`;
       zip.file(`${introDir}/label.xml`, labelXmlWithCtx(introAid, introMid, introCtx, introName, introContent, ts));
       zip.file(`${introDir}/module.xml`, moduleXml(introMid, 'label', mod.sectionNum, ts, MV.bv));
@@ -700,7 +711,7 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
         const video = contents.videos.get(ch.chapterId)!;
         const videoName = safeActivityName(`🎬 Video del capítulo ${ch.chapterNumber} — ${ch.title}`);
         const videoDir = `activities/url_${videoMid}`;
-        const videoIntro = sanitizeTokens(videoUrlIntroHtml(ch));
+        const videoIntro = sanitizeTokens(videoUrlIntroHtml(ch, video.delivery));
         zip.file(`${videoDir}/url.xml`, urlActivityXml({ aid: videoAid, mid: videoMid, ctx: videoCtx, name: videoName, introHtml: videoIntro, externalUrl: video.url, ts }));
         zip.file(`${videoDir}/module.xml`, moduleXml(videoMid, 'url', mod.sectionNum, ts, MV.bv));
         zip.file(`${videoDir}/inforef.xml`, inforefXml());

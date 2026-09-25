@@ -7,7 +7,8 @@ import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import { GenerationManifestsService, ManifestDto } from '../modules/generation-manifests/generation-manifests.service';
 import { CourseBlueprintsService } from '../modules/course-blueprints/course-blueprints.service';
 import { buildPackagingPlan } from '../modules/dynamic-packaging/packaging-plan';
-import { loadArtifactText, parseDynamicVideo, resolveRunArtifacts } from '../modules/dynamic-packaging/artifact-resolver';
+import { loadArtifactText, loadRunVideoDelivery, parseDynamicVideo, resolveRunArtifacts } from '../modules/dynamic-packaging/artifact-resolver';
+import type { VideoDeliveryStrategy } from '../modules/dynamic-generation/dynamic-video-delivery';
 import { sortedArtifactIds, sourceIdsHash as computeSourceIdsHash } from '../modules/dynamic-packaging/packaging-reuse-key';
 import { buildDynamicMbz, DYNAMIC_MBZ_BUILDER_VERSION } from '../package/dynamic-mbz-builder';
 import type { DynamicPackageContents, PackagingPlan, ResolvedArtifact } from '../modules/dynamic-packaging/packaging-types';
@@ -123,11 +124,12 @@ async function loadContentsForPlan(
   ownerId: string,
   plan: PackagingPlan,
   byItem: Map<string, ResolvedArtifact[]>,
+  videoDelivery: VideoDeliveryStrategy = 'videogen_direct',
 ): Promise<DynamicPackageContents> {
   const contentMd = new Map<string, string>();
   const scorm = new Map<string, { html: string; manifestXml: string }>();
   const examGift = new Map<string, string>();
-  const videos = new Map<string, { url: string; videogenJobId: string }>();
+  const videos: DynamicPackageContents['videos'] = new Map();
 
   const artifactsFor = (key: string): ResolvedArtifact[] => {
     const list = byItem.get(key);
@@ -166,7 +168,8 @@ async function loadContentsForPlan(
       scorm.set(c.chapterId, { html, manifestXml });
       if (c.videoItemKey) {
         const videoText = await deps.loadText(deps.artifacts, ownerId, artifactFor(c.videoItemKey));
-        videos.set(c.chapterId, deps.parseVideo(JSON.parse(videoText)));
+        // 5B.2.A: la URL de entrega sale de la estrategia CONGELADA del run.
+        videos.set(c.chapterId, deps.parseVideo(JSON.parse(videoText), videoDelivery));
       }
     }
     if (m.examItemKey) {
@@ -223,7 +226,8 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
     const plan = deps.buildPlan(manifest.manifest, blueprint.snapshot, { manifestId: manifest.id });
     if (leaseLost) return;
 
-    const contents = await loadContentsForPlan(deps, job.owner_id, plan, byItem);
+    const videoDelivery = await loadRunVideoDelivery({ query: deps.dataSource.query.bind(deps.dataSource) }, runId);
+    const contents = await loadContentsForPlan(deps, job.owner_id, plan, byItem, videoDelivery);
     if (leaseLost) return;
 
     const buffer = await deps.buildMbz({ plan, contents });
