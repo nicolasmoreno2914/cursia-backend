@@ -62,7 +62,7 @@ esto no es una propuesta, es lo que ya existe y funciona:
 - Ramas reales: `main` (producción), `staging`, más `feature/*`.
 - **Ya existen dos workflows de deploy completamente separados**:
   `.github/workflows/deploy.yml` (trigger solo `push: main` → VPS Contabo
-  `167.86.98.162`, directorio `cursia-backend`, procesos PM2
+  `<VPS_HOST>`, directorio `cursia-backend`, procesos PM2
   `cursia-backend`/`cursia-*-worker`) y
   `.github/workflows/deploy-staging.yml` (trigger solo `push: staging` →
   **mismo VPS pero directorio, puerto y procesos PM2 propios**
