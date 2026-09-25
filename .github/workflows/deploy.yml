@@ -124,6 +124,8 @@ jobs:
                ensure_pm2_process cursia-gamma-worker start:gamma-worker
                ensure_pm2_process cursia-package-worker start:package-worker
                ensure_pm2_process cursia-full-worker start:full-worker
+               ensure_pm2_process cursia-dynamic-item-worker start:dynamic-item-worker
+               ensure_pm2_process cursia-dynamic-package-worker start:dynamic-package-worker
                sudo pm2 save
                sudo pm2 status
 
