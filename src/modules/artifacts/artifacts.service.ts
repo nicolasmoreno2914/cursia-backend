@@ -33,6 +33,10 @@ export interface UploadBufferArtifactInput {
   metadata?: Record<string, any>;
   storageBucket?: string;
   storageProvider?: string;
+  /** M9 (fase5b-audit integral-review.md): false para paths inmutables por-contenido
+   *  (p.ej. dynamic_mbz, con el hash de sus fuentes en el path). Default true
+   *  (comportamiento legacy) — mismo patrón que UploadJsonArtifactInput.upsert. */
+  upsert?: boolean;
 }
 
 /**
@@ -156,7 +160,7 @@ export class ArtifactsService {
       headers: {
         ...supabaseServiceHeaders(serviceKey),
         'Content-Type': input.mimeType,
-        'x-upsert': 'true',
+        'x-upsert': input.upsert === false ? 'false' : 'true',
       },
       body: input.buffer as unknown as BodyInit,
     });
