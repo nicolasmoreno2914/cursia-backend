@@ -48,6 +48,25 @@ export interface PackageStatusResult {
   artifactId?: string;
   downloadUrl?: string;
   error?: string;
+  /**
+   * F78-BE2: ¿el paquete devuelto es el VIGENTE? Solo `true` cuando el job
+   * está `completed` y su clave de reuse (builder + versión de Moodle + ids de
+   * artifacts de origen) ya no coincide con la del run hoy (p.ej. un item se
+   * regeneró después de empaquetar) o el run está regenerando. Un `.mbz`
+   * stale sigue siendo descargable (histórico), pero la UI debe ofrecer
+   * "Preparar paquete" de nuevo: POST …/package construye uno nuevo.
+   */
+  stale: boolean;
+  /** Motivo corto cuando `stale`: run_in_progress | builder_changed | sources_changed | artifacts_unresolvable. */
+  staleReason?: string;
+  /** Items (por key/UUID) cuya salida vigente no está en el paquete (sources_changed). */
+  staleItemKeys?: string[];
+}
+
+interface BuildFreshness {
+  stale: boolean;
+  reason?: string;
+  staleItemKeys?: string[];
 }
 
 /**
@@ -124,38 +143,72 @@ export class PackagingService {
    * igual que hace el worker antes de reusar un `dynamic_mbz`).
    */
   private async isSameBuild(run: any, manifest: ManifestDto, existing: PackageJobRow): Promise<boolean> {
+    return !(await this.buildFreshness(run, manifest, existing)).stale;
+  }
+
+  /**
+   * F78-BE2: compara el job `completed` contra el build que saldría HOY del
+   * run: mismo `builderVersion` y misma clave de reuse (packageReuseHash sobre
+   * los artifacts resueltos con la generación completed vigente de cada item
+   * — el mismo resolver que usa el worker). Fuente única para el reuse de
+   * requestPackage y el `stale` de getPackageStatus.
+   */
+  private async buildFreshness(run: any, manifest: ManifestDto, existing: PackageJobRow): Promise<BuildFreshness> {
+    const runDone = run.worker_status === RUN_DONE_STATUS || run.status === RUN_DONE_STATUS;
+    if (!runDone) {
+      return { stale: true, reason: `run_in_progress: la ejecución está ${run.worker_status} (hay items regenerándose); el paquete puede no incluir su salida nueva` };
+    }
     const existingBuilderVersion = existing.output_summary?.builderVersion;
-    if (existingBuilderVersion !== DYNAMIC_MBZ_BUILDER_VERSION) return false;
+    if (existingBuilderVersion !== DYNAMIC_MBZ_BUILDER_VERSION) {
+      return { stale: true, reason: `builder_changed: el paquete se construyó con el builder ${existingBuilderVersion ?? '?'} (actual ${DYNAMIC_MBZ_BUILDER_VERSION})` };
+    }
     try {
       const byItem = await resolveRunArtifacts({ query: this.dataSource.query.bind(this.dataSource) }, run.id, manifest.manifest);
       const ids = sortedArtifactIds(byItem);
       // I3 (review-it2): misma clave que el worker (incluye la versión de
       // Moodle resuelta; idéntica a la de antes con la versión default). Un
-      // DYNAMIC_MBZ_MOODLE_VERSION inválido lanza acá → no se reusa → el job
+      // DYNAMIC_MBZ_MOODLE_VERSION inválido lanza acá → stale → el job
       // nuevo falla ruidoso en el worker con el mensaje de config.
       const currentHash = packageReuseHash(DYNAMIC_MBZ_BUILDER_VERSION, ids, resolveDynamicMoodleVersion().resolved);
-      return currentHash === existing.output_summary?.sourceIdsHash;
+      if (currentHash === existing.output_summary?.sourceIdsHash) return { stale: false };
+      const packaged = new Set<string>(Array.isArray(existing.output_summary?.sourceArtifactIds) ? existing.output_summary.sourceArtifactIds : []);
+      const staleItemKeys = [...byItem.entries()]
+        .filter(([, list]) => list.some((a) => !packaged.has(a.artifactId)))
+        .map(([key]) => key)
+        .sort();
+      return {
+        stale: true,
+        reason: `sources_changed: ${staleItemKeys.length} item(s) tienen salida más nueva que el paquete (p.ej. se regeneraron después de empaquetar)`,
+        staleItemKeys,
+      };
     } catch (err) {
       // Si el run ya no resuelve limpio (p.ej. artifacts borrados), no se
-      // puede confirmar que sea el mismo build — más seguro crear uno nuevo
-      // que reusar a ciegas.
-      this.logger.warn(`isSameBuild: no se pudo resolver artifacts para runId=${run.id}: ${err instanceof Error ? err.message : String(err)}`);
-      return false;
+      // puede confirmar que sea el mismo build — nunca se lo presenta como vigente.
+      const detail = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`buildFreshness: no se pudo resolver artifacts para runId=${run.id}: ${detail}`);
+      return { stale: true, reason: `artifacts_unresolvable: ${detail.slice(0, 300)}` };
     }
   }
 
   /** GET …/runs/:runId/package. */
   async getPackageStatus(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<PackageStatusResult> {
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
-    await this.loadRunRow(courseId, manifest, runId); // valida ownership + que el run pertenezca al curso/Manifest
+    const run = await this.loadRunRow(courseId, manifest, runId); // valida ownership + que el run pertenezca al curso/Manifest
 
     const job = await this.findLatestPackageJob(runId);
     if (!job) {
       throw new NotFoundException(`No hay ningún empaquetado iniciado para la ejecución ${runId}`);
     }
 
-    const result: PackageStatusResult = { status: job.worker_status };
+    const result: PackageStatusResult = { status: job.worker_status, stale: false };
     if (job.worker_status === 'completed') {
+      // F78-BE2: nunca devolver un paquete desactualizado como si fuera el vigente.
+      const fresh = await this.buildFreshness(run, manifest, job);
+      if (fresh.stale) {
+        result.stale = true;
+        result.staleReason = fresh.reason;
+        if (fresh.staleItemKeys) result.staleItemKeys = fresh.staleItemKeys;
+      }
       const artifactId = job.output_summary?.artifactId as string | undefined;
       if (artifactId) {
         result.artifactId = artifactId;
