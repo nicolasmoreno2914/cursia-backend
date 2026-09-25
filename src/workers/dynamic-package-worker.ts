@@ -136,29 +136,39 @@ async function loadContentsForPlan(
   const examGift = new Map<string, string>();
   const videos = new Map<string, { url: string; videogenJobId: string }>();
 
-  const artifactFor = (key: string): ResolvedArtifact => {
+  const artifactsFor = (key: string): ResolvedArtifact[] => {
     const list = byItem.get(key);
     if (!list?.length) throw new Error(`falta el artifact resuelto para el item "${key}" (integridad rota tras resolveRunArtifacts)`);
-    return list[0];
+    return list;
   };
+  const artifactFor = (key: string): ResolvedArtifact => artifactsFor(key)[0];
 
   for (const m of plan.modules) {
     for (const c of m.chapters) {
       contentMd.set(c.chapterId, await deps.loadText(deps.artifacts, ownerId, artifactFor(c.contentItemKey)));
-      const scormHtml = await deps.loadText(deps.artifacts, ownerId, artifactFor(c.scormItemKey));
-      // Contrato mínimo (ver B1/B2): el artifact dynamic_scorm_html trae HTML
-      // y manifiesto concatenados como JSON {html, manifestXml} — si B1/B2
-      // cambian el contrato exacto, solo este parseo debe ajustarse.
-      let html = scormHtml;
-      let manifestXml = '';
-      try {
-        const parsed = JSON.parse(scormHtml) as { html?: string; manifestXml?: string };
-        if (typeof parsed?.html === 'string') {
-          html = parsed.html;
-          manifestXml = parsed.manifestXml ?? '';
+
+      // El contrato real del resolver (B1) resuelve un item 'scorm' a DOS
+      // artifacts (dynamic_scorm_html + dynamic_scorm_manifest) — se
+      // seleccionan por `type` cuando resolveArtifacts los separó así. El
+      // placeholder de este bloque (artifact-resolver.ts, hasta que se
+      // integre B1) devuelve uno solo con ambos campos como JSON
+      // {html, manifestXml} — se soportan las dos formas sin tocar este
+      // archivo de nuevo cuando se integre el B1 real.
+      const scormArtifacts = artifactsFor(c.scormItemKey);
+      const htmlArtifact = scormArtifacts.find((a) => a.type === 'dynamic_scorm_html') ?? scormArtifacts[0];
+      const manifestArtifact = scormArtifacts.find((a) => a.type === 'dynamic_scorm_manifest');
+      let html = await deps.loadText(deps.artifacts, ownerId, htmlArtifact);
+      let manifestXml = manifestArtifact ? await deps.loadText(deps.artifacts, ownerId, manifestArtifact) : '';
+      if (!manifestArtifact) {
+        try {
+          const parsed = JSON.parse(html) as { html?: string; manifestXml?: string };
+          if (typeof parsed?.html === 'string') {
+            html = parsed.html;
+            manifestXml = parsed.manifestXml ?? '';
+          }
+        } catch {
+          /* no era JSON: se usa tal cual como html, manifestXml queda vacío */
         }
-      } catch {
-        /* no era JSON: se usa tal cual como html, manifestXml queda vacío */
       }
       scorm.set(c.chapterId, { html, manifestXml });
       if (c.videoItemKey) {
