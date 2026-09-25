@@ -37,6 +37,26 @@ export interface UploadBufferArtifactInput {
    *  (p.ej. dynamic_mbz, con el hash de sus fuentes en el path). Default true
    *  (comportamiento legacy) — mismo patrón que UploadJsonArtifactInput.upsert. */
   upsert?: boolean;
+  /**
+   * I2 (review-it2): solo con `upsert:false` sobre un path direccionado por
+   * contenido. Si Storage responde "already exists" (un intento previo subió
+   * el objeto pero murió antes de insertar el row de `artifacts`), se verifica
+   * que el objeto exista (HEAD, tamaño > 0) y se crea el row apuntando a él en
+   * vez de fallar para siempre. Si no se puede verificar, se lanza el error
+   * original del upload. Default false (comportamiento previo).
+   */
+  adoptExistingOnConflict?: boolean;
+}
+
+/**
+ * Supabase Storage responde a un POST con `x-upsert:false` sobre un objeto
+ * existente con HTTP 400 y body `{"statusCode":"409","error":"Duplicate",…}`
+ * (versiones más nuevas pueden responder 409 directo).
+ */
+export function isStorageDuplicateResponse(status: number, body: string): boolean {
+  if (status === 409) return true;
+  if (status !== 400) return false;
+  return /"statusCode"\s*:\s*"?409"?/.test(body) || /\bDuplicate\b/i.test(body) || /already exists/i.test(body);
 }
 
 /**
@@ -165,9 +185,28 @@ export class ArtifactsService {
       body: input.buffer as unknown as BodyInit,
     });
 
+    let sizeBytes = input.buffer.length;
+    let metadata = input.metadata ?? {};
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`Supabase Storage upload failed: ${response.status} ${errorText}`);
+      const uploadError = new Error(`Supabase Storage upload failed: ${response.status} ${errorText}`);
+      if (!(input.adoptExistingOnConflict && input.upsert === false && isStorageDuplicateResponse(response.status, errorText))) {
+        throw uploadError;
+      }
+      // I2: el objeto inmutable ya existe (crash entre Storage y el row) —
+      // se adopta solo si se puede verificar que está ahí y no está vacío.
+      const existingSize = await this.headStorageObjectSize(supabaseUrl, serviceKey, bucket, encodedPath);
+      if (existingSize === null || existingSize <= 0) {
+        this.logger.error(
+          `uploadBufferArtifact: ${input.storagePath} reporta "already exists" pero no se pudo verificar el objeto (size=${existingSize}) — no se adopta`,
+        );
+        throw uploadError;
+      }
+      this.logger.warn(
+        `uploadBufferArtifact: ${input.storagePath} ya existía en Storage (${existingSize} bytes) sin row en artifacts — se adopta el objeto existente`,
+      );
+      sizeBytes = existingSize;
+      metadata = { ...metadata, adoptedExistingObject: true };
     }
 
     return this.create(
@@ -180,11 +219,25 @@ export class ArtifactsService {
         storage_bucket: bucket,
         filename: input.filename,
         mime_type: input.mimeType,
-        size_bytes: input.buffer.length,
-        metadata: input.metadata ?? {},
+        size_bytes: sizeBytes,
+        metadata,
       },
       input.ownerId,
     );
+  }
+
+  /** Tamaño (content-length) de un objeto de Storage vía HEAD autenticado; null si no existe o no se pudo leer. */
+  private async headStorageObjectSize(supabaseUrl: string, serviceKey: string, bucket: string, encodedPath: string): Promise<number | null> {
+    const headUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/authenticated/${bucket}/${encodedPath}`;
+    try {
+      const res = await fetch(headUrl, { method: 'HEAD', headers: supabaseServiceHeaders(serviceKey) });
+      if (!res.ok) return null;
+      const len = Number(res.headers.get('content-length'));
+      return Number.isFinite(len) ? len : null;
+    } catch (err) {
+      this.logger.warn(`headStorageObjectSize: HEAD falló para ${bucket}/${encodedPath}: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
   }
 
   // ── FIND ALL ────────────────────────────────────────────────────────────────
