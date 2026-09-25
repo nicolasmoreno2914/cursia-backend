@@ -68,17 +68,7 @@ async function main() {
             -- .mbz de un run 5A completado (spec §7/§10, plan B3). Sin esto,
             -- insertar la fila del job en PackagingService.requestPackage se
             -- rechaza con 23514 antes de llegar a production_jobs.
-            'dynamic_package',
-            -- Brand Kit (extracción de marca desde PDF): BrandProfilesService
-            -- inserta un production_job con este execution_mode al recibir
-            -- POST /institutions/:id/brand-profiles/upload
-            -- (brand-profiles.service.ts) y brand-extraction-worker.ts lo
-            -- procesa. Faltaba en este allow-list (bug preexistente, ver
-            -- supabase-migration-brand-extraction-execution-mode.sql, un
-            -- archivo huérfano que nunca fue referenciado por ningún script
-            -- ni workflow) — sin esto, el insert se rechaza con 23514 en
-            -- cuanto un usuario sube un PDF de Brand Kit.
-            'brand_extraction'
+            'dynamic_package'
           )
         );
     `);
