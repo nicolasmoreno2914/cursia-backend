@@ -75,6 +75,9 @@ jobs:
       - name: Check dynamic-package-worker hardening (review-it2 fix wave)
         run: node scripts/check-dynamic-package-worker-hardening.js
 
+      - name: Check dynamic feature gating (Fase 9 — G1/G3/G4 + video real I1)
+        run: node scripts/check-dynamic-feature-gating.js
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
@@ -120,6 +123,40 @@ jobs:
                  exit 1
                fi
 
+               # Fase 9 (flag-gating): V2 va detrás de flags de entorno que viven en
+               # el .env del VPS (no se sincroniza). Idempotente: solo AGREGA lo que
+               # falta; nunca imprime valores del .env, solo nombres de clave.
+               ensure_env_flag_true() {
+                 local key="$1"
+                 if grep -q "^${key}=" .env; then
+                   if grep -q "^${key}=true\$" .env; then
+                     echo "✓ ${key} presente en el .env de staging"
+                   else
+                     echo "⚠️  ${key} está en el .env de staging con un valor distinto de true — se respeta (apagado manual); V2 queda OFF"
+                   fi
+                 else
+                   printf "\n%s=true\n" "$key" >> .env
+                   echo "+ ${key} agregado al .env de staging"
+                 fi
+               }
+               ensure_env_list_contains() {
+                 local key="$1"
+                 local item="$2"
+                 if ! grep -q "^${key}=" .env; then
+                   printf "\n%s=%s\n" "$key" "$item" >> .env
+                   echo "+ ${key} agregado al .env de staging"
+                 elif grep "^${key}=" .env | head -n 1 | grep -qi "$item"; then
+                   echo "✓ ${key} ya incluye el owner de prueba de staging"
+                 else
+                   # awk portable (sin sed -i GNU): agrega ",item" a la PRIMERA línea KEY=… y
+                   # reescribe .env in-place con cat (conserva dueño/permisos).
+                   awk -v k="$key" -v it="$item" "!d && index(\$0, k \"=\") == 1 { \$0 = \$0 \",\" it; d = 1 } { print }" .env > .env.flags.tmp
+                   cat .env.flags.tmp > .env
+                   rm -f .env.flags.tmp
+                   echo "+ owner de prueba de staging agregado a ${key}"
+                 fi
+               }
+
                ensure_pm2_process() {
                  local name="$1"
                  local start_script="$2"
@@ -132,6 +169,11 @@ jobs:
 
                echo "━━━ [0/6] Verificar poppler-utils (pdftoppm — portadas de Gamma) ━━━"
                command -v pdftoppm > /dev/null 2>&1 || sudo apt-get install -y poppler-utils
+
+               echo "━━━ [0b] Flags V2 de staging (DYNAMIC_COURSE_STRUCTURE, DYNAMIC_REAL_VIDEO_OWNERS) ━━━"
+               ensure_env_flag_true DYNAMIC_COURSE_STRUCTURE
+               # Owner de prueba de staging (un id, no un secreto) habilitado para video real (Videogen).
+               ensure_env_list_contains DYNAMIC_REAL_VIDEO_OWNERS aa2fa9a1-afb1-4b01-8646-94a0cb272b57
 
                echo "━━━ [1/6] Instalar dependencias de producción ━━━"
                npm install --omit=dev
