@@ -4,7 +4,7 @@
 #
 # REQUISITOS (GitHub → Settings → Secrets and variables → Actions):
 #
-#   VPS_HOST        IP pública del VPS Contabo (167.86.98.162)
+#   VPS_HOST        IP pública del VPS Contabo (<VPS_HOST>)
 #   VPS_USER        Usuario SSH (cursia)
 #   VPS_SSH_KEY     Clave privada SSH ed25519 del usuario cursia
 #   VPS_PATH        /var/www/cursia-backend

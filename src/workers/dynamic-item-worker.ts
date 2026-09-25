@@ -4,7 +4,7 @@ import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DataSource } from 'typeorm';
 import { AppModule } from '../app.module';
-import { holdIdleIfDynamicDisabled } from './dynamic-worker-gate';
+import { MissingSchemaBackoff, holdIdleIfDynamicDisabled } from './dynamic-worker-gate';
 import { isRealVideoAllowedForOwner } from '../modules/features/dynamic-features';
 import { ClaimedItem, DEFAULT_LEASE_SECONDS, SchedulerService } from '../modules/dynamic-generation/scheduler.service';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
@@ -1090,9 +1090,21 @@ async function bootstrap() {
       `videoDeliveryConfig=${configuredDelivery})`,
   );
 
+  // M5: esquema V2 ausente (42P01) → inactivo con backoff, sin crash-loop.
+  const schema = new MissingSchemaBackoff(logger, 'dynamic-item-worker');
   while (!shuttingDown) {
+    let waitOverrideMs: number | null = null;
     while (!shuttingDown && activeItems.size < concurrency) {
-      const item = await deps.scheduler.claimNextItem({ executorId: deps.executorId, types: ['video'], leaseSeconds: deps.leaseSeconds });
+      let item: ClaimedItem | null;
+      try {
+        item = await deps.scheduler.claimNextItem({ executorId: deps.executorId, types: ['video'], leaseSeconds: deps.leaseSeconds });
+      } catch (err) {
+        const wait = schema.onClaimError(err);
+        if (wait === null) throw err; // otros errores: igual que antes
+        waitOverrideMs = wait;
+        break;
+      }
+      schema.onClaimOk();
       if (!item) break;
       logger.log(`Item reclamado: ${item.itemKey} (run ${item.runId})`);
       const promise = processItem(deps, item)
@@ -1100,7 +1112,7 @@ async function bootstrap() {
         .finally(() => { activeItems.delete(promise); });
       activeItems.add(promise);
     }
-    await sleep(activeItems.size >= concurrency ? 500 : pollMs);
+    await sleep(waitOverrideMs ?? (activeItems.size >= concurrency ? 500 : pollMs));
   }
 }
 
