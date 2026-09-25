@@ -2,14 +2,14 @@ import 'reflect-metadata';
 import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DataSource } from 'typeorm';
-import { createHash } from 'crypto';
 import { AppModule } from '../app.module';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import { GenerationManifestsService, ManifestDto } from '../modules/generation-manifests/generation-manifests.service';
 import { CourseBlueprintsService } from '../modules/course-blueprints/course-blueprints.service';
 import { buildPackagingPlan } from '../modules/dynamic-packaging/packaging-plan';
 import { loadArtifactText, parseDynamicVideo, resolveRunArtifacts } from '../modules/dynamic-packaging/artifact-resolver';
-import { buildDynamicMbz } from '../package/dynamic-mbz-builder';
+import { sortedArtifactIds, sourceIdsHash as computeSourceIdsHash } from '../modules/dynamic-packaging/packaging-reuse-key';
+import { buildDynamicMbz, DYNAMIC_MBZ_BUILDER_VERSION } from '../package/dynamic-mbz-builder';
 import type { DynamicPackageContents, PackagingPlan, ResolvedArtifact } from '../modules/dynamic-packaging/packaging-types';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -69,16 +69,6 @@ function artifactCourseId(job: PackageJobRow): string {
   return job.frontend_course_id ?? String(job.course_id);
 }
 
-function sortedArtifactIds(byItem: Map<string, ResolvedArtifact[]>): string[] {
-  const ids: string[] = [];
-  for (const list of byItem.values()) for (const a of list) ids.push(a.artifactId);
-  return [...new Set(ids)].sort();
-}
-
-function sha256OfIds(ids: string[]): string {
-  return createHash('sha256').update(ids.join(',')).digest('hex');
-}
-
 async function findExistingDynamicMbz(
   artifacts: ArtifactsService,
   ownerId: string,
@@ -87,9 +77,12 @@ async function findExistingDynamicMbz(
   sourceIdsHash: string,
 ): Promise<{ id: string } | null> {
   const list = await artifacts.findAll(ownerId, { courseId, type: 'dynamic_mbz' });
-  const match = list.find(
-    (a) => (a.metadata as Record<string, any> | null)?.runId === runId && (a.metadata as Record<string, any> | null)?.sourceIdsHash === sourceIdsHash,
-  );
+  const match = list.find((a) => {
+    const meta = a.metadata as Record<string, any> | null;
+    return meta?.runId === runId
+      && meta?.sourceIdsHash === sourceIdsHash
+      && meta?.builderVersion === DYNAMIC_MBZ_BUILDER_VERSION;
+  });
   return match ? { id: match.id } : null;
 }
 
@@ -207,7 +200,7 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
 
     const byItem = await deps.resolveArtifacts({ query: deps.dataSource.query.bind(deps.dataSource) }, runId, manifest.manifest);
     const ids = sortedArtifactIds(byItem);
-    const sourceIdsHash = sha256OfIds(ids);
+    const sourceIdsHash = computeSourceIdsHash(DYNAMIC_MBZ_BUILDER_VERSION, ids);
     if (leaseLost) return;
 
     // Restore-first: mismo runId + mismo set de artifacts de origen -> reusar.
@@ -217,6 +210,8 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
       const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
         artifactId: existing.id,
         sourceArtifactIds: ids,
+        sourceIdsHash,
+        builderVersion: DYNAMIC_MBZ_BUILDER_VERSION,
         reused: true,
       });
       if (!ok) logger.warn(`Job ${job.id}: completeJob devolvió false (lease perdida) tras reutilizar ${existing.id}`);
@@ -244,13 +239,15 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
       storagePath,
       buffer,
       mimeType: 'application/vnd.moodle.backup',
-      metadata: { runId, manifestId: manifest.id, sourceArtifactIds: ids, sourceIdsHash },
+      metadata: { runId, manifestId: manifest.id, sourceArtifactIds: ids, sourceIdsHash, builderVersion: DYNAMIC_MBZ_BUILDER_VERSION },
     });
     if (leaseLost) return;
 
     const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
       artifactId: artifact.id,
       sourceArtifactIds: ids,
+      sourceIdsHash,
+      builderVersion: DYNAMIC_MBZ_BUILDER_VERSION,
       reused: false,
     });
     if (!ok) {
@@ -269,15 +266,20 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
   }
 }
 
-async function claimNext(dataSource: DataSource, workerId: string, leaseSeconds: number): Promise<PackageJobRow | null> {
+/** Exportado (además de usarse en `bootstrap`) para poder probarlo directo desde tests/harnesses. */
+export async function claimNext(dataSource: DataSource, workerId: string, leaseSeconds: number): Promise<PackageJobRow | null> {
   const queryRunner = dataSource.createQueryRunner();
   await queryRunner.connect();
   await queryRunner.startTransaction();
   try {
+    // También reclama jobs 'running' cuya lease venció (crash o reload del
+    // worker, I3 integral-review) — mismo patrón de lease/heartbeat que
+    // 'queued'/'retrying'; el heartbeat del worker original (si sigue vivo)
+    // fallará porque worker_id ya no coincide tras este UPDATE.
     const candidates = await queryRunner.query(
       `select id from public.production_jobs
         where execution_mode = 'dynamic_package'
-          and worker_status in ('queued', 'retrying')
+          and worker_status in ('queued', 'retrying', 'running')
           and (next_retry_at is null or next_retry_at <= now())
           and (lease_until is null or lease_until < now())
         order by created_at asc limit 1 for update skip locked`,

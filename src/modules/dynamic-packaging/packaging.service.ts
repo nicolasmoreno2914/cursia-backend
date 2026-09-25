@@ -2,12 +2,18 @@ import { BadRequestException, ConflictException, Injectable, InternalServerError
 import { DataSource } from 'typeorm';
 import { GenerationManifestsService, ManifestDto } from '../generation-manifests/generation-manifests.service';
 import { ArtifactsService } from '../artifacts/artifacts.service';
+import { resolveRunArtifacts } from './artifact-resolver';
+import { sortedArtifactIds, sourceIdsHash } from './packaging-reuse-key';
+import { DYNAMIC_MBZ_BUILDER_VERSION } from '../../package/dynamic-mbz-builder';
 
 export const EXECUTION_MODE = 'dynamic_package';
 /** worker_status del job de run (dynamic_generation) que cuentan como "terminado con éxito". */
 const RUN_DONE_STATUS = 'completed';
-/** worker_status del job de package que se consideran "vivos" (una segunda POST los reutiliza). */
-const ALIVE_PACKAGE_STATUSES = ['queued', 'running', 'retrying', 'completed'];
+/** worker_status del job de package en curso — una segunda POST reutiliza el mismo job sin crear otro. */
+const IN_PROGRESS_PACKAGE_STATUSES = ['queued', 'running', 'retrying'];
+// worker_status terminal-fallido ('failed', 'failed_retryable', 'cancelled') y cualquier otro
+// status no contemplado caen al `else` implícito de requestPackage: nunca se reusan, siempre
+// se permite un job nuevo (I2/I3, integral-review) — no necesitan una constante propia.
 
 export interface PackageJobRow {
   id: string;
@@ -59,8 +65,17 @@ export class PackagingService {
    * POST …/runs/:runId/package. 404/400 vía manifests.get; 404 si el runId no
    * pertenece a este Manifest/curso; 409 con `missing[]` si el run no está
    * `completed` o le faltan items; si no, get-or-create del job
-   * `dynamic_package` (idempotente: una segunda POST devuelve el mismo job
-   * mientras siga vivo).
+   * `dynamic_package`.
+   *
+   * Idempotencia (I2/I3, integral-review):
+   * - Un job `queued`/`running`/`retrying` se reusa siempre (evita duplicar
+   *   trabajo en curso).
+   * - Un job `completed` se reusa SOLO si se construyó con el mismo
+   *   `DYNAMIC_MBZ_BUILDER_VERSION` actual y el mismo set de artifacts de
+   *   origen — si un fix cambió el builder, o el run se volvió a generar,
+   *   se crea un job nuevo en vez de devolver el `.mbz` viejo para siempre.
+   * - Un job `failed`/`failed_retryable`/`cancelled` NUNCA se reusa — un job
+   *   huérfano o fallido no debe bloquear un reintento.
    */
   async requestPackage(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<RequestPackageResult> {
     const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
@@ -68,12 +83,47 @@ export class PackagingService {
     await this.assertRunReady(run, manifest);
 
     const existing = await this.findLatestPackageJob(runId);
-    if (existing && ALIVE_PACKAGE_STATUSES.includes(existing.worker_status)) {
-      return { jobId: existing.id, status: existing.worker_status, created: false };
+    if (existing) {
+      if (IN_PROGRESS_PACKAGE_STATUSES.includes(existing.worker_status)) {
+        return { jobId: existing.id, status: existing.worker_status, created: false };
+      }
+      if (existing.worker_status === RUN_DONE_STATUS) {
+        const sameBuild = await this.isSameBuild(run, manifest, existing);
+        if (sameBuild) {
+          return { jobId: existing.id, status: existing.worker_status, created: false };
+        }
+        this.logger.log(
+          `requestPackage: job ${existing.id} completado con un build distinto (builderVersion u origen de artifacts cambió) — se crea un job nuevo para runId=${runId}`,
+        );
+      }
+      // FAILED_PACKAGE_STATUSES u otro status no contemplado: no se reusa, se crea uno nuevo.
     }
 
     const jobId = await this.insertPackageJob(run, manifest, blueprintNumber, runId);
     return { jobId, status: 'queued', created: true };
+  }
+
+  /**
+   * Compara el job `completed` existente contra el build actual: mismo
+   * `builderVersion` (metadata del worker, I2) y mismo set ordenado de
+   * artifact ids de origen (recalculado en vivo vía `resolveRunArtifacts`,
+   * igual que hace el worker antes de reusar un `dynamic_mbz`).
+   */
+  private async isSameBuild(run: any, manifest: ManifestDto, existing: PackageJobRow): Promise<boolean> {
+    const existingBuilderVersion = existing.output_summary?.builderVersion;
+    if (existingBuilderVersion !== DYNAMIC_MBZ_BUILDER_VERSION) return false;
+    try {
+      const byItem = await resolveRunArtifacts({ query: this.dataSource.query.bind(this.dataSource) }, run.id, manifest.manifest);
+      const ids = sortedArtifactIds(byItem);
+      const currentHash = sourceIdsHash(DYNAMIC_MBZ_BUILDER_VERSION, ids);
+      return currentHash === existing.output_summary?.sourceIdsHash;
+    } catch (err) {
+      // Si el run ya no resuelve limpio (p.ej. artifacts borrados), no se
+      // puede confirmar que sea el mismo build — más seguro crear uno nuevo
+      // que reusar a ciegas.
+      this.logger.warn(`isSameBuild: no se pudo resolver artifacts para runId=${run.id}: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
   }
 
   /** GET …/runs/:runId/package. */
@@ -122,6 +172,19 @@ export class PackagingService {
 
   /** 409 con `missing[]` si el run no terminó `completed` o hay items sin completar (falla fuerte, spec §"Trampas"). */
   private async assertRunReady(run: any, manifest: ManifestDto): Promise<void> {
+    // I4 (integral-review): un run con videoMode='mock' (el default en
+    // staging) nunca se empaqueta — el .mbz saldría "completed" con
+    // actividades url que apuntan a mock-cdn.cursia.local. Falla fuerte y
+    // visible ANTES de encolar el job de empaquetado, no en el worker.
+    const hasVideoItem = manifest.manifest.items.some((it) => it.type === 'video');
+    const videoMode = run.input_payload?.videoMode;
+    if (hasVideoItem && videoMode !== 'real') {
+      throw new ConflictException({
+        message: `run con videos simulados: no empaquetable (videoMode=${videoMode ?? 'mock'}). Solo se empaquetan runs generados con videoMode='real'.`,
+        missing: [],
+      });
+    }
+
     const items: Array<{ item_key: string; status: string }> = await this.dataSource.query(
       `select item_key, status from public.generation_item_runs where job_id = $1`,
       [run.id],

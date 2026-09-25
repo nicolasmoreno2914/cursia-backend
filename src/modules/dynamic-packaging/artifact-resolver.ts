@@ -163,12 +163,25 @@ export async function resolveRunArtifacts(
 }
 
 /**
+ * Timeout (ms) de cada descarga individual de artifact en `loadArtifactText`
+ * — I3 (integral-review): sin esto, una descarga colgada dejaba el job
+ * `running` para siempre (el heartbeat seguía extendiendo la lease mientras
+ * el `fetch` nunca resolvía). Configurable por env para poder ajustarlo en
+ * staging sin tocar código.
+ */
+export function artifactDownloadTimeoutMs(): number {
+  const raw = Number(process.env.DYNAMIC_PACKAGE_ARTIFACT_DOWNLOAD_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 60_000;
+}
+
+/**
  * Descarga el contenido de texto de un artifact resuelto, usando
  * `ArtifactsService.getDownloadUrl` (header `apikey` ya corregido en 5A) +
  * `fetch`. Falla fuerte si el servicio no puede producir una URL firmada
  * (p.ej. si `SUPABASE_SERVICE_ROLE_KEY` no está configurada, `getDownloadUrl`
  * cae a `method: 'frontend'` sin `url` — eso es un error de configuración
- * del backend, no un caso a degradar en silencio) o si la descarga falla.
+ * del backend, no un caso a degradar en silencio), si la descarga falla, o si
+ * tarda más de `artifactDownloadTimeoutMs()` (I3, integral-review).
  */
 export async function loadArtifactText(
   artifacts: ArtifactsService,
@@ -181,7 +194,18 @@ export async function loadArtifactText(
       `No se pudo obtener una URL de descarga para el artifact ${a.artifactId} (item ${a.itemKey}, method=${download.method}).`,
     );
   }
-  const response = await fetch(download.url);
+  const timeoutMs = artifactDownloadTimeoutMs();
+  let response: Response;
+  try {
+    response = await fetch(download.url, { signal: AbortSignal.timeout(timeoutMs) });
+  } catch (err) {
+    if (err instanceof Error && err.name === 'TimeoutError') {
+      throw new Error(
+        `Timeout de ${timeoutMs}ms descargando el artifact ${a.artifactId} (item ${a.itemKey}).`,
+      );
+    }
+    throw err;
+  }
   if (!response.ok) {
     throw new Error(
       `Fallo al descargar el artifact ${a.artifactId} (item ${a.itemKey}): HTTP ${response.status} ${response.statusText}`,
@@ -195,6 +219,19 @@ export interface ParsedDynamicVideo {
   videogenJobId: string;
 }
 
+/** Hosts de video que NUNCA son un download real de Videogen — I4, integral-review. */
+const MOCK_VIDEO_HOST_PATTERNS = [/\.local$/i, /^mock-cdn/i, /mock-cdn\./i];
+
+function isMockVideoHost(url: string): boolean {
+  let host = '';
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    return false;
+  }
+  return MOCK_VIDEO_HOST_PATTERNS.some((re) => re.test(host));
+}
+
 /**
  * Parsea el JSON de un artifact `dynamic_video` (spec §4, §6). Decisión del
  * usuario (spec §12.2): NUNCA se usa una signed URL temporal del bucket
@@ -202,6 +239,11 @@ export interface ParsedDynamicVideo {
  * persistente de Videogen. Se rechaza cualquier URL que no sea https o que
  * tenga forma de signed URL (`token=` en la query, o el patrón de Supabase
  * Storage `/object/sign/`).
+ *
+ * I4 (integral-review): también se rechaza fuerte cualquier video producido
+ * en modo simulado (`mode !== 'real'`, el default de staging) o cuya URL
+ * apunte a un host mock/local (`*.local`, `mock-cdn*`) — nunca se empaqueta
+ * un `.mbz` "exitoso" con links de video muertos.
  */
 export function parseDynamicVideo(json: string | Record<string, any>): ParsedDynamicVideo {
   const data = typeof json === 'string' ? JSON.parse(json) : json;
@@ -210,11 +252,18 @@ export function parseDynamicVideo(json: string | Record<string, any>): ParsedDyn
   }
   const url = data.downloadUrl;
   const videogenJobId = data.videogenJobId;
+  const mode = data.mode;
   if (typeof url !== 'string' || url.length === 0) {
     throw new Error('dynamic_video: falta downloadUrl (string) en el artifact.');
   }
   if (typeof videogenJobId !== 'string' || videogenJobId.length === 0) {
     throw new Error('dynamic_video: falta videogenJobId (string) en el artifact.');
+  }
+  if (mode !== 'real') {
+    throw new Error(
+      `dynamic_video: run con videos simulados: no empaquetable (mode=${mode ?? 'undefined'}, videogenJobId=${videogenJobId}). ` +
+        `Solo se empaquetan runs con videoMode='real'.`,
+    );
   }
   if (!/^https:\/\//i.test(url)) {
     throw new Error(`dynamic_video: downloadUrl debe ser https, encontrado: ${url}`);
@@ -223,6 +272,11 @@ export function parseDynamicVideo(json: string | Record<string, any>): ParsedDyn
     throw new Error(
       `dynamic_video: downloadUrl parece ser una signed URL temporal (contiene 'token=' o '/object/sign/'), ` +
         `prohibido dentro del .mbz por decisión del usuario (spec §12.2): ${url}`,
+    );
+  }
+  if (isMockVideoHost(url)) {
+    throw new Error(
+      `dynamic_video: run con videos simulados: no empaquetable (downloadUrl apunta a un host mock/local: ${url}).`,
     );
   }
   return { url, videogenJobId };

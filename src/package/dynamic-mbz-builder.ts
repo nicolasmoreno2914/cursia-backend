@@ -47,6 +47,16 @@ import {
   PackagingPlan,
 } from '../modules/dynamic-packaging/packaging-types';
 
+/**
+ * Versión del builder — sube cada vez que un fix cambia el `.mbz` producido
+ * (I2, integral-review: sin esto un run empaquetado una vez no se podía
+ * reempaquetar tras corregir un bug del builder, porque la clave restore-first
+ * solo dependía del set de artifacts de origen, idéntico antes y después del
+ * fix). Se incluye en el hash de reuse y en la metadata del artifact
+ * `dynamic_mbz` — ver `dynamic-package-worker.ts`.
+ */
+export const DYNAMIC_MBZ_BUILDER_VERSION = '1.1.0';
+
 // ─── Palette ────────────────────────────────────────────────────────────────
 
 interface ModuleColor { main: string; accent: string }
@@ -81,31 +91,139 @@ function escapeHtmlText(s: string): string {
 
 function inlineMd(s: string): string {
   let t = escapeHtmlText(s);
+  // Código inline primero, para que su contenido no lo toquen los patrones
+  // de negrita/cursiva/links de abajo.
+  t = t.replace(/`([^`]+)`/g, (_m, code) => `<code>${code}</code>`);
+  // Links [texto](url) — la URL ya viene HTML-escapada (escapeHtmlText arriba).
+  t = t.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_m, text, url) => `<a href="${url}">${text}</a>`);
   t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
   t = t.replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, '<em>$1</em>');
   return t;
 }
 
+// ─── Tablas GFM ─────────────────────────────────────────────────────────────
+
+function isTableRow(line: string): boolean {
+  return line.includes('|') && line.trim().length > 0;
+}
+
+function isTableSeparatorRow(line: string): boolean {
+  return /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(line);
+}
+
+function splitTableRow(line: string): string[] {
+  let t = line.trim();
+  if (t.startsWith('|')) t = t.slice(1);
+  if (t.endsWith('|')) t = t.slice(0, -1);
+  return t.split('|').map((c) => c.trim());
+}
+
 function mdToHtmlBasic(md: string): string {
   const lines = (md ?? '').split(/\r?\n/);
   let html = '';
-  let inList = false;
-  const closeList = () => { if (inList) { html += '</ul>\n'; inList = false; } };
-  for (const line of lines) {
+  let inUl = false;
+  let inOl = false;
+  let inBq = false;
+  const closeLists = () => {
+    if (inUl) { html += '</ul>\n'; inUl = false; }
+    if (inOl) { html += '</ol>\n'; inOl = false; }
+  };
+  const closeBq = () => { if (inBq) { html += '</blockquote>\n'; inBq = false; } };
+
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // GFM table: fila de encabezado + fila separadora (|---|---|)
+    if (isTableRow(line) && i + 1 < lines.length && isTableSeparatorRow(lines[i + 1])) {
+      closeLists();
+      closeBq();
+      const headerCells = splitTableRow(line);
+      html += '<table>\n<thead>\n<tr>'
+        + headerCells.map((c) => `<th>${inlineMd(c)}</th>`).join('')
+        + '</tr>\n</thead>\n<tbody>\n';
+      i += 2;
+      while (i < lines.length && isTableRow(lines[i]) && !isTableSeparatorRow(lines[i])) {
+        const cells = splitTableRow(lines[i]);
+        html += '<tr>' + cells.map((c) => `<td>${inlineMd(c)}</td>`).join('') + '</tr>\n';
+        i++;
+      }
+      html += '</tbody>\n</table>\n';
+      continue;
+    }
+
+    const h5 = line.match(/^#####\s+(.*)/);
+    const h4 = line.match(/^####\s+(.*)/);
     const h3 = line.match(/^###\s+(.*)/);
     const h2 = line.match(/^##\s+(.*)/);
     const h1 = line.match(/^#\s+(.*)/);
-    const li = line.match(/^[-*]\s+(.*)/);
-    if (h1) { closeList(); html += `<h1>${inlineMd(h1[1])}</h1>\n`; continue; }
-    if (h2) { closeList(); html += `<h2>${inlineMd(h2[1])}</h2>\n`; continue; }
-    if (h3) { closeList(); html += `<h3>${inlineMd(h3[1])}</h3>\n`; continue; }
-    if (li) { if (!inList) { html += '<ul>\n'; inList = true; } html += `<li>${inlineMd(li[1])}</li>\n`; continue; }
-    if (!line.trim()) { closeList(); continue; }
-    closeList();
+    const ol = line.match(/^\s*\d+[.)]\s+(.*)/);
+    const ul = line.match(/^\s*[-*]\s+(.*)/);
+    const bq = line.match(/^\s*>\s?(.*)/);
+    const hr = /^\s*(-{3,}|_{3,}|\*{3,})\s*$/.test(line);
+
+    if (h1) { closeLists(); closeBq(); html += `<h1>${inlineMd(h1[1])}</h1>\n`; i++; continue; }
+    if (h2) { closeLists(); closeBq(); html += `<h2>${inlineMd(h2[1])}</h2>\n`; i++; continue; }
+    if (h3) { closeLists(); closeBq(); html += `<h3>${inlineMd(h3[1])}</h3>\n`; i++; continue; }
+    if (h4) { closeLists(); closeBq(); html += `<h4>${inlineMd(h4[1])}</h4>\n`; i++; continue; }
+    if (h5) { closeLists(); closeBq(); html += `<h5>${inlineMd(h5[1])}</h5>\n`; i++; continue; }
+    if (hr) { closeLists(); closeBq(); html += '<hr/>\n'; i++; continue; }
+    if (bq) {
+      closeLists();
+      if (!inBq) { html += '<blockquote>\n'; inBq = true; }
+      html += `<p>${inlineMd(bq[1])}</p>\n`;
+      i++; continue;
+    }
+    closeBq();
+    if (ol) {
+      if (inUl) { html += '</ul>\n'; inUl = false; }
+      if (!inOl) { html += '<ol>\n'; inOl = true; }
+      html += `<li>${inlineMd(ol[1])}</li>\n`;
+      i++; continue;
+    }
+    if (ul) {
+      if (inOl) { html += '</ol>\n'; inOl = false; }
+      if (!inUl) { html += '<ul>\n'; inUl = true; }
+      html += `<li>${inlineMd(ul[1])}</li>\n`;
+      i++; continue;
+    }
+    if (!line.trim()) { closeLists(); i++; continue; }
+    closeLists();
     html += `<p>${inlineMd(line)}</p>\n`;
+    i++;
   }
-  closeList();
+  closeLists();
+  closeBq();
   return html;
+}
+
+// ─── Evitar título duplicado (h2 del builder + `# Capítulo N…` propio del md) ──
+
+function normalizeForCompare(s: string): string {
+  return s
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function stripLeadingDuplicateTitle(md: string, chapterTitle: string, chapterNumber: number): string {
+  const lines = (md ?? '').split(/\r?\n/);
+  let idx = 0;
+  while (idx < lines.length && !lines[idx].trim()) idx++;
+  if (idx >= lines.length) return md;
+  const m = lines[idx].match(/^#{1,3}\s+(.*)/);
+  if (!m) return md;
+  const headingNorm = normalizeForCompare(m[1]);
+  const titleNorm = normalizeForCompare(chapterTitle);
+  const capNorm = normalizeForCompare(`capitulo ${chapterNumber}`);
+  const looksLikeDuplicate = (titleNorm.length > 0 && (headingNorm.includes(titleNorm) || titleNorm.includes(headingNorm)))
+    || headingNorm.includes(capNorm);
+  if (!looksLikeDuplicate) return md;
+  const rest = lines.slice(idx + 1);
+  while (rest.length && !rest[0].trim()) rest.shift();
+  return rest.join('\n');
 }
 
 // ─── Deterministic templates (sin LLM — ver spec §5 "Determinísticos") ─────
@@ -179,7 +297,8 @@ function compileLibroHtml(courseTitle: string, orderedChapters: PackagingChapter
     .map((c) => `<li><a href="#cap-${c.chapterNumber}">Capítulo ${c.chapterNumber}: ${esc(c.title)}</a></li>`)
     .join('\n');
   const body = orderedChapters.map((c) => {
-    const md = contentMd.get(c.chapterId) ?? '';
+    const rawMd = contentMd.get(c.chapterId) ?? '';
+    const md = stripLeadingDuplicateTitle(rawMd, c.title, c.chapterNumber);
     return `<section id="cap-${c.chapterNumber}"><h2>Capítulo ${c.chapterNumber} — ${esc(c.title)}</h2>\n${mdToHtmlBasic(md)}</section>`;
   }).join('\n');
   return `<!DOCTYPE html>
@@ -354,7 +473,7 @@ function urlActivityXml(p: { aid: number; mid: number; ctx: number; name: string
     <intro>${xmlEsc(p.introHtml)}</intro>
     <introformat>1</introformat>
     <externalurl>${xmlEsc(p.externalUrl)}</externalurl>
-    <display>0</display>
+    <display>3</display>
     <displayoptions>a:0:{}</displayoptions>
     <parameters>a:0:{}</parameters>
     <timemodified>${p.ts}</timemodified>
@@ -374,13 +493,17 @@ const SECTION_BOILERPLATE_CONTENTBANK = '<?xml version="1.0" encoding="UTF-8"?>\
 
 // ─── Section derivation from the plan (spec §3) ────────────────────────────
 
+// course_sections.name es varchar(255) en Moodle — truncar como las
+// actividades (safeActivityName), nunca a mitad de un carácter multibyte.
+const SECTION_NAME_MAX = 255;
+
 function deriveSectionDefs(plan: PackagingPlan): SectionMeta[] {
   return plan.sections.map((s) => {
     if (s.kind === 'welcome') {
-      return { num: 0, name: s.title, summary: 'Bienvenida al curso, resumen y módulos.' };
+      return { num: 0, name: safeActivityName(s.title, SECTION_NAME_MAX), summary: 'Bienvenida al curso, resumen y módulos.' };
     }
     if (s.kind === 'route_and_book') {
-      return { num: 1, name: s.title, summary: 'Ruta de aprendizaje y Libro Guía del curso.' };
+      return { num: 1, name: safeActivityName(s.title, SECTION_NAME_MAX), summary: 'Ruta de aprendizaje y Libro Guía del curso.' };
     }
     const mod = plan.modules.find((m) => m.moduleId === s.moduleId);
     const chapterRange = mod && mod.chapters.length
@@ -390,7 +513,7 @@ function deriveSectionDefs(plan: PackagingPlan): SectionMeta[] {
       : 'Sin capítulos';
     const objectivePart = mod?.objective ? ` ${mod.objective}` : '';
     const examPart = mod?.examItemKey ? ' Incluye evaluación de módulo.' : '';
-    return { num: s.sectionNum, name: s.title, summary: `${chapterRange}.${objectivePart}${examPart}` };
+    return { num: s.sectionNum, name: safeActivityName(s.title, SECTION_NAME_MAX), summary: `${chapterRange}.${objectivePart}${examPart}` };
   });
 }
 
@@ -660,6 +783,11 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
     if (mod.examItemKey) {
       const gift = contents.examGift.get(mod.moduleId)!;
       const parsedQs = parseGIFT(gift);
+      if (parsedQs.length === 0) {
+        throw new Error(
+          `dynamic-mbz-builder: el GIFT del examen del módulo ${mod.moduleNumber} (${mod.moduleId}) no produjo ninguna pregunta parseable — empaquetado abortado (no se genera un quiz vacío).`,
+        );
+      }
 
       addLabel(mod.sectionNum, `ℹ️ Evaluación del módulo ${mod.moduleNumber}`, examDescriptionHtml(mod, parsedQs.length));
 
@@ -729,7 +857,7 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
         <questioncategoryid>${qCatId}</questioncategoryid><idnumber>$@NULL@$</idnumber><ownerid>2</ownerid>
         <question_version><question_versions id="${qvId}"><version>1</version><status>ready</status>
         <questions><question id="${thisQId}">
-          <parent>0</parent><name>${q.name || 'Q-' + (qi + 1)}</name>
+          <parent>0</parent><name>${xmlEsc(q.name || 'Q-' + (qi + 1))}</name>
           <questiontext>${xmlEsc(q.text)}</questiontext><questiontextformat>0</questiontextformat>
           <generalfeedback></generalfeedback><generalfeedbackformat>0</generalfeedbackformat>
           <defaultmark>1.0000000</defaultmark><penalty>0.3333333</penalty><qtype>${q.type}</qtype>
@@ -781,9 +909,13 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
 
   // ── course/* (mbz-builder.service.ts:1478-1505, adaptado) ───────────────
   const courseTitle = plan.course.title;
+  // course.fullname es varchar(254) en Moodle (shortname también encaja en
+  // ese límite) — truncar como las secciones/actividades, no a mitad de un
+  // carácter multibyte.
+  const courseTitleSafe = safeActivityName(courseTitle, 254);
   zip.file('course/course.xml', `<?xml version="1.0" encoding="UTF-8"?>
 <course id="1" contextid="1">
-  <shortname>${esc(courseTitle)}</shortname><fullname>${esc(courseTitle)}</fullname>
+  <shortname>${esc(courseTitleSafe)}</shortname><fullname>${esc(courseTitleSafe)}</fullname>
   <idnumber></idnumber><summary>${xmlEsc(plan.course.summary ?? '')}</summary><summaryformat>1</summaryformat>
   <format>topics</format><showgrades>1</showgrades><newsitems>5</newsitems>
   <startdate>${ts}</startdate><enddate>0</enddate><marker>0</marker>
