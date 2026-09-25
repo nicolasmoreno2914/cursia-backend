@@ -363,6 +363,7 @@ export class RunsService {
     blueprintNumber: number,
     runId: string,
     itemKey: string,
+    resubmitVideo = false,
   ): Promise<ItemRunDto> {
     const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
     let job = await this.loadRunRow(courseId, manifest, runId);
@@ -380,14 +381,22 @@ export class RunsService {
         throw new ConflictException(`La ejecución ${job.id} está cancelada; no se pueden reintentar items`);
       }
 
-      const items: Array<{ id: string; item_key: string; status: ItemRunStatus; depends_on: string[] }> =
-        await qr.query(
-          `select id, item_key, status, depends_on from public.generation_item_runs
+      const items: Array<{
+        id: string;
+        item_key: string;
+        status: ItemRunStatus;
+        depends_on: string[];
+        type: string;
+        error: string | null;
+        output_summary: Record<string, any> | null;
+      }> = await qr.query(
+        `select id, item_key, status, depends_on, type, error, output_summary
+            from public.generation_item_runs
             where job_id = $1 and generation = $2
             order by id
             for update`,
-          [job.id, GENERATION],
-        );
+        [job.id, GENERATION],
+      );
       const target = items.find((i) => i.item_key === itemKey);
       if (!target) {
         throw new NotFoundException(`El item "${itemKey}" no existe en la ejecución ${job.id}`);
@@ -398,12 +407,33 @@ export class RunsService {
         );
       }
 
-      const updated = returningRows(
-        await qr.query(
-          `update public.generation_item_runs
-              set status = 'pending',
-                  max_attempts = attempt_count + 3,
-                  output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object(
+      // I4/R23: resubmitVideo solo para items type='video' en 'failed' cuyo
+      // último error sea 'videogen_failed' (job terminal, no hay video → no
+      // es un segundo video) o 'ambiguous_video_submission' (requiere
+      // confirmación explícita del usuario en la UI). Mueve external/
+      // externalSubmitStartedAt a output_summary.previousExternals[] antes
+      // del retry normal, para que el worker someta de nuevo en vez de
+      // reutilizar/quedar envenenado por el marcador anterior.
+      let resubmitSetSql = '';
+      if (resubmitVideo) {
+        if (target.type !== 'video') {
+          throw new BadRequestException(`resubmitVideo solo aplica a items type="video"; "${itemKey}" es "${target.type}"`);
+        }
+        const err = target.error ?? '';
+        const eligible = err.startsWith('videogen_failed') || err.startsWith('ambiguous_video_submission');
+        if (!eligible) {
+          throw new BadRequestException(
+            `resubmitVideo solo aplica cuando el último error es "videogen_failed" o "ambiguous_video_submission"; "${itemKey}" falló con "${err}"`,
+          );
+        }
+        this.logger.warn(
+          `retryItem: resubmitVideo=true para item "${itemKey}" (run ${job.id}) — error previo "${err}"; ` +
+            'archivando external/externalSubmitStartedAt en previousExternals y sometiendo un video nuevo',
+        );
+        resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt'`;
+      }
+
+      const previousErrorsExpr = `coalesce(output_summary, '{}'::jsonb) || jsonb_build_object(
                     'previousErrors',
                     coalesce(output_summary->'previousErrors', '[]'::jsonb) || jsonb_build_array(jsonb_build_object(
                       'error', error,
@@ -411,7 +441,25 @@ export class RunsService {
                       'maxAttempts', max_attempts,
                       'retriedAt', now()
                     ))
-                  ),
+                  )`;
+      const outputSummaryExpr = resubmitVideo
+        ? `((${previousErrorsExpr}) || jsonb_build_object(
+                    'previousExternals',
+                    coalesce(output_summary->'previousExternals', '[]'::jsonb) || jsonb_build_array(jsonb_build_object(
+                      'external', output_summary->'external',
+                      'externalSubmitStartedAt', output_summary->'externalSubmitStartedAt',
+                      'reason', error,
+                      'archivedAt', now()
+                    ))
+                  ))${resubmitSetSql}`
+        : previousErrorsExpr;
+
+      const updated = returningRows(
+        await qr.query(
+          `update public.generation_item_runs
+              set status = 'pending',
+                  max_attempts = attempt_count + 3,
+                  output_summary = ${outputSummaryExpr},
                   error = null,
                   next_retry_at = null,
                   worker_id = null,

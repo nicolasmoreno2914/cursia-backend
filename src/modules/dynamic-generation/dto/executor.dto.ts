@@ -76,3 +76,16 @@ export class FailItemDto extends ExecutorBaseDto {
   @IsBoolean()
   retryable: boolean;
 }
+
+/**
+ * I4/R23: body opcional de retryItem. `resubmitVideo: true` autoriza a
+ * retryItem a archivar external/externalSubmitStartedAt y someter un video
+ * NUEVO — solo válido para items type='video' en 'failed' con último error
+ * 'videogen_failed' o 'ambiguous_video_submission' (RunsService valida esto;
+ * el DTO solo transporta el flag bajo whitelist).
+ */
+export class RetryItemDto {
+  @IsOptional()
+  @IsBoolean()
+  resubmitVideo?: boolean;
+}

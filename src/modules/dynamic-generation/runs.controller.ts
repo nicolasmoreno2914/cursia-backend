@@ -14,6 +14,7 @@ import {
 import type { Response } from 'express';
 import { RunsService } from './runs.service';
 import { CourseContextDto } from './dto/course-context.dto';
+import { RetryItemDto } from './dto/executor.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
@@ -105,8 +106,9 @@ export class RunsController {
     @Param('number', ParseIntPipe) number: number,
     @Param('runId', ParseUUIDPipe) runId: string,
     @Param('itemKey') itemKey: string,
+    @Body() dto: RetryItemDto,
     @CurrentUser() user: AuthUser,
   ) {
-    return this.runs.retryItem(courseId, user.id, number, runId, itemKey);
+    return this.runs.retryItem(courseId, user.id, number, runId, itemKey, dto?.resubmitVideo === true);
   }
 }

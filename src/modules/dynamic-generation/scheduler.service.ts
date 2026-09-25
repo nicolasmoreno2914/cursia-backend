@@ -518,6 +518,15 @@ export class SchedulerService {
   ): Promise<ItemOpResult> {
     executorId = this.checkExecutorId(executorId);
     if (!isPlainObject(patch)) return { ok: false, reason: 'invalid_patch' };
+    // M5: si el run ya está cancelado, solo se permite un merge EXCLUSIVAMENTE
+    // de `external` (los ids de Videogen) — nunca `externalSubmitStartedAt` ni
+    // ningún otro campo. Esto evita que un video ya sometido (dinero real
+    // gastado) quede huérfano solo porque el cancel ganó la carrera contra el
+    // registro del id; el item igual queda cancelado por reconcileCancellation,
+    // pero el id sobrevive para que un futuro reopen lo vea como
+    // 'ambiguous_video_submission' recuperable en vez de perderlo en logs.
+    const patchKeys = Object.keys(patch);
+    const allowCancelled = patchKeys.length === 1 && patchKeys[0] === 'external';
     return this.guardedItemOp(itemRunId, executorId, ownerId, 'share', async (qr, _job, item) => {
       const merged = mergeOutputSummary(item.output_summary ?? {}, patch);
       if (merged.ok === false) throw new GuardRejection(merged.reason);
@@ -529,7 +538,7 @@ export class SchedulerService {
         ),
       );
       if (rows.length !== 1) throw new GuardRejection('not_running');
-    });
+    }, allowCancelled);
   }
 
   // ── sweep ────────────────────────────────────────────────────────────────
@@ -590,6 +599,13 @@ export class SchedulerService {
     ownerId: string | undefined,
     runLock: 'update' | 'share',
     fn: (qr: QueryRunner, job: any, item: any) => Promise<void>,
+    /**
+     * M5: si true y el run está cancelado, no rechaza — sigue adelante con
+     * `fn` (usado únicamente por el merge external-only de
+     * recordItemExternalDetailed). El run sigue reconciliándose después
+     * (items no terminales → cancelled), pero el patch ya quedó persistido.
+     */
+    allowCancelled = false,
   ): Promise<ItemOpResult> {
     if (!UUID_RE.test(String(itemRunId))) return { ok: false, reason: 'not_found' };
     const [head] = await this.dataSource.query(
@@ -608,9 +624,10 @@ export class SchedulerService {
         if (!job) throw new GuardRejection('not_found');
         if (isCancelledLike(job)) {
           cancelledJob = job;
-          throw new GuardRejection('run_cancelled');
+          if (!allowCancelled) throw new GuardRejection('run_cancelled');
+        } else if (!isActiveRun(job)) {
+          throw new GuardRejection('run_not_active');
         }
-        if (!isActiveRun(job)) throw new GuardRejection('run_not_active');
         const [item] = await qr.query(`select * from public.generation_item_runs where id = $1 for update`, [itemRunId]);
         if (!item) throw new GuardRejection('not_found');
         if (item.status !== 'running') throw new GuardRejection('not_running');

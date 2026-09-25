@@ -101,7 +101,8 @@ async function loadOutputSummary(dataSource: DataSource, itemRunId: string): Pro
   return row?.output_summary ?? {};
 }
 
-async function downloadContentMarkdown(
+/** Exportada para el harness de C1 (cross-seam test contra el Blob real que produce dynArtifactUpload). */
+export async function downloadContentMarkdown(
   artifacts: ArtifactsService,
   ownerId: string,
   artifactId: string,
@@ -110,9 +111,21 @@ async function downloadContentMarkdown(
   if (!urlRes.url) throw new Error(`sin URL de descarga para el artifact ${artifactId}`);
   const res = await fetch(urlRes.url);
   if (!res.ok) throw new Error(`descarga del artifact ${artifactId} falló (HTTP ${res.status})`);
-  const json = (await res.json()) as Record<string, any>;
-  const markdown = typeof json?.markdown === 'string' ? json.markdown : null;
-  if (markdown === null) throw new Error(`artifact ${artifactId} (dynamic_content_md) sin campo "markdown"`);
+  const text = await res.text();
+  // C1: el navegador sube markdown crudo (`text/markdown`, mejor para 5B) —
+  // este worker acepta AMBAS formas: JSON `{markdown: string}` (contrato
+  // original de Task 4) o el texto plano tal cual. Si el body parsea como
+  // JSON con un campo `markdown` string, se usa ese; si no, se usa el texto
+  // completo como markdown.
+  let markdown: string | null = null;
+  try {
+    const json = JSON.parse(text) as Record<string, any>;
+    if (json && typeof json.markdown === 'string') markdown = json.markdown;
+  } catch {
+    // no era JSON — cae al texto plano abajo.
+  }
+  if (markdown === null) markdown = text;
+  if (!markdown.trim()) throw new Error(`artifact ${artifactId} (dynamic_content_md) vacío`);
   return markdown;
 }
 
@@ -374,7 +387,11 @@ async function completeVideoItem(
     itemKey: item.itemKey,
     idempotencyKey: item.idempotencyKey,
   };
-  const storagePath = `dynamic/${item.frontendCourseId ?? item.courseId}/${item.manifestId}/video/${item.chapterId}.json`;
+  // I1: path inmutable por intento (R23) — nunca sobreescribe un artifact ya
+  // vinculado a un item completado por otro Manifest/ejecutor.
+  const storagePath =
+    `${runHead.ownerId}/dynamic/${item.artifactCourseId}/${item.manifestId}/dynamic_video/` +
+    `${item.idempotencyKey}/a${item.attempt}.json`;
   const artifact = await deps.artifacts.uploadJsonArtifact({
     ownerId: runHead.ownerId,
     courseId: item.artifactCourseId,
@@ -385,6 +402,7 @@ async function completeVideoItem(
     payload,
     mimeType: 'application/json',
     metadata: { manifestId: item.manifestId, itemKey: item.itemKey, chapterId: item.chapterId },
+    upsert: false,
   });
 
   const ok = await deps.scheduler.completeItem(item.itemRunId, deps.executorId, {
