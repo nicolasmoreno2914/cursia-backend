@@ -133,10 +133,11 @@ export class RunsController {
   }
 
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/items/:itemKey/regenerate
-  // F78-BE2: body {confirmPaid: true} (obligatorio si la regeneración cuesta:
-  // video real o items LLM). Crea una generación NUEVA del item en el mismo
-  // run (nunca reescribe la anterior). 201 si se creó; 200 si ya había una
-  // regeneración de ese item en vuelo (misma respuesta, idempotente).
+  // F78-BE2: body {confirmPaid: true, expectedGeneration?: n} (confirmPaid
+  // obligatorio si la regeneración cuesta: video real o items LLM). Crea una
+  // generación NUEVA del item en el mismo run (nunca reescribe la anterior).
+  // 201 si se creó; 200 si ya había una regeneración de ese item en vuelo.
+  // {dryRun: true} → 200 con el plan (affected + blockers), sin escribir nada.
   @Post(':runId/items/:itemKey/regenerate')
   async regenerate(
     @Param('courseId', ParseIntPipe) courseId: number,
@@ -147,9 +148,10 @@ export class RunsController {
     @CurrentUser() user: AuthUser,
     @Res({ passthrough: true }) res: Response,
   ) {
-    const confirmPaid = parseRegenerateItemBody(body);
-    const result = await this.runs.regenerateItem(courseId, user.id, number, runId, itemKey, confirmPaid);
-    res.status(result.created ? 201 : 200);
+    const opts = parseRegenerateItemBody(body);
+    const result = await this.runs.regenerateItem(courseId, user.id, number, runId, itemKey, opts);
+    // dryRun → 200 (no escribe); real → 201 si creó, 200 si ya estaba en vuelo.
+    res.status('dryRun' in result ? 200 : result.created ? 201 : 200);
     return result;
   }
 }

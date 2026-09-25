@@ -191,10 +191,49 @@ export interface RegenerateItemResult {
   run: RunDto;
 }
 
+export interface RegenerateItemOptions {
+  confirmPaid?: boolean;
+  /** Fix wave I1: planifica sin escribir nada. */
+  dryRun?: boolean;
+  /** Fix wave I2: generación vigente que vio el usuario; si cambió → 409 generation_changed. */
+  expectedGeneration?: number;
+}
+
+/** Fix wave I1: respuesta de `{dryRun:true}` (misma forma de `affected` que la llamada real). */
+export interface RegenerateDryRunResult {
+  dryRun: true;
+  costKind: RegenerationCostKind;
+  /** Generación vigente del item pedido (para mandarla como expectedGeneration). */
+  currentGeneration: number;
+  /** Lo que haría la llamada real; `itemRunId` es null en las generaciones que se crearían. */
+  affected: RegenerationAffectedItem[];
+  /** Trabas que la llamada real respondería con 403/409 (vacío = se puede confirmar). */
+  blockers: Array<{ code: string; message: string }>;
+}
+
+interface RegenerationBlocker {
+  code: string;
+  message: string;
+  error: () => Error;
+}
+
+interface RegenerationPlan {
+  inFlight: boolean;
+  latest: any;
+  currentGeneration: number;
+  blockers: RegenerationBlocker[];
+  affected: RegenerationAffectedItem[];
+  cascade: Array<{ key: string; prev: any; costKind: RegenerationCostKind }>;
+  video: { key: string; row: any; action: RegenerationAffectedItem['action'] } | null;
+  staleArtifactIds: string[];
+  stale: boolean;
+}
+
 export interface RegenerationAffectedItem {
   itemKey: string;
   type: string;
-  itemRunId: string;
+  /** null solo en un dryRun, para las generaciones que todavía no existen. */
+  itemRunId: string | null;
   generation: number;
   /** REGENERATE = generación nueva; STALE_NO_AUTO = video marcado (sin regenerar); WAITS = aún no generado, usará el content nuevo; UNCHANGED = video fallido, sin cambios. */
   action: 'REGENERATE' | 'STALE_NO_AUTO' | 'WAITS' | 'UNCHANGED';
@@ -998,31 +1037,27 @@ export class RunsService {
    *   generation = max + 1 e idempotency key propia (sha256(manifestId:
    *   itemKey:generation)) → el ejecutor/worker genera salida nueva (un video
    *   nuevo en Videogen, nunca reutiliza el `external` anterior);
-   * - la fila y los artifacts anteriores quedan INTACTOS (el stale sigue
-   *   stale); cuando la generación nueva completa, el resolver de
-   *   empaquetado, el precheck del paquete y Coherence usan la completada
+   * - la fila anterior queda intacta; sus artifacts pasan a `status='stale'`
+   *   con `metadata.staleReason` (tabla de Fase 8, fila REGENERATE: solo
+   *   status + metadata, nunca rutas ni filas). Cuando la generación nueva
+   *   completa, resolver, precheck del paquete y Coherence usan la completada
    *   más reciente (item-generations.ts);
-   * - si el run estaba completed se reabre (queued) para que el ejecutor
-   *   reclame el item; al completarse vuelve a completed.
+   * - regenerar un content hace CASCADA: scorm del capítulo + examen del
+   *   módulo (generación nueva, o WAITS si todavía no se generaron) y el video
+   *   del capítulo queda STALE_NO_AUTO (nunca se regenera solo);
+   * - si el run estaba completed se reabre (queued).
    *
    * Costo: `confirmPaid === true` (literal) es obligatorio cuando la
-   * regeneración puede costar: video en run 'real' (Videogen) o cualquier
-   * item LLM (content/scorm/exam/plan/intros → créditos de IA). Solo un video
-   * en run 'mock' no cuesta. Sin la confirmación → 400
-   * `confirm_paid_required` sin escribir nada.
+   * regeneración puede costar (video 'real' o items LLM). Solo un video
+   * 'mock' no cuesta.
    *
-   * Gates (en orden): G3 allow-list V2 (403) → ownership/404 → confirmPaid
-   * (400) → video real: DYNAMIC_REAL_VIDEO_OWNERS (403, fail closed) → bajo el
-   * advisory lock del curso (mismo orden que create/reopen/retry: lock del
-   * curso → fila del run FOR UPDATE → items FOR UPDATE): run cancelado (409),
-   * idempotencia, run reemplazado (409 superseded_run), otro run activo del
-   * curso (409), item no completado (409; si falló, usar retry), run
-   * terminado en failed (409; reintentar primero).
-   *
-   * Idempotente por (run, itemKey) mientras la regeneración está en vuelo
-   * (pending/running/retrying/blocked): devuelve la misma generación con
-   * `created:false` (200). Una vez completada, un nuevo POST crea otra
-   * generación (es una nueva regeneración paga, confirmada de nuevo).
+   * Fix wave I1 — `dryRun:true`: MISMO planificador (planRegeneration), sin
+   * locks ni escrituras; devuelve `{dryRun, affected, blockers, costKind,
+   * currentGeneration}`. Los gates de flag/allow-list/ownership aplican (403
+   * /404); el 403 de video real y los 409 se informan como `blockers`.
+   * Fix wave I2 — `expectedGeneration`: si viene y la generación vigente del
+   * item es otra → 409 `generation_changed` con `currentGeneration` (sin
+   * escribir). La idempotencia en vuelo va ANTES (no cambia).
    */
   async regenerateItem(
     courseId: number,
@@ -1030,8 +1065,9 @@ export class RunsService {
     blueprintNumber: number,
     runId: string,
     itemKey: string,
-    confirmPaid: boolean | undefined,
-  ): Promise<RegenerateItemResult> {
+    opts: RegenerateItemOptions | boolean | undefined,
+  ): Promise<RegenerateItemResult | RegenerateDryRunResult> {
+    const o: RegenerateItemOptions = typeof opts === 'object' && opts !== null ? opts : { confirmPaid: opts as boolean | undefined };
     assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     let job = await this.loadRunRow(courseId, manifest, runId);
@@ -1041,7 +1077,23 @@ export class RunsService {
     }
     const videoMode = this.videoModeOf(job);
     const costKind = regenerationCostKind(mItem.type, videoMode);
-    if (costKind !== 'none' && confirmPaid !== true) {
+    job = await this.reconcileCancellation(job);
+
+    if (o.dryRun) {
+      // Lectura sin locks y sin escrituras: el mismo planificador que la llamada real.
+      const plan = await this.planRegeneration(this.dataSource, false, {
+        courseId, ownerId, job, manifest, mItem, itemKey, videoMode, costKind, expectedGeneration: o.expectedGeneration,
+      });
+      return {
+        dryRun: true,
+        costKind,
+        currentGeneration: plan.currentGeneration,
+        affected: plan.affected,
+        blockers: plan.blockers.map((b) => ({ code: b.code, message: b.message })),
+      };
+    }
+
+    if (costKind !== 'none' && o.confirmPaid !== true) {
       throw new BadRequestException({
         message:
           `confirm_paid_required: regenerar "${itemKey}" tiene costo (${costKind === 'videogen' ? 'video real en Videogen' : 'créditos de IA'}); ` +
@@ -1051,9 +1103,7 @@ export class RunsService {
       });
     }
     // Video real = gasto en Videogen → allow-list de video real (fail closed).
-    // Un item no-video nunca paga Videogen, aunque el run sea 'real'.
     if (mItem.type === 'video' && videoMode === 'real') assertRealVideoAllowed(ownerId);
-    job = await this.reconcileCancellation(job);
     if (isCancelledLike(job)) {
       throw new ConflictException(`La ejecución ${job.id} está cancelada; no se pueden regenerar items`);
     }
@@ -1061,229 +1111,27 @@ export class RunsService {
     const outcome = await this.tx(async (qr) => {
       await this.lockCourseRuns(qr, courseId);
       const [locked] = await qr.query(`select * from public.production_jobs where id = $1 for update`, [job.id]);
-      if (isCancelledLike(locked)) {
-        throw new ConflictException(`La ejecución ${job.id} está cancelada; no se pueden regenerar items`);
-      }
-      const gens: any[] = await qr.query(
-        `select * from public.generation_item_runs where job_id = $1 and item_key = $2 order by generation desc for update`,
-        [job.id, itemKey],
-      );
-      if (gens.length === 0) {
-        throw new InternalServerErrorException(`La ejecución ${job.id} no tiene filas para el item "${itemKey}" del Manifest (integridad rota)`);
-      }
-      const latest = gens[0];
-      // Idempotencia: la regeneración pedida sigue en vuelo → misma respuesta.
-      if (latest.generation > 1 && REGENERATION_IN_FLIGHT.has(latest.status) && latest.output_summary?.regeneration) {
+      const plan = await this.planRegeneration(qr, true, {
+        courseId, ownerId, job: locked, manifest, mItem, itemKey, videoMode, costKind, expectedGeneration: o.expectedGeneration,
+      });
+      if (plan.inFlight) {
         return {
           kind: 'existing' as const,
-          itemRunId: latest.id as string,
-          previousItemRunId: latest.output_summary.regeneration.fromItemRunId as string,
-          previousGeneration: Number(latest.output_summary.regeneration.fromGeneration),
+          itemRunId: plan.latest.id as string,
+          previousItemRunId: plan.latest.output_summary.regeneration.fromItemRunId as string,
+          previousGeneration: Number(plan.latest.output_summary.regeneration.fromGeneration),
           affected: undefined as RegenerationAffectedItem[] | undefined,
         };
       }
-      const superseding = await this.findSupersedingRun(qr, job.id);
-      if (superseding) throw this.supersededConflict(job.id, superseding);
-      const other = await this.findActiveRunOnOtherManifest(qr, courseId, manifest.id);
-      if (other) throw this.otherActiveRunConflict(other, manifest);
-      if (latest.status !== 'completed') {
-        throw new ConflictException({
-          message:
-            `Solo se puede regenerar un item completado; "${itemKey}" (generation ${latest.generation}) está en "${latest.status}"` +
-            (latest.status === 'failed' ? ' — usá retry para reintentarlo' : ''),
-          code: 'item_not_completed',
-        });
-      }
-      const runActive = ACTIVE_RUN_WORKER_STATUSES.includes(String(locked.worker_status));
-      if (!runActive && locked.worker_status !== 'completed') {
-        throw new ConflictException({
-          message:
-            `La ejecución ${job.id} terminó en "${locked.worker_status}"; reintentá sus items fallidos (retry) antes de regenerar otros`,
-          code: 'run_not_regenerable',
-        });
-      }
-
-      const requestedAt = new Date().toISOString();
-      const staleArtifacts: Array<{ id: string }> = await qr.query(
-        `select id from public.artifacts where item_run_id = $1 and status = 'stale' order by id`,
-        [latest.id],
-      );
-      const stale = staleArtifacts.length > 0 || latest.output_summary?.invalidation?.action === 'STALE_NO_AUTO';
-
-      // Cascada (semántica de la tabla de Fase 8 para "editar el capítulo"):
-      // regenerar un content regenera sus dependientes LLM (scorm del capítulo
-      // y examen del módulo) y deja el video del capítulo STALE_NO_AUTO — un
-      // video nunca se regenera solo. Regenerar scorm/exam/video/intros solos
-      // no hace cascada. Todo en esta transacción, bajo el mismo lock.
-      const cascadeKeys: string[] = [];
-      let videoKey: string | null = null;
-      if (mItem.type === 'content' && mItem.chapterId) {
-        const has = (key: string) => manifest.manifest.items.some((it) => it.key === key);
-        if (has(`scorm:${mItem.chapterId}`)) cascadeKeys.push(`scorm:${mItem.chapterId}`);
-        if (mItem.moduleId && has(`exam:${mItem.moduleId}`)) cascadeKeys.push(`exam:${mItem.moduleId}`);
-        if (has(`video:${mItem.chapterId}`)) videoKey = `video:${mItem.chapterId}`;
-      }
-      const depKeys = videoKey ? [...cascadeKeys, videoKey] : cascadeKeys;
-      const depRows: any[] = depKeys.length
-        ? await qr.query(
-            `select * from public.generation_item_runs g
-              where g.job_id = $1 and g.item_key = any($2::text[]) and ${latestGenerationPredicate('g')}
-              order by g.item_key for update`,
-            [job.id, depKeys],
-          )
-        : [];
-      const depByKey = new Map(depRows.map((r) => [r.item_key, r]));
-      for (const key of depKeys) {
-        const r = depByKey.get(key);
-        if (!r) throw new InternalServerErrorException(`La ejecución ${job.id} no tiene filas para "${key}" (integridad rota)`);
-        if (r.status === 'running') {
-          // Un dependiente en ejecución se está generando con el content viejo:
-          // regenerar ahora dejaría su salida incoherente sin marca.
-          throw new ConflictException({
-            message: `No se puede regenerar "${itemKey}" mientras "${key}" se está generando; reintentá cuando termine`,
-            code: 'dependent_running',
-          });
-        }
-      }
-
-      const insertGeneration = async (prev: any, key: string, regeneration: Record<string, any>): Promise<{ id: string; generation: number }> => {
-        const generation = Number(prev.generation) + 1;
-        const [row] = await qr.query(
-          `insert into public.generation_item_runs
-             (job_id, course_id, blueprint_id, manifest_id, item_key, generation, type, module_id, chapter_id,
-              depends_on, idempotency_key, status, output_summary)
-           values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::text[], $11, 'pending', $12::jsonb)
-           returning id`,
-          [job.id, prev.course_id, prev.blueprint_id, prev.manifest_id, key, generation, prev.type,
-            prev.module_id, prev.chapter_id, prev.depends_on ?? [], itemIdempotencyKey(manifest.id, key, generation),
-            JSON.stringify({ regeneration })],
-        );
-        return { id: row.id, generation };
-      };
-
-      const affected: RegenerationAffectedItem[] = [];
-      const primaryRegen: Record<string, any> = {
-        fromItemRunId: latest.id,
-        fromGeneration: Number(latest.generation),
-        reason: stale ? 'stale_no_auto' : 'user_requested',
-        staleArtifactIds: staleArtifacts.map((a) => a.id),
-        costKind,
-        requestedBy: ownerId,
-        requestedAt,
-      };
-      const primary = await insertGeneration(latest, itemKey, primaryRegen);
-      affected.push({ itemKey, type: mItem.type, itemRunId: primary.id, generation: primary.generation, action: 'REGENERATE', created: true, costKind });
-
-      for (const key of cascadeKeys) {
-        const prev = depByKey.get(key);
-        if (REGENERATION_IN_FLIGHT.has(prev.status)) {
-          // Todavía no se generó (o espera): al reclamarse usará el content nuevo
-          // (las dependencias se resuelven contra la generación vigente).
-          affected.push({ itemKey: key, type: prev.type, itemRunId: prev.id, generation: Number(prev.generation), action: 'WAITS', created: false, costKind: regenerationCostKind(prev.type, videoMode) });
-          continue;
-        }
-        const depCost = regenerationCostKind(prev.type, videoMode);
-        const g = await insertGeneration(prev, key, {
-          fromItemRunId: prev.id,
-          fromGeneration: Number(prev.generation),
-          reason: 'cascade_from_content',
-          cascadeFromItemRunId: primary.id,
-          cascadeFromItemKey: itemKey,
-          staleArtifactIds: [],
-          costKind: depCost,
-          requestedBy: ownerId,
-          requestedAt,
-        });
-        affected.push({ itemKey: key, type: prev.type, itemRunId: g.id, generation: g.generation, action: 'REGENERATE', created: true, costKind: depCost });
-      }
-
-      if (videoKey) {
-        const v = depByKey.get(videoKey);
-        if (v.status === 'completed') {
-          // STALE_NO_AUTO: el video queda como está (se sigue empaquetando, con
-          // aviso) y la UI ofrece su regeneración paga explícita. Solo cambian
-          // status + motivo del artifact (nunca la ruta) y la marca del item.
-          await qr.query(
-            `update public.artifacts
-                set status = 'stale',
-                    metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object(
-                      'staleReason', 'content_regenerated', 'staleByItemRunId', $2::text, 'staleAt', $3::text),
-                    updated_at = now()
-              where item_run_id = $1 and status is distinct from 'disabled'`,
-            [v.id, primary.id, requestedAt],
-          );
-          const prevInv = v.output_summary?.invalidation ?? {};
-          const invalidation = {
-            ...prevInv,
-            action: 'STALE_NO_AUTO',
-            previousAction: prevInv.action ?? null,
-            reasons: [...new Set([...(Array.isArray(prevInv.reasons) ? prevInv.reasons : []), 'content_regenerated'])],
-            contentItemRunId: primary.id,
-          };
-          await qr.query(
-            `update public.generation_item_runs
-                set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('invalidation', $2::jsonb),
-                    updated_at = now()
-              where id = $1`,
-            [v.id, JSON.stringify(invalidation)],
-          );
-          affected.push({ itemKey: videoKey, type: 'video', itemRunId: v.id, generation: Number(v.generation), action: 'STALE_NO_AUTO', created: false, costKind: 'none' });
-        } else if (REGENERATION_IN_FLIGHT.has(v.status)) {
-          affected.push({ itemKey: videoKey, type: 'video', itemRunId: v.id, generation: Number(v.generation), action: 'WAITS', created: false, costKind: 'none' });
-        } else {
-          affected.push({ itemKey: videoKey, type: 'video', itemRunId: v.id, generation: Number(v.generation), action: 'UNCHANGED', created: false, costKind: 'none' });
-        }
-      }
-
-      if (affected.length > 1) {
-        await qr.query(
-          `update public.generation_item_runs
-              set output_summary = jsonb_set(output_summary, '{regeneration,cascade}', $2::jsonb)
-            where id = $1`,
-          [primary.id, JSON.stringify(affected)],
-        );
-      }
-
-      const note = JSON.stringify({ itemKey, generation: primary.generation, itemRunId: primary.id, requestedAt, affected: affected.map((a) => a.itemKey) });
-      if (runActive) {
-        await qr.query(
-          `update public.production_jobs
-              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('lastRegeneration', $2::jsonb),
-                  updated_at = now()
-            where id = $1`,
-          [job.id, note],
-        );
-      } else {
-        // Reabre el run completed para que el ejecutor reclame las generaciones nuevas.
-        try {
-          await qr.query(
-            `update public.production_jobs
-                set status = 'queued', worker_status = 'queued', finished_at = null, error_message = null,
-                    next_retry_at = null,
-                    output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('lastRegeneration', $2::jsonb),
-                    updated_at = now()
-              where id = $1`,
-            [job.id, note],
-          );
-        } catch (err) {
-          if (isActiveRunConflict(err)) {
-            throw new ConflictException(`Ya hay otra ejecución activa para el Manifest #${manifest.id}; no se puede reabrir ${job.id}`);
-          }
-          throw err;
-        }
-      }
-      return { kind: 'created' as const, itemRunId: primary.id, previousItemRunId: latest.id as string, previousGeneration: Number(latest.generation), affected };
+      // La primera traba es el error de siempre (mismo orden y códigos).
+      if (plan.blockers.length > 0) throw plan.blockers[0].error();
+      return this.applyRegeneration(qr, plan, { job: locked, manifest, itemKey, mItem, ownerId, costKind });
     });
 
     const [row] = await this.dataSource.query(`select * from public.generation_item_runs where id = $1`, [outcome.itemRunId]);
     let affected: RegenerationAffectedItem[] = outcome.affected ?? [];
     if (outcome.kind === 'existing') {
-      // Misma respuesta que la creación: las filas afectadas guardadas en la
-      // regeneración en vuelo (o solo el item si no hubo cascada).
-      const stored: RegenerationAffectedItem[] = Array.isArray(row.output_summary?.regeneration?.cascade)
-        ? row.output_summary.regeneration.cascade
-        : [{ itemKey, type: row.type, itemRunId: row.id, generation: Number(row.generation), action: 'REGENERATE', created: true, costKind }];
-      affected = stored.map((a) => ({ ...a, created: false }));
+      affected = this.storedAffected(row, itemKey, costKind);
     }
     return {
       created: outcome.kind === 'created',
@@ -1294,6 +1142,299 @@ export class RunsService {
       affected,
       run: await this.buildRunDto(await this.loadJobById(job.id), manifest),
     };
+  }
+
+  /** Filas afectadas guardadas en una regeneración en vuelo (o solo el item si no hubo cascada), con created:false. */
+  private storedAffected(row: any, itemKey: string, costKind: RegenerationCostKind): RegenerationAffectedItem[] {
+    const stored: RegenerationAffectedItem[] = Array.isArray(row.output_summary?.regeneration?.cascade)
+      ? row.output_summary.regeneration.cascade
+      : [{ itemKey, type: row.type, itemRunId: row.id, generation: Number(row.generation), action: 'REGENERATE', created: true, costKind }];
+    return stored.map((a) => ({ ...a, created: false }));
+  }
+
+  /**
+   * Planificador ÚNICO de regenerateItem (real y dryRun). Solo lee. Con
+   * `forUpdate` (llamada real, dentro de la tx y tras el lock del curso +
+   * FOR UPDATE del run) bloquea las filas que va a leer; en dryRun lee sin
+   * locks. Devuelve el plan de filas afectadas y TODAS las trabas en el orden
+   * en que la llamada real las lanzaría.
+   */
+  private async planRegeneration(
+    q: { query: (sql: string, params?: any[]) => Promise<any> },
+    forUpdate: boolean,
+    a: {
+      courseId: number;
+      ownerId: string;
+      job: any;
+      manifest: ManifestDto;
+      mItem: { key: string; type: string; moduleId?: string | null; chapterId?: string | null };
+      itemKey: string;
+      videoMode: RunVideoMode;
+      costKind: RegenerationCostKind;
+      expectedGeneration?: number;
+    },
+  ): Promise<RegenerationPlan> {
+    const lock = forUpdate ? ' for update' : '';
+    const { job, manifest, mItem, itemKey, videoMode, costKind } = a;
+    const blockers: RegenerationBlocker[] = [];
+    const block = (code: string, message: string, error: () => Error) => blockers.push({ code, message, error });
+
+    // Solo dryRun: el 403 de video real y el cancelado (que la llamada real lanza antes de la tx) como trabas.
+    if (!forUpdate) {
+      if (mItem.type === 'video' && videoMode === 'real') {
+        try {
+          assertRealVideoAllowed(a.ownerId);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          block('real_video_not_allowed', msg, () => err as Error);
+        }
+      }
+    }
+    if (isCancelledLike(job)) {
+      const msg = `La ejecución ${job.id} está cancelada; no se pueden regenerar items`;
+      block('run_cancelled', msg, () => new ConflictException(msg));
+    }
+
+    const gens: any[] = await q.query(
+      `select * from public.generation_item_runs where job_id = $1 and item_key = $2 order by generation desc${lock}`,
+      [job.id, itemKey],
+    );
+    if (gens.length === 0) {
+      throw new InternalServerErrorException(`La ejecución ${job.id} no tiene filas para el item "${itemKey}" del Manifest (integridad rota)`);
+    }
+    const latest = gens[0];
+    const currentGeneration = Number(latest.generation);
+    // Idempotencia: la regeneración pedida sigue en vuelo → misma respuesta (antes que cualquier otra regla).
+    if (latest.generation > 1 && REGENERATION_IN_FLIGHT.has(latest.status) && latest.output_summary?.regeneration && !isCancelledLike(job)) {
+      return { inFlight: true, latest, currentGeneration, blockers: [], affected: this.storedAffected(latest, itemKey, costKind), cascade: [], video: null, staleArtifactIds: [], stale: false };
+    }
+    if (a.expectedGeneration !== undefined && a.expectedGeneration !== currentGeneration) {
+      const message =
+        `generation_changed: "${itemKey}" ya está en la generación ${currentGeneration} (esperabas la ${a.expectedGeneration}); ` +
+        // El filtro global aplana el 409 a su mensaje: currentGeneration viaja también en el texto (como runId=).
+        `actualizá la vista y confirmá de nuevo. currentGeneration=${currentGeneration}`;
+      block('generation_changed', message, () => new ConflictException({ message, code: 'generation_changed', currentGeneration }));
+    }
+    const superseding = await this.findSupersedingRun(q, job.id);
+    if (superseding) {
+      const err = this.supersededConflict(job.id, superseding);
+      block('superseded_run', err.message, () => err);
+    }
+    const other = await this.findActiveRunOnOtherManifest(q, a.courseId, manifest.id);
+    if (other) {
+      const err = this.otherActiveRunConflict(other, manifest);
+      block('active_run_on_other_manifest', err.message, () => err);
+    }
+    if (latest.status !== 'completed') {
+      const message =
+        `Solo se puede regenerar un item completado; "${itemKey}" (generation ${latest.generation}) está en "${latest.status}"` +
+        (latest.status === 'failed' ? ' — usá retry para reintentarlo' : '');
+      block('item_not_completed', message, () => new ConflictException({ message, code: 'item_not_completed' }));
+    }
+    const runActive = ACTIVE_RUN_WORKER_STATUSES.includes(String(job.worker_status));
+    if (!runActive && job.worker_status !== 'completed' && !isCancelledLike(job)) {
+      const message = `La ejecución ${job.id} terminó en "${job.worker_status}"; reintentá sus items fallidos (retry) antes de regenerar otros`;
+      block('run_not_regenerable', message, () => new ConflictException({ message, code: 'run_not_regenerable' }));
+    }
+
+    const staleArtifacts: Array<{ id: string }> = await q.query(
+      `select id from public.artifacts where item_run_id = $1 and status = 'stale' order by id`,
+      [latest.id],
+    );
+    const stale = staleArtifacts.length > 0 || latest.output_summary?.invalidation?.action === 'STALE_NO_AUTO';
+
+    // Cascada de un content (tabla de Fase 8, "editar el capítulo").
+    const cascadeKeys: string[] = [];
+    let videoKey: string | null = null;
+    if (mItem.type === 'content' && mItem.chapterId) {
+      const has = (key: string) => manifest.manifest.items.some((it) => it.key === key);
+      if (has(`scorm:${mItem.chapterId}`)) cascadeKeys.push(`scorm:${mItem.chapterId}`);
+      if (mItem.moduleId && has(`exam:${mItem.moduleId}`)) cascadeKeys.push(`exam:${mItem.moduleId}`);
+      if (has(`video:${mItem.chapterId}`)) videoKey = `video:${mItem.chapterId}`;
+    }
+    const depKeys = videoKey ? [...cascadeKeys, videoKey] : cascadeKeys;
+    const depRows: any[] = depKeys.length
+      ? await q.query(
+          `select * from public.generation_item_runs g
+            where g.job_id = $1 and g.item_key = any($2::text[]) and ${latestGenerationPredicate('g')}
+            order by g.item_key${lock}`,
+          [job.id, depKeys],
+        )
+      : [];
+    const depByKey = new Map(depRows.map((r) => [r.item_key, r]));
+    for (const key of depKeys) {
+      const r = depByKey.get(key);
+      if (!r) throw new InternalServerErrorException(`La ejecución ${job.id} no tiene filas para "${key}" (integridad rota)`);
+      if (r.status === 'running') {
+        const message = `No se puede regenerar "${itemKey}" mientras "${key}" se está generando; reintentá cuando termine`;
+        block('dependent_running', message, () => new ConflictException({ message, code: 'dependent_running' }));
+      }
+    }
+
+    const affected: RegenerationAffectedItem[] = [
+      { itemKey, type: mItem.type, itemRunId: null, generation: currentGeneration + 1, action: 'REGENERATE', created: true, costKind },
+    ];
+    const cascade: RegenerationPlan['cascade'] = [];
+    for (const key of cascadeKeys) {
+      const prev = depByKey.get(key);
+      const depCost = regenerationCostKind(prev.type, videoMode);
+      if (REGENERATION_IN_FLIGHT.has(prev.status) || prev.status === 'running') {
+        affected.push({ itemKey: key, type: prev.type, itemRunId: prev.id, generation: Number(prev.generation), action: 'WAITS', created: false, costKind: depCost });
+        continue;
+      }
+      cascade.push({ key, prev, costKind: depCost });
+      affected.push({ itemKey: key, type: prev.type, itemRunId: null, generation: Number(prev.generation) + 1, action: 'REGENERATE', created: true, costKind: depCost });
+    }
+    let video: RegenerationPlan['video'] = null;
+    if (videoKey) {
+      const v = depByKey.get(videoKey);
+      const action: RegenerationAffectedItem['action'] =
+        v.status === 'completed' ? 'STALE_NO_AUTO' : REGENERATION_IN_FLIGHT.has(v.status) || v.status === 'running' ? 'WAITS' : 'UNCHANGED';
+      video = { key: videoKey, row: v, action };
+      affected.push({ itemKey: videoKey, type: 'video', itemRunId: v.id, generation: Number(v.generation), action, created: false, costKind: 'none' });
+    }
+    return { inFlight: false, latest, currentGeneration, blockers, affected, cascade, video, staleArtifactIds: staleArtifacts.map((x) => x.id), stale };
+  }
+
+  /** Escrituras de una regeneración ya planificada y sin trabas (dentro de la tx, con locks). */
+  private async applyRegeneration(
+    qr: QueryRunner,
+    plan: RegenerationPlan,
+    a: { job: any; manifest: ManifestDto; itemKey: string; mItem: { type: string }; ownerId: string; costKind: RegenerationCostKind },
+  ): Promise<{ kind: 'created'; itemRunId: string; previousItemRunId: string; previousGeneration: number; affected: RegenerationAffectedItem[] }> {
+    const { job, manifest, itemKey, ownerId, costKind } = a;
+    const latest = plan.latest;
+    const requestedAt = new Date().toISOString();
+    const insertGeneration = async (prev: any, key: string, regeneration: Record<string, any>): Promise<{ id: string; generation: number }> => {
+      const generation = Number(prev.generation) + 1;
+      const [row] = await qr.query(
+        `insert into public.generation_item_runs
+           (job_id, course_id, blueprint_id, manifest_id, item_key, generation, type, module_id, chapter_id,
+            depends_on, idempotency_key, status, output_summary)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::text[], $11, 'pending', $12::jsonb)
+         returning id`,
+        [job.id, prev.course_id, prev.blueprint_id, prev.manifest_id, key, generation, prev.type,
+          prev.module_id, prev.chapter_id, prev.depends_on ?? [], itemIdempotencyKey(manifest.id, key, generation),
+          JSON.stringify({ regeneration })],
+      );
+      // Fix wave M4 (tabla de Fase 8, fila REGENERATE): la salida de la
+      // generación anterior pasa a stale con motivo — solo status + metadata
+      // (el primer staleReason se conserva), nunca rutas ni filas.
+      await qr.query(
+        `update public.artifacts
+            set status = 'stale',
+                metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object(
+                  'staleReason', coalesce(metadata->>'staleReason', $2::text),
+                  'supersededByItemRunId', $3::text, 'supersededAt', $4::text),
+                updated_at = now()
+          where item_run_id = $1 and status is distinct from 'disabled'`,
+        [prev.id, regeneration.reason === 'cascade_from_content' ? 'cascade_from_content' : 'regenerated', row.id, requestedAt],
+      );
+      return { id: row.id, generation };
+    };
+
+    const primary = await insertGeneration(latest, itemKey, {
+      fromItemRunId: latest.id,
+      fromGeneration: Number(latest.generation),
+      reason: plan.stale ? 'stale_no_auto' : 'user_requested',
+      staleArtifactIds: plan.staleArtifactIds,
+      costKind,
+      requestedBy: ownerId,
+      requestedAt,
+    });
+    const affected: RegenerationAffectedItem[] = plan.affected.map((x) => ({ ...x }));
+    Object.assign(affected[0], { itemRunId: primary.id, generation: primary.generation });
+
+    for (const c of plan.cascade) {
+      const g = await insertGeneration(c.prev, c.key, {
+        fromItemRunId: c.prev.id,
+        fromGeneration: Number(c.prev.generation),
+        reason: 'cascade_from_content',
+        cascadeFromItemRunId: primary.id,
+        cascadeFromItemKey: itemKey,
+        staleArtifactIds: [],
+        costKind: c.costKind,
+        requestedBy: ownerId,
+        requestedAt,
+      });
+      const entry = affected.find((x) => x.itemKey === c.key);
+      Object.assign(entry, { itemRunId: g.id, generation: g.generation });
+    }
+
+    if (plan.video && plan.video.action === 'STALE_NO_AUTO') {
+      const v = plan.video.row;
+      // STALE_NO_AUTO: el video queda como está (se sigue empaquetando, con
+      // aviso) y la UI ofrece su regeneración paga explícita.
+      await qr.query(
+        `update public.artifacts
+            set status = 'stale',
+                metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object(
+                  'staleReason', 'content_regenerated', 'staleByItemRunId', $2::text, 'staleAt', $3::text),
+                updated_at = now()
+          where item_run_id = $1 and status is distinct from 'disabled'`,
+        [v.id, primary.id, requestedAt],
+      );
+      const prevInv = v.output_summary?.invalidation ?? {};
+      // Fix wave M3: una cascada repetida conserva el previousAction ORIGINAL.
+      const previousAction =
+        prevInv.action === 'STALE_NO_AUTO' && Object.prototype.hasOwnProperty.call(prevInv, 'previousAction')
+          ? prevInv.previousAction
+          : prevInv.action ?? null;
+      const invalidation = {
+        ...prevInv,
+        action: 'STALE_NO_AUTO',
+        previousAction,
+        reasons: [...new Set([...(Array.isArray(prevInv.reasons) ? prevInv.reasons : []), 'content_regenerated'])],
+        contentItemRunId: primary.id,
+      };
+      await qr.query(
+        `update public.generation_item_runs
+            set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('invalidation', $2::jsonb),
+                updated_at = now()
+          where id = $1`,
+        [v.id, JSON.stringify(invalidation)],
+      );
+    }
+
+    if (affected.length > 1) {
+      await qr.query(
+        `update public.generation_item_runs
+            set output_summary = jsonb_set(output_summary, '{regeneration,cascade}', $2::jsonb)
+          where id = $1`,
+        [primary.id, JSON.stringify(affected)],
+      );
+    }
+
+    const note = JSON.stringify({ itemKey, generation: primary.generation, itemRunId: primary.id, requestedAt, affected: affected.map((x) => x.itemKey) });
+    const runActive = ACTIVE_RUN_WORKER_STATUSES.includes(String(job.worker_status));
+    if (runActive) {
+      await qr.query(
+        `update public.production_jobs
+            set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('lastRegeneration', $2::jsonb),
+                updated_at = now()
+          where id = $1`,
+        [job.id, note],
+      );
+    } else {
+      // Reabre el run completed para que el ejecutor reclame las generaciones nuevas.
+      try {
+        await qr.query(
+          `update public.production_jobs
+              set status = 'queued', worker_status = 'queued', finished_at = null, error_message = null,
+                  next_retry_at = null,
+                  output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('lastRegeneration', $2::jsonb),
+                  updated_at = now()
+            where id = $1`,
+          [job.id, note],
+        );
+      } catch (err) {
+        if (isActiveRunConflict(err)) {
+          throw new ConflictException(`Ya hay otra ejecución activa para el Manifest #${manifest.id}; no se puede reabrir ${job.id}`);
+        }
+        throw err;
+      }
+    }
+    return { kind: 'created', itemRunId: primary.id, previousItemRunId: latest.id, previousGeneration: Number(latest.generation), affected };
   }
 
   // ── internals ────────────────────────────────────────────────────────────
