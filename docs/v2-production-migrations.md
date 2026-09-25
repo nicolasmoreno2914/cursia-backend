@@ -66,6 +66,43 @@ producción ya tiene otras, solo se suman dentro de la carpeta propia). El
 runner **imprime las políticas existentes** antes de aplicar. Si el owner
 decide no aplicarlas: `--skip-storage-policies`.
 
+## OBLIGATORIO antes de cualquier merge `staging` → `main`: chequeo pre-merge de `production_jobs` (DN-6)
+
+`deploy.yml` corre `scripts/migrate-production-jobs-constraints.js` (bajo
+`set -e`) en **cada** push a `main`. Ese script reconstruye los CHECK de
+`production_jobs.execution_mode` y `worker_status` con una lista fija que **no
+incluye `brand_extraction`** (nunca la incluyó; la agregó a mano
+`supabase-migration-brand-extraction-execution-mode.sql`). Si producción tiene
+cualquier fila fuera de esas listas, el `ADD CONSTRAINT` falla (23514), el
+script revierte, y el deploy aborta **después** del rsync y **antes** del
+`pm2 reload` (código nuevo en disco con procesos viejos). Por eso, **antes de
+mergear**, el owner corre esto (solo lectura) contra producción con `psql`:
+
+```sql
+begin transaction read only;
+select conname, pg_get_constraintdef(oid) from pg_constraint
+ where conrelid = 'public.production_jobs'::regclass
+   and conname in ('production_jobs_execution_mode_check','production_jobs_worker_status_check');
+select execution_mode, count(*), max(created_at) from public.production_jobs group by 1 order by 1;
+select count(*) as would_violate_execution_mode from public.production_jobs
+ where execution_mode not in ('frontend','backend_content','backend_audio','backend_videos','backend_h5p',
+   'backend_gamma','backend_package','backend_package_base','course_full_generation','backend_full_future',
+   'dynamic_generation','dynamic_package');
+select count(*) as would_violate_worker_status from public.production_jobs
+ where worker_status is not null and worker_status not in ('queued','running','waiting_external','retrying',
+   'paused','pausing','cancelling','completed','failed','failed_recoverable','failed_retryable',
+   'needs_reconnect','blocked_quota','cancelled');
+rollback;
+```
+
+**Resultado esperado: `would_violate_execution_mode = 0` y
+`would_violate_worker_status = 0`.** Si alguno es > 0 (típicamente filas
+`brand_extraction`), **no mergear**: resolver DN-6 primero (opción A: agregar
+`'brand_extraction'` a la lista del script y decidir el worker) en un PR
+revisado. Anotar el resultado (fecha + ambos conteos) junto al registro del
+backup. El histograma de `execution_mode` también lo imprime el runner (solo
+informativo) al hacer `--apply`.
+
 ## Precondiciones (el owner, antes de `--apply`)
 
 1. **Backup/PITR verificado** (runbook Paso 1.3): PITR activo en el proyecto
@@ -103,10 +140,32 @@ verifican precondiciones en una transacción READ ONLY antes de mutar nada.
 
 `--verify-only` exige lo mismo **menos** backup y el flag de mutación.
 
-El runner **nunca lee `.env` implícitamente**: las credenciales vienen del
-entorno o de `--env-file <ruta>` explícito (el entorno del proceso tiene
-prioridad sobre el archivo). Los verify/audit hijos corren con `cwd` en un
-directorio temporal vacío, así tampoco cargan ningún `.env`.
+El runner **nunca lee `.env` implícitamente**. `--env-file <ruta>` es
+explícito y **solo puede aportar claves de conexión**: `DB_HOST`, `DB_PORT`,
+`DB_USER`, `DB_PASS`, `DB_NAME`, `DB_SSL` (el entorno del proceso tiene
+prioridad). Cualquier otra clave del archivo — `MIGRATION_ENV`, `CONFIRM_*`,
+`NODE_ENV`, `V2_TEST_*`, `V2_VERIFY_MODE`, `V2_DB_SSL_CA`, `V2_HEALTH_*` — se
+**ignora** con un aviso que lista los nombres: aunque alguien ponga
+`CONFIRM_BACKUP_TAKEN=yes` en el `.env` del VPS, la confirmación sigue
+teniendo que escribirse en cada corrida. Los verify/audit hijos corren con
+`cwd` en un directorio temporal vacío, así tampoco cargan ningún `.env`.
+
+**TLS:** con `DB_SSL=true` y `V2_DB_SSL_CA=<ruta a un PEM>` (el CA de
+Supabase, descargable desde el dashboard: Database → SSL) se verifican los
+certificados (`rejectUnauthorized: true`). Sin CA, se mantiene el
+comportamiento de los scripts existentes (`rejectUnauthorized=false`) y se
+imprime un aviso explícito antes de conectar. `V2_DB_SSL_CA` inexistente →
+rechazo antes de conectar. Recomendado para producción: definir el CA.
+
+**Timeouts por paso:** antes de cada `.sql` el runner hace
+`SET LOCAL lock_timeout = '5s'` y `SET LOCAL statement_timeout = '300s'` (el
+`.sql` puede endurecerlos).
+
+**Pooler:** para el apply usar conexión directa o el pooler en **modo
+sesión** (5432). La verificación read-only funciona también detrás del modo
+transacción: es una única `BEGIN TRANSACTION READ ONLY` por conexión (no un
+setting de sesión) y el cliente rechaza cualquier `COMMIT`/`BEGIN`/`SET
+SESSION`/`RESET`/`DISCARD` mientras dura.
 
 ## Comandos
 
@@ -154,6 +213,22 @@ node scripts/prod/migrate-v2-production.js --env-file .env \
 llega ahí con el mismo merge.)
 
 ### 2b. Apply desde GitHub Actions (opcional)
+
+**Setup del owner (una vez, antes del primer uso — decisión D):** GitHub
+auto-crea un environment referenciado que no existe **sin** reviewers ni
+política de ramas, y `secrets.*` también resuelve secretos del repo. Por eso:
+
+1. Settings → Environments → **New environment** `production-v2-migrations`.
+2. **Required reviewers:** el owner (y nadie más).
+3. **Deployment branches:** solo `main` (rama protegida).
+4. **Environment variable** `V2_PROD_MIGRATIONS_ENV_GUARD = production-v2-migrations`
+   — **solo** en el environment, nunca como variable de repo u organización.
+   El primer step del job `migrate` falla si no la ve; es la prueba de que el
+   environment protegido existe (si GitHub lo auto-creara, no la tendría).
+5. **Environment secrets** `V2_PROD_DB_HOST`, `V2_PROD_DB_PORT`,
+   `V2_PROD_DB_USER`, `V2_PROD_DB_PASS`, `V2_PROD_DB_NAME` — **solo** en el
+   environment; no crear secretos de repo/organización con esos nombres. Los
+   secretos se leen únicamente en el último step, después del guard.
 
 Workflow **V2 production migrations (manual, owner approval)** → *Run workflow*
 desde `main`:
@@ -297,7 +372,15 @@ read only` + rollback; funciona con un rol que solo tenga `SELECT`). Reporta:
    (subestimación) + gasto legacy informativo de `usage_events`;
 6. bytes de **Storage** de artifacts dynamic (`item_run_id`/`manifest_id` no nulo).
 
-Umbrales por env (default): `V2_HEALTH_MAX_FAILED_ITEMS_24H=5`,
+Los textos de error (items fallidos y `error_message` de `dynamic_package`,
+y los errores de conexión/consulta) se **redactan** antes de imprimirse: JWT
+(`eyJ…`), `Bearer …`, parámetros `token=`/`sig=`/`key=`/…, URLs completas y
+emails. `--env-file` solo aporta `DB_*` (igual que el runner): umbrales y
+`V2_HEALTH_EXPECTED_REF` deben venir del entorno real o de la CLI. Para un rol
+de mínimo privilegio en el pooler se acepta `DB_USER=<rol>.<ref de 20>` (p.
+ej. `health_ro.hriwbakbuypaiovvvkqh`).
+
+Umbrales por env (default; se aceptan fraccionarios, p. ej. `V2_HEALTH_LONG_RUN_HOURS=0.5`): `V2_HEALTH_MAX_FAILED_ITEMS_24H=5`,
 `V2_HEALTH_LEASE_GRACE_MINUTES=10`, `V2_HEALTH_MAX_STUCK_LEASES=0`,
 `V2_HEALTH_MAX_PACKAGE_FAILURES_24H=0`, `V2_HEALTH_LONG_RUN_HOURS=6`,
 `V2_HEALTH_MAX_LONG_RUNS=0`, `V2_HEALTH_MAX_VIDEOGEN_USD_24H=25`,

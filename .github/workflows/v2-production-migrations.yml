@@ -4,11 +4,18 @@
 #
 # ⚠️  DECISIÓN D — REQUIERE APROBACIÓN DEL OWNER (Nicolás) ⚠️
 #   - El job que conecta a la base (`migrate`) usa el GitHub Environment
-#     `production-v2-migrations`. El owner DEBE configurarlo antes del primer uso:
+#     `production-v2-migrations`. GitHub AUTO-CREA un environment referenciado
+#     que no existe, SIN reviewers ni política de ramas — por eso el primer step
+#     de `migrate` falla salvo que exista la variable de ENVIRONMENT
+#     V2_PROD_MIGRATIONS_ENV_GUARD=production-v2-migrations, que solo el owner
+#     define al configurar el environment protegido. El owner DEBE, antes del
+#     primer uso:
 #       Settings → Environments → New environment "production-v2-migrations"
-#         · Required reviewers: el owner (y nadie más)
-#         · Deployment branches: solo `main`
-#         · Secrets del environment (NO del repo):
+#         · Required reviewers: el owner (y nadie más); "Prevent self-review" si aplica
+#         · Deployment branches: solo `main` (rama protegida)
+#         · Environment variable: V2_PROD_MIGRATIONS_ENV_GUARD = production-v2-migrations
+#           (SOLO en el environment; nunca como variable del repo/organización)
+#         · Environment secrets (NUNCA secretos del repo/organización con estos nombres):
 #             V2_PROD_DB_HOST  V2_PROD_DB_PORT  V2_PROD_DB_USER  V2_PROD_DB_PASS  V2_PROD_DB_NAME
 #           (recomendado: pooler de Supabase en MODO SESIÓN, puerto 5432,
 #            usuario "postgres.<ref>" — los runners de GitHub no tienen IPv6 y
@@ -89,6 +96,18 @@ jobs:
     environment: production-v2-migrations
     timeout-minutes: 30
     steps:
+      # PRIMER step, antes de cualquier secreto: prueba que el environment
+      # protegido existe y lo configuró el owner (ver cabecera).
+      - name: Guard — environment protegido configurado por el owner
+        env:
+          ENV_GUARD: ${{ vars.V2_PROD_MIGRATIONS_ENV_GUARD }}
+        run: |
+          if [ "$ENV_GUARD" != "production-v2-migrations" ]; then
+            echo "❌ Falta la variable de environment V2_PROD_MIGRATIONS_ENV_GUARD=production-v2-migrations."
+            echo "   El environment 'production-v2-migrations' no está configurado/protegido por el owner"
+            echo "   (required reviewers + rama main + secretos de environment). Ver docs/v2-production-migrations.md."
+            exit 1
+          fi
       - name: Validar entradas (sin interpolar inputs en shell)
         env:
           MODE: ${{ inputs.mode }}
