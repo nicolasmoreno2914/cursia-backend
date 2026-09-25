@@ -25,6 +25,7 @@
 // Usage: node scripts/check-dynamic-feature-gating.js [path/to/dist]
 
 const path = require('path');
+const fs = require('fs');
 const net = require('net');
 const os = require('os');
 const { spawn } = require('child_process');
@@ -70,6 +71,70 @@ const { RunsService } = loadDist('modules/dynamic-generation/runs.service.js');
 const { SchedulerService } = loadDist('modules/dynamic-generation/scheduler.service.js');
 const { PackagingController } = loadDist('modules/dynamic-packaging/packaging.controller.js');
 const { PackagingService } = loadDist('modules/dynamic-packaging/packaging.service.js');
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M1 (fix wave / review): descubrimiento automático de TODOS los controllers
+// compilados en dist/, en vez de una lista escrita a mano — un controller V2
+// nuevo (Fase 7/8) que no se clasifique acá hace FALLAR el check, en vez de
+// pasar en silencio sin gating.
+// ─────────────────────────────────────────────────────────────────────────────
+function findControllerFiles(dir) {
+  const out = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === 'node_modules') continue;
+    const p = path.join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...findControllerFiles(p));
+    else if (entry.isFile() && /\.controller\.js$/.test(entry.name)) out.push(p);
+  }
+  return out;
+}
+/** Cada .controller.js compilado → sus exports que son clases con @Controller (metadata PATH_METADATA). */
+function discoverControllers() {
+  const found = [];
+  for (const file of findControllerFiles(distRoot)) {
+    const mod = require(file);
+    for (const key of Object.keys(mod)) {
+      const val = mod[key];
+      if (typeof val === 'function' && Reflect.getMetadata(PATH_METADATA, val) !== undefined) {
+        found.push({ name: val.name || key, ctrl: val, file: path.relative(distRoot, file) });
+      }
+    }
+  }
+  return found;
+}
+/** Los 6 controllers 100% dynamic (G1) — deben coincidir con DYNAMIC_CONTROLLERS de dynamic-routes.ts. */
+const DYNAMIC_CONTROLLER_CLASS_NAMES = new Set([
+  'CourseStructureController',
+  'CourseBlueprintsController',
+  'GenerationManifestsController',
+  'RunsController',
+  'ExecutorController',
+  'PackagingController',
+]);
+/**
+ * Todo lo demás: legacy sin ninguna ruta dynamic, EXCEPTO CoursesController
+ * (mixto: legacy + el único handler POST /courses/dynamic, marcado a nivel de
+ * método vía isDynamicRoute, no de controller) y CourseSetupController
+ * (ungated por decisión explícita del controller — no crea datos dynamic,
+ * ver flag-report.md #3 y review "declined to judge").
+ */
+const LEGACY_CONTROLLER_CLASS_NAMES = new Set([
+  'AppController',
+  'AuthController',
+  'YoutubeController',
+  'TtsController',
+  'EventsController',
+  'VideoEngineController',
+  'AdminDashboardController',
+  'InstitutionsController',
+  'ArtifactsController',
+  'ProductionJobsController',
+  'BrandProfilesController',
+  'FeaturesController',
+  'CourseVersionsController',
+  'CourseSetupController',
+  'CoursesController',
+]);
 
 Logger.overrideLogger(false);
 
@@ -285,6 +350,31 @@ async function runWorkerProcess(script, env, { waitMs }) {
     eq(f({ [FLAG]: 'true' }), true, 'true');
   });
 
+  await check('M6 (fix wave) warnIfNearMissDynamicFlag: avisa UNA vez por proceso ante True/TRUE/1/yes/on; nunca ante ausente/false/true/basura', () => {
+    const warned = [];
+    const fakeLogger = { warn: (m) => warned.push(m) };
+    for (const raw of ['True', 'TRUE', '1', 'yes', 'YES', 'on', 'ON']) {
+      features._resetNearMissFlagWarningForTests();
+      warned.length = 0;
+      features.warnIfNearMissDynamicFlag(fakeLogger, { [FLAG]: raw });
+      assert(warned.length === 1, `"${raw}": esperaba 1 warning, hubo ${warned.length}`);
+      assert(warned[0].includes(raw) && /no activa V2/.test(warned[0]), `"${raw}": mensaje inesperado: ${warned[0]}`);
+    }
+    for (const env of [{}, { [FLAG]: 'false' }, { [FLAG]: 'true' }, { [FLAG]: 'basura' }, { [FLAG]: ' true' }]) {
+      features._resetNearMissFlagWarningForTests();
+      warned.length = 0;
+      features.warnIfNearMissDynamicFlag(fakeLogger, env);
+      eq(warned, [], `no debería avisar con ${JSON.stringify(env)}`);
+    }
+    // "Una sola vez por proceso": una segunda llamada con OTRO near-miss no vuelve a loguear.
+    features._resetNearMissFlagWarningForTests();
+    warned.length = 0;
+    features.warnIfNearMissDynamicFlag(fakeLogger, { [FLAG]: 'True' });
+    features.warnIfNearMissDynamicFlag(fakeLogger, { [FLAG]: 'yes' });
+    eq(warned.length, 1, 'debería avisar una sola vez pese a dos llamadas con valores near-miss distintos');
+    features._resetNearMissFlagWarningForTests();
+  });
+
   await check('G3 matriz resolveDynamicFeatures: off / on+vacía / on+listado / on+no listado', () => {
     const r = features.resolveDynamicFeatures;
     eq(r(OWNER_A, {}).dynamicCourseStructure, false, 'off');
@@ -327,6 +417,35 @@ async function runWorkerProcess(script, env, { waitMs }) {
       assert(!isDynamicRoute(CoursesController, r.handler), `legacy ${r.method} ${r.path} marcado dynamic`);
     }
     assert(!isDynamicRoute(AppController, AppController.prototype.getHealth), 'health');
+  });
+
+  await check('M1 (fix wave) discovery automática: TODO controller compilado en dist/ debe estar clasificado dynamic o legacy (protege Fase 7/8)', () => {
+    const discovered = discoverControllers();
+    assert(discovered.length >= 20, `muy pocos controllers descubiertos en dist/ (¿corrió el build?): ${discovered.length}`);
+    const seenNames = new Set();
+    for (const { name, file } of discovered) {
+      assert(!seenNames.has(name), `controller duplicado descubierto: ${name}`);
+      seenNames.add(name);
+      const inDynamic = DYNAMIC_CONTROLLER_CLASS_NAMES.has(name);
+      const inLegacy = LEGACY_CONTROLLER_CLASS_NAMES.has(name);
+      assert(
+        inDynamic || inLegacy,
+        `${name} (${file}) NO está clasificado en scripts/check-dynamic-feature-gating.js — ` +
+          'agregalo a DYNAMIC_CONTROLLER_CLASS_NAMES o LEGACY_CONTROLLER_CLASS_NAMES antes de mergear',
+      );
+      assert(!(inDynamic && inLegacy), `${name} está en ambos mapas (dynamic y legacy) a la vez`);
+    }
+    // Todo lo clasificado como dynamic debe haberse descubierto de verdad en dist/ (nombre no es un typo).
+    for (const name of DYNAMIC_CONTROLLER_CLASS_NAMES) {
+      assert(discovered.some((d) => d.name === name), `"${name}" está en DYNAMIC_CONTROLLER_CLASS_NAMES pero no se descubrió ningún controller con ese nombre en dist/`);
+    }
+    for (const name of LEGACY_CONTROLLER_CLASS_NAMES) {
+      assert(discovered.some((d) => d.name === name), `"${name}" está en LEGACY_CONTROLLER_CLASS_NAMES pero no se descubrió ningún controller con ese nombre en dist/`);
+    }
+    // El mapa dynamic de este check debe coincidir 1:1 con DYNAMIC_CONTROLLERS (dynamic-routes.ts): la
+    // fuente de verdad real del guard, no solo la clasificación de este test.
+    const dynamicRoutesNames = new Set([...DYNAMIC_CONTROLLERS].map((C) => C.name));
+    eq([...dynamicRoutesNames].sort(), [...DYNAMIC_CONTROLLER_CLASS_NAMES].sort(), 'DYNAMIC_CONTROLLERS (dynamic-routes.ts) vs. clasificación de este check');
   });
 
   // ── HTTP real ──────────────────────────────────────────────────────────────
@@ -565,6 +684,98 @@ async function runWorkerProcess(script, env, { waitMs }) {
       assert(b.state.created, 'mock no creó');
     }));
 
+  // ── I1 (fix wave): retryItem NO debe poder reabrir/gastar video real
+  // esquivando DYNAMIC_REAL_VIDEO_OWNERS (retry ≠ resume, ruling del
+  // controller). También debe respetar DYNAMIC_V2_ALLOWED_OWNERS como
+  // cualquier otro entry point. ──────────────────────────────────────────────
+  /**
+   * RunsService.retryItem con DB falsa a nivel de queryRunner: `job` es la fila
+   * cruda de production_jobs (con input_payload.videoMode ya congelado),
+   * `locked.worker_status` decide si el run está activo o terminal (reabre),
+   * `items` es la única fila del item a reintentar (sin dependientes, para no
+   * ejercitar dependentsToUnblock en este harness).
+   */
+  function retryItemServiceFor({ frozenMode, lockedStatus, itemType, itemError }) {
+    const state = { targetUpdated: false, runReopened: false };
+    const job = { id: 'run-1', status: lockedStatus, worker_status: lockedStatus, input_payload: { videoMode: frozenMode } };
+    const locked = { id: 'run-1', status: lockedStatus, worker_status: lockedStatus };
+    const target = {
+      id: 'item-1',
+      item_key: 'k1',
+      status: 'failed',
+      depends_on: [],
+      type: itemType,
+      error: itemError ?? 'some_error',
+      output_summary: {},
+    };
+    const svc = new RunsService({ query: async () => [{ id: target.id, item_key: target.item_key, type: itemType, status: 'pending' }] }, { async get() { return { id: 42, manifest: { items: [] } }; } }, {});
+    svc.loadRunRow = async () => job;
+    svc.reconcileCancellation = async (j) => j;
+    svc.tx = async (fn) =>
+      fn({
+        query: async (sql, params) => {
+          if (/from public\.production_jobs where id = \$1\s*$/m.test(sql.trim()) || /select id, status, worker_status from public\.production_jobs/.test(sql)) {
+            return [locked];
+          }
+          if (/select id, item_key, status, depends_on, type, error, output_summary/.test(sql)) {
+            return [target];
+          }
+          if (/update public\.generation_item_runs/.test(sql) && /set status = 'pending'/.test(sql) && /where id = \$1 and status = 'failed'/.test(sql)) {
+            state.targetUpdated = true;
+            return [{ id: params[0] }];
+          }
+          if (/where id = any\(\$1::uuid\[\]\)/.test(sql)) {
+            return [];
+          }
+          if (/update public\.production_jobs/.test(sql) && /set status = 'queued'/.test(sql)) {
+            state.runReopened = true;
+            return [];
+          }
+          throw new Error('SQL inesperado en fake qr de retryItem: ' + sql);
+        },
+      });
+    return { svc, state };
+  }
+  const retryRealMatrix = [
+    { label: 'real + item video, run activo, no listado → 403', frozenMode: 'real', lockedStatus: 'running', itemType: 'video', resubmit: false, ok: false },
+    { label: 'real + item video, run activo, listado → reintenta', frozenMode: 'real', lockedStatus: 'running', itemType: 'video', resubmit: false, ok: true },
+    { label: 'real + item no-video, run ACTIVO (no reabre), no listado → reintenta (no es gasto nuevo)', frozenMode: 'real', lockedStatus: 'running', itemType: 'content', resubmit: false, ok: true, forceUnlisted: true },
+    { label: 'real + item no-video, run TERMINADO (reabre), no listado → 403', frozenMode: 'real', lockedStatus: 'failed', itemType: 'content', resubmit: false, ok: false },
+    { label: 'real + item no-video, run TERMINADO (reabre), listado → reabre', frozenMode: 'real', lockedStatus: 'failed', itemType: 'content', resubmit: false, ok: true },
+    { label: 'real + resubmitVideo=true, no listado → 403', frozenMode: 'real', lockedStatus: 'running', itemType: 'video', resubmit: true, itemError: 'videogen_failed', ok: false },
+    { label: 'mock + item video, run activo, no listado → siempre permitido', frozenMode: 'mock', lockedStatus: 'running', itemType: 'video', resubmit: false, ok: true, forceUnlisted: true },
+  ];
+  for (const m of retryRealMatrix) {
+    const env = m.ok && !m.forceUnlisted ? { ...REAL_ON, [REAL]: OWNER_A } : REAL_ON;
+    await check(`I1 retryItem videoMode — ${m.label}`, () =>
+      withEnv({ ...ENV_CLEAN, ...env }, async () => {
+        const { svc, state } = retryItemServiceFor({ frozenMode: m.frozenMode, lockedStatus: m.lockedStatus, itemType: m.itemType, itemError: m.itemError });
+        const p = svc.retryItem(1, OWNER_A, 1, 'run-1', 'k1', m.resubmit);
+        if (m.ok) {
+          await p;
+          assert(state.targetUpdated, 'no reintentó el item');
+        } else {
+          await rejects(p, ForbiddenException, /video real/i, 'debería ser 403 (video real no habilitado)');
+          assert(!state.targetUpdated && !state.runReopened, 'mutó DB pese al 403');
+        }
+      }));
+  }
+  await check('I1 retryItem: DYNAMIC_V2_ALLOWED_OWNERS también aplica (owner no listado → 403 sin tocar el run)', () =>
+    withEnv({ ...ENV_CLEAN, [FLAG]: 'true', [ALLOW]: OWNER_B }, async () => {
+      const { svc, state } = retryItemServiceFor({ frozenMode: 'mock', lockedStatus: 'running', itemType: 'content' });
+      const err = await rejects(svc.retryItem(1, OWNER_A, 1, 'run-1', 'k1', false), ForbiddenException, /no está habilitad/, 'debería ser 403');
+      assert(!state.targetUpdated, 'mutó DB pese al 403');
+    }));
+  await check('I1 retryItem: flag OFF → 403 antes de tocar el manifest/run', () =>
+    withEnv(ENV_CLEAN, async () => {
+      const { svc, state } = retryItemServiceFor({ frozenMode: 'mock', lockedStatus: 'running', itemType: 'content' });
+      let manifestCalled = false;
+      svc.manifests = { async get() { manifestCalled = true; throw new Error('no debería llamarse'); } };
+      await rejects(svc.retryItem(1, OWNER_A, 1, 'run-1', 'k1', false), ForbiddenException, /no está habilitad/, 'debería ser 403');
+      assert(!manifestCalled, 'llamó al manifest antes del 403');
+      assert(!state.targetUpdated, 'mutó DB pese al 403');
+    }));
+
   // ── G4 workers ─────────────────────────────────────────────────────────────
   for (const script of ['dynamic-item-worker.js', 'dynamic-package-worker.js']) {
     await check(`G4 ${script} flag OFF: log claro, sigue vivo, 0 conexiones a la DB, SIGTERM → exit 0`, async () => {
@@ -578,6 +789,12 @@ async function runWorkerProcess(script, env, { waitMs }) {
       const r = await runWorkerProcess(script, { [FLAG]: 'true' }, { waitMs: 4000 });
       assert(!/el worker no reclama jobs/.test(r.output), 'no debería quedar inactivo');
       assert(r.connectionsAfterWait > 0, `no intentó conectar a la DB:\n${r.output}`);
+    });
+    await check(`M6 (fix wave) ${script} flag "True" (near-miss): sigue OFF (idle) Y avisa que no activó V2`, async () => {
+      const r = await runWorkerProcess(script, { [FLAG]: 'True', [ALLOW]: undefined, [REAL]: undefined }, { waitMs: 3500 });
+      assert(/DYNAMIC_COURSE_STRUCTURE desactivado: el worker no reclama jobs/.test(r.output), `sin log claro de OFF:\n${r.output}`);
+      assert(/DYNAMIC_COURSE_STRUCTURE="True" no activa V2/.test(r.output), `sin warning de near-miss:\n${r.output}`);
+      eq(r.connectionsAfterWait, 0, 'conexiones a la DB (debe seguir OFF)');
     });
   }
 
