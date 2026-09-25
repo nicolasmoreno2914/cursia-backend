@@ -33,4 +33,16 @@ export class TtsSpeechDto {
   @IsString()
   @MaxLength(300)
   instructions?: string;
+
+  /**
+   * Opcional: curso para el que se sintetiza (id numérico de `courses` o UUID
+   * del frontend). Si es un curso V2 (structure_version='dynamic') → 409
+   * `v2_course_legacy_audio_disabled:` antes de llamar a OpenAI. Sin este campo
+   * el endpoint sigue siendo un proxy sin contexto de curso (comportamiento
+   * legacy intacto).
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(80)
+  courseId?: string;
 }
