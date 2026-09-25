@@ -63,7 +63,12 @@ async function main() {
             -- de siquiera llegar al índice único parcial de Task 1
             -- (uq_dynamic_generation_active_run en
             -- supabase-migration-dynamic-generation.sql).
-            'dynamic_generation'
+            'dynamic_generation',
+            -- Fase 5B.1 (empaquetado Moodle dinámico): el job que produce el
+            -- .mbz de un run 5A completado (spec §7/§10, plan B3). Sin esto,
+            -- insertar la fila del job en PackagingService.requestPackage se
+            -- rechaza con 23514 antes de llegar a production_jobs.
+            'dynamic_package'
           )
         );
     `);
