@@ -76,6 +76,16 @@ export function supabaseServiceHeaders(serviceKey: string): Record<string, strin
   };
 }
 
+/**
+ * Artifact del flujo dynamic (V2): tipo `dynamic_*` (dynamic_content_md,
+ * dynamic_video, dynamic_mbz, dynamic_coherence_report_json, …) o vinculado a
+ * un item/Manifest. Esos paths son inmutables y pueden estar compartidos por
+ * filas "carried" (Fase 8). `null`/ausente en filas legacy.
+ */
+export function isDynamicArtifactRow(row: { type?: string | null; item_run_id?: string | null; manifest_id?: number | null }): boolean {
+  return String(row?.type ?? '').startsWith('dynamic_') || row?.item_run_id != null || row?.manifest_id != null;
+}
+
 @Injectable()
 export class ArtifactsService {
   private readonly logger = new Logger(ArtifactsService.name);
@@ -372,35 +382,48 @@ export class ArtifactsService {
   // ── DELETE ──────────────────────────────────────────────────────────────────
 
   /**
-   * Elimina el registro de metadata.
-   * Opcionalmente intenta borrar el archivo de Supabase Storage
-   * (requiere SUPABASE_SERVICE_ROLE_KEY).
+   * Elimina el registro de metadata y (si corresponde) el objeto de Supabase
+   * Storage (requiere SUPABASE_SERVICE_ROLE_KEY).
+   *
+   * Release-fix (release review Minor 1): dos semánticas según el artifact.
+   * - LEGACY (no dynamic): la de `main` — el objeto de Storage se borra ANTES
+   *   que la fila, aunque otra fila legacy comparta el path (`x-upsert:true`);
+   *   un fallo de Storage se loguea y la fila se borra igual. Única excepción:
+   *   si una fila DYNAMIC usa el mismo path, el objeto se conserva.
+   * - DYNAMIC (`type` dynamic_* o vinculado a item_run_id/manifest_id): Fase 8
+   *   — una fila "carried" (REUSE) apunta a la MISMA storage_path inmutable
+   *   que la fila histórica de la que salió; borrar una fila nunca debe borrar
+   *   el objeto que otra fila sigue usando. Fix wave I2 (carrera con el apply
+   *   fromRun): en UNA transacción se bloquea la fila (FOR UPDATE), se
+   *   bloquean y cuentan las demás filas con la misma ruta y se borra la
+   *   fila; el objeto se borra recién DESPUÉS del commit y solo si nadie más
+   *   lo referenciaba. Un apply que llegue después ve la fila borrada y falla
+   *   con 409.
    */
   async remove(id: string, ownerId: string): Promise<void> {
-    // Fase 8: una fila "carried" (REUSE) apunta a la MISMA storage_path
-    // inmutable que la fila histórica de la que salió. Borrar una fila nunca
-    // debe borrar el objeto que otra fila sigue usando.
-    //
-    // Fix wave I2 (carrera con el apply fromRun): en UNA transacción se
-    // bloquea la fila (FOR UPDATE: espera a un apply que la tenga bloqueada
-    // mientras inserta su copia), se bloquean y cuentan las demás filas con la
-    // misma ruta y se borra la fila. El objeto de Storage se borra recién
-    // DESPUÉS del commit y solo si nadie más lo referenciaba. Un apply que
-    // llegue después ve la fila borrada y falla con 409 (nunca copia una fila
-    // cuyo objeto se va a borrar).
     const qr = this.artifactRepo.manager.connection.createQueryRunner();
     let row: any;
-    let sharedWith = 0;
+    let sharers: any[] = [];
+    let dynamic = false;
     await qr.connect();
     try {
       await qr.startTransaction();
       [row] = await qr.query(`select * from public.artifacts where id = $1 and owner_id = $2 for update`, [id, ownerId]);
       if (!row) throw new NotFoundException(`Artifact ${id} not found`);
-      const sharers = await qr.query(
-        `select id from public.artifacts where storage_bucket = $1 and storage_path = $2 and id <> $3 for update`,
+      sharers = await qr.query(
+        `select * from public.artifacts where storage_bucket = $1 and storage_path = $2 and id <> $3 for update`,
         [row.storage_bucket, row.storage_path, row.id],
       );
-      sharedWith = sharers.length;
+      dynamic = isDynamicArtifactRow(row);
+      if (!dynamic) {
+        // Orden legacy (main): Storage primero, después la fila.
+        const dynamicSharers = sharers.filter(isDynamicArtifactRow).length;
+        if (dynamicSharers > 0) {
+          this.logger.log(`remove(${row.id}): ${dynamicSharers} fila(s) dynamic usan ${row.storage_path}; se conserva el objeto de Storage`);
+        } else {
+          await this.deleteStorageObject(row);
+        }
+      }
       await qr.query(`delete from public.artifacts where id = $1`, [row.id]);
       await qr.commitTransaction();
     } catch (err) {
@@ -409,26 +432,31 @@ export class ArtifactsService {
     } finally {
       await qr.release();
     }
+    if (!dynamic) return;
 
-    if (sharedWith > 0) {
-      this.logger.log(`remove(${row.id}): ${sharedWith} fila(s) más usan ${row.storage_path}; se conserva el objeto de Storage`);
+    if (sharers.length > 0) {
+      this.logger.log(`remove(${row.id}): ${sharers.length} fila(s) más usan ${row.storage_path}; se conserva el objeto de Storage`);
       return;
     }
+    await this.deleteStorageObject(row);
+  }
+
+  /** Borra el objeto de Storage de una fila (best effort: los fallos se loguean, nunca se propagan). */
+  private async deleteStorageObject(row: { storage_provider: string; storage_bucket: string; storage_path: string }): Promise<void> {
     const supabaseUrl = this.config.get<string>('SUPABASE_URL');
     const serviceKey  = this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY');
-    if (supabaseUrl && serviceKey && row.storage_provider === 'supabase') {
-      try {
-        const deleteUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/${row.storage_bucket}/${row.storage_path}`;
-        const res = await fetch(deleteUrl, {
-          method: 'DELETE',
-          headers: supabaseServiceHeaders(serviceKey),
-        });
-        if (!res.ok) {
-          this.logger.warn(`Storage delete failed for ${row.storage_path}: ${res.status}`);
-        }
-      } catch (err) {
-        this.logger.warn(`Storage delete error for ${row.storage_path}: ${err}`);
+    if (!(supabaseUrl && serviceKey && row.storage_provider === 'supabase')) return;
+    try {
+      const deleteUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/${row.storage_bucket}/${row.storage_path}`;
+      const res = await fetch(deleteUrl, {
+        method: 'DELETE',
+        headers: supabaseServiceHeaders(serviceKey),
+      });
+      if (!res.ok) {
+        this.logger.warn(`Storage delete failed for ${row.storage_path}: ${res.status}`);
       }
+    } catch (err) {
+      this.logger.warn(`Storage delete error for ${row.storage_path}: ${err}`);
     }
   }
 }

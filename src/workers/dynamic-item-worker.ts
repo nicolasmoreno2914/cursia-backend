@@ -5,6 +5,7 @@ import { NestFactory } from '@nestjs/core';
 import { DataSource } from 'typeorm';
 import { AppModule } from '../app.module';
 import { holdIdleIfDynamicDisabled } from './dynamic-worker-gate';
+import { isRealVideoAllowedForOwner } from '../modules/features/dynamic-features';
 import { ClaimedItem, DEFAULT_LEASE_SECONDS, SchedulerService } from '../modules/dynamic-generation/scheduler.service';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import {
@@ -137,6 +138,31 @@ interface RunHead {
  */
 export function isDynamicVideoCompleted(status: string | null | undefined): boolean {
   return isJobCompleted(status ?? '') || String(status ?? '').toLowerCase() === 'completed_local';
+}
+
+/**
+ * Release-fix I1: motivo (español, legible en la UI) con el que falla un item
+ * de video real cuyo owner YA NO está habilitado para video real al momento
+ * del submit. Prefijo estable `real_video_not_allowed:` para que la UI/ops lo
+ * reconozcan. Sin UUIDs.
+ */
+export const REAL_VIDEO_NOT_ALLOWED_ITEM_ERROR =
+  'real_video_not_allowed: El video real (Videogen, con costo) ya no está habilitado para esta cuenta, ' +
+  'así que no se envió este video (sin costo). Para generarlo, pedí que habiliten el video real y reintentá ' +
+  'esta parte, o regenerá el curso con video "mock".';
+
+/**
+ * Release-fix I1: re-chequeo en el MOMENTO del submit (no al boot del worker)
+ * de DYNAMIC_REAL_VIDEO_OWNERS (+ flag V2 y allow-list V2), leyendo el env
+ * ACTUAL del proceso. Fail closed: una lista inválida cuenta como "no".
+ */
+function realVideoStillAllowed(ownerId: string, logger: Logger): boolean {
+  try {
+    return isRealVideoAllowedForOwner(ownerId);
+  } catch (err) {
+    logger.error(`Configuración de video real inválida — no se somete a Videogen (fail closed): ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
 }
 
 /** Señal: el input_payload del run tiene una estrategia de entrega desconocida (integridad rota). */
@@ -347,6 +373,18 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
       // marcadores, a propósito — ver R3/R15).
       if (mode === 'real' && !(process.env.VIDEOGEN_API_KEY ?? '').trim()) {
         await scheduler.failItem(item.itemRunId, deps.executorId, 'videogen_not_configured', false);
+        return;
+      }
+      // Release-fix I1 (release review): el allow-list de video real se
+      // re-chequea JUSTO antes de un submit NUEVO (gasto). Quitar a un owner de
+      // DYNAMIC_REAL_VIDEO_OWNERS (+ pm2 restart --update-env) corta el gasto
+      // de sus runs 'real' activos: el item falla no-reintentable, sin
+      // marcar externalSubmitStartedAt (un retry posterior, ya habilitado, no
+      // cae en ambiguous_video_submission). Re-pollear un job ya sometido
+      // (rama `existingExternal` de arriba) sigue permitido: no hay gasto nuevo.
+      if (mode === 'real' && !realVideoStillAllowed(runHead.ownerId, logger)) {
+        logger.warn(`Item ${item.itemKey} (run ${item.runId}): video real ya no habilitado para el owner — no se somete a Videogen`);
+        await scheduler.failItem(item.itemRunId, deps.executorId, REAL_VIDEO_NOT_ALLOWED_ITEM_ERROR, false);
         return;
       }
 
