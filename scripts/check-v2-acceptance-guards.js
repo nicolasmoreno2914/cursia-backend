@@ -83,12 +83,20 @@ const DYN_UUID = '7f3a9c1e-1111-4222-8333-444455556666'; // empieza con dígitos
 const LEG_UUID = '0b9c8d1e-2f3a-4b5c-8d6e-7f8091a2b3c4';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// "DB" falsa de cursos: emula EXACTAMENTE el SQL de legacy-audio-guard.ts.
+// "DB" falsa de cursos: emula el SQL de legacy-audio-guard.ts LITERALMENTE por
+// cláusulas (si el SQL no trae la exclusión de gemelos legacy o la
+// preferencia por id numérico, la emulación tampoco las aplica → los tests
+// I1 fallan con el SQL viejo). La semántica exacta contra Postgres real la
+// valida además scratch/sa-be/i1-sql (ver reporte).
 // ─────────────────────────────────────────────────────────────────────────────
+const TWIN_UUID = '3c2b1a00-aaaa-4bbb-8ccc-dddddddddddd'; // legacy + gemelo V2 con el MISMO UUID
 const COURSES = [
   { id: 7, owner: OWNER_A, sv: 'dynamic', frontend: DYN_UUID },
   { id: 8, owner: OWNER_A, sv: 'legacy', frontend: LEG_UUID },
   { id: 9, owner: OWNER_B, sv: 'dynamic', frontend: 'otro-front' },
+  { id: 10, owner: OWNER_A, sv: 'legacy', frontend: TWIN_UUID },
+  { id: 11, owner: OWNER_A, sv: 'dynamic', frontend: TWIN_UUID },
+  { id: 12, owner: OWNER_B, sv: 'legacy', frontend: DYN_UUID }, // legacy de OTRO owner con el UUID V2 de A: no cuenta
 ];
 function makeDataSource(log) {
   return {
@@ -96,7 +104,14 @@ function makeDataSource(log) {
       log.push({ sql, params });
       if (/from public\.courses/.test(sql) && /structure_version = 'dynamic'/.test(sql)) {
         const [owner, numericId, raw] = params;
-        return COURSES.filter((c) => c.owner === owner && c.sv === 'dynamic' && ((numericId !== null && c.id === numericId) || c.frontend === raw))
+        const numericOnly = /\(\$2\)::bigint is null and/.test(sql); // UUID solo cuando no hay id numérico
+        const excludesTwins = /not exists[\s\S]*structure_version is distinct from 'dynamic'/.test(sql);
+        const byId = (c) => numericId !== null && c.id === numericId;
+        const byUuid = (c) =>
+          (!numericOnly || numericId === null) &&
+          c.frontend === raw &&
+          (!excludesTwins || !COURSES.some((l) => l.owner === owner && l.frontend === raw && l.sv !== 'dynamic'));
+        return COURSES.filter((c) => c.owner === owner && c.sv === 'dynamic' && (byId(c) || byUuid(c)))
           .slice(0, 1)
           .map(() => ({ found: 1 }));
       }
@@ -212,6 +227,30 @@ async function call(base, method, p, { user = OWNER_A, body } = {}) {
     assert(/estructura dinámica \(V2\)/.test(guard.v2CourseLegacyAudioDisabledMessage()), 'mensaje legible en español');
   });
 
+  await check('I1 gemelos: curso legacy + gemelo V2 con el MISMO UUID → el legacy sigue con audio; id numérico decide solo por esa fila; V2 puro → bloquea', async () => {
+    const log = [];
+    const q = (sql, params) => makeDataSource(log).query(sql, params);
+    eq(await guard.isDynamicCourseFor(q, OWNER_A, TWIN_UUID), false, 'UUID con fila legacy del mismo owner → NO bloquea');
+    eq(await guard.isDynamicCourseFor(q, OWNER_A, '10'), false, 'id numérico de la fila legacy');
+    eq(await guard.isDynamicCourseFor(q, OWNER_A, '11'), true, 'id numérico de la fila V2 (se actúa sobre el curso V2)');
+    eq(await guard.isDynamicCourseFor(q, OWNER_A, DYN_UUID), true, 'V2 puro (el legacy con ese UUID es de OTRO owner)');
+    eq(await guard.isDynamicCourseFor(q, OWNER_A, '8'), false, 'id legacy');
+  });
+
+  await check('I1 gemelos por HTTP/worker: /jobs/audio, /jobs/full, /tts/speech y el audio-worker dejan pasar el curso legacy con gemelo V2', async () => {
+    const { svc, repos } = makeJobsService();
+    const r = await svc.createAudioJob(OWNER_A, { courseId: TWIN_UUID, courseData: {} });
+    assert(r.ok && r.jobId, `createAudioJob: ${JSON.stringify(r)}`);
+    eq(repos.state.jobSaves, 1, 'job creado');
+    const full = await svc.createFullCourseJob(OWNER_A, { courseId: TWIN_UUID });
+    assert(full.ok && full.jobId, 'createFullCourseJob');
+    // Worker: job legacy típico (frontendCourseId = UUID; courseId puede ser un parseInt() espurio
+    // del UUID, p.ej. "3c2b…" → 3): nunca se falla por el gemelo V2.
+    eq(await guard.isLegacyAudioBlockedForJob({ ownerId: OWNER_A, frontendCourseId: TWIN_UUID, courseId: 11 }, svc), null, 'worker: gemelo');
+    eq(await guard.isLegacyAudioBlockedForJob({ ownerId: OWNER_A, frontendCourseId: TWIN_UUID, courseId: 3 }, svc), null, 'worker: parseInt espurio');
+    eq(await guard.isLegacyAudioBlockedForJob({ ownerId: OWNER_A, frontendCourseId: null, courseId: 7 }, svc), guard.v2CourseLegacyAudioDisabledMessage(), 'worker: solo id numérico V2');
+  });
+
   // ── A1 servicio (defensa en profundidad del worker maestro) ────────────────
   await check('A1 ProductionJobsService.createAudioJob (lo usa también el full-course-worker): V2 → 409 sin tocar repos; legacy → crea como siempre', async () => {
     for (const courseId of ['7', DYN_UUID]) {
@@ -285,12 +324,12 @@ async function call(base, method, p, { user = OWNER_A, body } = {}) {
         assert(String(r.json && r.json.error).startsWith(PREFIX_AUDIO), JSON.stringify(r.json));
       }
       eq(ttsCalls.length, 0, 'no debe sintetizar');
-      for (const body of [{ text: 'Hola' }, { text: 'Hola', courseId: LEG_UUID }, { text: 'Hola', courseId: '8' }]) {
+      for (const body of [{ text: 'Hola' }, { text: 'Hola', courseId: LEG_UUID }, { text: 'Hola', courseId: '8' }, { text: 'Hola', courseId: TWIN_UUID }]) {
         const r = await call(base, 'POST', '/api/v1/tts/speech', { body });
         eq(r.status, 200, `status ${JSON.stringify(body)}`);
         assert(/audio\/mpeg/.test(r.type) && r.buf.toString() === 'ID3fake', `respuesta de audio ${JSON.stringify(body)}`);
       }
-      eq(ttsCalls.length, 3, 'sintetizó los 3 legacy');
+      eq(ttsCalls.length, 4, 'sintetizó los 4 legacy (incluido el gemelo)');
       assert(ttsCalls.every((c) => !('courseId' in c)), 'courseId no se pasa a OpenAI');
     });
   } finally {
