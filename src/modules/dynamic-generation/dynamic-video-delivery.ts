@@ -65,6 +65,30 @@ export function readVideoDeliveryConfig(env: NodeJS.ProcessEnv = process.env): V
 }
 
 /**
+ * M6 (review-it2): chequeo de arranque SOLO para los workers dynamic. Un
+ * valor inválido se loguea como error claro pero NO tumba el proceso: los
+ * workers usan la estrategia CONGELADA de cada run, y la validación que
+ * falla ruidoso vive donde la config se consume (creación del run,
+ * `RunsService.startRun`). Nunca se valida en el constructor de un servicio
+ * de `AppModule`: eso tumbaría la API y los workers legacy por un typo.
+ * Devuelve la estrategia configurada, o null si es inválida.
+ */
+export function reportVideoDeliveryConfigAtStartup(
+  logger: { error(message: string): unknown },
+  env: NodeJS.ProcessEnv = process.env,
+): VideoDeliveryStrategy | null {
+  try {
+    return readVideoDeliveryConfig(env);
+  } catch (err) {
+    logger.error(
+      `${err instanceof Error ? err.message : String(err)} Los runs NUEVOS van a fallar al crearse hasta corregirlo; ` +
+        `los runs existentes siguen con su estrategia congelada.`,
+    );
+    return null;
+  }
+}
+
+/**
  * Estrategia congelada de un run (`production_jobs.input_payload.videoDelivery`).
  * Runs sin el campo (anteriores a 5B.2.A) → `videogen_direct`. Un valor
  * presente pero desconocido es integridad rota → lanza.

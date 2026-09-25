@@ -28,7 +28,7 @@ import {
   dynamicVideoDeliveryPhase,
   frozenVideoDeliveryOf,
   normalizeDeliveryState,
-  readVideoDeliveryConfig,
+  reportVideoDeliveryConfigAtStartup,
 } from '../modules/dynamic-generation/dynamic-video-delivery';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -801,10 +801,11 @@ export async function runOnce(deps: DynamicItemWorkerDeps): Promise<'claimed' | 
 
 async function bootstrap() {
   const logger = new Logger('DynamicItemWorker');
-  // 5B.2.A: fail-fast si DYNAMIC_VIDEO_DELIVERY es desconocido (el worker
-  // usa la estrategia CONGELADA de cada run, pero una config inválida en el
-  // mismo entorno es un error de despliegue que no debe pasar en silencio).
-  const configuredDelivery = readVideoDeliveryConfig();
+  // M6 (review-it2): un DYNAMIC_VIDEO_DELIVERY inválido se loguea como error
+  // claro al arrancar, pero no detiene el worker: procesa la estrategia
+  // CONGELADA de cada run, y la creación de runs nuevos (startRun) sí falla
+  // ruidoso con ese valor.
+  const configuredDelivery = reportVideoDeliveryConfigAtStartup(logger) ?? 'INVALIDO (ver error)';
   const app = await NestFactory.createApplicationContext(AppModule, { logger: ['log', 'warn', 'error'] });
   const youtubeService = app.get(YoutubeService);
   const youtubeUploadService = app.get(YoutubeUploadService);

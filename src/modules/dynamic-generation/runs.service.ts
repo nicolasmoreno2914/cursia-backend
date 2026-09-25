@@ -178,9 +178,11 @@ export class RunsService {
     private readonly manifests: GenerationManifestsService,
     private readonly costRates: CostRatesService,
   ) {
-    // 5B.2.A: fail-fast al arrancar — un DYNAMIC_VIDEO_DELIVERY desconocido
-    // aborta el boot en vez de caer en silencio a otra estrategia.
-    readVideoDeliveryConfig();
+    // M6 (review-it2): NO se valida DYNAMIC_VIDEO_DELIVERY acá. RunsService
+    // vive en AppModule, que arranca la API y todos los workers legacy — un
+    // typo tumbaría todo. La validación (ruidosa, sin fallback) es lazy: en
+    // startRun (creación del run) y, como log de arranque, en los workers
+    // dynamic (reportVideoDeliveryConfigAtStartup).
   }
 
   /**
