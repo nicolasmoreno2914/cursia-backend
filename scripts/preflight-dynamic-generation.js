@@ -209,7 +209,12 @@ async function main() {
       } else {
         console.log(`  ✓ '${DYNAMIC_MODE}' permitido`);
       }
-      console.log(`  'brand_extraction' permitido: ${yesNo(modes.includes('brand_extraction'))} (problema previo, PR aparte)`);
+      const brandExtractionAllowed = modes.includes('brand_extraction');
+      console.log(`  'brand_extraction' permitido: ${yesNo(brandExtractionAllowed)}`);
+      if (!brandExtractionAllowed) {
+        console.error("  ❌ 'brand_extraction' no está permitido (ver scripts/migrate-production-jobs-constraints.js)");
+        failed = true;
+      }
     }
     const legacyModes = await client.query(
       `select coalesce(execution_mode, '(null)') as mode, count(*)::int as n
