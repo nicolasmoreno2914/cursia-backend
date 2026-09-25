@@ -413,6 +413,9 @@ export class RunsService {
     itemKey: string,
     resubmitVideo = false,
   ): Promise<ItemRunDto> {
+    // G3 (fix wave / review I1): un retry es un entry point como cualquier
+    // otro — requiere la allow-list de V2, antes de tocar manifest o run.
+    assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
     let job = await this.loadRunRow(courseId, manifest, runId);
     job = await this.reconcileCancellation(job);
@@ -453,6 +456,19 @@ export class RunsService {
         throw new ConflictException(
           `Solo se puede reintentar un item en estado "failed"; "${itemKey}" está en "${target.status}"`,
         );
+      }
+
+      // I1 (fix wave / review controller ruling: "un retry NO es un resume").
+      // Un retry gasta Videogen de nuevo cuando: el item reintentado es de
+      // tipo 'video', o pide resubmitVideo (implica tipo video), o el run
+      // está TERMINADO y este retry lo va a reabrir (mismo gasto que reabrir
+      // desde startRun, I1 original). Un retry de un item NO-video dentro de
+      // un run 'real' ya ACTIVO no es gasto nuevo → no requiere la lista.
+      if (
+        this.videoModeOf(job) === 'real' &&
+        (target.type === 'video' || resubmitVideo || !isActive(locked))
+      ) {
+        assertRealVideoAllowed(ownerId);
       }
 
       // I4/R23: resubmitVideo solo para items type='video' en 'failed' cuyo
