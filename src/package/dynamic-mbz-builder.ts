@@ -55,7 +55,13 @@ import {
  * fix). Se incluye en el hash de reuse y en la metadata del artifact
  * `dynamic_mbz` — ver `dynamic-package-worker.ts`.
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION = '1.1.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION = '1.2.0';
+// 1.2.0 (5B.2.B, rulesVersion 2): intros de curso/módulo y bibliografía en el
+// Libro Guía, SOLO para planes v2. Un plan v1 produce exactamente los mismos
+// bytes que 1.1.0 (sha256 fijado en check-dynamic-video-delivery.js con reloj
+// congelado). El bump invalida a propósito la clave de reuse de los .mbz v1
+// ya construidos: un reempaquetado v1 reconstruye un .mbz con el mismo
+// contenido (una sola vez) en vez de mantener dos claves de versión.
 
 // ─── Palette ────────────────────────────────────────────────────────────────
 
@@ -322,6 +328,88 @@ ${body}
 </html>`;
 }
 
+// ─── rulesVersion 2 (5B.2.B): intros de curso/módulo y bibliografía ─────────
+// El markdown de los items course_intro/module_intro (texto LLM) se renderiza
+// con el MISMO conversor del Libro Guía (mdToHtmlBasic: escapa todo el HTML
+// del texto) y el label/archivo lo escapan después con xmlEsc, igual que el
+// resto de los labels. Estilos solo inline (Moodle elimina <style>).
+
+const BIBLIO_HEADING_RE = /^(#{1,6})\s*Bibliograf[ií]a sugerida\s*:?\s*$/i;
+
+/**
+ * Extrae la sección "Bibliografía sugerida" (sin su encabezado) del markdown
+ * de la intro de curso: desde ese encabezado hasta el próximo encabezado de
+ * igual o mayor nivel. `null` si no está o queda vacía.
+ */
+export function extractSuggestedBibliographyMd(md: string): string | null {
+  const lines = (md ?? '').split(/\r?\n/);
+  const start = lines.findIndex((l) => BIBLIO_HEADING_RE.test(l.trim()));
+  if (start < 0) return null;
+  const level = (lines[start].trim().match(BIBLIO_HEADING_RE) as RegExpMatchArray)[1].length;
+  const out: string[] = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    const h = lines[i].match(/^(#{1,6})\s+/);
+    if (h && h[1].length <= level) break;
+    out.push(lines[i]);
+  }
+  const body = out.join('\n').trim();
+  return body ? body : null;
+}
+
+function courseIntroLabelHtml(md: string): string {
+  return `<div style="font-family:'Segoe UI',Arial,sans-serif;">`
+    + mdToHtmlBasic(md)
+    + `</div>`;
+}
+
+function moduleIntroLabelHtml(mod: PackagingModulePlan, color: ModuleColor, md: string): string {
+  return `<div style="border-left:4px solid #${color.main};padding:16px 20px;font-family:'Segoe UI',Arial,sans-serif;">`
+    + `<span style="text-transform:uppercase;font-size:11px;font-weight:700;color:#${color.main};">Módulo ${mod.moduleNumber}</span>`
+    + `<h2 style="margin:6px 0;">${esc(mod.title)}</h2>`
+    + mdToHtmlBasic(md)
+    + `</div>`;
+}
+
+/**
+ * Libro Guía v2: portada, índice por módulo, y por cada módulo su prefacio
+ * (module_intro) seguido de sus capítulos (mismo HTML de capítulo que v1), y
+ * al final la bibliografía sugerida de la intro de curso. Módulos y capítulos
+ * en orden del plan (Manifest); el join con los contenidos es por UUID.
+ */
+function compileLibroHtmlV2(
+  courseTitle: string,
+  modules: PackagingModulePlan[],
+  contentMd: Map<string, string>,
+  moduleIntroMd: Map<string, string>,
+  bibliographyMd: string,
+): string {
+  const toc = modules.map((m) => {
+    const chapters = m.chapters
+      .map((c) => `<li><a href="#cap-${c.chapterNumber}">Capítulo ${c.chapterNumber}: ${esc(c.title)}</a></li>`)
+      .join('\n');
+    return `<li><a href="#mod-${m.moduleNumber}">Módulo ${m.moduleNumber}: ${esc(m.title)}</a><ul>${chapters}</ul></li>`;
+  }).join('\n') + `\n<li><a href="#bibliografia">Bibliografía sugerida</a></li>`;
+  const body = modules.map((m) => {
+    const preface = `<section id="mod-${m.moduleNumber}" class="cc-libro-module"><h2>Módulo ${m.moduleNumber} — ${esc(m.title)}</h2>\n${mdToHtmlBasic(moduleIntroMd.get(m.moduleId) ?? '')}</section>`;
+    const chapters = m.chapters.map((c) => {
+      const rawMd = contentMd.get(c.chapterId) ?? '';
+      const md = stripLeadingDuplicateTitle(rawMd, c.title, c.chapterNumber);
+      return `<section id="cap-${c.chapterNumber}"><h2>Capítulo ${c.chapterNumber} — ${esc(c.title)}</h2>\n${mdToHtmlBasic(md)}</section>`;
+    }).join('\n');
+    return `${preface}\n${chapters}`;
+  }).join('\n');
+  return `<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"><title>${esc(courseTitle)} — Libro Guía</title></head>
+<body>
+<div class="cc-libro-cover"><h1>${esc(courseTitle)}</h1><p>Libro Guía del curso</p></div>
+<div class="cc-libro-toc"><h2>Índice</h2><ul>${toc}</ul></div>
+${body}
+<section id="bibliografia" class="cc-libro-biblio"><h2>Bibliografía sugerida</h2>\n${mdToHtmlBasic(bibliographyMd)}</section>
+</body>
+</html>`;
+}
+
 // ─── SCORM/quiz XML — no exportados por el legacy; copiados aquí con el
 // file:line de origen (mbz-builder.service.ts, revisión c1733ae y anteriores).
 // Sin el trichotomy <=3/<=6: el color/sección ya vienen resueltos del plan.
@@ -548,6 +636,24 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
     }
     if (mod.examItemKey && !contents.examGift.has(mod.moduleId)) missing.push(mod.examItemKey);
   }
+  // rulesVersion 2: intro de curso + intro de CADA módulo (por UUID) son
+  // obligatorias, y la intro de curso debe traer su "Bibliografía sugerida"
+  // (va al final del Libro Guía). Nunca se empaqueta un v2 sin ellas.
+  const isV2 = plan.rulesVersion === 2;
+  let bibliographyMd: string | null = null;
+  if (isV2) {
+    const courseIntro = contents.courseIntroMd;
+    if (typeof courseIntro !== 'string' || !courseIntro.trim()) {
+      missing.push(plan.courseIntroItemKey ?? 'course_intro');
+    } else {
+      bibliographyMd = extractSuggestedBibliographyMd(courseIntro);
+      if (!bibliographyMd) missing.push(`${plan.courseIntroItemKey ?? 'course_intro'}:bibliografia_sugerida`);
+    }
+    for (const mod of plan.modules) {
+      const md = contents.moduleIntroMd?.get(mod.moduleId);
+      if (typeof md !== 'string' || !md.trim()) missing.push(mod.moduleIntroItemKey ?? `module_intro:${mod.moduleId}`);
+    }
+  }
   if (missing.length) {
     throw new Error(`No se puede empaquetar: faltan ${missing.length} contenido(s) del Manifest: ${missing.join(', ')}`);
   }
@@ -630,6 +736,11 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
   // ── Bienvenida (sección 0) ──────────────────────────────────────────────
   addLabel(0, '🏠 Bienvenida al Curso', welcomeLabelHtml(plan));
 
+  // ── v2: Introducción al curso (sección 0, después de la bienvenida) ─────
+  if (isV2) {
+    addLabel(0, '📚 Introducción al Curso', courseIntroLabelHtml(contents.courseIntroMd as string));
+  }
+
   // ── Ruta de aprendizaje (sección 1) ─────────────────────────────────────
   addLabel(1, '🗺️ Ruta de Aprendizaje', routeLabelHtml(plan));
 
@@ -641,7 +752,9 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
     .slice()
     .sort((a, b) => a.chapterNumber - b.chapterNumber);
 
-  const libroHtml = compileLibroHtml(plan.course.title, allChaptersInOrder, contents.contentMd);
+  const libroHtml = isV2
+    ? compileLibroHtmlV2(plan.course.title, plan.modules, contents.contentMd, contents.moduleIntroMd as Map<string, string>, bibliographyMd as string)
+    : compileLibroHtml(plan.course.title, allChaptersInOrder, contents.contentMd);
   if (!/<\/html>\s*$/i.test(libroHtml.trim())) {
     // Guard defensivo — mismo patrón que mbz-builder.service.ts:1312-1316,
     // aunque en 5B.1 el compilador es determinístico y siempre debería cerrar.
@@ -675,6 +788,15 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
   // ── Por módulo ───────────────────────────────────────────────────────────
   for (const mod of plan.modules) {
     const color = moduleColor(palette, mod.colorIndex);
+
+    // v2: presentación del módulo como PRIMER label de su sección.
+    if (isV2) {
+      addLabel(
+        mod.sectionNum,
+        safeActivityName(`🧭 Presentación del Módulo ${mod.moduleNumber} — ${mod.title}`),
+        moduleIntroLabelHtml(mod, color, contents.moduleIntroMd!.get(mod.moduleId) as string),
+      );
+    }
 
     for (const ch of mod.chapters) {
       // Se asignan los ids de TODAS las actividades del capítulo por adelantado,

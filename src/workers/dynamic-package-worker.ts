@@ -137,10 +137,25 @@ async function loadContentsForPlan(
     return list;
   };
   const artifactFor = (key: string): ResolvedArtifact => artifactsFor(key)[0];
+  // rulesVersion 2: un item puede resolver a varios roles (content v2 =
+  // dynamic_content_md + dynamic_context_package_json) — se elige por type.
+  const artifactOfType = (key: string, type: ResolvedArtifact['type']): ResolvedArtifact => {
+    const a = artifactsFor(key).find((x) => x.type === type);
+    if (!a) throw new Error(`falta el artifact ${type} del item "${key}" (integridad rota tras resolveRunArtifacts)`);
+    return a;
+  };
+  const moduleIntroMd = new Map<string, string>();
+  let courseIntroMd: string | undefined;
+  if (plan.rulesVersion === 2) {
+    courseIntroMd = await deps.loadText(deps.artifacts, ownerId, artifactOfType(plan.courseIntroItemKey as string, 'dynamic_course_intro_md'));
+    for (const m of plan.modules) {
+      moduleIntroMd.set(m.moduleId, await deps.loadText(deps.artifacts, ownerId, artifactOfType(m.moduleIntroItemKey as string, 'dynamic_module_intro_md')));
+    }
+  }
 
   for (const m of plan.modules) {
     for (const c of m.chapters) {
-      contentMd.set(c.chapterId, await deps.loadText(deps.artifacts, ownerId, artifactFor(c.contentItemKey)));
+      contentMd.set(c.chapterId, await deps.loadText(deps.artifacts, ownerId, artifactOfType(c.contentItemKey, 'dynamic_content_md')));
 
       // El contrato real del resolver (B1) resuelve un item 'scorm' a DOS
       // artifacts (dynamic_scorm_html + dynamic_scorm_manifest) — se
@@ -177,7 +192,9 @@ async function loadContentsForPlan(
     }
   }
 
-  return { contentMd, scorm, examGift, videos };
+  return plan.rulesVersion === 2
+    ? { contentMd, scorm, examGift, videos, courseIntroMd, moduleIntroMd }
+    : { contentMd, scorm, examGift, videos };
 }
 
 /** Ciclo de vida completo de UN job `dynamic_package` reclamado. Exportado para tests. */
@@ -196,9 +213,12 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
 
   try {
     const { runId, manifestId, blueprintNumber } = job.input_payload;
-    const manifest: ManifestDto = await deps.manifests.get(job.course_id, job.owner_id, blueprintNumber);
+    // El Manifest CONGELADO del job (por id, verificado contra el Blueprint y
+    // el dueño), no el "actual" de DYNAMIC_MANIFEST_RULES_VERSION: un run v1
+    // se sigue empaquetando aunque la config pase a v2 (y viceversa).
+    const manifest: ManifestDto = await deps.manifests.getById(job.course_id, job.owner_id, blueprintNumber, manifestId);
     if (manifest.id !== manifestId) {
-      throw new Error(`el Manifest actual del Blueprint v${blueprintNumber} (#${manifest.id}) no coincide con el del job (#${manifestId})`);
+      throw new Error(`el Manifest del Blueprint v${blueprintNumber} (#${manifest.id}) no coincide con el del job (#${manifestId})`);
     }
 
     const byItem = await deps.resolveArtifacts({ query: deps.dataSource.query.bind(deps.dataSource) }, runId, manifest.manifest);
