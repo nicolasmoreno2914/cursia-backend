@@ -1,4 +1,4 @@
-import { DYNAMIC_FLAG_ENV, isDynamicCourseStructureEnabled } from '../modules/features/dynamic-features';
+import { DYNAMIC_FLAG_ENV, isDynamicCourseStructureEnabled, warnIfNearMissDynamicFlag } from '../modules/features/dynamic-features';
 
 interface GateLogger {
   warn(message: string): void;
@@ -24,6 +24,7 @@ export function holdIdleIfDynamicDisabled(
   env: Record<string, string | undefined> = process.env,
 ): boolean {
   if (isDynamicCourseStructureEnabled(env)) return false;
+  warnIfNearMissDynamicFlag(logger, env);
   logger.warn(
     `${DYNAMIC_FLAG_ENV} desactivado: el worker no reclama jobs (${workerName} queda inactivo, sin conectarse ` +
       `a la DB). Para activarlo: ${DYNAMIC_FLAG_ENV}=true + pm2 restart --update-env.`,

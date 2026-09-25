@@ -48,6 +48,38 @@ export function isDynamicCourseStructureEnabled(env: Env = process.env): boolean
   return env[DYNAMIC_FLAG_ENV] === 'true';
 }
 
+/** Valores de `DYNAMIC_COURSE_STRUCTURE` que NO activan V2 (solo el string exacto 'true' lo hace) pero que
+ * parecen un intento fallido de encenderlo — typo o config de otro sistema (M6, fix wave). */
+const NEAR_MISS_FLAG_RE = /^(true|1|yes|on)$/i;
+let nearMissFlagWarned = false;
+
+/**
+ * M6 (review, fix wave): si `DYNAMIC_COURSE_STRUCTURE` está seteado a un
+ * valor "casi correcto" (`True`, `TRUE`, `1`, `yes`, `on`…) que NO activa V2
+ * (solo el string exacto `'true'` lo hace), loguea un warning UNA sola vez
+ * por proceso — para que el silencio no se confunda con "todo bien". Se llama
+ * en el arranque de la API (`main.ts`), en el guard dynamic (primer uso de
+ * una ruta V2) y en el arranque de los workers dynamic
+ * (`holdIdleIfDynamicDisabled`). No hace nada si el flag está ausente o ya en
+ * `'true'`.
+ */
+export function warnIfNearMissDynamicFlag(logInstance: { warn(msg: string): void } = logger, env: Env = process.env): void {
+  if (nearMissFlagWarned) return;
+  const raw = env[DYNAMIC_FLAG_ENV];
+  if (raw === undefined || raw === 'true') return;
+  if (!NEAR_MISS_FLAG_RE.test(raw)) return;
+  nearMissFlagWarned = true;
+  logInstance.warn(
+    `${DYNAMIC_FLAG_ENV}="${raw}" no activa V2 (solo el string EXACTO 'true' lo hace) — V2 sigue OFF. ` +
+      `Si la intención era encenderlo: ${DYNAMIC_FLAG_ENV}=true.`,
+  );
+}
+
+/** Solo para tests: resetea el "una sola vez" del warning de near-miss. */
+export function _resetNearMissFlagWarningForTests(): void {
+  nearMissFlagWarned = false;
+}
+
 /** Lista de owners (minúsculas). Entradas vacías se ignoran; no-UUID → DynamicFeatureConfigError. */
 export function parseOwnerList(envName: string, env: Env = process.env): string[] {
   const raw = env[envName] ?? '';

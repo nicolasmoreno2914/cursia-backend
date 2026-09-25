@@ -1,7 +1,14 @@
-import { CanActivate, ExecutionContext, Injectable, NotFoundException } from '@nestjs/common';
+import { CanActivate, ExecutionContext, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import type { Request } from 'express';
 import { isDynamicRoute } from './dynamic-routes';
-import { isDynamicCourseStructureEnabled, toHttpConfigError, validateDynamicFeatureConfig } from './dynamic-features';
+import {
+  isDynamicCourseStructureEnabled,
+  toHttpConfigError,
+  validateDynamicFeatureConfig,
+  warnIfNearMissDynamicFlag,
+} from './dynamic-features';
+
+const logger = new Logger('DynamicFeatureGuard');
 
 /**
  * Guard global (APP_GUARD, corre ANTES de los guards de controller como
@@ -20,6 +27,7 @@ export class DynamicFeatureGuard implements CanActivate {
     if (!isDynamicRoute(context.getClass(), context.getHandler())) return true;
 
     if (!isDynamicCourseStructureEnabled()) {
+      warnIfNearMissDynamicFlag(logger);
       const req = context.switchToHttp().getRequest<Request>();
       throw new NotFoundException(`Cannot ${req.method} ${req.originalUrl ?? req.url}`);
     }
