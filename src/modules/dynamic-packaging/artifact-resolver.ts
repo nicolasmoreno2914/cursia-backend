@@ -21,6 +21,11 @@ import type { ManifestItemType, GenerationManifestV1 } from '../generation-manif
 import type { ResolvedArtifact } from './packaging-types';
 import { PackagingNotReadyError } from './packaging-types';
 import type { ArtifactsService } from '../artifacts/artifacts.service';
+import {
+  VideoDeliveryStrategy,
+  checkYoutubeDeliveryUrl,
+  frozenVideoDeliveryOf,
+} from '../dynamic-generation/dynamic-video-delivery';
 
 /** Mínima interfaz de acceso a datos que necesita el resolver — un QueryRunner o DataSource de TypeORM cumplen esto, y también un pg.Pool/Client. */
 export interface QueryExecutor {
@@ -217,6 +222,29 @@ export async function loadArtifactText(
 export interface ParsedDynamicVideo {
   url: string;
   videogenJobId: string;
+  /**
+   * 5B.2.A: presente SOLO para `youtube` (el builder cambia el texto de la
+   * actividad). Con `videogen_direct` se omite a propósito: el objeto queda
+   * idéntico al de 5B.1.
+   */
+  delivery?: 'youtube';
+}
+
+/**
+ * 5B.2.A: estrategia de entrega congelada del run (`input_payload.videoDelivery`,
+ * ausente → `videogen_direct`). Un valor desconocido lanza (nunca se asume
+ * otra estrategia).
+ */
+export async function loadRunVideoDelivery(q: QueryExecutor, runId: string): Promise<VideoDeliveryStrategy> {
+  const rows = await q.query(`select input_payload from public.production_jobs where id = $1`, [runId]);
+  if (!rows[0]) {
+    throw new PackagingNotReadyError(
+      [`run:${runId}:not_found`],
+      `Empaquetado no listo: el run ${runId} no existe en production_jobs.`,
+    );
+  }
+  const payload = typeof rows[0].input_payload === 'string' ? JSON.parse(rows[0].input_payload) : rows[0].input_payload;
+  return frozenVideoDeliveryOf(payload);
 }
 
 /** Hosts de video que NUNCA son un download real de Videogen — I4, integral-review. */
@@ -245,10 +273,24 @@ function isMockVideoHost(url: string): boolean {
  * apunte a un host mock/local (`*.local`, `mock-cdn*`) — nunca se empaqueta
  * un `.mbz` "exitoso" con links de video muertos.
  */
-export function parseDynamicVideo(json: string | Record<string, any>): ParsedDynamicVideo {
+export function parseDynamicVideo(
+  json: string | Record<string, any>,
+  strategy: VideoDeliveryStrategy = 'videogen_direct',
+): ParsedDynamicVideo {
   const data = typeof json === 'string' ? JSON.parse(json) : json;
   if (!data || typeof data !== 'object') {
     throw new Error('dynamic_video: contenido no es un objeto JSON válido.');
+  }
+  if (strategy === 'youtube') return parseYoutubeDynamicVideo(data);
+  if (strategy !== 'videogen_direct') {
+    throw new Error(`dynamic_video: estrategia de entrega desconocida: ${JSON.stringify(strategy)}`);
+  }
+  if (data.delivery !== undefined && data.delivery !== null && data.delivery !== 'videogen_direct') {
+    throw new PackagingNotReadyError(
+      [`video:${data.itemKey ?? data.chapterId ?? '?'}:delivery_mismatch`],
+      `dynamic_video: el artifact declara delivery=${JSON.stringify(data.delivery)} pero el run está congelado en ` +
+        `videogen_direct (videogenJobId=${data.videogenJobId ?? '?'}).`,
+    );
   }
   const url = data.downloadUrl;
   const videogenJobId = data.videogenJobId;
@@ -280,4 +322,51 @@ export function parseDynamicVideo(json: string | Record<string, any>): ParsedDyn
     );
   }
   return { url, videogenJobId };
+}
+
+/**
+ * 5B.2.A — `youtube`: la URL de entrega es `youtubeUrl` del artifact
+ * (`https://www.youtube.com/watch?v=<id>` o `https://youtu.be/<id>`), validada
+ * (https, host de YouTube, sin firma ni parámetros extra, id coherente con
+ * `youtubeVideoId`). Si falta o no valida → `PackagingNotReadyError` (409):
+ * NUNCA cae a la URL de Videogen. Mantiene la regla I4 (sin videos simulados).
+ */
+function parseYoutubeDynamicVideo(data: Record<string, any>): ParsedDynamicVideo {
+  const videogenJobId = data.videogenJobId;
+  const where = `video:${data.itemKey ?? data.chapterId ?? '?'}`;
+  if (typeof videogenJobId !== 'string' || videogenJobId.length === 0) {
+    throw new Error('dynamic_video: falta videogenJobId (string) en el artifact.');
+  }
+  if (data.mode !== 'real') {
+    throw new Error(
+      `dynamic_video: run con videos simulados: no empaquetable (mode=${data.mode ?? 'undefined'}, videogenJobId=${videogenJobId}). ` +
+        `Solo se empaquetan runs con videoMode='real'.`,
+    );
+  }
+  if (data.delivery !== 'youtube') {
+    throw new PackagingNotReadyError(
+      [`${where}:delivery_mismatch`],
+      `dynamic_video: el run está congelado en videoDelivery=youtube pero el artifact declara ` +
+        `delivery=${JSON.stringify(data.delivery ?? null)} (videogenJobId=${videogenJobId}); no se cae a la URL de Videogen.`,
+    );
+  }
+  const url = data.youtubeUrl;
+  if (typeof url !== 'string' || url.length === 0) {
+    throw new PackagingNotReadyError(
+      [`${where}:missing_youtube_url`],
+      `dynamic_video: falta youtubeUrl en el artifact (videogenJobId=${videogenJobId}); el video no está publicado ` +
+        'en YouTube y nunca se usa la URL de Videogen como reemplazo.',
+    );
+  }
+  const check = checkYoutubeDeliveryUrl(url);
+  if (check.ok === false) {
+    throw new PackagingNotReadyError([`${where}:invalid_youtube_url`], `dynamic_video: ${check.reason}`);
+  }
+  if (typeof data.youtubeVideoId === 'string' && data.youtubeVideoId !== check.videoId) {
+    throw new PackagingNotReadyError(
+      [`${where}:youtube_id_mismatch`],
+      `dynamic_video: youtubeUrl (${check.videoId}) no coincide con youtubeVideoId (${data.youtubeVideoId}).`,
+    );
+  }
+  return { url, videogenJobId, delivery: 'youtube' };
 }
