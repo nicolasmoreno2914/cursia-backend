@@ -242,6 +242,34 @@ export class CourseBlueprintsService {
     return this.toDto(row);
   }
 
+  /**
+   * Fase 7 (coherencia estructural "en vivo"): snapshot de la estructura VIVA
+   * (módulos y capítulos actuales) SIN crear un Blueprint. Ownership + `dynamic`
+   * como las lecturas (404/400). Una estructura que todavía no valida (p.ej.
+   * un capítulo sin módulo) → 400 con el detalle.
+   */
+  async liveSnapshot(courseId: number, ownerId: string): Promise<BlueprintSnapshotV1> {
+    await this.loadReadableCourse(courseId, ownerId);
+    const [course] = await this.dataSource.query(`select id, title from public.courses where id = $1`, [courseId]);
+    const modules: RawModuleRow[] = await this.dataSource.query(
+      `select id, position, title, objective, exam_enabled from public.course_modules where course_id = $1`,
+      [courseId],
+    );
+    const chapters: RawChapterRow[] = await this.dataSource.query(
+      `select id, module_id, position, title, objective, video_enabled from public.course_chapters where course_id = $1`,
+      [courseId],
+    );
+    const courseRef = { id: course.id, title: course.title };
+    const errors = validateBlueprintInput(courseRef, modules, chapters);
+    if (errors.length > 0) {
+      throw new BadRequestException({
+        message: `La estructura actual no se puede evaluar todavía: ${errors.map((e) => e.message).join('; ')}`,
+        errors,
+      });
+    }
+    return buildBlueprintSnapshot(courseRef, modules, chapters);
+  }
+
   async getByNumber(courseId: number, ownerId: string, n: number): Promise<BlueprintDto> {
     await this.loadReadableCourse(courseId, ownerId);
     if (!Number.isInteger(n) || n < 1) {

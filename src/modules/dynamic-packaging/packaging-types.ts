@@ -86,6 +86,8 @@ export interface ResolvedArtifact {
     | 'dynamic_course_intro_md'
     | 'dynamic_module_intro_md'
     | 'dynamic_context_package_json';
+  /** Fase 8: 'stale' si el artifact se empaqueta marcado (STALE_NO_AUTO). Ausente = vigente. */
+  status?: 'stale';
   storageBucket: string;
   storagePath: string;
   mimeType: string | null;

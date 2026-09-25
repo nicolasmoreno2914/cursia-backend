@@ -78,6 +78,15 @@ jobs:
       - name: Check dynamic feature gating (Fase 9 — G1/G3/G4 + video real I1)
         run: node scripts/check-dynamic-feature-gating.js
 
+      - name: Check Coherence Engine rules/report (Fase 7)
+        run: node scripts/check-coherence-engine.js
+
+      - name: Check Invalidation plan by UUID (Fase 8)
+        run: node scripts/check-invalidation-plan.js
+
+      - name: Check Invalidation apply / packaging rules (Fase 8, puro)
+        run: node scripts/check-invalidation-apply.js
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
@@ -295,6 +304,9 @@ jobs:
 
                echo "━━━ [4h2] Dynamic Generation: migración rulesVersion 2 (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-dynamic-generation-v2.js
+
+               echo "━━━ [4h3] Invalidación (Fase 8): generation_item_runs.carried_from_item_run_id (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-invalidation.js
 
                echo "━━━ [4i] Dynamic Generation: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-dynamic-generation-schema.js

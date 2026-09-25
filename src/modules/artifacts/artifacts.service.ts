@@ -159,10 +159,39 @@ export class ArtifactsService {
   }
 
   async uploadBufferArtifact(input: UploadBufferArtifactInput): Promise<Artifact> {
+    const bucket = input.storageBucket ?? 'cursia-artifacts';
+    const provider = input.storageProvider ?? 'supabase';
+    const put = await this.putStorageObject(input);
+    const metadata = put.adopted ? { ...(input.metadata ?? {}), adoptedExistingObject: true } : input.metadata ?? {};
+    return this.create(
+      {
+        course_id: input.courseId ?? null,
+        job_id: input.jobId ?? null,
+        type: input.type,
+        storage_path: input.storagePath,
+        storage_provider: provider,
+        storage_bucket: bucket,
+        filename: input.filename,
+        mime_type: input.mimeType,
+        size_bytes: put.sizeBytes,
+        metadata,
+      },
+      input.ownerId,
+    );
+  }
+
+  /**
+   * Solo la subida a Storage (sin fila en `artifacts`): la usan quienes crean
+   * la fila ellos mismos dentro de su propia transacción/lock (p.ej. el
+   * reporte de coherencia, fix wave M4). Misma semántica de `upsert` y de
+   * adopción de un objeto inmutable preexistente que `uploadBufferArtifact`.
+   */
+  async putStorageObject(
+    input: Pick<UploadBufferArtifactInput, 'storagePath' | 'buffer' | 'mimeType' | 'storageBucket' | 'upsert' | 'adoptExistingOnConflict'>,
+  ): Promise<{ sizeBytes: number; adopted: boolean }> {
     const supabaseUrl = this.config.get<string>('SUPABASE_URL');
     const serviceKey = this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY');
     const bucket = input.storageBucket ?? 'cursia-artifacts';
-    const provider = input.storageProvider ?? 'supabase';
 
     if (!supabaseUrl || !serviceKey) {
       throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for server-side artifact upload');
@@ -185,45 +214,25 @@ export class ArtifactsService {
       body: input.buffer as unknown as BodyInit,
     });
 
-    let sizeBytes = input.buffer.length;
-    let metadata = input.metadata ?? {};
-    if (!response.ok) {
-      const errorText = await response.text();
-      const uploadError = new Error(`Supabase Storage upload failed: ${response.status} ${errorText}`);
-      if (!(input.adoptExistingOnConflict && input.upsert === false && isStorageDuplicateResponse(response.status, errorText))) {
-        throw uploadError;
-      }
-      // I2: el objeto inmutable ya existe (crash entre Storage y el row) —
-      // se adopta solo si se puede verificar que está ahí y no está vacío.
-      const existingSize = await this.headStorageObjectSize(supabaseUrl, serviceKey, bucket, encodedPath);
-      if (existingSize === null || existingSize <= 0) {
-        this.logger.error(
-          `uploadBufferArtifact: ${input.storagePath} reporta "already exists" pero no se pudo verificar el objeto (size=${existingSize}) — no se adopta`,
-        );
-        throw uploadError;
-      }
-      this.logger.warn(
-        `uploadBufferArtifact: ${input.storagePath} ya existía en Storage (${existingSize} bytes) sin row en artifacts — se adopta el objeto existente`,
-      );
-      sizeBytes = existingSize;
-      metadata = { ...metadata, adoptedExistingObject: true };
+    if (response.ok) return { sizeBytes: input.buffer.length, adopted: false };
+    const errorText = await response.text();
+    const uploadError = new Error(`Supabase Storage upload failed: ${response.status} ${errorText}`);
+    if (!(input.adoptExistingOnConflict && input.upsert === false && isStorageDuplicateResponse(response.status, errorText))) {
+      throw uploadError;
     }
-
-    return this.create(
-      {
-        course_id: input.courseId ?? null,
-        job_id: input.jobId ?? null,
-        type: input.type,
-        storage_path: input.storagePath,
-        storage_provider: provider,
-        storage_bucket: bucket,
-        filename: input.filename,
-        mime_type: input.mimeType,
-        size_bytes: sizeBytes,
-        metadata,
-      },
-      input.ownerId,
+    // I2: el objeto inmutable ya existe (crash entre Storage y el row) —
+    // se adopta solo si se puede verificar que está ahí y no está vacío.
+    const existingSize = await this.headStorageObjectSize(supabaseUrl, serviceKey, bucket, encodedPath);
+    if (existingSize === null || existingSize <= 0) {
+      this.logger.error(
+        `uploadBufferArtifact: ${input.storagePath} reporta "already exists" pero no se pudo verificar el objeto (size=${existingSize}) — no se adopta`,
+      );
+      throw uploadError;
+    }
+    this.logger.warn(
+      `uploadBufferArtifact: ${input.storagePath} ya existía en Storage (${existingSize} bytes) sin row en artifacts — se adopta el objeto existente`,
     );
+    return { sizeBytes: existingSize, adopted: true };
   }
 
   /** Tamaño (content-length) de un objeto de Storage vía HEAD autenticado; null si no existe o no se pudo leer. */
@@ -368,27 +377,58 @@ export class ArtifactsService {
    * (requiere SUPABASE_SERVICE_ROLE_KEY).
    */
   async remove(id: string, ownerId: string): Promise<void> {
-    const artifact = await this.findOne(id, ownerId);
+    // Fase 8: una fila "carried" (REUSE) apunta a la MISMA storage_path
+    // inmutable que la fila histórica de la que salió. Borrar una fila nunca
+    // debe borrar el objeto que otra fila sigue usando.
+    //
+    // Fix wave I2 (carrera con el apply fromRun): en UNA transacción se
+    // bloquea la fila (FOR UPDATE: espera a un apply que la tenga bloqueada
+    // mientras inserta su copia), se bloquean y cuentan las demás filas con la
+    // misma ruta y se borra la fila. El objeto de Storage se borra recién
+    // DESPUÉS del commit y solo si nadie más lo referenciaba. Un apply que
+    // llegue después ve la fila borrada y falla con 409 (nunca copia una fila
+    // cuyo objeto se va a borrar).
+    const qr = this.artifactRepo.manager.connection.createQueryRunner();
+    let row: any;
+    let sharedWith = 0;
+    await qr.connect();
+    try {
+      await qr.startTransaction();
+      [row] = await qr.query(`select * from public.artifacts where id = $1 and owner_id = $2 for update`, [id, ownerId]);
+      if (!row) throw new NotFoundException(`Artifact ${id} not found`);
+      const sharers = await qr.query(
+        `select id from public.artifacts where storage_bucket = $1 and storage_path = $2 and id <> $3 for update`,
+        [row.storage_bucket, row.storage_path, row.id],
+      );
+      sharedWith = sharers.length;
+      await qr.query(`delete from public.artifacts where id = $1`, [row.id]);
+      await qr.commitTransaction();
+    } catch (err) {
+      if (qr.isTransactionActive) await qr.rollbackTransaction();
+      throw err;
+    } finally {
+      await qr.release();
+    }
 
-    // Try to delete from storage
+    if (sharedWith > 0) {
+      this.logger.log(`remove(${row.id}): ${sharedWith} fila(s) más usan ${row.storage_path}; se conserva el objeto de Storage`);
+      return;
+    }
     const supabaseUrl = this.config.get<string>('SUPABASE_URL');
     const serviceKey  = this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY');
-
-    if (supabaseUrl && serviceKey && artifact.storageProvider === 'supabase') {
+    if (supabaseUrl && serviceKey && row.storage_provider === 'supabase') {
       try {
-        const deleteUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/${artifact.storageBucket}/${artifact.storagePath}`;
+        const deleteUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/${row.storage_bucket}/${row.storage_path}`;
         const res = await fetch(deleteUrl, {
           method: 'DELETE',
           headers: supabaseServiceHeaders(serviceKey),
         });
         if (!res.ok) {
-          this.logger.warn(`Storage delete failed for ${artifact.storagePath}: ${res.status}`);
+          this.logger.warn(`Storage delete failed for ${row.storage_path}: ${res.status}`);
         }
       } catch (err) {
-        this.logger.warn(`Storage delete error for ${artifact.storagePath}: ${err}`);
+        this.logger.warn(`Storage delete error for ${row.storage_path}: ${err}`);
       }
     }
-
-    await this.artifactRepo.remove(artifact);
   }
 }

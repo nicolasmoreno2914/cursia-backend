@@ -75,6 +75,7 @@ interface ItemRunRow {
   storage_bucket: string | null;
   storage_path: string | null;
   mime_type: string | null;
+  artifact_status: string | null;
 }
 
 /**
@@ -131,9 +132,12 @@ export async function resolveRunArtifacts(
             a.type              as artifact_type,
             a.storage_bucket    as storage_bucket,
             a.storage_path      as storage_path,
-            a.mime_type         as mime_type
+            a.mime_type         as mime_type,
+            a.status            as artifact_status
        from public.generation_item_runs gir
-       left join public.artifacts a on a.item_run_id = gir.id
+       -- Fase 8: un artifact 'disabled' (SOFT_DISABLE) nunca se empaqueta; su
+       -- ausencia cuenta como faltante. 'stale' sí (STALE_NO_AUTO, con aviso).
+       left join public.artifacts a on a.item_run_id = gir.id and a.status is distinct from 'disabled'
       where gir.job_id = $1 and gir.generation = 1`,
     [runId],
   );
@@ -183,6 +187,9 @@ export async function resolveRunArtifacts(
         storageBucket: match.storage_bucket ?? '',
         storagePath: match.storage_path ?? '',
         mimeType: match.mime_type ?? null,
+        // Fase 8: solo presente cuando el artifact está 'stale' (STALE_NO_AUTO);
+        // un artifact vigente queda idéntico a 5B.1.
+        ...(match.artifact_status === 'stale' ? { status: 'stale' as const } : {}),
       });
     }
     if (found.length === expectedTypes.length) {

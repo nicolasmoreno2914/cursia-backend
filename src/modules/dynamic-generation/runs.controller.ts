@@ -10,11 +10,13 @@ import {
   Post,
   Res,
   UseGuards,
+  ValidationPipe,
 } from '@nestjs/common';
 import type { Response } from 'express';
 import { RunsService } from './runs.service';
 import { CourseContextDto } from './dto/course-context.dto';
 import { RetryItemDto } from './dto/executor.dto';
+import { FromRunDto, isFromRunRequest } from '../invalidation/dto/from-run.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
@@ -24,6 +26,13 @@ import { AuthUser } from '../../auth/auth.types';
  * + existencia del Manifest vía GenerationManifestsService.get: curso ajeno o
  * inexistente / Manifest no creado → 404, curso legacy → 400.
  */
+const START_BODY_PIPE = new ValidationPipe({
+  whitelist: true,
+  forbidNonWhitelisted: true,
+  transform: true,
+  transformOptions: { enableImplicitConversion: true },
+});
+
 @Controller('courses/:courseId/blueprints/:number/manifest/runs')
 @UseGuards(SupabaseJwtGuard)
 export class RunsController {
@@ -35,14 +44,24 @@ export class RunsController {
   // (reopened:true, R10); 409 si el contexto difiere del run activo/anterior
   // (cambiarlo es regeneración, Fase 8) o si el run anterior está completed.
   // Body = CourseContext (se normaliza y se congela).
+  // Fase 8 (F8-BE): body = {fromRun: <runA>} → crea el run B aplicando el
+  // plan de invalidación (contexto/videoMode heredados de A); idempotente por
+  // (A, Manifest): 201 al crearlo, 200 si ya existía.
   @Post()
   async start(
     @Param('courseId', ParseIntPipe) courseId: number,
     @Param('number', ParseIntPipe) number: number,
-    @Body() dto: CourseContextDto,
+    @Body() body: Record<string, unknown>,
     @CurrentUser() user: AuthUser,
     @Res({ passthrough: true }) res: Response,
   ) {
+    // El body es uno de dos DTOs: se valida acá con las MISMAS opciones que el
+    // ValidationPipe global de main.ts (con un tipo unión, el pipe global no
+    // valida nada).
+    const dto: CourseContextDto | FromRunDto = await START_BODY_PIPE.transform(body, {
+      type: 'body',
+      metatype: isFromRunRequest(body) ? FromRunDto : CourseContextDto,
+    });
     const result = await this.runs.startRun(courseId, user.id, number, dto);
     res.status(result.created ? 201 : 200);
     return result;
