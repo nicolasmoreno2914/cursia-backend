@@ -421,7 +421,9 @@ async function uploadMp3Artifact(
 // Core job handler
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function handleAudioJob(
+// Exportado (acceptance fix): check-v2-acceptance-guards.js lo ejecuta con
+// proveedores espiados para probar providerCalls = 0 en un curso V2.
+export async function handleAudioJob(
   job: ProductionJob,
   jobsService: ProductionJobsService,
   artifactsService: ArtifactsService,
@@ -993,10 +995,14 @@ async function bootstrap() {
   }
 }
 
-bootstrap().catch((error) => {
-  const logger = new Logger('AudioWorker');
-  logger.error(
-    `Fatal audio worker bootstrap error: ${error instanceof Error ? error.stack || error.message : String(error)}`,
-  );
-  process.exit(1);
-});
+// Mismo patrón que dynamic-item-worker: pm2 lo ejecuta como entrypoint
+// (require.main === module); importarlo desde un check no arranca el loop.
+if (require.main === module) {
+  bootstrap().catch((error) => {
+    const logger = new Logger('AudioWorker');
+    logger.error(
+      `Fatal audio worker bootstrap error: ${error instanceof Error ? error.stack || error.message : String(error)}`,
+    );
+    process.exit(1);
+  });
+}

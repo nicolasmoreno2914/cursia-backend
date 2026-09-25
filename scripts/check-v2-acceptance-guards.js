@@ -362,6 +362,67 @@ async function call(base, method, p, { user = OWNER_A, body } = {}) {
     assert(/failAudioWorkerJob\(jobId, workerId, v2Blocked, false\)/.test(failCall), 'debe fallar el job como NO reintentable');
   });
 
+  // ── A3 audio-worker en ejecución: providerCalls = 0 ─────────────────────────
+  // handleAudioJob REAL (dist) con cada proveedor pago espiado: TTS
+  // (ttsService.synthesize), OpenAI chat (global fetch), Storage/artifacts y
+  // eventos. Un job de curso V2 debe terminar fallado NO reintentable sin
+  // ninguna llamada a esos proveedores. Control: el mismo harness con un curso
+  // legacy SÍ llega al TTS (prueba que los espías están cableados).
+  await check('A3 audio-worker en ejecución (handleAudioJob real, proveedores espiados): curso V2 → fallado no reintentable con providerCalls = 0; legacy → llega al TTS', async () => {
+    const worker = loadDist('workers/audio-worker.js'); // require.main !== module → el loop no arranca
+    assert(typeof worker.handleAudioJob === 'function', 'handleAudioJob debe estar exportado');
+    const realFetch = global.fetch;
+    const prevKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = 'sk-test-no-real';
+    const fetchCalls = [];
+    global.fetch = async (url) => { fetchCalls.push(String(url)); throw new Error('red deshabilitada en el check'); };
+    try {
+      async function runJob(job) {
+        const { svc } = makeJobsService();
+        const spy = { tts: 0, artifacts: [], events: 0, fails: [], jobCalls: [] };
+        const jobsSvc = new Proxy(svc, {
+          get(target, prop) {
+            if (prop === 'assertLegacyAudioAllowedForCourse') return target[prop].bind(target); // guard real (SQL emulado)
+            if (typeof prop === 'symbol' || prop === 'then') return undefined;
+            return async (...args) => {
+              spy.jobCalls.push(prop);
+              if (prop === 'failAudioWorkerJob') spy.fails.push(args);
+              return true; // markAudioWorkerRunning / heartbeat → sigue dueño del job
+            };
+          },
+        });
+        const artifacts = new Proxy({}, {
+          get(_t, prop) {
+            if (typeof prop === 'symbol' || prop === 'then') return undefined;
+            return async () => { spy.artifacts.push(prop); return prop === 'findAll' ? [] : { id: 'art-fake', sizeBytes: 7 }; };
+          },
+        });
+        const tts = { synthesize: async (o) => { spy.tts++; return { audioBuffer: Buffer.from('ID3fake'), voice: 'marin', model: 'gpt-4o-mini-tts', chars: String(o.text).length }; } };
+        const events = { trackBackendEvent: async () => { spy.events++; } };
+        const before = fetchCalls.length;
+        await worker.handleAudioJob(job, jobsSvc, artifacts, tts, events, 'worker-check', 300, 3600000, new Logger('A3'));
+        spy.fetch = fetchCalls.length - before;
+        return spy;
+      }
+      const baseJob = { status: 'running', inputPayload: { courseData: { nombre: 'Curso' }, options: { generateAudiobook: false } } };
+      for (const ids of [{ frontendCourseId: DYN_UUID, courseId: null }, { frontendCourseId: null, courseId: 7 }]) {
+        const s = await runJob({ ...baseJob, id: 'job-v2', ownerId: OWNER_A, ...ids });
+        const providerCalls = s.tts + s.fetch + s.artifacts.length + s.events;
+        eq(providerCalls, 0, `providerCalls V2 ${JSON.stringify(ids)} (tts=${s.tts} fetch=${s.fetch} artifacts=${s.artifacts} events=${s.events})`);
+        eq(s.fails.length, 1, 'un solo failAudioWorkerJob');
+        assert(String(s.fails[0][2]).startsWith(PREFIX_AUDIO), `mensaje: ${s.fails[0][2]}`);
+        eq(s.fails[0][3], false, 'NO reintentable');
+        eq(s.jobCalls, ['failAudioWorkerJob'], 'ni heartbeat ni markRunning antes de fallar');
+      }
+      const legacy = await runJob({ ...baseJob, id: 'job-legacy', ownerId: OWNER_A, frontendCourseId: LEG_UUID, courseId: 8 });
+      assert(legacy.tts >= 1, `control legacy: debe llegar al TTS (tts=${legacy.tts}) — si no, los espías no prueban nada`);
+      assert(!legacy.fails.some((f) => String(f[2]).startsWith(PREFIX_AUDIO)), 'legacy no se bloquea');
+    } finally {
+      global.fetch = realFetch;
+      if (prevKey === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = prevKey;
+    }
+  });
+
   // ── P1 preview: mock sin YouTube ───────────────────────────────────────────
   await check('P1 resolveRunVideoDelivery/frozenRunVideoGate: mock (con videos) → sin preflight de YouTube; real + ≥1 video → preflight obligatorio', () => {
     const env = {};
