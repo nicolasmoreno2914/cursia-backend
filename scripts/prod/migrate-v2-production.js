@@ -20,7 +20,9 @@
 //   - --verify-only: solo las verificaciones read-only (sin backup, sin mutar).
 //
 // Nunca lee .env implícitamente: las credenciales vienen del entorno del
-// proceso o de un --env-file <ruta> explícito. Los verify/audit hijos corren
+// proceso o de un --env-file <ruta> explícito, que SOLO puede aportar claves
+// de conexión DB_* (fix wave I1): MIGRATION_ENV, CONFIRM_*, NODE_ENV, V2_TEST_*
+// y demás perillas de seguridad del archivo se IGNORAN (con aviso). Los verify/audit hijos corren
 // con cwd en un directorio temporal vacío, así tampoco cargan ningún .env.
 //
 // Uso: ver docs/v2-production-migrations.md.
@@ -126,6 +128,14 @@ const EXCLUDED = [
   { file: 'supabase-migration-dashboard-course-costs.sql', reason: 'legacy, no V2' },
 ];
 
+// M2 (fix wave): cada paso fija SUS PROPIOS timeouts antes del .sql (el .sql
+// puede endurecerlos). Un archivo futuro que olvide lock_timeout no puede
+// quedar encolado minutos detrás de tráfico bloqueando a todos los writers.
+const STEP_PREAMBLE_SQL = [
+  "set local lock_timeout = '5s'",
+  "set local statement_timeout = '300s'",
+];
+
 const EXPECTED_STORAGE_POLICIES = [
   { name: 'cursia_artifacts_insert_own_folder', cmd: 'INSERT' },
   { name: 'cursia_artifacts_select_own_folder', cmd: 'SELECT' },
@@ -182,27 +192,6 @@ function usage() {
     '          --skip-storage-policies  --skip-verify (solo con --apply; desaconsejado)',
     'Ver docs/v2-production-migrations.md.',
   ].join('\n');
-}
-
-function loadEnvFileExplicit(envPath) {
-  const abs = path.resolve(envPath);
-  if (!fs.existsSync(abs)) throw new Error(`--env-file no existe: ${abs}`);
-  const lines = fs.readFileSync(abs, 'utf8').split(/\r?\n/);
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith('#')) continue;
-    const eq = line.indexOf('=');
-    if (eq === -1) continue;
-    const key = line.slice(0, eq).trim();
-    let value = line.slice(eq + 1).trim();
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    // El entorno del proceso gana (igual que los scripts existentes): así
-    // MIGRATION_ENV/CONFIRM_* tienen que venir del operador, no del archivo.
-    if (!(key in process.env)) process.env[key] = value;
-  }
-  return abs;
 }
 
 // ── Plan ───────────────────────────────────────────────────────────────────
@@ -372,6 +361,11 @@ async function describeCurrentState(client, { includeStorage }) {
     [['course_modules', 'course_chapters', 'course_blueprints', 'course_generation_manifests', 'generation_item_runs', 'generation_run_contexts']],
   );
   console.log('Estado actual de tablas V2: ' + rows.map((r) => `${r.t}=${r.present ? 'existe' : 'no'}`).join(', '));
+  // I3 / DN-6 (informativo): histograma de production_jobs.execution_mode.
+  const hist = await client.query(
+    `select coalesce(execution_mode, '(null)') as m, count(*)::int as n from public.production_jobs group by 1 order by 1`,
+  );
+  console.log('production_jobs por execution_mode: ' + (hist.rows.map((r) => `${r.m}=${r.n}`).join(', ') || '(vacía)'));
   if (includeStorage) {
     const pol = await client.query(
       `select policyname, cmd, roles::text as roles from pg_policies
@@ -432,6 +426,8 @@ function runVerifyScripts(tgt, { testFlag }) {
 
 async function connect(tgt) {
   const { Client } = require('pg'); // lazy: dry-run nunca carga el driver
+  const warn = target.tlsWarning(process.env);
+  if (warn) console.warn(warn);
   const client = new Client(target.pgClientConfigFromEnv(process.env));
   await client.connect();
   try {
@@ -478,7 +474,7 @@ async function applyMigrations(plan, tgt, opts) {
       console.log(`▶ ${step.order}. ${step.file} (sha256 ${step.sha256.slice(0, 12)}…)`);
       await client.query('begin');
       try {
-        await client.query(`set local statement_timeout = '300s'`);
+        for (const stmt of STEP_PREAMBLE_SQL) await client.query(stmt);
         await client.query(buf.toString('utf8'));
         await client.query('commit');
       } catch (err) {
@@ -500,7 +496,7 @@ async function verifyAll(tgt, opts) {
   if (!opts.skipStoragePolicies) {
     const client = await connect(tgt);
     try {
-      await target.enterReadOnlySession(client);
+      await target.beginReadOnlyTransaction(client);
       console.log('\n── verify: políticas de storage.objects (read-only) ──');
       const ok = await verifyStoragePolicies(client);
       if (!ok) {
@@ -549,8 +545,16 @@ async function main() {
     testFlag: args.flags.has('--test-allow-local-target'),
   };
   if (args.values['--env-file']) {
-    const abs = loadEnvFileExplicit(args.values['--env-file']);
-    console.error(`(variables cargadas de --env-file ${abs}; el entorno del proceso tiene prioridad)`);
+    let res;
+    try {
+      res = target.loadDbEnvFile(args.values['--env-file']);
+    } catch (err) {
+      console.error('❌ ' + err.message);
+      return 2;
+    }
+    console.error(`(--env-file ${res.abs}: cargadas ${res.loaded.join(', ') || 'ninguna'}; el entorno del proceso tiene prioridad)`);
+    const ign = target.describeIgnoredEnvFileKeys(res.ignored);
+    if (ign) console.error(ign);
   }
 
   const mode = apply ? 'APPLY' : verifyOnly ? 'VERIFY-ONLY' : 'DRY-RUN';
@@ -654,4 +658,4 @@ if (require.main === module) {
   );
 }
 
-module.exports = { buildPlan, MIGRATION_STEPS, VERIFY_SCRIPTS, parseArgs };
+module.exports = { buildPlan, MIGRATION_STEPS, VERIFY_SCRIPTS, STEP_PREAMBLE_SQL, parseArgs };

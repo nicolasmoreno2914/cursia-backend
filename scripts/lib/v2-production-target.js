@@ -44,6 +44,14 @@
 const KNOWN_PRODUCTION_SUPABASE_REF = 'hriwbakbuypaiovvvkqh';
 const KNOWN_STAGING_SUPABASE_REF = 'ljdtmkwuhkvtmlhugjrv';
 const REF_RE = /^[a-z0-9]{6,40}$/;
+const fs = require('fs');
+const path = require('path');
+
+// I1 (fix wave): lo ÚNICO que un --env-file puede aportar son claves de
+// conexión. MIGRATION_ENV, CONFIRM_*, NODE_ENV, V2_TEST_*, V2_VERIFY_MODE,
+// V2_HEALTH_*, V2_DB_SSL_CA y cualquier otra perilla de seguridad tienen que
+// venir del entorno real del proceso del operador (o de la CLI).
+const ENV_FILE_ALLOWED_KEYS = new Set(['DB_HOST', 'DB_PORT', 'DB_USER', 'DB_PASS', 'DB_NAME', 'DB_SSL']);
 
 class TargetRefusal extends Error {
   constructor(reasons) {
@@ -57,7 +65,9 @@ function parseProjectRef(env) {
   const host = String(env.DB_HOST || '');
   const user = String(env.DB_USER || '');
   const hostM = host.match(/^db\.([a-z0-9]+)\.supabase\.co$/i);
-  const userM = user.match(/^postgres\.([a-z0-9]+)$/i);
+  // Pooler de Supavisor: "postgres.<ref>" (histórico, cualquier largo) o un
+  // rol de mínimo privilegio "<rol>.<ref de 20>" (M5, p. ej. health_ro.<ref>).
+  const userM = user.match(/^postgres\.([a-z0-9]+)$/i) || user.match(/^[a-z_][a-z0-9_]*\.([a-z0-9]{20})$/i);
   const fromHost = hostM ? hostM[1].toLowerCase() : null;
   const fromUser = userM ? userM[1].toLowerCase() : null;
   if (fromHost && fromUser && fromHost !== fromUser) {
@@ -138,6 +148,9 @@ function assertProductionTarget(env, { kind, testFlag = false, envFlagAllowed = 
   if (!test.active && String(env.DB_SSL || '').toLowerCase() !== 'true') {
     reasons.push('DB_SSL debe ser "true" (Supabase exige TLS)');
   }
+  if (env.V2_DB_SSL_CA && !fs.existsSync(env.V2_DB_SSL_CA)) {
+    reasons.push(`V2_DB_SSL_CA apunta a un archivo inexistente (${env.V2_DB_SSL_CA})`);
+  }
   if (kind === 'apply' && env.CONFIRM_BACKUP_TAKEN !== 'yes') {
     reasons.push('falta CONFIRM_BACKUP_TAKEN=yes (el owner confirmó backup/PITR verificado — ver docs/v2-production-migrations.md §Precondiciones)');
   }
@@ -163,30 +176,116 @@ async function assertServerIdentity(client, { testMode }) {
 }
 
 /**
- * Sesión de solo lectura: todas las transacciones posteriores (incluidos los
- * `begin` explícitos de los verify/audit) son READ ONLY — cualquier escritura
- * accidental falla con SQLSTATE 25006 en vez de mutar producción.
+ * M3 (fix wave): solo lectura POR TRANSACCIÓN, no por sesión. Un
+ * `SET SESSION CHARACTERISTICS` no sobrevive (y hasta podría filtrarse) detrás
+ * del pooler de Supavisor en modo transacción; un `BEGIN TRANSACTION READ
+ * ONLY` fija el backend durante toda la transacción y cualquier escritura
+ * falla con SQLSTATE 25006. Cerrar la conexión sin COMMIT la revierte.
  */
-async function enterReadOnlySession(client) {
-  await client.query('set session characteristics as transaction read only');
-  await client.query(`set statement_timeout = '120s'`);
-  const { rows } = await client.query('show default_transaction_read_only');
-  if (rows[0].default_transaction_read_only !== 'on') {
-    throw new Error('no se pudo poner la sesión en solo lectura');
+async function beginReadOnlyTransaction(client, { statementTimeout = '120s' } = {}) {
+  await client.query('begin transaction read only');
+  await client.query(`set local statement_timeout = '${statementTimeout}'`);
+  const { rows } = await client.query('show transaction_read_only');
+  if (rows[0].transaction_read_only !== 'on') {
+    throw new Error('no se pudo abrir una transacción de solo lectura');
   }
 }
 
+// Control de transacción/sesión que rompería la transacción READ ONLY única.
+const FORBIDDEN_IN_READONLY = /^\s*(begin|start\s+transaction|commit|end|rollback|abort|savepoint|release|prepare\s+transaction|set\s+session|set\s+transaction|reset|discard)\b/i;
+
+/**
+ * Tras beginReadOnlyTransaction: envuelve client.query para que NADA pueda
+ * cerrar/cambiar esa transacción (defensa en profundidad: las sondas con
+ * escritura revertida ya están desactivadas por código en production-readonly).
+ */
+function lockReadOnlyClient(client) {
+  const original = client.query.bind(client);
+  client.query = function guardedQuery(config, ...rest) {
+    const text = typeof config === 'string' ? config : config && config.text;
+    if (typeof text === 'string' && FORBIDDEN_IN_READONLY.test(text)) {
+      const err = new Error(`production-readonly: sentencia de control de transacción/sesión rechazada: ${text.trim().split(/\s+/).slice(0, 3).join(' ')}`);
+      if (typeof rest[rest.length - 1] === 'function') return rest[rest.length - 1](err);
+      return Promise.reject(err);
+    }
+    return original(config, ...rest);
+  };
+  return client;
+}
+
+/**
+ * M6 (fix wave): con V2_DB_SSL_CA (ruta a un PEM, p. ej. el CA de Supabase)
+ * se verifican certificados (rejectUnauthorized: true). Sin CA se mantiene el
+ * comportamiento de los scripts existentes (rejectUnauthorized: false) y
+ * tlsWarning() devuelve un aviso explícito para imprimir antes de conectar.
+ */
 function pgClientConfigFromEnv(env) {
+  let ssl = false;
+  if (String(env.DB_SSL || '').toLowerCase() === 'true') {
+    ssl = env.V2_DB_SSL_CA
+      ? { ca: fs.readFileSync(env.V2_DB_SSL_CA, 'utf8'), rejectUnauthorized: true }
+      : { rejectUnauthorized: false };
+  }
   return {
     host: env.DB_HOST || '127.0.0.1',
     port: Number(env.DB_PORT || 5432),
     user: env.DB_USER,
     password: env.DB_PASS,
     database: env.DB_NAME,
-    ssl: String(env.DB_SSL || '').toLowerCase() === 'true' ? { rejectUnauthorized: false } : false,
+    ssl,
     connectionTimeoutMillis: 15000,
     application_name: 'cursia-v2-production-tooling',
   };
+}
+
+function tlsWarning(env) {
+  if (String(env.DB_SSL || '').toLowerCase() === 'true' && !env.V2_DB_SSL_CA) {
+    return '⚠️  TLS sin verificación de certificado (rejectUnauthorized=false): definí V2_DB_SSL_CA=<ruta al CA de Supabase> para verificarlo.';
+  }
+  return null;
+}
+
+/**
+ * I1 (fix wave): carga un --env-file aceptando SOLO claves de conexión DB_*.
+ * El entorno del proceso gana. Devuelve las claves cargadas e ignoradas
+ * (solo nombres, nunca valores).
+ */
+function loadDbEnvFile(envPath, env = process.env) {
+  const abs = path.resolve(envPath);
+  if (!fs.existsSync(abs)) throw new Error(`--env-file no existe: ${abs}`);
+  const loaded = [];
+  const ignored = [];
+  for (const rawLine of fs.readFileSync(abs, 'utf8').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq === -1) continue;
+    const key = line.slice(0, eq).trim().replace(/^export\s+/, '');
+    let value = line.slice(eq + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (!ENV_FILE_ALLOWED_KEYS.has(key)) { ignored.push(key); continue; }
+    if (!(key in env)) { env[key] = value; loaded.push(key); }
+  }
+  return { abs, loaded, ignored };
+}
+
+function describeIgnoredEnvFileKeys(ignored) {
+  if (!ignored.length) return null;
+  return `⚠️  --env-file: claves ignoradas (solo se aceptan ${[...ENV_FILE_ALLOWED_KEYS].join(', ')}; ` +
+    `las confirmaciones y perillas de seguridad deben venir del entorno real del operador): ${[...new Set(ignored)].join(', ')}`;
+}
+
+/** M4 (fix wave): quita JWT, tokens de query, URLs y emails de un texto libre. */
+function redactSensitive(text) {
+  if (text === null || text === undefined) return text;
+  return String(text)
+    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '[redacted-jwt]')
+    .replace(/\bbearer\s+[A-Za-z0-9._~+/=-]+/gi, 'bearer [redacted]')
+    .replace(/\bhttps?:\/\/[^\s"'<>]+/gi, '[redacted-url]')
+    .replace(/\b(token|sig|signature|apikey|api_key|key|access_token|refresh_token|secret|password|pwd)=[^\s&"']+/gi, '$1=[redacted]')
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '[redacted-email]');
 }
 
 // ── Hooks para los verify-*/audit-* existentes ─────────────────────────────
@@ -214,10 +313,15 @@ function assertProductionReadonlyTargetOrExit(env = process.env) {
   }
 }
 
-/** Tras client.connect(): identidad del servidor + sesión read-only. */
+/**
+ * Tras client.connect(): identidad del servidor + UNA transacción READ ONLY que
+ * dura hasta client.end() (sin COMMIT → se revierte) + cliente bloqueado
+ * contra control de transacción/sesión.
+ */
 async function enterProductionReadonlySession(client, target) {
   await assertServerIdentity(client, { testMode: target.testMode });
-  await enterReadOnlySession(client);
+  await beginReadOnlyTransaction(client);
+  lockReadOnlyClient(client);
 }
 
 function logSkippedProbe(label) {
@@ -233,8 +337,14 @@ module.exports = {
   resolveTestOverride,
   assertProductionTarget,
   assertServerIdentity,
-  enterReadOnlySession,
+  beginReadOnlyTransaction,
+  lockReadOnlyClient,
   pgClientConfigFromEnv,
+  tlsWarning,
+  loadDbEnvFile,
+  describeIgnoredEnvFileKeys,
+  redactSensitive,
+  ENV_FILE_ALLOWED_KEYS,
   isProductionReadonlyRequested,
   assertProductionReadonlyTargetOrExit,
   enterProductionReadonlySession,

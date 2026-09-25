@@ -19,7 +19,11 @@
 //
 // Nunca escribe: la sesión se pone en `default_transaction_read_only = on` y
 // todas las consultas corren dentro de `begin transaction read only` +
-// rollback. Nunca lee .env implícitamente (solo --env-file <ruta> explícito).
+// rollback. Nunca lee .env implícitamente (solo --env-file <ruta> explícito,
+// que SOLO aporta claves de conexión DB_*: umbrales V2_HEALTH_* y el ref
+// esperado deben venir del entorno real o de la CLI — fix wave I1). Los
+// textos de error se redactan (JWT, tokens, URLs, emails — M4). Umbrales
+// fraccionarios permitidos (M7).
 //
 // Código de salida: 0 = OK, 2 = algún umbral superado (sirve para alertar
 // desde cron), 1 = error (no se pudo conectar, etc.), 3 = objetivo rechazado.
@@ -42,8 +46,6 @@
 // Uso: ver docs/v2-production-migrations.md §Observabilidad.
 // ══════════════════════════════════════════════════════════════════════════
 
-const fs = require('fs');
-const path = require('path');
 const target = require('../lib/v2-production-target');
 
 const THRESHOLD_DEFAULTS = {
@@ -84,22 +86,6 @@ function parseArgs(argv) {
   return a;
 }
 
-function loadEnvFileExplicit(p) {
-  const abs = path.resolve(p);
-  if (!fs.existsSync(abs)) throw new Error(`--env-file no existe: ${abs}`);
-  for (const raw of fs.readFileSync(abs, 'utf8').split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
-    const eq = line.indexOf('=');
-    if (eq === -1) continue;
-    const key = line.slice(0, eq).trim();
-    let v = line.slice(eq + 1).trim();
-    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
-    if (!(key in process.env)) process.env[key] = v;
-  }
-}
-
-
 async function tableExists(client, qualified) {
   const { rows } = await client.query('select to_regclass($1) is not null as ok', [qualified]);
   return rows[0].ok === true;
@@ -134,13 +120,23 @@ async function collect(client, th) {
         where status = 'failed' and coalesce(finished_at, updated_at) >= now() - interval '24 hours'
         group by 1, 2 order by n desc, type limit 50`,
     );
-    const total = rows.reduce((a, r) => a + r.n, 0);
-    report.metrics.failedItems24h = { value: total, max: th.V2_HEALTH_MAX_FAILED_ITEMS_24H, breakdown: rows };
+    // M4: redactar y reagrupar (dos errores que solo difieren en un token
+    // quedan en el mismo grupo).
+    const grouped = new Map();
+    for (const r of rows) {
+      const error = target.redactSensitive(r.error);
+      const k = r.type + '\u0000' + error;
+      const prev = grouped.get(k);
+      if (prev) prev.n += r.n; else grouped.set(k, { type: r.type, error, n: r.n });
+    }
+    const breakdown = [...grouped.values()].sort((a, b) => b.n - a.n || a.type.localeCompare(b.type));
+    const total = breakdown.reduce((a, r) => a + r.n, 0);
+    report.metrics.failedItems24h = { value: total, max: th.V2_HEALTH_MAX_FAILED_ITEMS_24H, breakdown };
   }
 
   // 2. Leases vencidos
   {
-    const grace = Math.floor(th.V2_HEALTH_LEASE_GRACE_MINUTES);
+    const grace = th.V2_HEALTH_LEASE_GRACE_MINUTES;
     let items = [];
     let jobs = [];
     if (has.gir) {
@@ -149,7 +145,7 @@ async function collect(client, th) {
                 round(extract(epoch from (now() - lease_until)) / 60)::int as expired_minutes
            from public.generation_item_runs
           where status = 'running' and lease_until is not null
-            and lease_until < now() - make_interval(mins => $1::int)
+            and lease_until < now() - make_interval(secs => $1::float8 * 60)
           order by lease_until limit 50`,
         [grace],
       ));
@@ -161,7 +157,7 @@ async function collect(client, th) {
            from public.production_jobs
           where execution_mode in ('dynamic_generation','dynamic_package')
             and worker_status = 'running' and lease_until is not null
-            and lease_until < now() - make_interval(mins => $1::int)
+            and lease_until < now() - make_interval(secs => $1::float8 * 60)
           order by lease_until limit 50`,
         [grace],
       ));
@@ -187,6 +183,7 @@ async function collect(client, th) {
         where execution_mode = 'dynamic_package' and worker_status in ('queued','running','retrying')
         group by 1 having count(*) > 1 order by 2 desc limit 20`,
     );
+    for (const f of failures) f.error = target.redactSensitive(f.error);
     report.metrics.packageFailures24h = { value: failures.length, max: th.V2_HEALTH_MAX_PACKAGE_FAILURES_24H, failures };
     report.metrics.packageDuplicateActive = { value: dup.length, info: 'runs con >1 dynamic_package activo (gap M9) — informativo', runs: dup };
   }
@@ -198,9 +195,9 @@ async function collect(client, th) {
               round(extract(epoch from (now() - created_at)) / 3600, 1)::float as hours
          from public.production_jobs
         where execution_mode = 'dynamic_generation' and worker_status in ('queued','running','retrying')
-          and created_at < now() - make_interval(hours => $1::int)
+          and created_at < now() - make_interval(secs => $1::float8 * 3600)
         order by created_at limit 50`,
-      [Math.floor(th.V2_HEALTH_LONG_RUN_HOURS)],
+      [th.V2_HEALTH_LONG_RUN_HOURS],
     );
     report.metrics.longRunningRuns = { value: rows.length, max: th.V2_HEALTH_MAX_LONG_RUNS, hours: th.V2_HEALTH_LONG_RUN_HOURS, runs: rows };
   }
@@ -355,7 +352,11 @@ async function main() {
       console.log('node scripts/ops/v2-health-report.js [--json] [--expect-ref <ref>] [--env-file <ruta>]');
       return 0;
     }
-    if (args.envFile) loadEnvFileExplicit(args.envFile);
+    if (args.envFile) {
+      const res = target.loadDbEnvFile(args.envFile);
+      const ign = target.describeIgnoredEnvFileKeys(res.ignored);
+      if (ign) console.error(ign);
+    }
     th = readThresholds(process.env);
   } catch (err) {
     console.error('❌ ' + err.message);
@@ -376,25 +377,30 @@ async function main() {
   if (parsed.ref === target.KNOWN_PRODUCTION_SUPABASE_REF) targetDesc += ' [PRODUCCIÓN]';
   else if (parsed.ref === target.KNOWN_STAGING_SUPABASE_REF) targetDesc += ' [staging]';
 
+  if (process.env.V2_DB_SSL_CA && !require('fs').existsSync(process.env.V2_DB_SSL_CA)) {
+    console.error(`❌ V2_DB_SSL_CA apunta a un archivo inexistente (${process.env.V2_DB_SSL_CA})`);
+    return 3;
+  }
+  const warn = target.tlsWarning(process.env);
+  if (warn) console.error(warn);
   const { Client } = require('pg');
   const client = new Client(target.pgClientConfigFromEnv(process.env));
   try {
     await client.connect();
   } catch (err) {
-    console.error('❌ No se pudo conectar:', err.message);
+    console.error('❌ No se pudo conectar:', target.redactSensitive(err.message));
     return 1;
   }
   let report;
   try {
-    await target.enterReadOnlySession(client);
-    await client.query('begin transaction read only');
+    await target.beginReadOnlyTransaction(client);
     try {
       report = await collect(client, th);
     } finally {
       await client.query('rollback');
     }
   } catch (err) {
-    console.error('❌ Error consultando:', err.message);
+    console.error('❌ Error consultando:', target.redactSensitive(err.message));
     return 1;
   } finally {
     await client.end();

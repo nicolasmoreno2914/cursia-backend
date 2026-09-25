@@ -35,6 +35,14 @@ const PROD_REF = 'hriwbakbuypaiovvvkqh';
 const STAGING_REF = 'ljdtmkwuhkvtmlhugjrv';
 const FAKE_REF = 'localprodlike0001';
 const STAGING_LOCAL_ROLE = 'postgres.localstagingfake01';
+const INVALIDATION_SQL = path.join(REPO, 'supabase-migration-invalidation.sql');
+const WORKFLOW = path.join(REPO, '.github/workflows/v2-production-migrations.yml');
+const DOC = path.join(REPO, 'docs/v2-production-migrations.md');
+function writeTmpFile(name, content) {
+  const p = path.join(TMP_CWD, name);
+  fs.writeFileSync(p, content);
+  return p;
+}
 
 function findPgBin() {
   const cands = [process.env.PG_BIN, '/opt/homebrew/opt/postgresql@16/bin', '/opt/homebrew/bin', '/usr/lib/postgresql/16/bin'].filter(Boolean);
@@ -178,6 +186,12 @@ async function main() {
         assert(!files.includes('scripts/migrate-production-jobs-constraints.js'), 'no debe duplicar deploy.yml');
         assert(plan.excluded.some((e) => /production-jobs-constraints/.test(e.file)), 'exclusión documentada');
       });
+      await test('placeholder Fase 8 (M1): [included] si supabase-migration-invalidation.sql existe, [placeholder-unresolved] si no', async () => {
+        const res = run(RUNNER, ['--plan-json'], {}, { preload: FORBID });
+        const step = JSON.parse(res.stdout).steps.find((s) => s.id === 'invalidation-carried-from');
+        const expected = fs.existsSync(INVALIDATION_SQL) ? 'included' : 'placeholder-unresolved';
+        assert(step && step.status === expected, `status ${step && step.status}, esperado ${expected}`);
+      });
 
       // ── 2. --apply sin cada confirmación → rechazado, sin conectar ──────
       const fullProdLike = {
@@ -194,7 +208,6 @@ async function main() {
         ['sin CONFIRM_BACKUP_TAKEN', applyArgs, { CONFIRM_BACKUP_TAKEN: undefined }, /CONFIRM_BACKUP_TAKEN/],
         ['CONFIRM_BACKUP_TAKEN=y (no "yes")', applyArgs, { CONFIRM_BACKUP_TAKEN: 'y' }, /CONFIRM_BACKUP_TAKEN/],
         ['DB_SSL=false', applyArgs, { DB_SSL: 'false' }, /DB_SSL/],
-        ['placeholder sin resolver y sin --skip-unresolved-placeholders', ['--apply', '--i-understand-this-mutates-production'], {}, /placeholder/],
         ['--expect-plan-sha256 distinto', [...applyArgs, '--expect-plan-sha256', 'deadbeef'], {}, /expect-plan-sha256/],
         ['ref desconocido (ni prod ni staging)', applyArgs, { DB_USER: 'postgres.someotherref01', CONFIRM_PRODUCTION_REF: 'someotherref01' }, /no es el de producción conocido/],
         ['DB_HOST y DB_USER con refs distintos', applyArgs, { DB_HOST: `db.${PROD_REF}.supabase.co`, DB_USER: 'postgres.someotherref01' }, /proyectos distintos/],
@@ -202,6 +215,12 @@ async function main() {
         ['override de tests sin el flag de CLI (solo env V2_TEST_ALLOW_LOCAL_TARGET)', applyArgs, { NODE_ENV: 'test', V2_TEST_ALLOW_LOCAL_TARGET: '1', V2_TEST_FAKE_PROJECT_REF: FAKE_REF, DB_USER: 'postgres', CONFIRM_PRODUCTION_REF: FAKE_REF }, /override de tests pedido pero incompleto/],
         ['override de tests con host NO loopback', [...applyArgs, '--test-allow-local-target'], { NODE_ENV: 'test', V2_TEST_FAKE_PROJECT_REF: FAKE_REF, DB_HOST: '10.255.255.1', DB_USER: 'postgres', CONFIRM_PRODUCTION_REF: FAKE_REF }, /override de tests pedido pero incompleto/],
       ];
+      // M1: el placeholder de Fase 8 solo está "sin resolver" mientras el
+      // archivo no exista en la rama; cuando se integre, el caso deja de aplicar
+      // (y el test de --plan-json exige que quede [included]).
+      if (!fs.existsSync(INVALIDATION_SQL)) {
+        missingCases.push(['placeholder sin resolver y sin --skip-unresolved-placeholders', ['--apply', '--i-understand-this-mutates-production'], {}, /placeholder/]);
+      }
       for (const [label, args, patch, re] of missingCases) {
         await test(`--apply ${label}: exit 3, 0 conexiones`, async () => {
           const before = listener.state.connections;
@@ -213,6 +232,38 @@ async function main() {
           assert(listener.state.connections === before, 'conectó');
         });
       }
+      // ── I1: --env-file solo aporta claves de conexión DB_* ───────────────
+      await test('I1: --env-file con TODAS las confirmaciones + DB_* NO habilita --apply (exit 3, 0 conexiones, claves ignoradas avisadas)', async () => {
+        const before = listener.state.connections;
+        const f = writeTmpFile('all-confirmations.env', [
+          'DB_HOST=127.0.0.1', `DB_PORT=${LISTEN_PORT}`, `DB_USER=postgres.${PROD_REF}`, 'DB_PASS=x', 'DB_NAME=postgres', 'DB_SSL=true',
+          'MIGRATION_ENV=production', `CONFIRM_PRODUCTION_REF=${PROD_REF}`, 'CONFIRM_BACKUP_TAKEN=yes',
+          'NODE_ENV=test', `V2_TEST_FAKE_PROJECT_REF=${FAKE_REF}`, 'V2_TEST_ALLOW_LOCAL_TARGET=1', 'V2_VERIFY_MODE=production-readonly',
+        ].join('\n') + '\n');
+        const res = run(RUNNER, [...applyArgs, '--env-file', f], {}, { preload: FORBID });
+        assert(res.code === 3, `exit ${res.code}\n${res.out}`);
+        assert(/MIGRATION_ENV/.test(res.out) && /CONFIRM_BACKUP_TAKEN/.test(res.out), 'debe rechazar por confirmaciones ausentes');
+        assert(/ignorad/i.test(res.out) && /CONFIRM_PRODUCTION_REF/.test(res.out), 'debe avisar las claves ignoradas del env-file');
+        assert(!/FORBIDDEN_/.test(res.out) && listener.state.connections === before, 'conectó');
+      });
+      await test('I1: --env-file sí aporta DB_* (el rechazo ya no es por ref/SSL) — confirmaciones desde el proceso', async () => {
+        const f = writeTmpFile('db-only.env', ['DB_HOST=127.0.0.1', `DB_PORT=${CLOSED_PORT}`, `DB_USER=postgres.${PROD_REF}`, 'DB_SSL=true'].join('\n') + '\n');
+        const res = run(RUNNER, [...applyArgs, '--env-file', f], {
+          MIGRATION_ENV: 'production', CONFIRM_PRODUCTION_REF: PROD_REF, CONFIRM_BACKUP_TAKEN: 'yes',
+        });
+        assert(res.code === 1 && /ECONNREFUSED|connect/i.test(res.out), `exit ${res.code}\n${res.out}`);
+      });
+      await test('M6: sin V2_DB_SSL_CA el runner avisa que corre con rejectUnauthorized=false', async () => {
+        const res = run(RUNNER, applyArgs, { ...fullProdLike, DB_PORT: CLOSED_PORT });
+        assert(/rejectUnauthorized=false/.test(res.out), res.out);
+      });
+      await test('M6: V2_DB_SSL_CA inexistente → rechazo antes de conectar', async () => {
+        const before = listener.state.connections;
+        const res = run(RUNNER, applyArgs, { ...fullProdLike, V2_DB_SSL_CA: '/nonexistent/ca.pem' }, { preload: FORBID });
+        assert(res.code === 3 && /V2_DB_SSL_CA/.test(res.out), `exit ${res.code}\n${res.out}`);
+        assert(listener.state.connections === before, 'conectó');
+      });
+
       await test('--apply con TODAS las confirmaciones y ref de prod (puerto cerrado): pasa los guards y solo entonces intenta conectar', async () => {
         const res = run(RUNNER, applyArgs, { ...fullProdLike, DB_PORT: CLOSED_PORT });
         assert(res.code === 1 && /ECONNREFUSED|connect/i.test(res.out), `exit ${res.code}\n${res.out}`);
@@ -243,6 +294,44 @@ async function main() {
     } finally {
       await listener.close();
     }
+
+    // ── Unitarios de la librería / estáticos ─────────────────────────────
+    const lib = require('../../lib/v2-production-target');
+    await test('M5: parseProjectRef acepta usuario de pooler de mínimo privilegio (<rol>.<ref de 20>) y mantiene el chequeo de conflicto', async () => {
+      assert(lib.parseProjectRef({ DB_USER: `health_ro.${PROD_REF}` }).ref === PROD_REF, 'health_ro.<ref>');
+      assert(lib.parseProjectRef({ DB_USER: `postgres.${PROD_REF}` }).ref === PROD_REF, 'postgres.<ref>');
+      assert(lib.parseProjectRef({ DB_USER: 'health_ro.corto' }).ref === null, 'ref corto no es ref');
+      assert(lib.parseProjectRef({ DB_HOST: `db.${STAGING_REF}.supabase.co`, DB_USER: `health_ro.${PROD_REF}` }).conflict, 'conflicto');
+    });
+    await test('M6: pgClientConfigFromEnv verifica certificados cuando hay V2_DB_SSL_CA', async () => {
+      const ca = writeTmpFile('ca.pem', '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n');
+      const cfg = lib.pgClientConfigFromEnv({ DB_SSL: 'true', V2_DB_SSL_CA: ca });
+      assert(cfg.ssl && cfg.ssl.rejectUnauthorized === true && /BEGIN CERTIFICATE/.test(cfg.ssl.ca), JSON.stringify(cfg.ssl));
+      const cfg2 = lib.pgClientConfigFromEnv({ DB_SSL: 'true' });
+      assert(cfg2.ssl.rejectUnauthorized === false, 'sin CA');
+    });
+    await test('M2: cada paso del runner fija su propio lock_timeout y statement_timeout (SET LOCAL)', async () => {
+      const runner = require('../migrate-v2-production');
+      const pre = runner.STEP_PREAMBLE_SQL.join(';');
+      assert(/set local lock_timeout = '5s'/.test(pre) && /set local statement_timeout/.test(pre), pre);
+    });
+    await test('I2: workflow — solo workflow_dispatch; el job migrate falla primero sin la variable del environment y no lee secretos antes', async () => {
+      const y = fs.readFileSync(WORKFLOW, 'utf8');
+      const onBlock = y.slice(y.indexOf('\non:'), y.indexOf('\npermissions:'));
+      assert(/workflow_dispatch:/.test(onBlock) && !/\b(push|pull_request|pull_request_target|schedule|workflow_run|repository_dispatch):/.test(onBlock), 'triggers');
+      const job = y.slice(y.indexOf('\n  migrate:'));
+      const s0 = job.indexOf('\n      - ', job.indexOf('steps:'));
+      const firstStep = job.slice(s0, job.indexOf('\n      - ', s0 + 5));
+      assert(/vars\.V2_PROD_MIGRATIONS_ENV_GUARD/.test(firstStep) && /production-v2-migrations/.test(firstStep), 'el primer step debe ser el guard');
+      const guardIdx = job.indexOf('V2_PROD_MIGRATIONS_ENV_GUARD');
+      assert(job.indexOf('secrets.') > guardIdx, 'secretos antes del guard');
+      assert(y.slice(0, y.indexOf('\n  migrate:')).indexOf('secrets.') === -1, 'el job plan no debe leer secretos');
+    });
+    await test('I3: el doc incluye el chequeo SQL pre-merge obligatorio (DN-6) con resultados esperados', async () => {
+      const d = fs.readFileSync(DOC, 'utf8');
+      assert(/would_violate_execution_mode/.test(d) && /would_violate_worker_status/.test(d) && /DN-6/.test(d) && /begin transaction read only/i.test(d), 'falta el SQL pre-merge');
+      assert(/V2_PROD_MIGRATIONS_ENV_GUARD/.test(d), 'falta el setup del guard del environment');
+    });
 
     // ── 4. Guards de staging de los verify/audit: SIN cambios ────────────
     await test('verify-*.js sin V2_VERIFY_MODE (default staging): guard original intacto — MIGRATION_ENV=production rechazado', async () => {
@@ -315,6 +404,13 @@ async function main() {
       const res = run(RUNNER, ['--verify-only', '--test-allow-local-target'], overrideEnv('prodlike', { CONFIRM_BACKUP_TAKEN: undefined }));
       assert(res.code === 0 && /Verificación read-only OK/.test(res.out), `exit ${res.code}\n${res.out}`);
     });
+    await test('I1: --verify-only con DB_* desde --env-file (local) y confirmaciones desde el proceso → OK', async () => {
+      const f = writeTmpFile('local-db.env', ['DB_HOST=127.0.0.1', `DB_PORT=${PG_PORT}`, 'DB_USER=postgres', 'DB_PASS=x', 'DB_NAME=prodlike', 'DB_SSL=false'].join('\n') + '\n');
+      const res = run(RUNNER, ['--verify-only', '--test-allow-local-target', '--env-file', f], {
+        NODE_ENV: 'test', V2_TEST_FAKE_PROJECT_REF: FAKE_REF, MIGRATION_ENV: 'production', CONFIRM_PRODUCTION_REF: FAKE_REF,
+      });
+      assert(res.code === 0 && /Verificación read-only OK/.test(res.out), `exit ${res.code}\n${res.out}`);
+    });
     await test('camino de STAGING sin cambios: los 7 verify/audit con MIGRATION_ENV=staging y TODAS sus sondas de escritura revertida pasan sobre el esquema del runner', async () => {
       await withClient('postgres', (c) => c.query(`create role "${STAGING_LOCAL_ROLE}" login superuser`));
       const before = await withClient('prodlike', (c) => c.query(`select (select count(*) from courses)::int as c, (select count(*) from production_jobs)::int as j`));
@@ -327,13 +423,26 @@ async function main() {
       const after = await withClient('prodlike', (c) => c.query(`select (select count(*) from courses)::int as c, (select count(*) from production_jobs)::int as j`));
       assert(JSON.stringify(before.rows) === JSON.stringify(after.rows), 'las sondas dejaron filas');
     });
-    await test('sesión production-readonly bloquea escrituras (SQLSTATE 25006)', async () => {
-      const lib = require('../../lib/v2-production-target');
+    await test('M3: production-readonly = BEGIN READ ONLY por transacción (sin setting de sesión, apto para pooler) y bloquea escrituras (25006)', async () => {
       await withClient('prodlike', async (c) => {
-        await lib.enterReadOnlySession(c);
+        await lib.enterProductionReadonlySession(c, { ref: FAKE_REF, testMode: true });
+        const tro = await c.query('show transaction_read_only');
+        const dtro = await c.query('show default_transaction_read_only');
+        assert(tro.rows[0].transaction_read_only === 'on', 'transacción no read-only');
+        assert(dtro.rows[0].default_transaction_read_only === 'off', 'no debe depender de un setting de sesión');
         let code = null;
         try { await c.query(`insert into courses (title) values ('x')`); } catch (e) { code = e.code; }
         assert(code === '25006', 'código ' + code);
+      });
+    });
+    await test('M3: en production-readonly se rechaza cualquier control de transacción/sesión (commit, begin, set session)', async () => {
+      await withClient('prodlike', async (c) => {
+        await lib.enterProductionReadonlySession(c, { ref: FAKE_REF, testMode: true });
+        for (const sql of ['commit', 'begin', 'set session characteristics as transaction read write', 'end']) {
+          let rejected = false;
+          try { await c.query(sql); } catch (e) { rejected = /production-readonly/.test(e.message); }
+          assert(rejected, 'no rechazó: ' + sql);
+        }
       });
     });
 
@@ -403,6 +512,32 @@ async function main() {
     await test('health report: umbral inválido → exit 1', async () => {
       const res = run(HEALTH, [], { V2_HEALTH_MAX_STUCK_LEASES: 'abc' }, { preload: FORBID });
       assert(res.code === 1, `exit ${res.code}\n${res.out}`);
+    });
+    await test('I1: health --env-file solo aporta DB_* (umbrales y expected-ref del archivo se ignoran)', async () => {
+      const f = writeTmpFile('health.env', ['DB_HOST=127.0.0.1', `DB_PORT=${PG_PORT}`, 'DB_USER=health_ro', 'DB_NAME=prodlike', 'DB_SSL=false',
+        'V2_HEALTH_MAX_STUCK_LEASES=abc', `V2_HEALTH_EXPECTED_REF=${STAGING_REF}`, 'MIGRATION_ENV=production'].join('\n') + '\n');
+      const res = run(HEALTH, ['--json', '--env-file', f], {});
+      assert(res.code === 2, `exit ${res.code}\n${res.out}`);
+      assert(/ignorad/i.test(res.out), 'debe avisar claves ignoradas');
+    });
+    await test('M7: umbrales fraccionarios respetados (LONG_RUN_HOURS=8.5 → el run de 8 h no cuenta)', async () => {
+      const res = run(HEALTH, ['--json'], healthEnv({ V2_HEALTH_LONG_RUN_HOURS: '8.5', V2_HEALTH_LEASE_GRACE_MINUTES: '25.5' }));
+      const rep = JSON.parse(res.stdout);
+      assert(rep.metrics.longRunningRuns.value === 0, 'long ' + rep.metrics.longRunningRuns.value);
+      assert(rep.metrics.stuckLeases.items.length === 0 && rep.metrics.stuckLeases.jobs.length === 1, 'grace 25.5 min');
+    });
+    await test('M4: health report redacta JWT, tokens de query, URLs y emails en errores', async () => {
+      await withClient('prodlike', (c) => c.query(`
+        insert into production_jobs (owner_id, execution_mode, status, worker_status, input_payload, error_message)
+          values ('u', 'dynamic_package', 'failed', 'failed', '{"runId":"r"}',
+                  'GET https://abc.supabase.co/storage/v1/object/sign/x?token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sigSIG_123 by jane.doe@example.com');
+        update generation_item_runs set error = 'upload 403 https://files.example.org/a?sig=SECRETSIG&x=1 bearer eyJhbGciOiJIUzI1NiJ9.eyJhIjoxfQ.zzz_ZZZ mail ops@cursia.test'
+          where item_key = 'scorm:c1';`));
+      const res = run(HEALTH, ['--json'], healthEnv());
+      for (const needle of ['eyJ', 'jane.doe@example.com', 'ops@cursia.test', 'SECRETSIG', 'https://abc.supabase.co', 'https://files.example.org', 'sigSIG_123']) {
+        assert(!res.stdout.includes(needle), 'filtró: ' + needle);
+      }
+      assert(/\[redacted/.test(res.stdout), 'sin marcador de redacción');
     });
   } finally {
     if (started) {
