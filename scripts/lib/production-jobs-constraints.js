@@ -68,11 +68,15 @@ const APPLY_STATEMENTS = Object.freeze([
  * criterio que el chequeo pre-merge documentado en
  * docs/v2-production-migrations.md. Devuelve histogramas de los valores
  * ofensores (valor → cantidad).
+ *
+ * NULL no es violación (re-review N2): un CHECK `execution_mode in (…)` con
+ * execution_mode NULL evalúa a NULL, y PostgreSQL solo rechaza FALSE — igual
+ * que el `not in (…)` de la consulta manual del doc, que tampoco cuenta NULLs.
  */
 async function findViolations(client) {
   const em = await client.query(
-    `select coalesce(execution_mode, '(null)') as v, count(*)::int as n from public.production_jobs
-      where execution_mode is null or not (execution_mode = any($1::text[])) group by 1 order by 1`,
+    `select execution_mode as v, count(*)::int as n from public.production_jobs
+      where execution_mode is not null and not (execution_mode = any($1::text[])) group by 1 order by 1`,
     [EXECUTION_MODES],
   );
   const ws = await client.query(

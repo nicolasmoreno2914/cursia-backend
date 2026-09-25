@@ -265,15 +265,35 @@ async function main() {
   });
 
   try {
-    await check('M1 legacy: objeto de Storage borrado ANTES que la fila (orden de main), fila borrada', async () => {
+    await check('M1/N3 legacy: fila borrada y COMMIT primero; el DELETE de Storage corre FUERA de la transacción (mismo resultado que main)', async () => {
       const db = fakeArtifactsDb([legacyRow('a1')]);
       stubStorage(db.events);
       await new ArtifactsService(db.repo, CONFIG).remove('a1', 'u1');
       const iStorage = db.events.indexOf('storage:DELETE:cursia-artifacts/u1/course-9/final.mbz');
-      const iDelete = db.events.findIndex((e) => e === 'sql:delete from');
-      assert(iStorage >= 0 && iDelete >= 0 && iStorage < iDelete, 'orden: ' + db.events.join(' → '));
+      const iCommit = db.events.indexOf('commit');
+      assert(iStorage >= 0 && iCommit >= 0 && iStorage > iCommit, 'orden: ' + db.events.join(' → '));
       eq(db.table.length, 0, 'filas restantes');
     });
+    await check('N3 legacy/dynamic: el DELETE de Storage lleva un timeout acotado (AbortSignal); Storage colgado → remove() termina y la fila queda borrada', () =>
+      withEnv({ ARTIFACT_STORAGE_DELETE_TIMEOUT_MS: '50' }, async () => {
+        for (const row of [legacyRow('a1'), dynRow('d1', 'u1/dynamic/fc/7/dynamic_video/k/a1.json')]) {
+          const db = fakeArtifactsDb([row]);
+          let sawSignal = false;
+          global.fetch = (url, init) => new Promise((resolve, reject) => {
+            sawSignal = !!(init && init.signal);
+            if (init && init.signal) init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+          });
+          const t0 = Date.now();
+          let watchdog;
+          await Promise.race([
+            new ArtifactsService(db.repo, CONFIG).remove(row.id, 'u1'),
+            new Promise((_, rej) => { watchdog = setTimeout(() => rej(new Error(`${row.id}: remove() colgado con Storage sin responder (sin timeout)`)), 3000); }),
+          ]).finally(() => clearTimeout(watchdog));
+          assert(sawSignal, `${row.id}: fetch sin signal`);
+          assert(Date.now() - t0 < 2000, `${row.id}: no respetó el timeout (${Date.now() - t0} ms)`);
+          eq(db.table.length, 0, `${row.id}: filas restantes`);
+        }
+      }));
     await check('M1 legacy: dos filas legacy con el MISMO path (x-upsert) → el objeto se borra igual (semántica de main, sin fuga)', async () => {
       const db = fakeArtifactsDb([legacyRow('a1'), legacyRow('a2')]);
       stubStorage(db.events);

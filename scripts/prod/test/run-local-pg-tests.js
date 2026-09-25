@@ -38,6 +38,11 @@ const STAGING_LOCAL_ROLE = 'postgres.localstagingfake01';
 const INVALIDATION_SQL = path.join(REPO, 'supabase-migration-invalidation.sql');
 const WORKFLOW = path.join(REPO, '.github/workflows/v2-production-migrations.yml');
 const DOC = path.join(REPO, 'docs/v2-production-migrations.md');
+// Copia VERBATIM de scripts/migrate-production-jobs-constraints.js de origin/main
+// (pre-V2): lo que correría deploy.yml tras un revert del código a main.
+const MAIN_CONSTRAINTS_SCRIPT = path.join(__dirname, 'fixtures/main-migrate-production-jobs-constraints.js');
+const MAIN_CONSTRAINTS_SHA256 = '8e05ff03aba60b40d76ea279bb4444ef24fc23cc9a3391d25c139c35f29a9f88';
+const CONSTRAINTS_SCRIPT = path.join(REPO, 'scripts/migrate-production-jobs-constraints.js');
 function writeTmpFile(name, content) {
   const p = path.join(TMP_CWD, name);
   fs.writeFileSync(p, content);
@@ -151,6 +156,10 @@ async function main() {
     // Release-fix C1: producción ANTES del merge (CHECK de main, sin modos dynamic).
     await makeBaselineDb('schemafirst', { constraints: false });
     await makeBaselineDb('dn6', { constraints: false });
+    await makeBaselineDb('nullmode', { constraints: false });
+    await makeBaselineDb('cmpmain', { constraints: false });
+    await makeBaselineDb('cmpcur', { constraints: false });
+    await makeBaselineDb('locktest', { constraints: false });
 
     const listener = await startCountingListener(LISTEN_PORT);
     try {
@@ -404,6 +413,64 @@ async function main() {
       const t = await withClient('dn6', (c) => c.query(`select to_regclass('public.course_modules') as t,
         (select count(*) from pg_constraint where conname = 'production_jobs_execution_mode_check')::int as ck`));
       assert(t.rows[0].t === null && t.rows[0].ck === 0, 'aplicó algo: ' + JSON.stringify(t.rows[0]));
+    });
+    await test('N2/DN-6: una fila con execution_mode NULL (el CHECK acepta NULL; la consulta manual del doc no la cuenta) NO es violación → exit 0', async () => {
+      await withClient('nullmode', (c) => c.query(`insert into production_jobs (owner_id, execution_mode, status) values ('u', null, 'queued')`));
+      const doc = fs.readFileSync(DOC, 'utf8');
+      const manual = doc.slice(doc.indexOf('select count(*) as would_violate_execution_mode'), doc.indexOf('select count(*) as would_violate_worker_status'));
+      const m = await withClient('nullmode', (c) => c.query(manual.trim().replace(/;\s*$/, '')));
+      assert(Number(m.rows[0].would_violate_execution_mode) === 0, 'la consulta manual del doc debería dar 0: ' + JSON.stringify(m.rows));
+      const res = run(RUNNER, APPLY_ARGS, overrideEnv('nullmode'));
+      assert(res.code === 0 && /APPLY \+ verificación read-only OK/.test(res.out), `exit ${res.code}\n${res.out}`);
+      assert(!/\(null\)=/.test(res.out.split('DN-6')[1] || ''), 'reportó (null) como violación');
+      const n = await withClient('nullmode', (c) => c.query(`select count(*)::int as n from production_jobs where execution_mode is null`));
+      assert(n.rows[0].n === 1, 'la fila NULL debe seguir ahí');
+    });
+    // ── N1 (re-review): revert del código a main con filas dynamic ─────────
+    await test('N1 fixture: la copia del script de main es byte-idéntica a origin/main (sha256 fijado)', async () => {
+      const h = crypto.createHash('sha256').update(fs.readFileSync(MAIN_CONSTRAINTS_SCRIPT)).digest('hex');
+      assert(h === MAIN_CONSTRAINTS_SHA256, h);
+    });
+    await test('N1 reproducido: con una fila dynamic_generation, el script de main (revert del código) falla 23514 (deploy.yml abortaría en [2/4], antes de pm2 reload) y el CHECK queda ancho', async () => {
+      const before = await defsOf('schemafirst');
+      await withClient('schemafirst', (c) => c.query(`insert into production_jobs (owner_id, execution_mode, status) values ('u', 'dynamic_generation', 'completed')`));
+      try {
+        const res = run(MAIN_CONSTRAINTS_SCRIPT, [], localEnv('schemafirst'));
+        assert(res.code === 1 && /violated by some row|check constraint/i.test(res.out), `exit ${res.code}\n${res.out}`);
+        assert(JSON.stringify(await defsOf('schemafirst')) === JSON.stringify(before), 'el CHECK cambió (el rollback de la transacción debería dejarlo ancho)');
+        const cur = run(CONSTRAINTS_SCRIPT, [], localEnv('schemafirst'));
+        assert(cur.code === 0, 'el script actual (forward-revert que conserva la lib) debe pasar: ' + cur.out);
+      } finally {
+        await withClient('schemafirst', (c) => c.query(`delete from production_jobs where execution_mode = 'dynamic_generation' and owner_id = 'u'`));
+      }
+    });
+    await test('M5/N1: el SQL de constraint del script de deploy.yml es el de main + SOLO dynamic_generation/dynamic_package (PG16, pg_get_constraintdef)', async () => {
+      const m = run(MAIN_CONSTRAINTS_SCRIPT, [], localEnv('cmpmain'));
+      const c = run(CONSTRAINTS_SCRIPT, [], localEnv('cmpcur'));
+      assert(m.code === 0 && c.code === 0, m.out + c.out);
+      const dm = await defsOf('cmpmain');
+      const dc = await defsOf('cmpcur');
+      assert(dm.length === 2 && dc.length === 2, JSON.stringify([dm, dc]));
+      const stripped = dc[0].def.replace(", 'dynamic_generation'::text, 'dynamic_package'::text", '');
+      assert(dc[0].def !== stripped && stripped === dm[0].def, `execution_mode\nmain ${dm[0].def}\ncur  ${dc[0].def}`);
+      assert(dc[1].def === dm[1].def, `worker_status\nmain ${dm[1].def}\ncur  ${dc[1].def}`);
+    });
+    await test('M5: el script de deploy.yml fija lock_timeout — con production_jobs bloqueada por otra sesión falla rápido (55P03) en vez de colgarse', async () => {
+      const holder = new Client({ host: '127.0.0.1', port: PG_PORT, user: 'postgres', database: 'locktest' });
+      await holder.connect();
+      try {
+        await holder.query('begin');
+        await holder.query('lock table public.production_jobs in access share mode');
+        const t0 = Date.now();
+        const r = spawnSync(process.execPath, [CONSTRAINTS_SCRIPT], { cwd: TMP_CWD, env: cleanEnv(localEnv('locktest')), encoding: 'utf8', timeout: 40000 });
+        const ms = Date.now() - t0;
+        const out = (r.stdout || '') + (r.stderr || '');
+        assert(r.status === 1 && /lock timeout/i.test(out), `status ${r.status} signal ${r.signal} (${ms} ms)\n${out}`);
+        assert(ms < 30000, `tardó ${ms} ms`);
+      } finally {
+        await holder.query('rollback').catch(() => {});
+        await holder.end();
+      }
     });
     await test('C1: --verify-only falla (exit 5) si el CHECK de production_jobs no acepta los modos dynamic', async () => {
       const res = run(RUNNER, ['--verify-only', '--test-allow-local-target'], overrideEnv('noconstraint', { CONFIRM_BACKUP_TAKEN: undefined }));

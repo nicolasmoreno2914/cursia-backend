@@ -114,6 +114,11 @@ select count(*) as would_violate_worker_status from public.production_jobs
 rollback;
 ```
 
+Filas con `execution_mode` **NULL** no cuentan: el CHECK `execution_mode in
+(…)` las acepta (evalúa a NULL, y PostgreSQL solo rechaza FALSE) y el `not in`
+de arriba tampoco las cuenta. El runner usa exactamente el mismo criterio
+(re-review N2).
+
 **Resultado esperado: `would_violate_execution_mode = 0` y
 `would_violate_worker_status = 0`.** Si alguno es > 0 (típicamente filas
 `brand_extraction`), **no migrar ni mergear**: resolver DN-6 primero (opción
@@ -444,10 +449,59 @@ No corre en CI (necesita Postgres); no es un `check-*.js`.
   `supabase-migration-invalidation.sql` (bloque `v2/f78-backend`).
 - Políticas de Storage: `drop policy if exists cursia_artifacts_{insert,select,delete,update}_own_folder on storage.objects;`
   (solo si se decide explícitamente; rompe los uploads del ejecutor V2).
-- Código: como el esquema va primero y es solo aditivo, revertir el merge
-  (volver a `main` pre-V2) **no** exige tocar el esquema: el código de `main`
-  funciona sobre el esquema migrado (lo verifica
-  `run-legacy-app-compat-test.js`).
+- **Código — el backout soportado es FLAG OFF, no un revert.** Ver la
+  sección siguiente.
+
+## Backout del código V2 en producción (re-review N1)
+
+**Procedimiento soportado (siempre):**
+
+1. En el `.env` de producción: `DYNAMIC_COURSE_STRUCTURE=false` (o borrar la
+   línea). Para cortar solo el gasto de video, alcanza con sacar al owner de
+   `DYNAMIC_REAL_VIDEO_OWNERS` (el worker lo re-chequea antes de cada submit
+   a Videogen, release-fix I1). Opcional: vaciar `DYNAMIC_V2_ALLOWED_OWNERS`.
+2. `pm2 restart <cada proceso> --update-env` — **todos**: API, workers legacy
+   y `dynamic-item-worker`/`dynamic-package-worker` (los workers leen el flag
+   al arrancar; uno sin reiniciar sigue reclamando items).
+3. Verificar: `GET /api/v1/features` → `dynamicCourseStructure:false`; las
+   rutas V2 devuelven 404; el legacy funciona igual (el código V2 con el flag
+   OFF es el legacy de siempre + rutas V2 escondidas).
+
+No hay que tocar el esquema: tablas y columnas V2 quedan inertes.
+
+**NO soportado: revertir el código a `main` pre-V2 (git revert del merge) una
+vez que existe cualquier fila `dynamic_generation`/`dynamic_package` en
+`production_jobs`** (es decir, apenas alguien usó V2 con el flag ON).
+Reproducido en local (PG16, `run-local-pg-tests.js`, caso "N1 reproducido"):
+el push del revert hace que `deploy.yml` corra en `[2/4]` el
+`migrate-production-jobs-constraints.js` de `main`, que reconstruye el CHECK
+de `execution_mode` **sin** `dynamic_*`; el `ADD CONSTRAINT` falla con
+**23514** (`check constraint … is violated by some row`), el script sale con
+rc 1, `set -e` aborta el deploy **antes** de `pm2 reload`. Resultado: sin
+daño de datos (la transacción revierte y el CHECK queda ancho), pero **el
+rollback no ocurre** — siguen corriendo los procesos V2 con el código nuevo
+en disco a medias (rsync ya hecho). Antes de cualquier fila dynamic el revert
+sí pasaría (lo cubre `run-legacy-app-compat-test.js`: el código de `main`
+funciona sobre el esquema migrado), pero no es el camino recomendado.
+
+Si alguna vez hace falta sacar el código V2 del VPS (no solo apagarlo), la
+única forma que no rompe `deploy.yml` es un **forward-revert** revisado que
+quite el código de la app pero **conserve** `scripts/lib/production-jobs-constraints.js`
+y el `scripts/migrate-production-jobs-constraints.js` actual (con
+`dynamic_generation`/`dynamic_package`) — o, alternativamente, borrar antes
+las filas dynamic de `production_jobs`, lo que es destrucción de datos
+(decisión D del owner, con backup). Nunca hacerlo como primera respuesta.
+
+**`lock_timeout` en `deploy.yml`** (release review Minor 5):
+`migrate-production-jobs-constraints.js` ahora hace `SET LOCAL
+lock_timeout = '5s'` y `statement_timeout = '300s'` antes de reconstruir los
+CHECK. El SQL de las constraints no cambió (probado en PG16 contra la copia
+verbatim del script de `main`, `fixtures/main-migrate-production-jobs-constraints.js`:
+`pg_get_constraintdef` idéntico salvo los dos valores dynamic). Con tráfico
+que retenga un lock sobre `production_jobs` más de 5 s, el paso `[2/4]` falla
+con 55P03 (sin efecto, rollback) y el deploy aborta antes de `pm2 reload`:
+**re-correr el deploy** (en vez de quedar encolado bloqueando a todos los
+writers, como antes).
 
 ## Decisión del owner: políticas UPDATE/DELETE de Storage (release review, Minor 3)
 

@@ -86,6 +86,12 @@ export function isDynamicArtifactRow(row: { type?: string | null; item_run_id?: 
   return String(row?.type ?? '').startsWith('dynamic_') || row?.item_run_id != null || row?.manifest_id != null;
 }
 
+/** Re-review N3: tope del DELETE HTTP a Storage en remove() (ms). */
+function storageDeleteTimeoutMs(): number {
+  const n = Number(process.env.ARTIFACT_STORAGE_DELETE_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 10_000;
+}
+
 @Injectable()
 export class ArtifactsService {
   private readonly logger = new Logger(ArtifactsService.name);
@@ -386,10 +392,14 @@ export class ArtifactsService {
    * Storage (requiere SUPABASE_SERVICE_ROLE_KEY).
    *
    * Release-fix (release review Minor 1): dos semánticas según el artifact.
-   * - LEGACY (no dynamic): la de `main` — el objeto de Storage se borra ANTES
-   *   que la fila, aunque otra fila legacy comparta el path (`x-upsert:true`);
-   *   un fallo de Storage se loguea y la fila se borra igual. Única excepción:
-   *   si una fila DYNAMIC usa el mismo path, el objeto se conserva.
+   * - LEGACY (no dynamic): mismo resultado observable que `main` — la fila se
+   *   borra y el objeto de Storage también, aunque otra fila legacy comparta
+   *   el path (`x-upsert:true`); un fallo de Storage se loguea y nunca impide
+   *   borrar la fila. Única excepción: si una fila DYNAMIC usa el mismo path,
+   *   el objeto se conserva. (Re-review N3: el DELETE HTTP a Storage corre
+   *   DESPUÉS del commit, nunca con la transacción/locks abiertos.)
+   * En ambos casos el DELETE a Storage tiene un timeout acotado
+   * (ARTIFACT_STORAGE_DELETE_TIMEOUT_MS, default 10000 ms).
    * - DYNAMIC (`type` dynamic_* o vinculado a item_run_id/manifest_id): Fase 8
    *   — una fila "carried" (REUSE) apunta a la MISMA storage_path inmutable
    *   que la fila histórica de la que salió; borrar una fila nunca debe borrar
@@ -404,7 +414,7 @@ export class ArtifactsService {
     const qr = this.artifactRepo.manager.connection.createQueryRunner();
     let row: any;
     let sharers: any[] = [];
-    let dynamic = false;
+    let deleteObject = false;
     await qr.connect();
     try {
       await qr.startTransaction();
@@ -414,15 +424,12 @@ export class ArtifactsService {
         `select * from public.artifacts where storage_bucket = $1 and storage_path = $2 and id <> $3 for update`,
         [row.storage_bucket, row.storage_path, row.id],
       );
-      dynamic = isDynamicArtifactRow(row);
-      if (!dynamic) {
-        // Orden legacy (main): Storage primero, después la fila.
-        const dynamicSharers = sharers.filter(isDynamicArtifactRow).length;
-        if (dynamicSharers > 0) {
-          this.logger.log(`remove(${row.id}): ${dynamicSharers} fila(s) dynamic usan ${row.storage_path}; se conserva el objeto de Storage`);
-        } else {
-          await this.deleteStorageObject(row);
-        }
+      // Qué filas impiden borrar el objeto: para una fila dynamic, cualquier
+      // otra; para una legacy, solo las dynamic (entre legacy, semántica de main).
+      const blocking = isDynamicArtifactRow(row) ? sharers : sharers.filter(isDynamicArtifactRow);
+      deleteObject = blocking.length === 0;
+      if (!deleteObject) {
+        this.logger.log(`remove(${row.id}): ${blocking.length} fila(s) más usan ${row.storage_path}; se conserva el objeto de Storage`);
       }
       await qr.query(`delete from public.artifacts where id = $1`, [row.id]);
       await qr.commitTransaction();
@@ -432,13 +439,7 @@ export class ArtifactsService {
     } finally {
       await qr.release();
     }
-    if (!dynamic) return;
-
-    if (sharers.length > 0) {
-      this.logger.log(`remove(${row.id}): ${sharers.length} fila(s) más usan ${row.storage_path}; se conserva el objeto de Storage`);
-      return;
-    }
-    await this.deleteStorageObject(row);
+    if (deleteObject) await this.deleteStorageObject(row);
   }
 
   /** Borra el objeto de Storage de una fila (best effort: los fallos se loguean, nunca se propagan). */
@@ -451,6 +452,7 @@ export class ArtifactsService {
       const res = await fetch(deleteUrl, {
         method: 'DELETE',
         headers: supabaseServiceHeaders(serviceKey),
+        signal: AbortSignal.timeout(storageDeleteTimeoutMs()),
       });
       if (!res.ok) {
         this.logger.warn(`Storage delete failed for ${row.storage_path}: ${res.status}`);
