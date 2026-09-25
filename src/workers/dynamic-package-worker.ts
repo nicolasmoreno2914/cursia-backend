@@ -3,7 +3,7 @@ import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DataSource } from 'typeorm';
 import { AppModule } from '../app.module';
-import { holdIdleIfDynamicDisabled } from './dynamic-worker-gate';
+import { MissingSchemaBackoff, holdIdleIfDynamicDisabled } from './dynamic-worker-gate';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import { GenerationManifestsService, ManifestDto } from '../modules/generation-manifests/generation-manifests.service';
 import { CourseBlueprintsService } from '../modules/course-blueprints/course-blueprints.service';
@@ -471,6 +471,8 @@ export interface PackageWorkerLoopOptions {
   isStopping: () => boolean;
   /** Set de jobs activos (compartido con el handler de shutdown). */
   activeJobs?: Set<Promise<void>>;
+  /** M5: estado "esquema V2 ausente" (tests pueden inyectar uno con otro intervalo). */
+  schemaBackoff?: MissingSchemaBackoff;
 }
 
 /**
@@ -483,6 +485,8 @@ export async function runPackageWorkerLoop(deps: DynamicPackageWorkerDeps, opts:
   const { logger } = deps;
   const active = opts.activeJobs ?? new Set<Promise<void>>();
   const backoffMs = opts.claimErrorBackoffMs ?? Math.max(opts.pollMs, 1000);
+  // M5: esquema V2 ausente (42P01) → un error claro y re-chequeo lento, no un error cada poll.
+  const schema = opts.schemaBackoff ?? new MissingSchemaBackoff(logger, 'dynamic-package-worker');
   while (!opts.isStopping()) {
     let waitMs = opts.pollMs;
     while (!opts.isStopping() && active.size < opts.concurrency) {
@@ -490,10 +494,16 @@ export async function runPackageWorkerLoop(deps: DynamicPackageWorkerDeps, opts:
       try {
         job = await claimNext(deps.dataSource, deps.workerId, deps.leaseSeconds, logger);
       } catch (err) {
+        const schemaWait = schema.onClaimError(err);
+        if (schemaWait !== null) {
+          waitMs = schemaWait;
+          break;
+        }
         logger.error(`claimNext falló (reintento en ${backoffMs}ms): ${errMessage(err)}`);
         waitMs = backoffMs;
         break;
       }
+      schema.onClaimOk();
       if (!job) break;
       logger.log(`Job reclamado: ${job.id} (run ${job.input_payload?.runId})`);
       const claimed = job;

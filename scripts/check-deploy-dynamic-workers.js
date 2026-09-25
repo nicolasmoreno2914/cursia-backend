@@ -54,6 +54,7 @@ const WORKERS = [
 ];
 const PROD_ADDED_LINES = WORKERS.map((w) => `               ensure_pm2_process ${w.pm2} ${w.npm}`);
 const OWNER = 'aa2fa9a1-afb1-4b01-8646-94a0cb272b57';
+const IPV4_RE = /\b(?!127\.0\.0\.1\b)(?:\d{1,3}\.){3}\d{1,3}\b/g;
 
 let passes = 0;
 let failures = 0;
@@ -210,8 +211,17 @@ function tagOf(sql) {
   return w || 'EMPTY';
 }
 
-async function startFakePg() {
-  const state = { connections: 0, queries: [] };
+/** ErrorResponse de Postgres (42P01 = undefined_table). */
+function errorResponse(code, message) {
+  return msg('E', Buffer.concat([
+    Buffer.from('S'), cstr('ERROR'), Buffer.from('V'), cstr('ERROR'),
+    Buffer.from('C'), cstr(code), Buffer.from('M'), cstr(message), Buffer.from([0]),
+  ]));
+}
+
+/** `failRelation(sql)` → nombre de relación a reportar como inexistente (42P01), o null. */
+async function startFakePg({ failRelation } = {}) {
+  const state = { connections: 0, queries: [], failed: 0 };
   const sockets = new Set();
   const server = net.createServer((sock) => {
     state.connections++;
@@ -220,6 +230,7 @@ async function startFakePg() {
     let buf = Buffer.alloc(0);
     let started = false;
     let lastParsed = '';
+    let inError = false;
     const results = (sql) => {
       const syn = syntheticRows(sql);
       if (!syn) return [msg('C', cstr(tagOf(sql)))];
@@ -254,6 +265,12 @@ async function startFakePg() {
         if (type === 'Q') {
           const sql = body.toString('utf8').replace(/\0$/, '');
           state.queries.push(sql);
+          const rel = failRelation && failRelation(sql);
+          if (rel) {
+            state.failed++;
+            sock.write(Buffer.concat([errorResponse('42P01', `relation "${rel}" does not exist`), msg('Z', Buffer.from('I'))]));
+            continue;
+          }
           const syn = syntheticRows(sql);
           const out = syn ? [rowDescription(syn.cols)] : [];
           sock.write(Buffer.concat([...out, ...results(sql), msg('Z', Buffer.from('I'))]));
@@ -262,7 +279,17 @@ async function startFakePg() {
           const qEnd = body.indexOf(0, nameEnd + 1);
           lastParsed = body.subarray(nameEnd + 1, qEnd).toString('utf8');
           state.queries.push(lastParsed);
+          const rel = failRelation && failRelation(lastParsed);
+          if (rel) {
+            // Como Postgres real: error en Parse y se descarta todo hasta Sync.
+            state.failed++;
+            inError = true;
+            sock.write(errorResponse('42P01', `relation "${rel}" does not exist`));
+            continue;
+          }
           sock.write(msg('1', Buffer.alloc(0)));
+        } else if (inError && type !== 'S' && type !== 'X') {
+          continue;
         } else if (type === 'B') {
           sock.write(msg('2', Buffer.alloc(0)));
         } else if (type === 'D') {
@@ -271,6 +298,7 @@ async function startFakePg() {
         } else if (type === 'E') {
           sock.write(Buffer.concat(results(lastParsed)));
         } else if (type === 'S') {
+          inError = false;
           sock.write(msg('Z', Buffer.from('I')));
         } else if (type === 'C') {
           sock.write(msg('3', Buffer.alloc(0)));
@@ -290,8 +318,8 @@ async function startFakePg() {
   };
 }
 
-async function runWorker(script, env, { waitMs, until } = {}) {
-  const pg = await startFakePg();
+async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
+  const pg = await startFakePg({ failRelation });
   const childEnv = {
     ...process.env,
     ...env,
@@ -319,7 +347,7 @@ async function runWorker(script, env, { waitMs, until } = {}) {
   }
   if (!until) await sleep(Math.max(0, deadline - Date.now()));
   const aliveAfterWait = exited === null;
-  const snapshot = { connections: pg.state.connections, queries: pg.state.queries.slice() };
+  const snapshot = { connections: pg.state.connections, queries: pg.state.queries.slice(), failed: pg.state.failed };
   let termExit = exited;
   if (aliveAfterWait) {
     child.kill('SIGTERM');
@@ -350,7 +378,9 @@ async function runWorker(script, env, { waitMs, until } = {}) {
   await check('(a) deploy.yml = base (origin/main) + EXACTAMENTE las 2 líneas de los workers dinámicos (ningún otro step cambió)', () => {
     const { ref, text: base } = baseDeployYml();
     const cur = prodText.split('\n');
-    const baseLines = base.split('\n');
+    // M6 (integral-review): el único otro cambio permitido es quitar IPs de los
+    // COMENTARIOS (placeholder <VPS_HOST>); el host real sale del secret VPS_HOST.
+    const baseLines = base.split('\n').map((l) => (/^\s*#/.test(l) ? l.replace(IPV4_RE, '<VPS_HOST>') : l));
     const baseHas = PROD_ADDED_LINES.every((l) => baseLines.includes(l));
     if (baseHas) {
       eq(cur.join('\n') === baseLines.join('\n'), true, `deploy.yml difiere de ${ref} (que ya incluye los workers)`);
@@ -366,6 +396,13 @@ async function runWorker(script, env, { waitMs, until } = {}) {
         `deploy.yml no es ${ref} + las 2 líneas esperadas (primera diferencia en la línea ${diffAt + 1}: ` +
           `got ${JSON.stringify(cur[diffAt])}, want ${JSON.stringify(expected[diffAt])})`,
       );
+    }
+  });
+
+  await check('(M6) deploy.yml / deploy-staging.yml sin IPs públicas versionadas (el host viene del secret VPS_HOST)', () => {
+    for (const [name, text] of [['deploy.yml', prodText], ['deploy-staging.yml', stagingText]]) {
+      const hits = text.split('\n').filter((l) => { IPV4_RE.lastIndex = 0; return IPV4_RE.test(l); });
+      eq(hits, [], `${name}: líneas con IPv4`);
     }
   });
 
@@ -454,6 +491,23 @@ async function runWorker(script, env, { waitMs, until } = {}) {
       assert(r.queries.some(w.claim), `no intentó reclamar (queries: ${JSON.stringify(r.queries.map((q) => q.slice(0, 80)))})\n${r.output.slice(-2000)}`);
       assert(r.aliveAfterWait, `el proceso terminó solo: ${JSON.stringify(r.termExit)}\n${r.output.slice(-2000)}`);
       assert(r.termExit && r.termExit.code === 0, `SIGTERM: ${JSON.stringify(r.termExit)}\n${r.output.slice(-2000)}`);
+    });
+  }
+
+  // ── M5: flag ON antes de migrar (esquema V2 ausente → 42P01) ──────────────
+  for (const w of WORKERS) {
+    await check(`(M5) ${w.script} flag ON + esquema V2 ausente (42P01 en su claim): error claro UNA vez, sin crash-loop, re-chequeo con backoff; SIGTERM → exit 0`, async () => {
+      const r = await runWorker(w.script, { DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_WORKER_SCHEMA_RECHECK_MS: '1500' }, {
+        waitMs: 20000,
+        failRelation: (q) => (w.claim(q) ? (/generation_item_runs/.test(q) ? 'public.generation_item_runs' : 'public.production_jobs') : null),
+        until: (st) => st.failed >= 3,
+      });
+      assert(r.aliveAfterWait, `el proceso terminó solo (crash-loop en PM2): ${JSON.stringify(r.termExit)}\n${r.output.slice(-2500)}`);
+      assert(r.failed >= 3, `no re-chequeó con backoff (claims fallidos: ${r.failed})\n${r.output.slice(-2000)}`);
+      const logged = (r.output.match(/esquema V2 ausente/g) || []).length;
+      eq(logged, 1, 'el error de esquema ausente se loguea UNA vez');
+      assert(/42P01/.test(r.output) && /migraciones/.test(r.output), `el error no es claro:\n${r.output.slice(-2000)}`);
+      assert(r.termExit && r.termExit.code === 0, `SIGTERM: ${JSON.stringify(r.termExit)}`);
     });
   }
 
