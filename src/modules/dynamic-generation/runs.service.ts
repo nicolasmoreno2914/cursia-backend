@@ -14,6 +14,7 @@ import type { ManifestItemType } from '../generation-manifests/generation-manife
 import { CostRatesService } from '../../admin/services/cost-rates.service';
 import { CourseContextDto, RUN_VIDEO_MODES, RunVideoMode } from './dto/course-context.dto';
 import { REQUIRED_CONTEXT_FIELDS, canonicalContextHash, itemIdempotencyKey, normalizeCourseContext } from './run-hash';
+import { VideoDeliveryStrategy, frozenVideoDeliveryOf, readVideoDeliveryConfig } from './dynamic-video-delivery';
 import {
   ACTIVE_RUN_WORKER_STATUSES,
   isActiveRun,
@@ -91,6 +92,12 @@ export interface RunDto {
   workerStatus: string;
   /** R17: fijado al crear el run, nunca se actualiza (ni al reabrir). */
   videoMode: RunVideoMode;
+  /**
+   * 5B.2.A: estrategia de entrega final del video, congelada al crear el
+   * run desde DYNAMIC_VIDEO_DELIVERY; runs anteriores sin el campo →
+   * 'videogen_direct'. Nunca cambia (ni al reabrir).
+   */
+  videoDelivery: VideoDeliveryStrategy;
   courseContextSha256: string;
   courseContext: Record<string, any>;
   createdAt: string;
@@ -142,7 +149,7 @@ export interface StartRunResult {
  * Modelo (spec §3.2–§3.5, §7):
  * - 1 run = 1 fila de `production_jobs` con execution_mode
  *   'dynamic_generation'. `input_payload = {manifestId, blueprintNumber,
- *   contextHash}` (manifestId SIEMPRE, como número — el índice único parcial
+ *   contextHash, videoMode, videoDelivery}` (manifestId SIEMPRE, como número — el índice único parcial
  *   uq_dynamic_generation_active_run solo protege filas con manifestId). El
  *   run nunca usa `lease_until`/`worker_id` (quedan NULL: el reaper legacy
  *   solo mira `lease_until IS NOT NULL`) ni `worker_status='waiting_child'`.
@@ -170,7 +177,11 @@ export class RunsService {
     private readonly dataSource: DataSource,
     private readonly manifests: GenerationManifestsService,
     private readonly costRates: CostRatesService,
-  ) {}
+  ) {
+    // 5B.2.A: fail-fast al arrancar — un DYNAMIC_VIDEO_DELIVERY desconocido
+    // aborta el boot en vez de caer en silencio a otra estrategia.
+    readVideoDeliveryConfig();
+  }
 
   /**
    * Get-or-create (y reapertura) del run de un Manifest.
@@ -201,7 +212,11 @@ export class RunsService {
     this.assertRequiredContext(context);
     const contextHash = canonicalContextHash(context);
     const videoMode = this.normalizeVideoMode((courseContext as any)?.videoMode);
-    return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, true);
+    // 5B.2.A: la estrategia de entrega se lee (y valida, fail-fast) en cada
+    // uso y se congela SOLO en runs nuevos; un run existente/reabierto
+    // conserva la suya aunque la config haya cambiado.
+    const videoDelivery = readVideoDeliveryConfig();
+    return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, true, videoDelivery);
   }
 
   /**
@@ -218,6 +233,7 @@ export class RunsService {
     contextHash: string,
     videoMode: RunVideoMode,
     mayRetry: boolean,
+    videoDelivery: VideoDeliveryStrategy,
   ): Promise<StartRunResult> {
     const active = await this.findActiveRunRow(manifest.id);
     if (active) return this.existingRunOrConflict(active, manifest, contextHash, videoMode);
@@ -253,7 +269,7 @@ export class RunsService {
     // casi siempre la carrera "otro POST commiteó entre nuestras lecturas":
     // si ahora hay un run visible, se re-resuelve contra él (una vez).
     if (mayRetry && (await this.hasPreviousItems(manifest)) && (await this.findLatestRunRow(manifest.id))) {
-      return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, false);
+      return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, false, videoDelivery);
     }
     await this.assertNoPreviousItems(manifest);
 
@@ -266,7 +282,7 @@ export class RunsService {
     let jobId: string;
     try {
       jobId = await this.tx((qr) =>
-        this.insertRun(qr, manifest, ownerId, courseId, frontendCourseId, blueprintNumber, context, contextHash, videoMode),
+        this.insertRun(qr, manifest, ownerId, courseId, frontendCourseId, blueprintNumber, context, contextHash, videoMode, videoDelivery),
       );
     } catch (err) {
       if (isActiveRunConflict(err)) {
@@ -560,8 +576,9 @@ export class RunsService {
     context: Record<string, any>,
     contextHash: string,
     videoMode: RunVideoMode,
+    videoDelivery: VideoDeliveryStrategy,
   ): Promise<string> {
-    const inputPayload = { manifestId: manifest.id, blueprintNumber, contextHash, videoMode };
+    const inputPayload = { manifestId: manifest.id, blueprintNumber, contextHash, videoMode, videoDelivery };
     const [job] = await qr.query(
       `insert into public.production_jobs
          (owner_id, course_id, frontend_course_id, execution_mode, status, worker_status, current_step,
@@ -1010,6 +1027,7 @@ export class RunsService {
       status: job.status,
       workerStatus: job.worker_status,
       videoMode: this.videoModeOf(job),
+      videoDelivery: frozenVideoDeliveryOf(job.input_payload),
       courseContextSha256: ctx.context_hash,
       courseContext: ctx.context,
       createdAt: toIso(job.created_at),
