@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { Client } = require('pg');
+const v2Target = require('./lib/v2-production-target');
 
 function loadEnvFile(envPath) {
   if (!fs.existsSync(envPath)) return;
@@ -144,8 +145,16 @@ function validManifestJson({ courseId, blueprintId, blueprintSha256, moduleId, c
 
 async function main() {
   loadEnvFile(path.resolve(process.cwd(), '.env'));
-  assertExplicitStagingIntent();
-  assertNotProductionProject();
+  // Fase 9 (G6): modo opt-in V2_VERIFY_MODE=production-readonly (lo usa
+  // scripts/prod/migrate-v2-production.js). Sin esa env var, los guards de
+  // staging de siempre, sin ningún cambio de comportamiento.
+  const PROD_RO = v2Target.isProductionReadonlyRequested()
+    ? v2Target.assertProductionReadonlyTargetOrExit()
+    : null;
+  if (!PROD_RO) {
+    assertExplicitStagingIntent();
+    assertNotProductionProject();
+  }
 
   const client = new Client({
     host: process.env.DB_HOST || '127.0.0.1',
@@ -159,6 +168,14 @@ async function main() {
   });
 
   await client.connect();
+  if (PROD_RO) {
+    try {
+      await v2Target.enterProductionReadonlySession(client, PROD_RO);
+    } catch (err) {
+      await client.end();
+      throw err;
+    }
+  }
   const failures = [];
 
   try {
@@ -269,6 +286,12 @@ async function main() {
     // 4. Comportamiento real, en una transacción SIEMPRE revertida (finally →
     // rollback). Se usan SAVEPOINTs para que un error esperado no aborte el
     // resto de los checks. Nunca se asume que haya datos preexistentes.
+    // Fase 9 (G6): en production-readonly esta sonda NO corre (escribe dentro
+    // de una transacción revertida y la sesión es READ ONLY). Cuerpo sin
+    // reindentar a propósito para mantener el diff mínimo.
+    if (PROD_RO) {
+      v2Target.logSkippedProbe('4. comportamiento real de generation_item_runs/contexts/artifacts (inserts en transacción revertida)');
+    } else {
     await client.query('begin');
     try {
       const course = await client.query(
@@ -735,6 +758,7 @@ async function main() {
     } finally {
       await client.query('rollback'); // nunca deja basura, sea cual sea el resultado
     }
+    } // fin if (PROD_RO) — sonda con escritura revertida
 
     if (failures.length > 0) {
       console.error('❌ Verificación de esquema FALLÓ:');
