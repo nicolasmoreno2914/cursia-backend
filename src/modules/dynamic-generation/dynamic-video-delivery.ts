@@ -265,8 +265,34 @@ export const ALLOW_VIDEOGEN_DIRECT_ENV = 'DYNAMIC_ALLOW_VIDEOGEN_DIRECT';
 export const VIDEO_DELIVERY_NOT_YOUTUBE = 'video_delivery_not_youtube';
 export const YOUTUBE_PREFLIGHT_FAILED = 'youtube_preflight_failed';
 
+/** Ref del proyecto Supabase de PRODUCCIÓN: con él, el escape de staging se ignora siempre. */
+export const PRODUCTION_SUPABASE_REF = 'hriwbakbuypaiovvvkqh';
+let prodEscapeWarned = false;
+
+/** ¿El proceso apunta a producción? (SUPABASE_URL, DB_HOST o DB_USER con el ref de producción). */
+export function pointsToProduction(env: NodeJS.ProcessEnv = process.env): boolean {
+  return ['SUPABASE_URL', 'DB_HOST', 'DB_USER'].some((k) => String(env[k] ?? '').toLowerCase().includes(PRODUCTION_SUPABASE_REF));
+}
+
+/**
+ * Escape de staging. Fail closed en producción (review DN-1 M2): si el proceso
+ * apunta al ref de producción, `DYNAMIC_ALLOW_VIDEOGEN_DIRECT=true` se IGNORA y
+ * se loguea un error una sola vez por proceso.
+ */
 export function isVideogenDirectAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env[ALLOW_VIDEOGEN_DIRECT_ENV] === 'true';
+  if (env[ALLOW_VIDEOGEN_DIRECT_ENV] !== 'true') return false;
+  if (pointsToProduction(env)) {
+    if (!prodEscapeWarned) {
+      prodEscapeWarned = true;
+      // eslint-disable-next-line no-console
+      console.error(
+        `[DN-1] ${ALLOW_VIDEOGEN_DIRECT_ENV}=true IGNORADO: el proceso apunta a producción (${PRODUCTION_SUPABASE_REF}). ` +
+          'La entrega directa de Videogen es solo para staging; los videos reales van a YouTube.',
+      );
+    }
+    return false;
+  }
+  return true;
 }
 
 /** ¿El run (o la porción que se va a (re)generar) necesita YouTube? ≥1 video y video real (con gasto). */
@@ -423,6 +449,7 @@ export function youtubePreflightFailedMessage(reason: YoutubePreflightReason | s
 export const VIDEO_DELIVERY_VIEW_STATES = [
   'pending',
   'rendering',
+  'blocked_preflight',
   'completed_local',
   'uploading_youtube',
   'completed',
@@ -433,7 +460,7 @@ export const VIDEO_DELIVERY_VIEW_STATES = [
 ] as const;
 export type VideoDeliveryViewState = (typeof VIDEO_DELIVERY_VIEW_STATES)[number];
 
-export type VideoDeliveryAction = 'reconnect_youtube' | 'retry_upload' | 'resolve_ambiguous' | 'retry';
+export type VideoDeliveryAction = 'reconnect_youtube' | 'retry_upload' | 'retry_generation' | 'resolve_ambiguous' | 'retry';
 
 export interface VideoDeliveryView {
   state: VideoDeliveryViewState;
@@ -444,6 +471,14 @@ export interface VideoDeliveryView {
   detail: string | null;
   /** Acciones que la UI puede ofrecer en este estado. */
   actions: VideoDeliveryAction[];
+  /**
+   * Costo de la acción de reintento que se ofrece: `videogen` = reintentar
+   * GENERA el video (envío nuevo a Videogen, gasto); `none` = solo re-sube a
+   * YouTube (el MP4 ya existe); null = no hay reintento en este estado.
+   */
+  costKind: 'videogen' | 'none' | null;
+  /** Próximo reintento automático (ISO) si el item está esperando (p.ej. cuota); si no, null. */
+  nextRetryAt: string | null;
 }
 
 /**
@@ -457,6 +492,8 @@ export function deliveryViewOf(opts: {
   itemStatus: string;
   error: string | null | undefined;
   outputSummary: Record<string, any> | null | undefined;
+  /** `generation_item_runs.next_retry_at` (ISO/Date) — solo se expone si el item está en `retrying`. */
+  nextRetryAt?: string | Date | null;
 }): VideoDeliveryView {
   const os = opts.outputSummary ?? {};
   const ext = (os.external ?? {}) as Record<string, any>;
@@ -464,12 +501,18 @@ export function deliveryViewOf(opts: {
   const youtubeUrl: string | null = (typeof os.youtubeUrl === 'string' && os.youtubeUrl) || ext.youtubeUrl || null;
   const err = String(opts.error ?? '');
   const failed = opts.itemStatus === 'failed';
+  const nra = opts.itemStatus === 'retrying' && opts.nextRetryAt ? new Date(opts.nextRetryAt as any) : null;
+  const nextRetryAt = nra && !Number.isNaN(nra.getTime()) ? nra.toISOString() : null;
   const base = { strategy: opts.strategy, youtubeVideoId, youtubeUrl };
+  const costOf = (actions: VideoDeliveryAction[]): VideoDeliveryView['costKind'] =>
+    actions.includes('retry_generation') || actions.includes('retry') ? 'videogen' : actions.includes('retry_upload') ? 'none' : null;
   const view = (state: VideoDeliveryViewState, detail: string | null, actions: VideoDeliveryAction[]): VideoDeliveryView => ({
     state,
     ...base,
     detail,
     actions,
+    costKind: costOf(actions),
+    nextRetryAt,
   });
 
   if (opts.strategy === 'videogen_direct') {
@@ -501,7 +544,8 @@ export function deliveryViewOf(opts: {
     return view('completed_local', failed ? err || null : null, failed ? ['retry_upload'] : []);
   }
   // pending (antes o durante el render)
-  if (failed && err.startsWith(YOUTUBE_PREFLIGHT_FAILED)) return view('blocked_auth', err, ['reconnect_youtube', 'retry']);
+  // I1: bloqueado ANTES del envío a Videogen (nada generado todavía): reintentar = GENERAR (gasto).
+  if (failed && err.startsWith(YOUTUBE_PREFLIGHT_FAILED)) return view('blocked_preflight', err, ['reconnect_youtube', 'retry_generation']);
   if (ext.videogenJobId && !failed) return view('rendering', null, []);
   if (state === 'unknown') return view('pending', `output_summary.delivery desconocido: ${JSON.stringify(os.delivery)}`, []);
   return view('pending', failed ? err || null : null, failed ? ['retry'] : []);

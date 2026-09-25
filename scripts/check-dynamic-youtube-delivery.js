@@ -216,6 +216,17 @@ async function main() {
       });
     }));
 
+  await check('M2 DYNAMIC_ALLOW_VIDEOGEN_DIRECT se IGNORA (fail closed) con el ref de producción en SUPABASE_URL o DB_USER/DB_HOST', () => {
+    const PROD = 'hriwbakbuypaiovvvkqh';
+    eq(D.isVideogenDirectAllowed({ DYNAMIC_ALLOW_VIDEOGEN_DIRECT: 'true', SUPABASE_URL: 'https://ljdtmkwuhkvtmlhugjrv.supabase.co' }), true, 'staging');
+    for (const env of [
+      { SUPABASE_URL: `https://${PROD}.supabase.co` },
+      { DB_USER: `postgres.${PROD}` },
+      { DB_HOST: `db.${PROD}.supabase.co` },
+    ]) eq(D.isVideogenDirectAllowed({ DYNAMIC_ALLOW_VIDEOGEN_DIRECT: 'true', ...env }), false, JSON.stringify(env));
+    eq(D.resolveRunVideoDelivery({ videoCount: 1, videoMode: 'real', configured: 'videogen_direct', env: { DYNAMIC_VIDEO_DELIVERY: 'videogen_direct', DYNAMIC_ALLOW_VIDEOGEN_DIRECT: 'true', SUPABASE_URL: `https://${PROD}.supabase.co` } }).ok, false, 'gate en producción');
+  });
+
   // ── F. Preflight (DI) ─────────────────────────────────────────────────────
   const fdeps = (c, { tokenOk = true, channel = { id: 'UCx', title: 'T', thumbnail: null } } = {}) => ({
     getConnection: async () => c,
@@ -388,13 +399,24 @@ async function main() {
     eq(v('retrying', { delivery: 'upload_failed' }), 'upload_failed', 'upload_failed');
     eq(v('failed', { delivery: 'ambiguous', youtubeUploadStartedAt: 'x' }, 'ambiguous_youtube_upload: y'), 'ambiguous', 'ambiguous');
     eq(v('failed', { delivery: 'uploading_youtube', youtubeUploadStartedAt: 'x' }, 'ambiguous_youtube_upload: legacy 5B.2.A'), 'ambiguous', 'ambiguous (fila 5B.2.A)');
-    eq(v('failed', {}, 'youtube_preflight_failed:no_connection: x'), 'blocked_auth', 'bloqueado antes del envío');
+    // I1: bloqueado ANTES del envío a Videogen → blocked_preflight (reintentar = generar = gasto), no blocked_auth.
+    eq(v('failed', {}, 'youtube_preflight_failed:no_connection: x'), 'blocked_preflight', 'bloqueado antes del envío');
+    const bp = D.deliveryViewOf({ strategy: 'youtube', itemStatus: 'failed', error: 'youtube_preflight_failed:reauth_required: x', outputSummary: {} });
+    eq([bp.actions, bp.costKind], [['reconnect_youtube', 'retry_generation'], 'videogen'], 'I1 blocked_preflight: acciones reconectar + reintentar generación, costo videogen');
+    const ba = D.deliveryViewOf({ strategy: 'youtube', itemStatus: 'failed', error: 'youtube_blocked_auth: x', outputSummary: { delivery: 'blocked_auth', external: { videogenJobId: 'j' } } });
+    eq([ba.state, ba.actions, ba.costKind], ['blocked_auth', ['reconnect_youtube', 'retry_upload'], 'none'], 'I1 blocked_auth (después de completed_local): reintentar subida sin costo');
+    // I2: nextRetryAt veraz en la vista.
+    const q1 = D.deliveryViewOf({ strategy: 'youtube', itemStatus: 'retrying', error: 'youtube_blocked_quota: x', outputSummary: { delivery: 'blocked_quota' }, nextRetryAt: '2026-09-26T10:00:00.000Z' });
+    eq([q1.state, q1.nextRetryAt, q1.actions], ['blocked_quota', '2026-09-26T10:00:00.000Z', []], 'I2 blocked_quota esperando: nextRetryAt expuesto, sin acción');
+    const q2 = D.deliveryViewOf({ strategy: 'youtube', itemStatus: 'failed', error: 'youtube_upload_failed: cuota', outputSummary: { delivery: 'upload_failed' }, nextRetryAt: null });
+    eq([q2.state, q2.nextRetryAt, q2.actions, q2.costKind], ['upload_failed', null, ['retry_upload'], 'none'], 'I2 cuota agotada 24 h → upload_failed con retry_upload manual');
+    eq(D.deliveryViewOf({ strategy: 'youtube', itemStatus: 'pending', error: null, outputSummary: {} }).nextRetryAt, null, 'nextRetryAt null por defecto');
     const amb = D.deliveryViewOf({ strategy: 'youtube', itemStatus: 'failed', error: 'ambiguous_youtube_upload: y', outputSummary: { delivery: 'ambiguous' } });
     eq(amb.actions, ['resolve_ambiguous'], 'acción ambigua');
     const auth = D.deliveryViewOf({ strategy: 'youtube', itemStatus: 'failed', error: 'e', outputSummary: { delivery: 'blocked_auth', youtubeBlockDetail: 'reconectá' } });
     eq([auth.detail, auth.actions], ['reconectá', ['reconnect_youtube', 'retry_upload']], 'detalle/acciones auth');
     for (const s of D.VIDEO_DELIVERY_VIEW_STATES) assert(typeof s === 'string', 'estado');
-    eq(D.VIDEO_DELIVERY_VIEW_STATES, ['pending', 'rendering', 'completed_local', 'uploading_youtube', 'completed', 'blocked_auth', 'blocked_quota', 'upload_failed', 'ambiguous'], 'contrato de estados');
+    eq(D.VIDEO_DELIVERY_VIEW_STATES, ['pending', 'rendering', 'blocked_preflight', 'completed_local', 'uploading_youtube', 'completed', 'blocked_auth', 'blocked_quota', 'upload_failed', 'ambiguous'], 'contrato de estados');
   });
 
   await check('V youtubeDeliveryProblems: completed + id + URL válida del mismo id + delivery completed; si no → keys', () => {
@@ -490,8 +512,13 @@ function makeWorld({ videoDelivery = 'youtube', videoMode = 'real' } = {}) {
       getConnection: async () => { calls.getConnection++; return yt.connection; },
       getAccessToken: async () => { calls.getAccessToken++; if (!yt.tokenOk) throw new Error(RAW_GOOGLE_ERROR); return SECRET_TOKEN_MARKER; },
       uploadFromUrl: async (c, opts) => {
+        // Mismo orden que YoutubeUploadService: descarga del MP4 → onBeforeUpload (marcador) → YouTube.
         calls.uploads.push(opts);
         const p = yt.uploadPlan.shift() || 'ok';
+        if (yt.onDownload) await yt.onDownload(opts);
+        if (p instanceof BadRequestException || (p && p.beforeYoutube)) throw p;
+        if (typeof opts.onBeforeUpload === 'function') await opts.onBeforeUpload();
+        calls.hookCalls = (calls.hookCalls || 0) + 1;
         if (p !== 'ok') throw p;
         seq++;
         const videoId = `YtW${String(seq).padStart(8, '0')}`;
@@ -518,6 +545,65 @@ function assertCompleted(w, n, msg) {
 }
 
 async function runWorkerChecks() {
+  await check('I2 cuota: la espera NO consume max_attempts (refundAttempt) y usa su propio backoff; se guarda el inicio de la espera', () =>
+    withEnv(ENV, async () => {
+      const w = makeWorld();
+      w.yt.uploadPlan = [new YoutubeQuotaException()];
+      await worker.processItem(w.deps, makeItem(60));
+      const f = w.calls.failItem[0];
+      assert(f && f.retryable === true && f.opts && f.opts.refundAttempt === true && f.opts.retryAfterSeconds === 7200, 'failItem: ' + JSON.stringify(f));
+      assert(typeof w.store.get('ir-60').youtubeQuotaSince === 'string', 'youtubeQuotaSince guardado');
+      eq(w.store.get('ir-60').youtubeQuotaWaits, 1, 'contador propio de esperas');
+      // segunda espera: conserva el inicio, suma el contador
+      const since = w.store.get('ir-60').youtubeQuotaSince;
+      w.yt.uploadPlan = [new YoutubeQuotaException()];
+      await w.reclaim(60);
+      eq([w.store.get('ir-60').youtubeQuotaSince, w.store.get('ir-60').youtubeQuotaWaits], [since, 2], 'segunda espera');
+      eq(w.calls.batchCreate, 1, 'sin re-envío');
+    }));
+
+  await check('I2 cuota agotada durante 24 h → upload_failed (no reintentable, retry_upload manual) y el contador se reinicia', () =>
+    withEnv(ENV, async () => {
+      const w = makeWorld();
+      w.yt.uploadPlan = [new YoutubeQuotaException()];
+      await worker.processItem(w.deps, makeItem(61));
+      w.store.set('ir-61', { ...w.store.get('ir-61'), youtubeQuotaSince: new Date(Date.now() - 25 * 3600 * 1000).toISOString() });
+      w.yt.uploadPlan = [new YoutubeQuotaException()];
+      await w.reclaim(61);
+      const f = w.calls.failItem[w.calls.failItem.length - 1];
+      const os = w.store.get('ir-61');
+      assert(f.retryable === false && f.error.startsWith('youtube_upload_failed: ') && /24 h/.test(f.error), 'failItem: ' + JSON.stringify(f));
+      assert(os.delivery === 'upload_failed' && os.youtubeQuotaSince === null && !os.youtubeUploadStartedAt, 'estado: ' + JSON.stringify(os));
+      eq(D.deliveryViewOf({ strategy: 'youtube', itemStatus: 'failed', error: f.error, outputSummary: os }).actions, ['retry_upload'], 'acción manual');
+      w.yt.uploadPlan = [];
+      await w.reclaim(61);
+      assertCompleted(w, 61, 'retry manual tras 24 h');
+      eq(w.calls.batchCreate, 1, 'sin re-envío a Videogen');
+    }));
+
+  await check('M3 el marcador de subida se escribe DESPUÉS de bajar el MP4: durante la descarga no hay youtubeUploadStartedAt', () =>
+    withEnv(ENV, async () => {
+      const w = makeWorld();
+      let seen = 'no-visto';
+      w.yt.onDownload = async () => { seen = w.store.get('ir-62').youtubeUploadStartedAt ?? null; };
+      await worker.processItem(w.deps, makeItem(62));
+      eq(seen, null, 'sin marcador durante la descarga');
+      assertCompleted(w, 62, 'completa');
+    }));
+
+  await check('M3 error antes de contactar YouTube (sin onBeforeUpload) → upload_failed reintentable, NUNCA ambiguo', () =>
+    withEnv(ENV, async () => {
+      const w = makeWorld();
+      const e = new Error('ECONNRESET bajando el MP4');
+      e.beforeYoutube = true;
+      w.yt.uploadPlan = [e, e, e];
+      await worker.processItem(w.deps, makeItem(63));
+      const os = w.store.get('ir-63');
+      assert(os.delivery === 'upload_failed' && !os.youtubeUploadStartedAt, 'estado: ' + JSON.stringify(os));
+      const f = w.calls.failItem[w.calls.failItem.length - 1];
+      assert(f.retryable === true && f.error.startsWith('youtube_upload_failed: '), 'failItem: ' + JSON.stringify(f));
+    }));
+
   await check('W happy path youtube real: 1 envío a Videogen, preflight liviano antes, 1 subida Unlisted, completed con id+url', () =>
     withEnv(ENV, async () => {
       const w = makeWorld();
@@ -550,7 +636,7 @@ async function runWorkerChecks() {
         assert(f.retryable === false && f.error.startsWith(`youtube_preflight_failed:${reason}: `), 'error: ' + f.error);
         assert(!f.error.includes(SECRET_TOKEN_MARKER) && !f.error.includes('RAW-GOOGLE'), 'filtró token/error crudo');
         // Vista UI
-        eq(D.deliveryViewOf({ strategy: 'youtube', itemStatus: 'failed', error: f.error, outputSummary: w.store.get('ir-2') || {} }).state, 'blocked_auth', 'vista');
+        eq(D.deliveryViewOf({ strategy: 'youtube', itemStatus: 'failed', error: f.error, outputSummary: w.store.get('ir-2') || {} }).state, 'blocked_preflight', 'vista (I1)');
       }));
   }
 

@@ -142,6 +142,8 @@ export interface DynamicItemWorkerDeps {
   youtubeUploadRetryBaseMs?: number;
   /** DN-1: espera antes del reintento automático tras cuota agotada, en segundos. Default 3600. */
   youtubeQuotaRetrySeconds?: number;
+  /** DN-1 (review I2): tope TOTAL de espera por cuota (desde la primera), en segundos. Default 86400 (24 h). */
+  youtubeQuotaMaxWaitSeconds?: number;
 }
 
 interface RunHead {
@@ -640,7 +642,8 @@ function mockYoutubePublisher(item: ClaimedItem): DynamicYoutubePublisher {
     getConnection: async (ownerId: string) =>
       ({ userId: ownerId, status: 'active', scopes: 'youtube.upload,youtube.readonly' } as unknown as YoutubeConnection),
     getAccessToken: async () => 'mock-access-token',
-    uploadFromUrl: async () => {
+    uploadFromUrl: async (_c, options) => {
+      if (options.onBeforeUpload) await options.onBeforeUpload();
       const videoId = mockYoutubeVideoId(item.idempotencyKey);
       return { videoId, youtubeUrl: canonicalYoutubeWatchUrl(videoId) };
     },
@@ -649,6 +652,15 @@ function mockYoutubePublisher(item: ClaimedItem): DynamicYoutubePublisher {
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** Señal: la lease se perdió al escribir el marcador de subida (antes de contactar YouTube). */
+class UploadMarkerLeaseLost extends Error {}
+
+/** Error ANTES del primer contacto con YouTube: auth/cuota se respetan; el resto es un fallo de descarga (reintentable). */
+function classifyPreUploadError(err: unknown): ReturnType<typeof classifyYoutubeUploadError> {
+  const k = classifyYoutubeUploadError(err);
+  return k === 'auth' || k === 'quota' ? k : 'download';
 }
 
 /** DN-1: mensaje de bloqueo sin tokens ni texto crudo de Google (solo el tipo de fallo). */
@@ -700,6 +712,10 @@ async function blockYoutubeDelivery(
   state: 'blocked_auth' | 'blocked_quota',
   detail: string,
 ): Promise<void> {
+  if (state === 'blocked_quota') {
+    await blockYoutubeQuota(deps, item, detail);
+    return;
+  }
   const recorded = await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
     delivery: state,
     youtubeUploadStartedAt: null,
@@ -711,13 +727,58 @@ async function blockYoutubeDelivery(
     return;
   }
   deps.logger.warn(`Item ${item.itemKey}: entrega YouTube ${state}`);
-  if (state === 'blocked_quota') {
-    await deps.scheduler.failItem(item.itemRunId, deps.executorId, `youtube_blocked_quota: ${detail}`, true, undefined, {
-      retryAfterSeconds: deps.youtubeQuotaRetrySeconds ?? 3600,
+  await deps.scheduler.failItem(item.itemRunId, deps.executorId, `youtube_${state}: ${detail}`, false);
+}
+
+/**
+ * Cuota de YouTube (review DN-1 I2): la espera tiene contador y tope PROPIOS
+ * (`youtubeQuotaSince`, `youtubeQuotaWaits` en output_summary) y NO consume
+ * max_attempts del item (refundAttempt). Mientras no pasen
+ * `youtubeQuotaMaxWaitSeconds` (24 h) desde la primera espera → `retrying`
+ * con `next_retry_at` + `youtubeQuotaRetrySeconds`. Pasado el tope →
+ * `upload_failed` (failed, reintento manual `retry_upload`) y el contador se
+ * reinicia para el próximo intento manual.
+ */
+async function blockYoutubeQuota(deps: DynamicItemWorkerDeps, item: ClaimedItem, detail: string): Promise<void> {
+  const summary = await loadOutputSummary(deps.dataSource, item.itemRunId);
+  const nowIso = new Date().toISOString();
+  const since: string = typeof summary.youtubeQuotaSince === 'string' ? summary.youtubeQuotaSince : nowIso;
+  const waitedSec = Math.max(0, (Date.now() - new Date(since).getTime()) / 1000);
+  const maxWait = deps.youtubeQuotaMaxWaitSeconds ?? 86400;
+  if (waitedSec >= maxWait) {
+    const msg =
+      'YouTube siguió sin permitir subidas durante 24 h (cuota agotada). Reintentá la publicación más tarde: ' +
+      'el video ya está generado y no se vuelve a pagar.';
+    const recorded = await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
+      delivery: 'upload_failed',
+      youtubeUploadStartedAt: null,
+      youtubeUploadError: msg,
+      youtubeUploadFailedAt: nowIso,
+      youtubeQuotaSince: null,
+      youtubeQuotaWaits: 0,
     });
+    if (!recorded) return;
+    deps.logger.warn(`Item ${item.itemKey}: cuota de YouTube agotada más de ${Math.round(maxWait / 3600)} h → upload_failed (retry manual)`);
+    await deps.scheduler.failItem(item.itemRunId, deps.executorId, `youtube_upload_failed: ${msg}`, false);
     return;
   }
-  await deps.scheduler.failItem(item.itemRunId, deps.executorId, `youtube_blocked_auth: ${detail}`, false);
+  const recorded = await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
+    delivery: 'blocked_quota',
+    youtubeUploadStartedAt: null,
+    youtubeBlockedAt: nowIso,
+    youtubeBlockDetail: detail,
+    youtubeQuotaSince: since,
+    youtubeQuotaWaits: Number(summary.youtubeQuotaWaits ?? 0) + 1,
+  });
+  if (!recorded) {
+    deps.logger.warn(`Item ${item.itemKey}: lease perdida al registrar blocked_quota`);
+    return;
+  }
+  deps.logger.warn(`Item ${item.itemKey}: entrega YouTube blocked_quota (espera ${Number(summary.youtubeQuotaWaits ?? 0) + 1})`);
+  await deps.scheduler.failItem(item.itemRunId, deps.executorId, `youtube_blocked_quota: ${detail}`, true, undefined, {
+    retryAfterSeconds: deps.youtubeQuotaRetrySeconds ?? 3600,
+    refundAttempt: true,
+  });
 }
 
 /** Subida fallida SIN video creado (descarga del MP4, 5xx/red al iniciar, 5xx explícito): se reintenta SOLO la subida. */
@@ -808,13 +869,16 @@ async function publishYoutubeAndComplete(
       if (isLeaseLost()) return;
       const marked = await scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
         delivery: 'uploading_youtube',
-        youtubeUploadStartedAt: new Date().toISOString(),
         youtubeUploadAttempts: Number(summary.youtubeUploadAttempts ?? 0) + attempt,
       });
       if (!marked) {
         logger.error(`Item ${item.itemKey}: lease perdida antes de subir a YouTube — se detiene sin subir`);
         return;
       }
+      // Review DN-1 M3: el marcador de subida se escribe recién cuando el MP4 ya
+      // se bajó (onBeforeUpload, antes del primer contacto con YouTube). Un
+      // crash o error durante la descarga NO deja una subida "ambigua".
+      let contactedYoutube = false;
       try {
         result = await publisher.uploadFromUrl(light.connection, {
           downloadUrl,
@@ -822,9 +886,21 @@ async function publishYoutubeAndComplete(
           description: `Capítulo ${item.chapterNumber ?? '?'} — ${item.blueprint.course.title}`,
           privacyStatus: YOUTUBE_UPLOAD_PRIVACY,
           chapterNumber: item.chapterNumber ?? undefined,
+          onBeforeUpload: async () => {
+            const ok = await scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
+              youtubeUploadStartedAt: new Date().toISOString(),
+            });
+            if (!ok) throw new UploadMarkerLeaseLost();
+            contactedYoutube = true;
+          },
         });
       } catch (err) {
-        const kind = classifyYoutubeUploadError(err);
+        if (err instanceof UploadMarkerLeaseLost) {
+          logger.error(`Item ${item.itemKey}: lease perdida antes de contactar a YouTube — se detiene sin subir`);
+          return;
+        }
+        // Sin contacto con YouTube (descarga/validación del MP4 o error previo): nunca es ambiguo.
+        const kind = contactedYoutube ? classifyYoutubeUploadError(err) : classifyPreUploadError(err);
         logger.warn(`Item ${item.itemKey}: subida a YouTube falló (${kind}, intento ${attempt}/${maxTries})`);
         if (kind === 'quota') {
           await blockYoutubeDelivery(deps, item, 'blocked_quota', YOUTUBE_QUOTA_BLOCK_DETAIL);
@@ -989,6 +1065,7 @@ async function bootstrap() {
     youtubeUploadMaxTries: readPositiveInt('DYNAMIC_YOUTUBE_UPLOAD_MAX_TRIES', 3),
     youtubeUploadRetryBaseMs: readPositiveInt('DYNAMIC_YOUTUBE_UPLOAD_RETRY_BASE_MS', 2000),
     youtubeQuotaRetrySeconds: readPositiveInt('DYNAMIC_YOUTUBE_QUOTA_RETRY_SECONDS', 3600),
+    youtubeQuotaMaxWaitSeconds: readPositiveInt('DYNAMIC_YOUTUBE_QUOTA_MAX_WAIT_SECONDS', 86400),
   };
   const pollMs = readPositiveInt('DYNAMIC_ITEM_WORKER_POLL_MS', 5000);
   const concurrency = readPositiveInt('DYNAMIC_ITEM_WORKER_CONCURRENCY', 1);

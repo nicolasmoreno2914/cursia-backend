@@ -1207,7 +1207,7 @@ export class RunsService {
     }
     const strategy = frozenVideoDeliveryOf(job.input_payload);
     if (strategy !== 'youtube') {
-      throw new ConflictException({ message: `La ejecución ${job.id} no entrega sus videos por YouTube (videoDelivery=${strategy})`, code: 'not_youtube_run' });
+      throw new ConflictException({ message: `not_youtube_run: la ejecución ${job.id} no entrega sus videos por YouTube (videoDelivery=${strategy})`, code: 'not_youtube_run' });
     }
 
     // Estado del item ANTES de consultar a Google (sin red si no hay nada que resolver).
@@ -1224,6 +1224,9 @@ export class RunsService {
         code: 'not_ambiguous',
       });
     }
+
+    // Review DN-1 M6: un id ya asignado a OTRO item del run no se puede reutilizar (sin red).
+    if (action === 'confirm_existing') await this.assertYoutubeIdUnused(this.dataSource, job.id, itemKey, youtubeVideoId as string);
 
     // DN-1 ruling A: confirm_existing solo con un video VERIFICADO en YouTube con las
     // credenciales refrescadas del owner (existe, es de SU canal conectado, es Unlisted).
@@ -1283,9 +1286,10 @@ export class RunsService {
           code: 'not_ambiguous',
         });
       }
+      if (action === 'confirm_existing') await this.assertYoutubeIdUnused(qr, job.id, itemKey, youtubeVideoId as string);
       const os = target.output_summary ?? {};
       if (!os.external?.videogenJobId || !os.videogenDownloadUrl) {
-        throw new ConflictException({ message: `"${itemKey}" no tiene el render de Videogen registrado; no se puede resolver la subida`, code: 'not_ambiguous' });
+        throw new ConflictException({ message: `render_missing: "${itemKey}" no tiene el render de Videogen registrado; no se puede resolver la subida`, code: 'render_missing' });
       }
       const at = new Date().toISOString();
       const resolution: Record<string, any> = { action, at, by: ownerId };
@@ -1778,6 +1782,30 @@ export class RunsService {
   }
 
   // ── DN-1: gate de entrega de video ──────────────────────────────────────
+
+  /** Review DN-1 M6: 409 si `youtubeVideoId` ya está registrado en otro item (generación vigente) del run. */
+  private async assertYoutubeIdUnused(
+    q: { query: (sql: string, params?: any[]) => Promise<any> },
+    jobId: string,
+    itemKey: string,
+    youtubeVideoId: string,
+  ): Promise<void> {
+    const rows: Array<{ item_key: string }> = await q.query(
+      `select g.item_key from public.generation_item_runs g
+        where g.job_id = $1 and g.item_key <> $2 and ${latestGenerationPredicate('g')}
+          and (g.output_summary->'external'->>'youtubeVideoId' = $3 or g.output_summary->>'youtubeVideoId' = $3)`,
+      [jobId, itemKey, youtubeVideoId],
+    );
+    if (rows.length > 0) {
+      throw new ConflictException({
+        message:
+          `${YOUTUBE_VIDEO_NOT_VERIFIED}:video_already_used: ese video de YouTube ya está asignado a otro video de este curso ` +
+          `(${rows.map((r) => r.item_key).join(', ')}). No se registró nada.`,
+        code: YOUTUBE_VIDEO_NOT_VERIFIED,
+        reason: 'video_already_used',
+      });
+    }
+  }
 
   private videoCountOf(manifest: ManifestDto): number {
     return manifest.manifest.items.filter((it) => it.type === 'video').length;
@@ -2407,7 +2435,7 @@ export class RunsService {
   private toItemDto(r: any, strategy?: VideoDeliveryStrategy): ItemRunDto {
     const delivery =
       r.type === 'video' && strategy
-        ? deliveryViewOf({ strategy, itemStatus: r.status, error: r.error ?? null, outputSummary: r.output_summary ?? {} })
+        ? deliveryViewOf({ strategy, itemStatus: r.status, error: r.error ?? null, outputSummary: r.output_summary ?? {}, nextRetryAt: r.next_retry_at ?? null })
         : undefined;
     return {
       id: r.id,

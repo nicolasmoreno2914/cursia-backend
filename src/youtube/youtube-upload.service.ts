@@ -36,7 +36,9 @@ export class YoutubeUploadTransportError extends ServiceUnavailableException {
     public readonly httpStatus?: number,
   ) {
     super(message);
-    // `name` se deja como el de ServiceUnavailableException (paridad legacy).
+    // Nota: Nest (initName) fija `name = 'YoutubeUploadTransportError'`. Nada del
+    // legacy depende de `name`: status HTTP, respuesta e `instanceof
+    // ServiceUnavailableException` son los mismos de antes.
   }
 }
 
@@ -51,6 +53,13 @@ export interface YoutubeUploadOptions {
   description?:   string;
   privacyStatus?: 'public' | 'unlisted' | 'private';
   chapterNumber?: number;
+  /**
+   * DN-1 (opcional; el legacy no lo usa): se invoca DESPUÉS de bajar y validar
+   * el MP4 y ANTES del primer contacto con YouTube. El worker dynamic escribe
+   * ahí el marcador de subida, así un crash durante la descarga no queda como
+   * "subida ambigua". Si lanza, la subida se aborta sin tocar YouTube.
+   */
+  onBeforeUpload?: () => Promise<void>;
 }
 
 export interface YoutubeUploadResult {
@@ -145,6 +154,8 @@ export class YoutubeUploadService {
         'Máximo: 512 MB.',
       );
     }
+
+    if (options.onBeforeUpload) await options.onBeforeUpload();
 
     // ── 3. Iniciar upload resumable en YouTube ────────────────────────────
     const metadata = {
