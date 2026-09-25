@@ -219,6 +219,46 @@ async function main() {
       failures.push(`Índice "uq_artifacts_item_run_type" no es UNIQUE parcial sobre item_run_id IS NOT NULL (indexdef: ${artIdx.rows[0].indexdef}).`);
     }
 
+    // 3d. rulesVersion 2 (supabase-migration-dynamic-generation-v2.sql, paso
+    // [4h2] del deploy): module_id nullable, columna scope NOT NULL con su
+    // trigger de default, CHECKs gir_type_check/gir_type_scope/gir_chapter_scope
+    // (por scope) y conteos v2 en course_generation_manifests.
+    const girCols = await client.query(
+      `select column_name, is_nullable from information_schema.columns
+        where table_schema = 'public' and table_name = 'generation_item_runs' and column_name in ('module_id', 'scope')`,
+    );
+    const girCol = Object.fromEntries(girCols.rows.map((r) => [r.column_name, r.is_nullable]));
+    if (girCol.module_id !== 'YES') failures.push('generation_item_runs.module_id debería ser nullable (rulesVersion 2: items de scope course).');
+    if (girCol.scope !== 'NO') failures.push(`generation_item_runs.scope debería existir y ser NOT NULL (encontrado: ${girCol.scope || 'ausente'}).`);
+    for (const [conname, needle] of [['gir_type_check', 'course_plan'], ['gir_type_scope', 'scope'], ['gir_chapter_scope', 'scope']]) {
+      const c = await client.query(
+        `select pg_get_constraintdef(oid) as def from pg_constraint
+          where conname = $1 and conrelid = 'public.generation_item_runs'::regclass and contype = 'c'`,
+        [conname],
+      );
+      if (c.rows.length === 0 || !c.rows[0].def.includes(needle)) {
+        failures.push(`Falta el CHECK v2 "${conname}" (o no menciona "${needle}") en generation_item_runs.`);
+      }
+    }
+    const scopeTrig = await client.query(
+      `select t.tgname from pg_trigger t
+         join pg_class c on c.oid = t.tgrelid
+         join pg_namespace ns on ns.oid = c.relnamespace and ns.nspname = 'public'
+        where c.relname = 'generation_item_runs' and t.tgname = 'generation_item_runs_default_scope' and not t.tgisinternal`,
+    );
+    if (scopeTrig.rows.length === 0) failures.push('Falta el trigger "generation_item_runs_default_scope" en generation_item_runs.');
+    const cgmCols = await tableColumns(client, 'course_generation_manifests');
+    for (const col of ['course_plan_count', 'course_intro_count', 'module_intro_count']) {
+      if (!cgmCols.includes(col)) failures.push(`Tabla "course_generation_manifests" no tiene la columna v2 "${col}".`);
+    }
+    const cgmCheck = await client.query(
+      `select pg_get_constraintdef(oid) as def from pg_constraint
+        where conname = 'cgm_counts_consistent' and conrelid = 'public.course_generation_manifests'::regclass`,
+    );
+    if (cgmCheck.rows.length === 0 || !cgmCheck.rows[0].def.includes('module_intro_count')) {
+      failures.push('cgm_counts_consistent no incluye los conteos v2 (module_intro_count).');
+    }
+
     if (failures.length > 0) {
       console.error('❌ Verificación de esquema FALLÓ:');
       failures.forEach((f) => console.error('  - ' + f));
@@ -630,6 +670,68 @@ async function main() {
       if (!otherModeOk) {
         failures.push(`Un production_job de execution_mode='backend_content' con el mismo manifestId NO debería verse afectado por el índice parcial y falló: ${otherModeError}`);
       }
+
+      // 4m-4r. rulesVersion 2. Un item v1 insertado SIN scope (como lo hace el
+      // código v1) recibe scope='chapter' del trigger; un item de scope course
+      // (module_id y chapter_id nulos) se inserta; los CHECKs por scope
+      // rechazan combinaciones inválidas; y un Manifest v2 con conteos
+      // consistentes se inserta mientras que uno con module_intro_count
+      // inconsistente se rechaza.
+      async function insertItemV2(type, modId, chapId, key) {
+        return client.query(
+          `insert into public.generation_item_runs
+             (job_id, course_id, blueprint_id, manifest_id, item_key, generation, type, module_id, chapter_id, depends_on, idempotency_key)
+           values ($1, $2, $3, $4, $5, 1, $6, $7, $8, '{}', $9)
+           returning id, scope`,
+          [jobId, courseId, blueprintId, manifestId, key, type, modId, chapId, idempotencyKey(manifestId, key, 1)],
+        );
+      }
+      async function expectCheck(name, fn) {
+        await client.query('savepoint sp_v2_check');
+        let code = null;
+        try { await fn(); } catch (e) { code = e.code; } finally { await client.query('rollback to savepoint sp_v2_check'); }
+        if (code !== '23514') failures.push(`${name} NO fue rechazado con 23514 (código real: ${code || 'ninguno — se insertó'}).`);
+      }
+      await client.query('savepoint sp_v2_ok');
+      try {
+        const v1Row = await insertItemV2('scorm', moduleId, chapterId, `scorm:${chapterId}`);
+        if (v1Row.rows[0].scope !== 'chapter') failures.push(`Item v1 sin scope explícito recibió scope="${v1Row.rows[0].scope}" (esperado 'chapter' vía trigger).`);
+        const planRow = await insertItemV2('course_plan', null, null, `course_plan:${courseId}`);
+        if (planRow.rows[0].scope !== 'course') failures.push(`Item course_plan recibió scope="${planRow.rows[0].scope}" (esperado 'course').`);
+        const introRow = await insertItemV2('module_intro', moduleId, null, `module_intro:${moduleId}`);
+        if (introRow.rows[0].scope !== 'module') failures.push(`Item module_intro recibió scope="${introRow.rows[0].scope}" (esperado 'module').`);
+      } catch (e) {
+        failures.push(`Insertar items v2 válidos (scorm v1 sin scope / course_plan de scope course / module_intro) falló: ${e.message} (código: ${e.code || 'ninguno'})`);
+      } finally {
+        await client.query('rollback to savepoint sp_v2_ok');
+      }
+      await expectCheck('Insertar course_plan con module_id no nulo', () => insertItemV2('course_plan', moduleId, null, 'cp-bad'));
+      await expectCheck('Insertar module_intro con module_id nulo', () => insertItemV2('module_intro', null, null, 'mi-bad'));
+      await expectCheck('Insertar un type desconocido', () => insertItemV2('bogus', moduleId, chapterId, 'bogus-bad'));
+      await expectCheck('Insertar content con scope explícito "course"', () => client.query(
+        `insert into public.generation_item_runs
+           (job_id, course_id, blueprint_id, manifest_id, item_key, generation, type, module_id, chapter_id, depends_on, idempotency_key, scope)
+         values ($1, $2, $3, $4, 'content-scope-bad', 1, 'content', null, null, '{}', $5, 'course')`,
+        [jobId, courseId, blueprintId, manifestId, idempotencyKey(manifestId, 'content-scope-bad', 1)],
+      ));
+
+      const insertV2Manifest = (moduleIntroCount, totalJobs, sha) => client.query(
+        `insert into public.course_generation_manifests
+           (course_id, blueprint_id, rules_version, manifest_json, manifest_sha256, blueprint_sha256,
+            module_count, chapter_count, content_count, scorm_count, video_count, exam_count, total_jobs,
+            course_plan_count, course_intro_count, module_intro_count)
+         values ($1, $2, 2, $3::jsonb, $4, $5, 1, 1, 1, 1, 0, 0, $6, 1, 1, $7)`,
+        [courseId, blueprintId, JSON.stringify(manifestJson), sha, blueprintSha256, totalJobs, moduleIntroCount],
+      );
+      await client.query('savepoint sp_v2_manifest_ok');
+      try {
+        await insertV2Manifest(1, 5, 'e'.repeat(64));
+      } catch (e) {
+        failures.push(`Insertar un Manifest v2 con conteos consistentes (1+1+1 módulo, total 5) falló: ${e.message} (código: ${e.code || 'ninguno'})`);
+      } finally {
+        await client.query('rollback to savepoint sp_v2_manifest_ok');
+      }
+      await expectCheck('Insertar un Manifest v2 con module_intro_count ≠ module_count', () => insertV2Manifest(0, 4, 'f'.repeat(64)));
     } finally {
       await client.query('rollback'); // nunca deja basura, sea cual sea el resultado
     }

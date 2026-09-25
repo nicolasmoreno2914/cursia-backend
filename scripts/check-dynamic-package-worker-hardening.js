@@ -131,7 +131,13 @@ function workerDeps(ds, over = {}) {
       async findAll() { return over.existing || []; },
       async uploadBufferArtifact(input) { uploads.push(input); return { id: `artifact-${uploads.length}` }; },
     },
-    manifests: { async get() { return { id: 1, blueprintNumber: 1, manifest: { items: [] } }; } },
+    // El worker lee el Manifest CONGELADO del run (getById, R1/R3); `get`
+    // queda por compatibilidad con código previo. Stub desactualizado hasta
+    // la fix wave review-rv2 (7 checks fallaban por TypeError en getById).
+    manifests: {
+      async get() { return { id: 1, blueprintNumber: 1, rulesVersion: 1, manifest: { items: [] } }; },
+      async getById() { return { id: 1, blueprintNumber: 1, rulesVersion: 1, manifest: { items: [] } }; },
+    },
     blueprints: { async getByNumber() { return { snapshot: {} }; } },
     buildPlan: () => STUB_PLAN,
     resolveArtifacts: async () => RESOLVED,
