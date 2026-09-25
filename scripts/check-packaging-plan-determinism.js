@@ -230,6 +230,37 @@ check(`hash equals pinned value ${PINNED_HASH}`, () => {
   assertEqual(hash, PINNED_HASH, 'packagingPlanSha256 del plan de aceptación');
 });
 
+// ── rulesVersion 2 (5B.2.B): mismo fixture con Manifest v2 ────────────────
+// El plan v2 agrega rulesVersion/courseIntroItemKey/moduleIntroItemKey; el
+// hash v1 de arriba no cambia.
+const PINNED_HASH_V2 = 'd2c6e11405fa2f85a67e3e7e370b417d2a365f2a205385d3e90e7087b8c07886';
+function buildFixturePlanV2() {
+  const snapshot = buildFixtureSnapshot();
+  const manifest = buildGenerationManifest(snapshot, fixtureSource(snapshot), { rulesVersion: 2 });
+  return buildPackagingPlan(manifest, snapshot, { manifestId: 46 });
+}
+
+check('v2: intros por UUID/key y mismos totals/secciones que v1', () => {
+  const plan = buildFixturePlanV2();
+  assertEqual(plan.rulesVersion, 2, 'rulesVersion');
+  assertEqual(plan.courseIntroItemKey, 'course_intro:39', 'courseIntroItemKey');
+  assertDeepEqual(plan.modules.map((m) => m.moduleIntroItemKey), ['m1', 'm2', 'm3', 'm4'].map((id) => `module_intro:${id}`), 'moduleIntroItemKey');
+  assertDeepEqual(plan.totals, buildFixturePlan().totals, 'totals');
+  assertDeepEqual(plan.sections, buildFixturePlan().sections, 'sections');
+  assertEqual('rulesVersion' in buildFixturePlan(), false, 'un plan v1 no lleva rulesVersion');
+});
+
+check('v2: jsonb round trip → mismo hash, y distinto del v1', () => {
+  const plan = buildFixturePlanV2();
+  const h1 = packagingPlanSha256(plan);
+  assertEqual(packagingPlanSha256(shuffleKeys(JSON.parse(JSON.stringify(plan)))), h1, 'round trip v2');
+  assertEqual(h1 !== PINNED_HASH, true, 'el hash v2 no puede coincidir con el v1');
+});
+
+check(`v2: hash equals pinned value ${PINNED_HASH_V2}`, () => {
+  assertEqual(packagingPlanSha256(buildFixturePlanV2()), PINNED_HASH_V2, 'packagingPlanSha256 v2');
+});
+
 console.log('');
 if (failures > 0) {
   console.error(`❌ Packaging Plan determinism check FALLÓ (${failures} chequeo(s) roto(s)).`);

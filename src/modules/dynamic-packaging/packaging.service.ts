@@ -3,6 +3,7 @@ import { DataSource } from 'typeorm';
 import { GenerationManifestsService, ManifestDto } from '../generation-manifests/generation-manifests.service';
 import { ArtifactsService } from '../artifacts/artifacts.service';
 import { resolveRunArtifacts } from './artifact-resolver';
+import { PackagingNotReadyError } from './packaging-types';
 import { packageReuseHash, resolveDynamicMoodleVersion, sortedArtifactIds } from './packaging-reuse-key';
 import { DYNAMIC_MBZ_BUILDER_VERSION } from '../../package/dynamic-mbz-builder';
 
@@ -86,9 +87,10 @@ export class PackagingService {
    *   huérfano o fallido no debe bloquear un reintento.
    */
   async requestPackage(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<RequestPackageResult> {
-    const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
+    const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     const run = await this.loadRunRow(courseId, manifest, runId);
     await this.assertRunReady(run, manifest);
+    if (manifest.rulesVersion === 2) await this.assertV2ArtifactsResolvable(run, manifest);
 
     const existing = await this.findLatestPackageJob(runId);
     if (existing) {
@@ -140,7 +142,7 @@ export class PackagingService {
 
   /** GET …/runs/:runId/package. */
   async getPackageStatus(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<PackageStatusResult> {
-    const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
+    const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     await this.loadRunRow(courseId, manifest, runId); // valida ownership + que el run pertenezca al curso/Manifest
 
     const job = await this.findLatestPackageJob(runId);
@@ -180,6 +182,41 @@ export class PackagingService {
   }
 
   // ── internals ────────────────────────────────────────────────────────────
+
+  /**
+   * Manifest congelado del run (input_payload.manifestId), no el "actual" de
+   * DYNAMIC_MANIFEST_RULES_VERSION — mismo criterio que RunsService. Si el run
+   * no existe para el curso se usa el Manifest configurado (mismos 404/400 de
+   * siempre; loadRunRow da después el 404 del run).
+   */
+  private async manifestOfRun(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<ManifestDto> {
+    const [row] = await this.dataSource.query(
+      `select input_payload->>'manifestId' as manifest_id from public.production_jobs
+        where id = $1 and execution_mode = 'dynamic_generation' and course_id = $2`,
+      [runId, courseId],
+    );
+    const manifestId = Number(row?.manifest_id);
+    if (!row || !Number.isInteger(manifestId)) return this.manifests.get(courseId, ownerId, blueprintNumber);
+    return this.manifests.getById(courseId, ownerId, blueprintNumber, manifestId);
+  }
+
+  /**
+   * rulesVersion 2 (spec v2 §5): todo item del Manifest es obligatorio con
+   * TODOS sus roles (plan, intros, Context Package de cada content). Si falta
+   * cualquiera → 409 con la lista completa de keys faltantes (mismo formato
+   * `missingJson=` que assertRunReady), antes de encolar el job.
+   */
+  private async assertV2ArtifactsResolvable(run: any, manifest: ManifestDto): Promise<void> {
+    try {
+      await resolveRunArtifacts({ query: this.dataSource.query.bind(this.dataSource) }, run.id, manifest.manifest);
+    } catch (err) {
+      if (!(err instanceof PackagingNotReadyError)) throw err;
+      const message =
+        `La ejecución ${run.id} (rulesVersion 2) no tiene todos los artifacts requeridos para empaquetar ` +
+        `(${err.missing.length} faltante(s)) missingJson=${JSON.stringify(err.missing)}`;
+      throw new ConflictException({ message, missing: err.missing });
+    }
+  }
 
   private async loadRunRow(courseId: number, manifest: ManifestDto, runId: string): Promise<any> {
     const [row] = await this.dataSource.query(

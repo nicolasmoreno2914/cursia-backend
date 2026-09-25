@@ -179,6 +179,26 @@ export function buildPackagingPlan(
   if (totals.exams !== manifest.totals.examCount) {
     mismatches.push(`exams: plan=${totals.exams} manifest=${manifest.totals.examCount}`);
   }
+  // rulesVersion 2 (5B.2.B): intro de curso + una intro por módulo, por
+  // UUID/key del Manifest. Deben existir TODAS en manifest.items (en v2 todo
+  // item es obligatorio): una ausencia es un Manifest roto, no un plan parcial.
+  const v2 = manifest.rulesVersion === 2;
+  let courseIntroItemKey: string | undefined;
+  if (v2) {
+    courseIntroItemKey = `course_intro:${manifest.source.courseId}`;
+    if (!itemKeys.has(courseIntroItemKey)) {
+      mismatches.push(`course_intro: falta ${courseIntroItemKey} en manifest.items`);
+    }
+    for (const m of modules) {
+      const key = `module_intro:${m.moduleId}`;
+      if (!itemKeys.has(key)) mismatches.push(`module_intro: falta ${key} en manifest.items`);
+      m.moduleIntroItemKey = key;
+    }
+    if (manifest.totals.moduleIntroCount !== modules.length) {
+      mismatches.push(`moduleIntros: plan=${modules.length} manifest=${manifest.totals.moduleIntroCount}`);
+    }
+  }
+
   if (mismatches.length > 0) {
     throw new PackagingPlanError(
       `PackagingPlanError: totals del plan no coinciden con manifest.totals (${mismatches.join('; ')}).`,
@@ -187,6 +207,7 @@ export function buildPackagingPlan(
 
   return {
     planVersion: 1,
+    ...(v2 ? { rulesVersion: 2 as const, courseIntroItemKey } : {}),
     manifestId: opts?.manifestId ?? null,
     course: {
       id: manifest.source.courseId,
@@ -212,8 +233,12 @@ export function buildPackagingPlan(
  * arrays) produzca el mismo string y el mismo hash.
  */
 export function canonicalPackagingPlanJson(p: PackagingPlan): string {
+  // v2: rulesVersion/courseIntroItemKey/moduleIntroItemKey SOLO si el plan
+  // es v2 — un plan v1 serializa exactamente igual que antes (hash fijado).
+  const v2 = p.rulesVersion === 2;
   const canonical = {
     planVersion: p.planVersion,
+    ...(v2 ? { rulesVersion: p.rulesVersion, courseIntroItemKey: p.courseIntroItemKey } : {}),
     manifestId: p.manifestId,
     course: { id: p.course.id, title: p.course.title, summary: p.course.summary },
     sections: p.sections.map((s) =>
@@ -240,6 +265,7 @@ export function canonicalPackagingPlanJson(p: PackagingPlan): string {
         videoItemKey: c.videoItemKey,
       })),
       examItemKey: m.examItemKey,
+      ...(v2 ? { moduleIntroItemKey: m.moduleIntroItemKey } : {}),
     })),
     totals: {
       modules: p.totals.modules,
