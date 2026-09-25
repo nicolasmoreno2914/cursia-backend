@@ -63,6 +63,9 @@ jobs:
       - name: Check Generation Manifest determinism
         run: node scripts/check-generation-manifest-determinism.js
 
+      - name: Check Packaging Plan determinism (Fase 5B.1)
+        run: node scripts/check-packaging-plan-determinism.js
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
