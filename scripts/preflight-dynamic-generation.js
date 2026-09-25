@@ -87,6 +87,66 @@ function yesNo(b) {
   return b ? 'SÍ' : 'NO';
 }
 
+// Nunca imprime el valor de una clave: solo su formato, los claims NO secretos
+// de un JWT (role, ref) y la respuesta de Storage a una firma de prueba sobre
+// un path inexistente. Cualquier cosa con forma de JWT en esa respuesta se
+// redacta antes de imprimir.
+function redact(text) {
+  return String(text || '')
+    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '<jwt>')
+    .replace(/sb_(secret|publishable)_[A-Za-z0-9_-]+/g, '<key>')
+    .slice(0, 200);
+}
+
+function jwtClaims(token) {
+  const parts = String(token).split('.');
+  if (parts.length !== 3) return null;
+  try {
+    const json = Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+    const p = JSON.parse(json);
+    return { role: p.role ?? null, ref: p.ref ?? null, iss: p.iss ?? null };
+  } catch {
+    return null;
+  }
+}
+
+async function diagnoseServiceRoleKey() {
+  console.log('── SUPABASE_SERVICE_ROLE_KEY: diagnóstico (sin mostrar el valor) ──');
+  const key = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  const base = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
+  if (!key || !base) {
+    console.log('  ⚠️ falta SUPABASE_SERVICE_ROLE_KEY o SUPABASE_URL');
+    return;
+  }
+  const format = key.startsWith('sb_secret_') ? 'sb_secret (clave nueva)'
+    : key.startsWith('sb_publishable_') ? 'sb_publishable (clave pública nueva — NO sirve como service role)'
+    : key.split('.').length === 3 ? 'JWT (clave clásica)' : 'desconocido';
+  console.log(`  formato: ${format}`);
+  const claims = jwtClaims(key);
+  if (claims) {
+    console.log(`  claims: role=${claims.role} ref=${claims.ref} iss=${claims.iss}`);
+    console.log(`  role === service_role: ${yesNo(claims.role === 'service_role')}`);
+    console.log(`  ref coincide con SUPABASE_URL (${supabaseUrlRef()}): ${yesNo(claims.ref === supabaseUrlRef())}`);
+    if (claims.ref === KNOWN_PRODUCTION_SUPABASE_REF) {
+      console.log('  ❌ la clave pertenece al proyecto de PRODUCCIÓN');
+    }
+  }
+  // Firma de prueba sobre un objeto inexistente: con una service role válida
+  // del proyecto la respuesta esperada es "not found" (400/404); una clave
+  // inválida o de otro proyecto da un error de firma/autorización.
+  try {
+    const res = await fetch(`${base}/storage/v1/object/sign/${ARTIFACTS_BUCKET}/__preflight__/no-existe.txt`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, apikey: key, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ expiresIn: 60 }),
+    });
+    const body = await res.text();
+    console.log(`  firma de prueba (objeto inexistente): HTTP ${res.status} ${redact(body)}`);
+  } catch (err) {
+    console.log(`  firma de prueba: error de red ${redact(err && err.message)}`);
+  }
+}
+
 async function main() {
   loadEnvFile(path.resolve(process.cwd(), '.env'));
   assertExplicitStagingIntent();
@@ -123,6 +183,8 @@ async function main() {
     database: process.env.DB_NAME,
     ssl: String(process.env.DB_SSL || '').toLowerCase() === 'true' ? { rejectUnauthorized: false } : false,
   });
+  await diagnoseServiceRoleKey();
+
   await client.connect();
   try {
     await client.query('begin transaction read only');
