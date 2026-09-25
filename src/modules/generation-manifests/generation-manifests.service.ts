@@ -204,6 +204,15 @@ export class GenerationManifestsService {
   }
 
   /**
+   * Fase 7/8: Blueprint verificado (ownership + `dynamic` + hash) de un
+   * número, para quien ya tiene el Manifest y necesita el snapshot
+   * (coherencia, plan de invalidación). Mismos 404/400 que `get`.
+   */
+  async blueprintOf(courseId: number, ownerId: string, blueprintNumber: number): Promise<BlueprintDto> {
+    return this.blueprints.getByNumber(courseId, ownerId, blueprintNumber);
+  }
+
+  /**
    * Lee un Manifest concreto por id (el congelado en un run:
    * input_payload.manifestId), verificando que sea de ESE Blueprint/curso y
    * del dueño (mismas garantías que `get`). Así un run v1 sigue legible
