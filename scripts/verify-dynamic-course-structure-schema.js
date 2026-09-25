@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { Client } = require('pg');
+const v2Target = require('./lib/v2-production-target');
 
 function loadEnvFile(envPath) {
   if (!fs.existsSync(envPath)) return;
@@ -126,8 +127,16 @@ async function columnDetails(client, table, column) {
 
 async function main() {
   loadEnvFile(path.resolve(process.cwd(), '.env'));
-  assertExplicitStagingIntent();
-  assertNotProductionProject();
+  // Fase 9 (G6): modo opt-in V2_VERIFY_MODE=production-readonly (lo usa
+  // scripts/prod/migrate-v2-production.js). Sin esa env var, los guards de
+  // staging de siempre, sin ningún cambio de comportamiento.
+  const PROD_RO = v2Target.isProductionReadonlyRequested()
+    ? v2Target.assertProductionReadonlyTargetOrExit()
+    : null;
+  if (!PROD_RO) {
+    assertExplicitStagingIntent();
+    assertNotProductionProject();
+  }
 
   const client = new Client({
     host: process.env.DB_HOST || '127.0.0.1',
@@ -141,6 +150,14 @@ async function main() {
   });
 
   await client.connect();
+  if (PROD_RO) {
+    try {
+      await v2Target.enterProductionReadonlySession(client, PROD_RO);
+    } catch (err) {
+      await client.end();
+      throw err;
+    }
+  }
   const failures = [];
 
   try {
@@ -219,7 +236,10 @@ async function main() {
     );
 
     // 4. FK real: insertar course_chapter con module_id inexistente debe fallar
-    if (existing.rows.length === 0) {
+    if (PROD_RO) {
+      // Fase 9 (G6): sondas 4/5 escriben (en transacción revertida) — omitidas en production-readonly.
+      v2Target.logSkippedProbe('4/5 FK real + insert válido en course_modules/course_chapters');
+    } else if (existing.rows.length === 0) {
       console.warn('⚠️  No hay cursos existentes en esta base — se omiten los checks 3 y 5 (requieren un curso real).');
     } else {
       const courseId = existing.rows[0].id;
