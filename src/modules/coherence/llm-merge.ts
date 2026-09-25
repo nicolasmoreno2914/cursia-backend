@@ -177,7 +177,20 @@ export interface CompactLlmInput {
   promptInputSha256: string;
 }
 
-const LEVELS = [
+/** Largo máximo de cada concepto / término en la entrada compacta. */
+export const LLM_INPUT_CONCEPT_CHARS = 80;
+/** Largo máximo del título del curso en la entrada compacta. */
+export const LLM_INPUT_COURSE_TITLE_CHARS = 200;
+
+/**
+ * Niveles de compactación (0 = el más generoso). Por capítulo: `summaryChars`
+ * del resumen (planeado y real), hasta `maxConcepts` por lista (introducidos,
+ * asumidos, términos) de ≤ LLM_INPUT_CONCEPT_CHARS cada uno, y títulos/
+ * objetivos de ≤ `textChars`. Se usa el primer nivel cuyo JSON entra en el
+ * tope total; nunca se descartan módulos ni capítulos (sus UUID siempre
+ * están).
+ */
+export const LLM_INPUT_LEVELS: ReadonlyArray<{ summaryChars: number; maxConcepts: number; textChars: number }> = [
   { summaryChars: 400, maxConcepts: 20, textChars: 300 },
   { summaryChars: 200, maxConcepts: 12, textChars: 300 },
   { summaryChars: 80, maxConcepts: 8, textChars: 200 },
@@ -194,8 +207,8 @@ export function buildCompactLlmInput(args: CompactLlmInputArgs): CompactLlmInput
 
   const clip = (s: unknown, n: number) => (typeof s === 'string' && n > 0 ? s.slice(0, n) : undefined);
   const list = (xs: unknown, n: number) =>
-    n > 0 && Array.isArray(xs) ? xs.filter((x) => typeof x === 'string').slice(0, n).map((x: string) => x.slice(0, 80)) : undefined;
-  const pack = (s: ContextSummaryInput | undefined, lv: (typeof LEVELS)[number]) =>
+    n > 0 && Array.isArray(xs) ? xs.filter((x) => typeof x === 'string').slice(0, n).map((x: string) => x.slice(0, LLM_INPUT_CONCEPT_CHARS)) : undefined;
+  const pack = (s: ContextSummaryInput | undefined, lv: (typeof LLM_INPUT_LEVELS)[number]) =>
     s
       ? {
           summary: clip(s.summary, lv.summaryChars),
@@ -205,11 +218,11 @@ export function buildCompactLlmInput(args: CompactLlmInputArgs): CompactLlmInput
         }
       : undefined;
 
-  for (let level = 0; level < LEVELS.length; level++) {
-    const lv = LEVELS[level];
+  for (let level = 0; level < LLM_INPUT_LEVELS.length; level++) {
+    const lv = LLM_INPUT_LEVELS[level];
     const doc = {
       llmInputVersion: LLM_INPUT_VERSION,
-      course: { title: String(args.blueprint.course?.title ?? '').slice(0, 200) },
+      course: { title: String(args.blueprint.course?.title ?? '').slice(0, LLM_INPUT_COURSE_TITLE_CHARS) },
       modules: outline.modules.map((m) => ({
         id: m.id,
         title: m.title.slice(0, lv.textChars),
@@ -224,7 +237,7 @@ export function buildCompactLlmInput(args: CompactLlmInputArgs): CompactLlmInput
       })),
     };
     const json = JSON.stringify(doc);
-    if (json.length <= maxChars || level === LEVELS.length - 1) {
+    if (json.length <= maxChars || level === LLM_INPUT_LEVELS.length - 1) {
       if (json.length > maxChars) {
         throw new Error(`COHERENCE_LLM_INPUT_TOO_LARGE: el outline mínimo ocupa ${json.length} > ${maxChars} caracteres`);
       }

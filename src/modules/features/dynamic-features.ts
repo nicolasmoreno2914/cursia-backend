@@ -11,6 +11,10 @@ import { ForbiddenException, InternalServerErrorException, Logger } from '@nestj
  *   flag ON + lista → solo esos owners.
  * - `DYNAMIC_REAL_VIDEO_OWNERS`: UUIDs de owner que pueden iniciar runs con
  *   `videoMode: 'real'` (Videogen pago). FAIL CLOSED: ausente/vacía → nadie.
+ * - `DYNAMIC_COHERENCE_LLM` (F78-BE2): SOLO el string exacto `'true'` habilita
+ *   la revisión de coherencia con IA (entrada compacta `…/coherence/llm-input`
+ *   + UI) para los owners que YA tienen V2. Ausente / otro valor → nadie
+ *   (fail closed).
  *
  * Todo se lee de `process.env` en cada llamada (sin caché): cambiar el env +
  * `pm2 restart --update-env` alcanza. Una lista con entradas que no son UUID
@@ -20,12 +24,15 @@ import { ForbiddenException, InternalServerErrorException, Logger } from '@nestj
 export const DYNAMIC_FLAG_ENV = 'DYNAMIC_COURSE_STRUCTURE';
 export const DYNAMIC_ALLOWED_OWNERS_ENV = 'DYNAMIC_V2_ALLOWED_OWNERS';
 export const REAL_VIDEO_OWNERS_ENV = 'DYNAMIC_REAL_VIDEO_OWNERS';
+export const COHERENCE_LLM_ENV = 'DYNAMIC_COHERENCE_LLM';
 
 export const DYNAMIC_NOT_ALLOWED_MESSAGE =
   'La estructura dinámica de cursos (V2) no está habilitada para esta cuenta.';
 export const REAL_VIDEO_NOT_ALLOWED_MESSAGE =
   'El video real (Videogen, con costo) no está habilitado para esta cuenta. Usá el modo de video "mock" ' +
   'o pedí que habiliten tu cuenta.';
+export const COHERENCE_LLM_NOT_ALLOWED_MESSAGE =
+  'La revisión de coherencia con IA no está habilitada para esta cuenta.';
 
 type Env = Record<string, string | undefined>;
 
@@ -42,6 +49,8 @@ export class DynamicFeatureConfigError extends Error {
 export interface DynamicFeatures {
   dynamicCourseStructure: boolean;
   realVideo: boolean;
+  /** F78-BE2: revisión de coherencia con IA (DYNAMIC_COHERENCE_LLM === 'true' y V2 permitida). */
+  coherenceLlm: boolean;
 }
 
 export function isDynamicCourseStructureEnabled(env: Env = process.env): boolean {
@@ -113,12 +122,19 @@ export function isRealVideoAllowedForOwner(ownerId: string, env: Env = process.e
   return allowed.includes(String(ownerId ?? '').toLowerCase());
 }
 
+/** F78-BE2: fail closed — solo `DYNAMIC_COHERENCE_LLM === 'true'` y solo para owners con V2 permitida. */
+export function isCoherenceLlmAllowedForOwner(ownerId: string, env: Env = process.env): boolean {
+  if (!isDynamicAllowedForOwner(ownerId, env)) return false;
+  return env[COHERENCE_LLM_ENV] === 'true';
+}
+
 export function resolveDynamicFeatures(ownerId: string, env: Env = process.env): DynamicFeatures {
-  if (!isDynamicCourseStructureEnabled(env)) return { dynamicCourseStructure: false, realVideo: false };
+  if (!isDynamicCourseStructureEnabled(env)) return { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false };
   validateDynamicFeatureConfig(env);
   return {
     dynamicCourseStructure: isDynamicAllowedForOwner(ownerId, env),
     realVideo: isRealVideoAllowedForOwner(ownerId, env),
+    coherenceLlm: isCoherenceLlmAllowedForOwner(ownerId, env),
   };
 }
 
@@ -151,4 +167,15 @@ export function assertRealVideoAllowed(ownerId: string, env: Env = process.env):
     toHttpConfigError(err);
   }
   if (!allowed) throw new ForbiddenException(REAL_VIDEO_NOT_ALLOWED_MESSAGE);
+}
+
+/** F78-BE2: 403 si el owner no tiene la revisión de coherencia con IA (fail closed); 500 si una lista es inválida. */
+export function assertCoherenceLlmAllowed(ownerId: string, env: Env = process.env): void {
+  let allowed: boolean;
+  try {
+    allowed = isCoherenceLlmAllowedForOwner(ownerId, env);
+  } catch (err) {
+    toHttpConfigError(err);
+  }
+  if (!allowed) throw new ForbiddenException(COHERENCE_LLM_NOT_ALLOWED_MESSAGE);
 }

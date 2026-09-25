@@ -6,18 +6,29 @@ import {
   InternalServerErrorException,
   Logger,
   NotFoundException,
+  UnprocessableEntityException,
 } from '@nestjs/common';
 import { DataSource } from 'typeorm';
+import { effectiveOutputRowsSql } from '../dynamic-generation/item-generations';
 import { CourseBlueprintsService } from '../course-blueprints/course-blueprints.service';
 import { GenerationManifestsService, ManifestDto } from '../generation-manifests/generation-manifests.service';
 import { ArtifactsService } from '../artifacts/artifacts.service';
 import { loadArtifactText } from '../dynamic-packaging/artifact-resolver';
 import type { ResolvedArtifact } from '../dynamic-packaging/packaging-types';
-import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
+import { assertCoherenceLlmAllowed, assertDynamicOwnerAllowed } from '../features/dynamic-features';
+import type { BlueprintSnapshotV1 } from '../course-blueprints/blueprint-snapshot';
 import { sha256Canonical } from './canonical-json';
 import { COHERENCE_RULESET, COHERENCE_VERSION, ContextSummaryInput, CoursePlanInput } from './coherence-types';
 import { CoherenceReport, buildCoherenceReport, deterministicReportSha256 } from './report';
-import { mergeLlmFindings } from './llm-merge';
+import {
+  CompactLlmInput,
+  LLM_INPUT_CONCEPT_CHARS,
+  LLM_INPUT_COURSE_TITLE_CHARS,
+  LLM_INPUT_LEVELS,
+  LLM_INPUT_MAX_CHARS,
+  buildCompactLlmInput,
+  mergeLlmFindings,
+} from './llm-merge';
 import { LlmFindingsDto, StructureCoherenceDto } from './dto/coherence.dto';
 
 export const COHERENCE_REPORT_ARTIFACT_TYPE = 'dynamic_coherence_report_json';
@@ -35,6 +46,48 @@ export interface StructureCoherenceResponse {
   reportSha256: string;
   blueprintSha256: string;
   findings: CoherenceReport['findings'];
+}
+
+interface RunCoherenceInputs {
+  blueprint: BlueprintSnapshotV1;
+  coursePlan: CoursePlanInput | null;
+  coursePlanArtifactId: string | null;
+  contextSummaries: Record<string, ContextSummaryInput> | null;
+  contextSummaryArtifactIds: string[];
+  declaredPriorConcepts: string[] | null;
+}
+
+/** F78-BE2: respuesta de GET …/runs/:runId/coherence/llm-input (contrato para el FE). */
+export interface LlmInputResponse {
+  runId: string;
+  blueprintNumber: number;
+  llmInputVersion: number;
+  /** Tope total del JSON (caracteres). */
+  maxChars: number;
+  /** Largo real de `json` (≤ maxChars). */
+  chars: number;
+  /** 0 = sin recortes; >0 = nivel de `caps.levels` aplicado. */
+  compactionLevel: number;
+  /** sha256 hex de `json` (el FE puede usarlo para su promptSha256). */
+  promptInputSha256: string;
+  caps: {
+    summaryChars: number;
+    maxConceptsPerList: number;
+    conceptChars: number;
+    textChars: number;
+    courseTitleChars: number;
+    levels: Array<{ summaryChars: number; maxConcepts: number; textChars: number }>;
+  };
+  sources: {
+    coursePlanArtifactId: string | null;
+    contextSummaryArtifactIds: string[];
+    /** Capítulos (UUID) sin sidecar real (p.ej. contextSummary='missing'). */
+    chaptersWithoutRealSummary: string[];
+  };
+  /** Documento compacto ya parseado (= JSON.parse(json)). */
+  input: any;
+  /** El mismo documento serializado (lo que se manda al LLM; mide `chars`). */
+  json: string;
 }
 
 export interface RunCoherenceResponse {
@@ -138,6 +191,70 @@ export class CoherenceService {
     });
   }
 
+  /**
+   * F78-BE2: GET …/runs/:runId/coherence/llm-input — entrada COMPACTA para
+   * la revisión de coherencia con IA que corre en el navegador. Contiene
+   * solo: outline por UUID (módulos/capítulos en orden, títulos, objetivos),
+   * resúmenes y conceptos PLANEADOS del course_plan y los sidecars REALES
+   * `context_summary` por capítulo (generación vigente). Nunca el contenido
+   * completo de capítulos, SCORM ni exámenes.
+   *
+   * Topes (buildCompactLlmInput): total ≤ LLM_INPUT_MAX_CHARS (24 000) de
+   * JSON; por capítulo, en el nivel 0: resumen ≤ 400, ≤ 20 conceptos por lista
+   * de ≤ 80, títulos/objetivos ≤ 300 — si no entra, se compacta por niveles
+   * (`caps.levels`) sin perder ningún módulo ni capítulo. Si ni el outline
+   * mínimo entra → 422.
+   *
+   * Gates: allow-list V2 + DYNAMIC_COHERENCE_LLM (403, fail closed),
+   * ownership (404), run completed (409). Solo lectura: no persiste nada.
+   */
+  async llmInput(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<LlmInputResponse> {
+    assertDynamicOwnerAllowed(ownerId);
+    assertCoherenceLlmAllowed(ownerId);
+    const { job, manifest } = await this.runOf(courseId, ownerId, blueprintNumber, runId);
+    const inputs = await this.loadRunInputs(job, manifest, ownerId, blueprintNumber);
+    let compact: CompactLlmInput;
+    try {
+      compact = buildCompactLlmInput({
+        blueprint: inputs.blueprint,
+        coursePlan: inputs.coursePlan,
+        contextSummaries: inputs.contextSummaries,
+        maxChars: LLM_INPUT_MAX_CHARS,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.startsWith('COHERENCE_LLM_INPUT_TOO_LARGE')) throw new UnprocessableEntityException(msg);
+      throw err;
+    }
+    const chapterIds = inputs.blueprint.modules.flatMap((m) => m.chapters.map((c) => c.id));
+    const withReal = new Set(Object.keys(inputs.contextSummaries ?? {}));
+    const level0 = LLM_INPUT_LEVELS[0];
+    return {
+      runId: job.id,
+      blueprintNumber,
+      llmInputVersion: compact.llmInputVersion,
+      maxChars: LLM_INPUT_MAX_CHARS,
+      chars: compact.chars,
+      compactionLevel: compact.compactionLevel,
+      promptInputSha256: compact.promptInputSha256,
+      caps: {
+        summaryChars: level0.summaryChars,
+        maxConceptsPerList: level0.maxConcepts,
+        conceptChars: LLM_INPUT_CONCEPT_CHARS,
+        textChars: level0.textChars,
+        courseTitleChars: LLM_INPUT_COURSE_TITLE_CHARS,
+        levels: LLM_INPUT_LEVELS.map((l) => ({ ...l })),
+      },
+      sources: {
+        coursePlanArtifactId: inputs.coursePlanArtifactId,
+        contextSummaryArtifactIds: [...inputs.contextSummaryArtifactIds].sort(),
+        chaptersWithoutRealSummary: chapterIds.filter((id) => !withReal.has(id)),
+      },
+      input: JSON.parse(compact.json),
+      json: compact.json,
+    };
+  }
+
   // ── internals ────────────────────────────────────────────────────────────
 
   /** Run de este curso con su Manifest congelado (verifica dueño, `dynamic` y pertenencia al Blueprint `n`). */
@@ -158,6 +275,24 @@ export class CoherenceService {
   }
 
   private async buildDeterministicReport(job: any, manifest: ManifestDto, ownerId: string, blueprintNumber: number): Promise<CoherenceReport> {
+    const inputs = await this.loadRunInputs(job, manifest, ownerId, blueprintNumber);
+    return buildCoherenceReport({
+      blueprint: inputs.blueprint,
+      coursePlan: inputs.coursePlan,
+      contextSummaries: inputs.contextSummaries,
+      declaredPriorConcepts: inputs.declaredPriorConcepts,
+      manifest: manifest.manifest,
+    });
+  }
+
+  /**
+   * Inputs de coherencia de un run COMPLETED (nunca salida parcial): Blueprint
+   * del run + `course_plan` (v2: exactamente 1) + sidecars
+   * `dynamic_context_summary_json` REALES por capítulo, de la generación
+   * completed vigente de cada item (F78-BE2: una regeneración reemplaza a la
+   * anterior), excluyendo artifacts `disabled`.
+   */
+  private async loadRunInputs(job: any, manifest: ManifestDto, ownerId: string, blueprintNumber: number): Promise<RunCoherenceInputs> {
     if (job.worker_status !== 'completed') {
       throw new ConflictException(
         `La ejecución ${job.id} no está completada (worker_status=${job.worker_status}); la coherencia de contenido se ` +
@@ -169,9 +304,9 @@ export class CoherenceService {
       await this.dataSource.query(
         `select g.item_key, g.chapter_id, g.id as item_run_id, a.id as artifact_id, a.type as artifact_type,
                 a.storage_bucket, a.storage_path, a.mime_type
-           from public.generation_item_runs g
+           from ${effectiveOutputRowsSql('$1')} g
            join public.artifacts a on a.item_run_id = g.id and a.status is distinct from 'disabled'
-          where g.job_id = $1 and g.generation = 1 and g.status = 'completed'
+          where g.status = 'completed'
             and a.type in ('dynamic_course_plan_json', 'dynamic_context_summary_json')
           order by g.item_key, a.id`,
         [job.id],
@@ -202,6 +337,7 @@ export class CoherenceService {
     }
 
     let contextSummaries: Record<string, ContextSummaryInput> | null = null;
+    const contextSummaryArtifactIds: string[] = [];
     for (const r of rows.filter((x) => x.artifact_type === 'dynamic_context_summary_json')) {
       if (!r.chapter_id || !r.item_key.startsWith('content:')) {
         throw new ConflictException(`El sidecar ${r.artifact_id} está vinculado a ${r.item_key}, que no es un content de capítulo`);
@@ -213,6 +349,7 @@ export class CoherenceService {
         );
       }
       contextSummaries = contextSummaries ?? {};
+      contextSummaryArtifactIds.push(r.artifact_id);
       contextSummaries[r.chapter_id] = {
         summary: s?.summary ?? null,
         concepts_introduced: Array.isArray(s?.concepts_introduced) ? s.concepts_introduced : null,
@@ -225,13 +362,14 @@ export class CoherenceService {
     const caps = ctx?.context?.prevCourse?.caps;
     const declaredPriorConcepts = Array.isArray(caps) && caps.length > 0 ? caps.map(String) : null;
 
-    return buildCoherenceReport({
+    return {
       blueprint: bp.snapshot,
       coursePlan,
+      coursePlanArtifactId: coursePlan ? planRows[0].artifact_id : null,
       contextSummaries,
+      contextSummaryArtifactIds,
       declaredPriorConcepts,
-      manifest: manifest.manifest,
-    });
+    };
   }
 
   private parseJson(text: string, r: { artifact_id: string; item_key: string }): any {
