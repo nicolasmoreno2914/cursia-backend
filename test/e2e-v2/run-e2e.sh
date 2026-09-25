@@ -19,8 +19,8 @@ export MOODLE_PHPINI="$MOODLE_SCRATCH/php.ini"
 export PHP_BIN="/opt/homebrew/opt/php@8.3/bin/php"
 export LC_ALL=C
 PGBIN=/opt/homebrew/bin
-PORT=55491
-export PGPORT_T=$PORT APP_PORT=38471
+PORT="${E2E_PG_PORT:-55491}"
+export PGPORT_T=$PORT APP_PORT="${E2E_APP_PORT:-38471}"
 DATA="$SCRATCH/e2e-pgdata"
 T0=$(date +%s)
 

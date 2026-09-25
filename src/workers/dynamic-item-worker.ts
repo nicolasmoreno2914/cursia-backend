@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import { createHash } from 'crypto';
-import { BadRequestException, Logger, UnauthorizedException } from '@nestjs/common';
+import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DataSource } from 'typeorm';
 import { AppModule } from '../app.module';
@@ -15,20 +15,30 @@ import {
   isJobFailed,
 } from '../video-engine/videogen.service';
 import { YoutubeService } from '../youtube/youtube.service';
+import { YoutubeTokenService } from '../youtube/youtube-token.service';
 import {
-  YoutubeQuotaException,
   YoutubeUploadOptions,
   YoutubeUploadResult,
   YoutubeUploadService,
 } from '../youtube/youtube-upload.service';
+import {
+  classifyYoutubeUploadError,
+  lightYoutubePreflight,
+  resolveYoutubeConnectionFor,
+} from '../modules/dynamic-generation/dynamic-youtube';
 import type { YoutubeConnection } from '../youtube/entities/youtube-connection.entity';
 import {
   VideoDeliveryPhase,
   VideoDeliveryStrategy,
   canonicalYoutubeWatchUrl,
   checkYoutubeDeliveryUrl,
+  VIDEO_DELIVERY_NOT_YOUTUBE,
+  YOUTUBE_PREFLIGHT_FAILED,
+  YOUTUBE_PREFLIGHT_MESSAGES,
+  YOUTUBE_UPLOAD_PRIVACY,
   dynamicVideoDeliveryPhase,
   frozenVideoDeliveryOf,
+  isVideogenDirectAllowed,
   normalizeDeliveryState,
   reportVideoDeliveryConfigAtStartup,
 } from '../modules/dynamic-generation/dynamic-video-delivery';
@@ -91,7 +101,15 @@ export function bookMarkdownToNarrationText(md: string): string {
  * Los runs con `videoMode='mock'` nunca lo usan (publicador mock interno).
  */
 export interface DynamicYoutubePublisher {
+  /** Conexión del run (producción: resolveYoutubeConnectionFor → la del owner). */
   getConnection(ownerId: string): Promise<YoutubeConnection | null>;
+  /**
+   * DN-1: refresh del access token (en memoria, nunca se loguea ni persiste).
+   * Se usa en el preflight liviano antes de cada envío NUEVO a Videogen y
+   * justo antes de cada subida. Opcional por compatibilidad con fakes viejos
+   * (sin él, la subida igual refresca adentro de uploadFromUrl).
+   */
+  getAccessToken?(connection: YoutubeConnection): Promise<string>;
   uploadFromUrl(connection: YoutubeConnection, options: YoutubeUploadOptions): Promise<YoutubeUploadResult>;
 }
 
@@ -118,6 +136,14 @@ export interface DynamicItemWorkerDeps {
    * falla (no reintentable) sin subir nada.
    */
   youtube?: DynamicYoutubePublisher | null;
+  /** DN-1: intentos de subida en el MISMO reclamo ante un fallo transitorio (5xx/red al iniciar). Default 3 (paridad legacy). */
+  youtubeUploadMaxTries?: number;
+  /** DN-1: backoff base entre esos intentos, en ms (intento n espera base·n). Default 2000 (legacy: 2 s, 4 s). */
+  youtubeUploadRetryBaseMs?: number;
+  /** DN-1: espera antes del reintento automático tras cuota agotada, en segundos. Default 3600. */
+  youtubeQuotaRetrySeconds?: number;
+  /** DN-1 (review I2): tope TOTAL de espera por cuota (desde la primera), en segundos. Default 86400 (24 h). */
+  youtubeQuotaMaxWaitSeconds?: number;
 }
 
 interface RunHead {
@@ -164,6 +190,16 @@ function realVideoStillAllowed(ownerId: string, logger: Logger): boolean {
     return false;
   }
 }
+
+/**
+ * DN-1: motivo con el que falla un video real `videogen_direct` cuando el
+ * permiso de staging (DYNAMIC_ALLOW_VIDEOGEN_DIRECT) ya no está al momento del
+ * envío. Prefijo estable `video_delivery_not_youtube:`.
+ */
+export const VIDEOGEN_DIRECT_NOT_ALLOWED_ITEM_ERROR =
+  `${VIDEO_DELIVERY_NOT_YOUTUBE}: la entrega directa de Videogen ya no está permitida para videos reales ` +
+  '(la entrega final es YouTube Unlisted), así que no se envió este video (sin costo). Regenerá el curso para ' +
+  'que sus videos se publiquen en YouTube.';
 
 /** Señal: el input_payload del run tiene una estrategia de entrega desconocida (integridad rota). */
 class InvalidVideoDeliveryError extends Error {}
@@ -387,6 +423,35 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
         await scheduler.failItem(item.itemRunId, deps.executorId, REAL_VIDEO_NOT_ALLOWED_ITEM_ERROR, false);
         return;
       }
+      // DN-1: gate de entrega re-chequeado JUSTO antes de cada envío NUEVO
+      // (env y conexión ACTUALES, no los del boot ni los del startRun):
+      // - videogen_direct real solo con el permiso de staging;
+      // - youtube real: conexión activa + scope de subida + refresh del token.
+      // Fallo → item failed no-reintentable con motivo legible, sin marcar
+      // externalSubmitStartedAt (un retry posterior no queda ambiguo) y 0 gasto.
+      if (mode === 'real' && runHead.videoDelivery === 'videogen_direct' && !isVideogenDirectAllowed()) {
+        await scheduler.failItem(item.itemRunId, deps.executorId, VIDEOGEN_DIRECT_NOT_ALLOWED_ITEM_ERROR, false);
+        return;
+      }
+      if (mode === 'real' && runHead.videoDelivery === 'youtube') {
+        if (!deps.youtube) {
+          await scheduler.failItem(item.itemRunId, deps.executorId, 'youtube_publisher_not_configured', false);
+          return;
+        }
+        const light = await lightYoutubePreflight(deps.youtube, runHead.ownerId);
+        if (light.ok === false) {
+          logger.warn(`Item ${item.itemKey} (run ${item.runId}): preflight de YouTube falló (${light.reason}) — no se envía a Videogen`);
+          await scheduler.failItem(
+            item.itemRunId,
+            deps.executorId,
+            `${YOUTUBE_PREFLIGHT_FAILED}:${light.reason}: ${YOUTUBE_PREFLIGHT_MESSAGES[light.reason]} ` +
+              'No se envió el video a Videogen (sin costo); reintentá esta parte cuando el canal esté conectado.',
+            false,
+          );
+          return;
+        }
+        if (leaseLost) return;
+      }
 
       const contentTxt = buildContentTxt(item, markdown);
       const chapterTitle = item.blueprint.chapter?.title ?? `Capítulo ${item.chapterNumber ?? '?'}`;
@@ -574,8 +639,11 @@ export function mockYoutubeVideoId(idempotencyKey: string): string {
  */
 function mockYoutubePublisher(item: ClaimedItem): DynamicYoutubePublisher {
   return {
-    getConnection: async (ownerId: string) => ({ userId: ownerId, status: 'active' } as unknown as YoutubeConnection),
-    uploadFromUrl: async () => {
+    getConnection: async (ownerId: string) =>
+      ({ userId: ownerId, status: 'active', scopes: 'youtube.upload,youtube.readonly' } as unknown as YoutubeConnection),
+    getAccessToken: async () => 'mock-access-token',
+    uploadFromUrl: async (_c, options) => {
+      if (options.onBeforeUpload) await options.onBeforeUpload();
       const videoId = mockYoutubeVideoId(item.idempotencyKey);
       return { videoId, youtubeUrl: canonicalYoutubeWatchUrl(videoId) };
     },
@@ -586,14 +654,32 @@ function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** Señal: la lease se perdió al escribir el marcador de subida (antes de contactar YouTube). */
+class UploadMarkerLeaseLost extends Error {}
+
+/** Error ANTES del primer contacto con YouTube: auth/cuota se respetan; el resto es un fallo de descarga (reintentable). */
+function classifyPreUploadError(err: unknown): ReturnType<typeof classifyYoutubeUploadError> {
+  const k = classifyYoutubeUploadError(err);
+  return k === 'auth' || k === 'quota' ? k : 'download';
+}
+
+/** DN-1: mensaje de bloqueo sin tokens ni texto crudo de Google (solo el tipo de fallo). */
+const YOUTUBE_AUTH_BLOCK_DETAIL =
+  'YouTube rechazó la autorización del canal (conexión expirada, revocada o sin permiso de subida). ' +
+  'Volvé a conectar tu canal en la sección Cuenta y reintentá la subida: el video ya está generado y no se vuelve a pagar.';
+const YOUTUBE_QUOTA_BLOCK_DETAIL =
+  'YouTube no permite subir más videos por ahora (cuota diaria agotada). Se reintenta solo más tarde; ' +
+  'el video ya está generado y no se vuelve a pagar.';
+
 /**
  * Ejecuta la fase de entrega YouTube según `phase` (dynamicVideoDeliveryPhase):
- * - `publish_youtube`, `wait_auth`, `wait_quota`: intenta publicar. Las
- *   esperas son reanudables: el item sólo vuelve a reclamarse tras un retry
- *   manual (retryItem), que es la señal de "reconecté el canal" / "ya se
- *   restableció la cuota" — la publicación vuelve a verificar la condición.
+ * - `publish_youtube` (completed_local / uploading_youtube / upload_failed),
+ *   `wait_auth`, `wait_quota`: intenta publicar (re-verifica la condición).
+ * - `resolve_ambiguous`: NUNCA re-sube solo — falla pidiendo la resolución
+ *   explícita (POST …/items/:itemKey/youtube-resolution).
  * - `done`: solo finaliza (artifact + complete) con el id ya guardado.
  * - `poll_videogen`: imposible acá (el render ya terminó) → error fuerte.
+ * Ninguna rama vuelve a enviar nada a Videogen: el MP4 (completed_local) se preserva.
  */
 async function runYoutubeDeliveryPhase(
   deps: DynamicItemWorkerDeps,
@@ -605,18 +691,31 @@ async function runYoutubeDeliveryPhase(
   if (phase.next === 'poll_videogen') {
     throw new Error(`fase de entrega inconsistente: poll_videogen con el render ya terminado (item ${item.itemKey})`);
   }
+  if (phase.next === 'resolve_ambiguous') {
+    await failAmbiguous(deps, item, 'la subida anterior quedó sin confirmar y todavía no se resolvió');
+    return;
+  }
   await publishYoutubeAndComplete(deps, item, runHead, isLeaseLost);
 }
 
+/**
+ * Bloqueo reanudable por auth/cuota (rechazo DEFINITIVO de YouTube o sin
+ * conexión: no quedó ningún video a medio subir → se limpia el marcador).
+ * - auth: item failed (espera la reconexión + retry explícito, que SOLO re-sube).
+ * - quota: reintento automático con espera larga (retrying); agotados los
+ *   intentos → failed, retry explícito.
+ * El run nunca queda "fallado para siempre": un retry del item lo reabre.
+ */
 async function blockYoutubeDelivery(
   deps: DynamicItemWorkerDeps,
   item: ClaimedItem,
   state: 'blocked_auth' | 'blocked_quota',
   detail: string,
 ): Promise<void> {
-  // El marcador de subida se limpia: un bloqueo por auth/cuota es un rechazo
-  // DEFINITIVO de YouTube (401/403 o sin conexión) — no quedó ningún video a
-  // medio subir, así que reanudar no es ambiguo.
+  if (state === 'blocked_quota') {
+    await blockYoutubeQuota(deps, item, detail);
+    return;
+  }
   const recorded = await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
     delivery: state,
     youtubeUploadStartedAt: null,
@@ -627,10 +726,86 @@ async function blockYoutubeDelivery(
     deps.logger.warn(`Item ${item.itemKey}: lease perdida al registrar ${state}`);
     return;
   }
-  deps.logger.warn(`Item ${item.itemKey}: entrega YouTube ${state} — ${detail}`);
-  // No reintentable automáticamente: la espera se reanuda con un retry manual
-  // del item (mismo patrón que failed_recoverable del legacy).
+  deps.logger.warn(`Item ${item.itemKey}: entrega YouTube ${state}`);
   await deps.scheduler.failItem(item.itemRunId, deps.executorId, `youtube_${state}: ${detail}`, false);
+}
+
+/**
+ * Cuota de YouTube (review DN-1 I2): la espera tiene contador y tope PROPIOS
+ * (`youtubeQuotaSince`, `youtubeQuotaWaits` en output_summary) y NO consume
+ * max_attempts del item (refundAttempt). Mientras no pasen
+ * `youtubeQuotaMaxWaitSeconds` (24 h) desde la primera espera → `retrying`
+ * con `next_retry_at` + `youtubeQuotaRetrySeconds`. Pasado el tope →
+ * `upload_failed` (failed, reintento manual `retry_upload`) y el contador se
+ * reinicia para el próximo intento manual.
+ */
+async function blockYoutubeQuota(deps: DynamicItemWorkerDeps, item: ClaimedItem, detail: string): Promise<void> {
+  const summary = await loadOutputSummary(deps.dataSource, item.itemRunId);
+  const nowIso = new Date().toISOString();
+  const since: string = typeof summary.youtubeQuotaSince === 'string' ? summary.youtubeQuotaSince : nowIso;
+  const waitedSec = Math.max(0, (Date.now() - new Date(since).getTime()) / 1000);
+  const maxWait = deps.youtubeQuotaMaxWaitSeconds ?? 86400;
+  if (waitedSec >= maxWait) {
+    const msg =
+      'YouTube siguió sin permitir subidas durante 24 h (cuota agotada). Reintentá la publicación más tarde: ' +
+      'el video ya está generado y no se vuelve a pagar.';
+    const recorded = await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
+      delivery: 'upload_failed',
+      youtubeUploadStartedAt: null,
+      youtubeUploadError: msg,
+      youtubeUploadFailedAt: nowIso,
+      youtubeQuotaSince: null,
+      youtubeQuotaWaits: 0,
+    });
+    if (!recorded) return;
+    deps.logger.warn(`Item ${item.itemKey}: cuota de YouTube agotada más de ${Math.round(maxWait / 3600)} h → upload_failed (retry manual)`);
+    await deps.scheduler.failItem(item.itemRunId, deps.executorId, `youtube_upload_failed: ${msg}`, false);
+    return;
+  }
+  const recorded = await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
+    delivery: 'blocked_quota',
+    youtubeUploadStartedAt: null,
+    youtubeBlockedAt: nowIso,
+    youtubeBlockDetail: detail,
+    youtubeQuotaSince: since,
+    youtubeQuotaWaits: Number(summary.youtubeQuotaWaits ?? 0) + 1,
+  });
+  if (!recorded) {
+    deps.logger.warn(`Item ${item.itemKey}: lease perdida al registrar blocked_quota`);
+    return;
+  }
+  deps.logger.warn(`Item ${item.itemKey}: entrega YouTube blocked_quota (espera ${Number(summary.youtubeQuotaWaits ?? 0) + 1})`);
+  await deps.scheduler.failItem(item.itemRunId, deps.executorId, `youtube_blocked_quota: ${detail}`, true, undefined, {
+    retryAfterSeconds: deps.youtubeQuotaRetrySeconds ?? 3600,
+    refundAttempt: true,
+  });
+}
+
+/** Subida fallida SIN video creado (descarga del MP4, 5xx/red al iniciar, 5xx explícito): se reintenta SOLO la subida. */
+async function markUploadFailed(deps: DynamicItemWorkerDeps, item: ClaimedItem, detail: string): Promise<boolean> {
+  return deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
+    delivery: 'upload_failed',
+    youtubeUploadStartedAt: null,
+    youtubeUploadError: detail.slice(0, 500),
+    youtubeUploadFailedAt: new Date().toISOString(),
+  });
+}
+
+/** Subida ambigua: el marcador queda; nunca se re-sube sola (resolución explícita). */
+async function failAmbiguous(deps: DynamicItemWorkerDeps, item: ClaimedItem, why: string): Promise<void> {
+  const recorded = await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, { delivery: 'ambiguous' });
+  if (!recorded) {
+    deps.logger.warn(`Item ${item.itemKey}: lease perdida al registrar la subida ambigua`);
+    return;
+  }
+  await deps.scheduler.failItem(
+    item.itemRunId,
+    deps.executorId,
+    `ambiguous_youtube_upload: ${why}. Puede existir ya un video en el canal: revisar el canal y resolver con ` +
+      '"confirmar el video existente" (id) o "autorizar una nueva subida" — no se re-sube automáticamente ' +
+      'y el video de Videogen no se vuelve a generar.',
+    false,
+  );
 }
 
 async function publishYoutubeAndComplete(
@@ -655,15 +830,13 @@ async function publishYoutubeAndComplete(
   if (!youtubeVideoId) {
     // Idempotencia (espejo de la regla de "video ambiguo" de 5A/R3): si una
     // subida anterior empezó y nunca registró el id, NO se vuelve a subir —
-    // podría existir ya un video en el canal. Decisión manual.
+    // podría existir ya un video en el canal. Decisión explícita del usuario.
     if (summary.youtubeUploadStartedAt) {
-      await scheduler.failItem(
-        item.itemRunId,
-        deps.executorId,
-        `ambiguous_youtube_upload: una subida a YouTube empezó el ${summary.youtubeUploadStartedAt} y no registró ` +
-          'el id del video (crash, lease perdida o error a mitad de la subida). Puede existir ya un video en el canal: ' +
-          'revisar el canal y resolver manualmente antes de reintentar (no se re-sube automáticamente).',
-        false,
+      await failAmbiguous(
+        deps,
+        item,
+        `una subida a YouTube empezó el ${summary.youtubeUploadStartedAt} y no registró el id del video ` +
+          '(crash, lease perdida o error a mitad de la subida)',
       );
       return;
     }
@@ -678,71 +851,87 @@ async function publishYoutubeAndComplete(
       return;
     }
 
-    const connection = await publisher.getConnection(runHead.ownerId);
-    if (!connection || connection.status !== 'active') {
-      await blockYoutubeDelivery(
-        deps,
-        item,
-        'blocked_auth',
-        `No hay conexión activa de YouTube (estado=${connection?.status ?? 'none'}). Reconecta tu canal y reintenta el item.`,
-      );
+    // DN-1: credenciales re-validadas JUSTO antes de subir (conexión activa,
+    // scope de subida, refresh del token). Fallo → blocked_auth sin marcar la
+    // subida (nada se envió a YouTube) y SIN tocar el render.
+    const light = await lightYoutubePreflight(publisher, runHead.ownerId);
+    if (light.ok === false) {
+      await blockYoutubeDelivery(deps, item, 'blocked_auth', `${light.reason}: ${YOUTUBE_PREFLIGHT_MESSAGES[light.reason]}`);
       return;
     }
     if (isLeaseLost()) return;
 
-    const marked = await scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
-      delivery: 'uploading_youtube',
-      youtubeUploadStartedAt: new Date().toISOString(),
-    });
-    if (!marked) {
-      logger.error(`Item ${item.itemKey}: lease perdida antes de subir a YouTube — se detiene sin subir`);
-      return;
-    }
-
     const chapterTitle = item.blueprint.chapter?.title ?? `Capítulo ${item.chapterNumber ?? '?'}`;
-    let result: YoutubeUploadResult;
-    try {
-      result = await publisher.uploadFromUrl(connection, {
-        downloadUrl,
-        title: chapterTitle,
-        description: `Capítulo ${item.chapterNumber ?? '?'} — ${item.blueprint.course.title}`,
-        privacyStatus: 'unlisted',
-        chapterNumber: item.chapterNumber ?? undefined,
+    const maxTries = Math.max(1, Math.floor(deps.youtubeUploadMaxTries ?? 3));
+    const baseMs = Math.max(0, deps.youtubeUploadRetryBaseMs ?? 2000);
+    let result: YoutubeUploadResult | null = null;
+    for (let attempt = 1; attempt <= maxTries && !result; attempt++) {
+      if (isLeaseLost()) return;
+      const marked = await scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
+        delivery: 'uploading_youtube',
+        youtubeUploadAttempts: Number(summary.youtubeUploadAttempts ?? 0) + attempt,
       });
-    } catch (err) {
-      if (err instanceof YoutubeQuotaException) {
-        await blockYoutubeDelivery(deps, item, 'blocked_quota', errMsg(err));
+      if (!marked) {
+        logger.error(`Item ${item.itemKey}: lease perdida antes de subir a YouTube — se detiene sin subir`);
         return;
       }
-      if (err instanceof UnauthorizedException) {
-        await blockYoutubeDelivery(deps, item, 'blocked_auth', errMsg(err));
-        return;
-      }
-      if (err instanceof BadRequestException) {
-        // Falla ANTES de enviar bytes a YouTube (descarga del MP4 de Videogen,
-        // archivo vacío o demasiado grande): no hay video creado → se limpia
-        // el marcador y se reintenta con backoff.
-        const cleared = await scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
-          delivery: 'completed_local',
-          youtubeUploadStartedAt: null,
+      // Review DN-1 M3: el marcador de subida se escribe recién cuando el MP4 ya
+      // se bajó (onBeforeUpload, antes del primer contacto con YouTube). Un
+      // crash o error durante la descarga NO deja una subida "ambigua".
+      let contactedYoutube = false;
+      try {
+        result = await publisher.uploadFromUrl(light.connection, {
+          downloadUrl,
+          title: chapterTitle,
+          description: `Capítulo ${item.chapterNumber ?? '?'} — ${item.blueprint.course.title}`,
+          privacyStatus: YOUTUBE_UPLOAD_PRIVACY,
+          chapterNumber: item.chapterNumber ?? undefined,
+          onBeforeUpload: async () => {
+            const ok = await scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
+              youtubeUploadStartedAt: new Date().toISOString(),
+            });
+            if (!ok) throw new UploadMarkerLeaseLost();
+            contactedYoutube = true;
+          },
         });
-        if (cleared) {
-          await scheduler.failItem(item.itemRunId, deps.executorId, `youtube_download_failed: ${errMsg(err)}`, true);
+      } catch (err) {
+        if (err instanceof UploadMarkerLeaseLost) {
+          logger.error(`Item ${item.itemKey}: lease perdida antes de contactar a YouTube — se detiene sin subir`);
+          return;
         }
+        // Sin contacto con YouTube (descarga/validación del MP4 o error previo): nunca es ambiguo.
+        const kind = contactedYoutube ? classifyYoutubeUploadError(err) : classifyPreUploadError(err);
+        logger.warn(`Item ${item.itemKey}: subida a YouTube falló (${kind}, intento ${attempt}/${maxTries})`);
+        if (kind === 'quota') {
+          await blockYoutubeDelivery(deps, item, 'blocked_quota', YOUTUBE_QUOTA_BLOCK_DETAIL);
+          return;
+        }
+        if (kind === 'auth') {
+          await blockYoutubeDelivery(deps, item, 'blocked_auth', YOUTUBE_AUTH_BLOCK_DETAIL);
+          return;
+        }
+        if (kind === 'ambiguous') {
+          await failAmbiguous(deps, item, `la subida a YouTube falló sin confirmar el resultado (${errMsg(err).slice(0, 200)})`);
+          return;
+        }
+        // download | transient: no se creó ningún video → marcador limpio.
+        const detail =
+          kind === 'download'
+            ? `No se pudo descargar el MP4 generado para subirlo (${errMsg(err).slice(0, 200)})`
+            : `YouTube respondió con un error temporal (${errMsg(err).slice(0, 200)})`;
+        const cleared = await markUploadFailed(deps, item, detail);
+        if (!cleared) return;
+        if (kind === 'transient' && attempt < maxTries) {
+          await sleep(baseMs * attempt);
+          continue;
+        }
+        // Agotado en este reclamo: reintento automático con backoff del
+        // scheduler (solo la subida); sin intentos → failed + retry explícito.
+        await scheduler.failItem(item.itemRunId, deps.executorId, `youtube_upload_failed: ${detail}`, true);
         return;
       }
-      // Cualquier otro error (red, 5xx, timeout a mitad del PUT) puede haber
-      // dejado el video creado en el canal: el marcador queda y se falla sin
-      // reintento automático (decisión manual, nunca un segundo video).
-      await scheduler.failItem(
-        item.itemRunId,
-        deps.executorId,
-        `ambiguous_youtube_upload: la subida a YouTube falló sin confirmar el resultado (${errMsg(err)}). ` +
-          'Puede existir ya un video en el canal: revisar y resolver manualmente (no se re-sube automáticamente).',
-        false,
-      );
-      return;
     }
+    if (!result) return;
 
     youtubeVideoId = result.videoId;
     youtubeUrl = canonicalYoutubeWatchUrl(result.videoId);
@@ -802,6 +991,7 @@ async function publishYoutubeAndComplete(
     upsert: false,
   });
 
+  // Terminal SOLO con youtubeVideoId + URL final validada (DN-1).
   const ok = await scheduler.completeItem(item.itemRunId, deps.executorId, {
     artifactIds: [artifact.id],
     summary: {
@@ -849,6 +1039,7 @@ async function bootstrap() {
   const configuredDelivery = reportVideoDeliveryConfigAtStartup(logger) ?? 'INVALIDO (ver error)';
   const app = await NestFactory.createApplicationContext(AppModule, { logger: ['log', 'warn', 'error'] });
   const youtubeService = app.get(YoutubeService);
+  const youtubeTokenService = app.get(YoutubeTokenService);
   const youtubeUploadService = app.get(YoutubeUploadService);
 
   const deps: DynamicItemWorkerDeps = {
@@ -867,9 +1058,14 @@ async function bootstrap() {
     // Solo se invoca para runs congelados con videoDelivery='youtube' y
     // videoMode='real' (requiere la conexión OAuth de YouTube del dueño).
     youtube: {
-      getConnection: (ownerId) => youtubeService.getConnection(ownerId),
+      getConnection: (ownerId) => resolveYoutubeConnectionFor(youtubeService, ownerId),
+      getAccessToken: (connection) => youtubeTokenService.getAccessToken(connection.encryptedRefreshToken, connection.tokenIv),
       uploadFromUrl: (connection, options) => youtubeUploadService.uploadFromUrl(connection, options),
     },
+    youtubeUploadMaxTries: readPositiveInt('DYNAMIC_YOUTUBE_UPLOAD_MAX_TRIES', 3),
+    youtubeUploadRetryBaseMs: readPositiveInt('DYNAMIC_YOUTUBE_UPLOAD_RETRY_BASE_MS', 2000),
+    youtubeQuotaRetrySeconds: readPositiveInt('DYNAMIC_YOUTUBE_QUOTA_RETRY_SECONDS', 3600),
+    youtubeQuotaMaxWaitSeconds: readPositiveInt('DYNAMIC_YOUTUBE_QUOTA_MAX_WAIT_SECONDS', 86400),
   };
   const pollMs = readPositiveInt('DYNAMIC_ITEM_WORKER_POLL_MS', 5000);
   const concurrency = readPositiveInt('DYNAMIC_ITEM_WORKER_CONCURRENCY', 1);

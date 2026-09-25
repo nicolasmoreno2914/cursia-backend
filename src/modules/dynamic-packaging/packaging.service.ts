@@ -6,6 +6,7 @@ import { GenerationManifestsService, ManifestDto } from '../generation-manifests
 import { ArtifactsService } from '../artifacts/artifacts.service';
 import { resolveRunArtifacts } from './artifact-resolver';
 import { PackagingNotReadyError } from './packaging-types';
+import { frozenVideoDeliveryOf, youtubeDeliveryProblems } from '../dynamic-generation/dynamic-video-delivery';
 import { packageReuseHash, resolveDynamicMoodleVersion, sortedArtifactIds } from './packaging-reuse-key';
 import { DYNAMIC_MBZ_BUILDER_VERSION } from '../../package/dynamic-mbz-builder';
 import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
@@ -350,6 +351,29 @@ export class PackagingService {
         `La ejecución ${run.id} no está lista para empaquetar (worker_status=${run.worker_status}, ` +
         `${missing.length} item(s) sin completar) missingJson=${JSON.stringify(missing)}`;
       throw new ConflictException({ message, missing });
+    }
+
+    // DN-1: run youtube → cada video tiene que estar publicado (id + URL final
+    // + delivery completed). Si no → 409 con las keys, antes de encolar nada.
+    if (hasVideoItem && frozenVideoDeliveryOf(run.input_payload) === 'youtube') {
+      const rows: Array<{ item_key: string; status: string; output_summary: Record<string, any> | null }> = await this.dataSource.query(
+        `select gir.item_key, gir.status, gir.output_summary from ${effectiveOutputRowsSql('$1')} gir where gir.type = 'video'`,
+        [run.id],
+      );
+      const byKey = new Map(rows.map((r) => [r.item_key, r]));
+      const ytMissing = manifest.manifest.items
+        .filter((it) => it.type === 'video')
+        .flatMap((it) => {
+          const r = byKey.get(it.key);
+          return youtubeDeliveryProblems(it.key, r?.status ?? null, r?.output_summary ?? null);
+        });
+      if (ytMissing.length > 0) {
+        const message =
+          `youtube_delivery_incomplete: la ejecución ${run.id} tiene videos sin publicar en YouTube ` +
+          `(${ytMissing.length} problema(s)); el paquete solo se arma con cada video publicado (Unlisted). ` +
+          `missingJson=${JSON.stringify(ytMissing)}`;
+        throw new ConflictException({ message, missing: ytMissing, code: 'youtube_delivery_incomplete' });
+      }
     }
   }
 

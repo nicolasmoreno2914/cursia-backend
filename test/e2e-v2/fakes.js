@@ -2,6 +2,7 @@
 //  - Supabase Storage (mismos endpoints que usa el backend y el shim del navegador).
 //  - Videogen (batch-create / status / costs) → completed_local + download_url https LOCAL.
 //  - Servidor https local (cert autofirmado) que sirve el "MP4" de cada job.
+//  - Google (OAuth + YouTube Data API v3) para la fase YouTube (DN-1).
 'use strict';
 const http = require('http');
 const https = require('https');
@@ -105,9 +106,65 @@ function startHttpsVideos(tlsDir, videogen) {
     if (!m || !videogen.jobs.has(m[1])) { rs.writeHead(404); return rs.end('nf'); }
     downloads.push(m[1]);
     rs.writeHead(200, { 'content-type': 'video/mp4' });
-    rs.end(Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypmp42'), Buffer.from(`fake-mp4:${m[1]}`)]));
+    // ≥ 1 KB: YoutubeUploadService (legacy) rechaza archivos < 1024 bytes como vacíos (fase YouTube, DN-1).
+    rs.end(Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypmp42'), Buffer.from(`fake-mp4:${m[1]}`), Buffer.alloc(4096, 0)]));
   });
   return { srv, downloads };
+}
+
+// Google FALSO (DN-1): OAuth token (refresh), channels.list mine=true y subida
+// resumable de YouTube. Registra cada llamada; `initPlan` programa respuestas
+// del POST de inicio ('ok' | status HTTP) para probar reintentos.
+function startGoogle() {
+  const g = { refresh: new Map(), channels: new Map(), initPlan: [], calls: [], uploads: [], seq: 0, base: null };
+  const srv = http.createServer((rq, rs) => {
+    const chunks = [];
+    rq.on('data', (c) => chunks.push(c));
+    rq.on('end', () => {
+      const u = new URL(rq.url, 'http://x');
+      const body = Buffer.concat(chunks);
+      const json = (code, obj, headers = {}) => { rs.writeHead(code, { 'content-type': 'application/json', ...headers }); rs.end(JSON.stringify(obj)); };
+      g.calls.push(`${rq.method} ${u.pathname}`);
+      if (rq.method === 'POST' && u.pathname === '/token') {
+        const rt = new URLSearchParams(body.toString('utf8')).get('refresh_token');
+        const at = g.refresh.get(rt);
+        return at ? json(200, { access_token: at, expires_in: 3599 }) : json(400, { error: 'invalid_grant', error_description: 'fake revoked' });
+      }
+      const auth = String(rq.headers.authorization || '').replace(/^Bearer /, '');
+      if (rq.method === 'GET' && u.pathname === '/youtube/v3/channels') {
+        const c = g.channels.get(auth);
+        return json(200, { items: c ? [{ id: c.id, snippet: { title: c.title, thumbnails: { default: { url: c.thumb } } } }] : [] });
+      }
+      if (rq.method === 'GET' && u.pathname === '/youtube/v3/videos') {
+        // videos.list (part=snippet,status): los videos subidos a este fake pertenecen al canal del token.
+        const c = g.channels.get(auth);
+        if (!c) return json(401, { error: { message: 'bad token' } });
+        const id = u.searchParams.get('id');
+        const up = g.uploads.find((x) => x.videoId === id);
+        return json(200, { items: up ? [{ id, snippet: { channelId: c.id }, status: { privacyStatus: up.privacyStatus, uploadStatus: 'processed' } }] : [] });
+      }
+      if (rq.method === 'POST' && u.pathname === '/upload/youtube/v3/videos') {
+        if (!g.channels.get(auth)) return json(401, { error: { message: 'bad token' } });
+        const p = g.initPlan.shift() || 'ok';
+        if (typeof p === 'number') { rs.writeHead(p); return rs.end(`fake ${p}`); }
+        const meta = JSON.parse(body.toString('utf8') || '{}');
+        const n = ++g.seq;
+        g.uploads.push({ n, title: meta.snippet && meta.snippet.title, privacyStatus: meta.status && meta.status.privacyStatus, bytes: 0, videoId: null });
+        rs.writeHead(200, { location: `${g.base}/upload-session/${n}` });
+        return rs.end();
+      }
+      let m;
+      if (rq.method === 'PUT' && (m = u.pathname.match(/^\/upload-session\/(\d+)$/))) {
+        const up = g.uploads.find((x) => x.n === Number(m[1]));
+        if (!up) return json(404, { error: 'no session' });
+        up.bytes = body.length;
+        up.videoId = `YtE2E${String(up.n).padStart(6, '0')}`;
+        return json(200, { id: up.videoId, kind: 'youtube#video' });
+      }
+      json(404, { error: `unhandled ${rq.method} ${u.pathname}` });
+    });
+  });
+  return { srv, g };
 }
 
 async function listen(srv) {
@@ -120,16 +177,20 @@ async function startFakes({ tlsDir, videogenKey }) {
   let httpsBase = null;
   const videogen = startVideogen(videogenKey, () => httpsBase);
   const vids = startHttpsVideos(tlsDir, videogen);
+  const google = startGoogle();
   const sp = await listen(storage.srv);
   const vp = await listen(videogen.srv);
   const hp = await listen(vids.srv);
+  const gp = await listen(google.srv);
   httpsBase = `https://127.0.0.1:${hp}`;
+  google.g.base = `http://127.0.0.1:${gp}`;
   return {
     storageUrl: `http://127.0.0.1:${sp}`,
     videogenUrl: `http://127.0.0.1:${vp}`,
+    googleUrl: google.g.base,
     httpsBase,
-    storage, videogen, vids,
-    close: async () => { for (const s of [storage.srv, videogen.srv, vids.srv]) await new Promise((r) => s.close(() => r())); },
+    storage, videogen, vids, google: google.g,
+    close: async () => { for (const s of [storage.srv, videogen.srv, vids.srv, google.srv]) await new Promise((r) => s.close(() => r())); },
   };
 }
 

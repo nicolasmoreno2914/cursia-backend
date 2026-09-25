@@ -49,22 +49,39 @@ export async function applyItemFailure(
   itemRunId: string,
   error: string,
   retryable: boolean,
+  /**
+   * DN-1: espera explícita antes del próximo intento (p.ej. cuota diaria de
+   * YouTube). Ausente → backoff estándar. Solo cambia `next_retry_at`.
+   */
+  retryAfterSeconds?: number | null,
+  /**
+   * DN-1 (review I2): la espera NO consume un intento — se devuelve el que
+   * contó el claim (attempt_count - 1) y el item pasa a `retrying` aunque esté
+   * en su último intento. Uso: espera de cuota de YouTube (contador y tope
+   * propios en output_summary, fuera de max_attempts).
+   */
+  refundAttempt = false,
 ): Promise<FailedTransition | null> {
+  const retryAfter =
+    typeof retryAfterSeconds === 'number' && Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+      ? Math.floor(retryAfterSeconds)
+      : null;
   const [row] = returningRows(
     await qr.query(
       `update public.generation_item_runs
-          set status = case when $3::boolean and attempt_count < max_attempts then 'retrying' else 'failed' end,
-              next_retry_at = case when $3::boolean and attempt_count < max_attempts
-                then now() + make_interval(secs => least($5::int, $4::int * power(2, greatest(attempt_count, 1) - 1)))
+          set status = case when $3::boolean and ($7::boolean or attempt_count < max_attempts) then 'retrying' else 'failed' end,
+              next_retry_at = case when $3::boolean and ($7::boolean or attempt_count < max_attempts)
+                then now() + make_interval(secs => coalesce($6::int, least($5::int, $4::int * power(2, greatest(attempt_count, 1) - 1))))
                 else null end,
-              finished_at = case when $3::boolean and attempt_count < max_attempts then null else now() end,
+              finished_at = case when $3::boolean and ($7::boolean or attempt_count < max_attempts) then null else now() end,
+              attempt_count = case when $3::boolean and $7::boolean then greatest(attempt_count - 1, 0) else attempt_count end,
               worker_id = null,
               lease_until = null,
               error = $2,
               updated_at = now()
         where id = $1 and status = 'running'
         returning id, status, job_id, manifest_id, generation, item_key`,
-      [itemRunId, error, retryable, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS],
+      [itemRunId, error, retryable, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS, retryAfter, !!refundAttempt],
     ),
   );
   if (!row) return null;

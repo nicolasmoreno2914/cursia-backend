@@ -56,7 +56,11 @@ import {
  * fix). Se incluye en el hash de reuse y en la metadata del artifact
  * `dynamic_mbz` — ver `dynamic-package-worker.ts`.
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION = '1.2.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION = '1.3.0';
+// 1.3.0 (DN-1): el video de un run `youtube` pasa de actividad `url` a un
+// `label` (mismo lugar, mismos ids) con el link de YouTube que el filtro
+// multimedia de Moodle convierte en reproductor embebido. `videogen_direct`
+// produce exactamente los mismos bytes que 1.2.0 (sha256 fijado).
 // 1.2.0 (5B.2.B, rulesVersion 2): intros de curso/módulo y bibliografía en el
 // Libro Guía, SOLO para planes v2. Un plan v1 produce exactamente los mismos
 // bytes que 1.1.0 (sha256 fijado en check-dynamic-video-delivery.js con reloj
@@ -274,7 +278,7 @@ function libroCardHtml(libroMid: number): string {
  */
 function chapterIntroHtml(ch: PackagingChapterPlan, color: ModuleColor, hasVideo: boolean, videoDelivery?: 'youtube'): string {
   const videoNotice = videoDelivery === 'youtube'
-    ? `<p>🎬 Este capítulo incluye un video que se abre en YouTube.</p>`
+    ? `<p>🎬 Este capítulo incluye un video, justo debajo.</p>`
     : `<p>🎬 Este capítulo incluye un video que se abre en una pestaña externa.</p>`;
   return `<div style="border-left:4px solid #${color.main};padding:16px 20px;font-family:'Segoe UI',Arial,sans-serif;">`
     + `<span style="text-transform:uppercase;font-size:11px;font-weight:700;color:#${color.main};">Capítulo ${ch.chapterNumber}</span>`
@@ -291,11 +295,27 @@ function ctaLabelHtml(ch: PackagingChapterPlan, color: ModuleColor, scormMid: nu
     + `</div>`;
 }
 
-function videoUrlIntroHtml(ch: PackagingChapterPlan, videoDelivery?: 'youtube'): string {
-  if (videoDelivery === 'youtube') {
-    return `<p>Video del capítulo ${ch.chapterNumber} — ${esc(ch.title)}. Este video se abre en YouTube (no está embebido en el curso).</p>`;
-  }
+function videoUrlIntroHtml(ch: PackagingChapterPlan): string {
   return `<p>Video del capítulo ${ch.chapterNumber} — ${esc(ch.title)}. Este video se abre en una pestaña externa (no está embebido en el curso).</p>`;
+}
+
+/**
+ * DN-1: label del video de YouTube. El PRIMER `<a>` es un link plano a
+ * `https://www.youtube.com/watch?v=<id>`: el filtro multimedia de Moodle
+ * (filter_mediaplugin, activo por defecto) lo reemplaza por el reproductor
+ * embebido (media_youtube). El segundo es el respaldo accesible (abre YouTube)
+ * y lleva `class="nomediaplugin"` para que el filtro NO lo convierta en un
+ * segundo reproductor. Con el filtro apagado, ambos quedan como links.
+ */
+function youtubeEmbedLabelHtml(ch: PackagingChapterPlan, color: ModuleColor, watchUrl: string): string {
+  const title = `Video del capítulo ${ch.chapterNumber} — ${esc(ch.title)}`;
+  return `<div style="border-left:4px solid #${color.main};padding:12px 16px;font-family:'Segoe UI',Arial,sans-serif;">`
+    + `<p style="margin:0 0 8px;font-weight:700;">🎬 ${title}</p>`
+    // <div> (no <p>): el filtro reemplaza el <a> por un bloque (div del reproductor).
+    + `<div style="margin:0;"><a href="${esc(watchUrl)}">${title}</a></div>`
+    + `<p style="margin:8px 0 0;font-size:13px;">¿No se ve el reproductor? `
+    + `<a class="nomediaplugin" href="${esc(watchUrl)}" target="_blank" rel="noopener">Ver el video en YouTube</a>.</p>`
+    + `</div>`;
 }
 
 function scormIntroHtml(ch: PackagingChapterPlan): string {
@@ -831,14 +851,17 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
       const ctaAid = actId++; const ctaMid = modId++; const ctaCtx = ctxId++;
       const scormAid = actId++; const scormMid = modId++; const scormCtx = ctxId++;
 
+      // DN-1: run youtube → el video es un label (embed), en el MISMO lugar e ids que la url.
+      const chapterVideo = ch.videoItemKey ? contents.videos.get(ch.chapterId) : undefined;
+      const videoAsYoutubeLabel = chapterVideo?.delivery === 'youtube';
       ctaMap[introMid] = 'label';
-      if (ch.videoItemKey) ctaMap[videoMid] = 'url';
+      if (ch.videoItemKey) ctaMap[videoMid] = videoAsYoutubeLabel ? 'label' : 'url';
       ctaMap[ctaMid] = 'label';
       ctaMap[scormMid] = 'scorm';
 
       // 1. Intro
       const introName = safeActivityName(`📖 Capítulo ${ch.chapterNumber} — ${ch.title}`);
-      const chapterVideoDelivery = ch.videoItemKey ? contents.videos.get(ch.chapterId)?.delivery : undefined;
+      const chapterVideoDelivery = chapterVideo?.delivery;
       const introContent = sanitizeTokens(chapterIntroHtml(ch, color, !!ch.videoItemKey, chapterVideoDelivery));
       const introDir = `activities/label_${introMid}`;
       zip.file(`${introDir}/label.xml`, labelXmlWithCtx(introAid, introMid, introCtx, introName, introContent, ts));
@@ -850,12 +873,28 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
       actSettings.push({ mid: introMid, modname: 'label', title: introName });
       pushAct(mod.sectionNum, introMid);
 
-      // 2. Video (url externa) — solo si el Manifest lo incluye
-      if (ch.videoItemKey) {
+      // 2a. Video de YouTube (DN-1): label con el link que Moodle embebe.
+      if (ch.videoItemKey && videoAsYoutubeLabel) {
+        const video = chapterVideo!;
+        const videoName = safeActivityName(`🎬 Video del capítulo ${ch.chapterNumber} — ${ch.title}`);
+        const videoDir = `activities/label_${videoMid}`;
+        const videoContent = sanitizeTokens(youtubeEmbedLabelHtml(ch, color, video.url));
+        zip.file(`${videoDir}/label.xml`, labelXmlWithCtx(videoAid, videoMid, videoCtx, videoName, videoContent, ts));
+        zip.file(`${videoDir}/module.xml`, moduleXml(videoMid, 'label', mod.sectionNum, ts, MV.bv));
+        zip.file(`${videoDir}/inforef.xml`, inforefXml());
+        zip.file(`${videoDir}/grades.xml`, gradesXml(videoAid));
+        writeActFiles(zip, videoDir);
+        mbzActivities.push({ mid: videoMid, secnum: mod.sectionNum, modname: 'label', title: videoName, dir: videoDir });
+        actSettings.push({ mid: videoMid, modname: 'label', title: videoName });
+        pushAct(mod.sectionNum, videoMid);
+      }
+
+      // 2b. Video (url externa, videogen_direct) — solo si el Manifest lo incluye
+      if (ch.videoItemKey && !videoAsYoutubeLabel) {
         const video = contents.videos.get(ch.chapterId)!;
         const videoName = safeActivityName(`🎬 Video del capítulo ${ch.chapterNumber} — ${ch.title}`);
         const videoDir = `activities/url_${videoMid}`;
-        const videoIntro = sanitizeTokens(videoUrlIntroHtml(ch, video.delivery));
+        const videoIntro = sanitizeTokens(videoUrlIntroHtml(ch));
         zip.file(`${videoDir}/url.xml`, urlActivityXml({ aid: videoAid, mid: videoMid, ctx: videoCtx, name: videoName, introHtml: videoIntro, externalUrl: video.url, ts }));
         zip.file(`${videoDir}/module.xml`, moduleXml(videoMid, 'url', mod.sectionNum, ts, MV.bv));
         zip.file(`${videoDir}/inforef.xml`, inforefXml());
