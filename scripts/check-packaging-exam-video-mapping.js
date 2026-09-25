@@ -1,0 +1,329 @@
+#!/usr/bin/env node
+/* eslint-disable */
+// Fase 5B.1 — regresión del mapeo examen/video por UUID (sin DB, sin red).
+//
+// Fixture del criterio de aceptación de Fase 4, que el curso real 39 no
+// reproducía: 4 módulos {2,5,1,3}; exámenes M1 ON, M2 OFF, M3 ON, M4 ON (un
+// módulo intermedio SIN examen); videos en los capítulos globales
+// 1, 3, 5, 8, 10 y 11.
+//
+// Recorre Blueprint snapshot → Generation Manifest → PackagingPlan →
+// buildDynamicMbz con los módulos COMPILADOS de dist/ (igual que
+// check-packaging-plan-determinism.js), y verifica el .mbz resultante por UUID,
+// no solo por conteo: cada contenido de entrada lleva un marcador con el UUID
+// de su capítulo o módulo, y el check exige que ese marcador aparezca en la
+// actividad correcta dentro de la sección de Moodle correcta.
+//
+// Usage:
+//   node scripts/check-packaging-exam-video-mapping.js
+//   node scripts/check-packaging-exam-video-mapping.js path/to/dist
+
+const path = require('path');
+
+const distRoot = path.resolve(process.cwd(), process.argv[2] || 'dist');
+
+function loadDist(relPath) {
+  const abs = path.join(distRoot, relPath);
+  try {
+    return require(abs);
+  } catch (err) {
+    console.error(`❌ No se pudo cargar el módulo compilado en ${abs}`);
+    console.error(`   (¿corriste "npm run build" antes? — dist/ no se versiona)`);
+    console.error(`   ${err.message}`);
+    process.exit(1);
+  }
+}
+
+const { buildBlueprintSnapshot, snapshotSha256 } = loadDist('modules/course-blueprints/blueprint-snapshot.js');
+const { buildGenerationManifest } = loadDist('modules/generation-manifests/generation-manifest-builder.js');
+const { buildPackagingPlan } = loadDist('modules/dynamic-packaging/packaging-plan.js');
+const { buildDynamicMbz } = loadDist('package/dynamic-mbz-builder.js');
+const JSZip = require('jszip');
+
+let failures = 0;
+function check(name, fn) {
+  try {
+    fn();
+    console.log(`✅ ${name}`);
+  } catch (err) {
+    failures += 1;
+    console.error(`❌ ${name}`);
+    console.error(`   ${err && err.message ? err.message : err}`);
+  }
+}
+function assertDeepEqual(actual, expected, msg) {
+  const a = JSON.stringify(actual);
+  const e = JSON.stringify(expected);
+  if (a !== e) throw new Error(`${msg}: esperado ${e}, encontrado ${a}`);
+}
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg);
+}
+
+// ---------------------------------------------------------------------------
+// Fixture del criterio. UUIDs fijos (v4) para que un fallo sea reproducible.
+// ---------------------------------------------------------------------------
+
+const M = [
+  'a1000000-0000-4000-8000-000000000001',
+  'a1000000-0000-4000-8000-000000000002',
+  'a1000000-0000-4000-8000-000000000003',
+  'a1000000-0000-4000-8000-000000000004',
+];
+const EXAM_BY_MODULE = [true, false, true, true];
+const CHAPTERS_PER_MODULE = [2, 5, 1, 3];
+const VIDEO_CHAPTER_NUMBERS = [1, 3, 5, 8, 10, 11];
+
+function chapterUuid(n) {
+  return `c2000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+}
+
+function buildFixture() {
+  const modules = M.map((id, i) => ({
+    id,
+    position: i,
+    title: `Módulo criterio ${i + 1}`,
+    objective: `Objetivo del módulo ${i + 1}`,
+    exam_enabled: EXAM_BY_MODULE[i],
+  }));
+  const chapters = [];
+  let n = 0;
+  CHAPTERS_PER_MODULE.forEach((count, mi) => {
+    for (let ci = 0; ci < count; ci++) {
+      n += 1;
+      chapters.push({
+        id: chapterUuid(n),
+        module_id: M[mi],
+        position: ci,
+        title: `Capítulo criterio ${n}`,
+        objective: null,
+        video_enabled: VIDEO_CHAPTER_NUMBERS.includes(n),
+      });
+    }
+  });
+  const snapshot = buildBlueprintSnapshot({ id: 9001, title: 'Curso fixture criterio M1/M3/M4' }, modules, chapters);
+  const manifest = buildGenerationManifest(snapshot, {
+    courseId: 9001,
+    blueprintId: 9001,
+    blueprintNumber: 1,
+    blueprintSha256: snapshotSha256(snapshot),
+  });
+  const plan = buildPackagingPlan(manifest, snapshot, { manifestId: 9001 });
+  return { snapshot, manifest, plan };
+}
+
+// Marcadores con UUID en cada contenido de entrada.
+const chMark = (uuid) => `MARKCH${uuid}`;
+const modMark = (uuid) => `MARKMOD${uuid}`;
+
+function buildContents(plan) {
+  const contents = { contentMd: new Map(), scorm: new Map(), examGift: new Map(), videos: new Map() };
+  for (const m of plan.modules) {
+    if (m.examItemKey) {
+      contents.examGift.set(
+        m.moduleId,
+        [1, 2, 3].map((q) => `::Q${q}:: Pregunta ${q} ${modMark(m.moduleId)} {=correcta ~incorrecta}`).join('\n\n'),
+      );
+    }
+    for (const c of m.chapters) {
+      contents.contentMd.set(c.chapterId, `# ${c.title}\n\nContenido ${chMark(c.chapterId)}.`);
+      contents.scorm.set(c.chapterId, {
+        html: `<html><body><h1>${chMark(c.chapterId)}</h1></body></html>`,
+        manifestXml: `<?xml version="1.0"?><manifest identifier="cap${c.chapterNumber}"></manifest>`,
+      });
+      if (c.videoItemKey) {
+        contents.videos.set(c.chapterId, {
+          url: `https://videosb.nomaddi.com/api/videos/${c.chapterId}/download`,
+          videogenJobId: `job-${c.chapterId}`,
+        });
+      }
+    }
+  }
+  return contents;
+}
+
+// ---------------------------------------------------------------------------
+// Lectura del .mbz
+// ---------------------------------------------------------------------------
+
+async function readMbz(buf) {
+  const zip = await JSZip.loadAsync(buf);
+  const text = async (f) => {
+    const e = zip.file(f);
+    if (!e) throw new Error(`falta ${f} en el .mbz`);
+    return e.async('string');
+  };
+
+  // moduleid → número de sección, desde sections/section_N/section.xml
+  const sectionOfModule = {};
+  const sectionNumbers = [];
+  for (const f of Object.keys(zip.files).filter((x) => /^sections\/section_\d+\/section\.xml$/.test(x))) {
+    const x = await text(f);
+    const num = Number((x.match(/<number>(\d+)<\/number>/) || [])[1]);
+    sectionNumbers.push(num);
+    const seq = (x.match(/<sequence>([^<]*)<\/sequence>/) || [])[1] || '';
+    seq.split(',').filter(Boolean).forEach((mid, idx) => {
+      sectionOfModule[mid] = { section: num, index: idx };
+    });
+  }
+
+  // Actividades: moduleid, modname, contextid y su xml principal.
+  const activities = [];
+  for (const f of Object.keys(zip.files).filter((x) => /^activities\/(\w+)_(\d+)\/\1\.xml$/.test(x))) {
+    const [, modname, mid] = f.match(/^activities\/(\w+)_(\d+)\//);
+    const xml = await text(f);
+    const ctx = (xml.match(/contextid="(\d+)"/) || [])[1];
+    activities.push({ modname, mid, ctx, xml, ...sectionOfModule[mid] });
+  }
+
+  // files.xml → blobs por contexto
+  const filesXml = await text('files.xml');
+  const files = [...filesXml.matchAll(/<file id="\d+">([\s\S]*?)<\/file>/g)].map((m) => {
+    const b = m[1];
+    const g = (tag) => (b.match(new RegExp(`<${tag}>([^<]*)</${tag}>`)) || [])[1];
+    return { hash: g('contenthash'), ctx: g('contextid'), comp: g('component'), area: g('filearea'), name: g('filename') };
+  });
+  const blob = async (hash) => text(`files/${hash.slice(0, 2)}/${hash}`);
+
+  const questionsXml = await text('questions.xml');
+  return { activities, files, blob, questionsXml, sectionNumbers };
+}
+
+// ---------------------------------------------------------------------------
+// Checks
+// ---------------------------------------------------------------------------
+
+(async () => {
+  const { manifest, plan } = buildFixture();
+  const contents = buildContents(plan);
+  const buf = await buildDynamicMbz({ plan, contents });
+  const mbz = await readMbz(buf);
+
+  const chapterByNumber = {};
+  for (const m of plan.modules) for (const c of m.chapters) chapterByNumber[c.chapterNumber] = c;
+  const moduleByUuid = Object.fromEntries(plan.modules.map((m) => [m.moduleId, m]));
+
+  check('Manifest: exam solo en M1/M3/M4 (por UUID), video solo en caps 1,3,5,8,10,11 (por UUID)', () => {
+    const examModules = manifest.items.filter((i) => i.type === 'exam').map((i) => i.moduleId);
+    assertDeepEqual(examModules, [M[0], M[2], M[3]], 'exam items');
+    const videoChapters = manifest.items.filter((i) => i.type === 'video').map((i) => i.chapterId);
+    assertDeepEqual(videoChapters, VIDEO_CHAPTER_NUMBERS.map(chapterUuid), 'video items');
+  });
+
+  check('Plan: capítulos 1..11 globales, módulo y posición correctos por UUID', () => {
+    const got = plan.modules.flatMap((m) => m.chapters.map((c) => [c.chapterNumber, c.chapterId, c.moduleId, m.sectionNum]));
+    let n = 0;
+    const expected = [];
+    CHAPTERS_PER_MODULE.forEach((count, mi) => {
+      for (let ci = 0; ci < count; ci++) {
+        n += 1;
+        expected.push([n, chapterUuid(n), M[mi], 2 + mi]);
+      }
+    });
+    assertDeepEqual(got, expected, 'chapters');
+    assertDeepEqual(plan.totals, { modules: 4, chapters: 11, scorms: 11, videos: 6, exams: 3 }, 'totals');
+  });
+
+  check('Plan: examItemKey por UUID — M2 (intermedio) sin examen', () => {
+    assertDeepEqual(
+      plan.modules.map((m) => [m.moduleId, m.examItemKey]),
+      [[M[0], `exam:${M[0]}`], [M[1], null], [M[2], `exam:${M[2]}`], [M[3], `exam:${M[3]}`]],
+      'examItemKey',
+    );
+  });
+
+  check('.mbz: secciones 0..5 exactamente (sin sección de cierre/examen final)', () => {
+    assertDeepEqual([...mbz.sectionNumbers].sort((a, b) => a - b), [0, 1, 2, 3, 4, 5], 'sections');
+  });
+
+  check('.mbz: 3 quiz, cada uno en la sección de su módulo y con las preguntas de ESE módulo (UUID)', () => {
+    const quizzes = mbz.activities.filter((a) => a.modname === 'quiz');
+    assert(quizzes.length === 3, `esperado 3 quiz, encontrado ${quizzes.length}`);
+    const got = [];
+    for (const q of quizzes) {
+      // preguntas del banco en el contexto de este quiz (contextinstanceid = moduleid)
+      const cats = [...mbz.questionsXml.matchAll(/<question_category id="\d+">([\s\S]*?)<\/question_category>/g)]
+        .map((m) => m[1])
+        .filter((b) => (b.match(/<contextinstanceid>(\d+)<\/contextinstanceid>/) || [])[1] === q.mid);
+      const marks = new Set();
+      for (const b of cats) for (const mm of b.matchAll(/MARKMOD([0-9a-f-]{36})/g)) marks.add(mm[1]);
+      assert(marks.size === 1, `quiz ${q.mid}: esperado preguntas de 1 módulo, encontrado ${[...marks].join(',') || 'ninguno'}`);
+      const moduleId = [...marks][0];
+      const mod = moduleByUuid[moduleId];
+      assert(mod, `quiz ${q.mid}: UUID de módulo desconocido ${moduleId}`);
+      assert(q.section === mod.sectionNum, `quiz del módulo ${moduleId} en sección ${q.section}, esperado ${mod.sectionNum}`);
+      got.push([moduleId, q.section]);
+    }
+    got.sort((a, b) => a[1] - b[1]);
+    assertDeepEqual(got, [[M[0], 2], [M[2], 4], [M[3], 5]], 'quiz por módulo');
+    assert(!quizzes.some((q) => /final/i.test(q.xml.match(/<name>([^<]*)<\/name>/)?.[1] || '')), 'hay un quiz "final"');
+    assert(!mbz.activities.some((a) => a.section === 3 && a.modname === 'quiz'), 'M2 (sección 3) tiene quiz');
+  });
+
+  check('.mbz: 6 url de video, cada una con el UUID de SU capítulo y en la sección de su módulo', () => {
+    const urls = mbz.activities.filter((a) => a.modname === 'url');
+    assert(urls.length === 6, `esperado 6 url, encontrado ${urls.length}`);
+    const got = urls
+      .map((u) => {
+        const ext = (u.xml.match(/<externalurl>([^<]*)<\/externalurl>/) || [])[1] || '';
+        const uuid = (ext.match(/videos\/([0-9a-f-]{36})\/download/) || [])[1];
+        const ch = plan.modules.flatMap((m) => m.chapters).find((c) => c.chapterId === uuid);
+        assert(ch, `url ${u.mid} sin UUID de capítulo conocido (${ext})`);
+        const mod = moduleByUuid[ch.moduleId];
+        assert(u.section === mod.sectionNum, `video del cap ${ch.chapterNumber} en sección ${u.section}, esperado ${mod.sectionNum}`);
+        return ch.chapterNumber;
+      })
+      .sort((a, b) => a - b);
+    assertDeepEqual(got, VIDEO_CHAPTER_NUMBERS, 'capítulos con video');
+  });
+
+  // Checks asíncronos (leen blobs del .mbz).
+  try {
+    const scorms = mbz.activities.filter((a) => a.modname === 'scorm');
+    assert(scorms.length === 11, `esperado 11 scorm, encontrado ${scorms.length}`);
+    const rows = [];
+    for (const s of scorms) {
+      const idx = mbz.files.find((f) => f.ctx === s.ctx && f.comp === 'mod_scorm' && f.area === 'content' && f.name === 'index.html');
+      assert(idx, `scorm ${s.mid} sin index.html`);
+      const html = await mbz.blob(idx.hash);
+      const uuid = (html.match(/MARKCH([0-9a-f-]{36})/) || [])[1];
+      const ch = plan.modules.flatMap((m) => m.chapters).find((c) => c.chapterId === uuid);
+      assert(ch, `scorm ${s.mid} sin UUID de capítulo conocido`);
+      assert(s.section === moduleByUuid[ch.moduleId].sectionNum, `scorm cap ${ch.chapterNumber} en sección ${s.section}`);
+      rows.push([s.section, s.index, ch.chapterNumber]);
+    }
+    rows.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    assertDeepEqual(rows.map((r) => r[2]), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], 'orden de SCORM por sección/sequence');
+    console.log('✅ .mbz: 11 SCORM, index.html con el UUID de su capítulo, en su sección y en orden (sin truncar tras el cap 9)');
+  } catch (err) {
+    failures += 1;
+    console.error('❌ .mbz: 11 SCORM por UUID/orden');
+    console.error(`   ${err.message}`);
+  }
+
+  try {
+    const res = mbz.activities.filter((a) => a.modname === 'resource');
+    assert(res.length === 1 && res[0].section === 1, 'esperado 1 resource (Libro Guía) en la sección 1');
+    const f = mbz.files.find((x) => x.ctx === res[0].ctx && x.comp === 'mod_resource' && x.area === 'content' && x.name === 'libro_guia_completo.html');
+    assert(f, 'falta libro_guia_completo.html');
+    const html = await mbz.blob(f.hash);
+    assert(/<\/html>\s*$/.test(html), 'el Libro Guía no cierra en </html>');
+    const order = [...html.matchAll(/MARKCH([0-9a-f-]{36})/g)].map((m) => m[1]);
+    const uniq = order.filter((u, i) => order.indexOf(u) === i);
+    assertDeepEqual(uniq, Array.from({ length: 11 }, (_, i) => chapterUuid(i + 1)), 'capítulos del Libro Guía');
+    console.log('✅ .mbz: Libro Guía con los 11 capítulos en orden por UUID (sin truncar tras el cap 9)');
+  } catch (err) {
+    failures += 1;
+    console.error('❌ .mbz: Libro Guía completo');
+    console.error(`   ${err.message}`);
+  }
+
+  if (failures > 0) {
+    console.error(`\n❌ ${failures} check(s) fallaron — mapeo examen/video por UUID roto.`);
+    process.exit(1);
+  }
+  console.log('\n✅ Mapeo examen/video por UUID OK (criterio M1/M3/M4, videos 1,3,5,8,10,11).');
+})().catch((err) => {
+  console.error('❌ Error inesperado:', err);
+  process.exit(1);
+});

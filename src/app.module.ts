@@ -22,6 +22,7 @@ import { CourseStructureModule } from './modules/course-structure/course-structu
 import { CourseBlueprintsModule } from './modules/course-blueprints/course-blueprints.module';
 import { GenerationManifestsModule } from './modules/generation-manifests/generation-manifests.module';
 import { DynamicGenerationModule } from './modules/dynamic-generation/dynamic-generation.module';
+import { DynamicPackagingModule } from './modules/dynamic-packaging/dynamic-packaging.module';
 
 @Module({
   imports: [
@@ -49,6 +50,7 @@ import { DynamicGenerationModule } from './modules/dynamic-generation/dynamic-ge
     CourseBlueprintsModule,
     GenerationManifestsModule,
     DynamicGenerationModule,
+    DynamicPackagingModule,
   ],
   controllers: [AppController],
   providers: [AppService],

@@ -63,6 +63,12 @@ jobs:
       - name: Check Generation Manifest determinism
         run: node scripts/check-generation-manifest-determinism.js
 
+      - name: Check Packaging Plan determinism (Fase 5B.1)
+        run: node scripts/check-packaging-plan-determinism.js
+
+      - name: Check Packaging exam/video mapping by UUID (Fase 5B.1)
+        run: node scripts/check-packaging-exam-video-mapping.js
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
@@ -176,6 +182,7 @@ jobs:
                ensure_pm2_process cursia-package-worker-staging start:package-worker
                ensure_pm2_process cursia-full-worker-staging start:full-worker
                ensure_pm2_process cursia-dynamic-item-worker-staging start:dynamic-item-worker
+               ensure_pm2_process cursia-dynamic-package-worker-staging start:dynamic-package-worker
                sudo pm2 save
                sudo pm2 status
 
