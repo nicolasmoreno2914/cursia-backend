@@ -19,6 +19,18 @@
 > `production_jobs.execution_mode` (paso 0). Ver [Orden de rollout](#orden-de-rollout-en-producción-schema-first).
 > El `runbook.md` del frontend (Paso 2 merge → Paso 4 migraciones) queda
 > **superado** por este orden.
+>
+> **Release curado (DN-7 → A).** Lo que se mergea a `main` es la rama
+> `release/cursia-v2` de este repo (V2 + readiness, **sin `course-setup`**, con
+> `deploy.yml` idéntico a `main`), vía PR **`release/cursia-v2` → `main`** —
+> nunca `staging` → `main`. El PR se abre como **DRAFT y queda en draft hasta
+> completar A1–A5**; se mergea recién en B1, **solo con A4 en exit 0**.
+> Mergearlo antes de A4 rompe todo el legacy de producción (`42703`). El PR
+> del frontend (`campuscloud-gen`, misma rama) se mergea después, en B4.
+> Orden estricto: A1 DN-6 (solo lectura) → A2 backup → A3 dry-run + `Plan
+> sha256` desde un checkout del HEAD del PR → A4 apply → A5 smoke legacy → B1
+> merge del PR backend → B2 `--verify-only` → B3 smoke legacy → B4 merge del
+> PR frontend → C allow-lists → flag → restart.
 
 ## Qué hay
 
@@ -67,7 +79,8 @@ mecanismo de placeholder sigue en el runner por si se reutiliza: un paso
 `[placeholder-unresolved]` hace que `--apply` se niegue salvo ese flag.)
 
 **¿Políticas de Storage en producción? Sí.** El ejecutor dynamic de V2 (y el
-`artifactUpload` legacy de `39-brandkit.js`/`41-course-setup.js`) sube a
+`artifactUpload` legacy de `39-brandkit.js`; `41-course-setup.js` no forma
+parte del release curado) sube a
 `cursia-artifacts` desde el navegador con el JWT del usuario, y el frontend de
 producción usa el mismo proyecto Supabase que esta base
 (`hriwbakbuypaiovvvkqh`, `20-supabase.js`). Sin políticas, cada upload de un
@@ -134,8 +147,9 @@ de `deploy.yml` — y decidir el worker) en un PR revisado. Anotar el resultado
    `hriwbakbuypaiovvvkqh` con ventana ≥ 7 días, o `pg_dump` manual guardado y
    anotado. Solo entonces `CONFIRM_BACKUP_TAKEN=yes`.
 2. **El código V2 todavía NO está en `main`** (schema-first, release-fix C1).
-   El runner se corre desde un checkout del **commit de release** (el mismo que
-   después se mergea), no desde el VPS (que tiene el código de `main`, sin este
+   El runner se corre desde un checkout del **commit HEAD del PR
+   `release/cursia-v2` → `main`** (el mismo que después se mergea en B1; si el
+   PR cambia, repetir A3), no desde el VPS (que tiene el código de `main`, sin este
    runner). Ya **no** hace falta que `deploy.yml` haya corrido: el paso 0
    ensancha el CHECK. Si el runner se corre después del merge (re-apply o
    verificación), también funciona: todo es idempotente.
@@ -154,16 +168,17 @@ corre nada contra producción.
 
 | Paso | Qué | Comando / criterio de OK |
 |---|---|---|
-| A0 | Decisiones previas: DN-1..DN-6, política de Storage (sección de abajo), `.env` de producción con `DYNAMIC_COURSE_STRUCTURE` ausente/`false` | anotado |
+| A0 | Owner gates: DN-1..DN-7 ya resueltas (2026-09-25); política de Storage (sección de abajo); `.env` de producción con `DYNAMIC_COURSE_STRUCTURE` ausente/`false`; PRs `release/cursia-v2` → `main` abiertos en **draft** | anotado |
 | A1 | DN-6 a mano (solo lectura) | SQL de la sección DN-6 → ambos conteos `0` |
 | A2 | Backup | PITR ≥ 7 días o `pg_dump` fechado → anotado |
-| A3 | Dry-run del runner desde el commit de release | `node scripts/prod/migrate-v2-production.js --env-file <env-solo-DB>` → exit 0, pasos 0..7 `[included]`, anotar `Plan sha256` |
+| A3 | Dry-run del runner desde un checkout del HEAD del PR backend `release/cursia-v2` | `node scripts/prod/migrate-v2-production.js --env-file <env-solo-DB>` → exit 0, pasos 0..7 `[included]`, anotar `Plan sha256` |
 | A4 | **Apply** (esquema V2 completo, código todavía de `main`) | `MIGRATION_ENV=production CONFIRM_PRODUCTION_REF=hriwbakbuypaiovvvkqh CONFIRM_BACKUP_TAKEN=yes DB_SSL=true node scripts/prod/migrate-v2-production.js --env-file <env-solo-DB> --apply --i-understand-this-mutates-production --expect-plan-sha256 <sha de A3>` → `✅ APPLY + verificación read-only OK.` (exit 0) |
 | A5 | Smoke **legacy** con el código de `main` sobre el esquema nuevo | biblioteca de cursos, crear curso, un job backend corto, descargar un artifact → todo OK (esperado: solo cambios aditivos) |
-| B1 | Merge del release a `main` | `deploy.yml` → `gh run list --workflow=deploy.yml --limit=1` = `completed/success` (su `migrate-production-jobs-constraints.js` re-aplica el mismo CHECK: idempotente) |
+| B1 | Merge del PR **backend** `release/cursia-v2` → `main` (sale de draft recién acá; **solo con A4 exit 0**) | `deploy.yml` → `gh run list --workflow=deploy.yml --limit=1` = `completed/success` (su `migrate-production-jobs-constraints.js` re-aplica el mismo CHECK: idempotente) |
 | B2 | Re-verificación (solo lectura) | `MIGRATION_ENV=production CONFIRM_PRODUCTION_REF=hriwbakbuypaiovvvkqh DB_SSL=true node scripts/prod/migrate-v2-production.js --env-file <env-solo-DB> --verify-only` → exit 0 |
-| B3 | Smoke legacy con el código nuevo | mismo smoke que A5 |
-| C | Allow-list y flag (Paso 5/6 del runbook) | primero `DYNAMIC_V2_ALLOWED_OWNERS` / `DYNAMIC_REAL_VIDEO_OWNERS`, después `DYNAMIC_COURSE_STRUCTURE=true`, `pm2 restart --update-env` de **todos** los procesos |
+| B3 | Smoke legacy con el código nuevo del backend | mismo smoke que A5 |
+| B4 | Merge del PR **frontend** `release/cursia-v2` → `main` (`campuscloud-gen`) | Cloudflare Pages → fetch cache-busted de `43-dynamic-structure-editor.js`; flag todavía OFF |
+| C | Allow-lists → flag → restart (runbook C) | primero `DYNAMIC_V2_ALLOWED_OWNERS` / `DYNAMIC_REAL_VIDEO_OWNERS`, después `DYNAMIC_COURSE_STRUCTURE=true`, al final `pm2 restart --update-env` de **todos** los procesos (incluidos los workers dynamic según HD-6) |
 
 Notas:
 
@@ -177,6 +192,18 @@ Notas:
   antes de B1 lo reporta como "CHECK de production_jobs … NO coinciden".
 - No mergear si A4 no terminó en exit 0: con el código V2 en `main` y el
   esquema viejo, el legacy entero falla con 42703.
+- **HD-6 (decisión del owner, antes de C):** `deploy.yml` (idéntico a `main`
+  en el release) no gestiona `cursia-dynamic-item-worker` ni
+  `cursia-dynamic-package-worker`. (a) Recomendado: agregarlos con
+  `ensure_pm2_process` en un PR revisado (idle con el flag OFF; exige editar
+  `mustEqualBase` de `scripts/release/v2-release-allowlist.json`). (b)
+  `pm2 start` manual en C **y** `pm2 restart … --update-env` de los dos
+  después de cada deploy posterior; si no, corren código viejo en memoria
+  sobre el `dist/` nuevo.
+- **Checks del release:** el PR corre `v2-release-checks` (no despliega). Su
+  autoridad es `scripts/release/v2-release-allowlist.json`, editada a mano:
+  revisar su diff. Si `main` avanza después de fijar `base.sha`, el check de
+  CI falla a propósito (actualizar el pin, re-auditar y repetir A3).
 
 ## Guardas (todas antes de conectar)
 
@@ -263,8 +290,8 @@ claves `DB_*` del `.env` de producción vía `--env-file`):
 
 ```bash
 ssh cursia@167.86.98.162
-git clone --branch <rama-de-release> --single-branch <url del repo orbia-backend> ~/cursia-v2-migrate
-cd ~/cursia-v2-migrate && git checkout <sha de release> && npm ci --omit=dev
+git clone --branch release/cursia-v2 --single-branch <url del repo orbia-backend> ~/cursia-v2-migrate
+cd ~/cursia-v2-migrate && git checkout <sha HEAD del PR backend release/cursia-v2> && npm ci --omit=dev
 node scripts/prod/migrate-v2-production.js --env-file /var/www/cursia-backend/.env   # dry-run; anotar "Plan sha256"
 MIGRATION_ENV=production \
 CONFIRM_PRODUCTION_REF=hriwbakbuypaiovvvkqh \

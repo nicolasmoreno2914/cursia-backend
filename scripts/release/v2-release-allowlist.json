@@ -241,8 +241,8 @@
       "blob": "cea9cd7f080471bab1a18158df8875294c4a2735"
     },
     "docs/v2-production-migrations.md": {
-      "category": "DOCS",
-      "blob": "663439ea21f0496e495c93addf4f54d68082c6e9"
+      "category": "RELEASE-DOC",
+      "blob": "6dfe2be5595efbc0e16645c9478a277449d782db"
     },
     "package.json": {
       "category": "V2",
