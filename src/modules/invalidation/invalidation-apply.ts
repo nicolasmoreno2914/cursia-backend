@@ -1,4 +1,5 @@
 import type { BlueprintSnapshotV1 } from '../course-blueprints/blueprint-snapshot';
+import { effectiveOutputRowsSql } from '../dynamic-generation/item-generations';
 import type { ManifestItem } from '../generation-manifests/generation-manifest-builder';
 import { computeFingerprints, matchFingerprint } from './fingerprints';
 import {
@@ -55,9 +56,8 @@ async function itemsWithArtifacts(q: QueryExecutor, jobId: string): Promise<Item
     `select g.id as item_run_id, g.item_key, g.status,
             coalesce(json_agg(json_build_object('id', a.id, 'status', a.status, 'fp', a.metadata->>'inputFingerprint')
                               order by a.id) filter (where a.id is not null), '[]'::json) as arts
-       from public.generation_item_runs g
+       from ${effectiveOutputRowsSql('$1')} g
        left join public.artifacts a on a.item_run_id = g.id
-      where g.job_id = $1 and g.generation = 1
       group by g.id, g.item_key, g.status`,
     [jobId],
   );

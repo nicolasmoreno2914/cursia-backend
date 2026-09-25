@@ -1,4 +1,5 @@
 import { BadRequestException, ConflictException, Injectable, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common';
+import { effectiveOutputRowsSql } from '../dynamic-generation/item-generations';
 import { DataSource } from 'typeorm';
 import { GenerationManifestsService, ManifestDto } from '../generation-manifests/generation-manifests.service';
 import { ArtifactsService } from '../artifacts/artifacts.service';
@@ -258,12 +259,12 @@ export class PackagingService {
       });
     }
 
-    // M8 (fase5b-audit integral-review.md): filtrar generation = 1, igual
-    // que artifact-resolver.ts — hoy es un no-op porque 5A solo siembra
-    // generation 1, pero sin esto este precheck divergiría del resolver en
-    // cuanto existan regeneraciones (Fase 8).
+    // M8 (fase5b-audit) + F78-BE2: MISMA selección que artifact-resolver.ts
+    // (effectiveOutputRowsSql): por item, la generación completed más alta
+    // (o la más alta si ninguna completó). Con regeneraciones (generation 2…)
+    // el precheck y el resolver nunca divergen; sin ellas es generation = 1.
     const items: Array<{ item_key: string; status: string }> = await this.dataSource.query(
-      `select item_key, status from public.generation_item_runs where job_id = $1 and generation = 1`,
+      `select gir.item_key, gir.status from ${effectiveOutputRowsSql('$1')} gir`,
       [run.id],
     );
     const statusByKey = new Map(items.map((i) => [i.item_key, i.status]));

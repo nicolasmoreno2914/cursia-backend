@@ -20,6 +20,7 @@ import { assertDynamicOwnerAllowed, assertRealVideoAllowed } from '../features/d
 import { FromRunDto, isFromRunRequest } from '../invalidation/dto/from-run.dto';
 import { computePlanFromDb, executeApplyWrites, planApplyWrites } from '../invalidation/invalidation-apply';
 import { requiredArtifactTypes } from '../dynamic-packaging/artifact-resolver';
+import { latestGenerationPredicate } from './item-generations';
 import {
   ACTIVE_RUN_WORKER_STATUSES,
   isActiveRun,
@@ -36,7 +37,11 @@ const NON_TERMINAL_ITEM_STATUSES = ['pending', 'running', 'retrying', 'blocked']
 /** worker_status de un run terminado en fallo (reabrible por startRun con el mismo contexto, R10). */
 const FAILED_LIKE = new Set(['failed', 'failed_retryable', 'failed_recoverable']);
 const ACTIVE_RUN_INDEX = 'uq_dynamic_generation_active_run';
-/** 5A solo siembra generation 1 (Fase 8 creará generation 2… para regenerar). */
+/**
+ * Generation con la que se siembra un run (5A y el apply de Fase 8). Las
+ * regeneraciones explícitas (F78-BE2, regenerateItem) agregan generation 2, 3…
+ * del MISMO run; la vigente de cada item la decide item-generations.ts.
+ */
 const GENERATION = 1;
 /** R17: default cuando el body no manda videoMode. */
 const DEFAULT_VIDEO_MODE: RunVideoMode = 'mock';
@@ -153,6 +158,30 @@ export interface StartRunResult {
   run: RunDto;
   /** Fase 8: solo en runs creados con `{fromRun}` (resumen del plan aplicado). */
   invalidation?: { fromRunId: string; planSha256: string; totals: Record<string, number> };
+}
+
+/** F78-BE2: qué cuesta regenerar un item. */
+export type RegenerationCostKind = 'videogen' | 'llm' | 'none';
+
+/** Video en run 'real' → Videogen; video 'mock' → nada; cualquier otro tipo lo genera un LLM (créditos). */
+export function regenerationCostKind(type: string, videoMode: RunVideoMode): RegenerationCostKind {
+  if (type === 'video') return videoMode === 'real' ? 'videogen' : 'none';
+  return 'llm';
+}
+
+/** Estados de una generación nueva "en vuelo" (idempotencia de regenerateItem). */
+const REGENERATION_IN_FLIGHT = new Set(['pending', 'running', 'retrying', 'blocked']);
+
+export interface RegenerateItemResult {
+  /** true = se creó una generación nueva (201); false = ya había una en vuelo (200, misma respuesta). */
+  created: boolean;
+  costKind: RegenerationCostKind;
+  /** Fila (histórica, intacta) desde la que se regeneró. */
+  previousItemRunId: string;
+  previousGeneration: number;
+  /** La generación nueva (vigente). */
+  item: ItemRunDto;
+  run: RunDto;
 }
 
 /**
@@ -797,12 +826,14 @@ export class RunsService {
         error: string | null;
         output_summary: Record<string, any> | null;
       }> = await qr.query(
+        // F78-BE2: la generación VIGENTE de cada item (una regeneración
+        // fallida se reintenta sobre su propia fila, nunca sobre la histórica).
         `select id, item_key, status, depends_on, type, error, output_summary
-            from public.generation_item_runs
-            where job_id = $1 and generation = $2
+            from public.generation_item_runs g
+            where g.job_id = $1 and ${latestGenerationPredicate('g')}
             order by id
             for update`,
-        [job.id, GENERATION],
+        [job.id],
       );
       const target = items.find((i) => i.item_key === itemKey);
       if (!target) {
@@ -938,6 +969,181 @@ export class RunsService {
 
     const [row] = await this.dataSource.query(`select * from public.generation_item_runs where id = $1`, [targetId]);
     return this.toItemDto(row);
+  }
+
+  /**
+   * F78-BE2: regeneración explícita (y posiblemente paga) de UN item de un
+   * run completed o activo — el caso típico es el video STALE_NO_AUTO de un
+   * run B (Fase 8), pero sirve para cualquier item que el usuario quiera
+   * regenerar. Nunca reescribe historia:
+   * - crea una fila NUEVA en generation_item_runs del MISMO run con
+   *   generation = max + 1 e idempotency key propia (sha256(manifestId:
+   *   itemKey:generation)) → el ejecutor/worker genera salida nueva (un video
+   *   nuevo en Videogen, nunca reutiliza el `external` anterior);
+   * - la fila y los artifacts anteriores quedan INTACTOS (el stale sigue
+   *   stale); cuando la generación nueva completa, el resolver de
+   *   empaquetado, el precheck del paquete y Coherence usan la completada
+   *   más reciente (item-generations.ts);
+   * - si el run estaba completed se reabre (queued) para que el ejecutor
+   *   reclame el item; al completarse vuelve a completed.
+   *
+   * Costo: `confirmPaid === true` (literal) es obligatorio cuando la
+   * regeneración puede costar: video en run 'real' (Videogen) o cualquier
+   * item LLM (content/scorm/exam/plan/intros → créditos de IA). Solo un video
+   * en run 'mock' no cuesta. Sin la confirmación → 400
+   * `confirm_paid_required` sin escribir nada.
+   *
+   * Gates (en orden): G3 allow-list V2 (403) → ownership/404 → confirmPaid
+   * (400) → video real: DYNAMIC_REAL_VIDEO_OWNERS (403, fail closed) → bajo el
+   * advisory lock del curso (mismo orden que create/reopen/retry: lock del
+   * curso → fila del run FOR UPDATE → items FOR UPDATE): run cancelado (409),
+   * idempotencia, run reemplazado (409 superseded_run), otro run activo del
+   * curso (409), item no completado (409; si falló, usar retry), run
+   * terminado en failed (409; reintentar primero).
+   *
+   * Idempotente por (run, itemKey) mientras la regeneración está en vuelo
+   * (pending/running/retrying/blocked): devuelve la misma generación con
+   * `created:false` (200). Una vez completada, un nuevo POST crea otra
+   * generación (es una nueva regeneración paga, confirmada de nuevo).
+   */
+  async regenerateItem(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+    runId: string,
+    itemKey: string,
+    confirmPaid: boolean | undefined,
+  ): Promise<RegenerateItemResult> {
+    assertDynamicOwnerAllowed(ownerId);
+    const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
+    let job = await this.loadRunRow(courseId, manifest, runId);
+    const mItem = manifest.manifest.items.find((it) => it.key === itemKey);
+    if (!mItem) {
+      throw new NotFoundException(`El item "${itemKey}" no existe en el Manifest de la ejecución ${runId}`);
+    }
+    const videoMode = this.videoModeOf(job);
+    const costKind = regenerationCostKind(mItem.type, videoMode);
+    if (costKind !== 'none' && confirmPaid !== true) {
+      throw new BadRequestException({
+        message:
+          `confirm_paid_required: regenerar "${itemKey}" tiene costo (${costKind === 'videogen' ? 'video real en Videogen' : 'créditos de IA'}); ` +
+          'reenviá con {"confirmPaid": true} para confirmarlo explícitamente',
+        code: 'confirm_paid_required',
+        costKind,
+      });
+    }
+    // Video real = gasto en Videogen → allow-list de video real (fail closed).
+    // Un item no-video nunca paga Videogen, aunque el run sea 'real'.
+    if (mItem.type === 'video' && videoMode === 'real') assertRealVideoAllowed(ownerId);
+    job = await this.reconcileCancellation(job);
+    if (isCancelledLike(job)) {
+      throw new ConflictException(`La ejecución ${job.id} está cancelada; no se pueden regenerar items`);
+    }
+
+    const outcome = await this.tx(async (qr) => {
+      await this.lockCourseRuns(qr, courseId);
+      const [locked] = await qr.query(`select * from public.production_jobs where id = $1 for update`, [job.id]);
+      if (isCancelledLike(locked)) {
+        throw new ConflictException(`La ejecución ${job.id} está cancelada; no se pueden regenerar items`);
+      }
+      const gens: any[] = await qr.query(
+        `select * from public.generation_item_runs where job_id = $1 and item_key = $2 order by generation desc for update`,
+        [job.id, itemKey],
+      );
+      if (gens.length === 0) {
+        throw new InternalServerErrorException(`La ejecución ${job.id} no tiene filas para el item "${itemKey}" del Manifest (integridad rota)`);
+      }
+      const latest = gens[0];
+      // Idempotencia: la regeneración pedida sigue en vuelo → misma respuesta.
+      if (latest.generation > 1 && REGENERATION_IN_FLIGHT.has(latest.status) && latest.output_summary?.regeneration) {
+        return { kind: 'existing' as const, itemRunId: latest.id as string, previousItemRunId: latest.output_summary.regeneration.fromItemRunId as string, previousGeneration: Number(latest.output_summary.regeneration.fromGeneration) };
+      }
+      const superseding = await this.findSupersedingRun(qr, job.id);
+      if (superseding) throw this.supersededConflict(job.id, superseding);
+      const other = await this.findActiveRunOnOtherManifest(qr, courseId, manifest.id);
+      if (other) throw this.otherActiveRunConflict(other, manifest);
+      if (latest.status !== 'completed') {
+        throw new ConflictException({
+          message:
+            `Solo se puede regenerar un item completado; "${itemKey}" (generation ${latest.generation}) está en "${latest.status}"` +
+            (latest.status === 'failed' ? ' — usá retry para reintentarlo' : ''),
+          code: 'item_not_completed',
+        });
+      }
+      const runActive = ACTIVE_RUN_WORKER_STATUSES.includes(String(locked.worker_status));
+      if (!runActive && locked.worker_status !== 'completed') {
+        throw new ConflictException({
+          message:
+            `La ejecución ${job.id} terminó en "${locked.worker_status}"; reintentá sus items fallidos (retry) antes de regenerar otros`,
+          code: 'run_not_regenerable',
+        });
+      }
+
+      const staleArtifacts: Array<{ id: string }> = await qr.query(
+        `select id from public.artifacts where item_run_id = $1 and status = 'stale' order by id`,
+        [latest.id],
+      );
+      const stale = staleArtifacts.length > 0 || latest.output_summary?.invalidation?.action === 'STALE_NO_AUTO';
+      const generation = Number(latest.generation) + 1;
+      const regeneration = {
+        fromItemRunId: latest.id,
+        fromGeneration: Number(latest.generation),
+        reason: stale ? 'stale_no_auto' : 'user_requested',
+        staleArtifactIds: staleArtifacts.map((a) => a.id),
+        costKind,
+        requestedBy: ownerId,
+        requestedAt: new Date().toISOString(),
+      };
+      const [inserted] = await qr.query(
+        `insert into public.generation_item_runs
+           (job_id, course_id, blueprint_id, manifest_id, item_key, generation, type, module_id, chapter_id,
+            depends_on, idempotency_key, status, output_summary)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::text[], $11, 'pending', $12::jsonb)
+         returning id`,
+        [job.id, latest.course_id, latest.blueprint_id, latest.manifest_id, itemKey, generation, latest.type,
+          latest.module_id, latest.chapter_id, latest.depends_on ?? [], itemIdempotencyKey(manifest.id, itemKey, generation),
+          JSON.stringify({ regeneration })],
+      );
+      const note = JSON.stringify({ itemKey, generation, itemRunId: inserted.id, requestedAt: regeneration.requestedAt });
+      if (runActive) {
+        await qr.query(
+          `update public.production_jobs
+              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('lastRegeneration', $2::jsonb),
+                  updated_at = now()
+            where id = $1`,
+          [job.id, note],
+        );
+      } else {
+        // Reabre el run completed para que el ejecutor reclame la generación nueva.
+        try {
+          await qr.query(
+            `update public.production_jobs
+                set status = 'queued', worker_status = 'queued', finished_at = null, error_message = null,
+                    next_retry_at = null,
+                    output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('lastRegeneration', $2::jsonb),
+                    updated_at = now()
+              where id = $1`,
+            [job.id, note],
+          );
+        } catch (err) {
+          if (isActiveRunConflict(err)) {
+            throw new ConflictException(`Ya hay otra ejecución activa para el Manifest #${manifest.id}; no se puede reabrir ${job.id}`);
+          }
+          throw err;
+        }
+      }
+      return { kind: 'created' as const, itemRunId: inserted.id as string, previousItemRunId: latest.id as string, previousGeneration: Number(latest.generation) };
+    });
+
+    const [row] = await this.dataSource.query(`select * from public.generation_item_runs where id = $1`, [outcome.itemRunId]);
+    return {
+      created: outcome.kind === 'created',
+      costKind,
+      previousItemRunId: outcome.previousItemRunId,
+      previousGeneration: outcome.previousGeneration,
+      item: this.toItemDto(row),
+      run: await this.buildRunDto(await this.loadJobById(job.id), manifest),
+    };
   }
 
   // ── internals ────────────────────────────────────────────────────────────
@@ -1136,9 +1342,9 @@ export class RunsService {
 
         const items: Array<{ id: string; item_key: string; status: ItemRunStatus; depends_on: string[] }> =
           await qr.query(
-            `select id, item_key, status, depends_on from public.generation_item_runs
-              where job_id = $1 and generation = $2 order by id for update`,
-            [jobId, GENERATION],
+            `select id, item_key, status, depends_on from public.generation_item_runs g
+              where g.job_id = $1 and ${latestGenerationPredicate('g')} order by id for update`,
+            [jobId],
           );
         const status = new Map<string, ItemRunStatus>(items.map((i) => [i.item_key, i.status]));
         const reopen = items.filter((i) => i.status === 'cancelled');
@@ -1430,7 +1636,11 @@ export class RunsService {
     job = await this.reconcileCancellation(job);
     job = await this.sweepAndRecompute(job);
     const ctx = await this.loadContextRow(job.id);
-    const rows = await this.dataSource.query(`select * from public.generation_item_runs where job_id = $1`, [job.id]);
+    // F78-BE2: una fila por item — la generación vigente (las anteriores son histórico).
+    const rows = await this.dataSource.query(
+      `select * from public.generation_item_runs g where g.job_id = $1 and ${latestGenerationPredicate('g')}`,
+      [job.id],
+    );
     const progress = await this.progress(job.id, manifest);
     if (rows.length !== progress.total) {
       throw new InternalServerErrorException(`La ejecución ${job.id}: ${rows.length} items vs ${progress.total} del Manifest`);
@@ -1467,8 +1677,8 @@ export class RunsService {
    */
   private async progress(jobId: string, manifest: ManifestDto): Promise<RunProgress> {
     const rows: Array<{ status: ItemRunStatus; type: ManifestItemType; n: number }> = await this.dataSource.query(
-      `select status, type, count(*)::int as n from public.generation_item_runs
-        where job_id = $1 group by status, type`,
+      `select g.status, g.type, count(*)::int as n from public.generation_item_runs g
+        where g.job_id = $1 and ${latestGenerationPredicate('g')} group by g.status, g.type`,
       [jobId],
     );
     const all = emptyCounts();

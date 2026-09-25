@@ -29,6 +29,7 @@ import {
   recomputeRunStatus,
   sweepRunExpiredLeases,
 } from './item-transitions';
+import { latestGenerationPredicate } from './item-generations';
 
 export type ItemType = ManifestItemType;
 
@@ -57,8 +58,11 @@ const V2_ONLY_ITEM_TYPES: readonly ItemType[] = ['course_plan', 'course_intro', 
 /**
  * Predicado de "item reclamable" (spec §3.4, condición 6, R16), compartido
  * por el claim por run y el global. `typesParam` = placeholder del array de
- * tipos. Dependencias literales del Manifest (mismo manifest_id+generation):
- * - ninguna dependencia existente en estado distinto de `completed`
+ * tipos. Dependencias literales del Manifest, resueltas contra la generación
+ * VIGENTE (la más alta) de cada clave dentro del mismo run (F78-BE2: una
+ * regeneración, generation 2, depende de los items vigentes del run; sin
+ * regeneraciones es idéntico a "misma generation"):
+ * - ninguna dependencia vigente en estado distinto de `completed`
  *   (NOT EXISTS literal por clave);
  * - y TODAS las claves de depends_on existen como fila: una dependencia
  *   ausente nunca vuelve reclamable al dependiente (se reporta con
@@ -71,13 +75,14 @@ function claimablePredicate(g: string, typesParam: string): string {
             and ${g}.type = any(${typesParam}::text[])
             and not exists (
               select 1 from public.generation_item_runs d
-               where d.manifest_id = ${g}.manifest_id and d.generation = ${g}.generation
-                 and d.item_key = any(${g}.depends_on) and d.status <> 'completed')
+               where d.job_id = ${g}.job_id and d.manifest_id = ${g}.manifest_id
+                 and d.item_key = any(${g}.depends_on) and d.status <> 'completed'
+                 and ${latestGenerationPredicate('d')})
             and not exists (
               select 1 from unnest(${g}.depends_on) as dk(key)
                where not exists (
                  select 1 from public.generation_item_runs d2
-                  where d2.manifest_id = ${g}.manifest_id and d2.generation = ${g}.generation
+                  where d2.job_id = ${g}.job_id and d2.manifest_id = ${g}.manifest_id
                     and d2.item_key = dk.key))`;
 }
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -746,7 +751,7 @@ export class SchedulerService {
       `select g.job_id, g.item_key,
               array(select dk.key from unnest(g.depends_on) as dk(key)
                      where not exists (select 1 from public.generation_item_runs d2
-                                        where d2.manifest_id = g.manifest_id and d2.generation = g.generation
+                                        where d2.job_id = g.job_id and d2.manifest_id = g.manifest_id
                                           and d2.item_key = dk.key)) as missing
          from public.generation_item_runs g
          join public.production_jobs pj on pj.id = g.job_id
@@ -758,7 +763,7 @@ export class SchedulerService {
           and ($3::text is null or pj.owner_id = $3)
           and exists (select 1 from unnest(g.depends_on) as dk(key)
                        where not exists (select 1 from public.generation_item_runs d2
-                                          where d2.manifest_id = g.manifest_id and d2.generation = g.generation
+                                          where d2.job_id = g.job_id and d2.manifest_id = g.manifest_id
                                             and d2.item_key = dk.key))
         limit 50`,
       [ACTIVE_RUN_WORKER_STATUSES, runId, ownerId ?? null],
@@ -942,10 +947,12 @@ export class SchedulerService {
             `select d.item_key, a.id, a.type, a.storage_path
                from public.generation_item_runs d
                join public.artifacts a on a.item_run_id = d.id
-              where d.manifest_id = $1 and d.generation = $2 and d.item_key = any($3::text[])
-                and d.status = 'completed'
+              where d.job_id = $1 and d.manifest_id = $2 and d.item_key = any($3::text[])
+                and d.status = 'completed' and ${latestGenerationPredicate('d')}
               order by array_position($3::text[], d.item_key), a.created_at, a.id`,
-            [row.manifest_id, row.generation, deps],
+            // F78-BE2: artifacts de la generación VIGENTE de cada dependencia
+            // (la que el predicado de claim exigió completed).
+            [row.job_id, row.manifest_id, deps],
           );
 
     return {

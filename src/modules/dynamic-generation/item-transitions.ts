@@ -1,5 +1,6 @@
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
+import { latestGenerationPredicate } from './item-generations';
 
 /**
  * Transiciones de estado de items/run compartidas por RunsService (lecturas:
@@ -67,39 +68,37 @@ export async function applyItemFailure(
     ),
   );
   if (!row) return null;
-  const blocked = row.status === 'failed' ? await blockDependents(qr, row.manifest_id, row.generation, row.item_key) : [];
+  const blocked = row.status === 'failed' ? await blockDependents(qr, row.job_id, row.item_key) : [];
   return { id: row.id, status: row.status, blocked };
 }
 
 /**
- * Dependientes transitivos (depends_on literal del Manifest, mismo
- * manifest_id + generation) de `itemKey` en pending/retrying → `blocked`
- * (condición 6: nunca reclamables mientras la dependencia siga failed;
- * retryItem de Task 2 los desbloquea). Devuelve los ids bloqueados.
+ * Dependientes transitivos (depends_on literal del Manifest, mismo run) de
+ * `itemKey` en pending/retrying → `blocked` (condición 6: nunca reclamables
+ * mientras la dependencia siga failed; retryItem de Task 2 los desbloquea).
+ * F78-BE2: se recorre la generación VIGENTE (la más alta) de cada item_key
+ * del run — un item de generation 1 pendiente que depende de una
+ * regeneración (generation 2) fallida también queda bloqueado. Sin
+ * regeneraciones es idéntico a filtrar generation = 1. Devuelve los ids.
  */
-export async function blockDependents(
-  qr: QueryRunner,
-  manifestId: number,
-  generation: number,
-  itemKey: string,
-): Promise<string[]> {
+export async function blockDependents(qr: QueryRunner, jobId: string, itemKey: string): Promise<string[]> {
   const rows = returningRows(
     await qr.query(
       `with recursive dep(key) as (
-         select $3::text
+         select $2::text
          union
          select g.item_key
            from public.generation_item_runs g
            join dep on dep.key = any(g.depends_on)
-          where g.manifest_id = $1 and g.generation = $2
+          where g.job_id = $1 and ${latestGenerationPredicate('g')}
        )
        update public.generation_item_runs g
           set status = 'blocked', next_retry_at = null, lease_until = null, worker_id = null, updated_at = now()
-        where g.manifest_id = $1 and g.generation = $2
-          and g.item_key in (select key from dep) and g.item_key <> $3
+        where g.job_id = $1 and ${latestGenerationPredicate('g')}
+          and g.item_key in (select key from dep) and g.item_key <> $2
           and g.status in ('pending', 'retrying')
         returning g.id`,
-      [manifestId, generation, itemKey],
+      [jobId, itemKey],
     ),
   );
   return rows.map((r: any) => r.id);
@@ -143,7 +142,10 @@ export async function recomputeRunStatus(qr: QueryRunner, jobId: string): Promis
   if (!job || !isActiveRun(job)) return job?.worker_status ?? null;
 
   const rows: Array<{ status: string; n: number }> = await qr.query(
-    `select status, count(*)::int as n from public.generation_item_runs where job_id = $1 group by status`,
+    // F78-BE2: solo la generación vigente de cada item (una regeneración en
+    // vuelo mantiene el run activo; las filas históricas no cuentan).
+    `select g.status, count(*)::int as n from public.generation_item_runs g
+      where g.job_id = $1 and ${latestGenerationPredicate('g')} group by g.status`,
     [jobId],
   );
   const c: Record<string, number> = {};

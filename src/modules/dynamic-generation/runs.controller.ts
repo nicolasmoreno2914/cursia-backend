@@ -16,6 +16,7 @@ import type { Response } from 'express';
 import { RunsService } from './runs.service';
 import { CourseContextDto } from './dto/course-context.dto';
 import { RetryItemDto } from './dto/executor.dto';
+import { parseRegenerateItemBody } from './dto/regenerate-item.dto';
 import { FromRunDto, isFromRunRequest } from '../invalidation/dto/from-run.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
@@ -129,5 +130,26 @@ export class RunsController {
     @CurrentUser() user: AuthUser,
   ) {
     return this.runs.retryItem(courseId, user.id, number, runId, itemKey, dto?.resubmitVideo === true);
+  }
+
+  // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/items/:itemKey/regenerate
+  // F78-BE2: body {confirmPaid: true} (obligatorio si la regeneración cuesta:
+  // video real o items LLM). Crea una generación NUEVA del item en el mismo
+  // run (nunca reescribe la anterior). 201 si se creó; 200 si ya había una
+  // regeneración de ese item en vuelo (misma respuesta, idempotente).
+  @Post(':runId/items/:itemKey/regenerate')
+  async regenerate(
+    @Param('courseId', ParseIntPipe) courseId: number,
+    @Param('number', ParseIntPipe) number: number,
+    @Param('runId', ParseUUIDPipe) runId: string,
+    @Param('itemKey') itemKey: string,
+    @Body() body: Record<string, unknown>,
+    @CurrentUser() user: AuthUser,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const confirmPaid = parseRegenerateItemBody(body);
+    const result = await this.runs.regenerateItem(courseId, user.id, number, runId, itemKey, confirmPaid);
+    res.status(result.created ? 201 : 200);
+    return result;
   }
 }
