@@ -160,6 +160,9 @@ jobs:
                echo "━━━ [4j] Dynamic Generation: auditoría (solo lectura, staging) ━━━"
                MIGRATION_ENV=staging node scripts/audit-dynamic-generation.js
 
+               echo "━━━ [4k] Storage: políticas RLS mínimas de cursia-artifacts (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-storage-artifacts-policies.js
+
                echo "━━━ [5/6] Migrar usage_events y cost_rates (staging) ━━━"
                node scripts/migrate-usage-events-costs.js
 
