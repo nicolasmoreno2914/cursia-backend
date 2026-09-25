@@ -68,7 +68,9 @@ function baseEnv(fakes, { flag = true } = {}) {
     DB_HOST: '127.0.0.1', DB_PORT: String(PGPORT), DB_USER: 'postgres', DB_PASS: 'x', DB_NAME: 'v2db', DB_SSL: 'false',
     SUPABASE_URL: fakes.storageUrl, SUPABASE_SERVICE_ROLE_KEY: 'fake-service-role-key-local-only', SUPABASE_JWT_SECRET: JWT_SECRET,
     DYNAMIC_MANIFEST_RULES_VERSION: '2', DYNAMIC_REAL_VIDEO_OWNERS: OWNER, DYNAMIC_V2_ALLOWED_OWNERS: OWNER,
-    DYNAMIC_VIDEO_DELIVERY: 'videogen_direct',
+    // Runs A/B: entrega videogen_direct (pinned) → desde DN-1 solo con el escape de staging explícito.
+    // La fase 5y usa la config de producción (YouTube por default, sin el escape).
+    DYNAMIC_VIDEO_DELIVERY: 'videogen_direct', DYNAMIC_ALLOW_VIDEOGEN_DIRECT: 'true',
     VIDEOGEN_API_URL: fakes.videogenUrl, VIDEOGEN_API_KEY: VIDEOGEN_KEY,
   };
   if (flag) env.DYNAMIC_COURSE_STRUCTURE = 'true';
@@ -92,8 +94,8 @@ async function stopProc(ch, timeoutMs = 20000) {
   return ch.exited;
 }
 async function startApp(fakes, opts) {
-  const env = { ...baseEnv(fakes, opts), PORT: String(APP_PORT) };
-  const ch = spawnProc(opts && opts.flag === false ? 'app-flag-off' : 'app', 'main.js', env);
+  const env = { ...baseEnv(fakes, opts), ...((opts && opts.env) || {}), PORT: String(APP_PORT) };
+  const ch = spawnProc((opts && opts.label) || (opts && opts.flag === false ? 'app-flag-off' : 'app'), 'main.js', env);
   const t0 = Date.now();
   while (Date.now() - t0 < 60000) {
     if (ch.exited) throw new Error(`app terminó al arrancar: ${JSON.stringify(ch.exited)} (ver ${ch.logFile})`);
@@ -326,7 +328,7 @@ async function packageRun(label, courseId, n, runId, fakes) {
   const frontNet = [];
   let app, itemWorker, pkgWorker;
   const llm = createLlm({ getFixtures: () => S.front.SV2_PREVIEW_FIXTURES, getSplit: (n) => S.front.dynExamQuestionSplit(n) });
-  const claimLog = { A: [], B: [] };
+  const claimLog = { A: [], B: [], Y: [] };
   function newFront(label) {
     const f = makeFront({ feRoot: FE, backendUrl: `http://127.0.0.1:${APP_PORT}`, storageUrl: fakes.storageUrl, token: TOKEN, ownerId: OWNER, llm, logFile: path.join(OUT, `front-${label}.log`), netViolations: frontNet });
     const orig = f.backendDynClaim;
@@ -726,6 +728,162 @@ async function packageRun(label, courseId, n, runId, fakes) {
       const cohB = await api('POST', `/courses/${S.courseId}/blueprints/${S.nB}/manifest/runs/${S.runB}/coherence`);
       ok(cohB.status === 201, 'coherencia del run B → 201', { s: cohB.status, e: cohB.error });
       fs.writeFileSync(path.join(OUT, 'coherence-run-B.json'), JSON.stringify(cohB.data, null, 2));
+    });
+
+    // ═══ DN-1: run con entrega YouTube Unlisted (config de producción) ═══
+    await step('5y-youtube-dn1', async () => {
+      // App + item worker con la config de DN-1: sin DYNAMIC_VIDEO_DELIVERY ni el escape de staging →
+      // un run real con videos congela 'youtube'. Google (OAuth + YouTube Data API) = falso local vía
+      // google-fake-redirect.js; netguard sigue bloqueando todo lo que no sea 127.0.0.1.
+      const secret = crypto.randomBytes(32).toString('hex');
+      const ytEnv = (extra = {}) => ({
+        DYNAMIC_VIDEO_DELIVERY: '', DYNAMIC_ALLOW_VIDEOGEN_DIRECT: '',
+        YOUTUBE_TOKEN_SECRET: secret, YOUTUBE_CLIENT_ID: 'fake-client-id', YOUTUBE_CLIENT_SECRET: 'fake-client-secret',
+        E2E_GOOGLE_FAKE_BASE: fakes.googleUrl,
+        NODE_OPTIONS: `--require ${JSON.stringify(path.join(HERE, 'netguard.js'))} --require ${JSON.stringify(path.join(HERE, 'google-fake-redirect.js'))}`,
+        ...extra,
+      });
+      await stopProc(itemWorker);
+      await stopProc(app);
+      app = await startApp(fakes, { env: ytEnv(), label: 'app-youtube' });
+      itemWorker = spawnProc('dynamic-item-worker-youtube', 'workers/dynamic-item-worker.js', {
+        ...baseEnv(fakes), ...ytEnv({
+          DYNAMIC_ITEM_WORKER_ID: 'e2e-item-worker-yt', DYNAMIC_ITEM_WORKER_POLL_MS: '500', DYNAMIC_ITEM_WORKER_VIDEO_POLL_MS: '300',
+          DYNAMIC_ITEM_WORKER_HEARTBEAT_MS: '5000', DYNAMIC_YOUTUBE_UPLOAD_RETRY_BASE_MS: '50',
+          // Solo para bajar el "MP4" del Videogen falso (https local con cert autofirmado); netguard limita todo a 127.0.0.1.
+          NODE_TLS_REJECT_UNAUTHORIZED: '0',
+        }),
+      });
+      const g = fakes.google;
+
+      // Preflight sin conexión.
+      const p0 = await api('GET', '/dynamic/youtube/preflight');
+      ok(p0.status === 200 && p0.data && p0.data.ok === false && p0.data.reason === 'no_connection' && p0.data.channel === null,
+        'preflight sin canal conectado → {ok:false, reason:no_connection, channel:null}', p0);
+      eq(p0.data && p0.data.checks.map((c) => c.key), ['connected', 'oauth_valid', 'refresh_usable', 'channel_resolved', 'upload_permission', 'privacy_unlisted'], 'preflight: checks del contrato en orden');
+
+      // Curso Y: 1 módulo con examen, 2 capítulos (el 1º con video).
+      const COURSE_Y = '[E2E DN-1] Seguridad en circuitos hidráulicos';
+      const fcY = crypto.randomUUID();
+      const c = await api('POST', '/courses/dynamic', { frontendCourseId: fcY, title: COURSE_Y });
+      ok(c.status === 201, 'curso Y: POST /courses/dynamic → 201', { s: c.status, e: c.error });
+      const cY = Number(c.data.id);
+      let st = await readStructure(cY);
+      let counter = st.structureVersionCounter;
+      for (const m of st.modules) counter = (await api('DELETE', `/courses/${cY}/modules/${m.id}`, { expectedCounter: counter })).data.structureVersionCounter;
+      const cm = await api('POST', `/courses/${cY}/modules`, { title: 'Seguridad hidráulica', objective: 'Trabajar seguro con presión', examEnabled: true, expectedCounter: counter });
+      counter = cm.data.structureVersionCounter;
+      const mid = cm.data.module.id;
+      const specY = [{ title: 'Energía almacenada y bloqueo', objective: 'Aplicar bloqueo y etiquetado', video: true }, { title: 'Mangueras y fugas', objective: 'Inspeccionar mangueras', video: false }];
+      const auto = cm.data.module.chapters || [];
+      for (let i = 0; i < specY.length; i++) {
+        const cs = specY[i];
+        const r = i === 0 && auto.length === 1
+          ? await api('PATCH', `/courses/${cY}/modules/${mid}/chapters/${auto[0].id}`, { title: cs.title, objective: cs.objective, videoEnabled: cs.video, expectedCounter: counter })
+          : await api('POST', `/courses/${cY}/modules/${mid}/chapters`, { title: cs.title, objective: cs.objective, videoEnabled: cs.video, expectedCounter: counter });
+        counter = r.data.structureVersionCounter;
+      }
+      st = await readStructure(cY);
+      const modsY = modsFromStructure(st);
+      eq(modsY.map((m) => m.chapters.map((x) => x.video)), [[true, false]], 'curso Y: 1 módulo, video solo en el capítulo 1');
+      const lk = await api('POST', `/courses/${cY}/blueprints`, { expectedCounter: st.structureVersionCounter });
+      const nY = lk.data.blueprint.blueprintNumber;
+      const man = await api('POST', `/courses/${cY}/blueprints/${nY}/manifest`);
+      ok(man.status === 201 && man.data.manifest.manifest.items.filter((i) => i.type === 'video').length === 1, 'curso Y: Manifest v2 con 1 video');
+      const videoCh = modsY[0].chapters[0].id;
+      const plainCh = modsY[0].chapters[1].id;
+
+      const f = newFront('Y');
+      f.D = { ...D_FIELDS, nombre: COURSE_Y };
+      f.SEL = { scormTemplates: S.templates };
+      const ctx = f.dynBuildCourseContextFromCurrentFields();
+      const cnt = async () => (await q(`select (select count(*)::int from public.production_jobs) j, (select count(*)::int from public.generation_item_runs) g, (select count(*)::int from public.generation_run_contexts) c`))[0];
+
+      // Gate: sin canal → 409, sin escrituras ni gasto.
+      const before = await cnt();
+      const subs0 = fakes.videogen.submissions.length;
+      const r409 = await api('POST', `/courses/${cY}/blueprints/${nY}/manifest/runs`, { ...ctx, videoMode: 'real' });
+      ok(r409.status === 409 && /^youtube_preflight_failed:no_connection: /.test(r409.error), 'startRun video+real sin canal → 409 youtube_preflight_failed:no_connection', r409);
+      eq(await cnt(), before, 'gate: nada escrito (jobs, items, contextos)');
+      eq(fakes.videogen.submissions.length, subs0, 'gate: 0 envíos a Videogen');
+
+      // Conexión del owner (refresh token cifrado con el MISMO AES-256-GCM real de YoutubeTokenService).
+      process.env.YOUTUBE_TOKEN_SECRET = secret;
+      const { YoutubeTokenService } = require(path.join(REPO, 'dist/youtube/youtube-token.service.js'));
+      const tks = new YoutubeTokenService();
+      tks.onModuleInit();
+      const enc = tks.encryptRefreshToken('fake-refresh-token-e2e');
+      await q(`insert into public.youtube_connections (user_id, user_email, channel_id, channel_title, encrypted_refresh_token, token_iv, scopes, status, connected_at)
+               values ($1, 'e2e-owner@example.com', 'UCe2eChannel0000000000000', 'Canal E2E', $2, $3, 'youtube.upload,youtube.readonly', 'active', now())`,
+        [OWNER, enc.encrypted, enc.iv]);
+      g.refresh.set('fake-refresh-token-e2e', 'fake-access-token-e2e');
+      g.channels.set('fake-access-token-e2e', { id: 'UCe2eChannel0000000000000', title: 'Canal E2E (fake)', thumb: 'https://yt3.fake/e2e.jpg' });
+      const p1 = await api('GET', '/dynamic/youtube/preflight');
+      ok(p1.data && p1.data.ok === true && p1.data.channel && p1.data.channel.id === 'UCe2eChannel0000000000000' && p1.data.checks.every((x) => x.ok), 'preflight con canal → ok:true, canal verificado por channels.list', p1.data);
+      ok(!JSON.stringify(p1.raw).includes('fake-access-token') && !JSON.stringify(p1.raw).includes('fake-refresh-token'), 'preflight: sin tokens en la respuesta');
+
+      // Run youtube: el primer inicio de subida responde 503 (reintento en el mismo reclamo, paridad legacy).
+      g.initPlan = [503];
+      const s1 = await api('POST', `/courses/${cY}/blueprints/${nY}/manifest/runs`, { ...ctx, videoMode: 'real' });
+      ok(s1.status === 201 && s1.data.run.videoDelivery === 'youtube', 'startRun con preflight OK → 201, videoDelivery congelado = youtube', { s: s1.status, e: s1.error });
+      const runY = s1.data.run.id;
+      syncLlmMaps(llm, cY, modsY);
+      llm.st.tag = 'A';
+      const ctl = f.dynExecutorStart({ courseId: cY, blueprintNumber: nY, runId: runY });
+      const stt = await waitRunTerminal(ctl, 'run Y');
+      ok(stt.status === 'completed' && stt.failed === 0, `ejecutor Y: run completed (${stt.status})`, stt);
+      const itemsY = await itemRuns(runY);
+      const v = itemsY.find((i) => i.item_key === `video:${videoCh}`);
+      ok(v && v.status === 'completed' && v.worker_id === 'e2e-item-worker-yt', 'video del run Y: completed por el dynamic-item-worker real', v && { s: v.status, w: v.worker_id });
+      const os = (v && v.output_summary) || {};
+      const up = g.uploads.find((x) => x.videoId === os.youtubeVideoId);
+      ok(os.delivery === 'completed' && /^YtE2E\d{6}$/.test(os.youtubeVideoId || '') && os.youtubeUrl === `https://www.youtube.com/watch?v=${os.youtubeVideoId}`,
+        'video Y: delivery=completed con youtubeVideoId + URL final', os);
+      ok(up && up.privacyStatus === 'unlisted' && up.bytes > 0, 'Google falso: 1 video subido Unlisted con los bytes del MP4 de Videogen', up);
+      eq(g.calls.filter((x) => x === 'POST /upload/youtube/v3/videos').length, 2, 'Google falso: 2 inicios de subida (503 + OK, reintento en el mismo reclamo)');
+      eq(g.calls.filter((x) => x.startsWith('PUT /upload-session/')).length, 1, 'Google falso: 1 sola subida de bytes');
+      eq(fakes.videogen.submissions.length - subs0, 1, 'Videogen: exactamente 1 envío (nunca re-enviado por el reintento de subida)');
+      const gr = await api('GET', `/courses/${cY}/blueprints/${nY}/manifest/runs/${runY}`);
+      const dv = gr.data && gr.data.items.find((i) => i.itemKey === `video:${videoCh}`);
+      ok(gr.data.status === 'completed' && dv && dv.delivery.state === 'completed' && dv.delivery.youtubeVideoId === os.youtubeVideoId, 'GET run Y: completed, delivery.state del video = completed');
+      eq(gr.data.videoDeliverySummary, { total: 1, byState: { completed: 1 }, needsAttention: false }, 'GET run Y: videoDeliverySummary');
+
+      // Packaging youtube → label embebible (no url, no MP4).
+      const P = await packageRun('run-Y-youtube', cY, nY, runY, fakes);
+      const x = await inspectMbz(JSZip, P.buf);
+      eq(x.orphanTokens, [], '.mbz Y: 0 tokens huérfanos');
+      const all = x.sections.flatMap((s) => s.activities);
+      eq(all.filter((a) => a.modname === 'url').length, 0, '.mbz Y: 0 actividades url (el video no es un link externo)');
+      // Sección del módulo = la que EMPIEZA con su module_intro (el Libro Guía también lleva marcadores MI).
+      const sec = x.sections.find((s) => s.activities.length && s.activities[0].modname === 'label' && s.activities[0].markers.some((k) => k.kind === 'MI' && k.id === mid));
+      const acts = sec ? sec.activities : [];
+      const card = (id) => acts.findIndex((a) => a.modname === 'label' && a.title === `📖 Capítulo ${modsY[0].chapters.findIndex((c2) => c2.id === id) + 1} — ${modsY[0].chapters.find((c2) => c2.id === id).title}`);
+      const i1 = card(videoCh); const i2 = card(plainCh);
+      const watch = `https://www.youtube.com/watch?v=${os.youtubeVideoId}`;
+      const vl = acts[i1 + 1];
+      ok(i1 >= 0 && vl && vl.modname === 'label' && vl.text.includes(`href=&quot;${watch}&quot;`) && /nomediaplugin/.test(vl.text),
+        '.mbz Y: justo después de la tarjeta del capítulo con video, un label con el link de SU youtubeVideoId (+ respaldo nomediaplugin)', vl && { t: vl.title });
+      const block2 = acts.slice(i2 + 1).filter((a, j, arr) => j < arr.findIndex((b) => b.modname === 'scorm') + 1);
+      ok(i2 >= 0 && !block2.some((a) => /youtube\.com/.test(a.text)), '.mbz Y: el capítulo sin video no tiene link de YouTube');
+      ok(!P.buf.includes(Buffer.from('ftypmp42')) && !/\.mp4/i.test(all.map((a) => a.text).join('')), '.mbz Y: sin MP4 embebido ni URL de MP4');
+
+      // Moodle 4.5: restore + render del label con los filtros del contexto del módulo.
+      const r = await moodleRestore(P.file, path.join(OUT, 'moodle-Y.json'));
+      ok(!r.err, 'restore del .mbz Y en Moodle 4.5 local', r.err && String(r.err).slice(0, 500));
+      const mj = JSON.parse(fs.readFileSync(path.join(OUT, 'moodle-Y.json'), 'utf8'));
+      eq([mj.precheck_warnings, mj.precheck_errors, mj.restore_error], [[], [], null], 'Moodle Y: precheck sin warnings/errors y restore sin excepción');
+      eq(mj.sections.flatMap((s2) => s2.activities).filter((a) => a.modname === 'url').length, 0, 'Moodle Y (DB): 0 actividades url');
+      const renderOut = path.join(OUT, 'moodle-Y-render.json');
+      const rr = await new Promise((resolve) => execFile(process.env.PHP_BIN, ['-c', process.env.MOODLE_PHPINI, path.join(HERE, 'moodle-render-youtube-labels.php'), P.file, renderOut, 'default'],
+        { env: { ...process.env, MOODLE_ROOT: process.env.MOODLE_ROOT }, maxBuffer: 64 * 1024 * 1024, timeout: 600000 }, (err, stdout, stderr) => resolve({ err, stdout, stderr })));
+      ok(!rr.err && !/warning|notice|deprecated/i.test(rr.stderr || ''), 'render de labels en Moodle sin error ni warnings PHP', { err: rr.err && String(rr.err), stderr: (rr.stderr || '').slice(0, 500) });
+      const rj = JSON.parse(fs.readFileSync(renderOut, 'utf8'));
+      results.moodleYoutubeRender = { release: rj.moodle_release, mediaplugin: rj.filters_active_in_course.includes('mediaplugin'), sortorder: rj.media_plugins_sortorder, videojsYoutube: rj.media_videojs_youtube, labels: rj.labels.map((l) => ({ videoId: l.video_id, player: l.player, embeds: l.embeds_this_video, fallback: l.fallback_link_kept })) };
+      ok(rj.filters_active_in_course.includes('mediaplugin') && rj.media_youtube_enabled, `Moodle ${rj.moodle_release}: filtro multimedia activo en el curso y media_youtube habilitado (config por defecto)`, results.moodleYoutubeRender);
+      const lab = rj.labels.find((l) => l.video_id === os.youtubeVideoId);
+      ok(rj.labels.length === 1 && lab && lab.embeds_this_video && lab.media_players_in_label === 1 && lab.fallback_link_kept,
+        `Moodle: format_text del label (contexto del módulo) → reproductor embebido de ESE video (${lab && lab.player}), 1 solo reproductor + link de respaldo`, rj.labels.map((l) => ({ id: l.video_id, player: l.player, n: l.media_players_in_label })));
+      results.runY = { runId: runY, courseId: cY, youtubeVideoId: os.youtubeVideoId, googleCalls: g.calls.length };
     });
 
     await step('6-gating-flag-off', async () => {

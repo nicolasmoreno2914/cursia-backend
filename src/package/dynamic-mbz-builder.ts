@@ -311,7 +311,8 @@ function youtubeEmbedLabelHtml(ch: PackagingChapterPlan, color: ModuleColor, wat
   const title = `Video del capítulo ${ch.chapterNumber} — ${esc(ch.title)}`;
   return `<div style="border-left:4px solid #${color.main};padding:12px 16px;font-family:'Segoe UI',Arial,sans-serif;">`
     + `<p style="margin:0 0 8px;font-weight:700;">🎬 ${title}</p>`
-    + `<p style="margin:0;"><a href="${esc(watchUrl)}">${title}</a></p>`
+    // <div> (no <p>): el filtro reemplaza el <a> por un bloque (div del reproductor).
+    + `<div style="margin:0;"><a href="${esc(watchUrl)}">${title}</a></div>`
     + `<p style="margin:8px 0 0;font-size:13px;">¿No se ve el reproductor? `
     + `<a class="nomediaplugin" href="${esc(watchUrl)}" target="_blank" rel="noopener">Ver el video en YouTube</a>.</p>`
     + `</div>`;

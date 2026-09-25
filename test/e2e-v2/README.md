@@ -9,7 +9,10 @@ Aceptación end-to-end **sin costo ni red externa**:
 Cubre además:
 - coherencia (estructural y del run, idempotente);
 - invalidación, con dry-run comparado ítem por ítem, apply `fromRun`, run B y segundo restore;
-- gating con el flag apagado.
+- gating con el flag apagado;
+- **DN-1 (paso `5y-youtube-dn1`)**: con la config de producción (sin `DYNAMIC_VIDEO_DELIVERY` ni `DYNAMIC_ALLOW_VIDEOGEN_DIRECT`) un curso con video: preflight `GET /dynamic/youtube/preflight`, 409 `youtube_preflight_failed:no_connection` sin escrituras, conexión cifrada real, run `youtube` con el worker real contra un **Google falso** (OAuth + YouTube Data API en 127.0.0.1 vía `google-fake-redirect.js`; un 503 en la subida se reintenta sin re-enviar a Videogen), packaging con el video como **label embebible** y restore + render en Moodle 4.5 (`moodle-render-youtube-labels.php`: `format_text` con los filtros del contexto del módulo → reproductor embebido).
+
+Los runs A/B usan `videogen_direct` (pinned) con el escape de staging `DYNAMIC_ALLOW_VIDEOGEN_DIRECT=true`.
 
 `netguard.js` falla ante cualquier conexión fuera de 127.0.0.1.
 
@@ -26,4 +29,6 @@ E2E_SCRATCH=/tmp/cursia-e2e \
 E2E_MOODLE_DIR=/ruta/moodle-local \
   bash test/e2e-v2/run-e2e.sh
 ```
-Resultado esperado: `E2E F9: PASS — 426 aserciones, 0 fallidas`, más los verify/audit reales con exit 0. Nunca toca staging, `main` ni producción.
+Puertos opcionales: `E2E_PG_PORT` (default 55491) y `E2E_APP_PORT` (default 38471).
+
+Resultado esperado: `E2E F9: PASS — N aserciones, 0 fallidas`, más los verify/audit reales con exit 0. Nunca toca staging, `main` ni producción.
