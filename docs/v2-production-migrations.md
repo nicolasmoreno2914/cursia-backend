@@ -177,6 +177,15 @@ Notas:
   antes de B1 lo reporta como "CHECK de production_jobs … NO coinciden".
 - No mergear si A4 no terminó en exit 0: con el código V2 en `main` y el
   esquema viejo, el legacy entero falla con 42703.
+- **HD-6 (decisión del owner):** desde B1, `deploy.yml` arranca/recarga
+  también `cursia-dynamic-item-worker` y `cursia-dynamic-package-worker` con
+  PM2 (mismo `ensure_pm2_process` y mismo `.env` que los demás workers). Con
+  `DYNAMIC_COURSE_STRUCTURE` ausente/`false` quedan **inactivos**: no abren
+  conexión a la DB, no reclaman jobs, no entran en loop de restart y salen con
+  `0` ante SIGTERM. En el paso C, el `pm2 restart --update-env` de todos los
+  procesos los activa. Lo prueba `scripts/check-deploy-dynamic-workers.js`
+  (workers compilados contra un Postgres falso + `deploy.yml` = `origin/main`
+  + exactamente esas 2 líneas; base configurable con `DEPLOY_YML_BASE_REF`).
 
 ## Guardas (todas antes de conectar)
 
@@ -572,3 +581,77 @@ node scripts/ops/v2-health-report.js --env-file .env --expect-ref hriwbakbuypaio
 ```
 
 Antes de migrar, el reporte no falla: marca las métricas de items como n/a.
+
+## Protección de ramas y CODEOWNERS (pre-aceptación V2)
+
+`.github/CODEOWNERS` asigna a `@nicolasmoreno2914` los archivos de
+release/producción: `.github/workflows/**`, `scripts/prod/**`,
+`scripts/lib/production-jobs-constraints.js`,
+`scripts/migrate-production-jobs-constraints.js`, `scripts/check-*.js`,
+`docs/v2-production-migrations.md`, `test/e2e-v2/**` (y el propio
+CODEOWNERS). `scripts/release/**` no existe todavía; se agrega cuando exista.
+
+**Estado verificado (solo lectura, 2026-09-25):**
+
+```bash
+gh api repos/nicolasmoreno2914/cursia-backend/rulesets            # → 200 []  (ningún ruleset)
+gh api repos/nicolasmoreno2914/cursia-backend/branches/main/protection  # → 404 "Branch not protected"
+gh repo view nicolasmoreno2914/cursia-backend --json visibility   # → PUBLIC (plan de la cuenta: free)
+```
+
+- La premisa de que el repo es privado y que los rulesets no están
+  disponibles en el plan actual **no se cumple**: el repo es **público**, y
+  en repos públicos los rulesets y la branch protection **sí** están
+  disponibles en el plan free (la API respondió 200, lista vacía). Si el repo
+  pasa a privado en el plan free, esas APIs dejan de estar disponibles
+  (requieren Pro/Team) y vale la nota original.
+- Hoy **no hay ninguna regla** en `main` ni en `staging`: CODEOWNERS solo pide
+  review automáticamente; no bloquea ningún merge ni push. Nada de esto se
+  cambió desde acá: aplicar (o no) el ruleset es decisión del owner.
+- Límite importante: los agentes operan con la cuenta del owner. Cualquier
+  regla que el owner pueda saltear (admin bypass) también la pueden saltear
+  esos agentes; y "require review from Code Owners" bloquea los PRs que abre
+  la misma cuenta (nadie puede aprobar su propio PR). Por eso el ruleset
+  recomendado exige PR + checks + sin force-push/borrado, y deja la review
+  de Code Owners en `false` mientras haya un único colaborador.
+
+**Ruleset recomendado** (aplicar cuando el owner lo decida, p. ej.
+`gh api -X POST repos/nicolasmoreno2914/cursia-backend/rulesets --input ruleset.json`):
+
+```json
+{
+  "name": "protect-main-staging",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": { "include": ["refs/heads/main", "refs/heads/staging"], "exclude": [] }
+  },
+  "bypass_actors": [],
+  "rules": [
+    { "type": "deletion" },
+    { "type": "non_fast_forward" },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_approving_review_count": 0,
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": false,
+        "require_last_push_approval": false,
+        "required_review_thread_resolution": false
+      }
+    }
+  ]
+}
+```
+
+Ojo: la regla `pull_request` también prohíbe el push directo a `staging`
+(hoy el flujo de aceptación pushea a `staging` directo); si se quiere
+conservar ese flujo, dejar `staging` solo con `deletion` + `non_fast_forward`
+en un segundo ruleset.
+
+Con un segundo colaborador con permisos de escritura, subir
+`required_approving_review_count` a `1` y `require_code_owner_review` a
+`true` (ahí CODEOWNERS pasa a bloquear). Un check de estado requerido
+(`required_status_checks`) solo tiene sentido cuando exista un workflow de CI
+en PRs (hoy los `scripts/check-*.js` corren en `deploy-staging.yml`, al
+pushear a `staging`, no en PRs).
