@@ -1,4 +1,4 @@
-import { Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
+import { Injectable, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
 import { BlueprintDto, CourseBlueprintsService } from '../course-blueprints/course-blueprints.service';
@@ -61,16 +61,30 @@ function sourceOf(bp: BlueprintDto): ManifestSource {
  */
 @Injectable()
 export class GenerationManifestsService {
+  private readonly logger = new Logger(GenerationManifestsService.name);
+
   constructor(
     private readonly dataSource: DataSource,
     private readonly blueprints: CourseBlueprintsService,
   ) {
-    // Spec v2 §3: fail-fast al arrancar — un DYNAMIC_MANIFEST_RULES_VERSION
-    // desconocido aborta el boot en vez de caer en silencio a otra versión.
-    readManifestRulesVersionConfig();
+    // I4 (review-rv2, mismo criterio que M6 de It.2 con DYNAMIC_VIDEO_DELIVERY):
+    // este servicio vive en AppModule (API + workers legacy) y lo instancia
+    // también el dynamic-package-worker — un typo en DYNAMIC_MANIFEST_RULES_VERSION
+    // NO puede tumbar el boot de todo eso. La validación ruidosa y sin fallback
+    // es lazy: configuredRulesVersion() lanza en cada uso de las rutas dynamic
+    // que dependen de la config (crear un Manifest, leer "el Manifest actual").
+    // Acá solo se deja el error bien visible en el log de arranque.
+    try {
+      readManifestRulesVersionConfig();
+    } catch (err) {
+      this.logger.error(
+        `${err instanceof Error ? err.message : String(err)} — las rutas dynamic que crean/leen el Manifest ` +
+          'configurado van a fallar hasta corregirlo; el resto del backend arranca normal',
+      );
+    }
   }
 
-  /** rulesVersion configurado (DYNAMIC_MANIFEST_RULES_VERSION, default 1); lanza si es inválido. */
+  /** rulesVersion configurado (DYNAMIC_MANIFEST_RULES_VERSION, default 1); lanza si es inválido (fail loud en uso). */
   configuredRulesVersion(): ManifestRulesVersion {
     return readManifestRulesVersionConfig();
   }

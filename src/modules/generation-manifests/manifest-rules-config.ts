@@ -7,8 +7,10 @@ import type { ManifestRulesVersion } from './generation-manifest-builder';
  * completo y validado.
  *
  * Fail-fast: cualquier otro valor (incluido "v2", " 2 ", "3") lanza — nunca
- * se cae en silencio a otra versión. GenerationManifestsService lo lee en el
- * constructor (el boot aborta) y en cada uso.
+ * se cae en silencio a otra versión. GenerationManifestsService lo lee en cada
+ * uso (lanza ahí) y, en el constructor, solo lo loguea como error: un valor
+ * inválido nunca aborta el boot de la API legacy ni de los workers (I4
+ * review-rv2).
  */
 export const MANIFEST_RULES_VERSION_ENV = 'DYNAMIC_MANIFEST_RULES_VERSION';
 
