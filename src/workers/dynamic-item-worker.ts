@@ -86,6 +86,19 @@ interface RunHead {
   videoMode: 'mock' | 'real';
 }
 
+/**
+ * Estado terminal "listo" de un video en Videogen para el flujo dynamic.
+ * Fase 5A genera SIN YouTube: Videogen deja esos videos en `completed_local`
+ * (render terminado, MP4 descargable), que su propio endpoint de batch cuenta
+ * como completado — pero `isJobCompleted` (compartido con el flujo legacy, que
+ * sube a YouTube y termina en `completed`) no lo incluye. Hallazgo de la
+ * aceptación real de Task 7: el video quedaba listo y el worker seguía
+ * polleando hasta el timeout. Se amplía SOLO acá para no cambiar el legacy.
+ */
+export function isDynamicVideoCompleted(status: string | null | undefined): boolean {
+  return isJobCompleted(status ?? '') || String(status ?? '').toLowerCase() === 'completed_local';
+}
+
 async function loadRunHead(dataSource: DataSource, runId: string): Promise<RunHead> {
   const [row] = await dataSource.query(
     `select owner_id, input_payload->>'videoMode' as video_mode from public.production_jobs where id = $1`,
@@ -333,7 +346,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
         throw err;
       }
 
-      if (isJobCompleted(status.status)) {
+      if (isDynamicVideoCompleted(status.status)) {
         let cost: number | null = null;
         if (mode === 'real') {
           try {
