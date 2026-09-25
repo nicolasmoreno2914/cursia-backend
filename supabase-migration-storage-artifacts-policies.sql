@@ -14,8 +14,16 @@
 --     path = auth.uid() (rutas del flujo dynamic: <userId>/dynamic/...;
 --     rutas legacy: <userId>/<courseId>/...);
 --   - INSERT (subir), SELECT (leer / firmar URL de descarga), DELETE (borrar
---     lo propio). Sin UPDATE: el flujo dynamic sube con upsert:false.
+--     lo propio), UPDATE (sobrescribir lo propio — ver abajo).
 -- El worker del backend usa service_role (ignora RLS) y no depende de esto.
+--
+-- UPDATE (agregado después, additive): el flujo dynamic sube con
+-- upsert:false, pero dos rutas legacy del frontend (artifactUpload() en
+-- 24-backend-client.js, usada por 39-brandkit.js y 41-course-setup.js) suben
+-- con upsert:true y un nombre de archivo estable (el nombre literal del PDF),
+-- así que una re-subida al mismo path necesita permiso UPDATE bajo RLS, no
+-- solo INSERT — sin esto, Supabase Storage devuelve 403 en el overwrite. Ver
+-- docs/autonomous-audits/audit-track0.md item 2.
 --
 -- Idempotente: cada política se crea solo si no existe una con ese nombre;
 -- re-ejecutar no toma locks sobre storage.objects.
@@ -58,6 +66,23 @@ begin
     create policy cursia_artifacts_delete_own_folder
       on storage.objects for delete to authenticated
       using (
+        bucket_id = 'cursia-artifacts'
+        and (storage.foldername(name))[1] = (select auth.uid())::text
+      );
+  end if;
+
+  if not exists (
+    select 1 from pg_policies
+     where schemaname = 'storage' and tablename = 'objects'
+       and policyname = 'cursia_artifacts_update_own_folder'
+  ) then
+    create policy cursia_artifacts_update_own_folder
+      on storage.objects for update to authenticated
+      using (
+        bucket_id = 'cursia-artifacts'
+        and (storage.foldername(name))[1] = (select auth.uid())::text
+      )
+      with check (
         bucket_id = 'cursia-artifacts'
         and (storage.foldername(name))[1] = (select auth.uid())::text
       );
