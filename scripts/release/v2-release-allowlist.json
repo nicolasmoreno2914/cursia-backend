@@ -1,15 +1,33 @@
 {
-  "schema": 1,
-  "release": "cursia-v2 (DN-7, release curado)",
+  "schema": 2,
+  "release": "cursia-v2 (DN-7, release curado) — backend",
+  "note": "AUTORIDAD del check de release. Se edita y revisa A MANO en el PR: ningún script la genera. Un path nuevo, un blob nuevo, un hunk nuevo o una ruta nueva exigen editar este archivo. Todo path que no figure aquí debe ser byte-idéntico a base.sha.",
   "repo": "orbia-backend",
   "base": {
-    "ref": "origin/main",
+    "ref": "origin/main (fijado)",
     "sha": "d562b1581a914bf6a25f56a142b8cef1fa35877b"
   },
   "source": {
-    "ref": "autonomous/cursia-v2-integration",
+    "ref": "autonomous/cursia-v2-integration (auditado, fijado)",
     "sha": "8a5cf49ca881413a5ef62f5709722e8bad382300"
   },
+  "categories": {
+    "V2": "Código V2 auditado (módulos, builders, workers, entidades), byte-idéntico al source.",
+    "V2-DEP": "Cambio aditivo en un módulo compartido con legacy (DN-1: hook onBeforeUpload en youtube), byte-idéntico al source.",
+    "V2-SCHEMA": "Migraciones SQL V2 (se aplican con los runners en A4, no en el merge), byte-idénticas al source.",
+    "READINESS": "Checks, runners de migración, verify/audit, ops y workflows no-deploy, byte-idénticos al source.",
+    "TEST": "E2E V2, byte-idéntico al source.",
+    "DOCS": "Documentación V2, byte-idéntica al source.",
+    "RELEASE-DOC": "Documentación operativa actualizada para el release curado (difiere del source a propósito; blob fijado)."
+  },
+  "sourceCategories": [
+    "V2",
+    "V2-DEP",
+    "V2-SCHEMA",
+    "READINESS",
+    "TEST",
+    "DOCS"
+  ],
   "mustBeAbsent": [
     "src/modules/course-setup/"
   ],
@@ -114,682 +132,718 @@
     "POST /api/v1/youtube/oauth/session",
     "POST /api/v1/youtube/upload-from-url"
   ],
-  "summary": {
-    "source": 160,
-    "tooling": 4,
-    "partial": 2,
-    "manifest": 1
+  "tooling": [
+    ".github/workflows/v2-release-checks.yml",
+    "scripts/release/check-v2-release.js",
+    "scripts/release/partials/scripts__check-dynamic-feature-gating.js.patch",
+    "scripts/release/partials/src__app.module.ts.patch",
+    "scripts/release/v2-release-allowlist.json",
+    "scripts/release/v2-release-lib.js"
+  ],
+  "partial": {
+    "scripts/check-dynamic-feature-gating.js": {
+      "reason": "V2 de 8a5cf49 sin 'CourseSetupController' en LEGACY_CONTROLLER_CLASS_NAMES (el controller no existe en el release).",
+      "patch": "scripts/release/partials/scripts__check-dynamic-feature-gating.js.patch",
+      "blob": "bfeacf9e19f9aecd16571d08a4c3fe9f42861c6c",
+      "hunks": [
+        {
+          "sha256": "5327295fe324fc13d558e83a52776f162a564e2cb2a44d4f509cb391c225ee8b",
+          "patchId": "1ae53e11dc674117e12e860c46d464eed90b5882",
+          "summary": "+950/-0: #!/usr/bin/env node",
+          "adapterLines": [
+            " * método vía isDynamicRoute, no de controller).",
+            " * Release curado DN-7: CourseSetupController NO existe en este release",
+            " * (course-setup queda completamente fuera), así que no se clasifica."
+          ],
+          "adapterReason": "Comentario propio del release curado DN-7 (CourseSetupController fuera del release); solo texto de un comentario JSDoc del check, sin efecto en runtime.",
+          "from": [
+            "ddbbef92f841a2e9ea92079cd4499cc2790b3eb8",
+            "a9e42fd11e436132c5414f5660297e839a904fa5",
+            "ea4f429df400f07b06f6abdc6fb10afc2f3788ef",
+            "a2694ad0e08066a0a2e3228479432be36cd22373",
+            "ea584693e6d7a09c6b51ddd5a029c66e460bd08a",
+            "327e96234cfd42d9139f4c3aa21a6ef29e33e4bf",
+            "26cb2a411bb673d31c1b9e102416d444c4d30fff",
+            "770939551d05f3c83a156881671d78228fe1f5e7"
+          ]
+        }
+      ]
+    },
+    "src/app.module.ts": {
+      "reason": "V2 de 8a5cf49 sin las 2 líneas de CourseSetupModule (DN-7).",
+      "patch": "scripts/release/partials/src__app.module.ts.patch",
+      "blob": "58244e5f04089244edaa0156dbb060fbc06d4a4d",
+      "hunks": [
+        {
+          "sha256": "471c46c089437ce5c201248b43b126beafef20b5179cf455ad1a06104b9a3b6c",
+          "patchId": "4e54f3299e34f16cf006ecc90a283f8f8babe1b4",
+          "summary": "+8/-0: import { CourseStructureModule } from './modules/course-structure/course-structure.module'",
+          "from": [
+            "ea584693e6d7a09c6b51ddd5a029c66e460bd08a",
+            "ddbbef92f841a2e9ea92079cd4499cc2790b3eb8",
+            "ca72f2a445f62eb1e326715f85c7685276c22ec1",
+            "0605f3e0d2cdbb0eccdc26a5bb2cf1456a34a6d6",
+            "0ac0f6d7ffcb7a0eea213a6b1fea2d86f0d6c4ed",
+            "8946bd87346d33e18e9b51b5a4906189530d5246",
+            "0c5cb9953df8a3063d481287a0d5e864e079a7d7"
+          ]
+        },
+        {
+          "sha256": "d8734fcb8d69c491ab6f475c1fc5bce380fbae4d49d71c8f84114bdbbcc9e86a",
+          "patchId": "dca17ac016c1d82868dea3716841e14cd2e291ad",
+          "summary": "+8/-0: CourseStructureModule,",
+          "from": [
+            "ea584693e6d7a09c6b51ddd5a029c66e460bd08a",
+            "ddbbef92f841a2e9ea92079cd4499cc2790b3eb8",
+            "ca72f2a445f62eb1e326715f85c7685276c22ec1",
+            "0605f3e0d2cdbb0eccdc26a5bb2cf1456a34a6d6",
+            "0ac0f6d7ffcb7a0eea213a6b1fea2d86f0d6c4ed",
+            "8946bd87346d33e18e9b51b5a4906189530d5246",
+            "0c5cb9953df8a3063d481287a0d5e864e079a7d7"
+          ]
+        }
+      ]
+    }
   },
-  "files": {
+  "paths": {
     ".github/workflows/deploy-staging.yml": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "aaae37429cc65038a0827d8b94ea1f5b04c61567"
     },
     ".github/workflows/v2-production-migrations.yml": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "3e7a3b9dc63705ef835fca974771e9bdf7d89df0"
     },
-    ".github/workflows/v2-release-checks.yml": {
-      "mode": "tooling",
-      "blob": "a6ddfb85cd0b80fd4811f39e95c80d95597f5a33"
-    },
     ".gitignore": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "7b785dc183ad3b0effdbe4beff5ac1f3dec18421"
     },
     "docs/superpowers/plans/2026-09-23-dynamic-course-structure-fase0-fase1.md": {
-      "mode": "source",
+      "category": "DOCS",
       "blob": "f98919af11efe2362f8f672468c180e660a88fdb"
     },
     "docs/superpowers/specs/2026-09-23-dynamic-course-structure-design.md": {
-      "mode": "source",
+      "category": "DOCS",
       "blob": "cea9cd7f080471bab1a18158df8875294c4a2735"
     },
     "docs/v2-production-migrations.md": {
-      "mode": "source",
+      "category": "DOCS",
       "blob": "663439ea21f0496e495c93addf4f54d68082c6e9"
     },
     "package.json": {
-      "mode": "source",
+      "category": "V2",
       "blob": "d298932a0a970c5ea071edf31ffb6cd783ed08d6"
     },
     "scripts/audit-course-blueprints.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "f9eb30e11a8f3af7fd540ce4ebff24a588ab9ce6"
     },
     "scripts/audit-dynamic-generation.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "a39e5aa25d77dfe1dd60b631603a236f4138a5ae"
     },
     "scripts/audit-generation-manifests.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "940c4ba2e5a9075f7d78a23df74d4759df1cfa4c"
     },
     "scripts/check-coherence-engine.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "08205cbd30dad26d0016a90e80d42a7206e93adc"
     },
-    "scripts/check-dynamic-feature-gating.js": {
-      "mode": "partial",
-      "blob": "bfeacf9e19f9aecd16571d08a4c3fe9f42861c6c",
-      "patchId": "595e345880972eb8c036209305c2acf4632dd424",
-      "reason": "V2 de 8a5cf49 sin 'CourseSetupController' en LEGACY_CONTROLLER_CLASS_NAMES (el controller no existe en el release)."
-    },
     "scripts/check-dynamic-package-worker-hardening.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "e5c560a66f15c8d4a25d2c2111e0e90c9aaa1292"
     },
     "scripts/check-dynamic-video-delivery.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "16b14ed2db9caa1bac600275e0114666bf0d7ebc"
     },
     "scripts/check-dynamic-youtube-delivery.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "2ee3d9b24ab177987e0971c3fd10fc9261c5766b"
     },
     "scripts/check-generation-manifest-determinism.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "bebf51b7ae9c0eefe7caf981d2df496b8d2b88b1"
     },
     "scripts/check-invalidation-apply.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "d53f0795dde172b79962a699a1764a80d8a73318"
     },
     "scripts/check-invalidation-plan.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "88b2fdf011cabbe9148cf5f3ec2e7f99e44bc70f"
     },
     "scripts/check-packaging-exam-video-mapping.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "a3835bad7ec55a369bfe7196b5888912d1acfdf9"
     },
     "scripts/check-packaging-plan-determinism.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "e9fa4c7413bc54546e3f8683ae6ac8d908640c3c"
     },
     "scripts/check-v2-release-fix.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "5d2922510251453c85e42d894c6900c03214b705"
     },
     "scripts/harness-blueprint-snapshot.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "5b5e665ea013319c79bb466c09a60a904428e2d7"
     },
     "scripts/lib/production-jobs-constraints.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "ad249c518544325a9fb4ae35dcfbc8f5a6e485fc"
     },
     "scripts/lib/v2-production-target.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "113313aadb8aef55dd27812a2128b85e92627d4e"
     },
     "scripts/migrate-course-blueprints.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "d03f3831b90c385800378774caca36c9b400850b"
     },
     "scripts/migrate-dynamic-course-structure.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "b4217275bd1c85a47288c8a1a1edca1003b6c770"
     },
     "scripts/migrate-dynamic-generation-v2.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "6f4d5e951aeebe5cbd1e5eedd3ac71bd28766626"
     },
     "scripts/migrate-dynamic-generation.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "d3045fbb51d2bf2efd35963640fbea47a10f7c12"
     },
     "scripts/migrate-generation-manifests.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "8203d39982401a74e5cefe1e1fcd2ff367c0e29e"
     },
     "scripts/migrate-invalidation.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "fb48d6378226af3c1839a325591917b25ed40062"
     },
     "scripts/migrate-production-jobs-constraints.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "dcf74edce66b42d587ec1a4d27d39e54ce5957f1"
     },
     "scripts/migrate-storage-artifacts-policies.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "b1c9b6b6ecad7a837abbcb9a7b751d21b1a3edb9"
     },
     "scripts/ops/v2-health-report.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "38a0f3f8b09956b0523218f66b00c452e9262e32"
     },
     "scripts/pm2-staging-stability.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "2010ab50686dafbdac980de0eab90629905e0156"
     },
     "scripts/preflight-dynamic-generation.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "cf01c666a607710bfb80d7a78adc030f12d783e9"
     },
     "scripts/prod/migrate-v2-production.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "7227c407a826254b842da8b791b87c0b2181157e"
     },
     "scripts/prod/test/fixtures/forbid-network.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "18a477370eb4b665f9a5440268a74089f8e6846e"
     },
     "scripts/prod/test/fixtures/health-seed.sql": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "71de5307a0d7682171dbe151e334109d79cf9b5d"
     },
     "scripts/prod/test/fixtures/legacy-baseline.sql": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "2d33de73e2c4ed09fcea06980ce1eb0300458ce2"
     },
     "scripts/prod/test/fixtures/main-migrate-production-jobs-constraints.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "9f22e7324c2e80769b3d03c06a91189edec373ce"
     },
     "scripts/prod/test/run-legacy-app-compat-test.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "8f4509dda3f4f5f9fc6507debb7122e4f8264d13"
     },
     "scripts/prod/test/run-local-pg-tests.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "2679a297dc70259544a844eeaa787b581d67cf0a"
     },
-    "scripts/release/build-v2-release-manifest.js": {
-      "mode": "tooling",
-      "blob": "b551281cfb7c2846fb6d7a1bd1650675ea635a1f"
-    },
-    "scripts/release/check-v2-release.js": {
-      "mode": "tooling",
-      "blob": "bd5c79de827d1b3e0c4520153f9979426df922bd"
-    },
-    "scripts/release/v2-release-lib.js": {
-      "mode": "tooling",
-      "blob": "884e75265b0f28ea3ca8c5fa7a9eb80d0a856162"
-    },
-    "scripts/release/v2-release-manifest.json": {
-      "mode": "manifest"
-    },
     "scripts/verify-course-blueprints-schema.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "2ea0fe6a34c673497b9dcd3eb302815dbc2eb271"
     },
     "scripts/verify-course-structure-fase2.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "46fc1511f22c6f5165886877825b5e0059ecda3f"
     },
     "scripts/verify-dynamic-course-structure-schema.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "06efa21219ee1df0e4a5f76fac3f4be6fc13f0c2"
     },
     "scripts/verify-dynamic-generation-schema.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "a9de5fcfff2f9ec8f0aed3c3f6803b381e1c24aa"
     },
     "scripts/verify-generation-manifests-schema.js": {
-      "mode": "source",
+      "category": "READINESS",
       "blob": "09a4156b04cf9f034d1cfed1aa4064e0a2337c5f"
     },
-    "src/app.module.ts": {
-      "mode": "partial",
-      "blob": "58244e5f04089244edaa0156dbb060fbc06d4a4d",
-      "patchId": "d01f0d91fdf705cbdb10db683c9092a9476eac7e",
-      "reason": "V2 de 8a5cf49 sin las 2 líneas de CourseSetupModule (DN-7)."
-    },
     "src/common/db/returning-rows.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "0881dc14d100f2a8cc86b5c6d0e1c669e899caf8"
     },
     "src/database/database.module.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "5937aed8adac7bf71510e2282235ec371b693364"
     },
     "src/main.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "58fb40498a5527b619a8b19090bcdf4edea5a181"
     },
     "src/modules/artifacts/artifacts.controller.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "27eb0b4ae3ddadc743ccc49bd150a0e7f9ab7f1b"
     },
     "src/modules/artifacts/artifacts.service.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "bdc521195095d3413fedd3dee3645c2455a10ea7"
     },
     "src/modules/artifacts/entities/artifact.entity.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "d5f67b2689c4f769430697708442d6215fa57f4b"
     },
     "src/modules/coherence/canonical-json.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "d81d67fa43be6392dfb94f7207abcd949ad1f5e4"
     },
     "src/modules/coherence/coherence-types.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "72a4e92f04d7f84bd316974ebaed147d8bb45eec"
     },
     "src/modules/coherence/coherence.controller.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "dffc9ba467d0fe42d0b1391d7f8eeafe3c5d44fd"
     },
     "src/modules/coherence/coherence.module.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "8b8ad3854e2480de593802c6739980b37f6758fb"
     },
     "src/modules/coherence/coherence.service.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "643169810233b9eecb3f296d9518a4988e06b4da"
     },
     "src/modules/coherence/content.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "f5cf468b99bfaa87aeeea928a8392e9d8eca69dd"
     },
     "src/modules/coherence/dto/coherence.dto.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "38f9234298b0e6a1975f88159741e29351fbcab6"
     },
     "src/modules/coherence/llm-merge.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "ba44f6862832dc73a228bfe3378998f023431e0e"
     },
     "src/modules/coherence/normalize.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "110d831891e8996f83c33f6c94c1fba3bb6b7a87"
     },
     "src/modules/coherence/report.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "4e3110a382dfb3ff9b1e3d6ff2e517526978e507"
     },
     "src/modules/coherence/structural.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "47d67cd0e0cfb3e364aba4194661437c467343a7"
     },
     "src/modules/course-blueprints/blueprint-snapshot.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "9f49c720bc79dcb8534a64885e0fb6a9c29dc8d3"
     },
     "src/modules/course-blueprints/course-blueprints.controller.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "8e7f239d90f2be77dc48d304bc932ca9339453f6"
     },
     "src/modules/course-blueprints/course-blueprints.module.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "50326aba9113f8ccadad09e166adb93d71d37571"
     },
     "src/modules/course-blueprints/course-blueprints.service.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "664f4671e77b5c8a436948d2cb9ee178ec193916"
     },
     "src/modules/course-blueprints/dto/create-blueprint.dto.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "44560df6f5414533de6f91529bb7af1c23b7630e"
     },
     "src/modules/course-blueprints/entities/course-blueprint.entity.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "a255d17d9ecd592b1ff05d1a4f7005360f135816"
     },
     "src/modules/course-structure/course-structure.controller.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "2cdf797505da527eeb83fa2e71417f1fd1e55b03"
     },
     "src/modules/course-structure/course-structure.module.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "43955b916275a98676236362d81a6f4d531f73e9"
     },
     "src/modules/course-structure/course-structure.service.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "d3b77f08a06c37b03eff1a98de4acb87ab93203b"
     },
     "src/modules/course-structure/dto/create-chapter.dto.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "01bbb563c29b0c08e2b79bda8161d975ca91f790"
     },
     "src/modules/course-structure/dto/create-module.dto.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "a83911834f0d1634af85ebe33f490dc66e2254a1"
     },
     "src/modules/course-structure/dto/expected-counter.dto.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "84c78baf7852da3f2ac8005dcf8a1dcd2decb069"
     },
     "src/modules/course-structure/dto/move-chapter.dto.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "4ee3776035f34abf1b42cd17464394963a003014"
     },
     "src/modules/course-structure/dto/reorder.dto.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "93639e3c716e72a09bf7d7119d9a38f341ca3042"
     },
     "src/modules/course-structure/dto/update-chapter.dto.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "3c7593139969ce56b223da819b2a8e4b6edf5485"
     },
     "src/modules/course-structure/dto/update-module.dto.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "3f3d2a22c1a413318f71d8329f25858737390168"
     },
     "src/modules/course-structure/entities/course-chapter.entity.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "6d4abfdcf36b06f5c7a0c089a58a34762369606e"
     },
     "src/modules/course-structure/entities/course-module.entity.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "d372f08c4d64172f547fdacfbe0003f328cbcf4f"
     },
     "src/modules/course-versions/entities/course-version.entity.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "f1a2a9cd91b6d612e8c71320a4db3e5d775a3547"
     },
     "src/modules/courses/courses.controller.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "9cb23061cbc189da1d12cb1362fd89d75ea29a92"
     },
     "src/modules/courses/courses.service.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "248beedb96e147920aeb1991034818a138b8bdf2"
     },
     "src/modules/courses/dto/create-course.dto.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "d54cfaa40124698c02bf8a99a68fe80966af37bf"
     },
     "src/modules/courses/dto/create-dynamic-course.dto.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "874dc50c15ca8c40fd3084ec6f3dbabf4ba57cc0"
     },
     "src/modules/courses/dto/update-course.dto.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "1115a0487cb565bfdfa36d2dc52f524b34861463"
     },
     "src/modules/courses/entities/course.entity.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "78752fdf657fd1926ca9c92d8f41c0071586fb09"
     },
     "src/modules/dynamic-generation/dto/course-context.dto.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "e70dc6d5b0e079e7afca253e2e426073a508d307"
     },
     "src/modules/dynamic-generation/dto/executor.dto.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "62eac7ff2dc3c7f8b0048a4e91ba24ed085735a9"
     },
     "src/modules/dynamic-generation/dto/regenerate-item.dto.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "2434d72e936ec37deea47a57c22078592d2fe495"
     },
     "src/modules/dynamic-generation/dynamic-generation.module.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "12d0874762cac68759d44b3e8dfd1bdd6de511c9"
     },
     "src/modules/dynamic-generation/dynamic-video-delivery.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "859a2fda74a210d60c0aeeb5e57de56051df8dd6"
     },
     "src/modules/dynamic-generation/dynamic-youtube.controller.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "eb669027745d813687fc4ae338acf93bb2f90f7d"
     },
     "src/modules/dynamic-generation/dynamic-youtube.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "e74bea25a6ad30968e1912543a459aac9d0781c5"
     },
     "src/modules/dynamic-generation/entities/generation-item-run.entity.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "57457b70a985f1a69e276733be59d39527da5a3f"
     },
     "src/modules/dynamic-generation/executor.controller.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "24406c7d89f16ca4bc373274a031d2719f86b9e8"
     },
     "src/modules/dynamic-generation/item-generations.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "ee21ac2a338ab70b3b7f5adcad47b7084356cdcf"
     },
     "src/modules/dynamic-generation/item-transitions.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "dfb031afcf6001fb759d9b52c4302bcc92e4c4a7"
     },
     "src/modules/dynamic-generation/run-hash.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "ec86f269c62d7e87756f18584a91d0a1e2030925"
     },
     "src/modules/dynamic-generation/runs.controller.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "51bd167fb69c3fd2b6fc3e545d244018307dae4a"
     },
     "src/modules/dynamic-generation/runs.service.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "593c49383e00d58a12019979fd2d5c6b7fcebc76"
     },
     "src/modules/dynamic-generation/scheduler.service.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "a64b80324a0983a0740fa93d7d3f04ea6e6927b9"
     },
     "src/modules/dynamic-packaging/artifact-resolver.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "16e835ce15d245767654a2957afebafacac3401a"
     },
     "src/modules/dynamic-packaging/dynamic-packaging.module.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "6a34984b014381b16e53b44509643c9985bce6af"
     },
     "src/modules/dynamic-packaging/packaging-plan.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "3603940ef29daccc1c325cd0f09305542564f56c"
     },
     "src/modules/dynamic-packaging/packaging-reuse-key.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "15a814aeb5b635892cd58d503818aa4797ad4616"
     },
     "src/modules/dynamic-packaging/packaging-types.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "27c06d8290a9cc57b4978f76e7d8bbe0ce66f918"
     },
     "src/modules/dynamic-packaging/packaging-warnings.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "1e3e7233cd1b7b020d360e444b0dab62e17e4b9e"
     },
     "src/modules/dynamic-packaging/packaging.controller.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "1133cd32015da176ee942d5baa48c428af0dea3a"
     },
     "src/modules/dynamic-packaging/packaging.service.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "769af28485c6c5a062d048f827b211b70000bbff"
     },
     "src/modules/features/dynamic-feature.guard.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "7cf181a8557043c2e4fab7e3d5eedf77b0fed905"
     },
     "src/modules/features/dynamic-features.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "b18a67460198139fd3746788d0360b3b71bcf3a5"
     },
     "src/modules/features/dynamic-routes.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "975c39b11b300355e2edaf86ac2f7428d61d80e6"
     },
     "src/modules/features/features.controller.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "55db12d350b3fe558e9323f4d60ce3d519f40338"
     },
     "src/modules/features/features.module.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "a7ac7bc9da763305f16f4ada4f31f8548bcd156a"
     },
     "src/modules/generation-manifests/entities/course-generation-manifest.entity.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "fe6a5b94ba1667faf0784746b931d7b5f08638ef"
     },
     "src/modules/generation-manifests/generation-manifest-builder.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "0b4887cec339b4f5930646abaac54c1639aa14bb"
     },
     "src/modules/generation-manifests/generation-manifests.controller.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "c53e3adb0e585207e7f8ee91ff78d7041801d9f9"
     },
     "src/modules/generation-manifests/generation-manifests.module.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "93f1f1c0f83475830b264325c83d15f0990c13c9"
     },
     "src/modules/generation-manifests/generation-manifests.service.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "77b4ba1874ddaf78edef5ee8ad7b3e8a14276132"
     },
     "src/modules/generation-manifests/manifest-rules-config.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "a4d0ed40e335c67654a750faf52c76aee89f707f"
     },
     "src/modules/invalidation/dto/from-run.dto.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "f8f18d937918909ee351f81b67da4a382147fd6e"
     },
     "src/modules/invalidation/fingerprints.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "9467df929b1d27c416944d123e9926250d91f32b"
     },
     "src/modules/invalidation/invalidation-apply.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "b740b3fde4b0ff61e23ebccf4c8822f6dbbcad89"
     },
     "src/modules/invalidation/invalidation.controller.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "59e357d528e8ffcccf1227841b2626e5e4f32259"
     },
     "src/modules/invalidation/invalidation.module.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "be97fb155d4375695ca382e1aa022e2477987c7e"
     },
     "src/modules/invalidation/invalidation.service.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "5bc31bcc184cd6e216d98842e14a1194f02e391f"
     },
     "src/modules/invalidation/plan.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "71880a8ee4ffd719859e6b5ce54ccfb58b7855c4"
     },
     "src/modules/production-jobs/entities/production-job.entity.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "b0a6bad33d5d73c48434142315dcb9f88f9a395c"
     },
     "src/package/dynamic-mbz-builder.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "f6e35e0edfe02b53444f2043d5f416740d6022ed"
     },
     "src/package/mbz-common.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "6ea7ebc7ae492404bbf5b9a9ebae87cdc6d29456"
     },
     "src/workers/dynamic-item-worker.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "f4a2345d005da9f6e47616642366b5d9c111713b"
     },
     "src/workers/dynamic-package-worker.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "0f6bce629067dcf2b10660a3a9a646dd83cebd36"
     },
     "src/workers/dynamic-worker-gate.ts": {
-      "mode": "source",
+      "category": "V2",
       "blob": "3ccced84cdf41835703b29a76943a42e94fa48ec"
     },
     "src/youtube/youtube-upload.service.ts": {
-      "mode": "source",
+      "category": "V2-DEP",
       "blob": "6d73f88c8c644e0c4915d82f7c243931c3bdc725"
     },
     "supabase-migration-course-blueprints.sql": {
-      "mode": "source",
+      "category": "V2-SCHEMA",
       "blob": "25790edc2ab44f9abd6cda75af0222a532d70948"
     },
     "supabase-migration-dynamic-course-structure.sql": {
-      "mode": "source",
+      "category": "V2-SCHEMA",
       "blob": "9f59d59892e51c46b9ff2f2c8d87b5d870f1d36c"
     },
     "supabase-migration-dynamic-generation-v2.rollback.md": {
-      "mode": "source",
+      "category": "V2-SCHEMA",
       "blob": "31fc9f3790b75bbb543f4931297eece67a06c96c"
     },
     "supabase-migration-dynamic-generation-v2.sql": {
-      "mode": "source",
+      "category": "V2-SCHEMA",
       "blob": "7f1f595187218afb4db3b092b6d7601fbedb22b4"
     },
     "supabase-migration-dynamic-generation.sql": {
-      "mode": "source",
+      "category": "V2-SCHEMA",
       "blob": "fa6789c8b6372f4e2a00864b19cd7e36f149c747"
     },
     "supabase-migration-generation-manifests.sql": {
-      "mode": "source",
+      "category": "V2-SCHEMA",
       "blob": "2bfee9ae26e08ecdb995758985c0755b6d52c5a3"
     },
     "supabase-migration-invalidation.sql": {
-      "mode": "source",
+      "category": "V2-SCHEMA",
       "blob": "9ac8c736fa80317aa15db7eaccdebc506cb205cf"
     },
     "supabase-migration-storage-artifacts-policies.sql": {
-      "mode": "source",
+      "category": "V2-SCHEMA",
       "blob": "31d3233df61781c4de22786fa7d712f9f4e6e9c3"
     },
     "test/e2e-v2/README.md": {
-      "mode": "source",
+      "category": "TEST",
       "blob": "92ecfa39550acdd0a38d1d5ac4c3c64e79a96eab"
     },
     "test/e2e-v2/e2e.js": {
-      "mode": "source",
+      "category": "TEST",
       "blob": "5582f7c936738965078f5f17165e1c6e1b512e30"
     },
     "test/e2e-v2/fakes.js": {
-      "mode": "source",
+      "category": "TEST",
       "blob": "da9e7e43cc9a665cfe6f3d7c72c63d53340c78d1"
     },
     "test/e2e-v2/front.js": {
-      "mode": "source",
+      "category": "TEST",
       "blob": "6a5f1b9966b371f25140d34cccf0f00463fa3caa"
     },
     "test/e2e-v2/google-fake-redirect.js": {
-      "mode": "source",
+      "category": "TEST",
       "blob": "fd6868a712db7be6d283aa7dc59444b63b6f54e4"
     },
     "test/e2e-v2/llm.js": {
-      "mode": "source",
+      "category": "TEST",
       "blob": "7362c08061cc84cb6448772deb7a91184a645aed"
     },
     "test/e2e-v2/mbz.js": {
-      "mode": "source",
+      "category": "TEST",
       "blob": "53d6fce27c04d896c3afd8e9b323b845845f8e52"
     },
     "test/e2e-v2/moodle-local/inspect_course.php": {
-      "mode": "source",
+      "category": "TEST",
       "blob": "47ae99b7e0970eb96cf9bf5738c9f8f0d4b55798"
     },
     "test/e2e-v2/moodle-local/restore-and-inspect.sh": {
-      "mode": "source",
+      "category": "TEST",
       "blob": "d823e46621fc2d40ae062d965521528bf457138d"
     },
     "test/e2e-v2/moodle-local/start.sh": {
-      "mode": "source",
+      "category": "TEST",
       "blob": "20c23cdfc32a22c87b396dbad1d765d36f1c1153"
     },
     "test/e2e-v2/moodle-local/teardown.sh": {
-      "mode": "source",
+      "category": "TEST",
       "blob": "6e2976db7a81c86cb8d42075109601599fa4e1ab"
     },
     "test/e2e-v2/moodle-render-youtube-labels.php": {
-      "mode": "source",
+      "category": "TEST",
       "blob": "91eaa7ffcc21ef145884aa4285bfabca9f23f305"
     },
     "test/e2e-v2/moodle-restore-inspect.php": {
-      "mode": "source",
+      "category": "TEST",
       "blob": "7aba711f7270d06ecaa817c62665d24d34b27cd8"
     },
     "test/e2e-v2/netguard.js": {
-      "mode": "source",
+      "category": "TEST",
       "blob": "799f890542b2c694a7746b980913dc0577152d1b"
     },
     "test/e2e-v2/run-e2e.sh": {
-      "mode": "source",
+      "category": "TEST",
       "blob": "f122e92abbef56a1bf1c286ad9cd004545a741d9"
     },
     "test/e2e-v2/setup-schema.js": {
-      "mode": "source",
+      "category": "TEST",
       "blob": "46b8b924742292476dfb66b4fd170a39fbbbe3d0"
     }
   }

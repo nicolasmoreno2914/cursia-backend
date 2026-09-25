@@ -13,16 +13,21 @@
 //     A3 el grafo de módulos de AppModule (dist) no tiene CourseSetupModule
 //        ni ningún controller CourseSetup*.
 //     A4 la app Nest real (AppModule compilado, DB inerte) arranca y su tabla
-//        de rutas: sin /course-setup, IGUAL a expectedRoutes del manifest;
+//        de rutas: sin /course-setup, IGUAL a expectedRoutes de la allow-list;
 //        POST /api/v1/course-setup/extract-from-pdf por HTTP → 404.
 //     A5 clientes Anthropic/Opus: el conjunto (archivo, línea) que matchea en
 //        src/ es IGUAL al de la base (origin/main) y los importadores del SDK
 //        en dist/ son exactamente anthropicDistBaseline (brand-extraction).
-//  B  allow-list: todo path que difiere de la base está en el manifest y su
-//     blob coincide con el fijado; los "source" coinciden además con la rama
-//     de integración auditada (si ese commit está disponible); los "partial"
-//     coinciden con su patch-id; mustEqualBase (deploy.yml) sin cambios;
-//     mustBeAbsent sin archivos.
+//  B  allow-list EXPLÍCITA (scripts/release/v2-release-allowlist.json,
+//     editada y revisada a mano; ningún script la escribe): todo path que
+//     difiere de la base fijada está listado uno por uno (paths/partial/
+//     tooling) y todo lo demás es byte-idéntico a la base; los paths de
+//     categorías auditadas son byte-idénticos al source auditado fijado; cada
+//     PARTIAL se RECONSTRUYE: base + los hunks listados (sha256 exacto +
+//     patch-id; texto en scripts/release/partials/*.patch) aplicados sin fuzz
+//     == archivo del release, y cada línea de cada hunk viene de sus commits
+//     V2 auditados; mustEqualBase (deploy.yml) sin cambios. Si la base o el
+//     source fijados no están disponibles → FAIL (nunca degrada a "nota").
 //
 // Uso: node scripts/release/check-v2-release.js   (desde la raíz del repo)
 
@@ -82,12 +87,13 @@ function httpStatus(port, method, p) {
 }
 
 async function main() {
-  const M = L.readManifest();
+  const M = L.readAllowlist();
   console.log(`== Cursia V2 release check (backend) — base ${M.base.sha.slice(0, 7)} (${M.base.ref}), source ${M.source.sha.slice(0, 7)} (${M.source.ref}), head ${L.git(['rev-parse', '--short', HEAD]).trim()}`);
 
   // ── A. course-setup ausente ───────────────────────────────────────────
   if (!fs.existsSync(path.join(DIST, 'app.module.js'))) {
-    bad('dist/ compilado presente (correr `npm run build` antes)');
+    bad('dist/ compilado presente (correr `npm run build` antes); A2-A5 no se pueden evaluar');
+    runB(M); // B no depende de dist/: se reporta igual (sin fail-fast)
     return finish();
   }
   const absentPrefixes = M.mustBeAbsent || [];
@@ -122,7 +128,7 @@ async function main() {
     const expected = (M.expectedRoutes || []).slice().sort();
     const extra = booted.routes.filter((r) => !expected.includes(r));
     const missing = expected.filter((r) => !booted.routes.includes(r));
-    check('A4 tabla de rutas == expectedRoutes del manifest', extra.length === 0 && missing.length === 0, { extra, missing });
+    check('A4 tabla de rutas == expectedRoutes de la allow-list', extra.length === 0 && missing.length === 0, { extra, missing });
     try {
       await booted.app.listen(0, '127.0.0.1');
       const port = booted.app.getHttpServer().address().port;
@@ -148,48 +154,15 @@ async function main() {
   const distImp = L.distAnthropicImporters(DIST);
   check('A5 importadores de @anthropic-ai/sdk en dist/ == anthropicDistBaseline', JSON.stringify(distImp) === JSON.stringify((M.anthropicDistBaseline || []).slice().sort()), distImp);
 
-  // ── B. allow-list ────────────────────────────────────────────────────
-  if (!L.hasCommit(M.base.sha)) {
-    bad('B commit base disponible', M.base.sha);
-    return finish();
-  }
-  check(`B base ${M.base.sha.slice(0, 7)} es ancestro de ${HEAD}`, L.gitOk(['merge-base', '--is-ancestor', M.base.sha, HEAD]));
-  const diff = L.diffNameStatus(M.base.sha, HEAD);
-  const files = M.files || {};
-  const notAllowed = diff.filter((d) => !files[d.path]).map((d) => d.status + ' ' + d.path);
-  check(`B los ${diff.length} paths que difieren de la base están en el manifest`, notAllowed.length === 0, notAllowed);
-  const diffPaths = new Set(diff.map((d) => d.path));
-  const stale = Object.keys(files).filter((p) => !diffPaths.has(p));
-  check('B el manifest no lista paths que ya no difieren (manifest exacto)', stale.length === 0, stale);
-
-  const srcAvail = L.hasCommit(M.source.sha);
-  if (!srcAvail) console.log(`note commit source ${M.source.sha.slice(0, 7)} no disponible: se valida solo contra los blobs fijados en el manifest`);
-  const blobMismatch = [];
-  const sourceMismatch = [];
-  const patchMismatch = [];
-  for (const [p, e] of Object.entries(files)) {
-    const got = L.blobAt(HEAD, p);
-    if (e.mode === 'deleted') { if (got !== null) blobMismatch.push(p + ' (debería no existir)'); continue; }
-    if (e.mode === 'manifest') continue; // el propio manifest no puede fijarse a sí mismo
-    if (got !== e.blob) blobMismatch.push(p + ` (head ${got && got.slice(0, 10)} ≠ manifest ${e.blob && e.blob.slice(0, 10)})`);
-    if (e.mode === 'source' && srcAvail) {
-      const s = L.blobAt(M.source.sha, p);
-      if (s !== e.blob) sourceMismatch.push(p + ` (source ${s && s.slice(0, 10)} ≠ manifest ${e.blob.slice(0, 10)})`);
-    }
-    if (e.mode === 'partial') {
-      const pid = L.patchIdOf(M.base.sha, HEAD, p);
-      if (pid !== e.patchId) patchMismatch.push(p + ` (patch-id ${pid} ≠ ${e.patchId})`);
-    }
-  }
-  check('B cada path del manifest tiene el blob fijado', blobMismatch.length === 0, blobMismatch);
-  const nSource = Object.values(files).filter((e) => e.mode === 'source').length;
-  if (srcAvail) check(`B los ${nSource} paths "source" son byte-idénticos a la integración auditada`, sourceMismatch.length === 0, sourceMismatch);
-  const nPartial = Object.values(files).filter((e) => e.mode === 'partial').length;
-  check(`B los ${nPartial} paths PARTIAL coinciden con su patch-id`, patchMismatch.length === 0, patchMismatch);
-  for (const p of M.mustEqualBase || []) {
-    check(`B ${p} idéntico a la base`, L.blobAt(HEAD, p) === L.blobAt(M.base.sha, p));
-  }
+  runB(M);
   return finish();
+}
+
+// ── B. allow-list explícita ──────────────────────────────────────────────
+// Autoridad: scripts/release/v2-release-allowlist.json (editada a mano y
+// revisada en el PR; ningún script la genera). Ver L.verifyAllowlist.
+function runB(M) {
+  for (const r of L.verifyAllowlist(M, { head: HEAD })) check(r.name, r.ok, r.detail);
 }
 
 function finish() {
