@@ -36,6 +36,11 @@ const ACTIVE_RUN_INDEX = 'uq_dynamic_generation_active_run';
 const GENERATION = 1;
 /** R17: default cuando el body no manda videoMode. */
 const DEFAULT_VIDEO_MODE: RunVideoMode = 'mock';
+/**
+ * I1 (review-rv2): namespace del advisory lock por curso (pg_advisory_xact_lock(ns, courseId))
+ * que serializa crear/reabrir/reintentar-con-reapertura runs de un curso.
+ */
+const COURSE_RUNS_LOCK_NS = 0x5c2a01;
 
 export interface RunVideoEstimate {
   videoCount: number;
@@ -206,6 +211,11 @@ export class RunsService {
    * - Sin runs → se crea (job + contexto + items en una transacción). La
    *   concurrencia la garantiza el índice único parcial: el perdedor de una
    *   carrera recibe 23505, re-selecciona el run activo y lo devuelve.
+   * - I1 (review-rv2): si el CURSO ya tiene un run activo sobre OTRO Manifest
+   *   (otra rulesVersion del mismo Blueprint, u otro Blueprint) → 409 con
+   *   `runId=<activo>` (en el mensaje y en el body): nunca dos generaciones
+   *   completas en paralelo. Garantizado bajo concurrencia por un advisory
+   *   lock por curso en insertRun/reopenRun/retryItem.
    */
   async startRun(
     courseId: number,
@@ -222,6 +232,12 @@ export class RunsService {
     // uso y se congela SOLO en runs nuevos; un run existente/reabierto
     // conserva la suya aunque la config haya cambiado.
     const videoDelivery = readVideoDeliveryConfig();
+    // I1 (review-rv2): nunca dos generaciones completas activas del mismo
+    // curso (doble gasto) — p.ej. un run v1 en curso y la config pasa a v2.
+    // Chequeo temprano (409 legible); la garantía bajo concurrencia la dan
+    // los chequeos bajo advisory lock en insertRun/reopenRun/retryItem.
+    const other = await this.findActiveRunOnOtherManifest(this.dataSource, courseId, manifest.id);
+    if (other) throw this.otherActiveRunConflict(other, manifest);
     return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, true, videoDelivery);
   }
 
@@ -307,14 +323,121 @@ export class RunsService {
   }
 
   /**
-   * R11: el run "actual" de un Manifest para que la UI reanude tras recargar
+   * R11: el run "actual" del Blueprint para que la UI reanude tras recargar
    * sin reenviar contexto: el activo si hay, si no el más reciente, si no
    * `null`.
+   *
+   * I1 (review-rv2): se busca entre TODOS los Manifests del Blueprint (v1 y
+   * v2), no solo el de DYNAMIC_MANIFEST_RULES_VERSION — un run v1 en curso
+   * sigue siendo "el actual" aunque la config pase a 2 (antes: 404 y la UI
+   * creaba un run v2 en paralelo). Se responde con el Manifest congelado de
+   * ESE run. Sin runs, se conserva el comportamiento de siempre contra el
+   * Manifest configurado (mismos 404/400; `null` si existe y no tiene runs).
    */
   async getCurrentRun(courseId: number, ownerId: string, blueprintNumber: number): Promise<RunDto | null> {
-    const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
-    const job = (await this.findActiveRunRow(manifest.id)) ?? (await this.findLatestRunRow(manifest.id));
-    return job ? this.buildRunDto(job, manifest) : null;
+    const current = await this.findCurrentRunOfBlueprint(courseId, ownerId, blueprintNumber);
+    if (!current) {
+      await this.manifests.get(courseId, ownerId, blueprintNumber);
+      return null;
+    }
+    return this.buildRunDto(current.job, current.manifest);
+  }
+
+  /**
+   * I1: run actual del Blueprint entre todos sus Manifests (cualquier
+   * rulesVersion): el activo (tras reconciliar cancels legacy) si hay, si no
+   * el más reciente. Con su Manifest congelado, leído vía getById (verifica
+   * dueño, `dynamic` y pertenencia al Blueprint → 404/400 de siempre).
+   */
+  private async findCurrentRunOfBlueprint(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+  ): Promise<{ job: any; manifest: ManifestDto } | null> {
+    const rows = await this.dataSource.query(
+      `select pj.* from public.production_jobs pj
+         join public.course_generation_manifests m
+           on m.id::text = pj.input_payload->>'manifestId' and m.course_id = pj.course_id
+         join public.course_blueprints b on b.id = m.blueprint_id and b.course_id = m.course_id
+        where pj.execution_mode = 'dynamic_generation'
+          and pj.course_id = $1 and pj.owner_id = $2 and b.blueprint_number = $3
+        order by pj.created_at desc, pj.id desc`,
+      [courseId, ownerId, blueprintNumber],
+    );
+    if (rows.length === 0) return null;
+    let chosen: any = null;
+    for (const row of rows) {
+      const r = await this.reconcileCancellation(row);
+      if (isActive(r)) {
+        chosen = r;
+        break;
+      }
+    }
+    if (!chosen) chosen = await this.reconcileCancellation(rows[0]);
+    const manifest = await this.manifests.getById(courseId, ownerId, blueprintNumber, Number(chosen.input_payload?.manifestId));
+    return { job: chosen, manifest };
+  }
+
+  /**
+   * I1: run activo del MISMO curso sobre OTRO Manifest (otra rulesVersion u
+   * otro Blueprint). Con un QueryRunner dentro de una transacción que ya tomó
+   * el advisory lock del curso (lockCourseRuns), el resultado es estable
+   * hasta el commit.
+   */
+  private async findActiveRunOnOtherManifest(
+    q: { query: (sql: string, params?: any[]) => Promise<any> },
+    courseId: number,
+    manifestId: number,
+  ): Promise<{ id: string; manifestId: number; blueprintNumber: number | null; rulesVersion: number | null } | null> {
+    const [row] = await q.query(
+      `select pj.id, pj.input_payload->>'manifestId' as manifest_id, m.rules_version, b.blueprint_number
+         from public.production_jobs pj
+         left join public.course_generation_manifests m on m.id::text = pj.input_payload->>'manifestId'
+         left join public.course_blueprints b on b.id = m.blueprint_id
+        where pj.execution_mode = 'dynamic_generation' and pj.course_id = $1
+          and pj.input_payload->>'manifestId' is distinct from $2
+          and pj.worker_status = any($3::text[])
+          and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+        order by pj.created_at desc, pj.id desc
+        limit 1`,
+      [courseId, String(manifestId), ACTIVE_RUN_WORKER_STATUSES],
+    );
+    if (!row) return null;
+    return {
+      id: row.id,
+      manifestId: Number(row.manifest_id),
+      blueprintNumber: row.blueprint_number ?? null,
+      rulesVersion: row.rules_version ?? null,
+    };
+  }
+
+  private otherActiveRunConflict(
+    other: { id: string; manifestId: number; blueprintNumber: number | null; rulesVersion: number | null },
+    manifest: ManifestDto,
+  ): ConflictException {
+    const message =
+      `Ya hay una generación en curso para este curso (Blueprint v${other.blueprintNumber ?? '?'}, ` +
+      `rulesVersion ${other.rulesVersion ?? '?'}, Manifest #${other.manifestId}). No se puede iniciar otra ` +
+      `(Manifest #${manifest.id}, rulesVersion ${manifest.rulesVersion}) mientras esa siga activa: ` +
+      `reanudala o cancelala primero. runId=${other.id}`;
+    return new ConflictException({
+      message,
+      code: 'active_run_on_other_manifest',
+      runId: other.id,
+      manifestId: other.manifestId,
+      rulesVersion: other.rulesVersion,
+    });
+  }
+
+  /**
+   * I1: serializa, por curso, toda operación que puede dejar un run ACTIVO
+   * (crear, reabrir, reintentar con reapertura). Advisory lock de
+   * transacción: se libera solo en commit/rollback. Siempre se toma PRIMERO
+   * en la transacción (antes de cualquier FOR UPDATE) → sin ciclos de locks
+   * con el scheduler, que nunca lo toma.
+   */
+  private async lockCourseRuns(qr: QueryRunner, courseId: number): Promise<void> {
+    await qr.query(`select pg_advisory_xact_lock($1::int, $2::int)`, [COURSE_RUNS_LOCK_NS, courseId]);
   }
 
   /**
@@ -328,7 +451,10 @@ export class RunsService {
    * decidir si autorizar el modo 'real' (condición 7).
    */
   async estimateRun(courseId: number, ownerId: string, blueprintNumber: number): Promise<RunVideoEstimate> {
-    const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
+    // I1 (review-rv2): el Manifest del run actual del Blueprint (cualquier
+    // rulesVersion); sin runs, el configurado (mismos 404/400 de siempre).
+    const current = await this.findCurrentRunOfBlueprint(courseId, ownerId, blueprintNumber);
+    const manifest = current ? current.manifest : await this.manifests.get(courseId, ownerId, blueprintNumber);
     const videoItems = manifest.manifest.items.filter((it) => it.type === 'video');
     if (videoItems.length !== manifest.totals.videoCount) {
       throw new InternalServerErrorException(
@@ -417,12 +543,20 @@ export class RunsService {
     }
 
     const targetId = await this.tx(async (qr) => {
+      // I1: lock del curso primero — este reintento puede reabrir el run.
+      await this.lockCourseRuns(qr, courseId);
       const [locked] = await qr.query(
         `select id, status, worker_status from public.production_jobs where id = $1 for update`,
         [job.id],
       );
       if (isCancelledLike(locked)) {
         throw new ConflictException(`La ejecución ${job.id} está cancelada; no se pueden reintentar items`);
+      }
+      if (!ACTIVE_RUN_WORKER_STATUSES.includes(String(locked.worker_status))) {
+        // Reabrir este run con otro run del curso activo = dos generaciones
+        // completas en paralelo (doble gasto) → 409 con el runId del activo.
+        const other = await this.findActiveRunOnOtherManifest(qr, courseId, manifest.id);
+        if (other) throw this.otherActiveRunConflict(other, manifest);
       }
 
       const items: Array<{
@@ -604,6 +738,12 @@ export class RunsService {
     videoMode: RunVideoMode,
     videoDelivery: VideoDeliveryStrategy,
   ): Promise<string> {
+    // I1: bajo el lock del curso, ningún otro Manifest del curso puede tener
+    // un run activo (el índice único parcial solo protege ESTE Manifest).
+    await this.lockCourseRuns(qr, courseId);
+    const other = await this.findActiveRunOnOtherManifest(qr, courseId, manifest.id);
+    if (other) throw this.otherActiveRunConflict(other, manifest);
+
     const inputPayload = { manifestId: manifest.id, blueprintNumber, contextHash, videoMode, videoDelivery };
     const [job] = await qr.query(
       `insert into public.production_jobs
@@ -730,8 +870,12 @@ export class RunsService {
     let outcome: { kind: 'reopened' } | { kind: 'active'; row: any };
     try {
       outcome = await this.tx(async (qr) => {
+        // I1: lock del curso primero (antes de cualquier FOR UPDATE).
+        await this.lockCourseRuns(qr, manifest.courseId);
         const [locked] = await qr.query(`select * from public.production_jobs where id = $1 for update`, [jobId]);
         if (isActive(locked)) return { kind: 'active' as const, row: locked };
+        const other = await this.findActiveRunOnOtherManifest(qr, manifest.courseId, manifest.id);
+        if (other) throw this.otherActiveRunConflict(other, manifest);
         if (!isReopenable(locked)) {
           throw new ConflictException(
             `La ejecución anterior de este Manifest ya terminó (${locked.worker_status}); re-ejecutar un Manifest ` +
