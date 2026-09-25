@@ -137,6 +137,7 @@
     "scripts/release/check-v2-release.js",
     "scripts/release/partials/scripts__check-dynamic-feature-gating.js.patch",
     "scripts/release/partials/src__app.module.ts.patch",
+    "scripts/release/partials/tsconfig.build.json.patch",
     "scripts/release/v2-release-allowlist.json",
     "scripts/release/v2-release-lib.js"
   ],
@@ -201,6 +202,19 @@
             "8946bd87346d33e18e9b51b5a4906189530d5246",
             "0c5cb9953df8a3063d481287a0d5e864e079a7d7"
           ]
+        }
+      ]
+    },
+    "tsconfig.build.json": {
+      "reason": "Fix wave: excluye harness/tests (*.test.ts, __harness__, *.harness.ts) del dist del build de producción. Hoy no hay ninguno en src/: dist/ byte-idéntico antes/después (522 archivos); es un guard para el release.",
+      "patch": "scripts/release/partials/tsconfig.build.json.patch",
+      "blob": "778001c9c1aae47a7c2638659a63d3cd6647d23c",
+      "hunks": [
+        {
+          "sha256": "a1bb794099d9f87e35271264444b7b21f606763cdf0713885e2289beb7671955",
+          "patchId": "7c192421c95fc05cedcba4a159371b56ae7038c9",
+          "summary": "+1/-1: \"exclude\": [\"node_modules\", \"test\", \"dist\", \"**/*spec.ts\", \"**/*.test.ts\", \"**/__harness__",
+          "adapter": "Fix wave: excluye harness/tests (*.test.ts, __harness__, *.harness.ts) del dist del build de producción. Hoy no hay ninguno en src/: dist/ byte-idéntico antes/después (522 archivos); es un guard para el release."
         }
       ]
     }

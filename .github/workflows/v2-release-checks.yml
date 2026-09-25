@@ -1,6 +1,11 @@
 # Cursia V2 — checks del release curado (DN-7). Solo para el PR de la rama
 # release/cursia-v2 hacia main: no despliega, no usa secretos, no toca DB ni
 # red externa. deploy.yml NO se modifica ni invoca estos checks.
+#
+# Sin fail-fast: cada check corre aunque falle uno anterior, se imprime un
+# resumen con TODOS los fallos y los logs se suben como artifact. El job falla
+# si falló cualquiera. La autoridad del allow-list es
+# scripts/release/v2-release-allowlist.json (editada a mano, revisar su diff).
 name: v2-release-checks
 
 on:
@@ -15,7 +20,7 @@ jobs:
   release-checks:
     if: github.event_name == 'workflow_dispatch' || github.head_ref == 'release/cursia-v2'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,17 +30,30 @@ jobs:
           node-version: '22'
           cache: npm
       - run: npm ci
-      - run: npm run build
-      - run: npx tsc --noEmit --incremental false
-      - name: check-v2-release (course-setup ausente + allow-list)
-        run: node scripts/release/check-v2-release.js
-      - name: scripts/check-*.js
+      - name: checks (todos, sin fail-fast)
+        shell: bash
         run: |
-          rc_all=0
-          for f in scripts/check-*.js; do
-            node "$f" > "/tmp/$(basename "$f").log" 2>&1
-            rc=$?
-            echo "$f rc=$rc :: $(tail -1 "/tmp/$(basename "$f").log")"
-            [ $rc -ne 0 ] && rc_all=1
-          done
-          exit $rc_all
+          set -u -o pipefail
+          LOGS="$RUNNER_TEMP/v2-release-logs"
+          mkdir -p "$LOGS"
+          : > "$LOGS/summary.txt"
+          run() { # run <nombre> <comando...>: nunca corta el loop
+            local name=$1; shift
+            local rc=0
+            "$@" > "$LOGS/$name.log" 2>&1 || rc=$?
+            echo "$name rc=$rc :: $(tail -1 "$LOGS/$name.log")" | tee -a "$LOGS/summary.txt"
+            if [ $rc -ne 0 ]; then grep -E '^FAIL' "$LOGS/$name.log" | sed "s/^/    [$name] /" | tee -a "$LOGS/summary.txt" || true; fi
+          }
+          run build npm run build
+          run tsc npx tsc --noEmit --incremental false
+          run check-v2-release node scripts/release/check-v2-release.js
+          for f in scripts/check-*.js; do run "$(basename "$f" .js)" node "$f"; done
+          echo "---- resumen ----"; cat "$LOGS/summary.txt"
+          if grep -Eq ' rc=[1-9][0-9]* ' "$LOGS/summary.txt"; then echo "::error::fallaron checks del release (ver resumen)"; exit 1; fi
+      - name: logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2-release-check-logs
+          path: ${{ runner.temp }}/v2-release-logs
+          if-no-files-found: warn
