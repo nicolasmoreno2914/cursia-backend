@@ -9,6 +9,7 @@ import {
   HttpCode,
   HttpStatus,
   UseGuards,
+  ParseUUIDPipe,
 } from '@nestjs/common';
 import { ArtifactsService } from './artifacts.service';
 import { CreateArtifactDto } from './dto/create-artifact.dto';
@@ -60,7 +61,7 @@ export class ArtifactsController {
    */
   @Get(':id')
   async findOne(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
     @CurrentUser() user: AuthUser,
   ) {
     const artifact = await this.artifactsService.findOne(id, user.id);
@@ -75,7 +76,7 @@ export class ArtifactsController {
    */
   @Get(':id/download-url')
   async getDownloadUrl(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
     @CurrentUser() user: AuthUser,
     @Query('expires') expires?: string,
   ) {
@@ -95,7 +96,7 @@ export class ArtifactsController {
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
   async remove(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
     @CurrentUser() user: AuthUser,
   ) {
     await this.artifactsService.remove(id, user.id);

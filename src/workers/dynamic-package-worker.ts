@@ -37,6 +37,53 @@ function readPositiveInt(envKey: string, fallback: number): number {
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
 }
 
+// M11 (fase5b-audit integral-review.md): buildDynamicMbz() nunca recibía
+// moodleVersion y caía siempre al default del builder (4.1, mbz-common.ts
+// resolveMoodleVersion). Se hace configurable por env var, sin cambiar el
+// default para despliegues que no la seteen.
+function resolveDynamicMoodleVersion(): string | undefined {
+  const raw = process.env.DYNAMIC_MBZ_MOODLE_VERSION;
+  return raw && raw.trim() ? raw.trim() : undefined;
+}
+
+// M9 (fase5b-audit integral-review.md): lock consultivo de Postgres por
+// runId alrededor de todo el ciclo de build de un job `dynamic_package`
+// (restore-first + build + upload + completeJob). No reemplaza el sistema de
+// lease/heartbeat (eso serializa por *job*, no por *run*) — este lock cubre
+// el caso en que `requestPackage` (sin lock propio, gap documentado abajo)
+// dejó pasar la carrera y creó dos jobs `dynamic_package` para el MISMO
+// runId: sin este lock, dos workers podrían construir el mismo .mbz en
+// paralelo (duplicando trabajo/memoria) y competir al subir a la misma
+// `sourceIdsHash` (mitigado además por `upsert:false`, ver abajo). Usa una
+// conexión dedicada (no el pool) porque los advisory locks de Postgres son
+// por-sesión: pg_advisory_lock/unlock deben correr en la misma conexión.
+//
+// Gap documentado, no cerrado en este cambio: `PackagingService.requestPackage`
+// (packaging.service.ts) sigue sin advisory lock propio, así que dos POST
+// simultáneos a …/runs/:runId/package todavía pueden crear dos jobs para el
+// mismo runId (I2/I3 ya aceptan eso como posible); este lock en el worker
+// evita que ambos *construyan* en paralelo, pero no evita que ambos jobs
+// existan. Tampoco hay cap de concurrencia global del worker (N jobs de
+// runs distintos sí corren en paralelo sin límite) — eso requiere una
+// decisión de producto/ops sobre paralelismo objetivo (ver audit item 5-M9).
+async function withRunPackagingLock<T>(dataSource: DataSource, runId: string, fn: () => Promise<T>): Promise<T> {
+  const queryRunner = dataSource.createQueryRunner();
+  await queryRunner.connect();
+  try {
+    // hashtext() es determinístico e independiente del formato del uuid;
+    // pg_advisory_lock toma un solo bigint (usamos hashtextextended con seed
+    // fijo para reducir colisiones vs. un solo hashtext de 32 bits).
+    await queryRunner.query('select pg_advisory_lock(hashtextextended($1, 0))', [runId]);
+    try {
+      return await fn();
+    } finally {
+      await queryRunner.query('select pg_advisory_unlock(hashtextextended($1, 0))', [runId]);
+    }
+  } finally {
+    await queryRunner.release();
+  }
+}
+
 export interface DynamicPackageWorkerDeps {
   dataSource: DataSource;
   artifacts: ArtifactsService;
@@ -201,62 +248,77 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
       throw new Error(`el Manifest actual del Blueprint v${blueprintNumber} (#${manifest.id}) no coincide con el del job (#${manifestId})`);
     }
 
-    const byItem = await deps.resolveArtifacts({ query: deps.dataSource.query.bind(deps.dataSource) }, runId, manifest.manifest);
-    const ids = sortedArtifactIds(byItem);
-    const sourceIdsHash = computeSourceIdsHash(DYNAMIC_MBZ_BUILDER_VERSION, ids);
-    if (leaseLost) return;
+    await withRunPackagingLock(deps.dataSource, runId, async () => {
+      const byItem = await deps.resolveArtifacts({ query: deps.dataSource.query.bind(deps.dataSource) }, runId, manifest.manifest);
+      const ids = sortedArtifactIds(byItem);
+      const sourceIdsHash = computeSourceIdsHash(DYNAMIC_MBZ_BUILDER_VERSION, ids);
+      if (leaseLost) return;
 
-    // Restore-first: mismo runId + mismo set de artifacts de origen -> reusar.
-    const existing = await findExistingDynamicMbz(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash);
-    if (existing) {
-      logger.log(`Job ${job.id}: dynamic_mbz ya existe (${existing.id}) para runId=${runId} — reutilizando sin reconstruir`);
+      // Restore-first: mismo runId + mismo set de artifacts de origen -> reusar.
+      const existing = await findExistingDynamicMbz(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash);
+      if (existing) {
+        logger.log(`Job ${job.id}: dynamic_mbz ya existe (${existing.id}) para runId=${runId} — reutilizando sin reconstruir`);
+        const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
+          artifactId: existing.id,
+          sourceArtifactIds: ids,
+          sourceIdsHash,
+          builderVersion: DYNAMIC_MBZ_BUILDER_VERSION,
+          reused: true,
+        });
+        if (!ok) logger.warn(`Job ${job.id}: completeJob devolvió false (lease perdida) tras reutilizar ${existing.id}`);
+        return;
+      }
+      if (leaseLost) return;
+
+      const blueprint = await deps.blueprints.getByNumber(job.course_id, job.owner_id, blueprintNumber);
+      const plan = deps.buildPlan(manifest.manifest, blueprint.snapshot, { manifestId: manifest.id });
+      if (leaseLost) return;
+
+      const videoDelivery = await loadRunVideoDelivery({ query: deps.dataSource.query.bind(deps.dataSource) }, runId);
+      const contents = await loadContentsForPlan(deps, job.owner_id, plan, byItem, videoDelivery);
+      if (leaseLost) return;
+
+      const moodleVersion = resolveDynamicMoodleVersion();
+      const buffer = await deps.buildMbz({ plan, contents, moodleVersion });
+      if (leaseLost) return;
+
+      const storagePath = `${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${sourceIdsHash}.mbz`;
+      const artifact = await deps.artifacts.uploadBufferArtifact({
+        ownerId: job.owner_id,
+        courseId: artifactCourseId(job),
+        jobId: job.id,
+        type: 'dynamic_mbz',
+        filename: `${sourceIdsHash}.mbz`,
+        storagePath,
+        buffer,
+        mimeType: 'application/vnd.moodle.backup',
+        // M9: el path incluye sourceIdsHash (contenido) -> es inmutable por
+        // construcción; upsert:false evita pisar un objeto existente en una
+        // carrera entre dos workers para el mismo runId (mitigado también
+        // por el advisory lock, pero esto es la defensa a nivel storage).
+        upsert: false,
+        metadata: {
+          runId,
+          manifestId: manifest.id,
+          sourceArtifactIds: ids,
+          sourceIdsHash,
+          builderVersion: DYNAMIC_MBZ_BUILDER_VERSION,
+          moodleVersion: moodleVersion ?? '4.1',
+        },
+      });
+      if (leaseLost) return;
+
       const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
-        artifactId: existing.id,
+        artifactId: artifact.id,
         sourceArtifactIds: ids,
         sourceIdsHash,
         builderVersion: DYNAMIC_MBZ_BUILDER_VERSION,
-        reused: true,
+        reused: false,
       });
-      if (!ok) logger.warn(`Job ${job.id}: completeJob devolvió false (lease perdida) tras reutilizar ${existing.id}`);
-      return;
-    }
-    if (leaseLost) return;
-
-    const blueprint = await deps.blueprints.getByNumber(job.course_id, job.owner_id, blueprintNumber);
-    const plan = deps.buildPlan(manifest.manifest, blueprint.snapshot, { manifestId: manifest.id });
-    if (leaseLost) return;
-
-    const videoDelivery = await loadRunVideoDelivery({ query: deps.dataSource.query.bind(deps.dataSource) }, runId);
-    const contents = await loadContentsForPlan(deps, job.owner_id, plan, byItem, videoDelivery);
-    if (leaseLost) return;
-
-    const buffer = await deps.buildMbz({ plan, contents });
-    if (leaseLost) return;
-
-    const storagePath = `${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${sourceIdsHash}.mbz`;
-    const artifact = await deps.artifacts.uploadBufferArtifact({
-      ownerId: job.owner_id,
-      courseId: artifactCourseId(job),
-      jobId: job.id,
-      type: 'dynamic_mbz',
-      filename: `${sourceIdsHash}.mbz`,
-      storagePath,
-      buffer,
-      mimeType: 'application/vnd.moodle.backup',
-      metadata: { runId, manifestId: manifest.id, sourceArtifactIds: ids, sourceIdsHash, builderVersion: DYNAMIC_MBZ_BUILDER_VERSION },
+      if (!ok) {
+        logger.warn(`Job ${job.id}: el .mbz se generó y el artifact ${artifact.id} se subió, pero completeJob devolvió false (lease perdida)`);
+      }
     });
-    if (leaseLost) return;
-
-    const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
-      artifactId: artifact.id,
-      sourceArtifactIds: ids,
-      sourceIdsHash,
-      builderVersion: DYNAMIC_MBZ_BUILDER_VERSION,
-      reused: false,
-    });
-    if (!ok) {
-      logger.warn(`Job ${job.id}: el .mbz se generó y el artifact ${artifact.id} se subió, pero completeJob devolvió false (lease perdida)`);
-    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (leaseLost) {
