@@ -186,8 +186,8 @@ export class PackagingService {
   /**
    * Manifest congelado del run (input_payload.manifestId), no el "actual" de
    * DYNAMIC_MANIFEST_RULES_VERSION — mismo criterio que RunsService. Si el run
-   * no existe para el curso se usa el Manifest configurado (mismos 404/400 de
-   * siempre; loadRunRow da después el 404 del run).
+   * no existe para el curso: 404/400 del Blueprint o 404 del run, sin
+   * consultar la config (fix wave review-rv2).
    */
   private async manifestOfRun(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<ManifestDto> {
     const [row] = await this.dataSource.query(
@@ -196,7 +196,14 @@ export class PackagingService {
       [runId, courseId],
     );
     const manifestId = Number(row?.manifest_id);
-    if (!row || !Number.isInteger(manifestId)) return this.manifests.get(courseId, ownerId, blueprintNumber);
+    if (!row || !Number.isInteger(manifestId)) {
+      // Run inexistente para este curso: mismos 404/400 del Blueprint de
+      // siempre, pero SIN leer el Manifest de la config (un run se resuelve
+      // solo por su propio manifestId; la config nunca decide, fix wave
+      // review-rv2) y con el 404 del run.
+      await this.manifests.assertBlueprintAccessible(courseId, ownerId, blueprintNumber);
+      throw new NotFoundException(`La ejecución ${runId} no existe para el Blueprint v${blueprintNumber} del curso #${courseId}`);
+    }
     return this.manifests.getById(courseId, ownerId, blueprintNumber, manifestId);
   }
 

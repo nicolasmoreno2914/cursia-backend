@@ -705,9 +705,9 @@ export class RunsService {
    * de la config: un run v1 sigue siendo legible/cancelable/reintentable
    * aunque DYNAMIC_MANIFEST_RULES_VERSION pase a 2 (y viceversa). Ownership,
    * `dynamic` y pertenencia al Blueprint se verifican en
-   * GenerationManifestsService.getById. Si el run no existe para este curso
-   * se cae al Manifest configurado para conservar exactamente los mismos
-   * 404/400 de antes (loadRunRow después da el 404 del run).
+   * GenerationManifestsService.getById. Si el run no existe para este curso:
+   * 404/400 del Blueprint (ajeno/legacy) o 404 del run — nunca se consulta
+   * la config (fix wave review-rv2).
    */
   private async manifestOfRun(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<ManifestDto> {
     const [row] = await this.dataSource.query(
@@ -716,7 +716,14 @@ export class RunsService {
       [runId, courseId],
     );
     const manifestId = Number(row?.manifest_id);
-    if (!row || !Number.isInteger(manifestId)) return this.manifests.get(courseId, ownerId, blueprintNumber);
+    if (!row || !Number.isInteger(manifestId)) {
+      // Run inexistente para este curso: mismos 404/400 del Blueprint de
+      // siempre, pero SIN leer el Manifest de la config (un run se resuelve
+      // solo por su propio manifestId; la config nunca decide, fix wave
+      // review-rv2) y con el 404 del run.
+      await this.manifests.assertBlueprintAccessible(courseId, ownerId, blueprintNumber);
+      throw new NotFoundException(`La ejecución ${runId} no existe para el Blueprint v${blueprintNumber} del curso #${courseId}`);
+    }
     return this.manifests.getById(courseId, ownerId, blueprintNumber, manifestId);
   }
 

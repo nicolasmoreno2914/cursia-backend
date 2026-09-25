@@ -194,6 +194,16 @@ export class GenerationManifestsService {
   }
 
   /**
+   * Verifica acceso al Blueprint (404 ajeno/inexistente, 400 legacy) SIN
+   * depender de DYNAMIC_MANIFEST_RULES_VERSION. Lo usan los endpoints con
+   * runId cuando el run no existe, para responder 404 del run sin leer "el
+   * Manifest actual" de la config (fix wave review-rv2).
+   */
+  async assertBlueprintAccessible(courseId: number, ownerId: string, blueprintNumber: number): Promise<void> {
+    await this.blueprints.getByNumber(courseId, ownerId, blueprintNumber);
+  }
+
+  /**
    * Lee un Manifest concreto por id (el congelado en un run:
    * input_payload.manifestId), verificando que sea de ESE Blueprint/curso y
    * del dueño (mismas garantías que `get`). Así un run v1 sigue legible
