@@ -1,0 +1,41 @@
+# Cursia V2 — checks del release curado (DN-7). Solo para el PR de la rama
+# release/cursia-v2 hacia main: no despliega, no usa secretos, no toca DB ni
+# red externa. deploy.yml NO se modifica ni invoca estos checks.
+name: v2-release-checks
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-checks:
+    if: github.event_name == 'workflow_dispatch' || github.head_ref == 'release/cursia-v2'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npx tsc --noEmit --incremental false
+      - name: check-v2-release (course-setup ausente + allow-list)
+        run: node scripts/release/check-v2-release.js
+      - name: scripts/check-*.js
+        run: |
+          rc_all=0
+          for f in scripts/check-*.js; do
+            node "$f" > "/tmp/$(basename "$f").log" 2>&1
+            rc=$?
+            echo "$f rc=$rc :: $(tail -1 "/tmp/$(basename "$f").log")"
+            [ $rc -ne 0 ] && rc_all=1
+          done
+          exit $rc_all
