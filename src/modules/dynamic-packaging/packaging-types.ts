@@ -101,7 +101,10 @@ export interface BuildDynamicMbzInput {
 
 export class PackagingNotReadyError extends Error {
   constructor(public readonly missing: string[], message?: string) {
-    super(message ?? `Empaquetado no listo: faltan ${missing.length} item(s)`);
+    super(
+      message ??
+        `Empaquetado no listo: faltan ${missing.length} item(s): ${missing.join(', ')}`,
+    );
     this.name = 'PackagingNotReadyError';
   }
 }
