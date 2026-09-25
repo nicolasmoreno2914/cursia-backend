@@ -1,6 +1,6 @@
 /* eslint-disable */
 // Release curado de Cursia V2 (DN-7) — utilidades compartidas por
-// check-v2-release.js y build-v2-release-manifest.js. Sin red, sin DB.
+// check-v2-release.js. Sin red, sin DB.
 'use strict';
 
 const path = require('path');
@@ -152,6 +152,13 @@ function verifyAllowlist(AL, { head = 'HEAD', selfPaths = [] } = {}) {
   add(`B source auditado fijado ${AL.source.sha.slice(0, 7)} disponible (en CI: fetch-depth 0; si la rama de integración se borró, restaurarla o fijar un tag)`, srcOk, AL.source);
   if (!baseOk) return res;
   add(`B base ${AL.base.sha.slice(0, 7)} es ancestro de HEAD`, isAncestor(AL.base.sha, head));
+  // En CI del PR: la rama destino no puede haber avanzado desde el pin (si
+  // avanzó, hay que actualizar base.sha en la allow-list, re-auditar el diff y
+  // repetir A3). Si no se puede resolver la rama destino → FAIL, no se omite.
+  if (process.env.GITHUB_BASE_REF) {
+    let tip = null; try { tip = git(['rev-parse', 'origin/' + process.env.GITHUB_BASE_REF]).trim(); } catch (e) { tip = null; }
+    add(`B CI: origin/${process.env.GITHUB_BASE_REF} == base fijada (la rama destino no avanzó desde el pin)`, tip === AL.base.sha, { tip, pinned: AL.base.sha });
+  }
   const listed = new Map();
   for (const p of Object.keys(AL.paths)) listed.set(p, 'paths');
   for (const p of Object.keys(AL.partial)) { if (listed.has(p)) add(`B ${p} listado dos veces`, false); listed.set(p, 'partial'); }
