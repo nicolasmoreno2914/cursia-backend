@@ -308,10 +308,11 @@ function withDisabledVideoC1(extra = {}) {
   ];
 }
 
-check('video OFF→ON con artifact deshabilitado que coincide: REUSE del deshabilitado', () => {
+check('video OFF→ON con artifact deshabilitado que coincide (huella guardada): REUSE del deshabilitado', () => {
   const from = baseSpec();
   from[0].chapters[0].video = false;
-  const r = plan(from, baseSpec(), { mutateItems: withDisabledVideoC1() });
+  const good = matchFingerprint(computeFingerprints(buildBp(baseSpec())), `video:${C1}`);
+  const r = plan(from, baseSpec(), { mutateItems: withDisabledVideoC1({ inputFingerprint: good }) });
   expectActions(r, { [`video:${C1}`]: 'REUSE' });
   const a = act(r, `video:${C1}`);
   assert(a.fromItemRunId === 'ir-old-video-c1', 'fuente = item run deshabilitado');
@@ -346,19 +347,65 @@ check('video ON→OFF (C4): video SOFT_DISABLE, resto REUSE', () => {
   assertDeepEqual(act(r, `video:${C4}`).reasons, ['video_toggled_off'], 'motivo');
 });
 
-check('examen OFF→ON (M3): exam GENERATE; con deshabilitado que coincide: REUSE', () => {
+check('examen OFF→ON (M3): exam GENERATE; con deshabilitado que coincide (huella guardada): REUSE', () => {
   const to = baseSpec();
   to[2].exam = true;
   const r = plan(baseSpec(), to);
   expectActions(r, { [`exam:${M3}`]: 'GENERATE' });
+  const good = matchFingerprint(computeFingerprints(buildBp(to)), `exam:${M3}`);
   const r2 = plan(baseSpec(), to, {
+    mutateItems: (items) => [
+      ...items,
+      { itemKey: `exam:${M3}`, itemRunId: 'ir-old-exam-m3', status: 'completed', artifactIds: ['art-old-exam-m3'], artifactStatus: 'disabled', inputFingerprint: good },
+    ],
+  });
+  expectActions(r2, { [`exam:${M3}`]: 'REUSE' });
+  assert(act(r2, `exam:${M3}`).fromItemRunId === 'ir-old-exam-m3', 'fuente');
+});
+
+check('fix wave: deshabilitado SIN huella guardada nunca se reutiliza → REGENERATE (conservador), también video', () => {
+  const to = baseSpec();
+  to[2].exam = true;
+  const r = plan(baseSpec(), to, {
     mutateItems: (items) => [
       ...items,
       { itemKey: `exam:${M3}`, itemRunId: 'ir-old-exam-m3', status: 'completed', artifactIds: ['art-old-exam-m3'], artifactStatus: 'disabled' },
     ],
   });
-  expectActions(r2, { [`exam:${M3}`]: 'REUSE' });
-  assert(act(r2, `exam:${M3}`).fromItemRunId === 'ir-old-exam-m3', 'fuente');
+  expectActions(r, { [`exam:${M3}`]: 'REGENERATE' });
+  assert(act(r, `exam:${M3}`).reasons.includes('disabled_artifact_without_fingerprint'), 'motivo sin huella');
+  const from = baseSpec();
+  from[0].chapters[0].video = false;
+  const r2 = plan(from, baseSpec(), { mutateItems: withDisabledVideoC1() });
+  expectActions(r2, { [`video:${C1}`]: 'REGENERATE' });
+});
+
+check('fix wave: examen OFF→ON con membresía cambiada respecto del banco deshabilitado → GENERATE (huella no coincide)', () => {
+  // El banco se deshabilitó con M3 = {C6}; ahora M3 = {C6, C7} y el examen vuelve a ON.
+  const at = baseSpec();
+  const fpOld = matchFingerprint(computeFingerprints(buildBp(at)), `exam:${M3}`);
+  const to = baseSpec();
+  to[2].exam = true;
+  to[2].chapters.push({ id: C7, title: 'Capítulo siete', objective: 'Objetivo siete' });
+  const rNew = plan(baseSpec(), to, {
+    mutateItems: (items) => [
+      ...items,
+      { itemKey: `exam:${M3}`, itemRunId: 'ir-old-exam-m3', status: 'completed', artifactIds: ['art-old-exam-m3'], artifactStatus: 'disabled', inputFingerprint: fpOld },
+    ],
+  });
+  assert(act(rNew, `exam:${M3}`).action === 'GENERATE', 'capítulo nuevo en M3 → GENERATE');
+  // Membresía cambiada SIN content nuevo: C5 se mueve de M2 a M3 (content REVIEW).
+  const mv = baseSpec();
+  mv[2].exam = true;
+  const c5 = mv[1].chapters.pop();
+  mv[2].chapters.push(c5);
+  const r = plan(baseSpec(), mv, {
+    mutateItems: (items) => [
+      ...items,
+      { itemKey: `exam:${M3}`, itemRunId: 'ir-old-exam-m3', status: 'completed', artifactIds: ['art-old-exam-m3'], artifactStatus: 'disabled', inputFingerprint: fpOld },
+    ],
+  });
+  assert(act(r, `exam:${M3}`).action === 'GENERATE' && act(r, `exam:${M3}`).reasons.includes('disabled_artifact_does_not_match'), `exam M3: ${JSON.stringify(act(r, `exam:${M3}`))}`);
 });
 
 check('examen ON→OFF (M2): exam SOFT_DISABLE, resto REUSE', () => {

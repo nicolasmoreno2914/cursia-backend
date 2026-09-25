@@ -77,8 +77,9 @@ export interface InvalidationFromItem {
   artifactIds?: string[] | null;
   artifactStatus?: 'ready' | 'stale' | 'disabled' | string | null;
   /**
-   * Opcional: `matchFingerprint` con el que se generó el artifact (se guarda
-   * en su metadata). Si falta, se recalcula desde el Blueprint origen.
+   * `matchFingerprint` con el que se generó el artifact (se guarda en su
+   * metadata). Un artifact `disabled` SIN huella nunca se reutiliza
+   * (REGENERATE, fix wave); para los `ready` del run de origen no se usa.
    */
   inputFingerprint?: string | null;
 }
@@ -286,10 +287,17 @@ export function computeInvalidationPlan(input: InvalidationPlanInput): Invalidat
   const decideNewItem = (a: InvalidationAction, newReason: string, blockedByContent: boolean) => {
     const rec = records.get(a.itemKey);
     if (!blockedByContent && reusability(rec) === 'disabled') {
+      // Fix wave (review F78, promovido a Important): SOLO la huella guardada
+      // con el artifact decide. Sin huella no se puede saber con qué inputs se
+      // generó (recalcularla desde el Blueprint de origen podía reutilizar un
+      // banco de examen o un video viejos) ⇒ REGENERATE, conservador.
       const stored = rec!.inputFingerprint ?? null;
-      const fromEntityExists = matchFingerprint(fromFp, a.itemKey);
-      const oldMatch = stored ?? fromEntityExists;
-      if (oldMatch && oldMatch === a.matchFingerprint) {
+      if (!stored) {
+        a.action = 'REGENERATE';
+        a.reasons.push('disabled_artifact_without_fingerprint');
+        return;
+      }
+      if (stored === a.matchFingerprint) {
         a.action = 'REUSE';
         a.reasons.push('reenabled_matching_disabled');
         return;
