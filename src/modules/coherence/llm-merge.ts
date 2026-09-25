@@ -17,6 +17,10 @@ import { CoherenceReport, compareFindings, deterministicReportSha256, toFinding 
 
 export const LLM_INPUT_VERSION = 1;
 export const LLM_INPUT_MAX_CHARS = 24000;
+/** Fix wave I1: tope por campo de texto de un finding LLM (message, suggestion). */
+export const LLM_TEXT_MAX_CHARS = 2000;
+/** Fix wave I1: tope del JSON serializado de `evidence` de un finding LLM. */
+export const LLM_EVIDENCE_MAX_BYTES = 8192;
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 
@@ -93,6 +97,22 @@ export function mergeLlmFindings(
         ? (raw.evidence as Record<string, unknown>)
         : {};
     const suggestion = typeof raw.suggestion === 'string' ? raw.suggestion : '';
+    // Defensa en profundidad (el DTO HTTP ya responde 400): un finding que
+    // excede los topes por campo se descarta como malformado.
+    let evidenceBytes = Infinity;
+    try {
+      evidenceBytes = Buffer.byteLength(JSON.stringify(evidence), 'utf8');
+    } catch {
+      /* no serializable → malformado */
+    }
+    if (
+      raw.message.length > LLM_TEXT_MAX_CHARS ||
+      suggestion.length > LLM_TEXT_MAX_CHARS ||
+      evidenceBytes > LLM_EVIDENCE_MAX_BYTES
+    ) {
+      droppedMalformed += 1;
+      continue;
+    }
 
     // Todo UUID mencionado (en ids, evidencia o texto) debe existir y ser del tipo correcto.
     const badTyped =

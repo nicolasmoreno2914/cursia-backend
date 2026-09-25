@@ -1,5 +1,7 @@
 import {
   ConflictException,
+  HttpException,
+  HttpStatus,
   Injectable,
   InternalServerErrorException,
   Logger,
@@ -19,6 +21,12 @@ import { mergeLlmFindings } from './llm-merge';
 import { LlmFindingsDto, StructureCoherenceDto } from './dto/coherence.dto';
 
 export const COHERENCE_REPORT_ARTIFACT_TYPE = 'dynamic_coherence_report_json';
+
+/** Fix wave I1: tope de reportes LLM distintos por run y por hora (env COHERENCE_LLM_REPORTS_PER_HOUR, default 10). */
+export function llmReportsPerHour(): number {
+  const raw = Number(process.env.COHERENCE_LLM_REPORTS_PER_HOUR);
+  return Number.isInteger(raw) && raw > 0 ? raw : 10;
+}
 
 export interface StructureCoherenceResponse {
   source: 'live' | 'blueprint';
@@ -236,8 +244,17 @@ export class CoherenceService {
 
   /**
    * Guarda el reporte como artifact inmutable (ruta con el hash) salvo que ya
-   * exista uno con la misma clave (idempotencia). Serializado por run con un
-   * advisory lock de sesión (dos POST simultáneos → una sola fila).
+   * exista uno con la misma clave (idempotencia).
+   *
+   * Fix wave M4: el advisory lock es de TRANSACCIÓN y solo envuelve el chequeo
+   * y el INSERT de la fila (nunca la subida HTTP a Storage):
+   *   1. tx corta + lock: ¿ya existe? → se devuelve (y, si es LLM, tope por hora);
+   *   2. subida del objeto SIN lock (ruta direccionada por contenido,
+   *      upsert:false; un "already exists" de otra subida concurrente se adopta);
+   *   3. tx corta + lock: re-chequeo (otra request pudo insertar) y INSERT.
+   * Fix wave I1: más de COHERENCE_LLM_REPORTS_PER_HOUR (default 10) reportes
+   * LLM distintos por run en la última hora → 429; repetir uno ya guardado
+   * sigue siendo idempotente (200).
    */
   private async persist(
     job: any,
@@ -247,11 +264,65 @@ export class CoherenceService {
     key: string,
     extraMeta: Record<string, any>,
   ): Promise<RunCoherenceResponse> {
+    const first = await this.lockedStep(job, source, key, null);
+    if (first) return { created: false, artifactId: first, source, report };
+
+    const artifactCourseId = job.frontend_course_id ?? String(job.course_id);
+    const file = source === 'llm' ? `llm-${key}.json` : `${key}.json`;
+    const storagePath = `${job.owner_id}/dynamic/${artifactCourseId}/${manifest.id}/coherence/${job.id}/${file}`;
+    const buffer = Buffer.from(JSON.stringify(report, null, 2));
+    const put = await this.artifacts.putStorageObject({
+      storagePath,
+      buffer,
+      mimeType: 'application/json',
+      // Ruta direccionada por contenido → inmutable: nunca se sobrescribe.
+      upsert: false,
+      adoptExistingOnConflict: true,
+    });
+    const metadata = {
+      runId: job.id,
+      manifestId: manifest.id,
+      source,
+      reportSha256: report.reportSha256,
+      ...(source === 'llm' ? { llmReportSha256: key } : {}),
+      coherenceVersion: COHERENCE_VERSION,
+      ruleset: COHERENCE_RULESET,
+      findingCount: report.findings.length,
+      ...(put.adopted ? { adoptedExistingObject: true } : {}),
+      ...extraMeta,
+    };
+    let createdId: string | null = null;
+    const existing = await this.lockedStep(job, source, key, async (qr) => {
+      const [row] = await qr.query(
+        `insert into public.artifacts
+           (owner_id, course_id, job_id, type, storage_provider, storage_bucket, storage_path, filename, mime_type, size_bytes, metadata)
+         values ($1, $2, $3, $4, 'supabase', 'cursia-artifacts', $5, $6, 'application/json', $7, $8::jsonb)
+         returning id`,
+        [job.owner_id, artifactCourseId, job.id, COHERENCE_REPORT_ARTIFACT_TYPE, storagePath, file, put.sizeBytes, JSON.stringify(metadata)],
+      );
+      createdId = row.id;
+    });
+    if (existing) return { created: false, artifactId: existing, source, report };
+    this.logger.log(`coherence: reporte ${source} ${key.slice(0, 12)}… guardado para el run ${job.id} (artifact ${createdId})`);
+    return { created: true, artifactId: createdId!, source, report };
+  }
+
+  /**
+   * Transacción corta con `pg_advisory_xact_lock` por run: devuelve el id de
+   * un reporte ya guardado con la misma clave; si no hay y es LLM, aplica el
+   * tope por hora (429); si no hay y `insert` viene, lo ejecuta dentro del lock.
+   */
+  private async lockedStep(
+    job: any,
+    source: 'deterministic' | 'llm',
+    key: string,
+    insert: ((qr: { query: (sql: string, params?: any[]) => Promise<any> }) => Promise<void>) | null,
+  ): Promise<string | null> {
     const qr = this.dataSource.createQueryRunner();
     await qr.connect();
-    const lockKey = `coherence:${job.id}`;
     try {
-      await qr.query(`select pg_advisory_lock(hashtextextended($1, 0))`, [lockKey]);
+      await qr.startTransaction();
+      await qr.query(`select pg_advisory_xact_lock(hashtextextended($1, 0))`, [`coherence:${job.id}`]);
       const keyField = source === 'llm' ? 'llmReportSha256' : 'reportSha256';
       const [existing] = await qr.query(
         `select id from public.artifacts
@@ -259,42 +330,33 @@ export class CoherenceService {
           order by created_at asc, id asc limit 1`,
         [COHERENCE_REPORT_ARTIFACT_TYPE, job.id, job.owner_id, source, keyField, key],
       );
-      if (existing) return { created: false, artifactId: existing.id, source, report };
-
-      const artifactCourseId = job.frontend_course_id ?? String(job.course_id);
-      const file = source === 'llm' ? `llm-${key}.json` : `${key}.json`;
-      const saved = await this.artifacts.uploadBufferArtifact({
-        ownerId: job.owner_id,
-        courseId: artifactCourseId,
-        jobId: job.id,
-        type: COHERENCE_REPORT_ARTIFACT_TYPE,
-        filename: file,
-        storagePath: `${job.owner_id}/dynamic/${artifactCourseId}/${manifest.id}/coherence/${job.id}/${file}`,
-        buffer: Buffer.from(JSON.stringify(report, null, 2)),
-        mimeType: 'application/json',
-        // Ruta direccionada por contenido → inmutable: nunca se sobrescribe.
-        upsert: false,
-        adoptExistingOnConflict: true,
-        metadata: {
-          runId: job.id,
-          manifestId: manifest.id,
-          source,
-          reportSha256: report.reportSha256,
-          ...(source === 'llm' ? { llmReportSha256: key } : {}),
-          coherenceVersion: COHERENCE_VERSION,
-          ruleset: COHERENCE_RULESET,
-          findingCount: report.findings.length,
-          ...extraMeta,
-        },
-      });
-      this.logger.log(`coherence: reporte ${source} ${key.slice(0, 12)}… guardado para el run ${job.id} (artifact ${saved.id})`);
-      return { created: true, artifactId: saved.id, source, report };
-    } finally {
-      try {
-        await qr.query(`select pg_advisory_unlock(hashtextextended($1, 0))`, [lockKey]);
-      } finally {
-        await qr.release();
+      if (existing) {
+        await qr.commitTransaction();
+        return existing.id;
       }
+      if (source === 'llm') {
+        const limit = llmReportsPerHour();
+        const [{ n }] = await qr.query(
+          `select count(*)::int as n from public.artifacts
+            where type = $1 and job_id = $2 and metadata->>'source' = 'llm' and created_at > now() - interval '1 hour'`,
+          [COHERENCE_REPORT_ARTIFACT_TYPE, job.id],
+        );
+        if (n >= limit) {
+          throw new HttpException(
+            `Demasiados reportes de coherencia LLM para la ejecución ${job.id} (${n} en la última hora, tope ${limit}); ` +
+              'probá más tarde.',
+            HttpStatus.TOO_MANY_REQUESTS,
+          );
+        }
+      }
+      if (insert) await insert(qr);
+      await qr.commitTransaction();
+      return null;
+    } catch (err) {
+      if (qr.isTransactionActive) await qr.rollbackTransaction();
+      throw err;
+    } finally {
+      await qr.release();
     }
   }
 
