@@ -17,6 +17,14 @@ import { ContentGenerationModule } from './modules/content-generation/content-ge
 import { PackageModule } from './package/package.module';
 import { InstitutionsModule } from './modules/institutions/institutions.module';
 import { BrandProfilesModule } from './modules/brand-profiles/brand-profiles.module';
+import { CourseStructureModule } from './modules/course-structure/course-structure.module';
+import { CourseBlueprintsModule } from './modules/course-blueprints/course-blueprints.module';
+import { GenerationManifestsModule } from './modules/generation-manifests/generation-manifests.module';
+import { DynamicGenerationModule } from './modules/dynamic-generation/dynamic-generation.module';
+import { DynamicPackagingModule } from './modules/dynamic-packaging/dynamic-packaging.module';
+import { FeaturesModule } from './modules/features/features.module';
+import { CoherenceModule } from './modules/coherence/coherence.module';
+import { InvalidationModule } from './modules/invalidation/invalidation.module';
 
 @Module({
   imports: [
@@ -39,6 +47,14 @@ import { BrandProfilesModule } from './modules/brand-profiles/brand-profiles.mod
     PackageModule,
     InstitutionsModule,
     BrandProfilesModule,
+    CourseStructureModule,
+    CourseBlueprintsModule,
+    GenerationManifestsModule,
+    DynamicGenerationModule,
+    DynamicPackagingModule,
+    FeaturesModule,
+    CoherenceModule,
+    InvalidationModule,
   ],
   controllers: [AppController],
   providers: [AppService],

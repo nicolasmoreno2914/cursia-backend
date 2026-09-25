@@ -12,6 +12,11 @@ import { ProductionStep } from '../modules/production-jobs/entities/production-s
 import { Artifact } from '../modules/artifacts/entities/artifact.entity';
 import { Institution } from '../modules/institutions/entities/institution.entity';
 import { BrandProfile } from '../modules/brand-profiles/entities/brand-profile.entity';
+import { CourseModule as CourseModuleEntity } from '../modules/course-structure/entities/course-module.entity';
+import { CourseChapter } from '../modules/course-structure/entities/course-chapter.entity';
+import { CourseBlueprint } from '../modules/course-blueprints/entities/course-blueprint.entity';
+import { CourseGenerationManifest } from '../modules/generation-manifests/entities/course-generation-manifest.entity';
+import { GenerationItemRun } from '../modules/dynamic-generation/entities/generation-item-run.entity';
 
 @Module({
   imports: [
@@ -25,7 +30,7 @@ import { BrandProfile } from '../modules/brand-profiles/entities/brand-profile.e
         username: config.get<string>('DB_USER', 'postgres'),
         password: config.get<string>('DB_PASS', 'postgres'),
         database: config.get<string>('DB_NAME', 'orbia'),
-        entities: [Course, CourseVersion, YoutubeConnection, UsageEvent, CostRate, TraditionalCostBenchmark, ProductionJob, ProductionStep, Artifact, Institution, BrandProfile],
+        entities: [Course, CourseVersion, YoutubeConnection, UsageEvent, CostRate, TraditionalCostBenchmark, ProductionJob, ProductionStep, Artifact, Institution, BrandProfile, CourseModuleEntity, CourseChapter, CourseBlueprint, CourseGenerationManifest, GenerationItemRun],
         synchronize: config.get<string>('NODE_ENV', 'development') === 'development',
         logging: config.get<string>('DB_LOGGING', 'false') === 'true',
         ssl: config.get<string>('DB_SSL', 'false') === 'true'

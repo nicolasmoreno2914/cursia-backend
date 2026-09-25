@@ -76,6 +76,9 @@ export class CourseVersion {
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
 
+  @Column({ name: 'locked_at', type: 'timestamptz', nullable: true })
+  lockedAt: Date;
+
   @ManyToOne(() => Course, (course) => course.versions, { onDelete: 'CASCADE' })
   @JoinColumn({ name: 'course_id' })
   course: Course;

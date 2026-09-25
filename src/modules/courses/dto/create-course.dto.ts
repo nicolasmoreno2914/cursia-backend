@@ -33,6 +33,11 @@ export class CreateCourseDto {
   @IsIn(['draft', 'in_review', 'published', 'archived'])
   status?: string;
 
+  @IsString()
+  @IsOptional()
+  @IsIn(['legacy', 'dynamic'])
+  structureVersion?: string;
+
   @IsObject()
   @IsOptional()
   metadata?: Record<string, any>;

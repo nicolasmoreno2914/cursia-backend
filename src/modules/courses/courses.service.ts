@@ -5,6 +5,7 @@ import { Course } from './entities/course.entity';
 import { CreateCourseDto } from './dto/create-course.dto';
 import { UpdateCourseDto } from './dto/update-course.dto';
 import { AdminDashboardService } from '../../admin/services/admin-dashboard.service';
+import { assertDynamicCreationAllowed, assertDynamicOwnerAllowed } from '../features/dynamic-features';
 
 @Injectable()
 export class CoursesService {
@@ -29,10 +30,50 @@ export class CoursesService {
     ownerId: string,
     ownerEmail: string,
   ): Promise<Course> {
+    // Release-fix I4 (defensa en profundidad; el controller ya lo chequea con el
+    // mensaje 404 exacto de la ruta): un curso dynamic exige flag + allow-list.
+    if (dto?.structureVersion === 'dynamic') assertDynamicCreationAllowed(ownerId);
     const course = this.courseRepo.create({
       ...dto,
       ownerId,
       ownerEmail,
+    });
+    return this.courseRepo.save(course);
+  }
+
+  // ── FIND OR CREATE DYNAMIC ───────────────────────────────────────────────
+  /**
+   * Idempotente por (ownerId, frontendCourseId): si ya existe un curso
+   * dynamic con ese metadata.courseId para este owner, lo devuelve tal
+   * cual. Si no, crea uno nuevo en estado draft. Ventana de carrera
+   * teórica conocida y aceptada (spec Fase 2, sección 2.1): dos llamadas
+   * simultáneas con el mismo frontendCourseId podrían crear 2 filas — no
+   * se cierra en esta fase, no se agrega constraint nueva a `courses`.
+   */
+  async findOrCreateDynamic(
+    ownerId: string,
+    ownerEmail: string,
+    frontendCourseId: string,
+    title?: string,
+  ): Promise<Course> {
+    // G3: flag V2 + allow-list por owner (403 antes de tocar la DB).
+    assertDynamicOwnerAllowed(ownerId);
+    const existing = await this.courseRepo
+      .createQueryBuilder('course')
+      .where('course.owner_id = :ownerId', { ownerId })
+      .andWhere(`course.metadata->>'courseId' = :frontendCourseId`, { frontendCourseId })
+      .andWhere('course.structure_version = :sv', { sv: 'dynamic' })
+      .orderBy('course.id', 'ASC')
+      .getOne();
+    if (existing) return existing;
+
+    const course = this.courseRepo.create({
+      title: title || 'Curso sin título',
+      ownerId,
+      ownerEmail,
+      structureVersion: 'dynamic',
+      status: 'draft',
+      metadata: { courseId: frontendCourseId },
     });
     return this.courseRepo.save(course);
   }
