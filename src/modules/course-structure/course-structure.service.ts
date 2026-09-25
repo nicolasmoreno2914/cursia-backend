@@ -13,6 +13,7 @@ import { MoveChapterDto } from './dto/move-chapter.dto';
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
 import { CourseBlueprintsService } from '../course-blueprints/course-blueprints.service';
+import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import {
   RawChapterRow,
   RawModuleRow,
@@ -194,6 +195,7 @@ export class CourseStructureService {
   }
 
   async createModule(courseId: number, ownerId: string, dto: CreateModuleDto) {
+    assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();
@@ -240,6 +242,7 @@ export class CourseStructureService {
   }
 
   async updateModule(courseId: number, moduleId: string, ownerId: string, dto: UpdateModuleDto) {
+    assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();
@@ -281,6 +284,7 @@ export class CourseStructureService {
   }
 
   async deleteModule(courseId: number, moduleId: string, ownerId: string, expectedCounter: number) {
+    assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();
@@ -317,6 +321,7 @@ export class CourseStructureService {
   }
 
   async createChapter(courseId: number, moduleId: string, ownerId: string, dto: CreateChapterDto) {
+    assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();
@@ -356,6 +361,7 @@ export class CourseStructureService {
   }
 
   async updateChapter(courseId: number, moduleId: string, chapterId: string, ownerId: string, dto: UpdateChapterDto) {
+    assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();
@@ -397,6 +403,7 @@ export class CourseStructureService {
   }
 
   async deleteChapter(courseId: number, moduleId: string, chapterId: string, ownerId: string, expectedCounter: number) {
+    assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();
@@ -433,6 +440,7 @@ export class CourseStructureService {
   }
 
   async reorderModules(courseId: number, ownerId: string, dto: ReorderDto) {
+    assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();
@@ -471,6 +479,7 @@ export class CourseStructureService {
   }
 
   async reorderChapters(courseId: number, moduleId: string, ownerId: string, dto: ReorderDto) {
+    assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();
@@ -518,6 +527,7 @@ export class CourseStructureService {
   }
 
   async moveChapter(courseId: number, sourceModuleId: string, chapterId: string, ownerId: string, dto: MoveChapterDto) {
+    assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();

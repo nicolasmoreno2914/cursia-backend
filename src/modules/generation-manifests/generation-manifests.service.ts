@@ -1,6 +1,7 @@
 import { Injectable, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
+import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import { BlueprintDto, CourseBlueprintsService } from '../course-blueprints/course-blueprints.service';
 import {
   GenerationManifestV1,
@@ -99,6 +100,7 @@ export class GenerationManifestsService {
     ownerId: string,
     blueprintNumber: number,
   ): Promise<{ created: boolean; manifest: ManifestDto }> {
+    assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     const rulesVersion = this.configuredRulesVersion();
     const bp = await this.blueprints.getByNumber(courseId, ownerId, blueprintNumber);
     const source = sourceOf(bp);

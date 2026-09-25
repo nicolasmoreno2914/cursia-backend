@@ -47,7 +47,7 @@ function loadDist(rel) {
 
 require('reflect-metadata');
 const { Test } = require('@nestjs/testing');
-const { ForbiddenException, InternalServerErrorException, Logger } = require('@nestjs/common');
+const { ForbiddenException, InternalServerErrorException, Logger, NotFoundException } = require('@nestjs/common');
 const { PATH_METADATA, METHOD_METADATA } = require('@nestjs/common/constants');
 const { RequestMethod } = require('@nestjs/common');
 
@@ -553,6 +553,39 @@ async function runWorkerProcess(script, env, { waitMs }) {
         eq((await call(base, 'GET', '/api/v1/courses', { user: OWNER_A })).status, 200, 'GET /courses');
       }));
 
+    // ── I4 (release review): POST /courses legacy con structureVersion 'dynamic' ──
+    const DYN_BODY = { title: 'T', structureVersion: 'dynamic' };
+    for (const flagValue of [undefined, 'false', 'TRUE']) {
+      await check(`I4 POST /api/v1/courses {structureVersion:'dynamic'} con flag ${flagValue === undefined ? 'ausente' : `"${flagValue}"`} → 404 (mismo shape que las rutas dynamic) y el servicio no se invoca`, () =>
+        withEnv({ ...ENV_CLEAN, [FLAG]: flagValue }, async () => {
+          serviceCalls.length = 0;
+          const res = await call(base, 'POST', '/api/v1/courses', { user: OWNER_A, body: DYN_BODY });
+          eq(res.status, 404, 'status');
+          eq(res.json && res.json.error, 'Cannot POST /api/v1/courses', 'mensaje 404');
+          eq(serviceCalls, [], 'llamadas a servicios');
+          const legacy = await call(base, 'POST', '/api/v1/courses', { user: OWNER_A, body: { title: 'T', structureVersion: 'legacy' } });
+          eq(legacy.status, 201, "structureVersion 'legacy' sigue creando");
+        }));
+    }
+    const i4Matrix = [
+      { label: 'ON + no listado → 403', env: { [FLAG]: 'true', [ALLOW]: OWNER_B }, status: 403 },
+      { label: 'ON + listado → 201', env: { [FLAG]: 'true', [ALLOW]: `${OWNER_B},${OWNER_A}` }, status: 201 },
+      { label: 'ON + lista vacía (staging) → 201', env: { [FLAG]: 'true' }, status: 201 },
+      { label: 'ON + lista inválida → 500 nombrando la variable', env: { [FLAG]: 'true', [ALLOW]: 'nope' }, status: 500 },
+    ];
+    for (const m of i4Matrix) {
+      await check(`I4 POST /api/v1/courses {structureVersion:'dynamic'} — ${m.label}`, () =>
+        withEnv({ ...ENV_CLEAN, ...m.env }, async () => {
+          serviceCalls.length = 0;
+          const res = await call(base, 'POST', '/api/v1/courses', { user: OWNER_A, body: DYN_BODY });
+          eq(res.status, m.status, `status ${JSON.stringify(res.json)}`);
+          if (m.status === 201) eq(serviceCalls, ['CoursesService.create'], 'llega al servicio');
+          else eq(serviceCalls, [], 'no llega al servicio');
+          if (m.status === 403) assert(/no está habilitad/.test(JSON.stringify(res.json)), JSON.stringify(res.json));
+          if (m.status === 500) assert(/DYNAMIC_V2_ALLOWED_OWNERS/.test(JSON.stringify(res.json)), JSON.stringify(res.json));
+        }));
+    }
+
     // ── /features ────────────────────────────────────────────────────────────
     const featureMatrix = [
       { label: 'flag OFF', env: {}, user: OWNER_A, want: { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false } },
@@ -685,6 +718,64 @@ async function runWorkerProcess(script, env, { waitMs }) {
         else {
           await rejects(p, ForbiddenException, /no está habilitad/, 'debería ser 403');
           assert(!touched, 'tocó la DB antes del 403');
+        }
+      }));
+  }
+
+  // ── I4 (release review): defensa en profundidad en los servicios ─────────
+  for (const m of allowMatrix) {
+    const want = m.allowed ? 'permitido' : (m.label === 'flag OFF' ? '404' : '403');
+    await check(`I4 CoursesService.create({structureVersion:'dynamic'}) — ${m.label} → ${want}`, () =>
+      withEnv({ ...ENV_CLEAN, ...m.env }, async () => {
+        let repoTouched = false;
+        const repo = new Proxy({}, { get() { repoTouched = true; return () => { throw new Error(SENTINEL); }; } });
+        const p = new CoursesService(repo, {}).create({ title: 'T', structureVersion: 'dynamic' }, m.owner, 'x@example.com');
+        if (m.allowed) await rejects(p, null, new RegExp(SENTINEL), 'debería llegar al repo');
+        else {
+          await rejects(p, m.label === 'flag OFF' ? NotFoundException : ForbiddenException, null, 'rechazo');
+          assert(!repoTouched, 'tocó el repo antes del rechazo');
+        }
+      }));
+  }
+  await check("I4 CoursesService.create legacy (sin structureVersion / 'legacy') con flag OFF → llega al repo como siempre", () =>
+    withEnv(ENV_CLEAN, async () => {
+      for (const dto of [{ title: 'T' }, { title: 'T', structureVersion: 'legacy' }]) {
+        const repo = new Proxy({}, { get() { return () => { throw new Error(SENTINEL); }; } });
+        await rejects(new CoursesService(repo, {}).create(dto, OWNER_A, 'x@example.com'), null, new RegExp(SENTINEL), JSON.stringify(dto));
+      }
+    }));
+
+  const boomDeps = () => {
+    const state = { touched: false };
+    const boom = () => { state.touched = true; throw new Error(SENTINEL); };
+    const px = new Proxy({}, { get(_t, prop) { if (prop === 'then') return undefined; return (...a) => boom(); } });
+    return { state, px };
+  };
+  const writeCalls = [
+    ['CourseStructureService.createModule', (d, o) => new CourseStructureService(d.px, d.px, d.px, d.px, d.px).createModule(1, o, { title: 'M', expectedCounter: 0 })],
+    ['CourseStructureService.updateModule', (d, o) => new CourseStructureService(d.px, d.px, d.px, d.px, d.px).updateModule(1, PARAM_VALUES.moduleId, o, { title: 'M', expectedCounter: 0 })],
+    ['CourseStructureService.deleteModule', (d, o) => new CourseStructureService(d.px, d.px, d.px, d.px, d.px).deleteModule(1, PARAM_VALUES.moduleId, o, 0)],
+    ['CourseStructureService.createChapter', (d, o) => new CourseStructureService(d.px, d.px, d.px, d.px, d.px).createChapter(1, PARAM_VALUES.moduleId, o, { title: 'C', expectedCounter: 0 })],
+    ['CourseStructureService.updateChapter', (d, o) => new CourseStructureService(d.px, d.px, d.px, d.px, d.px).updateChapter(1, PARAM_VALUES.moduleId, PARAM_VALUES.chapterId, o, { title: 'C', expectedCounter: 0 })],
+    ['CourseStructureService.deleteChapter', (d, o) => new CourseStructureService(d.px, d.px, d.px, d.px, d.px).deleteChapter(1, PARAM_VALUES.moduleId, PARAM_VALUES.chapterId, o, 0)],
+    ['CourseStructureService.reorderModules', (d, o) => new CourseStructureService(d.px, d.px, d.px, d.px, d.px).reorderModules(1, o, { ids: [PARAM_VALUES.moduleId], expectedCounter: 0 })],
+    ['CourseStructureService.reorderChapters', (d, o) => new CourseStructureService(d.px, d.px, d.px, d.px, d.px).reorderChapters(1, PARAM_VALUES.moduleId, o, { ids: [PARAM_VALUES.chapterId], expectedCounter: 0 })],
+    ['CourseStructureService.moveChapter', (d, o) => new CourseStructureService(d.px, d.px, d.px, d.px, d.px).moveChapter(1, PARAM_VALUES.moduleId, PARAM_VALUES.chapterId, o, { targetModuleId: PARAM_VALUES.moduleId, targetPosition: 1, expectedCounter: 0 })],
+    ['CourseBlueprintsService.lock', (d, o) => new CourseBlueprintsService(d.px).lock(1, o, 0)],
+    ['GenerationManifestsService.getOrCreate', (d, o) => new GenerationManifestsService(d.px, d.px).getOrCreate(1, o, 1)],
+  ];
+  for (const m of allowMatrix) {
+    await check(`I4 escrituras de course-structure / blueprints / manifests — ${m.label} → ${m.allowed ? 'permitido' : '403'}`, () =>
+      withEnv({ ...ENV_CLEAN, ...m.env }, async () => {
+        for (const [name, fn] of writeCalls) {
+          const d = boomDeps();
+          let p;
+          try { p = Promise.resolve(fn(d, m.owner)); } catch (e) { p = Promise.reject(e); }
+          if (m.allowed) await rejects(p, null, new RegExp(SENTINEL), `${name}: debería llegar a la DB`);
+          else {
+            await rejects(p, ForbiddenException, /no está habilitad/, `${name}: debería ser 403`);
+            assert(!d.state.touched, `${name}: tocó la DB antes del 403`);
+          }
         }
       }));
   }

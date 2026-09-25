@@ -1,4 +1,4 @@
-import { ForbiddenException, InternalServerErrorException, Logger } from '@nestjs/common';
+import { ForbiddenException, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common';
 
 /**
  * Flags de entorno del rollout gradual de la estructura dinámica de cursos
@@ -156,6 +156,17 @@ export function assertDynamicOwnerAllowed(ownerId: string, env: Env = process.en
     toHttpConfigError(err);
   }
   if (!allowed) throw new ForbiddenException(DYNAMIC_NOT_ALLOWED_MESSAGE);
+}
+
+/**
+ * Release-fix I4: crear datos dynamic por una ruta LEGACY (POST /courses con
+ * `structureVersion: 'dynamic'`). Mismo contrato que las rutas V2: flag OFF →
+ * 404 con el mensaje nativo de Nest (`Cannot METHOD url`, la API V2 "no
+ * existe"); flag ON → allow-list por owner (403) / lista inválida (500).
+ */
+export function assertDynamicCreationAllowed(ownerId: string, notFoundMessage = 'Not Found', env: Env = process.env): void {
+  if (!isDynamicCourseStructureEnabled(env)) throw new NotFoundException(notFoundMessage);
+  assertDynamicOwnerAllowed(ownerId, env);
 }
 
 /** 403 si el owner no puede iniciar/reabrir un run con video real (fail closed); 500 si la lista es inválida. */
