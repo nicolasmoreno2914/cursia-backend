@@ -2,9 +2,11 @@
 -- Dynamic course structure — rulesVersion 2 (5B.2.B + Fase 6).
 -- Spec: campuscloud-gen docs/superpowers/specs/2026-09-25-cursia-v2-rules-v2-and-context-package-design.md §3 (DB).
 --
--- 100% aditivo y reversible sin tocar datos: solo relaja un NOT NULL, agrega
--- columnas (con backfill de las filas v1 existentes) y reemplaza CHECKs por
--- otros que TODAS las filas v1 ya cumplen. Corre exclusivamente contra la base
+-- 100% aditivo: solo relaja un NOT NULL, agrega columnas (con backfill de
+-- las filas v1 existentes) y reemplaza CHECKs por otros que TODAS las filas
+-- v1 ya cumplen. Reversible sin tocar datos SOLO mientras no existan filas
+-- v2 — ver supabase-migration-dynamic-generation-v2.rollback.md (orden,
+-- qué restaurar, y por qué con filas v2 el rollback de schema borra datos). Corre exclusivamente contra la base
 -- de STAGING — ver scripts/migrate-dynamic-generation-v2.js para el
 -- guardarraíl. Idempotente: se re-corre en cada deploy a staging, y cada paso
 -- chequea el catálogo primero para no pedir locks cuando ya está aplicado.
