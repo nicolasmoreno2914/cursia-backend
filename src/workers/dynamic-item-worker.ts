@@ -4,6 +4,7 @@ import { BadRequestException, Logger, UnauthorizedException } from '@nestjs/comm
 import { NestFactory } from '@nestjs/core';
 import { DataSource } from 'typeorm';
 import { AppModule } from '../app.module';
+import { holdIdleIfDynamicDisabled } from './dynamic-worker-gate';
 import { ClaimedItem, DEFAULT_LEASE_SECONDS, SchedulerService } from '../modules/dynamic-generation/scheduler.service';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import {
@@ -801,6 +802,8 @@ export async function runOnce(deps: DynamicItemWorkerDeps): Promise<'claimed' | 
 
 async function bootstrap() {
   const logger = new Logger('DynamicItemWorker');
+  // G4: con DYNAMIC_COURSE_STRUCTURE apagado, inactivo sin tocar la DB.
+  if (holdIdleIfDynamicDisabled(logger, 'dynamic-item-worker')) return;
   // M6 (review-it2): un DYNAMIC_VIDEO_DELIVERY inválido se loguea como error
   // claro al arrancar, pero no detiene el worker: procesa la estrategia
   // CONGELADA de cada run, y la creación de runs nuevos (startRun) sí falla
