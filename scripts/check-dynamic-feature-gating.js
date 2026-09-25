@@ -663,6 +663,18 @@ async function runWorkerProcess(script, env, { waitMs }) {
     { label: 'V2 + DYNAMIC_COHERENCE_LLM=true → permitido', env: { [FLAG]: 'true', [COH_LLM]: 'true' }, owner: OWNER_A, allowed: true },
   ];
   for (const m of cohLlmMatrix) {
+    await check(`F78-BE2 CoherenceService.mergeLlm (llm-findings) — ${m.label}`, () =>
+      withEnv({ ...ENV_CLEAN, ...m.env }, async () => {
+        let touched = false;
+        const boom = async () => { touched = true; throw new Error(SENTINEL); };
+        const svc = new CoherenceService({ query: boom }, { getByNumber: boom }, { getById: boom, assertBlueprintAccessible: boom }, {});
+        const p = svc.mergeLlm(1, m.owner, 1, PARAM_VALUES.runId, { model: 'm', promptSha256: 'a'.repeat(64), findings: [] });
+        if (m.allowed) await rejects(p, null, new RegExp(SENTINEL), 'debería llegar a la DB');
+        else {
+          await rejects(p, ForbiddenException, /no está habilitad/, 'debería ser 403');
+          assert(!touched, 'tocó la DB antes del 403');
+        }
+      }));
     await check(`F78-BE2 CoherenceService.llmInput — ${m.label}`, () =>
       withEnv({ ...ENV_CLEAN, ...m.env }, async () => {
         let touched = false;

@@ -171,6 +171,9 @@ export class CoherenceService {
     dto: LlmFindingsDto,
   ): Promise<RunCoherenceResponse> {
     assertDynamicOwnerAllowed(ownerId);
+    // F78-BE2 (ruling controller): el merge LLM también exige coherenceLlm
+    // (DYNAMIC_COHERENCE_LLM === 'true'), 403 fail closed antes de tocar la DB.
+    assertCoherenceLlmAllowed(ownerId);
     const { job, manifest } = await this.runOf(courseId, ownerId, blueprintNumber, runId);
     const base = await this.buildDeterministicReport(job, manifest, ownerId, blueprintNumber);
     const baseSaved = await this.persist(job, manifest, base, 'deterministic', base.reportSha256, {});
