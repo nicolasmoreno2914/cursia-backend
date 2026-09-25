@@ -5,6 +5,8 @@ import { RunsController } from '../dynamic-generation/runs.controller';
 import { ExecutorController } from '../dynamic-generation/executor.controller';
 import { PackagingController } from '../dynamic-packaging/packaging.controller';
 import { CoursesController } from '../courses/courses.controller';
+import { CoherenceController } from '../coherence/coherence.controller';
+import { InvalidationController } from '../invalidation/invalidation.controller';
 
 /**
  * Rutas de la estructura dinámica de cursos (V2) que DynamicFeatureGuard
@@ -24,6 +26,8 @@ export const DYNAMIC_CONTROLLERS: ReadonlySet<Function> = new Set<Function>([
   RunsController,
   ExecutorController,
   PackagingController,
+  CoherenceController,      // Fase 7 (F7-BE)
+  InvalidationController,   // Fase 8 (F8-BE)
 ]);
 
 export const DYNAMIC_HANDLERS: ReadonlySet<Function> = new Set<Function>([

@@ -68,6 +68,10 @@ const { GenerationManifestsService } = loadDist('modules/generation-manifests/ge
 const { RunsController } = loadDist('modules/dynamic-generation/runs.controller.js');
 const { ExecutorController } = loadDist('modules/dynamic-generation/executor.controller.js');
 const { RunsService } = loadDist('modules/dynamic-generation/runs.service.js');
+const { CoherenceController } = loadDist('modules/coherence/coherence.controller.js');
+const { CoherenceService } = loadDist('modules/coherence/coherence.service.js');
+const { InvalidationController } = loadDist('modules/invalidation/invalidation.controller.js');
+const { InvalidationService } = loadDist('modules/invalidation/invalidation.service.js');
 const { SchedulerService } = loadDist('modules/dynamic-generation/scheduler.service.js');
 const { PackagingController } = loadDist('modules/dynamic-packaging/packaging.controller.js');
 const { PackagingService } = loadDist('modules/dynamic-packaging/packaging.service.js');
@@ -102,7 +106,7 @@ function discoverControllers() {
   }
   return found;
 }
-/** Los 6 controllers 100% dynamic (G1) — deben coincidir con DYNAMIC_CONTROLLERS de dynamic-routes.ts. */
+/** Los 8 controllers 100% dynamic (G1 + Fase 7/8) — deben coincidir con DYNAMIC_CONTROLLERS de dynamic-routes.ts. */
 const DYNAMIC_CONTROLLER_CLASS_NAMES = new Set([
   'CourseStructureController',
   'CourseBlueprintsController',
@@ -110,6 +114,8 @@ const DYNAMIC_CONTROLLER_CLASS_NAMES = new Set([
   'RunsController',
   'ExecutorController',
   'PackagingController',
+  'CoherenceController', // Fase 7 (F7-BE)
+  'InvalidationController', // Fase 8 (F8-BE)
 ]);
 /**
  * Todo lo demás: legacy sin ninguna ruta dynamic, EXCEPTO CoursesController
@@ -231,6 +237,8 @@ async function buildApp() {
       RunsController,
       ExecutorController,
       PackagingController,
+      CoherenceController,
+      InvalidationController,
     ],
     providers: [
       AppService,
@@ -241,6 +249,8 @@ async function buildApp() {
       { provide: RunsService, useValue: fakeService('RunsService') },
       { provide: SchedulerService, useValue: fakeService('SchedulerService') },
       { provide: PackagingService, useValue: fakeService('PackagingService') },
+      { provide: CoherenceService, useValue: fakeService('CoherenceService') },
+      { provide: InvalidationService, useValue: fakeService('InvalidationService') },
     ],
   })
     .overrideGuard(SupabaseJwtGuard)
@@ -407,8 +417,8 @@ async function runWorkerProcess(script, env, { waitMs }) {
     eq(features.resolveDynamicFeatures(OWNER_A, { [ALLOW]: 'basura' }), { dynamicCourseStructure: false, realVideo: false }, 'off ignora lista inválida');
   });
 
-  await check('G1 set de rutas: los 6 controllers dynamic + solo POST /courses/dynamic de CoursesController', () => {
-    for (const C of [CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController]) {
+  await check('G1 set de rutas: los 8 controllers dynamic (incl. Coherence/Invalidation, Fase 7/8) + solo POST /courses/dynamic de CoursesController', () => {
+    for (const C of [CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController, CoherenceController, InvalidationController]) {
       assert(DYNAMIC_CONTROLLERS.has(C), `${C.name} no está en el set`);
     }
     assert(isDynamicRoute(CoursesController, CoursesController.prototype.createOrGetDynamic), 'POST /courses/dynamic');
@@ -451,7 +461,7 @@ async function runWorkerProcess(script, env, { waitMs }) {
   // ── HTTP real ──────────────────────────────────────────────────────────────
   const { app, base } = await buildApp();
   const dynamicRoutes = [
-    ...[CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController].flatMap(routesOf),
+    ...[CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController, CoherenceController, InvalidationController].flatMap(routesOf),
     ...routesOf(CoursesController).filter((r) => r.name === 'createOrGetDynamic'),
   ];
   const legacyRoutes = [
@@ -598,13 +608,21 @@ async function runWorkerProcess(script, env, { waitMs }) {
 
     await check(`G3 PackagingService.requestPackage — ${m.label} → ${m.allowed ? 'permitido' : '403'}`, () =>
       withEnv({ ...ENV_CLEAN, ...m.env }, async () => {
+        // Tras rulesVersion 2 (fix wave review-rv2) requestPackage resuelve el
+        // Manifest DEL RUN (manifestOfRun: primero la DB, después getById): lo
+        // primero que toca después del gate es la DB.
         let manifestsCalled = false;
-        const svc = new PackagingService({ query: async () => { throw new Error('DB no esperada'); } }, { async get() { manifestsCalled = true; throw new Error(SENTINEL); } }, {});
+        let dbCalled = false;
+        const svc = new PackagingService(
+          { query: async () => { dbCalled = true; throw new Error(SENTINEL); } },
+          { async get() { manifestsCalled = true; throw new Error(SENTINEL); }, async getById() { manifestsCalled = true; throw new Error(SENTINEL); } },
+          {},
+        );
         const p = svc.requestPackage(1, m.owner, 1, PARAM_VALUES.runId);
-        if (m.allowed) await rejects(p, null, new RegExp(SENTINEL), 'debería llegar al manifest');
+        if (m.allowed) await rejects(p, null, new RegExp(SENTINEL), 'debería llegar a la DB/manifest');
         else {
           await rejects(p, ForbiddenException, /no está habilitad/, 'debería ser 403');
-          assert(!manifestsCalled, 'consultó el manifest antes del 403');
+          assert(!manifestsCalled && !dbCalled, 'consultó la DB/el manifest antes del 403');
         }
       }));
   }
@@ -630,6 +648,8 @@ async function runWorkerProcess(script, env, { waitMs }) {
     const svc = new RunsService({ query: async () => [{ frontend_course_id: 'front-1' }] }, { async get() { return manifest; } }, {});
     const run = (status) => ({ id: 'run-1', status, worker_status: status, input_payload: { videoMode: frozenMode } });
     svc.findActiveRunRow = async () => (scenario === 'active' ? run('running') : null);
+    // I1 (review-rv2): ningún run activo de OTRO Manifest del curso en estos escenarios.
+    svc.findActiveRunOnOtherManifest = async () => null;
     svc.findLatestRunRow = async () => (scenario === 'reopen' ? run('cancelled') : null);
     svc.hasPreviousItems = async () => false;
     svc.assertNoPreviousItems = async () => {};
@@ -710,10 +730,15 @@ async function runWorkerProcess(script, env, { waitMs }) {
     };
     const svc = new RunsService({ query: async () => [{ id: target.id, item_key: target.item_key, type: itemType, status: 'pending' }] }, { async get() { return { id: 42, manifest: { items: [] } }; } }, {});
     svc.loadRunRow = async () => job;
+    // Fix wave review-rv2: retryItem resuelve el Manifest DEL RUN (manifestOfRun), no el configurado.
+    svc.manifestOfRun = async () => svc.manifests.get();
     svc.reconcileCancellation = async (j) => j;
     svc.tx = async (fn) =>
       fn({
         query: async (sql, params) => {
+          // I1 (review-rv2): lock por curso + "¿otro run activo en el curso?" (no hay).
+          if (/pg_advisory_xact_lock/.test(sql)) return [];
+          if (/from public\.production_jobs pj/.test(sql)) return [];
           if (/from public\.production_jobs where id = \$1\s*$/m.test(sql.trim()) || /select id, status, worker_status from public\.production_jobs/.test(sql)) {
             return [locked];
           }
