@@ -21,6 +21,7 @@
  *   siempre el UUID (chapterId/moduleId).
  */
 
+import { Logger } from '@nestjs/common';
 import * as JSZip from 'jszip';
 import {
   resolveMoodleVersion,
@@ -334,18 +335,29 @@ ${body}
 // del texto) y el label/archivo lo escapan después con xmlEsc, igual que el
 // resto de los labels. Estilos solo inline (Moodle elimina <style>).
 
-const BIBLIO_HEADING_RE = /^(#{1,6})\s*Bibliograf[ií]a sugerida\s*:?\s*$/i;
+/**
+ * I3 (review-rv2): regla ÚNICA y tolerante del encabezado "Bibliografía
+ * sugerida", IDÉNTICA (source + flags) a DYN_SUGGESTED_BIBLIOGRAPHY_HEADING_RE
+ * del frontend (46-dynamic-context-package.js, usada por la validación de la
+ * intro al completar el item): una línea (sin sangría) que empieza con un
+ * marcador markdown opcional (#…######) seguido de "Bibliografía sugerida",
+ * con cualquier texto después ("— 5 a 8 referencias", "(APA)", ":" …). Se
+ * aplica línea por línea (trim). Cambiar una sin la otra rompe el contrato.
+ */
+export const SUGGESTED_BIBLIOGRAPHY_HEADING_RE = /^(#{1,6})?[ \t]*Bibliograf[ií]a sugerida.*$/i;
 
 /**
  * Extrae la sección "Bibliografía sugerida" (sin su encabezado) del markdown
- * de la intro de curso: desde ese encabezado hasta el próximo encabezado de
- * igual o mayor nivel. `null` si no está o queda vacía.
+ * de la intro de curso: desde la PRIMERA línea que cumple la regla hasta el
+ * próximo encabezado de igual o mayor nivel (sin marcador: hasta el próximo
+ * encabezado de cualquier nivel). `null` si no está o queda vacía.
  */
 export function extractSuggestedBibliographyMd(md: string): string | null {
   const lines = (md ?? '').split(/\r?\n/);
-  const start = lines.findIndex((l) => BIBLIO_HEADING_RE.test(l.trim()));
+  const start = lines.findIndex((l) => SUGGESTED_BIBLIOGRAPHY_HEADING_RE.test(l.trim()));
   if (start < 0) return null;
-  const level = (lines[start].trim().match(BIBLIO_HEADING_RE) as RegExpMatchArray)[1].length;
+  const marker = (lines[start].trim().match(SUGGESTED_BIBLIOGRAPHY_HEADING_RE) as RegExpMatchArray)[1];
+  const level = marker ? marker.length : 6;
   const out: string[] = [];
   for (let i = start + 1; i < lines.length; i++) {
     const h = lines[i].match(/^(#{1,6})\s+/);
@@ -381,14 +393,14 @@ function compileLibroHtmlV2(
   modules: PackagingModulePlan[],
   contentMd: Map<string, string>,
   moduleIntroMd: Map<string, string>,
-  bibliographyMd: string,
+  bibliographyMd: string | null,
 ): string {
   const toc = modules.map((m) => {
     const chapters = m.chapters
       .map((c) => `<li><a href="#cap-${c.chapterNumber}">Capítulo ${c.chapterNumber}: ${esc(c.title)}</a></li>`)
       .join('\n');
     return `<li><a href="#mod-${m.moduleNumber}">Módulo ${m.moduleNumber}: ${esc(m.title)}</a><ul>${chapters}</ul></li>`;
-  }).join('\n') + `\n<li><a href="#bibliografia">Bibliografía sugerida</a></li>`;
+  }).join('\n') + (bibliographyMd ? `\n<li><a href="#bibliografia">Bibliografía sugerida</a></li>` : '');
   const body = modules.map((m) => {
     const preface = `<section id="mod-${m.moduleNumber}" class="cc-libro-module"><h2>Módulo ${m.moduleNumber} — ${esc(m.title)}</h2>\n${mdToHtmlBasic(moduleIntroMd.get(m.moduleId) ?? '')}</section>`;
     const chapters = m.chapters.map((c) => {
@@ -404,8 +416,7 @@ function compileLibroHtmlV2(
 <body>
 <div class="cc-libro-cover"><h1>${esc(courseTitle)}</h1><p>Libro Guía del curso</p></div>
 <div class="cc-libro-toc"><h2>Índice</h2><ul>${toc}</ul></div>
-${body}
-<section id="bibliografia" class="cc-libro-biblio"><h2>Bibliografía sugerida</h2>\n${mdToHtmlBasic(bibliographyMd)}</section>
+${body}${bibliographyMd ? `\n<section id="bibliografia" class="cc-libro-biblio"><h2>Bibliografía sugerida</h2>\n${mdToHtmlBasic(bibliographyMd)}</section>` : ''}
 </body>
 </html>`;
 }
@@ -647,7 +658,18 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
       missing.push(plan.courseIntroItemKey ?? 'course_intro');
     } else {
       bibliographyMd = extractSuggestedBibliographyMd(courseIntro);
-      if (!bibliographyMd) missing.push(`${plan.courseIntroItemKey ?? 'course_intro'}:bibliografia_sugerida`);
+      if (!bibliographyMd) {
+        // I3 (review-rv2): la validación del ejecutor (misma regla) ya exige
+        // la sección al completar el course_intro; si igual llega sin ella
+        // (artifact viejo, cliente con bugs), NO se lanza: un item completed
+        // no se puede reintentar y el run quedaría sin poder empaquetarse
+        // nunca. La intro se renderiza entera en su label (sin separar) y el
+        // Libro Guía sale sin sección de bibliografía — con warning visible.
+        new Logger('DynamicMbzBuilder').warn(
+          `${plan.courseIntroItemKey ?? 'course_intro'}: la intro de curso no tiene sección "Bibliografía sugerida" ` +
+            'reconocible; se empaqueta la intro completa sin separar y el Libro Guía sale sin bibliografía',
+        );
+      }
     }
     for (const mod of plan.modules) {
       const md = contents.moduleIntroMd?.get(mod.moduleId);
@@ -753,7 +775,7 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
     .sort((a, b) => a.chapterNumber - b.chapterNumber);
 
   const libroHtml = isV2
-    ? compileLibroHtmlV2(plan.course.title, plan.modules, contents.contentMd, contents.moduleIntroMd as Map<string, string>, bibliographyMd as string)
+    ? compileLibroHtmlV2(plan.course.title, plan.modules, contents.contentMd, contents.moduleIntroMd as Map<string, string>, bibliographyMd)
     : compileLibroHtml(plan.course.title, allChaptersInOrder, contents.contentMd);
   if (!/<\/html>\s*$/i.test(libroHtml.trim())) {
     // Guard defensivo — mismo patrón que mbz-builder.service.ts:1312-1316,

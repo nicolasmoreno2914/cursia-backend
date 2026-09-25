@@ -440,10 +440,44 @@ async function checkV2() {
     console.error(`   ${err.message}`);
   }
 
+  // I3 (fix wave review-rv2): encabezado "Bibliografía sugerida" tolerante
+  // (marcador opcional + cualquier texto después), MISMA regex que la
+  // validación del frontend (45/46). Si falta igual, el builder NO lanza:
+  // renderiza la intro entera sin separar y omite la sección del Libro Guía
+  // (con warning) — empaquetar nunca queda imposible para siempre.
+  for (const [heading, expectBib] of [
+    ['## Bibliografía sugerida — 5 a 8 referencias reales (autor, título, año)', true],
+    ['## Bibliografía sugerida y lecturas', true],
+    ['### Bibliografía sugerida (APA)', true],
+    ['## Bibliografia Sugerida:', true],
+    ['Bibliografía sugerida', true],
+    ['## Bibliografía', false],
+  ]) {
+    const variant = { ...contents, courseIntroMd: `## Introducción\nIntro ${ciMark}.\n\n${heading}\n- Autor, A. (2020). *Libro* ${bibMark}.` };
+    const warns = [];
+    const { Logger } = require('@nestjs/common');
+    const origWarn = Logger.prototype.warn;
+    Logger.prototype.warn = function (m) { warns.push(String(m)); };
+    let err = null;
+    let buf = null;
+    try { buf = await buildDynamicMbz({ plan, contents: variant }); } catch (e) { err = e; } finally { Logger.prototype.warn = origWarn; }
+    const name = `v2 builder con intro "${heading}"`;
+    if (err) { failures += 1; console.error(`❌ ${name}: lanzó (${err.message}) — debe empaquetar igual`); continue; }
+    const m2 = await readMbz(buf);
+    const res = m2.activities.find((a) => a.modname === 'resource');
+    const f = m2.files.find((x) => x.ctx === res.ctx && x.name === 'libro_guia_completo.html');
+    const html = await m2.blob(f.hash);
+    const ci = m2.activities.find((a) => a.section === 0 && a.xml.includes(ciMark));
+    const okShape = expectBib
+      ? html.includes(bibMark) && html.includes('id="bibliografia"') && warns.length === 0
+      : !html.includes('id="bibliografia"') && !html.includes('href="#bibliografia"') && warns.some((w) => /Bibliograf/.test(w)) && /<\/html>\s*$/.test(html);
+    if (okShape && ci && ci.xml.includes(bibMark)) console.log(`✅ ${name}: ${expectBib ? 'bibliografía extraída al Libro Guía' : 'sin encabezado → intro entera en su label, Libro Guía sin sección de bibliografía, warning'}`);
+    else { failures += 1; console.error(`❌ ${name}: forma inesperada (bib en libro=${html.includes(bibMark)}, warns=${JSON.stringify(warns)}, intro label=${!!ci})`); }
+  }
+
   for (const [name, mutate, needle] of [
     ['sin intro del módulo M3', (c) => c.moduleIntroMd.delete(M[2]), `module_intro:${M[2]}`],
     ['sin intro de curso', (c) => { delete c.courseIntroMd; }, 'course_intro:9001'],
-    ['intro de curso sin "Bibliografía sugerida"', (c) => { c.courseIntroMd = '## Introducción\nTexto.'; }, 'course_intro:9001:bibliografia_sugerida'],
   ]) {
     const broken = { ...contents, moduleIntroMd: new Map(contents.moduleIntroMd) };
     mutate(broken);
