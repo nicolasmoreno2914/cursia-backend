@@ -75,6 +75,9 @@ jobs:
       - name: Check dynamic-package-worker hardening (review-it2 fix wave)
         run: node scripts/check-dynamic-package-worker-hardening.js
 
+      - name: Check dynamic feature gating (Fase 9 — G1/G3/G4 + video real I1)
+        run: node scripts/check-dynamic-feature-gating.js
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
@@ -120,6 +123,125 @@ jobs:
                  exit 1
                fi
 
+               # Fase 9 (flag-gating): V2 va detrás de flags de entorno que viven en
+               # el .env del VPS (no se sincroniza). Idempotente: solo AGREGA lo que
+               # falta; nunca imprime valores del .env, solo nombres de clave.
+               #
+               # NOTA de comillas: todo este bloque remoto viaja como UN string entre
+               # comillas SIMPLES dentro del paso de GitHub Actions (para poder pegar
+               # el secret VPS_PATH_STAGING a mitad de camino) — un caracter comilla
+               # simple literal en cualquier punto de acá ABAJO cortaría ese string a
+               # la mitad. Por eso, en vez de $(quote) o patrones tipo *"*, *#* con
+               # comillas simples, se arman los caracteres delicados (CR, comilla
+               # simple, comilla doble) con printf + código octal.
+               _Q_CR=$(printf "\015")
+               _Q_SQ=$(printf "\047")
+               _Q_DQ=$(printf "\042")
+               _Q_TAB=$(printf "\011")
+               # M3/M5 (review, fix wave): el valor de una línea KEY=... puede venir
+               # entrecomillado (KEY="true"), con un comentario al final (KEY=true #
+               # nota) o con CRLF (checkout/edición en Windows) — "pelamos" eso antes
+               # de comparar, para no dar un falso "apagado manual" ni un falso
+               # "ya incluye el owner" que en realidad dotenv nunca vería.
+               _flags_strip_value() {
+                 # arg 1: el valor crudo tras "KEY="; stdout: pelado de CRLF, comentario
+                 # final fuera de comillas y comillas simples/dobles que envuelven TODO.
+                 local v
+                 v="$1"
+                 v="${v%"$_Q_CR"}"
+                 case "$v" in
+                   "$_Q_DQ"*"$_Q_DQ"|"$_Q_SQ"*"$_Q_SQ") ;; # entrecomillado completo: no recortar un # de adentro
+                   *) v="${v%%#*}" ;;
+                 esac
+                 # rtrim de espacios que pudieran quedar antes de un comentario recortado
+                 while [ "${v: -1}" = " " ] || [ "${v: -1}" = "$_Q_TAB" ]; do v="${v%?}"; done
+                 case "$v" in
+                   "$_Q_DQ"*"$_Q_DQ") v="${v#"$_Q_DQ"}"; v="${v%"$_Q_DQ"}" ;;
+                   "$_Q_SQ"*"$_Q_SQ") v="${v#"$_Q_SQ"}"; v="${v%"$_Q_SQ"}" ;;
+                 esac
+                 printf "%s" "$v"
+               }
+               ensure_env_flag_true() {
+                 local key="$1"
+                 if grep -q "^${key}=" .env; then
+                   local raw val
+                   raw=$(grep "^${key}=" .env | tail -n 1)
+                   val=$(_flags_strip_value "${raw#${key}=}")
+                   if [ "$val" = "true" ]; then
+                     echo "✓ ${key} presente en el .env de staging"
+                   else
+                     echo "⚠️  ${key} está en el .env de staging con un valor distinto de true — se respeta (apagado manual); V2 queda OFF"
+                   fi
+                 else
+                   printf "\n%s=true\n" "$key" >> .env
+                   echo "+ ${key} agregado al .env de staging"
+                 fi
+               }
+               ensure_env_list_contains() {
+                 local key="$1"
+                 local item="$2"
+                 local count
+                 count=$(grep -c "^${key}=" .env || true)
+                 if [ "$count" -eq 0 ]; then
+                   printf "\n%s=%s\n" "$key" "$item" >> .env
+                   echo "+ ${key} agregado al .env de staging"
+                   return 0
+                 fi
+                 if [ "$count" -gt 1 ]; then
+                   echo "⚠️  ${key} aparece más de una vez en el .env de staging — no se toca automáticamente (dotenv usaría la última línea; revisar a mano)"
+                   return 0
+                 fi
+                 local raw val
+                 raw=$(grep "^${key}=" .env)
+                 val="${raw#${key}=}"
+                 case "$val" in
+                   *"$_Q_CR")
+                     echo "⚠️  ${key} termina en CRLF — no se toca automáticamente (normalizar el archivo a LF a mano)"
+                     return 0
+                     ;;
+                 esac
+                 case "$val" in
+                   *"$_Q_DQ"*|*"$_Q_SQ"*|*"#"*)
+                     echo "⚠️  ${key} tiene comillas o un comentario en su valor — no se toca automáticamente (agregar el owner a mano si falta)"
+                     return 0
+                     ;;
+                 esac
+                 if printf "%s" "$val" | tr "," "\n" | grep -qix "$item"; then
+                   echo "✓ ${key} ya incluye el owner de prueba de staging"
+                   return 0
+                 fi
+                 # M4 (review, fix wave): reescritura atómica. awk arma el archivo
+                 # completo en un tmp EN EL MISMO directorio (mismo filesystem → el
+                 # mv final es un rename atómico, nunca deja .env truncado a mitad de
+                 # escritura); se valida (no vacío, mismas líneas que el original)
+                 # ANTES de reemplazar, y se conserva un .env.bak (rsync ya excluye
+                 # .env.* — no se sincroniza nunca a otro lado).
+                 local tmp new_line before_lines after_lines
+                 tmp=".env.flags.tmp.$$"
+                 new_line="${raw},${item}"
+                 awk -v old="$raw" -v new="$new_line" "!d && \$0 == old { \$0 = new; d = 1 } { print }" .env > "$tmp"
+                 if [ ! -s "$tmp" ]; then
+                   echo "❌ ${key}: la reescritura del .env salió vacía — se aborta sin tocar .env"
+                   rm -f "$tmp"
+                   return 1
+                 fi
+                 # awk (no wc -l): wc -l cuenta SALTOS de línea, no líneas — un .env
+                 # sin newline final (EOF sin \n, caso real en algunos VPS) daría un
+                 # falso "cambió de líneas" y abortaría un edit válido. awk cuenta
+                 # registros (NR), coherente con cómo el propio awk de arriba escribió
+                 # "$tmp" (siempre termina cada línea con \n al hacer print).
+                 before_lines=$(awk "END{print NR}" .env)
+                 after_lines=$(awk "END{print NR}" "$tmp")
+                 if [ "$before_lines" != "$after_lines" ]; then
+                   echo "❌ ${key}: la reescritura del .env cambió de $before_lines a $after_lines líneas — se aborta sin tocar .env"
+                   rm -f "$tmp"
+                   return 1
+                 fi
+                 cp .env .env.bak
+                 mv "$tmp" .env
+                 echo "+ owner de prueba de staging agregado a ${key} (backup: .env.bak)"
+               }
+
                ensure_pm2_process() {
                  local name="$1"
                  local start_script="$2"
@@ -132,6 +254,11 @@ jobs:
 
                echo "━━━ [0/6] Verificar poppler-utils (pdftoppm — portadas de Gamma) ━━━"
                command -v pdftoppm > /dev/null 2>&1 || sudo apt-get install -y poppler-utils
+
+               echo "━━━ [0b] Flags V2 de staging (DYNAMIC_COURSE_STRUCTURE, DYNAMIC_REAL_VIDEO_OWNERS) ━━━"
+               ensure_env_flag_true DYNAMIC_COURSE_STRUCTURE
+               # Owner de prueba de staging (un id, no un secreto) habilitado para video real (Videogen).
+               ensure_env_list_contains DYNAMIC_REAL_VIDEO_OWNERS aa2fa9a1-afb1-4b01-8646-94a0cb272b57
 
                echo "━━━ [1/6] Instalar dependencias de producción ━━━"
                npm install --omit=dev

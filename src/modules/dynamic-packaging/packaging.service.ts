@@ -6,6 +6,7 @@ import { resolveRunArtifacts } from './artifact-resolver';
 import { PackagingNotReadyError } from './packaging-types';
 import { packageReuseHash, resolveDynamicMoodleVersion, sortedArtifactIds } from './packaging-reuse-key';
 import { DYNAMIC_MBZ_BUILDER_VERSION } from '../../package/dynamic-mbz-builder';
+import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 
 export const EXECUTION_MODE = 'dynamic_package';
 /** worker_status del job de run (dynamic_generation) que cuentan como "terminado con éxito". */
@@ -87,6 +88,8 @@ export class PackagingService {
    *   huérfano o fallido no debe bloquear un reintento.
    */
   async requestPackage(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<RequestPackageResult> {
+    // G3: flag V2 + allow-list por owner (403 antes de tocar la DB).
+    assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     const run = await this.loadRunRow(courseId, manifest, runId);
     await this.assertRunReady(run, manifest);

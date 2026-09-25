@@ -16,6 +16,7 @@ import { CostRatesService } from '../../admin/services/cost-rates.service';
 import { CourseContextDto, RUN_VIDEO_MODES, RunVideoMode } from './dto/course-context.dto';
 import { REQUIRED_CONTEXT_FIELDS, canonicalContextHash, itemIdempotencyKey, normalizeCourseContext } from './run-hash';
 import { VideoDeliveryStrategy, frozenVideoDeliveryOf, readVideoDeliveryConfig } from './dynamic-video-delivery';
+import { assertDynamicOwnerAllowed, assertRealVideoAllowed } from '../features/dynamic-features';
 import {
   ACTIVE_RUN_WORKER_STATUSES,
   isActiveRun,
@@ -223,6 +224,8 @@ export class RunsService {
     blueprintNumber: number,
     courseContext: CourseContextDto,
   ): Promise<StartRunResult> {
+    // G3: flag V2 + allow-list por owner (403 antes de tocar la DB).
+    assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
     const context = normalizeCourseContext(courseContext);
     this.assertRequiredContext(context);
@@ -283,6 +286,8 @@ export class RunsService {
             `(Fase 8). runId=${latest.id}`,
         );
       }
+      // I1 (5C): reabrir un run 'real' vuelve a gastar Videogen → allow-list DYNAMIC_REAL_VIDEO_OWNERS.
+      if (latestVideoMode === 'real') assertRealVideoAllowed(ownerId);
       return this.reopenRun(latest.id, manifest, contextHash);
     }
 
@@ -294,6 +299,9 @@ export class RunsService {
       return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, false, videoDelivery);
     }
     await this.assertNoPreviousItems(manifest);
+    // I1 (5C): un run NUEVO con video real requiere DYNAMIC_REAL_VIDEO_OWNERS (fail closed). Un run
+    // 'real' ya activo se devuelve arriba sin pasar por acá (reanudar no se bloquea).
+    if (videoMode === 'real') assertRealVideoAllowed(ownerId);
 
     const [course] = await this.dataSource.query(
       `select metadata->>'courseId' as frontend_course_id from public.courses where id = $1`,
@@ -535,6 +543,9 @@ export class RunsService {
     itemKey: string,
     resubmitVideo = false,
   ): Promise<ItemRunDto> {
+    // G3 (fix wave / review I1): un retry es un entry point como cualquier
+    // otro — requiere la allow-list de V2, antes de tocar manifest o run.
+    assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     let job = await this.loadRunRow(courseId, manifest, runId);
     job = await this.reconcileCancellation(job);
@@ -583,6 +594,19 @@ export class RunsService {
         throw new ConflictException(
           `Solo se puede reintentar un item en estado "failed"; "${itemKey}" está en "${target.status}"`,
         );
+      }
+
+      // I1 (fix wave / review controller ruling: "un retry NO es un resume").
+      // Un retry gasta Videogen de nuevo cuando: el item reintentado es de
+      // tipo 'video', o pide resubmitVideo (implica tipo video), o el run
+      // está TERMINADO y este retry lo va a reabrir (mismo gasto que reabrir
+      // desde startRun, I1 original). Un retry de un item NO-video dentro de
+      // un run 'real' ya ACTIVO no es gasto nuevo → no requiere la lista.
+      if (
+        this.videoModeOf(job) === 'real' &&
+        (target.type === 'video' || resubmitVideo || !isActive(locked))
+      ) {
+        assertRealVideoAllowed(ownerId);
       }
 
       // I4/R23: resubmitVideo solo para items type='video' en 'failed' cuyo
