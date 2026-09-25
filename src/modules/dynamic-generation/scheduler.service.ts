@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, InternalServerErrorException, Logger } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, InternalServerErrorException, Logger } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
@@ -17,6 +17,7 @@ import {
   manifestSha256,
   validateGenerationManifest,
 } from '../generation-manifests/generation-manifest-builder';
+import { requiredArtifactTypes } from '../dynamic-packaging/artifact-resolver';
 import { RunsService } from './runs.service';
 import { canonicalContextHash, sortKeysDeep } from './run-hash';
 import {
@@ -50,6 +51,8 @@ const GLOBAL_CLAIM_RACE_RETRIES = 50;
  * items LLM del ejecutor del navegador, igual que content/scorm/exam.
  */
 export const BROWSER_CLAIMABLE_TYPES: ItemType[] = ['content', 'scorm', 'exam', 'course_plan', 'course_intro', 'module_intro'];
+/** Tipos que solo existen en Manifests rulesVersion 2 (M3: un claim del navegador sin ninguno = ejecutor v1-only). */
+const V2_ONLY_ITEM_TYPES: readonly ItemType[] = ['course_plan', 'course_intro', 'module_intro'];
 
 /**
  * Predicado de "item reclamable" (spec §3.4, condición 6, R16), compartido
@@ -262,6 +265,9 @@ export class SchedulerService {
 
     if (opts.runId) {
       if (!UUID_RE.test(opts.runId)) throw new BadRequestException('runId inválido');
+      if (opts.ownerId !== undefined && opts.ownerId !== null) {
+        await this.assertBrowserTypesMatchRun(opts.runId, opts.ownerId, types);
+      }
       const item = await this.claimInRun(opts.runId, executorId, types, leaseSeconds, opts.ownerId);
       if (!item) await this.reportMissingDependencies(opts.runId, opts.ownerId);
       return item;
@@ -381,6 +387,34 @@ export class SchedulerService {
     return claimed;
   }
 
+  /**
+   * M3 (review-rv2): un ejecutor del navegador que solo conoce tipos v1
+   * (frontend viejo en caché, o uno que no pudo leer el rulesVersion del run)
+   * reclamando un run rulesVersion 2 nunca encontraría nada reclamable
+   * (content depende de course_plan) y el run quedaría estancado SIN error.
+   * Se rechaza con 409 `rules_version_mismatch` (mensaje visible en la UI /
+   * consola) en vez de devolver `null` en silencio. Solo el camino navegador
+   * (ownerId): el worker interno reclama `video` y no se ve afectado.
+   */
+  private async assertBrowserTypesMatchRun(runId: string, ownerId: string, types: ItemType[]): Promise<void> {
+    if (types.some((t) => V2_ONLY_ITEM_TYPES.includes(t))) return;
+    const [row] = await this.dataSource.query(
+      `select m.rules_version
+         from public.production_jobs pj
+         join public.course_generation_manifests m on m.id::text = pj.input_payload->>'manifestId'
+        where pj.id = $1 and pj.execution_mode = 'dynamic_generation' and pj.owner_id = $2`,
+      [runId, ownerId],
+    );
+    const rulesVersion = row ? Number(row.rules_version) : null;
+    if (rulesVersion === 2) {
+      const message =
+        `rules_version_mismatch: la ejecución ${runId} es rulesVersion=2 (plan de conceptos, introducciones y ` +
+        `Context Package) y este ejecutor solo reclama tipos de rulesVersion 1 (${types.join(', ')}). ` +
+        'Recargá la página para usar el generador actualizado; con este ejecutor el curso no avanzaría.';
+      throw new ConflictException({ message, code: 'rules_version_mismatch', rulesVersion, runId });
+    }
+  }
+
   // ── heartbeat / complete / fail / external ───────────────────────────────
 
   async heartbeatItem(itemRunId: string, executorId: string, leaseSeconds: number, ownerId?: string): Promise<boolean> {
@@ -475,6 +509,44 @@ export class SchedulerService {
         throw err;
       }
       if (linked.length !== ids.length) throw new GuardRejection('artifacts_not_linkable');
+
+      // M1 (review-rv2): en rulesVersion 2 un item solo se completa con TODOS
+      // sus roles obligatorios (misma tabla que el resolver de empaquetado:
+      // content → md + Context Package; course_plan → plan json; intros → su
+      // md; scorm/exam/video como v1). Si falta alguno → 409 con los tipos
+      // faltantes y rollback (el item sigue running, nada queda vinculado):
+      // un item completado a medias ya no se puede reintentar. v1 intacto.
+      const [mrow] = await qr.query(
+        `select rules_version from public.course_generation_manifests where id = $1`,
+        [item.manifest_id],
+      );
+      if (mrow && Number(mrow.rules_version) === 2) {
+        const required = requiredArtifactTypes(2, item.type) ?? [];
+        const linkedTypes = new Set(
+          (await qr.query(`select type from public.artifacts where id = any($1::uuid[])`, [ids])).map((r: any) => r.type),
+        );
+        const missingTypes: string[] = required.filter((t) => !linkedTypes.has(t));
+        // El resumen del capítulo (dynamic_context_summary_json) es opcional,
+        // pero su ausencia tiene que quedar MARCADA (output_summary.
+        // contextSummary='missing', mismo invariante que la auditoría [4j]):
+        // nunca un content v2 sin resumen y sin marca.
+        if (
+          item.type === 'content' &&
+          !linkedTypes.has('dynamic_context_summary_json') &&
+          merged.merged.contextSummary !== 'missing'
+        ) {
+          missingTypes.push('dynamic_context_summary_json (o la marca contextSummary="missing")');
+        }
+        if (missingTypes.length > 0) {
+          throw new ConflictException({
+            message:
+              `missing_required_artifacts: el item ${item.item_key} (${item.type}, rulesVersion 2) no se puede completar ` +
+              `sin sus artifacts obligatorios; faltan: ${missingTypes.join(', ')}`,
+            code: 'missing_required_artifacts',
+            missing: missingTypes,
+          });
+        }
+      }
 
       const done = returningRows(
         await qr.query(
