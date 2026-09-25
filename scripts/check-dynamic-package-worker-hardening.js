@@ -428,13 +428,14 @@ function withEnv(key, value, fn) {
     }));
 
   await check('M6 startRun sigue fallando ruidoso con el valor inválido (validación lazy en la creación del run)', () =>
-    withEnv('DYNAMIC_VIDEO_DELIVERY', 'own_storage', async () => {
+    // Fase 9 (flag-gating): startRun exige DYNAMIC_COURSE_STRUCTURE=true (G1/G3).
+    withEnv('DYNAMIC_COURSE_STRUCTURE', 'true', () => withEnv('DYNAMIC_VIDEO_DELIVERY', 'own_storage', async () => {
       const svc = new RunsService({}, { async get() { return { id: 1, manifest: { items: [] } }; } }, {});
       // Aislar la validación de la estrategia del resto de startRun.
       svc.assertRequiredContext = () => {};
       svc.resolveOrCreateRun = async () => { throw new Error('no debería llegar a crear el run'); };
       await rejects(svc.startRun(1, 'owner-1', 1, {}), /DYNAMIC_VIDEO_DELIVERY/, 'startRun');
-    }));
+    })));
 
   await check('M6 reportVideoDeliveryConfigAtStartup: inválido → logger.error claro y NO lanza; válido → devuelve la estrategia', () => {
     const f = videoDelivery.reportVideoDeliveryConfigAtStartup;

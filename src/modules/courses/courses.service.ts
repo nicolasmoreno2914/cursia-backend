@@ -5,6 +5,7 @@ import { Course } from './entities/course.entity';
 import { CreateCourseDto } from './dto/create-course.dto';
 import { UpdateCourseDto } from './dto/update-course.dto';
 import { AdminDashboardService } from '../../admin/services/admin-dashboard.service';
+import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 
 @Injectable()
 export class CoursesService {
@@ -52,6 +53,8 @@ export class CoursesService {
     frontendCourseId: string,
     title?: string,
   ): Promise<Course> {
+    // G3: flag V2 + allow-list por owner (403 antes de tocar la DB).
+    assertDynamicOwnerAllowed(ownerId);
     const existing = await this.courseRepo
       .createQueryBuilder('course')
       .where('course.owner_id = :ownerId', { ownerId })

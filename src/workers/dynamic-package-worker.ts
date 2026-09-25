@@ -3,6 +3,7 @@ import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DataSource } from 'typeorm';
 import { AppModule } from '../app.module';
+import { holdIdleIfDynamicDisabled } from './dynamic-worker-gate';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import { GenerationManifestsService, ManifestDto } from '../modules/generation-manifests/generation-manifests.service';
 import { CourseBlueprintsService } from '../modules/course-blueprints/course-blueprints.service';
@@ -504,6 +505,8 @@ export async function runPackageWorkerLoop(deps: DynamicPackageWorkerDeps, opts:
 
 async function bootstrap() {
   const logger = new Logger('DynamicPackageWorker');
+  // G4: con DYNAMIC_COURSE_STRUCTURE apagado, inactivo sin tocar la DB.
+  if (holdIdleIfDynamicDisabled(logger, 'dynamic-package-worker')) return;
   // Config propia de este worker: inválida → no arranca (no afecta a otros procesos).
   const concurrency = resolveDynamicPackageWorkerConcurrency();
   // I3: una versión de Moodle inválida no detiene el worker (los jobs fallan
