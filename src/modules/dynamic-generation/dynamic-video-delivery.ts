@@ -535,3 +535,56 @@ export function youtubeDeliveryProblems(
   if (os.delivery !== 'completed') out.push(`${itemKey}:youtube_delivery_not_completed`);
   return out;
 }
+
+// ─── DN-1: verificación de un video existente (confirm_existing) ────────────
+
+export const YOUTUBE_VIDEO_VERIFY_REASONS = [
+  'video_id_invalid',
+  'video_not_found',
+  'video_not_owned',
+  'video_not_unlisted',
+  'video_upload_not_ok',
+  'video_lookup_failed',
+] as const;
+export type YoutubeVideoVerifyReason = (typeof YOUTUBE_VIDEO_VERIFY_REASONS)[number];
+
+export type YoutubeVideoVerifyResult =
+  | { ok: true; videoId: string; channelId: string; privacyStatus: string; uploadStatus: string | null }
+  | { ok: false; reason: YoutubeVideoVerifyReason | YoutubePreflightReason; privacyStatus?: string; uploadStatus?: string | null };
+
+/** Mensajes legibles (sin tokens ni errores crudos de Google) del rechazo de confirm_existing. */
+export const YOUTUBE_VIDEO_VERIFY_MESSAGES: Record<YoutubeVideoVerifyReason, string> = {
+  video_id_invalid: 'El id de YouTube no es válido (debe tener 11 caracteres).',
+  video_not_found: 'Ese video no existe en YouTube (o no es visible para tu canal conectado).',
+  video_not_owned: 'Ese video no pertenece al canal de YouTube conectado a esta cuenta.',
+  video_not_unlisted: 'Ese video no es "No listado" (Unlisted); los videos del curso deben ser No listados.',
+  video_upload_not_ok: 'YouTube no terminó de procesar ese video (subida rechazada, fallida o eliminada).',
+  video_lookup_failed: 'No se pudo consultar YouTube en este momento; reintentá en unos minutos.',
+};
+
+const UPLOAD_NOT_OK = new Set(['rejected', 'failed', 'deleted']);
+
+/** Evalúa la respuesta de videos.list (part=snippet,status) contra el canal conectado. Puro. */
+export function evaluateVideoOwnership(
+  videoId: string,
+  connectedChannelId: string | null | undefined,
+  item: { snippet?: { channelId?: string }; status?: { privacyStatus?: string; uploadStatus?: string } } | null | undefined,
+): YoutubeVideoVerifyResult {
+  if (!item) return { ok: false, reason: 'video_not_found' };
+  const channelId = item.snippet?.channelId ?? null;
+  const privacyStatus = String(item.status?.privacyStatus ?? 'unknown');
+  const uploadStatus = item.status?.uploadStatus ?? null;
+  if (!channelId || !connectedChannelId || channelId !== connectedChannelId) return { ok: false, reason: 'video_not_owned', privacyStatus };
+  if (uploadStatus && UPLOAD_NOT_OK.has(uploadStatus)) return { ok: false, reason: 'video_upload_not_ok', privacyStatus, uploadStatus };
+  if (privacyStatus !== YOUTUBE_UPLOAD_PRIVACY) return { ok: false, reason: 'video_not_unlisted', privacyStatus, uploadStatus };
+  return { ok: true, videoId, channelId, privacyStatus, uploadStatus };
+}
+
+/** Texto legible del rechazo (con la privacidad real si aplica). */
+export function youtubeVideoVerifyMessage(r: Extract<YoutubeVideoVerifyResult, { ok: false }>): string {
+  const base =
+    (YOUTUBE_VIDEO_VERIFY_MESSAGES as Record<string, string>)[r.reason] ??
+    (YOUTUBE_PREFLIGHT_MESSAGES as Record<string, string>)[r.reason] ??
+    'No se pudo verificar el video.';
+  return r.reason === 'video_not_unlisted' && r.privacyStatus ? `${base} Privacidad actual: ${r.privacyStatus}.` : base;
+}

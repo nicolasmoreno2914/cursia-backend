@@ -135,6 +135,14 @@ function startGoogle() {
         const c = g.channels.get(auth);
         return json(200, { items: c ? [{ id: c.id, snippet: { title: c.title, thumbnails: { default: { url: c.thumb } } } }] : [] });
       }
+      if (rq.method === 'GET' && u.pathname === '/youtube/v3/videos') {
+        // videos.list (part=snippet,status): los videos subidos a este fake pertenecen al canal del token.
+        const c = g.channels.get(auth);
+        if (!c) return json(401, { error: { message: 'bad token' } });
+        const id = u.searchParams.get('id');
+        const up = g.uploads.find((x) => x.videoId === id);
+        return json(200, { items: up ? [{ id, snippet: { channelId: c.id }, status: { privacyStatus: up.privacyStatus, uploadStatus: 'processed' } }] : [] });
+      }
       if (rq.method === 'POST' && u.pathname === '/upload/youtube/v3/videos') {
         if (!g.channels.get(auth)) return json(401, { error: { message: 'bad token' } });
         const p = g.initPlan.shift() || 'ok';

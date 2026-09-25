@@ -100,6 +100,9 @@ const G = {
   putPlan: [],  // cola de respuestas del PUT: 'ok' | 'noid' | status number | 'network' | {quota:true}
   downloadPlan: [], // 'ok' | status number
   videoSeq: 0,
+  videos: new Map(), // videoId → {channelId, privacy, upload?}
+  videoCalls: 0,
+  videos500: false,
 };
 function json(status, obj, headers = {}) {
   return new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json', ...headers } });
@@ -121,6 +124,16 @@ global.fetch = async (input, init = {}) => {
     if (c === 'http500') return json(500, { error: { message: 'backendError RAW-GOOGLE-TEXT' } });
     if (!c) return json(200, { items: [] });
     return json(200, { items: [{ id: c.id, snippet: { title: c.title, thumbnails: { default: { url: c.thumb } } } }] });
+  }
+  if (url.startsWith('https://www.googleapis.com/youtube/v3/videos?')) {
+    G.videoCalls++;
+    const u = new URL(url);
+    const tok = String((init.headers || {}).Authorization || '').replace(/^Bearer /, '');
+    if (!G.channels.get(tok) || G.channels.get(tok) === 'http500') return json(401, { error: { message: `bad token ${RAW_GOOGLE_ERROR}` } });
+    if (G.videos500) return json(503, { error: { message: `backendError ${RAW_GOOGLE_ERROR}` } });
+    const v = G.videos.get(u.searchParams.get('id'));
+    if (!v) return json(200, { kind: 'youtube#videoListResponse', items: [] });
+    return json(200, { items: [{ id: u.searchParams.get('id'), snippet: { channelId: v.channelId, title: 'x' }, status: { privacyStatus: v.privacy, uploadStatus: v.upload || 'processed' } }] });
   }
   if (url.startsWith('https://fake-videogen.local/download/')) {
     G.downloads++;
@@ -316,6 +329,50 @@ async function main() {
     assert(e instanceof ServiceUnavailableException, 'instanceof');
     eq(Y.classifyYoutubeUploadError(new Error('boom')), 'ambiguous', 'desconocido');
     eq(Y.classifyYoutubeUploadError(new YoutubeQuotaException()), 'quota', 'quota antes que ServiceUnavailable');
+  });
+
+  // ── R. confirm_existing: verificación del video en el canal del owner ─────
+  const CH = 'UCgood000000000000000000'; // canal que devuelve channels.list para rt-good
+  G.videos.set('dQw4w9WgXcQ', { channelId: CH, privacy: 'unlisted' });
+  G.videos.set('PubVideo001', { channelId: CH, privacy: 'public' });
+  G.videos.set('PrivVideo01', { channelId: CH, privacy: 'private' });
+  G.videos.set('OtherChan01', { channelId: 'UCotherchannel0000000000', privacy: 'unlisted' });
+  G.videos.set('Rejected001', { channelId: CH, privacy: 'unlisted', upload: 'rejected' });
+  const verify = (c, id) => svcFor(c).verifyExistingVideo(OWNER, id);
+  await check('R verifyExistingVideo: video unlisted del canal conectado → ok con privacy/channel (videos.list con token refrescado)', async () => {
+    const before = G.videoCalls;
+    const r = await verify(conn({ channelId: CH }), 'dQw4w9WgXcQ');
+    eq(r, { ok: true, videoId: 'dQw4w9WgXcQ', channelId: CH, privacyStatus: 'unlisted', uploadStatus: 'processed' }, 'resultado');
+    eq(G.videoCalls - before, 1, '1 llamada a videos.list');
+  });
+  for (const [label, c, id, reason, privacy] of [
+    ['video inexistente', conn({ channelId: CH }), 'NoExiste001', 'video_not_found'],
+    ['video de OTRO canal', conn({ channelId: CH }), 'OtherChan01', 'video_not_owned'],
+    ['video público', conn({ channelId: CH }), 'PubVideo001', 'video_not_unlisted', 'public'],
+    ['video privado', conn({ channelId: CH }), 'PrivVideo01', 'video_not_unlisted', 'private'],
+    ['upload rechazado por YouTube', conn({ channelId: CH }), 'Rejected001', 'video_upload_not_ok'],
+    ['conexión con otro channelId guardado', conn({ channelId: 'UCstoredDistinto00000000' }), 'dQw4w9WgXcQ', 'video_not_owned'],
+    ['sin conexión', null, 'dQw4w9WgXcQ', 'no_connection'],
+    ['reauth_required', conn({ status: 'reauth_required', channelId: CH }), 'dQw4w9WgXcQ', 'reauth_required'],
+    ['refresh rechazado', conn({ refreshToken: 'rt-revoked', channelId: CH }), 'dQw4w9WgXcQ', 'token_refresh_failed'],
+  ]) {
+    await check(`R verifyExistingVideo: ${label} → ${reason}${privacy ? ` (privacy ${privacy})` : ''}; sin tokens ni error crudo`, async () => {
+      const r = await verify(c, id);
+      eq([r.ok, r.reason], [false, reason], 'ok/reason');
+      if (privacy) eq(r.privacyStatus, privacy, 'privacy informada');
+      const js = JSON.stringify(r);
+      assert(!js.includes(SECRET_TOKEN_MARKER) && !js.includes('RAW-GOOGLE') && !js.includes('rt-'), 'filtró: ' + js);
+      assert(typeof D.YOUTUBE_VIDEO_VERIFY_MESSAGES[reason] === 'string' || D.YOUTUBE_PREFLIGHT_MESSAGES[reason], 'mensaje legible para ' + reason);
+    });
+  }
+  await check('R verifyExistingVideo: videos.list 5xx → video_lookup_failed (no se confirma nada)', async () => {
+    G.videos500 = true;
+    try { eq((await verify(conn({ channelId: CH }), 'dQw4w9WgXcQ')).reason, 'video_lookup_failed', 'reason'); } finally { G.videos500 = false; }
+  });
+  await check('R verifyExistingVideo: id inválido → video_id_invalid sin llamar a Google', async () => {
+    const before = G.videoCalls + G.tokenCalls;
+    eq((await verify(conn({ channelId: CH }), 'corto')).reason, 'video_id_invalid', 'reason');
+    eq(G.videoCalls + G.tokenCalls, before, 'sin red');
   });
 
   // ── V. Vista de entrega y requisito de packaging ─────────────────────────

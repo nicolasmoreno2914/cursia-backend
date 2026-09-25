@@ -9,7 +9,9 @@ import {
   YoutubePreflightCheckKey,
   YoutubePreflightReason,
   YoutubePreflightResult,
+  YoutubeVideoVerifyResult,
   buildYoutubePreflightResult,
+  evaluateVideoOwnership,
   hasYoutubeUploadScope,
 } from './dynamic-video-delivery';
 
@@ -158,6 +160,47 @@ export async function fetchMyYoutubeChannel(accessToken: string, logger?: { warn
   };
 }
 
+export const YOUTUBE_VIDEOS_URL = 'https://www.googleapis.com/youtube/v3/videos';
+
+/**
+ * DN-1 (ruling A): verifica un video EXISTENTE antes de aceptarlo en
+ * `confirm_existing`: credenciales del owner refrescadas → videos.list
+ * (part=snippet,status&id=<id>) → existe, `snippet.channelId` = canal conectado
+ * (`youtube_connections.channel_id`) y `privacyStatus` = unlisted. Solo lectura.
+ */
+export async function verifyExistingYoutubeVideo(
+  deps: Pick<YoutubePreflightDeps, 'getConnection' | 'getAccessToken' | 'logger'>,
+  ownerId: string,
+  videoId: string,
+  opts: ResolveYoutubeConnectionOptions = {},
+): Promise<YoutubeVideoVerifyResult> {
+  if (!/^[A-Za-z0-9_-]{11}$/.test(String(videoId ?? ''))) return { ok: false, reason: 'video_id_invalid' };
+  const conn = await deps.getConnection(ownerId, opts);
+  if (!conn || conn.status === 'revoked') return { ok: false, reason: 'no_connection' };
+  if (conn.status !== 'active') return { ok: false, reason: 'reauth_required' };
+  let token: string;
+  try {
+    token = await deps.getAccessToken(conn);
+    if (typeof token !== 'string' || !token) return { ok: false, reason: 'token_refresh_failed' };
+  } catch {
+    return { ok: false, reason: 'token_refresh_failed' };
+  }
+  let item: any = null;
+  try {
+    const url = `${YOUTUBE_VIDEOS_URL}?part=snippet,status&id=${encodeURIComponent(videoId)}`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) {
+      deps.logger?.warn(`[YTVerify] videos.list HTTP ${res.status}`);
+      return { ok: false, reason: res.status === 401 || res.status === 403 ? 'reauth_required' : 'video_lookup_failed' };
+    }
+    const data = (await res.json()) as Record<string, any>;
+    item = Array.isArray(data?.items) ? data.items.find((x: any) => x && x.id === videoId) ?? null : null;
+  } catch {
+    return { ok: false, reason: 'video_lookup_failed' };
+  }
+  return evaluateVideoOwnership(videoId, conn.channelId, item);
+}
+
 /**
  * Preflight de YouTube para V2 sobre los servicios legacy (sin modificarlos).
  * Usado por GET /dynamic/youtube/preflight y por el gate de RunsService.
@@ -184,6 +227,20 @@ export class DynamicYoutubePreflightService {
         logger: this.logger,
       },
       ownerId,
+      opts,
+    );
+  }
+
+  /** DN-1: verificación de un video existente para confirm_existing (ver verifyExistingYoutubeVideo). */
+  verifyExistingVideo(ownerId: string, videoId: string, opts: ResolveYoutubeConnectionOptions = {}): Promise<YoutubeVideoVerifyResult> {
+    return verifyExistingYoutubeVideo(
+      {
+        getConnection: (id, o) => this.getConnection(id, o),
+        getAccessToken: (c) => this.tokens.getAccessToken(c.encryptedRefreshToken, c.tokenIv),
+        logger: this.logger,
+      },
+      ownerId,
+      videoId,
       opts,
     );
   }

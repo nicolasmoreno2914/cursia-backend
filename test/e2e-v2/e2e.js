@@ -847,6 +847,12 @@ async function packageRun(label, courseId, n, runId, fakes) {
       const dv = gr.data && gr.data.items.find((i) => i.itemKey === `video:${videoCh}`);
       ok(gr.data.status === 'completed' && dv && dv.delivery.state === 'completed' && dv.delivery.youtubeVideoId === os.youtubeVideoId, 'GET run Y: completed, delivery.state del video = completed');
       eq(gr.data.videoDeliverySummary, { total: 1, byState: { completed: 1 }, needsAttention: false }, 'GET run Y: videoDeliverySummary');
+      // youtube-resolution sobre un video ya publicado: 409 not_ambiguous SIN consultar a YouTube (videos.list).
+      const vl0 = g.calls.filter((x) => x === 'GET /youtube/v3/videos').length;
+      const res409 = await api('POST', `/courses/${cY}/blueprints/${nY}/manifest/runs/${runY}/items/${encodeURIComponent(`video:${videoCh}`)}/youtube-resolution`,
+        { action: 'confirm_existing', youtubeVideoId: os.youtubeVideoId });
+      ok(res409.status === 409 && /^not_ambiguous: /.test(res409.error), 'youtube-resolution sobre un video completed → 409 not_ambiguous', res409);
+      eq(g.calls.filter((x) => x === 'GET /youtube/v3/videos').length, vl0, 'youtube-resolution sin nada que resolver: 0 consultas a videos.list');
 
       // Packaging youtube → label embebible (no url, no MP4).
       const P = await packageRun('run-Y-youtube', cY, nY, runY, fakes);

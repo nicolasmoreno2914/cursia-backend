@@ -30,6 +30,7 @@ import {
   readVideoDeliveryConfig,
   resolveRunVideoDelivery,
   youtubePreflightFailedMessage,
+  youtubeVideoVerifyMessage,
 } from './dynamic-video-delivery';
 import { DynamicYoutubePreflightService } from './dynamic-youtube';
 import { assertDynamicOwnerAllowed, assertRealVideoAllowed } from '../features/dynamic-features';
@@ -221,6 +222,9 @@ export interface StartRunResult {
 
 /** DN-1: acción explícita sobre una subida a YouTube ambigua. */
 export type YoutubeResolutionAction = 'confirm_existing' | 'authorize_reupload';
+
+/** Código estable del 409 de un confirm_existing cuyo video no pasó la verificación en YouTube. */
+export const YOUTUBE_VIDEO_NOT_VERIFIED = 'youtube_video_not_verified';
 
 /** Código estable del 409 de un retry sobre una subida ambigua. */
 export const YOUTUBE_UPLOAD_AMBIGUOUS = 'youtube_upload_ambiguous';
@@ -1206,6 +1210,49 @@ export class RunsService {
       throw new ConflictException({ message: `La ejecución ${job.id} no entrega sus videos por YouTube (videoDelivery=${strategy})`, code: 'not_youtube_run' });
     }
 
+    // Estado del item ANTES de consultar a Google (sin red si no hay nada que resolver).
+    const [pre] = await this.dataSource.query(
+      `select type, status, error, output_summary from public.generation_item_runs g
+        where g.job_id = $1 and g.item_key = $2 and ${latestGenerationPredicate('g')}`,
+      [job.id, itemKey],
+    );
+    if (!pre) throw new NotFoundException(`El item "${itemKey}" no existe en la ejecución ${job.id}`);
+    if (pre.type !== 'video') throw new BadRequestException(`"${itemKey}" no es un item de video`);
+    if (pre.status !== 'failed' || !isAmbiguousYoutubeUpload(pre)) {
+      throw new ConflictException({
+        message: `not_ambiguous: "${itemKey}" no tiene una subida a YouTube ambigua pendiente de resolución (estado ${pre.status})`,
+        code: 'not_ambiguous',
+      });
+    }
+
+    // DN-1 ruling A: confirm_existing solo con un video VERIFICADO en YouTube con las
+    // credenciales refrescadas del owner (existe, es de SU canal conectado, es Unlisted).
+    // Fuera de la tx (red); si no pasa → 409 legible y nada escrito.
+    let verified: Record<string, any> | null = null;
+    if (action === 'confirm_existing') {
+      if (!this.youtubePreflight) {
+        throw new ConflictException({
+          message: `${YOUTUBE_VIDEO_NOT_VERIFIED}:preflight_unavailable: No se pudo verificar el video en YouTube. No se registró nada.`,
+          code: YOUTUBE_VIDEO_NOT_VERIFIED, reason: 'preflight_unavailable',
+        });
+      }
+      let v;
+      try {
+        v = await this.youtubePreflight.verifyExistingVideo(ownerId, youtubeVideoId as string);
+      } catch (err) {
+        this.logger.warn(`verifyExistingVideo falló con error inesperado: ${err instanceof Error ? err.message : String(err)}`);
+        v = { ok: false as const, reason: 'video_lookup_failed' as const };
+      }
+      if (v.ok === false) {
+        const privacy = v.privacyStatus ? { privacyStatus: v.privacyStatus } : {};
+        throw new ConflictException({
+          message: `${YOUTUBE_VIDEO_NOT_VERIFIED}:${v.reason}: ${youtubeVideoVerifyMessage(v)} No se registró nada.`,
+          code: YOUTUBE_VIDEO_NOT_VERIFIED, reason: v.reason, ...privacy,
+        });
+      }
+      verified = { channelId: v.channelId, privacyStatus: v.privacyStatus, uploadStatus: v.uploadStatus, verifiedAt: new Date().toISOString() };
+    }
+
     const targetId = await this.tx(async (qr) => {
       await this.lockCourseRuns(qr, courseId);
       const [locked] = await qr.query(`select id, status, worker_status from public.production_jobs where id = $1 for update`, [job.id]);
@@ -1232,7 +1279,7 @@ export class RunsService {
       if (target.type !== 'video') throw new BadRequestException(`"${itemKey}" no es un item de video`);
       if (target.status !== 'failed' || !isAmbiguousYoutubeUpload(target)) {
         throw new ConflictException({
-          message: `"${itemKey}" no tiene una subida a YouTube ambigua pendiente de resolución (estado ${target.status})`,
+          message: `not_ambiguous: "${itemKey}" no tiene una subida a YouTube ambigua pendiente de resolución (estado ${target.status})`,
           code: 'not_ambiguous',
         });
       }
@@ -1242,7 +1289,10 @@ export class RunsService {
       }
       const at = new Date().toISOString();
       const resolution: Record<string, any> = { action, at, by: ownerId };
-      if (action === 'confirm_existing') resolution.youtubeVideoId = youtubeVideoId;
+      if (action === 'confirm_existing') {
+        resolution.youtubeVideoId = youtubeVideoId;
+        resolution.verified = verified;
+      }
       const next: Record<string, any> = {
         ...os,
         delivery: 'completed_local',
