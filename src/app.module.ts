@@ -23,6 +23,9 @@ import { CourseBlueprintsModule } from './modules/course-blueprints/course-bluep
 import { GenerationManifestsModule } from './modules/generation-manifests/generation-manifests.module';
 import { DynamicGenerationModule } from './modules/dynamic-generation/dynamic-generation.module';
 import { DynamicPackagingModule } from './modules/dynamic-packaging/dynamic-packaging.module';
+import { FeaturesModule } from './modules/features/features.module';
+import { CoherenceModule } from './modules/coherence/coherence.module';
+import { InvalidationModule } from './modules/invalidation/invalidation.module';
 
 @Module({
   imports: [
@@ -51,6 +54,9 @@ import { DynamicPackagingModule } from './modules/dynamic-packaging/dynamic-pack
     GenerationManifestsModule,
     DynamicGenerationModule,
     DynamicPackagingModule,
+    FeaturesModule,
+    CoherenceModule,
+    InvalidationModule,
   ],
   controllers: [AppController],
   providers: [AppService],

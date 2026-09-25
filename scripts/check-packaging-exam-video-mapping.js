@@ -318,6 +318,8 @@ async function readMbz(buf) {
     console.error(`   ${err.message}`);
   }
 
+  await checkV2();
+
   if (failures > 0) {
     console.error(`\n❌ ${failures} check(s) fallaron — mapeo examen/video por UUID roto.`);
     process.exit(1);
@@ -327,3 +329,161 @@ async function readMbz(buf) {
   console.error('❌ Error inesperado:', err);
   process.exit(1);
 });
+
+// ---------------------------------------------------------------------------
+// rulesVersion 2 (5B.2.B): mismo fixture del criterio con Manifest v2 →
+// 37 items (identidad por key/UUID), intro de curso en la sección 0 después
+// de la bienvenida, intro de cada módulo como PRIMER label de SU sección (por
+// UUID), prefacios de módulo + bibliografía en el Libro Guía. Las
+// verificaciones v1 de arriba no cambian.
+// ---------------------------------------------------------------------------
+
+async function checkV2() {
+  const { snapshot } = buildFixture();
+  const manifest = buildGenerationManifest(
+    snapshot,
+    { courseId: 9001, blueprintId: 9001, blueprintNumber: 1, blueprintSha256: snapshotSha256(snapshot) },
+    { rulesVersion: 2 },
+  );
+  const plan = buildPackagingPlan(manifest, snapshot, { manifestId: 9002 });
+  const ciMark = 'MARKCOURSEINTRO9001';
+  const bibMark = 'MARKBIBLIO9001';
+  const miMark = (uuid) => `MARKMI${uuid}`;
+  const contents = buildContents(plan);
+  contents.courseIntroMd = [
+    '## Introducción', `Intro del curso ${ciMark}.`,
+    '## Metodología', 'Metodología.', '## Competencias', '- Competencia 1',
+    '## Bibliografía sugerida', `- Autor, A. (2020). *Libro* ${bibMark}.`,
+  ].join('\n');
+  contents.moduleIntroMd = new Map(plan.modules.map((m) => [m.moduleId,
+    `## Presentación del módulo\nPresentación ${miMark(m.moduleId)} <b>no-html</b> & "citas".\n\n## Bibliografía sugerida\n- Ref del módulo.`]));
+
+  check('v2 Manifest: 37 items exactos por key/UUID (11 content, 11 scorm, 6 video, 3 exam, 1 plan, 1 intro, 4 intros de módulo)', () => {
+    const expected = ['course_plan:9001', 'course_intro:9001'];
+    let n = 0;
+    CHAPTERS_PER_MODULE.forEach((count, mi) => {
+      expected.push(`module_intro:${M[mi]}`);
+      for (let ci = 0; ci < count; ci++) {
+        n += 1;
+        expected.push(`content:${chapterUuid(n)}`, `scorm:${chapterUuid(n)}`);
+        if (VIDEO_CHAPTER_NUMBERS.includes(n)) expected.push(`video:${chapterUuid(n)}`);
+      }
+      if (EXAM_BY_MODULE[mi]) expected.push(`exam:${M[mi]}`);
+    });
+    assertDeepEqual(manifest.items.map((i) => i.key), expected, 'keys v2');
+    assert(expected.length === 37, `esperado 37, encontrado ${expected.length}`);
+    assert(manifest.totals.totalJobs === 37, 'totals.totalJobs');
+  });
+
+  check('v2 Plan: courseIntroItemKey y moduleIntroItemKey por UUID; totals iguales a v1', () => {
+    assert(plan.rulesVersion === 2, 'plan.rulesVersion');
+    assert(plan.courseIntroItemKey === 'course_intro:9001', `courseIntroItemKey=${plan.courseIntroItemKey}`);
+    assertDeepEqual(plan.modules.map((m) => [m.moduleId, m.moduleIntroItemKey]), M.map((id) => [id, `module_intro:${id}`]), 'moduleIntroItemKey');
+    assertDeepEqual(plan.totals, { modules: 4, chapters: 11, scorms: 11, videos: 6, exams: 3 }, 'totals');
+  });
+
+  const mbz = await readMbz(await buildDynamicMbz({ plan, contents }));
+  const labelText = (a) => a.xml;
+  const moduleByUuid = Object.fromEntries(plan.modules.map((m) => [m.moduleId, m]));
+
+  check('v2 .mbz: sección 0 = foro, bienvenida, intro de curso (con su marcador) — en ese orden', () => {
+    const s0 = mbz.activities.filter((a) => a.section === 0).sort((x, y) => x.index - y.index);
+    assertDeepEqual(s0.map((a) => a.modname), ['forum', 'label', 'label'], 'actividades de la sección 0');
+    assert(/Bienvenida/.test(labelText(s0[1])), 'la 2ª actividad no es la bienvenida');
+    assert(labelText(s0[2]).includes(ciMark), 'la intro de curso no está después de la bienvenida');
+    assert(!labelText(s0[2]).includes('<h2>'), 'el HTML de la intro no está xml-escapado en label.xml');
+    const withCi = mbz.activities.filter((a) => a.xml.includes(ciMark));
+    assert(withCi.length === 1, `el marcador de la intro de curso aparece en ${withCi.length} actividades`);
+  });
+
+  check('v2 .mbz: la intro de CADA módulo es el primer label de SU sección (por UUID), y solo ahí', () => {
+    for (const m of plan.modules) {
+      const inSection = mbz.activities.filter((a) => a.section === m.sectionNum).sort((x, y) => x.index - y.index);
+      const first = inSection[0];
+      assert(first && first.modname === 'label' && first.xml.includes(miMark(m.moduleId)),
+        `módulo ${m.moduleId}: la primera actividad de la sección ${m.sectionNum} no es su intro`);
+      assert(first.xml.includes('&amp;lt;b&amp;gt;no-html&amp;lt;/b&amp;gt;'), `módulo ${m.moduleId}: el HTML del markdown no quedó escapado (md→HTML + xmlEsc)`);
+      const holders = mbz.activities.filter((a) => a.xml.includes(miMark(m.moduleId)));
+      assert(holders.length === 1 && holders[0].section === m.sectionNum, `módulo ${m.moduleId}: su intro aparece fuera de su sección`);
+      assert(moduleByUuid[m.moduleId].sectionNum === 2 + M.indexOf(m.moduleId), 'sectionNum por UUID');
+    }
+  });
+
+  check('v2 .mbz: 3 quiz (M1/M3/M4) y 6 url de video, igual que v1', () => {
+    const quizzes = mbz.activities.filter((a) => a.modname === 'quiz').map((q) => q.section).sort();
+    assertDeepEqual(quizzes, [2, 4, 5], 'secciones con quiz');
+    assert(mbz.activities.filter((a) => a.modname === 'url').length === 6, '6 url');
+    assert(mbz.activities.filter((a) => a.modname === 'scorm').length === 11, '11 scorm');
+  });
+
+  try {
+    const res = mbz.activities.filter((a) => a.modname === 'resource');
+    assert(res.length === 1 && res[0].section === 1, 'esperado 1 resource (Libro Guía) en la sección 1');
+    const f = mbz.files.find((x) => x.ctx === res[0].ctx && x.name === 'libro_guia_completo.html');
+    const html = await mbz.blob(f.hash);
+    assert(/<\/html>\s*$/.test(html), 'el Libro Guía no cierra en </html>');
+    const order = [...html.matchAll(/MARK(MI|CH)([0-9a-f-]{36})|MARKBIBLIO9001/g)].map((m) => m[0]);
+    const uniq = order.filter((u, i) => order.indexOf(u) === i);
+    const expected = [];
+    let n = 0;
+    CHAPTERS_PER_MODULE.forEach((count, mi) => {
+      expected.push(miMark(M[mi]));
+      for (let ci = 0; ci < count; ci++) { n += 1; expected.push(chMark(chapterUuid(n))); }
+    });
+    expected.push(bibMark);
+    assertDeepEqual(uniq, expected, 'orden del Libro Guía (prefacio de módulo → capítulos …, bibliografía al final)');
+    assert(!html.includes(ciMark), 'el Libro Guía solo lleva la bibliografía de la intro de curso, no la intro completa');
+    console.log('✅ v2 .mbz: Libro Guía con prefacio de cada módulo antes de sus capítulos (UUID) y la bibliografía sugerida al final');
+  } catch (err) {
+    failures += 1;
+    console.error('❌ v2 .mbz: Libro Guía v2');
+    console.error(`   ${err.message}`);
+  }
+
+  // I3 (fix wave review-rv2): encabezado "Bibliografía sugerida" tolerante
+  // (marcador opcional + cualquier texto después), MISMA regex que la
+  // validación del frontend (45/46). Si falta igual, el builder NO lanza:
+  // renderiza la intro entera sin separar y omite la sección del Libro Guía
+  // (con warning) — empaquetar nunca queda imposible para siempre.
+  for (const [heading, expectBib] of [
+    ['## Bibliografía sugerida — 5 a 8 referencias reales (autor, título, año)', true],
+    ['## Bibliografía sugerida y lecturas', true],
+    ['### Bibliografía sugerida (APA)', true],
+    ['## Bibliografia Sugerida:', true],
+    ['Bibliografía sugerida', true],
+    ['## Bibliografía', false],
+  ]) {
+    const variant = { ...contents, courseIntroMd: `## Introducción\nIntro ${ciMark}.\n\n${heading}\n- Autor, A. (2020). *Libro* ${bibMark}.` };
+    const warns = [];
+    const { Logger } = require('@nestjs/common');
+    const origWarn = Logger.prototype.warn;
+    Logger.prototype.warn = function (m) { warns.push(String(m)); };
+    let err = null;
+    let buf = null;
+    try { buf = await buildDynamicMbz({ plan, contents: variant }); } catch (e) { err = e; } finally { Logger.prototype.warn = origWarn; }
+    const name = `v2 builder con intro "${heading}"`;
+    if (err) { failures += 1; console.error(`❌ ${name}: lanzó (${err.message}) — debe empaquetar igual`); continue; }
+    const m2 = await readMbz(buf);
+    const res = m2.activities.find((a) => a.modname === 'resource');
+    const f = m2.files.find((x) => x.ctx === res.ctx && x.name === 'libro_guia_completo.html');
+    const html = await m2.blob(f.hash);
+    const ci = m2.activities.find((a) => a.section === 0 && a.xml.includes(ciMark));
+    const okShape = expectBib
+      ? html.includes(bibMark) && html.includes('id="bibliografia"') && warns.length === 0
+      : !html.includes('id="bibliografia"') && !html.includes('href="#bibliografia"') && warns.some((w) => /Bibliograf/.test(w)) && /<\/html>\s*$/.test(html);
+    if (okShape && ci && ci.xml.includes(bibMark)) console.log(`✅ ${name}: ${expectBib ? 'bibliografía extraída al Libro Guía' : 'sin encabezado → intro entera en su label, Libro Guía sin sección de bibliografía, warning'}`);
+    else { failures += 1; console.error(`❌ ${name}: forma inesperada (bib en libro=${html.includes(bibMark)}, warns=${JSON.stringify(warns)}, intro label=${!!ci})`); }
+  }
+
+  for (const [name, mutate, needle] of [
+    ['sin intro del módulo M3', (c) => c.moduleIntroMd.delete(M[2]), `module_intro:${M[2]}`],
+    ['sin intro de curso', (c) => { delete c.courseIntroMd; }, 'course_intro:9001'],
+  ]) {
+    const broken = { ...contents, moduleIntroMd: new Map(contents.moduleIntroMd) };
+    mutate(broken);
+    let msg = null;
+    try { await buildDynamicMbz({ plan, contents: broken }); } catch (e) { msg = e.message; }
+    if (msg && msg.includes(needle)) console.log(`✅ v2 builder falla fuerte ${name} (lista ${needle})`);
+    else { failures += 1; console.error(`❌ v2 builder ${name}: esperado error con ${needle}, obtenido ${msg}`); }
+  }
+}

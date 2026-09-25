@@ -15,8 +15,13 @@ import {
   Min,
 } from 'class-validator';
 
-/** Tipos que el ejecutor del navegador puede reclamar: video solo por el worker del backend (spec §3.9, D1). */
-export const BROWSER_ITEM_TYPES = ['content', 'scorm', 'exam'] as const;
+/**
+ * Tipos que el ejecutor del navegador puede reclamar: video solo por el worker
+ * del backend (spec §3.9, D1). rulesVersion 2 agrega course_plan, course_intro
+ * y module_intro (el ejecutor v2 los manda junto con content/scorm/exam en un
+ * solo claim; debe coincidir con BROWSER_CLAIMABLE_TYPES del scheduler).
+ */
+export const BROWSER_ITEM_TYPES = ['content', 'scorm', 'exam', 'course_plan', 'course_intro', 'module_intro'] as const;
 export type BrowserItemType = (typeof BROWSER_ITEM_TYPES)[number];
 
 /** Lease del navegador: 15 s .. 15 min (default 120 s en el controlador). */

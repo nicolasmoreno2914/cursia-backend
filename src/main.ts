@@ -6,9 +6,11 @@ import * as express from 'express';
 import { AppModule } from './app.module';
 import { AllExceptionsFilter } from './common/filters/http-exception.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
+import { warnIfNearMissDynamicFlag } from './modules/features/dynamic-features';
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
+  warnIfNearMissDynamicFlag(logger);
   const app = await NestFactory.create(AppModule, { bodyParser: false });
 
   // Body size limit — 9 chapters of libro guía can exceed the 100KB default

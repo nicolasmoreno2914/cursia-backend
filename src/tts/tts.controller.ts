@@ -8,7 +8,11 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { Response } from 'express';
+import { DataSource } from 'typeorm';
 import { SupabaseJwtGuard } from '../auth/supabase-jwt.guard';
+import { CurrentUser } from '../auth/current-user.decorator';
+import { AuthUser } from '../auth/auth.types';
+import { assertLegacyAudioAllowed } from '../modules/production-jobs/legacy-audio-guard';
 import { TtsService } from './tts.service';
 import { TtsSpeechDto } from './dto/tts-speech.dto';
 
@@ -29,7 +33,10 @@ import { TtsSpeechDto } from './dto/tts-speech.dto';
 export class TtsController {
   private readonly logger = new Logger(TtsController.name);
 
-  constructor(private readonly ttsService: TtsService) {}
+  constructor(
+    private readonly ttsService: TtsService,
+    private readonly dataSource: DataSource,
+  ) {}
 
   /**
    * Sintetiza texto a audio MP3.
@@ -44,7 +51,14 @@ export class TtsController {
   async speech(
     @Body() dto: TtsSpeechDto,
     @Res() res: Response,
+    @CurrentUser() user?: AuthUser,
   ): Promise<void> {
+    // Decisión del owner (V2): si el cliente declara el curso y es dynamic →
+    // 409 `v2_course_legacy_audio_disabled:` ANTES de llamar a OpenAI (fuera
+    // del try: lo responde el filtro global de excepciones).
+    if (dto.courseId) {
+      await assertLegacyAudioAllowed((sql, params) => this.dataSource.query(sql, params), user?.id ?? '', dto.courseId);
+    }
     try {
       const result = await this.ttsService.synthesize({
         text:         dto.text,

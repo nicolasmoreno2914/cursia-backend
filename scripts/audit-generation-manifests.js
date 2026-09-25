@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { Client } = require('pg');
+const v2Target = require('./lib/v2-production-target');
 
 function loadEnvFile(envPath) {
   if (!fs.existsSync(envPath)) return;
@@ -108,8 +109,16 @@ function findModuleInSnapshot(snapshotJson, moduleId) {
 
 async function main() {
   loadEnvFile(path.resolve(process.cwd(), '.env'));
-  assertExplicitStagingIntent();
-  assertNotProductionProject();
+  // Fase 9 (G6): modo opt-in V2_VERIFY_MODE=production-readonly (lo usa
+  // scripts/prod/migrate-v2-production.js). Sin esa env var, los guards de
+  // staging de siempre, sin ningún cambio de comportamiento.
+  const PROD_RO = v2Target.isProductionReadonlyRequested()
+    ? v2Target.assertProductionReadonlyTargetOrExit()
+    : null;
+  if (!PROD_RO) {
+    assertExplicitStagingIntent();
+    assertNotProductionProject();
+  }
 
   const client = new Client({
     host: process.env.DB_HOST || '127.0.0.1',
@@ -123,6 +132,14 @@ async function main() {
   });
 
   await client.connect();
+  if (PROD_RO) {
+    try {
+      await v2Target.enterProductionReadonlySession(client, PROD_RO);
+    } catch (err) {
+      await client.end();
+      throw err;
+    }
+  }
   const failures = [];
 
   try {
@@ -170,6 +187,11 @@ async function main() {
           cgm.manifest_sha256, cgm.blueprint_sha256,
           cgm.module_count, cgm.chapter_count, cgm.content_count, cgm.scorm_count,
           cgm.video_count, cgm.exam_count, cgm.total_jobs,
+          -- rulesVersion 2: columnas de conteo v2 vía to_jsonb (pueden no existir
+          -- todavía si esta auditoría corre antes de la migración v2 → 0).
+          coalesce((to_jsonb(cgm)->>'course_plan_count')::int, 0)  as course_plan_count,
+          coalesce((to_jsonb(cgm)->>'course_intro_count')::int, 0) as course_intro_count,
+          coalesce((to_jsonb(cgm)->>'module_intro_count')::int, 0) as module_intro_count,
           cb.snapshot_sha256 as blueprint_snapshot_sha256,
           cb.snapshot_json   as blueprint_snapshot_json,
           cb.module_count    as blueprint_module_count,
@@ -189,6 +211,7 @@ async function main() {
     let checkedChapterCoverage = 0;
     let checkedModuleExamCoverage = 0;
     let checkedBlueprintCounts = 0;
+    let checkedV2 = 0;
 
     for (const row of all.rows) {
       const label = `Manifest id=${row.id} (course_id=${row.course_id}, blueprint_id=${row.blueprint_id})`;
@@ -238,7 +261,18 @@ async function main() {
 
       // 3d. Conteos por type en items = columnas.
       checkedTypeCounts += 1;
-      const byType = { content: 0, scorm: 0, video: 0, exam: 0 };
+      // rulesVersion 2 (spec v2 §3): además course_plan, course_intro y
+      // module_intro; en v1 esos tipos siguen siendo "desconocidos".
+      const isV2 = row.rules_version === 2;
+      if (row.rules_version !== 1 && !isV2) {
+        failures.push(`${label}: rules_version=${row.rules_version} no soportado (esperado 1 o 2).`);
+      }
+      if (manifest.rulesVersion !== row.rules_version) {
+        failures.push(`${label}: manifest_json.rulesVersion=${manifest.rulesVersion} no coincide con la columna rules_version=${row.rules_version}.`);
+      }
+      const byType = isV2
+        ? { content: 0, scorm: 0, video: 0, exam: 0, course_plan: 0, course_intro: 0, module_intro: 0 }
+        : { content: 0, scorm: 0, video: 0, exam: 0 };
       for (const item of items) {
         if (item && Object.prototype.hasOwnProperty.call(byType, item.type)) {
           byType[item.type] += 1;
@@ -250,6 +284,62 @@ async function main() {
       if (byType.scorm !== row.scorm_count) failures.push(`${label}: items de type=scorm (${byType.scorm}) no coincide con scorm_count=${row.scorm_count}.`);
       if (byType.video !== row.video_count) failures.push(`${label}: items de type=video (${byType.video}) no coincide con video_count=${row.video_count}.`);
       if (byType.exam !== row.exam_count) failures.push(`${label}: items de type=exam (${byType.exam}) no coincide con exam_count=${row.exam_count}.`);
+      const v2Counts = [
+        ['course_plan', 'course_plan_count'], ['course_intro', 'course_intro_count'], ['module_intro', 'module_intro_count'],
+      ];
+      for (const [t, col] of v2Counts) {
+        const n = byType[t] || 0;
+        if (n !== row[col]) failures.push(`${label}: items de type=${t} (${n}) no coincide con ${col}=${row[col]}.`);
+      }
+
+      // 3d-v2. Invariantes de rulesVersion 2 (plan R1 ítem 5): un solo
+      // course_plan y un solo course_intro (scope course, sin módulo ni
+      // capítulo, keys por courseId); module_intro sii el módulo existe en el
+      // snapshot (exactamente uno por módulo); content.dependsOn incluye
+      // course_plan (y course_intro/module_intro dependen solo del plan).
+      if (isV2) {
+        checkedV2 += 1;
+        const planKey = `course_plan:${row.course_id}`;
+        const introKey = `course_intro:${row.course_id}`;
+        const plans = items.filter((i) => i && i.type === 'course_plan');
+        const intros = items.filter((i) => i && i.type === 'course_intro');
+        if (plans.length !== 1 || plans[0].key !== planKey) {
+          failures.push(`${label}: v2 exige exactamente un course_plan con key ${planKey} (encontrados: ${JSON.stringify(plans.map((i) => i.key))}).`);
+        }
+        if (intros.length !== 1 || intros[0].key !== introKey) {
+          failures.push(`${label}: v2 exige exactamente un course_intro con key ${introKey} (encontrados: ${JSON.stringify(intros.map((i) => i.key))}).`);
+        }
+        for (const i of [...plans, ...intros]) {
+          if (i.scope !== 'course' || i.moduleId !== null || i.chapterId !== null) {
+            failures.push(`${label}: item ${i.key} debe ser scope=course sin moduleId/chapterId.`);
+          }
+        }
+        for (const i of intros) {
+          if (JSON.stringify(i.dependsOn) !== JSON.stringify([planKey])) failures.push(`${label}: ${i.key}.dependsOn debe ser [${planKey}].`);
+        }
+        const introByModule = new Map();
+        for (const i of items) {
+          if (!i || i.type !== 'module_intro') continue;
+          if (!findModuleInSnapshot(row.blueprint_snapshot_json, i.moduleId)) {
+            failures.push(`${label}: module_intro ${i.key} referencia un módulo inexistente en el snapshot (moduleId=${i.moduleId}).`);
+          }
+          if (i.key !== `module_intro:${i.moduleId}` || i.scope !== 'module' || i.chapterId !== null) {
+            failures.push(`${label}: module_intro ${i.key} con key/scope/chapterId inconsistentes.`);
+          }
+          if (JSON.stringify(i.dependsOn) !== JSON.stringify([planKey])) failures.push(`${label}: ${i.key}.dependsOn debe ser [${planKey}].`);
+          introByModule.set(i.moduleId, (introByModule.get(i.moduleId) || 0) + 1);
+        }
+        const smods = Array.isArray(row.blueprint_snapshot_json && row.blueprint_snapshot_json.modules) ? row.blueprint_snapshot_json.modules : [];
+        for (const smod of smods) {
+          const n = introByModule.get(smod.id) || 0;
+          if (n !== 1) failures.push(`${label}: módulo ${smod.id} del snapshot tiene ${n} items module_intro (esperado exactamente 1).`);
+        }
+        for (const i of items) {
+          if (i && i.type === 'content' && !(Array.isArray(i.dependsOn) && i.dependsOn.includes(planKey))) {
+            failures.push(`${label}: ${i.key}.dependsOn no incluye ${planKey} (v2).`);
+          }
+        }
+      }
 
       // 3e. Ningún item video cuyo chapterId tenga videoEnabled=false en el
       // snapshot del Blueprint (y el capítulo debe existir en el snapshot).
@@ -359,6 +449,7 @@ async function main() {
       console.log(`✅ (g) cada capítulo del snapshot tiene exactamente 1 content + 1 scorm, y video sii videoEnabled (${checkedChapterCoverage} Manifests revisados).`);
       console.log(`✅ (h) cada módulo del snapshot tiene exam sii examEnabled (${checkedModuleExamCoverage} Manifests revisados).`);
       console.log(`✅ (i) module_count/chapter_count = course_blueprints.module_count/chapter_count (${checkedBlueprintCounts} Manifests revisados).`);
+      console.log(`✅ (j) rulesVersion 2: 1 course_plan + 1 course_intro, module_intro sii el módulo existe, content depende de course_plan (${checkedV2} Manifests v2 revisados).`);
     } else {
       console.log(`❌ ${failures.length} violaciones de invariantes encontradas (detalle abajo).`);
     }
@@ -370,6 +461,12 @@ async function main() {
     // revisión de Fase 3: un 0-row UPDATE no es evidencia de que el trigger
     // falle.
     console.log('');
+    // Fase 9 (G6): en production-readonly esta sonda NO corre (escribe dentro
+    // de una transacción revertida y la sesión es READ ONLY). Cuerpo sin
+    // reindentar a propósito para mantener el diff mínimo.
+    if (PROD_RO) {
+      v2Target.logSkippedProbe('3g. inmutabilidad sobre datos reales (UPDATE no-op revertido)');
+    } else {
     await client.query('begin');
     try {
       const latest = await client.query(
@@ -415,6 +512,7 @@ async function main() {
     } finally {
       await client.query('rollback'); // nunca deja basura, sea cual sea el resultado
     }
+    } // fin if (PROD_RO) — sonda con escritura revertida
 
     console.log('');
     if (failures.length > 0) {

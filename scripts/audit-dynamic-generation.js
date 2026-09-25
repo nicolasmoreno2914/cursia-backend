@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { Client } = require('pg');
+const v2Target = require('./lib/v2-production-target');
 
 function loadEnvFile(envPath) {
   if (!fs.existsSync(envPath)) return;
@@ -151,8 +152,16 @@ function arraysEqual(a, b) {
 
 async function main() {
   loadEnvFile(path.resolve(process.cwd(), '.env'));
-  assertExplicitStagingIntent();
-  assertNotProductionProject();
+  // Fase 9 (G6): modo opt-in V2_VERIFY_MODE=production-readonly (lo usa
+  // scripts/prod/migrate-v2-production.js). Sin esa env var, los guards de
+  // staging de siempre, sin ningún cambio de comportamiento.
+  const PROD_RO = v2Target.isProductionReadonlyRequested()
+    ? v2Target.assertProductionReadonlyTargetOrExit()
+    : null;
+  if (!PROD_RO) {
+    assertExplicitStagingIntent();
+    assertNotProductionProject();
+  }
 
   const client = new Client({
     host: process.env.DB_HOST || '127.0.0.1',
@@ -166,6 +175,14 @@ async function main() {
   });
 
   await client.connect();
+  if (PROD_RO) {
+    try {
+      await v2Target.enterProductionReadonlySession(client, PROD_RO);
+    } catch (err) {
+      await client.end();
+      throw err;
+    }
+  }
   const failures = [];
 
   try {
@@ -216,6 +233,7 @@ async function main() {
       const runsWithManifest = await client.query(
         `select gir.id, gir.job_id, gir.manifest_id, gir.item_key, gir.generation, gir.type,
                 gir.module_id, gir.chapter_id, gir.depends_on, gir.idempotency_key,
+                to_jsonb(gir)->>'scope' as scope,
                 cgm.manifest_json
            from public.generation_item_runs gir
            left join public.course_generation_manifests cgm on cgm.id = gir.manifest_id
@@ -250,6 +268,11 @@ async function main() {
           }
           if (!arraysEqual(item.dependsOn, row.depends_on)) {
             failures.push(`${label}: depends_on=${JSON.stringify(row.depends_on)} no coincide con dependsOn=${JSON.stringify(item.dependsOn)} del item del Manifest (el orden importa).`);
+          }
+          // rulesVersion 2: la columna scope (si la migración v2 ya corrió)
+          // coincide con el scope del item del Manifest.
+          if (row.scope !== null && row.scope !== undefined && item.scope !== row.scope) {
+            failures.push(`${label}: scope="${row.scope}" no coincide con scope="${item.scope}" del item del Manifest.`);
           }
         }
 
@@ -389,6 +412,56 @@ async function main() {
       }
     }
 
+    // 3h. rulesVersion 2 (spec v2 §3/§4, contrato R2): items COMPLETADOS de
+    // Manifests v2 con sus roles de artifact (enlazados por item_run_id):
+    //  - course_plan → exactamente 1 dynamic_course_plan_json;
+    //  - course_intro / module_intro → 1 dynamic_course_intro_md / dynamic_module_intro_md;
+    //  - content → dynamic_content_md + dynamic_context_package_json, y
+    //    output_summary.contextPackageSha256 (64 hex) + contextPackageVersion=1;
+    //    el resumen real (dynamic_context_summary_json) es opcional, pero si
+    //    falta debe estar la marca output_summary.contextSummary='missing'
+    //    (nunca una ausencia silenciosa).
+    const v2Items = await client.query(
+      `select gir.id, gir.item_key, gir.type, gir.output_summary,
+              coalesce(array_agg(a.type order by a.type) filter (where a.id is not null), '{}') as artifact_types
+         from public.generation_item_runs gir
+         join public.course_generation_manifests cgm on cgm.id = gir.manifest_id and cgm.rules_version = 2
+         left join public.artifacts a on a.item_run_id = gir.id
+        where gir.status = 'completed'
+        group by gir.id, gir.item_key, gir.type, gir.output_summary`,
+    );
+    const V2_ROLES = {
+      course_plan: ['dynamic_course_plan_json'],
+      course_intro: ['dynamic_course_intro_md'],
+      module_intro: ['dynamic_module_intro_md'],
+      content: ['dynamic_content_md', 'dynamic_context_package_json'],
+    };
+    let checkedV2Items = 0;
+    for (const row of v2Items.rows) {
+      const roles = V2_ROLES[row.type];
+      if (!roles) continue;
+      checkedV2Items += 1;
+      const label = `Item run v2 id=${row.id} (item_key=${row.item_key})`;
+      const types = row.artifact_types || [];
+      for (const r of roles) {
+        const n = types.filter((t) => t === r).length;
+        if (n !== 1) failures.push(`${label}: esperado exactamente 1 artifact ${r}, encontrados ${n}.`);
+      }
+      if (row.type === 'content') {
+        const os = row.output_summary || {};
+        if (!/^[0-9a-f]{64}$/.test(String(os.contextPackageSha256 || ''))) {
+          failures.push(`${label}: output_summary.contextPackageSha256 ausente o inválido.`);
+        }
+        if (os.contextPackageVersion !== 1) {
+          failures.push(`${label}: output_summary.contextPackageVersion=${JSON.stringify(os.contextPackageVersion)} (esperado 1).`);
+        }
+        const hasSummary = types.includes('dynamic_context_summary_json');
+        if (!hasSummary && os.contextSummary !== 'missing') {
+          failures.push(`${label}: sin dynamic_context_summary_json y sin la marca output_summary.contextSummary='missing'.`);
+        }
+      }
+    }
+
     if (failures.length === 0) {
       if (hasRuns) {
         console.log(`✅ (a) cada item run matchea type/module_id/chapter_id/depends_on de su item en el Manifest (${checkedItemMatch} item runs revisados).`);
@@ -399,6 +472,7 @@ async function main() {
         console.log('⚠️  (a)-(d) omitido — 0 generation_item_runs.');
       }
       console.log(`✅ (e) todo artifact con manifest_id no nulo tiene manifest_item_key/item_run_id consistentes con su Manifest (${checkedArtifacts} artifacts revisados).`);
+      console.log(`✅ (h) rulesVersion 2: roles de artifact + Context Package (hash/versión) + marca de resumen en items completados (${checkedV2Items} revisados).`);
       console.log(`✅ (f2) input_payload.videoMode ∈ {'mock','real'} en runs que lo declaran (${checkedVideoMode} revisados; ausente = 'mock' por convención, no falla).`);
     } else {
       console.log(`❌ ${failures.length} violaciones de invariantes encontradas (detalle abajo).`);
@@ -409,6 +483,12 @@ async function main() {
     // UPDATE que no afecta ninguna fila (borrada entre el SELECT y el UPDATE)
     // cuenta como "⚠️ omitido", nunca como ❌.
     console.log('');
+    // Fase 9 (G6): en production-readonly esta sonda NO corre (escribe dentro
+    // de una transacción revertida y la sesión es READ ONLY). Cuerpo sin
+    // reindentar a propósito para mantener el diff mínimo.
+    if (PROD_RO) {
+      v2Target.logSkippedProbe('3g. inmutabilidad sobre datos reales (UPDATE no-op revertido)');
+    } else {
     await client.query('begin');
     try {
       const latest = await client.query(
@@ -454,6 +534,7 @@ async function main() {
     } finally {
       await client.query('rollback'); // nunca deja basura, sea cual sea el resultado
     }
+    } // fin if (PROD_RO) — sonda con escritura revertida
 
     console.log('');
     if (failures.length > 0) {

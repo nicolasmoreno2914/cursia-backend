@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, InternalServerErrorException, Logger } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, InternalServerErrorException, Logger } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
@@ -10,12 +10,14 @@ import {
   snapshotSha256,
 } from '../course-blueprints/blueprint-snapshot';
 import {
+  ALL_MANIFEST_ITEM_TYPES,
   GenerationManifestV1,
   ManifestItemType,
   canonicalManifestJson,
   manifestSha256,
   validateGenerationManifest,
 } from '../generation-manifests/generation-manifest-builder';
+import { requiredArtifactTypes } from '../dynamic-packaging/artifact-resolver';
 import { RunsService } from './runs.service';
 import { canonicalContextHash, sortKeysDeep } from './run-hash';
 import {
@@ -27,10 +29,12 @@ import {
   recomputeRunStatus,
   sweepRunExpiredLeases,
 } from './item-transitions';
+import { latestGenerationPredicate } from './item-generations';
 
 export type ItemType = ManifestItemType;
 
-const ALL_ITEM_TYPES: ItemType[] = ['content', 'scorm', 'video', 'exam'];
+/** content/scorm/video/exam (v1) + course_plan/course_intro/module_intro (rulesVersion 2). */
+const ALL_ITEM_TYPES: readonly ItemType[] = ALL_MANIFEST_ITEM_TYPES;
 export const MIN_LEASE_SECONDS = 15;
 export const MAX_LEASE_SECONDS = 3600;
 export const DEFAULT_LEASE_SECONDS = 120;
@@ -42,14 +46,23 @@ const MAX_EXECUTOR_ID_LENGTH = 200;
  * el candidato se elige entre TODOS los runs elegibles en una sola consulta.
  */
 const GLOBAL_CLAIM_RACE_RETRIES = 50;
-/** Tipos que puede reclamar el camino navegador (ownerId); video solo el worker. */
-export const BROWSER_CLAIMABLE_TYPES: ItemType[] = ['content', 'scorm', 'exam'];
+/**
+ * Tipos que puede reclamar el camino navegador (ownerId); video solo el worker.
+ * rulesVersion 2 (spec v2 §3): course_plan, course_intro y module_intro son
+ * items LLM del ejecutor del navegador, igual que content/scorm/exam.
+ */
+export const BROWSER_CLAIMABLE_TYPES: ItemType[] = ['content', 'scorm', 'exam', 'course_plan', 'course_intro', 'module_intro'];
+/** Tipos que solo existen en Manifests rulesVersion 2 (M3: un claim del navegador sin ninguno = ejecutor v1-only). */
+const V2_ONLY_ITEM_TYPES: readonly ItemType[] = ['course_plan', 'course_intro', 'module_intro'];
 
 /**
  * Predicado de "item reclamable" (spec §3.4, condición 6, R16), compartido
  * por el claim por run y el global. `typesParam` = placeholder del array de
- * tipos. Dependencias literales del Manifest (mismo manifest_id+generation):
- * - ninguna dependencia existente en estado distinto de `completed`
+ * tipos. Dependencias literales del Manifest, resueltas contra la generación
+ * VIGENTE (la más alta) de cada clave dentro del mismo run (F78-BE2: una
+ * regeneración, generation 2, depende de los items vigentes del run; sin
+ * regeneraciones es idéntico a "misma generation"):
+ * - ninguna dependencia vigente en estado distinto de `completed`
  *   (NOT EXISTS literal por clave);
  * - y TODAS las claves de depends_on existen como fila: una dependencia
  *   ausente nunca vuelve reclamable al dependiente (se reporta con
@@ -62,13 +75,14 @@ function claimablePredicate(g: string, typesParam: string): string {
             and ${g}.type = any(${typesParam}::text[])
             and not exists (
               select 1 from public.generation_item_runs d
-               where d.manifest_id = ${g}.manifest_id and d.generation = ${g}.generation
-                 and d.item_key = any(${g}.depends_on) and d.status <> 'completed')
+               where d.job_id = ${g}.job_id and d.manifest_id = ${g}.manifest_id
+                 and d.item_key = any(${g}.depends_on) and d.status <> 'completed'
+                 and ${latestGenerationPredicate('d')})
             and not exists (
               select 1 from unnest(${g}.depends_on) as dk(key)
                where not exists (
                  select 1 from public.generation_item_runs d2
-                  where d2.manifest_id = ${g}.manifest_id and d2.generation = ${g}.generation
+                  where d2.job_id = ${g}.job_id and d2.manifest_id = ${g}.manifest_id
                     and d2.item_key = dk.key))`;
 }
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -91,9 +105,13 @@ export interface ClaimedItem {
   blueprintNumber: number;
   itemKey: string;
   type: ItemType;
-  moduleId: string;
+  /** rulesVersion del Manifest del item (contrato R2: el ejecutor despacha por esto). */
+  rulesVersion: number;
+  /** null solo en items de scope course (rulesVersion 2: course_plan, course_intro). */
+  moduleId: string | null;
   chapterId: string | null;
-  moduleNumber: number;
+  /** null solo en items de scope course. */
+  moduleNumber: number | null;
   chapterNumber: number | null;
   idempotencyKey: string;
   generation: number;
@@ -103,9 +121,13 @@ export interface ClaimedItem {
   context: { courseContext: Record<string, any>; contextHash: string };
   blueprint: {
     course: { id: number; title: string };
-    module: { id: string; title: string; objective: string | null; position: number };
+    /** null solo en items de scope course (rulesVersion 2). */
+    module: { id: string; title: string; objective: string | null; position: number } | null;
     chapter: { id: string; title: string; objective: string | null; position: number; videoEnabled: boolean } | null;
-    /** Capítulos del módulo del item, en orden del Manifest (para exam: exactamente los que evalúa). */
+    /**
+     * Capítulos del módulo del item, en orden del Manifest (para exam:
+     * exactamente los que evalúa). Vacío en items de scope course.
+     */
     moduleChapters: Array<{ id: string; title: string; objective: string | null; chapterNumber: number }>;
     /**
      * R18: outline del curso COMPLETO (todos los módulos, en orden del
@@ -119,7 +141,13 @@ export interface ClaimedItem {
       moduleNumber: number;
       id: string;
       title: string;
-      chapters: Array<{ chapterNumber: number; id: string; title: string }>;
+      /**
+       * Objetivo del snapshot congelado (null si no tiene). Contrato R2 punto
+       * 5: el plan de conceptos y el Context Package lo usan; los prompts v1
+       * no lo leen (sin cambio de comportamiento en v1).
+       */
+      objective: string | null;
+      chapters: Array<{ chapterNumber: number; id: string; title: string; objective: string | null }>;
     }>;
   };
   dependencyArtifacts: Array<{ itemKey: string; artifactId: string; type: string; storagePath: string }>;
@@ -242,6 +270,9 @@ export class SchedulerService {
 
     if (opts.runId) {
       if (!UUID_RE.test(opts.runId)) throw new BadRequestException('runId inválido');
+      if (opts.ownerId !== undefined && opts.ownerId !== null) {
+        await this.assertBrowserTypesMatchRun(opts.runId, opts.ownerId, types);
+      }
       const item = await this.claimInRun(opts.runId, executorId, types, leaseSeconds, opts.ownerId);
       if (!item) await this.reportMissingDependencies(opts.runId, opts.ownerId);
       return item;
@@ -361,6 +392,34 @@ export class SchedulerService {
     return claimed;
   }
 
+  /**
+   * M3 (review-rv2): un ejecutor del navegador que solo conoce tipos v1
+   * (frontend viejo en caché, o uno que no pudo leer el rulesVersion del run)
+   * reclamando un run rulesVersion 2 nunca encontraría nada reclamable
+   * (content depende de course_plan) y el run quedaría estancado SIN error.
+   * Se rechaza con 409 `rules_version_mismatch` (mensaje visible en la UI /
+   * consola) en vez de devolver `null` en silencio. Solo el camino navegador
+   * (ownerId): el worker interno reclama `video` y no se ve afectado.
+   */
+  private async assertBrowserTypesMatchRun(runId: string, ownerId: string, types: ItemType[]): Promise<void> {
+    if (types.some((t) => V2_ONLY_ITEM_TYPES.includes(t))) return;
+    const [row] = await this.dataSource.query(
+      `select m.rules_version
+         from public.production_jobs pj
+         join public.course_generation_manifests m on m.id::text = pj.input_payload->>'manifestId'
+        where pj.id = $1 and pj.execution_mode = 'dynamic_generation' and pj.owner_id = $2`,
+      [runId, ownerId],
+    );
+    const rulesVersion = row ? Number(row.rules_version) : null;
+    if (rulesVersion === 2) {
+      const message =
+        `rules_version_mismatch: la ejecución ${runId} es rulesVersion=2 (plan de conceptos, introducciones y ` +
+        `Context Package) y este ejecutor solo reclama tipos de rulesVersion 1 (${types.join(', ')}). ` +
+        'Recargá la página para usar el generador actualizado; con este ejecutor el curso no avanzaría.';
+      throw new ConflictException({ message, code: 'rules_version_mismatch', rulesVersion, runId });
+    }
+  }
+
   // ── heartbeat / complete / fail / external ───────────────────────────────
 
   async heartbeatItem(itemRunId: string, executorId: string, leaseSeconds: number, ownerId?: string): Promise<boolean> {
@@ -456,6 +515,47 @@ export class SchedulerService {
       }
       if (linked.length !== ids.length) throw new GuardRejection('artifacts_not_linkable');
 
+      // M1 (review-rv2): en rulesVersion 2 un item solo se completa con TODOS
+      // sus roles obligatorios (misma tabla que el resolver de empaquetado:
+      // content → md + Context Package; course_plan → plan json; intros → su
+      // md; scorm/exam/video como v1). Si falta alguno → 409 con los tipos
+      // faltantes y rollback (el item sigue running, nada queda vinculado):
+      // un item completado a medias ya no se puede reintentar. v1 intacto.
+      const [mrow] = await qr.query(
+        `select rules_version from public.course_generation_manifests where id = $1`,
+        [item.manifest_id],
+      );
+      if (mrow && Number(mrow.rules_version) === 2) {
+        const required = requiredArtifactTypes(2, item.type) ?? [];
+        const linkedTypes = new Set(
+          (await qr.query(`select type from public.artifacts where id = any($1::uuid[])`, [ids])).map((r: any) => r.type),
+        );
+        const missingTypes: string[] = required.filter((t) => !linkedTypes.has(t));
+        // El resumen del capítulo (dynamic_context_summary_json) es opcional,
+        // pero su ausencia tiene que quedar MARCADA (output_summary.
+        // contextSummary='missing', mismo invariante que la auditoría [4j]):
+        // nunca un content v2 sin resumen y sin marca.
+        if (
+          item.type === 'content' &&
+          !linkedTypes.has('dynamic_context_summary_json') &&
+          merged.merged.contextSummary !== 'missing'
+        ) {
+          missingTypes.push('dynamic_context_summary_json (o la marca contextSummary="missing")');
+        }
+        if (missingTypes.length > 0) {
+          throw new ConflictException({
+            message:
+              `missing_required_artifacts: el item ${item.item_key} (${item.type}, rulesVersion 2) no se puede completar ` +
+              `sin sus artifacts obligatorios; faltan: ${missingTypes.join(', ')}`,
+            code: 'missing_required_artifacts',
+            missing: missingTypes,
+          });
+        }
+        if (item.type === 'content' && Number(item.generation) > 1) {
+          await this.assertRegeneratedContextPackage(qr, item, merged.merged);
+        }
+      }
+
       const done = returningRows(
         await qr.query(
           `update public.generation_item_runs
@@ -471,8 +571,15 @@ export class SchedulerService {
     });
   }
 
-  async failItem(itemRunId: string, executorId: string, error: string, retryable: boolean, ownerId?: string): Promise<boolean> {
-    return (await this.failItemDetailed(itemRunId, executorId, error, retryable, ownerId)).ok;
+  async failItem(
+    itemRunId: string,
+    executorId: string,
+    error: string,
+    retryable: boolean,
+    ownerId?: string,
+    opts?: { retryAfterSeconds?: number; refundAttempt?: boolean },
+  ): Promise<boolean> {
+    return (await this.failItemDetailed(itemRunId, executorId, error, retryable, ownerId, opts)).ok;
   }
 
   /**
@@ -485,11 +592,12 @@ export class SchedulerService {
     error: string,
     retryable: boolean,
     ownerId?: string,
+    opts?: { retryAfterSeconds?: number; refundAttempt?: boolean },
   ): Promise<ItemOpResult> {
     executorId = this.checkExecutorId(executorId);
     const msg = String(error ?? '').trim().slice(0, MAX_ERROR_LENGTH) || 'unknown_error';
     return this.guardedItemOp(itemRunId, executorId, ownerId, 'update', async (qr, job, item) => {
-      const t = await applyItemFailure(qr, item.id, msg, !!retryable);
+      const t = await applyItemFailure(qr, item.id, msg, !!retryable, opts?.retryAfterSeconds ?? null, opts?.refundAttempt === true);
       if (!t) throw new GuardRejection('not_running');
       await recomputeRunStatus(qr, job.id);
     });
@@ -588,6 +696,49 @@ export class SchedulerService {
   // ── internals ────────────────────────────────────────────────────────────
 
   /**
+   * F78-BE2: el Context Package de un content REGENERADO (generation > 1) se
+   * reconstruye en el navegador desde los inputs congelados del run
+   * (outline del Blueprint + contexto + course_plan vigente, ver
+   * dynBuildContextPackage en 46-dynamic-context-package.js): con el MISMO
+   * course_plan (misma storage_path) tiene que dar el MISMO
+   * contextPackageSha256 que la generación anterior. Si difiere, el ejecutor
+   * usó otros inputs → 409 `context_package_mismatch` y rollback (el item
+   * sigue running; nunca se completa con un paquete divergente en silencio).
+   * Si el plan cambió, o falta el dato en alguna de las dos generaciones, no
+   * se compara (no hay base para afirmar que deban coincidir).
+   */
+  private async assertRegeneratedContextPackage(qr: QueryRunner, item: any, summary: Record<string, any>): Promise<void> {
+    const fromId = item.output_summary?.regeneration?.fromItemRunId;
+    if (!fromId) return;
+    const [prev] = await qr.query(`select output_summary from public.generation_item_runs where id = $1`, [fromId]);
+    const prevSha = prev?.output_summary?.contextPackageSha256;
+    const newSha = summary?.contextPackageSha256;
+    const prevPlan = prev?.output_summary?.coursePlanArtifactId;
+    const newPlan = summary?.coursePlanArtifactId;
+    if (!prevSha || !newSha || !prevPlan || !newPlan) return;
+    const plans: Array<{ id: string; storage_bucket: string; storage_path: string }> = await qr.query(
+      `select id, storage_bucket, storage_path from public.artifacts where id = any($1::uuid[])`,
+      [[...new Set([String(prevPlan), String(newPlan)])]],
+    );
+    const pathOf = (id: string) => {
+      const r = plans.find((p) => p.id === id);
+      return r ? `${r.storage_bucket}/${r.storage_path}` : null;
+    };
+    const a = pathOf(String(prevPlan));
+    const b = pathOf(String(newPlan));
+    if (!a || !b || a !== b) return;
+    if (prevSha !== newSha) {
+      throw new ConflictException({
+        message:
+          `context_package_mismatch: el content regenerado ${item.item_key} (generation ${item.generation}) trae un Context Package ` +
+          `(${String(newSha).slice(0, 12)}…) distinto al de la generación ${prev ? 'anterior' : '?'} (${String(prevSha).slice(0, 12)}…) ` +
+          'con el mismo course_plan: el paquete se debe reconstruir desde los inputs congelados del run',
+        code: 'context_package_mismatch',
+      });
+    }
+  }
+
+  /**
    * Operación sobre un item reclamado con los guards de R14, en una
    * transacción: fila del run bloqueada primero ('update' si la operación
    * cambia el run, 'share' si no), después el item FOR UPDATE. Run cancelado
@@ -654,7 +805,7 @@ export class SchedulerService {
       `select g.job_id, g.item_key,
               array(select dk.key from unnest(g.depends_on) as dk(key)
                      where not exists (select 1 from public.generation_item_runs d2
-                                        where d2.manifest_id = g.manifest_id and d2.generation = g.generation
+                                        where d2.job_id = g.job_id and d2.manifest_id = g.manifest_id
                                           and d2.item_key = dk.key)) as missing
          from public.generation_item_runs g
          join public.production_jobs pj on pj.id = g.job_id
@@ -666,7 +817,7 @@ export class SchedulerService {
           and ($3::text is null or pj.owner_id = $3)
           and exists (select 1 from unnest(g.depends_on) as dk(key)
                        where not exists (select 1 from public.generation_item_runs d2
-                                          where d2.manifest_id = g.manifest_id and d2.generation = g.generation
+                                          where d2.job_id = g.job_id and d2.manifest_id = g.manifest_id
                                             and d2.item_key = dk.key))
         limit 50`,
       [ACTIVE_RUN_WORKER_STATUSES, runId, ownerId ?? null],
@@ -725,6 +876,8 @@ export class SchedulerService {
   }
 
   private checkTypes(types: ItemType[]): ItemType[] {
+    // Tipos de v1 y v2 se aceptan siempre: un tipo que no existe en el
+    // Manifest del run simplemente no matchea ningún item.
     if (!Array.isArray(types) || types.length === 0 || types.some((t) => !ALL_ITEM_TYPES.includes(t))) {
       throw new BadRequestException(`types debe ser un subconjunto no vacío de ${ALL_ITEM_TYPES.join(', ')}`);
     }
@@ -794,22 +947,31 @@ export class SchedulerService {
     if (
       !mItem ||
       mItem.type !== row.type ||
-      mItem.moduleId !== row.module_id ||
+      (mItem.moduleId ?? null) !== (row.module_id ?? null) ||
       (mItem.chapterId ?? null) !== (row.chapter_id ?? null) ||
       !sameJson(mItem.dependsOn, row.depends_on ?? [])
     ) {
       throw fail('el item no coincide con su entrada del Manifest');
     }
-    const mModule = manifest.modules.find((m) => m.moduleId === row.module_id);
-    const sModule = snapshot.modules.find((m) => m.id === row.module_id);
-    if (!mModule || !sModule) throw fail('módulo ausente en Manifest/Blueprint');
-    const sChapter = row.chapter_id ? sModule.chapters.find((c) => c.id === row.chapter_id) : null;
+    // rulesVersion 2: items de scope course (course_plan, course_intro) no
+    // tienen módulo ni capítulo — module/chapter null y moduleChapters vacío.
+    // Cualquier otro item exige su módulo (como siempre).
+    const courseScope = mItem.scope === 'course';
+    if (courseScope && (row.module_id !== null || row.chapter_id !== null)) {
+      throw fail('item de scope course con module_id/chapter_id');
+    }
+    const mModule = courseScope ? null : manifest.modules.find((m) => m.moduleId === row.module_id);
+    const sModule = courseScope ? null : snapshot.modules.find((m) => m.id === row.module_id);
+    if (!courseScope && (!mModule || !sModule)) throw fail('módulo ausente en Manifest/Blueprint');
+    const sChapter = row.chapter_id && sModule ? sModule.chapters.find((c) => c.id === row.chapter_id) : null;
     if (row.chapter_id && !sChapter) throw fail('capítulo ausente en el Blueprint');
-    const moduleChapters = mModule.chapters.map((mc) => {
-      const sc = sModule.chapters.find((c) => c.id === mc.chapterId);
-      if (!sc) throw fail(`capítulo ${mc.chapterId} del Manifest ausente en el Blueprint`);
-      return { id: sc.id, title: sc.title, objective: sc.objective ?? null, chapterNumber: mc.chapterNumber };
-    });
+    const moduleChapters = !mModule
+      ? []
+      : mModule.chapters.map((mc) => {
+          const sc = sModule!.chapters.find((c) => c.id === mc.chapterId);
+          if (!sc) throw fail(`capítulo ${mc.chapterId} del Manifest ausente en el Blueprint`);
+          return { id: sc.id, title: sc.title, objective: sc.objective ?? null, chapterNumber: mc.chapterNumber };
+        });
 
     // Outline del curso completo (R18), en el mismo orden en que el Manifest
     // enumera sus módulos (manifest.modules ya está en orden de moduleNumber
@@ -822,10 +984,11 @@ export class SchedulerService {
         moduleNumber: mm.moduleNumber,
         id: sm.id,
         title: sm.title,
+        objective: sm.objective ?? null,
         chapters: mm.chapters.map((mc) => {
           const sc = sm.chapters.find((c) => c.id === mc.chapterId);
           if (!sc) throw fail(`capítulo ${mc.chapterId} del Manifest ausente en el Blueprint`);
-          return { chapterNumber: mc.chapterNumber, id: sc.id, title: sc.title };
+          return { chapterNumber: mc.chapterNumber, id: sc.id, title: sc.title, objective: sc.objective ?? null };
         }),
       };
     });
@@ -838,10 +1001,12 @@ export class SchedulerService {
             `select d.item_key, a.id, a.type, a.storage_path
                from public.generation_item_runs d
                join public.artifacts a on a.item_run_id = d.id
-              where d.manifest_id = $1 and d.generation = $2 and d.item_key = any($3::text[])
-                and d.status = 'completed'
+              where d.job_id = $1 and d.manifest_id = $2 and d.item_key = any($3::text[])
+                and d.status = 'completed' and ${latestGenerationPredicate('d')}
               order by array_position($3::text[], d.item_key), a.created_at, a.id`,
-            [row.manifest_id, row.generation, deps],
+            // F78-BE2: artifacts de la generación VIGENTE de cada dependencia
+            // (la que el predicado de claim exigió completed).
+            [row.job_id, row.manifest_id, deps],
           );
 
     return {
@@ -855,9 +1020,10 @@ export class SchedulerService {
       blueprintNumber: bp.blueprint_number,
       itemKey: row.item_key,
       type: row.type,
-      moduleId: row.module_id,
+      rulesVersion: manifest.rulesVersion,
+      moduleId: row.module_id ?? null,
       chapterId: row.chapter_id ?? null,
-      moduleNumber: mItem.moduleNumber,
+      moduleNumber: mItem.moduleNumber ?? null,
       chapterNumber: mItem.chapterNumber ?? null,
       idempotencyKey: row.idempotency_key,
       generation: row.generation,
@@ -867,7 +1033,9 @@ export class SchedulerService {
       context: { courseContext: ctx.context, contextHash: ctx.context_hash },
       blueprint: {
         course: { id: snapshot.course.id, title: snapshot.course.title },
-        module: { id: sModule.id, title: sModule.title, objective: sModule.objective ?? null, position: sModule.position },
+        module: sModule
+          ? { id: sModule.id, title: sModule.title, objective: sModule.objective ?? null, position: sModule.position }
+          : null,
         chapter: sChapter
           ? {
               id: sChapter.id,

@@ -21,6 +21,7 @@
  *   siempre el UUID (chapterId/moduleId).
  */
 
+import { Logger } from '@nestjs/common';
 import * as JSZip from 'jszip';
 import {
   resolveMoodleVersion,
@@ -55,7 +56,17 @@ import {
  * fix). Se incluye en el hash de reuse y en la metadata del artifact
  * `dynamic_mbz` — ver `dynamic-package-worker.ts`.
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION = '1.1.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION = '1.3.0';
+// 1.3.0 (DN-1): el video de un run `youtube` pasa de actividad `url` a un
+// `label` (mismo lugar, mismos ids) con el link de YouTube que el filtro
+// multimedia de Moodle convierte en reproductor embebido. `videogen_direct`
+// produce exactamente los mismos bytes que 1.2.0 (sha256 fijado).
+// 1.2.0 (5B.2.B, rulesVersion 2): intros de curso/módulo y bibliografía en el
+// Libro Guía, SOLO para planes v2. Un plan v1 produce exactamente los mismos
+// bytes que 1.1.0 (sha256 fijado en check-dynamic-video-delivery.js con reloj
+// congelado). El bump invalida a propósito la clave de reuse de los .mbz v1
+// ya construidos: un reempaquetado v1 reconstruye un .mbz con el mismo
+// contenido (una sola vez) en vez de mantener dos claves de versión.
 
 // ─── Palette ────────────────────────────────────────────────────────────────
 
@@ -261,12 +272,19 @@ function libroCardHtml(libroMid: number): string {
     + `</div>`;
 }
 
-function chapterIntroHtml(ch: PackagingChapterPlan, color: ModuleColor, hasVideo: boolean): string {
+/**
+ * 5B.2.A: `videoDelivery` solo cambia el TEXTO del aviso de video. Con
+ * `undefined` (Videogen directo) el HTML es exactamente el de 5B.1.
+ */
+function chapterIntroHtml(ch: PackagingChapterPlan, color: ModuleColor, hasVideo: boolean, videoDelivery?: 'youtube'): string {
+  const videoNotice = videoDelivery === 'youtube'
+    ? `<p>🎬 Este capítulo incluye un video, justo debajo.</p>`
+    : `<p>🎬 Este capítulo incluye un video que se abre en una pestaña externa.</p>`;
   return `<div style="border-left:4px solid #${color.main};padding:16px 20px;font-family:'Segoe UI',Arial,sans-serif;">`
     + `<span style="text-transform:uppercase;font-size:11px;font-weight:700;color:#${color.main};">Capítulo ${ch.chapterNumber}</span>`
     + `<h2 style="margin:6px 0;">${esc(ch.title)}</h2>`
     + (ch.objective ? `<p>${esc(ch.objective)}</p>` : '')
-    + (hasVideo ? `<p>🎬 Este capítulo incluye un video que se abre en una pestaña externa.</p>` : '')
+    + (hasVideo ? videoNotice : '')
     + `</div>`;
 }
 
@@ -279,6 +297,25 @@ function ctaLabelHtml(ch: PackagingChapterPlan, color: ModuleColor, scormMid: nu
 
 function videoUrlIntroHtml(ch: PackagingChapterPlan): string {
   return `<p>Video del capítulo ${ch.chapterNumber} — ${esc(ch.title)}. Este video se abre en una pestaña externa (no está embebido en el curso).</p>`;
+}
+
+/**
+ * DN-1: label del video de YouTube. El PRIMER `<a>` es un link plano a
+ * `https://www.youtube.com/watch?v=<id>`: el filtro multimedia de Moodle
+ * (filter_mediaplugin, activo por defecto) lo reemplaza por el reproductor
+ * embebido (media_youtube). El segundo es el respaldo accesible (abre YouTube)
+ * y lleva `class="nomediaplugin"` para que el filtro NO lo convierta en un
+ * segundo reproductor. Con el filtro apagado, ambos quedan como links.
+ */
+function youtubeEmbedLabelHtml(ch: PackagingChapterPlan, color: ModuleColor, watchUrl: string): string {
+  const title = `Video del capítulo ${ch.chapterNumber} — ${esc(ch.title)}`;
+  return `<div style="border-left:4px solid #${color.main};padding:12px 16px;font-family:'Segoe UI',Arial,sans-serif;">`
+    + `<p style="margin:0 0 8px;font-weight:700;">🎬 ${title}</p>`
+    // <div> (no <p>): el filtro reemplaza el <a> por un bloque (div del reproductor).
+    + `<div style="margin:0;"><a href="${esc(watchUrl)}">${title}</a></div>`
+    + `<p style="margin:8px 0 0;font-size:13px;">¿No se ve el reproductor? `
+    + `<a class="nomediaplugin" href="${esc(watchUrl)}" target="_blank" rel="noopener">Ver el video en YouTube</a>.</p>`
+    + `</div>`;
 }
 
 function scormIntroHtml(ch: PackagingChapterPlan): string {
@@ -308,6 +345,98 @@ function compileLibroHtml(courseTitle: string, orderedChapters: PackagingChapter
 <div class="cc-libro-cover"><h1>${esc(courseTitle)}</h1><p>Libro Guía del curso</p></div>
 <div class="cc-libro-toc"><h2>Índice</h2><ul>${toc}</ul></div>
 ${body}
+</body>
+</html>`;
+}
+
+// ─── rulesVersion 2 (5B.2.B): intros de curso/módulo y bibliografía ─────────
+// El markdown de los items course_intro/module_intro (texto LLM) se renderiza
+// con el MISMO conversor del Libro Guía (mdToHtmlBasic: escapa todo el HTML
+// del texto) y el label/archivo lo escapan después con xmlEsc, igual que el
+// resto de los labels. Estilos solo inline (Moodle elimina <style>).
+
+/**
+ * I3 (review-rv2): regla ÚNICA y tolerante del encabezado "Bibliografía
+ * sugerida", IDÉNTICA (source + flags) a DYN_SUGGESTED_BIBLIOGRAPHY_HEADING_RE
+ * del frontend (46-dynamic-context-package.js, usada por la validación de la
+ * intro al completar el item): una línea (sin sangría) que empieza con un
+ * marcador markdown opcional (#…######) seguido de "Bibliografía sugerida",
+ * con cualquier texto después ("— 5 a 8 referencias", "(APA)", ":" …). Se
+ * aplica línea por línea (trim). Cambiar una sin la otra rompe el contrato.
+ */
+export const SUGGESTED_BIBLIOGRAPHY_HEADING_RE = /^(#{1,6})?[ \t]*Bibliograf[ií]a sugerida.*$/i;
+
+/**
+ * Extrae la sección "Bibliografía sugerida" (sin su encabezado) del markdown
+ * de la intro de curso: desde la PRIMERA línea que cumple la regla hasta el
+ * próximo encabezado de igual o mayor nivel (sin marcador: hasta el próximo
+ * encabezado de cualquier nivel). `null` si no está o queda vacía.
+ */
+export function extractSuggestedBibliographyMd(md: string): string | null {
+  const lines = (md ?? '').split(/\r?\n/);
+  const start = lines.findIndex((l) => SUGGESTED_BIBLIOGRAPHY_HEADING_RE.test(l.trim()));
+  if (start < 0) return null;
+  const marker = (lines[start].trim().match(SUGGESTED_BIBLIOGRAPHY_HEADING_RE) as RegExpMatchArray)[1];
+  const level = marker ? marker.length : 6;
+  const out: string[] = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    const h = lines[i].match(/^(#{1,6})\s+/);
+    if (h && h[1].length <= level) break;
+    out.push(lines[i]);
+  }
+  const body = out.join('\n').trim();
+  return body ? body : null;
+}
+
+function courseIntroLabelHtml(md: string): string {
+  return `<div style="font-family:'Segoe UI',Arial,sans-serif;">`
+    + mdToHtmlBasic(md)
+    + `</div>`;
+}
+
+function moduleIntroLabelHtml(mod: PackagingModulePlan, color: ModuleColor, md: string): string {
+  return `<div style="border-left:4px solid #${color.main};padding:16px 20px;font-family:'Segoe UI',Arial,sans-serif;">`
+    + `<span style="text-transform:uppercase;font-size:11px;font-weight:700;color:#${color.main};">Módulo ${mod.moduleNumber}</span>`
+    + `<h2 style="margin:6px 0;">${esc(mod.title)}</h2>`
+    + mdToHtmlBasic(md)
+    + `</div>`;
+}
+
+/**
+ * Libro Guía v2: portada, índice por módulo, y por cada módulo su prefacio
+ * (module_intro) seguido de sus capítulos (mismo HTML de capítulo que v1), y
+ * al final la bibliografía sugerida de la intro de curso. Módulos y capítulos
+ * en orden del plan (Manifest); el join con los contenidos es por UUID.
+ */
+function compileLibroHtmlV2(
+  courseTitle: string,
+  modules: PackagingModulePlan[],
+  contentMd: Map<string, string>,
+  moduleIntroMd: Map<string, string>,
+  bibliographyMd: string | null,
+): string {
+  const toc = modules.map((m) => {
+    const chapters = m.chapters
+      .map((c) => `<li><a href="#cap-${c.chapterNumber}">Capítulo ${c.chapterNumber}: ${esc(c.title)}</a></li>`)
+      .join('\n');
+    return `<li><a href="#mod-${m.moduleNumber}">Módulo ${m.moduleNumber}: ${esc(m.title)}</a><ul>${chapters}</ul></li>`;
+  }).join('\n') + (bibliographyMd ? `\n<li><a href="#bibliografia">Bibliografía sugerida</a></li>` : '');
+  const body = modules.map((m) => {
+    const preface = `<section id="mod-${m.moduleNumber}" class="cc-libro-module"><h2>Módulo ${m.moduleNumber} — ${esc(m.title)}</h2>\n${mdToHtmlBasic(moduleIntroMd.get(m.moduleId) ?? '')}</section>`;
+    const chapters = m.chapters.map((c) => {
+      const rawMd = contentMd.get(c.chapterId) ?? '';
+      const md = stripLeadingDuplicateTitle(rawMd, c.title, c.chapterNumber);
+      return `<section id="cap-${c.chapterNumber}"><h2>Capítulo ${c.chapterNumber} — ${esc(c.title)}</h2>\n${mdToHtmlBasic(md)}</section>`;
+    }).join('\n');
+    return `${preface}\n${chapters}`;
+  }).join('\n');
+  return `<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"><title>${esc(courseTitle)} — Libro Guía</title></head>
+<body>
+<div class="cc-libro-cover"><h1>${esc(courseTitle)}</h1><p>Libro Guía del curso</p></div>
+<div class="cc-libro-toc"><h2>Índice</h2><ul>${toc}</ul></div>
+${body}${bibliographyMd ? `\n<section id="bibliografia" class="cc-libro-biblio"><h2>Bibliografía sugerida</h2>\n${mdToHtmlBasic(bibliographyMd)}</section>` : ''}
 </body>
 </html>`;
 }
@@ -538,6 +667,35 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
     }
     if (mod.examItemKey && !contents.examGift.has(mod.moduleId)) missing.push(mod.examItemKey);
   }
+  // rulesVersion 2: intro de curso + intro de CADA módulo (por UUID) son
+  // obligatorias, y la intro de curso debe traer su "Bibliografía sugerida"
+  // (va al final del Libro Guía). Nunca se empaqueta un v2 sin ellas.
+  const isV2 = plan.rulesVersion === 2;
+  let bibliographyMd: string | null = null;
+  if (isV2) {
+    const courseIntro = contents.courseIntroMd;
+    if (typeof courseIntro !== 'string' || !courseIntro.trim()) {
+      missing.push(plan.courseIntroItemKey ?? 'course_intro');
+    } else {
+      bibliographyMd = extractSuggestedBibliographyMd(courseIntro);
+      if (!bibliographyMd) {
+        // I3 (review-rv2): la validación del ejecutor (misma regla) ya exige
+        // la sección al completar el course_intro; si igual llega sin ella
+        // (artifact viejo, cliente con bugs), NO se lanza: un item completed
+        // no se puede reintentar y el run quedaría sin poder empaquetarse
+        // nunca. La intro se renderiza entera en su label (sin separar) y el
+        // Libro Guía sale sin sección de bibliografía — con warning visible.
+        new Logger('DynamicMbzBuilder').warn(
+          `${plan.courseIntroItemKey ?? 'course_intro'}: la intro de curso no tiene sección "Bibliografía sugerida" ` +
+            'reconocible; se empaqueta la intro completa sin separar y el Libro Guía sale sin bibliografía',
+        );
+      }
+    }
+    for (const mod of plan.modules) {
+      const md = contents.moduleIntroMd?.get(mod.moduleId);
+      if (typeof md !== 'string' || !md.trim()) missing.push(mod.moduleIntroItemKey ?? `module_intro:${mod.moduleId}`);
+    }
+  }
   if (missing.length) {
     throw new Error(`No se puede empaquetar: faltan ${missing.length} contenido(s) del Manifest: ${missing.join(', ')}`);
   }
@@ -620,6 +778,11 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
   // ── Bienvenida (sección 0) ──────────────────────────────────────────────
   addLabel(0, '🏠 Bienvenida al Curso', welcomeLabelHtml(plan));
 
+  // ── v2: Introducción al curso (sección 0, después de la bienvenida) ─────
+  if (isV2) {
+    addLabel(0, '📚 Introducción al Curso', courseIntroLabelHtml(contents.courseIntroMd as string));
+  }
+
   // ── Ruta de aprendizaje (sección 1) ─────────────────────────────────────
   addLabel(1, '🗺️ Ruta de Aprendizaje', routeLabelHtml(plan));
 
@@ -631,7 +794,9 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
     .slice()
     .sort((a, b) => a.chapterNumber - b.chapterNumber);
 
-  const libroHtml = compileLibroHtml(plan.course.title, allChaptersInOrder, contents.contentMd);
+  const libroHtml = isV2
+    ? compileLibroHtmlV2(plan.course.title, plan.modules, contents.contentMd, contents.moduleIntroMd as Map<string, string>, bibliographyMd)
+    : compileLibroHtml(plan.course.title, allChaptersInOrder, contents.contentMd);
   if (!/<\/html>\s*$/i.test(libroHtml.trim())) {
     // Guard defensivo — mismo patrón que mbz-builder.service.ts:1312-1316,
     // aunque en 5B.1 el compilador es determinístico y siempre debería cerrar.
@@ -666,6 +831,15 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
   for (const mod of plan.modules) {
     const color = moduleColor(palette, mod.colorIndex);
 
+    // v2: presentación del módulo como PRIMER label de su sección.
+    if (isV2) {
+      addLabel(
+        mod.sectionNum,
+        safeActivityName(`🧭 Presentación del Módulo ${mod.moduleNumber} — ${mod.title}`),
+        moduleIntroLabelHtml(mod, color, contents.moduleIntroMd!.get(mod.moduleId) as string),
+      );
+    }
+
     for (const ch of mod.chapters) {
       // Se asignan los ids de TODAS las actividades del capítulo por adelantado,
       // así el CTA puede referenciar el mid real del scorm sin necesitar un
@@ -677,14 +851,18 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
       const ctaAid = actId++; const ctaMid = modId++; const ctaCtx = ctxId++;
       const scormAid = actId++; const scormMid = modId++; const scormCtx = ctxId++;
 
+      // DN-1: run youtube → el video es un label (embed), en el MISMO lugar e ids que la url.
+      const chapterVideo = ch.videoItemKey ? contents.videos.get(ch.chapterId) : undefined;
+      const videoAsYoutubeLabel = chapterVideo?.delivery === 'youtube';
       ctaMap[introMid] = 'label';
-      if (ch.videoItemKey) ctaMap[videoMid] = 'url';
+      if (ch.videoItemKey) ctaMap[videoMid] = videoAsYoutubeLabel ? 'label' : 'url';
       ctaMap[ctaMid] = 'label';
       ctaMap[scormMid] = 'scorm';
 
       // 1. Intro
       const introName = safeActivityName(`📖 Capítulo ${ch.chapterNumber} — ${ch.title}`);
-      const introContent = sanitizeTokens(chapterIntroHtml(ch, color, !!ch.videoItemKey));
+      const chapterVideoDelivery = chapterVideo?.delivery;
+      const introContent = sanitizeTokens(chapterIntroHtml(ch, color, !!ch.videoItemKey, chapterVideoDelivery));
       const introDir = `activities/label_${introMid}`;
       zip.file(`${introDir}/label.xml`, labelXmlWithCtx(introAid, introMid, introCtx, introName, introContent, ts));
       zip.file(`${introDir}/module.xml`, moduleXml(introMid, 'label', mod.sectionNum, ts, MV.bv));
@@ -695,8 +873,24 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
       actSettings.push({ mid: introMid, modname: 'label', title: introName });
       pushAct(mod.sectionNum, introMid);
 
-      // 2. Video (url externa) — solo si el Manifest lo incluye
-      if (ch.videoItemKey) {
+      // 2a. Video de YouTube (DN-1): label con el link que Moodle embebe.
+      if (ch.videoItemKey && videoAsYoutubeLabel) {
+        const video = chapterVideo!;
+        const videoName = safeActivityName(`🎬 Video del capítulo ${ch.chapterNumber} — ${ch.title}`);
+        const videoDir = `activities/label_${videoMid}`;
+        const videoContent = sanitizeTokens(youtubeEmbedLabelHtml(ch, color, video.url));
+        zip.file(`${videoDir}/label.xml`, labelXmlWithCtx(videoAid, videoMid, videoCtx, videoName, videoContent, ts));
+        zip.file(`${videoDir}/module.xml`, moduleXml(videoMid, 'label', mod.sectionNum, ts, MV.bv));
+        zip.file(`${videoDir}/inforef.xml`, inforefXml());
+        zip.file(`${videoDir}/grades.xml`, gradesXml(videoAid));
+        writeActFiles(zip, videoDir);
+        mbzActivities.push({ mid: videoMid, secnum: mod.sectionNum, modname: 'label', title: videoName, dir: videoDir });
+        actSettings.push({ mid: videoMid, modname: 'label', title: videoName });
+        pushAct(mod.sectionNum, videoMid);
+      }
+
+      // 2b. Video (url externa, videogen_direct) — solo si el Manifest lo incluye
+      if (ch.videoItemKey && !videoAsYoutubeLabel) {
         const video = contents.videos.get(ch.chapterId)!;
         const videoName = safeActivityName(`🎬 Video del capítulo ${ch.chapterNumber} — ${ch.title}`);
         const videoDir = `activities/url_${videoMid}`;

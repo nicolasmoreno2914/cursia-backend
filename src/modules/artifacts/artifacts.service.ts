@@ -33,6 +33,30 @@ export interface UploadBufferArtifactInput {
   metadata?: Record<string, any>;
   storageBucket?: string;
   storageProvider?: string;
+  /** M9 (fase5b-audit integral-review.md): false para paths inmutables por-contenido
+   *  (p.ej. dynamic_mbz, con el hash de sus fuentes en el path). Default true
+   *  (comportamiento legacy) — mismo patrón que UploadJsonArtifactInput.upsert. */
+  upsert?: boolean;
+  /**
+   * I2 (review-it2): solo con `upsert:false` sobre un path direccionado por
+   * contenido. Si Storage responde "already exists" (un intento previo subió
+   * el objeto pero murió antes de insertar el row de `artifacts`), se verifica
+   * que el objeto exista (HEAD, tamaño > 0) y se crea el row apuntando a él en
+   * vez de fallar para siempre. Si no se puede verificar, se lanza el error
+   * original del upload. Default false (comportamiento previo).
+   */
+  adoptExistingOnConflict?: boolean;
+}
+
+/**
+ * Supabase Storage responde a un POST con `x-upsert:false` sobre un objeto
+ * existente con HTTP 400 y body `{"statusCode":"409","error":"Duplicate",…}`
+ * (versiones más nuevas pueden responder 409 directo).
+ */
+export function isStorageDuplicateResponse(status: number, body: string): boolean {
+  if (status === 409) return true;
+  if (status !== 400) return false;
+  return /"statusCode"\s*:\s*"?409"?/.test(body) || /\bDuplicate\b/i.test(body) || /already exists/i.test(body);
 }
 
 /**
@@ -50,6 +74,22 @@ export function supabaseServiceHeaders(serviceKey: string): Record<string, strin
     apikey: serviceKey,
     Authorization: `Bearer ${serviceKey}`,
   };
+}
+
+/**
+ * Artifact del flujo dynamic (V2): tipo `dynamic_*` (dynamic_content_md,
+ * dynamic_video, dynamic_mbz, dynamic_coherence_report_json, …) o vinculado a
+ * un item/Manifest. Esos paths son inmutables y pueden estar compartidos por
+ * filas "carried" (Fase 8). `null`/ausente en filas legacy.
+ */
+export function isDynamicArtifactRow(row: { type?: string | null; item_run_id?: string | null; manifest_id?: number | null }): boolean {
+  return String(row?.type ?? '').startsWith('dynamic_') || row?.item_run_id != null || row?.manifest_id != null;
+}
+
+/** Re-review N3: tope del DELETE HTTP a Storage en remove() (ms). */
+function storageDeleteTimeoutMs(): number {
+  const n = Number(process.env.ARTIFACT_STORAGE_DELETE_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 10_000;
 }
 
 @Injectable()
@@ -135,10 +175,39 @@ export class ArtifactsService {
   }
 
   async uploadBufferArtifact(input: UploadBufferArtifactInput): Promise<Artifact> {
+    const bucket = input.storageBucket ?? 'cursia-artifacts';
+    const provider = input.storageProvider ?? 'supabase';
+    const put = await this.putStorageObject(input);
+    const metadata = put.adopted ? { ...(input.metadata ?? {}), adoptedExistingObject: true } : input.metadata ?? {};
+    return this.create(
+      {
+        course_id: input.courseId ?? null,
+        job_id: input.jobId ?? null,
+        type: input.type,
+        storage_path: input.storagePath,
+        storage_provider: provider,
+        storage_bucket: bucket,
+        filename: input.filename,
+        mime_type: input.mimeType,
+        size_bytes: put.sizeBytes,
+        metadata,
+      },
+      input.ownerId,
+    );
+  }
+
+  /**
+   * Solo la subida a Storage (sin fila en `artifacts`): la usan quienes crean
+   * la fila ellos mismos dentro de su propia transacción/lock (p.ej. el
+   * reporte de coherencia, fix wave M4). Misma semántica de `upsert` y de
+   * adopción de un objeto inmutable preexistente que `uploadBufferArtifact`.
+   */
+  async putStorageObject(
+    input: Pick<UploadBufferArtifactInput, 'storagePath' | 'buffer' | 'mimeType' | 'storageBucket' | 'upsert' | 'adoptExistingOnConflict'>,
+  ): Promise<{ sizeBytes: number; adopted: boolean }> {
     const supabaseUrl = this.config.get<string>('SUPABASE_URL');
     const serviceKey = this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY');
     const bucket = input.storageBucket ?? 'cursia-artifacts';
-    const provider = input.storageProvider ?? 'supabase';
 
     if (!supabaseUrl || !serviceKey) {
       throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for server-side artifact upload');
@@ -156,31 +225,44 @@ export class ArtifactsService {
       headers: {
         ...supabaseServiceHeaders(serviceKey),
         'Content-Type': input.mimeType,
-        'x-upsert': 'true',
+        'x-upsert': input.upsert === false ? 'false' : 'true',
       },
       body: input.buffer as unknown as BodyInit,
     });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Supabase Storage upload failed: ${response.status} ${errorText}`);
+    if (response.ok) return { sizeBytes: input.buffer.length, adopted: false };
+    const errorText = await response.text();
+    const uploadError = new Error(`Supabase Storage upload failed: ${response.status} ${errorText}`);
+    if (!(input.adoptExistingOnConflict && input.upsert === false && isStorageDuplicateResponse(response.status, errorText))) {
+      throw uploadError;
     }
-
-    return this.create(
-      {
-        course_id: input.courseId ?? null,
-        job_id: input.jobId ?? null,
-        type: input.type,
-        storage_path: input.storagePath,
-        storage_provider: provider,
-        storage_bucket: bucket,
-        filename: input.filename,
-        mime_type: input.mimeType,
-        size_bytes: input.buffer.length,
-        metadata: input.metadata ?? {},
-      },
-      input.ownerId,
+    // I2: el objeto inmutable ya existe (crash entre Storage y el row) —
+    // se adopta solo si se puede verificar que está ahí y no está vacío.
+    const existingSize = await this.headStorageObjectSize(supabaseUrl, serviceKey, bucket, encodedPath);
+    if (existingSize === null || existingSize <= 0) {
+      this.logger.error(
+        `uploadBufferArtifact: ${input.storagePath} reporta "already exists" pero no se pudo verificar el objeto (size=${existingSize}) — no se adopta`,
+      );
+      throw uploadError;
+    }
+    this.logger.warn(
+      `uploadBufferArtifact: ${input.storagePath} ya existía en Storage (${existingSize} bytes) sin row en artifacts — se adopta el objeto existente`,
     );
+    return { sizeBytes: existingSize, adopted: true };
+  }
+
+  /** Tamaño (content-length) de un objeto de Storage vía HEAD autenticado; null si no existe o no se pudo leer. */
+  private async headStorageObjectSize(supabaseUrl: string, serviceKey: string, bucket: string, encodedPath: string): Promise<number | null> {
+    const headUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/authenticated/${bucket}/${encodedPath}`;
+    try {
+      const res = await fetch(headUrl, { method: 'HEAD', headers: supabaseServiceHeaders(serviceKey) });
+      if (!res.ok) return null;
+      const len = Number(res.headers.get('content-length'));
+      return Number.isFinite(len) ? len : null;
+    } catch (err) {
+      this.logger.warn(`headStorageObjectSize: HEAD falló para ${bucket}/${encodedPath}: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
   }
 
   // ── FIND ALL ────────────────────────────────────────────────────────────────
@@ -306,32 +388,77 @@ export class ArtifactsService {
   // ── DELETE ──────────────────────────────────────────────────────────────────
 
   /**
-   * Elimina el registro de metadata.
-   * Opcionalmente intenta borrar el archivo de Supabase Storage
-   * (requiere SUPABASE_SERVICE_ROLE_KEY).
+   * Elimina el registro de metadata y (si corresponde) el objeto de Supabase
+   * Storage (requiere SUPABASE_SERVICE_ROLE_KEY).
+   *
+   * Release-fix (release review Minor 1): dos semánticas según el artifact.
+   * - LEGACY (no dynamic): mismo resultado observable que `main` — la fila se
+   *   borra y el objeto de Storage también, aunque otra fila legacy comparta
+   *   el path (`x-upsert:true`); un fallo de Storage se loguea y nunca impide
+   *   borrar la fila. Única excepción: si una fila DYNAMIC usa el mismo path,
+   *   el objeto se conserva. (Re-review N3: el DELETE HTTP a Storage corre
+   *   DESPUÉS del commit, nunca con la transacción/locks abiertos.)
+   * En ambos casos el DELETE a Storage tiene un timeout acotado
+   * (ARTIFACT_STORAGE_DELETE_TIMEOUT_MS, default 10000 ms).
+   * - DYNAMIC (`type` dynamic_* o vinculado a item_run_id/manifest_id): Fase 8
+   *   — una fila "carried" (REUSE) apunta a la MISMA storage_path inmutable
+   *   que la fila histórica de la que salió; borrar una fila nunca debe borrar
+   *   el objeto que otra fila sigue usando. Fix wave I2 (carrera con el apply
+   *   fromRun): en UNA transacción se bloquea la fila (FOR UPDATE), se
+   *   bloquean y cuentan las demás filas con la misma ruta y se borra la
+   *   fila; el objeto se borra recién DESPUÉS del commit y solo si nadie más
+   *   lo referenciaba. Un apply que llegue después ve la fila borrada y falla
+   *   con 409.
    */
   async remove(id: string, ownerId: string): Promise<void> {
-    const artifact = await this.findOne(id, ownerId);
+    const qr = this.artifactRepo.manager.connection.createQueryRunner();
+    let row: any;
+    let sharers: any[] = [];
+    let deleteObject = false;
+    await qr.connect();
+    try {
+      await qr.startTransaction();
+      [row] = await qr.query(`select * from public.artifacts where id = $1 and owner_id = $2 for update`, [id, ownerId]);
+      if (!row) throw new NotFoundException(`Artifact ${id} not found`);
+      sharers = await qr.query(
+        `select * from public.artifacts where storage_bucket = $1 and storage_path = $2 and id <> $3 for update`,
+        [row.storage_bucket, row.storage_path, row.id],
+      );
+      // Qué filas impiden borrar el objeto: para una fila dynamic, cualquier
+      // otra; para una legacy, solo las dynamic (entre legacy, semántica de main).
+      const blocking = isDynamicArtifactRow(row) ? sharers : sharers.filter(isDynamicArtifactRow);
+      deleteObject = blocking.length === 0;
+      if (!deleteObject) {
+        this.logger.log(`remove(${row.id}): ${blocking.length} fila(s) más usan ${row.storage_path}; se conserva el objeto de Storage`);
+      }
+      await qr.query(`delete from public.artifacts where id = $1`, [row.id]);
+      await qr.commitTransaction();
+    } catch (err) {
+      if (qr.isTransactionActive) await qr.rollbackTransaction();
+      throw err;
+    } finally {
+      await qr.release();
+    }
+    if (deleteObject) await this.deleteStorageObject(row);
+  }
 
-    // Try to delete from storage
+  /** Borra el objeto de Storage de una fila (best effort: los fallos se loguean, nunca se propagan). */
+  private async deleteStorageObject(row: { storage_provider: string; storage_bucket: string; storage_path: string }): Promise<void> {
     const supabaseUrl = this.config.get<string>('SUPABASE_URL');
     const serviceKey  = this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY');
-
-    if (supabaseUrl && serviceKey && artifact.storageProvider === 'supabase') {
-      try {
-        const deleteUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/${artifact.storageBucket}/${artifact.storagePath}`;
-        const res = await fetch(deleteUrl, {
-          method: 'DELETE',
-          headers: supabaseServiceHeaders(serviceKey),
-        });
-        if (!res.ok) {
-          this.logger.warn(`Storage delete failed for ${artifact.storagePath}: ${res.status}`);
-        }
-      } catch (err) {
-        this.logger.warn(`Storage delete error for ${artifact.storagePath}: ${err}`);
+    if (!(supabaseUrl && serviceKey && row.storage_provider === 'supabase')) return;
+    try {
+      const deleteUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/${row.storage_bucket}/${row.storage_path}`;
+      const res = await fetch(deleteUrl, {
+        method: 'DELETE',
+        headers: supabaseServiceHeaders(serviceKey),
+        signal: AbortSignal.timeout(storageDeleteTimeoutMs()),
+      });
+      if (!res.ok) {
+        this.logger.warn(`Storage delete failed for ${row.storage_path}: ${res.status}`);
       }
+    } catch (err) {
+      this.logger.warn(`Storage delete error for ${row.storage_path}: ${err}`);
     }
-
-    await this.artifactRepo.remove(artifact);
   }
 }

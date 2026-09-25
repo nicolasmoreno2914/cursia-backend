@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { Client } = require('pg');
+const v2Target = require('./lib/v2-production-target');
 
 function loadEnvFile(envPath) {
   if (!fs.existsSync(envPath)) return;
@@ -89,8 +90,16 @@ function shortSha(sha) {
 
 async function main() {
   loadEnvFile(path.resolve(process.cwd(), '.env'));
-  assertExplicitStagingIntent();
-  assertNotProductionProject();
+  // Fase 9 (G6): modo opt-in V2_VERIFY_MODE=production-readonly (lo usa
+  // scripts/prod/migrate-v2-production.js). Sin esa env var, los guards de
+  // staging de siempre, sin ningún cambio de comportamiento.
+  const PROD_RO = v2Target.isProductionReadonlyRequested()
+    ? v2Target.assertProductionReadonlyTargetOrExit()
+    : null;
+  if (!PROD_RO) {
+    assertExplicitStagingIntent();
+    assertNotProductionProject();
+  }
 
   const client = new Client({
     host: process.env.DB_HOST || '127.0.0.1',
@@ -104,6 +113,14 @@ async function main() {
   });
 
   await client.connect();
+  if (PROD_RO) {
+    try {
+      await v2Target.enterProductionReadonlySession(client, PROD_RO);
+    } catch (err) {
+      await client.end();
+      throw err;
+    }
+  }
   const failures = [];
 
   try {
@@ -283,6 +300,12 @@ async function main() {
     }
 
     // 3f. Inmutabilidad sobre datos reales.
+    // Fase 9 (G6): en production-readonly esta sonda NO corre (escribe dentro
+    // de una transacción revertida y la sesión es READ ONLY). Cuerpo sin
+    // reindentar a propósito para mantener el diff mínimo.
+    if (PROD_RO) {
+      v2Target.logSkippedProbe('3f. inmutabilidad sobre datos reales (UPDATE no-op revertido)');
+    } else {
     await client.query('begin');
     try {
       const latest = await client.query(
@@ -375,6 +398,7 @@ async function main() {
     } finally {
       await client.query('rollback'); // nunca deja basura, sea cual sea el resultado
     }
+    } // fin if (PROD_RO) — sonda con escritura revertida
 
     console.log('');
     if (failures.length > 0) {

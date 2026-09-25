@@ -1,0 +1,159 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# v2-production-migrations.yml — Fase 9 / G6: migraciones de esquema de Cursia V2
+# contra PRODUCCIÓN, SOLO a mano (workflow_dispatch). NUNCA se dispara por push.
+#
+# ⚠️  DECISIÓN D — REQUIERE APROBACIÓN DEL OWNER (Nicolás) ⚠️
+#   - El job que conecta a la base (`migrate`) usa el GitHub Environment
+#     `production-v2-migrations`. GitHub AUTO-CREA un environment referenciado
+#     que no existe, SIN reviewers ni política de ramas — por eso el primer step
+#     de `migrate` falla salvo que exista la variable de ENVIRONMENT
+#     V2_PROD_MIGRATIONS_ENV_GUARD=production-v2-migrations, que solo el owner
+#     define al configurar el environment protegido. El owner DEBE, antes del
+#     primer uso:
+#       Settings → Environments → New environment "production-v2-migrations"
+#         · Required reviewers: el owner (y nadie más); "Prevent self-review" si aplica
+#         · Deployment branches: solo `main` (rama protegida)
+#         · Environment variable: V2_PROD_MIGRATIONS_ENV_GUARD = production-v2-migrations
+#           (SOLO en el environment; nunca como variable del repo/organización)
+#         · Environment secrets (NUNCA secretos del repo/organización con estos nombres):
+#             V2_PROD_DB_HOST  V2_PROD_DB_PORT  V2_PROD_DB_USER  V2_PROD_DB_PASS  V2_PROD_DB_NAME
+#           (recomendado: pooler de Supabase en MODO SESIÓN, puerto 5432,
+#            usuario "postgres.<ref>" — los runners de GitHub no tienen IPv6 y
+#            db.<ref>.supabase.co puede resolver solo a IPv6)
+#     Sin ese environment configurado con reviewers, este workflow NO debe usarse.
+#   - Default: mode=dry-run → solo el job `plan` (sin secretos, sin red a la DB).
+#   - Precondiciones (backup/PITR, DN-6): docs/v2-production-migrations.md.
+#   - Schema-first (release-fix C1): el apply INICIAL se hace ANTES del merge,
+#     desde un checkout del commit de release (este workflow solo corre desde
+#     main); acá sirve para re-verificar/re-aplicar (idempotente) después.
+#
+# Este archivo no modifica deploy.yml ni deploy-staging.yml y no los dispara.
+# ══════════════════════════════════════════════════════════════════════════════
+
+name: V2 production migrations (manual, owner approval)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'dry-run (plan, no conecta) | verify-only (solo lectura) | apply (MUTA producción)'
+        type: choice
+        required: true
+        default: dry-run
+        options: [dry-run, verify-only, apply]
+      confirm_ref:
+        description: 'Ref de Supabase de producción, escrito a mano (obligatorio para verify-only/apply)'
+        type: string
+        required: false
+        default: ''
+      confirm_backup:
+        description: 'apply: ¿el owner verificó backup/PITR de producción HOY? (yes/no)'
+        type: choice
+        required: true
+        default: 'no'
+        options: ['no', 'yes']
+      skip_unresolved_placeholders:
+        description: 'apply: omitir pasos placeholder sin resolver (hoy no hay ninguno: Fase 8 ya está integrada)'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v2-production-migrations
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan (dry-run, sin secretos)
+    runs-on: ubuntu-latest
+    outputs:
+      plan_sha256: ${{ steps.plan.outputs.plan_sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - name: Dry-run (no conecta a ninguna base)
+        id: plan
+        env:
+          NODE_ENV: production
+        run: |
+          node scripts/prod/migrate-v2-production.js
+          node scripts/prod/migrate-v2-production.js --plan-json > plan.json
+          echo "plan_sha256=$(node -e 'process.stdout.write(require("./plan.json").planSha256)')" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v2-production-migration-plan
+          path: plan.json
+
+  migrate:
+    name: ${{ inputs.mode }} contra producción (requiere aprobación del owner)
+    needs: plan
+    if: inputs.mode != 'dry-run'
+    runs-on: ubuntu-latest
+    environment: production-v2-migrations
+    timeout-minutes: 30
+    steps:
+      # PRIMER step, antes de cualquier secreto: prueba que el environment
+      # protegido existe y lo configuró el owner (ver cabecera).
+      - name: Guard — environment protegido configurado por el owner
+        env:
+          ENV_GUARD: ${{ vars.V2_PROD_MIGRATIONS_ENV_GUARD }}
+        run: |
+          if [ "$ENV_GUARD" != "production-v2-migrations" ]; then
+            echo "❌ Falta la variable de environment V2_PROD_MIGRATIONS_ENV_GUARD=production-v2-migrations."
+            echo "   El environment 'production-v2-migrations' no está configurado/protegido por el owner"
+            echo "   (required reviewers + rama main + secretos de environment). Ver docs/v2-production-migrations.md."
+            exit 1
+          fi
+      - name: Validar entradas (sin interpolar inputs en shell)
+        env:
+          MODE: ${{ inputs.mode }}
+          CONFIRM_REF: ${{ inputs.confirm_ref }}
+          CONFIRM_BACKUP: ${{ inputs.confirm_backup }}
+          GIT_REF: ${{ github.ref }}
+        run: |
+          if [ "$GIT_REF" != "refs/heads/main" ]; then
+            echo "❌ Solo se permite correr contra producción desde main (ref actual: $GIT_REF)"; exit 1
+          fi
+          if ! printf '%s' "$CONFIRM_REF" | grep -Eq '^[a-z0-9]{20}$'; then
+            echo "❌ confirm_ref vacío o con formato inválido"; exit 1
+          fi
+          if [ "$MODE" = "apply" ] && [ "$CONFIRM_BACKUP" != "yes" ]; then
+            echo "❌ apply exige confirm_backup=yes"; exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - name: Ejecutar runner
+        env:
+          NODE_ENV: production
+          MIGRATION_ENV: production
+          MODE: ${{ inputs.mode }}
+          CONFIRM_PRODUCTION_REF: ${{ inputs.confirm_ref }}
+          CONFIRM_BACKUP_TAKEN: ${{ inputs.confirm_backup }}
+          SKIP_PLACEHOLDERS: ${{ inputs.skip_unresolved_placeholders }}
+          PLAN_SHA256: ${{ needs.plan.outputs.plan_sha256 }}
+          DB_HOST: ${{ secrets.V2_PROD_DB_HOST }}
+          DB_PORT: ${{ secrets.V2_PROD_DB_PORT }}
+          DB_USER: ${{ secrets.V2_PROD_DB_USER }}
+          DB_PASS: ${{ secrets.V2_PROD_DB_PASS }}
+          DB_NAME: ${{ secrets.V2_PROD_DB_NAME }}
+          DB_SSL: 'true'
+        run: |
+          if [ "$MODE" = "apply" ]; then
+            EXTRA=""
+            if [ "$SKIP_PLACEHOLDERS" = "true" ]; then EXTRA="--skip-unresolved-placeholders"; fi
+            node scripts/prod/migrate-v2-production.js --apply --i-understand-this-mutates-production \
+              --expect-plan-sha256 "$PLAN_SHA256" $EXTRA
+          else
+            node scripts/prod/migrate-v2-production.js --verify-only
+          fi

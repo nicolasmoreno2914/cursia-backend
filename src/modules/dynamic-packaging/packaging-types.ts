@@ -45,10 +45,19 @@ export interface PackagingModulePlan {
   colorIndex: number;
   chapters: PackagingChapterPlan[]; // orden del Manifest
   examItemKey: string | null; // 'exam:<moduleId>' si existe en el Manifest
+  /**
+   * rulesVersion 2 (5B.2.B): 'module_intro:<moduleId>'. Ausente en planes v1
+   * (la forma canónica v1 no cambia).
+   */
+  moduleIntroItemKey?: string;
 }
 
 export interface PackagingPlan {
   planVersion: 1;
+  /** Presente SOLO en planes de Manifests rulesVersion 2 (v1: ausente, canónico intacto). */
+  rulesVersion?: 2;
+  /** rulesVersion 2: 'course_intro:<courseId>' (sección 0 + bibliografía en el Libro Guía). */
+  courseIntroItemKey?: string;
   manifestId: number | null; // null en tests puros
   course: { id: number; title: string; summary: string | null };
   /** Secciones de Moodle en orden: 0 welcome, 1 route_and_book, luego una por módulo. */
@@ -71,7 +80,14 @@ export interface ResolvedArtifact {
     | 'dynamic_scorm_html'
     | 'dynamic_scorm_manifest'
     | 'dynamic_exam_gift'
-    | 'dynamic_video';
+    | 'dynamic_video'
+    // rulesVersion 2 (5B.2.B + Fase 6):
+    | 'dynamic_course_plan_json'
+    | 'dynamic_course_intro_md'
+    | 'dynamic_module_intro_md'
+    | 'dynamic_context_package_json';
+  /** Fase 8: 'stale' si el artifact se empaqueta marcado (STALE_NO_AUTO). Ausente = vigente. */
+  status?: 'stale';
   storageBucket: string;
   storagePath: string;
   mimeType: string | null;
@@ -87,8 +103,15 @@ export interface DynamicPackageContents {
    * (downloadUrl del artifact dynamic_video) SOLO como mecanismo de aceptación
    * en staging. La entrega final del video (YouTube, storage estable, etc.) se
    * decide en 5B.2. Nunca se usan signed URLs temporales.
+   * 5B.2.A: `delivery: 'youtube'` (solo runs congelados en youtube) → `url`
+   * es la de YouTube y cambia el texto de la actividad; ausente = Videogen
+   * directo (5B.1, byte-idéntico).
    */
-  videos: Map<string, { url: string; videogenJobId: string }>;
+  videos: Map<string, { url: string; videogenJobId: string; delivery?: 'youtube' }>;
+  /** rulesVersion 2: markdown del item course_intro (obligatorio si el plan es v2). */
+  courseIntroMd?: string;
+  /** rulesVersion 2: moduleId -> markdown del item module_intro (obligatorio por módulo si el plan es v2). */
+  moduleIntroMd?: Map<string, string>;
 }
 
 export interface BuildDynamicMbzInput {
@@ -101,7 +124,10 @@ export interface BuildDynamicMbzInput {
 
 export class PackagingNotReadyError extends Error {
   constructor(public readonly missing: string[], message?: string) {
-    super(message ?? `Empaquetado no listo: faltan ${missing.length} item(s)`);
+    super(
+      message ??
+        `Empaquetado no listo: faltan ${missing.length} item(s): ${missing.join(', ')}`,
+    );
     this.name = 'PackagingNotReadyError';
   }
 }
