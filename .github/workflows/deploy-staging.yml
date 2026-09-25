@@ -81,6 +81,12 @@ jobs:
       - name: Check dynamic feature gating (Fase 9 — G1/G3/G4 + video real I1)
         run: node scripts/check-dynamic-feature-gating.js
 
+      - name: Check deploy workflows run the dynamic workers (HD-6)
+        run: node scripts/check-deploy-dynamic-workers.js
+
+      - name: Check V2 pre-acceptance guards (legacy audio 409, mock video no empaquetable)
+        run: node scripts/check-v2-acceptance-guards.js
+
       - name: Check Coherence Engine rules/report (Fase 7)
         run: node scripts/check-coherence-engine.js
 
@@ -254,6 +260,19 @@ jobs:
                  echo "+ owner de prueba de staging agregado a ${key} (backup: .env.bak)"
                }
 
+               # Pre-aceptación V2: valor por defecto de staging SOLO si la clave no
+               # existe (nunca pisa un valor puesto a mano; imprime solo el nombre).
+               ensure_env_default_if_absent() {
+                 local key="$1"
+                 local value="$2"
+                 if grep -q "^${key}=" .env; then
+                   echo "✓ ${key} ya presente en el .env de staging — no se toca"
+                 else
+                   printf "\n%s=%s\n" "$key" "$value" >> .env
+                   echo "+ ${key} agregado al .env de staging"
+                 fi
+               }
+
                ensure_pm2_process() {
                  local name="$1"
                  local start_script="$2"
@@ -267,10 +286,21 @@ jobs:
                echo "━━━ [0/6] Verificar poppler-utils (pdftoppm — portadas de Gamma) ━━━"
                command -v pdftoppm > /dev/null 2>&1 || sudo apt-get install -y poppler-utils
 
-               echo "━━━ [0b] Flags V2 de staging (DYNAMIC_COURSE_STRUCTURE, DYNAMIC_REAL_VIDEO_OWNERS) ━━━"
+               echo "━━━ [0b] Flags V2 de staging (DYNAMIC_COURSE_STRUCTURE, DYNAMIC_REAL_VIDEO_OWNERS, DYNAMIC_V2_ALLOWED_OWNERS, DYNAMIC_VIDEO_DELIVERY, DYNAMIC_MANIFEST_RULES_VERSION) ━━━"
                ensure_env_flag_true DYNAMIC_COURSE_STRUCTURE
                # Owner de prueba de staging (un id, no un secreto) habilitado para video real (Videogen).
                ensure_env_list_contains DYNAMIC_REAL_VIDEO_OWNERS aa2fa9a1-afb1-4b01-8646-94a0cb272b57
+               # Pre-aceptación V2 (decisión del owner): V2 solo para el owner de prueba,
+               # entrega de video por YouTube y reglas de Manifest v2 (estos dos últimos
+               # solo si faltan). DYNAMIC_COHERENCE_LLM NO se agrega (queda OFF).
+               ensure_env_list_contains DYNAMIC_V2_ALLOWED_OWNERS aa2fa9a1-afb1-4b01-8646-94a0cb272b57
+               ensure_env_default_if_absent DYNAMIC_VIDEO_DELIVERY youtube
+               ensure_env_default_if_absent DYNAMIC_MANIFEST_RULES_VERSION 2
+               if grep -q "^DYNAMIC_COHERENCE_LLM=" .env; then
+                 echo "⚠️  DYNAMIC_COHERENCE_LLM está en el .env de staging — no se toca (la decisión de pre-aceptación es dejarlo OFF)"
+               else
+                 echo "✓ DYNAMIC_COHERENCE_LLM ausente (OFF)"
+               fi
 
                echo "━━━ [1/6] Instalar dependencias de producción ━━━"
                npm install --omit=dev

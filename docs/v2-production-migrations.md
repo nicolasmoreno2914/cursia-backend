@@ -177,6 +177,32 @@ Notas:
   antes de B1 lo reporta como "CHECK de production_jobs … NO coinciden".
 - No mergear si A4 no terminó en exit 0: con el código V2 en `main` y el
   esquema viejo, el legacy entero falla con 42703.
+- **HD-6 (decisión del owner):** desde B1, `deploy.yml` arranca/recarga
+  también `cursia-dynamic-item-worker` y `cursia-dynamic-package-worker` con
+  PM2 (mismo `ensure_pm2_process` y mismo `.env` que los demás workers). Con
+  `DYNAMIC_COURSE_STRUCTURE` ausente/`false` quedan **inactivos**: no abren
+  conexión a la DB, no reclaman jobs, no entran en loop de restart y salen con
+  `0` ante SIGTERM. En el paso C, el `pm2 restart --update-env` de todos los
+  procesos los activa. Lo prueba `scripts/check-deploy-dynamic-workers.js`
+  (workers compilados contra un Postgres falso + `deploy.yml` = `origin/main`
+  + exactamente esas 2 líneas; base configurable con `DEPLOY_YML_BASE_REF`).
+  - **Flag antes de A4 (M5):** nunca poner `DYNAMIC_COURSE_STRUCTURE=true`
+    antes de que A4 termine en exit 0. Si pasa igual, los workers ya no entran
+    en crash-loop: ante `42P01` (tabla V2 inexistente) loguean UN error claro
+    ("esquema V2 ausente …"), quedan inactivos y re-chequean cada
+    `DYNAMIC_WORKER_SCHEMA_RECHECK_MS` (default 5 min); al aparecer el esquema
+    retoman solos. El backend HTTP sí fallaría en las rutas V2 → corregir el
+    orden igual.
+  - **Memoria en reposo (M1):** cada worker dinámico inactivo ocupa ≈128 MB
+    de RSS (importa `AppModule` antes del gate) + ≈40-50 MB del wrapper `npm`
+    de `pm2 start npm` → ≈350 MB en total sin hacer nada. Revisar `free -m`
+    en el VPS antes de B1. Si sobra poco: leer el flag antes de importar
+    `AppModule`, o arrancar con `pm2 start dist/workers/…js` (sin npm).
+  - **Check estricto de `deploy.yml` (M7):** `check-deploy-dynamic-workers.js`
+    exige `deploy.yml` = `origin/main` + las 2 líneas (+ IPs de comentarios
+    reemplazadas por `<VPS_HOST>`). Cualquier cambio legítimo posterior de
+    `deploy.yml` (p. ej. un hotfix) necesita `DEPLOY_YML_BASE_REF=<ref>` o
+    actualizar el check; tras el merge, la comparación pasa a ser identidad.
 
 ## Guardas (todas antes de conectar)
 
@@ -262,7 +288,7 @@ El VPS tiene el código de `main` (sin este runner). Se usa un directorio
 claves `DB_*` del `.env` de producción vía `--env-file`):
 
 ```bash
-ssh cursia@167.86.98.162
+ssh cursia@<VPS_HOST>
 git clone --branch <rama-de-release> --single-branch <url del repo orbia-backend> ~/cursia-v2-migrate
 cd ~/cursia-v2-migrate && git checkout <sha de release> && npm ci --omit=dev
 node scripts/prod/migrate-v2-production.js --env-file /var/www/cursia-backend/.env   # dry-run; anotar "Plan sha256"
@@ -572,3 +598,100 @@ node scripts/ops/v2-health-report.js --env-file .env --expect-ref hriwbakbuypaio
 ```
 
 Antes de migrar, el reporte no falla: marca las métricas de items como n/a.
+
+## Protección de ramas y CODEOWNERS (pre-aceptación V2)
+
+`.github/CODEOWNERS` asigna a `@nicolasmoreno2914` los archivos de
+release/producción: `.github/workflows/**`, `scripts/prod/**`,
+`scripts/lib/**`, `scripts/migrate-*.js`, `scripts/ops/**`,
+`scripts/deploy.sh`, `scripts/check-*.js`, `package.json`,
+`package-lock.json`, `supabase-migration-*.sql`,
+`docs/v2-production-migrations.md`, `test/e2e-v2/**` (y el propio
+CODEOWNERS). `scripts/release/**` no existe todavía; se agrega cuando exista.
+
+**Estado verificado (solo lectura, 2026-09-25):**
+
+```bash
+gh api repos/nicolasmoreno2914/cursia-backend/rulesets            # → 200 []  (ningún ruleset)
+gh api repos/nicolasmoreno2914/cursia-backend/branches/main/protection  # → 404 "Branch not protected"
+gh repo view nicolasmoreno2914/cursia-backend --json visibility   # → PUBLIC (plan de la cuenta: free)
+```
+
+- La premisa de que el repo es privado y que los rulesets no están
+  disponibles en el plan actual **no se cumple**: el repo es **público**, y
+  en repos públicos los rulesets y la branch protection **sí** están
+  disponibles en el plan free (la API respondió 200, lista vacía). Si el repo
+  pasa a privado en el plan free, esas APIs dejan de estar disponibles
+  (requieren Pro/Team) y vale la nota original.
+- Hoy **no hay ninguna regla** en `main` ni en `staging`: CODEOWNERS solo pide
+  review automáticamente; no bloquea ningún merge ni push. Nada de esto se
+  cambió desde acá: aplicar (o no) el ruleset es decisión del owner.
+- Límite importante: los agentes operan con la cuenta del owner. Cualquier
+  regla que el owner pueda saltear (admin bypass) también la pueden saltear
+  esos agentes; y "require review from Code Owners" bloquea los PRs que abre
+  la misma cuenta (nadie puede aprobar su propio PR). Por eso el ruleset
+  recomendado exige PR + checks + sin force-push/borrado, y deja la review
+  de Code Owners en `false` mientras haya un único colaborador.
+
+**Ruleset recomendado** (aplicar cuando el owner lo decida, p. ej.
+`gh api -X POST repos/nicolasmoreno2914/cursia-backend/rulesets --input ruleset.json`):
+
+```json
+{
+  "name": "protect-main-staging",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": { "include": ["refs/heads/main", "refs/heads/staging"], "exclude": [] }
+  },
+  "bypass_actors": [],
+  "rules": [
+    { "type": "deletion" },
+    { "type": "non_fast_forward" },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_approving_review_count": 0,
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": false,
+        "require_last_push_approval": false,
+        "required_review_thread_resolution": false
+      }
+    }
+  ]
+}
+```
+
+Ojo: la regla `pull_request` también prohíbe el push directo a `staging`
+(hoy el flujo de aceptación pushea a `staging` directo); si se quiere
+conservar ese flujo, dejar `staging` solo con `deletion` + `non_fast_forward`
+en un segundo ruleset.
+
+Con un segundo colaborador con permisos de escritura, subir
+`required_approving_review_count` a `1` y `require_code_owner_review` a
+`true` (ahí CODEOWNERS pasa a bloquear). Un check de estado requerido
+(`required_status_checks`) solo tiene sentido cuando exista un workflow de CI
+en PRs (hoy los `scripts/check-*.js` corren en `deploy-staging.yml`, al
+pushear a `staging`, no en PRs).
+
+### Exposición del repo público (M6)
+
+La IP del VPS se quitó de los comentarios y docs de esta rama (placeholder
+`<VPS_HOST>`; los workflows toman el host del secret `VPS_HOST`, sin cambio
+de comportamiento). **Sigue en el historial de git** (commits anteriores y
+`main` hasta el merge). Recomendado al owner: correr una vez un escaneo de
+secretos sobre TODO el historial (p. ej. `gitleaks detect --source . --log-opts="--all"`),
+confirmar SSH solo con clave + fail2ban en el VPS, y decidir la visibilidad
+(privado en plan free = sin rulesets; público = aplicar el ruleset de arriba).
+
+## Allow-list de staging (M2)
+
+El paso [0b] de `deploy-staging.yml` agrega el owner de prueba
+`aa2fa9a1-afb1-4b01-8646-94a0cb272b57` a `DYNAMIC_V2_ALLOWED_OWNERS`. Si la
+clave NO existía, staging pasa de "V2 para todas las cuentas" a "V2 SOLO para
+ese owner": cualquier otra cuenta (segundo tester,
+`scripts/verify-course-structure-fase2.js` con su `TEST_OWNER_ID` por
+defecto) recibe 403 en las rutas V2 y vuelve a ver solo legacy. Para
+habilitar otra cuenta: agregar su UUID a mano a la lista en el `.env` de
+staging y `pm2 restart --update-env`. Sus cursos legacy con gemelo V2 (abiertos
+alguna vez en «Estructura») conservan el audio legacy (fix I1).

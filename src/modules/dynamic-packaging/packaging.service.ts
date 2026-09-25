@@ -4,7 +4,7 @@ import { ACTIVE_RUN_WORKER_STATUSES } from '../dynamic-generation/item-transitio
 import { DataSource } from 'typeorm';
 import { GenerationManifestsService, ManifestDto } from '../generation-manifests/generation-manifests.service';
 import { ArtifactsService } from '../artifacts/artifacts.service';
-import { resolveRunArtifacts } from './artifact-resolver';
+import { MOCK_VIDEO_NOT_PACKAGEABLE, resolveRunArtifacts } from './artifact-resolver';
 import { PackagingNotReadyError } from './packaging-types';
 import { frozenVideoDeliveryOf, youtubeDeliveryProblems } from '../dynamic-generation/dynamic-video-delivery';
 import { packageReuseHash, resolveDynamicMoodleVersion, sortedArtifactIds } from './packaging-reuse-key';
@@ -320,7 +320,7 @@ export class PackagingService {
     const videoMode = run.input_payload?.videoMode;
     if (hasVideoItem && videoMode !== 'real') {
       throw new ConflictException({
-        message: `run con videos simulados: no empaquetable (videoMode=${videoMode ?? 'mock'}). Solo se empaquetan runs generados con videoMode='real'.`,
+        message: `${MOCK_VIDEO_NOT_PACKAGEABLE}: run con videos simulados: no empaquetable (videoMode=${videoMode ?? 'mock'}). Solo se empaquetan runs generados con videoMode='real'.`,
         missing: [],
       });
     }

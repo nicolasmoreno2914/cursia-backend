@@ -21,6 +21,7 @@ import { CreateFullCourseJobDto } from './dto/create-full-course-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
 import { UpdateStepDto } from './dto/update-step.dto';
 import { EventsService } from '../../events/events.service';
+import { assertLegacyAudioAllowed } from './legacy-audio-guard';
 
 /** Pasos estándar del pipeline (matching CP_STEP_DEFS en 31-course-production.js) */
 const STANDARD_STEPS = [
@@ -466,6 +467,15 @@ export class ProductionJobsService implements OnModuleInit {
     if (dto.retries !== undefined) step.retries = dto.retries;
 
     return this.stepRepo.save(step);
+  }
+
+  /**
+   * 409 `v2_course_legacy_audio_disabled:` si `rawCourseId` es un curso V2
+   * (structure_version='dynamic') del owner. Usado por toda ruta/worker que
+   * pueda producir audio legacy (OpenAI TTS). Ver legacy-audio-guard.ts.
+   */
+  async assertLegacyAudioAllowedForCourse(ownerId: string, rawCourseId: unknown): Promise<void> {
+    await assertLegacyAudioAllowed((sql, params) => this.dataSource.query(sql, params), ownerId, rawCourseId);
   }
 
   // ── CREATE ──────────────────────────────────────────────────────────────────
@@ -1221,6 +1231,8 @@ export class ProductionJobsService implements OnModuleInit {
     if (!dto.courseId) {
       throw new BadRequestException('courseId is required');
     }
+    // Decisión del owner (V2): un curso dynamic nunca genera audio legacy → 409 antes de todo.
+    await this.assertLegacyAudioAllowedForCourse(ownerId, dto.courseId);
 
     const sanitizedPayload = this.sanitizePayload({
       courseId: dto.courseId,
@@ -2781,6 +2793,11 @@ export class ProductionJobsService implements OnModuleInit {
     dto: CreateFullCourseJobDto,
   ): Promise<{ ok: true; jobId: string; status: string; workerStatus: string; executionMode: string; currentStep: string; resumed?: boolean }> {
     if (!dto.courseId) throw new BadRequestException('courseId is required');
+    // Decisión del owner (V2): el job maestro genera audio legacy salvo
+    // generateAudio=false → con un curso dynamic, 409 antes de crear nada.
+    if ((dto.options as Record<string, any> | undefined)?.generateAudio !== false) {
+      await this.assertLegacyAudioAllowedForCourse(ownerId, dto.courseId);
+    }
 
     const rawCourseId    = dto.courseId;
     const numericCourseId = rawCourseId ? parseInt(rawCourseId, 10) : NaN;
@@ -3018,6 +3035,10 @@ export class ProductionJobsService implements OnModuleInit {
     if (job.ownerId !== userId) return { ok: false, reason: 'forbidden' };
     if (job.executionMode !== 'course_full_generation') return { ok: false, reason: 'not_a_full_course_job' };
     if (this.isCancelledLike(job)) return { ok: false, reason: 'job_cancelled' };
+    // Decisión del owner (V2): reencolar el job maestro volvería a generar audio legacy.
+    if ((job.inputPayload?.options as Record<string, any> | undefined)?.generateAudio !== false) {
+      await this.assertLegacyAudioAllowedForCourse(userId, job.frontendCourseId ?? job.courseId);
+    }
 
     const retryableStatuses = ['failed_retryable', 'failed', 'needs_reconnect', 'blocked_quota', 'failed_recoverable'];
     if (!retryableStatuses.includes(job.status)) {

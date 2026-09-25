@@ -34,7 +34,7 @@ El usuario final es un docente, empresa o institución que necesita transformar 
 ### Backend (cursia-backend)
 - **Estado: ✅ EN PRODUCCIÓN + QA VALIDADO** — `https://api.cursia.nomaddi.com`
 - Repo: `orbia-backend` / rama: `main`
-- PM2: ✅ `cursia-backend` online — `167.86.98.162:3000` — 0 restarts, ~110MB RAM
+- PM2: ✅ `cursia-backend` online — `<VPS_HOST>:3000` — 0 restarts, ~110MB RAM
 - Nginx: ✅ reverse proxy activo — syntax OK
 - SSL: ✅ Let's Encrypt — expira 2026-08-22, auto-renewal habilitado
 - Supabase DB: ✅ conectada — seeds corrieron (11 cost_rates, 7 benchmarks)
@@ -44,7 +44,7 @@ El usuario final es un docente, empresa o institución que necesita transformar 
 - CI/CD GitHub Actions: ⏳ workflow listo, pendiente configurar secrets en GitHub
 
 ### VPS Contabo
-- **IP pública**: `167.86.98.162`
+- **IP pública**: `<VPS_HOST>`
 - **Tipo**: Cloud VPS 20 SSD — Ubuntu 24.04.4 LTS
 - **Usuario app**: `cursia` (sudo, SSH key only)
 - **App path**: `/var/www/cursia-backend`
@@ -62,7 +62,7 @@ El usuario final es un docente, empresa o institución que necesita transformar 
 ### Deploy
 - Frontend: ✅ Cloudflare Pages — `https://cursia.nomaddi.com`
 - Backend: ✅ VPS Contabo — `https://api.cursia.nomaddi.com` — EN PRODUCCIÓN
-- DNS: ✅ registro A `api.cursia` → `167.86.98.162` creado
+- DNS: ✅ registro A `api.cursia` → `<VPS_HOST>` creado
 - Nginx + PM2 + SSL: ✅ todo configurado y activo
 
 ---
@@ -73,7 +73,7 @@ El usuario final es un docente, empresa o institución que necesita transformar 
 |---|---|
 | Mayo 2026 | **QA producción completado** — backend validado: health, PM2, SSL, CORS, JWT, DB |
 | Mayo 2026 | **Backend en producción** — VPS Contabo configurado + Nginx + PM2 + SSL |
-| Mayo 2026 | **DNS**: registro A `api.cursia.nomaddi.com` → `167.86.98.162` creado |
+| Mayo 2026 | **DNS**: registro A `api.cursia.nomaddi.com` → `<VPS_HOST>` creado |
 | Mayo 2026 | ElevenLabs: audio bienvenida + audiolibro implementados con guard MBZ/curso |
 | Mayo 2026 | MBZ: sanitización de `src="#audio"` — elimina placeholder falso del export |
 | Mayo 2026 | Admin Dashboard D0: UsageEvents, CostRates, Benchmarks, SuperAdminGuard |

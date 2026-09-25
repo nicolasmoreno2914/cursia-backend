@@ -10,8 +10,8 @@
 | Tarea | Prioridad | Estado | Riesgo si no se hace | Próxima acción |
 |---|---|---|---|---|
 | Ejecutar SCHEMA_SUPABASE.sql v1.1 en Supabase | 🔴 Alta | ✅ Completado | — | — |
-| Configurar VPS `167.86.98.162` (usuario, firewall, Node 22, PM2) | 🔴 Alta | ✅ Completado | — | — |
-| Crear DNS `api.cursia → 167.86.98.162` | 🔴 Alta | ✅ Completado | — | — |
+| Configurar VPS `<VPS_HOST>` (usuario, firewall, Node 22, PM2) | 🔴 Alta | ✅ Completado | — | — |
+| Crear DNS `api.cursia → <VPS_HOST>` | 🔴 Alta | ✅ Completado | — | — |
 | Crear `.env` en VPS con valores reales | 🔴 Alta | ✅ Completado | — | — |
 | Certbot SSL para `api.cursia.nomaddi.com` | 🔴 Alta | ✅ Completado | — | — |
 | Validar endpoints en producción (QA) | 🔴 Alta | ✅ Completado | — | — |
