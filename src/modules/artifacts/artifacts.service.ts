@@ -35,6 +35,23 @@ export interface UploadBufferArtifactInput {
   storageProvider?: string;
 }
 
+/**
+ * Headers para llamar a Supabase (Storage REST) con la clave de servicio.
+ * Las claves nuevas de Supabase (`sb_secret_…`) no son JWT y el gateway solo
+ * las reconoce en el header `apikey`; con solo `Authorization: Bearer` la
+ * firma/subida falla (hallazgo de la aceptación real de Fase 5A en staging:
+ * getDownloadUrl caía a method='frontend' y el worker de video no podía leer
+ * el contenido). Enviar ambos headers es válido también para la clave
+ * clásica (JWT service_role), así que el comportamiento con claves JWT no
+ * cambia.
+ */
+export function supabaseServiceHeaders(serviceKey: string): Record<string, string> {
+  return {
+    apikey: serviceKey,
+    Authorization: `Bearer ${serviceKey}`,
+  };
+}
+
 @Injectable()
 export class ArtifactsService {
   private readonly logger = new Logger(ArtifactsService.name);
@@ -88,7 +105,7 @@ export class ArtifactsService {
     const response = await fetch(uploadUrl, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${serviceKey}`,
+        ...supabaseServiceHeaders(serviceKey),
         'Content-Type': input.mimeType ?? 'application/json',
         'x-upsert': input.upsert === false ? 'false' : 'true',
       },
@@ -137,7 +154,7 @@ export class ArtifactsService {
     const response = await fetch(uploadUrl, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${serviceKey}`,
+        ...supabaseServiceHeaders(serviceKey),
         'Content-Type': input.mimeType,
         'x-upsert': 'true',
       },
@@ -238,7 +255,7 @@ export class ArtifactsService {
       const response = await fetch(signUrl, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${serviceKey}`,
+          ...supabaseServiceHeaders(serviceKey),
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ expiresIn: expiresInSeconds }),
@@ -305,7 +322,7 @@ export class ArtifactsService {
         const deleteUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/${artifact.storageBucket}/${artifact.storagePath}`;
         const res = await fetch(deleteUrl, {
           method: 'DELETE',
-          headers: { 'Authorization': `Bearer ${serviceKey}` },
+          headers: supabaseServiceHeaders(serviceKey),
         });
         if (!res.ok) {
           this.logger.warn(`Storage delete failed for ${artifact.storagePath}: ${res.status}`);
