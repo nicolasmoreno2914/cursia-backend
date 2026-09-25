@@ -201,7 +201,24 @@ export class RunsService {
     this.assertRequiredContext(context);
     const contextHash = canonicalContextHash(context);
     const videoMode = this.normalizeVideoMode((courseContext as any)?.videoMode);
+    return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, true);
+  }
 
+  /**
+   * Cuerpo de startRun. `mayRetry`: carrera en la que otro POST commitea su
+   * run (con items) entre nuestras lecturas y assertNoPreviousItems — en vez
+   * de un 409 "terminada" engañoso, se re-resuelve UNA vez contra ese run.
+   */
+  private async resolveOrCreateRun(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+    manifest: ManifestDto,
+    context: Record<string, any>,
+    contextHash: string,
+    videoMode: RunVideoMode,
+    mayRetry: boolean,
+  ): Promise<StartRunResult> {
     const active = await this.findActiveRunRow(manifest.id);
     if (active) return this.existingRunOrConflict(active, manifest, contextHash, videoMode);
 
@@ -232,7 +249,12 @@ export class RunsService {
     }
 
     // Respaldo: items generation 1 sin run visible no deberían existir (FK
-    // cascade), pero nunca se siembra encima de items ajenos.
+    // cascade), pero nunca se siembra encima de items ajenos. Si aparecen es
+    // casi siempre la carrera "otro POST commiteó entre nuestras lecturas":
+    // si ahora hay un run visible, se re-resuelve contra él (una vez).
+    if (mayRetry && (await this.hasPreviousItems(manifest)) && (await this.findLatestRunRow(manifest.id))) {
+      return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, false);
+    }
     await this.assertNoPreviousItems(manifest);
 
     const [course] = await this.dataSource.query(
@@ -594,12 +616,16 @@ export class RunsService {
     return job.id;
   }
 
-  private async assertNoPreviousItems(manifest: ManifestDto): Promise<void> {
+  private async hasPreviousItems(manifest: ManifestDto): Promise<boolean> {
     const [{ n }] = await this.dataSource.query(
       `select count(*)::int as n from public.generation_item_runs where manifest_id = $1 and generation = $2`,
       [manifest.id, GENERATION],
     );
-    if (n > 0) {
+    return n > 0;
+  }
+
+  private async assertNoPreviousItems(manifest: ManifestDto): Promise<void> {
+    if (await this.hasPreviousItems(manifest)) {
       throw new ConflictException(
         `Ya existe una ejecución terminada para este Manifest (#${manifest.id}); usar reintentar items ` +
           '(re-ejecutar un Manifest completo es regeneración, fuera de 5A)',
