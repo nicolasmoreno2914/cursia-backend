@@ -3,7 +3,7 @@ import { DataSource } from 'typeorm';
 import { GenerationManifestsService, ManifestDto } from '../generation-manifests/generation-manifests.service';
 import { ArtifactsService } from '../artifacts/artifacts.service';
 import { resolveRunArtifacts } from './artifact-resolver';
-import { sortedArtifactIds, sourceIdsHash } from './packaging-reuse-key';
+import { packageReuseHash, resolveDynamicMoodleVersion, sortedArtifactIds } from './packaging-reuse-key';
 import { DYNAMIC_MBZ_BUILDER_VERSION } from '../../package/dynamic-mbz-builder';
 
 export const EXECUTION_MODE = 'dynamic_package';
@@ -123,7 +123,11 @@ export class PackagingService {
     try {
       const byItem = await resolveRunArtifacts({ query: this.dataSource.query.bind(this.dataSource) }, run.id, manifest.manifest);
       const ids = sortedArtifactIds(byItem);
-      const currentHash = sourceIdsHash(DYNAMIC_MBZ_BUILDER_VERSION, ids);
+      // I3 (review-it2): misma clave que el worker (incluye la versión de
+      // Moodle resuelta; idéntica a la de antes con la versión default). Un
+      // DYNAMIC_MBZ_MOODLE_VERSION inválido lanza acá → no se reusa → el job
+      // nuevo falla ruidoso en el worker con el mensaje de config.
+      const currentHash = packageReuseHash(DYNAMIC_MBZ_BUILDER_VERSION, ids, resolveDynamicMoodleVersion().resolved);
       return currentHash === existing.output_summary?.sourceIdsHash;
     } catch (err) {
       // Si el run ya no resuelve limpio (p.ej. artifacts borrados), no se
