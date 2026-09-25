@@ -9,6 +9,7 @@ import { GenerationManifestsService, ManifestDto } from '../modules/generation-m
 import { CourseBlueprintsService } from '../modules/course-blueprints/course-blueprints.service';
 import { buildPackagingPlan } from '../modules/dynamic-packaging/packaging-plan';
 import { loadArtifactText, loadRunVideoDelivery, parseDynamicVideo, resolveRunArtifacts } from '../modules/dynamic-packaging/artifact-resolver';
+import { staleArtifactWarnings } from '../modules/dynamic-packaging/packaging-warnings';
 import type { VideoDeliveryStrategy } from '../modules/dynamic-generation/dynamic-video-delivery';
 import { packageReuseHash, resolveDynamicMoodleVersion, sortedArtifactIds } from '../modules/dynamic-packaging/packaging-reuse-key';
 import { reportVideoDeliveryConfigAtStartup } from '../modules/dynamic-generation/dynamic-video-delivery';
@@ -298,6 +299,9 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
     const byItem = await deps.resolveArtifacts({ query: deps.dataSource.query.bind(deps.dataSource) }, runId, manifest.manifest);
     const ids = sortedArtifactIds(byItem);
     const sourceIdsHash = packageReuseHash(DYNAMIC_MBZ_BUILDER_VERSION, ids, moodle.resolved);
+    // Fase 8: los artifacts 'stale' (STALE_NO_AUTO) se empaquetan con aviso visible.
+    const warnings = staleArtifactWarnings(byItem);
+    const warningsSummary = warnings.length > 0 ? { warnings } : {};
     if (leaseLost) return;
 
     // Restore-first: mismo runId + mismo set de artifacts de origen + misma versión -> reusar.
@@ -310,6 +314,7 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
         sourceIdsHash,
         builderVersion: DYNAMIC_MBZ_BUILDER_VERSION,
         reused: true,
+        ...warningsSummary,
       });
       if (!ok) logger.warn(`Job ${job.id}: completeJob devolvió false (lease perdida) tras reutilizar ${existing.id}`);
       return;
@@ -362,6 +367,7 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
       sourceIdsHash,
       builderVersion: DYNAMIC_MBZ_BUILDER_VERSION,
       reused: false,
+      ...warningsSummary,
     });
     if (!ok) {
       logger.warn(`Job ${job.id}: el .mbz se generó y el artifact ${artifact.id} se subió, pero completeJob devolvió false (lease perdida)`);

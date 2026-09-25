@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Not, Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { Artifact } from './entities/artifact.entity';
 import { CreateArtifactDto } from './dto/create-artifact.dto';
@@ -374,7 +374,18 @@ export class ArtifactsService {
     const supabaseUrl = this.config.get<string>('SUPABASE_URL');
     const serviceKey  = this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY');
 
-    if (supabaseUrl && serviceKey && artifact.storageProvider === 'supabase') {
+    // Fase 8: una fila "carried" (REUSE) apunta a la MISMA storage_path
+    // inmutable que la fila histórica de la que salió. Borrar una fila nunca
+    // debe borrar el objeto que otra fila sigue usando: solo se borra el
+    // objeto si ninguna otra fila de artifacts lo referencia.
+    const sharedWith = await this.artifactRepo.count({
+      where: { storageBucket: artifact.storageBucket, storagePath: artifact.storagePath, id: Not(artifact.id) },
+    });
+    if (sharedWith > 0) {
+      this.logger.log(`remove(${artifact.id}): ${sharedWith} fila(s) más usan ${artifact.storagePath}; se conserva el objeto de Storage`);
+    }
+
+    if (sharedWith === 0 && supabaseUrl && serviceKey && artifact.storageProvider === 'supabase') {
       try {
         const deleteUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/${artifact.storageBucket}/${artifact.storagePath}`;
         const res = await fetch(deleteUrl, {
