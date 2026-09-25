@@ -11,8 +11,13 @@
 /.github/CODEOWNERS                            @nicolasmoreno2914
 /.github/workflows/                            @nicolasmoreno2914
 /scripts/prod/                                 @nicolasmoreno2914
-/scripts/lib/production-jobs-constraints.js    @nicolasmoreno2914
-/scripts/migrate-production-jobs-constraints.js @nicolasmoreno2914
+/scripts/lib/                                  @nicolasmoreno2914
+/scripts/migrate-*.js                          @nicolasmoreno2914
+/scripts/ops/                                  @nicolasmoreno2914
+/scripts/deploy.sh                             @nicolasmoreno2914
 /scripts/check-*.js                            @nicolasmoreno2914
 /docs/v2-production-migrations.md              @nicolasmoreno2914
 /test/e2e-v2/                                  @nicolasmoreno2914
+/package.json                                  @nicolasmoreno2914
+/package-lock.json                             @nicolasmoreno2914
+/supabase-migration-*.sql                      @nicolasmoreno2914
