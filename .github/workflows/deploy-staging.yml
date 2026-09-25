@@ -66,6 +66,9 @@ jobs:
       - name: Check Packaging Plan determinism (Fase 5B.1)
         run: node scripts/check-packaging-plan-determinism.js
 
+      - name: Check Packaging exam/video mapping by UUID (Fase 5B.1)
+        run: node scripts/check-packaging-exam-video-mapping.js
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
