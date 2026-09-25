@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { Client } = require('pg');
+const { APPLY_STATEMENTS } = require('./lib/production-jobs-constraints');
 
 function loadEnvFile(envPath) {
   if (!fs.existsSync(envPath)) return;
@@ -38,68 +39,9 @@ async function main() {
   await client.connect();
   try {
     await client.query('begin');
-    await client.query(`
-      alter table if exists public.production_jobs
-        drop constraint if exists production_jobs_execution_mode_check;
-    `);
-    await client.query(`
-      alter table if exists public.production_jobs
-        add constraint production_jobs_execution_mode_check
-        check (
-          execution_mode in (
-            'frontend',
-            'backend_content',
-            'backend_audio',
-            'backend_videos',
-            'backend_h5p',
-            'backend_gamma',
-            'backend_package',
-            'backend_package_base',
-            'course_full_generation',
-            'backend_full_future',
-            -- Fase 5A (ejecución dinámica real): el "run" de generación es un
-            -- production_job normal con este execution_mode (spec §3.2) —
-            -- sin esto, insertar la fila del run se rechaza con 23514 antes
-            -- de siquiera llegar al índice único parcial de Task 1
-            -- (uq_dynamic_generation_active_run en
-            -- supabase-migration-dynamic-generation.sql).
-            'dynamic_generation',
-            -- Fase 5B.1 (empaquetado Moodle dinámico): el job que produce el
-            -- .mbz de un run 5A completado (spec §7/§10, plan B3). Sin esto,
-            -- insertar la fila del job en PackagingService.requestPackage se
-            -- rechaza con 23514 antes de llegar a production_jobs.
-            'dynamic_package'
-          )
-        );
-    `);
-
-    await client.query(`
-      alter table if exists public.production_jobs
-        drop constraint if exists production_jobs_worker_status_check;
-    `);
-    await client.query(`
-      alter table if exists public.production_jobs
-        add constraint production_jobs_worker_status_check
-        check (
-          worker_status is null
-          or worker_status in (
-            'queued',
-            'running',
-            'waiting_external',
-            'retrying',
-            'paused',
-            'pausing',
-            'cancelling',
-            'completed',
-            'failed',
-            'failed_recoverable',
-            'failed_retryable',
-            'needs_reconnect',
-            'blocked_quota',
-            'cancelled'
-          )
-        );
-    `);
+    // Listas y SQL: scripts/lib/production-jobs-constraints.js (fuente única,
+    // compartida con el paso 0 de scripts/prod/migrate-v2-production.js).
+    for (const stmt of APPLY_STATEMENTS) await client.query(stmt);
     await client.query('commit');
     console.log('production_jobs constraints migrated');
   } catch (err) {

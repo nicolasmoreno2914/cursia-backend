@@ -6,8 +6,19 @@
 >
 > Contexto: `campuscloud-gen/docs/autonomous-audits/audit-9-readiness.md` (G6 y
 > observabilidad) y `campuscloud-gen/docs/v2-rollout/{runbook,rollback,monitoring-and-costs}.md`.
-> Este documento cubre el **Paso 4** del runbook (migraciones de tabla V2) y la
-> parte automatizable de `monitoring-and-costs.md`.
+> Este documento cubre las migraciones de tabla V2 en producción y la parte
+> automatizable de `monitoring-and-costs.md`.
+>
+> **Release-fix C1 — SCHEMA-FIRST.** Las entities de este código mapean
+> columnas V2 en tablas COMPARTIDAS con legacy (`courses`, `course_versions`,
+> `artifacts`, `production_jobs`). Si el código V2 llega a `main` (deploy.yml →
+> `pm2 reload`) antes que el esquema, **todo el legacy** falla con `42703
+> column … does not exist` hasta migrar. Por eso el orden es: **primero el
+> runner (esquema completo), después el merge**. El runner ya no exige que
+> `deploy.yml` haya corrido: ensancha él mismo el CHECK de
+> `production_jobs.execution_mode` (paso 0). Ver [Orden de rollout](#orden-de-rollout-en-producción-schema-first).
+> El `runbook.md` del frontend (Paso 2 merge → Paso 4 migraciones) queda
+> **superado** por este orden.
 
 ## Qué hay
 
@@ -25,35 +36,35 @@ Los `scripts/migrate-*.js` de staging **no cambiaron** (siguen exigiendo
 
 ## Plan fijo (qué se aplica y en qué orden)
 
-Mismo orden que `deploy-staging.yml`. Cada archivo corre en **su propia
+Mismo orden que `deploy-staging.yml`. Cada paso corre en **su propia
 transacción**; el runner se detiene en el primer error (los pasos anteriores
 quedan commiteados — todos son idempotentes, se puede re-correr).
 
 | # | Archivo | Equivalente staging |
 |---|---|---|
+| 0 | `scripts/lib/production-jobs-constraints.js` — CHECK de `production_jobs.execution_mode` (+ `dynamic_generation`, `dynamic_package`) y `worker_status`. **Mismo SQL** que `scripts/migrate-production-jobs-constraints.js` (ambos usan esa lib). Pre-chequeo DN-6 de solo lectura antes de mutar nada; se omite (sin lock) si el CHECK ya está al día | `deploy.yml` / `deploy-staging.yml` |
 | 1 | `supabase-migration-dynamic-course-structure.sql` | paso 3 |
 | 2 | `supabase-migration-course-blueprints.sql` | 4b |
 | 3 | `supabase-migration-generation-manifests.sql` | 4e |
 | 4 | `supabase-migration-dynamic-generation.sql` | 4h |
 | 5 | `supabase-migration-dynamic-generation-v2.sql` | 4h2 |
-| 6 | `supabase-migration-invalidation.sql` (**placeholder**, Fase 8 — `carried_from_item_run_id`) | 4h3 (bloque `v2/f78-backend`) |
+| 6 | `supabase-migration-invalidation.sql` (Fase 8 — `carried_from_item_run_id`; ya integrado: `[included]`) | 4h3 |
 | 7 | `supabase-migration-storage-artifacts-policies.sql` | 4k |
 
-Después, en solo lectura: los 7 `verify-*/audit-*` de V2 en modo
-`production-readonly` + chequeo de las 4 políticas de `storage.objects`.
+Después, en solo lectura: el CHECK de `production_jobs` al día, los 7
+`verify-*/audit-*` de V2 en modo `production-readonly` y las 4 políticas de
+`storage.objects`.
 
-**Excluido a propósito:** `migrate-production-jobs-constraints.js` y
-`migrate-usage-events-costs.js` (ya los corre `deploy.yml` en cada push a
-`main`; no se duplican — el runner exige como **precondición** que el CHECK de
-`production_jobs.execution_mode` ya acepte `dynamic_generation`/`dynamic_package`),
-y las migraciones legacy (`p2-content-worker`, `brand-extraction-execution-mode`,
-`dashboard-course-costs`).
+**Excluido a propósito:** el *script* `migrate-production-jobs-constraints.js`
+no se invoca (su SQL es el paso 0; `deploy.yml` lo vuelve a correr en el merge,
+idempotente, con la misma lista), `migrate-usage-events-costs.js` (no es V2;
+lo sigue corriendo `deploy.yml`) y las migraciones legacy
+(`p2-content-worker`, `brand-extraction-execution-mode`, `dashboard-course-costs`).
 
-**Placeholder (paso 6):** mientras el bloque de Fase 8 no esté integrado en la
-rama, el archivo no existe → `--apply` se niega salvo que se pase
-`--skip-unresolved-placeholders`. Cuando se integre con ese nombre (y el `.sql`
-mencione `carried_from_item_run_id`), el paso queda incluido solo, sin tocar el
-runner. **No activar el código de Fase 8 en producción si este paso se omitió.**
+**Paso 6:** el bloque de Fase 8 ya está integrado, así que el paso queda
+`[included]` y **no** hace falta `--skip-unresolved-placeholders`. (El
+mecanismo de placeholder sigue en el runner por si se reutiliza: un paso
+`[placeholder-unresolved]` hace que `--apply` se niegue salvo ese flag.)
 
 **¿Políticas de Storage en producción? Sí.** El ejecutor dynamic de V2 (y el
 `artifactUpload` legacy de `39-brandkit.js`/`41-course-setup.js`) sube a
@@ -66,17 +77,25 @@ producción ya tiene otras, solo se suman dentro de la carpeta propia). El
 runner **imprime las políticas existentes** antes de aplicar. Si el owner
 decide no aplicarlas: `--skip-storage-policies`.
 
-## OBLIGATORIO antes de cualquier merge `staging` → `main`: chequeo pre-merge de `production_jobs` (DN-6)
+## OBLIGATORIO antes de migrar y de mergear: chequeo de `production_jobs` (DN-6)
 
-`deploy.yml` corre `scripts/migrate-production-jobs-constraints.js` (bajo
-`set -e`) en **cada** push a `main`. Ese script reconstruye los CHECK de
-`production_jobs.execution_mode` y `worker_status` con una lista fija que **no
-incluye `brand_extraction`** (nunca la incluyó; la agregó a mano
+El paso 0 del runner **y** `deploy.yml` (que corre
+`scripts/migrate-production-jobs-constraints.js` bajo `set -e` en **cada** push
+a `main`) reconstruyen los CHECK de `production_jobs.execution_mode` y
+`worker_status` con una lista fija que **no incluye `brand_extraction`** (nunca
+la incluyó; la agregó a mano
 `supabase-migration-brand-extraction-execution-mode.sql`). Si producción tiene
-cualquier fila fuera de esas listas, el `ADD CONSTRAINT` falla (23514), el
-script revierte, y el deploy aborta **después** del rsync y **antes** del
-`pm2 reload` (código nuevo en disco con procesos viejos). Por eso, **antes de
-mergear**, el owner corre esto (solo lectura) contra producción con `psql`:
+cualquier fila fuera de esas listas, el `ADD CONSTRAINT` falla (23514).
+
+- **El runner lo chequea solo** (solo lectura, antes de mutar nada): si
+  alguna fila violaría el CHECK, sale con **exit 4 sin aplicar NADA** y
+  reporta `would_violate_execution_mode=N (valor=cantidad, …)` y
+  `would_violate_worker_status=N (…)`.
+- En `deploy.yml` el mismo fallo aborta el deploy **después** del rsync y
+  **antes** del `pm2 reload` (código nuevo en disco con procesos viejos).
+
+El owner igual corre esto a mano (solo lectura) con `psql` antes del Paso A
+del rollout, para decidir DN-6 con tiempo:
 
 ```sql
 begin transaction read only;
@@ -97,26 +116,62 @@ rollback;
 
 **Resultado esperado: `would_violate_execution_mode = 0` y
 `would_violate_worker_status = 0`.** Si alguno es > 0 (típicamente filas
-`brand_extraction`), **no mergear**: resolver DN-6 primero (opción A: agregar
-`'brand_extraction'` a la lista del script y decidir el worker) en un PR
-revisado. Anotar el resultado (fecha + ambos conteos) junto al registro del
-backup. El histograma de `execution_mode` también lo imprime el runner (solo
-informativo) al hacer `--apply`.
+`brand_extraction`), **no migrar ni mergear**: resolver DN-6 primero (opción
+A: agregar `'brand_extraction'` a la lista de
+`scripts/lib/production-jobs-constraints.js` — la usan el runner y el script
+de `deploy.yml` — y decidir el worker) en un PR revisado. Anotar el resultado
+(fecha + ambos conteos) junto al registro del backup. El histograma de
+`execution_mode` también lo imprime el runner al hacer `--apply`.
 
 ## Precondiciones (el owner, antes de `--apply`)
 
 1. **Backup/PITR verificado** (runbook Paso 1.3): PITR activo en el proyecto
    `hriwbakbuypaiovvvkqh` con ventana ≥ 7 días, o `pg_dump` manual guardado y
    anotado. Solo entonces `CONFIRM_BACKUP_TAKEN=yes`.
-2. **El merge a `main` ya ocurrió y `deploy.yml` terminó en verde**
-   (`gh run list --workflow=deploy.yml --limit=1` → `completed/success`). El
-   runner lo comprueba (CHECK de `execution_mode`) y se niega si no.
-3. `DYNAMIC_COURSE_STRUCTURE` sigue en `false` en el `.env` de producción: las
-   tablas quedan creadas pero inertes hasta el Paso 5 del runbook.
+2. **El código V2 todavía NO está en `main`** (schema-first, release-fix C1).
+   El runner se corre desde un checkout del **commit de release** (el mismo que
+   después se mergea), no desde el VPS (que tiene el código de `main`, sin este
+   runner). Ya **no** hace falta que `deploy.yml` haya corrido: el paso 0
+   ensancha el CHECK. Si el runner se corre después del merge (re-apply o
+   verificación), también funciona: todo es idempotente.
+3. `DYNAMIC_COURSE_STRUCTURE` sigue en `false` (o ausente) en el `.env` de
+   producción: las tablas quedan creadas pero inertes hasta activar el flag.
 4. Ventana de bajo tráfico: los `ALTER TABLE` sobre `courses`, `artifacts` y
    `production_jobs` piden locks fuertes con `lock_timeout = 5s`; con tráfico
    pesado un paso puede fallar por timeout (sin efecto: rollback de ese paso) —
    simplemente se reintenta.
+
+## Orden de rollout en producción (schema-first)
+
+Reemplaza el orden "Paso 2 merge → Paso 3 smoke → Paso 4 migraciones" del
+`runbook.md` del frontend. Cada paso lo dispara **el owner**; ningún agente
+corre nada contra producción.
+
+| Paso | Qué | Comando / criterio de OK |
+|---|---|---|
+| A0 | Decisiones previas: DN-1..DN-6, política de Storage (sección de abajo), `.env` de producción con `DYNAMIC_COURSE_STRUCTURE` ausente/`false` | anotado |
+| A1 | DN-6 a mano (solo lectura) | SQL de la sección DN-6 → ambos conteos `0` |
+| A2 | Backup | PITR ≥ 7 días o `pg_dump` fechado → anotado |
+| A3 | Dry-run del runner desde el commit de release | `node scripts/prod/migrate-v2-production.js --env-file <env-solo-DB>` → exit 0, pasos 0..7 `[included]`, anotar `Plan sha256` |
+| A4 | **Apply** (esquema V2 completo, código todavía de `main`) | `MIGRATION_ENV=production CONFIRM_PRODUCTION_REF=hriwbakbuypaiovvvkqh CONFIRM_BACKUP_TAKEN=yes DB_SSL=true node scripts/prod/migrate-v2-production.js --env-file <env-solo-DB> --apply --i-understand-this-mutates-production --expect-plan-sha256 <sha de A3>` → `✅ APPLY + verificación read-only OK.` (exit 0) |
+| A5 | Smoke **legacy** con el código de `main` sobre el esquema nuevo | biblioteca de cursos, crear curso, un job backend corto, descargar un artifact → todo OK (esperado: solo cambios aditivos) |
+| B1 | Merge del release a `main` | `deploy.yml` → `gh run list --workflow=deploy.yml --limit=1` = `completed/success` (su `migrate-production-jobs-constraints.js` re-aplica el mismo CHECK: idempotente) |
+| B2 | Re-verificación (solo lectura) | `MIGRATION_ENV=production CONFIRM_PRODUCTION_REF=hriwbakbuypaiovvvkqh DB_SSL=true node scripts/prod/migrate-v2-production.js --env-file <env-solo-DB> --verify-only` → exit 0 |
+| B3 | Smoke legacy con el código nuevo | mismo smoke que A5 |
+| C | Allow-list y flag (Paso 5/6 del runbook) | primero `DYNAMIC_V2_ALLOWED_OWNERS` / `DYNAMIC_REAL_VIDEO_OWNERS`, después `DYNAMIC_COURSE_STRUCTURE=true`, `pm2 restart --update-env` de **todos** los procesos |
+
+Notas:
+
+- Entre A4 y B1 el esquema V2 existe con el código de `main`: inerte (tablas
+  V2 vacías, columnas nuevas nulas o con default). Si A4 falla a mitad, los
+  pasos commiteados son igual de inertes; se corrige y se re-corre.
+- **Si hay un push a `main` entre A4 y B1** (p. ej. un hotfix), su
+  `deploy.yml` corre el `migrate-production-jobs-constraints.js` de `main`, que
+  vuelve a **angostar** el CHECK (sin `dynamic_*`). Es inofensivo con el flag
+  OFF (no hay filas dynamic) y B1 lo vuelve a ensanchar; `--verify-only`
+  antes de B1 lo reporta como "CHECK de production_jobs … NO coinciden".
+- No mergear si A4 no terminó en exit 0: con el código V2 en `main` y el
+  esquema viejo, el legacy entero falla con 42703.
 
 ## Guardas (todas antes de conectar)
 
@@ -182,10 +237,11 @@ Salida esperada (abreviada):
  Cursia V2 — migraciones de PRODUCCIÓN  [modo: DRY-RUN]
 Plan sha256: <64 hex>
 Pasos (en este orden, cada uno en su propia transacción):
+  • 0. [included] scripts/lib/production-jobs-constraints.js
   • 1. [included] supabase-migration-dynamic-course-structure.sql
        sha256 d034b197…  (4744 bytes)
   …
-  ! 6. [placeholder-unresolved] supabase-migration-invalidation.sql
+  • 6. [included] supabase-migration-invalidation.sql
   • 7. [included] supabase-migration-storage-artifacts-policies.sql
 …
 DRY-RUN: no se conectó a ninguna base.
@@ -193,26 +249,37 @@ DRY-RUN: no se conectó a ninguna base.
 
 Exit 0 (1 solo si falta un `.sql` obligatorio o alguno no es transaccional).
 
-### 2a. Apply desde el VPS (opción recomendada: usa el `.env` de producción que ya existe)
+### 2a. Apply ANTES del merge, desde un checkout del commit de release (recomendado)
+
+El VPS tiene el código de `main` (sin este runner). Se usa un directorio
+**aparte** — nunca `/var/www/cursia-backend` (lo pisa `deploy.yml` con
+`rsync --delete`). Opción VPS (la red ya llega a la DB; reutiliza solo las
+claves `DB_*` del `.env` de producción vía `--env-file`):
 
 ```bash
 ssh cursia@167.86.98.162
-cd /var/www/cursia-backend            # VPS_PATH de deploy.yml
-node scripts/prod/migrate-v2-production.js --env-file .env          # dry-run primero; anotar "Plan sha256"
+git clone --branch <rama-de-release> --single-branch <url del repo orbia-backend> ~/cursia-v2-migrate
+cd ~/cursia-v2-migrate && git checkout <sha de release> && npm ci --omit=dev
+node scripts/prod/migrate-v2-production.js --env-file /var/www/cursia-backend/.env   # dry-run; anotar "Plan sha256"
 MIGRATION_ENV=production \
 CONFIRM_PRODUCTION_REF=hriwbakbuypaiovvvkqh \
 CONFIRM_BACKUP_TAKEN=yes \
 DB_SSL=true \
-node scripts/prod/migrate-v2-production.js --env-file .env \
+node scripts/prod/migrate-v2-production.js --env-file /var/www/cursia-backend/.env \
   --apply --i-understand-this-mutates-production \
-  --expect-plan-sha256 <sha del dry-run> \
-  [--skip-unresolved-placeholders]
+  --expect-plan-sha256 <sha del dry-run>
 ```
 
-(El código en el VPS es el de `main` desplegado por `deploy.yml`; este runner
-llega ahí con el mismo merge.)
+Alternativa: la misma secuencia desde la máquina del owner (checkout del sha
+de release, `npm ci`), con un archivo que tenga **solo** `DB_HOST`, `DB_PORT`,
+`DB_USER`, `DB_PASS`, `DB_NAME` de producción (conexión directa o pooler en
+modo sesión, 5432) pasado con `--env-file`.
 
-### 2b. Apply desde GitHub Actions (opcional)
+### 2b. Apply desde GitHub Actions (opcional, SOLO después del merge)
+
+El workflow corre únicamente desde `main`, así que **no sirve para el apply
+inicial schema-first** (el código V2 todavía no está en `main`). Sirve para
+re-verificar o re-aplicar (idempotente) después del merge.
 
 **Setup del owner (una vez, antes del primer uso — decisión D):** GitHub
 auto-crea un environment referenciado que no existe **sin** reviewers ni
@@ -252,10 +319,17 @@ MIGRATION_ENV=production CONFIRM_PRODUCTION_REF=hriwbakbuypaiovvvkqh DB_SSL=true
 ```
 🎯 Objetivo: ref hriwbakbuypaiovvvkqh (DB_HOST)
 Estado actual de tablas V2: course_modules=no, … generation_run_contexts=no
+production_jobs por execution_mode: backend_content=…, frontend=…
+CHECK de production_jobs: desactualizado (el paso 0 lo reconstruye)
+  DN-6: would_violate_execution_mode = 0, would_violate_worker_status = 0
 Políticas actuales en storage.objects (N): …
+▶ 0. scripts/lib/production-jobs-constraints.js (sha256 …)
+  ✓ commit (… ms)
 ▶ 1. supabase-migration-dynamic-course-structure.sql (sha256 d034b1978763…)
   ✓ commit (… ms)
-… (pasos 2–5, 7; el 6 "⏭️ … [placeholder-unresolved] — no se aplica" si se omitió)
+… (pasos 2–7)
+── verify: CHECK de production_jobs (read-only) ──
+  ✓ execution_mode/worker_status coinciden con scripts/lib/production-jobs-constraints.js
 ── verify: políticas de storage.objects (read-only) ──
   ✓ cursia_artifacts_insert_own_folder (INSERT, roles={authenticated}) …
 ── verify: scripts/verify-dynamic-course-structure-schema.js ──
@@ -274,7 +348,7 @@ Políticas actuales en storage.objects (N): …
 | 1 | error inesperado (p. ej. no se pudo conectar) o plan con archivo obligatorio faltante |
 | 2 | argumentos inválidos |
 | 3 | **rechazado por las guardas** (no se conectó, o se conectó y el servidor no es el esperado) |
-| 4 | apply detenido: precondición no cumplida (nada aplicado) o un paso falló (ese paso revertido; los anteriores commiteados) |
+| 4 | apply detenido: precondición no cumplida — incluido DN-6 — (nada aplicado) o un paso falló (ese paso revertido; los anteriores commiteados) |
 | 5 | migraciones aplicadas pero la **verificación falló** → no activar el flag |
 
 ## Modo `production-readonly` de los verify/audit
@@ -313,7 +387,20 @@ modo normal). El workflow fija `NODE_ENV=production`.
 ```bash
 npm ci
 node scripts/prod/test/run-local-pg-tests.js
+npm run build && node scripts/prod/test/run-legacy-app-compat-test.js   # release-fix C1
 ```
+
+`run-legacy-app-compat-test.js` (PG16 desechable, `127.0.0.1:55491`) es la
+regresión de C1 que el E2E (esquema por `synchronize`) no puede detectar:
+bootea las **entities compiladas** de esta rama contra
+`legacy-baseline.sql` (= producción pre-V2; comprueba que coincide con las
+entities de `main`), exige que las consultas legacy de
+`courses`/`course_versions`/`artifacts`/`production_jobs` **fallen con 42703**
+antes del runner y **pasen** después (sin correr antes el script de
+`deploy.yml`), que el cambio en esas tablas sea **solo aditivo** (ninguna
+columna nueva NOT NULL sin default; nada borrado ni cambiado) y que
+INSERT/UPDATE con solo las columnas de `main` sigan funcionando (código viejo
+contra esquema nuevo).
 
 Levanta un Postgres 16 desechable (`initdb --locale=C`, `127.0.0.1:55481`,
 data dir temporal, se destruye al final), carga un esquema legacy pre-V2
@@ -325,7 +412,11 @@ confirmación faltante → exit 3 sin conectar, ref de staging rechazado (runner
 verify-only, override y verify directo), guards originales de staging intactos,
 override contra un servidor con `supabase_admin` rechazado, precondición de
 `deploy.yml`, apply limpio + verificación, segundo apply idempotente (`pg_dump
--s` idéntico), datos legacy intactos, los 7 verify/audit en modo **staging**
+-s` idéntico), paso 0 schema-first (base con el CHECK de `main` → el runner lo
+ensancha, CHECK idéntico al del script de `deploy.yml`, no-op si ya está al
+día, `deploy.yml` después sin cambios, DN-6 con una fila `brand_extraction` →
+exit 4 sin aplicar nada, `--verify-only` falla si el CHECK no está al día),
+datos legacy intactos, los 7 verify/audit en modo **staging**
 con todas sus sondas de escritura pasando sobre el esquema del runner, sesión
 read-only (25006), stop en el primer error (paso 1 commiteado, paso 2 revertido
 entero, 3+ sin aplicar), y el health report (rol solo-SELECT, alertas y umbrales).
@@ -353,6 +444,34 @@ No corre en CI (necesita Postgres); no es un `check-*.js`.
   `supabase-migration-invalidation.sql` (bloque `v2/f78-backend`).
 - Políticas de Storage: `drop policy if exists cursia_artifacts_{insert,select,delete,update}_own_folder on storage.objects;`
   (solo si se decide explícitamente; rompe los uploads del ejecutor V2).
+- Código: como el esquema va primero y es solo aditivo, revertir el merge
+  (volver a `main` pre-V2) **no** exige tocar el esquema: el código de `main`
+  funciona sobre el esquema migrado (lo verifica
+  `run-legacy-app-compat-test.js`).
+
+## Decisión del owner: políticas UPDATE/DELETE de Storage (release review, Minor 3)
+
+`cursia_artifacts_update_own_folder` y `cursia_artifacts_delete_own_folder`
+dejan que el navegador de un usuario (JWT `authenticated`) **sobreescriba o
+borre cualquier objeto de su propia carpeta** de `cursia-artifacts` — incluidos
+los artifacts dynamic inmutables (`<uid>/dynamic/…`) y los `dynamic_mbz` que
+filas "carried" (REUSE, Fase 8) siguen referenciando. Eso **esquiva** la
+protección de rutas compartidas de `ArtifactsService.remove()` (que solo cubre
+el borrado vía API). Alcance: solo el contenido del propio usuario; el
+empaquetado falla ruidoso si falta una fuente (no produce un `.mbz` roto en
+silencio).
+
+Opciones (no se cambió nada; decide el owner antes del Paso A):
+
+1. **Aceptar** tal cual (estado actual; el legacy `artifactUpload` con
+   `x-upsert:true` necesita UPDATE en su carpeta).
+2. **Acotar** UPDATE/DELETE a los prefijos legacy (excluir
+   `(storage.foldername(name))[2] = 'dynamic'`), dejando INSERT/SELECT como
+   están. Requiere un `.sql` nuevo revisado y re-correr el runner.
+3. **Quitar** DELETE del rol `authenticated` (los borrados pasan solo por la
+   API con service role).
+
+Anotar la decisión junto a DN-1..DN-6.
 - Revertir el esquema completo es una decisión C/D del owner, con el backup
   del Paso 1.3 a mano.
 

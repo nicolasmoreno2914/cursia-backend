@@ -148,6 +148,9 @@ async function main() {
     await makeBaselineDb('prodlike');
     await makeBaselineDb('failstop');
     await makeBaselineDb('noconstraint', { constraints: false });
+    // Release-fix C1: producción ANTES del merge (CHECK de main, sin modos dynamic).
+    await makeBaselineDb('schemafirst', { constraints: false });
+    await makeBaselineDb('dn6', { constraints: false });
 
     const listener = await startCountingListener(LISTEN_PORT);
     try {
@@ -174,6 +177,7 @@ async function main() {
         assert(plan.connected === false && plan.mode === 'DRY-RUN', 'connected/mode');
         const files = plan.steps.map((s) => s.file);
         assert(JSON.stringify(files) === JSON.stringify([
+          'scripts/lib/production-jobs-constraints.js',
           'supabase-migration-dynamic-course-structure.sql', 'supabase-migration-course-blueprints.sql',
           'supabase-migration-generation-manifests.sql', 'supabase-migration-dynamic-generation.sql',
           'supabase-migration-dynamic-generation-v2.sql', 'supabase-migration-invalidation.sql',
@@ -183,8 +187,11 @@ async function main() {
           assert(h === s.sha256, `sha256 de ${s.file}`);
           assert(s.transactional === true, `${s.file} no transaccional`);
         }
-        assert(!files.includes('scripts/migrate-production-jobs-constraints.js'), 'no debe duplicar deploy.yml');
+        assert(!files.includes('scripts/migrate-production-jobs-constraints.js'), 'no invoca el script de deploy.yml (usa su lib)');
         assert(plan.excluded.some((e) => /production-jobs-constraints/.test(e.file)), 'exclusión documentada');
+        const s0 = plan.steps[0];
+        assert(s0.order === 0 && s0.id === 'production-jobs-constraints' && s0.builtin === true && s0.status === 'included', 'paso 0: ' + JSON.stringify(s0));
+        assert(!plan.preconditions.some((p) => /deploy\.yml ya corrió/.test(p)), 'la precondición "deploy.yml ya corrió" debe haber desaparecido (C1)');
       });
       await test('placeholder Fase 8 (M1): [included] si supabase-migration-invalidation.sql existe, [placeholder-unresolved] si no', async () => {
         const res = run(RUNNER, ['--plan-json'], {}, { preload: FORBID });
@@ -356,12 +363,51 @@ async function main() {
       }
     });
 
-    // ── 6. Precondición: deploy.yml no corrió → no aplica NADA ──────────
-    await test('precondición: sin el CHECK dynamic de production_jobs (deploy.yml no corrió) → exit 4, nada aplicado', async () => {
-      const res = run(RUNNER, APPLY_ARGS, overrideEnv('noconstraint'));
-      assert(res.code === 4 && /deploy\.yml/.test(res.out), `exit ${res.code}\n${res.out}`);
-      const t = await withClient('noconstraint', (c) => c.query(`select to_regclass('public.course_modules') as t`));
-      assert(t.rows[0].t === null, 'aplicó algo');
+    // ── 6. C1 schema-first: el runner ensancha el CHECK él mismo (paso 0) ─
+    const defsOf = (db) => withClient(db, async (c) => (await c.query(
+      `select conname, pg_get_constraintdef(oid) as def from pg_constraint
+        where conrelid = 'public.production_jobs'::regclass
+          and conname in ('production_jobs_execution_mode_check','production_jobs_worker_status_check') order by conname`)).rows);
+    await test('C1: base con el CHECK de main (sin modos dynamic, deploy.yml NO corrió) → el runner aplica el paso 0 + 1..7, exit 0', async () => {
+      const before = await defsOf('schemafirst');
+      assert(before.length === 2 && !before[0].def.includes('dynamic_generation'), 'fixture: ' + JSON.stringify(before));
+      const res = run(RUNNER, APPLY_ARGS, overrideEnv('schemafirst'));
+      assert(res.code === 0 && /APPLY \+ verificación read-only OK/.test(res.out), `exit ${res.code}\n${res.out}`);
+      assert(/▶ 0\. scripts\/lib\/production-jobs-constraints\.js/.test(res.out) && /desactualizado/.test(res.out), 'no se vio el paso 0\n' + res.out);
+      assert(/production-jobs-constraints/.test(res.out.split('Resumen apply:')[1] || ''), 'paso 0 no figura en el resumen');
+      const t = await withClient('schemafirst', (c) => c.query(`select to_regclass('public.course_modules') as t`));
+      assert(t.rows[0].t !== null, 'no aplicó el paso 1');
+    });
+    await test('C1: el CHECK que deja el runner es IDÉNTICO (pg_get_constraintdef) al del script real de deploy.yml', async () => {
+      const a = await defsOf('schemafirst');
+      const b = await defsOf('prodlike'); // prodlike: migrate-production-jobs-constraints.js real
+      assert(a.length === 2 && JSON.stringify(a) === JSON.stringify(b), `runner ${JSON.stringify(a)}\nscript ${JSON.stringify(b)}`);
+    });
+    await test('C1: re-correr el runner con el CHECK ya al día → paso 0 es no-op (sin ALTER), exit 0', async () => {
+      const res = run(RUNNER, APPLY_ARGS, overrideEnv('schemafirst'));
+      assert(res.code === 0 && /ya al día — sin cambios/.test(res.out), `exit ${res.code}\n${res.out}`);
+    });
+    await test('C1: deploy.yml DESPUÉS del runner (script real sobre la base ya migrada) → exit 0 y mismo CHECK', async () => {
+      const before = await defsOf('schemafirst');
+      const res = run(path.join(REPO, 'scripts/migrate-production-jobs-constraints.js'), [], localEnv('schemafirst'));
+      assert(res.code === 0, res.out);
+      assert(JSON.stringify(await defsOf('schemafirst')) === JSON.stringify(before), 'cambió el CHECK');
+    });
+    await test('C1/DN-6: una fila que violaría el CHECK nuevo (brand_extraction) → exit 4, reporte claro, NADA aplicado (ni el paso 0)', async () => {
+      await withClient('dn6', (c) => c.query(`
+        alter table production_jobs drop constraint production_jobs_execution_mode_check;
+        insert into production_jobs (owner_id, execution_mode, status) values ('u', 'brand_extraction', 'queued');`));
+      const res = run(RUNNER, APPLY_ARGS, overrideEnv('dn6'));
+      assert(res.code === 4, `exit ${res.code}\n${res.out}`);
+      assert(/DN-6/.test(res.out) && /would_violate_execution_mode=1 \(brand_extraction=1\)/.test(res.out) && /would_violate_worker_status=0/.test(res.out), 'reporte DN-6\n' + res.out);
+      assert(/no se aplicó NADA/.test(res.out), res.out);
+      const t = await withClient('dn6', (c) => c.query(`select to_regclass('public.course_modules') as t,
+        (select count(*) from pg_constraint where conname = 'production_jobs_execution_mode_check')::int as ck`));
+      assert(t.rows[0].t === null && t.rows[0].ck === 0, 'aplicó algo: ' + JSON.stringify(t.rows[0]));
+    });
+    await test('C1: --verify-only falla (exit 5) si el CHECK de production_jobs no acepta los modos dynamic', async () => {
+      const res = run(RUNNER, ['--verify-only', '--test-allow-local-target'], overrideEnv('noconstraint', { CONFIRM_BACKUP_TAKEN: undefined }));
+      assert(res.code === 5 && /CHECK de production_jobs/.test(res.out), `exit ${res.code}\n${res.out}`);
     });
 
     // ── 7. Apply limpio + verify + idempotencia ─────────────────────────

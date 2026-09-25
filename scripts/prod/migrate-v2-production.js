@@ -34,16 +34,33 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 const target = require('../lib/v2-production-target');
+const pjConstraints = require('../lib/production-jobs-constraints');
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 const TOOL_VERSION = 1;
 
 // ── Plan FIJO ──────────────────────────────────────────────────────────────
-// Mismo orden que deploy-staging.yml (pasos 3, 4b, 4e, 4h, 4h2, [4h3], 4k).
-// production_jobs constraints y usage_events/cost_rates NO están acá: los
-// aplica deploy.yml en cada push a main (migrate-production-jobs-constraints.js
-// y migrate-usage-events-costs.js) — el runner solo verifica como
-// PRECONDICIÓN que el CHECK de execution_mode ya acepte los modos dynamic.
+// Release-fix C1 (schema-first): TODO el esquema V2 se aplica en producción
+// ANTES de mergear el código V2 a main (con el código V2 corriendo contra el
+// esquema viejo, TypeORM falla con 42703 en courses/course_versions/artifacts/
+// production_jobs). Por eso el runner ya NO exige que deploy.yml haya
+// ensanchado antes el CHECK de production_jobs: lo hace él mismo como PASO 0,
+// con el MISMO SQL que scripts/migrate-production-jobs-constraints.js (fuente
+// única: scripts/lib/production-jobs-constraints.js) y con el pre-chequeo DN-6
+// (solo lectura): si alguna fila existente violaría el CHECK nuevo, se niega
+// sin aplicar NADA y reporta los valores ofensores. deploy.yml vuelve a correr
+// el mismo SQL en el merge (idempotente, misma lista).
+// Pasos 1..7: mismo orden que deploy-staging.yml (3, 4b, 4e, 4h, 4h2, 4h3, 4k).
+// usage_events/cost_rates (migrate-usage-events-costs.js) no es V2: lo sigue
+// aplicando deploy.yml.
+const CONSTRAINTS_STEP = {
+  id: 'production-jobs-constraints',
+  file: 'scripts/lib/production-jobs-constraints.js',
+  builtin: true,
+  stagingStep: 'deploy.yml / deploy-staging.yml (migrate-production-jobs-constraints.js)',
+  summary: 'CHECK de production_jobs.execution_mode (+ dynamic_generation, dynamic_package) y worker_status — mismo SQL que migrate-production-jobs-constraints.js; pre-chequeo DN-6 de solo lectura; se omite si ya está al día',
+};
+
 const MIGRATION_STEPS = [
   {
     id: 'dynamic-course-structure',
@@ -121,7 +138,7 @@ const VERIFY_SCRIPTS = [
 ];
 
 const EXCLUDED = [
-  { file: 'scripts/migrate-production-jobs-constraints.js', reason: 'ya lo corre deploy.yml en cada push a main (no se duplica); es PRECONDICIÓN verificada por este runner' },
+  { file: 'scripts/migrate-production-jobs-constraints.js', reason: 'no se invoca: su SQL (scripts/lib/production-jobs-constraints.js) es el PASO 0 de este runner; deploy.yml lo re-aplica igual en el merge (idempotente)' },
   { file: 'scripts/migrate-usage-events-costs.js', reason: 'ya lo corre deploy.yml en cada push a main; no es V2' },
   { file: 'supabase-migration-p2-content-worker.sql', reason: 'legacy (P2.1), ya aplicada en producción' },
   { file: 'supabase-migration-brand-extraction-execution-mode.sql', reason: 'legacy, no V2' },
@@ -200,8 +217,25 @@ function sha256(buf) {
   return crypto.createHash('sha256').update(buf).digest('hex');
 }
 
+function buildConstraintsStep() {
+  const buf = fs.readFileSync(path.join(REPO_ROOT, CONSTRAINTS_STEP.file));
+  return {
+    order: 0,
+    id: CONSTRAINTS_STEP.id,
+    file: CONSTRAINTS_STEP.file,
+    builtin: true,
+    stagingEquivalent: CONSTRAINTS_STEP.stagingStep,
+    summary: CONSTRAINTS_STEP.summary,
+    status: 'included',
+    sha256: sha256(buf),
+    bytes: buf.length,
+    transactional: true,
+    problems: [],
+  };
+}
+
 function buildPlan(opts) {
-  const steps = MIGRATION_STEPS.map((s, idx) => {
+  const sqlSteps = MIGRATION_STEPS.map((s, idx) => {
     const abs = path.join(REPO_ROOT, s.file);
     const step = {
       order: idx + 1,
@@ -243,6 +277,7 @@ function buildPlan(opts) {
     for (const p of nonTx) step.problems.push('no transaccional: ' + p.why);
     return step;
   });
+  const steps = [buildConstraintsStep(), ...sqlSteps];
 
   const applicable = steps.filter((s) => s.status === 'included');
   const planSha256 = sha256(
@@ -256,11 +291,13 @@ function buildPlan(opts) {
     planSha256,
     steps,
     verifications: VERIFY_SCRIPTS.map((f, i) => ({ order: i + 1, script: f, mode: 'V2_VERIFY_MODE=production-readonly' }))
-      .concat(opts.skipStoragePolicies ? [] : [{ order: VERIFY_SCRIPTS.length + 1, script: '(interno) políticas de storage.objects', mode: 'read-only' }]),
+      .concat([{ order: VERIFY_SCRIPTS.length + 1, script: '(interno) CHECK de production_jobs al día', mode: 'read-only' }])
+      .concat(opts.skipStoragePolicies ? [] : [{ order: VERIFY_SCRIPTS.length + 2, script: '(interno) políticas de storage.objects', mode: 'read-only' }]),
     excluded: EXCLUDED,
     preconditions: [
       'Backup/PITR de producción verificado por el owner (CONFIRM_BACKUP_TAKEN=yes)',
-      'deploy.yml ya corrió con este código: production_jobs_execution_mode_check acepta dynamic_generation y dynamic_package',
+      'Se corre ANTES de mergear el código V2 a main (schema-first, release-fix C1), desde un checkout del commit de release',
+      'DN-6 (lo chequea el runner, solo lectura): ninguna fila de production_jobs viola los CHECK nuevos — si alguna lo hace, no se aplica NADA',
       'Existen public.courses, public.course_versions, public.artifacts, public.production_jobs',
       'Para storage: existen storage.objects, storage.foldername() y auth.uid()',
       'El servidor es Supabase (rol supabase_admin)',
@@ -329,15 +366,17 @@ async function checkPreconditions(client, { includeStorage }) {
     if (!present.has(t)) problems.push(`falta la tabla legacy public.${t} — ¿base equivocada?`);
   }
   if (present.has('production_jobs')) {
-    const { rows } = await client.query(
-      `select pg_get_constraintdef(oid) as def from pg_constraint
-        where conname = 'production_jobs_execution_mode_check' and conrelid = 'public.production_jobs'::regclass`,
-    );
-    const def = rows[0] ? rows[0].def : '';
-    if (!def.includes('dynamic_generation') || !def.includes('dynamic_package')) {
+    // DN-6 (solo lectura): el paso 0 reconstruye los CHECK; si alguna fila
+    // existente los violaría, el ADD CONSTRAINT fallaría (23514). Se detecta
+    // ACÁ, antes de mutar nada, y se reporta qué valores ofenden.
+    const v = await pjConstraints.findViolations(client);
+    if (v.wouldViolateExecutionMode > 0 || v.wouldViolateWorkerStatus > 0) {
+      const fmt = (rows) => rows.map((r) => `${r.v}=${r.n}`).join(', ');
       problems.push(
-        'production_jobs_execution_mode_check no acepta dynamic_generation/dynamic_package — ' +
-        'deploy.yml (migrate-production-jobs-constraints.js) todavía no corrió con el código V2; mergeá/deployá primero',
+        'DN-6: filas existentes de production_jobs violarían los CHECK nuevos — resolvé DN-6 antes de migrar ' +
+        '(docs/v2-production-migrations.md). ' +
+        `would_violate_execution_mode=${v.wouldViolateExecutionMode}${v.executionMode.length ? ' (' + fmt(v.executionMode) + ')' : ''}; ` +
+        `would_violate_worker_status=${v.wouldViolateWorkerStatus}${v.workerStatus.length ? ' (' + fmt(v.workerStatus) + ')' : ''}`,
       );
     }
   }
@@ -366,6 +405,13 @@ async function describeCurrentState(client, { includeStorage }) {
     `select coalesce(execution_mode, '(null)') as m, count(*)::int as n from public.production_jobs group by 1 order by 1`,
   );
   console.log('production_jobs por execution_mode: ' + (hist.rows.map((r) => `${r.m}=${r.n}`).join(', ') || '(vacía)'));
+  const cs = await pjConstraints.currentState(client);
+  console.log(`CHECK de production_jobs: ${cs.upToDate ? 'ya al día (el paso 0 se omite)' : 'desactualizado (el paso 0 lo reconstruye)'}`);
+  console.log('  DN-6: would_violate_execution_mode = 0, would_violate_worker_status = 0');
+  if (cs.removedExecutionModes.length || cs.removedWorkerStatuses.length) {
+    console.log(`  ⚠️  el CHECK actual acepta valores que la lista de este código NO incluye (sin filas que los usen; ` +
+      `deploy.yml también los quitaría): execution_mode=[${cs.removedExecutionModes.join(', ')}] worker_status=[${cs.removedWorkerStatuses.join(', ')}]`);
+  }
   if (includeStorage) {
     const pol = await client.query(
       `select policyname, cmd, roles::text as roles from pg_policies
@@ -472,10 +518,23 @@ async function applyMigrations(plan, tgt, opts) {
       }
       const t0 = Date.now();
       console.log(`▶ ${step.order}. ${step.file} (sha256 ${step.sha256.slice(0, 12)}…)`);
+      if (step.builtin) {
+        // Paso 0: no pedir ACCESS EXCLUSIVE + full scan si ya está al día.
+        const cs = await pjConstraints.currentState(client);
+        if (cs.upToDate) {
+          console.log('  ✓ CHECK de production_jobs ya al día — sin cambios');
+          applied.push({ id: step.id, file: step.file, sha256: step.sha256, ms: Date.now() - t0, noop: true });
+          continue;
+        }
+      }
       await client.query('begin');
       try {
         for (const stmt of STEP_PREAMBLE_SQL) await client.query(stmt);
-        await client.query(buf.toString('utf8'));
+        if (step.builtin) {
+          for (const stmt of pjConstraints.APPLY_STATEMENTS) await client.query(stmt);
+        } else {
+          await client.query(buf.toString('utf8'));
+        }
         await client.query('commit');
       } catch (err) {
         try { await client.query('rollback'); } catch { /* conexión rota */ }
@@ -493,6 +552,21 @@ async function applyMigrations(plan, tgt, opts) {
 }
 
 async function verifyAll(tgt, opts) {
+  {
+    const client = await connect(tgt);
+    try {
+      await target.beginReadOnlyTransaction(client);
+      console.log('\n── verify: CHECK de production_jobs (read-only) ──');
+      const cs = await pjConstraints.currentState(client);
+      console.log(`  ${cs.upToDate ? '✓' : '❌'} execution_mode/worker_status ${cs.upToDate ? 'coinciden con' : 'NO coinciden con'} scripts/lib/production-jobs-constraints.js`);
+      if (!cs.upToDate) {
+        console.error('❌ El CHECK de production_jobs no acepta los modos dynamic — re-correr --apply (paso 0).');
+        return { ok: false, results: [{ script: 'production-jobs-constraints', exitCode: 1 }] };
+      }
+    } finally {
+      await client.end();
+    }
+  }
   if (!opts.skipStoragePolicies) {
     const client = await connect(tgt);
     try {
@@ -658,4 +732,4 @@ if (require.main === module) {
   );
 }
 
-module.exports = { buildPlan, MIGRATION_STEPS, VERIFY_SCRIPTS, STEP_PREAMBLE_SQL, parseArgs };
+module.exports = { buildPlan, MIGRATION_STEPS, CONSTRAINTS_STEP, VERIFY_SCRIPTS, STEP_PREAMBLE_SQL, parseArgs };
