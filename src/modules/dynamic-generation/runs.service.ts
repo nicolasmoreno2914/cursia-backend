@@ -17,6 +17,9 @@ import { CourseContextDto, RUN_VIDEO_MODES, RunVideoMode } from './dto/course-co
 import { REQUIRED_CONTEXT_FIELDS, canonicalContextHash, itemIdempotencyKey, normalizeCourseContext } from './run-hash';
 import { VideoDeliveryStrategy, frozenVideoDeliveryOf, readVideoDeliveryConfig } from './dynamic-video-delivery';
 import { assertDynamicOwnerAllowed, assertRealVideoAllowed } from '../features/dynamic-features';
+import { FromRunDto, isFromRunRequest } from '../invalidation/dto/from-run.dto';
+import { computePlanFromDb, executeApplyWrites, planApplyWrites } from '../invalidation/invalidation-apply';
+import { requiredArtifactTypes } from '../dynamic-packaging/artifact-resolver';
 import {
   ACTIVE_RUN_WORKER_STATUSES,
   isActiveRun,
@@ -148,6 +151,8 @@ export interface StartRunResult {
   created: boolean;
   reopened: boolean;
   run: RunDto;
+  /** Fase 8: solo en runs creados con `{fromRun}` (resumen del plan aplicado). */
+  invalidation?: { fromRunId: string; planSha256: string; totals: Record<string, number> };
 }
 
 /**
@@ -222,11 +227,16 @@ export class RunsService {
     courseId: number,
     ownerId: string,
     blueprintNumber: number,
-    courseContext: CourseContextDto,
+    courseContext: CourseContextDto | FromRunDto,
   ): Promise<StartRunResult> {
     // G3: flag V2 + allow-list por owner (403 antes de tocar la DB).
     assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
+    // Fase 8 (F8-BE): `{fromRun}` crea el run B aplicando el plan de
+    // invalidación (mismo entry point → mismos gates G3 de arriba).
+    if (isFromRunRequest(courseContext)) {
+      return this.startRunFromPrevious(courseId, ownerId, blueprintNumber, manifest, courseContext.fromRun);
+    }
     const context = normalizeCourseContext(courseContext);
     this.assertRequiredContext(context);
     const contextHash = canonicalContextHash(context);
@@ -242,6 +252,169 @@ export class RunsService {
     const other = await this.findActiveRunOnOtherManifest(this.dataSource, courseId, manifest.id);
     if (other) throw this.otherActiveRunConflict(other, manifest);
     return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, true, videoDelivery);
+  }
+
+  /**
+   * Fase 8 (F8-BE, spec §4 paso 3): crea el run B sobre el Manifest destino
+   * `manifest` (Mb, el de este Blueprint) aplicando en UNA transacción el plan
+   * de invalidación calculado desde el run A (`fromRunId`):
+   * - item runs de B pre-sembrados: `completed` (con carried_from_item_run_id)
+   *   para REUSE/REVIEW/STALE_NO_AUTO, `pending` para GENERATE/REGENERATE;
+   * - por cada item reutilizado, filas de artifact NUEVAS que apuntan a la
+   *   MISMA storage_path inmutable (`metadata.carriedFrom`); STALE_NO_AUTO →
+   *   la fila nueva queda `stale` (se empaqueta con aviso);
+   * - artifacts de A: `stale` (REGENERATE/STALE_NO_AUTO) o `disabled`
+   *   (SOFT_DISABLE) con su motivo en metadata — nunca se reescribe la ruta
+   *   ni se borra una fila.
+   * B hereda de A el contexto congelado, videoMode y videoDelivery (los
+   * artifacts reutilizados se generaron con ellos).
+   *
+   * Idempotente: el mismo par (A, Mb) devuelve el mismo B (`created:false`).
+   * Gates: G3 (allow-list) ya se aplicó en startRun; video real
+   * (`assertRealVideoAllowed`) si B es 'real' y va a GENERAR/REGENERAR algún
+   * video; 409 si hay otro run activo en el curso (incluido A) o si Mb ya
+   * tiene un run que no sale de A.
+   */
+  private async startRunFromPrevious(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+    manifestB: ManifestDto,
+    fromRunId: string,
+  ): Promise<StartRunResult> {
+    const [rowA] = await this.dataSource.query(
+      `select * from public.production_jobs
+        where id = $1 and execution_mode = 'dynamic_generation' and course_id = $2 and owner_id = $3`,
+      [fromRunId, courseId, ownerId],
+    );
+    if (!rowA) throw new NotFoundException(`La ejecución de origen ${fromRunId} no existe para el curso #${courseId}`);
+    const bpNumberA = Number(rowA.input_payload?.blueprintNumber);
+    const manifestA = await this.manifests.getById(courseId, ownerId, bpNumberA, Number(rowA.input_payload?.manifestId));
+    if (manifestA.id === manifestB.id) {
+      throw new ConflictException(
+        `La ejecución ${fromRunId} ya es del Manifest #${manifestB.id}: no hay cambio de estructura que aplicar ` +
+          '(los items fallidos se reintentan con retry). runId=' + fromRunId,
+      );
+    }
+    const ctxA = await this.loadContextRow(rowA.id);
+    const videoMode = this.videoModeOf(rowA);
+    const videoDelivery = frozenVideoDeliveryOf(rowA.input_payload);
+    const [bpA, bpB] = await Promise.all([
+      this.manifests.blueprintOf(courseId, ownerId, bpNumberA),
+      this.manifests.blueprintOf(courseId, ownerId, blueprintNumber),
+    ]);
+    const [course] = await this.dataSource.query(
+      `select metadata->>'courseId' as frontend_course_id from public.courses where id = $1`,
+      [courseId],
+    );
+
+    const outcome = await this.tx(async (qr) => {
+      await this.lockCourseRuns(qr, courseId);
+      // Idempotencia: ¿Mb ya tiene un run? Si sale de A → es "el" B.
+      const [existing] = await qr.query(
+        `select id, input_payload from public.production_jobs
+          where execution_mode = 'dynamic_generation' and input_payload->>'manifestId' = $1
+          order by created_at desc, id desc limit 1`,
+        [String(manifestB.id)],
+      );
+      if (existing) {
+        if (existing.input_payload?.fromRunId === rowA.id) return { kind: 'existing' as const, jobId: existing.id as string };
+        throw new ConflictException(
+          `El Manifest #${manifestB.id} ya tiene una ejecución que no sale de ${rowA.id}; ` +
+            `no se puede crear otra. runId=${existing.id}`,
+        );
+      }
+      const other = await this.findActiveRunOnOtherManifest(qr, courseId, manifestB.id);
+      if (other) throw this.otherActiveRunConflict(other, manifestB);
+
+      const { plan } = await computePlanFromDb(qr, {
+        runA: rowA,
+        manifestA,
+        blueprintA: bpA.snapshot,
+        manifestB,
+        blueprintB: bpB.snapshot,
+        contextHash: ctxA.context_hash,
+      });
+      const fromArtifactIds = [...new Set(plan.actions.flatMap((a) => a.fromArtifactIds))];
+      const srcRows: any[] = fromArtifactIds.length
+        ? await qr.query(`select * from public.artifacts where id = any($1::uuid[]) for update`, [fromArtifactIds])
+        : [];
+      const sources = new Map(srcRows.map((r) => [r.id, r]));
+      const writes = planApplyWrites(
+        plan,
+        manifestB.manifest.items,
+        bpA.snapshot,
+        ctxA.context_hash,
+        (id) => sources.get(id)?.status ?? null,
+        (id) => sources.get(id)?.metadata?.inputFingerprint ?? null,
+        { required: (t) => requiredArtifactTypes(manifestB.rulesVersion, t as ManifestItemType), typeOf: (id) => sources.get(id)?.type },
+      );
+      if (writes.missingRoles.length > 0) {
+        const message =
+          `No se puede reutilizar la salida de ${rowA.id} en el Manifest #${manifestB.id} (rulesVersion ` +
+          `${manifestB.rulesVersion}): faltan roles de artifact obligatorios (${writes.missingRoles.length}) ` +
+          `missingJson=${JSON.stringify(writes.missingRoles)}`;
+        throw new ConflictException({ message, code: 'reuse_missing_roles', missing: writes.missingRoles });
+      }
+      // Gate de video real (review 5C I1): B va a pagar Videogen solo si
+      // GENERA/REGENERA algún video (STALE_NO_AUTO nunca regenera solo).
+      if (videoMode === 'real' && writes.videoItemsToGenerate.length > 0) assertRealVideoAllowed(ownerId);
+
+      const invalidation = { fromRunId: rowA.id, planSha256: plan.planSha256, totals: plan.totals, plan };
+      const inputPayload = {
+        manifestId: manifestB.id,
+        blueprintNumber,
+        contextHash: ctxA.context_hash,
+        videoMode,
+        videoDelivery,
+        fromRunId: rowA.id,
+        invalidationPlanSha256: plan.planSha256,
+      };
+      const [job] = await qr.query(
+        `insert into public.production_jobs
+           (owner_id, course_id, frontend_course_id, execution_mode, status, worker_status, current_step,
+            progress, blueprint_version_id, input_payload, output_summary, options, result,
+            lease_until, worker_id, created_at, updated_at)
+         values ($1, $2, $3, 'dynamic_generation', 'queued', 'queued', 'dynamic_generation',
+                 0, $4, $5::jsonb, $6::jsonb, '{}'::jsonb, '{}'::jsonb,
+                 null, null, now(), now())
+         returning id`,
+        [ownerId, courseId, course?.frontend_course_id ?? null, manifestB.blueprintId, JSON.stringify(inputPayload),
+          JSON.stringify({ invalidation })],
+      );
+      await qr.query(
+        `insert into public.generation_run_contexts (job_id, manifest_id, context, context_hash)
+         values ($1, $2, $3::jsonb, $4)`,
+        [job.id, manifestB.id, JSON.stringify(ctxA.context), ctxA.context_hash],
+      );
+      const seeded = await executeApplyWrites(qr, {
+        jobB: job.id,
+        runA: rowA.id,
+        courseId,
+        manifestB: { id: manifestB.id, blueprintId: manifestB.blueprintId },
+        planSha256: plan.planSha256,
+        writes,
+        sourceArtifacts: sources,
+        idempotencyKey: (key) => itemIdempotencyKey(manifestB.id, key, GENERATION),
+      });
+      if (seeded.size !== manifestB.totals.totalJobs) {
+        throw new InternalServerErrorException(
+          `Manifest #${manifestB.id}: se sembraron ${seeded.size} items pero totals.totalJobs = ${manifestB.totals.totalJobs}`,
+        );
+      }
+      // Todo reutilizado (p.ej. reorder puro) → el run nace completed.
+      await recomputeRunStatus(qr, job.id);
+      return { kind: 'created' as const, jobId: job.id as string };
+    });
+
+    const job = await this.loadJobById(outcome.jobId);
+    const inv = job.output_summary?.invalidation;
+    return {
+      created: outcome.kind === 'created',
+      reopened: false,
+      run: await this.buildRunDto(job, manifestB),
+      invalidation: inv ? { fromRunId: inv.fromRunId, planSha256: inv.planSha256, totals: inv.totals } : undefined,
+    };
   }
 
   /**
