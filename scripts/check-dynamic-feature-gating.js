@@ -650,6 +650,8 @@ async function runWorkerProcess(script, env, { waitMs }) {
     svc.findActiveRunRow = async () => (scenario === 'active' ? run('running') : null);
     // I1 (review-rv2): ningún run activo de OTRO Manifest del curso en estos escenarios.
     svc.findActiveRunOnOtherManifest = async () => null;
+    // Fase 8 fix wave: ningún run reemplazó a este (sin B creado con fromRun).
+    svc.findSupersedingRun = async () => null;
     svc.findLatestRunRow = async () => (scenario === 'reopen' ? run('cancelled') : null);
     svc.hasPreviousItems = async () => false;
     svc.assertNoPreviousItems = async () => {};
@@ -738,6 +740,8 @@ async function runWorkerProcess(script, env, { waitMs }) {
         query: async (sql, params) => {
           // I1 (review-rv2): lock por curso + "¿otro run activo en el curso?" (no hay).
           if (/pg_advisory_xact_lock/.test(sql)) return [];
+          // Fase 8 fix wave: "¿otro run se creó desde este (fromRun)?" (no).
+          if (/fromRunId/.test(sql)) return [];
           if (/from public\.production_jobs pj/.test(sql)) return [];
           if (/from public\.production_jobs where id = \$1\s*$/m.test(sql.trim()) || /select id, status, worker_status from public\.production_jobs/.test(sql)) {
             return [locked];

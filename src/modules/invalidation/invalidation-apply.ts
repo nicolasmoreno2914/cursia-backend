@@ -112,9 +112,9 @@ export async function loadFromItemsFromDb(
         status: r.status,
         artifactIds: r.arts.map((a) => a.id),
         artifactStatus: 'disabled',
-        // Sin huella guardada NO se reutiliza: una huella ausente haría que el
-        // core la recalcule desde el Blueprint de A, que no es el del artifact.
-        inputFingerprint: uniformFingerprint(r.arts.map((a) => a.fp)) ?? 'unknown',
+        // Sin huella guardada (o no uniforme) → null: el core nunca reutiliza
+        // un deshabilitado sin huella (REGENERATE, fix wave).
+        inputFingerprint: uniformFingerprint(r.arts.map((a) => a.fp)),
       });
       wanted.delete(r.item_key);
     }
@@ -366,6 +366,7 @@ export async function executeApplyWrites(qr: QueryExecutor, args: ExecuteApplyAr
   }
 
   // 2) filas de artifact "carried": MISMA storage_path inmutable, fila nueva vinculada a B.
+  const carriedIdsByKey = new Map<string, string[]>();
   for (const c of writes.carried) {
     const src = args.sourceArtifacts.get(c.sourceArtifactId);
     if (!src) throw new Error(`apply: el artifact de origen ${c.sourceArtifactId} (${c.itemKey}) no existe`);
@@ -389,15 +390,27 @@ export async function executeApplyWrites(qr: QueryExecutor, args: ExecuteApplyAr
       },
       ...(c.reviewMarks.length ? { review: c.reviewMarks } : {}),
     };
-    await qr.query(
+    const [ins] = await qr.query(
       `insert into public.artifacts
          (owner_id, course_id, job_id, type, storage_provider, storage_bucket, storage_path, filename, mime_type,
           size_bytes, checksum_sha256, metadata, module_id, chapter_id, status, generated_with_version_id,
           manifest_id, manifest_item_key, item_run_id)
-       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::uuid, $14::uuid, $15, $16, $17, $18, $19::uuid)`,
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::uuid, $14::uuid, $15, $16, $17, $18, $19::uuid)
+       returning id`,
       [src.owner_id, src.course_id, jobB, src.type, src.storage_provider, src.storage_bucket, src.storage_path, src.filename,
         src.mime_type, src.size_bytes, src.checksum_sha256, JSON.stringify(metadata), seed.moduleId, seed.chapterId, c.status,
         src.generated_with_version_id, manifestB.id, c.itemKey, itemRunIds.get(c.itemKey)],
+    );
+    carriedIdsByKey.set(c.itemKey, [...(carriedIdsByKey.get(c.itemKey) ?? []), ins.id]);
+  }
+
+  // 2b) output_summary.artifactIds del item de B = SUS filas carried (no las de A; fix wave M3).
+  for (const [itemKey, ids] of carriedIdsByKey) {
+    await qr.query(
+      `update public.generation_item_runs
+          set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('artifactIds', $2::jsonb)
+        where id = $1`,
+      [itemRunIds.get(itemKey), JSON.stringify([...ids].sort())],
     );
   }
 

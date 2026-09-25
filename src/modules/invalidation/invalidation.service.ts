@@ -3,7 +3,8 @@ import { DataSource } from 'typeorm';
 import { GenerationManifestsService } from '../generation-manifests/generation-manifests.service';
 import type { ManifestItemType } from '../generation-manifests/generation-manifest-builder';
 import { requiredArtifactTypes } from '../dynamic-packaging/artifact-resolver';
-import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
+import { assertDynamicOwnerAllowed, isRealVideoAllowedForOwner, toHttpConfigError } from '../features/dynamic-features';
+import { ACTIVE_RUN_WORKER_STATUSES } from '../dynamic-generation/item-transitions';
 import { canonicalContextHash } from '../dynamic-generation/run-hash';
 import { computePlanFromDb, planApplyWrites } from './invalidation-apply';
 import type { InvalidationPlan } from './plan';
@@ -21,7 +22,16 @@ export interface InvalidationPlanResponse {
   videoMode: string;
   /** Videos que el run B generaría (gasto de Videogen si videoMode='real'). */
   videoItemsToGenerate: string[];
-  /** Roles faltantes que harían fallar el apply (409); vacío = aplicable. */
+  /**
+   * Todo lo que haría fallar el apply (fix wave M2), para que la UI avise
+   * ANTES de confirmar; vacío = aplicable:
+   * - `superseded_by:<runId>`: A ya fue reemplazado por otro run (409);
+   * - `manifest_has_other_run:<runId>`: el Manifest destino ya tiene un run que no sale de A (409);
+   * - `active_run:<runId>`: hay otro run activo en el curso (409);
+   * - `real_video_not_allowed`: B generaría videos reales y el owner no está habilitado (403);
+   * - `<key>:<tipo>:missing_role`: reutilizar dejaría roles v2 faltantes (409 reuse_missing_roles).
+   * (La allow-list V2 ya responde 403 a este mismo GET.)
+   */
   blockers: string[];
   plan: InvalidationPlan;
 }
@@ -63,6 +73,7 @@ export class InvalidationService {
       toManifestId: manifestB.id,
       toBlueprintNumber: blueprintNumber,
       toRulesVersion: manifestB.rulesVersion,
+      // Misma normalización que RunsService.videoModeOf ('mock' por defecto).
       videoMode: rowA.input_payload?.videoMode === 'real' ? 'real' : 'mock',
     };
 
@@ -120,12 +131,47 @@ export class InvalidationService {
       (id) => byId.get(id)?.metadata?.inputFingerprint ?? null,
       { required: (t) => requiredArtifactTypes(manifestB.rulesVersion, t as ManifestItemType), typeOf: (id) => byId.get(id)?.type },
     );
+    const blockers: string[] = [];
+    const [superseding] = await this.dataSource.query(
+      `select id from public.production_jobs
+        where execution_mode = 'dynamic_generation' and input_payload->>'fromRunId' = $1
+        order by created_at desc, id desc limit 1`,
+      [fromRunId],
+    );
+    if (superseding) blockers.push(`superseded_by:${superseding.id}`);
+    const [otherOnMb] = await this.dataSource.query(
+      `select id from public.production_jobs
+        where execution_mode = 'dynamic_generation' and input_payload->>'manifestId' = $1
+        order by created_at desc, id desc limit 1`,
+      [String(manifestB.id)],
+    );
+    if (otherOnMb) blockers.push(`manifest_has_other_run:${otherOnMb.id}`);
+    const [active] = await this.dataSource.query(
+      `select id from public.production_jobs
+        where execution_mode = 'dynamic_generation' and course_id = $1
+          and input_payload->>'manifestId' is distinct from $2
+          and worker_status = any($3::text[])
+          and coalesce(status, '') not in ('cancelled', 'cancelling')
+        order by created_at desc, id desc limit 1`,
+      [courseId, String(manifestB.id), ACTIVE_RUN_WORKER_STATUSES],
+    );
+    if (active) blockers.push(`active_run:${active.id}`);
+    if (base.videoMode === 'real' && writes.videoItemsToGenerate.length > 0) {
+      let allowed = false;
+      try {
+        allowed = isRealVideoAllowedForOwner(ownerId);
+      } catch (err) {
+        toHttpConfigError(err);
+      }
+      if (!allowed) blockers.push('real_video_not_allowed');
+    }
+    blockers.push(...writes.missingRoles);
     return {
       ...base,
       applied: false,
       existingRunId: null,
       videoItemsToGenerate: writes.videoItemsToGenerate,
-      blockers: writes.missingRoles,
+      blockers,
       plan,
     };
   }

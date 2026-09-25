@@ -324,6 +324,10 @@ export class RunsService {
             `no se puede crear otra. runId=${existing.id}`,
         );
       }
+      // Fix wave (review F78 M5, promovido): A ya reemplazado por otro B (otro
+      // Manifest) → se aplica desde el más reciente, nunca desde A.
+      const superseding = await this.findSupersedingRun(qr, rowA.id);
+      if (superseding) throw this.supersededConflict(rowA.id, superseding);
       const other = await this.findActiveRunOnOtherManifest(qr, courseId, manifestB.id);
       if (other) throw this.otherActiveRunConflict(other, manifestB);
 
@@ -339,6 +343,14 @@ export class RunsService {
       const srcRows: any[] = fromArtifactIds.length
         ? await qr.query(`select * from public.artifacts where id = any($1::uuid[]) for update`, [fromArtifactIds])
         : [];
+      if (srcRows.length !== fromArtifactIds.length) {
+        // Un artifact de A se borró entre el plan y el lock (fix wave I2): nunca
+        // se aplica un plan sobre salida que ya no existe.
+        throw new ConflictException(
+          `Los artifacts de la ejecución ${rowA.id} cambiaron mientras se aplicaba el plan ` +
+            `(${fromArtifactIds.length - srcRows.length} ya no existen); reintentá. runId=${rowA.id}`,
+        );
+      }
       const sources = new Map(srcRows.map((r) => [r.id, r]));
       const writes = planApplyWrites(
         plan,
@@ -353,7 +365,8 @@ export class RunsService {
         const message =
           `No se puede reutilizar la salida de ${rowA.id} en el Manifest #${manifestB.id} (rulesVersion ` +
           `${manifestB.rulesVersion}): faltan roles de artifact obligatorios (${writes.missingRoles.length}) ` +
-          `missingJson=${JSON.stringify(writes.missingRoles)}`;
+          `missingJson=${JSON.stringify(writes.missingRoles)}. Pasar a rulesVersion ${manifestB.rulesVersion} requiere una ` +
+          'generación completa nueva (POST …/runs con el contexto del curso, sin fromRun).';
         throw new ConflictException({ message, code: 'reuse_missing_roles', missing: writes.missingRoles });
       }
       // Gate de video real (review 5C I1): B va a pagar Videogen solo si
@@ -461,6 +474,9 @@ export class RunsService {
       }
       // I1 (5C): reabrir un run 'real' vuelve a gastar Videogen → allow-list DYNAMIC_REAL_VIDEO_OWNERS.
       if (latestVideoMode === 'real') assertRealVideoAllowed(ownerId);
+      // Fix wave (M5): un run reemplazado por uno creado desde él no se reabre.
+      const superseding = await this.findSupersedingRun(this.dataSource, latest.id);
+      if (superseding) throw this.supersededConflict(latest.id, superseding);
       return this.reopenRun(latest.id, manifest, contextHash);
     }
 
@@ -611,6 +627,31 @@ export class RunsService {
   }
 
   /**
+   * Fix wave (review F78 M5): run creado con `{fromRun: runId}` (el B más
+   * reciente). Si existe, `runId` quedó REEMPLAZADO: no se reintenta, no se
+   * reabre y no se aplica otro plan desde él.
+   */
+  private async findSupersedingRun(q: { query: (sql: string, params?: any[]) => Promise<any> }, runId: string): Promise<string | null> {
+    const [row] = await q.query(
+      `select id from public.production_jobs
+        where execution_mode = 'dynamic_generation' and input_payload->>'fromRunId' = $1
+        order by created_at desc, id desc limit 1`,
+      [runId],
+    );
+    return row?.id ?? null;
+  }
+
+  private supersededConflict(runId: string, supersedingId: string): ConflictException {
+    return new ConflictException({
+      message:
+        `La ejecución ${runId} fue reemplazada por ${supersedingId} (creada desde ella al cambiar la estructura); ` +
+        `seguí desde la más reciente. runId=${supersedingId}`,
+      code: 'superseded_run',
+      runId: supersedingId,
+    });
+  }
+
+  /**
    * I1: serializa, por curso, toda operación que puede dejar un run ACTIVO
    * (crear, reabrir, reintentar con reapertura). Advisory lock de
    * transacción: se libera solo en commit/rollback. Siempre se toma PRIMERO
@@ -736,6 +777,10 @@ export class RunsService {
       if (isCancelledLike(locked)) {
         throw new ConflictException(`La ejecución ${job.id} está cancelada; no se pueden reintentar items`);
       }
+      // Fix wave (M5): reintentar en un run ya reemplazado (B creado desde él)
+      // regeneraría —y podría pagar— salida que nadie va a usar.
+      const superseding = await this.findSupersedingRun(qr, job.id);
+      if (superseding) throw this.supersededConflict(job.id, superseding);
       if (!ACTIVE_RUN_WORKER_STATUSES.includes(String(locked.worker_status))) {
         // Reabrir este run con otro run del curso activo = dos generaciones
         // completas en paralelo (doble gasto) → 409 con el runId del activo.
@@ -1080,6 +1125,8 @@ export class RunsService {
         if (isActive(locked)) return { kind: 'active' as const, row: locked };
         const other = await this.findActiveRunOnOtherManifest(qr, manifest.courseId, manifest.id);
         if (other) throw this.otherActiveRunConflict(other, manifest);
+        const superseding = await this.findSupersedingRun(qr, jobId);
+        if (superseding) throw this.supersededConflict(jobId, superseding);
         if (!isReopenable(locked)) {
           throw new ConflictException(
             `La ejecución anterior de este Manifest ya terminó (${locked.worker_status}); re-ejecutar un Manifest ` +
