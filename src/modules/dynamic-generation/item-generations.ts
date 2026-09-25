@@ -18,12 +18,19 @@
  *   faltante con su estado real) — `effectiveOutputRowsSql`.
  */
 
-/** Predicado SQL: `alias` es la generación más alta de su item_key dentro de su run (job_id). */
+/**
+ * Predicado SQL: `alias` es la generación más alta de su item_key dentro de su
+ * run (job_id). Fix wave M8: la correlación incluye manifest_id (un run tiene
+ * un solo Manifest, así que la semántica no cambia) para que el NOT EXISTS use
+ * el índice único gir_item_generation_key (manifest_id, item_key, generation)
+ * — sin migración nueva.
+ */
 export function latestGenerationPredicate(alias: string): string {
   return `not exists (
               select 1 from public.generation_item_runs gir_newer
-               where gir_newer.job_id = ${alias}.job_id
+               where gir_newer.manifest_id = ${alias}.manifest_id
                  and gir_newer.item_key = ${alias}.item_key
+                 and gir_newer.job_id = ${alias}.job_id
                  and gir_newer.generation > ${alias}.generation)`;
 }
 

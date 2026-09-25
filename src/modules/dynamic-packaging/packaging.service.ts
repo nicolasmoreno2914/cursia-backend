@@ -1,5 +1,6 @@
 import { BadRequestException, ConflictException, Injectable, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common';
 import { effectiveOutputRowsSql } from '../dynamic-generation/item-generations';
+import { ACTIVE_RUN_WORKER_STATUSES } from '../dynamic-generation/item-transitions';
 import { DataSource } from 'typeorm';
 import { GenerationManifestsService, ManifestDto } from '../generation-manifests/generation-manifests.service';
 import { ArtifactsService } from '../artifacts/artifacts.service';
@@ -57,7 +58,7 @@ export interface PackageStatusResult {
    * "Preparar paquete" de nuevo: POST …/package construye uno nuevo.
    */
   stale: boolean;
-  /** Motivo corto cuando `stale`: run_in_progress | builder_changed | sources_changed | artifacts_unresolvable. */
+  /** Motivo cuando `stale` (código + frase): run_in_progress | run_not_completed | builder_changed | moodle_version_changed | sources_changed | artifacts_unresolvable. */
   staleReason?: string;
   /** Items (por key/UUID) cuya salida vigente no está en el paquete (sources_changed). */
   staleItemKeys?: string[];
@@ -156,7 +157,11 @@ export class PackagingService {
   private async buildFreshness(run: any, manifest: ManifestDto, existing: PackageJobRow): Promise<BuildFreshness> {
     const runDone = run.worker_status === RUN_DONE_STATUS || run.status === RUN_DONE_STATUS;
     if (!runDone) {
-      return { stale: true, reason: `run_in_progress: la ejecución está ${run.worker_status} (hay items regenerándose); el paquete puede no incluir su salida nueva` };
+      // Fix wave M1: activo (regenerando) ≠ terminado sin completar (p.ej. una regeneración falló).
+      if (ACTIVE_RUN_WORKER_STATUSES.includes(String(run.worker_status))) {
+        return { stale: true, reason: `run_in_progress: la ejecución está ${run.worker_status} (hay items regenerándose); el paquete puede no incluir su salida nueva` };
+      }
+      return { stale: true, reason: `run_not_completed: la ejecución terminó en ${run.worker_status} (p.ej. una regeneración falló); reintentá los items fallidos` };
     }
     const existingBuilderVersion = existing.output_summary?.builderVersion;
     if (existingBuilderVersion !== DYNAMIC_MBZ_BUILDER_VERSION) {
@@ -176,6 +181,13 @@ export class PackagingService {
         .filter(([, list]) => list.some((a) => !packaged.has(a.artifactId)))
         .map(([key]) => key)
         .sort();
+      if (staleItemKeys.length === 0) {
+        // Fix wave M2: mismos artifacts y mismo builder → lo único que cambió es la versión de Moodle de la clave.
+        return {
+          stale: true,
+          reason: `moodle_version_changed: el paquete se construyó para Moodle ${existing.output_summary?.moodleVersion ?? '4.1'} (actual ${resolveDynamicMoodleVersion().resolved})`,
+        };
+      }
       return {
         stale: true,
         reason: `sources_changed: ${staleItemKeys.length} item(s) tienen salida más nueva que el paquete (p.ej. se regeneraron después de empaquetar)`,
