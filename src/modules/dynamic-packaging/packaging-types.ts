@@ -87,8 +87,11 @@ export interface DynamicPackageContents {
    * (downloadUrl del artifact dynamic_video) SOLO como mecanismo de aceptación
    * en staging. La entrega final del video (YouTube, storage estable, etc.) se
    * decide en 5B.2. Nunca se usan signed URLs temporales.
+   * 5B.2.A: `delivery: 'youtube'` (solo runs congelados en youtube) → `url`
+   * es la de YouTube y cambia el texto de la actividad; ausente = Videogen
+   * directo (5B.1, byte-idéntico).
    */
-  videos: Map<string, { url: string; videogenJobId: string }>;
+  videos: Map<string, { url: string; videogenJobId: string; delivery?: 'youtube' }>;
 }
 
 export interface BuildDynamicMbzInput {
@@ -101,7 +104,10 @@ export interface BuildDynamicMbzInput {
 
 export class PackagingNotReadyError extends Error {
   constructor(public readonly missing: string[], message?: string) {
-    super(message ?? `Empaquetado no listo: faltan ${missing.length} item(s)`);
+    super(
+      message ??
+        `Empaquetado no listo: faltan ${missing.length} item(s): ${missing.join(', ')}`,
+    );
     this.name = 'PackagingNotReadyError';
   }
 }

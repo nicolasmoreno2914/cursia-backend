@@ -3,7 +3,7 @@ import { DataSource } from 'typeorm';
 import { GenerationManifestsService, ManifestDto } from '../generation-manifests/generation-manifests.service';
 import { ArtifactsService } from '../artifacts/artifacts.service';
 import { resolveRunArtifacts } from './artifact-resolver';
-import { sortedArtifactIds, sourceIdsHash } from './packaging-reuse-key';
+import { packageReuseHash, resolveDynamicMoodleVersion, sortedArtifactIds } from './packaging-reuse-key';
 import { DYNAMIC_MBZ_BUILDER_VERSION } from '../../package/dynamic-mbz-builder';
 
 export const EXECUTION_MODE = 'dynamic_package';
@@ -14,6 +14,14 @@ const IN_PROGRESS_PACKAGE_STATUSES = ['queued', 'running', 'retrying'];
 // worker_status terminal-fallido ('failed', 'failed_retryable', 'cancelled') y cualquier otro
 // status no contemplado caen al `else` implícito de requestPackage: nunca se reusan, siempre
 // se permite un job nuevo (I2/I3, integral-review) — no necesitan una constante propia.
+
+// M2 (fase5b-audit integral-review.md): TTL de la signed URL de descarga del
+// .mbz, configurable por env var — el default (300s) no cambia si no se setea.
+function resolveDownloadUrlTtlSeconds(): number {
+  const raw = Number(process.env.DYNAMIC_PACKAGE_DOWNLOAD_URL_TTL_SECONDS);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 300;
+}
+const DOWNLOAD_URL_TTL_SECONDS = resolveDownloadUrlTtlSeconds();
 
 export interface PackageJobRow {
   id: string;
@@ -115,7 +123,11 @@ export class PackagingService {
     try {
       const byItem = await resolveRunArtifacts({ query: this.dataSource.query.bind(this.dataSource) }, run.id, manifest.manifest);
       const ids = sortedArtifactIds(byItem);
-      const currentHash = sourceIdsHash(DYNAMIC_MBZ_BUILDER_VERSION, ids);
+      // I3 (review-it2): misma clave que el worker (incluye la versión de
+      // Moodle resuelta; idéntica a la de antes con la versión default). Un
+      // DYNAMIC_MBZ_MOODLE_VERSION inválido lanza acá → no se reusa → el job
+      // nuevo falla ruidoso en el worker con el mensaje de config.
+      const currentHash = packageReuseHash(DYNAMIC_MBZ_BUILDER_VERSION, ids, resolveDynamicMoodleVersion().resolved);
       return currentHash === existing.output_summary?.sourceIdsHash;
     } catch (err) {
       // Si el run ya no resuelve limpio (p.ej. artifacts borrados), no se
@@ -142,13 +154,27 @@ export class PackagingService {
       if (artifactId) {
         result.artifactId = artifactId;
         try {
-          const { url } = await this.artifacts.getDownloadUrl(artifactId, ownerId, 300);
-          if (url) result.downloadUrl = url;
+          const { url } = await this.artifacts.getDownloadUrl(artifactId, ownerId, DOWNLOAD_URL_TTL_SECONDS);
+          if (url) {
+            result.downloadUrl = url;
+          } else {
+            // M2 (fase5b-audit integral-review.md): antes se dejaba
+            // downloadUrl sin definir y no se tocaba result.error — el
+            // llamador no podía distinguir "sin URL porque el signing falló"
+            // de "sin URL porque el job no completó". Ahora es explícito.
+            result.error = 'El artifact está listo pero no se pudo generar su URL de descarga (respuesta vacía del signer).';
+            this.logger.warn(`getDownloadUrl(${artifactId}) devolvió una url vacía`);
+          }
         } catch (err) {
-          this.logger.warn(`No se pudo firmar la URL de descarga del artifact ${artifactId}: ${err instanceof Error ? err.message : String(err)}`);
+          const detail = err instanceof Error ? err.message : String(err);
+          this.logger.warn(`No se pudo firmar la URL de descarga del artifact ${artifactId}: ${detail}`);
+          result.error = `No se pudo firmar la URL de descarga del artifact (${detail})`;
         }
       }
     }
+    // El error_message del job (si lo hay) tiene prioridad sobre un fallo de
+    // signing — un job fallido es un problema más grave que no poder firmar
+    // la URL de un job completado.
     if (job.error_message) result.error = job.error_message;
     return result;
   }
@@ -185,8 +211,12 @@ export class PackagingService {
       });
     }
 
+    // M8 (fase5b-audit integral-review.md): filtrar generation = 1, igual
+    // que artifact-resolver.ts — hoy es un no-op porque 5A solo siembra
+    // generation 1, pero sin esto este precheck divergiría del resolver en
+    // cuanto existan regeneraciones (Fase 8).
     const items: Array<{ item_key: string; status: string }> = await this.dataSource.query(
-      `select item_key, status from public.generation_item_runs where job_id = $1`,
+      `select item_key, status from public.generation_item_runs where job_id = $1 and generation = 1`,
       [run.id],
     );
     const statusByKey = new Map(items.map((i) => [i.item_key, i.status]));

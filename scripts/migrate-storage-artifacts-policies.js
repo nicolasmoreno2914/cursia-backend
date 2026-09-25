@@ -70,6 +70,7 @@ const EXPECTED_POLICIES = [
   { name: 'cursia_artifacts_insert_own_folder', cmd: 'INSERT' },
   { name: 'cursia_artifacts_select_own_folder', cmd: 'SELECT' },
   { name: 'cursia_artifacts_delete_own_folder', cmd: 'DELETE' },
+  { name: 'cursia_artifacts_update_own_folder', cmd: 'UPDATE' },
 ];
 
 async function main() {
