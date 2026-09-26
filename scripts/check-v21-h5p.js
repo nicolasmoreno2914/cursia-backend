@@ -621,6 +621,16 @@ async function unzip(buf) {
   });
 
   // ── 5. Validadores ─────────────────────────────────────────────────────────
+  await check('validador QuestionSet: multichoice con EXACTAMENTE 1 correcta (0 o 2 correctas → rechazo; R13 fix round 1)', () => {
+    const two = inputs.qs();
+    const mc = two.questions.findIndex((q) => q.kind === 'multichoice');
+    two.questions[mc].answers.forEach((a, i) => { a.correct = i < 2; });
+    expectThrow(() => h.buildQuestionSet(two), /H5P_INPUT_INVALID\(QuestionSet\).*answers: debe haber exactamente 1 correcta \(hay 2\)/, 'dos correctas');
+    const none = inputs.qs();
+    none.questions[mc].answers.forEach((a) => { a.correct = false; });
+    expectThrow(() => h.buildQuestionSet(none), /debe haber exactamente 1 correcta \(hay 0\)/, 'ninguna correcta');
+    h.buildQuestionSet(inputs.qs()); // la fixture válida (1 correcta por multichoice) sigue pasando
+  });
   await check('validador: rechaza HTML y entidades en la entrada', () => {
     const q1 = inputs.qs();
     q1.questions[0].question = '¿Qué es <b>esto</b>?';

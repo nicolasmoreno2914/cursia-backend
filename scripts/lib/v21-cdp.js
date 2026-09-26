@@ -32,7 +32,10 @@ async function launchChrome({ extraArgs = [] } = {}) {
     [
       '--headless=new', '--disable-gpu', '--hide-scrollbars', '--no-first-run', '--no-default-browser-check',
       '--autoplay-policy=no-user-gesture-required', '--mute-audio',
-      `--user-data-dir=${userDataDir}`, `--remote-debugging-port=${port}`, ...extraArgs, 'about:blank',
+      `--user-data-dir=${userDataDir}`, `--remote-debugging-port=${port}`,
+      // R13: el gate puede restringir la red de Chrome (solo 127.0.0.1 + hosts de reproducción de YouTube).
+      ...(process.env.CURSIA_CHROME_HOST_RESOLVER_RULES ? [`--host-resolver-rules=${process.env.CURSIA_CHROME_HOST_RESOLVER_RULES}`, '--disable-background-networking', '--disable-component-update'] : []),
+      ...extraArgs, 'about:blank',
     ],
     { stdio: 'ignore' },
   );
@@ -64,11 +67,12 @@ async function launchChrome({ extraArgs = [] } = {}) {
       pending.delete(m.id);
     } else if (m.method) listeners.forEach((fn) => fn(m));
   });
-  const send = (method, params) =>
+  // sessionId opcional (R13): sesiones planas de iframes/workers adjuntados con Target.setAutoAttach.
+  const send = (method, params, sessionId) =>
     new Promise((res) => {
       const i = ++id;
       pending.set(i, res);
-      ws.send(JSON.stringify({ id: i, method, params: params || {} }));
+      ws.send(JSON.stringify({ id: i, method, params: params || {}, ...(sessionId ? { sessionId } : {}) }));
     });
   /** Evalúa en la página principal; lanza si hay excepción. */
   const evaluate = async (expression) => {

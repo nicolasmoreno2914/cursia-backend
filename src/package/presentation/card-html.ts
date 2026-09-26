@@ -60,6 +60,9 @@ function attr(v: string): string {
   return String(v).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+/** Ancho (px, atributo) de la portada en CLEAN_SAFE: sobrevive a forceclean y cabe en 320 px. */
+export const CARD_COVER_CLEAN_WIDTH_PX = 240;
+
 export function presentationCardHtml(input: PresentationCardInput): string {
   const { chapterNumber, coverUrl, pdfUrl, slideCount, theme, moduleColor } = input;
   assertMeasuredSlideCount(slideCount);
@@ -71,8 +74,12 @@ export function presentationCardHtml(input: PresentationCardInput): string {
   // título con ":-)" rompía el <img>). El título del capítulo ya está en el label.
   // HTMLPurifier (forceclean) descarta width/max-width en <img>: el tamaño
   // responsivo va en la capa ENHANCED; la base conserva margin y border.
+  // R13 (QA forceclean a 390 px): sin tamaño, la portada (≤ 640 px) desbordaba la
+  // columna con forceclean=1. El atributo width en PÍXELES sí sobrevive al purificador;
+  // 240 px cabe en la columna más angosta (320 px de viewport). En ENHANCED el style
+  // width:100% manda sobre el atributo.
   const img =
-    `<img src="${attr(coverUrl)}" alt="${attr(`Portada de la presentación del capítulo ${chapterNumber}`)}"` +
+    `<img src="${attr(coverUrl)}" alt="${attr(`Portada de la presentación del capítulo ${chapterNumber}`)}" width="${CARD_COVER_CLEAN_WIDTH_PX}"` +
     st(h, [['margin', '0 0 12px 0'], ['border', `1px solid ${theme.color.border}`]], [['max-width', '100%'], ['width', '100%'], ['height', 'auto'], ['display', 'block']]) +
     ' />';
   const linkText = `Ver presentación completa (PDF, ${slideCount} diapositiva${slideCount === 1 ? '' : 's'})`;

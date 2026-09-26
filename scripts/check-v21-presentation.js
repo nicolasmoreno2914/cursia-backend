@@ -253,7 +253,9 @@ check('4b: presentationCardHtml — el título (texto libre) no va en atributos:
 
 check('4c: presentationCardHtml — tamaño responsivo del <img> solo en ENHANCED (el purificador lo descarta en <img>)', () => {
   const clean = buildCard(lightTheme, 5).match(/<img[^>]*style="([^"]*)"/)[1];
-  assertTrue(!/width/.test(clean), `CLEAN_SAFE no declara width en <img>: ${clean}`);
+  assertTrue(!/width/.test(clean), `CLEAN_SAFE no declara width en el style del <img>: ${clean}`);
+  // R13: ancho en píxeles como ATRIBUTO (sobrevive a forceclean) para no desbordar a 390 px.
+  assertTrue(/<img [^>]*width="240"/.test(buildCard(lightTheme, 5)), 'CLEAN_SAFE: atributo width="240" en la portada');
   const enh = presentationCardHtml({ chapterNumber: 3, chapterTitle: 't', coverUrl: 'c', pdfUrl: 'p', slideCount: 5, theme: lightTheme, moduleColor: moduleColor(lightTheme, 0), level: 'enhanced' }).match(/<img[^>]*style="([^"]*)"/)[1];
   assertTrue(/max-width:100%/.test(enh) && /width:100%/.test(enh) && /height:auto/.test(enh), `ENHANCED responsivo: ${enh}`);
 });

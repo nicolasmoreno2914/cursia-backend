@@ -42,7 +42,9 @@ export function validateQuestionSetInput(input: unknown): asserts input is Quest
       checkChoiceQuestion(issues, `questions[${i}]`, q, {
         minAnswers: QUESTION_SET_LIMITS.minAnswers,
         maxAnswers: QUESTION_SET_LIMITS.maxAnswers,
-        exactlyOneCorrect: false,
+        // R13 fix round 1: igual que el prompt ("EXACTAMENTE 1 correcta") y que el IV. Con >1
+        // correcta H5P.MultiChoice pasa a casillas con puntaje parcial (otra semántica).
+        exactlyOneCorrect: true,
       }),
     );
   }

@@ -22,7 +22,9 @@ net.Socket.prototype.connect = function (...args) {
   }
   host = host || 'localhost';
   if (!LOOPBACK.has(host)) {
-    const line = `${new Date().toISOString()} pid=${process.pid} BLOCKED ${host}\n`;
+    // R13: etiqueta del proceso (script) para atribuir el intento por proveedor en el resumen.
+    const who = (process.argv[1] || 'node').split('/').slice(-2).join('/');
+    const line = `${new Date().toISOString()} pid=${process.pid} proc=${who} BLOCKED ${host}\n`;
     try { if (LOG) fs.appendFileSync(LOG, line); } catch (e) { /* ignore */ }
     const err = new Error(`E2E netguard: conexión externa bloqueada a ${host}`);
     process.nextTick(() => this.destroy(err));

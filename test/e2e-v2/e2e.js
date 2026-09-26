@@ -347,7 +347,8 @@ async function packageRun(label, courseId, n, runId, fakes) {
       app = await startApp(fakes);
       ok(true, `app Nest real (dist/main.js) en 127.0.0.1:${APP_PORT}, DYNAMIC_COURSE_STRUCTURE=true, rulesVersion 2, videogen_direct`);
       const f = await api('GET', '/features');
-      eq(f.data, { dynamicCourseStructure: true, realVideo: true, coherenceLlm: false }, 'GET /features con el JWT local → dynamic ON, realVideo ON para el owner de prueba, coherenceLlm OFF (fail-closed sin DYNAMIC_COHERENCE_LLM)');
+      // V2.1 R3/R13: /features expone además manifestRulesVersion (2 en esta fase).
+      eq(f.data, { dynamicCourseStructure: true, realVideo: true, coherenceLlm: false, manifestRulesVersion: 2 }, 'GET /features con el JWT local → dynamic ON, realVideo ON para el owner de prueba, coherenceLlm OFF (fail-closed sin DYNAMIC_COHERENCE_LLM), manifestRulesVersion 2');
       const noAuth = await api('GET', '/features', undefined, null);
       ok(noAuth.status === 401, 'sin token → 401 (guard JWT real, HS256 con SUPABASE_JWT_SECRET local)');
       const bad = await api('GET', '/features', undefined, jwt.sign({ sub: OWNER }, 'otro-secreto'));
@@ -436,7 +437,8 @@ async function packageRun(label, courseId, n, runId, fakes) {
       // aprobación de admin (409 con el estimateId); se aprueba como lo haría
       // POST /finops/courses/:id/authorizations (fila ADMIN_APPROVED) y se reintenta.
       const startText = JSON.stringify(start);
-      ok(start.status === 409 && /budget_approval_required/.test(startText), 'run real sin aprobación → 409 budget_approval_required (RF-b)', start);
+      // R13: el wrapper real (24) devuelve el status HTTP en `_httpStatus`.
+      ok((start._httpStatus === 409 || start.status === 409) && /budget_approval_required/.test(startText), 'run real sin aprobación → 409 budget_approval_required (RF-b)', start);
       const estM = /estimateId=([0-9a-f-]{36})/.exec(startText);
       ok(!!estM, '409 trae el estimateId', startText.slice(0, 400));
       await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
@@ -834,7 +836,13 @@ async function packageRun(label, courseId, n, runId, fakes) {
 
       // Run youtube: el primer inicio de subida responde 503 (reintento en el mismo reclamo, paridad legacy).
       g.initPlan = [503];
-      const s1 = await api('POST', `/courses/${cY}/blueprints/${nY}/manifest/runs`, { ...ctx, videoMode: 'real' });
+      // V2.1 RF-b (HD-V21-19): video real = proveedor pagado → 409 con estimateId, aprobación de admin y reintento.
+      let s1 = await api('POST', `/courses/${cY}/blueprints/${nY}/manifest/runs`, { ...ctx, videoMode: 'real' });
+      const estY = /estimateId=([0-9a-f-]{36})/.exec(String(s1.error || ''));
+      ok(s1.status === 409 && /^budget_approval_required/.test(String(s1.error)) && !!estY, 'run Y real sin aprobación → 409 budget_approval_required con estimateId (RF-b)', { s: s1.status, e: s1.error });
+      await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+               values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e: aprobación del run Y')`, [cY, estY && estY[1]]);
+      s1 = await api('POST', `/courses/${cY}/blueprints/${nY}/manifest/runs`, { ...ctx, videoMode: 'real' });
       ok(s1.status === 201 && s1.data.run.videoDelivery === 'youtube', 'startRun con preflight OK → 201, videoDelivery congelado = youtube', { s: s1.status, e: s1.error });
       const runY = s1.data.run.id;
       syncLlmMaps(llm, cY, modsY);
@@ -943,7 +951,7 @@ async function packageRun(label, courseId, n, runId, fakes) {
       await stopProc(app);
       app = await startApp(fakes);
       const f2 = await api('GET', '/features');
-      eq(f2.data, { dynamicCourseStructure: true, realVideo: true, coherenceLlm: false }, 'flag ON de nuevo: /features true (restart sin pérdida)');
+      eq(f2.data, { dynamicCourseStructure: true, realVideo: true, coherenceLlm: false, manifestRulesVersion: 2 }, 'flag ON de nuevo: /features true (restart sin pérdida)');
       const rB = await api('GET', `/courses/${S.courseId}/blueprints/${S.nB}/manifest/runs/${S.runB}`);
       ok(rB.status === 200 && rB.data.status === 'completed', 'flag ON de nuevo: el run B sigue legible y completed');
     });
@@ -952,6 +960,7 @@ async function packageRun(label, courseId, n, runId, fakes) {
       const blocked = fs.readFileSync(NET_LOG, 'utf8').trim();
       ok(blocked === '', 'netguard (app + workers): 0 conexiones fuera de 127.0.0.1', blocked.slice(0, 1000));
       eq(frontNet, [], 'navegador simulado: 0 fetch fuera de 127.0.0.1 / /api/proxy');
+      results.frontNet = frontNet.slice();
       results.network = { storageRequests: fakes.storage.log.length, videogenSubmissions: fakes.videogen.submissions.length, httpsVideoDownloads: fakes.vids.downloads.length };
     });
   } catch (e) {
