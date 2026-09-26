@@ -11,6 +11,7 @@
 /.github/CODEOWNERS                            @nicolasmoreno2914
 /.github/workflows/                            @nicolasmoreno2914
 /scripts/prod/                                 @nicolasmoreno2914
+/scripts/release/                              @nicolasmoreno2914
 /scripts/lib/                                  @nicolasmoreno2914
 /scripts/migrate-*.js                          @nicolasmoreno2914
 /scripts/ops/                                  @nicolasmoreno2914
