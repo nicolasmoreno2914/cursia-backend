@@ -433,7 +433,8 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       'ensure_env_flag_true DYNAMIC_COURSE_STRUCTURE',
     ]) assert(block.includes(needle), `falta: ${needle}`);
     assert(!/(ensure_\w+|printf[^\n]*>>\s*\.env)[^\n]*DYNAMIC_COHERENCE_LLM/.test(block), 'DYNAMIC_COHERENCE_LLM no debe escribirse');
-    assert(!/(ensure_\w+|printf[^\n]*>>\s*\.env)[^\n]*DYNAMIC_PROVIDER_WORKER_ENABLED/.test(block), 'DYNAMIC_PROVIDER_WORKER_ENABLED no debe tocarse (proveedores reales apagados)');
+    assert(!/DYNAMIC_PROVIDER_WORKER_ENABLED\s+true/.test(block), 'DYNAMIC_PROVIDER_WORKER_ENABLED nunca se enciende desde el deploy');
+    assert(block.includes('ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED false'), 'el deploy lo deja explícitamente en false');
     const SECRET = 'valor-secreto-no-imprimir-123';
     const scenarios = [
       { label: '.env mínimo', env: `NODE_ENV=production\nSUPABASE_SERVICE_KEY=${SECRET}\n` },
@@ -476,6 +477,81 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       } finally {
         fs.rmSync(dir, { recursive: true, force: true });
       }
+    }
+  });
+
+  // V2.1: FinOps + proveedores de STAGING. Aislamiento fuerte (decisión de Nicolás): el deploy de staging
+  // nunca lee el .env de producción, nunca copia claves desde producción ni imprime fragmentos de secretos.
+  await check('(a) deploy-staging.yml [0c]: aislamiento — sin .env de producción, sin VPS_PATH de producción, sin copiar claves ni imprimir fragmentos', () => {
+    const step = pm2StepOf(stagingText, 'deploy-staging.yml').text;
+    assert(!/secrets\.VPS_PATH\s*\}\}/.test(stagingText), 'el workflow de staging no debe usar secrets.VPS_PATH (producción)');
+    for (const re of [/PROD_ENV_FILE/, /reuse_from_production/, /inventory_production/, /_mask\b/, /sudo -n grep/, /\$\{v: -4\}/]) {
+      assert(!re.test(step), `lógica de producción/fragmentos presente: ${re}`);
+    }
+  });
+
+  await check('(a) deploy-staging.yml [0c]: FinOps token por stdin (nunca impreso), worker de proveedores en false, idempotente, solo .env de staging', () => {
+    const script = remoteScriptOf(pm2StepOf(stagingText, 'deploy-staging.yml').text);
+    const lines = script.split('\n');
+    const fnStart = lines.findIndex((l) => l.startsWith('_Q_CR='));
+    const fnEnd = lines.findIndex((l) => l.startsWith('ensure_pm2_process() {'));
+    const flagsStart = lines.findIndex((l) => l.startsWith('echo "━━━ [0b]'));
+    const flagsEnd = lines.findIndex((l) => l.startsWith('echo "━━━ [1/6]'));
+    const block = [...lines.slice(fnStart, fnEnd), ...lines.slice(flagsStart, flagsEnd)].join('\n');
+    assert(/IFS= read -r _FIT/.test(script), 'el token se lee de stdin');
+    assert(/printf "%s\\n" "\$FINOPS_INGEST_TOKEN_STAGING" \| ssh/.test(stagingText), 'el token viaja por stdin del ssh');
+    const TOKEN = 'finops-token-SECRET-6666';
+    const STG = { VG: 'vg-staging-SECRET-4444', DB: 'db-pass-SECRET-7777' };
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v21-provcfg-'));
+    try {
+      fs.writeFileSync(path.join(dir, '.env'), `NODE_ENV=production\nDB_PASS=${STG.DB}\nVIDEOGEN_API_KEY=${STG.VG}\nDYNAMIC_PROVIDER_WORKER_ENABLED=true\n`);
+      const run = (fit) => spawnSync('bash', ['-c', `set -e\n_FIT=${fit}\n${block}`], { cwd: dir, encoding: 'utf8' });
+      const r1 = run(TOKEN);
+      assert(r1.status === 0, `bloque falló: ${r1.stderr}`);
+      const out = r1.stdout + r1.stderr;
+      for (const v of [TOKEN, STG.VG, STG.DB]) assert(!out.includes(v), `imprimió un secreto: ${v}`);
+      assert(!/=/.test(out.replace(/^.*━━━.*$/gm, '')), `imprimió un KEY=VALUE:\n${out}`);
+      const kv = Object.fromEntries(fs.readFileSync(path.join(dir, '.env'), 'utf8').split('\n').filter((l) => /^[A-Z0-9_]+=/.test(l)).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
+      eq(kv.FINOPS_INGEST_TOKEN, TOKEN, 'token escrito');
+      eq(kv.DYNAMIC_PROVIDER_WORKER_ENABLED, 'false', 'worker de proveedores apagado');
+      eq(kv.VIDEOGEN_API_KEY, STG.VG, 'claves de staging intactas');
+      for (const k of ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GAMMA_API_KEY', 'GAMMA_THEME_V21_DARK_DEFAULT']) assert(!(k in kv), `no debe agregar ${k}`);
+      const before = fs.readFileSync(path.join(dir, '.env'), 'utf8');
+      const r2 = run(TOKEN);
+      assert(r2.status === 0, r2.stderr);
+      eq(fs.readFileSync(path.join(dir, '.env'), 'utf8'), before, 'idempotente');
+      const r3 = run('');
+      assert(r3.status === 0 && /FINOPS_INGEST_TOKEN: sin valor/.test(r3.stdout), 'sin secret de GitHub: no toca el token');
+      eq(fs.readFileSync(path.join(dir, '.env'), 'utf8'), before, 'sin secret: .env igual');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await check('preflight-v21-providers: READY / MISSING_CONFIG por proveedor sobre el .env de staging, sin imprimir valores; guard de producción', () => {
+    assert(/preflight-v21-providers\.js/.test(stagingText), 'el deploy corre el preflight');
+    const S = { O: 'sk-o-SECRET-1', A: 'sk-a-SECRET-2', G: 'g-SECRET-3', V: 'v-SECRET-4', Y: 'y-SECRET-5', F: 'f-SECRET-6' };
+    const base = { PATH: process.env.PATH, MIGRATION_ENV: 'staging' };
+    const full = { ...base, OPENAI_API_KEY: S.O, ANTHROPIC_API_KEY: S.A, GAMMA_API_KEY: S.G, GAMMA_THEME_V21_LIGHT_DEFAULT: 'l', GAMMA_THEME_V21_DARK_DEFAULT: 'd',
+      VIDEOGEN_API_KEY: S.V, YOUTUBE_CLIENT_ID: 'cid', YOUTUBE_CLIENT_SECRET: S.Y, YOUTUBE_REDIRECT_URI: 'https://x/cb', YOUTUBE_TOKEN_SECRET: S.Y, FINOPS_INGEST_TOKEN: S.F, DYNAMIC_PROVIDER_WORKER_ENABLED: 'false' };
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'v21-pf-'));
+    try {
+      fs.symlinkSync(path.resolve(distRoot), path.join(tmp, 'dist'));
+      const pf = (env) => spawnSync(process.execPath, [path.resolve('scripts/preflight-v21-providers.js')], { cwd: tmp, env, encoding: 'utf8' });
+      const ok = pf(full);
+      const outOk = ok.stdout + ok.stderr;
+      for (const name of ['Gamma', 'OpenAI TTS', 'Anthropic', 'Videogen', 'YouTube', 'FinOps']) assert(new RegExp(`✓ ${name}: READY`).test(outOk), `${name} READY:\n${outOk}`);
+      for (const v of Object.values(S)) assert(!outOk.includes(v), `imprimió un secreto: ${v}`);
+      const miss = pf({ ...base, VIDEOGEN_API_KEY: S.V });
+      const outMiss = miss.stdout + miss.stderr;
+      for (const name of ['Gamma', 'OpenAI TTS', 'Anthropic', 'YouTube', 'FinOps']) assert(new RegExp(`✗ ${name}: MISSING_CONFIG`).test(outMiss), `${name} MISSING:\n${outMiss}`);
+      assert(/✓ Videogen: READY/.test(outMiss) && /falta ANTHROPIC_API_KEY/.test(outMiss) && /falta GAMMA_API_KEY/.test(outMiss), outMiss);
+      assert(!outMiss.includes(S.V), 'imprimió la clave de Videogen');
+      assert(/GET \/themes/.test(fs.readFileSync('scripts/preflight-v21-providers.js', 'utf8')) && !/readFileSync\([^)]*VPS_PATH/.test(fs.readFileSync('scripts/preflight-v21-providers.js', 'utf8')), 'discovery read-only, sin producción');
+      const guard = pf({ ...base, DB_HOST: 'db.hriwbakbuypaiovvvkqh.supabase.co', DB_USER: 'x' });
+      eq(guard.status, 1, 'guard de producción');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
 

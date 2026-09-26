@@ -142,12 +142,17 @@ jobs:
             ./ "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:${{ secrets.VPS_PATH_STAGING }}/"
 
       - name: Install prod deps + migrate + restart staging processes on VPS
+        env:
+          # V2.1 FinOps: secreto del environment "staging" de GitHub. Viaja por stdin
+          # (nunca en argv ni en el log) y se escribe en el .env de staging sin imprimirse.
+          FINOPS_INGEST_TOKEN_STAGING: ${{ secrets.FINOPS_INGEST_TOKEN_STAGING }}
         run: |
-          ssh -i ~/.ssh/deploy_key \
+          printf "%s\n" "$FINOPS_INGEST_TOKEN_STAGING" | ssh -i ~/.ssh/deploy_key \
               -o StrictHostKeyChecking=no \
               "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
               'set -e
                cd '"${{ secrets.VPS_PATH_STAGING }}"'
+               IFS= read -r _FIT || true
 
                if [ ! -f .env ]; then
                  echo "❌ Falta .env en '"${{ secrets.VPS_PATH_STAGING }}"' — créalo a mano una sola vez"
@@ -333,6 +338,45 @@ jobs:
                  echo "+ ${key}: ${before} → ${value} (backup: .env.bak)"
                }
 
+               # ── V2.1 FinOps (staging) ──────────────────────────────────────────
+               # Aislamiento: este deploy SOLO lee/escribe el .env de STAGING. Nunca
+               # lee el .env de producción ni copia claves desde producción.
+               # Valor de una clave en el .env de staging (última línea, pelado); vacío si no está.
+               _env_val() {
+                 local f="$1"
+                 local k="$2"
+                 local raw
+                 raw=$(grep "^${k}=" "$f" 2>/dev/null | tail -n 1 || true)
+                 [ -n "$raw" ] && _flags_strip_value "${raw#${k}=}"
+                 return 0
+               }
+               # Secreto que llega por stdin desde un secret de GitHub: se escribe sin imprimirlo.
+               ensure_env_secret() {
+                 local key="$1"
+                 local value="$2"
+                 local count cur tmp
+                 if [ -z "$value" ]; then echo "✗ ${key}: sin valor (falta el secret de GitHub) — no se toca"; return 0; fi
+                 count=$(grep -c "^${key}=" .env || true)
+                 if [ "$count" -gt 1 ]; then echo "❌ ${key} aparece más de una vez en el .env — no se toca"; return 1; fi
+                 cur=$(_env_val .env "$key")
+                 if [ "$cur" = "$value" ]; then echo "✓ ${key}: sin cambios"; return 0; fi
+                 if [ "$count" -eq 0 ]; then
+                   printf "\n%s=%s\n" "$key" "$value" >> .env
+                   echo "+ ${key}: configurado"
+                   return 0
+                 fi
+                 tmp=".env.flags.tmp.$$"
+                 awk -v k="$key" -v v="$value" "BEGIN{p=k \"=\"} index(\$0,p)==1 {print p v; next} {print}" .env > "$tmp"
+                 if [ ! -s "$tmp" ] || [ "$(awk "END{print NR}" .env)" != "$(awk "END{print NR}" "$tmp")" ]; then
+                   echo "❌ ${key}: la reescritura del .env no validó — se aborta sin tocar .env"
+                   rm -f "$tmp"
+                   return 1
+                 fi
+                 cp .env .env.bak
+                 mv "$tmp" .env
+                 echo "+ ${key}: actualizado (backup: .env.bak)"
+               }
+
                ensure_pm2_process() {
                  local name="$1"
                  local start_script="$2"
@@ -365,6 +409,13 @@ jobs:
                else
                  echo "✓ DYNAMIC_COHERENCE_LLM ausente (OFF)"
                fi
+
+               echo "━━━ [0c] V2.1: FinOps + proveedores (solo el .env de STAGING) ━━━"
+               ensure_env_secret FINOPS_INGEST_TOKEN "${_FIT:-}"
+               # Calibración NO aprobada todavía: el worker de proveedores reales queda apagado.
+               ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED false
+               # Las claves de proveedores de staging se cargan en staging (secrets de staging);
+               # lo que falte lo reporta el preflight [6b2] — nunca se toma de producción.
 
                echo "━━━ [1/6] Instalar dependencias de producción ━━━"
                npm install --omit=dev
@@ -458,6 +509,9 @@ jobs:
 
                echo "━━━ [6b] Fase 5A: preflight (solo lectura, staging) ━━━"
                MIGRATION_ENV=staging node scripts/preflight-dynamic-generation.js
+
+               echo "━━━ [6b2] V2.1: preflight de proveedores + FinOps (solo lectura, informativo) ━━━"
+               MIGRATION_ENV=staging PREFLIGHT_GAMMA_THEMES=1 node scripts/preflight-v21-providers.js || true
 
                echo "━━━ [6c] Estabilidad PM2 staging (ventana de 45 s) ━━━"
                PM2_BEFORE=$(sudo pm2 jlist | node scripts/pm2-staging-stability.js snapshot)
