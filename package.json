@@ -27,6 +27,8 @@
     "start:dynamic-item-worker:dev": "ts-node src/workers/dynamic-item-worker.ts",
     "start:dynamic-package-worker": "node dist/workers/dynamic-package-worker.js",
     "start:dynamic-package-worker:dev": "ts-node src/workers/dynamic-package-worker.ts",
+    "start:dynamic-provider-worker": "node dist/workers/dynamic-provider-worker.js",
+    "start:dynamic-provider-worker:dev": "ts-node src/workers/dynamic-provider-worker.ts",
     "start:dev": "ts-node-dev --respawn --transpile-only src/main.ts",
     "start:debug": "ts-node-dev --inspect --respawn --transpile-only src/main.ts",
     "start:prod": "node dist/main.js",

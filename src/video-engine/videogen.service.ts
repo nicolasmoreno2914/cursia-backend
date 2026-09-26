@@ -16,6 +16,11 @@ export interface VideogenBatchJob {
   download_url?: string | null;
   error?: string | null;
   progress?: number | null;
+  /**
+   * V2.1 (R11a): duración del video en segundos SI Videogen la informa en el
+   * status (campo opcional; los consumidores legacy lo ignoran). null/ausente = desconocida.
+   */
+  duration_seconds?: number | null;
 }
 
 export interface VideogenBatchResult {
@@ -50,6 +55,22 @@ export function isJobPending(status: string): boolean {
   return !isJobCompleted(status) && !isJobFailed(status);
 }
 
+/**
+ * V2.1 (R11a): duración en SEGUNDOS del status crudo de Videogen, solo desde
+ * campos con unidad explícita (`duration_seconds`/`duration_sec`, o
+ * `duration_ms` convertido). El genérico `duration` (unidad desconocida) se
+ * ignora; el rango plausible lo valida el worker (video-duration.ts).
+ */
+function videogenDurationSeconds(j: any): number | null {
+  for (const k of ['duration_seconds', 'duration_sec']) {
+    const n = j?.[k] != null ? Number(j[k]) : NaN;
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  const ms = j?.duration_ms != null ? Number(j.duration_ms) : NaN;
+  if (Number.isFinite(ms) && ms > 0) return ms / 1000;
+  return null;
+}
+
 @Injectable()
 export class VideogenService {
   private readonly logger = new Logger(VideogenService.name);
@@ -73,6 +94,7 @@ export class VideogenService {
       download_url: j.download_url ?? null,
       error: j.error ?? j.error_message ?? null,
       progress: j.progress != null ? Number(j.progress) : null,
+      duration_seconds: videogenDurationSeconds(j),
     }));
   }
 

@@ -188,8 +188,12 @@ async function main() {
         assert(JSON.stringify(files) === JSON.stringify([
           'scripts/lib/production-jobs-constraints.js',
           'supabase-migration-dynamic-course-structure.sql', 'supabase-migration-course-blueprints.sql',
+          'supabase-migration-v21-blueprint-profiles.sql',
           'supabase-migration-generation-manifests.sql', 'supabase-migration-dynamic-generation.sql',
           'supabase-migration-dynamic-generation-v2.sql', 'supabase-migration-invalidation.sql',
+          'supabase-migration-v21-manifest-v3.sql',
+          // V2.1 RF (FinOps ledger + seed de precios por hook) y RF-b (RLS de FinOps + course_profiles).
+          'supabase-migration-v21-finops.sql', 'supabase-migration-v21-finops-rls.sql',
           'supabase-migration-storage-artifacts-policies.sql']), 'orden: ' + files.join(','));
         for (const s of plan.steps.filter((x) => x.status === 'included')) {
           const h = crypto.createHash('sha256').update(fs.readFileSync(path.join(REPO, s.file))).digest('hex');
@@ -201,6 +205,13 @@ async function main() {
         const s0 = plan.steps[0];
         assert(s0.order === 0 && s0.id === 'production-jobs-constraints' && s0.builtin === true && s0.status === 'included', 'paso 0: ' + JSON.stringify(s0));
         assert(!plan.preconditions.some((p) => /deploy\.yml ya corrió/.test(p)), 'la precondición "deploy.yml ya corrió" debe haber desaparecido (C1)');
+      });
+      await test('fix round 1 (review G2 I5): TODO supabase-migration-*.sql está en el plan o en EXCLUDED (ninguno se olvida)', async () => {
+        const res = run(RUNNER, ['--plan-json'], {}, { preload: FORBID });
+        const plan = JSON.parse(res.stdout);
+        const known = new Set([...plan.steps.map((x) => x.file), ...plan.excluded.map((x) => x.file)]);
+        const orphan = fs.readdirSync(REPO).filter((f) => /^supabase-migration-.*\.sql$/.test(f) && !known.has(f));
+        assert(orphan.length === 0, 'migraciones fuera del runner: ' + orphan.join(', '));
       });
       await test('placeholder Fase 8 (M1): [included] si supabase-migration-invalidation.sql existe, [placeholder-unresolved] si no', async () => {
         const res = run(RUNNER, ['--plan-json'], {}, { preload: FORBID });
@@ -488,9 +499,20 @@ async function main() {
       }
       // 6 y no 7: audit-generation-manifests.js sale antes de su sonda cuando
       // la tabla está vacía (comportamiento original, tabla recién creada).
-      assert((res.out.match(/sonda omitida/g) || []).length === 6, 'esperaba 6 sondas omitidas en production-readonly\n' + res.out);
-      assert((res.out.match(/🔒 Modo production-readonly/g) || []).length === 7, 'los 7 verify/audit en production-readonly');
+      // Fix round 1 (review G2 I5): + verify-v21-blueprint-profiles y verify-v21-manifest-v3 (1 sonda omitida c/u).
+      assert((res.out.match(/sonda omitida/g) || []).length === 8, 'esperaba 8 sondas omitidas en production-readonly\n' + res.out);
+      assert((res.out.match(/🔒 Modo production-readonly/g) || []).length === 9, 'los 9 verify/audit en production-readonly');
       assert((res.out.match(/✓ cursia_artifacts_/g) || []).length === 4, 'políticas de storage');
+      // V2.1 RF / RF-b: ledger FinOps + seed de precios (hook del paso, misma tx) + RLS.
+      for (const id of ['v21-finops', 'v21-finops-rls']) assert(res.out.includes(id), 'no aplicó ' + id);
+      await withClient('prodlike', async (c) => {
+        const seedRows = JSON.parse(fs.readFileSync(path.join(REPO, 'src/modules/finops/pricing-seed.v1.json'), 'utf8')).rows.length;
+        const n = (await c.query(`select count(*)::int n from public.pricing_catalog`)).rows[0].n;
+        assert(n === seedRows, `pricing_catalog sembrado: ${n} de ${seedRows}`);
+        const rls = (await c.query(`select count(*)::int n from pg_class where relnamespace = 'public'::regnamespace and relrowsecurity
+          and relname in ('pricing_catalog','generation_cost_events','cost_estimates','cost_budget_policies','cost_budget_authorizations','cost_avoidance_events','course_profiles')`)).rows[0].n;
+        assert(rls === 7, `RLS habilitada en ${rls}/7 tablas`);
+      });
       dumpAfterFirst = await schemaDump(pgBin, 'prodlike');
     });
     await test('APPLY idempotente: segunda corrida exit 0 y esquema idéntico (pg_dump -s)', async () => {

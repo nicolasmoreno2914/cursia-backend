@@ -1,11 +1,14 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   InternalServerErrorException,
   Logger,
   NotFoundException,
+  NotImplementedException,
   Optional,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import type { QueryRunner } from 'typeorm';
@@ -37,7 +40,49 @@ import { assertDynamicOwnerAllowed, assertRealVideoAllowed } from '../features/d
 import { FromRunDto, isFromRunRequest } from '../invalidation/dto/from-run.dto';
 import { computePlanFromDb, executeApplyWrites, planApplyWrites } from '../invalidation/invalidation-apply';
 import { requiredArtifactTypes } from '../dynamic-packaging/artifact-resolver';
+import { regenerationCascade } from './regeneration-cascade';
+import {
+  PROVIDER_MODES_CONFLICT,
+  PROVIDER_MOCK_NOT_ALLOWED,
+  ProviderModeError,
+  ProviderModes,
+  frozenProviderModesOf,
+  isProviderWorkerDeployed,
+  providerWorkerNotDeployedMessage,
+  resolveProviderModes,
+  sameProviderModes,
+} from './provider-modes';
+import {
+  PROVIDER_NOT_READY,
+  V3_REQUIRES_YOUTUBE_DELIVERY,
+  providerNotReadyMessage,
+  providerReadinessMissing,
+  v3RequiresYoutubeMessage,
+  v3VideoDeliveryOk,
+} from './provider-readiness';
+import { INVALIDATION_V3_NOT_IMPLEMENTED, assertInvalidationRulesSupported } from '../invalidation/plan';
 import { latestGenerationPredicate } from './item-generations';
+import { FinopsBudgetService, StartBudgetEvaluation } from '../finops/finops-budget.service';
+import {
+  BUDGET_APPROVAL_REQUIRED,
+  BUDGET_BLOCKED,
+  BUDGET_EXCEEDED,
+  FINOPS_UNAVAILABLE,
+  RunManifestItem,
+  RunSpendModes,
+  estimateItemsForRun,
+  runSpendModes,
+  spendModeOfItemType,
+  estimateSummary,
+  paidProviderOfItemType,
+  paidRealProviders,
+} from '../finops/run-budget';
+import { incrementalCostForPlan } from '../finops/incremental';
+import { FinopsError } from '../finops/errors';
+import { addDec, normalizeDecimal } from '../finops/decimal';
+import { runtimeGuard } from '../finops/budget';
+import type { EstimateResult, MinExpMax } from '../finops/estimator';
+import { assertAssessmentProfileResolvableForRun } from '../course-profiles/assessment-preflight';
 import {
   ACTIVE_RUN_WORKER_STATUSES,
   isActiveRun,
@@ -212,6 +257,11 @@ function isAmbiguousYoutubeUpload(row: { error?: string | null; output_summary?:
   );
 }
 
+/** V2.1 RF-b: item bloqueado por el runtime guard de presupuesto (reanudable con retry). */
+function isBudgetBlocked(row: { status?: string | null; error?: string | null }): boolean {
+  return row.status === 'blocked' && String(row.error ?? '').startsWith(BUDGET_EXCEEDED);
+}
+
 export interface StartRunResult {
   created: boolean;
   reopened: boolean;
@@ -229,12 +279,19 @@ export const YOUTUBE_VIDEO_NOT_VERIFIED = 'youtube_video_not_verified';
 /** Código estable del 409 de un retry sobre una subida ambigua. */
 export const YOUTUBE_UPLOAD_AMBIGUOUS = 'youtube_upload_ambiguous';
 
-/** F78-BE2: qué cuesta regenerar un item. */
-export type RegenerationCostKind = 'videogen' | 'llm' | 'none';
+/** F78-BE2: qué cuesta regenerar un item. V2.1 (R4): + 'gamma' (presentation) y 'tts' (audio_*). */
+export type RegenerationCostKind = 'videogen' | 'llm' | 'none' | 'gamma' | 'tts';
 
-/** Video en run 'real' → Videogen; video 'mock' → nada; cualquier otro tipo lo genera un LLM (créditos). */
+/**
+ * Video en run 'real' → Videogen; video 'mock' → nada; presentation (v3) →
+ * Gamma; audio_welcome/audiobook_chapter (v3) → TTS; cualquier otro tipo lo
+ * genera un LLM (créditos). Gamma/TTS se declaran siempre (sin atajo 'mock'):
+ * sus workers en modo real llaman a Gamma / OpenAI TTS (V2.1 F2).
+ */
 export function regenerationCostKind(type: string, videoMode: RunVideoMode): RegenerationCostKind {
   if (type === 'video') return videoMode === 'real' ? 'videogen' : 'none';
+  if (type === 'presentation') return 'gamma';
+  if (type === 'audio_welcome' || type === 'audiobook_chapter') return 'tts';
   return 'llm';
 }
 
@@ -278,6 +335,33 @@ export interface RegenerateDryRunResult {
   affected: RegenerationAffectedItem[];
   /** Trabas que la llamada real respondería con 403/409 (vacío = se puede confirmar). */
   blockers: Array<{ code: string; message: string }>;
+  /**
+   * V2.1 RF-b: costo incremental (min/esperado/max) y evitado por item afectado
+   * (incrementalCostForPlan: evitado = costo real histórico primero, HD-V21-18).
+   * null si el servicio de FinOps no está disponible (harness).
+   */
+  cost: RegenerationCostPreview | null;
+}
+
+/** V2.1 RF-b: vista de costo de una regeneración (dryRun). */
+export interface RegenerationCostPreview {
+  currency: string;
+  incrementalCost: MinExpMax;
+  avoided: string;
+  byItem: Array<{
+    itemKey: string;
+    action: RegenerationAffectedItem['action'];
+    incrementalCost: MinExpMax;
+    avoided: string;
+    avoidedBasis: 'historical_actual' | 'current_estimate' | null;
+  }>;
+}
+
+/** V2.1 RF-b: señal interna del camino fromRun (plan calculado DENTRO de la tx): hace falta aprobación. */
+class BudgetGateRejection extends Error {
+  constructor(public readonly evaluation: StartBudgetEvaluation, public readonly code: string, public readonly planSha: string | null) {
+    super(code);
+  }
 }
 
 interface RegenerationBlocker {
@@ -293,7 +377,8 @@ interface RegenerationPlan {
   blockers: RegenerationBlocker[];
   affected: RegenerationAffectedItem[];
   cascade: Array<{ key: string; prev: any; costKind: RegenerationCostKind }>;
-  video: { key: string; row: any; action: RegenerationAffectedItem['action'] } | null;
+  /** Dependientes que quedan STALE_NO_AUTO (v1/v2: el video; v3: proveedores + video_interactions). */
+  staleDeps: Array<{ key: string; row: any; action: RegenerationAffectedItem['action'] }>;
   staleArtifactIds: string[];
   stale: boolean;
 }
@@ -353,6 +438,12 @@ export class RunsService {
      * CERRADO con 409 `youtube_preflight_failed:preflight_unavailable`.
      */
     @Optional() private readonly youtubePreflight?: DynamicYoutubePreflightService,
+    /**
+     * V2.1 RF-b: estimado + gates de presupuesto. @Optional por los harnesses
+     * previos: sin él, todo camino con un proveedor pagado REAL falla CERRADO
+     * (503 finops_unavailable); los runs mock/LLM siguen sin estimado.
+     */
+    @Optional() private readonly finopsBudget?: FinopsBudgetService,
   ) {
     // M6 (review-it2): NO se valida DYNAMIC_VIDEO_DELIVERY acá. RunsService
     // vive en AppModule, que arranca la API y todos los workers legacy — un
@@ -393,6 +484,8 @@ export class RunsService {
     // G3: flag V2 + allow-list por owner (403 antes de tocar la DB).
     assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
+    // V2.1 F1 (I3): v3 → el perfil de evaluación vigente debe resolverse contra este Manifest ANTES de gastar (409).
+    await assertAssessmentProfileResolvableForRun(this.dataSource, courseId, manifest);
     // Fase 8 (F8-BE): `{fromRun}` crea el run B aplicando el plan de
     // invalidación (mismo entry point → mismos gates G3 de arriba).
     if (isFromRunRequest(courseContext)) {
@@ -406,13 +499,70 @@ export class RunsService {
     // uso y se congela SOLO en runs nuevos; un run existente/reabierto
     // conserva la suya aunque la config haya cambiado.
     const videoDelivery = readVideoDeliveryConfig();
+    // V2.1 fix round 1 (I1/M1): modos de proveedor explícitos (v3; v1/v2 → undefined).
+    const providerModes = this.providerModesForNewRun(manifest.rulesVersion, (courseContext as any)?.providerModes);
+    // V2.1 F2 (review final I1/I2): preflight de proveedores v3 ANTES de cualquier escritura o gasto.
+    if (providerModes) {
+      const gate = resolveRunVideoDelivery({ videoCount: this.videoCountOf(manifest), videoMode, configured: videoDelivery });
+      // Un gate de entrega inválido lo rechaza más abajo enforceVideoGate con su propio 409.
+      this.assertV3ProviderPreflight(manifest, providerModes, videoMode, gate.ok ? gate.strategy : null);
+    }
     // I1 (review-rv2): nunca dos generaciones completas activas del mismo
     // curso (doble gasto) — p.ej. un run v1 en curso y la config pasa a v2.
     // Chequeo temprano (409 legible); la garantía bajo concurrencia la dan
     // los chequeos bajo advisory lock en insertRun/reopenRun/retryItem.
     const other = await this.findActiveRunOnOtherManifest(this.dataSource, courseId, manifest.id);
     if (other) throw this.otherActiveRunConflict(other, manifest);
-    return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, true, videoDelivery);
+    return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, true, videoDelivery, providerModes);
+  }
+
+  /** V2.1 fix round 1 (I1/M1): ProviderModeError → 403/400; v3 sin worker de proveedor → 501. */
+  private providerModesForNewRun(rulesVersion: number, requested: unknown): ProviderModes | undefined {
+    let modes: ProviderModes | undefined;
+    try {
+      modes = resolveProviderModes(rulesVersion, requested);
+    } catch (err) {
+      if (err instanceof ProviderModeError) {
+        const body = { message: err.message, code: err.code };
+        throw err.code === PROVIDER_MOCK_NOT_ALLOWED ? new ForbiddenException(body) : new BadRequestException(body);
+      }
+      throw err;
+    }
+    if (modes && !isProviderWorkerDeployed()) {
+      throw new NotImplementedException({ message: providerWorkerNotDeployedMessage(), code: 'PROVIDER_WORKER_NOT_DEPLOYED' });
+    }
+    return modes;
+  }
+
+  /**
+   * V2.1 F2 (review final I1/I2): un run v3 solo nace si puede terminar.
+   * - cada proveedor congelado en `real` está cableado y configurado → si no,
+   *   409 `provider_not_ready` con la lista de lo que falta (nombres, nunca valores);
+   * - con videos, la entrega congelada es YouTube → si no, 409
+   *   `v3_requires_youtube_delivery` (video_interactions necesita el id de YouTube).
+   * Puro sobre el entorno actual; se llama antes de escribir nada. El gate de
+   * presupuesto (RF) corre después, igual que antes.
+   */
+  private assertV3ProviderPreflight(
+    manifest: ManifestDto,
+    providerModes: ProviderModes,
+    videoMode: RunVideoMode,
+    frozenDelivery: VideoDeliveryStrategy | null,
+    videoCount: number = this.videoCountOf(manifest),
+  ): void {
+    if (manifest.rulesVersion !== 3) return;
+    const missing = providerReadinessMissing({ providerModes, videoMode, videoCount });
+    if (missing.length > 0) {
+      throw new ConflictException({ message: providerNotReadyMessage(missing), code: PROVIDER_NOT_READY, missing });
+    }
+    if (frozenDelivery !== null && !v3VideoDeliveryOk(videoCount, frozenDelivery)) {
+      throw new ConflictException({
+        message: v3RequiresYoutubeMessage(frozenDelivery),
+        code: V3_REQUIRES_YOUTUBE_DELIVERY,
+        videoCount,
+        videoDelivery: frozenDelivery,
+      });
+    }
   }
 
   /**
@@ -452,6 +602,12 @@ export class RunsService {
     if (!rowA) throw new NotFoundException(`La ejecución de origen ${fromRunId} no existe para el curso #${courseId}`);
     const bpNumberA = Number(rowA.input_payload?.blueprintNumber);
     const manifestA = await this.manifests.getById(courseId, ownerId, bpNumberA, Number(rowA.input_payload?.manifestId));
+    // V2.1 (R5): v3 → v3 se calcula; mezclar rulesVersion 3 con 1/2 → 501 antes de leer Blueprints (fail loud).
+    try {
+      assertInvalidationRulesSupported(manifestA.rulesVersion, manifestB.rulesVersion);
+    } catch (err) {
+      throw new NotImplementedException({ code: INVALIDATION_V3_NOT_IMPLEMENTED, message: (err as Error).message });
+    }
     if (manifestA.id === manifestB.id) {
       throw new ConflictException(
         `La ejecución ${fromRunId} ya es del Manifest #${manifestB.id}: no hay cambio de estructura que aplicar ` +
@@ -461,9 +617,14 @@ export class RunsService {
     const ctxA = await this.loadContextRow(rowA.id);
     const videoMode = this.videoModeOf(rowA);
     const videoDelivery = frozenVideoDeliveryOf(rowA.input_payload);
+    // V2.1 F2 (review final I1): B hereda los modos congelados de A → mismo preflight antes de escribir nada.
+    {
+      const inherited = frozenProviderModesOf(rowA.input_payload);
+      if (manifestB.rulesVersion === 3 && inherited) this.assertV3ProviderPreflight(manifestB, inherited, videoMode, videoDelivery);
+    }
     const [bpA, bpB] = await Promise.all([
-      this.manifests.blueprintOf(courseId, ownerId, bpNumberA),
-      this.manifests.blueprintOf(courseId, ownerId, blueprintNumber),
+      this.manifests.blueprintOfForRules(courseId, ownerId, bpNumberA, manifestA.rulesVersion),
+      this.manifests.blueprintOfForRules(courseId, ownerId, blueprintNumber, manifestB.rulesVersion),
     ]);
     const [course] = await this.dataSource.query(
       `select metadata->>'courseId' as frontend_course_id from public.courses where id = $1`,
@@ -523,7 +684,7 @@ export class RunsService {
           ctxA.context_hash,
           (id) => sources.get(id)?.status ?? null,
           (id) => sources.get(id)?.metadata?.inputFingerprint ?? null,
-          { required: (t) => requiredArtifactTypes(manifestB.rulesVersion, t as ManifestItemType), typeOf: (id) => sources.get(id)?.type },
+          { required: (t, variant) => requiredArtifactTypes(manifestB.rulesVersion, t as ManifestItemType, variant), typeOf: (id) => sources.get(id)?.type },
         );
         if (writes.missingRoles.length > 0) {
           const message =
@@ -542,6 +703,19 @@ export class RunsService {
         const gate = frozenRunVideoGate({ videoWork: writes.videoItemsToGenerate.length, videoMode, strategy: videoDelivery });
         if (gate.ok === false) throw new ConflictException({ message: gate.message, code: gate.code });
         if (gate.requiresYoutubePreflight && !youtubePreflightPassed) throw new NeedsYoutubePreflight(gate);
+        // V2.1 fix round 1 (M1): B va a generar items de Gamma/TTS → el worker de proveedor tiene que existir.
+        if (writes.providerItemsToGenerate.length > 0 && !isProviderWorkerDeployed()) {
+          throw new NotImplementedException({ message: providerWorkerNotDeployedMessage(), code: 'PROVIDER_WORKER_NOT_DEPLOYED' });
+        }
+
+        // V2.1 RF-b: estimado del plan (REUSE = 0 incremental) + gate de presupuesto.
+        const planActions: Record<string, string> = {};
+        for (const a of plan.actions) if (a.inTargetManifest) planActions[a.itemKey] = a.action;
+        const budget = await this.finopsEvaluate({
+          courseId, ownerId, manifestId: manifestB.id, items: manifestB.manifest.items,
+          modes: runSpendModes(videoMode, frozenProviderModesOf(rowA.input_payload)), actions: planActions,
+          runner: qr, planSha: plan.planSha256,
+        });
 
         const invalidation = { fromRunId: rowA.id, planSha256: plan.planSha256, totals: plan.totals, plan };
         const inputPayload = {
@@ -552,6 +726,8 @@ export class RunsService {
           videoDelivery,
           fromRunId: rowA.id,
           invalidationPlanSha256: plan.planSha256,
+          // V2.1 fix round 1 (I1): B hereda los modos de proveedor congelados de A (v3).
+          ...(rowA.input_payload?.providerModes ? { providerModes: rowA.input_payload.providerModes } : {}),
         };
         const [job] = await qr.query(
           `insert into public.production_jobs
@@ -585,11 +761,15 @@ export class RunsService {
             `Manifest #${manifestB.id}: se sembraron ${seeded.size} items pero totals.totalJobs = ${manifestB.totals.totalJobs}`,
           );
         }
+        await this.finopsBindRun(qr, budget, { runId: job.id, courseId, ownerId, manifestId: manifestB.id, planSha: plan.planSha256 });
         // Todo reutilizado (p.ej. reorder puro) → el run nace completed.
         await recomputeRunStatus(qr, job.id);
         return { kind: 'created' as const, jobId: job.id as string };
       });
     } catch (err) {
+      if (err instanceof BudgetGateRejection) {
+        throw await this.budgetRejection(err.evaluation, err.code, { courseId, ownerId, manifestId: manifestB.id, planSha: err.planSha });
+      }
       if (!(err instanceof NeedsYoutubePreflight) || youtubePreflightPassed) throw err;
       await this.enforceVideoGate(ownerId, err.gate); // 409 si no pasa
       return this.startRunFromPrevious(courseId, ownerId, blueprintNumber, manifestB, fromRunId, true);
@@ -597,6 +777,7 @@ export class RunsService {
 
     const job = await this.loadJobById(outcome.jobId);
     const inv = job.output_summary?.invalidation;
+    if (outcome.kind === 'created' && inv?.plan) await this.finopsRecordAvoidance(job, manifestB, inv.plan);
     return {
       created: outcome.kind === 'created',
       reopened: false,
@@ -620,14 +801,15 @@ export class RunsService {
     videoMode: RunVideoMode,
     mayRetry: boolean,
     videoDelivery: VideoDeliveryStrategy,
+    providerModes?: ProviderModes,
   ): Promise<StartRunResult> {
     const active = await this.findActiveRunRow(manifest.id);
-    if (active) return this.existingRunOrConflict(active, manifest, contextHash, videoMode);
+    if (active) return this.existingRunOrConflict(active, manifest, contextHash, videoMode, providerModes);
 
     const latest = await this.findLatestRunRow(manifest.id);
     if (latest) {
       // Carrera: el run pudo commitearse entre las dos lecturas → es el activo.
-      if (isActive(latest)) return this.existingRunOrConflict(latest, manifest, contextHash, videoMode);
+      if (isActive(latest)) return this.existingRunOrConflict(latest, manifest, contextHash, videoMode, providerModes);
       if (!isReopenable(latest)) {
         throw new ConflictException(
           `La ejecución anterior de este Manifest ya terminó (${latest.worker_status}); re-ejecutar un Manifest ` +
@@ -647,6 +829,12 @@ export class RunsService {
             `(Fase 8). runId=${latest.id}`,
         );
       }
+      if (providerModes && !sameProviderModes(frozenProviderModesOf(latest.input_payload), providerModes)) {
+        throw new ConflictException({
+          message: `La ejecución anterior usó otros modos de proveedor; cambiarlos requiere regeneración. runId=${latest.id}`,
+          code: PROVIDER_MODES_CONFLICT,
+        });
+      }
       // I1 (5C): reabrir un run 'real' vuelve a gastar Videogen → allow-list DYNAMIC_REAL_VIDEO_OWNERS.
       if (latestVideoMode === 'real') assertRealVideoAllowed(ownerId);
       // Fix wave (M5): un run reemplazado por uno creado desde él no se reabre.
@@ -660,6 +848,19 @@ export class RunsService {
         ownerId,
         frozenRunVideoGate({ videoWork, videoMode: latestVideoMode, strategy: frozenVideoDeliveryOf(latest.input_payload) }),
       );
+      // RF-b fix I1: reabrir re-encola items cancelled; si alguno envía trabajo pagado
+      // real nuevo (video sin job, item de proveedor) → aprobación ADMIN que lo cubra.
+      {
+        const cancelled: Array<{ item_key: string; type: string; output_summary: Record<string, any> | null }> = await this.dataSource.query(
+          `select g.item_key, g.type, g.output_summary from public.generation_item_runs g
+            where g.job_id = $1 and g.status = 'cancelled' and ${latestGenerationPredicate('g')}`,
+          [latest.id],
+        );
+        const paidKeys = cancelled
+          .filter((r) => paidProviderOfItemType(r.type) !== null && (r.type !== 'video' || !r.output_summary?.external?.videogenJobId))
+          .map((r) => r.item_key);
+        await this.finopsPaidWorkGate({ courseId, ownerId, manifest, job: latest, paidKeys });
+      }
       return this.reopenRun(latest.id, manifest, contextHash);
     }
 
@@ -668,7 +869,7 @@ export class RunsService {
     // casi siempre la carrera "otro POST commiteó entre nuestras lecturas":
     // si ahora hay un run visible, se re-resuelve contra él (una vez).
     if (mayRetry && (await this.hasPreviousItems(manifest)) && (await this.findLatestRunRow(manifest.id))) {
-      return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, false, videoDelivery);
+      return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, false, videoDelivery, providerModes);
     }
     await this.assertNoPreviousItems(manifest);
     // I1 (5C): un run NUEVO con video real requiere DYNAMIC_REAL_VIDEO_OWNERS (fail closed). Un run
@@ -687,17 +888,24 @@ export class RunsService {
     );
     const frontendCourseId: string | null = course?.frontend_course_id ?? null;
 
+    // V2.1 RF-b: estimado + gate de presupuesto ANTES de escribir el run.
+    const budget = await this.finopsStartGate({
+      courseId, ownerId, manifestId: manifest.id, items: manifest.manifest.items, modes: runSpendModes(videoMode, providerModes ?? null),
+    });
+
     let jobId: string;
     try {
-      jobId = await this.tx((qr) =>
-        this.insertRun(qr, manifest, ownerId, courseId, frontendCourseId, blueprintNumber, context, contextHash, videoMode, frozenDelivery),
-      );
+      jobId = await this.tx(async (qr) => {
+        const id = await this.insertRun(qr, manifest, ownerId, courseId, frontendCourseId, blueprintNumber, context, contextHash, videoMode, frozenDelivery, providerModes);
+        await this.finopsBindRun(qr, budget, { runId: id, courseId, ownerId, manifestId: manifest.id });
+        return id;
+      });
     } catch (err) {
       if (isActiveRunConflict(err)) {
         // Carrera: otro POST creó el run activo primero (y ya commiteó — el
         // índice único espera al otro insert antes de fallar).
         const winner = await this.findActiveRunRow(manifest.id);
-        if (winner) return this.existingRunOrConflict(winner, manifest, contextHash, videoMode);
+        if (winner) return this.existingRunOrConflict(winner, manifest, contextHash, videoMode, providerModes);
         throw new ConflictException(
           `Otra ejecución del Manifest #${manifest.id} se creó y terminó mientras se procesaba esta; reintentá la consulta`,
         );
@@ -945,6 +1153,7 @@ export class RunsService {
     runId: string,
     itemKey: string,
     resubmitVideo = false,
+    resubmitProvider = false,
   ): Promise<ItemRunDto> {
     // G3 (fix wave / review I1): un retry es un entry point como cualquier
     // otro — requiere la allow-list de V2, antes de tocar manifest o run.
@@ -970,7 +1179,7 @@ export class RunsService {
       );
     const preTarget = preRows.find((i) => i.item_key === itemKey);
     let uploadPhaseRetry = false;
-    if (preTarget && preTarget.status === 'failed') {
+    if (preTarget && (preTarget.status === 'failed' || isBudgetBlocked(preTarget))) {
       if (preTarget.type === 'video' && frozenDelivery === 'youtube' && !resubmitVideo) {
         if (isAmbiguousYoutubeUpload(preTarget)) {
           const message =
@@ -988,6 +1197,18 @@ export class RunsService {
         videoWork = preRows.filter((i) => i.type === 'video' && i.status === 'blocked' && !i.output_summary?.external?.videogenJobId).length;
       }
       await this.enforceVideoGate(ownerId, frozenRunVideoGate({ videoWork, videoMode: this.videoModeOf(job), strategy: frozenDelivery }));
+      // RF-b fix I1: un retry que puede ENVIAR trabajo pagado real nuevo (video sin
+      // job / resubmitVideo, item de proveedor, o videos/proveedores bloqueados que
+      // se desbloquean) exige una aprobación ADMIN que cubra el incremental.
+      if (!uploadPhaseRetry) {
+        const isPaid = (r: { type: string }) => paidProviderOfItemType(r.type) !== null;
+        const newPaid = (r: { type: string; output_summary: Record<string, any> | null }, resubmit: boolean) =>
+          r.type !== 'video' || resubmit || !r.output_summary?.external?.videogenJobId;
+        const paidItems = isPaid(preTarget)
+          ? (newPaid(preTarget, resubmitVideo) ? [preTarget] : [])
+          : preRows.filter((r) => r.status === 'blocked' && isPaid(r) && newPaid(r, false));
+        await this.finopsPaidWorkGate({ courseId, ownerId, manifest, job, paidKeys: paidItems.map((r) => r.item_key) });
+      }
     }
 
     const targetId = await this.tx(async (qr) => {
@@ -1033,9 +1254,11 @@ export class RunsService {
       if (!target) {
         throw new NotFoundException(`El item "${itemKey}" no existe en la ejecución ${job.id}`);
       }
-      if (target.status !== 'failed') {
+      // V2.1 RF-b: un item `blocked` por presupuesto (budget_exceeded) se reanuda
+      // igual que un failed, tras ampliar la autorización del run.
+      if (target.status !== 'failed' && !isBudgetBlocked(target)) {
         throw new ConflictException(
-          `Solo se puede reintentar un item en estado "failed"; "${itemKey}" está en "${target.status}"`,
+          `Solo se puede reintentar un item en estado "failed" (o "blocked" por ${BUDGET_EXCEEDED}); "${itemKey}" está en "${target.status}"`,
         );
       }
 
@@ -1062,6 +1285,22 @@ export class RunsService {
       // del retry normal, para que el worker someta de nuevo en vez de
       // reutilizar/quedar envenenado por el marcador anterior.
       let resubmitSetSql = '';
+      // V2.1 F2 fix round 1: reenvío EXPLÍCITO de una generación de Gamma cuyo envío quedó ambiguo o falló
+      // en Gamma. Archiva el id/marcador (su reserva pendiente sigue en el ledger) y el worker pide una nueva.
+      if (resubmitProvider) {
+        if (resubmitVideo) throw new BadRequestException('resubmitVideo y resubmitProvider son excluyentes');
+        if (target.type !== 'presentation') {
+          throw new BadRequestException(`resubmitProvider solo aplica a items type="presentation"; "${itemKey}" es "${target.type}"`);
+        }
+        const err = target.error ?? '';
+        if (!(err.startsWith('gamma_submit_ambiguous') || err.startsWith('gamma_generation_failed'))) {
+          throw new BadRequestException(
+            `resubmitProvider solo aplica cuando el último error es "gamma_submit_ambiguous" o "gamma_generation_failed"; "${itemKey}" falló con "${err}"`,
+          );
+        }
+        this.logger.warn(`retryItem: resubmitProvider=true para "${itemKey}" (run ${job.id}) — error previo "${err}"; archivando la generación anterior`);
+        resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt'`;
+      }
       if (resubmitVideo) {
         if (target.type !== 'video') {
           throw new BadRequestException(`resubmitVideo solo aplica a items type="video"; "${itemKey}" es "${target.type}"`);
@@ -1089,7 +1328,7 @@ export class RunsService {
                       'retriedAt', now()
                     ))
                   )`;
-      const outputSummaryExpr = resubmitVideo
+      const outputSummaryExpr = resubmitVideo || resubmitProvider
         ? `((${previousErrorsExpr}) || jsonb_build_object(
                     'previousExternals',
                     coalesce(output_summary->'previousExternals', '[]'::jsonb) || jsonb_build_array(jsonb_build_object(
@@ -1114,6 +1353,7 @@ export class RunsService {
                   finished_at = null,
                   updated_at = now()
             where id = $1 and status = 'failed'
+               or (id = $1 and status = 'blocked' and error like '${BUDGET_EXCEEDED}%')
             returning id`,
           [target.id],
         ),
@@ -1430,13 +1670,16 @@ export class RunsService {
         currentGeneration: plan.currentGeneration,
         affected: plan.affected,
         blockers,
+        cost: await this.regenerationCostPreview(manifest, plan.affected, this.spendModesOf(job)).catch((err) => {
+          throw this.finopsUnavailable(err);
+        }),
       };
     }
 
     if (costKind !== 'none' && o.confirmPaid !== true) {
       throw new BadRequestException({
         message:
-          `confirm_paid_required: regenerar "${itemKey}" tiene costo (${costKind === 'videogen' ? 'video real en Videogen' : 'créditos de IA'}); ` +
+          `confirm_paid_required: regenerar "${itemKey}" tiene costo (${costKind === 'videogen' ? 'video real en Videogen' : costKind === 'gamma' ? 'presentación en Gamma' : costKind === 'tts' ? 'audio TTS' : 'créditos de IA'}); ` +
           'reenviá con {"confirmPaid": true} para confirmarlo explícitamente',
         code: 'confirm_paid_required',
         costKind,
@@ -1451,6 +1694,9 @@ export class RunsService {
     if (isCancelledLike(job)) {
       throw new ConflictException(`La ejecución ${job.id} está cancelada; no se pueden regenerar items`);
     }
+    // V2.1 RF-b: estimado de la regeneración + gate de presupuesto (reemplaza el
+    // binario confirmPaid por un monto cuando hay un proveedor pagado real).
+    await this.finopsRegenerationGate(courseId, ownerId, manifest, job, mItem, itemKey, videoMode);
 
     const outcome = await this.tx(async (qr) => {
       await this.lockCourseRuns(qr, courseId);
@@ -1469,6 +1715,18 @@ export class RunsService {
       }
       // La primera traba es el error de siempre (mismo orden y códigos).
       if (plan.blockers.length > 0) throw plan.blockers[0].error();
+      // V2.1 fix round 1 (I2): la cascada también puede costar (p.ej. v3: regenerar un video
+      // mock regenera sus interacciones con LLM) → confirmPaid aunque el pedido en sí sea gratis.
+      const paidCascade = plan.cascade.find((c) => c.costKind !== 'none');
+      if (paidCascade && o.confirmPaid !== true) {
+        throw new BadRequestException({
+          message:
+            `confirm_paid_required: regenerar "${itemKey}" regenera también "${paidCascade.key}" (${paidCascade.costKind}); ` +
+            'reenviá con {"confirmPaid": true} para confirmarlo explícitamente',
+          code: 'confirm_paid_required',
+          costKind: paidCascade.costKind,
+        });
+      }
       return this.applyRegeneration(qr, plan, { job: locked, manifest, itemKey, mItem, ownerId, costKind });
     });
 
@@ -1550,7 +1808,7 @@ export class RunsService {
     const currentGeneration = Number(latest.generation);
     // Idempotencia: la regeneración pedida sigue en vuelo → misma respuesta (antes que cualquier otra regla).
     if (latest.generation > 1 && REGENERATION_IN_FLIGHT.has(latest.status) && latest.output_summary?.regeneration && !isCancelledLike(job)) {
-      return { inFlight: true, latest, currentGeneration, blockers: [], affected: this.storedAffected(latest, itemKey, costKind), cascade: [], video: null, staleArtifactIds: [], stale: false };
+      return { inFlight: true, latest, currentGeneration, blockers: [], affected: this.storedAffected(latest, itemKey, costKind), cascade: [], staleDeps: [], staleArtifactIds: [], stale: false };
     }
     if (a.expectedGeneration !== undefined && a.expectedGeneration !== currentGeneration) {
       const message =
@@ -1587,16 +1845,13 @@ export class RunsService {
     );
     const stale = staleArtifacts.length > 0 || latest.output_summary?.invalidation?.action === 'STALE_NO_AUTO';
 
-    // Cascada de un content (tabla de Fase 8, "editar el capítulo").
-    const cascadeKeys: string[] = [];
-    let videoKey: string | null = null;
-    if (mItem.type === 'content' && mItem.chapterId) {
-      const has = (key: string) => manifest.manifest.items.some((it) => it.key === key);
-      if (has(`scorm:${mItem.chapterId}`)) cascadeKeys.push(`scorm:${mItem.chapterId}`);
-      if (mItem.moduleId && has(`exam:${mItem.moduleId}`)) cascadeKeys.push(`exam:${mItem.moduleId}`);
-      if (has(`video:${mItem.chapterId}`)) videoKey = `video:${mItem.chapterId}`;
-    }
-    const depKeys = videoKey ? [...cascadeKeys, videoKey] : cascadeKeys;
+    // Cascada (tabla de Fase 8 "editar el capítulo"; v3: regeneration-cascade.ts, fix round 1 I2).
+    const { regenerate: cascadeKeys, stale: staleKeys } = regenerationCascade(
+      manifest.rulesVersion,
+      manifest.manifest.items,
+      { key: itemKey, type: mItem.type, moduleId: mItem.moduleId ?? null, chapterId: mItem.chapterId ?? null },
+    );
+    const depKeys = [...cascadeKeys, ...staleKeys];
     const depRows: any[] = depKeys.length
       ? await q.query(
           `select * from public.generation_item_runs g
@@ -1629,15 +1884,15 @@ export class RunsService {
       cascade.push({ key, prev, costKind: depCost });
       affected.push({ itemKey: key, type: prev.type, itemRunId: null, generation: Number(prev.generation) + 1, action: 'REGENERATE', created: true, costKind: depCost });
     }
-    let video: RegenerationPlan['video'] = null;
-    if (videoKey) {
-      const v = depByKey.get(videoKey);
+    const staleDeps: RegenerationPlan['staleDeps'] = [];
+    for (const key of staleKeys) {
+      const v = depByKey.get(key);
       const action: RegenerationAffectedItem['action'] =
         v.status === 'completed' ? 'STALE_NO_AUTO' : REGENERATION_IN_FLIGHT.has(v.status) || v.status === 'running' ? 'WAITS' : 'UNCHANGED';
-      video = { key: videoKey, row: v, action };
-      affected.push({ itemKey: videoKey, type: 'video', itemRunId: v.id, generation: Number(v.generation), action, created: false, costKind: 'none' });
+      staleDeps.push({ key, row: v, action });
+      affected.push({ itemKey: key, type: v.type, itemRunId: v.id, generation: Number(v.generation), action, created: false, costKind: 'none' });
     }
-    return { inFlight: false, latest, currentGeneration, blockers, affected, cascade, video, staleArtifactIds: staleArtifacts.map((x) => x.id), stale };
+    return { inFlight: false, latest, currentGeneration, blockers, affected, cascade, staleDeps, staleArtifactIds: staleArtifacts.map((x) => x.id), stale };
   }
 
   /** Escrituras de una regeneración ya planificada y sin trabas (dentro de la tx, con locks). */
@@ -1672,7 +1927,7 @@ export class RunsService {
                   'supersededByItemRunId', $3::text, 'supersededAt', $4::text),
                 updated_at = now()
           where item_run_id = $1 and status is distinct from 'disabled'`,
-        [prev.id, regeneration.reason === 'cascade_from_content' ? 'cascade_from_content' : 'regenerated', row.id, requestedAt],
+        [prev.id, String(regeneration.reason).startsWith('cascade_from_') ? regeneration.reason : 'regenerated', row.id, requestedAt],
       );
       return { id: row.id, generation };
     };
@@ -1693,7 +1948,7 @@ export class RunsService {
       const g = await insertGeneration(c.prev, c.key, {
         fromItemRunId: c.prev.id,
         fromGeneration: Number(c.prev.generation),
-        reason: 'cascade_from_content',
+        reason: `cascade_from_${a.mItem.type}`,
         cascadeFromItemRunId: primary.id,
         cascadeFromItemKey: itemKey,
         staleArtifactIds: [],
@@ -1705,18 +1960,20 @@ export class RunsService {
       Object.assign(entry, { itemRunId: g.id, generation: g.generation });
     }
 
-    if (plan.video && plan.video.action === 'STALE_NO_AUTO') {
-      const v = plan.video.row;
+    for (const dep of plan.staleDeps) {
+      if (dep.action !== 'STALE_NO_AUTO') continue;
+      const v = dep.row;
+      const staleReason = `${a.mItem.type}_regenerated`;
       // STALE_NO_AUTO: el video queda como está (se sigue empaquetando, con
       // aviso) y la UI ofrece su regeneración paga explícita.
       await qr.query(
         `update public.artifacts
             set status = 'stale',
                 metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object(
-                  'staleReason', 'content_regenerated', 'staleByItemRunId', $2::text, 'staleAt', $3::text),
+                  'staleReason', $4::text, 'staleByItemRunId', $2::text, 'staleAt', $3::text),
                 updated_at = now()
           where item_run_id = $1 and status is distinct from 'disabled'`,
-        [v.id, primary.id, requestedAt],
+        [v.id, primary.id, requestedAt, staleReason],
       );
       const prevInv = v.output_summary?.invalidation ?? {};
       // Fix wave M3: una cascada repetida conserva el previousAction ORIGINAL.
@@ -1728,8 +1985,8 @@ export class RunsService {
         ...prevInv,
         action: 'STALE_NO_AUTO',
         previousAction,
-        reasons: [...new Set([...(Array.isArray(prevInv.reasons) ? prevInv.reasons : []), 'content_regenerated'])],
-        contentItemRunId: primary.id,
+        reasons: [...new Set([...(Array.isArray(prevInv.reasons) ? prevInv.reasons : []), staleReason])],
+        ...(a.mItem.type === 'content' ? { contentItemRunId: primary.id } : { sourceItemKey: itemKey, sourceItemRunId: primary.id }),
       };
       await qr.query(
         `update public.generation_item_runs
@@ -1779,6 +2036,318 @@ export class RunsService {
       }
     }
     return { kind: 'created', itemRunId: primary.id, previousItemRunId: latest.id, previousGeneration: Number(latest.generation), affected };
+  }
+
+  // ── V2.1 RF-b: estimado + gates de presupuesto (audit §W.6/§W.7) ─────────
+
+  /**
+   * Estimado del run desde el Manifest (v1/v2/v3) + decisión de presupuesto.
+   * - AUTO_WITHIN_POLICY → sigue (se vincula una autorización AUTO al crear el run).
+   * - ADMIN_APPROVAL → exige una aprobación ADMIN_APPROVED de este curso para un
+   *   estimado del MISMO Manifest, sin consumir y que cubra el esperado.
+   * - BLOCK (política con on_exceed=BLOCK) → sin salida por aprobación.
+   * Rechazo → BudgetGateRejection (el caller guarda el estimado FUERA de su tx y
+   * responde 409 con el estimateId para que un admin lo autorice).
+   */
+  private async finopsEvaluate(a: {
+    courseId: number;
+    ownerId: string;
+    manifestId: number;
+    items: readonly RunManifestItem[];
+    /** Modo de gasto por proveedor (video = videoMode; Gamma/TTS = providerModes congelados). */
+    modes: RunSpendModes;
+    actions?: Record<string, string> | null;
+    runner?: { query: (sql: string, params?: any[]) => Promise<any> };
+    planSha?: string | null;
+  }): Promise<{ evaluation: StartBudgetEvaluation; approval: any | null } | null> {
+    const mode = a.modes;
+    if (!this.finopsBudget) {
+      const paid = paidRealProviders(estimateItemsForRun(a.items, mode, a.actions ?? null), mode);
+      if (paid.length > 0) {
+        throw new ServiceUnavailableException({
+          code: FINOPS_UNAVAILABLE,
+          message: `${FINOPS_UNAVAILABLE}: no se puede evaluar el presupuesto de un run con proveedores pagados reales (${paid.join(', ')}); no se creó nada.`,
+        });
+      }
+      return null;
+    }
+    let evaluation: StartBudgetEvaluation;
+    try {
+      evaluation = await this.finopsBudget.evaluateStart({
+        courseId: a.courseId, ownerId: a.ownerId, mode, items: a.items, actions: a.actions ?? null,
+      });
+    } catch (err) {
+      // Fail loud y cerrado: sin estimado no se crea ningún run (p.ej. precio
+      // faltante en pricing_catalog o migración FinOps sin aplicar → 503 claro).
+      throw this.finopsUnavailable(err);
+    }
+    if (evaluation.decision === 'BLOCK') throw new BudgetGateRejection(evaluation, BUDGET_BLOCKED, a.planSha ?? null);
+    if (evaluation.decision === 'ADMIN_APPROVAL') {
+      const approval = await this.finopsBudget.findUnconsumedApproval(a.courseId, a.manifestId, evaluation.estimate.totals.expected, a.runner);
+      if (!approval) throw new BudgetGateRejection(evaluation, BUDGET_APPROVAL_REQUIRED, a.planSha ?? null);
+      return { evaluation, approval };
+    }
+    return { evaluation, approval: null };
+  }
+
+  /** FinopsError / tabla FinOps ausente → 503 finops_unavailable; cualquier otro error se relanza. */
+  private finopsUnavailable(err: unknown): unknown {
+    if (err instanceof FinopsError || pgCode(err) === '42P01') {
+      const detail = err instanceof FinopsError ? `${err.code}: ${err.message}` : (err as Error).message;
+      return new ServiceUnavailableException({
+        code: FINOPS_UNAVAILABLE,
+        message: `${FINOPS_UNAVAILABLE}: no se pudo estimar el costo de la generación (${detail}); no se creó nada.`,
+      });
+    }
+    return err;
+  }
+
+  /** Camino de run nuevo (fuera de tx): evalúa y, si rechaza, guarda el estimado y responde 409. */
+  private async finopsStartGate(a: {
+    courseId: number;
+    ownerId: string;
+    manifestId: number;
+    items: readonly RunManifestItem[];
+    modes: RunSpendModes;
+  }): Promise<{ evaluation: StartBudgetEvaluation; approval: any | null } | null> {
+    try {
+      return await this.finopsEvaluate(a);
+    } catch (err) {
+      if (err instanceof BudgetGateRejection) {
+        throw await this.budgetRejection(err.evaluation, err.code, { courseId: a.courseId, ownerId: a.ownerId, manifestId: a.manifestId, planSha: null });
+      }
+      throw err;
+    }
+  }
+
+  /** Guarda el estimado rechazado (sin run) y arma el 409 con sus totales. */
+  private async budgetRejection(
+    evaluation: StartBudgetEvaluation,
+    code: string,
+    ctx: { courseId: number; ownerId: string; manifestId: number; planSha: string | null },
+  ): Promise<ConflictException> {
+    const est = await this.finopsBudget!.recordEstimate({
+      scope: 'run', ownerId: ctx.ownerId, courseId: ctx.courseId, manifestId: ctx.manifestId, runId: null,
+      invalidationPlanSha: ctx.planSha, estimate: evaluation.estimate,
+    });
+    return this.budgetConflict(code, est.id, evaluation.estimate, evaluation.reasons, evaluation.paidRealProviders);
+  }
+
+  private budgetConflict(code: string, estimateId: string, estimate: EstimateResult, reasons: string[], providers: string[]): ConflictException {
+    const totals = estimateSummary(estimate);
+    const human = code === BUDGET_BLOCKED
+      ? 'la política de presupuesto bloquea esta generación (supera el límite configurado); un administrador tiene que cambiar la política.'
+      : 'esta generación requiere la aprobación de un administrador antes de gastar en proveedores pagados.';
+    // El filtro global aplana el 409 a su mensaje: estimateId y totales viajan también en el texto.
+    const message =
+      `${code}: ${human} No se creó ni se envió nada. estimateId=${estimateId} ` +
+      `totalsJson=${JSON.stringify({ currency: totals.currency, min: totals.min, expected: totals.expected, max: totals.max })}`;
+    return new ConflictException({ message, code, estimateId, estimate: totals, reasons, paidRealProviders: providers });
+  }
+
+  /** Dentro de la tx que crea el run: estimado con run_id + autorización del run (consumiendo la aprobación). */
+  private async finopsBindRun(
+    qr: QueryRunner,
+    gate: { evaluation: StartBudgetEvaluation; approval: any | null } | null,
+    a: { runId: string; courseId: number; ownerId: string; manifestId: number; planSha?: string | null },
+  ): Promise<void> {
+    if (!gate || !this.finopsBudget) return;
+    if (gate.approval) {
+      const [used] = await qr.query(
+        `select id from public.cost_budget_authorizations where estimate_id = $1 and run_id is not null limit 1`,
+        [gate.approval.estimate_id],
+      );
+      if (used) {
+        throw new ConflictException({
+          message: `${BUDGET_APPROVAL_REQUIRED}: la aprobación ${gate.approval.id} ya se usó en otra ejecución; pedí una nueva. No se creó nada.`,
+          code: BUDGET_APPROVAL_REQUIRED,
+        });
+      }
+    }
+    await this.finopsBudget.bindRun(qr, {
+      runId: a.runId, courseId: a.courseId, ownerId: a.ownerId, manifestId: a.manifestId,
+      evaluation: gate.evaluation, approval: gate.approval, invalidationPlanSha: a.planSha ?? null,
+    });
+  }
+
+  /**
+   * Run B desde un plan (ya commiteado): una fila de cost_avoidance_events por
+   * REUSE/REVIEW/STALE_NO_AUTO (historical actual first, HD-V21-18). Contable:
+   * un fallo se loguea fuerte pero no deshace el run.
+   */
+  private async finopsRecordAvoidance(job: any, manifest: ManifestDto, plan: { actions: any[] }): Promise<void> {
+    if (!this.finopsBudget) return;
+    try {
+      const keep = plan.actions.filter((x) => x.inTargetManifest && ['REUSE', 'REVIEW', 'STALE_NO_AUTO'].includes(x.action));
+      if (keep.length === 0) return;
+      const mode = this.spendModesOf(job);
+      const byKey = new Map(manifest.manifest.items.map((it) => [it.key, it]));
+      const items = keep.map((x) => byKey.get(x.itemKey)).filter(Boolean) as RunManifestItem[];
+      const est = await this.finopsBudget.estimate(estimateItemsForRun(items, mode, null));
+      const hist = await this.finopsBudget.historicalByItemRun(keep.map((x) => x.fromItemRunId).filter(Boolean));
+      const withBasis = keep.filter((x) => (x.fromItemRunId && (hist[x.fromItemRunId] || []).length > 0) || est.lines.some((l) => l.itemKey === x.itemKey));
+      const r = incrementalCostForPlan(withBasis.map((x) => ({ itemKey: x.itemKey, action: x.action, fromItemRunId: x.fromItemRunId })), est.lines, hist);
+      for (const act of r.actions) {
+        if (!act.basis) continue;
+        await this.finopsBudget.recordAvoidance({
+          runId: job.id, courseId: Number(job.course_id), manifestId: manifest.id, itemKey: act.itemKey,
+          action: act.action as 'REUSE' | 'REVIEW' | 'STALE_NO_AUTO', sourceItemRunId: act.sourceItemRunId, basis: act.basis,
+          avoidedAmount: act.avoided, sourceChargeEventIds: act.sourceChargeEventIds,
+        });
+      }
+    } catch (err) {
+      this.logger.error(`finops: no se pudo registrar el costo evitado del run ${job.id} — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** dryRun de regenerateItem: incremental (min/esperado/max) y evitado por item afectado. */
+  private async regenerationCostPreview(
+    manifest: ManifestDto,
+    affected: RegenerationAffectedItem[],
+    modes: RunSpendModes,
+  ): Promise<RegenerationCostPreview | null> {
+    if (!this.finopsBudget) return null;
+    const zero = normalizeDecimal(0);
+    const zeros: MinExpMax = { min: zero, expected: zero, max: zero };
+    const mode = modes;
+    const byKey = new Map(manifest.manifest.items.map((it) => [it.key, it]));
+    const planned = affected.filter((x) => x.action === 'REGENERATE' || x.action === 'STALE_NO_AUTO');
+    const actions: Record<string, string> = {};
+    for (const x of planned) actions[x.itemKey] = x.action;
+    const items = planned.map((x) => byKey.get(x.itemKey)).filter(Boolean) as RunManifestItem[];
+    const est = await this.finopsBudget.estimate(estimateItemsForRun(items, mode, actions));
+    const sourceIds = planned.filter((x) => x.action === 'STALE_NO_AUTO' && x.itemRunId).map((x) => x.itemRunId as string);
+    const hist = await this.finopsBudget.historicalByItemRun(sourceIds);
+    const computable = planned.filter(
+      (x) => est.lines.some((l) => l.itemKey === x.itemKey) || (x.itemRunId && (hist[x.itemRunId] || []).length > 0),
+    );
+    const r = incrementalCostForPlan(
+      computable.map((x) => ({ itemKey: x.itemKey, action: x.action, fromItemRunId: x.action === 'STALE_NO_AUTO' ? x.itemRunId : null })),
+      est.lines,
+      hist,
+    );
+    const byItemKey = new Map(r.actions.map((x) => [x.itemKey, x]));
+    return {
+      currency: est.currency,
+      incrementalCost: r.totals.incremental,
+      avoided: r.totals.avoided,
+      byItem: affected.map((x) => {
+        const c = byItemKey.get(x.itemKey);
+        return {
+          itemKey: x.itemKey,
+          action: x.action,
+          incrementalCost: c ? c.incremental : zeros,
+          avoided: c ? c.avoided : zero,
+          avoidedBasis: c ? c.basis : null,
+        };
+      }),
+    };
+  }
+
+  /**
+   * RF-b fix I1: gate de trabajo pagado REAL nuevo sobre un run existente
+   * (retry / resubmitVideo / reopen). Estimado de esos items (scope regeneration,
+   * con run_id) y exige que la última aprobación ADMIN_APPROVED del run cubra
+   * actual + incremental esperado; si no → 409 budget_approval_required con el
+   * estimateId. AUTO_WITHIN_POLICY nunca cubre proveedores pagados.
+   */
+  private async finopsPaidWorkGate(a: { courseId: number; ownerId: string; manifest: ManifestDto; job: any; paidKeys: string[] }): Promise<void> {
+    // Solo los items cuyo proveedor está congelado en `real` para este run (video: videoMode; Gamma/TTS: providerModes).
+    const modes = this.spendModesOf(a.job);
+    const typeOf = new Map(a.manifest.manifest.items.map((it) => [it.key, it.type]));
+    const keys = [...new Set(a.paidKeys)].filter((k) => spendModeOfItemType(modes, String(typeOf.get(k))) === 'real').sort();
+    if (keys.length === 0) return;
+    if (!this.finopsBudget) {
+      throw new ServiceUnavailableException({
+        code: FINOPS_UNAVAILABLE,
+        message: `${FINOPS_UNAVAILABLE}: no se puede evaluar el presupuesto de trabajo pagado real (${keys.join(', ')}); no se reintentó nada.`,
+      });
+    }
+    const byKey = new Map(a.manifest.manifest.items.map((it) => [it.key, it]));
+    const items = keys.map((k) => byKey.get(k)).filter(Boolean) as RunManifestItem[];
+    const actions: Record<string, string> = {};
+    for (const it of items) actions[it.key] = 'REGENERATE';
+    let estimate: EstimateResult;
+    try {
+      estimate = await this.finopsBudget.estimate(estimateItemsForRun(items, 'real', actions));
+    } catch (err) {
+      throw this.finopsUnavailable(err);
+    }
+    const [authorizedBudget, actualSoFar] = await Promise.all([
+      this.finopsBudget.runPaidAuthorizedBudget(a.job.id),
+      this.finopsBudget.runActual(a.job.id),
+    ]);
+    const g = runtimeGuard({ authorizedBudget, actualSoFar, reservedInFlight: '0', next: estimate.totals.expected });
+    if (g.allow) return;
+    const est = await this.finopsBudget.recordEstimate({
+      scope: 'regeneration', ownerId: a.ownerId, courseId: a.courseId, manifestId: a.manifest.id, runId: a.job.id, estimate,
+    });
+    const providers = [...new Set(items.map((it) => paidProviderOfItemType(it.type)).filter(Boolean) as string[])].sort();
+    throw this.budgetConflict(BUDGET_APPROVAL_REQUIRED, est.id, estimate, [
+      `${g.reason}(committed=${g.committed},authorized=${authorizedBudget ?? 'none'})`,
+    ], providers);
+  }
+
+  /**
+   * Regeneración real: guarda el estimado (scope regeneration, con run_id) y,
+   * si regenera con un proveedor pagado REAL, exige que el presupuesto
+   * autorizado del run cubra actual + incremental esperado; si no → 409
+   * budget_approval_required con el estimateId (un admin lo autoriza con el
+   * nuevo presupuesto TOTAL del run y se reintenta).
+   */
+  private async finopsRegenerationGate(
+    courseId: number,
+    ownerId: string,
+    manifest: ManifestDto,
+    job: any,
+    mItem: { key: string; type: string; moduleId?: string | null; chapterId?: string | null },
+    itemKey: string,
+    videoMode: RunVideoMode,
+  ): Promise<void> {
+    const plan = await this.planRegeneration(this.dataSource, false, {
+      courseId, ownerId, job, manifest, mItem, itemKey, videoMode, costKind: regenerationCostKind(mItem.type, videoMode),
+    });
+    // Idempotencia en vuelo o trabas: la tx responde lo de siempre, sin estimado nuevo.
+    if (plan.inFlight || plan.blockers.length > 0) return;
+    const mode = this.spendModesOf(job);
+    const regenerated = plan.affected.filter((x) => x.action === 'REGENERATE');
+    const paid = [...new Set(regenerated
+      .filter((x) => spendModeOfItemType(mode, x.type) === 'real')
+      .map((x) => paidProviderOfItemType(x.type)).filter(Boolean) as string[])].sort();
+    if (!this.finopsBudget) {
+      if (paid.length > 0) {
+        throw new ServiceUnavailableException({
+          code: FINOPS_UNAVAILABLE,
+          message: `${FINOPS_UNAVAILABLE}: no se puede evaluar el presupuesto de una regeneración con proveedores pagados reales (${paid.join(', ')}).`,
+        });
+      }
+      return;
+    }
+    const byKey = new Map(manifest.manifest.items.map((it) => [it.key, it]));
+    const actions: Record<string, string> = {};
+    for (const x of regenerated) actions[x.itemKey] = 'REGENERATE';
+    const items = regenerated.map((x) => byKey.get(x.itemKey)).filter(Boolean) as RunManifestItem[];
+    let estimate: EstimateResult;
+    try {
+      estimate = await this.finopsBudget.estimate(estimateItemsForRun(items, mode, actions));
+    } catch (err) {
+      throw this.finopsUnavailable(err);
+    }
+    const est = await this.finopsBudget.recordEstimate({
+      scope: 'regeneration', ownerId, courseId, manifestId: manifest.id, runId: job.id, estimate,
+    });
+    if (paid.length === 0) return;
+    // RF-b fix I1: solo una aprobación ADMIN_APPROVED cubre proveedores pagados (nunca AUTO).
+    const [authorizedBudget, actualSoFar] = await Promise.all([
+      this.finopsBudget.runPaidAuthorizedBudget(job.id),
+      this.finopsBudget.runActual(job.id),
+    ]);
+    const g = runtimeGuard({ authorizedBudget, actualSoFar, reservedInFlight: '0', next: estimate.totals.expected });
+    if (!g.allow) {
+      throw this.budgetConflict(BUDGET_APPROVAL_REQUIRED, est.id, estimate, [
+        `${g.reason}(committed=${g.committed},authorized=${authorizedBudget ?? 'none'},actual=${addDec(actualSoFar, 0)})`,
+      ], paid);
+    }
   }
 
   // ── DN-1: gate de entrega de video ──────────────────────────────────────
@@ -1908,6 +2477,7 @@ export class RunsService {
     contextHash: string,
     videoMode: RunVideoMode,
     videoDelivery: VideoDeliveryStrategy,
+    providerModes?: ProviderModes,
   ): Promise<string> {
     // I1: bajo el lock del curso, ningún otro Manifest del curso puede tener
     // un run activo (el índice único parcial solo protege ESTE Manifest).
@@ -1915,7 +2485,8 @@ export class RunsService {
     const other = await this.findActiveRunOnOtherManifest(qr, courseId, manifest.id);
     if (other) throw this.otherActiveRunConflict(other, manifest);
 
-    const inputPayload = { manifestId: manifest.id, blueprintNumber, contextHash, videoMode, videoDelivery };
+    // v1/v2: sin providerModes (input_payload idéntico al de antes); v3: congelados (fix round 1, I1).
+    const inputPayload = { manifestId: manifest.id, blueprintNumber, contextHash, videoMode, videoDelivery, ...(providerModes ? { providerModes } : {}) };
     const [job] = await qr.query(
       `insert into public.production_jobs
          (owner_id, course_id, frontend_course_id, execution_mode, status, worker_status, current_step,
@@ -1992,6 +2563,7 @@ export class RunsService {
     manifest: ManifestDto,
     contextHash: string,
     videoMode: RunVideoMode,
+    providerModes?: ProviderModes,
   ): Promise<StartRunResult> {
     const ctx = await this.loadContextRow(job.id);
     if (ctx.context_hash !== contextHash) {
@@ -2009,6 +2581,12 @@ export class RunsService {
           `enviado ${videoMode}). El modo de video de una ejecución iniciada no cambia. runId=${job.id}`,
       );
     }
+    if (providerModes && !sameProviderModes(frozenProviderModesOf(job.input_payload), providerModes)) {
+      throw new ConflictException({
+        message: `Ya hay una ejecución activa para este Manifest con otros modos de proveedor; no cambian una vez iniciada. runId=${job.id}`,
+        code: PROVIDER_MODES_CONFLICT,
+      });
+    }
     return { created: false, reopened: false, run: await this.buildRunDto(job, manifest) };
   }
 
@@ -2018,6 +2596,11 @@ export class RunsService {
   }
 
   /** videoMode congelado de un run ya existente; ausente (runs previos a esta feature) → 'mock'. */
+  /** V2.1 RF-b: modos de gasto congelados del run (video + providerModes; sin providerModes ⇒ real, fail safe). */
+  private spendModesOf(job: any): RunSpendModes {
+    return runSpendModes(this.videoModeOf(job), frozenProviderModesOf(job?.input_payload));
+  }
+
   private videoModeOf(job: any): RunVideoMode {
     const v = job?.input_payload?.videoMode;
     return (RUN_VIDEO_MODES as readonly string[]).includes(v) ? v : DEFAULT_VIDEO_MODE;

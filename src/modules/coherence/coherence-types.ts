@@ -8,6 +8,14 @@ import { cmpStr } from './canonical-json';
 
 export const COHERENCE_VERSION = 1 as const;
 export const COHERENCE_RULESET = 'coherence-rules@1' as const;
+/**
+ * V2.1 (R5): ruleset de los reportes sobre un Blueprint schemaVersion 2
+ * (rulesVersion 3). Mismas reglas y umbrales que `coherence-rules@1` más S4
+ * (curso sin nada calificable). Un reporte sobre un Blueprint v1 sigue siendo
+ * `coherence-rules@1`, byte-idéntico.
+ */
+export const COHERENCE_RULESET_V3 = 'coherence-rules-v3@1' as const;
+export type CoherenceRuleset = typeof COHERENCE_RULESET | typeof COHERENCE_RULESET_V3;
 
 export const COHERENCE_THRESHOLDS = Object.freeze({
   /** S1: títulos casi duplicados si trigram-Jaccard ≥ esto… */
@@ -29,7 +37,7 @@ export const COHERENCE_THRESHOLDS = Object.freeze({
   C6_CONCEPT_MATCH_TOKEN_JACCARD: 0.5,
 });
 
-export type CoherenceRuleId = 'S1' | 'S2' | 'S3' | 'C1' | 'C2' | 'C3' | 'C4' | 'C5' | 'C6' | 'C7';
+export type CoherenceRuleId = 'S1' | 'S2' | 'S3' | 'S4' | 'C1' | 'C2' | 'C3' | 'C4' | 'C5' | 'C6' | 'C7';
 export const RULE_ORDER: readonly string[] = ['S1', 'S2', 'S3', 'C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7'];
 
 export type CoherenceSeverity = 'info' | 'warning';

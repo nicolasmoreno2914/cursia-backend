@@ -11,6 +11,10 @@ import { AdminModule } from '../../admin/admin.module';
 import { YoutubeModule } from '../../youtube/youtube.module';
 import { DynamicYoutubeController } from './dynamic-youtube.controller';
 import { DynamicYoutubePreflightService } from './dynamic-youtube';
+import { ArtifactsModule } from '../artifacts/artifacts.module';
+import { ArtifactsService } from '../artifacts/artifacts.service';
+import { ArtifactsServiceTextReader, V3_ARTIFACT_TEXT_READER } from './v3-artifact-reader';
+import { FinopsModule } from '../finops/finops.module';
 
 /**
  * Generación dinámica (Fase 5A): runs sobre un Generation Manifest. No
@@ -25,9 +29,20 @@ import { DynamicYoutubePreflightService } from './dynamic-youtube';
     AuthModule,                // expone SupabaseJwtGuard para el controlador
     AdminModule,               // expone CostRatesService (estimate de costo de video, R17)
     YoutubeModule,             // DN-1: YoutubeService/YoutubeTokenService (preflight, sin modificarlos)
+    ArtifactsModule,           // V2.1 R11a: lector de artifacts para validar items LLM v3 al completar
+    FinopsModule,              // V2.1 RF-b: estimado + gates de presupuesto (FinopsBudgetService)
   ],
   controllers: [RunsController, ExecutorController, DynamicYoutubeController],
-  providers: [RunsService, SchedulerService, DynamicYoutubePreflightService],
+  providers: [
+    RunsService,
+    SchedulerService,
+    DynamicYoutubePreflightService,
+    {
+      provide: V3_ARTIFACT_TEXT_READER,
+      useFactory: (artifacts: ArtifactsService) => new ArtifactsServiceTextReader(artifacts),
+      inject: [ArtifactsService],
+    },
+  ],
   exports: [RunsService, SchedulerService, DynamicYoutubePreflightService],
 })
 export class DynamicGenerationModule {}

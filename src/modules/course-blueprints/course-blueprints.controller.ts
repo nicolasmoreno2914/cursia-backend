@@ -61,6 +61,6 @@ export class CourseBlueprintsController {
     @Param('number', ParseIntPipe) number: number,
     @CurrentUser() user: AuthUser,
   ) {
-    return this.blueprintsService.getByNumber(courseId, user.id, number);
+    return this.blueprintsService.getByNumberAnySchema(courseId, user.id, number);
   }
 }

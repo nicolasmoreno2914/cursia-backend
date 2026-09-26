@@ -75,6 +75,14 @@ const MIGRATION_STEPS = [
     summary: 'course_blueprints inmutable + courses.current_blueprint_id; reapunta 3 FKs (vacías) de course_versions a course_blueprints',
   },
   {
+    // V2.1 R3 (fix round 1, review G2 I5): el código V2.1 lee estas columnas en
+    // las rutas de estructura; sin ellas → 503 schema_not_migrated_v21.
+    id: 'v21-blueprint-profiles',
+    file: 'supabase-migration-v21-blueprint-profiles.sql',
+    stagingStep: '4d2 (migrate-v21-blueprint-profiles.js)',
+    summary: 'V2.1 R3: courses.final_exam_enabled/activity_engine, course_chapters.activity_enabled, course_blueprints schemaVersion 2, course_profiles append-only',
+  },
+  {
     id: 'generation-manifests',
     file: 'supabase-migration-generation-manifests.sql',
     stagingStep: '4e (migrate-generation-manifests.js)',
@@ -106,6 +114,34 @@ const MIGRATION_STEPS = [
     placeholder: { mustMention: 'carried_from_item_run_id' },
   },
   {
+    // V2.1 R4 (fix round 1, I5). Requiere dynamic-generation-v2 (scope, gir_type_check)
+    // y va DESPUÉS: re-crea generation_item_runs_default_scope con los tipos v3.
+    id: 'v21-manifest-v3',
+    file: 'supabase-migration-v21-manifest-v3.sql',
+    stagingStep: '4h4 (migrate-v21-manifest-v3.js)',
+    summary: 'V2.1 R4: tipos v3 en gir_type_check/gir_type_scope/default scope, conteos v3 en course_generation_manifests, scorm_count >= 0',
+  },
+  {
+    // V2.1 RF (FinOps): ledger append-only + catálogo de precios. Sin tablas ni
+    // precios, startRun responde 503 finops_unavailable (fail closed). El seed de
+    // pricing_catalog NO está en el .sql: lo inserta el hook `finops-pricing-seed`
+    // (mismo código que migrate-v21-finops.js, ON CONFLICT DO NOTHING) en la
+    // MISMA transacción del paso.
+    id: 'v21-finops',
+    file: 'supabase-migration-v21-finops.sql',
+    stagingStep: '4h6 (migrate-v21-finops.js)',
+    summary: 'V2.1 RF: pricing_catalog, generation_cost_events, cost_estimates, cost_budget_policies/authorizations, cost_avoidance_events (append-only por trigger) + seed de precios',
+    afterSql: 'finops-pricing-seed',
+  },
+  {
+    // V2.1 RF-b (review G3 C2): RLS sin policies + REVOKE de anon/authenticated
+    // en las 6 tablas FinOps y course_profiles (el backend usa el rol dueño).
+    id: 'v21-finops-rls',
+    file: 'supabase-migration-v21-finops-rls.sql',
+    stagingStep: '4h8 (migrate-v21-finops-rls.js)',
+    summary: 'V2.1 RF-b: ENABLE ROW LEVEL SECURITY + REVOKE ALL (anon, authenticated) en FinOps y course_profiles',
+  },
+  {
     // Decisión: SÍ se necesita en producción. El ejecutor dynamic de V2 (y el
     // artifactUpload legacy de 39-brandkit/41-course-setup) sube a
     // cursia-artifacts DESDE EL NAVEGADOR con el JWT del usuario; el
@@ -131,11 +167,22 @@ const VERIFY_SCRIPTS = [
   'scripts/verify-dynamic-course-structure-schema.js',
   'scripts/verify-course-blueprints-schema.js',
   'scripts/audit-course-blueprints.js',
+  'scripts/verify-v21-blueprint-profiles-schema.js',
   'scripts/verify-generation-manifests-schema.js',
   'scripts/audit-generation-manifests.js',
   'scripts/verify-dynamic-generation-schema.js',
+  'scripts/verify-v21-manifest-v3-schema.js',
   'scripts/audit-dynamic-generation.js',
 ];
+
+/** Hooks post-SQL de un paso (misma transacción). */
+const STEP_HOOKS = {
+  'finops-pricing-seed': async (client) => {
+    const { seedPricingCatalog } = require(path.join(REPO_ROOT, 'scripts/migrate-v21-finops.js'));
+    const r = await seedPricingCatalog(client);
+    console.log(`  ✓ seed ${r.seedVersion}: ${r.inserted} filas nuevas de ${r.seedRows}`);
+  },
+};
 
 const EXCLUDED = [
   { file: 'scripts/migrate-production-jobs-constraints.js', reason: 'no se invoca: su SQL (scripts/lib/production-jobs-constraints.js) es el PASO 0 de este runner; deploy.yml lo re-aplica igual en el merge (idempotente)' },
@@ -243,6 +290,7 @@ function buildPlan(opts) {
       file: s.file,
       stagingEquivalent: s.stagingStep,
       summary: s.summary,
+      afterSql: s.afterSql || null,
       status: 'included',
       sha256: null,
       bytes: null,
@@ -534,6 +582,11 @@ async function applyMigrations(plan, tgt, opts) {
           for (const stmt of pjConstraints.APPLY_STATEMENTS) await client.query(stmt);
         } else {
           await client.query(buf.toString('utf8'));
+          if (step.afterSql) {
+            const hook = STEP_HOOKS[step.afterSql];
+            if (!hook) throw new Error(`hook desconocido ${step.afterSql}`);
+            await hook(client);
+          }
         }
         await client.query('commit');
       } catch (err) {

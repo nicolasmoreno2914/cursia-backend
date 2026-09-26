@@ -28,7 +28,9 @@ cleanup() {
   "$PGBIN/pg_ctl" -D "$DATA" stop -m fast >/dev/null 2>&1 || true
   rm -rf "$DATA"
   echo "PG16 descartable destruido"
-  "$MOODLE_SCRATCH/teardown.sh" || true   # sin --purge: los datos de Moodle quedan en disco
+  # V2.1 R13: solo se detiene el Postgres del Moodle local si lo arrancó ESTA corrida
+  # (otro proceso puede estar usándolo); nunca --purge: los datos quedan en disco.
+  if [ "${MOODLE_STARTED_HERE:-0}" = "1" ]; then "$MOODLE_SCRATCH/teardown.sh" || true; fi
   echo "total: $(( $(date +%s) - T0 )) s"
 }
 trap cleanup EXIT
@@ -63,14 +65,33 @@ DB_HOST=127.0.0.1 DB_PORT=$PORT DB_USER=postgres DB_PASS=x DB_NAME=v2db DB_SSL=f
 STG="MIGRATION_ENV=staging DB_HOST=127.0.0.1 DB_PORT=$PORT DB_USER=postgres.e2elocaltest DB_PASS=x DB_NAME=v2db DB_SSL=false"
 env $STG node "$REPO/scripts/migrate-dynamic-generation-v2.js" > "$OUT/migrate-v2.log" 2>&1 || { cat "$OUT/migrate-v2.log"; exit 8; }
 env $STG node "$REPO/scripts/migrate-invalidation.js" > "$OUT/migrate-invalidation.log" 2>&1 || { cat "$OUT/migrate-invalidation.log"; exit 9; }
+# V2.1 R4: Manifest rulesVersion 3 (extiende los CHECKs de la migración v2 → corre DESPUÉS de ella).
+env $STG node "$REPO/scripts/migrate-v21-manifest-v3.js" > "$OUT/migrate-v21-manifest-v3.log" 2>&1 || { cat "$OUT/migrate-v21-manifest-v3.log"; exit 9; }
+env $STG node "$REPO/scripts/verify-v21-manifest-v3-schema.js" > "$OUT/verify-v21-manifest-v3.log" 2>&1 || { cat "$OUT/verify-v21-manifest-v3.log"; exit 9; }
+# V2.1 RF-b: seed de pricing_catalog (las tablas ya las creó setup-schema.js sql; el script es idempotente).
+env $STG node "$REPO/scripts/migrate-v21-finops.js" > "$OUT/migrate-v21-finops.log" 2>&1 || { cat "$OUT/migrate-v21-finops.log"; exit 9; }
+env $STG node "$REPO/scripts/verify-v21-finops-schema.js" > "$OUT/verify-v21-finops.log" 2>&1 || { cat "$OUT/verify-v21-finops.log"; exit 9; }
 echo "schema + migraciones reales OK"
 
 echo "== Moodle 4.5 local =="
-"$MOODLE_SCRATCH/start.sh" > "$OUT/moodle-start.log" 2>&1 || { cat "$OUT/moodle-start.log"; exit 10; }
+if pg_isready -h 127.0.0.1 -p 5570 >/dev/null 2>&1; then
+  echo "Postgres del Moodle local ya estaba arriba (127.0.0.1:5570): se usa tal cual y no se detiene al final"
+else
+  "$MOODLE_SCRATCH/start.sh" > "$OUT/moodle-start.log" 2>&1 || { cat "$OUT/moodle-start.log"; exit 10; }
+  MOODLE_STARTED_HERE=1
+fi
 
-echo "== E2E =="
-node "$HERE/e2e.js" 2>&1 | tee "$OUT/e2e.log"
-RC=${PIPESTATUS[0]}
+RC=0
+if [ "${E2E_SKIP_V2:-0}" != "1" ]; then
+  echo "== E2E =="
+  node "$HERE/e2e.js" 2>&1 | tee "$OUT/e2e.log"
+  RC=${PIPESTATUS[0]}
+fi
+# V2.1 R13: fases extra (run-e2e-v21.sh) sobre el MISMO PG descartable, antes del cleanup.
+if [ -n "${E2E_AFTER:-}" ]; then
+  echo "== fases extra: $E2E_AFTER =="
+  bash -c "$E2E_AFTER" || RC=1
+fi
 
 echo "== verify/audit (scripts reales del backend, con runs A y B) =="
 for s in verify-dynamic-generation-schema audit-generation-manifests audit-dynamic-generation audit-course-blueprints; do

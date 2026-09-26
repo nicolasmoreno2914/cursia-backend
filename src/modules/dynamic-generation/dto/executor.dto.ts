@@ -21,7 +21,11 @@ import {
  * y module_intro (el ejecutor v2 los manda junto con content/scorm/exam en un
  * solo claim; debe coincidir con BROWSER_CLAIMABLE_TYPES del scheduler).
  */
-export const BROWSER_ITEM_TYPES = ['content', 'scorm', 'exam', 'course_plan', 'course_intro', 'module_intro'] as const;
+export const BROWSER_ITEM_TYPES = [
+  'content', 'scorm', 'exam', 'course_plan', 'course_intro', 'module_intro',
+  // V2.1 rulesVersion 3 (R4): items LLM del navegador. presentation/audio_* son del worker.
+  'experience', 'video_interactions', 'activity', 'final_exam',
+] as const;
 export type BrowserItemType = (typeof BROWSER_ITEM_TYPES)[number];
 
 /** Lease del navegador: 15 s .. 15 min (default 120 s en el controlador). */
@@ -93,4 +97,14 @@ export class RetryItemDto {
   @IsOptional()
   @IsBoolean()
   resubmitVideo?: boolean;
+
+  /**
+   * V2.1 F2 fix round 1: decisión humana explícita para un item de Gamma
+   * (`presentation`) en 'failed' con `gamma_submit_ambiguous` o
+   * `gamma_generation_failed`: archiva el generationId/marcador y pide una
+   * generación NUEVA (pasa por el gate de presupuesto como todo retry pagado).
+   */
+  @IsOptional()
+  @IsBoolean()
+  resubmitProvider?: boolean;
 }

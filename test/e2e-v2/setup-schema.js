@@ -50,6 +50,15 @@ const req = (p) => require(path.join(BUILD, p));
     'supabase-migration-course-blueprints.sql',
     'supabase-migration-generation-manifests.sql',
     'supabase-migration-dynamic-generation.sql',
+    'supabase-migration-v21-blueprint-profiles.sql', // V2.1 R3: toggles de Blueprint v2 + course_profiles
+    // V2.1 R4 (supabase-migration-v21-manifest-v3.sql) NO va acá: extiende los
+    // CHECKs de supabase-migration-dynamic-generation-v2.sql, que run-e2e.sh
+    // aplica DESPUÉS de este paso con su script real. run-e2e.sh corre
+    // scripts/migrate-v21-manifest-v3.js (+ su verify) justo después de la v2.
+    // V2.1 RF-a: ledger FinOps (sin dependencias; el seed de precios lo hace scripts/migrate-v21-finops.js).
+    'supabase-migration-v21-finops.sql',
+    // V2.1 RF-b fix C2: RLS + REVOKE de anon/authenticated (FinOps + course_profiles).
+    'supabase-migration-v21-finops-rls.sql',
   ]) {
     await ds.query(fs.readFileSync(path.join(REPO, f), 'utf8'));
     console.log('applied', f);

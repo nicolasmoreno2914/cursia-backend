@@ -96,6 +96,27 @@ jobs:
       - name: Check Invalidation apply / packaging rules (Fase 8, puro)
         run: node scripts/check-invalidation-apply.js
 
+      - name: Check V2.1 R3 Blueprint v2 + perfiles (puro; la parte PG16 corre local)
+        run: node scripts/check-v21-blueprint-profiles.js --pure-only
+
+      - name: Check V2.1 R4 Manifest rulesVersion 3 (puro; la parte PG16 corre local)
+        run: node scripts/check-v21-manifest-v3.js --pure-only
+
+      - name: Check V2.1 R5 invalidación v3 + coherencia v3 + auditorías v3 (puro; la parte PG16 corre local)
+        run: node scripts/check-v21-invalidation-v3.js --pure-only
+
+      - name: Check V2.1 RF-b cableado FinOps (puro; la parte PG16 corre local)
+        run: node scripts/check-v21-finops-wiring.js --pure-only
+
+      - name: Check V2.1 F2 proveedores reales Gamma/TTS contra fakes locales + preflight v3 + duración mvhd (puro; la parte PG16 corre local)
+        run: node scripts/check-v21-providers.js --pure-only
+
+      - name: Check V2.1 R12 empaque v3 (builder + validador §Q.8 + worker con fakes; puro, la restauración en Moodle corre local)
+        run: node scripts/check-v21-packaging-v3.js
+
+      - name: Check V2.1 F1 perfiles (pesos normalizados / curso sin nota, 409 al arrancar, paleta → presentación; puro)
+        run: node scripts/check-v21-f1-profiles.js
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
@@ -323,6 +344,12 @@ jobs:
                echo "━━━ [4d] Blueprints: auditoría de datos (solo lectura, staging) ━━━"
                MIGRATION_ENV=staging node scripts/audit-course-blueprints.js
 
+               echo "━━━ [4d2] V2.1 R3: toggles de Blueprint v2 + course_profiles — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-v21-blueprint-profiles.js
+
+               echo "━━━ [4d3] V2.1 R3: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-v21-blueprint-profiles-schema.js
+
                echo "━━━ [4e] Generation Manifests: migración (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-generation-manifests.js
 
@@ -340,6 +367,24 @@ jobs:
 
                echo "━━━ [4h3] Invalidación (Fase 8): generation_item_runs.carried_from_item_run_id (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-invalidation.js
+
+               echo "━━━ [4h4] V2.1 R4: Manifest rulesVersion 3 — tipos de item v3 + conteos v3 (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-v21-manifest-v3.js
+
+               echo "━━━ [4h5] V2.1 R4: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-v21-manifest-v3-schema.js
+
+               echo "━━━ [4h6] V2.1 RF: ledger FinOps (tablas append-only + seed de precios) (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-v21-finops.js
+
+               echo "━━━ [4h7] V2.1 RF: verificación de esquema FinOps (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-v21-finops-schema.js
+
+               echo "━━━ [4h8] V2.1 RF-b: RLS + REVOKE anon/authenticated en FinOps y course_profiles (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-v21-finops-rls.js
+
+               echo "━━━ [4h9] V2.1 RF-b: verificación de RLS (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-v21-finops-rls.js
 
                echo "━━━ [4i] Dynamic Generation: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-dynamic-generation-schema.js
@@ -364,6 +409,7 @@ jobs:
                ensure_pm2_process cursia-full-worker-staging start:full-worker
                ensure_pm2_process cursia-dynamic-item-worker-staging start:dynamic-item-worker
                ensure_pm2_process cursia-dynamic-package-worker-staging start:dynamic-package-worker
+               ensure_pm2_process cursia-dynamic-provider-worker-staging start:dynamic-provider-worker
                sudo pm2 save
                sudo pm2 status
 

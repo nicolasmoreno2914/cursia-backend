@@ -1,0 +1,11 @@
+{
+  "description": "Vectores fijos de activityTypeForChapter(chapterId) — ruling del controlador (fix round 1, review G5 I6). type = ['questionset','dragtext','blanks'][fnv1a32(utf8(chapterId.toLowerCase())) % 3]; FNV-1a 32 bits estándar (offset 2166136261, primo 16777619, sin signo). El espejo del frontend (dynActivityTypeForChapter) se prueba contra estos mismos vectores.",
+  "rotation": ["questionset", "dragtext", "blanks"],
+  "vectors": [
+    { "chapterId": "00000000-0000-4000-8000-c00000050103", "fnv1a32": 2876216487, "type": "questionset" },
+    { "chapterId": "00000000-0000-4000-8000-0000000001c2", "fnv1a32": 3936119275, "type": "dragtext" },
+    { "chapterId": "00000000-0000-4000-8000-0000000001c3", "fnv1a32": 3919341656, "type": "blanks" },
+    { "chapterId": "3F2504E0-4F89-41D3-9A0C-0305E82C3301", "fnv1a32": 3905166385, "type": "dragtext" },
+    { "chapterId": "00000000-0000-4000-8000-0000000001c1", "fnv1a32": 3952896894, "type": "questionset" }
+  ]
+}

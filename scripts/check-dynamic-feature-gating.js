@@ -79,6 +79,9 @@ const { DynamicYoutubePreflightService } = loadDist('modules/dynamic-generation/
 const { SchedulerService } = loadDist('modules/dynamic-generation/scheduler.service.js');
 const { PackagingController } = loadDist('modules/dynamic-packaging/packaging.controller.js');
 const { PackagingService } = loadDist('modules/dynamic-packaging/packaging.service.js');
+const { CourseStructureSettingsController } = loadDist('modules/course-structure/course-structure-settings.controller.js');
+const { CourseProfilesController } = loadDist('modules/course-profiles/course-profiles.controller.js');
+const { CourseProfilesService } = loadDist('modules/course-profiles/course-profiles.service.js');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // M1 (fix wave / review): descubrimiento automático de TODOS los controllers
@@ -110,7 +113,7 @@ function discoverControllers() {
   }
   return found;
 }
-/** Los 9 controllers 100% dynamic (G1 + Fase 7/8 + DN-1) — deben coincidir con DYNAMIC_CONTROLLERS de dynamic-routes.ts. */
+/** Los 11 controllers 100% dynamic (G1 + Fase 7/8 + DN-1 + V2.1 R3) — deben coincidir con DYNAMIC_CONTROLLERS de dynamic-routes.ts. */
 const DYNAMIC_CONTROLLER_CLASS_NAMES = new Set([
   'CourseStructureController',
   'CourseBlueprintsController',
@@ -121,6 +124,8 @@ const DYNAMIC_CONTROLLER_CLASS_NAMES = new Set([
   'CoherenceController', // Fase 7 (F7-BE)
   'InvalidationController', // Fase 8 (F8-BE)
   'DynamicYoutubeController', // DN-1: GET /dynamic/youtube/preflight
+  'CourseStructureSettingsController', // V2.1 R3
+  'CourseProfilesController', // V2.1 R3
 ]);
 /**
  * Todo lo demás: legacy sin ninguna ruta dynamic, EXCEPTO CoursesController
@@ -145,6 +150,8 @@ const LEGACY_CONTROLLER_CLASS_NAMES = new Set([
   'CourseVersionsController',
   'CourseSetupController',
   'CoursesController',
+  'FinopsIngestController', // V2.1 RF-a: ingest server-to-server (secreto compartido), no es ruta V2
+  'FinopsAdminController',  // V2.1 RF-a: lecturas admin (SupabaseJwtGuard + SuperAdminGuard)
 ]);
 
 Logger.overrideLogger(false);
@@ -198,7 +205,7 @@ async function withEnv(vars, fn) {
     }
   }
 }
-const ENV_CLEAN = { [FLAG]: undefined, [ALLOW]: undefined, [REAL]: undefined, [COH_LLM]: undefined };
+const ENV_CLEAN = { [FLAG]: undefined, [ALLOW]: undefined, [REAL]: undefined, [COH_LLM]: undefined, DYNAMIC_MANIFEST_RULES_VERSION: undefined };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // App Nest HTTP real con servicios falsos
@@ -246,6 +253,8 @@ async function buildApp() {
       CoherenceController,
       InvalidationController,
       DynamicYoutubeController,
+      CourseStructureSettingsController,
+      CourseProfilesController,
     ],
     providers: [
       AppService,
@@ -259,6 +268,7 @@ async function buildApp() {
       { provide: CoherenceService, useValue: fakeService('CoherenceService') },
       { provide: InvalidationService, useValue: fakeService('InvalidationService') },
       { provide: DynamicYoutubePreflightService, useValue: fakeService('DynamicYoutubePreflightService') },
+      { provide: CourseProfilesService, useValue: fakeService('CourseProfilesService') },
     ],
   })
     .overrideGuard(SupabaseJwtGuard)
@@ -437,8 +447,8 @@ async function runWorkerProcess(script, env, { waitMs }) {
     eq(r(OWNER_A, { [FLAG]: 'true', [COH_LLM]: 'true' }).realVideo, false, 'coherenceLlm no habilita video real');
   });
 
-  await check('G1 set de rutas: los 9 controllers dynamic (incl. Coherence/Invalidation, Fase 7/8, y YouTube preflight DN-1) + solo POST /courses/dynamic de CoursesController', () => {
-    for (const C of [CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController, CoherenceController, InvalidationController, DynamicYoutubeController]) {
+  await check('G1 set de rutas: los 11 controllers dynamic (incl. Coherence/Invalidation, Fase 7/8, YouTube preflight DN-1 y V2.1 R3 settings/profiles) + solo POST /courses/dynamic de CoursesController', () => {
+    for (const C of [CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController, CoherenceController, InvalidationController, DynamicYoutubeController, CourseStructureSettingsController, CourseProfilesController]) {
       assert(DYNAMIC_CONTROLLERS.has(C), `${C.name} no está en el set`);
     }
     assert(isDynamicRoute(CoursesController, CoursesController.prototype.createOrGetDynamic), 'POST /courses/dynamic');
@@ -481,7 +491,7 @@ async function runWorkerProcess(script, env, { waitMs }) {
   // ── HTTP real ──────────────────────────────────────────────────────────────
   const { app, base } = await buildApp();
   const dynamicRoutes = [
-    ...[CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController, CoherenceController, InvalidationController, DynamicYoutubeController].flatMap(routesOf),
+    ...[CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController, CoherenceController, InvalidationController, DynamicYoutubeController, CourseStructureSettingsController, CourseProfilesController].flatMap(routesOf),
     ...routesOf(CoursesController).filter((r) => r.name === 'createOrGetDynamic'),
   ];
   const legacyRoutes = [
@@ -595,11 +605,13 @@ async function runWorkerProcess(script, env, { waitMs }) {
     const featureMatrix = [
       { label: 'flag OFF', env: {}, user: OWNER_A, want: { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false } },
       { label: 'flag OFF aunque esté en ambas listas', env: { [ALLOW]: OWNER_A, [REAL]: OWNER_A, [COH_LLM]: 'true' }, user: OWNER_A, want: { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false } },
-      { label: 'ON + lista vacía', env: { [FLAG]: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false } },
-      { label: 'ON + lista vacía + coherencia IA', env: { [FLAG]: 'true', [COH_LLM]: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: true } },
-      { label: 'ON + listado + real', env: { [FLAG]: 'true', [ALLOW]: `${OWNER_B},${OWNER_A}`, [REAL]: OWNER_A }, user: OWNER_A, want: { dynamicCourseStructure: true, realVideo: true, coherenceLlm: false } },
-      { label: 'ON + listado sin real', env: { [FLAG]: 'true', [ALLOW]: `${OWNER_B},${OWNER_A}`, [REAL]: OWNER_A }, user: OWNER_B, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false } },
+      { label: 'ON + lista vacía', env: { [FLAG]: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false, manifestRulesVersion: 1 } },
+      { label: 'ON + lista vacía + coherencia IA', env: { [FLAG]: 'true', [COH_LLM]: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: true, manifestRulesVersion: 1 } },
+      { label: 'ON + listado + real', env: { [FLAG]: 'true', [ALLOW]: `${OWNER_B},${OWNER_A}`, [REAL]: OWNER_A }, user: OWNER_A, want: { dynamicCourseStructure: true, realVideo: true, coherenceLlm: false, manifestRulesVersion: 1 } },
+      { label: 'ON + listado sin real', env: { [FLAG]: 'true', [ALLOW]: `${OWNER_B},${OWNER_A}`, [REAL]: OWNER_A }, user: OWNER_B, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false, manifestRulesVersion: 1 } },
       { label: 'ON + no listado', env: { [FLAG]: 'true', [ALLOW]: OWNER_A, [REAL]: OWNER_C, [COH_LLM]: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false } },
+      // V2.1 fix round 1 (review G2 I4): el editor muestra los toggles V2.1 solo con rulesVersion 3.
+      { label: 'ON + reglas v3 (DYNAMIC_MANIFEST_RULES_VERSION=3)', env: { [FLAG]: 'true', DYNAMIC_MANIFEST_RULES_VERSION: '3' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false, manifestRulesVersion: 3 } },
     ];
     for (const m of featureMatrix) {
       await check(`GET /api/v1/features — ${m.label}`, () =>

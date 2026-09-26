@@ -15,6 +15,20 @@ import { packageReuseHash, resolveDynamicMoodleVersion, sortedArtifactIds } from
 import { reportVideoDeliveryConfigAtStartup } from '../modules/dynamic-generation/dynamic-video-delivery';
 import { buildDynamicMbz, DYNAMIC_MBZ_BUILDER_VERSION } from '../package/dynamic-mbz-builder';
 import type { DynamicPackageContents, PackagingPlan, ResolvedArtifact } from '../modules/dynamic-packaging/packaging-types';
+import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
+import { WorkerLedger, recordPackageBuild } from './finops-worker-hooks';
+import { buildDynamicMbzV3, DYNAMIC_MBZ_BUILDER_VERSION_V3 } from '../package/dynamic-mbz-builder-v3';
+import { validateMbzV3 } from '../package/v3/mbz-validator-v3';
+import { buildPackagingPlanV3 } from '../modules/dynamic-packaging/packaging-plan-v3';
+import {
+  ContentLoadersV3,
+  artifactsServiceLoadersV3,
+  loadContentsV3,
+  prepareV3Package,
+} from '../modules/dynamic-packaging/packaging-v3';
+import { resolveTheme } from '../modules/theme-engine';
+import { assessmentItemCountsFromManifest, resolveAssessment } from '../package/assessment';
+import type { BlueprintSnapshotV2 } from '../modules/course-blueprints/blueprint-snapshot';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fase 5B.1 — B3: dynamic-package-worker. Reclama production_jobs con
@@ -95,6 +109,23 @@ export interface DynamicPackageWorkerDeps {
   workerId: string;
   leaseSeconds: number;
   heartbeatMs: number;
+  /**
+   * V2.1 RF-b: ledger de costos — un evento ZERO_BY_DESIGN por build
+   * (idempotente por el id del job de paquete). El bootstrap SIEMPRE lo
+   * cablea; opcional solo para harnesses previos. Un fallo del ledger se
+   * loguea como error y nunca rompe el empaquetado.
+   */
+  finops?: WorkerLedger | null;
+  /**
+   * V2.1 R12 (rulesVersion 3). Opcionales para no romper harnesses previos;
+   * el bootstrap los cablea y, si faltan, se usan las implementaciones reales.
+   */
+  buildMbzV3?: typeof buildDynamicMbzV3;
+  validateMbzV3?: typeof validateMbzV3;
+  /** Cargadores de contenidos v3 por dueño (default: ArtifactsService + fetch). */
+  loadersV3?: (ownerId: string) => ContentLoadersV3;
+  /** Reloj inyectable (segundos UNIX) para el `ts` del .mbz v3. */
+  nowSeconds?: () => number;
 }
 
 export interface PackageJobRow {
@@ -296,6 +327,12 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
       throw new Error(`el Manifest del Blueprint v${blueprintNumber} (#${manifest.id}) no coincide con el del job (#${manifestId})`);
     }
 
+    // V2.1 R12: rulesVersion 3 tiene su propio camino (plan, artifacts, perfiles, builder y validador v3).
+    if (manifest.manifest?.rulesVersion === 3) {
+      await processV3PackageJob(deps, job, manifest, moodle.resolved, moodle.requested, () => leaseLost);
+      return;
+    }
+
     const byItem = await deps.resolveArtifacts({ query: deps.dataSource.query.bind(deps.dataSource) }, runId, manifest.manifest);
     const ids = sortedArtifactIds(byItem);
     const sourceIdsHash = packageReuseHash(DYNAMIC_MBZ_BUILDER_VERSION, ids, moodle.resolved);
@@ -361,6 +398,15 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
     });
     if (leaseLost) return;
 
+    // V2.1 RF-b: packaging = costo directo 0 (ZERO_BY_DESIGN), atribuido al run.
+    if (deps.finops) {
+      try {
+        await recordPackageBuild(deps.finops, { ownerId: job.owner_id, packageJobId: job.id, runId: runId ?? null });
+      } catch (err) {
+        logger.error(`finops: no se pudo registrar el build del paquete ${job.id} en el ledger — ${errMessage(err)}`);
+      }
+    }
+
     const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
       artifactId: artifact.id,
       sourceArtifactIds: ids,
@@ -383,6 +429,158 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
   } finally {
     clearInterval(heartbeatTimer);
   }
+}
+
+/**
+ * V2.1 R12 — job de empaquetado de un run rulesVersion 3. Nunca genera: solo
+ * consume artifacts ya completados. Orden (fail loud en cada paso):
+ *   1. resolver artifacts v3 + guarda de mocks (R-007) + perfiles vigentes →
+ *      clave de reuse v3 (tema, nota mínima, builder, renderer, H5P, Moodle);
+ *   2. restore-first: mismo run + misma clave → se reutiliza el .mbz;
+ *   3. cargar contenidos (fixtures simuladas → medios sintéticos, solo si el
+ *      run está congelado en mock para ese proveedor);
+ *   4. build v3 + VALIDADOR v3 ANTES de subir (un hallazgo = job fallido);
+ *   5. subir, evento ZERO_BY_DESIGN (RF-b) y completar con resumen/avisos.
+ * Exportado para tests.
+ */
+export async function processV3PackageJob(
+  deps: DynamicPackageWorkerDeps,
+  job: PackageJobRow,
+  manifest: ManifestDto,
+  moodleVersion: string,
+  moodleRequested: string | undefined,
+  isLeaseLost: () => boolean,
+): Promise<void> {
+  const { logger } = deps;
+  const { runId, blueprintNumber } = job.input_payload;
+  const q = { query: deps.dataSource.query.bind(deps.dataSource) };
+  const prepared = await prepareV3Package(q, runId, manifest, job.course_id, moodleVersion);
+  const { sourceIdsHash, sourceArtifactIds: ids } = prepared;
+  const baseSummary = {
+    sourceArtifactIds: ids,
+    sourceIdsHash,
+    builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3,
+    rulesVersion: 3,
+    moodleVersion,
+    assessmentProfileVersion: prepared.profiles.assessmentVersion,
+    presentationProfileVersion: prepared.profiles.presentationVersion,
+    themeSource: prepared.profiles.theme.source,
+    themeSha256: prepared.profiles.themeSha256,
+    // F1 (I3): weightsNormalized + pesos originales/finales, o curso sin nota.
+    assessment: prepared.assessment,
+  };
+  // F1: avisos de perfiles (tema por defecto, pesos normalizados, curso sin nota) — también en un paquete reutilizado.
+  const profileWarnings = prepared.profileWarnings.map((w) => ({ code: w.split(':')[0], detail: w }));
+  if (isLeaseLost()) return;
+
+  const existing = await findExistingDynamicMbzV3(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash);
+  if (existing) {
+    logger.log(`Job ${job.id}: dynamic_mbz v3 ya existe (${existing.id}) para runId=${runId} — reutilizando sin reconstruir`);
+    const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
+      artifactId: existing.id,
+      reused: true,
+      ...baseSummary,
+      ...(prepared.staleWarnings.length || profileWarnings.length ? { warnings: [...prepared.staleWarnings, ...profileWarnings] } : {}),
+    });
+    if (!ok) logger.warn(`Job ${job.id}: completeJob devolvió false (lease perdida) tras reutilizar ${existing.id}`);
+    return;
+  }
+
+  const blueprint = await deps.blueprints.getByNumberAnySchema(job.course_id, job.owner_id, blueprintNumber);
+  if (blueprint.schemaVersion !== 2) throw new Error(`el run v3 exige un Blueprint schemaVersion 2 (vino ${blueprint.schemaVersion})`);
+  const snapshot = blueprint.snapshot as BlueprintSnapshotV2;
+  const plan = buildPackagingPlanV3(manifest.manifest, snapshot, { manifestId: manifest.id });
+  const theme = resolveTheme(prepared.profiles.theme.input);
+  const loaders = deps.loadersV3 ? deps.loadersV3(job.owner_id) : artifactsServiceLoadersV3(deps.artifacts, job.owner_id);
+  const loaded = await loadContentsV3(loaders, plan, prepared.byItem, prepared.run, { familyId: theme.familyId, mode: theme.mode });
+  if (isLeaseLost()) return;
+
+  const build = deps.buildMbzV3 ?? buildDynamicMbzV3;
+  const built = await build({
+    manifest: manifest.manifest,
+    blueprint: snapshot,
+    manifestId: manifest.id,
+    assessmentProfile: prepared.profiles.assessment,
+    presentation: prepared.profiles.theme.input,
+    contents: loaded.contents,
+    ts: (deps.nowSeconds ?? (() => Math.floor(Date.now() / 1000)))(),
+    moodleVersion: moodleRequested,
+  });
+  // §Q.8: el validador corre sobre los BYTES del paquete, antes de subir. Un hallazgo = fail loud.
+  // G6 M1: la evaluación esperada se resuelve ACÁ, del perfil que cargó el worker (no se confía en la del builder).
+  // F1 (I3): con los mismos itemCounts del Manifest que usa el builder.
+  const resolved = resolveAssessment(prepared.profiles.assessment, {
+    hasFinalExam: manifest.manifest.features?.finalExam === true,
+    activityEngine: manifest.manifest.features?.activityEngine,
+    itemCounts: assessmentItemCountsFromManifest(manifest.manifest),
+  });
+  if (JSON.stringify(resolved) !== JSON.stringify(built.expectations.resolved)) {
+    throw new Error('MBZ_V3_VALIDATION_FAILED: el builder resolvió una evaluación distinta de la del perfil vigente');
+  }
+  const validation = await (deps.validateMbzV3 ?? validateMbzV3)(built.mbz, { facts: built.expectations.facts, resolved });
+  if (!validation.ok) {
+    throw new Error(
+      `MBZ_V3_VALIDATION_FAILED: ${validation.issues.length} hallazgo(s): ` +
+        validation.issues.slice(0, 8).map((i) => `${i.code} ${i.where}: ${i.message}`).join(' | '),
+    );
+  }
+  if (isLeaseLost()) return;
+
+  const storagePath = `${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${sourceIdsHash}.mbz`;
+  const artifact = await deps.artifacts.uploadBufferArtifact({
+    ownerId: job.owner_id,
+    courseId: artifactCourseId(job),
+    jobId: job.id,
+    type: 'dynamic_mbz',
+    filename: `${sourceIdsHash}.mbz`,
+    storagePath,
+    buffer: built.mbz,
+    mimeType: 'application/vnd.moodle.backup',
+    upsert: false,
+    adoptExistingOnConflict: true,
+    metadata: { runId, manifestId: manifest.id, ...baseSummary },
+  });
+  if (isLeaseLost()) return;
+
+  if (deps.finops) {
+    try {
+      await recordPackageBuild(deps.finops, { ownerId: job.owner_id, packageJobId: job.id, runId: runId ?? null });
+    } catch (err) {
+      logger.error(`finops: no se pudo registrar el build del paquete ${job.id} en el ledger — ${errMessage(err)}`);
+    }
+  }
+  const warnings = [
+    ...prepared.staleWarnings,
+    ...profileWarnings,
+    ...[...loaded.warnings, ...built.summary.warnings].map((w) => ({ code: w.split(':')[0], detail: w })),
+  ];
+  const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
+    artifactId: artifact.id,
+    reused: false,
+    ...baseSummary,
+    planSha256: built.summary.planSha256,
+    counts: built.summary.counts,
+    h5pPackages: built.summary.h5pPackages,
+    mockProviderItems: loaded.mockProviderItems,
+    validation: validation.stats,
+    ...(warnings.length ? { warnings } : {}),
+  });
+  if (!ok) logger.warn(`Job ${job.id}: el .mbz v3 se subió (artifact ${artifact.id}) pero completeJob devolvió false (lease perdida)`);
+}
+
+async function findExistingDynamicMbzV3(
+  artifacts: ArtifactsService,
+  ownerId: string,
+  courseId: string,
+  runId: string,
+  sourceIdsHash: string,
+): Promise<{ id: string } | null> {
+  const list = await artifacts.findAll(ownerId, { courseId, type: 'dynamic_mbz' });
+  const match = list.find((a) => {
+    const meta = a.metadata as Record<string, any> | null;
+    return meta?.runId === runId && meta?.sourceIdsHash === sourceIdsHash && meta?.builderVersion === DYNAMIC_MBZ_BUILDER_VERSION_V3;
+  });
+  return match ? { id: match.id } : null;
 }
 
 /**
@@ -551,6 +749,7 @@ async function bootstrap() {
     workerId: process.env.DYNAMIC_PACKAGE_WORKER_ID || `dynamic-package-worker-${process.pid}`,
     leaseSeconds: readPositiveInt('DYNAMIC_PACKAGE_WORKER_LEASE_SECONDS', 600),
     heartbeatMs: readPositiveInt('DYNAMIC_PACKAGE_WORKER_HEARTBEAT_MS', 30000),
+    finops: app.get(FinopsLedgerService),
   };
   const pollMs = readPositiveInt('DYNAMIC_PACKAGE_WORKER_POLL_MS', 5000);
 
