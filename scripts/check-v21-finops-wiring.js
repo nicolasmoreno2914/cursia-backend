@@ -115,6 +115,16 @@ async function pureChecks() {
     eq(F.paidRealProviders(F.estimateItemsForRun(V3_ITEMS, 'real'), 'mock'), [], 'mock nunca paga');
   });
 
+  await check('puro (merge R5): modos de gasto POR proveedor — video mock + providerModes real ⇒ Gamma/TTS se estiman y exigen aprobación; providerModes ausentes ⇒ real (fail safe)', () => {
+    const modes = F.runSpendModes('mock', { presentation: 'real', audio: 'real' });
+    eq(modes, { video: 'mock', presentation: 'real', audio: 'real' }, 'modos');
+    const items = F.estimateItemsForRun(V3_ITEMS, modes);
+    assert(!items.some((x) => x.itemType === 'video') && items.some((x) => x.itemType === 'presentation'), 'video excluido, Gamma incluido');
+    eq(F.paidRealProviders(items, modes), ['gamma', 'openai'], 'proveedores reales');
+    eq(F.runSpendModes('real', null), { video: 'real', presentation: 'real', audio: 'real' }, 'sin providerModes → real');
+    eq(F.paidRealProviders(F.estimateItemsForRun(V3_ITEMS, F.runSpendModes('mock', { presentation: 'mock', audio: 'mock' })), F.runSpendModes('mock', { presentation: 'mock', audio: 'mock' })), [], 'todo mock');
+  });
+
   await check('puro: decisión — mock/solo-LLM sin política → AUTO; pagado real → ADMIN_APPROVAL aunque la política lo permita; BLOCK por política; LLM sobre maxCostPerRun → ADMIN_APPROVAL (nunca BLOCK)', () => {
     const estMock = estimate(F.estimateItemsForRun(V3_ITEMS, 'mock'));
     const estReal = estimate(F.estimateItemsForRun(V3_ITEMS, 'real'));
@@ -329,9 +339,12 @@ function cleanEnv(extra) {
 const OWNER = '11111111-2222-4333-8444-555555555555';
 const ATTACKER = '99999999-8888-4777-8666-555555555555';
 const CONTEXT = { nombre: 'Curso RF-b', sector: 'Salud', pais: 'Chile', contexto: 'x', nivel: 'Básico', tono: 'Formal' };
+// Run MOCK completo: video mock + providerModes mock (R5: el default de Gamma/TTS es real).
+const MOCK_CTX = { ...CONTEXT, videoMode: 'mock', providerModes: { presentation: 'mock', audio: 'mock' } };
 const ENV_KEYS = [
   'DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_ALLOWED_OWNERS', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION',
   'DYNAMIC_VIDEO_DELIVERY', 'DYNAMIC_ALLOW_VIDEOGEN_DIRECT', 'VIDEOGEN_API_KEY', 'ALLOW_UNOWNED_COURSES', 'FINOPS_INGEST_TOKEN',
+  'DYNAMIC_PROVIDER_WORKER_ENABLED', 'DYNAMIC_ALLOW_PROVIDER_MOCK',
 ];
 
 async function dbChecks() {
@@ -460,6 +473,8 @@ async function dbChecks() {
     process.env.DYNAMIC_VIDEO_DELIVERY = 'videogen_direct';
     process.env.DYNAMIC_ALLOW_VIDEOGEN_DIRECT = 'true';
     process.env.VIDEOGEN_API_KEY = 'fake-key-never-used-no-network';
+    process.env.DYNAMIC_PROVIDER_WORKER_ENABLED = 'true'; // R5: sin él, runs v3 con Gamma/TTS → 501
+    process.env.DYNAMIC_ALLOW_PROVIDER_MOCK = 'true';     // R5: providerModes mock (escape de no-producción)
 
     ds = new DataSource({ type: 'postgres', host: '127.0.0.1', port, username: 'postgres', database: DB, entities: [], synchronize: false });
     await ds.initialize();
@@ -533,7 +548,7 @@ async function dbChecks() {
     const A = await makeCourse('Curso mock');
     let runA = null;
     await check('DB gate: run MOCK → AUTO_WITHIN_POLICY sin aprobación; estimado (sin items de worker) guardado con run_id + autorización AUTO vinculada', async () => {
-      const res = await runs.startRun(A.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' });
+      const res = await runs.startRun(A.cid, OWNER, 1, MOCK_CTX);
       eq(res.created, true, 'creado');
       runA = res.run.id;
       const auths = await ds.query(`select decision, authorized_budget::text as b, estimate_id from public.cost_budget_authorizations where run_id = $1`, [runA]);
@@ -544,6 +559,12 @@ async function dbChecks() {
       for (const t of ['video', 'presentation', 'audio_welcome', 'audiobook_chapter']) assert(!types.has(t), `mock no estima ${t}`);
       assert(types.has('content') && dec(est.totals.expected) > 0, 'LLM estimado');
       eq(dec(auths[0].b), dec(est.totals.max), 'authorized = max del estimado');
+    });
+
+    await check('DB gate (merge R5): video MOCK pero Gamma/TTS en su default REAL → 409 budget_approval_required (el modo de video no decide el gasto de proveedores)', async () => {
+      const P = await makeCourse('Curso providers reales');
+      const err = await rejectsRe(runs.startRun(P.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' }), /budget_approval_required/, 'providers reales', 409);
+      eq(err.getResponse().paidRealProviders, ['gamma', 'openai'], 'proveedores');
     });
 
     // ════ B: run REAL → 409 hasta aprobación ═════════════════════════════
@@ -975,7 +996,7 @@ async function dbChecks() {
         [String(Cc.cid), JSON.stringify({ maxCostPerRun: '0.0001' })]);
       await rejectsRe(runs.startRun(Cc.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /budget_blocked/, 'bloqueado', 409);
       // Mock con la misma política: el LLM sobre el límite pide aprobación (nunca BLOCK).
-      await rejectsRe(runs.startRun(Cc.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' }), /budget_approval_required/, 'LLM sobre el límite', 409);
+      await rejectsRe(runs.startRun(Cc.cid, OWNER, 1, MOCK_CTX), /budget_approval_required/, 'LLM sobre el límite', 409);
     });
   } finally {
     if (app) await app.close().catch(() => {});

@@ -116,6 +116,11 @@ function loadPricingSeed(seedPath = SEED_PATH) {
 async function applyV21Finops(client, opts = {}) {
   const sql = fs.readFileSync(opts.sqlPath || SQL_PATH, 'utf8');
   await client.query(sql);
+  return seedPricingCatalog(client, opts);
+}
+
+/** Solo el seed de pricing_catalog (ON CONFLICT DO NOTHING). Lo usa también el runner de producción. */
+async function seedPricingCatalog(client, opts = {}) {
   const seed = loadPricingSeed(opts.seedPath || SEED_PATH);
   let inserted = 0;
   for (const r of seed.rows) {
@@ -163,7 +168,7 @@ async function main() {
   }
 }
 
-module.exports = { applyV21Finops, loadPricingSeed, SQL_PATH, SEED_PATH };
+module.exports = { applyV21Finops, seedPricingCatalog, loadPricingSeed, SQL_PATH, SEED_PATH };
 
 if (require.main === module) {
   main().catch((err) => {

@@ -138,6 +138,8 @@ function makeDeps({ videoMode = 'real' } = {}) {
     logger: { log() {}, warn() {}, error() {}, debug() {} },
     executorId: 'exec-1', leaseSeconds: 60, heartbeatMs: 60_000,
     videoTimeoutMin: 1, videoPollMs: 1, mockScenario: 'success', mockResolvePolls: 1, youtube: null,
+    // V2.1 RF-b (fix round 2): runtime guard de presupuesto falso y permisivo (sin él, video real falla cerrado).
+    budget: require(require('path').join(__dirname, 'lib/finops-test-fakes.js')).permissiveBudgetGuard(),
   };
   return { deps, calls };
 }
