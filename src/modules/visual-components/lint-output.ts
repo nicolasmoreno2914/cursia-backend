@@ -230,7 +230,9 @@ export type CleanSafeLintCode =
   | 'GRADIENT_WITHOUT_FALLBACK'
   | 'DUPLICATE_SAFE_PROPERTY'
   | 'FONT_TOO_SMALL'
-  | 'LOW_CONTRAST';
+  | 'LOW_CONTRAST'
+  | 'LINK_WITHOUT_COLOR'
+  | 'PURE_BLACK_WHITE';
 
 export interface CleanSafeLintError {
   code: CleanSafeLintCode;
@@ -272,7 +274,9 @@ function pxValue(v: string | undefined): number | undefined {
  *    un gradiente (enhanced) exige background-color hex en el mismo elemento;
  *  - una propiedad segura no se repite salvo override con clamp()/min()/max()/calc() (que el purificador descarta);
  *  - font-size base < 16px solo en .cvc-meta y nunca < 13px;
- *  - contraste estático color/fondo emparejados ≥ 4.5:1 (WCAG, texto normal).
+ *  - contraste estático color/fondo emparejados ≥ 4.5:1 (WCAG, texto normal);
+ *  - todo <a> fija su propio color (los filtros de Moodle inyectan enlaces sin color);
+ *  - sin #FFFFFF/#000000 puros en color/background-color (§G.4).
  */
 export function lintCleanSafe(html: string): CleanSafeLintResult {
   const errors: CleanSafeLintError[] = [];
@@ -299,6 +303,10 @@ export function lintCleanSafe(html: string): CleanSafeLintResult {
     }
     if ('hidden' in el.attrs) errors.push({ code: 'BASE_HIDDEN', message: 'atributo hidden', where: w() });
     if (el.tag === 'details' && !('open' in el.attrs)) errors.push({ code: 'BASE_HIDDEN', message: '<details> cerrado', where: w() });
+    // Un enlace sin color propio toma el azul del tema de Moodle (p. ej. #0F6CBF), ilegible en temas oscuros.
+    if (el.tag === 'a' && baseValue(decls, 'color') === undefined) {
+      errors.push({ code: 'LINK_WITHOUT_COLOR', message: '<a> sin color inline propio', where: w() });
+    }
 
     // valores prohibidos / duplicados en propiedades seguras
     const seen = new Map<string, number>();
@@ -321,6 +329,9 @@ export function lintCleanSafe(html: string): CleanSafeLintResult {
       }
       if ((d.prop === 'color' || d.prop === 'background-color') && !rejected && !HEX.test(d.value.trim())) {
         errors.push({ code: 'NON_HEX_COLOR', message: `${d.prop}:${d.value}`, where: w() });
+      }
+      if ((d.prop === 'color' || d.prop === 'background-color') && /^#(?:fff|ffffff|000|000000)$/i.test(d.value.trim())) {
+        errors.push({ code: 'PURE_BLACK_WHITE', message: `${d.prop}:${d.value} (§G.4: sin blanco/negro puros)`, where: w() });
       }
       const count = (seen.get(d.prop) || 0) + 1;
       seen.set(d.prop, count);

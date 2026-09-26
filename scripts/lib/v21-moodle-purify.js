@@ -40,4 +40,27 @@ function purifyMany(htmls) {
   return out;
 }
 
-module.exports = { purifyMany, PHP_BIN, PHP_INI, MOODLE_CONFIG };
+const FORMAT_BRIDGE = path.resolve(__dirname, 'moodle-format.php');
+
+/** format_text() con filtros (ver moodle-format.php). */
+function moodleFormat(payload) {
+  for (const [label, p] of [['PHP_BIN', PHP_BIN], ['PHP_INI', PHP_INI], ['MOODLE_CONFIG', MOODLE_CONFIG]]) {
+    if (!fs.existsSync(p)) throw new Error(`MOODLE_FORMAT_UNAVAILABLE: ${label} no existe (${p})`);
+  }
+  const r = spawnSync(PHP_BIN, ['-c', PHP_INI, FORMAT_BRIDGE], {
+    input: JSON.stringify(payload),
+    env: { ...process.env, MOODLE_CONFIG },
+    maxBuffer: 512 * 1024 * 1024,
+    encoding: 'utf8',
+  });
+  if (r.status !== 0) {
+    throw new Error(`MOODLE_FORMAT_FAILED: exit ${r.status}: ${(r.stderr || '').slice(0, 800)} ${(r.stdout || '').slice(0, 400)}`);
+  }
+  try {
+    return JSON.parse(r.stdout);
+  } catch (e) {
+    throw new Error(`MOODLE_FORMAT_FAILED: salida no JSON: ${(r.stdout || '').slice(0, 400)}`);
+  }
+}
+
+module.exports = { purifyMany, moodleFormat, PHP_BIN, PHP_INI, MOODLE_CONFIG };

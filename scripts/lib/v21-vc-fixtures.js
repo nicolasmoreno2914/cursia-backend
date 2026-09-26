@@ -27,14 +27,14 @@ function loadFixture() {
   return JSON.parse(fs.readFileSync(FIXTURE, 'utf8'));
 }
 
-/** Un componente de cada tipo (16) + variantes de callout. */
+/** Un componente de cada tipo (16) + variantes de callout + comparaciones de 3 y 4 columnas × 8 filas. */
 function loadComponents() {
   const f = loadFixture();
-  return [...f.components, ...f.callout_variants].map(clone);
+  return [...f.components, ...f.callout_variants, ...(f.comparison_variants || [])].map(clone);
 }
 
 function byType(type, variant) {
-  const c = loadComponents().find((x) => x.type === type && (!variant || x.variant === variant));
+  const c = loadComponents().find((x) => x.type === type && (type === 'comparison' ? x.columns.length === (variant || 2) : !variant || x.variant === variant));
   if (!c) throw new Error(`fixture sin componente ${type}`);
   return c;
 }
@@ -46,7 +46,7 @@ function buildExperience() {
     chapterId: 'cap-escucha-activa',
     movements: {
       opening: [byType('hero'), byType('learning_objectives'), byType('callout', 'tip')],
-      deepening: [byType('concept_cards'), byType('accordion'), byType('tabs'), byType('comparison')],
+      deepening: [byType('concept_cards'), byType('accordion'), byType('tabs'), byType('comparison', 4)],
       synthesis: [byType('summary_visual'), byType('myth_reality')],
       closing: [byType('reflection'), byType('case_scenario')],
       video_primer: [byType('process_steps'), byType('timeline')],
@@ -80,6 +80,13 @@ function longVariant(c) {
   return walk(clone(c), null);
 }
 
+/** Nombre legible y único de un fixture de componente. */
+function fixtureName(c) {
+  if (c.type === 'callout') return `callout-${c.variant}`;
+  if (c.type === 'comparison') return `comparison-${c.columns.length}col`;
+  return c.type;
+}
+
 /** Todos los strings de texto de un componente (sin type/variant), con ** removidos. */
 function textsOf(c) {
   const out = [];
@@ -97,4 +104,4 @@ function themeLabel(combo) {
   return `${combo.themeFamily}-${combo.mode}`;
 }
 
-module.exports = { THEME_COMBOS, loadComponents, buildExperience, longVariant, textsOf, themeLabel, LONG_WORD, clone };
+module.exports = { fixtureName, THEME_COMBOS, loadComponents, buildExperience, longVariant, textsOf, themeLabel, LONG_WORD, clone };

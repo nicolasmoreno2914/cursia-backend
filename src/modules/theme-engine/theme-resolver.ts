@@ -16,8 +16,11 @@ import {
   correctForegroundForBackgrounds,
   hexToHsl,
   hslToHex,
+  isPureBlackOrWhite,
   isValidHex,
   normalizeHex,
+  ON_DARK,
+  ON_LIGHT,
   resolveReadableOn,
 } from './color-math';
 import { SPACE_SCALE, THEME_FAMILIES } from './families';
@@ -59,9 +62,9 @@ function resolveTextOnAccent(
   accentStrongFixed: string,
   min: number,
 ): { accent: string; on: string; changed: boolean } {
-  const strongWhiteOk = contrastRatio('#FFFFFF', accentStrongFixed) >= min;
-  const strongBlackOk = contrastRatio('#000000', accentStrongFixed) >= min;
-  const preferred = strongWhiteOk ? '#FFFFFF' : strongBlackOk ? '#000000' : null;
+  const strongWhiteOk = contrastRatio(ON_LIGHT, accentStrongFixed) >= min;
+  const strongBlackOk = contrastRatio(ON_DARK, accentStrongFixed) >= min;
+  const preferred = strongWhiteOk ? ON_LIGHT : strongBlackOk ? ON_DARK : null;
   if (!preferred) {
     throw new Error(`THEME_INVALID: accentStrong "${accentStrongFixed}" no admite ningún texto legible`);
   }
@@ -69,7 +72,7 @@ function resolveTextOnAccent(
     return { accent, on: preferred, changed: false };
   }
   const { h, s, l } = hexToHsl(accent);
-  const darken = preferred === '#FFFFFF';
+  const darken = preferred === ON_LIGHT;
   for (let i = 1; i <= 50; i++) {
     const ll = clamp01(l + (darken ? -1 : 1) * 0.02 * i);
     const candidate = hslToHex(h, s, ll);
@@ -88,13 +91,23 @@ const STATUS_ON_KEY: Record<(typeof STATUS_KEYS)[number], keyof ThemeColorTokens
   info: 'onInfo',
 };
 
+/** Un color de la semilla que sea blanco/negro puro se sustituye por ON_LIGHT/ON_DARK (§G.4), registrándolo. */
+function nudgePure(hex: string, label: string, adjustments: string[]): string {
+  const h = normalizeHex(hex);
+  if (!isPureBlackOrWhite(h)) return h;
+  const out = h === '#FFFFFF' ? ON_LIGHT : ON_DARK;
+  adjustments.push(`${label} ${h} es blanco/negro puro; se usa ${out}`);
+  return out;
+}
+
 function deriveModuleColorsBasis(
   familyModuleColors: string[],
   brandSeed: BrandSeed | undefined,
+  adjustments: string[],
 ): string[] {
   const seedColors = (brandSeed?.moduleColors ?? []).filter((c) => typeof c === 'string' && c.length > 0);
-  const basis = seedColors.length > 0 ? seedColors : familyModuleColors;
-  return basis.map(normalizeHex);
+  if (seedColors.length > 0) return seedColors.map((c, i) => nudgePure(c, `brandSeed.moduleColors[${i}]`, adjustments));
+  return familyModuleColors.map(normalizeHex);
 }
 
 export function resolveTheme(input: PresentationProfileInput): ResolvedTheme {
@@ -114,13 +127,20 @@ export function resolveTheme(input: PresentationProfileInput): ResolvedTheme {
 
   if (input.brandSeed?.accent) normalizeHex(input.brandSeed.accent); // throws THEME_INVALID early on malformed seed
   for (const c of input.brandSeed?.moduleColors ?? []) normalizeHex(c);
+  if (input.themeVersion !== undefined && input.themeVersion !== THEME_ENGINE_VERSION) {
+    // Un tema etiquetado con otra versión pero construido con las reglas v1 mentiría y
+    // cambiaría themeSha256 (clave de reuse) sin cambiar el resultado.
+    throw new Error(
+      `THEME_INVALID: themeVersion ${String(input.themeVersion)} no soportada (este motor es v${THEME_ENGINE_VERSION})`,
+    );
+  }
 
   const adjustments: string[] = [];
   const color: ThemeColorTokens = { ...baseMode.color };
 
   // ── accent / accentStrong / textOnAccent ──────────────────────────────
   if (input.brandSeed?.accent) {
-    color.accent = normalizeHex(input.brandSeed.accent);
+    color.accent = nudgePure(input.brandSeed.accent, 'brandSeed.accent', adjustments);
   }
   const accentStrongInitial = deriveAccentStrong(color.accent, input.mode);
   const accentStrongFixed = correctForegroundForBackgrounds(accentStrongInitial, [color.bg], CONTRAST_BODY);
@@ -181,10 +201,10 @@ export function resolveTheme(input: PresentationProfileInput): ResolvedTheme {
     color[onKey] = resolved.on;
   }
 
-  const moduleColorsBasis = deriveModuleColorsBasis(baseMode.moduleColors, input.brandSeed);
+  const moduleColorsBasis = deriveModuleColorsBasis(baseMode.moduleColors, input.brandSeed, adjustments);
 
   const theme: ResolvedTheme = {
-    version: input.themeVersion ?? THEME_ENGINE_VERSION,
+    version: THEME_ENGINE_VERSION,
     familyId: input.themeFamily,
     mode: input.mode,
     color,
@@ -216,6 +236,9 @@ export function resolveTheme(input: PresentationProfileInput): ResolvedTheme {
     moduleColorsBasis,
   };
 
+  // Correcciones de los colores de módulo ancla (semilla o familia), registradas (§H.5).
+  adjustments.push(...moduleColorAdjustments(theme, moduleColorsBasis.length));
+
   const errors = validateTheme(theme);
   if (errors.length > 0) {
     throw new Error(
@@ -227,50 +250,116 @@ export function resolveTheme(input: PresentationProfileInput): ResolvedTheme {
   return theme;
 }
 
+interface ModuleColorsComputation {
+  colors: ModuleColor[];
+  /** Notas de corrección por índice (vacío si el color se usó tal cual). */
+  notes: string[][];
+}
+
+function hueDelta(a: number, b: number): number {
+  const d = Math.abs(a - b) % 360;
+  return d > 180 ? 360 - d : d;
+}
+
+/** Dos `main` vecinos son indistinguibles si difieren poco en contraste Y en tono. */
+function tooSimilar(a: string, b: string): boolean {
+  return a === b || (contrastRatio(a, b) < 1.2 && hueDelta(hexToHsl(a).h, hexToHsl(b).h) < 20);
+}
+
 /**
- * Deterministic module color for any index >= 0. Cycles through the
- * theme's resolved anchor hues (BrandSeed.moduleColors or the family's own
- * anchors), rotating by the golden angle once the anchors are exhausted so
- * neighbouring hues never collide even for very large N. Self-corrects
- * main/soft lightness (same algorithm as resolveTheme's status colors) so
- * onMain/onSoft are always ≥ 4.5:1 — this needs no external `adjustments`
- * bookkeeping because it is recomputed identically on every call.
+ * Calcula los colores de módulo 0..count-1 en orden.
+ *
+ * - Índices < anclas: el ancla i (BrandSeed.moduleColors[i] o el ancla i de la familia) se
+ *   usa CON SU PROPIO tono y saturación; solo se corrige la luminosidad para contraste con
+ *   su `on` (resolveReadableOn), y se anota.
+ * - Índices ≥ anclas: rotación por ángulo áureo desde el primer ancla (N arbitrario).
+ * - Colisión con el anterior (o igualdad con cualquiera previo): se desplaza primero la
+ *   luminosidad y, si no alcanza, el tono; se anota.
+ * Pura y determinista: depende solo de (theme, count).
+ */
+function computeModuleColors(theme: ResolvedTheme, count: number): ModuleColorsComputation {
+  const basis = theme.moduleColorsBasis.length > 0 ? theme.moduleColorsBasis : [theme.color.accent];
+  const isDark = theme.mode === 'dark';
+  const colors: ModuleColor[] = [];
+  const notes: string[][] = [];
+  const hue0 = hexToHsl(basis[0]).h;
+
+  for (let i = 0; i < count; i++) {
+    const note: string[] = [];
+    let h: number;
+    let s: number;
+    let l: number;
+    let baseHex: string;
+    if (i < basis.length) {
+      baseHex = basis[i];
+      ({ h, s, l } = hexToHsl(baseHex));
+    } else {
+      h = (hue0 + GOLDEN_ANGLE_DEG * i) % 360;
+      s = Math.max(hexToHsl(basis[i % basis.length]).s, 0.45);
+      l = isDark ? 0.58 : 0.4;
+      baseHex = hslToHex(h, s, l);
+    }
+
+    let main = resolveReadableOn(baseHex, CONTRAST_BODY);
+    if (main.changed && i < basis.length) {
+      note.push(`moduleColor(${i}).main corregido para contraste ≥ ${CONTRAST_BODY} (${baseHex} → ${main.bg})`);
+    }
+    const collides = (hex: string) =>
+      (i > 0 && tooSimilar(hex, colors[i - 1].main)) || colors.some((c) => c.main === hex);
+    if (collides(main.bg)) {
+      const before = main.bg;
+      const shifts = [0.14, -0.14, 0.28, -0.28];
+      let fixed = false;
+      for (const dl of shifts) {
+        const cand = resolveReadableOn(hslToHex(h, s, clamp01(l + dl)), CONTRAST_BODY);
+        if (!collides(cand.bg)) {
+          main = cand;
+          fixed = true;
+          break;
+        }
+      }
+      for (let k = 1; !fixed && k <= 12; k++) {
+        const cand = resolveReadableOn(hslToHex(h + GOLDEN_ANGLE_DEG * k, Math.max(s, 0.45), l), CONTRAST_BODY);
+        if (!collides(cand.bg)) {
+          main = cand;
+          fixed = true;
+        }
+      }
+      if (!fixed) throw new Error(`THEME_INVALID: no se pudo distinguir moduleColor(${i}) de sus vecinos`);
+      h = hexToHsl(main.bg).h;
+      note.push(`moduleColor(${i}).main ajustado por parecido con un módulo anterior (${before} → ${main.bg})`);
+    }
+
+    const softResolved = resolveReadableOn(hslToHex(h, Math.min(s, isDark ? 0.35 : 0.3), isDark ? 0.22 : 0.92), CONTRAST_BODY);
+    colors.push({
+      main: main.bg,
+      onMain: main.on,
+      soft: softResolved.bg,
+      onSoft: softResolved.on,
+      border: hslToHex(h, Math.min(s, 0.5), isDark ? 0.42 : 0.55),
+    });
+    notes.push(note);
+  }
+  return { colors, notes };
+}
+
+/**
+ * Color de módulo determinista para cualquier índice ≥ 0 (ver computeModuleColors):
+ * los anclas de la BrandSeed se respetan en orden (m1 → módulo 0, m2 → módulo 1, …).
  */
 export function moduleColor(theme: ResolvedTheme, moduleIndex0: number): ModuleColor {
   if (!Number.isInteger(moduleIndex0) || moduleIndex0 < 0) {
     throw new Error(`THEME_INVALID: moduleIndex0 debe ser un entero ≥ 0 (recibido ${moduleIndex0})`);
   }
-  const basis = theme.moduleColorsBasis.length > 0 ? theme.moduleColorsBasis : [theme.color.accent];
-  // Hue comes from a single continuous golden-angle sequence anchored on
-  // basis[0] — NOT from each anchor's own hue. Two legacy BrandSeed anchors
-  // can be near-neutral and land within a fraction of a degree of each
-  // other in hue (e.g. the "slate" palette's m1 #1E293B / m2 #374151 are
-  // 0.3° apart), which collapsed adjacent module colors to the same hex
-  // when hue was read straight off each anchor. The golden angle (137.5°)
-  // is equidistributed, so rotating a single starting hue by index
-  // guarantees every one of indices 0..N-1 stays well separated regardless
-  // of how degenerate the seed's raw anchors are. The anchors still flavor
-  // saturation (cycled per index), so a seed's chroma is not thrown away.
-  const hue0 = hexToHsl(basis[0]).h;
-  const hue = (hue0 + GOLDEN_ANGLE_DEG * moduleIndex0) % 360;
-  const anchorIdx = moduleIndex0 % basis.length;
-  const sat = Math.max(hexToHsl(basis[anchorIdx]).s, 0.45);
-  const isDark = theme.mode === 'dark';
+  return computeModuleColors(theme, moduleIndex0 + 1).colors[moduleIndex0];
+}
 
-  const mainBase = hslToHex(hue, sat, isDark ? 0.58 : 0.4);
-  const softBase = hslToHex(hue, Math.min(sat, isDark ? 0.35 : 0.3), isDark ? 0.22 : 0.92);
-  const border = hslToHex(hue, Math.min(sat, 0.5), isDark ? 0.42 : 0.55);
-
-  const mainResolved = resolveReadableOn(mainBase, CONTRAST_BODY);
-  const softResolved = resolveReadableOn(softBase, CONTRAST_BODY);
-
-  return {
-    main: mainResolved.bg,
-    onMain: mainResolved.on,
-    soft: softResolved.bg,
-    onSoft: softResolved.on,
-    border,
-  };
+/** Correcciones aplicadas a los colores de módulo 0..count-1 (para registrar o auditar). */
+export function moduleColorAdjustments(theme: ResolvedTheme, count: number): string[] {
+  if (!Number.isInteger(count) || count < 0) {
+    throw new Error(`THEME_INVALID: count debe ser un entero ≥ 0 (recibido ${count})`);
+  }
+  return computeModuleColors(theme, count).notes.flat();
 }
 
 export function validateTheme(t: ResolvedTheme, opts?: { moduleCount?: number }): ThemeValidationError[] {
@@ -293,7 +382,18 @@ export function validateTheme(t: ResolvedTheme, opts?: { moduleCount?: number })
     }
   }
 
-  for (const [k, v] of Object.entries(t.color)) checkHex(v, `color.${k}`);
+  function checkNotPure(value: unknown, path: string) {
+    if (typeof value === 'string' && isPureBlackOrWhite(value)) {
+      errors.push({ code: 'PURE_BLACK_WHITE', message: `${path}: ${value} es blanco/negro puro (§G.4)` });
+    }
+  }
+  for (const [k, v] of Object.entries(t.color)) {
+    checkHex(v, `color.${k}`);
+    checkNotPure(v, `color.${k}`);
+  }
+  if (t.version !== THEME_ENGINE_VERSION) {
+    errors.push({ code: 'VERSION', message: `version ${t.version} ≠ ${THEME_ENGINE_VERSION}` });
+  }
   for (const [i, v] of t.moduleColorsBasis.entries()) checkHex(v, `moduleColorsBasis[${i}]`);
 
   const c = t.color;
@@ -324,6 +424,7 @@ export function validateTheme(t: ResolvedTheme, opts?: { moduleCount?: number })
     checkHex(m.onMain, `moduleColor(${i}).onMain`);
     checkHex(m.onSoft, `moduleColor(${i}).onSoft`);
     checkHex(m.border, `moduleColor(${i}).border`);
+    for (const k of ['main', 'soft', 'onMain', 'onSoft', 'border'] as const) checkNotPure(m[k], `moduleColor(${i}).${k}`);
     checkContrast(`moduleColor(${i}).onMain`, m.onMain, `moduleColor(${i}).main`, m.main, CONTRAST_BODY);
     checkContrast(`moduleColor(${i}).onSoft`, m.onSoft, `moduleColor(${i}).soft`, m.soft, CONTRAST_BODY);
   }

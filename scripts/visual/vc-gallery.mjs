@@ -16,7 +16,7 @@
 //
 // Uso: node scripts/visual/vc-gallery.mjs   (requiere npm run build + Moodle local)
 import { spawn } from 'node:child_process';
-import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import net from 'node:net';
 import path from 'node:path';
@@ -34,14 +34,18 @@ const OUT =
   process.env.OUT_DIR ||
   '/private/tmp/claude-501/-Users-nicolas-Documents-Claude-course-gen/c3707ccd-9a84-4474-8052-2f6dfeb251b1/scratchpad/v21/visual/r2';
 const CHROME = process.env.CHROME_BIN || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+// mobile:false en TODOS los anchos (fix round 1 / I2): con mobile:true Chrome ensancha el
+// layout viewport hasta el contenido y un desborde a 390 px deja de ser detectable.
 const WIDTHS = [
-  [390, 844, true],
+  [390, 844, false],
   [768, 1024, false],
   [1280, 900, false],
 ];
 const SHOT_SLICE = 8000;
 const SHOT_MAX_SLICES = 4;
 mkdirSync(path.join(OUT, 'pages'), { recursive: true });
+// sin capturas viejas mezcladas con las de esta corrida
+for (const f of readdirSync(OUT)) if (f.endsWith('.png')) rmSync(path.join(OUT, f));
 
 // ─── Galería ────────────────────────────────────────────────────────────────
 function page(title, labels) {
@@ -59,8 +63,8 @@ for (const combo of F.THEME_COMBOS) {
   const theme = te.resolveTheme(combo);
   const tl = F.themeLabel(combo);
   const sets = {
-    componentes: components.map((c, i) => ({ name: `${c.type}${c.type === 'callout' ? '-' + c.variant : ''}`, list: [c], uid: `g${i}` })),
-    largos: components.map((c, i) => ({ name: `${c.type}-largo`, list: [F.longVariant(c)], uid: `l${i}` })),
+    componentes: components.map((c, i) => ({ name: F.fixtureName(c), list: [c], uid: `g${i}` })),
+    largos: components.map((c, i) => ({ name: `${F.fixtureName(c)}-largo`, list: [F.longVariant(c)], uid: `l${i}` })),
     capitulo: Object.entries(chapter.movements).map(([mv, list]) => ({ name: mv, list, uid: `c-${mv.replace('_', '-')}` })),
   };
   for (const [kind, labels] of Object.entries(sets)) {
@@ -69,6 +73,8 @@ for (const combo of F.THEME_COMBOS) {
     const clean = { id: `${tl}-${kind}-clean_safe`, theme: tl, kind, level: 'clean_safe', labels: enh.map((l) => ({ name: l.name, html: null })) };
     enh.forEach((l, i) => toPurify.push({ page: clean, i, html: l.html }));
     pages.push(clean);
+    // nivel CLEAN_SAFE propio del renderer (sin ENHANCED), tal cual (M8)
+    pages.push({ id: `${tl}-${kind}-clean_raw`, theme: tl, kind, level: 'clean_raw', labels: labels.map((l) => ({ name: l.name, html: vc.renderMovement(l.list, theme, { uid: l.uid }) })) });
   }
 }
 const purified = purifyMany(toPurify.map((x) => x.html));
@@ -134,14 +140,16 @@ async function load(url) {
 }
 
 // Medición en la página. mode: 'js' (ENHANCED con JS), 'static' (CLEAN_SAFE o sin JS: todo visible).
-const MEASURE = (mode) => `(() => {
+const MEASURE = (mode, VIEW_W) => `(() => {
   const mode = ${JSON.stringify(mode)};
   const lum = (c) => { const v = c / 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
   const parse = (s) => { const m = s.match(/rgba?\\(([^)]+)\\)/); if (!m) return null; const p = m[1].split(/[ ,\\/]+/).filter(Boolean).map(Number); return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 }; };
   const L = (c) => 0.2126 * lum(c.r) + 0.7152 * lum(c.g) + 0.0722 * lum(c.b);
   const ratio = (a, b) => { const x = L(a), y = L(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
   const bgOf = (el) => { for (let e = el; e; e = e.parentElement) { const c = parse(getComputedStyle(e).backgroundColor); if (c && c.a >= 1) return c; } return { r: 255, g: 255, b: 255, a: 1 }; };
-  const out = { hscroll: document.scrollingElement.scrollWidth > innerWidth, scrollW: document.scrollingElement.scrollWidth, innerW: innerWidth,
+  const vw = document.documentElement.clientWidth;
+  const out = { hscroll: document.scrollingElement.scrollWidth > vw || innerWidth !== ${VIEW_W}, scrollW: document.scrollingElement.scrollWidth, innerW: innerWidth, vw,
+    rootsOver: [...document.querySelectorAll('.cvc')].filter((r) => r.getBoundingClientRect().right > vw + 0.5).map((r) => r.closest('.gal-label')?.dataset.name),
     texts: 0, uiTexts: 0, hiddenBad: [], small: [], lowContrast: [], clipped: [], zero: [], offscreen: [], allowedHidden: 0 };
   const roots = [...document.querySelectorAll('.cvc')];
   const clipChecked = new Set();
@@ -153,11 +161,11 @@ const MEASURE = (mode) => `(() => {
       const el = n.parentElement;
       if (el.closest('style,script')) continue;
       // el texto de los botones de tab lo crea el runtime (duplica la etiqueta del panel): se mide, pero no se cuenta
-      if (el.closest('.cvc-tablist')) out.uiTexts++; else out.texts++;
+      if (el.closest('.cvc-tablist, .cvc-cmp-full')) out.uiTexts++; else out.texts++;
       const label = el.closest('.gal-label')?.dataset.name + ' «' + txt.slice(0, 30) + '»';
       const visible = el.checkVisibility({ checkVisibilityCSS: true, checkOpacity: false });
       if (!visible) {
-        const allowed = mode === 'js' && (el.closest('[role=tabpanel][hidden]') || el.closest('.cvc-tablabel[hidden]') || (el.closest('details:not([open])') && !el.closest('summary')));
+        const allowed = mode === 'js' && (el.closest('[role=tabpanel][hidden]') || el.closest('.cvc-tablabel[hidden]') || (el.closest('details:not([open])') && !el.closest('summary')) || el.closest('.cvc-cmp-full') || el.closest('.cvc-js .cvc-cmp-stack'));
         if (allowed) { out.allowedHidden++; continue; }
         out.hiddenBad.push(label); continue;
       }
@@ -165,7 +173,7 @@ const MEASURE = (mode) => `(() => {
       const rects = [...range.getClientRects()];
       if (!rects.length || rects.every((r) => r.width < 1 || r.height < 1)) { out.zero.push(label); continue; }
       const right = Math.max(...rects.map((r) => r.right + scrollX));
-      if (right > document.scrollingElement.scrollWidth + 1 || right > innerWidth + 1) out.offscreen.push(label + ' right=' + Math.round(right));
+      if (!el.closest('.cvc-scroll') && (right > document.scrollingElement.scrollWidth + 1 || right > vw + 1)) out.offscreen.push(label + ' right=' + Math.round(right));
       const cs = getComputedStyle(el);
       const fs = parseFloat(cs.fontSize);
       const meta = !!el.closest('.cvc-meta');
@@ -177,7 +185,7 @@ const MEASURE = (mode) => `(() => {
         if (clipChecked.has(e)) continue; clipChecked.add(e);
         const s = getComputedStyle(e);
         const clips = s.overflowX !== 'visible' || s.overflowY !== 'visible';
-        if (clips && (e.scrollWidth > e.clientWidth + 1 || e.scrollHeight > e.clientHeight + 1)) out.clipped.push(label + ' <' + e.tagName.toLowerCase() + '>');
+        if (clips && !e.matches('.cvc-scroll[role=region]') && (e.scrollWidth > e.clientWidth + 1 || e.scrollHeight > e.clientHeight + 1)) out.clipped.push(label + ' <' + e.tagName.toLowerCase() + '>');
       }
     }
   }
@@ -214,8 +222,25 @@ async function shoot(name) {
 
 function summarize(m) {
   const probs = [];
-  if (m.hscroll) probs.push(`hscroll ${m.scrollW}>${m.innerW}`);
+  if (m.hscroll) probs.push(`hscroll scrollWidth=${m.scrollW} viewport=${m.vw} innerWidth=${m.innerW}`);
+  if (m.rootsOver.length) probs.push(`labels más anchos que el viewport: ${m.rootsOver.slice(0, 3).join(', ')}`);
   for (const k of ['hiddenBad', 'zero', 'small', 'lowContrast', 'clipped', 'offscreen']) if (m[k].length) probs.push(`${k}:${m[k].length} (${m[k].slice(0, 2).join(' | ')})`);
+  return probs;
+}
+
+// Comparaciones de > 2 columnas con JS: tabla completa en región accesible en pantallas anchas,
+// versión apilada en angostas; siempre exactamente una de las dos visible.
+async function comparisonChecks(w) {
+  const r = await evalv(`[...document.querySelectorAll('.cvc-cmp-stack')].map((st) => { const full = st.parentNode.querySelector('.cvc-cmp-full');
+    return { full: !!full, fullVis: !!full && full.checkVisibility(), stackVis: st.checkVisibility(), region: !!full && full.getAttribute('role') === 'region' && full.tabIndex === 0 && !!full.getAttribute('aria-label'),
+      cols: full ? full.querySelectorAll('thead th').length : 0 }; })`);
+  const probs = [];
+  if (!r.length) probs.push('sin comparaciones apiladas en la página');
+  for (const c of r) {
+    if (!c.full || !c.region) probs.push(`tabla ENHANCED ausente o sin región accesible ${JSON.stringify(c)}`);
+    const wide = w >= 720;
+    if (c.fullVis !== wide || c.stackVis === wide) probs.push(`visibilidad tabla/apilado incorrecta a ${w}px ${JSON.stringify(c)}`);
+  }
   return probs;
 }
 
@@ -258,6 +283,14 @@ async function keyboardChecks() {
     const again = await evalv(`document.querySelector('${sel}').open`);
     if (again) probs.push(`${sel} Enter no cerró`);
   }
+  // Espacio también alterna (patrón de botón)
+  await evalv(`document.querySelector('details.cvc-selfcheck summary').focus(); true`);
+  await key(' ', 'Space', 32);
+  if (!(await evalv(`document.querySelector('details.cvc-selfcheck').open`))) probs.push('Espacio no abrió el revelado');
+  await key(' ', 'Space', 32);
+  // todas las instancias de tabs quedan operables (no solo la primera)
+  const allTabs = await evalv(`[...document.querySelectorAll('.cvc-tabs')].map((b) => ({ n: b.querySelectorAll('[role=tab]').length, named: !!(b.querySelector('[role=tablist]').getAttribute('aria-labelledby') || b.querySelector('[role=tablist]').getAttribute('aria-label')) }))`);
+  if (!allTabs.length || allTabs.some((t) => t.n < 2 || !t.named)) probs.push(`tablists sin nombre o incompletos ${JSON.stringify(allTabs)}`);
   const acc = await evalv(`(() => { const ds = [...document.querySelectorAll('details.cvc-acc')]; return ds.map((d) => d.open); })()`);
   if (!acc.length || !acc[0] || acc.slice(1).some(Boolean)) probs.push(`accordion estado inicial ${JSON.stringify(acc)}`);
   const idem = await evalv(`(() => { const n = document.querySelectorAll('[role=tablist]').length; for (const r of document.querySelectorAll('[data-cvc-uid]')) window.CursiaVC.init(r.getAttribute('data-cvc-uid')); return n === document.querySelectorAll('[role=tablist]').length; })()`);
@@ -298,18 +331,19 @@ try {
       await send('Emulation.setScriptExecutionDisabled', { value: false });
       await load(url);
       const mode = p.level === 'enhanced' ? 'js' : 'static';
-      const m = await evalv(MEASURE(mode));
+      const m = await evalv(MEASURE(mode, w));
       const probs = summarize(m);
       if (p.level === 'enhanced' && m.tablists !== m.tabsBoxes) probs.push(`tablists ${m.tablists}/${m.tabsBoxes}`);
-      if (p.level === 'clean_safe' && (m.tablists || m.detailsTotal)) probs.push('capa enhanced en CLEAN_SAFE');
+      if (p.level !== 'enhanced' && (m.tablists || m.detailsTotal)) probs.push('capa enhanced en CLEAN_SAFE');
+      if (p.level === 'enhanced' && p.kind === 'componentes') probs.push(...(await comparisonChecks(w)));
       const files = await shoot(`${p.id}-${w}`);
       if (p.level === 'enhanced' && p.kind === 'componentes' && w === 1280) probs.push(...(await keyboardChecks()));
-      record({ page: p.id, w, mode: p.level === 'enhanced' ? 'enhanced+js' : 'clean_safe', texts: m.texts, hidden: m.allowedHidden, pass: probs.length === 0, probs, png: files[0] });
+      record({ page: p.id, w, mode: p.level === 'enhanced' ? 'enhanced+js' : p.level, texts: m.texts, hidden: m.allowedHidden, pass: probs.length === 0, probs, png: files[0] });
 
       if (p.level === 'enhanced') {
         await send('Emulation.setScriptExecutionDisabled', { value: true });
         await load(url);
-        const n = await evalv(MEASURE('static'));
+        const n = await evalv(MEASURE('static', w));
         const probs2 = summarize(n);
         if (n.tablists !== 0) probs2.push('tablist sin JS');
         if (n.detailsOpen !== n.detailsTotal) probs2.push(`details cerrados sin JS ${n.detailsOpen}/${n.detailsTotal}`);
@@ -320,6 +354,14 @@ try {
       }
     }
   }
+  // Control negativo (I2): una tabla ancha conocida a 390 px DEBE detectarse como desborde.
+  const ctrl = path.join(OUT, 'pages', '_control-overflow.html');
+  writeFileSync(ctrl, page('control', [{ name: 'control', html: '<div class="cvc" style="background-color:#FAFAFA;color:#111111"><table style="border-collapse:collapse;width:100%"><tr>' + Array.from({ length: 5 }, () => '<td style="border:1px solid #333333;padding:8px">Interdepartamentalidad</td>').join('') + '</tr></table></div>' }]));
+  await send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: false });
+  await load(pathToFileURL(ctrl).href);
+  const cm = await evalv(MEASURE('static', 390));
+  const detected = summarize(cm).length > 0;
+  record({ page: '_control-overflow (debe detectarse)', w: 390, mode: 'control', texts: cm.texts, hidden: 0, pass: detected, probs: detected ? [] : ['el check NO detectó una tabla que desborda a 390 px'], png: '' });
 } finally {
   try {
     ws && ws.close();

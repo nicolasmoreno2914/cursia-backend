@@ -96,6 +96,15 @@ function hueDiffDeg(a, b) {
   const d = Math.abs(a - b) % 360;
   return Math.min(d, 360 - d);
 }
+function hexSat(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = ((n >> 16) & 255) / 255, g = ((n >> 8) & 255) / 255, b = (n & 255) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2;
+  if (max === min) return 0;
+  const d = max - min;
+  return l > 0.5 ? d / (2 - max - min) : d / (max + min);
+}
+
 function hexToHueDeg(hex) {
   const h = hex.slice(1);
   const r = parseInt(h.slice(0, 2), 16) / 255;
@@ -214,6 +223,9 @@ check('2: determinismo — mismo input → mismo JSON/sha; distinto seed → dis
     brandSeed: { accent: '#123456' },
   });
   assertTrue(themeSha256(seeded) !== themeSha256(a1), 'distinto seed debe producir distinto sha');
+  const seededModules = resolveTheme({ themeFamily: 'aula-clara', mode: 'light', brandSeed: { moduleColors: ['#2563EB'] } });
+  assertTrue(themeSha256(seededModules) !== themeSha256(a1), 'seed solo de módulos debe cambiar el sha');
+  assertTrue(moduleColor(seededModules, 0).main !== moduleColor(a1, 0).main, 'seed de módulos llega a moduleColor(0)');
 });
 
 // ── 3: moduleColor para N = 1..12 ──
@@ -322,8 +334,83 @@ check('THEME_ENGINE_VERSION === 1 y ResolvedTheme.version usa themeVersion o el 
   assertEqual(THEME_ENGINE_VERSION, 1, 'THEME_ENGINE_VERSION');
   const t = resolveTheme(defaultPresentationProfile());
   assertEqual(t.version, 1, 'version por defecto');
-  const t2 = resolveTheme({ ...defaultPresentationProfile(), themeVersion: 7 });
-  assertEqual(t2.version, 7, 'version explícita');
+  const t1 = resolveTheme({ ...defaultPresentationProfile(), themeVersion: 1 });
+  assertEqual(t1.version, 1, 'themeVersion 1 explícita');
+  for (const bad of [7, 0, 2, '1']) {
+    let threw = false;
+    try {
+      resolveTheme({ ...defaultPresentationProfile(), themeVersion: bad });
+    } catch (err) {
+      threw = /^THEME_INVALID:/.test(err.message);
+    }
+    assertTrue(threw, `themeVersion ${JSON.stringify(bad)} debe lanzar THEME_INVALID`);
+  }
+  assertTrue(validateTheme({ ...t, version: 9 }).some((e) => e.code === 'VERSION'), 'validateTheme rechaza version ≠ motor');
+});
+
+// ── Fix round 1 / I3: la BrandSeed de módulos se respeta en orden ──
+check('I3: seed rojo/azul/verde → módulos 0/1/2 rojo/azul/verde (Δtono ≤ 10°), en todas las familias', () => {
+  const seedColors = ['#E11D48', '#2563EB', '#16A34A'];
+  for (const familyId of Object.keys(THEME_FAMILIES)) {
+    for (const mode of THEME_FAMILIES[familyId].supportedModes) {
+      const theme = resolveTheme({ themeFamily: familyId, mode, brandSeed: { moduleColors: seedColors } });
+      seedColors.forEach((sc, i) => {
+        const main = moduleColor(theme, i).main;
+        const d = hueDiffDeg(hexToHueDeg(main), hexToHueDeg(sc));
+        assertTrue(d <= 10, `${familyId}/${mode}: módulo ${i} ${main} vs seed ${sc} Δtono ${d.toFixed(1)}°`);
+      });
+      // más allá de las anclas sigue habiendo colores distintos
+      const mains = Array.from({ length: 12 }, (_, i) => moduleColor(theme, i).main);
+      assertEqual(new Set(mains).size, 12, `${familyId}/${mode}: 12 módulos distintos`);
+    }
+  }
+});
+
+check('I3: paletas legacy conservan el orden de tonos m1/m2/m3 (anclas no neutras)', () => {
+  let checked = 0;
+  for (const p of LEGACY_PALETTES) {
+    const theme = resolveTheme(legacyPaletteThemeFallback(p.id));
+    const notes = te.moduleColorAdjustments(theme, 3);
+    [p.m1, p.m2, p.m3].forEach((m, i) => {
+      const anchor = m.toUpperCase();
+      const sat = hexSat(anchor);
+      const collided = notes.some((n) => n.startsWith(`moduleColor(${i}).main ajustado`));
+      if (sat < 0.2 || collided) return;
+      const main = moduleColor(theme, i).main;
+      const d = hueDiffDeg(hexToHueDeg(main), hexToHueDeg(anchor));
+      assertTrue(d <= 10, `${p.id}: m${i + 1} ${anchor} → módulo ${i} ${main} (Δtono ${d.toFixed(1)}°)`);
+      checked++;
+    });
+  }
+  assertTrue(checked >= 60, `pocas anclas verificadas: ${checked}`);
+});
+
+check('I3/M5: correcciones de color de módulo quedan en adjustments y en moduleColorAdjustments', () => {
+  // gris de luminancia ~0.19: ni el casi-blanco ni el casi-negro alcanzan 4.5 → hay corrección
+  const theme = resolveTheme({ themeFamily: 'aula-clara', mode: 'light', brandSeed: { moduleColors: ['#797979', '#2563EB'] } });
+  const notes = te.moduleColorAdjustments(theme, 2);
+  assertTrue(notes.some((n) => n.startsWith('moduleColor(0).main corregido')), `nota de corrección: ${JSON.stringify(notes)}`);
+  assertTrue(theme.adjustments.some((n) => n.startsWith('moduleColor(0).main corregido')), `adjustments: ${JSON.stringify(theme.adjustments)}`);
+  assertTrue(te.moduleColorAdjustments(resolveTheme({ themeFamily: 'aula-clara', mode: 'light', brandSeed: { moduleColors: ['#2563EB'] } }), 1).length === 0, 'sin corrección, sin nota');
+});
+
+check('M3: ningún color emitido es #FFFFFF/#000000 puro; una seed pura se sustituye y se registra', () => {
+  for (const familyId of Object.keys(THEME_FAMILIES)) {
+    for (const mode of THEME_FAMILIES[familyId].supportedModes) {
+      for (const { label, seed } of allSeeds) {
+        const theme = resolveTheme({ themeFamily: familyId, mode, brandSeed: seed });
+        const hexes = [];
+        walkHexValues(theme, hexes);
+        for (let i = 0; i < 12; i++) walkHexValues(moduleColor(theme, i), hexes);
+        for (const h of hexes) assertTrue(h !== '#FFFFFF' && h !== '#000000', `${familyId}/${mode}/${label}: ${h}`);
+      }
+    }
+  }
+  const t = resolveTheme({ themeFamily: 'aula-clara', mode: 'light', brandSeed: { accent: '#000000', moduleColors: ['#FFFFFF', '#2563EB'] } });
+  assertTrue(t.color.accent !== '#000000' && t.adjustments.some((a) => a.includes('brandSeed.accent')), 'accent puro sustituido');
+  assertTrue(t.moduleColorsBasis[0] !== '#FFFFFF' && t.adjustments.some((a) => a.includes('brandSeed.moduleColors[0]')), 'módulo puro sustituido');
+  const bad = { ...t, color: { ...t.color, surface: '#FFFFFF' } };
+  assertTrue(validateTheme(bad).some((e) => e.code === 'PURE_BLACK_WHITE'), 'validateTheme detecta blanco puro');
 });
 
 console.log('');
