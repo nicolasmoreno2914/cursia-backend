@@ -174,7 +174,10 @@ function recordsOf(manifest, tag, over = {}) {
     if (over[it.key] === null) continue;
     out.push({
       itemKey: it.key, itemRunId: `${tag}#${it.key}`, status: 'completed', artifactIds: roleIds(tag, it),
-      artifactStatus: 'ready', inputFingerprint: null, outputIdentity: `out/${tag}/${it.key}`, ...(over[it.key] || {}),
+      artifactStatus: 'ready', inputFingerprint: null, outputIdentity: `out/${tag}/${it.key}`,
+      // Fix round 1 (I3): las interacciones registran el video contra el que se generaron.
+      ...(it.type === 'video_interactions' ? { consumedVideoIdentity: `out/${tag}/video:${it.chapterId}` } : {}),
+      ...(over[it.key] || {}),
     });
   }
   return out;
@@ -727,6 +730,87 @@ async function pureChecks() {
     assert(AUD.auditItemRolesV3({ id: 1, item_key: 'activity:x', type: 'activity', variant: 'scorm', artifact_types: ['dynamic_scorm_html'] })[0].includes('dynamic_scorm_manifest'), 'rol faltante');
     assert(AUD.auditItemRolesV3({ id: 1, item_key: 'activity:x', type: 'activity', variant: null, artifact_types: [] })[0].includes('sin roles'), 'variant desconocido');
   });
+
+  // ── Fix round 1 (review G2) ───────────────────────────────────────────────
+  await check('fix round 1 I3: video_interactions compara contra la identidad REGISTRADA (no la del video actual): distinta → REGENERATE; ausente → REGENERATE', () => {
+    const vi = K('video_interactions', C1);
+    // El video de A se regeneró en el run (identidad nueva) y las interacciones no: describen el video viejo.
+    const p1 = planOf(bp0, buildBp(baseSpec()), { over: { [vi]: { consumedVideoIdentity: 'out/A/video-gen1' } } }).plan;
+    expectPlan(p1, { [vi]: 'REGENERATE' });
+    assertReason(p1, vi, 'video_changed');
+    eq(byKey(p1)[vi].fromMatchFingerprint, F.matchFingerprintV3(F.computeFingerprintsV3(bp0, { courseContextSha256: CTX }), vi, { videoIdentity: 'out/A/video-gen1' }), 'huella de origen = la registrada');
+    const p2 = planOf(bp0, buildBp(baseSpec()), { over: { [vi]: { consumedVideoIdentity: null } } }).plan;
+    expectPlan(p2, { [vi]: 'REGENERATE' });
+    assertReason(p2, vi, 'video_identity_unknown');
+  });
+
+  await check('fix round 1 I1: providerModes explícitos (default real, mock solo con escape de entorno), nunca derivados de videoMode', () => {
+    const PM = loadDist('modules/dynamic-generation/provider-modes.js');
+    eq(PM.resolveProviderModes(3, undefined, {}), { presentation: 'real', audio: 'real' }, 'default real');
+    eq(PM.resolveProviderModes(3, { audio: 'real' }, {}), { presentation: 'real', audio: 'real' }, 'parcial');
+    throwsRe(() => PM.resolveProviderModes(3, { presentation: 'mock' }, {}), /^provider_mock_not_allowed/, 'mock sin escape');
+    eq(PM.resolveProviderModes(3, { presentation: 'mock' }, { DYNAMIC_ALLOW_PROVIDER_MOCK: 'true' }), { presentation: 'mock', audio: 'real' }, 'mock con escape');
+    throwsRe(() => PM.resolveProviderModes(3, { presentation: 'fake' }, {}), /^provider_mode_invalid/, 'valor inválido');
+    throwsRe(() => PM.resolveProviderModes(3, { video: 'mock' }, {}), /^provider_mode_invalid/, 'clave desconocida');
+    eq(PM.resolveProviderModes(1, undefined, {}), undefined, 'v1: nada congelado');
+    eq(PM.frozenProviderModesOf({ videoMode: 'mock' }), null, 'videoMode no es un modo de proveedor');
+    eq(PM.frozenProviderModesOf({ providerModes: { presentation: 'mock', audio: 'x' } }), null, 'corrupto → null');
+    const W = loadDist('workers/dynamic-provider-worker.js');
+    eq([W.providerModeOf({ videoMode: 'mock' }, 'presentation'), W.providerModeOf({ videoMode: 'real', providerModes: { presentation: 'mock', audio: 'real' } }, 'audiobook_chapter')], [null, 'real'], 'worker lee providerModes');
+  });
+
+  await check('fix round 1 I1: assertNoMockArtifactsForRealPackage — un run no congelado como mock nunca empaqueta fixtures; la auditoría aplica la misma regla', () => {
+    const G = loadDist('modules/dynamic-packaging/packaging-guards.js');
+    const mockPres = { id: 'a1', type: 'dynamic_presentation', metadata: { mock: true }, itemKey: 'presentation:x' };
+    const mockAudio = { id: 'a2', type: 'dynamic_audio_mp3', metadata: { fixture: true }, itemKey: 'audio_welcome:1' };
+    const realPres = { id: 'a3', type: 'dynamic_presentation', metadata: {}, itemKey: 'presentation:y' };
+    const runReal = { id: 'r1', input_payload: { providerModes: { presentation: 'real', audio: 'real' } } };
+    const runMockPres = { id: 'r2', input_payload: { providerModes: { presentation: 'mock', audio: 'real' } } };
+    const runNone = { id: 'r3', input_payload: { videoMode: 'mock' } };
+    G.assertNoMockArtifactsForRealPackage(runReal, [realPres]);
+    G.assertNoMockArtifactsForRealPackage(runMockPres, [mockPres, realPres]);
+    throwsRe(() => G.assertNoMockArtifactsForRealPackage(runReal, [mockPres]), /^MOCK_ARTIFACT_IN_REAL_RUN.*presentation:x/, 'real + fixture');
+    throwsRe(() => G.assertNoMockArtifactsForRealPackage(runMockPres, [mockAudio]), /^MOCK_ARTIFACT_IN_REAL_RUN.*audio_welcome/, 'mock solo para Gamma, no TTS');
+    throwsRe(() => G.assertNoMockArtifactsForRealPackage(runNone, [mockPres]), /^MOCK_ARTIFACT_IN_REAL_RUN/, 'sin modos congelados');
+    throwsRe(() => G.assertNoMockArtifactsForRealPackage(runMockPres, [{ id: 'a4', type: 'dynamic_exam_gift', metadata: { mock: true } }]), /^MOCK_ARTIFACT_IN_REAL_RUN/, 'fixture de un tipo no proveedor');
+    const row = (pm, types) => ({ id: 1, item_key: 'k', provider_modes: pm, mock_artifact_types: types });
+    eq(AUD.auditMockArtifactsV3(row(runMockPres.input_payload.providerModes, ['dynamic_presentation'])), [], 'auditoría: ok');
+    eq(AUD.auditMockArtifactsV3(row(runReal.input_payload.providerModes, ['dynamic_presentation'])).length, 1, 'auditoría: real + fixture');
+    eq(AUD.auditMockArtifactsV3(row(null, ['dynamic_audio_mp3'])).length, 1, 'auditoría: sin modos');
+  });
+
+  await check('fix round 1 I2: cascada de regenerateItem por rulesVersion — v1/v2 idéntica a la de Fase 8; v3 según las reglas de invalidación v3', () => {
+    const RC = loadDist('modules/dynamic-generation/regeneration-cascade.js');
+    const v1items = [
+      { key: `content:${C1}`, type: 'content', moduleId: M1, chapterId: C1 }, { key: `scorm:${C1}`, type: 'scorm', moduleId: M1, chapterId: C1 },
+      { key: `video:${C1}`, type: 'video', moduleId: M1, chapterId: C1 }, { key: `exam:${M1}`, type: 'exam', moduleId: M1, chapterId: null },
+    ];
+    for (const rv of [1, 2]) {
+      eq(RC.regenerationCascade(rv, v1items, v1items[0]), { regenerate: [`scorm:${C1}`, `exam:${M1}`], stale: [`video:${C1}`] }, `v${rv} content`);
+      eq(RC.regenerationCascade(rv, v1items, v1items[2]), { regenerate: [], stale: [] }, `v${rv} video`);
+    }
+    const it = (k) => m0.items.find((x) => x.key === k);
+    eq(RC.regenerationCascade(3, m0.items, it(K('content', C1))), {
+      regenerate: [K('experience', C1), K('activity', C1), K('exam', M1), CK('final_exam')],
+      stale: [K('presentation', C1), K('video', C1), K('video_interactions', C1), K('audiobook_chapter', C1)],
+    }, 'v3 content');
+    eq(RC.regenerationCascade(3, m0.items, it(K('content', C5))), {
+      regenerate: [K('experience', C5), K('exam', M2), CK('final_exam')], stale: [K('presentation', C5), K('audiobook_chapter', C5)],
+    }, 'v3 content sin video ni actividad');
+    eq(RC.regenerationCascade(3, m0.items, it(K('video', C1))), { regenerate: [K('video_interactions', C1)], stale: [] }, 'v3 video');
+    eq(RC.regenerationCascade(3, m0.items, it(CK('course_intro'))), { regenerate: [], stale: [CK('audio_welcome')] }, 'v3 course_intro');
+    for (const k of [CK('course_plan'), K('presentation', C1), K('experience', C1), K('module_intro', M1)]) {
+      eq(RC.regenerationCascade(3, m0.items, it(k)), { regenerate: [], stale: [] }, `v3 ${k} sin cascada`);
+    }
+  });
+
+  await check('fix round 1 M1/M7: apply lista los items de Gamma/TTS a generar (providerItemsToGenerate); vacío en v1/v2', () => {
+    const s = baseSpec(); s.modules[1].chapters.push({ id: C7, title: 'Capítulo siete', objective: 'O7', video: false, act: false });
+    const { plan, mB } = planOf(bp0, buildBp(s));
+    eq(applyOf(plan, mB, bp0).providerItemsToGenerate, [K('presentation', C7), K('audiobook_chapter', C7)], 'capítulo nuevo');
+    const same = planOf(bp0, buildBp(baseSpec()));
+    eq(applyOf(same.plan, same.mB, bp0).providerItemsToGenerate, [], 'sin cambios');
+  });
 }
 
 // Sha fijado del plan "título de C1 editado" (fixture de arriba). Cambia solo
@@ -855,64 +939,91 @@ async function dbChecks() {
     };
     const coherence = new CoherenceService(ds, blueprints, manifests, artifactsStub);
 
-    const [course] = await ds.query(`insert into public.courses (owner_id, title, structure_version) values ($1, 'Curso R5', 'dynamic') returning id`, [OWNER]);
-    const cid = course.id;
-    const dm = (n) => `00000000-0000-4000-8000-0000000005a${n}`;
-    const dc = (n) => `00000000-0000-4000-8000-0000000005c${n}`;
-    const spec1 = { finalExam: true, activityEngine: 'h5p', title: 'Curso R5', chapters: [
-      { id: dc(1), m: dm(1), pos: 0, title: 'C1', video: true, act: true },
-      { id: dc(2), m: dm(1), pos: 1, title: 'C2', video: false, act: true },
-      { id: dc(3), m: dm(2), pos: 0, title: 'C3', video: true, act: false },
-    ] };
-    const mods = [{ id: dm(1), position: 0, title: 'M1', objective: null, exam_enabled: true }, { id: dm(2), position: 1, title: 'M2', objective: null, exam_enabled: false }];
-    const bpOf = (sp) => snap.buildBlueprintSnapshotV2({ id: cid, title: sp.title, finalExam: sp.finalExam, activityEngine: sp.activityEngine }, mods,
-      sp.chapters.map((c) => ({ id: c.id, module_id: c.m, position: c.pos, title: c.title, objective: null, video_enabled: c.video, activity_enabled: c.act })));
-    for (const m of mods) await ds.query(`insert into public.course_modules (id, course_id, position, title) values ($1, $2, $3, $4)`, [m.id, cid, m.position, m.title]);
-    for (const c of spec1.chapters) {
-      await ds.query(`insert into public.course_chapters (id, course_id, module_id, position, title, video_enabled, activity_enabled) values ($1, $2, $3, $4, $5, $6, $7)`,
-        [c.id, cid, c.m, c.pos, c.title, c.video, c.act]);
-    }
-    const insertBp = async (n, s) => ds.query(
-      `insert into public.course_blueprints (course_id, blueprint_number, schema_version, snapshot_json, snapshot_sha256, structure_counter_at_lock, module_count, chapter_count)
-       values ($1, $2, 2, $3::jsonb, $4, 0, $5, $6)`,
-      [cid, n, snap.canonicalJsonV2(s), snap.snapshotSha256V2(s), s.modules.length, s.modules.reduce((x, m) => x + m.chapters.length, 0)]);
-    const bp1 = bpOf(spec1);
-    await insertBp(1, bp1);
+    // ── Fixtures DB: un curso = filas vivas + Blueprints v2 congelados (ids por prefijo) ──
+    const ctx = { courseName: 'Curso R5', sector: 'Tecnología', pais: 'Chile' };
+    const makeCourse = async (pfx, title) => {
+      const [course] = await ds.query(`insert into public.courses (owner_id, title, structure_version) values ($1, $2, 'dynamic') returning id`, [OWNER, title]);
+      const cidX = course.id;
+      const dmX = (n) => `00000000-0000-4000-8000-000000${pfx}05a${n}`;
+      const dcX = (n) => `00000000-0000-4000-8000-000000${pfx}05c${n}`;
+      const spec = { finalExam: true, activityEngine: 'h5p', title, chapters: [
+        { id: dcX(1), m: dmX(1), pos: 0, title: 'C1', video: true, act: true },
+        { id: dcX(2), m: dmX(1), pos: 1, title: 'C2', video: false, act: true },
+        { id: dcX(3), m: dmX(2), pos: 0, title: 'C3', video: true, act: false },
+      ] };
+      const modsX = [{ id: dmX(1), position: 0, title: 'M1', objective: null, exam_enabled: true }, { id: dmX(2), position: 1, title: 'M2', objective: null, exam_enabled: false }];
+      for (const m of modsX) await ds.query(`insert into public.course_modules (id, course_id, position, title) values ($1, $2, $3, $4)`, [m.id, cidX, m.position, m.title]);
+      for (const c of spec.chapters) {
+        await ds.query(`insert into public.course_chapters (id, course_id, module_id, position, title, video_enabled, activity_enabled) values ($1, $2, $3, $4, $5, $6, $7)`,
+          [c.id, cidX, c.m, c.pos, c.title, c.video, c.act]);
+      }
+      const bpOfX = (sp) => snap.buildBlueprintSnapshotV2({ id: cidX, title: sp.title, finalExam: sp.finalExam, activityEngine: sp.activityEngine }, modsX,
+        sp.chapters.map((c) => ({ id: c.id, module_id: c.m, position: c.pos, title: c.title, objective: null, video_enabled: c.video, activity_enabled: c.act })));
+      const insertBpX = async (n, sp) => {
+        const b = bpOfX(sp);
+        await ds.query(
+          `insert into public.course_blueprints (course_id, blueprint_number, schema_version, snapshot_json, snapshot_sha256, structure_counter_at_lock, module_count, chapter_count)
+           values ($1, $2, 2, $3::jsonb, $4, 0, $5, $6)`,
+          [cidX, n, snap.canonicalJsonV2(b), snap.snapshotSha256V2(b), b.modules.length, b.modules.reduce((x, m) => x + m.chapters.length, 0)]);
+        return b;
+      };
+      return { cid: cidX, dm: dmX, dc: dcX, spec, bpOf: bpOfX, insertBp: insertBpX };
+    };
+    /**
+     * Run v3 completado, sembrado como lo deja un run real: item runs
+     * completed + un artifact por rol; las interacciones registran la
+     * identidad del video contra el que se generaron (fix round 1, I3).
+     */
+    const seedCompletedRun = async (cidX, m, bpNumber, spec, extraPayload = {}) => {
+      const [job] = await ds.query(
+        `insert into public.production_jobs (owner_id, course_id, execution_mode, status, worker_status, current_step, progress, input_payload, output_summary, options, result)
+         values ($1, $2, 'dynamic_generation', 'completed', 'completed', 'dynamic_generation', 100, $3::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb) returning id`,
+        [OWNER, cidX, JSON.stringify({ manifestId: m.id, blueprintNumber: bpNumber, contextHash: canonicalContextHash(ctx), videoMode: 'mock',
+          providerModes: { presentation: 'real', audio: 'real' }, ...extraPayload })]);
+      await ds.query(`insert into public.generation_run_contexts (job_id, manifest_id, context, context_hash) values ($1, $2, $3::jsonb, $4)`,
+        [job.id, m.id, JSON.stringify(ctx), canonicalContextHash(ctx)]);
+      const videoOf = new Map();
+      for (const it of m.manifest.items) {
+        const summary = {};
+        if (it.type === 'video_interactions') summary.videoIdentity = videoOf.get(it.chapterId);
+        const [ir] = await ds.query(
+          `insert into public.generation_item_runs (job_id, course_id, blueprint_id, manifest_id, item_key, generation, type, module_id, chapter_id, depends_on, idempotency_key, status, finished_at, output_summary)
+           values ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9::text[], $10, 'completed', now(), $11::jsonb) returning id`,
+          [job.id, cidX, m.blueprintId, m.id, it.key, it.type, it.moduleId, it.chapterId, it.dependsOn, itemIdempotencyKey(m.id, it.key, 1), JSON.stringify(summary)]);
+        const arts = [];
+        for (const role of R.requiredArtifactTypesV3(it.type, it.variant)) {
+          const path1 = `r5/${job.id}/${it.key}/${role}`;
+          const [a] = await ds.query(
+            `insert into public.artifacts (owner_id, course_id, job_id, type, storage_provider, storage_bucket, storage_path, filename, mime_type, metadata, module_id, chapter_id, manifest_id, manifest_item_key, item_run_id)
+             values ($1, $2, $3, $4, 'supabase', 'cursia-artifacts', $5, 'f', 'application/json', '{}'::jsonb, $6, $7, $8, $9, $10) returning id`,
+            [OWNER, String(cidX), job.id, role, path1, it.moduleId, it.chapterId, m.id, it.key, ir.id]);
+          arts.push({ id: a.id, type: role, bucket: 'cursia-artifacts', path: path1 });
+          if (role === 'dynamic_course_plan_json') {
+            texts.set(a.id, JSON.stringify({ chapters: Object.fromEntries(spec.chapters.map((c) => [c.id, { summary: c.title, concepts_introduced: [c.title] }])) }));
+          }
+        }
+        if (it.type === 'video') videoOf.set(it.chapterId, { identity: A.artifactOutputIdentity(arts), itemRunId: ir.id, generation: 1, artifactIds: arts.map((x) => x.id) });
+      }
+      return job;
+    };
+
+    const K1 = await makeCourse('01', 'Curso R5');
+    const cid = K1.cid;
+    const dm = K1.dm;
+    const dc = K1.dc;
+    const spec1 = K1.spec;
+    const bp1 = await K1.insertBp(1, spec1);
     // Blueprint 2: título de C1 editado + actividad de C2 apagada.
     const spec2 = clone(spec1); spec2.chapters[0].title = 'C1 revisado'; spec2.chapters[1].act = false;
-    const bp2 = bpOf(spec2);
-    await insertBp(2, bp2);
+    const bp2 = await K1.insertBp(2, spec2);
     const mA = (await manifests.getOrCreate(cid, OWNER, 1)).manifest;
     const mB = (await manifests.getOrCreate(cid, OWNER, 2)).manifest;
-
-    // Run A (v3) completado, sembrado como lo deja un run real: item runs completed + artifacts por rol.
-    const ctx = { courseName: 'Curso R5', sector: 'Tecnología', pais: 'Chile' };
-    const [jobA] = await ds.query(
-      `insert into public.production_jobs (owner_id, course_id, execution_mode, status, worker_status, current_step, progress, input_payload, output_summary, options, result)
-       values ($1, $2, 'dynamic_generation', 'completed', 'completed', 'dynamic_generation', 100, $3::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb) returning id`,
-      [OWNER, cid, JSON.stringify({ manifestId: mA.id, blueprintNumber: 1, contextHash: canonicalContextHash(ctx), videoMode: 'mock' })]);
-    await ds.query(`insert into public.generation_run_contexts (job_id, manifest_id, context, context_hash) values ($1, $2, $3::jsonb, $4)`,
-      [jobA.id, mA.id, JSON.stringify(ctx), canonicalContextHash(ctx)]);
-    for (const it of mA.manifest.items) {
-      const [ir] = await ds.query(
-        `insert into public.generation_item_runs (job_id, course_id, blueprint_id, manifest_id, item_key, generation, type, module_id, chapter_id, depends_on, idempotency_key, status, finished_at)
-         values ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9::text[], $10, 'completed', now()) returning id`,
-        [jobA.id, cid, mA.blueprintId, mA.id, it.key, it.type, it.moduleId, it.chapterId, it.dependsOn, itemIdempotencyKey(mA.id, it.key, 1)]);
-      for (const role of R.requiredArtifactTypesV3(it.type, it.variant)) {
-        const [a] = await ds.query(
-          `insert into public.artifacts (owner_id, course_id, job_id, type, storage_provider, storage_bucket, storage_path, filename, mime_type, metadata, module_id, chapter_id, manifest_id, manifest_item_key, item_run_id)
-           values ($1, $2, $3, $4, 'supabase', 'cursia-artifacts', $5, 'f', 'application/json', '{}'::jsonb, $6, $7, $8, $9, $10) returning id`,
-          [OWNER, String(cid), jobA.id, role, `r5/${jobA.id}/${it.key}/${role}`, it.moduleId, it.chapterId, mA.id, it.key, ir.id]);
-        if (role === 'dynamic_course_plan_json') {
-          texts.set(a.id, JSON.stringify({ chapters: Object.fromEntries(spec1.chapters.map((c) => [c.id, { summary: c.title, concepts_introduced: [c.title] }])) }));
-        }
-      }
-    }
+    const jobA = await seedCompletedRun(cid, mA, 1, spec1);
 
     let planResp = null;
     await check('DB InvalidationService.getPlan v3 → v3: plan real (acciones por key), sin blockers, sin 501', async () => {
       planResp = await invalidation.getPlan(cid, OWNER, 2, jobA.id);
-      eq([planResp.applied, planResp.toRulesVersion, planResp.blockers, planResp.videoItemsToGenerate], [false, 3, [], []], 'respuesta');
+      eq([planResp.applied, planResp.toRulesVersion, planResp.blockers, planResp.videoItemsToGenerate, planResp.providerItemsToGenerate], [false, 3, [], [], []], 'respuesta');
       const m = byKey(planResp.plan);
       const want = {
         [K('content', dc(1))]: 'REGENERATE', [K('experience', dc(1))]: 'REGENERATE', [K('presentation', dc(1))]: 'STALE_NO_AUTO',
@@ -949,6 +1060,8 @@ async function dbChecks() {
       eq(vi.metadata.inputFingerprint, byKey(planResp.plan)[K('video_interactions', dc(1))].fromMatchFingerprint, 'huella del vi carried = la de A');
       const again = await runs.startRun(cid, OWNER, 2, { fromRun: jobA.id });
       eq([again.created], [false], 'idempotente');
+      const [jb] = await ds.query(`select input_payload from public.production_jobs where id = $1`, [jobB]);
+      eq({ presentation: jb.input_payload.providerModes.presentation, audio: jb.input_payload.providerModes.audio }, { presentation: 'real', audio: 'real' }, 'B hereda providerModes de A (fix round 1, I1)');
     });
 
     await check('DB coherencia de un run v3 completado (antes 501): reporte coherence-rules-v3@1 persistido, idempotente', async () => {
@@ -978,6 +1091,125 @@ async function dbChecks() {
         await ds.query(`update public.artifacts a set item_run_id = g.id from public.generation_item_runs g
                          where a.id = $1 and g.job_id = $2 and g.item_key = a.manifest_item_key`, [victim.id, jobA.id]);
       }
+    });
+
+    // ── Fix round 1 ────────────────────────────────────────────────────────
+    await check('DB fix round 1 I1: startRun v3 congela providerModes explícitos (default real); mock exige DYNAMIC_ALLOW_PROVIDER_MOCK; sin worker → 501; otro modo → 409', async () => {
+      const saved = { w: process.env.DYNAMIC_PROVIDER_WORKER_ENABLED, m: process.env.DYNAMIC_ALLOW_PROVIDER_MOCK };
+      const body = { nombre: 'Curso R5 b', sector: 'Tecnología', pais: 'Chile', contexto: 'Empresa', nivel: 'Básico', tono: 'formal' };
+      try {
+        delete process.env.DYNAMIC_PROVIDER_WORKER_ENABLED;
+        delete process.env.DYNAMIC_ALLOW_PROVIDER_MOCK;
+        const K2 = await makeCourse('02', 'Curso R5 b');
+        await K2.insertBp(1, K2.spec);
+        await manifests.getOrCreate(K2.cid, OWNER, 1);
+        await rejectsRe(runs.startRun(K2.cid, OWNER, 1, body), /PROVIDER_WORKER_NOT_DEPLOYED/, 'sin worker de proveedor', 501);
+        process.env.DYNAMIC_PROVIDER_WORKER_ENABLED = 'true';
+        await rejectsRe(runs.startRun(K2.cid, OWNER, 1, { ...body, providerModes: { presentation: 'mock' } }), /provider_mock_not_allowed/, 'mock sin escape', 403);
+        const res = await runs.startRun(K2.cid, OWNER, 1, { ...body, videoMode: 'mock' });
+        eq(res.created, true, 'creado');
+        const [row] = await ds.query(`select input_payload from public.production_jobs where id = $1`, [res.run.id]);
+        eq([row.input_payload.videoMode, row.input_payload.providerModes.presentation, row.input_payload.providerModes.audio], ['mock', 'real', 'real'], 'videoMode mock NO arrastra a los proveedores');
+        process.env.DYNAMIC_ALLOW_PROVIDER_MOCK = 'true';
+        await rejectsRe(runs.startRun(K2.cid, OWNER, 1, { ...body, videoMode: 'mock', providerModes: { audio: 'mock' } }), /provider_modes_conflict|otros modos de proveedor/, 'modos distintos', 409);
+        eq((await runs.startRun(K2.cid, OWNER, 1, { ...body, videoMode: 'mock' })).created, false, 'mismo pedido → idempotente');
+        // v1/v2: providerModes no aplica (400) y el input_payload no cambia.
+        const P2 = loadDist('modules/dynamic-generation/provider-modes.js');
+        throwsRe(() => P2.resolveProviderModes(2, { audio: 'mock' }, {}), /provider_mode_invalid/, 'v2 con providerModes');
+        eq(P2.resolveProviderModes(2, undefined, {}), undefined, 'v2 sin providerModes');
+      } finally {
+        for (const [k, v] of [['DYNAMIC_PROVIDER_WORKER_ENABLED', saved.w], ['DYNAMIC_ALLOW_PROVIDER_MOCK', saved.m]]) {
+          if (v === undefined) delete process.env[k]; else process.env[k] = v;
+        }
+      }
+    });
+
+    await check('DB fix round 1 I2: regenerateItem v3 de content → LLM REGENERATE (pending) + proveedores/video_interactions STALE con aviso; dryRun lista la cascada completa; video → interacciones', async () => {
+      const K3 = await makeCourse('03', 'Curso R5 c');
+      await K3.insertBp(1, K3.spec);
+      const m3 = (await manifests.getOrCreate(K3.cid, OWNER, 1)).manifest;
+      const job3 = await seedCompletedRun(K3.cid, m3, 1, K3.spec);
+      const ch = K3.dc(1);
+      const want = [
+        [`content:${ch}`, 'REGENERATE'], [`experience:${ch}`, 'REGENERATE'], [`activity:${ch}`, 'REGENERATE'],
+        [`exam:${K3.dm(1)}`, 'REGENERATE'], [`final_exam:${K3.cid}`, 'REGENERATE'],
+        [`presentation:${ch}`, 'STALE_NO_AUTO'], [`video:${ch}`, 'STALE_NO_AUTO'], [`video_interactions:${ch}`, 'STALE_NO_AUTO'],
+        [`audiobook_chapter:${ch}`, 'STALE_NO_AUTO'],
+      ];
+      const dry = await runs.regenerateItem(K3.cid, OWNER, 1, job3.id, `content:${ch}`, { dryRun: true });
+      eq(dry.affected.map((x) => [x.itemKey, x.action]), want, 'dryRun: cascada completa');
+      eq(dry.blockers, [], 'sin trabas');
+      await rejectsRe(runs.regenerateItem(K3.cid, OWNER, 1, job3.id, `content:${ch}`, {}), /confirm_paid_required/, 'sin confirmPaid', 400);
+      const res = await runs.regenerateItem(K3.cid, OWNER, 1, job3.id, `content:${ch}`, { confirmPaid: true });
+      eq(res.affected.map((x) => [x.itemKey, x.action]), want, 'real = dryRun');
+      const rows = await ds.query(
+        `select g.item_key, g.generation, g.status from public.generation_item_runs g where g.job_id = $1 order by g.item_key, g.generation`, [job3.id]);
+      const latest = new Map();
+      for (const r of rows) latest.set(r.item_key, r);
+      for (const [k, a] of want) {
+        const r = latest.get(k);
+        if (a === 'REGENERATE') eq([r.generation, r.status], [2, 'pending'], `${k}: generación nueva pending`);
+        else eq([r.generation, r.status], [1, 'completed'], `${k}: sin regenerar`);
+      }
+      const stale = await ds.query(
+        `select a.manifest_item_key k, a.status, a.metadata->>'staleReason' reason from public.artifacts a
+          join public.generation_item_runs g on g.id = a.item_run_id where g.job_id = $1 and g.generation = 1`, [job3.id]);
+      for (const k of [`presentation:${ch}`, `video:${ch}`, `video_interactions:${ch}`, `audiobook_chapter:${ch}`]) {
+        const xs = stale.filter((x) => x.k === k);
+        assert(xs.length && xs.every((x) => x.status === 'stale' && x.reason === 'content_regenerated'), `${k}: artifacts stale con motivo (${JSON.stringify(xs)})`);
+      }
+      const W = loadDist('modules/dynamic-packaging/packaging-warnings.js');
+      assert(typeof W.staleArtifactWarnings === 'function', 'aviso de empaque disponible');
+      // Video (mock, gratis) → regenera sus interacciones (LLM) ⇒ confirmPaid también.
+      const K4 = await makeCourse('04', 'Curso R5 d');
+      await K4.insertBp(1, K4.spec);
+      const m4 = (await manifests.getOrCreate(K4.cid, OWNER, 1)).manifest;
+      const job4 = await seedCompletedRun(K4.cid, m4, 1, K4.spec);
+      const vdry = await runs.regenerateItem(K4.cid, OWNER, 1, job4.id, `video:${K4.dc(1)}`, { dryRun: true });
+      eq(vdry.affected.map((x) => [x.itemKey, x.action]), [[`video:${K4.dc(1)}`, 'REGENERATE'], [`video_interactions:${K4.dc(1)}`, 'REGENERATE']], 'video → interacciones');
+      await rejectsRe(runs.regenerateItem(K4.cid, OWNER, 1, job4.id, `video:${K4.dc(1)}`, {}), /confirm_paid_required.*video_interactions/, 'cascada paga', 400);
+    });
+
+    await check('DB fix round 1 I3: completar video_interactions registra la identidad del video vigente (output_summary.videoIdentity); sin video completado → 409', async () => {
+      const { SchedulerService } = loadDist('modules/dynamic-generation/scheduler.service.js');
+      const sched = new SchedulerService(ds, { async tx() {}, async reconcileCancellation() {} });
+      const [vi] = await ds.query(`select * from public.generation_item_runs where job_id = $1 and type = 'video_interactions' limit 1`, [jobA.id]);
+      const got = await sched['consumedVideoIdentity'](ds, jobA.id, vi);
+      eq(got.identity, vi.output_summary.videoIdentity.identity, 'identidad = la del video vigente (storage paths)');
+      const [vrow] = await ds.query(`select id from public.generation_item_runs where job_id = $1 and item_key = $2`, [jobA.id, `video:${vi.chapter_id}`]);
+      eq(got.itemRunId, vrow.id, 'item run del video');
+      await ds.query('begin');
+      try {
+        await ds.query(`update public.generation_item_runs set status = 'failed' where id = $1`, [vrow.id]);
+        await rejectsRe(sched['consumedVideoIdentity'](ds, jobA.id, vi), /video_not_completed/, 'video no completado', 409);
+      } finally { await ds.query('rollback'); }
+    });
+
+    await check('DB fix round 1 I5: sin las columnas de R3 las rutas de estructura responden 503 schema_not_migrated_v21 (nunca 500 crudo)', async () => {
+      const G = loadDist('modules/course-structure/v21-schema-guard.js');
+      G._resetV21SchemaGuardForTests();
+      await withClient(DB, async (c) => {
+        await c.query('begin');
+        try {
+          await c.query(`alter table public.courses rename column activity_engine to activity_engine_x`);
+          const err = await rejectsRe(G.assertV21StructureSchema(c), /schema_not_migrated_v21/, 'guarda', 503);
+          eq(err.getResponse().missing, ['courses.activity_engine'], 'columnas faltantes');
+        } finally { await c.query('rollback'); }
+      });
+      await G.assertV21StructureSchema(ds); // migrada → pasa (y queda cacheado)
+    });
+
+    await check('DB fix round 1 M11: la auditoría falla con un artifact simulado en un run no congelado como mock', async () => {
+      const env = localEnv({ MIGRATION_ENV: 'staging' });
+      const [victim] = await ds.query(`select a.id from public.artifacts a where a.job_id = $1 and a.type = 'dynamic_presentation' limit 1`, [jobA.id]);
+      await ds.query(`update public.artifacts set metadata = metadata || '{"mock": true}'::jsonb where id = $1`, [victim.id]);
+      try {
+        const bad = runScript('scripts/audit-dynamic-generation.js', env);
+        assert(bad.code !== 0 && /artifact simulado dynamic_presentation/.test(bad.out), `debió fallar: exit ${bad.code}\n${bad.out.slice(-1500)}`);
+      } finally {
+        await ds.query(`update public.artifacts set metadata = metadata - 'mock' where id = $1`, [victim.id]);
+      }
+      eq(runScript('scripts/audit-dynamic-generation.js', env).code, 0, 'vuelve a verde');
     });
   } finally {
     if (ds && ds.isInitialized) await ds.destroy().catch(() => {});

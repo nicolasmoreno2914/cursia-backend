@@ -75,6 +75,14 @@ const MIGRATION_STEPS = [
     summary: 'course_blueprints inmutable + courses.current_blueprint_id; reapunta 3 FKs (vacías) de course_versions a course_blueprints',
   },
   {
+    // V2.1 R3 (fix round 1, review G2 I5): el código V2.1 lee estas columnas en
+    // las rutas de estructura; sin ellas → 503 schema_not_migrated_v21.
+    id: 'v21-blueprint-profiles',
+    file: 'supabase-migration-v21-blueprint-profiles.sql',
+    stagingStep: '4d2 (migrate-v21-blueprint-profiles.js)',
+    summary: 'V2.1 R3: courses.final_exam_enabled/activity_engine, course_chapters.activity_enabled, course_blueprints schemaVersion 2, course_profiles append-only',
+  },
+  {
     id: 'generation-manifests',
     file: 'supabase-migration-generation-manifests.sql',
     stagingStep: '4e (migrate-generation-manifests.js)',
@@ -106,6 +114,14 @@ const MIGRATION_STEPS = [
     placeholder: { mustMention: 'carried_from_item_run_id' },
   },
   {
+    // V2.1 R4 (fix round 1, I5). Requiere dynamic-generation-v2 (scope, gir_type_check)
+    // y va DESPUÉS: re-crea generation_item_runs_default_scope con los tipos v3.
+    id: 'v21-manifest-v3',
+    file: 'supabase-migration-v21-manifest-v3.sql',
+    stagingStep: '4h4 (migrate-v21-manifest-v3.js)',
+    summary: 'V2.1 R4: tipos v3 en gir_type_check/gir_type_scope/default scope, conteos v3 en course_generation_manifests, scorm_count >= 0',
+  },
+  {
     // Decisión: SÍ se necesita en producción. El ejecutor dynamic de V2 (y el
     // artifactUpload legacy de 39-brandkit/41-course-setup) sube a
     // cursia-artifacts DESDE EL NAVEGADOR con el JWT del usuario; el
@@ -131,9 +147,11 @@ const VERIFY_SCRIPTS = [
   'scripts/verify-dynamic-course-structure-schema.js',
   'scripts/verify-course-blueprints-schema.js',
   'scripts/audit-course-blueprints.js',
+  'scripts/verify-v21-blueprint-profiles-schema.js',
   'scripts/verify-generation-manifests-schema.js',
   'scripts/audit-generation-manifests.js',
   'scripts/verify-dynamic-generation-schema.js',
+  'scripts/verify-v21-manifest-v3-schema.js',
   'scripts/audit-dynamic-generation.js',
 ];
 

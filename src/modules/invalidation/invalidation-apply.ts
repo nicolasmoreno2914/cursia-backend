@@ -68,18 +68,20 @@ interface ItemArtifactsRow {
   item_run_id: string;
   item_key: string;
   status: string;
+  consumed_video_identity?: string | null;
   arts: Array<{ id: string; status: string | null; fp: string | null; type?: string | null; bucket?: string | null; path?: string | null }>;
 }
 
 async function itemsWithArtifacts(q: QueryExecutor, jobId: string): Promise<ItemArtifactsRow[]> {
   return q.query(
     `select g.id as item_run_id, g.item_key, g.status,
+            g.output_summary->'videoIdentity'->>'identity' as consumed_video_identity,
             coalesce(json_agg(json_build_object('id', a.id, 'status', a.status, 'fp', a.metadata->>'inputFingerprint',
                                                  'type', a.type, 'bucket', a.storage_bucket, 'path', a.storage_path)
                               order by a.id) filter (where a.id is not null), '[]'::json) as arts
        from ${effectiveOutputRowsSql('$1')} g
        left join public.artifacts a on a.item_run_id = g.id
-      group by g.id, g.item_key, g.status`,
+      group by g.id, g.item_key, g.status, g.output_summary`,
     [jobId],
   );
 }
@@ -110,6 +112,7 @@ export async function loadFromItemsFromDb(
       artifactStatus: aggregateArtifactStatus(r.arts.map((a) => a.status)),
       inputFingerprint: uniformFingerprint(r.arts.map((a) => a.fp)),
       outputIdentity: artifactOutputIdentity(r.arts),
+      ...(r.consumed_video_identity ? { consumedVideoIdentity: r.consumed_video_identity } : {}),
     });
   }
   const have = new Set(out.map((o) => o.itemKey));
@@ -138,6 +141,7 @@ export async function loadFromItemsFromDb(
         // un deshabilitado sin huella (REGENERATE, fix wave).
         inputFingerprint: uniformFingerprint(r.arts.map((a) => a.fp)),
         outputIdentity: artifactOutputIdentity(r.arts),
+        ...(r.consumed_video_identity ? { consumedVideoIdentity: r.consumed_video_identity } : {}),
       });
       wanted.delete(r.item_key);
     }
@@ -224,6 +228,13 @@ export interface ApplyWrites {
   /** Items de video del Manifest destino que el run B va a generar (gasto de Videogen si videoMode='real'). */
   videoItemsToGenerate: string[];
   /**
+   * V2.1 (fix round 1, M1/M7): items de Gamma/TTS (presentation,
+   * audio_welcome, audiobook_chapter) que el run B va a GENERAR/REGENERAR.
+   * Siempre vacío en v1/v2. Con los proveedores reales sin cablear (R9/R10)
+   * fallan fuerte al ejecutarse; el gate de aprobación de gasto es de R9/R10.
+   */
+  providerItemsToGenerate: string[];
+  /**
    * Items reutilizados cuyo origen NO tiene todos los roles de artifact que
    * exige el rulesVersion destino (p.ej. un content v1 reutilizado en un run
    * v2 no tiene `dynamic_context_package_json`): `<key>:<tipo>:missing_role`.
@@ -274,6 +285,7 @@ export function planApplyWrites(
   const carried: CarriedArtifactPlan[] = [];
   const statusChanges: StatusChangePlan[] = [];
   const videoItemsToGenerate: string[] = [];
+  const providerItemsToGenerate: string[] = [];
   const missingRoles: string[] = [];
 
   for (const it of targetItems) {
@@ -333,6 +345,12 @@ export function planApplyWrites(
       statusChanges.push({ itemKey: it.key, itemRunId: a.fromItemRunId, status: 'stale', action: a.action, reasons: [...a.reasons], inputFingerprint: null });
     }
     if (it.type === 'video' && (a.action === 'GENERATE' || a.action === 'REGENERATE')) videoItemsToGenerate.push(it.key);
+    if (
+      (it.type === 'presentation' || it.type === 'audio_welcome' || it.type === 'audiobook_chapter') &&
+      (a.action === 'GENERATE' || a.action === 'REGENERATE')
+    ) {
+      providerItemsToGenerate.push(it.key);
+    }
   }
   const leftovers = [...byKey.keys()];
   if (leftovers.length > 0) {
@@ -349,7 +367,7 @@ export function planApplyWrites(
     const fp = stored.length === 1 && stored[0] ? stored[0] : allReady ? fromMatchOf(a) : 'unknown';
     statusChanges.push({ itemKey: a.itemKey, itemRunId: a.fromItemRunId, status: 'disabled', action: a.action, reasons: [...a.reasons], inputFingerprint: fp });
   }
-  return { seeds, carried, statusChanges, videoItemsToGenerate, missingRoles };
+  return { seeds, carried, statusChanges, videoItemsToGenerate, providerItemsToGenerate, missingRoles };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

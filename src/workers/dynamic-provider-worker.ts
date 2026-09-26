@@ -8,6 +8,14 @@ import { MissingSchemaBackoff, holdIdleIfDynamicDisabled } from './dynamic-worke
 import { ClaimedItem, DEFAULT_LEASE_SECONDS, SchedulerService } from '../modules/dynamic-generation/scheduler.service';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import type { ManifestItemType } from '../modules/generation-manifests/generation-manifest-builder';
+import {
+  ALLOW_PROVIDER_MOCK_ENV,
+  PROVIDER_MODE_UNSET,
+  ProviderMode,
+  frozenProviderModesOf,
+  isProviderMockAllowed,
+  providerKindOfItemType,
+} from '../modules/dynamic-generation/provider-modes';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cursia V2.1 — R4: worker de items de PROVEEDOR de rulesVersion 3 que no son
@@ -16,12 +24,17 @@ import type { ManifestItemType } from '../modules/generation-manifests/generatio
 // global sin ownerId (worker interno), un artifact por item, completeItem.
 //
 // ESTADO: stubs. R9 (Gamma) y R10 (TTS) cablean los proveedores reales.
-//  - Run con videoMode 'mock' (el switch mock/real congelado del run; default
-//    'mock', igual que RunsService.videoModeOf): salida de FIXTURE
-//    determinística (misma entrada → mismo payload, byte a byte), para E2E.
-//  - Run con videoMode 'real': falla FUERTE con PROVIDER_NOT_WIRED_V21 (el
-//    item queda `failed`, no reintentable, dependientes `blocked`) — nunca
-//    una salida falsa en un run real y nunca una llamada a un proveedor.
+// Fix round 1 (review G2 I1): el modo sale de `input_payload.providerModes`
+// ({presentation, audio}, congelado al crear el run; ver provider-modes.ts),
+// NUNCA de videoMode:
+//  - 'real' (default y único de producción): falla FUERTE con
+//    PROVIDER_NOT_WIRED_V21 (item `failed`, no reintentable, dependientes
+//    `blocked`) — nunca una salida falsa ni una llamada a un proveedor.
+//  - 'mock' (pedido explícito + DYNAMIC_ALLOW_PROVIDER_MOCK=true, que se
+//    vuelve a exigir acá): fixture determinística, artifact con
+//    `metadata.mock=true` (el empaque real la rechaza:
+//    assertNoMockArtifactsForRealPackage).
+//  - sin modos congelados (run v3 previo a este fix) → PROVIDER_MODE_UNSET.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const PROVIDER_NOT_WIRED_V21 = 'PROVIDER_NOT_WIRED_V21';
@@ -29,7 +42,7 @@ export const PROVIDER_NOT_WIRED_V21 = 'PROVIDER_NOT_WIRED_V21';
 /** Tipos que reclama este worker (nunca el navegador: ver WORKER_ONLY_TYPES del scheduler). */
 export const PROVIDER_WORKER_TYPES: readonly ManifestItemType[] = ['presentation', 'audio_welcome', 'audiobook_chapter'];
 
-export type ProviderMode = 'mock' | 'real';
+export type { ProviderMode };
 
 /** Proveedor que produciría el item en modo real (para el mensaje y el costo). */
 export function providerOfType(type: string): 'gamma' | 'tts' {
@@ -38,9 +51,15 @@ export function providerOfType(type: string): 'gamma' | 'tts' {
   throw new Error(`dynamic-provider-worker: type no soportado: ${type}`);
 }
 
-/** Modo del run: `input_payload.videoMode` congelado ('real' | cualquier otra cosa = 'mock'). */
-export function providerModeOf(inputPayload: any): ProviderMode {
-  return inputPayload?.videoMode === 'real' ? 'real' : 'mock';
+/**
+ * Modo congelado del run para el proveedor de `itemType`. `null` = no hay
+ * modos congelados (nunca se asume uno: el item falla con PROVIDER_MODE_UNSET).
+ */
+export function providerModeOf(inputPayload: any, itemType: string): ProviderMode | null {
+  const kind = providerKindOfItemType(itemType);
+  const modes = frozenProviderModesOf(inputPayload);
+  if (!kind || !modes) return null;
+  return modes[kind];
 }
 
 export class ProviderNotWiredError extends Error {
@@ -88,7 +107,7 @@ export function mockProviderOutput(item: Pick<ClaimedItem, 'type' | 'itemKey' | 
         pdfUrl: null,
         coverPngUrl: null,
       },
-      summary: { mode: 'mock', fixture: true, provider, slideCount },
+      summary: { mode: 'mock', fixture: true, mock: true, provider, slideCount },
     };
   }
   const durationSeconds = item.type === 'audio_welcome' ? 45 : 150 + (parseInt(digest.slice(0, 2), 16) % 60);
@@ -107,7 +126,7 @@ export function mockProviderOutput(item: Pick<ClaimedItem, 'type' | 'itemKey' | 
       mp3Url: null,
       script: item.type === 'audiobook_chapter' ? `[fixture] guion del capítulo ${item.chapterNumber}` : '[fixture] bienvenida',
     },
-    summary: { mode: 'mock', fixture: true, provider, durationSeconds },
+    summary: { mode: 'mock', fixture: true, mock: true, provider, durationSeconds },
   };
 }
 
@@ -120,10 +139,14 @@ export interface ProviderWorkerDeps {
   leaseSeconds: number;
 }
 
-async function loadRunHead(dataSource: Pick<DataSource, 'query'>, runId: string): Promise<{ ownerId: string; mode: ProviderMode }> {
+async function loadRunHead(
+  dataSource: Pick<DataSource, 'query'>,
+  runId: string,
+  itemType: string,
+): Promise<{ ownerId: string; mode: ProviderMode | null }> {
   const [row] = await dataSource.query(`select owner_id, input_payload from public.production_jobs where id = $1`, [runId]);
   if (!row) throw new Error(`run ${runId} no encontrado (integridad rota)`);
-  return { ownerId: row.owner_id, mode: providerModeOf(row.input_payload) };
+  return { ownerId: row.owner_id, mode: providerModeOf(row.input_payload, itemType) };
 }
 
 /**
@@ -136,7 +159,21 @@ export async function processProviderItem(deps: ProviderWorkerDeps, item: Claime
     await deps.scheduler.failItem(item.itemRunId, deps.executorId, `provider_worker_wrong_type: ${item.type}`, false);
     throw new Error(`dynamic-provider-worker: reclamó un item de tipo ${item.type} (${item.itemKey}) que no le corresponde`);
   }
-  const head = await loadRunHead(deps.dataSource, item.runId);
+  const head = await loadRunHead(deps.dataSource, item.runId, item.type);
+  if (head.mode === null) {
+    const msg =
+      `${PROVIDER_MODE_UNSET}: el run ${item.runId} no tiene providerModes congelados; el item ${item.itemKey} ` +
+      '(Gamma/TTS) no se ejecuta con un modo supuesto. Iniciá un run nuevo.';
+    await deps.scheduler.failItem(item.itemRunId, deps.executorId, msg, false);
+    throw new Error(msg);
+  }
+  if (head.mode === 'mock' && !isProviderMockAllowed()) {
+    const msg =
+      `provider_mock_not_allowed: el run ${item.runId} está congelado en mock para ${item.type} pero ` +
+      `${ALLOW_PROVIDER_MOCK_ENV}≠true en este entorno; no se produce una fixture.`;
+    await deps.scheduler.failItem(item.itemRunId, deps.executorId, msg, false);
+    throw new Error(msg);
+  }
   if (head.mode === 'real') {
     const err = new ProviderNotWiredError(item.type, item.itemKey);
     await deps.scheduler.failItem(item.itemRunId, deps.executorId, err.message, false);
@@ -156,7 +193,7 @@ export async function processProviderItem(deps: ProviderWorkerDeps, item: Claime
     storagePath,
     payload: out.payload,
     mimeType: 'application/json',
-    metadata: { manifestId: item.manifestId, itemKey: item.itemKey, chapterId: item.chapterId, fixture: true },
+    metadata: { manifestId: item.manifestId, itemKey: item.itemKey, chapterId: item.chapterId, fixture: true, mock: true },
     upsert: false,
   });
   const ok = await deps.scheduler.completeItem(item.itemRunId, deps.executorId, {

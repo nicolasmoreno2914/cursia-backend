@@ -203,7 +203,7 @@ async function withEnv(vars, fn) {
     }
   }
 }
-const ENV_CLEAN = { [FLAG]: undefined, [ALLOW]: undefined, [REAL]: undefined, [COH_LLM]: undefined };
+const ENV_CLEAN = { [FLAG]: undefined, [ALLOW]: undefined, [REAL]: undefined, [COH_LLM]: undefined, DYNAMIC_MANIFEST_RULES_VERSION: undefined };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // App Nest HTTP real con servicios falsos
@@ -603,11 +603,13 @@ async function runWorkerProcess(script, env, { waitMs }) {
     const featureMatrix = [
       { label: 'flag OFF', env: {}, user: OWNER_A, want: { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false } },
       { label: 'flag OFF aunque esté en ambas listas', env: { [ALLOW]: OWNER_A, [REAL]: OWNER_A, [COH_LLM]: 'true' }, user: OWNER_A, want: { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false } },
-      { label: 'ON + lista vacía', env: { [FLAG]: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false } },
-      { label: 'ON + lista vacía + coherencia IA', env: { [FLAG]: 'true', [COH_LLM]: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: true } },
-      { label: 'ON + listado + real', env: { [FLAG]: 'true', [ALLOW]: `${OWNER_B},${OWNER_A}`, [REAL]: OWNER_A }, user: OWNER_A, want: { dynamicCourseStructure: true, realVideo: true, coherenceLlm: false } },
-      { label: 'ON + listado sin real', env: { [FLAG]: 'true', [ALLOW]: `${OWNER_B},${OWNER_A}`, [REAL]: OWNER_A }, user: OWNER_B, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false } },
+      { label: 'ON + lista vacía', env: { [FLAG]: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false, manifestRulesVersion: 1 } },
+      { label: 'ON + lista vacía + coherencia IA', env: { [FLAG]: 'true', [COH_LLM]: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: true, manifestRulesVersion: 1 } },
+      { label: 'ON + listado + real', env: { [FLAG]: 'true', [ALLOW]: `${OWNER_B},${OWNER_A}`, [REAL]: OWNER_A }, user: OWNER_A, want: { dynamicCourseStructure: true, realVideo: true, coherenceLlm: false, manifestRulesVersion: 1 } },
+      { label: 'ON + listado sin real', env: { [FLAG]: 'true', [ALLOW]: `${OWNER_B},${OWNER_A}`, [REAL]: OWNER_A }, user: OWNER_B, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false, manifestRulesVersion: 1 } },
       { label: 'ON + no listado', env: { [FLAG]: 'true', [ALLOW]: OWNER_A, [REAL]: OWNER_C, [COH_LLM]: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false } },
+      // V2.1 fix round 1 (review G2 I4): el editor muestra los toggles V2.1 solo con rulesVersion 3.
+      { label: 'ON + reglas v3 (DYNAMIC_MANIFEST_RULES_VERSION=3)', env: { [FLAG]: 'true', DYNAMIC_MANIFEST_RULES_VERSION: '3' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false, manifestRulesVersion: 3 } },
     ];
     for (const m of featureMatrix) {
       await check(`GET /api/v1/features — ${m.label}`, () =>

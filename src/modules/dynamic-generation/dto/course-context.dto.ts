@@ -9,6 +9,7 @@ import {
   MaxLength,
   ValidateNested,
 } from 'class-validator';
+import { PROVIDER_MODE_VALUES } from '../provider-modes';
 
 /** Modo de video del run (R17, Fase 5A Task 4): 'mock' (default) nunca llama a Videogen; 'real' sí. Fijo por run. */
 export const RUN_VIDEO_MODES = ['mock', 'real'] as const;
@@ -24,6 +25,21 @@ export class PrevCourseDto {
   @IsString({ each: true })
   @MaxLength(255, { each: true })
   caps: string[];
+}
+
+/**
+ * V2.1 (fix round 1, I1): modos de proveedor pedidos para un run rulesVersion
+ * 3. Omitido = `real`. `mock` exige DYNAMIC_ALLOW_PROVIDER_MOCK=true (403 si
+ * no). No es parte del contexto congelado: vive en input_payload.providerModes.
+ */
+export class ProviderModesDto {
+  @IsOptional()
+  @IsIn(PROVIDER_MODE_VALUES as unknown as string[])
+  presentation?: 'real' | 'mock';
+
+  @IsOptional()
+  @IsIn(PROVIDER_MODE_VALUES as unknown as string[])
+  audio?: 'real' | 'mock';
 }
 
 /**
@@ -101,6 +117,12 @@ export class CourseContextDto {
   @IsOptional()
   @IsIn(RUN_VIDEO_MODES as unknown as string[])
   videoMode?: RunVideoMode;
+
+  /** V2.1 (fix round 1, I1): ver ProviderModesDto. Solo Manifests rulesVersion 3 (en v1/v2 → 400). */
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => ProviderModesDto)
+  providerModes?: ProviderModesDto;
 
   /**
    * R19 (Fase 5A Task 6a): ids de plantilla SCORM v2 activos, congelados al

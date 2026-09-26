@@ -195,8 +195,9 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
     const { type, entityId } = parseItemKey(key);
     if (type === 'activity') return { variant: fromItems.get(key)?.variant ?? null };
     if (type === 'video_interactions') {
-      const vKey = `video:${entityId}`;
-      return { videoIdentity: fromItems.has(vKey) ? identityOf(vKey) : null };
+      // Fix round 1 (I3): la identidad REGISTRADA al generarse las
+      // interacciones, no la del video actual (que pudo regenerarse después).
+      return { videoIdentity: records.get(key)?.consumedVideoIdentity ?? null };
     }
     return {};
   };
@@ -394,7 +395,7 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
         regenerate(a, 'content_regenerated');
       } else if (a.matchFingerprint !== a.fromMatchFingerprint) {
         // El video que B hereda no es el que describían (o no se conoce su identidad).
-        regenerate(a, a.matchFingerprint ? 'video_changed' : 'video_identity_unknown');
+        regenerate(a, a.fromMatchFingerprint && a.matchFingerprint ? 'video_changed' : 'video_identity_unknown');
       } else {
         a.reasons.push('video_reused');
         settleReuse(a, 'REUSE');

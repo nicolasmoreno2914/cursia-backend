@@ -193,7 +193,32 @@ function auditItemRolesV3(row) {
   return out;
 }
 
+/**
+ * Fix round 1 (review G2 M11): artifacts SIMULADOS (`metadata.mock` o
+ * `metadata.fixture` = true) de un item v3 completado solo son válidos si el
+ * run está congelado en `providerModes` mock para ese proveedor (misma regla
+ * que assertNoMockArtifactsForRealPackage en packaging-guards.ts). Un
+ * artifact simulado que no es de Gamma/TTS nunca es válido.
+ *
+ * @param row { id, item_key, provider_modes: {presentation, audio} | null, mock_artifact_types: string[] }
+ */
+function auditMockArtifactsV3(row) {
+  const label = `Item run v3 id=${row.id} (item_key=${row.item_key})`;
+  const pm = row.provider_modes;
+  const valid = pm && ['real', 'mock'].includes(pm.presentation) && ['real', 'mock'].includes(pm.audio) ? pm : null;
+  const kindOf = (t) => (t === 'dynamic_presentation' ? 'presentation' : t === 'dynamic_audio_mp3' ? 'audio' : null);
+  const out = [];
+  for (const t of row.mock_artifact_types || []) {
+    const kind = kindOf(t);
+    if (!kind || !valid || valid[kind] !== 'mock') {
+      out.push(`${label}: artifact simulado ${t} en un run no congelado como mock para ese proveedor (providerModes=${JSON.stringify(pm ?? null)}).`);
+    }
+  }
+  return out;
+}
+
 module.exports = {
+  auditMockArtifactsV3,
   V3_ITEM_TYPES,
   V3_COUNT_COLUMNS,
   V3_ARTIFACT_ROLES,

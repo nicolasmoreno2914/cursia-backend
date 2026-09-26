@@ -1,4 +1,5 @@
 import { ForbiddenException, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common';
+import { readConfiguredRulesVersion } from '../generation-manifests/manifest-rules-config';
 
 /**
  * Flags de entorno del rollout gradual de la estructura dinámica de cursos
@@ -51,6 +52,14 @@ export interface DynamicFeatures {
   realVideo: boolean;
   /** F78-BE2: revisión de coherencia con IA (DYNAMIC_COHERENCE_LLM === 'true' y V2 permitida). */
   coherenceLlm: boolean;
+  /**
+   * V2.1 fix round 1 (review G2 I4): rulesVersion configurado
+   * (DYNAMIC_MANIFEST_RULES_VERSION). Solo cuando la estructura dinámica está
+   * habilitada para el usuario. El editor muestra los toggles V2.1 (Actividad,
+   * Examen final, motor) SOLO con 3: con 1/2 el lock produce un Blueprint v1
+   * que los ignoraría.
+   */
+  manifestRulesVersion?: 1 | 2 | 3;
 }
 
 export function isDynamicCourseStructureEnabled(env: Env = process.env): boolean {
@@ -131,10 +140,13 @@ export function isCoherenceLlmAllowedForOwner(ownerId: string, env: Env = proces
 export function resolveDynamicFeatures(ownerId: string, env: Env = process.env): DynamicFeatures {
   if (!isDynamicCourseStructureEnabled(env)) return { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false };
   validateDynamicFeatureConfig(env);
+  const dynamicCourseStructure = isDynamicAllowedForOwner(ownerId, env);
   return {
-    dynamicCourseStructure: isDynamicAllowedForOwner(ownerId, env),
+    dynamicCourseStructure,
     realVideo: isRealVideoAllowedForOwner(ownerId, env),
     coherenceLlm: isCoherenceLlmAllowedForOwner(ownerId, env),
+    // Config inválida → lanza (fail loud, mismo criterio que el lock y los Manifests).
+    ...(dynamicCourseStructure ? { manifestRulesVersion: readConfiguredRulesVersion(env) } : {}),
   };
 }
 

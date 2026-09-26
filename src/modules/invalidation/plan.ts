@@ -92,6 +92,13 @@ export interface InvalidationFromItem {
    * `video_interactions` (qué video describe). v1/v2 la ignoran.
    */
   outputIdentity?: string | null;
+  /**
+   * Solo rulesVersion 3, items `video_interactions` (fix round 1, I3):
+   * identidad del video CONTRA el que se generaron, registrada al completarse
+   * (`output_summary.videoIdentity.identity`). null/ausente = desconocida
+   * (nunca se reutilizan a ciegas).
+   */
+  consumedVideoIdentity?: string | null;
 }
 
 export interface InvalidationPlanInput {

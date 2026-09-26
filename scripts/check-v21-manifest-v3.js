@@ -503,13 +503,15 @@ async function pureChecks() {
     throwsRe(() => plan.assertInvalidationRulesSupported(2, 2, [1, 2]), /^INVALIDATION_V3_NOT_IMPLEMENTED/, 'Blueprint v2');
   });
 
-  await check('worker de proveedor: mock → fixture determinística + completeItem; real → PROVIDER_NOT_WIRED_V21 (item failed, sin artifact)', async () => {
+  // Fix round 1 (review G2 I1): el modo sale de input_payload.providerModes (nunca de videoMode);
+  // mock exige además DYNAMIC_ALLOW_PROVIDER_MOCK=true al ejecutar; sin modos → PROVIDER_MODE_UNSET.
+  await check('worker de proveedor: providerModes mock (+env) → fixture mock:true + completeItem; real / sin modos / mock sin env → falla fuerte sin artifact', async () => {
     const W = loadDist('workers/dynamic-provider-worker.js');
     const item = (type, chapterId) => ({
       itemRunId: 'ir-1', runId: 'run-1', courseId: 1, artifactCourseId: 'front-1', manifestId: 9, itemKey: `${type}:${chapterId || 1}`,
       type, chapterId, chapterNumber: chapterId ? 2 : null, idempotencyKey: `idem-${type}`, attempt: 1,
     });
-    const mk = (videoMode) => {
+    const mk = (inputPayload) => {
       const calls = { uploads: [], completes: [], fails: [] };
       return {
         calls,
@@ -519,7 +521,7 @@ async function pureChecks() {
             async completeItem(id, ex, out) { calls.completes.push(out); return true; },
             async failItem(id, ex, err, retry) { calls.fails.push({ err, retry }); return true; },
           },
-          dataSource: { async query() { return [{ owner_id: 'owner-1', input_payload: { videoMode } }]; } },
+          dataSource: { async query() { return [{ owner_id: 'owner-1', input_payload: inputPayload }]; } },
           artifacts: { async uploadJsonArtifact(i) { calls.uploads.push(i); return { id: `art-${calls.uploads.length}` }; } },
           logger: { log() {}, warn() {}, error() {} },
           executorId: 'ex', leaseSeconds: 60,
@@ -528,18 +530,34 @@ async function pureChecks() {
     };
     for (const [type, artifactType] of [['presentation', 'dynamic_presentation'], ['audio_welcome', 'dynamic_audio_mp3'], ['audiobook_chapter', 'dynamic_audio_mp3']]) {
       const ch = type === 'audio_welcome' ? null : 'c1';
-      const a = mk('mock');
-      await W.processProviderItem(a.deps, item(type, ch));
+      const savedMock = process.env.DYNAMIC_ALLOW_PROVIDER_MOCK;
+      process.env.DYNAMIC_ALLOW_PROVIDER_MOCK = 'true';
+      const a = mk({ videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } });
+      try { await W.processProviderItem(a.deps, item(type, ch)); } finally {
+        if (savedMock === undefined) delete process.env.DYNAMIC_ALLOW_PROVIDER_MOCK; else process.env.DYNAMIC_ALLOW_PROVIDER_MOCK = savedMock;
+      }
+      eq([a.calls.uploads[0].metadata.mock, a.calls.uploads[0].metadata.fixture], [true, true], `${type}: metadata mock/fixture`);
       eq(a.calls.uploads.map((u) => u.type), [artifactType], `${type}: tipo de artifact`);
       eq(a.calls.completes.map((c) => c.artifactIds), [['art-1']], `${type}: completeItem`);
       assert(a.calls.uploads[0].payload.fixture === true, 'payload sin fixture:true');
       eq(W.mockProviderOutput(item(type, ch)), W.mockProviderOutput(item(type, ch)), `${type}: determinística`);
       const R = loadDist('modules/dynamic-packaging/artifact-resolver.js');
       eq(R.requiredArtifactTypesV3(type), [artifactType], `${type}: rol que exige completeItem`);
-      const b = mk('real');
+      // videoMode 'mock' + providerModes real → real (el modo de video NO decide).
+      const b = mk({ videoMode: 'mock', providerModes: { presentation: 'real', audio: 'real' } });
       await rejectsRe(W.processProviderItem(b.deps, item(type, ch)), /^PROVIDER_NOT_WIRED_V21/, `${type} real`);
       eq(b.calls.uploads.length + b.calls.completes.length, 0, `${type} real: sin artifact ni complete`);
       assert(b.calls.fails.length === 1 && b.calls.fails[0].retry === false && /^PROVIDER_NOT_WIRED_V21/.test(b.calls.fails[0].err), `${type} real: failItem no reintentable`);
+      // Sin providerModes (solo videoMode 'mock', como antes del fix) → PROVIDER_MODE_UNSET, nunca fixture.
+      const u = mk({ videoMode: 'mock' });
+      await rejectsRe(W.processProviderItem(u.deps, item(type, ch)), /PROVIDER_MODE_UNSET/, `${type} sin modos`);
+      eq(u.calls.uploads.length + u.calls.completes.length, 0, `${type} sin modos: sin artifact`);
+      // Congelado mock pero el entorno ya no lo permite → falla fuerte.
+      const m = mk({ providerModes: { presentation: 'mock', audio: 'mock' } });
+      delete process.env.DYNAMIC_ALLOW_PROVIDER_MOCK;
+      await rejectsRe(W.processProviderItem(m.deps, item(type, ch)), /provider_mock_not_allowed/, `${type} mock sin env`);
+      if (savedMock !== undefined) process.env.DYNAMIC_ALLOW_PROVIDER_MOCK = savedMock;
+      eq(m.calls.uploads.length, 0, `${type} mock sin env: sin artifact`);
     }
     eq([...W.PROVIDER_WORKER_TYPES].sort(), ['audio_welcome', 'audiobook_chapter', 'presentation'], 'tipos del worker');
   });
@@ -761,7 +779,7 @@ async function dbChecks() {
       const [job] = await ds.query(
         `insert into public.production_jobs (owner_id, course_id, execution_mode, status, worker_status, input_payload)
          values ($1, $2, 'dynamic_generation', 'queued', 'queued', $3::jsonb) returning id`,
-        [OWNER, cid, JSON.stringify({ manifestId: String(dto.id), blueprintNumber: 1 })]);
+        [OWNER, cid, JSON.stringify({ manifestId: String(dto.id), blueprintNumber: 1, providerModes: { presentation: 'mock', audio: 'mock' } })]);
       let n = 0;
       for (const it of dto.manifest.items) {
         n += 1;
@@ -833,7 +851,14 @@ async function dbChecks() {
         scheduler: sched, dataSource: ds, logger: { log() {}, warn() {}, error() {} }, executorId: 'prov-1', leaseSeconds: 60,
         artifacts: { async uploadJsonArtifact(i) { uploads.push(i.type); return { id: await insArt(i.type, 'prov') }; } },
       };
-      eq(await W.runProviderOnce(deps), 'claimed', 'worker de proveedor reclamó');
+      // Fix round 1 (I1): run congelado en providerModes mock + escape de entorno explícito.
+      const savedMock = process.env.DYNAMIC_ALLOW_PROVIDER_MOCK;
+      process.env.DYNAMIC_ALLOW_PROVIDER_MOCK = 'true';
+      try {
+        eq(await W.runProviderOnce(deps), 'claimed', 'worker de proveedor reclamó');
+      } finally {
+        if (savedMock === undefined) delete process.env.DYNAMIC_ALLOW_PROVIDER_MOCK; else process.env.DYNAMIC_ALLOW_PROVIDER_MOCK = savedMock;
+      }
       const [done] = await ds.query(
         `select type, status, output_summary from public.generation_item_runs where job_id = $1 and worker_id = 'prov-1'`, [job.id]);
       assert(done && done.status === 'completed' && PROVIDER.includes(done.type), `item de proveedor: ${JSON.stringify(done)}`);

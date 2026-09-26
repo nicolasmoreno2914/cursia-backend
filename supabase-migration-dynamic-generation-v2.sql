@@ -61,12 +61,16 @@ update public.generation_item_runs
  where scope is null;
 
 -- Deriva scope del type en cada INSERT que no lo mande (writers v1).
+-- V2.1 fix round 1 (review G2 M5): este cuerpo es un SUPERCONJUNTO del de la
+-- migración v21-manifest-v3 (audio_welcome y final_exam también son de scope
+-- course). Así re-correr esta migración en cada deploy nunca "des-v3-iza" la
+-- función (para los tipos v1/v2 el resultado es idéntico al de antes).
 create or replace function public.generation_item_runs_default_scope() returns trigger
 language plpgsql as $$
 begin
   if new.scope is null then
     new.scope := case
-                   when new.type in ('course_plan', 'course_intro') then 'course'
+                   when new.type in ('course_plan', 'course_intro', 'audio_welcome', 'final_exam') then 'course'
                    when new.type in ('exam', 'module_intro') then 'module'
                    else 'chapter'
                  end;

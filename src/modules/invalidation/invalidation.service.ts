@@ -7,6 +7,7 @@ import { assertDynamicOwnerAllowed, isRealVideoAllowedForOwner, toHttpConfigErro
 import { ACTIVE_RUN_WORKER_STATUSES } from '../dynamic-generation/item-transitions';
 import { canonicalContextHash } from '../dynamic-generation/run-hash';
 import { computePlanFromDb, planApplyWrites } from './invalidation-apply';
+import { isProviderWorkerDeployed } from '../dynamic-generation/provider-modes';
 import type { InvalidationPlan } from './plan';
 import { INVALIDATION_V3_NOT_IMPLEMENTED, assertInvalidationRulesSupported } from './plan';
 
@@ -23,6 +24,8 @@ export interface InvalidationPlanResponse {
   videoMode: string;
   /** Videos que el run B generaría (gasto de Videogen si videoMode='real'). */
   videoItemsToGenerate: string[];
+  /** V2.1 (fix round 1): items de Gamma/TTS que el run B generaría (vacío en v1/v2). */
+  providerItemsToGenerate: string[];
   /**
    * Todo lo que haría fallar el apply (fix wave M2), para que la UI avise
    * ANTES de confirmar; vacío = aplicable:
@@ -100,6 +103,9 @@ export class InvalidationService {
         videoItemsToGenerate: plan.actions
           .filter((a) => a.inTargetManifest && a.type === 'video' && (a.action === 'GENERATE' || a.action === 'REGENERATE'))
           .map((a) => a.itemKey),
+        providerItemsToGenerate: plan.actions
+          .filter((a) => a.inTargetManifest && ['presentation', 'audio_welcome', 'audiobook_chapter'].includes(a.type) && (a.action === 'GENERATE' || a.action === 'REGENERATE'))
+          .map((a) => a.itemKey),
         blockers: [],
         plan,
       };
@@ -172,12 +178,15 @@ export class InvalidationService {
       }
       if (!allowed) blockers.push('real_video_not_allowed');
     }
+    // V2.1 fix round 1 (M1): mismo 501 que el apply si B genera Gamma/TTS sin worker de proveedor.
+    if (writes.providerItemsToGenerate.length > 0 && !isProviderWorkerDeployed()) blockers.push('provider_worker_not_deployed');
     blockers.push(...writes.missingRoles);
     return {
       ...base,
       applied: false,
       existingRunId: null,
       videoItemsToGenerate: writes.videoItemsToGenerate,
+      providerItemsToGenerate: writes.providerItemsToGenerate,
       blockers,
       plan,
     };

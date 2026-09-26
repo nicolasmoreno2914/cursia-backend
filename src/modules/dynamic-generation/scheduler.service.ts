@@ -34,6 +34,7 @@ import {
   sweepRunExpiredLeases,
 } from './item-transitions';
 import { latestGenerationPredicate } from './item-generations';
+import { artifactOutputIdentity } from '../invalidation/invalidation-apply';
 
 export type ItemType = ManifestItemType;
 
@@ -500,6 +501,42 @@ export class SchedulerService {
    * vinculan TODOS → rollback y {ok:false, reason:'artifacts_not_linkable'}
    * (un artifact subido por un lease perdido queda huérfano, R13).
    */
+  /**
+   * V2.1 fix round 1 (I3): identidad del video vigente (última generación de
+   * `video:<ch>` del run, que tiene que estar completed) para las
+   * interacciones de ese capítulo: `{identity, itemRunId, generation,
+   * artifactIds}`. `identity` = artifactOutputIdentity (storage paths): una
+   * fila carried conserva la identidad; un video regenerado la cambia. Sin
+   * video completado → 409 (unas interacciones sin video no se completan).
+   */
+  private async consumedVideoIdentity(qr: QueryRunner, jobId: string, item: any): Promise<Record<string, any>> {
+    const videoKey = `video:${item.chapter_id}`;
+    const [v] = await qr.query(
+      `select g.id, g.generation, g.status from public.generation_item_runs g
+        where g.job_id = $1 and g.item_key = $2 and ${latestGenerationPredicate('g')}`,
+      [jobId, videoKey],
+    );
+    if (!v || v.status !== 'completed') {
+      throw new ConflictException({
+        message: `video_not_completed: ${item.item_key} no se completa sin ${videoKey} completado (estado ${v?.status ?? 'inexistente'})`,
+        code: 'video_not_completed',
+      });
+    }
+    const arts: any[] = await qr.query(
+      `select id, type, storage_bucket as bucket, storage_path as path from public.artifacts
+        where item_run_id = $1 and coalesce(status, 'ready') <> 'disabled' order by id`,
+      [v.id],
+    );
+    const identity = artifactOutputIdentity(arts);
+    if (!identity) {
+      throw new ConflictException({
+        message: `video_not_completed: ${videoKey} (item run ${v.id}) no tiene artifacts; no se puede registrar la identidad del video`,
+        code: 'video_not_completed',
+      });
+    }
+    return { identity, itemRunId: v.id, generation: Number(v.generation), artifactIds: arts.map((a) => a.id) };
+  }
+
   async completeItemDetailed(
     itemRunId: string,
     executorId: string,
@@ -604,6 +641,13 @@ export class SchedulerService {
         }
         if (item.type === 'content' && Number(item.generation) > 1) {
           await this.assertRegeneratedContextPackage(qr, item, merged.merged);
+        }
+        // V2.1 fix round 1 (review G2 I3): las interacciones registran la
+        // identidad del video CONTRA el que se generaron (generación vigente
+        // de video:<ch> en este run al completar). La invalidación compara
+        // contra ESTO, nunca contra el video actual.
+        if (itemRulesVersion === 3 && item.type === 'video_interactions') {
+          merged.merged.videoIdentity = await this.consumedVideoIdentity(qr, job.id, item);
         }
       }
 
