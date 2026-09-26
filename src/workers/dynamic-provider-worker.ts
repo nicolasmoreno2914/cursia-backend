@@ -10,7 +10,9 @@ import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import type { ManifestItemType } from '../modules/generation-manifests/generation-manifest-builder';
 import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
 import { FinopsBudgetService } from '../modules/finops/finops-budget.service';
-import { WorkerBudget, WorkerLedger, blockWithoutGuard, budgetExceededMessage, recordProviderMock } from './finops-worker-hooks';
+import { WorkerBudget, WorkerLedger, blockWithoutGuard, recordProviderMock } from './finops-worker-hooks';
+import { processRealProviderItem } from './provider-real/real-providers';
+import type { CoverRasterizer } from './provider-real/pdf-cover';
 import {
   ALLOW_PROVIDER_MOCK_ENV,
   PROVIDER_MODE_UNSET,
@@ -26,13 +28,14 @@ import {
 // Espejo mínimo del camino de claim de dynamic-item-worker (video): claim
 // global sin ownerId (worker interno), un artifact por item, completeItem.
 //
-// ESTADO: stubs. R9 (Gamma) y R10 (TTS) cablean los proveedores reales.
 // Fix round 1 (review G2 I1): el modo sale de `input_payload.providerModes`
 // ({presentation, audio}, congelado al crear el run; ver provider-modes.ts),
 // NUNCA de videoMode:
-//  - 'real' (default y único de producción): falla FUERTE con
-//    PROVIDER_NOT_WIRED_V21 (item `failed`, no reintentable, dependientes
-//    `blocked`) — nunca una salida falsa ni una llamada a un proveedor.
+//  - 'real' (default y único de producción) — V2.1 F2: proveedores REALES
+//    cableados (provider-real/real-providers.ts): Gamma para presentation,
+//    OpenAI TTS (+ guion LLM server-side medido) para audio. Sin guard de
+//    presupuesto → fail closed; sin configuración → `provider_not_ready`
+//    (no reintentable, antes de gastar).
 //  - 'mock' (pedido explícito + DYNAMIC_ALLOW_PROVIDER_MOCK=true, que se
 //    vuelve a exigir acá): fixture determinística, artifact con
 //    `metadata.mock=true` (el empaque real la rechaza:
@@ -40,6 +43,7 @@ import {
 //  - sin modos congelados (run v3 previo a este fix) → PROVIDER_MODE_UNSET.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Histórico (R4/R5): código del stub previo a F2. Ya no se emite (los proveedores reales están cableados). */
 export const PROVIDER_NOT_WIRED_V21 = 'PROVIDER_NOT_WIRED_V21';
 
 /** Tipos que reclama este worker (nunca el navegador: ver WORKER_ONLY_TYPES del scheduler). */
@@ -134,9 +138,12 @@ export function mockProviderOutput(item: Pick<ClaimedItem, 'type' | 'itemKey' | 
 }
 
 export interface ProviderWorkerDeps {
-  scheduler: Pick<SchedulerService, 'claimNextItem' | 'completeItem' | 'failItem'> & Partial<Pick<SchedulerService, 'blockItemForBudget'>>;
+  scheduler: Pick<SchedulerService, 'claimNextItem' | 'completeItem' | 'failItem'> &
+    Partial<Pick<SchedulerService, 'blockItemForBudget' | 'recordItemExternal' | 'heartbeatItem'>>;
   dataSource: Pick<DataSource, 'query'>;
-  artifacts: Pick<ArtifactsService, 'uploadJsonArtifact'>;
+  /** Modo real (F2) usa además uploadBufferArtifact / putStorageObject / getDownloadUrl. */
+  artifacts: Pick<ArtifactsService, 'uploadJsonArtifact'> &
+    Partial<Pick<ArtifactsService, 'uploadBufferArtifact' | 'putStorageObject' | 'getDownloadUrl'>>;
   logger: Pick<Logger, 'log' | 'warn' | 'error'>;
   executorId: string;
   leaseSeconds: number;
@@ -144,6 +151,12 @@ export interface ProviderWorkerDeps {
   finops?: WorkerLedger | null;
   /** V2.1 RF-b: runtime guard ANTES de donde iría la llamada real. El bootstrap SIEMPRE lo cablea. */
   budget?: WorkerBudget | null;
+  /** V2.1 F2: entorno del modo real (claves, URLs base, themeIds). Default process.env. */
+  env?: Record<string, string | undefined>;
+  /** V2.1 F2: rasterizador de la portada (default pdftoppm). */
+  rasterizer?: CoverRasterizer;
+  gammaPollMs?: number;
+  gammaTimeoutMs?: number;
 }
 
 async function loadRunHead(
@@ -157,9 +170,9 @@ async function loadRunHead(
 }
 
 /**
- * Procesa UN item reclamado. Modo real → failItem(PROVIDER_NOT_WIRED_V21, no
- * reintentable) y relanza el error (fail loud). Modo mock → fixture +
- * artifact + completeItem.
+ * Procesa UN item reclamado. Modo real → proveedor real (F2) detrás del guard
+ * de presupuesto; un fallo no reintentable se relanza (fail loud). Modo mock →
+ * fixture + artifact + completeItem.
  */
 export async function processProviderItem(deps: ProviderWorkerDeps, item: ClaimedItem): Promise<void> {
   if (!PROVIDER_WORKER_TYPES.includes(item.type)) {
@@ -182,26 +195,33 @@ export async function processProviderItem(deps: ProviderWorkerDeps, item: Claime
     throw new Error(msg);
   }
   if (head.mode === 'real') {
-    // V2.1 RF-b: runtime guard de presupuesto ANTES de la llamada pagada (que
-    // R9/R10 cablean acá). Excedido → item `blocked` budget_exceeded, sin gasto.
     // RF-b fix round 2 (M3): sin guard → fail CLOSED (item bloqueado, nunca una llamada pagada).
     if (!deps.budget) {
       deps.logger.error(`Item ${item.itemKey}: runtime guard de presupuesto no configurado — no se llama al proveedor (fail closed)`);
       await blockWithoutGuard(deps.scheduler, item.itemRunId, deps.executorId, providerOfType(item.type) === 'gamma' ? 'Gamma' : 'TTS');
       return;
     }
-    {
-      const g = await deps.budget.guardPaidSubmission({ runId: item.runId, itemRunId: item.itemRunId, itemType: item.type });
-      if (!g.allow) {
-        if (!deps.scheduler.blockItemForBudget) throw new Error('dynamic-provider-worker: scheduler sin blockItemForBudget');
-        deps.logger.warn(`Item ${item.itemKey}: presupuesto excedido (${g.reason}) — no se llama al proveedor`);
-        await deps.scheduler.blockItemForBudget(item.itemRunId, deps.executorId, budgetExceededMessage(g));
-        return;
-      }
-    }
-    const err = new ProviderNotWiredError(item.type, item.itemKey);
-    await deps.scheduler.failItem(item.itemRunId, deps.executorId, err.message, false);
-    throw err;
+    // V2.1 F2: proveedor real. Cada llamada pagada NUEVA pasa antes por el runtime guard
+    // (excedido → `blocked` budget_exceeded, sin gasto) y registra su evento en el ledger.
+    await processRealProviderItem(
+      {
+        scheduler: deps.scheduler,
+        dataSource: deps.dataSource,
+        artifacts: deps.artifacts,
+        logger: deps.logger,
+        executorId: deps.executorId,
+        leaseSeconds: deps.leaseSeconds,
+        finops: deps.finops ?? null,
+        budget: deps.budget,
+        env: deps.env,
+        rasterizer: deps.rasterizer,
+        gammaPollMs: deps.gammaPollMs,
+        gammaTimeoutMs: deps.gammaTimeoutMs,
+      },
+      item,
+      head.ownerId,
+    );
+    return;
   }
 
   const out = mockProviderOutput(item);

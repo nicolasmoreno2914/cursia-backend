@@ -130,7 +130,7 @@ export class RunsController {
     @Body() dto: RetryItemDto,
     @CurrentUser() user: AuthUser,
   ) {
-    return this.runs.retryItem(courseId, user.id, number, runId, itemKey, dto?.resubmitVideo === true);
+    return this.runs.retryItem(courseId, user.id, number, runId, itemKey, dto?.resubmitVideo === true, dto?.resubmitProvider === true);
   }
 
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/items/:itemKey/youtube-resolution

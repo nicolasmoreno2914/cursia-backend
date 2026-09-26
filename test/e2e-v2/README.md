@@ -54,6 +54,11 @@ E2E_JSDOM_NODE_PATH=/ruta/node_modules-con-jsdom \
 ```
 Opcionales: `SKIP_BUILD=1`, `E2E_SKIP_REGRESSION=1`. `run-e2e.sh` acepta además `E2E_SKIP_V2=1` (solo fases extra) y `E2E_AFTER` (comando extra antes del cleanup); ya no detiene el Postgres del Moodle local si no lo arrancó él.
 
+### V2.1 F2: proveedores reales contra fakes (E4)
+- `fakes.js` suma `startProviderFakes` (Gamma `POST/GET /generations`, export PDF; OpenAI `POST /v1/audio/speech` con `x-request-id`; Anthropic `POST /v1/messages` con `usage` e `id`), todo en 127.0.0.1 y con su clave falsa, y el MP4 del Videogen falso ahora trae una caja `moov/mvhd` real (468 s).
+- `e2e-v3.js` agrega **E4**: run v3 con `providerModes` REAL (default) → 409 `budget_approval_required` (el preflight de proveedores pasó) → `ADMIN_APPROVED` → Gamma/TTS/guion LLM por el `dynamic-provider-worker` contra los fakes → empaque v3 con el PDF/PNG/MP3 de los fakes → ledger `CALCULATED_FROM_USAGE` por id externo; netguard 0. E1–E3 verifican además la duración medida del `mvhd` (`durationSource: mp4_mvhd`).
+- `E2E_V3_ONLY=real-providers` corre solo arranque + workers + E4 (sin E1–E3 ni restores de Moodle), p. ej. `E2E_V3_ONLY=real-providers E2E_SKIP_V2=1 E2E_AFTER="node test/e2e-v2/e2e-v3.js" bash test/e2e-v2/run-e2e.sh`.
+
 ### R13 fix round 1 (review G6)
 - **Proveedores, medido:** `providers.js` clasifica por proveedor pagado (Anthropic, OpenAI, Gamma, Videogen, YouTube Data/upload/OAuth) cada intento saliente registrado por netguard (app, workers y ahora también la regresión, que corre con `NODE_OPTIONS=--require netguard.js` y un entorno limpio `env -i` sin claves del shell), por el navegador simulado y por Chrome (CDP `Network.requestWillBeSent` en la página y en cada iframe/worker adjuntado; red de Chrome restringida con `--host-resolver-rules` a 127.0.0.1 + hosts de reproducción de YouTube, también en los checks de Chrome de la regresión vía `CURSIA_CHROME_HOST_RESOLVER_RULES`). El resumen imprime la tabla medida por alcance.
 - **QA visual:** segunda pasada con todo abierto (`<details>`, revelados, cada pestaña); con forceclean=1, `extractText` de cada label = el de sin forceclean (100 %, por label), conteos exactos por capítulo y las mismas métricas visuales; overflow medido contra el ancho configurado (también en emulación móvil).

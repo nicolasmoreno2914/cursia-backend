@@ -920,6 +920,9 @@ async function dbChecks() {
     // ── Servicios compilados contra la DB real ──────────────────────────
     process.env.DYNAMIC_COURSE_STRUCTURE = 'true';
     process.env.DYNAMIC_MANIFEST_RULES_VERSION = '3';
+    // V2.1 F2: el preflight de startRun exige claves/themeIds para Gamma/TTS reales (valores FALSOS, 0 red).
+    require('./lib/provider-test-env').applyFakeProviderEnv();
+    process.env.DYNAMIC_VIDEO_DELIVERY = 'youtube'; // V2.1 F2: v3 con videos exige YouTube (también en mock)
     delete process.env.DYNAMIC_V2_ALLOWED_OWNERS;
     delete process.env.ALLOW_UNOWNED_COURSES;
     ds = new DataSource({ type: 'postgres', host: '127.0.0.1', port, username: 'postgres', database: DB, entities: [], synchronize: false });
@@ -982,6 +985,8 @@ async function dbChecks() {
         `insert into public.production_jobs (owner_id, course_id, execution_mode, status, worker_status, current_step, progress, input_payload, output_summary, options, result)
          values ($1, $2, 'dynamic_generation', 'completed', 'completed', 'dynamic_generation', 100, $3::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb) returning id`,
         [OWNER, cidX, JSON.stringify({ manifestId: m.id, blueprintNumber: bpNumber, contextHash: canonicalContextHash(ctx), videoMode: 'mock',
+          // V2.1 F2: un run v3 con videos se congela con entrega YouTube (preflight v3_requires_youtube_delivery).
+          videoDelivery: 'youtube',
           providerModes: { presentation: 'real', audio: 'real' }, ...extraPayload })]);
       await ds.query(`insert into public.generation_run_contexts (job_id, manifest_id, context, context_hash) values ($1, $2, $3::jsonb, $4)`,
         [job.id, m.id, JSON.stringify(ctx), canonicalContextHash(ctx)]);

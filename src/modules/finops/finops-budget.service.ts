@@ -327,9 +327,20 @@ export class FinopsBudgetService {
    * Antes de un envío pagado NUEVO: committed = actual(run) + reservas + next
    * <= authorized_budget del run. Sin autorización ⇒ BLOCK (fail closed).
    */
-  async guardPaidSubmission(a: { runId: string; itemRunId: string; itemType: string }): Promise<RuntimeGuardResult & { authorizedBudget: string | null }> {
-    const provider = paidProviderOfItemType(a.itemType);
-    if (!provider) throw new FinopsError('INVALID_INPUT', `guardPaidSubmission: ${a.itemType} no es un item de proveedor pagado`);
+  async guardPaidSubmission(a: {
+    runId: string;
+    itemRunId: string;
+    itemType: string;
+    /**
+     * V2.1 F2: proveedor de ESTA llamada cuando el item paga más de uno (audiobook_chapter:
+     * el guion LLM server-side = 'anthropic', antes del TTS = 'openai'). Default: el
+     * proveedor pagado del item type.
+     */
+    provider?: string;
+  }): Promise<RuntimeGuardResult & { authorizedBudget: string | null }> {
+    const itemProvider = paidProviderOfItemType(a.itemType);
+    if (!itemProvider) throw new FinopsError('INVALID_INPUT', `guardPaidSubmission: ${a.itemType} no es un item de proveedor pagado`);
+    const provider = a.provider ?? itemProvider;
     const [authorizedBudget, actualSoFar, reservedInFlight, next] = await Promise.all([
       this.runPaidAuthorizedBudget(a.runId),
       this.runActual(a.runId),

@@ -97,4 +97,14 @@ export class RetryItemDto {
   @IsOptional()
   @IsBoolean()
   resubmitVideo?: boolean;
+
+  /**
+   * V2.1 F2 fix round 1: decisión humana explícita para un item de Gamma
+   * (`presentation`) en 'failed' con `gamma_submit_ambiguous` o
+   * `gamma_generation_failed`: archiva el generationId/marcador y pide una
+   * generación NUEVA (pasa por el gate de presupuesto como todo retry pagado).
+   */
+  @IsOptional()
+  @IsBoolean()
+  resubmitProvider?: boolean;
 }

@@ -58,8 +58,10 @@ export interface YoutubeUploadOptions {
    * el MP4 y ANTES del primer contacto con YouTube. El worker dynamic escribe
    * ahí el marcador de subida, así un crash durante la descarga no queda como
    * "subida ambigua". Si lanza, la subida se aborta sin tocar YouTube.
+   * V2.1 F2 (aditivo): recibe los bytes del MP4 ya descargado (el worker mide
+   * la duración desde la caja `mvhd` ANTES de subir); el legacy no lo usa.
    */
-  onBeforeUpload?: () => Promise<void>;
+  onBeforeUpload?: (mp4?: Buffer) => Promise<void>;
 }
 
 export interface YoutubeUploadResult {
@@ -155,7 +157,7 @@ export class YoutubeUploadService {
       );
     }
 
-    if (options.onBeforeUpload) await options.onBeforeUpload();
+    if (options.onBeforeUpload) await options.onBeforeUpload(fileBuffer);
 
     // ── 3. Iniciar upload resumable en YouTube ────────────────────────────
     const metadata = {

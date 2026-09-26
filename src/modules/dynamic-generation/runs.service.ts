@@ -52,6 +52,14 @@ import {
   resolveProviderModes,
   sameProviderModes,
 } from './provider-modes';
+import {
+  PROVIDER_NOT_READY,
+  V3_REQUIRES_YOUTUBE_DELIVERY,
+  providerNotReadyMessage,
+  providerReadinessMissing,
+  v3RequiresYoutubeMessage,
+  v3VideoDeliveryOk,
+} from './provider-readiness';
 import { INVALIDATION_V3_NOT_IMPLEMENTED, assertInvalidationRulesSupported } from '../invalidation/plan';
 import { latestGenerationPredicate } from './item-generations';
 import { FinopsBudgetService, StartBudgetEvaluation } from '../finops/finops-budget.service';
@@ -278,7 +286,7 @@ export type RegenerationCostKind = 'videogen' | 'llm' | 'none' | 'gamma' | 'tts'
  * Video en run 'real' → Videogen; video 'mock' → nada; presentation (v3) →
  * Gamma; audio_welcome/audiobook_chapter (v3) → TTS; cualquier otro tipo lo
  * genera un LLM (créditos). Gamma/TTS se declaran siempre (sin atajo 'mock'):
- * sus workers en modo real fallan con PROVIDER_NOT_WIRED_V21 hasta R9/R10.
+ * sus workers en modo real llaman a Gamma / OpenAI TTS (V2.1 F2).
  */
 export function regenerationCostKind(type: string, videoMode: RunVideoMode): RegenerationCostKind {
   if (type === 'video') return videoMode === 'real' ? 'videogen' : 'none';
@@ -493,6 +501,12 @@ export class RunsService {
     const videoDelivery = readVideoDeliveryConfig();
     // V2.1 fix round 1 (I1/M1): modos de proveedor explícitos (v3; v1/v2 → undefined).
     const providerModes = this.providerModesForNewRun(manifest.rulesVersion, (courseContext as any)?.providerModes);
+    // V2.1 F2 (review final I1/I2): preflight de proveedores v3 ANTES de cualquier escritura o gasto.
+    if (providerModes) {
+      const gate = resolveRunVideoDelivery({ videoCount: this.videoCountOf(manifest), videoMode, configured: videoDelivery });
+      // Un gate de entrega inválido lo rechaza más abajo enforceVideoGate con su propio 409.
+      this.assertV3ProviderPreflight(manifest, providerModes, videoMode, gate.ok ? gate.strategy : null);
+    }
     // I1 (review-rv2): nunca dos generaciones completas activas del mismo
     // curso (doble gasto) — p.ej. un run v1 en curso y la config pasa a v2.
     // Chequeo temprano (409 legible); la garantía bajo concurrencia la dan
@@ -518,6 +532,37 @@ export class RunsService {
       throw new NotImplementedException({ message: providerWorkerNotDeployedMessage(), code: 'PROVIDER_WORKER_NOT_DEPLOYED' });
     }
     return modes;
+  }
+
+  /**
+   * V2.1 F2 (review final I1/I2): un run v3 solo nace si puede terminar.
+   * - cada proveedor congelado en `real` está cableado y configurado → si no,
+   *   409 `provider_not_ready` con la lista de lo que falta (nombres, nunca valores);
+   * - con videos, la entrega congelada es YouTube → si no, 409
+   *   `v3_requires_youtube_delivery` (video_interactions necesita el id de YouTube).
+   * Puro sobre el entorno actual; se llama antes de escribir nada. El gate de
+   * presupuesto (RF) corre después, igual que antes.
+   */
+  private assertV3ProviderPreflight(
+    manifest: ManifestDto,
+    providerModes: ProviderModes,
+    videoMode: RunVideoMode,
+    frozenDelivery: VideoDeliveryStrategy | null,
+    videoCount: number = this.videoCountOf(manifest),
+  ): void {
+    if (manifest.rulesVersion !== 3) return;
+    const missing = providerReadinessMissing({ providerModes, videoMode, videoCount });
+    if (missing.length > 0) {
+      throw new ConflictException({ message: providerNotReadyMessage(missing), code: PROVIDER_NOT_READY, missing });
+    }
+    if (frozenDelivery !== null && !v3VideoDeliveryOk(videoCount, frozenDelivery)) {
+      throw new ConflictException({
+        message: v3RequiresYoutubeMessage(frozenDelivery),
+        code: V3_REQUIRES_YOUTUBE_DELIVERY,
+        videoCount,
+        videoDelivery: frozenDelivery,
+      });
+    }
   }
 
   /**
@@ -572,6 +617,11 @@ export class RunsService {
     const ctxA = await this.loadContextRow(rowA.id);
     const videoMode = this.videoModeOf(rowA);
     const videoDelivery = frozenVideoDeliveryOf(rowA.input_payload);
+    // V2.1 F2 (review final I1): B hereda los modos congelados de A → mismo preflight antes de escribir nada.
+    {
+      const inherited = frozenProviderModesOf(rowA.input_payload);
+      if (manifestB.rulesVersion === 3 && inherited) this.assertV3ProviderPreflight(manifestB, inherited, videoMode, videoDelivery);
+    }
     const [bpA, bpB] = await Promise.all([
       this.manifests.blueprintOfForRules(courseId, ownerId, bpNumberA, manifestA.rulesVersion),
       this.manifests.blueprintOfForRules(courseId, ownerId, blueprintNumber, manifestB.rulesVersion),
@@ -1103,6 +1153,7 @@ export class RunsService {
     runId: string,
     itemKey: string,
     resubmitVideo = false,
+    resubmitProvider = false,
   ): Promise<ItemRunDto> {
     // G3 (fix wave / review I1): un retry es un entry point como cualquier
     // otro — requiere la allow-list de V2, antes de tocar manifest o run.
@@ -1234,6 +1285,22 @@ export class RunsService {
       // del retry normal, para que el worker someta de nuevo en vez de
       // reutilizar/quedar envenenado por el marcador anterior.
       let resubmitSetSql = '';
+      // V2.1 F2 fix round 1: reenvío EXPLÍCITO de una generación de Gamma cuyo envío quedó ambiguo o falló
+      // en Gamma. Archiva el id/marcador (su reserva pendiente sigue en el ledger) y el worker pide una nueva.
+      if (resubmitProvider) {
+        if (resubmitVideo) throw new BadRequestException('resubmitVideo y resubmitProvider son excluyentes');
+        if (target.type !== 'presentation') {
+          throw new BadRequestException(`resubmitProvider solo aplica a items type="presentation"; "${itemKey}" es "${target.type}"`);
+        }
+        const err = target.error ?? '';
+        if (!(err.startsWith('gamma_submit_ambiguous') || err.startsWith('gamma_generation_failed'))) {
+          throw new BadRequestException(
+            `resubmitProvider solo aplica cuando el último error es "gamma_submit_ambiguous" o "gamma_generation_failed"; "${itemKey}" falló con "${err}"`,
+          );
+        }
+        this.logger.warn(`retryItem: resubmitProvider=true para "${itemKey}" (run ${job.id}) — error previo "${err}"; archivando la generación anterior`);
+        resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt'`;
+      }
       if (resubmitVideo) {
         if (target.type !== 'video') {
           throw new BadRequestException(`resubmitVideo solo aplica a items type="video"; "${itemKey}" es "${target.type}"`);
@@ -1261,7 +1328,7 @@ export class RunsService {
                       'retriedAt', now()
                     ))
                   )`;
-      const outputSummaryExpr = resubmitVideo
+      const outputSummaryExpr = resubmitVideo || resubmitProvider
         ? `((${previousErrorsExpr}) || jsonb_build_object(
                     'previousExternals',
                     coalesce(output_summary->'previousExternals', '[]'::jsonb) || jsonb_build_array(jsonb_build_object(

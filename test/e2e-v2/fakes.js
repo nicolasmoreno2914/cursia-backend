@@ -108,9 +108,129 @@ function startHttpsVideos(tlsDir, videogen) {
     downloads.push(m[1]);
     rs.writeHead(200, { 'content-type': 'video/mp4' });
     // ≥ 1 KB: YoutubeUploadService (legacy) rechaza archivos < 1024 bytes como vacíos (fase YouTube, DN-1).
-    rs.end(Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypmp42'), Buffer.from(`fake-mp4:${m[1]}`), Buffer.alloc(4096, 0)]));
+    // V2.1 F2: MP4 sintético con una caja `moov/mvhd` REAL (468 s) → el worker mide la duración al subir.
+    rs.end(syntheticMp4WithMvhd(468, `fake-mp4:${m[1]}`));
   });
   return { srv, downloads };
+}
+
+/**
+ * V2.1 F2: MP4 mínimo con cajas válidas: ftyp + moov/mvhd (v0, timescale 1000) + free
+ * (etiqueta + relleno ≥ 4 KB). `parseMp4DurationSec` lee `durationSec` exacto.
+ */
+function syntheticMp4WithMvhd(durationSec, tag = 'fake-mp4') {
+  const box = (type, body) => { const h = Buffer.alloc(8); h.writeUInt32BE(8 + body.length, 0); h.write(type, 4, 'latin1'); return Buffer.concat([h, body]); };
+  const ftyp = box('ftyp', Buffer.concat([Buffer.from('mp42'), Buffer.alloc(4, 0), Buffer.from('mp42')]));
+  const mvhd = Buffer.alloc(100, 0);
+  mvhd.writeUInt32BE(0, 0); // version 0 + flags
+  mvhd.writeUInt32BE(1000, 12); // timescale
+  mvhd.writeUInt32BE(Math.round(durationSec * 1000), 16); // duration
+  mvhd.writeUInt32BE(0x00010000, 20); // rate 1.0
+  mvhd.writeUInt16BE(0x0100, 24); // volume 1.0
+  mvhd.writeUInt32BE(2, 96); // next_track_ID
+  const moov = box('moov', box('mvhd', mvhd));
+  const free = box('free', Buffer.concat([Buffer.from(String(tag)), Buffer.alloc(4096, 0)]));
+  return Buffer.concat([ftyp, moov, free]);
+}
+
+// ─── V2.1 F2: proveedores FALSOS (Gamma, OpenAI TTS, Anthropic) en 127.0.0.1 ────
+// Un solo servidor HTTP con las rutas de los tres (misma forma que las APIs reales
+// que usa el worker): POST /generations, GET /generations/:id, GET /exports/:id.pdf
+// (Gamma); POST /v1/audio/speech (OpenAI); POST /v1/messages (Anthropic). Cada
+// proveedor exige SU clave (401 si no). `plan` programa fallos/esperas para las
+// pruebas de reanudación. Registra cada llamada (sin guardar las claves).
+function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp3, pdfPages = 10, readyAfterPolls = 1 }) {
+  const st = { gammaPosts: [], gammaGets: [], exports: [], tts: [], llm: [], badAuth: [], seq: 0 };
+  const gens = new Map(); // id → {polls}
+  // Un valor numérico en gammaPostFail/ttsFail/llmFail = ese status HTTP; 'drop' = se corta la conexión DESPUÉS de recibir el pedido.
+  const plan = { gammaPostFail: [], gammaHoldPending: false, gammaFailGeneration: false, gammaNoCredits: false, ttsFail: [], llmFail: [], llmShortFirst: 0 };
+  let base = null;
+  const words = (n, seed) => Array.from({ length: n }, (_, i) => ['proceso', 'equipo', 'seguridad', 'medición', 'ajuste', 'práctica', 'turno', 'planta'][(i + seed) % 8]).join(' ') + '.';
+  const srv = http.createServer((rq, rs) => {
+    const chunks = [];
+    rq.on('data', (c) => chunks.push(c));
+    rq.on('end', () => {
+      const u = new URL(rq.url, 'http://x');
+      const p = u.pathname;
+      const body = Buffer.concat(chunks).toString('utf8');
+      const json = (code, obj, headers = {}) => { rs.writeHead(code, { 'content-type': 'application/json', ...headers }); rs.end(JSON.stringify(obj)); };
+      let m;
+      // ── Gamma ──
+      if (p === '/generations' || p.startsWith('/generations/')) {
+        if (rq.headers['x-api-key'] !== gammaKey) { st.badAuth.push(`gamma ${rq.method} ${p}`); return json(401, { message: 'invalid api key' }); }
+        if (rq.method === 'POST' && p === '/generations') {
+          const req = JSON.parse(body || '{}');
+          st.gammaPosts.push(req);
+          const f = plan.gammaPostFail.shift();
+          if (f === 'drop') return rq.socket.destroy();
+          if (typeof f === 'number') return json(f, { message: `fake ${f}` });
+          const id = `gen_f2_${++st.seq}`;
+          gens.set(id, { polls: 0 });
+          return json(200, { generationId: id });
+        }
+        if (rq.method === 'GET' && (m = p.match(/^\/generations\/([^/]+)$/))) {
+          const g = gens.get(m[1]);
+          st.gammaGets.push(m[1]);
+          if (!g) return json(404, { message: 'not found' });
+          g.polls++;
+          if (plan.gammaHoldPending || g.polls <= readyAfterPolls) return json(200, { generationId: m[1], status: 'pending' });
+          if (plan.gammaFailGeneration) return json(200, { generationId: m[1], status: 'failed', error: { message: 'fake failure' }, credits: { deducted: 5, remaining: 995 } });
+          return json(200, {
+            generationId: m[1], status: 'completed', gammaId: `g_${m[1]}`, gammaUrl: `https://gamma.app/docs/${m[1]}`,
+            exportUrl: `${base}/exports/${m[1]}.pdf`, ...(plan.gammaNoCredits ? {} : { credits: { deducted: 42, remaining: 958 } }),
+          });
+        }
+      }
+      if (rq.method === 'GET' && (m = p.match(/^\/exports\/([^/]+)\.pdf$/))) {
+        st.exports.push(m[1]);
+        rs.writeHead(200, { 'content-type': 'application/pdf' });
+        return rs.end(makePdf(pdfPages));
+      }
+      // ── OpenAI TTS ──
+      if (rq.method === 'POST' && p === '/v1/audio/speech') {
+        if (rq.headers.authorization !== `Bearer ${openaiKey}`) { st.badAuth.push('openai speech'); return json(401, { error: { message: 'bad key' } }); }
+        const req = JSON.parse(body || '{}');
+        const f = plan.ttsFail.shift();
+        if (f === 'drop') { st.tts.push({ ...req, failed: 'drop' }); return rq.socket.destroy(); }
+        if (typeof f === 'number') { st.tts.push({ ...req, failed: f }); return json(f, { error: { message: `fake ${f}` } }); }
+        const rid = `req_f2_${++st.seq}`;
+        st.tts.push({ model: req.model, voice: req.voice, chars: String(req.input || '').length, requestId: rid, response_format: req.response_format });
+        // ~2.5 palabras/s → duración proporcional al texto (segundos enteros, ≥ 1).
+        const secs = Math.max(1, Math.round(String(req.input || '').split(/\s+/).length / 2.5));
+        rs.writeHead(200, { 'content-type': 'audio/mpeg', 'x-request-id': rid });
+        return rs.end(makeMp3(secs));
+      }
+      // ── Anthropic ──
+      if (rq.method === 'POST' && p === '/v1/messages') {
+        if (rq.headers['x-api-key'] !== anthropicKey) { st.badAuth.push('anthropic messages'); return json(401, { type: 'error', error: { message: 'bad key' } }); }
+        const req = JSON.parse(body || '{}');
+        const lf = plan.llmFail.shift();
+        if (lf === 'drop') { st.llm.push({ failed: 'drop', model: req.model }); return rq.socket.destroy(); }
+        if (typeof lf === 'number') { st.llm.push({ failed: lf, model: req.model }); return json(lf, { type: 'error', error: { message: `fake ${lf}` } }); }
+        const id = `msg_f2_${++st.seq}`;
+        const short = plan.llmShortFirst > 0;
+        if (short) plan.llmShortFirst--;
+        const isCont = /CONTINUAR/.test(String(req.system || ''));
+        const text = isCont ? words(180, st.seq) : short ? words(200, st.seq) : words(430, st.seq);
+        st.llm.push({ id, model: req.model, maxTokens: req.max_tokens, continuation: isCont });
+        return json(200, {
+          id, type: 'message', role: 'assistant', model: req.model, stop_reason: 'end_turn',
+          content: [{ type: 'text', text }],
+          usage: { input_tokens: 1200, output_tokens: isCont ? 260 : 640, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+        }, { 'request-id': `req_llm_${st.seq}` });
+      }
+      json(404, { error: `unhandled ${rq.method} ${p}` });
+    });
+  });
+  return {
+    srv, st, plan,
+    async listen() {
+      await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+      base = `http://127.0.0.1:${srv.address().port}`;
+      return { gammaUrl: base, openaiUrl: `${base}/v1`, anthropicUrl: base };
+    },
+    close: () => new Promise((r) => srv.close(() => r())),
+  };
 }
 
 // Google FALSO (DN-1): OAuth token (refresh), channels.list mine=true y subida
@@ -197,4 +317,4 @@ async function startFakes({ tlsDir, videogenKey }) {
   };
 }
 
-module.exports = { startFakes };
+module.exports = { startFakes, startStorage, startProviderFakes, syntheticMp4WithMvhd };

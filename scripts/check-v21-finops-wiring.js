@@ -470,7 +470,12 @@ async function dbChecks() {
     delete process.env.ALLOW_UNOWNED_COURSES;
     process.env.DYNAMIC_REAL_VIDEO_OWNERS = OWNER;
     process.env.DYNAMIC_MANIFEST_RULES_VERSION = '3';
-    process.env.DYNAMIC_VIDEO_DELIVERY = 'videogen_direct';
+    // V2.1 F2: un run v3 con videos exige entrega YouTube al crearse (409 v3_requires_youtube_delivery);
+    // los checks de ledger del worker de Videogen de este archivo prueban la rama videogen_direct, así que
+    // startRunT reescribe la entrega congelada DESPUÉS de crear el run (fixture; ver startRunT).
+    process.env.DYNAMIC_VIDEO_DELIVERY = 'youtube';
+    // V2.1 F2: preflight de proveedores reales (Gamma/TTS/LLM) — claves y themeIds FALSOS, 0 red.
+    require('./lib/provider-test-env').applyFakeProviderEnv();
     process.env.DYNAMIC_ALLOW_VIDEOGEN_DIRECT = 'true';
     process.env.VIDEOGEN_API_KEY = 'fake-key-never-used-no-network';
     process.env.DYNAMIC_PROVIDER_WORKER_ENABLED = 'true'; // R5: sin él, runs v3 con Gamma/TTS → 501
@@ -484,6 +489,14 @@ async function dbChecks() {
     const budget = new F.FinopsBudgetService(ds, ledger);
     const ytOk = { async check() { return { ok: true }; } };
     const runs = new RunsService(ds, manifests, {}, ytOk, budget);
+    /** startRun + (fixture F2) entrega congelada → videogen_direct para los checks de ledger del worker de Videogen. */
+    const startRunT = async (...a) => {
+      const res = await runs.startRun(...a);
+      if (res && res.run && res.run.id) {
+        await ds.query(`update public.production_jobs set input_payload = input_payload || '{"videoDelivery":"videogen_direct"}'::jsonb where id = $1`, [res.run.id]);
+      }
+      return res;
+    };
     const sched = new SchedulerService(ds, runs);
     const admin = new FinopsAdminController(ledger, budget);
     const ADMIN_USER = { id: 'admin-1', email: 'admin@cursia.test' };
@@ -548,7 +561,7 @@ async function dbChecks() {
     const A = await makeCourse('Curso mock');
     let runA = null;
     await check('DB gate: run MOCK → AUTO_WITHIN_POLICY sin aprobación; estimado (sin items de worker) guardado con run_id + autorización AUTO vinculada', async () => {
-      const res = await runs.startRun(A.cid, OWNER, 1, MOCK_CTX);
+      const res = await startRunT(A.cid, OWNER, 1, MOCK_CTX);
       eq(res.created, true, 'creado');
       runA = res.run.id;
       const auths = await ds.query(`select decision, authorized_budget::text as b, estimate_id from public.cost_budget_authorizations where run_id = $1`, [runA]);
@@ -563,7 +576,7 @@ async function dbChecks() {
 
     await check('DB gate (merge R5): video MOCK pero Gamma/TTS en su default REAL → 409 budget_approval_required (el modo de video no decide el gasto de proveedores)', async () => {
       const P = await makeCourse('Curso providers reales');
-      const err = await rejectsRe(runs.startRun(P.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' }), /budget_approval_required/, 'providers reales', 409);
+      const err = await rejectsRe(startRunT(P.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' }), /budget_approval_required/, 'providers reales', 409);
       eq(err.getResponse().paidRealProviders, ['gamma', 'openai'], 'proveedores');
     });
 
@@ -572,7 +585,7 @@ async function dbChecks() {
     let runB = null;
     let rejectedEstimateId = null;
     await check('DB gate: run REAL sin aprobación → 409 budget_approval_required con estimateId + totales; nada creado; estimado guardado sin run', async () => {
-      const err = await rejectsRe(runs.startRun(Bc.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /budget_approval_required/, 'real sin aprobación', 409);
+      const err = await rejectsRe(startRunT(Bc.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /budget_approval_required/, 'real sin aprobación', 409);
       const body = err.getResponse();
       rejectedEstimateId = body.estimateId;
       assert(/estimateId=[0-9a-f-]{36}/.test(body.message) && /totalsJson=/.test(body.message), 'el mensaje (aplanado por el filtro global) lleva estimateId y totales');
@@ -588,7 +601,7 @@ async function dbChecks() {
       await rejectsRe(admin.authorize(Bc.cid, { estimateId: rejectedEstimateId, authorizedBudget: '100', amount: 1 }, ADMIN_USER), /campo no permitido/, 'campo extra', 400);
       const a = await admin.authorize(Bc.cid, { estimateId: rejectedEstimateId, authorizedBudget: '100', reason: 'test' }, ADMIN_USER);
       eq([a.decision, a.approvedBy, a.runId, dec(a.authorizedBudget)], ['ADMIN_APPROVED', 'admin@cursia.test', null, 100], 'fila de aprobación');
-      const res = await runs.startRun(Bc.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' });
+      const res = await startRunT(Bc.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' });
       eq(res.created, true, 'run real creado');
       runB = res.run.id;
       const bound = await ds.query(`select decision, estimate_id, approved_by, reason, authorized_budget::text as b from public.cost_budget_authorizations where run_id = $1`, [runB]);
@@ -916,10 +929,10 @@ async function dbChecks() {
     const E = await makeCourse('Curso I1');
     let runE = null;
     await check('DB I1 setup: run real E con aprobación ADMIN justa, gasto que la agota y una autorización AUTO_WITHIN_POLICY enorme posterior', async () => {
-      const err = await rejectsRe(runs.startRun(E.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /budget_approval_required/, 'pide aprobación', 409);
+      const err = await rejectsRe(startRunT(E.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /budget_approval_required/, 'pide aprobación', 409);
       const b = err.getResponse();
       await admin.authorize(E.cid, { estimateId: b.estimateId, authorizedBudget: b.estimate.expected }, ADMIN_USER);
-      runE = (await runs.startRun(E.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' })).run.id;
+      runE = (await startRunT(E.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' })).run.id;
       const it = await itemRow(runE, `content:${E.c1}`);
       const r = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_e_big', usage: { input_tokens: 1000000, output_tokens: 5000000 } }));
       eq(r.status, 200, 'gasto LLM');
@@ -982,11 +995,11 @@ async function dbChecks() {
 
     await check('DB I1 reopen: run real cancelado con videos/proveedores por enviar → 409; con aprobación ADMIN del run (POST authorizations {runId}) → se reabre', async () => {
       await runs.cancelRun(E.cid, OWNER, 1, runE);
-      await rejectsRe(runs.startRun(E.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /budget_approval_required/, 'reopen', 409);
+      await rejectsRe(startRunT(E.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /budget_approval_required/, 'reopen', 409);
       await rejectsRe(admin.authorize(E.cid, { runId: runE, estimateId: crypto.randomUUID(), authorizedBudget: '1' }, ADMIN_USER), /exactamente uno/, 'runId y estimateId', 400);
       const a = await admin.authorize(E.cid, { runId: runE, authorizedBudget: '100000' }, ADMIN_USER);
       eq([a.runId, a.decision, a.estimateId], [runE, 'ADMIN_APPROVED', null], 'aprobación del run');
-      const res = await runs.startRun(E.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' });
+      const res = await startRunT(E.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' });
       eq([res.reopened, res.run.id], [true, runE], 'reabierto');
     });
 
@@ -994,9 +1007,9 @@ async function dbChecks() {
       const Cc = await makeCourse('Curso bloqueado');
       await ds.query(`insert into public.cost_budget_policies (scope, scope_id, version, limits, on_exceed) values ('course', $1, 1, $2::jsonb, 'BLOCK')`,
         [String(Cc.cid), JSON.stringify({ maxCostPerRun: '0.0001' })]);
-      await rejectsRe(runs.startRun(Cc.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /budget_blocked/, 'bloqueado', 409);
+      await rejectsRe(startRunT(Cc.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /budget_blocked/, 'bloqueado', 409);
       // Mock con la misma política: el LLM sobre el límite pide aprobación (nunca BLOCK).
-      await rejectsRe(runs.startRun(Cc.cid, OWNER, 1, MOCK_CTX), /budget_approval_required/, 'LLM sobre el límite', 409);
+      await rejectsRe(startRunT(Cc.cid, OWNER, 1, MOCK_CTX), /budget_approval_required/, 'LLM sobre el límite', 409);
     });
   } finally {
     if (app) await app.close().catch(() => {});

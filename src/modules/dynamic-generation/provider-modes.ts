@@ -3,9 +3,9 @@
  * rulesVersion 3, congelado en `production_jobs.input_payload.providerModes`
  * al crear el run. Nunca se deriva de `videoMode`.
  *
- *  - Default (y único valor de producción): `real`. Mientras R9/R10 no cablean
- *    los proveedores, un item `real` falla FUERTE con PROVIDER_NOT_WIRED_V21 al
- *    ejecutarse (nunca una salida falsa marcada `completed`).
+ *  - Default (y único valor de producción): `real`. V2.1 F2: Gamma y TTS están
+ *    cableados; startRun exige que estén configurados (provider-readiness.ts,
+ *    409 `provider_not_ready`) antes de escribir nada.
  *  - `mock` solo si se pide EXPLÍCITAMENTE en el body (`providerModes`) Y el
  *    entorno lo permite (`DYNAMIC_ALLOW_PROVIDER_MOCK=true`, escape de
  *    no-producción, como DYNAMIC_ALLOW_VIDEOGEN_DIRECT). El worker lo vuelve a
