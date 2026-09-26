@@ -67,8 +67,24 @@ if ($cmd === 'restore') {
     $modinfo = get_fast_modinfo($course);
     $cms = array_values(array_filter($modinfo->get_cms(), fn($cm) => $cm->modname === 'h5pactivity'));
     $out['h5pactivityCount'] = count($cms);
+    // Resumen por actividad (varias actividades: prueba del reproductor real, review G4 I4).
+    $out['cms'] = [];
+    foreach ($cms as $c) {
+        $cctx = context_module::instance($c->id);
+        $crec = $DB->get_record('h5pactivity', ['id' => $c->instance], '*', MUST_EXIST);
+        $ccm = $DB->get_record('course_modules', ['id' => $c->id], '*', MUST_EXIST);
+        $cgi = grade_item::fetch(['courseid' => $courseid, 'itemtype' => 'mod', 'itemmodule' => 'h5pactivity',
+            'iteminstance' => $c->instance, 'itemnumber' => 0]);
+        $cfiles = [];
+        foreach (get_file_storage()->get_area_files($cctx->id, 'mod_h5pactivity', 'package', false, 'filename', false) as $f) {
+            $cfiles[] = ['filename' => $f->get_filename(), 'contenthash' => $f->get_contenthash()];
+        }
+        $out['cms'][] = ['cmid' => (int)$c->id, 'instance' => (int)$c->instance, 'name' => $crec->name, 'contextid' => (int)$cctx->id,
+            'grade' => (int)$crec->grade, 'completion' => (int)$ccm->completion, 'completionpassgrade' => (int)$ccm->completionpassgrade,
+            'gradepass' => $cgi ? (float)$cgi->gradepass : null, 'grademax' => $cgi ? (float)$cgi->grademax : null, 'package' => $cfiles];
+    }
     if (count($cms) !== 1) {
-        v21v_out($out, 1);
+        v21v_out($out, count($cms) > 1 ? 0 : 1);
     }
     $cm = $cms[0];
     $ctx = context_module::instance($cm->id);
@@ -85,6 +101,12 @@ if ($cmd === 'restore') {
         'showdescription' => (int)$cmrec->showdescription, 'visible' => (int)$cmrec->visible];
     $out['introRaw'] = $rec->intro;
     $out['introFormatted'] = format_module_intro('h5pactivity', $rec, $cm->id);
+    // forceclean=1 SOLO en memoria para esta llamada (no se guarda la configuración del sitio).
+    $prevforceclean = $CFG->forceclean ?? null;
+    $CFG->forceclean = true;
+    $out['introFormattedForceclean'] = format_module_intro('h5pactivity', $rec, $cm->id);
+    $CFG->forceclean = $prevforceclean;
+    $out['forcecleanSetting'] = get_config('core', 'forceclean');
     $out['wwwroot'] = $CFG->wwwroot;
     $files = [];
     foreach (['package', 'intro'] as $area) {

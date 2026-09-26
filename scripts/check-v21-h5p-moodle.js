@@ -90,6 +90,13 @@ const packages = [
         { question: '¿Qué limpia el lecho?', answers: [{ text: 'Retrolavado', correct: true }, { text: 'Cloración', correct: false }] },
       ],
     }),
+    // Forma REAL de SCS 1.11 (review G4 C1/I4): hijos con ?subContentId=<uuid> y padre
+    // 'answered' SIN result.completion ⇒ Moodle no califica (ver moodle-grading.ts).
+    interactionTypes: ['choice', 'choice', 'choice', 'choice'],
+    parentVerb: 'answered',
+    parentCompletion: false,
+    passScenario: { ...PASS, expectedGrade: null, expectedCompletion: 'INCOMPLETE' },
+    failScenario: { ...FAIL, expectedGrade: null, expectedCompletion: 'INCOMPLETE' },
   },
   {
     key: 'dragtext',
@@ -148,8 +155,10 @@ const packages = [
       subContentIds: b.subContentIds,
       interactionTypes: p.interactionTypes || [],
       maxScore: b.maxScore,
-      passScenario: PASS,
-      failScenario: FAIL,
+      passScenario: p.passScenario || PASS,
+      failScenario: p.failScenario || FAIL,
+      parentVerb: p.parentVerb || 'completed',
+      parentCompletion: p.parentCompletion !== false,
     });
   }
   if (libsDir) {

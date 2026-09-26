@@ -15,14 +15,42 @@
 // Solo hex, fondo sólido, margin/padding/border, flujo de bloques; nada depende
 // de iframe, aria ni display.
 //
-// Mejora progresiva (solo con forceclean=0): un <style> oculta el iframe inline
-// y el enlace "Abrir…" en la propia página view.php de la actividad, donde
-// Moodle ya muestra su reproductor principal debajo del intro (evita dos
-// reproductores en la misma página).
+// Carga diferida y sin rutas fijas (review G4 I2/I3):
+// - El iframe NO lleva `src`: la URL va en `data-cursia-src` y un script inline
+//   (namespaced `window.CursiaIV`, idempotente) la asigna cuando el iframe se
+//   acerca al viewport (IntersectionObserver; sin IO ⇒ inmediato). Así el curso
+//   no arranca N reproductores + N YouTube a la vez.
+// - En la propia view.php de la actividad (Moodle ya muestra su reproductor
+//   principal) el script ELIMINA el bloque inline antes de cargarlo: nunca hay
+//   dos instancias guardando estado xAPI sobre el mismo contexto.
+// - Sin JS el bloque inline queda oculto (display:none) y el enlace visible es
+//   el camino a la actividad.
+// - La URL del embed se deriva del plugin URL reescrito por Moodle:
+//   "@@PLUGINFILE@@/../../../../h5p/embed.php" = <wwwroot>/h5p/embed.php también
+//   con wwwroot en subcarpeta (pluginfile.php/<ctx>/mod_h5pactivity/intro/../../../../).
+// - La lógica del h5p-resizer (MIT, H5P) va inline: no depende de h5plib/vNNN.
 import { esc } from '../../mbz-common';
 
-export const H5P_RESIZER_PATH = '/h5p/h5plib/v128/joubel/core/js/h5p-resizer.js';
-export const H5P_EMBED_PATH = '/h5p/embed.php';
+/** Del filearea intro (pluginfile.php/<ctx>/mod_h5pactivity/intro) a <wwwroot>: 4 niveles. */
+export const H5P_EMBED_FROM_PLUGINFILE = '@@PLUGINFILE@@/../../../../h5p/embed.php';
+
+/**
+ * Script inline (sin `<`, `>` ni `&` para sobrevivir cualquier escape): cargador
+ * diferido + resizer H5P (port de h5p-resizer.js, MIT © Joubel; respeta
+ * window.h5pResizerInitialized para no duplicarse con el de Moodle).
+ */
+export const CURSIA_IV_INLINE_SCRIPT = String.raw`(function(w,d){var C=w.CursiaIV;if(!C){C=w.CursiaIV={v:1};` +
+  String.raw`C.resizer=function(){if(w.h5pResizerInitialized||!w.postMessage||!w.addEventListener){return}w.h5pResizerInitialized=true;` +
+  String.raw`var H={hello:function(f,x,r){f.style.width='100%';f.getBoundingClientRect();var rs=function(){if(f.contentWindow){r('resize')}else{w.removeEventListener('resize',rs)}};w.addEventListener('resize',rs,false);r('hello')},` +
+  String.raw`prepareResize:function(f,x,r){if(f.clientHeight!==x.scrollHeight||x.scrollHeight!==x.clientHeight){f.style.height=x.clientHeight+'px';r('resizePrepared')}},` +
+  String.raw`resize:function(f,x){f.style.height=x.scrollHeight+'px'}};` +
+  String.raw`w.addEventListener('message',function(e){var x=e.data;if(!x||x.context!=='h5p'||!H[x.action]){return}var fs=d.getElementsByTagName('iframe'),f=null;for(var i=0;i!==fs.length;i++){if(fs[i].contentWindow===e.source){f=fs[i];break}}if(!f){return}H[x.action](f,x,function(a,p){p=p||{};p.action=a;p.context='h5p';e.source.postMessage(p,e.origin)})},false)};` +
+  String.raw`C.load=function(f){if(!f.getAttribute('src')){f.setAttribute('src',f.getAttribute('data-cursia-src'))}};` +
+  String.raw`C.scan=function(){var onView=/\/mod\/h5pactivity\/view\.php$/.test(w.location.pathname);var bs=d.querySelectorAll('.cursia-iv-inline');` +
+  String.raw`for(var i=0;i!==bs.length;i++){var b=bs[i];if(b.getAttribute('data-cursia-done')){continue}b.setAttribute('data-cursia-done','1');var root=b.parentNode;var f=b.querySelector('iframe[data-cursia-src]');` +
+  String.raw`if(onView){root.removeChild(b);var o=root.querySelector('.cursia-iv-open');if(o){o.style.display='none'}continue}if(!f){continue}b.style.display='block';` +
+  String.raw`if('IntersectionObserver' in w){(function(f){var io=new w.IntersectionObserver(function(es){for(var j=0;j!==es.length;j++){if(es[j].isIntersecting){io.disconnect();C.load(f)}}},{rootMargin:'400px 0px'});io.observe(f)})(f)}else{C.load(f)}}}}` +
+  String.raw`C.resizer();C.scan()})(window,document);`;
 
 export interface VideoIntroTheme {
   surface: string;
@@ -100,16 +128,14 @@ export function videoInlineIntroHtml(input: VideoInlineIntroInput): string {
   if (errs.length) throw new Error(`VIDEO_INTRO_INVALID: ${errs.join('; ')}`);
   const t = resolveTheme(input.theme);
   const C = VIDEO_INTRO_COPY;
-  const src = `${H5P_EMBED_PATH}?url=@@PLUGINFILE@@/${packageFilename}&amp;component=mod_h5pactivity`;
+  const src = `${H5P_EMBED_FROM_PLUGINFILE}?url=@@PLUGINFILE@@/${packageFilename}&amp;component=mod_h5pactivity`;
   const yt = `https://www.youtube.com/watch?v=${youtubeId}`;
   const viewToken = `$@H5PACTIVITYVIEWBYID*${activityMid}@$`;
   return [
     `<div class="cursia-iv" style="max-width:960px;margin:0 0 16px 0;padding:0;">`,
-    // Mejora progresiva: en view.php de la actividad Moodle ya pinta su reproductor.
-    `<style>#page-mod-h5pactivity-view .cursia-iv-inline,#page-mod-h5pactivity-view .cursia-iv-open{display:none}</style>`,
-    `<div class="cursia-iv-inline" style="margin:0 0 12px 0;padding:0;">`,
-    `<iframe title="${esc(title.trim())}" src="${src}" width="100%" height="560" style="width:100%;border:0;" allowfullscreen="allowfullscreen"></iframe>`,
-    `<script src="${H5P_RESIZER_PATH}"></script>`,
+    // Oculto hasta que el script lo active (sin JS ⇒ solo el bloque de respaldo).
+    `<div class="cursia-iv-inline" style="display:none;margin:0 0 12px 0;padding:0;">`,
+    `<iframe title="${esc(title.trim())}" data-cursia-src="${src}" loading="lazy" width="100%" height="560" style="width:100%;border:0;" allowfullscreen="allowfullscreen"></iframe>`,
     `</div>`,
     `<div class="cursia-iv-fallback" style="background-color:${t.surface};color:${t.textPrimary};border:1px solid ${t.border};border-left:4px solid ${t.accent};padding:12px 16px;margin:0;font-size:15px;line-height:1.5;">`,
     `<p style="margin:0 0 6px 0;color:${t.textPrimary};"><strong>${esc(C.heading)}</strong></p>`,
@@ -117,6 +143,7 @@ export function videoInlineIntroHtml(input: VideoInlineIntroInput): string {
     `<p class="cursia-iv-open" style="margin:0 0 6px 0;"><a href="${viewToken}" style="color:${t.accent};font-weight:bold;">${esc(C.openLink)}</a></p>`,
     `<p style="margin:0;color:${t.textSecondary};"><a class="nomediaplugin" href="${yt}" style="color:${t.textSecondary};">${esc(C.youtubeLink)}</a> ${esc(C.youtubeNote)}</p>`,
     `</div>`,
+    `<script>${CURSIA_IV_INLINE_SCRIPT}</script>`,
     `</div>`,
   ].join('\n');
 }

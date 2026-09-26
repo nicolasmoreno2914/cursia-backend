@@ -54,6 +54,11 @@ export function parseBlankMarkup(
     if (mode === 'blanks') {
       alternatives = part.split('/').map((a) => a.trim());
       if (alternatives.some((a) => a.length === 0)) issues.add(bp, 'alternativa vacía en "/"');
+      // En Blanks "/" SIEMPRE separa alternativas: "km/h" o "1/2" se partirían en respuestas
+      // sueltas y el alumno que escribe "km/h" quedaría mal (review G4 M2). Se rechazan.
+      else if (alternatives.length > 1 && (alternatives.some((a) => a.length < 2) || /\d\s*\/|\/\s*\d/.test(part))) {
+        issues.add(bp, `"/" separa alternativas; "${part}" parece una unidad o fracción (usa otra redacción)`);
+      }
     }
     if (part.length > 80) issues.add(bp, 'respuesta demasiado larga (máx. 80)');
     blanks.push({ answer: alternatives[0], alternatives });

@@ -290,11 +290,108 @@ check('buildVideoActivity rechaza: itemKey ≠ videoItemKey del doc, duración r
 // ── 4. Intro inline ──────────────────────────────────────────────────────
 const INTRO_IN = { packageFilename: 'cursia-video-ch1.h5p', title: 'Matriz de peligros y valoración de riesgos', activityMid: 4242, youtubeId: 'IdwOipZAeqY' };
 
-check('intro: iframe embed.php con @@PLUGINFILE@@ + component + h5p-resizer.js (receta R0)', () => {
+check('intro: iframe con data-cursia-src derivado de @@PLUGINFILE@@ (sin rutas fijas), loading=lazy, sin src', () => {
   const html = h.videoInlineIntroHtml(INTRO_IN);
-  assert(html.includes('<iframe title="Matriz de peligros y valoración de riesgos" src="/h5p/embed.php?url=@@PLUGINFILE@@/cursia-video-ch1.h5p&amp;component=mod_h5pactivity"'), 'iframe src');
-  assert(html.includes('<script src="/h5p/h5plib/v128/joubel/core/js/h5p-resizer.js"></script>'), 'resizer');
-  assert(/allowfullscreen/.test(html), 'allowfullscreen');
+  assert(html.includes('<iframe title="Matriz de peligros y valoración de riesgos" data-cursia-src="@@PLUGINFILE@@/../../../../h5p/embed.php?url=@@PLUGINFILE@@/cursia-video-ch1.h5p&amp;component=mod_h5pactivity" loading="lazy"'), 'iframe');
+  assert(!/<iframe[^>]* src=/.test(html), 'el iframe no debe tener src (carga diferida)');
+  assert(!/h5plib|\/h5p\/embed\.php\?/.test(html.replace('@@PLUGINFILE@@/../../../../h5p/embed.php?', '')), 'ruta fija a h5plib o /h5p/embed.php');
+  assert(!/<script src=/.test(html), 'sin scripts externos');
+  assert(html.includes(`<script>${h.CURSIA_IV_INLINE_SCRIPT}</script>`), 'script inline');
+  assert(!/[<>&]/.test(h.CURSIA_IV_INLINE_SCRIPT), 'el script inline no contiene < > &');
+});
+
+// Simula la reescritura de Moodle (file_rewrite_pluginfile_urls) y la resolución del navegador.
+function resolveEmbed(html, wwwroot, ctx) {
+  const base = `${wwwroot}/pluginfile.php/${ctx}/mod_h5pactivity/intro`;
+  const m = /data-cursia-src="([^"]+)"/.exec(html.split('@@PLUGINFILE@@').join(base));
+  const u = new URL(m[1].replace(/&amp;/g, '&'), `${wwwroot}/course/view.php?id=2`);
+  return u;
+}
+check('intro I3: la URL del embed resuelve a <wwwroot>/h5p/embed.php en raíz Y en subcarpeta (https://x.edu/moodle)', () => {
+  const html = h.videoInlineIntroHtml(INTRO_IN);
+  for (const [root, exp] of [['http://127.0.0.1:8099', 'http://127.0.0.1:8099/h5p/embed.php'], ['https://x.edu/moodle', 'https://x.edu/moodle/h5p/embed.php'], ['https://campus.example.org/a/b/moodle', 'https://campus.example.org/a/b/moodle/h5p/embed.php']]) {
+    const u = resolveEmbed(html, root, 4772);
+    eq(u.origin + u.pathname, exp, `embed para ${root}`);
+    eq(u.searchParams.get('url'), `${root}/pluginfile.php/4772/mod_h5pactivity/intro/cursia-video-ch1.h5p`, 'url');
+    eq(u.searchParams.get('component'), 'mod_h5pactivity', 'component');
+  }
+});
+
+// Mini-DOM para ejecutar el script inline en Node (vm) sin dependencias.
+function runInlineScript({ pathname, withIO, preInit }) {
+  const vm = require('vm');
+  const mk = (tag, attrs = {}) => {
+    const el = { tagName: tag, attrs: { ...attrs }, style: {}, children: [], parentNode: null,
+      getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; },
+      setAttribute(k, v) { this.attrs[k] = String(v); },
+      removeChild(c) { this.children = this.children.filter((x) => x !== c); c.parentNode = null; },
+      querySelector(sel) { return all(this).find((e) => match(e, sel)) || null; },
+      getBoundingClientRect() { return {}; } };
+    return el;
+  };
+  const add = (p, c) => { c.parentNode = p; p.children.push(c); return c; };
+  const all = (root) => root.children.flatMap((c) => [c, ...all(c)]);
+  const match = (e, sel) => (sel === '.cursia-iv-inline' ? e.attrs.class === 'cursia-iv-inline' : sel === '.cursia-iv-open' ? e.attrs.class === 'cursia-iv-open' : sel === 'iframe[data-cursia-src]' ? e.tagName === 'iframe' && 'data-cursia-src' in e.attrs : false);
+  const body = mk('body');
+  const wrap = add(body, mk('div', { class: 'cursia-iv' }));
+  const inline = add(wrap, mk('div', { class: 'cursia-iv-inline' }));
+  inline.style.display = 'none';
+  const frame = add(inline, mk('iframe', { 'data-cursia-src': 'http://x/h5p/embed.php?url=u' }));
+  const open = add(wrap, mk('p', { class: 'cursia-iv-open' }));
+  const listeners = {};
+  const observed = [];
+  const win = { location: { pathname }, postMessage() {}, addEventListener(t, fn) { (listeners[t] = listeners[t] || []).push(fn); }, removeEventListener() {} };
+  if (preInit) win.h5pResizerInitialized = true;
+  if (withIO) win.IntersectionObserver = function (cb) { this.observe = (el) => observed.push({ el, cb, io: this }); this.disconnect = () => { this.off = true; }; };
+  const doc = { querySelectorAll: (sel) => all(body).filter((e) => match(e, sel)), getElementsByTagName: (t) => all(body).filter((e) => e.tagName === t) };
+  const ctx = { window: win, document: doc };
+  vm.runInNewContext(h.CURSIA_IV_INLINE_SCRIPT, ctx);
+  return { win, body, wrap, inline, frame, open, listeners, observed, run: () => vm.runInNewContext(h.CURSIA_IV_INLINE_SCRIPT, ctx) };
+}
+check('intro I2: en view.php el script ELIMINA el bloque inline antes de cargarlo y oculta "Abrir…"', () => {
+  for (const p of ['/mod/h5pactivity/view.php', '/moodle/mod/h5pactivity/view.php']) {
+    const t = runInlineScript({ pathname: p, withIO: true });
+    assert(!t.wrap.children.includes(t.inline), `${p}: bloque inline no eliminado`);
+    assert(t.frame.getAttribute('src') === null, `${p}: el iframe recibió src`);
+    eq(t.open.style.display, 'none', `${p}: "Abrir…" visible`);
+    eq(t.observed.length, 0, 'no observa nada');
+  }
+});
+check('intro I2: en el curso activa el bloque y carga el iframe SOLO al acercarse al viewport (IntersectionObserver)', () => {
+  const t = runInlineScript({ pathname: '/course/view.php', withIO: true });
+  eq(t.inline.style.display, 'block', 'bloque visible');
+  assert(t.frame.getAttribute('src') === null, 'cargó antes de intersectar');
+  eq(t.observed.length, 1, 'observa el iframe');
+  t.observed[0].cb([{ isIntersecting: false }]);
+  assert(t.frame.getAttribute('src') === null, 'cargó sin intersectar');
+  t.observed[0].cb([{ isIntersecting: true }]);
+  eq(t.frame.getAttribute('src'), 'http://x/h5p/embed.php?url=u', 'src asignado');
+  assert(t.observed[0].io.off, 'desconecta el observer');
+  t.run();
+  eq(t.observed.length, 1, 'idempotente: una segunda ejecución no vuelve a procesar el bloque');
+  eq(t.listeners.message.length, 1, 'idempotente: un solo listener de mensajes');
+});
+check('intro I2: sin IntersectionObserver carga inmediatamente; respeta un resizer H5P ya instalado', () => {
+  const t = runInlineScript({ pathname: '/course/view.php', withIO: false });
+  eq(t.frame.getAttribute('src'), 'http://x/h5p/embed.php?url=u', 'src inmediato');
+  eq(t.win.h5pResizerInitialized, true, 'marca el resizer');
+  const u = runInlineScript({ pathname: '/course/view.php', withIO: false, preInit: true });
+  assert(!u.listeners.message, 'no duplica el resizer si Moodle ya cargó el suyo');
+});
+check('intro I3: resizer inline sigue el protocolo h5p-resizer (hello, prepareResize, resize)', () => {
+  const t = runInlineScript({ pathname: '/course/view.php', withIO: false });
+  const sent = [];
+  const src = { postMessage: (d) => sent.push(d.action) };
+  t.frame.contentWindow = src;
+  t.frame.clientHeight = 560;
+  const fire = (data) => t.listeners.message[0]({ data, source: src, origin: 'http://x' });
+  fire({ context: 'h5p', action: 'hello' });
+  fire({ context: 'h5p', action: 'prepareResize', scrollHeight: 300, clientHeight: 300 });
+  fire({ context: 'h5p', action: 'resize', scrollHeight: 312 });
+  fire({ context: 'other', action: 'resize', scrollHeight: 999 });
+  eq(sent, ['hello', 'resizePrepared'], 'respuestas');
+  eq(t.frame.style.height, '312px', 'altura');
+  eq(t.frame.style.width, '100%', 'ancho');
 });
 
 check('intro: fallback visible fuera del iframe (activity token + YouTube nomediaplugin)', () => {
@@ -324,7 +421,10 @@ check('intro CLEAN_SAFE: con forceclean simulado quedan el texto y AMBOS enlaces
 
 check('intro CLEAN_SAFE: estilos inline solo con hex, fondo sólido, sin display/flex/grid/radius/var/oklch/gradiente', () => {
   const html = h.videoInlineIntroHtml(INTRO_IN);
-  const styles = [...html.matchAll(/ style="([^"]*)"/g)].map((m) => m[1]);
+  // Única excepción: el contenedor del iframe (no esencial) nace con display:none; con forceclean
+  // se elimina display y también el iframe/script, así que queda un div vacío.
+  assert(html.includes('<div class="cursia-iv-inline" style="display:none;margin:0 0 12px 0;padding:0;">'), 'contenedor inline oculto sin JS');
+  const styles = [...html.replace('style="display:none;margin:0 0 12px 0;', 'style="margin:0 0 12px 0;').matchAll(/ style="([^"]*)"/g)].map((m) => m[1]);
   assert(styles.length >= 5, 'hay estilos inline');
   for (const s of styles) {
     assert(!/display|flex|grid|gap|radius|shadow|var\(|oklch|gradient|rgb\(|hsl\(|opacity|position|clamp\(/i.test(s), `estilo no clean-safe: ${s}`);
@@ -340,9 +440,8 @@ check('intro: copy en español que dice que es calificable, SIN números (los n�
   for (const v of Object.values(h.VIDEO_INTRO_COPY)) assert(!/\d/.test(v), `copy con dígitos: ${v}`);
 });
 
-check('intro: mejora progresiva — oculta el iframe y "Abrir…" solo en view.php de la actividad', () => {
-  const html = h.videoInlineIntroHtml(INTRO_IN);
-  assert(html.includes('<style>#page-mod-h5pactivity-view .cursia-iv-inline,#page-mod-h5pactivity-view .cursia-iv-open{display:none}</style>'), 'style');
+check('intro: sin <style> (la ocultación en view.php la hace el script, no CSS)', () => {
+  assert(!/<style/.test(h.videoInlineIntroHtml(INTRO_IN)), 'hay <style>');
 });
 
 check('intro: theme hex aplicado; theme/filename/mid/youtubeId/title inválidos fallan fuerte', () => {
@@ -384,7 +483,7 @@ check('files: 2 entradas (package + intro), mismo hash SHA-1, un solo blob, mime
 
 check('ajustes Moodle: grade 100, gradepass 70, completion por nota aprobatoria, showdescription', () => {
   const S = h.VIDEO_ACTIVITY_MOODLE_SETTINGS;
-  eq([S.grade, S.gradepass, S.completion, S.completionpassgrade, S.showdescription], [100, 70, 2, 1, 1], 'settings');
+  eq([S.grade, S.gradepass, S.completion, S.completionpassgrade, S.showdescription, S.displayoptions], [100, 70, 2, 1, 1, 15], 'settings');
 });
 
 check('fixture: el banco cubre 8 checkpoints y los MC tienen 3–4 opciones', () => {

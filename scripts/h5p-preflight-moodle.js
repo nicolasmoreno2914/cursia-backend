@@ -4,7 +4,8 @@
 // (HD-V21-15, fail loud). Ejecuta el CLI de Moodle
 // `scripts/moodle/h5p-installed-libraries.php` (solo lectura), aplica
 // CURSIA_H5P_PROFILE_V1 y sale con código != 0 si falta alguna librería o si
-// alguna tiene un patch menor al del perfil.
+// alguna tiene un patch menor al del perfil, o si una librería principal del
+// perfil está deshabilitada en el sitio (mdl_h5p_libraries.enabled = 0).
 //
 // Uso (después de `npm run build`):
 //   node scripts/h5p-preflight-moodle.js <moodleDir> <phpIni> [--scope runtime|full]

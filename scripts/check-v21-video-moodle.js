@@ -182,15 +182,25 @@ async function main() {
       pkg[0].contenthash === built.sha1 && intr[0].contenthash === built.sha1,
     R.files,
   );
-  report('restore: intro guardado con @@PLUGINFILE@@ (Moodle lo reescribe al mostrar)', R.introRaw.includes(`@@PLUGINFILE@@/${packageFilename}`));
+  report('restore: intro guardado con @@PLUGINFILE@@ (Moodle lo reescribe al mostrar)', R.introRaw.includes(`data-cursia-src="@@PLUGINFILE@@/../../../../h5p/embed.php?url=@@PLUGINFILE@@/${packageFilename}&amp;component=mod_h5pactivity"`));
   const viewUrl = `${R.wwwroot}/mod/h5pactivity/view.php?id=${R.cmid}`;
   report('restore: enlace de respaldo resuelto a view.php?id=<cmid> real', R.introRaw.includes(`href="${viewUrl}"`) && !R.introRaw.includes('$@'), viewUrl);
-  const pf = encodeURIComponent(`${R.wwwroot}/pluginfile.php/${R.contextid}/mod_h5pactivity/intro/${packageFilename}`);
+  const pfBase = `${R.wwwroot}/pluginfile.php/${R.contextid}/mod_h5pactivity/intro`;
+  const pf = encodeURIComponent(`${pfBase}/${packageFilename}`);
   report(
-    'restore: iframe del intro formateado apunta a pluginfile.php/<ctx>/mod_h5pactivity/intro/<file>',
-    R.introFormatted.includes(`/h5p/embed.php?url=${pf}&amp;component=mod_h5pactivity`) && !R.introFormatted.includes('@@PLUGINFILE@@'),
-    R.introFormatted.slice(0, 600),
+    'restore: data-cursia-src del intro formateado = <pluginfile intro>/../../../../h5p/embed.php?url=<pluginfile intro>/<file>',
+    R.introFormatted.includes(`data-cursia-src="${pfBase}/../../../../h5p/embed.php?url=${pf}&amp;component=mod_h5pactivity"`) && !R.introFormatted.includes('@@PLUGINFILE@@'),
+    R.introFormatted.slice(0, 700),
   );
+  report('restore: el script inline sobrevive intacto a format_text (forceclean=0)', R.introFormatted.includes(`<script>${h.CURSIA_IV_INLINE_SCRIPT}</script>`));
+  const FC = R.introFormattedForceclean;
+  report(
+    'forceclean=1 (format_text real, en memoria): sin iframe/script; bloque de respaldo, ambos enlaces, nomediaplugin y hex intactos',
+    !/<iframe|<script|<style/i.test(FC) && FC.includes(`href="${viewUrl}"`) && /<a class="nomediaplugin" href="https:\/\/www\.youtube\.com\/watch\?v=IdwOipZAeqY"/.test(FC) &&
+      FC.includes('Video interactivo calificable') && /background-color:\s*#F4F6FA/i.test(FC) && /border-left:\s*4px solid #1F5FBF/i.test(FC),
+    FC.slice(0, 900),
+  );
+  report('forceclean: la configuración del sitio sigue en 0', String(R.forcecleanSetting) === '0' || R.forcecleanSetting === false || R.forcecleanSetting === '', R.forcecleanSetting);
   report('restore: YouTube con class="nomediaplugin" (sin segundo reproductor del filtro)', /<a class="nomediaplugin" href="https:\/\/www\.youtube\.com\/watch\?v=IdwOipZAeqY"/.test(R.introFormatted));
 
   // ── 3. Matrícula + servidor ──
@@ -223,8 +233,20 @@ async function main() {
   if (!report('login del estudiante local de prueba', loggedIn)) return;
 
   await b.navigate(`${WWWROOT}/course/view.php?id=${R.courseid}`);
-  const iframeInfo = await b.evaluate(`(()=>{const f=document.querySelector('.cursia-iv-inline iframe');return f?{src:f.getAttribute('src'),h:f.offsetHeight,w:f.offsetWidth}:null})()`);
-  report('curso: iframe inline presente en la página del curso', !!iframeInfo && iframeInfo.src.includes('/h5p/embed.php?url=') && iframeInfo.w > 300, iframeInfo);
+  const iframeInfo = await b
+    .waitFor(`(()=>{const f=document.querySelector('.cursia-iv-inline iframe');return f&&f.src?JSON.stringify({src:f.src,h:f.offsetHeight,w:f.offsetWidth,lazy:f.getAttribute('loading'),ns:!!window.CursiaIV,resizer:!!window.h5pResizerInitialized}):null})()`, { timeoutMs: 15000, what: 'iframe inline con src' })
+    .then((v) => JSON.parse(v), (e) => ({ error: e.message }));
+  let resolved = null;
+  try {
+    const u = new URL(iframeInfo.src);
+    resolved = { path: u.origin + u.pathname, url: u.searchParams.get('url'), component: u.searchParams.get('component') };
+  } catch (e) {}
+  report('curso: iframe inline presente, visible y con carga diferida (data-cursia-src → src, loading=lazy, CursiaIV + resizer inline)', !!iframeInfo.src && iframeInfo.w > 300 && iframeInfo.lazy === 'lazy' && iframeInfo.ns && iframeInfo.resizer, iframeInfo);
+  report(
+    'curso: el navegador resuelve el embed a <wwwroot>/h5p/embed.php (dot-segments desde pluginfile)',
+    !!resolved && resolved.path === `${WWWROOT}/h5p/embed.php` && resolved.url === `${WWWROOT}/pluginfile.php/${R.contextid}/mod_h5pactivity/intro/${packageFilename}` && resolved.component === 'mod_h5pactivity',
+    resolved,
+  );
   await b.waitFor(iv(`return iv.libraryInfo.versionedName`), { timeoutMs: 45000, what: 'instancia H5P en el iframe' }).then(
     (v) => report(`curso: el iframe carga ${v}`, v === 'H5P.InteractiveVideo 1.27', v),
     (e) => report('curso: el iframe carga H5P.InteractiveVideo', false, e.message),
@@ -338,8 +360,13 @@ async function main() {
   // ── 6. view.php (un solo reproductor) y 390 px ──
   await b.navigate(`${WWWROOT}/mod/h5pactivity/view.php?id=${R.cmid}`);
   await sleep(2500);
-  const view = await b.evaluate(`(()=>{const f=document.querySelector('.cursia-iv-inline');const o=document.querySelector('.cursia-iv-open');const players=[...document.querySelectorAll('iframe')].filter(x=>x.offsetParent!==null&&/h5p/.test(x.src||x.className));return {bodyId:document.body.id,inlineHidden:!!f&&getComputedStyle(f).display==='none',openHidden:!!o&&getComputedStyle(o).display==='none',visibleH5pIframes:players.length,fallback:!!document.querySelector('.cursia-iv-fallback a.nomediaplugin')}})()`);
-  report('view.php: el iframe inline y "Abrir…" se ocultan (un solo reproductor visible), el bloque YouTube sigue', view.bodyId === 'page-mod-h5pactivity-view' && view.inlineHidden && view.openHidden && view.visibleH5pIframes === 1 && view.fallback, view);
+  await sleep(3000);
+  const view = await b.evaluate(`(()=>{const o=document.querySelector('.cursia-iv-open');const all=[...document.querySelectorAll('iframe')];const h5p=all.filter(x=>/h5p|embed\\.php/.test((x.src||'')+' '+x.className));const inst=h5p.map(x=>{try{const d=x.contentDocument;const i=d&&d.querySelector('iframe.h5p-iframe');const w=i?i.contentWindow:x.contentWindow;return w&&w.H5P?w.H5P.instances.length:0}catch(e){return -1}});return {bodyId:document.body.id,inlineInDom:!!document.querySelector('.cursia-iv-inline'),dataSrcFrames:document.querySelectorAll('iframe[data-cursia-src]').length,openHidden:!!o&&getComputedStyle(o).display==='none',h5pIframes:h5p.length,instances:inst,fallback:!!document.querySelector('.cursia-iv-fallback a.nomediaplugin')}})()`);
+  report(
+    'view.php: el bloque inline se ELIMINA sin cargarse (1 solo iframe H5P, 1 sola instancia IV), "Abrir…" oculto, bloque YouTube visible',
+    view.bodyId === 'page-mod-h5pactivity-view' && !view.inlineInDom && view.dataSrcFrames === 0 && view.h5pIframes === 1 && view.instances.reduce((a, x) => a + x, 0) === 1 && view.openHidden && view.fallback,
+    view,
+  );
   await b.screenshot(path.join(shotsDir, `r8-${scenario}-05-view-php.png`));
 
   await b.setViewport(390, 844, true);

@@ -10,7 +10,8 @@ import { createHash } from 'crypto';
 /** Namespace fijo de Cursia para los subContentId H5P. NUNCA cambiarlo. */
 export const CURSIA_H5P_UUID_NAMESPACE = '81ee0752-b41e-4906-8d17-adf92734544a';
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Solo minúsculas: el validador H5P de Moodle (h5p.classes.php) elimina en silencio cualquier otro formato.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export function isUuid(value: unknown): boolean {
   return typeof value === 'string' && UUID_RE.test(value);

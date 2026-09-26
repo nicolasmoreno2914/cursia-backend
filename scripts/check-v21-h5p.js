@@ -165,6 +165,10 @@ function walkL10n(semanticsFields, params, pathPrefix, libName, problems, stats)
     const v = params ? params[f.name] : undefined;
     if (f.type === 'group' && f.fields) {
       // Un grupo de un solo campo puede venir "aplanado" en H5P; no usamos esa forma.
+      if (f.isSubContent && v && typeof v === 'object') {
+        stats.subContents += 1;
+        if (!h.isUuid(v.subContentId)) problems.push(`${libName}:${p} grupo isSubContent sin subContentId UUID (${v.subContentId})`);
+      }
       walkL10n(f.fields, v, p, libName, problems, stats);
     } else if (f.type === 'list' && f.field) {
       if (!Array.isArray(v)) {
@@ -172,7 +176,13 @@ function walkL10n(semanticsFields, params, pathPrefix, libName, problems, stats)
         continue;
       }
       v.forEach((item, i) => {
-        if (f.field.type === 'group') walkL10n(f.field.fields, item, `${p}[${i}]`, libName, problems, stats);
+        if (f.field.type === 'group') {
+          if (f.field.isSubContent && item && typeof item === 'object') {
+            stats.subContents += 1;
+            if (!h.isUuid(item.subContentId)) problems.push(`${libName}:${p}[${i}] grupo isSubContent sin subContentId UUID (${item.subContentId})`);
+          }
+          walkL10n(f.field.fields, item, `${p}[${i}]`, libName, problems, stats);
+        }
         else walkL10n([{ ...f.field, name: String(i) }], { [String(i)]: item }, p, libName, problems, stats);
       });
     } else if (f.type === 'library') {
@@ -213,6 +223,13 @@ function checkValue(f, v, p, problems) {
     // H5P "aplana" los grupos de un solo campo: el valor es directamente el del campo interno.
     if (f.fields && f.fields.length === 1 && (typeof v !== 'object' || v === null || Array.isArray(v))) {
       checkValue(f.fields[0], v, `${p}.${f.fields[0].name}`, problems);
+      return;
+    }
+    if (f.isSubContent && v && typeof v === 'object' && !Array.isArray(v)) {
+      // H5P conserva subContentId en grupos isSubContent (h5p.classes.php validateGroup).
+      if (!h.isUuid(v.subContentId)) problems.push(`${p}: grupo isSubContent sin subContentId UUID`);
+      const { subContentId, ...rest } = v;
+      walkConformance(f.fields || [], rest, p, problems);
       return;
     }
     walkConformance(f.fields || [], v, p, problems);
@@ -347,7 +364,7 @@ async function unzip(buf) {
     const r = h.h5pPreflight(P, inst);
     assert(!r.ok, 'ok=true');
     assertDeepEqual(r.missing.map((x) => x.machineName), ['H5P.DragText'], 'missing');
-    expectThrow(() => h.assertH5pPreflight(P, inst), /^H5P_PREFLIGHT_FAILED: missing=\[H5P\.DragText-1\.10\.\d+\] incompatible=\[\]$/, 'assert');
+    expectThrow(() => h.assertH5pPreflight(P, inst), /^H5P_PREFLIGHT_FAILED: missing=\[H5P\.DragText-1\.10\.\d+\] incompatible=\[\] disabled=\[\]$/, 'assert');
   });
   await check('preflight: patch instalado MENOR → incompatible', () => {
     const inst = installedAll().map((r) => (r.machineName === 'H5P.Blanks' ? { ...r, patchVersion: r.patchVersion - 1 } : r));
@@ -368,6 +385,29 @@ async function unzip(buf) {
     const inst = installedAll().filter((r) => !r.machineName.startsWith('H5PEditor.'));
     assert(!h.h5pPreflight(P, inst).ok, 'full debería fallar sin editor');
     assert(h.h5pPreflight(P, inst, { scope: 'runtime' }).ok, 'runtime debería pasar sin editor');
+  });
+
+  await check('preflight: tipo de contenido principal DESHABILITADO (enabled=0) → disabled[] y FAIL LOUD', () => {
+    const inst = installedAll().map((r) => ({ ...r, enabled: 1 }));
+    assert(h.h5pPreflight(P, inst).ok, 'todo habilitado debería pasar');
+    // Basta UNA fila deshabilitada del machineName (api::is_library_enabled), aunque otra versión esté habilitada.
+    const dis = [...inst.map((r) => (r.machineName === 'H5P.SingleChoiceSet' ? { ...r, enabled: 0 } : r)), { machineName: 'H5P.SingleChoiceSet', majorVersion: 1, minorVersion: 9, patchVersion: 0, enabled: 1 }]
+      .map((r) => (r.machineName === 'H5P.TrueFalse' ? { ...r, enabled: '0' } : r));
+    const r = h.h5pPreflight(P, dis);
+    assert(!r.ok, 'ok=true con librerías deshabilitadas');
+    assertDeepEqual(r.disabled, ['H5P.SingleChoiceSet', 'H5P.TrueFalse'], 'disabled');
+    expectThrow(() => h.assertH5pPreflight(P, dis), /disabled=\[H5P\.SingleChoiceSet, H5P\.TrueFalse\]$/, 'assert');
+    // Una dependencia no principal deshabilitada no bloquea (Moodle solo filtra por la principal).
+    const dep = inst.map((r) => (r.machineName === 'H5P.JoubelUI' ? { ...r, enabled: 0 } : r));
+    assert(h.h5pPreflight(P, dep).ok, 'dependencia deshabilitada no debería bloquear');
+  });
+  await check('preflight: entrada inválida (null, "", enabled raro) → H5P_PREFLIGHT_BAD_INPUT, no "patch 0"', () => {
+    const base = installedAll();
+    for (const bad of [{ patchVersion: null }, { patchVersion: '' }, { minorVersion: '1.5' }, { majorVersion: -1 }, { enabled: 'yes' }, { machineName: '' }]) {
+      const inst = base.map((r, i) => (i === 0 ? { ...r, ...bad } : r));
+      expectThrow(() => h.h5pPreflight(P, inst), /^H5P_PREFLIGHT_BAD_INPUT: installed\[0\]/, JSON.stringify(bad));
+    }
+    assert(h.h5pPreflight(P, base.map((r) => ({ ...r, patchVersion: String(r.patchVersion) }))).ok, 'string numérico aceptado');
   });
 
   // ── 3. IDs ─────────────────────────────────────────────────────────────────
@@ -415,6 +455,7 @@ async function unzip(buf) {
       assert(problems.length === 0, `${problems.length} problema(s):\n     - ${problems.join('\n     - ')}`);
       assert(stats.textFields > 5, `muy pocos campos revisados (${stats.textFields})`);
       if (lib === 'H5P.QuestionSet' || lib === 'H5P.InteractiveVideo') assertEqual(stats.subContents, 4, 'sub-contenidos revisados');
+      if (lib === 'H5P.SingleChoiceSet') assertEqual(stats.subContents, 2, 'sub-contenidos revisados');
     });
   }
   for (const [lib, b] of Object.entries(built)) {
@@ -425,6 +466,115 @@ async function unzip(buf) {
       assert(problems.length === 0, problems.join('; '));
     });
   }
+  // ── C1 (review G4): subContentId en TODO sub-contenido de TODO paquete ─────
+  // Recorre el content.json REAL de cada paquete: todo objeto con "library" y todo
+  // elemento de un grupo isSubContent de semantics (a cualquier profundidad) debe
+  // llevar un subContentId UUID v5 en minúsculas, único dentro del paquete.
+  function collectSubContent(fields, params, p, out) {
+    for (const f of fields) {
+      const v = params ? params[f.name] : undefined;
+      const fp = p ? `${p}.${f.name}` : f.name;
+      if (v === undefined) continue;
+      if (f.type === 'group' && f.fields) {
+        if (f.isSubContent) out.push({ path: fp, id: v && v.subContentId });
+        collectSubContent(f.fields, v, fp, out);
+      } else if (f.type === 'list' && f.field && Array.isArray(v)) {
+        v.forEach((item, i) => collectSubContent([{ ...f.field, name: String(i) }], { [String(i)]: item }, `${fp}`, out));
+      } else if (f.type === 'library' && v && v.library) {
+        collectSubContent(semanticsByLibraryString(v.library), v.params, `${fp}<${v.library}>`, out);
+      }
+    }
+  }
+  function genericSubContentAudit(mainLibrary, content) {
+    const problems = [];
+    const ids = [];
+    const libObjs = [];
+    (function walk(v, p) {
+      if (Array.isArray(v)) v.forEach((x, i) => walk(x, `${p}[${i}]`));
+      else if (v && typeof v === 'object') {
+        if (typeof v.library === 'string') libObjs.push({ path: p || '$', id: v.subContentId });
+        for (const [k, x] of Object.entries(v)) walk(x, p ? `${p}.${k}` : k);
+      }
+    })(content, '');
+    const ref = P.mainLibraries[mainLibrary];
+    const groups = [];
+    collectSubContent(semanticsOf(ref.machineName, ref.majorVersion, ref.minorVersion), content, '', groups);
+    for (const x of [...libObjs, ...groups]) {
+      if (!h.isUuid(x.id) || !/^[0-9a-f-]+$/.test(x.id)) problems.push(`${x.path}: subContentId inválido (${x.id})`);
+      else if (ids.includes(x.id)) problems.push(`${x.path}: duplicado ${x.id}`);
+      else ids.push(x.id);
+    }
+    return { problems, count: ids.length };
+  }
+  const EXPECTED_SUBCONTENT = { 'H5P.QuestionSet': 4, 'H5P.SingleChoiceSet': 2, 'H5P.DragText': 0, 'H5P.Blanks': 0, 'H5P.InteractiveVideo': 4, 'H5P.MultiChoice': 0, 'H5P.TrueFalse': 0 };
+  for (const [lib, b] of Object.entries(built)) {
+    await check(`subContentId genérico: ${lib} — content.json del paquete, todo sub-contenido con UUID v5 único`, async () => {
+      const buf = await h.buildContentOnlyH5p({ mainLibrary: b.mainLibrary || lib, content: b.content, title: b.title || 'Ejemplo', language: 'es' });
+      const { out } = await unzip(buf);
+      const content = JSON.parse(out['content/content.json']);
+      const r = genericSubContentAudit(lib, content);
+      assert(r.problems.length === 0, r.problems.join('; '));
+      assertEqual(r.count, EXPECTED_SUBCONTENT[lib], 'sub-contenidos encontrados');
+      if (b.subContentIds) assertEqual(b.subContentIds.length, r.count, 'subContentIds declarados = encontrados');
+    });
+  }
+  await check('subContentId genérico: la Library Pack sample de IV/QS/SCS también cumple', async () => {
+    for (const lib of ['H5P.InteractiveVideo', 'H5P.QuestionSet', 'H5P.SingleChoiceSet']) {
+      const r = genericSubContentAudit(lib, h.libraryPackSampleContent(lib).content);
+      assert(r.problems.length === 0 && r.count > 0, `${lib}: ${r.problems.join('; ')} (n=${r.count})`);
+    }
+  });
+  await check('H5P_SUBCONTENT_GROUP_PATHS coincide con los grupos isSubContent de primer nivel de las 7 semantics', () => {
+    for (const lib of Object.keys(P.mainLibraries)) {
+      const ref = P.mainLibraries[lib];
+      const found = [];
+      (function scan(fields, p) {
+        for (const f of fields) {
+          const fp = p ? `${p}.${f.name}` : f.name;
+          if (f.type === 'group' && f.isSubContent) found.push(fp.replace(/\.[^.]+$/, '') || fp);
+          if (f.type === 'group' && f.fields && !f.isSubContent) scan(f.fields, fp);
+          if (f.type === 'list' && f.field) scan([f.field], fp);
+        }
+      })(semanticsOf(ref.machineName, ref.majorVersion, ref.minorVersion), '');
+      assertDeepEqual(found, [...(h.H5P_SUBCONTENT_GROUP_PATHS[lib] || [])], lib);
+    }
+  });
+  await check('paquete: falla fuerte sin subContentId, con id no UUID, en mayúsculas o duplicado (SCS y QS)', async () => {
+    const tries = [
+      ['H5P.SingleChoiceSet', (c) => { delete c.choices[0].subContentId; }],
+      ['H5P.SingleChoiceSet', (c) => { c.choices[1].subContentId = c.choices[0].subContentId; }],
+      ['H5P.QuestionSet', (c) => { c.questions[2].subContentId = 'q3'; }],
+      ['H5P.QuestionSet', (c) => { c.questions[0].subContentId = c.questions[0].subContentId.toUpperCase(); }],
+      ['H5P.InteractiveVideo', (c) => { delete c.interactiveVideo.assets.interactions[1].action.subContentId; }],
+    ];
+    for (const [lib, mut] of tries) {
+      const b = built[lib];
+      const c = JSON.parse(JSON.stringify(b.content));
+      mut(c);
+      let err = null;
+      try {
+        await h.buildContentOnlyH5p({ mainLibrary: lib, content: c, title: b.title, language: 'es' });
+      } catch (e) {
+        err = e;
+      }
+      assert(err && /H5P_PACKAGE_SUBCONTENT_ID/.test(err.message), `${lib}: sin error (${err && err.message})`);
+    }
+  });
+  await check('SCS: cada pregunta (grupo isSubContent "choice") lleva h5pSubContentId(itemKey, i, 1)', () => {
+    const b = built['H5P.SingleChoiceSet'];
+    assertDeepEqual(b.content.choices.map((c) => c.subContentId), b.content.choices.map((_, i) => h.h5pSubContentId(inputs.scs().itemKey, i, 1)), 'ids');
+    assertDeepEqual(b.subContentIds, b.content.choices.map((c) => c.subContentId), 'subContentIds');
+  });
+  await check('H5P_MOODLE_GRADING: cubre las 7 principales; SCS no calificable ⇒ assertH5pGradableInMoodle lanza', () => {
+    assertDeepEqual(Object.keys(h.H5P_MOODLE_GRADING).sort(), Object.keys(P.mainLibraries).sort(), 'claves');
+    for (const lib of ['H5P.InteractiveVideo', 'H5P.QuestionSet', 'H5P.DragText', 'H5P.Blanks']) h.assertH5pGradableInMoodle(lib);
+    expectThrow(() => h.assertH5pGradableInMoodle('H5P.SingleChoiceSet'), /^H5P_NOT_GRADABLE_IN_MOODLE: H5P\.SingleChoiceSet/, 'SCS');
+    expectThrow(() => h.assertH5pGradableInMoodle('H5P.Accordion'), /H5P_NOT_GRADABLE_IN_MOODLE/, 'desconocida');
+  });
+  await check('isUuid: solo minúsculas (Moodle elimina UUID en mayúsculas)', () => {
+    const id = h.h5pSubContentId('x', 0, 1);
+    assert(h.isUuid(id) && !h.isUuid(id.toUpperCase()), 'mayúsculas aceptadas');
+  });
   await check('semantics: el control de conformidad SÍ detecta campo extra, lista vacía y select inválido (control negativo)', () => {
     const iv = JSON.parse(JSON.stringify(built['H5P.InteractiveVideo'].content));
     iv.interactiveVideo.video.files[0].aspectRatio = '16:9';
@@ -503,6 +653,9 @@ async function unzip(buf) {
     expectThrow(() => h.buildBlanks({ ...inputs.bl(), questions: ['Solo *uno*.'] }), /al menos 2 huecos en total/, 'pocos');
     expectThrow(() => h.buildBlanks({ ...inputs.bl(), questions: ['Sin hueco.', 'Con *a* y *b*.'] }), /al menos 1 hueco/, 'sin hueco');
     expectThrow(() => h.buildBlanks({ ...inputs.bl(), questions: ['A *b/* y *c*.'] }), /alternativa vacía/, 'alt vacía');
+    expectThrow(() => h.buildBlanks({ ...inputs.bl(), questions: ['Va a 60 *km/h* y *rápido*.'] }), /parece una unidad o fracción/, 'km/h');
+    expectThrow(() => h.buildBlanks({ ...inputs.bl(), questions: ['Es *1/2* de la *mezcla*.'] }), /parece una unidad o fracción/, '1/2');
+    h.buildBlanks({ ...inputs.bl(), questions: ['El *skimmer/desnatador* y la *bomba*.'] });
   });
   await check('validador: IV con tiempos inválidos (antes de 30 s, en los últimos 15 s, no creciente, < 20 s, 2 o 9 interacciones)', () => {
     const withTimes = (times) => {

@@ -12,6 +12,13 @@ export interface H5pInstalledLibrary {
   majorVersion: number;
   minorVersion: number;
   patchVersion: number;
+  /**
+   * mdl_h5p_libraries.enabled (1/0). Moodle no despliega ni muestra contenido
+   * cuya librería principal está deshabilitada (h5p/classes/api.php
+   * is_library_enabled: basta UNA fila deshabilitada del machineName).
+   * Ausente ⇒ se asume habilitada (entradas antiguas); el script PHP siempre lo exporta.
+   */
+  enabled?: number | boolean | null;
 }
 
 export interface H5pPreflightIncompatible {
@@ -25,6 +32,8 @@ export interface H5pPreflightResult {
   missing: H5pLibraryRef[];
   incompatible: H5pPreflightIncompatible[];
   satisfied: H5pLibraryRef[];
+  /** Librerías principales del perfil (incl. MC/TF de IV) deshabilitadas en el sitio, por machineName. */
+  disabled: string[];
 }
 
 export interface H5pPreflightOptions {
@@ -45,21 +54,33 @@ function requiredLibraries(profile: H5pProfile, scope: 'full' | 'runtime'): H5pL
   return [...map.values()].sort(compareH5pRefs);
 }
 
+// Entero no negativo como número o string numérico no vacío (null/'' ⇒ entrada inválida, no "0").
+function isVersionPart(n: unknown): boolean {
+  if (typeof n === 'number') return Number.isInteger(n) && n >= 0;
+  return typeof n === 'string' && /^\d+$/.test(n);
+}
+
 function assertInstalledShape(installed: unknown): H5pInstalledLibrary[] {
   if (!Array.isArray(installed)) throw new Error('H5P_PREFLIGHT_BAD_INPUT: installed debe ser un array');
   return installed.map((x: any, i) => {
     if (
       !x ||
       typeof x.machineName !== 'string' ||
-      ![x.majorVersion, x.minorVersion, x.patchVersion].every((n) => Number.isInteger(Number(n)))
+      !x.machineName ||
+      ![x.majorVersion, x.minorVersion, x.patchVersion].every(isVersionPart)
     ) {
       throw new Error(`H5P_PREFLIGHT_BAD_INPUT: installed[${i}] inválido`);
+    }
+    const en = x.enabled;
+    if (!(en === undefined || en === null || typeof en === 'boolean' || en === 0 || en === 1 || en === '0' || en === '1')) {
+      throw new Error(`H5P_PREFLIGHT_BAD_INPUT: installed[${i}].enabled inválido (${JSON.stringify(en)})`);
     }
     return {
       machineName: x.machineName,
       majorVersion: Number(x.majorVersion),
       minorVersion: Number(x.minorVersion),
       patchVersion: Number(x.patchVersion),
+      enabled: en === undefined || en === null ? true : en === true || en === 1 || en === '1',
     };
   });
 }
@@ -73,7 +94,9 @@ export function h5pPreflight(
   const required = requiredLibraries(profile, scope);
   // Si un sitio tuviera varias filas del mismo major.minor, vale el patch más alto.
   const bestPatch = new Map<string, number>();
-  for (const lib of assertInstalledShape(installed)) {
+  const rows = assertInstalledShape(installed);
+  const disabledNames = new Set(rows.filter((r) => r.enabled === false).map((r) => r.machineName));
+  for (const lib of rows) {
     const k = h5pLibraryDirName(lib);
     bestPatch.set(k, Math.max(bestPatch.get(k) ?? -1, lib.patchVersion));
   }
@@ -86,7 +109,17 @@ export function h5pPreflight(
     else if (patch < req.patchVersion) incompatible.push({ required: req, installedPatchVersion: patch });
     else satisfied.push(req);
   }
-  return { ok: missing.length === 0 && incompatible.length === 0, required, missing, incompatible, satisfied };
+  const disabled = Object.keys(profile.mainLibraries)
+    .filter((m) => disabledNames.has(m))
+    .sort();
+  return {
+    ok: missing.length === 0 && incompatible.length === 0 && disabled.length === 0,
+    required,
+    missing,
+    incompatible,
+    satisfied,
+    disabled,
+  };
 }
 
 function fmt(r: H5pLibraryRef): string {
@@ -105,7 +138,7 @@ export function assertH5pPreflight(
     const incompatible = r.incompatible
       .map((x) => `${fmt(x.required)} (instalada .${x.installedPatchVersion})`)
       .join(', ');
-    throw new Error(`H5P_PREFLIGHT_FAILED: missing=[${missing}] incompatible=[${incompatible}]`);
+    throw new Error(`H5P_PREFLIGHT_FAILED: missing=[${missing}] incompatible=[${incompatible}] disabled=[${r.disabled.join(', ')}]`);
   }
   return r;
 }
