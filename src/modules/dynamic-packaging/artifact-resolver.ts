@@ -21,6 +21,7 @@ import type { ManifestItemType, GenerationManifestV1 } from '../generation-manif
 import { effectiveOutputRowsSql } from '../dynamic-generation/item-generations';
 import type { ResolvedArtifact } from './packaging-types';
 import { PackagingNotReadyError } from './packaging-types';
+import { assertPackagingRulesSupported } from './packaging-plan';
 import type { ArtifactsService } from '../artifacts/artifacts.service';
 import {
   VideoDeliveryStrategy,
@@ -61,8 +62,49 @@ const ARTIFACT_TYPES_BY_ITEM_TYPE_V2: Partial<Record<ManifestItemType, ResolvedA
 
 export const OPTIONAL_ARTIFACT_TYPES_V2 = ['dynamic_context_summary_json'] as const;
 
-/** Roles obligatorios de un tipo de item según el rulesVersion del Manifest (v1: exactamente los de 5B.1). */
+/**
+ * rulesVersion 3 (V2.1 R4, audit §N.2 columna "artifact(s)"): roles
+ * obligatorios para COMPLETAR un item v3 (scheduler.completeItem). `activity`
+ * depende del `variant` del item (ver `requiredArtifactTypesV3`). El empaque
+ * v3 (R12) todavía no consume esta tabla: packaging-plan rechaza v3.
+ */
+const ARTIFACT_TYPES_BY_ITEM_TYPE_V3: Partial<Record<ManifestItemType, ResolvedArtifact['type'][]>> = {
+  course_plan: ['dynamic_course_plan_json'],
+  course_intro: ['dynamic_course_intro_json'],
+  audio_welcome: ['dynamic_audio_mp3'],
+  module_intro: ['dynamic_module_intro_json'],
+  content: ['dynamic_content_md', 'dynamic_context_package_json'],
+  experience: ['dynamic_experience_json'],
+  presentation: ['dynamic_presentation'],
+  video: ['dynamic_video'],
+  video_interactions: ['dynamic_video_interactions_json'],
+  audiobook_chapter: ['dynamic_audio_mp3'],
+  exam: ['dynamic_exam_gift'],
+  final_exam: ['dynamic_exam_gift'],
+};
+const ACTIVITY_ARTIFACT_TYPES_V3: Record<'h5p' | 'scorm', ResolvedArtifact['type'][]> = {
+  h5p: ['dynamic_h5p_params_json'],
+  scorm: ['dynamic_scorm_html', 'dynamic_scorm_manifest'],
+};
+
+/** Roles obligatorios de un item v3; `activity` exige su `variant` (sin variant → undefined: el caller falla fuerte). */
+export function requiredArtifactTypesV3(
+  type: ManifestItemType,
+  variant?: string | null,
+): ResolvedArtifact['type'][] | undefined {
+  if (type === 'activity') {
+    return variant === 'h5p' || variant === 'scorm' ? [...ACTIVITY_ARTIFACT_TYPES_V3[variant]] : undefined;
+  }
+  const t = ARTIFACT_TYPES_BY_ITEM_TYPE_V3[type];
+  return t ? [...t] : undefined;
+}
+
+/**
+ * Roles obligatorios de un tipo de item según el rulesVersion del Manifest (v1: exactamente los de 5B.1).
+ * rulesVersion 3: usar `requiredArtifactTypesV3` (activity depende del variant); acá `activity` v3 → undefined.
+ */
 export function requiredArtifactTypes(rulesVersion: number, type: ManifestItemType): ResolvedArtifact['type'][] | undefined {
+  if (rulesVersion === 3) return requiredArtifactTypesV3(type);
   return (rulesVersion === 2 ? ARTIFACT_TYPES_BY_ITEM_TYPE_V2 : ARTIFACT_TYPES_BY_ITEM_TYPE)[type];
 }
 
@@ -89,6 +131,8 @@ export async function resolveRunArtifacts(
   runId: string,
   manifest: GenerationManifestV1,
 ): Promise<Map<string, ResolvedArtifact[]>> {
+  // V2.1 (R4): empaque v3 = R12 — falla fuerte antes de tocar la DB.
+  assertPackagingRulesSupported(manifest?.rulesVersion);
   // 1) Precondición del run: existe, es un run dynamic_generation, y está
   // completado. `worker_status` es el campo que el resto del código de
   // Fase 5A usa como marca terminal (`runs.service.ts:362`); se acepta

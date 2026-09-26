@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, Injectable, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, InternalServerErrorException, Logger, NotFoundException, NotImplementedException } from '@nestjs/common';
 import { effectiveOutputRowsSql } from '../dynamic-generation/item-generations';
 import { ACTIVE_RUN_WORKER_STATUSES } from '../dynamic-generation/item-transitions';
 import { DataSource } from 'typeorm';
@@ -6,6 +6,7 @@ import { GenerationManifestsService, ManifestDto } from '../generation-manifests
 import { ArtifactsService } from '../artifacts/artifacts.service';
 import { MOCK_VIDEO_NOT_PACKAGEABLE, resolveRunArtifacts } from './artifact-resolver';
 import { PackagingNotReadyError } from './packaging-types';
+import { PACKAGING_V3_NOT_IMPLEMENTED } from './packaging-plan';
 import { frozenVideoDeliveryOf, youtubeDeliveryProblems } from '../dynamic-generation/dynamic-video-delivery';
 import { packageReuseHash, resolveDynamicMoodleVersion, sortedArtifactIds } from './packaging-reuse-key';
 import { DYNAMIC_MBZ_BUILDER_VERSION } from '../../package/dynamic-mbz-builder';
@@ -113,6 +114,13 @@ export class PackagingService {
     // G3: flag V2 + allow-list por owner (403 antes de tocar la DB).
     assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
+    // V2.1 (R4): empaque v3 = R12 → 501 explícito, antes de crear ningún job.
+    if (manifest.rulesVersion === 3) {
+      throw new NotImplementedException({
+        code: PACKAGING_V3_NOT_IMPLEMENTED,
+        message: `${PACKAGING_V3_NOT_IMPLEMENTED}: el run ${runId} es rulesVersion 3; su empaquetado todavía no está implementado (bloque R12).`,
+      });
+    }
     const run = await this.loadRunRow(courseId, manifest, runId);
     await this.assertRunReady(run, manifest);
     if (manifest.rulesVersion === 2) await this.assertV2ArtifactsResolvable(run, manifest);

@@ -51,6 +51,10 @@ const req = (p) => require(path.join(BUILD, p));
     'supabase-migration-generation-manifests.sql',
     'supabase-migration-dynamic-generation.sql',
     'supabase-migration-v21-blueprint-profiles.sql', // V2.1 R3: toggles de Blueprint v2 + course_profiles
+    // V2.1 R4 (supabase-migration-v21-manifest-v3.sql) NO va acá: extiende los
+    // CHECKs de supabase-migration-dynamic-generation-v2.sql, que run-e2e.sh
+    // aplica DESPUÉS de este paso con su script real. run-e2e.sh corre
+    // scripts/migrate-v21-manifest-v3.js (+ su verify) justo después de la v2.
   ]) {
     await ds.query(fs.readFileSync(path.join(REPO, f), 'utf8'));
     console.log('applied', f);

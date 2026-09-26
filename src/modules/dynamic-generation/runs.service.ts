@@ -5,6 +5,7 @@ import {
   InternalServerErrorException,
   Logger,
   NotFoundException,
+  NotImplementedException,
   Optional,
 } from '@nestjs/common';
 import { DataSource } from 'typeorm';
@@ -37,6 +38,7 @@ import { assertDynamicOwnerAllowed, assertRealVideoAllowed } from '../features/d
 import { FromRunDto, isFromRunRequest } from '../invalidation/dto/from-run.dto';
 import { computePlanFromDb, executeApplyWrites, planApplyWrites } from '../invalidation/invalidation-apply';
 import { requiredArtifactTypes } from '../dynamic-packaging/artifact-resolver';
+import { INVALIDATION_V3_NOT_IMPLEMENTED, assertInvalidationRulesSupported } from '../invalidation/plan';
 import { latestGenerationPredicate } from './item-generations';
 import {
   ACTIVE_RUN_WORKER_STATUSES,
@@ -229,12 +231,19 @@ export const YOUTUBE_VIDEO_NOT_VERIFIED = 'youtube_video_not_verified';
 /** Código estable del 409 de un retry sobre una subida ambigua. */
 export const YOUTUBE_UPLOAD_AMBIGUOUS = 'youtube_upload_ambiguous';
 
-/** F78-BE2: qué cuesta regenerar un item. */
-export type RegenerationCostKind = 'videogen' | 'llm' | 'none';
+/** F78-BE2: qué cuesta regenerar un item. V2.1 (R4): + 'gamma' (presentation) y 'tts' (audio_*). */
+export type RegenerationCostKind = 'videogen' | 'llm' | 'none' | 'gamma' | 'tts';
 
-/** Video en run 'real' → Videogen; video 'mock' → nada; cualquier otro tipo lo genera un LLM (créditos). */
+/**
+ * Video en run 'real' → Videogen; video 'mock' → nada; presentation (v3) →
+ * Gamma; audio_welcome/audiobook_chapter (v3) → TTS; cualquier otro tipo lo
+ * genera un LLM (créditos). Gamma/TTS se declaran siempre (sin atajo 'mock'):
+ * sus workers en modo real fallan con PROVIDER_NOT_WIRED_V21 hasta R9/R10.
+ */
 export function regenerationCostKind(type: string, videoMode: RunVideoMode): RegenerationCostKind {
   if (type === 'video') return videoMode === 'real' ? 'videogen' : 'none';
+  if (type === 'presentation') return 'gamma';
+  if (type === 'audio_welcome' || type === 'audiobook_chapter') return 'tts';
   return 'llm';
 }
 
@@ -452,6 +461,12 @@ export class RunsService {
     if (!rowA) throw new NotFoundException(`La ejecución de origen ${fromRunId} no existe para el curso #${courseId}`);
     const bpNumberA = Number(rowA.input_payload?.blueprintNumber);
     const manifestA = await this.manifests.getById(courseId, ownerId, bpNumberA, Number(rowA.input_payload?.manifestId));
+    // V2.1 (R4): invalidación v3 = R5. 501 explícito antes de leer Blueprints (fail loud).
+    try {
+      assertInvalidationRulesSupported(manifestA.rulesVersion, manifestB.rulesVersion);
+    } catch (err) {
+      throw new NotImplementedException({ code: INVALIDATION_V3_NOT_IMPLEMENTED, message: (err as Error).message });
+    }
     if (manifestA.id === manifestB.id) {
       throw new ConflictException(
         `La ejecución ${fromRunId} ya es del Manifest #${manifestB.id}: no hay cambio de estructura que aplicar ` +
@@ -1436,7 +1451,7 @@ export class RunsService {
     if (costKind !== 'none' && o.confirmPaid !== true) {
       throw new BadRequestException({
         message:
-          `confirm_paid_required: regenerar "${itemKey}" tiene costo (${costKind === 'videogen' ? 'video real en Videogen' : 'créditos de IA'}); ` +
+          `confirm_paid_required: regenerar "${itemKey}" tiene costo (${costKind === 'videogen' ? 'video real en Videogen' : costKind === 'gamma' ? 'presentación en Gamma' : costKind === 'tts' ? 'audio TTS' : 'créditos de IA'}); ` +
           'reenviá con {"confirmPaid": true} para confirmarlo explícitamente',
         code: 'confirm_paid_required',
         costKind,

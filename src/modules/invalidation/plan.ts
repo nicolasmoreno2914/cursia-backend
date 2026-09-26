@@ -216,7 +216,34 @@ function reorderedModules(from: Outline, to: Outline): Set<string> {
   return out;
 }
 
+/**
+ * V2.1 (R4): las reglas de invalidación para Manifests rulesVersion 3 (tipos
+ * experience/presentation/activity/audio…, Blueprint schemaVersion 2) son R5.
+ * Hasta entonces, cualquier plan que toque un Manifest v3 o un Blueprint v2
+ * falla fuerte con este código en vez de reutilizar/regenerar con reglas v1/v2.
+ */
+export const INVALIDATION_V3_NOT_IMPLEMENTED = 'INVALIDATION_V3_NOT_IMPLEMENTED';
+
+/** Lanza INVALIDATION_V3_NOT_IMPLEMENTED si algún lado es rulesVersion 3 (o un Blueprint schemaVersion 2). v1/v2: no-op. */
+export function assertInvalidationRulesSupported(
+  fromRulesVersion: number | null | undefined,
+  toRulesVersion: number | null | undefined,
+  blueprintSchemaVersions: Array<number | null | undefined> = [],
+): void {
+  if (fromRulesVersion === 3 || toRulesVersion === 3 || blueprintSchemaVersions.some((v) => v === 2)) {
+    throw new Error(
+      `${INVALIDATION_V3_NOT_IMPLEMENTED}: el plan de invalidación para Manifests rulesVersion 3 (from=` +
+        `${fromRulesVersion ?? '?'}, to=${toRulesVersion ?? '?'}) todavía no está implementado (bloque R5). ` +
+        'Para aplicar el cambio de estructura, iniciá una ejecución nueva sin fromRun.',
+    );
+  }
+}
+
 export function computeInvalidationPlan(input: InvalidationPlanInput): InvalidationPlan {
+  assertInvalidationRulesSupported(input?.from?.manifest?.rulesVersion, input?.to?.manifest?.rulesVersion, [
+    (input?.from?.blueprint as any)?.schemaVersion,
+    (input?.to?.blueprint as any)?.schemaVersion,
+  ]);
   const fromItems = indexManifest(input.from.manifest, 'from.manifest');
   const toItems = indexManifest(input.to.manifest, 'to.manifest');
   const fromFp: BlueprintFingerprints = computeFingerprints(input.from.blueprint, {

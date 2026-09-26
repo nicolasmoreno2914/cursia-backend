@@ -3,21 +3,25 @@ import { DataSource } from 'typeorm';
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
 import {
+  AnyBlueprintSnapshot,
   BlueprintSnapshotV1,
   RawChapterRow,
   RawModuleRow,
   buildBlueprintSnapshot,
+  recanonicalizeBlueprintSnapshotV2,
   snapshotSha256,
+  snapshotSha256V2,
 } from '../course-blueprints/blueprint-snapshot';
 import {
   ALL_MANIFEST_ITEM_TYPES,
   GenerationManifestV1,
   ManifestItemType,
+  V3_ONLY_ITEM_TYPES,
   canonicalManifestJson,
   manifestSha256,
   validateGenerationManifest,
 } from '../generation-manifests/generation-manifest-builder';
-import { requiredArtifactTypes } from '../dynamic-packaging/artifact-resolver';
+import { requiredArtifactTypes, requiredArtifactTypesV3 } from '../dynamic-packaging/artifact-resolver';
 import { RunsService } from './runs.service';
 import { canonicalContextHash, sortKeysDeep } from './run-hash';
 import {
@@ -51,7 +55,20 @@ const GLOBAL_CLAIM_RACE_RETRIES = 50;
  * rulesVersion 2 (spec v2 §3): course_plan, course_intro y module_intro son
  * items LLM del ejecutor del navegador, igual que content/scorm/exam.
  */
-export const BROWSER_CLAIMABLE_TYPES: ItemType[] = ['content', 'scorm', 'exam', 'course_plan', 'course_intro', 'module_intro'];
+export const BROWSER_CLAIMABLE_TYPES: ItemType[] = [
+  'content', 'scorm', 'exam', 'course_plan', 'course_intro', 'module_intro',
+  // V2.1 rulesVersion 3 (R4): items LLM del ejecutor del navegador (activity en sus dos variantes).
+  'experience', 'video_interactions', 'activity', 'final_exam',
+];
+/**
+ * V2.1 rulesVersion 3 (R4): items de PROVEEDOR que solo reclama el worker del
+ * backend (nunca el navegador): video (Videogen, dynamic-item-worker, como
+ * siempre), presentation (Gamma) y audio_welcome / audiobook_chapter (TTS),
+ * estos tres en dynamic-provider-worker.
+ */
+export const WORKER_ONLY_TYPES: readonly ItemType[] = ['video', 'presentation', 'audio_welcome', 'audiobook_chapter'];
+/** Tipos v3 que reclama el camino navegador (un claim con alguno = ejecutor v3). */
+const V3_BROWSER_ITEM_TYPES: readonly ItemType[] = V3_ONLY_ITEM_TYPES.filter((t) => BROWSER_CLAIMABLE_TYPES.includes(t));
 /** Tipos que solo existen en Manifests rulesVersion 2 (M3: un claim del navegador sin ninguno = ejecutor v1-only). */
 const V2_ONLY_ITEM_TYPES: readonly ItemType[] = ['course_plan', 'course_intro', 'module_intro'];
 
@@ -107,6 +124,8 @@ export interface ClaimedItem {
   type: ItemType;
   /** rulesVersion del Manifest del item (contrato R2: el ejecutor despacha por esto). */
   rulesVersion: number;
+  /** V2.1 (R4): solo en items `activity` de rulesVersion 3 — 'h5p' | 'scorm' (course.activityEngine congelado). */
+  variant?: 'h5p' | 'scorm';
   /** null solo en items de scope course (rulesVersion 2: course_plan, course_intro). */
   moduleId: string | null;
   chapterId: string | null;
@@ -402,7 +421,9 @@ export class SchedulerService {
    * (ownerId): el worker interno reclama `video` y no se ve afectado.
    */
   private async assertBrowserTypesMatchRun(runId: string, ownerId: string, types: ItemType[]): Promise<void> {
-    if (types.some((t) => V2_ONLY_ITEM_TYPES.includes(t))) return;
+    // V2.1 (R4): un ejecutor v3 (reclama algún tipo v3) no se restringe acá.
+    if (types.some((t) => V3_BROWSER_ITEM_TYPES.includes(t))) return;
+    const claimsV2 = types.some((t) => V2_ONLY_ITEM_TYPES.includes(t));
     const [row] = await this.dataSource.query(
       `select m.rules_version
          from public.production_jobs pj
@@ -411,6 +432,16 @@ export class SchedulerService {
       [runId, ownerId],
     );
     const rulesVersion = row ? Number(row.rules_version) : null;
+    // R4: un ejecutor v1/v2 sobre un run v3 nunca reclamaría experience/activity/…
+    // (el run quedaría estancado sin error) → mismo 409 rules_version_mismatch.
+    if (rulesVersion === 3) {
+      const message =
+        `rules_version_mismatch: la ejecución ${runId} es rulesVersion=3 (V2.1: experiencias, actividades, ` +
+        `presentaciones y audio) y este ejecutor no reclama tipos de rulesVersion 3 (${types.join(', ')}). ` +
+        'Recargá la página para usar el generador actualizado; con este ejecutor el curso no avanzaría.';
+      throw new ConflictException({ message, code: 'rules_version_mismatch', rulesVersion, runId });
+    }
+    if (claimsV2) return;
     if (rulesVersion === 2) {
       const message =
         `rules_version_mismatch: la ejecución ${runId} es rulesVersion=2 (plan de conceptos, introducciones y ` +
@@ -525,8 +556,28 @@ export class SchedulerService {
         `select rules_version from public.course_generation_manifests where id = $1`,
         [item.manifest_id],
       );
-      if (mrow && Number(mrow.rules_version) === 2) {
-        const required = requiredArtifactTypes(2, item.type) ?? [];
+      const itemRulesVersion = mrow ? Number(mrow.rules_version) : null;
+      if (itemRulesVersion === 2 || itemRulesVersion === 3) {
+        // V2.1 (R4): v3 usa su tabla de roles; activity según el variant del
+        // item en el Manifest congelado. Sin tabla para el tipo → 409 (nunca
+        // se completa un item v3 sin saber qué debía producir).
+        let required: string[];
+        if (itemRulesVersion === 3) {
+          const variant = await this.manifestItemVariant(qr, item.manifest_id, item.item_key);
+          const v3 = requiredArtifactTypesV3(item.type, variant);
+          if (!v3) {
+            throw new ConflictException({
+              message:
+                `missing_required_artifacts: el item ${item.item_key} (${item.type}, rulesVersion 3) no tiene roles de ` +
+                `artifact definidos${item.type === 'activity' ? ` para variant=${JSON.stringify(variant)}` : ''}; no se completa`,
+              code: 'missing_required_artifacts',
+              missing: [],
+            });
+          }
+          required = v3;
+        } else {
+          required = requiredArtifactTypes(2, item.type) ?? [];
+        }
         const linkedTypes = new Set(
           (await qr.query(`select type from public.artifacts where id = any($1::uuid[])`, [ids])).map((r: any) => r.type),
         );
@@ -545,7 +596,7 @@ export class SchedulerService {
         if (missingTypes.length > 0) {
           throw new ConflictException({
             message:
-              `missing_required_artifacts: el item ${item.item_key} (${item.type}, rulesVersion 2) no se puede completar ` +
+              `missing_required_artifacts: el item ${item.item_key} (${item.type}, rulesVersion ${itemRulesVersion}) no se puede completar ` +
               `sin sus artifacts obligatorios; faltan: ${missingTypes.join(', ')}`,
             code: 'missing_required_artifacts',
             missing: missingTypes,
@@ -931,8 +982,10 @@ export class SchedulerService {
       [row.blueprint_id, row.course_id],
     );
     if (!bp) throw fail('el Blueprint no existe');
-    const snapshot = this.recanonicalizeSnapshot(bp.snapshot_json, fail);
-    if (snapshotSha256(snapshot) !== bp.snapshot_sha256) throw fail('sha256 del snapshot del Blueprint no coincide');
+    // V2.1 (R4): Blueprint schemaVersion 2 (runs v3) con su propio builder/sha.
+    const snapshot: AnyBlueprintSnapshot = this.recanonicalizeAnySnapshot(bp.snapshot_json, fail);
+    const bpSha = snapshot.schemaVersion === 2 ? snapshotSha256V2(snapshot) : snapshotSha256(snapshot);
+    if (bpSha !== bp.snapshot_sha256) throw fail('sha256 del snapshot del Blueprint no coincide');
     if (mrow.blueprint_sha256 !== bp.snapshot_sha256) throw fail('blueprint_sha256 del Manifest ≠ snapshot del Blueprint');
     const source = {
       courseId: bp.course_id,
@@ -1021,6 +1074,8 @@ export class SchedulerService {
       itemKey: row.item_key,
       type: row.type,
       rulesVersion: manifest.rulesVersion,
+      // V2.1 (R4): solo items activity de rulesVersion 3.
+      ...(mItem.variant !== undefined ? { variant: mItem.variant } : {}),
       moduleId: row.module_id ?? null,
       chapterId: row.chapter_id ?? null,
       moduleNumber: mItem.moduleNumber ?? null,
@@ -1063,6 +1118,31 @@ export class SchedulerService {
    * CourseBlueprintsService.recanonicalize (privado, owner-scoped: no se usa
    * desde el camino del worker, R2).
    */
+  private recanonicalizeAnySnapshot(stored: any, fail: (msg: string) => Error): AnyBlueprintSnapshot {
+    const s = typeof stored === 'string' ? JSON.parse(stored) : stored;
+    if (s && s.schemaVersion === 2) {
+      try {
+        return recanonicalizeBlueprintSnapshotV2(s);
+      } catch (err) {
+        throw fail(`snapshot v2 del Blueprint inválido (${err instanceof Error ? err.message : String(err)})`);
+      }
+    }
+    return this.recanonicalizeSnapshot(s, fail);
+  }
+
+  /** `variant` del item en el Manifest congelado (solo activity v3); null si no tiene. */
+  private async manifestItemVariant(qr: QueryRunner, manifestId: number, itemKey: string): Promise<string | null> {
+    const [r] = await qr.query(
+      `select e.it->>'variant' as variant
+         from public.course_generation_manifests m,
+              jsonb_array_elements(m.manifest_json->'items') as e(it)
+        where m.id = $1 and e.it->>'key' = $2
+        limit 1`,
+      [manifestId, itemKey],
+    );
+    return r?.variant ?? null;
+  }
+
   private recanonicalizeSnapshot(stored: any, fail: (msg: string) => Error): BlueprintSnapshotV1 {
     const s = typeof stored === 'string' ? JSON.parse(stored) : stored;
     if (!s || s.schemaVersion !== 1 || !Array.isArray(s.modules)) throw fail('snapshot del Blueprint con forma no soportada');

@@ -63,6 +63,9 @@ DB_HOST=127.0.0.1 DB_PORT=$PORT DB_USER=postgres DB_PASS=x DB_NAME=v2db DB_SSL=f
 STG="MIGRATION_ENV=staging DB_HOST=127.0.0.1 DB_PORT=$PORT DB_USER=postgres.e2elocaltest DB_PASS=x DB_NAME=v2db DB_SSL=false"
 env $STG node "$REPO/scripts/migrate-dynamic-generation-v2.js" > "$OUT/migrate-v2.log" 2>&1 || { cat "$OUT/migrate-v2.log"; exit 8; }
 env $STG node "$REPO/scripts/migrate-invalidation.js" > "$OUT/migrate-invalidation.log" 2>&1 || { cat "$OUT/migrate-invalidation.log"; exit 9; }
+# V2.1 R4: Manifest rulesVersion 3 (extiende los CHECKs de la migración v2 → corre DESPUÉS de ella).
+env $STG node "$REPO/scripts/migrate-v21-manifest-v3.js" > "$OUT/migrate-v21-manifest-v3.log" 2>&1 || { cat "$OUT/migrate-v21-manifest-v3.log"; exit 9; }
+env $STG node "$REPO/scripts/verify-v21-manifest-v3-schema.js" > "$OUT/verify-v21-manifest-v3.log" 2>&1 || { cat "$OUT/verify-v21-manifest-v3.log"; exit 9; }
 echo "schema + migraciones reales OK"
 
 echo "== Moodle 4.5 local =="

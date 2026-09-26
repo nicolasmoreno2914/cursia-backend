@@ -1,9 +1,10 @@
-import { Injectable, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common';
+import { ConflictException, Injectable, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
 import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
-import { BlueprintDto, CourseBlueprintsService } from '../course-blueprints/course-blueprints.service';
+import { AnyBlueprintDto, BlueprintDto, CourseBlueprintsService } from '../course-blueprints/course-blueprints.service';
 import {
+  BLUEPRINT_SCHEMA_MISMATCH,
   GenerationManifestV1,
   MANIFEST_SCHEMA_VERSION,
   ManifestRulesVersion,
@@ -42,7 +43,7 @@ function describeErrors(errors: ManifestValidationError[]): string {
   return `[${codes}] ${detail}${errors.length > 5 ? ` (+${errors.length - 5} más)` : ''}`;
 }
 
-function sourceOf(bp: BlueprintDto): ManifestSource {
+function sourceOf(bp: AnyBlueprintDto): ManifestSource {
   return {
     courseId: bp.courseId,
     blueprintId: bp.id,
@@ -102,7 +103,7 @@ export class GenerationManifestsService {
   ): Promise<{ created: boolean; manifest: ManifestDto }> {
     assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     const rulesVersion = this.configuredRulesVersion();
-    const bp = await this.blueprints.getByNumber(courseId, ownerId, blueprintNumber);
+    const bp = await this.blueprintForRules(courseId, ownerId, blueprintNumber, rulesVersion);
     const source = sourceOf(bp);
     const m = buildGenerationManifest(bp.snapshot, source, { rulesVersion });
 
@@ -124,7 +125,9 @@ export class GenerationManifestsService {
     // generation-v2.sql); sin esa migración el CHECK cgm_counts_consistent
     // viejo rechaza el total (falla fuerte, nunca un Manifest v2 a medias).
     const inserted = returningRows(
-      rulesVersion === 2
+      rulesVersion === 3
+        ? await this.insertV3(courseId, bp.id, bp.sha256, canonical, sha, t, ownerId)
+        : rulesVersion === 2
         ? await this.dataSource.query(
             `insert into public.course_generation_manifests
                (course_id, blueprint_id, rules_version, manifest_schema_version, manifest_json,
@@ -184,7 +187,7 @@ export class GenerationManifestsService {
     blueprintNumber: number,
     rulesVersion: ManifestRulesVersion = this.configuredRulesVersion(),
   ): Promise<ManifestDto> {
-    const bp = await this.blueprints.getByNumber(courseId, ownerId, blueprintNumber);
+    const bp = await this.blueprintForRules(courseId, ownerId, blueprintNumber, rulesVersion);
     const row = await this.findRow(courseId, bp.id, rulesVersion);
     if (!row) {
       throw new NotFoundException(
@@ -202,7 +205,66 @@ export class GenerationManifestsService {
    * Manifest actual" de la config (fix wave review-rv2).
    */
   async assertBlueprintAccessible(courseId: number, ownerId: string, blueprintNumber: number): Promise<void> {
-    await this.blueprints.getByNumber(courseId, ownerId, blueprintNumber);
+    // V2.1 (R4): acceso = ownership + dynamic + existencia, sin importar el
+    // schemaVersion del Blueprint (un run v3 tiene Blueprint v2).
+    await this.blueprints.getByNumberAnySchema(courseId, ownerId, blueprintNumber);
+  }
+
+  /**
+   * V2.1 (R4): Blueprint para un rulesVersion. v1/v2 → `getByNumber` (igual
+   * que antes: un Blueprint v2 da 501 BLUEPRINT_V2_REQUIRES_RULES_V3). v3 →
+   * cualquier schema, pero exige schemaVersion 2: un Blueprint v1 (lockeado
+   * antes de pasar la config a 3) da 409 BLUEPRINT_SCHEMA_MISMATCH con la
+   * acción (re-lockear) — nunca se arma un Manifest v3 sin los toggles v2.
+   */
+  private async blueprintForRules(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+    rulesVersion: ManifestRulesVersion,
+  ): Promise<AnyBlueprintDto> {
+    if (rulesVersion !== 3) return this.blueprints.getByNumber(courseId, ownerId, blueprintNumber);
+    const bp = await this.blueprints.getByNumberAnySchema(courseId, ownerId, blueprintNumber);
+    if (bp.schemaVersion !== 2) {
+      throw new ConflictException({
+        code: BLUEPRINT_SCHEMA_MISMATCH,
+        message:
+          `${BLUEPRINT_SCHEMA_MISMATCH}: el Blueprint v${bp.blueprintNumber} del curso #${courseId} es schemaVersion ` +
+          `${bp.schemaVersion} y DYNAMIC_MANIFEST_RULES_VERSION=3 requiere schemaVersion 2. Congelá (lock) un Blueprint ` +
+          'nuevo con la config actual para generar con las reglas v3.',
+      });
+    }
+    return bp;
+  }
+
+  /** INSERT v3: columnas de conteo v2 + v3 (supabase-migration-v21-manifest-v3.sql); scorm_count = 0. */
+  private async insertV3(
+    courseId: number,
+    blueprintId: number,
+    blueprintSha: string,
+    canonical: string,
+    sha: string,
+    t: ManifestTotals,
+    ownerId: string,
+  ): Promise<any> {
+    return this.dataSource.query(
+      `insert into public.course_generation_manifests
+         (course_id, blueprint_id, rules_version, manifest_schema_version, manifest_json,
+          manifest_sha256, blueprint_sha256, module_count, chapter_count, content_count,
+          scorm_count, video_count, exam_count, total_jobs, created_by,
+          course_plan_count, course_intro_count, module_intro_count,
+          experience_count, presentation_count, video_interactions_count, activity_count,
+          audiobook_chapter_count, audio_welcome_count, final_exam_count)
+       values ($1, $2, 3, $3, $4::jsonb, $5, $6, $7, $8, $9, 0, $10, $11, $12, $13, $14, $15, $16,
+               $17, $18, $19, $20, $21, $22, $23)
+       on conflict (blueprint_id, rules_version) do nothing
+       returning *`,
+      [courseId, blueprintId, MANIFEST_SCHEMA_VERSION, canonical, sha, blueprintSha,
+        t.moduleCount, t.chapterCount, t.contentCount, t.videoCount, t.examCount, t.totalJobs, ownerId,
+        t.coursePlanCount, t.courseIntroCount, t.moduleIntroCount,
+        t.experienceCount, t.presentationCount, t.videoInteractionsCount, t.activityCount,
+        t.audiobookChapterCount, t.audioWelcomeCount, t.finalExamCount],
+    );
   }
 
   /**
@@ -222,7 +284,10 @@ export class GenerationManifestsService {
    * este Blueprint.
    */
   async getById(courseId: number, ownerId: string, blueprintNumber: number, manifestId: number): Promise<ManifestDto> {
-    const bp = await this.blueprints.getByNumber(courseId, ownerId, blueprintNumber);
+    // V2.1 (R4): cualquier schema; toDto valida el par (rulesVersion, schema)
+    // y un Manifest v1/v2 sobre un Blueprint v2 (imposible por construcción)
+    // sería BLUEPRINT_SCHEMA_MISMATCH → 500 de integridad.
+    const bp = await this.blueprints.getByNumberAnySchema(courseId, ownerId, blueprintNumber);
     const id = Number(manifestId);
     const [row] = Number.isInteger(id)
       ? await this.dataSource.query(
@@ -255,7 +320,7 @@ export class GenerationManifestsService {
    * snapshot del Blueprint y se comparan las columnas de conteo. Cualquier
    * discrepancia → 500 explícito (nunca se devuelve un Manifest corrupto).
    */
-  private toDto(row: any, bp: BlueprintDto): ManifestDto {
+  private toDto(row: any, bp: AnyBlueprintDto): ManifestDto {
     const where = `Generation Manifest #${row.id} (Blueprint v${bp.blueprintNumber}, curso #${bp.courseId})`;
     const stored = typeof row.manifest_json === 'string' ? JSON.parse(row.manifest_json) : row.manifest_json;
 
@@ -312,6 +377,12 @@ export class GenerationManifestsService {
     // que es lo que declara un Manifest v1).
     cols.push(row.course_plan_count ?? 0, row.course_intro_count ?? 0, row.module_intro_count ?? 0);
     fromJson.push(t.coursePlanCount ?? 0, t.courseIntroCount ?? 0, t.moduleIntroCount ?? 0);
+    // v3 (R4): scorm_count = 0 (no hay items scorm) + columnas v3 (0 en v1/v2).
+    if (manifest.rulesVersion === 3) fromJson[3] = t.scormCount ?? 0;
+    cols.push(row.experience_count ?? 0, row.presentation_count ?? 0, row.video_interactions_count ?? 0,
+      row.activity_count ?? 0, row.audiobook_chapter_count ?? 0, row.audio_welcome_count ?? 0, row.final_exam_count ?? 0);
+    fromJson.push(t.experienceCount ?? 0, t.presentationCount ?? 0, t.videoInteractionsCount ?? 0,
+      t.activityCount ?? 0, t.audiobookChapterCount ?? 0, t.audioWelcomeCount ?? 0, t.finalExamCount ?? 0);
     if (cols.some((v, i) => v !== fromJson[i])) {
       throw new InternalServerErrorException(
         `${where}: columnas de conteo [${cols.join(',')}] no coinciden con totals del manifest [${fromJson.join(',')}]`,

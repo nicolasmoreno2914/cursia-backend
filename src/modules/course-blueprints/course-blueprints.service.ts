@@ -443,7 +443,7 @@ export class CourseBlueprintsService {
     if (dto.schemaVersion !== 1) {
       throw new NotImplementedException(
         `${BLUEPRINT_V2_REQUIRES_RULES_V3}: el Blueprint v${n} del curso #${courseId} es schemaVersion ` +
-          `${dto.schemaVersion} y solo lo procesan las reglas v3 (bloque R4, todavía no implementado).`,
+          `${dto.schemaVersion} y solo lo procesan las reglas v3 (Manifest rulesVersion 3); este consumidor es v1/v2.`,
       );
     }
     return dto;

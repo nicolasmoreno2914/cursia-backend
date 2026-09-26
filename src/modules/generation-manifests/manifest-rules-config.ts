@@ -12,15 +12,18 @@ import type { ManifestRulesVersion } from './generation-manifest-builder';
  * inválido nunca aborta el boot de la API legacy ni de los workers (I4
  * review-rv2).
  *
- * V2.1 (R3): "3" es un valor válido de config (el lock crea Blueprints
- * schemaVersion 2), pero crear/leer Manifests con "3" lanza
- * NOT_IMPLEMENTED_RULES_V3 hasta R4. El default sigue siendo 1.
+ * V2.1: "3" crea Manifests rulesVersion 3 (R4) sobre Blueprints schemaVersion
+ * 2 (el lock los crea con esta misma config, R3). El default sigue siendo 1.
  */
 export const MANIFEST_RULES_VERSION_ENV = 'DYNAMIC_MANIFEST_RULES_VERSION';
 
-/** Valores que acepta la config. 3 = V2.1 (Blueprint schemaVersion 2); su builder de Manifest es R4. */
+/** Valores que acepta la config. 3 = V2.1 (Blueprint schemaVersion 2 + Manifest rulesVersion 3). */
 export type ConfiguredRulesVersion = 1 | 2 | 3;
 
+/**
+ * @deprecated R4 implementó el builder v3: `readManifestRulesVersionConfig`
+ * ya no lanza este código. Se conserva el export por compatibilidad.
+ */
 export const NOT_IMPLEMENTED_RULES_V3 = 'NOT_IMPLEMENTED_RULES_V3';
 
 /**
@@ -45,17 +48,10 @@ export function blueprintSchemaVersionForRules(rules: ConfiguredRulesVersion): 1
 }
 
 /**
- * rulesVersion para CREAR/LEER Manifests (builder v1/v2). Con "3" lanza
- * `NOT_IMPLEMENTED_RULES_V3` hasta que R4 implemente el builder v3: nunca se
- * cae en silencio a v1/v2 con un Blueprint v2.
+ * rulesVersion para CREAR/LEER Manifests: 1 | 2 | 3 (fail-fast con cualquier
+ * otro valor, sin fallback). Con 3 el builder exige un Blueprint schemaVersion
+ * 2 (`BLUEPRINT_SCHEMA_MISMATCH` si no).
  */
 export function readManifestRulesVersionConfig(env: NodeJS.ProcessEnv = process.env): ManifestRulesVersion {
-  const rules = readConfiguredRulesVersion(env);
-  if (rules === 3) {
-    throw new Error(
-      `${NOT_IMPLEMENTED_RULES_V3}: ${MANIFEST_RULES_VERSION_ENV}=3 (V2.1) todavía no tiene builder de Generation ` +
-        'Manifest (bloque R4). El lock de Blueprints ya produce snapshots schemaVersion 2 con esta config.',
-    );
-  }
-  return rules;
+  return readConfiguredRulesVersion(env);
 }

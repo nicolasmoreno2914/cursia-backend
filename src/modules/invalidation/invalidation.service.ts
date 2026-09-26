@@ -1,4 +1,4 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { ConflictException, Injectable, NotFoundException, NotImplementedException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { GenerationManifestsService } from '../generation-manifests/generation-manifests.service';
 import type { ManifestItemType } from '../generation-manifests/generation-manifest-builder';
@@ -8,6 +8,7 @@ import { ACTIVE_RUN_WORKER_STATUSES } from '../dynamic-generation/item-transitio
 import { canonicalContextHash } from '../dynamic-generation/run-hash';
 import { computePlanFromDb, planApplyWrites } from './invalidation-apply';
 import type { InvalidationPlan } from './plan';
+import { INVALIDATION_V3_NOT_IMPLEMENTED, assertInvalidationRulesSupported } from './plan';
 
 export interface InvalidationPlanResponse {
   /** true: ya existe el run B de este par (A, Mb) — se devuelve el plan que se aplicó. */
@@ -61,6 +62,12 @@ export class InvalidationService {
     if (!rowA) throw new NotFoundException(`La ejecución de origen ${fromRunId} no existe para el curso #${courseId}`);
     const bpNumberA = Number(rowA.input_payload?.blueprintNumber);
     const manifestA = await this.manifests.getById(courseId, ownerId, bpNumberA, Number(rowA.input_payload?.manifestId));
+    // V2.1 (R4): invalidación v3 = R5. 501 explícito antes de leer Blueprints (fail loud).
+    try {
+      assertInvalidationRulesSupported(manifestA.rulesVersion, manifestB.rulesVersion);
+    } catch (err) {
+      throw new NotImplementedException({ code: INVALIDATION_V3_NOT_IMPLEMENTED, message: (err as Error).message });
+    }
     if (manifestA.id === manifestB.id) {
       throw new ConflictException(
         `La ejecución ${fromRunId} ya es del Manifest #${manifestB.id}: no hay cambio de estructura que aplicar. runId=${fromRunId}`,

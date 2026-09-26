@@ -9,7 +9,7 @@
 //     check-generation-manifest-determinism.js);
 //   - v2: forma, orden de claves, determinismo, validador;
 //   - readSnapshotAsV2 (compat §S);
-//   - config DYNAMIC_MANIFEST_RULES_VERSION=3 (lock v2, Manifest → NOT_IMPLEMENTED_RULES_V3);
+//   - config DYNAMIC_MANIFEST_RULES_VERSION=3 (lock v2; Manifest v3 desde R4);
 //   - perfiles: defaults (ambos sets de pesos), validadores, sha determinístico;
 //   - perfiles FUERA de las huellas de invalidación.
 // Parte DB (default; se salta SOLO con --pure-only, y lo dice): Postgres 16
@@ -230,12 +230,13 @@ async function pureChecks() {
     eq(snap.anySnapshotSha256(snap.buildBlueprintSnapshot(V1_FIXED_COURSE, V1_FIXED_MODULES, V1_FIXED_CHAPTERS)), V1_PINNED_SHA, 'anySnapshotSha256 v1');
   });
 
-  await check('config: DYNAMIC_MANIFEST_RULES_VERSION 1/2 sin cambios; 3 → Blueprint v2 y Manifest NOT_IMPLEMENTED_RULES_V3; basura → throw', () => {
+  await check('config: DYNAMIC_MANIFEST_RULES_VERSION 1/2 sin cambios; 3 → Blueprint v2 y Manifest v3 (R4); basura → throw', () => {
     const E = rulesCfg.MANIFEST_RULES_VERSION_ENV;
     eq(rulesCfg.readManifestRulesVersionConfig({}), 1, 'ausente');
     eq(rulesCfg.readManifestRulesVersionConfig({ [E]: '1' }), 1, '1');
     eq(rulesCfg.readManifestRulesVersionConfig({ [E]: '2' }), 2, '2');
-    throwsRe(() => rulesCfg.readManifestRulesVersionConfig({ [E]: '3' }), /^NOT_IMPLEMENTED_RULES_V3/, 'manifest v3');
+    // R4 levantó NOT_IMPLEMENTED_RULES_V3: el Manifest v3 ya existe.
+    eq(rulesCfg.readManifestRulesVersionConfig({ [E]: '3' }), 3, 'manifest v3 (R4)');
     for (const bad of ['4', 'v3', ' 3']) throwsRe(() => rulesCfg.readConfiguredRulesVersion({ [E]: bad }), /inválido/, `"${bad}"`);
     eq([1, 2, 3].map((r) => rulesCfg.blueprintSchemaVersionForRules(r)), [1, 1, 2], 'schemaVersion por regla');
     eq(rulesCfg.blueprintSchemaVersionForRules(rulesCfg.readConfiguredRulesVersion({})), 1, 'default staging → v1');
