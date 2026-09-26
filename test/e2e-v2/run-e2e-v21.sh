@@ -34,17 +34,25 @@ mkdir -p "$SCRATCH" "$SHOTS" "$REG"
 rm -f "$REG"/*.log
 
 MOODLE_PG_STARTED=0
+forceclean_now() { (cd "$MOODLE/source" && "$PHP_BIN" -c "$MOODLE/php.ini" admin/cli/cfg.php --name=forceclean 2>/dev/null); }
 finish() {
-  # El Postgres del Moodle local solo se detiene si lo arrancó esta corrida (nunca --purge).
-  if [ "$MOODLE_PG_STARTED" = "1" ]; then "$MOODLE/teardown.sh" >/dev/null 2>&1 || true; fi
-  # Red de seguridad: forceclean siempre en 0 al terminar (idempotente).
+  # 1º red de seguridad de forceclean (idempotente) MIENTRAS el Postgres del Moodle sigue arriba;
+  # recién después se detiene ese Postgres, y solo si lo arrancó esta corrida (nunca --purge).
   if pg_isready -h 127.0.0.1 -p 5570 >/dev/null 2>&1; then
-    v=$(cd "$MOODLE/source" && "$PHP_BIN" -c "$MOODLE/php.ini" admin/cli/cfg.php --name=forceclean 2>/dev/null)
-    [ "$v" != "0" ] && (cd "$MOODLE/source" && "$PHP_BIN" -c "$MOODLE/php.ini" admin/cli/cfg.php --name=forceclean --set=0 && "$PHP_BIN" -c "$MOODLE/php.ini" admin/cli/purge_caches.php) >/dev/null 2>&1
+    v=$(forceclean_now)
+    if [ "$v" != "0" ]; then
+      (cd "$MOODLE/source" && "$PHP_BIN" -c "$MOODLE/php.ini" admin/cli/cfg.php --name=forceclean --set=0 && "$PHP_BIN" -c "$MOODLE/php.ini" admin/cli/purge_caches.php) >/dev/null 2>&1
+      v=$(forceclean_now)
+    fi
+    echo "forceclean al salir (leído): $v"
   fi
+  lsof -tiTCP:8099 -sTCP:LISTEN >/dev/null 2>&1 && echo "ATENCIÓN: algo sigue escuchando en 127.0.0.1:8099"
+  if [ "$MOODLE_PG_STARTED" = "1" ]; then "$MOODLE/teardown.sh" >/dev/null 2>&1 || true; fi
   echo "total run-e2e-v21: $(( $(date +%s) - T0 )) s"
 }
 trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
   echo "== npm run build (backend) =="
@@ -72,7 +80,16 @@ else
 fi
 
 REG_RC=0
+# Regresión bajo netguard (toda conexión fuera de 127.0.0.1 se bloquea y se registra por
+# proveedor) y con un entorno LIMPIO: sin claves ni URLs de proveedores del shell del usuario.
+# Chrome (checks de reproductor/visual) con la misma red restringida que el QA.
+ALLOW_CHROME="MAP * ~NOTFOUND, EXCLUDE 127.0.0.1, EXCLUDE localhost, EXCLUDE youtube.com, EXCLUDE *.youtube.com, EXCLUDE youtube-nocookie.com, EXCLUDE *.youtube-nocookie.com, EXCLUDE *.ytimg.com, EXCLUDE *.googlevideo.com, EXCLUDE *.ggpht.com"
+env | cut -d= -f1 | grep -E 'API_KEY|ANTHROPIC|OPENAI|GAMMA|VIDEOGEN|ELEVEN|YOUTUBE|GOOGLE|SUPABASE|SECRET|TOKEN|_KEY$' | sort > "$REG/scrubbed-env-names.txt" || true
+: > "$REG/net.log"
+CLEAN_ENV=(env -i PATH="$PATH" HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-}" TMPDIR="${TMPDIR:-/tmp}" LANG=C LC_ALL=C
+  PHP_BIN="$PHP_BIN" NODE_OPTIONS="--require $HERE/netguard.js" E2E_NET_LOG="$REG/net.log" CURSIA_CHROME_HOST_RESOLVER_RULES="$ALLOW_CHROME")
 if [ "${E2E_SKIP_REGRESSION:-0}" != "1" ]; then
+  echo "(entorno limpio: $(wc -l < "$REG/scrubbed-env-names.txt" | tr -d ' ') variables de proveedor/credenciales del shell NO se pasan; netguard activo)"
   echo "== 3. Regresión: checks del backend =="
   for f in "$REPO"/scripts/check-*.js; do
     n=$(basename "$f" .js)
@@ -82,7 +99,7 @@ if [ "${E2E_SKIP_REGRESSION:-0}" != "1" ]; then
       check-v21-video-moodle) a=("$MOODLE/source" "$MOODLE/php.ini" --creds "$CREDS" --shots "$SHOTS/regression-video") ;;
       *) a=() ;;
     esac
-    (cd "$REPO" && node "$f" "${a[@]+"${a[@]}"}") > "$REG/$n.log" 2>&1
+    (cd "$REPO" && "${CLEAN_ENV[@]}" node "$f" "${a[@]+"${a[@]}"}") > "$REG/$n.log" 2>&1
     rc=$?
     echo "$rc" > "$REG/$n.rc"
     [ $rc -ne 0 ] && REG_RC=1
@@ -92,24 +109,34 @@ if [ "${E2E_SKIP_REGRESSION:-0}" != "1" ]; then
            "prod-run-local-pg-tests:scripts/prod/test/run-local-pg-tests.js:" \
            "prod-legacy-app-compat:scripts/prod/test/run-legacy-app-compat-test.js:"; do
     n="${h%%:*}"; rest="${h#*:}"; s="${rest%%:*}"; arg="${rest#*:}"
-    if [ -n "$arg" ]; then (cd "$REPO" && node "$s" "$REPO/$arg") > "$REG/$n.log" 2>&1; else (cd "$REPO" && node "$s") > "$REG/$n.log" 2>&1; fi
+    if [ -n "$arg" ]; then (cd "$REPO" && "${CLEAN_ENV[@]}" node "$s" "$REPO/$arg") > "$REG/$n.log" 2>&1; else (cd "$REPO" && "${CLEAN_ENV[@]}" node "$s") > "$REG/$n.log" 2>&1; fi
     rc=$?; echo "$rc" > "$REG/$n.rc"; [ $rc -ne 0 ] && REG_RC=1
     printf '%-48s rc=%s ✅%s ❌%s\n' "$n" "$rc" "$(grep -cE '^[[:space:]]*✅' "$REG/$n.log")" "$(grep -cE '^[[:space:]]*❌' "$REG/$n.log")"
   done
   echo "== 3b. Regresión: harnesses del frontend =="
   for f in "$FE"/src/js/__harness__/*.mjs; do
     n="fe-$(basename "$f" .mjs)"
-    (cd "$FE" && NODE_PATH="${E2E_JSDOM_NODE_PATH:-}" node "$f") > "$REG/$n.log" 2>&1
+    (cd "$FE" && "${CLEAN_ENV[@]}" NODE_PATH="${E2E_JSDOM_NODE_PATH:-}" node "$f") > "$REG/$n.log" 2>&1
     rc=$?; echo "$rc" > "$REG/$n.rc"; [ $rc -ne 0 ] && REG_RC=1
     printf '%-48s rc=%s ✅%s ❌%s\n' "$n" "$rc" "$(grep -cE '^[[:space:]]*✅' "$REG/$n.log")" "$(grep -cE '^[[:space:]]*❌' "$REG/$n.log")"
   done
 fi
 
-echo "== 4. Resumen =="
+echo "== 4. forceclean final =="
+FC_RC=0
+FC=$(forceclean_now)
+echo "forceclean (leído con admin/cli/cfg.php): $FC"
+echo "$FC" > "$SCRATCH/forceclean-final.txt"
+[ "$FC" != "0" ] && FC_RC=1
+lsof -tiTCP:8099 -sTCP:LISTEN >/dev/null 2>&1 && { echo "servidor en 8099 sigue arriba"; FC_RC=1; }
+
+echo "== 5. Resumen =="
 node "$HERE/summary-v21.js" "$SCRATCH" | tee "$SCRATCH/summary.txt"
 RC=0
 [ $E2E_RC -ne 0 ] && RC=1
 [ $QA_RC -ne 0 ] && RC=1
 [ $REG_RC -ne 0 ] && RC=1
-echo "run-e2e-v21 exit=$RC (e2e=$E2E_RC qa=$QA_RC regresión=$REG_RC)"
+[ $FC_RC -ne 0 ] && RC=1
+grep -q "^RESULTADO: PASS" "$SCRATCH/summary.txt" || RC=1
+echo "run-e2e-v21 exit=$RC (e2e=$E2E_RC qa=$QA_RC regresión=$REG_RC forceclean/servidores=$FC_RC)"
 exit $RC

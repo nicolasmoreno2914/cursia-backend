@@ -35,6 +35,8 @@ const { makeFront } = require('./front');
 const { createLlm } = require('./llm');
 const { createLlmV3 } = require('./llm-v3');
 const D = (p) => require(path.join(REPO, 'dist', p));
+const SHELL_TYPES = require(path.join(REPO, 'dist', 'modules/course-shell/index.js'));
+const PV = require('./providers');
 
 const PGPORT = Number(process.env.PGPORT_T);
 const APP_PORT = Number(process.env.APP_PORT || 38471) + 7;
@@ -144,8 +146,8 @@ const CTX = { sector: 'Minería', pais: 'Chile', ciudad: 'Antofagasta', contexto
 const COURSES = [
   { key: 'E1', title: '[E2E V2.1 E1] Hidráulica de planta', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'h5p', modules: [
     { title: 'Fundamentos del circuito', objective: 'Comprender presión y caudal', exam: true, chapters: [
-      { title: 'Presión y caudal en planta', v: true, a: true },
-      { title: 'Fluidos y contaminación del aceite', v: false, a: true },
+      { title: 'Presión y caudal en planta', v: true, a: true, h5p: 'questionset' },
+      { title: 'Fluidos y contaminación del aceite', v: false, a: true, h5p: 'dragtext' },
     ] },
     { title: 'Componentes de potencia', objective: 'Seleccionar bombas y actuadores', exam: false, chapters: [
       { title: 'Bombas de engranajes y paletas', v: true, a: false },
@@ -166,7 +168,7 @@ const COURSES = [
   ] },
   { key: 'E3', title: '[E2E V2.1 E3] Válvulas y control', theme: { themeFamily: 'tecnico', mode: 'dark' }, passing: 80, finalExam: true, engine: 'h5p', modules: [
     { title: 'Válvulas direccionales', objective: 'Leer esquemas de válvulas', exam: true, chapters: [
-      { title: 'Esquemas de centros de válvula', v: true, a: true },
+      { title: 'Esquemas de centros de válvula', v: true, a: true, h5p: 'blanks' },
       { title: 'Solenoides y mando', v: false, a: false },
     ] },
     { title: 'Control de presión', objective: 'Ajustar válvulas de alivio', exam: true, chapters: [{ title: 'Válvulas de alivio y secuencia', v: false, a: true }] },
@@ -225,11 +227,28 @@ async function createCourse(C, llm) {
     for (let i = 0; i < ms.chapters.length; i++) {
       const cs = ms.chapters[i];
       const body = { title: cs.title, objective: `Aplicar ${cs.title.toLowerCase()}`, videoEnabled: cs.v, activityEnabled: cs.a, expectedCounter: counter };
-      const r = i === 0 && auto.length === 1
+      const isAuto = i === 0 && auto.length === 1;
+      const r = isAuto
         ? await api('PATCH', `/courses/${courseId}/modules/${mid}/chapters/${auto[0].id}`, body)
         : await api('POST', `/courses/${courseId}/modules/${mid}/chapters`, body);
       if (![200, 201].includes(r.status)) throw new Error(`capítulo "${cs.title}": ${r.status} ${r.error}`);
       counter = r.data.structureVersionCounter;
+      // R13 fix round 1 (I5): cobertura DETERMINÍSTICA de los 3 tipos H5P calificables. El tipo sale
+      // del UUID del capítulo (R-012, FNV-1a); si no coincide con el pedido, se crea el capítulo de
+      // nuevo (UUID nuevo) y se borra el anterior, hasta que la rotación dé el tipo pedido.
+      if (cs.h5p) {
+        let curId = isAuto ? auto[0].id : r.data.chapter.id;
+        for (let tries = 0; SHELL_TYPES.activityTypeForChapter(curId) !== cs.h5p; tries++) {
+          if (tries > 60) throw new Error(`no se obtuvo un UUID con tipo ${cs.h5p} para "${cs.title}"`);
+          const nw = await api('POST', `/courses/${courseId}/modules/${mid}/chapters`, { ...body, expectedCounter: counter });
+          if (nw.status !== 201) throw new Error(`recrear capítulo: ${nw.status} ${nw.error}`);
+          counter = nw.data.structureVersionCounter;
+          const del = await api('DELETE', `/courses/${courseId}/modules/${mid}/chapters/${curId}`, { expectedCounter: counter });
+          if (del.status !== 200) throw new Error(`borrar capítulo: ${del.status} ${del.error}`);
+          counter = del.data.structureVersionCounter;
+          curId = nw.data.chapter.id;
+        }
+      }
     }
   }
   st = await readStructure(courseId);
@@ -473,8 +492,25 @@ async function ledgerRows(where = 'true', params = []) {
           ok(os.sourceIdsHash !== results.mbz.E1.summary.sourceIdsHash, 'E1-repack: clave de reuse distinta (tema/perfil forman parte de la clave)');
           // Los .h5p de contenido no cambian con el tema (solo passPercentage de QS si aplica).
           const z1 = await JSZip.loadAsync(S.E1.pkg.buf); const z2 = await JSZip.loadAsync(P.buf);
-          const names1 = Object.keys(z1.files).filter((f) => /^files\//.test(f)).length; const names2 = Object.keys(z2.files).filter((f) => /^files\//.test(f)).length;
-          ok(names1 > 0 && names2 > 0, `E1-repack: blobs en ambos paquetes (${names1} / ${names2})`);
+          // M7: los ids de origen del resumen existen como artifacts ready del run, y los blobs de
+          // contenido (MP3, PDF, PNG de portada) son byte-idénticos entre los dos paquetes.
+          const runArts = await artifactsOfRun(c.runId);
+          const runIds = new Set(runArts.map((a) => a.id));
+          ok(os.sourceArtifactIds.length > 0 && os.sourceArtifactIds.every((id) => runIds.has(id)) && runArts.filter((a) => os.sourceArtifactIds.includes(a.id)).every((a) => a.status === 'ready'),
+            `E1-repack: los ${os.sourceArtifactIds.length} sourceArtifactIds son artifacts ready de ESTE run (cruce con la DB)`);
+          const blobs = async (z) => {
+            const fx = await z.file('files.xml').async('string');
+            const m = {};
+            for (const f of fx.match(/<file id="\d+">[\s\S]*?<\/file>/g) || []) {
+              const fnm = (/<filename>([^<]*)<\/filename>/.exec(f) || [])[1] || '';
+              const ext = (/\.(mp3|pdf|png|h5p|html)$/.exec(fnm) || [])[1];
+              if (ext) (m[ext] = m[ext] || new Set()).add(/<contenthash>(\w+)<\/contenthash>/.exec(f)[1]);
+            }
+            return Object.fromEntries(Object.entries(m).map(([k, v]) => [k, [...v].sort()]));
+          };
+          const b1 = await blobs(z1); const b2 = await blobs(z2);
+          eq([b2.mp3, b2.pdf, b2.png], [b1.mp3, b1.pdf, b1.png], `E1-repack: MP3 (${(b1.mp3 || []).length}), PDF (${(b1.pdf || []).length}) y PNG (${(b1.png || []).length}) byte-idénticos entre E1 y E1-repack`);
+          ok((b1.h5p || []).length > 0 && (b1.h5p || []).length === (b2.h5p || []).length, `E1-repack: misma cantidad de paquetes .h5p (${(b1.h5p || []).length}); cambian solo por passPercentage/tema`);
           results.courses.E1repack = { ...results.courses.E1, theme: { themeFamily: 'tecnico', mode: 'dark' }, passing: 80, packageSummary: os };
         });
       }
@@ -508,25 +544,44 @@ async function ledgerRows(where = 'true', params = []) {
       const blocked = fs.readFileSync(NET_LOG, 'utf8').trim();
       ok(blocked === '', 'netguard (app + 3 workers): 0 conexiones fuera de 127.0.0.1 ⇒ 0 llamadas a proveedores reales', blocked.slice(0, 800));
       eq(frontNet, [], 'navegador simulado: 0 fetch fuera de 127.0.0.1');
+      // R13 fix round 1 (I1): conteos MEDIDOS por proveedor. netguard registra cada conexión saliente
+      // fuera de 127.0.0.1 de la app y de los 3 workers (host + proceso); el navegador simulado registra
+      // cada fetch fuera de 127.0.0.1 / /api/proxy. Se clasifican por host de proveedor pagado.
+      const ng = PV.countNetguardLog(NET_LOG);
+      const fn = PV.countUrls(frontNet);
+      const attempts = PV.emptyCounts();
+      for (const k of PV.PROVIDERS) attempts[k] = ng.byProvider[k] + fn.byProvider[k];
+      results.frontNet = frontNet.slice();
       results.counters = {
-        realProviderCalls: blocked === '' && frontNet.length === 0 ? 0 : 'VIOLATION',
-        netguardBlocked: blocked ? blocked.split('\n').length : 0,
-        fakeVideogenSubmissions: FAKES.videogen.submissions.length,
-        fakeGoogleUploads: g.uploads.length,
-        fakeGoogleCalls: g.calls.length,
-        fakeLlmCalls: llm.st.calls.length,
+        scope: 'fase v3: app Nest + dynamic-item/provider/package-worker (netguard) + ejecutor del navegador (vm)',
+        realAttemptsByProvider: attempts,
+        netguardBlockedTotal: ng.total,
+        netguardOtherHosts: ng.otherHosts,
+        frontBlockedTotal: fn.total,
+        fakeReached: {
+          anthropic_via_api_proxy_fake: llm.st.calls.length,
+          videogen_fake_submissions: FAKES.videogen.submissions.length,
+          google_fake_calls: g.calls.length,
+          google_fake_uploads: g.uploads.length,
+          gamma_mock_ledger: ev.filter((e) => e.provider === 'gamma' && e.cost_source === 'MOCK').length,
+          tts_mock_ledger: ev.filter((e) => e.provider === 'openai' && e.cost_source === 'MOCK').length,
+        },
         fakeLlmInvalidFirst: llm.st.invalidSent,
         fakeLlmRetriesSeen: llm.st.retriesSeen,
-        gammaRealCalls: 0, ttsRealCalls: 0, anthropicRealCalls: 0, videogenRealCalls: 0, youtubeRealCalls: 0,
       };
+      eq(attempts, PV.emptyCounts(), `intentos REALES medidos por proveedor (netguard + navegador simulado): ${JSON.stringify(attempts)}`);
+      ok(ev.filter((e) => ['gamma', 'openai'].includes(e.provider)).every((e) => e.cost_source === 'MOCK'), 'Gamma/TTS: todos los eventos del ledger son MOCK (ningún cliente real resuelto)');
+      const pwLog = fs.readFileSync(providerWorker.logFile, 'utf8');
+      ok(!/PROVIDER_NOT_WIRED_V21|provider_mock_not_allowed|PROVIDER_MODE_UNSET/.test(pwLog), 'dynamic-provider-worker: nunca tomó el camino real (sin PROVIDER_NOT_WIRED_V21 / modo no-mock en su log)');
       eq(FAKES.videogen.submissions.length, videoCount, `Videogen FALSO: ${videoCount} envíos (uno por video; ninguno en los 409 ni en el re-empaque)`);
       eq(g.uploads.length, videoCount, `Google FALSO: ${videoCount} subidas Unlisted`);
-      // Reintento dirigido: una respuesta inválida por tipo, una sola vez, y luego válida.
+      // Cobertura determinística (I5): los 3 tipos H5P calificables aparecen en E1+E3.
+      const types = [...new Set(['E1', 'E3'].flatMap((k) => results.courses[k].modules.flatMap((m) => m.chapters)).filter((x) => x.a).map((x) => SHELL_TYPES.activityTypeForChapter(x.id)))].sort();
+      eq(types, ['blanks', 'dragtext', 'questionset'], 'E1+E3: los 3 tipos H5P calificables (questionset, dragtext, blanks) por la rotación del UUID');
+      // Reintento dirigido: una respuesta inválida por tipo, una sola vez, y luego exactamente 1 reintento.
       const kinds = ['experience', 'course_intro', 'module_intro', 'video_interactions', 'h5p_questionset', 'h5p_dragtext', 'h5p_blanks', 'final_exam'];
-      const sent = llm.st.invalidSent;
-      const seenKinds = kinds.filter((k) => sent[k]);
-      ok(seenKinds.length >= 6 && seenKinds.every((k) => sent[k] === 1), `LLM falso: 1 respuesta inválida por tipo (${seenKinds.join(', ')})`, sent);
-      ok(seenKinds.every((k) => (llm.st.retriesSeen[k] || 0) >= 1), 'cada respuesta inválida produjo exactamente el reintento dirigido (validation_retry / continuation) y luego pasó', llm.st.retriesSeen);
+      eq(kinds.map((k) => llm.st.invalidSent[k] || 0), kinds.map(() => 1), `LLM falso: exactamente 1 respuesta inválida por cada uno de los ${kinds.length} tipos v3`);
+      eq(kinds.map((k) => llm.st.retriesSeen[k] || 0), kinds.map(() => 1), 'cada respuesta inválida produjo EXACTAMENTE 1 reintento dirigido (validation_retry / continuation) y luego pasó');
     }, { fatal: false });
 
     // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══
@@ -656,6 +711,19 @@ async function ledgerRows(where = 'true', params = []) {
           if (!ch.activityEnabled && /actividad (práctica|interactiva)/.test(t)) mention.push(`${ch.chapterId.slice(0, 8)} menciona actividad`);
         }
         eq(mention, [], `${label}: ningún label de capítulo menciona un video/actividad apagado`);
+        // M4: la ruta de aprendizaje lista, por capítulo, exactamente sus recursos (V/A).
+        const route = text('cv3:shell:route');
+        const titleOf = Object.fromEntries(info.modules.flatMap((m) => m.chapters).map((x) => [x.id, x.title]));
+        const routeBad = [];
+        for (const ch of chFlags) {
+          const t0 = route.indexOf(titleOf[ch.chapterId]);
+          if (t0 < 0) { routeBad.push(`${ch.chapterId.slice(0, 8)}: no está en la ruta`); continue; }
+          const rest = route.slice(t0 + titleOf[ch.chapterId].length);
+          const seg = rest.slice(0, Math.max(0, rest.search(/Capítulo \d|Módulo \d|Evaluación|Examen/)) || rest.length);
+          if (/video interactivo/.test(seg) !== ch.videoEnabled) routeBad.push(`${titleOf[ch.chapterId]}: video ${ch.videoEnabled}`);
+          if (/actividad práctica/.test(seg) !== ch.activityEnabled) routeBad.push(`${titleOf[ch.chapterId]}: actividad ${ch.activityEnabled}`);
+        }
+        eq(routeBad, [], `${label}: la ruta de aprendizaje lista por capítulo exactamente video/actividad según sus flags`);
         // ── simulación de notas por la API de Moodle ──
         const plan = { pass: {}, fail: {}, mixed: {} };
         const gradedList = graded.map((c) => ({ idnumber: c.idnumber, modname: c.modname, kind: kindOf(c.idnumber) }));

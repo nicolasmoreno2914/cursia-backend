@@ -53,3 +53,9 @@ E2E_JSDOM_NODE_PATH=/ruta/node_modules-con-jsdom \
   bash test/e2e-v2/run-e2e-v21.sh
 ```
 Opcionales: `SKIP_BUILD=1`, `E2E_SKIP_REGRESSION=1`. `run-e2e.sh` acepta además `E2E_SKIP_V2=1` (solo fases extra) y `E2E_AFTER` (comando extra antes del cleanup); ya no detiene el Postgres del Moodle local si no lo arrancó él.
+
+### R13 fix round 1 (review G6)
+- **Proveedores, medido:** `providers.js` clasifica por proveedor pagado (Anthropic, OpenAI, Gamma, Videogen, YouTube Data/upload/OAuth) cada intento saliente registrado por netguard (app, workers y ahora también la regresión, que corre con `NODE_OPTIONS=--require netguard.js` y un entorno limpio `env -i` sin claves del shell), por el navegador simulado y por Chrome (CDP `Network.requestWillBeSent` en la página y en cada iframe/worker adjuntado; red de Chrome restringida con `--host-resolver-rules` a 127.0.0.1 + hosts de reproducción de YouTube, también en los checks de Chrome de la regresión vía `CURSIA_CHROME_HOST_RESOLVER_RULES`). El resumen imprime la tabla medida por alcance.
+- **QA visual:** segunda pasada con todo abierto (`<details>`, revelados, cada pestaña); con forceclean=1, `extractText` de cada label = el de sin forceclean (100 %, por label), conteos exactos por capítulo y las mismas métricas visuales; overflow medido contra el ancho configurado (también en emulación móvil).
+- **H5P:** los fixtures fuerzan, por UUID, los 3 tipos calificables; el QA responde en el reproductor real QuestionSet, DragText, Blanks y el IV (nota 100 en DB y gradebook).
+- **forceclean:** el trap del runner lo restaura ANTES de detener el Postgres del Moodle (EXIT/INT/TERM) y el gate falla si al final no es 0.

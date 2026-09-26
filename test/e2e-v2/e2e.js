@@ -960,6 +960,7 @@ async function packageRun(label, courseId, n, runId, fakes) {
       const blocked = fs.readFileSync(NET_LOG, 'utf8').trim();
       ok(blocked === '', 'netguard (app + workers): 0 conexiones fuera de 127.0.0.1', blocked.slice(0, 1000));
       eq(frontNet, [], 'navegador simulado: 0 fetch fuera de 127.0.0.1 / /api/proxy');
+      results.frontNet = frontNet.slice();
       results.network = { storageRequests: fakes.storage.log.length, videogenSubmissions: fakes.videogen.submissions.length, httpsVideoDownloads: fakes.vids.downloads.length };
     });
   } catch (e) {
