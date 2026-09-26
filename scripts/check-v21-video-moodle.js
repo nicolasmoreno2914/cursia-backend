@@ -18,6 +18,9 @@
 //     del contenido en español (sin "Submit Answers" ni "Untitled").
 //  5. DB: 1 intento, nota esperada, COMPLETE_PASS/COMPLETE_FAIL, resultados con
 //     subContentId UUID (los 5 del paquete).
+// 5b. HD-V21-22: en la primera respuesta incorrecta no hay "Reintentar" y "Ver
+//     solución" no permite corregir; recargar = intento NUEVO limpio, 5/5 ⇒ 2
+//     intentos en la DB y gradebook = la nota más alta (100).
 //  6. 390 px: sin scroll horizontal y el enlace de respaldo visible. view.php: el
 //     iframe inline queda oculto (un solo reproductor).
 //
@@ -298,6 +301,23 @@ async function main() {
     const fbOk = wantCorrect ? fb.includes('¡Correcto') && fb.includes('Obtuviste 1 de 1 puntos') : fb.includes('No es correcto') && fb.includes('Obtuviste 0 de 1 puntos');
     report(`checkpoint ${cp.index}: puntaje acumulado ${runningScore} y feedback en español`, scored && fbOk, fb.replace(/\s+/g, ' ').slice(0, 240));
     if (i === 0) await b.screenshot(path.join(shotsDir, `r8-${scenario}-02-checkpoint1-answered.png`));
+    // HD-V21-22: en la primera respuesta incorrecta → no hay "Reintentar"; "Ver solución" sí, y ver la
+    // solución NO permite corregir (opciones bloqueadas) ni cambia el puntaje del intento.
+    if (!wantCorrect && CORRECT_PLAN.indexOf(false) === i) {
+      const box = `[...d.querySelectorAll('.h5p-interaction')].find(e=>e.offsetParent!==null&&e.innerText.includes(${JSON.stringify(q.question)}))`;
+      const btns = await b.evaluate(iv(`const box=${box};return [...box.querySelectorAll('button, .h5p-joubelui-button')].filter(x=>x.offsetParent!==null).map(x=>(x.innerText.trim()||x.getAttribute('aria-label')||'')).filter(Boolean);`));
+      report(`HD-V21-22 intento 1: tras responder mal no hay "Reintentar" y sí "Ver solución" (${btns.join(' | ')})`, !btns.some((t) => /^Reintentar|Reintentar la tarea/i.test(t)) && btns.some((t) => /^Ver (la )?solución/i.test(t)), btns);
+      await b.evaluate(iv(`const box=${box};[...box.querySelectorAll('button, .h5p-joubelui-button')].find(x=>/^Ver (la )?solución/i.test((x.innerText.trim()||x.getAttribute('aria-label')||''))).click();return 1;`));
+      await sleep(600);
+      const after = await b.evaluate(iv(`const box=${box};const opts=[...box.querySelectorAll('.h5p-answer, .h5p-true-false-answer')];
+        const o=opts.find(e=>!e.classList.contains('h5p-selected')&&!/selected/.test(e.getAttribute('aria-checked')||''));
+        if(o)o.click();
+        const btns=[...box.querySelectorAll('button, .h5p-joubelui-button')].filter(x=>x.offsetParent!==null).map(x=>(x.innerText.trim()||x.getAttribute('aria-label')||'')).filter(Boolean);
+        return JSON.stringify({score:iv.getUsersScore(),btns,disabled:opts.every(e=>e.getAttribute('aria-disabled')==='true'||e.classList.contains('h5p-disabled')||e.hasAttribute('disabled')||(e.closest('[aria-disabled="true"]')!==null))});`)).then(JSON.parse);
+      report('HD-V21-22 intento 1: ver la solución no permite corregir (sin Comprobar/Reintentar) y el puntaje no cambia',
+        after.score === runningScore && !after.btns.some((t) => /^Comprobar|^Reintentar/i.test(t)), after);
+      await b.screenshot(path.join(shotsDir, `r8-${scenario}-02b-solution-no-retry.png`));
+    }
     texts.push(await b.evaluate(COLLECT_TEXT));
   }
 
@@ -356,6 +376,38 @@ async function main() {
     return r ? r.rawscore === r.maxscore && r.maxscore > 0 : null;
   });
   report('DB: acierto por interacción coincide con lo respondido', JSON.stringify(childCorrect) === JSON.stringify(CORRECT_PLAN), childCorrect);
+
+  // ── 5b. HD-V21-22: mejorar la nota = NUEVO intento (recargar); nota = la más alta ──
+  await b.navigate(`${WWWROOT}/course/view.php?id=${R.courseid}`);
+  await b.waitFor(iv(`return iv.video&&iv.video.getDuration&&iv.video.getDuration()>0?1:0;`), { timeoutMs: 60000, what: 'IV recargado' });
+  const fresh = await b.evaluate(iv(`return iv.getUsersScore();`));
+  report('HD-V21-22 intento 2: al recargar la actividad empieza limpia (puntaje 0, no hereda el intento enviado)', fresh === 0, fresh);
+  for (let i = 0; i < PLAN.length; i++) {
+    const cp = PLAN[i];
+    const q = DOC.checkpoints[i];
+    const bank = BANK[i];
+    await b.evaluate(iv(`iv.video.seek(${cp.atSec + 1});iv.video.play();return 1;`));
+    await b.waitFor(iv(`const els=[...d.querySelectorAll('.h5p-interaction')].filter(e=>e.offsetParent!==null&&e.innerText.includes(${JSON.stringify(q.question)}));return els.length?1:0;`), { timeoutMs: 30000, what: `intento 2: interacción ${cp.index}` }).catch(() => 0);
+    const pick = q.kind === 'multichoice' ? bank.correct : bank.correct ? 'Verdadero' : 'Falso';
+    await b.evaluate(iv(`const box=[...d.querySelectorAll('.h5p-interaction')].find(e=>e.offsetParent!==null&&e.innerText.includes(${JSON.stringify(q.question)}));
+      if(!box)return 0;const o=[...box.querySelectorAll('.h5p-answer, .h5p-true-false-answer')].find(e=>e.innerText.trim()===${JSON.stringify(pick)});if(o)o.click();
+      const btn=[...box.querySelectorAll('button')].find(x=>x.innerText.trim()==='Comprobar');if(btn)btn.click();
+      const c=[...box.querySelectorAll('button')].find(x=>x.innerText.trim()==='Continuar');if(c)setTimeout(()=>c.click(),300);return 1;`));
+    await b.waitFor(iv(`return iv.getUsersScore()===${i + 1}?1:0;`), { timeoutMs: 10000, what: `intento 2: puntaje ${i + 1}` }).catch(() => 0);
+    await sleep(500);
+  }
+  const score2 = await b.evaluate(iv(`return iv.getUsersScore();`));
+  report(`HD-V21-22 intento 2: todas correctas ⇒ ${PLAN.length}/${PLAN.length}`, score2 === PLAN.length, score2);
+  await b.evaluate(iv(`iv.video.seek(${DURATION - 3});iv.video.play();return 1;`));
+  const sub2 = await b
+    .waitFor(iv(`const x=[...d.querySelectorAll('button, .h5p-joubelui-button')].find(e=>e.offsetParent!==null&&e.innerText.trim()==='Enviar respuestas');if(x){x.click();return 1}return 0;`), { timeoutMs: 40000, what: 'intento 2: Enviar respuestas' })
+    .then(() => true, () => false);
+  report('HD-V21-22 intento 2: envío', sub2);
+  await sleep(3000);
+  await b.screenshot(path.join(shotsDir, `r8-${scenario}-05-attempt2-submitted.png`));
+  const st2 = php('state', String(R.courseid), String(R.cmid), creds.username).data;
+  report('HD-V21-22 DB: 2 intentos registrados (el primero intacto)', st2.attempts.length === 2 && st2.attempts[0].rawscore === EXPECT_RAW && st2.attempts[1].rawscore === PLAN.length, st2.attempts);
+  report('HD-V21-22 DB: gradebook = la nota MÁS ALTA (100) y completion COMPLETE_PASS', st2.grade === 100 && st2.completion === 'COMPLETE_PASS', { grade: st2.grade, completion: st2.completion });
 
   // ── 6. view.php (un solo reproductor) y 390 px ──
   await b.navigate(`${WWWROOT}/mod/h5pactivity/view.php?id=${R.cmid}`);

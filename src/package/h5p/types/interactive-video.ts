@@ -154,7 +154,8 @@ export function buildInteractiveVideo(input: InteractiveVideoInput): H5pBuiltCon
       autoplay: false,
       loop: false,
       showSolutionButton: 'on',
-      retryButton: 'on',
+      // HD-V21-22: el override del IV fuerza el botón de cada interacción — sin reintento dentro del intento.
+      retryButton: 'off',
       showBookmarksmenuOnLoad: false,
       showRewind10: true,
       preventSkippingMode: 'none',

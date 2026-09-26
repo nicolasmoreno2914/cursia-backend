@@ -223,7 +223,9 @@ export function buildChoiceSubContent(
       })),
       overallFeedback: [{ from: 0, to: 100 }],
       behaviour: {
-        enableRetry: true,
+        // HD-V21-22: sin reintento DENTRO del intento (ver solución → corregir → 100 no se permite);
+        // mejorar la nota = intento nuevo (IV recargado / "Reintentar" final del QuestionSet).
+        enableRetry: false,
         enableSolutionsButton: true,
         enableCheckButton: true,
         type: 'auto',
@@ -245,7 +247,7 @@ export function buildChoiceSubContent(
     };
   }
   const behaviour: Record<string, unknown> = {
-    enableRetry: true,
+    enableRetry: false, // HD-V21-22 (ver arriba)
     enableSolutionsButton: true,
     enableCheckButton: true,
     confirmCheckDialog: false,
