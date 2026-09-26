@@ -27,6 +27,7 @@ export function formatDurationShortEs(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) {
     throw new RangeError(`formatDurationShortEs: duración inválida (${seconds})`);
   }
-  const minutes = Math.round(seconds / 60);
+  // Fix round 1 (M3): un audio de menos de medio minuto nunca se anuncia como "≈ 0 min".
+  const minutes = seconds > 0 ? Math.max(1, Math.round(seconds / 60)) : 0;
   return `≈ ${minutes} min`;
 }

@@ -98,7 +98,9 @@ export function parseFrameHeader(buf: Buffer, offset: number): FrameParseResult 
   // Xing/Info: aparece en el primer frame, en el lugar del side-info, cuando
   // el encoder describe el stream completo (frame placeholder, sin audio real).
   const sideInfoSize = channels === 1 ? (version === 'MPEG1' ? 17 : 9) : version === 'MPEG1' ? 32 : 17;
-  const xingOffset = offset + 4 + sideInfoSize;
+  // protection_bit = 0 → hay un CRC de 2 bytes tras el header (fix round 1, M2).
+  const crcBytes = (b1 & 0x01) === 0 ? 2 : 0;
+  const xingOffset = offset + 4 + crcBytes + sideInfoSize;
   let isXingOrInfo = false;
   let xingFrameCount: number | undefined;
   if (xingOffset + 8 <= offset + length && xingOffset + 8 <= buf.length) {

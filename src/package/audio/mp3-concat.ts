@@ -13,7 +13,7 @@
  *  - se descarta el frame Xing/Info de cada parte (mentiría sobre el total).
  */
 
-import { parseMp3 } from './mp3-parser';
+import { audioFramesOf, parseMp3 } from './mp3-parser';
 import { Mp3IncompatiblePartsError, Mp3InvalidError } from './mp3-errors';
 
 interface PartProfile {
@@ -51,7 +51,7 @@ export function concatMp3(parts: Buffer[]): Buffer {
   for (let i = 0; i < parsedParts.length; i++) {
     const { parsed } = parsedParts[i];
     const sourceBuf = parts[i];
-    const audioFrames = parsed.hasXing ? parsed.frames.slice(1) : parsed.frames;
+    const audioFrames = audioFramesOf(parsed);
     for (const frame of audioFrames) {
       chunks.push(sourceBuf.subarray(frame.offset, frame.offset + frame.length));
     }

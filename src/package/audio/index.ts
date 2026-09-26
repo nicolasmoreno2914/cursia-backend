@@ -5,7 +5,7 @@
  * y el brief `scratchpad/v21/briefs/r10-core-audio.md` para el contrato.
  */
 
-export { parseMp3, mp3DurationSeconds } from './mp3-parser';
+export { parseMp3, mp3DurationSeconds, audioFramesOf } from './mp3-parser';
 export type { ParsedMp3 } from './mp3-parser';
 
 export { concatMp3 } from './mp3-concat';

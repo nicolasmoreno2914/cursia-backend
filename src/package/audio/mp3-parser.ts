@@ -88,6 +88,15 @@ export function parseMp3(buf: Buffer): ParsedMp3 {
       hasXing = true;
       xingFrames = frame.xingFrameCount;
     }
+    // Fix round 1 (M2): todos los frames de una parte comparten el formato del
+    // primero; un cambio de versión/sample rate/canales a mitad de stream es fatal.
+    const ref = frames[0];
+    if (ref && (frame.version !== ref.version || frame.sampleRate !== ref.sampleRate || frame.channels !== ref.channels)) {
+      throw new Mp3InvalidError(
+        `el formato cambia a mitad del stream en offset ${offset}: ${frame.version}/${frame.sampleRate}Hz/${frame.channels}ch ` +
+          `≠ ${ref.version}/${ref.sampleRate}Hz/${ref.channels}ch del primer frame`,
+      );
+    }
     frames.push(frame);
     offset += frame.length;
     firstFrame = false;
@@ -108,23 +117,21 @@ function parseFrameHeaderOk(buf: Buffer, offset: number, end: number): boolean {
   return result.ok;
 }
 
+/** Frames de AUDIO (sin el frame Xing/Info inicial, que es un placeholder). */
+export function audioFramesOf(parsed: ParsedMp3): Mp3Frame[] {
+  return parsed.hasXing ? parsed.frames.slice(1) : parsed.frames;
+}
+
 /**
- * Duración exacta en segundos. Prefiere el conteo de frames del header
- * Xing/Info cuando está presente (representa el stream completo tal como lo
- * declaró el encoder); si no, suma `samples/sampleRate` de cada frame real.
+ * Duración MEDIDA en segundos: siempre la suma de los frames de audio realmente
+ * presentes (fix round 1, I3). El conteo declarado por un header Xing/Info se
+ * ignora: un MP3 truncado que sigue terminando en borde de frame mentiría.
+ * Todos los frames comparten formato (lo exige parseMp3), así que la suma es
+ * exacta: frames × samples / sampleRate.
  */
 export function mp3DurationSeconds(buf: Buffer): number {
   const parsed = parseMp3(buf);
-  const audioFrames = parsed.hasXing ? parsed.frames.slice(1) : parsed.frames;
-
-  if (parsed.hasXing && typeof parsed.xingFrames === 'number') {
-    const ref = parsed.frames[0];
-    return (parsed.xingFrames * ref.samples) / ref.sampleRate;
-  }
-
-  let totalSeconds = 0;
-  for (const frame of audioFrames) {
-    totalSeconds += frame.samples / frame.sampleRate;
-  }
-  return totalSeconds;
+  const audio = audioFramesOf(parsed);
+  if (audio.length === 0) throw new Mp3InvalidError('el MP3 solo tiene el frame Xing/Info, sin audio');
+  return (audio.length * audio[0].samples) / audio[0].sampleRate;
 }

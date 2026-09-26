@@ -14,7 +14,7 @@
 
 import { concatMp3 } from './mp3-concat';
 import { mp3DurationSeconds } from './mp3-parser';
-import { AudiobookPartMissingError } from './mp3-errors';
+import { AudiobookPartMissingError, Mp3InvalidError } from './mp3-errors';
 
 export interface AudiobookChapterInput {
   chapterId: string;
@@ -48,6 +48,13 @@ export function assembleAudiobook(chapters: AudiobookChapterInput[]): AssembledA
 
   const durations = ordered.map((c) => mp3DurationSeconds(c.mp3 as Buffer));
   const buffer = concatMp3(ordered.map((c) => c.mp3 as Buffer));
+  // Fix round 1 (I3): la duración total y los offsets deben ser los del buffer
+  // ensamblado (frames contados), nunca un header declarado.
+  const measured = mp3DurationSeconds(buffer);
+  const declared = durations.reduce((sum, d) => sum + d, 0);
+  if (Math.abs(measured - declared) > 1e-6) {
+    throw new Mp3InvalidError(`el audiolibro ensamblado dura ${measured}s pero las partes suman ${declared}s`);
+  }
 
   const parts: AudiobookPart[] = [];
   let cursor = 0;

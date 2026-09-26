@@ -231,7 +231,8 @@ check('formatDurationEs: casos exactos', () => {
 check('formatDurationShortEs: casos exactos (redondeado al minuto)', () => {
   assert(formatDurationShortEs(511) === '≈ 9 min', `obtuve "${formatDurationShortEs(511)}"`);
   assert(formatDurationShortEs(60) === '≈ 1 min', `obtuve "${formatDurationShortEs(60)}"`);
-  assert(formatDurationShortEs(29) === '≈ 0 min', `obtuve "${formatDurationShortEs(29)}"`);
+  assert(formatDurationShortEs(29) === '≈ 1 min', `obtuve "${formatDurationShortEs(29)}" (M3: nunca "≈ 0 min" con audio)`);
+  assert(formatDurationShortEs(0) === '≈ 0 min', `obtuve "${formatDurationShortEs(0)}"`);
 });
 
 // ─── Garbage → MP3_INVALID ──────────────────────────────────────────────────
@@ -248,6 +249,61 @@ check('parseMp3: buffer vacío → MP3_INVALID', () => {
 check('parseMp3: frame válido seguido de basura (cadena rota a mitad) → MP3_INVALID', () => {
   const corrupted = Buffer.concat([sliceA, Buffer.from([0x00, 0x01, 0x02, 0x03, 0x04, 0x05])]);
   assertThrowsCode(() => parseMp3(corrupted), 'MP3_INVALID');
+});
+
+// ─── Fix round 1 (review G5: I3, M2) — sondas p2 ────────────────────────────
+// Frames sintéticos MPEG2 L3 24 kHz mono 32 kbps (384 bytes, 576 muestras = 24 ms).
+function synthFrame({ crc = false } = {}) {
+  const b = Buffer.alloc(384, 0x55);
+  b[0] = 0xff; b[1] = crc ? 0xf2 : 0xf3; b[2] = 0xc4; b[3] = 0xc0;
+  return b;
+}
+function synthInfo(n, crc = false) {
+  const b = synthFrame({ crc });
+  b.fill(0, 4);
+  const o = 4 + (crc ? 2 : 0) + 9;
+  b.write('Info', o, 'ascii');
+  b.writeUInt32BE(1, o + 4);
+  b.writeUInt32BE(n, o + 8);
+  return b;
+}
+const synthAudio = (n) => Buffer.concat(Array.from({ length: n }, () => synthFrame()));
+const near = (a, b) => Math.abs(a - b) < 1e-9;
+
+check('I3: un header Info que declara 1000 frames con 100 reales → duración de los 100 frames contados', () => {
+  const lie = Buffer.concat([synthInfo(1000), synthAudio(100)]);
+  const d = mp3DurationSeconds(lie);
+  assert(near(d, 2.4), `duración ${d} (esperada 2.4)`);
+});
+
+check('I3: assembleAudiobook — total y offsets coinciden EXACTAMENTE con el buffer ensamblado (con parte Info mentirosa)', () => {
+  const lie = Buffer.concat([synthInfo(1000), synthAudio(100)]);
+  const r = assembleAudiobook([
+    { chapterId: 'b', chapterNumber: 2, mp3: synthAudio(50) },
+    { chapterId: 'a', chapterNumber: 1, mp3: lie },
+    { chapterId: 'c', chapterNumber: 3, mp3: Buffer.concat([synthInfo(7, true), synthAudio(25)]) },
+  ]);
+  const real = mp3DurationSeconds(r.buffer);
+  assert(near(r.durationSeconds, real) && near(real, 175 * 0.024), `total ${r.durationSeconds} vs buffer ${real}`);
+  assert(JSON.stringify(r.parts.map((p) => [p.chapterId, +p.offsetSeconds.toFixed(6), +p.durationSeconds.toFixed(6)])) ===
+    JSON.stringify([['a', 0, 2.4], ['b', 2.4, 1.2], ['c', 3.6, 0.6]]), JSON.stringify(r.parts));
+  // Cada offset cae exactamente en un borde de frame del buffer ensamblado.
+  const frames = parseMp3(r.buffer).frames;
+  assert(!parseMp3(r.buffer).hasXing && frames.length === 175, `frames ${frames.length}`);
+});
+
+check('M2: un frame Info con CRC (protection_bit=0) se detecta y se descarta al concatenar', () => {
+  const crcX = Buffer.concat([synthInfo(100, true), synthAudio(100)]);
+  const p = parseMp3(crcX);
+  assert(p.hasXing === true, 'Info con CRC no detectado');
+  assert(near(mp3DurationSeconds(crcX), 2.4), `duración ${mp3DurationSeconds(crcX)}`);
+  assert(parseMp3(concatMp3([crcX])).frames.length === 100, 'el frame Info se coló en el stream');
+});
+
+check('M2: una parte que cambia de sample rate a mitad del stream → MP3_INVALID', () => {
+  const f22 = synthFrame(); f22[2] = 0xc0; // 22050 Hz → 417 bytes
+  const mixed = Buffer.concat([synthAudio(2), Buffer.concat([f22, Buffer.alloc(417 - 384, 0)])]);
+  assertThrowsCode(() => parseMp3(mixed), 'MP3_INVALID');
 });
 
 // ─── Resumen ────────────────────────────────────────────────────────────────
