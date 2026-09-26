@@ -150,6 +150,8 @@ const LEGACY_CONTROLLER_CLASS_NAMES = new Set([
   'CourseVersionsController',
   'CourseSetupController',
   'CoursesController',
+  'FinopsIngestController', // V2.1 RF-a: ingest server-to-server (secreto compartido), no es ruta V2
+  'FinopsAdminController',  // V2.1 RF-a: lecturas admin (SupabaseJwtGuard + SuperAdminGuard)
 ]);
 
 Logger.overrideLogger(false);
