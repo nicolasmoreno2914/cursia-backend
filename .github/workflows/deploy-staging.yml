@@ -414,6 +414,10 @@ jobs:
                ensure_env_secret FINOPS_INGEST_TOKEN "${_FIT:-}"
                # Calibración NO aprobada todavía: el worker de proveedores reales queda apagado.
                ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED false
+               # Gamma V2.1: temas por defecto (ids públicos de Gamma, no secretos), elegidos del
+               # listado real de la cuenta (GET /themes). Solo si faltan: un valor puesto a mano gana.
+               ensure_env_default_if_absent GAMMA_THEME_V21_LIGHT_DEFAULT default-light
+               ensure_env_default_if_absent GAMMA_THEME_V21_DARK_DEFAULT default-dark
                # Las claves de proveedores de staging se cargan en staging (secrets de staging);
                # lo que falte lo reporta el preflight [6b2] — nunca se toma de producción.
 
