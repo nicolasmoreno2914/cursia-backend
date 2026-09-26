@@ -34,6 +34,50 @@ export function paidProviderOfItemType(itemType: string): 'videogen' | 'gamma' |
 
 export type RunSpendMode = 'mock' | 'real';
 
+/**
+ * Modo de gasto POR PROVEEDOR de un run: video = `input_payload.videoMode`;
+ * presentation/audio = `input_payload.providerModes` (R5 fix round 1; default
+ * real). Un string aplica el mismo modo a todo (compatibilidad).
+ */
+export interface RunSpendModes {
+  video: RunSpendMode;
+  presentation: RunSpendMode;
+  audio: RunSpendMode;
+}
+
+/**
+ * Modos de gasto de un run desde lo congelado. providerModes ausente/corrupto ⇒
+ * `real` para el presupuesto (fail safe: nunca se asume gratis un proveedor pagado).
+ */
+export function runSpendModes(
+  videoMode: string | null | undefined,
+  providerModes: { presentation?: string | null; audio?: string | null } | null | undefined,
+): RunSpendModes {
+  return {
+    video: videoMode === 'real' ? 'real' : 'mock',
+    presentation: providerModes?.presentation === 'mock' ? 'mock' : 'real',
+    audio: providerModes?.audio === 'mock' ? 'mock' : 'real',
+  };
+}
+
+function asModes(mode: RunSpendMode | RunSpendModes): RunSpendModes {
+  if (mode === 'mock' || mode === 'real') return { video: mode, presentation: mode, audio: mode };
+  if (!mode || typeof mode !== 'object') throw new FinopsError('INVALID_INPUT', `modo inválido: ${String(mode)}`);
+  for (const k of ['video', 'presentation', 'audio'] as const) {
+    if (mode[k] !== 'mock' && mode[k] !== 'real') throw new FinopsError('INVALID_INPUT', `modo inválido para ${k}: ${String(mode[k])}`);
+  }
+  return mode;
+}
+
+/** Modo de gasto de un item type de worker pagado (null = no es de worker pagado: LLM). */
+export function spendModeOfItemType(mode: RunSpendMode | RunSpendModes, itemType: string): RunSpendMode | null {
+  const m = asModes(mode);
+  if (itemType === 'video') return m.video;
+  if (itemType === 'presentation') return m.presentation;
+  if (itemType === 'audio_welcome' || itemType === 'audiobook_chapter') return m.audio;
+  return null;
+}
+
 export interface RunManifestItem {
   key: string;
   type: string;
@@ -49,14 +93,14 @@ const GENERATING = new Set(['GENERATE', 'REGENERATE']);
  */
 export function estimateItemsForRun(
   items: readonly RunManifestItem[],
-  mode: RunSpendMode,
+  mode: RunSpendMode | RunSpendModes,
   actions?: Readonly<Record<string, string>> | null,
 ): EstimateItem[] {
   if (!Array.isArray(items)) throw new FinopsError('INVALID_INPUT', 'estimateItemsForRun necesita items[]');
-  if (mode !== 'mock' && mode !== 'real') throw new FinopsError('INVALID_INPUT', `modo inválido: ${String(mode)}`);
+  const modes = asModes(mode);
   const out: EstimateItem[] = [];
   for (const it of items) {
-    if (mode === 'mock' && WORKER_PAID_ITEM_TYPES.includes(it.type)) continue;
+    if (WORKER_PAID_ITEM_TYPES.includes(it.type) && spendModeOfItemType(modes, it.type) === 'mock') continue;
     out.push({
       itemKey: it.key,
       itemType: it.type,
@@ -69,12 +113,12 @@ export function estimateItemsForRun(
 }
 
 /** Proveedores pagados REALES que el run va a usar (ordenados, sin repetidos). */
-export function paidRealProviders(items: readonly EstimateItem[], mode: RunSpendMode): string[] {
-  if (mode !== 'real') return [];
+export function paidRealProviders(items: readonly EstimateItem[], mode: RunSpendMode | RunSpendModes): string[] {
+  const modes = asModes(mode);
   const set = new Set<string>();
   for (const it of items) {
     const p = paidProviderOfItemType(String(it.itemType));
-    if (p && GENERATING.has(String(it.action ?? 'GENERATE'))) set.add(p);
+    if (p && spendModeOfItemType(modes, String(it.itemType)) === 'real' && GENERATING.has(String(it.action ?? 'GENERATE'))) set.add(p);
   }
   return Array.from(set).sort();
 }

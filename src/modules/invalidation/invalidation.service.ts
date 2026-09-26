@@ -7,6 +7,7 @@ import { assertDynamicOwnerAllowed, isRealVideoAllowedForOwner, toHttpConfigErro
 import { ACTIVE_RUN_WORKER_STATUSES } from '../dynamic-generation/item-transitions';
 import { canonicalContextHash } from '../dynamic-generation/run-hash';
 import { computePlanFromDb, planApplyWrites } from './invalidation-apply';
+import { isProviderWorkerDeployed } from '../dynamic-generation/provider-modes';
 import type { InvalidationPlan } from './plan';
 import { INVALIDATION_V3_NOT_IMPLEMENTED, assertInvalidationRulesSupported } from './plan';
 
@@ -23,6 +24,8 @@ export interface InvalidationPlanResponse {
   videoMode: string;
   /** Videos que el run B generaría (gasto de Videogen si videoMode='real'). */
   videoItemsToGenerate: string[];
+  /** V2.1 (fix round 1): items de Gamma/TTS que el run B generaría (vacío en v1/v2). */
+  providerItemsToGenerate: string[];
   /**
    * Todo lo que haría fallar el apply (fix wave M2), para que la UI avise
    * ANTES de confirmar; vacío = aplicable:
@@ -62,7 +65,7 @@ export class InvalidationService {
     if (!rowA) throw new NotFoundException(`La ejecución de origen ${fromRunId} no existe para el curso #${courseId}`);
     const bpNumberA = Number(rowA.input_payload?.blueprintNumber);
     const manifestA = await this.manifests.getById(courseId, ownerId, bpNumberA, Number(rowA.input_payload?.manifestId));
-    // V2.1 (R4): invalidación v3 = R5. 501 explícito antes de leer Blueprints (fail loud).
+    // V2.1 (R5): v3 → v3 se calcula; mezclar rulesVersion 3 con 1/2 → 501 antes de leer Blueprints (fail loud).
     try {
       assertInvalidationRulesSupported(manifestA.rulesVersion, manifestB.rulesVersion);
     } catch (err) {
@@ -100,6 +103,9 @@ export class InvalidationService {
         videoItemsToGenerate: plan.actions
           .filter((a) => a.inTargetManifest && a.type === 'video' && (a.action === 'GENERATE' || a.action === 'REGENERATE'))
           .map((a) => a.itemKey),
+        providerItemsToGenerate: plan.actions
+          .filter((a) => a.inTargetManifest && ['presentation', 'audio_welcome', 'audiobook_chapter'].includes(a.type) && (a.action === 'GENERATE' || a.action === 'REGENERATE'))
+          .map((a) => a.itemKey),
         blockers: [],
         plan,
       };
@@ -113,8 +119,8 @@ export class InvalidationService {
       throw new ConflictException(`La ejecución ${fromRunId} no tiene un contexto congelado íntegro`);
     }
     const [bpA, bpB] = await Promise.all([
-      this.manifests.blueprintOf(courseId, ownerId, bpNumberA),
-      this.manifests.blueprintOf(courseId, ownerId, blueprintNumber),
+      this.manifests.blueprintOfForRules(courseId, ownerId, bpNumberA, manifestA.rulesVersion),
+      this.manifests.blueprintOfForRules(courseId, ownerId, blueprintNumber, manifestB.rulesVersion),
     ]);
     const { plan } = await computePlanFromDb(this.dataSource, {
       runA: rowA,
@@ -136,7 +142,7 @@ export class InvalidationService {
       ctx.context_hash,
       (id) => byId.get(id)?.status ?? null,
       (id) => byId.get(id)?.metadata?.inputFingerprint ?? null,
-      { required: (t) => requiredArtifactTypes(manifestB.rulesVersion, t as ManifestItemType), typeOf: (id) => byId.get(id)?.type },
+      { required: (t, variant) => requiredArtifactTypes(manifestB.rulesVersion, t as ManifestItemType, variant), typeOf: (id) => byId.get(id)?.type },
     );
     const blockers: string[] = [];
     const [superseding] = await this.dataSource.query(
@@ -172,12 +178,15 @@ export class InvalidationService {
       }
       if (!allowed) blockers.push('real_video_not_allowed');
     }
+    // V2.1 fix round 1 (M1): mismo 501 que el apply si B genera Gamma/TTS sin worker de proveedor.
+    if (writes.providerItemsToGenerate.length > 0 && !isProviderWorkerDeployed()) blockers.push('provider_worker_not_deployed');
     blockers.push(...writes.missingRoles);
     return {
       ...base,
       applied: false,
       existingRunId: null,
       videoItemsToGenerate: writes.videoItemsToGenerate,
+      providerItemsToGenerate: writes.providerItemsToGenerate,
       blockers,
       plan,
     };

@@ -1,4 +1,4 @@
-import type { BlueprintSnapshotV1 } from '../course-blueprints/blueprint-snapshot';
+import type { AnyBlueprintSnapshot, BlueprintSnapshotV1 } from '../course-blueprints/blueprint-snapshot';
 import { cmpStr, sha256Canonical } from '../coherence/canonical-json';
 import { Outline } from '../coherence/coherence-types';
 import {
@@ -9,6 +9,7 @@ import {
   matchFingerprint,
   parseItemKey,
 } from './fingerprints';
+import { computeInvalidationPlanV3 } from './plan-v3';
 
 /**
  * Fase 8 — plan de invalidación (spec §1–§3). Función PURA, por UUID: sin
@@ -63,6 +64,8 @@ export interface InvalidationManifestItem {
   scope?: string;
   moduleId?: string | null;
   chapterId?: string | null;
+  /** Solo rulesVersion 3, items `activity`: motor ('h5p' | 'scorm'). */
+  variant?: string | null;
 }
 
 export interface InvalidationManifest {
@@ -82,17 +85,32 @@ export interface InvalidationFromItem {
    * (REGENERATE, fix wave); para los `ready` del run de origen no se usa.
    */
   inputFingerprint?: string | null;
+  /**
+   * Solo rulesVersion 3: identidad estable del output (storage paths de sus
+   * artifacts; ver `artifactOutputIdentity`). Una fila "carried" conserva la
+   * misma storage_path ⇒ misma identidad. Se usa para la huella de
+   * `video_interactions` (qué video describe). v1/v2 la ignoran.
+   */
+  outputIdentity?: string | null;
+  /**
+   * Solo rulesVersion 3, items `video_interactions` (fix round 1, I3):
+   * identidad del video CONTRA el que se generaron, registrada al completarse
+   * (`output_summary.videoIdentity.identity`). null/ausente = desconocida
+   * (nunca se reutilizan a ciegas).
+   */
+  consumedVideoIdentity?: string | null;
 }
 
 export interface InvalidationPlanInput {
   from: {
-    blueprint: BlueprintSnapshotV1;
+    /** v1/v2: Blueprint schemaVersion 1. rulesVersion 3: schemaVersion 2. */
+    blueprint: BlueprintSnapshotV1 | AnyBlueprintSnapshot;
     manifest: InvalidationManifest;
     items: InvalidationFromItem[];
     courseContextSha256?: string | null;
   };
   to: {
-    blueprint: BlueprintSnapshotV1;
+    blueprint: BlueprintSnapshotV1 | AnyBlueprintSnapshot;
     manifest: InvalidationManifest;
     courseContextSha256?: string | null;
   };
@@ -113,6 +131,13 @@ export interface InvalidationAction {
   fingerprint: string | null;
   /** Huella con la que se decide un match (guardar en metadata del artifact). */
   matchFingerprint: string | null;
+  /**
+   * Solo planes rulesVersion 3 (en v1/v2 el campo NO existe, para no cambiar
+   * su planSha256): huella de match del item en el ORIGEN, con la que el
+   * artifact de A era válido. El apply la guarda al marcar stale/disabled.
+   * null si el item no existe en el origen o no se puede calcular.
+   */
+  fromMatchFingerprint?: string | null;
 }
 
 export interface InvalidationPlan {
@@ -127,7 +152,7 @@ export interface InvalidationPlan {
 
 type Reusability = 'ready' | 'stale' | 'disabled' | 'none';
 
-function reusability(rec: InvalidationFromItem | undefined): Reusability {
+export function reusability(rec: InvalidationFromItem | undefined): Reusability {
   if (!rec) return 'none';
   const hasArtifacts = Array.isArray(rec.artifactIds) && rec.artifactIds.length > 0;
   if (!REUSABLE_ITEM_STATUSES.includes(rec.status) || !hasArtifacts) return 'none';
@@ -137,7 +162,7 @@ function reusability(rec: InvalidationFromItem | undefined): Reusability {
   return 'none';
 }
 
-function indexManifest(m: InvalidationManifest, label: string): Map<string, InvalidationManifestItem> {
+export function indexManifest(m: InvalidationManifest, label: string): Map<string, InvalidationManifestItem> {
   const out = new Map<string, InvalidationManifestItem>();
   for (const it of m?.items ?? []) {
     if (!it || typeof it.key !== 'string') throw new Error(`INVALID_INVALIDATION_INPUT: item sin key en ${label}`);
@@ -191,7 +216,7 @@ function canonicalRank(outline: Outline): (key: string) => [number, string] {
 }
 
 /** Capítulos cuyo orden relativo (entre los comunes al mismo módulo) cambió. */
-function reorderedWithinModule(from: Outline, to: Outline): Set<string> {
+export function reorderedWithinModule(from: Outline, to: Outline): Set<string> {
   const out = new Set<string>();
   for (const tm of to.modules) {
     const fm = from.moduleById.get(tm.id);
@@ -206,7 +231,7 @@ function reorderedWithinModule(from: Outline, to: Outline): Set<string> {
 }
 
 /** Módulos cuyo orden relativo (entre los comunes) cambió. */
-function reorderedModules(from: Outline, to: Outline): Set<string> {
+export function reorderedModules(from: Outline, to: Outline): Set<string> {
   const out = new Set<string>();
   const toIds = to.modules.map((m) => m.id).filter((id) => from.moduleById.has(id));
   const fromIds = from.modules.map((m) => m.id).filter((id) => to.moduleById.has(id));
@@ -217,25 +242,39 @@ function reorderedModules(from: Outline, to: Outline): Set<string> {
 }
 
 /**
- * V2.1 (R4): las reglas de invalidación para Manifests rulesVersion 3 (tipos
- * experience/presentation/activity/audio…, Blueprint schemaVersion 2) son R5.
- * Hasta entonces, cualquier plan que toque un Manifest v3 o un Blueprint v2
- * falla fuerte con este código en vez de reutilizar/regenerar con reglas v1/v2.
+ * V2.1: código de error de los cruces de reglas no soportados. Desde R5 un
+ * plan rulesVersion 3 → 3 se calcula (`plan-v3.ts`); lo que sigue sin
+ * implementarse (y falla fuerte con este código, 501 en los servicios) es
+ * MEZCLAR rulesVersion 3 con 1/2 (v1/v2 → v3 o v3 → v1/v2), o un Blueprint
+ * schemaVersion 2 en un plan v1/v2 / un Blueprint schemaVersion 1 en uno v3.
  */
 export const INVALIDATION_V3_NOT_IMPLEMENTED = 'INVALIDATION_V3_NOT_IMPLEMENTED';
 
-/** Lanza INVALIDATION_V3_NOT_IMPLEMENTED si algún lado es rulesVersion 3 (o un Blueprint schemaVersion 2). v1/v2: no-op. */
+/**
+ * Lanza INVALIDATION_V3_NOT_IMPLEMENTED si el par de rulesVersion mezcla 3
+ * con 1/2, o si el schemaVersion de algún Blueprint no corresponde a las
+ * reglas (v1/v2 ⇒ schemaVersion 1; v3 ⇒ schemaVersion 2). v1/v2 puros y v3
+ * puro: no-op.
+ */
 export function assertInvalidationRulesSupported(
   fromRulesVersion: number | null | undefined,
   toRulesVersion: number | null | undefined,
   blueprintSchemaVersions: Array<number | null | undefined> = [],
 ): void {
-  if (fromRulesVersion === 3 || toRulesVersion === 3 || blueprintSchemaVersions.some((v) => v === 2)) {
+  const fromV3 = fromRulesVersion === 3;
+  const toV3 = toRulesVersion === 3;
+  const fail = (why: string) => {
     throw new Error(
-      `${INVALIDATION_V3_NOT_IMPLEMENTED}: el plan de invalidación para Manifests rulesVersion 3 (from=` +
-        `${fromRulesVersion ?? '?'}, to=${toRulesVersion ?? '?'}) todavía no está implementado (bloque R5). ` +
+      `${INVALIDATION_V3_NOT_IMPLEMENTED}: ${why} (from=${fromRulesVersion ?? '?'}, to=${toRulesVersion ?? '?'}). ` +
         'Para aplicar el cambio de estructura, iniciá una ejecución nueva sin fromRun.',
     );
+  };
+  if (fromV3 !== toV3) fail('el plan de invalidación entre rulesVersion 3 y rulesVersion 1/2 no está implementado');
+  if (!fromV3 && blueprintSchemaVersions.some((v) => v === 2)) {
+    fail('un Blueprint schemaVersion 2 solo lo procesan las reglas v3');
+  }
+  if (fromV3 && blueprintSchemaVersions.some((v) => v != null && v !== 2)) {
+    fail('las reglas v3 requieren Blueprints schemaVersion 2');
   }
 }
 
@@ -244,12 +283,14 @@ export function computeInvalidationPlan(input: InvalidationPlanInput): Invalidat
     (input?.from?.blueprint as any)?.schemaVersion,
     (input?.to?.blueprint as any)?.schemaVersion,
   ]);
+  // V2.1 (R5): rulesVersion 3 → 3 tiene su propio plan (tipos y reglas de §P).
+  if (input?.from?.manifest?.rulesVersion === 3) return computeInvalidationPlanV3(input);
   const fromItems = indexManifest(input.from.manifest, 'from.manifest');
   const toItems = indexManifest(input.to.manifest, 'to.manifest');
-  const fromFp: BlueprintFingerprints = computeFingerprints(input.from.blueprint, {
+  const fromFp: BlueprintFingerprints = computeFingerprints(input.from.blueprint as BlueprintSnapshotV1, {
     courseContextSha256: input.from.courseContextSha256 ?? null,
   });
-  const toFp: BlueprintFingerprints = computeFingerprints(input.to.blueprint, {
+  const toFp: BlueprintFingerprints = computeFingerprints(input.to.blueprint as BlueprintSnapshotV1, {
     courseContextSha256: input.to.courseContextSha256 ?? null,
   });
   assertItemsMatchBlueprint(fromItems, fromFp.outline, 'from.manifest');

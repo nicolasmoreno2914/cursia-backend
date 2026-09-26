@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException, NotFoundException, ConflictException, Logger } from '@nestjs/common';
+import { Injectable, BadRequestException, NotFoundException, ConflictException, Logger, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
 import { CourseModule as CourseModuleEntity } from './entities/course-module.entity';
@@ -25,9 +25,11 @@ import {
   snapshotSha256,
   snapshotSha256V2,
 } from '../course-blueprints/blueprint-snapshot';
+import { assertV21StructureSchema, probeV21StructureSchema } from './v21-schema-guard';
+import { blueprintSchemaVersionForRules, readConfiguredRulesVersion } from '../generation-manifests/manifest-rules-config';
 
 @Injectable()
-export class CourseStructureService {
+export class CourseStructureService implements OnModuleInit {
   private readonly logger = new Logger(CourseStructureService.name);
 
   constructor(
@@ -39,6 +41,11 @@ export class CourseStructureService {
     private readonly dataSource: DataSource,
     private readonly blueprintsService: CourseBlueprintsService,
   ) {}
+
+  /** V2.1 fix round 1 (I5): sonda de arranque (solo loguea; las rutas responden 503 si falta la migración). */
+  async onModuleInit(): Promise<void> {
+    await probeV21StructureSchema(this.dataSource, this.logger);
+  }
 
   /**
    * Verifica ownership + structureVersion==='dynamic', y dentro de la
@@ -110,19 +117,45 @@ export class CourseStructureService {
 
   async getStructure(courseId: number, ownerId: string) {
     const course = await this.coursesService.findOne(courseId, ownerId);
-    const modules = await this.moduleRepo.find({
-      where: { courseId },
-      relations: ['chapters'],
-      order: { position: 'ASC' },
-    });
-    modules.forEach((m) => m.chapters.sort((a, b) => a.position - b.position));
+    // V2.1 fix round 1 (I5): sin la migración R3 → 503 schema_not_migrated_v21 (nunca un 500 crudo).
+    await assertV21StructureSchema(this.dataSource);
 
-    // V2.1 (R3): toggles de curso y `activity_enabled` por query propia (NO
-    // mapeados en las entidades Course/CourseChapter: así las lecturas por
-    // entidad — y el runner de producción V2, que no incluye esta migración —
-    // no dependen de supabase-migration-v21-blueprint-profiles.sql).
-    const settings = await this.readCourseSettings(courseId);
-    const activityByChapter = await this.readActivityEnabled(courseId);
+    // V2.1 fix round 1 (review G2 M10): estructura, toggles V2.1 y counter en
+    // UN snapshot (REPEATABLE READ): un capítulo creado o un PATCH commiteado
+    // entre lecturas nunca devuelve toggles de otro estado que el counter.
+    // Los toggles V2.1 se leen por query propia (NO mapeados en las entidades
+    // Course/CourseChapter).
+    const qr = this.dataSource.createQueryRunner();
+    let modules: CourseModuleEntity[];
+    let settings: { finalExam: boolean; activityEngine: 'h5p' | 'scorm' };
+    let activityByChapter: Map<string, boolean>;
+    let counter: number;
+    try {
+      await qr.connect();
+      await qr.startTransaction('REPEATABLE READ');
+      const [crow] = await qr.query(`select structure_version_counter from public.courses where id = $1`, [courseId]);
+      if (!crow) throw new NotFoundException(`Course #${courseId} not found`);
+      counter = Number(crow.structure_version_counter);
+      modules = await qr.manager.find(CourseModuleEntity, {
+        where: { courseId },
+        relations: ['chapters'],
+        order: { position: 'ASC' },
+      });
+      settings = await this.readCourseSettings(courseId, qr);
+      activityByChapter = await this.readActivityEnabled(courseId, qr);
+      await qr.commitTransaction();
+    } catch (err) {
+      if (qr.isTransactionActive) await qr.rollbackTransaction();
+      throw err;
+    } finally {
+      await qr.release();
+    }
+    modules.forEach((m) => m.chapters.sort((a, b) => a.position - b.position));
+    for (const m of modules) {
+      for (const c of m.chapters) {
+        if (!activityByChapter.has(c.id)) throw new Error(`Capítulo ${c.id}: activity_enabled ausente en el mismo snapshot (integridad rota)`);
+      }
+    }
 
     // Task 4 / Ruling R1: currentInfo no verifica ownership ni "dynamic" —
     // ya lo hizo coursesService.findOne arriba, así que se llama después.
@@ -137,7 +170,7 @@ export class CourseStructureService {
 
     return {
       structureVersion: course.structureVersion,
-      structureVersionCounter: course.structureVersionCounter,
+      structureVersionCounter: counter,
       finalExam: settings.finalExam,
       activityEngine: settings.activityEngine,
       modules: modules.map((m) => ({
@@ -180,6 +213,11 @@ export class CourseStructureService {
   ): boolean {
     if (!currentBlueprint) return false;
     try {
+      // V2.1 fix round 1 (review G2 M3): un Blueprint de otro schemaVersion que el
+      // que produciría el lock con la config actual NUNCA "coincide" (con config 3 y
+      // un Blueprint v1 el Manifest v3 da 409 BLUEPRINT_SCHEMA_MISMATCH: hay que
+      // re-confirmar). Config inválida → throw → catch de abajo → false.
+      if ((currentBlueprint.schemaVersion ?? 1) !== blueprintSchemaVersionForRules(readConfiguredRulesVersion())) return false;
       if (currentBlueprint.schemaVersion === 2) {
         // V2.1: un Blueprint v2 se compara con el builder v2 (incluye los toggles nuevos).
         if (!settings || !activityByChapter) throw new Error('faltan los toggles V2.1 para comparar contra un Blueprint v2');
@@ -258,11 +296,11 @@ export class CourseStructureService {
    * V2.1 (R3): `course_chapters.activity_enabled` por capítulo. Fail loud si
    * a algún capítulo le falta el valor (no debería: NOT NULL DEFAULT true).
    */
-  private async readActivityEnabled(courseId: number): Promise<Map<string, boolean>> {
-    const rows: { id: string; activity_enabled: unknown }[] = await this.dataSource.query(
-      `select id, activity_enabled from public.course_chapters where course_id = $1`,
-      [courseId],
-    );
+  private async readActivityEnabled(courseId: number, runner?: QueryRunner): Promise<Map<string, boolean>> {
+    const q = `select id, activity_enabled from public.course_chapters where course_id = $1`;
+    const rows: { id: string; activity_enabled: unknown }[] = runner
+      ? await runner.query(q, [courseId])
+      : await this.dataSource.query(q, [courseId]);
     const out = new Map<string, boolean>();
     for (const r of rows) {
       if (typeof r.activity_enabled !== 'boolean') {
@@ -281,6 +319,7 @@ export class CourseStructureService {
    */
   async updateSettings(courseId: number, ownerId: string, dto: UpdateStructureSettingsDto) {
     assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
+    await assertV21StructureSchema(this.dataSource); // V2.1 fix round 1 (I5): 503 si falta la migración R3
     if (dto.finalExam === undefined && dto.activityEngine === undefined) {
       throw new BadRequestException('Nada para actualizar: enviá "finalExam" y/o "activityEngine".');
     }
@@ -312,6 +351,7 @@ export class CourseStructureService {
 
   async createModule(courseId: number, ownerId: string, dto: CreateModuleDto) {
     assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
+    await assertV21StructureSchema(this.dataSource); // V2.1 fix round 1 (I5): 503 si falta la migración R3
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();
@@ -438,6 +478,7 @@ export class CourseStructureService {
 
   async createChapter(courseId: number, moduleId: string, ownerId: string, dto: CreateChapterDto) {
     assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
+    await assertV21StructureSchema(this.dataSource); // V2.1 fix round 1 (I5): 503 si falta la migración R3
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();
@@ -479,6 +520,7 @@ export class CourseStructureService {
 
   async updateChapter(courseId: number, moduleId: string, chapterId: string, ownerId: string, dto: UpdateChapterDto) {
     assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
+    await assertV21StructureSchema(this.dataSource); // V2.1 fix round 1 (I5): 503 si falta la migración R3
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();

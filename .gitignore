@@ -13,3 +13,7 @@ qa_*.json
 
 # Worktrees de agentes (scratch, nunca versionado)
 .claude/worktrees/
+
+# Cursia H5P Library Pack y paquetes .h5p: salida de build, nunca se versionan
+*.h5p
+h5p-library-pack/

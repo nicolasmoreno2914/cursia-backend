@@ -45,15 +45,30 @@ quedan commiteados — todos son idempotentes, se puede re-correr).
 | 0 | `scripts/lib/production-jobs-constraints.js` — CHECK de `production_jobs.execution_mode` (+ `dynamic_generation`, `dynamic_package`) y `worker_status`. **Mismo SQL** que `scripts/migrate-production-jobs-constraints.js` (ambos usan esa lib). Pre-chequeo DN-6 de solo lectura antes de mutar nada; se omite (sin lock) si el CHECK ya está al día | `deploy.yml` / `deploy-staging.yml` |
 | 1 | `supabase-migration-dynamic-course-structure.sql` | paso 3 |
 | 2 | `supabase-migration-course-blueprints.sql` | 4b |
-| 3 | `supabase-migration-generation-manifests.sql` | 4e |
-| 4 | `supabase-migration-dynamic-generation.sql` | 4h |
-| 5 | `supabase-migration-dynamic-generation-v2.sql` | 4h2 |
-| 6 | `supabase-migration-invalidation.sql` (Fase 8 — `carried_from_item_run_id`; ya integrado: `[included]`) | 4h3 |
-| 7 | `supabase-migration-storage-artifacts-policies.sql` | 4k |
+| 3 | `supabase-migration-v21-blueprint-profiles.sql` (V2.1 R3 — toggles de curso/capítulo, `course_profiles`; backfill de legado: cursos dinámicos existentes → `scorm`, sin examen final) | 4d2 |
+| 4 | `supabase-migration-generation-manifests.sql` | 4e |
+| 5 | `supabase-migration-dynamic-generation.sql` | 4h |
+| 6 | `supabase-migration-dynamic-generation-v2.sql` | 4h2 |
+| 7 | `supabase-migration-invalidation.sql` (Fase 8 — `carried_from_item_run_id`; ya integrado: `[included]`) | 4h3 |
+| 8 | `supabase-migration-v21-manifest-v3.sql` (V2.1 R4 — tipos y conteos rulesVersion 3; va después de la v2) | 4h4 |
+| 9 | `supabase-migration-storage-artifacts-policies.sql` | 4k |
 
-Después, en solo lectura: el CHECK de `production_jobs` al día, los 7
-`verify-*/audit-*` de V2 en modo `production-readonly` y las 4 políticas de
+Después, en solo lectura: el CHECK de `production_jobs` al día, los 9
+`verify-*/audit-*` de V2/V2.1 en modo `production-readonly` y las 4 políticas de
 `storage.objects`.
+
+**V2.1 (fix round 1, review G2 I5):** el código V2.1 lee las columnas del paso 3
+en las rutas de estructura. Si llega a una base sin ellas responde **503
+`schema_not_migrated_v21`** (y lo loguea al arrancar), nunca un 500 crudo.
+`scripts/prod/test/run-local-pg-tests.js` falla si algún
+`supabase-migration-*.sql` no está ni en el plan ni en `EXCLUDED`. Migraciones
+de bloques V2.1 posteriores (RF ledger, R6…) se agregan a este plan en su
+propio bloque, con la misma regla.
+
+**Config (review G2 M12):** con V2.1, un `DYNAMIC_MANIFEST_RULES_VERSION`
+inválido (fuera de 1/2/3) hace fallar también el **confirmar estructura**
+(lock del Blueprint) y `GET /features`, no solo la creación del Manifest
+(fail loud). Revisar la variable antes de desplegar.
 
 **Excluido a propósito:** el *script* `migrate-production-jobs-constraints.js`
 no se invoca (su SQL es el paso 0; `deploy.yml` lo vuelve a correr en el merge,
@@ -272,8 +287,9 @@ Pasos (en este orden, cada uno en su propia transacción):
   • 1. [included] supabase-migration-dynamic-course-structure.sql
        sha256 d034b197…  (4744 bytes)
   …
-  • 6. [included] supabase-migration-invalidation.sql
-  • 7. [included] supabase-migration-storage-artifacts-policies.sql
+  • 7. [included] supabase-migration-invalidation.sql
+  • 8. [included] supabase-migration-v21-manifest-v3.sql
+  • 9. [included] supabase-migration-storage-artifacts-policies.sql
 …
 DRY-RUN: no se conectó a ninguna base.
 ```

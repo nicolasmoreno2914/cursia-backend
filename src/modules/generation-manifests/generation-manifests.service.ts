@@ -277,6 +277,21 @@ export class GenerationManifestsService {
   }
 
   /**
+   * V2.1 (R5): Blueprint verificado para el rulesVersion de un Manifest
+   * (invalidación, coherencia). v1/v2 → igual que `blueprintOf` (un
+   * Blueprint v2 da 501). v3 → exige schemaVersion 2 (409
+   * BLUEPRINT_SCHEMA_MISMATCH si no), mismas reglas que al crear el Manifest.
+   */
+  async blueprintOfForRules(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+    rulesVersion: number,
+  ): Promise<AnyBlueprintDto> {
+    return this.blueprintForRules(courseId, ownerId, blueprintNumber, rulesVersion as ManifestRulesVersion);
+  }
+
+  /**
    * Lee un Manifest concreto por id (el congelado en un run:
    * input_payload.manifestId), verificando que sea de ESE Blueprint/curso y
    * del dueño (mismas garantías que `get`). Así un run v1 sigue legible

@@ -336,33 +336,37 @@ async function pureChecks() {
     throwsRe(() => profiles.normalizePresentationProfile({ ...p, mode: 'x' }), /^PROFILE_INVALID: INVALID_THEME_MODE/, 'normalize inválido lanza');
   });
 
-  await check('perfiles FUERA de las huellas: computeFingerprints idéntico con/sin perfiles (y con perfiles distintos)', () => {
-    const bp = snap.buildBlueprintSnapshot(V1_FIXED_COURSE, V1_FIXED_MODULES, V1_FIXED_CHAPTERS);
-    const ser = (f) => JSON.stringify({
-      outline: f.outline,
-      content: [...f.content.entries()],
-      exam: [...f.exam.entries()],
-      moduleIntro: [...f.moduleIntro.entries()],
-      courseOutline: f.courseOutline,
-    });
-    const plain = ser(fingerprints.computeFingerprints(bp));
-    const withA = ser(fingerprints.computeFingerprints(bp, {
-      courseContextSha256: null,
-      assessmentProfile: profiles.defaultAssessmentProfile({ finalExam: true }),
-      presentationProfile: profiles.defaultPresentationProfile(),
-    }));
+  // Fix round 1 (review G2 M9): la versión anterior pasaba los perfiles por
+  // parámetros que nadie lee (tautológica). Ahora los perfiles se COLAN en el
+  // propio snapshot v2 (el único lugar por donde una huella podría leerlos) y
+  // se compara el plan de invalidación v3 real: tiene que ser todo REUSE e
+  // idéntico al de "sin perfiles".
+  await check('perfiles FUERA de las huellas: perfiles colados en el Blueprint v2 no mueven ninguna huella v3 ni el plan (todo REUSE)', () => {
+    const planMod = loadDist('modules/invalidation/plan.js');
+    const B = loadDist('modules/generation-manifests/generation-manifest-builder.js');
+    const bp = snap.buildBlueprintSnapshotV2(V2_COURSE, V1_FIXED_MODULES, V2_CHAPTERS);
     const b = profiles.defaultAssessmentProfile({ finalExam: false });
     b.passingGrade = 55;
-    const withB = ser(fingerprints.computeFingerprints(bp, {
-      assessmentProfile: b,
-      presentationProfile: { themeFamily: 'oscuro-premium', mode: 'dark', brandSeed: { accent: '#FF0000' }, themeVersion: 1 },
+    const noisy = JSON.parse(JSON.stringify(bp));
+    noisy.course.assessmentProfile = b;
+    noisy.course.presentationProfile = { themeFamily: 'oscuro-premium', mode: 'dark', brandSeed: { accent: '#FF0000' }, themeVersion: 1 };
+    const fA = fingerprints.computeFingerprintsV3(bp);
+    const fB = fingerprints.computeFingerprintsV3(noisy);
+    const ser = (f) => JSON.stringify({ c: [...f.content.entries()], e: [...f.exam.entries()], m: [...f.moduleIntro.entries()], o: f.courseOutline, x: f.finalExam });
+    eq(ser(fB), ser(fA), 'huellas v3');
+    const src = (n) => ({ courseId: V2_COURSE.id, blueprintId: n, blueprintNumber: n, blueprintSha256: snap.snapshotSha256V2(bp) });
+    const m1 = B.buildGenerationManifest(bp, src(1), { rulesVersion: 3 });
+    const m2 = B.buildGenerationManifest(bp, src(2), { rulesVersion: 3 });
+    const items = m1.items.map((it) => ({
+      itemKey: it.key, itemRunId: 'ir-' + it.key, status: 'completed', artifactIds: ['a-' + it.key], artifactStatus: 'ready',
+      outputIdentity: 'o-' + it.key, consumedVideoIdentity: it.type === 'video_interactions' ? 'o-video:' + it.chapterId : undefined,
     }));
-    eq(withA, plain, 'con perfiles A');
-    eq(withB, plain, 'con perfiles B');
-    // Y el Blueprint v2 no tiene dónde recibir perfiles: mismo sha pase lo que pase con ellos.
-    const s1 = snap.snapshotSha256V2(snap.buildBlueprintSnapshotV2(V2_COURSE, V1_FIXED_MODULES, V2_CHAPTERS, { assessmentProfile: b }));
-    const s2 = snap.snapshotSha256V2(snap.buildBlueprintSnapshotV2(V2_COURSE, V1_FIXED_MODULES, V2_CHAPTERS));
-    eq(s1, s2, 'Blueprint v2 independiente de perfiles');
+    const plain = planMod.computeInvalidationPlan({ from: { blueprint: bp, manifest: m1, items }, to: { blueprint: bp, manifest: m2 } });
+    const withProfiles = planMod.computeInvalidationPlan({ from: { blueprint: noisy, manifest: m1, items }, to: { blueprint: noisy, manifest: m2 } });
+    assert(withProfiles.actions.every((a) => a.action === 'REUSE'), 'plan con perfiles: no todo REUSE');
+    eq(withProfiles.planSha256, plain.planSha256, 'planSha256');
+    // Y el sha del Blueprint v2 (lo que decide si hay Manifest nuevo) tampoco los ve.
+    eq(snap.snapshotSha256V2(snap.recanonicalizeBlueprintSnapshotV2(noisy)), snap.snapshotSha256V2(bp), 'sha del Blueprint v2');
   });
 }
 
@@ -491,11 +495,21 @@ async function dbChecks() {
       const v = runScript(VERIFY, localEnv({ MIGRATION_ENV: 'staging' }));
       assert(v.code === 0 && /Esquema V2.1 R3 verificado/.test(v.out), `verify: exit ${v.code}\n${v.out}`);
     });
-    await check('DB: filas existentes quedan con los defaults (activity_enabled=true, final_exam_enabled=true, activity_engine=h5p)', async () => {
+    // Fix round 1 (review G2 M2, audit §S): los cursos DINÁMICOS existentes al
+    // agregar las columnas se leen como legado (SCORM, sin examen final); los
+    // legacy y los cursos nuevos quedan con los defaults (h5p, examen final ON).
+    await check('DB: filas existentes: dinámicos → (finalExam=false, scorm), legacy → defaults; capítulos activity_enabled=true; cursos nuevos → (true, h5p)', async () => {
       await withClient(DB, async (c) => {
         eq((await c.query(`select activity_enabled from public.course_chapters where id=$1`, [pre.chapterId])).rows[0].activity_enabled, true, 'activity_enabled');
         const row = (await c.query(`select final_exam_enabled, activity_engine from public.courses where id=$1`, [pre.courseId])).rows[0];
-        eq([row.final_exam_enabled, row.activity_engine], [true, 'h5p'], 'curso');
+        eq([row.final_exam_enabled, row.activity_engine], [false, 'scorm'], 'curso dinámico existente');
+        const leg = (await c.query(`select final_exam_enabled, activity_engine from public.courses where id=$1`, [pre.legacyId])).rows[0];
+        eq([leg.final_exam_enabled, leg.activity_engine], [true, 'h5p'], 'curso legacy existente');
+        await c.query('begin');
+        try {
+          const n = (await c.query(`insert into public.courses (owner_id, title, structure_version) values ($1, 'nuevo', 'dynamic') returning final_exam_enabled, activity_engine`, [OWNER])).rows[0];
+          eq([n.final_exam_enabled, n.activity_engine], [true, 'h5p'], 'curso nuevo');
+        } finally { await c.query('rollback'); }
       });
     });
     await check('DB: E2E setup-schema incluye la migración (mismo archivo)', () => {
@@ -528,7 +542,7 @@ async function dbChecks() {
 
     await check('DB estructura: GET devuelve finalExam/activityEngine del curso y activityEnabled por capítulo', async () => {
       const s = await structure.getStructure(cid, OWNER);
-      eq([s.finalExam, s.activityEngine], [true, 'h5p'], 'curso');
+      eq([s.finalExam, s.activityEngine], [false, 'scorm'], 'curso (dinámico existente, backfill M2)');
       eq(s.modules[0].chapters[0].activityEnabled, true, 'capítulo');
     });
     await check('DB estructura: updateChapter acepta activityEnabled (persiste, bump de counter) y 409 con counter viejo', async () => {

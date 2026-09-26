@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   InternalServerErrorException,
   Logger,
@@ -39,6 +40,18 @@ import { assertDynamicOwnerAllowed, assertRealVideoAllowed } from '../features/d
 import { FromRunDto, isFromRunRequest } from '../invalidation/dto/from-run.dto';
 import { computePlanFromDb, executeApplyWrites, planApplyWrites } from '../invalidation/invalidation-apply';
 import { requiredArtifactTypes } from '../dynamic-packaging/artifact-resolver';
+import { regenerationCascade } from './regeneration-cascade';
+import {
+  PROVIDER_MODES_CONFLICT,
+  PROVIDER_MOCK_NOT_ALLOWED,
+  ProviderModeError,
+  ProviderModes,
+  frozenProviderModesOf,
+  isProviderWorkerDeployed,
+  providerWorkerNotDeployedMessage,
+  resolveProviderModes,
+  sameProviderModes,
+} from './provider-modes';
 import { INVALIDATION_V3_NOT_IMPLEMENTED, assertInvalidationRulesSupported } from '../invalidation/plan';
 import { latestGenerationPredicate } from './item-generations';
 import { FinopsBudgetService, StartBudgetEvaluation } from '../finops/finops-budget.service';
@@ -48,7 +61,10 @@ import {
   BUDGET_EXCEEDED,
   FINOPS_UNAVAILABLE,
   RunManifestItem,
+  RunSpendModes,
   estimateItemsForRun,
+  runSpendModes,
+  spendModeOfItemType,
   estimateSummary,
   paidProviderOfItemType,
   paidRealProviders,
@@ -352,7 +368,8 @@ interface RegenerationPlan {
   blockers: RegenerationBlocker[];
   affected: RegenerationAffectedItem[];
   cascade: Array<{ key: string; prev: any; costKind: RegenerationCostKind }>;
-  video: { key: string; row: any; action: RegenerationAffectedItem['action'] } | null;
+  /** Dependientes que quedan STALE_NO_AUTO (v1/v2: el video; v3: proveedores + video_interactions). */
+  staleDeps: Array<{ key: string; row: any; action: RegenerationAffectedItem['action'] }>;
   staleArtifactIds: string[];
   stale: boolean;
 }
@@ -471,13 +488,33 @@ export class RunsService {
     // uso y se congela SOLO en runs nuevos; un run existente/reabierto
     // conserva la suya aunque la config haya cambiado.
     const videoDelivery = readVideoDeliveryConfig();
+    // V2.1 fix round 1 (I1/M1): modos de proveedor explícitos (v3; v1/v2 → undefined).
+    const providerModes = this.providerModesForNewRun(manifest.rulesVersion, (courseContext as any)?.providerModes);
     // I1 (review-rv2): nunca dos generaciones completas activas del mismo
     // curso (doble gasto) — p.ej. un run v1 en curso y la config pasa a v2.
     // Chequeo temprano (409 legible); la garantía bajo concurrencia la dan
     // los chequeos bajo advisory lock en insertRun/reopenRun/retryItem.
     const other = await this.findActiveRunOnOtherManifest(this.dataSource, courseId, manifest.id);
     if (other) throw this.otherActiveRunConflict(other, manifest);
-    return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, true, videoDelivery);
+    return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, true, videoDelivery, providerModes);
+  }
+
+  /** V2.1 fix round 1 (I1/M1): ProviderModeError → 403/400; v3 sin worker de proveedor → 501. */
+  private providerModesForNewRun(rulesVersion: number, requested: unknown): ProviderModes | undefined {
+    let modes: ProviderModes | undefined;
+    try {
+      modes = resolveProviderModes(rulesVersion, requested);
+    } catch (err) {
+      if (err instanceof ProviderModeError) {
+        const body = { message: err.message, code: err.code };
+        throw err.code === PROVIDER_MOCK_NOT_ALLOWED ? new ForbiddenException(body) : new BadRequestException(body);
+      }
+      throw err;
+    }
+    if (modes && !isProviderWorkerDeployed()) {
+      throw new NotImplementedException({ message: providerWorkerNotDeployedMessage(), code: 'PROVIDER_WORKER_NOT_DEPLOYED' });
+    }
+    return modes;
   }
 
   /**
@@ -517,7 +554,7 @@ export class RunsService {
     if (!rowA) throw new NotFoundException(`La ejecución de origen ${fromRunId} no existe para el curso #${courseId}`);
     const bpNumberA = Number(rowA.input_payload?.blueprintNumber);
     const manifestA = await this.manifests.getById(courseId, ownerId, bpNumberA, Number(rowA.input_payload?.manifestId));
-    // V2.1 (R4): invalidación v3 = R5. 501 explícito antes de leer Blueprints (fail loud).
+    // V2.1 (R5): v3 → v3 se calcula; mezclar rulesVersion 3 con 1/2 → 501 antes de leer Blueprints (fail loud).
     try {
       assertInvalidationRulesSupported(manifestA.rulesVersion, manifestB.rulesVersion);
     } catch (err) {
@@ -533,8 +570,8 @@ export class RunsService {
     const videoMode = this.videoModeOf(rowA);
     const videoDelivery = frozenVideoDeliveryOf(rowA.input_payload);
     const [bpA, bpB] = await Promise.all([
-      this.manifests.blueprintOf(courseId, ownerId, bpNumberA),
-      this.manifests.blueprintOf(courseId, ownerId, blueprintNumber),
+      this.manifests.blueprintOfForRules(courseId, ownerId, bpNumberA, manifestA.rulesVersion),
+      this.manifests.blueprintOfForRules(courseId, ownerId, blueprintNumber, manifestB.rulesVersion),
     ]);
     const [course] = await this.dataSource.query(
       `select metadata->>'courseId' as frontend_course_id from public.courses where id = $1`,
@@ -594,7 +631,7 @@ export class RunsService {
           ctxA.context_hash,
           (id) => sources.get(id)?.status ?? null,
           (id) => sources.get(id)?.metadata?.inputFingerprint ?? null,
-          { required: (t) => requiredArtifactTypes(manifestB.rulesVersion, t as ManifestItemType), typeOf: (id) => sources.get(id)?.type },
+          { required: (t, variant) => requiredArtifactTypes(manifestB.rulesVersion, t as ManifestItemType, variant), typeOf: (id) => sources.get(id)?.type },
         );
         if (writes.missingRoles.length > 0) {
           const message =
@@ -613,12 +650,17 @@ export class RunsService {
         const gate = frozenRunVideoGate({ videoWork: writes.videoItemsToGenerate.length, videoMode, strategy: videoDelivery });
         if (gate.ok === false) throw new ConflictException({ message: gate.message, code: gate.code });
         if (gate.requiresYoutubePreflight && !youtubePreflightPassed) throw new NeedsYoutubePreflight(gate);
+        // V2.1 fix round 1 (M1): B va a generar items de Gamma/TTS → el worker de proveedor tiene que existir.
+        if (writes.providerItemsToGenerate.length > 0 && !isProviderWorkerDeployed()) {
+          throw new NotImplementedException({ message: providerWorkerNotDeployedMessage(), code: 'PROVIDER_WORKER_NOT_DEPLOYED' });
+        }
 
         // V2.1 RF-b: estimado del plan (REUSE = 0 incremental) + gate de presupuesto.
         const planActions: Record<string, string> = {};
         for (const a of plan.actions) if (a.inTargetManifest) planActions[a.itemKey] = a.action;
         const budget = await this.finopsEvaluate({
-          courseId, ownerId, manifestId: manifestB.id, items: manifestB.manifest.items, videoMode, actions: planActions,
+          courseId, ownerId, manifestId: manifestB.id, items: manifestB.manifest.items,
+          modes: runSpendModes(videoMode, frozenProviderModesOf(rowA.input_payload)), actions: planActions,
           runner: qr, planSha: plan.planSha256,
         });
 
@@ -631,6 +673,8 @@ export class RunsService {
           videoDelivery,
           fromRunId: rowA.id,
           invalidationPlanSha256: plan.planSha256,
+          // V2.1 fix round 1 (I1): B hereda los modos de proveedor congelados de A (v3).
+          ...(rowA.input_payload?.providerModes ? { providerModes: rowA.input_payload.providerModes } : {}),
         };
         const [job] = await qr.query(
           `insert into public.production_jobs
@@ -704,14 +748,15 @@ export class RunsService {
     videoMode: RunVideoMode,
     mayRetry: boolean,
     videoDelivery: VideoDeliveryStrategy,
+    providerModes?: ProviderModes,
   ): Promise<StartRunResult> {
     const active = await this.findActiveRunRow(manifest.id);
-    if (active) return this.existingRunOrConflict(active, manifest, contextHash, videoMode);
+    if (active) return this.existingRunOrConflict(active, manifest, contextHash, videoMode, providerModes);
 
     const latest = await this.findLatestRunRow(manifest.id);
     if (latest) {
       // Carrera: el run pudo commitearse entre las dos lecturas → es el activo.
-      if (isActive(latest)) return this.existingRunOrConflict(latest, manifest, contextHash, videoMode);
+      if (isActive(latest)) return this.existingRunOrConflict(latest, manifest, contextHash, videoMode, providerModes);
       if (!isReopenable(latest)) {
         throw new ConflictException(
           `La ejecución anterior de este Manifest ya terminó (${latest.worker_status}); re-ejecutar un Manifest ` +
@@ -731,6 +776,12 @@ export class RunsService {
             `(Fase 8). runId=${latest.id}`,
         );
       }
+      if (providerModes && !sameProviderModes(frozenProviderModesOf(latest.input_payload), providerModes)) {
+        throw new ConflictException({
+          message: `La ejecución anterior usó otros modos de proveedor; cambiarlos requiere regeneración. runId=${latest.id}`,
+          code: PROVIDER_MODES_CONFLICT,
+        });
+      }
       // I1 (5C): reabrir un run 'real' vuelve a gastar Videogen → allow-list DYNAMIC_REAL_VIDEO_OWNERS.
       if (latestVideoMode === 'real') assertRealVideoAllowed(ownerId);
       // Fix wave (M5): un run reemplazado por uno creado desde él no se reabre.
@@ -746,7 +797,7 @@ export class RunsService {
       );
       // RF-b fix I1: reabrir re-encola items cancelled; si alguno envía trabajo pagado
       // real nuevo (video sin job, item de proveedor) → aprobación ADMIN que lo cubra.
-      if (latestVideoMode === 'real') {
+      {
         const cancelled: Array<{ item_key: string; type: string; output_summary: Record<string, any> | null }> = await this.dataSource.query(
           `select g.item_key, g.type, g.output_summary from public.generation_item_runs g
             where g.job_id = $1 and g.status = 'cancelled' and ${latestGenerationPredicate('g')}`,
@@ -765,7 +816,7 @@ export class RunsService {
     // casi siempre la carrera "otro POST commiteó entre nuestras lecturas":
     // si ahora hay un run visible, se re-resuelve contra él (una vez).
     if (mayRetry && (await this.hasPreviousItems(manifest)) && (await this.findLatestRunRow(manifest.id))) {
-      return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, false, videoDelivery);
+      return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, false, videoDelivery, providerModes);
     }
     await this.assertNoPreviousItems(manifest);
     // I1 (5C): un run NUEVO con video real requiere DYNAMIC_REAL_VIDEO_OWNERS (fail closed). Un run
@@ -785,12 +836,14 @@ export class RunsService {
     const frontendCourseId: string | null = course?.frontend_course_id ?? null;
 
     // V2.1 RF-b: estimado + gate de presupuesto ANTES de escribir el run.
-    const budget = await this.finopsStartGate({ courseId, ownerId, manifestId: manifest.id, items: manifest.manifest.items, videoMode });
+    const budget = await this.finopsStartGate({
+      courseId, ownerId, manifestId: manifest.id, items: manifest.manifest.items, modes: runSpendModes(videoMode, providerModes ?? null),
+    });
 
     let jobId: string;
     try {
       jobId = await this.tx(async (qr) => {
-        const id = await this.insertRun(qr, manifest, ownerId, courseId, frontendCourseId, blueprintNumber, context, contextHash, videoMode, frozenDelivery);
+        const id = await this.insertRun(qr, manifest, ownerId, courseId, frontendCourseId, blueprintNumber, context, contextHash, videoMode, frozenDelivery, providerModes);
         await this.finopsBindRun(qr, budget, { runId: id, courseId, ownerId, manifestId: manifest.id });
         return id;
       });
@@ -799,7 +852,7 @@ export class RunsService {
         // Carrera: otro POST creó el run activo primero (y ya commiteó — el
         // índice único espera al otro insert antes de fallar).
         const winner = await this.findActiveRunRow(manifest.id);
-        if (winner) return this.existingRunOrConflict(winner, manifest, contextHash, videoMode);
+        if (winner) return this.existingRunOrConflict(winner, manifest, contextHash, videoMode, providerModes);
         throw new ConflictException(
           `Otra ejecución del Manifest #${manifest.id} se creó y terminó mientras se procesaba esta; reintentá la consulta`,
         );
@@ -1093,7 +1146,7 @@ export class RunsService {
       // RF-b fix I1: un retry que puede ENVIAR trabajo pagado real nuevo (video sin
       // job / resubmitVideo, item de proveedor, o videos/proveedores bloqueados que
       // se desbloquean) exige una aprobación ADMIN que cubra el incremental.
-      if (this.videoModeOf(job) === 'real' && !uploadPhaseRetry) {
+      if (!uploadPhaseRetry) {
         const isPaid = (r: { type: string }) => paidProviderOfItemType(r.type) !== null;
         const newPaid = (r: { type: string; output_summary: Record<string, any> | null }, resubmit: boolean) =>
           r.type !== 'video' || resubmit || !r.output_summary?.external?.videogenJobId;
@@ -1547,7 +1600,7 @@ export class RunsService {
         currentGeneration: plan.currentGeneration,
         affected: plan.affected,
         blockers,
-        cost: await this.regenerationCostPreview(manifest, plan.affected, videoMode).catch((err) => {
+        cost: await this.regenerationCostPreview(manifest, plan.affected, this.spendModesOf(job)).catch((err) => {
           throw this.finopsUnavailable(err);
         }),
       };
@@ -1592,6 +1645,18 @@ export class RunsService {
       }
       // La primera traba es el error de siempre (mismo orden y códigos).
       if (plan.blockers.length > 0) throw plan.blockers[0].error();
+      // V2.1 fix round 1 (I2): la cascada también puede costar (p.ej. v3: regenerar un video
+      // mock regenera sus interacciones con LLM) → confirmPaid aunque el pedido en sí sea gratis.
+      const paidCascade = plan.cascade.find((c) => c.costKind !== 'none');
+      if (paidCascade && o.confirmPaid !== true) {
+        throw new BadRequestException({
+          message:
+            `confirm_paid_required: regenerar "${itemKey}" regenera también "${paidCascade.key}" (${paidCascade.costKind}); ` +
+            'reenviá con {"confirmPaid": true} para confirmarlo explícitamente',
+          code: 'confirm_paid_required',
+          costKind: paidCascade.costKind,
+        });
+      }
       return this.applyRegeneration(qr, plan, { job: locked, manifest, itemKey, mItem, ownerId, costKind });
     });
 
@@ -1673,7 +1738,7 @@ export class RunsService {
     const currentGeneration = Number(latest.generation);
     // Idempotencia: la regeneración pedida sigue en vuelo → misma respuesta (antes que cualquier otra regla).
     if (latest.generation > 1 && REGENERATION_IN_FLIGHT.has(latest.status) && latest.output_summary?.regeneration && !isCancelledLike(job)) {
-      return { inFlight: true, latest, currentGeneration, blockers: [], affected: this.storedAffected(latest, itemKey, costKind), cascade: [], video: null, staleArtifactIds: [], stale: false };
+      return { inFlight: true, latest, currentGeneration, blockers: [], affected: this.storedAffected(latest, itemKey, costKind), cascade: [], staleDeps: [], staleArtifactIds: [], stale: false };
     }
     if (a.expectedGeneration !== undefined && a.expectedGeneration !== currentGeneration) {
       const message =
@@ -1710,16 +1775,13 @@ export class RunsService {
     );
     const stale = staleArtifacts.length > 0 || latest.output_summary?.invalidation?.action === 'STALE_NO_AUTO';
 
-    // Cascada de un content (tabla de Fase 8, "editar el capítulo").
-    const cascadeKeys: string[] = [];
-    let videoKey: string | null = null;
-    if (mItem.type === 'content' && mItem.chapterId) {
-      const has = (key: string) => manifest.manifest.items.some((it) => it.key === key);
-      if (has(`scorm:${mItem.chapterId}`)) cascadeKeys.push(`scorm:${mItem.chapterId}`);
-      if (mItem.moduleId && has(`exam:${mItem.moduleId}`)) cascadeKeys.push(`exam:${mItem.moduleId}`);
-      if (has(`video:${mItem.chapterId}`)) videoKey = `video:${mItem.chapterId}`;
-    }
-    const depKeys = videoKey ? [...cascadeKeys, videoKey] : cascadeKeys;
+    // Cascada (tabla de Fase 8 "editar el capítulo"; v3: regeneration-cascade.ts, fix round 1 I2).
+    const { regenerate: cascadeKeys, stale: staleKeys } = regenerationCascade(
+      manifest.rulesVersion,
+      manifest.manifest.items,
+      { key: itemKey, type: mItem.type, moduleId: mItem.moduleId ?? null, chapterId: mItem.chapterId ?? null },
+    );
+    const depKeys = [...cascadeKeys, ...staleKeys];
     const depRows: any[] = depKeys.length
       ? await q.query(
           `select * from public.generation_item_runs g
@@ -1752,15 +1814,15 @@ export class RunsService {
       cascade.push({ key, prev, costKind: depCost });
       affected.push({ itemKey: key, type: prev.type, itemRunId: null, generation: Number(prev.generation) + 1, action: 'REGENERATE', created: true, costKind: depCost });
     }
-    let video: RegenerationPlan['video'] = null;
-    if (videoKey) {
-      const v = depByKey.get(videoKey);
+    const staleDeps: RegenerationPlan['staleDeps'] = [];
+    for (const key of staleKeys) {
+      const v = depByKey.get(key);
       const action: RegenerationAffectedItem['action'] =
         v.status === 'completed' ? 'STALE_NO_AUTO' : REGENERATION_IN_FLIGHT.has(v.status) || v.status === 'running' ? 'WAITS' : 'UNCHANGED';
-      video = { key: videoKey, row: v, action };
-      affected.push({ itemKey: videoKey, type: 'video', itemRunId: v.id, generation: Number(v.generation), action, created: false, costKind: 'none' });
+      staleDeps.push({ key, row: v, action });
+      affected.push({ itemKey: key, type: v.type, itemRunId: v.id, generation: Number(v.generation), action, created: false, costKind: 'none' });
     }
-    return { inFlight: false, latest, currentGeneration, blockers, affected, cascade, video, staleArtifactIds: staleArtifacts.map((x) => x.id), stale };
+    return { inFlight: false, latest, currentGeneration, blockers, affected, cascade, staleDeps, staleArtifactIds: staleArtifacts.map((x) => x.id), stale };
   }
 
   /** Escrituras de una regeneración ya planificada y sin trabas (dentro de la tx, con locks). */
@@ -1795,7 +1857,7 @@ export class RunsService {
                   'supersededByItemRunId', $3::text, 'supersededAt', $4::text),
                 updated_at = now()
           where item_run_id = $1 and status is distinct from 'disabled'`,
-        [prev.id, regeneration.reason === 'cascade_from_content' ? 'cascade_from_content' : 'regenerated', row.id, requestedAt],
+        [prev.id, String(regeneration.reason).startsWith('cascade_from_') ? regeneration.reason : 'regenerated', row.id, requestedAt],
       );
       return { id: row.id, generation };
     };
@@ -1816,7 +1878,7 @@ export class RunsService {
       const g = await insertGeneration(c.prev, c.key, {
         fromItemRunId: c.prev.id,
         fromGeneration: Number(c.prev.generation),
-        reason: 'cascade_from_content',
+        reason: `cascade_from_${a.mItem.type}`,
         cascadeFromItemRunId: primary.id,
         cascadeFromItemKey: itemKey,
         staleArtifactIds: [],
@@ -1828,18 +1890,20 @@ export class RunsService {
       Object.assign(entry, { itemRunId: g.id, generation: g.generation });
     }
 
-    if (plan.video && plan.video.action === 'STALE_NO_AUTO') {
-      const v = plan.video.row;
+    for (const dep of plan.staleDeps) {
+      if (dep.action !== 'STALE_NO_AUTO') continue;
+      const v = dep.row;
+      const staleReason = `${a.mItem.type}_regenerated`;
       // STALE_NO_AUTO: el video queda como está (se sigue empaquetando, con
       // aviso) y la UI ofrece su regeneración paga explícita.
       await qr.query(
         `update public.artifacts
             set status = 'stale',
                 metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object(
-                  'staleReason', 'content_regenerated', 'staleByItemRunId', $2::text, 'staleAt', $3::text),
+                  'staleReason', $4::text, 'staleByItemRunId', $2::text, 'staleAt', $3::text),
                 updated_at = now()
           where item_run_id = $1 and status is distinct from 'disabled'`,
-        [v.id, primary.id, requestedAt],
+        [v.id, primary.id, requestedAt, staleReason],
       );
       const prevInv = v.output_summary?.invalidation ?? {};
       // Fix wave M3: una cascada repetida conserva el previousAction ORIGINAL.
@@ -1851,8 +1915,8 @@ export class RunsService {
         ...prevInv,
         action: 'STALE_NO_AUTO',
         previousAction,
-        reasons: [...new Set([...(Array.isArray(prevInv.reasons) ? prevInv.reasons : []), 'content_regenerated'])],
-        contentItemRunId: primary.id,
+        reasons: [...new Set([...(Array.isArray(prevInv.reasons) ? prevInv.reasons : []), staleReason])],
+        ...(a.mItem.type === 'content' ? { contentItemRunId: primary.id } : { sourceItemKey: itemKey, sourceItemRunId: primary.id }),
       };
       await qr.query(
         `update public.generation_item_runs
@@ -1920,12 +1984,13 @@ export class RunsService {
     ownerId: string;
     manifestId: number;
     items: readonly RunManifestItem[];
-    videoMode: RunVideoMode;
+    /** Modo de gasto por proveedor (video = videoMode; Gamma/TTS = providerModes congelados). */
+    modes: RunSpendModes;
     actions?: Record<string, string> | null;
     runner?: { query: (sql: string, params?: any[]) => Promise<any> };
     planSha?: string | null;
   }): Promise<{ evaluation: StartBudgetEvaluation; approval: any | null } | null> {
-    const mode = a.videoMode === 'real' ? 'real' : 'mock';
+    const mode = a.modes;
     if (!this.finopsBudget) {
       const paid = paidRealProviders(estimateItemsForRun(a.items, mode, a.actions ?? null), mode);
       if (paid.length > 0) {
@@ -1973,7 +2038,7 @@ export class RunsService {
     ownerId: string;
     manifestId: number;
     items: readonly RunManifestItem[];
-    videoMode: RunVideoMode;
+    modes: RunSpendModes;
   }): Promise<{ evaluation: StartBudgetEvaluation; approval: any | null } | null> {
     try {
       return await this.finopsEvaluate(a);
@@ -2045,7 +2110,7 @@ export class RunsService {
     try {
       const keep = plan.actions.filter((x) => x.inTargetManifest && ['REUSE', 'REVIEW', 'STALE_NO_AUTO'].includes(x.action));
       if (keep.length === 0) return;
-      const mode = this.videoModeOf(job) === 'real' ? 'real' : 'mock';
+      const mode = this.spendModesOf(job);
       const byKey = new Map(manifest.manifest.items.map((it) => [it.key, it]));
       const items = keep.map((x) => byKey.get(x.itemKey)).filter(Boolean) as RunManifestItem[];
       const est = await this.finopsBudget.estimate(estimateItemsForRun(items, mode, null));
@@ -2069,12 +2134,12 @@ export class RunsService {
   private async regenerationCostPreview(
     manifest: ManifestDto,
     affected: RegenerationAffectedItem[],
-    videoMode: RunVideoMode,
+    modes: RunSpendModes,
   ): Promise<RegenerationCostPreview | null> {
     if (!this.finopsBudget) return null;
     const zero = normalizeDecimal(0);
     const zeros: MinExpMax = { min: zero, expected: zero, max: zero };
-    const mode = videoMode === 'real' ? 'real' : 'mock';
+    const mode = modes;
     const byKey = new Map(manifest.manifest.items.map((it) => [it.key, it]));
     const planned = affected.filter((x) => x.action === 'REGENERATE' || x.action === 'STALE_NO_AUTO');
     const actions: Record<string, string> = {};
@@ -2117,8 +2182,11 @@ export class RunsService {
    * estimateId. AUTO_WITHIN_POLICY nunca cubre proveedores pagados.
    */
   private async finopsPaidWorkGate(a: { courseId: number; ownerId: string; manifest: ManifestDto; job: any; paidKeys: string[] }): Promise<void> {
-    if (this.videoModeOf(a.job) !== 'real' || a.paidKeys.length === 0) return;
-    const keys = [...new Set(a.paidKeys)].sort();
+    // Solo los items cuyo proveedor está congelado en `real` para este run (video: videoMode; Gamma/TTS: providerModes).
+    const modes = this.spendModesOf(a.job);
+    const typeOf = new Map(a.manifest.manifest.items.map((it) => [it.key, it.type]));
+    const keys = [...new Set(a.paidKeys)].filter((k) => spendModeOfItemType(modes, String(typeOf.get(k))) === 'real').sort();
+    if (keys.length === 0) return;
     if (!this.finopsBudget) {
       throw new ServiceUnavailableException({
         code: FINOPS_UNAVAILABLE,
@@ -2171,9 +2239,11 @@ export class RunsService {
     });
     // Idempotencia en vuelo o trabas: la tx responde lo de siempre, sin estimado nuevo.
     if (plan.inFlight || plan.blockers.length > 0) return;
-    const mode = videoMode === 'real' ? 'real' : 'mock';
+    const mode = this.spendModesOf(job);
     const regenerated = plan.affected.filter((x) => x.action === 'REGENERATE');
-    const paid = mode === 'real' ? [...new Set(regenerated.map((x) => paidProviderOfItemType(x.type)).filter(Boolean) as string[])].sort() : [];
+    const paid = [...new Set(regenerated
+      .filter((x) => spendModeOfItemType(mode, x.type) === 'real')
+      .map((x) => paidProviderOfItemType(x.type)).filter(Boolean) as string[])].sort();
     if (!this.finopsBudget) {
       if (paid.length > 0) {
         throw new ServiceUnavailableException({
@@ -2337,6 +2407,7 @@ export class RunsService {
     contextHash: string,
     videoMode: RunVideoMode,
     videoDelivery: VideoDeliveryStrategy,
+    providerModes?: ProviderModes,
   ): Promise<string> {
     // I1: bajo el lock del curso, ningún otro Manifest del curso puede tener
     // un run activo (el índice único parcial solo protege ESTE Manifest).
@@ -2344,7 +2415,8 @@ export class RunsService {
     const other = await this.findActiveRunOnOtherManifest(qr, courseId, manifest.id);
     if (other) throw this.otherActiveRunConflict(other, manifest);
 
-    const inputPayload = { manifestId: manifest.id, blueprintNumber, contextHash, videoMode, videoDelivery };
+    // v1/v2: sin providerModes (input_payload idéntico al de antes); v3: congelados (fix round 1, I1).
+    const inputPayload = { manifestId: manifest.id, blueprintNumber, contextHash, videoMode, videoDelivery, ...(providerModes ? { providerModes } : {}) };
     const [job] = await qr.query(
       `insert into public.production_jobs
          (owner_id, course_id, frontend_course_id, execution_mode, status, worker_status, current_step,
@@ -2421,6 +2493,7 @@ export class RunsService {
     manifest: ManifestDto,
     contextHash: string,
     videoMode: RunVideoMode,
+    providerModes?: ProviderModes,
   ): Promise<StartRunResult> {
     const ctx = await this.loadContextRow(job.id);
     if (ctx.context_hash !== contextHash) {
@@ -2438,6 +2511,12 @@ export class RunsService {
           `enviado ${videoMode}). El modo de video de una ejecución iniciada no cambia. runId=${job.id}`,
       );
     }
+    if (providerModes && !sameProviderModes(frozenProviderModesOf(job.input_payload), providerModes)) {
+      throw new ConflictException({
+        message: `Ya hay una ejecución activa para este Manifest con otros modos de proveedor; no cambian una vez iniciada. runId=${job.id}`,
+        code: PROVIDER_MODES_CONFLICT,
+      });
+    }
     return { created: false, reopened: false, run: await this.buildRunDto(job, manifest) };
   }
 
@@ -2447,6 +2526,11 @@ export class RunsService {
   }
 
   /** videoMode congelado de un run ya existente; ausente (runs previos a esta feature) → 'mock'. */
+  /** V2.1 RF-b: modos de gasto congelados del run (video + providerModes; sin providerModes ⇒ real, fail safe). */
+  private spendModesOf(job: any): RunSpendModes {
+    return runSpendModes(this.videoModeOf(job), frozenProviderModesOf(job?.input_payload));
+  }
+
   private videoModeOf(job: any): RunVideoMode {
     const v = job?.input_payload?.videoMode;
     return (RUN_VIDEO_MODES as readonly string[]).includes(v) ? v : DEFAULT_VIDEO_MODE;

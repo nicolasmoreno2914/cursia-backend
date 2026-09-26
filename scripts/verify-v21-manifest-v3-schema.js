@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { Client } = require('pg');
+const v2Target = require('./lib/v2-production-target');
 
 function loadEnvFile(envPath) {
   if (!fs.existsSync(envPath)) return;
@@ -104,8 +105,16 @@ async function constraintDef(client, table, conname) {
 
 async function main() {
   loadEnvFile(path.resolve(process.cwd(), '.env'));
-  assertExplicitStagingIntent();
-  assertNotProductionProject();
+  // Fix round 1 (review G2 I5): modo opt-in V2_VERIFY_MODE=production-readonly
+  // (lo usa scripts/prod/migrate-v2-production.js), igual que los verify-* de
+  // V2: solo catálogo, sesión READ ONLY, sin la sonda con escrituras.
+  const PROD_RO = v2Target.isProductionReadonlyRequested()
+    ? v2Target.assertProductionReadonlyTargetOrExit()
+    : null;
+  if (!PROD_RO) {
+    assertExplicitStagingIntent();
+    assertNotProductionProject();
+  }
 
   const client = new Client({
     host: process.env.DB_HOST || '127.0.0.1',
@@ -116,6 +125,14 @@ async function main() {
     ssl: String(process.env.DB_SSL || '').toLowerCase() === 'true' ? { rejectUnauthorized: false } : false,
   });
   await client.connect();
+  if (PROD_RO) {
+    try {
+      await v2Target.enterProductionReadonlySession(client, PROD_RO);
+    } catch (err) {
+      await client.end();
+      throw err;
+    }
+  }
   const failures = [];
   try {
     // 1. Catálogo.
@@ -157,6 +174,11 @@ async function main() {
       return;
     }
 
+    if (PROD_RO) {
+      v2Target.logSkippedProbe('2. sonda de comportamiento (inserts en transacción revertida)');
+      console.log('✅ Catálogo verificado (production-readonly).');
+      return;
+    }
     // 2. Comportamiento, en una transacción SIEMPRE revertida.
     await client.query('begin');
     try {

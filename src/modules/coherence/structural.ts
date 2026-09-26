@@ -1,4 +1,5 @@
-import type { BlueprintSnapshotV1 } from '../course-blueprints/blueprint-snapshot';
+import type { BlueprintSnapshotV1, BlueprintSnapshotV2 } from '../course-blueprints/blueprint-snapshot';
+import { blueprintV2Warnings, structuralViewV1 } from '../course-blueprints/blueprint-snapshot';
 import { cmpStr } from './canonical-json';
 import { COHERENCE_THRESHOLDS as T, CoherenceFindingDraft, buildOutline } from './coherence-types';
 import { normTokens, round4, tokenContainment, tokenJaccard, tokenSet, trigramJaccard } from './normalize';
@@ -85,6 +86,34 @@ export function runStructuralRules(bp: BlueprintSnapshotV1): CoherenceFindingDra
     }
   }
 
+  return out;
+}
+
+/**
+ * V2.1 (R5) — capa estructural sobre un Blueprint schemaVersion 2 (runs
+ * rulesVersion 3), `coherence-rules-v3@1`:
+ *  - S1–S3: las mismas reglas de v1, sobre la vista estructural (títulos,
+ *    objetivos, orden, examEnabled). Los toggles nuevos no las cambian.
+ *  - S4 (nuevo, info): el curso no tiene nada calificable (ninguna
+ *    actividad, ningún examen de módulo y sin examen final). Mismo criterio
+ *    que la advertencia NO_GRADED_ITEMS del Blueprint v2.
+ * El motor (`activityEngine`) y los recursos obligatorios (Gamma, audio) no
+ * generan findings: son decisiones de producto, no incoherencias.
+ */
+export function runStructuralRulesV3(bp: BlueprintSnapshotV2): CoherenceFindingDraft[] {
+  const out = runStructuralRules(structuralViewV1(bp));
+  if (blueprintV2Warnings(bp).some((w) => w.code === 'NO_GRADED_ITEMS')) {
+    out.push({
+      rule: 'S4',
+      severity: 'info',
+      moduleIds: [],
+      chapterIds: [],
+      evidence: { activityCount: 0, examCount: 0, finalExam: false },
+      message: 'El curso no tiene nada calificable: ninguna actividad, ningún examen de módulo y sin examen final.',
+      suggestion: 'Activá al menos una actividad, un examen de módulo o el examen final para que el curso tenga nota.',
+      suggestedAction: 'review',
+    });
+  }
   return out;
 }
 

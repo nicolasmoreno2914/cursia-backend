@@ -18,7 +18,10 @@
 --                                     de invalidación.
 --
 -- Los defaults hacen que las filas existentes queden como "todo ON" (igual
--- que un Blueprint v1: activityEnabled=true). Los snapshots v1 ya congelados
+-- que un Blueprint v1: activityEnabled=true), SALVO los cursos dinámicos que
+-- ya existían al agregar las columnas: finalExam=false y activityEngine=
+-- 'scorm' (lectura de legado de §S; fix round 1, M2). Cursos nuevos: default
+-- h5p + examen final ON (DECISIONES VIGENTES). Los snapshots v1 ya congelados
 -- no se tocan (el sha de un v1 no cambia).
 --
 -- Rollback (solo si ningún código V2.1 lee las columnas/tabla):
@@ -52,6 +55,10 @@ do $$ begin
        and column_name = 'final_exam_enabled'
   ) then
     alter table public.courses add column final_exam_enabled boolean not null default true;
+    -- Fix round 1 (review G2 M2, audit §S): los cursos dinámicos que YA existían
+    -- no tenían examen final; se leen como finalExam=false (solo al agregar la
+    -- columna: re-correr la migración nunca pisa lo que el usuario eligió).
+    update public.courses set final_exam_enabled = false where structure_version = 'dynamic';
   end if;
 end $$;
 
@@ -63,6 +70,9 @@ do $$ begin
        and column_name = 'activity_engine'
   ) then
     alter table public.courses add column activity_engine text not null default 'h5p';
+    -- Fix round 1 (M2, §S): sus actividades existentes son SCORM → motor 'scorm'
+    -- (así re-confirmarlos en v3 reutiliza la variante, sin cambiar de motor).
+    update public.courses set activity_engine = 'scorm' where structure_version = 'dynamic';
   end if;
 end $$;
 

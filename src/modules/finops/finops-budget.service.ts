@@ -11,6 +11,7 @@ import {
   RunBudgetDecision,
   RunManifestItem,
   RunSpendMode,
+  RunSpendModes,
   WORKER_PAID_ITEM_TYPES,
   decideRunBudget,
   estimateItemsForRun,
@@ -113,7 +114,7 @@ export class FinopsBudgetService {
   async evaluateStart(a: {
     courseId: number;
     ownerId: string;
-    mode: RunSpendMode;
+    mode: RunSpendMode | RunSpendModes;
     items: readonly RunManifestItem[];
     actions?: Readonly<Record<string, string>> | null;
   }): Promise<StartBudgetEvaluation> {
