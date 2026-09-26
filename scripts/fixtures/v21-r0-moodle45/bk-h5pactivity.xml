@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<activity id="1" moduleid="4575" modulename="h5pactivity" contextid="4707">
+  <h5pactivity id="1">
+    <name>QS por docente</name>
+    <timecreated>1790404423</timecreated>
+    <timemodified>1790404423</timemodified>
+    <intro></intro>
+    <introformat>1</introformat>
+    <grade>100</grade>
+    <displayoptions>0</displayoptions>
+    <enabletracking>1</enabletracking>
+    <grademethod>1</grademethod>
+    <reviewmode>1</reviewmode>
+    <attempts>
+    </attempts>
+  </h5pactivity>
+</activity>
