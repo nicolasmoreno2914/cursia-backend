@@ -415,7 +415,7 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     }
   });
 
-  await check('(a) deploy-staging.yml [0b]: flags V2 idempotentes, solo agrega lo que falta y nunca imprime valores', () => {
+  await check('(a) deploy-staging.yml [0b]: flags V2 idempotentes (rules v3 exacto), nunca imprime KEY=VALUE ni toca los proveedores', () => {
     const script = remoteScriptOf(pm2StepOf(stagingText, 'deploy-staging.yml').text);
     const lines = script.split('\n');
     const fnStart = lines.findIndex((l) => l.startsWith('_Q_CR='));
@@ -428,10 +428,12 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       `ensure_env_list_contains DYNAMIC_V2_ALLOWED_OWNERS ${OWNER}`,
       `ensure_env_list_contains DYNAMIC_REAL_VIDEO_OWNERS ${OWNER}`,
       'ensure_env_default_if_absent DYNAMIC_VIDEO_DELIVERY youtube',
-      'ensure_env_default_if_absent DYNAMIC_MANIFEST_RULES_VERSION 2',
+      // Aceptación rv3 (autorizado por Nicolás): valor EXACTO 3, no solo default.
+      'ensure_env_exact DYNAMIC_MANIFEST_RULES_VERSION 3',
       'ensure_env_flag_true DYNAMIC_COURSE_STRUCTURE',
     ]) assert(block.includes(needle), `falta: ${needle}`);
     assert(!/(ensure_\w+|printf[^\n]*>>\s*\.env)[^\n]*DYNAMIC_COHERENCE_LLM/.test(block), 'DYNAMIC_COHERENCE_LLM no debe escribirse');
+    assert(!/(ensure_\w+|printf[^\n]*>>\s*\.env)[^\n]*DYNAMIC_PROVIDER_WORKER_ENABLED/.test(block), 'DYNAMIC_PROVIDER_WORKER_ENABLED no debe tocarse (proveedores reales apagados)');
     const SECRET = 'valor-secreto-no-imprimir-123';
     const scenarios = [
       { label: '.env mínimo', env: `NODE_ENV=production\nSUPABASE_SERVICE_KEY=${SECRET}\n` },
@@ -464,10 +466,11 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
         eq(kv.SUPABASE_SERVICE_KEY, SECRET, `${sc.label}: otra clave alterada`);
         if (sc.label === '.env mínimo') {
           eq(kv.DYNAMIC_VIDEO_DELIVERY, 'youtube', 'default DYNAMIC_VIDEO_DELIVERY');
-          eq(kv.DYNAMIC_MANIFEST_RULES_VERSION, '2', 'default DYNAMIC_MANIFEST_RULES_VERSION');
+          eq(kv.DYNAMIC_MANIFEST_RULES_VERSION, '3', 'DYNAMIC_MANIFEST_RULES_VERSION agregado en 3');
         } else {
           eq(kv.DYNAMIC_VIDEO_DELIVERY, 'videogen_direct', 'valor manual respetado');
-          eq(kv.DYNAMIC_MANIFEST_RULES_VERSION, '1', 'valor manual respetado');
+          eq(kv.DYNAMIC_MANIFEST_RULES_VERSION, '3', 'rv3: el valor anterior (1) se reemplaza por 3');
+          assert(fs.existsSync(path.join(dir, '.env.bak')), 'backup del .env');
           eq(kv.DYNAMIC_V2_ALLOWED_OWNERS, `11111111-2222-4333-8444-555555555555,${OWNER}`, 'lista extendida (no reemplazada)');
         }
       } finally {
