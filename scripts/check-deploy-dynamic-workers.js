@@ -433,8 +433,11 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       'ensure_env_flag_true DYNAMIC_COURSE_STRUCTURE',
     ]) assert(block.includes(needle), `falta: ${needle}`);
     assert(!/(ensure_\w+|printf[^\n]*>>\s*\.env)[^\n]*DYNAMIC_COHERENCE_LLM/.test(block), 'DYNAMIC_COHERENCE_LLM no debe escribirse');
-    assert(!/DYNAMIC_PROVIDER_WORKER_ENABLED\s+true/.test(block), 'DYNAMIC_PROVIDER_WORKER_ENABLED nunca se enciende desde el deploy');
-    assert(block.includes('ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED false'), 'el deploy lo deja explícitamente en false');
+    // Calibración V2.1: el único "true" posible está detrás de _CAL_WORKER=on (dispatch manual).
+    const trueLines = block.split('\n').filter((l) => /DYNAMIC_PROVIDER_WORKER_ENABLED\s+true/.test(l));
+    eq(trueLines.length, 1, 'un único punto que enciende el worker');
+    assert(/if \[ "\$\{_CAL_WORKER:-off\}" = "on" \]; then\n[^\n]*\n\s*ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED true\n\s*else\n\s*ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED false/.test(block),
+      'el worker solo se enciende con _CAL_WORKER=on; si no, false explícito');
     const SECRET = 'valor-secreto-no-imprimir-123';
     const scenarios = [
       { label: '.env mínimo', env: `NODE_ENV=production\nSUPABASE_SERVICE_KEY=${SECRET}\n` },
@@ -499,13 +502,13 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     const flagsEnd = lines.findIndex((l) => l.startsWith('echo "━━━ [1/6]'));
     const block = [...lines.slice(fnStart, fnEnd), ...lines.slice(flagsStart, flagsEnd)].join('\n');
     assert(/IFS= read -r _FIT/.test(script), 'el token se lee de stdin');
-    assert(/printf "%s\\n" "\$FINOPS_INGEST_TOKEN_STAGING" \| ssh/.test(stagingText), 'el token viaja por stdin del ssh');
+    assert(/printf "%s\\n%s\\n%s\\n%s\\n" "\$FINOPS_INGEST_TOKEN_STAGING" "\$CAL_WORKER" "\$CAL_ACTION" "\$CAL_COURSE" \| ssh/.test(stagingText), 'token + controles de calibración viajan por stdin del ssh');
     const TOKEN = 'finops-token-SECRET-6666';
     const STG = { VG: 'vg-staging-SECRET-4444', DB: 'db-pass-SECRET-7777' };
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v21-provcfg-'));
     try {
       fs.writeFileSync(path.join(dir, '.env'), `NODE_ENV=production\nDB_PASS=${STG.DB}\nVIDEOGEN_API_KEY=${STG.VG}\nDYNAMIC_PROVIDER_WORKER_ENABLED=true\n`);
-      const run = (fit) => spawnSync('bash', ['-c', `set -e\n_FIT=${fit}\n${block}`], { cwd: dir, encoding: 'utf8' });
+      const run = (fit, worker) => spawnSync('bash', ['-c', `set -e\n_FIT=${fit}\n${worker === undefined ? '' : `_CAL_WORKER=${worker}\n`}${block}`], { cwd: dir, encoding: 'utf8' });
       const r1 = run(TOKEN);
       assert(r1.status === 0, `bloque falló: ${r1.stderr}`);
       const out = r1.stdout + r1.stderr;
@@ -528,9 +531,62 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       fs.writeFileSync(path.join(dir, '.env'), before.replace('GAMMA_THEME_V21_LIGHT_DEFAULT=default-light', 'GAMMA_THEME_V21_LIGHT_DEFAULT=manual-theme'));
       assert(run(TOKEN).status === 0, 'corrida con tema manual');
       assert(/GAMMA_THEME_V21_LIGHT_DEFAULT=manual-theme/.test(fs.readFileSync(path.join(dir, '.env'), 'utf8')), 'tema manual respetado');
+      // Calibración V2.1: dispatch con provider_worker=on → true; cualquier otro valor/ausente (push) → false.
+      const workerVal = () => (fs.readFileSync(path.join(dir, '.env'), 'utf8').match(/^DYNAMIC_PROVIDER_WORKER_ENABLED=(.*)$/m) || [])[1];
+      assert(run(TOKEN, 'on').status === 0 && workerVal() === 'true', 'dispatch on → worker true');
+      assert(run(TOKEN).status === 0 && workerVal() === 'false', 'push (sin control) → worker vuelve a false');
+      assert(run(TOKEN, 'on').status === 0 && workerVal() === 'true', 'on otra vez');
+      assert(run(TOKEN, 'off').status === 0 && workerVal() === 'false', 'dispatch off → false');
+      assert(run(TOKEN, 'ON; true').status === 0 && workerVal() === 'false', 'valor raro → false');
+      eq((fs.readFileSync(path.join(dir, '.env'), 'utf8').match(/^DYNAMIC_PROVIDER_WORKER_ENABLED=/gm) || []).length, 1, 'una sola línea del flag');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  await check('deploy-staging.yml: controles de calibración V2.1 solo en dispatch manual, validados en el runner, sin interpolar inputs en el script remoto', () => {
+    const step = pm2StepOf(stagingText, 'deploy-staging.yml').text;
+    assert(/provider_worker:[\s\S]*?options: \['off', 'on'\][\s\S]*?default: 'off'/.test(stagingText), 'input provider_worker off/on, default off');
+    assert(/calibration_action:[\s\S]*?options: \['none', 'policy', 'authorize', 'report'\][\s\S]*?default: 'none'/.test(stagingText), 'input calibration_action');
+    assert(/CAL_WORKER: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.provider_worker == 'on' && 'on' \|\| 'off' \}\}/.test(step), 'push → off');
+    assert(/CAL_ACTION: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.calibration_action \|\| 'none' \}\}/.test(step), 'push → none');
+    assert(step.includes('case "$CAL_COURSE" in "") ;; *[!0-9]*)'), 'curso validado numérico en el runner');
+    const script = remoteScriptOf(step);
+    assert(!/inputs\./.test(script), 'ningún input interpolado dentro del script remoto');
+    for (const a of ['policy', 'authorize "${_CAL_COURSE}"', 'report "${_CAL_COURSE}"']) {
+      assert(script.includes(`node scripts/staging-v21-calibration.js ${a}`), `acción ${a}`);
+    }
+    assert(script.indexOf('━━━ [6b1]') > 0 && script.indexOf('━━━ [6b1]') < script.indexOf('━━━ [6b2]'), 'la acción corre antes del preflight');
+    const C = require(path.resolve('scripts/staging-v21-calibration.js'));
+    const pol = { limits: { maxCostPerRun: '10', maxCostPerCourse: '15', monthlyCapStaging: '50' }, on_exceed: 'ADMIN_APPROVAL', require_human_approval_for_real_spend: true };
+    assert(C.policyMatches(pol), 'política aprobada reconocida');
+    assert(C.policyMatches({ ...pol, limits: { maxCostPerRun: 10, maxCostPerCourse: '15.00', monthlyCapStaging: '50' } }), 'numérico equivalente');
+    assert(!C.policyMatches({ ...pol, on_exceed: 'BLOCK' }) && !C.policyMatches({ ...pol, limits: { ...pol.limits, maxCostPerRun: '11' } }) && !C.policyMatches(null), 'otra política ≠ aprobada');
+    assert(!C.policyMatches({ ...pol, limits: { ...pol.limits, maxCostPerProvider: { gamma: '1' } } }), 'claves extra ≠ aprobada');
+    const course = { title: '[CALIBRATION V2.1] Provider Cost Verification' };
+    const est = { totals: { expected: '2.32', max: '5.41' } };
+    const base = { course, estimate: est, existingApprovals: 0, monthSpent: '0', policy: pol };
+    assert(C.decideAuthorization(base).ok, 'caso aprobado');
+    for (const [label, over, re] of [
+      ['curso ajeno', { course: { title: 'Curso real' } }, /no es de calibración/],
+      ['sin curso', { course: undefined }, /no existe/],
+      ['segunda aprobación', { existingApprovals: 1 }, /solo se autoriza UNA/],
+      ['sin estimado', { estimate: null }, /no hay un estimado/],
+      ['max > 8', { estimate: { totals: { expected: '5', max: '8.01' } } }, /supera la aprobación/],
+      ['tope mensual', { monthSpent: '42.5' }, /tope mensual/],
+      ['política distinta', { policy: { ...pol, on_exceed: 'BLOCK' } }, /política global vigente no es la aprobada/],
+    ]) {
+      const d = C.decideAuthorization({ ...base, ...over });
+      assert(!d.ok && re.test(d.reason), `${label}: ${JSON.stringify(d)}`);
+    }
+    assert(C.decideAuthorization({ ...base, monthSpent: '42' }).ok, '42 + 8 = 50 cabe justo');
+    eq(C.APPROVED.calibrationAuthorization, '8', 'aprobación de 8 USD');
+    const g = spawnSync(process.execPath, [path.resolve('scripts/staging-v21-calibration.js'), 'policy'], { env: { PATH: process.env.PATH, MIGRATION_ENV: 'staging', DB_HOST: 'db.hriwbakbuypaiovvvkqh.supabase.co', DB_USER: 'x' }, cwd: os.tmpdir(), encoding: 'utf8' });
+    eq(g.status, 1, 'guard de producción');
+    const n = spawnSync(process.execPath, [path.resolve('scripts/staging-v21-calibration.js'), 'policy'], { env: { PATH: process.env.PATH, DB_HOST: 'db.abc.supabase.co' }, cwd: os.tmpdir(), encoding: 'utf8' });
+    eq(n.status, 1, 'sin MIGRATION_ENV=staging no corre');
+    const bad = spawnSync(process.execPath, [path.resolve('scripts/staging-v21-calibration.js'), 'authorize', '1;drop'], { env: { PATH: process.env.PATH, MIGRATION_ENV: 'staging', DB_HOST: 'db.abc.supabase.co' }, cwd: os.tmpdir(), encoding: 'utf8' });
+    assert(bad.status === 1 && /courseId inválido/.test(bad.stderr), 'courseId validado en el script');
   });
 
   await check('preflight-v21-providers: READY / MISSING_CONFIG por proveedor sobre el .env de staging, sin imprimir valores; guard de producción', () => {
