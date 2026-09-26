@@ -15,6 +15,8 @@ import { packageReuseHash, resolveDynamicMoodleVersion, sortedArtifactIds } from
 import { reportVideoDeliveryConfigAtStartup } from '../modules/dynamic-generation/dynamic-video-delivery';
 import { buildDynamicMbz, DYNAMIC_MBZ_BUILDER_VERSION } from '../package/dynamic-mbz-builder';
 import type { DynamicPackageContents, PackagingPlan, ResolvedArtifact } from '../modules/dynamic-packaging/packaging-types';
+import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
+import { WorkerLedger, recordPackageBuild } from './finops-worker-hooks';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fase 5B.1 — B3: dynamic-package-worker. Reclama production_jobs con
@@ -95,6 +97,13 @@ export interface DynamicPackageWorkerDeps {
   workerId: string;
   leaseSeconds: number;
   heartbeatMs: number;
+  /**
+   * V2.1 RF-b: ledger de costos — un evento ZERO_BY_DESIGN por build
+   * (idempotente por el id del job de paquete). El bootstrap SIEMPRE lo
+   * cablea; opcional solo para harnesses previos. Un fallo del ledger se
+   * loguea como error y nunca rompe el empaquetado.
+   */
+  finops?: WorkerLedger | null;
 }
 
 export interface PackageJobRow {
@@ -361,6 +370,15 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
     });
     if (leaseLost) return;
 
+    // V2.1 RF-b: packaging = costo directo 0 (ZERO_BY_DESIGN), atribuido al run.
+    if (deps.finops) {
+      try {
+        await recordPackageBuild(deps.finops, { ownerId: job.owner_id, packageJobId: job.id, runId: runId ?? null });
+      } catch (err) {
+        logger.error(`finops: no se pudo registrar el build del paquete ${job.id} en el ledger — ${errMessage(err)}`);
+      }
+    }
+
     const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
       artifactId: artifact.id,
       sourceArtifactIds: ids,
@@ -551,6 +569,7 @@ async function bootstrap() {
     workerId: process.env.DYNAMIC_PACKAGE_WORKER_ID || `dynamic-package-worker-${process.pid}`,
     leaseSeconds: readPositiveInt('DYNAMIC_PACKAGE_WORKER_LEASE_SECONDS', 600),
     heartbeatMs: readPositiveInt('DYNAMIC_PACKAGE_WORKER_HEARTBEAT_MS', 30000),
+    finops: app.get(FinopsLedgerService),
   };
   const pollMs = readPositiveInt('DYNAMIC_PACKAGE_WORKER_POLL_MS', 5000);
 

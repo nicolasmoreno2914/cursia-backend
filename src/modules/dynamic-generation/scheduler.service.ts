@@ -27,6 +27,7 @@ import { canonicalContextHash, sortKeysDeep } from './run-hash';
 import {
   ACTIVE_RUN_WORKER_STATUSES,
   applyItemFailure,
+  blockDependents,
   isActiveRun,
   isCancelledLike,
   markRunRunning,
@@ -652,6 +653,35 @@ export class SchedulerService {
       if (!t) throw new GuardRejection('not_running');
       await recomputeRunStatus(qr, job.id);
     });
+  }
+
+  /**
+   * V2.1 RF-b — runtime guard de presupuesto: un item `running` cuyo envío
+   * pagado superaría el presupuesto autorizado del run pasa a `blocked` con
+   * error `budget_exceeded: …` (visible, sin gasto: se llama ANTES del envío).
+   * Sus dependientes transitivos también quedan `blocked`. Se reanuda con
+   * retryItem tras ampliar la autorización (POST /finops/courses/:id/authorizations).
+   */
+  async blockItemForBudget(itemRunId: string, executorId: string, detail: string, ownerId?: string): Promise<boolean> {
+    executorId = this.checkExecutorId(executorId);
+    const raw = String(detail ?? '').trim();
+    const msg = (raw.startsWith('budget_exceeded') ? raw : `budget_exceeded: ${raw || 'presupuesto agotado'}`).slice(0, MAX_ERROR_LENGTH);
+    const res = await this.guardedItemOp(itemRunId, executorId, ownerId, 'update', async (qr, job, item) => {
+      const rows = returningRows(
+        await qr.query(
+          `update public.generation_item_runs
+              set status = 'blocked', error = $2, worker_id = null, lease_until = null, next_retry_at = null,
+                  finished_at = null, updated_at = now()
+            where id = $1 and status = 'running'
+            returning id`,
+          [item.id, msg],
+        ),
+      );
+      if (rows.length !== 1) throw new GuardRejection('not_running');
+      await blockDependents(qr, job.id, item.item_key);
+      await recomputeRunStatus(qr, job.id);
+    });
+    return res.ok;
   }
 
   async recordItemExternal(

@@ -7,6 +7,7 @@ import {
   NotFoundException,
   NotImplementedException,
   Optional,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import type { QueryRunner } from 'typeorm';
@@ -40,6 +41,23 @@ import { computePlanFromDb, executeApplyWrites, planApplyWrites } from '../inval
 import { requiredArtifactTypes } from '../dynamic-packaging/artifact-resolver';
 import { INVALIDATION_V3_NOT_IMPLEMENTED, assertInvalidationRulesSupported } from '../invalidation/plan';
 import { latestGenerationPredicate } from './item-generations';
+import { FinopsBudgetService, StartBudgetEvaluation } from '../finops/finops-budget.service';
+import {
+  BUDGET_APPROVAL_REQUIRED,
+  BUDGET_BLOCKED,
+  BUDGET_EXCEEDED,
+  FINOPS_UNAVAILABLE,
+  RunManifestItem,
+  estimateItemsForRun,
+  estimateSummary,
+  paidProviderOfItemType,
+  paidRealProviders,
+} from '../finops/run-budget';
+import { incrementalCostForPlan } from '../finops/incremental';
+import { FinopsError } from '../finops/errors';
+import { addDec, normalizeDecimal } from '../finops/decimal';
+import { runtimeGuard } from '../finops/budget';
+import type { EstimateResult, MinExpMax } from '../finops/estimator';
 import {
   ACTIVE_RUN_WORKER_STATUSES,
   isActiveRun,
@@ -214,6 +232,11 @@ function isAmbiguousYoutubeUpload(row: { error?: string | null; output_summary?:
   );
 }
 
+/** V2.1 RF-b: item bloqueado por el runtime guard de presupuesto (reanudable con retry). */
+function isBudgetBlocked(row: { status?: string | null; error?: string | null }): boolean {
+  return row.status === 'blocked' && String(row.error ?? '').startsWith(BUDGET_EXCEEDED);
+}
+
 export interface StartRunResult {
   created: boolean;
   reopened: boolean;
@@ -287,6 +310,33 @@ export interface RegenerateDryRunResult {
   affected: RegenerationAffectedItem[];
   /** Trabas que la llamada real respondería con 403/409 (vacío = se puede confirmar). */
   blockers: Array<{ code: string; message: string }>;
+  /**
+   * V2.1 RF-b: costo incremental (min/esperado/max) y evitado por item afectado
+   * (incrementalCostForPlan: evitado = costo real histórico primero, HD-V21-18).
+   * null si el servicio de FinOps no está disponible (harness).
+   */
+  cost: RegenerationCostPreview | null;
+}
+
+/** V2.1 RF-b: vista de costo de una regeneración (dryRun). */
+export interface RegenerationCostPreview {
+  currency: string;
+  incrementalCost: MinExpMax;
+  avoided: string;
+  byItem: Array<{
+    itemKey: string;
+    action: RegenerationAffectedItem['action'];
+    incrementalCost: MinExpMax;
+    avoided: string;
+    avoidedBasis: 'historical_actual' | 'current_estimate' | null;
+  }>;
+}
+
+/** V2.1 RF-b: señal interna del camino fromRun (plan calculado DENTRO de la tx): hace falta aprobación. */
+class BudgetGateRejection extends Error {
+  constructor(public readonly evaluation: StartBudgetEvaluation, public readonly code: string, public readonly planSha: string | null) {
+    super(code);
+  }
 }
 
 interface RegenerationBlocker {
@@ -362,6 +412,12 @@ export class RunsService {
      * CERRADO con 409 `youtube_preflight_failed:preflight_unavailable`.
      */
     @Optional() private readonly youtubePreflight?: DynamicYoutubePreflightService,
+    /**
+     * V2.1 RF-b: estimado + gates de presupuesto. @Optional por los harnesses
+     * previos: sin él, todo camino con un proveedor pagado REAL falla CERRADO
+     * (503 finops_unavailable); los runs mock/LLM siguen sin estimado.
+     */
+    @Optional() private readonly finopsBudget?: FinopsBudgetService,
   ) {
     // M6 (review-it2): NO se valida DYNAMIC_VIDEO_DELIVERY acá. RunsService
     // vive en AppModule, que arranca la API y todos los workers legacy — un
@@ -558,6 +614,14 @@ export class RunsService {
         if (gate.ok === false) throw new ConflictException({ message: gate.message, code: gate.code });
         if (gate.requiresYoutubePreflight && !youtubePreflightPassed) throw new NeedsYoutubePreflight(gate);
 
+        // V2.1 RF-b: estimado del plan (REUSE = 0 incremental) + gate de presupuesto.
+        const planActions: Record<string, string> = {};
+        for (const a of plan.actions) if (a.inTargetManifest) planActions[a.itemKey] = a.action;
+        const budget = await this.finopsEvaluate({
+          courseId, ownerId, manifestId: manifestB.id, items: manifestB.manifest.items, videoMode, actions: planActions,
+          runner: qr, planSha: plan.planSha256,
+        });
+
         const invalidation = { fromRunId: rowA.id, planSha256: plan.planSha256, totals: plan.totals, plan };
         const inputPayload = {
           manifestId: manifestB.id,
@@ -600,11 +664,15 @@ export class RunsService {
             `Manifest #${manifestB.id}: se sembraron ${seeded.size} items pero totals.totalJobs = ${manifestB.totals.totalJobs}`,
           );
         }
+        await this.finopsBindRun(qr, budget, { runId: job.id, courseId, ownerId, manifestId: manifestB.id, planSha: plan.planSha256 });
         // Todo reutilizado (p.ej. reorder puro) → el run nace completed.
         await recomputeRunStatus(qr, job.id);
         return { kind: 'created' as const, jobId: job.id as string };
       });
     } catch (err) {
+      if (err instanceof BudgetGateRejection) {
+        throw await this.budgetRejection(err.evaluation, err.code, { courseId, ownerId, manifestId: manifestB.id, planSha: err.planSha });
+      }
       if (!(err instanceof NeedsYoutubePreflight) || youtubePreflightPassed) throw err;
       await this.enforceVideoGate(ownerId, err.gate); // 409 si no pasa
       return this.startRunFromPrevious(courseId, ownerId, blueprintNumber, manifestB, fromRunId, true);
@@ -612,6 +680,7 @@ export class RunsService {
 
     const job = await this.loadJobById(outcome.jobId);
     const inv = job.output_summary?.invalidation;
+    if (outcome.kind === 'created' && inv?.plan) await this.finopsRecordAvoidance(job, manifestB, inv.plan);
     return {
       created: outcome.kind === 'created',
       reopened: false,
@@ -702,11 +771,16 @@ export class RunsService {
     );
     const frontendCourseId: string | null = course?.frontend_course_id ?? null;
 
+    // V2.1 RF-b: estimado + gate de presupuesto ANTES de escribir el run.
+    const budget = await this.finopsStartGate({ courseId, ownerId, manifestId: manifest.id, items: manifest.manifest.items, videoMode });
+
     let jobId: string;
     try {
-      jobId = await this.tx((qr) =>
-        this.insertRun(qr, manifest, ownerId, courseId, frontendCourseId, blueprintNumber, context, contextHash, videoMode, frozenDelivery),
-      );
+      jobId = await this.tx(async (qr) => {
+        const id = await this.insertRun(qr, manifest, ownerId, courseId, frontendCourseId, blueprintNumber, context, contextHash, videoMode, frozenDelivery);
+        await this.finopsBindRun(qr, budget, { runId: id, courseId, ownerId, manifestId: manifest.id });
+        return id;
+      });
     } catch (err) {
       if (isActiveRunConflict(err)) {
         // Carrera: otro POST creó el run activo primero (y ya commiteó — el
@@ -985,7 +1059,7 @@ export class RunsService {
       );
     const preTarget = preRows.find((i) => i.item_key === itemKey);
     let uploadPhaseRetry = false;
-    if (preTarget && preTarget.status === 'failed') {
+    if (preTarget && (preTarget.status === 'failed' || isBudgetBlocked(preTarget))) {
       if (preTarget.type === 'video' && frozenDelivery === 'youtube' && !resubmitVideo) {
         if (isAmbiguousYoutubeUpload(preTarget)) {
           const message =
@@ -1048,9 +1122,11 @@ export class RunsService {
       if (!target) {
         throw new NotFoundException(`El item "${itemKey}" no existe en la ejecución ${job.id}`);
       }
-      if (target.status !== 'failed') {
+      // V2.1 RF-b: un item `blocked` por presupuesto (budget_exceeded) se reanuda
+      // igual que un failed, tras ampliar la autorización del run.
+      if (target.status !== 'failed' && !isBudgetBlocked(target)) {
         throw new ConflictException(
-          `Solo se puede reintentar un item en estado "failed"; "${itemKey}" está en "${target.status}"`,
+          `Solo se puede reintentar un item en estado "failed" (o "blocked" por ${BUDGET_EXCEEDED}); "${itemKey}" está en "${target.status}"`,
         );
       }
 
@@ -1129,6 +1205,7 @@ export class RunsService {
                   finished_at = null,
                   updated_at = now()
             where id = $1 and status = 'failed'
+               or (id = $1 and status = 'blocked' and error like '${BUDGET_EXCEEDED}%')
             returning id`,
           [target.id],
         ),
@@ -1445,6 +1522,9 @@ export class RunsService {
         currentGeneration: plan.currentGeneration,
         affected: plan.affected,
         blockers,
+        cost: await this.regenerationCostPreview(manifest, plan.affected, videoMode).catch((err) => {
+          throw this.finopsUnavailable(err);
+        }),
       };
     }
 
@@ -1466,6 +1546,9 @@ export class RunsService {
     if (isCancelledLike(job)) {
       throw new ConflictException(`La ejecución ${job.id} está cancelada; no se pueden regenerar items`);
     }
+    // V2.1 RF-b: estimado de la regeneración + gate de presupuesto (reemplaza el
+    // binario confirmPaid por un monto cuando hay un proveedor pagado real).
+    await this.finopsRegenerationGate(courseId, ownerId, manifest, job, mItem, itemKey, videoMode);
 
     const outcome = await this.tx(async (qr) => {
       await this.lockCourseRuns(qr, courseId);
@@ -1794,6 +1877,270 @@ export class RunsService {
       }
     }
     return { kind: 'created', itemRunId: primary.id, previousItemRunId: latest.id, previousGeneration: Number(latest.generation), affected };
+  }
+
+  // ── V2.1 RF-b: estimado + gates de presupuesto (audit §W.6/§W.7) ─────────
+
+  /**
+   * Estimado del run desde el Manifest (v1/v2/v3) + decisión de presupuesto.
+   * - AUTO_WITHIN_POLICY → sigue (se vincula una autorización AUTO al crear el run).
+   * - ADMIN_APPROVAL → exige una aprobación ADMIN_APPROVED de este curso para un
+   *   estimado del MISMO Manifest, sin consumir y que cubra el esperado.
+   * - BLOCK (política con on_exceed=BLOCK) → sin salida por aprobación.
+   * Rechazo → BudgetGateRejection (el caller guarda el estimado FUERA de su tx y
+   * responde 409 con el estimateId para que un admin lo autorice).
+   */
+  private async finopsEvaluate(a: {
+    courseId: number;
+    ownerId: string;
+    manifestId: number;
+    items: readonly RunManifestItem[];
+    videoMode: RunVideoMode;
+    actions?: Record<string, string> | null;
+    runner?: { query: (sql: string, params?: any[]) => Promise<any> };
+    planSha?: string | null;
+  }): Promise<{ evaluation: StartBudgetEvaluation; approval: any | null } | null> {
+    const mode = a.videoMode === 'real' ? 'real' : 'mock';
+    if (!this.finopsBudget) {
+      const paid = paidRealProviders(estimateItemsForRun(a.items, mode, a.actions ?? null), mode);
+      if (paid.length > 0) {
+        throw new ServiceUnavailableException({
+          code: FINOPS_UNAVAILABLE,
+          message: `${FINOPS_UNAVAILABLE}: no se puede evaluar el presupuesto de un run con proveedores pagados reales (${paid.join(', ')}); no se creó nada.`,
+        });
+      }
+      return null;
+    }
+    let evaluation: StartBudgetEvaluation;
+    try {
+      evaluation = await this.finopsBudget.evaluateStart({
+        courseId: a.courseId, ownerId: a.ownerId, mode, items: a.items, actions: a.actions ?? null,
+      });
+    } catch (err) {
+      // Fail loud y cerrado: sin estimado no se crea ningún run (p.ej. precio
+      // faltante en pricing_catalog o migración FinOps sin aplicar → 503 claro).
+      throw this.finopsUnavailable(err);
+    }
+    if (evaluation.decision === 'BLOCK') throw new BudgetGateRejection(evaluation, BUDGET_BLOCKED, a.planSha ?? null);
+    if (evaluation.decision === 'ADMIN_APPROVAL') {
+      const approval = await this.finopsBudget.findUnconsumedApproval(a.courseId, a.manifestId, evaluation.estimate.totals.expected, a.runner);
+      if (!approval) throw new BudgetGateRejection(evaluation, BUDGET_APPROVAL_REQUIRED, a.planSha ?? null);
+      return { evaluation, approval };
+    }
+    return { evaluation, approval: null };
+  }
+
+  /** FinopsError / tabla FinOps ausente → 503 finops_unavailable; cualquier otro error se relanza. */
+  private finopsUnavailable(err: unknown): unknown {
+    if (err instanceof FinopsError || pgCode(err) === '42P01') {
+      const detail = err instanceof FinopsError ? `${err.code}: ${err.message}` : (err as Error).message;
+      return new ServiceUnavailableException({
+        code: FINOPS_UNAVAILABLE,
+        message: `${FINOPS_UNAVAILABLE}: no se pudo estimar el costo de la generación (${detail}); no se creó nada.`,
+      });
+    }
+    return err;
+  }
+
+  /** Camino de run nuevo (fuera de tx): evalúa y, si rechaza, guarda el estimado y responde 409. */
+  private async finopsStartGate(a: {
+    courseId: number;
+    ownerId: string;
+    manifestId: number;
+    items: readonly RunManifestItem[];
+    videoMode: RunVideoMode;
+  }): Promise<{ evaluation: StartBudgetEvaluation; approval: any | null } | null> {
+    try {
+      return await this.finopsEvaluate(a);
+    } catch (err) {
+      if (err instanceof BudgetGateRejection) {
+        throw await this.budgetRejection(err.evaluation, err.code, { courseId: a.courseId, ownerId: a.ownerId, manifestId: a.manifestId, planSha: null });
+      }
+      throw err;
+    }
+  }
+
+  /** Guarda el estimado rechazado (sin run) y arma el 409 con sus totales. */
+  private async budgetRejection(
+    evaluation: StartBudgetEvaluation,
+    code: string,
+    ctx: { courseId: number; ownerId: string; manifestId: number; planSha: string | null },
+  ): Promise<ConflictException> {
+    const est = await this.finopsBudget!.recordEstimate({
+      scope: 'run', ownerId: ctx.ownerId, courseId: ctx.courseId, manifestId: ctx.manifestId, runId: null,
+      invalidationPlanSha: ctx.planSha, estimate: evaluation.estimate,
+    });
+    return this.budgetConflict(code, est.id, evaluation.estimate, evaluation.reasons, evaluation.paidRealProviders);
+  }
+
+  private budgetConflict(code: string, estimateId: string, estimate: EstimateResult, reasons: string[], providers: string[]): ConflictException {
+    const totals = estimateSummary(estimate);
+    const human = code === BUDGET_BLOCKED
+      ? 'la política de presupuesto bloquea esta generación (supera el límite configurado); un administrador tiene que cambiar la política.'
+      : 'esta generación requiere la aprobación de un administrador antes de gastar en proveedores pagados.';
+    // El filtro global aplana el 409 a su mensaje: estimateId y totales viajan también en el texto.
+    const message =
+      `${code}: ${human} No se creó ni se envió nada. estimateId=${estimateId} ` +
+      `totalsJson=${JSON.stringify({ currency: totals.currency, min: totals.min, expected: totals.expected, max: totals.max })}`;
+    return new ConflictException({ message, code, estimateId, estimate: totals, reasons, paidRealProviders: providers });
+  }
+
+  /** Dentro de la tx que crea el run: estimado con run_id + autorización del run (consumiendo la aprobación). */
+  private async finopsBindRun(
+    qr: QueryRunner,
+    gate: { evaluation: StartBudgetEvaluation; approval: any | null } | null,
+    a: { runId: string; courseId: number; ownerId: string; manifestId: number; planSha?: string | null },
+  ): Promise<void> {
+    if (!gate || !this.finopsBudget) return;
+    if (gate.approval) {
+      const [used] = await qr.query(
+        `select id from public.cost_budget_authorizations where estimate_id = $1 and run_id is not null limit 1`,
+        [gate.approval.estimate_id],
+      );
+      if (used) {
+        throw new ConflictException({
+          message: `${BUDGET_APPROVAL_REQUIRED}: la aprobación ${gate.approval.id} ya se usó en otra ejecución; pedí una nueva. No se creó nada.`,
+          code: BUDGET_APPROVAL_REQUIRED,
+        });
+      }
+    }
+    await this.finopsBudget.bindRun(qr, {
+      runId: a.runId, courseId: a.courseId, ownerId: a.ownerId, manifestId: a.manifestId,
+      evaluation: gate.evaluation, approval: gate.approval, invalidationPlanSha: a.planSha ?? null,
+    });
+  }
+
+  /**
+   * Run B desde un plan (ya commiteado): una fila de cost_avoidance_events por
+   * REUSE/REVIEW/STALE_NO_AUTO (historical actual first, HD-V21-18). Contable:
+   * un fallo se loguea fuerte pero no deshace el run.
+   */
+  private async finopsRecordAvoidance(job: any, manifest: ManifestDto, plan: { actions: any[] }): Promise<void> {
+    if (!this.finopsBudget) return;
+    try {
+      const keep = plan.actions.filter((x) => x.inTargetManifest && ['REUSE', 'REVIEW', 'STALE_NO_AUTO'].includes(x.action));
+      if (keep.length === 0) return;
+      const mode = this.videoModeOf(job) === 'real' ? 'real' : 'mock';
+      const byKey = new Map(manifest.manifest.items.map((it) => [it.key, it]));
+      const items = keep.map((x) => byKey.get(x.itemKey)).filter(Boolean) as RunManifestItem[];
+      const est = await this.finopsBudget.estimate(estimateItemsForRun(items, mode, null));
+      const hist = await this.finopsBudget.historicalByItemRun(keep.map((x) => x.fromItemRunId).filter(Boolean));
+      const withBasis = keep.filter((x) => (x.fromItemRunId && (hist[x.fromItemRunId] || []).length > 0) || est.lines.some((l) => l.itemKey === x.itemKey));
+      const r = incrementalCostForPlan(withBasis.map((x) => ({ itemKey: x.itemKey, action: x.action, fromItemRunId: x.fromItemRunId })), est.lines, hist);
+      for (const act of r.actions) {
+        if (!act.basis) continue;
+        await this.finopsBudget.recordAvoidance({
+          runId: job.id, courseId: Number(job.course_id), manifestId: manifest.id, itemKey: act.itemKey,
+          action: act.action as 'REUSE' | 'REVIEW' | 'STALE_NO_AUTO', sourceItemRunId: act.sourceItemRunId, basis: act.basis,
+          avoidedAmount: act.avoided, sourceChargeEventIds: act.sourceChargeEventIds,
+        });
+      }
+    } catch (err) {
+      this.logger.error(`finops: no se pudo registrar el costo evitado del run ${job.id} — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** dryRun de regenerateItem: incremental (min/esperado/max) y evitado por item afectado. */
+  private async regenerationCostPreview(
+    manifest: ManifestDto,
+    affected: RegenerationAffectedItem[],
+    videoMode: RunVideoMode,
+  ): Promise<RegenerationCostPreview | null> {
+    if (!this.finopsBudget) return null;
+    const zero = normalizeDecimal(0);
+    const zeros: MinExpMax = { min: zero, expected: zero, max: zero };
+    const mode = videoMode === 'real' ? 'real' : 'mock';
+    const byKey = new Map(manifest.manifest.items.map((it) => [it.key, it]));
+    const planned = affected.filter((x) => x.action === 'REGENERATE' || x.action === 'STALE_NO_AUTO');
+    const actions: Record<string, string> = {};
+    for (const x of planned) actions[x.itemKey] = x.action;
+    const items = planned.map((x) => byKey.get(x.itemKey)).filter(Boolean) as RunManifestItem[];
+    const est = await this.finopsBudget.estimate(estimateItemsForRun(items, mode, actions));
+    const sourceIds = planned.filter((x) => x.action === 'STALE_NO_AUTO' && x.itemRunId).map((x) => x.itemRunId as string);
+    const hist = await this.finopsBudget.historicalByItemRun(sourceIds);
+    const computable = planned.filter(
+      (x) => est.lines.some((l) => l.itemKey === x.itemKey) || (x.itemRunId && (hist[x.itemRunId] || []).length > 0),
+    );
+    const r = incrementalCostForPlan(
+      computable.map((x) => ({ itemKey: x.itemKey, action: x.action, fromItemRunId: x.action === 'STALE_NO_AUTO' ? x.itemRunId : null })),
+      est.lines,
+      hist,
+    );
+    const byItemKey = new Map(r.actions.map((x) => [x.itemKey, x]));
+    return {
+      currency: est.currency,
+      incrementalCost: r.totals.incremental,
+      avoided: r.totals.avoided,
+      byItem: affected.map((x) => {
+        const c = byItemKey.get(x.itemKey);
+        return {
+          itemKey: x.itemKey,
+          action: x.action,
+          incrementalCost: c ? c.incremental : zeros,
+          avoided: c ? c.avoided : zero,
+          avoidedBasis: c ? c.basis : null,
+        };
+      }),
+    };
+  }
+
+  /**
+   * Regeneración real: guarda el estimado (scope regeneration, con run_id) y,
+   * si regenera con un proveedor pagado REAL, exige que el presupuesto
+   * autorizado del run cubra actual + incremental esperado; si no → 409
+   * budget_approval_required con el estimateId (un admin lo autoriza con el
+   * nuevo presupuesto TOTAL del run y se reintenta).
+   */
+  private async finopsRegenerationGate(
+    courseId: number,
+    ownerId: string,
+    manifest: ManifestDto,
+    job: any,
+    mItem: { key: string; type: string; moduleId?: string | null; chapterId?: string | null },
+    itemKey: string,
+    videoMode: RunVideoMode,
+  ): Promise<void> {
+    const plan = await this.planRegeneration(this.dataSource, false, {
+      courseId, ownerId, job, manifest, mItem, itemKey, videoMode, costKind: regenerationCostKind(mItem.type, videoMode),
+    });
+    // Idempotencia en vuelo o trabas: la tx responde lo de siempre, sin estimado nuevo.
+    if (plan.inFlight || plan.blockers.length > 0) return;
+    const mode = videoMode === 'real' ? 'real' : 'mock';
+    const regenerated = plan.affected.filter((x) => x.action === 'REGENERATE');
+    const paid = mode === 'real' ? [...new Set(regenerated.map((x) => paidProviderOfItemType(x.type)).filter(Boolean) as string[])].sort() : [];
+    if (!this.finopsBudget) {
+      if (paid.length > 0) {
+        throw new ServiceUnavailableException({
+          code: FINOPS_UNAVAILABLE,
+          message: `${FINOPS_UNAVAILABLE}: no se puede evaluar el presupuesto de una regeneración con proveedores pagados reales (${paid.join(', ')}).`,
+        });
+      }
+      return;
+    }
+    const byKey = new Map(manifest.manifest.items.map((it) => [it.key, it]));
+    const actions: Record<string, string> = {};
+    for (const x of regenerated) actions[x.itemKey] = 'REGENERATE';
+    const items = regenerated.map((x) => byKey.get(x.itemKey)).filter(Boolean) as RunManifestItem[];
+    let estimate: EstimateResult;
+    try {
+      estimate = await this.finopsBudget.estimate(estimateItemsForRun(items, mode, actions));
+    } catch (err) {
+      throw this.finopsUnavailable(err);
+    }
+    const est = await this.finopsBudget.recordEstimate({
+      scope: 'regeneration', ownerId, courseId, manifestId: manifest.id, runId: job.id, estimate,
+    });
+    if (paid.length === 0) return;
+    const [authorizedBudget, actualSoFar] = await Promise.all([
+      this.finopsBudget.runAuthorizedBudget(job.id),
+      this.finopsBudget.runActual(job.id),
+    ]);
+    const g = runtimeGuard({ authorizedBudget, actualSoFar, reservedInFlight: '0', next: estimate.totals.expected });
+    if (!g.allow) {
+      throw this.budgetConflict(BUDGET_APPROVAL_REQUIRED, est.id, estimate, [
+        `${g.reason}(committed=${g.committed},authorized=${authorizedBudget ?? 'none'},actual=${addDec(actualSoFar, 0)})`,
+      ], paid);
+    }
   }
 
   // ── DN-1: gate de entrega de video ──────────────────────────────────────

@@ -51,6 +51,11 @@ const WORKERS = [
     script: 'dynamic-package-worker.js', npm: 'start:dynamic-package-worker', pm2: 'cursia-dynamic-package-worker',
     claim: (q) => /for update of j skip locked/i.test(q),
   },
+  // V2.1 RF-b: worker de proveedores v3 (presentation / audio_*), mismo claim global del scheduler.
+  {
+    script: 'dynamic-provider-worker.js', npm: 'start:dynamic-provider-worker', pm2: 'cursia-dynamic-provider-worker',
+    claim: (q) => /from public\.generation_item_runs g/.test(q) && /pj\.execution_mode = 'dynamic_generation'/.test(q),
+  },
 ];
 const PROD_ADDED_LINES = WORKERS.map((w) => `               ensure_pm2_process ${w.pm2} ${w.npm}`);
 const OWNER = 'aa2fa9a1-afb1-4b01-8646-94a0cb272b57';
@@ -363,19 +368,19 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
   const prodText = readWf(PROD_WF);
   const stagingText = readWf(STAGING_WF);
 
-  await check('(a) deploy.yml: arranca/recarga cursia-dynamic-item-worker y cursia-dynamic-package-worker con PM2 en el step de los workers', () => {
+  await check('(a) deploy.yml: arranca/recarga cursia-dynamic-{item,package,provider}-worker con PM2 en el step de los workers', () => {
     const step = pm2StepOf(prodText, 'deploy.yml');
     const script = assertWorkersInStep(step, '', 'deploy.yml');
     bashSyntaxOk(script, 'deploy.yml (script remoto)');
   });
 
-  await check('(a) deploy-staging.yml: arranca/recarga ambos workers -staging con PM2 en el step de los workers', () => {
+  await check('(a) deploy-staging.yml: arranca/recarga los 3 workers dinámicos -staging con PM2 en el step de los workers', () => {
     const step = pm2StepOf(stagingText, 'deploy-staging.yml');
     const script = assertWorkersInStep(step, '-staging', 'deploy-staging.yml');
     bashSyntaxOk(script, 'deploy-staging.yml (script remoto)');
   });
 
-  await check('(a) deploy.yml = base (origin/main) + EXACTAMENTE las 2 líneas de los workers dinámicos (ningún otro step cambió)', () => {
+  await check(`(a) deploy.yml = base (origin/main) + EXACTAMENTE las ${PROD_ADDED_LINES.length} líneas de los workers dinámicos (ningún otro step cambió)`, () => {
     const { ref, text: base } = baseDeployYml();
     const cur = prodText.split('\n');
     // M6 (integral-review): el único otro cambio permitido es quitar IPs de los
@@ -386,14 +391,18 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       eq(cur.join('\n') === baseLines.join('\n'), true, `deploy.yml difiere de ${ref} (que ya incluye los workers)`);
       return;
     }
+    // V2.1 RF-b: la base puede traer ya un subconjunto de los workers (p.ej. item +
+    // package tras su merge): se quitan de la base y se re-insertan TODOS, en
+    // orden, justo después del full-worker.
     const anchor = '               ensure_pm2_process cursia-full-worker start:full-worker';
-    const idx = baseLines.indexOf(anchor);
+    const baseRest = baseLines.filter((l) => !PROD_ADDED_LINES.includes(l));
+    const idx = baseRest.indexOf(anchor);
     assert(idx >= 0, `${ref}: no se encontró la línea del full-worker (ancla)`);
-    const expected = [...baseLines.slice(0, idx + 1), ...PROD_ADDED_LINES, ...baseLines.slice(idx + 1)];
+    const expected = [...baseRest.slice(0, idx + 1), ...PROD_ADDED_LINES, ...baseRest.slice(idx + 1)];
     if (cur.join('\n') !== expected.join('\n')) {
       const diffAt = cur.findIndex((l, i) => l !== expected[i]);
       throw new Error(
-        `deploy.yml no es ${ref} + las 2 líneas esperadas (primera diferencia en la línea ${diffAt + 1}: ` +
+        `deploy.yml no es ${ref} + las ${PROD_ADDED_LINES.length} líneas esperadas (primera diferencia en la línea ${diffAt + 1}: ` +
           `got ${JSON.stringify(cur[diffAt])}, want ${JSON.stringify(expected[diffAt])})`,
       );
     }

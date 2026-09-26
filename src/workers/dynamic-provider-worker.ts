@@ -8,6 +8,9 @@ import { MissingSchemaBackoff, holdIdleIfDynamicDisabled } from './dynamic-worke
 import { ClaimedItem, DEFAULT_LEASE_SECONDS, SchedulerService } from '../modules/dynamic-generation/scheduler.service';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import type { ManifestItemType } from '../modules/generation-manifests/generation-manifest-builder';
+import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
+import { FinopsBudgetService } from '../modules/finops/finops-budget.service';
+import { WorkerBudget, WorkerLedger, budgetExceededMessage, recordProviderMock } from './finops-worker-hooks';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cursia V2.1 — R4: worker de items de PROVEEDOR de rulesVersion 3 que no son
@@ -112,12 +115,16 @@ export function mockProviderOutput(item: Pick<ClaimedItem, 'type' | 'itemKey' | 
 }
 
 export interface ProviderWorkerDeps {
-  scheduler: Pick<SchedulerService, 'claimNextItem' | 'completeItem' | 'failItem'>;
+  scheduler: Pick<SchedulerService, 'claimNextItem' | 'completeItem' | 'failItem'> & Partial<Pick<SchedulerService, 'blockItemForBudget'>>;
   dataSource: Pick<DataSource, 'query'>;
   artifacts: Pick<ArtifactsService, 'uploadJsonArtifact'>;
   logger: Pick<Logger, 'log' | 'warn' | 'error'>;
   executorId: string;
   leaseSeconds: number;
+  /** V2.1 RF-b: ledger (mock → evento MOCK a 0). El bootstrap SIEMPRE lo cablea. */
+  finops?: WorkerLedger | null;
+  /** V2.1 RF-b: runtime guard ANTES de donde iría la llamada real. El bootstrap SIEMPRE lo cablea. */
+  budget?: WorkerBudget | null;
 }
 
 async function loadRunHead(dataSource: Pick<DataSource, 'query'>, runId: string): Promise<{ ownerId: string; mode: ProviderMode }> {
@@ -138,6 +145,17 @@ export async function processProviderItem(deps: ProviderWorkerDeps, item: Claime
   }
   const head = await loadRunHead(deps.dataSource, item.runId);
   if (head.mode === 'real') {
+    // V2.1 RF-b: runtime guard de presupuesto ANTES de la llamada pagada (que
+    // R9/R10 cablean acá). Excedido → item `blocked` budget_exceeded, sin gasto.
+    if (deps.budget) {
+      const g = await deps.budget.guardPaidSubmission({ runId: item.runId, itemRunId: item.itemRunId, itemType: item.type });
+      if (!g.allow) {
+        if (!deps.scheduler.blockItemForBudget) throw new Error('dynamic-provider-worker: scheduler sin blockItemForBudget');
+        deps.logger.warn(`Item ${item.itemKey}: presupuesto excedido (${g.reason}) — no se llama al proveedor`);
+        await deps.scheduler.blockItemForBudget(item.itemRunId, deps.executorId, budgetExceededMessage(g));
+        return;
+      }
+    }
     const err = new ProviderNotWiredError(item.type, item.itemKey);
     await deps.scheduler.failItem(item.itemRunId, deps.executorId, err.message, false);
     throw err;
@@ -159,6 +177,15 @@ export async function processProviderItem(deps: ProviderWorkerDeps, item: Claime
     metadata: { manifestId: item.manifestId, itemKey: item.itemKey, chapterId: item.chapterId, fixture: true },
     upsert: false,
   });
+  // V2.1 RF-b: evento MOCK (monto 0), idempotente por el id de la fixture.
+  if (deps.finops) {
+    const externalId = String((out.payload as any).gammaId ?? (out.payload as any).audioId);
+    try {
+      await recordProviderMock(deps.finops, { ownerId: head.ownerId, itemRunId: item.itemRunId, itemType: item.type, externalId });
+    } catch (err) {
+      deps.logger.error(`finops: no se pudo registrar el evento mock de ${item.itemKey} — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   const ok = await deps.scheduler.completeItem(item.itemRunId, deps.executorId, {
     artifactIds: [artifact.id],
     summary: out.summary,
@@ -191,8 +218,9 @@ function readPositiveInt(envKey: string, fallback: number): number {
 }
 
 /**
- * Proceso standalone (no cableado todavía en PM2/deploy: lo hace R9/R10 o el
- * E2E v3). Mismo gate que dynamic-item-worker (flag + esquema ausente).
+ * Proceso standalone. V2.1 RF-b: cableado en PM2 (deploy.yml /
+ * deploy-staging.yml, `start:dynamic-provider-worker`) igual que
+ * dynamic-item-worker. Mismo gate (flag + esquema ausente).
  */
 async function bootstrap() {
   const logger = new Logger('DynamicProviderWorker');
@@ -205,6 +233,8 @@ async function bootstrap() {
     logger,
     executorId: process.env.DYNAMIC_PROVIDER_WORKER_ID || `dynamic-provider-worker-${process.pid}`,
     leaseSeconds: readPositiveInt('DYNAMIC_PROVIDER_WORKER_LEASE_SECONDS', DEFAULT_LEASE_SECONDS),
+    finops: app.get(FinopsLedgerService),
+    budget: app.get(FinopsBudgetService),
   };
   const pollMs = readPositiveInt('DYNAMIC_PROVIDER_WORKER_POLL_MS', 5000);
   let shuttingDown = false;

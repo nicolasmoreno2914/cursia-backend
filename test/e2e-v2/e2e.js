@@ -431,7 +431,17 @@ async function packageRun(label, courseId, n, runId, fakes) {
       const estD = est.data && est.data.videoCount !== undefined ? est.data : est.data && est.data.data;
       ok(est.ok && estD && estD.videoCount === 6, 'estimate (wrapper real 24) → 6 videos', est);
       const t0 = Date.now();
-      const start = await f.backendDynStartRun(S.courseId, S.nA, { ...ctx, videoMode: 'real' });
+      let start = await f.backendDynStartRun(S.courseId, S.nA, { ...ctx, videoMode: 'real' });
+      // V2.1 RF-b (HD-V21-19): video real = proveedor pagado → el primer intento pide
+      // aprobación de admin (409 con el estimateId); se aprueba como lo haría
+      // POST /finops/courses/:id/authorizations (fila ADMIN_APPROVED) y se reintenta.
+      const startText = JSON.stringify(start);
+      ok(start.status === 409 && /budget_approval_required/.test(startText), 'run real sin aprobación → 409 budget_approval_required (RF-b)', start);
+      const estM = /estimateId=([0-9a-f-]{36})/.exec(startText);
+      ok(!!estM, '409 trae el estimateId', startText.slice(0, 400));
+      await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+               values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e: aprobación del run real')`, [S.courseId, estM && estM[1]]);
+      start = await f.backendDynStartRun(S.courseId, S.nA, { ...ctx, videoMode: 'real' });
       const sd = start.data && start.data.run ? start.data : start.data && start.data.data;
       ok(start.ok && sd && sd.created === true && sd.run.id, 'backendDynStartRun (wrapper real) → run A creado, videoMode real', start);
       S.runA = sd.run.id;

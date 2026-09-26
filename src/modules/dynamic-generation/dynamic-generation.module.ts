@@ -11,6 +11,7 @@ import { AdminModule } from '../../admin/admin.module';
 import { YoutubeModule } from '../../youtube/youtube.module';
 import { DynamicYoutubeController } from './dynamic-youtube.controller';
 import { DynamicYoutubePreflightService } from './dynamic-youtube';
+import { FinopsModule } from '../finops/finops.module';
 
 /**
  * Generación dinámica (Fase 5A): runs sobre un Generation Manifest. No
@@ -25,6 +26,7 @@ import { DynamicYoutubePreflightService } from './dynamic-youtube';
     AuthModule,                // expone SupabaseJwtGuard para el controlador
     AdminModule,               // expone CostRatesService (estimate de costo de video, R17)
     YoutubeModule,             // DN-1: YoutubeService/YoutubeTokenService (preflight, sin modificarlos)
+    FinopsModule,              // V2.1 RF-b: estimado + gates de presupuesto (FinopsBudgetService)
   ],
   controllers: [RunsController, ExecutorController, DynamicYoutubeController],
   providers: [RunsService, SchedulerService, DynamicYoutubePreflightService],

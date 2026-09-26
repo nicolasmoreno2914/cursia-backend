@@ -52,6 +52,19 @@ export interface RecordChargeInput {
   costSource?: LedgerCostSource | null;
   /** Obligatorio si costSource='ACTUAL_PROVIDER'. */
   actualAmount?: DecimalLike | null;
+  /**
+   * V2.1 RF-b: monto CALCULADO POR EL PROVEEDOR desde su propio uso (p.ej.
+   * Videogen `estimated_total_cost`, HD-V21-20). Solo con
+   * costSource='CALCULATED_FROM_USAGE' y solo desde workers server-side (el
+   * ingest HTTP nunca lo setea). Sin él, el monto sale de usage × pricing_catalog.
+   */
+  providerCalculatedAmount?: DecimalLike | null;
+  /**
+   * V2.1 RF-b: atribución a un RUN (no a un item) para cargos de workers sin
+   * item run (p.ej. package.build). Se verifica contra production_jobs (mismo
+   * owner); nunca viene del cliente.
+   */
+  attributionRunId?: string | null;
   currency?: string | null;
   measurementStatus?: 'final' | 'pending';
   outcome?: ChargeOutcome;
@@ -187,6 +200,46 @@ export class FinopsLedgerService {
     };
   }
 
+  /**
+   * V2.1 RF-b: atribución a nivel RUN (cargos de workers sin item run, p.ej.
+   * package.build). Deriva course_id de production_jobs y exige el mismo owner.
+   */
+  async resolveRunAttribution(runId: string, ownerIdFromAuth: string): Promise<Attribution> {
+    const base: Attribution = {
+      attributed: false,
+      rejectReason: null,
+      owner_id: ownerIdFromAuth,
+      course_id: null,
+      blueprint_id: null,
+      manifest_id: null,
+      run_id: null,
+      item_run_id: null,
+      item_key: null,
+      item_type: null,
+      item_generation: null,
+      scope: null,
+      module_id: null,
+      chapter_id: null,
+    };
+    if (typeof runId !== 'string' || !UUID_RE.test(runId)) return { ...base, rejectReason: 'invalid_run_id' };
+    const [r] = await this.dataSource.query(
+      `select id, owner_id, course_id, input_payload->>'manifestId' as manifest_id, blueprint_version_id
+         from public.production_jobs where id = $1`,
+      [runId],
+    );
+    if (!r) return { ...base, rejectReason: 'run_not_found' };
+    if (String(r.owner_id) !== ownerIdFromAuth) return { ...base, rejectReason: 'owner_mismatch' };
+    const manifestId = Number(r.manifest_id);
+    return {
+      ...base,
+      attributed: true,
+      course_id: r.course_id === null ? null : Number(r.course_id),
+      manifest_id: Number.isInteger(manifestId) ? manifestId : null,
+      run_id: r.id,
+      scope: 'run',
+    };
+  }
+
   // ─── cargos ────────────────────────────────────────────────────────────────
 
   async recordCharge(input: RecordChargeInput): Promise<RecordResult> {
@@ -224,12 +277,18 @@ export class FinopsLedgerService {
       throw new FinopsError('INVALID_INPUT', `costSource inválido en el ledger: ${String(costSource)} (ESTIMATED solo vive en cost_estimates)`);
     }
 
-    const attribution = await this.resolveAttribution(input.itemRunId ?? null, owner);
+    const attribution =
+      (input.itemRunId === null || input.itemRunId === undefined || input.itemRunId === '') && input.attributionRunId
+        ? await this.resolveRunAttribution(input.attributionRunId, owner)
+        : await this.resolveAttribution(input.itemRunId ?? null, owner);
 
     // Operación: derivada del item atribuido; si no hay atribución, `<base>.unattributed`.
     const family = familyOfProvider(input.provider);
     let operation: string;
-    if (attribution.attributed) {
+    if (attribution.attributed && !attribution.item_run_id) {
+      // RF-b: atribución de run (worker server-side) — la operación la declara el worker.
+      operation = input.operation || `${family}.unattributed`;
+    } else if (attribution.attributed) {
       operation = input.operation || operationForItem(attribution.item_type as string, input.provider) || `${family}.unattributed`;
     } else {
       operation = `${input.operation || family}.unattributed`;
@@ -239,8 +298,14 @@ export class FinopsLedgerService {
     let amount: string;
     let currency = (input.currency || 'USD').toUpperCase();
     let pricingSnapshot: PricingSnapshot | null = null;
-    if (costSource === 'ZERO_BY_DESIGN') {
+    if (costSource === 'ZERO_BY_DESIGN' || costSource === 'MOCK') {
+      // RF-b: MOCK nunca cuesta (audit §W.2: "Mock / fake → 0").
       amount = normalizeDecimal(0);
+    } else if (input.providerCalculatedAmount !== null && input.providerCalculatedAmount !== undefined) {
+      if (costSource !== 'CALCULATED_FROM_USAGE') {
+        throw new FinopsError('INVALID_INPUT', 'providerCalculatedAmount solo con costSource=CALCULATED_FROM_USAGE');
+      }
+      amount = normalizeDecimal(input.providerCalculatedAmount, 'providerCalculatedAmount');
     } else if (costSource === 'ACTUAL_PROVIDER') {
       if (input.actualAmount === null || input.actualAmount === undefined) {
         throw new FinopsError('INVALID_INPUT', 'ACTUAL_PROVIDER exige actualAmount');
@@ -270,10 +335,14 @@ export class FinopsLedgerService {
     delete metadata.attributionRejected;
     delete metadata.attributionRejectReason;
     delete metadata.requestedItemRunId;
+    delete metadata.amountBasis;
     if (!attribution.attributed && attribution.rejectReason) {
       metadata.attributionRejected = true;
       metadata.attributionRejectReason = attribution.rejectReason;
       metadata.requestedItemRunId = typeof input.itemRunId === 'string' ? input.itemRunId.slice(0, 64) : null;
+    }
+    if (costSource === 'CALCULATED_FROM_USAGE' && input.providerCalculatedAmount !== null && input.providerCalculatedAmount !== undefined) {
+      metadata.amountBasis = 'provider_calculated';
     }
 
     const billable = input.billingAccount === 'cursia' && costSource !== 'MOCK';
@@ -326,6 +395,8 @@ export class FinopsLedgerService {
     externalId: string;
     ownerIdFromAuth: string;
     itemRunId?: string | null;
+    /** RF-b: atribución a nivel run (package.build), verificada contra production_jobs. */
+    attributionRunId?: string | null;
     quotaUnits?: DecimalLike | null;
     mode?: ChargeMode;
     recordedBy: string;
@@ -337,6 +408,7 @@ export class FinopsLedgerService {
     const mode = input.mode ?? 'real';
     return this.recordCharge({
       itemRunId: input.itemRunId ?? null,
+      attributionRunId: input.attributionRunId ?? null,
       ownerIdFromAuth: input.ownerIdFromAuth,
       provider: isYoutube ? 'youtube' : 'cursia',
       service: isYoutube ? 'data_api_v3' : 'packaging',
@@ -450,10 +522,10 @@ export class FinopsLedgerService {
     invalidationPlanSha?: string | null;
     estimate: EstimateResult;
     createdBy?: string | null;
-  }): Promise<any> {
+  }, runner: { query: (sql: string, params?: any[]) => Promise<any> } = this.dataSource): Promise<any> {
     if (!input || !input.estimate) throw new FinopsError('INVALID_INPUT', 'createEstimate necesita estimate');
     const e = input.estimate;
-    const [row] = await this.dataSource.query(
+    const [row] = await runner.query(
       `insert into public.cost_estimates
          (scope, owner_id, course_id, manifest_id, run_id, invalidation_plan_sha, estimator_version,
           pricing_versions, usage_model_version, lines, totals, currency, created_by)
@@ -478,11 +550,11 @@ export class FinopsLedgerService {
     approvedBy?: string | null;
     reason?: string | null;
     currency?: string;
-  }): Promise<any> {
+  }, runner: { query: (sql: string, params?: any[]) => Promise<any> } = this.dataSource): Promise<any> {
     if (input.decision === 'ADMIN_APPROVED' && !input.approvedBy) {
       throw new FinopsError('INVALID_INPUT', 'ADMIN_APPROVED exige approvedBy');
     }
-    const [row] = await this.dataSource.query(
+    const [row] = await runner.query(
       `insert into public.cost_budget_authorizations
          (run_id, course_id, estimate_id, authorized_budget, currency, policy_id, decision, approved_by, reason)
        values ($1,$2,$3,$4,$5,$6,$7,$8,$9) returning *`,
