@@ -644,6 +644,22 @@ async function runWorkerProcess(script, env, { waitMs }) {
   ];
   const SENTINEL = 'PASO_EL_GATE';
 
+  // Aceptación rv3 (staging, Important): el frontend marcaba como "creado en esta sesión" un curso
+  // EXISTENTE devuelto por POST /courses/dynamic (idempotente) y le atribuía la paleta global.
+  // El endpoint informa `created` para que el cliente distinga.
+  await check('POST /courses/dynamic informa created:true solo al crear; un curso existente → created:false', () =>
+    withEnv({ ...ENV_CLEAN, [FLAG]: 'true' }, async () => {
+      const found = { id: 7, title: 'T', structureVersion: 'dynamic' };
+      const qb = (hit) => { const q = { where: () => q, andWhere: () => q, orderBy: () => q, getOne: async () => (hit ? found : null) }; return q; };
+      const repoHit = { createQueryBuilder: () => qb(true) };
+      const repoMiss = { createQueryBuilder: () => qb(false), create: (o) => ({ ...o }), save: async (o) => ({ ...o, id: 8 }) };
+      const ctrlOf = (repo) => new CoursesController(new CoursesService(repo, {}));
+      const user = { id: OWNER_A, email: 'x@example.com' };
+      const a = await ctrlOf(repoHit).createOrGetDynamic({ frontendCourseId: 'f', title: 'T' }, user);
+      const b = await ctrlOf(repoMiss).createOrGetDynamic({ frontendCourseId: 'f', title: 'T' }, user);
+      eq([a.id, a.created, b.id, b.created], [7, false, 8, true], 'created');
+    }));
+
   for (const m of allowMatrix) {
     await check(`G3 CoursesService.findOrCreateDynamic — ${m.label} → ${m.allowed ? 'permitido' : '403'}`, () =>
       withEnv({ ...ENV_CLEAN, ...m.env }, async () => {
