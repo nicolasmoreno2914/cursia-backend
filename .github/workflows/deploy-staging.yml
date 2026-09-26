@@ -294,6 +294,45 @@ jobs:
                  fi
                }
 
+               # V2.1 aceptación rv3 (autorizado por Nicolás, 2026-09-26): fija una
+               # clave NO secreta a un valor exacto (reemplaza la línea existente o la
+               # agrega). Imprime SOLO esa clave antes/después. Reescritura atómica
+               # con validación y .env.bak, igual que ensure_env_list_contains.
+               ensure_env_exact() {
+                 local key="$1"
+                 local value="$2"
+                 local count
+                 count=$(grep -c "^${key}=" .env || true)
+                 if [ "$count" -eq 0 ]; then
+                   printf "\n%s=%s\n" "$key" "$value" >> .env
+                   echo "+ ${key}: (ausente) → ${value}"
+                   return 0
+                 fi
+                 if [ "$count" -gt 1 ]; then
+                   echo "❌ ${key} aparece más de una vez en el .env de staging — no se toca (revisar a mano)"
+                   return 1
+                 fi
+                 local raw before tmp before_lines after_lines
+                 raw=$(grep "^${key}=" .env)
+                 before=$(_flags_strip_value "${raw#${key}=}")
+                 if [ "$before" = "$value" ]; then
+                   echo "✓ ${key}: ya vale ${value} — no se toca"
+                   return 0
+                 fi
+                 tmp=".env.flags.tmp.$$"
+                 awk -v old="$raw" -v new="${key}=${value}" "!d && \$0 == old { \$0 = new; d = 1 } { print }" .env > "$tmp"
+                 before_lines=$(awk "END{print NR}" .env)
+                 after_lines=$(awk "END{print NR}" "$tmp")
+                 if [ ! -s "$tmp" ] || [ "$before_lines" != "$after_lines" ] || [ "$(grep -c "^${key}=${value}\$" "$tmp")" != "1" ]; then
+                   echo "❌ ${key}: la reescritura del .env no validó — se aborta sin tocar .env"
+                   rm -f "$tmp"
+                   return 1
+                 fi
+                 cp .env .env.bak
+                 mv "$tmp" .env
+                 echo "+ ${key}: ${before} → ${value} (backup: .env.bak)"
+               }
+
                ensure_pm2_process() {
                  local name="$1"
                  local start_script="$2"
@@ -316,7 +355,11 @@ jobs:
                # solo si faltan). DYNAMIC_COHERENCE_LLM NO se agrega (queda OFF).
                ensure_env_list_contains DYNAMIC_V2_ALLOWED_OWNERS aa2fa9a1-afb1-4b01-8646-94a0cb272b57
                ensure_env_default_if_absent DYNAMIC_VIDEO_DELIVERY youtube
-               ensure_env_default_if_absent DYNAMIC_MANIFEST_RULES_VERSION 2
+               # Aceptación rv3 de V2.1 (autorizado por Nicolás, 2026-09-26): reglas v3 en
+               # staging. Revertir = cambiar este 3 por 2 (los runs existentes conservan
+               # su rulesVersion congelado). Los proveedores reales siguen apagados:
+               # DYNAMIC_PROVIDER_WORKER_ENABLED no se toca acá.
+               ensure_env_exact DYNAMIC_MANIFEST_RULES_VERSION 3
                if grep -q "^DYNAMIC_COHERENCE_LLM=" .env; then
                  echo "⚠️  DYNAMIC_COHERENCE_LLM está en el .env de staging — no se toca (la decisión de pre-aceptación es dejarlo OFF)"
                else
