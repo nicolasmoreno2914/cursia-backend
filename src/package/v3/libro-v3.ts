@@ -48,6 +48,24 @@ function paragraphs(text: string): string {
     .join('\n');
 }
 
+/**
+ * G6 M2: el Libro se sirve CRUDO en el origen de Moodle. `mdToHtmlBasic` (v1/v2,
+ * byte-idéntico, no se toca) no escapa `"` ni filtra el esquema de los links.
+ * Antes de convertir, cada link markdown se conserva solo si su URL es
+ * http(s)/mailto/#ancla sin comillas ni `<>`; si no, queda solo el texto.
+ */
+export function sanitizeMarkdownLinks(md: string): string {
+  const SAFE = /^(https?:\/\/|mailto:|#)[^"'<>\s`]*$/i;
+  let prev: string;
+  let cur = String(md ?? '');
+  // Repetir hasta un punto fijo: quitar un link inseguro no puede dejar otro armado.
+  do {
+    prev = cur;
+    cur = cur.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, text: string, url: string) => (SAFE.test(url) ? m : text));
+  } while (cur !== prev);
+  return cur;
+}
+
 function biblioItem(b: BibliographyEntry): string {
   return `<li>${esc(b.author)} (${b.year}). <em>${esc(b.title)}</em>. ${esc(b.publisher)}.</li>`;
 }
@@ -115,7 +133,7 @@ export function compileLibroHtmlV3(input: LibroV3Input): string {
       const chapters = m.chapters
         .map((c) => {
           const md = stripLeadingDuplicateTitle(c.md, c.title, c.number);
-          return `<section id="cap-${c.number}" class="cc-libro-chapter"><h2>Capítulo ${c.number} — ${esc(c.title)}</h2>\n${mdToHtmlBasic(md)}</section>`;
+          return `<section id="cap-${c.number}" class="cc-libro-chapter"><h2>Capítulo ${c.number} — ${esc(c.title)}</h2>\n${mdToHtmlBasic(sanitizeMarkdownLinks(md))}</section>`;
         })
         .join('\n');
       return `${preface}\n${chapters}`;

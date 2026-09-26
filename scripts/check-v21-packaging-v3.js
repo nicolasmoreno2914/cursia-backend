@@ -357,6 +357,29 @@ const MATRIX = [
       return { [`${a.dir}/module.xml`]: (x) => x.replace('<idnumber>cv3:shell:welcome</idnumber>', '<idnumber>cv3:shell:forum</idnumber>') };
     }],
   ];
+  // Fix round 1 (G6 M6/M8): códigos que antes no tenían una mutación que los hiciera fallar.
+  cases.push(
+    ['COURSE_GRADEPASS', () => ({ 'gradebook.xml': (x) => x.replace('<gradepass>70.00000</gradepass>', '<gradepass>65.00000</gradepass>') })],
+    ['TRANSITION_DISABLED_RESOURCE', () => {
+      const a = bacts.find((x) => x.idnumber === `cv3:ch:${noVideoCh.chapterId}:closing`);
+      return { [`${a.dir}/label.xml`]: (x) => {
+        const at = x.indexOf('cvc-transition');
+        const sp = x.indexOf('&lt;span class=&quot;nolink&quot;&gt;', at) + '&lt;span class=&quot;nolink&quot;&gt;'.length;
+        return x.slice(0, sp) + 'Ahora mira el video. ' + x.slice(sp);
+      } };
+    }],
+    ['STRUCTURE', () => {
+      const a = find(/^cv3:shell:competencies$/);
+      const forum = find(/^cv3:shell:forum$/);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace(/contextid="\d+"/, () => `contextid="${forumCtx}"`) };
+    }],
+    ['STRUCTURE', () => {
+      const a = find(/^cv3:exam:/);
+      return { [`${a.dir}/inforef.xml`]: (x) => x.replace(/(<grade_itemref>\s*<grade_item><id>)(\d+)/, (m, pre, id) => `${pre}${Number(id) + 999}`) };
+    }],
+  );
+  const forumAct = find(/^cv3:shell:forum$/);
+  const forumCtx = /contextid="(\d+)"/.exec(await bz.file(`${forumAct.dir}/forum.xml`).async('string'))[1];
   for (const [code, mk] of cases) {
     await check(`validador detecta ${code}`, async () => {
       const bad = await mutate(base.r.mbz, mk());
@@ -385,7 +408,129 @@ const MATRIX = [
     const v2 = await V.validateMbzV3(await z2.generateAsync({ type: 'nodebuffer' }), base.r.expectations);
     assert(v2.issues.some((i) => i.code === 'FILES_INTEGRITY'), 'blob alterado');
   });
+  // Reescribe un blob del paquete (re-hash + files.xml) para mutar archivos, no solo XML.
+  async function rewriteBlob(mbz, pickHash, fn) {
+    const z = await JSZip.loadAsync(mbz);
+    const fx0 = await z.file('files.xml').async('string');
+    const h = pickHash(fx0);
+    const p0 = `files/${h.slice(0, 2)}/${h}`;
+    const oldBuf = await z.file(p0).async('nodebuffer');
+    const nb = await fn(oldBuf);
+    const nh = crypto.createHash('sha1').update(nb).digest('hex');
+    z.remove(p0);
+    z.file(`files/${nh.slice(0, 2)}/${nh}`, nb);
+    const fx = fx0.split(h).join(nh).split(`<filesize>${oldBuf.length}</filesize>`).join(`<filesize>${nb.length}</filesize>`);
+    z.file('files.xml', fx);
+    return z.generateAsync({ type: 'nodebuffer' });
+  }
+  await check('validador detecta LIBRO (sin print CSS / sin </html>) y H5P_LIBRARIES por rol (G6 M7: actividad con otra librería, video que no es IV)', async () => {
+    const libroHash = (fx) => /<contenthash>(\w+)<\/contenthash>/.exec(fx.match(/<file id="\d+">[\s\S]*?<\/file>/g).find((b) => b.includes('<filename>libro_guia_completo.html</filename>')))[1];
+    for (const edit of [(t) => t.replace('@media print', '@media screen'), (t) => t.replace(/<\/html>\s*$/, '')]) {
+      const bad = await rewriteBlob(base.r.mbz, libroHash, async (b) => Buffer.from(edit(b.toString('utf8'))));
+      const v = await V.validateMbzV3(bad, base.r.expectations);
+      assert(v.issues.some((i) => i.code === 'LIBRO'), JSON.stringify(v.issues.slice(0, 3)));
+    }
+    const swapMain = (lib) => async (b) => {
+      const inner = await JSZip.loadAsync(b);
+      const hj = JSON.parse(await inner.file('h5p.json').async('string'));
+      hj.mainLibrary = lib;
+      inner.file('h5p.json', JSON.stringify(hj));
+      return inner.generateAsync({ type: 'nodebuffer' });
+    };
+    const act = base.r.summary.h5pPackages.find((p) => p.itemKey.startsWith('activity:'));
+    const other = ['H5P.QuestionSet', 'H5P.DragText', 'H5P.Blanks'].find((l) => l !== act.mainLibrary);
+    for (const [pkg, lib, re] of [[act, other, /R-012/], [act, 'H5P.SingleChoiceSet', /R-011/], [base.r.summary.h5pPackages.find((p) => p.mainLibrary === 'H5P.InteractiveVideo'), 'H5P.QuestionSet', /H5P.InteractiveVideo/]]) {
+      const bad = await rewriteBlob(base.r.mbz, () => pkg.sha1, swapMain(lib));
+      const v = await V.validateMbzV3(bad, base.r.expectations);
+      assert(v.issues.some((i) => i.code === 'H5P_LIBRARIES' && re.test(i.message)), `${lib}: ${JSON.stringify(v.issues.slice(0, 3))}`);
+    }
+  });
   void bz;
+
+
+  // ── Fix round 1 (review G6) ───────────────────────────────────────────────
+  await check('fix G6 I1: predicado único de mock (metadata o cuerpo); reproducción del review: run real + flag solo en el cuerpo → falla fuerte', async () => {
+    const run = { id: 'r', input_payload: { providerModes: { presentation: 'real', audio: 'real' } } };
+    const mk = (key, type, mime) => ({ itemKey: key, type: key.split(':')[0], outputSummary: {}, artifacts: [{ itemKey: key, artifactId: key + '-a', type, metadata: {}, mimeType: mime, storageBucket: 'b', storagePath: 'o/x' }] });
+    const byItem = new Map();
+    for (const [k, t, m] of [['course_intro:1', 'dynamic_course_intro_json', 'application/json'], ['audio_welcome:1', 'dynamic_audio_mp3', 'application/json'], ['presentation:c1', 'dynamic_presentation', 'application/json'], ['audiobook_chapter:c1', 'dynamic_audio_mp3', 'application/json'], ['module_intro:m1', 'dynamic_module_intro_json'], ['content:c1', 'dynamic_content_md'], ['experience:c1', 'dynamic_experience_json']]) byItem.set(k, mk(k, t, m));
+    PK.assertRunArtifactsPackageable(run, byItem); // metadata limpia: la guarda previa pasa…
+    const plan = { keys: { courseIntro: 'course_intro:1', audioWelcome: 'audio_welcome:1', finalExam: null }, modules: [{ moduleId: 'm1', keys: { moduleIntro: 'module_intro:m1', exam: null }, chapters: [{ chapterId: 'c1', keys: { content: 'content:c1', experience: 'experience:c1', presentation: 'presentation:c1', audiobookChapter: 'audiobook_chapter:c1', video: null, activity: null } }] }] };
+    const L = (body) => ({ loadText: async (a) => (a.type === 'dynamic_presentation' ? JSON.stringify({ ...body, slideCount: 3 }) : a.type === 'dynamic_audio_mp3' ? JSON.stringify({ ...body, durationSeconds: 5 }) : '{}'), loadBytes: async () => { throw new Error('bytes'); }, loadStorageBytes: async () => { throw new Error('storage'); } });
+    for (const body of [{ fixture: true }, { mock: true }, { mode: 'mock' }]) {
+      await rejects(PK.loadContentsV3(L(body), plan, byItem, run, { familyId: 'aula-clara', mode: 'light' }), /MOCK_ARTIFACT_IN_REAL_RUN/, `…pero el cargador rechaza el cuerpo ${JSON.stringify(body)}`);
+    }
+    // metadata.mode='mock' también es señal (ahora la guarda previa lo ve)
+    const bm = new Map([['presentation:c1', { itemKey: 'presentation:c1', type: 'presentation', outputSummary: {}, artifacts: [{ itemKey: 'presentation:c1', artifactId: 'p', type: 'dynamic_presentation', metadata: { mode: 'mock' } }] }]]);
+    throwsSync(() => PK.assertRunArtifactsPackageable(run, bm), /MOCK_ARTIFACT_IN_REAL_RUN/, 'metadata.mode=mock');
+    assert(PK.isMockSignaled({ metadata: {} }, { fixture: true }) && PK.isMockSignaled({ metadata: { fixture: true } }) && !PK.isMockSignaled({ metadata: {} }, { mode: 'real' }), 'predicado');
+    // audio JSON sin marcas en un run real: tampoco se materializa
+    const L2 = { loadText: async (a) => (a.type === 'dynamic_audio_mp3' ? '{"durationSeconds":5}' : a.type === 'dynamic_presentation' ? '{"schemaVersion":1}' : '{}'), loadBytes: async () => Buffer.from('{"fixture":true}'), loadStorageBytes: async () => { throw new Error('x'); } };
+    await rejects(PK.loadContentsV3(L2, plan, byItem, run, { familyId: 'aula-clara', mode: 'light' }), /PACKAGING_V3/, 'JSON de audio en run real');
+    // run mock pero fixture sin datos → falla (G6 M3), nunca un valor inventado
+    const runMock = { id: 'r', input_payload: { providerModes: { presentation: 'mock', audio: 'mock' } } };
+    const L3 = { loadText: async (a) => (a.type === 'dynamic_presentation' ? '{"fixture":true}' : a.type === 'dynamic_audio_mp3' ? '{"fixture":true,"durationSeconds":5}' : '{}'), loadBytes: async () => { throw new Error('x'); }, loadStorageBytes: async () => { throw new Error('x'); } };
+    await rejects(PK.loadContentsV3(L3, plan, byItem, runMock, { familyId: 'aula-clara', mode: 'light' }), /sin slideCount válido/, 'fixture sin slideCount');
+  });
+  await check('fix G6 I2: storage path — dot-segments, backslashes, %-encoding, absolutos, vacíos y otro dueño se rechazan ANTES de descargar', async () => {
+    const OWN = '8a1b2c3d-0000-4000-8000-000000000001';
+    const bad = [
+      `${OWN}/../victim/f.pdf`, `${OWN}/./f.pdf`, `${OWN}/a/../../victim/f.pdf`, `${OWN}\\..\\victim\\f.pdf`, `${OWN}/..\\victim/f.pdf`,
+      `${OWN}/%2e%2e/victim/f.pdf`, `${OWN}/%2E%2E/victim`, `${OWN}%2f..%2fvictim/f.pdf`, `${OWN}/a%2fb.pdf`, `/${OWN}/f.pdf`, `${OWN}//f.pdf`,
+      `${OWN}/f.pdf/`, '', `victim/${OWN}/f.pdf`, `${OWN}x/f.pdf`, `${OWN}/a b.pdf`, `${OWN}/f\u0000.pdf`,
+    ];
+    for (const p of bad) throwsSync(() => PK.assertOwnerStoragePath(OWN, p), /STORAGE_PATH_INVALID|no pertenece al dueño/, `rechaza ${JSON.stringify(p)}`);
+    eq(PK.assertOwnerStoragePath(OWN, `${OWN}/dynamic/9/presentation/cap-1.pdf`), [OWN, 'dynamic', '9', 'presentation', 'cap-1.pdf'], 'válido');
+    // ArtifactsService.downloadStorageObject: valida antes de fetch y arma la URL por segmentos
+    const { ArtifactsService } = loadDist('modules/artifacts/artifacts.service.js');
+    const svc = new ArtifactsService({}, { get: (k) => ({ SUPABASE_URL: 'https://sb.example', SUPABASE_SERVICE_ROLE_KEY: 'k' })[k] });
+    const urls = [];
+    const saved = global.fetch;
+    global.fetch = async (u) => { urls.push(String(u)); return { ok: true, arrayBuffer: async () => new ArrayBuffer(2) }; };
+    try {
+      // el servicio valida la FORMA (el dueño lo exige el cargador del empaque)
+      for (const p of bad.filter((x) => !x.startsWith('victim/') && !x.startsWith(`${OWN}x/`))) await rejects(svc.downloadStorageObject('cursia-artifacts', p), /STORAGE_PATH_INVALID/, `service rechaza ${JSON.stringify(p)}`);
+      await rejects(svc.downloadStorageObject('../x', `${OWN}/f.pdf`), /STORAGE_PATH_INVALID: bucket/, 'bucket');
+      eq(urls, [], 'ningún fetch con un path inválido');
+      await svc.downloadStorageObject('cursia-artifacts', `${OWN}/d/f.pdf`);
+      eq(urls, [`https://sb.example/storage/v1/object/authenticated/cursia-artifacts/${OWN}/d/f.pdf`], 'URL');
+    } finally {
+      global.fetch = saved;
+    }
+    // el cargador real aplica el mismo control
+    const Lr = PK.artifactsServiceLoadersV3({ downloadStorageObject: async () => Buffer.from('x'), getDownloadUrl: async () => ({}) }, OWN);
+    await rejects(Lr.loadStorageBytes('cursia-artifacts', `${OWN}/../victim/f.pdf`), /STORAGE_PATH_INVALID/, 'loader');
+  });
+  await check('fix G6 M2: Libro sin links javascript:/data: ni atributos inyectados; links http(s)/mailto/# se conservan', async () => {
+    const LB = loadDist('package/v3/libro-v3.js');
+    eq(LB.sanitizeMarkdownLinks('[a](javascript:alert(1)) [b](https://x.org/p) [c](a"onmouseover="alert(1)) [d](#cap-2) [e](mailto:a@b.co) [f](data:text/html,x)'),
+      'a) [b](https://x.org/p) c) [d](#cap-2) [e](mailto:a@b.co) f', 'sanitizado (el `)` sobrante queda como texto inerte)');
+    const input = PF.packagingInput(distRoot, MATRIX[0]);
+    const [c1] = input.contents.contentMd.keys();
+    input.contents.contentMd.set(c1, input.contents.contentMd.get(c1) + '\n\nVer [esto](javascript:alert(1)) y [aquello](x"onmouseover="alert(2)).');
+    const r = await B.buildDynamicMbzV3(input);
+    const z = await JSZip.loadAsync(r.mbz);
+    const names = Object.keys(z.files).filter((n) => n.startsWith('files/'));
+    let libro = '';
+    for (const n of names) { const t = await z.file(n).async('string'); if (t.includes('Libro Guía del curso')) libro = t; }
+    assert(libro && !/javascript:/i.test(libro) && !/onmouseover/i.test(libro), 'sin javascript:/onmouseover en el Libro');
+  });
+  await check('fix G6 M5: categoría ponderada vacía → prepareV3Package falla (409 al pedir), no un job fallido', async () => {
+    const { manifest } = SF.buildCourse(distRoot, { courseId: 641, finalExam: false, engine: 'h5p', modules: [{ examEnabled: true, chapters: [{ video: false, activity: false }] }] });
+    const R = loadDist('modules/dynamic-packaging/artifact-resolver.js');
+    const rows = [];
+    for (const it of manifest.items) for (const t of R.requiredArtifactTypesV3(it.type, it.variant)) {
+      rows.push({ item_key: it.key, item_run_id: `g-${it.key}`, gir_status: 'completed', gir_type: it.type, output_summary: {}, artifact_id: `${it.key}-${t}`, artifact_type: t, storage_bucket: 'b', storage_path: 'o/p', mime_type: 'application/json', artifact_status: null, metadata: {} });
+    }
+    const q = { query: async (sql) => {
+      if (/generation_item_runs/.test(sql)) return rows;
+      if (/course_profiles/.test(sql)) return [];
+      if (/course_generation_manifests/.test(sql)) return [{ n: 0 }];
+      if (/production_jobs/.test(sql)) return [{ id: 'r', owner_id: 'o', execution_mode: 'dynamic_generation', worker_status: 'completed', status: 'completed', input_payload: {} }];
+      throw new Error(sql);
+    } };
+    await rejects(PK.prepareV3Package(q, 'r', { id: 1, sha256: 's', manifest }, 641, '4.1'), /ASSESSMENT_EMPTY_WEIGHTED_CATEGORY: practice/, 'práctica vacía');
+  });
 
   // ── Fail loud del builder ─────────────────────────────────────────────────
   await check('builder falla fuerte: contenido faltante lista las keys del Manifest', async () => {
@@ -476,7 +621,7 @@ const MATRIX = [
     for (const [f, v] of [['builderVersion', '3.0.1'], ['manifestSha256', 'm2'], ['sourceArtifactIds', ['a']], ['themeSha256', 't2'], ['assessmentProfileSha256', 'p2'], ['h5pProfileVersion', 2], ['vcRendererVersion', 'r2'], ['moodleVersion', '4.5']]) {
       assert(PK.packageReuseHashV3({ ...baseK, [f]: v }) !== k0, `cambia con ${f}`);
     }
-    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.0.0' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
+    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.0.1' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
   });
 
   // ── Medios ────────────────────────────────────────────────────────────────
@@ -555,7 +700,8 @@ async function workerChecks() {
     }
   }
 
-  function harness({ providerModes, profiles = [] } = {}) {
+  function harness({ providerModes, profiles = [], stripMockMetadata = false } = {}) {
+    const rowsFor = stripMockMetadata ? rows.map((r) => ({ ...r, metadata: {} })) : rows;
     const state = { completed: [], failed: [], uploads: [], ledger: [], dynamicMbz: [] };
     const runRow = { id: RUN_ID, owner_id: OWNER, execution_mode: 'dynamic_generation', worker_status: 'completed', status: 'completed', input_payload: { videoMode: 'real', videoDelivery: 'youtube', ...(providerModes ? { providerModes } : {}) } };
     const ds = {
@@ -565,7 +711,7 @@ async function workerChecks() {
         if (/set lease_until = now\(\)/.test(sql)) return [{ id: params[0] }];
         if (/from public\.course_profiles/.test(sql)) return profiles;
         if (/from public\.course_generation_manifests/.test(sql)) return [{ n: 0 }];
-        if (/generation_item_runs/.test(sql)) return rows;
+        if (/generation_item_runs/.test(sql)) return rowsFor;
         if (/from public\.production_jobs where id = \$1/.test(sql)) return [runRow];
         throw new Error(`SQL no esperado en el fake: ${sql.slice(0, 80)}`);
       },
@@ -608,7 +754,7 @@ async function workerChecks() {
     eq(h.state.failed, [], 'sin fallos');
     eq(h.state.uploads.length, 1, 'un upload');
     const s = h.state.completed[0];
-    eq([s.builderVersion, s.rulesVersion, s.reused, s.themeSource], ['3.0.0', 3, false, 'default_v3'], 'resumen');
+    eq([s.builderVersion, s.rulesVersion, s.reused, s.themeSource], [B.DYNAMIC_MBZ_BUILDER_VERSION_V3, 3, false, 'default_v3'], 'resumen');
     eq(s.mockProviderItems.length, manifest.items.filter((i) => ['presentation', 'audio_welcome', 'audiobook_chapter'].includes(i.type)).length, 'fixtures materializadas');
     eq(h.state.ledger.map((e) => [e.kind, e.externalId, e.attributionRunId]), [['package', 'job-1', RUN_ID]], 'ZERO_BY_DESIGN');
     const up = h.state.uploads[0];
@@ -641,5 +787,14 @@ async function workerChecks() {
     await W.processItem(h.deps, h.job);
     eq(h.state.uploads.length, 0, 'sin upload');
     assert(/ASSESSMENT_PROFILE_INVALID.*WEIGHTS_FINAL_EXAM_MISMATCH/.test(h.state.failed[0] || ''), `falla: ${h.state.failed[0]}`);
+  });
+  await check('fix G6 I1 (worker): run REAL cuyas fixtures perdieron la marca en metadata (solo el cuerpo dice fixture) → MOCK_ARTIFACT_IN_REAL_RUN, sin upload', async () => {
+    const h = harness({ providerModes: { presentation: 'real', audio: 'real' }, stripMockMetadata: true });
+    await W.processItem(h.deps, h.job);
+    eq(h.state.uploads.length, 0, 'sin upload');
+    assert(h.state.failed.length === 1 && /MOCK_ARTIFACT_IN_REAL_RUN/.test(h.state.failed[0]), `falla: ${h.state.failed[0]}`);
+    const hm = harness({ providerModes: { presentation: 'mock', audio: 'mock' }, stripMockMetadata: true });
+    await W.processItem(hm.deps, hm.job);
+    eq([hm.state.failed.length, hm.state.uploads.length], [0, 1], 'el mismo cuerpo en un run mock sí empaqueta');
   });
 }

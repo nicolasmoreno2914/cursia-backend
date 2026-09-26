@@ -27,6 +27,7 @@ import {
   prepareV3Package,
 } from '../modules/dynamic-packaging/packaging-v3';
 import { resolveTheme } from '../modules/theme-engine';
+import { resolveAssessment } from '../package/assessment';
 import type { BlueprintSnapshotV2 } from '../modules/course-blueprints/blueprint-snapshot';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -502,7 +503,15 @@ export async function processV3PackageJob(
     moodleVersion: moodleRequested,
   });
   // §Q.8: el validador corre sobre los BYTES del paquete, antes de subir. Un hallazgo = fail loud.
-  const validation = await (deps.validateMbzV3 ?? validateMbzV3)(built.mbz, built.expectations);
+  // G6 M1: la evaluación esperada se resuelve ACÁ, del perfil que cargó el worker (no se confía en la del builder).
+  const resolved = resolveAssessment(prepared.profiles.assessment, {
+    hasFinalExam: manifest.manifest.features?.finalExam === true,
+    activityEngine: manifest.manifest.features?.activityEngine,
+  });
+  if (JSON.stringify(resolved) !== JSON.stringify(built.expectations.resolved)) {
+    throw new Error('MBZ_V3_VALIDATION_FAILED: el builder resolvió una evaluación distinta de la del perfil vigente');
+  }
+  const validation = await (deps.validateMbzV3 ?? validateMbzV3)(built.mbz, { facts: built.expectations.facts, resolved });
   if (!validation.ok) {
     throw new Error(
       `MBZ_V3_VALIDATION_FAILED: ${validation.issues.length} hallazgo(s): ` +
