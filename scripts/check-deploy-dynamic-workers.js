@@ -515,7 +515,8 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       eq(kv.FINOPS_INGEST_TOKEN, TOKEN, 'token escrito');
       eq(kv.DYNAMIC_PROVIDER_WORKER_ENABLED, 'false', 'worker de proveedores apagado');
       eq(kv.VIDEOGEN_API_KEY, STG.VG, 'claves de staging intactas');
-      for (const k of ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GAMMA_API_KEY', 'GAMMA_THEME_V21_DARK_DEFAULT']) assert(!(k in kv), `no debe agregar ${k}`);
+      for (const k of ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GAMMA_API_KEY']) assert(!(k in kv), `no debe agregar ${k}`);
+      eq([kv.GAMMA_THEME_V21_LIGHT_DEFAULT, kv.GAMMA_THEME_V21_DARK_DEFAULT], ['default-light', 'default-dark'], 'temas Gamma por defecto');
       const before = fs.readFileSync(path.join(dir, '.env'), 'utf8');
       const r2 = run(TOKEN);
       assert(r2.status === 0, r2.stderr);
@@ -523,6 +524,10 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       const r3 = run('');
       assert(r3.status === 0 && /FINOPS_INGEST_TOKEN: sin valor/.test(r3.stdout), 'sin secret de GitHub: no toca el token');
       eq(fs.readFileSync(path.join(dir, '.env'), 'utf8'), before, 'sin secret: .env igual');
+      // Un tema puesto a mano no se pisa.
+      fs.writeFileSync(path.join(dir, '.env'), before.replace('GAMMA_THEME_V21_LIGHT_DEFAULT=default-light', 'GAMMA_THEME_V21_LIGHT_DEFAULT=manual-theme'));
+      assert(run(TOKEN).status === 0, 'corrida con tema manual');
+      assert(/GAMMA_THEME_V21_LIGHT_DEFAULT=manual-theme/.test(fs.readFileSync(path.join(dir, '.env'), 'utf8')), 'tema manual respetado');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
