@@ -53,7 +53,7 @@ import {
   recordYoutubeUpload,
   settleVideogenPending,
 } from './finops-worker-hooks';
-import { MOCK_VIDEO_DURATION_SEC, VideoDuration, resolveVideoDuration } from './video-duration';
+import { MOCK_VIDEO_DURATION_SEC, VideoDuration, parseMp4DurationSec, plausibleSeconds, resolveVideoDuration } from './video-duration';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fase 5A Task 4 — dynamic-item-worker: ejecuta items type='video' de un run
@@ -914,6 +914,9 @@ async function publishYoutubeAndComplete(
 
   let youtubeVideoId: string | undefined = external.youtubeVideoId;
   let youtubeUrl: string | undefined = external.youtubeUrl;
+  // V2.1 F2 (review final I2): duración MEDIDA desde la caja `mvhd` de los bytes del MP4
+  // que se suben (se persiste antes del primer contacto con YouTube).
+  let measuredMp4: VideoDuration | null = null;
 
   if (!youtubeVideoId) {
     // Idempotencia (espejo de la regla de "video ambiguo" de 5A/R3): si una
@@ -974,9 +977,19 @@ async function publishYoutubeAndComplete(
           description: `Capítulo ${item.chapterNumber ?? '?'} — ${item.blueprint.course.title}`,
           privacyStatus: YOUTUBE_UPLOAD_PRIVACY,
           chapterNumber: item.chapterNumber ?? undefined,
-          onBeforeUpload: async () => {
+          onBeforeUpload: async (mp4?: Buffer) => {
+            // V2.1 F2 (I2): el MP4 ya está en memoria → duración desde `mvhd`, persistida en el
+            // MISMO patch que el marcador de subida (antes de tocar YouTube). Sin mvhd → 'unknown'.
+            let durationPatch: Record<string, any> = {};
+            if (mp4 && mp4.length > 0) {
+              const sec = parseMp4DurationSec(mp4);
+              measuredMp4 = sec === null ? { durationSec: null, durationSource: 'unknown' } : { durationSec: sec, durationSource: 'mp4_mvhd' };
+              if (sec === null) logger.warn(`Item ${item.itemKey}: el MP4 a subir no trae una caja mvhd legible (durationSource=unknown)`);
+              durationPatch = { mp4Duration: measuredMp4 };
+            }
             const ok = await scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
               youtubeUploadStartedAt: new Date().toISOString(),
+              ...durationPatch,
             });
             if (!ok) throw new UploadMarkerLeaseLost();
             contactedYoutube = true;
@@ -1067,12 +1080,11 @@ async function publishYoutubeAndComplete(
     }
   }
   const downloadUrl: string | null = summary.videogenDownloadUrl ?? null;
-  // V2.1 (R11a): la duración quedó en external al terminar el render; un item
-  // anterior a este cambio no la tiene → null + 'unknown' (nunca inventada).
-  const hasDuration = typeof external.durationSec === 'number' && external.durationSec > 0;
-  const duration: VideoDuration = hasDuration
-    ? { durationSec: external.durationSec, durationSource: external.durationSource ?? 'videogen_status' }
-    : { durationSec: null, durationSource: 'unknown' };
+  // V2.1 F2 (review final I2): fuente PRIMARIA = `mvhd` del MP4 subido (medido en
+  // onBeforeUpload; en un re-claim ya publicado, el que quedó en output_summary.mp4Duration).
+  // Secundaria = la duración de Videogen (solo campos con unidad conocida, R11a/RF-b I3).
+  // Sin ninguna → null + 'unknown' (nunca inventada; video_interactions falla fuerte).
+  const duration = finalVideoDuration(measuredMp4 ?? summary.mp4Duration ?? null, external);
   const payload = {
     videogenJobId,
     downloadUrl,
@@ -1122,6 +1134,9 @@ async function publishYoutubeAndComplete(
       ...(external.durationSec === undefined
         ? { external: { durationSec: null, durationSource: 'unknown' } }
         : {}),
+      // V2.1 F2: duración final (la que lee video_interactions) a nivel del summary.
+      durationSec: duration.durationSec,
+      durationSource: duration.durationSource,
     },
   });
   if (!ok) {
@@ -1130,6 +1145,23 @@ async function publishYoutubeAndComplete(
         'false (lease perdida) — el reintento reutiliza el youtubeVideoId sin volver a subir',
     );
   }
+}
+
+/**
+ * V2.1 F2 (review final I2): duración final de un video entregado por YouTube.
+ * 1. `mvhd` del MP4 subido (medida real de los bytes publicados);
+ * 2. la duración de Videogen registrada en `external` (solo unidades conocidas);
+ * 3. nada → null + 'unknown'.
+ */
+export function finalVideoDuration(mp4: unknown, external: Record<string, any>): VideoDuration {
+  const m = mp4 as { durationSec?: unknown; durationSource?: unknown } | null;
+  if (m && m.durationSource === 'mp4_mvhd') {
+    const s = plausibleSeconds(m.durationSec);
+    if (s !== null) return { durationSec: s, durationSource: 'mp4_mvhd' };
+  }
+  const vg = typeof external?.durationSec === 'number' && external.durationSec > 0 ? plausibleSeconds(external.durationSec) : null;
+  if (vg !== null) return { durationSec: vg, durationSource: external.durationSource ?? 'videogen_status' };
+  return { durationSec: null, durationSource: 'unknown' };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1156,6 +1188,13 @@ async function bootstrap() {
   // CONGELADA de cada run, y la creación de runs nuevos (startRun) sí falla
   // ruidoso con ese valor.
   const configuredDelivery = reportVideoDeliveryConfigAtStartup(logger) ?? 'INVALIDO (ver error)';
+  // V2.1 F2 (review final I2): aviso de arranque — el contrato de Videogen no documenta la
+  // duración del render; la fuente medida es el `mvhd` del MP4 al subirlo a YouTube.
+  logger.warn(
+    'duración de video: el status de Videogen no documenta un campo de duración (se usa solo si trae una unidad explícita). ' +
+      'La duración medida sale del mvhd del MP4 que se sube a YouTube; con entrega videogen_direct no hay medición ' +
+      '(los runs rulesVersion 3 exigen YouTube).',
+  );
   const app = await NestFactory.createApplicationContext(AppModule, { logger: ['log', 'warn', 'error'] });
   const youtubeService = app.get(YoutubeService);
   const youtubeTokenService = app.get(YoutubeTokenService);

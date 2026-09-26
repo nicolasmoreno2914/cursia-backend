@@ -525,6 +525,7 @@ async function pureChecks() {
           artifacts: { async uploadJsonArtifact(i) { calls.uploads.push(i); return { id: `art-${calls.uploads.length}` }; } },
           logger: { log() {}, warn() {}, error() {} },
           executorId: 'ex', leaseSeconds: 60,
+          env: {}, // V2.1 F2: entorno del modo real sin claves (nunca el del shell)
           // V2.1 RF-b (fix round 2, M3): guard de presupuesto falso y permisivo (sin él, real falla cerrado).
           ...(withBudget ? { budget: { async guardPaidSubmission() { return { allow: true, decision: 'ALLOW', committed: '0', remaining: null, reason: 'test', authorizedBudget: '999' }; } } } : {}),
         },
@@ -547,9 +548,10 @@ async function pureChecks() {
       eq(R.requiredArtifactTypesV3(type), [artifactType], `${type}: rol que exige completeItem`);
       // videoMode 'mock' + providerModes real → real (el modo de video NO decide).
       const b = mk({ videoMode: 'mock', providerModes: { presentation: 'real', audio: 'real' } });
-      await rejectsRe(W.processProviderItem(b.deps, item(type, ch)), /^PROVIDER_NOT_WIRED_V21/, `${type} real`);
+      // V2.1 F2: real ya está cableado; sin claves en el entorno → provider_not_ready ANTES de llamar (sin gasto).
+      await rejectsRe(W.processProviderItem(b.deps, item(type, ch)), /^provider_not_ready/, `${type} real`);
       eq(b.calls.uploads.length + b.calls.completes.length, 0, `${type} real: sin artifact ni complete`);
-      assert(b.calls.fails.length === 1 && b.calls.fails[0].retry === false && /^PROVIDER_NOT_WIRED_V21/.test(b.calls.fails[0].err), `${type} real: failItem no reintentable`);
+      assert(b.calls.fails.length === 1 && b.calls.fails[0].retry === false && /^provider_not_ready/.test(b.calls.fails[0].err), `${type} real: failItem no reintentable`);
       // Sin providerModes (solo videoMode 'mock', como antes del fix) → PROVIDER_MODE_UNSET, nunca fixture.
       const u = mk({ videoMode: 'mock' });
       await rejectsRe(W.processProviderItem(u.deps, item(type, ch)), /PROVIDER_MODE_UNSET/, `${type} sin modos`);
@@ -725,6 +727,8 @@ async function dbChecks() {
 
     // ── Servicios compilados contra la DB real ──────────────────────────
     process.env.DYNAMIC_COURSE_STRUCTURE = 'true';
+    // V2.1 F2: el preflight de startRun exige claves/themeIds para Gamma/TTS reales (valores FALSOS, 0 red).
+    require('./lib/provider-test-env').applyFakeProviderEnv();
     delete process.env.DYNAMIC_V2_ALLOWED_OWNERS;
     delete process.env.ALLOW_UNOWNED_COURSES;
     ds = new DataSource({ type: 'postgres', host: '127.0.0.1', port, username: 'postgres', database: DB, entities: [], synchronize: false });

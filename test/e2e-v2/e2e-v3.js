@@ -30,7 +30,7 @@ const R = (m) => require(path.join(REPO, 'node_modules', m));
 const jwt = R('jsonwebtoken');
 const JSZip = R('jszip');
 const { Client } = R('pg');
-const { startFakes } = require('./fakes');
+const { startFakes, startProviderFakes } = require('./fakes');
 const { makeFront } = require('./front');
 const { createLlm } = require('./llm');
 const { createLlmV3 } = require('./llm-v3');
@@ -48,6 +48,11 @@ const V3OUT = path.join(OUT, 'v3');
 fs.mkdirSync(V3OUT, { recursive: true });
 const NET_LOG = path.join(V3OUT, 'net-violations.log');
 const MOODLE_SCRATCH = process.env.MOODLE_SCRATCH;
+// V2.1 F2: `E2E_V3_ONLY=real-providers` corre SOLO arranque + workers + E4 (Gamma/TTS/LLM reales contra
+// fakes locales), sin E1–E3 ni restores de Moodle (para correrlo aparte cuando el Moodle local está ocupado).
+const ONLY_REAL_PROVIDERS = process.env.E2E_V3_ONLY === 'real-providers';
+// Claves FALSAS de los proveedores reales (Gamma/OpenAI/Anthropic): solo abren los fakes de 127.0.0.1.
+const PROVIDER_KEYS = { gamma: 'fake-gamma-key-e2e-local', openai: 'fake-openai-key-e2e-local', anthropic: 'fake-anthropic-key-e2e-local' };
 const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -81,6 +86,8 @@ function save() { fs.writeFileSync(path.join(V3OUT, 'results-v3.json'), JSON.str
 // ─── procesos ───────────────────────────────────────────────────────────────
 const children = new Set();
 let FAKES;
+let PFAKES; // V2.1 F2: Gamma / OpenAI TTS / Anthropic falsos
+let PURLS;
 const YT_SECRET = crypto.randomBytes(32).toString('hex');
 function baseEnv() {
   return {
@@ -97,6 +104,12 @@ function baseEnv() {
     // Config de producción del video: entrega YouTube (sin DYNAMIC_VIDEO_DELIVERY ni el escape videogen_direct).
     YOUTUBE_TOKEN_SECRET: YT_SECRET, YOUTUBE_CLIENT_ID: 'fake-client-id', YOUTUBE_CLIENT_SECRET: 'fake-client-secret',
     VIDEOGEN_API_URL: FAKES.videogenUrl, VIDEOGEN_API_KEY: VIDEOGEN_KEY,
+    // V2.1 F2: proveedores REALES de Gamma/TTS/LLM apuntando a fakes en 127.0.0.1 (claves falsas).
+    GAMMA_API_KEY: PROVIDER_KEYS.gamma, GAMMA_API_BASE_URL: PURLS.gammaUrl,
+    GAMMA_THEME_V21_LIGHT_DEFAULT: 'e2e-theme-light', GAMMA_THEME_V21_DARK_DEFAULT: 'e2e-theme-dark',
+    OPENAI_API_KEY: PROVIDER_KEYS.openai, OPENAI_API_BASE_URL: PURLS.openaiUrl,
+    ANTHROPIC_API_KEY: PROVIDER_KEYS.anthropic, ANTHROPIC_API_BASE_URL: PURLS.anthropicUrl,
+    DYNAMIC_GAMMA_POLL_MS: '200',
   };
 }
 function spawnProc(label, script, env) {
@@ -314,6 +327,11 @@ async function ledgerRows(where = 'true', params = []) {
   db = new Client({ host: '127.0.0.1', port: PGPORT, user: 'postgres', database: 'v2db' });
   await db.connect();
   FAKES = await startFakes({ tlsDir: process.env.TLS_DIR, videogenKey: VIDEOGEN_KEY });
+  {
+    const SMM = D('package/v3/synthetic-media.js');
+    PFAKES = startProviderFakes({ gammaKey: PROVIDER_KEYS.gamma, openaiKey: PROVIDER_KEYS.openai, anthropicKey: PROVIDER_KEYS.anthropic, makePdf: SMM.syntheticPdf, makeMp3: SMM.syntheticMp3 });
+    PURLS = await PFAKES.listen();
+  }
   const g = FAKES.google;
   g.fixedVideoId = YT_ID;
   const frontNet = [];
@@ -395,7 +413,7 @@ async function ledgerRows(where = 'true', params = []) {
       ok(!itemWorker.exited && !providerWorker.exited && !pkgWorker.exited, '3 workers reales vivos (item, provider, package)', { i: itemWorker.exited, p: providerWorker.exited, k: pkgWorker.exited });
     });
 
-    for (const C of COURSES) {
+    for (const C of (ONLY_REAL_PROVIDERS ? [] : COURSES)) {
       await step(`v3-${C.key}-generacion`, async () => {
         const c = await createCourse(C, llm);
         S[C.key] = c;
@@ -433,6 +451,8 @@ async function ledgerRows(where = 'true', params = []) {
         for (const v of byType('video')) {
           const os = v.output_summary || {};
           ok(os.youtubeVideoId === YT_ID && os.delivery === 'completed' && os.external && os.external.durationSec === 468, `${C.key}: video ${v.chapter_id.slice(0, 8)} publicado (${YT_ID}), durationSec 468 del Videogen falso`, os);
+          // V2.1 F2 (I2): la duración final sale del mvhd del MP4 que se subió (fuente primaria).
+          ok(os.durationSec === 468 && os.durationSource === 'mp4_mvhd' && os.mp4Duration && os.mp4Duration.durationSource === 'mp4_mvhd', `${C.key}: video ${v.chapter_id.slice(0, 8)}: duración medida del mvhd del MP4 subido (468 s, mp4_mvhd)`, { d: os.durationSec, s: os.durationSource, m: os.mp4Duration });
         }
         const run = await api('GET', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs/${c.runId}`);
         ok(run.data && run.data.status === 'completed', `${C.key}: GET run → completed`, run.data && run.data.status);
@@ -516,7 +536,7 @@ async function ledgerRows(where = 'true', params = []) {
       }
     }
 
-    await step('v3-finops', async () => {
+    if (!ONLY_REAL_PROVIDERS) await step('v3-finops', async () => {
       const courseIds = COURSES.map((C) => S[C.key].courseId);
       const ev = await ledgerRows('course_id = any($1::int[])', [courseIds]);
       const bySrc = {};
@@ -584,8 +604,70 @@ async function ledgerRows(where = 'true', params = []) {
       eq(kinds.map((k) => llm.st.retriesSeen[k] || 0), kinds.map(() => 1), 'cada respuesta inválida produjo EXACTAMENTE 1 reintento dirigido (validation_retry / continuation) y luego pasó');
     }, { fatal: false });
 
+    // ═══ V2.1 F2: E4 — Gamma / TTS / guion LLM REALES contra fakes locales ═══
+    await step('v3-E4-proveedores-reales', async () => {
+      const C = { key: 'E4', title: '[E2E V2.1 E4] Seguridad hidráulica (proveedores reales/fakes)', theme: { themeFamily: 'tecnico', mode: 'dark' }, passing: 70, finalExam: true, engine: 'h5p', modules: [
+        { title: 'Seguridad hidráulica', objective: 'Operar el circuito con seguridad', exam: true, chapters: [
+          { title: 'Bloqueo y etiquetado', v: true, a: true },
+          { title: 'Purgado de circuitos', v: false, a: false },
+        ] }] };
+      const c = await createCourse(C, llm);
+      S.E4 = c;
+      const body = { nombre: C.title, ...CTX, scormTemplateIds: S.templates, videoMode: 'real' }; // providerModes: default REAL
+      const calls0 = { g: PFAKES.st.gammaPosts.length, t: PFAKES.st.tts.length, l: PFAKES.st.llm.length, v: FAKES.videogen.submissions.length };
+      let start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, body);
+      const estM = /estimateId=([0-9a-f-]{36})/.exec(String(start.error || ''));
+      ok(start.status === 409 && /^budget_approval_required/.test(String(start.error)) && !!estM, 'E4: Gamma/TTS/Videogen reales sin aprobación → 409 budget_approval_required (el preflight de proveedores pasó)', { s: start.status, e: start.error });
+      eq([PFAKES.st.gammaPosts.length, PFAKES.st.tts.length, PFAKES.st.llm.length, FAKES.videogen.submissions.length], [calls0.g, calls0.t, calls0.l, calls0.v], 'E4: el 409 no llamó a ningún proveedor');
+      await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+               values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e v3 E4: aprobación (proveedores FALSOS locales)')`, [c.courseId, estM && estM[1]]);
+      start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, body);
+      ok(start.status === 201 && start.data.run.videoDelivery === 'youtube', 'E4: run creado (201) tras ADMIN_APPROVED, entrega YouTube', { s: start.status, e: start.error });
+      c.runId = start.data.run.id;
+      const [job] = await q(`select input_payload from public.production_jobs where id = $1`, [c.runId]);
+      eq([job.input_payload.providerModes.presentation, job.input_payload.providerModes.audio], ['real', 'real'], 'E4: providerModes REAL congelados');
+      const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
+      const stt = await waitRunTerminal(ctl, 'E4 run');
+      const items = await waitItemsDone(c.runId);
+      ok(stt.status === 'completed' && stt.failed === 0, 'E4: ejecutor del navegador terminó sin fallidos', stt);
+      ok(items.length > 0 && items.every((i) => i.status === 'completed'), `E4: los ${items.length} items completed`, items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, i.error_message && i.error_message.slice(0, 300)]));
+      const prov = items.filter((i) => ['presentation', 'audio_welcome', 'audiobook_chapter'].includes(i.type));
+      ok(prov.length === 5 && prov.every((i) => i.worker_id === 'e2e-v3-provider-worker' && i.output_summary && i.output_summary.mode === 'real'), 'E4: Gamma/TTS por el dynamic-provider-worker en modo REAL', prov.map((i) => [i.item_key, i.worker_id, i.output_summary && i.output_summary.mode]));
+      const arts = await artifactsOfRun(c.runId);
+      const provArts = arts.filter((a) => ['dynamic_presentation', 'dynamic_audio_mp3'].includes(a.type));
+      ok(provArts.length === 5 && provArts.every((a) => a.metadata && a.metadata.mode === 'real' && !a.metadata.mock && !a.metadata.fixture), 'E4: artifacts de Gamma/TTS reales (no mock)', provArts.map((a) => [a.item_key, a.metadata]));
+      const newGamma = PFAKES.st.gammaPosts.slice(calls0.g);
+      ok(newGamma.length === 2 && newGamma.every((b) => b.textOptions && b.textOptions.language === 'es-419' && b.themeId === 'e2e-theme-dark' && b.exportAs === 'pdf'),
+        'E4: Gamma falso recibió 2 generaciones (una por capítulo) con es-419 y el themeId de tecnico/dark', newGamma.map((b) => [b.textOptions, b.themeId]));
+      ok(PFAKES.st.llm.length - calls0.l >= 2, `E4: guion del audiolibro por el LLM server-side (fake Anthropic): ${PFAKES.st.llm.length - calls0.l} llamadas`);
+      ok(PFAKES.st.tts.length - calls0.t >= 3, `E4: OpenAI TTS falso: ${PFAKES.st.tts.length - calls0.t} llamadas (bienvenida + 2 capítulos)`);
+      eq(PFAKES.st.badAuth, [], 'E4: los fakes recibieron SU clave (0 rechazos)');
+      const vid = items.find((i) => i.type === 'video');
+      ok(vid && vid.output_summary.durationSource === 'mp4_mvhd' && vid.output_summary.durationSec === 468, 'E4: video con duración medida del mvhd (468 s)', vid && vid.output_summary);
+      const P = await packageRun('E4', c.courseId, c.n, c.runId);
+      const os = P.job.output_summary || {};
+      eq((os.warnings || []).filter((w) => /mock/i.test(JSON.stringify(w))), [], 'E4: el empaque no usó ninguna fixture mock');
+      ok(Array.isArray(os.mockPresentationChapters) ? os.mockPresentationChapters.length === 0 : true, 'E4: 0 capítulos con presentación mock', os.mockPresentationChapters);
+      const z = await JSZip.loadAsync(P.buf);
+      const fx = await z.file('files.xml').async('string');
+      const names = [...fx.matchAll(/<filename>([^<]*)<\/filename>/g)].map((m) => m[1]);
+      ok(names.some((n) => /\.pdf$/.test(n)) && names.some((n) => /\.png$/.test(n)) && names.some((n) => /\.mp3$/.test(n)), 'E4: el MBZ lleva el PDF, la portada PNG y los MP3 de los fakes', names.filter((n) => /\.(pdf|png|mp3)$/.test(n)));
+      const ev = await q(`select provider, operation, cost_source, amount::float8 amount, external_operation_id, recorded_by, item_key from public.generation_cost_events where course_id = $1 and event_kind = 'CHARGE'`, [c.courseId]);
+      const g = ev.filter((e) => e.provider === 'gamma');
+      ok(g.length === 2 && g.every((e) => e.cost_source === 'CALCULATED_FROM_USAGE' && Math.abs(e.amount - 0.42) < 1e-9 && /^gen_f2_/.test(e.external_operation_id)), 'E4 ledger: Gamma = credits.deducted × catálogo (CALCULATED_FROM_USAGE, id = generationId)', g);
+      const t = ev.filter((e) => e.provider === 'openai');
+      ok(t.length >= 3 && t.every((e) => e.cost_source === 'CALCULATED_FROM_USAGE' && e.amount > 0 && /^req_f2_/.test(e.external_operation_id)), 'E4 ledger: TTS medido por segundos de audio (CALCULATED_FROM_USAGE, id = x-request-id)', t);
+      const l = ev.filter((e) => e.provider === 'anthropic' && e.recorded_by === 'dynamic-provider-worker');
+      ok(l.length >= 2 && l.every((e) => e.operation === 'llm.audiobook_script' && e.cost_source === 'CALCULATED_FROM_USAGE' && /^msg_f2_/.test(e.external_operation_id)), 'E4 ledger: guion LLM server-side medido (llm.audiobook_script, id = msg_…)', l);
+      ok(!ev.some((e) => e.cost_source === 'MOCK'), 'E4 ledger: ningún evento MOCK');
+      const blocked = fs.readFileSync(NET_LOG, 'utf8').trim();
+      ok(blocked === '', 'E4 netguard: 0 conexiones fuera de 127.0.0.1 (proveedores = fakes locales)', blocked.slice(0, 500));
+      results.courses.E4 = { courseId: c.courseId, runId: c.runId, items: items.length, spec: C };
+      results.counters.providerFakes = { gammaGenerations: PFAKES.st.gammaPosts.length, ttsCalls: PFAKES.st.tts.length, llmServerCalls: PFAKES.st.llm.length };
+    }, { fatal: false });
+
     // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══
-    const MOODLE_JOBS = [['E1', 'E1'], ['E1-repack', 'E1repack'], ['E2', 'E2'], ['E3', 'E3']];
+    const MOODLE_JOBS = ONLY_REAL_PROVIDERS ? [] : [['E1', 'E1'], ['E1-repack', 'E1repack'], ['E2', 'E2'], ['E3', 'E3']];
     const SHELL = D('modules/course-shell/index.js');
     const AS = D('package/assessment/index.js');
     const { mp3DurationSeconds } = D('package/audio/mp3-parser.js');
@@ -594,7 +676,7 @@ async function ledgerRows(where = 'true', params = []) {
     const PHPINI = process.env.MOODLE_PHPINI;
     const kindOf = (idn) => (/:video$/.test(idn) ? 'video' : /:activity$/.test(idn) ? 'activity' : /^cv3:exam:/.test(idn) ? 'exam' : idn === 'cv3:final_exam' ? 'finalExam' : null);
     results.moodle = {};
-    await step('moodle-preflight-h5p', async () => {
+    if (!ONLY_REAL_PROVIDERS) await step('moodle-preflight-h5p', async () => {
       const pf = spawnSync(process.execPath, [path.join(REPO, 'scripts/h5p-preflight-moodle.js'), process.env.MOODLE_ROOT, PHPINI], { encoding: 'utf8', env: { ...process.env, PHP_BIN: PHP } });
       ok(pf.status === 0, 'preflight de librerías H5P del sitio vs CURSIA_H5P_PROFILE_V1 (h5p-preflight-moodle.js) pasa', (pf.stdout + pf.stderr).slice(-800));
     }, { fatal: false });
@@ -774,6 +856,7 @@ async function ledgerRows(where = 'true', params = []) {
   } finally {
     for (const ch of [...children]) await stopProc(ch);
     await FAKES.close().catch(() => {});
+    if (PFAKES) await PFAKES.close().catch(() => {});
     await db.end().catch(() => {});
     results.finishedAt = new Date().toISOString();
     results.pass = !results.aborted && Object.values(results.steps).every((s) => s.pass) && results.assertions.every((a) => a.ok);

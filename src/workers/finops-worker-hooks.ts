@@ -10,6 +10,7 @@ import type { FinopsLedgerService, RecordResult, CallRole } from '../modules/fin
 import type { FinopsBudgetService } from '../modules/finops/finops-budget.service';
 import { BUDGET_EXCEEDED } from '../modules/finops/run-budget';
 import { costIdempotencyKey } from '../modules/finops/idempotency';
+import { llmIngestToChargeInput } from '../modules/finops/llm-usage-ingest';
 
 export type WorkerLedger = Pick<FinopsLedgerService, 'recordCharge' | 'recordAdjustment' | 'recordZero'>;
 export type WorkerBudget = Pick<FinopsBudgetService, 'guardPaidSubmission'>;
@@ -163,6 +164,153 @@ export async function recordProviderMock(
     recordedBy: 'dynamic-provider-worker',
     metadata: { fixture: true },
   });
+}
+
+// ─── V2.1 F2: cargos REALES de Gamma, OpenAI TTS y el LLM server-side ─────────
+
+/** Rol/intento de una llamada de proveedor según el intento del item (reintento del item = provider_retry). */
+export function providerCallRoleOf(itemAttempt: number | null | undefined): { callRole: CallRole; attempt: number } {
+  const n = Number.isInteger(itemAttempt) && (itemAttempt as number) >= 1 ? (itemAttempt as number) : 1;
+  return n > 1 ? { callRole: 'provider_retry', attempt: n } : { callRole: 'main', attempt: 1 };
+}
+
+/**
+ * Generación de Gamma (una fila por generationId, idempotente):
+ * `credits.deducted` × precio por crédito del catálogo → CALCULATED_FROM_USAGE
+ * (audit §W.2). Sin créditos informados → CHARGE a 0 `pending` (se concilia con
+ * `credits.remaining`); precio faltante → pending_zero (nunca se pierde el cargo).
+ */
+export async function recordGammaCharge(
+  ledger: WorkerLedger,
+  a: {
+    ownerId: string;
+    itemRunId: string;
+    generationId: string;
+    creditsDeducted: number | null;
+    creditsRemaining: number | null;
+    failed?: boolean;
+    itemAttempt?: number;
+  },
+): Promise<RecordResult> {
+  const role = providerCallRoleOf(a.itemAttempt);
+  const measured = typeof a.creditsDeducted === 'number' && Number.isFinite(a.creditsDeducted) && a.creditsDeducted >= 0;
+  return ledger.recordCharge({
+    itemRunId: a.itemRunId,
+    ownerIdFromAuth: a.ownerId,
+    provider: 'gamma',
+    service: 'generations',
+    modelOrProduct: 'gamma-generate',
+    operation: 'gamma.generate',
+    usage: measured ? { gamma_credit: a.creditsDeducted as number } : {},
+    usageUnit: 'gamma_credit',
+    externalOperationId: a.generationId,
+    idempotency: { kind: 'gamma', parts: { generationId: a.generationId } },
+    callRole: role.callRole,
+    attempt: role.attempt,
+    billingAccount: 'cursia',
+    mode: 'real',
+    costSource: 'CALCULATED_FROM_USAGE',
+    measurementStatus: measured ? 'final' : 'pending',
+    pricingFallback: 'pending_zero',
+    outcome: a.failed ? (measured && (a.creditsDeducted as number) > 0 ? 'failed_charged' : 'failed_uncharged') : 'succeeded',
+    recordedBy: 'dynamic-provider-worker',
+    metadata: {
+      costBasis: 'gamma.credits.deducted x pricing_catalog',
+      creditsRemaining: a.creditsRemaining,
+      ...(measured ? {} : { pendingReason: 'gamma_credits_not_reported' }),
+    },
+  });
+}
+
+/**
+ * Un chunk de OpenAI TTS: la API devuelve audio sin `usage` → se mide la
+ * DURACIÓN del audio devuelto (segundos, del MP3 real) × snapshot de precios
+ * (CALCULATED_FROM_USAGE; nunca "real" desde caracteres). Idempotente por
+ * `x-request-id`; sin él, fallback determinístico por item/generación/chunk/intento.
+ */
+export async function recordTtsCharge(
+  ledger: WorkerLedger,
+  a: {
+    ownerId: string;
+    itemRunId: string;
+    requestId: string | null;
+    /** Segundos medidos del MP3 devuelto; null si el audio no se pudo medir → cargo `pending` (nunca se pierde). */
+    audioSeconds: number | null;
+    characters: number;
+    model: string;
+    generation: number;
+    chunk: number;
+    itemAttempt?: number;
+  },
+): Promise<RecordResult> {
+  const measured = typeof a.audioSeconds === 'number' && Number.isFinite(a.audioSeconds) && a.audioSeconds > 0;
+  const role = providerCallRoleOf(a.itemAttempt);
+  return ledger.recordCharge({
+    itemRunId: a.itemRunId,
+    ownerIdFromAuth: a.ownerId,
+    provider: 'openai',
+    service: 'audio.speech',
+    modelOrProduct: a.model,
+    usage: measured ? { audio_seconds: (Math.round((a.audioSeconds as number) * 1000) / 1000).toFixed(3) } : {},
+    usageUnit: 'audio_seconds',
+    externalOperationId: a.requestId,
+    idempotency: a.requestId
+      ? { kind: 'openai_tts', parts: { requestId: a.requestId } }
+      : { kind: 'openai_tts', parts: { itemRunId: a.itemRunId, generation: a.generation, chunk: a.chunk, attempt: role.attempt } },
+    callRole: role.callRole,
+    attempt: role.attempt,
+    billingAccount: 'cursia',
+    mode: 'real',
+    costSource: 'CALCULATED_FROM_USAGE',
+    measurementStatus: measured ? 'final' : 'pending',
+    pricingFallback: 'pending_zero',
+    recordedBy: 'dynamic-provider-worker',
+    // `characters` va solo como dato (el monto sale de los segundos medidos).
+    metadata: {
+      costBasis: 'measured_audio_seconds x pricing_catalog',
+      characters: a.characters,
+      chunk: a.chunk,
+      ...(measured ? {} : { pendingReason: 'tts_audio_not_measurable' }),
+    },
+  });
+}
+
+/**
+ * Llamada LLM server-side (guion del audiolibro): usage de la respuesta de
+ * Anthropic × snapshot → CALCULATED_FROM_USAGE, idempotente por `msg_…`
+ * (misma traducción que el ingest del proxy, HD-V21-17).
+ */
+export async function recordServerLlmCharge(
+  ledger: WorkerLedger,
+  a: {
+    ownerId: string;
+    itemRunId: string;
+    model: string;
+    messageId: string;
+    requestId: string | null;
+    usage: { input_tokens: number; output_tokens: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number };
+    callRole: CallRole;
+    attempt: number;
+  },
+): Promise<RecordResult> {
+  const input = llmIngestToChargeInput({
+    subject: a.ownerId,
+    itemRunId: a.itemRunId,
+    callRole: a.callRole,
+    attempt: a.attempt,
+    model: a.model,
+    messageId: a.messageId,
+    requestId: a.requestId,
+    usage: {
+      input_tokens: a.usage.input_tokens,
+      output_tokens: a.usage.output_tokens,
+      cache_creation_input_tokens: a.usage.cache_creation_input_tokens ?? 0,
+      cache_read_input_tokens: a.usage.cache_read_input_tokens ?? 0,
+    },
+    billingAccount: 'cursia',
+    mode: 'real',
+  });
+  return ledger.recordCharge({ ...input, recordedBy: 'dynamic-provider-worker', metadata: { ...(input.metadata || {}), serverSide: true } });
 }
 
 /** Mensaje del item bloqueado por presupuesto (prefijo estable `budget_exceeded:`). */
