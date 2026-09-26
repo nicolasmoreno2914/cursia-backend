@@ -13,7 +13,8 @@ import {
   ProfileKind,
   ProfileValidationError,
   defaultAssessmentProfile,
-  defaultPresentationProfile,
+  PresentationDefaultSource,
+  defaultPresentationProfileFor,
   isProfileKind,
   normalizeProfile,
   profileSha256,
@@ -37,6 +38,22 @@ export interface CourseProfileDto {
    * lectura; el empaque (R12) debe revalidar y fallar fuerte.
    */
   warnings: ProfileValidationError[];
+  /**
+   * F1 (I4): solo en un default de presentación — `palette` si se derivó de la
+   * paleta del usuario (query `paletteId` o `courses.metadata`), `fallback` si
+   * es aula-clara/light. `null` en un perfil guardado o de evaluación.
+   */
+  defaultSource: PresentationDefaultSource | null;
+}
+
+/** F1 (I4): id de paleta guardado en `courses.metadata` (`paletteId` o `pal.id`), si lo hay. */
+export function paletteIdFromCourseMetadata(metadata: unknown): string | null {
+  let m: any = metadata;
+  if (typeof m === 'string') {
+    try { m = JSON.parse(m); } catch { return null; }
+  }
+  const id = m?.paletteId ?? m?.pal?.id ?? null;
+  return typeof id === 'string' && id.trim() ? id.trim() : null;
 }
 
 const PROFILE_VERSION_UNIQUE = 'course_profiles_course_kind_version_key';
@@ -88,7 +105,12 @@ export class CourseProfilesService {
     return row.final_exam_enabled;
   }
 
-  async getCurrent(courseId: number, ownerId: string, kind: string): Promise<CourseProfileDto> {
+  /**
+   * `paletteId` (F1/I4, opcional, solo presentación): la paleta elegida en el
+   * frontend; sin perfil guardado, el default se deriva de ella. Nunca
+   * persiste: guardar es un POST explícito (el frontend lo hace a la vista).
+   */
+  async getCurrent(courseId: number, ownerId: string, kind: string, paletteId?: string | null): Promise<CourseProfileDto> {
     this.assertKind(kind);
     await this.loadCourse(courseId, ownerId);
     const finalExam = await this.readFinalExam(this.dataSource, courseId);
@@ -97,10 +119,22 @@ export class CourseProfilesService {
       [courseId, kind],
     );
     if (!row) {
-      const profile = kind === 'presentation' ? defaultPresentationProfile() : defaultAssessmentProfile({ finalExam });
+      if (kind === 'presentation') {
+        let pid = typeof paletteId === 'string' && paletteId.trim() ? paletteId.trim() : null;
+        if (!pid) {
+          const [c] = await this.dataSource.query(`select metadata from public.courses where id = $1`, [courseId]);
+          pid = paletteIdFromCourseMetadata(c?.metadata);
+        }
+        const d = defaultPresentationProfileFor(pid);
+        return {
+          courseId, kind, version: 0, profile: d.profile, sha256: profileSha256(d.profile), isDefault: true,
+          createdAt: null, createdBy: null, warnings: d.warnings, defaultSource: d.source,
+        };
+      }
+      const profile = defaultAssessmentProfile({ finalExam });
       return {
         courseId, kind, version: 0, profile, sha256: profileSha256(profile), isDefault: true,
-        createdAt: null, createdBy: null, warnings: [],
+        createdAt: null, createdBy: null, warnings: [], defaultSource: null,
       };
     }
     return this.toDto(row, finalExam);
@@ -196,6 +230,7 @@ export class CourseProfilesService {
       createdAt: toIso(row.created_at),
       createdBy: row.created_by ?? null,
       warnings: kind === 'assessment' ? validateAssessmentProfile(profile, { finalExam }) : [],
+      defaultSource: null,
     };
   }
 }

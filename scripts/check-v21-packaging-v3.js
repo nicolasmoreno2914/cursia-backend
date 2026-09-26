@@ -48,6 +48,7 @@ const AUDIO = loadDist('package/audio/index.js');
 const SHELL = loadDist('modules/course-shell/index.js');
 const PROF = loadDist('modules/course-profiles/course-profiles.js');
 const THEME = loadDist('modules/theme-engine/index.js');
+const A = loadDist('package/assessment/index.js');
 const H5P = loadDist('package/h5p/index.js');
 const MA = loadDist('package/v3/moodle-activities-v3.js');
 const W = loadDist('workers/dynamic-package-worker.js');
@@ -515,7 +516,7 @@ const MATRIX = [
     for (const n of names) { const t = await z.file(n).async('string'); if (t.includes('Libro Guía del curso')) libro = t; }
     assert(libro && !/javascript:/i.test(libro) && !/onmouseover/i.test(libro), 'sin javascript:/onmouseover en el Libro');
   });
-  await check('fix G6 M5: categoría ponderada vacía → prepareV3Package falla (409 al pedir), no un job fallido', async () => {
+  await check('F1 (I3): categoría ponderada vacía → prepareV3Package normaliza (sin fallar) y lo registra; tema sin perfil ni paleta → presentation_profile_defaulted', async () => {
     const { manifest } = SF.buildCourse(distRoot, { courseId: 641, finalExam: false, engine: 'h5p', modules: [{ examEnabled: true, chapters: [{ video: false, activity: false }] }] });
     const R = loadDist('modules/dynamic-packaging/artifact-resolver.js');
     const rows = [];
@@ -525,11 +526,15 @@ const MATRIX = [
     const q = { query: async (sql) => {
       if (/generation_item_runs/.test(sql)) return rows;
       if (/course_profiles/.test(sql)) return [];
-      if (/course_generation_manifests/.test(sql)) return [{ n: 0 }];
+      if (/from public\.courses where id/.test(sql)) return [{ metadata: {} }];
       if (/production_jobs/.test(sql)) return [{ id: 'r', owner_id: 'o', execution_mode: 'dynamic_generation', worker_status: 'completed', status: 'completed', input_payload: {} }];
       throw new Error(sql);
     } };
-    await rejects(PK.prepareV3Package(q, 'r', { id: 1, sha256: 's', manifest }, 641, '4.1'), /ASSESSMENT_EMPTY_WEIGHTED_CATEGORY: practice/, 'práctica vacía');
+    const prep = await PK.prepareV3Package(q, 'r', { id: 1, sha256: 's', manifest }, 641, '4.1');
+    eq(prep.resolved.categories.map((c) => [c.key, c.weight]), [['moduleExams', 100]], 'práctica vacía → exámenes 100');
+    eq(prep.assessment, { weightsNormalized: true, originalWeights: { practice: 40, moduleExams: 60 }, weights: { moduleExams: 100 }, emptyCategories: ['practice'], withoutGrades: false }, 'resumen');
+    eq(prep.profileWarnings, ['presentation_profile_defaulted', 'assessment_weights_normalized:practice=40,moduleExams=60->moduleExams=100'], 'avisos');
+    eq(prep.profiles.theme.source, 'default_v3', 'sin perfil ni paleta');
   });
 
   // ── Fail loud del builder ─────────────────────────────────────────────────
@@ -574,11 +579,15 @@ const MATRIX = [
     input.contents.videos = new Map(); input.contents.videoInteractions = new Map(); input.contents.activities = new Map();
     input.contents.moduleIntros = new Map([[manifest.modules[0].moduleId, SF.moduleIntroFixture(manifest, 0)]]);
     input.contents.examGift = new Map([[manifest.modules[0].moduleId, PF.moduleGift(1)]]);
-    await rejects(B.buildDynamicMbzV3(input), /ASSESSMENT_EMPTY_WEIGHTED_CATEGORY: practice \(peso 40\)/, 'práctica vacía');
+    // F1 (I3): la categoría vacía ya no falla — su peso se redistribuye y el paquete valida.
+    const rn = await B.buildDynamicMbzV3(input);
+    assert((await validate(rn)).ok, 'práctica vacía (peso 40) → normalizado, empaqueta y valida');
+    eq(rn.summary.assessment, { weightsNormalized: true, originalWeights: { practice: 40, moduleExams: 60 }, weights: { moduleExams: 100 }, emptyCategories: ['practice'], withoutGrades: false }, 'resumen normalizado');
     const okProfile = PROF.defaultAssessmentProfile({ finalExam: false });
     okProfile.categoryWeights = { practice: 0, moduleExams: 100 };
     const r = await B.buildDynamicMbzV3({ ...input, assessmentProfile: okProfile });
     assert((await validate(r)).ok, 'con peso 0 en práctica el curso desnudo empaqueta y valida');
+    eq(r.summary.assessment.weightsNormalized, false, 'peso 0 → no hubo que normalizar');
     const bad = PF.packagingInput(distRoot, MATRIX[0]);
     bad.assessmentProfile = PROF.defaultAssessmentProfile({ finalExam: false });
     await rejects(B.buildDynamicMbzV3(bad), /ASSESSMENT_PROFILE_INVALID: .*WEIGHTS_FINAL_EXAM_MISMATCH/, 'pesos sin final');
@@ -604,13 +613,17 @@ const MATRIX = [
     throwsSync(() => PK.assertRunArtifactsPackageable({ id: 'r', input_payload: {} }, byItem), /MOCK_ARTIFACT_IN_REAL_RUN/, 'sin modos');
     PK.assertRunArtifactsPackageable({ id: 'r', input_payload: { providerModes: { presentation: 'mock', audio: 'real' } } }, byItem);
   });
-  await check('tema del paquete: perfil > paleta legacy (solo cursos migrados de v2) > default v3 aula-clara/light', async () => {
+  await check('tema del paquete (F1/I4): perfil > paleta del curso (cualquier curso) > default v3 aula-clara/light', async () => {
     const prof = { themeFamily: 'vibrante', mode: 'light', brandSeed: { accent: '#AA3366' }, themeVersion: 1 };
     eq(PK.resolvePackagingTheme({ presentationProfile: prof, v2Migrated: true, legacyPaletteId: 'ocean' }).source, 'profile', 'perfil');
     const leg = PK.resolvePackagingTheme({ presentationProfile: null, v2Migrated: true, legacyPaletteId: 'ocean' });
-    eq(leg.source, 'legacy_palette', 'legacy');
-    eq(leg.input, THEME.legacyPaletteThemeFallback('ocean'), 'fallback de R1');
-    eq(PK.resolvePackagingTheme({ presentationProfile: null, v2Migrated: false, legacyPaletteId: 'ocean' }), { source: 'default_v3', input: { themeFamily: 'aula-clara', mode: 'light', themeVersion: 1 } }, 'no migrado → default');
+    eq(leg.source, 'palette', 'paleta');
+    eq(leg.input, { themeFamily: 'oscuro-premium', mode: 'dark', brandSeed: THEME.brandSeedFromLegacyPalette(THEME.LEGACY_PALETTES.find((p) => p.id === 'ocean')), themeVersion: 1 }, 'oscuro → oscuro-premium/dark + seed');
+    eq(PK.resolvePackagingTheme({ presentationProfile: null, v2Migrated: false, legacyPaletteId: 'ocean' }), leg, 'no migrado → también la paleta (I4)');
+    eq(PK.resolvePackagingTheme({ presentationProfile: null, legacyPaletteId: 'blanco-corp' }).input.themeFamily, 'aula-clara', 'claro → aula-clara');
+    eq(PK.resolvePackagingTheme({ presentationProfile: null, legacyPaletteId: null }), { source: 'default_v3', input: { themeFamily: 'aula-clara', mode: 'light', themeVersion: 1 } }, 'sin paleta → default');
+    eq(PK.profileWarningsV3({ source: 'default_v3' }, A.resolveAssessment(PROF.defaultAssessmentProfile({ finalExam: true }), { hasFinalExam: true, itemCounts: { practice: 1, moduleExams: 1, finalExam: 1 } })), ['presentation_profile_defaulted'], 'aviso del default');
+    eq(PK.profileWarningsV3({ source: 'palette' }, A.resolveAssessment(PROF.defaultAssessmentProfile({ finalExam: true }), { hasFinalExam: true, itemCounts: { practice: 1, moduleExams: 1, finalExam: 1 } })), [], 'paleta → sin aviso');
     throwsSync(() => PK.resolvePackagingTheme({ presentationProfile: null, v2Migrated: true, legacyPaletteId: 'inexistente' }), /THEME_INVALID/, 'paleta desconocida');
     eq(PK.legacyPaletteIdOf({ pal: { id: 'berry' } }), 'berry', 'metadata.pal.id');
   });
@@ -621,7 +634,7 @@ const MATRIX = [
     for (const [f, v] of [['builderVersion', '3.0.1'], ['manifestSha256', 'm2'], ['sourceArtifactIds', ['a']], ['themeSha256', 't2'], ['assessmentProfileSha256', 'p2'], ['h5pProfileVersion', 2], ['vcRendererVersion', 'r2'], ['moodleVersion', '4.5']]) {
       assert(PK.packageReuseHashV3({ ...baseK, [f]: v }) !== k0, `cambia con ${f}`);
     }
-    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.0.1' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
+    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.0.2' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
   });
 
   // ── Medios ────────────────────────────────────────────────────────────────
@@ -700,7 +713,7 @@ async function workerChecks() {
     }
   }
 
-  function harness({ providerModes, profiles = [], stripMockMetadata = false } = {}) {
+  function harness({ providerModes, profiles = [], stripMockMetadata = false, courseMetadata = {} } = {}) {
     const rowsFor = stripMockMetadata ? rows.map((r) => ({ ...r, metadata: {} })) : rows;
     const state = { completed: [], failed: [], uploads: [], ledger: [], dynamicMbz: [] };
     const runRow = { id: RUN_ID, owner_id: OWNER, execution_mode: 'dynamic_generation', worker_status: 'completed', status: 'completed', input_payload: { videoMode: 'real', videoDelivery: 'youtube', ...(providerModes ? { providerModes } : {}) } };
@@ -710,7 +723,7 @@ async function workerChecks() {
         if (/set status = 'failed'/.test(sql)) { state.failed.push(params[2]); return []; }
         if (/set lease_until = now\(\)/.test(sql)) return [{ id: params[0] }];
         if (/from public\.course_profiles/.test(sql)) return profiles;
-        if (/from public\.course_generation_manifests/.test(sql)) return [{ n: 0 }];
+        if (/from public\.courses where id = \$1/.test(sql)) return [{ metadata: courseMetadata }];
         if (/generation_item_runs/.test(sql)) return rowsFor;
         if (/from public\.production_jobs where id = \$1/.test(sql)) return [runRow];
         throw new Error(`SQL no esperado en el fake: ${sql.slice(0, 80)}`);
@@ -755,6 +768,9 @@ async function workerChecks() {
     eq(h.state.uploads.length, 1, 'un upload');
     const s = h.state.completed[0];
     eq([s.builderVersion, s.rulesVersion, s.reused, s.themeSource], [B.DYNAMIC_MBZ_BUILDER_VERSION_V3, 3, false, 'default_v3'], 'resumen');
+    // F1 (I4): sin perfil ni paleta guardada → aviso visible en el resumen del paquete.
+    assert((s.warnings || []).some((w) => w.code === 'presentation_profile_defaulted'), `aviso presentation_profile_defaulted: ${JSON.stringify(s.warnings)}`);
+    eq(s.assessment && s.assessment.weightsNormalized, false, 'F1 (I3): curso completo → sin normalizar');
     eq(s.mockProviderItems.length, manifest.items.filter((i) => ['presentation', 'audio_welcome', 'audiobook_chapter'].includes(i.type)).length, 'fixtures materializadas');
     eq(h.state.ledger.map((e) => [e.kind, e.externalId, e.attributionRunId]), [['package', 'job-1', RUN_ID]], 'ZERO_BY_DESIGN');
     const up = h.state.uploads[0];
@@ -765,6 +781,7 @@ async function workerChecks() {
     h.state.completed.length = 0;
     await W.processItem(h.deps, h.job);
     eq([h.state.uploads.length, h.state.completed[0].reused, h.state.completed[0].artifactId], [1, true, 'mbz-1'], 'reuse');
+    assert((h.state.completed[0].warnings || []).some((w) => w.code === 'presentation_profile_defaulted'), 'el aviso también en el paquete reutilizado');
     // un perfil de evaluación nuevo (nota 80) = clave nueva = paquete nuevo, sin artifacts nuevos
     const p80 = PROF.defaultAssessmentProfile({ finalExam: true });
     p80.passingGrade = 80;
@@ -775,6 +792,16 @@ async function workerChecks() {
     assert(s2.sourceIdsHash !== s.sourceIdsHash && s2.reused === false, 'clave nueva, build nuevo');
     eq(s2.sourceArtifactIds, s.sourceArtifactIds, 'mismos artifacts de origen');
     eq(s2.assessmentProfileVersion, 2, 'versión del perfil');
+  });
+  await check('F1 (I4) worker v3: sin perfil pero con la paleta guardada en el curso → tema de la paleta, sin aviso de default', async () => {
+    const h = harness({ providerModes: { presentation: 'mock', audio: 'mock' }, courseMetadata: { paletteId: 'blanco-corp' } });
+    await W.processItem(h.deps, h.job);
+    eq(h.state.failed, [], 'sin fallos');
+    const s = h.state.completed[0];
+    eq(s.themeSource, 'palette', 'fuente');
+    assert(!(s.warnings || []).some((w) => w.code === 'presentation_profile_defaulted'), 'sin aviso de default');
+    const expected = THEME.themeSha256(THEME.resolveTheme(THEME.presentationProfileFromPaletteId('blanco-corp')));
+    eq(s.themeSha256, expected, 'tema = aula-clara/light + seed de blanco-corp');
   });
   await check('worker v3: run REAL con fixtures de proveedor → falla MOCK_ARTIFACT_IN_REAL_RUN antes de construir o subir', async () => {
     const h = harness({ providerModes: { presentation: 'real', audio: 'real' } });

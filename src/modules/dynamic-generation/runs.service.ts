@@ -74,6 +74,7 @@ import { FinopsError } from '../finops/errors';
 import { addDec, normalizeDecimal } from '../finops/decimal';
 import { runtimeGuard } from '../finops/budget';
 import type { EstimateResult, MinExpMax } from '../finops/estimator';
+import { assertAssessmentProfileResolvableForRun } from '../course-profiles/assessment-preflight';
 import {
   ACTIVE_RUN_WORKER_STATUSES,
   isActiveRun,
@@ -475,6 +476,8 @@ export class RunsService {
     // G3: flag V2 + allow-list por owner (403 antes de tocar la DB).
     assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
+    // V2.1 F1 (I3): v3 → el perfil de evaluación vigente debe resolverse contra este Manifest ANTES de gastar (409).
+    await assertAssessmentProfileResolvableForRun(this.dataSource, courseId, manifest);
     // Fase 8 (F8-BE): `{fromRun}` crea el run B aplicando el plan de
     // invalidación (mismo entry point → mismos gates G3 de arriba).
     if (isFromRunRequest(courseContext)) {

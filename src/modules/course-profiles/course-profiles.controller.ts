@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, ParseIntPipe, Post, Res, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, ParseIntPipe, Post, Query, Res, UseGuards } from '@nestjs/common';
 import type { Response } from 'express';
 import { CourseProfilesService } from './course-profiles.service';
 import { CreateProfileDto } from './dto/create-profile.dto';
@@ -16,14 +16,16 @@ import { AuthUser } from '../../auth/auth.types';
 export class CourseProfilesController {
   constructor(private readonly profilesService: CourseProfilesService) {}
 
-  // GET /api/v1/courses/:courseId/profiles/:kind → vigente, o el default con isDefault:true
+  // GET /api/v1/courses/:courseId/profiles/:kind[?paletteId=…] → vigente, o el default con isDefault:true
+  // (F1/I4: el default de presentación se deriva de la paleta; nunca persiste).
   @Get(':kind')
   getCurrent(
     @Param('courseId', ParseIntPipe) courseId: number,
     @Param('kind') kind: string,
     @CurrentUser() user: AuthUser,
+    @Query('paletteId') paletteId?: string,
   ) {
-    return this.profilesService.getCurrent(courseId, user.id, kind);
+    return this.profilesService.getCurrent(courseId, user.id, kind, typeof paletteId === 'string' ? paletteId.slice(0, 64) : null);
   }
 
   // POST /api/v1/courses/:courseId/profiles/:kind  body { data, expectedVersion? }

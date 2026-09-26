@@ -69,12 +69,35 @@ export interface ResolvedCourseCompletion {
 export interface ResolvedAssessment {
   assessmentProfileVersion: number;
   hasFinalExam: boolean;
-  /** Nota aprobatoria del curso (`gradepass` del course item) = `passingGrade` base. */
+  /**
+   * Nota aprobatoria del curso (`gradepass` del course item) = `passingGrade`
+   * base. 0 en un curso sin nota (`withoutGrades`).
+   */
   courseGradepass: number;
   kinds: Record<AssessableType, ResolvedKind>;
-  /** Orden fijo: practice, moduleExams, finalExam (solo con examen final). Suma 100. */
+  /**
+   * Orden fijo: practice, moduleExams, finalExam (solo con examen final). Suma
+   * 100. Con `itemCounts` (F1/I3) solo quedan las categorías con ítems
+   * calificables; vacío si el curso no tiene nota.
+   */
   categories: ResolvedCategory[];
   courseCompletion: ResolvedCourseCompletion;
+  /**
+   * F1 (I3): presentes SOLO si se resolvió con `facts.itemCounts`.
+   * - `weightsNormalized`: alguna categoría con peso > 0 no tenía ítems y su
+   *   peso se repartió (proporcional, resto mayor) entre las no vacías.
+   * - `originalWeights`: los pesos del perfil, tal cual, de las categorías
+   *   aplicables al curso.
+   * - `emptyCategories`: categorías aplicables sin ítems calificables (se
+   *   omiten del gradebook).
+   * - `withoutGrades`: ninguna categoría tiene ítems → curso sin nota
+   *   (sin categorías ponderadas; completion por vista de los recursos
+   *   obligatorios, ver el builder v3).
+   */
+  weightsNormalized?: boolean;
+  originalWeights?: Partial<Record<AssessmentCategoryKey, number>>;
+  emptyCategories?: AssessmentCategoryKey[];
+  withoutGrades?: boolean;
 }
 
 export interface AssessmentFacts {
@@ -85,6 +108,71 @@ export interface AssessmentFacts {
    * de intentos (ver `resolveAssessment`).
    */
   activityEngine?: 'h5p' | 'scorm';
+  /**
+   * F1 (I3): cantidad de ítems calificables por categoría (del Manifest
+   * congelado, ver `assessmentItemCountsFromManifest`). Si se da, las
+   * categorías vacías se omiten y su peso se redistribuye (ver
+   * `normalizeCategoryWeights`); si ninguna tiene ítems, el curso queda sin
+   * nota. Sin `itemCounts` el comportamiento es el de R6 (sin normalizar).
+   */
+  itemCounts?: Partial<Record<AssessmentCategoryKey, number>>;
+}
+
+/** Orden fijo de las categorías (también desempata el resto mayor). */
+export const ASSESSMENT_CATEGORY_ORDER: readonly AssessmentCategoryKey[] = Object.freeze(['practice', 'moduleExams', 'finalExam']);
+
+/**
+ * F1 (I3): ítems calificables por categoría a partir de los tipos de item de
+ * un Manifest (v3): `video` + `activity` → practice, `exam` → moduleExams,
+ * `final_exam` → finalExam. Pura.
+ */
+export function assessmentItemCountsFromManifest(manifest: { items: ReadonlyArray<{ type: string }> }): Record<AssessmentCategoryKey, number> {
+  if (!manifest || !Array.isArray(manifest.items)) {
+    throw new Error('ASSESSMENT_INVALID_FACTS: el Manifest no tiene items');
+  }
+  const count = (t: string) => manifest.items.filter((i) => i && i.type === t).length;
+  return {
+    practice: count('video') + count('activity'),
+    moduleExams: count('exam'),
+    finalExam: count('final_exam'),
+  };
+}
+
+/**
+ * F1 (I3): reparte 100 entre `keys` en proporción a `weights` (enteros ≥ 0),
+ * con el método del resto mayor: piso de cada cuota exacta y los puntos que
+ * faltan van a los restos más grandes; empate → orden fijo de categorías.
+ * Si todos los pesos son 0, reparte en partes iguales. Determinística; la
+ * suma es siempre exactamente 100.
+ */
+export function normalizeCategoryWeights(
+  weights: Partial<Record<AssessmentCategoryKey, number>>,
+  keys: readonly AssessmentCategoryKey[],
+): Record<AssessmentCategoryKey, number> {
+  if (keys.length === 0) throw new Error('ASSESSMENT_INVALID_FACTS: no hay categorías para normalizar');
+  const ordered = ASSESSMENT_CATEGORY_ORDER.filter((k) => keys.includes(k));
+  if (ordered.length !== keys.length) throw new Error(`ASSESSMENT_INVALID_FACTS: categorías desconocidas o repetidas (${keys.join(', ')})`);
+  for (const k of ordered) {
+    const w = weights[k];
+    if (typeof w !== 'number' || !Number.isInteger(w) || w < 0) {
+      throw new Error(`ASSESSMENT_INVALID_FACTS: peso de ${k} inválido (${String(w)})`);
+    }
+  }
+  const total = ordered.reduce((a, k) => a + (weights[k] as number), 0);
+  const base = (k: AssessmentCategoryKey) => (total === 0 ? 1 : (weights[k] as number));
+  const denom = total === 0 ? ordered.length : total;
+  const out = {} as Record<AssessmentCategoryKey, number>;
+  const rems: Array<{ k: AssessmentCategoryKey; rem: number; idx: number }> = [];
+  let assigned = 0;
+  ordered.forEach((k, idx) => {
+    const num = base(k) * 100;
+    out[k] = Math.floor(num / denom);
+    assigned += out[k];
+    rems.push({ k, rem: num % denom, idx });
+  });
+  rems.sort((a, b) => b.rem - a.rem || a.idx - b.idx);
+  for (let i = 0; i < 100 - assigned; i++) out[rems[i % rems.length].k] += 1;
+  return out;
 }
 
 /**
@@ -135,28 +223,85 @@ export function resolveAssessment(profile: AssessmentProfile, facts: AssessmentF
     ? ['practice', 'moduleExams', 'finalExam']
     : ['practice', 'moduleExams'];
   const w = profile.categoryWeights as unknown as Record<string, number>;
-  const categories: ResolvedCategory[] = keys.map((key) => ({
+  const profileCategories: ResolvedCategory[] = keys.map((key) => ({
     key,
     fullname: ASSESSMENT_CATEGORY_NAMES[key],
     weight: w[key],
   }));
   // Doble control (el validador ya lo exige): nunca emitir pesos que no sumen 100.
-  const sum = categories.reduce((a, c) => a + c.weight, 0);
+  const sum = profileCategories.reduce((a, c) => a + c.weight, 0);
   if (sum !== 100) throw new Error(`ASSESSMENT_WEIGHTS_SUM_NOT_100: suman ${sum}`);
 
-  return {
+  const courseCompletion: ResolvedCourseCompletion = {
+    requireAllChapterActivities: profile.courseCompletion.requireAllChapterActivities,
+    requireExams: profile.courseCompletion.requireExams,
+    requireCourseGradePass: profile.courseCompletion.requireCourseGradePass,
+    courseGradepass: profile.passingGrade,
+    aggregation: 'all',
+  };
+  const base = {
     assessmentProfileVersion: profile.assessmentProfileVersion,
     hasFinalExam: facts.hasFinalExam,
     courseGradepass: profile.passingGrade,
     kinds,
+  };
+  if (facts.itemCounts === undefined) {
+    return { ...base, categories: profileCategories, courseCompletion };
+  }
+
+  // ── F1 (I3): normalización contra los ítems reales ──
+  const counts = facts.itemCounts;
+  if (!counts || typeof counts !== 'object') throw new Error('ASSESSMENT_INVALID_FACTS: itemCounts debe ser un objeto');
+  for (const k of keys) {
+    const n = counts[k];
+    if (typeof n !== 'number' || !Number.isInteger(n) || n < 0) {
+      throw new Error(`ASSESSMENT_INVALID_FACTS: itemCounts.${k} debe ser un entero ≥ 0 (recibido ${String(n)})`);
+    }
+  }
+  if (facts.hasFinalExam && counts.finalExam !== 1) {
+    throw new Error(`ASSESSMENT_INVALID_FACTS: hasFinalExam=true exige itemCounts.finalExam=1 (recibido ${String(counts.finalExam)})`);
+  }
+  if (!facts.hasFinalExam && (counts.finalExam ?? 0) !== 0) {
+    throw new Error(`ASSESSMENT_INVALID_FACTS: hasFinalExam=false pero itemCounts.finalExam=${String(counts.finalExam)}`);
+  }
+  const originalWeights: Partial<Record<AssessmentCategoryKey, number>> = {};
+  for (const c of profileCategories) originalWeights[c.key] = c.weight;
+  const populated = keys.filter((k) => (counts[k] as number) > 0);
+  const emptyCategories = keys.filter((k) => (counts[k] as number) === 0);
+
+  if (populated.length === 0) {
+    // Curso sin nota: sin categorías ponderadas, sin nota aprobatoria del
+    // curso ni criterio de nota; la completion la dan las vistas (builder).
+    return {
+      ...base,
+      courseGradepass: 0,
+      categories: [],
+      courseCompletion: { ...courseCompletion, requireCourseGradePass: false, courseGradepass: 0 },
+      weightsNormalized: false,
+      originalWeights,
+      emptyCategories,
+      withoutGrades: true,
+    };
+  }
+  const weightsNormalized = emptyCategories.some((k) => (originalWeights[k] as number) > 0);
+  const weights = weightsNormalized
+    ? normalizeCategoryWeights(originalWeights, populated)
+    : (originalWeights as Record<AssessmentCategoryKey, number>);
+  const categories: ResolvedCategory[] = populated.map((key) => ({
+    key,
+    fullname: ASSESSMENT_CATEGORY_NAMES[key],
+    weight: weights[key],
+  }));
+  const sum2 = categories.reduce((a, c) => a + c.weight, 0);
+  if (sum2 !== 100) throw new Error(`ASSESSMENT_WEIGHTS_SUM_NOT_100: tras normalizar suman ${sum2}`);
+  return {
+    ...base,
     categories,
-    courseCompletion: {
-      requireAllChapterActivities: profile.courseCompletion.requireAllChapterActivities,
-      requireExams: profile.courseCompletion.requireExams,
-      requireCourseGradePass: profile.courseCompletion.requireCourseGradePass,
-      courseGradepass: profile.passingGrade,
-      aggregation: 'all',
-    },
+    courseCompletion,
+    weightsNormalized,
+    originalWeights,
+    emptyCategories,
+    withoutGrades: false,
   };
 }
 

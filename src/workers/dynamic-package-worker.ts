@@ -27,7 +27,7 @@ import {
   prepareV3Package,
 } from '../modules/dynamic-packaging/packaging-v3';
 import { resolveTheme } from '../modules/theme-engine';
-import { resolveAssessment } from '../package/assessment';
+import { assessmentItemCountsFromManifest, resolveAssessment } from '../package/assessment';
 import type { BlueprintSnapshotV2 } from '../modules/course-blueprints/blueprint-snapshot';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -466,7 +466,11 @@ export async function processV3PackageJob(
     presentationProfileVersion: prepared.profiles.presentationVersion,
     themeSource: prepared.profiles.theme.source,
     themeSha256: prepared.profiles.themeSha256,
+    // F1 (I3): weightsNormalized + pesos originales/finales, o curso sin nota.
+    assessment: prepared.assessment,
   };
+  // F1: avisos de perfiles (tema por defecto, pesos normalizados, curso sin nota) — también en un paquete reutilizado.
+  const profileWarnings = prepared.profileWarnings.map((w) => ({ code: w.split(':')[0], detail: w }));
   if (isLeaseLost()) return;
 
   const existing = await findExistingDynamicMbzV3(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash);
@@ -476,7 +480,7 @@ export async function processV3PackageJob(
       artifactId: existing.id,
       reused: true,
       ...baseSummary,
-      ...(prepared.staleWarnings.length ? { warnings: prepared.staleWarnings } : {}),
+      ...(prepared.staleWarnings.length || profileWarnings.length ? { warnings: [...prepared.staleWarnings, ...profileWarnings] } : {}),
     });
     if (!ok) logger.warn(`Job ${job.id}: completeJob devolvió false (lease perdida) tras reutilizar ${existing.id}`);
     return;
@@ -504,9 +508,11 @@ export async function processV3PackageJob(
   });
   // §Q.8: el validador corre sobre los BYTES del paquete, antes de subir. Un hallazgo = fail loud.
   // G6 M1: la evaluación esperada se resuelve ACÁ, del perfil que cargó el worker (no se confía en la del builder).
+  // F1 (I3): con los mismos itemCounts del Manifest que usa el builder.
   const resolved = resolveAssessment(prepared.profiles.assessment, {
     hasFinalExam: manifest.manifest.features?.finalExam === true,
     activityEngine: manifest.manifest.features?.activityEngine,
+    itemCounts: assessmentItemCountsFromManifest(manifest.manifest),
   });
   if (JSON.stringify(resolved) !== JSON.stringify(built.expectations.resolved)) {
     throw new Error('MBZ_V3_VALIDATION_FAILED: el builder resolvió una evaluación distinta de la del perfil vigente');
@@ -545,6 +551,7 @@ export async function processV3PackageJob(
   }
   const warnings = [
     ...prepared.staleWarnings,
+    ...profileWarnings,
     ...[...loaded.warnings, ...built.summary.warnings].map((w) => ({ code: w.split(':')[0], detail: w })),
   ];
   const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {

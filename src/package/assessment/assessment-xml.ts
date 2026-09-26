@@ -228,6 +228,11 @@ export interface GradebookXmlInput {
   courseCategoryId?: number;
   /** id del grade_item `course` (default 1). */
   courseItemId?: number;
+  /**
+   * F1 (I3): curso sin nota — `categories` debe ser vacío y `courseGradepass`
+   * 0; solo se emiten la categoría y el ítem del curso.
+   */
+  withoutGrades?: boolean;
 }
 
 function gradeCategoryXml(id: number, parent: number | null, path: string, fullname: string, aggregation: number, ts: number): string {
@@ -308,7 +313,15 @@ export function gradebookXml(p: GradebookXmlInput): string {
   const courseItemId = p.courseItemId ?? 1;
   assertInt(courseCategoryId, 'courseCategoryId', 1);
   assertInt(courseItemId, 'courseItemId', 1);
-  if (!Array.isArray(p.categories) || p.categories.length === 0) {
+  if (p.withoutGrades !== undefined && typeof p.withoutGrades !== 'boolean') {
+    throw new Error('ASSESSMENT_XML_INVALID: withoutGrades debe ser boolean');
+  }
+  if (p.withoutGrades === true) {
+    if (!Array.isArray(p.categories) || p.categories.length !== 0) {
+      throw new Error('ASSESSMENT_XML_INVALID: un curso sin nota no lleva categorías ponderadas');
+    }
+    if (p.courseGradepass !== 0) throw new Error('ASSESSMENT_XML_INVALID: un curso sin nota lleva courseGradepass 0');
+  } else if (!Array.isArray(p.categories) || p.categories.length === 0) {
     throw new Error('ASSESSMENT_XML_INVALID: categories vacío');
   }
   const catIds = new Set<number>([courseCategoryId]);
@@ -330,7 +343,7 @@ export function gradebookXml(p: GradebookXmlInput): string {
     names.add(c.fullname);
     sum += c.weight;
   }
-  if (sum !== 100) throw new Error(`ASSESSMENT_WEIGHTS_SUM_NOT_100: los pesos suman ${sum}`);
+  if (p.withoutGrades !== true && sum !== 100) throw new Error(`ASSESSMENT_WEIGHTS_SUM_NOT_100: los pesos suman ${sum}`);
 
   let cats = '';
   for (const c of p.categories) {
@@ -375,9 +388,19 @@ export const COMPLETION_CRITERIA_TYPE_ACTIVITY = 4;
 export const COMPLETION_CRITERIA_TYPE_GRADE = 6;
 export const COMPLETION_AGGREGATION_ALL = 1;
 
+/**
+ * F1 (I3): módulos que pueden ser criterio de completion del curso por VISTA
+ * (curso sin nota): el Libro Guía (`resource`, con `completionview=1`).
+ */
+export type ViewCompletionModname = 'resource';
+const VIEW_COMPLETION_MODNAMES: readonly ViewCompletionModname[] = ['resource'];
+
 export interface CourseCompletionXmlInput {
-  /** Criterios de actividad: `moduleId` = id del course_module (`<module id>` del module.xml). */
-  criteria: Array<{ moduleId: number; modname: GradedModname }>;
+  /**
+   * Criterios de actividad: `moduleId` = id del course_module (`<module id>` del module.xml).
+   * `resource` solo para la completion por vista de un curso sin nota (F1).
+   */
+  criteria: Array<{ moduleId: number; modname: GradedModname | ViewCompletionModname }>;
   aggregation: 'all';
   requireCourseGradePass: boolean;
   courseGradepass: number;
@@ -402,7 +425,9 @@ export function courseCompletionXml(p: CourseCompletionXmlInput): string {
   const seen = new Set<number>();
   for (const c of p.criteria) {
     assertInt(c.moduleId, 'criteria[].moduleId', 1);
-    if (!GRADED_MODNAMES.includes(c.modname)) throw new Error(`ASSESSMENT_XML_INVALID: criteria[].modname (${String(c.modname)})`);
+    if (!GRADED_MODNAMES.includes(c.modname as GradedModname) && !VIEW_COMPLETION_MODNAMES.includes(c.modname as ViewCompletionModname)) {
+      throw new Error(`ASSESSMENT_XML_INVALID: criteria[].modname (${String(c.modname)})`);
+    }
     if (seen.has(c.moduleId)) throw new Error(`ASSESSMENT_XML_INVALID: criterio repetido para el módulo ${c.moduleId}`);
     seen.add(c.moduleId);
   }

@@ -53,6 +53,12 @@ function assert(c, m) { if (!c) throw new Error(m); }
 const CONFIGS = [
   { id: 'h5p-final-light', engine: 'h5p', finalExam: true, theme: { themeFamily: 'aula-clara', mode: 'light' }, courseId: 631 },
   { id: 'scorm-nofinal-dark', engine: 'scorm', finalExam: false, theme: { themeFamily: 'oscuro-premium', mode: 'dark' }, realAudio: true, courseId: 632 },
+  // F1 (I3): sin exámenes de módulo → pesos normalizados (práctica/final 60/40).
+  { id: 'f1-noexams-normalized', engine: 'h5p', finalExam: true, theme: { themeFamily: 'tecnico', mode: 'dark' }, courseId: 633,
+    modules: [{ examEnabled: false, chapters: [{ video: false, activity: true }, { video: false, activity: true }] }] },
+  // F1 (I3): curso sin nota → sin categorías, completion del curso por vista del Libro Guía.
+  { id: 'f1-without-grades', engine: 'h5p', finalExam: false, theme: { themeFamily: 'aula-clara', mode: 'light' }, courseId: 634,
+    modules: [{ examEnabled: false, chapters: [{ video: false, activity: false }] }] },
 ];
 const QUIZ_GM = { highest: 1, average: 2, first: 3, last: 4 };
 const H5P_GM = { highest: 1, average: 2, last: 3, first: 4 };
@@ -120,7 +126,11 @@ async function runConfig(cfg) {
       eq([it.gradepass, it.grademax, it.grademin, it.category], [k.passingGrade, 100, 0, A.ASSESSMENT_CATEGORY_NAMES[k.category]], c.idnumber);
       eq([c.completion, String(c.completiongradeitemnumber), c.completionpassgrade, c.showdescription], [2, '0', 1, 1], `completion ${c.idnumber}`);
     }
-    for (const c of cms.filter((x) => !kindOf(x.idnumber))) eq(c.completion, 0, `sin completion ${c.idnumber}`);
+    for (const c of cms.filter((x) => !kindOf(x.idnumber))) {
+      // F1 (I3): en un curso sin nota el Libro Guía se completa por vista.
+      if (resolved.withoutGrades && c.idnumber === 'cv3:shell:libro') eq([c.completion, c.completionview], [2, 1], 'Libro por vista');
+      else eq(c.completion, 0, `sin completion ${c.idnumber}`);
+    }
   });
   check(`${tag} gradebook: media ponderada, categorías y pesos ${resolved.categories.map((c) => c.weight).join('/')}, gradepass del curso ${resolved.courseGradepass}`, () => {
     const top = o.categories.find((c) => c.depth === 1);
@@ -133,7 +143,8 @@ async function runConfig(cfg) {
       cms.filter((c) => kindOf(c.idnumber)).map((c) => ({ moduleId: c.cmid, modname: c.modname, kind: kindOf(c.idnumber) })),
       resolved.courseCompletion,
     ).map((x) => cms.find((c) => c.cmid === x.moduleId).idnumber);
-    eq(o.criteria.filter((c) => c.criteriatype === 4).map((c) => c.idnumber), expected, 'criterios');
+    eq(o.criteria.filter((c) => c.criteriatype === 4).map((c) => c.idnumber), resolved.withoutGrades ? ['cv3:shell:libro'] : expected, 'criterios');
+    eq(o.criteria.filter((c) => c.criteriatype === 6).length, resolved.courseCompletion.requireCourseGradePass ? 1 : 0, 'criterio de nota');
     eq(o.aggr, [{ criteriatype: null, method: 1 }], 'agregación');
   });
   check(`${tag} quiz: intentos/método del perfil, sumgrades = Σ maxmark = 100, preguntas = GIFT`, () => {
