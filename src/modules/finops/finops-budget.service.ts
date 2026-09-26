@@ -95,8 +95,9 @@ export class FinopsBudgetService {
 
   async spentSoFar(courseId: number, runner: Runner = this.dataSource): Promise<SpentSoFar> {
     const rows = await runner.query(
+      // RF-b fix M4: el gasto con la clave del usuario (user_key) no consume el presupuesto de Cursia.
       `select provider, coalesce(sum(amount),0)::text as total from public.generation_cost_events
-        where course_id = $1 group by provider order by provider`,
+        where course_id = $1 and billing_account <> 'user_key' group by provider order by provider`,
       [courseId],
     );
     const byProvider: Record<string, string> = {};
@@ -200,6 +201,27 @@ export class FinopsBudgetService {
     return { estimateId: est.id, authorizationId: auth.id };
   }
 
+  /**
+   * RF-b fix M9: aprobación humana directa del presupuesto TOTAL de un run
+   * (p.ej. runs reales creados antes de RF-b, sin estimado con run_id).
+   */
+  async adminAuthorizeRun(a: { courseId: number; runId: string; authorizedBudget: DecimalLike; approvedBy: string; reason?: string | null }): Promise<any> {
+    if (typeof a.runId !== 'string' || !UUID_RE.test(a.runId)) throw new FinopsError('INVALID_INPUT', 'runId debe ser UUID');
+    if (typeof a.approvedBy !== 'string' || !a.approvedBy.trim()) throw new FinopsError('INVALID_INPUT', 'approvedBy es obligatorio');
+    const budget = normalizeDecimal(a.authorizedBudget, 'authorizedBudget');
+    if (cmpDec(budget, 0) <= 0) throw new FinopsError('INVALID_INPUT', 'authorizedBudget debe ser > 0');
+    const [run] = await this.dataSource.query(
+      `select id, course_id from public.production_jobs where id = $1 and execution_mode = 'dynamic_generation'`,
+      [a.runId],
+    );
+    if (!run) throw new FinopsError('ESTIMATE_NOT_FOUND', `no existe el run ${a.runId}`);
+    if (Number(run.course_id) !== Number(a.courseId)) throw new FinopsError('INVALID_INPUT', `el run ${a.runId} no es del curso #${a.courseId}`);
+    return this.ledger.authorize({
+      runId: a.runId, courseId: a.courseId, estimateId: null, authorizedBudget: budget,
+      decision: 'ADMIN_APPROVED', approvedBy: a.approvedBy.trim(), reason: a.reason ?? 'admin_approved_run',
+    });
+  }
+
   /** POST /finops/courses/:courseId/authorizations — aprobación humana de un estimado (append-only). */
   async adminAuthorize(a: { courseId: number; estimateId: string; authorizedBudget: DecimalLike; approvedBy: string; reason?: string | null }): Promise<any> {
     if (typeof a.estimateId !== 'string' || !UUID_RE.test(a.estimateId)) throw new FinopsError('INVALID_INPUT', 'estimateId debe ser UUID');
@@ -236,6 +258,21 @@ export class FinopsBudgetService {
 
   // ─── runtime guard (antes de cada llamada pagada) ─────────────────────────
 
+  /**
+   * RF-b fix I1: presupuesto para PROVEEDORES PAGADOS (Videogen/Gamma/TTS):
+   * SOLO la última autorización ADMIN_APPROVED del run (una BLOCKED posterior la
+   * revoca). AUTO_WITHIN_POLICY nunca cubre gasto real de proveedores (HD-V21-19).
+   */
+  async runPaidAuthorizedBudget(runId: string, runner: Runner = this.dataSource): Promise<string | null> {
+    const [row] = await runner.query(
+      `select decision, authorized_budget::text as authorized_budget from public.cost_budget_authorizations
+        where run_id = $1 and decision in ('ADMIN_APPROVED', 'BLOCKED') order by created_at desc, id desc limit 1`,
+      [runId],
+    );
+    if (!row || row.decision !== 'ADMIN_APPROVED') return null;
+    return row.authorized_budget;
+  }
+
   /** Última autorización vigente del run (AUTO/ADMIN_APPROVED); BLOCKED o ninguna → null. */
   async runAuthorizedBudget(runId: string, runner: Runner = this.dataSource): Promise<string | null> {
     const [row] = await runner.query(
@@ -249,7 +286,8 @@ export class FinopsBudgetService {
 
   async runActual(runId: string, runner: Runner = this.dataSource): Promise<string> {
     const [row] = await runner.query(
-      `select coalesce(sum(amount),0)::text as total from public.generation_cost_events where run_id = $1`,
+      `select coalesce(sum(amount),0)::text as total from public.generation_cost_events
+        where run_id = $1 and billing_account <> 'user_key'`,
       [runId],
     );
     return row.total;
@@ -292,7 +330,7 @@ export class FinopsBudgetService {
     const provider = paidProviderOfItemType(a.itemType);
     if (!provider) throw new FinopsError('INVALID_INPUT', `guardPaidSubmission: ${a.itemType} no es un item de proveedor pagado`);
     const [authorizedBudget, actualSoFar, reservedInFlight, next] = await Promise.all([
-      this.runAuthorizedBudget(a.runId),
+      this.runPaidAuthorizedBudget(a.runId),
       this.runActual(a.runId),
       this.reservedInFlight(a.runId, a.itemRunId),
       this.singleCallCost(a.itemType, provider),

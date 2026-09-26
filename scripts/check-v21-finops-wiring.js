@@ -236,6 +236,46 @@ async function pureChecks() {
     eq(svc.parseJobs([{ job_id: 'j', status: 'completed', duration_seconds: 468 }, { job_id: 'k', status: 'completed' }]).map((j) => j.duration_seconds), [468, null], 'parseJobs');
   });
 
+  // Copia EXACTA de PRICED_MODELS de functions/api/proxy.js (frontend). Si cambia allá, cambia acá.
+  const PROXY_PRICED_MODELS = [
+    'claude-haiku-4-5', 'claude-haiku-4-5-20251001', 'claude-opus-4-8', 'claude-opus-5',
+    'claude-sonnet-4-20250514', 'claude-sonnet-4-5', 'claude-sonnet-4-6', 'claude-sonnet-5',
+  ];
+  await check('puro (fix C1): el seed precia EXACTAMENTE la allowlist del proxy (incl. Haiku 4.5 y Sonnet 4 fechados del selector); un id desconocido → PRICING_MISSING', () => {
+    const seedModels = [...new Set(catalog.filter((r) => r.provider === 'anthropic').map((r) => r.product_or_model))].sort();
+    eq(seedModels, [...PROXY_PRICED_MODELS].sort(), 'seed anthropic == allowlist del proxy');
+    const usage = { input_tokens: 1000, output_tokens: 1000, cache_write_tokens: 100, cache_read_tokens: 100 };
+    for (const model of PROXY_PRICED_MODELS) {
+      const r = F.priceUsage(usage, catalog, { provider: 'anthropic', service: 'messages', product: model });
+      assert(dec(r.amount) > 0, `${model} sin precio`);
+    }
+    const haiku = F.priceUsage({ input_tokens: 1e6, output_tokens: 1e6 }, catalog, { provider: 'anthropic', service: 'messages', product: 'claude-haiku-4-5-20251001' });
+    const sonnet4 = F.priceUsage({ input_tokens: 1e6, output_tokens: 1e6 }, catalog, { provider: 'anthropic', service: 'messages', product: 'claude-sonnet-4-20250514' });
+    eq([dec(haiku.amount), dec(sonnet4.amount)], [6, 18], 'precios públicos (1/5 y 3/15 por 1M)');
+    assert(catalog.filter((r) => ['claude-haiku-4-5-20251001', 'claude-sonnet-4-20250514'].includes(r.product_or_model)).every((r) => r.verified === false), 'marcados verified:false');
+    let code = null;
+    try { F.priceUsage(usage, catalog, { provider: 'anthropic', service: 'messages', product: 'claude-unknown-9' }); } catch (e) { code = e.code; }
+    eq(code, 'PRICING_MISSING', 'id desconocido');
+  });
+
+  await check('puro (fix I3): duración de Videogen solo con unidad explícita y en 5..7200 s — segundos OK, ms convertidos, `duration` sin unidad / fuera de rango / basura → null', () => {
+    eq(VD.durationFromVideogenStatus({ duration_seconds: 468 }), 468, 'segundos');
+    eq(VD.durationFromVideogenStatus({ duration_sec: '468.4' }), 468, 'segundos (string)');
+    eq(VD.durationFromVideogenStatus({ duration_ms: 468000 }), 468, 'ms → s');
+    eq(VD.durationFromVideogenStatus({ durationMs: 468000 }), 468, 'ms camelCase');
+    eq(VD.durationFromVideogenStatus({ duration: 468000 }), null, '`duration` sin unidad');
+    eq(VD.durationFromVideogenStatus({ duration: 468 }), null, '`duration` sin unidad (aunque parezca s)');
+    eq(VD.durationFromVideogenStatus({ duration_seconds: 468000 }), null, 'segundos fuera de rango (eran ms)');
+    eq(VD.durationFromVideogenStatus({ duration_seconds: 3 }), null, '< 5 s');
+    eq(VD.durationFromVideogenStatus({ duration_seconds: 'abc' }), null, 'basura');
+    eq(VD.durationFromVideogenStatus({ duration_ms: 468 }), null, 'ms fuera de rango (0.5 s)');
+    eq(VD.resolveVideoDuration({ videogenStatus: { duration: 468000 } }), { durationSec: null, durationSource: 'unknown' }, 'resolve → unknown');
+    eq(VD.parseIso8601DurationSec('PT10H'), null, 'ISO fuera de rango');
+    const { VideogenService } = loadDist('video-engine/videogen.service.js');
+    const svc = new VideogenService();
+    eq(svc.parseJobs([{ job_id: 'a', duration: 468 }, { job_id: 'b', duration_ms: 468000 }, { job_id: 'c', duration_seconds: 468 }]).map((j) => j.duration_seconds), [null, 468, 468], 'parseJobs');
+  });
+
   await check('puro: cableado — deploy/PM2 del worker de proveedores, migración FinOps en deploy-staging y run-e2e.sh, CI corre este check', () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(REPO, 'package.json'), 'utf8'));
     eq(pkg.scripts['start:dynamic-provider-worker'], 'node dist/workers/dynamic-provider-worker.js', 'npm script');
@@ -247,6 +287,11 @@ async function pureChecks() {
     assert(iMig > 0 && iVer > iMig, 'deploy-staging: migrate + verify FinOps');
     assert(iMig < yml.indexOf('ensure_pm2_process cursia-dynamic-item-worker-staging'), 'la migración corre antes de recargar los workers');
     assert(yml.includes('node scripts/check-v21-finops-wiring.js --pure-only'), 'CI');
+    const iRls = yml.indexOf('MIGRATION_ENV=staging node scripts/migrate-v21-finops-rls.js');
+    const iRlsV = yml.indexOf('MIGRATION_ENV=staging node scripts/verify-v21-finops-rls.js');
+    assert(iRls > iVer && iRlsV > iRls, 'deploy-staging: RLS después del ledger (fix C2)');
+    const setup = fs.readFileSync(path.join(REPO, 'test/e2e-v2/setup-schema.js'), 'utf8');
+    assert(setup.indexOf('supabase-migration-v21-finops-rls.sql') > setup.indexOf("'supabase-migration-v21-finops.sql'"), 'E2E setup-schema aplica la RLS');
     const sh = fs.readFileSync(path.join(REPO, 'test/e2e-v2/run-e2e.sh'), 'utf8');
     assert(sh.indexOf('migrate-v21-finops.js') > sh.indexOf('migrate-v21-manifest-v3.js'), 'run-e2e.sh siembra precios');
   });
@@ -359,6 +404,53 @@ async function dbChecks() {
       const res = runScript(s, localEnv({ MIGRATION_ENV: 'staging' }));
       assert(res.code === 0, `${s}: exit ${res.code}\n${res.out.slice(-2000)}`);
     }
+
+    await check('DB RLS (fix C2): con roles anon/authenticated y el GRANT ALL por defecto de Supabase, la migración (2×, idempotente) habilita RLS y revoca todo; `SET ROLE authenticated`/`anon` no puede SELECT/INSERT en las 6 tablas FinOps ni course_profiles; el backend (dueño) sí; verify verde', async () => {
+      const TABLES = ['pricing_catalog', 'generation_cost_events', 'cost_estimates', 'cost_budget_policies', 'cost_budget_authorizations', 'cost_avoidance_events', 'course_profiles'];
+      await withClient(DB, async (c) => {
+        // Roles de cliente de Supabase (el baseline legacy puede haberlos creado ya: el cluster es compartido por la DB).
+        for (const r of ['anon', 'authenticated']) {
+          await c.query(`do $$ begin if not exists (select 1 from pg_roles where rolname = '${r}') then create role ${r} nologin; end if; end $$`);
+        }
+        // Default de Supabase: ALL sobre las tablas de public para los roles cliente.
+        await c.query(`grant usage on schema public to anon, authenticated; grant all on all tables in schema public to anon, authenticated`);
+      });
+      const pre = runScript('scripts/verify-v21-finops-rls.js', localEnv({ MIGRATION_ENV: 'staging' }));
+      assert(pre.code !== 0 && /sin ROW LEVEL SECURITY/.test(pre.out), `verify antes de migrar debería fallar:\n${pre.out}`);
+      const g = runScript('scripts/migrate-v21-finops-rls.js', localEnv({}));
+      assert(g.code !== 0 && /MIGRATION_ENV no es "staging"/.test(g.out), 'guard MIGRATION_ENV');
+      const gp = runScript('scripts/migrate-v21-finops-rls.js', localEnv({ MIGRATION_ENV: 'staging', DB_USER: 'postgres.hriwbakbuypaiovvvkqh' }));
+      assert(gp.code !== 0 && /PRODUCCIÓN/.test(gp.out), 'guard producción');
+      for (let i = 0; i < 2; i++) {
+        const res = runScript('scripts/migrate-v21-finops-rls.js', localEnv({ MIGRATION_ENV: 'staging' }));
+        assert(res.code === 0, `rls corrida ${i + 1}: ${res.out}`);
+      }
+      const v = runScript('scripts/verify-v21-finops-rls.js', localEnv({ MIGRATION_ENV: 'staging' }));
+      assert(v.code === 0 && /RLS V2.1 FinOps verificado/.test(v.out), `verify: ${v.out}`);
+      await withClient(DB, async (c) => {
+        for (const t of TABLES) {
+          const rel = (await c.query(`select relrowsecurity from pg_class where relname = $1 and relnamespace = 'public'::regnamespace`, [t])).rows[0];
+          assert(rel && rel.relrowsecurity === true, `${t} sin RLS`);
+          for (const role of ['authenticated', 'anon']) {
+            for (const sql of [`select * from public.${t} limit 1`, `insert into public.${t} default values`]) {
+              await c.query('begin');
+              let code = null;
+              try { await c.query(`set local role ${role}`); await c.query(sql); } catch (e) { code = e.code; }
+              await c.query('rollback');
+              eq(code, '42501', `${role}: ${sql}`);
+            }
+          }
+          await c.query(`select * from public.${t} limit 1`); // backend (dueño): OK
+        }
+        // Aun con un GRANT accidental, RLS sin policies no deja ver filas.
+        await c.query('begin');
+        await c.query(`grant select on public.pricing_catalog to authenticated`);
+        await c.query(`set local role authenticated`);
+        const n = (await c.query(`select count(*)::int n from public.pricing_catalog`)).rows[0].n;
+        await c.query('rollback');
+        eq(n, 0, 'RLS sin policies → 0 filas visibles');
+      });
+    });
 
     process.env.DYNAMIC_COURSE_STRUCTURE = 'true';
     delete process.env.DYNAMIC_V2_ALLOWED_OWNERS;
@@ -693,6 +785,30 @@ async function dbChecks() {
       assert(nw.pricing_snapshot.pricing_versions.includes('anthropic-rfb-test'), 'snapshot con la versión nueva');
     });
 
+    await check('DB ingest (fix C1/I2): ids fechados del selector (Haiku 4.5 / Sonnet 4) → 200 con precio; id sin precio → 202, CHARGE a 0 pendiente (pricingMissing), nunca perdido; al cargar el precio → ADJUSTMENT y el pendiente se limpia', async () => {
+      const h = await ingest(llmBody({ model: 'claude-haiku-4-5-20251001', messageId: 'msg_haiku_dated', usage: { input_tokens: 1000000, output_tokens: 1000000 } }));
+      const s4 = await ingest(llmBody({ model: 'claude-sonnet-4-20250514', messageId: 'msg_sonnet4_dated', usage: { input_tokens: 1000000, output_tokens: 1000000 } }));
+      eq([h.status, dec(h.body.amount), s4.status, dec(s4.body.amount)], [200, 6, 200, 18], 'fechados con precio');
+      const victimItem = await itemRow(runB, `content:${Bc.c1}`);
+      const u = await ingest(llmBody({ model: 'claude-new-model-x', itemRunId: victimItem.id, messageId: 'msg_unpriced_1', usage: { input_tokens: 1000000, output_tokens: 2000000 } }));
+      eq([u.status, u.body.inserted, u.body.pricingMissing, u.body.measurementStatus, u.body.amount, u.body.attributed], [202, true, true, 'pending', F.normalizeDecimal(0), true], 'registrado pendiente');
+      const [ev] = await events(`idempotency_key = 'anthropic:msg:msg_unpriced_1'`, []);
+      eq([ev.metadata.pricingMissing, ev.metadata.pricingError.code, ev.pricing_snapshot], [true, 'PRICING_MISSING', null], 'metadata');
+      const dup = await ingest(llmBody({ model: 'claude-new-model-x', itemRunId: victimItem.id, messageId: 'msg_unpriced_1', usage: { input_tokens: 1000000, output_tokens: 2000000 } }));
+      eq([dup.status, dup.body.inserted, dup.body.pricingMissing], [202, false, true], 'reenvío idempotente (sigue pendiente)');
+      const before = await ledger.costsByRun(runB);
+      assert(before.totals.pending_events >= 1, 'aparece en pendientes');
+      await ds.query(
+        `insert into public.pricing_catalog (provider, service, product_or_model, meter, unit_size, unit_price, currency, pricing_version, effective_from, source, verified)
+         values ('anthropic','messages','claude-new-model-x','input_tokens',1000000,2,'USD','anthropic-newx','2026-01-01T00:00:00Z','contract',false),
+                ('anthropic','messages','claude-new-model-x','output_tokens',1000000,10,'USD','anthropic-newx','2026-01-01T00:00:00Z','contract',false)`);
+      const adj = await ledger.repricePendingCharge('anthropic:msg:msg_unpriced_1');
+      eq([adj.inserted, dec(adj.delta)], [true, 22], 'ADJUSTMENT = precio real');
+      eq((await ledger.repricePendingCharge('anthropic:msg:msg_unpriced_1')).inserted, false, 'repetir = no-op');
+      const after = await ledger.costsByRun(runB);
+      eq(after.totals.pending_events, before.totals.pending_events - 1, 'el pendiente corregido ya no cuenta (fix M5)');
+    });
+
     // ════ Consultas ══════════════════════════════════════════════════════
     await check('DB consultas: estimado vs actual por run; costsByCourse con byChapter/byItemType/byProvider/retriesPaid/avoided/estimatedVsActual; rollup por owner', async () => {
       const byRun = await ledger.costsByRun(runB);
@@ -773,6 +889,67 @@ async function dbChecks() {
       } finally {
         await ds.query(`update public.production_jobs set input_payload = input_payload || '{"videoDelivery":"videogen_direct"}'::jsonb where id = $1`, [runA]);
       }
+    });
+
+    // ════ I1: AUTO_WITHIN_POLICY nunca cubre proveedores pagados reales ═════
+    const E = await makeCourse('Curso I1');
+    let runE = null;
+    await check('DB I1 setup: run real E con aprobación ADMIN justa, gasto que la agota y una autorización AUTO_WITHIN_POLICY enorme posterior', async () => {
+      const err = await rejectsRe(runs.startRun(E.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /budget_approval_required/, 'pide aprobación', 409);
+      const b = err.getResponse();
+      await admin.authorize(E.cid, { estimateId: b.estimateId, authorizedBudget: b.estimate.expected }, ADMIN_USER);
+      runE = (await runs.startRun(E.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' })).run.id;
+      const it = await itemRow(runE, `content:${E.c1}`);
+      const r = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_e_big', usage: { input_tokens: 1000000, output_tokens: 5000000 } }));
+      eq(r.status, 200, 'gasto LLM');
+      await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, authorized_budget, decision, reason)
+                      values ($1, $2, 99999, 'AUTO_WITHIN_POLICY', 'test I1: AUTO enorme')`, [runE, E.cid]);
+      eq(await budget.runAuthorizedBudget(runE), F.normalizeDecimal(99999), 'la AUTO es la última autorización');
+      eq(dec(await budget.runPaidAuthorizedBudget(runE)), dec(b.estimate.expected), 'para proveedores pagados solo cuenta la ADMIN');
+    });
+
+    await check('DB I1 workers: el guard de Videogen y el de proveedores bloquean (budget_exceeded) aunque haya AUTO de sobra', async () => {
+      const s = fakeScheduler();
+      const vg = fakeVideogen(0.97);
+      await itemWorker.processItem(workerDeps(s, vg), await claimedVideo(runE, E.c1));
+      eq([vg.st.submits, s.st.blocked.length], [0, 1], 'Videogen bloqueado');
+      const p = await itemRow(runE, `presentation:${E.c1}`);
+      const s2 = fakeScheduler();
+      await providerWorker.processProviderItem({ scheduler: s2, dataSource: ds, logger: workerLog, executorId: 'p-e', leaseSeconds: 60, finops: ledger, budget,
+        artifacts: { async uploadJsonArtifact() { return { id: 'x' }; } } },
+      { itemRunId: p.id, runId: runE, itemKey: p.item_key, type: 'presentation', idempotencyKey: p.idempotency_key, chapterId: E.c1, chapterNumber: 1, manifestId: p.manifest_id, artifactCourseId: String(E.cid), attempt: 1 });
+      eq(s2.st.blocked.length, 1, 'proveedor bloqueado');
+      assert(/budget_exceeded/.test(s2.st.blocked[0].msg), s2.st.blocked[0].msg);
+    });
+
+    await check('DB I1 regenerate: video real con solo AUTO de sobra → 409 budget_approval_required (sin generación nueva)', async () => {
+      const key = `video:${E.c1}`;
+      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() where job_id = $1 and item_key = $2`, [runE, key]);
+      await rejectsRe(runs.regenerateItem(E.cid, OWNER, 1, runE, key, { confirmPaid: true }), /budget_approval_required/, 'regenerate', 409);
+      eq((await itemRow(runE, key)).generation, 1, 'sin generación 2');
+    });
+
+    await check('DB I1 retry: video fallido sin job y resubmitVideo → 409 budget_approval_required con estimado (scope regeneration) y el item sigue failed', async () => {
+      const key = `video:${E.c2}`;
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'video_timeout' where job_id = $1 and item_key = $2`, [runE, key]);
+      const err = await rejectsRe(runs.retryItem(E.cid, OWNER, 1, runE, key), /budget_approval_required/, 'retry', 409);
+      const [est] = await ds.query(`select scope, run_id from public.cost_estimates where id = $1`, [err.getResponse().estimateId]);
+      eq([est.scope, est.run_id], ['regeneration', runE], 'estimado');
+      await ds.query(`update public.generation_item_runs set error = 'videogen_failed: x',
+                        output_summary = output_summary || '{"external":{"videogenJobId":"vg_old","mode":"real"}}'::jsonb
+                      where job_id = $1 and item_key = $2`, [runE, key]);
+      await rejectsRe(runs.retryItem(E.cid, OWNER, 1, runE, key, true), /budget_approval_required/, 'resubmitVideo', 409);
+      eq((await itemRow(runE, key)).status, 'failed', 'sigue failed');
+    });
+
+    await check('DB I1 reopen: run real cancelado con videos/proveedores por enviar → 409; con aprobación ADMIN del run (POST authorizations {runId}) → se reabre', async () => {
+      await runs.cancelRun(E.cid, OWNER, 1, runE);
+      await rejectsRe(runs.startRun(E.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /budget_approval_required/, 'reopen', 409);
+      await rejectsRe(admin.authorize(E.cid, { runId: runE, estimateId: crypto.randomUUID(), authorizedBudget: '1' }, ADMIN_USER), /exactamente uno/, 'runId y estimateId', 400);
+      const a = await admin.authorize(E.cid, { runId: runE, authorizedBudget: '100000' }, ADMIN_USER);
+      eq([a.runId, a.decision, a.estimateId], [runE, 'ADMIN_APPROVED', null], 'aprobación del run');
+      const res = await runs.startRun(E.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' });
+      eq([res.reopened, res.run.id], [true, runE], 'reabierto');
     });
 
     await check('DB gate BLOCK: política del curso con maxCostPerRun mínimo y on_exceed BLOCK → 409 budget_blocked para un run real (sin salida por aprobación)', async () => {

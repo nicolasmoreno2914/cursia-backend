@@ -744,6 +744,19 @@ export class RunsService {
         ownerId,
         frozenRunVideoGate({ videoWork, videoMode: latestVideoMode, strategy: frozenVideoDeliveryOf(latest.input_payload) }),
       );
+      // RF-b fix I1: reabrir re-encola items cancelled; si alguno envía trabajo pagado
+      // real nuevo (video sin job, item de proveedor) → aprobación ADMIN que lo cubra.
+      if (latestVideoMode === 'real') {
+        const cancelled: Array<{ item_key: string; type: string; output_summary: Record<string, any> | null }> = await this.dataSource.query(
+          `select g.item_key, g.type, g.output_summary from public.generation_item_runs g
+            where g.job_id = $1 and g.status = 'cancelled' and ${latestGenerationPredicate('g')}`,
+          [latest.id],
+        );
+        const paidKeys = cancelled
+          .filter((r) => paidProviderOfItemType(r.type) !== null && (r.type !== 'video' || !r.output_summary?.external?.videogenJobId))
+          .map((r) => r.item_key);
+        await this.finopsPaidWorkGate({ courseId, ownerId, manifest, job: latest, paidKeys });
+      }
       return this.reopenRun(latest.id, manifest, contextHash);
     }
 
@@ -1077,6 +1090,18 @@ export class RunsService {
         videoWork = preRows.filter((i) => i.type === 'video' && i.status === 'blocked' && !i.output_summary?.external?.videogenJobId).length;
       }
       await this.enforceVideoGate(ownerId, frozenRunVideoGate({ videoWork, videoMode: this.videoModeOf(job), strategy: frozenDelivery }));
+      // RF-b fix I1: un retry que puede ENVIAR trabajo pagado real nuevo (video sin
+      // job / resubmitVideo, item de proveedor, o videos/proveedores bloqueados que
+      // se desbloquean) exige una aprobación ADMIN que cubra el incremental.
+      if (this.videoModeOf(job) === 'real' && !uploadPhaseRetry) {
+        const isPaid = (r: { type: string }) => paidProviderOfItemType(r.type) !== null;
+        const newPaid = (r: { type: string; output_summary: Record<string, any> | null }, resubmit: boolean) =>
+          r.type !== 'video' || resubmit || !r.output_summary?.external?.videogenJobId;
+        const paidItems = isPaid(preTarget)
+          ? (newPaid(preTarget, resubmitVideo) ? [preTarget] : [])
+          : preRows.filter((r) => r.status === 'blocked' && isPaid(r) && newPaid(r, false));
+        await this.finopsPaidWorkGate({ courseId, ownerId, manifest, job, paidKeys: paidItems.map((r) => r.item_key) });
+      }
     }
 
     const targetId = await this.tx(async (qr) => {
@@ -2085,6 +2110,47 @@ export class RunsService {
   }
 
   /**
+   * RF-b fix I1: gate de trabajo pagado REAL nuevo sobre un run existente
+   * (retry / resubmitVideo / reopen). Estimado de esos items (scope regeneration,
+   * con run_id) y exige que la última aprobación ADMIN_APPROVED del run cubra
+   * actual + incremental esperado; si no → 409 budget_approval_required con el
+   * estimateId. AUTO_WITHIN_POLICY nunca cubre proveedores pagados.
+   */
+  private async finopsPaidWorkGate(a: { courseId: number; ownerId: string; manifest: ManifestDto; job: any; paidKeys: string[] }): Promise<void> {
+    if (this.videoModeOf(a.job) !== 'real' || a.paidKeys.length === 0) return;
+    const keys = [...new Set(a.paidKeys)].sort();
+    if (!this.finopsBudget) {
+      throw new ServiceUnavailableException({
+        code: FINOPS_UNAVAILABLE,
+        message: `${FINOPS_UNAVAILABLE}: no se puede evaluar el presupuesto de trabajo pagado real (${keys.join(', ')}); no se reintentó nada.`,
+      });
+    }
+    const byKey = new Map(a.manifest.manifest.items.map((it) => [it.key, it]));
+    const items = keys.map((k) => byKey.get(k)).filter(Boolean) as RunManifestItem[];
+    const actions: Record<string, string> = {};
+    for (const it of items) actions[it.key] = 'REGENERATE';
+    let estimate: EstimateResult;
+    try {
+      estimate = await this.finopsBudget.estimate(estimateItemsForRun(items, 'real', actions));
+    } catch (err) {
+      throw this.finopsUnavailable(err);
+    }
+    const [authorizedBudget, actualSoFar] = await Promise.all([
+      this.finopsBudget.runPaidAuthorizedBudget(a.job.id),
+      this.finopsBudget.runActual(a.job.id),
+    ]);
+    const g = runtimeGuard({ authorizedBudget, actualSoFar, reservedInFlight: '0', next: estimate.totals.expected });
+    if (g.allow) return;
+    const est = await this.finopsBudget.recordEstimate({
+      scope: 'regeneration', ownerId: a.ownerId, courseId: a.courseId, manifestId: a.manifest.id, runId: a.job.id, estimate,
+    });
+    const providers = [...new Set(items.map((it) => paidProviderOfItemType(it.type)).filter(Boolean) as string[])].sort();
+    throw this.budgetConflict(BUDGET_APPROVAL_REQUIRED, est.id, estimate, [
+      `${g.reason}(committed=${g.committed},authorized=${authorizedBudget ?? 'none'})`,
+    ], providers);
+  }
+
+  /**
    * Regeneración real: guarda el estimado (scope regeneration, con run_id) y,
    * si regenera con un proveedor pagado REAL, exige que el presupuesto
    * autorizado del run cubra actual + incremental esperado; si no → 409
@@ -2131,8 +2197,9 @@ export class RunsService {
       scope: 'regeneration', ownerId, courseId, manifestId: manifest.id, runId: job.id, estimate,
     });
     if (paid.length === 0) return;
+    // RF-b fix I1: solo una aprobación ADMIN_APPROVED cubre proveedores pagados (nunca AUTO).
     const [authorizedBudget, actualSoFar] = await Promise.all([
-      this.finopsBudget.runAuthorizedBudget(job.id),
+      this.finopsBudget.runPaidAuthorizedBudget(job.id),
       this.finopsBudget.runActual(job.id),
     ]);
     const g = runtimeGuard({ authorizedBudget, actualSoFar, reservedInFlight: '0', next: estimate.totals.expected });

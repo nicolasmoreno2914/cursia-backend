@@ -368,6 +368,12 @@ jobs:
                echo "━━━ [4h7] V2.1 RF: verificación de esquema FinOps (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-v21-finops-schema.js
 
+               echo "━━━ [4h8] V2.1 RF-b: RLS + REVOKE anon/authenticated en FinOps y course_profiles (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-v21-finops-rls.js
+
+               echo "━━━ [4h9] V2.1 RF-b: verificación de RLS (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-v21-finops-rls.js
+
                echo "━━━ [4i] Dynamic Generation: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-dynamic-generation-schema.js
 

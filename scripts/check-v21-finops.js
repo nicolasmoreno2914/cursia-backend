@@ -608,9 +608,11 @@ async function dbChecks() {
       let err = null;
       try { await ctrl.llmUsage({ ...body, messageId: 'msg_z', amount: 5 }); } catch (e) { err = e; }
       assert(err && err.getStatus && err.getStatus() === 400, 'campo extra ⇒ 400');
-      err = null;
-      try { await ctrl.llmUsage({ ...body, messageId: 'msg_y', model: 'claude-sin-precio' }); } catch (e) { err = e; }
-      assert(err && err.getStatus && err.getStatus() === 422, 'sin precio ⇒ 422');
+      // RF-b fix C1/I2 (ruling del controller): sin precio ⇒ el cargo NO se pierde:
+      // CHARGE a 0, pending, metadata.pricingMissing y 202 (antes: 422).
+      const fakeRes = { code: 200, status(c) { this.code = c; return this; } };
+      const rp = await ctrl.llmUsage({ ...body, messageId: 'msg_y', model: 'claude-sin-precio' }, fakeRes);
+      eq([fakeRes.code, rp.inserted, rp.pricingMissing, rp.measurementStatus, rp.amount], [202, true, true, 'pending', '0.0000000000'], 'sin precio ⇒ 202 pendiente');
     });
   } catch (err) {
     failures++;

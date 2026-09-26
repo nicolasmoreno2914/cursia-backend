@@ -23,22 +23,45 @@ export interface VideoDuration {
  */
 export const MOCK_VIDEO_DURATION_SEC = 468;
 
-/** Campos de duración (segundos) que aceptamos en el status de Videogen. */
-const VIDEOGEN_DURATION_FIELDS = ['duration_seconds', 'duration_sec', 'durationSec', 'duration'] as const;
+/**
+ * RF-b fix I3: rango plausible de un video de capítulo. Fuera de él la
+ * duración se descarta (null + 'unknown'): una unidad equivocada (ms, minutos)
+ * nunca llega a R11a como segundos.
+ */
+export const MIN_VIDEO_DURATION_SEC = 5;
+export const MAX_VIDEO_DURATION_SEC = 7200;
 
-function positiveSeconds(v: unknown): number | null {
+/**
+ * Campos del status de Videogen con UNIDAD EXPLÍCITA. El genérico `duration`
+ * (unidad desconocida) NO se acepta.
+ */
+const VIDEOGEN_SECONDS_FIELDS = ['duration_seconds', 'duration_sec', 'durationSec', 'durationSeconds'] as const;
+const VIDEOGEN_MS_FIELDS = ['duration_ms', 'durationMs'] as const;
+
+function toNumber(v: unknown): number | null {
   const n = typeof v === 'string' && v.trim() !== '' ? Number(v) : v;
-  if (typeof n !== 'number' || !Number.isFinite(n) || n <= 0) return null;
+  return typeof n === 'number' && Number.isFinite(n) ? n : null;
+}
+
+/** Segundos enteros dentro de [MIN, MAX]; si no, null. */
+export function plausibleSeconds(v: unknown): number | null {
+  const n = toNumber(v);
+  if (n === null) return null;
   const s = Math.round(n);
-  return s > 0 ? s : null;
+  return s >= MIN_VIDEO_DURATION_SEC && s <= MAX_VIDEO_DURATION_SEC ? s : null;
 }
 
 export function durationFromVideogenStatus(status: unknown): number | null {
   if (!status || typeof status !== 'object') return null;
   const s = status as Record<string, unknown>;
-  for (const f of VIDEOGEN_DURATION_FIELDS) {
-    const v = positiveSeconds(s[f]);
-    if (v !== null) return v;
+  for (const f of VIDEOGEN_SECONDS_FIELDS) {
+    if (s[f] === undefined || s[f] === null) continue;
+    return plausibleSeconds(s[f]);
+  }
+  for (const f of VIDEOGEN_MS_FIELDS) {
+    if (s[f] === undefined || s[f] === null) continue;
+    const ms = toNumber(s[f]);
+    return ms === null ? null : plausibleSeconds(ms / 1000);
   }
   return null;
 }
@@ -102,7 +125,7 @@ export function parseMp4DurationSec(bytes: Uint8Array): number | null {
     return null;
   }
   if (!timescale || !duration || duration === 0xffffffff) return null;
-  return positiveSeconds(duration / timescale);
+  return plausibleSeconds(duration / timescale);
 }
 
 /** ISO 8601 de YouTube (`PT7M48S`, `PT1H2M`, `P0DT0H0M5S`) → segundos. */
@@ -111,7 +134,7 @@ export function parseIso8601DurationSec(iso: unknown): number | null {
   const m = /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$/.exec(iso.trim());
   if (!m || (!m[1] && !m[2] && !m[3] && !m[4])) return null;
   const s = Number(m[1] || 0) * 86400 + Number(m[2] || 0) * 3600 + Number(m[3] || 0) * 60 + Number(m[4] || 0);
-  return positiveSeconds(s);
+  return plausibleSeconds(s);
 }
 
 export function resolveVideoDuration(src: {

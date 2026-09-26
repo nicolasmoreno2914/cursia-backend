@@ -101,6 +101,8 @@ export function llmIngestToChargeInput(body: LlmUsageIngestBody): RecordChargeIn
     billingAccount: mock ? 'mock' : body.billingAccount,
     mode: mock ? 'mock' : 'real',
     recordedBy: 'llm-proxy',
+    // RF-b fix C1/I2: un cargo LLM real nunca se pierde por un precio faltante.
+    pricingFallback: 'pending_zero',
     metadata: { requestId: body.requestId ?? null, billingAccountRequested: body.billingAccount },
   };
 }

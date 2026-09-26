@@ -9,9 +9,11 @@ import {
   Param,
   ParseIntPipe,
   Post,
+  Res,
   UnprocessableEntityException,
   UseGuards,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { SuperAdminGuard } from '../../auth/super-admin.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
@@ -48,11 +50,15 @@ export class FinopsIngestController {
   // POST /api/v1/finops/ingest/llm-usage
   @Post('llm-usage')
   @HttpCode(HttpStatus.OK)
-  async llmUsage(@Body() body: Record<string, unknown>) {
+  async llmUsage(@Body() body: Record<string, unknown>, @Res({ passthrough: true }) res: Response) {
     try {
       const parsed = parseLlmUsageIngest(body);
       const r = await this.ledger.recordCharge(llmIngestToChargeInput(parsed));
+      // RF-b fix C1/I2: precio faltante → registrado a 0 pendiente → 202 (nunca 4xx: el proxy no pierde el cargo).
+      if (r.pricingMissing && res) res.status(HttpStatus.ACCEPTED);
       return {
+        pricingMissing: !!r.pricingMissing,
+        measurementStatus: r.event.measurement_status,
         inserted: r.inserted,
         eventId: r.event.id,
         idempotencyKey: r.event.idempotency_key,
@@ -87,9 +93,12 @@ export class FinopsAdminController {
   ) {
     const b = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
     for (const k of Object.keys(b)) {
-      if (!['estimateId', 'authorizedBudget', 'reason'].includes(k)) throw new BadRequestException(`campo no permitido: ${k}`);
+      if (!['estimateId', 'runId', 'authorizedBudget', 'reason'].includes(k)) throw new BadRequestException(`campo no permitido: ${k}`);
     }
-    if (typeof b.estimateId !== 'string') throw new BadRequestException('estimateId es obligatorio');
+    // RF-b fix M9: {runId} (sin estimateId) = presupuesto TOTAL de un run existente.
+    if ((typeof b.estimateId === 'string') === (typeof b.runId === 'string')) {
+      throw new BadRequestException('exactamente uno de estimateId | runId es obligatorio');
+    }
     if (typeof b.authorizedBudget !== 'string' && typeof b.authorizedBudget !== 'number') {
       throw new BadRequestException('authorizedBudget es obligatorio (string decimal o número)');
     }
@@ -97,13 +106,15 @@ export class FinopsAdminController {
       throw new BadRequestException('reason inválido');
     }
     try {
-      const row = await this.budget.adminAuthorize({
+      const common = {
         courseId,
-        estimateId: b.estimateId,
         authorizedBudget: b.authorizedBudget as string | number,
         approvedBy: String(user?.email || user?.id || ''),
         reason: (b.reason as string | undefined) ?? null,
-      });
+      };
+      const row = typeof b.runId === 'string'
+        ? await this.budget.adminAuthorizeRun({ ...common, runId: b.runId })
+        : await this.budget.adminAuthorize({ ...common, estimateId: b.estimateId as string });
       return {
         id: row.id,
         courseId: row.course_id,

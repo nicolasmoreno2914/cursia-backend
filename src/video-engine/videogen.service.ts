@@ -55,12 +55,19 @@ export function isJobPending(status: string): boolean {
   return !isJobCompleted(status) && !isJobFailed(status);
 }
 
-/** V2.1 (R11a): duración (s) del status crudo de Videogen si viene en algún campo conocido; si no, null. */
+/**
+ * V2.1 (R11a): duración en SEGUNDOS del status crudo de Videogen, solo desde
+ * campos con unidad explícita (`duration_seconds`/`duration_sec`, o
+ * `duration_ms` convertido). El genérico `duration` (unidad desconocida) se
+ * ignora; el rango plausible lo valida el worker (video-duration.ts).
+ */
 function videogenDurationSeconds(j: any): number | null {
-  for (const k of ['duration_seconds', 'duration_sec', 'duration']) {
+  for (const k of ['duration_seconds', 'duration_sec']) {
     const n = j?.[k] != null ? Number(j[k]) : NaN;
     if (Number.isFinite(n) && n > 0) return n;
   }
+  const ms = j?.duration_ms != null ? Number(j.duration_ms) : NaN;
+  if (Number.isFinite(ms) && ms > 0) return ms / 1000;
   return null;
 }
 

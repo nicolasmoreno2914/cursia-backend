@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { FinopsError } from './errors';
 import { addDec, cmpDec, isZeroDec, normalizeDecimal, subDec, DecimalLike } from './decimal';
@@ -65,6 +65,13 @@ export interface RecordChargeInput {
    * owner); nunca viene del cliente.
    */
   attributionRunId?: string | null;
+  /**
+   * RF-b fix C1/I2: si el precio falta (o es ambiguo), 'pending_zero' registra
+   * IGUAL el CHARGE con monto 0, measurement_status='pending' y
+   * metadata.pricingMissing=true (log fuerte); un ADJUSTMENT lo precia después
+   * (repricePendingCharge). Sin él, el error de precio se propaga (fail loud).
+   */
+  pricingFallback?: 'pending_zero' | null;
   currency?: string | null;
   measurementStatus?: 'final' | 'pending';
   outcome?: ChargeOutcome;
@@ -105,7 +112,12 @@ export interface CostEventRow {
 export interface RecordResult {
   inserted: boolean;
   event: CostEventRow;
+  /** RF-b fix C1: el precio faltaba → CHARGE a 0 pendiente (se re-precia con repricePendingCharge). */
+  pricingMissing?: boolean;
 }
+
+/** Errores de precio que NUNCA deben perder un cargo real (fallback 'pending_zero'). */
+const PRICING_FALLBACK_CODES = new Set(['PRICING_MISSING', 'PRICING_AMBIGUOUS', 'CURRENCY_MISMATCH']);
 
 interface Attribution {
   attributed: boolean;
@@ -147,6 +159,8 @@ function num(v: DecimalLike | null | undefined): string | null {
 
 @Injectable()
 export class FinopsLedgerService {
+  private readonly logger = new Logger('FinopsLedger');
+
   constructor(private readonly dataSource: DataSource) {}
 
   // ─── atribución ────────────────────────────────────────────────────────────
@@ -296,6 +310,7 @@ export class FinopsLedgerService {
 
     // Monto
     let amount: string;
+    let pricingError: { code: string; message: string } | null = null;
     let currency = (input.currency || 'USD').toUpperCase();
     let pricingSnapshot: PricingSnapshot | null = null;
     if (costSource === 'ZERO_BY_DESIGN' || costSource === 'MOCK') {
@@ -313,16 +328,23 @@ export class FinopsLedgerService {
       amount = normalizeDecimal(input.actualAmount, 'actualAmount');
     } else {
       const catalog = input.pricingCatalog ?? (await this.loadCatalog(input.provider, input.service, input.modelOrProduct));
-      const priced = priceUsage(input.usage || {}, catalog, {
-        provider: input.provider,
-        service: input.service,
-        product: input.modelOrProduct,
-        // Default: ahora (una fila con effective_from futuro nunca se aplica antes de tiempo).
-        asOf: input.pricingAsOf ?? new Date(),
-      });
-      amount = priced.amount;
-      currency = priced.currency;
-      pricingSnapshot = priced.pricingSnapshot;
+      try {
+        const priced = priceUsage(input.usage || {}, catalog, {
+          provider: input.provider,
+          service: input.service,
+          product: input.modelOrProduct,
+          // Default: ahora (una fila con effective_from futuro nunca se aplica antes de tiempo).
+          asOf: input.pricingAsOf ?? new Date(),
+        });
+        amount = priced.amount;
+        currency = priced.currency;
+        pricingSnapshot = priced.pricingSnapshot;
+      } catch (err) {
+        if (!(input.pricingFallback === 'pending_zero' && err instanceof FinopsError && PRICING_FALLBACK_CODES.has(err.code))) throw err;
+        pricingError = { code: err.code, message: err.message };
+        amount = normalizeDecimal(0);
+        pricingSnapshot = null;
+      }
     }
     if (cmpDec(amount, 0) < 0) throw new FinopsError('INVALID_INPUT', `un CHARGE no puede ser negativo (${amount})`);
 
@@ -336,6 +358,12 @@ export class FinopsLedgerService {
     delete metadata.attributionRejectReason;
     delete metadata.requestedItemRunId;
     delete metadata.amountBasis;
+    delete metadata.pricingMissing;
+    delete metadata.pricingError;
+    if (pricingError) {
+      metadata.pricingMissing = true;
+      metadata.pricingError = pricingError;
+    }
     if (!attribution.attributed && attribution.rejectReason) {
       metadata.attributionRejected = true;
       metadata.attributionRejectReason = attribution.rejectReason;
@@ -378,7 +406,7 @@ export class FinopsLedgerService {
       amount,
       currency,
       cost_source: costSource,
-      measurement_status: input.measurementStatus ?? 'final',
+      measurement_status: pricingError ? 'pending' : input.measurementStatus ?? 'final',
       billing_account: input.billingAccount,
       billable,
       outcome: input.outcome ?? 'succeeded',
@@ -386,7 +414,44 @@ export class FinopsLedgerService {
       recorded_by: input.recordedBy,
       metadata,
     };
-    return this.insertEvent(row, this.dataSource);
+    const res = await this.insertEvent(row, this.dataSource);
+    if (pricingError) {
+      this.logger.error(
+        `PRICING_MISSING: CHARGE ${idempotencyKey} (${input.provider}/${input.service}/${input.modelOrProduct}) registrado a 0 ` +
+          `y PENDIENTE (${pricingError.code}: ${pricingError.message}). Cargar el precio en pricing_catalog y re-preciar ` +
+          '(FinopsLedgerService.repricePendingCharge) — el costo real NO está en los totales hasta entonces.',
+      );
+      return { ...res, pricingMissing: true };
+    }
+    return res;
+  }
+
+  /**
+   * RF-b fix C1: re-precia un CHARGE registrado sin precio (metadata.pricingMissing)
+   * con el catálogo vigente AL MOMENTO DEL CARGO → ADJUSTMENT por la diferencia
+   * (append; repetir es no-op). Lanza PRICING_MISSING si el precio sigue sin existir.
+   */
+  async repricePendingCharge(idempotencyKey: string) {
+    nonEmpty(idempotencyKey, 'idempotencyKey');
+    const [orig] = await this.dataSource.query(
+      `select *, amount::text as amount from public.generation_cost_events where idempotency_key = $1`,
+      [idempotencyKey],
+    );
+    if (!orig) throw new FinopsError('ORIGINAL_NOT_FOUND', `no existe el evento ${idempotencyKey}`);
+    if (orig.event_kind !== 'CHARGE' || !orig.metadata?.pricingMissing) {
+      throw new FinopsError('INVALID_INPUT', `${idempotencyKey} no es un CHARGE pendiente de precio`);
+    }
+    const catalog = await this.loadCatalog(orig.provider, orig.service, orig.model_or_product);
+    const priced = priceUsage(orig.usage || {}, catalog, {
+      provider: orig.provider,
+      service: orig.service,
+      product: orig.model_or_product,
+      asOf: orig.created_at,
+    });
+    return this.recordAdjustment(idempotencyKey, priced.amount, 'repriced_after_pricing_missing', {
+      recordedBy: 'reconciler',
+      metadata: { pricingSnapshot: priced.pricingSnapshot },
+    });
   }
 
   /** Cargo de costo cero por diseño (YouTube: cuota; packaging/render local). */
@@ -685,9 +750,13 @@ export class FinopsLedgerService {
               coalesce(sum(amount) filter (where event_kind='CHARGE'),0)::text as charges,
               coalesce(sum(amount) filter (where event_kind='ADJUSTMENT'),0)::text as adjustments,
               coalesce(sum(amount) filter (where event_kind='REFUND'),0)::text as refunds,
-              coalesce(sum(amount) filter (where measurement_status='pending'),0)::text as pending,
+              -- RF-b fix M5: pendiente = CHARGE pendiente SIN un ADJUSTMENT que lo corrija.
+              coalesce(sum(amount) filter (where measurement_status='pending' and event_kind='CHARGE'
+                and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)),0)::text as pending,
+              count(*) filter (where measurement_status='pending' and event_kind='CHARGE'
+                and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id))::int as pending_events,
               count(*)::int as events
-         from public.generation_cost_events where ${where}`,
+         from public.generation_cost_events e where ${where}`,
       params,
     );
     return { totals: t };
