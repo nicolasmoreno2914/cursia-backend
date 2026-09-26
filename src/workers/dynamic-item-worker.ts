@@ -47,6 +47,7 @@ import { FinopsBudgetService } from '../modules/finops/finops-budget.service';
 import {
   WorkerBudget,
   WorkerLedger,
+  blockWithoutGuard,
   budgetExceededMessage,
   recordVideogenCharge,
   recordYoutubeUpload,
@@ -492,7 +493,14 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
       // V2.1 RF-b: runtime guard de presupuesto JUSTO antes de un envío NUEVO
       // (gasto). committed = actual(run) + reservas + este render <= autorizado;
       // si no → item `blocked` con budget_exceeded, sin marcar el submit y 0 gasto.
-      if (mode === 'real' && deps.budget) {
+      if (mode === 'real') {
+        // RF-b fix round 2 (M3): sin guard de presupuesto cableado NO se envía nada
+        // (fail CLOSED, sin marcar el submit). El item queda bloqueado con un error claro.
+        if (!deps.budget) {
+          logger.error(`Item ${item.itemKey} (run ${item.runId}): runtime guard de presupuesto no configurado — no se envía a Videogen (fail closed)`);
+          await blockWithoutGuard(scheduler, item.itemRunId, deps.executorId, 'Videogen');
+          return;
+        }
         const g = await deps.budget.guardPaidSubmission({ runId: item.runId, itemRunId: item.itemRunId, itemType: 'video' });
         if (!g.allow) {
           logger.warn(`Item ${item.itemKey} (run ${item.runId}): presupuesto excedido (${g.reason}) — no se envía a Videogen`);

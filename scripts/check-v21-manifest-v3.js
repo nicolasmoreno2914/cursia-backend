@@ -506,7 +506,7 @@ async function pureChecks() {
       itemRunId: 'ir-1', runId: 'run-1', courseId: 1, artifactCourseId: 'front-1', manifestId: 9, itemKey: `${type}:${chapterId || 1}`,
       type, chapterId, chapterNumber: chapterId ? 2 : null, idempotencyKey: `idem-${type}`, attempt: 1,
     });
-    const mk = (videoMode) => {
+    const mk = (videoMode, withBudget = true) => {
       const calls = { uploads: [], completes: [], fails: [] };
       return {
         calls,
@@ -520,6 +520,8 @@ async function pureChecks() {
           artifacts: { async uploadJsonArtifact(i) { calls.uploads.push(i); return { id: `art-${calls.uploads.length}` }; } },
           logger: { log() {}, warn() {}, error() {} },
           executorId: 'ex', leaseSeconds: 60,
+          // V2.1 RF-b (fix round 2, M3): guard de presupuesto falso y permisivo (sin él, real falla cerrado).
+          ...(withBudget ? { budget: { async guardPaidSubmission() { return { allow: true, decision: 'ALLOW', committed: '0', remaining: null, reason: 'test', authorizedBudget: '999' }; } } } : {}),
         },
       };
     };
@@ -537,6 +539,14 @@ async function pureChecks() {
       await rejectsRe(W.processProviderItem(b.deps, item(type, ch)), /^PROVIDER_NOT_WIRED_V21/, `${type} real`);
       eq(b.calls.uploads.length + b.calls.completes.length, 0, `${type} real: sin artifact ni complete`);
       assert(b.calls.fails.length === 1 && b.calls.fails[0].retry === false && /^PROVIDER_NOT_WIRED_V21/.test(b.calls.fails[0].err), `${type} real: failItem no reintentable`);
+      // RF-b M3: real SIN guard de presupuesto → fail closed (sin llamada, sin artifact), no PROVIDER_NOT_WIRED.
+      const c = mk('real', false);
+      await W.processProviderItem(c.deps, item(type, ch));
+      eq(c.calls.uploads.length + c.calls.completes.length, 0, `${type} real sin guard: sin artifact`);
+      assert(c.calls.fails.length === 1 && c.calls.fails[0].retry === false && /^finops_unavailable: /.test(c.calls.fails[0].err), `${type} real sin guard: ${JSON.stringify(c.calls.fails)}`);
+      const d = mk('mock', false);
+      await W.processProviderItem(d.deps, item(type, ch));
+      eq(d.calls.completes.length, 1, `${type} mock sin guard: completa`);
     }
     eq([...W.PROVIDER_WORKER_TYPES].sort(), ['audio_welcome', 'audiobook_chapter', 'presentation'], 'tipos del worker');
   });

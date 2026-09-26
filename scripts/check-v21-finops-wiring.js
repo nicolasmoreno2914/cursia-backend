@@ -922,6 +922,23 @@ async function dbChecks() {
       assert(/budget_exceeded/.test(s2.st.blocked[0].msg), s2.st.blocked[0].msg);
     });
 
+    await check('DB M3 (fix round 2): worker de Videogen / proveedores en run REAL SIN guard de presupuesto → item bloqueado (budget_exceeded: finops_unavailable), 0 envíos (fail closed)', async () => {
+      const s = fakeScheduler();
+      const vg = fakeVideogen(0.97);
+      const deps = { ...workerDeps(s, vg) };
+      delete deps.budget;
+      await itemWorker.processItem(deps, await claimedVideo(runE, E.c2));
+      eq([vg.st.submits, s.st.blocked.length, s.st.completed.length], [0, 1, 0], 'Videogen sin guard');
+      assert(/^budget_exceeded: finops_unavailable: /.test(s.st.blocked[0].msg), s.st.blocked[0].msg);
+      const p = await itemRow(runE, `presentation:${E.c2}`);
+      const s2 = fakeScheduler();
+      await providerWorker.processProviderItem({ scheduler: s2, dataSource: ds, logger: workerLog, executorId: 'p-m3', leaseSeconds: 60, finops: ledger,
+        artifacts: { async uploadJsonArtifact() { throw new Error('no debería subir'); } } },
+      { itemRunId: p.id, runId: runE, itemKey: p.item_key, type: 'presentation', idempotencyKey: p.idempotency_key, chapterId: E.c2, chapterNumber: 2, manifestId: p.manifest_id, artifactCourseId: String(E.cid), attempt: 1 });
+      eq([s2.st.blocked.length, s2.st.failed.length], [1, 0], 'proveedor sin guard');
+      assert(/finops_unavailable/.test(s2.st.blocked[0].msg), s2.st.blocked[0].msg);
+    });
+
     await check('DB I1 regenerate: video real con solo AUTO de sobra → 409 budget_approval_required (sin generación nueva)', async () => {
       const key = `video:${E.c1}`;
       await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() where job_id = $1 and item_key = $2`, [runE, key]);

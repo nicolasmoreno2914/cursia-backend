@@ -10,7 +10,7 @@ import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import type { ManifestItemType } from '../modules/generation-manifests/generation-manifest-builder';
 import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
 import { FinopsBudgetService } from '../modules/finops/finops-budget.service';
-import { WorkerBudget, WorkerLedger, budgetExceededMessage, recordProviderMock } from './finops-worker-hooks';
+import { WorkerBudget, WorkerLedger, blockWithoutGuard, budgetExceededMessage, recordProviderMock } from './finops-worker-hooks';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cursia V2.1 — R4: worker de items de PROVEEDOR de rulesVersion 3 que no son
@@ -147,7 +147,13 @@ export async function processProviderItem(deps: ProviderWorkerDeps, item: Claime
   if (head.mode === 'real') {
     // V2.1 RF-b: runtime guard de presupuesto ANTES de la llamada pagada (que
     // R9/R10 cablean acá). Excedido → item `blocked` budget_exceeded, sin gasto.
-    if (deps.budget) {
+    // RF-b fix round 2 (M3): sin guard → fail CLOSED (item bloqueado, nunca una llamada pagada).
+    if (!deps.budget) {
+      deps.logger.error(`Item ${item.itemKey}: runtime guard de presupuesto no configurado — no se llama al proveedor (fail closed)`);
+      await blockWithoutGuard(deps.scheduler, item.itemRunId, deps.executorId, providerOfType(item.type) === 'gamma' ? 'Gamma' : 'TTS');
+      return;
+    }
+    {
       const g = await deps.budget.guardPaidSubmission({ runId: item.runId, itemRunId: item.itemRunId, itemType: item.type });
       if (!g.allow) {
         if (!deps.scheduler.blockItemForBudget) throw new Error('dynamic-provider-worker: scheduler sin blockItemForBudget');

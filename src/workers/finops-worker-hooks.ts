@@ -173,3 +173,27 @@ export function budgetExceededMessage(r: { reason: string; committed: string; au
     '(POST /api/v1/finops/courses/:courseId/authorizations) y reintentar esta parte.'
   );
 }
+
+/** Mensaje estable del item bloqueado por falta del guard de presupuesto (prefijo `finops_unavailable:`). */
+export const FINOPS_GUARD_MISSING_ITEM_ERROR =
+  'finops_unavailable: el control de presupuesto (runtime guard) no está configurado en este worker, así que no se envió ' +
+  'nada al proveedor pagado (sin gasto). Corregí la configuración del worker y reintentá esta parte.';
+
+/**
+ * RF-b fix round 2 (M3): bloquea (visible, reanudable con retry) un item de gasto
+ * real cuando falta el guard. Con un scheduler sin blockItemForBudget (fakes) →
+ * failItem no reintentable. Nunca envía nada.
+ */
+export async function blockWithoutGuard(
+  scheduler: { blockItemForBudget?: (id: string, e: string, d: string) => Promise<boolean>; failItem: (id: string, e: string, m: string, r: boolean) => Promise<boolean> },
+  itemRunId: string,
+  executorId: string,
+  provider: string,
+): Promise<void> {
+  const msg = `${FINOPS_GUARD_MISSING_ITEM_ERROR} (proveedor: ${provider})`;
+  if (typeof scheduler.blockItemForBudget === 'function') {
+    await scheduler.blockItemForBudget(itemRunId, executorId, `budget_exceeded: ${msg}`);
+  } else {
+    await scheduler.failItem(itemRunId, executorId, msg, false);
+  }
+}
