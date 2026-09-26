@@ -30,7 +30,10 @@ import type { QueryExecutor } from './artifact-resolver';
 import { artifactDownloadTimeoutMs, parseDynamicVideo, requiredArtifactTypesV3 } from './artifact-resolver';
 import type { ArtifactsService } from '../artifacts/artifacts.service';
 import { frozenVideoDeliveryOf, checkYoutubeDeliveryUrl } from '../dynamic-generation/dynamic-video-delivery';
-import { GuardArtifact, assertNoMockArtifactsForRealPackage, isMockArtifact } from './packaging-guards';
+import { GuardArtifact, MockArtifactInRealRunError, assertNoMockArtifactsForRealPackage } from './packaging-guards';
+import { frozenProviderModesOf, providerKindOfArtifactType } from '../dynamic-generation/provider-modes';
+import { assertSafeStoragePath } from '../artifacts/artifacts.service';
+import { assertCategoriesPopulated } from '../../package/assessment';
 import {
   AssessmentProfile,
   PresentationProfile,
@@ -173,10 +176,42 @@ export function sortedArtifactIdsV3(byItem: Map<string, ResolvedItemV3>): string
   return [...new Set(allArtifactsV3(byItem).map((a) => a.artifactId))].sort();
 }
 
-/** Guarda R-007 sobre el run + todos sus artifacts resueltos (lanza MOCK_ARTIFACT_IN_REAL_RUN). */
+/**
+ * Fix round 1 (review G6 I1): ÚNICA definición de "este artifact es simulado".
+ * Cualquier señal alcanza: `metadata.mock`/`metadata.fixture` del artifact, o
+ * `mock`/`fixture` = true o `mode: 'mock'` en el CUERPO (JSON) ya descargado.
+ * La usan la guarda previa a la carga (solo metadata, lo único que hay antes
+ * de descargar) y el cargador después de parsear cada cuerpo de proveedor.
+ */
+export function isMockSignaled(a: { metadata?: Record<string, any> | null }, payload?: any): boolean {
+  const m = a?.metadata;
+  if (m && (m.mock === true || m.fixture === true || m.mode === 'mock')) return true;
+  return !!payload && typeof payload === 'object' && (payload.mock === true || payload.fixture === true || payload.mode === 'mock');
+}
+
+/** ¿El run está congelado en mock para el proveedor de este tipo de artifact? */
+export function runAllowsMockFor(run: { input_payload?: any } | null | undefined, artifactType: string): boolean {
+  const kind = providerKindOfArtifactType(artifactType);
+  const modes = frozenProviderModesOf(run?.input_payload);
+  return !!kind && !!modes && modes[kind] === 'mock';
+}
+
+/** Falla fuerte (MOCK_ARTIFACT_IN_REAL_RUN) si el artifact (metadata o cuerpo) es simulado y el run no está congelado en mock para su proveedor. */
+export function assertArtifactMockAllowed(run: { id?: string; input_payload?: any }, a: ResolvedArtifactV3, payload?: any): boolean {
+  if (!isMockSignaled(a, payload)) return false;
+  if (!runAllowsMockFor(run, a.type)) throw new MockArtifactInRealRunError([`${a.itemKey}:${a.type}:${a.artifactId}`], run?.id);
+  return true;
+}
+
+/** Guarda R-007 sobre el run + todos sus artifacts resueltos, ANTES de descargar nada (lanza MOCK_ARTIFACT_IN_REAL_RUN). */
 export function assertRunArtifactsPackageable(run: { id?: string; input_payload?: any }, byItem: Map<string, ResolvedItemV3>): void {
   const arts: GuardArtifact[] = allArtifactsV3(byItem).map((a) => ({ id: a.artifactId, type: a.type, metadata: a.metadata, itemKey: a.itemKey }));
   assertNoMockArtifactsForRealPackage(run, arts);
+  // Misma regla con el predicado único (cubre además metadata.mode='mock').
+  const bad = allArtifactsV3(byItem)
+    .filter((a) => isMockSignaled(a) && !runAllowsMockFor(run, a.type))
+    .map((a) => `${a.itemKey}:${a.type}:${a.artifactId}`);
+  if (bad.length) throw new MockArtifactInRealRunError(bad.sort(), run?.id);
 }
 
 export interface V3StaleWarning {
@@ -358,12 +393,23 @@ export function artifactsServiceLoadersV3(
     loadText: async (a) => (await fetchOk(a)).text(),
     loadBytes: async (a) => Buffer.from(await (await fetchOk(a)).arrayBuffer()),
     loadStorageBytes: async (bucket, storagePath) => {
-      if (!storagePath.startsWith(`${ownerId}/`)) {
-        throw new Error(`${PACKAGING_V3}: el archivo ${storagePath} no pertenece al dueño del run; no se descarga`);
-      }
-      return artifacts.downloadStorageObject(bucket, storagePath, artifactDownloadTimeoutMs());
+      const segments = assertOwnerStoragePath(ownerId, storagePath);
+      return artifacts.downloadStorageObject(bucket, segments.join('/'), artifactDownloadTimeoutMs());
     },
   };
+}
+
+/**
+ * Fix round 1 (review G6 I2): el path se valida y normaliza ANTES del chequeo
+ * de dueño (dot-segments, `\\`, `%`-encoding, absolutos, segmentos vacíos →
+ * rechazo) y el primer segmento debe ser EXACTAMENTE el ownerId.
+ */
+export function assertOwnerStoragePath(ownerId: string, storagePath: string): string[] {
+  const segments = assertSafeStoragePath(storagePath);
+  if (!ownerId || segments[0] !== ownerId) {
+    throw new Error(`${PACKAGING_V3}: el archivo ${JSON.stringify(storagePath)} no pertenece al dueño del run; no se descarga`);
+  }
+  return segments;
 }
 
 export interface LoadedContentsV3 {
@@ -394,7 +440,10 @@ function sha256(s: string | Buffer): string {
 async function validatedText(L: ContentLoadersV3, byItem: Map<string, ResolvedItemV3>, key: string, type: string): Promise<string> {
   const a = one(byItem, key, type);
   const text = await L.loadText(a);
-  const expected = byItem.get(key)?.outputSummary?.v3Validation?.contentSha256;
+  const v = byItem.get(key)?.outputSummary?.v3Validation;
+  // El sha registrado corresponde a UN artifact (el validado): solo se compara contra ése.
+  const applies = !!v && (!v.artifactType || v.artifactType === type) && (!v.artifactId || v.artifactId === a.artifactId);
+  const expected = applies ? v.contentSha256 : undefined;
   if (typeof expected === 'string' && expected && sha256(text) !== expected) {
     throw new Error(`${PACKAGING_V3}: el contenido de ${key} (${type}) no es el que validó el servidor (sha256 distinto)`);
   }
@@ -409,9 +458,6 @@ function json(text: string, key: string): any {
   }
 }
 
-function isMockPayload(a: ResolvedArtifactV3, payload: any): boolean {
-  return isMockArtifact(a) || payload?.fixture === true || payload?.mock === true;
-}
 
 export async function loadContentsV3(
   L: ContentLoadersV3,
@@ -429,14 +475,26 @@ export async function loadContentsV3(
   const audio = async (key: string): Promise<Buffer> => {
     const a = one(byItem, key, 'dynamic_audio_mp3');
     const looksJson = (a.mimeType ?? '').includes('json');
-    if (isMockArtifact(a) || looksJson) {
+    if (isMockSignaled(a) || looksJson) {
       const payload = json(await L.loadText(a), key);
-      if (!isMockPayload(a, payload)) throw new Error(`${PACKAGING_V3}: ${key} es JSON pero no es una fixture simulada; se esperaba un MP3`);
+      // Un cuerpo JSON en un artifact de audio SOLO es válido como fixture de un run mock (G6 I1).
+      if (!assertArtifactMockAllowed(run, a, payload)) {
+        throw new Error(`${PACKAGING_V3}: ${key} es JSON pero no es una fixture simulada; se esperaba un MP3`);
+      }
       const secs = Number(payload.durationSeconds);
+      if (!Number.isFinite(secs) || secs <= 0) throw new Error(`${PACKAGING_V3}: fixture ${key} sin durationSeconds válido (G6 M3)`);
       mockProviderItems.push(key);
-      return syntheticMp3(Number.isFinite(secs) && secs > 0 ? secs : 60);
+      return syntheticMp3(secs);
     }
-    return L.loadBytes(a);
+    const bytes = await L.loadBytes(a);
+    // Un MP3 "real" cuyo contenido resulta ser un JSON de fixture también se detecta.
+    if (bytes.length > 0 && bytes[0] === 0x7b) {
+      let payload: any = null;
+      try { payload = JSON.parse(bytes.toString('utf8')); } catch { payload = null; }
+      if (payload) assertArtifactMockAllowed(run, a, payload);
+      throw new Error(`${PACKAGING_V3}: ${key} no es un MP3 (contenido JSON)`);
+    }
+    return bytes;
   };
 
   const courseIntro = json(await validatedText(L, byItem, plan.keys.courseIntro, 'dynamic_course_intro_json'), plan.keys.courseIntro);
@@ -452,23 +510,26 @@ export async function loadContentsV3(
 
   for (const m of plan.modules) {
     moduleIntros.set(m.moduleId, json(await validatedText(L, byItem, m.keys.moduleIntro, 'dynamic_module_intro_json'), m.keys.moduleIntro));
-    if (m.keys.exam) examGift.set(m.moduleId, await L.loadText(one(byItem, m.keys.exam, 'dynamic_exam_gift')));
+    if (m.keys.exam) examGift.set(m.moduleId, await validatedText(L, byItem, m.keys.exam, 'dynamic_exam_gift'));
     for (const ch of m.chapters) {
-      contentMd.set(ch.chapterId, await L.loadText(one(byItem, ch.keys.content, 'dynamic_content_md')));
+      contentMd.set(ch.chapterId, await validatedText(L, byItem, ch.keys.content, 'dynamic_content_md'));
       experiences.set(ch.chapterId, json(await validatedText(L, byItem, ch.keys.experience, 'dynamic_experience_json'), ch.keys.experience));
 
       // Presentación (R9): real = PDF + portada en Storage (sha verificado); simulada = medios sintéticos.
       const pa = one(byItem, ch.keys.presentation, 'dynamic_presentation');
       const pres = json(await L.loadText(pa), ch.keys.presentation);
-      if (isMockPayload(pa, pres)) {
+      if (assertArtifactMockAllowed(run, pa, pres)) {
         const n = Number(pres.slideCount);
-        const pdf = syntheticPdf(Number.isInteger(n) && n >= 1 && n <= 500 ? n : 1);
+        if (!Number.isInteger(n) || n < 1 || n > 500) throw new Error(`${PACKAGING_V3}: fixture ${ch.keys.presentation} sin slideCount válido (G6 M3)`);
+        const pdf = syntheticPdf(n);
         presentations.set(ch.chapterId, { pdf, cover: syntheticCoverPng(MOCK_COVER.w, MOCK_COVER.h, MOCK_COVER.color), mock: true });
         mockProviderItems.push(ch.keys.presentation);
       } else {
         const errs = validatePresentationArtifact(pres);
         if (errs.length) throw new Error(`${PACKAGING_V3}: ${ch.keys.presentation} inválido: ${errs.map((e) => e.code).join(', ')}`);
         if (pres.chapterId !== ch.chapterId) throw new Error(`${PACKAGING_V3}: ${ch.keys.presentation} es de otro capítulo (${pres.chapterId})`);
+        assertSafeStoragePath(pres.pdf.storagePath);
+        assertSafeStoragePath(pres.cover.storagePath);
         const bucket = pa.storageBucket || 'cursia-artifacts';
         const pdf = await L.loadStorageBytes(bucket, pres.pdf.storagePath);
         const cover = await L.loadStorageBytes(bucket, pres.cover.storagePath);
@@ -516,8 +577,8 @@ export async function loadContentsV3(
         } else {
           activities.set(ch.chapterId, {
             variant: 'scorm',
-            html: await L.loadText(one(byItem, ch.keys.activity, 'dynamic_scorm_html')),
-            manifestXml: await L.loadText(one(byItem, ch.keys.activity, 'dynamic_scorm_manifest')),
+            html: await validatedText(L, byItem, ch.keys.activity, 'dynamic_scorm_html'),
+            manifestXml: await validatedText(L, byItem, ch.keys.activity, 'dynamic_scorm_manifest'),
           });
         }
       }
@@ -586,9 +647,16 @@ export async function prepareV3Package(
   const profiles = await loadPackagingProfilesV3(q, courseId, manifest.manifest.features?.finalExam === true);
   // Falla temprano (antes de encolar/descargar) si el perfil vigente no se puede aplicar a ESTE run
   // (p.ej. pesos con examen final y el run no lo tiene: R3 ruling 7; intentos no aplicables: R6).
-  resolveAssessment(profiles.assessment, {
+  const resolved = resolveAssessment(profiles.assessment, {
     hasFinalExam: manifest.manifest.features?.finalExam === true,
     activityEngine: manifest.manifest.features?.activityEngine,
+  });
+  // G6 M5: una categoría ponderada vacía se sabe desde el Manifest → 409 al pedir, no un job fallido.
+  const count = (t: string) => manifest.manifest.items.filter((i) => i.type === t).length;
+  assertCategoriesPopulated(resolved, {
+    practice: count('video') + count('activity'),
+    moduleExams: count('exam'),
+    finalExam: count('final_exam'),
   });
   const sourceArtifactIds = sortedArtifactIdsV3(byItem);
   const sourceIdsHash = packageReuseHashV3({

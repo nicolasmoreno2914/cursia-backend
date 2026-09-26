@@ -264,7 +264,7 @@ export class PackagingService {
         throw new ConflictException({ message, missing: err.missing });
       }
       const msg = err instanceof Error ? err.message : String(err);
-      if ((err as any)?.code === MOCK_ARTIFACT_IN_REAL_RUN || /^(ASSESSMENT_|THEME_INVALID|PROFILE_INVALID)/.test(msg)) {
+      if ((err as any)?.code === MOCK_ARTIFACT_IN_REAL_RUN || /^(ASSESSMENT_|THEME_INVALID|PROFILE_INVALID|STORAGE_PATH_INVALID)/.test(msg)) {
         throw new ConflictException({ message: msg, missing: [], code: (err as any)?.code ?? msg.split(':')[0] });
       }
       throw err;

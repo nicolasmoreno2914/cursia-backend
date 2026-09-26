@@ -116,8 +116,15 @@ import { IdAllocator, buildQuizV3, parseScormManifestIds, scormActivityXmlV3 } f
  * Versión del builder v3. Entra en la clave de reuse v3 (y SOLO en la v3:
  * `DYNAMIC_MBZ_BUILDER_VERSION` de v1/v2 no cambia, así sus paquetes y claves
  * siguen idénticos).
+ *
+ * REGLA (review G6 M9): TODO cambio que altere el `.mbz` para los mismos
+ * insumos — plantillas del shell/capítulo (R11a), tarjeta (R9), intros de
+ * actividad, Libro v3, XML — exige subir esta versión; si no, el reuse sirve
+ * paquetes viejos. Hoy `hours` no se cablea desde el worker (no hay dato de
+ * setup en el backend); el día que se cablee debe entrar en la clave de reuse.
+ * 3.0.1 (fix round 1 G6): Libro sin links inseguros (M2).
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.0.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.0.1';
 /** Versión del renderer de Visual Components que entra en la clave de reuse. */
 export const VC_RENDERER_VERSION = `vc${VC_SCHEMA_VERSION}-rt${VC_RUNTIME_VERSION}-theme${THEME_ENGINE_VERSION}`;
 

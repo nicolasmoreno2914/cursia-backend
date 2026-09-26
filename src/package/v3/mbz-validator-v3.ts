@@ -29,7 +29,15 @@ import { extractText, lintCleanSafe, lintResourceMentions, parseHtml } from '../
 import type { HtmlNode } from '../../modules/visual-components';
 import { CourseFacts, lintShellNumbers } from '../../modules/course-shell';
 import { formatDurationEs, mp3DurationSeconds } from '../audio';
-import { CURSIA_H5P_PROFILE_V1 } from '../h5p';
+import { CURSIA_H5P_PROFILE_V1, H5P_MOODLE_GRADING } from '../h5p';
+import { activityTypeForChapter } from '../../modules/course-shell/activity-type';
+
+const ACTIVITY_MAIN_LIBRARY: Record<string, string> = {
+  questionset: 'H5P.QuestionSet',
+  dragtext: 'H5P.DragText',
+  blanks: 'H5P.Blanks',
+  singlechoiceset: 'H5P.SingleChoiceSet',
+};
 
 export interface MbzV3Issue {
   code: string;
@@ -60,6 +68,10 @@ interface ParsedActivity {
   module: Record<string, string>;
   grade: Record<string, string> | null;
   inforefFiles: number[];
+  inforefGradeItems: number[];
+  gradeItemId: number | null;
+  moduleXmlId: number;
+  actXmlModuleId: number;
 }
 
 interface ParsedFile {
@@ -207,9 +219,27 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       module,
       grade,
       inforefFiles: Array.from(fileref.matchAll(/<id>(\d+)<\/id>/g), (m) => Number(m[1])),
+      inforefGradeItems: Array.from((tag(inf, 'grade_itemref') ?? '').matchAll(/<id>(\d+)<\/id>/g), (m) => Number(m[1])),
+      gradeItemId: gi ? num(/<grade_item id="(\d+)"/.exec(gi)?.[1]) : null,
+      moduleXmlId: num(/<module id="(\d+)"/.exec(moduleXml)?.[1]),
+      actXmlModuleId: num(/moduleid="(\d+)"/.exec(actXml)?.[1]),
     });
   }
   const byMid = new Map(acts.map((a) => [a.mid, a]));
+  // G6 M6: unicidad de ids y coherencia moduleid ↔ module.xml ↔ <activity>, grade_itemref ↔ grades.xml, tuplas de archivos.
+  const dup = <T,>(xs: T[]) => [...new Set(xs.filter((x, i) => xs.indexOf(x) !== i))];
+  for (const d of dup(acts.map((a) => a.mid))) add('STRUCTURE', 'moodle_backup.xml', `moduleid repetido ${d}`);
+  for (const d of dup(acts.map((a) => a.ctx))) add('STRUCTURE', 'activities', `contextid repetido ${d}`);
+  for (const d of dup(files.map((f) => f.id))) add('FILES_INTEGRITY', 'files.xml', `file id repetido ${d}`);
+  for (const d of dup(files.filter((f) => f.filename !== '.').map((f) => `${f.ctx}|${f.component}|${f.filearea}|${f.filename}`))) {
+    add('FILES_INTEGRITY', 'files.xml', `archivo repetido (ctx|component|filearea|filename) ${d}`);
+  }
+  for (const a of acts) {
+    if (a.moduleXmlId !== a.mid || a.actXmlModuleId !== a.mid) add('STRUCTURE', a.dir, `moduleid incoherente (backup ${a.mid}, module.xml ${a.moduleXmlId}, ${a.modname}.xml ${a.actXmlModuleId})`);
+    const want = a.gradeItemId !== null ? [a.gradeItemId] : [];
+    if (JSON.stringify(a.inforefGradeItems) !== JSON.stringify(want)) add('STRUCTURE', a.dir, `grade_itemref ${a.inforefGradeItems.join(',')} ≠ grades.xml ${want.join(',')}`);
+  }
+  for (const d of dup(acts.filter((a) => a.gradeItemId !== null).map((a) => a.gradeItemId))) add('STRUCTURE', 'grades', `grade_item id repetido ${d}`);
   const seenId = new Set<string>();
   for (const a of acts) {
     if (!/^cv3:/.test(a.idnumber)) add('STRUCTURE', a.dir, `idnumber sin prefijo cv3: (${a.idnumber})`);
@@ -399,6 +429,16 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       if (extra.length) add('H5P_LIBRARIES', a.idnumber, `el paquete no es content-only: ${extra.slice(0, 3).join(', ')}`);
       const hj = JSON.parse(await hz.file('h5p.json')!.async('string'));
       if (!mainKeys.has(hj.mainLibrary)) add('H5P_LIBRARIES', a.idnumber, `librería principal fuera del perfil: ${hj.mainLibrary}`);
+      // G6 M7: la librería principal debe corresponder al rol (video → IV; actividad → tipo R-012 del UUID, calificable en Moodle).
+      const role = /^cv3:ch:([^:]+):(video|activity)$/.exec(a.idnumber);
+      if (role && role[2] === 'video' && hj.mainLibrary !== 'H5P.InteractiveVideo') {
+        add('H5P_LIBRARIES', a.idnumber, `un video debe ser H5P.InteractiveVideo (vino ${hj.mainLibrary})`);
+      }
+      if (role && role[2] === 'activity') {
+        const want = ACTIVITY_MAIN_LIBRARY[activityTypeForChapter(role[1])];
+        if (!H5P_MOODLE_GRADING[hj.mainLibrary]?.gradable) add('H5P_LIBRARIES', a.idnumber, `${hj.mainLibrary} no es calificable en Moodle (R-011)`);
+        if (hj.mainLibrary !== want) add('H5P_LIBRARIES', a.idnumber, `la actividad del capítulo debe ser ${want} (R-012), vino ${hj.mainLibrary}`);
+      }
       for (const d of hj.preloadedDependencies ?? []) {
         const k = `${d.machineName} ${d.majorVersion}.${d.minorVersion}`;
         if (!profileKeys.has(k)) add('H5P_LIBRARIES', a.idnumber, `dependencia fuera del perfil: ${k}`);
@@ -421,7 +461,13 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       add('AUDIO_DURATION', idnumber, 'el label no lleva su MP3 en el filearea intro');
       return;
     }
-    const measured = mp3DurationSeconds(blob);
+    let measured: number;
+    try {
+      measured = mp3DurationSeconds(blob);
+    } catch (err) {
+      add('AUDIO_DURATION', idnumber, `el MP3 del paquete no se puede medir: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
     if (Math.abs(measured - expectSeconds) > 1e-6) add('AUDIO_DURATION', idnumber, `facts dice ${expectSeconds}s, el MP3 del paquete mide ${measured}s`);
     const txt = extractText(a.intro);
     for (const s of [formatDurationEs(measured), ...extra(txt)]) if (!txt.includes(s)) add('AUDIO_DURATION', idnumber, `no muestra la duración medida "${s}"`);
