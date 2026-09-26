@@ -433,7 +433,8 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       'ensure_env_flag_true DYNAMIC_COURSE_STRUCTURE',
     ]) assert(block.includes(needle), `falta: ${needle}`);
     assert(!/(ensure_\w+|printf[^\n]*>>\s*\.env)[^\n]*DYNAMIC_COHERENCE_LLM/.test(block), 'DYNAMIC_COHERENCE_LLM no debe escribirse');
-    assert(!/(ensure_\w+|printf[^\n]*>>\s*\.env)[^\n]*DYNAMIC_PROVIDER_WORKER_ENABLED/.test(block), 'DYNAMIC_PROVIDER_WORKER_ENABLED no debe tocarse (proveedores reales apagados)');
+    assert(!/DYNAMIC_PROVIDER_WORKER_ENABLED\s+true/.test(block), 'DYNAMIC_PROVIDER_WORKER_ENABLED nunca se enciende desde el deploy');
+    assert(block.includes('ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED false'), 'el deploy lo deja explícitamente en false');
     const SECRET = 'valor-secreto-no-imprimir-123';
     const scenarios = [
       { label: '.env mínimo', env: `NODE_ENV=production\nSUPABASE_SERVICE_KEY=${SECRET}\n` },
@@ -476,6 +477,53 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       } finally {
         fs.rmSync(dir, { recursive: true, force: true });
       }
+    }
+  });
+
+  // V2.1: FinOps + proveedores — token por stdin (nunca impreso), inventario de producción SOLO lectura
+  // y reutilización de claves en staging SOLO si faltan (nunca pisa), sin imprimir secretos.
+  await check('(a) deploy-staging.yml [0c]: FinOps token por stdin, producción solo lectura, reutiliza solo lo que falta, sin imprimir secretos', () => {
+    const script = remoteScriptOf(pm2StepOf(stagingText, 'deploy-staging.yml').text);
+    const lines = script.split('\n');
+    const fnStart = lines.findIndex((l) => l.startsWith('_Q_CR='));
+    const fnEnd = lines.findIndex((l) => l.startsWith('ensure_pm2_process() {'));
+    const flagsStart = lines.findIndex((l) => l.startsWith('echo "━━━ [0b]'));
+    const flagsEnd = lines.findIndex((l) => l.startsWith('echo "━━━ [1/6]'));
+    const block = [...lines.slice(fnStart, fnEnd), ...lines.slice(flagsStart, flagsEnd)].join('\n');
+    assert(/IFS= read -r _FIT/.test(script), 'el token se lee de stdin');
+    assert(/printf "%s\\n" "\$FINOPS_INGEST_TOKEN_STAGING" \| ssh/.test(stagingText), 'el token viaja por stdin del ssh');
+    const S = { OPENAI: 'sk-prod-openai-SECRET-1111', ANTH: 'sk-ant-prod-SECRET-2222', GAMMA: 'sk-gamma-prod-SECRET-3333', VG_STAGING: 'vg-staging-SECRET-4444', VG_PROD: 'vg-prod-SECRET-5555', TOKEN: 'finops-token-SECRET-6666', DB: 'db-pass-SECRET-7777' };
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v21-provcfg-'));
+    try {
+      const prodEnv = path.join(dir, 'prod.env');
+      fs.writeFileSync(prodEnv, `DB_PASS=${S.DB}\nOPENAI_API_KEY=${S.OPENAI}\nOPENAI_TTS_MODEL=gpt-4o-mini-tts\nANTHROPIC_API_KEY=${S.ANTH}\nVIDEOGEN_API_KEY=${S.VG_PROD}\nGAMMA_API_KEY=${S.GAMMA}\nGAMMA_THEME_MEDIANOCHE=theme-medianoche-id\n`);
+      const stg = path.join(dir, 'stg');
+      fs.mkdirSync(stg);
+      fs.writeFileSync(path.join(stg, '.env'), `NODE_ENV=production\nVIDEOGEN_API_KEY=${S.VG_STAGING}\nDYNAMIC_PROVIDER_WORKER_ENABLED=true\n`);
+      const run = (fit) => spawnSync('bash', ['-c', `set -e\nPROD_ENV_FILE=${prodEnv}\n_FIT=${fit}\n${block}`], { cwd: stg, encoding: 'utf8' });
+      const r1 = run(S.TOKEN);
+      assert(r1.status === 0, `bloque falló: ${r1.stderr}`);
+      const out = r1.stdout + r1.stderr;
+      for (const v of Object.values(S)) assert(!out.includes(v), `imprimió un secreto: ${v}`);
+      assert(!/=/.test(out.replace(/^.*━━━.*$/gm, '')), `imprimió un KEY=VALUE:\n${out}`);
+      const kv = Object.fromEntries(fs.readFileSync(path.join(stg, '.env'), 'utf8').split('\n').filter((l) => /^[A-Z0-9_]+=/.test(l)).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
+      eq(kv.FINOPS_INGEST_TOKEN, S.TOKEN, 'token escrito');
+      eq(kv.DYNAMIC_PROVIDER_WORKER_ENABLED, 'false', 'worker de proveedores apagado');
+      eq([kv.OPENAI_API_KEY, kv.ANTHROPIC_API_KEY, kv.GAMMA_API_KEY, kv.OPENAI_TTS_MODEL], [S.OPENAI, S.ANTH, S.GAMMA, 'gpt-4o-mini-tts'], 'copiadas de producción');
+      eq(kv.VIDEOGEN_API_KEY, S.VG_STAGING, 'la de staging NO se pisa');
+      eq(kv.GAMMA_THEME_V21_DARK_DEFAULT, 'theme-medianoche-id', 'default oscuro desde medianoche');
+      assert(!('DB_PASS' in kv), 'no copia claves fuera de la lista');
+      assert(/producción OPENAI_API_KEY: PRESENT …1111/.test(out) && /producción VIDEOGEN_API_URL: ABSENT/.test(out), `inventario:\n${out}`);
+      eq(fs.readFileSync(prodEnv, 'utf8').includes('FINOPS'), false, 'producción intacta');
+      const before = fs.readFileSync(path.join(stg, '.env'), 'utf8');
+      const r2 = run(S.TOKEN);
+      assert(r2.status === 0, r2.stderr);
+      eq(fs.readFileSync(path.join(stg, '.env'), 'utf8'), before, 'idempotente');
+      const r3 = run('');
+      assert(r3.status === 0 && /FINOPS_INGEST_TOKEN: sin valor/.test(r3.stdout), 'sin secret de GitHub: no toca el token');
+      eq(fs.readFileSync(path.join(stg, '.env'), 'utf8'), before, 'sin secret: .env igual');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
