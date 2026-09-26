@@ -8,8 +8,8 @@
     "sha": "d562b1581a914bf6a25f56a142b8cef1fa35877b"
   },
   "source": {
-    "ref": "autonomous/cursia-v2-integration (auditado, fijado)",
-    "sha": "8a5cf49ca881413a5ef62f5709722e8bad382300"
+    "ref": "origin/staging tras cursia-backend#16 (V2 + aceptación de staging; auditado, fijado)",
+    "sha": "f0da7f6201d8193c698760b165489b3b961c1067"
   },
   "categories": {
     "V2": "Código V2 auditado (módulos, builders, workers, entidades), byte-idéntico al source.",
@@ -31,9 +31,7 @@
   "mustBeAbsent": [
     "src/modules/course-setup/"
   ],
-  "mustEqualBase": [
-    ".github/workflows/deploy.yml"
-  ],
+  "mustEqualBase": [],
   "anthropicDistBaseline": [
     "dist/modules/brand-profiles/brand-extraction.service.js"
   ],
@@ -220,9 +218,17 @@
     }
   },
   "paths": {
+    ".github/CODEOWNERS": {
+      "category": "READINESS",
+      "blob": "4f5da72005cebd940a46b63bfd355697fdb3a6d4"
+    },
     ".github/workflows/deploy-staging.yml": {
       "category": "READINESS",
-      "blob": "aaae37429cc65038a0827d8b94ea1f5b04c61567"
+      "blob": "dd24308aebe53a90d4925923c0b720d54539c67c"
+    },
+    ".github/workflows/deploy.yml": {
+      "category": "READINESS",
+      "blob": "cb97aa44fee369b219d2fe0166b85d5467d677a1"
     },
     ".github/workflows/v2-production-migrations.yml": {
       "category": "READINESS",
@@ -232,17 +238,25 @@
       "category": "READINESS",
       "blob": "7b785dc183ad3b0effdbe4beff5ac1f3dec18421"
     },
+    "docs/memory/00_estado_actual.md": {
+      "category": "DOCS",
+      "blob": "59db037f8106e1ec3c4a9e33254c33b5181bc042"
+    },
+    "docs/memory/12_pendientes_riesgos.md": {
+      "category": "DOCS",
+      "blob": "2644b557de112732694197bf03534278fdeae845"
+    },
     "docs/superpowers/plans/2026-09-23-dynamic-course-structure-fase0-fase1.md": {
       "category": "DOCS",
       "blob": "f98919af11efe2362f8f672468c180e660a88fdb"
     },
     "docs/superpowers/specs/2026-09-23-dynamic-course-structure-design.md": {
       "category": "DOCS",
-      "blob": "cea9cd7f080471bab1a18158df8875294c4a2735"
+      "blob": "5351427be2ff677192d05643009591d790743c6d"
     },
     "docs/v2-production-migrations.md": {
       "category": "RELEASE-DOC",
-      "blob": "6dfe2be5595efbc0e16645c9478a277449d782db"
+      "blob": "847c9290ff7384c66a789cb5f3321c76bed1c2d5"
     },
     "package.json": {
       "category": "V2",
@@ -263,6 +277,10 @@
     "scripts/check-coherence-engine.js": {
       "category": "READINESS",
       "blob": "08205cbd30dad26d0016a90e80d42a7206e93adc"
+    },
+    "scripts/check-deploy-dynamic-workers.js": {
+      "category": "TEST",
+      "blob": "be75360160c080b5c034ec0e83a0556b3d8e3299"
     },
     "scripts/check-dynamic-package-worker-hardening.js": {
       "category": "READINESS",
@@ -295,6 +313,10 @@
     "scripts/check-packaging-plan-determinism.js": {
       "category": "READINESS",
       "blob": "e9fa4c7413bc54546e3f8683ae6ac8d908640c3c"
+    },
+    "scripts/check-v2-acceptance-guards.js": {
+      "category": "TEST",
+      "blob": "fbd4c9f3423db2a17375bef0c146ca80c9f5f5e5"
     },
     "scripts/check-v2-release-fix.js": {
       "category": "READINESS",
@@ -634,7 +656,7 @@
     },
     "src/modules/dynamic-packaging/artifact-resolver.ts": {
       "category": "V2",
-      "blob": "16e835ce15d245767654a2957afebafacac3401a"
+      "blob": "bfd96844e7f3a18081acb75a4dc5b5a0f4808ebe"
     },
     "src/modules/dynamic-packaging/dynamic-packaging.module.ts": {
       "category": "V2",
@@ -662,7 +684,7 @@
     },
     "src/modules/dynamic-packaging/packaging.service.ts": {
       "category": "V2",
-      "blob": "769af28485c6c5a062d048f827b211b70000bbff"
+      "blob": "3546fd28d8b4e15a71e6a4bd2b233199f606171e"
     },
     "src/modules/features/dynamic-feature.guard.ts": {
       "category": "V2",
@@ -740,6 +762,14 @@
       "category": "V2",
       "blob": "b0a6bad33d5d73c48434142315dcb9f88f9a395c"
     },
+    "src/modules/production-jobs/legacy-audio-guard.ts": {
+      "category": "V2",
+      "blob": "bb81f36a9290f73654909635191ad17b759d1dfb"
+    },
+    "src/modules/production-jobs/production-jobs.service.ts": {
+      "category": "V2",
+      "blob": "81a6631edfe5dd126caf168ab879a5a831367ec6"
+    },
     "src/package/dynamic-mbz-builder.ts": {
       "category": "V2",
       "blob": "f6e35e0edfe02b53444f2043d5f416740d6022ed"
@@ -748,17 +778,29 @@
       "category": "V2",
       "blob": "6ea7ebc7ae492404bbf5b9a9ebae87cdc6d29456"
     },
+    "src/tts/dto/tts-speech.dto.ts": {
+      "category": "V2",
+      "blob": "9053b67c9eebc04403178ee034a78a502dd9f62a"
+    },
+    "src/tts/tts.controller.ts": {
+      "category": "V2",
+      "blob": "742f41ced9836bfe4fa71677c91273eeab41cb74"
+    },
+    "src/workers/audio-worker.ts": {
+      "category": "V2",
+      "blob": "3a078b73aa9791d6d3da8a8bcced7691c91c7f9f"
+    },
     "src/workers/dynamic-item-worker.ts": {
       "category": "V2",
-      "blob": "f4a2345d005da9f6e47616642366b5d9c111713b"
+      "blob": "f1a546d7025e9c779ba78f8385258f48bb3bb9ae"
     },
     "src/workers/dynamic-package-worker.ts": {
       "category": "V2",
-      "blob": "0f6bce629067dcf2b10660a3a9a646dd83cebd36"
+      "blob": "53b89aca009cb9539581663fd1941fefd8073710"
     },
     "src/workers/dynamic-worker-gate.ts": {
       "category": "V2",
-      "blob": "3ccced84cdf41835703b29a76943a42e94fa48ec"
+      "blob": "d4e963a97769cf2130899916a852835949e48d97"
     },
     "src/youtube/youtube-upload.service.ts": {
       "category": "V2-DEP",
