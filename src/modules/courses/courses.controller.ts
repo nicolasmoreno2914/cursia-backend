@@ -30,16 +30,18 @@ export class CoursesController {
   // POST /api/v1/courses/dynamic
   @Post('dynamic')
   @HttpCode(HttpStatus.CREATED)
-  createOrGetDynamic(
+  async createOrGetDynamic(
     @Body() dto: CreateDynamicCourseDto,
     @CurrentUser() user: AuthUser,
   ) {
-    return this.coursesService.findOrCreateDynamic(
+    // Aditivo: el curso de siempre + `created` (true solo si esta llamada lo creó).
+    const { course, created } = await this.coursesService.findOrCreateDynamicWithStatus(
       user.id,
       user.email,
       dto.frontendCourseId,
       dto.title,
     );
+    return { ...course, created };
   }
 
   // POST /api/v1/courses

@@ -56,6 +56,20 @@ export class CoursesService {
     frontendCourseId: string,
     title?: string,
   ): Promise<Course> {
+    return (await this.findOrCreateDynamicWithStatus(ownerId, ownerEmail, frontendCourseId, title)).course;
+  }
+
+  /**
+   * Aceptación rv3 (staging): igual que findOrCreateDynamic pero informa si el
+   * curso se CREÓ en esta llamada. El cliente lo usa para no atribuirle la
+   * paleta global a un curso que ya existía (idempotencia del POST).
+   */
+  async findOrCreateDynamicWithStatus(
+    ownerId: string,
+    ownerEmail: string,
+    frontendCourseId: string,
+    title?: string,
+  ): Promise<{ course: Course; created: boolean }> {
     // G3: flag V2 + allow-list por owner (403 antes de tocar la DB).
     assertDynamicOwnerAllowed(ownerId);
     const existing = await this.courseRepo
@@ -65,7 +79,7 @@ export class CoursesService {
       .andWhere('course.structure_version = :sv', { sv: 'dynamic' })
       .orderBy('course.id', 'ASC')
       .getOne();
-    if (existing) return existing;
+    if (existing) return { course: existing, created: false };
 
     const course = this.courseRepo.create({
       title: title || 'Curso sin título',
@@ -75,7 +89,7 @@ export class CoursesService {
       status: 'draft',
       metadata: { courseId: frontendCourseId },
     });
-    return this.courseRepo.save(course);
+    return { course: await this.courseRepo.save(course), created: true };
   }
 
   // ── FIND ALL ──────────────────────────────────────────────────────────────
