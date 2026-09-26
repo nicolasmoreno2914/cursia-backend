@@ -2,10 +2,15 @@
  * R11a — tipo H5P de la actividad de un capítulo (variant h5p) y validación
  * del payload `activity` que produce el LLM.
  *
- * El tipo NO lo elige el LLM ni el navegador: es una rotación determinística
- * por número GLOBAL de capítulo (1-based, numeración del Manifest). El
- * frontend la replica (`dynActivityTypeForChapter`) y el backend la impone al
- * completar el item (un payload de otro tipo se rechaza).
+ * El tipo NO lo elige el LLM ni el navegador. Ruling del controlador (fix
+ * round 1, review G5 I6): se deriva del UUID del capítulo — nunca de su
+ * número — para que un reordenamiento (que R5 trata como REUSE) jamás cambie
+ * el tipo de una actividad ya generada:
+ *   type = ACTIVITY_H5P_ROTATION[fnv1a32(utf8(chapterId.toLowerCase())) % 3]
+ * FNV-1a 32 bits estándar (offset 2166136261, primo 16777619, sin signo).
+ * El frontend la replica (`dynActivityTypeForChapter`) contra los mismos
+ * vectores (`scripts/fixtures/v21-activity-type-vectors.json`) y el backend la
+ * impone al completar el item (un payload de otro tipo se rechaza).
  *
  * R-011: 'singlechoiceset' es un tipo de dato válido pero NO forma parte de
  * la rotación de actividades calificadas (Moodle core no lo califica) — ver
@@ -60,12 +65,22 @@ export const ACTIVITY_H5P_ROTATION: readonly H5pActivityType[] = Object.freeze([
   'blanks',
 ]);
 
-/** Tipo H5P del capítulo N (1-based, numeración global del Manifest). */
-export function activityTypeForChapter(chapterNumber: number): H5pActivityType {
-  if (!Number.isInteger(chapterNumber) || chapterNumber < 1) {
-    throw new Error(`ACTIVITY_TYPE_INVALID_CHAPTER: chapterNumber debe ser un entero ≥ 1 (recibido ${String(chapterNumber)})`);
+/** FNV-1a de 32 bits (estándar) sobre los bytes UTF-8 de `s`; entero sin signo. */
+export function fnv1a32(s: string): number {
+  let h = 2166136261;
+  for (const b of Buffer.from(s, 'utf8')) {
+    h ^= b;
+    h = Math.imul(h, 16777619) >>> 0;
   }
-  return ACTIVITY_H5P_ROTATION[(chapterNumber - 1) % ACTIVITY_H5P_ROTATION.length];
+  return h >>> 0;
+}
+
+/** Tipo H5P calificado del capítulo, derivado de su UUID (estable ante reordenamientos). */
+export function activityTypeForChapter(chapterId: string): H5pActivityType {
+  if (typeof chapterId !== 'string' || !chapterId.trim()) {
+    throw new Error(`ACTIVITY_TYPE_INVALID_CHAPTER: chapterId debe ser un texto no vacío (recibido ${JSON.stringify(chapterId)})`);
+  }
+  return ACTIVITY_H5P_ROTATION[fnv1a32(chapterId.toLowerCase()) % ACTIVITY_H5P_ROTATION.length];
 }
 
 /** Campos de `data` que escribe el LLM por tipo (además, Cursia agrega itemKey y, en QS/SCS, passPercentage). */
@@ -101,10 +116,10 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
  */
 export function validateH5pActivityPayload(
   payload: unknown,
-  expect: { chapterNumber: number; itemKey: string },
+  expect: { chapterId: string; itemKey: string },
 ): H5pActivityPayloadResult {
   const errors: ShellValidationError[] = [];
-  const expectedType = activityTypeForChapter(expect.chapterNumber);
+  const expectedType = activityTypeForChapter(expect.chapterId);
   if (!isPlainObject(payload)) {
     return { ok: false, errors: [{ path: '$', code: 'NOT_OBJECT', message: 'el payload debe ser un objeto {type, data}' }] };
   }
@@ -131,7 +146,7 @@ export function validateH5pActivityPayload(
     errors.push({
       path: '$.type',
       code: 'ACTIVITY_TYPE_MISMATCH',
-      message: `el capítulo ${expect.chapterNumber} exige "${expectedType}" (rotación), llegó "${type}"`,
+      message: `el capítulo ${expect.chapterId} exige "${expectedType}" (rotación), llegó "${type}"`,
     });
     return { ok: false, errors };
   }

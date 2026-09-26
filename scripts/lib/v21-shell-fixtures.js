@@ -30,7 +30,7 @@ const MODULE_TITLES = ['Bases del servicio', 'Relación con el cliente', 'Gesti�
  * Curso: `modules` = [{ examEnabled, chapters: [{ video, activity }] }].
  * Devuelve { snapshot, manifest, source, ids }.
  */
-function buildCourse(distRoot, { courseId = 501, title = 'Atención al cliente de excelencia', finalExam = true, engine = 'h5p', modules }) {
+function buildCourse(distRoot, { courseId = 501, title = 'Atención al cliente de excelencia', finalExam = true, engine = 'h5p', modules, chapterTitles = CHAPTER_TITLES, moduleTitles = MODULE_TITLES }) {
   const snap = loadDist(distRoot, 'modules/course-blueprints/blueprint-snapshot.js');
   const B = loadDist(distRoot, 'modules/generation-manifests/generation-manifest-builder.js');
   const mrows = [];
@@ -38,14 +38,14 @@ function buildCourse(distRoot, { courseId = 501, title = 'Atención al cliente d
   let ci = 0;
   modules.forEach((m, mi) => {
     const mid = uuid('a', courseId * 10 + mi + 1);
-    mrows.push({ id: mid, position: mi, title: MODULE_TITLES[mi % MODULE_TITLES.length], objective: null, exam_enabled: !!m.examEnabled });
+    mrows.push({ id: mid, position: mi, title: moduleTitles[mi % moduleTitles.length], objective: null, exam_enabled: !!m.examEnabled });
     m.chapters.forEach((c, k) => {
       ci += 1;
       crows.push({
         id: uuid('c', courseId * 100 + ci),
         module_id: mid,
         position: k,
-        title: CHAPTER_TITLES[(ci - 1) % CHAPTER_TITLES.length],
+        title: chapterTitles[(ci - 1) % chapterTitles.length],
         objective: null,
         video_enabled: !!c.video,
         activity_enabled: !!c.activity,

@@ -2,7 +2,7 @@
  * R9 — contrato del artifact `presentation:<chapterUUID>` (Gamma V2).
  * Ver r9-core-gamma.md §1. `schemaVersion` fijo en 1 para esta primera versión.
  */
-import type { ThemeFamilyId } from '../../modules/theme-engine';
+import type { ThemeFamilyId, ThemeMode } from '../../modules/theme-engine';
 
 export const PRESENTATION_ARTIFACT_SCHEMA_VERSION = 1;
 
@@ -26,7 +26,11 @@ export interface PresentationArtifact {
   cover: PresentationCoverRef;
   slideCount: number;
   themeFamilyAtGeneration: ThemeFamilyId;
+  /** Aditivo (fix round 1, I5): modo del tema con que se generó; opcional en artifacts previos. */
+  themeModeAtGeneration?: ThemeMode;
   gammaThemeId: string;
+  /** R-007 / M13: true si y solo si es un fixture (gammaGenerationId null). El empaque rechaza mocks en runs reales. */
+  mock?: true;
   /** ISO 8601. */
   generatedAt: string;
 }
@@ -99,6 +103,17 @@ export function validatePresentationArtifact(a: unknown): PresentationValidation
   }
   if (!isNonEmptyString(artifact.themeFamilyAtGeneration)) {
     push('THEME_FAMILY', 'falta themeFamilyAtGeneration');
+  }
+  if (artifact.themeModeAtGeneration !== undefined && artifact.themeModeAtGeneration !== 'light' && artifact.themeModeAtGeneration !== 'dark') {
+    push('THEME_MODE', 'themeModeAtGeneration debe ser "light" o "dark"');
+  }
+  // M13: un artifact sin generación de Gamma es un mock y debe declararlo (y viceversa).
+  const isMock = (artifact as { mock?: unknown }).mock === true;
+  if (artifact.gammaGenerationId === null && !isMock) {
+    push('MOCK_UNDECLARED', 'gammaGenerationId null exige mock: true (un fixture nunca se presenta como real)');
+  }
+  if (isMock && artifact.gammaGenerationId !== null) {
+    push('MOCK_WITH_GENERATION', 'mock: true exige gammaGenerationId null');
   }
   if (!isNonEmptyString(artifact.gammaThemeId)) {
     push('GAMMA_THEME_ID', 'falta gammaThemeId');

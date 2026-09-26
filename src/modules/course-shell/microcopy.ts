@@ -49,11 +49,18 @@ export function continueWith(next: { number: number; title: string }): string {
 /** Puente determinístico al final del capítulo (§F.3: con actividad OFF habla de "repasar"). */
 export function bridgeText(opts: {
   activityEnabled: boolean;
+  /** Intentos de la actividad (facts.assessment.kinds.activity.attempts; 0 = ilimitados). Fix round 1 (M4). */
+  activityAttempts?: number;
   next?: { number: number; title: string } | null;
 }): string {
-  const lead = opts.activityEnabled
-    ? 'Si todavía no alcanzaste la nota mínima en la práctica, vuelve a intentarlo.'
-    : 'Repasa las ideas clave de este capítulo antes de avanzar.';
+  const attempts = opts.activityAttempts ?? 0;
+  const lead = !opts.activityEnabled
+    ? 'Repasa las ideas clave de este capítulo antes de avanzar.'
+    : attempts === 0
+      ? 'Si todavía no alcanzaste la nota mínima en la práctica, vuelve a intentarlo.'
+      : attempts === 1
+        ? 'Revisa tu resultado en la práctica y repasa lo que necesites.'
+        : 'Si todavía no alcanzaste la nota mínima en la práctica y te quedan intentos, vuelve a intentarlo.';
   const tail = opts.next ? continueWith(opts.next) : COPY.lastChapterOfCourse;
   return `${lead} ${tail}`;
 }

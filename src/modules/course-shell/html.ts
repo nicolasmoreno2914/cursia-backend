@@ -12,7 +12,8 @@
  * completo + `**énfasis**` + guiones suaves). Determinista.
  */
 import { contrastRatio, ResolvedTheme } from '../theme-engine';
-import { escapeHtml, inlineHtml, multilineInlineHtml, splitParagraphs } from '../visual-components/text';
+import { HtmlNode, parseHtml } from '../visual-components/lint-output';
+import { HYPHEN_HEADING, inlineHtml, labelHtml, richParagraphs } from '../visual-components/text';
 
 export type ShellLevel = 'enhanced';
 
@@ -112,14 +113,14 @@ export function heading(h: Hx, tag: 'h2' | 'h3' | 'h4', text: string, s: Surf): 
       ],
       [['font-size', fl]],
     ) +
-    `>${inlineHtml(text)}</${tag}>`
+    `>${inlineHtml(text, HYPHEN_HEADING)}</${tag}>`
   );
 }
 
 /** Párrafos de texto plano (línea en blanco = párrafo). */
 export function paras(h: Hx, text: string, s: Surf, opts: { secondary?: boolean; weight?: number; last?: boolean } = {}): string {
   const ty = h.t.typography;
-  const ps = splitParagraphs(text);
+  const ps = richParagraphs(text);
   return ps
     .map((p, i) => {
       const safe: Decl[] = [
@@ -131,7 +132,7 @@ export function paras(h: Hx, text: string, s: Surf, opts: { secondary?: boolean;
         ['max-width', `${ty.measureCh}ch`],
       ];
       if (opts.weight) safe.push(['font-weight', String(opts.weight)]);
-      return `<p${st(h, safe, [['font-size', ty.enhanced.sizeBodyFluid]])}>${multilineInlineHtml(p)}</p>`;
+      return `<p${st(h, safe, [['font-size', ty.enhanced.sizeBodyFluid]])}>${p}</p>`;
     })
     .join('');
 }
@@ -220,7 +221,7 @@ export function audio(h: Hx, src: string, label: string, s: Surf): string {
   return (
     `<p${st(h, [['margin', '0 0 12px 0'], ['padding', 0], ['color', s.fg]])}>` +
     `<audio controls preload="none" src="${attr(src)}"${st(h, [['width', '100%'], ['max-width', '100%']])}>` +
-    `Tu navegador no puede reproducir este audio: usa el enlace de descarga.</audio></p>` +
+    `${labelHtml('Tu navegador no puede reproducir este audio: usa el enlace de descarga.')}</audio></p>` +
     pHtml(h, link(h, src, `Descargar ${label} (MP3)`, s), s, { secondary: true })
   );
 }
@@ -244,8 +245,8 @@ export function statRow(h: Hx, stats: Array<{ value: number; label: string }>): 
           ],
           [['border-radius', h.t.shape.radiusMd], ['flex', '1 1 9rem'], ['min-width', '0']],
         ) +
-        `><strong${st(h, [['color', cs.s.fg], ['font-size', ty.sizeH2Px], ['font-weight', '700'], ['line-height', '1.2']])}>${x.value}</strong> ` +
-        `<span${st(h, [['color', cs.s.fg], ['font-size', ty.sizeBodyPx]])}>${escapeHtml(x.label)}</span></li>`,
+        `><strong${st(h, [['color', cs.s.fg], ['font-size', ty.sizeH2Px], ['font-weight', '700'], ['line-height', '1.2']])}>${labelHtml(String(x.value))}</strong>` +
+        `<span${st(h, [['color', cs.s.fg], ['font-size', ty.sizeBodyPx]])}>${labelHtml(` ${x.label}`)}</span></li>`,
     )
     .join('');
   return (
@@ -282,4 +283,26 @@ export function injectIntoMovement(movementHtml: string, before: string, after: 
   const scriptAt = movementHtml.lastIndexOf('<script>');
   const tail = scriptAt > head ? scriptAt : movementHtml.length - '</div>'.length;
   return movementHtml.slice(0, head) + before + movementHtml.slice(head, tail) + after + movementHtml.slice(tail);
+}
+
+/**
+ * Textos visibles que NO están dentro de `<span class="nolink">` (los filtros
+ * de Moodle —activitynames, glossary, emoticon, urltolink— los reescribirían;
+ * ledger R-005). Vacío = todo protegido.
+ */
+export function unprotectedText(html: string): string[] {
+  const out: string[] = [];
+  const walk = (n: HtmlNode, protectedRun: boolean) => {
+    if (n.kind === 'text') {
+      const t = n.text.replace(/[\u00AD\u200B]/g, '').trim();
+      // Solo texto con letras o dígitos: los glifos decorativos de R2 (✓, ☐) no los reescribe ningún filtro.
+      if (t && /[\p{L}\p{N}]/u.test(t) && !protectedRun) out.push(t);
+      return;
+    }
+    if (n.tag === 'style' || n.tag === 'script') return;
+    const isNolink = n.tag === 'span' && (n.attrs.class || '').split(/\s+/).includes('nolink');
+    n.children.forEach((c) => walk(c, protectedRun || isNolink));
+  };
+  walk(parseHtml(html), false);
+  return out;
 }

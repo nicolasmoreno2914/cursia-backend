@@ -87,6 +87,50 @@ const CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
 /** Misma expresión que DYN_INTRO_URL_RE del ejecutor (R11b). */
 const URL_RE = /(https?:\/\/|www\.|\bdoi\s*:|\b10\.\d{4,9}\/\S+|\bisbn\b)/i;
 
+// ─── Lint de prosa del shell (fix round 1, review G5 C1) ───────────────────
+// Los textos LLM que el shell muestra como prosa NO pueden traer cifras: toda
+// cifra visible sale de facts. Se rechaza:
+//  - DIGIT_IN_TEXT: cualquier dígito (la bibliografía queda exenta: años);
+//  - QUANTITY_CLAIM: número escrito en palabras junto a un sustantivo de
+//    estructura o de tiempo ("tres módulos", "una docena de lecciones");
+//  - FORBIDDEN_CLAIM: afirmaciones que el shell nunca puede respaldar (§E):
+//    certificado/certificación/diploma, PDF, narración profesional, horas,
+//    minutos, semanas.
+// "un/una" no cuentan como número (demasiado frecuentes en prosa normal).
+const NUMBER_WORDS =
+  '(?:dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce|trece|catorce|quince|dieciseis|diecisiete|dieciocho|diecinueve|' +
+  'veinte|veinti[a-z]+|treinta|cuarenta|cincuenta|sesenta|setenta|ochenta|noventa|cien|ciento|docena|decena|par)';
+const STRUCTURE_OR_TIME_NOUNS =
+  '(?:modulos?|capitulos?|videos?|actividad(?:es)?|preguntas?|intentos?|minutos?|horas?|paginas?|semanas?|dias?|meses|mes|anos?|' +
+  'lecciones|leccion|unidad(?:es)?|sesion(?:es)?|clases?|ejercicios?|creditos?|temas?|diapositivas?|palabras?|niveles?|etapas?|' +
+  'evaluacion(?:es)?|examen(?:es)?|cuestionarios?|pruebas?|juegos?|presentacion(?:es)?|partes?|secciones?|bloques?)';
+const LB = '(?<![\\p{L}\\p{N}_])';
+const RB = '(?![\\p{L}\\p{N}_])';
+const NUMBER_WORD_RE = new RegExp(`${LB}${NUMBER_WORDS}\\s+(?:(?:de|del|los|las|sus|[\\p{L}]+)\\s+){0,2}${STRUCTURE_OR_TIME_NOUNS}${RB}`, 'gu');
+const FORBIDDEN_CLAIM_RE = new RegExp(
+  `${LB}(?:certificad[oa]s?|certificacion(?:es)?|certificar|diplomas?|pdf|narracion(?:es)? profesional(?:es)?|narrad[oa]s? profesionalmente|locucion profesional|horas|minutos|semanas)${RB}`,
+  'gu',
+);
+
+function normalizeLint(text: string): string {
+  return String(text ?? '').normalize('NFD').replace(/[\u0300-\u036F]/g, '').toLowerCase().replace(/\*\*/g, '').replace(/\s+/g, ' ');
+}
+
+export interface ShellProseHit {
+  code: 'DIGIT_IN_TEXT' | 'QUANTITY_CLAIM' | 'FORBIDDEN_CLAIM';
+  match: string;
+}
+
+/** Lint de los textos LLM que el shell renderiza como prosa (sin cifras, sin afirmaciones prohibidas). */
+export function lintShellProse(text: string): ShellProseHit[] {
+  const hits: ShellProseHit[] = [];
+  for (const m of String(text ?? '').matchAll(/\p{Nd}+/gu)) hits.push({ code: 'DIGIT_IN_TEXT', match: m[0] });
+  const norm = normalizeLint(text);
+  for (const m of norm.matchAll(NUMBER_WORD_RE)) hits.push({ code: 'QUANTITY_CLAIM', match: m[0] });
+  for (const m of norm.matchAll(FORBIDDEN_CLAIM_RE)) hits.push({ code: 'FORBIDDEN_CLAIM', match: m[0] });
+  return hits;
+}
+
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === 'object' && !Array.isArray(v);
 }
@@ -129,6 +173,10 @@ function checkText(v: unknown, path: string, rule: TextRule, errors: ShellValida
   if (rule.lint !== false) {
     for (const h of lintResourceMentions(v)) errors.push({ path, code: 'RESOURCE_MENTION', message: `menciona un recurso: "${h.match}"` });
     for (const h of lintQuantityClaims(v)) errors.push({ path, code: 'QUANTITY_CLAIM', message: `afirma una cantidad: "${h.match}"` });
+    for (const h of lintShellProse(v)) {
+      const what = h.code === 'DIGIT_IN_TEXT' ? 'cifra (las cifras las pone Cursia desde facts)' : h.code === 'FORBIDDEN_CLAIM' ? 'afirmación no respaldada' : 'cantidad en palabras';
+      errors.push({ path, code: h.code, message: `${what}: "${h.match}"` });
+    }
   }
 }
 

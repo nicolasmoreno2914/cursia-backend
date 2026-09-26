@@ -71,7 +71,7 @@ export interface ChapterFacts {
   activityEnabled: boolean;
   /** null si la actividad está OFF. */
   activityVariant: 'h5p' | 'scorm' | null;
-  /** Solo variant h5p (rotación activityTypeForChapter). */
+  /** Solo variant h5p (activityTypeForChapter(chapterId): estable ante reordenamientos). */
   activityType: H5pActivityType | null;
   slideCount: number;
 }
@@ -196,7 +196,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
         videoEnabled: mc.videoEnabled,
         activityEnabled,
         activityVariant: variant,
-        activityType: variant === 'h5p' ? activityTypeForChapter(mc.chapterNumber) : null,
+        activityType: variant === 'h5p' ? activityTypeForChapter(mc.chapterId) : null,
         slideCount: posInt(artifacts.slideCountByChapter?.[mc.chapterId], `slideCount del capítulo ${mc.chapterNumber}`),
       });
     });
@@ -338,8 +338,17 @@ export function factsNumberSet(facts: CourseFacts): Set<number> {
   return s;
 }
 
-/** Números del texto que NO están en factsNumberSet (vacío = pasa). */
+/**
+ * Números del texto que NO están en factsNumberSet (vacío = pasa). Los títulos
+ * del Blueprint (curso, módulos, capítulos) se quitan antes: son nombres que
+ * puso la institución ("ISO 9001"), no cifras que afirme el shell.
+ */
 export function lintShellNumbers(text: string, facts: CourseFacts): number[] {
   const allowed = factsNumberSet(facts);
-  return numbersInText(text).filter((n) => !allowed.has(n));
+  const titles = [facts.course.title, ...facts.modules.map((m) => m.title), ...facts.chapters.map((c) => c.title)]
+    .filter((t) => typeof t === 'string' && t.trim().length > 0)
+    .sort((a, b) => b.length - a.length);
+  let t = String(text ?? '');
+  for (const title of titles) t = t.split(title).join(' ');
+  return numbersInText(t).filter((n) => !allowed.has(n));
 }

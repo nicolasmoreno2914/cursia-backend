@@ -75,23 +75,33 @@ export function gammaThemeFor(familyId: ThemeFamilyId, mode: ThemeMode): string 
 export interface ThemeMismatchResult {
   mismatch: boolean;
   warning?: 'theme_mismatch';
+  /** Tema de Gamma que corresponde HOY a la familia+modo del curso. */
+  expectedGammaThemeId?: string;
+  /** Qué cambió respecto de la generación (si el artifact registró familia/modo). */
+  changed?: Array<'family' | 'mode' | 'gammaTheme'>;
 }
 
 /**
- * Compara la familia de tema con la que se generó el artifact de Gamma
- * contra la familia vigente del curso. Es puramente informativo: un cambio
- * de tema **nunca** dispara regeneración de Gamma (ver §P del audit —
- * "theme (familia o modo)" → presentation queda en REUSE, solo se agrega el
- * aviso `theme_mismatch`; Gamma solo se regenera si el usuario lo pide
- * explícitamente, por costo). El caller es responsable de mostrar el aviso
- * en la UI/label; esta función no tiene efectos secundarios ni dispara nada.
+ * ¿La presentación de Gamma ya generada corresponde al tema VIGENTE del curso?
+ * Fix round 1 (review G5, I5; §P "theme (familia o modo)"): la comparación es
+ * por el tema de Gamma efectivo — `artifact.gammaThemeId !==
+ * gammaThemeFor(familia, modo vigentes)` —, así un cambio de familia O de modo
+ * que cambia el tema de Gamma produce el aviso. `changed` detalla familia/modo
+ * cuando el artifact los registró (`themeModeAtGeneration` es aditivo).
+ *
+ * Puramente informativo: un cambio de tema **nunca** dispara regeneración de
+ * Gamma (presentation queda en REUSE con el aviso `theme_mismatch`; solo se
+ * regenera si el usuario lo pide, por costo). Sin efectos secundarios.
  */
 export function themeMismatch(
-  themeFamilyAtGeneration: ThemeFamilyId,
-  currentFamilyId: ThemeFamilyId,
+  artifact: { gammaThemeId: string; themeFamilyAtGeneration?: ThemeFamilyId; themeModeAtGeneration?: ThemeMode },
+  current: { familyId: ThemeFamilyId; mode: ThemeMode },
 ): ThemeMismatchResult {
-  if (themeFamilyAtGeneration === currentFamilyId) {
-    return { mismatch: false };
-  }
-  return { mismatch: true, warning: 'theme_mismatch' };
+  const expectedGammaThemeId = gammaThemeFor(current.familyId, current.mode);
+  const changed: Array<'family' | 'mode' | 'gammaTheme'> = [];
+  if (artifact.themeFamilyAtGeneration && artifact.themeFamilyAtGeneration !== current.familyId) changed.push('family');
+  if (artifact.themeModeAtGeneration && artifact.themeModeAtGeneration !== current.mode) changed.push('mode');
+  if (artifact.gammaThemeId !== expectedGammaThemeId) changed.push('gammaTheme');
+  if (!changed.includes('gammaTheme')) return { mismatch: false, expectedGammaThemeId, changed };
+  return { mismatch: true, warning: 'theme_mismatch', expectedGammaThemeId, changed };
 }

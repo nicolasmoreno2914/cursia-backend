@@ -114,7 +114,7 @@ function shellLabels(facts, course, theme, level) {
   const out = [
     S.welcomeLabel(facts, ci, theme, o),
     S.audioWelcomeLabel(facts, theme, o),
-    S.competenciesLabel(ci, theme, o),
+    S.competenciesLabel(facts, ci, theme, o),
     S.methodologyLabel(facts, ci, theme, o),
     S.routeLabel(facts, theme, o),
     S.libroCardLabel(77, facts, theme, o),
@@ -149,6 +149,19 @@ function textOfClass(html, cls) {
   return out.join(' ');
 }
 
+// I6: tipo h5p por UUID de capítulo (FNV-1a 32). Implementación INDEPENDIENTE del
+// módulo para verificarlo, y vectores fijos compartidos con el frontend.
+const VECTORS = require('./fixtures/v21-activity-type-vectors.json');
+function fnvRef(str) {
+  let h = 0x811c9dc5;
+  for (const b of Buffer.from(str, 'utf8')) { h ^= b; h = Math.imul(h, 0x01000193) >>> 0; }
+  return h >>> 0;
+}
+const typeRef = (id) => ['questionset', 'dragtext', 'blanks'][fnvRef(id.toLowerCase()) % 3];
+/** Capítulos de prueba con tipo conocido: 1 → questionset, 2 → dragtext, 3 → blanks. */
+const CH_BY_N = { 1: VECTORS.vectors[0].chapterId, 2: VECTORS.vectors[1].chapterId, 3: VECTORS.vectors[2].chapterId };
+const chOf = (n) => CH_BY_N[((n - 1) % 3) + 1];
+
 const seqOf = (slots) => slots.map((s) => (s.kind === 'label' ? `label:${s.role}` : s.kind));
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -163,7 +176,7 @@ async function pureChecks() {
   await check('facts 2 módulos: conteos, capítulos (4 combinaciones V/A), módulos, evaluación, audio y horas', () => {
     eq(f2.counts, { modules: 2, chapters: 4, videos: 2, activities: 2, activitiesByVariant: { h5p: 2, scorm: 0 }, exams: 1, finalExam: true, evaluations: 2 }, 'counts');
     eq(f2.chapters.map((c) => [c.number, c.moduleNumber, c.indexInModule, c.videoEnabled, c.activityEnabled, c.activityVariant, c.activityType, c.slideCount]),
-      [[1, 1, 1, true, true, 'h5p', 'questionset', 8], [2, 1, 2, true, false, null, null, 9], [3, 2, 1, false, true, 'h5p', 'blanks', 10], [4, 2, 2, false, false, null, null, 8]], 'chapters');
+      [[1, 1, 1, true, true, 'h5p', typeRef(f2.chapters[0].id), 8], [2, 1, 2, true, false, null, null, 9], [3, 2, 1, false, true, 'h5p', typeRef(f2.chapters[2].id), 10], [4, 2, 2, false, false, null, null, 8]], 'chapters');
     eq(f2.modules.map((m) => [m.number, m.title, m.chapterNumbers, m.examEnabled, m.examQuestionCount]),
       [[1, 'Bases del servicio', [1, 2], true, 12], [2, 'Relación con el cliente', [3, 4], false, null]], 'modules');
     eq(f2.finalExam, { enabled: true, questionCount: 20 }, 'final');
@@ -220,11 +233,30 @@ async function pureChecks() {
     throwsRe(() => factsOf(c2, { hours: -1 }), /hours/, 'horas negativas');
   });
 
-  await check('activityTypeForChapter: rotación [questionset, dragtext, blanks] (R-011: sin singlechoiceset) y entrada inválida', () => {
-    eq([1, 2, 3, 4, 5, 6, 7, 8, 9].map(S.activityTypeForChapter),
-      ['questionset', 'dragtext', 'blanks', 'questionset', 'dragtext', 'blanks', 'questionset', 'dragtext', 'blanks'], 'rotación');
-    eq(S.ACTIVITY_H5P_ROTATION, ['questionset', 'dragtext', 'blanks'], 'constante');
-    for (const bad of [0, -1, 1.5, '1', null]) throwsRe(() => S.activityTypeForChapter(bad), /ACTIVITY_TYPE_INVALID_CHAPTER/, `chapter ${bad}`);
+  await check('activityTypeForChapter(chapterId): FNV-1a 32 estándar sobre el UUID en minúsculas, vectores fijos, estable ante reordenamientos (I6)', () => {
+    eq(S.ACTIVITY_H5P_ROTATION, ['questionset', 'dragtext', 'blanks'], 'rotación (R-011: sin singlechoiceset)');
+    eq(VECTORS.rotation, S.ACTIVITY_H5P_ROTATION, 'rotación del fixture');
+    // Vectores estándar de FNV-1a 32 (tabla de referencia de Fowler/Noll/Vo).
+    eq([S.fnv1a32(''), S.fnv1a32('a'), S.fnv1a32('foobar')], [0x811c9dc5, 0xe40c292c, 0xbf9cf968], 'FNV-1a estándar');
+    assert(VECTORS.vectors.length === 5, 'se esperan 5 vectores');
+    const seen = new Set();
+    for (const v of VECTORS.vectors) {
+      eq([S.fnv1a32(v.chapterId.toLowerCase()), S.activityTypeForChapter(v.chapterId)], [v.fnv1a32, v.type], v.chapterId);
+      eq([fnvRef(v.chapterId.toLowerCase()), typeRef(v.chapterId)], [v.fnv1a32, v.type], `referencia independiente ${v.chapterId}`);
+      seen.add(v.type);
+    }
+    eq([...seen].sort(), ['blanks', 'dragtext', 'questionset'], 'los vectores cubren los 3 tipos');
+    eq(S.activityTypeForChapter(VECTORS.vectors[3].chapterId), S.activityTypeForChapter(VECTORS.vectors[3].chapterId.toLowerCase()), 'insensible a mayúsculas');
+    for (const bad of ['', '  ', 1, null, undefined]) throwsRe(() => S.activityTypeForChapter(bad), /ACTIVITY_TYPE_INVALID_CHAPTER/, `chapterId ${JSON.stringify(bad)}`);
+    // Reordenar capítulos (otro número global) no cambia el tipo de ninguno.
+    const reordered = F.buildCourse(DIST, {
+      courseId: 501, modules: [
+        { examEnabled: false, chapters: [{ video: false, activity: true }, { video: true, activity: true }] },
+        { examEnabled: true, chapters: [{ video: true, activity: true }, { video: false, activity: true }] },
+      ],
+    });
+    const fr = factsOf(reordered, { artifacts: F.measuredArtifacts(reordered.manifest, { finalExamQuestionCount: 20 }) });
+    for (const ch of fr.chapters) eq(ch.activityType, typeRef(ch.id), `cap ${ch.number}`);
   });
 
   await check('ensamblador: secuencias EXACTAS por combinación V/A (§F.3)', () => {
@@ -389,7 +421,7 @@ async function pureChecks() {
       ['schemaVersion', (d) => { d.schemaVersion = 2; }, 'SCHEMA_VERSION'],
       ['campo extra', (d) => { d.extra = 'x'; }, 'UNKNOWN_FIELD'],
       ['welcome corto', (d) => { d.welcome = 'Hola y bienvenida.'; }, 'WORD_RANGE'],
-      ['welcome con recurso', (d) => { d.welcome = d.welcome + ' Mira cada video con atención.'; }, 'RESOURCE_MENTION'],
+      ['welcome con recurso', (d) => { d.welcome = d.welcome + ' Mira el video del capítulo con atención.'; }, 'RESOURCE_MENTION'],
       ['welcome con cantidad', (d) => { d.welcome = d.welcome + ' Son 3 módulos intensos.'; }, 'QUANTITY_CLAIM'],
       ['welcome con HTML', (d) => { d.welcome = d.welcome + ' <b>fuerte</b>'; }, 'HTML_IN_TEXT'],
       ['competencias 3', (d) => { d.competencies = d.competencies.slice(0, 3); }, 'COUNT_RANGE'],
@@ -427,7 +459,7 @@ async function pureChecks() {
       ['journey incompleto', (d) => { d.journey.pop(); }, 'JOURNEY_MISMATCH'],
       ['journey con extra', (d) => { d.journey.push({ chapterId: 'x', line: 'y' }); }, 'JOURNEY_MISMATCH'],
       ['línea con capítulo N', (d) => { d.journey[0].line = 'Como vimos en el capítulo 3, seguimos.'; }, 'QUANTITY_CLAIM'],
-      ['línea con actividad', (d) => { d.journey[0].line = 'Cierra con una actividad breve.'; }, 'RESOURCE_MENTION'],
+      ['línea con actividad', (d) => { d.journey[0].line = 'Cierra con la actividad práctica del tema.'; }, 'RESOURCE_MENTION'],
       ['outcomes 6', (d) => { d.outcomes = [...d.outcomes, 'a', 'b', 'c']; }, 'COUNT_RANGE'],
       ['presentación larga', (d) => { d.presentation = 'z'.repeat(2001); }, 'TEXT_TOO_LONG'],
       ['línea larga', (d) => { d.journey[0].line = 'w'.repeat(401); }, 'TEXT_TOO_LONG'],
@@ -445,33 +477,106 @@ async function pureChecks() {
   await check('activity h5p: payload válido para los 3 tipos calificados; tipo ≠ rotación, desconocido, campos de Cursia y data inválida se rechazan', () => {
     const typeForN = { questionset: 1, dragtext: 2, blanks: 3 };
     for (const [t, n] of Object.entries(typeForN)) {
-      eq(S.validateH5pActivityPayload(F.h5pPayload(t), { chapterNumber: n, itemKey: `activity:ch${n}` }), { ok: true, errors: [] }, t);
-      eq(S.validateH5pActivityPayload(F.h5pPayload(t), { chapterNumber: n + 3, itemKey: `activity:ch${n}` }).ok, true, `${t} (vuelta 2)`);
+      eq(S.validateH5pActivityPayload(F.h5pPayload(t), { chapterId: chOf(n), itemKey: `activity:ch${n}` }), { ok: true, errors: [] }, t);
+      eq(S.validateH5pActivityPayload(F.h5pPayload(t), { chapterId: chOf(n + 3), itemKey: `activity:ch${n}` }).ok, true, `${t} (vuelta 2)`);
     }
-    const r1 = S.validateH5pActivityPayload(F.h5pPayload('dragtext'), { chapterNumber: 1, itemKey: 'activity:ch1' });
+    const r1 = S.validateH5pActivityPayload(F.h5pPayload('dragtext'), { chapterId: chOf(1), itemKey: 'activity:ch1' });
     eq(codes(r1), ['ACTIVITY_TYPE_MISMATCH'], 'mismatch');
-    eq(codes(S.validateH5pActivityPayload({ type: 'flashcards', data: {} }, { chapterNumber: 1, itemKey: 'a:1' })), ['ACTIVITY_TYPE_UNKNOWN'], 'desconocido');
+    eq(codes(S.validateH5pActivityPayload({ type: 'flashcards', data: {} }, { chapterId: chOf(1), itemKey: 'a:1' })), ['ACTIVITY_TYPE_UNKNOWN'], 'desconocido');
     // R-011: singlechoiceset es un tipo conocido pero NUNCA calificable — rechazo
     // explícito H5P_TYPE_NOT_GRADABLE, incluso si el capítulo pidiera otro tipo
     // o si por coincidencia se sobreescribiera el `type` esperado.
     for (const n of [1, 2, 3]) {
-      eq(codes(S.validateH5pActivityPayload(F.h5pPayload('singlechoiceset'), { chapterNumber: n, itemKey: `a:${n}` })), ['H5P_TYPE_NOT_GRADABLE'], `singlechoiceset no calificable (cap ${n})`);
+      eq(codes(S.validateH5pActivityPayload(F.h5pPayload('singlechoiceset'), { chapterId: chOf(n), itemKey: `a:${n}` })), ['H5P_TYPE_NOT_GRADABLE'], `singlechoiceset no calificable (cap ${n})`);
     }
     // Forma del ejecutor R11b: data = entrada COMPLETA de R7 (Cursia pone itemKey y passPercentage).
     const full = F.h5pPayload('questionset'); full.data.itemKey = 'a:1'; full.data.passPercentage = 60;
-    eq(S.validateH5pActivityPayload(full, { chapterNumber: 1, itemKey: 'a:1' }), { ok: true, errors: [] }, 'entrada completa de R7');
+    eq(S.validateH5pActivityPayload(full, { chapterId: chOf(1), itemKey: 'a:1' }), { ok: true, errors: [] }, 'entrada completa de R7');
     const otherKey = clone(full); otherKey.data.itemKey = 'activity:otro';
-    eq(codes(S.validateH5pActivityPayload(otherKey, { chapterNumber: 1, itemKey: 'a:1' })), ['ITEM_KEY_MISMATCH'], 'itemKey ajeno');
+    eq(codes(S.validateH5pActivityPayload(otherKey, { chapterId: chOf(1), itemKey: 'a:1' })), ['ITEM_KEY_MISMATCH'], 'itemKey ajeno');
     const badPass = clone(full); badPass.data.passPercentage = 150;
-    eq(codes(S.validateH5pActivityPayload(badPass, { chapterNumber: 1, itemKey: 'a:1' })), ['H5P_INPUT_INVALID'], 'passPercentage fuera de rango');
+    eq(codes(S.validateH5pActivityPayload(badPass, { chapterId: chOf(1), itemKey: 'a:1' })), ['H5P_INPUT_INVALID'], 'passPercentage fuera de rango');
     const dtPass = F.h5pPayload('dragtext'); dtPass.data.passPercentage = 70;
-    eq(codes(S.validateH5pActivityPayload(dtPass, { chapterNumber: 2, itemKey: 'a:2' })), ['H5P_INPUT_INVALID'], 'passPercentage en DragText');
+    eq(codes(S.validateH5pActivityPayload(dtPass, { chapterId: chOf(2), itemKey: 'a:2' })), ['H5P_INPUT_INVALID'], 'passPercentage en DragText');
     const badData = F.h5pPayload('blanks'); badData.data.questions = ['Sin ningún hueco en la frase.'];
-    eq(codes(S.validateH5pActivityPayload(badData, { chapterNumber: 3, itemKey: 'a:3' })), ['H5P_INPUT_INVALID'], 'data inválida (R7)');
+    eq(codes(S.validateH5pActivityPayload(badData, { chapterId: chOf(3), itemKey: 'a:3' })), ['H5P_INPUT_INVALID'], 'data inválida (R7)');
     const html = F.h5pPayload('questionset'); html.data.title = '<b>x</b>';
-    eq(codes(S.validateH5pActivityPayload(html, { chapterNumber: 1, itemKey: 'a:1' })), ['H5P_INPUT_INVALID'], 'HTML en data');
-    eq(codes(S.validateH5pActivityPayload([], { chapterNumber: 1, itemKey: 'a:1' })), ['NOT_OBJECT'], 'no objeto');
-    eq(codes(S.validateH5pActivityPayload({ type: 'questionset', data: {}, extra: 1 }, { chapterNumber: 1, itemKey: 'a:1' })).includes('UNKNOWN_FIELD'), true, 'extra');
+    eq(codes(S.validateH5pActivityPayload(html, { chapterId: chOf(1), itemKey: 'a:1' })), ['H5P_INPUT_INVALID'], 'HTML en data');
+    eq(codes(S.validateH5pActivityPayload([], { chapterId: chOf(1), itemKey: 'a:1' })), ['NOT_OBJECT'], 'no objeto');
+    eq(codes(S.validateH5pActivityPayload({ type: 'questionset', data: {}, extra: 1 }, { chapterId: chOf(1), itemKey: 'a:1' })).includes('UNKNOWN_FIELD'), true, 'extra');
+  });
+
+  await check('C1 (sonda g5probe/p3): cifras, cantidades en palabras y afirmaciones prohibidas en intros → rechazadas; el shell nunca las renderiza', () => {
+    const bad = F.courseIntroFixture();
+    bad.welcome = bad.welcome + ' A lo largo de tres módulos y nueve capítulos, en 6 semanas y 40 horas cronológicas, obtendrás tu certificado oficial. Incluye 12 lecciones y 30 ejercicios.';
+    bad.methodology_note = 'Mira cada clase grabada y resuelve los cuestionarios; en 4 semanas completarás las 12 lecciones.';
+    const r = S.validateCourseIntroV3(bad);
+    assert(!r.ok, 'la intro de la sonda p3 pasó la validación');
+    for (const code of ['DIGIT_IN_TEXT', 'QUANTITY_CLAIM', 'FORBIDDEN_CLAIM']) assert(codes(r).includes(code), `falta ${code}: ${JSON.stringify(codes(r))}`);
+    const matches = r.errors.map((e) => e.message).join(' | ');
+    for (const m of ['tres modulos', 'nueve capitulos', 'certificado', 'horas', 'semanas', '"6"', '"30"', '"12"', '"4"']) assert(matches.includes(m), `no detectó ${m}: ${matches}`);
+    bad.welcome = bad.welcome.replace(' y 40 horas cronológicas', '');
+    assert(!S.validateCourseIntroV3(bad).ok, 'sin las horas sigue siendo inválida');
+    throwsRe(() => S.welcomeLabel(f2, bad, THEME), /COURSE_INTRO_V3_INVALID/, 'welcomeLabel renderiza la intro de p3');
+    throwsRe(() => S.methodologyLabel(f2, bad, THEME), /COURSE_INTRO_V3_INVALID/, 'methodologyLabel renderiza la intro de p3');
+    // Cada clase por separado, en cada campo de prosa de ambas intros.
+    const cases = [
+      ['Durante una docena de lecciones practicarás.', 'QUANTITY_CLAIM'],
+      ['Son veinte ejercicios guiados.', 'QUANTITY_CLAIM'],
+      ['Recibirás un diploma al terminar.', 'FORBIDDEN_CLAIM'],
+      ['Incluye un PDF descargable.', 'FORBIDDEN_CLAIM'],
+      ['Con narración profesional de cada tema.', 'FORBIDDEN_CLAIM'],
+      ['Dedica unos minutos por día.', 'FORBIDDEN_CLAIM'],
+      ['Aplica la norma ISO 9001 en tu área.', 'DIGIT_IN_TEXT'],
+    ];
+    for (const [txt, code] of cases) {
+      eq(S.lintShellProse(txt).map((h) => h.code).includes(code), true, `${txt} → ${code}`);
+      const ci = F.courseIntroFixture(); ci.competencies[1] = txt;
+      assert(codes(S.validateCourseIntroV3(ci)).includes(code), `competencia: ${txt}`);
+      const mi = F.moduleIntroFixture(c2.manifest, 0); mi.outcomes[0] = txt;
+      assert(codes(S.validateModuleIntroV3(mi, { chapterIds: c2.manifest.modules[0].chapters.map((c) => c.chapterId) })).includes(code), `outcome: ${txt}`);
+    }
+    // Prosa normal sin cifras: sin falsos positivos ("a la hora de", "una semana" no se cuenta como cantidad; "dos formas de").
+    eq(S.lintShellProse('A la hora de atender, hay dos formas de escuchar y una semana cualquiera lo demuestra.'), [], 'falsos positivos');
+    // Bibliografía exenta (años y títulos con cifras).
+    const b = F.courseIntroFixture(); b.bibliography[0].title = 'ISO 9001 en 3 capítulos';
+    assert(S.validateCourseIntroV3(b).ok, 'bibliografía linteada');
+  });
+
+  await check('C1 (b): gate de render — assertShellNumbers lanza SHELL_NUMBER_NOT_FROM_FACTS; títulos del Blueprint exentos; todos los labels lo pasan', () => {
+    throwsRe(() => S.assertShellNumbers({ name: 'Bienvenida', html: '<div><p>Incluye 30 ejercicios</p></div>' }, f2), /SHELL_NUMBER_NOT_FROM_FACTS.*30/, 'cifra inventada');
+    S.assertShellNumbers({ name: 'Bienvenida', html: `<div><p>${f2.chapters[0].title} · 4 capítulos</p></div>` }, f2);
+    // Un título con cifras (dato de la institución) no dispara el gate.
+    const iso = F.buildCourse(DIST, { courseId: 509, title: 'Gestión ISO 9001:2015', finalExam: false, modules: [{ examEnabled: false, chapters: [{ video: false, activity: false }] }] });
+    const fi = factsOf(iso);
+    const w = S.welcomeLabel(fi, F.courseIntroFixture(), THEME);
+    assert(vc.extractText(w.html).includes('9001:2015'), 'el título con cifras se muestra');
+    for (const l of shellLabels(f2, c2, THEME)) S.assertShellNumbers(l, f2);
+  });
+
+  await check('I7: todo texto con letras/dígitos de los labels del shell y del capítulo va en <span class="nolink">', () => {
+    for (const [course, facts] of [[c2, f2], [c4, f4]]) {
+      for (const level of [undefined, 'enhanced']) {
+        for (const l of shellLabels(facts, course, THEME, level)) eq(S.unprotectedText(l.html), [], `${l.name}`);
+        for (const { slots } of S.assembleAllChapters(facts, F.experiencesFor(course.manifest), THEME, level ? { level } : undefined)) {
+          for (const sl of slots.filter((x) => x.kind === 'label')) eq(S.unprotectedText(sl.html), [], sl.name);
+        }
+      }
+    }
+    eq(S.unprotectedText('<div><p>Hola <span class="nolink">mundo</span></p></div>'), ['Hola'], 'detecta texto desprotegido');
+  });
+
+  await check('M4/M12: el puente respeta los intentos de la actividad y omite el texto LLM antes de un examen o al final del curso', () => {
+    eq(S.bridgeText({ activityEnabled: true, activityAttempts: 0, next: { number: 2, title: 'X' } }).startsWith('Si todavía no alcanzaste la nota mínima en la práctica, vuelve a intentarlo.'), true, 'ilimitados');
+    eq(S.bridgeText({ activityEnabled: true, activityAttempts: 1, next: null }).includes('vuelve a intentarlo'), false, '1 intento: no promete reintentar');
+    eq(S.bridgeText({ activityEnabled: true, activityAttempts: 3, next: null }).includes('te quedan intentos'), true, 'intentos finitos');
+    const exps = F.experiencesFor(c2.manifest);
+    const bridgeLLM = exps[f2.chapters[0].id].bridge_to_next;
+    const all = S.assembleAllChapters(f2, exps, THEME);
+    const closing = (n) => vc.extractText(all[n - 1].slots.find((x) => x.role === 'closing').html);
+    assert(closing(1).includes(bridgeLLM), 'cap 1 (sigue otro capítulo): con puente LLM');
+    assert(!closing(2).includes(bridgeLLM), 'cap 2 (antes del examen del módulo): sin puente LLM');
+    assert(!closing(4).includes(bridgeLLM), 'cap 4 (fin del curso): sin puente LLM');
   });
 
   await check('GIFT final: conteo con parseGIFT, rango [5,40], bloque ilegible, vacío', () => {
@@ -501,7 +606,7 @@ async function pureChecks() {
       [{ type: 'module_intro', itemKey: 'module_intro:m', moduleChapterIds: ids }, JSON.stringify(F.moduleIntroFixture(c2.manifest, 0))],
       [{ type: 'experience', itemKey: 'experience:c1', chapterId: 'c1' }, JSON.stringify(F.experienceFor('c1'))],
       [{ type: 'video_interactions', itemKey: 'video_interactions:c1', video: { videoItemKey: 'video:c1', durationSec: 468 } }, JSON.stringify(vdoc)],
-      [{ type: 'activity', variant: 'h5p', itemKey: 'activity:c3', chapterNumber: 3 }, JSON.stringify(F.h5pPayload('blanks'))],
+      [{ type: 'activity', variant: 'h5p', itemKey: 'activity:c3', chapterId: chOf(3) }, JSON.stringify(F.h5pPayload('blanks'))],
       [{ type: 'final_exam', itemKey: 'final_exam:1' }, F.FINAL_GIFT],
     ];
     for (const [ctx, text] of ok) eq(V(ctx, text).ok, true, `válido ${ctx.type}`);
@@ -509,10 +614,10 @@ async function pureChecks() {
     eq(V(ok[3][0], JSON.stringify(vdoc)).summary, { interactionCount: 5 }, 'summary video');
     const bad = [
       [ok[0][0], '{no json', 'JSON_INVALID'],
-      [ok[0][0], JSON.stringify({ ...F.courseIntroFixture(), closing: 'Revisa cada video del curso para cerrar el recorrido completo y seguir aprendiendo siempre con tu equipo.' }), 'RESOURCE_MENTION'],
+      [ok[0][0], JSON.stringify({ ...F.courseIntroFixture(), closing: 'Revisa el video del capítulo para cerrar el recorrido completo y seguir aprendiendo siempre con tu equipo.' }), 'RESOURCE_MENTION'],
       [ok[1][0], JSON.stringify({ ...F.moduleIntroFixture(c2.manifest, 0), journey: [] }), 'JOURNEY_MISMATCH'],
       [ok[2][0], JSON.stringify(F.experienceFor('otro')), 'CHAPTER_ID_MISMATCH'],
-      [ok[2][0], JSON.stringify({ ...F.experienceFor('c1'), bridge_to_next: 'Sigue con la actividad.' }), 'RESOURCE_MENTION'],
+      [ok[2][0], JSON.stringify({ ...F.experienceFor('c1'), bridge_to_next: 'Sigue con la actividad práctica siguiente.' }), 'RESOURCE_MENTION'],
       [ok[3][0], JSON.stringify({ ...vdoc, durationSec: 300 }), 'H5P_INPUT_INVALID'],
       [ok[3][0], JSON.stringify({ ...vdoc, videoItemKey: 'video:otro' }), 'H5P_INPUT_INVALID'],
       [ok[4][0], JSON.stringify(F.h5pPayload('questionset')), 'ACTIVITY_TYPE_MISMATCH'],
@@ -754,6 +859,9 @@ async function dbChecks() {
       eq(r, { ok: true }, 'completo');
       const after = await item(`experience:${C1}`);
       eq([after.status, after.output_summary.v3Validation.artifactType, after.output_summary.v3Validation.artifactId], ['completed', 'dynamic_experience_json', art], 'estado');
+      // M7: huella sha256 del contenido validado (el empaque la verifica).
+      const sha = require('crypto').createHash('sha256').update(JSON.stringify(F.experienceFor(C1)), 'utf8').digest('hex');
+      eq(after.output_summary.v3Validation.contentSha256, sha, 'contentSha256 del contenido validado');
       eq(await linked(art), after.id, 'vinculado');
     });
 
@@ -791,7 +899,7 @@ async function dbChecks() {
       eq([ci.type, ci.claimPayload.validatedArtifactType], ['course_intro', 'dynamic_course_intro_json'], 'claim');
       const bad = F.courseIntroFixture(); bad.methodology_note = 'Son 3 módulos y 20 horas.';
       const r = await sched.completeItemDetailed(ci.itemRunId, 'b1', { artifactIds: [await upload('dynamic_course_intro_json', bad)], summary: {} }, OWNER);
-      eq([r.reason, r.errors], ['v3_payload_invalid', ['QUANTITY_CLAIM']], 'cantidad');
+      eq([r.reason, r.errors], ['v3_payload_invalid', ['DIGIT_IN_TEXT', 'FORBIDDEN_CLAIM', 'QUANTITY_CLAIM']], 'cantidad / cifras / horas');
       await readyAgain(`course_intro:${cid}`);
       const again = await claim(['course_intro']);
       eq(await sched.completeItemDetailed(again.itemRunId, 'b1', { artifactIds: [await upload('dynamic_course_intro_json', F.courseIntroFixture())], summary: {} }, OWNER), { ok: true }, 'válido');
@@ -801,11 +909,11 @@ async function dbChecks() {
       await ds.query(`update public.generation_item_runs set status = 'completed', output_summary = '{}'::jsonb where job_id = $1 and item_key = $2`, [job.id, `video:${C1}`]);
       await ds.query(`update public.generation_item_runs set status = 'completed', output_summary = $3::jsonb where job_id = $1 and item_key = $2`,
         [job.id, `video:${C3}`, JSON.stringify({ youtubeVideoId: 'IdwOipZAeqY', durationSec: 468, delivery: 'completed' })]);
-      const first = await claim(['video_interactions']);
-      eq(first, null, 'el claim sin datos no entrega el item');
+      // M6: el claim marca failed el item sin datos y SIGUE con el próximo candidato (no devuelve null).
+      const v = await claim(['video_interactions']);
       const vi1 = await item(`video_interactions:${C1}`);
       assert(vi1.status === 'failed' && /claim_payload_unavailable: VIDEO_YOUTUBE_ID_MISSING/.test(vi1.error), `${vi1.status} ${vi1.error}`);
-      const v = await claim(['video_interactions']);
+      assert(v, 'el claim devolvió null habiendo otro item reclamable');
       eq([v.chapterId, v.claimPayload.video.youtubeId, v.claimPayload.video.durationSec, v.claimPayload.video.checkpoints.map((c) => c.atSec)], [C3, 'IdwOipZAeqY', 468, [72, 157, 242, 326, 411]], 'claim con plan');
       const plan = v.claimPayload.video.checkpoints;
       const wrong = VF.makeInteractionsDoc(plan, { videoItemKey: `video:${C3}`, durationSec: 300 });
@@ -832,9 +940,27 @@ async function dbChecks() {
       eq((await item(a.itemKey)).status, 'running', 'sigue running tras 503');
     });
 
-    await check('DB guards de siempre intactos: executor ajeno → lease_lost sin validar; artifact ya validado cambiado → rechazo', async () => {
+    await check('DB M5 (fail closed): item v3 validable cuya entrada falta del Manifest congelado → 500 v3_validation_context, sigue running', async () => {
       const a = await claim(['experience']);
-      const art = await upload('dynamic_experience_json', F.experienceFor(a.chapterId));
+      assert(a && a.type === 'experience', 'sin experience reclamable');
+      // El Manifest es inmutable (trigger): se simula la integridad rota renombrando la clave del item run.
+      await ds.query(`update public.generation_item_runs set item_key = $2 where id = $1`, [a.itemRunId, `${a.itemKey}-roto`]);
+      try {
+        const art = await upload('dynamic_experience_json', F.experienceFor(a.chapterId));
+        await rejectsRe(sched.completeItemDetailed(a.itemRunId, 'b1', { artifactIds: [art], summary: {} }, OWNER), /v3_validation_context/, 'sin entrada del Manifest', 500);
+        eq((await item(`${a.itemKey}-roto`)).status, 'running', 'sigue running');
+      } finally {
+        await ds.query(`update public.generation_item_runs set item_key = $2 where id = $1`, [a.itemRunId, a.itemKey]);
+      }
+      const art2 = await upload('dynamic_experience_json', F.experienceFor(a.chapterId));
+      eq(await sched.completeItemDetailed(a.itemRunId, 'b1', { artifactIds: [art2], summary: {} }, OWNER), { ok: true }, 'con el Manifest restaurado completa');
+    });
+
+    await check('DB guards de siempre intactos: executor ajeno → lease_lost sin validar; artifact ya validado cambiado → rechazo', async () => {
+      const a = await claim(['module_intro']);
+      assert(a && a.type === 'module_intro', 'sin module_intro reclamable');
+      const miDoc = F.moduleIntroFixture({ modules: [{ chapters: a.claimPayload.moduleChapterIds.map((chapterId) => ({ chapterId })) }] }, 0);
+      const art = await upload('dynamic_module_intro_json', miDoc);
       const before = reads.length;
       eq(await sched.completeItemDetailed(a.itemRunId, 'otro', { artifactIds: [art], summary: {} }, OWNER), { ok: false, reason: 'lease_lost' }, 'executor ajeno');
       eq(reads.length, before, 'leyó el artifact de un executor ajeno');
@@ -848,7 +974,7 @@ async function dbChecks() {
       });
       eq(await swapper.completeItemDetailed(a.itemRunId, 'b1', { artifactIds: [art], summary: {} }, OWNER), { ok: false, reason: 'artifact_changed_after_validation' }, 'artifact cambiado');
       eq([(await item(a.itemKey)).status, await linked(art)], ['running', null], 'sigue running y sin vincular');
-      const art2 = await upload('dynamic_experience_json', F.experienceFor(a.chapterId));
+      const art2 = await upload('dynamic_module_intro_json', miDoc);
       eq(await sched.completeItemDetailed(a.itemRunId, 'b1', { artifactIds: [art2], summary: {} }, OWNER), { ok: true }, 'completo');
     });
   } finally {

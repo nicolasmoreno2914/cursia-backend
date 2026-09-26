@@ -15,11 +15,11 @@
  */
 import type { ResolvedTheme } from '../theme-engine';
 import { moduleColor } from '../theme-engine';
-import { lintCleanSafe, renderComponent } from '../visual-components';
-import { escapeHtml, inlineHtml } from '../visual-components/text';
+import { extractText, lintCleanSafe, renderComponent } from '../visual-components';
+import { labelHtml, inlineHtml } from '../visual-components/text';
 import { formatDurationEs } from '../../package/audio';
 import type { AssessableType } from '../course-profiles/course-profiles';
-import type { CourseFacts, ModuleFacts } from './facts';
+import { CourseFacts, ModuleFacts, lintShellNumbers } from './facts';
 import {
   CourseIntroV3,
   ModuleIntroV3,
@@ -45,6 +45,7 @@ import {
   surfOn,
   toneSurf,
   ul,
+  unprotectedText,
 } from './html';
 import { GRADE_METHOD_ES, attemptsValue } from './microcopy';
 
@@ -56,12 +57,33 @@ export interface ShellLabel {
 export const SHELL_AUDIO_WELCOME_FILE = 'audio_bienvenida.mp3';
 export const SHELL_AUDIOBOOK_FILE = 'audiolibro.mp3';
 
-function out(name: string, html: string): ShellLabel {
+/**
+ * Gate de render (fix round 1, C1): todo número visible del label (nombre +
+ * texto) debe estar en factsNumberSet. Si no → SHELL_NUMBER_NOT_FROM_FACTS
+ * (el empaquetado falla fuerte; nunca se publica una cifra inventada).
+ */
+export function assertShellNumbers(label: ShellLabel, facts: CourseFacts): void {
+  const bad = lintShellNumbers(`${label.name} ${extractText(label.html)}`, facts);
+  if (bad.length > 0) {
+    throw new Error(`SHELL_NUMBER_NOT_FROM_FACTS: "${label.name}" muestra cifras que no salen de facts: ${bad.join(', ')}`);
+  }
+}
+
+function out(name: string, html: string, facts: CourseFacts): ShellLabel {
   const lint = lintCleanSafe(html);
   if (!lint.ok) {
     shellFail(`${name}: no pasa CLEAN_SAFE: ${lint.errors.slice(0, 3).map((e) => `${e.code} ${e.message}`).join('; ')}`);
   }
-  return { name, html };
+  const unprotected = unprotectedText(html);
+  if (unprotected.length > 0) shellFail(`${name}: texto sin protección nolink: ${JSON.stringify(unprotected.slice(0, 3))}`);
+  const label = { name, html };
+  assertShellNumbers(label, facts);
+  return label;
+}
+
+/** "<strong>Clave:</strong> valor" con cada tramo protegido (nolink). */
+function kv(key: string, value: string): string {
+  return `<strong>${labelHtml(`${key}:`)}</strong>${labelHtml(` ${value}`)}`;
 }
 
 function lvl(h: Hx): 'enhanced' | undefined {
@@ -88,9 +110,9 @@ export function welcomeLabel(facts: CourseFacts, courseIntro: CourseIntroV3, the
   );
   const s = bgSurf(h);
   const hours = facts.hours
-    ? pHtml(h, escapeHtml(`Duración estimada: ${facts.hours.value} h (${facts.hours.source}).`), s, { secondary: true, last: true })
+    ? pHtml(h, labelHtml(`Duración estimada: ${facts.hours.value} h (${facts.hours.source}).`), s, { secondary: true, last: true })
     : '';
-  return out('Bienvenida', root(h, 'shell-welcome', hero + statRow(h, stats) + hours));
+  return out('Bienvenida', root(h, 'shell-welcome', hero + statRow(h, stats) + hours), facts);
 }
 
 // ─── S0.3 Audio de bienvenida ───────────────────────────────────────────────
@@ -100,14 +122,14 @@ export function audioWelcomeLabel(facts: CourseFacts, theme: ResolvedTheme, opts
   const s = bgSurf(h);
   const inner =
     heading(h, 'h3', 'Audio de bienvenida', s) +
-    pHtml(h, escapeHtml(`Escucha la presentación del curso. Duración: ${formatDurationEs(facts.audio.welcomeSeconds)}.`), s) +
+    pHtml(h, labelHtml(`Escucha la presentación del curso. Duración: ${formatDurationEs(facts.audio.welcomeSeconds)}.`), s) +
     audio(h, `@@PLUGINFILE@@/${SHELL_AUDIO_WELCOME_FILE}`, 'el audio de bienvenida', s);
-  return out('Audio de bienvenida', root(h, 'shell-audio-welcome', inner));
+  return out('Audio de bienvenida', root(h, 'shell-audio-welcome', inner), facts);
 }
 
 // ─── S0.4 Competencias ──────────────────────────────────────────────────────
 
-export function competenciesLabel(courseIntro: CourseIntroV3, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
+export function competenciesLabel(facts: CourseFacts, courseIntro: CourseIntroV3, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
   const intro = assertValidCourseIntroV3(courseIntro);
   const h = hx(theme, opts);
   const comp = renderComponent(
@@ -115,7 +137,7 @@ export function competenciesLabel(courseIntro: CourseIntroV3, theme: ResolvedThe
     theme,
     { uid: 'shell-competencies-list', level: lvl(h) },
   );
-  return out('Qué aprenderás', root(h, 'shell-competencies', comp));
+  return out('Qué aprenderás', root(h, 'shell-competencies', comp), facts);
 }
 
 // ─── S0.5 Metodología (plantilla determinística) ────────────────────────────
@@ -158,9 +180,9 @@ export function methodologyLabel(facts: CourseFacts, courseIntro: CourseIntroV3,
   const intro = assertValidCourseIntroV3(courseIntro);
   const h = hx(theme, opts);
   const s = bgSurf(h);
-  const items = methodologySteps(facts).map((x) => `<strong>${escapeHtml(x.title)}.</strong> ${escapeHtml(x.body)}`);
+  const items = methodologySteps(facts).map((x) => `<strong>${labelHtml(`${x.title}.`)}</strong>${labelHtml(` ${x.body}`)}`);
   const inner = heading(h, 'h3', 'Cómo vas a aprender', s) + ul(h, items, s, { ordered: true }) + paras(h, intro.methodology_note, s, { last: true });
-  return out('Metodología', root(h, 'shell-methodology', inner));
+  return out('Metodología', root(h, 'shell-methodology', inner), facts);
 }
 
 // ─── S1.1 Ruta de aprendizaje ───────────────────────────────────────────────
@@ -178,11 +200,11 @@ export function routeLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: Shel
       const marks: string[] = [];
       if (ch.videoEnabled) marks.push('video interactivo');
       if (ch.activityEnabled) marks.push('actividad práctica');
-      const tail = marks.length ? ` <span>(${escapeHtml(marks.join(' · '))})</span>` : '';
-      return `<strong>${escapeHtml(`Capítulo ${ch.number}`)}</strong> · ${inlineHtml(ch.title)}${tail}`;
+      const tail = marks.length ? labelHtml(` (${marks.join(' · ')})`) : '';
+      return `<strong>${labelHtml(`Capítulo ${ch.number}`)}</strong>${labelHtml(' · ')}${inlineHtml(ch.title)}${tail}`;
     });
     if (m.examEnabled) {
-      items.push(`<strong>Evaluación del módulo</strong> · ${escapeHtml(`${m.examQuestionCount} ${plural(m.examQuestionCount as number, 'pregunta', 'preguntas')}`)}`);
+      items.push(`<strong>${labelHtml('Evaluación del módulo')}</strong>${labelHtml(' · ')}${labelHtml(`${m.examQuestionCount} ${plural(m.examQuestionCount as number, 'pregunta', 'preguntas')}`)}`);
     }
     const body = heading(h, 'h4', `Módulo ${m.number} · ${m.title}`, ms) + ul(h, items, ms);
     inner += box(h, body, { s: ms, border: mc.border }, { accentLeft: mc.main });
@@ -190,9 +212,9 @@ export function routeLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: Shel
   if (facts.finalExam.enabled) {
     const cs = toneSurf(h, 'alt');
     const q = facts.finalExam.questionCount as number;
-    inner += box(h, heading(h, 'h4', 'Evaluación final', cs.s) + pHtml(h, escapeHtml(`${q} ${plural(q, 'pregunta', 'preguntas')} sobre todo el curso.`), cs.s, { last: true }), cs);
+    inner += box(h, heading(h, 'h4', 'Evaluación final', cs.s) + pHtml(h, labelHtml(`${q} ${plural(q, 'pregunta', 'preguntas')} sobre todo el curso.`), cs.s, { last: true }), cs);
   }
-  return out('Ruta de aprendizaje', root(h, 'shell-route', inner));
+  return out('Ruta de aprendizaje', root(h, 'shell-route', inner), facts);
 }
 
 // ─── S1.2 Libro Guía ────────────────────────────────────────────────────────
@@ -209,9 +231,9 @@ export function libroCardLabel(libroMid: number, facts: CourseFacts, theme: Reso
   const inner =
     eyebrow(h, 'Material de estudio', cs.s) +
     heading(h, 'h3', 'Libro Guía', cs.s) +
-    pHtml(h, escapeHtml(text), cs.s) +
+    pHtml(h, labelHtml(text), cs.s) +
     pHtml(h, link(h, `$@RESOURCEVIEWBYID*${libroMid}@$`, 'Abrir el Libro Guía', cs.s), cs.s, { last: true });
-  return out('Libro Guía', root(h, 'shell-libro', box(h, inner, cs)));
+  return out('Libro Guía', root(h, 'shell-libro', box(h, inner, cs)), facts);
 }
 
 // ─── S1.3 Audiolibro ────────────────────────────────────────────────────────
@@ -223,17 +245,17 @@ export function audiobookLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: 
     const ch = facts.chapters.find((c) => c.id === p.chapterId);
     if (!ch) shellFail(`parte del audiolibro sin capítulo (${p.chapterId})`);
     return (
-      `<strong>${escapeHtml(`Capítulo ${ch.number}`)}</strong> · ${inlineHtml(ch.title)} — ` +
-      escapeHtml(`empieza en ${formatDurationEs(p.offsetSeconds)} · dura ${formatDurationEs(p.seconds)}`)
+      `<strong>${labelHtml(`Capítulo ${ch.number}`)}</strong>${labelHtml(' · ')}${inlineHtml(ch.title)}` +
+      labelHtml(` — empieza en ${formatDurationEs(p.offsetSeconds)} · dura ${formatDurationEs(p.seconds)}`)
     );
   });
   const inner =
     heading(h, 'h3', 'Audiolibro', s) +
-    pHtml(h, escapeHtml(`La versión narrada de los capítulos. Duración total: ${formatDurationEs(facts.audio.audiobookSeconds)}.`), s) +
+    pHtml(h, labelHtml(`La versión narrada de los capítulos. Duración total: ${formatDurationEs(facts.audio.audiobookSeconds)}.`), s) +
     audio(h, `@@PLUGINFILE@@/${SHELL_AUDIOBOOK_FILE}`, 'el audiolibro', s) +
     heading(h, 'h4', 'Índice', s) +
     ul(h, items, s);
-  return out('Audiolibro', root(h, 'shell-audiobook', inner));
+  return out('Audiolibro', root(h, 'shell-audiobook', inner), facts);
 }
 
 // ─── Sm.0 Presentación del módulo ───────────────────────────────────────────
@@ -256,7 +278,7 @@ export function moduleIntroLabel(
   const mc = moduleColor(theme, module.number - 1);
   const ms = surfOn(theme, mc.soft, [mc.onSoft]);
   const header = box(h, eyebrow(h, `Módulo ${module.number}`, ms) + heading(h, 'h2', module.title, ms), { s: ms, border: mc.border }, { accentLeft: mc.main });
-  const journey = intro.journey.map((j, i) => `<strong>${escapeHtml(`Capítulo ${chapters[i].number}`)}</strong> · ${inlineHtml(chapters[i].title)}: ${inlineHtml(j.line)}`);
+  const journey = intro.journey.map((j, i) => `<strong>${labelHtml(`Capítulo ${chapters[i].number}`)}</strong>${labelHtml(' · ')}${inlineHtml(chapters[i].title)}${labelHtml(': ')}${inlineHtml(j.line)}`);
   const inner =
     header +
     paras(h, intro.presentation, s) +
@@ -264,7 +286,7 @@ export function moduleIntroLabel(
     ul(h, intro.outcomes.map((o) => inlineHtml(o)), s) +
     heading(h, 'h4', 'Recorrido del módulo', s) +
     ul(h, journey, s);
-  return out(`Módulo ${module.number}: presentación`, root(h, `shell-module-${module.number}`, inner));
+  return out(`Módulo ${module.number}: presentación`, root(h, `shell-module-${module.number}`, inner), facts);
 }
 
 // ─── Sm.E Evaluación del módulo / SZ Evaluación final ───────────────────────
@@ -277,23 +299,23 @@ function examInfo(
   lead: string,
   questionCount: number,
   kind: AssessableType,
-  facts: Pick<CourseFacts, 'assessment'>,
+  facts: CourseFacts,
 ): ShellLabel {
   const k = facts.assessment.kinds[kind];
   const cs = toneSurf(h, 'alt');
   const items = [
-    `<strong>Preguntas:</strong> ${questionCount}`,
-    `<strong>Nota mínima para aprobar:</strong> ${k.passingGrade} de 100`,
-    `<strong>Intentos:</strong> ${escapeHtml(attemptsValue(k.attempts))}`,
-    `<strong>Calificación:</strong> ${escapeHtml(`se toma ${GRADE_METHOD_ES[k.gradeMethod]}`)}`,
+    kv('Preguntas', String(questionCount)),
+    kv('Nota mínima para aprobar', `${k.passingGrade} de 100`),
+    kv('Intentos', attemptsValue(k.attempts)),
+    kv('Calificación', `se toma ${GRADE_METHOD_ES[k.gradeMethod]}`),
   ];
-  const inner = eyebrow(h, 'Evaluación', cs.s) + heading(h, 'h3', title, cs.s) + pHtml(h, escapeHtml(lead), cs.s) + ul(h, items, cs.s);
-  return out(name, root(h, uid, box(h, inner, cs)));
+  const inner = eyebrow(h, 'Evaluación', cs.s) + heading(h, 'h3', title, cs.s) + pHtml(h, labelHtml(lead), cs.s) + ul(h, items, cs.s);
+  return out(name, root(h, uid, box(h, inner, cs)), facts);
 }
 
 export function examInfoLabel(
   module: ModuleFacts,
-  facts: Pick<CourseFacts, 'assessment'>,
+  facts: CourseFacts,
   theme: ResolvedTheme,
   opts?: ShellRenderOptions,
 ): ShellLabel {
@@ -337,6 +359,6 @@ export function closingLabel(facts: CourseFacts, courseIntro: CourseIntroV3, the
   const next = facts.finalExam.enabled
     ? 'Para terminar, completa la evaluación final.'
     : 'Has completado el recorrido del curso.';
-  const inner = heading(h, 'h3', 'Cierre del curso', s) + paras(h, intro.closing, s) + pHtml(h, escapeHtml(next), s, { weight: 700, last: true });
-  return out('Cierre del curso', root(h, 'shell-closing', inner));
+  const inner = heading(h, 'h3', 'Cierre del curso', s) + paras(h, intro.closing, s) + pHtml(h, labelHtml(next), s, { weight: 700, last: true });
+  return out('Cierre del curso', root(h, 'shell-closing', inner), facts);
 }

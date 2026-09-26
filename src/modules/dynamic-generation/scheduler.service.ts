@@ -8,6 +8,7 @@ import {
   Optional,
   ServiceUnavailableException,
 } from '@nestjs/common';
+import { createHash } from 'crypto';
 import { DataSource } from 'typeorm';
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
@@ -350,9 +351,15 @@ export class SchedulerService {
       if (opts.ownerId !== undefined && opts.ownerId !== null) {
         await this.assertBrowserTypesMatchRun(opts.runId, opts.ownerId, types);
       }
-      const item = await this.claimInRun(opts.runId, executorId, types, leaseSeconds, opts.ownerId);
-      if (!item) await this.reportMissingDependencies(opts.runId, opts.ownerId);
-      return item;
+      // M6: un item cuyo payload no se puede armar se marca failed dentro del
+      // claim; se sigue con el próximo candidato en vez de devolver "nada".
+      for (let attempt = 0; attempt < GLOBAL_CLAIM_RACE_RETRIES; attempt++) {
+        const r = await this.claimInRun(opts.runId, executorId, types, leaseSeconds, opts.ownerId);
+        if (r.item) return r.item;
+        if (!r.unavailable) break;
+      }
+      await this.reportMissingDependencies(opts.runId, opts.ownerId);
+      return null;
     }
 
     // Global (worker, R16). Orden de locks: el candidato se ELIGE sin tomar
@@ -393,7 +400,7 @@ export class SchedulerService {
         return null;
       }
       tried.push(cand.id);
-      const item = await this.claimInRun(cand.job_id, executorId, types, leaseSeconds, opts.ownerId, cand.id);
+      const { item } = await this.claimInRun(cand.job_id, executorId, types, leaseSeconds, opts.ownerId, cand.id);
       if (item) return item;
     }
     this.logger.warn(
@@ -415,7 +422,7 @@ export class SchedulerService {
     leaseSeconds: number,
     ownerId?: string,
     itemId?: string,
-  ): Promise<ClaimedItem | null> {
+  ): Promise<{ item: ClaimedItem | null; unavailable: boolean }> {
     let cancelledJob: any = null;
     let unavailable: string | null = null;
     const claimed = await this.runs.tx(async (qr) => {
@@ -478,7 +485,7 @@ export class SchedulerService {
       this.logger.error(`Item ${unavailable} — marcado failed en el claim (dato de una dependencia ausente; no se inventa)`);
     }
     if (cancelledJob) await this.runs.reconcileCancellation(cancelledJob);
-    return claimed;
+    return { item: claimed, unavailable: unavailable !== null };
   }
 
   /**
@@ -593,7 +600,9 @@ export class SchedulerService {
       return failed.ok ? { ok: false, reason: V3_PAYLOAD_INVALID, errors: pre.codes } : failed;
     }
     const validationPatch =
-      pre.kind === 'valid' ? { v3Validation: { artifactType: pre.artifactType, artifactId: pre.artifactId, ...pre.summary } } : {};
+      pre.kind === 'valid'
+        ? { v3Validation: { artifactType: pre.artifactType, artifactId: pre.artifactId, contentSha256: pre.contentSha256, ...pre.summary } }
+        : {};
 
     return this.guardedItemOp(itemRunId, executorId, ownerId, 'update', async (qr, job, item) => {
       if (pre.kind === 'valid') {
@@ -809,7 +818,15 @@ export class SchedulerService {
   ): Promise<
     | { kind: 'skip' }
     | { kind: 'invalid'; message: string; codes: string[]; retryable: boolean }
-    | { kind: 'valid'; artifactType: string; artifactId: string; storageBucket: string; storagePath: string; summary: Record<string, unknown> }
+    | {
+        kind: 'valid';
+        artifactType: string;
+        artifactId: string;
+        storageBucket: string;
+        storagePath: string;
+        contentSha256: string;
+        summary: Record<string, unknown>;
+      }
   > {
     if (!UUID_RE.test(String(itemRunId))) return { kind: 'skip' };
     const [g] = await this.dataSource.query(
@@ -824,7 +841,10 @@ export class SchedulerService {
     if (!g || Number(g.rules_version) !== 3 || g.status !== 'running' || g.worker_id !== executorId) return { kind: 'skip' };
     const manifest = typeof g.manifest_json === 'string' ? JSON.parse(g.manifest_json) : g.manifest_json;
     const mItem = (manifest?.items ?? []).find((i: any) => i && i.key === g.item_key);
-    if (!mItem) return { kind: 'skip' };
+    if (!mItem) {
+      // M5 (fail closed): un item v3 running sin su entrada del Manifest es integridad rota.
+      throw new InternalServerErrorException(`v3_validation_context: el item ${g.item_key} no está en su Manifest congelado; no se completa sin validar`);
+    }
     const artifactType = v3ValidatedArtifactType(g.type, mItem.variant ?? null);
     if (!artifactType) return { kind: 'skip' };
 
@@ -852,12 +872,15 @@ export class SchedulerService {
     if (g.type === 'module_intro') {
       const mod = (manifest.modules ?? []).find((m: any) => m.moduleId === g.module_id);
       ctx.moduleChapterIds = mod ? mod.chapters.map((c: any) => c.chapterId) : [];
-      if (ctx.moduleChapterIds.length === 0) return { kind: 'skip' };
+      if (ctx.moduleChapterIds.length === 0) {
+        throw new InternalServerErrorException(`v3_validation_context: el module_intro ${g.item_key} no tiene capítulos en el Manifest; no se completa sin validar`);
+      }
     }
     if (g.type === 'video_interactions') {
       const vf = await this.loadVideoFacts(this.dataSource, g.job_id, g.manifest_id, `video:${g.chapter_id}`);
       if (vf.ok === false) {
-        return { kind: 'invalid', message: `${V3_PAYLOAD_INVALID}: ${vf.code}: ${vf.message}`, codes: [vf.code], retryable: false };
+        // M6: reintentable — si el video se regenera, un claim nuevo trae el plan vigente.
+        return { kind: 'invalid', message: `${V3_PAYLOAD_INVALID}: ${vf.code}: ${vf.message}`, codes: [vf.code], retryable: true };
       }
       ctx.video = { videoItemKey: vf.video.videoItemKey, durationSec: vf.video.durationSec };
     }
@@ -895,6 +918,8 @@ export class SchedulerService {
       artifactId: art.id,
       storageBucket: art.storage_bucket,
       storagePath: art.storage_path,
+      // M7: huella del contenido validado; el empaque (R12) verifica que el objeto descargado coincida.
+      contentSha256: createHash('sha256').update(text, 'utf8').digest('hex'),
       summary: (r.summary ?? {}) as Record<string, unknown>,
     };
   }
@@ -944,7 +969,7 @@ export class SchedulerService {
       const mod = manifest.modules.find((m) => m.moduleId === row.module_id);
       out.moduleChapterIds = mod ? mod.chapters.map((c) => c.chapterId) : [];
     }
-    if (row.type === 'activity' && mItem.variant === 'h5p') out.activityType = activityTypeForChapter(mItem.chapterNumber);
+    if (row.type === 'activity' && mItem.variant === 'h5p') out.activityType = activityTypeForChapter(row.chapter_id);
     if (row.type === 'video_interactions') {
       const vf = await this.loadVideoFacts(qr, row.job_id, row.manifest_id, `video:${row.chapter_id}`);
       if (vf.ok === false) throw new ClaimPayloadUnavailable(vf.code, vf.message);

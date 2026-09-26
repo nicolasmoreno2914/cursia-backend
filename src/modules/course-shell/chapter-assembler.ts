@@ -21,7 +21,7 @@
  */
 import type { ResolvedTheme } from '../theme-engine';
 import { ChapterExperience, assertValidExperience, lintCleanSafe, renderMovement } from '../visual-components';
-import { escapeHtml, inlineHtml } from '../visual-components/text';
+import { labelHtml, inlineHtml } from '../visual-components/text';
 import type { ChapterFacts, CourseFacts, ModuleFacts } from './facts';
 import {
   ShellRenderOptions,
@@ -36,6 +36,7 @@ import {
   shellFail,
   toneSurf,
   transitionBox,
+  unprotectedText,
 } from './html';
 import { COPY, activityInstruction, bridgeText, moduleExamTransition } from './microcopy';
 
@@ -80,6 +81,8 @@ export function chapterSlotSequence(flags: { videoEnabled: boolean; activityEnab
 function check(html: string, name: string): string {
   const lint = lintCleanSafe(html);
   if (!lint.ok) shellFail(`${name}: no pasa CLEAN_SAFE: ${lint.errors.slice(0, 3).map((e) => `${e.code} ${e.message}`).join('; ')}`);
+  const bare = unprotectedText(html);
+  if (bare.length) shellFail(`${name}: texto sin protección nolink: ${JSON.stringify(bare.slice(0, 3))}`);
   return html;
 }
 
@@ -126,8 +129,8 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   slots.push(label('deepening', 'Profundización', mv('deepening')));
   // [4] Video: guía previa (plantilla + conceptos del LLM) + transición → video.
   if (ch.videoEnabled) {
-    const before = heading(h, 'h3', COPY.videoPrimerTitle, s) + pHtml(h, escapeHtml(COPY.videoPrimerLead), s);
-    const after = transitionBox(h, pHtml(h, escapeHtml(COPY.videoGo), alt, { last: true }));
+    const before = heading(h, 'h3', COPY.videoPrimerTitle, s) + pHtml(h, labelHtml(COPY.videoPrimerLead), s);
+    const after = transitionBox(h, pHtml(h, labelHtml(COPY.videoGo), alt, { last: true }));
     slots.push(label('video_primer', 'Antes del video', injectIntoMovement(mv('video_primer'), before, after)));
     slots.push({ kind: 'video_h5p' });
   }
@@ -138,24 +141,28 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     const k = assessment.kinds.activity;
     const inner = transitionBox(
       h,
-      heading(h, 'h3', COPY.activityTitle, alt) + pHtml(h, escapeHtml(activityInstruction(k.passingGrade, k.attempts)), alt, { last: true }),
+      heading(h, 'h3', COPY.activityTitle, alt) + pHtml(h, labelHtml(activityInstruction(k.passingGrade, k.attempts)), alt, { last: true }),
     );
     slots.push(label('activity_instruction', 'Práctica', root(h, uid('activity_instruction'), inner)));
     slots.push({ kind: 'activity', variant: ch.activityVariant as 'h5p' | 'scorm' });
   } else {
-    const before = pHtml(h, escapeHtml(COPY.selfCheckLead), s);
+    const before = pHtml(h, labelHtml(COPY.selfCheckLead), s);
     slots.push(label('self_check', 'Repaso', injectIntoMovement(mv('self_check'), before, '')));
   }
   // [7] Cierre + puente (LLM, sin recursos) + transiciones determinísticas.
-  let after = paras(h, exp.bridge_to_next, s);
+  // M12: el puente del LLM ("a continuación…") solo cuando realmente sigue otro
+  // capítulo; antes de un examen de módulo o al final del curso manda la
+  // transición determinística (nunca dos mensajes de navegación contradictorios).
+  const examNext = lastOfModule && mod.examEnabled;
+  let after = input.nextChapter && !examNext ? paras(h, exp.bridge_to_next, s) : '';
   const bridge: string[] = [];
-  if (lastOfModule && mod.examEnabled) {
+  if (examNext) {
     if (!Number.isInteger(mod.examQuestionCount) || (mod.examQuestionCount as number) < 1) {
       shellFail(`módulo ${mod.number} con examen sin cantidad de preguntas medida`);
     }
     bridge.push(moduleExamTransition({ number: mod.number, examQuestionCount: mod.examQuestionCount as number }, assessment.kinds.exam.passingGrade));
   }
-  bridge.push(bridgeText({ activityEnabled: ch.activityEnabled, next: input.nextChapter ?? null }));
+  bridge.push(bridgeText({ activityEnabled: ch.activityEnabled, activityAttempts: assessment.kinds.activity.attempts, next: input.nextChapter ?? null }));
   after += transitionBox(h, bridge.map((b, i) => pHtml(h, inlineHtml(b), alt, { last: i === bridge.length - 1 })).join(''));
   slots.push(label('closing', 'Cierre', injectIntoMovement(mv('closing'), '', after)));
   return slots;

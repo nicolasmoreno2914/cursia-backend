@@ -117,6 +117,8 @@ check('1b: pdfPageCount — los 9 PDFs de V1 (reales si hay scratch, sintéticos
     const { pdfBytes, real } = loadV1ChapterBytes(n);
     const count = pdfPageCount(pdfBytes);
     assertTrue(Number.isInteger(count) && count >= 1, `cap${n}: page count inválido (${count})`);
+    // M8: los PDFs reales de V1 tienen exactamente 10 páginas (medido); fijado para detectar regresiones.
+    if (real) assertEqual(count, 10, `cap${n}: el PDF real de V1 tiene 10 páginas`);
     console.log(`      cap${n}_presentacion.pdf (${real ? 'real V1' : 'sintético'}): ${count} páginas`);
   }
 });
@@ -130,6 +132,52 @@ check('1d: pdfPageCount — PDF sin /Pages ni /Page en absoluto lanza PDF_PAGECO
   const bogus = Buffer.from('%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n', 'latin1');
   const e = assertThrows(() => pdfPageCount(bogus), 'PDF sin árbol de páginas');
   assertTrue(e.message.startsWith('PDF_PAGECOUNT_UNKNOWN'), `mensaje inesperado: ${e.message}`);
+});
+
+// ── 1e–1j: fix round 1 (review G5 I2/M1, sondas p1) — nunca un número dudoso ──
+const zlib = require('zlib');
+const pdfOf = (s) => Buffer.from(s, 'latin1');
+function unknown(buf, what) {
+  const e = assertThrows(() => pdfPageCount(buf), what);
+  assertTrue(e.code === 'PDF_PAGECOUNT_UNKNOWN', `${what}: código ${e.code} (${e.message})`);
+}
+check('1e: pdfPageCount — un /Outlines /Count cercano NO contamina: se resuelve /Root → /Pages', () => {
+  const near = pdfOf('%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R /Outlines 3 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [4 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Outlines /First 5 0 R /Count 25 >> endobj\n4 0 obj << /Type /Page /Parent 2 0 R >> endobj\ntrailer << /Root 1 0 R >>\n%%EOF');
+  assertEqual(pdfPageCount(near), 1, 'outlines cerca');
+  const before = pdfOf('%PDF-1.4\n3 0 obj << /Type /Outlines /Count 17 >> endobj\n2 0 obj << /Type /Pages /Kids [4 0 R 5 0 R] /Count 2 >> endobj\n4 0 obj << /Type /Page /Parent 2 0 R >> endobj 5 0 obj << /Type /Page /Parent 2 0 R >> endobj\n%%EOF');
+  assertEqual(pdfPageCount(before), 2, 'outlines antes del /Pages (sin trailer: única raíz /Pages)');
+});
+check('1f: pdfPageCount — actualización incremental: gana la versión vigente del nodo /Pages', () => {
+  const inc = pdfOf('%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [4 0 R 5 0 R] /Count 2 >> endobj\n4 0 obj << /Type /Page >> endobj 5 0 obj << /Type /Page >> endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n2 0 obj << /Type /Pages /Kids [4 0 R] /Count 1 >> endobj\ntrailer << /Root 1 0 R /Prev 9 >>\n%%EOF');
+  assertEqual(pdfPageCount(inc), 1, 'incremental');
+  const incNoTrailer = pdfOf('%PDF-1.4\n2 0 obj << /Type /Pages /Kids [4 0 R 5 0 R] /Count 2 >> endobj\n%%EOF\n2 0 obj << /Type /Pages /Kids [4 0 R] /Count 1 >> endobj\n%%EOF');
+  assertEqual(pdfPageCount(incNoTrailer), 1, 'incremental sin trailer');
+});
+check('1g: pdfPageCount — /Count 0, /Count indirecto y raíces /Pages ambiguas → PDF_PAGECOUNT_UNKNOWN', () => {
+  unknown(pdfOf('%PDF-1.4\n2 0 obj << /Type /Pages /Kids [] /Count 0 >> endobj\n%%EOF'), '/Count 0');
+  unknown(pdfOf('%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Count 7 0 R >> endobj\ntrailer << /Root 1 0 R >>'), '/Count indirecto');
+  unknown(pdfOf('%PDF-1.4\n2 0 obj << /Type /Pages /Count 3 >> endobj\n6 0 obj << /Type /Pages /Count 5 >> endobj\n%%EOF'), 'dos raíces sin /Root');
+  unknown(pdfOf('%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 9 0 R >> endobj\ntrailer << /Root 1 0 R >>'), '/Pages inexistente');
+});
+check('1h: pdfPageCount — ObjStm comprimido con catálogo + xref stream (forma de Gamma)', () => {
+  const objs = ['<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Outlines /Count 40 >>', '<< /Type /Pages /Kids [4 0 R] /Count 10 >>'];
+  const nums = [1, 3, 2];
+  let off = 0; const hdr = []; let body = '';
+  objs.forEach((o, i) => { hdr.push(`${nums[i]} ${off}`); body += o + ' '; off += o.length + 1; });
+  const head = hdr.join(' ') + ' ';
+  const data = zlib.deflateSync(Buffer.from(head + body, 'latin1'));
+  const pdf = Buffer.concat([
+    pdfOf(`%PDF-1.7\n5 0 obj << /Type /ObjStm /N 3 /First ${head.length} /Filter /FlateDecode /Length ${data.length} >> stream\n`), data,
+    pdfOf('\nendstream endobj\n6 0 obj << /Type /XRef /Root 1 0 R /Size 7 >> stream\nxx\nendstream endobj\n%%EOF'),
+  ]);
+  assertEqual(pdfPageCount(pdf), 10, 'ObjStm + xref stream');
+});
+check('1i: pdfPageCount — ObjStm que infla > 32 MiB → PDF_PAGECOUNT_UNKNOWN sin agotar memoria', () => {
+  const big = zlib.deflateSync(Buffer.alloc(50 * 1024 * 1024));
+  const pdf = Buffer.concat([pdfOf('%PDF-1.5\n1 0 obj << /Type /ObjStm /N 1 /First 4 /Filter /FlateDecode >> stream\n'), big, pdfOf('\nendstream endobj\n%%EOF')]);
+  const rss0 = process.memoryUsage().rss;
+  unknown(pdf, 'bomba');
+  assertTrue(process.memoryUsage().rss - rss0 < 80e6, 'la bomba consumió demasiada memoria');
 });
 
 // ── 2: PNG dimensions ───────────────────────────────────────────────────────
@@ -166,11 +214,24 @@ function buildCard(theme, slideCount) {
   });
 }
 
-check('3: presentationCardHtml — pasa el lint CLEAN_SAFE mínimo (claro y oscuro)', () => {
-  for (const theme of [lightTheme, darkTheme]) {
-    const html = buildCard(theme, 12);
-    const violations = lintCleanSafeMinimal(html);
-    assertEqual(violations.length, 0, `violaciones CLEAN_SAFE: ${JSON.stringify(violations)}`);
+const vc = require(path.resolve(process.cwd(), 'dist/modules/visual-components/index.js'));
+const COMBOS = [
+  ['aula-clara', 'light'], ['institucional', 'light'], ['editorial', 'light'], ['vibrante', 'light'],
+  ['tecnico', 'light'], ['tecnico', 'dark'], ['oscuro-premium', 'dark'],
+];
+check('3: presentationCardHtml — pasa lintCleanSafe REAL de R2 en los 7 temas × {CLEAN_SAFE, ENHANCED}; CLEAN_SAFE sin capa ENHANCED; todo texto en nolink', () => {
+  for (const [f, m] of COMBOS) {
+    const theme = resolveTheme({ themeFamily: f, mode: m });
+    for (const level of [undefined, 'enhanced']) {
+      for (let mi = 0; mi < 4; mi++) {
+        const html = presentationCardHtml({ chapterNumber: 3, chapterTitle: 'Título', coverUrl: 'c.png', pdfUrl: 'p.pdf', slideCount: 10, theme, moduleColor: moduleColor(theme, mi), level });
+        const r = vc.lintCleanSafe(html);
+        assertTrue(r.ok, `${f}-${m}/${level || 'clean'}/módulo ${mi}: ${JSON.stringify(r.errors.slice(0, 3))}`);
+        if (!level) assertTrue(!/border-radius|box-shadow|height:auto|display:|rgba\(/.test(html), `${f}-${m}: capa ENHANCED en CLEAN_SAFE`);
+        else assertTrue(/border-radius/.test(html), 'ENHANCED sin radius');
+        assertTrue(html.includes('<span class="nolink">Ver presentación completa (PDF, 10 diapositivas)</span>'), 'enlace sin nolink');
+      }
+    }
   }
 });
 
@@ -184,19 +245,17 @@ check('4: presentationCardHtml — contiene el N medido y el link de respaldo, n
   assertTrue(singular.includes('PDF, 1 diapositiva)'), 'singular de "diapositiva" cuando N=1');
 });
 
-check('4b: presentationCardHtml — escapa HTML en el título (alt e img)', () => {
+check('4b: presentationCardHtml — el título (texto libre) no va en atributos: alt fijo, sin HTML crudo', () => {
   const html = buildCard(lightTheme, 5);
-  assertTrue(!html.includes('<raros>'), 'no debe inyectar HTML crudo del título');
-  assertTrue(html.includes('&lt;raros&gt;'), 'el título debe quedar HTML-escapado');
+  assertTrue(!html.includes('<raros>') && !html.includes('&lt;raros&gt;'), 'el título no debe aparecer en la tarjeta');
+  assertTrue(html.includes('alt="Portada de la presentación del capítulo 3"'), 'alt fijo');
 });
 
-check('4c: presentationCardHtml — responsive a 390px (imagen max-width/width sin height fijo en la parte safe)', () => {
-  const html = buildCard(lightTheme, 5);
-  const imgMatch = html.match(/<img[^>]*style="([^"]*)"/);
-  assertTrue(!!imgMatch, 'debe haber un <img>');
-  const style = imgMatch[1];
-  assertTrue(/max-width:100%/.test(style), 'max-width:100%');
-  assertTrue(/width:100%/.test(style), 'width:100%');
+check('4c: presentationCardHtml — tamaño responsivo del <img> solo en ENHANCED (el purificador lo descarta en <img>)', () => {
+  const clean = buildCard(lightTheme, 5).match(/<img[^>]*style="([^"]*)"/)[1];
+  assertTrue(!/width/.test(clean), `CLEAN_SAFE no declara width en <img>: ${clean}`);
+  const enh = presentationCardHtml({ chapterNumber: 3, chapterTitle: 't', coverUrl: 'c', pdfUrl: 'p', slideCount: 5, theme: lightTheme, moduleColor: moduleColor(lightTheme, 0), level: 'enhanced' }).match(/<img[^>]*style="([^"]*)"/)[1];
+  assertTrue(/max-width:100%/.test(enh) && /width:100%/.test(enh) && /height:auto/.test(enh), `ENHANCED responsivo: ${enh}`);
 });
 
 check('4d: presentationCardHtml — slideCount inválido (<1 o no entero) falla fuerte', () => {
@@ -239,14 +298,26 @@ check('6d: gammaThemeFor — todas las 6 familias × sus modos soportados resuel
   }
 });
 
-check('7: themeMismatch — misma familia no genera aviso; familia distinta sí', () => {
-  const same = themeMismatch('aula-clara', 'aula-clara');
-  assertEqual(same.mismatch, false, 'misma familia => sin mismatch');
+check('7: themeMismatch — por tema de Gamma efectivo: cambio de familia y cambio de MODO avisan; nunca regenera', () => {
+  process.env.GAMMA_THEME_V21_LIGHT_DEFAULT = 'gamma-light-default-id';
+  process.env.GAMMA_THEME_V21_DARK_DEFAULT = 'gamma-dark-default-id';
+  process.env.GAMMA_THEME_V21_OSCURO_PREMIUM_DARK = 'gamma-oscuro-id';
+  const art = { gammaThemeId: 'gamma-light-default-id', themeFamilyAtGeneration: 'tecnico', themeModeAtGeneration: 'light' };
+  const same = themeMismatch(art, { familyId: 'tecnico', mode: 'light' });
+  assertEqual(same.mismatch, false, 'mismo tema => sin mismatch');
   assertTrue(same.warning === undefined, 'sin warning cuando no hay mismatch');
-
-  const diff = themeMismatch('aula-clara', 'oscuro-premium');
-  assertEqual(diff.mismatch, true, 'familia distinta => mismatch');
-  assertEqual(diff.warning, 'theme_mismatch', 'warning debe ser theme_mismatch');
+  const mode = themeMismatch(art, { familyId: 'tecnico', mode: 'dark' });
+  assertEqual(JSON.stringify([mode.mismatch, mode.warning, mode.changed]), JSON.stringify([true, 'theme_mismatch', ['mode', 'gammaTheme']]), 'cambio de modo');
+  const fam = themeMismatch(art, { familyId: 'oscuro-premium', mode: 'dark' });
+  assertEqual(JSON.stringify([fam.mismatch, fam.changed]), JSON.stringify([true, ['family', 'mode', 'gammaTheme']]), 'cambio de familia');
+  // familia distinta que mapea al MISMO tema de Gamma: sin aviso (la presentación ya es la correcta).
+  const sameGamma = themeMismatch(art, { familyId: 'editorial', mode: 'light' });
+  assertEqual(JSON.stringify([sameGamma.mismatch, sameGamma.changed]), JSON.stringify([false, ['family']]), 'mismo tema Gamma');
+  // artifact previo sin modo registrado: la comparación por gammaThemeId sigue funcionando.
+  assertEqual(themeMismatch({ gammaThemeId: 'gamma-light-default-id', themeFamilyAtGeneration: 'tecnico' }, { familyId: 'tecnico', mode: 'dark' }).mismatch, true, 'sin modo registrado');
+  const r = themeMismatch(art, { familyId: 'tecnico', mode: 'dark' });
+  assertTrue(!('regenerate' in r), 'themeMismatch nunca ordena regenerar');
+  delete process.env.GAMMA_THEME_V21_OSCURO_PREMIUM_DARK;
 });
 
 // ── 8: validatePresentationArtifact ─────────────────────────────────────────
@@ -254,7 +325,7 @@ function validArtifact() {
   return {
     schemaVersion: 1,
     chapterId: 'chapter-uuid-1',
-    gammaGenerationId: null,
+    gammaGenerationId: 'gamma-gen-1',
     pdf: { storagePath: 's3://x/cap1.pdf', sha256: 'a'.repeat(64), bytes: 1000 },
     cover: { storagePath: 's3://x/cap1.png', sha256: 'b'.repeat(64), bytes: 500, width: 1280, height: 720 },
     slideCount: 12,
@@ -307,6 +378,17 @@ check('8e: validatePresentationArtifact — rechaza schemaVersion incorrecta y o
   assertTrue(validatePresentationArtifact(a).some((e) => e.code === 'SCHEMA_VERSION'));
   assertTrue(validatePresentationArtifact(null).some((e) => e.code === 'NOT_AN_OBJECT'));
   assertTrue(validatePresentationArtifact('nope').some((e) => e.code === 'NOT_AN_OBJECT'));
+});
+
+check('8f: validatePresentationArtifact — mock ⇔ gammaGenerationId null (M13) y themeModeAtGeneration válido', () => {
+  const a = validArtifact(); a.gammaGenerationId = null;
+  assertTrue(validatePresentationArtifact(a).some((e) => e.code === 'MOCK_UNDECLARED'), 'null sin mock');
+  const b = validArtifact(); b.mock = true;
+  assertTrue(validatePresentationArtifact(b).some((e) => e.code === 'MOCK_WITH_GENERATION'), 'mock con generación');
+  const c = validArtifact(); c.themeModeAtGeneration = 'sepia';
+  assertTrue(validatePresentationArtifact(c).some((e) => e.code === 'THEME_MODE'), 'modo inválido');
+  const d = validArtifact(); d.themeModeAtGeneration = 'dark';
+  assertEqual(validatePresentationArtifact(d).length, 0, 'modo válido');
 });
 
 // ── 9: mockPresentationArtifactFromFixture (E2E, nunca llama a Gamma) ───────

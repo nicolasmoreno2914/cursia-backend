@@ -48,7 +48,7 @@ export interface V3ItemValidationContext {
   variant?: string | null;
   itemKey: string;
   chapterId?: string | null;
-  /** Numeración global del Manifest (activity). */
+  /** Numeración global del Manifest (informativo; el tipo h5p sale de chapterId). */
   chapterNumber?: number | null;
   /** module_intro: capítulos del módulo en orden del Manifest. */
   moduleChapterIds?: string[];
@@ -123,11 +123,9 @@ export function validateV3ItemArtifact(ctx: V3ItemValidationContext, text: strin
       }
     }
     case 'activity': {
-      if (!Number.isInteger(ctx.chapterNumber) || (ctx.chapterNumber as number) < 1) {
-        throw new Error(`V3_VALIDATION_CONTEXT: activity ${ctx.itemKey} sin chapterNumber`);
-      }
-      const r = validateH5pActivityPayload(doc, { chapterNumber: ctx.chapterNumber as number, itemKey: ctx.itemKey });
-      return { ...r, summary: { activityType: activityTypeForChapter(ctx.chapterNumber as number) } };
+      if (!ctx.chapterId) throw new Error(`V3_VALIDATION_CONTEXT: activity ${ctx.itemKey} sin chapterId`);
+      const r = validateH5pActivityPayload(doc, { chapterId: ctx.chapterId, itemKey: ctx.itemKey });
+      return { ...r, summary: { activityType: activityTypeForChapter(ctx.chapterId) } };
     }
     default:
       throw new Error(`V3_VALIDATION_CONTEXT: tipo ${ctx.type} sin validador`);

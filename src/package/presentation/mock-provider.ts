@@ -8,7 +8,7 @@ import { pdfPageCount } from './pdf-page-count';
 import { pngDimensions } from './png-dimensions';
 import { loadV1ChapterBytes } from './fixtures-loader';
 import { PRESENTATION_ARTIFACT_SCHEMA_VERSION, type PresentationArtifact } from './artifact';
-import type { ThemeFamilyId } from '../../modules/theme-engine';
+import type { ThemeFamilyId, ThemeMode } from '../../modules/theme-engine';
 
 export type MockPresentationArtifact = PresentationArtifact & { mock: true };
 
@@ -30,7 +30,7 @@ function sha256Hex(buf: Buffer): string {
 export function mockPresentationArtifactFromFixture(
   chapterId: string,
   fixtureIndex: number,
-  opts?: { themeFamily?: ThemeFamilyId; gammaThemeId?: string; generatedAt?: string },
+  opts?: { themeFamily?: ThemeFamilyId; themeMode?: ThemeMode; gammaThemeId?: string; generatedAt?: string },
 ): MockPresentationResult {
   const { pdfBytes, coverBytes } = loadV1ChapterBytes(fixtureIndex);
 
@@ -59,6 +59,7 @@ export function mockPresentationArtifactFromFixture(
     },
     slideCount,
     themeFamilyAtGeneration,
+    themeModeAtGeneration: opts?.themeMode ?? 'light',
     gammaThemeId,
     generatedAt,
     mock: true,

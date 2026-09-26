@@ -51,15 +51,12 @@ export function v1FixtureMeta(chapterNumber: number): V1FixtureChapter | null {
 
 /**
  * Candidatos de directorio del scratch de auditoría, en orden de prioridad:
- * override explícito por env var, o el path fijo que usó esta sesión.
- * Ninguno de los dos se asume presente — sólo se usan si `fs.existsSync`.
+ * solo el override explícito `V21_AUDIT_MBZ_DIR` (fix round 1, M9: ningún
+ * path de sesión hardcodeado en src/). Se usa solo si `fs.existsSync`.
  */
 function auditMbzDirCandidates(): string[] {
   const candidates: string[] = [];
   if (process.env.V21_AUDIT_MBZ_DIR) candidates.push(process.env.V21_AUDIT_MBZ_DIR);
-  candidates.push(
-    '/private/tmp/claude-501/-Users-nicolas-Documents-Claude-course-gen/c3707ccd-9a84-4474-8052-2f6dfeb251b1/scratchpad/v21audit/mbz',
-  );
   return candidates;
 }
 

@@ -25,10 +25,11 @@
 
 const path = require('path');
 const F = require('./lib/v21-shell-fixtures');
-const { purifyMany, MOODLE_CONFIG } = require('./lib/v21-moodle-purify');
+const { purifyMany, moodleFormat, MOODLE_CONFIG } = require('./lib/v21-moodle-purify');
 
-let S, vc, te, cp;
+let S, vc, te, cp, P;
 try {
+  P = require(path.resolve(process.cwd(), 'dist/package/presentation/index.js'));
   S = require(path.resolve(process.cwd(), 'dist/modules/course-shell/index.js'));
   vc = require(path.resolve(process.cwd(), 'dist/modules/visual-components/index.js'));
   te = require(path.resolve(process.cwd(), 'dist/modules/theme-engine/index.js'));
@@ -90,7 +91,7 @@ for (const combo of F.THEME_COMBOS) {
       const labels = [
         S.welcomeLabel(facts, ci, theme, o),
         S.audioWelcomeLabel(facts, theme, o),
-        S.competenciesLabel(ci, theme, o),
+        S.competenciesLabel(facts, ci, theme, o),
         S.methodologyLabel(facts, ci, theme, o),
         S.routeLabel(facts, theme, o),
         S.libroCardLabel(77, facts, theme, o),
@@ -105,6 +106,13 @@ for (const combo of F.THEME_COMBOS) {
       for (const { slots } of S.assembleAllChapters(facts, F.experiencesFor(course.manifest), theme, o)) {
         for (const s of slots) if (s.kind === 'label') labels.push(s);
       }
+      // I4: la tarjeta de Gamma también pasa por el purificador real.
+      facts.chapters.forEach((ch) => {
+        labels.push({
+          name: `Capítulo ${ch.number} · Presentación`,
+          html: P.presentationCardHtml({ chapterNumber: ch.number, chapterTitle: ch.title, coverUrl: `@@PLUGINFILE@@/cap${ch.number}_portada.png`, pdfUrl: `@@PLUGINFILE@@/cap${ch.number}_presentacion.pdf`, slideCount: ch.slideCount, theme, moduleColor: te.moduleColor(theme, ch.moduleNumber - 1), level }),
+        });
+      });
       for (const l of labels) {
         cases.push({ name: `${tl}/${cname}/${l.name}/${level || 'clean'}`, key: `${tl}/${cname}/${l.name}`, level, html: resolveTokens(l.html) });
       }
@@ -219,6 +227,72 @@ check('ENHANCED purificado ≡ CLEAN_SAFE purificado en texto (misma informació
     assert(vc.extractText(purified[idx.get(`${c.key}/enhanced`)]) === vc.extractText(purified[j]), `${c.name}: texto distinto al CLEAN_SAFE`);
   }
 });
+
+// ─── I7: filtros de Moodle (format_text real: activitynames, emoticon, urltolink…) ─────────
+// Títulos del Blueprint = nombres REALES de actividades del curso de contexto + emoticones:
+// sin `nolink` los filtros los enlazarían/reemplazarían. Se exige que no se inyecte nada.
+let probe = null;
+try {
+  probe = moodleFormat({ mode: 'probe' });
+} catch (err) {
+  failures += 1;
+  console.error(`❌ format_text() del Moodle local no disponible: ${err.message}`);
+}
+if (probe) {
+  const [n1, n2] = probe.names;
+  const trig = (base) => `${base} ${n1} :-) (y)`;
+  const course = F.buildCourse(DIST, {
+    courseId: 520, title: trig('Curso'), finalExam: true,
+    chapterTitles: [trig('Escucha'), n2 || n1, trig('Reclamos')], moduleTitles: [trig('Bases'), n1],
+    modules: [
+      { examEnabled: true, chapters: [{ video: true, activity: true }, { video: false, activity: false }] },
+      { examEnabled: false, chapters: [{ video: true, activity: false }] },
+    ],
+  });
+  const facts = factsOf(course, 12);
+  const fcases = [];
+  for (const combo of [F.THEME_COMBOS[0], F.THEME_COMBOS[6]]) {
+    const theme = te.resolveTheme(combo);
+    for (const level of [undefined, 'enhanced']) {
+      const o = level ? { level } : undefined;
+      const ci = F.courseIntroFixture();
+      const ls = [
+        S.welcomeLabel(facts, ci, theme, o), S.audioWelcomeLabel(facts, theme, o), S.competenciesLabel(facts, ci, theme, o),
+        S.methodologyLabel(facts, ci, theme, o), S.routeLabel(facts, theme, o), S.libroCardLabel(77, facts, theme, o),
+        S.audiobookLabel(facts, theme, o), S.closingLabel(facts, ci, theme, o), S.finalExamInfoLabel(facts, theme, o),
+      ];
+      facts.modules.forEach((m, i) => {
+        ls.push(S.moduleIntroLabel(m, F.moduleIntroFixture(course.manifest, i), facts, theme, o));
+        if (m.examEnabled) ls.push(S.examInfoLabel(m, facts, theme, o));
+      });
+      for (const { slots } of S.assembleAllChapters(facts, F.experiencesFor(course.manifest), theme, o)) for (const s of slots) if (s.kind === 'label') ls.push(s);
+      facts.chapters.forEach((ch) => ls.push({ name: `card ${ch.number}`, html: P.presentationCardHtml({ chapterNumber: ch.number, chapterTitle: ch.title, coverUrl: 'c.png', pdfUrl: 'p.pdf', slideCount: ch.slideCount, theme, moduleColor: te.moduleColor(theme, 0), level }) }));
+      for (const l of ls) fcases.push({ name: `${F.themeLabel(combo)}/${level || 'clean'}/${l.name}`, html: resolveTokens(l.html) });
+    }
+  }
+  const unprotected = fcases[0].html.split('<span class="nolink">').join('<span>');
+  const out = moodleFormat({ mode: 'format', cmid: probe.cmid, items: [...fcases.map((c) => c.html), unprotected] });
+  const tagCount = (h, t) => (h.match(new RegExp(`<${t}[\\s>]`, 'gi')) || []).length;
+  check(`filtros: control — sin nolink, el label SÍ se filtra (curso ${probe.courseid}, cm ${probe.cmid})`, () => {
+    for (const v of ['noclean', 'clean']) {
+      const u = out[v][fcases.length];
+      assert(/<a\s[^>]*autolink/.test(u) || /<img[^>]*emoticon/.test(u), `${v}: los filtros no actuaron sobre el control`);
+    }
+  });
+  for (const v of ['noclean', 'clean']) {
+    check(`filtros ${v}: ${fcases.length} labels del shell/capítulo/tarjeta — ningún <a>/<img> inyectado y el texto no cambia`, () => {
+      const bad = [];
+      fcases.forEach((c, i) => {
+        const f = out[v][i];
+        if (tagCount(f, 'a') !== tagCount(c.html, 'a') || tagCount(f, 'img') !== tagCount(c.html, 'img') || /autolink|emoticon/.test(f)) bad.push(`${c.name}: enlace/imagen inyectado`);
+        if (vc.extractText(f) !== vc.extractText(c.html)) bad.push(`${c.name}: texto reescrito`);
+        const l = vc.lintCleanSafe(f);
+        if (!l.ok) bad.push(`${c.name}: ${JSON.stringify(l.errors.slice(0, 2))}`);
+      });
+      assert(bad.length === 0, `${bad.length} casos:\n   ${bad.slice(0, 5).join('\n   ')}`);
+    });
+  }
+}
 
 if (failures > 0) {
   console.error(`\n${failures} check(s) fallaron.`);
