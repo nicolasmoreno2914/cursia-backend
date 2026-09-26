@@ -127,7 +127,7 @@ export function compileLibroHtmlV3(input: LibroV3Input): string {
       const mc = moduleColor(t, mi);
       const outcomes = m.intro.outcomes.map((o) => `<li>${esc(o)}</li>`).join('');
       const preface =
-        `<section id="mod-${m.number}" class="cc-libro-module" style="border:1px solid ${mc.main};border-radius:8px;padding:0 20px 8px;">` +
+        `<section id="mod-${m.number}" class="cc-libro-module" style="border:1px solid ${mc.main};border-radius:8px;">` +
         `<h2>Módulo ${m.number} — ${esc(m.title)}</h2>\n${paragraphs(m.intro.presentation)}\n` +
         `<h4>Al terminar este módulo podrás:</h4><ul>${outcomes}</ul></section>`;
       const chapters = m.chapters

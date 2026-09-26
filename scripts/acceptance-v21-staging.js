@@ -216,12 +216,16 @@ function partial(label, mutate, expectFn) {
   check(`regeneración parcial — ${label}: 0 generación pagada; incremental_cost y avoided_cost correctos`, () => {
     const s2 = clone(base);
     const extra = mutate(s2) || {};
-    const bpB = buildBp(s2);
-    const mB = manifestOf(bpB, 2);
+    const bpClean = buildBp(s2);
+    const mB = manifestOf(bpClean, 2);
+    // `inject` cuela datos que NO son del Blueprint (perfiles) en el objeto destino: las huellas deben ignorarlos.
+    const bpB = extra.inject ? extra.inject(clone(bpClean)) : bpClean;
+    if (extra.inject) assert(JSON.stringify(bpB) !== JSON.stringify(bpClean), 'el perfil inyectado cambia el objeto');
     const plan = P.computeInvalidationPlan({
       from: { blueprint: bpBase, manifest: mBase, items: recordsOf(mBase), courseContextSha256: CTX },
       to: { blueprint: bpB, manifest: mB, courseContextSha256: CTX },
     });
+    delete extra.inject;
     const actions = Object.fromEntries(plan.actions.map((a) => [a.itemKey, a.action]));
     const paid = plan.actions.filter((a) => a.action === 'GENERATE' || a.action === 'REGENERATE');
     eq(paid.map((a) => `${a.itemKey}=${a.action}`), [], 'items que pagarían');
@@ -237,9 +241,18 @@ function partial(label, mutate, expectFn) {
     report.partial[label] = { incremental: inc.totals.incremental.expected, avoided: inc.totals.avoided, actions: counts, ...extra };
   });
 }
-// Tema y passingGrade NO son parte del Blueprint (perfiles, solo packaging): el Blueprint no cambia.
-partial('cambio de tema (perfil de presentación)', () => ({ note: 'perfil de presentación: fuera del Blueprint y de las huellas' }), (_a, c) => eq(Object.keys(c), ['REUSE'], 'todo REUSE'));
-partial('cambio de passingGrade (perfil de evaluación)', () => ({ note: 'perfil de evaluación: solo re-empaque' }), (_a, c) => eq(Object.keys(c), ['REUSE'], 'todo REUSE'));
+// Tema y passingGrade viven en course_profiles (append-only), fuera del Blueprint: el Blueprint confirmado no
+// cambia. Para que el caso no pase "por construcción", el perfil NUEVO se cuela en el objeto destino y el plan
+// debe ignorarlo (huellas sin perfiles). El re-empaque con el tema/nota nuevos (bytes distintos, mismos
+// artifacts de contenido) está probado en check-v21-packaging-v3 y en el E2E v3 (re-empaque E1).
+partial('cambio de tema (perfil de presentación colado en el destino)', () => ({
+  note: 'solo re-empaque',
+  inject: (bp) => ((bp.course.presentationProfile = { themeFamily: 'vibrante', mode: 'light', themeVersion: 1 }), bp),
+}), (_a, c) => eq(Object.keys(c), ['REUSE'], 'todo REUSE'));
+partial('cambio de passingGrade 70→80 (perfil de evaluación colado en el destino)', () => ({
+  note: 'solo re-empaque',
+  inject: (bp) => ((bp.course.assessmentProfile = { passingGrade: 80, attempts: { exam: 5 } }), bp),
+}), (_a, c) => eq(Object.keys(c), ['REUSE'], 'todo REUSE'));
 partial('reorder de capítulos dentro del módulo', (s) => {
   const ch = s.modules[1].chapters;
   ch.forEach((c, i) => (c.position = ch.length - 1 - i));

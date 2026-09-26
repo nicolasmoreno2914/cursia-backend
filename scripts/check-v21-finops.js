@@ -612,6 +612,33 @@ async function dbChecks() {
       eq(fin.inserted, false, 'CHARGE final + delta 0 ⇒ nada');
     });
 
+    // Review C1: re-preciar NUNCA liquida algo que no se midió (reserva estimada o uso vacío).
+    await check('DB: repricePendingCharge solo liquida medición real; reserva estimada o uso vacío ⇒ falla fuerte y sigue pendiente', async () => {
+      const pendingOf = async () => Number((await ledger.costsByCourse(101)).totals.pending_events);
+      const mk = (id, usage, metadata) => ledger.recordCharge({
+        itemRunId: irAv.id, ownerIdFromAuth: OWNER_A, provider: 'videogen', service: 'render', modelOrProduct: 'video-sin-precio',
+        usage, externalOperationId: id, idempotency: { kind: 'videogen', parts: { jobId: id } }, billingAccount: 'cursia', mode: 'real',
+        recordedBy: 'dynamic-item-worker', measurementStatus: 'pending', pricingFallback: 'pending_zero', metadata,
+      });
+      const before = await pendingOf();
+      const est = await mk('vg-np-est', { video_render: 1 }, { estimatedPending: true });
+      const empty = await mk('vg-np-empty', {}, null);
+      eq([est.pricingMissing, empty.event.measurement_status], [true, 'pending'], 'reserva sin precio + cargo sin medición');
+      eq(await pendingOf(), before + 2, 'dos pendientes');
+      await client.query(
+        `insert into public.pricing_catalog (provider, service, product_or_model, meter, unit_size, unit_price, currency, pricing_version, effective_from, source, verified)
+         values ('videogen','render','video-sin-precio','video_render',1,0.5,'USD','vg-np','2026-01-01T00:00:00Z','contract',false)`);
+      await rejects(ledger.repricePendingCharge('videogen:job:vg-np-est'), /INVALID_INPUT/, 'reserva estimada');
+      await rejects(ledger.repricePendingCharge('videogen:job:vg-np-empty'), /MEASUREMENT_INCOMPLETE|INVALID_INPUT/, 'uso vacío');
+      eq(await pendingOf(), before + 2, 'siguen pendientes');
+      const { rows } = await client.query(`select count(*)::int n from public.generation_cost_events where event_kind='ADJUSTMENT' and external_operation_id in ('vg-np-est','vg-np-empty')`);
+      eq(rows[0].n, 0, 'sin ajustes');
+      // La reserva estimada SÍ se liquida con la medición real.
+      const s = await ledger.settleMeasuredUsage('videogen:job:vg-np-est', { video_render: 1 }, 'measured');
+      eq([s.inserted, s.event && s.event.metadata.settlement], [true, 'measured_differs'], 'liquidada por medición');
+      eq(await pendingOf(), before + 1, 'queda solo la de uso vacío');
+    });
+
     await check('DB: cero por diseño (YouTube cuota), user_key no facturable, mock, y ESTIMATED rechazado por constraint', async () => {
       const yt = await ledger.recordZero({ kind: 'youtube', externalId: 'yt-1', ownerIdFromAuth: OWNER_A, itemRunId: irAv.id, quotaUnits: 1600, recordedBy: 'dynamic-item-worker' });
       eq([yt.event.amount, yt.event.cost_source, yt.event.quota_units, yt.event.operation, yt.event.idempotency_key], ['0.0000000000', 'ZERO_BY_DESIGN', '1600.000000', 'youtube.upload', 'youtube:video:yt-1'], 'youtube');

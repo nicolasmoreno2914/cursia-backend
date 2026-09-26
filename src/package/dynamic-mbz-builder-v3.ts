@@ -126,8 +126,10 @@ import { IdAllocator, buildQuizV3, parseScormManifestIds, scormActivityXmlV3 } f
  * 3.0.1 (fix round 1 G6): Libro sin links inseguros (M2).
  * 3.0.2 (F1/I3): categorías vacías fuera del gradebook, pesos normalizados y
  * curso sin nota (completion por vista del Libro Guía).
+ * 3.0.3 (aceptación staging): tarjetas con borde completo en vez de franja lateral
+ * (shell, tarjeta, intros, Libro) y sin reintento dentro del intento en IV/QuestionSet (HD-V21-22).
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.0.2';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.0.3';
 /** Versión del renderer de Visual Components que entra en la clave de reuse. */
 export const VC_RENDERER_VERSION = `vc${VC_SCHEMA_VERSION}-rt${VC_RUNTIME_VERSION}-theme${THEME_ENGINE_VERSION}`;
 

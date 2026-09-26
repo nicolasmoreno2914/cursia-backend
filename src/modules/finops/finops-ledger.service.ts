@@ -459,6 +459,13 @@ export class FinopsLedgerService {
     if (orig.event_kind !== 'CHARGE' || !orig.metadata?.pricingMissing) {
       throw new FinopsError('INVALID_INPUT', `${idempotencyKey} no es un CHARGE pendiente de precio`);
     }
+    // Aceptación staging (review C1): re-preciar liquida el pendiente, así que solo
+    // vale para un uso MEDIDO y completo. Una reserva estimada se liquida con la
+    // medición real (settleMeasuredUsage), nunca re-preciando el estimado.
+    if (orig.metadata?.estimatedPending) {
+      throw new FinopsError('INVALID_INPUT', `${idempotencyKey} es una reserva estimada: se liquida con la medición (settleMeasuredUsage), no re-preciando`);
+    }
+    assertCompleteMeasurement(idempotencyKey, orig.usage);
     const catalog = await this.loadCatalog(orig.provider, orig.service, orig.model_or_product);
     const priced = priceUsage(orig.usage || {}, catalog, {
       provider: orig.provider,
