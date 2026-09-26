@@ -42,6 +42,18 @@ import {
   normalizeDeliveryState,
   reportVideoDeliveryConfigAtStartup,
 } from '../modules/dynamic-generation/dynamic-video-delivery';
+import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
+import { FinopsBudgetService } from '../modules/finops/finops-budget.service';
+import {
+  WorkerBudget,
+  WorkerLedger,
+  blockWithoutGuard,
+  budgetExceededMessage,
+  recordVideogenCharge,
+  recordYoutubeUpload,
+  settleVideogenPending,
+} from './finops-worker-hooks';
+import { MOCK_VIDEO_DURATION_SEC, VideoDuration, resolveVideoDuration } from './video-duration';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fase 5A Task 4 — dynamic-item-worker: ejecuta items type='video' de un run
@@ -144,6 +156,29 @@ export interface DynamicItemWorkerDeps {
   youtubeQuotaRetrySeconds?: number;
   /** DN-1 (review I2): tope TOTAL de espera por cuota (desde la primera), en segundos. Default 86400 (24 h). */
   youtubeQuotaMaxWaitSeconds?: number;
+  /**
+   * V2.1 RF-b: ledger de costos (Videogen CALCULATED_FROM_USAGE / MOCK,
+   * YouTube ZERO_BY_DESIGN + cuota). El bootstrap SIEMPRE lo cablea; opcional
+   * solo para los harnesses previos a RF-b. Un fallo del ledger se loguea
+   * como error y nunca rompe la generación (el gasto ya ocurrió).
+   */
+  finops?: WorkerLedger | null;
+  /**
+   * V2.1 RF-b: runtime guard de presupuesto ANTES de cada envío pagado nuevo
+   * a Videogen. El bootstrap SIEMPRE lo cablea; si falla (DB) el item falla
+   * reintentable SIN enviar (fail closed).
+   */
+  budget?: WorkerBudget | null;
+}
+
+/** RF-b: un fallo del ledger nunca rompe la generación, pero se loguea fuerte. */
+async function ledgerSafe(deps: DynamicItemWorkerDeps, label: string, fn: (l: WorkerLedger) => Promise<unknown>): Promise<void> {
+  if (!deps.finops) return;
+  try {
+    await fn(deps.finops);
+  } catch (err) {
+    deps.logger.error(`finops: no se pudo registrar ${label} en el ledger — ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 interface RunHead {
@@ -307,12 +342,14 @@ async function mockPollVideoStatus(
   if (deps.mockScenario === 'fail') {
     return { ...base, status: 'failed', progress: null, error: 'Mock: render falló' };
   }
+  // V2.1: el mock devuelve la duración de la fixture (R11a necesita la duración medida).
   return {
     ...base,
     status: 'completed',
     progress: 100,
     download_url: `https://mock-cdn.cursia.local/dynamic/${jobId}.mp4`,
-  };
+    duration_seconds: MOCK_VIDEO_DURATION_SEC,
+  } as VideogenBatchJob;
 }
 
 /** Señal interna: la lease del item se perdió a mitad de una operación — el llamador debe abortar sin fail/complete. */
@@ -453,6 +490,26 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
         if (leaseLost) return;
       }
 
+      // V2.1 RF-b: runtime guard de presupuesto JUSTO antes de un envío NUEVO
+      // (gasto). committed = actual(run) + reservas + este render <= autorizado;
+      // si no → item `blocked` con budget_exceeded, sin marcar el submit y 0 gasto.
+      if (mode === 'real') {
+        // RF-b fix round 2 (M3): sin guard de presupuesto cableado NO se envía nada
+        // (fail CLOSED, sin marcar el submit). El item queda bloqueado con un error claro.
+        if (!deps.budget) {
+          logger.error(`Item ${item.itemKey} (run ${item.runId}): runtime guard de presupuesto no configurado — no se envía a Videogen (fail closed)`);
+          await blockWithoutGuard(scheduler, item.itemRunId, deps.executorId, 'Videogen');
+          return;
+        }
+        const g = await deps.budget.guardPaidSubmission({ runId: item.runId, itemRunId: item.itemRunId, itemType: 'video' });
+        if (!g.allow) {
+          logger.warn(`Item ${item.itemKey} (run ${item.runId}): presupuesto excedido (${g.reason}) — no se envía a Videogen`);
+          await scheduler.blockItemForBudget(item.itemRunId, deps.executorId, budgetExceededMessage(g));
+          return;
+        }
+        if (leaseLost) return;
+      }
+
       const contentTxt = buildContentTxt(item, markdown);
       const chapterTitle = item.blueprint.chapter?.title ?? `Capítulo ${item.chapterNumber ?? '?'}`;
 
@@ -524,12 +581,33 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
 
       if (isDynamicVideoCompleted(status.status)) {
         let cost: number | null = null;
+        let costError: string | null = null;
         if (mode === 'real') {
           try {
             cost = (await deps.videogen.getVideoCost(jobId)).estimated_total_cost;
           } catch (err) {
-            logger.warn(`Item ${item.itemKey}: no se pudo obtener el costo real de Videogen — ${err instanceof Error ? err.message : String(err)}`);
+            costError = err instanceof Error ? err.message : String(err);
+            logger.warn(`Item ${item.itemKey}: no se pudo obtener el costo real de Videogen — ${costError}`);
           }
+        }
+        // V2.1 RF-b: un CHARGE por job (idempotente por videogenJobId): MOCK a 0,
+        // CALCULATED_FROM_USAGE con el costo de Videogen, o pendiente si falló la consulta.
+        const jobIdForLedger = jobId;
+        await ledgerSafe(deps, `el render ${jobIdForLedger}`, (l) =>
+          recordVideogenCharge(l, {
+            ownerId: runHead.ownerId, itemRunId: item.itemRunId, jobId: jobIdForLedger, mode, cost,
+            costError, outputSummary: item.outputSummary,
+          }));
+        // V2.1 (R11a): duración medida del video (status de Videogen; el worker no
+        // tiene los bytes del MP4 ni consulta YouTube). Sin fuente → null + 'unknown'.
+        // `external` nunca cambia un valor ya registrado (external_conflict): un
+        // re-claim del mismo job reutiliza la duración que ya quedó guardada.
+        const priorExternal = (item.outputSummary?.external ?? {}) as Record<string, any>;
+        const duration: VideoDuration = priorExternal.durationSec !== undefined
+          ? { durationSec: priorExternal.durationSec ?? null, durationSource: priorExternal.durationSource ?? 'unknown' }
+          : resolveVideoDuration({ videogenStatus: status });
+        if (duration.durationSec === null) {
+          logger.warn(`Item ${item.itemKey}: Videogen no informó la duración del video (durationSource=unknown)`);
         }
         if (runHead.videoDelivery === 'youtube') {
           // 5B.2.A: con YouTube, completed_local es INTERMEDIO — se persiste
@@ -540,6 +618,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
             videogenStatus: status.status,
             videogenDownloadUrl: status.download_url ?? null,
             costUsd: cost,
+            external: { durationSec: duration.durationSec, durationSource: duration.durationSource },
           });
           if (!recorded) {
             logger.warn(`Item ${item.itemKey}: lease perdida al registrar completed_local — se detiene sin publicar`);
@@ -549,7 +628,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
           await runYoutubeDeliveryPhase(deps, item, runHead, phase, () => leaseLost);
           return;
         }
-        await completeVideoItem(deps, item, runHead, jobId, status, mode, cost);
+        await completeVideoItem(deps, item, runHead, jobId, status, mode, cost, duration);
         return;
       }
       if (isJobFailed(status.status)) {
@@ -583,6 +662,7 @@ async function completeVideoItem(
   status: VideogenBatchJob,
   mode: 'mock' | 'real',
   cost: number | null,
+  duration: VideoDuration,
 ): Promise<void> {
   const payload = {
     videogenJobId: jobId,
@@ -590,6 +670,8 @@ async function completeVideoItem(
     status: status.status,
     mode,
     costUsd: cost,
+    durationSec: duration.durationSec,
+    durationSource: duration.durationSource,
     chapterId: item.chapterId,
     itemKey: item.itemKey,
     idempotencyKey: item.idempotencyKey,
@@ -608,13 +690,19 @@ async function completeVideoItem(
     storagePath,
     payload,
     mimeType: 'application/json',
-    metadata: { manifestId: item.manifestId, itemKey: item.itemKey, chapterId: item.chapterId },
+    metadata: {
+      manifestId: item.manifestId, itemKey: item.itemKey, chapterId: item.chapterId,
+      durationSec: duration.durationSec, durationSource: duration.durationSource,
+    },
     upsert: false,
   });
 
   const ok = await deps.scheduler.completeItem(item.itemRunId, deps.executorId, {
     artifactIds: [artifact.id],
-    summary: { videogenJobId: jobId, mode, downloadUrl: status.download_url ?? null, costUsd: cost },
+    summary: {
+      videogenJobId: jobId, mode, downloadUrl: status.download_url ?? null, costUsd: cost,
+      external: { durationSec: duration.durationSec, durationSource: duration.durationSource },
+    },
   });
   if (!ok) {
     deps.logger.warn(
@@ -950,6 +1038,10 @@ async function publishYoutubeAndComplete(
       return;
     }
     logger.log(`Item ${item.itemKey}: publicado en YouTube (unlisted) ${youtubeUrl}`);
+    // V2.1 RF-b: la subida consume cuota (no dinero): ZERO_BY_DESIGN + quota_units, idempotente por videoId.
+    const uploadedId = youtubeVideoId;
+    await ledgerSafe(deps, `la subida a YouTube ${uploadedId}`, (l) =>
+      recordYoutubeUpload(l, { ownerId: runHead.ownerId, itemRunId: item.itemRunId, videoId: uploadedId, mode: runHead.videoMode }));
   }
 
   const check = checkYoutubeDeliveryUrl(youtubeUrl);
@@ -960,14 +1052,35 @@ async function publishYoutubeAndComplete(
   }
   if (isLeaseLost()) return;
 
-  const cost: number | null = typeof summary.costUsd === 'number' ? summary.costUsd : null;
+  let cost: number | null = typeof summary.costUsd === 'number' ? summary.costUsd : null;
+  if (cost === null && mode === 'real' && deps.finops) {
+    // V2.1 RF-b: el costo no estaba al terminar el render (cargo pendiente):
+    // se vuelve a consultar y, si llega, se corrige con un ADJUSTMENT.
+    try {
+      const measured = (await deps.videogen.getVideoCost(videogenJobId)).estimated_total_cost;
+      if (typeof measured === 'number' && Number.isFinite(measured)) {
+        cost = measured;
+        await ledgerSafe(deps, `el ajuste del render ${videogenJobId}`, (l) => settleVideogenPending(l, videogenJobId, measured));
+      }
+    } catch (err) {
+      logger.warn(`Item ${item.itemKey}: el costo de Videogen sigue sin estar disponible — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   const downloadUrl: string | null = summary.videogenDownloadUrl ?? null;
+  // V2.1 (R11a): la duración quedó en external al terminar el render; un item
+  // anterior a este cambio no la tiene → null + 'unknown' (nunca inventada).
+  const hasDuration = typeof external.durationSec === 'number' && external.durationSec > 0;
+  const duration: VideoDuration = hasDuration
+    ? { durationSec: external.durationSec, durationSource: external.durationSource ?? 'videogen_status' }
+    : { durationSec: null, durationSource: 'unknown' };
   const payload = {
     videogenJobId,
     downloadUrl,
     status: summary.videogenStatus ?? null,
     mode,
     costUsd: cost,
+    durationSec: duration.durationSec,
+    durationSource: duration.durationSource,
     chapterId: item.chapterId,
     itemKey: item.itemKey,
     idempotencyKey: item.idempotencyKey,
@@ -987,7 +1100,10 @@ async function publishYoutubeAndComplete(
     storagePath,
     payload,
     mimeType: 'application/json',
-    metadata: { manifestId: item.manifestId, itemKey: item.itemKey, chapterId: item.chapterId, delivery: 'youtube' },
+    metadata: {
+      manifestId: item.manifestId, itemKey: item.itemKey, chapterId: item.chapterId, delivery: 'youtube',
+      durationSec: duration.durationSec, durationSource: duration.durationSource,
+    },
     upsert: false,
   });
 
@@ -1003,6 +1119,9 @@ async function publishYoutubeAndComplete(
       youtubeVideoId,
       youtubeUrl,
       youtubeUploadStartedAt: null,
+      ...(external.durationSec === undefined
+        ? { external: { durationSec: null, durationSource: 'unknown' } }
+        : {}),
     },
   });
   if (!ok) {
@@ -1066,6 +1185,9 @@ async function bootstrap() {
     youtubeUploadRetryBaseMs: readPositiveInt('DYNAMIC_YOUTUBE_UPLOAD_RETRY_BASE_MS', 2000),
     youtubeQuotaRetrySeconds: readPositiveInt('DYNAMIC_YOUTUBE_QUOTA_RETRY_SECONDS', 3600),
     youtubeQuotaMaxWaitSeconds: readPositiveInt('DYNAMIC_YOUTUBE_QUOTA_MAX_WAIT_SECONDS', 86400),
+    // V2.1 RF-b: ledger + runtime guard de presupuesto (siempre cableados en el proceso real).
+    finops: app.get(FinopsLedgerService),
+    budget: app.get(FinopsBudgetService),
   };
   const pollMs = readPositiveInt('DYNAMIC_ITEM_WORKER_POLL_MS', 5000);
   const concurrency = readPositiveInt('DYNAMIC_ITEM_WORKER_CONCURRENCY', 1);

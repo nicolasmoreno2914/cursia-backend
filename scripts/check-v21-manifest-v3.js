@@ -511,7 +511,7 @@ async function pureChecks() {
       itemRunId: 'ir-1', runId: 'run-1', courseId: 1, artifactCourseId: 'front-1', manifestId: 9, itemKey: `${type}:${chapterId || 1}`,
       type, chapterId, chapterNumber: chapterId ? 2 : null, idempotencyKey: `idem-${type}`, attempt: 1,
     });
-    const mk = (inputPayload) => {
+    const mk = (inputPayload, withBudget = true) => {
       const calls = { uploads: [], completes: [], fails: [] };
       return {
         calls,
@@ -525,6 +525,8 @@ async function pureChecks() {
           artifacts: { async uploadJsonArtifact(i) { calls.uploads.push(i); return { id: `art-${calls.uploads.length}` }; } },
           logger: { log() {}, warn() {}, error() {} },
           executorId: 'ex', leaseSeconds: 60,
+          // V2.1 RF-b (fix round 2, M3): guard de presupuesto falso y permisivo (sin él, real falla cerrado).
+          ...(withBudget ? { budget: { async guardPaidSubmission() { return { allow: true, decision: 'ALLOW', committed: '0', remaining: null, reason: 'test', authorizedBudget: '999' }; } } } : {}),
         },
       };
     };
@@ -558,6 +560,17 @@ async function pureChecks() {
       await rejectsRe(W.processProviderItem(m.deps, item(type, ch)), /provider_mock_not_allowed/, `${type} mock sin env`);
       if (savedMock !== undefined) process.env.DYNAMIC_ALLOW_PROVIDER_MOCK = savedMock;
       eq(m.calls.uploads.length, 0, `${type} mock sin env: sin artifact`);
+      // RF-b M3: real SIN guard de presupuesto → fail closed (sin llamada, sin artifact), no PROVIDER_NOT_WIRED.
+      const c = mk({ videoMode: 'mock', providerModes: { presentation: 'real', audio: 'real' } }, false);
+      await W.processProviderItem(c.deps, item(type, ch));
+      eq(c.calls.uploads.length + c.calls.completes.length, 0, `${type} real sin guard: sin artifact`);
+      assert(c.calls.fails.length === 1 && c.calls.fails[0].retry === false && /^finops_unavailable: /.test(c.calls.fails[0].err), `${type} real sin guard: ${JSON.stringify(c.calls.fails)}`);
+      process.env.DYNAMIC_ALLOW_PROVIDER_MOCK = 'true';
+      const d = mk({ videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } }, false);
+      try { await W.processProviderItem(d.deps, item(type, ch)); } finally {
+        if (savedMock === undefined) delete process.env.DYNAMIC_ALLOW_PROVIDER_MOCK; else process.env.DYNAMIC_ALLOW_PROVIDER_MOCK = savedMock;
+      }
+      eq(d.calls.completes.length, 1, `${type} mock sin guard: completa`);
     }
     eq([...W.PROVIDER_WORKER_TYPES].sort(), ['audio_welcome', 'audiobook_chapter', 'presentation'], 'tipos del worker');
   });

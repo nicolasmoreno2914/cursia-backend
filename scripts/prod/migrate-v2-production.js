@@ -122,6 +122,26 @@ const MIGRATION_STEPS = [
     summary: 'V2.1 R4: tipos v3 en gir_type_check/gir_type_scope/default scope, conteos v3 en course_generation_manifests, scorm_count >= 0',
   },
   {
+    // V2.1 RF (FinOps): ledger append-only + catálogo de precios. Sin tablas ni
+    // precios, startRun responde 503 finops_unavailable (fail closed). El seed de
+    // pricing_catalog NO está en el .sql: lo inserta el hook `finops-pricing-seed`
+    // (mismo código que migrate-v21-finops.js, ON CONFLICT DO NOTHING) en la
+    // MISMA transacción del paso.
+    id: 'v21-finops',
+    file: 'supabase-migration-v21-finops.sql',
+    stagingStep: '4h6 (migrate-v21-finops.js)',
+    summary: 'V2.1 RF: pricing_catalog, generation_cost_events, cost_estimates, cost_budget_policies/authorizations, cost_avoidance_events (append-only por trigger) + seed de precios',
+    afterSql: 'finops-pricing-seed',
+  },
+  {
+    // V2.1 RF-b (review G3 C2): RLS sin policies + REVOKE de anon/authenticated
+    // en las 6 tablas FinOps y course_profiles (el backend usa el rol dueño).
+    id: 'v21-finops-rls',
+    file: 'supabase-migration-v21-finops-rls.sql',
+    stagingStep: '4h8 (migrate-v21-finops-rls.js)',
+    summary: 'V2.1 RF-b: ENABLE ROW LEVEL SECURITY + REVOKE ALL (anon, authenticated) en FinOps y course_profiles',
+  },
+  {
     // Decisión: SÍ se necesita en producción. El ejecutor dynamic de V2 (y el
     // artifactUpload legacy de 39-brandkit/41-course-setup) sube a
     // cursia-artifacts DESDE EL NAVEGADOR con el JWT del usuario; el
@@ -154,6 +174,15 @@ const VERIFY_SCRIPTS = [
   'scripts/verify-v21-manifest-v3-schema.js',
   'scripts/audit-dynamic-generation.js',
 ];
+
+/** Hooks post-SQL de un paso (misma transacción). */
+const STEP_HOOKS = {
+  'finops-pricing-seed': async (client) => {
+    const { seedPricingCatalog } = require(path.join(REPO_ROOT, 'scripts/migrate-v21-finops.js'));
+    const r = await seedPricingCatalog(client);
+    console.log(`  ✓ seed ${r.seedVersion}: ${r.inserted} filas nuevas de ${r.seedRows}`);
+  },
+};
 
 const EXCLUDED = [
   { file: 'scripts/migrate-production-jobs-constraints.js', reason: 'no se invoca: su SQL (scripts/lib/production-jobs-constraints.js) es el PASO 0 de este runner; deploy.yml lo re-aplica igual en el merge (idempotente)' },
@@ -261,6 +290,7 @@ function buildPlan(opts) {
       file: s.file,
       stagingEquivalent: s.stagingStep,
       summary: s.summary,
+      afterSql: s.afterSql || null,
       status: 'included',
       sha256: null,
       bytes: null,
@@ -552,6 +582,11 @@ async function applyMigrations(plan, tgt, opts) {
           for (const stmt of pjConstraints.APPLY_STATEMENTS) await client.query(stmt);
         } else {
           await client.query(buf.toString('utf8'));
+          if (step.afterSql) {
+            const hook = STEP_HOOKS[step.afterSql];
+            if (!hook) throw new Error(`hook desconocido ${step.afterSql}`);
+            await hook(client);
+          }
         }
         await client.query('commit');
       } catch (err) {

@@ -1,0 +1,25 @@
+{
+  "version": "usage-priors-v1",
+  "learnedFromLedger": false,
+  "minSamplesToLearn": 20,
+  "defaultRetryRate": 0.15,
+  "notes": "PRIORS, not measurements. p10/p50/p90 of usage per operation (audit §W.6). LLM token priors are rough guesses from prompt sizes in the V2 executor and the audiobook target (~480 words/chapter ≈ 650 output tokens). TTS audio tokens assume ~1250 audio-output tokens per minute (US$0.015/min ÷ US$12/1M) and ~150 words/min. Gamma credits are a placeholder. Videogen = 1 render per video (observed). YouTube videos.insert quota = 1600 units (verify against current YouTube Data API docs). Replace each operation with p10/p50/p90 learned from generation_cost_events once it has >= minSamplesToLearn CHARGE samples.",
+  "operations": {
+    "llm.course_plan":        { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 3000, "p50": 5000, "p90": 8000 }, "output_tokens": { "p10": 1500, "p50": 3000, "p90": 5000 } } },
+    "llm.course_intro":       { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 2000, "p50": 3000, "p90": 5000 }, "output_tokens": { "p10": 600, "p50": 1000, "p90": 1800 } } },
+    "llm.module_intro":       { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 2000, "p50": 3000, "p90": 5000 }, "output_tokens": { "p10": 500, "p50": 900, "p90": 1500 } } },
+    "llm.content":            { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 3000, "p50": 5000, "p90": 9000 }, "output_tokens": { "p10": 2500, "p50": 4000, "p90": 6000 } } },
+    "llm.experience":         { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 3000, "p50": 5000, "p90": 8000 }, "output_tokens": { "p10": 800, "p50": 1500, "p90": 2500 } } },
+    "llm.video_interactions": { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 2500, "p50": 4000, "p90": 6000 }, "output_tokens": { "p10": 500, "p50": 900, "p90": 1500 } } },
+    "llm.activity":           { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 3000, "p50": 5000, "p90": 8000 }, "output_tokens": { "p10": 2000, "p50": 4000, "p90": 7000 } } },
+    "llm.scorm":              { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 4000, "p50": 6000, "p90": 9000 }, "output_tokens": { "p10": 6000, "p50": 10000, "p90": 14000 } } },
+    "llm.exam":               { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 4000, "p50": 8000, "p90": 14000 }, "output_tokens": { "p10": 1500, "p50": 3000, "p90": 5000 } } },
+    "llm.final_exam":         { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 6000, "p50": 12000, "p90": 20000 }, "output_tokens": { "p10": 2000, "p50": 4000, "p90": 6000 } } },
+    "llm.audiobook_script":   { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 3000, "p50": 5000, "p90": 8000 }, "output_tokens": { "p10": 500, "p50": 700, "p90": 1000 } } },
+    "tts.audio_welcome":      { "provider": "openai", "service": "audio.speech", "product": "gpt-4o-mini-tts", "meters": { "text_input_tokens": { "p10": 150, "p50": 250, "p90": 400 }, "audio_output_tokens": { "p10": 900, "p50": 1250, "p90": 2000 } } },
+    "tts.audiobook_chapter":  { "provider": "openai", "service": "audio.speech", "product": "gpt-4o-mini-tts", "meters": { "text_input_tokens": { "p10": 550, "p50": 650, "p90": 800 }, "audio_output_tokens": { "p10": 3200, "p50": 4000, "p90": 5000 } } },
+    "gamma.generate":         { "provider": "gamma", "service": "generations", "product": "gamma-generate", "meters": { "gamma_credit": { "p10": 40, "p50": 60, "p90": 100 } } },
+    "videogen.render":        { "provider": "videogen", "service": "render", "product": "video", "meters": { "video_render": { "p10": 1, "p50": 1, "p90": 1 } } },
+    "youtube.upload":         { "provider": "youtube", "service": "data_api_v3", "product": "videos.insert", "meters": { "quota_unit": { "p10": 1600, "p50": 1600, "p90": 1600 } } }
+  }
+}

@@ -192,6 +192,8 @@ async function main() {
           'supabase-migration-generation-manifests.sql', 'supabase-migration-dynamic-generation.sql',
           'supabase-migration-dynamic-generation-v2.sql', 'supabase-migration-invalidation.sql',
           'supabase-migration-v21-manifest-v3.sql',
+          // V2.1 RF (FinOps ledger + seed de precios por hook) y RF-b (RLS de FinOps + course_profiles).
+          'supabase-migration-v21-finops.sql', 'supabase-migration-v21-finops-rls.sql',
           'supabase-migration-storage-artifacts-policies.sql']), 'orden: ' + files.join(','));
         for (const s of plan.steps.filter((x) => x.status === 'included')) {
           const h = crypto.createHash('sha256').update(fs.readFileSync(path.join(REPO, s.file))).digest('hex');
@@ -501,6 +503,16 @@ async function main() {
       assert((res.out.match(/sonda omitida/g) || []).length === 8, 'esperaba 8 sondas omitidas en production-readonly\n' + res.out);
       assert((res.out.match(/🔒 Modo production-readonly/g) || []).length === 9, 'los 9 verify/audit en production-readonly');
       assert((res.out.match(/✓ cursia_artifacts_/g) || []).length === 4, 'políticas de storage');
+      // V2.1 RF / RF-b: ledger FinOps + seed de precios (hook del paso, misma tx) + RLS.
+      for (const id of ['v21-finops', 'v21-finops-rls']) assert(res.out.includes(id), 'no aplicó ' + id);
+      await withClient('prodlike', async (c) => {
+        const seedRows = JSON.parse(fs.readFileSync(path.join(REPO, 'src/modules/finops/pricing-seed.v1.json'), 'utf8')).rows.length;
+        const n = (await c.query(`select count(*)::int n from public.pricing_catalog`)).rows[0].n;
+        assert(n === seedRows, `pricing_catalog sembrado: ${n} de ${seedRows}`);
+        const rls = (await c.query(`select count(*)::int n from pg_class where relnamespace = 'public'::regnamespace and relrowsecurity
+          and relname in ('pricing_catalog','generation_cost_events','cost_estimates','cost_budget_policies','cost_budget_authorizations','cost_avoidance_events','course_profiles')`)).rows[0].n;
+        assert(rls === 7, `RLS habilitada en ${rls}/7 tablas`);
+      });
       dumpAfterFirst = await schemaDump(pgBin, 'prodlike');
     });
     await test('APPLY idempotente: segunda corrida exit 0 y esquema idéntico (pg_dump -s)', async () => {
