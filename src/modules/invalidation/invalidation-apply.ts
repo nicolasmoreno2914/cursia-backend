@@ -1,4 +1,5 @@
-import type { BlueprintSnapshotV1 } from '../course-blueprints/blueprint-snapshot';
+import type { AnyBlueprintSnapshot, BlueprintSnapshotV1 } from '../course-blueprints/blueprint-snapshot';
+import { sha256Canonical } from '../coherence/canonical-json';
 import { effectiveOutputRowsSql } from '../dynamic-generation/item-generations';
 import type { ManifestItem } from '../generation-manifests/generation-manifest-builder';
 import { computeFingerprints, matchFingerprint } from './fingerprints';
@@ -44,17 +45,37 @@ function uniformFingerprint(fps: Array<string | null | undefined>): string | nul
   return vals.length === 1 ? vals[0] : null;
 }
 
+/**
+ * V2.1 (R5): identidad estable del OUTPUT de un item run — la que cambia si
+ * el output cambia y NO cambia cuando una fila se "carga" a otro run (apply:
+ * fila nueva, MISMA storage_path inmutable). sha de los (type, bucket, path)
+ * ordenados. Si algún artifact no tiene storage_path, se cae a los ids de
+ * fila (conservador: una fila carried no coincide ⇒ se regenera un item LLM
+ * barato, nunca se reutiliza algo que describe otro output). null sin artifacts.
+ */
+export function artifactOutputIdentity(
+  arts: Array<{ id: string; type?: string | null; bucket?: string | null; path?: string | null }>,
+): string | null {
+  if (!arts || arts.length === 0) return null;
+  if (arts.every((a) => typeof a.path === 'string' && a.path.length > 0)) {
+    const parts = arts.map((a) => `${a.type ?? ''}|${a.bucket ?? ''}|${a.path}`).sort();
+    return sha256Canonical({ kind: 'artifact-output-identity', v: 1, by: 'storage', parts });
+  }
+  return sha256Canonical({ kind: 'artifact-output-identity', v: 1, by: 'id', parts: arts.map((a) => String(a.id)).sort() });
+}
+
 interface ItemArtifactsRow {
   item_run_id: string;
   item_key: string;
   status: string;
-  arts: Array<{ id: string; status: string | null; fp: string | null }>;
+  arts: Array<{ id: string; status: string | null; fp: string | null; type?: string | null; bucket?: string | null; path?: string | null }>;
 }
 
 async function itemsWithArtifacts(q: QueryExecutor, jobId: string): Promise<ItemArtifactsRow[]> {
   return q.query(
     `select g.id as item_run_id, g.item_key, g.status,
-            coalesce(json_agg(json_build_object('id', a.id, 'status', a.status, 'fp', a.metadata->>'inputFingerprint')
+            coalesce(json_agg(json_build_object('id', a.id, 'status', a.status, 'fp', a.metadata->>'inputFingerprint',
+                                                 'type', a.type, 'bucket', a.storage_bucket, 'path', a.storage_path)
                               order by a.id) filter (where a.id is not null), '[]'::json) as arts
        from ${effectiveOutputRowsSql('$1')} g
        left join public.artifacts a on a.item_run_id = g.id
@@ -88,6 +109,7 @@ export async function loadFromItemsFromDb(
       artifactIds: r.arts.map((a) => a.id),
       artifactStatus: aggregateArtifactStatus(r.arts.map((a) => a.status)),
       inputFingerprint: uniformFingerprint(r.arts.map((a) => a.fp)),
+      outputIdentity: artifactOutputIdentity(r.arts),
     });
   }
   const have = new Set(out.map((o) => o.itemKey));
@@ -115,6 +137,7 @@ export async function loadFromItemsFromDb(
         // Sin huella guardada (o no uniforme) → null: el core nunca reutiliza
         // un deshabilitado sin huella (REGENERATE, fix wave).
         inputFingerprint: uniformFingerprint(r.arts.map((a) => a.fp)),
+        outputIdentity: artifactOutputIdentity(r.arts),
       });
       wanted.delete(r.item_key);
     }
@@ -126,9 +149,10 @@ export async function loadFromItemsFromDb(
 export interface PlanContext {
   runA: { id: string; course_id: number; input_payload: any };
   manifestA: { id: number; rulesVersion: number; manifest: { rulesVersion?: number; items: ManifestItem[] } };
-  blueprintA: BlueprintSnapshotV1;
+  /** v1/v2: schemaVersion 1; rulesVersion 3: schemaVersion 2. */
+  blueprintA: BlueprintSnapshotV1 | AnyBlueprintSnapshot;
   manifestB: { id: number; rulesVersion: number; manifest: { rulesVersion?: number; items: ManifestItem[] } };
-  blueprintB: BlueprintSnapshotV1;
+  blueprintB: BlueprintSnapshotV1 | AnyBlueprintSnapshot;
   /** context_hash del run A (B lo hereda). */
   contextHash: string;
 }
@@ -209,7 +233,8 @@ export interface ApplyWrites {
 }
 
 export interface RoleCheck {
-  required: (itemType: string) => readonly string[] | undefined;
+  /** `variant`: solo items `activity` de rulesVersion 3 (el motor define los roles). */
+  required: (itemType: string, variant?: string | null) => readonly string[] | undefined;
   typeOf: (artifactId: string) => string | null | undefined;
 }
 
@@ -223,7 +248,7 @@ const REUSE_LIKE = new Set(['REUSE', 'REVIEW', 'STALE_NO_AUTO']);
 export function planApplyWrites(
   plan: InvalidationPlan,
   targetItems: ManifestItem[],
-  fromBlueprint: BlueprintSnapshotV1,
+  fromBlueprint: BlueprintSnapshotV1 | AnyBlueprintSnapshot,
   fromContextHash: string | null,
   sourceArtifactStatus: (artifactId: string) => string | null | undefined,
   sourceFingerprint: (artifactId: string) => string | null | undefined,
@@ -235,7 +260,16 @@ export function planApplyWrites(
     if (byKey.has(a.itemKey)) throw new Error(`INVALID_INVALIDATION_PLAN: acción duplicada para ${a.itemKey}`);
     byKey.set(a.itemKey, a);
   }
-  const fromFp = computeFingerprints(fromBlueprint, { courseContextSha256: fromContextHash });
+  // Huella de match del ORIGEN: un plan v3 la trae en cada acción
+  // (`fromMatchFingerprint`, depende de variant / identidad del video); v1/v2
+  // la recalculan desde el Blueprint de A exactamente como antes.
+  let fromFpCache: ReturnType<typeof computeFingerprints> | null = null;
+  const fromMatchOf = (a: InvalidationAction): string | null => {
+    if (Object.prototype.hasOwnProperty.call(a, 'fromMatchFingerprint')) return a.fromMatchFingerprint ?? null;
+    fromFpCache = fromFpCache ?? computeFingerprints(fromBlueprint as BlueprintSnapshotV1, { courseContextSha256: fromContextHash });
+    return matchFingerprint(fromFpCache, a.itemKey);
+  };
+  const isV3 = plan.toRulesVersion === 3;
   const seeds: ItemSeed[] = [];
   const carried: CarriedArtifactPlan[] = [];
   const statusChanges: StatusChangePlan[] = [];
@@ -265,7 +299,10 @@ export function planApplyWrites(
     });
     if (reuse && roles) {
       const have = new Set(a.fromArtifactIds.map((id) => roles.typeOf(id)));
-      for (const t of roles.required(it.type) ?? []) if (!have.has(t)) missingRoles.push(`${it.key}:${t}:missing_role`);
+      const required = roles.required(it.type, it.variant ?? null);
+      // v3: un tipo sin roles conocidos nunca se reutiliza a ciegas (fail loud en el apply).
+      if (isV3 && !required) missingRoles.push(`${it.key}:*:unknown_roles`);
+      for (const t of required ?? []) if (!have.has(t)) missingRoles.push(`${it.key}:${t}:missing_role`);
     }
     if (reuse) {
       for (const artifactId of a.fromArtifactIds) {
@@ -275,7 +312,7 @@ export function planApplyWrites(
         if (a.action === 'STALE_NO_AUTO') {
           // El video sigue siendo válido para la huella con la que se generó
           // (la del Blueprint de A si estaba ready), nunca para la del destino.
-          fp = srcFp ?? (srcStatus == null || srcStatus === 'ready' ? matchFingerprint(fromFp, it.key) : 'unknown');
+          fp = srcFp ?? (srcStatus == null || srcStatus === 'ready' ? fromMatchOf(a) : 'unknown');
         } else {
           fp = a.matchFingerprint;
         }
@@ -309,7 +346,7 @@ export function planApplyWrites(
     const statuses = a.fromArtifactIds.map((id) => sourceArtifactStatus(id));
     const stored = [...new Set(a.fromArtifactIds.map((id) => sourceFingerprint(id) ?? null))];
     const allReady = statuses.every((s) => s == null || s === 'ready');
-    const fp = stored.length === 1 && stored[0] ? stored[0] : allReady ? matchFingerprint(fromFp, a.itemKey) : 'unknown';
+    const fp = stored.length === 1 && stored[0] ? stored[0] : allReady ? fromMatchOf(a) : 'unknown';
     statusChanges.push({ itemKey: a.itemKey, itemRunId: a.fromItemRunId, status: 'disabled', action: a.action, reasons: [...a.reasons], inputFingerprint: fp });
   }
   return { seeds, carried, statusChanges, videoItemsToGenerate, missingRoles };

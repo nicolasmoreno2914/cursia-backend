@@ -102,6 +102,9 @@ jobs:
       - name: Check V2.1 R4 Manifest rulesVersion 3 (puro; la parte PG16 corre local)
         run: node scripts/check-v21-manifest-v3.js --pure-only
 
+      - name: Check V2.1 R5 invalidación v3 + coherencia v3 + auditorías v3 (puro; la parte PG16 corre local)
+        run: node scripts/check-v21-invalidation-v3.js --pure-only
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh

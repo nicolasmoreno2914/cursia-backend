@@ -101,10 +101,15 @@ export function requiredArtifactTypesV3(
 
 /**
  * Roles obligatorios de un tipo de item según el rulesVersion del Manifest (v1: exactamente los de 5B.1).
- * rulesVersion 3: usar `requiredArtifactTypesV3` (activity depende del variant); acá `activity` v3 → undefined.
+ * rulesVersion 3: delega en `requiredArtifactTypesV3` (activity depende del `variant`; sin variant → undefined).
+ * v1/v2 ignoran `variant`.
  */
-export function requiredArtifactTypes(rulesVersion: number, type: ManifestItemType): ResolvedArtifact['type'][] | undefined {
-  if (rulesVersion === 3) return requiredArtifactTypesV3(type);
+export function requiredArtifactTypes(
+  rulesVersion: number,
+  type: ManifestItemType,
+  variant?: string | null,
+): ResolvedArtifact['type'][] | undefined {
+  if (rulesVersion === 3) return requiredArtifactTypesV3(type, variant);
   return (rulesVersion === 2 ? ARTIFACT_TYPES_BY_ITEM_TYPE_V2 : ARTIFACT_TYPES_BY_ITEM_TYPE)[type];
 }
 

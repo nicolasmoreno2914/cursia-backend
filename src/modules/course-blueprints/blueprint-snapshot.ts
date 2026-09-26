@@ -476,8 +476,12 @@ export function recanonicalizeBlueprintSnapshotV2(stored: any): BlueprintSnapsho
   );
 }
 
-/** Vista v1 de un v2 (solo para reusar las reglas estructurales de v1; nunca para hashear). */
-function structuralViewV1(s: BlueprintSnapshotV2): BlueprintSnapshotV1 {
+/**
+ * Vista v1 de un v2 (solo para reusar las reglas estructurales de v1; nunca
+ * para hashear). Exportada en R5 para el Coherence Engine (reglas S1–S3 y
+ * de contenido sobre un Blueprint v2).
+ */
+export function structuralViewV1(s: BlueprintSnapshotV2): BlueprintSnapshotV1 {
   return {
     schemaVersion: 1,
     course: { id: s.course.id, title: s.course.title, structureVersion: 'dynamic' },

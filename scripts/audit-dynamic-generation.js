@@ -5,6 +5,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { Client } = require('pg');
 const v2Target = require('./lib/v2-production-target');
+const { auditItemRolesV3 } = require('./lib/audit-v3');
 
 function loadEnvFile(envPath) {
   if (!fs.existsSync(envPath)) return;
@@ -462,6 +463,26 @@ async function main() {
       }
     }
 
+    // 3h-v3. V2.1 (R5): items COMPLETADOS de Manifests rulesVersion 3 con sus
+    // roles de artifact (contrato de R4, completeItem): activity según el
+    // variant congelado en el item del Manifest. Ver scripts/lib/audit-v3.js.
+    const v3Items = await client.query(
+      `select gir.id, gir.item_key, gir.type,
+              (select i->>'variant' from jsonb_array_elements(cgm.manifest_json->'items') i
+                where i->>'key' = gir.item_key limit 1) as variant,
+              coalesce(array_agg(a.type order by a.type) filter (where a.id is not null), '{}') as artifact_types
+         from public.generation_item_runs gir
+         join public.course_generation_manifests cgm on cgm.id = gir.manifest_id and cgm.rules_version = 3
+         left join public.artifacts a on a.item_run_id = gir.id
+        where gir.status = 'completed'
+        group by gir.id, gir.item_key, gir.type, cgm.manifest_json`,
+    );
+    let checkedV3Items = 0;
+    for (const row of v3Items.rows) {
+      checkedV3Items += 1;
+      failures.push(...auditItemRolesV3(row));
+    }
+
     if (failures.length === 0) {
       if (hasRuns) {
         console.log(`✅ (a) cada item run matchea type/module_id/chapter_id/depends_on de su item en el Manifest (${checkedItemMatch} item runs revisados).`);
@@ -473,6 +494,7 @@ async function main() {
       }
       console.log(`✅ (e) todo artifact con manifest_id no nulo tiene manifest_item_key/item_run_id consistentes con su Manifest (${checkedArtifacts} artifacts revisados).`);
       console.log(`✅ (h) rulesVersion 2: roles de artifact + Context Package (hash/versión) + marca de resumen en items completados (${checkedV2Items} revisados).`);
+      console.log(`✅ (h3) rulesVersion 3: roles de artifact por tipo (activity según variant) en items completados (${checkedV3Items} revisados).`);
       console.log(`✅ (f2) input_payload.videoMode ∈ {'mock','real'} en runs que lo declaran (${checkedVideoMode} revisados; ausente = 'mock' por convención, no falla).`);
     } else {
       console.log(`❌ ${failures.length} violaciones de invariantes encontradas (detalle abajo).`);

@@ -461,7 +461,7 @@ export class RunsService {
     if (!rowA) throw new NotFoundException(`La ejecución de origen ${fromRunId} no existe para el curso #${courseId}`);
     const bpNumberA = Number(rowA.input_payload?.blueprintNumber);
     const manifestA = await this.manifests.getById(courseId, ownerId, bpNumberA, Number(rowA.input_payload?.manifestId));
-    // V2.1 (R4): invalidación v3 = R5. 501 explícito antes de leer Blueprints (fail loud).
+    // V2.1 (R5): v3 → v3 se calcula; mezclar rulesVersion 3 con 1/2 → 501 antes de leer Blueprints (fail loud).
     try {
       assertInvalidationRulesSupported(manifestA.rulesVersion, manifestB.rulesVersion);
     } catch (err) {
@@ -477,8 +477,8 @@ export class RunsService {
     const videoMode = this.videoModeOf(rowA);
     const videoDelivery = frozenVideoDeliveryOf(rowA.input_payload);
     const [bpA, bpB] = await Promise.all([
-      this.manifests.blueprintOf(courseId, ownerId, bpNumberA),
-      this.manifests.blueprintOf(courseId, ownerId, blueprintNumber),
+      this.manifests.blueprintOfForRules(courseId, ownerId, bpNumberA, manifestA.rulesVersion),
+      this.manifests.blueprintOfForRules(courseId, ownerId, blueprintNumber, manifestB.rulesVersion),
     ]);
     const [course] = await this.dataSource.query(
       `select metadata->>'courseId' as frontend_course_id from public.courses where id = $1`,
@@ -538,7 +538,7 @@ export class RunsService {
           ctxA.context_hash,
           (id) => sources.get(id)?.status ?? null,
           (id) => sources.get(id)?.metadata?.inputFingerprint ?? null,
-          { required: (t) => requiredArtifactTypes(manifestB.rulesVersion, t as ManifestItemType), typeOf: (id) => sources.get(id)?.type },
+          { required: (t, variant) => requiredArtifactTypes(manifestB.rulesVersion, t as ManifestItemType, variant), typeOf: (id) => sources.get(id)?.type },
         );
         if (writes.missingRoles.length > 0) {
           const message =

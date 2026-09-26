@@ -491,11 +491,14 @@ async function pureChecks() {
     assert(!touched, 'el resolver tocó la DB con un Manifest v3');
   });
 
-  await check('invalidación: plan con un Manifest v3 → INVALIDATION_V3_NOT_IMPLEMENTED; v1/v2 no afectados', () => {
+  // R5 levantó el 501 de v3 → v3 (plan-v3.ts; ver check-v21-invalidation-v3.js).
+  // Lo que sigue rechazado: mezclar rulesVersion 3 con 1/2 y Blueprints del schema equivocado.
+  await check('invalidación: v3 → v3 se calcula (R5); mezclar v3 con v1/v2 → INVALIDATION_V3_NOT_IMPLEMENTED; v1/v2 no afectados', () => {
     const plan = loadDist('modules/invalidation/plan.js');
     const m3 = B.buildGenerationManifest(SMALL(), SOURCE, { rulesVersion: 3 });
     const input = { from: { blueprint: SMALL(), manifest: m3, items: [] }, to: { blueprint: SMALL(), manifest: m3 } };
-    throwsRe(() => plan.computeInvalidationPlan(input), /^INVALIDATION_V3_NOT_IMPLEMENTED/, 'v3');
+    eq(plan.computeInvalidationPlan(input).toRulesVersion, 3, 'v3 → v3');
+    throwsRe(() => plan.assertInvalidationRulesSupported(2, 3), /^INVALIDATION_V3_NOT_IMPLEMENTED/, 'v2 → v3');
     plan.assertInvalidationRulesSupported(1, 2, [1, 1]); // no lanza
     throwsRe(() => plan.assertInvalidationRulesSupported(2, 2, [1, 2]), /^INVALIDATION_V3_NOT_IMPLEMENTED/, 'Blueprint v2');
   });

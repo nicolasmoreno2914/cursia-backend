@@ -62,7 +62,7 @@ export class InvalidationService {
     if (!rowA) throw new NotFoundException(`La ejecución de origen ${fromRunId} no existe para el curso #${courseId}`);
     const bpNumberA = Number(rowA.input_payload?.blueprintNumber);
     const manifestA = await this.manifests.getById(courseId, ownerId, bpNumberA, Number(rowA.input_payload?.manifestId));
-    // V2.1 (R4): invalidación v3 = R5. 501 explícito antes de leer Blueprints (fail loud).
+    // V2.1 (R5): v3 → v3 se calcula; mezclar rulesVersion 3 con 1/2 → 501 antes de leer Blueprints (fail loud).
     try {
       assertInvalidationRulesSupported(manifestA.rulesVersion, manifestB.rulesVersion);
     } catch (err) {
@@ -113,8 +113,8 @@ export class InvalidationService {
       throw new ConflictException(`La ejecución ${fromRunId} no tiene un contexto congelado íntegro`);
     }
     const [bpA, bpB] = await Promise.all([
-      this.manifests.blueprintOf(courseId, ownerId, bpNumberA),
-      this.manifests.blueprintOf(courseId, ownerId, blueprintNumber),
+      this.manifests.blueprintOfForRules(courseId, ownerId, bpNumberA, manifestA.rulesVersion),
+      this.manifests.blueprintOfForRules(courseId, ownerId, blueprintNumber, manifestB.rulesVersion),
     ]);
     const { plan } = await computePlanFromDb(this.dataSource, {
       runA: rowA,
@@ -136,7 +136,7 @@ export class InvalidationService {
       ctx.context_hash,
       (id) => byId.get(id)?.status ?? null,
       (id) => byId.get(id)?.metadata?.inputFingerprint ?? null,
-      { required: (t) => requiredArtifactTypes(manifestB.rulesVersion, t as ManifestItemType), typeOf: (id) => byId.get(id)?.type },
+      { required: (t, variant) => requiredArtifactTypes(manifestB.rulesVersion, t as ManifestItemType, variant), typeOf: (id) => byId.get(id)?.type },
     );
     const blockers: string[] = [];
     const [superseding] = await this.dataSource.query(
