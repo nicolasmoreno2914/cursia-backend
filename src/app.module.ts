@@ -27,6 +27,7 @@ import { FeaturesModule } from './modules/features/features.module';
 import { CoherenceModule } from './modules/coherence/coherence.module';
 import { InvalidationModule } from './modules/invalidation/invalidation.module';
 import { CourseProfilesModule } from './modules/course-profiles/course-profiles.module';
+import { FinopsModule } from './modules/finops/finops.module';
 
 @Module({
   imports: [
@@ -59,6 +60,7 @@ import { CourseProfilesModule } from './modules/course-profiles/course-profiles.
     CoherenceModule,
     InvalidationModule,
     CourseProfilesModule, // V2.1 (R3): perfiles de curso (presentation / assessment)
+    FinopsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

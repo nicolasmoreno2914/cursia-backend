@@ -927,7 +927,10 @@ async function dbChecks() {
     const OWNER = '11111111-2222-4333-8444-555555555555';
     const blueprints = new CourseBlueprintsService(ds);
     const manifests = new GenerationManifestsService(ds, blueprints);
-    const runs = new RunsService(ds, manifests, { async getActiveRate() { return null; } });
+    // V2.1 RF-b (fix round 2): los gates de presupuesto fallan cerrados sin FinopsBudgetService;
+    // este check prueba invalidación/providerModes → presupuesto falso permisivo (siempre AUTO).
+    const { permissiveFinopsBudget } = require(path.join(REPO, 'scripts/lib/finops-test-fakes.js'));
+    const runs = new RunsService(ds, manifests, { async getActiveRate() { return null; } }, undefined, permissiveFinopsBudget(loadDist('modules/finops/index.js')));
     const invalidation = new InvalidationService(ds, manifests);
     const texts = new Map(); // artifactId → contenido (descarga vía data: URL)
     const artifactsStub = {

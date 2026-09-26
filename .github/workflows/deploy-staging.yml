@@ -105,6 +105,9 @@ jobs:
       - name: Check V2.1 R5 invalidación v3 + coherencia v3 + auditorías v3 (puro; la parte PG16 corre local)
         run: node scripts/check-v21-invalidation-v3.js --pure-only
 
+      - name: Check V2.1 RF-b cableado FinOps (puro; la parte PG16 corre local)
+        run: node scripts/check-v21-finops-wiring.js --pure-only
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
@@ -362,6 +365,18 @@ jobs:
                echo "━━━ [4h5] V2.1 R4: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-v21-manifest-v3-schema.js
 
+               echo "━━━ [4h6] V2.1 RF: ledger FinOps (tablas append-only + seed de precios) (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-v21-finops.js
+
+               echo "━━━ [4h7] V2.1 RF: verificación de esquema FinOps (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-v21-finops-schema.js
+
+               echo "━━━ [4h8] V2.1 RF-b: RLS + REVOKE anon/authenticated en FinOps y course_profiles (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-v21-finops-rls.js
+
+               echo "━━━ [4h9] V2.1 RF-b: verificación de RLS (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-v21-finops-rls.js
+
                echo "━━━ [4i] Dynamic Generation: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-dynamic-generation-schema.js
 
@@ -385,6 +400,7 @@ jobs:
                ensure_pm2_process cursia-full-worker-staging start:full-worker
                ensure_pm2_process cursia-dynamic-item-worker-staging start:dynamic-item-worker
                ensure_pm2_process cursia-dynamic-package-worker-staging start:dynamic-package-worker
+               ensure_pm2_process cursia-dynamic-provider-worker-staging start:dynamic-provider-worker
                sudo pm2 save
                sudo pm2 status
 

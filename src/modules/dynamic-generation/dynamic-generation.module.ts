@@ -14,6 +14,7 @@ import { DynamicYoutubePreflightService } from './dynamic-youtube';
 import { ArtifactsModule } from '../artifacts/artifacts.module';
 import { ArtifactsService } from '../artifacts/artifacts.service';
 import { ArtifactsServiceTextReader, V3_ARTIFACT_TEXT_READER } from './v3-artifact-reader';
+import { FinopsModule } from '../finops/finops.module';
 
 /**
  * Generación dinámica (Fase 5A): runs sobre un Generation Manifest. No
@@ -29,6 +30,7 @@ import { ArtifactsServiceTextReader, V3_ARTIFACT_TEXT_READER } from './v3-artifa
     AdminModule,               // expone CostRatesService (estimate de costo de video, R17)
     YoutubeModule,             // DN-1: YoutubeService/YoutubeTokenService (preflight, sin modificarlos)
     ArtifactsModule,           // V2.1 R11a: lector de artifacts para validar items LLM v3 al completar
+    FinopsModule,              // V2.1 RF-b: estimado + gates de presupuesto (FinopsBudgetService)
   ],
   controllers: [RunsController, ExecutorController, DynamicYoutubeController],
   providers: [

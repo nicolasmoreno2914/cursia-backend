@@ -87,7 +87,8 @@ function startVideogen(apiKey, getHttpsBase) {
         j.polls++;
         if (j.polls < 2) return json(200, { job_id: m[1], chapter_number: j.chapter_number, status: 'processing', progress: 50, client_reference_id: j.ref, download_url: null });
         return json(200, { job_id: m[1], chapter_number: j.chapter_number, status: 'completed_local', progress: 100, client_reference_id: j.ref,
-          download_url: `${getHttpsBase()}/api/videos/${m[1]}/download` });
+          // V2.1 (R11a): duración medida (468 s = fixture IdwOipZAeqY) para video_interactions.
+          download_url: `${getHttpsBase()}/api/videos/${m[1]}/download`, duration_seconds: 468 });
       }
       if (rq.method === 'GET' && (m = p.match(/^\/api\/costs\/videos\/([^/]+)$/))) {
         if (!jobs.has(decodeURIComponent(m[1]))) return json(404, { error: 'job not found' });

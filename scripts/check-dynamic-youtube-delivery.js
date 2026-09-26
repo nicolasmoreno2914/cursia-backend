@@ -508,6 +508,9 @@ function makeWorld({ videoDelivery = 'youtube', videoMode = 'real' } = {}) {
     executorId: 'exec-1', leaseSeconds: 60, heartbeatMs: 60_000,
     videoTimeoutMin: 1, videoPollMs: 1, mockScenario: 'success', mockResolvePolls: 1,
     youtubeUploadMaxTries: 3, youtubeUploadRetryBaseMs: 1, youtubeQuotaRetrySeconds: 7200,
+    // V2.1 RF-b (fix round 2, M3): runtime guard de presupuesto falso y permisivo — el
+    // worker FALLA CERRADO sin él en modo real (ver el check "W sin guard de presupuesto").
+    budget: { guardPaidSubmission: async () => ({ allow: true, decision: 'ALLOW', committed: '0', remaining: null, reason: 'test_permissive', authorizedBudget: '999' }) },
     youtube: {
       getConnection: async () => { calls.getConnection++; return yt.connection; },
       getAccessToken: async () => { calls.getAccessToken++; if (!yt.tokenOk) throw new Error(RAW_GOOGLE_ERROR); return SECRET_TOKEN_MARKER; },
@@ -602,6 +605,22 @@ async function runWorkerChecks() {
       assert(os.delivery === 'upload_failed' && !os.youtubeUploadStartedAt, 'estado: ' + JSON.stringify(os));
       const f = w.calls.failItem[w.calls.failItem.length - 1];
       assert(f.retryable === true && f.error.startsWith('youtube_upload_failed: '), 'failItem: ' + JSON.stringify(f));
+    }));
+
+  await check('W sin guard de presupuesto (RF-b M3): modo real → 0 envíos a Videogen, sin marcador, item fallado finops_unavailable (fail closed); modo mock no lo necesita', () =>
+    withEnv(ENV, async () => {
+      const w = makeWorld();
+      delete w.deps.budget;
+      await worker.processItem(w.deps, makeItem(70));
+      eq(w.calls.batchCreate, 0, 'batchCreate (gasto)');
+      assert(!(w.store.get('ir-70') || {}).externalSubmitStartedAt, 'marcó externalSubmitStartedAt');
+      eq(w.calls.failItem.length, 1, 'failItem');
+      assert(w.calls.failItem[0].retryable === false && w.calls.failItem[0].error.startsWith('finops_unavailable: '), 'error: ' + w.calls.failItem[0].error);
+      const m = makeWorld({ videoMode: 'mock' });
+      delete m.deps.budget;
+      await worker.processItem(m.deps, makeItem(71));
+      eq(m.calls.failItem, [], 'mock sin guard: sin fallo');
+      assertCompleted(m, 71, 'mock sin guard');
     }));
 
   await check('W happy path youtube real: 1 envío a Videogen, preflight liviano antes, 1 subida Unlisted, completed con id+url', () =>
