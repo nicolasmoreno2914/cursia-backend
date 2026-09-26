@@ -480,9 +480,17 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     }
   });
 
-  // V2.1: FinOps + proveedores — token por stdin (nunca impreso), inventario de producción SOLO lectura
-  // y reutilización de claves en staging SOLO si faltan (nunca pisa), sin imprimir secretos.
-  await check('(a) deploy-staging.yml [0c]: FinOps token por stdin, producción solo lectura, reutiliza solo lo que falta, sin imprimir secretos', () => {
+  // V2.1: FinOps + proveedores de STAGING. Aislamiento fuerte (decisión de Nicolás): el deploy de staging
+  // nunca lee el .env de producción, nunca copia claves desde producción ni imprime fragmentos de secretos.
+  await check('(a) deploy-staging.yml [0c]: aislamiento — sin .env de producción, sin VPS_PATH de producción, sin copiar claves ni imprimir fragmentos', () => {
+    const step = pm2StepOf(stagingText, 'deploy-staging.yml').text;
+    assert(!/secrets\.VPS_PATH\s*\}\}/.test(stagingText), 'el workflow de staging no debe usar secrets.VPS_PATH (producción)');
+    for (const re of [/PROD_ENV_FILE/, /reuse_from_production/, /inventory_production/, /_mask\b/, /sudo -n grep/, /\$\{v: -4\}/]) {
+      assert(!re.test(step), `lógica de producción/fragmentos presente: ${re}`);
+    }
+  });
+
+  await check('(a) deploy-staging.yml [0c]: FinOps token por stdin (nunca impreso), worker de proveedores en false, idempotente, solo .env de staging', () => {
     const script = remoteScriptOf(pm2StepOf(stagingText, 'deploy-staging.yml').text);
     const lines = script.split('\n');
     const fnStart = lines.findIndex((l) => l.startsWith('_Q_CR='));
@@ -492,38 +500,58 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     const block = [...lines.slice(fnStart, fnEnd), ...lines.slice(flagsStart, flagsEnd)].join('\n');
     assert(/IFS= read -r _FIT/.test(script), 'el token se lee de stdin');
     assert(/printf "%s\\n" "\$FINOPS_INGEST_TOKEN_STAGING" \| ssh/.test(stagingText), 'el token viaja por stdin del ssh');
-    const S = { OPENAI: 'sk-prod-openai-SECRET-1111', ANTH: 'sk-ant-prod-SECRET-2222', GAMMA: 'sk-gamma-prod-SECRET-3333', VG_STAGING: 'vg-staging-SECRET-4444', VG_PROD: 'vg-prod-SECRET-5555', TOKEN: 'finops-token-SECRET-6666', DB: 'db-pass-SECRET-7777' };
+    const TOKEN = 'finops-token-SECRET-6666';
+    const STG = { VG: 'vg-staging-SECRET-4444', DB: 'db-pass-SECRET-7777' };
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v21-provcfg-'));
     try {
-      const prodEnv = path.join(dir, 'prod.env');
-      fs.writeFileSync(prodEnv, `DB_PASS=${S.DB}\nOPENAI_API_KEY=${S.OPENAI}\nOPENAI_TTS_MODEL=gpt-4o-mini-tts\nANTHROPIC_API_KEY=${S.ANTH}\nVIDEOGEN_API_KEY=${S.VG_PROD}\nGAMMA_API_KEY=${S.GAMMA}\nGAMMA_THEME_MEDIANOCHE=theme-medianoche-id\n`);
-      const stg = path.join(dir, 'stg');
-      fs.mkdirSync(stg);
-      fs.writeFileSync(path.join(stg, '.env'), `NODE_ENV=production\nVIDEOGEN_API_KEY=${S.VG_STAGING}\nDYNAMIC_PROVIDER_WORKER_ENABLED=true\n`);
-      const run = (fit) => spawnSync('bash', ['-c', `set -e\nPROD_ENV_FILE=${prodEnv}\n_FIT=${fit}\n${block}`], { cwd: stg, encoding: 'utf8' });
-      const r1 = run(S.TOKEN);
+      fs.writeFileSync(path.join(dir, '.env'), `NODE_ENV=production\nDB_PASS=${STG.DB}\nVIDEOGEN_API_KEY=${STG.VG}\nDYNAMIC_PROVIDER_WORKER_ENABLED=true\n`);
+      const run = (fit) => spawnSync('bash', ['-c', `set -e\n_FIT=${fit}\n${block}`], { cwd: dir, encoding: 'utf8' });
+      const r1 = run(TOKEN);
       assert(r1.status === 0, `bloque falló: ${r1.stderr}`);
       const out = r1.stdout + r1.stderr;
-      for (const v of Object.values(S)) assert(!out.includes(v), `imprimió un secreto: ${v}`);
+      for (const v of [TOKEN, STG.VG, STG.DB]) assert(!out.includes(v), `imprimió un secreto: ${v}`);
       assert(!/=/.test(out.replace(/^.*━━━.*$/gm, '')), `imprimió un KEY=VALUE:\n${out}`);
-      const kv = Object.fromEntries(fs.readFileSync(path.join(stg, '.env'), 'utf8').split('\n').filter((l) => /^[A-Z0-9_]+=/.test(l)).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
-      eq(kv.FINOPS_INGEST_TOKEN, S.TOKEN, 'token escrito');
+      const kv = Object.fromEntries(fs.readFileSync(path.join(dir, '.env'), 'utf8').split('\n').filter((l) => /^[A-Z0-9_]+=/.test(l)).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
+      eq(kv.FINOPS_INGEST_TOKEN, TOKEN, 'token escrito');
       eq(kv.DYNAMIC_PROVIDER_WORKER_ENABLED, 'false', 'worker de proveedores apagado');
-      eq([kv.OPENAI_API_KEY, kv.ANTHROPIC_API_KEY, kv.GAMMA_API_KEY, kv.OPENAI_TTS_MODEL], [S.OPENAI, S.ANTH, S.GAMMA, 'gpt-4o-mini-tts'], 'copiadas de producción');
-      eq(kv.VIDEOGEN_API_KEY, S.VG_STAGING, 'la de staging NO se pisa');
-      eq(kv.GAMMA_THEME_V21_DARK_DEFAULT, 'theme-medianoche-id', 'default oscuro desde medianoche');
-      assert(!('DB_PASS' in kv), 'no copia claves fuera de la lista');
-      assert(/producción OPENAI_API_KEY: PRESENT …1111/.test(out) && /producción VIDEOGEN_API_URL: ABSENT/.test(out), `inventario:\n${out}`);
-      eq(fs.readFileSync(prodEnv, 'utf8').includes('FINOPS'), false, 'producción intacta');
-      const before = fs.readFileSync(path.join(stg, '.env'), 'utf8');
-      const r2 = run(S.TOKEN);
+      eq(kv.VIDEOGEN_API_KEY, STG.VG, 'claves de staging intactas');
+      for (const k of ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GAMMA_API_KEY', 'GAMMA_THEME_V21_DARK_DEFAULT']) assert(!(k in kv), `no debe agregar ${k}`);
+      const before = fs.readFileSync(path.join(dir, '.env'), 'utf8');
+      const r2 = run(TOKEN);
       assert(r2.status === 0, r2.stderr);
-      eq(fs.readFileSync(path.join(stg, '.env'), 'utf8'), before, 'idempotente');
+      eq(fs.readFileSync(path.join(dir, '.env'), 'utf8'), before, 'idempotente');
       const r3 = run('');
       assert(r3.status === 0 && /FINOPS_INGEST_TOKEN: sin valor/.test(r3.stdout), 'sin secret de GitHub: no toca el token');
-      eq(fs.readFileSync(path.join(stg, '.env'), 'utf8'), before, 'sin secret: .env igual');
+      eq(fs.readFileSync(path.join(dir, '.env'), 'utf8'), before, 'sin secret: .env igual');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await check('preflight-v21-providers: READY / MISSING_CONFIG por proveedor sobre el .env de staging, sin imprimir valores; guard de producción', () => {
+    assert(/preflight-v21-providers\.js/.test(stagingText), 'el deploy corre el preflight');
+    const S = { O: 'sk-o-SECRET-1', A: 'sk-a-SECRET-2', G: 'g-SECRET-3', V: 'v-SECRET-4', Y: 'y-SECRET-5', F: 'f-SECRET-6' };
+    const base = { PATH: process.env.PATH, MIGRATION_ENV: 'staging' };
+    const full = { ...base, OPENAI_API_KEY: S.O, ANTHROPIC_API_KEY: S.A, GAMMA_API_KEY: S.G, GAMMA_THEME_V21_LIGHT_DEFAULT: 'l', GAMMA_THEME_V21_DARK_DEFAULT: 'd',
+      VIDEOGEN_API_KEY: S.V, YOUTUBE_CLIENT_ID: 'cid', YOUTUBE_CLIENT_SECRET: S.Y, YOUTUBE_REDIRECT_URI: 'https://x/cb', YOUTUBE_TOKEN_SECRET: S.Y, FINOPS_INGEST_TOKEN: S.F, DYNAMIC_PROVIDER_WORKER_ENABLED: 'false' };
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'v21-pf-'));
+    try {
+      fs.symlinkSync(path.resolve(distRoot), path.join(tmp, 'dist'));
+      const pf = (env) => spawnSync(process.execPath, [path.resolve('scripts/preflight-v21-providers.js')], { cwd: tmp, env, encoding: 'utf8' });
+      const ok = pf(full);
+      const outOk = ok.stdout + ok.stderr;
+      for (const name of ['Gamma', 'OpenAI TTS', 'Anthropic', 'Videogen', 'YouTube', 'FinOps']) assert(new RegExp(`✓ ${name}: READY`).test(outOk), `${name} READY:\n${outOk}`);
+      for (const v of Object.values(S)) assert(!outOk.includes(v), `imprimió un secreto: ${v}`);
+      const miss = pf({ ...base, VIDEOGEN_API_KEY: S.V });
+      const outMiss = miss.stdout + miss.stderr;
+      for (const name of ['Gamma', 'OpenAI TTS', 'Anthropic', 'YouTube', 'FinOps']) assert(new RegExp(`✗ ${name}: MISSING_CONFIG`).test(outMiss), `${name} MISSING:\n${outMiss}`);
+      assert(/✓ Videogen: READY/.test(outMiss) && /falta ANTHROPIC_API_KEY/.test(outMiss) && /falta GAMMA_API_KEY/.test(outMiss), outMiss);
+      assert(!outMiss.includes(S.V), 'imprimió la clave de Videogen');
+      assert(/GET \/themes/.test(fs.readFileSync('scripts/preflight-v21-providers.js', 'utf8')) && !/readFileSync\([^)]*VPS_PATH/.test(fs.readFileSync('scripts/preflight-v21-providers.js', 'utf8')), 'discovery read-only, sin producción');
+      const guard = pf({ ...base, DB_HOST: 'db.hriwbakbuypaiovvvkqh.supabase.co', DB_USER: 'x' });
+      eq(guard.status, 1, 'guard de producción');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
 

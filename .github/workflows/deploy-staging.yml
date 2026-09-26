@@ -153,8 +153,6 @@ jobs:
               'set -e
                cd '"${{ secrets.VPS_PATH_STAGING }}"'
                IFS= read -r _FIT || true
-               # .env de PRODUCCIÓN: SOLO LECTURA (inventario de proveedores y reutilización de claves).
-               PROD_ENV_FILE='"${{ secrets.VPS_PATH }}"'/.env
 
                if [ ! -f .env ]; then
                  echo "❌ Falta .env en '"${{ secrets.VPS_PATH_STAGING }}"' — créalo a mano una sola vez"
@@ -340,74 +338,17 @@ jobs:
                  echo "+ ${key}: ${before} → ${value} (backup: .env.bak)"
                }
 
-               # ── V2.1 proveedores/FinOps (staging) ──────────────────────────────
-               # Valor de una clave en un .env (última línea, pelado); vacío si no está o no se puede leer.
-               # El .env de producción se lee con sudo -n (sin prompt) y SOLO para las claves listadas.
+               # ── V2.1 FinOps (staging) ──────────────────────────────────────────
+               # Aislamiento: este deploy SOLO lee/escribe el .env de STAGING. Nunca
+               # lee el .env de producción ni copia claves desde producción.
+               # Valor de una clave en el .env de staging (última línea, pelado); vacío si no está.
                _env_val() {
                  local f="$1"
                  local k="$2"
                  local raw
-                 raw=$( { sudo -n grep "^${k}=" "$f" 2>/dev/null || grep "^${k}=" "$f" 2>/dev/null || true; } | tail -n 1)
+                 raw=$(grep "^${k}=" "$f" 2>/dev/null | tail -n 1 || true)
                  [ -n "$raw" ] && _flags_strip_value "${raw#${k}=}"
                  return 0
-               }
-               _mask() {
-                 local v="$1"
-                 printf "…%s" "${v: -4}"
-               }
-               _prod_env_readable() {
-                 [ -n "${PROD_ENV_FILE:-}" ] && { sudo -n test -r "$PROD_ENV_FILE" 2>/dev/null || test -r "$PROD_ENV_FILE"; }
-               }
-               # Inventario de PRODUCCIÓN (solo lectura): PRESENT …últimos 4 / ABSENT. Nunca el valor.
-               inventory_production() {
-                 if ! _prod_env_readable; then
-                   echo "⚠️  producción: .env no legible desde este usuario — inventario omitido"
-                   return 0
-                 fi
-                 local k v
-                 for k in OPENAI_API_KEY ANTHROPIC_API_KEY VIDEOGEN_API_KEY GAMMA_API_KEY; do
-                   v=$(_env_val "$PROD_ENV_FILE" "$k")
-                   if [ -n "$v" ]; then echo "  producción ${k}: PRESENT $(_mask "$v")"; else echo "  producción ${k}: ABSENT"; fi
-                 done
-                 for k in OPENAI_TTS_MODEL OPENAI_TTS_VOICE VIDEOGEN_API_URL VIDEOGEN_MODEL DYNAMIC_PROVIDER_WORKER_ENABLED; do
-                   v=$(_env_val "$PROD_ENV_FILE" "$k")
-                   if [ -n "$v" ]; then echo "  producción ${k}: PRESENT (${v})"; else echo "  producción ${k}: ABSENT"; fi
-                 done
-                 echo "  producción GAMMA_THEME_*: $( { sudo -n grep -oE "^GAMMA_THEME_[A-Z0-9_]+" "$PROD_ENV_FILE" 2>/dev/null || grep -oE "^GAMMA_THEME_[A-Z0-9_]+" "$PROD_ENV_FILE" 2>/dev/null || true; } | sort -u | tr "\n" " ")"
-               }
-               # Reutiliza una clave de producción SOLO si falta en staging (nunca pisa staging). Sin imprimir el valor.
-               reuse_from_production() {
-                 local key="$1"
-                 local secret="$2"
-                 local cur prod shown
-                 cur=$(_env_val .env "$key")
-                 if [ -n "$cur" ]; then
-                   if [ "$secret" = 1 ]; then shown=$(_mask "$cur"); else shown="$cur"; fi
-                   echo "✓ ${key}: ya presente en staging (${shown}) — no se toca"
-                   return 0
-                 fi
-                 prod=""
-                 if _prod_env_readable; then prod=$(_env_val "$PROD_ENV_FILE" "$key"); fi
-                 if [ -z "$prod" ]; then
-                   echo "✗ ${key}: ausente en staging y en producción"
-                   return 0
-                 fi
-                 printf "\n%s=%s\n" "$key" "$prod" >> .env
-                 if [ "$secret" = 1 ]; then shown=$(_mask "$prod"); else shown="$prod"; fi
-                 echo "+ ${key}: copiado de producción (${shown})"
-               }
-               # Copia el valor de otra clave (staging, si no producción) a una clave nueva, si falta.
-               derive_from_key() {
-                 local key="$1"
-                 local src="$2"
-                 local cur v
-                 cur=$(_env_val .env "$key")
-                 if [ -n "$cur" ]; then echo "✓ ${key}: ya presente en staging — no se toca"; return 0; fi
-                 v=$(_env_val .env "$src")
-                 if [ -z "$v" ] && _prod_env_readable; then v=$(_env_val "$PROD_ENV_FILE" "$src"); fi
-                 if [ -z "$v" ]; then echo "✗ ${key}: falta (tampoco hay ${src})"; return 0; fi
-                 printf "\n%s=%s\n" "$key" "$v" >> .env
-                 echo "+ ${key}: tomado de ${src} ($(_mask "$v"))"
                }
                # Secreto que llega por stdin desde un secret de GitHub: se escribe sin imprimirlo.
                ensure_env_secret() {
@@ -469,23 +410,12 @@ jobs:
                  echo "✓ DYNAMIC_COHERENCE_LLM ausente (OFF)"
                fi
 
-               echo "━━━ [0c] V2.1: FinOps + proveedores (staging; producción SOLO lectura) ━━━"
+               echo "━━━ [0c] V2.1: FinOps + proveedores (solo el .env de STAGING) ━━━"
                ensure_env_secret FINOPS_INGEST_TOKEN "${_FIT:-}"
                # Calibración NO aprobada todavía: el worker de proveedores reales queda apagado.
                ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED false
-               echo "Inventario de producción (solo lectura):"
-               inventory_production
-               echo "Reutilización en staging (solo si falta; nunca pisa staging):"
-               reuse_from_production OPENAI_API_KEY 1
-               reuse_from_production OPENAI_TTS_MODEL 0
-               reuse_from_production OPENAI_TTS_VOICE 0
-               reuse_from_production ANTHROPIC_API_KEY 1
-               reuse_from_production VIDEOGEN_API_KEY 1
-               reuse_from_production VIDEOGEN_API_URL 0
-               reuse_from_production VIDEOGEN_MODEL 0
-               reuse_from_production GAMMA_API_KEY 1
-               # Gamma V2.1: los 6 temas legacy son oscuros → default oscuro = el tema legacy "medianoche".
-               derive_from_key GAMMA_THEME_V21_DARK_DEFAULT GAMMA_THEME_MEDIANOCHE
+               # Las claves de proveedores de staging se cargan en staging (secrets de staging);
+               # lo que falte lo reporta el preflight [6b2] — nunca se toma de producción.
 
                echo "━━━ [1/6] Instalar dependencias de producción ━━━"
                npm install --omit=dev
