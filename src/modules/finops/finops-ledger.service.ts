@@ -129,6 +129,9 @@ const SETTLEABLE_COST_SOURCES = new Set(['CALCULATED_FROM_USAGE', 'ACTUAL_PROVID
 function assertCompleteMeasurement(originalKey: string, measured: UsageMeters | null | undefined): void {
   const entries = Object.entries(measured || {}).filter(([, v]) => v !== null && v !== undefined);
   const bad = entries.filter(([, v]) => {
+    // Solo números o strings decimales: Number('') === 0 no puede pasar por "medido" (review M1).
+    if (typeof v === 'string' && !/^\s*\d+(\.\d+)?\s*$/.test(v)) return true;
+    if (typeof v !== 'string' && typeof v !== 'number') return true;
     const n = Number(v);
     return !Number.isFinite(n) || n < 0;
   });

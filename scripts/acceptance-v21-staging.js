@@ -118,14 +118,14 @@ function keysDeep(o, out = new Set()) {
   return out;
 }
 
-for (const [label, s] of [['2 módulos (3+4 capítulos)', spec(2, [3, 4])], ['4 módulos (2+3+1+2 capítulos, examen M3 OFF)', spec(4, [2, 3, 1, 2], { examOff: [2] })]]) {
+for (const [label, s] of [['2 módulos (3+4 capítulos)', spec(2, [3, 4])], ['4 módulos (2+3+1+2 capítulos, examen M3 OFF)', spec(4, [2, 3, 1, 2], { examOff: [2] })], ['2 módulos sin examen final', spec(2, [3, 4], { finalExam: false })]]) {
   const bp = buildBp(s);
   const m = manifestOf(bp, 1);
   const facts = factsOf(m);
   const chs = s.modules.flatMap((x) => x.chapters);
   check(`[${label}] Blueprint v2: schemaVersion 2; toggles exactos por capítulo/módulo/curso; sin toggles de Gamma/audio/Libro`, () => {
     eq(bp.schemaVersion, 2, 'schemaVersion');
-    eq([bp.course.finalExam, bp.course.activityEngine], [true, 'h5p'], 'curso');
+    eq([bp.course.finalExam, bp.course.activityEngine], [s.finalExam, 'h5p'], 'curso');
     const snapCh = bp.modules.flatMap((x) => x.chapters);
     eq(snapCh.map((c) => [c.videoEnabled, c.activityEnabled]), chs.map((c) => [!!c.video, !!c.act]), 'V/A por capítulo');
     eq(bp.modules.map((x) => x.examEnabled), s.modules.map((x) => !!x.exam), 'examEnabled por módulo');
@@ -144,7 +144,7 @@ for (const [label, s] of [['2 módulos (3+4 capítulos)', spec(2, [3, 4])], ['4 
     eq(facts.videoInteractions, facts.videos, 'interacciones = videos');
     eq(facts.activities, chs.filter((c) => c.act).length, 'actividades');
     eq(facts.moduleExams, s.modules.filter((x) => x.exam).length, 'exámenes de módulo');
-    eq(facts.finalExam, 1, 'examen final');
+    eq(facts.finalExam, s.finalExam ? 1 : 0, 'examen final');
     // Obligatorios: Gamma, audiolibro y Libro por capítulo; bienvenida una vez.
     eq([facts.presentations, facts.audiobookChapters, facts.audioWelcome], [chs.length, chs.length, 1], 'obligatorios');
   });
@@ -170,7 +170,8 @@ for (const [label, s] of [['2 módulos (3+4 capítulos)', spec(2, [3, 4])], ['4 
       const sum = Object.values(t[g]).reduce((a, v) => a + dec(v.expected), 0);
       assert(Math.abs(sum - dec(t.expected)) < 1e-6, `${g}: ${sum} ≠ ${t.expected}`);
     }
-    assert(!t.byItemType.video || Object.keys(t.byChapter).length > 0, 'por capítulo');
+    eq(Object.keys(t.byChapter).sort(), [...chs.map((c) => c.id), F.NO_CHAPTER_KEY || '_none'].sort(), 'una entrada por capítulo + curso/módulo');
+    if (!s.finalExam) assert(!t.byItemType.final_exam, 'sin examen final ⇒ sin gasto de final_exam');
   });
   check(`[${label}] budget gate sin política ⇒ ADMIN_APPROVAL (fail closed); run mock ⇒ permitido`, () => {
     eq(F.evaluateBudget({ estimate: est, policy: null, realSpend: true }).decision, 'ADMIN_APPROVAL', 'real sin política');

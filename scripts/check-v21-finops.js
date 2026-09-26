@@ -601,6 +601,8 @@ async function dbChecks() {
       });
       await rejects(ledger.settleMeasuredUsage('videogen:job:vg-eq3', {}, 'measured'), /MEASUREMENT_INCOMPLETE/, 'medición vacía');
       await rejects(ledger.settleMeasuredUsage('videogen:job:vg-eq3', { video_render: -1 }, 'measured'), /MEASUREMENT_INCOMPLETE/, 'medición negativa');
+      await rejects(ledger.settleMeasuredUsage('videogen:job:vg-eq3', { video_render: '' }, 'measured'), /MEASUREMENT_INCOMPLETE/, 'medición vacía como string (review M1)');
+      await rejects(ledger.settleMeasuredUsage('videogen:job:vg-eq3', { video_render: 'abc' }, 'measured'), /MEASUREMENT_INCOMPLETE/, 'medición no numérica');
       eq(await pendingOf(), before + 1, 'medición incompleta ⇒ sigue pendiente');
       // Un CHARGE ya final con delta 0: la liquidación no escribe nada (no había nada pendiente).
       await ledger.recordCharge({
