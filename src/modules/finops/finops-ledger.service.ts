@@ -119,6 +119,24 @@ export interface RecordResult {
 /** Errores de precio que NUNCA deben perder un cargo real (fallback 'pending_zero'). */
 const PRICING_FALLBACK_CODES = new Set(['PRICING_MISSING', 'PRICING_AMBIGUOUS', 'CURRENCY_MISMATCH']);
 
+/** Costos que una medición del proveedor puede liquidar (MOCK / ZERO_BY_DESIGN nunca quedan pendientes). */
+const SETTLEABLE_COST_SOURCES = new Set(['CALCULATED_FROM_USAGE', 'ACTUAL_PROVIDER']);
+
+/**
+ * Medición completa = al menos un medidor, y todos finitos y ≥ 0. Una medición
+ * incompleta NUNCA liquida un pendiente: falla ruidoso y el cargo sigue pending.
+ */
+function assertCompleteMeasurement(originalKey: string, measured: UsageMeters | null | undefined): void {
+  const entries = Object.entries(measured || {}).filter(([, v]) => v !== null && v !== undefined);
+  const bad = entries.filter(([, v]) => {
+    const n = Number(v);
+    return !Number.isFinite(n) || n < 0;
+  });
+  if (!entries.length || bad.length) {
+    throw new FinopsError('MEASUREMENT_INCOMPLETE', `medición incompleta para ${originalKey}: ${JSON.stringify(measured ?? null)}`);
+  }
+}
+
 interface Attribution {
   attributed: boolean;
   rejectReason: string | null;
@@ -451,6 +469,7 @@ export class FinopsLedgerService {
     return this.recordAdjustment(idempotencyKey, priced.amount, 'repriced_after_pricing_missing', {
       recordedBy: 'reconciler',
       metadata: { pricingSnapshot: priced.pricingSnapshot },
+      settlement: true,
     });
   }
 
@@ -473,6 +492,7 @@ export class FinopsLedgerService {
     );
     if (!orig) throw new FinopsError('ORIGINAL_NOT_FOUND', `no existe el evento ${originalKey}`);
     if (orig.event_kind !== 'CHARGE') throw new FinopsError('INVALID_INPUT', `${originalKey} no es un CHARGE`);
+    assertCompleteMeasurement(originalKey, measuredUsage);
     const catalog = await this.loadCatalog(orig.provider, orig.service, orig.model_or_product);
     const priced = priceUsage(measuredUsage || {}, catalog, {
       provider: orig.provider,
@@ -483,6 +503,7 @@ export class FinopsLedgerService {
     return this.recordAdjustment(originalKey, priced.amount, reason, {
       recordedBy: opts.recordedBy,
       metadata: { ...(opts.metadata || {}), measuredUsage, pricingSnapshot: priced.pricingSnapshot },
+      settlement: true,
     });
   }
 
@@ -529,13 +550,21 @@ export class FinopsLedgerService {
    * nuevo total y el total actual (original + ajustes previos). Nunca edita.
    * Serializado por clave original (advisory lock) para que dos ajustes
    * concurrentes no calculen el delta contra el mismo total.
-   * Delta 0 ⇒ no inserta ({inserted:false, event:null}).
+   * Delta 0 ⇒ no inserta ({inserted:false, event:null}), SALVO una liquidación.
+   *
+   * Liquidación (`opts.settlement`, aceptación staging V2.1): llegó una
+   * medición COMPLETA del proveedor para el CHARGE. Si el CHARGE está
+   * `pending` y todavía no tiene ningún ADJUSTMENT, se inserta SIEMPRE un
+   * ADJUSTMENT `final` — con delta 0 si la medición coincide con el monto
+   * provisional (`metadata.settlement='measured_equals_provisional'`). Lo que
+   * resuelve el pendiente es el evento de liquidación, nunca "delta != 0".
+   * Solo aplica a costos medibles (CALCULATED_FROM_USAGE / ACTUAL_PROVIDER).
    */
   async recordAdjustment(
     originalKey: string,
     newAmount: DecimalLike,
     reason: string,
-    opts: { recordedBy?: string; metadata?: Record<string, unknown> } = {},
+    opts: { recordedBy?: string; metadata?: Record<string, unknown>; settlement?: boolean } = {},
   ): Promise<{ inserted: boolean; event: CostEventRow | null; delta: string; previousTotal: string; newTotal: string }> {
     nonEmpty(originalKey, 'originalKey');
     nonEmpty(reason, 'reason');
@@ -553,7 +582,12 @@ export class FinopsLedgerService {
       );
       const previousTotal = addDec(orig.amount, agg.total);
       const delta = subDec(newTotal, previousTotal);
-      if (isZeroDec(delta)) return { inserted: false, event: null, delta, previousTotal, newTotal };
+      if (opts.settlement && !SETTLEABLE_COST_SOURCES.has(orig.cost_source)) {
+        throw new FinopsError('INVALID_INPUT', `${originalKey} (${orig.cost_source}) no es un costo medible: no se liquida`);
+      }
+      const settlesPending = !!opts.settlement && orig.measurement_status === 'pending' && Number(agg.n) === 0;
+      if (isZeroDec(delta) && !settlesPending) return { inserted: false, event: null, delta, previousTotal, newTotal };
+      const settlementMeta = opts.settlement ? { settlement: isZeroDec(delta) ? 'measured_equals_provisional' : 'measured_differs' } : {};
       const row: Record<string, unknown> = {};
       for (const c of EVENT_COLUMNS) row[c] = orig[c];
       Object.assign(row, {
@@ -564,7 +598,7 @@ export class FinopsLedgerService {
         measurement_status: 'final',
         recorded_by: opts.recordedBy || 'reconciler',
         usage: orig.usage ?? {},
-        metadata: { ...(opts.metadata || {}), reason, previousTotal, newTotal, adjusts: originalKey },
+        metadata: { ...(opts.metadata || {}), ...settlementMeta, reason, previousTotal, newTotal, adjusts: originalKey },
       });
       const r = await this.insertEvent(row, manager);
       return { inserted: r.inserted, event: r.event, delta, previousTotal, newTotal };

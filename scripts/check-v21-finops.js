@@ -559,6 +559,59 @@ async function dbChecks() {
       await rejects(ledger.recordAdjustment('videogen:job:nope', '1', 'x'), /ORIGINAL_NOT_FOUND/, 'original inexistente');
     });
 
+    // Aceptación staging V2.1 (minor conocido de F2): medido == provisional NO deja el cargo pendiente.
+    // La regla: un CHARGE pending se resuelve con una LIQUIDACIÓN (ADJUSTMENT final) cuando llega una
+    // medición completa del proveedor — aunque el delta sea 0. Nunca por "difference != 0".
+    await check('DB: liquidación con medición == provisional resuelve el pending (delta 0 ⇒ ADJUSTMENT de liquidación, idempotente)', async () => {
+      const pendingOf = async () => Number((await ledger.costsByCourse(101)).totals.pending_events);
+      const before = await pendingOf();
+      const vg = await ledger.recordCharge({
+        itemRunId: irAv.id, ownerIdFromAuth: OWNER_A, provider: 'videogen', service: 'render', modelOrProduct: 'video',
+        usage: { video_render: 1 }, externalOperationId: 'vg-eq', idempotency: { kind: 'videogen', parts: { jobId: 'vg-eq' } },
+        billingAccount: 'cursia', mode: 'real', recordedBy: 'dynamic-item-worker', measurementStatus: 'pending',
+      });
+      eq([vg.event.amount, vg.event.measurement_status], ['0.9400000000', 'pending'], 'cargo provisional');
+      eq(await pendingOf(), before + 1, 'un pendiente más');
+      // Ajuste común (no liquidación) con delta 0: sigue siendo no-op (semántica de "repetido").
+      const plain = await ledger.recordAdjustment('videogen:job:vg-eq', '0.94', 'poll');
+      eq([plain.inserted, plain.event], [false, null], 'ajuste común con delta 0 no inserta');
+      eq(await pendingOf(), before + 1, 'un ajuste común no liquida');
+      const s = await ledger.recordAdjustment('videogen:job:vg-eq', '0.94', 'videogen_cost_measured', { settlement: true });
+      eq([s.inserted, s.delta, s.event && s.event.event_kind, s.event && s.event.amount, s.event && s.event.measurement_status, s.event && s.event.metadata.settlement],
+        [true, '0.0000000000', 'ADJUSTMENT', '0.0000000000', 'final', 'measured_equals_provisional'], 'liquidación con delta 0');
+      eq(await pendingOf(), before, 'el cargo ya no está pendiente');
+      const again = await ledger.recordAdjustment('videogen:job:vg-eq', '0.94', 'videogen_cost_measured', { settlement: true });
+      eq(again.inserted, false, 'liquidación repetida ⇒ no-op');
+      const { rows } = await client.query(`select count(*)::int n, sum(amount)::text t from public.generation_cost_events where external_operation_id = 'vg-eq'`);
+      eq([rows[0].n, rows[0].t], [2, '0.9400000000'], 'CHARGE + 1 liquidación; total intacto');
+      // settleMeasuredUsage (Gamma/TTS/LLM) con medición completa igual a la reserva ⇒ liquida.
+      await ledger.recordCharge({
+        itemRunId: irAv.id, ownerIdFromAuth: OWNER_A, provider: 'videogen', service: 'render', modelOrProduct: 'video',
+        usage: { video_render: 1 }, externalOperationId: 'vg-eq2', idempotency: { kind: 'videogen', parts: { jobId: 'vg-eq2' } },
+        billingAccount: 'cursia', mode: 'real', recordedBy: 'dynamic-item-worker', measurementStatus: 'pending',
+      });
+      const m = await ledger.settleMeasuredUsage('videogen:job:vg-eq2', { video_render: 1 }, 'measured');
+      eq([m.inserted, m.event && m.event.metadata.settlement], [true, 'measured_equals_provisional'], 'settleMeasuredUsage liquida con delta 0');
+      eq(await pendingOf(), before, 'sin pendientes nuevos');
+      // Medición incompleta ⇒ fail loud, el cargo queda pendiente (nunca se "liquida" con nada).
+      await ledger.recordCharge({
+        itemRunId: irAv.id, ownerIdFromAuth: OWNER_A, provider: 'videogen', service: 'render', modelOrProduct: 'video',
+        usage: { video_render: 1 }, externalOperationId: 'vg-eq3', idempotency: { kind: 'videogen', parts: { jobId: 'vg-eq3' } },
+        billingAccount: 'cursia', mode: 'real', recordedBy: 'dynamic-item-worker', measurementStatus: 'pending',
+      });
+      await rejects(ledger.settleMeasuredUsage('videogen:job:vg-eq3', {}, 'measured'), /MEASUREMENT_INCOMPLETE/, 'medición vacía');
+      await rejects(ledger.settleMeasuredUsage('videogen:job:vg-eq3', { video_render: -1 }, 'measured'), /MEASUREMENT_INCOMPLETE/, 'medición negativa');
+      eq(await pendingOf(), before + 1, 'medición incompleta ⇒ sigue pendiente');
+      // Un CHARGE ya final con delta 0: la liquidación no escribe nada (no había nada pendiente).
+      await ledger.recordCharge({
+        itemRunId: irAv.id, ownerIdFromAuth: OWNER_A, provider: 'videogen', service: 'render', modelOrProduct: 'video',
+        usage: { video_render: 1 }, externalOperationId: 'vg-eq4', idempotency: { kind: 'videogen', parts: { jobId: 'vg-eq4' } },
+        billingAccount: 'cursia', mode: 'real', recordedBy: 'dynamic-item-worker',
+      });
+      const fin = await ledger.recordAdjustment('videogen:job:vg-eq4', '0.94', 'videogen_cost_measured', { settlement: true });
+      eq(fin.inserted, false, 'CHARGE final + delta 0 ⇒ nada');
+    });
+
     await check('DB: cero por diseño (YouTube cuota), user_key no facturable, mock, y ESTIMATED rechazado por constraint', async () => {
       const yt = await ledger.recordZero({ kind: 'youtube', externalId: 'yt-1', ownerIdFromAuth: OWNER_A, itemRunId: irAv.id, quotaUnits: 1600, recordedBy: 'dynamic-item-worker' });
       eq([yt.event.amount, yt.event.cost_source, yt.event.quota_units, yt.event.operation, yt.event.idempotency_key], ['0.0000000000', 'ZERO_BY_DESIGN', '1600.000000', 'youtube.upload', 'youtube:video:yt-1'], 'youtube');
