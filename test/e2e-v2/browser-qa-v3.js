@@ -287,6 +287,11 @@ const FLOWS = {
       const r = await b.evaluate(inH5p(`const box=[...d.querySelectorAll('.h5p-interaction')].find(e=>e.offsetParent!==null&&e.innerText.includes(${JSON.stringify(q)}));const o=[...box.querySelectorAll('.h5p-answer, .h5p-true-false-answer')].find(e=>e.innerText.trim()===${JSON.stringify(pick)});if(!o)return 'sin opción';o.click();const k=[...box.querySelectorAll('button')].find(x=>x.innerText.trim()==='Comprobar');if(!k)return 'sin Comprobar';k.click();return 'ok';`));
       if (r !== 'ok') throw new Error(`IV checkpoint ${cp.index}: ${r}`);
       await b.waitFor(inH5p(`return inst.getUsersScore()===${i + 1}?1:0;`), { timeoutMs: 10000, what: `IV puntaje ${i + 1}` });
+      // Como un estudiante real: cerrar la interacción ("Continuar") antes de seguir. Una
+      // interacción que pausa y queda abierta mantiene el video en pausa: sin esto, el salto
+      // final no llega al "ended" y la pantalla de envío nunca aparece (flaky según timing).
+      await b.evaluate(inH5p(`const c=[...d.querySelectorAll('button, .h5p-joubelui-button')].find(e=>e.offsetParent!==null&&e.innerText.trim()==='Continuar');if(c)c.click();return 1;`));
+      await sleep(300);
     }
     await b.evaluate(inH5p(`inst.video.seek(465);inst.video.play();return 1;`));
     await b.waitFor(inH5p(`return [...d.querySelectorAll('button, .h5p-joubelui-button')].some(e=>e.offsetParent!==null&&e.innerText.trim()==='Enviar respuestas')?1:0;`), { timeoutMs: 40000, what: 'Enviar respuestas' });
