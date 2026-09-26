@@ -16,9 +16,10 @@ import { ArtifactsService } from '../artifacts/artifacts.service';
 import { loadArtifactText } from '../dynamic-packaging/artifact-resolver';
 import type { ResolvedArtifact } from '../dynamic-packaging/packaging-types';
 import { assertCoherenceLlmAllowed, assertDynamicOwnerAllowed } from '../features/dynamic-features';
-import type { BlueprintSnapshotV1 } from '../course-blueprints/blueprint-snapshot';
+import type { AnyBlueprintSnapshot, BlueprintSnapshotV1 } from '../course-blueprints/blueprint-snapshot';
+import { structuralViewV1 } from '../course-blueprints/blueprint-snapshot';
 import { sha256Canonical } from './canonical-json';
-import { COHERENCE_RULESET, COHERENCE_VERSION, ContextSummaryInput, CoursePlanInput } from './coherence-types';
+import { COHERENCE_VERSION, ContextSummaryInput, CoursePlanInput } from './coherence-types';
 import { CoherenceReport, buildCoherenceReport, deterministicReportSha256 } from './report';
 import {
   CompactLlmInput,
@@ -32,6 +33,11 @@ import {
 import { LlmFindingsDto, StructureCoherenceDto } from './dto/coherence.dto';
 
 export const COHERENCE_REPORT_ARTIFACT_TYPE = 'dynamic_coherence_report_json';
+
+/** Vista estructural v1 (ids, títulos, objetivos, orden, examEnabled) de cualquier snapshot. */
+function asStructuralV1(s: BlueprintSnapshotV1 | AnyBlueprintSnapshot): BlueprintSnapshotV1 {
+  return s.schemaVersion === 2 ? structuralViewV1(s) : (s as BlueprintSnapshotV1);
+}
 
 /** Fix wave I1: tope de reportes LLM distintos por run y por hora (env COHERENCE_LLM_REPORTS_PER_HOUR, default 10). */
 export function llmReportsPerHour(): number {
@@ -49,7 +55,8 @@ export interface StructureCoherenceResponse {
 }
 
 interface RunCoherenceInputs {
-  blueprint: BlueprintSnapshotV1;
+  /** V2.1 (R5): schemaVersion 1 (runs v1/v2) o 2 (runs rulesVersion 3). */
+  blueprint: BlueprintSnapshotV1 | AnyBlueprintSnapshot;
   coursePlan: CoursePlanInput | null;
   coursePlanArtifactId: string | null;
   contextSummaries: Record<string, ContextSummaryInput> | null;
@@ -124,7 +131,8 @@ export class CoherenceService {
   async structure(courseId: number, ownerId: string, dto: StructureCoherenceDto): Promise<StructureCoherenceResponse> {
     assertDynamicOwnerAllowed(ownerId);
     const n = dto?.blueprintNumber;
-    const snapshot = n ? (await this.blueprints.getByNumber(courseId, ownerId, n)).snapshot : await this.blueprints.liveSnapshot(courseId, ownerId);
+    // V2.1 (R5): un Blueprint congelado de cualquier schemaVersion (v2 → coherence-rules-v3@1).
+    const snapshot = n ? (await this.blueprints.getByNumberAnySchema(courseId, ownerId, n)).snapshot : await this.blueprints.liveSnapshot(courseId, ownerId);
     const report = buildCoherenceReport({ blueprint: snapshot, layers: { structural: true, content: false } });
     return {
       source: n ? 'blueprint' : 'live',
@@ -177,8 +185,8 @@ export class CoherenceService {
     const { job, manifest } = await this.runOf(courseId, ownerId, blueprintNumber, runId);
     const base = await this.buildDeterministicReport(job, manifest, ownerId, blueprintNumber);
     const baseSaved = await this.persist(job, manifest, base, 'deterministic', base.reportSha256, {});
-    const bp = await this.blueprints.getByNumber(courseId, ownerId, blueprintNumber);
-    const merged = mergeLlmFindings(base, bp.snapshot, {
+    const bp = await this.manifests.blueprintOfForRules(courseId, ownerId, blueprintNumber, manifest.rulesVersion);
+    const merged = mergeLlmFindings(base, asStructuralV1(bp.snapshot), {
       model: dto.model,
       promptSha256: dto.promptSha256,
       findings: dto.findings as any[],
@@ -219,7 +227,7 @@ export class CoherenceService {
     let compact: CompactLlmInput;
     try {
       compact = buildCompactLlmInput({
-        blueprint: inputs.blueprint,
+        blueprint: asStructuralV1(inputs.blueprint),
         coursePlan: inputs.coursePlan,
         contextSummaries: inputs.contextSummaries,
         maxChars: LLM_INPUT_MAX_CHARS,
@@ -302,7 +310,8 @@ export class CoherenceService {
           'calcula sobre un run terminado (nunca sobre salida parcial).',
       );
     }
-    const bp = await this.blueprints.getByNumber(job.course_id, ownerId, blueprintNumber);
+    // V2.1 (R5): Blueprint según las reglas del Manifest del run (v3 ⇒ schemaVersion 2).
+    const bp = await this.manifests.blueprintOfForRules(job.course_id, ownerId, blueprintNumber, manifest.rulesVersion);
     const rows: Array<{ item_key: string; chapter_id: string | null; artifact_id: string; artifact_type: string; storage_bucket: string; storage_path: string; mime_type: string | null; item_run_id: string }> =
       await this.dataSource.query(
         `select g.item_key, g.chapter_id, g.id as item_run_id, a.id as artifact_id, a.type as artifact_type,
@@ -327,10 +336,11 @@ export class CoherenceService {
 
     let coursePlan: CoursePlanInput | null = null;
     const planRows = rows.filter((r) => r.artifact_type === 'dynamic_course_plan_json');
-    if (manifest.rulesVersion === 2) {
+    // rulesVersion 2 y 3 tienen course_plan (v3: mismo item, mismo artifact).
+    if (manifest.rulesVersion === 2 || manifest.rulesVersion === 3) {
       if (planRows.length !== 1) {
         throw new ConflictException(
-          `La ejecución ${job.id} (rulesVersion 2) debe tener exactamente 1 dynamic_course_plan_json vinculado; tiene ${planRows.length}`,
+          `La ejecución ${job.id} (rulesVersion ${manifest.rulesVersion}) debe tener exactamente 1 dynamic_course_plan_json vinculado; tiene ${planRows.length}`,
         );
       }
       coursePlan = this.parseJson(await loadArtifactText(this.artifacts, ownerId, asResolved(planRows[0])), planRows[0]);
@@ -427,7 +437,7 @@ export class CoherenceService {
       reportSha256: report.reportSha256,
       ...(source === 'llm' ? { llmReportSha256: key } : {}),
       coherenceVersion: COHERENCE_VERSION,
-      ruleset: COHERENCE_RULESET,
+      ruleset: report.ruleset,
       findingCount: report.findings.length,
       ...(put.adopted ? { adoptedExistingObject: true } : {}),
       ...extraMeta,

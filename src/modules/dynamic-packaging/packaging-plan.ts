@@ -75,11 +75,28 @@ function findBlueprintChapter(
   return c;
 }
 
+/**
+ * V2.1 (R4): el empaque de Manifests rulesVersion 3 (actividades H5P/SCORM,
+ * experiencias, Gamma, audio…) es el bloque R12. Hasta entonces un Manifest
+ * v3 se rechaza con este código — nunca se empaqueta con las reglas v1/v2.
+ */
+export const PACKAGING_V3_NOT_IMPLEMENTED = 'PACKAGING_V3_NOT_IMPLEMENTED';
+
+export function assertPackagingRulesSupported(rulesVersion: number | null | undefined): void {
+  if (rulesVersion === 3) {
+    throw new PackagingPlanError(
+      `${PACKAGING_V3_NOT_IMPLEMENTED}: el empaquetado de Manifests rulesVersion 3 todavía no está implementado ` +
+        '(bloque R12); no se arma un .mbz v3 con las reglas v1/v2.',
+    );
+  }
+}
+
 export function buildPackagingPlan(
   manifest: GenerationManifestV1,
   blueprint: BlueprintSnapshotV1,
   opts?: { manifestId?: number },
 ): PackagingPlan {
+  assertPackagingRulesSupported(manifest?.rulesVersion);
   // El source del Manifest es la única referencia al Blueprint que usamos
   // para validar que el snapshot recibido es EL snapshot congelado del que
   // este Manifest derivó — nunca lo asumimos por conveniencia del caller.

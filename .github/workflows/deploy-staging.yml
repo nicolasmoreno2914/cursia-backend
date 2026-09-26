@@ -96,6 +96,15 @@ jobs:
       - name: Check Invalidation apply / packaging rules (Fase 8, puro)
         run: node scripts/check-invalidation-apply.js
 
+      - name: Check V2.1 R3 Blueprint v2 + perfiles (puro; la parte PG16 corre local)
+        run: node scripts/check-v21-blueprint-profiles.js --pure-only
+
+      - name: Check V2.1 R4 Manifest rulesVersion 3 (puro; la parte PG16 corre local)
+        run: node scripts/check-v21-manifest-v3.js --pure-only
+
+      - name: Check V2.1 R5 invalidación v3 + coherencia v3 + auditorías v3 (puro; la parte PG16 corre local)
+        run: node scripts/check-v21-invalidation-v3.js --pure-only
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
@@ -323,6 +332,12 @@ jobs:
                echo "━━━ [4d] Blueprints: auditoría de datos (solo lectura, staging) ━━━"
                MIGRATION_ENV=staging node scripts/audit-course-blueprints.js
 
+               echo "━━━ [4d2] V2.1 R3: toggles de Blueprint v2 + course_profiles — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-v21-blueprint-profiles.js
+
+               echo "━━━ [4d3] V2.1 R3: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-v21-blueprint-profiles-schema.js
+
                echo "━━━ [4e] Generation Manifests: migración (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-generation-manifests.js
 
@@ -340,6 +355,12 @@ jobs:
 
                echo "━━━ [4h3] Invalidación (Fase 8): generation_item_runs.carried_from_item_run_id (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-invalidation.js
+
+               echo "━━━ [4h4] V2.1 R4: Manifest rulesVersion 3 — tipos de item v3 + conteos v3 (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-v21-manifest-v3.js
+
+               echo "━━━ [4h5] V2.1 R4: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-v21-manifest-v3-schema.js
 
                echo "━━━ [4i] Dynamic Generation: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-dynamic-generation-schema.js

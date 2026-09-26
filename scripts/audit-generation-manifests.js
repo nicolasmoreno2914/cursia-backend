@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { Client } = require('pg');
 const v2Target = require('./lib/v2-production-target');
+const { auditManifestV3 } = require('./lib/audit-v3');
 
 function loadEnvFile(envPath) {
   if (!fs.existsSync(envPath)) return;
@@ -192,6 +193,15 @@ async function main() {
           coalesce((to_jsonb(cgm)->>'course_plan_count')::int, 0)  as course_plan_count,
           coalesce((to_jsonb(cgm)->>'course_intro_count')::int, 0) as course_intro_count,
           coalesce((to_jsonb(cgm)->>'module_intro_count')::int, 0) as module_intro_count,
+          -- V2.1 (R5): columnas de conteo v3 (supabase-migration-v21-manifest-v3.sql);
+          -- 0 si la migración todavía no corrió.
+          coalesce((to_jsonb(cgm)->>'experience_count')::int, 0)         as experience_count,
+          coalesce((to_jsonb(cgm)->>'presentation_count')::int, 0)       as presentation_count,
+          coalesce((to_jsonb(cgm)->>'video_interactions_count')::int, 0) as video_interactions_count,
+          coalesce((to_jsonb(cgm)->>'activity_count')::int, 0)           as activity_count,
+          coalesce((to_jsonb(cgm)->>'audiobook_chapter_count')::int, 0)  as audiobook_chapter_count,
+          coalesce((to_jsonb(cgm)->>'audio_welcome_count')::int, 0)      as audio_welcome_count,
+          coalesce((to_jsonb(cgm)->>'final_exam_count')::int, 0)         as final_exam_count,
           cb.snapshot_sha256 as blueprint_snapshot_sha256,
           cb.snapshot_json   as blueprint_snapshot_json,
           cb.module_count    as blueprint_module_count,
@@ -212,6 +222,7 @@ async function main() {
     let checkedModuleExamCoverage = 0;
     let checkedBlueprintCounts = 0;
     let checkedV2 = 0;
+    let checkedV3 = 0;
 
     for (const row of all.rows) {
       const label = `Manifest id=${row.id} (course_id=${row.course_id}, blueprint_id=${row.blueprint_id})`;
@@ -259,13 +270,32 @@ async function main() {
         failures.push(`${label}: items.length=${items.length} no coincide con la columna total_jobs=${row.total_jobs}.`);
       }
 
+      // 3d-v3. V2.1 (R5): rulesVersion 3 tiene su propio conjunto de tipos
+      // (sin scorm; activity condicional con variant; experience,
+      // presentation, video_interactions, audio_welcome, audiobook_chapter y
+      // final_exam) — invariantes en scripts/lib/audit-v3.js. Las secciones
+      // 3d–3h de abajo son de v1/v2; 3i (conteos contra el Blueprint) aplica igual.
+      if (row.rules_version === 3) {
+        checkedV3 += 1;
+        checkedTypeCounts += 1;
+        failures.push(...auditManifestV3(row, label));
+        checkedBlueprintCounts += 1;
+        if (row.blueprint_module_count !== undefined && row.module_count !== row.blueprint_module_count) {
+          failures.push(`${label}: module_count=${row.module_count} no coincide con course_blueprints.module_count=${row.blueprint_module_count}.`);
+        }
+        if (row.blueprint_chapter_count !== undefined && row.chapter_count !== row.blueprint_chapter_count) {
+          failures.push(`${label}: chapter_count=${row.chapter_count} no coincide con course_blueprints.chapter_count=${row.blueprint_chapter_count}.`);
+        }
+        continue;
+      }
+
       // 3d. Conteos por type en items = columnas.
       checkedTypeCounts += 1;
       // rulesVersion 2 (spec v2 §3): además course_plan, course_intro y
       // module_intro; en v1 esos tipos siguen siendo "desconocidos".
       const isV2 = row.rules_version === 2;
       if (row.rules_version !== 1 && !isV2) {
-        failures.push(`${label}: rules_version=${row.rules_version} no soportado (esperado 1 o 2).`);
+        failures.push(`${label}: rules_version=${row.rules_version} no soportado (esperado 1, 2 o 3).`);
       }
       if (manifest.rulesVersion !== row.rules_version) {
         failures.push(`${label}: manifest_json.rulesVersion=${manifest.rulesVersion} no coincide con la columna rules_version=${row.rules_version}.`);
@@ -450,6 +480,7 @@ async function main() {
       console.log(`✅ (h) cada módulo del snapshot tiene exam sii examEnabled (${checkedModuleExamCoverage} Manifests revisados).`);
       console.log(`✅ (i) module_count/chapter_count = course_blueprints.module_count/chapter_count (${checkedBlueprintCounts} Manifests revisados).`);
       console.log(`✅ (j) rulesVersion 2: 1 course_plan + 1 course_intro, module_intro sii el módulo existe, content depende de course_plan (${checkedV2} Manifests v2 revisados).`);
+      console.log(`✅ (k) rulesVersion 3: tipos/conteos/variant/features y cobertura exacta contra el Blueprint v2 (${checkedV3} Manifests v3 revisados).`);
     } else {
       console.log(`❌ ${failures.length} violaciones de invariantes encontradas (detalle abajo).`);
     }

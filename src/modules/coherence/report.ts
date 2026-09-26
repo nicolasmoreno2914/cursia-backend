@@ -1,9 +1,18 @@
-import { BlueprintSnapshotV1, snapshotSha256 } from '../course-blueprints/blueprint-snapshot';
+import {
+  AnyBlueprintSnapshot,
+  BlueprintSnapshotV1,
+  recanonicalizeBlueprintSnapshotV2,
+  snapshotSha256,
+  snapshotSha256V2,
+  structuralViewV1,
+} from '../course-blueprints/blueprint-snapshot';
 import { GenerationManifestV1, manifestSha256 } from '../generation-manifests/generation-manifest-builder';
 import { cmpStr, sha256Canonical, sha256Hex, sortedCanonicalJson } from './canonical-json';
 import {
   COHERENCE_RULESET,
+  COHERENCE_RULESET_V3,
   COHERENCE_THRESHOLDS,
+  CoherenceRuleset,
   COHERENCE_VERSION,
   CoherenceFinding,
   CoherenceFindingDraft,
@@ -12,7 +21,7 @@ import {
   RULE_ORDER,
 } from './coherence-types';
 import { ContentCoherenceInput, normalizePlanChapters, runContentRules } from './content';
-import { runStructuralRules } from './structural';
+import { runStructuralRules, runStructuralRulesV3 } from './structural';
 
 /**
  * Fase 7 — ensamblado del reporte de coherencia (spec §4).
@@ -44,7 +53,7 @@ export interface CoherenceLlmBlock {
 
 export interface CoherenceReport {
   coherenceVersion: typeof COHERENCE_VERSION;
-  ruleset: typeof COHERENCE_RULESET;
+  ruleset: CoherenceRuleset;
   layers: { structural: boolean; content: boolean };
   thresholds: typeof COHERENCE_THRESHOLDS;
   inputs: CoherenceReportInputs;
@@ -54,7 +63,13 @@ export interface CoherenceReport {
   reportSha256: string;
 }
 
-export interface CoherenceReportInput extends ContentCoherenceInput {
+export interface CoherenceReportInput extends Omit<ContentCoherenceInput, 'blueprint'> {
+  /**
+   * Blueprint del run: schemaVersion 1 (runs v1/v2, `coherence-rules@1`) o
+   * schemaVersion 2 (runs rulesVersion 3, `coherence-rules-v3@1`: hash v2,
+   * reglas sobre la vista estructural + S4).
+   */
+  blueprint: BlueprintSnapshotV1 | AnyBlueprintSnapshot;
   /** Manifest del run (v1 o v2). Solo se hashea; las reglas no lo leen. */
   manifest?: { rulesVersion?: number } | null;
   /** Default: estructural siempre; contenido solo si hay plan o sidecars. */
@@ -186,9 +201,15 @@ export function buildCoherenceReport(input: CoherenceReportInput): CoherenceRepo
     content: input.layers?.content ?? hasContentInputs,
   };
 
+  // V2.1 (R5): Blueprint v2 ⇒ reglas sobre la vista estructural (+ S4) y su
+  // propio hash/ruleset. Blueprint v1 ⇒ exactamente el camino de siempre.
+  const bpV2 = input.blueprint.schemaVersion === 2 ? recanonicalizeBlueprintSnapshotV2(input.blueprint) : null;
+  const bpV1: BlueprintSnapshotV1 = bpV2 ? structuralViewV1(bpV2) : (input.blueprint as BlueprintSnapshotV1);
+  const ruleset: CoherenceRuleset = bpV2 ? COHERENCE_RULESET_V3 : COHERENCE_RULESET;
+
   const drafts: CoherenceFindingDraft[] = [];
-  if (layers.structural) drafts.push(...runStructuralRules(input.blueprint));
-  if (layers.content) drafts.push(...runContentRules(input));
+  if (layers.structural) drafts.push(...(bpV2 ? runStructuralRulesV3(bpV2) : runStructuralRules(bpV1)));
+  if (layers.content) drafts.push(...runContentRules({ ...input, blueprint: bpV1 }));
 
   const byId = new Map<string, CoherenceFinding>();
   for (const d of drafts) {
@@ -198,7 +219,7 @@ export function buildCoherenceReport(input: CoherenceReportInput): CoherenceRepo
   const findings = [...byId.values()].sort(compareFindings);
 
   const inputs: CoherenceReportInputs = {
-    blueprintSha256: canonicalBlueprintSha256(input.blueprint),
+    blueprintSha256: bpV2 ? snapshotSha256V2(bpV2) : canonicalBlueprintSha256(bpV1),
     manifestSha256: canonicalManifestSha256(input.manifest),
     coursePlanSha256: canonicalCoursePlanSha256(input.coursePlan),
     contextSummariesSha256: canonicalContextSummariesSha256(input.contextSummaries),
@@ -207,10 +228,10 @@ export function buildCoherenceReport(input: CoherenceReportInput): CoherenceRepo
       : null,
   };
 
-  const base = { coherenceVersion: COHERENCE_VERSION, ruleset: COHERENCE_RULESET, layers, inputs, findings };
+  const base = { coherenceVersion: COHERENCE_VERSION, ruleset, layers, inputs, findings };
   return {
     coherenceVersion: COHERENCE_VERSION,
-    ruleset: COHERENCE_RULESET,
+    ruleset,
     layers,
     thresholds: COHERENCE_THRESHOLDS,
     inputs,

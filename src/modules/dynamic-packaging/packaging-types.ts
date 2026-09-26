@@ -85,7 +85,15 @@ export interface ResolvedArtifact {
     | 'dynamic_course_plan_json'
     | 'dynamic_course_intro_md'
     | 'dynamic_module_intro_md'
-    | 'dynamic_context_package_json';
+    | 'dynamic_context_package_json'
+    // rulesVersion 3 (V2.1 R4, audit §N.2) — roles obligatorios al completar; el empaque v3 es R12:
+    | 'dynamic_course_intro_json'
+    | 'dynamic_module_intro_json'
+    | 'dynamic_experience_json'
+    | 'dynamic_presentation'
+    | 'dynamic_video_interactions_json'
+    | 'dynamic_h5p_params_json'
+    | 'dynamic_audio_mp3';
   /** Fase 8: 'stale' si el artifact se empaqueta marcado (STALE_NO_AUTO). Ausente = vigente. */
   status?: 'stale';
   storageBucket: string;
