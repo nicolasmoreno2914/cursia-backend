@@ -251,6 +251,25 @@ export class ArtifactsService {
     return { sizeBytes: existingSize, adopted: true };
   }
 
+  /**
+   * V2.1 R12: descarga (server-side, service role) un objeto de Storage por
+   * bucket + path. Lo usa el empaque v3 para los archivos que un artifact
+   * `dynamic_presentation` referencia (PDF y portada). Falla fuerte: sin
+   * credenciales, HTTP ≠ 2xx o timeout → Error. Aditivo: nada lo usaba antes.
+   */
+  async downloadStorageObject(bucket: string, storagePath: string, timeoutMs = 60_000): Promise<Buffer> {
+    const supabaseUrl = this.config.get<string>('SUPABASE_URL');
+    const serviceKey = this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY');
+    if (!supabaseUrl || !serviceKey) {
+      throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for server-side storage download');
+    }
+    const encodedPath = storagePath.split('/').filter(Boolean).map((s) => encodeURIComponent(s)).join('/');
+    const url = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/authenticated/${bucket}/${encodedPath}`;
+    const res = await fetch(url, { headers: supabaseServiceHeaders(serviceKey), signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) throw new Error(`Supabase Storage download failed: ${res.status} ${bucket}/${storagePath}`);
+    return Buffer.from(await res.arrayBuffer());
+  }
+
   /** Tamaño (content-length) de un objeto de Storage vía HEAD autenticado; null si no existe o no se pudo leer. */
   private async headStorageObjectSize(supabaseUrl: string, serviceKey: string, bucket: string, encodedPath: string): Promise<number | null> {
     const headUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/authenticated/${bucket}/${encodedPath}`;

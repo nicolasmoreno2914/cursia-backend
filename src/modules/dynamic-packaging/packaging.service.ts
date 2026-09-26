@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, Injectable, InternalServerErrorException, Logger, NotFoundException, NotImplementedException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common';
 import { effectiveOutputRowsSql } from '../dynamic-generation/item-generations';
 import { ACTIVE_RUN_WORKER_STATUSES } from '../dynamic-generation/item-transitions';
 import { DataSource } from 'typeorm';
@@ -6,11 +6,13 @@ import { GenerationManifestsService, ManifestDto } from '../generation-manifests
 import { ArtifactsService } from '../artifacts/artifacts.service';
 import { MOCK_VIDEO_NOT_PACKAGEABLE, resolveRunArtifacts } from './artifact-resolver';
 import { PackagingNotReadyError } from './packaging-types';
-import { PACKAGING_V3_NOT_IMPLEMENTED } from './packaging-plan';
 import { frozenVideoDeliveryOf, youtubeDeliveryProblems } from '../dynamic-generation/dynamic-video-delivery';
 import { packageReuseHash, resolveDynamicMoodleVersion, sortedArtifactIds } from './packaging-reuse-key';
 import { DYNAMIC_MBZ_BUILDER_VERSION } from '../../package/dynamic-mbz-builder';
 import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
+import { prepareV3Package } from './packaging-v3';
+import { MOCK_ARTIFACT_IN_REAL_RUN } from './packaging-guards';
+import { DYNAMIC_MBZ_BUILDER_VERSION_V3 } from '../../package/dynamic-mbz-builder-v3';
 
 export const EXECUTION_MODE = 'dynamic_package';
 /** worker_status del job de run (dynamic_generation) que cuentan como "terminado con éxito". */
@@ -114,16 +116,12 @@ export class PackagingService {
     // G3: flag V2 + allow-list por owner (403 antes de tocar la DB).
     assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
-    // V2.1 (R4): empaque v3 = R12 → 501 explícito, antes de crear ningún job.
-    if (manifest.rulesVersion === 3) {
-      throw new NotImplementedException({
-        code: PACKAGING_V3_NOT_IMPLEMENTED,
-        message: `${PACKAGING_V3_NOT_IMPLEMENTED}: el run ${runId} es rulesVersion 3; su empaquetado todavía no está implementado (bloque R12).`,
-      });
-    }
     const run = await this.loadRunRow(courseId, manifest, runId);
     await this.assertRunReady(run, manifest);
     if (manifest.rulesVersion === 2) await this.assertV2ArtifactsResolvable(run, manifest);
+    // V2.1 R12: rulesVersion 3 — artifacts completos, sin mocks en runs reales, video en YouTube y perfil
+    // aplicable, TODO antes de encolar (409 con la lista). Nunca se empaqueta un v3 con las reglas v1/v2.
+    if (manifest.rulesVersion === 3) await this.prepareV3OrConflict(run, manifest);
 
     const existing = await this.findLatestPackageJob(runId);
     if (existing) {
@@ -164,6 +162,7 @@ export class PackagingService {
    * requestPackage y el `stale` de getPackageStatus.
    */
   private async buildFreshness(run: any, manifest: ManifestDto, existing: PackageJobRow): Promise<BuildFreshness> {
+    if (manifest.rulesVersion === 3) return this.buildFreshnessV3(run, manifest, existing);
     const runDone = run.worker_status === RUN_DONE_STATUS || run.status === RUN_DONE_STATUS;
     if (!runDone) {
       // Fix wave M1: activo (regenerando) ≠ terminado sin completar (p.ej. una regeneración falló).
@@ -208,6 +207,67 @@ export class PackagingService {
       const detail = err instanceof Error ? err.message : String(err);
       this.logger.warn(`buildFreshness: no se pudo resolver artifacts para runId=${run.id}: ${detail}`);
       return { stale: true, reason: `artifacts_unresolvable: ${detail.slice(0, 300)}` };
+    }
+  }
+
+  /**
+   * V2.1 R12: ¿el paquete v3 completado sigue siendo el vigente? Misma clave que
+   * el worker (`prepareV3Package`): cambian los artifacts, el tema, la nota
+   * mínima/perfil, el builder, el renderer, el perfil H5P o la versión de Moodle
+   * → stale (y POST …/package arma uno nuevo, sin generar nada).
+   */
+  private async buildFreshnessV3(run: any, manifest: ManifestDto, existing: PackageJobRow): Promise<BuildFreshness> {
+    const runDone = run.worker_status === RUN_DONE_STATUS || run.status === RUN_DONE_STATUS;
+    if (!runDone) {
+      if (ACTIVE_RUN_WORKER_STATUSES.includes(String(run.worker_status))) {
+        return { stale: true, reason: `run_in_progress: la ejecución está ${run.worker_status} (hay items regenerándose); el paquete puede no incluir su salida nueva` };
+      }
+      return { stale: true, reason: `run_not_completed: la ejecución terminó en ${run.worker_status} (p.ej. una regeneración falló); reintentá los items fallidos` };
+    }
+    const existingBuilderVersion = existing.output_summary?.builderVersion;
+    if (existingBuilderVersion !== DYNAMIC_MBZ_BUILDER_VERSION_V3) {
+      return { stale: true, reason: `builder_changed: el paquete se construyó con el builder ${existingBuilderVersion ?? '?'} (actual ${DYNAMIC_MBZ_BUILDER_VERSION_V3})` };
+    }
+    try {
+      const prepared = await prepareV3Package(
+        { query: this.dataSource.query.bind(this.dataSource) }, run.id, manifest, run.course_id, resolveDynamicMoodleVersion().resolved,
+      );
+      if (prepared.sourceIdsHash === existing.output_summary?.sourceIdsHash) return { stale: false };
+      const packaged = new Set<string>(Array.isArray(existing.output_summary?.sourceArtifactIds) ? existing.output_summary.sourceArtifactIds : []);
+      const staleItemKeys = [...prepared.byItem.entries()]
+        .filter(([, it]) => it.artifacts.some((a) => !packaged.has(a.artifactId)))
+        .map(([key]) => key)
+        .sort();
+      if (staleItemKeys.length) {
+        return { stale: true, reason: `sources_changed: ${staleItemKeys.length} item(s) tienen salida más nueva que el paquete`, staleItemKeys };
+      }
+      return {
+        stale: true,
+        reason: 'profile_or_theme_changed: cambió el perfil de evaluación, el tema, el renderer o la versión de Moodle desde que se armó el paquete (se re-empaqueta sin generar nada)',
+      };
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`buildFreshnessV3: no se pudo preparar el paquete v3 del run ${run.id}: ${detail}`);
+      return { stale: true, reason: `artifacts_unresolvable: ${detail.slice(0, 300)}` };
+    }
+  }
+
+  /** 409 (con la lista) si el run v3 no se puede empaquetar tal como está. */
+  private async prepareV3OrConflict(run: any, manifest: ManifestDto): Promise<void> {
+    try {
+      await prepareV3Package({ query: this.dataSource.query.bind(this.dataSource) }, run.id, manifest, run.course_id, resolveDynamicMoodleVersion().resolved);
+    } catch (err) {
+      if (err instanceof PackagingNotReadyError) {
+        const message =
+          `La ejecución ${run.id} (rulesVersion 3) no se puede empaquetar todavía (${err.missing.length} problema(s)) ` +
+          `missingJson=${JSON.stringify(err.missing)}`;
+        throw new ConflictException({ message, missing: err.missing });
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      if ((err as any)?.code === MOCK_ARTIFACT_IN_REAL_RUN || /^(ASSESSMENT_|THEME_INVALID|PROFILE_INVALID)/.test(msg)) {
+        throw new ConflictException({ message: msg, missing: [], code: (err as any)?.code ?? msg.split(':')[0] });
+      }
+      throw err;
     }
   }
 

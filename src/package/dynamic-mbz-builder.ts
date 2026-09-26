@@ -129,7 +129,7 @@ function splitTableRow(line: string): string[] {
   return t.split('|').map((c) => c.trim());
 }
 
-function mdToHtmlBasic(md: string): string {
+export function mdToHtmlBasic(md: string): string {
   const lines = (md ?? '').split(/\r?\n/);
   let html = '';
   let inUl = false;
@@ -219,7 +219,7 @@ function normalizeForCompare(s: string): string {
     .trim();
 }
 
-function stripLeadingDuplicateTitle(md: string, chapterTitle: string, chapterNumber: number): string {
+export function stripLeadingDuplicateTitle(md: string, chapterTitle: string, chapterNumber: number): string {
   const lines = (md ?? '').split(/\r?\n/);
   let idx = 0;
   while (idx < lines.length && !lines[idx].trim()) idx++;
