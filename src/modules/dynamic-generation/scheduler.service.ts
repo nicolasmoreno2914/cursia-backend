@@ -1,4 +1,14 @@
-import { BadRequestException, ConflictException, Injectable, InternalServerErrorException, Logger } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Inject,
+  Injectable,
+  InternalServerErrorException,
+  Logger,
+  Optional,
+  ServiceUnavailableException,
+} from '@nestjs/common';
+import { createHash } from 'crypto';
 import { DataSource } from 'typeorm';
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
@@ -35,6 +45,18 @@ import {
 } from './item-transitions';
 import { latestGenerationPredicate } from './item-generations';
 import { artifactOutputIdentity } from '../invalidation/invalidation-apply';
+import {
+  FINAL_EXAM_QUESTION_RANGE,
+  H5pActivityType,
+  V3_PAYLOAD_INVALID,
+  VideoClaimFacts,
+  activityTypeForChapter,
+  v3ValidatedArtifactType,
+  v3ValidationErrorMessage,
+  validateV3ItemArtifact,
+  videoClaimFacts,
+} from '../course-shell';
+import { V3_ARTIFACT_TEXT_READER, V3ArtifactTextReader } from './v3-artifact-reader';
 
 export type ItemType = ManifestItemType;
 
@@ -171,6 +193,39 @@ export interface ClaimedItem {
     }>;
   };
   dependencyArtifacts: Array<{ itemKey: string; artifactId: string; type: string; storagePath: string }>;
+  /**
+   * V2.1 R11a: `claimPayload`, solo items de rulesVersion 3 validados por el
+   * servidor (nombres alineados con `_dynClaimField` del ejecutor R11b). Dice
+   * qué artifact se valida al completar y trae los datos que el ejecutor NO
+   * decide: tipo H5P de la rotación (activity h5p), plan de checkpoints +
+   * youtubeId/duración medida del video (video_interactions), rango de
+   * preguntas (final_exam), capítulos exactos del journey (module_intro).
+   * Las salidas de las dependencias (content md + Context Package, video…)
+   * siguen llegando en `dependencyArtifacts`, como en v2.
+   */
+  claimPayload?: ClaimPayloadV3;
+}
+
+export interface ClaimPayloadV3 {
+  /** Artifact cuyo contenido valida el servidor al completar (null = solo roles). */
+  validatedArtifactType: string | null;
+  activityType?: H5pActivityType;
+  video?: VideoClaimFacts;
+  finalExam?: { minQuestions: number; maxQuestions: number };
+  moduleChapterIds?: string[];
+  chapterId?: string;
+}
+
+/**
+ * V2.1 R11a: el payload de un item v3 no se puede armar por un dato de su
+ * dependencia (p.ej. video sin youtubeId o sin duración medida). El claim lo
+ * marca `failed` (no reintentable: reintentar no cambia el dato) en la misma
+ * transacción, en vez de entregar un item sin datos o reintentarlo en bucle.
+ */
+class ClaimPayloadUnavailable extends Error {
+  constructor(public readonly code: string, message: string) {
+    super(`${code}: ${message}`);
+  }
 }
 
 export interface ClaimOptions {
@@ -186,6 +241,8 @@ export interface ClaimOptions {
 export interface ItemOpResult {
   ok: boolean;
   reason?: string;
+  /** V2.1 R11a: códigos del validador server-side (reason = v3_payload_invalid). */
+  errors?: string[];
 }
 
 /** Rechazo de guard dentro de una transacción: provoca rollback y se devuelve como {ok:false, reason}. */
@@ -271,6 +328,8 @@ export class SchedulerService {
   constructor(
     private readonly dataSource: DataSource,
     private readonly runs: RunsService,
+    /** V2.1 R11a: lector de artifacts para validar items LLM v3 (ausente → un item v3 validable no se completa). */
+    @Optional() @Inject(V3_ARTIFACT_TEXT_READER) private readonly v3Reader?: V3ArtifactTextReader,
   ) {}
 
   // ── claim ────────────────────────────────────────────────────────────────
@@ -293,9 +352,15 @@ export class SchedulerService {
       if (opts.ownerId !== undefined && opts.ownerId !== null) {
         await this.assertBrowserTypesMatchRun(opts.runId, opts.ownerId, types);
       }
-      const item = await this.claimInRun(opts.runId, executorId, types, leaseSeconds, opts.ownerId);
-      if (!item) await this.reportMissingDependencies(opts.runId, opts.ownerId);
-      return item;
+      // M6: un item cuyo payload no se puede armar se marca failed dentro del
+      // claim; se sigue con el próximo candidato en vez de devolver "nada".
+      for (let attempt = 0; attempt < GLOBAL_CLAIM_RACE_RETRIES; attempt++) {
+        const r = await this.claimInRun(opts.runId, executorId, types, leaseSeconds, opts.ownerId);
+        if (r.item) return r.item;
+        if (!r.unavailable) break;
+      }
+      await this.reportMissingDependencies(opts.runId, opts.ownerId);
+      return null;
     }
 
     // Global (worker, R16). Orden de locks: el candidato se ELIGE sin tomar
@@ -336,7 +401,7 @@ export class SchedulerService {
         return null;
       }
       tried.push(cand.id);
-      const item = await this.claimInRun(cand.job_id, executorId, types, leaseSeconds, opts.ownerId, cand.id);
+      const { item } = await this.claimInRun(cand.job_id, executorId, types, leaseSeconds, opts.ownerId, cand.id);
       if (item) return item;
     }
     this.logger.warn(
@@ -358,8 +423,9 @@ export class SchedulerService {
     leaseSeconds: number,
     ownerId?: string,
     itemId?: string,
-  ): Promise<ClaimedItem | null> {
+  ): Promise<{ item: ClaimedItem | null; unavailable: boolean }> {
     let cancelledJob: any = null;
+    let unavailable: string | null = null;
     const claimed = await this.runs.tx(async (qr) => {
       const job = await this.lockRun(qr, runId, ownerId, 'update');
       if (!job) return null;
@@ -406,10 +472,21 @@ export class SchedulerService {
       );
       if (!row) throw new InternalServerErrorException(`No se pudo reclamar el item ${cand.id} (fila no actualizada)`);
       await markRunRunning(qr, job.id);
-      return this.buildClaimedItem(qr, job, row);
+      try {
+        return await this.buildClaimedItem(qr, job, row);
+      } catch (err) {
+        if (!(err instanceof ClaimPayloadUnavailable)) throw err;
+        await applyItemFailure(qr, row.id, `claim_payload_unavailable: ${err.message}`.slice(0, MAX_ERROR_LENGTH), false);
+        await recomputeRunStatus(qr, job.id);
+        unavailable = `${row.item_key}: ${err.message}`;
+        return null;
+      }
     });
+    if (unavailable) {
+      this.logger.error(`Item ${unavailable} — marcado failed en el claim (dato de una dependencia ausente; no se inventa)`);
+    }
     if (cancelledJob) await this.runs.reconcileCancellation(cancelledJob);
-    return claimed;
+    return { item: claimed, unavailable: unavailable !== null };
   }
 
   /**
@@ -550,8 +627,29 @@ export class SchedulerService {
     const summary = output?.summary ?? {};
     if (!isPlainObject(summary)) return { ok: false, reason: 'invalid_summary' };
 
+    // V2.1 R11a: items LLM de rulesVersion 3 → el servidor valida el contenido
+    // del artifact ANTES de aceptar (fuera de la transacción: la descarga no
+    // retiene locks). Inválido → el item falla reintentable con los códigos
+    // del validador (nunca se acepta en silencio). v1/v2: no aplica.
+    const pre = await this.prevalidateV3(itemRunId, executorId, ids, ownerId);
+    if (pre.kind === 'invalid') {
+      const failed = await this.failItemDetailed(itemRunId, executorId, pre.message, pre.retryable, ownerId);
+      return failed.ok ? { ok: false, reason: V3_PAYLOAD_INVALID, errors: pre.codes } : failed;
+    }
+    const validationPatch =
+      pre.kind === 'valid'
+        ? { v3Validation: { artifactType: pre.artifactType, artifactId: pre.artifactId, contentSha256: pre.contentSha256, ...pre.summary } }
+        : {};
+
     return this.guardedItemOp(itemRunId, executorId, ownerId, 'update', async (qr, job, item) => {
-      const merged = mergeOutputSummary(item.output_summary ?? {}, { ...summary, artifactIds: ids });
+      if (pre.kind === 'valid') {
+        // El artifact validado sigue siendo el mismo objeto (misma ruta) al completar.
+        const [a] = await qr.query(`select storage_bucket, storage_path from public.artifacts where id = $1`, [pre.artifactId]);
+        if (!a || a.storage_bucket !== pre.storageBucket || a.storage_path !== pre.storagePath) {
+          throw new GuardRejection('artifact_changed_after_validation');
+        }
+      }
+      const merged = mergeOutputSummary(item.output_summary ?? {}, { ...summary, ...validationPatch, artifactIds: ids });
       if (merged.ok === false) throw new GuardRejection(merged.reason);
 
       // Spec §3.3 / R16: un artifact por item y rol (type). Se rechaza antes
@@ -742,6 +840,186 @@ export class SchedulerService {
       );
       if (rows.length !== 1) throw new GuardRejection('not_running');
     }, allowCancelled);
+  }
+
+  // ── V2.1 R11a: validación server-side de items LLM v3 ─────────────────────
+
+  /**
+   * Lectura sin locks del item + su artifact validable; descarga y valida.
+   * - 'skip': no aplica (no v3, tipo sin validación de contenido, o el
+   *   estado/artifacts no son completables → la transacción de completeItem
+   *   devuelve el motivo de siempre: not_running, lease_lost,
+   *   artifacts_not_linkable, missing_required_artifacts…).
+   * - 'invalid': el contenido no pasa el validador (o falta un dato medido de
+   *   la dependencia, p.ej. la duración del video → no reintentable).
+   * - 'valid': ok; la transacción re-verifica que el artifact no cambió.
+   */
+  private async prevalidateV3(
+    itemRunId: string,
+    executorId: string,
+    artifactIds: string[],
+    ownerId?: string,
+  ): Promise<
+    | { kind: 'skip' }
+    | { kind: 'invalid'; message: string; codes: string[]; retryable: boolean }
+    | {
+        kind: 'valid';
+        artifactType: string;
+        artifactId: string;
+        storageBucket: string;
+        storagePath: string;
+        contentSha256: string;
+        summary: Record<string, unknown>;
+      }
+  > {
+    if (!UUID_RE.test(String(itemRunId))) return { kind: 'skip' };
+    const [g] = await this.dataSource.query(
+      `select g.id, g.job_id, g.manifest_id, g.item_key, g.type, g.status, g.worker_id, g.chapter_id, g.module_id,
+              pj.owner_id, pj.course_id as job_course_id, pj.frontend_course_id, m.rules_version, m.manifest_json
+         from public.generation_item_runs g
+         join public.production_jobs pj on pj.id = g.job_id
+         join public.course_generation_manifests m on m.id = g.manifest_id
+        where g.id = $1 and pj.execution_mode = 'dynamic_generation' and ($2::text is null or pj.owner_id = $2)`,
+      [itemRunId, ownerId ?? null],
+    );
+    if (!g || Number(g.rules_version) !== 3 || g.status !== 'running' || g.worker_id !== executorId) return { kind: 'skip' };
+    const manifest = typeof g.manifest_json === 'string' ? JSON.parse(g.manifest_json) : g.manifest_json;
+    const mItem = (manifest?.items ?? []).find((i: any) => i && i.key === g.item_key);
+    if (!mItem) {
+      // M5 (fail closed): un item v3 running sin su entrada del Manifest es integridad rota.
+      throw new InternalServerErrorException(`v3_validation_context: el item ${g.item_key} no está en su Manifest congelado; no se completa sin validar`);
+    }
+    const artifactType = v3ValidatedArtifactType(g.type, mItem.variant ?? null);
+    if (!artifactType) return { kind: 'skip' };
+
+    const rows = await this.dataSource.query(
+      `select id, type, storage_bucket, storage_path from public.artifacts
+        where id = any($1::uuid[]) and type = $2 and owner_id = $3 and course_id = $4 and item_run_id is null`,
+      [artifactIds, artifactType, g.owner_id, g.frontend_course_id ?? String(g.job_course_id)],
+    );
+    if (rows.length !== 1) return { kind: 'skip' };
+    const art = rows[0];
+    if (!this.v3Reader) {
+      throw new InternalServerErrorException(
+        `v3_validator_unavailable: el item ${g.item_key} (${g.type}, rulesVersion 3) exige validar ${artifactType} en el servidor ` +
+          'y no hay lector de artifacts configurado; no se completa sin validar',
+      );
+    }
+
+    const ctx: Parameters<typeof validateV3ItemArtifact>[0] = {
+      type: g.type,
+      variant: mItem.variant ?? null,
+      itemKey: g.item_key,
+      chapterId: g.chapter_id ?? null,
+      chapterNumber: mItem.chapterNumber ?? null,
+    };
+    if (g.type === 'module_intro') {
+      const mod = (manifest.modules ?? []).find((m: any) => m.moduleId === g.module_id);
+      ctx.moduleChapterIds = mod ? mod.chapters.map((c: any) => c.chapterId) : [];
+      if (ctx.moduleChapterIds.length === 0) {
+        throw new InternalServerErrorException(`v3_validation_context: el module_intro ${g.item_key} no tiene capítulos en el Manifest; no se completa sin validar`);
+      }
+    }
+    if (g.type === 'video_interactions') {
+      const vf = await this.loadVideoFacts(this.dataSource, g.job_id, g.manifest_id, `video:${g.chapter_id}`);
+      if (vf.ok === false) {
+        // M6: reintentable — si el video se regenera, un claim nuevo trae el plan vigente.
+        return { kind: 'invalid', message: `${V3_PAYLOAD_INVALID}: ${vf.code}: ${vf.message}`, codes: [vf.code], retryable: true };
+      }
+      ctx.video = { videoItemKey: vf.video.videoItemKey, durationSec: vf.video.durationSec };
+    }
+
+    let text: string;
+    try {
+      text = await this.v3Reader.readText({
+        id: art.id,
+        ownerId: g.owner_id,
+        itemKey: g.item_key,
+        itemRunId: g.id,
+        type: art.type,
+        storageBucket: art.storage_bucket,
+        storagePath: art.storage_path,
+      });
+    } catch (err) {
+      // No es un problema del contenido: el item sigue running y el ejecutor puede reintentar completar.
+      throw new ServiceUnavailableException(
+        `v3_artifact_unreadable: no se pudo leer ${artifactType} (${art.id}) del item ${g.item_key} para validarlo: ` +
+          (err instanceof Error ? err.message : String(err)),
+      );
+    }
+    const r = validateV3ItemArtifact(ctx, text);
+    if (!r.ok) {
+      return {
+        kind: 'invalid',
+        message: v3ValidationErrorMessage({ itemKey: g.item_key, type: g.type }, r.errors),
+        codes: [...new Set(r.errors.map((e) => e.code))].sort(),
+        retryable: true,
+      };
+    }
+    return {
+      kind: 'valid',
+      artifactType,
+      artifactId: art.id,
+      storageBucket: art.storage_bucket,
+      storagePath: art.storage_path,
+      // M7: huella del contenido validado; el empaque (R12) verifica que el objeto descargado coincida.
+      contentSha256: createHash('sha256').update(text, 'utf8').digest('hex'),
+      summary: (r.summary ?? {}) as Record<string, unknown>,
+    };
+  }
+
+  /** Datos del video completado (vigente) del capítulo: output_summary + metadata de su dynamic_video. */
+  private async loadVideoFacts(
+    q: { query: (sql: string, params?: any[]) => Promise<any[]> },
+    jobId: string,
+    manifestId: number,
+    videoItemKey: string,
+  ): Promise<ReturnType<typeof videoClaimFacts>> {
+    const [v] = await q.query(
+      `select d.output_summary, a.metadata
+         from public.generation_item_runs d
+         left join public.artifacts a on a.item_run_id = d.id and a.type = 'dynamic_video'
+        where d.job_id = $1 and d.manifest_id = $2 and d.item_key = $3 and d.status = 'completed'
+          and ${latestGenerationPredicate('d')}
+        order by a.created_at desc nulls last
+        limit 1`,
+      [jobId, manifestId, videoItemKey],
+    );
+    if (!v) return { ok: false, code: 'VIDEO_NOT_COMPLETED', message: `el video ${videoItemKey} no está completado` };
+    return videoClaimFacts({ videoItemKey, outputSummary: v.output_summary, artifactMetadata: v.metadata });
+  }
+
+  /** Bloque `claimPayload` del ClaimedItem (solo rulesVersion 3 y tipos validados por el servidor). */
+  private async buildClaimV3(qr: QueryRunner, row: any, mItem: any, manifest: GenerationManifestV1): Promise<ClaimPayloadV3 | undefined> {
+    if (manifest.rulesVersion !== 3) return undefined;
+    const validatedArtifactType = v3ValidatedArtifactType(row.type, mItem.variant ?? null);
+    const out: ClaimPayloadV3 = { validatedArtifactType };
+    switch (row.type) {
+      case 'course_intro':
+      case 'final_exam':
+      case 'experience':
+      case 'module_intro':
+      case 'video_interactions':
+      case 'activity':
+        break;
+      default:
+        return undefined;
+    }
+    if (row.type === 'experience') out.chapterId = row.chapter_id;
+    if (row.type === 'final_exam') {
+      out.finalExam = { minQuestions: FINAL_EXAM_QUESTION_RANGE.min, maxQuestions: FINAL_EXAM_QUESTION_RANGE.max };
+    }
+    if (row.type === 'module_intro') {
+      const mod = manifest.modules.find((m) => m.moduleId === row.module_id);
+      out.moduleChapterIds = mod ? mod.chapters.map((c) => c.chapterId) : [];
+    }
+    if (row.type === 'activity' && mItem.variant === 'h5p') out.activityType = activityTypeForChapter(row.chapter_id);
+    if (row.type === 'video_interactions') {
+      const vf = await this.loadVideoFacts(qr, row.job_id, row.manifest_id, `video:${row.chapter_id}`);
+      if (vf.ok === false) throw new ClaimPayloadUnavailable(vf.code, vf.message);
+      out.video = vf.video;
+    }
+    return out;
   }
 
   // ── sweep ────────────────────────────────────────────────────────────────
@@ -1106,6 +1384,8 @@ export class SchedulerService {
             [row.job_id, row.manifest_id, deps],
           );
 
+    const v3 = await this.buildClaimV3(qr, row, mItem, manifest);
+
     return {
       itemRunId: row.id,
       runId: job.id,
@@ -1153,6 +1433,7 @@ export class SchedulerService {
         type: a.type,
         storagePath: a.storage_path,
       })),
+      ...(v3 ? { claimPayload: v3 } : {}),
     };
   }
 
