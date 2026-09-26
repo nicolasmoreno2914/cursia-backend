@@ -25,6 +25,23 @@ on:
   push:
     branches: [staging]
   workflow_dispatch:
+    # V2.1 calibración de proveedores (aprobada por Nicolás, 2026-09-26). Solo en un dispatch
+    # MANUAL: un push a staging siempre deja el worker en false y no corre ninguna acción.
+    inputs:
+      provider_worker:
+        description: 'DYNAMIC_PROVIDER_WORKER_ENABLED en staging (on = proveedores reales habilitados)'
+        type: choice
+        options: ['off', 'on']
+        default: 'off'
+      calibration_action:
+        description: 'Acción de calibración V2.1 (scripts/staging-v21-calibration.js)'
+        type: choice
+        options: ['none', 'policy', 'authorize', 'report']
+        default: 'none'
+      calibration_course_id:
+        description: 'Id numérico del curso de calibración (authorize/report)'
+        type: string
+        default: ''
 
 concurrency:
   group: deploy-staging
@@ -146,13 +163,28 @@ jobs:
           # V2.1 FinOps: secreto del environment "staging" de GitHub. Viaja por stdin
           # (nunca en argv ni en el log) y se escribe en el .env de staging sin imprimirse.
           FINOPS_INGEST_TOKEN_STAGING: ${{ secrets.FINOPS_INGEST_TOKEN_STAGING }}
+          # Calibración V2.1: solo un dispatch manual puede pedir worker "on" o una acción.
+          # Viajan por env + stdin (nunca interpolados en el script remoto).
+          CAL_WORKER: ${{ github.event_name == 'workflow_dispatch' && inputs.provider_worker == 'on' && 'on' || 'off' }}
+          CAL_ACTION: ${{ github.event_name == 'workflow_dispatch' && inputs.calibration_action || 'none' }}
+          CAL_COURSE: ${{ github.event_name == 'workflow_dispatch' && inputs.calibration_course_id || '' }}
         run: |
-          printf "%s\n" "$FINOPS_INGEST_TOKEN_STAGING" | ssh -i ~/.ssh/deploy_key \
+          case "$CAL_WORKER" in on|off) ;; *) echo "❌ provider_worker inválido"; exit 1 ;; esac
+          case "$CAL_ACTION" in none|policy|authorize|report) ;; *) echo "❌ calibration_action inválido"; exit 1 ;; esac
+          case "$CAL_COURSE" in "") ;; *[!0-9]*) echo "❌ calibration_course_id debe ser numérico"; exit 1 ;; esac
+          if { [ "$CAL_ACTION" = authorize ] || [ "$CAL_ACTION" = report ]; } && [ -z "$CAL_COURSE" ]; then
+            echo "❌ calibration_action=$CAL_ACTION necesita calibration_course_id"; exit 1
+          fi
+          echo "Calibración V2.1: worker=$CAL_WORKER acción=$CAL_ACTION curso=${CAL_COURSE:-(ninguno)}"
+          printf "%s\n%s\n%s\n%s\n" "$FINOPS_INGEST_TOKEN_STAGING" "$CAL_WORKER" "$CAL_ACTION" "$CAL_COURSE" | ssh -i ~/.ssh/deploy_key \
               -o StrictHostKeyChecking=no \
               "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
               'set -e
                cd '"${{ secrets.VPS_PATH_STAGING }}"'
                IFS= read -r _FIT || true
+               IFS= read -r _CAL_WORKER || true
+               IFS= read -r _CAL_ACTION || true
+               IFS= read -r _CAL_COURSE || true
 
                if [ ! -f .env ]; then
                  echo "❌ Falta .env en '"${{ secrets.VPS_PATH_STAGING }}"' — créalo a mano una sola vez"
@@ -412,8 +444,14 @@ jobs:
 
                echo "━━━ [0c] V2.1: FinOps + proveedores (solo el .env de STAGING) ━━━"
                ensure_env_secret FINOPS_INGEST_TOKEN "${_FIT:-}"
-               # Calibración NO aprobada todavía: el worker de proveedores reales queda apagado.
-               ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED false
+               # Worker de proveedores reales: apagado siempre, salvo un dispatch MANUAL con
+               # provider_worker=on (calibración V2.1 aprobada por Nicolás, 2026-09-26).
+               if [ "${_CAL_WORKER:-off}" = "on" ]; then
+                 echo "⚠️  Dispatch manual de calibración: se ENCIENDE el worker de proveedores reales"
+                 ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED true
+               else
+                 ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED false
+               fi
                # Gamma V2.1: temas por defecto (ids públicos de Gamma, no secretos), elegidos del
                # listado real de la cuenta (GET /themes). Solo si faltan: un valor puesto a mano gana.
                ensure_env_default_if_absent GAMMA_THEME_V21_LIGHT_DEFAULT default-light
@@ -513,6 +551,14 @@ jobs:
 
                echo "━━━ [6b] Fase 5A: preflight (solo lectura, staging) ━━━"
                MIGRATION_ENV=staging node scripts/preflight-dynamic-generation.js
+
+               echo "━━━ [6b1] V2.1: acción de calibración (solo dispatch manual) ━━━"
+               case "${_CAL_ACTION:-none}" in
+                 policy) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js policy || echo "❌ acción policy falló" ;;
+                 authorize) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js authorize "${_CAL_COURSE}" || echo "❌ acción authorize rechazada o falló" ;;
+                 report) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js report "${_CAL_COURSE}" || echo "❌ acción report falló" ;;
+                 *) echo "(sin acción de calibración)" ;;
+               esac
 
                echo "━━━ [6b2] V2.1: preflight de proveedores + FinOps (solo lectura, informativo) ━━━"
                MIGRATION_ENV=staging PREFLIGHT_GAMMA_THEMES=1 node scripts/preflight-v21-providers.js || true
