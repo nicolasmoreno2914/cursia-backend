@@ -96,6 +96,9 @@ jobs:
       - name: Check Invalidation apply / packaging rules (Fase 8, puro)
         run: node scripts/check-invalidation-apply.js
 
+      - name: Check V2.1 R3 Blueprint v2 + perfiles (puro; la parte PG16 corre local)
+        run: node scripts/check-v21-blueprint-profiles.js --pure-only
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
@@ -322,6 +325,12 @@ jobs:
 
                echo "━━━ [4d] Blueprints: auditoría de datos (solo lectura, staging) ━━━"
                MIGRATION_ENV=staging node scripts/audit-course-blueprints.js
+
+               echo "━━━ [4d2] V2.1 R3: toggles de Blueprint v2 + course_profiles — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-v21-blueprint-profiles.js
+
+               echo "━━━ [4d3] V2.1 R3: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-v21-blueprint-profiles-schema.js
 
                echo "━━━ [4e] Generation Manifests: migración (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-generation-manifests.js

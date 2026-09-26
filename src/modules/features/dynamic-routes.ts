@@ -8,6 +8,8 @@ import { PackagingController } from '../dynamic-packaging/packaging.controller';
 import { CoursesController } from '../courses/courses.controller';
 import { CoherenceController } from '../coherence/coherence.controller';
 import { InvalidationController } from '../invalidation/invalidation.controller';
+import { CourseStructureSettingsController } from '../course-structure/course-structure-settings.controller';
+import { CourseProfilesController } from '../course-profiles/course-profiles.controller';
 
 /**
  * Rutas de la estructura dinámica de cursos (V2) que DynamicFeatureGuard
@@ -30,6 +32,8 @@ export const DYNAMIC_CONTROLLERS: ReadonlySet<Function> = new Set<Function>([
   CoherenceController,      // Fase 7 (F7-BE)
   InvalidationController,   // Fase 8 (F8-BE)
   DynamicYoutubeController, // DN-1: GET /dynamic/youtube/preflight
+  CourseStructureSettingsController, // V2.1 R3: PATCH /courses/:id/structure-settings
+  CourseProfilesController,          // V2.1 R3: /courses/:id/profiles/:kind
 ]);
 
 export const DYNAMIC_HANDLERS: ReadonlySet<Function> = new Set<Function>([

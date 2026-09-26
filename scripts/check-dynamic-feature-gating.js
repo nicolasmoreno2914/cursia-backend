@@ -79,6 +79,9 @@ const { DynamicYoutubePreflightService } = loadDist('modules/dynamic-generation/
 const { SchedulerService } = loadDist('modules/dynamic-generation/scheduler.service.js');
 const { PackagingController } = loadDist('modules/dynamic-packaging/packaging.controller.js');
 const { PackagingService } = loadDist('modules/dynamic-packaging/packaging.service.js');
+const { CourseStructureSettingsController } = loadDist('modules/course-structure/course-structure-settings.controller.js');
+const { CourseProfilesController } = loadDist('modules/course-profiles/course-profiles.controller.js');
+const { CourseProfilesService } = loadDist('modules/course-profiles/course-profiles.service.js');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // M1 (fix wave / review): descubrimiento automático de TODOS los controllers
@@ -110,7 +113,7 @@ function discoverControllers() {
   }
   return found;
 }
-/** Los 9 controllers 100% dynamic (G1 + Fase 7/8 + DN-1) — deben coincidir con DYNAMIC_CONTROLLERS de dynamic-routes.ts. */
+/** Los 11 controllers 100% dynamic (G1 + Fase 7/8 + DN-1 + V2.1 R3) — deben coincidir con DYNAMIC_CONTROLLERS de dynamic-routes.ts. */
 const DYNAMIC_CONTROLLER_CLASS_NAMES = new Set([
   'CourseStructureController',
   'CourseBlueprintsController',
@@ -121,6 +124,8 @@ const DYNAMIC_CONTROLLER_CLASS_NAMES = new Set([
   'CoherenceController', // Fase 7 (F7-BE)
   'InvalidationController', // Fase 8 (F8-BE)
   'DynamicYoutubeController', // DN-1: GET /dynamic/youtube/preflight
+  'CourseStructureSettingsController', // V2.1 R3
+  'CourseProfilesController', // V2.1 R3
 ]);
 /**
  * Todo lo demás: legacy sin ninguna ruta dynamic, EXCEPTO CoursesController
@@ -246,6 +251,8 @@ async function buildApp() {
       CoherenceController,
       InvalidationController,
       DynamicYoutubeController,
+      CourseStructureSettingsController,
+      CourseProfilesController,
     ],
     providers: [
       AppService,
@@ -259,6 +266,7 @@ async function buildApp() {
       { provide: CoherenceService, useValue: fakeService('CoherenceService') },
       { provide: InvalidationService, useValue: fakeService('InvalidationService') },
       { provide: DynamicYoutubePreflightService, useValue: fakeService('DynamicYoutubePreflightService') },
+      { provide: CourseProfilesService, useValue: fakeService('CourseProfilesService') },
     ],
   })
     .overrideGuard(SupabaseJwtGuard)
@@ -437,8 +445,8 @@ async function runWorkerProcess(script, env, { waitMs }) {
     eq(r(OWNER_A, { [FLAG]: 'true', [COH_LLM]: 'true' }).realVideo, false, 'coherenceLlm no habilita video real');
   });
 
-  await check('G1 set de rutas: los 9 controllers dynamic (incl. Coherence/Invalidation, Fase 7/8, y YouTube preflight DN-1) + solo POST /courses/dynamic de CoursesController', () => {
-    for (const C of [CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController, CoherenceController, InvalidationController, DynamicYoutubeController]) {
+  await check('G1 set de rutas: los 11 controllers dynamic (incl. Coherence/Invalidation, Fase 7/8, YouTube preflight DN-1 y V2.1 R3 settings/profiles) + solo POST /courses/dynamic de CoursesController', () => {
+    for (const C of [CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController, CoherenceController, InvalidationController, DynamicYoutubeController, CourseStructureSettingsController, CourseProfilesController]) {
       assert(DYNAMIC_CONTROLLERS.has(C), `${C.name} no está en el set`);
     }
     assert(isDynamicRoute(CoursesController, CoursesController.prototype.createOrGetDynamic), 'POST /courses/dynamic');
@@ -481,7 +489,7 @@ async function runWorkerProcess(script, env, { waitMs }) {
   // ── HTTP real ──────────────────────────────────────────────────────────────
   const { app, base } = await buildApp();
   const dynamicRoutes = [
-    ...[CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController, CoherenceController, InvalidationController, DynamicYoutubeController].flatMap(routesOf),
+    ...[CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController, CoherenceController, InvalidationController, DynamicYoutubeController, CourseStructureSettingsController, CourseProfilesController].flatMap(routesOf),
     ...routesOf(CoursesController).filter((r) => r.name === 'createOrGetDynamic'),
   ];
   const legacyRoutes = [

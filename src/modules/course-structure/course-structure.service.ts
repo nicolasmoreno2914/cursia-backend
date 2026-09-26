@@ -10,15 +10,20 @@ import { CreateChapterDto } from './dto/create-chapter.dto';
 import { UpdateChapterDto } from './dto/update-chapter.dto';
 import { ReorderDto } from './dto/reorder.dto';
 import { MoveChapterDto } from './dto/move-chapter.dto';
+import { UpdateStructureSettingsDto } from './dto/update-structure-settings.dto';
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
 import { CourseBlueprintsService } from '../course-blueprints/course-blueprints.service';
 import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import {
   RawChapterRow,
+  RawChapterRowV2,
   RawModuleRow,
   buildBlueprintSnapshot,
+  buildBlueprintSnapshotV2,
+  isActivityEngine,
   snapshotSha256,
+  snapshotSha256V2,
 } from '../course-blueprints/blueprint-snapshot';
 
 @Injectable()
@@ -112,6 +117,13 @@ export class CourseStructureService {
     });
     modules.forEach((m) => m.chapters.sort((a, b) => a.position - b.position));
 
+    // V2.1 (R3): toggles de curso y `activity_enabled` por query propia (NO
+    // mapeados en las entidades Course/CourseChapter: así las lecturas por
+    // entidad — y el runner de producción V2, que no incluye esta migración —
+    // no dependen de supabase-migration-v21-blueprint-profiles.sql).
+    const settings = await this.readCourseSettings(courseId);
+    const activityByChapter = await this.readActivityEnabled(courseId);
+
     // Task 4 / Ruling R1: currentInfo no verifica ownership ni "dynamic" —
     // ya lo hizo coursesService.findOne arriba, así que se llama después.
     const currentBlueprint = await this.blueprintsService.currentInfo(courseId);
@@ -119,11 +131,15 @@ export class CourseStructureService {
       course,
       modules,
       currentBlueprint,
+      settings,
+      activityByChapter,
     );
 
     return {
       structureVersion: course.structureVersion,
       structureVersionCounter: course.structureVersionCounter,
+      finalExam: settings.finalExam,
+      activityEngine: settings.activityEngine,
       modules: modules.map((m) => ({
         id: m.id,
         position: m.position,
@@ -136,6 +152,7 @@ export class CourseStructureService {
           title: c.title,
           objective: c.objective,
           videoEnabled: c.videoEnabled,
+          activityEnabled: activityByChapter.get(c.id) as boolean,
         })),
       })),
       currentBlueprint,
@@ -157,10 +174,31 @@ export class CourseStructureService {
   private computeLiveMatchesCurrentBlueprint(
     course: { id: number; title: string },
     modules: CourseModuleEntity[],
-    currentBlueprint: { sha256: string } | null,
+    currentBlueprint: { sha256: string; schemaVersion?: number } | null,
+    settings?: { finalExam: boolean; activityEngine: 'h5p' | 'scorm' },
+    activityByChapter?: Map<string, boolean>,
   ): boolean {
     if (!currentBlueprint) return false;
     try {
+      if (currentBlueprint.schemaVersion === 2) {
+        // V2.1: un Blueprint v2 se compara con el builder v2 (incluye los toggles nuevos).
+        if (!settings || !activityByChapter) throw new Error('faltan los toggles V2.1 para comparar contra un Blueprint v2');
+        const rawModulesV2: RawModuleRow[] = modules.map((m) => ({
+          id: m.id, position: m.position, title: m.title, objective: m.objective, exam_enabled: m.examEnabled,
+        }));
+        const rawChaptersV2: RawChapterRowV2[] = modules.flatMap((m) =>
+          m.chapters.map((c) => ({
+            id: c.id, module_id: m.id, position: c.position, title: c.title, objective: c.objective,
+            video_enabled: c.videoEnabled, activity_enabled: activityByChapter.get(c.id) as boolean,
+          })),
+        );
+        const snapshotV2 = buildBlueprintSnapshotV2(
+          { id: course.id, title: course.title, finalExam: settings.finalExam, activityEngine: settings.activityEngine },
+          rawModulesV2,
+          rawChaptersV2,
+        );
+        return snapshotSha256V2(snapshotV2) === currentBlueprint.sha256;
+      }
       const rawModules: RawModuleRow[] = modules.map((m) => ({
         id: m.id,
         position: m.position,
@@ -194,6 +232,84 @@ export class CourseStructureService {
     }
   }
 
+  /**
+   * V2.1 (R3): `courses.final_exam_enabled` / `courses.activity_engine`.
+   * Fail loud: un valor fuera de contrato (no debería pasar: NOT NULL +
+   * CHECK) tira en vez de devolverse "arreglado".
+   */
+  private async readCourseSettings(
+    courseId: number,
+    runner?: QueryRunner,
+  ): Promise<{ finalExam: boolean; activityEngine: 'h5p' | 'scorm' }> {
+    const q = `select final_exam_enabled, activity_engine from public.courses where id = $1`;
+    const rows = runner ? await runner.query(q, [courseId]) : await this.dataSource.query(q, [courseId]);
+    const row = rows[0];
+    if (!row) throw new NotFoundException(`Course #${courseId} not found`);
+    if (typeof row.final_exam_enabled !== 'boolean' || !isActivityEngine(row.activity_engine)) {
+      throw new Error(
+        `Curso #${courseId}: toggles de curso inválidos (final_exam_enabled=${JSON.stringify(row.final_exam_enabled)}, ` +
+          `activity_engine=${JSON.stringify(row.activity_engine)})`,
+      );
+    }
+    return { finalExam: row.final_exam_enabled, activityEngine: row.activity_engine };
+  }
+
+  /**
+   * V2.1 (R3): `course_chapters.activity_enabled` por capítulo. Fail loud si
+   * a algún capítulo le falta el valor (no debería: NOT NULL DEFAULT true).
+   */
+  private async readActivityEnabled(courseId: number): Promise<Map<string, boolean>> {
+    const rows: { id: string; activity_enabled: unknown }[] = await this.dataSource.query(
+      `select id, activity_enabled from public.course_chapters where course_id = $1`,
+      [courseId],
+    );
+    const out = new Map<string, boolean>();
+    for (const r of rows) {
+      if (typeof r.activity_enabled !== 'boolean') {
+        throw new Error(`Capítulo ${r.id}: activity_enabled ilegible (${JSON.stringify(r.activity_enabled)})`);
+      }
+      out.set(r.id, r.activity_enabled);
+    }
+    return out;
+  }
+
+  /**
+   * V2.1 (R3): PATCH de los toggles de curso (`finalExam`, `activityEngine`).
+   * Mismo lockAndVerify (ownership + dynamic + expectedCounter → 409) y
+   * mismo bump de counter que cualquier otra mutación de estructura: estos
+   * toggles entran en el Blueprint v2.
+   */
+  async updateSettings(courseId: number, ownerId: string, dto: UpdateStructureSettingsDto) {
+    assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
+    if (dto.finalExam === undefined && dto.activityEngine === undefined) {
+      throw new BadRequestException('Nada para actualizar: enviá "finalExam" y/o "activityEngine".');
+    }
+    const queryRunner = this.dataSource.createQueryRunner();
+    try {
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
+      await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
+
+      const sets: string[] = [];
+      const params: any[] = [];
+      let i = 1;
+      if (dto.finalExam !== undefined) { sets.push(`final_exam_enabled = $${i++}`); params.push(dto.finalExam); }
+      if (dto.activityEngine !== undefined) { sets.push(`activity_engine = $${i++}`); params.push(dto.activityEngine); }
+      params.push(courseId);
+      await queryRunner.query(`update public.courses set ${sets.join(', ')} where id = $${i}`, params);
+
+      const newCounter = await this.bumpCounter(queryRunner, courseId);
+      const settings = await this.readCourseSettings(courseId, queryRunner);
+      await queryRunner.commitTransaction();
+      return { structureVersionCounter: newCounter, ...settings };
+    } catch (err) {
+      if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
   async createModule(courseId: number, ownerId: string, dto: CreateModuleDto) {
     assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     const queryRunner = this.dataSource.createQueryRunner();
@@ -223,7 +339,7 @@ export class CourseStructureService {
       const insertedChapter = await queryRunner.query(
         `insert into public.course_chapters (course_id, module_id, position, title, video_enabled)
          values ($1, $2, $3, $4, $5)
-         returning id, position, title, objective, video_enabled as "videoEnabled"`,
+         returning id, position, title, objective, video_enabled as "videoEnabled", activity_enabled as "activityEnabled"`,
         [courseId, newModuleId, 0, 'Nuevo capítulo', false],
       );
 
@@ -344,10 +460,11 @@ export class CourseStructureService {
       const nextPosition = Number(maxRows[0].max_pos) + 1;
 
       const inserted = await queryRunner.query(
-        `insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled)
-         values ($1, $2, $3, $4, $5, $6)
-         returning id, position, title, objective, video_enabled as "videoEnabled"`,
-        [courseId, moduleId, nextPosition, dto.title, dto.objective || null, dto.videoEnabled ?? false],
+        `insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled, activity_enabled)
+         values ($1, $2, $3, $4, $5, $6, $7)
+         returning id, position, title, objective, video_enabled as "videoEnabled", activity_enabled as "activityEnabled"`,
+        [courseId, moduleId, nextPosition, dto.title, dto.objective || null, dto.videoEnabled ?? false,
+          dto.activityEnabled ?? true],
       );
       const newCounter = await this.bumpCounter(queryRunner, courseId);
       await queryRunner.commitTransaction();
@@ -383,6 +500,7 @@ export class CourseStructureService {
       if (dto.title !== undefined) { sets.push(`title = $${i++}`); params.push(dto.title); }
       if (dto.objective !== undefined) { sets.push(`objective = $${i++}`); params.push(dto.objective); }
       if (dto.videoEnabled !== undefined) { sets.push(`video_enabled = $${i++}`); params.push(dto.videoEnabled); }
+      if (dto.activityEnabled !== undefined) { sets.push(`activity_enabled = $${i++}`); params.push(dto.activityEnabled); }
       if (sets.length > 0) {
         params.push(chapterId);
         await queryRunner.query(

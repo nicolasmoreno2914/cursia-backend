@@ -50,6 +50,7 @@ const req = (p) => require(path.join(BUILD, p));
     'supabase-migration-course-blueprints.sql',
     'supabase-migration-generation-manifests.sql',
     'supabase-migration-dynamic-generation.sql',
+    'supabase-migration-v21-blueprint-profiles.sql', // V2.1 R3: toggles de Blueprint v2 + course_profiles
   ]) {
     await ds.query(fs.readFileSync(path.join(REPO, f), 'utf8'));
     console.log('applied', f);
