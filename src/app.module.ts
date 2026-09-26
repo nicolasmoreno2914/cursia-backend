@@ -26,6 +26,7 @@ import { DynamicPackagingModule } from './modules/dynamic-packaging/dynamic-pack
 import { FeaturesModule } from './modules/features/features.module';
 import { CoherenceModule } from './modules/coherence/coherence.module';
 import { InvalidationModule } from './modules/invalidation/invalidation.module';
+import { FinopsModule } from './modules/finops/finops.module';
 
 @Module({
   imports: [
@@ -57,6 +58,7 @@ import { InvalidationModule } from './modules/invalidation/invalidation.module';
     FeaturesModule,
     CoherenceModule,
     InvalidationModule,
+    FinopsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
