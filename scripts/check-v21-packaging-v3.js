@@ -190,6 +190,26 @@ const MATRIX = [
     });
   }
 
+  // Aceptación staging V2.1: el Visual System prohíbe franjas laterales (border-left/right > 1px como acento).
+  // Se escanea TODO texto del paquete: XML de actividades/labels (HTML escapado), Libro, blobs de texto.
+  await check('Visual System: ningún HTML del paquete v3 usa franja lateral (border-left/right > 1px), en toda la matriz', async () => {
+    const STRIPE = /border-(?:left|right)(?:-width)?\s*:\s*(?:[2-9]|\d{2,})(?:\.\d+)?px/i;
+    const hits = [];
+    for (const cfg of MATRIX) {
+      const z = await JSZip.loadAsync(built[cfg.id].r.mbz);
+      for (const name of Object.keys(z.files)) {
+        const f = z.files[name];
+        if (f.dir) continue;
+        const buf = await f.async('nodebuffer');
+        if (buf.subarray(0, 2).toString('latin1') === 'PK' || buf.subarray(0, 4).toString('latin1') === '%PDF') continue;
+        const txt = buf.toString('utf8');
+        const m = STRIPE.exec(txt);
+        if (m) hits.push(`${cfg.id}:${name}: …${txt.slice(Math.max(0, m.index - 60), m.index + 40).replace(/\s+/g, ' ')}…`);
+      }
+    }
+    eq(hits.slice(0, 6), [], 'franjas laterales encontradas');
+  });
+
   await check('[h5p-final-light] H5P: activity type por UUID del capítulo (R-012), paquetes content-only del perfil, sin SingleChoiceSet', async () => {
     const { input, r } = built['h5p-final-light'];
     const acts = r.summary.h5pPackages.filter((p) => p.itemKey.startsWith('activity:'));

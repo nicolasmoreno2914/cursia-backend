@@ -446,7 +446,9 @@ check('intro: sin <style> (la ocultación en view.php la hace el script, no CSS)
 
 check('intro: theme hex aplicado; theme/filename/mid/youtubeId/title inválidos fallan fuerte', () => {
   const html = h.videoInlineIntroHtml({ ...INTRO_IN, theme: { accent: '#AA0055' } });
-  assert(html.includes('border-left:4px solid #AA0055') && html.includes('color:#AA0055'), 'accent aplicado');
+  // Tarjeta con borde COMPLETO del acento (el Visual System prohíbe la franja lateral border-left).
+  assert(html.includes('border:1px solid #AA0055') && html.includes('color:#AA0055'), 'accent aplicado');
+  assert(!/border-(left|right)\s*:/.test(html), 'sin franja lateral');
   throwsWith(() => h.videoInlineIntroHtml({ ...INTRO_IN, theme: { accent: 'oklch(0.5 0.1 200)' } }), /VIDEO_INTRO_INVALID: theme\.accent/, 'oklch');
   throwsWith(() => h.videoInlineIntroHtml({ ...INTRO_IN, theme: { surface: 'var(--x)' } }), /theme\.surface/, 'var');
   throwsWith(() => h.videoInlineIntroHtml({ ...INTRO_IN, packageFilename: 'x.zip' }), /packageFilename/, 'zip');

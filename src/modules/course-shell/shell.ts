@@ -207,7 +207,7 @@ export function routeLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: Shel
       items.push(`<strong>${labelHtml('Evaluación del módulo')}</strong>${labelHtml(' · ')}${labelHtml(`${m.examQuestionCount} ${plural(m.examQuestionCount as number, 'pregunta', 'preguntas')}`)}`);
     }
     const body = heading(h, 'h4', `Módulo ${m.number} · ${m.title}`, ms) + ul(h, items, ms);
-    inner += box(h, body, { s: ms, border: mc.border }, { accentLeft: mc.main });
+    inner += box(h, body, { s: ms, border: mc.border }, { accentBorder: mc.main });
   });
   if (facts.finalExam.enabled) {
     const cs = toneSurf(h, 'alt');
@@ -277,7 +277,7 @@ export function moduleIntroLabel(
   const s = bgSurf(h);
   const mc = moduleColor(theme, module.number - 1);
   const ms = surfOn(theme, mc.soft, [mc.onSoft]);
-  const header = box(h, eyebrow(h, `Módulo ${module.number}`, ms) + heading(h, 'h2', module.title, ms), { s: ms, border: mc.border }, { accentLeft: mc.main });
+  const header = box(h, eyebrow(h, `Módulo ${module.number}`, ms) + heading(h, 'h2', module.title, ms), { s: ms, border: mc.border }, { accentBorder: mc.main });
   const journey = intro.journey.map((j, i) => `<strong>${labelHtml(`Capítulo ${chapters[i].number}`)}</strong>${labelHtml(' · ')}${inlineHtml(chapters[i].title)}${labelHtml(': ')}${inlineHtml(j.line)}`);
   const inner =
     header +

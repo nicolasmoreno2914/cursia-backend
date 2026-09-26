@@ -93,7 +93,7 @@ function css(t: ResolvedTheme): string {
     `h1{font-size:${ty.sizeH1Px}px;margin:0 0 16px;}h2{font-size:${ty.sizeH2Px}px;margin:48px 0 16px;}h3{font-size:${ty.sizeH3Px}px;margin:32px 0 12px;}h4{font-size:${ty.sizeBodyPx}px;margin:24px 0 8px;}`,
     `p,li{max-width:${ty.measureCh}ch;}`,
     `a{color:${c.accentStrong};}`,
-    `blockquote{margin:16px 0;padding:8px 16px;border-left:4px solid ${c.accent};background:${c.surfaceAlt};color:${c.textPrimary};}`,
+    `blockquote{margin:16px 0;padding:8px 16px;border:1px solid ${c.border};border-radius:8px;background:${c.surfaceAlt};color:${c.textPrimary};}`,
     `code{background:${c.surfaceAlt};color:${c.textPrimary};padding:0 4px;}`,
     `table{border-collapse:collapse;width:100%;margin:16px 0;display:block;overflow-x:auto;}th,td{border:1px solid ${c.border};padding:8px;text-align:left;vertical-align:top;}th{background:${c.surfaceAlt};}`,
     `.cc-libro-cover{background:${c.accent};color:${c.textOnAccent};padding:48px 32px;margin:0 0 32px;}`,
@@ -127,7 +127,7 @@ export function compileLibroHtmlV3(input: LibroV3Input): string {
       const mc = moduleColor(t, mi);
       const outcomes = m.intro.outcomes.map((o) => `<li>${esc(o)}</li>`).join('');
       const preface =
-        `<section id="mod-${m.number}" class="cc-libro-module" style="border-left:6px solid ${mc.main};">` +
+        `<section id="mod-${m.number}" class="cc-libro-module" style="border:1px solid ${mc.main};border-radius:8px;padding:0 20px 8px;">` +
         `<h2>Módulo ${m.number} — ${esc(m.title)}</h2>\n${paragraphs(m.intro.presentation)}\n` +
         `<h4>Al terminar este módulo podrás:</h4><ul>${outcomes}</ul></section>`;
       const chapters = m.chapters

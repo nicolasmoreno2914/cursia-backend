@@ -197,7 +197,7 @@ async function main() {
   report(
     'forceclean=1 (format_text real, en memoria): sin iframe/script; bloque de respaldo, ambos enlaces, nomediaplugin y hex intactos',
     !/<iframe|<script|<style/i.test(FC) && FC.includes(`href="${viewUrl}"`) && /<a class="nomediaplugin" href="https:\/\/www\.youtube\.com\/watch\?v=IdwOipZAeqY"/.test(FC) &&
-      FC.includes('Video interactivo calificable') && /background-color:\s*#F4F6FA/i.test(FC) && /border-left:\s*4px solid #1F5FBF/i.test(FC),
+      FC.includes('Video interactivo calificable') && /background-color:\s*#F4F6FA/i.test(FC) && /border:\s*1px solid #1F5FBF/i.test(FC) && !/border-left/i.test(FC),
     FC.slice(0, 900),
   );
   report('forceclean: la configuración del sitio sigue en 0', String(R.forcecleanSetting) === '0' || R.forcecleanSetting === false || R.forcecleanSetting === '', R.forcecleanSetting);

@@ -137,7 +137,7 @@ export function videoInlineIntroHtml(input: VideoInlineIntroInput): string {
     `<div class="cursia-iv-inline" style="display:none;margin:0 0 12px 0;padding:0;">`,
     `<iframe title="${esc(title.trim())}" data-cursia-src="${src}" loading="lazy" width="100%" height="560" style="width:100%;border:0;" allowfullscreen="allowfullscreen"></iframe>`,
     `</div>`,
-    `<div class="cursia-iv-fallback" style="background-color:${t.surface};color:${t.textPrimary};border:1px solid ${t.border};border-left:4px solid ${t.accent};padding:12px 16px;margin:0;font-size:15px;line-height:1.5;">`,
+    `<div class="cursia-iv-fallback" style="background-color:${t.surface};color:${t.textPrimary};border:1px solid ${t.accent};padding:12px 16px;margin:0;font-size:15px;line-height:1.5;">`,
     `<p style="margin:0 0 6px 0;color:${t.textPrimary};"><strong>${esc(C.heading)}</strong></p>`,
     `<p style="margin:0 0 10px 0;color:${t.textPrimary};">${esc(C.body)}</p>`,
     `<p class="cursia-iv-open" style="margin:0 0 6px 0;"><a href="${viewToken}" style="color:${t.accent};font-weight:bold;">${esc(C.openLink)}</a></p>`,

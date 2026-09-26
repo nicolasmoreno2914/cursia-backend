@@ -181,18 +181,18 @@ export function box(
   h: Hx,
   inner: string,
   cs: { s: Surf; border: string },
-  opts: { cls?: string; tag?: 'div' | 'li'; accentLeft?: string } = {},
+  opts: { cls?: string; tag?: 'div' | 'li'; accentBorder?: string } = {},
 ): string {
   const tag = opts.tag ?? 'div';
   const bw = h.t.shape.borderWidth;
   const safe: Decl[] = [
     ['background-color', cs.s.bg],
     ['color', cs.s.fg],
-    ['border', `${bw}px solid ${cs.border}`],
+    // Acento = borde COMPLETO (el Visual System prohíbe franjas laterales).
+    ['border', `${bw}px solid ${opts.accentBorder ?? cs.border}`],
     ['margin', '0 0 16px 0'],
     ['padding', '16px 20px'],
   ];
-  if (opts.accentLeft) safe.push(['border-left', `4px solid ${opts.accentLeft}`]);
   return (
     `<${tag}${opts.cls ? ` class="${opts.cls}"` : ''}` +
     st(h, safe, [['border-radius', h.t.shape.radiusMd], ['min-width', '0']]) +
@@ -258,7 +258,7 @@ export function statRow(h: Hx, stats: Array<{ value: number; label: string }>): 
 
 /** Bloque de transición determinística (fondo propio + filete de acento). */
 export function transitionBox(h: Hx, inner: string): string {
-  return box(h, inner, toneSurf(h, 'alt'), { cls: 'cvc-transition', accentLeft: h.t.color.accent });
+  return box(h, inner, toneSurf(h, 'alt'), { cls: 'cvc-transition', accentBorder: h.t.color.accent });
 }
 
 export function plural(n: number, one: string, many: string): string {

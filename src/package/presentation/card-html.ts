@@ -87,7 +87,7 @@ export function presentationCardHtml(input: PresentationCardInput): string {
     eyebrow(h, `Presentación — Capítulo ${chapterNumber}`, cs.s) +
     img +
     pHtml(h, link(h, pdfUrl, linkText, cs.s), cs.s, { last: true });
-  const html = root(h, `ch${chapterNumber}-presentation`, box(h, inner, cs, { accentLeft: moduleColor.main }));
+  const html = root(h, `ch${chapterNumber}-presentation`, box(h, inner, cs, { accentBorder: moduleColor.main }));
   const lint = lintCleanSafe(html);
   if (!lint.ok) shellFail(`presentation card: no pasa CLEAN_SAFE: ${lint.errors.slice(0, 3).map((e) => `${e.code} ${e.message}`).join('; ')}`);
   const bare = unprotectedText(html);
