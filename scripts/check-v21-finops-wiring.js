@@ -47,6 +47,7 @@ function loadDist(rel) {
 require('reflect-metadata');
 const F = loadDist('modules/finops/index.js');
 const H = loadDist('workers/finops-worker-hooks.js');
+const VD = loadDist('workers/video-duration.js');
 
 let passes = 0;
 let failures = 0;
@@ -205,6 +206,34 @@ async function pureChecks() {
       if (saved === undefined) delete process.env.FINOPS_INGEST_TOKEN; else process.env.FINOPS_INGEST_TOKEN = saved;
       await app.close();
     }
+  });
+
+  await check('puro: duración de video (R11a) — mvhd v0/v1 (caja largesize, free antes de moov), truncado/sin mvhd → null; ISO 8601; prioridad Videogen > mvhd > YouTube > unknown; VideogenService pasa duration_seconds', () => {
+    const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32BE(n >>> 0); return b; };
+    const u64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64BE(BigInt(n)); return b; };
+    const box = (type, payload) => Buffer.concat([u32(8 + payload.length), Buffer.from(type, 'latin1'), payload]);
+    const bigBox = (type, payload) => Buffer.concat([u32(1), Buffer.from(type, 'latin1'), u64(16 + payload.length), payload]);
+    const mvhd0 = (ts, dur) => box('mvhd', Buffer.concat([Buffer.from([0, 0, 0, 0]), u32(0), u32(0), u32(ts), u32(dur), Buffer.alloc(80)]));
+    const mvhd1 = (ts, dur) => box('mvhd', Buffer.concat([Buffer.from([1, 0, 0, 0]), u64(0), u64(0), u32(ts), u64(dur), Buffer.alloc(80)]));
+    const ftyp = box('ftyp', Buffer.from('isom\0\0\0\0isommp41', 'latin1'));
+    const mp4v0 = Buffer.concat([ftyp, box('moov', Buffer.concat([mvhd0(1000, 468000), box('trak', Buffer.alloc(16))])), box('mdat', Buffer.alloc(32))]);
+    eq(VD.parseMp4DurationSec(new Uint8Array(mp4v0)), 468, 'v0');
+    const mp4v1 = Buffer.concat([ftyp, box('free', Buffer.alloc(10)), bigBox('moov', mvhd1(90000, 468 * 90000 + 30000))]);
+    eq(VD.parseMp4DurationSec(new Uint8Array(mp4v1)), 468, 'v1 + largesize + free (redondeo)');
+    eq(VD.parseMp4DurationSec(new Uint8Array(Buffer.concat([ftyp, box('mdat', Buffer.alloc(8))]))), null, 'sin moov');
+    eq(VD.parseMp4DurationSec(new Uint8Array(Buffer.concat([ftyp, box('moov', box('trak', Buffer.alloc(4)))]))), null, 'sin mvhd');
+    eq(VD.parseMp4DurationSec(new Uint8Array(mp4v0.subarray(0, mp4v0.length - 60))), null, 'truncado');
+    eq(VD.parseMp4DurationSec(new Uint8Array(Buffer.concat([ftyp, box('moov', mvhd0(0, 5))]))), null, 'timescale 0');
+    eq([VD.parseIso8601DurationSec('PT7M48S'), VD.parseIso8601DurationSec('PT1H'), VD.parseIso8601DurationSec('P0DT0H0M5S'), VD.parseIso8601DurationSec('PT'), VD.parseIso8601DurationSec('7:48')],
+      [468, 3600, 5, null, null], 'ISO 8601');
+    eq(VD.resolveVideoDuration({ videogenStatus: { duration_seconds: 468.4 }, mp4Bytes: new Uint8Array(mp4v1), youtubeContentDetailsDuration: 'PT1M' }), { durationSec: 468, durationSource: 'videogen_status' }, 'prioridad 1');
+    eq(VD.resolveVideoDuration({ videogenStatus: { status: 'completed' }, mp4Bytes: new Uint8Array(mp4v0), youtubeContentDetailsDuration: 'PT1M' }), { durationSec: 468, durationSource: 'mp4_mvhd' }, 'prioridad 2');
+    eq(VD.resolveVideoDuration({ videogenStatus: {}, youtubeContentDetailsDuration: 'PT7M48S' }), { durationSec: 468, durationSource: 'youtube_content_details' }, 'prioridad 3');
+    eq(VD.resolveVideoDuration({ videogenStatus: { duration: 0 } }), { durationSec: null, durationSource: 'unknown' }, 'ninguna');
+    eq(VD.MOCK_VIDEO_DURATION_SEC, 468, 'fixture IdwOipZAeqY');
+    const { VideogenService } = loadDist('video-engine/videogen.service.js');
+    const svc = new VideogenService();
+    eq(svc.parseJobs([{ job_id: 'j', status: 'completed', duration_seconds: 468 }, { job_id: 'k', status: 'completed' }]).map((j) => j.duration_seconds), [468, null], 'parseJobs');
   });
 
   await check('puro: cableado — deploy/PM2 del worker de proveedores, migración FinOps en deploy-staging y run-e2e.sh, CI corre este check', () => {
@@ -381,6 +410,15 @@ async function dbChecks() {
     }
     const itemRow = async (runId, key) => (await ds.query(`select * from public.generation_item_runs where job_id = $1 and item_key = $2 order by generation desc limit 1`, [runId, key]))[0];
     const events = (where, p) => ds.query(`select *, amount::text as amount from public.generation_cost_events where ${where} order by created_at, id`, p);
+    const { mergeOutputSummary } = loadDist('modules/dynamic-generation/scheduler.service.js');
+    /** recordItemExternal de un scheduler falso que SÍ persiste (mismo merge que el real). */
+    const patchSummary = async (id, patch) => {
+      const [r] = await ds.query(`select output_summary from public.generation_item_runs where id = $1`, [id]);
+      const m = mergeOutputSummary(r.output_summary || {}, patch);
+      if (!m.ok) return false;
+      await ds.query(`update public.generation_item_runs set output_summary = $2::jsonb where id = $1`, [id, JSON.stringify(m.merged)]);
+      return true;
+    };
 
     // ── Ingest HTTP con el ledger real ──────────────────────────────────
     class IngestDbModule {}
@@ -498,6 +536,7 @@ async function dbChecks() {
       assert(near(videoEvent.amount, 0.97), `monto ${videoEvent.amount}`);
       eq([videoEvent.course_id, videoEvent.run_id, videoEvent.item_key, videoEvent.chapter_id, videoEvent.owner_id], [Bc.cid, runB, `video:${Bc.c1}`, Bc.c1, OWNER], 'atribución');
       eq(videoEvent.metadata.amountBasis, 'provider_calculated', 'base del monto');
+      eq(s.st.completed[0].payload.summary.external, { durationSec: null, durationSource: 'unknown' }, 'Videogen real sin duración → null + unknown');
       assert(videoEvent.idempotency_key.startsWith('videogen:job:vg_job_1_'), 'clave por job');
     });
 
@@ -697,6 +736,43 @@ async function dbChecks() {
       await admin.authorize(Bc.cid, { estimateId, authorizedBudget: '300' }, ADMIN_USER);
       const res = await runs.regenerateItem(Bc.cid, OWNER, 1, runB, key, { confirmPaid: true });
       eq([res.created, res.costKind, res.item.generation], [true, 'videogen', 2], 'regenerado');
+    });
+
+    await check('DB duración (R11a): run MOCK videogen_direct → Videogen mock devuelve 468 y se persiste en output_summary.external + payload/metadata del artifact dynamic_video', async () => {
+      const s = fakeScheduler();
+      const uploads = [];
+      const deps = workerDeps(s, fakeVideogen(0));
+      deps.artifacts = { ...deps.artifacts, async uploadJsonArtifact(i) { uploads.push(i); return { id: 'art-video-mock' }; } };
+      // En mock el worker usa su Videogen interno (mockPollVideoStatus lee/escribe output_summary por el scheduler).
+      const row = await itemRow(runA, `video:${A.c2}`);
+      s.recordItemExternal = async (id, _e, patch) => { await patchSummary(id, patch); return true; };
+      await itemWorker.processItem(deps, await claimedVideo(runA, A.c2));
+      eq([s.st.completed.length, s.st.failed.length], [1, 0], `completó (${JSON.stringify(s.st.failed)})`);
+      eq(s.st.completed[0].payload.summary.external, { durationSec: 468, durationSource: 'videogen_status' }, 'external');
+      eq([uploads[0].payload.durationSec, uploads[0].metadata.durationSec, uploads[0].metadata.durationSource], [468, 468, 'videogen_status'], 'artifact');
+      const [ev] = await events(`item_run_id = $1`, [row.id]);
+      eq([ev.cost_source, ev.amount], ['MOCK', F.normalizeDecimal(0)], 'ledger MOCK');
+    });
+
+    await check('DB duración (R11a): run MOCK con entrega YouTube → la duración queda en external al terminar el render y viaja al artifact final (publicador mock, sin red)', async () => {
+      await ds.query(`update public.production_jobs set input_payload = input_payload || '{"videoDelivery":"youtube"}'::jsonb where id = $1`, [runA]);
+      try {
+        const s = fakeScheduler();
+        const uploads = [];
+        s.recordItemExternal = async (id, _e, patch) => patchSummary(id, patch);
+        const deps = workerDeps(s, fakeVideogen(0));
+        deps.artifacts = { ...deps.artifacts, async uploadJsonArtifact(i) { uploads.push(i); return { id: 'art-video-yt' }; } };
+        const row = await itemRow(runA, `video:${A.c1}`);
+        await itemWorker.processItem(deps, await claimedVideo(runA, A.c1));
+        eq([s.st.completed.length, s.st.failed.length], [1, 0], `completó (${JSON.stringify(s.st.failed)})`);
+        const [db] = await ds.query(`select output_summary from public.generation_item_runs where id = $1`, [row.id]);
+        eq([db.output_summary.external.durationSec, db.output_summary.external.durationSource, !!db.output_summary.external.youtubeVideoId], [468, 'videogen_status', true], 'external en la DB');
+        eq([uploads[0].payload.durationSec, uploads[0].metadata.durationSec, uploads[0].payload.delivery], [468, 468, 'youtube'], 'artifact final');
+        const yt = await events(`item_run_id = $1 and provider = 'youtube'`, [row.id]);
+        eq(yt.map((e) => [e.cost_source, dec(e.quota_units)]), [['MOCK', 1600]], 'cuota de YouTube (mock)');
+      } finally {
+        await ds.query(`update public.production_jobs set input_payload = input_payload || '{"videoDelivery":"videogen_direct"}'::jsonb where id = $1`, [runA]);
+      }
     });
 
     await check('DB gate BLOCK: política del curso con maxCostPerRun mínimo y on_exceed BLOCK → 409 budget_blocked para un run real (sin salida por aprobación)', async () => {

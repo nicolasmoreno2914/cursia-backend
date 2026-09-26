@@ -52,6 +52,7 @@ import {
   recordYoutubeUpload,
   settleVideogenPending,
 } from './finops-worker-hooks';
+import { MOCK_VIDEO_DURATION_SEC, VideoDuration, resolveVideoDuration } from './video-duration';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fase 5A Task 4 — dynamic-item-worker: ejecuta items type='video' de un run
@@ -340,12 +341,14 @@ async function mockPollVideoStatus(
   if (deps.mockScenario === 'fail') {
     return { ...base, status: 'failed', progress: null, error: 'Mock: render falló' };
   }
+  // V2.1: el mock devuelve la duración de la fixture (R11a necesita la duración medida).
   return {
     ...base,
     status: 'completed',
     progress: 100,
     download_url: `https://mock-cdn.cursia.local/dynamic/${jobId}.mp4`,
-  };
+    duration_seconds: MOCK_VIDEO_DURATION_SEC,
+  } as VideogenBatchJob;
 }
 
 /** Señal interna: la lease del item se perdió a mitad de una operación — el llamador debe abortar sin fail/complete. */
@@ -587,6 +590,17 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
             ownerId: runHead.ownerId, itemRunId: item.itemRunId, jobId: jobIdForLedger, mode, cost,
             costError, outputSummary: item.outputSummary,
           }));
+        // V2.1 (R11a): duración medida del video (status de Videogen; el worker no
+        // tiene los bytes del MP4 ni consulta YouTube). Sin fuente → null + 'unknown'.
+        // `external` nunca cambia un valor ya registrado (external_conflict): un
+        // re-claim del mismo job reutiliza la duración que ya quedó guardada.
+        const priorExternal = (item.outputSummary?.external ?? {}) as Record<string, any>;
+        const duration: VideoDuration = priorExternal.durationSec !== undefined
+          ? { durationSec: priorExternal.durationSec ?? null, durationSource: priorExternal.durationSource ?? 'unknown' }
+          : resolveVideoDuration({ videogenStatus: status });
+        if (duration.durationSec === null) {
+          logger.warn(`Item ${item.itemKey}: Videogen no informó la duración del video (durationSource=unknown)`);
+        }
         if (runHead.videoDelivery === 'youtube') {
           // 5B.2.A: con YouTube, completed_local es INTERMEDIO — se persiste
           // lo necesario para publicar (y reanudar sin Videogen) y se pasa a
@@ -596,6 +610,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
             videogenStatus: status.status,
             videogenDownloadUrl: status.download_url ?? null,
             costUsd: cost,
+            external: { durationSec: duration.durationSec, durationSource: duration.durationSource },
           });
           if (!recorded) {
             logger.warn(`Item ${item.itemKey}: lease perdida al registrar completed_local — se detiene sin publicar`);
@@ -605,7 +620,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
           await runYoutubeDeliveryPhase(deps, item, runHead, phase, () => leaseLost);
           return;
         }
-        await completeVideoItem(deps, item, runHead, jobId, status, mode, cost);
+        await completeVideoItem(deps, item, runHead, jobId, status, mode, cost, duration);
         return;
       }
       if (isJobFailed(status.status)) {
@@ -639,6 +654,7 @@ async function completeVideoItem(
   status: VideogenBatchJob,
   mode: 'mock' | 'real',
   cost: number | null,
+  duration: VideoDuration,
 ): Promise<void> {
   const payload = {
     videogenJobId: jobId,
@@ -646,6 +662,8 @@ async function completeVideoItem(
     status: status.status,
     mode,
     costUsd: cost,
+    durationSec: duration.durationSec,
+    durationSource: duration.durationSource,
     chapterId: item.chapterId,
     itemKey: item.itemKey,
     idempotencyKey: item.idempotencyKey,
@@ -664,13 +682,19 @@ async function completeVideoItem(
     storagePath,
     payload,
     mimeType: 'application/json',
-    metadata: { manifestId: item.manifestId, itemKey: item.itemKey, chapterId: item.chapterId },
+    metadata: {
+      manifestId: item.manifestId, itemKey: item.itemKey, chapterId: item.chapterId,
+      durationSec: duration.durationSec, durationSource: duration.durationSource,
+    },
     upsert: false,
   });
 
   const ok = await deps.scheduler.completeItem(item.itemRunId, deps.executorId, {
     artifactIds: [artifact.id],
-    summary: { videogenJobId: jobId, mode, downloadUrl: status.download_url ?? null, costUsd: cost },
+    summary: {
+      videogenJobId: jobId, mode, downloadUrl: status.download_url ?? null, costUsd: cost,
+      external: { durationSec: duration.durationSec, durationSource: duration.durationSource },
+    },
   });
   if (!ok) {
     deps.logger.warn(
@@ -1035,12 +1059,20 @@ async function publishYoutubeAndComplete(
     }
   }
   const downloadUrl: string | null = summary.videogenDownloadUrl ?? null;
+  // V2.1 (R11a): la duración quedó en external al terminar el render; un item
+  // anterior a este cambio no la tiene → null + 'unknown' (nunca inventada).
+  const hasDuration = typeof external.durationSec === 'number' && external.durationSec > 0;
+  const duration: VideoDuration = hasDuration
+    ? { durationSec: external.durationSec, durationSource: external.durationSource ?? 'videogen_status' }
+    : { durationSec: null, durationSource: 'unknown' };
   const payload = {
     videogenJobId,
     downloadUrl,
     status: summary.videogenStatus ?? null,
     mode,
     costUsd: cost,
+    durationSec: duration.durationSec,
+    durationSource: duration.durationSource,
     chapterId: item.chapterId,
     itemKey: item.itemKey,
     idempotencyKey: item.idempotencyKey,
@@ -1060,7 +1092,10 @@ async function publishYoutubeAndComplete(
     storagePath,
     payload,
     mimeType: 'application/json',
-    metadata: { manifestId: item.manifestId, itemKey: item.itemKey, chapterId: item.chapterId, delivery: 'youtube' },
+    metadata: {
+      manifestId: item.manifestId, itemKey: item.itemKey, chapterId: item.chapterId, delivery: 'youtube',
+      durationSec: duration.durationSec, durationSource: duration.durationSource,
+    },
     upsert: false,
   });
 
@@ -1076,6 +1111,9 @@ async function publishYoutubeAndComplete(
       youtubeVideoId,
       youtubeUrl,
       youtubeUploadStartedAt: null,
+      ...(external.durationSec === undefined
+        ? { external: { durationSec: null, durationSource: 'unknown' } }
+        : {}),
     },
   });
   if (!ok) {
