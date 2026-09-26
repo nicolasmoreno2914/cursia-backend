@@ -108,6 +108,9 @@ jobs:
       - name: Check V2.1 RF-b cableado FinOps (puro; la parte PG16 corre local)
         run: node scripts/check-v21-finops-wiring.js --pure-only
 
+      - name: Check V2.1 R12 empaque v3 (builder + validador §Q.8 + worker con fakes; puro, la restauración en Moodle corre local)
+        run: node scripts/check-v21-packaging-v3.js
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh

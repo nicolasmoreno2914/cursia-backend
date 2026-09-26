@@ -53,6 +53,34 @@ export interface UploadBufferArtifactInput {
  * existente con HTTP 400 y body `{"statusCode":"409","error":"Duplicate",…}`
  * (versiones más nuevas pueden responder 409 directo).
  */
+/**
+ * V2.1 R12 fix round 1 (review G6 I2): valida un storage path ANTES de usarlo
+ * para una descarga con service role. Rechaza: vacío, absoluto (`/…`),
+ * backslashes, cualquier `%` (encoding: `%2e%2e`, `%2f`…), segmentos vacíos,
+ * `.` o `..`, caracteres de control y cualquier carácter fuera de
+ * `[A-Za-z0-9._@:+=-]` por segmento. Devuelve los segmentos validados (la URL
+ * se arma con encodeURIComponent por segmento).
+ */
+export function assertSafeStoragePath(storagePath: unknown): string[] {
+  const fail = (why: string): never => {
+    throw new Error(`STORAGE_PATH_INVALID: ${why} (${JSON.stringify(storagePath)})`);
+  };
+  if (typeof storagePath !== 'string' || storagePath.length === 0) fail('vacío');
+  const p = storagePath as string;
+  if (p.length > 1024) fail('demasiado largo');
+  if (p.startsWith('/')) fail('absoluto');
+  if (p.includes('\\')) fail('backslash');
+  if (p.includes('%')) fail('percent-encoding');
+  if (/[\u0000-\u001f\u007f]/.test(p)) fail('caracteres de control');
+  const segments = p.split('/');
+  for (const s of segments) {
+    if (s === '') fail('segmento vacío');
+    if (s === '.' || s === '..') fail('dot-segment');
+    if (!/^[A-Za-z0-9._@:+=-]+$/.test(s)) fail(`segmento con caracteres no permitidos "${s}"`);
+  }
+  return segments;
+}
+
 export function isStorageDuplicateResponse(status: number, body: string): boolean {
   if (status === 409) return true;
   if (status !== 400) return false;
@@ -249,6 +277,27 @@ export class ArtifactsService {
       `uploadBufferArtifact: ${input.storagePath} ya existía en Storage (${existingSize} bytes) sin row en artifacts — se adopta el objeto existente`,
     );
     return { sizeBytes: existingSize, adopted: true };
+  }
+
+  /**
+   * V2.1 R12: descarga (server-side, service role) un objeto de Storage por
+   * bucket + path. Lo usa el empaque v3 para los archivos que un artifact
+   * `dynamic_presentation` referencia (PDF y portada). Falla fuerte: sin
+   * credenciales, HTTP ≠ 2xx o timeout → Error. Aditivo: nada lo usaba antes.
+   */
+  async downloadStorageObject(bucket: string, storagePath: string, timeoutMs = 60_000): Promise<Buffer> {
+    const supabaseUrl = this.config.get<string>('SUPABASE_URL');
+    const serviceKey = this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY');
+    if (!supabaseUrl || !serviceKey) {
+      throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for server-side storage download');
+    }
+    // G6 I2: segmentos validados (sin dot-segments ni encoding) y bucket con forma de id.
+    if (!/^[a-z0-9][a-z0-9._-]{0,62}$/.test(bucket)) throw new Error(`STORAGE_PATH_INVALID: bucket ${JSON.stringify(bucket)}`);
+    const encodedPath = assertSafeStoragePath(storagePath).map((s) => encodeURIComponent(s)).join('/');
+    const url = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/authenticated/${bucket}/${encodedPath}`;
+    const res = await fetch(url, { headers: supabaseServiceHeaders(serviceKey), signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) throw new Error(`Supabase Storage download failed: ${res.status} ${bucket}/${storagePath}`);
+    return Buffer.from(await res.arrayBuffer());
   }
 
   /** Tamaño (content-length) de un objeto de Storage vía HEAD autenticado; null si no existe o no se pudo leer. */
