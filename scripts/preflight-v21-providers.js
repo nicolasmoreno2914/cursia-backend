@@ -92,6 +92,10 @@ async function readDb(env) {
     db.pricing = pr.rows;
     db.pricingRows = pr.rows.reduce((a, r) => a + r.n, 0);
     db.policies = (await client.query(`select scope, count(*)::int n from public.cost_budget_policies group by scope order by scope`)).rows;
+    db.globalPolicy = (await client.query(
+      `select version, limits, on_exceed, require_human_approval_for_real_spend from public.cost_budget_policies
+        where scope = 'global' order by version desc, created_at desc limit 1`,
+    )).rows[0] || null;
     db.authorizations = (await client.query(`select count(*)::int n from public.cost_budget_authorizations`)).rows[0].n;
     db.youtubeActive = (await client.query(`select count(*)::int n from public.youtube_connections where status = 'active'`)).rows[0].n;
   } catch (err) {
@@ -127,6 +131,10 @@ async function main() {
   if (db && !db.error) {
     for (const r of db.pricing) console.log(`  pricing_catalog ${r.provider}: ${r.n} filas vigentes, ${r.verified} verificadas`);
     console.log(`  cost_budget_policies: ${db.policies.length ? db.policies.map((r) => `${r.scope} ${r.n}`).join(', ') : 'ninguna (el gate responde ADMIN_APPROVAL: fail closed)'}`);
+    if (db.globalPolicy) {
+      const g = db.globalPolicy;
+      console.log(`  política global vigente v${g.version}: limits ${JSON.stringify(g.limits)} · on_exceed ${g.on_exceed} · aprobación humana ${g.require_human_approval_for_real_spend}`);
+    }
     console.log(`  cost_budget_authorizations: ${db.authorizations}`);
   }
 
