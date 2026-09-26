@@ -1,0 +1,32 @@
+{
+  "title": "Components",
+  "description": "This component library can be used to quickly and easily get a unified look across different content types",
+  "majorVersion": 1,
+  "minorVersion": 0,
+  "patchVersion": 97,
+  "runnable": 0,
+  "author": "H5P Group",
+  "license": "MIT",
+  "machineName": "H5P.Components",
+  "coreApi": {
+    "majorVersion": 1,
+    "minorVersion": 28
+  },
+  "preloadedJs": [
+    {
+      "path": "dist/h5p-components.js"
+    }
+  ],
+  "preloadedCss": [
+    {
+      "path": "dist/h5p-components.css"
+    }
+  ],
+  "preloadedDependencies": [
+    {
+      "machineName": "jQuery.ui",
+      "majorVersion": 1,
+      "minorVersion": 10
+    }
+  ]
+}
