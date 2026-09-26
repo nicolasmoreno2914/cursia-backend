@@ -153,7 +153,8 @@ function v21_filter(int $h5pid): array {
         'library' => $content['library']['name'] . ' ' . $content['library']['majorVersion'] . '.' . $content['library']['minorVersion']];
 }
 
-function v21_xapi(int $cmid, stdClass $student, int $raw, int $max, array $children): array {
+function v21_xapi(int $cmid, stdClass $student, int $raw, int $max, array $children, string $parentverb = 'completed',
+        bool $parentcompletion = true): array {
     global $CFG;
     v21_fresh_page();
     \core\session\manager::set_user($student);
@@ -161,13 +162,17 @@ function v21_xapi(int $cmid, stdClass $student, int $raw, int $max, array $child
     $actor = ['objectType' => 'Agent', 'account' => ['homePage' => $CFG->wwwroot, 'name' => (string)$student->id]];
     $objectid = \core_xapi\iri::generate($ctx->id, 'activity');
     // Sentencia padre (sin subContentId): H5P la emite al terminar; abre el intento.
+    $parentresult = ['duration' => 'PT45S', 'score' => ['min' => 0, 'max' => $max, 'raw' => $raw, 'scaled' => $raw / $max]];
+    if ($parentcompletion) {
+        // SCS 1.11 real NO envía completion/success en el padre (review G4 I4).
+        $parentresult = ['completion' => true, 'success' => ($raw / $max) >= 0.7] + $parentresult;
+    }
     $statements = [[
         'actor' => $actor,
-        'verb' => ['id' => 'http://adlnet.gov/expapi/verbs/completed'],
+        'verb' => ['id' => 'http://adlnet.gov/expapi/verbs/' . $parentverb],
         'object' => ['objectType' => 'Activity', 'id' => $objectid,
             'definition' => ['interactionType' => 'compound', 'name' => ['es' => 'Cursia V2.1 R7']]],
-        'result' => ['completion' => true, 'success' => ($raw / $max) >= 0.7, 'duration' => 'PT45S',
-            'score' => ['min' => 0, 'max' => $max, 'raw' => $raw, 'scaled' => $raw / $max]],
+        'result' => $parentresult,
     ]];
     // Sentencias hijas: una por sub-contenido, con ?subContentId=<uuid> (como el reproductor real).
     foreach ($children as $c) {
@@ -275,7 +280,8 @@ foreach ($plan['packages'] as $pkg) {
             $children[] = ['subContentId' => $id, 'interactionType' => $pkg['interactionTypes'][$i],
                 'title' => 'Pregunta ' . ($i + 1), 'correct' => (bool)$sc['childCorrect'][$i]];
         }
-        $post = v21_xapi($mod->coursemodule, $u, $sc['raw'], $pkg['maxScore'], $children);
+        $post = v21_xapi($mod->coursemodule, $u, $sc['raw'], $pkg['maxScore'], $children, $pkg['parentVerb'] ?? 'completed',
+            $pkg['parentCompletion'] ?? true);
         $st = v21_state($course, $mod->coursemodule, $mod->instance, $u);
         $r['xapi'][$u->username] = ['post' => $post, 'state' => $st];
         $tag = "$key/{$u->username} {$sc['raw']}/{$pkg['maxScore']}";
@@ -289,9 +295,14 @@ foreach ($plan['packages'] as $pkg) {
         sort($exp);
         v21_check("$tag: resultados = 1 padre + " . count($exp) . " hijos con subcontent = UUID del paquete",
             count($res) === 1 + count($exp) && $subs === $exp, ['results' => $res]);
-        v21_check("$tag: nota {$sc['expectedGrade']} / 100 en el libro de calificaciones",
-            $st['grade'] !== null && abs($st['grade'] - $sc['expectedGrade']) < 0.001 && $st['grademax'] == 100.0 && $st['gradepass'] == (float)$GRADEPASS,
-            ['grade' => $st['grade'], 'grademax' => $st['grademax'], 'gradepass' => $st['gradepass']]);
+        if ($sc['expectedGrade'] === null) {
+            v21_check("$tag: SIN nota (limitación upstream: padre sin completion; ver moodle-grading.ts)", $st['grade'] === null,
+                ['grade' => $st['grade']]);
+        } else {
+            v21_check("$tag: nota {$sc['expectedGrade']} / 100 en el libro de calificaciones",
+                $st['grade'] !== null && abs($st['grade'] - $sc['expectedGrade']) < 0.001 && $st['grademax'] == 100.0 && $st['gradepass'] == (float)$GRADEPASS,
+                ['grade' => $st['grade'], 'grademax' => $st['grademax'], 'gradepass' => $st['gradepass']]);
+        }
         v21_check("$tag: completion {$sc['expectedCompletion']}", $st['completion'] === $sc['expectedCompletion'], $st['completion']);
     }
     $result['packages'][] = $r;

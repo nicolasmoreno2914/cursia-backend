@@ -21,6 +21,9 @@ import {
   VcComponentType,
   VcFieldSpec,
 } from './schema';
+import { lintView } from './text';
+
+const hasOwn = (o: object, k: string): boolean => Object.prototype.hasOwnProperty.call(o, k);
 
 export type VcErrorCode =
   | 'NOT_OBJECT'
@@ -72,19 +75,40 @@ function normalizeForLint(text: string): string {
 const WB_START = '(?<![\\p{L}\\p{N}_])';
 const WB_END = '(?![\\p{L}\\p{N}_])';
 
-const RESOURCE_WORDS = [
-  'videos?',
-  'actividad(?:es)?',
-  'juegos?',
+/**
+ * RESOURCE_MENTION (ruling del controlador, fix round 1 / I4): detecta REFERENCIAS a recursos
+ * o navegación del curso ("en el video", "la actividad interactiva", "el examen"), no el
+ * vocabulario del dominio ("juego de roles", "evaluación de riesgos", "presentación de
+ * resultados", "actividad económica"). Se evalúa sobre el texto normalizado (minúsculas, sin
+ * acentos, sin `**`, espacios simples).
+ */
+const DET_SG_M = '(?:el|este|ese|del|al|un|en el|siguiente|proximo|ultimo)';
+const DET_PL_M = '(?:los|estos|esos|unos|en los|siguientes|proximos)';
+const DET_SG_F = '(?:la|esta|esa|una|en la|siguiente|proxima|ultima)';
+const DET_PL_F = '(?:las|estas|esas|unas|en las|siguientes|proximas)';
+/** "presentación de/del X" es dominio salvo que X sea una unidad del curso. */
+const COURSE_UNIT = '(?:(?:este|esta|el|la)\\s+)?(?:capitulo|modulo|tema|curso|unidad|leccion)';
+/** "examen físico/médico…" es dominio. */
+const EXAM_DOMAIN = '(?:fisico|medico|clinico|oftalmologico|visual|de sangre|de laboratorio|de conciencia)';
+const RESOURCE_PATTERNS = [
+  `${DET_SG_M}\\s+video`,
+  `${DET_PL_M}\\s+videos`,
+  `${DET_SG_F}\\s+actividad\\s+(?:interactiva|practica|gamificada|de practica|calificada|evaluada|siguiente|final)`,
+  `${DET_PL_F}\\s+actividades\\s+(?:interactivas|practicas|gamificadas|de practica|calificadas|evaluadas)`,
+  `(?:en|con)\\s+la\\s+siguiente\\s+actividad`,
+  `${DET_SG_M}\\s+examen(?!\\s+${EXAM_DOMAIN})`,
+  `${DET_PL_M}\\s+examenes(?!\\s+${EXAM_DOMAIN})`,
+  `${DET_SG_F}\\s+evaluacion\\s+(?:del modulo|de la unidad|del capitulo|del curso|final|calificada|siguiente)`,
+  `${DET_SG_F}\\s+presentacion(?!\\s+(?:de|del)\\s+(?!${COURSE_UNIT}))`,
+  `${DET_PL_F}\\s+presentaciones(?!\\s+(?:de|del)\\s+(?!${COURSE_UNIT}))`,
+  'diapositivas?',
+  'quiz(?:zes|es)?',
   'scorm',
   'h5p',
-  'presentacion(?:es)?',
-  'diapositivas?',
-  'examen(?:es)?',
-  'quiz(?:zes)?',
-  'evaluacion(?:es)?',
+  'juegos?\\s+(?:interactivos?|gamificados?|educativos?|de practica|del capitulo|del modulo)',
+  '(?:el|este|al|del)\\s+(?:siguiente|proximo)\\s+recurso',
 ];
-const RESOURCE_RE = new RegExp(`${WB_START}(?:${RESOURCE_WORDS.join('|')})${WB_END}`, 'gu');
+const RESOURCE_RE = new RegExp(`${WB_START}(?:${RESOURCE_PATTERNS.join('|')})${WB_END}`, 'gu');
 
 const QUANTITY_WORDS = [
   'modulos?',
@@ -109,12 +133,12 @@ const QUANTITY_RE = new RegExp(
 );
 
 export function lintResourceMentions(text: string): VcTextLintHit[] {
-  const norm = normalizeForLint(String(text ?? ''));
+  const norm = normalizeForLint(lintView(String(text ?? '')));
   return Array.from(norm.matchAll(RESOURCE_RE), (m) => ({ code: 'RESOURCE_MENTION' as const, match: m[0] }));
 }
 
 export function lintQuantityClaims(text: string): VcTextLintHit[] {
-  const norm = normalizeForLint(String(text ?? ''));
+  const norm = normalizeForLint(lintView(String(text ?? '')));
   return Array.from(norm.matchAll(QUANTITY_RE), (m) => ({ code: 'QUANTITY_CLAIM' as const, match: m[0] }));
 }
 
@@ -124,6 +148,8 @@ export function lintQuantityClaims(text: string): VcTextLintHit[] {
 const HTML_TAG_RE = /<(?:\/?[a-zA-Z]|!|\?)/;
 // Controles prohibidos (se permiten \n y \t en textos largos).
 const CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
+// Invisibles que evadirían los lints ("vid\u200Beo") o romperían el renderer (uso privado).
+const INVISIBLE_RE = /[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\uE000-\uF8FF]/;
 
 function checkText(value: unknown, path: string, max: number, errors: VcValidationError[]): void {
   if (typeof value !== 'string') {
@@ -143,6 +169,9 @@ function checkText(value: unknown, path: string, max: number, errors: VcValidati
   }
   if (CONTROL_RE.test(value)) {
     errors.push({ path, code: 'TEXT_FORMAT', message: 'caracteres de control no permitidos' });
+  }
+  if (INVISIBLE_RE.test(value)) {
+    errors.push({ path, code: 'TEXT_FORMAT', message: 'caracteres invisibles/de formato (ancho cero, guion suave, bidi, uso privado) no permitidos' });
   }
   const stars = value.split('**').length - 1;
   if (stars % 2 !== 0) {
@@ -207,7 +236,7 @@ function checkObject(
     return;
   }
   for (const key of Object.keys(value)) {
-    if (!(key in fields) && !implicit.includes(key)) {
+    if (!hasOwn(fields, key) && !implicit.includes(key)) {
       errors.push({ path: `${path}.${key}`, code: 'UNKNOWN_FIELD', message: `campo no permitido "${key}"` });
     }
   }
@@ -229,7 +258,7 @@ export function validateComponent(c: unknown, path = 'component'): VcValidationE
     return errors;
   }
   const type = c.type;
-  if (typeof type !== 'string' || !(type in VC_COMPONENT_SPECS)) {
+  if (typeof type !== 'string' || !hasOwn(VC_COMPONENT_SPECS, type)) {
     errors.push({ path: `${path}.type`, code: 'UNKNOWN_COMPONENT', message: `tipo de componente desconocido "${String(type)}"` });
     return errors;
   }
@@ -312,7 +341,7 @@ export function validateExperience(doc: unknown): VcValidationResult {
       const cpath = `${mpath}[${i}]`;
       errors.push(...validateComponent(c, cpath));
       const type = isPlainObject(c) ? c.type : undefined;
-      if (typeof type === 'string' && type in VC_COMPONENT_SPECS) {
+      if (typeof type === 'string' && hasOwn(VC_COMPONENT_SPECS, type)) {
         typeCounts.set(type, (typeCounts.get(type) || 0) + 1);
         // self_check (movimiento) contiene exactamente un componente self_check, y ese
         // tipo no aparece en otros movimientos (el movimiento se ensambla solo si la

@@ -1,7 +1,9 @@
 // Cursia V2.1 / R7-core — H5P.SingleChoiceSet (práctica rápida, §J.2).
 // En SingleChoiceSet la PRIMERA respuesta de cada pregunta es la correcta (la
 // librería baraja al mostrar). El builder reordena a partir de `correct`.
+import { h5pSubContentId } from '../ids';
 import { applyH5pL10n } from '../l10n';
+import { h5pProfileVersion } from '../profile';
 import {
   H5pBuiltContent,
   Issues,
@@ -77,10 +79,17 @@ export function validateSingleChoiceSetInput(input: unknown): asserts input is S
 
 export function buildSingleChoiceSet(input: SingleChoiceSetInput): H5pBuiltContent {
   validateSingleChoiceSetInput(input);
-  const choices = input.questions.map((q) => {
+  // Cada `choice` es un grupo isSubContent en semantics: el reproductor pone su
+  // subContentId en el xAPI hijo. Sin él, mod_h5pactivity abre un intento por
+  // respuesta y "más alta" infla la nota (review G4 C1).
+  const choices = input.questions.map((q, i) => {
     const correct = q.answers.filter((a) => a.correct);
     const wrong = q.answers.filter((a) => !a.correct);
-    return { question: htmlP(q.question), answers: [...correct, ...wrong].map((a) => htmlP(a.text)) };
+    return {
+      subContentId: h5pSubContentId(input.itemKey, i, h5pProfileVersion),
+      question: htmlP(q.question),
+      answers: [...correct, ...wrong].map((a) => htmlP(a.text)),
+    };
   });
   const content = applyH5pL10n('H5P.SingleChoiceSet', {
     choices,
@@ -99,7 +108,7 @@ export function buildSingleChoiceSet(input: SingleChoiceSetInput): H5pBuiltConte
     mainLibrary: 'H5P.SingleChoiceSet',
     title: input.title.trim(),
     content,
-    subContentIds: [],
+    subContentIds: choices.map((c) => c.subContentId),
     maxScore: choices.length,
   };
 }

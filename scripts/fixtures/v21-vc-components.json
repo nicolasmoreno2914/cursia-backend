@@ -19,72 +19,156 @@
       "type": "concept_cards",
       "title": "Conceptos clave",
       "cards": [
-        { "term": "Escucha activa", "definition": "Atender al mensaje completo: palabras, tono y emoción, y demostrarlo con paráfrasis." },
-        { "term": "Paráfrasis", "definition": "Repetir con tus palabras lo que entendiste para confirmar el sentido." },
-        { "term": "Pregunta abierta", "definition": "Invita a explicar y no se responde con un simple sí o no." }
+        {
+          "term": "Escucha activa",
+          "definition": "Atender al mensaje completo: palabras, tono y emoción, y demostrarlo con paráfrasis."
+        },
+        {
+          "term": "Paráfrasis",
+          "definition": "Repetir con tus palabras lo que entendiste para confirmar el sentido."
+        },
+        {
+          "term": "Pregunta abierta",
+          "definition": "Invita a explicar y no se responde con un simple sí o no."
+        }
       ]
     },
     {
       "type": "reveal_cards",
       "title": "Del concepto al ejemplo",
       "cards": [
-        { "front": "¿Qué es validar una emoción?", "back": "Reconocer que la emoción es comprensible, sin necesariamente darle la razón al contenido: «Entiendo que esto le moleste»." },
-        { "front": "¿Qué es una paráfrasis útil?", "back": "Una que resume el problema y la necesidad: «Si entiendo bien, necesita el reembolso antes del viernes»." }
+        {
+          "front": "¿Qué es validar una emoción?",
+          "back": "Reconocer que la emoción es comprensible, sin necesariamente darle la razón al contenido: «Entiendo que esto le moleste»."
+        },
+        {
+          "front": "¿Qué es una paráfrasis útil?",
+          "back": "Una que resume el problema y la necesidad: «Si entiendo bien, necesita el reembolso antes del viernes»."
+        }
       ]
     },
     {
       "type": "accordion",
       "title": "Las fases de una conversación difícil",
       "items": [
-        { "heading": "Apertura", "body": "Saluda, presenta tu rol y **baja el ritmo**. La primera impresión define el tono.\n\nEvita justificar a la empresa en los primeros segundos." },
-        { "heading": "Exploración", "body": "Pregunta, escucha y parafrasea hasta que el cliente confirme que entendiste." },
-        { "heading": "Acuerdo", "body": "Propón un siguiente paso concreto, con responsable y fecha." }
+        {
+          "heading": "Apertura",
+          "body": "Saluda, presenta tu rol y **baja el ritmo**. La primera impresión define el tono.\n\nEvita justificar a la empresa en los primeros segundos."
+        },
+        {
+          "heading": "Exploración",
+          "body": "Pregunta, escucha y parafrasea hasta que el cliente confirme que entendiste."
+        },
+        {
+          "heading": "Acuerdo",
+          "body": "Propón un siguiente paso concreto, con responsable y fecha."
+        }
       ]
     },
     {
       "type": "tabs",
       "title": "Tres enfoques de respuesta",
       "tabs": [
-        { "label": "Defensivo", "body": "Se centra en justificar el error. El cliente percibe que la empresa se protege a sí misma." },
-        { "label": "Complaciente", "body": "Promete todo para cerrar rápido. Genera expectativas que después no se cumplen." },
-        { "label": "Colaborativo", "body": "Reconoce el problema, explora la necesidad y acuerda un paso concreto. Es el enfoque que buscamos." }
+        {
+          "label": "Defensivo",
+          "body": "Se centra en justificar el error. El cliente percibe que la empresa se protege a sí misma."
+        },
+        {
+          "label": "Complaciente",
+          "body": "Promete todo para cerrar rápido. Genera expectativas que después no se cumplen."
+        },
+        {
+          "label": "Colaborativo",
+          "body": "Reconoce el problema, explora la necesidad y acuerda un paso concreto. Es el enfoque que buscamos."
+        }
       ]
     },
     {
       "type": "timeline",
       "title": "Evolución del servicio al cliente",
       "events": [
-        { "marker": "Década de 1970", "heading": "Atención por mostrador", "body": "El contacto era presencial y el tiempo de respuesta dependía de la fila." },
-        { "marker": "Década de 1990", "heading": "Centros de llamadas", "body": "Aparecen los guiones estandarizados y las métricas de duración." },
-        { "marker": "Hoy", "heading": "Omnicanalidad", "body": "El cliente espera continuidad entre chat, correo y teléfono." }
+        {
+          "marker": "Década de 1970",
+          "heading": "Atención por mostrador",
+          "body": "El contacto era presencial y el tiempo de respuesta dependía de la fila."
+        },
+        {
+          "marker": "Década de 1990",
+          "heading": "Centros de llamadas",
+          "body": "Aparecen los guiones estandarizados y las métricas de duración."
+        },
+        {
+          "marker": "Hoy",
+          "heading": "Omnicanalidad",
+          "body": "El cliente espera continuidad entre chat, correo y teléfono."
+        }
       ]
     },
     {
       "type": "process_steps",
       "title": "Protocolo para una queja",
       "steps": [
-        { "heading": "Recibir", "body": "Deja que el cliente termine su relato sin interrumpir." },
-        { "heading": "Confirmar", "body": "Parafrasea el problema y pregunta si lo entendiste bien." },
-        { "heading": "Resolver", "body": "Propón una solución concreta o el siguiente paso con fecha." },
-        { "heading": "Cerrar", "body": "Resume el acuerdo y agradece la paciencia." }
+        {
+          "heading": "Recibir",
+          "body": "Deja que el cliente termine su relato sin interrumpir."
+        },
+        {
+          "heading": "Confirmar",
+          "body": "Parafrasea el problema y pregunta si lo entendiste bien."
+        },
+        {
+          "heading": "Resolver",
+          "body": "Propón una solución concreta o el siguiente paso con fecha."
+        },
+        {
+          "heading": "Cerrar",
+          "body": "Resume el acuerdo y agradece la paciencia."
+        }
       ]
     },
     {
       "type": "comparison",
       "title": "Pregunta abierta frente a pregunta cerrada",
-      "columns": ["Pregunta abierta", "Pregunta cerrada"],
+      "columns": [
+        "Pregunta abierta",
+        "Pregunta cerrada"
+      ],
       "rows": [
-        { "label": "Propósito", "cells": ["Explorar la necesidad", "Confirmar un dato puntual"] },
-        { "label": "Ejemplo", "cells": ["¿Qué pasó cuando intentó pagar?", "¿Intentó pagar con tarjeta?"] },
-        { "label": "Riesgo", "cells": ["Conversación larga si no se guía", "Interrogatorio si se abusa"] }
+        {
+          "label": "Propósito",
+          "cells": [
+            "Explorar la necesidad",
+            "Confirmar un dato puntual"
+          ]
+        },
+        {
+          "label": "Ejemplo",
+          "cells": [
+            "¿Qué pasó cuando intentó pagar?",
+            "¿Intentó pagar con tarjeta?"
+          ]
+        },
+        {
+          "label": "Riesgo",
+          "cells": [
+            "Conversación larga si no se guía",
+            "Interrogatorio si se abusa"
+          ]
+        }
       ]
     },
     {
       "type": "myth_reality",
       "title": "Creencias frecuentes",
       "pairs": [
-        { "myth": "Si el cliente grita, hay que responder con firmeza para recuperar el control.", "reality": "Bajar el volumen y el ritmo propio suele desescalar más rápido que imponerse." },
-        { "myth": "Pedir disculpas equivale a aceptar la culpa legal.", "reality": "Lamentar la experiencia del cliente es distinto de admitir responsabilidad." }
+        {
+          "myth": "Si el cliente grita, hay que responder con firmeza para recuperar el control.",
+          "reality": "Bajar el volumen y el ritmo propio suele desescalar más rápido que imponerse."
+        },
+        {
+          "myth": "Pedir disculpas equivale a aceptar la culpa legal.",
+          "reality": "Lamentar la experiencia del cliente es distinto de admitir responsabilidad."
+        }
       ]
     },
     {
@@ -129,14 +213,194 @@
       "type": "self_check",
       "title": "Repaso rápido",
       "items": [
-        { "q": "¿Para qué sirve la paráfrasis?", "a": "Para confirmar que entendiste y demostrarle al cliente que lo escuchaste." },
-        { "q": "¿Validar una emoción es darle la razón al cliente?", "a": "No. Es reconocer que su emoción es comprensible, sin juzgar el contenido." }
+        {
+          "q": "¿Para qué sirve la paráfrasis?",
+          "a": "Para confirmar que entendiste y demostrarle al cliente que lo escuchaste."
+        },
+        {
+          "q": "¿Validar una emoción es darle la razón al cliente?",
+          "a": "No. Es reconocer que su emoción es comprensible, sin juzgar el contenido."
+        }
       ]
     }
   ],
   "callout_variants": [
-    { "type": "callout", "variant": "warning", "body": "Nunca prometas una fecha que no depende de ti." },
-    { "type": "callout", "variant": "info", "title": "Dato útil", "body": "La mayoría de las quejas escaladas empiezan con una respuesta defensiva." },
-    { "type": "callout", "variant": "example", "body": "«Lamento que haya tenido que escribir de nuevo; revisemos juntos el estado del envío»." }
+    {
+      "type": "callout",
+      "variant": "warning",
+      "body": "Nunca prometas una fecha que no depende de ti."
+    },
+    {
+      "type": "callout",
+      "variant": "info",
+      "title": "Dato útil",
+      "body": "La mayoría de las quejas escaladas empiezan con una respuesta defensiva."
+    },
+    {
+      "type": "callout",
+      "variant": "example",
+      "body": "«Lamento que haya tenido que escribir de nuevo; revisemos juntos el estado del envío»."
+    }
+  ],
+  "comparison_variants": [
+    {
+      "type": "comparison",
+      "title": "Tres canales de atención",
+      "columns": [
+        "Teléfono",
+        "Correo electrónico",
+        "Chat en vivo"
+      ],
+      "rows": [
+        {
+          "label": "Propósito",
+          "cells": [
+            "Propósito por teléfono: respuesta inmediata y tono cálido",
+            "Propósito por correo: registro escrito y trazabilidad",
+            "Propósito por chat: rapidez con varias conversaciones"
+          ]
+        },
+        {
+          "label": "Momento de uso",
+          "cells": [
+            "Momento de uso por teléfono: respuesta inmediata y tono cálido",
+            "Momento de uso por correo: registro escrito y trazabilidad",
+            "Momento de uso por chat: rapidez con varias conversaciones"
+          ]
+        },
+        {
+          "label": "Ejemplo típico",
+          "cells": [
+            "Ejemplo típico por teléfono: respuesta inmediata y tono cálido",
+            "Ejemplo típico por correo: registro escrito y trazabilidad",
+            "Ejemplo típico por chat: rapidez con varias conversaciones"
+          ]
+        },
+        {
+          "label": "Riesgo principal",
+          "cells": [
+            "Riesgo principal por teléfono: respuesta inmediata y tono cálido",
+            "Riesgo principal por correo: registro escrito y trazabilidad",
+            "Riesgo principal por chat: rapidez con varias conversaciones"
+          ]
+        },
+        {
+          "label": "Señal de éxito",
+          "cells": [
+            "Señal de éxito por teléfono: respuesta inmediata y tono cálido",
+            "Señal de éxito por correo: registro escrito y trazabilidad",
+            "Señal de éxito por chat: rapidez con varias conversaciones"
+          ]
+        },
+        {
+          "label": "Tono recomendado",
+          "cells": [
+            "Tono recomendado por teléfono: respuesta inmediata y tono cálido",
+            "Tono recomendado por correo: registro escrito y trazabilidad",
+            "Tono recomendado por chat: rapidez con varias conversaciones"
+          ]
+        },
+        {
+          "label": "Duración esperada",
+          "cells": [
+            "Duración esperada por teléfono: respuesta inmediata y tono cálido",
+            "Duración esperada por correo: registro escrito y trazabilidad",
+            "Duración esperada por chat: rapidez con varias conversaciones"
+          ]
+        },
+        {
+          "label": "Error frecuente",
+          "cells": [
+            "Error frecuente por teléfono: respuesta inmediata y tono cálido",
+            "Error frecuente por correo: registro escrito y trazabilidad",
+            "Error frecuente por chat: rapidez con varias conversaciones"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "comparison",
+      "title": "Cuatro estilos de respuesta",
+      "columns": [
+        "Defensivo",
+        "Complaciente",
+        "Evasivo",
+        "Colaborativo"
+      ],
+      "rows": [
+        {
+          "label": "Propósito",
+          "cells": [
+            "Justifica el error de la empresa",
+            "Promete cualquier cosa para cerrar",
+            "Cambia de tema sin resolver",
+            "Reconoce, explora y acuerda"
+          ]
+        },
+        {
+          "label": "Momento de uso",
+          "cells": [
+            "Justifica el error de la empresa",
+            "Promete cualquier cosa para cerrar",
+            "Cambia de tema sin resolver",
+            "Reconoce, explora y acuerda"
+          ]
+        },
+        {
+          "label": "Ejemplo típico",
+          "cells": [
+            "Justifica el error de la empresa",
+            "Promete cualquier cosa para cerrar",
+            "Cambia de tema sin resolver",
+            "Reconoce, explora y acuerda"
+          ]
+        },
+        {
+          "label": "Riesgo principal",
+          "cells": [
+            "Justifica el error de la empresa",
+            "Promete cualquier cosa para cerrar",
+            "Cambia de tema sin resolver",
+            "Reconoce, explora y acuerda"
+          ]
+        },
+        {
+          "label": "Señal de éxito",
+          "cells": [
+            "Justifica el error de la empresa",
+            "Promete cualquier cosa para cerrar",
+            "Cambia de tema sin resolver",
+            "Reconoce, explora y acuerda"
+          ]
+        },
+        {
+          "label": "Tono recomendado",
+          "cells": [
+            "Justifica el error de la empresa",
+            "Promete cualquier cosa para cerrar",
+            "Cambia de tema sin resolver",
+            "Reconoce, explora y acuerda"
+          ]
+        },
+        {
+          "label": "Duración esperada",
+          "cells": [
+            "Justifica el error de la empresa",
+            "Promete cualquier cosa para cerrar",
+            "Cambia de tema sin resolver",
+            "Reconoce, explora y acuerda"
+          ]
+        },
+        {
+          "label": "Error frecuente",
+          "cells": [
+            "Justifica el error de la empresa",
+            "Promete cualquier cosa para cerrar",
+            "Cambia de tema sin resolver",
+            "Reconoce, explora y acuerda"
+          ]
+        }
+      ]
+    }
   ]
 }

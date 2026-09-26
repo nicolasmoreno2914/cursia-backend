@@ -10,6 +10,22 @@
 
 const HEX_RE = /^#([0-9a-fA-F]{6})$/;
 
+/**
+ * "Blanco" y "negro" del sistema: tintes casi puros. §G.4 prohíbe #FFFFFF/#000000 puros
+ * en la salida; todo `on*`/texto legible usa estos en su lugar.
+ */
+export const ON_LIGHT = '#FBFBF9';
+export const ON_DARK = '#101214';
+
+export function isPureBlackOrWhite(hex: string): boolean {
+  const h = String(hex).toUpperCase();
+  return h === '#FFFFFF' || h === '#000000';
+}
+
+/** Límites de luminosidad HSL que evitan generar blanco/negro puros. */
+const L_MIN = 0.03;
+const L_MAX = 0.985;
+
 /** Validates and uppercases a `#RRGGBB` hex color. Throws THEME_INVALID otherwise. */
 export function normalizeHex(hex: string): string {
   if (typeof hex !== 'string' || !HEX_RE.test(hex.trim())) {
@@ -112,7 +128,7 @@ function hueToRgbChannel(p: number, q: number, t: number): number {
 export function hslToHex(h: number, s: number, l: number): string {
   const hue = ((h % 360) + 360) % 360;
   const sat = clamp01(s);
-  const light = clamp01(l);
+  const light = Math.min(L_MAX, Math.max(L_MIN, clamp01(l)));
   if (sat === 0) {
     const v = toByte(light * 255);
     return rgbToHex(v, v, v);
@@ -127,7 +143,7 @@ export function hslToHex(h: number, s: number, l: number): string {
 }
 
 /**
- * Chooses a readable `on` color (pure white or pure black) for a background.
+ * Chooses a readable `on` color (ON_LIGHT / ON_DARK, near-white / near-black) for a background.
  * If neither reaches `min` contrast, walks the background's own hue/sat in
  * both lightness directions (deterministic 0.02 steps) until one side
  * works, returning the (possibly corrected) background alongside the `on`
@@ -139,15 +155,15 @@ export function resolveReadableOn(
   bg: string,
   min: number,
 ): { bg: string; on: string; changed: boolean } {
-  if (contrastRatio('#FFFFFF', bg) >= min) return { bg, on: '#FFFFFF', changed: false };
-  if (contrastRatio('#000000', bg) >= min) return { bg, on: '#000000', changed: false };
+  if (contrastRatio(ON_LIGHT, bg) >= min) return { bg, on: ON_LIGHT, changed: false };
+  if (contrastRatio(ON_DARK, bg) >= min) return { bg, on: ON_DARK, changed: false };
   const { h, s, l } = hexToHsl(bg);
   for (let i = 1; i <= 50; i++) {
     const dl = 0.02 * i;
     const darker = hslToHex(h, s, clamp01(l - dl));
-    if (contrastRatio('#FFFFFF', darker) >= min) return { bg: darker, on: '#FFFFFF', changed: true };
+    if (contrastRatio(ON_LIGHT, darker) >= min) return { bg: darker, on: ON_LIGHT, changed: true };
     const lighter = hslToHex(h, s, clamp01(l + dl));
-    if (contrastRatio('#000000', lighter) >= min) return { bg: lighter, on: '#000000', changed: true };
+    if (contrastRatio(ON_DARK, lighter) >= min) return { bg: lighter, on: ON_DARK, changed: true };
   }
   throw new Error(`THEME_INVALID: no se pudo generar un color legible a partir de "${bg}"`);
 }
@@ -175,7 +191,7 @@ export function correctForegroundForBackgrounds(
     if (worst(candidate) >= min) return { color: candidate, changed: true };
     if (ll <= 0 || ll >= 1) break;
   }
-  if (worst('#000000') >= min) return { color: '#000000', changed: true };
-  if (worst('#FFFFFF') >= min) return { color: '#FFFFFF', changed: true };
+  if (worst(ON_DARK) >= min) return { color: ON_DARK, changed: true };
+  if (worst(ON_LIGHT) >= min) return { color: ON_LIGHT, changed: true };
   throw new Error(`THEME_INVALID: no se pudo corregir "${fg}" contra [${backgrounds.join(', ')}]`);
 }

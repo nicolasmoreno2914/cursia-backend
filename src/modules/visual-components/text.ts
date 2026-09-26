@@ -2,12 +2,17 @@
  * R2 — Visual Components: texto plano → HTML inline seguro.
  *
  * - Escapa TODO (& < > " ').
- * - `**énfasis**` → <strong>. Un `**` sin pareja queda literal.
+ * - `**énfasis**` → <strong>, emparejado sobre el CAMPO COMPLETO (igual que valida
+ *   validate.ts): un énfasis que cruza un salto de línea se cierra al final de la línea y se
+ *   reabre en la siguiente, sin dejar `**` literales ni correr los tramos. Un `**` sin
+ *   pareja (el validador lo rechaza) queda literal.
  * - Doble salto de línea → párrafos; salto simple → <br>.
- * - Palabras largas reciben guiones suaves (&shy;) deterministas: bajo forceclean=1
- *   Moodle elimina overflow-wrap/word-break y <wbr> (probado, §X.1), y el &shy; es lo
- *   único que sobrevive para evitar desborde horizontal a 390 px. Solo se ve un guion
- *   si el navegador realmente corta la palabra.
+ * - Cada tramo de texto va dentro de `<span class="nolink">` (exactamente esa clase y sin
+ *   <span> internos): los filtros de Moodle (activitynames, glossary, urltolink, emoticon,
+ *   displayh5p…) no tocan su contenido. Verificado con format_text() real (fix round 1, I6).
+ * - Palabras muy largas reciben guiones suaves (&shy;) deterministas: bajo forceclean=1
+ *   Moodle elimina overflow-wrap/word-break y <wbr> (§X.1), y el &shy; es lo único que
+ *   evita el desborde horizontal a 390 px. Umbrales altos para no tocar palabras normales.
  */
 
 export interface HyphenOpts {
@@ -17,11 +22,21 @@ export interface HyphenOpts {
   every: number;
 }
 
-export const HYPHEN_DEFAULT: HyphenOpts = { minLen: 14, every: 7 };
-/** Celdas de tabla: columnas angostas en móvil sin CSS. */
-export const HYPHEN_TABLE: HyphenOpts = { minLen: 8, every: 5 };
+/** Cuerpo (18 px, columna ≥ ~290 px a 390): solo palabras que realmente no caben. */
+export const HYPHEN_DEFAULT: HyphenOpts = { minLen: 22, every: 10 };
+/** Títulos (hasta 28 px en la base). */
+export const HYPHEN_HEADING: HyphenOpts = { minLen: 16, every: 8 };
+/** Celdas de tabla (tablas de ≤ 2 columnas + rótulo). */
+export const HYPHEN_TABLE: HyphenOpts = { minLen: 12, every: 6 };
 
 const SHY = '\u00AD';
+const OPEN = '\uE000';
+const CLOSE = '\uE001';
+/** Caracteres invisibles/de formato y de uso privado: nunca llegan al HTML. */
+export const INVISIBLE_CHARS_RE = /[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\uE000-\uF8FF]/g;
+
+export const NOLINK_OPEN = '<span class="nolink">';
+export const NOLINK_CLOSE = '</span>';
 
 export function escapeHtml(s: string): string {
   return s
@@ -45,47 +60,81 @@ function hyphenateWord(word: string, h: HyphenOpts): string {
   return out;
 }
 
-function hyphenate(text: string, h: HyphenOpts): string {
-  return text.replace(/[^\s]+/g, (w) => hyphenateWord(w, h));
-}
-
-/** Escapa + guiones suaves (sin énfasis). Para atributos/labels usar escapeHtml a secas. */
+/** Escapa + guiones suaves. Las palabras se miden sin los marcadores de énfasis. */
 function escapeRun(text: string, h: HyphenOpts): string {
-  return escapeHtml(hyphenate(text, h)).split(SHY).join('&shy;');
+  const hy = text.replace(/[^\s\uE000\uE001]+/g, (w) => hyphenateWord(w, h));
+  return escapeHtml(hy).split(SHY).join('&shy;');
 }
 
-/** Una línea de texto con `**énfasis**` → HTML inline. */
-export function inlineHtml(text: string, h: HyphenOpts = HYPHEN_DEFAULT): string {
-  const parts = String(text).split('**');
-  // Un número par de partes significa un `**` sin cerrar: el último se deja literal.
+/** Sustituye los pares `**` por marcadores internos (emparejados en todo el campo). */
+function markEmphasis(text: string): string {
+  const parts = text.replace(INVISIBLE_CHARS_RE, '').split('**');
   const unbalanced = parts.length % 2 === 0;
   let out = '';
   for (let i = 0; i < parts.length; i++) {
-    const isLastUnbalanced = unbalanced && i === parts.length - 1;
-    if (isLastUnbalanced) {
-      out += escapeRun('**' + parts[i], h);
-    } else if (i % 2 === 1) {
-      out += `<strong>${escapeRun(parts[i], h)}</strong>`;
-    } else {
-      out += escapeRun(parts[i], h);
+    out += parts[i];
+    if (i < parts.length - 1) {
+      if (unbalanced && i === parts.length - 2) out += '**';
+      else out += i % 2 === 0 ? OPEN : CLOSE;
     }
   }
   return out;
 }
 
-/** Texto (posiblemente con saltos de línea) → HTML inline con <br> entre líneas. */
-export function multilineInlineHtml(text: string, h: HyphenOpts = HYPHEN_DEFAULT): string {
-  return String(text)
-    .split(/\r?\n/)
-    .map((line) => inlineHtml(line.trim(), h))
-    .join('<br>');
+/**
+ * Una línea (con marcadores de énfasis) → HTML. `state.bold` viene de la línea anterior:
+ * un énfasis abierto se reabre al inicio y se cierra al final de cada línea.
+ * Cada tramo entre marcadores se hifeniza por su cuenta.
+ */
+function renderLine(line: string, state: { bold: boolean }, h: HyphenOpts): string {
+  let out = state.bold ? '<strong>' : '';
+  for (const seg of line.split(/([\uE000\uE001])/)) {
+    if (seg === OPEN) {
+      if (!state.bold) out += '<strong>';
+      state.bold = true;
+    } else if (seg === CLOSE) {
+      if (state.bold) out += '</strong>';
+      state.bold = false;
+    } else if (seg) {
+      out += escapeRun(seg, h);
+    }
+  }
+  if (state.bold) out += '</strong>';
+  return out.split('<strong></strong>').join('');
 }
 
-/** Divide en párrafos por línea en blanco (se descartan vacíos). */
-export function splitParagraphs(text: string): string[] {
-  const ps = String(text)
-    .split(/\r?\n\s*\r?\n/)
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0);
-  return ps.length ? ps : [String(text).trim()];
+/**
+ * Campo de texto → lista de párrafos, cada uno como HTML inline (líneas unidas con <br>)
+ * envuelto en `<span class="nolink">`. El estado del énfasis cruza líneas y párrafos.
+ */
+export function richParagraphs(text: string, h: HyphenOpts = HYPHEN_DEFAULT): string[] {
+  const marked = markEmphasis(String(text));
+  const state = { bold: false };
+  const out: string[] = [];
+  for (const para of marked.split(/\r?\n[ \t]*\r?\n/)) {
+    const lines = para
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+    const html = lines.map((l) => renderLine(l, state, h)).filter((x) => x.length > 0);
+    // un párrafo que solo tenía marcadores no produce salida, pero sí actualizó el estado
+    if (html.length) out.push(NOLINK_OPEN + html.join('<br>') + NOLINK_CLOSE);
+  }
+  return out.length ? out : [NOLINK_OPEN + NOLINK_CLOSE];
+}
+
+/** Texto de una sola pieza (títulos, ítems): mismos reglas; los saltos de línea pasan a <br>. */
+export function inlineHtml(text: string, h: HyphenOpts = HYPHEN_DEFAULT): string {
+  const ps = richParagraphs(text, h).map((p) => p.slice(NOLINK_OPEN.length, p.length - NOLINK_CLOSE.length));
+  return NOLINK_OPEN + ps.join('<br>') + NOLINK_CLOSE;
+}
+
+/** Texto fijo del renderer (rótulos): escapado y protegido de filtros, sin énfasis ni guiones. */
+export function labelHtml(text: string): string {
+  return NOLINK_OPEN + escapeHtml(text) + NOLINK_CLOSE;
+}
+
+/** Vista de texto para lints: sin `**`, sin invisibles, espacios normalizados. */
+export function lintView(text: string): string {
+  return String(text).replace(INVISIBLE_CHARS_RE, '').split('**').join('').replace(/\s+/g, ' ').trim();
 }

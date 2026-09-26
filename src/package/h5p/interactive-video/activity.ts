@@ -111,6 +111,12 @@ export function videoActivityFileEntries(input: { packageFilename: string; h5p: 
 
 /** Ajustes Moodle de la actividad de video (§K, R0): nota 0–100, aprobación 70, completion por nota aprobatoria. */
 export const VIDEO_ACTIVITY_MOODLE_SETTINGS = Object.freeze({
+  /**
+   * Máscara de DESHABILITADOS de H5PCore (FRAME 1 | DOWNLOAD 2 | EMBED 4 | COPYRIGHT 8) = 15:
+   * sin barra de acciones, sin "Reuse"/descarga ni "Embed" (§K.3 "sin descarga"). Es lo que guarda
+   * el formulario de Moodle con las casillas desmarcadas. OJO: 0 significa "mostrar todo".
+   */
+  displayoptions: 15,
   grade: 100,
   gradepass: 70,
   grademethod: 1,

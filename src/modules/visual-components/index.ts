@@ -17,7 +17,8 @@ export {
   VcValidationResult,
   VcTextLintHit,
 } from './validate';
-export { renderComponent, renderMovement, VcRenderContext, VcRenderLevel } from './render';
+export { renderComponent, renderMovement, VcRenderContext, VcRenderLevel, VC_TABLE_MAX_COLUMNS } from './render';
+export { VC_RUNTIME_VERSION } from './runtime';
 export {
   lintCleanSafe,
   extractText,
@@ -34,4 +35,4 @@ export {
   HtmlText,
   CssDecl,
 } from './lint-output';
-export { escapeHtml } from './text';
+export { escapeHtml, lintView } from './text';

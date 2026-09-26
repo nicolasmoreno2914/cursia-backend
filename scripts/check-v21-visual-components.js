@@ -202,13 +202,29 @@ check('validador: junta todos los errores (no corta en el primero)', () => {
   for (const c of ['HTML_IN_TEXT', 'COUNT_RANGE', 'RESOURCE_MENTION', 'QUANTITY_CLAIM', 'UNKNOWN_FIELD']) assert(codes.includes(c), `falta ${c} en ${codes}`);
 });
 
-check('lint RESOURCE_MENTION: acentos/mayúsculas, límites de palabra, en cualquier campo', () => {
-  const pos = ['En el Vídeo verás', 'las ACTIVIDADES', 'Evaluación final', 'el SCORM', 'un h5p', 'la presentación', 'las presentaciones', 'una diapositiva', 'los exámenes', 'el examen', 'el quiz', 'un juego', 'videos cortos', 'la actividad'];
-  for (const t of pos) assert(vc.lintResourceMentions(t).length === 1, `debió marcar: ${t}`);
-  const neg = ['videojuegos', 'reactividad', 'evaluar el caso', 'examinar', 'presentar la idea', 'juego de roles'.replace('juego', 'juegan')];
-  for (const t of neg) assert(vc.lintResourceMentions(t).length === 0, `no debió marcar: ${t} → ${JSON.stringify(vc.lintResourceMentions(t))}`);
+check('lint RESOURCE_MENTION (ruling I4): referencias a recursos/navegación sí, vocabulario del dominio no', () => {
+  const deny = [
+    'En el video verás el proceso', 'Mira este video con atención', 'Observa el VIDEO', 'los videos del capítulo',
+    'Resuelve la actividad interactiva', 'la actividad de práctica', 'Continúa en la siguiente actividad',
+    'Prepárate para el examen', 'Repasa antes del examen', 'la evaluación del módulo', 'La evaluación final',
+    'En la presentación verás los datos', 'Revisa la presentación del capítulo', 'la presentación de este capítulo',
+    'la diapositiva 3', 'las diapositivas', 'el quiz', 'un SCORM', 'el H5P', 'un juego interactivo', 'el juego de práctica',
+    'Sigue con el siguiente recurso', 'En este Vídeo',
+  ];
+  for (const t of deny) assert(vc.lintResourceMentions(t).length >= 1, `debió marcar: "${t}"`);
+  const allow = [
+    'El juego de roles ayuda a practicar la escucha', 'juego limpio entre colegas', 'La evaluación de riesgos es obligatoria',
+    'evaluación del desempeño', 'La presentación de resultados al cliente', 'la presentación del producto',
+    'la actividad económica del sector', 'las actividades del puesto', 'Un examen físico previo', 'el examen médico anual',
+    'producción de video para redes', 'videojuegos y aprendizaje', 'reactividad', 'evaluar el caso', 'presentar la idea',
+  ];
+  for (const t of allow) assert(vc.lintResourceMentions(t).length === 0, `no debió marcar: "${t}" → ${JSON.stringify(vc.lintResourceMentions(t))}`);
   expectCode(mutate((d) => (d.movements.deepening[3].rows[0].cells[1] = 'Como en la Presentación')), 'RESOURCE_MENTION', 'rows[0].cells[1]');
   expectCode(mutate((d) => (d.movements.video_primer[0].steps[0].body = 'Observa el VIDEO con atención')), 'RESOURCE_MENTION', 'steps[0].body');
+  // el énfasis no evade el lint
+  expectCode(mutate((d) => (d.movements.opening[0].lead = 'Mira **el** video')), 'RESOURCE_MENTION');
+  const ok = vc.validateExperience(mutate((d) => (d.movements.opening[0].lead = 'El **juego de roles** y la **evaluación de riesgos** son parte del trabajo.')));
+  assert(ok.ok, JSON.stringify(ok.errors));
 });
 
 check('lint QUANTITY_CLAIM: dígitos pegados a módulos/capítulos/…/%', () => {
@@ -217,6 +233,60 @@ check('lint QUANTITY_CLAIM: dígitos pegados a módulos/capítulos/…/%', () =>
   const neg = ['el año 1990', 'módulos del curso', 'en 3 pasos', 'Década de 1970', 'tres módulos', 'hora de actuar'];
   for (const t of neg) assert(vc.lintQuantityClaims(t).length === 0, `no debió marcar: ${t} → ${JSON.stringify(vc.lintQuantityClaims(t))}`);
   expectCode(mutate((d) => (d.movements.synthesis[0].points[0] = 'El 80% de las quejas se resuelve escuchando')), 'QUANTITY_CLAIM', 'points[0]');
+});
+
+check('I1: el énfasis ** y los invisibles no evaden QUANTITY_CLAIM / RESOURCE_MENTION', () => {
+  const pos = ['En **3** módulos', '**3** módulos', 'el **30**% del grupo', 'el **30%** del grupo', 'Ver **capítulo** 2', '**capítulo 2**', '3\n**módulos**', '3  \n  módulos'];
+  for (const t of pos) assert(vc.lintQuantityClaims(t).length >= 1, `debió marcar: ${JSON.stringify(t)}`);
+  expectCode(mutate((d) => (d.movements.opening[0].lead = 'Recuerda **esta idea\nclave** siempre. En **3** módulos y el **30**% y **capítulo** 2')), 'QUANTITY_CLAIM');
+  // invisibles: rechazados explícitamente
+  for (const t of ['vid\u200Beo', 'hola\u00ADmundo', 'a\uFEFFb', 'x\u202Ey', 'p\uE000q']) {
+    expectCode(mutate((d) => (d.movements.opening[0].lead = t)), 'TEXT_FORMAT');
+  }
+  assert(vc.lintResourceMentions('en el vid\u200Beo').length === 1, 'zero-width dentro de la palabra');
+});
+
+check('I1: énfasis que cruza saltos de línea se renderiza sin ** literales ni tramos corridos', () => {
+  const t = themes[0].theme;
+  const html = vc.renderComponent({ type: 'callout', variant: 'info', body: 'Recuerda **esta idea\nclave** siempre.\n\nOtro **párrafo\n\ncon énfasis** largo y **fin**.' }, t, { uid: 'b' });
+  assert(!html.includes('**'), `quedaron ** literales: ${html}`);
+  assert(html.includes('<strong>esta idea</strong><br><strong>clave</strong> siempre.'), `línea con énfasis: ${html}`);
+  assert(html.includes('<strong>párrafo</strong>') && html.includes('<strong>con énfasis</strong> largo y <strong>fin</strong>.'), `párrafos con énfasis: ${html}`);
+  assert(vc.extractText(html) === 'Dato Recuerda esta idea clave siempre. Otro párrafo con énfasis largo y fin.', vc.extractText(html));
+  // strong siempre balanceado
+  const opens = (html.match(/<strong>/g) || []).length;
+  const closes = (html.match(/<\/strong>/g) || []).length;
+  assert(opens === closes, `strong desbalanceado ${opens}/${closes}`);
+  // un ** sin pareja queda literal (el validador lo rechaza igual)
+  assert(vc.renderComponent({ type: 'callout', variant: 'info', body: 'a **b' }, t, { uid: 'b' }).includes('a **b'), 'literal');
+});
+
+check('I5: claves del prototipo no son tipos ni campos ("constructor", "__proto__", "toString")', () => {
+  for (const type of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf']) {
+    const e = vc.validateComponent(JSON.parse(`{"type":"${type}"}`));
+    assert(e.some((x) => x.code === 'UNKNOWN_COMPONENT'), `${type}: ${JSON.stringify(e)}`);
+    let msg = '';
+    try {
+      vc.renderMovement([JSON.parse(`{"type":"${type}"}`)], themes[0].theme, { uid: 'p' });
+    } catch (err) {
+      msg = err.message;
+    }
+    assert(/^VC_RENDER: tipo de componente desconocido/.test(msg), `${type}: renderer → ${msg}`);
+  }
+  const doc = F.buildExperience();
+  for (const mv of ['opening', 'deepening', 'synthesis', 'closing', 'video_primer']) doc.movements[mv] = [{ type: 'constructor' }];
+  const r = vc.validateExperience(doc);
+  assert(!r.ok && r.errors.filter((e) => e.code === 'UNKNOWN_COMPONENT').length === 5, JSON.stringify(r.errors.slice(0, 3)));
+  for (const extra of ['constructor', 'toString', '__proto__']) {
+    const c = JSON.parse(`{"type":"callout","variant":"info","body":"hola","${extra}":"x"}`);
+    const e = vc.validateComponent(c);
+    assert(e.some((x) => x.code === 'UNKNOWN_FIELD' && x.path.endsWith(extra)), `${extra} como campo: ${JSON.stringify(e)}`);
+  }
+  const bad = JSON.parse('{"type":"callout","variant":"constructor","body":"hola"}');
+  assert(vc.validateComponent(bad).some((x) => x.code === 'ENUM_VALUE'), 'variant constructor');
+  let msg = '';
+  try { vc.renderComponent(bad, themes[0].theme, { uid: 'p' }); } catch (err) { msg = err.message; }
+  assert(/^VC_RENDER/.test(msg), `variant constructor en renderer: ${msg}`);
 });
 
 // ─── Renderer ───────────────────────────────────────────────────────────────
@@ -252,7 +322,14 @@ check('escape: <script>, atributos y entidades en texto quedan inertes (ambos ni
       const html = vc.renderMovement([c], themes[0].theme, { uid: 'esc', level });
       assert(!/<script>alert/i.test(html), `${c.type}: <script> sin escapar`);
       assert(!/<img/i.test(html), `${c.type}: <img> sin escapar`);
-      assert(!/onerror=alert/.test(html.replace(/onerror=alert\(2\)&gt;/g, '')) || !/<[^>]*onerror/i.test(html), `${c.type}: onerror en un tag`);
+      const onAttrs = [];
+      const walkOn = (el) => {
+        if (el.kind !== 'el') return;
+        for (const k of Object.keys(el.attrs)) if (/^on/i.test(k)) onAttrs.push(`${el.tag}[${k}]`);
+        el.children.forEach(walkOn);
+      };
+      walkOn(vc.parseHtml(html));
+      assert(onAttrs.length === 0, `${c.type}: atributos de evento en el HTML: ${onAttrs.join(', ')}`);
       assert(html.split('&shy;').join('').includes('&lt;script&gt;alert(1)&lt;/script&gt;'), `${c.type}: no se ve el texto escapado`);
       // el texto sobrevive tal cual (decodificado)
       assert(vc.extractText(html).includes('<script>alert(1)</script> "><img src=x onerror=alert(2)> & &amp; \'x\''), `${c.type}: texto no preservado`);
@@ -324,7 +401,7 @@ check('lintCleanSafe: todos los componentes × familias × modos × niveles × (
 });
 
 check('lintCleanSafe detecta violaciones (ocultos, color sin fondo, valores prohibidos, duplicados, fuente chica, contraste)', () => {
-  const bg = (inner, extra = '') => `<div style="background-color:#FFFFFF;color:#111111${extra}">${inner}</div>`;
+  const bg = (inner, extra = '') => `<div style="background-color:#FAFAFA;color:#111111${extra}">${inner}</div>`;
   const cases = [
     ['BASE_HIDDEN', bg('<p style="display:none;color:#111111">x</p>')],
     ['BASE_HIDDEN', bg('<p style="visibility:hidden">x</p>')],
@@ -333,23 +410,27 @@ check('lintCleanSafe detecta violaciones (ocultos, color sin fondo, valores proh
     ['NO_COLOR', '<p>texto suelto</p>'],
     ['NO_BACKGROUND', '<p style="color:#111111">x</p>'],
     ['COLOR_WITHOUT_BACKGROUND', '<p style="color:#111111">x</p>'],
-    ['BG_NOT_PAIRED', bg('<div style="background-color:#000000"><p>x</p></div>')],
+    ['BG_NOT_PAIRED', bg('<div style="background-color:#101010"><p>x</p></div>')],
     ['NON_HEX_COLOR', bg('<p style="color:red">x</p>')],
     ['FORBIDDEN_VALUE', bg('<p style="color:oklch(0.5 0.1 200)">x</p>')],
     ['FORBIDDEN_VALUE', bg('<p style="color:var(--x)">x</p>')],
     ['FORBIDDEN_VALUE', bg('x', ';background-color:rgba(0,0,0,1)')],
-    ['GRADIENT_WITHOUT_FALLBACK', '<div style="background:linear-gradient(#FFFFFF,#EEEEEE);color:#111111">x</div>'],
+    ['GRADIENT_WITHOUT_FALLBACK', '<div style="background:linear-gradient(#FAFAFA,#EEEEEE);color:#111111">x</div>'],
+    ['LINK_WITHOUT_COLOR', bg('<p><a href="#">enlace inyectado</a></p>')],
+    ['PURE_BLACK_WHITE', '<div style="background-color:#FFFFFF;color:#111111">x</div>'],
+    ['PURE_BLACK_WHITE', '<div style="background-color:#FAFAFA;color:#000">x</div>'],
     ['DUPLICATE_SAFE_PROPERTY', bg('<p style="margin:0;margin:4px">x</p>')],
     ['FONT_TOO_SMALL', bg('<p style="font-size:14px">x</p>')],
     ['FONT_TOO_SMALL', bg('<span class="cvc-meta" style="font-size:12px">x</span>')],
-    ['LOW_CONTRAST', '<div style="background-color:#FFFFFF;color:#AAAAAA">x</div>'],
+    ['LOW_CONTRAST', '<div style="background-color:#FAFAFA;color:#AAAAAA">x</div>'],
   ];
   for (const [code, html] of cases) {
     const r = vc.lintCleanSafe(html);
     assert(!r.ok && r.errors.some((e) => e.code === code), `${code} no detectado en ${html}: ${JSON.stringify(r.errors)}`);
   }
   const good = [
-    '<div style="background:linear-gradient(#FFFFFF,#EEEEEE);background-color:#FFFFFF;color:#111111">x</div>',
+    '<div style="background:linear-gradient(#FAFAFA,#EEEEEE);background-color:#FAFAFA;color:#111111">x</div>',
+    bg('<p><a href="#" style="color:#1D4ED8">enlace con color</a></p>'),
     bg('<p style="font-size:18px;font-size:clamp(1rem, 1vw, 2rem)">x</p>'),
     bg('<span class="cvc-meta" style="font-size:14px">x</span>'),
     bg('<details open><summary>q</summary>a</details>'),
@@ -431,20 +512,115 @@ check('todo el texto del JSON aparece en el HTML, en orden (normal y largo)', ()
   for (const c of components) {
     for (const variant of [c, F.longVariant(c)]) {
       const text = vc.extractText(vc.renderComponent(variant, themes[0].theme, { uid: 't' }));
+      // comparación apilada (> 2 columnas): el orden de lectura es por criterio; se exige presencia
+      const ordered = !(c.type === 'comparison' && c.columns.length > vc.VC_TABLE_MAX_COLUMNS);
       let from = 0;
       for (const s of F.textsOf(variant)) {
-        const i = text.indexOf(norm(s), from);
-        assert(i >= 0, `${c.type}: falta u orden roto "${norm(s).slice(0, 50)}"`);
-        from = i;
+        const i = text.indexOf(norm(s), ordered ? from : 0);
+        assert(i >= 0, `${F.fixtureName(c)}: falta u orden roto "${norm(s).slice(0, 50)}"`);
+        if (ordered) from = i;
       }
     }
   }
+});
+
+check('M9: palabras normales no reciben guiones suaves; solo las muy largas', () => {
+  const html = vc.renderComponent({ type: 'callout', variant: 'info', title: 'Internacionalización y responsabilidades', body: 'La implementación, la administración y las responsabilidades interdepartamentales.' }, themes[0].theme, { uid: 'h' });
+  assert(!html.includes('&shy;'), `&shy; en palabras normales: ${html}`);
 });
 
 check('palabras largas reciben guiones suaves (sin desborde bajo forceclean)', () => {
   const html = vc.renderComponent(F.longVariant(components[0]), themes[0].theme, { uid: 'l' });
   assert(html.includes('&shy;'), 'sin &shy;');
   assert(!new RegExp(`[^\\s;&]{40,}`).test(html.replace(/style="[^"]*"/g, '').replace(/<[^>]+>/g, ' ')), 'quedó una corrida de 40+ caracteres sin punto de corte');
+});
+
+check('I6: todo texto va en <span class="nolink"> (clase exacta, sin <span> internos) en ambos niveles', () => {
+  for (const { theme } of themes.slice(0, 2)) {
+    for (const c of components) {
+      for (const level of LEVELS) {
+        const root = vc.parseHtml(vc.renderMovement([c, F.longVariant(c)], theme, { uid: 'nl', level }));
+        const walk = (node, inNolink) => {
+          if (node.kind === 'text') {
+            if (node.text.replace(/[­\s]/g, '') && !/^[✓☐:]+$/.test(node.text.trim())) {
+              assert(inNolink, `${F.fixtureName(c)}/${level || 'clean'}: texto fuera de nolink: "${node.text.slice(0, 40)}"`);
+            }
+            return;
+          }
+          if (['style', 'script'].includes(node.tag)) return;
+          const isNolink = node.tag === 'span' && node.attrs.class === 'nolink';
+          if (inNolink) assert(node.tag !== 'span' && node.tag !== 'a', `${F.fixtureName(c)}: <${node.tag}> dentro de nolink (el filtro cierra la región en el primer </span>)`);
+          node.children.forEach((ch) => walk(ch, inNolink || isNolink));
+        };
+        walk(root, false);
+      }
+    }
+  }
+});
+
+check('I2: comparación de > 2 columnas se apila por criterio en la base (sin <table>); ≤ 2 columnas es <table>', () => {
+  const theme = themes[0].theme;
+  for (const c of components.filter((x) => x.type === 'comparison')) {
+    for (const level of LEVELS) {
+      const html = vc.renderComponent(c, theme, { uid: 'cmp', level });
+      if (c.columns.length > vc.VC_TABLE_MAX_COLUMNS) {
+        assert(!html.includes('<table'), `${F.fixtureName(c)}/${level || 'clean'}: <table> en la base`);
+        assert((html.match(/class="cvc-card cvc-cmp-row"/g) || []).length === c.rows.length, 'un bloque por criterio');
+        assert((html.match(/class="cvc-cmp-col"/g) || []).length === c.rows.length * c.columns.length, 'columna:valor por celda');
+      } else {
+        assert(html.includes('<table') && html.includes('scope="col"') && html.includes('scope="row"'), 'tabla con th scope');
+        if (level) assert(/class="cvc-cmp cvc-scroll" role="region" tabindex="0" aria-label/.test(html), 'región desplazable accesible en ENHANCED');
+      }
+    }
+  }
+});
+
+check('M1: jerarquía de encabezados (sin h1–h3 en el label), role=list en ENHANCED, summaries con nombre accesible', () => {
+  for (const c of components) {
+    const clean = vc.renderMovement([c], themes[0].theme, { uid: 'hx' });
+    const enh = vc.renderMovement([c], themes[0].theme, { uid: 'hx', level: 'enhanced' });
+    assert(!/<h[1-3][\s>]/.test(clean + enh), `${F.fixtureName(c)}: h1–h3 dentro del label`);
+    if (/style="list-style:none/.test(enh)) assert(/role="list" style="list-style:none/.test(enh), `${F.fixtureName(c)}: lista sin role=list`);
+    for (const m of enh.matchAll(/<summary([^>]*)>/g)) {
+      if (/cvc-acc/.test(enh) && !/aria-label/.test(m[1])) continue; // acordeón: el nombre es su encabezado
+      assert(/aria-label="[^"]+"/.test(m[1]), `${F.fixtureName(c)}: summary sin aria-label`);
+    }
+  }
+  const tabs = vc.renderMovement([components.find((c) => c.type === 'tabs')], themes[0].theme, { uid: 'tl', level: 'enhanced' });
+  assert(/data-cvc-labelledby="cvc-tl-0-tt\d+"/.test(tabs) && /<h4 id="cvc-tl-0-tt\d+"/.test(tabs), 'tablist nombrada por el título');
+});
+
+check('M6/M7: tema adulterado y uid fuera de rango → VC_RENDER', () => {
+  const bad = [
+    (t) => (t.color.bg = '#fff}</style><script>alert(1)</script>'),
+    (t) => (t.color.textPrimary = 'red'),
+    (t) => (t.typography.fontBody = 'Arial;}</style><script>'),
+    (t) => (t.typography.sizeBodyPx = 12),
+    (t) => (t.typography.enhanced.sizeBodyFluid = 'expression(alert(1))'),
+    (t) => (t.shape.radiusMd = NaN),
+    (t) => (t.variants.card = 'x'),
+  ];
+  for (const fn of bad) {
+    const t = F.clone(themes[0].theme);
+    fn(t);
+    let msg = '';
+    try { vc.renderMovement([components[0]], t, { uid: 'bad', level: 'enhanced' }); } catch (err) { msg = err.message; }
+    assert(/^VC_RENDER: tema/.test(msg), `debió lanzar VC_RENDER: ${fn} → ${msg}`);
+  }
+  const u60 = 'a'.repeat(60), u61 = 'a'.repeat(61), u64 = 'a'.repeat(64);
+  vc.renderMovement([components[0]], themes[0].theme, { uid: u60 });
+  vc.renderComponent(components[0], themes[0].theme, { uid: u64 });
+  let msg = '';
+  try { vc.renderMovement([components[0]], themes[0].theme, { uid: u61 }); } catch (err) { msg = err.message; }
+  assert(/^VC_RENDER: uid/.test(msg), `uid 61 en renderMovement: ${msg}`);
+});
+
+check('M2: runtime versionado, localiza su label por currentScript y genera ids faltantes', () => {
+  const html = vc.renderMovement([components.find((c) => c.type === 'tabs')], themes[0].theme, { uid: 'rt', level: 'enhanced' });
+  assert(vc.VC_RUNTIME_VERSION >= 2, 'versión');
+  assert(html.includes(`var V=${vc.VC_RUNTIME_VERSION}`) && html.includes('(N.v|0)<V'), 'version gate');
+  assert(html.includes('document.currentScript'), 'currentScript');
+  assert(html.includes('N.id=function'), 'ids derivados');
 });
 
 if (failures > 0) {

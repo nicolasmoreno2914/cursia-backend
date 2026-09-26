@@ -54,7 +54,7 @@ for (const combo of F.THEME_COMBOS) {
     for (const [vname, variant] of [['normal', c], ['largo', F.longVariant(c)]]) {
       for (const level of [undefined, 'enhanced']) {
         cases.push({
-          name: `${tl}/${c.type}${c.type === 'callout' ? ':' + c.variant : ''}/${vname}/${level || 'clean'}`,
+          name: `${tl}/${F.fixtureName(c)}/${vname}/${level || 'clean'}`,
           level,
           html: vc.renderMovement([variant], theme, { uid: `p${i}`, level }),
         });
@@ -116,12 +116,27 @@ check('lintCleanSafe pasa sobre el HTML purificado en todos los casos', () => {
   assert(bad.length === 0, `${bad.length} casos:\n   ${bad.slice(0, 5).join('\n   ')}`);
 });
 
-check('el purificado no conserva la capa ENHANCED (<style>, <script>, <details>, aria, data-, display)', () => {
+check('el purificado no conserva la capa ENHANCED: ni tags/atributos, ni NINGUNA propiedad solo-ENHANCED', () => {
+  const byName = new Map(cases.map((c, i) => [c.name, i]));
   cases.forEach((c, i) => {
     const p = purified[i];
-    for (const bad of ['<style', '<script', '<details', '<summary', 'aria-', 'data-cvc', 'display:', 'border-radius', 'box-shadow', 'clamp(']) {
+    for (const bad of ['<style', '<script', '<details', '<summary', 'aria-', 'data-cvc', ' role=', 'tabindex', 'clamp(']) {
       assert(!p.includes(bad), `${c.name}: "${bad}" sobrevivió a forceclean (el modelo §X.1 no se cumple)`);
     }
+    if (c.level !== 'enhanced') return;
+    // propiedades que solo aparecen en ENHANCED (vs el render CLEAN_SAFE del mismo caso)
+    const cleanIdx = byName.get(c.name.replace(/\/enhanced$/, '/clean'));
+    const enhProps = Object.keys(propsCount(c.html)).filter((pr) => !(pr in propsCount(cases[cleanIdx].html)));
+    const survived = enhProps.filter((pr) => pr in propsCount(p));
+    assert(enhProps.length > 0 && survived.length === 0, `${c.name}: propiedades ENHANCED que sobreviven: ${survived.join(', ')}`);
+  });
+});
+
+check('los <span class="nolink"> sobreviven al purificador (protección contra filtros)', () => {
+  cases.forEach((c, i) => {
+    const a = (c.html.match(/<span class="nolink">/g) || []).length;
+    const b = (purified[i].match(/<span class="nolink">/g) || []).length;
+    assert(a > 0 && a === b, `${c.name}: nolink ${a} → ${b}`);
   });
 });
 

@@ -7,7 +7,7 @@
 // <moodleDir> es la carpeta que contiene config.php.
 //
 // Salida: {"moodleRelease": "...", "libraries": [{machineName, majorVersion,
-// minorVersion, patchVersion, runnable}]} ordenado por nombre y versión.
+// minorVersion, patchVersion, runnable, enabled}]} ordenado por nombre y versión.
 define('CLI_SCRIPT', 1);
 if (empty($argv[1]) || !is_file(rtrim($argv[1], '/') . '/config.php')) {
     fwrite(STDERR, "usage: php h5p-installed-libraries.php <moodleDirWithConfigPhp>\n");
@@ -16,7 +16,7 @@ if (empty($argv[1]) || !is_file(rtrim($argv[1], '/') . '/config.php')) {
 require(rtrim($argv[1], '/') . '/config.php');
 global $DB, $CFG;
 $rows = $DB->get_records('h5p_libraries', null, 'machinename ASC, majorversion ASC, minorversion ASC, patchversion ASC',
-    'id, machinename, majorversion, minorversion, patchversion, runnable');
+    'id, machinename, majorversion, minorversion, patchversion, runnable, enabled');
 $libs = [];
 foreach ($rows as $r) {
     $libs[] = [
@@ -25,6 +25,8 @@ foreach ($rows as $r) {
         'minorVersion' => (int)$r->minorversion,
         'patchVersion' => (int)$r->patchversion,
         'runnable' => (int)$r->runnable,
+        // Moodle no muestra contenido cuya librería principal está deshabilitada (api::is_library_enabled).
+        'enabled' => $r->enabled === null ? null : (int)$r->enabled,
     ];
 }
 echo json_encode(['moodleRelease' => $CFG->release, 'libraries' => $libs], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), "\n";
