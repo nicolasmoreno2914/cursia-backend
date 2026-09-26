@@ -47,9 +47,12 @@ import {
   WorkerLedger,
   budgetExceededMessage,
   providerCallRoleOf,
-  recordGammaCharge,
+  recordGammaPending,
+  recordLlmReservation,
   recordServerLlmCharge,
   recordTtsCharge,
+  recordTtsReservation,
+  settleGammaCharge,
 } from '../finops-worker-hooks';
 import { AnthropicClient, GammaClient, OpenAiTtsClient, ProviderCallError } from './provider-clients';
 import { CoverError, CoverRasterizer, GAMMA_COVER_RASTERIZER_UNAVAILABLE, pdftoppmRasterizer } from './pdf-cover';
@@ -69,7 +72,18 @@ export const GAMMA_NUM_CARDS = 10;
 export const TTS_MODEL_DEFAULT = 'gpt-4o-mini-tts';
 export const TTS_VOICE_DEFAULT = 'marin';
 export const TTS_TARGET_BITRATE_KBPS = 64;
-export const AMBIGUOUS_GAMMA_SUBMISSION = 'ambiguous_gamma_submission';
+/** Envío a Gamma de resultado desconocido (5xx/red/timeout/sin id tras enviar): nunca se reenvía solo. */
+export const AMBIGUOUS_GAMMA_SUBMISSION = 'gamma_submit_ambiguous';
+
+/**
+ * F2 fix round 1: ¿el error de un envío es un rechazo DEFINITIVO anterior a la
+ * aceptación? Solo un 4xx con respuesta lo es (el proveedor no procesó el
+ * pedido). 5xx, red, timeout o una respuesta sin id → resultado desconocido
+ * (pudo cobrarse).
+ */
+export function isDefinitiveRejection(err: unknown): boolean {
+  return err instanceof ProviderCallError && err.status !== null && err.status >= 400 && err.status < 500;
+}
 
 export interface RealProviderDeps {
   scheduler: Pick<SchedulerService, 'completeItem' | 'failItem'> &
@@ -101,6 +115,8 @@ export class ProviderItemFailed extends Error {
 }
 
 class LeaseLost extends Error {}
+/** El guard bloqueó una llamada intermedia (el item ya quedó `blocked`). */
+class BudgetBlocked extends Error {}
 
 function envOf(deps: RealProviderDeps): Env {
   return deps.env ?? process.env;
@@ -254,16 +270,17 @@ export async function processRealPresentation(deps: RealProviderDeps, item: Clai
   if (generationId) {
     // Reanudación: la generación ya existe (y ya se pagó) — NUNCA se reenvía.
     if (!apiKey) await fail(deps, item, notReady(item, ['GAMMA_API_KEY']), false);
+    // Fix round 1: la reserva pendiente existe aunque el proceso haya caído entre el id y el ledger.
+    const gid0 = generationId;
+    await ledgerSafe(deps, `la reserva de Gamma ${gid0}`, (l) =>
+      recordGammaPending(l, { ownerId, itemRunId: item.itemRunId, generationId: gid0, itemAttempt: item.attempt }));
     themeFamily = external.themeFamily;
     themeMode = external.themeMode;
     themeId = external.gammaThemeId;
   } else if (item.outputSummary?.externalSubmitStartedAt) {
-    await fail(
-      deps,
-      item,
-      `${AMBIGUOUS_GAMMA_SUBMISSION}: un envío a Gamma empezó (${item.outputSummary.externalSubmitStartedAt}) y no registró el ` +
-        'generationId (crash o lease perdida a mitad). Puede existir ya una generación cobrada: no se reenvía automáticamente.',
-      false,
+    await gammaAmbiguous(
+      deps, item, ownerId, String(item.outputSummary.externalSubmitStartedAt),
+      `un envío empezó (${item.outputSummary.externalSubmitStartedAt}) y no registró el generationId (crash o lease perdida a mitad)`,
     );
     return;
   } else {
@@ -298,22 +315,31 @@ export async function processRealPresentation(deps: RealProviderDeps, item: Clai
     const markdown = markdownOf(await dependencyText(deps, item, ownerId, 'dynamic_content_md'));
     const chapterTitle = item.blueprint?.chapter?.title ?? `Capítulo ${item.chapterNumber ?? '?'}`;
     const client = new GammaClient(apiKey, env);
-    await record(deps, item, { externalSubmitStartedAt: new Date().toISOString() });
+    const marker = new Date().toISOString();
+    await record(deps, item, { externalSubmitStartedAt: marker });
     try {
       generationId = await client.createGeneration(gammaGenerationBody({ chapterTitle, contentMarkdown: markdown, themeId: themeId! }));
     } catch (err) {
-      const e = err instanceof ProviderCallError ? err : null;
-      // Rechazo HTTP explícito (4xx/5xx con respuesta): Gamma no creó nada → se limpia el marcador.
-      if (e && e.status !== null) {
+      // Fix round 1 (review f12 m2): SOLO un 4xx con respuesta es un rechazo definitivo previo a la
+      // aceptación → se limpia el marcador y el reintento automático (acotado) puede reenviar.
+      if (isDefinitiveRejection(err)) {
+        const e = err as ProviderCallError;
         await record(deps, item, { externalSubmitStartedAt: null });
         await fail(deps, item, `gamma_submit_failed: ${e.message}`, e.retryable);
       }
-      // Red/timeout o respuesta sin id: pudo crearse → queda ambiguo (nunca se reenvía solo).
-      await fail(deps, item, `${AMBIGUOUS_GAMMA_SUBMISSION}: ${err instanceof Error ? err.message : String(err)}`, false);
+      // 5xx / red / timeout / respuesta sin id: Gamma pudo aceptarla (y cobrarla) → reserva pendiente
+      // + item detenido para una decisión humana explícita (nunca un reenvío automático).
+      await gammaAmbiguous(deps, item, ownerId, marker, err instanceof Error ? err.message : String(err));
+      return;
     }
     await record(deps, item, {
       external: { gammaGenerationId: generationId, gammaThemeId: themeId!, themeFamily, themeMode },
     });
+    // Fix round 1 (review f12 m1): Gamma aceptó → reserva PENDIENTE en el ledger YA (estimado p90),
+    // para que el presupuesto la cuente aunque el poll termine en timeout o se agoten los intentos.
+    const acceptedId = generationId!;
+    await ledgerSafe(deps, `la reserva de Gamma ${acceptedId}`, (l) =>
+      recordGammaPending(l, { ownerId, itemRunId: item.itemRunId, generationId: acceptedId, itemAttempt: item.attempt }));
   }
 
   // ── poll hasta completed/failed ────────────────────────────────────────────
@@ -332,11 +358,14 @@ export async function processRealPresentation(deps: RealProviderDeps, item: Clai
     st = await pollOnce(deps, item, client, generationId!);
   }
   const gid = generationId!;
-  await ledgerSafe(deps, `la generación de Gamma ${gid}`, (l) =>
-    recordGammaCharge(l, {
+  // Terminal: la reserva pendiente se liquida con los créditos medidos (ADJUSTMENT); sin créditos queda pendiente.
+  await ledgerSafe(deps, `la generación de Gamma ${gid}`, async (l) => {
+    const r = await settleGammaCharge(l, {
       ownerId, itemRunId: item.itemRunId, generationId: gid, creditsDeducted: st.creditsDeducted,
       creditsRemaining: st.creditsRemaining, failed: st.status === 'failed', itemAttempt: item.attempt,
-    }));
+    });
+    if (r === 'still_pending') deps.logger.error(`finops: Gamma no informó credits.deducted de ${gid} — el cargo queda PENDIENTE con el estimado`);
+  });
   if (st.status === 'failed') {
     await fail(
       deps,
@@ -416,6 +445,27 @@ export async function processRealPresentation(deps: RealProviderDeps, item: Clai
   if (!ok) deps.logger.warn(`Item ${item.itemKey}: presentación subida (artifact ${row.id}) pero completeItem devolvió false (lease perdida)`);
 }
 
+/**
+ * Envío ambiguo a Gamma: reserva pendiente (clave sintética por item + marcador,
+ * idempotente) y el item queda `failed` NO reintentable con
+ * `gamma_submit_ambiguous`. Resolución explícita: revisar la cuenta de Gamma y
+ * pedir un reenvío con `POST …/items/:itemKey/retry {"resubmitProvider": true}`.
+ */
+async function gammaAmbiguous(deps: RealProviderDeps, item: ClaimedItem, ownerId: string, marker: string, why: string): Promise<never> {
+  const ms = Date.parse(marker);
+  const syntheticId = `ambiguous-${item.itemRunId}-${Number.isFinite(ms) ? ms : 'x'}`;
+  await ledgerSafe(deps, `la reserva ambigua de Gamma ${syntheticId}`, (l) =>
+    recordGammaPending(l, { ownerId, itemRunId: item.itemRunId, generationId: syntheticId, itemAttempt: item.attempt, ambiguous: true, reason: why }));
+  return fail(
+    deps,
+    item,
+    `${AMBIGUOUS_GAMMA_SUBMISSION}: el envío a Gamma quedó sin confirmar (${why.slice(0, 300)}). Puede existir ya una generación ` +
+      'cobrada (quedó reservada en el ledger): no se reenvía automáticamente. Revisá la cuenta de Gamma y, si corresponde, ' +
+      'pedí un reenvío explícito (retry con resubmitProvider=true).',
+    false,
+  );
+}
+
 async function pollOnce(deps: RealProviderDeps, item: ClaimedItem, client: GammaClient, generationId: string) {
   try {
     return await client.getGeneration(generationId);
@@ -475,7 +525,23 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
         },
         async (prompt, role) => {
           await heartbeat(deps, item);
-          const r = await llmClient.messages({ model, system: prompt.system, user: prompt.user, maxTokens: prompt.maxTokens });
+          // Fix round 1 (review f12 m3): la continuación es otra llamada pagada → vuelve a pasar el guard.
+          if (role === 'continuation' && !(await guard(deps, item, 'anthropic'))) throw new BudgetBlocked();
+          let r;
+          try {
+            r = await llmClient.messages({ model, system: prompt.system, user: prompt.user, maxTokens: prompt.maxTokens });
+          } catch (err) {
+            // Fix round 1: resultado desconocido tras enviar (timeout/red/5xx/sin id-usage) → reserva pendiente.
+            if (!isDefinitiveRejection(err)) {
+              await ledgerSafe(deps, `la reserva LLM (${role})`, (l) =>
+                recordLlmReservation(l, {
+                  ownerId, itemRunId: item.itemRunId, model, promptChars: prompt.system.length + prompt.user.length,
+                  maxTokens: prompt.maxTokens, role, generation: item.generation ?? 1, itemAttempt: item.attempt,
+                  reason: err instanceof Error ? err.message : String(err),
+                }));
+            }
+            throw err;
+          }
           // Medición server-side del LLM (HD-V21-17): usage de la respuesta, idempotente por msg_…
           await ledgerSafe(deps, `el guion LLM ${r.messageId}`, (l) =>
             recordServerLlmCharge(l, {
@@ -489,6 +555,7 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
       );
     } catch (err) {
       if (err instanceof LeaseLost) throw err;
+      if (err instanceof BudgetBlocked) return;
       if (err instanceof AudioScriptError) return fail(deps, item, err.message, err.retryable);
       const e = err instanceof ProviderCallError ? err : null;
       return fail(deps, item, `audiobook_script_failed: ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
@@ -515,6 +582,17 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
       res = await tts.speech({ model, voice, input: chunks[i] });
     } catch (err) {
       const e = err instanceof ProviderCallError ? err : null;
+      // Fix round 1: timeout/red/5xx DESPUÉS de enviar = gasto posible → reserva pendiente por
+      // (item, generación, chunk, intento). El reintento del item es el acotado de siempre y
+      // cada intento suma su reserva (el guard la cuenta).
+      if (!isDefinitiveRejection(err)) {
+        const chunkIdx = i;
+        await ledgerSafe(deps, `la reserva de TTS (chunk ${chunkIdx})`, (l) =>
+          recordTtsReservation(l, {
+            ownerId, itemRunId: item.itemRunId, characters: chunks[chunkIdx].length, model, generation: item.generation ?? 1,
+            chunk: chunkIdx, itemAttempt: item.attempt, reason: err instanceof Error ? err.message : String(err),
+          }));
+      }
       return fail(deps, item, `tts_failed: chunk ${i + 1}/${chunks.length}: ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
     }
     let seconds: number | null = null;

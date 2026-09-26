@@ -1150,6 +1150,7 @@ export class RunsService {
     runId: string,
     itemKey: string,
     resubmitVideo = false,
+    resubmitProvider = false,
   ): Promise<ItemRunDto> {
     // G3 (fix wave / review I1): un retry es un entry point como cualquier
     // otro — requiere la allow-list de V2, antes de tocar manifest o run.
@@ -1281,6 +1282,22 @@ export class RunsService {
       // del retry normal, para que el worker someta de nuevo en vez de
       // reutilizar/quedar envenenado por el marcador anterior.
       let resubmitSetSql = '';
+      // V2.1 F2 fix round 1: reenvío EXPLÍCITO de una generación de Gamma cuyo envío quedó ambiguo o falló
+      // en Gamma. Archiva el id/marcador (su reserva pendiente sigue en el ledger) y el worker pide una nueva.
+      if (resubmitProvider) {
+        if (resubmitVideo) throw new BadRequestException('resubmitVideo y resubmitProvider son excluyentes');
+        if (target.type !== 'presentation') {
+          throw new BadRequestException(`resubmitProvider solo aplica a items type="presentation"; "${itemKey}" es "${target.type}"`);
+        }
+        const err = target.error ?? '';
+        if (!(err.startsWith('gamma_submit_ambiguous') || err.startsWith('gamma_generation_failed'))) {
+          throw new BadRequestException(
+            `resubmitProvider solo aplica cuando el último error es "gamma_submit_ambiguous" o "gamma_generation_failed"; "${itemKey}" falló con "${err}"`,
+          );
+        }
+        this.logger.warn(`retryItem: resubmitProvider=true para "${itemKey}" (run ${job.id}) — error previo "${err}"; archivando la generación anterior`);
+        resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt'`;
+      }
       if (resubmitVideo) {
         if (target.type !== 'video') {
           throw new BadRequestException(`resubmitVideo solo aplica a items type="video"; "${itemKey}" es "${target.type}"`);
@@ -1308,7 +1325,7 @@ export class RunsService {
                       'retriedAt', now()
                     ))
                   )`;
-      const outputSummaryExpr = resubmitVideo
+      const outputSummaryExpr = resubmitVideo || resubmitProvider
         ? `((${previousErrorsExpr}) || jsonb_build_object(
                     'previousExternals',
                     coalesce(output_summary->'previousExternals', '[]'::jsonb) || jsonb_build_array(jsonb_build_object(

@@ -11,8 +11,10 @@ import type { FinopsBudgetService } from '../modules/finops/finops-budget.servic
 import { BUDGET_EXCEEDED } from '../modules/finops/run-budget';
 import { costIdempotencyKey } from '../modules/finops/idempotency';
 import { llmIngestToChargeInput } from '../modules/finops/llm-usage-ingest';
+import { usageModelPriorsV1 } from '../modules/finops/usage-model';
 
-export type WorkerLedger = Pick<FinopsLedgerService, 'recordCharge' | 'recordAdjustment' | 'recordZero'>;
+export type WorkerLedger = Pick<FinopsLedgerService, 'recordCharge' | 'recordAdjustment' | 'recordZero'> &
+  Partial<Pick<FinopsLedgerService, 'settleMeasuredUsage'>>;
 export type WorkerBudget = Pick<FinopsBudgetService, 'guardPaidSubmission'>;
 
 /**
@@ -311,6 +313,162 @@ export async function recordServerLlmCharge(
     mode: 'real',
   });
   return ledger.recordCharge({ ...input, recordedBy: 'dynamic-provider-worker', metadata: { ...(input.metadata || {}), serverSide: true } });
+}
+
+// ─── V2.1 F2 fix round 1: reservas PENDIENTES (gasto posible no medido todavía) ──
+// Regla: toda llamada pagada que PUDO cobrarse deja una fila CHARGE en el ledger
+// en el mismo momento en que se sabe (aceptación, o envío ambiguo), con
+// `measurement_status='pending'` y un monto ESTIMADO (usage model p90 × catálogo;
+// `metadata.estimatedPending=true`). `ESTIMATED` no existe en el ledger (§W.2):
+// el costo es CALCULATED_FROM_USAGE provisional y se liquida con un ADJUSTMENT
+// cuando llega la medición. Así `runActual` (y el runtime guard) la cuentan
+// aunque el item quede en timeout, reintento o bloqueado.
+
+function priorP90(operation: string, meter: string): number {
+  const op = usageModelPriorsV1().operations[operation];
+  const v = Number(op?.meters?.[meter]?.p90);
+  if (!Number.isFinite(v) || v <= 0) throw new Error(`usage model sin p90 para ${operation}.${meter}`);
+  return v;
+}
+
+/** Créditos estimados de una generación de Gamma para la reserva (p90 del usage model). */
+export function gammaEstimatedCredits(): number {
+  return priorP90('gamma.generate', 'gamma_credit');
+}
+
+/**
+ * Reserva PENDIENTE de una generación de Gamma, apenas Gamma la acepta (id =
+ * generationId) o cuando el envío fue ambiguo (id sintético por intento).
+ * Idempotente por la clave `gamma:gen:<id>`.
+ */
+export async function recordGammaPending(
+  ledger: WorkerLedger,
+  a: { ownerId: string; itemRunId: string; generationId: string; itemAttempt?: number; ambiguous?: boolean; reason?: string },
+): Promise<RecordResult> {
+  const role = providerCallRoleOf(a.itemAttempt);
+  const credits = gammaEstimatedCredits();
+  return ledger.recordCharge({
+    itemRunId: a.itemRunId,
+    ownerIdFromAuth: a.ownerId,
+    provider: 'gamma',
+    service: 'generations',
+    modelOrProduct: 'gamma-generate',
+    operation: 'gamma.generate',
+    usage: { gamma_credit: credits },
+    usageUnit: 'gamma_credit',
+    externalOperationId: a.ambiguous ? null : a.generationId,
+    idempotency: { kind: 'gamma', parts: { generationId: a.generationId } },
+    callRole: role.callRole,
+    attempt: role.attempt,
+    billingAccount: 'cursia',
+    mode: 'real',
+    costSource: 'CALCULATED_FROM_USAGE',
+    measurementStatus: 'pending',
+    pricingFallback: 'pending_zero',
+    recordedBy: 'dynamic-provider-worker',
+    metadata: {
+      estimatedPending: true,
+      costBasis: 'usage_model_p90 x pricing_catalog (provisional)',
+      ...(a.ambiguous ? { ambiguous: true } : {}),
+      ...(a.reason ? { pendingReason: a.reason.slice(0, 300) } : {}),
+    },
+  });
+}
+
+/**
+ * Terminal de una generación de Gamma: si ya existe la reserva pendiente, se
+ * liquida con los créditos medidos (ADJUSTMENT); si no existe (p.ej. generación
+ * anterior a este cambio), se registra el CHARGE medido directamente. Sin
+ * créditos informados, la reserva queda pendiente (nunca se borra).
+ */
+export async function settleGammaCharge(
+  ledger: WorkerLedger,
+  a: { ownerId: string; itemRunId: string; generationId: string; creditsDeducted: number | null; creditsRemaining: number | null; failed?: boolean; itemAttempt?: number },
+): Promise<'final_recorded' | 'settled' | 'still_pending' | 'already_final'> {
+  const r = await recordGammaCharge(ledger, a);
+  if (r.inserted) return 'final_recorded';
+  const pending = r.event?.measurement_status === 'pending' && r.event?.metadata?.estimatedPending === true;
+  if (!pending) return 'already_final';
+  const measured = typeof a.creditsDeducted === 'number' && Number.isFinite(a.creditsDeducted) && a.creditsDeducted >= 0;
+  if (!measured) return 'still_pending';
+  if (!ledger.settleMeasuredUsage) throw new Error('ledger sin settleMeasuredUsage');
+  await ledger.settleMeasuredUsage(costIdempotencyKey('gamma', { generationId: a.generationId }), { gamma_credit: a.creditsDeducted as number }, 'gamma_credits_measured', {
+    recordedBy: 'dynamic-provider-worker',
+    metadata: { creditsRemaining: a.creditsRemaining, failed: !!a.failed },
+  });
+  return 'settled';
+}
+
+/** ~15 caracteres de texto por segundo de voz (≈150 palabras/min): estimado de la reserva de TTS. */
+export const TTS_CHARS_PER_SECOND_ESTIMATE = 15;
+
+/**
+ * Reserva PENDIENTE de un chunk de TTS cuyo resultado se desconoce (timeout /
+ * red / 5xx DESPUÉS de enviar): la clave es la determinística por item /
+ * generación / chunk / intento (sin x-request-id), así que cada intento acotado
+ * del item suma su propia reserva.
+ */
+export async function recordTtsReservation(
+  ledger: WorkerLedger,
+  a: { ownerId: string; itemRunId: string; characters: number; model: string; generation: number; chunk: number; itemAttempt?: number; reason: string },
+): Promise<RecordResult> {
+  const role = providerCallRoleOf(a.itemAttempt);
+  const secs = Math.max(1, Math.ceil(a.characters / TTS_CHARS_PER_SECOND_ESTIMATE));
+  return ledger.recordCharge({
+    itemRunId: a.itemRunId,
+    ownerIdFromAuth: a.ownerId,
+    provider: 'openai',
+    service: 'audio.speech',
+    modelOrProduct: a.model,
+    usage: { audio_seconds: secs },
+    usageUnit: 'audio_seconds',
+    externalOperationId: null,
+    idempotency: { kind: 'openai_tts', parts: { itemRunId: a.itemRunId, generation: a.generation, chunk: a.chunk, attempt: role.attempt } },
+    callRole: role.callRole,
+    attempt: role.attempt,
+    billingAccount: 'cursia',
+    mode: 'real',
+    costSource: 'CALCULATED_FROM_USAGE',
+    measurementStatus: 'pending',
+    pricingFallback: 'pending_zero',
+    outcome: 'failed_charged',
+    recordedBy: 'dynamic-provider-worker',
+    metadata: { estimatedPending: true, ambiguous: true, characters: a.characters, chunk: a.chunk, pendingReason: a.reason.slice(0, 300) },
+  });
+}
+
+/**
+ * Reserva PENDIENTE de una llamada LLM server-side sin respuesta medible
+ * (timeout / red / 5xx después de enviar, o respuesta sin id/usage): input
+ * estimado del prompt (≈3 caracteres/token) y output = max_tokens (cota).
+ */
+export async function recordLlmReservation(
+  ledger: WorkerLedger,
+  a: { ownerId: string; itemRunId: string; model: string; promptChars: number; maxTokens: number; role: 'main' | 'continuation'; generation: number; itemAttempt?: number; reason: string },
+): Promise<RecordResult> {
+  const role = providerCallRoleOf(a.itemAttempt);
+  const synthetic = `unmeasured-${a.itemRunId}-g${a.generation}-a${role.attempt}-${a.role}`;
+  return ledger.recordCharge({
+    itemRunId: a.itemRunId,
+    ownerIdFromAuth: a.ownerId,
+    provider: 'anthropic',
+    service: 'messages',
+    modelOrProduct: a.model,
+    usage: { input_tokens: Math.max(1, Math.ceil(a.promptChars / 3)), output_tokens: a.maxTokens },
+    usageUnit: 'output_tokens',
+    externalOperationId: null,
+    idempotency: { kind: 'anthropic', parts: { messageId: synthetic } },
+    callRole: a.role === 'continuation' ? 'continuation' : 'main',
+    attempt: role.attempt,
+    billingAccount: 'cursia',
+    mode: 'real',
+    costSource: 'CALCULATED_FROM_USAGE',
+    measurementStatus: 'pending',
+    pricingFallback: 'pending_zero',
+    outcome: 'failed_charged',
+    recordedBy: 'dynamic-provider-worker',
+    metadata: { estimatedPending: true, ambiguous: true, serverSide: true, pendingReason: a.reason.slice(0, 300) },
+  });
 }
 
 /** Mensaje del item bloqueado por presupuesto (prefijo estable `budget_exceeded:`). */

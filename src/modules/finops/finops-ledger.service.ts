@@ -454,6 +454,38 @@ export class FinopsLedgerService {
     });
   }
 
+  /**
+   * V2.1 F2 fix round 1: un CHARGE provisional (`pending`, monto estimado del
+   * usage model) se liquida cuando llega la medición real del proveedor: se
+   * precia `measuredUsage` con el catálogo vigente AL MOMENTO DEL CARGO y se
+   * agrega un ADJUSTMENT por la diferencia (append; repetir = no-op).
+   */
+  async settleMeasuredUsage(
+    originalKey: string,
+    measuredUsage: UsageMeters,
+    reason: string,
+    opts: { recordedBy?: string; metadata?: Record<string, unknown> } = {},
+  ) {
+    nonEmpty(originalKey, 'originalKey');
+    const [orig] = await this.dataSource.query(
+      `select *, amount::text as amount from public.generation_cost_events where idempotency_key = $1`,
+      [originalKey],
+    );
+    if (!orig) throw new FinopsError('ORIGINAL_NOT_FOUND', `no existe el evento ${originalKey}`);
+    if (orig.event_kind !== 'CHARGE') throw new FinopsError('INVALID_INPUT', `${originalKey} no es un CHARGE`);
+    const catalog = await this.loadCatalog(orig.provider, orig.service, orig.model_or_product);
+    const priced = priceUsage(measuredUsage || {}, catalog, {
+      provider: orig.provider,
+      service: orig.service,
+      product: orig.model_or_product,
+      asOf: orig.created_at,
+    });
+    return this.recordAdjustment(originalKey, priced.amount, reason, {
+      recordedBy: opts.recordedBy,
+      metadata: { ...(opts.metadata || {}), measuredUsage, pricingSnapshot: priced.pricingSnapshot },
+    });
+  }
+
   /** Cargo de costo cero por diseño (YouTube: cuota; packaging/render local). */
   async recordZero(input: {
     kind: 'youtube' | 'package';

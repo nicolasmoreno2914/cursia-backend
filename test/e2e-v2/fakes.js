@@ -142,7 +142,8 @@ function syntheticMp4WithMvhd(durationSec, tag = 'fake-mp4') {
 function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp3, pdfPages = 10, readyAfterPolls = 1 }) {
   const st = { gammaPosts: [], gammaGets: [], exports: [], tts: [], llm: [], badAuth: [], seq: 0 };
   const gens = new Map(); // id → {polls}
-  const plan = { gammaPostFail: [], gammaHoldPending: false, gammaFailGeneration: false, gammaNoCredits: false, ttsFail: [], llmShortFirst: 0 };
+  // Un valor numérico en gammaPostFail/ttsFail/llmFail = ese status HTTP; 'drop' = se corta la conexión DESPUÉS de recibir el pedido.
+  const plan = { gammaPostFail: [], gammaHoldPending: false, gammaFailGeneration: false, gammaNoCredits: false, ttsFail: [], llmFail: [], llmShortFirst: 0 };
   let base = null;
   const words = (n, seed) => Array.from({ length: n }, (_, i) => ['proceso', 'equipo', 'seguridad', 'medición', 'ajuste', 'práctica', 'turno', 'planta'][(i + seed) % 8]).join(' ') + '.';
   const srv = http.createServer((rq, rs) => {
@@ -161,6 +162,7 @@ function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp
           const req = JSON.parse(body || '{}');
           st.gammaPosts.push(req);
           const f = plan.gammaPostFail.shift();
+          if (f === 'drop') return rq.socket.destroy();
           if (typeof f === 'number') return json(f, { message: `fake ${f}` });
           const id = `gen_f2_${++st.seq}`;
           gens.set(id, { polls: 0 });
@@ -189,6 +191,7 @@ function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp
         if (rq.headers.authorization !== `Bearer ${openaiKey}`) { st.badAuth.push('openai speech'); return json(401, { error: { message: 'bad key' } }); }
         const req = JSON.parse(body || '{}');
         const f = plan.ttsFail.shift();
+        if (f === 'drop') { st.tts.push({ ...req, failed: 'drop' }); return rq.socket.destroy(); }
         if (typeof f === 'number') { st.tts.push({ ...req, failed: f }); return json(f, { error: { message: `fake ${f}` } }); }
         const rid = `req_f2_${++st.seq}`;
         st.tts.push({ model: req.model, voice: req.voice, chars: String(req.input || '').length, requestId: rid, response_format: req.response_format });
@@ -201,6 +204,9 @@ function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp
       if (rq.method === 'POST' && p === '/v1/messages') {
         if (rq.headers['x-api-key'] !== anthropicKey) { st.badAuth.push('anthropic messages'); return json(401, { type: 'error', error: { message: 'bad key' } }); }
         const req = JSON.parse(body || '{}');
+        const lf = plan.llmFail.shift();
+        if (lf === 'drop') { st.llm.push({ failed: 'drop', model: req.model }); return rq.socket.destroy(); }
+        if (typeof lf === 'number') { st.llm.push({ failed: lf, model: req.model }); return json(lf, { type: 'error', error: { message: `fake ${lf}` } }); }
         const id = `msg_f2_${++st.seq}`;
         const short = plan.llmShortFirst > 0;
         if (short) plan.llmShortFirst--;

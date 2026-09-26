@@ -652,9 +652,12 @@ async function ledgerRows(where = 'true', params = []) {
       const fx = await z.file('files.xml').async('string');
       const names = [...fx.matchAll(/<filename>([^<]*)<\/filename>/g)].map((m) => m[1]);
       ok(names.some((n) => /\.pdf$/.test(n)) && names.some((n) => /\.png$/.test(n)) && names.some((n) => /\.mp3$/.test(n)), 'E4: el MBZ lleva el PDF, la portada PNG y los MP3 de los fakes', names.filter((n) => /\.(pdf|png|mp3)$/.test(n)));
-      const ev = await q(`select provider, operation, cost_source, amount::float8 amount, external_operation_id, recorded_by, item_key from public.generation_cost_events where course_id = $1 and event_kind = 'CHARGE'`, [c.courseId]);
+      // Neto por CHARGE = monto + sus ADJUSTMENT (F2 fix round 1: Gamma reserva pendiente al aceptar y se liquida al terminar).
+      const ev = await q(`select c.provider, c.operation, c.cost_source, c.measurement_status, c.external_operation_id, c.recorded_by, c.item_key,
+                                 (c.amount + coalesce((select sum(a.amount) from public.generation_cost_events a where a.corrects_event_id = c.id), 0))::float8 amount
+                            from public.generation_cost_events c where c.course_id = $1 and c.event_kind = 'CHARGE'`, [c.courseId]);
       const g = ev.filter((e) => e.provider === 'gamma');
-      ok(g.length === 2 && g.every((e) => e.cost_source === 'CALCULATED_FROM_USAGE' && Math.abs(e.amount - 0.42) < 1e-9 && /^gen_f2_/.test(e.external_operation_id)), 'E4 ledger: Gamma = credits.deducted × catálogo (CALCULATED_FROM_USAGE, id = generationId)', g);
+      ok(g.length === 2 && g.every((e) => e.cost_source === 'CALCULATED_FROM_USAGE' && Math.abs(e.amount - 0.42) < 1e-9 && /^gen_f2_/.test(e.external_operation_id)), 'E4 ledger: Gamma = reserva al aceptar liquidada a credits.deducted × catálogo (neto 0.42, CALCULATED_FROM_USAGE, id = generationId)', g);
       const t = ev.filter((e) => e.provider === 'openai');
       ok(t.length >= 3 && t.every((e) => e.cost_source === 'CALCULATED_FROM_USAGE' && e.amount > 0 && /^req_f2_/.test(e.external_operation_id)), 'E4 ledger: TTS medido por segundos de audio (CALCULATED_FROM_USAGE, id = x-request-id)', t);
       const l = ev.filter((e) => e.provider === 'anthropic' && e.recorded_by === 'dynamic-provider-worker');

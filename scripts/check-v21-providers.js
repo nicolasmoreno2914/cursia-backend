@@ -216,7 +216,7 @@ async function pureChecks() {
     }
   });
 
-  await check('puro: worker real sin claves → provider_not_ready (no reintentable) ANTES de llamar; marcador de envío sin generationId → ambiguous_gamma_submission sin reenviar', async () => {
+  await check('puro: worker real sin claves → provider_not_ready (no reintentable) ANTES de llamar; marcador de envío sin generationId → gamma_submit_ambiguous sin reenviar', async () => {
     const fakes = startProviderFakes({ gammaKey: SECRETS.GAMMA_API_KEY, openaiKey: SECRETS.OPENAI_API_KEY, anthropicKey: SECRETS.ANTHROPIC_API_KEY, makePdf: SM.syntheticPdf, makeMp3: SM.syntheticMp3 });
     const urls = await fakes.listen();
     try {
@@ -247,7 +247,7 @@ async function pureChecks() {
         assert(t.calls.fails.length === 1 && t.calls.fails[0].retry === false && need.test(t.calls.fails[0].err), `${type}: ${JSON.stringify(t.calls.fails)}`);
       }
       const amb = mk({ ...base, GAMMA_API_KEY: SECRETS.GAMMA_API_KEY }, { externalSubmitStartedAt: '2026-09-26T00:00:00Z' });
-      await rejectsRe(PW.processProviderItem(amb.deps, amb.item('presentation')), /^ambiguous_gamma_submission/, 'ambiguo');
+      await rejectsRe(PW.processProviderItem(amb.deps, amb.item('presentation')), /^gamma_submit_ambiguous/, 'ambiguo');
       eq([amb.calls.fails[0].retry, amb.calls.completes.length], [false, 0], 'no reintentable');
       eq([fakes.st.gammaPosts.length, fakes.st.tts.length, fakes.st.llm.length], [0, 0, 0], '0 llamadas a los proveedores');
     } finally {
@@ -554,17 +554,18 @@ async function dbChecks() {
       eq(art.metadata.mock, undefined, 'artifact real (no mock)');
     });
 
-    await check('DB ledger Gamma: 1 CHARGE CALCULATED_FROM_USAGE = credits.deducted (42) × precio por crédito del catálogo; external_operation_id = generationId; atribuido al item; idempotente', async () => {
+    await check('DB ledger Gamma (fix round 1): al ACEPTAR → CHARGE pendiente estimado (p90 = 100 créditos × 0.01); al terminar → ADJUSTMENT a credits.deducted (42) ⇒ neto 0.42; external_operation_id = generationId; atribuido; liquidar de nuevo = no-op', async () => {
       const evs = await events(`provider = 'gamma'`, []);
-      eq(evs.length, 1, 'un cargo');
-      const e = evs[0];
-      eq([e.cost_source, e.operation, e.external_operation_id, e.idempotency_key, e.billing_account, e.measurement_status, e.item_key, e.run_id, e.recorded_by],
-        ['CALCULATED_FROM_USAGE', 'gamma.generate', genId1, `gamma:gen:${genId1}`, 'cursia', 'final', `presentation:${C.c1}`, runId, 'dynamic-provider-worker'], 'evento');
-      assert(near(e.amount, 0.42) && Number(e.usage.gamma_credit) === 42, `monto ${e.amount}`);
-      eq(e.metadata.creditsRemaining, 958, 'saldo');
-      const again = await H.recordGammaCharge(ledger, { ownerId: OWNER, itemRunId: e.item_run_id, generationId: genId1, creditsDeducted: 42, creditsRemaining: 958 });
-      eq(again.inserted, false, 're-registro = no-op');
-      eq((await events(`provider = 'gamma'`, [])).length, 1, 'sigue uno');
+      eq(evs.map((x) => x.event_kind), ['CHARGE', 'ADJUSTMENT'], 'reserva + ajuste');
+      const [e, adj] = evs;
+      eq([e.cost_source, e.operation, e.external_operation_id, e.idempotency_key, e.billing_account, e.measurement_status, e.item_key, e.run_id, e.recorded_by, e.metadata.estimatedPending],
+        ['CALCULATED_FROM_USAGE', 'gamma.generate', genId1, `gamma:gen:${genId1}`, 'cursia', 'pending', `presentation:${C.c1}`, runId, 'dynamic-provider-worker', true], 'reserva');
+      assert(near(e.amount, 1.0) && Number(e.usage.gamma_credit) === H.gammaEstimatedCredits(), `reserva ${e.amount}`);
+      eq([adj.corrects_event_id, adj.measurement_status, adj.metadata.reason, Number(adj.metadata.measuredUsage.gamma_credit), adj.metadata.creditsRemaining], [e.id, 'final', 'gamma_credits_measured', 42, 958], 'ajuste');
+      assert(near(Number(e.amount) + Number(adj.amount), 0.42), `neto ${Number(e.amount) + Number(adj.amount)}`);
+      const again = await H.settleGammaCharge(ledger, { ownerId: OWNER, itemRunId: e.item_run_id, generationId: genId1, creditsDeducted: 42, creditsRemaining: 958 });
+      eq((await events(`provider = 'gamma'`, [])).length, 2, 'liquidar otra vez no agrega filas');
+      assert(again === 'settled', again);
     });
 
     await check('DB Gamma reanudación: generación lenta → gamma_timeout reintentable CON el generationId guardado; el re-claim sigue polleando la MISMA generación (0 reenvíos)', async () => {
@@ -578,6 +579,12 @@ async function dbChecks() {
       const gid = row.output_summary.external.gammaGenerationId;
       assert(gid && row.output_summary.externalSubmitStartedAt, 'id + marcador persistidos');
       eq(fakes.st.gammaPosts.length, 2, 'un envío más (C2)');
+      // Fix round 1 (m1): el timeout deja la reserva PENDIENTE en el ledger y el presupuesto la cuenta.
+      const pend = await events(`idempotency_key = $1`, [`gamma:gen:${gid}`]);
+      eq(pend.map((x) => [x.event_kind, x.measurement_status]), [['CHARGE', 'pending']], 'reserva pendiente tras el timeout');
+      const actual = await budget.runActual(runId);
+      const sumRun = (await ds.query(`select coalesce(sum(amount),0)::text t from public.generation_cost_events where run_id = $1`, [runId]))[0].t;
+      assert(near(actual, sumRun) && Number(actual) >= 1.0 + 0.42, `runActual ${actual} incluye la reserva`);
       fakes.plan.gammaHoldPending = false;
       await ds.query(`update public.generation_item_runs set next_retry_at = now() where id = $1`, [row.id]);
       const again = await claimProvider(runId, 'presentation');
@@ -586,7 +593,8 @@ async function dbChecks() {
       row = await itemRow(runId, item.itemKey);
       eq(row.status, 'completed', `completado (${row.error})`);
       eq(fakes.st.gammaPosts.length, 2, 'NINGÚN reenvío');
-      eq((await events(`provider = 'gamma' and external_operation_id = $1`, [gid])).length, 1, 'un cargo por la generación');
+      const gev = await events(`provider = 'gamma' and external_operation_id = $1`, [gid]);
+      eq(gev.map((x) => x.event_kind), ['CHARGE', 'ADJUSTMENT'], 'una reserva + su liquidación');
     });
 
     await check('DB TTS bienvenida: texto `welcome` del course_intro (sin LLM) → OpenAI TTS falso; MP3 real subido; duración medida (mp3DurationSeconds) en metadata; ledger por x-request-id', async () => {
@@ -644,6 +652,11 @@ async function dbChecks() {
       let row = await itemRow(runId, item.itemKey);
       eq(row.status, 'retrying', `estado ${row.status} ${row.error}`);
       assert(/^tts_failed/.test(row.error) && row.output_summary.audiobookScript, 'guion guardado');
+      // Fix round 1: un 5xx DESPUÉS de enviar = gasto posible → reserva pendiente (clave por item/gen/chunk/intento).
+      const resv = await events(`item_run_id = $1 and provider = 'openai'`, [row.id]);
+      eq(resv.map((x) => [x.event_kind, x.measurement_status, x.metadata.ambiguous, x.idempotency_key]),
+        [['CHARGE', 'pending', true, `tts:${row.id}:1:0:1`]], 'reserva TTS');
+      assert(Number(resv[0].amount) > 0, 'reserva con monto estimado');
       const llmAfterFirst = fakes.st.llm.length;
       eq(llmAfterFirst - llm0, 1, 'una llamada LLM');
       await ds.query(`update public.generation_item_runs set next_retry_at = now() where id = $1`, [row.id]);
@@ -709,9 +722,112 @@ async function dbChecks() {
       assert(/OPENAI_API_KEY/.test(row.error) && !row.error.includes(SECRETS.OPENAI_API_KEY), row.error);
     });
 
+    // ═══ Fix round 1: envíos ambiguos / rechazos definitivos (curso aparte, sin videos) ═══
+    const A2 = await makeCourse('Curso ambigüedad F2', { videos: false });
+    let runA2 = null;
+    {
+      setReady();
+      const e = await rejectsRe(runs.startRun(A2.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' }), /^budget_approval_required/, 'aprobación A2', 409);
+      await budget.adminAuthorize({ courseId: A2.cid, estimateId: e.getResponse().estimateId, authorizedBudget: '500', approvedBy: 'admin@cursia.test' });
+      runA2 = (await runs.startRun(A2.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' })).run.id;
+      await seedDependency(runA2, `content:${A2.c1}`, 'dynamic_content_md', CONTENT_MD('Bombas'), 'text/markdown');
+      await seedDependency(runA2, `content:${A2.c2}`, 'dynamic_content_md', CONTENT_MD('Válvulas'), 'text/markdown');
+      await seedDependency(runA2, `course_intro:${A2.cid}`, 'dynamic_course_intro_json', JSON.stringify({ welcome: 'Hola y bienvenida al curso.' }), 'application/json');
+    }
+    const gammaEv = (itemRunId) => events(`item_run_id = $1 and provider = 'gamma'`, [itemRunId]);
+
+    await check('DB Gamma 5xx en el envío (m2) → gamma_submit_ambiguous NO reintentable + reserva pendiente ambigua (el presupuesto la cuenta); un retry común NO reenvía; solo resubmitProvider explícito pide otra generación', async () => {
+      fakes.plan.gammaPostFail = [502];
+      const posts0 = fakes.st.gammaPosts.length;
+      const item = await claimProvider(runA2, 'presentation');
+      await rejectsRe(PW.processProviderItem(workerDeps(), item), /^gamma_submit_ambiguous/, '502');
+      let row = await itemRow(runA2, item.itemKey);
+      eq([row.status, fakes.st.gammaPosts.length - posts0], ['failed', 1], 'failed tras 1 envío');
+      assert(/^gamma_submit_ambiguous: .*HTTP 502/.test(row.error) && row.output_summary.externalSubmitStartedAt, `marcador conservado: ${row.error}`);
+      let ev = await gammaEv(row.id);
+      eq(ev.map((x) => [x.event_kind, x.measurement_status, x.metadata.ambiguous, x.external_operation_id]), [['CHARGE', 'pending', true, null]], 'reserva ambigua');
+      assert(near(ev[0].amount, 1.0) && /^gamma:gen:ambiguous-/.test(ev[0].idempotency_key), `reserva ${ev[0].amount} ${ev[0].idempotency_key}`);
+      const actual = await budget.runActual(runA2);
+      assert(Number(actual) >= 1.0, `runActual ${actual} cuenta la reserva`);
+      // Retry común: el marcador sigue → ambiguo otra vez, 0 envíos, la reserva NO se duplica.
+      await runs.retryItem(A2.cid, OWNER, 1, runA2, item.itemKey);
+      const again = await claimProvider(runA2, 'presentation');
+      await rejectsRe(PW.processProviderItem(workerDeps(), again), /^gamma_submit_ambiguous/, 'retry común');
+      eq(fakes.st.gammaPosts.length - posts0, 1, 'NINGÚN reenvío automático');
+      eq((await gammaEv(row.id)).length, 1, 'reserva idempotente');
+      // Decisión humana explícita: reenvío.
+      await rejectsRe(runs.retryItem(A2.cid, OWNER, 1, runA2, `audio_welcome:${A2.cid}`, false, true), /resubmitProvider solo aplica|Solo se puede reintentar/, 'solo presentation');
+      await runs.retryItem(A2.cid, OWNER, 1, runA2, item.itemKey, false, true);
+      row = await itemRow(runA2, item.itemKey);
+      assert(!row.output_summary.externalSubmitStartedAt && row.output_summary.previousExternals.length === 1, 'marcador archivado');
+      const third = await claimProvider(runA2, 'presentation');
+      await PW.processProviderItem(workerDeps(), third);
+      row = await itemRow(runA2, item.itemKey);
+      eq([row.status, fakes.st.gammaPosts.length - posts0], ['completed', 2], 'nueva generación tras la decisión');
+      ev = await gammaEv(row.id);
+      eq(ev.filter((x) => x.event_kind === 'CHARGE').length, 2, 'reserva ambigua (queda) + cargo de la nueva generación');
+    });
+
+    await check('DB Gamma 4xx definitivo (429) → marcador limpio, reintentable, SIN reserva; conexión cortada tras enviar → ambiguo con reserva (m2)', async () => {
+      fakes.plan.gammaPostFail = [429];
+      const posts0 = fakes.st.gammaPosts.length;
+      const item = await claimProvider(runA2, 'presentation');
+      assert(item && item.chapterId === A2.c2, 'claim C2');
+      await PW.processProviderItem(workerDeps(), item);
+      let row = await itemRow(runA2, item.itemKey);
+      eq(row.status, 'retrying', `429 reintentable (${row.error})`);
+      assert(/^gamma_submit_failed/.test(row.error) && row.output_summary.externalSubmitStartedAt === null, 'marcador limpio');
+      eq((await gammaEv(row.id)).length, 0, 'sin reserva por un rechazo definitivo');
+      fakes.plan.gammaPostFail = ['drop'];
+      await ds.query(`update public.generation_item_runs set next_retry_at = now() where id = $1`, [row.id]);
+      const again = await claimProvider(runA2, 'presentation');
+      await rejectsRe(PW.processProviderItem(workerDeps(), again), /^gamma_submit_ambiguous/, 'drop');
+      row = await itemRow(runA2, item.itemKey);
+      eq([row.status, fakes.st.gammaPosts.length - posts0], ['failed', 2], 'failed, sin más envíos');
+      const ev = await gammaEv(row.id);
+      eq(ev.map((x) => [x.measurement_status, x.metadata.ambiguous]), [['pending', true]], 'reserva ambigua');
+    });
+
+    await check('DB TTS: conexión cortada tras enviar → reserva pendiente + reintento acotado; 4xx (400) definitivo → sin reserva', async () => {
+      fakes.plan.ttsFail = ['drop'];
+      const item = await claimProvider(runA2, 'audio_welcome');
+      await PW.processProviderItem(workerDeps(), item);
+      let row = await itemRow(runA2, item.itemKey);
+      eq(row.status, 'retrying', `drop reintentable (${row.error})`);
+      let ev = await events(`item_run_id = $1 and provider = 'openai'`, [row.id]);
+      eq(ev.map((x) => [x.measurement_status, x.metadata.ambiguous, x.idempotency_key]), [['pending', true, `tts:${row.id}:1:0:1`]], 'reserva');
+      fakes.plan.ttsFail = [400];
+      await ds.query(`update public.generation_item_runs set next_retry_at = now() where id = $1`, [row.id]);
+      const again = await claimProvider(runA2, 'audio_welcome');
+      await rejectsRe(PW.processProviderItem(workerDeps(), again), /tts_failed/, '400 definitivo');
+      row = await itemRow(runA2, item.itemKey);
+      eq(row.status, 'failed', '400 no reintentable');
+      ev = await events(`item_run_id = $1 and provider = 'openai'`, [row.id]);
+      eq(ev.length, 1, 'el 400 no agrega reserva');
+    });
+
+    await check('DB LLM server-side: conexión cortada tras enviar → reserva pendiente (clave sintética, output = max_tokens) + reintento acotado; el re-claim completa con el cargo medido', async () => {
+      fakes.plan.llmFail = ['drop'];
+      const item = await claimProvider(runA2, 'audiobook_chapter');
+      await PW.processProviderItem(workerDeps(), item);
+      let row = await itemRow(runA2, item.itemKey);
+      eq(row.status, 'retrying', `drop reintentable (${row.error})`);
+      let ev = await events(`item_run_id = $1 and provider = 'anthropic'`, [row.id]);
+      eq(ev.map((x) => [x.measurement_status, x.metadata.ambiguous, x.operation, x.idempotency_key, Number(x.usage.output_tokens)]),
+        [['pending', true, 'llm.audiobook_script', `anthropic:msg:unmeasured-${row.id}-g1-a1-main`, 1500]], 'reserva LLM');
+      eq((await events(`item_run_id = $1 and provider = 'openai'`, [row.id])).length, 0, 'sin TTS');
+      await ds.query(`update public.generation_item_runs set next_retry_at = now() where id = $1`, [row.id]);
+      const again = await claimProvider(runA2, 'audiobook_chapter');
+      await PW.processProviderItem(workerDeps(), again);
+      row = await itemRow(runA2, item.itemKey);
+      eq(row.status, 'completed', `completado (${row.error})`);
+      ev = await events(`item_run_id = $1 and provider = 'anthropic'`, [row.id]);
+      eq(ev.map((x) => x.measurement_status), ['pending', 'final'], 'reserva del intento 1 + cargo medido del intento 2');
+    });
+
     await check('DB netguard/fakes: todas las llamadas a proveedores fueron a 127.0.0.1 con SU clave (0 rechazos de auth en los fakes)', async () => {
       eq(fakes.st.badAuth, [], 'claves correctas');
-      assert(fakes.st.gammaPosts.length === 2 && fakes.st.exports.length === 2 && fakes.st.tts.length >= 4 && fakes.st.llm.length === 3, JSON.stringify({ g: fakes.st.gammaPosts.length, e: fakes.st.exports.length, t: fakes.st.tts.length, l: fakes.st.llm.length }));
+      assert(fakes.st.gammaPosts.length >= 2 && fakes.st.exports.length >= 2 && fakes.st.tts.length >= 4 && fakes.st.llm.filter((x) => !x.failed).length >= 3, JSON.stringify({ g: fakes.st.gammaPosts.length, e: fakes.st.exports.length, t: fakes.st.tts.length, l: fakes.st.llm.length }));
     });
 
     await check('DB secretos: ninguna clave aparece en logs capturados, errores de items, output_summary, metadata de artifacts ni del ledger', async () => {
