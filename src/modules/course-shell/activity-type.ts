@@ -7,6 +7,10 @@
  * frontend la replica (`dynActivityTypeForChapter`) y el backend la impone al
  * completar el item (un payload de otro tipo se rechaza).
  *
+ * R-011: 'singlechoiceset' es un tipo de dato válido pero NO forma parte de
+ * la rotación de actividades calificadas (Moodle core no lo califica) — ver
+ * ACTIVITY_H5P_ROTATION.
+ *
  * Payload (artifact `dynamic_h5p_params_json`):
  *   { type: 'questionset'|'singlechoiceset'|'dragtext'|'blanks', data }
  * `data` es la entrada de R7. `itemKey` y `passPercentage` los pone CURSIA
@@ -25,11 +29,34 @@ import {
 
 export type H5pActivityType = 'questionset' | 'singlechoiceset' | 'dragtext' | 'blanks';
 
-/** Rotación canónica (orden vinculante; el frontend la replica tal cual). */
+/**
+ * Tipos H5P reconocidos por el validador de payload (incluye 'singlechoiceset',
+ * que sigue siendo un tipo válido de dato pero YA NO es asignable a una
+ * actividad calificada — ver ACTIVITY_H5P_ROTATION).
+ */
+const KNOWN_H5P_TYPES: readonly H5pActivityType[] = Object.freeze([
+  'questionset',
+  'singlechoiceset',
+  'dragtext',
+  'blanks',
+]);
+
+/**
+ * Rotación canónica de actividades CALIFICADAS (orden vinculante; el frontend
+ * la replica tal cual).
+ *
+ * R-011 (evidencia técnica de un player Moodle 4.5 real): Moodle core NO
+ * califica H5P.SingleChoiceSet 1.11 — el intento queda guardado sin disparar
+ * completion/grade. Por eso 'singlechoiceset' se excluyó de esta rotación.
+ * El validador de SCS (`validateSingleChoiceSetInput`) se conserva por si se
+ * usa más adelante como actividad NO calificada, pero para una actividad
+ * calificada es inalcanzable: `validateH5pActivityPayload` rechaza cualquier
+ * payload de tipo 'singlechoiceset' con H5P_TYPE_NOT_GRADABLE antes de llegar
+ * a compararlo contra la rotación.
+ */
 export const ACTIVITY_H5P_ROTATION: readonly H5pActivityType[] = Object.freeze([
   'questionset',
   'dragtext',
-  'singlechoiceset',
   'blanks',
 ]);
 
@@ -85,8 +112,19 @@ export function validateH5pActivityPayload(
     if (k !== 'type' && k !== 'data') errors.push({ path: `$.${k}`, code: 'UNKNOWN_FIELD', message: `campo no permitido "${k}"` });
   }
   const type = payload.type;
-  if (typeof type !== 'string' || !(ACTIVITY_H5P_ROTATION as readonly string[]).includes(type)) {
+  if (typeof type !== 'string' || !(KNOWN_H5P_TYPES as readonly string[]).includes(type)) {
     errors.push({ path: '$.type', code: 'ACTIVITY_TYPE_UNKNOWN', message: `tipo desconocido ${JSON.stringify(type)}` });
+    return { ok: false, errors };
+  }
+  if (type === 'singlechoiceset') {
+    // R-011: Moodle core no dispara completion/grade para H5P.SingleChoiceSet
+    // 1.11 — no es asignable a una actividad calificada, sin importar qué
+    // pida la rotación para este capítulo.
+    errors.push({
+      path: '$.type',
+      code: 'H5P_TYPE_NOT_GRADABLE',
+      message: 'singlechoiceset (H5P.SingleChoiceSet) no es calificable en Moodle core (R-011); no puede usarse en una actividad calificada',
+    });
     return { ok: false, errors };
   }
   if (type !== expectedType) {

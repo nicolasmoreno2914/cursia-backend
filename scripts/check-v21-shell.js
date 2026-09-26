@@ -163,7 +163,7 @@ async function pureChecks() {
   await check('facts 2 módulos: conteos, capítulos (4 combinaciones V/A), módulos, evaluación, audio y horas', () => {
     eq(f2.counts, { modules: 2, chapters: 4, videos: 2, activities: 2, activitiesByVariant: { h5p: 2, scorm: 0 }, exams: 1, finalExam: true, evaluations: 2 }, 'counts');
     eq(f2.chapters.map((c) => [c.number, c.moduleNumber, c.indexInModule, c.videoEnabled, c.activityEnabled, c.activityVariant, c.activityType, c.slideCount]),
-      [[1, 1, 1, true, true, 'h5p', 'questionset', 8], [2, 1, 2, true, false, null, null, 9], [3, 2, 1, false, true, 'h5p', 'singlechoiceset', 10], [4, 2, 2, false, false, null, null, 8]], 'chapters');
+      [[1, 1, 1, true, true, 'h5p', 'questionset', 8], [2, 1, 2, true, false, null, null, 9], [3, 2, 1, false, true, 'h5p', 'blanks', 10], [4, 2, 2, false, false, null, null, 8]], 'chapters');
     eq(f2.modules.map((m) => [m.number, m.title, m.chapterNumbers, m.examEnabled, m.examQuestionCount]),
       [[1, 'Bases del servicio', [1, 2], true, 12], [2, 'Relación con el cliente', [3, 4], false, null]], 'modules');
     eq(f2.finalExam, { enabled: true, questionCount: 20 }, 'final');
@@ -220,10 +220,10 @@ async function pureChecks() {
     throwsRe(() => factsOf(c2, { hours: -1 }), /hours/, 'horas negativas');
   });
 
-  await check('activityTypeForChapter: rotación [questionset, dragtext, singlechoiceset, blanks] y entrada inválida', () => {
+  await check('activityTypeForChapter: rotación [questionset, dragtext, blanks] (R-011: sin singlechoiceset) y entrada inválida', () => {
     eq([1, 2, 3, 4, 5, 6, 7, 8, 9].map(S.activityTypeForChapter),
-      ['questionset', 'dragtext', 'singlechoiceset', 'blanks', 'questionset', 'dragtext', 'singlechoiceset', 'blanks', 'questionset'], 'rotación');
-    eq(S.ACTIVITY_H5P_ROTATION, ['questionset', 'dragtext', 'singlechoiceset', 'blanks'], 'constante');
+      ['questionset', 'dragtext', 'blanks', 'questionset', 'dragtext', 'blanks', 'questionset', 'dragtext', 'blanks'], 'rotación');
+    eq(S.ACTIVITY_H5P_ROTATION, ['questionset', 'dragtext', 'blanks'], 'constante');
     for (const bad of [0, -1, 1.5, '1', null]) throwsRe(() => S.activityTypeForChapter(bad), /ACTIVITY_TYPE_INVALID_CHAPTER/, `chapter ${bad}`);
   });
 
@@ -442,15 +442,21 @@ async function pureChecks() {
     throwsRe(() => S.validateModuleIntroV3({}, { chapterIds: [] }), /MODULE_INTRO_EXPECT_INVALID/, 'expect vacío');
   });
 
-  await check('activity h5p: payload válido para los 4 tipos; tipo ≠ rotación, desconocido, campos de Cursia y data inválida se rechazan', () => {
-    const typeForN = { questionset: 1, dragtext: 2, singlechoiceset: 3, blanks: 4 };
+  await check('activity h5p: payload válido para los 3 tipos calificados; tipo ≠ rotación, desconocido, campos de Cursia y data inválida se rechazan', () => {
+    const typeForN = { questionset: 1, dragtext: 2, blanks: 3 };
     for (const [t, n] of Object.entries(typeForN)) {
       eq(S.validateH5pActivityPayload(F.h5pPayload(t), { chapterNumber: n, itemKey: `activity:ch${n}` }), { ok: true, errors: [] }, t);
-      eq(S.validateH5pActivityPayload(F.h5pPayload(t), { chapterNumber: n + 4, itemKey: `activity:ch${n}` }).ok, true, `${t} (vuelta 2)`);
+      eq(S.validateH5pActivityPayload(F.h5pPayload(t), { chapterNumber: n + 3, itemKey: `activity:ch${n}` }).ok, true, `${t} (vuelta 2)`);
     }
     const r1 = S.validateH5pActivityPayload(F.h5pPayload('dragtext'), { chapterNumber: 1, itemKey: 'activity:ch1' });
     eq(codes(r1), ['ACTIVITY_TYPE_MISMATCH'], 'mismatch');
     eq(codes(S.validateH5pActivityPayload({ type: 'flashcards', data: {} }, { chapterNumber: 1, itemKey: 'a:1' })), ['ACTIVITY_TYPE_UNKNOWN'], 'desconocido');
+    // R-011: singlechoiceset es un tipo conocido pero NUNCA calificable — rechazo
+    // explícito H5P_TYPE_NOT_GRADABLE, incluso si el capítulo pidiera otro tipo
+    // o si por coincidencia se sobreescribiera el `type` esperado.
+    for (const n of [1, 2, 3]) {
+      eq(codes(S.validateH5pActivityPayload(F.h5pPayload('singlechoiceset'), { chapterNumber: n, itemKey: `a:${n}` })), ['H5P_TYPE_NOT_GRADABLE'], `singlechoiceset no calificable (cap ${n})`);
+    }
     // Forma del ejecutor R11b: data = entrada COMPLETA de R7 (Cursia pone itemKey y passPercentage).
     const full = F.h5pPayload('questionset'); full.data.itemKey = 'a:1'; full.data.passPercentage = 60;
     eq(S.validateH5pActivityPayload(full, { chapterNumber: 1, itemKey: 'a:1' }), { ok: true, errors: [] }, 'entrada completa de R7');
@@ -461,7 +467,7 @@ async function pureChecks() {
     const dtPass = F.h5pPayload('dragtext'); dtPass.data.passPercentage = 70;
     eq(codes(S.validateH5pActivityPayload(dtPass, { chapterNumber: 2, itemKey: 'a:2' })), ['H5P_INPUT_INVALID'], 'passPercentage en DragText');
     const badData = F.h5pPayload('blanks'); badData.data.questions = ['Sin ningún hueco en la frase.'];
-    eq(codes(S.validateH5pActivityPayload(badData, { chapterNumber: 4, itemKey: 'a:4' })), ['H5P_INPUT_INVALID'], 'data inválida (R7)');
+    eq(codes(S.validateH5pActivityPayload(badData, { chapterNumber: 3, itemKey: 'a:3' })), ['H5P_INPUT_INVALID'], 'data inválida (R7)');
     const html = F.h5pPayload('questionset'); html.data.title = '<b>x</b>';
     eq(codes(S.validateH5pActivityPayload(html, { chapterNumber: 1, itemKey: 'a:1' })), ['H5P_INPUT_INVALID'], 'HTML en data');
     eq(codes(S.validateH5pActivityPayload([], { chapterNumber: 1, itemKey: 'a:1' })), ['NOT_OBJECT'], 'no objeto');
@@ -495,7 +501,7 @@ async function pureChecks() {
       [{ type: 'module_intro', itemKey: 'module_intro:m', moduleChapterIds: ids }, JSON.stringify(F.moduleIntroFixture(c2.manifest, 0))],
       [{ type: 'experience', itemKey: 'experience:c1', chapterId: 'c1' }, JSON.stringify(F.experienceFor('c1'))],
       [{ type: 'video_interactions', itemKey: 'video_interactions:c1', video: { videoItemKey: 'video:c1', durationSec: 468 } }, JSON.stringify(vdoc)],
-      [{ type: 'activity', variant: 'h5p', itemKey: 'activity:c3', chapterNumber: 3 }, JSON.stringify(F.h5pPayload('singlechoiceset'))],
+      [{ type: 'activity', variant: 'h5p', itemKey: 'activity:c3', chapterNumber: 3 }, JSON.stringify(F.h5pPayload('blanks'))],
       [{ type: 'final_exam', itemKey: 'final_exam:1' }, F.FINAL_GIFT],
     ];
     for (const [ctx, text] of ok) eq(V(ctx, text).ok, true, `válido ${ctx.type}`);
