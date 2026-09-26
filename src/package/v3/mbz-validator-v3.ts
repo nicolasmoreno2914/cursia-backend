@@ -318,9 +318,16 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       add('COMPLETION', a.dir, `completion ${md.completion}/${md.completiongradeitemnumber}/${md.completionpassgrade} ≠ 2/0/1`);
     }
   }
+  // F1 (I3): en un curso sin nota el Libro Guía se completa por vista (criterio del curso); el resto, 0.
+  const viewCompletion = (a: ParsedActivity) => resolved.withoutGrades === true && a.modname === 'resource' && a.idnumber === 'cv3:shell:libro';
   for (const a of acts.filter((x) => !GRADED.has(x.modname))) {
-    if (a.module.completion !== '0') add('COMPLETION', a.dir, `módulo no calificable con completion ${a.module.completion}`);
+    if (viewCompletion(a)) {
+      if (a.module.completion !== '2' || a.module.completionview !== '1') {
+        add('COMPLETION', a.dir, `Libro Guía de un curso sin nota con completion ${a.module.completion}/${a.module.completionview} ≠ 2/1`);
+      }
+    } else if (a.module.completion !== '0') add('COMPLETION', a.dir, `módulo no calificable con completion ${a.module.completion}`);
   }
+  if (resolved.withoutGrades === true && gradedActs.length > 0) add('STRUCTURE', 'graded', `curso sin nota con ${gradedActs.length} ítem(s) calificable(s)`);
   const practice = gradedActs.filter((g) => g.kind === 'activity' || g.kind === 'video').length;
   const expectedPractice = facts.counts.activities + facts.counts.videos;
   if (practice !== expectedPractice) add('STRUCTURE', 'graded', `ítems de práctica ${practice} ≠ facts ${expectedPractice}`);
@@ -330,8 +337,11 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   // ── completion del curso ──
   const comp = (await text('completion.xml')) ?? '';
   const crit = blocks(comp, 'course_completion_criteria').map((b) => ({ type: num(tag(b, 'criteriatype')), mi: num(tag(b, 'moduleinstance')), gp: tag(b, 'gradepass') }));
-  const wantCrit = completionCriteriaFor(gradedActs.map((g) => ({ moduleId: g.a.mid, modname: g.a.modname as 'quiz', kind: g.kind })), resolved.courseCompletion)
-    .map((c) => c.moduleId);
+  const wantCrit = resolved.withoutGrades === true
+    ? acts.filter(viewCompletion).map((a) => a.mid)
+    : completionCriteriaFor(gradedActs.map((g) => ({ moduleId: g.a.mid, modname: g.a.modname as 'quiz', kind: g.kind })), resolved.courseCompletion)
+      .map((c) => c.moduleId);
+  if (resolved.withoutGrades === true && wantCrit.length !== 1) add('COURSE_COMPLETION', 'completion.xml', `curso sin nota: se esperaba el Libro Guía como criterio (hay ${wantCrit.length})`);
   const gotCrit = crit.filter((c) => c.type === 4).map((c) => c.mi);
   if (JSON.stringify(gotCrit) !== JSON.stringify(wantCrit)) add('COURSE_COMPLETION', 'completion.xml', `criterios ${gotCrit.join(',')} ≠ ${wantCrit.join(',')}`);
   const gradeCrit = crit.filter((c) => c.type === 6);

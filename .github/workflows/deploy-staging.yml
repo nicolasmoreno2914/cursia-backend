@@ -111,6 +111,9 @@ jobs:
       - name: Check V2.1 R12 empaque v3 (builder + validador §Q.8 + worker con fakes; puro, la restauración en Moodle corre local)
         run: node scripts/check-v21-packaging-v3.js
 
+      - name: Check V2.1 F1 perfiles (pesos normalizados / curso sin nota, 409 al arrancar, paleta → presentación; puro)
+        run: node scripts/check-v21-f1-profiles.js
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh

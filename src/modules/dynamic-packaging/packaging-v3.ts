@@ -11,9 +11,9 @@
  *    + output_summary (sha del contenido validado, review G5 M7).
  *  - `loadPackagingProfilesV3`: perfil de evaluación y de presentación
  *    VIGENTES (última versión de `course_profiles`, o el default). El tema de
- *    un curso sin perfil: fallback de paleta legacy SOLO si el curso viene de
- *    v1/v2 (tiene un Manifest rulesVersion < 3) y trae `metadata.paletteId`;
- *    si no, el default v3 aula-clara/light.
+ *    un curso sin perfil (F1/I4): derivado de la paleta guardada con el curso
+ *    (`metadata.paletteId`/`pal.id`) para TODO curso; si no hay, el default v3
+ *    aula-clara/light con el aviso `presentation_profile_defaulted`.
  *  - `packageReuseHashV3`: builder v3 + sha del Manifest + ids de artifacts
  *    + sha del tema + sha del perfil de evaluación + versión del perfil H5P +
  *    versión del renderer + versión de Moodle. Cambiar el tema o la nota
@@ -33,7 +33,7 @@ import { frozenVideoDeliveryOf, checkYoutubeDeliveryUrl } from '../dynamic-gener
 import { GuardArtifact, MockArtifactInRealRunError, assertNoMockArtifactsForRealPackage } from './packaging-guards';
 import { frozenProviderModesOf, providerKindOfArtifactType } from '../dynamic-generation/provider-modes';
 import { assertSafeStoragePath } from '../artifacts/artifacts.service';
-import { assertCategoriesPopulated } from '../../package/assessment';
+import { ResolvedAssessment, assertCategoriesPopulated, assessmentItemCountsFromManifest } from '../../package/assessment';
 import {
   AssessmentProfile,
   PresentationProfile,
@@ -46,13 +46,19 @@ import {
 import {
   LEGACY_PALETTES,
   PresentationProfileInput,
-  legacyPaletteThemeFallback,
+  presentationProfileFromPaletteId,
   resolveTheme,
   themeSha256,
 } from '../theme-engine';
 import { PackagingPlanV3 } from './packaging-plan-v3';
 import type { DynamicPackageContentsV3, ActivityContentV3 } from '../../package/dynamic-mbz-builder-v3';
-import { DYNAMIC_MBZ_BUILDER_VERSION_V3, VC_RENDERER_VERSION } from '../../package/dynamic-mbz-builder-v3';
+import {
+  AssessmentPackageSummary,
+  DYNAMIC_MBZ_BUILDER_VERSION_V3,
+  VC_RENDERER_VERSION,
+  assessmentPackageSummary,
+  assessmentPackageWarnings,
+} from '../../package/dynamic-mbz-builder-v3';
 import { h5pProfileVersion } from '../../package/h5p';
 import { resolveAssessment } from '../../package/assessment';
 import { syntheticCoverPng, syntheticMp3, syntheticPdf } from '../../package/v3/synthetic-media';
@@ -237,7 +243,10 @@ export function staleWarningsV3(byItem: Map<string, ResolvedItemV3>): V3StaleWar
 
 // ─── Perfiles y tema ───────────────────────────────────────────────────────
 
-export type PresentationSource = 'profile' | 'legacy_palette' | 'default_v3';
+export type PresentationSource = 'profile' | 'palette' | 'default_v3';
+
+/** F1 (I4): aviso del paquete cuando el tema cae al default aula-clara/light (sin perfil ni paleta). */
+export const PRESENTATION_PROFILE_DEFAULTED = 'presentation_profile_defaulted';
 
 export interface ResolvedPackagingTheme {
   input: PresentationProfileInput;
@@ -245,13 +254,17 @@ export interface ResolvedPackagingTheme {
 }
 
 /**
- * Tema del paquete: el perfil de presentación vigente; sin perfil, la paleta
- * legacy SOLO para cursos migrados de v1/v2 que la tengan; si no, el default
- * v3 (aula-clara/light). Una paleta legacy desconocida falla fuerte (R1).
+ * Tema del paquete: el perfil de presentación vigente; sin perfil (F1/I4), el
+ * derivado de la paleta guardada con el curso para CUALQUIER curso
+ * (`presentationProfileFromPaletteId`: claro → aula-clara/light, el resto →
+ * oscuro-premium/dark, brandSeed de la paleta); si no hay paleta, el default
+ * v3 (aula-clara/light) — el llamador registra `presentation_profile_defaulted`.
+ * Una paleta desconocida falla fuerte (R1). `v2Migrated` ya no cambia nada
+ * (se acepta por compatibilidad).
  */
 export function resolvePackagingTheme(p: {
   presentationProfile: PresentationProfile | null;
-  v2Migrated: boolean;
+  v2Migrated?: boolean;
   legacyPaletteId?: string | null;
 }): ResolvedPackagingTheme {
   if (p.presentationProfile) {
@@ -266,8 +279,8 @@ export function resolvePackagingTheme(p: {
       } as PresentationProfileInput,
     };
   }
-  if (p.v2Migrated && typeof p.legacyPaletteId === 'string' && p.legacyPaletteId.trim()) {
-    return { source: 'legacy_palette', input: legacyPaletteThemeFallback(p.legacyPaletteId.trim()) };
+  if (typeof p.legacyPaletteId === 'string' && p.legacyPaletteId.trim()) {
+    return { source: 'palette', input: presentationProfileFromPaletteId(p.legacyPaletteId.trim()) as PresentationProfileInput };
   }
   const d = defaultPresentationProfile();
   return { source: 'default_v3', input: { themeFamily: d.themeFamily, mode: d.mode, themeVersion: d.themeVersion } as PresentationProfileInput };
@@ -303,26 +316,19 @@ export async function loadPackagingProfilesV3(q: QueryExecutor, courseId: number
   const p = rows.find((r) => r.kind === 'presentation');
   const assessment = a ? normalizeAssessmentProfile(parseJson(a.data)) : defaultAssessmentProfile({ finalExam });
   const presentation = p ? normalizePresentationProfile(parseJson(p.data)) : null;
-  let v2Migrated = false;
   let legacyPaletteId: string | null = null;
   if (!presentation) {
-    const [mc] = await q.query(
-      `select count(*)::int as n from public.course_generation_manifests where course_id = $1 and rules_version < 3`,
-      [courseId],
-    );
-    v2Migrated = Number(mc?.n ?? 0) > 0;
-    if (v2Migrated) {
-      const [c] = await q.query(`select metadata from public.courses where id = $1`, [courseId]);
-      legacyPaletteId = legacyPaletteIdOf(c?.metadata);
-      if (legacyPaletteId && !LEGACY_PALETTES.some((x) => x.id === legacyPaletteId)) {
-        throw new Error(
-          `THEME_INVALID: el curso #${courseId} (migrado de v2) tiene la paleta legacy desconocida "${legacyPaletteId}"; ` +
-            'guardá un perfil de presentación para empaquetarlo.',
-        );
-      }
+    // F1 (I4): la paleta guardada con el curso aplica a TODO curso sin perfil (no solo a los migrados).
+    const [c] = await q.query(`select metadata from public.courses where id = $1`, [courseId]);
+    legacyPaletteId = legacyPaletteIdOf(c?.metadata);
+    if (legacyPaletteId && !LEGACY_PALETTES.some((x) => x.id === legacyPaletteId)) {
+      throw new Error(
+        `THEME_INVALID: el curso #${courseId} tiene la paleta desconocida "${legacyPaletteId}"; ` +
+          'guardá un perfil de presentación ("Diseño y evaluación") para empaquetarlo.',
+      );
     }
   }
-  const theme = resolvePackagingTheme({ presentationProfile: presentation, v2Migrated, legacyPaletteId });
+  const theme = resolvePackagingTheme({ presentationProfile: presentation, legacyPaletteId });
   return {
     assessment,
     assessmentVersion: a ? Number(a.version) : 0,
@@ -617,6 +623,24 @@ export interface PreparedV3Package {
   /** Clave de reuse v3 (se guarda como `sourceIdsHash` en el job y en el artifact dynamic_mbz). */
   sourceIdsHash: string;
   staleWarnings: V3StaleWarning[];
+  /** F1 (I3): evaluación resuelta contra los ítems del Manifest (pesos normalizados / sin nota). */
+  resolved: ResolvedAssessment;
+  /** F1: lo que el resumen del paquete registra de la evaluación (weightsNormalized + pesos originales). */
+  assessment: AssessmentPackageSummary;
+  /**
+   * F1: avisos de perfiles para el resumen del paquete —
+   * `presentation_profile_defaulted`, `course_without_grades`,
+   * `assessment_weights_normalized:…`.
+   */
+  profileWarnings: string[];
+}
+
+/** F1: avisos de perfiles (tema por defecto + evaluación normalizada / sin nota). Pura. */
+export function profileWarningsV3(theme: ResolvedPackagingTheme, resolved: ResolvedAssessment): string[] {
+  return [
+    ...(theme.source === 'default_v3' ? [PRESENTATION_PROFILE_DEFAULTED] : []),
+    ...assessmentPackageWarnings(resolved),
+  ];
 }
 
 /**
@@ -647,17 +671,15 @@ export async function prepareV3Package(
   const profiles = await loadPackagingProfilesV3(q, courseId, manifest.manifest.features?.finalExam === true);
   // Falla temprano (antes de encolar/descargar) si el perfil vigente no se puede aplicar a ESTE run
   // (p.ej. pesos con examen final y el run no lo tiene: R3 ruling 7; intentos no aplicables: R6).
+  // F1 (I3): las categorías vacías se omiten y sus pesos se redistribuyen (o el curso queda sin nota).
+  const itemCounts = assessmentItemCountsFromManifest(manifest.manifest);
   const resolved = resolveAssessment(profiles.assessment, {
     hasFinalExam: manifest.manifest.features?.finalExam === true,
     activityEngine: manifest.manifest.features?.activityEngine,
+    itemCounts,
   });
-  // G6 M5: una categoría ponderada vacía se sabe desde el Manifest → 409 al pedir, no un job fallido.
-  const count = (t: string) => manifest.manifest.items.filter((i) => i.type === t).length;
-  assertCategoriesPopulated(resolved, {
-    practice: count('video') + count('activity'),
-    moduleExams: count('exam'),
-    finalExam: count('final_exam'),
-  });
+  // Doble control (G6 M5): tras normalizar ninguna categoría ponderada puede quedar vacía.
+  assertCategoriesPopulated(resolved, itemCounts);
   const sourceArtifactIds = sortedArtifactIdsV3(byItem);
   const sourceIdsHash = packageReuseHashV3({
     builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3,
@@ -669,5 +691,15 @@ export async function prepareV3Package(
     vcRendererVersion: VC_RENDERER_VERSION,
     moodleVersion,
   });
-  return { run, byItem, profiles, sourceArtifactIds, sourceIdsHash, staleWarnings: staleWarningsV3(byItem) };
+  return {
+    run,
+    byItem,
+    profiles,
+    sourceArtifactIds,
+    sourceIdsHash,
+    staleWarnings: staleWarningsV3(byItem),
+    resolved,
+    assessment: assessmentPackageSummary(resolved),
+    profileWarnings: profileWarningsV3(profiles.theme, resolved),
+  };
 }

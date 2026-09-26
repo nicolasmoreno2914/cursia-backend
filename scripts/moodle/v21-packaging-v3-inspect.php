@@ -59,7 +59,8 @@ foreach ($modinfo->get_section_info_all() as $si) {
         }
         $cms[] = ['cmid' => (int)$cm->id, 'modname' => $cm->modname, 'name' => $cm->name, 'idnumber' => $row->idnumber,
             'completion' => (int)$row->completion, 'completiongradeitemnumber' => $row->completiongradeitemnumber,
-            'completionpassgrade' => (int)$row->completionpassgrade, 'showdescription' => (int)$row->showdescription,
+            'completionpassgrade' => (int)$row->completionpassgrade, 'completionview' => (int)$row->completionview,
+            'showdescription' => (int)$row->showdescription,
             'files' => $files];
     }
     $sections[] = ['section' => (int)$si->section, 'name' => $si->name, 'cms' => $cms];

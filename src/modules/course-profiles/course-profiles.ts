@@ -1,4 +1,5 @@
 import { sha256Canonical, sortedCanonicalJson } from '../coherence/canonical-json';
+import { LEGACY_PALETTES, THEME_FAMILIES, presentationProfileFromPalette } from '../theme-engine';
 
 /**
  * Cursia V2.1 — R3: perfiles de curso (audit §M.2, §K.2). Lógica PURA: sin
@@ -57,6 +58,51 @@ export interface PresentationProfile {
 
 export function defaultPresentationProfile(): PresentationProfile {
   return { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 };
+}
+
+/** F1 (I4): de dónde sale el perfil de presentación por defecto de un curso sin perfil guardado. */
+export type PresentationDefaultSource = 'palette' | 'fallback';
+
+/**
+ * F1 (I4): perfil de presentación por defecto de un curso sin perfil guardado.
+ * - Con una paleta legacy conocida → derivado de ella
+ *   (`presentationProfileFromPalette`: claro → aula-clara/light, el resto →
+ *   oscuro-premium/dark; brandSeed de la paleta), `source: 'palette'`.
+ * - Sin paleta → aula-clara/light, `source: 'fallback'`.
+ * - Paleta desconocida → aula-clara/light, `source: 'fallback'` + aviso
+ *   `PALETTE_UNKNOWN` (esto es solo la LECTURA del default; el empaque falla
+ *   fuerte con una paleta guardada desconocida).
+ * Pura: nunca persiste nada.
+ */
+export function defaultPresentationProfileFor(paletteId: string | null | undefined): {
+  profile: PresentationProfile;
+  source: PresentationDefaultSource;
+  warnings: ProfileValidationError[];
+} {
+  const id = typeof paletteId === 'string' ? paletteId.trim() : '';
+  if (!id) return { profile: defaultPresentationProfile(), source: 'fallback', warnings: [] };
+  const found = LEGACY_PALETTES.find((x) => x.id === id);
+  if (!found) {
+    return {
+      profile: defaultPresentationProfile(),
+      source: 'fallback',
+      warnings: [{ path: 'paletteId', code: 'PALETTE_UNKNOWN', message: `Paleta desconocida "${id}": se usa el diseño por defecto (Aula Clara, claro)` }],
+    };
+  }
+  const d = presentationProfileFromPalette(found);
+  const seed: BrandSeedInput = {};
+  if (d.brandSeed.accent) seed.accent = d.brandSeed.accent;
+  if (d.brandSeed.moduleColors) seed.moduleColors = [...d.brandSeed.moduleColors];
+  return {
+    profile: {
+      themeFamily: d.themeFamily,
+      mode: d.mode,
+      brandSeed: Object.keys(seed).length ? seed : null,
+      themeVersion: d.themeVersion,
+    },
+    source: 'palette',
+    warnings: [],
+  };
 }
 
 // ── Assessment ──────────────────────────────────────────────────────────────
@@ -163,6 +209,19 @@ export function validatePresentationProfile(p: unknown): ProfileValidationError[
       path: 'mode',
       code: 'INVALID_THEME_MODE',
       message: `mode inválido: ${JSON.stringify(p.mode)} (permitidos: ${THEME_MODES.join(', ')})`,
+    });
+  }
+  // F1: la familia define qué modos existen (Theme Engine R1); un modo que la
+  // familia no soporta se rechaza al guardar, no recién al empaquetar.
+  if (
+    (THEME_FAMILY_IDS as readonly unknown[]).includes(p.themeFamily) &&
+    (THEME_MODES as readonly unknown[]).includes(p.mode) &&
+    !(THEME_FAMILIES[p.themeFamily as ThemeFamilyIdCopy].supportedModes as readonly unknown[]).includes(p.mode)
+  ) {
+    errors.push({
+      path: 'mode',
+      code: 'THEME_MODE_NOT_SUPPORTED',
+      message: `La familia ${String(p.themeFamily)} no admite el modo ${String(p.mode)} (admite: ${THEME_FAMILIES[p.themeFamily as ThemeFamilyIdCopy].supportedModes.join(', ')})`,
     });
   }
   if ('themeVersion' in p && !(isInt(p.themeVersion) && p.themeVersion >= 1)) {

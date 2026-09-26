@@ -42,6 +42,7 @@ import {
   ResolvedAssessment,
   applyXmlFields,
   assertCategoriesPopulated,
+  assessmentItemCountsFromManifest,
   completionCriteriaFor,
   courseCompletionXml,
   gradeItemXml,
@@ -123,8 +124,10 @@ import { IdAllocator, buildQuizV3, parseScormManifestIds, scormActivityXmlV3 } f
  * paquetes viejos. Hoy `hours` no se cablea desde el worker (no hay dato de
  * setup en el backend); el día que se cablee debe entrar en la clave de reuse.
  * 3.0.1 (fix round 1 G6): Libro sin links inseguros (M2).
+ * 3.0.2 (F1/I3): categorías vacías fuera del gradebook, pesos normalizados y
+ * curso sin nota (completion por vista del Libro Guía).
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.0.1';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.0.2';
 /** Versión del renderer de Visual Components que entra en la clave de reuse. */
 export const VC_RENDERER_VERSION = `vc${VC_SCHEMA_VERSION}-rt${VC_RUNTIME_VERSION}-theme${THEME_ENGINE_VERSION}`;
 
@@ -202,7 +205,47 @@ export interface BuildDynamicMbzV3Result {
     mockPresentationChapters: string[];
     warnings: string[];
     counts: CourseFacts['counts'];
+    /** F1 (I3): resultado de la normalización de pesos (ver `assessmentPackageSummary`). */
+    assessment: AssessmentPackageSummary;
   };
+}
+
+/** F1 (I3): lo que el resumen del paquete registra de la evaluación resuelta. */
+export interface AssessmentPackageSummary {
+  weightsNormalized: boolean;
+  originalWeights: Partial<Record<AssessmentCategoryKey, number>>;
+  weights: Partial<Record<AssessmentCategoryKey, number>>;
+  emptyCategories: AssessmentCategoryKey[];
+  withoutGrades: boolean;
+}
+
+/** F1 (I3): resumen de una evaluación resuelta CON `itemCounts` (falla si no lo fue). */
+export function assessmentPackageSummary(resolved: ResolvedAssessment): AssessmentPackageSummary {
+  if (typeof resolved.weightsNormalized !== 'boolean' || typeof resolved.withoutGrades !== 'boolean' || !resolved.originalWeights || !resolved.emptyCategories) {
+    throw new Error('ASSESSMENT_INVALID_FACTS: la evaluación del paquete v3 debe resolverse con itemCounts');
+  }
+  const weights: Partial<Record<AssessmentCategoryKey, number>> = {};
+  for (const c of resolved.categories) weights[c.key] = c.weight;
+  return {
+    weightsNormalized: resolved.weightsNormalized,
+    originalWeights: { ...resolved.originalWeights },
+    weights,
+    emptyCategories: [...resolved.emptyCategories],
+    withoutGrades: resolved.withoutGrades,
+  };
+}
+
+/**
+ * F1 (I3): avisos del paquete derivados de la evaluación resuelta:
+ * `course_without_grades` y `assessment_weights_normalized:<orig>-><final>`.
+ */
+export function assessmentPackageWarnings(resolved: ResolvedAssessment): string[] {
+  const s = assessmentPackageSummary(resolved);
+  if (s.withoutGrades) return ['course_without_grades'];
+  if (!s.weightsNormalized) return [];
+  const fmt = (w: Partial<Record<AssessmentCategoryKey, number>>) =>
+    (Object.keys(w) as AssessmentCategoryKey[]).map((k) => `${k}=${w[k]}`).join(',');
+  return [`assessment_weights_normalized:${fmt(s.originalWeights)}->${fmt(s.weights)}`];
 }
 
 export class PackagingV3ContentMissingError extends Error {
@@ -447,9 +490,11 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const theme: ResolvedTheme = resolveTheme(input.presentation);
   const themeErrors = validateTheme(theme, { moduleCount: plan.modules.length });
   if (themeErrors.length) throw new Error(`THEME_INVALID: ${themeErrors.map((e) => e.code).join(', ')}`);
+  // F1 (I3): los pesos se normalizan contra los ítems calificables del Manifest.
   const resolved = resolveAssessment(input.assessmentProfile, {
     hasFinalExam: plan.features.finalExam,
     activityEngine: plan.features.activityEngine,
+    itemCounts: assessmentItemCountsFromManifest(manifest),
   });
 
   // ── Contenidos LLM validados ─────────────────────────────────────────────
@@ -627,7 +672,9 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     <timemodified>${ts}</timemodified>
   </resource>
 </activity>`);
-    W.put(`${a.dir}/module.xml`, withIdnumber(moduleXml(a.mid, 'resource', 1, ts, MV.bv), a.idnumber));
+    // F1 (I3): en un curso sin nota el Libro Guía es el criterio de completion (por vista).
+    const libroModule = withIdnumber(moduleXml(a.mid, 'resource', 1, ts, MV.bv), a.idnumber);
+    W.put(`${a.dir}/module.xml`, resolved.withoutGrades ? applyXmlFields(libroModule, { completion: '2', completionview: '1' }) : libroModule);
     W.put(`${a.dir}/inforef.xml`, inforef([fid]));
     W.put(`${a.dir}/grades.xml`, gradesXml(a.aid));
     W.boilerplate(a.dir);
@@ -798,9 +845,15 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     courseCategoryId: 1,
     courseItemId: 1,
     categories: resolved.categories.map((cat) => ({ id: CAT_ID[cat.key], fullname: cat.fullname, weight: cat.weight, gradeItemId: CAT_ID[cat.key] })),
+    ...(resolved.withoutGrades ? { withoutGrades: true } : {}),
   }));
+  if (resolved.withoutGrades && graded.length > 0) {
+    throw new Error(`ASSESSMENT_INVALID_FACTS: curso sin nota con ${graded.length} ítem(s) calificable(s) en el paquete`);
+  }
   W.put('completion.xml', courseCompletionXml({
-    criteria: completionCriteriaFor(graded.map((g) => ({ moduleId: g.moduleId, modname: g.modname, kind: g.kind })), resolved.courseCompletion),
+    criteria: resolved.withoutGrades
+      ? [{ moduleId: libroMid, modname: 'resource' as const }]
+      : completionCriteriaFor(graded.map((g) => ({ moduleId: g.moduleId, modname: g.modname, kind: g.kind })), resolved.courseCompletion),
     aggregation: 'all',
     requireCourseGradePass: resolved.courseCompletion.requireCourseGradePass,
     courseGradepass: resolved.courseCompletion.courseGradepass,
@@ -914,6 +967,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       mockPresentationChapters,
       warnings,
       counts: facts.counts,
+      assessment: assessmentPackageSummary(resolved),
     },
   };
 }
