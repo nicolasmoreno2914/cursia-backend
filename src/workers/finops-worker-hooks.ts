@@ -102,12 +102,16 @@ export async function recordVideogenCharge(ledger: WorkerLedger, a: VideogenChar
   });
 }
 
-/** Medición llegada para un cargo pendiente de Videogen → ADJUSTMENT (append; delta 0 = no-op). */
+/**
+ * Medición llegada para un cargo pendiente de Videogen → liquidación (ADJUSTMENT
+ * append; con delta 0 si coincide con el provisional — el pendiente se resuelve igual).
+ */
 export async function settleVideogenPending(ledger: WorkerLedger, jobId: string, cost: number) {
   if (!(typeof cost === 'number' && Number.isFinite(cost) && cost >= 0)) throw new Error(`costo de Videogen inválido: ${String(cost)}`);
   return ledger.recordAdjustment(costIdempotencyKey('videogen', { jobId }), String(cost), 'videogen_cost_measured', {
     recordedBy: 'dynamic-item-worker',
     metadata: { costBasis: 'videogen.getVideoCost.estimated_total_cost' },
+    settlement: true,
   });
 }
 

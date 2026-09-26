@@ -220,6 +220,24 @@ check('buildVideoActivity: 5 interacciones, maxScore 5, paquete solo contenido',
   eq(p.h5pJson.language, 'es', 'language');
 });
 
+// HD-V21-22 (resuelto por Nicolás): dentro de un intento → responder, enviar, nota, feedback y
+// solución; para mejorar la nota → NUEVO intento. Nunca "ver solución → corregir → 100" en el mismo.
+check('HD-V21-22 IV: sin "Reintentar" dentro del intento (override off + enableRetry false), "Ver solución" sí', async () => {
+  const r = await h.buildVideoActivity(INPUT);
+  const { content } = await readH5p(r.h5p);
+  eq([content.override.retryButton, content.override.showSolutionButton], ['off', 'on'], 'override del IV');
+  const beh = content.interactiveVideo.assets.interactions.map((x) => x.action.params.behaviour);
+  eq(beh.map((b) => [b.enableRetry, b.enableSolutionsButton, b.enableCheckButton]), beh.map(() => [false, true, true]), 'behaviour por interacción');
+});
+
+check('HD-V21-22 QuestionSet: sin reintento por pregunta dentro del intento; "Reintentar" final (= intento nuevo) sí', async () => {
+  const { buildQuestionSet } = require(path.resolve(__dirname, '..', 'dist/package/h5p/types/question-set.js'));
+  const q = (t, ok) => ({ kind: 'multichoice', question: t, answers: [{ text: 'Sí', correct: ok }, { text: 'No', correct: !ok }] });
+  const built = buildQuestionSet({ itemKey: 'activity:x', title: 'Práctica', passPercentage: 70, questions: [q('¿Uno?', true), q('¿Dos?', false), q('¿Tres?', true)] });
+  eq(built.content.questions.map((x) => x.params.behaviour.enableRetry), [false, false, false], 'enableRetry por pregunta');
+  eq(built.content.endGame.showRetryButton, true, 'reintento del set completo (nuevo intento en Moodle)');
+});
+
 check('buildVideoActivity: tiempos = plan, pausa, YouTube, preventSkipping none, sin Summary', async () => {
   const r = await h.buildVideoActivity(INPUT);
   const { content } = await readH5p(r.h5p);
@@ -446,7 +464,9 @@ check('intro: sin <style> (la ocultación en view.php la hace el script, no CSS)
 
 check('intro: theme hex aplicado; theme/filename/mid/youtubeId/title inválidos fallan fuerte', () => {
   const html = h.videoInlineIntroHtml({ ...INTRO_IN, theme: { accent: '#AA0055' } });
-  assert(html.includes('border-left:4px solid #AA0055') && html.includes('color:#AA0055'), 'accent aplicado');
+  // Tarjeta con borde COMPLETO del acento (el Visual System prohíbe la franja lateral border-left).
+  assert(html.includes('border:1px solid #AA0055') && html.includes('color:#AA0055'), 'accent aplicado');
+  assert(!/border-(left|right)\s*:/.test(html), 'sin franja lateral');
   throwsWith(() => h.videoInlineIntroHtml({ ...INTRO_IN, theme: { accent: 'oklch(0.5 0.1 200)' } }), /VIDEO_INTRO_INVALID: theme\.accent/, 'oklch');
   throwsWith(() => h.videoInlineIntroHtml({ ...INTRO_IN, theme: { surface: 'var(--x)' } }), /theme\.surface/, 'var');
   throwsWith(() => h.videoInlineIntroHtml({ ...INTRO_IN, packageFilename: 'x.zip' }), /packageFilename/, 'zip');

@@ -190,6 +190,33 @@ const MATRIX = [
     });
   }
 
+  // Aceptación staging V2.1: el Visual System prohíbe franjas laterales (border-left/right > 1px como acento).
+  // Se escanea TODO texto del paquete: XML de actividades/labels (HTML escapado), Libro, blobs de texto.
+  await check('Visual System: ningún HTML del paquete v3 usa franja lateral (border-left/right > 1px), en toda la matriz', async () => {
+    const STRIPE = /border-(?:left|right)(?:-width)?\s*:\s*(?:[2-9]|\d{2,})(?:\.\d+)?px/i;
+    const hits = [];
+    for (const cfg of MATRIX) {
+      const z = await JSZip.loadAsync(built[cfg.id].r.mbz);
+      for (const name of Object.keys(z.files)) {
+        const f = z.files[name];
+        if (f.dir) continue;
+        const buf = await f.async('nodebuffer');
+        if (buf.subarray(0, 2).toString('latin1') === 'PK' || buf.subarray(0, 4).toString('latin1') === '%PDF') continue;
+        const txt = buf.toString('utf8');
+        const m = STRIPE.exec(txt);
+        if (m) hits.push(`${cfg.id}:${name}: …${txt.slice(Math.max(0, m.index - 60), m.index + 40).replace(/\s+/g, ' ')}…`);
+      }
+    }
+    eq(hits.slice(0, 6), [], 'franjas laterales encontradas');
+    // Review I3: la tarjeta de módulo del Libro conserva el padding de su clase (el h2 no queda pegado al borde).
+    const lib = await JSZip.loadAsync(built['h5p-final-light'].r.mbz);
+    let libro = '';
+    for (const n of Object.keys(lib.files)) { if (!n.startsWith('files/') || lib.files[n].dir) continue; const t = (await lib.files[n].async('nodebuffer')).toString('utf8'); if (t.includes('cc-libro-module')) { libro = t; break; } }
+    const secs = libro.match(/<section[^>]*class="cc-libro-module"[^>]*>/g) || [];
+    assert(secs.length > 0, 'Libro con tarjetas de módulo');
+    eq(secs.filter((x) => /padding/.test(x)), [], 'padding inline que pisa el de la clase');
+  });
+
   await check('[h5p-final-light] H5P: activity type por UUID del capítulo (R-012), paquetes content-only del perfil, sin SingleChoiceSet', async () => {
     const { input, r } = built['h5p-final-light'];
     const acts = r.summary.h5pPackages.filter((p) => p.itemKey.startsWith('activity:'));
@@ -634,7 +661,7 @@ const MATRIX = [
     for (const [f, v] of [['builderVersion', '3.0.1'], ['manifestSha256', 'm2'], ['sourceArtifactIds', ['a']], ['themeSha256', 't2'], ['assessmentProfileSha256', 'p2'], ['h5pProfileVersion', 2], ['vcRendererVersion', 'r2'], ['moodleVersion', '4.5']]) {
       assert(PK.packageReuseHashV3({ ...baseK, [f]: v }) !== k0, `cambia con ${f}`);
     }
-    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.0.2' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
+    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.0.3' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
   });
 
   // ── Medios ────────────────────────────────────────────────────────────────
