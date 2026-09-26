@@ -32,3 +32,24 @@ E2E_MOODLE_DIR=/ruta/moodle-local \
 Puertos opcionales: `E2E_PG_PORT` (default 55491) y `E2E_APP_PORT` (default 38471).
 
 Resultado esperado: `E2E F9: PASS — N aserciones, 0 fallidas`, más los verify/audit reales con exit 0. Nunca toca staging, `main` ni producción.
+
+## V2.1 (R13): compuerta final — `run-e2e-v21.sh`
+Un solo comando que corre, en orden:
+1. **E2E v2 intacto** (`e2e.js`, rulesVersion 2) y, sobre el mismo PG16 descartable, la **fase rulesVersion 3** (`e2e-v3.js`, enganchada con `E2E_AFTER` de `run-e2e.sh`):
+   - app + workers reales (`dynamic-item-worker`, `dynamic-provider-worker`, `dynamic-package-worker`) con `DYNAMIC_MANIFEST_RULES_VERSION=3`, `DYNAMIC_PROVIDER_WORKER_ENABLED=true`, `DYNAMIC_ALLOW_PROVIDER_MOCK=true` y la config de producción del video (entrega YouTube contra el Google falso; el video "publicado" es el id real `IdwOipZAeqY`, 468 s del Videogen falso);
+   - LLM falso v3 (`llm-v3.js`): salidas válidas para experience, intros v3 sin dígitos, H5P del tipo derivado del UUID, video_interactions de los checkpoints planeados y examen final GIFT; **una respuesta inválida por tipo, una sola vez**, para probar el reintento dirigido;
+   - cursos E1 (2 módulos, las 4 combinaciones V/A, aula-clara/light, 70, final ON, h5p), E2 (4 módulos, oscuro-premium/dark, 60, final OFF, scorm) y E3 (2 módulos, tecnico/dark, 80, final ON, h5p); E1 se re-empaca con tecnico/dark + 80 (0 item runs, 0 CHARGE salvo el ZERO_BY_DESIGN del empaque, sha distinto, mismos artifacts);
+   - FinOps: E0 (run 100 % mock → AUTO), 409 `budget_approval_required` sin aprobación, ledger, `cost_estimates`, contadores de los fakes;
+   - restore de los 4 MBZ con `moodle-local/restore-and-inspect.sh` + `scripts/moodle/v21-packaging-v3-inspect.php` (estructura por UUID, gradepass, categorías, completion, H5P, audio con duración medida, Libro, Gamma, cifras del shell = Manifest) y simulación de notas (`moodle-v3-grades.php`).
+2. **QA de navegador** (`browser-qa-v3.js`, Chrome headless por CDP): servidor PHP en 127.0.0.1:8099 solo durante la prueba, estudiante local de prueba (`E2E_MOODLE_CREDS`), E1/E2 a 390/768/1280 (+ emulación móvil), IV inline, H5P respondido → gradebook, `forceclean=1` temporal y **siempre** de vuelta a 0. Capturas en `E2E_SHOTS`.
+3. **Regresión**: todos los `scripts/check-*.js` (incluidos los de Moodle local), `harness-blueprint-snapshot`, el runner de producción local y los harnesses del frontend.
+4. **Resumen** (`summary-v21.js`): aserciones por área, sha de los MBZ, warnings de restore y contadores de proveedores.
+
+```bash
+E2E_BACKEND_ROOT=/ruta/orbia-backend E2E_FRONTEND_ROOT=/ruta/campuscloud-gen \
+E2E_SCRATCH=/tmp/cursia-e2e-v21 E2E_MOODLE_DIR=/ruta/moodle-local \
+E2E_MOODLE_CREDS=/ruta/.local-test-credentials E2E_SHOTS=/ruta/capturas \
+E2E_JSDOM_NODE_PATH=/ruta/node_modules-con-jsdom \
+  bash test/e2e-v2/run-e2e-v21.sh
+```
+Opcionales: `SKIP_BUILD=1`, `E2E_SKIP_REGRESSION=1`. `run-e2e.sh` acepta además `E2E_SKIP_V2=1` (solo fases extra) y `E2E_AFTER` (comando extra antes del cleanup); ya no detiene el Postgres del Moodle local si no lo arrancó él.

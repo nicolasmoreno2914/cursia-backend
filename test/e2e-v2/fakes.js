@@ -117,7 +117,7 @@ function startHttpsVideos(tlsDir, videogen) {
 // resumable de YouTube. Registra cada llamada; `initPlan` programa respuestas
 // del POST de inicio ('ok' | status HTTP) para probar reintentos.
 function startGoogle() {
-  const g = { refresh: new Map(), channels: new Map(), initPlan: [], calls: [], uploads: [], seq: 0, base: null };
+  const g = { refresh: new Map(), channels: new Map(), initPlan: [], calls: [], uploads: [], seq: 0, base: null, fixedVideoId: null };
   const srv = http.createServer((rq, rs) => {
     const chunks = [];
     rq.on('data', (c) => chunks.push(c));
@@ -159,7 +159,9 @@ function startGoogle() {
         const up = g.uploads.find((x) => x.n === Number(m[1]));
         if (!up) return json(404, { error: 'no session' });
         up.bytes = body.length;
-        up.videoId = `YtE2E${String(up.n).padStart(6, '0')}`;
+        // V2.1 R13: la fase rulesVersion 3 fija el id de un video REAL existente (IdwOipZAeqY, el de R0)
+        // para que el QA de navegador reproduzca algo; sin fixedVideoId, ids sintéticos como siempre.
+        up.videoId = g.fixedVideoId || `YtE2E${String(up.n).padStart(6, '0')}`;
         return json(200, { id: up.videoId, kind: 'youtube#video' });
       }
       json(404, { error: `unhandled ${rq.method} ${u.pathname}` });
