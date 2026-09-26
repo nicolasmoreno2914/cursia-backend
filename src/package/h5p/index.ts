@@ -20,3 +20,4 @@ export * from './types/blanks';
 export * from './types/interactive-video';
 export * from './package';
 export * from './library-pack';
+export * from './interactive-video';
