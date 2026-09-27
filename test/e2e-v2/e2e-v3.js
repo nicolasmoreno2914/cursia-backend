@@ -318,7 +318,16 @@ async function packageRun(label, courseId, n, runId) {
 }
 
 async function ledgerRows(where = 'true', params = []) {
-  return q(`select event_kind, cost_source, provider, operation, amount::float8 amount, billing_account, course_id, run_id, item_key, item_type, measurement_status from public.generation_cost_events where ${where}`, params);
+  return q(`select id, corrects_event_id, event_kind, cost_source, provider, operation, amount::float8 amount, billing_account, course_id, run_id, item_key, item_type, measurement_status,
+                  coalesce((metadata->>'reservation') = 'true', false) as reservation
+             from public.generation_cost_events where ${where}`, params);
+}
+
+// Calibración #2: cada llamada pagada deja una RESERVA (CHARGE pending) que se liquida a 0 con un ADJUSTMENT
+// en la misma transacción que su cargo final. Filas de reservas y de sus liquidaciones (netean 0).
+function reservationBookkeeping(ev) {
+  const resIds = new Set(ev.filter((e) => e.reservation).map((e) => e.id));
+  return ev.filter((e) => e.reservation || resIds.has(e.corrects_event_id));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -553,7 +562,12 @@ async function ledgerRows(where = 'true', params = []) {
       eq(zero.length, COURSES.length + 1, `ledger v3: ${COURSES.length + 1} eventos ZERO_BY_DESIGN de empaque (uno por curso + el re-empaque de E1)`);
       const yt = ev.filter((e) => e.provider === 'youtube');
       ok(yt.length >= 1 && yt.every((e) => e.cost_source === 'ZERO_BY_DESIGN' && e.amount === 0), 'ledger v3: cuota de YouTube como ZERO_BY_DESIGN (monto 0)', yt);
-      const vg = ev.filter((e) => e.provider === 'videogen');
+      const book = reservationBookkeeping(ev);
+      const bookIds = new Set(book.map((e) => e.id));
+      const resv = book.filter((e) => e.reservation);
+      ok(resv.every((r) => book.some((a) => a.corrects_event_id === r.id)) && Math.abs(book.reduce((a, e) => a + e.amount, 0)) < 1e-9,
+        'ledger v3 (calibración #2): toda reserva previa a una llamada pagada quedó liquidada (neto 0)', resv);
+      const vg = ev.filter((e) => e.provider === 'videogen' && !bookIds.has(e.id) && e.event_kind === 'CHARGE');
       ok(vg.length === videoCount && vg.every((e) => e.cost_source === 'CALCULATED_FROM_USAGE' && Math.abs(e.amount - 0.42) < 1e-9),
         `ledger v3: ${videoCount} eventos de Videogen = el costo que devuelve el Videogen FALSO local (0.42, CALCULATED_FROM_USAGE, HD-V21-20); ninguno de un proveedor real`, vg);
       const est = await q(`select course_id, scope, run_id from public.cost_estimates where course_id = any($1::int[])`, [courseIds]);
@@ -655,7 +669,12 @@ async function ledgerRows(where = 'true', params = []) {
       // Neto por CHARGE = monto + sus ADJUSTMENT (F2 fix round 1: Gamma reserva pendiente al aceptar y se liquida al terminar).
       const ev = await q(`select c.provider, c.operation, c.cost_source, c.measurement_status, c.external_operation_id, c.recorded_by, c.item_key,
                                  (c.amount + coalesce((select sum(a.amount) from public.generation_cost_events a where a.corrects_event_id = c.id), 0))::float8 amount
-                            from public.generation_cost_events c where c.course_id = $1 and c.event_kind = 'CHARGE'`, [c.courseId]);
+                            from public.generation_cost_events c where c.course_id = $1 and c.event_kind = 'CHARGE'
+                             and coalesce(c.metadata->>'reservation', 'false') <> 'true'`, [c.courseId]);
+      const resvE4 = await q(`select c.provider, (c.amount + coalesce((select sum(a.amount) from public.generation_cost_events a where a.corrects_event_id = c.id), 0))::float8 net,
+                                     exists (select 1 from public.generation_cost_events a where a.corrects_event_id = c.id) settled
+                                from public.generation_cost_events c where c.course_id = $1 and c.event_kind = 'CHARGE' and (c.metadata->>'reservation') = 'true'`, [c.courseId]);
+      ok(resvE4.length >= 5 && resvE4.every((r) => r.settled && Math.abs(r.net) < 1e-9), 'E4 ledger (calibración #2): una reserva durable antes de CADA llamada pagada (Gamma / TTS / LLM / Videogen), toda liquidada a neto 0', resvE4);
       const g = ev.filter((e) => e.provider === 'gamma');
       ok(g.length === 2 && g.every((e) => e.cost_source === 'CALCULATED_FROM_USAGE' && Math.abs(e.amount - 0.42) < 1e-9 && /^gen_f2_/.test(e.external_operation_id)), 'E4 ledger: Gamma = reserva al aceptar liquidada a credits.deducted × catálogo (neto 0.42, CALCULATED_FROM_USAGE, id = generationId)', g);
       const t = ev.filter((e) => e.provider === 'openai');

@@ -647,6 +647,8 @@ async function dbChecks() {
       finops: ledger, budget,
     });
 
+    // Calibración #2: reserva durable antes del envío, liquidada contra UN cargo por job al terminar.
+    const finalChargesW = (where, params) => events(`${where} and event_kind = 'CHARGE' and coalesce(metadata->>'reservation', 'false') <> 'true'`, params);
     let videoEvent = null;
     await check('DB worker Videogen (fake, presupuesto autorizado) → continúa: 1 envío y CHARGE CALCULATED_FROM_USAGE con el costo de Videogen, atribuido server-side (curso/run/item/capítulo)', async () => {
       const s = fakeScheduler();
@@ -654,8 +656,11 @@ async function dbChecks() {
       await itemWorker.processItem(workerDeps(s, vg), await claimedVideo(runB, Bc.c1));
       eq([vg.st.submits, s.st.completed.length, s.st.blocked.length, s.st.failed.length], [1, 1, 0, 0], `envío/complete (${JSON.stringify(s.st.failed)})`);
       const row = await itemRow(runB, `video:${Bc.c1}`);
-      const evs = await events(`item_run_id = $1`, [row.id]);
-      eq(evs.length, 1, 'un evento');
+      const evs = await finalChargesW(`item_run_id = $1`, [row.id]);
+      eq(evs.length, 1, 'un cargo final');
+      const all = await events(`item_run_id = $1`, [row.id]);
+      eq(all.map((x) => x.event_kind).sort(), ['ADJUSTMENT', 'CHARGE', 'CHARGE'], 'reserva + su liquidación + cargo del job');
+      assert(near(all.reduce((a, x) => a + Number(x.amount), 0), 0.97), 'neto = costo de Videogen');
       videoEvent = evs[0];
       eq([videoEvent.cost_source, videoEvent.operation, videoEvent.provider, videoEvent.billing_account, videoEvent.billable, videoEvent.measurement_status],
         ['CALCULATED_FROM_USAGE', 'videogen.render', 'videogen', 'cursia', true, 'final'], 'evento');
@@ -678,7 +683,7 @@ async function dbChecks() {
         outputSummary: { previousExternals: [{ external: { videogenJobId: videoEvent.external_operation_id } }] },
       });
       eq([r2.inserted, r2.event.call_role, r2.event.attempt], [true, 'provider_retry', 2], 'retry');
-      eq((await events(`item_run_id = $1 and event_kind = 'CHARGE'`, [videoEvent.item_run_id])).length, 2, 'dos cargos');
+      eq((await finalChargesW(`item_run_id = $1`, [videoEvent.item_run_id])).length, 2, 'dos cargos (sin contar la reserva liquidada)');
       const byRun = await ledger.costsByRun(runB);
       eq(byRun.retriesPaid.events, 1, 'retriesPaid');
       assert(near(byRun.retriesPaid.total, 0.95), 'monto del retry');
@@ -702,7 +707,7 @@ async function dbChecks() {
       await itemWorker.processItem(workerDeps(s, vg), await claimedVideo(runB, Bc.c2));
       eq([vg.st.submits, s.st.completed.length], [1, 1], 'completó');
       const row = await itemRow(runB, `video:${Bc.c2}`);
-      const [ev] = await events(`item_run_id = $1`, [row.id]);
+      const [ev] = await finalChargesW(`item_run_id = $1`, [row.id]);
       eq([ev.measurement_status, ev.metadata.pendingReason], ['pending', 'costs endpoint 503'], 'pendiente');
     });
 

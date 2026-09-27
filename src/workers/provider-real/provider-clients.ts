@@ -74,8 +74,14 @@ export interface GammaGenerationStatus {
   error: string | null;
 }
 
+/** Timeout por llamada (ms): PROVIDER_CALL_TIMEOUT_MS acota los defaults (pruebas de fault injection / operación). */
+export function callTimeoutMs(env: Env, dflt: number): number {
+  const n = Number(env.PROVIDER_CALL_TIMEOUT_MS);
+  return Number.isInteger(n) && n > 0 ? Math.min(n, dflt) : dflt;
+}
+
 export class GammaClient {
-  constructor(private readonly apiKey: string, private readonly env: Env = process.env, private readonly timeoutMs = 60_000) {
+  constructor(private readonly apiKey: string, private readonly env: Env = process.env, private readonly timeoutMs = callTimeoutMs(env, 60_000)) {
     if (!apiKey || !apiKey.trim()) throw new ProviderCallError('gamma', false, 'gamma: GAMMA_API_KEY no configurada');
   }
 
@@ -133,7 +139,7 @@ export interface TtsCallResult {
 }
 
 export class OpenAiTtsClient {
-  constructor(private readonly apiKey: string, private readonly env: Env = process.env, private readonly timeoutMs = 120_000) {
+  constructor(private readonly apiKey: string, private readonly env: Env = process.env, private readonly timeoutMs = callTimeoutMs(env, 120_000)) {
     if (!apiKey || !apiKey.trim()) throw new ProviderCallError('openai', false, 'openai: OPENAI_API_KEY no configurada');
   }
 
@@ -173,7 +179,7 @@ export interface AnthropicCallResult {
 }
 
 export class AnthropicClient {
-  constructor(private readonly apiKey: string, private readonly env: Env = process.env, private readonly timeoutMs = 120_000) {
+  constructor(private readonly apiKey: string, private readonly env: Env = process.env, private readonly timeoutMs = callTimeoutMs(env, 120_000)) {
     if (!apiKey || !apiKey.trim()) throw new ProviderCallError('anthropic', false, 'anthropic: ANTHROPIC_API_KEY no configurada');
   }
 

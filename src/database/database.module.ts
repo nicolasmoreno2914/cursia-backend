@@ -18,6 +18,8 @@ import { CourseBlueprint } from '../modules/course-blueprints/entities/course-bl
 import { CourseGenerationManifest } from '../modules/generation-manifests/entities/course-generation-manifest.entity';
 import { GenerationItemRun } from '../modules/dynamic-generation/entities/generation-item-run.entity';
 
+import { dbPoolConfig } from './db-pool-config';
+
 @Module({
   imports: [
     TypeOrmModule.forRootAsync({
@@ -43,12 +45,14 @@ import { GenerationItemRun } from '../modules/dynamic-generation/entities/genera
         // `extra` reduce conexiones idle que Supabase puede cortar del lado servidor.
         retryAttempts: 10,
         retryDelay: 3000,
+        // V2.1 calibración #2: tamaño del pool POR PROCESO (api vs worker), configurable por
+        // entorno; sin variables = los valores de siempre (max 5, idle 20 s). Ver db-pool-config.ts.
         extra: {
-          max: 5,
+          max: dbPoolConfig().max,
           min: 0,
           keepAlive: true,
           keepAliveInitialDelayMillis: 10000,
-          idleTimeoutMillis: 20000,
+          idleTimeoutMillis: dbPoolConfig().idleTimeoutMillis,
           connectionTimeoutMillis: 10000,
         },
       }),

@@ -143,7 +143,9 @@ function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp
   const st = { gammaPosts: [], gammaGets: [], exports: [], tts: [], llm: [], badAuth: [], seq: 0 };
   const gens = new Map(); // id → {polls}
   // Un valor numérico en gammaPostFail/ttsFail/llmFail = ese status HTTP; 'drop' = se corta la conexión DESPUÉS de recibir el pedido.
-  const plan = { gammaPostFail: [], gammaHoldPending: false, gammaFailGeneration: false, gammaNoCredits: false, ttsFail: [], llmFail: [], llmShortFirst: 0 };
+  const plan = { gammaPostFail: [], gammaHoldPending: false, gammaFailGeneration: false, gammaNoCredits: false, ttsFail: [], llmFail: [], llmShortFirst: 0, ttsFixedRequestId: null, llmTiny: 0 };
+  // 'hang' = se recibe el pedido y nunca se responde (el cliente corta por timeout; la operación pudo ejecutarse).
+  const hang = (rq) => setTimeout(() => rq.socket.destroy(), 10_000).unref();
   let base = null;
   const words = (n, seed) => Array.from({ length: n }, (_, i) => ['proceso', 'equipo', 'seguridad', 'medición', 'ajuste', 'práctica', 'turno', 'planta'][(i + seed) % 8]).join(' ') + '.';
   const srv = http.createServer((rq, rs) => {
@@ -163,6 +165,8 @@ function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp
           st.gammaPosts.push(req);
           const f = plan.gammaPostFail.shift();
           if (f === 'drop') return rq.socket.destroy();
+          if (f === 'hang') return hang(rq);
+          if (f === 'noid') return json(200, { ok: true });
           if (typeof f === 'number') return json(f, { message: `fake ${f}` });
           const id = `gen_f2_${++st.seq}`;
           gens.set(id, { polls: 0 });
@@ -192,8 +196,9 @@ function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp
         const req = JSON.parse(body || '{}');
         const f = plan.ttsFail.shift();
         if (f === 'drop') { st.tts.push({ ...req, failed: 'drop' }); return rq.socket.destroy(); }
+        if (f === 'hang') { st.tts.push({ ...req, failed: 'hang' }); return hang(rq); }
         if (typeof f === 'number') { st.tts.push({ ...req, failed: f }); return json(f, { error: { message: `fake ${f}` } }); }
-        const rid = `req_f2_${++st.seq}`;
+        const rid = plan.ttsFixedRequestId || `req_f2_${++st.seq}`;
         st.tts.push({ model: req.model, voice: req.voice, chars: String(req.input || '').length, requestId: rid, response_format: req.response_format });
         // ~2.5 palabras/s → duración proporcional al texto (segundos enteros, ≥ 1).
         const secs = Math.max(1, Math.round(String(req.input || '').split(/\s+/).length / 2.5));
@@ -206,12 +211,15 @@ function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp
         const req = JSON.parse(body || '{}');
         const lf = plan.llmFail.shift();
         if (lf === 'drop') { st.llm.push({ failed: 'drop', model: req.model }); return rq.socket.destroy(); }
+        if (lf === 'hang') { st.llm.push({ failed: 'hang', model: req.model }); return hang(rq); }
         if (typeof lf === 'number') { st.llm.push({ failed: lf, model: req.model }); return json(lf, { type: 'error', error: { message: `fake ${lf}` } }); }
         const id = `msg_f2_${++st.seq}`;
         const short = plan.llmShortFirst > 0;
         if (short) plan.llmShortFirst--;
         const isCont = /CONTINUAR/.test(String(req.system || ''));
-        const text = isCont ? words(180, st.seq) : short ? words(200, st.seq) : words(430, st.seq);
+        const tiny = plan.llmTiny > 0;
+        if (tiny) plan.llmTiny--;
+        const text = tiny ? words(20, st.seq) : isCont ? words(180, st.seq) : short ? words(200, st.seq) : words(430, st.seq);
         st.llm.push({ id, model: req.model, maxTokens: req.max_tokens, continuation: isCont });
         return json(200, {
           id, type: 'message', role: 'assistant', model: req.model, stop_reason: 'end_turn',

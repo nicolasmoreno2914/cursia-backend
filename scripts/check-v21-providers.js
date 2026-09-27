@@ -527,6 +527,14 @@ async function dbChecks() {
       eq(retried.status, 'pending', 'reanudado');
     });
 
+    // Calibración #2: cada llamada pagada deja una RESERVA durable (CHARGE pending, metadata.reservation) que se
+    // liquida a 0 (ADJUSTMENT) en la misma transacción que el cargo final por el id del proveedor.
+    const finalCharges = (where, params) => events(`${where} and event_kind = 'CHARGE' and coalesce(metadata->>'reservation', 'false') <> 'true'`, params);
+    const reservationsOf = async (itemRunId, provider) => {
+      const rows = await events(`item_run_id = $1 and provider = $2 and event_kind = 'CHARGE' and metadata->>'reservation' = 'true'`, [itemRunId, provider]);
+      for (const r of rows) r.settled = (await events(`corrects_event_id = $1`, [r.id])).length > 0;
+      return rows;
+    };
     let genId1 = null;
     await check('DB Gamma (fake) happy path: es-419 + themeId del tema del curso; PDF + portada medidos (pdfPageCount/pngDimensions) y subidos; artifact R9 válido; completed', async () => {
       const item = await claimProvider(runId, 'presentation');
@@ -554,18 +562,22 @@ async function dbChecks() {
       eq(art.metadata.mock, undefined, 'artifact real (no mock)');
     });
 
-    await check('DB ledger Gamma (fix round 1): al ACEPTAR → CHARGE pendiente estimado (p90 = 100 créditos × 0.01); al terminar → ADJUSTMENT a credits.deducted (42) ⇒ neto 0.42; external_operation_id = generationId; atribuido; liquidar de nuevo = no-op', async () => {
+    await check('DB ledger Gamma (calibración #2): reserva durable ANTES del envío (p90 = 100 créditos × 0.01) → al terminar UN cargo medido por generationId (42 créditos) + reserva a 0, atómico ⇒ neto 0.42; atribuido; liquidar de nuevo = no-op', async () => {
+      // Calibración #2: reserva durable ANTES del envío (p90 = 100 créditos × 0.01) → al terminar, UN cargo
+      // medido por generationId (42 créditos) + la reserva a 0, en la misma transacción. Neto = 0.42.
       const evs = await events(`provider = 'gamma'`, []);
-      eq(evs.map((x) => x.event_kind), ['CHARGE', 'ADJUSTMENT'], 'reserva + ajuste');
-      const [e, adj] = evs;
-      eq([e.cost_source, e.operation, e.external_operation_id, e.idempotency_key, e.billing_account, e.measurement_status, e.item_key, e.run_id, e.recorded_by, e.metadata.estimatedPending],
-        ['CALCULATED_FROM_USAGE', 'gamma.generate', genId1, `gamma:gen:${genId1}`, 'cursia', 'pending', `presentation:${C.c1}`, runId, 'dynamic-provider-worker', true], 'reserva');
-      assert(near(e.amount, 1.0) && Number(e.usage.gamma_credit) === H.gammaEstimatedCredits(), `reserva ${e.amount}`);
-      eq([adj.corrects_event_id, adj.measurement_status, adj.metadata.reason, Number(adj.metadata.measuredUsage.gamma_credit), adj.metadata.creditsRemaining], [e.id, 'final', 'gamma_credits_measured', 42, 958], 'ajuste');
-      assert(near(Number(e.amount) + Number(adj.amount), 0.42), `neto ${Number(e.amount) + Number(adj.amount)}`);
+      eq(evs.map((x) => x.event_kind).sort(), ['ADJUSTMENT', 'CHARGE', 'CHARGE'], 'reserva + su liquidación + cargo final');
+      const [resv] = await reservationsOf(evs[0].item_run_id, 'gamma');
+      eq([resv.measurement_status, resv.metadata.reservedBeforeCall, new RegExp(`^reservation:gamma:${resv.item_run_id}:g1:a\\d+:submit$`).test(resv.idempotency_key), near(resv.amount, 1.0), resv.settled],
+        ['pending', true, true, true, true], 'reserva previa al envío, liquidada');
+      const [e] = await finalCharges(`provider = 'gamma'`, []);
+      eq([e.cost_source, e.operation, e.external_operation_id, e.idempotency_key, e.billing_account, e.measurement_status, e.item_key, e.run_id, e.recorded_by, Number(e.usage.gamma_credit), e.metadata.creditsRemaining],
+        ['CALCULATED_FROM_USAGE', 'gamma.generate', genId1, `gamma:gen:${genId1}`, 'cursia', 'final', `presentation:${C.c1}`, runId, 'dynamic-provider-worker', 42, 958], 'cargo final medido');
+      const net = evs.reduce((a, x) => a + Number(x.amount), 0);
+      assert(near(net, 0.42), `neto ${net}`);
       const again = await H.settleGammaCharge(ledger, { ownerId: OWNER, itemRunId: e.item_run_id, generationId: genId1, creditsDeducted: 42, creditsRemaining: 958 });
-      eq((await events(`provider = 'gamma'`, [])).length, 2, 'liquidar otra vez no agrega filas');
-      assert(again === 'settled', again);
+      eq((await events(`provider = 'gamma'`, [])).length, 3, 'liquidar otra vez no agrega filas (misma operación = un cargo)');
+      assert(again === 'already_final', again);
     });
 
     await check('DB Gamma reanudación: generación lenta → gamma_timeout reintentable CON el generationId guardado; el re-claim sigue polleando la MISMA generación (0 reenvíos)', async () => {
@@ -579,9 +591,9 @@ async function dbChecks() {
       const gid = row.output_summary.external.gammaGenerationId;
       assert(gid && row.output_summary.externalSubmitStartedAt, 'id + marcador persistidos');
       eq(fakes.st.gammaPosts.length, 2, 'un envío más (C2)');
-      // Fix round 1 (m1): el timeout deja la reserva PENDIENTE en el ledger y el presupuesto la cuenta.
-      const pend = await events(`idempotency_key = $1`, [`gamma:gen:${gid}`]);
-      eq(pend.map((x) => [x.event_kind, x.measurement_status]), [['CHARGE', 'pending']], 'reserva pendiente tras el timeout');
+      // El timeout deja la reserva previa al envío PENDIENTE y el presupuesto la cuenta.
+      const pend = await reservationsOf(row.id, 'gamma');
+      eq(pend.map((x) => [x.measurement_status, x.settled, x.idempotency_key === row.output_summary.externalReservationKey]), [['pending', false, true]], 'reserva pendiente tras el timeout');
       const actual = await budget.runActual(runId);
       const sumRun = (await ds.query(`select coalesce(sum(amount),0)::text t from public.generation_cost_events where run_id = $1`, [runId]))[0].t;
       assert(near(actual, sumRun) && Number(actual) >= 1.0 + 0.42, `runActual ${actual} incluye la reserva`);
@@ -593,8 +605,8 @@ async function dbChecks() {
       row = await itemRow(runId, item.itemKey);
       eq(row.status, 'completed', `completado (${row.error})`);
       eq(fakes.st.gammaPosts.length, 2, 'NINGÚN reenvío');
-      const gev = await events(`provider = 'gamma' and external_operation_id = $1`, [gid]);
-      eq(gev.map((x) => x.event_kind), ['CHARGE', 'ADJUSTMENT'], 'una reserva + su liquidación');
+      eq((await finalCharges(`provider = 'gamma' and external_operation_id = $1`, [gid])).map((x) => x.measurement_status), ['final'], 'UN cargo por la generación');
+      eq((await reservationsOf(row.id, 'gamma')).map((x) => x.settled), [true], 'la reserva quedó liquidada');
     });
 
     await check('DB TTS bienvenida: texto `welcome` del course_intro (sin LLM) → OpenAI TTS falso; MP3 real subido; duración medida (mp3DurationSeconds) en metadata; ledger por x-request-id', async () => {
@@ -612,9 +624,10 @@ async function dbChecks() {
       const mp3 = storage.blobs.get(`cursia-artifacts/${art.storage_path}`);
       eq(art.mime_type, 'audio/mpeg', 'mime');
       eq(art.metadata.durationSeconds, AUD.mp3DurationSeconds(mp3), 'duración medida');
-      const evs = await events(`item_run_id = $1`, [row.id]);
+      const evs = await finalCharges(`item_run_id = $1`, [row.id]);
       eq(evs.map((e) => [e.provider, e.operation, e.cost_source, e.external_operation_id, e.idempotency_key]),
         [['openai', 'tts.audio_welcome', 'CALCULATED_FROM_USAGE', call.requestId, `openai:req:${call.requestId}`]], 'evento');
+      eq((await reservationsOf(row.id, 'openai')).map((x) => [x.idempotency_key, x.settled]), [[`reservation:tts:${row.id}:g1:a1:chunk0`, true]], 'reserva del chunk liquidada');
       assert(near(evs[0].amount, (AUD.mp3DurationSeconds(mp3) / 60) * 0.015), `monto ${evs[0].amount} (segundos medidos × 0.015/min)`);
       eq(evs[0].usage_unit, 'audio_seconds', 'medidor = segundos de audio (nunca caracteres)');
     });
@@ -631,11 +644,12 @@ async function dbChecks() {
       eq([calls.length, calls[0].continuation, calls[1].continuation, calls[0].model], [2, false, true, 'claude-sonnet-4-6'], 'main + continuación');
       const s = row.output_summary.audiobookScript;
       assert(s && s.words >= 350 && s.messageIds.join() === calls.map((c) => c.id).join(), `guion persistido ${JSON.stringify(s && s.words)}`);
-      const llmEv = await events(`item_run_id = $1 and provider = 'anthropic'`, [row.id]);
+      const llmEv = await finalCharges(`item_run_id = $1 and provider = 'anthropic'`, [row.id]);
+      eq((await reservationsOf(row.id, 'anthropic')).map((x) => x.settled), [true, true], 'reservas LLM liquidadas');
       eq(llmEv.map((e) => [e.operation, e.call_role, e.cost_source, e.external_operation_id, e.idempotency_key]),
         calls.map((c, i) => ['llm.audiobook_script', i === 0 ? 'main' : 'continuation', 'CALCULATED_FROM_USAGE', c.id, `anthropic:msg:${c.id}`]), 'eventos LLM');
       assert(near(llmEv[0].amount, 1200 * 3 / 1e6 + 640 * 15 / 1e6), `monto main ${llmEv[0].amount}`);
-      const ttsEv = await events(`item_run_id = $1 and provider = 'openai'`, [row.id]);
+      const ttsEv = await finalCharges(`item_run_id = $1 and provider = 'openai'`, [row.id]);
       assert(ttsEv.length >= 1 && ttsEv.every((e) => e.operation === 'tts.audiobook_chapter' && e.cost_source === 'CALCULATED_FROM_USAGE' && /^req_f2_/.test(e.external_operation_id)), 'eventos TTS');
       const [art] = await ds.query(`select * from public.artifacts where item_run_id = $1 and type = 'dynamic_audio_mp3'`, [row.id]);
       const mp3 = storage.blobs.get(`cursia-artifacts/${art.storage_path}`);
@@ -643,29 +657,35 @@ async function dbChecks() {
       assert(art.metadata.script === s.text && art.metadata.words === s.words, 'guion en el artifact');
     });
 
-    await check('DB audiolibro reanudación: TTS falla (500) tras el guion → reintentable; el re-claim reutiliza el guion guardado (0 llamadas LLM nuevas) y completa', async () => {
+    await check('DB audiolibro (calibración #2): TTS 500 tras el guion = gasto posible → RECONCILIACIÓN (no reintentable), reserva pendiente; un retry común NO vuelve a llamar; resubmitProvider explícito reutiliza el guion (0 LLM) y completa', async () => {
       fakes.plan.ttsFail = [500];
       const llm0 = fakes.st.llm.length;
+      const tts0 = fakes.st.tts.length;
       const item = await claimProvider(runId, 'audiobook_chapter');
       assert(item && item.chapterId === C.c2, 'claim C2');
-      await PW.processProviderItem(workerDeps(), item);
+      await rejectsRe(PW.processProviderItem(workerDeps(), item), /^provider_reconciliation_required/, 'reconciliación');
       let row = await itemRow(runId, item.itemKey);
-      eq(row.status, 'retrying', `estado ${row.status} ${row.error}`);
-      assert(/^tts_failed/.test(row.error) && row.output_summary.audiobookScript, 'guion guardado');
-      // Fix round 1: un 5xx DESPUÉS de enviar = gasto posible → reserva pendiente (clave por item/gen/chunk/intento).
-      const resv = await events(`item_run_id = $1 and provider = 'openai'`, [row.id]);
-      eq(resv.map((x) => [x.event_kind, x.measurement_status, x.metadata.ambiguous, x.idempotency_key]),
-        [['CHARGE', 'pending', true, `tts:${row.id}:1:0:1`]], 'reserva TTS');
+      eq(row.status, 'failed', `estado ${row.status} ${row.error}`);
+      assert(/tts_failed/.test(row.error) && row.output_summary.audiobookScript, 'guion guardado + motivo');
+      const resv = await reservationsOf(row.id, 'openai');
+      eq(resv.map((x) => [x.measurement_status, x.settled, x.idempotency_key]), [['pending', false, `reservation:tts:${row.id}:g1:a1:chunk0`]], 'reserva TTS pendiente (el presupuesto la cuenta)');
       assert(Number(resv[0].amount) > 0, 'reserva con monto estimado');
       const llmAfterFirst = fakes.st.llm.length;
-      eq(llmAfterFirst - llm0, 1, 'una llamada LLM');
-      await ds.query(`update public.generation_item_runs set next_retry_at = now() where id = $1`, [row.id]);
+      eq([llmAfterFirst - llm0, fakes.st.tts.length - tts0], [1, 1], 'una llamada LLM, un TTS');
+      // Retry común: el ledger delata la operación ambigua → 0 llamadas nuevas, sigue en reconciliación.
+      await runs.retryItem(C.cid, OWNER, 1, runId, item.itemKey);
       const again = await claimProvider(runId, 'audiobook_chapter');
-      await PW.processProviderItem(workerDeps(), again);
+      await rejectsRe(PW.processProviderItem(workerDeps(), again), /^provider_reconciliation_required/, 'retry común');
+      eq([fakes.st.llm.length, fakes.st.tts.length - tts0], [llmAfterFirst, 1], '0 llamadas en el retry común');
+      // Decisión humana explícita.
+      await runs.retryItem(C.cid, OWNER, 1, runId, item.itemKey, false, true);
+      const third = await claimProvider(runId, 'audiobook_chapter');
+      await PW.processProviderItem(workerDeps(), third);
       row = await itemRow(runId, item.itemKey);
       eq(row.status, 'completed', `completado (${row.error})`);
-      eq(fakes.st.llm.length, llmAfterFirst, '0 llamadas LLM en la reanudación');
-      eq((await events(`item_run_id = $1 and provider = 'anthropic'`, [row.id])).length, 1, 'un solo cargo LLM');
+      eq(fakes.st.llm.length, llmAfterFirst, '0 llamadas LLM en la reanudación (guion reutilizado)');
+      eq((await finalCharges(`item_run_id = $1 and provider = 'anthropic'`, [row.id])).length, 1, 'un solo cargo LLM');
+      eq((await reservationsOf(row.id, 'openai')).map((x) => x.settled), [false, true], 'reserva ambigua (queda, reconocida) + la del nuevo intento liquidada');
     });
 
     await check('DB video (I2): el worker mide la duración desde el mvhd del MP4 que sube y la persiste ANTES de terminar la subida; artifact + summary con durationSource mp4_mvhd; video_interactions la usa', async () => {
@@ -736,7 +756,7 @@ async function dbChecks() {
     }
     const gammaEv = (itemRunId) => events(`item_run_id = $1 and provider = 'gamma'`, [itemRunId]);
 
-    await check('DB Gamma 5xx en el envío (m2) → gamma_submit_ambiguous NO reintentable + reserva pendiente ambigua (el presupuesto la cuenta); un retry común NO reenvía; solo resubmitProvider explícito pide otra generación', async () => {
+    await check('DB Gamma 5xx en el envío → gamma_submit_ambiguous NO reintentable + reserva previa pendiente (el presupuesto la cuenta); un retry común NO reenvía (reconciliación); solo resubmitProvider explícito pide otra generación', async () => {
       fakes.plan.gammaPostFail = [502];
       const posts0 = fakes.st.gammaPosts.length;
       const item = await claimProvider(runA2, 'presentation');
@@ -744,31 +764,31 @@ async function dbChecks() {
       let row = await itemRow(runA2, item.itemKey);
       eq([row.status, fakes.st.gammaPosts.length - posts0], ['failed', 1], 'failed tras 1 envío');
       assert(/^gamma_submit_ambiguous: .*HTTP 502/.test(row.error) && row.output_summary.externalSubmitStartedAt, `marcador conservado: ${row.error}`);
-      let ev = await gammaEv(row.id);
-      eq(ev.map((x) => [x.event_kind, x.measurement_status, x.metadata.ambiguous, x.external_operation_id]), [['CHARGE', 'pending', true, null]], 'reserva ambigua');
-      assert(near(ev[0].amount, 1.0) && /^gamma:gen:ambiguous-/.test(ev[0].idempotency_key), `reserva ${ev[0].amount} ${ev[0].idempotency_key}`);
+      let resv = await reservationsOf(row.id, 'gamma');
+      eq(resv.map((x) => [x.measurement_status, x.settled, x.external_operation_id, x.idempotency_key === row.output_summary.externalReservationKey]), [['pending', false, null, true]], 'reserva previa pendiente');
+      assert(near(resv[0].amount, 1.0), `reserva ${resv[0].amount}`);
       const actual = await budget.runActual(runA2);
       assert(Number(actual) >= 1.0, `runActual ${actual} cuenta la reserva`);
-      // Retry común: el marcador sigue → ambiguo otra vez, 0 envíos, la reserva NO se duplica.
+      // Retry común: el ledger delata la operación ambigua → reconciliación, 0 envíos, la reserva no se duplica.
       await runs.retryItem(A2.cid, OWNER, 1, runA2, item.itemKey);
       const again = await claimProvider(runA2, 'presentation');
-      await rejectsRe(PW.processProviderItem(workerDeps(), again), /^gamma_submit_ambiguous/, 'retry común');
+      await rejectsRe(PW.processProviderItem(workerDeps(), again), /^provider_reconciliation_required/, 'retry común');
       eq(fakes.st.gammaPosts.length - posts0, 1, 'NINGÚN reenvío automático');
-      eq((await gammaEv(row.id)).length, 1, 'reserva idempotente');
+      eq((await reservationsOf(row.id, 'gamma')).length, 1, 'reserva idempotente');
       // Decisión humana explícita: reenvío.
-      await rejectsRe(runs.retryItem(A2.cid, OWNER, 1, runA2, `audio_welcome:${A2.cid}`, false, true), /resubmitProvider solo aplica|Solo se puede reintentar/, 'solo presentation');
+      await rejectsRe(runs.retryItem(A2.cid, OWNER, 1, runA2, `audio_welcome:${A2.cid}`, false, true), /resubmitProvider solo aplica|Solo se puede reintentar/, 'audio sin reconciliación');
       await runs.retryItem(A2.cid, OWNER, 1, runA2, item.itemKey, false, true);
       row = await itemRow(runA2, item.itemKey);
-      assert(!row.output_summary.externalSubmitStartedAt && row.output_summary.previousExternals.length === 1, 'marcador archivado');
+      assert(!row.output_summary.externalSubmitStartedAt && row.output_summary.previousExternals.length >= 1 && row.output_summary.reconciliationAcknowledgedThroughAttempt >= 2, 'marcador archivado + reconocido');
       const third = await claimProvider(runA2, 'presentation');
       await PW.processProviderItem(workerDeps(), third);
       row = await itemRow(runA2, item.itemKey);
       eq([row.status, fakes.st.gammaPosts.length - posts0], ['completed', 2], 'nueva generación tras la decisión');
-      ev = await gammaEv(row.id);
-      eq(ev.filter((x) => x.event_kind === 'CHARGE').length, 2, 'reserva ambigua (queda) + cargo de la nueva generación');
+      eq((await finalCharges(`item_run_id = $1 and provider = 'gamma'`, [row.id])).length, 1, 'un cargo final (la nueva generación)');
+      eq((await reservationsOf(row.id, 'gamma')).map((x) => x.settled), [false, true], 'reserva ambigua (queda) + la nueva liquidada');
     });
 
-    await check('DB Gamma 4xx definitivo (429) → marcador limpio, reintentable, SIN reserva; conexión cortada tras enviar → ambiguo con reserva (m2)', async () => {
+    await check('DB Gamma 4xx definitivo (429) → reserva LIBERADA (neto 0), marcador limpio, reintentable; conexión cortada tras enviar → ambiguo con reserva pendiente', async () => {
       fakes.plan.gammaPostFail = [429];
       const posts0 = fakes.st.gammaPosts.length;
       const item = await claimProvider(runA2, 'presentation');
@@ -777,57 +797,437 @@ async function dbChecks() {
       let row = await itemRow(runA2, item.itemKey);
       eq(row.status, 'retrying', `429 reintentable (${row.error})`);
       assert(/^gamma_submit_failed/.test(row.error) && row.output_summary.externalSubmitStartedAt === null, 'marcador limpio');
-      eq((await gammaEv(row.id)).length, 0, 'sin reserva por un rechazo definitivo');
+      eq((await reservationsOf(row.id, 'gamma')).map((x) => x.settled), [true], 'reserva liberada por un rechazo definitivo');
+      eq((await gammaEv(row.id)).reduce((a, x) => a + Number(x.amount), 0), 0, 'neto 0');
       fakes.plan.gammaPostFail = ['drop'];
       await ds.query(`update public.generation_item_runs set next_retry_at = now() where id = $1`, [row.id]);
       const again = await claimProvider(runA2, 'presentation');
       await rejectsRe(PW.processProviderItem(workerDeps(), again), /^gamma_submit_ambiguous/, 'drop');
       row = await itemRow(runA2, item.itemKey);
       eq([row.status, fakes.st.gammaPosts.length - posts0], ['failed', 2], 'failed, sin más envíos');
-      const ev = await gammaEv(row.id);
-      eq(ev.map((x) => [x.measurement_status, x.metadata.ambiguous]), [['pending', true]], 'reserva ambigua');
+      eq((await reservationsOf(row.id, 'gamma')).map((x) => [x.attempt, x.settled]), [[1, true], [2, false]], 'reserva ambigua del intento 2');
     });
 
-    await check('DB TTS: conexión cortada tras enviar → reserva pendiente + reintento acotado; 4xx (400) definitivo → sin reserva', async () => {
+    await check('DB TTS: conexión cortada tras enviar → RECONCILIACIÓN (0 reintentos automáticos) con reserva pendiente; tras la decisión humana, 4xx (400) definitivo → reserva liberada, no reintentable', async () => {
       fakes.plan.ttsFail = ['drop'];
+      const tts0 = fakes.st.tts.length;
       const item = await claimProvider(runA2, 'audio_welcome');
-      await PW.processProviderItem(workerDeps(), item);
+      await rejectsRe(PW.processProviderItem(workerDeps(), item), /^provider_reconciliation_required/, 'drop');
       let row = await itemRow(runA2, item.itemKey);
-      eq(row.status, 'retrying', `drop reintentable (${row.error})`);
-      let ev = await events(`item_run_id = $1 and provider = 'openai'`, [row.id]);
-      eq(ev.map((x) => [x.measurement_status, x.metadata.ambiguous, x.idempotency_key]), [['pending', true, `tts:${row.id}:1:0:1`]], 'reserva');
+      eq([row.status, fakes.st.tts.length - tts0], ['failed', 1], 'drop → reconciliación, 1 llamada');
+      eq((await reservationsOf(row.id, 'openai')).map((x) => [x.settled, x.idempotency_key]), [[false, `reservation:tts:${row.id}:g1:a1:chunk0`]], 'reserva pendiente');
       fakes.plan.ttsFail = [400];
-      await ds.query(`update public.generation_item_runs set next_retry_at = now() where id = $1`, [row.id]);
+      await runs.retryItem(A2.cid, OWNER, 1, runA2, item.itemKey, false, true);
       const again = await claimProvider(runA2, 'audio_welcome');
       await rejectsRe(PW.processProviderItem(workerDeps(), again), /tts_failed/, '400 definitivo');
       row = await itemRow(runA2, item.itemKey);
       eq(row.status, 'failed', '400 no reintentable');
-      ev = await events(`item_run_id = $1 and provider = 'openai'`, [row.id]);
-      eq(ev.length, 1, 'el 400 no agrega reserva');
+      eq((await reservationsOf(row.id, 'openai')).map((x) => x.settled), [false, true], 'el 400 libera su reserva; la ambigua queda');
+      eq((await finalCharges(`item_run_id = $1 and provider = 'openai'`, [row.id])).length, 0, 'sin cargos finales');
     });
 
-    await check('DB LLM server-side: conexión cortada tras enviar → reserva pendiente (clave sintética, output = max_tokens) + reintento acotado; el re-claim completa con el cargo medido', async () => {
+    await check('DB LLM server-side: conexión cortada tras enviar → RECONCILIACIÓN con reserva pendiente (output = max_tokens); 0 TTS; tras la decisión humana el re-claim completa con el cargo medido', async () => {
       fakes.plan.llmFail = ['drop'];
+      const llm0 = fakes.st.llm.length;
       const item = await claimProvider(runA2, 'audiobook_chapter');
-      await PW.processProviderItem(workerDeps(), item);
+      await rejectsRe(PW.processProviderItem(workerDeps(), item), /^provider_reconciliation_required/, 'drop');
       let row = await itemRow(runA2, item.itemKey);
-      eq(row.status, 'retrying', `drop reintentable (${row.error})`);
-      let ev = await events(`item_run_id = $1 and provider = 'anthropic'`, [row.id]);
-      eq(ev.map((x) => [x.measurement_status, x.metadata.ambiguous, x.operation, x.idempotency_key, Number(x.usage.output_tokens)]),
-        [['pending', true, 'llm.audiobook_script', `anthropic:msg:unmeasured-${row.id}-g1-a1-main`, 1500]], 'reserva LLM');
+      eq(row.status, 'failed', `reconciliación (${row.error})`);
+      const resv = await reservationsOf(row.id, 'anthropic');
+      eq(resv.map((x) => [x.settled, x.operation, x.idempotency_key, Number(x.usage.output_tokens) > 0]),
+        [[false, 'llm.audiobook_script', `reservation:llm:${row.id}:g1:a1:script-main-0`, true]], 'reserva LLM');
       eq((await events(`item_run_id = $1 and provider = 'openai'`, [row.id])).length, 0, 'sin TTS');
-      await ds.query(`update public.generation_item_runs set next_retry_at = now() where id = $1`, [row.id]);
+      await runs.retryItem(A2.cid, OWNER, 1, runA2, item.itemKey, false, true);
       const again = await claimProvider(runA2, 'audiobook_chapter');
       await PW.processProviderItem(workerDeps(), again);
       row = await itemRow(runA2, item.itemKey);
       eq(row.status, 'completed', `completado (${row.error})`);
-      ev = await events(`item_run_id = $1 and provider = 'anthropic'`, [row.id]);
-      eq(ev.map((x) => x.measurement_status), ['pending', 'final'], 'reserva del intento 1 + cargo medido del intento 2');
+      eq((await finalCharges(`item_run_id = $1 and provider = 'anthropic'`, [row.id])).map((x) => x.measurement_status), ['final'], 'cargo medido del intento reconocido');
+      eq((await reservationsOf(row.id, 'anthropic')).map((x) => x.settled)[0], false, 'la reserva ambigua queda (reconocida)');
+      assert(fakes.st.llm.length - llm0 >= 2, 'la llamada ambigua + la nueva');
     });
+
+    // ═══ Calibración #2 — FAULT INJECTION del protocolo de llamada pagada ═══════════════════════
+    // reserva durable → llamada → resultado → liquidación durable. Ningún caso ambiguo puede
+    // producir automáticamente una segunda operación pagada.
+    const FAULT = () => Object.assign(new Error('EMAXCONNSESSION: max clients reached in session mode (fault injection)'), { code: 'XX000' });
+    const faulty = (target, failOn) => new Proxy(target, {
+      get(t, k) {
+        const v = t[k];
+        if (typeof v !== 'function') return v;
+        return async (...a) => { if (failOn(String(k), a)) throw FAULT(); return v.apply(t, a); };
+      },
+    });
+    const isReservationWrite = (k, a) => k === 'recordCharge' && String((a[0] && a[0].idempotencyKey) || '').startsWith('reservation:');
+    const onlyOnce = (pred) => { let used = false; return (k, a) => { if (!used && pred(k, a)) { used = true; return true; } return false; }; };
+    async function freshRun(title, videos = false) {
+      setReady();
+      const K = await makeCourse(title, { videos });
+      const mode = videos ? 'real' : 'mock';
+      const e = await rejectsRe(runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: mode }), /^budget_approval_required/, `aprobación ${title}`, 409);
+      await budget.adminAuthorize({ courseId: K.cid, estimateId: e.getResponse().estimateId, authorizedBudget: '500', approvedBy: 'admin@cursia.test' });
+      const rid = (await runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: mode })).run.id;
+      await seedDependency(rid, `content:${K.c1}`, 'dynamic_content_md', CONTENT_MD('Bombas'), 'text/markdown');
+      await seedDependency(rid, `content:${K.c2}`, 'dynamic_content_md', CONTENT_MD('Válvulas'), 'text/markdown');
+      await seedDependency(rid, `course_intro:${K.cid}`, 'dynamic_course_intro_json', JSON.stringify({ welcome: 'Hola y bienvenida al curso de hidráulica de planta.' }), 'application/json');
+      return { ...K, rid };
+    }
+    const counts = () => ({ g: fakes.st.gammaPosts.length, t: fakes.st.tts.length, l: fakes.st.llm.length });
+    const delta = (c0) => { const c = counts(); return { gamma: c.g - c0.g, tts: c.t - c0.t, llm: c.l - c0.l }; };
+    const retryNow = (id) => ds.query(`update public.generation_item_runs set next_retry_at = now() where id = $1`, [id]);
+    const FAST = { ...process.env, PROVIDER_CALL_TIMEOUT_MS: '400' };
+
+    await check('FAULT DB cae ANTES del proveedor (la reserva no se puede escribir) → Gamma / TTS / guion LLM: 0 llamadas, 0 eventos, item reintentable; con la DB de vuelta completa sin duplicar', async () => {
+      const R = await freshRun('Fault antes');
+      for (const type of ['presentation', 'audio_welcome', 'audiobook_chapter']) {
+        const c0 = counts();
+        const item = await claimProvider(R.rid, type);
+        await PW.processProviderItem(workerDeps({ finops: faulty(ledger, isReservationWrite) }), item);
+        let row = await itemRow(R.rid, item.itemKey);
+        eq([row.status, delta(c0)], ['retrying', { gamma: 0, tts: 0, llm: 0 }], `${type}: reintentable y 0 llamadas (${row.error})`);
+        assert(/EMAXCONNSESSION/.test(row.error), `${type}: motivo ${row.error}`);
+        eq((await events(`item_run_id = $1`, [row.id])).length, 0, `${type}: 0 eventos`);
+        await retryNow(row.id);
+        const again = await claimProvider(R.rid, type);
+        await PW.processProviderItem(workerDeps(), again);
+        row = await itemRow(R.rid, item.itemKey);
+        eq(row.status, 'completed', `${type}: completa tras volver la DB (${row.error})`);
+        const d = delta(c0);
+        eq(type === 'presentation' ? d.gamma : type === 'audio_welcome' ? d.tts : d.llm, 1, `${type}: exactamente UNA operación pagada`);
+      }
+    });
+
+    await check('FAULT DB cae DESPUÉS del proveedor (falla la liquidación) → TTS y LLM: RECONCILIACIÓN (0 reintentos, reserva pendiente); Gamma: retoma la MISMA generación (0 reenvíos) y liquida UN cargo', async () => {
+      const R = await freshRun('Fault después');
+      const settleFails = (k) => k === 'settleReservation';
+      // OpenAI TTS
+      let c0 = counts();
+      let item = await claimProvider(R.rid, 'audio_welcome');
+      await rejectsRe(PW.processProviderItem(workerDeps({ finops: faulty(ledger, settleFails) }), item), /^provider_reconciliation_required: openai/, 'TTS');
+      let row = await itemRow(R.rid, item.itemKey);
+      eq([row.status, delta(c0).tts], ['failed', 1], 'TTS: failed tras 1 llamada');
+      eq((await reservationsOf(row.id, 'openai')).map((x) => x.settled), [false], 'TTS: reserva pendiente (cuenta en el presupuesto)');
+      await runs.retryItem(R.cid, OWNER, 1, R.rid, item.itemKey);
+      await rejectsRe(PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome')), /^provider_reconciliation_required/, 'TTS retry común');
+      eq(delta(c0).tts, 1, 'TTS: 0 llamadas nuevas en el retry común');
+      // Anthropic (guion del audiolibro)
+      c0 = counts();
+      item = await claimProvider(R.rid, 'audiobook_chapter');
+      await rejectsRe(PW.processProviderItem(workerDeps({ finops: faulty(ledger, settleFails) }), item), /^provider_reconciliation_required: anthropic/, 'LLM');
+      row = await itemRow(R.rid, item.itemKey);
+      eq([row.status, delta(c0)], ['failed', { gamma: 0, tts: 0, llm: 1 }], 'LLM: failed tras 1 llamada, sin TTS');
+      assert(/msg_f2_/.test(row.error), `LLM: el id de la operación queda en el motivo (${row.error})`);
+      // Gamma: la liquidación es al terminal; el id ya quedó persistido → retoma sin reenviar.
+      c0 = counts();
+      item = await claimProvider(R.rid, 'presentation');
+      await PW.processProviderItem(workerDeps({ finops: faulty(ledger, settleFails) }), item);
+      row = await itemRow(R.rid, item.itemKey);
+      eq([row.status, delta(c0).gamma], ['retrying', 1], `Gamma: reintentable (retoma), 1 envío (${row.error})`);
+      assert(/finops_ledger_write_failed/.test(row.error) && row.output_summary.external.gammaGenerationId, 'Gamma: motivo + id persistido');
+      await retryNow(row.id);
+      await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'presentation'));
+      row = await itemRow(R.rid, item.itemKey);
+      eq([row.status, delta(c0).gamma], ['completed', 1], 'Gamma: completa con 0 reenvíos');
+      eq((await finalCharges(`item_run_id = $1 and provider = 'gamma'`, [row.id])).length, 1, 'Gamma: UN cargo');
+      eq((await reservationsOf(row.id, 'gamma')).map((x) => x.settled), [true], 'Gamma: reserva liquidada');
+    });
+
+    await check('FAULT DB caída TOTAL después del proveedor (ni liquidación ni failItem): la lease vence y el re-claim lo detecta en el LEDGER → reconciliación, 0 llamadas; también si el audio pagado no se pudo subir', async () => {
+      const R = await freshRun('Fault total');
+      const c0 = counts();
+      let item = await claimProvider(R.rid, 'audio_welcome');
+      const deadSched = faulty(sched, (k) => k === 'failItem' || k === 'completeItem');
+      await rejectsRe(PW.processProviderItem(workerDeps({ finops: faulty(ledger, (k) => k === 'settleReservation'), scheduler: deadSched }), item), /EMAXCONNSESSION/, 'DB caída');
+      let row = await itemRow(R.rid, item.itemKey);
+      eq([row.status, delta(c0).tts], ['running', 1], 'quedó running tras 1 llamada');
+      await ds.query(`update public.generation_item_runs set lease_until = now() - interval '1 second' where id = $1`, [row.id]);
+      await sched.sweepExpiredLeases(R.rid);
+      await retryNow(row.id);
+      await rejectsRe(PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome')), /^provider_reconciliation_required/, 're-claim');
+      row = await itemRow(R.rid, item.itemKey);
+      eq([row.status, delta(c0).tts], ['failed', 1], 're-claim: reconciliación, 0 llamadas nuevas');
+      // Variante: la liquidación SÍ quedó, pero el audio pagado no se pudo subir y la DB tampoco deja fallar el item.
+      const c1 = counts();
+      item = await claimProvider(R.rid, 'audiobook_chapter');
+      const deadArtifacts = faulty(artifacts, (k) => k === 'uploadBufferArtifact');
+      await rejectsRe(PW.processProviderItem(workerDeps({ artifacts: deadArtifacts, scheduler: deadSched }), item), /EMAXCONNSESSION/, 'subida caída');
+      row = await itemRow(R.rid, item.itemKey);
+      const d1 = delta(c1);
+      eq([row.status, d1.llm >= 1, d1.tts >= 1], ['running', true, true], 'pagó guion + TTS');
+      await ds.query(`update public.generation_item_runs set lease_until = now() - interval '1 second' where id = $1`, [row.id]);
+      await sched.sweepExpiredLeases(R.rid);
+      await retryNow(row.id);
+      await rejectsRe(PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audiobook_chapter')), /^provider_reconciliation_required: openai/, 're-claim tras pagar sin persistir');
+      eq(delta(c1), d1, '0 llamadas nuevas (ni LLM ni TTS)');
+    });
+
+    await check('REVIEW I4a: el MP3 pagado YA se subió y la DB cae al completar (ni completeItem ni failItem): el re-claim REUTILIZA el artifact subido y completa, 0 llamadas nuevas (nunca reconciliación ni re-pago)', async () => {
+      const R = await freshRun('Review I4a');
+      const c0 = counts();
+      const item = await claimProvider(R.rid, 'audio_welcome');
+      const deadSched = faulty(sched, (k) => k === 'completeItem' || k === 'failItem');
+      await rejectsRe(PW.processProviderItem(workerDeps({ scheduler: deadSched }), item), /EMAXCONNSESSION/, 'DB caída al completar');
+      let row = await itemRow(R.rid, item.itemKey);
+      eq([row.status, delta(c0).tts], ['running', 1], 'running tras 1 TTS');
+      await ds.query(`update public.generation_item_runs set lease_until = now() - interval '1 second' where id = $1`, [row.id]);
+      await sched.sweepExpiredLeases(R.rid);
+      await retryNow(row.id);
+      await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome'));
+      row = await itemRow(R.rid, item.itemKey);
+      eq([row.status, delta(c0).tts, row.output_summary.reusedUploadedArtifact], ['completed', 1, true], `reutilizado (${row.error})`);
+      eq((await finalCharges(`item_run_id = $1 and provider = 'openai'`, [row.id])).length, 1, 'UN cargo de TTS');
+    });
+
+    await check('REVIEW I4b: resultado CONOCIDO (guion rechazado por validación, AUDIOBOOK_SCRIPT_TOO_SHORT) → reintento acotado normal (NO reconciliación); el intento queda reconocido y el re-claim completa', async () => {
+      const R = await freshRun('Review I4b');
+      const c0 = counts();
+      fakes.plan.llmTiny = 2; // main + continuación, ambas cortas
+      const item = await claimProvider(R.rid, 'audiobook_chapter');
+      await PW.processProviderItem(workerDeps(), item);
+      let row = await itemRow(R.rid, item.itemKey);
+      eq(row.status, 'retrying', `reintentable (${row.error})`);
+      assert(/^AUDIOBOOK_SCRIPT_TOO_SHORT/.test(row.error) && !/reconciliation/.test(row.error), row.error);
+      eq([row.output_summary.reconciliationAcknowledgedThroughAttempt, delta(c0).llm, delta(c0).tts], [1, 2, 0], 'intento reconocido; 2 LLM, 0 TTS');
+      await retryNow(row.id);
+      await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audiobook_chapter'));
+      row = await itemRow(R.rid, item.itemKey);
+      eq(row.status, 'completed', `completa (${row.error})`);
+    });
+
+    await check('FAULT timeout del proveedor (PROVIDER_CALL_TIMEOUT_MS) → TTS y LLM: reconciliación; Gamma: gamma_submit_ambiguous; reserva pendiente y 0 reintentos automáticos', async () => {
+      const R = await freshRun('Fault timeout');
+      let c0 = counts();
+      fakes.plan.ttsFail = ['hang'];
+      await rejectsRe(PW.processProviderItem(workerDeps({ env: FAST }), await claimProvider(R.rid, 'audio_welcome')), /^provider_reconciliation_required: openai/, 'TTS timeout');
+      fakes.plan.llmFail = ['hang'];
+      await rejectsRe(PW.processProviderItem(workerDeps({ env: FAST }), await claimProvider(R.rid, 'audiobook_chapter')), /^provider_reconciliation_required: anthropic/, 'LLM timeout');
+      fakes.plan.gammaPostFail = ['hang'];
+      await rejectsRe(PW.processProviderItem(workerDeps({ env: FAST }), await claimProvider(R.rid, 'presentation')), /^gamma_submit_ambiguous/, 'Gamma timeout');
+      eq(delta(c0), { gamma: 1, tts: 1, llm: 1 }, 'una llamada por proveedor, ninguna repetida');
+      const pend = await ds.query(`select provider from public.generation_cost_events e where e.run_id = $1 and metadata->>'reservation' = 'true'
+        and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id) order by provider`, [R.rid]);
+      eq(pend.map((x) => x.provider), ['anthropic', 'gamma', 'openai'], 'las tres reservas quedan pendientes (el presupuesto las cuenta)');
+    });
+
+    await check('FAULT respuesta ambigua del proveedor: Gamma 200 sin generationId → ambiguo; TTS 502 → reconciliación; nunca un reenvío', async () => {
+      const R = await freshRun('Fault ambiguo');
+      const c0 = counts();
+      fakes.plan.gammaPostFail = ['noid'];
+      await rejectsRe(PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'presentation')), /^gamma_submit_ambiguous: .*sin generationId/, 'Gamma sin id');
+      fakes.plan.ttsFail = [502];
+      await rejectsRe(PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome')), /^provider_reconciliation_required/, 'TTS 502');
+      eq(delta(c0), { gamma: 1, tts: 1, llm: 0 }, 'sin reenvíos');
+    });
+
+    await check('FAULT misma operación del proveedor dos veces (x-request-id repetido) → UN solo cargo en el ledger; ambas reservas liquidadas', async () => {
+      const R1 = await freshRun('Fault dup 1');
+      const R2 = await freshRun('Fault dup 2');
+      fakes.plan.ttsFixedRequestId = 'req_dup_calib2';
+      try {
+        await PW.processProviderItem(workerDeps(), await claimProvider(R1.rid, 'audio_welcome'));
+        await PW.processProviderItem(workerDeps(), await claimProvider(R2.rid, 'audio_welcome'));
+      } finally {
+        fakes.plan.ttsFixedRequestId = null;
+      }
+      eq((await events(`idempotency_key = 'openai:req:req_dup_calib2'`, [])).length, 1, 'un cargo por la operación');
+      const r1 = await itemRow(R1.rid, `audio_welcome:${R1.cid}`);
+      const r2 = await itemRow(R2.rid, `audio_welcome:${R2.cid}`);
+      eq([(await reservationsOf(r1.id, 'openai')).map((x) => x.settled), (await reservationsOf(r2.id, 'openai')).map((x) => x.settled)], [[true], [true]], 'reservas liquidadas (sin doble conteo)');
+    });
+
+    // ── Videogen (dynamic-item-worker) ──
+    let ytSeq = 0;
+    const ytPublisher = {
+      async getConnection() { return { userId: OWNER, status: 'active', scopes: 'youtube.upload,youtube.readonly' }; },
+      async getAccessToken() { return 'fake-access'; },
+      async uploadFromUrl(_c, options) { await options.onBeforeUpload(syntheticMp4WithMvhd(120, 'fault')); const id = `Yt${String(++ytSeq).padStart(9, '0')}`; return { videoId: id, youtubeUrl: `https://www.youtube.com/watch?v=${id}` }; },
+    };
+    const vgFake = (behavior) => {
+      const st = { submits: 0 };
+      return {
+        st,
+        async batchCreate() {
+          st.submits++;
+          if (behavior === 'timeout') throw new Error('The operation was aborted due to timeout');
+          if (behavior === '422') throw new Error('Videogen batch-create failed (HTTP 422): invalid content');
+          if (behavior === 'weird') return { batch_id: 'b', jobs: [] };
+          return { batch_id: `b_${st.submits}`, jobs: [{ job_id: `vg_fault_${crypto.randomUUID().slice(0, 8)}` }] };
+        },
+        async getVideoStatus(id) { return { job_id: id, status: 'completed_local', download_url: 'https://fake-videogen.invalid/x.mp4', progress: 100, error: null }; },
+        async getVideoCost() { return { estimated_total_cost: 0.9 }; },
+      };
+    };
+    const videoDeps = (videogen, over = {}) => ({
+      scheduler: sched, dataSource: ds, artifacts: { getDownloadUrl: (id, o) => artifacts.getDownloadUrl(id, o), uploadJsonArtifact: (i) => artifacts.uploadJsonArtifact(i) },
+      videogen, youtube: ytPublisher, logger: capLogger, executorId: 'f2-item-worker', leaseSeconds: 120, heartbeatMs: 600000,
+      videoTimeoutMin: 1, videoPollMs: 5, mockScenario: 'success', mockResolvePolls: 1, finops: ledger, budget, ...over,
+    });
+    const claimVideo = (rid) => sched.claimNextItem({ executorId: 'f2-item-worker', types: ['video'], leaseSeconds: 120, runId: rid });
+
+    await check('FAULT Videogen: DB cae antes (reserva) → 0 envíos, reintentable; timeout / respuesta rara → ambiguous_video_submission NO reintentable con reserva pendiente (retry común: 0 envíos); 4xx → rechazo definitivo, reserva liberada', async () => {
+      const R = await freshRun('Fault video A', true);
+      let vg = vgFake('ok');
+      let item = await claimVideo(R.rid);
+      await IW.processItem(videoDeps(vg, { finops: faulty(ledger, isReservationWrite) }), item);
+      let row = await itemRow(R.rid, item.itemKey);
+      eq([row.status, vg.st.submits, (await events(`item_run_id = $1`, [row.id])).length], ['retrying', 0, 0], `DB antes: 0 envíos (${row.error})`);
+      await retryNow(row.id);
+      vg = vgFake('timeout');
+      item = await claimVideo(R.rid);
+      await IW.processItem(videoDeps(vg), item);
+      row = await itemRow(R.rid, item.itemKey);
+      eq([row.status, vg.st.submits], ['failed', 1], 'timeout: failed tras 1 envío');
+      assert(/^ambiguous_video_submission: .*timeout/.test(row.error), row.error);
+      eq((await reservationsOf(row.id, 'videogen')).map((x) => x.settled), [false], 'reserva pendiente');
+      await runs.retryItem(R.cid, OWNER, 1, R.rid, item.itemKey);
+      await IW.processItem(videoDeps(vg), await claimVideo(R.rid));
+      eq(vg.st.submits, 1, 'retry común: 0 envíos nuevos');
+      const R2 = await freshRun('Fault video B', true);
+      const vgw = vgFake('weird');
+      await IW.processItem(videoDeps(vgw), await claimVideo(R2.rid));
+      row = await itemRow(R2.rid, `video:${R2.c1}`);
+      eq([row.status, vgw.st.submits, /^ambiguous_video_submission: .*forma inesperada/.test(row.error)], ['failed', 1, true], `respuesta rara (${row.error})`);
+      const R3 = await freshRun('Fault video C', true);
+      const vg4 = vgFake('422');
+      await IW.processItem(videoDeps(vg4), await claimVideo(R3.rid));
+      row = await itemRow(R3.rid, `video:${R3.c1}`);
+      eq([row.status, /^videogen_submit_rejected/.test(row.error)], ['failed', true], `422 (${row.error})`);
+      eq((await reservationsOf(row.id, 'videogen')).map((x) => x.settled), [true], '422: reserva liberada');
+    });
+
+    await check('FAULT Videogen: DB cae DESPUÉS del envío (job sin persistir) → ambiguous_video_submission con el jobId en el motivo; falla la liquidación al terminar → retoma el MISMO job (0 reenvíos) y deja UN cargo', async () => {
+      const R = await freshRun('Fault video D', true);
+      const vg = vgFake('ok');
+      const extFails = faulty(sched, (k, a) => k === 'recordItemExternal' && a[2] && a[2].external && a[2].external.videogenJobId);
+      await IW.processItem(videoDeps(vg, { scheduler: extFails }), await claimVideo(R.rid));
+      let row = await itemRow(R.rid, `video:${R.c1}`);
+      eq([row.status, vg.st.submits], ['failed', 1], `failed tras 1 envío (${row.error})`);
+      assert(/^ambiguous_video_submission: .*vg_fault_/.test(row.error), row.error);
+      const R2 = await freshRun('Fault video E', true);
+      const vg2 = vgFake('ok');
+      await IW.processItem(videoDeps(vg2, { finops: faulty(ledger, (k) => k === 'settleReservation') }), await claimVideo(R2.rid));
+      row = await itemRow(R2.rid, `video:${R2.c1}`);
+      eq([row.status, vg2.st.submits], ['retrying', 1], `liquidación caída: reintentable (${row.error})`);
+      await retryNow(row.id);
+      await IW.processItem(videoDeps(vg2), await claimVideo(R2.rid));
+      row = await itemRow(R2.rid, `video:${R2.c1}`);
+      eq([row.status, vg2.st.submits], ['completed', 1], `retoma el mismo job (${row.error})`);
+      eq((await finalCharges(`item_run_id = $1 and provider = 'videogen'`, [row.id])).length, 1, 'UN cargo por el job');
+      eq((await reservationsOf(row.id, 'videogen')).map((x) => x.settled), [true], 'reserva liquidada');
+    });
+
+    await check('REVIEW I5: Videogen con costo pendiente al terminar el render → en la fase YouTube el costo llega pero el LEDGER falla → el item NO completa en silencio (reintentable); el re-claim NO re-sube ni re-renderiza y liquida', async () => {
+      const R = await freshRun('Review I5', true);
+      let costCalls = 0;
+      const vg = { st: { submits: 0 },
+        async batchCreate() { this.st.submits++; return { batch_id: 'b_i5', jobs: [{ job_id: `vg_i5_${crypto.randomUUID().slice(0, 8)}` }] }; },
+        async getVideoStatus(id) { return { job_id: id, status: 'completed_local', download_url: 'https://fake-videogen.invalid/x.mp4', progress: 100, error: null }; },
+        async getVideoCost() { costCalls++; if (costCalls === 1) throw new Error('costs endpoint 503'); return { estimated_total_cost: 0.88 }; },
+      };
+      const ytBefore = ytSeq;
+      await IW.processItem(videoDeps(vg, { finops: faulty(ledger, (k) => k === 'recordAdjustment') }), await claimVideo(R.rid));
+      let row = await itemRow(R.rid, `video:${R.c1}`);
+      eq(row.status, 'retrying', `no completa en silencio (${row.error})`);
+      assert(/finops_ledger_write_failed/.test(row.error), row.error);
+      await retryNow(row.id);
+      await IW.processItem(videoDeps(vg), await claimVideo(R.rid));
+      row = await itemRow(R.rid, `video:${R.c1}`);
+      eq([row.status, vg.st.submits, ytSeq - ytBefore], ['completed', 1, 1], `completa: 1 render, 1 subida (${row.error})`);
+      const net = (await events(`item_run_id = $1 and provider = 'videogen'`, [row.id])).reduce((a, e) => a + Number(e.amount), 0);
+      assert(near(net, 0.88), `neto liquidado ${net}`);
+    });
+
+    // ═══ Calibración #2 — Pages proxy REAL (frontend) → JWT ES256 → Anthropic FALSO → ingest HTTP REAL (Nest + guard)
+    //     → ledger REAL (PG16) con la cadena curso/Blueprint/Manifest/run/item_run. 1 operación = 1 evento.
+    const FE_REPO = process.env.CURSIA_FRONTEND_REPO || path.resolve(REPO, '../campuscloud-gen');
+    const PROXY_JS = path.join(FE_REPO, 'functions/api/proxy.js');
+    if (!fs.existsSync(PROXY_JS)) {
+      console.log(`⚠️  sin ${PROXY_JS} (CURSIA_FRONTEND_REPO): se omite el e2e del proxy de Pages`);
+    } else {
+      await check('E2E Pages proxy (functions/api/proxy.js real, config de staging server_only) → JWT ES256 validado → Anthropic falso → ingest HTTP real → ledger: owner / curso / Blueprint / Manifest / run / item_run / item_key / módulo / capítulo / proveedor / modelo / usage / snapshot de precio; 1 operación = 1 evento (re-post idempotente)', async () => {
+        const { NestFactory } = require('@nestjs/core');
+        const { Module, Logger: NestLogger } = require('@nestjs/common');
+        NestLogger.overrideLogger(false);
+        const FC = loadDist('modules/finops/finops.controller.js');
+        const FG = loadDist('modules/finops/finops-ingest-token.guard.js');
+        const FL = loadDist('modules/finops/finops-ledger.service.js');
+        class IngestE2EModule {}
+        Module({ controllers: [FC.FinopsIngestController], providers: [{ provide: FL.FinopsLedgerService, useValue: ledger }, FG.FinopsIngestTokenGuard] })(IngestE2EModule);
+        const app = await NestFactory.create(IngestE2EModule, { logger: false });
+        app.setGlobalPrefix('api/v1');
+        await app.listen(0, '127.0.0.1');
+        const backend = `http://127.0.0.1:${app.getHttpServer().address().port}`;
+        const savedTok = process.env.FINOPS_INGEST_TOKEN;
+        process.env.FINOPS_INGEST_TOKEN = 'finops-e2e-token';
+        const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+        const jwk = { ...publicKey.export({ format: 'jwk' }), kid: 'e2e', alg: 'ES256', use: 'sig' };
+        const b64 = (b) => Buffer.from(b).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        const SUPA = 'https://e2e-staging.supabase.co';
+        const hdr = b64(JSON.stringify({ alg: 'ES256', typ: 'JWT', kid: 'e2e' }));
+        const pay = b64(JSON.stringify({ sub: OWNER, exp: Math.floor(Date.now() / 1000) + 600 }));
+        const token = `${hdr}.${pay}.${b64(crypto.sign('sha256', Buffer.from(`${hdr}.${pay}`), { key: privateKey, dsaEncoding: 'ieee-p1363' }))}`;
+        const realFetch = globalThis.fetch;
+        const anth = [];
+        let msgSeq = 1; // msg_e2e_1 es la operación que se repite
+        let replayNext = false; // el proxy no reenvía headers del cliente a Anthropic: la repetición la decide la prueba
+        globalThis.fetch = async (url, opts = {}) => {
+          const u = String(url);
+          if (u === `${SUPA}/auth/v1/.well-known/jwks.json`) return new Response(JSON.stringify({ keys: [jwk] }), { status: 200 });
+          if (u === 'https://api.anthropic.com/v1/messages') {
+            anth.push({ key: opts.headers['x-api-key'] });
+            const id = replayNext ? 'msg_e2e_1' : `msg_e2e_${++msgSeq}`;
+            return new Response(JSON.stringify({ id, type: 'message', role: 'assistant', model: 'claude-haiku-4-5-20251001', stop_reason: 'end_turn', content: [{ type: 'text', text: 'ok' }], usage: { input_tokens: 3000, output_tokens: 3700, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }), { status: 200, headers: { 'request-id': `req_${id}` } });
+          }
+          if (u.startsWith(backend)) return realFetch(url, opts);
+          throw new Error('red inesperada en el e2e del proxy: ' + u);
+        };
+        try {
+          const { onRequest } = await import(require('url').pathToFileURL(PROXY_JS).href);
+          const R = await freshRun('E2E proxy Pages');
+          const target = await itemRow(R.rid, `content:${R.c1}`);
+          const env = { SUPABASE_URL: SUPA, ANTHROPIC_API_KEY: 'sk-cursia-staging-e2e', ANTHROPIC_KEY_POLICY: 'server_only', FINOPS_BACKEND_URL: backend, FINOPS_INGEST_TOKEN: 'finops-e2e-token' };
+          const callProxy = async (extra = {}) => {
+            replayNext = !!extra['x-e2e-replay'];
+            const waits = [];
+            const request = new Request('https://staging.orbia.pages.dev/api/proxy', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, 'x-user-key': 'sk-personal-NO', 'x-cursia-item-run-id': target.id, 'x-cursia-call-role': 'main', 'x-cursia-attempt': '1', ...extra },
+              body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 8000, messages: [{ role: 'user', content: 'capítulo' }] }),
+            });
+            const res = await onRequest({ request, env, waitUntil: (p) => waits.push(p) });
+            await Promise.all(waits);
+            return res.status;
+          };
+          eq(await callProxy({ 'x-e2e-replay': '1' }), 200, 'proxy 200');
+          const evs = await events(`idempotency_key = 'anthropic:msg:msg_e2e_1'`, []);
+          eq(evs.length, 1, 'exactamente 1 evento por la operación');
+          const e = evs[0];
+          const [bp] = await ds.query(`select b.id from public.course_blueprints b where b.course_id = $1`, [R.cid]);
+          eq([e.owner_id, e.course_id, e.blueprint_id, e.manifest_id, e.run_id, e.item_run_id, e.item_key, e.module_id, e.chapter_id],
+            [OWNER, R.cid, bp.id, R.manifest.id, R.rid, target.id, `content:${R.c1}`, R.m1, R.c1], 'atribución completa');
+          eq([e.provider, e.model_or_product, e.operation, e.billing_account, e.cost_source, e.measurement_status, e.external_operation_id, e.recorded_by],
+            ['anthropic', 'claude-haiku-4-5-20251001', 'llm.content', 'cursia', 'CALCULATED_FROM_USAGE', 'final', 'msg_e2e_1', 'llm-proxy'], 'proveedor / modelo / medición');
+          eq([Number(e.usage.input_tokens), Number(e.usage.output_tokens)], [3000, 3700], 'usage');
+          assert(e.pricing_snapshot && JSON.stringify(e.pricing_snapshot).includes('claude-haiku-4-5') && Number(e.amount) > 0, `snapshot de precio + monto ${e.amount}`);
+          eq(anth.map((a) => a.key), ['sk-cursia-staging-e2e'], 'clave de Cursia (x-user-key ignorada)');
+          // La MISMA operación re-posteada (reintento del post / reintento del proxy) → sigue siendo 1 evento.
+          eq(await callProxy({ 'x-e2e-replay': '1' }), 200, 'replay 200');
+          eq((await events(`idempotency_key = 'anthropic:msg:msg_e2e_1'`, [])).length, 1, 'misma operación = 1 evento');
+          // Otra operación distinta → otro evento (1 operación = 1 evento).
+          eq(await callProxy(), 200, 'segunda operación');
+          const all = await events(`item_run_id = $1 and provider = 'anthropic'`, [target.id]);
+          eq(all.length, 2, `2 operaciones = 2 eventos (${JSON.stringify(all.map((x) => [x.event_kind, x.idempotency_key, x.recorded_by]))})`);
+        } finally {
+          globalThis.fetch = realFetch;
+          if (savedTok === undefined) delete process.env.FINOPS_INGEST_TOKEN; else process.env.FINOPS_INGEST_TOKEN = savedTok;
+          await app.close();
+        }
+      });
+    }
 
     await check('DB netguard/fakes: todas las llamadas a proveedores fueron a 127.0.0.1 con SU clave (0 rechazos de auth en los fakes)', async () => {
       eq(fakes.st.badAuth, [], 'claves correctas');
-      assert(fakes.st.gammaPosts.length >= 2 && fakes.st.exports.length >= 2 && fakes.st.tts.length >= 4 && fakes.st.llm.filter((x) => !x.failed).length >= 3, JSON.stringify({ g: fakes.st.gammaPosts.length, e: fakes.st.exports.length, t: fakes.st.tts.length, l: fakes.st.llm.length }));
+      assert(fakes.st.gammaPosts.length >= 2 && fakes.st.exports.length >= 2 && fakes.st.tts.length >= 3 && fakes.st.llm.filter((x) => !x.failed).length >= 3, JSON.stringify({ g: fakes.st.gammaPosts.length, e: fakes.st.exports.length, t: fakes.st.tts.length, l: fakes.st.llm.length }));
     });
 
     await check('DB secretos: ninguna clave aparece en logs capturados, errores de items, output_summary, metadata de artifacts ni del ledger', async () => {

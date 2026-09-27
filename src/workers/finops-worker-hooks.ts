@@ -6,15 +6,15 @@
 // La atribución (owner/course/run/item) la deriva el ledger del item run o
 // del run — nunca de datos del cliente.
 // ─────────────────────────────────────────────────────────────────────────────
-import type { FinopsLedgerService, RecordResult, CallRole } from '../modules/finops/finops-ledger.service';
+import type { FinopsLedgerService, RecordResult, CallRole, RecordChargeInput, ItemPaidCharge } from '../modules/finops/finops-ledger.service';
 import type { FinopsBudgetService } from '../modules/finops/finops-budget.service';
-import { BUDGET_EXCEEDED } from '../modules/finops/run-budget';
+import { BUDGET_EXCEEDED, PROVIDER_RECONCILIATION_REQUIRED } from '../modules/finops/run-budget';
 import { costIdempotencyKey } from '../modules/finops/idempotency';
 import { llmIngestToChargeInput } from '../modules/finops/llm-usage-ingest';
 import { usageModelPriorsV1 } from '../modules/finops/usage-model';
 
 export type WorkerLedger = Pick<FinopsLedgerService, 'recordCharge' | 'recordAdjustment' | 'recordZero'> &
-  Partial<Pick<FinopsLedgerService, 'settleMeasuredUsage'>>;
+  Partial<Pick<FinopsLedgerService, 'settleMeasuredUsage' | 'settleReservation' | 'itemPaidCharges'>>;
 export type WorkerBudget = Pick<FinopsBudgetService, 'guardPaidSubmission'>;
 
 /**
@@ -62,6 +62,10 @@ export interface VideogenChargeInput {
  *   measurement_status='pending'; se corrige con settleVideogenPending (ADJUSTMENT).
  */
 export async function recordVideogenCharge(ledger: WorkerLedger, a: VideogenChargeInput): Promise<RecordResult> {
+  return ledger.recordCharge(videogenChargeInput(a));
+}
+
+export function videogenChargeInput(a: VideogenChargeInput): RecordChargeInput {
   const role = videogenCallRoleOf(a.outputSummary);
   const base = {
     itemRunId: a.itemRunId,
@@ -79,10 +83,10 @@ export async function recordVideogenCharge(ledger: WorkerLedger, a: VideogenChar
     recordedBy: 'dynamic-item-worker',
   };
   if (a.mode === 'mock') {
-    return ledger.recordCharge({ ...base, billingAccount: 'mock', mode: 'mock', costSource: 'MOCK', metadata: { fixture: true } });
+    return { ...base, billingAccount: 'mock', mode: 'mock', costSource: 'MOCK', metadata: { fixture: true } };
   }
   if (typeof a.cost === 'number' && Number.isFinite(a.cost) && a.cost >= 0) {
-    return ledger.recordCharge({
+    return {
       ...base,
       billingAccount: 'cursia',
       mode: 'real',
@@ -90,16 +94,30 @@ export async function recordVideogenCharge(ledger: WorkerLedger, a: VideogenChar
       providerCalculatedAmount: String(a.cost),
       measurementStatus: 'final',
       metadata: { costBasis: 'videogen.getVideoCost.estimated_total_cost' },
-    });
+    };
   }
-  return ledger.recordCharge({
+  return {
     ...base,
     billingAccount: 'cursia',
     mode: 'real',
     costSource: 'CALCULATED_FROM_USAGE',
     measurementStatus: 'pending',
     metadata: { costBasis: 'pricing_catalog_provisional', pendingReason: (a.costError || 'cost_lookup_failed').slice(0, 300) },
-  });
+  };
+}
+
+/**
+ * Terminal de un render (calibración #2): el cargo del job ya existe `pending` desde la
+ * aceptación (reserva liquidada) → con el costo medido se liquida (ADJUSTMENT); sin fila
+ * previa (runs anteriores a este cambio) se inserta. Nunca traga errores del ledger.
+ */
+export async function finalizeVideogenCharge(ledger: WorkerLedger, a: VideogenChargeInput): Promise<'recorded' | 'settled' | 'still_pending' | 'already_final'> {
+  const r = await ledger.recordCharge(videogenChargeInput(a));
+  if (r.inserted) return 'recorded';
+  if (r.event?.measurement_status !== 'pending') return 'already_final';
+  if (!(a.mode === 'real' && typeof a.cost === 'number' && Number.isFinite(a.cost) && a.cost >= 0)) return 'still_pending';
+  await settleVideogenPending(ledger, a.jobId, a.cost);
+  return 'settled';
 }
 
 /**
@@ -198,9 +216,13 @@ export async function recordGammaCharge(
     itemAttempt?: number;
   },
 ): Promise<RecordResult> {
+  return ledger.recordCharge(gammaChargeInput(a));
+}
+
+export function gammaChargeInput(a: Parameters<typeof recordGammaCharge>[1]): RecordChargeInput {
   const role = providerCallRoleOf(a.itemAttempt);
   const measured = typeof a.creditsDeducted === 'number' && Number.isFinite(a.creditsDeducted) && a.creditsDeducted >= 0;
-  return ledger.recordCharge({
+  return {
     itemRunId: a.itemRunId,
     ownerIdFromAuth: a.ownerId,
     provider: 'gamma',
@@ -225,7 +247,7 @@ export async function recordGammaCharge(
       creditsRemaining: a.creditsRemaining,
       ...(measured ? {} : { pendingReason: 'gamma_credits_not_reported' }),
     },
-  });
+  };
 }
 
 /**
@@ -249,9 +271,13 @@ export async function recordTtsCharge(
     itemAttempt?: number;
   },
 ): Promise<RecordResult> {
+  return ledger.recordCharge(ttsChargeInput(a));
+}
+
+export function ttsChargeInput(a: Parameters<typeof recordTtsCharge>[1]): RecordChargeInput {
   const measured = typeof a.audioSeconds === 'number' && Number.isFinite(a.audioSeconds) && a.audioSeconds > 0;
   const role = providerCallRoleOf(a.itemAttempt);
-  return ledger.recordCharge({
+  return {
     itemRunId: a.itemRunId,
     ownerIdFromAuth: a.ownerId,
     provider: 'openai',
@@ -278,7 +304,7 @@ export async function recordTtsCharge(
       chunk: a.chunk,
       ...(measured ? {} : { pendingReason: 'tts_audio_not_measurable' }),
     },
-  });
+  };
 }
 
 /**
@@ -299,6 +325,10 @@ export async function recordServerLlmCharge(
     attempt: number;
   },
 ): Promise<RecordResult> {
+  return ledger.recordCharge(serverLlmChargeInput(a));
+}
+
+export function serverLlmChargeInput(a: Parameters<typeof recordServerLlmCharge>[1]): RecordChargeInput {
   const input = llmIngestToChargeInput({
     subject: a.ownerId,
     itemRunId: a.itemRunId,
@@ -316,7 +346,7 @@ export async function recordServerLlmCharge(
     billingAccount: 'cursia',
     mode: 'real',
   });
-  return ledger.recordCharge({ ...input, recordedBy: 'dynamic-provider-worker', metadata: { ...(input.metadata || {}), serverSide: true } });
+  return { ...input, recordedBy: 'dynamic-provider-worker', metadata: { ...(input.metadata || {}), serverSide: true } };
 }
 
 // ─── V2.1 F2 fix round 1: reservas PENDIENTES (gasto posible no medido todavía) ──
@@ -349,9 +379,13 @@ export async function recordGammaPending(
   ledger: WorkerLedger,
   a: { ownerId: string; itemRunId: string; generationId: string; itemAttempt?: number; ambiguous?: boolean; reason?: string },
 ): Promise<RecordResult> {
+  return ledger.recordCharge(gammaPendingInput(a));
+}
+
+export function gammaPendingInput(a: Parameters<typeof recordGammaPending>[1]): RecordChargeInput {
   const role = providerCallRoleOf(a.itemAttempt);
   const credits = gammaEstimatedCredits();
-  return ledger.recordCharge({
+  return {
     itemRunId: a.itemRunId,
     ownerIdFromAuth: a.ownerId,
     provider: 'gamma',
@@ -376,7 +410,7 @@ export async function recordGammaPending(
       ...(a.ambiguous ? { ambiguous: true } : {}),
       ...(a.reason ? { pendingReason: a.reason.slice(0, 300) } : {}),
     },
-  });
+  };
 }
 
 /**
@@ -506,4 +540,154 @@ export async function blockWithoutGuard(
   } else {
     await scheduler.failItem(itemRunId, executorId, msg, false);
   }
+}
+
+// ─── V2.1 calibración (#2): protocolo de llamada pagada ───────────────────────
+//   reserva DURABLE → llamada → resultado → liquidación DURABLE (atómica).
+// - Si la reserva no se puede escribir, la llamada NO se hace (provider_calls = 0).
+// - Si el proveedor pudo aceptar/completar y después falla la persistencia o la
+//   liquidación, NO hay reintento automático: el item queda en reconciliación.
+// - Nunca se ignora un error del ledger (ni reserva, ni liquidación, ni cargo).
+
+/** Prefijo estable del estado de reconciliación de un item (resultado externo ambiguo). */
+export { PROVIDER_RECONCILIATION_REQUIRED };
+
+export type PaidCallKind = 'tts' | 'llm' | 'gamma' | 'videogen';
+
+export interface PaidCallReservation {
+  kind: PaidCallKind;
+  ownerId: string;
+  itemRunId: string;
+  generation: number;
+  itemAttempt: number;
+  /** Identifica la llamada dentro del intento (p.ej. `chunk0`, `main`, `continuation`, `submit`). */
+  tag: string;
+  /** Estimado conservador de la llamada (solo para la reserva). */
+  estimate: { characters?: number; promptChars?: number; maxTokens?: number; model?: string };
+}
+
+export function reservationKey(r: Pick<PaidCallReservation, 'kind' | 'itemRunId' | 'generation' | 'itemAttempt' | 'tag'>): string {
+  const safeTag = String(r.tag).replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 64);
+  return `reservation:${r.kind}:${r.itemRunId}:g${r.generation}:a${r.itemAttempt}:${safeTag}`;
+}
+
+function reservationInput(r: PaidCallReservation): RecordChargeInput {
+  const role = providerCallRoleOf(r.itemAttempt);
+  const base = {
+    itemRunId: r.itemRunId,
+    ownerIdFromAuth: r.ownerId,
+    idempotencyKey: reservationKey(r),
+    externalOperationId: null,
+    callRole: role.callRole,
+    attempt: role.attempt,
+    billingAccount: 'cursia' as const,
+    mode: 'real' as const,
+    costSource: 'CALCULATED_FROM_USAGE' as const,
+    measurementStatus: 'pending' as const,
+    pricingFallback: 'pending_zero' as const,
+    recordedBy: r.kind === 'videogen' ? 'dynamic-item-worker' : 'dynamic-provider-worker',
+  };
+  const meta = { reservation: true, estimatedPending: true, reservedBeforeCall: true, callTag: r.tag, generation: r.generation };
+  switch (r.kind) {
+    case 'tts': {
+      const secs = Math.max(1, Math.ceil((r.estimate.characters ?? 0) / TTS_CHARS_PER_SECOND_ESTIMATE));
+      return { ...base, provider: 'openai', service: 'audio.speech', modelOrProduct: r.estimate.model || 'gpt-4o-mini-tts',
+        usage: { audio_seconds: secs }, usageUnit: 'audio_seconds', metadata: { ...meta, characters: r.estimate.characters ?? null } };
+    }
+    case 'llm':
+      return { ...base, provider: 'anthropic', service: 'messages', modelOrProduct: r.estimate.model || 'claude-sonnet-4-6',
+        usage: { input_tokens: Math.max(1, Math.ceil((r.estimate.promptChars ?? 0) / 3)), output_tokens: Math.max(1, r.estimate.maxTokens ?? 1) },
+        usageUnit: 'output_tokens', callRole: r.tag === 'continuation' ? 'continuation' : role.callRole, metadata: { ...meta, serverSide: true } };
+    case 'gamma':
+      return { ...base, provider: 'gamma', service: 'generations', modelOrProduct: 'gamma-generate', operation: 'gamma.generate',
+        usage: { gamma_credit: gammaEstimatedCredits() }, usageUnit: 'gamma_credit', metadata: meta };
+    case 'videogen':
+      return { ...base, provider: 'videogen', service: 'render', modelOrProduct: 'video', operation: 'videogen.render',
+        usage: { video_render: 1 }, usageUnit: 'video_render', metadata: meta };
+    default:
+      throw new Error(`reserva de tipo desconocido: ${String((r as any).kind)}`);
+  }
+}
+
+/** Error de ledger que impide seguir (nunca se traga). */
+export class LedgerWriteFailed extends Error {
+  constructor(what: string, cause: unknown) {
+    super(`finops_ledger_write_failed: ${what} — ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'LedgerWriteFailed';
+  }
+}
+
+function requireLedger(ledger: WorkerLedger | null | undefined, what: string): WorkerLedger {
+  if (!ledger) throw new LedgerWriteFailed(what, 'ledger FinOps no configurado en el worker');
+  return ledger;
+}
+
+/** Reserva DURABLE antes de la llamada. Si falla, lanza (y la llamada no se hace). Devuelve la clave. */
+export async function reservePaidCall(ledger: WorkerLedger | null | undefined, r: PaidCallReservation): Promise<string> {
+  const l = requireLedger(ledger, `la reserva ${r.kind}/${r.tag}`);
+  try {
+    await l.recordCharge(reservationInput(r));
+  } catch (err) {
+    throw new LedgerWriteFailed(`la reserva ${r.kind}/${r.tag}`, err);
+  }
+  return reservationKey(r);
+}
+
+/** Liquidación DURABLE: cargo final (idempotente por la operación del proveedor) + reserva a 0, atómico. */
+export async function settlePaidCall(
+  ledger: WorkerLedger | null | undefined,
+  key: string,
+  finalCharge: RecordChargeInput | null,
+  reason: string,
+): Promise<{ finalInserted: boolean; finalEvent: any }> {
+  const l = requireLedger(ledger, `la liquidación ${key}`);
+  if (!l.settleReservation) throw new LedgerWriteFailed(`la liquidación ${key}`, 'ledger sin settleReservation');
+  try {
+    const r = await l.settleReservation(key, finalCharge, reason);
+    return { finalInserted: r.finalInserted, finalEvent: r.finalEvent };
+  } catch (err) {
+    throw new LedgerWriteFailed(`la liquidación ${key}`, err);
+  }
+}
+
+/**
+ * Detección DURABLE al reclamar un item real: cargos/reservas de intentos
+ * ANTERIORES (no reconocidos por un humano) = una operación pagada cuyo resultado
+ * no quedó persistido → el item va a reconciliación y NO se vuelve a llamar.
+ * - una reserva liquidada no cuenta (su cargo final es otra fila, que sí cuenta);
+ * - `releasableKey`: reserva sin marcador de envío (Gamma/Videogen) = la llamada
+ *   nunca se hizo → se libera en vez de bloquear;
+ * - `skipProviders`: proveedores cuyo resultado sí quedó persistido/reanudable.
+ */
+export async function priorPaidOperations(
+  ledger: WorkerLedger | null | undefined,
+  itemRunId: string,
+  opts: { currentAttempt: number; acknowledgedThroughAttempt: number; skipProviders?: string[]; isSubmitMarked?: (key: string) => boolean },
+): Promise<{ blocking: ItemPaidCharge[]; releasable: ItemPaidCharge[] }> {
+  const l = requireLedger(ledger, 'la consulta de cargos previos del item');
+  if (!l.itemPaidCharges) throw new LedgerWriteFailed('la consulta de cargos previos del item', 'ledger sin itemPaidCharges');
+  let rows: ItemPaidCharge[];
+  try {
+    rows = await l.itemPaidCharges(itemRunId);
+  } catch (err) {
+    throw new LedgerWriteFailed('la consulta de cargos previos del item', err);
+  }
+  const skip = new Set(opts.skipProviders ?? []);
+  const prior = rows.filter((r) => r.attempt < opts.currentAttempt && r.attempt > opts.acknowledgedThroughAttempt && !skip.has(r.provider));
+  const releasable: ItemPaidCharge[] = [];
+  const blocking: ItemPaidCharge[] = [];
+  for (const r of prior) {
+    if (r.reservation && r.settled) continue;
+    if (r.reservation && opts.isSubmitMarked && !opts.isSubmitMarked(r.idempotency_key)) releasable.push(r);
+    else blocking.push(r);
+  }
+  return { blocking, releasable };
+}
+
+export function reconciliationMessage(provider: string, what: string, detail: string): string {
+  return (
+    `${PROVIDER_RECONCILIATION_REQUIRED}: ${provider} — ${what}. ${detail.slice(0, 400)} ` +
+    'El proveedor pudo haber completado (y cobrado) la operación: quedó reservada en el ledger y NO se reintenta sola. ' +
+    'Revisá la cuenta del proveedor y resolvé explícitamente (retry con resubmitProvider/resubmitVideo=true).'
+  );
 }

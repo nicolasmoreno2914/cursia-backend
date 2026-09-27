@@ -177,7 +177,7 @@ async function pureChecks() {
     eq(e.totals.byProvider.youtube.max, '0.0000000000', 'youtube $0');
     assert(e.totals.byChapter._none, 'items sin capítulo agrupados en _none');
     eq(e.estimatorVersion, 'finops-estimator-v1', 'versión');
-    eq(e.usageModelVersion, 'usage-priors-v1', 'usage model');
+    eq(e.usageModelVersion, 'usage-priors-v1.1', 'usage model');
   });
 
   await check('estimador: determinístico (mismo input ⇒ mismo output)', () => {

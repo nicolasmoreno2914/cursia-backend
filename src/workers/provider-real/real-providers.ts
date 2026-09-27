@@ -43,16 +43,21 @@ import { concatMp3, mp3DurationSeconds } from '../../package/audio';
 import { transcodeMp3Bitrate } from '../../tts/mp3-transcode.util';
 import type { ThemeFamilyId, ThemeMode } from '../../modules/theme-engine/types';
 import {
+  LedgerWriteFailed,
   WorkerBudget,
   WorkerLedger,
   budgetExceededMessage,
+  gammaChargeInput,
+  gammaPendingInput,
+  priorPaidOperations,
   providerCallRoleOf,
+  reconciliationMessage,
   recordGammaPending,
-  recordLlmReservation,
-  recordServerLlmCharge,
-  recordTtsCharge,
-  recordTtsReservation,
+  reservePaidCall,
+  serverLlmChargeInput,
   settleGammaCharge,
+  settlePaidCall,
+  ttsChargeInput,
 } from '../finops-worker-hooks';
 import { AnthropicClient, GammaClient, OpenAiTtsClient, ProviderCallError } from './provider-clients';
 import { CoverError, CoverRasterizer, GAMMA_COVER_RASTERIZER_UNAVAILABLE, pdftoppmRasterizer } from './pdf-cover';
@@ -82,7 +87,9 @@ export const AMBIGUOUS_GAMMA_SUBMISSION = 'gamma_submit_ambiguous';
  * (pudo cobrarse).
  */
 export function isDefinitiveRejection(err: unknown): boolean {
-  return err instanceof ProviderCallError && err.status !== null && err.status >= 400 && err.status < 500;
+  // Review (minor): 408 (timeout del lado del proveedor) y 409 (conflicto: p.ej. ya existe) NO prueban
+  // que el pedido no se procesó → ambiguos, nunca "sin gasto".
+  return err instanceof ProviderCallError && err.status !== null && err.status >= 400 && err.status < 500 && err.status !== 408 && err.status !== 409;
 }
 
 export interface RealProviderDeps {
@@ -104,6 +111,31 @@ export interface RealProviderDeps {
   gammaPollMs?: number;
   /** Tope de espera de UNA generación en este claim (ms). Default env DYNAMIC_GAMMA_TIMEOUT_MS o 5 min. */
   gammaTimeoutMs?: number;
+  /** Estado de la llamada pagada en curso (lo crea processRealProviderItem por item). */
+  tracker?: PaidCallTracker;
+}
+
+/**
+ * V2.1 calibración #2: qué gasto está "en el aire" en este claim.
+ * - inFlight: se reservó y se envió al proveedor, sin liquidación todavía;
+ * - unpersistedPaidOutput: el proveedor ya entregó (y se cobró) un resultado que aún no quedó persistido.
+ * Con cualquiera de los dos, NINGÚN fallo es reintentable automáticamente: reconciliación.
+ */
+export interface PaidCallTracker {
+  inFlight: { provider: string; key: string; opId?: string | null } | null;
+  unpersistedPaidOutput: { provider: string; what: string; opIds: string[] } | null;
+}
+
+export function newPaidCallTracker(): PaidCallTracker {
+  return { inFlight: null, unpersistedPaidOutput: null };
+}
+
+function trackerAmbiguity(t: PaidCallTracker | undefined): { provider: string; what: string; opIds: string[] } | null {
+  if (!t) return null;
+  if (t.inFlight) {
+    return { provider: t.inFlight.provider, what: 'llamada pagada enviada sin resultado liquidado', opIds: t.inFlight.opId ? [t.inFlight.opId] : [] };
+  }
+  return t.unpersistedPaidOutput;
 }
 
 /** Fallo del item (el caller ya lo registró con failItem). `retryable=false` → se relanza (fail loud). */
@@ -126,6 +158,11 @@ function trimmed(env: Env, k: string): string {
   return (env[k] ?? '').trim();
 }
 
+function requireFinops(deps: RealProviderDeps): WorkerLedger {
+  if (!deps.finops) throw new LedgerWriteFailed('el cargo del proveedor', 'ledger FinOps no configurado en el worker');
+  return deps.finops;
+}
+
 function positiveInt(v: unknown, dflt: number): number {
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : dflt;
@@ -137,21 +174,31 @@ function sha256(b: Buffer | string): string {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function fail(deps: RealProviderDeps, item: ClaimedItem, message: string, retryable: boolean): Promise<never> {
+async function fail(
+  deps: RealProviderDeps,
+  item: ClaimedItem,
+  message: string,
+  retryable: boolean,
+  opts: { knownOutcome?: boolean } = {},
+): Promise<never> {
+  // Review I4: resultado CONOCIDO del proveedor (guion rechazado por validación, audio no medible):
+  // no es ambiguo → reintento acotado normal. El intento queda reconocido de forma durable ANTES de
+  // fallar (si esa escritura falla, se lanza y termina en reconciliación, nunca en un pago ciego).
+  if (opts.knownOutcome && retryable && !deps.tracker?.inFlight) {
+    await record(deps, item, { reconciliationAcknowledgedThroughAttempt: item.attempt, knownPaidFailure: message.slice(0, 300) });
+    if (deps.tracker) deps.tracker.unpersistedPaidOutput = null;
+    await deps.scheduler.failItem(item.itemRunId, deps.executorId, message.slice(0, 1900), true);
+    throw new ProviderItemFailed(message, true);
+  }
+  // Con gasto "en el aire" (enviado sin liquidar, o resultado pagado sin persistir) un reintento
+  // automático volvería a pagar: el fallo pasa a reconciliación, nunca reintentable.
+  const amb = trackerAmbiguity(deps.tracker);
+  if (amb && retryable) {
+    message = reconciliationMessage(amb.provider, amb.what, `${message}${amb.opIds.length ? ` (operación del proveedor: ${amb.opIds.join(', ')})` : ''}`);
+    retryable = false;
+  }
   await deps.scheduler.failItem(item.itemRunId, deps.executorId, message.slice(0, 1900), retryable);
   throw new ProviderItemFailed(message, retryable);
-}
-
-async function ledgerSafe(deps: RealProviderDeps, label: string, fn: (l: WorkerLedger) => Promise<unknown>): Promise<void> {
-  if (!deps.finops) {
-    deps.logger.error(`finops: ledger no configurado — ${label} NO quedó registrado (el gasto ya ocurrió)`);
-    return;
-  }
-  try {
-    await fn(deps.finops);
-  } catch (err) {
-    deps.logger.error(`finops: no se pudo registrar ${label} en el ledger — ${err instanceof Error ? err.message : String(err)}`);
-  }
 }
 
 /** Runtime guard antes de una llamada pagada NUEVA. false = item bloqueado (sin llamada). */
@@ -270,10 +317,12 @@ export async function processRealPresentation(deps: RealProviderDeps, item: Clai
   if (generationId) {
     // Reanudación: la generación ya existe (y ya se pagó) — NUNCA se reenvía.
     if (!apiKey) await fail(deps, item, notReady(item, ['GAMMA_API_KEY']), false);
-    // Fix round 1: la reserva pendiente existe aunque el proceso haya caído entre el id y el ledger.
+    // Con reserva previa al envío (calibración #2), ESA reserva cuenta el gasto hasta el terminal.
+    // Items anteriores (sin reserva): cargo pendiente por generationId, estricto (error → reintento sin reenviar).
     const gid0 = generationId;
-    await ledgerSafe(deps, `la reserva de Gamma ${gid0}`, (l) =>
-      recordGammaPending(l, { ownerId, itemRunId: item.itemRunId, generationId: gid0, itemAttempt: item.attempt }));
+    if (!(typeof item.outputSummary?.externalReservationKey === 'string')) {
+      await recordGammaPending(requireFinops(deps), { ownerId, itemRunId: item.itemRunId, generationId: gid0, itemAttempt: external.acceptedAtAttempt ?? item.attempt });
+    }
     themeFamily = external.themeFamily;
     themeMode = external.themeMode;
     themeId = external.gammaThemeId;
@@ -315,31 +364,43 @@ export async function processRealPresentation(deps: RealProviderDeps, item: Clai
     const markdown = markdownOf(await dependencyText(deps, item, ownerId, 'dynamic_content_md'));
     const chapterTitle = item.blueprint?.chapter?.title ?? `Capítulo ${item.chapterNumber ?? '?'}`;
     const client = new GammaClient(apiKey, env);
+    // Calibración #2: reserva DURABLE → marcador (con la clave de la reserva) → envío.
+    // Si la reserva o el marcador fallan, se lanza ANTES de llamar a Gamma (0 llamadas).
+    const resKey = await reservePaidCall(deps.finops, {
+      kind: 'gamma', ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1, itemAttempt: item.attempt, tag: 'submit', estimate: {},
+    });
     const marker = new Date().toISOString();
-    await record(deps, item, { externalSubmitStartedAt: marker });
+    await record(deps, item, { externalSubmitStartedAt: marker, externalReservationKey: resKey });
+    const tracker = deps.tracker;
+    if (tracker) {
+      tracker.inFlight = { provider: 'gamma', key: resKey };
+      (tracker as any).gammaReservationKey = resKey;
+    }
     try {
       generationId = await client.createGeneration(gammaGenerationBody({ chapterTitle, contentMarkdown: markdown, themeId: themeId! }));
     } catch (err) {
-      // Fix round 1 (review f12 m2): SOLO un 4xx con respuesta es un rechazo definitivo previo a la
-      // aceptación → se limpia el marcador y el reintento automático (acotado) puede reenviar.
+      // SOLO un 4xx con respuesta es un rechazo definitivo previo a la aceptación → se libera la
+      // reserva, se limpia el marcador y el reintento automático (acotado) puede reenviar.
       if (isDefinitiveRejection(err)) {
         const e = err as ProviderCallError;
-        await record(deps, item, { externalSubmitStartedAt: null });
+        await settlePaidCall(deps.finops, resKey, null, 'gamma_rejected_definitively');
+        if (tracker) tracker.inFlight = null;
+        await record(deps, item, { externalSubmitStartedAt: null, externalReservationKey: null });
         await fail(deps, item, `gamma_submit_failed: ${e.message}`, e.retryable);
       }
-      // 5xx / red / timeout / respuesta sin id: Gamma pudo aceptarla (y cobrarla) → reserva pendiente
-      // + item detenido para una decisión humana explícita (nunca un reenvío automático).
+      // 5xx / red / timeout / respuesta sin id: Gamma pudo aceptarla (y cobrarla) → la reserva queda
+      // pendiente + item detenido para una decisión humana explícita (nunca un reenvío automático).
       await gammaAmbiguous(deps, item, ownerId, marker, err instanceof Error ? err.message : String(err));
       return;
     }
+    if (tracker && tracker.inFlight) tracker.inFlight.opId = generationId;
+    deps.logger.log(`Item ${item.itemKey}: Gamma aceptó la generación ${generationId}`);
     await record(deps, item, {
-      external: { gammaGenerationId: generationId, gammaThemeId: themeId!, themeFamily, themeMode },
+      external: { gammaGenerationId: generationId, gammaThemeId: themeId!, themeFamily, themeMode, acceptedAtAttempt: item.attempt },
     });
-    // Fix round 1 (review f12 m1): Gamma aceptó → reserva PENDIENTE en el ledger YA (estimado p90),
-    // para que el presupuesto la cuente aunque el poll termine en timeout o se agoten los intentos.
-    const acceptedId = generationId!;
-    await ledgerSafe(deps, `la reserva de Gamma ${acceptedId}`, (l) =>
-      recordGammaPending(l, { ownerId, itemRunId: item.itemRunId, generationId: acceptedId, itemAttempt: item.attempt }));
+    // Id persistido: la generación es reanudable (poll gratis) → ya no es un gasto "en el aire".
+    // La reserva sigue contando el gasto (p90) hasta el terminal, donde se liquida con los créditos medidos.
+    if (tracker) tracker.inFlight = null;
   }
 
   // ── poll hasta completed/failed ────────────────────────────────────────────
@@ -359,13 +420,29 @@ export async function processRealPresentation(deps: RealProviderDeps, item: Clai
   }
   const gid = generationId!;
   // Terminal: la reserva pendiente se liquida con los créditos medidos (ADJUSTMENT); sin créditos queda pendiente.
-  await ledgerSafe(deps, `la generación de Gamma ${gid}`, async (l) => {
-    const r = await settleGammaCharge(l, {
-      ownerId, itemRunId: item.itemRunId, generationId: gid, creditsDeducted: st.creditsDeducted,
-      creditsRemaining: st.creditsRemaining, failed: st.status === 'failed', itemAttempt: item.attempt,
-    });
-    if (r === 'still_pending') deps.logger.error(`finops: Gamma no informó credits.deducted de ${gid} — el cargo queda PENDIENTE con el estimado`);
-  });
+  // Nunca se ignora un error del ledger: lanza → reintento que retoma la MISMA generación (sin reenviar).
+  const acceptedAttempt = external.acceptedAtAttempt ?? item.attempt;
+  const measuredCredits = typeof st.creditsDeducted === 'number' && Number.isFinite(st.creditsDeducted) && st.creditsDeducted >= 0;
+  const resKeyT = typeof item.outputSummary?.externalReservationKey === 'string' ? item.outputSummary.externalReservationKey : (deps.tracker as any)?.gammaReservationKey ?? null;
+  if (resKeyT) {
+    // Calibración #2: reserva → UN cargo por generationId (medido; sin créditos → pendiente estimado), atómico.
+    const finalInput = measuredCredits
+      ? gammaChargeInput({ ownerId, itemRunId: item.itemRunId, generationId: gid, creditsDeducted: st.creditsDeducted, creditsRemaining: st.creditsRemaining, failed: st.status === 'failed', itemAttempt: acceptedAttempt })
+      : gammaPendingInput({ ownerId, itemRunId: item.itemRunId, generationId: gid, itemAttempt: acceptedAttempt, reason: 'gamma_credits_not_reported' });
+    await settlePaidCall(deps.finops, resKeyT, finalInput, measuredCredits ? 'gamma_credits_measured' : 'gamma_credits_not_reported');
+    if (!measuredCredits) deps.logger.error(`finops: Gamma no informó credits.deducted de ${gid} — el cargo queda PENDIENTE con el estimado`);
+  } else {
+    let settled: Awaited<ReturnType<typeof settleGammaCharge>>;
+    try {
+      settled = await settleGammaCharge(requireFinops(deps), {
+        ownerId, itemRunId: item.itemRunId, generationId: gid, creditsDeducted: st.creditsDeducted,
+        creditsRemaining: st.creditsRemaining, failed: st.status === 'failed', itemAttempt: acceptedAttempt,
+      });
+    } catch (err) {
+      throw err instanceof LedgerWriteFailed ? err : new LedgerWriteFailed(`la liquidación de Gamma ${gid}`, err);
+    }
+    if (settled === 'still_pending') deps.logger.error(`finops: Gamma no informó credits.deducted de ${gid} — el cargo queda PENDIENTE con el estimado`);
+  }
   if (st.status === 'failed') {
     await fail(
       deps,
@@ -452,10 +529,15 @@ export async function processRealPresentation(deps: RealProviderDeps, item: Clai
  * pedir un reenvío con `POST …/items/:itemKey/retry {"resubmitProvider": true}`.
  */
 async function gammaAmbiguous(deps: RealProviderDeps, item: ClaimedItem, ownerId: string, marker: string, why: string): Promise<never> {
-  const ms = Date.parse(marker);
-  const syntheticId = `ambiguous-${item.itemRunId}-${Number.isFinite(ms) ? ms : 'x'}`;
-  await ledgerSafe(deps, `la reserva ambigua de Gamma ${syntheticId}`, (l) =>
-    recordGammaPending(l, { ownerId, itemRunId: item.itemRunId, generationId: syntheticId, itemAttempt: item.attempt, ambiguous: true, reason: why }));
+  // Con reserva previa al envío (clave en el marcador), ESA fila pendiente ya cuenta el posible gasto.
+  // Items anteriores a este cambio (marcador sin reserva) → reserva sintética, estricta.
+  if (!deps.finops) {
+    deps.logger.error(`finops: worker real sin ledger — la posible generación ambigua de ${item.itemKey} NO quedó reservada`);
+  } else if (!(typeof item.outputSummary?.externalReservationKey === 'string') && !deps.tracker?.inFlight) {
+    const ms = Date.parse(marker);
+    const syntheticId = `ambiguous-${item.itemRunId}-${Number.isFinite(ms) ? ms : 'x'}`;
+    await recordGammaPending(requireFinops(deps), { ownerId, itemRunId: item.itemRunId, generationId: syntheticId, itemAttempt: item.attempt, ambiguous: true, reason: why });
+  }
   return fail(
     deps,
     item,
@@ -512,6 +594,9 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
     const model = trimmed(env, AUDIOBOOK_SCRIPT_MODEL_ENV) || AUDIOBOOK_SCRIPT_MODEL_DEFAULT;
     const llmClient = new AnthropicClient(anthropicKey, env);
     const itemRole = providerCallRoleOf(item.attempt);
+    const tracker = deps.tracker;
+    let llmCallIdx = 0;
+    const llmMessageIds: string[] = [];
     let result;
     try {
       result = await generateChapterScript(
@@ -527,36 +612,45 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
           await heartbeat(deps, item);
           // Fix round 1 (review f12 m3): la continuación es otra llamada pagada → vuelve a pasar el guard.
           if (role === 'continuation' && !(await guard(deps, item, 'anthropic'))) throw new BudgetBlocked();
+          // Calibración #2: reserva DURABLE antes de la llamada (si falla, no se llama).
+          const resKey = await reservePaidCall(deps.finops, {
+            kind: 'llm', ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1, itemAttempt: item.attempt,
+            tag: `script-${role}-${llmCallIdx++}`,
+            estimate: { promptChars: prompt.system.length + prompt.user.length, maxTokens: prompt.maxTokens, model },
+          });
+          if (tracker) tracker.inFlight = { provider: 'anthropic', key: resKey };
           let r;
           try {
             r = await llmClient.messages({ model, system: prompt.system, user: prompt.user, maxTokens: prompt.maxTokens });
           } catch (err) {
-            // Fix round 1: resultado desconocido tras enviar (timeout/red/5xx/sin id-usage) → reserva pendiente.
-            if (!isDefinitiveRejection(err)) {
-              await ledgerSafe(deps, `la reserva LLM (${role})`, (l) =>
-                recordLlmReservation(l, {
-                  ownerId, itemRunId: item.itemRunId, model, promptChars: prompt.system.length + prompt.user.length,
-                  maxTokens: prompt.maxTokens, role, generation: item.generation ?? 1, itemAttempt: item.attempt,
-                  reason: err instanceof Error ? err.message : String(err),
-                }));
+            // Rechazo definitivo (4xx con respuesta) → sin gasto: se libera la reserva. Cualquier otro
+            // resultado (timeout/red/5xx/sin id-usage) queda reservado y el item va a reconciliación.
+            if (isDefinitiveRejection(err)) {
+              await settlePaidCall(deps.finops, resKey, null, 'anthropic_rejected_definitively');
+              if (tracker) tracker.inFlight = null;
             }
             throw err;
           }
-          // Medición server-side del LLM (HD-V21-17): usage de la respuesta, idempotente por msg_…
-          await ledgerSafe(deps, `el guion LLM ${r.messageId}`, (l) =>
-            recordServerLlmCharge(l, {
-              ownerId, itemRunId: item.itemRunId, model, messageId: r.messageId, requestId: r.requestId, usage: r.usage,
-              // Llamada principal: 'main' con el intento del item (un reintento del item = otro msg_ = otra fila).
-              callRole: role === 'continuation' ? 'continuation' : 'main',
-              attempt: itemRole.attempt,
-            }));
+          if (tracker && tracker.inFlight) tracker.inFlight.opId = r.messageId;
+          // Medición server-side (HD-V21-17): cargo por msg_… + reserva a 0, atómico. Error → reconciliación.
+          await settlePaidCall(deps.finops, resKey, serverLlmChargeInput({
+            ownerId, itemRunId: item.itemRunId, model, messageId: r.messageId, requestId: r.requestId, usage: r.usage,
+            // Llamada principal: 'main' con el intento del item (un reintento del item = otro msg_ = otra fila).
+            callRole: role === 'continuation' ? 'continuation' : 'main',
+            attempt: itemRole.attempt,
+          }), 'anthropic_measured');
+          llmMessageIds.push(r.messageId);
+          if (tracker) {
+            tracker.inFlight = null;
+            tracker.unpersistedPaidOutput = { provider: 'anthropic', what: 'guion del audiolibro pagado sin persistir', opIds: [...llmMessageIds] };
+          }
           return { text: r.text, messageId: r.messageId };
         },
       );
     } catch (err) {
       if (err instanceof LeaseLost) throw err;
       if (err instanceof BudgetBlocked) return;
-      if (err instanceof AudioScriptError) return fail(deps, item, err.message, err.retryable);
+      if (err instanceof AudioScriptError) return fail(deps, item, err.message, err.retryable, { knownOutcome: true });
       const e = err instanceof ProviderCallError ? err : null;
       return fail(deps, item, `audiobook_script_failed: ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
     }
@@ -564,6 +658,7 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
     scriptMeta = { words: result.words, messageIds: result.messageIds, model, continued: result.continued };
     // Idempotencia: el guion validado queda guardado — un re-claim no vuelve a pagar el LLM.
     await record(deps, item, { audiobookScript: { text: script, words: result.words, messageIds: result.messageIds, model } });
+    if (tracker) tracker.unpersistedPaidOutput = null;
     // El LLM gastó: el TTS vuelve a pasar por el guard con el gasto actualizado.
     if (!(await guard(deps, item, 'openai'))) return;
   }
@@ -575,39 +670,48 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
   const tts = new OpenAiTtsClient(openaiKey, env);
   const parts: Buffer[] = [];
   const requestIds: Array<string | null> = [];
+  const ttsTracker = deps.tracker;
+  const paidTtsOps: string[] = [];
   for (let i = 0; i < chunks.length; i++) {
     await heartbeat(deps, item);
+    const chunkIdx = i;
+    // Calibración #2: reserva DURABLE del chunk antes de llamar (si falla, no se llama a OpenAI).
+    const resKey = await reservePaidCall(deps.finops, {
+      kind: 'tts', ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1, itemAttempt: item.attempt,
+      tag: `chunk${chunkIdx}`, estimate: { characters: chunks[chunkIdx].length, model },
+    });
+    if (ttsTracker) ttsTracker.inFlight = { provider: 'openai', key: resKey };
     let res;
     try {
       res = await tts.speech({ model, voice, input: chunks[i] });
     } catch (err) {
       const e = err instanceof ProviderCallError ? err : null;
-      // Fix round 1: timeout/red/5xx DESPUÉS de enviar = gasto posible → reserva pendiente por
-      // (item, generación, chunk, intento). El reintento del item es el acotado de siempre y
-      // cada intento suma su reserva (el guard la cuenta).
-      if (!isDefinitiveRejection(err)) {
-        const chunkIdx = i;
-        await ledgerSafe(deps, `la reserva de TTS (chunk ${chunkIdx})`, (l) =>
-          recordTtsReservation(l, {
-            ownerId, itemRunId: item.itemRunId, characters: chunks[chunkIdx].length, model, generation: item.generation ?? 1,
-            chunk: chunkIdx, itemAttempt: item.attempt, reason: err instanceof Error ? err.message : String(err),
-          }));
+      // Rechazo definitivo (4xx con respuesta) → sin gasto: se libera la reserva. Timeout/red/5xx
+      // DESPUÉS de enviar = gasto posible → la reserva queda y el item va a reconciliación (fail()).
+      if (isDefinitiveRejection(err)) {
+        await settlePaidCall(deps.finops, resKey, null, 'openai_tts_rejected_definitively');
+        if (ttsTracker) ttsTracker.inFlight = null;
       }
       return fail(deps, item, `tts_failed: chunk ${i + 1}/${chunks.length}: ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
     }
+    if (ttsTracker && ttsTracker.inFlight) ttsTracker.inFlight.opId = res.requestId;
     let seconds: number | null = null;
     try {
       seconds = mp3DurationSeconds(res.audio);
     } catch {
       seconds = null;
     }
-    const chunkIdx = i;
-    await ledgerSafe(deps, `el TTS ${res.requestId ?? `chunk ${chunkIdx}`}`, (l) =>
-      recordTtsCharge(l, {
-        ownerId, itemRunId: item.itemRunId, requestId: res.requestId, audioSeconds: seconds, characters: chunks[chunkIdx].length,
-        model, generation: item.generation ?? 1, chunk: chunkIdx, itemAttempt: item.attempt,
-      }));
-    if (seconds === null) await fail(deps, item, `TTS_AUDIO_INVALID: el chunk ${i + 1}/${chunks.length} de ${item.itemKey} no es un MP3 medible`, true);
+    // Cargo por x-request-id (idempotente: la misma operación = un solo cargo) + reserva a 0, atómico.
+    await settlePaidCall(deps.finops, resKey, ttsChargeInput({
+      ownerId, itemRunId: item.itemRunId, requestId: res.requestId, audioSeconds: seconds, characters: chunks[chunkIdx].length,
+      model, generation: item.generation ?? 1, chunk: chunkIdx, itemAttempt: item.attempt,
+    }), 'openai_tts_measured');
+    if (res.requestId) paidTtsOps.push(res.requestId);
+    if (ttsTracker) {
+      ttsTracker.inFlight = null;
+      ttsTracker.unpersistedPaidOutput = { provider: 'openai', what: 'audio TTS pagado sin persistir', opIds: [...paidTtsOps] };
+    }
+    if (seconds === null) await fail(deps, item, `TTS_AUDIO_INVALID: el chunk ${i + 1}/${chunks.length} de ${item.itemKey} no es un MP3 medible`, true, { knownOutcome: true });
     requestIds.push(res.requestId);
     // Mismo transcode que tts.service (64 kbps mono; sin ffmpeg → el original, como hoy).
     parts.push(await transcodeMp3Bitrate(res.audio, TTS_TARGET_BITRATE_KBPS));
@@ -618,7 +722,7 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
     mp3 = parts.length === 1 ? parts[0] : concatMp3(parts);
     durationSeconds = mp3DurationSeconds(mp3);
   } catch (err) {
-    return fail(deps, item, `TTS_AUDIO_INVALID: ${err instanceof Error ? err.message : String(err)}`, true);
+    return fail(deps, item, `TTS_AUDIO_INVALID: ${err instanceof Error ? err.message : String(err)}`, true, { knownOutcome: true });
   }
   if (!deps.artifacts.uploadBufferArtifact) throw new Error('dynamic-provider-worker: artifacts sin uploadBufferArtifact (modo real)');
   const entity = item.chapterId ?? 'course';
@@ -638,6 +742,7 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
     },
     upsert: false,
   });
+  if (ttsTracker) ttsTracker.unpersistedPaidOutput = null; // el audio pagado ya está en el Storage + artifact
   const ok = await deps.scheduler.completeItem(item.itemRunId, deps.executorId, {
     artifactIds: [row.id],
     summary: { mode: 'real', provider: 'openai', model, voice, durationSeconds, chunks: chunks.length, scriptSha256: sha256(script), ...scriptMeta },
@@ -647,21 +752,101 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
 
 /** Despacho del modo real. La lease perdida corta en silencio (otro ejecutor sigue). */
 export async function processRealProviderItem(deps: RealProviderDeps, item: ClaimedItem, ownerId: string): Promise<void> {
+  const tracked: RealProviderDeps = { ...deps, tracker: deps.tracker ?? newPaidCallTracker() };
   try {
-    if (item.type === 'presentation') await processRealPresentation(deps, item, ownerId);
-    else await processRealAudio(deps, item, ownerId);
+    // Calibración #2 — detección DURABLE: una operación pagada de un intento anterior sin resultado
+    // persistido (reserva sin liquidar, o cargo sin salida) nunca se vuelve a pagar sola.
+    const blocked = await priorPaidBlock(tracked, item, ownerId);
+    if (blocked) return;
+    if (item.type === 'presentation') await processRealPresentation(tracked, item, ownerId);
+    else await processRealAudio(tracked, item, ownerId);
   } catch (err) {
+    const amb = trackerAmbiguity(tracked.tracker);
     if (err instanceof LeaseLost) {
-      deps.logger.warn(`Item ${item.itemKey}: lease perdida en modo real — se detiene (el próximo claim retoma sin reenviar)`);
+      if (amb) deps.logger.error(`Item ${item.itemKey}: lease perdida con gasto sin resultado persistido (${amb.provider}) — el próximo claim NO reenvía (queda en reconciliación por el ledger)`);
+      else deps.logger.warn(`Item ${item.itemKey}: lease perdida en modo real — se detiene (el próximo claim retoma sin reenviar)`);
       return;
     }
     if (err instanceof ProviderItemFailed) {
       if (err.retryable) return; // ya quedó `retrying` con su motivo
       throw err;
     }
-    // Inesperado: reintentable (sin reenviar lo ya registrado: el marcador/ids quedan en output_summary).
-    const msg = `unexpected_error: ${err instanceof Error ? err.message : String(err)}`;
+    const detail = err instanceof Error ? err.message : String(err);
+    if (amb) {
+      // Después de una llamada pagada (DB caída al liquidar/persistir, error inesperado): reconciliación.
+      const msg = reconciliationMessage(amb.provider, amb.what, `${detail}${amb.opIds.length ? ` (operación del proveedor: ${amb.opIds.join(', ')})` : ''}`);
+      deps.logger.error(`Item ${item.itemKey}: ${msg}`);
+      await deps.scheduler.failItem(item.itemRunId, deps.executorId, msg.slice(0, 1900), false);
+      throw new ProviderItemFailed(msg, false);
+    }
+    if (err instanceof LedgerWriteFailed && !deps.finops) {
+      // Worker real sin ledger FinOps: configuración, no transitorio. Nunca se llamó al proveedor.
+      const msg = `finops_unavailable: ${detail}. No se llamó al proveedor (sin gasto); corregí la configuración del worker.`;
+      deps.logger.error(`Item ${item.itemKey}: ${msg}`);
+      await deps.scheduler.failItem(item.itemRunId, deps.executorId, msg.slice(0, 1900), false);
+      throw new ProviderItemFailed(msg, false);
+    }
+    // Antes de cualquier llamada pagada (p.ej. DB caída en el guard o la reserva): reintentable, 0 llamadas.
+    const msg = `unexpected_error: ${detail}`;
     deps.logger.error(`Item ${item.itemKey}: ${msg}`);
     await deps.scheduler.failItem(item.itemRunId, deps.executorId, msg.slice(0, 1900), true);
   }
+}
+
+/** Item bloqueado por una operación pagada previa sin resultado → true (ya quedó en reconciliación). */
+async function priorPaidBlock(deps: RealProviderDeps, item: ClaimedItem, ownerId: string): Promise<boolean> {
+  // Sin ledger cableado, la configuración se valida primero; la reserva (antes de cualquier llamada)
+  // falla después con finops_unavailable (fail closed, 0 llamadas).
+  if (!deps.finops) return false;
+  // Review I4: el MP3 pagado YA quedó subido (artifact del item) y lo que falló fue completar el item
+  // (p.ej. DB caída en completeItem): se reutiliza ese artifact y se completa, 0 llamadas nuevas.
+  if (item.type === 'audio_welcome' || item.type === 'audiobook_chapter') {
+    // El artifact se vincula al item recién en completeItem: se lo identifica por el run + el prefijo de
+    // Storage del item (incluye su idempotencyKey, distinta por generación) + metadata real.
+    const prefix = `${storageBase(item, ownerId, 'dynamic_audio_mp3')}/`;
+    const [prev] = await deps.dataSource.query(
+      `select id, metadata from public.artifacts
+        where job_id = $1 and type = 'dynamic_audio_mp3' and left(storage_path, length($2)) = $2
+          and metadata->>'mode' = 'real' and metadata->>'itemKey' = $3
+        order by created_at desc limit 1`,
+      [item.runId, prefix, item.itemKey],
+    );
+    if (prev) {
+      const m = (prev.metadata ?? {}) as Record<string, any>;
+      deps.logger.warn(`Item ${item.itemKey}: el audio ya estaba subido (artifact ${prev.id}) — se completa sin volver a llamar a OpenAI`);
+      const ok = await deps.scheduler.completeItem(item.itemRunId, deps.executorId, {
+        artifactIds: [prev.id],
+        summary: { mode: 'real', provider: 'openai', model: m.model ?? null, voice: m.voice ?? null, durationSeconds: m.durationSeconds ?? null, chunks: m.chunks ?? null, reusedUploadedArtifact: true },
+      });
+      if (!ok) deps.logger.warn(`Item ${item.itemKey}: completeItem devolvió false al reutilizar el audio (lease perdida)`);
+      return true;
+    }
+  }
+  const os = (item.outputSummary ?? {}) as Record<string, any>;
+  const ext = (os.external ?? {}) as Record<string, any>;
+  const skip: string[] = [];
+  // Gamma con generationId persistido = reanudable (poll gratis, nunca reenvía).
+  if (item.type === 'presentation' && typeof ext.gammaGenerationId === 'string') skip.push('gamma');
+  // Guion del audiolibro persistido = se reutiliza sin volver a pagar el LLM.
+  if (os.audiobookScript && typeof os.audiobookScript.text === 'string' && os.audiobookScript.text.trim()) skip.push('anthropic');
+  const markedKey = typeof os.externalReservationKey === 'string' ? os.externalReservationKey : null;
+  const { blocking, releasable } = await priorPaidOperations(deps.finops, item.itemRunId, {
+    currentAttempt: item.attempt,
+    acknowledgedThroughAttempt: Number(os.reconciliationAcknowledgedThroughAttempt ?? 0),
+    skipProviders: skip,
+    // Gamma: el marcador de envío se escribe DESPUÉS de la reserva y ANTES de llamar. Una reserva de
+    // Gamma sin marcador que la nombre = la llamada nunca se hizo → se libera.
+    isSubmitMarked: (key) => !key.startsWith('reservation:gamma:') || key === markedKey,
+  });
+  for (const r of releasable) await settlePaidCall(deps.finops, r.idempotency_key, null, 'reserved_without_submit_marker');
+  if (!blocking.length) return false;
+  const what = blocking.map((b) => `${b.provider} ${b.external_operation_id ?? b.idempotency_key} (intento ${b.attempt})`).join('; ');
+  const msg = reconciliationMessage(
+    blocking[0].provider,
+    'operación pagada de un intento anterior sin resultado persistido',
+    `${what}. No se llamó al proveedor en este intento.`,
+  );
+  deps.logger.error(`Item ${item.itemKey}: ${msg}`);
+  void ownerId;
+  return fail(deps, item, msg, false);
 }
