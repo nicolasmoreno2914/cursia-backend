@@ -961,6 +961,39 @@ async function dbChecks() {
       eq(delta(c1), d1, '0 llamadas nuevas (ni LLM ni TTS)');
     });
 
+    await check('REVIEW I4a: el MP3 pagado YA se subió y la DB cae al completar (ni completeItem ni failItem): el re-claim REUTILIZA el artifact subido y completa, 0 llamadas nuevas (nunca reconciliación ni re-pago)', async () => {
+      const R = await freshRun('Review I4a');
+      const c0 = counts();
+      const item = await claimProvider(R.rid, 'audio_welcome');
+      const deadSched = faulty(sched, (k) => k === 'completeItem' || k === 'failItem');
+      await rejectsRe(PW.processProviderItem(workerDeps({ scheduler: deadSched }), item), /EMAXCONNSESSION/, 'DB caída al completar');
+      let row = await itemRow(R.rid, item.itemKey);
+      eq([row.status, delta(c0).tts], ['running', 1], 'running tras 1 TTS');
+      await ds.query(`update public.generation_item_runs set lease_until = now() - interval '1 second' where id = $1`, [row.id]);
+      await sched.sweepExpiredLeases(R.rid);
+      await retryNow(row.id);
+      await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome'));
+      row = await itemRow(R.rid, item.itemKey);
+      eq([row.status, delta(c0).tts, row.output_summary.reusedUploadedArtifact], ['completed', 1, true], `reutilizado (${row.error})`);
+      eq((await finalCharges(`item_run_id = $1 and provider = 'openai'`, [row.id])).length, 1, 'UN cargo de TTS');
+    });
+
+    await check('REVIEW I4b: resultado CONOCIDO (guion rechazado por validación, AUDIOBOOK_SCRIPT_TOO_SHORT) → reintento acotado normal (NO reconciliación); el intento queda reconocido y el re-claim completa', async () => {
+      const R = await freshRun('Review I4b');
+      const c0 = counts();
+      fakes.plan.llmTiny = 2; // main + continuación, ambas cortas
+      const item = await claimProvider(R.rid, 'audiobook_chapter');
+      await PW.processProviderItem(workerDeps(), item);
+      let row = await itemRow(R.rid, item.itemKey);
+      eq(row.status, 'retrying', `reintentable (${row.error})`);
+      assert(/^AUDIOBOOK_SCRIPT_TOO_SHORT/.test(row.error) && !/reconciliation/.test(row.error), row.error);
+      eq([row.output_summary.reconciliationAcknowledgedThroughAttempt, delta(c0).llm, delta(c0).tts], [1, 2, 0], 'intento reconocido; 2 LLM, 0 TTS');
+      await retryNow(row.id);
+      await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audiobook_chapter'));
+      row = await itemRow(R.rid, item.itemKey);
+      eq(row.status, 'completed', `completa (${row.error})`);
+    });
+
     await check('FAULT timeout del proveedor (PROVIDER_CALL_TIMEOUT_MS) → TTS y LLM: reconciliación; Gamma: gamma_submit_ambiguous; reserva pendiente y 0 reintentos automáticos', async () => {
       const R = await freshRun('Fault timeout');
       let c0 = counts();
@@ -1081,6 +1114,27 @@ async function dbChecks() {
       eq([row.status, vg2.st.submits], ['completed', 1], `retoma el mismo job (${row.error})`);
       eq((await finalCharges(`item_run_id = $1 and provider = 'videogen'`, [row.id])).length, 1, 'UN cargo por el job');
       eq((await reservationsOf(row.id, 'videogen')).map((x) => x.settled), [true], 'reserva liquidada');
+    });
+
+    await check('REVIEW I5: Videogen con costo pendiente al terminar el render → en la fase YouTube el costo llega pero el LEDGER falla → el item NO completa en silencio (reintentable); el re-claim NO re-sube ni re-renderiza y liquida', async () => {
+      const R = await freshRun('Review I5', true);
+      let costCalls = 0;
+      const vg = { st: { submits: 0 },
+        async batchCreate() { this.st.submits++; return { batch_id: 'b_i5', jobs: [{ job_id: `vg_i5_${crypto.randomUUID().slice(0, 8)}` }] }; },
+        async getVideoStatus(id) { return { job_id: id, status: 'completed_local', download_url: 'https://fake-videogen.invalid/x.mp4', progress: 100, error: null }; },
+        async getVideoCost() { costCalls++; if (costCalls === 1) throw new Error('costs endpoint 503'); return { estimated_total_cost: 0.88 }; },
+      };
+      const ytBefore = ytSeq;
+      await IW.processItem(videoDeps(vg, { finops: faulty(ledger, (k) => k === 'recordAdjustment') }), await claimVideo(R.rid));
+      let row = await itemRow(R.rid, `video:${R.c1}`);
+      eq(row.status, 'retrying', `no completa en silencio (${row.error})`);
+      assert(/finops_ledger_write_failed/.test(row.error), row.error);
+      await retryNow(row.id);
+      await IW.processItem(videoDeps(vg), await claimVideo(R.rid));
+      row = await itemRow(R.rid, `video:${R.c1}`);
+      eq([row.status, vg.st.submits, ytSeq - ytBefore], ['completed', 1, 1], `completa: 1 render, 1 subida (${row.error})`);
+      const net = (await events(`item_run_id = $1 and provider = 'videogen'`, [row.id])).reduce((a, e) => a + Number(e.amount), 0);
+      assert(near(net, 0.88), `neto liquidado ${net}`);
     });
 
     // ═══ Calibración #2 — Pages proxy REAL (frontend) → JWT ES256 → Anthropic FALSO → ingest HTTP REAL (Nest + guard)

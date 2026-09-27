@@ -275,6 +275,9 @@ export async function runProviderOnce(deps: ProviderWorkerDeps): Promise<'claime
   return 'claimed';
 }
 
+/** Lease mínima del worker de proveedores: > timeout de una llamada (120 s) + margen. */
+export const PROVIDER_WORKER_MIN_LEASE_SECONDS = 300;
+
 function readPositiveInt(envKey: string, fallback: number): number {
   const raw = Number(process.env[envKey]);
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
@@ -296,7 +299,8 @@ async function bootstrap() {
     artifacts: app.get(ArtifactsService),
     logger,
     executorId: process.env.DYNAMIC_PROVIDER_WORKER_ID || `dynamic-provider-worker-${process.pid}`,
-    leaseSeconds: readPositiveInt('DYNAMIC_PROVIDER_WORKER_LEASE_SECONDS', DEFAULT_LEASE_SECONDS),
+    // Review (minor): la lease debe superar el timeout de UNA llamada (TTS/LLM 120 s, sin heartbeat en vuelo).
+    leaseSeconds: readPositiveInt('DYNAMIC_PROVIDER_WORKER_LEASE_SECONDS', Math.max(DEFAULT_LEASE_SECONDS, PROVIDER_WORKER_MIN_LEASE_SECONDS)),
     finops: app.get(FinopsLedgerService),
     budget: app.get(FinopsBudgetService),
   };

@@ -143,7 +143,7 @@ function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp
   const st = { gammaPosts: [], gammaGets: [], exports: [], tts: [], llm: [], badAuth: [], seq: 0 };
   const gens = new Map(); // id → {polls}
   // Un valor numérico en gammaPostFail/ttsFail/llmFail = ese status HTTP; 'drop' = se corta la conexión DESPUÉS de recibir el pedido.
-  const plan = { gammaPostFail: [], gammaHoldPending: false, gammaFailGeneration: false, gammaNoCredits: false, ttsFail: [], llmFail: [], llmShortFirst: 0, ttsFixedRequestId: null };
+  const plan = { gammaPostFail: [], gammaHoldPending: false, gammaFailGeneration: false, gammaNoCredits: false, ttsFail: [], llmFail: [], llmShortFirst: 0, ttsFixedRequestId: null, llmTiny: 0 };
   // 'hang' = se recibe el pedido y nunca se responde (el cliente corta por timeout; la operación pudo ejecutarse).
   const hang = (rq) => setTimeout(() => rq.socket.destroy(), 10_000).unref();
   let base = null;
@@ -217,7 +217,9 @@ function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp
         const short = plan.llmShortFirst > 0;
         if (short) plan.llmShortFirst--;
         const isCont = /CONTINUAR/.test(String(req.system || ''));
-        const text = isCont ? words(180, st.seq) : short ? words(200, st.seq) : words(430, st.seq);
+        const tiny = plan.llmTiny > 0;
+        if (tiny) plan.llmTiny--;
+        const text = tiny ? words(20, st.seq) : isCont ? words(180, st.seq) : short ? words(200, st.seq) : words(430, st.seq);
         st.llm.push({ id, model: req.model, maxTokens: req.max_tokens, continuation: isCont });
         return json(200, {
           id, type: 'message', role: 'assistant', model: req.model, stop_reason: 'end_turn',

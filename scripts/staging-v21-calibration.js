@@ -244,7 +244,7 @@ async function actionReport(c, courseId) {
   }
   const ev = await q(
     `select id, corrects_event_id, event_kind, provider, service, model_or_product, operation, call_role, attempt, usage, usage_quantity, usage_unit,
-            pricing_snapshot, amount::text amount, cost_source, measurement_status, billing_account, outcome, quota_units::text quota_units,
+            pricing_snapshot, metadata, amount::text amount, cost_source, measurement_status, billing_account, outcome, quota_units::text quota_units,
             owner_id, blueprint_id, manifest_id, run_id, item_run_id, item_key, item_type, chapter_id, external_operation_id, idempotency_key, recorded_by, created_at
        from public.generation_cost_events where course_id = $1 order by created_at`, [courseId]);
   console.log(`── ${ev.length} evento(s) FinOps del curso ──`);

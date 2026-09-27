@@ -24,9 +24,20 @@ name: Deploy to Staging (Contabo VPS)
 on:
   push:
     branches: [staging]
-  # Calibración V2.1: las acciones (policy/authorize/report/worker) viven en
-  # staging-calibration.yml y NO despliegan. Un deploy deja siempre el worker en false.
+  # Calibración V2.1 (#2): con calibration_action ≠ none el dispatch corre SOLO el job
+  # `calibration` (sin rsync / npm / migraciones / reinicio de los 11 procesos). Un push o un
+  # dispatch con none despliega, y todo deploy deja DYNAMIC_PROVIDER_WORKER_ENABLED=false.
   workflow_dispatch:
+    inputs:
+      calibration_action:
+        description: 'none = deploy normal; otra = acción de calibración V2.1 en staging SIN deploy'
+        type: choice
+        options: ['none', 'report', 'preflight', 'policy', 'authorize', 'worker_on', 'worker_off']
+        default: 'none'
+      calibration_course_id:
+        description: 'Id numérico del curso de calibración (authorize / report)'
+        type: string
+        default: ''
 
 concurrency:
   group: deploy-staging
@@ -35,6 +46,7 @@ concurrency:
 jobs:
   deploy:
     name: Build & Deploy to Staging
+    if: github.event_name == 'push' || inputs.calibration_action == 'none' || inputs.calibration_action == ''
     runs-on: ubuntu-latest
     environment: staging
 
@@ -557,3 +569,62 @@ jobs:
         run: |
           echo "⚠️  El deploy de STAGING falló. Último commit: $(git rev-parse --short HEAD)"
           echo "Esto NO afecta producción — cursia-backend sigue corriendo con su propio código."
+
+  calibration:
+    name: Calibration control (staging, SIN deploy)
+    if: github.event_name == 'workflow_dispatch' && inputs.calibration_action != 'none' && inputs.calibration_action != ''
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Validate inputs
+        env:
+          CAL_ACTION: ${{ inputs.calibration_action }}
+          CAL_COURSE: ${{ inputs.calibration_course_id }}
+        run: |
+          case "$CAL_ACTION" in report|preflight|policy|authorize|worker_on|worker_off) ;; *) echo "❌ action inválida"; exit 1 ;; esac
+          case "$CAL_COURSE" in "") ;; *[!0-9]*) echo "❌ course_id debe ser numérico"; exit 1 ;; esac
+          if { [ "$CAL_ACTION" = authorize ] || [ "$CAL_ACTION" = report ]; } && [ -z "$CAL_COURSE" ]; then
+            echo "❌ action=$CAL_ACTION necesita course_id"; exit 1
+          fi
+          echo "Calibración V2.1 (staging): acción=$CAL_ACTION curso=${CAL_COURSE:-(ninguno)}"
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Run calibration action on the staging VPS (sin deploy)
+        env:
+          CAL_ACTION: ${{ inputs.calibration_action }}
+          CAL_COURSE: ${{ inputs.calibration_course_id }}
+        run: |
+          printf "%s\n%s\n" "$CAL_ACTION" "$CAL_COURSE" | ssh -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+              'set -e
+               cd '"${{ secrets.VPS_PATH_STAGING }}"'
+               IFS= read -r _ACTION || true
+               IFS= read -r _COURSE || true
+               case "$_ACTION" in report|preflight|policy|authorize|worker_on|worker_off) ;; *) echo "❌ acción inválida"; exit 1 ;; esac
+               case "$_COURSE" in "") ;; *[!0-9]*) echo "❌ curso inválido"; exit 1 ;; esac
+               if [ ! -f .env ] || [ ! -f scripts/staging-v21-calibration.js ]; then
+                 echo "❌ staging sin .env o sin el script (desplegá primero)"; exit 1
+               fi
+               case "$_ACTION" in
+                 policy) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js policy ;;
+                 authorize) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js authorize "$_COURSE" ;;
+                 report) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js report "$_COURSE" ;;
+                 preflight) MIGRATION_ENV=staging node scripts/preflight-v21-providers.js ;;
+                 worker_on|worker_off)
+                   _MODE=on; [ "$_ACTION" = worker_off ] && _MODE=off
+                   MIGRATION_ENV=staging node scripts/staging-v21-calibration.js worker "$_MODE"
+                   sudo pm2 restart cursia-dynamic-provider-worker-staging --update-env
+                   sudo pm2 restart cursia-backend-staging --update-env
+                   sleep 8
+                   sudo pm2 jlist | node -e "let s=\"\";process.stdin.on(\"data\",d=>s+=d).on(\"end\",()=>{const l=JSON.parse(s).filter(p=>/-staging$/.test(p.name));for(const p of l)console.log(p.name.padEnd(44)+p.pm2_env.status+\" restarts=\"+p.pm2_env.restart_time);if(l.some(p=>p.pm2_env.status!==\"online\"))process.exit(1)})"
+                   MIGRATION_ENV=staging node scripts/preflight-v21-providers.js
+                   ;;
+               esac
+               echo "✅ Acción de calibración terminada (sin deploy)."'

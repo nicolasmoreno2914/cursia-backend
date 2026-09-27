@@ -1156,14 +1156,20 @@ async function publishYoutubeAndComplete(
   if (cost === null && mode === 'real' && deps.finops) {
     // V2.1 RF-b: el costo no estaba al terminar el render (cargo pendiente):
     // se vuelve a consultar y, si llega, se corrige con un ADJUSTMENT.
+    // Solo la CONSULTA del costo puede fallar en silencio (el cargo sigue pendiente, visible en el
+    // reporte); un error del LEDGER al liquidar se propaga (calibración #2, review I5): el item
+    // falla reintentable y el re-claim retoma la publicación sin volver a pagar el render.
+    let measured: number | null = null;
     try {
-      const measured = (await deps.videogen.getVideoCost(videogenJobId)).estimated_total_cost;
-      if (typeof measured === 'number' && Number.isFinite(measured)) {
-        cost = measured;
-        await ledgerStrict(deps, `el ajuste del render ${videogenJobId}`, (l) => settleVideogenPending(l, videogenJobId, measured));
-      }
+      const m = (await deps.videogen.getVideoCost(videogenJobId)).estimated_total_cost;
+      if (typeof m === 'number' && Number.isFinite(m)) measured = m;
     } catch (err) {
       logger.warn(`Item ${item.itemKey}: el costo de Videogen sigue sin estar disponible — ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (measured !== null) {
+      cost = measured;
+      const mc = measured;
+      await ledgerStrict(deps, `el ajuste del render ${videogenJobId}`, (l) => settleVideogenPending(l, videogenJobId, mc));
     }
   }
   const downloadUrl: string | null = summary.videogenDownloadUrl ?? null;

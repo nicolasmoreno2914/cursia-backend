@@ -87,7 +87,9 @@ export const AMBIGUOUS_GAMMA_SUBMISSION = 'gamma_submit_ambiguous';
  * (pudo cobrarse).
  */
 export function isDefinitiveRejection(err: unknown): boolean {
-  return err instanceof ProviderCallError && err.status !== null && err.status >= 400 && err.status < 500;
+  // Review (minor): 408 (timeout del lado del proveedor) y 409 (conflicto: p.ej. ya existe) NO prueban
+  // que el pedido no se procesó → ambiguos, nunca "sin gasto".
+  return err instanceof ProviderCallError && err.status !== null && err.status >= 400 && err.status < 500 && err.status !== 408 && err.status !== 409;
 }
 
 export interface RealProviderDeps {
@@ -172,7 +174,22 @@ function sha256(b: Buffer | string): string {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function fail(deps: RealProviderDeps, item: ClaimedItem, message: string, retryable: boolean): Promise<never> {
+async function fail(
+  deps: RealProviderDeps,
+  item: ClaimedItem,
+  message: string,
+  retryable: boolean,
+  opts: { knownOutcome?: boolean } = {},
+): Promise<never> {
+  // Review I4: resultado CONOCIDO del proveedor (guion rechazado por validación, audio no medible):
+  // no es ambiguo → reintento acotado normal. El intento queda reconocido de forma durable ANTES de
+  // fallar (si esa escritura falla, se lanza y termina en reconciliación, nunca en un pago ciego).
+  if (opts.knownOutcome && retryable && !deps.tracker?.inFlight) {
+    await record(deps, item, { reconciliationAcknowledgedThroughAttempt: item.attempt, knownPaidFailure: message.slice(0, 300) });
+    if (deps.tracker) deps.tracker.unpersistedPaidOutput = null;
+    await deps.scheduler.failItem(item.itemRunId, deps.executorId, message.slice(0, 1900), true);
+    throw new ProviderItemFailed(message, true);
+  }
   // Con gasto "en el aire" (enviado sin liquidar, o resultado pagado sin persistir) un reintento
   // automático volvería a pagar: el fallo pasa a reconciliación, nunca reintentable.
   const amb = trackerAmbiguity(deps.tracker);
@@ -633,7 +650,7 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
     } catch (err) {
       if (err instanceof LeaseLost) throw err;
       if (err instanceof BudgetBlocked) return;
-      if (err instanceof AudioScriptError) return fail(deps, item, err.message, err.retryable);
+      if (err instanceof AudioScriptError) return fail(deps, item, err.message, err.retryable, { knownOutcome: true });
       const e = err instanceof ProviderCallError ? err : null;
       return fail(deps, item, `audiobook_script_failed: ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
     }
@@ -694,7 +711,7 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
       ttsTracker.inFlight = null;
       ttsTracker.unpersistedPaidOutput = { provider: 'openai', what: 'audio TTS pagado sin persistir', opIds: [...paidTtsOps] };
     }
-    if (seconds === null) await fail(deps, item, `TTS_AUDIO_INVALID: el chunk ${i + 1}/${chunks.length} de ${item.itemKey} no es un MP3 medible`, true);
+    if (seconds === null) await fail(deps, item, `TTS_AUDIO_INVALID: el chunk ${i + 1}/${chunks.length} de ${item.itemKey} no es un MP3 medible`, true, { knownOutcome: true });
     requestIds.push(res.requestId);
     // Mismo transcode que tts.service (64 kbps mono; sin ffmpeg → el original, como hoy).
     parts.push(await transcodeMp3Bitrate(res.audio, TTS_TARGET_BITRATE_KBPS));
@@ -705,7 +722,7 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
     mp3 = parts.length === 1 ? parts[0] : concatMp3(parts);
     durationSeconds = mp3DurationSeconds(mp3);
   } catch (err) {
-    return fail(deps, item, `TTS_AUDIO_INVALID: ${err instanceof Error ? err.message : String(err)}`, true);
+    return fail(deps, item, `TTS_AUDIO_INVALID: ${err instanceof Error ? err.message : String(err)}`, true, { knownOutcome: true });
   }
   if (!deps.artifacts.uploadBufferArtifact) throw new Error('dynamic-provider-worker: artifacts sin uploadBufferArtifact (modo real)');
   const entity = item.chapterId ?? 'course';
@@ -781,6 +798,30 @@ async function priorPaidBlock(deps: RealProviderDeps, item: ClaimedItem, ownerId
   // Sin ledger cableado, la configuración se valida primero; la reserva (antes de cualquier llamada)
   // falla después con finops_unavailable (fail closed, 0 llamadas).
   if (!deps.finops) return false;
+  // Review I4: el MP3 pagado YA quedó subido (artifact del item) y lo que falló fue completar el item
+  // (p.ej. DB caída en completeItem): se reutiliza ese artifact y se completa, 0 llamadas nuevas.
+  if (item.type === 'audio_welcome' || item.type === 'audiobook_chapter') {
+    // El artifact se vincula al item recién en completeItem: se lo identifica por el run + el prefijo de
+    // Storage del item (incluye su idempotencyKey, distinta por generación) + metadata real.
+    const prefix = `${storageBase(item, ownerId, 'dynamic_audio_mp3')}/`;
+    const [prev] = await deps.dataSource.query(
+      `select id, metadata from public.artifacts
+        where job_id = $1 and type = 'dynamic_audio_mp3' and left(storage_path, length($2)) = $2
+          and metadata->>'mode' = 'real' and metadata->>'itemKey' = $3
+        order by created_at desc limit 1`,
+      [item.runId, prefix, item.itemKey],
+    );
+    if (prev) {
+      const m = (prev.metadata ?? {}) as Record<string, any>;
+      deps.logger.warn(`Item ${item.itemKey}: el audio ya estaba subido (artifact ${prev.id}) — se completa sin volver a llamar a OpenAI`);
+      const ok = await deps.scheduler.completeItem(item.itemRunId, deps.executorId, {
+        artifactIds: [prev.id],
+        summary: { mode: 'real', provider: 'openai', model: m.model ?? null, voice: m.voice ?? null, durationSeconds: m.durationSeconds ?? null, chunks: m.chunks ?? null, reusedUploadedArtifact: true },
+      });
+      if (!ok) deps.logger.warn(`Item ${item.itemKey}: completeItem devolvió false al reutilizar el audio (lease perdida)`);
+      return true;
+    }
+  }
   const os = (item.outputSummary ?? {}) as Record<string, any>;
   const ext = (os.external ?? {}) as Record<string, any>;
   const skip: string[] = [];

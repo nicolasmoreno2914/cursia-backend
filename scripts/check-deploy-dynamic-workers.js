@@ -543,20 +543,26 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     }
   });
 
-  await check('staging-calibration.yml: plano de control SIN deploy (sin rsync / npm / migraciones / reinicio de los 11); inputs validados en el runner y por stdin; worker_on/off reinicia SOLO API + worker de proveedores; deploy-staging sin inputs de calibración', () => {
-    const calText = readWf('.github/workflows/staging-calibration.yml').split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
-    assert(/^\s*group: deploy-staging\s*$/m.test(calText), 'mismo grupo de concurrencia que el deploy (nunca a la vez)');
-    assert(/environment: staging/.test(calText) && !/secrets\.VPS_PATH\s*\}\}/.test(calText), 'solo staging');
-    for (const bad of [/rsync/, /npm (ci|install)/, /migrate-/, /ensure_pm2_process/, /pm2 restart all/, /npm run build/]) assert(!bad.test(calText), `no despliega: ${bad}`);
+  await check('deploy-staging.yml job `calibration`: plano de control SIN deploy (sin rsync / npm / migraciones / reinicio de los 11); inputs validados en el runner y por stdin; worker_on/off reinicia SOLO API + worker de proveedores; el job de deploy no corre en un dispatch de calibración', () => {
+    const noComments = (t) => t.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
+    const all = noComments(stagingText);
+    const calText = all.slice(all.indexOf('\n  calibration:\n'));
+    const deployJob = all.slice(all.indexOf('\n  deploy:\n'), all.indexOf('\n  calibration:\n'));
+    assert(calText.length > 100 && deployJob.length > 100, 'dos jobs: deploy y calibration');
+    assert(/^\s*group: deploy-staging\s*$/m.test(all), 'grupo de concurrencia único (deploy y calibración nunca a la vez)');
+    assert(/if: github\.event_name == 'workflow_dispatch' && inputs\.calibration_action != 'none'/.test(calText), 'calibration solo en dispatch con acción');
+    assert(/if: github\.event_name == 'push' \|\| inputs\.calibration_action == 'none'/.test(deployJob), 'deploy solo en push o dispatch none');
+    assert(/environment: staging/.test(calText) && !/secrets\.VPS_PATH\s*\}\}/.test(all), 'solo staging');
+    for (const bad of [/rsync/, /npm (ci|install)/, /migrate-/, /ensure_pm2_process/, /pm2 restart all/, /npm run build/]) assert(!bad.test(calText), `el job calibration no despliega: ${bad}`);
     const restarts = [...calText.matchAll(/pm2 restart (\S+)/g)].map((m) => m[1]).sort();
     eq(restarts, ['cursia-backend-staging', 'cursia-dynamic-provider-worker-staging'], 'solo los 2 procesos que leen el flag');
-    assert(/options: \['report', 'preflight', 'policy', 'authorize', 'worker_on', 'worker_off'\]/.test(calText), 'acciones');
+    assert(/options: \['none', 'report', 'preflight', 'policy', 'authorize', 'worker_on', 'worker_off'\]/.test(all), 'acciones');
     assert(calText.includes('case "$CAL_COURSE" in "") ;; *[!0-9]*)'), 'curso validado en el runner');
-    // El único corte del string remoto es el secret del directorio de staging (mismo patrón que deploy-staging).
     const remote = calText.slice(calText.indexOf("'set -e"), calText.lastIndexOf("'")).replace(`'"\${{ secrets.VPS_PATH_STAGING }}"'`, 'STAGING_DIR');
     assert(!/inputs\./.test(remote) && !remote.slice(1).includes("'"), 'ningún input interpolado ni comilla simple en el script remoto');
     for (const a of ['policy', 'authorize "$_COURSE"', 'report "$_COURSE"', 'worker "$_MODE"']) assert(remote.includes(`node scripts/staging-v21-calibration.js ${a}`), `acción ${a}`);
-    assert(!/provider_worker|calibration_action|_CAL_/.test(stagingText), 'deploy-staging sin inputs de calibración');
+    assert(!/_CAL_|CAL_ACTION|inputs\.calibration/.test(deployJob.replace(/^\s*if:.*$/m, '')), 'el job de deploy no lee inputs de calibración');
+    assert(!fs.existsSync(path.join(repoRoot, '.github/workflows/staging-calibration.yml')), 'sin workflow solo-dispatch no registrado');
     const C = require(path.resolve('scripts/staging-v21-calibration.js'));
     const pol = { limits: { maxCostPerRun: '10', maxCostPerCourse: '15', monthlyCapStaging: '50' }, on_exceed: 'ADMIN_APPROVAL', require_human_approval_for_real_spend: true };
     assert(C.policyMatches(pol), 'política aprobada reconocida');
@@ -618,6 +624,10 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       { id: 'r2', event_kind: 'CHARGE', provider: 'gamma', amount: '1.0', metadata: { reservation: true }, measurement_status: 'pending', run_id: 'x', item_run_id: 'z', call_role: 'main', attempt: 1 },
       { id: 'c2', event_kind: 'CHARGE', provider: 'anthropic', amount: '0.01', metadata: {}, measurement_status: 'final', run_id: null, item_run_id: null, call_role: 'main', attempt: 1 },
     ];
+    // Review I2: la consulta del reporte DEBE traer metadata (si no, las reservas se cuentan como operaciones).
+    const reportSrc = fs.readFileSync(path.resolve('scripts/staging-v21-calibration.js'), 'utf8');
+    const evQuery = reportSrc.slice(reportSrc.indexOf('select id, corrects_event_id, event_kind'), reportSrc.indexOf('from public.generation_cost_events where course_id = $1 order by created_at'));
+    assert(/\bmetadata\b/.test(evQuery) && /corrects_event_id/.test(evQuery) && /call_role/.test(evQuery), 'la consulta de eventos del reporte trae metadata / corrects_event_id / call_role');
     const sm = C.summarizeEvents(ev);
     eq([sm.byProvider.openai.finalCharges, Number(sm.byProvider.openai.net.toFixed(4)), sm.byProvider.gamma.reservationsPending, sm.pending, sm.unattributed], [1, 0.0147, 1, 1, 1], 'resumen');
   });
