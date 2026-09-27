@@ -109,6 +109,16 @@ export interface CostEventRow {
   [k: string]: any;
 }
 
+export interface ItemPaidCharge {
+  idempotency_key: string;
+  attempt: number;
+  provider: string;
+  external_operation_id: string | null;
+  measurement_status: string;
+  reservation: boolean;
+  settled: boolean;
+}
+
 export interface RecordResult {
   inserted: boolean;
   event: CostEventRow;
@@ -278,6 +288,27 @@ export class FinopsLedgerService {
   // ─── cargos ────────────────────────────────────────────────────────────────
 
   async recordCharge(input: RecordChargeInput): Promise<RecordResult> {
+    const { row, pricingError, idempotencyKey } = await this.buildChargeRow(input);
+    const res = await this.insertEvent(row, this.dataSource);
+    if (pricingError) {
+      this.logPricingMissing(idempotencyKey, input, pricingError);
+      return { ...res, pricingMissing: true };
+    }
+    return res;
+  }
+
+  private logPricingMissing(idempotencyKey: string, input: RecordChargeInput, pricingError: { code: string; message: string }): void {
+    this.logger.error(
+      `PRICING_MISSING: CHARGE ${idempotencyKey} (${input.provider}/${input.service}/${input.modelOrProduct}) registrado a 0 ` +
+        `y PENDIENTE (${pricingError.code}: ${pricingError.message}). Cargar el precio en pricing_catalog y re-preciar ` +
+        '(FinopsLedgerService.repricePendingCharge) — el costo real NO está en los totales hasta entonces.',
+    );
+  }
+
+  /** Arma (validación + atribución server-side + precio) la fila de un CHARGE sin insertarla. */
+  private async buildChargeRow(
+    input: RecordChargeInput,
+  ): Promise<{ row: Record<string, unknown>; pricingError: { code: string; message: string } | null; idempotencyKey: string }> {
     if (!input) throw new FinopsError('INVALID_INPUT', 'recordCharge sin input');
     const owner = nonEmpty(input.ownerIdFromAuth, 'ownerIdFromAuth');
     nonEmpty(input.provider, 'provider');
@@ -435,16 +466,7 @@ export class FinopsLedgerService {
       recorded_by: input.recordedBy,
       metadata,
     };
-    const res = await this.insertEvent(row, this.dataSource);
-    if (pricingError) {
-      this.logger.error(
-        `PRICING_MISSING: CHARGE ${idempotencyKey} (${input.provider}/${input.service}/${input.modelOrProduct}) registrado a 0 ` +
-          `y PENDIENTE (${pricingError.code}: ${pricingError.message}). Cargar el precio en pricing_catalog y re-preciar ` +
-          '(FinopsLedgerService.repricePendingCharge) — el costo real NO está en los totales hasta entonces.',
-      );
-      return { ...res, pricingMissing: true };
-    }
-    return res;
+    return { row, pricingError, idempotencyKey };
   }
 
   /**
@@ -580,7 +602,18 @@ export class FinopsLedgerService {
     nonEmpty(reason, 'reason');
     const newTotal = normalizeDecimal(newAmount, 'newAmount');
     if (cmpDec(newTotal, 0) < 0) throw new FinopsError('INVALID_INPUT', 'el nuevo total no puede ser negativo (usar REFUND)');
-    return this.dataSource.transaction(async (manager) => {
+    return this.dataSource.transaction((manager) => this.adjustWith(manager, originalKey, newTotal, reason, opts));
+  }
+
+  /** Cuerpo de recordAdjustment dentro de una transacción ya abierta (lock por clave original). */
+  private async adjustWith(
+    manager: { query: (sql: string, params?: any[]) => Promise<any> },
+    originalKey: string,
+    newTotal: string,
+    reason: string,
+    opts: { recordedBy?: string; metadata?: Record<string, unknown>; settlement?: boolean },
+  ): Promise<{ inserted: boolean; event: CostEventRow | null; delta: string; previousTotal: string; newTotal: string }> {
+    {
       await manager.query(`select pg_advisory_xact_lock(hashtext($1))`, ['finops:adj:' + originalKey]);
       const [orig] = await manager.query(`select * from public.generation_cost_events where idempotency_key = $1`, [originalKey]);
       if (!orig) throw new FinopsError('ORIGINAL_NOT_FOUND', `no existe el evento ${originalKey}`);
@@ -612,7 +645,77 @@ export class FinopsLedgerService {
       });
       const r = await this.insertEvent(row, manager);
       return { inserted: r.inserted, event: r.event, delta, previousTotal, newTotal };
+    }
+  }
+
+  // ─── V2.1 calibración: reservas DURABLES antes de cada llamada pagada ───────
+  //
+  // Protocolo (workers): reserva durable (CHARGE `pending`, metadata.reservation)
+  // → llamada al proveedor → liquidación ATÓMICA: CHARGE final idempotente por el
+  // id de operación del proveedor + ADJUSTMENT de la reserva a 0 en la MISMA
+  // transacción. Nunca queda la reserva y el cargo real sumados, ni ninguno.
+
+  /**
+   * Liquida una reserva: inserta `finalCharge` (idempotente por su clave: el
+   * mismo id de operación del proveedor = un solo cargo) y lleva la reserva a 0
+   * (settlement) en una transacción. `finalCharge=null` = liberar (el proveedor
+   * rechazó el pedido de forma definitiva, sin gasto). Repetir = no-op.
+   */
+  async settleReservation(
+    reservationKey: string,
+    finalCharge: RecordChargeInput | null,
+    reason: string,
+    opts: { recordedBy?: string } = {},
+  ): Promise<{ finalInserted: boolean; finalEvent: CostEventRow | null; released: boolean; alreadySettled: boolean }> {
+    nonEmpty(reservationKey, 'reservationKey');
+    nonEmpty(reason, 'reason');
+    // Lecturas (atribución / catálogo) fuera de la transacción; las escrituras, juntas.
+    const built = finalCharge ? await this.buildChargeRow(finalCharge) : null;
+    const out = await this.dataSource.transaction(async (manager) => {
+      await manager.query(`select pg_advisory_xact_lock(hashtext($1))`, ['finops:adj:' + reservationKey]);
+      const [res] = await manager.query(
+        `select id, event_kind, metadata, measurement_status from public.generation_cost_events where idempotency_key = $1`,
+        [reservationKey],
+      );
+      if (!res) throw new FinopsError('ORIGINAL_NOT_FOUND', `no existe la reserva ${reservationKey}`);
+      if (res.event_kind !== 'CHARGE' || res.metadata?.reservation !== true) {
+        throw new FinopsError('INVALID_INPUT', `${reservationKey} no es una reserva de llamada pagada`);
+      }
+      const [adj] = await manager.query(
+        `select count(*)::int as n from public.generation_cost_events where corrects_event_id = $1 and event_kind = 'ADJUSTMENT'`,
+        [res.id],
+      );
+      let fin: RecordResult | null = null;
+      if (built) fin = await this.insertEvent(built.row, manager);
+      if (Number(adj.n) > 0) return { finalInserted: !!fin?.inserted, finalEvent: fin?.event ?? null, released: false, alreadySettled: true };
+      await this.adjustWith(manager, reservationKey, normalizeDecimal(0), reason, {
+        recordedBy: opts.recordedBy || 'dynamic-worker',
+        settlement: true,
+        metadata: { reservationSettled: true, supersededBy: built ? built.idempotencyKey : null },
+      });
+      return { finalInserted: !!fin?.inserted, finalEvent: fin?.event ?? null, released: true, alreadySettled: false };
     });
+    if (built?.pricingError && out.finalInserted) this.logPricingMissing(built.idempotencyKey, finalCharge as RecordChargeInput, built.pricingError);
+    return out;
+  }
+
+  /**
+   * Cargos REALES (no mock) de un item run, con su intento: reservas (liquidadas o no)
+   * y cargos finales. Un re-claim los usa para no volver a pagar una operación cuyo
+   * resultado no quedó persistido (detección durable, no depende de la memoria del worker).
+   */
+  async itemPaidCharges(itemRunId: string): Promise<ItemPaidCharge[]> {
+    if (typeof itemRunId !== 'string' || !UUID_RE.test(itemRunId)) throw new FinopsError('INVALID_INPUT', 'itemRunId debe ser UUID');
+    const rows = await this.dataSource.query(
+      `select e.idempotency_key, e.attempt, e.provider, e.external_operation_id, e.measurement_status,
+              coalesce((e.metadata->>'reservation') = 'true', false) as reservation,
+              exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id) as settled
+         from public.generation_cost_events e
+        where e.item_run_id = $1 and e.event_kind = 'CHARGE' and e.billing_account <> 'mock'
+        order by e.created_at, e.idempotency_key`,
+      [itemRunId],
+    );
+    return rows.map((r: any) => ({ ...r, attempt: Number(r.attempt), reservation: !!r.reservation, settled: !!r.settled }));
   }
 
   // ─── evitado / estimaciones / autorizaciones ──────────────────────────────

@@ -1,3 +1,4 @@
+import { PROVIDER_WORKER_ENABLED_ENV, isProviderWorkerDeployed } from '../modules/dynamic-generation/provider-modes';
 import { DYNAMIC_FLAG_ENV, isDynamicCourseStructureEnabled, warnIfNearMissDynamicFlag } from '../modules/features/dynamic-features';
 
 interface GateLogger {
@@ -28,6 +29,31 @@ export function holdIdleIfDynamicDisabled(
   logger.warn(
     `${DYNAMIC_FLAG_ENV} desactivado: el worker no reclama jobs (${workerName} queda inactivo, sin conectarse ` +
       `a la DB). Para activarlo: ${DYNAMIC_FLAG_ENV}=true + pm2 restart --update-env.`,
+  );
+  const timer = setInterval(() => undefined, KEEP_ALIVE_MS);
+  const stop = () => {
+    clearInterval(timer);
+    process.exit(0);
+  };
+  process.once('SIGINT', stop);
+  process.once('SIGTERM', stop);
+  return true;
+}
+
+/**
+ * V2.1 calibración #2: el worker de proveedores reales (Gamma / OpenAI TTS / guion LLM) solo
+ * reclama items con DYNAMIC_PROVIDER_WORKER_ENABLED=true. Antes el flag solo cerraba la
+ * creación de runs en la API: "apagarlo" no detenía un run ya activo. Apagado = inactivo,
+ * sin conectarse a la DB (0 gasto, 0 clientes del pool).
+ */
+export function holdIdleIfProviderWorkerDisabled(
+  logger: GateLogger,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  if (isProviderWorkerDeployed(env)) return false;
+  logger.warn(
+    `${PROVIDER_WORKER_ENABLED_ENV}≠true: el worker de proveedores reales no reclama items (queda inactivo, sin conectarse ` +
+      `a la DB ni llamar a proveedores). Para activarlo: ${PROVIDER_WORKER_ENABLED_ENV}=true + pm2 restart --update-env.`,
   );
   const timer = setInterval(() => undefined, KEEP_ALIVE_MS);
   const stop = () => {

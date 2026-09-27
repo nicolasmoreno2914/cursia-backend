@@ -11,7 +11,11 @@
 //                        aprobación en el curso, el estimado supera $8, o el gasto del mes + $8 supera
 //                        el tope mensual de staging ($50).
 //   report <courseId>    Solo lectura: runs, estimados, autorizaciones y eventos FinOps del curso
-//                        (atribución, precio, liquidación, duplicados por operación del proveedor).
+//                        (atribución, precio, liquidación, duplicados por operación del proveedor,
+//                        reservas previas a cada llamada pagada y estimado vs medido por proveedor).
+//   worker <on|off>      Solo el .env de staging: DYNAMIC_PROVIDER_WORKER_ENABLED (reescritura atómica
+//                        con .env.bak; imprime solo esa clave). El workflow reinicia SOLO los 2 procesos
+//                        que la leen (API + worker de proveedores).
 //
 // Límites TEMPORALES de calibración, no los comerciales de HD-V21-19. Nunca imprime secretos.
 // Uso: MIGRATION_ENV=staging node scripts/staging-v21-calibration.js <policy|authorize|report> [courseId]
@@ -55,6 +59,43 @@ function dbProjectRef(env) {
 
 const num = (v) => Number(v);
 const sameNum = (a, b) => a !== undefined && a !== null && b !== undefined && b !== null && Number(a) === Number(b);
+
+/**
+ * Fija KEY=value en un .env (pura sobre el texto): reemplaza la ÚNICA línea KEY= o la agrega.
+ * Más de una línea → error (no se adivina cuál usa dotenv). Devuelve {text, before}.
+ */
+function setEnvKeyText(text, key, value) {
+  if (!/^[A-Z0-9_]+$/.test(key)) throw new Error(`clave inválida: ${key}`);
+  if (!/^[A-Za-z0-9_.-]+$/.test(value)) throw new Error(`valor inválido para ${key}`);
+  const lines = text.split('\n');
+  const idx = lines.map((l, i) => (l.startsWith(`${key}=`) ? i : -1)).filter((i) => i >= 0);
+  if (idx.length > 1) throw new Error(`${key} aparece ${idx.length} veces en el .env — no se toca (revisar a mano)`);
+  if (idx.length === 0) {
+    const base = text.length && !text.endsWith('\n') ? `${text}\n` : text;
+    return { text: `${base}${key}=${value}\n`, before: null };
+  }
+  const before = lines[idx[0]].slice(key.length + 1).replace(/\r$/, '').replace(/^["']|["']$/g, '');
+  lines[idx[0]] = `${key}=${value}`;
+  return { text: lines.join('\n'), before };
+}
+
+function actionWorker(mode, envPath) {
+  if (mode !== 'on' && mode !== 'off') throw new Error('uso: worker <on|off>');
+  const value = mode === 'on' ? 'true' : 'false';
+  const text = fs.readFileSync(envPath, 'utf8');
+  const { text: next, before } = setEnvKeyText(text, 'DYNAMIC_PROVIDER_WORKER_ENABLED', value);
+  if (before === value) {
+    console.log(`✓ DYNAMIC_PROVIDER_WORKER_ENABLED ya vale ${value} — no se toca`);
+    return;
+  }
+  const tmp = `${envPath}.worker.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, next, { mode: fs.statSync(envPath).mode });
+  const lines = (t) => t.split('\n').filter((l) => l.length).length;
+  if (lines(next) < lines(text)) { fs.rmSync(tmp); throw new Error('la reescritura del .env perdió líneas — se aborta sin tocar .env'); }
+  fs.copyFileSync(envPath, `${envPath}.bak`);
+  fs.renameSync(tmp, envPath);
+  console.log(`+ DYNAMIC_PROVIDER_WORKER_ENABLED: ${before === null ? '(ausente)' : before} → ${value} (backup: .env.bak)`);
+}
 
 /** ¿La fila vigente ya es exactamente la política aprobada? (pura) */
 function policyMatches(row) {
@@ -202,7 +243,7 @@ async function actionReport(c, courseId) {
     console.log(`  autorización ${a.id} ${a.decision} ${a.ab} USD run ${a.run_id || '-'} estimado ${a.estimate_id || '-'} (${a.reason || ''})`);
   }
   const ev = await q(
-    `select id, event_kind, provider, service, model_or_product, operation, call_role, attempt, usage, usage_quantity, usage_unit,
+    `select id, corrects_event_id, event_kind, provider, service, model_or_product, operation, call_role, attempt, usage, usage_quantity, usage_unit,
             pricing_snapshot, amount::text amount, cost_source, measurement_status, billing_account, outcome, quota_units::text quota_units,
             owner_id, blueprint_id, manifest_id, run_id, item_run_id, item_key, item_type, chapter_id, external_operation_id, idempotency_key, recorded_by, created_at
        from public.generation_cost_events where course_id = $1 order by created_at`, [courseId]);
@@ -216,18 +257,29 @@ async function actionReport(c, courseId) {
     console.log(`     pricing ${psTxt || '-'} · owner ${e.owner_id || '-'} blueprint ${e.blueprint_id || '-'} manifest ${e.manifest_id || '-'} run ${e.run_id || '-'} item_run ${e.item_run_id || '-'} item ${e.item_key || '-'} (${e.item_type || '-'}) chapter ${e.chapter_id || '-'}`);
     console.log(`     providerOp ${e.external_operation_id || '-'} · idem ${e.idempotency_key} · por ${e.recorded_by}`);
   }
-  const sum = (f) => ev.filter(f).reduce((s, e) => s + Number(e.amount), 0);
-  const byProv = {};
-  for (const e of ev) byProv[e.provider] = (byProv[e.provider] || 0) + Number(e.amount);
-  console.log(`  total por proveedor: ${JSON.stringify(Object.fromEntries(Object.entries(byProv).map(([k, v]) => [k, v.toFixed(6)])))}`);
-  console.log(`  total medido/calculado: ${sum(() => true).toFixed(6)} USD`);
-  console.log(`  pending: ${ev.filter((e) => e.measurement_status === 'pending').length}`);
-  console.log(`  sin atribuir (sin run o sin item_run): ${ev.filter((e) => !e.run_id || !e.item_run_id).length}`);
+  const summary = summarizeEvents(ev);
+  console.log('── resumen FinOps por proveedor (reservas previas a cada llamada netean a 0 al liquidarse) ──');
+  const estByProv = {};
+  for (const e of await q(`select totals from public.cost_estimates where course_id = $1 and scope = 'run' and run_id is not null order by created_at desc limit 1`, [courseId])) {
+    for (const [k, v] of Object.entries((e.totals && e.totals.byProvider) || {})) estByProv[k] = v;
+  }
+  for (const p of [...new Set([...Object.keys(summary.byProvider), ...Object.keys(estByProv)])].sort()) {
+    const s = summary.byProvider[p] || { net: 0, finalCharges: 0, pendingFinal: 0, reservationsPending: 0, retries: 0 };
+    const est = estByProv[p] || {};
+    console.log(`  ${p.padEnd(10)} estimado exp ${est.expected ?? '-'} max ${est.max ?? '-'} · medido/calculado ${s.net.toFixed(6)} · operaciones ${s.finalCharges} · reintentos pagados ${s.retries} · pendientes ${s.pendingFinal} · reservas sin liquidar ${s.reservationsPending}`);
+  }
+  console.log(`  total medido/calculado: ${summary.total.toFixed(6)} USD`);
+  console.log(`  pending (cargos finales pendientes + reservas sin liquidar): ${summary.pending}`);
+  console.log(`  sin atribuir (cargos finales sin run o sin item_run): ${summary.unattributed}`);
   const dup = await q(
     `select provider, external_operation_id, count(*)::int n from public.generation_cost_events
       where course_id = $1 and event_kind = 'CHARGE' and external_operation_id is not null
+        and coalesce(metadata->>'reservation', 'false') <> 'true'
       group by provider, external_operation_id having count(*) > 1`, [courseId]);
   console.log(`  CHARGE duplicados por operación del proveedor: ${dup.length}${dup.length ? ' ' + JSON.stringify(dup) : ''}`);
+  const recon = await q(`select item_key, left(error, 160) as error from public.generation_item_runs g join public.production_jobs j on j.id = g.job_id
+                          where j.course_id = $1 and (g.error like 'provider_reconciliation_required%' or g.error like '%ambiguous%')`, [courseId]);
+  console.log(`  items en reconciliación / ambiguos: ${recon.length}${recon.length ? ' ' + JSON.stringify(recon) : ''}`);
   const [{ total: monthSpent }] = await q(`select coalesce(sum(amount),0)::text total from public.generation_cost_events where billing_account = 'cursia' and created_at >= date_trunc('month', now())`);
   console.log(`  gasto del mes en staging (cursia, todos los cursos): ${monthSpent} USD`);
 }
@@ -249,9 +301,13 @@ async function main() {
     process.exit(1);
   }
   const [action, courseArg] = process.argv.slice(2);
-  if (!['policy', 'authorize', 'report'].includes(action)) {
-    console.error('uso: staging-v21-calibration.js <policy|authorize|report> [courseId]');
+  if (!['policy', 'authorize', 'report', 'worker'].includes(action)) {
+    console.error('uso: staging-v21-calibration.js <policy|authorize|report> [courseId] | worker <on|off>');
     process.exit(1);
+  }
+  if (action === 'worker') {
+    actionWorker(courseArg, path.resolve(process.cwd(), '.env'));
+    return;
   }
   let courseId = null;
   if (action !== 'policy') {
@@ -271,7 +327,37 @@ async function main() {
   }
 }
 
-module.exports = { APPROVED, policyMatches, decideAuthorization, CALIBRATION_TITLE_PREFIX };
+/**
+ * Resumen puro de los eventos de un curso: neto por proveedor (CHARGE + ADJUSTMENT + REFUND),
+ * operaciones = cargos finales (no reservas), pendientes = cargos finales pending sin liquidar +
+ * reservas sin liquidar, sin atribuir = cargos finales sin run/item_run.
+ */
+function summarizeEvents(ev) {
+  const adjusted = new Set(ev.filter((e) => e.corrects_event_id).map((e) => e.corrects_event_id));
+  const byProvider = {};
+  let total = 0;
+  let pending = 0;
+  let unattributed = 0;
+  for (const e of ev) {
+    const p = (byProvider[e.provider] = byProvider[e.provider] || { net: 0, finalCharges: 0, pendingFinal: 0, reservationsPending: 0, retries: 0 });
+    p.net += Number(e.amount);
+    total += Number(e.amount);
+    if (e.event_kind !== 'CHARGE') continue;
+    const isRes = !!(e.metadata && e.metadata.reservation === true);
+    const settled = adjusted.has(e.id);
+    if (isRes) {
+      if (!settled) { p.reservationsPending++; pending++; }
+      continue;
+    }
+    p.finalCharges++;
+    if (e.call_role === 'provider_retry' || e.call_role === 'validation_retry' || Number(e.attempt) > 1) p.retries++;
+    if (e.measurement_status === 'pending' && !settled) { p.pendingFinal++; pending++; }
+    if (!e.run_id || !e.item_run_id) unattributed++;
+  }
+  return { byProvider, total, pending, unattributed };
+}
+
+module.exports = { APPROVED, policyMatches, decideAuthorization, CALIBRATION_TITLE_PREFIX, setEnvKeyText, summarizeEvents };
 if (require.main === module) {
   main().catch((err) => {
     console.error(`❌ staging-v21-calibration: ${String((err && (err.code || err.message)) || err).slice(0, 200)}`);

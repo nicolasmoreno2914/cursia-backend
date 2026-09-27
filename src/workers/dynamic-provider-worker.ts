@@ -4,7 +4,7 @@ import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DataSource } from 'typeorm';
 import { AppModule } from '../app.module';
-import { MissingSchemaBackoff, holdIdleIfDynamicDisabled } from './dynamic-worker-gate';
+import { MissingSchemaBackoff, holdIdleIfDynamicDisabled, holdIdleIfProviderWorkerDisabled } from './dynamic-worker-gate';
 import { ClaimedItem, DEFAULT_LEASE_SECONDS, SchedulerService } from '../modules/dynamic-generation/scheduler.service';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import type { ManifestItemType } from '../modules/generation-manifests/generation-manifest-builder';
@@ -288,6 +288,7 @@ function readPositiveInt(envKey: string, fallback: number): number {
 async function bootstrap() {
   const logger = new Logger('DynamicProviderWorker');
   if (holdIdleIfDynamicDisabled(logger, 'dynamic-provider-worker')) return;
+  if (holdIdleIfProviderWorkerDisabled(logger)) return;
   const app = await NestFactory.createApplicationContext(AppModule, { logger: ['log', 'warn', 'error'] });
   const deps: ProviderWorkerDeps = {
     scheduler: app.get(SchedulerService),

@@ -49,9 +49,14 @@ import {
   WorkerLedger,
   blockWithoutGuard,
   budgetExceededMessage,
-  recordVideogenCharge,
+  finalizeVideogenCharge,
+  priorPaidOperations,
+  reconciliationMessage,
   recordYoutubeUpload,
+  reservePaidCall,
+  settlePaidCall,
   settleVideogenPending,
+  videogenChargeInput,
 } from './finops-worker-hooks';
 import { MOCK_VIDEO_DURATION_SEC, VideoDuration, parseMp4DurationSec, plausibleSeconds, resolveVideoDuration } from './video-duration';
 
@@ -171,14 +176,24 @@ export interface DynamicItemWorkerDeps {
   budget?: WorkerBudget | null;
 }
 
-/** RF-b: un fallo del ledger nunca rompe la generación, pero se loguea fuerte. */
-async function ledgerSafe(deps: DynamicItemWorkerDeps, label: string, fn: (l: WorkerLedger) => Promise<unknown>): Promise<void> {
+/**
+ * Calibración #2: un error del ledger NUNCA se ignora. Lanza → el item falla reintentable, y
+ * el reintento retoma el MISMO job / video (idempotente por su id) sin volver a pagar.
+ * Sin ledger cableado (harnesses previos a RF-b) → no-op, como antes.
+ */
+async function ledgerStrict(deps: DynamicItemWorkerDeps, label: string, fn: (l: WorkerLedger) => Promise<unknown>): Promise<void> {
   if (!deps.finops) return;
   try {
     await fn(deps.finops);
   } catch (err) {
-    deps.logger.error(`finops: no se pudo registrar ${label} en el ledger — ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(`finops_ledger_write_failed: ${label} — ${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+/** Solo un 4xx de batch-create es un rechazo DEFINITIVO de Videogen (no aceptó nada). Todo lo demás es ambiguo. */
+export function isVideogenDefinitiveRejection(err: unknown): boolean {
+  const m = err instanceof Error ? err.message : String(err);
+  return /Videogen batch-create failed \(HTTP 4\d\d\)/.test(m);
 }
 
 interface RunHead {
@@ -366,6 +381,10 @@ class LeaseLostError extends Error {
 export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem): Promise<void> {
   const { scheduler, logger } = deps;
   let leaseLost = false;
+  // Calibración #2: envío a Videogen hecho y todavía sin job persistido (posible gasto "en el aire").
+  let submitInFlight: { jobId: string | null } | null = null;
+  // Reserva previa al envío (calibración #2): se liquida contra UN cargo por job al terminar el render.
+  let videoResKey: string | null = null;
   const heartbeatTimer = setInterval(() => {
     void (async () => {
       if (leaseLost) return;
@@ -428,6 +447,8 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
     if (existingExternal?.videogenJobId) {
       jobId = existingExternal.videogenJobId;
       mode = existingExternal.mode === 'real' ? 'real' : 'mock';
+      // Calibración #2: si hubo reserva previa al envío, sigue contando el gasto hasta el terminal del render.
+      if (typeof item.outputSummary?.externalReservationKey === 'string') videoResKey = item.outputSummary.externalReservationKey;
     } else if (item.outputSummary?.externalSubmitStartedAt) {
       // Crash entre el submit y el registro del id — decisión manual (R3).
       await scheduler.failItem(item.itemRunId, deps.executorId, 'ambiguous_video_submission', false);
@@ -513,8 +534,32 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
       const contentTxt = buildContentTxt(item, markdown);
       const chapterTitle = item.blueprint.chapter?.title ?? `Capítulo ${item.chapterNumber ?? '?'}`;
 
+      // Calibración #2: reserva DURABLE antes del marcador y del envío (si falla, no se envía nada).
+      // Reservas de intentos anteriores: sin marcador que las nombre = el envío nunca se hizo → se liberan;
+      // un cargo previo no reconocido (job anterior sin resolver) → reconciliación, nunca un envío nuevo.
+      let resKey: string | null = null;
+      if (mode === 'real' && deps.finops) {
+        const os = (item.outputSummary ?? {}) as Record<string, any>;
+        const { blocking, releasable } = await priorPaidOperations(deps.finops, item.itemRunId, {
+          currentAttempt: item.attempt,
+          acknowledgedThroughAttempt: Number(os.reconciliationAcknowledgedThroughAttempt ?? 0),
+          isSubmitMarked: () => false,
+        });
+        for (const r of releasable) await settlePaidCall(deps.finops, r.idempotency_key, null, 'reserved_without_submit_marker');
+        if (blocking.length) {
+          const what = blocking.map((b) => `${b.provider} ${b.external_operation_id ?? b.idempotency_key} (intento ${b.attempt})`).join('; ');
+          await scheduler.failItem(item.itemRunId, deps.executorId, reconciliationMessage('videogen', 'render pagado de un intento anterior sin resolver', `${what}. No se envió un video nuevo.`).slice(0, 1900), false);
+          return;
+        }
+        resKey = await reservePaidCall(deps.finops, {
+          kind: 'videogen', ownerId: runHead.ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1,
+          itemAttempt: item.attempt, tag: 'submit', estimate: {},
+        });
+      }
+
       const marked = await scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
         externalSubmitStartedAt: new Date().toISOString(),
+        ...(resKey ? { externalReservationKey: resKey } : {}),
       });
       if (!marked) {
         logger.error(`Item ${item.itemKey}: lease perdida antes de someter el video a Videogen — se detiene sin someter`);
@@ -526,19 +571,42 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
         batchId = mockBatchId(item.idempotencyKey);
         jobId = mockJobId(item.idempotencyKey);
       } else {
-        const result = await deps.videogen.batchCreate([
-          {
-            title: chapterTitle,
-            content_txt: contentTxt,
-            chapter_number: item.chapterNumber ?? 0,
-            client_reference_id: item.idempotencyKey,
-          },
-        ]);
+        submitInFlight = { jobId: null };
+        let result;
+        try {
+          result = await deps.videogen.batchCreate([
+            {
+              title: chapterTitle,
+              content_txt: contentTxt,
+              chapter_number: item.chapterNumber ?? 0,
+              client_reference_id: item.idempotencyKey,
+            },
+          ]);
+        } catch (err) {
+          const why = err instanceof Error ? err.message : String(err);
+          if (isVideogenDefinitiveRejection(err)) {
+            // Videogen no aceptó nada: se libera la reserva (sin gasto). Decisión humana para reenviar.
+            if (resKey && deps.finops) await settlePaidCall(deps.finops, resKey, null, 'videogen_rejected_definitively');
+            submitInFlight = null;
+            await scheduler.failItem(item.itemRunId, deps.executorId, `videogen_submit_rejected: ${why}`.slice(0, 1900), false);
+            return;
+          }
+          // Timeout / red / 5xx / respuesta ilegible: Videogen pudo aceptarlo (y cobrarlo). La reserva
+          // queda pendiente y el item NO se reintenta solo (resolución explícita con resubmitVideo).
+          await scheduler.failItem(item.itemRunId, deps.executorId, `ambiguous_video_submission: ${why}`.slice(0, 1900), false);
+          return;
+        }
         if (!result.batch_id || result.jobs.length !== 1 || !result.jobs[0]?.job_id) {
-          throw new Error(`Videogen batchCreate devolvió una forma inesperada: ${JSON.stringify(result)}`);
+          await scheduler.failItem(
+            item.itemRunId, deps.executorId,
+            `ambiguous_video_submission: Videogen batchCreate devolvió una forma inesperada: ${JSON.stringify(result).slice(0, 400)}`, false,
+          );
+          return;
         }
         batchId = result.batch_id;
         jobId = result.jobs[0].job_id;
+        submitInFlight = { jobId };
+        logger.log(`Item ${item.itemKey}: Videogen aceptó el job ${jobId}`);
       }
 
       const recorded = await scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
@@ -558,6 +626,8 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
         );
         return;
       }
+      submitInFlight = null; // job persistido: reanudable (poll gratis, nunca reenvía)
+      videoResKey = resKey; // la reserva sigue contando el gasto hasta el terminal del render
     }
     if (leaseLost) return;
 
@@ -593,11 +663,21 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
         // V2.1 RF-b: un CHARGE por job (idempotente por videogenJobId): MOCK a 0,
         // CALCULATED_FROM_USAGE con el costo de Videogen, o pendiente si falló la consulta.
         const jobIdForLedger = jobId;
-        await ledgerSafe(deps, `el render ${jobIdForLedger}`, (l) =>
-          recordVideogenCharge(l, {
+        await ledgerStrict(deps, `el render ${jobIdForLedger}`, async (l) => {
+          if (mode === 'real' && videoResKey) {
+            // Reserva → UN cargo por job (costo de Videogen; sin costo → catálogo pendiente), atómico.
+            await settlePaidCall(l, videoResKey, videogenChargeInput({
+              ownerId: runHead.ownerId, itemRunId: item.itemRunId, jobId: jobIdForLedger, mode, cost, costError, outputSummary: item.outputSummary,
+            }), cost === null ? 'videogen_cost_unavailable' : 'videogen_cost_measured');
+            if (cost === null) logger.error(`finops: Videogen no informó el costo del job ${jobIdForLedger} — el cargo queda PENDIENTE (catálogo)`);
+            return;
+          }
+          const r = await finalizeVideogenCharge(l, {
             ownerId: runHead.ownerId, itemRunId: item.itemRunId, jobId: jobIdForLedger, mode, cost,
             costError, outputSummary: item.outputSummary,
-          }));
+          });
+          if (r === 'still_pending') logger.error(`finops: Videogen no informó el costo del job ${jobIdForLedger} — el cargo queda PENDIENTE (catálogo)`);
+        });
         // V2.1 (R11a): duración medida del video (status de Videogen; el worker no
         // tiene los bytes del MP4 ni consulta YouTube). Sin fuente → null + 'unknown'.
         // `external` nunca cambia un valor ya registrado (external_conflict): un
@@ -646,6 +726,13 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (!leaseLost) {
+      if (submitInFlight) {
+        // Envío hecho y job sin persistir (p.ej. DB caída al registrarlo): nunca un reenvío automático.
+        const detail = `${msg}${submitInFlight.jobId ? ` (job de Videogen ${submitInFlight.jobId})` : ''}`;
+        deps.logger.error(`Item ${item.itemKey} (run ${item.runId}): envío a Videogen sin job persistido — ${detail}`);
+        await scheduler.failItem(item.itemRunId, deps.executorId, `ambiguous_video_submission: ${detail}`.slice(0, 1900), false);
+        return;
+      }
       deps.logger.error(`Item ${item.itemKey} (run ${item.runId}): error inesperado — ${msg}`);
       await scheduler.failItem(item.itemRunId, deps.executorId, `unexpected_error: ${msg}`, true);
     }
@@ -1053,7 +1140,7 @@ async function publishYoutubeAndComplete(
     logger.log(`Item ${item.itemKey}: publicado en YouTube (unlisted) ${youtubeUrl}`);
     // V2.1 RF-b: la subida consume cuota (no dinero): ZERO_BY_DESIGN + quota_units, idempotente por videoId.
     const uploadedId = youtubeVideoId;
-    await ledgerSafe(deps, `la subida a YouTube ${uploadedId}`, (l) =>
+    await ledgerStrict(deps, `la subida a YouTube ${uploadedId}`, (l) =>
       recordYoutubeUpload(l, { ownerId: runHead.ownerId, itemRunId: item.itemRunId, videoId: uploadedId, mode: runHead.videoMode }));
   }
 
@@ -1073,7 +1160,7 @@ async function publishYoutubeAndComplete(
       const measured = (await deps.videogen.getVideoCost(videogenJobId)).estimated_total_cost;
       if (typeof measured === 'number' && Number.isFinite(measured)) {
         cost = measured;
-        await ledgerSafe(deps, `el ajuste del render ${videogenJobId}`, (l) => settleVideogenPending(l, videogenJobId, measured));
+        await ledgerStrict(deps, `el ajuste del render ${videogenJobId}`, (l) => settleVideogenPending(l, videogenJobId, measured));
       }
     } catch (err) {
       logger.warn(`Item ${item.itemKey}: el costo de Videogen sigue sin estar disponible — ${err instanceof Error ? err.message : String(err)}`);

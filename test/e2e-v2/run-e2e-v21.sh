@@ -87,7 +87,8 @@ ALLOW_CHROME="MAP * ~NOTFOUND, EXCLUDE 127.0.0.1, EXCLUDE localhost, EXCLUDE you
 env | cut -d= -f1 | grep -E 'API_KEY|ANTHROPIC|OPENAI|GAMMA|VIDEOGEN|ELEVEN|YOUTUBE|GOOGLE|SUPABASE|SECRET|TOKEN|_KEY$' | sort > "$REG/scrubbed-env-names.txt" || true
 : > "$REG/net.log"
 CLEAN_ENV=(env -i PATH="$PATH" HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-}" TMPDIR="${TMPDIR:-/tmp}" LANG=C LC_ALL=C
-  PHP_BIN="$PHP_BIN" NODE_OPTIONS="--require $HERE/netguard.js" E2E_NET_LOG="$REG/net.log" CURSIA_CHROME_HOST_RESOLVER_RULES="$ALLOW_CHROME")
+  PHP_BIN="$PHP_BIN" NODE_OPTIONS="--require $HERE/netguard.js" E2E_NET_LOG="$REG/net.log" CURSIA_CHROME_HOST_RESOLVER_RULES="$ALLOW_CHROME"
+  CURSIA_FRONTEND_REPO="$FE")
 if [ "${E2E_SKIP_REGRESSION:-0}" != "1" ]; then
   echo "(entorno limpio: $(wc -l < "$REG/scrubbed-env-names.txt" | tr -d ' ') variables de proveedor/credenciales del shell NO se pasan; netguard activo)"
   echo "== 3. Regresión: checks del backend =="

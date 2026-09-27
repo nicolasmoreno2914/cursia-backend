@@ -55,6 +55,8 @@ const WORKERS = [
   {
     script: 'dynamic-provider-worker.js', npm: 'start:dynamic-provider-worker', pm2: 'cursia-dynamic-provider-worker',
     claim: (q) => /from public\.generation_item_runs g/.test(q) && /pj\.execution_mode = 'dynamic_generation'/.test(q),
+    // Calibración #2: además de DYNAMIC_COURSE_STRUCTURE, reclama solo con su propio flag encendido.
+    onEnv: { DYNAMIC_PROVIDER_WORKER_ENABLED: 'true' },
   },
 ];
 const PROD_ADDED_LINES = WORKERS.map((w) => `               ensure_pm2_process ${w.pm2} ${w.npm}`);
@@ -433,11 +435,9 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       'ensure_env_flag_true DYNAMIC_COURSE_STRUCTURE',
     ]) assert(block.includes(needle), `falta: ${needle}`);
     assert(!/(ensure_\w+|printf[^\n]*>>\s*\.env)[^\n]*DYNAMIC_COHERENCE_LLM/.test(block), 'DYNAMIC_COHERENCE_LLM no debe escribirse');
-    // Calibración V2.1: el único "true" posible está detrás de _CAL_WORKER=on (dispatch manual).
-    const trueLines = block.split('\n').filter((l) => /DYNAMIC_PROVIDER_WORKER_ENABLED\s+true/.test(l));
-    eq(trueLines.length, 1, 'un único punto que enciende el worker');
-    assert(/if \[ "\$\{_CAL_WORKER:-off\}" = "on" \]; then\n[^\n]*\n\s*ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED true\n\s*else\n\s*ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED false/.test(block),
-      'el worker solo se enciende con _CAL_WORKER=on; si no, false explícito');
+    // Calibración #2: el deploy NUNCA enciende el worker (eso es staging-calibration.yml worker_on).
+    assert(!/DYNAMIC_PROVIDER_WORKER_ENABLED\s+true/.test(block), 'DYNAMIC_PROVIDER_WORKER_ENABLED nunca se enciende desde el deploy');
+    assert(block.includes('ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED false'), 'el deploy lo deja explícitamente en false');
     const SECRET = 'valor-secreto-no-imprimir-123';
     const scenarios = [
       { label: '.env mínimo', env: `NODE_ENV=production\nSUPABASE_SERVICE_KEY=${SECRET}\n` },
@@ -502,13 +502,13 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     const flagsEnd = lines.findIndex((l) => l.startsWith('echo "━━━ [1/6]'));
     const block = [...lines.slice(fnStart, fnEnd), ...lines.slice(flagsStart, flagsEnd)].join('\n');
     assert(/IFS= read -r _FIT/.test(script), 'el token se lee de stdin');
-    assert(/printf "%s\\n%s\\n%s\\n%s\\n" "\$FINOPS_INGEST_TOKEN_STAGING" "\$CAL_WORKER" "\$CAL_ACTION" "\$CAL_COURSE" \| ssh/.test(stagingText), 'token + controles de calibración viajan por stdin del ssh');
+    assert(/printf "%s\\n" "\$FINOPS_INGEST_TOKEN_STAGING" \| ssh/.test(stagingText), 'el token viaja por stdin del ssh');
     const TOKEN = 'finops-token-SECRET-6666';
     const STG = { VG: 'vg-staging-SECRET-4444', DB: 'db-pass-SECRET-7777' };
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v21-provcfg-'));
     try {
       fs.writeFileSync(path.join(dir, '.env'), `NODE_ENV=production\nDB_PASS=${STG.DB}\nVIDEOGEN_API_KEY=${STG.VG}\nDYNAMIC_PROVIDER_WORKER_ENABLED=true\n`);
-      const run = (fit, worker) => spawnSync('bash', ['-c', `set -e\n_FIT=${fit}\n${worker === undefined ? '' : `_CAL_WORKER=${worker}\n`}${block}`], { cwd: dir, encoding: 'utf8' });
+      const run = (fit) => spawnSync('bash', ['-c', `set -e\n_FIT=${fit}\n${block}`], { cwd: dir, encoding: 'utf8' });
       const r1 = run(TOKEN);
       assert(r1.status === 0, `bloque falló: ${r1.stderr}`);
       const out = r1.stdout + r1.stderr;
@@ -531,32 +531,32 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       fs.writeFileSync(path.join(dir, '.env'), before.replace('GAMMA_THEME_V21_LIGHT_DEFAULT=default-light', 'GAMMA_THEME_V21_LIGHT_DEFAULT=manual-theme'));
       assert(run(TOKEN).status === 0, 'corrida con tema manual');
       assert(/GAMMA_THEME_V21_LIGHT_DEFAULT=manual-theme/.test(fs.readFileSync(path.join(dir, '.env'), 'utf8')), 'tema manual respetado');
-      // Calibración V2.1: dispatch con provider_worker=on → true; cualquier otro valor/ausente (push) → false.
-      const workerVal = () => (fs.readFileSync(path.join(dir, '.env'), 'utf8').match(/^DYNAMIC_PROVIDER_WORKER_ENABLED=(.*)$/m) || [])[1];
-      assert(run(TOKEN, 'on').status === 0 && workerVal() === 'true', 'dispatch on → worker true');
-      assert(run(TOKEN).status === 0 && workerVal() === 'false', 'push (sin control) → worker vuelve a false');
-      assert(run(TOKEN, 'on').status === 0 && workerVal() === 'true', 'on otra vez');
-      assert(run(TOKEN, 'off').status === 0 && workerVal() === 'false', 'dispatch off → false');
-      assert(run(TOKEN, 'ON; true').status === 0 && workerVal() === 'false', 'valor raro → false');
+      // Calibración #2: aunque alguien lo haya encendido (worker_on), un deploy lo vuelve a false.
+      fs.writeFileSync(path.join(dir, '.env'), fs.readFileSync(path.join(dir, '.env'), 'utf8').replace(/^DYNAMIC_PROVIDER_WORKER_ENABLED=.*$/m, 'DYNAMIC_PROVIDER_WORKER_ENABLED=true'));
+      assert(run(TOKEN).status === 0, 'deploy con worker encendido');
+      eq((fs.readFileSync(path.join(dir, '.env'), 'utf8').match(/^DYNAMIC_PROVIDER_WORKER_ENABLED=(.*)$/m) || [])[1], 'false', 'deploy → worker false');
       eq((fs.readFileSync(path.join(dir, '.env'), 'utf8').match(/^DYNAMIC_PROVIDER_WORKER_ENABLED=/gm) || []).length, 1, 'una sola línea del flag');
+      const kv2 = Object.fromEntries(fs.readFileSync(path.join(dir, '.env'), 'utf8').split('\n').filter((l) => /^[A-Z0-9_]+=/.test(l)).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
+      eq([kv2.DB_POOL_MAX, kv2.DB_POOL_MAX_WORKER, kv2.DB_POOL_IDLE_MS_WORKER], ['2', '1', '1000'], 'pool de staging (EMAXCONNSESSION)');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  await check('deploy-staging.yml: controles de calibración V2.1 solo en dispatch manual, validados en el runner, sin interpolar inputs en el script remoto', () => {
-    const step = pm2StepOf(stagingText, 'deploy-staging.yml').text;
-    assert(/provider_worker:[\s\S]*?options: \['off', 'on'\][\s\S]*?default: 'off'/.test(stagingText), 'input provider_worker off/on, default off');
-    assert(/calibration_action:[\s\S]*?options: \['none', 'policy', 'authorize', 'report'\][\s\S]*?default: 'none'/.test(stagingText), 'input calibration_action');
-    assert(/CAL_WORKER: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.provider_worker == 'on' && 'on' \|\| 'off' \}\}/.test(step), 'push → off');
-    assert(/CAL_ACTION: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.calibration_action \|\| 'none' \}\}/.test(step), 'push → none');
-    assert(step.includes('case "$CAL_COURSE" in "") ;; *[!0-9]*)'), 'curso validado numérico en el runner');
-    const script = remoteScriptOf(step);
-    assert(!/inputs\./.test(script), 'ningún input interpolado dentro del script remoto');
-    for (const a of ['policy', 'authorize "${_CAL_COURSE}"', 'report "${_CAL_COURSE}"']) {
-      assert(script.includes(`node scripts/staging-v21-calibration.js ${a}`), `acción ${a}`);
-    }
-    assert(script.indexOf('━━━ [6b1]') > 0 && script.indexOf('━━━ [6b1]') < script.indexOf('━━━ [6b2]'), 'la acción corre antes del preflight');
+  await check('staging-calibration.yml: plano de control SIN deploy (sin rsync / npm / migraciones / reinicio de los 11); inputs validados en el runner y por stdin; worker_on/off reinicia SOLO API + worker de proveedores; deploy-staging sin inputs de calibración', () => {
+    const calText = readWf('.github/workflows/staging-calibration.yml').split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
+    assert(/^\s*group: deploy-staging\s*$/m.test(calText), 'mismo grupo de concurrencia que el deploy (nunca a la vez)');
+    assert(/environment: staging/.test(calText) && !/secrets\.VPS_PATH\s*\}\}/.test(calText), 'solo staging');
+    for (const bad of [/rsync/, /npm (ci|install)/, /migrate-/, /ensure_pm2_process/, /pm2 restart all/, /npm run build/]) assert(!bad.test(calText), `no despliega: ${bad}`);
+    const restarts = [...calText.matchAll(/pm2 restart (\S+)/g)].map((m) => m[1]).sort();
+    eq(restarts, ['cursia-backend-staging', 'cursia-dynamic-provider-worker-staging'], 'solo los 2 procesos que leen el flag');
+    assert(/options: \['report', 'preflight', 'policy', 'authorize', 'worker_on', 'worker_off'\]/.test(calText), 'acciones');
+    assert(calText.includes('case "$CAL_COURSE" in "") ;; *[!0-9]*)'), 'curso validado en el runner');
+    // El único corte del string remoto es el secret del directorio de staging (mismo patrón que deploy-staging).
+    const remote = calText.slice(calText.indexOf("'set -e"), calText.lastIndexOf("'")).replace(`'"\${{ secrets.VPS_PATH_STAGING }}"'`, 'STAGING_DIR');
+    assert(!/inputs\./.test(remote) && !remote.slice(1).includes("'"), 'ningún input interpolado ni comilla simple en el script remoto');
+    for (const a of ['policy', 'authorize "$_COURSE"', 'report "$_COURSE"', 'worker "$_MODE"']) assert(remote.includes(`node scripts/staging-v21-calibration.js ${a}`), `acción ${a}`);
+    assert(!/provider_worker|calibration_action|_CAL_/.test(stagingText), 'deploy-staging sin inputs de calibración');
     const C = require(path.resolve('scripts/staging-v21-calibration.js'));
     const pol = { limits: { maxCostPerRun: '10', maxCostPerCourse: '15', monthlyCapStaging: '50' }, on_exceed: 'ADMIN_APPROVAL', require_human_approval_for_real_spend: true };
     assert(C.policyMatches(pol), 'política aprobada reconocida');
@@ -587,6 +587,39 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     eq(n.status, 1, 'sin MIGRATION_ENV=staging no corre');
     const bad = spawnSync(process.execPath, [path.resolve('scripts/staging-v21-calibration.js'), 'authorize', '1;drop'], { env: { PATH: process.env.PATH, MIGRATION_ENV: 'staging', DB_HOST: 'db.abc.supabase.co' }, cwd: os.tmpdir(), encoding: 'utf8' });
     assert(bad.status === 1 && /courseId inválido/.test(bad.stderr), 'courseId validado en el script');
+    // worker on/off: SOLO esa clave del .env, atómico, con backup y sin imprimir otros valores.
+    const SECRET = 'db-pass-SECRET-9191';
+    const tmpW = fs.mkdtempSync(path.join(os.tmpdir(), 'cal-worker-'));
+    try {
+      fs.writeFileSync(path.join(tmpW, '.env'), `NODE_ENV=production\nDB_PASS=${SECRET}\nDYNAMIC_PROVIDER_WORKER_ENABLED=false\nOTHER=1\n`);
+      const w = (mode) => spawnSync(process.execPath, [path.resolve('scripts/staging-v21-calibration.js'), 'worker', mode], { env: { PATH: process.env.PATH, MIGRATION_ENV: 'staging', DB_HOST: 'db.abcstaging.supabase.co' }, cwd: tmpW, encoding: 'utf8' });
+      const on = w('on');
+      assert(on.status === 0 && /false → true/.test(on.stdout) && !(on.stdout + on.stderr).includes(SECRET), `on: ${on.stdout}${on.stderr}`);
+      const txt = fs.readFileSync(path.join(tmpW, '.env'), 'utf8');
+      eq(txt, `NODE_ENV=production\nDB_PASS=${SECRET}\nDYNAMIC_PROVIDER_WORKER_ENABLED=true\nOTHER=1\n`, '.env: solo cambia el flag');
+      assert(fs.existsSync(path.join(tmpW, '.env.bak')), 'backup');
+      assert(/ya vale true/.test(w('on').stdout), 'idempotente');
+      assert(w('off').status === 0 && /DYNAMIC_PROVIDER_WORKER_ENABLED=false/.test(fs.readFileSync(path.join(tmpW, '.env'), 'utf8')), 'off');
+      assert(w('maybe').status === 1, 'modo inválido');
+      const guard = spawnSync(process.execPath, [path.resolve('scripts/staging-v21-calibration.js'), 'worker', 'on'], { env: { PATH: process.env.PATH, MIGRATION_ENV: 'staging', DB_HOST: 'db.hriwbakbuypaiovvvkqh.supabase.co' }, cwd: tmpW, encoding: 'utf8' });
+      eq(guard.status, 1, 'guard de producción también para worker');
+    } finally {
+      fs.rmSync(tmpW, { recursive: true, force: true });
+    }
+    eq(C.setEnvKeyText('A=1\n', 'K', 'true'), { text: 'A=1\nK=true\n', before: null }, 'agrega');
+    let dupThrew = false;
+    try { C.setEnvKeyText('K=1\nK=2\n', 'K', 'true'); } catch { dupThrew = true; }
+    assert(dupThrew, 'clave duplicada → no se toca');
+    // Resumen FinOps: reservas liquidadas netean 0, pendientes = cargos finales pending + reservas sin liquidar.
+    const ev = [
+      { id: 'r1', event_kind: 'CHARGE', provider: 'openai', amount: '0.02', metadata: { reservation: true }, measurement_status: 'pending', run_id: 'x', item_run_id: 'y', call_role: 'main', attempt: 1 },
+      { id: 'a1', corrects_event_id: 'r1', event_kind: 'ADJUSTMENT', provider: 'openai', amount: '-0.02', metadata: {}, run_id: 'x', item_run_id: 'y' },
+      { id: 'c1', event_kind: 'CHARGE', provider: 'openai', amount: '0.0147', metadata: {}, measurement_status: 'final', run_id: 'x', item_run_id: 'y', call_role: 'main', attempt: 1 },
+      { id: 'r2', event_kind: 'CHARGE', provider: 'gamma', amount: '1.0', metadata: { reservation: true }, measurement_status: 'pending', run_id: 'x', item_run_id: 'z', call_role: 'main', attempt: 1 },
+      { id: 'c2', event_kind: 'CHARGE', provider: 'anthropic', amount: '0.01', metadata: {}, measurement_status: 'final', run_id: null, item_run_id: null, call_role: 'main', attempt: 1 },
+    ];
+    const sm = C.summarizeEvents(ev);
+    eq([sm.byProvider.openai.finalCharges, Number(sm.byProvider.openai.net.toFixed(4)), sm.byProvider.gamma.reservationsPending, sm.pending, sm.unattributed], [1, 0.0147, 1, 1, 1], 'resumen');
   });
 
   await check('preflight-v21-providers: READY / MISSING_CONFIG por proveedor sobre el .env de staging, sin imprimir valores; guard de producción', () => {
@@ -631,7 +664,7 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       });
     }
     await check(`(b) ${w.script} con DYNAMIC_COURSE_STRUCTURE=true: conecta y ejecuta su query de claim contra la DB falsa (sin filas → idle); SIGTERM → exit 0`, async () => {
-      const r = await runWorker(w.script, { DYNAMIC_COURSE_STRUCTURE: 'true' }, {
+      const r = await runWorker(w.script, { DYNAMIC_COURSE_STRUCTURE: 'true', ...(w.onEnv || {}) }, {
         waitMs: 20000,
         until: (st) => st.queries.some(w.claim),
       });
@@ -643,10 +676,21 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     });
   }
 
+  // ── Calibración #2: el worker de proveedores reales respeta SU flag (apagado = 0 conexiones, 0 claims) ──
+  for (const flag of [undefined, 'false', 'TRUE']) {
+    await check(`(b) dynamic-provider-worker.js con DYNAMIC_PROVIDER_WORKER_ENABLED ${flag === undefined ? 'ausente' : `"${flag}"`} (y DYNAMIC_COURSE_STRUCTURE=true): inactivo, 0 conexiones / 0 claims — apagar el worker detiene el gasto de Gamma/TTS de runs activos`, async () => {
+      const r = await runWorker('dynamic-provider-worker.js', { DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_PROVIDER_WORKER_ENABLED: flag }, { waitMs: 3500 });
+      assert(/DYNAMIC_PROVIDER_WORKER_ENABLED≠true: el worker de proveedores reales no reclama items/.test(r.output), `sin log claro:\n${r.output}`);
+      assert(r.aliveAfterWait, `el proceso terminó solo: ${JSON.stringify(r.termExit)}`);
+      eq([r.connections, r.queries.length], [0, 0], 'conexiones / queries');
+      assert(r.termExit && r.termExit.code === 0, `SIGTERM: ${JSON.stringify(r.termExit)}`);
+    });
+  }
+
   // ── M5: flag ON antes de migrar (esquema V2 ausente → 42P01) ──────────────
   for (const w of WORKERS) {
     await check(`(M5) ${w.script} flag ON + esquema V2 ausente (42P01 en su claim): error claro UNA vez, sin crash-loop, re-chequeo con backoff; SIGTERM → exit 0`, async () => {
-      const r = await runWorker(w.script, { DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_WORKER_SCHEMA_RECHECK_MS: '1500' }, {
+      const r = await runWorker(w.script, { DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_WORKER_SCHEMA_RECHECK_MS: '1500', ...(w.onEnv || {}) }, {
         waitMs: 20000,
         failRelation: (q) => (w.claim(q) ? (/generation_item_runs/.test(q) ? 'public.generation_item_runs' : 'public.production_jobs') : null),
         until: (st) => st.failed >= 3,

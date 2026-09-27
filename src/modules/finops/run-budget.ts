@@ -19,6 +19,8 @@ import type { EstimateItem, EstimateResult } from './estimator';
 export const BUDGET_APPROVAL_REQUIRED = 'budget_approval_required';
 export const BUDGET_BLOCKED = 'budget_blocked';
 export const BUDGET_EXCEEDED = 'budget_exceeded';
+/** Calibración #2: item con una operación pagada de resultado ambiguo (no se reintenta solo). */
+export const PROVIDER_RECONCILIATION_REQUIRED = 'provider_reconciliation_required';
 export const FINOPS_UNAVAILABLE = 'finops_unavailable';
 
 /** Item types que produce un worker del backend contra un proveedor pagado. */

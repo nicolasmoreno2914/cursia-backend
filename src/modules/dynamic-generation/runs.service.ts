@@ -67,6 +67,7 @@ import {
   BUDGET_APPROVAL_REQUIRED,
   BUDGET_BLOCKED,
   BUDGET_EXCEEDED,
+  PROVIDER_RECONCILIATION_REQUIRED,
   FINOPS_UNAVAILABLE,
   RunManifestItem,
   RunSpendModes,
@@ -1289,34 +1290,39 @@ export class RunsService {
       // en Gamma. Archiva el id/marcador (su reserva pendiente sigue en el ledger) y el worker pide una nueva.
       if (resubmitProvider) {
         if (resubmitVideo) throw new BadRequestException('resubmitVideo y resubmitProvider son excluyentes');
-        if (target.type !== 'presentation') {
-          throw new BadRequestException(`resubmitProvider solo aplica a items type="presentation"; "${itemKey}" es "${target.type}"`);
+        // Calibración #2: también los items de audio (OpenAI TTS / guion LLM) en reconciliación.
+        if (!['presentation', 'audio_welcome', 'audiobook_chapter'].includes(target.type)) {
+          throw new BadRequestException(`resubmitProvider solo aplica a items type="presentation" | "audio_welcome" | "audiobook_chapter"; "${itemKey}" es "${target.type}"`);
         }
         const err = target.error ?? '';
-        if (!(err.startsWith('gamma_submit_ambiguous') || err.startsWith('gamma_generation_failed'))) {
+        const eligible = target.type === 'presentation'
+          ? err.startsWith('gamma_submit_ambiguous') || err.startsWith('gamma_generation_failed') || err.startsWith(PROVIDER_RECONCILIATION_REQUIRED)
+          : err.startsWith(PROVIDER_RECONCILIATION_REQUIRED);
+        if (!eligible) {
           throw new BadRequestException(
-            `resubmitProvider solo aplica cuando el último error es "gamma_submit_ambiguous" o "gamma_generation_failed"; "${itemKey}" falló con "${err}"`,
+            `resubmitProvider solo aplica cuando el último error es "gamma_submit_ambiguous", "gamma_generation_failed" o "${PROVIDER_RECONCILIATION_REQUIRED}"; "${itemKey}" falló con "${err}"`,
           );
         }
         this.logger.warn(`retryItem: resubmitProvider=true para "${itemKey}" (run ${job.id}) — error previo "${err}"; archivando la generación anterior`);
-        resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt'`;
+        resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey'`;
       }
       if (resubmitVideo) {
         if (target.type !== 'video') {
           throw new BadRequestException(`resubmitVideo solo aplica a items type="video"; "${itemKey}" es "${target.type}"`);
         }
         const err = target.error ?? '';
-        const eligible = err.startsWith('videogen_failed') || err.startsWith('ambiguous_video_submission');
+        const eligible = err.startsWith('videogen_failed') || err.startsWith('ambiguous_video_submission')
+          || err.startsWith('videogen_submit_rejected') || err.startsWith(PROVIDER_RECONCILIATION_REQUIRED);
         if (!eligible) {
           throw new BadRequestException(
-            `resubmitVideo solo aplica cuando el último error es "videogen_failed" o "ambiguous_video_submission"; "${itemKey}" falló con "${err}"`,
+            `resubmitVideo solo aplica cuando el último error es "videogen_failed", "ambiguous_video_submission", "videogen_submit_rejected" o "${PROVIDER_RECONCILIATION_REQUIRED}"; "${itemKey}" falló con "${err}"`,
           );
         }
         this.logger.warn(
           `retryItem: resubmitVideo=true para item "${itemKey}" (run ${job.id}) — error previo "${err}"; ` +
             'archivando external/externalSubmitStartedAt en previousExternals y sometiendo un video nuevo',
         );
-        resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt'`;
+        resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey'`;
       }
 
       const previousErrorsExpr = `coalesce(output_summary, '{}'::jsonb) || jsonb_build_object(
@@ -1334,9 +1340,13 @@ export class RunsService {
                     coalesce(output_summary->'previousExternals', '[]'::jsonb) || jsonb_build_array(jsonb_build_object(
                       'external', output_summary->'external',
                       'externalSubmitStartedAt', output_summary->'externalSubmitStartedAt',
+                      'externalReservationKey', output_summary->'externalReservationKey',
                       'reason', error,
                       'archivedAt', now()
-                    ))
+                    )),
+                    -- Calibración #2: decisión humana explícita → las operaciones pagadas de los
+                    -- intentos hasta acá quedan reconocidas (el worker ya no las trata como ambiguas).
+                    'reconciliationAcknowledgedThroughAttempt', attempt_count
                   ))${resubmitSetSql}`
         : previousErrorsExpr;
 
