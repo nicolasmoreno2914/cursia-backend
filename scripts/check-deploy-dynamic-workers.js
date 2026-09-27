@@ -586,6 +586,11 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       assert(!d.ok && re.test(d.reason), `${label}: ${JSON.stringify(d)}`);
     }
     assert(C.decideAuthorization({ ...base, monthSpent: '42' }).ok, '42 + 8 = 50 cabe justo');
+    // Calibración #2: "[CALIBRATION V2.1 #2] …" es de calibración; variantes parecidas no.
+    assert(C.decideAuthorization({ ...base, course: { title: '[CALIBRATION V2.1 #2] Provider Cost Verification' } }).ok, 'título con número de calibración');
+    for (const bad of ['[CALIBRATION V2.1 #x] A', '[CALIBRATION V2.1#2] A', 'CALIBRATION V2.1 #2 A', '[CALIBRATION V2.10] A']) {
+      assert(!C.decideAuthorization({ ...base, course: { title: bad } }).ok, `rechaza "${bad}"`);
+    }
     eq(C.APPROVED.calibrationAuthorization, '8', 'aprobación de 8 USD');
     const g = spawnSync(process.execPath, [path.resolve('scripts/staging-v21-calibration.js'), 'policy'], { env: { PATH: process.env.PATH, MIGRATION_ENV: 'staging', DB_HOST: 'db.hriwbakbuypaiovvvkqh.supabase.co', DB_USER: 'x' }, cwd: os.tmpdir(), encoding: 'utf8' });
     eq(g.status, 1, 'guard de producción');
