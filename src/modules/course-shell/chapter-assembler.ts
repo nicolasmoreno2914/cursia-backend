@@ -38,7 +38,7 @@ import {
   transitionBox,
   unprotectedText,
 } from './html';
-import { COPY, activityInstruction, bridgeText, moduleExamTransition } from './microcopy';
+import { COPY, activityInstruction, bridgeLead, continueWith, moduleExamTransition } from './microcopy';
 
 export type ChapterSlot =
   | { kind: 'label'; role: ChapterLabelRole; name: string; html: string }
@@ -108,8 +108,13 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   const h = hx(theme, input.options);
   const level = h.enh ? ('enhanced' as const) : undefined;
   const uid = (role: string) => `ch${ch.number}-${role.replace(/_/g, '-')}`;
+  const opener = {
+    kicker: `Módulo ${mod.number} · Capítulo ${ch.number}`,
+    title: ch.title,
+    numeral: ch.number < 10 ? `0${ch.number}` : String(ch.number),
+  };
   const mv = (role: 'opening' | 'deepening' | 'video_primer' | 'synthesis' | 'self_check' | 'closing') =>
-    renderMovement(exp.movements[role], theme, { uid: uid(role), level });
+    renderMovement(exp.movements[role], theme, { uid: uid(role), level, opener: role === 'opening' ? opener : undefined });
   const label = (role: ChapterLabelRole, name: string, html: string): ChapterSlot => ({
     kind: 'label',
     role,
@@ -117,11 +122,15 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     html: check(html, `capítulo ${ch.number} ${role}`),
   });
   const s = bgSurf(h);
-  const alt = toneSurf(h, 'alt').s;
+  const alt = s;
 
   const slots: ChapterSlot[] = [];
   // [1] Apertura: identificación determinística + movimiento opening.
-  const head = eyebrow(h, `Módulo ${mod.number} · Capítulo ${ch.number}`, s) + heading(h, 'h2', ch.title, s);
+  // R14-A: si el movimiento abre con un hero, el título del capítulo entra COMO apertura (pico
+  // tipográfico, ctx.opener); si no, se antepone con la misma jerarquía (kicker + display).
+  const opening = exp.movements.opening;
+  const headsWithHero = Array.isArray(opening) && opening.length > 0 && (opening[0] as { type?: string }).type === 'hero';
+  const head = headsWithHero ? '' : eyebrow(h, opener.kicker, s) + heading(h, 'h2', ch.title, s);
   slots.push(label('opening', 'Apertura', injectIntoMovement(mv('opening'), head, '')));
   // [2] Presentación (obligatoria en V2.1).
   slots.push({ kind: 'presentation' });
@@ -129,7 +138,7 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   slots.push(label('deepening', 'Profundización', mv('deepening')));
   // [4] Video: guía previa (plantilla + conceptos del LLM) + transición → video.
   if (ch.videoEnabled) {
-    const before = heading(h, 'h3', COPY.videoPrimerTitle, s) + pHtml(h, labelHtml(COPY.videoPrimerLead), s);
+    const before = eyebrow(h, 'Video interactivo', s) + heading(h, 'h3', COPY.videoPrimerTitle, s) + pHtml(h, labelHtml(COPY.videoPrimerLead), s);
     const after = transitionBox(h, pHtml(h, labelHtml(COPY.videoGo), alt, { last: true }));
     slots.push(label('video_primer', 'Antes del video', injectIntoMovement(mv('video_primer'), before, after)));
     slots.push({ kind: 'video_h5p' });
@@ -139,10 +148,10 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   // [6] Actividad (instrucción determinística con nota mínima/intentos de facts) o repaso no calificado.
   if (ch.activityEnabled) {
     const k = assessment.kinds.activity;
-    const inner = transitionBox(
-      h,
-      heading(h, 'h3', COPY.activityTitle, alt) + pHtml(h, labelHtml(activityInstruction(k.passingGrade, k.attempts)), alt, { last: true }),
-    );
+    const inner =
+      eyebrow(h, 'Práctica calificada', s) +
+      heading(h, 'h3', COPY.activityTitle, s) +
+      pHtml(h, labelHtml(activityInstruction(k.passingGrade, k.attempts)), s, { last: true });
     slots.push(label('activity_instruction', 'Práctica', root(h, uid('activity_instruction'), inner)));
     slots.push({ kind: 'activity', variant: ch.activityVariant as 'h5p' | 'scorm' });
   } else {
@@ -155,15 +164,23 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   // transición determinística (nunca dos mensajes de navegación contradictorios).
   const examNext = lastOfModule && mod.examEnabled;
   let after = input.nextChapter && !examNext ? paras(h, exp.bridge_to_next, s) : '';
-  const bridge: string[] = [];
+  // R14-A (I5): la transición dice primero qué repasar/reintentar y después el siguiente paso,
+  // sin repetir "Con este capítulo terminas…" dos veces.
+  const bridgeLeadText = bridgeLead({ activityEnabled: ch.activityEnabled, activityAttempts: assessment.kinds.activity.attempts });
+  let nextStep: string;
   if (examNext) {
     if (!Number.isInteger(mod.examQuestionCount) || (mod.examQuestionCount as number) < 1) {
       shellFail(`módulo ${mod.number} con examen sin cantidad de preguntas medida`);
     }
-    bridge.push(moduleExamTransition({ number: mod.number, examQuestionCount: mod.examQuestionCount as number }, assessment.kinds.exam.passingGrade));
+    const q = mod.examQuestionCount as number;
+    const pg = assessment.kinds.exam.passingGrade;
+    nextStep = input.nextChapter
+      ? `${moduleExamTransition({ number: mod.number, examQuestionCount: q }, pg)} ${continueWith(input.nextChapter)}`
+      : `${COPY.lastChapterOfCourse} A continuación encontrarás la evaluación del módulo ${mod.number}: ${q} ${q === 1 ? 'pregunta' : 'preguntas'} y una nota mínima de ${pg} de 100.`;
+  } else {
+    nextStep = input.nextChapter ? continueWith(input.nextChapter) : COPY.lastChapterOfCourse;
   }
-  bridge.push(bridgeText({ activityEnabled: ch.activityEnabled, activityAttempts: assessment.kinds.activity.attempts, next: input.nextChapter ?? null }));
-  after += transitionBox(h, bridge.map((b, i) => pHtml(h, inlineHtml(b), alt, { last: i === bridge.length - 1 })).join(''));
+  after += transitionBox(h, pHtml(h, labelHtml(bridgeLeadText), alt, { secondary: true }) + pHtml(h, inlineHtml(nextStep), alt, { last: true, weight: 600 }));
   slots.push(label('closing', 'Cierre', injectIntoMovement(mv('closing'), '', after)));
   return slots;
 }

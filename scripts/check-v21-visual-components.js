@@ -357,7 +357,8 @@ check('escape: <script>, atributos y entidades en texto quedan inertes (ambos ni
 check('**énfasis** → <strong>; saltos de línea → párrafos/<br>', () => {
   const html = vc.renderComponent({ type: 'callout', variant: 'info', body: 'uno **dos** tres\n\ncuatro\ncinco' }, themes[0].theme, { uid: 'x' });
   assert(html.includes('<strong>dos</strong>'), 'strong');
-  assert((html.match(/<p /g) || []).length === 2, 'dos párrafos');
+  // R14-A: el callout abre con un kicker (<p class="cvc-meta">); el cuerpo son 2 párrafos.
+  assert((html.match(/<p (?!class="cvc-meta)/g) || []).length === 2, 'dos párrafos');
   assert(html.includes('cuatro<br>cinco'), 'br');
 });
 
@@ -565,7 +566,7 @@ check('I2: comparación de > 2 columnas se apila por criterio en la base (sin <t
       const html = vc.renderComponent(c, theme, { uid: 'cmp', level });
       if (c.columns.length > vc.VC_TABLE_MAX_COLUMNS) {
         assert(!html.includes('<table'), `${F.fixtureName(c)}/${level || 'clean'}: <table> en la base`);
-        assert((html.match(/class="cvc-card cvc-cmp-row"/g) || []).length === c.rows.length, 'un bloque por criterio');
+        assert((html.match(/class="cvc-cmp-row"/g) || []).length === c.rows.length, 'un bloque por criterio');
         assert((html.match(/class="cvc-cmp-col"/g) || []).length === c.rows.length * c.columns.length, 'columna:valor por celda');
       } else {
         assert(html.includes('<table') && html.includes('scope="col"') && html.includes('scope="row"'), 'tabla con th scope');

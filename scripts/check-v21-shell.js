@@ -367,7 +367,7 @@ async function pureChecks() {
     assert(aw.includes('<audio controls preload="none" src="@@PLUGINFILE@@/audio_bienvenida.mp3"'), 'audio de bienvenida');
     assert(vc.extractText(aw).includes('Duración: 0 min 58 s.'), 'duración medida (formatDurationEs)');
     const ab = vc.extractText(byName['Audiolibro'].html);
-    assert(ab.includes('Duración total: 15 min 48 s.') && ab.includes('empieza en 3 min 01 s · dura 3 min 38 s'), `índice del audiolibro: ${ab}`);
+    assert(ab.includes('Duración total: 15 min 48 s.') && ab.toLowerCase().includes('empieza en 3 min 01 s · dura 3 min 38 s'), `índice del audiolibro: ${ab}`);
     assert(byName['Libro Guía'].html.includes('href="$@RESOURCEVIEWBYID*77@$"'), 'token del Libro');
     assert(vc.extractText(byName['Bienvenida'].html).includes('Duración estimada: 40 h (definida por la institución).'), 'horas etiquetadas');
     for (const w of ['certificado', 'narración profesional', 'minutos por pregunta']) {
