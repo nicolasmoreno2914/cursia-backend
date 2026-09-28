@@ -376,6 +376,10 @@ async function pureChecks() {
     const enh = shellLabels(f2, c2, THEME, 'enhanced');
     labels.forEach((l, i) => eq(vc.extractText(enh[i].html), vc.extractText(l.html), `texto CLEAN_SAFE = ENHANCED (${l.name})`));
     throwsRe(() => S.libroCardLabel(0, f2, THEME), /libroMid/, 'libroMid inválido');
+    // R14: la tarjeta solo promete "bibliografía sugerida" si el Libro publica la sección (verificada).
+    assert(/bibliograf/i.test(vc.extractText(byName['Libro Guía'].html)), 'con bibliografía la menciona');
+    const f2nb = factsOf(c2, { artifacts: { ...F.measuredArtifacts(c2.manifest), libroHasBibliography: false } });
+    assert(!/bibliograf/i.test(vc.extractText(S.libroCardLabel(77, f2nb, THEME).html)), 'sin bibliografía no la promete');
     throwsRe(() => S.welcomeLabel(f2, { ...F.courseIntroFixture(), welcome: 'Muy corto.' }, THEME), /COURSE_INTRO_V3_INVALID.*WORD_RANGE/, 'intro inválida no se renderiza');
   });
 

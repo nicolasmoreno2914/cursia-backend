@@ -48,6 +48,8 @@ export interface CourseFactsArtifactsInput {
   finalExamQuestionCount?: number;
   /** Palabras del Libro Guía compilado. */
   libroWordCount: number;
+  /** R14: el Libro publica una sección de bibliografía (verificada). Omitido = sí (compatibilidad). */
+  libroHasBibliography?: boolean;
 }
 
 export interface BuildCourseFactsInput {
@@ -121,7 +123,7 @@ export interface CourseFacts {
     audiobookSeconds: number;
     audiobookParts: Array<{ chapterId: string; chapterNumber: number; seconds: number; offsetSeconds: number }>;
   };
-  libro: { wordCount: number };
+  libro: { wordCount: number; hasBibliography: boolean };
   hours: { value: number; source: string } | null;
 }
 
@@ -275,7 +277,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
     finalExam: { enabled: features.finalExam, questionCount: finalQ },
     assessment: { assessmentProfileVersion: assessment.assessmentProfileVersion, kinds },
     audio: { welcomeSeconds, audiobookSeconds: offset, audiobookParts },
-    libro: { wordCount: libroWordCount },
+    libro: { wordCount: libroWordCount, hasBibliography: artifacts.libroHasBibliography !== false },
     hours,
   };
   // Sanidad contra los totales del Manifest (dos fuentes, un número).

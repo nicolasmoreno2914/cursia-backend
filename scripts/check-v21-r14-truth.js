@@ -48,13 +48,23 @@ const REAL = {
 };
 
 (async () => {
-  await check('bibliografía: obras reales se conservan; erratas de autor/título se corrigen a la forma canónica', () => {
-    const r = VB.verifyBibliography([REAL.hattie, REAL.wigginsGarbled, REAL.floridiTypo, REAL.selwynReal]);
-    assert.strictEqual(r.kept.length, 4);
-    assert.strictEqual(r.dropped.length, 0);
-    assert.strictEqual(r.kept[1].title, 'Educative Assessment: Designing Assessments to Inform and Improve Student Performance');
-    assert.strictEqual(r.kept[2].author, 'Floridi, Luciano y Cowls, Josh');
-    assert.strictEqual(r.corrected, 2, 'Wiggins (título) y Floridi (autor); Hattie y Selwyn ya eran canónicas');
+  await check('bibliografía: obras reales se conservan; una errata de AUTOR con el título exacto se corrige a la forma canónica; un título deformado se omite (ante la duda, omitir)', () => {
+    const r = VB.verifyBibliography([REAL.hattie, REAL.wigginsGarbled, REAL.floridiTypo, REAL.selwynReal, { author: 'John Hattie', year: 2009, title: 'Visible learning: a synthesis of over 800 meta-analyses relating to achievement', publisher: 'Routledge' }]);
+    assert.deepStrictEqual(r.kept.map((b) => b.author), ['Hattie, John', 'Floridi, Luciano y Cowls, Josh', 'Selwyn, Neil'], JSON.stringify(r.kept));
+    assert.deepStrictEqual(r.dropped.map((b) => b.author), ['Wiggins, Grant P.']);
+    assert.strictEqual(r.corrected, 1, 'Floridi (autor)');
+  });
+
+  await check('bibliografía (revisión): otra obra real del mismo autor y año, otra ley o un título mínimo NUNCA se publican como la obra del catálogo', () => {
+    const cases = [
+      { author: 'Black, Paul y Wiliam, Dylan', year: 1998, title: 'Inside the Black Box: Raising Standards Through Classroom Assessment', publisher: 'Phi Delta Kappan' },
+      { author: 'Congreso de la República de Colombia', year: 2012, title: 'Ley 1480 de 2012, por la cual se dictan disposiciones generales', publisher: 'Diario Oficial' },
+      { author: 'Mayer, Richard E.', year: 2009, title: 'Learning and multimedia instruction', publisher: 'X' },
+      { author: 'Hattie, John', year: 2009, title: 'Learning', publisher: 'X' },
+      { author: 'Hattie, John', year: 2007, title: 'Feedback power in schools', publisher: 'X' },
+    ];
+    const r = VB.verifyBibliography(cases);
+    assert.deepStrictEqual(r.kept, [], JSON.stringify(r.kept));
   });
 
   await check('bibliografía: referencias inventadas o mal atribuidas se omiten (nunca se publican)', () => {

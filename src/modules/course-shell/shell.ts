@@ -239,7 +239,7 @@ export function libroCardLabel(libroMid: number, facts: CourseFacts, theme: Reso
   const c = facts.counts;
   const text =
     `El texto completo del curso en un solo documento: ${c.chapters} ${plural(c.chapters, 'capítulo', 'capítulos')} ` +
-    `en ${c.modules} ${plural(c.modules, 'módulo', 'módulos')}, con bibliografía sugerida. ` +
+    `en ${c.modules} ${plural(c.modules, 'módulo', 'módulos')}${facts.libro.hasBibliography === false ? '' : ', con bibliografía sugerida'}. ` +
     `Extensión aproximada: ${facts.libro.wordCount} palabras.`;
   const inner =
     eyebrow(h, 'Material de estudio', cs.s) +

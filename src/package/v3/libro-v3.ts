@@ -140,10 +140,16 @@ export function compileLibroHtmlV3(input: LibroV3Input): string {
       return `${preface}\n${chapters}`;
     })
     .join('\n');
-  // R14: solo obras verificadas, en forma canónica (verified-bibliography.ts); lo demás se omite.
-  const courseBib = verifyBibliography(dedupe(courseIntro.bibliography)).kept;
+  // R14: solo obras verificadas, en forma canónica (verified-bibliography.ts); lo demás se omite
+  // y se registra (nunca en silencio).
+  const verified = (list: BibliographyEntry[], where: string): BibliographyEntry[] => {
+    const v = verifyBibliography(dedupe(list));
+    if (v.dropped.length || v.corrected) console.warn(`[libro-v3] bibliografía ${where}: ${v.kept.length} publicadas, ${v.corrected} corregidas a forma canónica, ${v.dropped.length} omitidas por no verificables`);
+    return v.kept;
+  };
+  const courseBib = verified(courseIntro.bibliography, 'del curso');
   const moduleBibs = modules
-    .map((m) => ({ m, list: verifyBibliography(dedupe(m.intro.bibliography)).kept }))
+    .map((m) => ({ m, list: verified(m.intro.bibliography, `del módulo ${m.number}`) }))
     .filter((x) => x.list.length > 0)
     .map((x) => `<h3>Módulo ${x.m.number} — ${esc(x.m.title)}</h3><ul>${x.list.map(biblioItem).join('')}</ul>`)
     .join('\n');

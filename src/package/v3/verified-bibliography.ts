@@ -31,17 +31,16 @@ export const VERIFIED_BIBLIOGRAPHY: readonly VerifiedWork[] = [
   { author: 'Wiliam, Dylan', year: 2011, title: 'Embedded Formative Assessment', publisher: 'Solution Tree Press' },
   { author: 'Shute, Valerie J.', year: 2008, title: 'Focus on Formative Feedback', publisher: 'Review of Educational Research, 78(1)' },
   { author: 'Nicol, David J. y Macfarlane-Dick, Debra', year: 2006, title: 'Formative Assessment and Self-Regulated Learning: A Model and Seven Principles of Good Feedback Practice', publisher: 'Studies in Higher Education, 31(2)' },
-  { author: 'Anderson, Lorin W. y Krathwohl, David R.', year: 2001, title: "A Taxonomy for Learning, Teaching, and Assessing: A Revision of Bloom's Taxonomy of Educational Objectives", publisher: 'Longman' },
-  { author: 'Bloom, Benjamin S.', year: 1956, title: 'Taxonomy of Educational Objectives. Handbook I: Cognitive Domain', publisher: 'David McKay' },
+  { author: 'Anderson, Lorin W. y Krathwohl, David R. (Eds.)', year: 2001, title: "A Taxonomy for Learning, Teaching, and Assessing: A Revision of Bloom's Taxonomy of Educational Objectives", publisher: 'Longman' },
+  { author: 'Bloom, Benjamin S. (Ed.)', year: 1956, title: 'Taxonomy of Educational Objectives: The Classification of Educational Goals. Handbook I: Cognitive Domain', publisher: 'David McKay' },
   { author: 'Brookfield, Stephen D. y Preskill, Stephen', year: 2005, title: 'Discussion as a Way of Teaching: Tools and Techniques for Democratic Classrooms (2.ª ed.)', publisher: 'Jossey-Bass' },
   { author: 'Garrison, D. Randy y Vaughan, Norman D.', year: 2008, title: 'Blended Learning in Higher Education: Framework, Principles, and Guidelines', publisher: 'Jossey-Bass' },
   { author: 'Bates, A. W. (Tony)', year: 2015, title: 'Teaching in a Digital Age: Guidelines for Designing Teaching and Learning', publisher: 'Tony Bates Associates' },
-  { author: 'Bates, A. W. (Tony)', year: 2019, title: 'Teaching in a Digital Age: Guidelines for Designing Teaching and Learning (2.ª ed.)', publisher: 'Tony Bates Associates' },
+  { author: 'Bates, A. W. (Tony)', year: 2019, title: 'Teaching in a Digital Age: Guidelines for Designing Teaching and Learning (2.ª ed.)', publisher: 'Tony Bates Associates Ltd.' },
   { author: 'Mayer, Richard E.', year: 2009, title: 'Multimedia Learning (2.ª ed.)', publisher: 'Cambridge University Press' },
   { author: 'Mishra, Punya y Koehler, Matthew J.', year: 2006, title: 'Technological Pedagogical Content Knowledge: A Framework for Teacher Knowledge', publisher: 'Teachers College Record, 108(6)' },
   { author: 'Rose, David H. y Meyer, Anne', year: 2002, title: 'Teaching Every Student in the Digital Age: Universal Design for Learning', publisher: 'ASCD' },
   { author: 'Kolb, David A.', year: 1984, title: 'Experiential Learning: Experience as the Source of Learning and Development', publisher: 'Prentice Hall' },
-  { author: 'Vygotsky, Lev S.', year: 1978, title: 'Mind in Society: The Development of Higher Psychological Processes', publisher: 'Harvard University Press' },
   { author: 'Selwyn, Neil', year: 2019, title: 'Should Robots Replace Teachers? AI and the Future of Education', publisher: 'Polity Press' },
   { author: 'Holmes, Wayne, Bialik, Maya y Fadel, Charles', year: 2019, title: 'Artificial Intelligence in Education: Promises and Implications for Teaching and Learning', publisher: 'Center for Curriculum Redesign' },
   { author: 'Luckin, Rose', year: 2018, title: 'Machine Learning and Human Intelligence: The Future of Education for the 21st Century', publisher: 'UCL IOE Press' },
@@ -59,11 +58,17 @@ export const VERIFIED_BIBLIOGRAPHY: readonly VerifiedWork[] = [
 const fold = (s: unknown): string =>
   String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
 
-/** Primer apellido (o primera palabra de un autor institucional). */
+/**
+ * Primer apellido. "Apellido, Nombre …" → la primera palabra antes de la coma; "Nombre Apellido"
+ * (sin coma) → la última palabra del primer autor; un autor institucional se compara igual en
+ * ambos lados (catálogo y entrada pasan por la misma función).
+ */
 function firstSurname(author: unknown): string {
-  const a = fold(author);
-  const head = a.split(/,|\sy\s|\sand\s|&/)[0].trim();
-  return head.split(/\s+/)[0] || '';
+  const raw = String(author ?? '');
+  const firstAuthor = fold(raw).split(/\sy\s|\sand\s|&|;/)[0].trim();
+  if (firstAuthor.includes(',')) return firstAuthor.split(',')[0].trim().split(/\s+/)[0] || '';
+  const words = firstAuthor.replace(/\(.*?\)/g, ' ').split(/\s+/).filter(Boolean);
+  return words[words.length - 1] || '';
 }
 
 const STOP = new Set(['a', 'an', 'and', 'the', 'of', 'for', 'to', 'in', 'on', 'de', 'del', 'la', 'el', 'los', 'las', 'y', 'en', 'para', 'por', 'ed', 'con']);
@@ -71,15 +76,23 @@ function titleTokens(t: unknown): Set<string> {
   return new Set(fold(t).replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length > 2 && !STOP.has(w)));
 }
 
-/** Proporción de palabras del título más corto presentes en el otro (0–1). */
-function titleOverlap(a: unknown, b: unknown): number {
+/** Números del título (leyes, ediciones, tomos): deben coincidir exactamente. */
+function titleNumbers(t: unknown): string {
+  const nums: string[] = fold(t).match(/\d+/g) ?? [];
+  return nums.filter((n) => n.length > 1).sort().join(',');
+}
+
+/**
+ * Misma obra: ≥ 2 palabras en común y ≥ 75 % de cada título cubierto por el otro (en AMBOS
+ * sentidos: un título largo distinto que contiene el corto no cuenta), y los mismos números.
+ */
+function sameTitle(a: unknown, b: unknown): boolean {
   const ta = titleTokens(a);
   const tb = titleTokens(b);
-  const [small, big] = ta.size <= tb.size ? [ta, tb] : [tb, ta];
-  if (!small.size) return 0;
+  if (!ta.size || !tb.size || titleNumbers(a) !== titleNumbers(b)) return false;
   let hit = 0;
-  for (const w of small) if (big.has(w)) hit++;
-  return hit / small.size;
+  for (const w of ta) if (tb.has(w)) hit++;
+  return hit >= 2 && hit / ta.size >= 0.75 && hit / tb.size >= 0.75;
 }
 
 export interface BibliographyVerification {
@@ -90,7 +103,8 @@ export interface BibliographyVerification {
 
 /**
  * Publica solo obras verificadas, en su forma canónica. Coincidencia = mismo primer apellido,
- * mismo año y ≥ 60 % de las palabras del título más corto en el otro.
+ * mismo año y el mismo título (sameTitle). Ante la duda se omite: una omisión es segura, una
+ * obra equivocada publicada como verificada no.
  */
 export function verifyBibliography(list: readonly BibliographyEntry[] | null | undefined): BibliographyVerification {
   const kept: BibliographyEntry[] = [];
@@ -100,7 +114,7 @@ export function verifyBibliography(list: readonly BibliographyEntry[] | null | u
   for (const b of list ?? []) {
     const s = firstSurname(b?.author);
     const match = VERIFIED_BIBLIOGRAPHY.find(
-      (w) => firstSurname(w.author) === s && w.year === Number(b?.year) && titleOverlap(w.title, b?.title) >= 0.6,
+      (w) => firstSurname(w.author) === s && w.year === Number(b?.year) && sameTitle(w.title, b?.title),
     );
     if (!match) { dropped.push(b); continue; }
     const key = `${match.author}|${match.year}|${match.title}`;

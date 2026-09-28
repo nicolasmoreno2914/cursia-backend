@@ -552,6 +552,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       examQuestionCountByModule,
       ...(finalExamQuestionCount !== undefined ? { finalExamQuestionCount } : {}),
       libroWordCount: libroWordCount(libroHtml),
+      libroHasBibliography: libroHtml.includes('id="bibliografia"'),
     },
   });
   // R6: una categoría con peso > 0 y sin ítems calificables deja el curso sin poder llegar a 100 → falla fuerte.
