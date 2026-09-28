@@ -276,7 +276,9 @@ export function gammaGenerationBody(input: { chapterTitle: string; contentMarkdo
     numCards: GAMMA_NUM_CARDS,
     additionalInstructions:
       'La diapositiva 1 es la portada del capítulo y debe mostrar su título. ' +
-      'El resto desarrolla el contenido en bloques temáticos coherentes, en español latinoamericano.',
+      'El resto desarrolla el contenido en bloques temáticos coherentes, en español latinoamericano con tuteo (tú), nunca voseo. ' +
+      // R14: con textMode 'generate' Gamma completa el texto; no debe inventar cifras ni fuentes.
+      'No agregues cifras, porcentajes, estadísticas, estudios, encuestas, instituciones ni citas que no estén literalmente en el texto; si el texto no trae un dato, no lo inventes.',
     cardOptions: {
       dimensions: '16x9',
       headerFooter: { bottomRight: { type: 'image', source: 'themeLogo', size: 'sm' } },
