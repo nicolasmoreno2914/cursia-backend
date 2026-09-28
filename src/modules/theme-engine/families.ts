@@ -8,11 +8,23 @@
  * Fonts are system stacks only (no webfonts — Moodle labels can't load
  * external CSS reliably, see CLAUDE.md "Moodle filtra el HTML").
  */
-import { ThemeFamily, ThemeFamilyId, ThemeFamilyModeBase } from './types';
+import { ThemeFamily, ThemeFamilyId, ThemeFamilyModeBase, ThemePersonality } from './types';
 
 const SANS =
   "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
+/** R14-A — pilas de sistema con personalidad (sin webfonts: Moodle/CSP/offline). */
+const HUMANIST = "'Avenir Next', Avenir, 'Segoe UI', Candara, 'Trebuchet MS', Roboto, sans-serif";
+const ROUNDED = "ui-rounded, 'SF Pro Rounded', 'Nunito', 'Varela Round', 'Avenir Next', 'Segoe UI', Roboto, sans-serif";
+const SERIF_TEXT = "Charter, 'Bitstream Charter', 'Iowan Old Style', Georgia, Cambria, 'Times New Roman', serif";
+const SERIF_DISPLAY = "'Iowan Old Style', 'Palatino Linotype', Palatino, Charter, Georgia, serif";
+const MONO = "ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace";
+/** Pila serif histórica (se conserva exportada para compatibilidad de fixtures). */
 const SERIF = "Georgia, 'Times New Roman', Cambria, serif";
+void SERIF;
+
+function persona(p: ThemePersonality): ThemePersonality {
+  return p;
+}
 
 function base(partial: ThemeFamilyModeBase): ThemeFamilyModeBase {
   return partial;
@@ -47,10 +59,11 @@ export const THEME_FAMILIES: Record<ThemeFamilyId, ThemeFamily> = {
           onDanger: '#FBFBF9',
           onInfo: '#FBFBF9',
         },
-        typography: { fontBody: SANS, fontHeading: SANS, weightHeading: 700, lineHeading: 1.25, measureCh: 70 },
+        typography: { fontBody: HUMANIST, fontHeading: HUMANIST, weightHeading: 700, lineHeading: 1.25, measureCh: 70 },
         shape: { radiusSm: 8, radiusMd: 12, radiusLg: 20, borderWidth: 1 },
         variants: { card: 'outline', callout: 'tinted', hero: 'soft' },
         moduleColors: ['#0F6E5C', '#B45309', '#1E3A5F', '#7A4E12'],
+        personality: persona({ fontDisplay: HUMANIST, fontMeta: HUMANIST, fontNumeral: HUMANIST, displayWeight: 700, thesisItalic: false, heroTreatment: 'rule', density: 'airy', ruleBetween: false, metaTracking: 0.08, plate: false, sectionRule: false, gridRules: false, metaCase: 'sentence' }),
       }),
     },
   },
@@ -87,6 +100,7 @@ export const THEME_FAMILIES: Record<ThemeFamilyId, ThemeFamily> = {
         shape: { radiusSm: 4, radiusMd: 8, radiusLg: 12, borderWidth: 1 },
         variants: { card: 'flat', callout: 'outline', hero: 'solid' },
         moduleColors: ['#334155', '#1D4ED8', '#0F766E', '#7C2D12'],
+        personality: persona({ fontDisplay: SANS, fontMeta: SANS, fontNumeral: SANS, displayWeight: 700, thesisItalic: false, heroTreatment: 'band', density: 'regular', ruleBetween: false, metaTracking: 0.1, plate: false, sectionRule: true, gridRules: false, metaCase: 'upper' }),
       }),
     },
   },
@@ -119,10 +133,11 @@ export const THEME_FAMILIES: Record<ThemeFamilyId, ThemeFamily> = {
           onDanger: '#FBFBF9',
           onInfo: '#FBFBF9',
         },
-        typography: { fontBody: SERIF, fontHeading: SERIF, weightHeading: 700, lineHeading: 1.2, measureCh: 62 },
+        typography: { fontBody: SERIF_TEXT, fontHeading: SERIF_DISPLAY, weightHeading: 600, lineHeading: 1.2, measureCh: 62 },
         shape: { radiusSm: 2, radiusMd: 4, radiusLg: 8, borderWidth: 1 },
         variants: { card: 'flat', callout: 'outline', hero: 'soft' },
         moduleColors: ['#7C2D12', '#1E3A5F', '#3F6212', '#5B3A8E'],
+        personality: persona({ fontDisplay: SERIF_DISPLAY, fontMeta: SANS, fontNumeral: SERIF_DISPLAY, displayWeight: 600, thesisItalic: true, heroTreatment: 'rule', density: 'airy', ruleBetween: true, metaTracking: 0.12, plate: false, sectionRule: false, gridRules: false, metaCase: 'upper' }),
       }),
     },
   },
@@ -159,6 +174,7 @@ export const THEME_FAMILIES: Record<ThemeFamilyId, ThemeFamily> = {
         shape: { radiusSm: 0, radiusMd: 2, radiusLg: 4, borderWidth: 1 },
         variants: { card: 'outline', callout: 'flat', hero: 'solid' },
         moduleColors: ['#0E7490', '#B45309', '#334155', '#3F6212'],
+        personality: persona({ fontDisplay: SANS, fontMeta: MONO, fontNumeral: MONO, displayWeight: 700, thesisItalic: false, heroTreatment: 'rule', density: 'compact', ruleBetween: false, metaTracking: 0.04, plate: false, sectionRule: false, gridRules: true, metaCase: 'upper' }),
       }),
       dark: base({
         color: {
@@ -186,6 +202,7 @@ export const THEME_FAMILIES: Record<ThemeFamilyId, ThemeFamily> = {
         shape: { radiusSm: 0, radiusMd: 2, radiusLg: 4, borderWidth: 1 },
         variants: { card: 'outline', callout: 'flat', hero: 'solid' },
         moduleColors: ['#22D3EE', '#FBBF24', '#818CF8', '#4ADE80'],
+        personality: persona({ fontDisplay: SANS, fontMeta: MONO, fontNumeral: MONO, displayWeight: 700, thesisItalic: false, heroTreatment: 'rule', density: 'compact', ruleBetween: false, metaTracking: 0.04, plate: true, sectionRule: false, gridRules: true, metaCase: 'upper' }),
       }),
     },
   },
@@ -218,10 +235,11 @@ export const THEME_FAMILIES: Record<ThemeFamilyId, ThemeFamily> = {
           onDanger: '#FBFBF9',
           onInfo: '#FBFBF9',
         },
-        typography: { fontBody: SANS, fontHeading: SANS, weightHeading: 800, lineHeading: 1.25, measureCh: 68 },
-        shape: { radiusSm: 12, radiusMd: 20, radiusLg: 32, borderWidth: 2 },
+        typography: { fontBody: HUMANIST, fontHeading: ROUNDED, weightHeading: 800, lineHeading: 1.25, measureCh: 68 },
+        shape: { radiusSm: 12, radiusMd: 20, radiusLg: 28, borderWidth: 1 },
         variants: { card: 'tinted', callout: 'tinted', hero: 'solid' },
         moduleColors: ['#C026D3', '#0EA5E9', '#65A30D', '#F97316', '#DB2777'],
+        personality: persona({ fontDisplay: ROUNDED, fontMeta: ROUNDED, fontNumeral: ROUNDED, displayWeight: 800, thesisItalic: false, heroTreatment: 'plate', density: 'regular', ruleBetween: false, metaTracking: 0.06, plate: false, sectionRule: false, gridRules: false, metaCase: 'upper' }),
       }),
     },
   },
@@ -258,6 +276,7 @@ export const THEME_FAMILIES: Record<ThemeFamilyId, ThemeFamily> = {
         shape: { radiusSm: 8, radiusMd: 14, radiusLg: 24, borderWidth: 1 },
         variants: { card: 'tinted', callout: 'outline', hero: 'solid' },
         moduleColors: ['#1A3C5E', '#0B6B56', '#7D3C98', '#9B1C1C'],
+        personality: persona({ fontDisplay: SERIF_DISPLAY, fontMeta: SANS, fontNumeral: SERIF_DISPLAY, displayWeight: 600, thesisItalic: true, heroTreatment: 'rule', density: 'airy', ruleBetween: false, metaTracking: 0.14, plate: true, sectionRule: false, gridRules: false, metaCase: 'upper' }),
       }),
     },
   },

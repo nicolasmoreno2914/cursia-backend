@@ -65,6 +65,12 @@ export function bridgeText(opts: {
   return `${lead} ${tail}`;
 }
 
+/** R14-A — solo la parte "repasa / reintenta" del puente (va como párrafo, fuera de la transición). */
+export function bridgeLead(opts: { activityEnabled: boolean; activityAttempts?: number }): string {
+  const full = bridgeText({ ...opts, next: { number: 1, title: 'x' } });
+  return full.slice(0, full.indexOf(' Continúa con el capítulo'));
+}
+
 /** Transición al examen del módulo (solo si el módulo TIENE examen). */
 export function moduleExamTransition(m: { number: number; examQuestionCount: number }, passingGrade: number): string {
   return (

@@ -19,6 +19,7 @@ import type { ResolvedTheme, ModuleColor } from '../../modules/theme-engine';
 import { lintCleanSafe } from '../../modules/visual-components';
 import {
   ShellRenderOptions,
+  bgSurf,
   box,
   eyebrow,
   hx,
@@ -80,14 +81,21 @@ export function presentationCardHtml(input: PresentationCardInput): string {
   // width:100% manda sobre el atributo.
   const img =
     `<img src="${attr(coverUrl)}" alt="${attr(`Portada de la presentación del capítulo ${chapterNumber}`)}" width="${CARD_COVER_CLEAN_WIDTH_PX}"` +
-    st(h, [['margin', '0 0 12px 0'], ['border', `1px solid ${theme.color.border}`]], [['max-width', '100%'], ['width', '100%'], ['height', 'auto'], ['display', 'block']]) +
+    st(h, [['margin', '0 0 16px 0'], ['border', `1px solid ${theme.color.border}`]], [['max-width', '100%'], ['width', '100%'], ['height', 'auto'], ['display', 'block'], ['border-radius', theme.shape.radiusMd]]) +
     ' />';
+  // R14-A: la presentación es una figura (portada a todo el ancho + CTA), no una caja.
+  void box;
+  void toneSurf;
+  void moduleColor;
+  const s = bgSurf(h);
   const linkText = `Ver presentación completa (PDF, ${slideCount} diapositiva${slideCount === 1 ? '' : 's'})`;
   const inner =
-    eyebrow(h, `Presentación — Capítulo ${chapterNumber}`, cs.s) +
+    eyebrow(h, `Presentación · Capítulo ${chapterNumber}`, s) +
     img +
-    pHtml(h, link(h, pdfUrl, linkText, cs.s), cs.s, { last: true });
-  const html = root(h, `ch${chapterNumber}-presentation`, box(h, inner, cs, { accentBorder: moduleColor.main }));
+    link(h, pdfUrl, linkText, s, { button: true });
+  void cs;
+  void pHtml;
+  const html = root(h, `ch${chapterNumber}-presentation`, inner);
   const lint = lintCleanSafe(html);
   if (!lint.ok) shellFail(`presentation card: no pasa CLEAN_SAFE: ${lint.errors.slice(0, 3).map((e) => `${e.code} ${e.message}`).join('; ')}`);
   const bare = unprotectedText(html);

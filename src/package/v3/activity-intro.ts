@@ -63,9 +63,9 @@ export function h5pActivityInlineIntroHtml(input: { packageFilename: string; tit
     `<div class="cursia-iv-inline" style="display:none;margin:0 0 12px 0;padding:0;">`,
     `<iframe title="${esc(title.trim())}" data-cursia-src="${src}" loading="lazy" width="100%" height="560" style="width:100%;border:0;" allowfullscreen="allowfullscreen"></iframe>`,
     `</div>`,
-    `<div class="cursia-iv-fallback" style="background-color:${t.surface};color:${t.textPrimary};border:1px solid ${t.accent};padding:12px 16px;margin:0;font-size:16px;line-height:1.5;">`,
-    `<p style="margin:0 0 6px 0;color:${t.textPrimary};"><strong>${esc(C.heading)}</strong></p>`,
-    `<p style="margin:0 0 10px 0;color:${t.textPrimary};">${esc(C.body)}</p>`,
+    `<div class="cursia-iv-fallback" style="background-color:${t.surface};color:${t.textPrimary};border-top:1px solid ${t.border};padding:16px 20px 14px 20px;margin:0;font-size:16px;line-height:1.5;">`,
+    `<p class="cvc-meta" style="margin:0 0 6px 0;color:${t.accent};font-size:14px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;">${esc(C.heading)}</p>`,
+    `<p style="margin:0 0 10px 0;color:${t.textSecondary};max-width:68ch;">${esc(C.body)}</p>`,
     `<p class="cursia-iv-open" style="margin:0;"><a href="$@H5PACTIVITYVIEWBYID*${activityMid}@$" style="color:${t.accent};font-weight:bold;">${esc(C.openLink)}</a></p>`,
     `</div>`,
     `<script>${CURSIA_IV_INLINE_SCRIPT}</script>`,
@@ -75,7 +75,7 @@ export function h5pActivityInlineIntroHtml(input: { packageFilename: string; tit
 
 export function scormIntroHtml(theme: VideoIntroTheme): string {
   return (
-    `<div style="background-color:${theme.surface};color:${theme.textPrimary};border:1px solid ${theme.border};padding:12px 16px;margin:0;font-size:16px;line-height:1.5;">` +
+    `<div style="background-color:${theme.surface};color:${theme.textPrimary};border-top:1px solid ${theme.border};padding:16px 20px 14px 20px;margin:0;font-size:16px;line-height:1.5;">` +
     `<p style="margin:0;color:${theme.textPrimary};">${esc(ACTIVITY_INTRO_COPY.scormBody)}</p></div>`
   );
 }

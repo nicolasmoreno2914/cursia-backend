@@ -63,6 +63,54 @@ export interface ThemeTypographyTokens {
     sizeH2Fluid: string;
     sizeH1Fluid: string;
   };
+  /**
+   * R14-A — escala editorial (Design Language V1 §1). Los *Px son la base CLEAN_SAFE;
+   * `scale` son los clamp() de ENHANCED (mismo orden de roles).
+   */
+  sizeDisplayPx: number;
+  sizeTitlePx: number;
+  sizeItemPx: number;
+  sizeLeadPx: number;
+  sizeStatementPx: number;
+  sizeNumeralPx: number;
+  scale: {
+    display: string;
+    title: string;
+    item: string;
+    lead: string;
+    statement: string;
+    numeral: string;
+  };
+}
+
+/** R14-A — cómo se abre un capítulo/curso en cada familia (Design Language V1 §5–6). */
+export type HeroTreatment = 'rule' | 'band' | 'plate';
+export type Density = 'compact' | 'regular' | 'airy';
+
+/**
+ * R14-A — personalidad de la familia: tipografía y composición, no solo color
+ * (Design Language V1 §6). Derivada de la familia; no entra en validateTheme de color.
+ */
+export interface ThemePersonality {
+  fontDisplay: string;
+  fontMeta: string;
+  fontNumeral: string;
+  displayWeight: number;
+  thesisItalic: boolean;
+  heroTreatment: HeroTreatment;
+  density: Density;
+  /** Filete de 1 px entre componentes de un mismo label (Editorial). */
+  ruleBetween: boolean;
+  /** Tracking de las líneas meta, en em. */
+  metaTracking: number;
+  /** El label pinta su fondo como una lámina (familias oscuras); si no, el contenido va abierto sobre la página. */
+  plate: boolean;
+  /** Filete de acento de 2 px a todo el ancho sobre el kicker de cada componente (membrete, Institucional). */
+  sectionRule: boolean;
+  /** Filetes de ítem en borderStrong (retícula de ficha técnica, Técnico). */
+  gridRules: boolean;
+  /** Kicker en mayúsculas con tracking (default) o en "oración" (Aula clara: más cercano). */
+  metaCase: 'upper' | 'sentence';
 }
 
 export interface ThemeShapeTokens {
@@ -86,6 +134,7 @@ export interface ThemeFamilyModeBase {
   variants: ThemeVariantTokens;
   /** Anchor hues (hex) used to derive module colors when no BrandSeed.moduleColors is given. */
   moduleColors: string[];
+  personality: ThemePersonality;
 }
 
 export interface ThemeFamily {
@@ -118,6 +167,7 @@ export interface ResolvedTheme {
   space: number[];
   shape: ThemeShapeTokens;
   variants: ThemeVariantTokens;
+  personality: ThemePersonality;
   /** Every automatic contrast correction resolveTheme applied, in order, human-readable (Spanish). */
   adjustments: string[];
   /**

@@ -1,24 +1,29 @@
 /**
  * R2 — Visual Components: renderer (JSON validado + ResolvedTheme → HTML de label Moodle).
+ * R14-A — reescrito según «CURSIA V2 DESIGN LANGUAGE V1» (docs/v21/design-language-v1.md):
+ * contenido ABIERTO por defecto, jerarquía tipográfica real, superficies solo por rol
+ * (panel / sección tintada / bloque delineado), nunca una superficie dentro de otra.
  *
  * Dos niveles sobre EL MISMO markup (§X.1, HD-V21-3):
  *  - CLEAN_SAFE (siempre): HTML semántico + estilos inline que sobreviven forceclean=1
  *    (hex, margin/padding/border, tipografía, max-width…). Todo el contenido visible, en
- *    orden de lectura, en flujo de bloques, sin desborde a 390 px. Todo elemento que fija
- *    `color` está dentro de (o es) un elemento con `background-color` sólido del tema,
- *    elegido para ese color. Todo texto va en <span class="nolink"> (filtros de Moodle).
- *  - ENHANCED (ctx.level === 'enhanced'): propiedades extra DESPUÉS de las seguras
- *    (grid, radius, shadow, overflow-wrap, font-size fluido), <details open>, aria/ids/role,
- *    y en renderMovement un <style> con scope + runtime JS (runtime.ts).
+ *    orden de lectura, en flujo de bloques (una columna), sin desborde a 390 px. Todo
+ *    elemento que fija `color` está dentro de (o es) un elemento con `background-color`
+ *    sólido del tema, elegido para ese color. Todo texto va en <span class="nolink">.
+ *  - ENHANCED (ctx.level === 'enhanced'): propiedades extra DESPUÉS de las seguras (tamaños
+ *    fluidos, radius, overflow-wrap), <details open>, aria/ids/role, y en renderMovement un
+ *    <style> con scope (layout en columnas, grillas, ejes, botones) + runtime JS.
+ *    El layout en columnas vive SOLO en el <style> (clases), así que sin él todo queda en
+ *    una columna legible.
  *
  * Determinista: mismo componente + tema + uid → mismos bytes. Sin reloj ni azar.
  * El renderer NO valida longitudes (eso es validateExperience); sí exige estructura, un
  * tema bien formado y escapa todo texto, así que un input fuera de rango nunca produce
  * HTML inseguro.
  *
- * Jerarquía de encabezados: el nombre de la sección Moodle es <h3>; dentro del label el
- * hero y los títulos de componente son <h4> y los encabezados de ítem <h5> (o <h4> si el
- * componente no tiene título).
+ * Jerarquía de encabezados: el nombre de la sección Moodle es <h3>; la apertura de capítulo
+ * (ctx.opener) usa <h2> para el título del capítulo; dentro del label los títulos de
+ * componente son <h4> y los encabezados de ítem <h5> (o <h4> si el componente no tiene título).
  */
 import { contrastRatio, isValidHex, ResolvedTheme } from '../theme-engine';
 import {
@@ -45,6 +50,16 @@ import { runtimeScript, scopedStyle } from './runtime';
 
 export type VcRenderLevel = 'enhanced';
 
+/** R14-A — contexto de apertura de capítulo: el título del capítulo es el pico de la página. */
+export interface VcOpener {
+  /** Línea meta, p. ej. "Módulo 1 · Capítulo 2". */
+  kicker: string;
+  /** Título del capítulo (display, <h2>). */
+  title: string;
+  /** Numeral grande (p. ej. "02"); opcional. */
+  numeral?: string;
+}
+
 export interface VcRenderContext {
   /**
    * Identificador del label, ÚNICO en la página del curso; [a-z0-9-]. renderComponent admite
@@ -54,6 +69,13 @@ export interface VcRenderContext {
   uid: string;
   /** Omitido = solo CLEAN_SAFE. */
   level?: VcRenderLevel;
+  /** Solo para un `hero`: lo convierte en la apertura del capítulo (Design Language §5). */
+  opener?: VcOpener;
+  /**
+   * Labels del shell: toda cifra visible debe salir de facts (SHELL_NUMBER_NOT_FROM_FACTS),
+   * así que sin conteos en los kickers ni numerales de índice.
+   */
+  countless?: boolean;
 }
 
 const UID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
@@ -77,6 +99,8 @@ interface R {
   enh: boolean;
   uid: string;
   seq: number;
+  opener?: VcOpener;
+  countless?: boolean;
 }
 
 type Decl = [string, string | number];
@@ -91,6 +115,11 @@ function checkCtx(ctx: VcRenderContext, maxLen = 64): void {
     renderFail(`uid inválido "${ctx && ctx.uid}" (se espera [a-z0-9-], 1–${maxLen})`);
   }
   if (ctx.level !== undefined && ctx.level !== 'enhanced') renderFail(`level desconocido "${String(ctx.level)}"`);
+  if (ctx.opener !== undefined) {
+    const o = ctx.opener;
+    if (!o || typeof o.kicker !== 'string' || typeof o.title !== 'string' || !o.title.trim()) renderFail('opener inválido');
+    if (o.numeral !== undefined && !/^[0-9]{1,3}$/.test(o.numeral)) renderFail(`opener.numeral inválido "${String(o.numeral)}"`);
+  }
 }
 
 const FONT_RE = /^[A-Za-z0-9 ,'\-]+$/;
@@ -100,24 +129,36 @@ const FONT_RE = /^[A-Za-z0-9 ,'\-]+$/;
  * ResolvedTheme deserializado/alterado con un token malicioso no debe poder inyectar.
  */
 function checkTheme(t: ResolvedTheme): void {
-  if (!t || typeof t !== 'object' || !t.color || !t.typography || !t.shape || !t.variants) renderFail('tema inválido');
+  if (!t || typeof t !== 'object' || !t.color || !t.typography || !t.shape || !t.variants || !t.personality) renderFail('tema inválido');
   for (const [k, v] of Object.entries(t.color)) if (!isValidHex(v)) renderFail(`tema: color.${k} no es #RRGGBB`);
   const ty = t.typography;
-  for (const k of ['fontBody', 'fontHeading'] as const) {
-    if (typeof ty[k] !== 'string' || !FONT_RE.test(ty[k])) renderFail(`tema: typography.${k} con caracteres no permitidos`);
+  const p = t.personality;
+  for (const [k, v] of [['fontBody', ty.fontBody], ['fontHeading', ty.fontHeading], ['fontDisplay', p.fontDisplay], ['fontMeta', p.fontMeta], ['fontNumeral', p.fontNumeral]] as const) {
+    if (typeof v !== 'string' || !FONT_RE.test(v)) renderFail(`tema: ${k} con caracteres no permitidos`);
   }
-  for (const k of ['sizeBodyPx', 'sizeSmallPx', 'sizeMetaPx', 'sizeH3Px', 'sizeH2Px', 'sizeH1Px', 'lineBody', 'lineHeading', 'weightBody', 'weightHeading', 'measureCh'] as const) {
+  for (const k of [
+    'sizeBodyPx', 'sizeSmallPx', 'sizeMetaPx', 'sizeH3Px', 'sizeH2Px', 'sizeH1Px', 'lineBody', 'lineHeading', 'weightBody', 'weightHeading', 'measureCh',
+    'sizeDisplayPx', 'sizeTitlePx', 'sizeItemPx', 'sizeLeadPx', 'sizeStatementPx', 'sizeNumeralPx',
+  ] as const) {
     if (typeof ty[k] !== 'number' || !Number.isFinite(ty[k]) || ty[k] <= 0) renderFail(`tema: typography.${k} no es un número positivo`);
   }
   if (ty.sizeBodyPx < 16 || ty.sizeSmallPx < 16 || ty.sizeMetaPx < 13) renderFail('tema: tamaños de fuente por debajo del mínimo');
+  const CLAMP = /^clamp\([0-9a-z.+\- ,]+\)$/;
   for (const k of ['sizeBodyFluid', 'sizeH3Fluid', 'sizeH2Fluid', 'sizeH1Fluid'] as const) {
-    if (!ty.enhanced || typeof ty.enhanced[k] !== 'string' || !/^clamp\([0-9a-z.+\- ,]+\)$/.test(ty.enhanced[k])) renderFail(`tema: typography.enhanced.${k} inválido`);
+    if (!ty.enhanced || typeof ty.enhanced[k] !== 'string' || !CLAMP.test(ty.enhanced[k])) renderFail(`tema: typography.enhanced.${k} inválido`);
+  }
+  for (const k of ['display', 'title', 'item', 'lead', 'statement', 'numeral'] as const) {
+    if (!ty.scale || typeof ty.scale[k] !== 'string' || !CLAMP.test(ty.scale[k])) renderFail(`tema: typography.scale.${k} inválido`);
   }
   for (const k of ['radiusSm', 'radiusMd', 'radiusLg', 'borderWidth'] as const) {
     if (typeof t.shape[k] !== 'number' || !Number.isFinite(t.shape[k]) || t.shape[k] < 0) renderFail(`tema: shape.${k} inválido`);
   }
   if (!['flat', 'outline', 'tinted'].includes(t.variants.card) || !['flat', 'outline', 'tinted'].includes(t.variants.callout) || !['solid', 'soft'].includes(t.variants.hero)) {
     renderFail('tema: variants inválidas');
+  }
+  if (!['rule', 'band', 'plate'].includes(p.heroTreatment) || !['compact', 'regular', 'airy'].includes(p.density)) renderFail('tema: personality inválida');
+  for (const k of ['displayWeight', 'metaTracking'] as const) {
+    if (typeof p[k] !== 'number' || !Number.isFinite(p[k]) || p[k] < 0) renderFail(`tema: personality.${k} inválido`);
   }
 }
 
@@ -128,6 +169,11 @@ function surf(t: ResolvedTheme, bg: string, preferred: string[] = []): Surf {
   if (!fg) renderFail(`ningún color de texto del tema alcanza ${MIN_CONTRAST}:1 sobre ${bg}`);
   const fg2 = contrastRatio(t.color.textSecondary, bg) >= MIN_CONTRAST ? t.color.textSecondary : fg;
   return { bg, fg, fg2 };
+}
+
+/** Primer color legible (≥ 4.5:1) sobre `bg` de la lista; si ninguno, el texto principal de `s`. */
+function readable(bg: string, cands: string[], fallback: string): string {
+  return cands.find((c) => isValidHex(c) && contrastRatio(c, bg) >= MIN_CONTRAST) ?? fallback;
 }
 
 function attr(v: string): string {
@@ -155,12 +201,50 @@ function ea(r: R, attrs: Record<string, string | undefined>): string {
     .join('');
 }
 
-// ─── Primitivas ─────────────────────────────────────────────────────────────
+/** Ritmo vertical según la densidad de la familia (§2). */
+function D(r: R, px: number): number {
+  const m = r.t.personality.density === 'compact' ? 0.85 : r.t.personality.density === 'airy' ? 1.15 : 1;
+  return Math.round(px * m);
+}
 
-function componentWrap(r: R, type: string, inner: string, s: Surf, extraSafe: Decl[] = [], extraEnh: Decl[] = []): string {
+/** Fondo del label: lámina (familias oscuras) o la superficie casi blanca que se funde con la página. */
+export function groundColor(t: ResolvedTheme): string {
+  return t.personality && t.personality.plate ? t.color.bg : t.color.surface;
+}
+
+function ground(r: R): Surf {
+  return surf(r.t, groundColor(r.t));
+}
+
+/** Superficie de un panel/sección tintada: distinta del fondo del label. */
+function panelBg(r: R): string {
+  return r.t.personality.plate ? r.t.color.surface : r.t.color.surfaceAlt;
+}
+
+function plural(n: number, one: string, many: string): string {
+  return `${n} ${n === 1 ? one : many}`;
+}
+
+/** Kicker con conteo ("Proceso · 6 pasos"); en labels del shell (countless) solo la etiqueta. */
+function counted(r: R, label: string, n: number, one: string, many: string): string {
+  return r.countless ? label : `${label} · ${plural(n, one, many)}`;
+}
+
+/** Índice "01"; en countless un glifo neutro (sin cifras). */
+function indexText(r: R, i: number): string {
+  return r.countless ? '—' : pad2(i + 1);
+}
+
+// ─── Primitivas tipográficas ────────────────────────────────────────────────
+
+/** Ritmo: los componentes "mayores" respiran más antes del siguiente (64 vs 44, × densidad). */
+const MAJOR_TYPES = new Set(['hero', 'process_steps', 'comparison', 'summary_visual', 'case_scenario', 'timeline', 'accordion', 'concept_cards', 'tabs']);
+
+function componentWrap(r: R, type: string, inner: string, s: Surf, extraSafe: Decl[] = [], extraEnh: Decl[] = [], cls = ''): string {
   const ty = r.t.typography;
+  const gap = D(r, MAJOR_TYPES.has(type) ? 64 : 44);
   return (
-    `<div class="cvc-c cvc-t-${type}"` +
+    `<div class="cvc-c cvc-t-${type}${cls ? ' ' + cls : ''}"` +
     st(
       r,
       [
@@ -169,25 +253,58 @@ function componentWrap(r: R, type: string, inner: string, s: Surf, extraSafe: De
         ['font-family', ty.fontBody],
         ['font-size', ty.sizeBodyPx],
         ['line-height', String(ty.lineBody)],
-        ['margin', '0 0 24px 0'],
+        ['margin', `0 0 ${gap}px 0`],
         ...extraSafe,
       ],
-      [['font-size', ty.enhanced.sizeBodyFluid], ['overflow-wrap', 'anywhere'], ...extraEnh],
+      [['font-size', ty.enhanced.sizeBodyFluid], ['overflow-wrap', 'break-word'], ...extraEnh],
     ) +
     `>${inner}</div>`
   );
 }
 
-type HeadingSize = 'hero' | 'title' | 'item';
+/** Línea meta / kicker (única excepción de tamaño: sizeMetaPx, clase cvc-meta). */
+function kicker(r: R, text: string, s: Surf, opts: { color?: string; margin?: string; tag?: 'p' | 'span'; llm?: boolean } = {}): string {
+  const p = r.t.personality;
+  const color = readable(s.bg, [opts.color ?? r.t.color.accentStrong, r.t.color.accent, s.fg2], s.fg);
+  const tag = opts.tag ?? 'p';
+  return (
+    `<${tag} class="cvc-meta cvc-kicker"` +
+    st(r, [
+      ['margin', opts.margin ?? `0 0 ${D(r, 10)}px 0`],
+      ['padding', 0],
+      ['color', color],
+      ['font-family', p.fontMeta],
+      // < 16 px solo para meta en MAYÚSCULAS (regla de QA/a11y); en caja de oración, 16 px.
+      ['font-size', p.metaCase === 'sentence' ? r.t.typography.sizeSmallPx : r.t.typography.sizeMetaPx],
+      ['font-weight', '700'],
+      ['line-height', '1.4'],
+      ['letter-spacing', p.metaCase === 'sentence' ? '0.01em' : `${p.metaTracking}em`],
+      ['text-transform', p.metaCase === 'sentence' ? 'none' : 'uppercase'],
+    ]) +
+    `>${opts.llm ? inlineHtml(text) : labelHtml(text)}</${tag}>`
+  );
+}
 
-function heading(r: R, tag: HTag, text: string, s: Surf, size: HeadingSize, opts: { cls?: string; id?: string } = {}): string {
+/** Kicker que abre un componente: en familias con `sectionRule` lleva un filete de acento a todo el ancho. */
+function sectionKicker(r: R, text: string, s: Surf): string {
+  if (!r.t.personality.sectionRule) return kicker(r, text, s);
+  const col = readable(s.bg, [r.t.color.accent, r.t.color.accentStrong], r.t.color.borderStrong);
+  return `<div class="cvc-secrule"${st(r, [['margin', '0 0 14px 0'], ['padding', '12px 0 0 0'], ['border-top', `2px solid ${col}`]])}>${kicker(r, text, s, { margin: '0' })}</div>`;
+}
+
+type Role = 'display' | 'title' | 'item' | 'statement';
+
+function heading(r: R, tag: 'h2' | HTag, text: string, s: Surf, role: Role, opts: { cls?: string; id?: string; margin?: string } = {}): string {
   const ty = r.t.typography;
-  const sz =
-    size === 'hero'
-      ? { px: ty.sizeH2Px, fl: ty.enhanced.sizeH1Fluid, h: HYPHEN_HEADING }
-      : size === 'title'
-        ? { px: ty.sizeH3Px, fl: ty.enhanced.sizeH3Fluid, h: HYPHEN_HEADING }
-        : { px: ty.sizeBodyPx, fl: ty.enhanced.sizeBodyFluid, h: undefined };
+  const p = r.t.personality;
+  const spec =
+    role === 'display'
+      ? { px: ty.sizeDisplayPx, fl: ty.scale.display, font: p.fontDisplay, w: p.displayWeight, lh: '1.08', ls: '-0.015em', m: `0 0 ${D(r, 20)}px 0` }
+      : role === 'title'
+        ? { px: ty.sizeTitlePx, fl: ty.scale.title, font: ty.fontHeading, w: ty.weightHeading, lh: '1.2', ls: '-0.01em', m: `0 0 ${D(r, 20)}px 0` }
+        : role === 'statement'
+          ? { px: ty.sizeStatementPx, fl: ty.scale.statement, font: p.fontDisplay, w: 600, lh: '1.3', ls: '-0.005em', m: `0 0 ${D(r, 16)}px 0` }
+          : { px: ty.sizeItemPx, fl: ty.scale.item, font: ty.fontHeading, w: 600, lh: '1.3', ls: '0', m: '0 0 6px 0' };
   const cls = opts.cls ? ` class="${opts.cls}"` : '';
   const id = opts.id ? ea(r, { id: opts.id }) : '';
   return (
@@ -195,134 +312,147 @@ function heading(r: R, tag: HTag, text: string, s: Surf, size: HeadingSize, opts
     st(
       r,
       [
-        ['margin', size === 'item' ? '0 0 8px 0' : '0 0 16px 0'],
+        ['margin', opts.margin ?? spec.m],
         ['padding', 0],
         ['color', s.fg],
-        ['font-family', ty.fontHeading],
-        ['font-size', sz.px],
-        ['font-weight', String(ty.weightHeading)],
-        ['line-height', String(ty.lineHeading)],
+        ['font-family', spec.font],
+        ['font-size', spec.px],
+        ['font-weight', String(spec.w)],
+        ['line-height', spec.lh],
+        ['letter-spacing', spec.ls],
       ],
-      [['font-size', sz.fl]],
+      [['font-size', spec.fl], ['text-wrap', 'balance']],
     ) +
-    `>${inlineHtml(text, sz.h)}</${tag}>`
+    `>${inlineHtml(text, role === 'item' ? undefined : HYPHEN_HEADING)}</${tag}>`
   );
 }
 
-function paragraphs(r: R, text: string, s: Surf, opts: { secondary?: boolean; px?: number; weight?: number; last?: boolean; id?: string } = {}): string {
+function paragraphs(
+  r: R,
+  text: string,
+  s: Surf,
+  opts: { secondary?: boolean; role?: 'body' | 'lead' | 'statement'; weight?: number; last?: boolean; id?: string; italic?: boolean; font?: string; climax?: boolean } = {},
+): string {
   const ty = r.t.typography;
-  const px = opts.px ?? ty.sizeBodyPx;
+  const role = opts.role ?? 'body';
+  const px = opts.climax ? ty.sizeDisplayPx - 8 : role === 'lead' ? ty.sizeLeadPx : role === 'statement' ? ty.sizeStatementPx : ty.sizeBodyPx;
+  const fl = opts.climax ? 'clamp(1.625rem, 1.2rem + 2vw, 2.5rem)' : role === 'lead' ? ty.scale.lead : role === 'statement' ? ty.scale.statement : ty.enhanced.sizeBodyFluid;
+  const lh = opts.climax ? '1.18' : role === 'lead' ? '1.5' : role === 'statement' ? '1.3' : String(ty.lineBody);
+  const measure = role === 'body' ? `${ty.measureCh}ch` : role === 'lead' ? '60ch' : '36ch';
   const ps = richParagraphs(text);
   return ps
     .map((p, i) => {
       const safe: Decl[] = [
-        ['margin', i === ps.length - 1 && opts.last ? '0' : '0 0 12px 0'],
+        ['margin', i === ps.length - 1 && opts.last ? '0' : `0 0 ${role === 'body' ? 14 : 16}px 0`],
         ['padding', 0],
         ['color', opts.secondary ? s.fg2 : s.fg],
         ['font-size', px],
-        ['line-height', String(ty.lineBody)],
-        ['max-width', `${ty.measureCh}ch`],
+        ['line-height', lh],
+        ['max-width', measure],
       ];
-      if (opts.weight) safe.push(['font-weight', String(opts.weight)]);
-      const enh: Decl[] = px === ty.sizeBodyPx ? [['font-size', ty.enhanced.sizeBodyFluid]] : [];
+      if (opts.font || role === 'statement') safe.push(['font-family', opts.font ?? r.t.personality.fontDisplay]);
+      if (opts.weight || role === 'statement') safe.push(['font-weight', String(opts.weight ?? 600)]);
+      if (opts.italic) safe.push(['font-style', 'italic']);
       const id = i === 0 && opts.id ? ea(r, { id: opts.id }) : '';
-      return `<p${id}${st(r, safe, enh)}>${p}</p>`;
+      return `<p${id}${st(r, safe, [['font-size', fl]])}>${p}</p>`;
     })
     .join('');
 }
 
-/** Badge de metadatos (única excepción de tamaño: sizeMetaPx, clase cvc-meta). Lleva su propio fondo. */
-function badge(r: R, text: string, bg: string, fg?: string): string {
-  const color = fg ?? surf(r.t, bg).fg;
+/** Filete de acento (40–56 × 3 px): marca la apertura y la idea central, nada más (§4). */
+function accentRule(r: R, s: Surf, margin?: string): string {
+  const col = readable(s.bg, [r.t.color.accent, r.t.color.accentStrong], r.t.color.borderStrong);
+  return `<div class="cvc-rule"${ea(r, { 'aria-hidden': 'true' })}${st(r, [['width', '48px'], ['max-width', '48px'], ['margin', margin ?? `0 0 ${D(r, 20)}px 0`], ['border-top', `3px solid ${col}`]])}></div>`;
+}
+
+/** Numeral grande (capítulo, paso). */
+function numeral(r: R, text: string, s: Surf, size: 'xl' | 'md' | 'sm' = 'md'): string {
+  const ty = r.t.typography;
+  const col = readable(s.bg, [r.t.color.accentStrong, r.t.color.accent], s.fg);
+  const px = size === 'xl' ? Math.round(ty.sizeNumeralPx * 1.6) : size === 'md' ? ty.sizeNumeralPx : ty.sizeItemPx;
+  const fl = size === 'xl' ? 'clamp(3.25rem, 2.2rem + 4vw, 5.5rem)' : size === 'md' ? ty.scale.numeral : ty.scale.item;
   return (
-    `<span class="cvc-meta"` +
+    `<div class="cvc-num"` +
     st(
       r,
       [
-        ['background-color', bg],
-        ['color', color],
-        ['border', `1px solid ${bg}`],
-        ['padding', '2px 8px'],
-        ['font-size', r.t.typography.sizeMetaPx],
-        ['font-weight', '700'],
-        ['line-height', '1.5'],
-        ['letter-spacing', '0.04em'],
-        ['text-transform', 'uppercase'],
+        ['margin', size === 'sm' ? '0 0 4px 0' : '0 0 8px 0'],
+        ['color', col],
+        ['font-family', r.t.personality.fontNumeral],
+        ['font-size', px],
+        ['font-weight', String(Math.max(600, Math.min(900, Math.round(r.t.personality.displayWeight / 100) * 100)))],
+        ['line-height', '1'],
+        ['letter-spacing', '-0.02em'],
       ],
-      [['border-radius', '999px'], ['display', 'inline-block']],
+      [['font-size', fl], ['font-variant-numeric', 'tabular-nums lining-nums']],
     ) +
-    `>${labelHtml(text)}</span>`
+    `>${labelHtml(text)}</div>`
   );
 }
 
-function badgeLine(r: R, badgeHtml: string): string {
-  return `<div${st(r, [['margin', '0 0 8px 0']])}>${badgeHtml}</div>`;
+function pad2(n: number): string {
+  return n < 10 ? `0${n}` : String(n);
 }
 
-type CardTone = 'card' | 'surface' | 'alt' | 'soft';
-
-function cardSurf(r: R, tone: CardTone): { s: Surf; border: string } {
-  const c = r.t.color;
-  const tn = tone === 'card' ? ({ flat: 'alt', outline: 'surface', tinted: 'soft' } as const)[r.t.variants.card] : tone;
-  if (tn === 'alt') return { s: surf(r.t, c.surfaceAlt), border: c.surfaceAlt };
-  if (tn === 'soft') return { s: surf(r.t, c.accentSoft), border: c.border };
-  return { s: surf(r.t, c.surface), border: c.border };
-}
-
-function card(r: R, inner: string, cs: { s: Surf; border: string }, opts: { cls?: string; tag?: 'div' | 'li'; id?: string; border?: string; borderWidth?: number } = {}): string {
-  const tag = opts.tag || 'div';
-  const bw = opts.borderWidth ?? r.t.shape.borderWidth;
+/** Fila separada por filete superior (el separador de todo contenido abierto). */
+function row(r: R, inner: string, s: Surf, opts: { tag?: 'div' | 'li'; cls?: string; first?: boolean; id?: string } = {}): string {
+  const tag = opts.tag ?? 'div';
   return (
-    `<${tag} class="cvc-card${opts.cls ? ' ' + opts.cls : ''}"${opts.id ? ` id="${attr(opts.id)}"` : ''}` +
+    `<${tag}${opts.cls ? ` class="${opts.cls}"` : ''}${opts.id ? ` id="${attr(opts.id)}"` : ''}` +
+    st(r, [
+      ['margin', 0],
+      ['padding', `${D(r, 18)}px 0 ${D(r, 18)}px 0`],
+      ['color', s.fg],
+      ['border-top', `1px solid ${r.t.personality.gridRules ? r.t.color.borderStrong : r.t.color.border}`],
+    ]) +
+    `>${inner}</${tag}>`
+  );
+}
+
+/** Panel: una superficie por rol (caso, tarjetas de revelado). Nunca contiene otra superficie. */
+function panel(r: R, inner: string, s: Surf, opts: { cls?: string; tag?: 'div' | 'li'; border?: string; borderWidth?: number; padding?: string } = {}): string {
+  const tag = opts.tag || 'div';
+  return (
+    `<${tag} class="cvc-panel${opts.cls ? ' ' + opts.cls : ''}"` +
     st(
       r,
       [
-        ['background-color', cs.s.bg],
-        ['color', cs.s.fg],
-        ['border', `${bw}px solid ${opts.border || cs.border}`],
-        ['margin', '0 0 16px 0'],
-        ['padding', '16px 20px'],
+        ['background-color', s.bg],
+        ['color', s.fg],
+        ['border', `${opts.borderWidth ?? 1}px solid ${opts.border ?? r.t.color.border}`],
+        ['margin', `0 0 ${D(r, 16)}px 0`],
+        ['padding', opts.padding ?? `${D(r, 24)}px ${D(r, 28)}px`],
       ],
-      [['border-radius', r.t.shape.radiusMd], ['box-shadow', `0 1px 2px ${r.t.color.border}`]],
+      [['border-radius', r.t.shape.radiusMd]],
     ) +
     `>${inner}</${tag}>`
   );
 }
 
-function grid(r: R, inner: string, minRem = 16): string {
-  return (
-    `<div class="cvc-grid"` +
-    st(
-      r,
-      [['margin', 0], ['padding', 0]],
-      [
-        ['display', 'grid'],
-        ['grid-template-columns', `repeat(auto-fit,minmax(min(100%,${minRem}rem),1fr))`],
-        ['column-gap', '16px'],
-      ],
-    ) +
-    `>${inner}</div>`
-  );
-}
-
 /** <ul>/<ol> sin viñetas: en ENHANCED se devuelve role="list" (Safari/VoiceOver lo pierde). */
-function bareList(r: R, tag: 'ul' | 'ol', inner: string): string {
-  return `<${tag}${ea(r, { role: 'list' })}${st(r, [['list-style', 'none'], ['margin', 0], ['padding', 0]])}>${inner}</${tag}>`;
+function bareList(r: R, tag: 'ul' | 'ol', inner: string, cls?: string): string {
+  return `<${tag}${cls ? ` class="${cls}"` : ''}${ea(r, { role: 'list' })}${st(r, [['list-style', 'none'], ['margin', 0], ['padding', 0]])}>${inner}</${tag}>`;
 }
 
 /**
  * Bloque de revelado. CLEAN_SAFE: etiqueta + cuerpo apilados, siempre visibles.
  * ENHANCED: <details open> (el runtime lo cierra al iniciar; sin JS queda abierto), con un
- * nombre accesible que incluye el contexto del ítem (aria-label contiene el texto visible).
+ * botón-píldora como <summary> y un nombre accesible con el contexto del ítem.
  */
-function reveal(r: R, cls: string, summaryInner: string, cleanLead: string, body: string, opts: { keepOpen?: boolean; ariaLabel?: string } = {}): string {
+function reveal(r: R, cls: string, summaryInner: string, cleanLead: string, body: string, opts: { keepOpen?: boolean; ariaLabel?: string; button?: boolean } = {}): string {
   if (!r.enh) return `<div class="${cls}">${cleanLead}${body}</div>`;
   const k = opts.keepOpen ? ' cvc-keep-open' : '';
   return (
     `<details class="${cls} cvc-collapsible${k}" open>` +
-    `<summary class="cvc-summary"${ea(r, { 'aria-label': opts.ariaLabel })}${st(r, [['margin', '0 0 8px 0']])}>${summaryInner}</summary>` +
+    `<summary class="cvc-summary${opts.button ? ' cvc-btn' : ''}"${ea(r, { 'aria-label': opts.ariaLabel })}${st(r, [['margin', opts.button ? '4px 0 0 0' : '0']])}>${summaryInner}</summary>` +
     `<div class="cvc-dbody">${body}</div></details>`
   );
+}
+
+/** Texto de un botón-píldora de revelado (solo ENHANCED lo muestra como botón). */
+function btnLabel(r: R, text: string, s: Surf): string {
+  const col = readable(s.bg, [r.t.color.accentStrong, r.t.color.accent], s.fg);
+  return `<span class="cvc-btn-t"${st(r, [['color', col], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700']])}>${labelHtml(text)}</span>`;
 }
 
 function titleIf(r: R, title: string | undefined, s: Surf, fallback?: string, id?: string): string {
@@ -339,149 +469,227 @@ function list<T>(v: T[] | undefined, what: string): T[] {
   return v;
 }
 
-function glyph(r: R, ch: string, color: string): string {
-  return `<span${ea(r, { 'aria-hidden': 'true' })}${st(r, [['color', color], ['font-weight', '700']])}>${ch}</span> `;
+function glyph(r: R, ch: string, color: string, cls = 'cvc-glyph'): string {
+  return `<span class="${cls}"${ea(r, { 'aria-hidden': 'true' })}${st(r, [['color', color], ['font-weight', '700']])}>${ch}</span> `;
+}
+
+/** "Paso 3: Frota…" → "Frota…" (el numeral ya dice el orden). */
+const STEP_PREFIX_RE = /^\s*(?:paso|etapa|fase|step)\s*\d{1,2}\s*[:.\-–—)]\s*/i;
+function stripStepPrefix(h: string): string {
+  const out = h.replace(STEP_PREFIX_RE, '');
+  return out.trim() ? out : h;
 }
 
 // ─── Componentes (una función por tipo) ─────────────────────────────────────
 
 function renderHero(r: R, c: VcHero): string {
   const col = r.t.color;
-  const solid = r.t.variants.hero === 'solid';
-  const s = solid ? surf(r.t, col.accent, [col.textOnAccent]) : surf(r.t, col.accentSoft);
-  const eyebrow = c.eyebrow
-    ? `<p${st(r, [['margin', '0 0 8px 0'], ['color', s.fg], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700'], ['letter-spacing', '0.06em'], ['text-transform', 'uppercase']])}>${inlineHtml(c.eyebrow, HYPHEN_HEADING)}</p>`
-    : '';
-  const inner = eyebrow + heading(r, 'h4', c.title, s, 'hero') + paragraphs(r, c.lead, s, { last: true });
-  return componentWrap(
-    r,
-    'hero',
-    inner,
-    s,
-    [['padding', '28px 24px'], ['border', `${r.t.shape.borderWidth}px solid ${solid ? col.accent : col.border}`]],
-    [['border-radius', r.t.shape.radiusLg]],
-  );
+  const p = r.t.personality;
+  const g = ground(r);
+  const op = r.opener;
+  const plate = p.heroTreatment === 'plate';
+  const s = plate ? surf(r.t, col.accentSoft) : g;
+  const metaParts = [op ? op.kicker : '', c.eyebrow ?? ''].filter((x) => x && x.trim());
+  let head = '';
+  if (p.heroTreatment === 'band' && metaParts.length) {
+    const bs = surf(r.t, col.accent, [col.textOnAccent]);
+    head =
+      `<div class="cvc-band"${st(r, [['background-color', bs.bg], ['color', bs.fg], ['margin', `0 0 ${D(r, 24)}px 0`], ['padding', '10px 16px']], [['border-radius', r.t.shape.radiusSm]])}>` +
+      kicker(r, metaParts.join(' · '), bs, { color: bs.fg, margin: '0', llm: true }) +
+      `</div>`;
+  } else if (metaParts.length) {
+    head = kicker(r, metaParts.join(' · '), s, { llm: true });
+  }
+  let main: string;
+  if (op) {
+    main =
+      heading(r, 'h2', op.title, s, 'display') +
+      accentRule(r, s) +
+      paragraphs(r, c.title, s, { role: 'statement', italic: p.thesisItalic }) +
+      paragraphs(r, c.lead, s, { role: 'lead', last: true });
+  } else {
+    main = heading(r, 'h4', c.title, s, 'display') + accentRule(r, s) + paragraphs(r, c.lead, s, { role: 'lead', last: true });
+  }
+  const num = op && op.numeral ? `<div class="cvc-op-num">${numeral(r, op.numeral, s, 'xl')}</div>` : '';
+  const body = `<div class="cvc-op${num ? ' cvc-op-split' : ''}"><div class="cvc-op-lead">${head}</div>${num}<div class="cvc-op-main">${main}</div></div>`;
+  if (plate) {
+    return componentWrap(
+      r,
+      'hero',
+      body,
+      s,
+      [['padding', `${D(r, 32)}px ${D(r, 28)}px`], ['border', `1px solid ${col.accentSoft}`]],
+      [['border-radius', r.t.shape.radiusLg], ['padding', 'clamp(24px, 4vw, 48px)']],
+      op ? 'cvc-opener' : '',
+    );
+  }
+  return componentWrap(r, 'hero', body, s, [['padding', `${D(r, 8)}px 0 0 0`]], [], op ? 'cvc-opener' : '');
 }
 
 function renderLearningObjectives(r: R, c: VcLearningObjectives): string {
-  const s = surf(r.t, r.t.color.bg);
-  const items = list(c.items, 'learning_objectives.items')
-    .map((it) => `<li${st(r, [['margin', '0 0 10px 0'], ['padding', 0], ['color', s.fg]])}>${glyph(r, '✓', r.t.color.accentStrong)}${inlineHtml(it)}</li>`)
+  const s = ground(r);
+  const items = list(c.items, 'learning_objectives.items');
+  const lis = items
+    .map(
+      (it, i) =>
+        row(
+          r,
+          `<div class="cvc-li-n"${st(r, [['margin', '0 0 4px 0'], ['color', readable(s.bg, [r.t.color.accentStrong], s.fg)], ['font-family', r.t.personality.fontNumeral], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700']], [['font-variant-numeric', 'tabular-nums']])}>${labelHtml(indexText(r, i))}</div>` +
+            `<div class="cvc-li-t"${st(r, [['color', s.fg]])}>${inlineHtml(it)}</div>`,
+          s,
+          { tag: 'li', cls: 'cvc-obj' },
+        ),
+    )
     .join('');
-  return componentWrap(r, 'learning_objectives', titleIf(r, c.title, s, 'Objetivos de aprendizaje') + bareList(r, 'ul', items), s);
+  const cls = items.length >= 4 ? 'cvc-cols2 cvc-objs' : 'cvc-objs';
+  return componentWrap(
+    r,
+    'learning_objectives',
+    sectionKicker(r, 'Al terminar podrás', s) + titleIf(r, c.title, s, 'Al terminar podrás') + bareList(r, 'ol', lis, cls),
+    s,
+  );
 }
 
 function renderConceptCards(r: R, c: VcConceptCards): string {
-  const s = surf(r.t, r.t.color.bg);
-  const ht = itemTag(c.title);
-  const cards = list(c.cards, 'concept_cards.cards')
-    .map((k) => {
-      const cs = cardSurf(r, 'card');
-      return card(r, heading(r, ht, k.term, cs.s, 'item') + paragraphs(r, k.definition, cs.s, { last: true }), cs);
-    })
+  const s = ground(r);
+  const ht = itemTag(c.title, 'Glosario');
+  const cards = list(c.cards, 'concept_cards.cards');
+  const items = cards
+    .map((k) => row(r, heading(r, ht, k.term, s, 'item') + paragraphs(r, k.definition, s, { last: true, secondary: true }), s, { tag: 'li', cls: 'cvc-term' }))
     .join('');
-  return componentWrap(r, 'concept_cards', titleIf(r, c.title, s) + grid(r, cards), s);
+  return componentWrap(
+    r,
+    'concept_cards',
+    sectionKicker(r, 'Glosario', s) + titleIf(r, c.title, s, 'Conceptos clave') + bareList(r, 'ul', items, 'cvc-cols2'),
+    s,
+  );
 }
 
 function renderRevealCards(r: R, c: VcRevealCards): string {
-  const s = surf(r.t, r.t.color.bg);
-  const col = r.t.color;
-  const cards = list(c.cards, 'reveal_cards.cards')
+  const s = ground(r);
+  const ps = surf(r.t, panelBg(r));
+  const cards = list(c.cards, 'reveal_cards.cards');
+  const items = cards
     .map((k, i) => {
-      const cs = cardSurf(r, 'surface');
-      const front = badgeLine(r, badge(r, 'Frente', cs.s.bg === col.surfaceAlt ? col.surface : col.surfaceAlt)) + paragraphs(r, k.front, cs.s, { weight: 700 });
-      const b = badge(r, 'Reverso', col.accent, col.textOnAccent);
-      const back = reveal(r, 'cvc-reveal', b, badgeLine(r, b), paragraphs(r, k.back, cs.s, { last: true }), { ariaLabel: `Reverso: tarjeta ${i + 1}` });
-      return card(r, front + back, cs, { cls: 'cvc-reveal-card' });
+      const front = paragraphs(r, k.front, ps, { weight: 600 });
+      const lead = kicker(r, 'Respuesta', ps, { margin: '0 0 6px 0' });
+      const back = reveal(r, 'cvc-reveal', btnLabel(r, 'Respuesta', ps), lead, paragraphs(r, k.back, ps, { last: true }), {
+        ariaLabel: `Respuesta: tarjeta ${i + 1}`,
+        button: true,
+      });
+      return panel(r, front + back, ps, { tag: 'li', cls: 'cvc-reveal-card' });
     })
     .join('');
-  return componentWrap(r, 'reveal_cards', titleIf(r, c.title, s) + grid(r, cards), s);
+  return componentWrap(
+    r,
+    'reveal_cards',
+    sectionKicker(r, 'Pon a prueba', s) + titleIf(r, c.title, s) + bareList(r, 'ul', items, 'cvc-cols2 cvc-cards'),
+    s,
+  );
 }
 
 function renderAccordion(r: R, c: VcAccordion): string {
-  const s = surf(r.t, r.t.color.bg);
+  const s = ground(r);
   const ht = itemTag(c.title);
-  const items = list(c.items, 'accordion.items')
+  const its = list(c.items, 'accordion.items');
+  const items = its
     .map((it, i) => {
-      const cs = cardSurf(r, 'surface');
-      const h = heading(r, ht, it.heading, cs.s, 'item');
-      return card(r, reveal(r, 'cvc-acc', h, h, paragraphs(r, it.body, cs.s, { last: true }), { keepOpen: i === 0 }), cs);
+      const h = heading(r, ht, it.heading, s, 'item', { margin: '0' });
+      return row(r, reveal(r, 'cvc-acc', h, h, `<div${st(r, [['padding', '10px 0 0 0']])}>${paragraphs(r, it.body, s, { last: true, secondary: true })}</div>`, { keepOpen: i === 0 }), s, {
+        cls: 'cvc-acc-row',
+      });
     })
     .join('');
-  return componentWrap(r, 'accordion', titleIf(r, c.title, s) + items, s);
+  return componentWrap(
+    r,
+    'accordion',
+    sectionKicker(r, 'Profundiza', s) + titleIf(r, c.title, s) + `<div class="cvc-rows"${st(r, [['border-bottom', `1px solid ${r.t.color.border}`]])}>${items}</div>`,
+    s,
+  );
 }
 
 function renderTabs(r: R, c: VcTabs): string {
-  const s = surf(r.t, r.t.color.bg);
+  const s = ground(r);
   const ht = itemTag(c.title);
   const titleId = r.enh && c.title ? nextId(r, 'tt') : undefined;
-  const panels = list(c.tabs, 'tabs.tabs')
+  const tabs = list(c.tabs, 'tabs.tabs');
+  const panels = tabs
     .map((tb) => {
-      const cs = cardSurf(r, 'surface');
       const id = r.enh ? nextId(r, 'tab') : undefined;
-      return card(r, heading(r, ht, tb.label, cs.s, 'item', { cls: 'cvc-tablabel' }) + paragraphs(r, tb.body, cs.s, { last: true }), cs, {
-        cls: 'cvc-tabpanel',
-        id,
-      });
+      return row(r, heading(r, ht, tb.label, s, 'item', { cls: 'cvc-tablabel' }) + paragraphs(r, tb.body, s, { last: true }), s, { cls: 'cvc-tabpanel', id });
     })
     .join('');
   const box = `<div class="cvc-tabs"${ea(r, titleId ? { 'data-cvc-labelledby': titleId } : { 'data-cvc-label': 'Pestañas' })}>${panels}</div>`;
-  return componentWrap(r, 'tabs', titleIf(r, c.title, s, undefined, titleId) + box, s);
+  return componentWrap(r, 'tabs', sectionKicker(r, 'Perspectivas', s) + titleIf(r, c.title, s, undefined, titleId) + box, s);
 }
 
 function renderTimeline(r: R, c: VcTimeline): string {
-  const s = surf(r.t, r.t.color.bg);
+  const s = ground(r);
   const col = r.t.color;
   const ht = itemTag(c.title);
-  const events = list(c.events, 'timeline.events')
+  const evs = list(c.events, 'timeline.events');
+  const events = evs
     .map((ev) => {
-      const cs = cardSurf(r, 'surface');
-      const marker = `<p${st(r, [['margin', '0 0 4px 0'], ['color', cs.s.fg2], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700']])}>${inlineHtml(ev.marker)}</p>`;
-      return card(r, marker + heading(r, ht, ev.heading, cs.s, 'item') + paragraphs(r, ev.body, cs.s, { last: true }), cs, {
-        tag: 'li',
-        border: col.borderStrong,
-      });
+      const marker = kicker(r, ev.marker, s, { margin: '0 0 4px 0', llm: true });
+      return (
+        `<li class="cvc-ev"${st(r, [['margin', 0], ['padding', `0 0 ${D(r, 28)}px ${D(r, 28)}px`], ['color', s.fg]])}>` +
+        marker +
+        heading(r, ht, ev.heading, s, 'item') +
+        paragraphs(r, ev.body, s, { last: true, secondary: true }) +
+        `</li>`
+      );
     })
     .join('');
-  return componentWrap(r, 'timeline', titleIf(r, c.title, s) + bareList(r, 'ol', events), s);
+  void col;
+  const axis = `<ol class="cvc-axis"${ea(r, { role: 'list' })}${st(r, [['list-style', 'none'], ['margin', '0 0 0 6px'], ['padding', `${D(r, 4)}px 0 0 0`]])}>${events}</ol>`;
+  return componentWrap(r, 'timeline', sectionKicker(r, counted(r, 'Línea de tiempo', evs.length, 'hito', 'hitos'), s) + titleIf(r, c.title, s) + axis, s);
 }
 
 function renderProcessSteps(r: R, c: VcProcessSteps): string {
-  const s = surf(r.t, r.t.color.bg);
-  const col = r.t.color;
+  const s = ground(r);
   const ht = itemTag(c.title);
-  const steps = list(c.steps, 'process_steps.steps')
-    .map((sp, i) => {
-      const cs = cardSurf(r, 'surface');
-      const b = badgeLine(r, badge(r, `Paso ${i + 1}`, col.accent, col.textOnAccent));
-      return card(r, b + heading(r, ht, sp.heading, cs.s, 'item') + paragraphs(r, sp.body, cs.s, { last: true }), cs, { tag: 'li' });
-    })
+  const sps = list(c.steps, 'process_steps.steps');
+  const steps = sps
+    .map((sp, i) =>
+      row(
+        r,
+        `<div class="cvc-step-n">${numeral(r, String(i + 1), s, 'md')}</div>` +
+          `<div class="cvc-step-b">${heading(r, ht, stripStepPrefix(sp.heading), s, 'item')}${paragraphs(r, sp.body, s, { last: true, secondary: true })}</div>`,
+        s,
+        { tag: 'li', cls: 'cvc-step' },
+      ),
+    )
     .join('');
-  return componentWrap(r, 'process_steps', titleIf(r, c.title, s) + bareList(r, 'ol', steps), s);
+  return componentWrap(
+    r,
+    'process_steps',
+    sectionKicker(r, counted(r, 'Proceso', sps.length, 'paso', 'pasos'), s) + titleIf(r, c.title, s) + bareList(r, 'ol', steps, 'cvc-steps'),
+    s,
+  );
 }
 
 /** ≤ 2 columnas: <table> real (cabe a 390 px); en ENHANCED dentro de una región desplazable accesible. */
 function comparisonTable(r: R, columns: string[], rows: VcComparison['rows'], titleId?: string): string {
   const col = r.t.color;
   const ty = r.t.typography;
-  const head = surf(r.t, col.accent, [col.textOnAccent]);
-  const rowHead = surf(r.t, col.surfaceAlt);
-  const cell = surf(r.t, col.surface);
+  const g = ground(r);
+  const head = surf(r.t, panelBg(r));
   const h: HyphenOpts = HYPHEN_TABLE;
-  const cellStyle = (x: Surf, bold: boolean): Decl[] => [
+  const cellStyle = (x: Surf, bold: boolean, isHead = false): Decl[] => [
     ['background-color', x.bg],
     ['color', x.fg],
-    ['border', `1px solid ${col.borderStrong}`],
-    ['padding', '8px 10px'],
+    ['border-bottom', `1px solid ${isHead ? col.borderStrong : col.border}`],
+    ['padding', '12px 14px'],
     ['font-size', ty.sizeSmallPx],
     ['line-height', '1.5'],
     ['font-weight', bold ? '700' : String(ty.weightBody)],
     ['text-align', 'left'],
     ['vertical-align', 'top'],
   ];
+  const headCell = (x: Surf): Decl[] => cellStyle(x, true, true);
   const thead =
-    `<thead><tr><th scope="col"${st(r, cellStyle(head, true))}>${labelHtml('Aspecto')}</th>` +
-    columns.map((cn) => `<th scope="col"${st(r, cellStyle(head, true))}>${inlineHtml(cn, h)}</th>`).join('') +
+    `<thead><tr><th scope="col"${st(r, headCell(head))}>${labelHtml('Aspecto')}</th>` +
+    columns.map((cn) => `<th scope="col"${st(r, headCell(head))}>${inlineHtml(cn, h)}</th>`).join('') +
     '</tr></thead>';
   const tbody =
     '<tbody>' +
@@ -489,8 +697,8 @@ function comparisonTable(r: R, columns: string[], rows: VcComparison['rows'], ti
       .map((row) => {
         const cells = list(row.cells, 'comparison.rows[].cells');
         return (
-          `<tr><th scope="row"${st(r, cellStyle(rowHead, true))}>${inlineHtml(row.label, h)}</th>` +
-          cells.map((v) => `<td${st(r, cellStyle(cell, false))}>${inlineHtml(v, h)}</td>`).join('') +
+          `<tr><th scope="row"${st(r, cellStyle(g, true))}>${inlineHtml(row.label, h)}</th>` +
+          cells.map((v) => `<td${st(r, cellStyle(g, false))}>${inlineHtml(v, h)}</td>`).join('') +
           '</tr>'
         );
       })
@@ -511,81 +719,97 @@ function comparisonTable(r: R, columns: string[], rows: VcComparison['rows'], ti
  * completa (región desplazable) y la muestra en pantallas anchas.
  */
 function comparisonStack(r: R, columns: string[], rows: VcComparison['rows'], title: string | undefined): string {
-  const col = r.t.color;
+  const s = ground(r);
   const ht = itemTag(title);
   const blocks = rows
-    .map((row) => {
-      const cs = cardSurf(r, 'surface');
-      const cells = list(row.cells, 'comparison.rows[].cells');
+    .map((rw) => {
+      const cells = list(rw.cells, 'comparison.rows[].cells');
       const items = cells
         .map(
           (v, i) =>
-            `<p class="cvc-cmp-cell"${st(r, [['margin', '0 0 8px 0'], ['color', cs.s.fg], ['font-size', r.t.typography.sizeBodyPx], ['line-height', String(r.t.typography.lineBody)]])}>` +
+            `<p class="cvc-cmp-cell"${st(r, [['margin', '0 0 6px 0'], ['color', s.fg], ['font-size', r.t.typography.sizeBodyPx], ['line-height', String(r.t.typography.lineBody)]])}>` +
             `<strong class="cvc-cmp-col">${inlineHtml(columns[i] ?? '')}:</strong> <span class="cvc-cmp-val">${inlineHtml(v)}</span></p>`,
         )
         .join('');
-      return card(r, heading(r, ht, row.label, cs.s, 'item', { cls: 'cvc-cmp-label' }) + items, cs, { cls: 'cvc-cmp-row', border: col.borderStrong });
+      return row(r, heading(r, ht, rw.label, s, 'item', { cls: 'cvc-cmp-label' }) + items, s, { cls: 'cvc-cmp-row' });
     })
     .join('');
   return `<div class="cvc-cmp cvc-cmp-stack"${ea(r, { 'data-cvc-cols': String(columns.length) })}>${blocks}</div>`;
 }
 
 function renderComparison(r: R, c: VcComparison): string {
-  const s = surf(r.t, r.t.color.bg);
+  const s = ground(r);
   const columns = list(c.columns, 'comparison.columns');
   const rows = list(c.rows, 'comparison.rows');
   const titleId = r.enh && c.title ? nextId(r, 'cmp') : undefined;
   const body = columns.length > VC_TABLE_MAX_COLUMNS ? comparisonStack(r, columns, rows, c.title) : comparisonTable(r, columns, rows, titleId);
-  return componentWrap(r, 'comparison', titleIf(r, c.title, s, undefined, titleId) + body, s);
+  return componentWrap(r, 'comparison', sectionKicker(r, 'Comparación', s) + titleIf(r, c.title, s, undefined, titleId) + body, s);
 }
 
 function renderMythReality(r: R, c: VcMythReality): string {
-  const s = surf(r.t, r.t.color.bg);
+  const s = ground(r);
   const col = r.t.color;
-  const pairs = list(c.pairs, 'myth_reality.pairs')
+  const pairs = list(c.pairs, 'myth_reality.pairs');
+  const rowsHtml = pairs
     .map((p, i) => {
-      const cs = cardSurf(r, 'surface');
-      const myth = badgeLine(r, badge(r, 'Mito', col.danger, col.onDanger)) + paragraphs(r, p.myth, cs.s, { weight: 700 });
-      const b = badge(r, 'Realidad', col.success, col.onSuccess);
-      return card(r, myth + reveal(r, 'cvc-myth', b, badgeLine(r, b), paragraphs(r, p.reality, cs.s, { last: true }), { ariaLabel: `Realidad: mito ${i + 1}` }), cs);
+      const myth = `<div class="cvc-myth-a">${kicker(r, 'Mito', s, { color: col.danger, margin: '0 0 6px 0' })}${paragraphs(r, p.myth, s, { secondary: true, last: true })}</div>`;
+      const lead = kicker(r, 'Realidad', s, { color: col.success, margin: '0 0 6px 0' });
+      const real = `<div class="cvc-myth-b">${reveal(r, 'cvc-myth', btnLabel(r, 'Realidad', s), lead, paragraphs(r, p.reality, s, { weight: 600, last: true }), {
+        ariaLabel: `Realidad: mito ${i + 1}`,
+        button: true,
+      })}</div>`;
+      return row(r, myth + real, s, { tag: 'li', cls: 'cvc-mr' });
     })
     .join('');
-  return componentWrap(r, 'myth_reality', titleIf(r, c.title, s) + pairs, s);
+  return componentWrap(r, 'myth_reality', sectionKicker(r, 'Mito y realidad', s) + titleIf(r, c.title, s) + bareList(r, 'ul', rowsHtml), s);
 }
 
 function renderCaseScenario(r: R, c: VcCaseScenario): string {
-  const cs = cardSurf(r, 'card');
-  const col = r.t.color;
+  const ps = surf(r.t, panelBg(r));
   const qs = list(c.questions, 'case_scenario.questions')
-    .map((q) => `<li${st(r, [['margin', '0 0 8px 0'], ['color', cs.s.fg]])}>${inlineHtml(q)}</li>`)
+    .map(
+      (q, i) =>
+        `<li class="cvc-q"${st(r, [['margin', '0 0 12px 0'], ['padding', 0], ['color', ps.fg]])}>` +
+        `<span class="cvc-q-n"${st(r, [['color', readable(ps.bg, [r.t.color.accentStrong], ps.fg)], ['font-family', r.t.personality.fontNumeral], ['font-weight', '700']])}>${labelHtml(`${i + 1}.`)}</span> ` +
+        `<span class="cvc-q-t">${inlineHtml(q)}</span></li>`,
+    )
     .join('');
   const inner =
-    badgeLine(r, badge(r, 'Caso', col.accent, col.textOnAccent)) +
-    heading(r, 'h4', c.title, cs.s, 'title') +
-    paragraphs(r, c.narrative, cs.s) +
-    heading(r, 'h5', 'Preguntas guía', cs.s, 'item') +
-    `<ol${st(r, [['margin', '0 0 0 24px'], ['padding', 0], ['list-style', 'decimal']])}>${qs}</ol>`;
-  const s = surf(r.t, r.t.color.bg);
-  return componentWrap(r, 'case_scenario', card(r, inner, cs), s);
+    kicker(r, 'Caso', ps) +
+    heading(r, 'h4', c.title, ps, 'title') +
+    paragraphs(r, c.narrative, ps) +
+    kicker(r, 'Preguntas guía', ps, { margin: `${D(r, 20)}px 0 12px 0` }) +
+    bareList(r, 'ol', qs, 'cvc-qs');
+  return componentWrap(r, 'case_scenario', panel(r, inner, ps, { padding: `${D(r, 28)}px ${D(r, 28)}px` }), ground(r), [], [], 'cvc-case');
 }
 
 function renderChecklist(r: R, c: VcChecklist): string {
-  const s = surf(r.t, r.t.color.bg);
-  const items = list(c.items, 'checklist.items')
-    .map((it) => `<li${st(r, [['margin', '0 0 10px 0'], ['padding', 0], ['color', s.fg]])}>${glyph(r, '☐', s.fg)}${inlineHtml(it)}</li>`)
+  const s = ground(r);
+  const its = list(c.items, 'checklist.items');
+  const items = its
+    .map((it) => row(r, glyph(r, '☐', readable(s.bg, [r.t.color.accentStrong], s.fg)) + `<span class="cvc-li-t">${inlineHtml(it)}</span>`, s, { tag: 'li', cls: 'cvc-check' }))
     .join('');
-  return componentWrap(r, 'checklist', titleIf(r, c.title, s, 'Lista de verificación') + bareList(r, 'ul', items), s);
+  return componentWrap(r, 'checklist', sectionKicker(r, 'Lista de verificación', s) + titleIf(r, c.title, s) + bareList(r, 'ul', items), s);
 }
 
 function renderReflection(r: R, c: VcReflection): string {
-  const col = r.t.color;
-  const cs = cardSurf(r, 'soft');
-  let inner = badgeLine(r, badge(r, 'Para reflexionar', col.accent, col.textOnAccent)) + paragraphs(r, c.prompt, cs.s, { weight: 700, last: !c.hint });
+  const s = ground(r);
+  const p = r.t.personality;
+  const q = `<div class="cvc-quote"${ea(r, { 'aria-hidden': 'true' })}${st(r, [['margin', '0 0 -8px 0'], ['color', readable(s.bg, [r.t.color.accent, r.t.color.accentStrong], s.fg)], ['font-family', "Georgia, 'Times New Roman', serif"], ['font-size', 64], ['font-weight', '700'], ['line-height', '1']])}>${labelHtml('“')}</div>`;
+  let inner = q + kicker(r, 'Para reflexionar', s) + paragraphs(r, c.prompt, s, { role: 'statement', italic: p.thesisItalic, last: !c.hint });
   if (c.hint) {
-    const b = badge(r, 'Pista', col.info, col.onInfo);
-    inner += reveal(r, 'cvc-hint', b, badgeLine(r, b), paragraphs(r, c.hint, cs.s, { last: true }), { ariaLabel: 'Pista para la reflexión' });
+    inner += reveal(r, 'cvc-hint', btnLabel(r, 'Pista', s), kicker(r, 'Pista', s, { margin: '0 0 6px 0' }), paragraphs(r, c.hint, s, { last: true, secondary: true }), {
+      ariaLabel: 'Pista para la reflexión',
+      button: true,
+    });
   }
-  return componentWrap(r, 'reflection', card(r, inner, cs), surf(r.t, col.bg));
+  return componentWrap(
+    r,
+    'reflection',
+    inner,
+    s,
+    [['padding', `${D(r, 24)}px 0 ${D(r, 8)}px 0`], ['border-top', `1px solid ${r.t.color.borderStrong}`]],
+  );
 }
 
 const CALLOUT_LABEL: Record<VcCallout['variant'], string> = {
@@ -597,51 +821,68 @@ const CALLOUT_LABEL: Record<VcCallout['variant'], string> = {
 
 function renderCallout(r: R, c: VcCallout): string {
   const col = r.t.color;
-  const tone: Record<VcCallout['variant'], [string, string]> = {
-    tip: [col.success, col.onSuccess],
-    warning: [col.warning, col.onWarning],
-    info: [col.info, col.onInfo],
-    example: [col.accent, col.textOnAccent],
+  const tone: Record<VcCallout['variant'], string> = {
+    tip: col.success,
+    warning: col.warning,
+    info: col.info,
+    example: col.accent,
   };
   if (typeof c.variant !== 'string' || !hasOwn(tone, c.variant)) renderFail(`callout.variant desconocido "${String(c.variant)}"`);
-  const pair = tone[c.variant];
-  const cs = r.t.variants.callout === 'tinted' ? cardSurf(r, 'soft') : cardSurf(r, 'surface');
+  const s = ground(r);
+  const border = tone[c.variant];
   const inner =
-    badgeLine(r, badge(r, CALLOUT_LABEL[c.variant], pair[0], pair[1])) +
-    (c.title ? heading(r, 'h5', c.title, cs.s, 'item') : '') +
-    paragraphs(r, c.body, cs.s, { last: true });
-  return componentWrap(r, 'callout', card(r, inner, cs, { border: pair[0], borderWidth: 2 }), surf(r.t, col.bg));
+    kicker(r, CALLOUT_LABEL[c.variant], s, { color: border, margin: '0 0 8px 0' }) +
+    (c.title ? heading(r, 'h5', c.title, s, 'item') : '') +
+    paragraphs(r, c.body, s, { last: true });
+  return componentWrap(
+    r,
+    'callout',
+    inner,
+    s,
+    [['padding', `${D(r, 20)}px ${D(r, 24)}px`], ['border', `${c.variant === 'warning' ? 2 : 1}px solid ${border}`]],
+    [['border-radius', r.t.shape.radiusMd]],
+  );
 }
 
 function renderSummaryVisual(r: R, c: VcSummaryVisual): string {
-  const col = r.t.color;
-  const s = surf(r.t, col.bg);
-  const center = surf(r.t, col.accent, [col.textOnAccent]);
-  const central =
-    `<div class="cvc-central"` +
-    st(r, [['background-color', center.bg], ['color', center.fg], ['border', `1px solid ${center.bg}`], ['padding', '16px 20px'], ['margin', '0 0 16px 0']], [['border-radius', r.t.shape.radiusMd]]) +
-    `>${paragraphs(r, c.central, center, { px: r.t.typography.sizeH3Px, weight: 700, last: true })}</div>`;
-  const points = list(c.points, 'summary_visual.points')
-    .map((p) => {
-      const cs = cardSurf(r, 'card');
-      return card(r, paragraphs(r, p, cs.s, { last: true }), cs);
-    })
+  const ts = surf(r.t, panelBg(r));
+  const pts = list(c.points, 'summary_visual.points');
+  const points = pts
+    .map(
+      (p, i) =>
+        `<li class="cvc-pt"${st(r, [['margin', 0], ['padding', `${D(r, 14)}px 0 ${D(r, 14)}px 0`], ['color', ts.fg], ['border-top', `1px solid ${r.t.color.border}`]])}>` +
+        `<div class="cvc-li-n"${st(r, [['margin', '0 0 4px 0'], ['color', readable(ts.bg, [r.t.color.accentStrong], ts.fg)], ['font-family', r.t.personality.fontNumeral], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700']], [['font-variant-numeric', 'tabular-nums']])}>${labelHtml(indexText(r, i))}</div>` +
+        `<div class="cvc-li-t">${inlineHtml(p)}</div></li>`,
+    )
     .join('');
-  return componentWrap(r, 'summary_visual', heading(r, 'h4', 'Ideas clave', s, 'title') + central + grid(r, points, 14), s);
+  const inner =
+    kicker(r, 'Ideas clave', ts) +
+    accentRule(r, ts, `0 0 ${D(r, 16)}px 0`) +
+    `<div class="cvc-central">${paragraphs(r, c.central, ts, { role: 'statement', italic: r.t.personality.thesisItalic, last: true, climax: true })}</div>` +
+    `<div${st(r, [['margin', `${D(r, 24)}px 0 0 0`]])}>${bareList(r, 'ol', points, pts.reduce((a, x) => a + x.length, 0) / pts.length > 90 ? 'cvc-pts' : 'cvc-cols2 cvc-pts')}</div>`;
+  return componentWrap(
+    r,
+    'summary_visual',
+    inner,
+    ts,
+    [['padding', `${D(r, 32)}px ${D(r, 28)}px ${D(r, 20)}px ${D(r, 28)}px`]],
+    [['border-radius', r.t.shape.radiusLg], ['padding', `clamp(24px, 3.4vw, ${D(r, 44)}px)`]],
+  );
 }
 
 function renderSelfCheck(r: R, c: VcSelfCheck): string {
-  const col = r.t.color;
-  const s = surf(r.t, col.bg);
-  const items = list(c.items, 'self_check.items')
+  const s = ground(r);
+  const its = list(c.items, 'self_check.items');
+  const items = its
     .map((it, i) => {
-      const cs = cardSurf(r, 'surface');
-      const q = badgeLine(r, badge(r, `Pregunta ${i + 1}`, cs.s.bg === col.surfaceAlt ? col.surface : col.surfaceAlt)) + paragraphs(r, it.q, cs.s, { weight: 700 });
-      const b = badge(r, 'Respuesta', col.success, col.onSuccess);
-      return card(r, q + reveal(r, 'cvc-selfcheck', b, badgeLine(r, b), paragraphs(r, it.a, cs.s, { last: true }), { ariaLabel: `Respuesta: pregunta ${i + 1}` }), cs);
+      const q = kicker(r, `Pregunta ${i + 1}`, s, { margin: '0 0 6px 0' }) + paragraphs(r, it.q, s, { weight: 600 });
+      const lead = kicker(r, 'Respuesta', s, { color: r.t.color.success, margin: '0 0 6px 0' });
+      return row(r, q + reveal(r, 'cvc-selfcheck', btnLabel(r, 'Respuesta', s), lead, paragraphs(r, it.a, s, { last: true, secondary: true }), { ariaLabel: `Respuesta: pregunta ${i + 1}`, button: true }), s, {
+        tag: 'li',
+      });
     })
     .join('');
-  return componentWrap(r, 'self_check', titleIf(r, c.title, s, 'Repaso rápido') + items, s);
+  return componentWrap(r, 'self_check', sectionKicker(r, counted(r, 'Autoevaluación', its.length, 'pregunta', 'preguntas'), s) + titleIf(r, c.title, s, 'Repaso rápido') + bareList(r, 'ol', items), s);
 }
 
 const RENDERERS: { [K in VcComponent['type']]: (r: R, c: Extract<VcComponent, { type: K }>) => string } = {
@@ -678,36 +919,45 @@ function renderWith(r: R, c: VcComponent): string {
 export function renderComponent(c: VcComponent, theme: ResolvedTheme, ctx: VcRenderContext): string {
   checkCtx(ctx);
   checkTheme(theme);
-  return renderWith({ t: theme, enh: ctx.level === 'enhanced', uid: ctx.uid, seq: 0 }, c);
+  return renderWith({ t: theme, enh: ctx.level === 'enhanced', uid: ctx.uid, seq: 0, opener: ctx.opener, countless: !!ctx.countless }, c);
 }
 
-/** Un movimiento → cuerpo completo de UN label Moodle. */
+/** Estilos de la raíz de un label (compartidos con el shell): lámina en familias oscuras, abierta en claras. */
+export function labelRootStyle(theme: ResolvedTheme, enh: boolean): string {
+  const ty = theme.typography;
+  const plate = !!theme.personality && theme.personality.plate;
+  const safe: Decl[] = [
+    ['background-color', groundColor(theme)],
+    ['color', theme.color.textPrimary],
+    ['font-family', ty.fontBody],
+    ['font-size', ty.sizeBodyPx],
+    ['line-height', String(ty.lineBody)],
+    ['margin', 0],
+    ['padding', plate ? '24px' : '8px 4px'],
+    ['max-width', '100%'],
+  ];
+  const e: Decl[] = plate ? [['border-radius', theme.shape.radiusLg], ['padding', 'clamp(20px, 3.2vw, 44px)'], ['overflow-wrap', 'break-word']] : [['overflow-wrap', 'break-word']];
+  const decls = enh ? [...safe, ...e] : safe;
+  return ` style="${attr(decls.map(([k, v]) => `${k}:${typeof v === 'number' ? `${v}px` : v}`).join(';'))}"`;
+}
+
+/** Un movimiento → cuerpo completo de UN label Moodle. `opener` aplica al primer hero. */
 export function renderMovement(components: VcComponent[], theme: ResolvedTheme, ctx: VcRenderContext): string {
   checkCtx(ctx, MOVEMENT_UID_MAX);
   checkTheme(theme);
   if (!Array.isArray(components) || components.length === 0) renderFail('un movimiento necesita al menos un componente');
   const enh = ctx.level === 'enhanced';
   const r: R = { t: theme, enh, uid: ctx.uid, seq: 0 };
-  const ty = theme.typography;
-  const body = components.map((c, i) => renderComponent(c, theme, { uid: `${ctx.uid}-${i}`, level: ctx.level })).join('');
+  let openerUsed = false;
+  const body = components
+    .map((c, i) => {
+      const useOpener = !!ctx.opener && !openerUsed && i === 0 && c && (c as { type?: unknown }).type === 'hero';
+      if (useOpener) openerUsed = true;
+      return renderComponent(c, theme, { uid: `${ctx.uid}-${i}`, level: ctx.level, opener: useOpener ? ctx.opener : undefined });
+    })
+    .join('');
   const style = enh ? `<style>${scopedStyle(ctx.uid, theme)}</style>` : '';
   const script = enh ? `<script>${runtimeScript(ctx.uid)}</script>` : '';
-  return (
-    `<div class="cvc cvc-${ctx.uid}"${ea(r, { 'data-cvc-uid': ctx.uid, 'data-cvc-v': '1' })} lang="es"` +
-    st(
-      r,
-      [
-        ['background-color', theme.color.bg],
-        ['color', theme.color.textPrimary],
-        ['font-family', ty.fontBody],
-        ['font-size', ty.sizeBodyPx],
-        ['line-height', String(ty.lineBody)],
-        ['margin', 0],
-        ['padding', '16px'],
-        ['max-width', '100%'],
-      ],
-      [['border-radius', theme.shape.radiusLg], ['overflow-wrap', 'anywhere']],
-    ) +
-    `>${style}${body}${script}</div>`
-  );
+  const plateCls = theme.personality && theme.personality.plate ? ' cvc-plate' : '';
+  return `<div class="cvc cvc-${ctx.uid}${plateCls}"${ea(r, { 'data-cvc-uid': ctx.uid, 'data-cvc-v': '2' })} lang="es"` + labelRootStyle(theme, enh) + `>${style}${body}${script}</div>`;
 }
