@@ -209,7 +209,7 @@ check('lint RESOURCE_MENTION (ruling I4): referencias a recursos/navegación sí
     'Prepárate para el examen', 'Repasa antes del examen', 'la evaluación del módulo', 'La evaluación final',
     'En la presentación verás los datos', 'Revisa la presentación del capítulo', 'la presentación de este capítulo',
     'la diapositiva 3', 'las diapositivas', 'el quiz', 'un SCORM', 'el H5P', 'un juego interactivo', 'el juego de práctica',
-    'Sigue con el siguiente recurso', 'En este Vídeo',
+    'Sigue con el siguiente recurso', 'En este Vídeo', 'Verás un video', 'en estas diapositivas', 'este quiz',
   ];
   for (const t of deny) assert(vc.lintResourceMentions(t).length >= 1, `debió marcar: "${t}"`);
   const allow = [
@@ -217,6 +217,9 @@ check('lint RESOURCE_MENTION (ruling I4): referencias a recursos/navegación sí
     'evaluación del desempeño', 'La presentación de resultados al cliente', 'la presentación del producto',
     'la actividad económica del sector', 'las actividades del puesto', 'Un examen físico previo', 'el examen médico anual',
     'producción de video para redes', 'videojuegos y aprendizaje', 'reactividad', 'evaluar el caso', 'presentar la idea',
+    // R14 (curso sobre enseñar y evaluar): menciones GENÉRICAS del tema, no del curso.
+    'Diseña un examen que valore el proceso', 'unos exámenes bien diseñados', 'crea un quiz de repaso con IA',
+    'genera diapositivas claras para tu clase', 'Un examen tradicional mide memoria',
   ];
   for (const t of allow) assert(vc.lintResourceMentions(t).length === 0, `no debió marcar: "${t}" → ${JSON.stringify(vc.lintResourceMentions(t))}`);
   expectCode(mutate((d) => (d.movements.deepening[3].rows[0].cells[1] = 'Como en la Presentación')), 'RESOURCE_MENTION', 'rows[0].cells[1]');
