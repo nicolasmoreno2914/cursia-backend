@@ -17,6 +17,8 @@ export interface VerifiedWork {
   year: number;
   title: string;
   publisher: string;
+  /** Otras formas de citar al primer autor (autores institucionales). */
+  authorAliases?: string[];
 }
 
 /** Obras verificadas (educación, evaluación, diseño instruccional, IA y educación). */
@@ -49,9 +51,9 @@ export const VERIFIED_BIBLIOGRAPHY: readonly VerifiedWork[] = [
   { author: "O'Neil, Cathy", year: 2016, title: 'Weapons of Math Destruction: How Big Data Increases Inequality and Threatens Democracy', publisher: 'Crown' },
   { author: 'Noble, Safiya Umoja', year: 2018, title: 'Algorithms of Oppression: How Search Engines Reinforce Racism', publisher: 'NYU Press' },
   { author: 'Mollick, Ethan', year: 2024, title: 'Co-Intelligence: Living and Working with AI', publisher: 'Portfolio' },
-  { author: 'UNESCO', year: 2021, title: 'AI and Education: Guidance for Policy-Makers', publisher: 'UNESCO' },
-  { author: 'UNESCO', year: 2023, title: 'Guidance for Generative AI in Education and Research', publisher: 'UNESCO' },
-  { author: 'U.S. Department of Education, Office of Educational Technology', year: 2023, title: 'Artificial Intelligence and the Future of Teaching and Learning: Insights and Recommendations', publisher: 'U.S. Department of Education' },
+  { author: 'UNESCO', authorAliases: ['Organización de las Naciones Unidas para la Educación, la Ciencia y la Cultura', 'United Nations Educational, Scientific and Cultural Organization'], year: 2021, title: 'AI and Education: Guidance for Policy-Makers', publisher: 'UNESCO' },
+  { author: 'UNESCO', authorAliases: ['Organización de las Naciones Unidas para la Educación, la Ciencia y la Cultura', 'United Nations Educational, Scientific and Cultural Organization'], year: 2023, title: 'Guidance for Generative AI in Education and Research', publisher: 'UNESCO' },
+  { author: 'U.S. Department of Education, Office of Educational Technology', authorAliases: ['U.S. Department of Education', 'Office of Educational Technology', 'Departamento de Educación de los Estados Unidos'], year: 2023, title: 'Artificial Intelligence and the Future of Teaching and Learning: Insights and Recommendations', publisher: 'U.S. Department of Education' },
   { author: 'Congreso de la República de Colombia', year: 2012, title: 'Ley Estatutaria 1581 de 2012, por la cual se dictan disposiciones generales para la protección de datos personales', publisher: 'Diario Oficial' },
 ];
 
@@ -71,14 +73,28 @@ function firstSurname(author: unknown): string {
   return words[words.length - 1] || '';
 }
 
+/** Marcas de edición ("2nd ed.", "2.ª ed.", "Expanded Edition", "edición revisada"): no distinguen la obra. */
+function stripEdition(t: unknown): string {
+  return fold(t)
+    .replace(/\(?\s*\d+\s*(?:st|nd|rd|th|\.?\s*a|\.?\s*ª|º|\.?\s*o)?\.?\s*(?:edition|edicion|ed\b\.?)\s*\)?/g, ' ')
+    .replace(/\b(?:expanded|revised|updated|ampliada|revisada|actualizada)\s*(?:edition|edicion|ed\.?)?/g, ' ');
+}
+
+/** Título principal (antes de ":"), sin marcas de edición. */
+function mainTitle(t: unknown): string {
+  return stripEdition(t).split(':')[0].replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// Nota para el catálogo: apellidos compuestos o con partícula ("Creus Solé", "de Vries") deben citarse
+// "Apellido, Nombre" en el catálogo y se agregan como alias si el LLM suele escribirlos sin coma.
 const STOP = new Set(['a', 'an', 'and', 'the', 'of', 'for', 'to', 'in', 'on', 'de', 'del', 'la', 'el', 'los', 'las', 'y', 'en', 'para', 'por', 'ed', 'con']);
 function titleTokens(t: unknown): Set<string> {
-  return new Set(fold(t).replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length > 2 && !STOP.has(w)));
+  return new Set(stripEdition(t).replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length > 2 && !STOP.has(w)));
 }
 
 /** Números del título (leyes, ediciones, tomos): deben coincidir exactamente. */
 function titleNumbers(t: unknown): string {
-  const nums: string[] = fold(t).match(/\d+/g) ?? [];
+  const nums: string[] = stripEdition(t).match(/\d+/g) ?? [];
   return nums.filter((n) => n.length > 1).sort().join(',');
 }
 
@@ -89,10 +105,24 @@ function titleNumbers(t: unknown): string {
 function sameTitle(a: unknown, b: unknown): boolean {
   const ta = titleTokens(a);
   const tb = titleTokens(b);
-  if (!ta.size || !tb.size || titleNumbers(a) !== titleNumbers(b)) return false;
-  let hit = 0;
-  for (const w of ta) if (tb.has(w)) hit++;
-  return hit >= 2 && hit / ta.size >= 0.75 && hit / tb.size >= 0.75;
+  if (ta.size && tb.size && titleNumbers(a) === titleNumbers(b)) {
+    let hit = 0;
+    for (const w of ta) if (tb.has(w)) hit++;
+    if (hit >= 2 && hit / ta.size >= 0.75 && hit / tb.size >= 0.75) return true;
+  }
+  // Cita abreviada sin subtítulo ("Visible Learning"): título principal exacto (≥ 2 palabras con
+  // contenido) contra el principal o el título completo del otro.
+  const norm = (x: string) => x.replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const words = (x: string) => x.split(' ').filter((w) => w.length > 2 && !STOP.has(w)).length;
+  const ma = mainTitle(a);
+  const mb = mainTitle(b);
+  const fa = norm(stripEdition(a));
+  const fb = norm(stripEdition(b));
+  return (ma === mb && words(ma) >= 2) || (ma === fb && words(ma) >= 2) || (mb === fa && words(mb) >= 2);
+}
+
+function authorKeys(w: VerifiedWork): string[] {
+  return [w.author, ...(w.authorAliases ?? [])].map(firstSurname);
 }
 
 export interface BibliographyVerification {
@@ -114,7 +144,7 @@ export function verifyBibliography(list: readonly BibliographyEntry[] | null | u
   for (const b of list ?? []) {
     const s = firstSurname(b?.author);
     const match = VERIFIED_BIBLIOGRAPHY.find(
-      (w) => firstSurname(w.author) === s && w.year === Number(b?.year) && sameTitle(w.title, b?.title),
+      (w) => authorKeys(w).includes(s) && w.year === Number(b?.year) && sameTitle(w.title, b?.title),
     );
     if (!match) { dropped.push(b); continue; }
     const key = `${match.author}|${match.year}|${match.title}`;

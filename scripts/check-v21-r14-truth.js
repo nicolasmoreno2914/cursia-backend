@@ -67,6 +67,22 @@ const REAL = {
     assert.deepStrictEqual(r.kept, [], JSON.stringify(r.kept));
   });
 
+  await check('bibliografía (re-revisión): ediciones, citas sin subtítulo y autores institucionales abreviados se reconocen', () => {
+    const cases = [
+      { author: 'Mayer, Richard E.', year: 2009, title: 'Multimedia learning (2nd ed.)', publisher: 'Cambridge' },
+      { author: 'Wiggins, Grant y McTighe, Jay', year: 2005, title: 'Understanding by Design, Expanded 2nd Edition', publisher: 'ASCD' },
+      { author: 'Biggs, John y Tang, Catherine', year: 2011, title: 'Teaching for Quality Learning at University (4th ed.)', publisher: 'McGraw-Hill' },
+      { author: 'Hattie, John', year: 2009, title: 'Visible Learning', publisher: 'Routledge' },
+      { author: 'Wiggins, Grant', year: 1998, title: 'Educative Assessment', publisher: 'Jossey-Bass' },
+      { author: 'U.S. Department of Education', year: 2023, title: 'Artificial Intelligence and the Future of Teaching and Learning', publisher: 'U.S. Department of Education' },
+      { author: 'Organización de las Naciones Unidas para la Educación, la Ciencia y la Cultura', year: 2023, title: 'Guidance for generative AI in education and research', publisher: 'UNESCO' },
+    ];
+    const r = VB.verifyBibliography(cases);
+    assert.strictEqual(r.kept.length, 7, JSON.stringify(r.dropped));
+    // sin subtítulo pero con UNA sola palabra de título principal → no alcanza (sigue omitido)
+    assert.strictEqual(VB.verifyBibliography([{ author: 'Hattie, John', year: 2009, title: 'Learning', publisher: 'X' }]).kept.length, 0);
+  });
+
   await check('bibliografía: referencias inventadas o mal atribuidas se omiten (nunca se publican)', () => {
     const r = VB.verifyBibliography([REAL.suarezInvented, REAL.selwynMisattributed, REAL.brookfieldWrongYear, REAL.hattie]);
     assert.deepStrictEqual(r.kept.map((b) => b.author), ['Hattie, John']);
