@@ -128,8 +128,10 @@ import { IdAllocator, buildQuizV3, parseScormManifestIds, scormActivityXmlV3 } f
  * curso sin nota (completion por vista del Libro Guía).
  * 3.0.3 (aceptación staging): tarjetas con borde completo en vez de franja lateral
  * (shell, tarjeta, intros, Libro) y sin reintento dentro del intento en IV/QuestionSet (HD-V21-22).
+ * 3.0.4 (R14): bibliografía verificada del Libro (verified-bibliography.ts) y normalización de
+ * comparaciones con la columna del rótulo (render.ts, #28) — un paquete anterior no se reutiliza.
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.0.3';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.0.4';
 /** Versión del renderer de Visual Components que entra en la clave de reuse. */
 export const VC_RENDERER_VERSION = `vc${VC_SCHEMA_VERSION}-rt${VC_RUNTIME_VERSION}-theme${THEME_ENGINE_VERSION}`;
 
