@@ -10,6 +10,7 @@
  * Siempre termina en `</html>` (mismo guard que el builder v1/v2).
  * Puro y determinístico.
  */
+import { verifyBibliography } from './verified-bibliography';
 import type { ResolvedTheme } from '../../modules/theme-engine';
 import { moduleColor } from '../../modules/theme-engine';
 import type { BibliographyEntry, CourseIntroV3, ModuleIntroV3 } from '../../modules/course-shell/intro-schemas';
@@ -139,15 +140,19 @@ export function compileLibroHtmlV3(input: LibroV3Input): string {
       return `${preface}\n${chapters}`;
     })
     .join('\n');
-  const courseBib = dedupe(courseIntro.bibliography);
+  // R14: solo obras verificadas, en forma canónica (verified-bibliography.ts); lo demás se omite.
+  const courseBib = verifyBibliography(dedupe(courseIntro.bibliography)).kept;
   const moduleBibs = modules
-    .map((m) => ({ m, list: dedupe(m.intro.bibliography) }))
+    .map((m) => ({ m, list: verifyBibliography(dedupe(m.intro.bibliography)).kept }))
     .filter((x) => x.list.length > 0)
     .map((x) => `<h3>Módulo ${x.m.number} — ${esc(x.m.title)}</h3><ul>${x.list.map(biblioItem).join('')}</ul>`)
     .join('\n');
-  const biblio =
-    `<section id="bibliografia" class="cc-libro-biblio"><h2>Bibliografía</h2>` +
-    `<h3>Bibliografía general del curso</h3><ul>${courseBib.map(biblioItem).join('')}</ul>\n${moduleBibs}</section>`;
+  const hasBiblio = courseBib.length > 0 || moduleBibs.length > 0;
+  const biblio = !hasBiblio
+    ? ''
+    : `<section id="bibliografia" class="cc-libro-biblio"><h2>Bibliografía</h2>` +
+      (courseBib.length ? `<h3>Bibliografía general del curso</h3><ul>${courseBib.map(biblioItem).join('')}</ul>\n` : '') +
+      `${moduleBibs}</section>`;
   const html = `<!DOCTYPE html>
 <html lang="es">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${esc(input.courseTitle)} — Libro Guía</title>
@@ -156,7 +161,7 @@ ${css(t)}
 </style></head>
 <body><main class="libro">
 <div class="cc-libro-cover"><h1>${esc(input.courseTitle)}</h1><p>Libro Guía del curso</p></div>
-<nav class="cc-libro-toc"><h2>Índice</h2><ul>${toc}\n<li><a href="#bibliografia">Bibliografía</a></li></ul></nav>
+<nav class="cc-libro-toc"><h2>Índice</h2><ul>${toc}${hasBiblio ? '\n<li><a href="#bibliografia">Bibliografía</a></li>' : ''}</ul></nav>
 ${body}
 ${biblio}
 </main></body>

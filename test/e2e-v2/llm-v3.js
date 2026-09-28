@@ -32,11 +32,12 @@ function words(n, seed) {
 }
 
 const BIB = [
-  { author: 'Parker Hannifin', title: 'Tecnología hidráulica industrial', year: 2018, publisher: 'Parker Hannifin' },
-  { author: 'Eaton Vickers', title: 'Manual de hidráulica industrial', year: 2010, publisher: 'Eaton' },
-  { author: 'Antonio Creus Solé', title: 'Neumática e hidráulica', year: 2011, publisher: 'Marcombo' },
-  { author: 'Werner Deppert y Kurt Stoll', title: 'Aplicaciones de la neumática', year: 2001, publisher: 'Marcombo' },
-  { author: 'Antonio Serrano Nicolás', title: 'Oleohidráulica', year: 2002, publisher: 'McGraw-Hill' },
+  // R14: el Libro publica solo obras del catálogo verificado (package/v3/verified-bibliography.ts).
+  { author: 'Hattie, John', title: 'Visible Learning: A Synthesis of Over 800 Meta-Analyses Relating to Achievement', year: 2009, publisher: 'Routledge' },
+  { author: 'Wiggins, Grant y McTighe, Jay', title: 'Understanding by Design (2.ª ed.)', year: 2005, publisher: 'ASCD' },
+  { author: 'Biggs, John y Tang, Catherine', title: 'Teaching for Quality Learning at University: What the Student Does (4.ª ed.)', year: 2011, publisher: 'Open University Press' },
+  { author: 'Mayer, Richard E.', title: 'Multimedia Learning (2.ª ed.)', year: 2009, publisher: 'Cambridge University Press' },
+  { author: 'Kolb, David A.', title: 'Experiential Learning: Experience as the Source of Learning and Development', year: 1984, publisher: 'Prentice Hall' },
 ];
 
 function courseIntro() {

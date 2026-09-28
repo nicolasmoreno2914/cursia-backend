@@ -275,7 +275,7 @@ const MATRIX = [
     assert(html.trim().endsWith('</html>'), '</html>');
     assert(html.includes('@media print') && html.includes(theme.color.accentStrong), 'print CSS + tokens');
     assert(html.includes('Al terminar este módulo podrás') && html.includes('Bibliografía general del curso'), 'prefacio + bibliografía');
-    assert(html.includes('La revolución del servicio') && html.includes('(1990)'), 'entradas de bibliografía');
+    assert(html.includes('Visible Learning') && html.includes('(2009)'), 'entradas de bibliografía (verificadas)');
     for (const m of input.manifest.modules) for (const c of m.chapters) assert(html.includes(`id="cap-${c.chapterNumber}"`), `capítulo ${c.chapterNumber}`);
     const words = r.expectations.facts.libro.wordCount;
     assert(words > 100, 'palabras medidas');

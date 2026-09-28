@@ -147,11 +147,12 @@ function courseIntroFixture() {
       'Llegaste al final del recorrido con herramientas concretas para escuchar mejor, explicar con claridad y resolver con criterio. ' +
       'Sigue practicando con tu equipo y comparte lo que funcione en tu contexto.',
     bibliography: [
-      { author: 'Zeithaml, V.', title: 'Calidad total en la gestión de servicios', year: 1993, publisher: 'Díaz de Santos' },
-      { author: 'Albrecht, K.', title: 'La revolución del servicio', year: 1990, publisher: 'Legis' },
-      { author: 'Barlow, J. y Moller, C.', title: 'Una queja es un favor', year: 2005, publisher: 'Gestión 2000' },
-      { author: 'Fisher, R. y Ury, W.', title: 'Obtenga el sí', year: 2011, publisher: 'Gestión 2000' },
-      { author: 'Goleman, D.', title: 'Inteligencia emocional', year: 1996, publisher: 'Kairós' },
+      // R14: el Libro publica solo obras del catálogo verificado (package/v3/verified-bibliography.ts).
+      { author: 'Hattie, John', title: 'Visible Learning: A Synthesis of Over 800 Meta-Analyses Relating to Achievement', year: 2009, publisher: 'Routledge' },
+      { author: 'Wiggins, Grant y McTighe, Jay', title: 'Understanding by Design (2.ª ed.)', year: 2005, publisher: 'ASCD' },
+      { author: 'Biggs, John y Tang, Catherine', title: 'Teaching for Quality Learning at University: What the Student Does (4.ª ed.)', year: 2011, publisher: 'Open University Press' },
+      { author: 'Black, Paul y Wiliam, Dylan', title: 'Assessment and Classroom Learning', year: 1998, publisher: 'Assessment in Education: Principles, Policy & Practice, 5(1)' },
+      { author: 'Shute, Valerie J.', title: 'Focus on Formative Feedback', year: 2008, publisher: 'Review of Educational Research, 78(1)' },
     ],
   };
 }
@@ -170,8 +171,8 @@ function moduleIntroFixture(manifest, moduleIndex0) {
     ],
     journey: m.chapters.map((c) => ({ chapterId: c.chapterId, line: 'Un paso más en la forma de acompañar al cliente con criterio y calidez.' })),
     bibliography: [
-      { author: 'Albrecht, K.', title: 'La revolución del servicio', year: 1990, publisher: 'Legis' },
-      { author: 'Goleman, D.', title: 'Inteligencia emocional', year: 1996, publisher: 'Kairós' },
+      { author: 'Hattie, John', title: 'Visible Learning: A Synthesis of Over 800 Meta-Analyses Relating to Achievement', year: 2009, publisher: 'Routledge' },
+      { author: 'Wiliam, Dylan', title: 'Embedded Formative Assessment', year: 2011, publisher: 'Solution Tree Press' },
     ],
   };
 }

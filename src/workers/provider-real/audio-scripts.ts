@@ -95,7 +95,17 @@ export interface ChapterScriptInput {
   chapterTitle: string;
   sector?: string | null;
   nivel?: string | null;
+  /** R14: país del curso → tuteo (voseo solo en Argentina/Uruguay/Paraguay). */
+  pais?: string | null;
   contentMarkdown: string;
+}
+
+const AUDIO_VOSEO_COUNTRIES = ['argentina', 'uruguay', 'paraguay'];
+/** R14: el guion del audiolibro derivaba al voseo en un curso para Colombia. */
+export function audioLocaleRule(pais?: string | null): string {
+  const p = String(pais ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+  if (AUDIO_VOSEO_COUNTRIES.includes(p)) return '- Español con el trato habitual del país.\n';
+  return '- Español latinoamericano con tuteo (tú: «usas», «puedes», «quieres»); nunca voseo («vos», «usás», «podés», «querés»).\n';
 }
 
 export interface ScriptPrompt {
@@ -118,6 +128,7 @@ export function chapterNarrationPrompt(i: ChapterScriptInput): ScriptPrompt {
     '- Tono natural, conversacional y educativo, como una clase narrada en voz alta.\n' +
     '- Empieza con una frase de transición hacia este capítulo.\n' +
     '- No inventes datos técnicos, estadísticas o citas que no estén en el extracto de referencia.\n' +
+    audioLocaleRule(i.pais) +
     '- Texto plano, sin markdown, sin títulos, sin listas, sin asteriscos.\n' +
     '- Responde SOLO con el bloque narrado, sin preámbulos ni explicaciones.';
   const user =
@@ -128,7 +139,7 @@ export function chapterNarrationPrompt(i: ChapterScriptInput): ScriptPrompt {
 }
 
 /** Prompt de la continuación acotada (texto del legacy continueChapterNarrationBlock). */
-export function chapterContinuationPrompt(existingText: string, chapterTitle: string, wordsNeeded: number): ScriptPrompt {
+export function chapterContinuationPrompt(existingText: string, chapterTitle: string, wordsNeeded: number, pais?: string | null): ScriptPrompt {
   const system =
     'Eres un narrador experto en educación. Vas a CONTINUAR (no repetir ni resumir) un bloque ' +
     'narrado de audiolibro que quedó corto. Sigue de forma natural desde donde se detuvo, mismo ' +
@@ -137,6 +148,7 @@ export function chapterContinuationPrompt(existingText: string, chapterTitle: st
     `- Añade aproximadamente ${wordsNeeded} palabras más.\n` +
     '- NO repitas ni resumas lo ya escrito — continúa la idea.\n' +
     '- Mismo tono conversacional, estilo clase hablada.\n' +
+    audioLocaleRule(pais) +
     '- Texto plano, sin markdown.\n' +
     '- Responde SOLO con el texto de continuación, sin preámbulos.';
   const user =
@@ -173,7 +185,7 @@ export async function generateChapterScript(input: ChapterScriptInput, llm: Scri
   let continued = false;
   if (wordCount(block) < AUDIOBOOK_MIN_WORDS_PER_CHAPTER) {
     const needed = Math.max(60, AUDIOBOOK_WORDS_PER_CHAPTER - wordCount(block));
-    const cont = await llm(chapterContinuationPrompt(block, input.chapterTitle, needed), 'continuation');
+    const cont = await llm(chapterContinuationPrompt(block, input.chapterTitle, needed, input.pais), 'continuation');
     messageIds.push(cont.messageId);
     continued = true;
     block = `${block} ${cleanAudioText(cont.text)}`.replace(/\s+/g, ' ').trim();
