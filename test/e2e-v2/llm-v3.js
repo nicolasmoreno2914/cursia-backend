@@ -107,7 +107,9 @@ const H5P = {
   blanks: { title: 'Completa las frases', text: 'Escribe la palabra que falta.', questions: ['La bomba genera el *caudal*.', 'El manómetro mide la *presión*.', 'El filtro retiene *partículas*.', 'Antes de intervenir se aplica el *bloqueo*.'] },
 };
 const INVALID = {
-  experience: (id, title) => { const e = experience(id, title); e.movements.opening[0].lead = 'Mira el video y luego resuelve la actividad interactiva.'; return e; },
+  // Calibración #2: la experience repara sola violaciones en movimientos con margen (autoRepairs); la
+  // inválida va en synthesis (sin margen) para seguir ejercitando el reintento dirigido.
+  experience: (id, title) => { const e = experience(id, title); e.movements.synthesis[0].central = 'Mira el video y resuelve la actividad interactiva.'; return e; },
   course_intro: () => { const c = courseIntro(); c.welcome = `Este curso tiene 3 módulos y 12 capítulos. ${c.welcome}`; return c; },
   module_intro: (ids) => { const m = moduleIntro(ids); m.journey = m.journey.slice(1); return m; },
   video_interactions: (indices) => interactions(indices.slice(0, Math.max(1, indices.length - 1))),

@@ -24,6 +24,8 @@ const path = require('path');
 
 const KNOWN_PRODUCTION_SUPABASE_REF = 'hriwbakbuypaiovvvkqh';
 const CALIBRATION_TITLE_PREFIX = '[CALIBRATION V2.1]';
+/** Calibración #2: también "[CALIBRATION V2.1 #2] …" (número de calibración). */
+const CALIBRATION_TITLE_RE = /^\[CALIBRATION V2\.1(?: #\d{1,3})?\] /;
 const CREATED_BY = 'staging-v21-calibration (aprobado en el chat por Nicolás, 2026-09-26)';
 
 /** Límites aprobados. monthlyCapStaging no lo aplica el gate del run: lo aplica `authorize`. */
@@ -114,8 +116,8 @@ function policyMatches(row) {
  */
 function decideAuthorization(a) {
   if (!a.course) return { ok: false, reason: 'el curso no existe' };
-  if (!String(a.course.title || '').startsWith(CALIBRATION_TITLE_PREFIX)) {
-    return { ok: false, reason: `el curso no es de calibración (el título debe empezar con "${CALIBRATION_TITLE_PREFIX}")` };
+  if (!CALIBRATION_TITLE_RE.test(String(a.course.title || ''))) {
+    return { ok: false, reason: `el curso no es de calibración (el título debe empezar con "${CALIBRATION_TITLE_PREFIX}" o "[CALIBRATION V2.1 #N]")` };
   }
   if (!policyMatches(a.policy)) return { ok: false, reason: 'la política global vigente no es la aprobada (correr la acción policy primero)' };
   if (a.existingApprovals > 0) return { ok: false, reason: 'el curso ya tiene una aprobación ADMIN_APPROVED (solo se autoriza UNA)' };
