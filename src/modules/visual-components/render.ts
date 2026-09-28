@@ -762,6 +762,9 @@ export function normalizeLegacyLabelColumn(
     (rw) => Array.isArray(rw.cells) && rw.cells.length === columns.length && String(rw.cells[rw.cells.length - 1]).trim() === '—',
   );
   if (!padded || !VC_CRITERION_HEADER_RE.test(foldHeader(columns[0]))) return null;
+  // "Nivel básico / Nivel intermedio", "Opción A / Opción B": serie de sujetos, no un criterio.
+  const w0 = foldHeader(columns[0]).split(/\s+/)[0];
+  if (w0 && columns.slice(1).some((cn) => foldHeader(cn).split(/\s+/)[0] === w0)) return null;
   return { columns: columns.slice(1), rows: rows.map((rw) => ({ ...rw, cells: rw.cells.slice(0, -1) })) };
 }
 

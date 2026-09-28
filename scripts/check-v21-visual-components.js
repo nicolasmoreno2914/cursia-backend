@@ -170,6 +170,8 @@ check('R14: comparación almacenada con la columna del rótulo + relleno "—" �
   assert(vc.normalizeLegacyLabelColumn(['Docente', 'Estudiante', 'Familia'], [{ label: 'Rol', cells: ['Guía', 'Aprende', '—'] }]) === null, 'sujeto real');
   assert(vc.normalizeLegacyLabelColumn(['Aspecto', 'A', 'B'], [{ label: 'x', cells: ['1', '2', '—'] }, { label: 'y', cells: ['1', '2', '3'] }]) === null, 'relleno parcial');
   assert(vc.normalizeLegacyLabelColumn(['A', 'B'], [{ label: 'x', cells: ['1', '—'] }]) === null, 'dos columnas');
+  assert(vc.normalizeLegacyLabelColumn(['Nivel básico', 'Nivel intermedio', 'Nivel avanzado'], [{ label: 'x', cells: ['1', '2', '—'] }]) === null, 'serie de sujetos');
+  assert(vc.normalizeLegacyLabelColumn(['Opción A', 'Opción B', 'Opción C'], [{ label: 'x', cells: ['1', '2', '—'] }]) === null, 'serie de opciones');
 });
 
 check('validador: límites por movimiento, self_check exclusivo, diversidad y repetición de tipos', () => {
