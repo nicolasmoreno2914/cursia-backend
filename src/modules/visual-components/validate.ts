@@ -90,19 +90,27 @@ const DET_PL_F = '(?:las|estas|esas|unas|en las|siguientes|proximas)';
 const COURSE_UNIT = '(?:(?:este|esta|el|la)\\s+)?(?:capitulo|modulo|tema|curso|unidad|leccion)';
 /** "examen físico/médico…" es dominio. */
 const EXAM_DOMAIN = '(?:fisico|medico|clinico|oftalmologico|visual|de sangre|de laboratorio|de conciencia)';
+/**
+ * R14 — examen/diapositivas/quiz solo con determinantes REFERENCIALES (definidos/demostrativos):
+ * un indefinido ("diseña un examen", "crea un quiz") es vocabulario del tema en un curso sobre
+ * enseñar y evaluar. "video" mantiene los indefinidos: "Verás un video" sí refiere al curso.
+ */
+const REF_SG_M = '(?:el|este|ese|del|al|en el|siguiente|proximo|ultimo)';
+const REF_PL_M = '(?:los|estos|esos|en los|siguientes|proximos)';
+const REF_F = '(?:la|las|esta|estas|esa|esas|en la|en las|siguientes?|proximas?|ultimas?)';
 const RESOURCE_PATTERNS = [
   `${DET_SG_M}\\s+video`,
   `${DET_PL_M}\\s+videos`,
   `${DET_SG_F}\\s+actividad\\s+(?:interactiva|practica|gamificada|de practica|calificada|evaluada|siguiente|final)`,
   `${DET_PL_F}\\s+actividades\\s+(?:interactivas|practicas|gamificadas|de practica|calificadas|evaluadas)`,
   `(?:en|con)\\s+la\\s+siguiente\\s+actividad`,
-  `${DET_SG_M}\\s+examen(?!\\s+${EXAM_DOMAIN})`,
-  `${DET_PL_M}\\s+examenes(?!\\s+${EXAM_DOMAIN})`,
+  `${REF_SG_M}\\s+examen(?!\\s+${EXAM_DOMAIN})`,
+  `${REF_PL_M}\\s+examenes(?!\\s+${EXAM_DOMAIN})`,
   `${DET_SG_F}\\s+evaluacion\\s+(?:del modulo|de la unidad|del capitulo|del curso|final|calificada|siguiente)`,
   `${DET_SG_F}\\s+presentacion(?!\\s+(?:de|del)\\s+(?!${COURSE_UNIT}))`,
   `${DET_PL_F}\\s+presentaciones(?!\\s+(?:de|del)\\s+(?!${COURSE_UNIT}))`,
-  'diapositivas?',
-  'quiz(?:zes|es)?',
+  `${REF_F}\\s+diapositivas?`,
+  `(?:${REF_SG_M}|${REF_PL_M})\\s+quiz(?:zes|es)?`,
   'scorm',
   'h5p',
   'juegos?\\s+(?:interactivos?|gamificados?|educativos?|de practica|del capitulo|del modulo)',
