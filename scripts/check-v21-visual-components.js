@@ -209,7 +209,7 @@ check('lint RESOURCE_MENTION (ruling I4): referencias a recursos/navegación sí
     'Prepárate para el examen', 'Repasa antes del examen', 'la evaluación del módulo', 'La evaluación final',
     'En la presentación verás los datos', 'Revisa la presentación del capítulo', 'la presentación de este capítulo',
     'la diapositiva 3', 'las diapositivas', 'el quiz', 'un SCORM', 'el H5P', 'un juego interactivo', 'el juego de práctica',
-    'Sigue con el siguiente recurso', 'En este Vídeo', 'Verás un video', 'en estas diapositivas', 'este quiz',
+    'Sigue con el siguiente recurso', 'En este Vídeo', 'Verás un video', 'en estas diapositivas', 'este quiz', 'En la siguiente diapositiva', 'la última diapositiva', 'en las próximas diapositivas',
   ];
   for (const t of deny) assert(vc.lintResourceMentions(t).length >= 1, `debió marcar: "${t}"`);
   const allow = [

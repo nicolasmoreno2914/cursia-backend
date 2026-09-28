@@ -97,7 +97,7 @@ const EXAM_DOMAIN = '(?:fisico|medico|clinico|oftalmologico|visual|de sangre|de 
  */
 const REF_SG_M = '(?:el|este|ese|del|al|en el|siguiente|proximo|ultimo)';
 const REF_PL_M = '(?:los|estos|esos|en los|siguientes|proximos)';
-const REF_F = '(?:la|las|esta|estas|esa|esas|en la|en las)';
+const REF_F = '(?:la|las|esta|estas|esa|esas|en la|en las|siguientes?|proximas?|ultimas?)';
 const RESOURCE_PATTERNS = [
   `${DET_SG_M}\\s+video`,
   `${DET_PL_M}\\s+videos`,
