@@ -107,7 +107,10 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
 
   const h = hx(theme, input.options);
   const level = h.enh ? ('enhanced' as const) : undefined;
-  const uid = (role: string) => `ch${ch.number}-${role.replace(/_/g, '-')}`;
+  // R14: el rol VA PRIMERO ("opening-ch8", no "ch8-opening"): el filtro de emoticones de Moodle
+  // convierte "8-o" en una imagen DENTRO del atributo class/uid y rompe el HTML del capítulo 8/18/28….
+  // Con el número al final nunca queda "<dígito>-<letra>" que forme un emoticón.
+  const uid = (role: string) => `${role.replace(/_/g, '-')}-ch${ch.number}`;
   const opener = {
     kicker: `Módulo ${mod.number} · Capítulo ${ch.number}`,
     title: ch.title,
