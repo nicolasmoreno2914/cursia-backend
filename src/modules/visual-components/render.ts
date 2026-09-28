@@ -737,10 +737,44 @@ function comparisonStack(r: R, columns: string[], rows: VcComparison['rows'], ti
   return `<div class="cvc-cmp cvc-cmp-stack"${ea(r, { 'data-cvc-cols': String(columns.length) })}>${blocks}</div>`;
 }
 
+/**
+ * R14 — encabezado que nombra el CRITERIO (no un sujeto comparado): vacío, "Aspecto", "Criterio",
+ * "Tipo de adaptación", "Nivel"... Texto ya sin tildes y en minúsculas. Espejo en el frontend
+ * (DYN_CRITERION_HEADER_RE, 45-dynamic-generation-executor.js).
+ */
+export const VC_CRITERION_HEADER_RE =
+  /^(?:|aspectos?|criterios?|caracteristicas?|dimension(?:es)?|elementos?|factor(?:es)?|variables?|rasgos?|categorias?|indicador(?:es)?|parametros?|atributos?|conceptos?|puntos?|temas?|ejes?|ambitos?|items?|comparacion|dato|tipos?|nivel(?:es)?|clases?|modalidad(?:es)?|fases?|etapas?|momentos?|situacion(?:es)?|escenarios?|casos?|opcion(?:es)?|enfoques?)(?:\s.*)?$/;
+
+const foldHeader = (x: unknown): string =>
+  String(x ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+
+/**
+ * R14 — comparación ALMACENADA con la firma del repair anterior: la columna del rótulo quedó en
+ * columns[0] y cada fila recibió un relleno "—" al final. Se normaliza al renderizar (sin
+ * regenerar): se quita columns[0] y el "—" final. Solo con esa firma exacta y un encabezado de criterio.
+ */
+export function normalizeLegacyLabelColumn(
+  columns: string[],
+  rows: VcComparison['rows'],
+): { columns: string[]; rows: VcComparison['rows'] } | null {
+  if (columns.length < 3 || !rows.length) return null;
+  const padded = rows.every(
+    (rw) => Array.isArray(rw.cells) && rw.cells.length === columns.length && String(rw.cells[rw.cells.length - 1]).trim() === '—',
+  );
+  if (!padded || !VC_CRITERION_HEADER_RE.test(foldHeader(columns[0]))) return null;
+  // "Nivel básico / Nivel intermedio", "Opción A / Opción B": serie de sujetos, no un criterio.
+  const w0 = foldHeader(columns[0]).split(/\s+/)[0];
+  if (w0 && columns.slice(1).some((cn) => foldHeader(cn).split(/\s+/)[0] === w0)) return null;
+  return { columns: columns.slice(1), rows: rows.map((rw) => ({ ...rw, cells: rw.cells.slice(0, -1) })) };
+}
+
 function renderComparison(r: R, c: VcComparison): string {
   const s = ground(r);
-  const columns = list(c.columns, 'comparison.columns');
-  const rows = list(c.rows, 'comparison.rows');
+  const rawColumns = list(c.columns, 'comparison.columns');
+  const rawRows = list(c.rows, 'comparison.rows');
+  const legacy = normalizeLegacyLabelColumn(rawColumns, rawRows);
+  const columns = legacy ? legacy.columns : rawColumns;
+  const rows = legacy ? legacy.rows : rawRows;
   const titleId = r.enh && c.title ? nextId(r, 'cmp') : undefined;
   const body = columns.length > VC_TABLE_MAX_COLUMNS ? comparisonStack(r, columns, rows, c.title) : comparisonTable(r, columns, rows, titleId);
   return componentWrap(r, 'comparison', sectionKicker(r, 'Comparación', s) + titleIf(r, c.title, s, undefined, titleId) + body, s);

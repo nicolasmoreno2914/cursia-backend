@@ -147,6 +147,33 @@ check('validador: rangos de cantidad por componente (COUNT_RANGE / ARITY_MISMATC
   assert(codesOf(vc.validateComponent(cmp)).includes('ARITY_MISMATCH'), 'ARITY_MISMATCH');
 });
 
+check('R14: comparación almacenada con la columna del rótulo + relleno "—" → se normaliza al renderizar (sin regenerar)', () => {
+  const t = themes[0].theme;
+  const legacy = {
+    type: 'comparison',
+    title: 'Niveles de adaptación y esfuerzo docente',
+    columns: ['Tipo de adaptación', 'Qué cambia', 'Riesgo de error', 'Ejemplo real'],
+    rows: [
+      { label: 'Cambio de lenguaje', cells: ['Simplificar jerga sin perder contenido', 'Bajo a medio', 'Artículo académico → guía práctica', '—'] },
+      { label: 'Cambio de formato', cells: ['De ensayo a procedimiento', 'Bajo', 'Capítulo → protocolo paso a paso', '—'] },
+    ],
+  };
+  const n = vc.normalizeLegacyLabelColumn(legacy.columns, legacy.rows);
+  assert(n && JSON.stringify(n.columns) === JSON.stringify(['Qué cambia', 'Riesgo de error', 'Ejemplo real']), JSON.stringify(n));
+  assert(n.rows.every((r) => r.cells.length === 3 && !r.cells.includes('—')), 'sin relleno');
+  for (const level of [undefined, 'enhanced']) {
+    const html = vc.renderComponent(legacy, t, { uid: 'lg', level });
+    assert(!html.includes('>—<') && !html.includes('Tipo de adaptación'), level + ': sin columna del rótulo ni relleno');
+    assert(html.includes('Ejemplo real') && html.includes('Capítulo → protocolo paso a paso'), level + ': contenido completo');
+  }
+  // Un SUJETO real con relleno, o filas sin la firma exacta → intacto.
+  assert(vc.normalizeLegacyLabelColumn(['Docente', 'Estudiante', 'Familia'], [{ label: 'Rol', cells: ['Guía', 'Aprende', '—'] }]) === null, 'sujeto real');
+  assert(vc.normalizeLegacyLabelColumn(['Aspecto', 'A', 'B'], [{ label: 'x', cells: ['1', '2', '—'] }, { label: 'y', cells: ['1', '2', '3'] }]) === null, 'relleno parcial');
+  assert(vc.normalizeLegacyLabelColumn(['A', 'B'], [{ label: 'x', cells: ['1', '—'] }]) === null, 'dos columnas');
+  assert(vc.normalizeLegacyLabelColumn(['Nivel básico', 'Nivel intermedio', 'Nivel avanzado'], [{ label: 'x', cells: ['1', '2', '—'] }]) === null, 'serie de sujetos');
+  assert(vc.normalizeLegacyLabelColumn(['Opción A', 'Opción B', 'Opción C'], [{ label: 'x', cells: ['1', '2', '—'] }]) === null, 'serie de opciones');
+});
+
 check('validador: límites por movimiento, self_check exclusivo, diversidad y repetición de tipos', () => {
   expectCode(mutate((d) => d.movements.deepening.push(d.movements.opening[1])), 'MOVEMENT_RANGE', 'deepening');
   expectCode(mutate((d) => (d.movements.opening = [])), 'MOVEMENT_RANGE', 'opening');
