@@ -17,7 +17,7 @@ export {
   VcValidationResult,
   VcTextLintHit,
 } from './validate';
-export { renderComponent, renderMovement, VcRenderContext, VcRenderLevel, VC_TABLE_MAX_COLUMNS } from './render';
+export { renderComponent, renderMovement, VcRenderContext, VcRenderLevel, VC_TABLE_MAX_COLUMNS, VC_CRITERION_HEADER_RE, normalizeLegacyLabelColumn } from './render';
 export { VC_RUNTIME_VERSION } from './runtime';
 export {
   lintCleanSafe,
