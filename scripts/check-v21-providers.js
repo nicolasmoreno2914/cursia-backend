@@ -181,6 +181,8 @@ async function pureChecks() {
     const b = RP.gammaGenerationBody({ chapterTitle: 'Cap 1', contentMarkdown: '## Título\n**negrita**', themeId: 'th-1' });
     eq([b.textOptions.language, b.themeId, b.numCards, b.exportAs, b.format], ['es-419', 'th-1', 10, 'pdf', 'presentation'], 'campos');
     assert(b.inputText === 'Cap 1\n\nTítulo negrita', `inputText ${JSON.stringify(b.inputText)}`);
+    // R14: Gamma (textMode generate) no debe inventar cifras/fuentes y usa tuteo.
+    assert(/No agregues cifras, porcentajes/.test(b.additionalInstructions) && /tuteo/.test(b.additionalInstructions), 'instrucciones de veracidad/tuteo');
   });
 
   await check('puro: duración final del video — mvhd del MP4 > Videogen (unidad conocida) > unknown; el MP4 sintético del fake tiene un mvhd real', () => {
