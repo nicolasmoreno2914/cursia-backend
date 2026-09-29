@@ -556,11 +556,11 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     for (const bad of [/rsync/, /npm (ci|install)/, /migrate-/, /ensure_pm2_process/, /pm2 restart all/, /npm run build/]) assert(!bad.test(calText), `el job calibration no despliega: ${bad}`);
     const restarts = [...calText.matchAll(/pm2 restart (\S+)/g)].map((m) => m[1]).sort();
     eq(restarts, ['cursia-backend-staging', 'cursia-dynamic-provider-worker-staging'], 'solo los 2 procesos que leen el flag');
-    assert(/options: \['none', 'report', 'preflight', 'policy', 'authorize', 'reconcile_charged_dry', 'reconcile_charged', 'worker_on', 'worker_off', 'titles_dry', 'titles_apply'\]/.test(all), 'acciones');
+    assert(/options: \['none', 'report', 'preflight', 'policy', 'authorize', 'reconcile_charged_dry', 'reconcile_charged', 'worker_on', 'worker_off', 'titles_dry', 'titles_apply', 'failures_report'\]/.test(all), 'acciones');
     assert(calText.includes('case "$CAL_COURSE" in "") ;; *[!0-9]*)'), 'curso validado en el runner');
     const remote = calText.slice(calText.indexOf("'set -e"), calText.lastIndexOf("'")).replace(`'"\${{ secrets.VPS_PATH_STAGING }}"'`, 'STAGING_DIR');
     assert(!/inputs\./.test(remote) && !remote.slice(1).includes("'"), 'ningún input interpolado ni comilla simple en el script remoto');
-    for (const a of ['policy', 'authorize "$_COURSE"', 'report "$_COURSE"', 'worker "$_MODE"', 'titles_dry "$_COURSE"', 'titles_apply "$_COURSE"']) assert(remote.includes(`node scripts/staging-v21-calibration.js ${a}`), `acción ${a}`);
+    for (const a of ['policy', 'authorize "$_COURSE"', 'report "$_COURSE"', 'worker "$_MODE"', 'titles_dry "$_COURSE"', 'titles_apply "$_COURSE"', 'failures_report "$_COURSE"']) assert(remote.includes(`node scripts/staging-v21-calibration.js ${a}`), `acción ${a}`);
     assert(!/_CAL_|CAL_ACTION|inputs\.calibration/.test(deployJob.replace(/^\s*if:.*$/m, '')), 'el job de deploy no lee inputs de calibración');
     assert(!fs.existsSync(path.join(repoRoot, '.github/workflows/staging-calibration.yml')), 'sin workflow solo-dispatch no registrado');
     const C = require(path.resolve('scripts/staging-v21-calibration.js'));
