@@ -556,7 +556,7 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     for (const bad of [/rsync/, /npm (ci|install)/, /migrate-/, /ensure_pm2_process/, /pm2 restart all/, /npm run build/]) assert(!bad.test(calText), `el job calibration no despliega: ${bad}`);
     const restarts = [...calText.matchAll(/pm2 restart (\S+)/g)].map((m) => m[1]).sort();
     eq(restarts, ['cursia-backend-staging', 'cursia-dynamic-provider-worker-staging'], 'solo los 2 procesos que leen el flag');
-    assert(/options: \['none', 'report', 'preflight', 'policy', 'authorize', 'worker_on', 'worker_off'\]/.test(all), 'acciones');
+    assert(/options: \['none', 'report', 'preflight', 'policy', 'authorize', 'reconcile_charged_dry', 'reconcile_charged', 'worker_on', 'worker_off'\]/.test(all), 'acciones');
     assert(calText.includes('case "$CAL_COURSE" in "") ;; *[!0-9]*)'), 'curso validado en el runner');
     const remote = calText.slice(calText.indexOf("'set -e"), calText.lastIndexOf("'")).replace(`'"\${{ secrets.VPS_PATH_STAGING }}"'`, 'STAGING_DIR');
     assert(!/inputs\./.test(remote) && !remote.slice(1).includes("'"), 'ningún input interpolado ni comilla simple en el script remoto');
@@ -635,6 +635,64 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     assert(/\bmetadata\b/.test(evQuery) && /corrects_event_id/.test(evQuery) && /call_role/.test(evQuery), 'la consulta de eventos del reporte trae metadata / corrects_event_id / call_role');
     const sm = C.summarizeEvents(ev);
     eq([sm.byProvider.openai.finalCharges, Number(sm.byProvider.openai.net.toFixed(4)), sm.byProvider.gamma.reservationsPending, sm.pending, sm.unattributed], [1, 0.0147, 1, 1, 1], 'resumen');
+    // R14: package.build se atribuye a nivel RUN por diseño (RF-b): con run_id y sin item_run NO es "sin atribuir".
+    const smPkg = C.summarizeEvents([{ id: 'p1', event_kind: 'CHARGE', provider: 'cursia', operation: 'package.build', amount: '0', metadata: {}, measurement_status: 'final', run_id: 'x', item_run_id: null, call_role: 'main', attempt: 1 }]);
+    eq([smPkg.unattributed, smPkg.runLevel], [0, 1], 'package.build a nivel run');
+    eq(C.summarizeEvents([{ id: 'p3', event_kind: 'CHARGE', provider: 'openai', operation: 'package.build', amount: '0', metadata: {}, measurement_status: 'final', run_id: 'x', item_run_id: null, call_role: 'main', attempt: 1 }]).unattributed, 1, 'solo el package.build de cursia');
+    const smNoRun = C.summarizeEvents([{ id: 'p2', event_kind: 'CHARGE', provider: 'cursia', operation: 'package.build', amount: '0', metadata: {}, measurement_status: 'final', run_id: null, item_run_id: null, call_role: 'main', attempt: 1 }]);
+    eq(smNoRun.unattributed, 1, 'package.build sin run sí es sin atribuir');
+  });
+
+  await check('calibración R14: reconcile_charged concilia COMO COBRADA solo reservas ambiguas ya reemplazadas por un reenvío liquidado (run terminado); nunca llama al proveedor', () => {
+    const all = fs.readFileSync(path.join(repoRoot, '.github/workflows/deploy-staging.yml'), 'utf8');
+    const calText = all.slice(all.indexOf('\n  calibration:\n'));
+    assert(/options: \[[^\]]*'reconcile_charged'[^\]]*\]/.test(all), 'acción en el dispatch');
+    assert(/reconcile_charged\) MIGRATION_ENV=staging node scripts\/staging-v21-calibration\.js reconcile_charged "\$_COURSE"/.test(calText), 'acción remota');
+    assert(/\[ "\$CAL_ACTION" = reconcile_charged \]/.test(calText) && /\[ "\$CAL_ACTION" = reconcile_charged_dry \]/.test(calText), 'exige course_id');
+    assert(/reconcile_charged_dry\) MIGRATION_ENV=staging node scripts\/staging-v21-calibration\.js reconcile_charged_dry "\$_COURSE" ;;/.test(calText), 'dry-run remoto (solo lectura)');
+    const C = require(path.resolve('scripts/staging-v21-calibration.js'));
+    const IR = 'a2437047-ae33-441a-b978-d3092b30857f';
+    const res = { id: 'res1', idempotency_key: `reservation:tts:${IR}:g1:a1:chunk0`, event_kind: 'CHARGE', provider: 'openai', amount: '0.0140000000', metadata: { reservation: true }, measurement_status: 'pending', run_id: 'run1', item_run_id: IR, attempt: 1 };
+    const later = { id: 'fin2', event_kind: 'CHARGE', provider: 'openai', amount: '0.0144', metadata: {}, measurement_status: 'final', run_id: 'run1', item_run_id: IR, attempt: 2 };
+    const itemRuns = { [IR]: { status: 'completed', ack: 1, humanResubmits: 1 } };
+    const jobs = { run1: { status: 'completed' } };
+    const ok = C.selectChargedReconciliations([res, later], itemRuns, jobs);
+    eq([ok.eligible.map((e) => e.idempotency_key), ok.skipped.length], [[res.idempotency_key], 0], 'caso real #241');
+    for (const [label, evs, irs, js, re] of [
+      ['run activo', [res, later], itemRuns, { run1: { status: 'running' } }, /run no terminado/],
+      ['item no completado', [res, later], { [IR]: { status: 'failed', ack: 1, humanResubmits: 1 } }, jobs, /item no completado/],
+      ['sin decisión humana (sin resubmit)', [res, later], { [IR]: { status: 'completed', ack: 0, humanResubmits: 0 } }, jobs, /sin decisión humana/],
+      ['ack escrito por el worker (sin previousExternals)', [res, later], { [IR]: { status: 'completed', ack: 1, humanResubmits: 0 } }, jobs, /sin decisión humana/],
+      ['cargo final del mismo intento (crash entre escrituras)', [res, { ...later, id: 'fin1', attempt: 1 }, later], itemRuns, jobs, /contaría doble/],
+      ['decisión que no cubre el intento', [{ ...res, attempt: 2 }, { ...later, attempt: 3 }], itemRuns, jobs, /sin decisión humana/],
+      ['reenvío en otro item_run', [res, { ...later, item_run_id: 'otro' }], itemRuns, jobs, /sin reenvío liquidado/],
+      ['reenvío con el mismo intento', [res, { ...later, attempt: 1 }], itemRuns, jobs, /contaría doble/],
+      ['monto NaN', [{ ...res, amount: 'abc' }, later], itemRuns, jobs, /tope/],
+      ['monto negativo', [{ ...res, amount: '-0.01' }, later], itemRuns, jobs, /tope/],
+      ['sin reenvío liquidado', [res], itemRuns, jobs, /sin reenvío liquidado/],
+      ['reenvío de otro proveedor', [res, { ...later, provider: 'anthropic' }], itemRuns, jobs, /sin reenvío liquidado/],
+      ['reenvío pendiente', [res, { ...later, measurement_status: 'pending' }], itemRuns, jobs, /sin reenvío liquidado/],
+      ['monto sobre el tope', [{ ...res, amount: '0.75' }, later], itemRuns, jobs, /tope/],
+    ]) {
+      const s = C.selectChargedReconciliations(evs, irs, js);
+      assert(s.eligible.length === 0 && s.skipped.length === 1 && re.test(s.skipped[0].reason), `${label}: ${JSON.stringify(s)}`);
+    }
+    // review R3: TTS multi-chunk — cargos finales de chunks HERMANOS del mismo intento no bloquean.
+    const resC3 = { ...res, id: 'resC3', idempotency_key: `reservation:tts:${IR}:g1:a1:chunk3`, metadata: { reservation: true, callTag: 'chunk3' } };
+    const sib = [0, 1, 2].map((n) => ({ ...later, id: 'sib' + n, attempt: 1, metadata: { chunk: n } }));
+    eq(C.selectChargedReconciliations([resC3, ...sib, later], itemRuns, jobs).eligible.map((e) => e.id), ['resC3'], 'chunks hermanos no bloquean');
+    eq(C.selectChargedReconciliations([resC3, { ...later, id: 'same3', attempt: 1, metadata: { chunk: 3 } }, later], itemRuns, jobs).skipped.map((e) => e.reason.includes('doble')), [true], 'mismo chunk sí bloquea');
+    const pendAdj = C.selectChargedReconciliations([res, { ...later, measurement_status: 'pending' }, { id: 'adj2', corrects_event_id: 'fin2', event_kind: 'ADJUSTMENT', provider: 'openai', amount: '0' }], itemRuns, jobs);
+    eq(pendAdj.eligible.length, 1, 'reenvío registrado pending y luego liquidado cuenta como reemplazo');
+    const IR2 = 'b0000000-0000-4000-8000-000000000002';
+    const two = C.selectChargedReconciliations([res, later, { ...res, id: 'res2', idempotency_key: `reservation:tts:${IR2}:g1:a1:chunk0`, item_run_id: IR2 }], { ...itemRuns, [IR2]: { status: 'completed', ack: 1, humanResubmits: 1 } }, jobs);
+    eq([two.eligible.map((e) => e.id), two.skipped.map((e) => e.id)], [['res1'], ['res2']], 'dos reservas: solo la reemplazada');
+    eq(C.selectChargedReconciliations([{ ...res, measurement_status: 'final' }, later], itemRuns, jobs), { eligible: [], skipped: [] }, 'reserva no pendiente: ignorada');
+    const settled = C.selectChargedReconciliations([res, later, { id: 'adj', corrects_event_id: 'res1', event_kind: 'ADJUSTMENT', provider: 'openai', amount: '0' }], itemRuns, jobs);
+    eq([settled.eligible.length, settled.skipped.length], [0, 0], 'ya liquidada: ni elegible ni omitida');
+    const src = fs.readFileSync(path.resolve('scripts/staging-v21-calibration.js'), 'utf8');
+    assert(/previousExternals/.test(src) && /archivedAt/.test(src), 'la consulta trae la evidencia del resubmit humano');
+    assert(/reconcileReservationAsCharged/.test(src) && !/fetch\(|https?:\/\/api\.(openai|anthropic)/.test(src), 'usa el ledger; ninguna llamada a proveedores');
   });
 
   await check('preflight-v21-providers: READY / MISSING_CONFIG por proveedor sobre el .env de staging, sin imprimir valores; guard de producción', () => {

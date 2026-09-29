@@ -122,6 +122,15 @@ const REAL = {
     assert.ok(/tuteo/.test(none.system), 'sin país → tuteo latinoamericano');
   });
 
+  await check('audiolibro (R14-11): narración y continuación prohíben multiplicadores atribuidos a investigación y cifras que no estén en el extracto', () => {
+    const co = AS.chapterNarrationPrompt({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Colombia', contentMarkdown: 'x' });
+    const cont = AS.chapterContinuationPrompt('texto', 'T', 100, 'Colombia');
+    for (const [name, p] of [['narración', co], ['continuación', cont]]) {
+      assert.ok(/multiplicadores/.test(p.system) && /triplica/.test(p.system), `${name}: multiplicadores`);
+      assert.ok(/No inventes ni exageres/.test(p.system), `${name}: veracidad`);
+    }
+  });
+
   console.log(`\n${failed === 0 ? 'Todos los checks de R14 (veracidad) pasaron' : failed + ' check(s) fallaron'} (${passed} ✅, ${failed} ❌).`);
   process.exit(failed === 0 ? 0 : 1);
 })();

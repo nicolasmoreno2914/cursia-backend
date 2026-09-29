@@ -681,6 +681,65 @@ async function dbChecks() {
       assert(course.estimatedVsActual.some((x) => x.run_id === jobA.id), 'estimated vs actual por run');
     });
 
+    await check('DB (R14): reserva ambigua reconocida por el dueño ⇒ se concilia COMO COBRADA (ADJUSTMENT final delta 0): pending 0, el monto sigue contado; repetir = no-op', async () => {
+      const resKey = `reservation:llm:${irA.id}:g2:a1:ambiguous`;
+      const res = await ledger.recordCharge(llmCharge({
+        idempotencyKey: resKey, idempotency: undefined, externalOperationId: null,
+        measurementStatus: 'pending', metadata: { reservation: true, estimatedPending: true, reservedBeforeCall: true },
+      }));
+      assert(res.inserted && res.event.measurement_status === 'pending', 'reserva pendiente');
+      const before = await ledger.costsByRun(jobA.id);
+      const r1 = await ledger.reconcileReservationAsCharged(resKey, 'ambiguous_call_counted_as_charged', { decidedBy: 'owner (chat)' });
+      eq([r1.reconciled, r1.alreadySettled, r1.amount], [true, false, res.event.amount], 'conciliada');
+      eq([r1.event.event_kind, r1.event.amount, r1.event.measurement_status, r1.event.corrects_event_id], ['ADJUSTMENT', '0.0000000000', 'final', res.event.id], 'ADJUSTMENT delta 0 final');
+      eq([r1.event.metadata.settlement, r1.event.metadata.decidedBy, r1.event.metadata.reservationReconciledAsCharged], ['reconciled_as_charged', 'owner (chat)', true], 'metadata explícita');
+      const after = await ledger.costsByRun(jobA.id);
+      eq(after.totals.total, before.totals.total, 'el gasto contado no cambia (se cuenta como cobrado)');
+      eq(Number(after.totals.pending_events), Number(before.totals.pending_events) - 1, 'pendiente resuelto');
+      const r2 = await ledger.reconcileReservationAsCharged(resKey, 'ambiguous_call_counted_as_charged', { decidedBy: 'owner (chat)' });
+      eq([r2.reconciled, r2.alreadySettled], [false, true], 'repetir = no-op');
+      const { rows } = await client.query(`select count(*)::int n from public.generation_cost_events where corrects_event_id = $1`, [res.event.id]);
+      eq(rows[0].n, 1, 'un solo ADJUSTMENT');
+    });
+
+    await check('DB (R14): conciliar como cobrada se niega para cargos que no son reservas, sin decidedBy/reason, o inexistentes', async () => {
+      await rejects(ledger.reconcileReservationAsCharged('anthropic:msg:msg_same', 'x', { decidedBy: 'owner' }), /no es una reserva/, 'cargo final');
+      await rejects(ledger.reconcileReservationAsCharged('reservation:llm:nope', 'x', { decidedBy: 'owner' }), /no existe/, 'inexistente');
+      const k = `reservation:llm:${irA.id}:g2:a1:nodecider`;
+      await ledger.recordCharge(llmCharge({ idempotencyKey: k, idempotency: undefined, externalOperationId: null, measurementStatus: 'pending', metadata: { reservation: true } }));
+      await rejects(ledger.reconcileReservationAsCharged(k, 'x', {}), /decidedBy/, 'sin decidedBy');
+      await rejects(ledger.reconcileReservationAsCharged(k, '', { decidedBy: 'owner' }), /reason/, 'sin reason');
+    });
+
+    await check('DB (R14): el adaptador pg de la calibración (pg.Client, sin TypeORM) concilia como cobrada y hace rollback ante error', async () => {
+      const C = require('./staging-v21-calibration.js');
+      const pgLedger = new FinopsLedgerService(C.pgDataSource(client));
+      const k = `reservation:llm:${irA.id}:g2:a1:viapg`;
+      const res = await ledger.recordCharge(llmCharge({ idempotencyKey: k, idempotency: undefined, externalOperationId: null, measurementStatus: 'pending', metadata: { reservation: true } }));
+      const out = await pgLedger.reconcileReservationAsCharged(k, 'ambiguous_call_counted_as_charged', { decidedBy: 'owner (chat)' });
+      eq([out.reconciled, out.event && out.event.amount, out.event && out.event.metadata.settlement], [true, '0.0000000000', 'reconciled_as_charged'], 'conciliada vía pg');
+      const { rows } = await client.query(`select count(*)::int n from public.generation_cost_events where corrects_event_id = $1`, [res.event.id]);
+      eq(rows[0].n, 1, 'un ADJUSTMENT');
+      // Rollback REAL: el error ocurre DESPUÉS del INSERT del ADJUSTMENT (dentro de la transacción).
+      const k2 = `reservation:llm:${irA.id}:g2:a1:viapg-rollback`;
+      const res2 = await ledger.recordCharge(llmCharge({ idempotencyKey: k2, idempotency: undefined, externalOperationId: null, measurementStatus: 'pending', metadata: { reservation: true } }));
+      let inserted = false;
+      const flaky = { query: async (sql, p) => {
+        const r = await client.query(sql, p);
+        if (/^\s*insert into public\.generation_cost_events/i.test(sql)) { inserted = true; throw new Error('fallo simulado tras el insert'); }
+        return r;
+      } };
+      await rejects(new FinopsLedgerService(C.pgDataSource(flaky)).reconcileReservationAsCharged(k2, 'x', { decidedBy: 'owner' }), /fallo simulado/, 'falla dentro de la transacción');
+      assert(inserted, 'el insert llegó a ejecutarse');
+      const { rows: r2 } = await client.query(`select count(*)::int n from public.generation_cost_events where corrects_event_id = $1`, [res2.event.id]);
+      eq(r2[0].n, 0, 'rollback: el ADJUSTMENT no quedó');
+      const t1 = (await client.query('select clock_timestamp() c, now() n')).rows[0];
+      await new Promise((r) => setTimeout(r, 15));
+      const t2 = (await client.query('select now() n')).rows[0];
+      assert(new Date(t2.n).getTime() > new Date(t1.n).getTime(), 'sin transacción abierta (now() avanza entre sentencias)');
+      await rejects(pgLedger.reconcileReservationAsCharged('anthropic:msg:msg_same', 'x', { decidedBy: 'owner' }), /no es una reserva/, 'cargo final');
+    });
+
     await check('DB: controller de ingest (sin HTTP) registra con atribución verificada y responde idempotente', async () => {
       const ctrl = new FinopsIngestController(ledger);
       const body = { subject: OWNER_A, itemRunId: irA.id, callRole: 'continuation', attempt: 1, model: 'claude-sonnet-4-6', messageId: 'msg_ingest', requestId: 'req_x', usage: { input_tokens: 100, output_tokens: 100, cache_read_input_tokens: 1000 }, billingAccount: 'cursia' };

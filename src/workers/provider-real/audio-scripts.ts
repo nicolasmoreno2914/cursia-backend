@@ -108,6 +108,15 @@ export function audioLocaleRule(pais?: string | null): string {
   return '- Español latinoamericano con tuteo (tú: «usas», «puedes», «quieres»); nunca voseo («vos», «usás», «podés», «querés»).\n';
 }
 
+/**
+ * R14-11: el guion parafraseaba una cifra inventada del capítulo («Hattie: la retroalimentación
+ * triplica el aprendizaje» → «la multiplica significativamente»). Va en narración Y continuación.
+ */
+export const AUDIO_TRUTH_RULE =
+  '- No inventes ni exageres datos, estadísticas, estudios ni citas, ni multiplicadores atribuidos a investigación ' +
+  '(«duplica», «triplica», «multiplica el aprendizaje»): si el extracto trae una cifra así, no la repitas; ' +
+  'habla de la idea sin cuantificarla.\n';
+
 export interface ScriptPrompt {
   system: string;
   user: string;
@@ -128,6 +137,7 @@ export function chapterNarrationPrompt(i: ChapterScriptInput): ScriptPrompt {
     '- Tono natural, conversacional y educativo, como una clase narrada en voz alta.\n' +
     '- Empieza con una frase de transición hacia este capítulo.\n' +
     '- No inventes datos técnicos, estadísticas o citas que no estén en el extracto de referencia.\n' +
+    AUDIO_TRUTH_RULE +
     audioLocaleRule(i.pais) +
     '- Texto plano, sin markdown, sin títulos, sin listas, sin asteriscos.\n' +
     '- Responde SOLO con el bloque narrado, sin preámbulos ni explicaciones.';
@@ -148,6 +158,7 @@ export function chapterContinuationPrompt(existingText: string, chapterTitle: st
     `- Añade aproximadamente ${wordsNeeded} palabras más.\n` +
     '- NO repitas ni resumas lo ya escrito — continúa la idea.\n' +
     '- Mismo tono conversacional, estilo clase hablada.\n' +
+    AUDIO_TRUTH_RULE +
     audioLocaleRule(pais) +
     '- Texto plano, sin markdown.\n' +
     '- Responde SOLO con el texto de continuación, sin preámbulos.';

@@ -611,7 +611,7 @@ export class FinopsLedgerService {
     originalKey: string,
     newTotal: string,
     reason: string,
-    opts: { recordedBy?: string; metadata?: Record<string, unknown>; settlement?: boolean },
+    opts: { recordedBy?: string; metadata?: Record<string, unknown>; settlement?: boolean; settlementLabel?: string },
   ): Promise<{ inserted: boolean; event: CostEventRow | null; delta: string; previousTotal: string; newTotal: string }> {
     {
       await manager.query(`select pg_advisory_xact_lock(hashtext($1))`, ['finops:adj:' + originalKey]);
@@ -630,7 +630,9 @@ export class FinopsLedgerService {
       }
       const settlesPending = !!opts.settlement && orig.measurement_status === 'pending' && Number(agg.n) === 0;
       if (isZeroDec(delta) && !settlesPending) return { inserted: false, event: null, delta, previousTotal, newTotal };
-      const settlementMeta = opts.settlement ? { settlement: isZeroDec(delta) ? 'measured_equals_provisional' : 'measured_differs' } : {};
+      const settlementMeta = opts.settlement
+        ? { settlement: opts.settlementLabel ?? (isZeroDec(delta) ? 'measured_equals_provisional' : 'measured_differs') }
+        : {};
       const row: Record<string, unknown> = {};
       for (const c of EVENT_COLUMNS) row[c] = orig[c];
       Object.assign(row, {
@@ -697,6 +699,49 @@ export class FinopsLedgerService {
     });
     if (built?.pricingError && out.finalInserted) this.logPricingMissing(built.idempotencyKey, finalCharge as RecordChargeInput, built.pricingError);
     return out;
+  }
+
+  /**
+   * R14: conciliación ADMINISTRATIVA de una reserva cuya llamada quedó ambigua (el proveedor
+   * pudo haber cobrado sin que llegara el id de la operación) y que el dueño decidió contar
+   * COMO COBRADA. Inserta un ADJUSTMENT `final` con delta 0: el pendiente se resuelve y el
+   * monto reservado sigue contado como gasto (nunca se libera a 0 ni se llama al proveedor).
+   * Exige `decidedBy` y `reason` explícitos. Repetir, o una reserva ya liquidada = no-op.
+   */
+  async reconcileReservationAsCharged(
+    reservationKey: string,
+    reason: string,
+    opts: { decidedBy?: string; recordedBy?: string } = {},
+  ): Promise<{ reconciled: boolean; alreadySettled: boolean; amount: string; event: CostEventRow | null }> {
+    nonEmpty(reservationKey, 'reservationKey');
+    nonEmpty(reason, 'reason');
+    const decidedBy = nonEmpty(opts.decidedBy, 'decidedBy');
+    return this.dataSource.transaction(async (manager) => {
+      await manager.query(`select pg_advisory_xact_lock(hashtext($1))`, ['finops:adj:' + reservationKey]);
+      const [res] = await manager.query(
+        `select id, event_kind, metadata, measurement_status, amount::text as amount from public.generation_cost_events where idempotency_key = $1`,
+        [reservationKey],
+      );
+      if (!res) throw new FinopsError('ORIGINAL_NOT_FOUND', `no existe la reserva ${reservationKey}`);
+      if (res.event_kind !== 'CHARGE' || res.metadata?.reservation !== true) {
+        throw new FinopsError('INVALID_INPUT', `${reservationKey} no es una reserva de llamada pagada`);
+      }
+      const [adj] = await manager.query(
+        `select count(*)::int as n from public.generation_cost_events where corrects_event_id = $1 and event_kind = 'ADJUSTMENT'`,
+        [res.id],
+      );
+      if (Number(adj.n) > 0) return { reconciled: false, alreadySettled: true, amount: res.amount, event: null };
+      if (res.measurement_status !== 'pending') {
+        throw new FinopsError('INVALID_INPUT', `${reservationKey} no está pendiente (${String(res.measurement_status)}): no hay nada que conciliar`);
+      }
+      const r = await this.adjustWith(manager, reservationKey, normalizeDecimal(res.amount), reason, {
+        recordedBy: opts.recordedBy || 'reconciler',
+        settlement: true,
+        settlementLabel: 'reconciled_as_charged',
+        metadata: { reservationReconciledAsCharged: true, decidedBy },
+      });
+      return { reconciled: r.inserted, alreadySettled: false, amount: res.amount, event: r.event };
+    });
   }
 
   /**

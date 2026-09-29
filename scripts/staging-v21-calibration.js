@@ -13,12 +13,19 @@
 //   report <courseId>    Solo lectura: runs, estimados, autorizaciones y eventos FinOps del curso
 //                        (atribución, precio, liquidación, duplicados por operación del proveedor,
 //                        reservas previas a cada llamada pagada y estimado vs medido por proveedor).
+//   reconcile_charged_dry <courseId>
+//                        Solo lectura: lista qué reservas concilia reconcile_charged y cuáles omite (y por qué).
+//   reconcile_charged <courseId>
+//                        R14: concilia COMO COBRADAS (ADJUSTMENT final delta 0, el monto sigue contado)
+//                        SOLO las reservas de llamadas ambiguas que el dueño reconoció de forma durable
+//                        (retry con resubmitProvider/resubmitVideo ⇒ reconciliationAcknowledgedThroughAttempt)
+//                        y que ya reemplazó un reenvío liquidado. Nunca llama a un proveedor.
 //   worker <on|off>      Solo el .env de staging: DYNAMIC_PROVIDER_WORKER_ENABLED (reescritura atómica
 //                        con .env.bak; imprime solo esa clave). El workflow reinicia SOLO los 2 procesos
 //                        que la leen (API + worker de proveedores).
 //
 // Límites TEMPORALES de calibración, no los comerciales de HD-V21-19. Nunca imprime secretos.
-// Uso: MIGRATION_ENV=staging node scripts/staging-v21-calibration.js <policy|authorize|report> [courseId]
+// Uso: MIGRATION_ENV=staging node scripts/staging-v21-calibration.js <policy|authorize|report|reconcile_charged> [courseId]
 const fs = require('fs');
 const path = require('path');
 
@@ -272,7 +279,10 @@ async function actionReport(c, courseId) {
   }
   console.log(`  total medido/calculado: ${summary.total.toFixed(6)} USD`);
   console.log(`  pending (cargos finales pendientes + reservas sin liquidar): ${summary.pending}`);
-  console.log(`  sin atribuir (cargos finales sin run o sin item_run): ${summary.unattributed}`);
+  console.log(`  sin atribuir (cargos finales sin run, o sin item_run fuera de package.build): ${summary.unattributed}`);
+  console.log(`  atribuidos a nivel run por diseño (package.build): ${summary.runLevel}`);
+  const reconciled = ev.filter((e) => e.event_kind === 'ADJUSTMENT' && e.metadata && e.metadata.settlement === 'reconciled_as_charged');
+  console.log(`  reservas ambiguas conciliadas como cobradas: ${reconciled.length}${reconciled.length ? ' ' + JSON.stringify(reconciled.map((e) => e.metadata.adjusts)) : ''}`);
   const dup = await q(
     `select provider, external_operation_id, count(*)::int n from public.generation_cost_events
       where course_id = $1 and event_kind = 'CHARGE' and external_operation_id is not null
@@ -303,8 +313,8 @@ async function main() {
     process.exit(1);
   }
   const [action, courseArg] = process.argv.slice(2);
-  if (!['policy', 'authorize', 'report', 'worker'].includes(action)) {
-    console.error('uso: staging-v21-calibration.js <policy|authorize|report> [courseId] | worker <on|off>');
+  if (!['policy', 'authorize', 'report', 'reconcile_charged_dry', 'reconcile_charged', 'worker'].includes(action)) {
+    console.error('uso: staging-v21-calibration.js <policy|authorize|report|reconcile_charged_dry|reconcile_charged> [courseId] | worker <on|off>');
     process.exit(1);
   }
   if (action === 'worker') {
@@ -323,6 +333,8 @@ async function main() {
   try {
     if (action === 'policy') await actionPolicy(c);
     else if (action === 'authorize') await actionAuthorize(c, courseId);
+    else if (action === 'reconcile_charged_dry') await actionReconcileCharged(c, courseId, { dryRun: true });
+    else if (action === 'reconcile_charged') await actionReconcileCharged(c, courseId, { dryRun: false });
     else await actionReport(c, courseId);
   } finally {
     await c.end().catch(() => {});
@@ -334,12 +346,16 @@ async function main() {
  * operaciones = cargos finales (no reservas), pendientes = cargos finales pending sin liquidar +
  * reservas sin liquidar, sin atribuir = cargos finales sin run/item_run.
  */
+/** Cargos que se atribuyen a nivel RUN por diseño (RF-b, recordZero kind package), sin item_run. */
+const isRunLevelByDesign = (e) => e.provider === 'cursia' && e.operation === 'package.build';
+
 function summarizeEvents(ev) {
   const adjusted = new Set(ev.filter((e) => e.corrects_event_id).map((e) => e.corrects_event_id));
   const byProvider = {};
   let total = 0;
   let pending = 0;
   let unattributed = 0;
+  let runLevel = 0;
   for (const e of ev) {
     const p = (byProvider[e.provider] = byProvider[e.provider] || { net: 0, finalCharges: 0, pendingFinal: 0, reservationsPending: 0, retries: 0 });
     p.net += Number(e.amount);
@@ -354,12 +370,122 @@ function summarizeEvents(ev) {
     p.finalCharges++;
     if (e.call_role === 'provider_retry' || e.call_role === 'validation_retry' || Number(e.attempt) > 1) p.retries++;
     if (e.measurement_status === 'pending' && !settled) { p.pendingFinal++; pending++; }
-    if (!e.run_id || !e.item_run_id) unattributed++;
+    if (e.run_id && !e.item_run_id && isRunLevelByDesign(e)) runLevel++;
+    else if (!e.run_id || !e.item_run_id) unattributed++;
   }
-  return { byProvider, total, pending, unattributed };
+  return { byProvider, total, pending, unattributed, runLevel };
 }
 
-module.exports = { APPROVED, policyMatches, decideAuthorization, CALIBRATION_TITLE_PREFIX, setEnvKeyText, summarizeEvents };
+/** Tope por reserva conciliada como cobrada (una llamada TTS/LLM ambigua cuesta centavos). */
+const RECONCILE_CHARGED_MAX_USD = 0.5;
+const TERMINAL_JOB_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+
+/**
+ * R14 (pura): reservas SIN liquidar del curso que se pueden conciliar como cobradas. Solo las de
+ * una llamada ambigua que un humano RECONOCIÓ de forma durable (retry con resubmitProvider/Video ⇒
+ * item_run.output_summary.reconciliationAcknowledgedThroughAttempt ≥ intento de la reserva) y que
+ * ya reemplazó un reenvío liquidado: mismo item_run, un CHARGE (no reserva) del mismo proveedor en
+ * un intento posterior, final o liquidado; item `completed` y run terminado.
+ * Todo lo demás se informa en `skipped` con el motivo y NO se toca.
+ * itemRuns: {item_run_id: {status, ack, humanResubmits}} · jobs: {run_id: {status}}
+ */
+function selectChargedReconciliations(ev, itemRuns, jobs) {
+  const adjusted = new Set(ev.filter((e) => e.corrects_event_id).map((e) => e.corrects_event_id));
+  const eligible = [];
+  const skipped = [];
+  for (const r of ev) {
+    if (r.event_kind !== 'CHARGE' || !(r.metadata && r.metadata.reservation === true)) continue;
+    if (adjusted.has(r.id) || r.measurement_status !== 'pending') continue;
+    const skip = (reason) => skipped.push({ id: r.id, idempotency_key: r.idempotency_key, amount: r.amount, reason });
+    const job = jobs[r.run_id];
+    if (!job || !TERMINAL_JOB_STATUSES.has(job.status)) { skip('run no terminado'); continue; }
+    const ir = itemRuns[r.item_run_id];
+    if (!ir || ir.status !== 'completed') { skip('item no completado'); continue; }
+    // Decisión HUMANA: el ack también lo escribe el worker (fail con knownOutcome), pero previousExternals
+    // con archivedAt solo lo escribe el retry con resubmitProvider/resubmitVideo (runs.service).
+    if (!(Number(ir.ack) >= Number(r.attempt)) || !(Number(ir.humanResubmits) > 0)) { skip('sin decisión humana registrada (resubmit con reconciliationAcknowledgedThroughAttempt)'); continue; }
+    const sameAttemptFinal = ev.some((f) => f.event_kind === 'CHARGE' && !(f.metadata && f.metadata.reservation === true)
+      && f.item_run_id === r.item_run_id && f.provider === r.provider && Number(f.attempt) === Number(r.attempt)
+      && sameCall(r, f));
+    if (sameAttemptFinal) { skip('el mismo intento ya tiene un cargo final (se contaría doble): revisar a mano'); continue; }
+    const superseded = ev.some((f) => f.event_kind === 'CHARGE' && !(f.metadata && f.metadata.reservation === true)
+      && f.item_run_id === r.item_run_id && f.provider === r.provider
+      && (f.measurement_status === 'final' || adjusted.has(f.id))
+      && Number(f.attempt) > Number(r.attempt));
+    if (!superseded) { skip('sin reenvío liquidado posterior'); continue; }
+    const amt = Number(r.amount);
+    if (!(Number.isFinite(amt) && amt >= 0 && amt <= RECONCILE_CHARGED_MAX_USD)) { skip(`monto fuera del tope (${RECONCILE_CHARGED_MAX_USD} USD)`); continue; }
+    eligible.push({ ...r, ack: Number(ir.ack) });
+  }
+  return { eligible, skipped };
+}
+
+/**
+ * ¿El cargo final `f` es de la MISMA llamada que la reserva `r`? TTS: una llamada por chunk
+ * (reserva metadata.callTag='chunkN', cargo metadata.chunk=N): los chunks hermanos NO cuentan.
+ * Sin forma de distinguir la llamada → se asume la misma (conservador: se omite, nunca se cuenta doble).
+ */
+function sameCall(r, f) {
+  const m = /^chunk(\d+)$/.exec(String((r.metadata && r.metadata.callTag) || ''));
+  const fc = f.metadata && f.metadata.chunk;
+  if (m && fc !== undefined && fc !== null) return Number(fc) === Number(m[1]);
+  return true;
+}
+
+/** DataSource mínimo (query + transaction) sobre un pg.Client, para usar FinopsLedgerService de dist/. */
+function pgDataSource(c) {
+  const runner = { query: async (sql, params) => (await c.query(sql, params)).rows };
+  return {
+    query: runner.query,
+    transaction: async (fn) => {
+      await c.query('begin');
+      try {
+        const out = await fn(runner);
+        await c.query('commit');
+        return out;
+      } catch (err) {
+        await c.query('rollback').catch(() => {});
+        throw err;
+      }
+    },
+  };
+}
+
+async function actionReconcileCharged(c, courseId, { dryRun }) {
+  const q = async (sql, p) => (await c.query(sql, p)).rows;
+  const [course] = await q(`select id, title from public.courses where id = $1`, [courseId]);
+  if (!course) { console.log(`✗ curso #${courseId} no existe`); process.exitCode = 1; return; }
+  const ev = await q(
+    `select id, corrects_event_id, event_kind, provider, operation, attempt, metadata, amount::text amount, measurement_status,
+            run_id, item_run_id, idempotency_key
+       from public.generation_cost_events where course_id = $1 order by created_at`, [courseId]);
+  const itemRuns = {};
+  for (const r of await q(
+    `select g.id, g.status, coalesce((g.output_summary->>'reconciliationAcknowledgedThroughAttempt')::int, 0) ack,
+            (select count(*)::int from jsonb_array_elements(case when jsonb_typeof(g.output_summary->'previousExternals') = 'array'
+                                                                 then g.output_summary->'previousExternals' else '[]'::jsonb end) x
+              where x->>'archivedAt' is not null) "humanResubmits"
+       from public.generation_item_runs g join public.production_jobs j on j.id = g.job_id where j.course_id = $1`, [courseId])) itemRuns[r.id] = r;
+  const jobs = {};
+  for (const r of await q(`select id, status from public.production_jobs where course_id = $1`, [courseId])) jobs[r.id] = r;
+  const sel = selectChargedReconciliations(ev, itemRuns, jobs);
+  console.log(`curso #${courseId} ${JSON.stringify(course.title)}: ${sel.eligible.length} reserva(s) conciliable(s) como cobrada(s), ${sel.skipped.length} omitida(s)`);
+  for (const s of sel.skipped) console.log(`  = omitida ${s.idempotency_key} (${s.amount} USD): ${s.reason}`);
+  for (const r of sel.eligible) console.log(`  ${dryRun ? '? conciliable' : '→ conciliando'} ${r.idempotency_key} (${r.amount} USD, reconocida hasta el intento ${r.ack})`);
+  if (dryRun || !sel.eligible.length) return;
+  const { FinopsLedgerService } = require(path.resolve(process.cwd(), 'dist/modules/finops/finops-ledger.service.js'));
+  const ledger = new FinopsLedgerService(pgDataSource(c));
+  for (const r of sel.eligible) {
+    const decidedBy = `owner: retry resubmitProvider/resubmitVideo (item_run ${r.item_run_id}, reconciliationAcknowledgedThroughAttempt=${r.ack})`;
+    const out = await ledger.reconcileReservationAsCharged(r.idempotency_key, 'ambiguous_call_counted_as_charged', { decidedBy });
+    console.log(`  ${out.reconciled ? '+ conciliada como cobrada' : '= ya liquidada'} ${r.idempotency_key} (${out.amount} USD)`);
+  }
+}
+
+module.exports = {
+  APPROVED, policyMatches, decideAuthorization, CALIBRATION_TITLE_PREFIX, setEnvKeyText, summarizeEvents,
+  selectChargedReconciliations, RECONCILE_CHARGED_MAX_USD, pgDataSource,
+};
 if (require.main === module) {
   main().catch((err) => {
     console.error(`❌ staging-v21-calibration: ${String((err && (err.code || err.message)) || err).slice(0, 200)}`);
