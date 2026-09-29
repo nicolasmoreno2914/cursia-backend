@@ -32,10 +32,10 @@ on:
       calibration_action:
         description: 'none = deploy normal; otra = acción de calibración V2.1 en staging SIN deploy'
         type: choice
-        options: ['none', 'report', 'preflight', 'policy', 'authorize', 'worker_on', 'worker_off']
+        options: ['none', 'report', 'preflight', 'policy', 'authorize', 'reconcile_charged_dry', 'reconcile_charged', 'worker_on', 'worker_off']
         default: 'none'
       calibration_course_id:
-        description: 'Id numérico del curso de calibración (authorize / report)'
+        description: 'Id numérico del curso (authorize / report / reconcile_charged[_dry])'
         type: string
         default: ''
 
@@ -581,9 +581,9 @@ jobs:
           CAL_ACTION: ${{ inputs.calibration_action }}
           CAL_COURSE: ${{ inputs.calibration_course_id }}
         run: |
-          case "$CAL_ACTION" in report|preflight|policy|authorize|worker_on|worker_off) ;; *) echo "❌ action inválida"; exit 1 ;; esac
+          case "$CAL_ACTION" in report|preflight|policy|authorize|reconcile_charged_dry|reconcile_charged|worker_on|worker_off) ;; *) echo "❌ action inválida"; exit 1 ;; esac
           case "$CAL_COURSE" in "") ;; *[!0-9]*) echo "❌ course_id debe ser numérico"; exit 1 ;; esac
-          if { [ "$CAL_ACTION" = authorize ] || [ "$CAL_ACTION" = report ]; } && [ -z "$CAL_COURSE" ]; then
+          if { [ "$CAL_ACTION" = authorize ] || [ "$CAL_ACTION" = report ] || [ "$CAL_ACTION" = reconcile_charged ] || [ "$CAL_ACTION" = reconcile_charged_dry ]; } && [ -z "$CAL_COURSE" ]; then
             echo "❌ action=$CAL_ACTION necesita course_id"; exit 1
           fi
           echo "Calibración V2.1 (staging): acción=$CAL_ACTION curso=${CAL_COURSE:-(ninguno)}"
@@ -607,7 +607,7 @@ jobs:
                cd '"${{ secrets.VPS_PATH_STAGING }}"'
                IFS= read -r _ACTION || true
                IFS= read -r _COURSE || true
-               case "$_ACTION" in report|preflight|policy|authorize|worker_on|worker_off) ;; *) echo "❌ acción inválida"; exit 1 ;; esac
+               case "$_ACTION" in report|preflight|policy|authorize|reconcile_charged_dry|reconcile_charged|worker_on|worker_off) ;; *) echo "❌ acción inválida"; exit 1 ;; esac
                case "$_COURSE" in "") ;; *[!0-9]*) echo "❌ curso inválido"; exit 1 ;; esac
                if [ ! -f .env ] || [ ! -f scripts/staging-v21-calibration.js ]; then
                  echo "❌ staging sin .env o sin el script (desplegá primero)"; exit 1
@@ -616,6 +616,9 @@ jobs:
                  policy) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js policy ;;
                  authorize) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js authorize "$_COURSE" ;;
                  report) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js report "$_COURSE" ;;
+                 reconcile_charged_dry) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js reconcile_charged_dry "$_COURSE" ;;
+                 reconcile_charged) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js reconcile_charged "$_COURSE"
+                   MIGRATION_ENV=staging node scripts/staging-v21-calibration.js report "$_COURSE" ;;
                  preflight) MIGRATION_ENV=staging node scripts/preflight-v21-providers.js ;;
                  worker_on|worker_off)
                    _MODE=on; [ "$_ACTION" = worker_off ] && _MODE=off
