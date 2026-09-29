@@ -13,3 +13,4 @@ export * from './finops-ingest-token.guard';
 export * from './finops-ledger.service';
 export * from './run-budget';
 export * from './finops-budget.service';
+export * from './normal-approval';

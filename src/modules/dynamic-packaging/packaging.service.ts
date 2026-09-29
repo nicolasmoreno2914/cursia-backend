@@ -169,7 +169,7 @@ export class PackagingService {
       if (ACTIVE_RUN_WORKER_STATUSES.includes(String(run.worker_status))) {
         return { stale: true, reason: `run_in_progress: la ejecución está ${run.worker_status} (hay items regenerándose); el paquete puede no incluir su salida nueva` };
       }
-      return { stale: true, reason: `run_not_completed: la ejecución terminó en ${run.worker_status} (p.ej. una regeneración falló); reintentá los items fallidos` };
+      return { stale: true, reason: `run_not_completed: la ejecución terminó en ${run.worker_status} (p.ej. una regeneración falló); reintenta los items fallidos` };
     }
     const existingBuilderVersion = existing.output_summary?.builderVersion;
     if (existingBuilderVersion !== DYNAMIC_MBZ_BUILDER_VERSION) {
@@ -222,7 +222,7 @@ export class PackagingService {
       if (ACTIVE_RUN_WORKER_STATUSES.includes(String(run.worker_status))) {
         return { stale: true, reason: `run_in_progress: la ejecución está ${run.worker_status} (hay items regenerándose); el paquete puede no incluir su salida nueva` };
       }
-      return { stale: true, reason: `run_not_completed: la ejecución terminó en ${run.worker_status} (p.ej. una regeneración falló); reintentá los items fallidos` };
+      return { stale: true, reason: `run_not_completed: la ejecución terminó en ${run.worker_status} (p.ej. una regeneración falló); reintenta los items fallidos` };
     }
     const existingBuilderVersion = existing.output_summary?.builderVersion;
     if (existingBuilderVersion !== DYNAMIC_MBZ_BUILDER_VERSION_V3) {

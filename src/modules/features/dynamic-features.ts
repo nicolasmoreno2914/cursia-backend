@@ -30,8 +30,8 @@ export const COHERENCE_LLM_ENV = 'DYNAMIC_COHERENCE_LLM';
 export const DYNAMIC_NOT_ALLOWED_MESSAGE =
   'La estructura dinámica de cursos (V2) no está habilitada para esta cuenta.';
 export const REAL_VIDEO_NOT_ALLOWED_MESSAGE =
-  'El video real (Videogen, con costo) no está habilitado para esta cuenta. Usá el modo de video "mock" ' +
-  'o pedí que habiliten tu cuenta.';
+  'El video real (Videogen, con costo) no está habilitado para esta cuenta. Usa el modo de video "mock" ' +
+  'o pide que habiliten tu cuenta.';
 export const COHERENCE_LLM_NOT_ALLOWED_MESSAGE =
   'La revisión de coherencia con IA no está habilitada para esta cuenta.';
 

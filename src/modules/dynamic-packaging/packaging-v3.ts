@@ -236,7 +236,7 @@ export function staleWarningsV3(byItem: Map<string, ResolvedItemV3>): V3StaleWar
       itemKey: a.itemKey,
       artifactId: a.artifactId,
       type: a.type,
-      message: `El artifact ${a.type} de ${a.itemKey} quedó desactualizado y se empaquetó igual (no se regenera solo: revisalo o pedí regenerarlo).`,
+      message: `El artifact ${a.type} de ${a.itemKey} quedó desactualizado y se empaquetó igual (no se regenera solo: revísalo o pide regenerarlo).`,
     }))
     .sort((x, y) => (x.itemKey + x.type + x.artifactId < y.itemKey + y.type + y.artifactId ? -1 : 1));
 }
@@ -324,7 +324,7 @@ export async function loadPackagingProfilesV3(q: QueryExecutor, courseId: number
     if (legacyPaletteId && !LEGACY_PALETTES.some((x) => x.id === legacyPaletteId)) {
       throw new Error(
         `THEME_INVALID: el curso #${courseId} tiene la paleta desconocida "${legacyPaletteId}"; ` +
-          'guardá un perfil de presentación ("Diseño y evaluación") para empaquetarlo.',
+          'guarda un perfil de presentación ("Diseño y evaluación") para empaquetarlo.',
       );
     }
   }

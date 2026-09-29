@@ -226,7 +226,7 @@ async function heartbeat(deps: RealProviderDeps, item: ClaimedItem): Promise<voi
 function notReady(item: ClaimedItem, what: string[]): string {
   return (
     `${PROVIDER_NOT_READY}: el item ${item.itemKey} (${item.type}) necesita ${what.join(', ')} en el entorno del worker; ` +
-    'no se llamó al proveedor (sin gasto). Configurá lo que falta y reintentá esta parte.'
+    'no se llamó al proveedor (sin gasto). Configura lo que falta y reintenta esta parte.'
   );
 }
 
@@ -457,7 +457,7 @@ export async function processRealPresentation(deps: RealProviderDeps, item: Clai
       deps,
       item,
       `gamma_generation_failed: la generación ${gid} falló en Gamma (${st.error ?? 'sin detalle'}). No se reenvía sola: ` +
-        'regenerá la presentación para pedir una nueva.',
+        'regenera la presentación para pedir una nueva.',
       false,
     );
   }
@@ -551,8 +551,8 @@ async function gammaAmbiguous(deps: RealProviderDeps, item: ClaimedItem, ownerId
     deps,
     item,
     `${AMBIGUOUS_GAMMA_SUBMISSION}: el envío a Gamma quedó sin confirmar (${why.slice(0, 300)}). Puede existir ya una generación ` +
-      'cobrada (quedó reservada en el ledger): no se reenvía automáticamente. Revisá la cuenta de Gamma y, si corresponde, ' +
-      'pedí un reenvío explícito (retry con resubmitProvider=true).',
+      'cobrada (quedó reservada en el ledger): no se reenvía automáticamente. Revisa la cuenta de Gamma y, si corresponde, ' +
+      'pide un reenvío explícito (retry con resubmitProvider=true).',
     false,
   );
 }

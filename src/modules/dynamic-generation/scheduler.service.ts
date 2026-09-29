@@ -517,7 +517,7 @@ export class SchedulerService {
       const message =
         `rules_version_mismatch: la ejecución ${runId} es rulesVersion=3 (V2.1: experiencias, actividades, ` +
         `presentaciones y audio) y este ejecutor no reclama tipos de rulesVersion 3 (${types.join(', ')}). ` +
-        'Recargá la página para usar el generador actualizado; con este ejecutor el curso no avanzaría.';
+        'Recarga la página para usar el generador actualizado; con este ejecutor el curso no avanzaría.';
       throw new ConflictException({ message, code: 'rules_version_mismatch', rulesVersion, runId });
     }
     if (claimsV2) return;
@@ -525,7 +525,7 @@ export class SchedulerService {
       const message =
         `rules_version_mismatch: la ejecución ${runId} es rulesVersion=2 (plan de conceptos, introducciones y ` +
         `Context Package) y este ejecutor solo reclama tipos de rulesVersion 1 (${types.join(', ')}). ` +
-        'Recargá la página para usar el generador actualizado; con este ejecutor el curso no avanzaría.';
+        'Recarga la página para usar el generador actualizado; con este ejecutor el curso no avanzaría.';
       throw new ConflictException({ message, code: 'rules_version_mismatch', rulesVersion, runId });
     }
   }

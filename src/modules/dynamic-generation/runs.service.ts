@@ -80,10 +80,13 @@ import {
 } from '../finops/run-budget';
 import { incrementalCostForPlan } from '../finops/incremental';
 import { FinopsError } from '../finops/errors';
-import { addDec, normalizeDecimal } from '../finops/decimal';
-import { runtimeGuard } from '../finops/budget';
+import { addDec, cmpDec, normalizeDecimal } from '../finops/decimal';
+import { runtimeGuard, SpentSoFar } from '../finops/budget';
+import { MONTH_CAP_LOCK } from '../finops/finops-budget.service';
 import type { EstimateResult, MinExpMax } from '../finops/estimator';
 import { assertAssessmentProfileResolvableForRun } from '../course-profiles/assessment-preflight';
+import { estimateCategories, estimateFingerprint, planNormalApproval, NormalApprovalPlan } from '../finops/normal-approval';
+import { isSuperAdminEmail } from '../../auth/super-admin';
 import {
   ACTIVE_RUN_WORKER_STATUSES,
   isActiveRun,
@@ -425,6 +428,107 @@ export interface RegenerationAffectedItem {
  * pasan a `cancelled` y el run se normaliza a status = worker_status =
  * 'cancelled' (lo que además libera el índice de run activo).
  */
+export const ESTIMATE_STALE = 'estimate_stale';
+
+/** Aprobación del flujo normal que startRun escribe DENTRO de la tx del run (ver finopsBindRun). */
+export interface NormalApprovalRequest {
+  approvedBy: string;
+  fingerprint: string;
+  /** Monto del plan que vio el usuario; se recalcula en la tx y debe coincidir. */
+  amount: string;
+  /** Totales del estimado que vio el usuario; el de startRun debe coincidir. */
+  expected: string;
+  max: string;
+  /** Lo completa finopsBindRun al escribirla. */
+  result: { authorizationId: string; amount: string } | null;
+}
+
+type FinopsGate = { evaluation: StartBudgetEvaluation; approval: any | null; normalApproval?: NormalApprovalRequest };
+
+interface NormalPlanContext {
+  spent: SpentSoFar;
+  month: { spent: string; outstanding: string; total: string };
+  plan: NormalApprovalPlan;
+}
+
+export function budgetBlockedConflict(blockedBy: NormalApprovalPlan['blockedBy'], preview?: unknown): ConflictException {
+  const b = blockedBy.map((x) => `${x.limit}(${x.over === 'max' ? 'máximo' : 'esperado'}=${x.expected}, gastado=${x.spent}, límite=${x.limitValue ?? '—'})`).join(', ');
+  return new ConflictException({
+    code: BUDGET_BLOCKED,
+    message: `${BUDGET_BLOCKED}: el estimado supera la política de presupuesto: ${b}. No se creó nada.`,
+    blockedBy,
+    ...(preview ? { preview } : {}),
+  });
+}
+export const APPROVAL_FORBIDDEN = 'approval_forbidden';
+
+export interface StartPreview {
+  manifestId: number;
+  blueprintNumber: number;
+  rulesVersion: number;
+  counts: PreviewCounts;
+  existingRun: { id: string; status: string; active: boolean } | null;
+  estimate: {
+    currency: string; min: string; expected: string; max: string;
+    byProvider: Record<string, MinExpMax>; byItemType: Record<string, MinExpMax>; byCategory: Record<string, MinExpMax>;
+  } | null;
+  decision: string | null;
+  reasons: string[];
+  paidRealProviders: string[];
+  approval: {
+    required: boolean; canApprove: boolean; withinPolicy: boolean; amount: string | null;
+    cappedByLimit: string | null; blockedBy: NormalApprovalPlan['blockedBy'];
+    /** Aprobación de admin vigente sin consumir que ya cubre el esperado (startRun la usa). */
+    existing: { amount: string } | null;
+  } | null;
+  policy: { maxCostPerRun: string | null; maxCostPerCourse: string | null; monthlyCap: string | null; courseSpent: string; monthSpent: string } | null;
+  estimateHash: string | null;
+  /** Internos (no viajan al cliente: ver publicPreview). */
+  _plan?: NormalApprovalPlan;
+  _evaluation?: StartBudgetEvaluation;
+}
+
+export interface PreviewCounts {
+  modules: number;
+  chapters: number;
+  presentations: number;
+  videos: number;
+  activities: number;
+  moduleExams: number;
+  finalExam: boolean;
+  audiobookChapters: number;
+  audioWelcome: boolean;
+}
+
+/** Conteos visibles desde los items del Manifest (lo que realmente se generaría). */
+export function previewCounts(manifest: { manifest: { items: ReadonlyArray<{ type: string; moduleId?: string | null; chapterId?: string | null }> } }): PreviewCounts {
+  const items = (manifest.manifest && manifest.manifest.items) || [];
+  const mods = new Set<string>();
+  const chs = new Set<string>();
+  const n = (t: string) => items.filter((i) => i.type === t).length;
+  for (const i of items) {
+    if (i.moduleId) mods.add(i.moduleId);
+    if (i.chapterId) chs.add(i.chapterId);
+  }
+  return {
+    modules: mods.size,
+    chapters: chs.size,
+    presentations: n('presentation'),
+    videos: n('video'),
+    activities: n('activity') + n('scorm'),
+    moduleExams: n('exam'),
+    finalExam: n('final_exam') > 0,
+    audiobookChapters: n('audiobook_chapter'),
+    audioWelcome: n('audio_welcome') > 0,
+  };
+}
+
+/** Preview sin los campos internos. */
+export function publicPreview(pv: StartPreview): Omit<StartPreview, '_plan' | '_evaluation'> {
+  const { _plan, _evaluation, ...rest } = pv;
+  return rest;
+}
+
 @Injectable()
 export class RunsService {
   private readonly logger = new Logger(RunsService.name);
@@ -481,6 +585,8 @@ export class RunsService {
     ownerId: string,
     blueprintNumber: number,
     courseContext: CourseContextDto | FromRunDto,
+    /** Flujo normal (approveAndStart): aprobación a escribir en la tx del run nuevo. */
+    opts: { normalApproval?: NormalApprovalRequest } = {},
   ): Promise<StartRunResult> {
     // G3: flag V2 + allow-list por owner (403 antes de tocar la DB).
     assertDynamicOwnerAllowed(ownerId);
@@ -514,7 +620,178 @@ export class RunsService {
     // los chequeos bajo advisory lock en insertRun/reopenRun/retryItem.
     const other = await this.findActiveRunOnOtherManifest(this.dataSource, courseId, manifest.id);
     if (other) throw this.otherActiveRunConflict(other, manifest);
-    return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, true, videoDelivery, providerModes);
+    return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, true, videoDelivery, providerModes, opts);
+  }
+
+  // ── Flujo NORMAL de aprobación desde la UI (separado de la calibración) ──
+
+  /**
+   * Estimado COMPLETO de lo que costaría iniciar la generación con este
+   * contexto, más la decisión de presupuesto y si el usuario puede aprobarla
+   * desde la UI. Solo lectura: no escribe estimados, aprobaciones ni runs, y
+   * corre los gates previos a escribir de startRun para un run nuevo
+   * (owner/flag, Manifest, perfil de evaluación, contexto, modos de proveedor,
+   * worker de proveedores, preflight v3, otro run activo del curso, video
+   * real habilitado). Con un run ya existente en este Manifest devuelve
+   * `existingRun` (la UI lo retoma; no se re-estima). Sin FinOps: solo runs
+   * sin proveedores pagados (mismo criterio que startRun).
+   */
+  async previewStart(
+    courseId: number,
+    user: { id: string; email?: string | null },
+    blueprintNumber: number,
+    courseContext: CourseContextDto,
+  ): Promise<StartPreview> {
+    const ownerId = user.id;
+    assertDynamicOwnerAllowed(ownerId);
+    const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
+    await assertAssessmentProfileResolvableForRun(this.dataSource, courseId, manifest);
+    const context = normalizeCourseContext(courseContext);
+    this.assertRequiredContext(context);
+    const contextHash = canonicalContextHash(context);
+    const videoMode = this.normalizeVideoMode((courseContext as any)?.videoMode);
+    const providerModes = this.providerModesForNewRun(manifest.rulesVersion, (courseContext as any)?.providerModes);
+    if (providerModes) {
+      const gate = resolveRunVideoDelivery({ videoCount: this.videoCountOf(manifest), videoMode, configured: readVideoDeliveryConfig() });
+      this.assertV3ProviderPreflight(manifest, providerModes, videoMode, gate.ok ? gate.strategy : null);
+    }
+    const counts = previewCounts(manifest);
+    const base = { manifestId: manifest.id, blueprintNumber, rulesVersion: manifest.rulesVersion, counts };
+    const empty = { estimate: null, decision: null, reasons: [], paidRealProviders: [], approval: null, policy: null, estimateHash: null };
+    const latest = await this.findLatestRunRow(manifest.id);
+    if (latest) {
+      return { ...base, ...empty, existingRun: { id: latest.id, status: latest.worker_status, active: isActive(latest) } };
+    }
+    // Mismos 409/403 que startRun daría para un run nuevo, ANTES de ofrecer autorizar.
+    const other = await this.findActiveRunOnOtherManifest(this.dataSource, courseId, manifest.id);
+    if (other) throw this.otherActiveRunConflict(other, manifest);
+    if (videoMode === 'real') assertRealVideoAllowed(ownerId);
+    const modes = runSpendModes(videoMode, providerModes ?? null);
+    if (!this.finopsBudget) {
+      const paid = paidRealProviders(estimateItemsForRun(manifest.manifest.items, modes, null), modes);
+      if (paid.length > 0) {
+        throw new ServiceUnavailableException({
+          code: FINOPS_UNAVAILABLE,
+          message: `${FINOPS_UNAVAILABLE}: no se puede evaluar el presupuesto de un run con proveedores pagados reales (${paid.join(', ')}); no se creó nada.`,
+        });
+      }
+      return { ...base, ...empty, existingRun: null };
+    }
+    let evaluation: StartBudgetEvaluation;
+    let np: NormalPlanContext;
+    let existing: any | null = null;
+    try {
+      evaluation = await this.finopsBudget.evaluateStart({ courseId, ownerId, mode: modes, items: manifest.manifest.items });
+      np = await this.normalPlan(this.dataSource, courseId, ownerId, evaluation);
+      if (evaluation.decision === 'ADMIN_APPROVAL') {
+        existing = await this.finopsBudget.findUnconsumedApproval(courseId, manifest.id, evaluation.estimate.totals.expected);
+      }
+    } catch (err) {
+      throw this.finopsUnavailable(err);
+    }
+    let plan = np.plan;
+    if (evaluation.decision === 'BLOCK' && plan.withinPolicy) {
+      // on_exceed=BLOCK: startRun lo rechaza sin salida por aprobación.
+      plan = { ...plan, withinPolicy: false, amount: null, cappedByLimit: null,
+        blockedBy: [{ limit: 'policy_block', limitValue: null, spent: normalizeDecimal(np.spent.course), expected: evaluation.estimate.totals.expected, over: 'expected' }] };
+    }
+    // Una aprobación de admin vigente para este Manifest ya cubre el esperado: startRun la consume (camino normal).
+    const required = evaluation.decision !== 'AUTO_WITHIN_POLICY' && !existing;
+    const canApprove = isSuperAdminEmail(user.email);
+    const estimateHash = estimateFingerprint({
+      courseId, manifestId: manifest.id, manifestSha: manifest.sha256, contextHash, modes, estimate: evaluation.estimate,
+      policyId: evaluation.policyId, plan, courseSpent: normalizeDecimal(np.spent.course),
+    });
+    const sum = estimateSummary(evaluation.estimate);
+    return {
+      ...base,
+      existingRun: null,
+      estimate: {
+        currency: sum.currency, min: sum.min, expected: sum.expected, max: sum.max,
+        byProvider: sum.byProvider, byItemType: evaluation.estimate.totals.byItemType, byCategory: estimateCategories(sum.byProvider),
+      },
+      decision: evaluation.decision,
+      reasons: evaluation.reasons,
+      paidRealProviders: evaluation.paidRealProviders,
+      approval: {
+        required,
+        canApprove,
+        withinPolicy: plan.withinPolicy,
+        amount: plan.amount,
+        cappedByLimit: plan.cappedByLimit,
+        blockedBy: plan.blockedBy,
+        existing: existing ? { amount: normalizeDecimal(existing.authorized_budget) } : null,
+      },
+      policy: { ...plan.limits, courseSpent: normalizeDecimal(np.spent.course), monthSpent: np.month.total },
+      estimateHash,
+      _plan: plan,
+      _evaluation: evaluation,
+    } as StartPreview;
+  }
+
+  /** Política + gasto del curso + comprometido del mes → plan de aprobación normal (sobre `runner`). */
+  private async normalPlan(runner: { query: (sql: string, params?: any[]) => Promise<any> }, courseId: number, ownerId: string,
+    evaluation: StartBudgetEvaluation): Promise<NormalPlanContext> {
+    const policy = await this.finopsBudget!.policyFor(courseId, ownerId, runner);
+    const spent = await this.finopsBudget!.spentSoFar(courseId, runner);
+    const month = await this.finopsBudget!.monthCommitted(runner);
+    const plan = planNormalApproval({
+      estimate: evaluation.estimate, policy, courseSpent: spent.course, monthSpent: month.total, providerSpent: spent.byProvider,
+    });
+    return { spent, month, plan };
+  }
+
+  /**
+   * «Autorizar y generar» (UI). Re-valida TODO server-side: rol (SuperAdmin por
+   * SUPER_ADMIN_EMAILS, nunca lo que diga el cliente), ownership + Manifest
+   * vigente y gates de un run nuevo (previewStart), estimado recalculado ahora
+   * con la MISMA huella que vio el usuario (si el Blueprint/Manifest, el
+   * contexto, los precios, la política o el gasto cambiaron → 409
+   * estimate_stale), y el monto sale del plan de la política (nunca del
+   * cliente). La aprobación se escribe DENTRO de la transacción que crea el
+   * run (finopsBindRun), bajo el lock global del tope mensual y con el plan
+   * recalculado ahí: o nacen juntos run + aprobación consumida, o no se
+   * escribe nada (sin aprobaciones colgadas que otro start pueda consumir).
+   */
+  async approveAndStart(
+    courseId: number,
+    user: { id: string; email?: string | null },
+    blueprintNumber: number,
+    courseContext: CourseContextDto,
+    estimateHash: string,
+  ): Promise<StartRunResult & { approval: { authorizationId: string | null; amount: string | null } }> {
+    const pv = await this.previewStart(courseId, user, blueprintNumber, courseContext);
+    const none = { authorizationId: null, amount: null };
+    // Run existente (se retoma / reabre por el camino normal) o sin FinOps (solo mock): sin aprobación nueva.
+    if (pv.existingRun || !pv.estimate || !pv.approval) {
+      return { ...(await this.startRun(courseId, user.id, blueprintNumber, courseContext)), approval: none };
+    }
+    if (pv.estimateHash !== estimateHash) {
+      throw new ConflictException({
+        code: ESTIMATE_STALE,
+        message: `${ESTIMATE_STALE}: el costo estimado cambió desde que lo viste (estructura, datos, precios o gasto); revisa el estimado nuevo. No se creó nada.`,
+        preview: publicPreview(pv),
+      });
+    }
+    // AUTO o una aprobación de admin vigente: el camino normal (startRun la consume).
+    if (!pv.approval.required) return { ...(await this.startRun(courseId, user.id, blueprintNumber, courseContext)), approval: none };
+    if (!pv.approval.canApprove) {
+      throw new ForbiddenException({
+        code: APPROVAL_FORBIDDEN,
+        message: `${APPROVAL_FORBIDDEN}: este curso requiere la autorización de un administrador (esperado USD ${pv.estimate.expected}, máximo USD ${pv.estimate.max}). No se creó nada.`,
+      });
+    }
+    if (!pv.approval.withinPolicy) throw budgetBlockedConflict(pv.approval.blockedBy, publicPreview(pv));
+    const na: NormalApprovalRequest = {
+      approvedBy: String(user.email),
+      fingerprint: estimateHash,
+      amount: pv._plan!.amount!,
+      expected: pv.estimate.expected,
+      max: pv.estimate.max,
+      result: null,
+    };
+    const started = await this.startRun(courseId, user.id, blueprintNumber, courseContext, { normalApproval: na });
+    return { ...started, approval: na.result ?? none };
   }
 
   /** V2.1 fix round 1 (I1/M1): ProviderModeError → 403/400; v3 sin worker de proveedor → 501. */
@@ -674,7 +951,7 @@ export class RunsService {
           // se aplica un plan sobre salida que ya no existe.
           throw new ConflictException(
             `Los artifacts de la ejecución ${rowA.id} cambiaron mientras se aplicaba el plan ` +
-              `(${fromArtifactIds.length - srcRows.length} ya no existen); reintentá. runId=${rowA.id}`,
+              `(${fromArtifactIds.length - srcRows.length} ya no existen); reintenta. runId=${rowA.id}`,
           );
         }
         const sources = new Map(srcRows.map((r) => [r.id, r]));
@@ -803,6 +1080,7 @@ export class RunsService {
     mayRetry: boolean,
     videoDelivery: VideoDeliveryStrategy,
     providerModes?: ProviderModes,
+    opts: { normalApproval?: NormalApprovalRequest } = {},
   ): Promise<StartRunResult> {
     const active = await this.findActiveRunRow(manifest.id);
     if (active) return this.existingRunOrConflict(active, manifest, contextHash, videoMode, providerModes);
@@ -870,7 +1148,7 @@ export class RunsService {
     // casi siempre la carrera "otro POST commiteó entre nuestras lecturas":
     // si ahora hay un run visible, se re-resuelve contra él (una vez).
     if (mayRetry && (await this.hasPreviousItems(manifest)) && (await this.findLatestRunRow(manifest.id))) {
-      return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, false, videoDelivery, providerModes);
+      return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, false, videoDelivery, providerModes, opts);
     }
     await this.assertNoPreviousItems(manifest);
     // I1 (5C): un run NUEVO con video real requiere DYNAMIC_REAL_VIDEO_OWNERS (fail closed). Un run
@@ -892,6 +1170,7 @@ export class RunsService {
     // V2.1 RF-b: estimado + gate de presupuesto ANTES de escribir el run.
     const budget = await this.finopsStartGate({
       courseId, ownerId, manifestId: manifest.id, items: manifest.manifest.items, modes: runSpendModes(videoMode, providerModes ?? null),
+      normalApproval: opts.normalApproval,
     });
 
     let jobId: string;
@@ -908,7 +1187,7 @@ export class RunsService {
         const winner = await this.findActiveRunRow(manifest.id);
         if (winner) return this.existingRunOrConflict(winner, manifest, contextHash, videoMode, providerModes);
         throw new ConflictException(
-          `Otra ejecución del Manifest #${manifest.id} se creó y terminó mientras se procesaba esta; reintentá la consulta`,
+          `Otra ejecución del Manifest #${manifest.id} se creó y terminó mientras se procesaba esta; reintenta la consulta`,
         );
       }
       throw err;
@@ -1014,7 +1293,7 @@ export class RunsService {
       `Ya hay una generación en curso para este curso (Blueprint v${other.blueprintNumber ?? '?'}, ` +
       `rulesVersion ${other.rulesVersion ?? '?'}, Manifest #${other.manifestId}). No se puede iniciar otra ` +
       `(Manifest #${manifest.id}, rulesVersion ${manifest.rulesVersion}) mientras esa siga activa: ` +
-      `reanudala o cancelala primero. runId=${other.id}`;
+      `reanudala o cancélala primero. runId=${other.id}`;
     return new ConflictException({
       message,
       code: 'active_run_on_other_manifest',
@@ -1043,7 +1322,7 @@ export class RunsService {
     return new ConflictException({
       message:
         `La ejecución ${runId} fue reemplazada por ${supersedingId} (creada desde ella al cambiar la estructura); ` +
-        `seguí desde la más reciente. runId=${supersedingId}`,
+        `sigue desde la más reciente. runId=${supersedingId}`,
       code: 'superseded_run',
       runId: supersedingId,
     });
@@ -1185,7 +1464,7 @@ export class RunsService {
         if (isAmbiguousYoutubeUpload(preTarget)) {
           const message =
             `${YOUTUBE_UPLOAD_AMBIGUOUS}: la subida a YouTube de "${itemKey}" quedó sin confirmar (puede existir ya un video en el canal). ` +
-            'No se re-sube a ciegas: confirmá el video existente o autorizá una nueva subida con ' +
+            'No se re-sube a ciegas: confirma el video existente o autoriza una nueva subida con ' +
             'POST …/items/:itemKey/youtube-resolution {"action":"confirm_existing","youtubeVideoId":"…"} | {"action":"authorize_reupload"}.';
           throw new ConflictException({ message, code: YOUTUBE_UPLOAD_AMBIGUOUS });
         }
@@ -1824,7 +2103,7 @@ export class RunsService {
       const message =
         `generation_changed: "${itemKey}" ya está en la generación ${currentGeneration} (esperabas la ${a.expectedGeneration}); ` +
         // El filtro global aplana el 409 a su mensaje: currentGeneration viaja también en el texto (como runId=).
-        `actualizá la vista y confirmá de nuevo. currentGeneration=${currentGeneration}`;
+        `actualiza la vista y confirma de nuevo. currentGeneration=${currentGeneration}`;
       block('generation_changed', message, () => new ConflictException({ message, code: 'generation_changed', currentGeneration }));
     }
     const superseding = await this.findSupersedingRun(q, job.id);
@@ -1840,12 +2119,12 @@ export class RunsService {
     if (latest.status !== 'completed') {
       const message =
         `Solo se puede regenerar un item completado; "${itemKey}" (generation ${latest.generation}) está en "${latest.status}"` +
-        (latest.status === 'failed' ? ' — usá retry para reintentarlo' : '');
+        (latest.status === 'failed' ? ' — usa retry para reintentarlo' : '');
       block('item_not_completed', message, () => new ConflictException({ message, code: 'item_not_completed' }));
     }
     const runActive = ACTIVE_RUN_WORKER_STATUSES.includes(String(job.worker_status));
     if (!runActive && job.worker_status !== 'completed' && !isCancelledLike(job)) {
-      const message = `La ejecución ${job.id} terminó en "${job.worker_status}"; reintentá sus items fallidos (retry) antes de regenerar otros`;
+      const message = `La ejecución ${job.id} terminó en "${job.worker_status}"; reintenta sus items fallidos (retry) antes de regenerar otros`;
       block('run_not_regenerable', message, () => new ConflictException({ message, code: 'run_not_regenerable' }));
     }
 
@@ -1875,7 +2154,7 @@ export class RunsService {
       const r = depByKey.get(key);
       if (!r) throw new InternalServerErrorException(`La ejecución ${job.id} no tiene filas para "${key}" (integridad rota)`);
       if (r.status === 'running') {
-        const message = `No se puede regenerar "${itemKey}" mientras "${key}" se está generando; reintentá cuando termine`;
+        const message = `No se puede regenerar "${itemKey}" mientras "${key}" se está generando; reintenta cuando termine`;
         block('dependent_running', message, () => new ConflictException({ message, code: 'dependent_running' }));
       }
     }
@@ -2069,7 +2348,8 @@ export class RunsService {
     actions?: Record<string, string> | null;
     runner?: { query: (sql: string, params?: any[]) => Promise<any> };
     planSha?: string | null;
-  }): Promise<{ evaluation: StartBudgetEvaluation; approval: any | null } | null> {
+    normalApproval?: NormalApprovalRequest;
+  }): Promise<FinopsGate | null> {
     const mode = a.modes;
     if (!this.finopsBudget) {
       const paid = paidRealProviders(estimateItemsForRun(a.items, mode, a.actions ?? null), mode);
@@ -2093,6 +2373,19 @@ export class RunsService {
     }
     if (evaluation.decision === 'BLOCK') throw new BudgetGateRejection(evaluation, BUDGET_BLOCKED, a.planSha ?? null);
     if (evaluation.decision === 'ADMIN_APPROVAL') {
+      if (a.normalApproval) {
+        // Flujo normal: el estimado de ESTE start tiene que ser el que vio el usuario; la aprobación
+        // se escribe en la tx del run (finopsBindRun), nunca se reutiliza otra.
+        const na = a.normalApproval;
+        const t = evaluation.estimate.totals;
+        if (cmpDec(t.expected, na.expected) !== 0 || cmpDec(t.max, na.max) !== 0) {
+          throw new ConflictException({
+            code: ESTIMATE_STALE,
+            message: `${ESTIMATE_STALE}: el costo estimado cambió desde que lo viste (esperado ${na.expected} → ${t.expected}); revisa el estimado nuevo. No se creó nada.`,
+          });
+        }
+        return { evaluation, approval: null, normalApproval: na };
+      }
       const approval = await this.finopsBudget.findUnconsumedApproval(a.courseId, a.manifestId, evaluation.estimate.totals.expected, a.runner);
       if (!approval) throw new BudgetGateRejection(evaluation, BUDGET_APPROVAL_REQUIRED, a.planSha ?? null);
       return { evaluation, approval };
@@ -2119,7 +2412,8 @@ export class RunsService {
     manifestId: number;
     items: readonly RunManifestItem[];
     modes: RunSpendModes;
-  }): Promise<{ evaluation: StartBudgetEvaluation; approval: any | null } | null> {
+    normalApproval?: NormalApprovalRequest;
+  }): Promise<FinopsGate | null> {
     try {
       return await this.finopsEvaluate(a);
     } catch (err) {
@@ -2158,10 +2452,30 @@ export class RunsService {
   /** Dentro de la tx que crea el run: estimado con run_id + autorización del run (consumiendo la aprobación). */
   private async finopsBindRun(
     qr: QueryRunner,
-    gate: { evaluation: StartBudgetEvaluation; approval: any | null } | null,
+    gate: FinopsGate | null,
     a: { runId: string; courseId: number; ownerId: string; manifestId: number; planSha?: string | null },
   ): Promise<void> {
     if (!gate || !this.finopsBudget) return;
+    if (gate.normalApproval) {
+      // Flujo normal: la aprobación nace en ESTA tx (con el run). Lock global del tope mensual y plan
+      // recalculado sobre la tx: si otra aprobación ya se llevó el remanente, o cambió el monto, no se escribe nada.
+      const na = gate.normalApproval;
+      await qr.query(`select pg_advisory_xact_lock(hashtext($1))`, [MONTH_CAP_LOCK]);
+      const np = await this.normalPlan(qr, a.courseId, a.ownerId, gate.evaluation);
+      if (!np.plan.withinPolicy) throw budgetBlockedConflict(np.plan.blockedBy);
+      if (cmpDec(np.plan.amount!, na.amount) !== 0) {
+        throw new ConflictException({
+          code: ESTIMATE_STALE,
+          message: `${ESTIMATE_STALE}: el monto a autorizar cambió (${na.amount} → ${np.plan.amount}) por gasto o aprobaciones nuevas; revisa el estimado nuevo. No se creó nada.`,
+        });
+      }
+      const rec = await this.finopsBudget.recordNormalApproval(qr, {
+        courseId: a.courseId, ownerId: a.ownerId, manifestId: a.manifestId, estimate: gate.evaluation.estimate, amount: na.amount,
+        policyId: gate.evaluation.policyId, approvedBy: na.approvedBy, fingerprint: na.fingerprint,
+      });
+      gate = { ...gate, approval: { id: rec.authorizationId, estimate_id: rec.estimateId, authorized_budget: na.amount, approved_by: na.approvedBy, policy_id: gate.evaluation.policyId } };
+      na.result = { authorizationId: rec.authorizationId, amount: na.amount };
+    }
     if (gate.approval) {
       const [used] = await qr.query(
         `select id from public.cost_budget_authorizations where estimate_id = $1 and run_id is not null limit 1`,
@@ -2169,7 +2483,7 @@ export class RunsService {
       );
       if (used) {
         throw new ConflictException({
-          message: `${BUDGET_APPROVAL_REQUIRED}: la aprobación ${gate.approval.id} ya se usó en otra ejecución; pedí una nueva. No se creó nada.`,
+          message: `${BUDGET_APPROVAL_REQUIRED}: la aprobación ${gate.approval.id} ya se usó en otra ejecución; pide una nueva. No se creó nada.`,
           code: BUDGET_APPROVAL_REQUIRED,
         });
       }

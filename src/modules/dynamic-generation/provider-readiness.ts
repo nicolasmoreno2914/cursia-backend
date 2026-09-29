@@ -101,7 +101,7 @@ export function providerReadinessMissing(input: ProviderReadinessInput, env: Env
 export function providerNotReadyMessage(missing: string[]): string {
   return (
     `${PROVIDER_NOT_READY}: este run v3 usa proveedores reales que no están listos en este entorno ` +
-    `(${missing.join(', ')}). No se creó nada ni hubo gasto. Configurá lo que falta o usá un run mock ` +
+    `(${missing.join(', ')}). No se creó nada ni hubo gasto. Configura lo que falta o usa un run mock ` +
     '(solo donde DYNAMIC_ALLOW_PROVIDER_MOCK=true).'
   );
 }
@@ -119,6 +119,6 @@ export function v3RequiresYoutubeMessage(frozenDelivery: VideoDeliveryStrategy):
   return (
     `${V3_REQUIRES_YOUTUBE_DELIVERY}: los videos de un curso V2.1 (rulesVersion 3) se publican en YouTube Unlisted ` +
     `para armar el video interactivo; este run quedaría con entrega "${frozenDelivery}" y sus preguntas de video ` +
-    'fallarían al final. Configurá DYNAMIC_VIDEO_DELIVERY=youtube. No se creó nada ni hubo gasto.'
+    'fallarían al final. Configura DYNAMIC_VIDEO_DELIVERY=youtube. No se creó nada ni hubo gasto.'
   );
 }

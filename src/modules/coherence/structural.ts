@@ -38,7 +38,7 @@ export function runStructuralRules(bp: BlueprintSnapshotV1): CoherenceFindingDra
             tokenContainment: round4(cont),
           },
           message: `Los capítulos "${a.title}" y "${b.title}" tienen títulos casi duplicados.`,
-          suggestion: 'Diferenciá los títulos o fusioná los capítulos si cubren lo mismo.',
+          suggestion: 'Diferencia los títulos o fusiona los capítulos si cubren lo mismo.',
           suggestedAction: 'review',
         });
       }
@@ -64,7 +64,7 @@ export function runStructuralRules(bp: BlueprintSnapshotV1): CoherenceFindingDra
         chapterIds: [],
         evidence: { moduleId: m.id, uncoveredTokens: uncovered, coverage: round4(coverage) },
         message: `El objetivo del módulo "${m.title}" no está cubierto por ningún capítulo.`,
-        suggestion: 'Agregá o ajustá capítulos que trabajen el objetivo, o reformulá el objetivo del módulo.',
+        suggestion: 'Agrega o ajusta capítulos que trabajen el objetivo, o reformula el objetivo del módulo.',
         suggestedAction: 'review',
       });
     }

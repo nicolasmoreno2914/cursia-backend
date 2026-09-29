@@ -224,8 +224,8 @@ export function isDynamicVideoCompleted(status: string | null | undefined): bool
  */
 export const REAL_VIDEO_NOT_ALLOWED_ITEM_ERROR =
   'real_video_not_allowed: El video real (Videogen, con costo) ya no está habilitado para esta cuenta, ' +
-  'así que no se envió este video (sin costo). Para generarlo, pedí que habiliten el video real y reintentá ' +
-  'esta parte, o regenerá el curso con video "mock".';
+  'así que no se envió este video (sin costo). Para generarlo, pide que habiliten el video real y reintenta ' +
+  'esta parte, o regenera el curso con video "mock".';
 
 /**
  * Release-fix I1: re-chequeo en el MOMENTO del submit (no al boot del worker)
@@ -503,7 +503,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
             item.itemRunId,
             deps.executorId,
             `${YOUTUBE_PREFLIGHT_FAILED}:${light.reason}: ${YOUTUBE_PREFLIGHT_MESSAGES[light.reason]} ` +
-              'No se envió el video a Videogen (sin costo); reintentá esta parte cuando el canal esté conectado.',
+              'No se envió el video a Videogen (sin costo); reintenta esta parte cuando el canal esté conectado.',
             false,
           );
           return;
@@ -841,7 +841,7 @@ function classifyPreUploadError(err: unknown): ReturnType<typeof classifyYoutube
 /** DN-1: mensaje de bloqueo sin tokens ni texto crudo de Google (solo el tipo de fallo). */
 const YOUTUBE_AUTH_BLOCK_DETAIL =
   'YouTube rechazó la autorización del canal (conexión expirada, revocada o sin permiso de subida). ' +
-  'Volvé a conectar tu canal en la sección Cuenta y reintentá la subida: el video ya está generado y no se vuelve a pagar.';
+  'Vuelve a conectar tu canal en la sección Cuenta y reintenta la subida: el video ya está generado y no se vuelve a pagar.';
 const YOUTUBE_QUOTA_BLOCK_DETAIL =
   'YouTube no permite subir más videos por ahora (cuota diaria agotada). Se reintenta solo más tarde; ' +
   'el video ya está generado y no se vuelve a pagar.';
@@ -922,7 +922,7 @@ async function blockYoutubeQuota(deps: DynamicItemWorkerDeps, item: ClaimedItem,
   const maxWait = deps.youtubeQuotaMaxWaitSeconds ?? 86400;
   if (waitedSec >= maxWait) {
     const msg =
-      'YouTube siguió sin permitir subidas durante 24 h (cuota agotada). Reintentá la publicación más tarde: ' +
+      'YouTube siguió sin permitir subidas durante 24 h (cuota agotada). Reintenta la publicación más tarde: ' +
       'el video ya está generado y no se vuelve a pagar.';
     const recorded = await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
       delivery: 'upload_failed',

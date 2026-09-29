@@ -103,6 +103,54 @@ async function pureChecks() {
   const catalog = seedCatalog();
   const estimate = (items, rp) => F.estimateCost({ items, catalog, usageModel: F.usageModelPriorsV1(), retryPolicy: rp || { maxRetries: 1 } });
 
+  await check('puro (flujo normal): planNormalApproval — dentro de la política ⇒ monto = min(max, lo que queda de run/curso/mes); esperado sobre un límite ⇒ bloqueado nombrando el límite; sin política ⇒ bloqueado; límites por proveedor', () => {
+    const est = { totals: { min: '3', expected: '5', max: '13', byProvider: { gamma: { min: '1', expected: '2', max: '4' } }, byItemType: {} } };
+    const pol = (limits) => ({ limits, onExceed: 'ADMIN_APPROVAL', requireHumanApprovalForRealSpend: true });
+    let p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerRun: '10', maxCostPerCourse: '15', monthlyCapStaging: '50' }), courseSpent: '0', monthSpent: '30.6' });
+    eq([p.withinPolicy, dec(p.amount), p.cappedByLimit, p.blockedBy], [true, 10, 'maxCostPerRun', []], 'acotado por maxCostPerRun');
+    eq(dec(p.limits.monthlyCap), 50, 'monthlyCapStaging se lee como límite mensual');
+    p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerRun: '100', maxCostPerCourse: '15', monthlyCap: '50' }), courseSpent: '8', monthSpent: '0' });
+    eq([p.withinPolicy, dec(p.amount), p.cappedByLimit], [true, 7, 'maxCostPerCourse'], 'lo que queda del curso');
+    p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerRun: '100', monthlyCap: '50' }), courseSpent: '0', monthSpent: '46' });
+    eq([p.withinPolicy, p.amount, p.blockedBy.map((b) => b.limit)], [false, null, ['monthlyCap']], 'mes agotado ⇒ bloqueado');
+    p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerRun: '4' }), courseSpent: '0', monthSpent: '0' });
+    eq([p.withinPolicy, p.blockedBy[0].limit, dec(p.blockedBy[0].limitValue)], [false, 'maxCostPerRun', 4], 'esperado > por run');
+    p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerProvider: { gamma: '1' } }), courseSpent: '0', monthSpent: '0' });
+    eq(p.blockedBy.map((b) => [b.limit, b.over]), [['maxCostPerProvider.gamma', 'expected']], 'por proveedor');
+    // Review I1: lo ya gastado en el proveedor cuenta, y el MÁXIMO del proveedor debe entrar (una autorización total no lo acota).
+    p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerProvider: { gamma: '9' } }), courseSpent: '0', monthSpent: '0', providerSpent: { gamma: '6' } });
+    eq(p.blockedBy.map((b) => [b.limit, b.over, dec(b.spent)]), [['maxCostPerProvider.gamma', 'max', 6]], 'gastado + max > límite');
+    p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerProvider: { gamma: '10' } }), courseSpent: '0', monthSpent: '0', providerSpent: { gamma: '6' } });
+    eq(p.withinPolicy, true, 'gastado + max ≤ límite');
+    p = F.planNormalApproval({ estimate: est, policy: pol({ monthlyCap: '50' }), courseSpent: '0', monthSpent: '50' });
+    eq([p.withinPolicy, p.blockedBy[0].limit], [false, 'monthlyCap'], 'mes justo agotado ⇒ bloqueado (nunca monto 0)');
+    const est0 = { totals: { min: '0', expected: '0', max: '1', byProvider: {}, byItemType: {} } };
+    p = F.planNormalApproval({ estimate: est0, policy: pol({ maxCostPerCourse: '5' }), courseSpent: '5', monthSpent: '0' });
+    eq([p.withinPolicy, p.blockedBy[0].limit, dec(p.blockedBy[0].limitValue)], [false, 'maxCostPerCourse', 5], 'remanente 0 ⇒ nombra el límite que lo acotó');
+    p = F.planNormalApproval({ estimate: est, policy: pol({}), courseSpent: '0', monthSpent: '0' });
+    eq([p.withinPolicy, dec(p.amount), p.cappedByLimit], [true, 13, null], 'sin límites ⇒ el max');
+    p = F.planNormalApproval({ estimate: est, policy: null, courseSpent: '0', monthSpent: '0' });
+    eq([p.withinPolicy, p.blockedBy.map((b) => b.limit)], [false, ['no_budget_policy']], 'sin política');
+  });
+
+  await check('puro (flujo normal): huella del estimado cambia con Manifest / totales / gasto / monto; categorías por proveedor; SuperAdmin solo por SUPER_ADMIN_EMAILS', () => {
+    const e = { estimatorVersion: 'e1', usageModelVersion: 'u1', pricingVersions: ['b', 'a'], totals: { min: '1', expected: '2', max: '3' } };
+    const base = { courseId: 1, manifestId: 10, manifestSha: 's', contextHash: 'h', modes: { video: 'mock' }, estimate: e, policyId: 'p', plan: { amount: '3', withinPolicy: true }, courseSpent: '0' };
+    const h = F.estimateFingerprint(base);
+    assert(/^[0-9a-f]{64}$/.test(h), 'sha256 hex');
+    eq(F.estimateFingerprint({ ...base, estimate: { ...e, pricingVersions: ['a', 'b'] } }), h, 'orden de versiones irrelevante');
+    for (const [k, v] of [['manifestId', 11], ['manifestSha', 't'], ['contextHash', 'x'], ['courseSpent', '1'], ['policyId', 'q'], ['plan', { amount: '2', withinPolicy: true }],
+      ['estimate', { ...e, totals: { ...e.totals, expected: '2.5' } }], ['modes', { video: 'real' }]]) {
+      assert(F.estimateFingerprint({ ...base, [k]: v }) !== h, `cambia con ${k}`);
+    }
+    const cats = F.estimateCategories({ anthropic: { min: '1', expected: '1', max: '1' }, gamma: { min: '2', expected: '2', max: '2' }, videogen: { min: '1', expected: '1', max: '1' },
+      youtube: { min: '0', expected: '0', max: '0' }, openai: { min: '0.5', expected: '0.5', max: '0.5' }, other: { min: '0.1', expected: '0.1', max: '0.1' } });
+    eq(Object.fromEntries(Object.entries(cats).map(([k, v]) => [k, dec(v.expected)])), { content: 1, presentations: 2, videos: 1, audio: 0.5, other: 0.1 }, 'categorías');
+    const sa = loadDist('auth/super-admin.js');
+    eq([sa.isSuperAdminEmail('A@x.com', { SUPER_ADMIN_EMAILS: ' a@x.com , b@y.com' }), sa.isSuperAdminEmail('c@x.com', { SUPER_ADMIN_EMAILS: 'a@x.com' }),
+      sa.isSuperAdminEmail('a@x.com', {}), sa.isSuperAdminEmail('', { SUPER_ADMIN_EMAILS: 'a@x.com' })], [true, false, false, false], 'SuperAdmin');
+  });
+
   await check('puro: items del estimador — mock excluye items de worker pagado; real los incluye; acciones del plan respetadas', () => {
     const mock = F.estimateItemsForRun(V3_ITEMS, 'mock');
     eq(mock.map((x) => x.itemKey), ['course_plan:c', 'content:ch1', 'video_interactions:ch1', 'exam:m1'], 'mock');
@@ -344,7 +392,7 @@ const MOCK_CTX = { ...CONTEXT, videoMode: 'mock', providerModes: { presentation:
 const ENV_KEYS = [
   'DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_ALLOWED_OWNERS', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION',
   'DYNAMIC_VIDEO_DELIVERY', 'DYNAMIC_ALLOW_VIDEOGEN_DIRECT', 'VIDEOGEN_API_KEY', 'ALLOW_UNOWNED_COURSES', 'FINOPS_INGEST_TOKEN',
-  'DYNAMIC_PROVIDER_WORKER_ENABLED', 'DYNAMIC_ALLOW_PROVIDER_MOCK',
+  'DYNAMIC_PROVIDER_WORKER_ENABLED', 'DYNAMIC_ALLOW_PROVIDER_MOCK', 'SUPER_ADMIN_EMAILS',
 ];
 
 async function dbChecks() {
@@ -1015,6 +1063,195 @@ async function dbChecks() {
       await rejectsRe(startRunT(Cc.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /budget_blocked/, 'bloqueado', 409);
       // Mock con la misma política: el LLM sobre el límite pide aprobación (nunca BLOCK).
       await rejectsRe(startRunT(Cc.cid, OWNER, 1, MOCK_CTX), /budget_approval_required/, 'LLM sobre el límite', 409);
+    });
+
+    // ════ Flujo NORMAL de aprobación (UI): preview + «Autorizar y generar» ════
+    process.env.SUPER_ADMIN_EMAILS = 'admin@cursia.test';
+    const ADMIN = { id: OWNER, email: 'Admin@Cursia.test' };
+    const NOT_ADMIN = { id: OWNER, email: 'owner@cursia.test' };
+    const NCTX = { ...CONTEXT, videoMode: 'mock' }; // Gamma/TTS reales por default ⇒ requiere aprobación
+    const coursePolicy = (cid, limits, onExceed = 'ADMIN_APPROVAL') => ds.query(
+      `insert into public.cost_budget_policies (scope, scope_id, version, limits, on_exceed) values ('course', $1, 1, $2::jsonb, $3)`,
+      [String(cid), JSON.stringify(limits), onExceed]);
+    const authRows = (cid) => ds.query(`select id, run_id, estimate_id, decision, approved_by, reason, authorized_budget::text as b from public.cost_budget_authorizations where course_id = $1 order by created_at, (run_id is not null), id`, [cid]);
+    const N = await makeCourse('Curso normal');
+    // Tope mensual holgado: el harness tiene runs vivos de checks anteriores con autorizaciones enormes (cuentan como comprometidas).
+    await coursePolicy(N.cid, { maxCostPerRun: '1000', maxCostPerCourse: '1000', monthlyCap: '1000000000' });
+    let pvN = null;
+    await check('DB flujo normal: preview = estimado COMPLETO (totales, familias, tipos), conteos del Manifest, aprobación requerida, canApprove por SUPER_ADMIN_EMAILS; no escribe nada', async () => {
+      const before = (await ds.query(`select count(*)::int n from public.cost_estimates where course_id = $1`, [N.cid]))[0].n;
+      pvN = await runs.previewStart(N.cid, ADMIN, 1, NCTX);
+      eq([pvN.existingRun, pvN.decision, pvN.approval.required, pvN.approval.canApprove, pvN.approval.withinPolicy], [null, 'ADMIN_APPROVAL', true, true, true], 'decisión');
+      assert(dec(pvN.estimate.expected) > 0 && dec(pvN.estimate.max) >= dec(pvN.estimate.expected), 'totales');
+      assert(dec(pvN.estimate.byCategory.presentations.expected) > 0 && dec(pvN.estimate.byCategory.audio.expected) > 0 && dec(pvN.estimate.byCategory.content.expected) > 0, 'familias');
+      eq(dec(pvN.estimate.byCategory.videos.expected), 0, 'videos de vista previa ⇒ 0');
+      eq([pvN.counts.modules, pvN.counts.chapters, pvN.counts.videos, pvN.counts.moduleExams, pvN.counts.finalExam], [1, 2, 2, 1, true], 'conteos');
+      eq(dec(pvN.approval.amount), dec(pvN.estimate.max), 'monto = max (límites holgados)');
+      assert(/^[0-9a-f]{64}$/.test(pvN.estimateHash), 'huella');
+      eq((await runs.previewStart(N.cid, NOT_ADMIN, 1, NCTX)).approval.canApprove, false, 'otro email no aprueba');
+      eq((await ds.query(`select count(*)::int n from public.cost_estimates where course_id = $1`, [N.cid]))[0].n, before, 'sin escrituras');
+      eq((await authRows(N.cid)).length, 0, 'sin aprobaciones');
+    });
+
+    await check('DB flujo normal: sin rol → 403 approval_forbidden; huella vieja → 409 estimate_stale con el estimado nuevo; nada creado', async () => {
+      await rejectsRe(runs.approveAndStart(N.cid, NOT_ADMIN, 1, NCTX, pvN.estimateHash), /approval_forbidden/, 'sin rol', 403);
+      const err = await rejectsRe(runs.approveAndStart(N.cid, ADMIN, 1, NCTX, 'f'.repeat(64)), /estimate_stale/, 'huella vieja', 409);
+      eq(err.getResponse().preview.estimateHash, pvN.estimateHash, 'devuelve el estimado vigente');
+      assert(!('_plan' in err.getResponse().preview) && !('_evaluation' in err.getResponse().preview), 'sin internos');
+      eq((await authRows(N.cid)).length, 0, 'sin aprobaciones');
+      eq((await ds.query(`select count(*)::int n from public.production_jobs where course_id = $1`, [N.cid]))[0].n, 0, 'sin run');
+    });
+
+    let runN = null;
+    await check('DB flujo normal: «Autorizar y generar» → aprobación ADMIN_APPROVED persistida (email del JWT, monto del servidor, huella en reason) + run creado que la consume y la vincula', async () => {
+      const res = await runs.approveAndStart(N.cid, ADMIN, 1, NCTX, pvN.estimateHash);
+      eq([res.created, dec(res.approval.amount)], [true, dec(pvN.approval.amount)], 'creado');
+      runN = res.run.id;
+      const rows = await authRows(N.cid);
+      eq(rows.map((r) => [r.decision, r.run_id === null, r.approved_by]), [['ADMIN_APPROVED', true, 'Admin@Cursia.test'], ['ADMIN_APPROVED', false, 'Admin@Cursia.test']], 'aprobación + vinculación');
+      eq(rows[0].reason, `ui_normal_approval:${pvN.estimateHash}`, 'huella en reason');
+      eq([dec(rows[0].b), dec(rows[1].b)], [dec(pvN.approval.amount), dec(pvN.approval.amount)], 'monto del servidor');
+      eq(rows[1].estimate_id, rows[0].estimate_id, 'estimado aprobado vinculado al run');
+      eq(rows[1].reason, `bound_from:${rows[0].id}`, 'consumida');
+      const [job] = await ds.query(`select course_id, input_payload->>'manifestId' as m from public.production_jobs where id = $1`, [runN]);
+      eq([Number(job.course_id), Number(job.m)], [N.cid, N.manifest.id], 'run del curso y Manifest correctos');
+      eq(await budget.findUnconsumedApproval(N.cid, N.manifest.id, '0'), null, 'nada sin consumir');
+    });
+
+    await check('DB flujo normal: doble clic / reintento → devuelve el MISMO run, sin aprobaciones nuevas; preview con run existente ⇒ existingRun', async () => {
+      const n0 = (await authRows(N.cid)).length;
+      const again = await runs.approveAndStart(N.cid, ADMIN, 1, NCTX, pvN.estimateHash);
+      eq([again.created, again.run.id], [false, runN], 'mismo run');
+      eq((await authRows(N.cid)).length, n0, 'sin aprobaciones nuevas');
+      const pv = await runs.previewStart(N.cid, ADMIN, 1, NCTX);
+      eq([pv.existingRun && pv.existingRun.id, pv.estimate, pv.estimateHash], [runN, null, null], 'existingRun');
+    });
+
+    await check('DB flujo normal: dos clics simultáneos → UN run y UNA aprobación consumida (advisory lock + índice de run activo)', async () => {
+      const Q = await makeCourse('Curso doble clic');
+      await coursePolicy(Q.cid, { maxCostPerRun: '1000' });
+      const pv = await runs.previewStart(Q.cid, ADMIN, 1, NCTX);
+      const rs = await Promise.allSettled([runs.approveAndStart(Q.cid, ADMIN, 1, NCTX, pv.estimateHash), runs.approveAndStart(Q.cid, ADMIN, 1, NCTX, pv.estimateHash)]);
+      const ok = rs.filter((r) => r.status === 'fulfilled').map((r) => r.value.run.id);
+      assert(ok.length >= 1 && new Set(ok).size === 1, `un solo run (${JSON.stringify(rs.map((r) => r.status === 'rejected' ? String(r.reason && r.reason.message) : 'ok'))})`);
+      eq((await ds.query(`select count(*)::int n from public.production_jobs where course_id = $1`, [Q.cid]))[0].n, 1, 'un run');
+      const rows = await authRows(Q.cid);
+      eq(rows.filter((r) => r.run_id === null).length, 1, 'una sola aprobación de UI');
+      eq(await budget.findUnconsumedApproval(Q.cid, Q.manifest.id, '0'), null, 'consumida');
+    });
+
+    await check('DB flujo normal: gasto nuevo del curso tras el preview ⇒ la huella queda vieja (409 estimate_stale); con la huella nueva sí aprueba', async () => {
+      const G = await makeCourse('Curso gasto cambia');
+      await coursePolicy(G.cid, { maxCostPerRun: '1000', maxCostPerCourse: '1000' });
+      const pv = await runs.previewStart(G.cid, ADMIN, 1, NCTX);
+      await ds.query(`insert into public.generation_cost_events (course_id, event_kind, operation, provider, idempotency_key, amount, cost_source, billing_account, billable, recorded_by)
+                      values ($1, 'CHARGE', 'llm.x', 'anthropic', $2, 0.5, 'CALCULATED_FROM_USAGE', 'cursia', true, 't')`, [G.cid, `test-normal-${G.cid}`]);
+      await rejectsRe(runs.approveAndStart(G.cid, ADMIN, 1, NCTX, pv.estimateHash), /estimate_stale/, 'gasto cambió', 409);
+      const pv2 = await runs.previewStart(G.cid, ADMIN, 1, NCTX);
+      assert(pv2.estimateHash !== pv.estimateHash, 'huella nueva');
+      eq((await runs.approveAndStart(G.cid, ADMIN, 1, NCTX, pv2.estimateHash)).created, true, 'con la huella nueva');
+    });
+
+    await check('DB flujo normal: esperado sobre maxCostPerRun (on_exceed ADMIN_APPROVAL) o sobre el mes ⇒ 409 budget_blocked nombrando el límite; nada creado (no sube límites)', async () => {
+      const K = await makeCourse('Curso sobre límite');
+      await coursePolicy(K.cid, { maxCostPerRun: '0.0001' });
+      const pv = await runs.previewStart(K.cid, ADMIN, 1, NCTX);
+      eq([pv.approval.withinPolicy, pv.approval.blockedBy.map((b) => b.limit)], [false, ['maxCostPerRun']], 'preview bloqueado');
+      const err = await rejectsRe(runs.approveAndStart(K.cid, ADMIN, 1, NCTX, pv.estimateHash), /budget_blocked.*maxCostPerRun/, 'bloqueado', 409);
+      eq(err.getResponse().blockedBy[0].limit, 'maxCostPerRun', 'límite nombrado');
+      const M = await makeCourse('Curso mes agotado');
+      await coursePolicy(M.cid, { maxCostPerRun: '1000', monthlyCap: '0.0001' });
+      const pvm = await runs.previewStart(M.cid, ADMIN, 1, NCTX);
+      await rejectsRe(runs.approveAndStart(M.cid, ADMIN, 1, NCTX, pvm.estimateHash), /budget_blocked.*monthlyCap/, 'mes', 409);
+      for (const c of [K.cid, M.cid]) {
+        eq((await authRows(c)).length, 0, 'sin aprobaciones');
+        eq((await ds.query(`select count(*)::int n from public.production_jobs where course_id = $1`, [c]))[0].n, 0, 'sin run');
+      }
+    });
+
+    await check('DB flujo normal: monto acotado por el límite por run (max > límite ≥ esperado) — la aprobación nunca supera la política', async () => {
+      const L = await makeCourse('Curso acotado');
+      const pv0 = await runs.previewStart(L.cid, ADMIN, 1, NCTX); // sin política del curso: la global (si hay) o ninguna
+      assert(pv0.estimate, 'estimado');
+      const mid = ((dec(pv0.estimate.expected) + dec(pv0.estimate.max)) / 2).toFixed(6);
+      await coursePolicy(L.cid, { maxCostPerRun: mid });
+      const pv = await runs.previewStart(L.cid, ADMIN, 1, NCTX);
+      eq([pv.approval.withinPolicy, pv.approval.cappedByLimit, dec(pv.approval.amount)], [true, 'maxCostPerRun', dec(mid)], 'acotado');
+      const res = await runs.approveAndStart(L.cid, ADMIN, 1, NCTX, pv.estimateHash);
+      const [bound] = await ds.query(`select authorized_budget::text as b from public.cost_budget_authorizations where run_id = $1`, [res.run.id]);
+      eq(dec(bound.b), dec(mid), 'presupuesto del run = límite');
+    });
+
+    await check('DB flujo normal: una aprobación de más de 24 h sin usar ya no se reutiliza (vence)', async () => {
+      const V = await makeCourse('Curso aprobación vieja');
+      const [est] = await ds.query(`insert into public.cost_estimates (scope, owner_id, course_id, manifest_id, estimator_version, usage_model_version, currency, pricing_versions, lines, totals, created_by)
+        select scope, owner_id, $1, $2, estimator_version, usage_model_version, currency, pricing_versions, lines, totals, created_by from public.cost_estimates where course_id = $3 limit 1 returning id`,
+        [V.cid, V.manifest.id, N.cid]);
+      await ds.query(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, currency, decision, approved_by, reason, created_at)
+                      values ($1, $2, 1000, 'USD', 'ADMIN_APPROVED', 'x@y', 'old', now() - interval '25 hours')`, [V.cid, est.id]);
+      eq(await budget.findUnconsumedApproval(V.cid, V.manifest.id, '0'), null, 'vencida');
+      await ds.query(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, currency, decision, approved_by, reason, created_at)
+                      values ($1, $2, 1000, 'USD', 'ADMIN_APPROVED', 'x@y', 'fresh', now() - interval '1 hour')`, [V.cid, est.id]);
+      const fresh = await budget.findUnconsumedApproval(V.cid, V.manifest.id, '0');
+      assert(fresh && fresh.approved_by === 'x@y', 'la de 1 h sí está vigente');
+    });
+
+    await check('DB flujo normal (review I2): si el run no se puede crear, la aprobación TAMPOCO queda (misma tx) — otro run activo del curso ⇒ 409 en el preview, sin escrituras', async () => {
+      const O = await makeCourse('Curso con otro run');
+      await coursePolicy(O.cid, { maxCostPerRun: '1000' });
+      const pv = await runs.previewStart(O.cid, ADMIN, 1, NCTX);
+      // Otro Manifest del mismo curso con un run activo (Blueprint 2) aparece DESPUÉS del preview.
+      await ds.query(`insert into public.production_jobs (course_id, owner_id, execution_mode, status, worker_status, input_payload)
+                      values ($1, $2, 'dynamic_generation', 'processing', 'running', $3::jsonb)`, [O.cid, OWNER, JSON.stringify({ manifestId: 999999 })]).catch(() => null);
+      const n0 = (await authRows(O.cid)).length;
+      let err = null;
+      try { await runs.approveAndStart(O.cid, ADMIN, 1, NCTX, pv.estimateHash); } catch (e) { err = e; }
+      assert(err, 'no debe iniciar con otro run activo');
+      eq((await authRows(O.cid)).length, n0, 'sin aprobación colgada');
+    });
+
+    await check('DB flujo normal (review I4): tope mensual compartido — dos cursos aprobados a la vez no se reparten dos veces el remanente (lock global + comprometido de runs vivos)', async () => {
+      const X = await makeCourse('Curso mes X');
+      const Y = await makeCourse('Curso mes Y');
+      const pvx0 = await runs.previewStart(X.cid, ADMIN, 1, NCTX);
+      const e = dec(pvx0.estimate.expected);
+      const m = dec(pvx0.estimate.max);
+      // Tope mensual que alcanza para UNO (monto = max) pero no para dos (el esperado del segundo ya no entra).
+      const month = (await budget.monthCommitted()).total;
+      const cap = (dec(month) + m + e / 2).toFixed(6);
+      for (const c of [X.cid, Y.cid]) await coursePolicy(c, { maxCostPerRun: '1000', monthlyCap: cap });
+      const [px, py] = [await runs.previewStart(X.cid, ADMIN, 1, NCTX), await runs.previewStart(Y.cid, ADMIN, 1, NCTX)];
+      eq([px.approval.withinPolicy, py.approval.withinPolicy], [true, true], 'cada uno por separado entra');
+      const rs = await Promise.allSettled([runs.approveAndStart(X.cid, ADMIN, 1, NCTX, px.estimateHash), runs.approveAndStart(Y.cid, ADMIN, 1, NCTX, py.estimateHash)]);
+      const ok = rs.filter((r) => r.status === 'fulfilled');
+      eq(ok.length, 1, `uno solo (${JSON.stringify(rs.map((r) => r.status === 'rejected' ? String(r.reason && r.reason.message).slice(0, 60) : 'ok'))})`);
+      const loser = rs.find((r) => r.status === 'rejected');
+      assert(/budget_blocked|estimate_stale/.test(String(loser.reason && loser.reason.message)), 'el otro: bloqueado/obsoleto');
+      const committed = await budget.monthCommitted();
+      assert(dec(committed.total) <= dec(cap) + 1e-9, `comprometido ${committed.total} ≤ tope ${cap}`);
+      const losers = [X.cid, Y.cid].filter((c) => !ok.some((r) => Number(r.value.run.course_id ?? 0) === c));
+      const totalUi = (await ds.query(`select count(*)::int n from public.cost_budget_authorizations where course_id = any($1::int[]) and reason like 'ui_normal_approval:%'`, [[X.cid, Y.cid]]))[0].n;
+      eq(totalUi, 1, 'una sola aprobación de UI entre los dos');
+    });
+
+    await check('DB flujo normal (review I3/I5): aprobación de admin vigente (p.ej. calibración) ⇒ el preview no pide aprobar (existing) y el owner sin rol inicia por el camino normal; approve-and-start nunca la reutiliza con otro monto', async () => {
+      const Z = await makeCourse('Curso con aprobación previa');
+      await coursePolicy(Z.cid, { maxCostPerRun: '1000' });
+      const err = await rejectsRe(startRunT(Z.cid, OWNER, 1, NCTX), /budget_approval_required/, 'sin aprobación', 409);
+      await admin.authorize(Z.cid, { estimateId: err.getResponse().estimateId, authorizedBudget: '999' }, ADMIN_USER);
+      const pv = await runs.previewStart(Z.cid, NOT_ADMIN, 1, NCTX);
+      eq([pv.approval.required, dec(pv.approval.existing.amount)], [false, 999], 'existing ⇒ no requiere');
+      const res = await runs.startRun(Z.cid, OWNER, 1, NCTX);
+      eq(res.created, true, 'owner sin rol inicia (consume la aprobación de admin)');
+      eq((await ds.query(`select count(*)::int n from public.cost_budget_authorizations where course_id = $1 and reason like 'ui_normal_approval:%'`, [Z.cid]))[0].n, 0, 'sin aprobación de UI');
+    });
+
+    await check('DB flujo normal (review I5): sin FinOps → preview de un run solo-mock sin estimado (camino normal); con proveedores pagados → 503 finops_unavailable', async () => {
+      const noFin = new RunsService(ds, manifests, {}, ytOk);
+      const W = await makeCourse('Curso sin finops');
+      const pv = await noFin.previewStart(W.cid, ADMIN, 1, MOCK_CTX);
+      eq([pv.existingRun, pv.estimate, pv.approval], [null, null, null], 'mock sin FinOps');
+      await rejectsRe(noFin.previewStart(W.cid, ADMIN, 1, NCTX), /finops_unavailable/, 'pagados sin FinOps', 503);
     });
   } finally {
     if (app) await app.close().catch(() => {});

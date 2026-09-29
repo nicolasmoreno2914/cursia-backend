@@ -19,6 +19,7 @@ import {
 } from '@nestjs/common';
 import { Request } from 'express';
 import { AuthUser } from './auth.types';
+import { superAdminEmails } from './super-admin';
 
 @Injectable()
 export class SuperAdminGuard implements CanActivate {
@@ -30,11 +31,7 @@ export class SuperAdminGuard implements CanActivate {
       throw new ForbiddenException('Acceso denegado');
     }
 
-    const rawEnv = process.env.SUPER_ADMIN_EMAILS || '';
-    const allowedEmails = rawEnv
-      .split(',')
-      .map((e) => e.trim().toLowerCase())
-      .filter(Boolean);
+    const allowedEmails = superAdminEmails();
 
     if (allowedEmails.length === 0) {
       // Sin emails configurados → nadie entra (fail-secure)

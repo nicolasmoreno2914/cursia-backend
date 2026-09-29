@@ -172,7 +172,7 @@ export function runContentRules(input: ContentCoherenceInput): CoherenceFindingD
           chapterIds: [ch.id],
           evidence: { concept: k, chapterId: ch.id },
           message: `"${ch.title}" asume "${label(k)}", que no se introduce en ningún capítulo ni en el contexto previo declarado.`,
-          suggestion: 'Declaralo como conocimiento previo del curso o agregá su introducción en un capítulo anterior.',
+          suggestion: 'Decláralo como conocimiento previo del curso o agregá su introducción en un capítulo anterior.',
           suggestedAction: 'review',
         });
       }
@@ -211,7 +211,7 @@ export function runContentRules(input: ContentCoherenceInput): CoherenceFindingD
         chapterIds: [ch.id],
         evidence: { chapterId: ch.id, uncoveredTokens: uncovered, coverage: round4(coverage) },
         message: `Los conceptos que introduce "${ch.title}" cubren poco su objetivo.`,
-        suggestion: 'Revisá si el capítulo cumple su objetivo; si no, regeneralo o ajustá el objetivo.',
+        suggestion: 'Revisa si el capítulo cumple su objetivo; si no, regenéralo o ajusta el objetivo.',
         suggestedAction: 'regenerate_chapter',
       });
     }
@@ -235,7 +235,7 @@ export function runContentRules(input: ContentCoherenceInput): CoherenceFindingD
           chapterIds: [a.id, b.id],
           evidence: { chapterIds: [a.id, b.id], sharedKeyTerms: shared, jaccard: round4(jac) },
           message: `"${a.title}" y "${b.title}" comparten la mayoría de sus términos clave; puede haber explicaciones repetidas.`,
-          suggestion: 'Revisá si ambos capítulos explican lo mismo y diferenciá sus enfoques.',
+          suggestion: 'Revisa si ambos capítulos explican lo mismo y diferenciá sus enfoques.',
           suggestedAction: 'review',
         });
       }
@@ -264,7 +264,7 @@ export function runContentRules(input: ContentCoherenceInput): CoherenceFindingD
         chapterIds: [ch.id],
         evidence: { chapterId: ch.id, planned: plannedKeys, real: realKeys, matched, overlap: round4(overlap) },
         message: `"${ch.title}" se desvió del plan: introduce conceptos distintos a los planeados.`,
-        suggestion: 'Revisá el capítulo contra el plan del curso; regeneralo si el desvío afecta a otros capítulos.',
+        suggestion: 'Revisa el capítulo contra el plan del curso; regenéralo si el desvío afecta a otros capítulos.',
         suggestedAction: 'review',
       });
     }

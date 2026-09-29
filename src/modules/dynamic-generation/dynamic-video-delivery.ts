@@ -431,11 +431,11 @@ export function hasYoutubeUploadScope(scopes: string | null | undefined): boolea
 
 /** Mensajes legibles (español, sin tokens ni errores crudos de Google) por reason. */
 export const YOUTUBE_PREFLIGHT_MESSAGES: Record<YoutubePreflightReason, string> = {
-  no_connection: 'No hay un canal de YouTube conectado a esta cuenta. Conectá tu canal en la sección Cuenta.',
-  reauth_required: 'La conexión con YouTube expiró o fue revocada. Volvé a conectar tu canal en la sección Cuenta.',
-  token_refresh_failed: 'No se pudo renovar el acceso a YouTube. Volvé a conectar tu canal en la sección Cuenta.',
-  channel_unresolved: 'No se pudo verificar tu canal de YouTube. Revisá que la cuenta de Google tenga un canal y reintentá.',
-  missing_upload_scope: 'La conexión con YouTube no tiene permiso para subir videos. Volvé a conectar tu canal aceptando el permiso de subida.',
+  no_connection: 'No hay un canal de YouTube conectado a esta cuenta. Conecta tu canal en la sección Cuenta.',
+  reauth_required: 'La conexión con YouTube expiró o fue revocada. Vuelve a conectar tu canal en la sección Cuenta.',
+  token_refresh_failed: 'No se pudo renovar el acceso a YouTube. Vuelve a conectar tu canal en la sección Cuenta.',
+  channel_unresolved: 'No se pudo verificar tu canal de YouTube. Revisa que la cuenta de Google tenga un canal y reintenta.',
+  missing_upload_scope: 'La conexión con YouTube no tiene permiso para subir videos. Vuelve a conectar tu canal aceptando el permiso de subida.',
 };
 
 /** Mensaje del 409 de un run bloqueado por el preflight: `youtube_preflight_failed:<reason>: <texto>`. */
@@ -603,7 +603,7 @@ export const YOUTUBE_VIDEO_VERIFY_MESSAGES: Record<YoutubeVideoVerifyReason, str
   video_not_owned: 'Ese video no pertenece al canal de YouTube conectado a esta cuenta.',
   video_not_unlisted: 'Ese video no es "No listado" (Unlisted); los videos del curso deben ser No listados.',
   video_upload_not_ok: 'YouTube no terminó de procesar ese video (subida rechazada, fallida o eliminada).',
-  video_lookup_failed: 'No se pudo consultar YouTube en este momento; reintentá en unos minutos.',
+  video_lookup_failed: 'No se pudo consultar YouTube en este momento; reintenta en unos minutos.',
 };
 
 const UPLOAD_NOT_OK = new Set(['rejected', 'failed', 'deleted']);

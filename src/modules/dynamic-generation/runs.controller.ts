@@ -14,7 +14,7 @@ import {
   ValidationPipe,
 } from '@nestjs/common';
 import type { Response } from 'express';
-import { RunsService, YoutubeResolutionAction } from './runs.service';
+import { RunsService, YoutubeResolutionAction, publicPreview } from './runs.service';
 import { CourseContextDto } from './dto/course-context.dto';
 import { RetryItemDto } from './dto/executor.dto';
 import { parseRegenerateItemBody } from './dto/regenerate-item.dto';
@@ -93,6 +93,44 @@ export class RunsController {
     @CurrentUser() user: AuthUser,
   ) {
     return this.runs.estimateRun(courseId, user.id, number);
+  }
+
+  // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/estimate-preview
+  // Flujo normal: estimado COMPLETO (totales, por familia/proveedor/tipo),
+  // conteos, decisión de presupuesto y si ESTE usuario puede aprobar. Body =
+  // CourseContext (el mismo que POST …/runs). Solo lectura: no crea nada.
+  @Post('estimate-preview')
+  @HttpCode(HttpStatus.OK)
+  async estimatePreview(
+    @Param('courseId', ParseIntPipe) courseId: number,
+    @Param('number', ParseIntPipe) number: number,
+    @Body() body: Record<string, unknown>,
+    @CurrentUser() user: AuthUser,
+  ) {
+    const dto: CourseContextDto = await START_BODY_PIPE.transform(body, { type: 'body', metatype: CourseContextDto });
+    return publicPreview(await this.runs.previewStart(courseId, { id: user.id, email: user.email }, number, dto));
+  }
+
+  // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/approve-and-start
+  // «Autorizar y generar»: body = CourseContext + estimateHash (la huella del
+  // estimado que vio el usuario). Rol, monto y vigencia se deciden en el
+  // servidor; 201 si se creó el run, 200 si ya existía.
+  @Post('approve-and-start')
+  async approveAndStart(
+    @Param('courseId', ParseIntPipe) courseId: number,
+    @Param('number', ParseIntPipe) number: number,
+    @Body() body: Record<string, unknown>,
+    @CurrentUser() user: AuthUser,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const { estimateHash, ...rest } = (body && typeof body === 'object' && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
+    if (typeof estimateHash !== 'string' || !/^[0-9a-f]{64}$/.test(estimateHash)) {
+      throw new BadRequestException('estimateHash es obligatorio (la huella del estimado que se mostró)');
+    }
+    const dto: CourseContextDto = await START_BODY_PIPE.transform(rest, { type: 'body', metatype: CourseContextDto });
+    const result = await this.runs.approveAndStart(courseId, { id: user.id, email: user.email }, number, dto, estimateHash);
+    res.status(result.created ? 201 : 200);
+    return result;
   }
 
   // GET /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId
