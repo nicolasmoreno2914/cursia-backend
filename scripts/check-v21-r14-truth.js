@@ -22,6 +22,7 @@ const VB = loadDist('package/v3/verified-bibliography.js');
 const LB = loadDist('package/v3/libro-v3.js');
 const TE = loadDist('modules/theme-engine/index.js');
 const AS = loadDist('workers/provider-real/audio-scripts.js');
+const RP = loadDist('workers/provider-real/real-providers.js');
 
 let passed = 0;
 let failed = 0;
@@ -129,6 +130,14 @@ const REAL = {
       assert.ok(/multiplicadores/.test(p.system) && /triplica/.test(p.system), `${name}: multiplicadores`);
       assert.ok(/No inventes ni exageres/.test(p.system), `${name}: veracidad`);
     }
+  });
+
+  await check('Gamma (R14-12): las instrucciones prohíben rotular casos ilustrativos como reales, agregarles resultados y citar a personas', () => {
+    const b = RP.gammaGenerationBody({ chapterTitle: 'T', contentMarkdown: 'x', themeId: 't' });
+    const ins = String(b.additionalInstructions);
+    assert.ok(/caso real/.test(ins) && /ejemplo real/.test(ins), 'rótulos');
+    assert.ok(/ilustrativ/.test(ins) && /resultados/.test(ins), 'casos ilustrativos sin resultados agregados');
+    assert.ok(/atribu/.test(ins), 'sin frases atribuidas a autores');
   });
 
   console.log(`\n${failed === 0 ? 'Todos los checks de R14 (veracidad) pasaron' : failed + ' check(s) fallaron'} (${passed} ✅, ${failed} ❌).`);

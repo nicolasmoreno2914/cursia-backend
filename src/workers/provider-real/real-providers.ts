@@ -278,7 +278,11 @@ export function gammaGenerationBody(input: { chapterTitle: string; contentMarkdo
       'La diapositiva 1 es la portada del capítulo y debe mostrar su título. ' +
       'El resto desarrolla el contenido en bloques temáticos coherentes, en español latinoamericano con tuteo (tú), nunca voseo. ' +
       // R14: con textMode 'generate' Gamma completa el texto; no debe inventar cifras ni fuentes.
-      'No agregues cifras, porcentajes, estadísticas, estudios, encuestas, instituciones ni citas que no estén literalmente en el texto; si el texto no trae un dato, no lo inventes.',
+      'No agregues cifras, porcentajes, estadísticas, estudios, encuestas, instituciones ni citas que no estén literalmente en el texto; si el texto no trae un dato, no lo inventes. ' +
+      // R14-12: Gamma rotuló casos ilustrativos como "Caso real"/"Ejemplo real" y convirtió una mención de
+      // Hattie en una cita atribuida ("… — John Hattie").
+      'Los casos, personajes y ejemplos del texto son ilustrativos: nunca los rotules como «caso real», «ejemplo real» o «historia real» ni les agregues resultados que el texto no afirma. ' +
+      'No pongas frases entre comillas atribuidas a autores o personas reales.',
     cardOptions: {
       dimensions: '16x9',
       headerFooter: { bottomRight: { type: 'image', source: 'themeLogo', size: 'sm' } },
