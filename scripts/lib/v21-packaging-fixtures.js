@@ -69,7 +69,7 @@ function packagingInput(distRoot, o = {}) {
   const finalExam = o.finalExam !== undefined ? o.finalExam : true;
   // F1: `o.modules` (forma de SF.buildCourse) permite cursos a medida (sin exámenes, sin práctica…).
   const { snapshot, manifest } = o.modules
-    ? SF.buildCourse(distRoot, { engine, finalExam, courseId: o.courseId || 601, modules: o.modules })
+    ? SF.buildCourse(distRoot, { engine, finalExam, courseId: o.courseId || 601, modules: o.modules, ...(o.chapterTitles ? { chapterTitles: o.chapterTitles } : {}) })
     : SF.course2(distRoot, { engine, finalExam, courseId: o.courseId || 601 });
   const chapters = manifest.modules.flatMap((m) => m.chapters);
   const titleOf = new Map();

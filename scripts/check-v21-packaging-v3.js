@@ -290,6 +290,24 @@ const MATRIX = [
   });
 
   // ── Determinismo ──────────────────────────────────────────────────────────
+  await check('título de capítulo > 200 caracteres (InteractiveVideo + actividad H5P): el paquete se genera, el título H5P queda ≤ 200 sin cortar palabras y sigue identificable', async () => {
+    const H = loadDist('package/h5p/index.js');
+    const LONG = 'Comercialización y distribución de productos agrícolas Canales de comercialización, análisis de costos y precios, identificación de mercados locales y regionales, logística de transporte y almacenamiento poscosecha para pequeños productores';
+    assert(LONG.length > 200 && LONG.length <= 255, `fixture ${LONG.length}`);
+    const t = H.h5pTitle(LONG);
+    assert(t.length <= 200 && t.endsWith('…'), `h5pTitle: ${t.length}`);
+    assert(t.startsWith('Comercialización y distribución de productos agrícolas'), 'identificable');
+    const body = t.slice(0, -1);
+    assert(LONG.startsWith(body) && [' ', ','].includes(LONG[body.length]), `no corta palabras: "${body.slice(-20)}|${LONG.slice(body.length, body.length + 5)}"`);
+    eq(H.h5pTitle('  Título   corto  '), 'Título corto', 'corto: solo normaliza espacios');
+    eq(H.h5pTitle('x'.repeat(250)).length <= 200, true, 'sin espacios: corta igual');
+    const { r } = await build({ engine: 'h5p', finalExam: true, courseId: 671, chapterTitles: [LONG],
+      modules: [{ examEnabled: true, chapters: [{ video: true, activity: true }] }] });
+    assert(r && r.mbz && r.mbz.length > 0, 'MBZ generado');
+    const v = await validate(r);
+    assert(v.ok, `validador: ${JSON.stringify(v.issues.slice(0, 5))}`);
+  });
+
   await check('determinismo: mismos insumos + reloj fijo → mismos bytes (dos veces y en otro TZ)', async () => {
     const a = (await build(MATRIX[0])).r.mbz;
     const b = (await build(MATRIX[0])).r.mbz;
