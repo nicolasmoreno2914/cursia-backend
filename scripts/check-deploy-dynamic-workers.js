@@ -493,7 +493,7 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     }
   });
 
-  await check('(a) deploy-staging.yml [0c]: FinOps token por stdin (nunca impreso), worker de proveedores en false, idempotente, solo .env de staging', () => {
+  await check('(a) deploy-staging.yml [0c]: FinOps token por stdin (nunca impreso), worker de proveedores en true, idempotente, solo .env de staging', () => {
     const script = remoteScriptOf(pm2StepOf(stagingText, 'deploy-staging.yml').text);
     const lines = script.split('\n');
     const fnStart = lines.findIndex((l) => l.startsWith('_Q_CR='));
