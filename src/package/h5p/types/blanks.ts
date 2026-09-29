@@ -70,7 +70,9 @@ export function buildBlanks(input: BlanksInput): H5pBuiltContent {
       separateLines: false,
       confirmCheckDialog: false,
       confirmRetryDialog: false,
-      acceptSpellingErrors: false,
+      // R14-13: práctica calificada (aprueba con 70) donde el estudiante TIPEA la respuesta: una errata
+      // menor no debe contarse como error conceptual.
+      acceptSpellingErrors: true,
     },
   });
   return { mainLibrary: 'H5P.Blanks', title: input.title.trim(), content, subContentIds: [], maxScore: total };

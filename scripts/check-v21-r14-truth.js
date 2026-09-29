@@ -23,6 +23,7 @@ const LB = loadDist('package/v3/libro-v3.js');
 const TE = loadDist('modules/theme-engine/index.js');
 const AS = loadDist('workers/provider-real/audio-scripts.js');
 const RP = loadDist('workers/provider-real/real-providers.js');
+const BL = loadDist('package/h5p/types/blanks.js');
 
 let passed = 0;
 let failed = 0;
@@ -138,6 +139,23 @@ const REAL = {
     assert.ok(/caso real/.test(ins) && /ejemplo real/.test(ins), 'rótulos');
     assert.ok(/ilustrativ/.test(ins) && /resultados/.test(ins), 'casos ilustrativos sin resultados agregados');
     assert.ok(/atribu/.test(ins), 'sin frases atribuidas a autores');
+  });
+
+  await check('audiolibro (R14-13): narración y continuación prohíben anunciar apartados que no se narran y mencionar "el extracto"', () => {
+    const co = AS.chapterNarrationPrompt({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Colombia', contentMarkdown: 'x' });
+    const cont = AS.chapterContinuationPrompt('texto', 'T', 100, 'Colombia');
+    for (const [n, p] of [['narración', co], ['continuación', cont]]) assert.ok(/siguiente apartado/.test(p.system) && /extracto/.test(p.system) && /idea completa/.test(p.system), n);
+  });
+
+  await check('H5P Blanks (R14-13): práctica calificada tolera errores menores de ortografía (el estudiante tipea)', () => {
+    const b = BL.buildBlanks({ itemKey: 'activity:c1', title: 'T', text: 'Completa.', questions: ['La *brújula* orienta.', 'El *prompt* instruye.', 'La *rúbrica* guía.', 'El *sesgo* distorsiona.'] });
+    assert.strictEqual(b.content.behaviour.acceptSpellingErrors, true);
+    assert.strictEqual(b.content.behaviour.caseSensitive, false);
+  });
+
+  await check('Gamma (R14-13): no afirmar capacidades permanentes de la IA ni siglas de leyes de otro país', () => {
+    const ins = String(RP.gammaGenerationBody({ chapterTitle: 'T', contentMarkdown: 'x', themeId: 't' }).additionalInstructions);
+    assert.ok(/depende de la herramienta/.test(ins) && /LOPD/.test(ins), ins);
   });
 
   console.log(`\n${failed === 0 ? 'Todos los checks de R14 (veracidad) pasaron' : failed + ' check(s) fallaron'} (${passed} ✅, ${failed} ❌).`);

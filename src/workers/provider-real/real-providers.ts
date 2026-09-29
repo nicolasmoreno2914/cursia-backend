@@ -282,7 +282,10 @@ export function gammaGenerationBody(input: { chapterTitle: string; contentMarkdo
       // R14-12: Gamma rotuló casos ilustrativos como "Caso real"/"Ejemplo real" y convirtió una mención de
       // Hattie en una cita atribuida ("… — John Hattie").
       'Los casos, personajes y ejemplos del texto son ilustrativos: nunca los rotules como «caso real», «ejemplo real» o «historia real» ni les agregues resultados que el texto no afirma. ' +
-      'No pongas frases entre comillas atribuidas a autores o personas reales.',
+      'No pongas frases entre comillas atribuidas a autores o personas reales. ' +
+      // R14-13: afirmaciones caducas y leyes de otro país (LOPD es España; en Colombia, Ley 1581 de 2012).
+      'No afirmes capacidades ni limitaciones permanentes de las herramientas de IA (acceso a internet, memoria): depende de la herramienta. ' +
+      'Nombra las leyes como en el texto y nunca con siglas de leyes de otros países (p. ej., LOPD).',
     cardOptions: {
       dimensions: '16x9',
       headerFooter: { bottomRight: { type: 'image', source: 'themeLogo', size: 'sm' } },
