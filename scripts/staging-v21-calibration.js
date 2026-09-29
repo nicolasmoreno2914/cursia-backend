@@ -313,7 +313,7 @@ async function main() {
     process.exit(1);
   }
   const [action, courseArg] = process.argv.slice(2);
-  if (!['policy', 'authorize', 'report', 'reconcile_charged_dry', 'reconcile_charged', 'worker', 'titles_dry', 'titles_apply'].includes(action)) {
+  if (!['policy', 'authorize', 'report', 'reconcile_charged_dry', 'reconcile_charged', 'worker', 'titles_dry', 'titles_apply', 'failures_report'].includes(action)) {
     console.error('uso: staging-v21-calibration.js <policy|authorize|report|reconcile_charged_dry|reconcile_charged> [courseId] | worker <on|off> | <titles_dry|titles_apply> [courseId]');
     process.exit(1);
   }
@@ -322,6 +322,18 @@ async function main() {
     return;
   }
   let courseId = null;
+  if (action === 'failures_report') {
+    // Product Hardening: reporte de SOLO LECTURA de fallos de generación (curso opcional; últimos 30 días).
+    if (courseArg && !/^[0-9]{1,9}$/.test(String(courseArg))) { console.error('❌ courseId inválido (entero)'); process.exit(1); }
+    const FR = require('./lib/failures-report');
+    const c = await connect(env);
+    try {
+      FR.printReport(await FR.failuresReport(c, { courseId: courseArg ? Number(courseArg) : null, days: 30 }));
+    } finally {
+      await c.end().catch(() => {});
+    }
+    return;
+  }
   if (action === 'titles_dry' || action === 'titles_apply') {
     // Title Normalization: curso opcional (sin curso = todos los cursos dinámicos).
     if (courseArg && !/^[0-9]{1,9}$/.test(String(courseArg))) {
