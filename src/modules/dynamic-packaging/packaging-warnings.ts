@@ -26,7 +26,7 @@ export function staleArtifactWarnings(byItem: Map<string, ResolvedArtifact[]>): 
         type: a.type,
         message:
           `El artifact ${a.type} de ${a.itemKey} quedó desactualizado por un cambio de estructura y se empaquetó igual ` +
-          '(no se regenera automáticamente: revisalo o pedí regenerarlo).',
+          '(no se regenera automáticamente: revísalo o pide regenerarlo).',
       });
     }
   }

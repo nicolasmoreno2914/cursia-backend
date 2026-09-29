@@ -92,7 +92,7 @@ export async function assertAssessmentProfileResolvableForRun(
   throw new ConflictException({
     message:
       `${ASSESSMENT_PROFILE_INVALID}: ${where} no se puede aplicar a este curso (${reason}). ` +
-      'Corregilo en "Diseño y evaluación" antes de generar; no se gastó nada.',
+      'Corrígelo en "Diseño y evaluación" antes de generar; no se gastó nada.',
     code: ASSESSMENT_PROFILE_INVALID,
     profileVersion: loaded.version,
     reason,

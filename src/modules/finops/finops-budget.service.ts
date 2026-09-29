@@ -18,6 +18,10 @@ import {
   paidProviderOfItemType,
   paidRealProviders,
 } from './run-budget';
+import { APPROVAL_TTL_HOURS, NORMAL_APPROVAL_REASON_PREFIX } from './normal-approval';
+
+/** Advisory lock global (por transacción) que serializa las aprobaciones del flujo normal frente al tope mensual. */
+export const MONTH_CAP_LOCK = 'finops-normal-approval-month-cap';
 
 type Runner = { query: (sql: string, params?: any[]) => Promise<any> };
 
@@ -151,8 +155,71 @@ export class FinopsBudgetService {
   }
 
   /**
+   * Comprometido del mes calendario en curso (todos los cursos) para el
+   * límite mensual del flujo normal de aprobación:
+   *   gasto liquidado del mes (sin la clave del usuario, igual que spentSoFar)
+   * + presupuesto todavía NO gastado de runs vivos (última autorización de cada
+   *   run no terminado, menos lo que ese run ya gastó; nunca negativo).
+   * Así dos aprobaciones (de cursos distintos, o con un run anterior aún en
+   * vuelo) no pueden repartirse dos veces el mismo remanente del mes. El caller
+   * serializa las aprobaciones con MONTH_CAP_LOCK.
+   */
+  async monthCommitted(runner: Runner = this.dataSource): Promise<{ spent: string; outstanding: string; total: string }> {
+    const [s] = await runner.query(
+      `select coalesce(sum(amount),0)::text as total from public.generation_cost_events
+        where billing_account <> 'user_key' and created_at >= date_trunc('month', now())`,
+    );
+    const [o] = await runner.query(
+      `select coalesce(sum(greatest(a.authorized_budget - coalesce(sp.spent, 0), 0)),0)::text as total
+         from (select distinct on (run_id) run_id, authorized_budget from public.cost_budget_authorizations
+                where run_id is not null and decision in ('ADMIN_APPROVED','AUTO_WITHIN_POLICY')
+                order by run_id, created_at desc, id desc) a
+         join public.production_jobs j on j.id = a.run_id
+         left join (select run_id, sum(amount) as spent from public.generation_cost_events
+                     where run_id is not null and billing_account <> 'user_key' group by run_id) sp on sp.run_id = a.run_id
+        where coalesce(j.worker_status, '') not in ('completed', 'failed', 'cancelled', 'cancelling')
+          and coalesce(j.status, '') not in ('cancelled', 'cancelling')`,
+    );
+    const spent = normalizeDecimal(s?.total ?? 0);
+    const outstanding = normalizeDecimal(o?.total ?? 0);
+    return { spent, outstanding, total: addDec(spent, outstanding) };
+  }
+
+  /**
+   * Flujo normal (UI): guarda el estimado que vio el usuario y UNA aprobación
+   * ADMIN_APPROVED por `amount` (ya validado contra la política por el caller),
+   * sin run todavía — el run que se crea a continuación la consume (bindRun).
+   * Debe correr dentro de la tx del caller, con su advisory lock por curso.
+   */
+  async recordNormalApproval(runner: Runner, a: {
+    courseId: number;
+    ownerId: string;
+    manifestId: number;
+    estimate: EstimateResult;
+    amount: DecimalLike;
+    policyId: string | null;
+    approvedBy: string;
+    fingerprint: string;
+  }): Promise<{ estimateId: string; authorizationId: string }> {
+    if (typeof a.approvedBy !== 'string' || !a.approvedBy.trim()) throw new FinopsError('INVALID_INPUT', 'approvedBy es obligatorio');
+    const amount = normalizeDecimal(a.amount, 'amount');
+    if (cmpDec(amount, a.estimate.totals.expected) < 0) {
+      throw new FinopsError('INVALID_INPUT', `el monto aprobado (${amount}) no cubre el esperado (${a.estimate.totals.expected})`);
+    }
+    const est = await this.recordEstimate({
+      scope: 'run', ownerId: a.ownerId, courseId: a.courseId, manifestId: a.manifestId, runId: null, estimate: a.estimate,
+    }, runner);
+    const auth = await this.ledger.authorize({
+      runId: null, courseId: a.courseId, estimateId: est.id, authorizedBudget: amount, policyId: a.policyId,
+      decision: 'ADMIN_APPROVED', approvedBy: a.approvedBy.trim(), reason: `${NORMAL_APPROVAL_REASON_PREFIX}:${a.fingerprint}`,
+    }, runner);
+    return { estimateId: est.id, authorizationId: auth.id };
+  }
+
+  /**
    * Aprobación ADMIN_APPROVED de este curso, para un estimado del MISMO
    * Manifest, todavía no vinculada a ningún run y que cubre `minBudget`.
+   * Vence a las APPROVAL_TTL_HOURS: una aprobación vieja no se reutiliza.
    */
   async findUnconsumedApproval(courseId: number, manifestId: number, minBudget: DecimalLike, runner: Runner = this.dataSource): Promise<any | null> {
     const [row] = await runner.query(
@@ -161,6 +228,7 @@ export class FinopsBudgetService {
          join public.cost_estimates e on e.id = a.estimate_id
         where a.course_id = $1 and a.decision = 'ADMIN_APPROVED' and a.run_id is null and e.manifest_id = $2
           and a.authorized_budget >= $3::numeric
+          and a.created_at > now() - make_interval(hours => ${APPROVAL_TTL_HOURS})
           and not exists (select 1 from public.cost_budget_authorizations b
                            where b.estimate_id = a.estimate_id and b.run_id is not null)
         order by a.created_at desc, a.id desc

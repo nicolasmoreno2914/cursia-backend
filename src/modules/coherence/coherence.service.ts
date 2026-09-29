@@ -162,7 +162,7 @@ export class CoherenceService {
         order by created_at desc, id desc limit 1`,
       [COHERENCE_REPORT_ARTIFACT_TYPE, job.id, ownerId],
     );
-    if (!row) throw new NotFoundException(`La ejecución ${runId} todavía no tiene reporte de coherencia (calculalo con POST)`);
+    if (!row) throw new NotFoundException(`La ejecución ${runId} todavía no tiene reporte de coherencia (calcúlalo con POST)`);
     const report = await this.readReport(row.id, ownerId, runId);
     if (report.reportSha256 !== row.metadata?.reportSha256) {
       throw new InternalServerErrorException(`Reporte de coherencia ${row.id}: el hash guardado no coincide con su metadata (integridad rota)`);
@@ -495,7 +495,7 @@ export class CoherenceService {
         if (n >= limit) {
           throw new HttpException(
             `Demasiados reportes de coherencia LLM para la ejecución ${job.id} (${n} en la última hora, tope ${limit}); ` +
-              'probá más tarde.',
+              'prueba más tarde.',
             HttpStatus.TOO_MANY_REQUESTS,
           );
         }

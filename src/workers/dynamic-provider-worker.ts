@@ -74,7 +74,7 @@ export class ProviderNotWiredError extends Error {
     super(
       `${PROVIDER_NOT_WIRED_V21}: el item ${itemKey} (${itemType}) necesita el proveedor real ` +
         `${providerOfType(itemType) === 'gamma' ? 'Gamma' : 'TTS'}, que todavía no está cableado en V2.1 ` +
-        '(bloques R9/R10). No se generó nada ni hubo gasto. Usá un run mock o esperá ese bloque.',
+        '(bloques R9/R10). No se generó nada ni hubo gasto. Usa un run mock o espera ese bloque.',
     );
     this.name = 'ProviderNotWiredError';
   }
@@ -183,7 +183,7 @@ export async function processProviderItem(deps: ProviderWorkerDeps, item: Claime
   if (head.mode === null) {
     const msg =
       `${PROVIDER_MODE_UNSET}: el run ${item.runId} no tiene providerModes congelados; el item ${item.itemKey} ` +
-      '(Gamma/TTS) no se ejecuta con un modo supuesto. Iniciá un run nuevo.';
+      '(Gamma/TTS) no se ejecuta con un modo supuesto. Inicia un run nuevo.';
     await deps.scheduler.failItem(item.itemRunId, deps.executorId, msg, false);
     throw new Error(msg);
   }

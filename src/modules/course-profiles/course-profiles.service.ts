@@ -181,7 +181,7 @@ export class CourseProfilesService {
         await qr.rollbackTransaction();
         throw new ConflictException(
           `El perfil "${kind}" del curso #${courseId} cambió: expectedVersion=${expectedVersion}, actual=${currentVersion}. ` +
-            'Volvé a leerlo (GET) antes de guardar.',
+            'Vuelve a leerlo (GET) antes de guardar.',
         );
       }
       if (latest && latest.sha256 === sha) {
@@ -200,7 +200,7 @@ export class CourseProfilesService {
     } catch (err) {
       if (qr.isTransactionActive) await qr.rollbackTransaction();
       if (isVersionConflict(err)) {
-        throw new ConflictException('Otro guardado del perfil en curso, volvé a leerlo y reintentá');
+        throw new ConflictException('Otro guardado del perfil en curso, vuelve a leerlo y reintenta');
       }
       throw err;
     } finally {

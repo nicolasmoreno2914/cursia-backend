@@ -167,7 +167,7 @@ export class CourseBlueprintsService {
         throw new ConflictException(
           `La estructura del curso #${courseId} cambió desde que se leyó: ` +
             `expectedCounter=${expectedCounter}, actual=${course.structure_version_counter}. ` +
-            'Volvé a leer la estructura (GET) antes de reintentar el lock.',
+            'Vuelve a leer la estructura (GET) antes de reintentar el lock.',
         );
       }
 
@@ -236,7 +236,7 @@ export class CourseBlueprintsService {
     } catch (err) {
       if (qr.isTransactionActive) await qr.rollbackTransaction();
       if (isBlueprintNumberConflict(err)) {
-        throw new ConflictException({ message: 'Otro lock en curso, reintentá' });
+        throw new ConflictException({ message: 'Otro lock en curso, reintenta' });
       }
       throw err;
     } finally {
@@ -295,7 +295,7 @@ export class CourseBlueprintsService {
         throw new ConflictException(
           `La estructura del curso #${courseId} cambió desde que se leyó: ` +
             `expectedCounter=${expectedCounter}, actual=${course.structure_version_counter}. ` +
-            'Volvé a leer la estructura (GET) antes de reintentar el lock.',
+            'Vuelve a leer la estructura (GET) antes de reintentar el lock.',
         );
       }
 
@@ -358,7 +358,7 @@ export class CourseBlueprintsService {
     } catch (err) {
       if (qr.isTransactionActive) await qr.rollbackTransaction();
       if (isBlueprintNumberConflict(err)) {
-        throw new ConflictException({ message: 'Otro lock en curso, reintentá' });
+        throw new ConflictException({ message: 'Otro lock en curso, reintenta' });
       }
       throw err;
     } finally {

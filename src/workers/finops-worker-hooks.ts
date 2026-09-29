@@ -521,7 +521,7 @@ export function budgetExceededMessage(r: { reason: string; committed: string; au
 /** Mensaje estable del item bloqueado por falta del guard de presupuesto (prefijo `finops_unavailable:`). */
 export const FINOPS_GUARD_MISSING_ITEM_ERROR =
   'finops_unavailable: el control de presupuesto (runtime guard) no está configurado en este worker, así que no se envió ' +
-  'nada al proveedor pagado (sin gasto). Corregí la configuración del worker y reintentá esta parte.';
+  'nada al proveedor pagado (sin gasto). Corrige la configuración del worker y reintenta esta parte.';
 
 /**
  * RF-b fix round 2 (M3): bloquea (visible, reanudable con retry) un item de gasto
@@ -688,6 +688,6 @@ export function reconciliationMessage(provider: string, what: string, detail: st
   return (
     `${PROVIDER_RECONCILIATION_REQUIRED}: ${provider} — ${what}. ${detail.slice(0, 400)} ` +
     'El proveedor pudo haber completado (y cobrado) la operación: quedó reservada en el ledger y NO se reintenta sola. ' +
-    'Revisá la cuenta del proveedor y resolvé explícitamente (retry con resubmitProvider/resubmitVideo=true).'
+    'Revisa la cuenta del proveedor y resuelve explícitamente (retry con resubmitProvider/resubmitVideo=true).'
   );
 }
