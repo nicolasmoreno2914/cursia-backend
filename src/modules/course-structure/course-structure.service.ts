@@ -26,6 +26,53 @@ import {
   snapshotSha256V2,
 } from '../course-blueprints/blueprint-snapshot';
 import { assertV21StructureSchema, probeV21StructureSchema } from './v21-schema-guard';
+import {
+  CHAPTER_TITLE_TOO_LONG,
+  MODULE_TITLE_TOO_LONG,
+  STRUCTURE_DESCRIPTION_MAX,
+  STRUCTURE_DESCRIPTION_TOO_LONG,
+  STRUCTURE_TITLE_MAX,
+  StructureTitleSplit,
+  mergeDescription,
+  normalizeStructureTitle,
+} from './structure-titles';
+
+/**
+ * Title Normalization: título ≤ STRUCTURE_TITLE_MAX. Un título largo se separa
+ * en título + descripción (sin truncar); si no hay un corte natural → 400 con
+ * código claro (nunca se guarda un título largo).
+ */
+export function normalizeTitleOrThrow(kind: 'chapter' | 'module', raw: string): StructureTitleSplit {
+  const n = normalizeStructureTitle(raw);
+  if (n) return n;
+  const code = kind === 'chapter' ? CHAPTER_TITLE_TOO_LONG : MODULE_TITLE_TOO_LONG;
+  const what = kind === 'chapter' ? 'del capítulo' : 'del módulo';
+  throw new BadRequestException({
+    code,
+    max: STRUCTURE_TITLE_MAX,
+    length: String(raw ?? '').trim().length,
+    message:
+      `${code}: el título ${what} tiene ${String(raw ?? '').trim().length} caracteres (máximo ${STRUCTURE_TITLE_MAX}) y no se ` +
+      'pudo separar automáticamente en título y descripción. Escribe un título breve y pon el detalle en la descripción.',
+  });
+}
+
+/** Descripción final: nunca se trunca; si supera el máximo → 400 (el usuario la acorta). */
+export function checkedDescription(v: string | null): string | null {
+  if (v !== null && v.length > STRUCTURE_DESCRIPTION_MAX) {
+    throw new BadRequestException({
+      code: STRUCTURE_DESCRIPTION_TOO_LONG,
+      max: STRUCTURE_DESCRIPTION_MAX,
+      message: `${STRUCTURE_DESCRIPTION_TOO_LONG}: la descripción quedaría con ${v.length} caracteres (máximo ${STRUCTURE_DESCRIPTION_MAX}). Acórtala.`,
+    });
+  }
+  return v;
+}
+
+function cleanDescription(v: string | undefined | null): string | null {
+  const t = String(v ?? '').replace(/\s+/g, ' ').trim();
+  return t ? t : null;
+}
 import { blueprintSchemaVersionForRules, readConfiguredRulesVersion } from '../generation-manifests/manifest-rules-config';
 
 @Injectable()
@@ -178,12 +225,14 @@ export class CourseStructureService implements OnModuleInit {
         position: m.position,
         title: m.title,
         objective: m.objective,
+        description: m.description ?? null,
         examEnabled: m.examEnabled,
         chapters: m.chapters.map((c) => ({
           id: c.id,
           position: c.position,
           title: c.title,
           objective: c.objective,
+          description: c.description ?? null,
           videoEnabled: c.videoEnabled,
           activityEnabled: activityByChapter.get(c.id) as boolean,
         })),
@@ -223,10 +272,12 @@ export class CourseStructureService implements OnModuleInit {
         if (!settings || !activityByChapter) throw new Error('faltan los toggles V2.1 para comparar contra un Blueprint v2');
         const rawModulesV2: RawModuleRow[] = modules.map((m) => ({
           id: m.id, position: m.position, title: m.title, objective: m.objective, exam_enabled: m.examEnabled,
+          description: m.description ?? null,
         }));
         const rawChaptersV2: RawChapterRowV2[] = modules.flatMap((m) =>
           m.chapters.map((c) => ({
             id: c.id, module_id: m.id, position: c.position, title: c.title, objective: c.objective,
+            description: c.description ?? null,
             video_enabled: c.videoEnabled, activity_enabled: activityByChapter.get(c.id) as boolean,
           })),
         );
@@ -364,11 +415,13 @@ export class CourseStructureService implements OnModuleInit {
       );
       const nextPosition = Number(maxRows[0].max_pos) + 1;
 
+      const nt = normalizeTitleOrThrow('module', dto.title);
       const inserted = await queryRunner.query(
-        `insert into public.course_modules (course_id, position, title, objective, exam_enabled)
-         values ($1, $2, $3, $4, $5)
-         returning id, position, title, objective, exam_enabled as "examEnabled"`,
-        [courseId, nextPosition, dto.title, dto.objective || null, dto.examEnabled ?? true],
+        `insert into public.course_modules (course_id, position, title, objective, exam_enabled, description)
+         values ($1, $2, $3, $4, $5, $6)
+         returning id, position, title, objective, description, exam_enabled as "examEnabled"`,
+        [courseId, nextPosition, nt.title, dto.objective || null, dto.examEnabled ?? true,
+          checkedDescription(mergeDescription(cleanDescription(dto.description), nt.description))],
       );
       const newModuleId = inserted[0].id;
 
@@ -379,7 +432,7 @@ export class CourseStructureService implements OnModuleInit {
       const insertedChapter = await queryRunner.query(
         `insert into public.course_chapters (course_id, module_id, position, title, video_enabled)
          values ($1, $2, $3, $4, $5)
-         returning id, position, title, objective, video_enabled as "videoEnabled", activity_enabled as "activityEnabled"`,
+         returning id, position, title, objective, description, video_enabled as "videoEnabled", activity_enabled as "activityEnabled"`,
         [courseId, newModuleId, 0, 'Nuevo capítulo', false],
       );
 
@@ -388,6 +441,7 @@ export class CourseStructureService implements OnModuleInit {
       return {
         module: { ...inserted[0], chapters: [insertedChapter[0]] },
         structureVersionCounter: newCounter,
+        titleNormalized: nt.changed,
       };
     } catch (err) {
       if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
@@ -406,7 +460,7 @@ export class CourseStructureService implements OnModuleInit {
       await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
 
       const existing = await queryRunner.query(
-        `select id from public.course_modules where id = $1 and course_id = $2`,
+        `select id, description from public.course_modules where id = $1 and course_id = $2`,
         [moduleId, courseId],
       );
       if (existing.length === 0) {
@@ -417,9 +471,14 @@ export class CourseStructureService implements OnModuleInit {
       const sets: string[] = [];
       const params: any[] = [];
       let i = 1;
-      if (dto.title !== undefined) { sets.push(`title = $${i++}`); params.push(dto.title); }
+      const nt = dto.title !== undefined ? normalizeTitleOrThrow('module', dto.title) : null;
+      if (nt) { sets.push(`title = $${i++}`); params.push(nt.title); }
       if (dto.objective !== undefined) { sets.push(`objective = $${i++}`); params.push(dto.objective); }
       if (dto.examEnabled !== undefined) { sets.push(`exam_enabled = $${i++}`); params.push(dto.examEnabled); }
+      let description: string | null | undefined;
+      if (nt?.description) description = checkedDescription(mergeDescription(dto.description !== undefined ? cleanDescription(dto.description) : existing[0].description, nt.description));
+      else if (dto.description !== undefined) description = cleanDescription(dto.description);
+      if (description !== undefined) { sets.push(`description = $${i++}`); params.push(description); }
       if (sets.length > 0) {
         params.push(moduleId);
         await queryRunner.query(
@@ -430,7 +489,11 @@ export class CourseStructureService implements OnModuleInit {
 
       const newCounter = await this.bumpCounter(queryRunner, courseId);
       await queryRunner.commitTransaction();
-      return { structureVersionCounter: newCounter };
+      return {
+        structureVersionCounter: newCounter,
+        ...(nt ? { title: nt.title, titleNormalized: nt.changed } : {}),
+        ...(description !== undefined ? { description } : {}),
+      };
     } catch (err) {
       if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
       throw err;
@@ -500,16 +563,17 @@ export class CourseStructureService implements OnModuleInit {
       );
       const nextPosition = Number(maxRows[0].max_pos) + 1;
 
+      const nt = normalizeTitleOrThrow('chapter', dto.title);
       const inserted = await queryRunner.query(
-        `insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled, activity_enabled)
-         values ($1, $2, $3, $4, $5, $6, $7)
-         returning id, position, title, objective, video_enabled as "videoEnabled", activity_enabled as "activityEnabled"`,
-        [courseId, moduleId, nextPosition, dto.title, dto.objective || null, dto.videoEnabled ?? false,
-          dto.activityEnabled ?? true],
+        `insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled, activity_enabled, description)
+         values ($1, $2, $3, $4, $5, $6, $7, $8)
+         returning id, position, title, objective, description, video_enabled as "videoEnabled", activity_enabled as "activityEnabled"`,
+        [courseId, moduleId, nextPosition, nt.title, dto.objective || null, dto.videoEnabled ?? false,
+          dto.activityEnabled ?? true, checkedDescription(mergeDescription(cleanDescription(dto.description), nt.description))],
       );
       const newCounter = await this.bumpCounter(queryRunner, courseId);
       await queryRunner.commitTransaction();
-      return { chapter: inserted[0], structureVersionCounter: newCounter };
+      return { chapter: inserted[0], structureVersionCounter: newCounter, titleNormalized: nt.changed };
     } catch (err) {
       if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
       throw err;
@@ -528,7 +592,7 @@ export class CourseStructureService implements OnModuleInit {
       await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
 
       const existing = await queryRunner.query(
-        `select id from public.course_chapters where id = $1 and module_id = $2 and course_id = $3`,
+        `select id, description from public.course_chapters where id = $1 and module_id = $2 and course_id = $3`,
         [chapterId, moduleId, courseId],
       );
       if (existing.length === 0) {
@@ -539,8 +603,13 @@ export class CourseStructureService implements OnModuleInit {
       const sets: string[] = [];
       const params: any[] = [];
       let i = 1;
-      if (dto.title !== undefined) { sets.push(`title = $${i++}`); params.push(dto.title); }
+      const nt = dto.title !== undefined ? normalizeTitleOrThrow('chapter', dto.title) : null;
+      if (nt) { sets.push(`title = $${i++}`); params.push(nt.title); }
       if (dto.objective !== undefined) { sets.push(`objective = $${i++}`); params.push(dto.objective); }
+      let description: string | null | undefined;
+      if (nt?.description) description = checkedDescription(mergeDescription(dto.description !== undefined ? cleanDescription(dto.description) : existing[0].description, nt.description));
+      else if (dto.description !== undefined) description = cleanDescription(dto.description);
+      if (description !== undefined) { sets.push(`description = $${i++}`); params.push(description); }
       if (dto.videoEnabled !== undefined) { sets.push(`video_enabled = $${i++}`); params.push(dto.videoEnabled); }
       if (dto.activityEnabled !== undefined) { sets.push(`activity_enabled = $${i++}`); params.push(dto.activityEnabled); }
       if (sets.length > 0) {
@@ -553,7 +622,11 @@ export class CourseStructureService implements OnModuleInit {
 
       const newCounter = await this.bumpCounter(queryRunner, courseId);
       await queryRunner.commitTransaction();
-      return { structureVersionCounter: newCounter };
+      return {
+        structureVersionCounter: newCounter,
+        ...(nt ? { title: nt.title, titleNormalized: nt.changed } : {}),
+        ...(description !== undefined ? { description } : {}),
+      };
     } catch (err) {
       if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
       throw err;

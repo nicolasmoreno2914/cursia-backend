@@ -268,9 +268,11 @@ function storageBase(item: ClaimedItem, ownerId: string, artifactType: string): 
 // ═══════════════════════════════════════════════════════════════════════════
 
 /** Cuerpo de la generación: el del legacy probado (gamma-worker.ts), sin las marcas PARTE A/B del layout V1. */
-export function gammaGenerationBody(input: { chapterTitle: string; contentMarkdown: string; themeId: string }): Record<string, unknown> {
+export function gammaGenerationBody(input: { chapterTitle: string; chapterDescription?: string | null; contentMarkdown: string; themeId: string }): Record<string, unknown> {
+  // Title Normalization: el título (breve) encabeza la portada; la descripción es contexto, nunca título.
+  const desc = input.chapterDescription && input.chapterDescription.trim() ? `${input.chapterDescription.trim()}\n\n` : '';
   return {
-    inputText: `${input.chapterTitle}\n\n${cleanAudioText(input.contentMarkdown)}`,
+    inputText: `${input.chapterTitle}\n\n${desc}${cleanAudioText(input.contentMarkdown)}`,
     textMode: 'generate',
     format: 'presentation',
     numCards: GAMMA_NUM_CARDS,
@@ -386,7 +388,9 @@ export async function processRealPresentation(deps: RealProviderDeps, item: Clai
       (tracker as any).gammaReservationKey = resKey;
     }
     try {
-      generationId = await client.createGeneration(gammaGenerationBody({ chapterTitle, contentMarkdown: markdown, themeId: themeId! }));
+      generationId = await client.createGeneration(gammaGenerationBody({
+        chapterTitle, chapterDescription: item.blueprint?.chapter?.description ?? null, contentMarkdown: markdown, themeId: themeId!,
+      }));
     } catch (err) {
       // SOLO un 4xx con respuesta es un rechazo definitivo previo a la aceptación → se libera la
       // reserva, se limpia el marcador y el reintento automático (acotado) puede reenviar.
@@ -613,6 +617,7 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
           courseTitle: item.blueprint?.course?.title ?? 'este curso',
           chapterNumber: item.chapterNumber ?? 0,
           chapterTitle: item.blueprint?.chapter?.title ?? `Capítulo ${item.chapterNumber ?? '?'}`,
+          chapterDescription: item.blueprint?.chapter?.description ?? null,
           sector: (item.context?.courseContext as any)?.sector ?? null,
           nivel: (item.context?.courseContext as any)?.nivel ?? null,
           pais: (item.context?.courseContext as any)?.pais ?? null,

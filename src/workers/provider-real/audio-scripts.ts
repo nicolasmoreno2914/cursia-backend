@@ -93,6 +93,8 @@ export interface ChapterScriptInput {
   courseTitle: string;
   chapterNumber: number;
   chapterTitle: string;
+  /** Title Normalization: detalle del capítulo (contexto; el título sigue siendo breve). */
+  chapterDescription?: string | null;
   sector?: string | null;
   nivel?: string | null;
   /** R14: país del curso → tuteo (voseo solo en Argentina/Uruguay/Paraguay). */
@@ -152,6 +154,7 @@ export function chapterNarrationPrompt(i: ChapterScriptInput): ScriptPrompt {
     '- Responde SOLO con el bloque narrado, sin preámbulos ni explicaciones.';
   const user =
     `Capítulo ${i.chapterNumber} — ${i.chapterTitle} del curso "${i.courseTitle}"${sectorLine}${nivelLine}.\n\n` +
+    (i.chapterDescription && i.chapterDescription.trim() ? `De qué trata este capítulo: ${i.chapterDescription.trim()}\n\n` : '') +
     `Extracto de referencia:\n${excerpt}\n\n` +
     `Escribe el bloque narrado de este capítulo (${AUDIOBOOK_MIN_WORDS_PER_CHAPTER}-${AUDIOBOOK_WORDS_PER_CHAPTER + 120} palabras).`;
   return { system, user, maxTokens: 1500 };

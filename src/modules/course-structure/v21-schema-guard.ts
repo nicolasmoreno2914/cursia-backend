@@ -20,6 +20,9 @@ export const V21_STRUCTURE_COLUMNS: ReadonlyArray<{ table: string; column: strin
   { table: 'courses', column: 'final_exam_enabled' },
   { table: 'courses', column: 'activity_engine' },
   { table: 'course_chapters', column: 'activity_enabled' },
+  // Title Normalization: el detalle de módulos/capítulos (mismo archivo de migración).
+  { table: 'course_modules', column: 'description' },
+  { table: 'course_chapters', column: 'description' },
 ];
 
 let verified = false;

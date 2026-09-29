@@ -90,6 +90,8 @@ export interface OutlineChapter {
   moduleId: string;
   title: string;
   objective: string | null;
+  /** Title Normalization: solo si el snapshot v2 la trae (con texto). */
+  description?: string;
   /** Índice 0-based en el orden global del curso. */
   index: number;
 }
@@ -98,6 +100,8 @@ export interface OutlineModule {
   id: string;
   title: string;
   objective: string | null;
+  /** Title Normalization: solo si el snapshot v2 la trae (con texto). */
+  description?: string;
   examEnabled: boolean;
   chapters: OutlineChapter[];
 }
@@ -114,6 +118,12 @@ export interface Outline {
  * `position` dentro de su módulo (desempate por UUID para que un empate
  * nunca dependa del orden del arreglo de entrada).
  */
+/** Descripción (snapshot v2) solo si hay texto: sin ella, huellas y outline quedan idénticos a antes. */
+export function outlineDescription(x: unknown): { description?: string } {
+  const d = (x as { description?: unknown } | null)?.description;
+  return typeof d === 'string' && d.trim() ? { description: d } : {};
+}
+
 export function buildOutline(bp: BlueprintSnapshotV1): Outline {
   const modules = [...(bp.modules ?? [])].sort(
     (a, b) => Number(a.position) - Number(b.position) || cmpStr(a.id, b.id),
@@ -128,12 +138,13 @@ export function buildOutline(bp: BlueprintSnapshotV1): Outline {
           moduleId: m.id,
           title: c.title ?? '',
           objective: c.objective ?? null,
+          ...outlineDescription(c),
           index: chapters.length,
         };
         chapters.push(oc);
         return oc;
       });
-    return { id: m.id, title: m.title ?? '', objective: m.objective ?? null, examEnabled: !!m.examEnabled, chapters: chs };
+    return { id: m.id, title: m.title ?? '', objective: m.objective ?? null, ...outlineDescription(m), examEnabled: !!m.examEnabled, chapters: chs };
   });
   return {
     modules: outModules,

@@ -93,6 +93,8 @@ function assertNotProductionProject() {
 
 const EXPECTED_ADDED_COLUMNS = [
   { table: 'course_chapters', column: 'activity_enabled', type: 'boolean', nullable: 'NO', defaultRe: /^true$/ },
+  { table: 'course_modules', column: 'description', type: 'text', nullable: 'YES', defaultRe: null },
+  { table: 'course_chapters', column: 'description', type: 'text', nullable: 'YES', defaultRe: null },
   { table: 'courses', column: 'final_exam_enabled', type: 'boolean', nullable: 'NO', defaultRe: /^true$/ },
   { table: 'courses', column: 'activity_engine', type: 'text', nullable: 'NO', defaultRe: /^'h5p'::text$/ },
 ];
@@ -165,8 +167,8 @@ async function main() {
       const col = res.rows[0];
       if (!col) { failures.push(`Falta la columna "${exp.table}.${exp.column}".`); continue; }
       if (col.data_type !== exp.type) failures.push(`"${exp.table}.${exp.column}" es ${col.data_type}, esperado ${exp.type}.`);
-      if (col.is_nullable !== exp.nullable) failures.push(`"${exp.table}.${exp.column}" admite NULL.`);
-      if (!exp.defaultRe.test(String(col.column_default))) failures.push(`"${exp.table}.${exp.column}" default=${col.column_default}.`);
+      if (col.is_nullable !== exp.nullable) failures.push(`"${exp.table}.${exp.column}" is_nullable=${col.is_nullable}, esperado ${exp.nullable}.`);
+      if (exp.defaultRe && !exp.defaultRe.test(String(col.column_default))) failures.push(`"${exp.table}.${exp.column}" default=${col.column_default}.`);
     }
 
     // 2. Tabla course_profiles.

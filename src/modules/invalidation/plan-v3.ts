@@ -412,7 +412,7 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
         const oldIds = oldMod!.chapters.map((c) => c.id).sort(cmpStr).join(',');
         const newIds = newMod.chapters.map((c) => c.id).sort(cmpStr).join(',');
         if (oldIds !== newIds) reasons.push('module_membership_changed');
-        if (oldMod!.title !== newMod.title || oldMod!.objective !== newMod.objective) reasons.push('module_title_or_objective_changed');
+        if (oldMod!.title !== newMod.title || oldMod!.objective !== newMod.objective || (oldMod!.description ?? null) !== (newMod.description ?? null)) reasons.push('module_title_or_objective_changed');
         const existingMemberContentNew = newMod.chapters.some(
           (c) => contentProducesNew.has(c.id) && oldMod!.chapters.some((oc) => oc.id === c.id),
         );
