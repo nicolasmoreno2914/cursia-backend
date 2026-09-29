@@ -62,6 +62,7 @@ import {
   buildQuestionSet,
   buildVideoActivity,
   h5pProfileVersion,
+  h5pTitle,
   validateBlanksInput,
   validateDragTextInput,
   validateQuestionSetInput,
@@ -448,6 +449,7 @@ async function buildActivityH5p(
   }
   const p = payload as { type: string; data: Record<string, unknown> };
   const input: Record<string, unknown> = { ...p.data, itemKey };
+  if (typeof input.title === 'string') input.title = h5pTitle(input.title);
   let built;
   if (p.type === 'questionset') {
     // R11a ruling 3: la nota interna del QuestionSet es la del perfil VIGENTE, nunca la del LLM/executor.
@@ -737,7 +739,8 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
           const key = ch.keys.video as string;
           const built = await buildVideoActivity({
             itemKey: key,
-            title: ch.title,
+            // El título del capítulo puede superar el máximo de H5P (200): se normaliza, no se rechaza el paquete.
+            title: h5pTitle(ch.title),
             youtubeId: video.youtubeId,
             durationSec: video.durationSec,
             interactionsDoc: c.videoInteractions.get(ch.chapterId),

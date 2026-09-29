@@ -281,6 +281,27 @@ export interface H5pBuiltContent {
   maxScore: number;
 }
 
+export const H5P_TITLE_MAX = 200;
+
 export function titleRule(issues: Issues, v: unknown): void {
-  checkPlainText(issues, 'title', v, { max: 200 });
+  checkPlainText(issues, 'title', v, { max: H5P_TITLE_MAX });
+}
+
+/**
+ * Título apto para un paquete H5P (≤ H5P_TITLE_MAX). Los títulos de capítulo
+ * del usuario pueden medir hasta 255: sin esto el empaquetado fallaba con
+ * H5P_INPUT_INVALID(title: máximo 200). Colapsa espacios; si sobra, corta en
+ * el último límite de palabra (si no queda demasiado corto), quita separadores
+ * sueltos al final y agrega «…». Nunca agrega HTML; el validador sigue igual
+ * de estricto para todo lo demás.
+ */
+export function h5pTitle(raw: string, max: number = H5P_TITLE_MAX): string {
+  const t = String(raw ?? '').replace(/\s+/g, ' ').trim();
+  if (t.length <= max) return t;
+  const room = max - 1; // lugar para «…»
+  let cut = t.slice(0, room);
+  const lastSpace = cut.lastIndexOf(' ');
+  if (lastSpace >= Math.floor(room * 0.6)) cut = cut.slice(0, lastSpace);
+  cut = cut.replace(/[\s·:;,.\-–—(]+$/u, '');
+  return `${cut}…`;
 }
