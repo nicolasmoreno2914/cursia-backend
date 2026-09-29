@@ -165,13 +165,14 @@ export interface ClaimedItem {
   blueprint: {
     course: { id: number; title: string };
     /** null solo en items de scope course (rulesVersion 2). */
-    module: { id: string; title: string; objective: string | null; position: number } | null;
-    chapter: { id: string; title: string; objective: string | null; position: number; videoEnabled: boolean } | null;
+    /** `description` (Title Normalization): detalle/alcance; el título es breve. null si no tiene. */
+    module: { id: string; title: string; objective: string | null; description: string | null; position: number } | null;
+    chapter: { id: string; title: string; objective: string | null; description: string | null; position: number; videoEnabled: boolean } | null;
     /**
      * Capítulos del módulo del item, en orden del Manifest (para exam:
      * exactamente los que evalúa). Vacío en items de scope course.
      */
-    moduleChapters: Array<{ id: string; title: string; objective: string | null; chapterNumber: number }>;
+    moduleChapters: Array<{ id: string; title: string; objective: string | null; description: string | null; chapterNumber: number }>;
     /**
      * R18: outline del curso COMPLETO (todos los módulos, en orden del
      * Manifest), con numeración global — para que los builders dynamic
@@ -190,7 +191,8 @@ export interface ClaimedItem {
        * no lo leen (sin cambio de comportamiento en v1).
        */
       objective: string | null;
-      chapters: Array<{ chapterNumber: number; id: string; title: string; objective: string | null }>;
+      description: string | null;
+      chapters: Array<{ chapterNumber: number; id: string; title: string; objective: string | null; description: string | null }>;
     }>;
   };
   dependencyArtifacts: Array<{ itemKey: string; artifactId: string; type: string; storagePath: string }>;
@@ -322,6 +324,12 @@ export function mergeOutputSummary(
  * `ownerId` presente = camino navegador (JWT): todo se restringe a runs de
  * ese dueño. Ausente = worker interno.
  */
+/** Title Normalization: descripción del snapshot (v2 con texto) o null (v1 / sin descripción). */
+function descOf(x: unknown): string | null {
+  const d = (x as { description?: unknown } | null)?.description;
+  return typeof d === 'string' && d.trim() ? d : null;
+}
+
 @Injectable()
 export class SchedulerService {
   private readonly logger = new Logger(SchedulerService.name);
@@ -1375,7 +1383,7 @@ export class SchedulerService {
       : mModule.chapters.map((mc) => {
           const sc = sModule!.chapters.find((c) => c.id === mc.chapterId);
           if (!sc) throw fail(`capítulo ${mc.chapterId} del Manifest ausente en el Blueprint`);
-          return { id: sc.id, title: sc.title, objective: sc.objective ?? null, chapterNumber: mc.chapterNumber };
+          return { id: sc.id, title: sc.title, objective: sc.objective ?? null, description: descOf(sc), chapterNumber: mc.chapterNumber };
         });
 
     // Outline del curso completo (R18), en el mismo orden en que el Manifest
@@ -1390,10 +1398,11 @@ export class SchedulerService {
         id: sm.id,
         title: sm.title,
         objective: sm.objective ?? null,
+        description: descOf(sm),
         chapters: mm.chapters.map((mc) => {
           const sc = sm.chapters.find((c) => c.id === mc.chapterId);
           if (!sc) throw fail(`capítulo ${mc.chapterId} del Manifest ausente en el Blueprint`);
-          return { chapterNumber: mc.chapterNumber, id: sc.id, title: sc.title, objective: sc.objective ?? null };
+          return { chapterNumber: mc.chapterNumber, id: sc.id, title: sc.title, objective: sc.objective ?? null, description: descOf(sc) };
         }),
       };
     });
@@ -1443,13 +1452,14 @@ export class SchedulerService {
       blueprint: {
         course: { id: snapshot.course.id, title: snapshot.course.title },
         module: sModule
-          ? { id: sModule.id, title: sModule.title, objective: sModule.objective ?? null, position: sModule.position }
+          ? { id: sModule.id, title: sModule.title, objective: sModule.objective ?? null, description: descOf(sModule), position: sModule.position }
           : null,
         chapter: sChapter
           ? {
               id: sChapter.id,
               title: sChapter.title,
               objective: sChapter.objective ?? null,
+              description: descOf(sChapter),
               position: sChapter.position,
               videoEnabled: sChapter.videoEnabled,
             }

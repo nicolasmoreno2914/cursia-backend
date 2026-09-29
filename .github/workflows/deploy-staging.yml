@@ -33,10 +33,10 @@ on:
       calibration_action:
         description: 'none = deploy normal; otra = acción de calibración V2.1 en staging SIN deploy'
         type: choice
-        options: ['none', 'report', 'preflight', 'policy', 'authorize', 'reconcile_charged_dry', 'reconcile_charged', 'worker_on', 'worker_off']
+        options: ['none', 'report', 'preflight', 'policy', 'authorize', 'reconcile_charged_dry', 'reconcile_charged', 'worker_on', 'worker_off', 'titles_dry', 'titles_apply']
         default: 'none'
       calibration_course_id:
-        description: 'Id numérico del curso (authorize / report / reconcile_charged[_dry])'
+        description: 'Id numérico del curso (authorize / report / reconcile_charged[_dry]; opcional en titles_dry/titles_apply)'
         type: string
         default: ''
 
@@ -113,6 +113,8 @@ jobs:
 
       - name: Check V2.1 R3 Blueprint v2 + perfiles (puro; la parte PG16 corre local)
         run: node scripts/check-v21-blueprint-profiles.js --pure-only
+      - name: V2.1 Title Normalization (puro)
+        run: node scripts/check-v21-structure-titles.js --pure-only
 
       - name: Check V2.1 R4 Manifest rulesVersion 3 (puro; la parte PG16 corre local)
         run: node scripts/check-v21-manifest-v3.js --pure-only
@@ -584,7 +586,7 @@ jobs:
           CAL_ACTION: ${{ inputs.calibration_action }}
           CAL_COURSE: ${{ inputs.calibration_course_id }}
         run: |
-          case "$CAL_ACTION" in report|preflight|policy|authorize|reconcile_charged_dry|reconcile_charged|worker_on|worker_off) ;; *) echo "❌ action inválida"; exit 1 ;; esac
+          case "$CAL_ACTION" in report|preflight|policy|authorize|reconcile_charged_dry|reconcile_charged|worker_on|worker_off|titles_dry|titles_apply) ;; *) echo "❌ action inválida"; exit 1 ;; esac
           case "$CAL_COURSE" in "") ;; *[!0-9]*) echo "❌ course_id debe ser numérico"; exit 1 ;; esac
           if { [ "$CAL_ACTION" = authorize ] || [ "$CAL_ACTION" = report ] || [ "$CAL_ACTION" = reconcile_charged ] || [ "$CAL_ACTION" = reconcile_charged_dry ]; } && [ -z "$CAL_COURSE" ]; then
             echo "❌ action=$CAL_ACTION necesita course_id"; exit 1
@@ -610,7 +612,7 @@ jobs:
                cd '"${{ secrets.VPS_PATH_STAGING }}"'
                IFS= read -r _ACTION || true
                IFS= read -r _COURSE || true
-               case "$_ACTION" in report|preflight|policy|authorize|reconcile_charged_dry|reconcile_charged|worker_on|worker_off) ;; *) echo "❌ acción inválida"; exit 1 ;; esac
+               case "$_ACTION" in report|preflight|policy|authorize|reconcile_charged_dry|reconcile_charged|worker_on|worker_off|titles_dry|titles_apply) ;; *) echo "❌ acción inválida"; exit 1 ;; esac
                case "$_COURSE" in "") ;; *[!0-9]*) echo "❌ curso inválido"; exit 1 ;; esac
                if [ ! -f .env ] || [ ! -f scripts/staging-v21-calibration.js ]; then
                  echo "❌ staging sin .env o sin el script (desplegá primero)"; exit 1
@@ -623,6 +625,8 @@ jobs:
                  reconcile_charged) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js reconcile_charged "$_COURSE"
                    MIGRATION_ENV=staging node scripts/staging-v21-calibration.js report "$_COURSE" ;;
                  preflight) MIGRATION_ENV=staging node scripts/preflight-v21-providers.js ;;
+                 titles_dry) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js titles_dry "$_COURSE" ;;
+                 titles_apply) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js titles_apply "$_COURSE" ;;
                  worker_on|worker_off)
                    _MODE=on; [ "$_ACTION" = worker_off ] && _MODE=off
                    MIGRATION_ENV=staging node scripts/staging-v21-calibration.js worker "$_MODE"

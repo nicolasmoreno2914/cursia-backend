@@ -1,3 +1,4 @@
+import { CHAPTER_TITLE_TOO_LONG, MODULE_TITLE_TOO_LONG, STRUCTURE_TITLE_MAX } from '../course-structure/structure-titles';
 import {
   Injectable,
   BadRequestException,
@@ -97,6 +98,32 @@ function isBlueprintNumberConflict(err: any): boolean {
   const e = err?.driverError ?? err;
   return (err?.code === '23505' || e?.code === '23505') &&
     (err?.constraint === BLUEPRINT_NUMBER_UNIQUE || e?.constraint === BLUEPRINT_NUMBER_UNIQUE);
+}
+
+/** Title Normalization: errores de títulos > STRUCTURE_TITLE_MAX (módulos y capítulos), con ids. */
+export function structureTitleErrors(
+  modules: Array<{ id: string; title: string; position?: number }>,
+  chapters: Array<{ id: string; title: string; module_id?: string; position?: number }>,
+): Array<{ code: string; path: string; message: string }> {
+  const out: Array<{ code: string; path: string; message: string }> = [];
+  // Numeración visible (módulos por position, capítulos global por módulo+position) para un mensaje accionable.
+  const mods = [...modules].sort((a, b) => Number(a.position ?? 0) - Number(b.position ?? 0));
+  const modNum = new Map(mods.map((m, i) => [m.id, i + 1]));
+  const chs = [...chapters].sort((a, b) => (modNum.get(a.module_id ?? '') ?? 0) - (modNum.get(b.module_id ?? '') ?? 0) || Number(a.position ?? 0) - Number(b.position ?? 0));
+  const short = (t: string) => { const s = String(t ?? '').trim(); return s.length > 40 ? `${s.slice(0, 40)}…` : s; };
+  for (const m of mods) {
+    const n = String(m.title ?? '').trim().length;
+    if (n > STRUCTURE_TITLE_MAX) {
+      out.push({ code: MODULE_TITLE_TOO_LONG, path: `modules[${m.id}].title`, message: `el título del módulo ${modNum.get(m.id)} («${short(m.title)}») tiene ${n} caracteres (máximo ${STRUCTURE_TITLE_MAX})` });
+    }
+  }
+  chs.forEach((c, i) => {
+    const n = String(c.title ?? '').trim().length;
+    if (n > STRUCTURE_TITLE_MAX) {
+      out.push({ code: CHAPTER_TITLE_TOO_LONG, path: `chapters[${c.id}].title`, message: `el título del capítulo ${i + 1} («${short(c.title)}») tiene ${n} caracteres (máximo ${STRUCTURE_TITLE_MAX})` });
+    }
+  });
+  return out;
 }
 
 @Injectable()
@@ -281,11 +308,11 @@ export class CourseBlueprintsService {
       }
 
       const modules: RawModuleRow[] = await qr.query(
-        `select id, position, title, objective, exam_enabled from public.course_modules where course_id = $1`,
+        `select id, position, title, objective, description, exam_enabled from public.course_modules where course_id = $1`,
         [courseId],
       );
       const chapters: RawChapterRowV2[] = await qr.query(
-        `select id, module_id, position, title, objective, video_enabled, activity_enabled
+        `select id, module_id, position, title, objective, description, video_enabled, activity_enabled
            from public.course_chapters where course_id = $1`,
         [courseId],
       );
@@ -312,6 +339,17 @@ export class CourseBlueprintsService {
         throw new BadRequestException({
           message: `La estructura no cumple las validaciones para crear un Blueprint: ${detail}`,
           errors,
+        });
+      }
+      // Title Normalization: un Blueprint nunca congela un título de módulo/capítulo > 80
+      // (cursos anteriores al cambio: se corrigen en el editor o con la migración de títulos).
+      const longTitles = structureTitleErrors(modules, chapters);
+      if (longTitles.length > 0) {
+        await qr.rollbackTransaction();
+        throw new BadRequestException({
+          code: longTitles[0].code,
+          message: `${longTitles[0].code}: ${longTitles.map((e) => e.message).join('; ')}`,
+          errors: longTitles,
         });
       }
 

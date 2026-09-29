@@ -3,6 +3,16 @@ import { cmpStr, sha256Canonical } from '../coherence/canonical-json';
 import { Outline, buildOutline } from '../coherence/coherence-types';
 
 /**
+ * Title Normalization: la descripción entra en la huella SOLO si existe (con la
+ * clave indicada). Sin descripción la huella es idéntica a la de antes → runs y
+ * planes de invalidación existentes no cambian; cambiarla regenera lo que
+ * dependía del capítulo/módulo, igual que el título o el objetivo.
+ */
+function descField(x: { description?: string }, key: string): Record<string, string> {
+  return x.description ? { [key]: x.description } : {};
+}
+
+/**
  * Fase 8 — huellas de inputs relevantes por item (spec §2), siempre por UUID.
  *
  * - `content:<ch>`: `own` = (chapter.id, title, objective) y `context` =
@@ -70,10 +80,11 @@ function computeFingerprintsAt(
       moduleId: m.id,
       moduleTitle: m.title,
       moduleObjective: m.objective,
+      ...descField(m, 'moduleDescription'),
       courseContextSha256: ctx,
     });
     for (const c of m.chapters) {
-      const own = sha256Canonical({ v, kind: 'content-own', chapterId: c.id, title: c.title, objective: c.objective });
+      const own = sha256Canonical({ v, kind: 'content-own', chapterId: c.id, title: c.title, objective: c.objective, ...descField(c, 'description') });
       content.set(c.id, { own, context, full: sha256Canonical({ v, kind: 'content', own, context }) });
     }
     const chapterIds = m.chapters.map((c) => c.id).sort(cmpStr);
@@ -85,13 +96,14 @@ function computeFingerprintsAt(
         moduleId: m.id,
         moduleTitle: m.title,
         moduleObjective: m.objective,
+        ...descField(m, 'moduleDescription'),
         chapterIds,
         contentOwn: chapterIds.map((id) => content.get(id)!.own),
       }),
     );
     moduleIntro.set(
       m.id,
-      sha256Canonical({ v, kind: 'module_intro', moduleId: m.id, title: m.title, objective: m.objective, chapterIds }),
+      sha256Canonical({ v, kind: 'module_intro', moduleId: m.id, title: m.title, objective: m.objective, ...descField(m, 'description'), chapterIds }),
     );
   }
 
@@ -110,9 +122,10 @@ function computeFingerprintsAt(
         id: m.id,
         title: m.title,
         objective: m.objective,
+        ...descField(m, 'description'),
         chapters: [...m.chapters]
           .sort((a, b) => cmpStr(a.id, b.id))
-          .map((c) => ({ id: c.id, title: c.title, objective: c.objective })),
+          .map((c) => ({ id: c.id, title: c.title, objective: c.objective, ...descField(c, 'description') })),
       })),
   });
 
@@ -225,6 +238,7 @@ export function computeFingerprintsV3(
         moduleId: m.id,
         title: m.title,
         objective: m.objective,
+        ...descField(m, 'description'),
         chapterIds: ids,
         contentOwn: ids.map((id) => base.content.get(id)!.own),
       }),

@@ -9,6 +9,8 @@
 -- está aplicado (mismo criterio que supabase-migration-course-blueprints.sql).
 --
 --   course_chapters.activity_enabled  boolean not null default true
+--   course_modules.description        text    null   (Title Normalization: el detalle
+--   course_chapters.description       text    null    va acá; el título queda ≤ 80)
 --   courses.final_exam_enabled        boolean not null default true
 --   courses.activity_engine           text    not null default 'h5p'
 --                                     check (activity_engine in ('h5p','scorm'))
@@ -32,6 +34,8 @@
 --   alter table public.courses drop column if exists activity_engine;
 --   alter table public.courses drop column if exists final_exam_enabled;
 --   alter table public.course_chapters drop column if exists activity_enabled;
+--   alter table public.course_chapters drop column if exists description;
+--   alter table public.course_modules drop column if exists description;
 -- ══════════════════════════════════════════════════════════════════════════
 
 set lock_timeout = '5s';
@@ -44,6 +48,25 @@ do $$ begin
        and column_name = 'activity_enabled'
   ) then
     alter table public.course_chapters add column activity_enabled boolean not null default true;
+  end if;
+end $$;
+
+-- ── course_modules.description / course_chapters.description ────────────────
+-- Title Normalization (V2.1): nullable, sin default → filas existentes quedan
+-- NULL y sus Blueprints/huellas no cambian (el snapshot solo incluye
+-- `description` cuando hay texto).
+do $$ begin
+  if not exists (
+    select 1 from information_schema.columns
+     where table_schema = 'public' and table_name = 'course_modules' and column_name = 'description'
+  ) then
+    alter table public.course_modules add column description text;
+  end if;
+  if not exists (
+    select 1 from information_schema.columns
+     where table_schema = 'public' and table_name = 'course_chapters' and column_name = 'description'
+  ) then
+    alter table public.course_chapters add column description text;
   end if;
 end $$;
 

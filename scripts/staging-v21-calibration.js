@@ -313,8 +313,8 @@ async function main() {
     process.exit(1);
   }
   const [action, courseArg] = process.argv.slice(2);
-  if (!['policy', 'authorize', 'report', 'reconcile_charged_dry', 'reconcile_charged', 'worker'].includes(action)) {
-    console.error('uso: staging-v21-calibration.js <policy|authorize|report|reconcile_charged_dry|reconcile_charged> [courseId] | worker <on|off>');
+  if (!['policy', 'authorize', 'report', 'reconcile_charged_dry', 'reconcile_charged', 'worker', 'titles_dry', 'titles_apply'].includes(action)) {
+    console.error('uso: staging-v21-calibration.js <policy|authorize|report|reconcile_charged_dry|reconcile_charged> [courseId] | worker <on|off> | <titles_dry|titles_apply> [courseId]');
     process.exit(1);
   }
   if (action === 'worker') {
@@ -322,6 +322,26 @@ async function main() {
     return;
   }
   let courseId = null;
+  if (action === 'titles_dry' || action === 'titles_apply') {
+    // Title Normalization: curso opcional (sin curso = todos los cursos dinámicos).
+    if (courseArg && !/^[0-9]{1,9}$/.test(String(courseArg))) {
+      console.error('❌ courseId inválido (entero)');
+      process.exit(1);
+    }
+    const M = require('./lib/structure-titles-migration');
+    const c = await connect(env);
+    try {
+      const plan = await M.planStructureTitleMigration(c, { distRoot: path.resolve(process.cwd(), 'dist'), courseId: courseArg ? Number(courseArg) : null });
+      M.printPlan(plan);
+      if (action === 'titles_apply' && plan.changes.length) {
+        const out = await M.applyStructureTitleMigration(c, plan);
+        console.log(`+ aplicados ${out.applied.length} (${new Set(out.applied.map((x) => x.courseId)).size} curso(s), contador de estructura +1 c/u); omitidos ${out.skipped.length} (editados desde el plan)`);
+      }
+    } finally {
+      await c.end().catch(() => {});
+    }
+    return;
+  }
   if (action !== 'policy') {
     if (!/^[0-9]{1,9}$/.test(String(courseArg || ''))) {
       console.error('❌ courseId inválido (entero)');

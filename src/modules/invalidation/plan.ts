@@ -447,7 +447,7 @@ export function computeInvalidationPlan(input: InvalidationPlanInput): Invalidat
         const oldIds = oldMod!.chapters.map((c) => c.id).sort(cmpStr).join(',');
         const newIds = newMod.chapters.map((c) => c.id).sort(cmpStr).join(',');
         if (oldIds !== newIds) reasons.push('module_membership_changed');
-        if (oldMod!.title !== newMod.title || oldMod!.objective !== newMod.objective) {
+        if (oldMod!.title !== newMod.title || oldMod!.objective !== newMod.objective || (oldMod!.description ?? null) !== (newMod.description ?? null)) {
           reasons.push('module_title_or_objective_changed');
         }
         // Capítulos que ya eran del módulo y cuyo content genera salida nueva

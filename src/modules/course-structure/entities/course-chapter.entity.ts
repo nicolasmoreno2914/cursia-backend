@@ -36,6 +36,10 @@ export class CourseChapter {
   @Column({ type: 'text', nullable: true })
   objective: string;
 
+  /** Title Normalization: detalle/alcance (el título queda breve, ≤ 80). */
+  @Column({ type: 'text', nullable: true })
+  description: string | null;
+
   @Column({ name: 'video_enabled', default: false })
   videoEnabled: boolean;
 

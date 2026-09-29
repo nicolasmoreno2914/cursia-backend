@@ -10,6 +10,8 @@ export interface RawModuleRow {
   title: string;
   objective: string | null;
   exam_enabled: boolean;
+  /** Title Normalization (solo v2; v1 lo ignora). */
+  description?: string | null;
 }
 
 /**
@@ -22,6 +24,8 @@ export interface RawChapterRow {
   title: string;
   objective: string | null;
   video_enabled: boolean;
+  /** Title Normalization (solo v2; v1 lo ignora). */
+  description?: string | null;
 }
 
 export interface BlueprintChapter {
@@ -332,6 +336,8 @@ export interface BlueprintCourseInputV2 {
 }
 
 export interface BlueprintChapterV2 extends BlueprintChapter {
+  /** Solo presente con texto: los snapshots sin descripción conservan su sha. */
+  description?: string;
   activityEnabled: boolean;
 }
 
@@ -340,6 +346,8 @@ export interface BlueprintModuleV2 {
   position: number;
   title: string;
   objective: string | null;
+  /** Solo presente con texto: los snapshots sin descripción conservan su sha. */
+  description?: string;
   examEnabled: boolean;
   chapters: BlueprintChapterV2[];
 }
@@ -357,6 +365,17 @@ export interface BlueprintSnapshotV2 {
 }
 
 export type AnyBlueprintSnapshot = BlueprintSnapshotV1 | BlueprintSnapshotV2;
+
+/**
+ * Title Normalization: la clave `description` va en el snapshot v2 SOLO si hay
+ * texto (después de colapsar espacios), en orden fijo detrás de `objective`.
+ * Sin descripción el JSON canónico es byte a byte el de antes → los Blueprints
+ * existentes, sus huellas y su invalidación no cambian.
+ */
+export function descriptionKey(v: string | null | undefined): { description?: string } {
+  const t = String(v ?? '').replace(/\s+/g, ' ').trim();
+  return t ? { description: t } : {};
+}
 
 export function isActivityEngine(v: unknown): v is ActivityEngine {
   return v === 'h5p' || v === 'scorm';
@@ -425,12 +444,14 @@ export function buildBlueprintSnapshotV2(
         position: Number(m.position),
         title: m.title,
         objective: m.objective ?? null,
+        ...descriptionKey(m.description),
         examEnabled: !!m.exam_enabled,
         chapters: moduleChapters.map((c) => ({
           id: c.id,
           position: Number(c.position),
           title: c.title,
           objective: c.objective ?? null,
+          ...descriptionKey(c.description),
           videoEnabled: !!c.video_enabled,
           activityEnabled: c.activity_enabled,
         })),
@@ -461,10 +482,11 @@ export function recanonicalizeBlueprintSnapshotV2(stored: any): BlueprintSnapsho
   const modules: RawModuleRow[] = [];
   const chapters: RawChapterRowV2[] = [];
   for (const m of s.modules) {
-    modules.push({ id: m.id, position: m.position, title: m.title, objective: m.objective, exam_enabled: m.examEnabled });
+    modules.push({ id: m.id, position: m.position, title: m.title, objective: m.objective, exam_enabled: m.examEnabled, description: m.description ?? null });
     for (const c of m.chapters) {
       chapters.push({
         id: c.id, module_id: m.id, position: c.position, title: c.title, objective: c.objective,
+        description: c.description ?? null,
         video_enabled: c.videoEnabled, activity_enabled: c.activityEnabled,
       });
     }
