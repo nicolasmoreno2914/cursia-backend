@@ -117,6 +117,14 @@ export const AUDIO_TRUTH_RULE =
   '(«duplica», «triplica», «multiplica el aprendizaje»): si el extracto trae una cifra así, no la repitas; ' +
   'habla de la idea sin cuantificarla.\n';
 
+/**
+ * R14-13: el guion narra un EXTRACTO del capítulo; terminaba anunciando apartados que no narra
+ * ("En el siguiente apartado vamos a ver… los sesgos") y citaba el prompt ("El extracto del curso…").
+ */
+export const AUDIO_SCOPE_RULE =
+  '- No anuncies apartados, secciones o temas siguientes que no vas a narrar («en el siguiente apartado…»), ' +
+  'ni menciones «el extracto», «el texto» o «el material de referencia»; cierra el bloque con una idea completa.\n';
+
 export interface ScriptPrompt {
   system: string;
   user: string;
@@ -138,6 +146,7 @@ export function chapterNarrationPrompt(i: ChapterScriptInput): ScriptPrompt {
     '- Empieza con una frase de transición hacia este capítulo.\n' +
     '- No inventes datos técnicos, estadísticas o citas que no estén en el extracto de referencia.\n' +
     AUDIO_TRUTH_RULE +
+    AUDIO_SCOPE_RULE +
     audioLocaleRule(i.pais) +
     '- Texto plano, sin markdown, sin títulos, sin listas, sin asteriscos.\n' +
     '- Responde SOLO con el bloque narrado, sin preámbulos ni explicaciones.';
@@ -159,6 +168,7 @@ export function chapterContinuationPrompt(existingText: string, chapterTitle: st
     '- NO repitas ni resumas lo ya escrito — continúa la idea.\n' +
     '- Mismo tono conversacional, estilo clase hablada.\n' +
     AUDIO_TRUTH_RULE +
+    AUDIO_SCOPE_RULE +
     audioLocaleRule(pais) +
     '- Texto plano, sin markdown.\n' +
     '- Responde SOLO con el texto de continuación, sin preámbulos.';
