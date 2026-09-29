@@ -608,6 +608,7 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
           chapterTitle: item.blueprint?.chapter?.title ?? `Capítulo ${item.chapterNumber ?? '?'}`,
           sector: (item.context?.courseContext as any)?.sector ?? null,
           nivel: (item.context?.courseContext as any)?.nivel ?? null,
+          pais: (item.context?.courseContext as any)?.pais ?? null,
           contentMarkdown: markdown,
         },
         async (prompt, role) => {

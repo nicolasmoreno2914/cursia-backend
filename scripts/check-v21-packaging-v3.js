@@ -275,7 +275,7 @@ const MATRIX = [
     assert(html.trim().endsWith('</html>'), '</html>');
     assert(html.includes('@media print') && html.includes(theme.color.accentStrong), 'print CSS + tokens');
     assert(html.includes('Al terminar este módulo podrás') && html.includes('Bibliografía general del curso'), 'prefacio + bibliografía');
-    assert(html.includes('La revolución del servicio') && html.includes('(1990)'), 'entradas de bibliografía');
+    assert(html.includes('Visible Learning') && html.includes('(2009)'), 'entradas de bibliografía (verificadas)');
     for (const m of input.manifest.modules) for (const c of m.chapters) assert(html.includes(`id="cap-${c.chapterNumber}"`), `capítulo ${c.chapterNumber}`);
     const words = r.expectations.facts.libro.wordCount;
     assert(words > 100, 'palabras medidas');
@@ -661,7 +661,7 @@ const MATRIX = [
     for (const [f, v] of [['builderVersion', '3.0.1'], ['manifestSha256', 'm2'], ['sourceArtifactIds', ['a']], ['themeSha256', 't2'], ['assessmentProfileSha256', 'p2'], ['h5pProfileVersion', 2], ['vcRendererVersion', 'r2'], ['moodleVersion', '4.5']]) {
       assert(PK.packageReuseHashV3({ ...baseK, [f]: v }) !== k0, `cambia con ${f}`);
     }
-    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.0.3' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
+    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.0.4' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
   });
 
   // ── Medios ────────────────────────────────────────────────────────────────

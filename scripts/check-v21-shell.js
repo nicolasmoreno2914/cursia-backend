@@ -259,6 +259,23 @@ async function pureChecks() {
     for (const ch of fr.chapters) eq(ch.activityType, typeRef(ch.id), `cap ${ch.number}`);
   });
 
+  await check('R14: ningún label del capítulo contiene un código de emoticón de Moodle (el filtro rompería el HTML: "ch8-opening" → 8-o)', () => {
+    const big = F.buildCourse(DIST, {
+      courseId: 502, modules: [0, 1, 2].map((mi) => ({ examEnabled: mi < 2, chapters: Array.from({ length: 7 }, (_, i) => ({ video: i % 2 === 0, activity: i % 3 === 0 })) })),
+    });
+    const fb = factsOf(big, { artifacts: F.measuredArtifacts(big.manifest, { finalExamQuestionCount: 20 }) });
+    const all = S.assembleAllChapters(fb, F.experiencesFor(big.manifest), THEME);
+    assert(all.length === 21, `21 capítulos (${all.length})`);
+    // Códigos por defecto del filtro emoticon de Moodle con dígito o guion (los de ":" no aparecen en atributos).
+    const EMO = /\d-[o).\[|]|B-\)|\^-\)|xx-P|V-\.|\}-\]|P-\|/;
+    for (const { chapterNumber, slots } of all) for (const sl of slots) {
+      const html = sl.html || '';
+      const attrs = (html.match(/(?:class|id|data-cvc-uid|aria-labelledby|for)="[^"]*"/g) || []).join(' ');
+      const css = (html.match(/<style>[\s\S]*?<\/style>/g) || []).join(' ');
+      assert(!EMO.test(attrs) && !EMO.test(css), `cap ${chapterNumber} ${sl.role}: ${(attrs.match(EMO) || css.match(EMO) || [])[0]}`);
+    }
+  });
+
   await check('ensamblador: secuencias EXACTAS por combinación V/A (§F.3)', () => {
     const exp = {
       'VA': ['label:opening', 'presentation', 'label:deepening', 'label:video_primer', 'video_h5p', 'label:synthesis', 'label:activity_instruction', 'activity', 'label:closing'],
@@ -376,6 +393,10 @@ async function pureChecks() {
     const enh = shellLabels(f2, c2, THEME, 'enhanced');
     labels.forEach((l, i) => eq(vc.extractText(enh[i].html), vc.extractText(l.html), `texto CLEAN_SAFE = ENHANCED (${l.name})`));
     throwsRe(() => S.libroCardLabel(0, f2, THEME), /libroMid/, 'libroMid inválido');
+    // R14: la tarjeta solo promete "bibliografía sugerida" si el Libro publica la sección (verificada).
+    assert(/bibliograf/i.test(vc.extractText(byName['Libro Guía'].html)), 'con bibliografía la menciona');
+    const f2nb = factsOf(c2, { artifacts: { ...F.measuredArtifacts(c2.manifest), libroHasBibliography: false } });
+    assert(!/bibliograf/i.test(vc.extractText(S.libroCardLabel(77, f2nb, THEME).html)), 'sin bibliografía no la promete');
     throwsRe(() => S.welcomeLabel(f2, { ...F.courseIntroFixture(), welcome: 'Muy corto.' }, THEME), /COURSE_INTRO_V3_INVALID.*WORD_RANGE/, 'intro inválida no se renderiza');
   });
 
