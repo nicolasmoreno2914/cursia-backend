@@ -13,7 +13,7 @@
 //   Videogen   — VIDEOGEN_API_KEY
 //   YouTube    — YOUTUBE_CLIENT_ID / _SECRET / _REDIRECT_URI / _TOKEN_SECRET + canal conectado activo (DB)
 //   FinOps     — FINOPS_INGEST_TOKEN + catálogo de precios vigente (DB); informa verificados y políticas
-// y DYNAMIC_PROVIDER_WORKER_ENABLED (debe seguir en false hasta aprobar la calibración).
+// y DYNAMIC_PROVIDER_WORKER_ENABLED (en staging queda encendido desde 2026-09-29).
 //
 // Gamma theme discovery (read-only): con GAMMA_API_KEY y PREFLIGHT_GAMMA_THEMES=1, y solo si falta
 // algún tema, GET /themes (no genera nada ni consume créditos) para elegir los ids.
@@ -127,7 +127,7 @@ async function main() {
   if (db && db.error) console.log(`⚠️  DB de staging no consultable (${db.error}): YouTube/FinOps evaluados solo por variables`);
   console.log(`  TTS: modelo ${present(env, 'OPENAI_TTS_MODEL') ? 'configurado' : 'default del código'}, voz ${present(env, 'OPENAI_TTS_VOICE') ? 'configurada' : 'default del código'}`);
   const worker = env.DYNAMIC_PROVIDER_WORKER_ENABLED;
-  console.log(`${worker === 'true' ? '⚠️ ' : '✓'} DYNAMIC_PROVIDER_WORKER_ENABLED: ${worker === 'true' ? 'ENCENDIDO (proveedores reales habilitados)' : 'apagado'}`);
+  console.log(`${worker === 'true' ? '✓' : '⚠️ '} DYNAMIC_PROVIDER_WORKER_ENABLED: ${worker === 'true' ? 'ENCENDIDO (proveedores reales habilitados)' : 'APAGADO (runs con Gamma/TTS → PROVIDER_WORKER_NOT_DEPLOYED)'}`);
   if (db && !db.error) {
     for (const r of db.pricing) console.log(`  pricing_catalog ${r.provider}: ${r.n} filas vigentes, ${r.verified} verificadas`);
     console.log(`  cost_budget_policies: ${db.policies.length ? db.policies.map((r) => `${r.scope} ${r.n}`).join(', ') : 'ninguna (el gate responde ADMIN_APPROVAL: fail closed)'}`);

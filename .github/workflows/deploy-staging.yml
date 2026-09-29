@@ -26,7 +26,8 @@ on:
     branches: [staging]
   # Calibración V2.1 (#2): con calibration_action ≠ none el dispatch corre SOLO el job
   # `calibration` (sin rsync / npm / migraciones / reinicio de los 11 procesos). Un push o un
-  # dispatch con none despliega, y todo deploy deja DYNAMIC_PROVIDER_WORKER_ENABLED=false.
+  # dispatch con none despliega, y todo deploy deja DYNAMIC_PROVIDER_WORKER_ENABLED=true
+  # (staging operativo para generar cursos completos; worker_off lo apaga hasta el próximo deploy).
   workflow_dispatch:
     inputs:
       calibration_action:
@@ -418,8 +419,7 @@ jobs:
                ensure_env_default_if_absent DYNAMIC_VIDEO_DELIVERY youtube
                # Aceptación rv3 de V2.1 (autorizado por Nicolás, 2026-09-26): reglas v3 en
                # staging. Revertir = cambiar este 3 por 2 (los runs existentes conservan
-               # su rulesVersion congelado). Los proveedores reales siguen apagados:
-               # DYNAMIC_PROVIDER_WORKER_ENABLED no se toca acá.
+               # su rulesVersion congelado). El worker de proveedores se fija en [0c].
                ensure_env_exact DYNAMIC_MANIFEST_RULES_VERSION 3
                if grep -q "^DYNAMIC_COHERENCE_LLM=" .env; then
                  echo "⚠️  DYNAMIC_COHERENCE_LLM está en el .env de staging — no se toca (la decisión de pre-aceptación es dejarlo OFF)"
@@ -429,9 +429,12 @@ jobs:
 
                echo "━━━ [0c] V2.1: FinOps + proveedores (solo el .env de STAGING) ━━━"
                ensure_env_secret FINOPS_INGEST_TOKEN "${_FIT:-}"
-               # Worker de proveedores reales: todo deploy lo deja APAGADO. Encenderlo es una acción
-               # explícita de staging-calibration.yml (worker_on), que reinicia solo 2 procesos.
-               ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED false
+               # Worker de proveedores reales (Gamma/TTS): ENCENDIDO de forma permanente en staging
+               # (autorizado por Nicolás, 2026-09-29: staging debe generar cursos completos desde la
+               # UI). El gasto sigue bajo los gates FinOps (aprobación, límites por run/curso, guard
+               # previo a cada llamada pagada). Apagado de emergencia: dispatch worker_off (dura
+               # hasta el próximo deploy; para dejarlo apagado, cambiar este true por false).
+               ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED true
                # Gamma V2.1: temas por defecto (ids públicos de Gamma, no secretos), elegidos del
                # listado real de la cuenta (GET /themes). Solo si faltan: un valor puesto a mano gana.
                ensure_env_default_if_absent GAMMA_THEME_V21_LIGHT_DEFAULT default-light

@@ -435,9 +435,9 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       'ensure_env_flag_true DYNAMIC_COURSE_STRUCTURE',
     ]) assert(block.includes(needle), `falta: ${needle}`);
     assert(!/(ensure_\w+|printf[^\n]*>>\s*\.env)[^\n]*DYNAMIC_COHERENCE_LLM/.test(block), 'DYNAMIC_COHERENCE_LLM no debe escribirse');
-    // Calibración #2: el deploy NUNCA enciende el worker (eso es staging-calibration.yml worker_on).
-    assert(!/DYNAMIC_PROVIDER_WORKER_ENABLED\s+true/.test(block), 'DYNAMIC_PROVIDER_WORKER_ENABLED nunca se enciende desde el deploy');
-    assert(block.includes('ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED false'), 'el deploy lo deja explícitamente en false');
+    // 2026-09-29 (autorizado por Nicolás): staging queda operativo, el deploy deja el worker ENCENDIDO.
+    assert(!/DYNAMIC_PROVIDER_WORKER_ENABLED\s+false/.test(block), 'el deploy de staging ya no apaga el worker');
+    assert(block.includes('ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED true'), 'el deploy lo deja explícitamente en true');
     const SECRET = 'valor-secreto-no-imprimir-123';
     const scenarios = [
       { label: '.env mínimo', env: `NODE_ENV=production\nSUPABASE_SERVICE_KEY=${SECRET}\n` },
@@ -493,7 +493,7 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     }
   });
 
-  await check('(a) deploy-staging.yml [0c]: FinOps token por stdin (nunca impreso), worker de proveedores en false, idempotente, solo .env de staging', () => {
+  await check('(a) deploy-staging.yml [0c]: FinOps token por stdin (nunca impreso), worker de proveedores en true, idempotente, solo .env de staging', () => {
     const script = remoteScriptOf(pm2StepOf(stagingText, 'deploy-staging.yml').text);
     const lines = script.split('\n');
     const fnStart = lines.findIndex((l) => l.startsWith('_Q_CR='));
@@ -516,7 +516,7 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       assert(!/=/.test(out.replace(/^.*━━━.*$/gm, '')), `imprimió un KEY=VALUE:\n${out}`);
       const kv = Object.fromEntries(fs.readFileSync(path.join(dir, '.env'), 'utf8').split('\n').filter((l) => /^[A-Z0-9_]+=/.test(l)).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
       eq(kv.FINOPS_INGEST_TOKEN, TOKEN, 'token escrito');
-      eq(kv.DYNAMIC_PROVIDER_WORKER_ENABLED, 'false', 'worker de proveedores apagado');
+      eq(kv.DYNAMIC_PROVIDER_WORKER_ENABLED, 'true', 'worker de proveedores encendido');
       eq(kv.VIDEOGEN_API_KEY, STG.VG, 'claves de staging intactas');
       for (const k of ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GAMMA_API_KEY']) assert(!(k in kv), `no debe agregar ${k}`);
       eq([kv.GAMMA_THEME_V21_LIGHT_DEFAULT, kv.GAMMA_THEME_V21_DARK_DEFAULT], ['default-light', 'default-dark'], 'temas Gamma por defecto');
@@ -531,10 +531,10 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       fs.writeFileSync(path.join(dir, '.env'), before.replace('GAMMA_THEME_V21_LIGHT_DEFAULT=default-light', 'GAMMA_THEME_V21_LIGHT_DEFAULT=manual-theme'));
       assert(run(TOKEN).status === 0, 'corrida con tema manual');
       assert(/GAMMA_THEME_V21_LIGHT_DEFAULT=manual-theme/.test(fs.readFileSync(path.join(dir, '.env'), 'utf8')), 'tema manual respetado');
-      // Calibración #2: aunque alguien lo haya encendido (worker_on), un deploy lo vuelve a false.
-      fs.writeFileSync(path.join(dir, '.env'), fs.readFileSync(path.join(dir, '.env'), 'utf8').replace(/^DYNAMIC_PROVIDER_WORKER_ENABLED=.*$/m, 'DYNAMIC_PROVIDER_WORKER_ENABLED=true'));
-      assert(run(TOKEN).status === 0, 'deploy con worker encendido');
-      eq((fs.readFileSync(path.join(dir, '.env'), 'utf8').match(/^DYNAMIC_PROVIDER_WORKER_ENABLED=(.*)$/m) || [])[1], 'false', 'deploy → worker false');
+      // Aunque alguien lo haya apagado (worker_off), un deploy lo vuelve a true (una sola línea).
+      fs.writeFileSync(path.join(dir, '.env'), fs.readFileSync(path.join(dir, '.env'), 'utf8').replace(/^DYNAMIC_PROVIDER_WORKER_ENABLED=.*$/m, 'DYNAMIC_PROVIDER_WORKER_ENABLED=false'));
+      assert(run(TOKEN).status === 0, 'deploy con worker apagado');
+      eq((fs.readFileSync(path.join(dir, '.env'), 'utf8').match(/^DYNAMIC_PROVIDER_WORKER_ENABLED=(.*)$/m) || [])[1], 'true', 'deploy → worker true');
       eq((fs.readFileSync(path.join(dir, '.env'), 'utf8').match(/^DYNAMIC_PROVIDER_WORKER_ENABLED=/gm) || []).length, 1, 'una sola línea del flag');
       const kv2 = Object.fromEntries(fs.readFileSync(path.join(dir, '.env'), 'utf8').split('\n').filter((l) => /^[A-Z0-9_]+=/.test(l)).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
       eq([kv2.DB_POOL_MAX, kv2.DB_POOL_MAX_WORKER, kv2.DB_POOL_IDLE_MS_WORKER], ['2', '1', '1000'], 'pool de staging (EMAXCONNSESSION)');
