@@ -115,11 +115,12 @@ export const AUTO_HEAL_ALLOW_LIST: readonly AutoHealRule[] = Object.freeze([
  * configuración o permisos → siempre humano.
  */
 export const AUTO_HEAL_DENY_PATTERNS: readonly RegExp[] = Object.freeze([
-  new RegExp(`\\b${PROVIDER_RECONCILIATION_REQUIRED}\\b`, 'i'),
-  new RegExp(`\\b${BUDGET_EXCEEDED}\\b`, 'i'),
-  new RegExp(`\\b${BUDGET_APPROVAL_REQUIRED}\\b`, 'i'),
+  // Subcadena (sin \b): `_` es carácter de palabra y un prefijo como `youtube_…` escondería el código.
+  new RegExp(PROVIDER_RECONCILIATION_REQUIRED, 'i'),
+  new RegExp(BUDGET_EXCEEDED, 'i'),
+  new RegExp(BUDGET_APPROVAL_REQUIRED, 'i'),
   /ambiguous|ambigu[oa]/i,
-  /\bquota\b|\bcuota\b/i,
+  /quota|cuota/i,
   /presupuesto/i,
   /not_allowed|not_configured|not_ready|provider_mode_unset|mock_not_allowed/i,
   /blocked_auth|youtube_preflight/i,
