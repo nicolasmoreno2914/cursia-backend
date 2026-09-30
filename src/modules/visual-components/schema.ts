@@ -70,7 +70,9 @@ export interface VcWorkedExample {
   result: string;
   takeaway?: string;
 }
-export type VcDiagramKind = 'cycle' | 'flow' | 'hierarchy' | 'matrix';
+/** Formas de diagrama que se describen con `nodes`. */
+export type VcNodeDiagramKind = 'cycle' | 'flow' | 'hierarchy' | 'matrix';
+export type VcDiagramKind = VcNodeDiagramKind | 'decision';
 /**
  * Edu Phase A — diagrama educativo. Formas fijas; el LLM llena nodos, Cursia dibuja
  * (HTML/CSS + SVG decorativo en ENHANCED; lista/tabla legible en CLEAN_SAFE).
@@ -79,15 +81,41 @@ export type VcDiagramKind = 'cycle' | 'flow' | 'hierarchy' | 'matrix';
  *  - matrix: exactamente 4 cuadrantes [arriba-izq, arriba-der, abajo-izq, abajo-der] + x_axis/y_axis
  *    (cada eje crece hacia la derecha / hacia arriba).
  */
-export interface VcDiagram {
+export interface VcNodeDiagram {
   type: 'diagram';
-  kind: VcDiagramKind;
+  kind: VcNodeDiagramKind;
   title: string;
   caption?: string;
   nodes: { label: string; detail?: string }[];
   x_axis?: string;
   y_axis?: string;
 }
+/**
+ * EV6 — árbol de decisión (kind "decision"): una pregunta con dos ramas (Sí / No); cada rama
+ * termina en una acción o abre otra pregunta. Reemplaza al flujo "1 ¿Responde? → 2 Sí → …"
+ * que enseñaba como secuencia algo que se ramifica. Límites en VC_DECISION_LIMITS.
+ */
+export interface VcDecisionBranch {
+  /** Rótulo de la rama (por defecto «Sí» / «No»). */
+  label?: string;
+  /** Acción final (exactamente una de action | tree). */
+  action?: string;
+  /** Otra pregunta (exactamente una de action | tree). */
+  tree?: VcDecisionNode;
+}
+export interface VcDecisionNode {
+  question: string;
+  yes: VcDecisionBranch;
+  no: VcDecisionBranch;
+}
+export interface VcDecisionDiagram {
+  type: 'diagram';
+  kind: 'decision';
+  title?: string;
+  caption?: string;
+  tree: VcDecisionNode;
+}
+export type VcDiagram = VcNodeDiagram | VcDecisionDiagram;
 
 export type VcComponent =
   | VcHero
@@ -130,13 +158,25 @@ const T = (max: number, optional = false): VcFieldSpec => ({ kind: 'text', max, 
 const TITLE = T(120, true);
 
 export const VC_CALLOUT_VARIANTS: readonly VcCalloutVariant[] = ['tip', 'warning', 'info', 'example'];
-export const VC_DIAGRAM_KINDS: readonly VcDiagramKind[] = ['cycle', 'flow', 'hierarchy', 'matrix'];
+export const VC_DIAGRAM_KINDS: readonly VcDiagramKind[] = ['cycle', 'flow', 'hierarchy', 'matrix', 'decision'];
 /** Nodos por forma de diagrama [min, max] (además del rango genérico 2–8 del spec). */
-export const VC_DIAGRAM_NODES: Record<VcDiagramKind, [number, number]> = {
+export const VC_DIAGRAM_NODES: Record<VcNodeDiagramKind, [number, number]> = {
   cycle: [3, 6],
   flow: [3, 6],
   hierarchy: [3, 6],
   matrix: [4, 4],
+};
+/**
+ * EV6 — árbol de decisión: la pregunta termina en «?»; profundidad = preguntas en un camino.
+ * La forma (question/yes/no, label/action/tree) la valida validate.ts (el árbol es recursivo:
+ * no entra en VC_COMPONENT_SPECS).
+ */
+export const VC_DECISION_LIMITS = { questionMax: 90, actionMax: 90, labelMax: 24, maxDepth: 3, maxQuestions: 4 } as const;
+/** Campos de primer nivel de un diagrama "decision" (el `tree` se valida aparte). */
+export const VC_DECISION_DIAGRAM_SPEC: Record<string, VcFieldSpec> = {
+  kind: { kind: 'enum', values: ['decision'] },
+  title: T(120, true),
+  caption: T(300, true),
 };
 /** Tipos cuyos textos son datos ILUSTRATIVOS: cifras y % permitidos (no cantidades del curso). */
 export const VC_ILLUSTRATIVE_TYPES: readonly VcComponentType[] = ['worked_example'];

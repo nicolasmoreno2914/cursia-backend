@@ -88,7 +88,7 @@ check('espejo del frontend (44): DYN_VC_COMPONENT_SPECS, nodos por diagrama y ti
   const ctx = { console: { log() {}, warn() {}, error() {} } };
   ctx.window = ctx;
   vm.createContext(ctx);
-  vm.runInContext(fs.readFileSync(file, 'utf8') + '\n;this.__specs = DYN_VC_COMPONENT_SPECS; this.__nodes = DYN_VC_DIAGRAM_NODES; this.__ill = DYN_VC_ILLUSTRATIVE_TYPES; this.__limits = DYN_VC_MOVEMENT_LIMITS; this.__ped = typeof DYN_VC_PEDAGOGY !== "undefined" ? DYN_VC_PEDAGOGY : null;', ctx);
+  vm.runInContext(fs.readFileSync(file, 'utf8') + '\n;this.__specs = DYN_VC_COMPONENT_SPECS; this.__nodes = DYN_VC_DIAGRAM_NODES; this.__ill = DYN_VC_ILLUSTRATIVE_TYPES; this.__limits = DYN_VC_MOVEMENT_LIMITS; this.__ped = typeof DYN_VC_PEDAGOGY !== "undefined" ? DYN_VC_PEDAGOGY : null; this.__dec = DYN_VC_DECISION_LIMITS; this.__decSpec = DYN_VC_DECISION_DIAGRAM_SPEC;', ctx);
   const canon = (v) => (Array.isArray(v) ? v.map(canon) : v && typeof v === 'object' ? Object.keys(v).sort().reduce((o, k) => ((o[k] = canon(v[k])), o), {}) : v);
   const norm = (spec) => canon(JSON.parse(JSON.stringify(spec, (k, v) => (k === 'optional' && v === false ? undefined : v))));
   const be = norm(vc.VC_COMPONENT_SPECS);
@@ -99,6 +99,9 @@ check('espejo del frontend (44): DYN_VC_COMPONENT_SPECS, nodos por diagrama y ti
   assert(JSON.stringify(Array.from(ctx.__ill)) === JSON.stringify(Array.from(vc.VC_ILLUSTRATIVE_TYPES)), 'VC_ILLUSTRATIVE_TYPES');
   assert(JSON.stringify(canon(ctx.__limits)) === JSON.stringify(canon(vc.VC_MOVEMENT_LIMITS)), `VC_MOVEMENT_LIMITS: FE ${JSON.stringify(ctx.__limits)} ≠ BE ${JSON.stringify(vc.VC_MOVEMENT_LIMITS)}`);
   if (vc.VC_PEDAGOGY) assert(JSON.stringify(canon(ctx.__ped)) === JSON.stringify(canon(vc.VC_PEDAGOGY)), `VC_PEDAGOGY: FE ${JSON.stringify(ctx.__ped)} ≠ BE ${JSON.stringify(vc.VC_PEDAGOGY)}`);
+  // EV6: árbol de decisión (límites + spec de primer nivel)
+  assert(JSON.stringify(canon(ctx.__dec)) === JSON.stringify(canon(vc.VC_DECISION_LIMITS)), `VC_DECISION_LIMITS: FE ${JSON.stringify(ctx.__dec)} ≠ BE ${JSON.stringify(vc.VC_DECISION_LIMITS)}`);
+  assert(JSON.stringify(norm(ctx.__decSpec)) === JSON.stringify(norm(vc.VC_DECISION_DIAGRAM_SPEC)), `VC_DECISION_DIAGRAM_SPEC: FE ${JSON.stringify(ctx.__decSpec)} ≠ BE`);
 });
 
 check('EV5: guiones suaves en fronteras de sílaba, *énfasis* simple sin asteriscos literales, hero sin repetir el título', () => {
@@ -224,6 +227,144 @@ check('Edu Phase A: diagram — nodos por forma y ejes solo en matriz (DIAGRAM_S
   assert(codes(we).includes('QUANTITY_CLAIM'), 'cantidades del curso siguen prohibidas en el ejemplo');
   const callout = { type: 'callout', variant: 'info', body: 'El 30 % de los reclamos se repite.' };
   assert(codes(callout).includes('QUANTITY_CLAIM'), '% fuera del ejemplo resuelto sigue prohibido');
+});
+
+// ─── EV6 — árbol de decisión y diagramas simulados con texto ───────────────
+const DEC = (tree, extra) => Object.assign({ type: 'diagram', kind: 'decision', title: 'Valoración inicial', tree }, extra || {});
+const leaf = (a) => ({ action: a });
+const q = (question, yes, no) => ({ question, yes, no });
+const DEPTH1 = DEC(q('¿Responde cuando le hablas?', leaf('Mantenla acompañada y vigila su estado.'), leaf('Llama a emergencias y revisa si respira.')));
+const DEPTH3 = DEC(q('¿Responde?', { label: 'Consciente', action: 'Pregúntale qué pasó.' }, { label: 'Inconsciente', tree: q('¿Respira con normalidad?', leaf('Posición lateral de seguridad.'), { tree: q('¿Hay un desfibrilador cerca?', leaf('Inicia RCP y pide que lo traigan.'), leaf('Inicia RCP y llama a emergencias.')) }) }));
+
+check('EV6: diagram kind "decision" — forma, profundidad ≤ 3, ≤ 4 preguntas, «?» final, sin nodes/ejes; tree solo en decision', () => {
+  const codes = (c) => vc.validateComponent(c).map((e) => e.code);
+  const errs = (c) => vc.validateComponent(c);
+  assert(vc.VC_DIAGRAM_KINDS.includes('decision') && vc.VC_DECISION_LIMITS.maxDepth === 3 && vc.VC_DECISION_LIMITS.maxQuestions === 4, 'límites exportados');
+  assert(codes(DEPTH1).length === 0, 'profundidad 1: ' + JSON.stringify(errs(DEPTH1)));
+  assert(codes(DEPTH3).length === 0, 'profundidad 3: ' + JSON.stringify(errs(DEPTH3)));
+  const noTitle = F.clone(DEPTH1); delete noTitle.title;
+  assert(codes(noTitle).length === 0, 'title opcional en decision');
+  // acción Y subárbol en la misma rama
+  const both = F.clone(DEPTH1); both.tree.yes.tree = q('¿Otra?', leaf('a'), leaf('b'));
+  assert(errs(both).some((e) => e.code === 'DIAGRAM_SHAPE' && e.path === 'component.tree.yes'), 'action + tree: ' + JSON.stringify(errs(both)));
+  const neither = F.clone(DEPTH1); neither.tree.no = { label: 'No' };
+  assert(errs(neither).some((e) => e.code === 'DIAGRAM_SHAPE' && e.path === 'component.tree.no'), 'rama vacía');
+  // profundidad 4
+  const deep = DEC(q('¿A?', leaf('x'), { tree: q('¿B?', leaf('x'), { tree: q('¿C?', leaf('x'), { tree: q('¿D?', leaf('x'), leaf('y')) }) }) }));
+  assert(errs(deep).some((e) => e.code === 'DIAGRAM_SHAPE' && /encadenadas/.test(e.message) && e.path === 'component.tree.no.tree.no.tree.no.tree'), 'profundidad 4: ' + JSON.stringify(errs(deep)));
+  // 5 preguntas con profundidad ≤ 3
+  const wide = DEC(q('¿A?', { tree: q('¿B?', { tree: q('¿C?', leaf('x'), leaf('y')) }, leaf('z')) }, { tree: q('¿D?', { tree: q('¿E?', leaf('x'), leaf('y')) }, leaf('z')) }));
+  assert(errs(wide).some((e) => e.code === 'DIAGRAM_SHAPE' && /como máximo 4 preguntas \(hay 5\)/.test(e.message)), '5 preguntas: ' + JSON.stringify(errs(wide)));
+  assert(!errs(wide).some((e) => /encadenadas/.test(e.message)), '5 preguntas en profundidad 3 no es error de profundidad');
+  // sin «?»
+  const noQ = F.clone(DEPTH1); noQ.tree.question = 'La persona responde';
+  assert(errs(noQ).some((e) => e.code === 'DIAGRAM_SHAPE' && e.path === 'component.tree.question'), 'pregunta sin «?»');
+  // nodes / ejes en decision; tree en flow
+  const withNodes = Object.assign(F.clone(DEPTH1), { nodes: [{ label: 'a' }, { label: 'b' }, { label: 'c' }], x_axis: 'x' });
+  const wn = errs(withNodes);
+  assert(wn.some((e) => e.code === 'DIAGRAM_SHAPE' && e.path === 'component.nodes') && wn.some((e) => e.code === 'DIAGRAM_SHAPE' && e.path === 'component.x_axis'), 'nodes/ejes en decision: ' + JSON.stringify(wn));
+  const flowTree = { type: 'diagram', kind: 'flow', title: 'Flujo', nodes: [{ label: 'A' }, { label: 'B' }, { label: 'C' }], tree: DEPTH1.tree };
+  assert(JSON.stringify(codes(flowTree)) === '["DIAGRAM_SHAPE"]', 'tree en flow: ' + JSON.stringify(errs(flowTree)));
+  const noTree = F.clone(DEPTH1); delete noTree.tree;
+  assert(codes(noTree).includes('MISSING_FIELD'), 'decision sin tree');
+  // longitudes, campos extra, lints de texto dentro del árbol
+  const long = F.clone(DEPTH1); long.tree.question = '¿' + 'x'.repeat(90) + '?'; long.tree.yes.label = 'y'.repeat(25); long.tree.no.action = 'z'.repeat(91); long.tree.no.extra = 1; long.tree.extra = 1;
+  const lc = errs(long).map((e) => e.code + ' ' + e.path);
+  for (const want of ['TEXT_TOO_LONG component.tree.question', 'TEXT_TOO_LONG component.tree.yes.label', 'TEXT_TOO_LONG component.tree.no.action', 'UNKNOWN_FIELD component.tree.no.extra', 'UNKNOWN_FIELD component.tree.extra']) assert(lc.includes(want), `falta ${want}: ${JSON.stringify(lc)}`);
+  const lint = F.clone(DEPTH1); lint.tree.no.action = 'Revisa el video del capítulo.';
+  assert(codes(lint).includes('RESOURCE_MENTION'), 'lints R2 dentro del árbol');
+  // árbol hostil muy profundo: termina y reporta
+  let hostile = leaf('fin');
+  for (let i = 0; i < 2000; i++) hostile = { tree: q('¿N?', leaf('x'), hostile) };
+  assert(codes(DEC(hostile.tree)).includes('DIAGRAM_SHAPE'), 'árbol hostil');
+  // capítulo con decision en deepening: schema + pedagogía (cuenta como recurso visual)
+  const d = F.buildExperience();
+  d.movements.deepening = [d.movements.deepening[0], F.clone(DEPTH3)];
+  d.movements.opening[0] = { type: 'hero', title: 'Primeros pasos', lead: 'Antes de actuar, decide con criterio.' };
+  d.movements.closing = [d.movements.closing[1]];
+  assert(vc.validateExperience(d).ok, 'experiencia con decision: ' + JSON.stringify(vc.validateExperience(d).errors));
+  assert(!vc.validatePedagogy(d).some((e) => /recurso visual/.test(e.message)), 'decision cuenta como recurso visual: ' + JSON.stringify(vc.validatePedagogy(d)));
+});
+
+check('EV6: validateSimulatedDiagrams — DIAGRAM_BRANCHING_IN_SEQUENCE y TEXT_SIMULATED_DIAGRAM (sin falsos positivos)', () => {
+  const doc = (deepExtra, bridge) => {
+    const d = F.buildExperience();
+    if (deepExtra) d.movements.deepening = [d.movements.deepening[0], deepExtra];
+    if (bridge !== undefined) d.bridge_to_next = bridge;
+    return d;
+  };
+  const codesAt = (d) => vc.validateSimulatedDiagrams(d).map((e) => `${e.code} ${e.path}`);
+  assert(vc.validateSimulatedDiagrams(F.buildExperience()).length === 0, 'fixture completo sin hallazgos: ' + JSON.stringify(vc.validateSimulatedDiagrams(F.buildExperience())));
+  // Auditoría #413: árbol aplanado en un flujo
+  const flat = { type: 'diagram', kind: 'flow', title: 'Valoración', nodes: [{ label: '¿Responde?' }, { label: 'Sí → Consciente' }, { label: 'No → Inconsciente' }, { label: '¿Respira?' }] };
+  const fc = codesAt(doc(flat));
+  assert(fc.includes('DIAGRAM_BRANCHING_IN_SEQUENCE $.movements.deepening[1].nodes[1].label') && fc.includes('DIAGRAM_BRANCHING_IN_SEQUENCE $.movements.deepening[1].nodes[2].label'), 'flujo aplanado: ' + JSON.stringify(fc));
+  for (const [type, list, field] of [['process_steps', 'steps', 'heading'], ['timeline', 'events', 'heading']]) {
+    for (const head of ['Sí: llama al supervisor', 'No - espera la señal', 'Si no responde, pide ayuda', 'En caso contrario, detén la máquina', 'SÍ → sigue', 'no: detén']) {
+      const items = [0, 1, 2].map((i) => Object.assign({ heading: i === 1 ? head : 'Paso normal ' + 'abc'[i], body: 'Detalle del paso.' }, type === 'timeline' ? { marker: 'Etapa' } : {}));
+      const c = { type, [list]: items };
+      assert(codesAt(doc(c)).includes(`DIAGRAM_BRANCHING_IN_SEQUENCE $.movements.deepening[1].${list}[1].${field}`), `${type} "${head}": ${JSON.stringify(codesAt(doc(c)))}`);
+    }
+  }
+  for (const head of ['Sistema de bloqueo', 'Silencio operativo', 'Nota: revisa el tablero', 'No-conformidades del lote', 'Normas vigentes', 'Si el equipo vibra, detén la línea', 'Señales de alerta']) {
+    const c = { type: 'process_steps', steps: [{ heading: head, body: 'Detalle.' }, { heading: 'Otro paso', body: 'Detalle.' }, { heading: 'Cierre', body: 'Detalle.' }] };
+    assert(codesAt(doc(c)).length === 0, `falso positivo "${head}": ${JSON.stringify(codesAt(doc(c)))}`);
+    assert(!vc.isBranchHead(head), `isBranchHead("${head}")`);
+  }
+  // flechas
+  for (const t of ['Paso 1 → Paso 2 → Paso 3', 'Recibir -> clasificar -> responder', 'Causa ⇒ efecto ⇒ medida', 'Observa → decide -> actúa']) {
+    const c = { type: 'callout', variant: 'info', body: t };
+    assert(codesAt(doc(null, t)).includes('TEXT_SIMULATED_DIAGRAM $.bridge_to_next'), `bridge "${t}"`);
+    const d = doc(); d.movements.opening[2] = c;
+    assert(codesAt(d).includes('TEXT_SIMULATED_DIAGRAM $.movements.opening[2].body'), `callout "${t}": ${JSON.stringify(codesAt(d))}`);
+  }
+  const nested = doc(); nested.movements.deepening[0].cards[0].definition = 'Entrada → proceso → salida.';
+  assert(codesAt(nested).includes('TEXT_SIMULATED_DIAGRAM $.movements.deepening[0].cards[0].definition'), 'campo anidado');
+  for (const t of ['El calor sube → el aceite pierde viscosidad.', 'Una flecha → aquí.\n\nOtra flecha → en otro párrafo.', 'Temperatura a 40 °C y presión estable.']) {
+    assert(codesAt(doc(null, t)).length === 0, `falso positivo flechas "${t}"`);
+  }
+  assert(vc.arrowChainLength('a → b → c') === 2 && vc.arrowChainLength('a → b\n\nc → d') === 1, 'arrowChainLength');
+  // el árbol de decisión real no dispara nada
+  assert(codesAt(doc(F.clone(DEPTH3))).length === 0, 'decision limpia');
+  // el empaque (validateExperience) no aplica estos lints: los cursos ya generados siguen válidos
+  assert(vc.validateExperience(doc(flat, 'Observa → decide → actúa.')).ok, 'validateExperience no cambia');
+});
+
+check('EV6: render de decision — CLEAN_SAFE sin <style>/flex/grid/height, orden «pregunta → Sí → No», ENHANCED con dos columnas solo si hay decision', () => {
+  for (const { combo, theme } of themes) {
+    for (const c of [DEPTH1, DEPTH3, components.find((x) => x.kind === 'decision')]) {
+      const clean = vc.renderMovement([c], theme, { uid: 'dt' });
+      for (const bad of ['<style', '<script', 'flex', 'grid', 'display:', 'aria-', 'border-radius']) assert(!clean.includes(bad), `${F.themeLabel(combo)}: "${bad}" en CLEAN_SAFE`);
+      assert(!/(?:^|[;"\s])(?:min-|max-)?height\s*:/.test(clean) && !/\sheight=/.test(clean), `${F.themeLabel(combo)}: height en CLEAN_SAFE (el purificador lo quita)`);
+      assert(vc.lintCleanSafe(clean).ok, `${F.themeLabel(combo)} lint clean: ${JSON.stringify(vc.lintCleanSafe(clean).errors.slice(0, 3))}`);
+      const enh = vc.renderMovement([c], theme, { uid: 'dt', level: 'enhanced' });
+      assert(vc.lintCleanSafe(enh).ok, `${F.themeLabel(combo)} lint enhanced`);
+      assert(enh.includes('.cvc-dt-d1>.cvc-dt-branches{display:grid'), 'dos columnas en ENHANCED');
+      assert(vc.extractText(clean) === vc.extractText(enh), 'mismo texto en ambos niveles');
+    }
+  }
+  const text = vc.extractText(vc.renderComponent(DEPTH1, themes[0].theme, { uid: 'o' }));
+  const order = ['Diagrama · Decisión', 'Valoración inicial', '¿Responde cuando le hablas?', 'Sí', 'Mantenla acompañada', 'No', 'Llama a emergencias'];
+  let from = 0;
+  for (const s of order) { const i = text.indexOf(s, from); assert(i >= 0, `orden: falta "${s}" después de ${from} en "${text}"`); from = i + s.length; }
+  // d3: el orden de lectura recorre el árbol en profundidad, «Sí» antes que «No» en cada nivel
+  const t3 = vc.extractText(vc.renderComponent(DEPTH3, themes[0].theme, { uid: 'o' }));
+  from = 0;
+  for (const s of ['¿Responde?', 'Consciente', 'Pregúntale', 'Inconsciente', '¿Respira', 'Sí', 'Posición lateral', 'No', '¿Hay un desfibrilador', 'Sí', 'pide que lo traigan', 'No', 'llama a emergencias']) { const i = t3.indexOf(s, from); assert(i >= 0, `orden d3: "${s}"`); from = i + s.length; }
+  // snapshot de estructura: par de acciones → <table> de 2 columnas; rama con subárbol → apilada
+  const h1 = vc.renderComponent(DEPTH1, themes[0].theme, { uid: 's' });
+  assert((h1.match(/<td class="cvc-dt-br/g) || []).length === 2 && !h1.includes('cvc-dt-branches'), 'profundidad 1: par lado a lado');
+  const h3 = vc.renderComponent(DEPTH3, themes[0].theme, { uid: 's' });
+  assert((h3.match(/class="cvc-dt-node cvc-dt-d/g) || []).length === 3 && h3.includes('cvc-dt-d3') && (h3.match(/class="cvc-dt-branches"/g) || []).length === 3, 'profundidad 3: 3 nodos, los 3 niveles apilados');
+  assert(!h3.includes('<table'), 'el par de nivel 3 se apila (no aprieta una tabla en un teléfono)');
+  assert(h3.includes('>Consciente<') && h3.split('&shy;').join('').includes('>Inconsciente<') && h3.includes('↙') && h3.includes('↘'), 'rótulos propios y conectores');
+  assert(vc.renderComponent(DEPTH1, themes[0].theme, { uid: 's' }) === h1, 'determinista');
+  // sin decision en el label: <style> byte-idéntico al de siempre (sin reglas cvc-dt)
+  const flow = components.find((x) => x.kind === 'flow');
+  assert(!vc.renderMovement([flow], themes[0].theme, { uid: 'f', level: 'enhanced' }).includes('cvc-dt'), 'labels sin decision no cargan sus reglas');
+  let msg = '';
+  try { vc.renderComponent({ type: 'diagram', kind: 'decision', tree: { question: '¿x?', yes: {}, no: { action: 'a' } } }, themes[0].theme, { uid: 'x' }); } catch (err) { msg = err.message; }
+  assert(/^VC_RENDER: diagram/.test(msg), 'rama sin action/tree → VC_RENDER: ' + msg);
 });
 
 check('validador: HTML en texto → HTML_IN_TEXT (tags, cierre, comentario)', () => {

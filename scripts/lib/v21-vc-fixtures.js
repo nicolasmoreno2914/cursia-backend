@@ -27,7 +27,7 @@ function loadFixture() {
   return JSON.parse(fs.readFileSync(FIXTURE, 'utf8'));
 }
 
-/** Un componente de cada tipo (18) + variantes de diagrama (flow/hierarchy/matrix) + variantes de callout + comparaciones de 3 y 4 columnas × 8 filas. */
+/** Un componente de cada tipo (18) + variantes de diagrama (flow/hierarchy/matrix/decision) + variantes de callout + comparaciones de 3 y 4 columnas × 8 filas. */
 function loadComponents() {
   const f = loadFixture();
   return [...f.components, ...f.callout_variants, ...(f.comparison_variants || []), ...(f.diagram_variants || [])].map(clone);

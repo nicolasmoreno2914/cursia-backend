@@ -13,6 +13,8 @@ import {
   VC_BRIDGE_MAX,
   VC_CHAPTER_ID_MAX,
   VC_COMPONENT_SPECS,
+  VC_DECISION_DIAGRAM_SPEC,
+  VC_DECISION_LIMITS,
   VC_DIAGRAM_NODES,
   VC_ILLUSTRATIVE_TYPES,
   VC_MAX_SAME_TYPE,
@@ -21,8 +23,8 @@ import {
   VC_MOVEMENT_LIMITS,
   VC_SCHEMA_VERSION,
   VcComponentType,
-  VcDiagramKind,
   VcFieldSpec,
+  VcNodeDiagramKind,
 } from './schema';
 import { lintView } from './text';
 
@@ -49,6 +51,8 @@ export type VcErrorCode =
   | 'RESOURCE_MENTION'
   | 'QUANTITY_CLAIM'
   | 'DIAGRAM_SHAPE'
+  | 'DIAGRAM_BRANCHING_IN_SEQUENCE'
+  | 'TEXT_SIMULATED_DIAGRAM'
   | 'PEDAGOGY_MISSING'
   | 'TEXT_DENSE'
   | 'CHAPTER_ID';
@@ -279,6 +283,60 @@ function checkObject(
   }
 }
 
+/**
+ * EV6 — árbol de decisión (recursivo): cada nodo {question, yes, no}; cada rama {label?, action | tree}.
+ * Profundidad ≤ maxDepth preguntas por camino y ≤ maxQuestions en total. No desciende más allá del
+ * límite (un árbol hostil muy profundo no recorre la pila).
+ */
+function checkDecisionNode(node: unknown, path: string, errors: VcValidationError[], depth: number, count: { n: number }): void {
+  const L = VC_DECISION_LIMITS;
+  if (!isPlainObject(node)) {
+    errors.push({ path, code: 'NOT_OBJECT', message: 'se esperaba un nodo {question, yes, no}' });
+    return;
+  }
+  count.n += 1;
+  if (depth > L.maxDepth) {
+    errors.push({ path, code: 'DIAGRAM_SHAPE', message: `un árbol de decisión tiene como máximo ${L.maxDepth} preguntas encadenadas en un camino` });
+    return;
+  }
+  for (const key of Object.keys(node)) {
+    if (!['question', 'yes', 'no'].includes(key)) errors.push({ path: `${path}.${key}`, code: 'UNKNOWN_FIELD', message: `campo no permitido "${key}"` });
+  }
+  if (node.question === undefined) {
+    errors.push({ path: `${path}.question`, code: 'MISSING_FIELD', message: 'falta "question"' });
+  } else {
+    checkText(node.question, `${path}.question`, L.questionMax, errors);
+    if (typeof node.question === 'string' && node.question.trim() && !node.question.trim().endsWith('?')) {
+      errors.push({ path: `${path}.question`, code: 'DIAGRAM_SHAPE', message: 'la pregunta de una decisión termina en "?"' });
+    }
+  }
+  for (const side of ['yes', 'no'] as const) {
+    const b = node[side];
+    const bpath = `${path}.${side}`;
+    if (b === undefined) {
+      errors.push({ path: bpath, code: 'MISSING_FIELD', message: `falta la rama "${side}"` });
+      continue;
+    }
+    if (!isPlainObject(b)) {
+      errors.push({ path: bpath, code: 'NOT_OBJECT', message: 'una rama es un objeto {label?, action | tree}' });
+      continue;
+    }
+    for (const key of Object.keys(b)) {
+      if (!['label', 'action', 'tree'].includes(key)) errors.push({ path: `${bpath}.${key}`, code: 'UNKNOWN_FIELD', message: `campo no permitido "${key}"` });
+    }
+    if (b.label !== undefined) checkText(b.label, `${bpath}.label`, L.labelMax, errors);
+    const hasAction = b.action !== undefined;
+    const hasTree = b.tree !== undefined;
+    if (hasAction && hasTree) {
+      errors.push({ path: bpath, code: 'DIAGRAM_SHAPE', message: 'una rama lleva "action" (acción final) o "tree" (otra pregunta), no ambos' });
+    } else if (!hasAction && !hasTree) {
+      errors.push({ path: bpath, code: 'DIAGRAM_SHAPE', message: 'una rama necesita "action" (acción final) o "tree" (otra pregunta)' });
+    }
+    if (hasAction) checkText(b.action, `${bpath}.action`, L.actionMax, errors);
+    if (hasTree) checkDecisionNode(b.tree, `${bpath}.tree`, errors, depth + 1, count);
+  }
+}
+
 /** Valida un componente suelto (sin reglas de movimiento). */
 export function validateComponent(c: unknown, path = 'component'): VcValidationError[] {
   const errors: VcValidationError[] = [];
@@ -291,9 +349,29 @@ export function validateComponent(c: unknown, path = 'component'): VcValidationE
     errors.push({ path: `${path}.type`, code: 'UNKNOWN_COMPONENT', message: `tipo de componente desconocido "${String(type)}"` });
     return errors;
   }
-  checkObject(VC_COMPONENT_SPECS[type as VcComponentType], c, path, errors, ['type'], VC_ILLUSTRATIVE_TYPES.includes(type as VcComponentType));
+  if (type === 'diagram' && c.kind === 'decision') {
+    // EV6: el árbol reemplaza a nodes/ejes (no se mezclan formas).
+    checkObject(VC_DECISION_DIAGRAM_SPEC, c, path, errors, ['type', 'tree', 'nodes', 'x_axis', 'y_axis']);
+    for (const k of ['nodes', 'x_axis', 'y_axis'] as const) {
+      if (c[k] !== undefined) errors.push({ path: `${path}.${k}`, code: 'DIAGRAM_SHAPE', message: `"${k}" no aplica a diagramas "decision" (usa "tree")` });
+    }
+    if (c.tree === undefined) {
+      errors.push({ path: `${path}.tree`, code: 'MISSING_FIELD', message: 'falta "tree"' });
+    } else {
+      const count = { n: 0 };
+      checkDecisionNode(c.tree, `${path}.tree`, errors, 1, count);
+      if (count.n > VC_DECISION_LIMITS.maxQuestions) {
+        errors.push({ path: `${path}.tree`, code: 'DIAGRAM_SHAPE', message: `un árbol de decisión lleva como máximo ${VC_DECISION_LIMITS.maxQuestions} preguntas (hay ${count.n})` });
+      }
+    }
+    return errors;
+  }
+  checkObject(VC_COMPONENT_SPECS[type as VcComponentType], c, path, errors, type === 'diagram' ? ['type', 'tree'] : ['type'], VC_ILLUSTRATIVE_TYPES.includes(type as VcComponentType));
+  if (type === 'diagram' && c.tree !== undefined) {
+    errors.push({ path: `${path}.tree`, code: 'DIAGRAM_SHAPE', message: '"tree" solo aplica a diagramas "decision"' });
+  }
   if (type === 'diagram' && typeof c.kind === 'string' && hasOwn(VC_DIAGRAM_NODES, c.kind)) {
-    const kind = c.kind as VcDiagramKind;
+    const kind = c.kind as VcNodeDiagramKind;
     const [nmin, nmax] = VC_DIAGRAM_NODES[kind];
     if (Array.isArray(c.nodes) && (c.nodes.length < nmin || c.nodes.length > nmax)) {
       errors.push({ path: `${path}.nodes`, code: 'DIAGRAM_SHAPE', message: `un diagrama "${kind}" lleva ${nmin === nmax ? nmin : `${nmin}–${nmax}`} nodos (hay ${c.nodes.length})` });

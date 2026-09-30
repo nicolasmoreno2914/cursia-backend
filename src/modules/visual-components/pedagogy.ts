@@ -8,8 +8,10 @@
  * (validación del item v3); NUNCA al empaquetar: los cursos ya generados siguen siendo
  * válidos con el schema R2 (validateExperience / assertValidExperience no cambian).
  */
+import { VC_MOVEMENT_IDS } from './schema';
 import type { ChapterExperience, VcComponentType } from './schema';
 import type { VcValidationError } from './validate';
+import { lintView } from './text';
 
 export const VC_PEDAGOGY = {
   /** La apertura empieza con una introducción visual. */
@@ -72,6 +74,102 @@ export function validatePedagogy(doc: Doc): VcValidationError[] {
         }
       });
     });
+  }
+  return errors;
+}
+
+// ─── EV6 — diagramas simulados con texto ────────────────────────────────────
+//
+// Auditoría #413 (primeros auxilios): un árbol de decisión llegó como flujo lineal
+// «1 ¿Responde? → 2 Sí → Consciente → 3 No → …», enseñando una secuencia que no existe.
+// Igual que validatePedagogy, se aplica SOLO al aceptar una experiencia nueva (nunca al empaquetar).
+
+/** Flechas que dibujan un diagrama dentro del texto. */
+const ARROW_RE = /→|->|⇒/g;
+/** Mínimo de flechas en UN párrafo para considerarlo un diagrama simulado («A → B → C»). */
+export const VC_ARROW_CHAIN_MIN = 2;
+
+/**
+ * Encabezado de paso que codifica una rama (texto normalizado: minúsculas, sin acentos):
+ * «Sí → Consciente», «No: llama al 123», «Si - …», «Si no responde…», «En caso contrario…».
+ * «Sistema…», «Nota: …», «No-conformidad» no coinciden.
+ */
+const BRANCH_HEAD_RE = /^(?:(?:si|no)\s*(?:→|->|⇒|[:\-–—](?=\s|$))|si\s+no(?![\p{L}\p{N}_])|en\s+caso\s+contrario(?![\p{L}\p{N}_])|de\s+lo\s+contrario(?![\p{L}\p{N}_]))/u;
+
+function foldLint(text: string): string {
+  return lintView(String(text ?? '')).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+}
+
+/** Nº máximo de flechas en un mismo párrafo del texto. */
+export function arrowChainLength(text: string): number {
+  let best = 0;
+  for (const para of String(text ?? '').split(/\r?\n[ \t]*\r?\n/)) {
+    const n = (para.match(ARROW_RE) || []).length;
+    if (n > best) best = n;
+  }
+  return best;
+}
+
+/** ¿El rótulo/encabezado de un paso codifica una rama (Sí/No/Si no/En caso contrario)? */
+export function isBranchHead(text: string): boolean {
+  return BRANCH_HEAD_RE.test(foldLint(text));
+}
+
+/** Rótulos de ítems de secuencia por tipo: [lista, campo]. */
+function sequenceHeads(c: Record<string, unknown>): { list: string; field: string } | null {
+  if (c.type === 'diagram' && (c.kind === 'flow' || c.kind === 'cycle')) return { list: 'nodes', field: 'label' };
+  if (c.type === 'process_steps') return { list: 'steps', field: 'heading' };
+  if (c.type === 'timeline') return { list: 'events', field: 'heading' };
+  return null;
+}
+
+const SKIP_KEYS = new Set(['type', 'kind', 'variant']);
+
+function walkTexts(v: unknown, path: string, out: Array<{ path: string; text: string }>): void {
+  if (typeof v === 'string') out.push({ path, text: v });
+  else if (Array.isArray(v)) v.forEach((x, i) => walkTexts(x, `${path}[${i}]`, out));
+  else if (v && typeof v === 'object') for (const [k, x] of Object.entries(v)) if (!SKIP_KEYS.has(k)) walkTexts(x, `${path}.${k}`, out);
+}
+
+/**
+ * Errores DIAGRAM_BRANCHING_IN_SEQUENCE / TEXT_SIMULATED_DIAGRAM (vacío = cumple). Espera un
+ * documento que ya pasó validateExperience. Solo textos del LLM (el shell escribe los suyos aparte).
+ */
+export function validateSimulatedDiagrams(doc: Pick<ChapterExperience, 'movements'> & { bridge_to_next?: unknown }): VcValidationError[] {
+  const errors: VcValidationError[] = [];
+  if (!doc || typeof doc !== 'object' || !doc.movements) return errors;
+  for (const m of VC_MOVEMENT_IDS) {
+    const list = doc.movements[m];
+    if (!Array.isArray(list)) continue;
+    list.forEach((raw, i) => {
+      if (!raw || typeof raw !== 'object') return;
+      const c = raw as unknown as Record<string, unknown>;
+      const cpath = `$.movements.${m}[${i}]`;
+      const seq = sequenceHeads(c);
+      const items = seq ? c[seq.list] : undefined;
+      if (seq && Array.isArray(items)) {
+        items.forEach((it, j) => {
+          const head = it && typeof it === 'object' ? (it as Record<string, unknown>)[seq.field] : undefined;
+          if (typeof head === 'string' && isBranchHead(head)) {
+            errors.push({
+              path: `${cpath}.${seq.list}[${j}].${seq.field}`,
+              code: 'DIAGRAM_BRANCHING_IN_SEQUENCE',
+              message: 'este paso codifica una rama («Sí → …», «No: …», «Si no…»): una secuencia no se ramifica; si hay condiciones usa un diagram con kind "decision"',
+            });
+          }
+        });
+      }
+      const texts: Array<{ path: string; text: string }> = [];
+      walkTexts(c, cpath, texts);
+      for (const t of texts) {
+        if (arrowChainLength(t.text) >= VC_ARROW_CHAIN_MIN) {
+          errors.push({ path: t.path, code: 'TEXT_SIMULATED_DIAGRAM', message: 'el texto dibuja un diagrama con flechas («A → B → C»): escribe frases o usa process_steps o un diagram' });
+        }
+      }
+    });
+  }
+  if (typeof doc.bridge_to_next === 'string' && arrowChainLength(doc.bridge_to_next) >= VC_ARROW_CHAIN_MIN) {
+    errors.push({ path: '$.bridge_to_next', code: 'TEXT_SIMULATED_DIAGRAM', message: 'el texto dibuja un diagrama con flechas («A → B → C»): escribe frases o usa process_steps o un diagram' });
   }
   return errors;
 }

@@ -44,7 +44,25 @@ export function plateJoinStyle(): string {
   ].join('\n');
 }
 
-export function scopedStyle(uid: string, theme: ResolvedTheme): string {
+/**
+ * EV6 — árbol de decisión: dos columnas reales desde 600 px (nivel 1) y 960 px (nivel 2) del ancho
+ * del label; más angosto, las ramas quedan apiladas como en CLEAN_SAFE. La pregunta raíz se centra
+ * y las píldoras ↙/↘ miran al centro, como conectores de un árbol.
+ */
+export function decisionStyle(S: string): string {
+  const cols = (d: number) =>
+    `${S} .cvc-dt-d${d}>.cvc-dt-branches{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:28px;align-items:start}` +
+    `${S} .cvc-dt-d${d}>.cvc-dt-branches>.cvc-dt-br{border-left:0!important;padding-left:0!important;margin-bottom:0!important}` +
+    `${S} .cvc-dt-d${d}>.cvc-dt-branches>.cvc-dt-yes>.cvc-dt-pill{text-align:right}`;
+  return [
+    `${S} .cvc-dt-pair{table-layout:fixed}`,
+    `${S} .cvc-dt-d1>.cvc-dt-q{text-align:center}`,
+    `@container (min-width:600px){${S} .cvc-dt-d1>.cvc-dt-q{max-width:36rem;margin-left:auto!important;margin-right:auto!important}${cols(1)}}`,
+    `@container (min-width:960px){${cols(2)}}`,
+  ].join('\n');
+}
+
+export function scopedStyle(uid: string, theme: ResolvedTheme, opts: { decision?: boolean } = {}): string {
   const S = `.cvc-${uid}`;
   const c = theme.color;
   const p = theme.personality;
@@ -114,6 +132,7 @@ export function scopedStyle(uid: string, theme: ResolvedTheme): string {
     `${S} .cvc-dg-kids>li{margin:0!important;position:relative}`,
     `${S} .cvc-dg-kids>li::before{content:"";position:absolute;left:-20px;top:1.4em;width:18px;height:2px;background-color:${c.borderStrong}}`,
     `${S} .cvc-dg-matrix table{table-layout:fixed}`,
+    opts.decision ? decisionStyle(S) : '',
     `${S} .cvc-we-result{margin-bottom:0!important}`,
     // apertura de capítulo
     `${S} .cvc-op-num .cvc-num,${S} .cvc-op-num .cvc-badge{margin:0!important}`,

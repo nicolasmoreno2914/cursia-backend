@@ -64,6 +64,25 @@ function moduleIntro(chapterIds) {
     bibliography: BIB.slice(0, 2).map((b) => ({ ...b })),
   };
 }
+// EV6: los capítulos alternan (en orden de primera generación) un flujo y un árbol de decisión, así el
+// E2E lleva ambos por generación → validación → empaque → restauración en Moodle real.
+const DIAGRAM_KIND_BY_CHAPTER = new Map();
+function diagramFor(chapterId) {
+  if (!DIAGRAM_KIND_BY_CHAPTER.has(chapterId)) DIAGRAM_KIND_BY_CHAPTER.set(chapterId, DIAGRAM_KIND_BY_CHAPTER.size % 2 === 0 ? 'decision' : 'flow');
+  if (DIAGRAM_KIND_BY_CHAPTER.get(chapterId) === 'decision') {
+    return {
+      type: 'diagram',
+      kind: 'decision',
+      title: 'Qué hacer ante un ruido anormal',
+      tree: {
+        question: '¿La presión está dentro de la especificación?',
+        yes: { tree: { question: '¿La temperatura del aceite es normal?', yes: { action: 'Registra la observación y sigue operando.' }, no: { label: 'Alta', action: 'Revisa el enfriador y el nivel de aceite.' } } },
+        no: { action: 'Detén el equipo y revisa la bomba antes de volver a operar.' },
+      },
+    };
+  }
+  return { type: 'diagram', kind: 'flow', title: 'Del síntoma a la decisión', nodes: [{ label: 'Observar el síntoma', detail: 'Ruido, temperatura o respuesta lenta.' }, { label: 'Medir presión y caudal' }, { label: 'Comparar con la especificación' }, { label: 'Decidir la intervención' }] };
+}
 function experience(chapterId, title) {
   return {
     vcSchemaVersion: 1,
@@ -78,7 +97,7 @@ function experience(chapterId, title) {
         { type: 'accordion', items: [{ heading: 'Señales tempranas', body: 'Ruido anormal, temperatura elevada y respuesta lenta de los actuadores.' }, { heading: 'Consecuencias', body: 'Desgaste acelerado, fugas y detenciones no programadas.' }] },
         // Edu Phase A: el E2E restaura en Moodle real un ejemplo resuelto (con datos ilustrativos) y un diagrama.
         { type: 'worked_example', title: 'Estimar el caudal que entrega una bomba', situation: 'Un técnico debe confirmar si la bomba de un circuito entrega el caudal que pide el fabricante antes de volver a operar.', data: ['Desplazamiento de la bomba: 20 cm³ por vuelta', 'Velocidad del motor: 1.500 rpm', 'Eficiencia volumétrica: 90 %'], steps: [{ action: 'Calcula el caudal teórico', detail: '20 cm³ × 1.500 rpm = 30.000 cm³ por minuto, es decir 30 litros por minuto.' }, { action: 'Aplica la eficiencia', detail: '30 litros por minuto × 0,90 = 27 litros por minuto reales.' }, { action: 'Compara con la especificación', detail: 'Si el fabricante pide 25 litros por minuto, la bomba cumple con margen.' }], result: 'La bomba entrega 27 litros por minuto reales: cumple la especificación y puede volver a operar.', takeaway: 'Nunca compares el caudal teórico con la especificación sin aplicar la eficiencia.' },
-        { type: 'diagram', kind: 'flow', title: 'Del síntoma a la decisión', nodes: [{ label: 'Observar el síntoma', detail: 'Ruido, temperatura o respuesta lenta.' }, { label: 'Medir presión y caudal' }, { label: 'Comparar con la especificación' }, { label: 'Decidir la intervención' }] },
+        diagramFor(chapterId),
       ],
       synthesis: [{ type: 'summary_visual', central: 'Criterio técnico', points: ['Observa antes de intervenir.', 'Registra lo que ves.', 'Decide con tu equipo.'] }],
       closing: [{ type: 'reflection', prompt: '¿Qué señal de tu equipo pasarías por alto si trabajaras con prisa?' }],

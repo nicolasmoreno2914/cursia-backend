@@ -687,6 +687,11 @@ async function pureChecks() {
     eq(V(ok[2][0], noVisual).ok, true, 'sin promptVersion: compatibilidad con el bundle anterior');
     eq(V({ ...ok[2][0], promptVersion: 'v21-exp-3' }, noVisual).ok, true, 'v21-exp-3: sin exigir estructura');
     eq(S.pedagogyApplies('v21-exp-4') && S.pedagogyApplies('v21-exp-12') && !S.pedagogyApplies('v21-exp-3') && !S.pedagogyApplies(null), true, 'pedagogyApplies');
+    // EV6: diagramas dibujados con flechas / decisiones aplanadas → solo desde v21-exp-5 (el prompt que describe kind "decision").
+    const arrows = JSON.stringify({ ...F.experienceFor('c1'), bridge_to_next: 'Observa la señal → decide con tu equipo → actúa con calma.' });
+    eq(V({ ...ok[2][0], promptVersion: 'v21-exp-4' }, arrows).ok, true, 'v21-exp-4: sin exigir el lint de flechas');
+    assert(codes(V({ ...ok[2][0], promptVersion: 'v21-exp-5' }, arrows)).includes('TEXT_SIMULATED_DIAGRAM'), 'v21-exp-5: TEXT_SIMULATED_DIAGRAM');
+    eq(S.antiSimulationApplies('v21-exp-5') && S.antiSimulationApplies('v21-exp-12') && !S.antiSimulationApplies('v21-exp-4') && !S.antiSimulationApplies(null), true, 'antiSimulationApplies');
     for (const [ctx, text, code] of bad) {
       const r = V(ctx, text);
       assert(!r.ok && codes(r).includes(code), `${ctx.type}: ${JSON.stringify(codes(r))} sin ${code}`);
