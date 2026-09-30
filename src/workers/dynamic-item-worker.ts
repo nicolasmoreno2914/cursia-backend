@@ -190,6 +190,44 @@ export interface DynamicItemWorkerDeps {
    * YouTube) en vez de seguir. Nunca se corta una llamada ya enviada.
    */
   drain?: DrainSignal | null;
+  /**
+   * R16 (#7): descarga del MP4 ya renderizado (gratis) para re-medir su duración
+   * (`mvhd`) cuando un video v3 llega al final sin duración medida. Default:
+   * fetch con timeout. Inyectable en tests.
+   */
+  fetchMp4?: (url: string) => Promise<Uint8Array>;
+}
+
+/**
+ * R16 (#7): código con el que falla (REINTENTABLE) un video de un run
+ * rulesVersion 3 que llegó al final sin duración medida. Antes se completaba
+ * con durationSec=null y su `video_interactions` fallaba para siempre en el
+ * claim (VIDEO_DURATION_MISSING, no reintentable): solo un render PAGADO nuevo
+ * lo destrababa. Ahora el video nunca se completa sin duración; el reintento
+ * re-mide gratis (re-poll de Videogen / re-descarga del MP4) sin reenviar ni
+ * volver a subir.
+ */
+export const VIDEO_DURATION_UNMEASURED = 'video_duration_unmeasured';
+
+/** R16 (#7): el video interactivo (video_interactions, solo v3) planifica sus preguntas con la duración medida. */
+export function videoRequiresMeasuredDuration(item: Pick<ClaimedItem, 'rulesVersion'>): boolean {
+  return Number(item.rulesVersion) === 3;
+}
+
+const MP4_REMEASURE_TIMEOUT_MS = 120_000;
+
+async function defaultFetchMp4(url: string): Promise<Uint8Array> {
+  const res = await fetch(url, { signal: AbortSignal.timeout(MP4_REMEASURE_TIMEOUT_MS) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return new Uint8Array(await res.arrayBuffer());
+}
+
+function durationUnmeasuredMessage(item: ClaimedItem, detail: string): string {
+  return (
+    `${VIDEO_DURATION_UNMEASURED}: el video ${item.itemKey} terminó sin una duración medida (${detail}). ` +
+    'No se completa: el video interactivo planifica sus preguntas con esa duración. Se reintenta re-midiendo ' +
+    '(sin reenviar a Videogen ni volver a subir a YouTube).'
+  );
 }
 
 /**
@@ -786,6 +824,11 @@ async function completeVideoItem(
   cost: number | null,
   duration: VideoDuration,
 ): Promise<void> {
+  if (videoRequiresMeasuredDuration(item) && duration.durationSec === null) {
+    // El re-claim re-pollea el MISMO job (gratis) y vuelve a leer la duración.
+    await deps.scheduler.failItem(item.itemRunId, deps.executorId, durationUnmeasuredMessage(item, `Videogen no informó la duración del job ${jobId}`), true);
+    return;
+  }
   const payload = {
     videogenJobId: jobId,
     downloadUrl: status.download_url ?? null,
@@ -1214,7 +1257,32 @@ async function publishYoutubeAndComplete(
   // onBeforeUpload; en un re-claim ya publicado, el que quedó en output_summary.mp4Duration).
   // Secundaria = la duración de Videogen (solo campos con unidad conocida, R11a/RF-b I3).
   // Sin ninguna → null + 'unknown' (nunca inventada; video_interactions falla fuerte).
-  const duration = finalVideoDuration(measuredMp4 ?? summary.mp4Duration ?? null, external);
+  let duration = finalVideoDuration(measuredMp4 ?? summary.mp4Duration ?? null, external);
+  if (videoRequiresMeasuredDuration(item) && duration.durationSec === null) {
+    // R16 (#7): nunca se completa un video v3 sin duración. Si el MP4 todavía no se midió en ningún
+    // intento (p.ej. subido por un camino sin bytes), se re-descarga (gratis) y se mide su `mvhd`.
+    let detail = 'ni el mvhd del MP4 ni Videogen la informaron';
+    if (!measuredMp4 && !summary.mp4Duration && downloadUrl) {
+      try {
+        const bytes = await (deps.fetchMp4 ?? defaultFetchMp4)(downloadUrl);
+        const sec = parseMp4DurationSec(bytes);
+        const remeasured: VideoDuration = sec === null ? { durationSec: null, durationSource: 'unknown' } : { durationSec: sec, durationSource: 'mp4_mvhd' };
+        if (!(await scheduler.recordItemExternal(item.itemRunId, deps.executorId, { mp4Duration: remeasured }))) {
+          logger.warn(`Item ${item.itemKey}: lease perdida al registrar la duración re-medida`);
+          return;
+        }
+        duration = finalVideoDuration(remeasured, external);
+        if (sec === null) detail = 'el MP4 re-descargado no trae una caja mvhd legible';
+      } catch (err) {
+        detail = `no se pudo re-descargar el MP4 para medirlo (${errMsg(err).slice(0, 200)})`;
+      }
+    }
+    if (duration.durationSec === null) {
+      await scheduler.failItem(item.itemRunId, deps.executorId, durationUnmeasuredMessage(item, detail), true);
+      return;
+    }
+    logger.log(`Item ${item.itemKey}: duración re-medida desde el MP4 (${duration.durationSec} s)`);
+  }
   const payload = {
     videogenJobId,
     downloadUrl,
