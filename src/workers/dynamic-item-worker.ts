@@ -231,11 +231,50 @@ export function videoRequiresMeasuredDuration(item: Pick<ClaimedItem, 'rulesVers
 }
 
 const MP4_REMEASURE_TIMEOUT_MS = 120_000;
+/** Fix m4: tope de bytes de la re-descarga del MP4 (Content-Length y bytes leídos). Pasarlo → `unavailable` (reintentable). */
+export const MP4_REMEASURE_MAX_BYTES = 600 * 1024 * 1024;
+
+/**
+ * Descarga acotada del MP4 ya renderizado (gratis): rechaza un Content-Length
+ * mayor al tope sin leer el cuerpo y corta el stream en cuanto lo supera.
+ * Exportada para el check (tope chico contra un servidor local).
+ */
+export async function fetchMp4Capped(url: string, maxBytes: number = MP4_REMEASURE_MAX_BYTES, timeoutMs: number = MP4_REMEASURE_TIMEOUT_MS): Promise<Uint8Array> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const declared = Number(res.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      ctrl.abort();
+      throw new Error(`MP4 demasiado grande para medirlo (Content-Length ${declared} > ${maxBytes})`);
+    }
+    if (!res.body) return new Uint8Array(0);
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        ctrl.abort();
+        throw new Error(`MP4 demasiado grande para medirlo (> ${maxBytes} bytes leídos)`);
+      }
+      chunks.push(value);
+    }
+    const out = new Uint8Array(total);
+    let o = 0;
+    for (const c of chunks) { out.set(c, o); o += c.byteLength; }
+    return out;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function defaultFetchMp4(url: string): Promise<Uint8Array> {
-  const res = await fetch(url, { signal: AbortSignal.timeout(MP4_REMEASURE_TIMEOUT_MS) });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return new Uint8Array(await res.arrayBuffer());
+  return fetchMp4Capped(url);
 }
 
 type Remeasure =

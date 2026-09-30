@@ -368,6 +368,43 @@ function ytPublisher(mp4, st) {
     eq(r.s.st.completed[0].summary.external, { durationSec: null, durationSource: 'unknown' }, 'v2: null + unknown como antes');
   });
 
+  await check('#7 fix m4: re-descarga del MP4 acotada — Content-Length mayor al tope o stream que lo supera → error (unavailable, reintentable); dentro del tope → bytes', async () => {
+    const http = require('http');
+    const mp4 = syntheticMp4WithMvhd(200);
+    const srv = http.createServer((rq, rs) => {
+      if (rq.url === '/big') { rs.writeHead(200, { 'content-length': String(10 * 1024 * 1024) }); return rs.end(); }
+      if (rq.url === '/stream') {
+        rs.writeHead(200, { 'content-type': 'video/mp4' });
+        let n = 0;
+        const t = setInterval(() => { rs.write(Buffer.alloc(4096, 1)); if (++n >= 20) { clearInterval(t); rs.end(); } }, 1);
+        rs.on('close', () => clearInterval(t));
+        return;
+      }
+      rs.writeHead(200, { 'content-length': String(mp4.length) });
+      rs.end(mp4);
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${srv.address().port}`;
+    try {
+      eq(IW.MP4_REMEASURE_MAX_BYTES, 600 * 1024 * 1024, 'tope 600 MB');
+      let e = null;
+      try { await IW.fetchMp4Capped(`${base}/big`, 1024 * 1024); } catch (x) { e = x; }
+      assert(e && /Content-Length/.test(e.message), `Content-Length: ${e && e.message}`);
+      e = null;
+      try { await IW.fetchMp4Capped(`${base}/stream`, 16 * 1024); } catch (x) { e = x; }
+      assert(e && /bytes leídos/.test(e.message), `stream: ${e && e.message}`);
+      const ok = await IW.fetchMp4Capped(`${base}/ok`, 1024 * 1024);
+      eq(ok.length, mp4.length, 'dentro del tope');
+      // En el worker: el tope superado es `unavailable` → video_duration_unmeasured REINTENTABLE, sin completar.
+      const s = fakeScheduler(ytResume({ videogenDownloadUrl: `${base}/big`, external: { videogenBatchId: 'b', videogenJobId: 'vg-1', mode: 'real', durationSec: null, durationSource: 'unknown', youtubeVideoId: 'AbCdEfGhIjK', youtubeUrl: 'https://www.youtube.com/watch?v=AbCdEfGhIjK' } }));
+      await IW.processItem(videoDeps(s, YT_RUN, { youtube: ytPublisher(null, {}), fetchMp4: (u) => IW.fetchMp4Capped(u, 1024 * 1024) }), videoItem({ rulesVersion: 3, outputSummary: s.st.summary }));
+      const f = s.st.failed[0];
+      eq([s.st.completed.length, f && f.retryable, f && f.msg.startsWith(`${IW.VIDEO_DURATION_UNMEASURED}:`)], [0, true, true], JSON.stringify(s.st.failed));
+    } finally {
+      await new Promise((r) => srv.close(r));
+    }
+  });
+
   // ═══ #1 / #16: worker de proveedores (proveedores FALSOS en 127.0.0.1) ═════
   const fakes = startProviderFakes({ gammaKey: SECRETS.GAMMA_API_KEY, openaiKey: SECRETS.OPENAI_API_KEY, anthropicKey: SECRETS.ANTHROPIC_API_KEY, makePdf: SM.syntheticPdf, makeMp3: SM.syntheticMp3 });
   const urls = await fakes.listen();
