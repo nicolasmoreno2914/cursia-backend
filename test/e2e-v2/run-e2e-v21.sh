@@ -88,7 +88,9 @@ env | cut -d= -f1 | grep -E 'API_KEY|ANTHROPIC|OPENAI|GAMMA|VIDEOGEN|ELEVEN|YOUT
 : > "$REG/net.log"
 CLEAN_ENV=(env -i PATH="$PATH" HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-}" TMPDIR="${TMPDIR:-/tmp}" LANG=C LC_ALL=C
   PHP_BIN="$PHP_BIN" NODE_OPTIONS="--require $HERE/netguard.js" E2E_NET_LOG="$REG/net.log" CURSIA_CHROME_HOST_RESOLVER_RULES="$ALLOW_CHROME"
-  CURSIA_FRONTEND_REPO="$FE")
+  CURSIA_FRONTEND_REPO="$FE"
+  # El Moodle local del gate para TODO check que lo use (antes algunos caían a una ruta fija de sesión).
+  E2E_MOODLE_DIR="$MOODLE" MOODLE_LOCAL_DIR="$MOODLE" PHP_INI="$MOODLE/php.ini" MOODLE_CONFIG="$MOODLE/source/config.php")
 if [ "${E2E_SKIP_REGRESSION:-0}" != "1" ]; then
   echo "(entorno limpio: $(wc -l < "$REG/scrubbed-env-names.txt" | tr -d ' ') variables de proveedor/credenciales del shell NO se pasan; netguard activo)"
   echo "== 3. Regresión: checks del backend =="

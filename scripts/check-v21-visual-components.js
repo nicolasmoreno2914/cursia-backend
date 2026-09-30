@@ -69,11 +69,34 @@ const LEVELS = [undefined, 'enhanced'];
 
 // ─── Validador ──────────────────────────────────────────────────────────────
 
-check('schema: VC_SCHEMA_VERSION === 1 y 16 tipos de componente', () => {
+check('schema: VC_SCHEMA_VERSION === 1 y 18 tipos de componente (Edu Phase A: worked_example, diagram)', () => {
   assert(vc.VC_SCHEMA_VERSION === 1, 'VC_SCHEMA_VERSION');
-  assert(vc.VC_COMPONENT_TYPES.length === 16, `tipos: ${vc.VC_COMPONENT_TYPES.length}`);
+  assert(vc.VC_COMPONENT_TYPES.length === 18, `tipos: ${vc.VC_COMPONENT_TYPES.length}`);
   const inFixture = new Set(components.map((c) => c.type));
   for (const t of vc.VC_COMPONENT_TYPES) assert(inFixture.has(t), `fixture sin ${t}`);
+});
+
+check('espejo del frontend (44): DYN_VC_COMPONENT_SPECS, nodos por diagrama y tipos ilustrativos idénticos al schema R2', () => {
+  const fs = require('fs');
+  const vm = require('vm');
+  const FE = process.env.CURSIA_FRONTEND_REPO || path.resolve(__dirname, '..', '..', 'campuscloud-gen');
+  const file = path.join(FE, 'src/js/44-dynamic-prompt-builders.js');
+  if (!fs.existsSync(file)) {
+    console.log(`   ⚠️  sin ${file} (CURSIA_FRONTEND_REPO): se omite la paridad del espejo`);
+    return;
+  }
+  const ctx = { console: { log() {}, warn() {}, error() {} } };
+  ctx.window = ctx;
+  vm.createContext(ctx);
+  vm.runInContext(fs.readFileSync(file, 'utf8') + '\n;this.__specs = DYN_VC_COMPONENT_SPECS; this.__nodes = DYN_VC_DIAGRAM_NODES; this.__ill = DYN_VC_ILLUSTRATIVE_TYPES;', ctx);
+  const canon = (v) => (Array.isArray(v) ? v.map(canon) : v && typeof v === 'object' ? Object.keys(v).sort().reduce((o, k) => ((o[k] = canon(v[k])), o), {}) : v);
+  const norm = (spec) => canon(JSON.parse(JSON.stringify(spec, (k, v) => (k === 'optional' && v === false ? undefined : v))));
+  const be = norm(vc.VC_COMPONENT_SPECS);
+  const fe = norm(ctx.__specs);
+  assert(JSON.stringify(Object.keys(fe).sort()) === JSON.stringify(Object.keys(be).sort()), `tipos distintos: FE ${Object.keys(fe)} / BE ${Object.keys(be)}`);
+  for (const t of Object.keys(be)) assert(JSON.stringify(fe[t]) === JSON.stringify(be[t]), `${t}: FE ${JSON.stringify(fe[t])} ≠ BE ${JSON.stringify(be[t])}`);
+  assert(JSON.stringify(canon(ctx.__nodes)) === JSON.stringify(canon(vc.VC_DIAGRAM_NODES)), 'VC_DIAGRAM_NODES');
+  assert(JSON.stringify(Array.from(ctx.__ill)) === JSON.stringify(Array.from(vc.VC_ILLUSTRATIVE_TYPES)), 'VC_ILLUSTRATIVE_TYPES');
 });
 
 check('validador acepta el fixture completo (capítulo) y cada componente suelto', () => {
@@ -83,6 +106,26 @@ check('validador acepta el fixture completo (capítulo) y cada componente suelto
     const e = vc.validateComponent(c);
     assert(e.length === 0, `${c.type}: ${JSON.stringify(e)}`);
   }
+});
+
+check('Edu Phase A: diagram — nodos por forma y ejes solo en matriz (DIAGRAM_SHAPE); worked_example admite datos ilustrativos', () => {
+  const dg = (kind, n, extra) => Object.assign({ type: 'diagram', kind, title: 'T', nodes: Array.from({ length: n }, (_, i) => ({ label: 'Etapa ' + String.fromCharCode(65 + i) })) }, extra || {});
+  const codes = (c) => vc.validateComponent(c).map((e) => e.code);
+  assert(codes(dg('cycle', 4)).length === 0, 'ciclo de 4');
+  assert(codes(dg('cycle', 2)).includes('DIAGRAM_SHAPE'), 'ciclo de 2');
+  assert(codes(dg('flow', 7)).includes('DIAGRAM_SHAPE'), 'flujo de 7');
+  assert(codes(dg('hierarchy', 3)).length === 0, 'jerarquía raíz + 2');
+  assert(codes(dg('matrix', 4, { x_axis: 'Urgencia', y_axis: 'Impacto' })).length === 0, 'matriz ok');
+  assert(codes(dg('matrix', 4)).filter((c) => c === 'DIAGRAM_SHAPE').length === 2, 'matriz sin ejes');
+  assert(codes(dg('matrix', 3, { x_axis: 'a', y_axis: 'b' })).includes('DIAGRAM_SHAPE'), 'matriz de 3');
+  assert(codes(dg('flow', 3, { x_axis: 'a' })).includes('DIAGRAM_SHAPE'), 'eje en un flujo');
+  assert(codes(dg('radial', 3)).includes('ENUM_VALUE'), 'forma desconocida');
+  const we = F.clone(components.find((x) => x.type === 'worked_example'));
+  assert(codes(we).length === 0, 'fixture con $ y % válido: ' + JSON.stringify(vc.validateComponent(we)));
+  we.steps[0].detail = 'Aplica esto en los 3 módulos del curso.';
+  assert(codes(we).includes('QUANTITY_CLAIM'), 'cantidades del curso siguen prohibidas en el ejemplo');
+  const callout = { type: 'callout', variant: 'info', body: 'El 30 % de los reclamos se repite.' };
+  assert(codes(callout).includes('QUANTITY_CLAIM'), '% fuera del ejemplo resuelto sigue prohibido');
 });
 
 check('validador: HTML en texto → HTML_IN_TEXT (tags, cierre, comentario)', () => {

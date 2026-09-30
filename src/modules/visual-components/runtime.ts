@@ -100,6 +100,20 @@ export function scopedStyle(uid: string, theme: ResolvedTheme): string {
     `${S} .cvc-grid>*,${S} .cvc-cols2>*{min-width:0}`,
     `${S} .cvc-cards{display:grid;gap:16px}`,
     `${S} .cvc-cards>li{margin:0!important}`,
+    // Edu Phase A — diagramas (layout SOLO acá: sin <style> todo queda como lista/tabla legible)
+    `${S} .cvc-dg-flow .cvc-dg-step{position:relative}`,
+    `${S} .cvc-dg-flow .cvc-dg-step:not(:last-child)::after{content:"\\2193";position:absolute;left:50%;bottom:-1.3em;transform:translateX(-50%);color:${c.accentStrong};font-weight:700;line-height:1}`,
+    `${S} .cvc-dg-flow .cvc-dg-step:not(:last-child){margin-bottom:1.6em!important}`,
+    `${S} .cvc-dg-ring{display:block;width:140px;height:140px;margin:0 auto 16px auto}`,
+    `${S} .cvc-dg-hierarchy .cvc-dg-root{text-align:center;max-width:28rem;margin-left:auto!important;margin-right:auto!important;position:relative}`,
+    // jerarquía angosta: árbol indentado (línea a la izquierda + rama por hijo)
+    // (la línea del árbol es un ::before, no un border-left: el Visual System prohíbe franjas laterales > 1px)
+    `${S} .cvc-dg-kids{display:grid;gap:12px;position:relative;margin-left:12px!important;padding-left:18px!important}`,
+    `${S} .cvc-dg-kids::before{content:"";position:absolute;left:0;top:0;bottom:1.4em;width:2px;background-color:${c.borderStrong}}`,
+    `${S} .cvc-dg-kids>li{margin:0!important;position:relative}`,
+    `${S} .cvc-dg-kids>li::before{content:"";position:absolute;left:-20px;top:1.4em;width:18px;height:2px;background-color:${c.borderStrong}}`,
+    `${S} .cvc-dg-matrix table{table-layout:fixed}`,
+    `${S} .cvc-we-result{margin-bottom:0!important}`,
     // apertura de capítulo
     `${S} .cvc-op-num .cvc-num{margin:0!important}`,
     // comparación: tabla completa construida por el runtime
@@ -114,6 +128,15 @@ export function scopedStyle(uid: string, theme: ResolvedTheme): string {
       `${S} .cvc-cols2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:40px}` +
       `${S} .cvc-cards{grid-template-columns:repeat(2,minmax(0,1fr))}` +
       `${S} .cvc-step{grid-template-columns:4.25rem minmax(0,1fr)}` +
+      `${S} .cvc-dg-flow:not(.cvc-dg-long) .cvc-dg-list{display:flex;align-items:stretch;gap:12px 36px}` +
+      `${S} .cvc-dg-flow:not(.cvc-dg-long) .cvc-dg-step,${S} .cvc-dg-flow:not(.cvc-dg-long) .cvc-dg-step:not(:last-child){flex:1 1 0;min-width:0;margin:0!important}` +
+      `${S} .cvc-dg-flow:not(.cvc-dg-long) .cvc-dg-step:not(:last-child)::after{content:"\\2192";left:auto;right:-26px;bottom:auto;top:50%;transform:translateY(-50%)}` +
+      `${S} .cvc-dg-cycle{display:grid;grid-template-columns:180px minmax(0,1fr);column-gap:32px;align-items:center}` +
+      `${S} .cvc-dg-ring{width:180px;height:180px;margin:0}` +
+      `${S} .cvc-dg-kids{grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:30px 12px;margin-left:0!important;padding-left:0!important;padding-top:14px!important;border-top:2px solid ${c.borderStrong}}` +
+      `${S} .cvc-dg-kids::before{display:none}` +
+      `${S} .cvc-dg-kids>li::before{left:50%;top:-16px;width:2px;height:14px}` +
+      `${S} .cvc-dg-hierarchy .cvc-dg-root::after{content:"";position:absolute;left:50%;bottom:-14px;width:2px;height:12px;background-color:${c.borderStrong}}` +
       `${S} .cvc-mr{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:40px;align-items:start}` +
       `${S} .cvc-op-split{display:grid;grid-template-columns:auto minmax(0,1fr);grid-template-areas:"num lead" "num main";column-gap:clamp(20px,3vw,40px)}` +
       `${S} .cvc-op-split>.cvc-op-num{grid-area:num}` +
