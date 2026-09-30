@@ -145,9 +145,12 @@ const OBJECTIVES = [
   'Comparar métodos de conservación',
 ];
 // sha256 del Manifest v3 con reglas 1 de buildConfig({...GOLDEN_CFG, objectives: OBJECTIVES}).
-// sha256 de TODAS las listas de las reglas v1 (verbos, raíces, terminaciones, lista negra, pistas, rangos, mapeo).
+// sha256 de TODAS las listas de las reglas v1 (verbos, raíces, terminaciones, lista negra, pistas, rangos, mapeo, balance)
+// y del comportamiento derivado (mapa forma→intención ordenado + frases + balance). Fijados al final del fix round 2.
 // CONGELADO: si cambia, no es rules 1 — nuevas reglas (activityTypeRules 2) con despacho propio.
-const PINNED_RULES_V1_LISTS_SHA = 'c3e7f395a95bed0faf123d66421fd58bae92d8f56806c958021c966eee10fb67';
+const PINNED_RULES_V1_LISTS_SHA = 'ff995ee83b98028ac66a07ea3c98f3c65529f642f4801698914d4df043dc90a4';
+const PINNED_RULES_V1_BEHAVIOR_SHA = '7d60c85e0b5c6659e241d4e6c78b4fae65c13523d459a9f89c57bd7657cbbdfc';
+const PINNED_RULES_V1_FORM_COUNT = 8451;
 const PINNED_SHA_V3_RULES1 = 'c9ad40c71ef93f797c35e6cded78f439217b1e8b16a5b297e9ac4b62d4414b48';
 
 /** Blueprint v2 a medida: chapters = [{ id, objective, title?, activity }] en un solo módulo. */
@@ -189,20 +192,41 @@ async function main() {
     const nouns = ['aplicacion', 'aplicaciones', 'identificacion', 'construccion', 'valoracion', 'conocimiento', 'conocimientos', 'ordenamiento',
       'nombramiento', 'ordenador', 'ordenadora', 'evaluacion', 'comprension', 'diferenciacion', 'aplicado', 'aplicada', 'definido', 'definida',
       'organizadamente', 'comparativamente', 'confianza', 'diferencia', 'secuencia', 'resumen', 'nombre', 'uso', 'diseno', 'calculo', 'negocio',
-      'mejora', 'formula', 'contraste', 'compartir', 'relevancia'];
+      'mejora', 'formula', 'contraste', 'compartir', 'relevancia', 'diagnóstica', 'diagnósticas', 'diagnostica', 'diagnóstico', 'diagnostico',
+      'diseño', 'cálculo', 'aplico', 'decidio', 'operaria'];
     for (const w of nouns) eq(RULES.verbIntentOfWord(w), null, w);
     const verbs = { aplicar: 'apply', aplique: 'apply', apliquen: 'apply', aplicando: 'apply', aplicarlos: 'apply', analice: 'apply', elija: 'apply',
       resuelva: 'apply', construya: 'apply', establezca: 'apply', prevenga: 'apply', convierta: 'apply', usar: 'apply', utilice: 'apply',
       negocie: 'apply', fije: 'apply', conozca: 'recall', reconozca: 'recall', recuerde: 'recall', identifique: 'recall', distinga: 'relate',
-      distingue: 'relate', organice: 'relate', clasifique: 'relate', ordene: 'relate', entienda: 'understand', explique: 'understand', resume: 'understand' };
+      distingue: 'relate', organice: 'relate', clasifique: 'relate', ordene: 'relate', entienda: 'understand', explique: 'understand', resume: 'understand',
+      // round 2: futuro, condicional, pretérito (con ó), gerundio + enclítico, tildes permitidas
+      aplicarán: 'apply', aplicará: 'apply', aplicaría: 'apply', aplicarían: 'apply', aplicó: 'apply', aplicaron: 'apply', decidió: 'apply',
+      decidieron: 'apply', construyó: 'apply', construyeron: 'apply', eligió: 'apply', propondrá: 'apply', prevendrá: 'apply', previniendo: 'apply',
+      aplicándolos: 'apply', identificándolas: 'recall', reconocerá: 'recall', identificarán: 'recall', diseñó: 'apply', usó: 'apply',
+      diagnosticó: 'apply', diagnosticar: 'apply', evalúe: 'apply', clasificarán: 'relate', explicaría: 'understand' };
     for (const [w, i] of Object.entries(verbs)) eq(RULES.verbIntentOfWord(w), i, w);
     // Las apply agregadas en la review.
     for (const v of ['elegir', 'establecer', 'usar', 'utilizar', 'adaptar', 'detectar', 'revisar', 'auditar', 'formular', 'redactar', 'prevenir', 'crear', 'convertir', 'generar', 'negociar', 'fijar']) {
       eq(RULES.verbIntentOfWord(v), 'apply', v);
     }
   });
-  await check('CONGELADO: sha256 de la serialización canónica de todas las listas v1 = el fijado (cambiarlas exige activityTypeRules 2)', () => {
+  await check('CONGELADO: sha256 de las listas v1 Y del comportamiento (mapa forma→intención generado + frases + balance) = los fijados', () => {
     eq(RULES.activityTypeRulesV1ListsSha256(), PINNED_RULES_V1_LISTS_SHA, 'listas v1');
+    eq(RULES.activityTypeRulesV1BehaviorSha256(), PINNED_RULES_V1_BEHAVIOR_SHA, 'comportamiento v1');
+    eq(RULES.verbFormCountV1(), PINNED_RULES_V1_FORM_COUNT, 'cantidad de formas');
+  });
+  await check('listas v1 inmutables en runtime (deep-freeze; lista negra solo lectura)', () => {
+    for (const obj of [RULES.VERBS_V1, RULES.NOUN_CUES_V1, RULES.IRREGULAR_ROOTS_V1]) {
+      assert(Object.isFrozen(obj), 'objeto congelado');
+      for (const arr of Object.values(obj)) assert(Object.isFrozen(arr), 'arreglo anidado congelado');
+    }
+    for (const arr of [RULES.VERB_ENDINGS_V1, RULES.ACCENTED_PRETERITE_ENDINGS_V1, RULES.NON_VERB_WORDS_V1, RULES.BALANCE_PROMOTION_ORDER_V1]) {
+      assert(Object.isFrozen(arr), 'arreglo congelado');
+    }
+    assert(Array.isArray(RULES.NON_VERB_WORDS_V1) && typeof RULES.NON_VERB_WORDS_V1.add !== 'function', 'la lista negra no es un Set mutable');
+    throwsRe(() => { 'use strict'; RULES.VERBS_V1.apply.push('x'); }, /not extensible|read only|frozen/i, 'push sobre VERBS_V1.apply');
+    eq([RULES.isNonVerbWordV1('resumen'), RULES.isNonVerbWordV1('aplicar')], [true, false], 'isNonVerbWordV1');
+    eq(RULES.BALANCE_PROMOTION_ORDER_V1, ['fallback', 'relate', 'recall'], 'orden del balance');
   });
 
   // ── 2. chooseActivityTypesV1 ────────────────────────────────────────────
