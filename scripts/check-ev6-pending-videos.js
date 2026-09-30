@@ -20,6 +20,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const { spawnSync, execFileSync } = require('child_process');
 const JSZip = require('jszip');
 
@@ -203,13 +204,23 @@ async function pureChecks() {
     eq([res.weightsNormalized, res.emptyCategories, res.categories.map((c) => c.key)], [true, ['practice'], ['moduleExams', 'finalExam']], 'normalización');
     eq(res.categories.reduce((s, c) => s + c.weight, 0), 100, 'suma 100');
   });
-  await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al de antes de T5 (mismo input, sin el campo)', async () => {
-    const i1 = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true, courseId: 644 });
-    const i2 = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true, courseId: 644 });
-    i2.pendingVideoChapterIds = [];
-    const [r1, r2] = [await B.buildDynamicMbzV3(i1), await B.buildDynamicMbzV3(i2)];
-    assert(r1.mbz.equals(r2.mbz), 'mismo .mbz');
-    eq(r1.summary.pendingVideos, [], 'sin pendientes');
+  // Fix round 1 (m-3): sha256 dorados tomados de un build de 4f60353 (ANTES de T5) con los mismos
+  // fixtures; el revisor lo verificó por su lado. Si un cambio posterior altera el .mbz a propósito,
+  // actualizar estos valores Y subir DYNAMIC_MBZ_BUILDER_VERSION_V3 (regla G6 M9).
+  const GOLDEN_PRE_T5 = {
+    644: ['6dd79270155faaa6c83db25be0df26c3bf659e11b93e5a4ae8fa615badecb232', { engine: 'h5p', finalExam: true, courseId: 644 }],
+    645: ['6b35ed0bf50e3d2496081dde232851ce2db87c2725a1245ea4952dd581ddd745', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
+  };
+  await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al de antes de T5 (sha256 dorado de 4f60353), con y sin el campo', async () => {
+    for (const [id, [want, o]] of Object.entries(GOLDEN_PRE_T5)) {
+      const i1 = PF.packagingInput(distRoot, o);
+      const i2 = PF.packagingInput(distRoot, o);
+      i2.pendingVideoChapterIds = [];
+      const [r1, r2] = [await B.buildDynamicMbzV3(i1), await B.buildDynamicMbzV3(i2)];
+      eq(crypto.createHash('sha256').update(r1.mbz).digest('hex'), want, `sha256 del fixture ${id} vs pre-T5`);
+      assert(r1.mbz.equals(r2.mbz), 'mismo .mbz con pendingVideoChapterIds=[]');
+      eq(r1.summary.pendingVideos, [], 'sin pendientes');
+    }
   });
 
   // ── Ruling 3: aviso neutral ──
@@ -387,8 +398,6 @@ function workerHarness({ videoMode = 'mock', videoModeByItem = null, omitMode = 
   const job = { id: 'job-ev6', owner_id: OWNER, course_id: manifest.source.courseId, frontend_course_id: null, worker_status: 'running', status: 'running', input_payload: { runId: RUN_ID, manifestId: 9001, blueprintNumber: 1 }, output_summary: {}, attempt_count: 1, max_attempts: 3 };
   return { deps, job, state, manifest, fx };
 }
-const crypto = require('crypto');
-
 let workerMbz = null;
 async function workerChecks() {
   await check('worker v3: run MOCK (videos de vista previa) → empaqueta SIN videos, nunca descarga el video simulado, pendingVideos + aviso en el resumen', async () => {
@@ -404,6 +413,9 @@ async function workerChecks() {
     assert((s.warnings || []).filter((w) => w.code === 'pending_video_omitted').length === vids.length, `avisos: ${JSON.stringify(s.warnings)}`);
     assert(!s.sourceArtifactIds.some((id) => /video/.test(id)), 'sourceArtifactIds sin los videos');
     eq(h.state.uploads[0].metadata.pendingVideos, s.pendingVideos, 'metadata del .mbz');
+    // Fix round 1 (m-2): el ruling 3 se puede medir en staging desde el resumen del job.
+    assert(s.pendingVideos.every((p) => p.notice === false), `flag notice por video: ${JSON.stringify(s.pendingVideos)}`);
+    eq(s.pendingVideoNoticeCount, 0, 'pendingVideoNoticeCount');
     const acts = await mbzActs(h.state.uploads[0].buffer);
     assert(!acts.some((a) => /:video(_primer)?$/.test(a.idnumber)), 'sin actividades de video');
     for (const a of acts.filter((x) => x.modname === 'label' && /^cv3:ch:.*:opening$/.test(x.idnumber))) {
@@ -415,7 +427,9 @@ async function workerChecks() {
     h.state.completed.length = 0;
     await W.processItem(h.deps, h.job);
     eq([h.state.uploads.length, h.state.completed[0].reused], [1, true], 'reuse');
-    eq(h.state.completed[0].pendingVideos, s.pendingVideos, 'pendingVideos en el reuse');
+    eq(h.state.completed[0].pendingVideos, s.pendingVideos, 'pendingVideos (con notice) en el reuse');
+    eq(h.state.completed[0].pendingVideoNoticeCount, 0, 'pendingVideoNoticeCount en el reuse');
+    eq((h.state.completed[0].warnings || []).filter((w) => w.code === 'pending_video_omitted').length, s.pendingVideos.length, 'avisos de pendientes también en el reuse');
   });
   await check('worker v3: run MIXTO (1 video real + 1 de vista previa) → el real entra, el mock queda pendiente', async () => {
     const probe = workerHarness();

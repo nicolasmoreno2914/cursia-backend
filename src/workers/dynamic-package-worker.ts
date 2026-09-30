@@ -476,14 +476,21 @@ export async function processV3PackageJob(
   const profileWarnings = prepared.profileWarnings.map((w) => ({ code: w.split(':')[0], detail: w }));
   if (isLeaseLost()) return;
 
+  // EV6 T5 (fix round 1, m-2): el aviso de video pendiente de cada capítulo solo se decide al
+  // construir; un .mbz reutilizado lo trae en su metadata (mismo sourceIdsHash = mismos textos).
+  const pendingWarnings = baseSummary.pendingVideos.map((p) => ({ code: 'pending_video_omitted', detail: `pending_video_omitted:${p.itemKey}` }));
   const existing = await findExistingDynamicMbzV3(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash);
   if (existing) {
     logger.log(`Job ${job.id}: dynamic_mbz v3 ya existe (${existing.id}) para runId=${runId} — reutilizando sin reconstruir`);
+    const reusedPending: any[] = Array.isArray(existing.metadata?.pendingVideos) ? existing.metadata.pendingVideos : baseSummary.pendingVideos;
+    const reuseWarnings = [...prepared.staleWarnings, ...profileWarnings, ...pendingWarnings];
     const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
       artifactId: existing.id,
       reused: true,
       ...baseSummary,
-      ...(prepared.staleWarnings.length || profileWarnings.length ? { warnings: [...prepared.staleWarnings, ...profileWarnings] } : {}),
+      pendingVideos: reusedPending,
+      pendingVideoNoticeCount: reusedPending.filter((p) => p && p.notice === true).length,
+      ...(reuseWarnings.length ? { warnings: reuseWarnings } : {}),
     });
     if (!ok) logger.warn(`Job ${job.id}: completeJob devolvió false (lease perdida) tras reutilizar ${existing.id}`);
     return;
@@ -532,6 +539,11 @@ export async function processV3PackageJob(
   }
   if (isLeaseLost()) return;
 
+  // EV6 T5 (fix round 1, m-2): pendientes con el flag `notice` del builder (ruling 3, medible).
+  const noticeByKey = new Map(built.summary.pendingVideos.map((p) => [p.itemKey, p.notice === true]));
+  const pendingVideos = baseSummary.pendingVideos.map((p) => ({ ...p, notice: noticeByKey.get(p.itemKey) === true }));
+  const pendingSummary = { pendingVideos, pendingVideoNoticeCount: pendingVideos.filter((p) => p.notice).length };
+
   const storagePath = `${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${sourceIdsHash}.mbz`;
   const artifact = await deps.artifacts.uploadBufferArtifact({
     ownerId: job.owner_id,
@@ -544,7 +556,7 @@ export async function processV3PackageJob(
     mimeType: 'application/vnd.moodle.backup',
     upsert: false,
     adoptExistingOnConflict: true,
-    metadata: { runId, manifestId: manifest.id, ...baseSummary },
+    metadata: { runId, manifestId: manifest.id, ...baseSummary, ...pendingSummary },
   });
   if (isLeaseLost()) return;
 
@@ -564,6 +576,7 @@ export async function processV3PackageJob(
     artifactId: artifact.id,
     reused: false,
     ...baseSummary,
+    ...pendingSummary,
     planSha256: built.summary.planSha256,
     counts: built.summary.counts,
     h5pPackages: built.summary.h5pPackages,
@@ -599,13 +612,13 @@ async function findExistingDynamicMbzV3(
   courseId: string,
   runId: string,
   sourceIdsHash: string,
-): Promise<{ id: string } | null> {
+): Promise<{ id: string; metadata: Record<string, any> | null } | null> {
   const list = await artifacts.findAll(ownerId, { courseId, type: 'dynamic_mbz' });
   const match = list.find((a) => {
     const meta = a.metadata as Record<string, any> | null;
     return meta?.runId === runId && meta?.sourceIdsHash === sourceIdsHash && meta?.builderVersion === DYNAMIC_MBZ_BUILDER_VERSION_V3;
   });
-  return match ? { id: match.id } : null;
+  return match ? { id: match.id, metadata: (match.metadata as Record<string, any> | null) ?? null } : null;
 }
 
 /**

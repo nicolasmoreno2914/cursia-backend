@@ -144,6 +144,13 @@ export function buildPackagingPlanV3(
       const id = mc.chapterId;
       const videoInManifest = mc.videoEnabled === true;
       const videoPending = videoInManifest && omit.has(id);
+      // Un video pendiente se consume igual (el Manifest queda cubierto) pero no ocupa lugar en el paquete.
+      let videoKey: string | null = null;
+      let videoInteractionsKey: string | null = null;
+      if (videoInManifest) {
+        videoKey = take(`video:${id}`, 'video');
+        videoInteractionsKey = take(`video_interactions:${id}`, 'video_interactions');
+      }
       const activityEnabled = mc.activityEnabled === true;
       let variant: 'h5p' | 'scorm' | null = null;
       let activityKey: string | null = null;
@@ -169,11 +176,8 @@ export function buildPackagingPlanV3(
           experience: take(`experience:${id}`, 'experience'),
           presentation: take(`presentation:${id}`, 'presentation'),
           audiobookChapter: take(`audiobook_chapter:${id}`, 'audiobook_chapter'),
-          // Un video pendiente se consume (el Manifest queda cubierto) pero no ocupa lugar en el paquete.
-          video: videoInManifest ? (videoPending ? (take(`video:${id}`, 'video'), null) : take(`video:${id}`, 'video')) : null,
-          videoInteractions: videoInManifest
-            ? (videoPending ? (take(`video_interactions:${id}`, 'video_interactions'), null) : take(`video_interactions:${id}`, 'video_interactions'))
-            : null,
+          video: videoPending ? null : videoKey,
+          videoInteractions: videoPending ? null : videoInteractionsKey,
           activity: activityKey,
         },
       };
