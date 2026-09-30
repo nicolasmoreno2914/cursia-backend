@@ -8,6 +8,7 @@
  *  - shell.ts              — labels del shell (CLEAN_SAFE + ENHANCED)
  *  - chapter-assembler.ts  — slots ordenados del capítulo según video/actividad
  *  - microcopy.ts          — transiciones determinísticas en español
+ *  - section-layout.ts     — EV6: una sección Moodle por capítulo / evaluación (plan + shell)
  */
 export * from './facts';
 export * from './intro-schemas';
@@ -18,4 +19,5 @@ export * from './shell';
 export * from './chapter-assembler';
 export * from './microcopy';
 export * from './cta';
+export * from './section-layout';
 export { ShellRenderOptions, ShellLevel, injectIntoMovement, unprotectedText } from './html';

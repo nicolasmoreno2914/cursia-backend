@@ -134,10 +134,20 @@ const MATRIX = [
 
 (async () => {
   // ── Plan ──────────────────────────────────────────────────────────────────
-  await check('plan v3: cada item del Manifest en exactamente un lugar; secciones 0,1,módulos,cierre', async () => {
+  await check('plan v3: cada item del Manifest en exactamente un lugar; EV6: secciones 0, 1, una por capítulo / evaluación, evaluación final, cierre', async () => {
     const { manifest, blueprint } = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true });
     const plan = PV3.buildPackagingPlanV3(manifest, blueprint, { manifestId: 7 });
-    eq(plan.sections.map((s) => [s.sectionNum, s.kind]), [[0, 'shell'], [1, 'route_and_book'], [2, 'module'], [3, 'module'], [4, 'closing']], 'secciones');
+    // Fixture: módulo 1 (2 capítulos, con examen), módulo 2 (2 capítulos, sin examen), examen final.
+    eq(plan.sections.map((s) => [s.sectionNum, s.kind]), [[0, 'shell'], [1, 'route_and_book'], [2, 'chapter'], [3, 'chapter'], [4, 'module_exam'], [5, 'chapter'], [6, 'chapter'], [7, 'final_exam'], [8, 'closing']], 'secciones');
+    const chs = plan.modules.flatMap((m) => m.chapters);
+    eq(plan.sections.filter((s) => s.kind === 'chapter').map((s) => [s.chapterId, s.title]), chs.map((c) => [c.chapterId, `Módulo ${c.moduleNumber} · Capítulo ${c.chapterNumber}: ${c.title}`]), 'títulos de las secciones de capítulo');
+    eq(chs.map((c) => c.sectionNum), [2, 3, 5, 6], 'sección de cada capítulo');
+    eq(plan.modules.map((m) => [m.firstSectionNum, m.examSectionNum]), [[2, 4], [5, null]], 'primera sección y sección de evaluación por módulo');
+    eq(plan.sections.find((s) => s.kind === 'module_exam').title, 'Módulo 1 · Evaluación', 'título de la evaluación del módulo');
+    eq([plan.finalExamSectionNum, plan.closingSectionNum, plan.sections[plan.sections.length - 1].title], [7, 8, 'Cierre del curso'], 'evaluación final ANTES del cierre; el cierre es la última sección');
+    const nf = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: false });
+    const pnf = PV3.buildPackagingPlanV3(nf.manifest, nf.blueprint);
+    eq([pnf.sections.map((s) => s.kind).slice(-2), pnf.finalExamSectionNum, pnf.closingSectionNum], [['chapter', 'closing'], null, 7], 'sin examen final: el cierre sigue al último capítulo');
     const keys = new Set([
       ...Object.values(plan.keys).filter(Boolean),
       ...plan.modules.flatMap((m) => [...Object.values(m.keys).filter(Boolean), ...m.chapters.flatMap((c) => Object.values(c.keys).filter(Boolean))]),
@@ -380,13 +390,35 @@ const MATRIX = [
         assert(bacts[i + 1].modname === 'quiz' && x.includes(`$@QUIZVIEWBYID*${mid}@$`), `${a.idnumber}: el botón no apunta a su evaluación`);
       }
     }
+    const sectionLinks = async (a) => Array.from((await intro(a)).matchAll(/\$@COURSESECTIONBYID\*(\d+)@\$/g), (m) => Number(m[1]));
+    const M = base.input.manifest;
+    const firstCh = (mod) => secOf.get(`cv3:ch:${mod.chapters[0].chapterId}:opening`);
     const nexts = bacts.filter((a) => /^cv3:module_next:/.test(a.idnumber));
-    assert(nexts.length === base.input.manifest.modules.length, `module_next ${nexts.length}`);
-    for (const a of nexts) {
-      const n = Number(/\$@COURSESECTIONBYID\*(\d+)@\$/.exec(await intro(a))?.[1]);
-      assert(n === a.section + 1, `${a.idnumber}: apunta a la sección ${n}, esperaba ${a.section + 1}`);
+    assert(nexts.length === M.modules.length, `module_next ${nexts.length}`);
+    const finalSec = secOf.get('cv3:final_exam');
+    const closingSec = secOf.get('cv3:shell:closing');
+    // EV6: el cierre es la ÚLTIMA sección y va después de la evaluación final.
+    assert(Number.isInteger(finalSec) && finalSec < closingSec && Math.max(...bacts.map((a) => a.section)) === closingSec, `evaluación final (${finalSec}) antes del cierre (${closingSec}), cierre al final`);
+    for (const [i, mod] of M.modules.entries()) {
+      const a = nexts.find((x) => x.idnumber === `cv3:module_next:${mod.moduleId}`);
+      const want = M.modules[i + 1] ? firstCh(M.modules[i + 1]) : finalSec;
+      eq(await sectionLinks(a), [want], `${a.idnumber}: botón → sección ${want}`);
     }
-    assert(secOf.get('cv3:shell:closing') === nexts[nexts.length - 1].section + 1, 'el último botón lleva al cierre');
+    eq(await sectionLinks(find(/^cv3:shell:start$/)), [firstCh(M.modules[0])], '«Comenzar el curso» → sección del capítulo 1');
+    eq(await sectionLinks(find(/^cv3:shell:route_start$/)), [firstCh(M.modules[0])], '«Comenzar con el capítulo 1» → sección del capítulo 1');
+    eq(await sectionLinks(find(/^cv3:final_exam_next$/)), [closingSec], 'evaluación final → cierre');
+    // Cada cierre de capítulo: exactamente UN botón de sección, al paso siguiente real.
+    const chapters = M.modules.flatMap((mod, mi) => mod.chapters.map((ch, ci) => ({ mod, mi, ch, ci })));
+    for (const { mod, mi, ch, ci } of chapters) {
+      const a = find(new RegExp(`^cv3:ch:${ch.chapterId}:closing$`));
+      const nextCh = mod.chapters[ci + 1];
+      const want = nextCh ? secOf.get(`cv3:ch:${nextCh.chapterId}:opening`)
+        : mod.examEnabled ? secOf.get(`cv3:exam:${mod.moduleId}`)
+          : M.modules[mi + 1] ? firstCh(M.modules[mi + 1])
+            : Number.isInteger(finalSec) ? finalSec : closingSec;
+      eq(await sectionLinks(a), [want], `${a.idnumber}: un solo botón → sección ${want}`);
+      assert(a.section === secOf.get(`cv3:ch:${ch.chapterId}:opening`), `${a.idnumber}: el cierre está en la sección de su capítulo`);
+    }
   });
   const cases = [
     ['GRADEPASS', () => {
@@ -472,6 +504,21 @@ const MATRIX = [
     ['STRUCTURE', () => {
       const a = find(/^cv3:module_next:/);
       return { [`${a.dir}/module.xml`]: (x) => x.replace(/<idnumber>cv3:module_next:[^<]+<\/idnumber>/, '<idnumber>cv3:module_next:no-existe</idnumber>') };
+    }],
+    // EV6: botón de capítulo a una sección real pero equivocada; layout de una sola página; secciones renombradas/movidas.
+    ['NAVIGATION', () => {
+      const a = find(/^cv3:ch:[^:]+:closing$/);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace(/\$@COURSESECTIONBYID\*\d+@\$/, '$@COURSESECTIONBYID*0@$') };
+    }],
+    ['NAVIGATION', () => {
+      const a = find(/^cv3:ch:[^:]+:closing$/);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace(/(\$@COURSESECTIONBYID\*\d+@\$)/, '$1&quot; data-x=&quot;$1') };
+    }],
+    ['SECTIONS', () => ({ 'course/course.xml': (x) => x.replace('<name>coursedisplay</name><value>1</value>', '<name>coursedisplay</name><value>0</value>') })],
+    ['SECTIONS', () => ({ 'sections/section_7/section.xml': (x) => x.replace('<name>Evaluación final</name>', '<name>Cierre del curso</name>') })],
+    ['SECTIONS', () => {
+      const a = find(/^cv3:shell:closing$/);
+      return { 'moodle_backup.xml': (x) => x.replace(`<moduleid>${/_(\d+)$/.exec(a.dir)[1]}</moduleid>\n        <sectionid>8</sectionid>`, `<moduleid>${/_(\d+)$/.exec(a.dir)[1]}</moduleid>\n        <sectionid>7</sectionid>`) };
     }],
     ['STRUCTURE', () => {
       const a = find(/^cv3:exam:/);
@@ -738,7 +785,7 @@ const MATRIX = [
     for (const [f, v] of [['builderVersion', '3.0.1'], ['manifestSha256', 'm2'], ['sourceArtifactIds', ['a']], ['themeSha256', 't2'], ['assessmentProfileSha256', 'p2'], ['h5pProfileVersion', 2], ['vcRendererVersion', 'r2'], ['moodleVersion', '4.5']]) {
       assert(PK.packageReuseHashV3({ ...baseK, [f]: v }) !== k0, `cambia con ${f}`);
     }
-    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.0.4' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
+    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.1.0' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
   });
 
   // ── Medios ────────────────────────────────────────────────────────────────

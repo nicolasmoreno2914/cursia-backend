@@ -63,9 +63,13 @@ foreach ($modinfo->get_section_info_all() as $si) {
             'showdescription' => (int)$row->showdescription,
             'files' => $files];
     }
-    $sections[] = ['section' => (int)$si->section, 'name' => $si->name, 'cms' => $cms];
+    // EV6: id real de la sección (destino de los botones /course/section.php?id=…).
+    $sections[] = ['section' => (int)$si->section, 'id' => (int)$si->id, 'name' => $si->name, 'cms' => $cms];
 }
 $out['sections'] = $sections;
+// EV6: formato del curso restaurado (una sección por página = coursedisplay 1).
+$fmtopts = course_get_format($course)->get_format_options();
+$out['courseFormat'] = ['format' => $course->format, 'coursedisplay' => isset($fmtopts['coursedisplay']) ? (int)$fmtopts['coursedisplay'] : null];
 $cmByIdnumber = [];
 foreach ($sections as $s) { foreach ($s['cms'] as $c) { $cmByIdnumber[$c['cmid']] = $c['idnumber']; } }
 

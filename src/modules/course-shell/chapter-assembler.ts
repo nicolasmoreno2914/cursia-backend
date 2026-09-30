@@ -15,6 +15,9 @@
  *   V OFF A OFF: opening · presentation · deepening · synthesis · self_check · closing
  * Último capítulo de un módulo CON examen: el cierre agrega la transición
  * "evaluación del módulo" (nunca se promete una evaluación inexistente).
+ * EV6: el cierre termina con UN botón a la sección siguiente (`nextStep`, derivado del layout
+ * de secciones): «Continuar con el capítulo N →», «Presentar evaluación del módulo M →»,
+ * «Continuar con el módulo M: … →», «Ir a la evaluación final →» o «Ir al cierre del curso →».
  *
  * Las transiciones son microcopy determinístico (microcopy.ts); el LLM nunca
  * escribe navegación ni nombra recursos (lo garantiza validateExperience).
@@ -40,8 +43,9 @@ import {
   transitionBox,
   unprotectedText,
 } from './html';
-import { COPY, activityInstruction, bridgeLead, continueWith, moduleExamTransition } from './microcopy';
-import { CTA_ACTIVITY, ctaButton } from './cta';
+import { COPY, activityInstruction, bridgeLead, moduleEndText, moduleExamTransition, nextChapterLine } from './microcopy';
+import { CTA_ACTIVITY, ctaButton, ctaSection } from './cta';
+import { ChapterNextStep, chapterNextSteps } from './section-layout';
 
 export type ChapterSlot =
   | { kind: 'label'; role: ChapterLabelRole; name: string; html: string }
@@ -66,6 +70,8 @@ export interface AssembleChapterInput {
   assessment: CourseFacts['assessment'];
   isLastChapterOfModule: boolean;
   nextChapter?: { number: number; title: string } | null;
+  /** EV6: destino del botón del cierre del capítulo (sección siguiente). */
+  nextStep: ChapterNextStep;
   theme: ResolvedTheme;
   options?: ShellRenderOptions;
 }
@@ -101,6 +107,19 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   }
   if (input.nextChapter && (!Number.isInteger(input.nextChapter.number) || input.nextChapter.number !== ch.number + 1)) {
     shellFail(`nextChapter debe ser el capítulo ${ch.number + 1}`);
+  }
+  const step = input.nextStep;
+  if (!step || !Number.isInteger(step.sectionNum) || step.sectionNum < 2) shellFail(`capítulo ${ch.number} sin paso siguiente (nextStep)`);
+  if (!lastOfModule) {
+    if (step.kind !== 'chapter' || !input.nextChapter || step.number !== input.nextChapter.number) {
+      shellFail(`capítulo ${ch.number}: el paso siguiente debe ser el capítulo ${ch.number + 1} del mismo módulo (vino ${step.kind})`);
+    }
+  } else if (mod.examEnabled) {
+    if (step.kind !== 'module_exam' || step.moduleNumber !== mod.number) shellFail(`capítulo ${ch.number}: el paso siguiente debe ser la evaluación del módulo ${mod.number} (vino ${step.kind})`);
+  } else if (step.kind === 'chapter' || step.kind === 'module_exam') {
+    shellFail(`capítulo ${ch.number}: último capítulo de un módulo sin examen con paso siguiente ${step.kind}`);
+  } else if ((step.kind === 'module') !== !!input.nextChapter) {
+    shellFail(`capítulo ${ch.number}: paso siguiente ${step.kind} incoherente con nextChapter`);
   }
   const exp = assertValidExperience(input.experience);
   if (exp.chapterId !== ch.id) shellFail(`experience.chapterId (${exp.chapterId}) ≠ capítulo ${ch.id}`);
@@ -175,8 +194,10 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   // R14-A (I5): la transición dice primero qué repasar/reintentar y después el siguiente paso,
   // sin repetir "Con este capítulo terminas…" dos veces.
   const bridgeLeadText = bridgeLead({ activityEnabled: ch.activityEnabled, activityAttempts: assessment.kinds.activity.attempts });
-  let nextStep: string;
-  if (examNext) {
+  // EV6: el texto dice qué viene y el BOTÓN (elemento dominante) lleva a la sección siguiente.
+  let nextText: string;
+  let button: string;
+  if (step.kind === 'module_exam') {
     if (!Number.isInteger(mod.examQuestionCount) || (mod.examQuestionCount as number) < 1) {
       shellFail(`módulo ${mod.number} con examen sin cantidad de preguntas medida`);
     }
@@ -184,11 +205,24 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     const pg = assessment.kinds.exam.passingGrade;
     // EV5: solo la evaluación. El paso siguiente (módulo o cierre) lo da el label module_next
     // después del examen; antes esta línea anunciaba el examen Y «Continúa con el capítulo…».
-    nextStep = moduleExamTransition({ number: mod.number, examQuestionCount: q }, pg);
+    nextText = moduleExamTransition({ number: mod.number, examQuestionCount: q }, pg);
+    button = `Presentar evaluación del módulo ${mod.number} →`;
+  } else if (step.kind === 'chapter') {
+    nextText = nextChapterLine(step);
+    button = `Continuar con el capítulo ${step.number} →`;
+  } else if (step.kind === 'module') {
+    nextText = moduleEndText(mod.number);
+    button = `Continuar con el módulo ${step.number}: ${step.title} →`;
   } else {
-    nextStep = input.nextChapter ? continueWith(input.nextChapter) : COPY.lastChapterOfCourse;
+    nextText = COPY.lastChapterOfCourse;
+    button = step.kind === 'final_exam' ? 'Ir a la evaluación final →' : 'Ir al cierre del curso →';
   }
-  after += transitionBox(h, pHtml(h, labelHtml(bridgeLeadText), alt, { secondary: true }) + pHtml(h, inlineHtml(nextStep), alt, { last: true, weight: 600 }));
+  after += transitionBox(
+    h,
+    pHtml(h, labelHtml(bridgeLeadText), alt, { secondary: true }) +
+      pHtml(h, inlineHtml(nextText), alt, { last: true }) +
+      ctaButton(h, ctaSection(step.sectionNum), button, alt),
+  );
   slots.push(label('closing', 'Cierre', injectIntoMovement(mv('closing'), '', after)));
   return slots;
 }
@@ -216,6 +250,7 @@ export function assembleAllChapters(
   theme: ResolvedTheme,
   options?: ShellRenderOptions,
 ): Array<{ chapterNumber: number; slots: ChapterSlot[] }> {
+  const steps = chapterNextSteps(facts);
   return facts.chapters.map((ch, i) => {
     const mod = facts.modules.find((m) => m.id === ch.moduleId);
     if (!mod) shellFail(`módulo ${ch.moduleId} ausente en facts`);
@@ -231,6 +266,7 @@ export function assembleAllChapters(
         assessment: facts.assessment,
         isLastChapterOfModule: mod.chapterNumbers[mod.chapterNumbers.length - 1] === ch.number,
         nextChapter: next ? { number: next.number, title: next.title } : null,
+        nextStep: steps[ch.id],
         theme,
         options,
       }),
