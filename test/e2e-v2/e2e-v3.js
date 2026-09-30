@@ -739,8 +739,7 @@ function reservationBookkeeping(ev) {
               const role = s.startsWith('label:') ? s.slice(6) : s === 'video_h5p' ? 'video' : s;
               ids.push(`cv3:ch:${ch.chapterId}:${role}`);
             }
-            // Edu EV3: sin examen, el «siguiente paso» del módulo cierra su último capítulo.
-            if (ci === mod.chapters.length - 1 && !mod.examEnabled) ids.push(`cv3:module_next:${mod.moduleId}`);
+            // EV6 fix 1 (I1): sin examen no hay module_next (el cierre del último capítulo es el siguiente paso).
             if (ci === 0) firstSecOfMod[mod.moduleId] = sn;
             secOfCh[ch.chapterId] = sn;
             want.push([sn++, ids]);
@@ -863,7 +862,7 @@ function reservationBookkeeping(ev) {
           if (m.examEnabled && !hrefs(`cv3:exam_info:${m.moduleId}`).some((h) => /\/mod\/quiz\/view\.php\?id=\d+$/.test(h))) ctaBad.push(`${m.moduleId.slice(0, 8)}: «Presentar evaluación» sin enlace al cuestionario`);
           const nm = M.modules[mi + 1];
           const after = nm ? firstSecOfMod[nm.moduleId] : finalSec ?? closingSec;
-          navWant[`cv3:module_next:${m.moduleId}`] = after;
+          if (m.examEnabled) navWant[`cv3:module_next:${m.moduleId}`] = after;
           m.chapters.forEach((ch, ci) => {
             const nc = m.chapters[ci + 1];
             navWant[`cv3:ch:${ch.chapterId}:closing`] = nc ? secOfCh[nc.chapterId] : m.examEnabled ? secOfExam[m.moduleId] : after;
@@ -878,6 +877,15 @@ function reservationBookkeeping(ev) {
           if (!(got.length === 1 && sidOf(num) && got[0] === sidOf(num))) ctaBad.push(`${idn}: botón de sección ${JSON.stringify(got)} ≠ sección ${num} (id ${sidOf(num)})`);
         }
         for (const idn of Object.keys(L.labels || {})) if (!(idn in navWant) && secLinks(idn).length) ctaBad.push(`${idn}: enlace de sección fuera de un botón de navegación`);
+        for (const m of M.modules) if (!m.examEnabled && (`cv3:module_next:${m.moduleId}` in (L.labels || {}))) ctaBad.push(`${m.moduleId.slice(0, 8)}: module_next en un módulo sin examen (botón duplicado)`);
+        // Fix 1 (I1): ninguna sección tiene dos botones al mismo destino.
+        const dupNav = [];
+        for (const sec of o.sections) {
+          const seen = {};
+          for (const c of sec.cms) for (const t of new Set(secLinks(c.idnumber))) (seen[t] = seen[t] || []).push(c.idnumber);
+          for (const [t, ids] of Object.entries(seen)) if (ids.length > 1) dupNav.push(`sección ${sec.section} → ${t}: ${ids.join(', ')}`);
+        }
+        eq(dupNav, [], `${label}: ninguna sección repite un botón al mismo destino`);
         eq(ctaBad, [], `${label}: botones de navegación (actividad, evaluación, ${Object.keys(navWant).length} botones de sección — uno por cierre de capítulo) enlazan a la URL real de su destino tras el restore`);
         // ── simulación de notas por la API de Moodle ──
         const plan = { pass: {}, fail: {}, mixed: {} };

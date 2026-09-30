@@ -131,7 +131,9 @@ function shellLabels(facts, course, theme, level) {
   out.push(S.welcomeStartLabel(first, facts, theme, o), S.routeStartLabel(first, facts, theme, o));
   if (facts.finalExam.enabled) out.push(S.finalExamInfoLabel(facts, theme, o), S.finalExamNextLabel(L.closingSection, facts, theme, o));
   // Edu EV3: cierre de cada módulo con botón al siguiente (o a la evaluación final / cierre del curso).
+  // EV6 fix 1 (I1): solo los módulos CON examen tienen label «siguiente paso» (tras su evaluación).
   facts.modules.forEach((m, i) => {
+    if (!m.examEnabled) return;
     const nx = facts.modules[i + 1];
     out.push(S.moduleNextLabel(m, nx ? { kind: 'module', module: nx, sectionNum: L.moduleFirstSection[nx.id] } : { kind: 'closing', sectionNum: L.finalExamSection ?? L.closingSection }, facts, theme, o));
   });
@@ -322,7 +324,8 @@ async function pureChecks() {
         const secLinks = Array.from(closingHtml.matchAll(/href="cursia-cta:\/\/section\/(\d+)"/g), (m) => Number(m[1]));
         // EV6: exactamente UN botón por cierre de capítulo, a la sección que corresponde.
         let want;
-        if (!last) want = [`Lo que sigue: capítulo ${next.number}, «${next.title}».`, `Continuar con el capítulo ${next.number} →`, L.chapterSection[next.id]];
+        // Fix 1 (m5): sin línea «Lo que sigue…»; el botón nombra el capítulo.
+        if (!last) want = ['A continuación', `Continuar con el capítulo ${next.number} →`, L.chapterSection[next.id]];
         else if (mod.examEnabled) want = [`Con este capítulo terminas el módulo ${mod.number}.`, `Presentar evaluación del módulo ${mod.number} →`, L.examSection[mod.id]];
         else if (next) {
           const nm = facts.modules.find((m) => m.id === next.moduleId);
@@ -336,21 +339,34 @@ async function pureChecks() {
         assert(ch.activityEnabled ? /nota mínima|Revisa tu resultado/.test(t) : /Repasa las ideas clave/.test(t), `cap ${chapterNumber}: frase de reintento/repaso: ${t}`);
         // EV5: tras el anuncio del examen no hay «Continúa con el capítulo…» (lo dice el label module_next).
         if (has) assert(!/Continúa con el capítulo|Continuar con el capítulo|terminas el recorrido/.test(t), `mensajes contradictorios: ${t}`);
-        assert(!/Continúa con el capítulo/.test(t), `cap ${chapterNumber}: queda el texto plano «Continúa con el capítulo…»: ${t}`);
+        assert(!/Continúa con el capítulo|Lo que sigue/.test(t), `cap ${chapterNumber}: queda texto redundante sobre el botón: ${t}`);
       }
     }
     // Entradas incoherentes → fallo fuerte.
     const ch = f2.chapters[0];
-    const base = { chapterFacts: ch, moduleFacts: f2.modules[0], experience: F.experienceFor(ch.id), assessment: f2.assessment, isLastChapterOfModule: false, nextChapter: { number: 2, title: 'x' }, nextStep: { kind: 'chapter', number: 2, title: 'x', sectionNum: 3 }, theme: THEME };
+    const base = { chapterFacts: ch, moduleFacts: f2.modules[0], experience: F.experienceFor(ch.id), assessment: f2.assessment, isLastChapterOfModule: false, nextChapter: { number: 2, title: 'x' }, nextStep: { kind: 'chapter', number: 2, title: 'x', sectionNum: 3 }, finalExamEnabled: f2.finalExam.enabled, theme: THEME };
     throwsRe(() => S.assembleChapter({ ...base, isLastChapterOfModule: true }), /isLastChapterOfModule/, 'último mal declarado');
     throwsRe(() => S.assembleChapter({ ...base, moduleFacts: f2.modules[1] }), /no pertenece/, 'módulo ajeno');
     throwsRe(() => S.assembleChapter({ ...base, experience: F.experienceFor('otro-capitulo') }), /experience.chapterId/, 'experience ajeno');
-    throwsRe(() => S.assembleChapter({ ...base, nextChapter: { number: 5, title: 'x' } }), /nextChapter|paso siguiente/, 'next ≠ N+1');
+    throwsRe(() => S.assembleChapter({ ...base, nextChapter: { number: 5, title: 'x' } }), /nextChapter/, 'next ≠ N+1');
     // EV6: el paso siguiente es obligatorio y coherente con la posición del capítulo.
     throwsRe(() => S.assembleChapter({ ...base, nextStep: undefined }), /sin paso siguiente/, 'sin nextStep');
     throwsRe(() => S.assembleChapter({ ...base, nextStep: { kind: 'closing', sectionNum: 9 } }), /debe ser el capítulo 2/, 'nextStep ≠ capítulo siguiente');
     throwsRe(() => S.assembleChapter({ ...base, nextStep: { kind: 'module_exam', moduleNumber: 1, sectionNum: 4 } }), /debe ser el capítulo 2/, 'nextStep examen a mitad de módulo');
     assert(S.assembleChapter(base).length > 0, 'base válida');
+    // Fix 1 (m3): el paso terminal se verifica contra facts (examen final del curso, módulo siguiente).
+    {
+      const c4f = f4.chapters.find((c) => c.number === f4.modules[1].chapterNumbers[1]); // último del módulo 2 (sin examen)
+      const b4 = { chapterFacts: c4f, moduleFacts: f4.modules[1], experience: F.experienceFor(c4f.id), assessment: f4.assessment, isLastChapterOfModule: true, nextChapter: { number: c4f.number + 1, title: 'x' }, finalExamEnabled: false, theme: THEME };
+      assert(!f4.modules[1].examEnabled && f4.modules[2], 'fixture c4: módulo 2 sin examen seguido del módulo 3');
+      assert(S.assembleChapter({ ...b4, nextStep: { kind: 'module', number: 3, title: 'x', sectionNum: 9 } }).length > 0, 'módulo siguiente correcto');
+      throwsRe(() => S.assembleChapter({ ...b4, nextStep: { kind: 'module', number: 4, title: 'x', sectionNum: 9 } }), /debe ser el módulo 3/, 'módulo ≠ siguiente');
+      const lastF = f4.chapters[f4.chapters.length - 1];
+      const bl = { ...b4, chapterFacts: lastF, moduleFacts: f4.modules[3], experience: F.experienceFor(lastF.id), nextChapter: null };
+      assert(!f4.modules[3].examEnabled, 'fixture c4: último módulo sin examen');
+      throwsRe(() => S.assembleChapter({ ...bl, nextStep: { kind: 'final_exam', sectionNum: 9 } }), /incoherente con el examen final/, 'final_exam sin examen final');
+      throwsRe(() => S.assembleChapter({ ...bl, finalExamEnabled: true, nextStep: { kind: 'closing', sectionNum: 9 } }), /incoherente con el examen final/, 'cierre con examen final pendiente');
+    }
     const bad = F.experienceFor(ch.id); bad.bridge_to_next = 'Ahora mira el video.';
     throwsRe(() => S.assembleChapter({ ...base, experience: bad }), /VC_INVALID.*RESOURCE_MENTION/, 'experience con recurso');
   });
@@ -410,15 +426,18 @@ async function pureChecks() {
     // Edu EV3: botones de navegación con texto específico y marcador (el builder lo resuelve).
     const all2 = shellLabels(f2, c2, THEME);
     const nextHtml = all2.filter((l) => /^Módulo \d+: siguiente paso/.test(l.name)).map((l) => l.html);
-    assert(nextHtml.length === f2.modules.length, `module_next: ${nextHtml.length} ≠ ${f2.modules.length}`);
+    assert(nextHtml.length === f2.modules.filter((m) => m.examEnabled).length, `module_next: ${nextHtml.length} ≠ módulos con examen`);
     const L2 = S.sectionLayoutFromFacts(f2);
     assert(/Continuar con el módulo 2: /.test(vc.extractText(nextHtml[0])) && nextHtml[0].includes(`href="cursia-cta://section/${L2.moduleFirstSection[f2.modules[1].id]}"`), 'module_next 1 → primer capítulo del módulo 2');
     // EV6: con examen final, el último module_next lleva a la sección «Evaluación final» (el cierre va después).
-    assert(f2.finalExam.enabled && /Ir a la evaluación final/.test(vc.extractText(nextHtml[nextHtml.length - 1])) && nextHtml[nextHtml.length - 1].includes(`href="cursia-cta://section/${L2.finalExamSection}"`), 'último module_next → evaluación final');
+    // (fix 1: en c2/c4 el último módulo no tiene examen → sin module_next; la rama «closing» se prueba directo)
+    const lastNextF2 = S.moduleNextLabel(f2.modules[0], { kind: 'closing', sectionNum: L2.finalExamSection }, f2, THEME).html;
+    assert(f2.finalExam.enabled && /Ir a la evaluación final/.test(vc.extractText(lastNextF2)) && lastNextF2.includes(`href="cursia-cta://section/${L2.finalExamSection}"`), 'último module_next → evaluación final');
     assert(L2.finalExamSection < L2.closingSection && L2.sections[L2.sections.length - 1].kind === 'closing', 'evaluación final antes del cierre (última sección)');
-    const f4next = shellLabels(f4, c4, THEME).filter((l) => /^Módulo \d+: siguiente paso/.test(l.name)).map((l) => l.html);
     const L4 = S.sectionLayoutFromFacts(f4);
-    assert(!f4.finalExam.enabled && /Ir al cierre del curso/.test(vc.extractText(f4next[f4next.length - 1])) && f4next[f4next.length - 1].includes(`href="cursia-cta://section/${L4.closingSection}"`), 'sin examen final: último module_next → cierre');
+    const lastNextF4 = S.moduleNextLabel(f4.modules[2], { kind: 'closing', sectionNum: L4.closingSection }, f4, THEME).html;
+    assert(!f4.finalExam.enabled && /Ir al cierre del curso/.test(vc.extractText(lastNextF4)) && lastNextF4.includes(`href="cursia-cta://section/${L4.closingSection}"`), 'sin examen final: module_next «closing» → cierre');
+    eq(shellLabels(f4, c4, THEME).filter((l) => /^Módulo \d+: siguiente paso/.test(l.name)).map((l) => l.name), f4.modules.filter((m) => m.examEnabled).map((m) => `Módulo ${m.number}: siguiente paso`), 'c4: siguiente paso solo en módulos con examen');
     const startT = all2.filter((l) => /^Comenzar/.test(l.name)).map((l) => vc.extractText(l.html));
     assert(startT.length === 2 && startT[0].includes('Comenzar el curso →') && startT[1].includes(`Comenzar con el capítulo ${f2.chapters[0].number} →`), `botones de inicio: ${startT}`);
     const fin = all2.find((l) => /Evaluación final: siguiente paso/.test(l.name));

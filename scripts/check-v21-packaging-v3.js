@@ -394,12 +394,18 @@ const MATRIX = [
     const M = base.input.manifest;
     const firstCh = (mod) => secOf.get(`cv3:ch:${mod.chapters[0].chapterId}:opening`);
     const nexts = bacts.filter((a) => /^cv3:module_next:/.test(a.idnumber));
-    assert(nexts.length === M.modules.length, `module_next ${nexts.length}`);
+    // Fix 1 (I1): module_next SOLO en módulos con examen (sin examen, el cierre del capítulo es el paso siguiente).
+    assert(nexts.length === M.modules.filter((m) => m.examEnabled).length && M.modules.some((m) => !m.examEnabled), `module_next ${nexts.length}`);
+    for (const mod of M.modules.filter((m) => !m.examEnabled)) assert(!find(new RegExp(`^cv3:module_next:${mod.moduleId}$`)), `module_next en el módulo sin examen ${mod.moduleId}`);
+    const dup = {};
+    for (const a of bacts.filter((x) => x.modname === 'label')) for (const t of new Set(await sectionLinks(a))) (dup[`${a.section}→${t}`] = dup[`${a.section}→${t}`] || []).push(a.idnumber);
+    eq(Object.entries(dup).filter(([, ids]) => ids.length > 1), [], 'ninguna sección con dos botones al mismo destino');
     const finalSec = secOf.get('cv3:final_exam');
     const closingSec = secOf.get('cv3:shell:closing');
     // EV6: el cierre es la ÚLTIMA sección y va después de la evaluación final.
     assert(Number.isInteger(finalSec) && finalSec < closingSec && Math.max(...bacts.map((a) => a.section)) === closingSec, `evaluación final (${finalSec}) antes del cierre (${closingSec}), cierre al final`);
     for (const [i, mod] of M.modules.entries()) {
+      if (!mod.examEnabled) continue;
       const a = nexts.find((x) => x.idnumber === `cv3:module_next:${mod.moduleId}`);
       const want = M.modules[i + 1] ? firstCh(M.modules[i + 1]) : finalSec;
       eq(await sectionLinks(a), [want], `${a.idnumber}: botón → sección ${want}`);
@@ -515,6 +521,19 @@ const MATRIX = [
       return { [`${a.dir}/label.xml`]: (x) => x.replace(/(\$@COURSESECTIONBYID\*\d+@\$)/, '$1&quot; data-x=&quot;$1') };
     }],
     ['SECTIONS', () => ({ 'course/course.xml': (x) => x.replace('<name>coursedisplay</name><value>1</value>', '<name>coursedisplay</name><value>0</value>') })],
+    // Fix 1 (I2): «evaluación final» en el cuerpo (síntesis, LLM) del último capítulo del curso — solo
+    // el label de cierre (botón determinístico «Ir a la evaluación final →») puede nombrarla.
+    ['RESOURCE_DISABLED', () => {
+      const M = base.input.manifest;
+      const lastMod = M.modules[M.modules.length - 1];
+      const lastCh = lastMod.chapters[lastMod.chapters.length - 1];
+      assert(!lastMod.examEnabled && M.features.finalExam, 'fixture: último módulo sin examen y con examen final');
+      const a = find(new RegExp(`^cv3:ch:${lastCh.chapterId}:synthesis$`));
+      return { [`${a.dir}/label.xml`]: (x) => {
+        const sp = x.indexOf('&lt;span class=&quot;nolink&quot;&gt;') + '&lt;span class=&quot;nolink&quot;&gt;'.length;
+        return x.slice(0, sp) + 'Prepárate para la evaluación final. ' + x.slice(sp);
+      } };
+    }],
     ['SECTIONS', () => ({ 'sections/section_7/section.xml': (x) => x.replace('<name>Evaluación final</name>', '<name>Cierre del curso</name>') })],
     ['SECTIONS', () => {
       const a = find(/^cv3:shell:closing$/);
@@ -525,6 +544,14 @@ const MATRIX = [
       return { [`${a.dir}/inforef.xml`]: (x) => x.replace(/(<grade_itemref>\s*<grade_item><id>)(\d+)/, (m, pre, id) => `${pre}${Number(id) + 999}`) };
     }],
   );
+  await check('validador (fix 1, I1): dos botones de la MISMA sección al MISMO destino → NAVIGATION «misma sección»', async () => {
+    // route_start (sección 1) movido a la sección 0, junto a start: los dos llevan al capítulo 1.
+    const a = find(/^cv3:shell:route_start$/);
+    const mid = /_(\d+)$/.exec(a.dir)[1];
+    const bad = await mutate(base.r.mbz, { 'moodle_backup.xml': (x) => x.replace(`<moduleid>${mid}</moduleid>\n        <sectionid>1</sectionid>`, `<moduleid>${mid}</moduleid>\n        <sectionid>0</sectionid>`) });
+    const v = await V.validateMbzV3(bad, base.r.expectations);
+    assert(v.issues.some((i) => i.code === 'NAVIGATION' && /llevan a la misma sección/.test(i.message) && /cv3:shell:start/.test(i.where) && /cv3:shell:route_start/.test(i.where)), JSON.stringify(v.issues.slice(0, 5)));
+  });
   const forumAct = find(/^cv3:shell:forum$/);
   const forumCtx = /contextid="(\d+)"/.exec(await bz.file(`${forumAct.dir}/forum.xml`).async('string'))[1];
   for (const [code, mk] of cases) {

@@ -221,6 +221,8 @@ async function mouseDrag(b, from, to) {
   await b.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', buttons: 0, clickCount: 1 });
   await sleep(300);
 }
+// Re-arrastres del flujo DragText (harness), reportados en el resultado para no esconder la señal.
+const dtRedrags = [];
 // Respuestas correctas de las fixtures del LLM falso (llm-v3.js) ⇒ nota 100.
 const FLOWS = {
   async questionset(b) {
@@ -244,15 +246,25 @@ const FLOWS = {
       const word = words[i];
       const fromSel = `[...d.querySelectorAll('.h5p-drag-draggables-container .h5p-draggable')].find(e=>e.innerText.split('\\n')[0].trim()===${JSON.stringify(word)})`;
       const toSel = `d.querySelectorAll('.h5p-dropzone')[${i}]`;
-      let from = null; let to = null;
-      for (let k = 0; k < 20; k++) {
-        const f1 = await b.evaluate(centerOf(fromSel)); const t1 = await b.evaluate(centerOf(toSel));
-        await sleep(250);
-        from = await b.evaluate(centerOf(fromSel)); to = await b.evaluate(centerOf(toSel));
-        if (!from) throw new Error(`DT: no está "${word}"`);
-        if (JSON.stringify([f1, t1]) === JSON.stringify([from, to])) break;
+      // Harness (EV6 fix round 1): a veces el PRIMER arrastre sintético justo después de cargar se
+      // pierde (la palabra vuelve a la lista; visto también antes de EV6, r14/gate15 → 3/4). Como un
+      // estudiante real, si la palabra no quedó en su hueco se vuelve a arrastrar (máx. 3 veces).
+      // Nunca se toca el estado del H5P: la nota sigue saliendo de las respuestas en el reproductor.
+      let placed = false;
+      for (let attempt = 0; attempt < 3 && !placed; attempt++) {
+        let from = null; let to = null;
+        for (let k = 0; k < 20; k++) {
+          const f1 = await b.evaluate(centerOf(fromSel)); const t1 = await b.evaluate(centerOf(toSel));
+          await sleep(250);
+          from = await b.evaluate(centerOf(fromSel)); to = await b.evaluate(centerOf(toSel));
+          if (!from) throw new Error(`DT: no está "${word}"`);
+          if (JSON.stringify([f1, t1]) === JSON.stringify([from, to])) break;
+        }
+        await mouseDrag(b, from, to);
+        placed = (await b.evaluate(inH5p(`const z=d.querySelectorAll('.h5p-dropzone')[${i}];return z?z.innerText.trim():'';`))) === word;
+        if (!placed) dtRedrags.push({ word, attempt: attempt + 1 });
       }
-      await mouseDrag(b, from, to);
+      if (!placed) throw new Error(`DT: "${word}" no quedó en el hueco ${i + 1} tras 3 arrastres`);
     }
     const k = await clickBtn(b, ['Comprobar']);
     if (k !== 'ok') throw new Error(`DT Comprobar: ${k}`);
@@ -505,7 +517,7 @@ async function main() {
       ok(lib === LIB[t], `${t}: el reproductor real despliega y carga ${LIB[t]} (${target.key}, cm ${target.cmid})`, lib);
       let answered = true;
       try { await FLOWS[t](b); } catch (e) { answered = ok(false, `${t}: respondido a través del DOM`, e.message); }
-      if (answered) ok(true, `${t}: respondido a través del DOM (todas correctas)`);
+      if (answered) ok(true, `${t}: respondido a través del DOM (todas correctas)${t === 'dragtext' && dtRedrags.length ? `; re-arrastres del harness: ${JSON.stringify(dtRedrags)}` : ''}`);
       await sleep(3000); // deja terminar el POST xAPI
       const file = path.join(SHOTS, `h5p-${t}-answered.png`);
       await b.screenshot(file);

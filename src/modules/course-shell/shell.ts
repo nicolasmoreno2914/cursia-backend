@@ -430,7 +430,7 @@ export function welcomeStartLabel(firstChapterSectionNum: number, facts: CourseF
   const h = hx(theme, opts);
   const s = bgSurf(h);
   const inner =
-    pHtml(h, labelHtml('Cuando estés listo, empieza por el primer capítulo. La ruta de aprendizaje y el Libro Guía te acompañan en todo el recorrido.'), s, { weight: 600 }) +
+    pHtml(h, labelHtml('Empieza por aquí. La ruta de aprendizaje y el Libro Guía están en la sección siguiente, para consultarlos cuando quieras.'), s, { weight: 600 }) +
     ctaButton(h, ctaSection(firstChapterSectionNum), 'Comenzar el curso →', s);
   return out('Comenzar el curso', root(h, 'shell-start', inner), facts);
 }
@@ -464,9 +464,9 @@ export function closingLabel(facts: CourseFacts, courseIntro: CourseIntroV3, the
   const intro = assertValidCourseIntroV3(courseIntro);
   const h = hx(theme, opts);
   const s = bgSurf(h);
-  // EV6: el cierre va DESPUÉS de la evaluación final (nunca la anuncia como un paso pendiente).
+  // EV6: el cierre va DESPUÉS de la evaluación final: constata que terminó (nunca la anuncia como pendiente).
   const next = facts.finalExam.enabled
-    ? 'Con la evaluación final completas el recorrido del curso.'
+    ? 'Has completado el recorrido del curso y su evaluación final.'
     : 'Has completado el recorrido del curso.';
   const inner =
     eyebrow(h, 'Cierre', s) +

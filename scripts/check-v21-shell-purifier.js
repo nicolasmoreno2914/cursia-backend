@@ -76,10 +76,12 @@ function resolveTokens(html) {
 function moduleNextLabels(facts, theme, o) {
   const L = S.sectionLayoutFromFacts(facts);
   const first = L.moduleFirstSection[facts.modules[0].id];
-  const out = facts.modules.map((m, i) => {
+  // Fix 1 (I1): «siguiente paso» solo en módulos con examen; la rama «closing» se purifica siempre.
+  const out = facts.modules.flatMap((m, i) => {
     const nx = facts.modules[i + 1];
-    return S.moduleNextLabel(m, nx ? { kind: 'module', module: nx, sectionNum: L.moduleFirstSection[nx.id] } : { kind: 'closing', sectionNum: L.finalExamSection ?? L.closingSection }, facts, theme, o);
+    return m.examEnabled ? [S.moduleNextLabel(m, nx ? { kind: 'module', module: nx, sectionNum: L.moduleFirstSection[nx.id] } : { kind: 'closing', sectionNum: L.finalExamSection ?? L.closingSection }, facts, theme, o)] : [];
   });
+  out.push(S.moduleNextLabel(facts.modules[facts.modules.length - 1], { kind: 'closing', sectionNum: L.finalExamSection ?? L.closingSection }, facts, theme, o));
   out.push(S.welcomeStartLabel(first, facts, theme, o), S.routeStartLabel(first, facts, theme, o));
   if (facts.finalExam.enabled) out.push(S.finalExamNextLabel(L.closingSection, facts, theme, o));
   return out;

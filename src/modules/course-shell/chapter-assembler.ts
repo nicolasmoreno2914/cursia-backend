@@ -43,7 +43,7 @@ import {
   transitionBox,
   unprotectedText,
 } from './html';
-import { COPY, activityInstruction, bridgeLead, moduleEndText, moduleExamTransition, nextChapterLine } from './microcopy';
+import { COPY, activityInstruction, bridgeLead, moduleEndText, moduleExamTransition } from './microcopy';
 import { CTA_ACTIVITY, ctaButton, ctaSection } from './cta';
 import { ChapterNextStep, chapterNextSteps } from './section-layout';
 
@@ -72,6 +72,8 @@ export interface AssembleChapterInput {
   nextChapter?: { number: number; title: string } | null;
   /** EV6: destino del botón del cierre del capítulo (sección siguiente). */
   nextStep: ChapterNextStep;
+  /** EV6 (fix 1, m3): facts.finalExam.enabled — el paso terminal debe coincidir con el curso. */
+  finalExamEnabled: boolean;
   theme: ResolvedTheme;
   options?: ShellRenderOptions;
 }
@@ -120,6 +122,10 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     shellFail(`capítulo ${ch.number}: último capítulo de un módulo sin examen con paso siguiente ${step.kind}`);
   } else if ((step.kind === 'module') !== !!input.nextChapter) {
     shellFail(`capítulo ${ch.number}: paso siguiente ${step.kind} incoherente con nextChapter`);
+  } else if (step.kind === 'module' && step.number !== mod.number + 1) {
+    shellFail(`capítulo ${ch.number}: el paso siguiente debe ser el módulo ${mod.number + 1} (vino ${step.number})`);
+  } else if (step.kind !== 'module' && (step.kind === 'final_exam') !== (input.finalExamEnabled === true)) {
+    shellFail(`capítulo ${ch.number}: paso ${step.kind} incoherente con el examen final del curso (${input.finalExamEnabled})`);
   }
   const exp = assertValidExperience(input.experience);
   if (exp.chapterId !== ch.id) shellFail(`experience.chapterId (${exp.chapterId}) ≠ capítulo ${ch.id}`);
@@ -208,7 +214,8 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     nextText = moduleExamTransition({ number: mod.number, examQuestionCount: q }, pg);
     button = `Presentar evaluación del módulo ${mod.number} →`;
   } else if (step.kind === 'chapter') {
-    nextText = nextChapterLine(step);
+    // Fix 1 (m5): sin línea «Lo que sigue…»: el botón ya lo dice.
+    nextText = '';
     button = `Continuar con el capítulo ${step.number} →`;
   } else if (step.kind === 'module') {
     nextText = moduleEndText(mod.number);
@@ -219,8 +226,8 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   }
   after += transitionBox(
     h,
-    pHtml(h, labelHtml(bridgeLeadText), alt, { secondary: true }) +
-      pHtml(h, inlineHtml(nextText), alt, { last: true }) +
+    pHtml(h, labelHtml(bridgeLeadText), alt, nextText ? { secondary: true } : { secondary: true, last: true }) +
+      (nextText ? pHtml(h, inlineHtml(nextText), alt, { last: true }) : '') +
       ctaButton(h, ctaSection(step.sectionNum), button, alt),
   );
   slots.push(label('closing', 'Cierre', injectIntoMovement(mv('closing'), '', after)));
@@ -267,6 +274,7 @@ export function assembleAllChapters(
         isLastChapterOfModule: mod.chapterNumbers[mod.chapterNumbers.length - 1] === ch.number,
         nextChapter: next ? { number: next.number, title: next.title } : null,
         nextStep: steps[ch.id],
+        finalExamEnabled: facts.finalExam.enabled,
         theme,
         options,
       }),

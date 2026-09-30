@@ -30,7 +30,7 @@ import type { AssessmentCategoryKey } from '../assessment/resolve-assessment';
 import type { AssessableType } from '../../modules/course-profiles/course-profiles';
 import { extractText, lintCleanSafe, lintResourceMentions, parseHtml } from '../../modules/visual-components';
 import type { HtmlNode } from '../../modules/visual-components';
-import { CourseFacts, chapterNextSteps, lintShellNumbers, sectionLayoutFromFacts } from '../../modules/course-shell';
+import { CourseFacts, chapterNextSteps, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles } from '../../modules/course-shell';
 import { safeActivityName } from '../mbz-common';
 import { formatDurationEs, mp3DurationSeconds } from '../audio';
 import { CURSIA_H5P_PROFILE_V1, H5P_MOODLE_GRADING } from '../h5p';
@@ -301,12 +301,6 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   if (layout.finalExamSection !== null && !(layout.finalExamSection < layout.closingSection)) add('SECTIONS', 'sections', 'el cierre aparece antes de la evaluación final');
   const courseXml = (await text('course/course.xml')) ?? '';
   if (!/<name>coursedisplay<\/name><value>1<\/value>/.test(courseXml)) add('SECTIONS', 'course/course.xml', 'coursedisplay ≠ 1 (una sección por página)');
-  const moduleLastChapterSection = (moduleId: string): number | undefined => {
-    const mod = facts.modules.find((x) => x.id === moduleId);
-    const lastN = mod?.chapterNumbers[mod.chapterNumbers.length - 1];
-    const ch = facts.chapters.find((c) => c.number === lastN);
-    return ch ? layout.chapterSection[ch.id] : undefined;
-  };
   const expectedSection = (idn: string): number | undefined => {
     if (/^cv3:shell:(forum|welcome|audio_welcome|competencies|methodology|start)$/.test(idn)) return 0;
     if (/^cv3:shell:(route|libro|libro_card|audiobook|route_start)$/.test(idn)) return 1;
@@ -318,8 +312,9 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     if (m) return layout.moduleFirstSection[m[1]];
     m = /^cv3:(?:exam_info|exam):(.+)$/.exec(idn);
     if (m) return layout.examSection[m[1]];
+    // Fix 1 (I1): module_next solo existe en la sección de evaluación (módulos con examen).
     m = /^cv3:module_next:(.+)$/.exec(idn);
-    if (m) return layout.examSection[m[1]] ?? moduleLastChapterSection(m[1]);
+    if (m) return layout.examSection[m[1]];
     return undefined;
   };
   for (const a of acts) {
@@ -343,8 +338,14 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     return undefined;
   };
   const navIds = new Set<string>();
+  const navBySectionTarget = new Map<string, string[]>();
   for (const a of acts) {
     const secLinks = Array.from(a.intro.matchAll(/\$@COURSESECTIONBYID\*(\d+)@\$/g), (x) => Number(x[1]));
+    // Fix 1 (I1): dos botones de navegación de la MISMA sección al MISMO destino = botón duplicado.
+    for (const t of new Set(secLinks)) {
+      const k = `${a.sectionid}→${t}`;
+      navBySectionTarget.set(k, [...(navBySectionTarget.get(k) ?? []), a.idnumber]);
+    }
     const want = ctaTarget(a.idnumber);
     if (want === undefined) {
       if (secLinks.length) add('NAVIGATION', a.idnumber, `enlace a sección fuera de un label de navegación (${secLinks.join(',')})`);
@@ -353,7 +354,10 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     navIds.add(a.idnumber);
     if (JSON.stringify(secLinks) !== JSON.stringify([want])) add('NAVIGATION', a.idnumber, `botón de sección ${secLinks.join(',') || '(ninguno)'} ≠ sección ${want}`);
   }
-  const wantNav = ['cv3:shell:start', 'cv3:shell:route_start', ...facts.chapters.map((c) => `cv3:ch:${c.id}:closing`), ...facts.modules.map((m) => `cv3:module_next:${m.id}`)];
+  for (const [k, ids] of navBySectionTarget) {
+    if (ids.length > 1) add('NAVIGATION', ids.join(', '), `${ids.length} botones en la sección ${k.split('→')[0]} llevan a la misma sección ${k.split('→')[1]}`);
+  }
+  const wantNav = ['cv3:shell:start', 'cv3:shell:route_start', ...facts.chapters.map((c) => `cv3:ch:${c.id}:closing`), ...facts.modules.filter((m) => m.examEnabled).map((m) => `cv3:module_next:${m.id}`)];
   if (facts.finalExam.enabled) wantNav.push('cv3:final_exam_next');
   for (const idn of wantNav) if (!navIds.has(idn)) add('NAVIGATION', idn, 'falta el label de navegación');
 
@@ -454,7 +458,8 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       const mod = moduleById.get(ch.moduleId);
       const last = !!mod && mod.chapterNumbers[mod.chapterNumbers.length - 1] === ch.number;
       // EV6: el último capítulo del curso (módulo sin examen) lleva el botón «Ir a la evaluación final →».
-      const toFinal = steps[ch.id]?.kind === 'final_exam';
+      // Fix 1 (I2): SOLO su label de cierre (el botón determinístico); el resto del capítulo, nunca.
+      const toFinal = steps[ch.id]?.kind === 'final_exam' && /:closing$/.test(a.idnumber);
       return { video: ch.videoEnabled, activity: ch.activityEnabled, exam: !!mod?.examEnabled && last, final_exam: toFinal, presentation: true, other: false };
     }
     const mm = /^cv3:(?:module_intro|exam_info):(.+)$/.exec(a.idnumber);
@@ -475,7 +480,8 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     const mn = /^cv3:module_next:(.+)$/.exec(a.idnumber);
     if (!allowed || (mn && !moduleById.has(mn[1]))) add('STRUCTURE', a.idnumber, 'idnumber apunta a un capítulo/módulo que no está en facts');
     else {
-      for (const hit of lintResourceMentions(`${a.name}. ${txt}`)) {
+      // Fix 1 (m4): los títulos del Blueprint (p. ej. el módulo siguiente en un botón) no son menciones de recursos.
+      for (const hit of lintResourceMentions(stripStructureTitles(`${a.name}. ${txt}`, facts))) {
         const kind = resourceMentionKind(hit.match);
         if (!allowed[kind]) add('RESOURCE_DISABLED', a.idnumber, `menciona "${hit.match}" (${kind}) y ese recurso no existe aquí`);
       }
@@ -487,7 +493,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     }
     const chm = /^cv3:ch:([^:]+):/.exec(a.idnumber);
     if (chm && allowed) {
-      for (const t of transitionTexts(a.intro)) {
+      for (const t of transitionTexts(a.intro).map((x) => stripStructureTitles(x, facts))) {
         const bad = lintShellNumbers(t, facts);
         if (bad.length) add('NUMBER_NOT_FROM_FACTS', a.idnumber, `transición con cifras fuera de facts: ${bad.join(', ')}`);
         if (!allowed.video && /\bvideos?\b/i.test(t)) add('TRANSITION_DISABLED_RESOURCE', a.idnumber, 'transición habla de video sin video');

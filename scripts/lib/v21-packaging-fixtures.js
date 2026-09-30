@@ -156,7 +156,8 @@ function packagingInput(distRoot, o = {}) {
  * Secuencia esperada de idnumbers `cv3:…` por sección, derivada SOLO del Manifest + chapterSlotSequence (R11a).
  * EV6 (derivación independiente de section-layout.ts): 0 bienvenida, 1 ruta; por módulo una sección por
  * capítulo (la presentación del módulo arriba del primero) y, si tiene examen, «Módulo m · Evaluación»
- * (info + quiz + siguiente paso; sin examen, el siguiente paso cierra su último capítulo); después la
+ * (info + quiz + siguiente paso; sin examen NO hay label de siguiente paso: el botón del cierre de su
+ * último capítulo lo es — fix 1, I1); después la
  * evaluación final (si hay: info + quiz + botón al cierre) y, ÚLTIMA, el cierre del curso.
  */
 function expectedSequence(distRoot, input) {
@@ -173,7 +174,6 @@ function expectedSequence(distRoot, input) {
         const role = s.startsWith('label:') ? s.slice(6) : s === 'video_h5p' ? 'video' : s;
         ids.push(`cv3:ch:${ch.chapterId}:${role}`);
       }
-      if (i === mod.chapters.length - 1 && !mod.examEnabled) ids.push(`cv3:module_next:${mod.moduleId}`);
       seq.push([n++, ids]);
     });
     // Edu EV3: la evaluación del módulo cierra con el botón al módulo siguiente (o a la evaluación final / cierre).

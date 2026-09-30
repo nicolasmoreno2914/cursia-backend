@@ -840,16 +840,16 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
         }
       }
     }
-    // Sección «Módulo m · Evaluación» (solo si el módulo tiene examen).
-    const lastChapter = m.chapters[m.chapters.length - 1];
-    const nextSec = m.keys.exam ? (m.examSectionNum as number) : lastChapter.sectionNum;
-    if (m.keys.exam) {
-      if (!Number.isInteger(m.examSectionNum)) throw new Error(`MBZ_V3_INVARIANT: módulo ${m.moduleId} con examen sin sección`);
-      addLabel(nextSec, `cv3:exam_info:${m.moduleId}`, examInfoLabel(mf, facts, theme, opts));
-      addQuiz(nextSec, `cv3:exam:${m.moduleId}`, safeActivityName(`Evaluación del módulo ${m.moduleNumber}: ${m.title}`), 'exam', c.examGift.get(m.moduleId) as string, m.keys.exam);
-    }
-    // Edu EV3 / EV6: cierre del módulo (tras su evaluación o, sin examen, al final de su último
-    // capítulo) → botón al primer capítulo del módulo siguiente, o a la evaluación final / cierre.
+    // Sección «Módulo m · Evaluación» (solo si el módulo tiene examen). EV6 fix 1 (I1): SIN examen
+    // no hay label module_next — el botón del cierre de su último capítulo ya es el siguiente paso
+    // (antes quedaban dos botones iguales seguidos).
+    if (!m.keys.exam) continue;
+    const nextSec = m.examSectionNum as number;
+    if (!Number.isInteger(nextSec)) throw new Error(`MBZ_V3_INVARIANT: módulo ${m.moduleId} con examen sin sección`);
+    addLabel(nextSec, `cv3:exam_info:${m.moduleId}`, examInfoLabel(mf, facts, theme, opts));
+    addQuiz(nextSec, `cv3:exam:${m.moduleId}`, safeActivityName(`Evaluación del módulo ${m.moduleNumber}: ${m.title}`), 'exam', c.examGift.get(m.moduleId) as string, m.keys.exam);
+    // Edu EV3 / EV6: tras la evaluación → botón al primer capítulo del módulo siguiente, o a la
+    // evaluación final / cierre.
     const nextPlan = plan.modules[plan.modules.indexOf(m) + 1];
     const nextFacts = nextPlan ? facts.modules.find((x) => x.id === nextPlan.moduleId) : undefined;
     if (nextPlan && !nextFacts) throw new Error(`MBZ_V3_INVARIANT: módulo ${nextPlan.moduleId} ausente en facts`);
