@@ -460,17 +460,18 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       // EV6: el último capítulo del curso (módulo sin examen) lleva el botón «Ir a la evaluación final →».
       // Fix 1 (I2): SOLO su label de cierre (el botón determinístico); el resto del capítulo, nunca.
       const toFinal = steps[ch.id]?.kind === 'final_exam' && /:closing$/.test(a.idnumber);
-      return { video: ch.videoEnabled, activity: ch.activityEnabled, exam: !!mod?.examEnabled && last, final_exam: toFinal, presentation: true, other: false };
+      // EV6 T5 (ruling 3): un capítulo con video pendiente solo puede nombrar el video si lleva el aviso.
+      return { video: ch.videoEnabled || ch.videoPendingNotice === true, activity: ch.activityEnabled, exam: !!mod?.examEnabled && last, final_exam: toFinal, presentation: true, other: false };
     }
     const mm = /^cv3:(?:module_intro|exam_info):(.+)$/.exec(a.idnumber);
     if (mm) {
       const mod = moduleById.get(mm[1]);
       if (!mod) return null;
       const chs = facts.chapters.filter((c) => c.moduleId === mod.id);
-      return { video: chs.some((c) => c.videoEnabled), activity: chs.some((c) => c.activityEnabled), exam: mod.examEnabled, final_exam: false, presentation: true, other: false };
+      return { video: chs.some((c) => c.videoEnabled || c.videoPendingNotice === true), activity: chs.some((c) => c.activityEnabled), exam: mod.examEnabled, final_exam: false, presentation: true, other: false };
     }
     const cc = facts.counts;
-    return { video: cc.videos > 0, activity: cc.activities > 0, exam: cc.exams > 0 || cc.finalExam, final_exam: cc.finalExam, presentation: true, other: false };
+    return { video: cc.videos > 0 || facts.chapters.some((c) => c.videoPendingNotice === true), activity: cc.activities > 0, exam: cc.exams > 0 || cc.finalExam, final_exam: cc.finalExam, presentation: true, other: false };
   };
   for (const a of labels) {
     const lint = lintCleanSafe(a.intro);
@@ -496,12 +497,20 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       for (const t of transitionTexts(a.intro).map((x) => stripStructureTitles(x, facts))) {
         const bad = lintShellNumbers(t, facts);
         if (bad.length) add('NUMBER_NOT_FROM_FACTS', a.idnumber, `transición con cifras fuera de facts: ${bad.join(', ')}`);
-        if (!allowed.video && /\bvideos?\b/i.test(t)) add('TRANSITION_DISABLED_RESOURCE', a.idnumber, 'transición habla de video sin video');
+        // EV6 T5: transiciones y recorrido son navegación → solo con un video REAL (el aviso de pendiente no cuenta).
+        if (!chapterById.get(chm[1])?.videoEnabled && /\bvideos?\b/i.test(t)) add('TRANSITION_DISABLED_RESOURCE', a.idnumber, 'transición habla de video sin video');
         if (!allowed.activity && /\b(actividad|práctica|practica)\b/i.test(t)) add('TRANSITION_DISABLED_RESOURCE', a.idnumber, 'transición habla de práctica sin actividad');
         if (!allowed.exam && /evaluaci[oó]n del m[oó]dulo/i.test(t)) add('TRANSITION_DISABLED_RESOURCE', a.idnumber, 'transición promete una evaluación del módulo inexistente');
         if (!allowed.final_exam && /evaluaci[oó]n final|examen final/i.test(t)) add('TRANSITION_DISABLED_RESOURCE', a.idnumber, 'un capítulo no promete el examen final');
       }
     }
+  }
+  // EV6 T5: video pendiente = sin actividad de video; el aviso existe si y solo si facts lo pide.
+  for (const ch of facts.chapters) {
+    const hasVideo = acts.some((a) => a.idnumber === `cv3:ch:${ch.id}:video`);
+    const hasNotice = labels.some((a) => a.idnumber === `cv3:ch:${ch.id}:video_pending`);
+    if (ch.videoPending === true && hasVideo) add('STRUCTURE', `cv3:ch:${ch.id}:video`, 'video pendiente (vista previa) empaquetado como actividad');
+    if (hasNotice !== (ch.videoPendingNotice === true)) add('STRUCTURE', `cv3:ch:${ch.id}:video_pending`, `aviso de video pendiente ${hasNotice ? 'sin' : 'faltante con'} video pendiente mencionado`);
   }
   for (const a of acts) {
     if (`${a.intro}`.includes('cursia-cta://')) add('TOKEN_INVALID', a.idnumber, 'botón de navegación con marcador cursia-cta sin resolver');

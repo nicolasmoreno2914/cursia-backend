@@ -60,6 +60,13 @@ export interface BuildCourseFactsInput {
   artifacts: CourseFactsArtifactsInput;
   /** Dato del setup (horas); se muestra etiquetado como definido por la institución. */
   hours?: number | null;
+  /**
+   * EV6 T5: videos pendientes (vista previa) que el paquete omite. `chapterIds` = capítulos con
+   * video en el Manifest cuyo video no es real todavía (quedan `videoEnabled:false`,
+   * `videoPending:true`); `noticeChapterIds` ⊆ chapterIds = los que llevan el aviso neutral
+   * «El video interactivo de este capítulo estará disponible…» (sus textos mencionan el video).
+   */
+  pendingVideos?: { chapterIds: readonly string[]; noticeChapterIds?: readonly string[] } | null;
 }
 
 export interface ChapterFacts {
@@ -70,7 +77,12 @@ export interface ChapterFacts {
   /** Posición 1-based dentro de su módulo. */
   indexInModule: number;
   title: string;
+  /** Video REAL presente en el paquete. */
   videoEnabled: boolean;
+  /** EV6 T5: el Manifest tiene video pero todavía es de vista previa (omitido del paquete). */
+  videoPending?: boolean;
+  /** EV6 T5: el capítulo pendiente lleva el aviso neutral de video próximo (ver pending-video.ts). */
+  videoPendingNotice?: boolean;
   activityEnabled: boolean;
   /** null si la actividad está OFF. */
   activityVariant: 'h5p' | 'scorm' | null;
@@ -178,6 +190,9 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
     };
   }
 
+  const pendingIds = new Set<string>(input.pendingVideos?.chapterIds ?? []);
+  const noticeIds = new Set<string>(input.pendingVideos?.noticeChapterIds ?? []);
+  for (const id of noticeIds) if (!pendingIds.has(id)) fail(`aviso de video pendiente en un capítulo sin video pendiente (${id})`);
   const itemKeys = new Set(manifest.items.map((i) => i.key));
   const itemByKey = new Map(manifest.items.map((i) => [i.key, i]));
   const chapters: ChapterFacts[] = [];
@@ -194,6 +209,8 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
       if (itemKeys.has(`activity:${mc.chapterId}`) !== activityEnabled) fail(`activity del capítulo ${mc.chapterNumber} incoherente con el Manifest`);
       if (itemKeys.has(`video:${mc.chapterId}`) !== mc.videoEnabled) fail(`video del capítulo ${mc.chapterNumber} incoherente con el Manifest`);
       const variant = activityEnabled ? features.activityEngine : null;
+      const videoPending = pendingIds.has(mc.chapterId);
+      if (videoPending && !mc.videoEnabled) fail(`video pendiente en el capítulo ${mc.chapterNumber}, que no tiene video en el Manifest`);
       chapters.push({
         id: mc.chapterId,
         number: mc.chapterNumber,
@@ -201,7 +218,8 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
         moduleNumber: mm.moduleNumber,
         indexInModule: idx + 1,
         title: displayStructureTitle(sc.title),
-        videoEnabled: mc.videoEnabled,
+        videoEnabled: mc.videoEnabled && !videoPending,
+        ...(videoPending ? { videoPending: true, videoPendingNotice: noticeIds.has(mc.chapterId) } : {}),
         activityEnabled,
         activityVariant: variant,
         activityType: variant === 'h5p' ? resolveActivityType(itemByKey.get(`activity:${mc.chapterId}`)) : null,
@@ -220,6 +238,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
       examQuestionCount: mm.examEnabled ? (q as number) : null,
     });
   }
+  for (const id of pendingIds) if (!knownChapterIds.has(id)) fail(`video pendiente de un capítulo que no está en el Manifest (${id})`);
   for (const id of Object.keys(artifacts.slideCountByChapter ?? {})) {
     if (!knownChapterIds.has(id)) fail(`slideCount de un capítulo que no está en el Manifest (${id})`);
   }
@@ -288,7 +307,8 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
   };
   // Sanidad contra los totales del Manifest (dos fuentes, un número).
   const t = manifest.totals;
-  if (t.moduleCount !== facts.counts.modules || t.chapterCount !== facts.counts.chapters || t.videoCount !== facts.counts.videos ||
+  // EV6 T5: los videos pendientes están en el Manifest pero no en el paquete.
+  if (t.moduleCount !== facts.counts.modules || t.chapterCount !== facts.counts.chapters || t.videoCount !== facts.counts.videos + pendingIds.size ||
     t.examCount !== facts.counts.exams || (t.activityCount ?? 0) !== facts.counts.activities) {
     fail('los conteos derivados no coinciden con manifest.totals');
   }

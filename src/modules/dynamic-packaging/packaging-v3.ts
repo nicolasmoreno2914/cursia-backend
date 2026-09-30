@@ -33,7 +33,7 @@ import { frozenVideoDeliveryOf, checkYoutubeDeliveryUrl } from '../dynamic-gener
 import { GuardArtifact, MockArtifactInRealRunError, assertNoMockArtifactsForRealPackage } from './packaging-guards';
 import { frozenProviderModesOf, providerKindOfArtifactType } from '../dynamic-generation/provider-modes';
 import { assertSafeStoragePath } from '../artifacts/artifacts.service';
-import { ResolvedAssessment, assertCategoriesPopulated, assessmentItemCountsFromManifest } from '../../package/assessment';
+import { ResolvedAssessment, assertCategoriesPopulated, assessmentItemCountsForPackage } from '../../package/assessment';
 import {
   AssessmentProfile,
   PresentationProfile,
@@ -351,6 +351,8 @@ export interface PackageReuseKeyV3Input {
   h5pProfileVersion: number;
   vcRendererVersion: string;
   moodleVersion: string;
+  /** EV6 T5: keys de los videos pendientes omitidos (entra en la clave SOLO si no está vacía). */
+  omittedVideoKeys?: string[];
 }
 
 export function packageReuseHashV3(k: PackageReuseKeyV3Input): string {
@@ -364,6 +366,8 @@ export function packageReuseHashV3(k: PackageReuseKeyV3Input): string {
     h5pProfileVersion: k.h5pProfileVersion,
     vcRendererVersion: k.vcRendererVersion,
     moodleVersion: k.moodleVersion,
+    // EV6 T5: solo si hay omisiones → la clave de un run 100% real no cambia.
+    ...(k.omittedVideoKeys && k.omittedVideoKeys.length ? { omittedVideoKeys: [...k.omittedVideoKeys].sort() } : {}),
   });
   return createHash('sha256').update(canon, 'utf8').digest('hex');
 }
@@ -708,11 +712,60 @@ export interface PreparedV3Package {
   /** F1: lo que el resumen del paquete registra de la evaluación (weightsNormalized + pesos originales). */
   assessment: AssessmentPackageSummary;
   /**
+   * EV6 T5: videos del Manifest cuya generación vigente NO es real (vista previa): se omiten del
+   * paquete (no están en `byItem` ni en `sourceArtifactIds`). Orden del Manifest.
+   */
+  pendingVideos: PendingVideoV3[];
+  /**
    * F1: avisos de perfiles para el resumen del paquete —
    * `presentation_profile_defaulted`, `course_without_grades`,
    * `assessment_weights_normalized:…`.
    */
   profileWarnings: string[];
+}
+
+export interface PendingVideoV3 {
+  itemKey: string;
+  chapterId: string;
+  videoInteractionsKey: string;
+}
+
+/**
+ * EV6 T5: ¿el video vigente del item es real? La verdad por item es `output_summary.mode` que
+ * escribe el worker al completarlo (`'real'` | `'mock'`). Sin ese dato (items anteriores) decide
+ * el modo congelado del run: un run real sigue exigiendo su video (y el parser del artifact
+ * sigue rechazando fuerte un cuerpo simulado); un run mock lo deja pendiente. Nunca se presenta
+ * como real un video que no se sabe real.
+ */
+export function isRealVideoOutput(outputSummary: Record<string, any> | null | undefined, runVideoMode: unknown): boolean {
+  const mode = outputSummary?.mode;
+  if (mode === 'real') return true;
+  if (mode === 'mock') return false;
+  return runVideoMode === 'real';
+}
+
+/**
+ * EV6 T5: separa los videos pendientes (vista previa) de un run v3 resuelto. Devuelve la lista
+ * (orden del Manifest) y un `byItem` SIN esos videos ni sus interacciones: lo que el paquete
+ * realmente contiene. Pura.
+ */
+export function splitPendingVideosV3(
+  manifest: GenerationManifestV1,
+  byItem: Map<string, ResolvedItemV3>,
+  runVideoMode: unknown,
+): { pendingVideos: PendingVideoV3[]; byItem: Map<string, ResolvedItemV3> } {
+  const pendingVideos: PendingVideoV3[] = [];
+  for (const it of manifest.items) {
+    if (it.type !== 'video') continue;
+    const r = byItem.get(it.key);
+    if (!r) continue; // resolveRunArtifactsV3 ya exigió todos los items
+    if (isRealVideoOutput(r.outputSummary, runVideoMode)) continue;
+    const chapterId = String(it.chapterId ?? it.key.slice('video:'.length));
+    pendingVideos.push({ itemKey: it.key, chapterId, videoInteractionsKey: `video_interactions:${chapterId}` });
+  }
+  if (!pendingVideos.length) return { pendingVideos, byItem };
+  const drop = new Set(pendingVideos.flatMap((p) => [p.itemKey, p.videoInteractionsKey]));
+  return { pendingVideos, byItem: new Map([...byItem].filter(([k]) => !drop.has(k))) };
 }
 
 /** F1: avisos de perfiles (tema por defecto + evaluación normalizada / sin nota). Pura. */
@@ -739,9 +792,13 @@ export async function prepareV3Package(
   const [run] = await q.query(`select id, owner_id, input_payload from public.production_jobs where id = $1`, [runId]);
   if (!run) throw new PackagingNotReadyError([`run:${runId}:not_found`]);
   run.input_payload = parseJson(run.input_payload);
-  const byItem = await resolveRunArtifactsV3(q, runId, manifest.manifest);
+  const resolvedAll = await resolveRunArtifactsV3(q, runId, manifest.manifest);
+  // EV6 T5: los videos de vista previa quedan fuera del paquete (nunca un video simulado como real).
+  const { pendingVideos, byItem } = splitPendingVideosV3(manifest.manifest, resolvedAll, run.input_payload?.videoMode);
+  const omittedVideoKeys = pendingVideos.map((p) => p.itemKey);
   assertRunArtifactsPackageable(run, byItem);
-  const videoKeys = manifest.manifest.items.filter((i) => i.type === 'video').map((i) => i.key);
+  const pendingKeys = new Set(omittedVideoKeys);
+  const videoKeys = manifest.manifest.items.filter((i) => i.type === 'video' && !pendingKeys.has(i.key)).map((i) => i.key);
   if (videoKeys.length && frozenVideoDeliveryOf(run.input_payload) !== 'youtube') {
     throw new PackagingNotReadyError(
       videoKeys.map((k) => `${k}:${V3_VIDEO_REQUIRES_YOUTUBE}`),
@@ -752,7 +809,7 @@ export async function prepareV3Package(
   // Falla temprano (antes de encolar/descargar) si el perfil vigente no se puede aplicar a ESTE run
   // (p.ej. pesos con examen final y el run no lo tiene: R3 ruling 7; intentos no aplicables: R6).
   // F1 (I3): las categorías vacías se omiten y sus pesos se redistribuyen (o el curso queda sin nota).
-  const itemCounts = assessmentItemCountsFromManifest(manifest.manifest);
+  const itemCounts = assessmentItemCountsForPackage(manifest.manifest, omittedVideoKeys);
   const resolved = resolveAssessment(profiles.assessment, {
     hasFinalExam: manifest.manifest.features?.finalExam === true,
     activityEngine: manifest.manifest.features?.activityEngine,
@@ -770,6 +827,7 @@ export async function prepareV3Package(
     h5pProfileVersion,
     vcRendererVersion: VC_RENDERER_VERSION,
     moodleVersion,
+    omittedVideoKeys,
   });
   return {
     run,
@@ -781,5 +839,6 @@ export async function prepareV3Package(
     resolved,
     assessment: assessmentPackageSummary(resolved),
     profileWarnings: profileWarningsV3(profiles.theme, resolved),
+    pendingVideos,
   };
 }

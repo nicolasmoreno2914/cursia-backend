@@ -10,7 +10,7 @@ import { frozenVideoDeliveryOf, youtubeDeliveryProblems } from '../dynamic-gener
 import { packageReuseHash, resolveDynamicMoodleVersion, sortedArtifactIds } from './packaging-reuse-key';
 import { DYNAMIC_MBZ_BUILDER_VERSION } from '../../package/dynamic-mbz-builder';
 import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
-import { prepareV3Package } from './packaging-v3';
+import { isRealVideoOutput, prepareV3Package } from './packaging-v3';
 import { MOCK_ARTIFACT_IN_REAL_RUN } from './packaging-guards';
 import { DYNAMIC_MBZ_BUILDER_VERSION_V3 } from '../../package/dynamic-mbz-builder-v3';
 
@@ -66,6 +66,11 @@ export interface PackageStatusResult {
   staleReason?: string;
   /** Items (por key/UUID) cuya salida vigente no está en el paquete (sources_changed). */
   staleItemKeys?: string[];
+  /**
+   * EV6 T5 (v3): videos de vista previa que el paquete omitió (vacío = todos los videos son
+   * reales). La UI muestra «Este curso contiene videos pendientes de generación…».
+   */
+  pendingVideos?: Array<{ itemKey: string; chapterId: string; chapterNumber: number | null }>;
 }
 
 interface BuildFreshness {
@@ -282,6 +287,7 @@ export class PackagingService {
     }
 
     const result: PackageStatusResult = { status: job.worker_status, stale: false };
+    if (Array.isArray(job.output_summary?.pendingVideos)) result.pendingVideos = job.output_summary.pendingVideos;
     if (job.worker_status === 'completed') {
       // F78-BE2: nunca devolver un paquete desactualizado como si fuera el vigente.
       const fresh = await this.buildFreshness(run, manifest, job);
@@ -386,7 +392,9 @@ export class PackagingService {
     // visible ANTES de encolar el job de empaquetado, no en el worker.
     const hasVideoItem = manifest.manifest.items.some((it) => it.type === 'video');
     const videoMode = run.input_payload?.videoMode;
-    if (hasVideoItem && videoMode !== 'real') {
+    // EV6 T5: rulesVersion 3 empaqueta con los videos de vista previa OMITIDOS (prepareV3Package
+    // los separa por item; nunca se presenta un video simulado como real). v1/v2: sin cambios.
+    if (hasVideoItem && videoMode !== 'real' && manifest.rulesVersion !== 3) {
       throw new ConflictException({
         message: `${MOCK_VIDEO_NOT_PACKAGEABLE}: run con videos simulados: no empaquetable (videoMode=${videoMode ?? 'mock'}). Solo se empaquetan runs generados con videoMode='real'.`,
         missing: [],
@@ -431,6 +439,8 @@ export class PackagingService {
       const byKey = new Map(rows.map((r) => [r.item_key, r]));
       const ytMissing = manifest.manifest.items
         .filter((it) => it.type === 'video')
+        // EV6 T5: un video pendiente (vista previa) no se empaqueta → no se le exige YouTube.
+        .filter((it) => manifest.rulesVersion !== 3 || isRealVideoOutput(byKey.get(it.key)?.output_summary ?? null, videoMode))
         .flatMap((it) => {
           const r = byKey.get(it.key);
           return youtubeDeliveryProblems(it.key, r?.status ?? null, r?.output_summary ?? null);

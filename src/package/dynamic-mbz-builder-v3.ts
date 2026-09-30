@@ -42,7 +42,7 @@ import {
   ResolvedAssessment,
   applyXmlFields,
   assertCategoriesPopulated,
-  assessmentItemCountsFromManifest,
+  assessmentItemCountsForPackage,
   completionCriteriaFor,
   courseCompletionXml,
   gradeItemXml,
@@ -106,6 +106,7 @@ import {
   methodologyLabel,
   moduleIntroLabel,
   moduleNextLabel,
+  pendingVideoNoticeChapterIds,
   routeLabel,
   routeStartLabel,
   sectionLayoutFromFacts,
@@ -187,6 +188,11 @@ export interface BuildDynamicMbzV3Input {
   hours?: number | null;
   /** Nivel de render de los labels (default ENHANCED sobre la base CLEAN_SAFE). */
   level?: 'enhanced' | 'clean_safe';
+  /**
+   * EV6 T5: capítulos cuyo video todavía es de vista previa. Su video (y sus interacciones) se
+   * omiten del paquete; nunca se presenta un video simulado como real.
+   */
+  pendingVideoChapterIds?: readonly string[] | null;
 }
 
 export interface MbzV3H5pPackage {
@@ -217,6 +223,8 @@ export interface BuildDynamicMbzV3Result {
     vcRendererVersion: string;
     h5pPackages: MbzV3H5pPackage[];
     mockPresentationChapters: string[];
+    /** EV6 T5: videos omitidos por estar pendientes (vista previa) y si el capítulo lleva el aviso. */
+    pendingVideos: Array<{ itemKey: string; chapterId: string; chapterNumber: number; title: string; notice: boolean }>;
     warnings: string[];
     counts: CourseFacts['counts'];
     /** F1 (I3): resultado de la normalización de pesos (ver `assessmentPackageSummary`). */
@@ -505,13 +513,17 @@ async function scormZip(launch: string, html: string, manifestXml: string): Prom
 export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<BuildDynamicMbzV3Result> {
   if (!Number.isInteger(input?.ts) || input.ts <= 0) throw new Error('MBZ_V3_INVALID: ts (reloj inyectado) debe ser un entero > 0');
   const { manifest, blueprint, contents: c, ts } = input;
-  const plan = buildPackagingPlanV3(manifest, blueprint, { manifestId: input.manifestId ?? null });
+  const pendingIds = [...new Set(input.pendingVideoChapterIds ?? [])];
+  const plan = buildPackagingPlanV3(manifest, blueprint, { manifestId: input.manifestId ?? null, omitVideoChapterIds: pendingIds });
+  const omittedVideoKeys = plan.omittedVideos.map((v) => v.videoKey);
   const missing = collectMissing(plan, c);
   if (missing.length) throw new PackagingV3ContentMissingError(missing);
   const MV = resolveMoodleVersion(input.moodleVersion);
   const level = input.level === 'clean_safe' ? undefined : ('enhanced' as const);
   const opts = level ? { level } : undefined;
   const warnings: string[] = [];
+  // EV6 T5: aviso visible en el resumen del paquete por cada video pendiente omitido.
+  for (const v of plan.omittedVideos) warnings.push(`pending_video_omitted:${v.videoKey}`);
 
   // ── Tema (R1) y evaluación (R6) ──────────────────────────────────────────
   const theme: ResolvedTheme = resolveTheme(input.presentation);
@@ -521,7 +533,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const resolved = resolveAssessment(input.assessmentProfile, {
     hasFinalExam: plan.features.finalExam,
     activityEngine: plan.features.activityEngine,
-    itemCounts: assessmentItemCountsFromManifest(manifest),
+    itemCounts: assessmentItemCountsForPackage(manifest, omittedVideoKeys),
   });
 
   // ── Contenidos LLM validados ─────────────────────────────────────────────
@@ -563,11 +575,20 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     })),
   });
 
+  // EV6 T5 (ruling 3): capítulos pendientes cuyos textos publicados mencionan su video → aviso.
+  const noticeChapterIds = pendingVideoNoticeChapterIds({
+    chapters: plan.modules.flatMap((m) => m.chapters.map((ch) => ({ id: ch.chapterId, moduleId: m.moduleId }))),
+    pendingChapterIds: plan.omittedVideos.map((v) => v.chapterId),
+    courseIntro,
+    moduleIntros,
+    experiences: c.experiences,
+  });
   const facts = buildCourseFacts({
     manifest,
     blueprint,
     assessment: input.assessmentProfile,
     hours: input.hours ?? null,
+    pendingVideos: plan.omittedVideos.length ? { chapterIds: plan.omittedVideos.map((v) => v.chapterId), noticeChapterIds } : null,
     artifacts: {
       audioWelcomeSeconds,
       audiobookParts: audiobook.parts.map((p) => ({ chapterId: p.chapterId, seconds: p.durationSeconds })),
@@ -1053,6 +1074,9 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       vcRendererVersion: VC_RENDERER_VERSION,
       h5pPackages,
       mockPresentationChapters,
+      pendingVideos: plan.omittedVideos.map((v) => ({
+        itemKey: v.videoKey, chapterId: v.chapterId, chapterNumber: v.chapterNumber, title: v.title, notice: noticeChapterIds.includes(v.chapterId),
+      })),
       warnings,
       counts: facts.counts,
       assessment: assessmentPackageSummary(resolved),

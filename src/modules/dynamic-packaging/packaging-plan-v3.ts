@@ -38,7 +38,13 @@ export interface PackagingChapterPlanV3 {
   /** EV6: sección Moodle del capítulo. */
   sectionNum: number;
   title: string;
+  /** Video REAL en el paquete (false si el capítulo no tiene video o si su video quedó pendiente). */
   videoEnabled: boolean;
+  /**
+   * EV6 T5: el capítulo tiene video en el Manifest pero su video todavía es de vista previa
+   * (mock): se omite del paquete (sin actividad, sin guía, sin mención en el recorrido).
+   */
+  videoPending: boolean;
   activityEnabled: boolean;
   activityVariant: 'h5p' | 'scorm' | null;
   keys: {
@@ -76,12 +82,21 @@ export interface PackagingPlanV3 {
   modules: PackagingModulePlanV3[];
   finalExamSectionNum: number | null;
   closingSectionNum: number;
+  /**
+   * EV6 T5: videos del Manifest omitidos por estar pendientes (vista previa), en orden del
+   * plan. Sus items (video + video_interactions) quedan consumidos pero sin lugar en el paquete.
+   */
+  omittedVideos: Array<{ chapterId: string; chapterNumber: number; title: string; videoKey: string; videoInteractionsKey: string }>;
 }
 
 export function buildPackagingPlanV3(
   manifest: GenerationManifestV1,
   blueprint: BlueprintSnapshotV2,
-  opts?: { manifestId?: number | null },
+  opts?: {
+    manifestId?: number | null;
+    /** EV6 T5: capítulos cuyo video está pendiente (vista previa) → se omite su video. */
+    omitVideoChapterIds?: readonly string[] | null;
+  },
 ): PackagingPlanV3 {
   if (!manifest || manifest.rulesVersion !== 3) throw new PackagingPlanV3Error('el Manifest debe ser rulesVersion 3');
   if (!blueprint || blueprint.schemaVersion !== 2) throw new PackagingPlanV3Error('el Blueprint debe ser schemaVersion 2');
@@ -97,6 +112,11 @@ export function buildPackagingPlanV3(
   for (const it of manifest.items) {
     if (byKey.has(it.key)) throw new PackagingPlanV3Error(`item repetido ${it.key}`);
     byKey.set(it.key, it);
+  }
+  const omit = new Set<string>(opts?.omitVideoChapterIds ?? []);
+  const videoChapterIds = new Set(manifest.modules.flatMap((m) => m.chapters.filter((c) => c.videoEnabled).map((c) => c.chapterId)));
+  for (const id of omit) {
+    if (!videoChapterIds.has(id)) throw new PackagingPlanV3Error(`omitVideoChapterIds: ${id} no es un capítulo con video en el Manifest`);
   }
   const consumed = new Set<string>();
   const take = (key: string, type: string): string => {
@@ -122,6 +142,8 @@ export function buildPackagingPlanV3(
       const bc = bm.chapters.find((c) => c.id === mc.chapterId);
       if (!bc) throw new PackagingPlanV3Error(`el capítulo ${mc.chapterId} no está en el módulo ${mm.moduleId} del Blueprint`);
       const id = mc.chapterId;
+      const videoInManifest = mc.videoEnabled === true;
+      const videoPending = videoInManifest && omit.has(id);
       const activityEnabled = mc.activityEnabled === true;
       let variant: 'h5p' | 'scorm' | null = null;
       let activityKey: string | null = null;
@@ -138,7 +160,8 @@ export function buildPackagingPlanV3(
         moduleNumber: mm.moduleNumber,
         sectionNum: -1, // se asigna abajo con el layout de secciones
         title: displayStructureTitle(bc.title),
-        videoEnabled: mc.videoEnabled === true,
+        videoEnabled: videoInManifest && !videoPending,
+        videoPending,
         activityEnabled,
         activityVariant: variant,
         keys: {
@@ -146,8 +169,11 @@ export function buildPackagingPlanV3(
           experience: take(`experience:${id}`, 'experience'),
           presentation: take(`presentation:${id}`, 'presentation'),
           audiobookChapter: take(`audiobook_chapter:${id}`, 'audiobook_chapter'),
-          video: mc.videoEnabled ? take(`video:${id}`, 'video') : null,
-          videoInteractions: mc.videoEnabled ? take(`video_interactions:${id}`, 'video_interactions') : null,
+          // Un video pendiente se consume (el Manifest queda cubierto) pero no ocupa lugar en el paquete.
+          video: videoInManifest ? (videoPending ? (take(`video:${id}`, 'video'), null) : take(`video:${id}`, 'video')) : null,
+          videoInteractions: videoInManifest
+            ? (videoPending ? (take(`video_interactions:${id}`, 'video_interactions'), null) : take(`video_interactions:${id}`, 'video_interactions'))
+            : null,
           activity: activityKey,
         },
       };
@@ -183,6 +209,17 @@ export function buildPackagingPlanV3(
     m.examSectionNum = m.examEnabled ? layout.examSection[m.moduleId] : null;
     for (const ch of m.chapters) ch.sectionNum = layout.chapterSection[ch.chapterId];
   }
+  const omittedVideos = modules.flatMap((m) =>
+    m.chapters
+      .filter((ch) => ch.videoPending)
+      .map((ch) => ({
+        chapterId: ch.chapterId,
+        chapterNumber: ch.chapterNumber,
+        title: ch.title,
+        videoKey: `video:${ch.chapterId}`,
+        videoInteractionsKey: `video_interactions:${ch.chapterId}`,
+      })),
+  );
   const sections = layout.sections;
   const finalExamSectionNum = layout.finalExamSection;
   const closingSectionNum = layout.closingSection;
@@ -197,6 +234,7 @@ export function buildPackagingPlanV3(
     modules,
     finalExamSectionNum,
     closingSectionNum,
+    omittedVideos,
   };
 }
 

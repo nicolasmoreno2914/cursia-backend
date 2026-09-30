@@ -57,6 +57,7 @@ export type ChapterLabelRole =
   | 'opening'
   | 'deepening'
   | 'video_primer'
+  | 'video_pending'
   | 'synthesis'
   | 'activity_instruction'
   | 'self_check'
@@ -79,9 +80,10 @@ export interface AssembleChapterInput {
 }
 
 /** Secuencia de slots (solo `kind`/`role`) — útil para tests y para R12. */
-export function chapterSlotSequence(flags: { videoEnabled: boolean; activityEnabled: boolean }): string[] {
+export function chapterSlotSequence(flags: { videoEnabled: boolean; activityEnabled: boolean; videoPendingNotice?: boolean }): string[] {
   const seq = ['label:opening', 'presentation', 'label:deepening'];
   if (flags.videoEnabled) seq.push('label:video_primer', 'video_h5p');
+  else if (flags.videoPendingNotice) seq.push('label:video_pending');
   seq.push('label:synthesis');
   if (flags.activityEnabled) seq.push('label:activity_instruction', 'activity');
   else seq.push('label:self_check');
@@ -174,6 +176,13 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     const after = transitionBox(h, pHtml(h, labelHtml(COPY.videoGo), alt, { last: true }));
     slots.push(label('video_primer', 'Antes del video', injectIntoMovement(mv('video_primer'), before, after)));
     slots.push({ kind: 'video_h5p' });
+  } else if (ch.videoPendingNotice) {
+    // EV6 T5 (ruling 3): video todavía de vista previa y los textos del curso lo mencionan →
+    // aviso neutral en su lugar (nunca un video simulado, nunca un recorrido que lo prometa).
+    if (!ch.videoPending) shellFail(`capítulo ${ch.number}: aviso de video pendiente sin video pendiente`);
+    const cs = toneSurf(h, 'alt');
+    const inner = box(h, eyebrow(h, 'Video interactivo', cs.s) + pHtml(h, labelHtml(COPY.videoPendingNotice), cs.s, { last: true }), cs, { cls: 'cvc-video-pending' });
+    slots.push(label('video_pending', 'Video pendiente', root(h, uid('video_pending'), inner)));
   }
   // [5] Síntesis.
   slots.push(label('synthesis', 'Síntesis', mv('synthesis')));
