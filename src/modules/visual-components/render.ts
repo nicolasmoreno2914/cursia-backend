@@ -432,12 +432,21 @@ function panel(r: R, inner: string, s: Surf, opts: { cls?: string; tag?: 'div' |
   );
 }
 
+/** El título del LLM que repetiría el kicker de objetivos (evita «Objetivos de aprendizaje» dos veces). */
+const OBJ_KICKER_RE = /^objetivos( de aprendizaje)?[.:]?$/i;
+
+/** Borde de una superficie tintada: en familias con lámina (oscuras) el tinte casi no se distingue del fondo. */
+function edgeOf(r: R, s: Surf): string {
+  return r.t.personality.plate ? r.t.color.border : s.bg;
+}
+
 /**
  * Edu EV4 — tarjeta de aprendizaje: superficie tintada con relleno (no una fila entre filetes),
  * para que un bloque didáctico se lea como pieza del curso y no como párrafo de revista.
  */
 function tile(r: R, inner: string, s: Surf, opts: { cls?: string; tag?: 'div' | 'li' } = {}): string {
   const tag = opts.tag || 'li';
+  const edge = edgeOf(r, s);
   return (
     `<${tag} class="cvc-tile${opts.cls ? ' ' + opts.cls : ''}"` +
     st(
@@ -445,6 +454,7 @@ function tile(r: R, inner: string, s: Surf, opts: { cls?: string; tag?: 'div' | 
       [
         ['background-color', s.bg],
         ['color', s.fg],
+        ['border', `1px solid ${edge}`],
         ['margin', `0 0 ${D(r, 12)}px 0`],
         ['padding', `${D(r, 18)}px ${D(r, 20)}px`],
       ],
@@ -587,7 +597,8 @@ function renderLearningObjectives(r: R, c: VcLearningObjectives): string {
           `<div class="cvc-li-n"${st(r, [['margin', '0 0 4px 0'], ['color', readable(ps.bg, [r.t.color.accentStrong], ps.fg)], ['font-family', r.t.personality.fontNumeral], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700']], [['font-variant-numeric', 'tabular-nums']])}>${labelHtml(indexText(r, i))}</div>` +
             `<div class="cvc-li-t"${st(r, [['color', ps.fg]])}>${inlineHtml(it)}</div>`,
           ps,
-          { tag: 'li', cls: 'cvc-obj', first: i === 0 },
+          // En 2 columnas (≥ 4 ítems) la primera fila visual son los ítems 0 y 1.
+          { tag: 'li', cls: 'cvc-obj', first: i < (items.length >= 4 ? 2 : 1) },
         ),
     )
     .join('');
@@ -596,9 +607,9 @@ function renderLearningObjectives(r: R, c: VcLearningObjectives): string {
     r,
     'learning_objectives',
     // Edu EV4: el kicker ya no repite el título; la lista vive en un panel tintado.
-    sectionKicker(r, 'Objetivos de aprendizaje', s) +
+    sectionKicker(r, OBJ_KICKER_RE.test((c.title ?? '').trim()) ? 'Al terminar podrás' : 'Objetivos de aprendizaje', s) +
       titleIf(r, c.title, s, 'Al terminar podrás') +
-      panel(r, bareList(r, 'ol', lis, cls), ps, { cls: 'cvc-obj-panel', border: ps.bg, padding: `${D(r, 6)}px ${D(r, 24)}px` }),
+      panel(r, bareList(r, 'ol', lis, cls), ps, { cls: 'cvc-obj-panel', border: edgeOf(r, ps), padding: `${D(r, 6)}px ${D(r, 24)}px` }),
     s,
   );
 }

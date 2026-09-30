@@ -94,13 +94,12 @@ export function scopedStyle(uid: string, theme: ResolvedTheme): string {
     `${S} .cvc-step{display:grid;grid-template-columns:2.75rem minmax(0,1fr);column-gap:8px;align-items:start}`,
     `${S} .cvc-step .cvc-num,${S} .cvc-step .cvc-badge{margin:0!important}`,
     // Edu EV4: tarjetas de aprendizaje y panel de objetivos
-    `${S} .cvc-cards>.cvc-tile{margin:0!important}`,
     `${S} .cvc-obj,${S} .cvc-pt{display:grid;grid-template-columns:2.75rem minmax(0,1fr);align-items:baseline}`,
     `${S} .cvc-obj .cvc-li-n,${S} .cvc-pt .cvc-li-n{margin:0!important}`,
     `${S} .cvc-check{display:grid;grid-template-columns:2rem minmax(0,1fr);align-items:baseline}`,
     `${S} .cvc-q{display:grid;grid-template-columns:1.75rem minmax(0,1fr);align-items:baseline}`,
     `${S} .cvc-grid>*,${S} .cvc-cols2>*{min-width:0}`,
-    `${S} .cvc-cards{display:grid;gap:16px}`,
+    `${S} .cvc-cards{display:grid;grid-template-columns:minmax(0,1fr);gap:16px}`,
     `${S} .cvc-cards>li{margin:0!important}`,
     // Edu Phase A — diagramas (layout SOLO acá: sin <style> todo queda como lista/tabla legible)
     `${S} .cvc-dg-flow .cvc-dg-step{position:relative}`,

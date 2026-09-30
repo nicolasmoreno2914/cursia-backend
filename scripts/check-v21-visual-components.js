@@ -101,6 +101,31 @@ check('espejo del frontend (44): DYN_VC_COMPONENT_SPECS, nodos por diagrama y ti
   if (vc.VC_PEDAGOGY) assert(JSON.stringify(canon(ctx.__ped)) === JSON.stringify(canon(vc.VC_PEDAGOGY)), `VC_PEDAGOGY: FE ${JSON.stringify(ctx.__ped)} ≠ BE ${JSON.stringify(vc.VC_PEDAGOGY)}`);
 });
 
+check('Edu EV4: bloques como piezas de curso (tarjetas, panel de objetivos, insignias) sin kicker repetido', () => {
+  for (const { combo, theme } of themes) {
+    for (const level of LEVELS) {
+      const o = { uid: 'ev4', level };
+      // Objetivos: kicker distinto del título; en 2 columnas los ítems 0 y 1 sin filete superior.
+      const four = vc.renderComponent({ type: 'learning_objectives', items: ['Uno claro', 'Dos claro', 'Tres claro', 'Cuatro claro'] }, theme, o);
+      const lis = four.match(/<li class="cvc-obj"[^>]*>/g) || [];
+      assert(lis.length === 4 && !/border-top/.test(lis[0]) && !/border-top/.test(lis[1]) && /border-top/.test(lis[2]), `${combo.themeFamily}: filetes de la primera fila (${lis.map((l) => /border-top/.test(l)).join(',')})`);
+      assert(four.includes('Objetivos de aprendizaje') && four.includes('Al terminar podrás') && four.includes('cvc-obj-panel'), 'kicker + título + panel');
+      const dup = vc.extractText(vc.renderComponent({ type: 'learning_objectives', title: 'Objetivos de aprendizaje', items: ['Uno claro', 'Dos claro'] }, theme, o));
+      assert(dup.split('Objetivos de aprendizaje').length === 2, `${combo.themeFamily}: kicker repite el título del LLM: ${dup.slice(0, 80)}`);
+      // Conceptos: tarjetas con borde (visible también en familias con lámina).
+      const cards = vc.renderComponent({ type: 'concept_cards', cards: [{ term: 'Término', definition: 'Definición breve.' }, { term: 'Otro', definition: 'Otra definición.' }] }, theme, o);
+      assert((cards.match(/class="cvc-tile cvc-term"[^>]*border:1px solid/g) || []).length === 2 && cards.includes('class="cvc-cards"'), `${combo.themeFamily}: tarjetas de conceptos`);
+      // Pasos: insignia, no numeral gigante.
+      const steps = vc.renderComponent({ type: 'process_steps', steps: [{ heading: 'Primero', body: 'Hacer algo.' }, { heading: 'Luego', body: 'Hacer otra cosa.' }, { heading: 'Final', body: 'Cerrar.' }] }, theme, o);
+      assert((steps.match(/class="cvc-badge"/g) || []).length === 3 && !steps.includes('class="cvc-num"'), `${combo.themeFamily}: insignias de paso`);
+      if (level) {
+        const lbl = vc.renderMovement([{ type: 'concept_cards', cards: [{ term: 'Término', definition: 'Definición breve.' }] }], theme, o);
+        assert(/\.cvc-cards\{display:grid;grid-template-columns:minmax\(0,1fr\)/.test(lbl), 'la grilla de tarjetas no desborda en angosto');
+      }
+    }
+  }
+});
+
 check('Edu EV2: validatePedagogy — introducción visual, conceptos clave, ejemplo práctico, recurso visual y sin muros de texto', () => {
   const base = () => {
     const d = F.buildExperience();
