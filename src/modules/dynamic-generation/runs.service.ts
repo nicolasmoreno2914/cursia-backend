@@ -62,7 +62,16 @@ import {
 } from './provider-readiness';
 import { INVALIDATION_V3_NOT_IMPLEMENTED, assertInvalidationRulesSupported } from '../invalidation/plan';
 import { latestGenerationPredicate } from './item-generations';
-import { AutoHealPolicy, AutoHealSweepResult, DEFAULT_AUTO_HEAL_POLICY, autoHealDecision } from './auto-heal';
+import {
+  AUTO_HEAL_SQL_ALLOW_REGEX,
+  AUTO_HEAL_SQL_DENY_REGEX,
+  AUTO_HEAL_WORKER_ITEM_TYPES,
+  AutoHealPolicy,
+  AutoHealSweepResult,
+  autoHealDecision,
+  autoHealMaxRoundsFor,
+  autoHealPolicyFromEnv,
+} from './auto-heal';
 import { FinopsBudgetService, StartBudgetEvaluation } from '../finops/finops-budget.service';
 import {
   BUDGET_APPROVAL_REQUIRED,
@@ -1667,7 +1676,7 @@ export class RunsService {
       const nowIso = (auto?.now ?? new Date()).toISOString();
       const entryExtra = autoMeta ? { auto: true, autoHealRound: autoMeta.round, autoHealCode: autoMeta.code } : {};
       const topExtra = autoMeta
-        ? { autoHeal: { rounds: autoMeta.round, lastAt: nowIso, lastCode: autoMeta.code, maxRounds: auto!.policy.maxRounds } }
+        ? { autoHeal: { rounds: autoMeta.round, lastAt: nowIso, lastCode: autoMeta.code, maxRounds: autoHealMaxRoundsFor(target.type, auto!.policy) } }
         : {};
       const attemptsGranted = auto ? Math.max(1, Math.floor(auto.policy.attemptsPerRound)) : 3;
 
@@ -1744,67 +1753,119 @@ export class RunsService {
   /**
    * R16 (#2 + #16) — barrido del auto-healer (lo dispara el timer de la API,
    * ver auto-heal.ts/startAutoHealTimer). Lee sin locks los items `failed`
-   * (generación vigente) de runs dinámicos no cancelados con rondas
-   * automáticas disponibles, evalúa la política pura y reabre los elegibles
-   * con retryItem(auto) — que re-evalúa todo bajo lock. Un item que no se
-   * puede reabrir (presupuesto, run reemplazado, otro run activo, owner fuera
-   * de la allow-list…) se deja para un humano, con un log por motivo.
+   * (generación vigente) y reabre los elegibles con retryItem(auto), que
+   * re-evalúa todo bajo lock. Un item que no se puede reabrir (presupuesto,
+   * run reemplazado, otro run activo, owner fuera de la allow-list…) se deja
+   * para un humano, con un log por motivo.
+   *
+   * Fix round 1 (review I1/I2): el SQL ya filtra lo que el healer reabriría —
+   * fallos RECIENTES (policy.maxAgeHours) de la ejecución VIGENTE del curso (sin
+   * run ni Manifest más nuevos), allow/deny-list gruesa, precondición del id
+   * del proveedor, tope de rondas por tipo y espera —, los más nuevos primero,
+   * con paginación por clave (finished_at, id): filas no elegibles nunca tapan
+   * a una elegible. Un log por barrido con los conteos.
    */
-  async autoHealFailedItems(opts: { policy?: AutoHealPolicy; now?: Date; limit?: number } = {}): Promise<AutoHealSweepResult> {
-    const policy = opts.policy ?? DEFAULT_AUTO_HEAL_POLICY;
-    const limit = Math.max(1, Math.floor(opts.limit ?? 50));
-    const result: AutoHealSweepResult = { reopened: [], skipped: [] };
-    const rows: Array<{
-      id: string; job_id: string; item_key: string; status: string; error: string | null; output_summary: Record<string, any> | null;
-      finished_at: Date | null; updated_at: Date | null; course_id: number; owner_id: string; blueprint_number: number;
-    }> = await this.dataSource.query(
-      `select g.id, g.job_id, g.item_key, g.status, g.error, g.output_summary, g.finished_at, g.updated_at,
-              pj.course_id, pj.owner_id, b.blueprint_number
-         from public.generation_item_runs g
-         join public.production_jobs pj on pj.id = g.job_id
-         join public.course_generation_manifests m on m.id = g.manifest_id
-         join public.course_blueprints b on b.id = m.blueprint_id
-        where pj.execution_mode = 'dynamic_generation'
-          and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
-          and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed')
-          and g.status = 'failed'
-          and ${latestGenerationPredicate('g')}
-          and (case when jsonb_typeof(g.output_summary->'autoHeal'->'rounds') = 'number'
-                    then (g.output_summary->'autoHeal'->>'rounds')::numeric else 0 end) < $1
-        order by g.finished_at nulls first, g.id
-        limit $2`,
-      [policy.maxRounds, limit],
-    );
+  async autoHealFailedItems(
+    opts: { policy?: AutoHealPolicy; now?: Date; limit?: number; maxCandidates?: number } = {},
+  ): Promise<AutoHealSweepResult> {
+    const policy = opts.policy ?? autoHealPolicyFromEnv();
+    const pageSize = Math.max(1, Math.floor(opts.limit ?? 50));
+    const maxCandidates = Math.max(pageSize, Math.floor(opts.maxCandidates ?? 200));
     const now = opts.now ?? new Date();
-    for (const r of rows) {
-      const d = autoHealDecision(r, now, policy);
-      if (d.heal === false) {
-        // backoff = todavía no; el resto = nunca automático (sin log por item: muchos son no-transitorios).
-        if (d.reason !== 'backoff') result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: d.reason });
-        continue;
-      }
-      try {
-        await this.retryItem(r.course_id, r.owner_id, Number(r.blueprint_number), r.job_id, r.item_key, false, false, { policy, now });
-        this.autoHealLastSkip.delete(r.id);
-        result.reopened.push({ runId: r.job_id, itemKey: r.item_key, code: d.rule.code, round: d.round });
-        this.logger.warn(
-          `auto-heal: reabierto ${r.item_key} (run ${r.job_id}) — ronda ${d.round}/${policy.maxRounds}, ` +
-            `código ${d.rule.code}; error previo: ${String(r.error ?? '').slice(0, 200)}`,
-        );
-      } catch (err) {
-        const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
-        const code = (resp && typeof resp === 'object' && (resp as any).code) || (err instanceof Error ? err.name : 'error');
-        const msg = err instanceof Error ? err.message : String(err);
-        result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: String(code) });
-        const key = `${code}:${msg.slice(0, 120)}`;
-        if (this.autoHealLastSkip.get(r.id) !== key) {
-          this.autoHealLastSkip.set(r.id, key);
-          this.logger.warn(`auto-heal: ${r.item_key} (run ${r.job_id}) no se reabre automáticamente (${code}): ${msg.slice(0, 300)}`);
-        }
-      }
+    const result: AutoHealSweepResult = { candidates: 0, reopened: [], skipped: [] };
+    const roundsSql = `floor(case when jsonb_typeof(g.output_summary->'autoHeal'->'rounds') = 'number'
+                                  then (g.output_summary->'autoHeal'->>'rounds')::numeric else 0 end)::int`;
+    const backoffs = (policy.backoffSeconds.length ? policy.backoffSeconds : [0]).map((x) => Math.max(0, Math.floor(x)));
+    let cursor: { finishedAt: Date; id: string } | null = null;
+    while (result.candidates! < maxCandidates) {
+      const rows: Array<{
+        id: string; job_id: string; item_key: string; type: string; status: string; error: string | null; output_summary: Record<string, any> | null;
+        finished_at: Date; updated_at: Date | null; course_id: number; owner_id: string; blueprint_number: number;
+      }> = await this.dataSource.query(
+        `select g.id, g.job_id, g.item_key, g.type, g.status, g.error, g.output_summary, g.finished_at, g.updated_at,
+                pj.course_id, pj.owner_id, b.blueprint_number
+           from public.generation_item_runs g
+           join public.production_jobs pj on pj.id = g.job_id
+           join public.course_generation_manifests m on m.id = g.manifest_id
+           join public.course_blueprints b on b.id = m.blueprint_id
+          where pj.execution_mode = 'dynamic_generation'
+            and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+            and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed')
+            and g.status = 'failed'
+            and ${latestGenerationPredicate('g')}
+            -- I1: solo fallos recientes
+            and g.finished_at > $1::timestamptz - make_interval(secs => $2::int)
+            -- I1: solo la ejecución vigente del curso (ningún run más nuevo, ni un Manifest más nuevo)
+            and not exists (
+              select 1 from public.production_jobs pj2
+               where pj2.execution_mode = 'dynamic_generation' and pj2.course_id = pj.course_id and pj2.id <> pj.id
+                 and (pj2.created_at > pj.created_at or (pj2.created_at = pj.created_at and pj2.id > pj.id)))
+            and not exists (select 1 from public.course_generation_manifests m2 where m2.course_id = m.course_id and m2.id > m.id)
+            -- I2: allow/deny-list gruesa + precondición del id del proveedor
+            and g.error ~* $3 and g.error !~* $4
+            and not (g.error ~ '^(gamma_timeout|gamma_poll_failed|gamma_export_missing)'
+                     and coalesce(g.output_summary->'external'->>'gammaGenerationId', '') = '')
+            and not (g.error ~ '^(video_timeout|video_duration_unmeasured|youtube_upload_failed)'
+                     and coalesce(g.output_summary->'external'->>'videogenJobId', '') = '')
+            -- M6 + tope: rondas por tipo; espera creciente desde el fallo
+            and ${roundsSql} < case when g.type = any($5::text[]) then $6::int else $7::int end
+            and g.finished_at <= $1::timestamptz - make_interval(secs => ($8::int[])[least(${roundsSql}, cardinality($8::int[]) - 1) + 1])
+            and ($9::timestamptz is null or (g.finished_at, g.id) < ($9::timestamptz, $10::uuid))
+          order by g.finished_at desc, g.id desc
+          limit $11`,
+        [
+          now.toISOString(), Math.round(policy.maxAgeHours * 3600), AUTO_HEAL_SQL_ALLOW_REGEX, AUTO_HEAL_SQL_DENY_REGEX,
+          [...AUTO_HEAL_WORKER_ITEM_TYPES], policy.maxRounds, policy.browserMaxRounds, backoffs,
+          cursor ? cursor.finishedAt : null, cursor ? cursor.id : null, pageSize,
+        ],
+      );
+      if (rows.length === 0) break;
+      result.candidates! += rows.length;
+      cursor = { finishedAt: rows[rows.length - 1].finished_at, id: rows[rows.length - 1].id };
+      for (const r of rows) await this.autoHealOne(r, now, policy, result);
+      if (rows.length < pageSize) break;
     }
     if (this.autoHealLastSkip.size > 5000) this.autoHealLastSkip.clear();
+    const byReason: Record<string, number> = {};
+    for (const s of result.skipped) byReason[s.reason] = (byReason[s.reason] ?? 0) + 1;
+    this.logger.log(
+      `auto-heal: barrido — candidatos ${result.candidates}, reabiertos ${result.reopened.length}, ` +
+        `omitidos ${result.skipped.length}${result.skipped.length ? ` ${JSON.stringify(byReason)}` : ''}`,
+    );
     return result;
+  }
+
+  private async autoHealOne(
+    r: { id: string; job_id: string; item_key: string; type: string; status: string; error: string | null; output_summary: Record<string, any> | null;
+      finished_at: Date; updated_at: Date | null; course_id: number; owner_id: string; blueprint_number: number },
+    now: Date,
+    policy: AutoHealPolicy,
+    result: AutoHealSweepResult,
+  ): Promise<void> {
+    const d = autoHealDecision(r, now, policy);
+    if (d.heal === false) {
+      result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: d.reason });
+      return;
+    }
+    try {
+      await this.retryItem(r.course_id, r.owner_id, Number(r.blueprint_number), r.job_id, r.item_key, false, false, { policy, now });
+      this.autoHealLastSkip.delete(r.id);
+      result.reopened.push({ runId: r.job_id, itemKey: r.item_key, code: d.rule.code, round: d.round });
+      this.logger.warn(
+        `auto-heal: reabierto ${r.item_key} (run ${r.job_id}) — ronda ${d.round}/${autoHealMaxRoundsFor(r.type, policy)}, ` +
+          `código ${d.rule.code}; error previo: ${String(r.error ?? '').slice(0, 200)}`,
+      );
+    } catch (err) {
+      const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
+      const code = (resp && typeof resp === 'object' && (resp as any).code) || (err instanceof Error ? err.name : 'error');
+      const msg = err instanceof Error ? err.message : String(err);
+      result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: String(code) });
+      const key = `${code}:${msg.slice(0, 120)}`;
+      if (this.autoHealLastSkip.get(r.id) !== key) {
+        this.autoHealLastSkip.set(r.id, key);
+        this.logger.warn(`auto-heal: ${r.item_key} (run ${r.job_id}) no se reabre automáticamente (${code}): ${msg.slice(0, 300)}`);
+      }
+    }
   }
 
   /**

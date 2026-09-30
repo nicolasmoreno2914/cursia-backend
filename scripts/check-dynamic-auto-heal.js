@@ -181,6 +181,19 @@ async function pureChecks() {
     eq([P.maxRounds, P.attemptsPerRound, [...P.backoffSeconds]], [3, 2, [120, 600, 1800]], 'política por defecto');
   });
 
+  await check('puro fix M6/I1: tope de rondas por tipo (navegador 1, worker 3; tipos de worker = WORKER_ONLY_TYPES del scheduler); fallo > ventana (24 h, env) → too_old', () => {
+    const { WORKER_ONLY_TYPES } = loadDist('modules/dynamic-generation/scheduler.service.js');
+    eq([...AH.AUTO_HEAL_WORKER_ITEM_TYPES].sort(), [...WORKER_ONLY_TYPES].sort(), 'tipos de worker');
+    eq([P.browserMaxRounds, P.maxAgeHours], [1, 24], 'defaults');
+    const row = (type, rounds) => ({ ...failedRow('lease_expired', rounds ? { autoHeal: { rounds } } : {}, 7200), type });
+    eq(AH.autoHealDecision(row('content', 1), NOW, P).reason, 'cap_reached', 'content: 1 ronda');
+    eq(AH.autoHealDecision(row('final_exam', 0), NOW, P).heal, true, 'navegador ronda 1');
+    eq(AH.autoHealDecision(row('presentation', 1), NOW, P).heal, true, 'worker ronda 2');
+    eq(AH.autoHealDecision(failedRow('lease_expired', {}, 25 * 3600), NOW, P).reason, 'too_old', '25 h');
+    eq(AH.autoHealPolicyFromEnv({ DYNAMIC_AUTO_HEAL_MAX_AGE_HOURS: '48' }).maxAgeHours, 48, 'env');
+    eq(AH.autoHealPolicyFromEnv({ DYNAMIC_AUTO_HEAL_MAX_AGE_HOURS: 'x' }).maxAgeHours, 24, 'basura → 24');
+  });
+
   await check('puro: kill-switch — apagado sin el flag dinámico o con DYNAMIC_AUTO_HEAL_ENABLED=false; timer sin solapamiento y null si está apagado', async () => {
     eq(AH.autoHealEnabled({}), false, 'sin flag dinámico');
     eq(AH.autoHealEnabled({ DYNAMIC_COURSE_STRUCTURE: 'true' }), true, 'default encendido');
@@ -381,59 +394,85 @@ async function dbChecks() {
     });
 
     // ═══ #2 healer ═══════════════════════════════════════════════════════════
+    const P = AH.DEFAULT_AUTO_HEAL_POLICY;
+    const revoke = async (why) => {
+      const [est] = await ds.query(`select id from public.cost_estimates where run_id = $1 and scope = 'run'`, [C.runId]);
+      await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, decision, reason) values ($1, $2, $3, 0, 'BLOCKED', $4)`, [C.runId, C.cid, est.id, why]);
+      return est.id;
+    };
+    const reauthorize = async (estId) => ds.query(
+      `insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, decision, approved_by, reason) values ($1, $2, $3, 500, 'ADMIN_APPROVED', 'admin@cursia.test', 'check R16: reautorizado')`,
+      [C.runId, C.cid, estId]);
+    const failAt = (id, error, minutesAgo, osSql = null) => setRow(id,
+      `status = 'failed', error = $2, finished_at = now() - make_interval(mins => $3::int)${osSql ? `, output_summary = ${osSql}` : ''}`, [error, minutesAgo]);
+
     await check('DB #2 healer: dentro de la espera (recién fallado) NO reabre; pasada la espera reabre: pending, +2 intentos, previousErrors auto:true, autoHeal.rounds=1, dependientes desbloqueados', async () => {
       let r = await heal(0);
       eq(r.reopened.length, 0, 'espera');
       eq((await itemRow(C.runId, contentKey)).status, 'failed', 'sigue failed');
-      r = await heal(AH.DEFAULT_AUTO_HEAL_POLICY.backoffSeconds[0] + 5);
+      r = await heal(P.backoffSeconds[0] + 5);
       eq(r.reopened.map((x) => [x.itemKey, x.code, x.round]), [[contentKey, 'lease_expired', 1]], 'reabierto');
       const row = await itemRow(C.runId, contentKey);
-      eq([row.status, row.error, row.max_attempts, row.output_summary.autoHeal.rounds, row.output_summary.autoHeal.lastCode], ['pending', null, 4 + 2, 1, 'lease_expired'], 'fila');
+      eq([row.status, row.error, row.max_attempts, row.output_summary.autoHeal.rounds, row.output_summary.autoHeal.lastCode, row.output_summary.autoHeal.maxRounds],
+        ['pending', null, 4 + 2, 1, 'lease_expired', P.browserMaxRounds], 'fila');
       const last = row.output_summary.previousErrors[row.output_summary.previousErrors.length - 1];
       eq([last.error, last.auto, last.autoHealRound, last.autoHealCode, last.attemptCount], ['lease_expired', true, 1, 'lease_expired', 4], 'auditoría en previousErrors');
       const stillBlocked = await ds.query(`select item_key from public.generation_item_runs where job_id = $1 and status = 'blocked' and $2 = any(depends_on)`, [C.runId, contentKey]);
       eq(stillBlocked.length, 0, 'dependientes directos desbloqueados');
       assert(LOGS.some((l) => /auto-heal: reabierto/.test(l) && l.includes(contentKey)), 'log de la reapertura');
+      assert(LOGS.some((l) => /auto-heal: barrido — candidatos \d+, reabiertos 1, omitidos \d+/.test(l)), 'log por barrido con conteos');
     });
 
-    await check('DB #2 healer: 2ª ronda solo pasada la espera mayor (10 min); con el tope de rondas nunca más', async () => {
+    await check('DB fix M6: item del navegador (content) → UNA sola ronda automática (cada ronda repite LLM pagado); ya no es candidato', async () => {
       const it = await itemRow(C.runId, contentKey);
-      await setRow(it.id, `status = 'failed', error = 'unexpected_error: Connection terminated', finished_at = now()`);
-      eq((await heal(AH.DEFAULT_AUTO_HEAL_POLICY.backoffSeconds[0] + 5)).reopened.length, 0, 'la espera de la ronda 1 ya no alcanza');
-      const r2 = await heal(AH.DEFAULT_AUTO_HEAL_POLICY.backoffSeconds[1] + 5);
-      eq(r2.reopened.map((x) => [x.code, x.round]), [['unexpected_error', 2]], 'ronda 2');
-      await setRow(it.id, `status = 'failed', error = 'lease_expired', finished_at = now() - interval '10 hours',
-                           output_summary = output_summary || jsonb_build_object('autoHeal', jsonb_build_object('rounds', $2::int))`, [AH.DEFAULT_AUTO_HEAL_POLICY.maxRounds]);
-      eq((await heal(0)).reopened.length, 0, 'tope de rondas');
+      await failAt(it.id, 'unexpected_error: Connection terminated', 60);
+      const r = await heal(0);
+      eq(r.reopened.map((x) => x.itemKey).includes(contentKey), false, 'no reabre');
+      eq(r.skipped.map((x) => x.itemKey).includes(contentKey), false, 'ni siquiera es candidato (filtro SQL)');
       eq((await itemRow(C.runId, contentKey)).status, 'failed', 'queda para un humano');
-      await rejectsRe(runs.retryItem(C.cid, OWNER, 1, C.runId, contentKey, false, false, { policy: AH.DEFAULT_AUTO_HEAL_POLICY }), /auto_heal_not_eligible/, 'bajo lock', 409);
+    });
+
+    const presKey = `presentation:${C.c1}`;
+    await check('DB #2 healer (item de worker): ronda 2 solo pasada la espera mayor (10 min); ronda 3; con el tope nunca más; retryItem(auto) re-evalúa bajo lock (409)', async () => {
+      const it = await itemRow(C.runId, presKey);
+      const withId = `jsonb_build_object('external', jsonb_build_object('gammaGenerationId', 'gen_r16_w'))`;
+      await failAt(it.id, 'gamma_timeout: no terminó', 3, withId);
+      eq((await heal(0)).reopened.map((x) => [x.itemKey, x.round]), [[presKey, 1]], 'ronda 1 (3 min > 2 min)');
+      await failAt(it.id, 'gamma_poll_failed: HTTP 503', 5);
+      eq((await heal(0)).reopened.length, 0, 'ronda 2: 5 min < 10 min');
+      await failAt(it.id, 'gamma_poll_failed: HTTP 503', 11);
+      eq((await heal(0)).reopened.map((x) => [x.itemKey, x.round]), [[presKey, 2]], 'ronda 2 (11 min)');
+      await failAt(it.id, 'gamma_timeout: no terminó', 31);
+      eq((await heal(0)).reopened.map((x) => [x.itemKey, x.round]), [[presKey, 3]], 'ronda 3 (31 min)');
+      await failAt(it.id, 'gamma_timeout: no terminó', 120);
+      eq((await heal(0)).reopened.length, 0, 'tope de rondas');
+      eq((await itemRow(C.runId, presKey)).status, 'failed', 'queda para un humano');
+      await rejectsRe(runs.retryItem(C.cid, OWNER, 1, C.runId, presKey, false, false, { policy: P }), /auto_heal_not_eligible/, 'bajo lock', 409);
+      await setRow(it.id, `output_summary = output_summary - 'autoHeal'`);
     });
 
     await check('DB #2 healer: NUNCA reabre pagos ambiguos, reconciliación ni bloqueos de presupuesto', async () => {
-      const pres = await itemRow(C.runId, `presentation:${C.c1}`);
+      const pres = await itemRow(C.runId, presKey);
       const vid = await itemRow(C.runId, `video:${C.c1}`);
       const audio = await itemRow(C.runId, `audiobook_chapter:${C.c1}`);
       const exam = await ds.query(`select id, item_key from public.generation_item_runs where job_id = $1 and type = 'module_intro' limit 1`, [C.runId]);
-      await setRow(pres.id, `status = 'failed', error = 'gamma_submit_ambiguous: el envío a Gamma quedó sin confirmar', finished_at = now() - interval '5 hours',
-                             output_summary = jsonb_build_object('externalSubmitStartedAt', '2026-09-30T00:00:00Z')`);
-      await setRow(vid.id, `status = 'failed', error = 'ambiguous_video_submission: timeout', finished_at = now() - interval '5 hours'`);
-      await setRow(audio.id, `status = 'failed', error = 'provider_reconciliation_required: openai — audio TTS pagado sin persistir', finished_at = now() - interval '5 hours'`);
+      await failAt(pres.id, 'gamma_submit_ambiguous: el envío a Gamma quedó sin confirmar', 300, `jsonb_build_object('externalSubmitStartedAt', '2026-09-30T00:00:00Z')`);
+      await failAt(vid.id, 'ambiguous_video_submission: timeout', 300);
+      await failAt(audio.id, 'provider_reconciliation_required: openai — audio TTS pagado sin persistir', 300);
       if (exam[0]) await setRow(exam[0].id, `status = 'blocked', error = 'budget_exceeded: no_authorization', finished_at = null, updated_at = now() - interval '5 hours'`);
-      const r = await heal(3600);
+      const r = await heal(0);
       eq(r.reopened.length, 0, `nada reabierto: ${JSON.stringify(r.reopened)}`);
-      for (const [row, st] of [[pres, 'failed'], [vid, 'failed'], [audio, 'failed']]) eq((await itemRow(C.runId, row.item_key)).status, st, row.item_key);
+      for (const row of [pres, vid, audio]) eq((await itemRow(C.runId, row.item_key)).status, 'failed', row.item_key);
       if (exam[0]) eq((await itemRow(C.runId, exam[0].item_key)).status, 'blocked', 'budget_exceeded intacto');
-      const reasons = Object.fromEntries(r.skipped.map((s) => [s.itemKey, s.reason]));
-      eq([reasons[pres.item_key], reasons[vid.item_key], reasons[audio.item_key]], ['denied', 'denied', 'denied'], 'motivo');
+      eq(r.candidates, 0, 'el filtro SQL ya los descarta (deny-list)');
     });
 
     await check('DB #2 healer: gamma_timeout sin el generationId persistido → no (sería un envío nuevo); con el id → reabre sin registrar estimados', async () => {
-      const pres = await itemRow(C.runId, `presentation:${C.c1}`);
+      const pres = await itemRow(C.runId, presKey);
       const est0 = await estimatesOf(C.cid);
-      await setRow(pres.id, `status = 'failed', error = 'gamma_timeout: no terminó', finished_at = now() - interval '5 hours', output_summary = '{}'::jsonb`);
+      await failAt(pres.id, 'gamma_timeout: no terminó', 60, `'{}'::jsonb`);
       let r = await heal(0);
-      eq(r.reopened.length, 0, 'sin id');
-      eq(r.skipped.find((s) => s.itemKey === pres.item_key).reason, 'missing_precondition', 'motivo');
+      eq([r.reopened.length, r.candidates], [0, 0], 'sin id: descartado por la precondición');
       await setRow(pres.id, `output_summary = jsonb_build_object('external', jsonb_build_object('gammaGenerationId', 'gen_r16_1'))`);
       r = await heal(0);
       eq(r.reopened.map((x) => x.itemKey), [pres.item_key], 'reabierto con el id');
@@ -441,11 +480,10 @@ async function dbChecks() {
       eq(await estimatesOf(C.cid), est0, 'sin estimados nuevos');
     });
 
-    await check('DB #2 healer: presupuesto insuficiente (autorización revocada) → no reabre un item pagado, 0 estimados registrados, queda failed', async () => {
-      const pres = await itemRow(C.runId, `presentation:${C.c1}`);
-      await setRow(pres.id, `status = 'failed', error = 'unexpected_error: DB caída antes del envío', finished_at = now() - interval '5 hours', output_summary = '{}'::jsonb`);
-      const [est] = await ds.query(`select id from public.cost_estimates where run_id = $1 and scope = 'run'`, [C.runId]);
-      await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, decision, reason) values ($1, $2, $3, 0, 'BLOCKED', 'check R16: revocado')`, [C.runId, C.cid, est.id]);
+    await check('DB #2 healer: presupuesto insuficiente → no reabre un item que ENVÍA trabajo pagado (0 estimados); fix M1: una presentación que solo re-pollea su generationId SÍ (auto y manual)', async () => {
+      const pres = await itemRow(C.runId, presKey);
+      await failAt(pres.id, 'unexpected_error: DB caída antes del envío', 60, `'{}'::jsonb`);
+      const estId = await revoke('check R16: revocado');
       const est0 = await estimatesOf(C.cid);
       const r = await heal(0);
       eq(r.reopened.length, 0, 'no reabre');
@@ -454,7 +492,91 @@ async function dbChecks() {
       const n = LOGS.filter((l) => /no se reabre automáticamente/.test(l) && l.includes(pres.item_key)).length;
       await heal(0);
       eq(LOGS.filter((l) => /no se reabre automáticamente/.test(l) && l.includes(pres.item_key)).length, n, 'el mismo motivo no se loguea en cada barrido');
-      await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, decision, approved_by, reason) values ($1, $2, $3, 500, 'ADMIN_APPROVED', 'admin@cursia.test', 'check R16: reautorizado')`, [C.runId, C.cid, est.id]);
+      // M1: con el generationId persistido el reintento es un re-poll gratis → sin gate de presupuesto.
+      await failAt(pres.id, 'gamma_timeout: no terminó', 60, `jsonb_build_object('external', jsonb_build_object('gammaGenerationId', 'gen_r16_m1'))`);
+      eq((await heal(0)).reopened.map((x) => x.itemKey), [pres.item_key], 'auto: reabierto con presupuesto revocado');
+      await failAt(pres.id, 'gamma_poll_failed: HTTP 503', 60);
+      eq((await runs.retryItem(C.cid, OWNER, 1, C.runId, pres.item_key)).status, 'pending', 'manual: sin budget_approval_required');
+      eq(await estimatesOf(C.cid), est0, 'sin estimados');
+      await reauthorize(estId);
+    });
+
+    await check('DB fix M3: resubmitProvider / resubmitVideo archivan el envío anterior y también borran gammaPollSince / videoPollSince', async () => {
+      const pres = await itemRow(C.runId, presKey);
+      await failAt(pres.id, 'gamma_submit_ambiguous: sin confirmar', 60,
+        `jsonb_build_object('external', jsonb_build_object('gammaGenerationId', 'gen_old'), 'externalSubmitStartedAt', '2026-09-30T00:00:00Z', 'gammaPollSince', '2026-09-30T00:00:00Z')`);
+      await runs.retryItem(C.cid, OWNER, 1, C.runId, presKey, false, true);
+      let row = await itemRow(C.runId, presKey);
+      eq([row.status, 'gammaPollSince' in row.output_summary, 'external' in row.output_summary, row.output_summary.previousExternals.length >= 1], ['pending', false, false, true], 'presentación');
+      const vid = await itemRow(C.runId, `video:${C.c1}`);
+      await failAt(vid.id, 'videogen_failed: render', 60,
+        `jsonb_build_object('external', jsonb_build_object('videogenJobId', 'vg_old', 'mode', 'real'), 'videoPollSince', '2026-09-30T00:00:00Z')`);
+      await runs.retryItem(C.cid, OWNER, 1, C.runId, `video:${C.c1}`, true, false);
+      row = await itemRow(C.runId, `video:${C.c1}`);
+      eq([row.status, 'videoPollSince' in row.output_summary, 'external' in row.output_summary], ['pending', false, false], 'video');
+    });
+
+    await check('DB fix I1: un fallo fuera de la ventana de recencia (25 h) no se reabre (run viejo/abandonado)', async () => {
+      const it = await itemRow(C.runId, `content:${C.c2}`);
+      await setRow(it.id, `status = 'failed', error = 'lease_expired', finished_at = now() - interval '25 hours', output_summary = '{}'::jsonb`);
+      const r = await heal(0);
+      eq([r.reopened.length, r.candidates], [0, 0], 'viejo');
+      eq(AH.autoHealDecision({ status: 'failed', error: 'lease_expired', output_summary: {}, finished_at: new Date(Date.now() - 25 * 3600e3) }, new Date(), P).reason, 'too_old', 'pura');
+    });
+
+    await check('DB fix I1: un fallo de un run que NO es el vigente del curso (hay un run más nuevo) no se reabre', async () => {
+      const it = await itemRow(C.runId, `content:${C.c2}`);
+      await setRow(it.id, `status = 'failed', error = 'lease_expired', finished_at = now() - interval '1 hour', output_summary = '{}'::jsonb`);
+      const [clone] = await ds.query(
+        `insert into public.production_jobs
+         select (jsonb_populate_record(null::public.production_jobs, to_jsonb(pj) || jsonb_build_object(
+                  'id', gen_random_uuid(), 'created_at', now() + interval '1 minute', 'status', 'completed', 'worker_status', 'completed'))).*
+           from public.production_jobs pj where pj.id = $1
+         returning id`, [C.runId]);
+      try {
+        const r = await heal(0);
+        eq([r.reopened.length, r.candidates], [0, 0], 'run reemplazado');
+        eq((await itemRow(C.runId, `content:${C.c2}`)).status, 'failed', 'intacto');
+      } finally {
+        await ds.query(`delete from public.production_jobs where id = $1`, [clone.id]);
+      }
+    });
+
+    await check('DB fix I2: más filas no elegibles que el LIMIT (descartadas en SQL o rechazadas por retryItem) no tapan a las elegibles; los más nuevos primero', async () => {
+      const estId = await revoke('check R16: I2');
+      // 3 errores de contenido (fuera de la allow-list) — los más nuevos.
+      const others = await ds.query(`select id, item_key, type from public.generation_item_runs where job_id = $1 and type in ('final_exam', 'module_intro', 'experience', 'activity', 'video_interactions') order by item_key`, [C.runId]);
+      assert(others.length >= 3, `items de contenido suficientes (${others.length})`);
+      for (const o of others.slice(0, 3)) await failAt(o.id, 'CONTENT_TRUTH: persisten oraciones', 1);
+      // 2 pagados que pasan el SQL pero retryItem rechaza (presupuesto revocado).
+      const audio = await itemRow(C.runId, `audiobook_chapter:${C.c1}`);
+      await failAt(audio.id, 'unexpected_error: DB caída antes del envío', 5, `'{}'::jsonb`);
+      await failAt((await itemRow(C.runId, presKey)).id, 'unexpected_error: DB caída antes del envío', 6, `'{}'::jsonb`);
+      // 2 elegibles, más viejos: course_intro (30 min) y content:c2 (60 min).
+      const intro = await ds.query(`select id, item_key from public.generation_item_runs where job_id = $1 and type = 'course_intro'`, [C.runId]);
+      assert(intro[0], 'course_intro');
+      await failAt(intro[0].id, 'lease_expired', 30, `'{}'::jsonb`);
+      await failAt((await itemRow(C.runId, `content:${C.c2}`)).id, 'lease_expired', 60, `'{}'::jsonb`);
+      const r = await runs.autoHealFailedItems({ now: new Date(), limit: 1 });
+      eq(r.reopened.map((x) => x.itemKey), [intro[0].item_key, `content:${C.c2}`], 'elegibles reabiertos, el más nuevo primero');
+      eq(r.skipped.map((x) => [x.itemKey, x.reason]), [[audio.item_key, 'budget_approval_required'], [presKey, 'budget_approval_required']], 'rechazados en orden (más nuevo primero)');
+      eq(r.candidates, 4, 'los errores de contenido no cuentan (filtro SQL)');
+      await reauthorize(estId);
+    });
+
+    await check('DB fix I2: el filtro grueso SQL coincide con la política JS (allow/deny) en los códigos de la allow-list y de la deny-list', async () => {
+      const samples = [
+        'lease_expired', 'worker_draining: x', 'unexpected_error: x', 'content_download_failed: x', 'dynamic_content_md_download_failed: x',
+        'gamma_timeout: x', 'gamma_poll_failed: x', 'gamma_export_missing: x', 'video_timeout', 'video_duration_unmeasured: x', 'youtube_upload_failed: x',
+        '❌ Falló después de 3 intentos: 529', 'Falló después de 5 intentos: fetch failed', 'no se pudo subir el artifact x: HTTP 500',
+        'gamma_submit_ambiguous: x', 'provider_reconciliation_required: x', 'unexpected_error: provider_reconciliation_required: x', 'youtube_blocked_quota: x',
+        'budget_exceeded: x', 'CONTENT_TRUTH: x', 'v3_payload_invalid: x', 'videogen_failed: x', 'video_duration_unmeasurable: x', 'provider_not_ready: x',
+      ];
+      for (const e of samples) {
+        const [q] = await ds.query(`select ($1 ~* $2 and $1 !~* $3) as ok`, [e, AH.AUTO_HEAL_SQL_ALLOW_REGEX, AH.AUTO_HEAL_SQL_DENY_REGEX]);
+        const js = !AH.isAutoHealDenied(e) && !!AH.matchAutoHealRule(e);
+        eq(q.ok, js, e);
+      }
     });
 
     await check('DB #1/#16 failItem(grantAttempt) en el último intento → retrying (attempt_count intacto, max_attempts + 1); sin grant → failed', async () => {

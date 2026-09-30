@@ -13,8 +13,13 @@
 // - allow-list explícita (nada fuera de ella se reabre);
 // - deny-list que gana siempre: resultados pagados ambiguos / reconciliación,
 //   presupuesto, cuota, configuración, permisos → nunca se reabren solos;
-// - tope de rondas automáticas por item (autoHeal.rounds en output_summary);
-// - espera creciente entre rondas, medida desde el fallo;
+// - tope de rondas automáticas por item (autoHeal.rounds en output_summary):
+//   3 para items de worker (re-poll gratis / sin gasto en el aire), 1 para items
+//   del navegador (cada ronda repite llamadas LLM pagadas);
+// - espera creciente entre rondas, medida desde el fallo: 2 min, 10 min, 30 min;
+// - solo fallos RECIENTES (ventana DYNAMIC_AUTO_HEAL_MAX_AGE_HOURS, 24 h) de la
+//   ejecución VIGENTE del curso (sin run más nuevo ni Manifest más nuevo): nunca
+//   se revive un run viejo o abandonado; los más nuevos primero;
 // - cada ronda concede AUTO_HEAL_ATTEMPTS_PER_ROUND intentos (retryItem da 3);
 // - cada reapertura queda en output_summary.previousErrors (auto: true) + log.
 // Ningún código de la allow-list implica un envío pagado ambiguo: o re-pollea
@@ -30,10 +35,23 @@ import { isDynamicCourseStructureEnabled } from '../features/dynamic-features';
 export const AUTO_HEAL_ENABLED_ENV = 'DYNAMIC_AUTO_HEAL_ENABLED';
 export const AUTO_HEAL_INTERVAL_ENV = 'DYNAMIC_AUTO_HEAL_INTERVAL_MS';
 export const DEFAULT_AUTO_HEAL_INTERVAL_MS = 60_000;
+export const AUTO_HEAL_MAX_AGE_ENV = 'DYNAMIC_AUTO_HEAL_MAX_AGE_HOURS';
+/** Ventana de recencia: un fallo más viejo que esto nunca se reabre solo (run abandonado). */
+export const DEFAULT_AUTO_HEAL_MAX_AGE_HOURS = 24;
+
+/**
+ * Tipos que ejecutan los workers del servidor (espejo de WORKER_ONLY_TYPES del
+ * scheduler; el check lo compara). El resto los ejecuta el navegador con LLM.
+ */
+export const AUTO_HEAL_WORKER_ITEM_TYPES: readonly string[] = Object.freeze(['video', 'presentation', 'audio_welcome', 'audiobook_chapter']);
 
 export interface AutoHealPolicy {
-  /** Rondas automáticas máximas por item (después: humano). */
+  /** Rondas automáticas máximas por item de WORKER (después: humano). */
   maxRounds: number;
+  /** R16 fix M6: rondas máximas para items del NAVEGADOR (cada ronda repite llamadas LLM pagadas). */
+  browserMaxRounds: number;
+  /** R16 fix I1: solo fallos de las últimas N horas. */
+  maxAgeHours: number;
   /** Espera mínima desde el fallo antes de la ronda n+1 (índice n; el último valor se repite). */
   backoffSeconds: readonly number[];
   /** Intentos que concede cada ronda (max_attempts = attempt_count + N). */
@@ -42,6 +60,8 @@ export interface AutoHealPolicy {
 
 export const DEFAULT_AUTO_HEAL_POLICY: AutoHealPolicy = Object.freeze({
   maxRounds: 3,
+  browserMaxRounds: 1,
+  maxAgeHours: DEFAULT_AUTO_HEAL_MAX_AGE_HOURS,
   backoffSeconds: Object.freeze([120, 600, 1800]),
   attemptsPerRound: 2,
 });
@@ -49,6 +69,8 @@ export const DEFAULT_AUTO_HEAL_POLICY: AutoHealPolicy = Object.freeze({
 /** Fila mínima que evalúa la política (generation_item_runs). */
 export interface AutoHealRow {
   status: string;
+  /** Tipo del item (tope de rondas por tipo). Ausente → tope de worker. */
+  type?: string | null;
   error: string | null;
   output_summary: Record<string, any> | null;
   finished_at?: Date | string | null;
@@ -126,7 +148,27 @@ export const AUTO_HEAL_DENY_PATTERNS: readonly RegExp[] = Object.freeze([
   /blocked_auth|youtube_preflight/i,
 ]);
 
-export type AutoHealSkipReason = 'not_failed' | 'no_error' | 'denied' | 'not_allow_listed' | 'missing_precondition' | 'cap_reached' | 'backoff';
+export type AutoHealSkipReason =
+  | 'not_failed' | 'no_error' | 'denied' | 'not_allow_listed' | 'missing_precondition' | 'cap_reached' | 'backoff' | 'too_old';
+
+/** R16 fix M6: tope de rondas según quién ejecuta el item. */
+export function autoHealMaxRoundsFor(type: string | null | undefined, policy: AutoHealPolicy = DEFAULT_AUTO_HEAL_POLICY): number {
+  if (type && !AUTO_HEAL_WORKER_ITEM_TYPES.includes(type)) return policy.browserMaxRounds;
+  return policy.maxRounds;
+}
+
+/**
+ * R16 fix I2: filtro GRUESO en SQL (POSIX, sin \b) equivalente a la allow-list,
+ * para que el LIMIT del barrido cuente solo candidatos reales. La decisión fina
+ * sigue siendo autoHealDecision (JS), que se re-evalúa además bajo lock.
+ */
+export const AUTO_HEAL_SQL_ALLOW_REGEX =
+  '^(lease_expired|worker_draining|unexpected_error|[a-z0-9_]+_download_failed|gamma_timeout|gamma_poll_failed|gamma_export_missing|' +
+  'video_timeout|video_duration_unmeasured|youtube_upload_failed|no se pudo subir el artifact|(❌[[:space:]]*)?fall[oó] despu[eé]s de [0-9]+ intentos)';
+/** Mismo contenido que AUTO_HEAL_DENY_PATTERNS, como una sola regex POSIX case-insensitive. */
+export const AUTO_HEAL_SQL_DENY_REGEX =
+  `${PROVIDER_RECONCILIATION_REQUIRED}|${BUDGET_EXCEEDED}|${BUDGET_APPROVAL_REQUIRED}|ambiguous|ambigu[oa]|quota|cuota|presupuesto|` +
+  'not_allowed|not_configured|not_ready|provider_mode_unset|mock_not_allowed|blocked_auth|youtube_preflight';
 
 export type AutoHealDecision =
   | { heal: true; rule: AutoHealRule; round: number }
@@ -162,8 +204,9 @@ export function autoHealDecision(row: AutoHealRow, now: Date, policy: AutoHealPo
   const os = (row.output_summary ?? {}) as Record<string, any>;
   if (rule.requires && !rule.requires(os)) return { heal: false, reason: 'missing_precondition', rule };
   const rounds = autoHealRoundsOf(os);
-  if (rounds >= policy.maxRounds) return { heal: false, reason: 'cap_reached', rule };
+  if (rounds >= autoHealMaxRoundsFor(row.type, policy)) return { heal: false, reason: 'cap_reached', rule };
   const failedAt = toDate(row.finished_at) ?? toDate(row.updated_at);
+  if (failedAt && now.getTime() - failedAt.getTime() > policy.maxAgeHours * 3_600_000) return { heal: false, reason: 'too_old', rule };
   const waits = policy.backoffSeconds.length ? policy.backoffSeconds : [0];
   const waitSec = waits[Math.min(rounds, waits.length - 1)];
   if (failedAt) {
@@ -178,12 +221,21 @@ export function autoHealEnabled(env: Record<string, string | undefined> = proces
   return String(env[AUTO_HEAL_ENABLED_ENV] ?? '').trim().toLowerCase() !== 'false';
 }
 
+/** Política efectiva (ventana de recencia configurable por env). */
+export function autoHealPolicyFromEnv(env: Record<string, string | undefined> = process.env): AutoHealPolicy {
+  const raw = Number(env[AUTO_HEAL_MAX_AGE_ENV]);
+  const maxAgeHours = Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_AUTO_HEAL_MAX_AGE_HOURS;
+  return { ...DEFAULT_AUTO_HEAL_POLICY, maxAgeHours };
+}
+
 export function autoHealIntervalMs(env: Record<string, string | undefined> = process.env): number {
   const raw = Number(env[AUTO_HEAL_INTERVAL_ENV]);
   return Number.isFinite(raw) && raw >= 5_000 ? Math.floor(raw) : DEFAULT_AUTO_HEAL_INTERVAL_MS;
 }
 
 export interface AutoHealSweepResult {
+  /** Filas que pasaron el filtro SQL (recencia, run vigente, allow/deny grueso, rondas, espera). */
+  candidates?: number;
   reopened: Array<{ runId: string; itemKey: string; code: string; round: number }>;
   skipped: Array<{ runId: string; itemKey: string; reason: string }>;
 }
