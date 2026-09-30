@@ -67,6 +67,10 @@ const themes = F.THEME_COMBOS.map((combo) => ({ combo, theme: te.resolveTheme(co
 const components = F.loadComponents();
 const LEVELS = [undefined, 'enhanced'];
 
+// Fix round 1 (I1): mismos vectores en el harness del frontend (test-45-v3-items.mjs).
+const VC_BRANCH_POSITIVES = ['Sí', 'No', 'No.', 'Sí, está consciente', 'No, llama al 131', 'No; espera la señal', 'Sí (consciente)', 'Si responde → consciente', 'Si respira: posición lateral', '2 Sí → Consciente', '3. No → Inconsciente', '«Sí» → x', '"No": detén la máquina', 'Si no hay pulso, inicia RCP'];
+const VC_BRANCH_NEGATIVES = ['Sistema de bloqueo', 'Silencio operativo', 'Nota: revisa el tablero', 'No-conformidades del lote', 'Normas vigentes', 'Si el equipo vibra, detén la línea', 'Señales de alerta', 'No olvides el casco', 'No toques el tablero energizado', 'No uses agua en un fuego eléctrico', 'Nunca trabajes solo', 'Si bien es simple, requiere práctica', 'Sin tensión: verifica'];
+
 // ─── Validador ──────────────────────────────────────────────────────────────
 
 check('schema: VC_SCHEMA_VERSION === 1 y 18 tipos de componente (Edu Phase A: worked_example, diagram)', () => {
@@ -99,6 +103,16 @@ check('espejo del frontend (44): DYN_VC_COMPONENT_SPECS, nodos por diagrama y ti
   assert(JSON.stringify(Array.from(ctx.__ill)) === JSON.stringify(Array.from(vc.VC_ILLUSTRATIVE_TYPES)), 'VC_ILLUSTRATIVE_TYPES');
   assert(JSON.stringify(canon(ctx.__limits)) === JSON.stringify(canon(vc.VC_MOVEMENT_LIMITS)), `VC_MOVEMENT_LIMITS: FE ${JSON.stringify(ctx.__limits)} ≠ BE ${JSON.stringify(vc.VC_MOVEMENT_LIMITS)}`);
   if (vc.VC_PEDAGOGY) assert(JSON.stringify(canon(ctx.__ped)) === JSON.stringify(canon(vc.VC_PEDAGOGY)), `VC_PEDAGOGY: FE ${JSON.stringify(ctx.__ped)} ≠ BE ${JSON.stringify(vc.VC_PEDAGOGY)}`);
+  // Fix round 1: lints anti-simulación del ejecutor (45) idénticos al backend sobre los vectores compartidos.
+  const f45 = path.join(FE, 'src/js/45-dynamic-generation-executor.js');
+  vm.runInContext(fs.readFileSync(f45, 'utf8') + '\n;this.__br = dynIsBranchHead; this.__q = dynIsQuestionHead; this.__ar = dynArrowChainLength; this.__sim = dynValidateSimulatedDiagramsV3;', ctx);
+  for (const t of [...VC_BRANCH_POSITIVES, ...VC_BRANCH_NEGATIVES, '¿Responde?', '1. ¿Respira?', 'Calor → dilatación\nFrío → contracción', 'a → b → c', 'x -> y ⇒ z']) {
+    assert(ctx.__br(t) === vc.isBranchHead(t) && ctx.__q(t) === vc.isQuestionHead(t) && ctx.__ar(t) === vc.arrowChainLength(t), `lint FE ≠ BE en "${t}"`);
+  }
+  const simDoc = F.buildExperience();
+  simDoc.movements.deepening[1] = { type: 'diagram', kind: 'flow', title: 'V', nodes: ['¿Responde?', 'Sí', 'Consciente', 'No, llama', 'Inconsciente'].map((label) => ({ label })) };
+  simDoc.bridge_to_next = 'Observa → decide → actúa.';
+  assert(JSON.stringify(JSON.parse(JSON.stringify(ctx.__sim(simDoc)))) === JSON.stringify(vc.validateSimulatedDiagrams(simDoc)), 'validateSimulatedDiagrams FE ≠ BE');
   // EV6: árbol de decisión (límites + spec de primer nivel)
   assert(JSON.stringify(canon(ctx.__dec)) === JSON.stringify(canon(vc.VC_DECISION_LIMITS)), `VC_DECISION_LIMITS: FE ${JSON.stringify(ctx.__dec)} ≠ BE ${JSON.stringify(vc.VC_DECISION_LIMITS)}`);
   assert(JSON.stringify(norm(ctx.__decSpec)) === JSON.stringify(norm(vc.VC_DECISION_DIAGRAM_SPEC)), `VC_DECISION_DIAGRAM_SPEC: FE ${JSON.stringify(ctx.__decSpec)} ≠ BE`);
@@ -306,7 +320,20 @@ check('EV6: validateSimulatedDiagrams — DIAGRAM_BRANCHING_IN_SEQUENCE y TEXT_S
       assert(codesAt(doc(c)).includes(`DIAGRAM_BRANCHING_IN_SEQUENCE $.movements.deepening[1].${list}[1].${field}`), `${type} "${head}": ${JSON.stringify(codesAt(doc(c)))}`);
     }
   }
-  for (const head of ['Sistema de bloqueo', 'Silencio operativo', 'Nota: revisa el tablero', 'No-conformidades del lote', 'Normas vigentes', 'Si el equipo vibra, detén la línea', 'Señales de alerta']) {
+  // Fix round 1 (I1): variantes que el modelo produce después de «no escribas Sí → …»
+  for (const head of VC_BRANCH_POSITIVES) {
+    assert(vc.isBranchHead(head), `isBranchHead("${head}")`);
+    const c = { type: 'diagram', kind: 'flow', title: 'Valoración', nodes: [{ label: 'Observar' }, { label: head }, { label: 'Actuar' }] };
+    assert(codesAt(doc(c)).includes('DIAGRAM_BRANCHING_IN_SEQUENCE $.movements.deepening[1].nodes[1].label'), `flujo con "${head}": ${JSON.stringify(codesAt(doc(c)))}`);
+  }
+  // señal estructural: «¿Responde?» seguida de ramas → también se marca la pregunta
+  const bare = { type: 'diagram', kind: 'flow', title: 'Valoración', nodes: ['¿Responde?', 'Sí', 'Consciente', 'No', 'Inconsciente'].map((label) => ({ label })) };
+  const bc = codesAt(doc(bare));
+  for (const j of [0, 1, 3]) assert(bc.includes(`DIAGRAM_BRANCHING_IN_SEQUENCE $.movements.deepening[1].nodes[${j}].label`), `flujo «Sí»/«No» sueltos, nodo ${j}: ${JSON.stringify(bc)}`);
+  assert(bc.length === 3, 'solo pregunta + ramas: ' + JSON.stringify(bc));
+  const qOnly = { type: 'process_steps', steps: [{ heading: '¿Qué riesgo ves?', body: 'a' }, { heading: 'Evalúa el riesgo', body: 'b' }, { heading: 'Controla', body: 'c' }] };
+  assert(codesAt(doc(qOnly)).length === 0, 'una pregunta sin ramas no es un árbol');
+  for (const head of VC_BRANCH_NEGATIVES) {
     const c = { type: 'process_steps', steps: [{ heading: head, body: 'Detalle.' }, { heading: 'Otro paso', body: 'Detalle.' }, { heading: 'Cierre', body: 'Detalle.' }] };
     assert(codesAt(doc(c)).length === 0, `falso positivo "${head}": ${JSON.stringify(codesAt(doc(c)))}`);
     assert(!vc.isBranchHead(head), `isBranchHead("${head}")`);
@@ -320,10 +347,10 @@ check('EV6: validateSimulatedDiagrams — DIAGRAM_BRANCHING_IN_SEQUENCE y TEXT_S
   }
   const nested = doc(); nested.movements.deepening[0].cards[0].definition = 'Entrada → proceso → salida.';
   assert(codesAt(nested).includes('TEXT_SIMULATED_DIAGRAM $.movements.deepening[0].cards[0].definition'), 'campo anidado');
-  for (const t of ['El calor sube → el aceite pierde viscosidad.', 'Una flecha → aquí.\n\nOtra flecha → en otro párrafo.', 'Temperatura a 40 °C y presión estable.']) {
+  for (const t of ['El calor sube → el aceite pierde viscosidad.', 'Una flecha → aquí.\n\nOtra flecha → en otro párrafo.', 'Calor → dilatación\nFrío → contracción', 'Temperatura a 40 °C y presión estable.']) {
     assert(codesAt(doc(null, t)).length === 0, `falso positivo flechas "${t}"`);
   }
-  assert(vc.arrowChainLength('a → b → c') === 2 && vc.arrowChainLength('a → b\n\nc → d') === 1, 'arrowChainLength');
+  assert(vc.arrowChainLength('a → b → c') === 2 && vc.arrowChainLength('a → b\n\nc → d') === 1 && vc.arrowChainLength('a → b\nc → d') === 1, 'arrowChainLength por línea (M1)');
   // el árbol de decisión real no dispara nada
   assert(codesAt(doc(F.clone(DEPTH3))).length === 0, 'decision limpia');
   // el empaque (validateExperience) no aplica estos lints: los cursos ya generados siguen válidos
@@ -357,7 +384,15 @@ check('EV6: render de decision — CLEAN_SAFE sin <style>/flex/grid/height, orde
   const h3 = vc.renderComponent(DEPTH3, themes[0].theme, { uid: 's' });
   assert((h3.match(/class="cvc-dt-node cvc-dt-d/g) || []).length === 3 && h3.includes('cvc-dt-d3') && (h3.match(/class="cvc-dt-branches"/g) || []).length === 3, 'profundidad 3: 3 nodos, los 3 niveles apilados');
   assert(!h3.includes('<table'), 'el par de nivel 3 se apila (no aprieta una tabla en un teléfono)');
-  assert(h3.includes('>Consciente<') && h3.split('&shy;').join('').includes('>Inconsciente<') && h3.includes('↙') && h3.includes('↘'), 'rótulos propios y conectores');
+  assert(h3.includes('>Consciente<') && h3.split('&shy;').join('').includes('>Inconsciente<'), 'rótulos propios');
+  // Fix round 1 (M2): texto plano «Sí: …» / «No: …»; el conector ↙ / ↘ es decorativo (solo ::before en ENHANCED)
+  assert(!h3.includes('↙') && !h3.includes('↘'), 'sin glifos en el texto');
+  const plain1 = vc.extractText(vc.renderComponent(DEPTH1, themes[0].theme, { uid: 'o' })).replace(/\s+/g, ' ');
+  assert(plain1.includes('¿Responde cuando le hablas? Sí: Mantenla acompañada') && plain1.includes('No: Llama a emergencias'), 'texto plano: ' + plain1);
+  const plain3 = vc.extractText(h3).replace(/\s+/g, ' ');
+  assert(plain3.includes('Consciente: Pregúntale') && plain3.includes('Sí: Posición lateral'), 'rótulo propio con «:»: ' + plain3);
+  const enh1 = vc.renderMovement([DEPTH1], themes[0].theme, { uid: 'g', level: 'enhanced' });
+  assert(enh1.includes('.cvc-dt-sep{display:none}') && enh1.includes('content:"\\2199" / ""') && enh1.includes('content:"\\2198" / ""'), 'conectores decorativos en ENHANCED');
   assert(vc.renderComponent(DEPTH1, themes[0].theme, { uid: 's' }) === h1, 'determinista');
   // sin decision en el label: <style> byte-idéntico al de siempre (sin reglas cvc-dt)
   const flow = components.find((x) => x.kind === 'flow');

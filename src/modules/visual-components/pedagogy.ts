@@ -90,29 +90,60 @@ const ARROW_RE = /→|->|⇒/g;
 export const VC_ARROW_CHAIN_MIN = 2;
 
 /**
- * Encabezado de paso que codifica una rama (texto normalizado: minúsculas, sin acentos):
- * «Sí → Consciente», «No: llama al 123», «Si - …», «Si no responde…», «En caso contrario…».
- * «Sistema…», «Nota: …», «No-conformidad» no coinciden.
+ * Encabezado de paso que codifica una rama (texto normalizado: minúsculas, sin acentos, sin comillas
+ * ni numeración inicial «2 », «3. », «4) »). Coincide:
+ *  - «Sí» / «No» solos (o con punto), o seguidos de flecha, «,», «;», «(» o «:» / «-» / «–» / «—» + espacio;
+ *  - «Si no…», «En caso contrario…», «De lo contrario…»;
+ *  - una condición corta que termina en flecha o dos puntos: «Si responde → …», «Si respira: …».
+ * No coinciden: «Sistema…», «Nota: …», «No-conformidad», «No olvides…» (imperativo normal),
+ * «Si el equipo vibra, detén la línea» (paso con condición, sin flecha ni dos puntos).
  */
-const BRANCH_HEAD_RE = /^(?:(?:si|no)\s*(?:→|->|⇒|[:\-–—](?=\s|$))|si\s+no(?![\p{L}\p{N}_])|en\s+caso\s+contrario(?![\p{L}\p{N}_])|de\s+lo\s+contrario(?![\p{L}\p{N}_]))/u;
+const WORD_END = '(?![\\p{L}\\p{N}_])';
+const BRANCH_HEAD_RE = new RegExp(
+  '^(?:' +
+    [
+      '(?:si|no)[.!]?$',
+      '(?:si|no)\\s*(?:→|->|⇒|[,;(]|[:\\-–—](?=\\s|$))',
+      `si\\s+no${WORD_END}`,
+      `en\\s+caso\\s+contrario${WORD_END}`,
+      `de\\s+lo\\s+contrario${WORD_END}`,
+      'si\\s+[^\\s,;:→]+(?:\\s+[^\\s,;:→]+){0,3}\\s*(?:→|->|⇒|:)',
+    ].join('|') +
+    ')',
+  'u',
+);
+/** Numeración y comillas iniciales («2 Sí → …», «"Sí" → …») no esconden la rama. */
+const QUOTES_RE = /["'«»“”‘’„]/g;
+const LEAD_NUM_RE = /^\s*\d{1,2}\s*[.)\-–:]?\s+/;
+/** Encabezado que es una pregunta («¿Responde?»): en una secuencia, anuncia ramas. */
+const QUESTION_HEAD_RE = /^¿.*\?$/su;
 
 function foldLint(text: string): string {
   return lintView(String(text ?? '')).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
 }
 
-/** Nº máximo de flechas en un mismo párrafo del texto. */
+function headView(text: string): string {
+  return foldLint(text).replace(QUOTES_RE, '').replace(LEAD_NUM_RE, '').trim();
+}
+
+/** Nº máximo de flechas en una misma LÍNEA del texto («A → B\nC → D» son dos pares, no una cadena). */
 export function arrowChainLength(text: string): number {
   let best = 0;
-  for (const para of String(text ?? '').split(/\r?\n[ \t]*\r?\n/)) {
-    const n = (para.match(ARROW_RE) || []).length;
+  for (const line of String(text ?? '').split(/\r?\n/)) {
+    const n = (line.match(ARROW_RE) || []).length;
     if (n > best) best = n;
   }
   return best;
 }
 
-/** ¿El rótulo/encabezado de un paso codifica una rama (Sí/No/Si no/En caso contrario)? */
+/** ¿El rótulo/encabezado de un paso codifica una rama (Sí/No/Si no/En caso contrario/«Si X →»)? */
 export function isBranchHead(text: string): boolean {
-  return BRANCH_HEAD_RE.test(foldLint(text));
+  return BRANCH_HEAD_RE.test(headView(text));
+}
+
+/** ¿El rótulo es una pregunta («¿…?»)? */
+export function isQuestionHead(text: string): boolean {
+  return QUESTION_HEAD_RE.test(headView(text));
 }
 
 /** Rótulos de ítems de secuencia por tipo: [lista, campo]. */
@@ -148,13 +179,24 @@ export function validateSimulatedDiagrams(doc: Pick<ChapterExperience, 'movement
       const seq = sequenceHeads(c);
       const items = seq ? c[seq.list] : undefined;
       if (seq && Array.isArray(items)) {
-        items.forEach((it, j) => {
-          const head = it && typeof it === 'object' ? (it as Record<string, unknown>)[seq.field] : undefined;
-          if (typeof head === 'string' && isBranchHead(head)) {
+        const heads = items.map((it) => {
+          const h = it && typeof it === 'object' ? (it as Record<string, unknown>)[seq.field] : undefined;
+          return typeof h === 'string' ? h : '';
+        });
+        const branchAt = heads.map((h) => !!h && isBranchHead(h));
+        heads.forEach((h, j) => {
+          if (branchAt[j]) {
             errors.push({
               path: `${cpath}.${seq.list}[${j}].${seq.field}`,
               code: 'DIAGRAM_BRANCHING_IN_SEQUENCE',
               message: 'este paso codifica una rama («Sí → …», «No: …», «Si no…»): una secuencia no se ramifica; si hay condiciones usa un diagram con kind "decision"',
+            });
+          } else if (h && isQuestionHead(h) && branchAt.some((x, k) => x && k > j)) {
+            // Señal estructural: una pregunta seguida de pasos-rama es un árbol aplanado (auditoría #413).
+            errors.push({
+              path: `${cpath}.${seq.list}[${j}].${seq.field}`,
+              code: 'DIAGRAM_BRANCHING_IN_SEQUENCE',
+              message: 'una pregunta seguida de pasos «Sí/No» es un árbol de decisión aplanado: usa un diagram con kind "decision" (la pregunta es "question" y cada respuesta, una rama)',
             });
           }
         });

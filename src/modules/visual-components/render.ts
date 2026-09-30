@@ -1082,7 +1082,7 @@ function cycleRing(r: R, n: number, s: Surf): string {
 // ─── EV6 — árbol de decisión ────────────────────────────────────────────────
 //
 // CLEAN_SAFE (sin flex/grid ni <style>): la pregunta es una caja DELINEADA; cada rama abre con su
-// píldora (↙ Sí / ↘ No) y termina en una acción (caja TINTADA) o en otra pregunta. Un par de
+// píldora («Sí:» / «No:»; ENHANCED le suma el conector ↙ / ↘) y termina en una acción (caja TINTADA) o en otra pregunta. Un par de
 // acciones finales en los dos primeros niveles va lado a lado en una <table> de 2 columnas (lo único
 // que da columnas bajo forceclean y cabe a 390 px); una rama que abre otra pregunta se apila con un
 // filete de 1 px a la izquierda (nunca se aprieta un subárbol en media columna de teléfono).
@@ -1090,33 +1090,33 @@ function cycleRing(r: R, n: number, s: Surf): string {
 // Orden de lectura (y texto sin estilos): pregunta → «Sí» → su rama → «No» → su rama.
 
 const DECISION_DEFAULT_LABEL = { yes: 'Sí', no: 'No' } as const;
-const DECISION_GLYPH = { yes: '\u2199', no: '\u2198' } as const;
 /** Pares de acciones finales lado a lado solo hasta este nivel (más adentro se apilan). */
 const DECISION_TABLE_MAX_DEPTH = 2;
 /** Tope de recursión del renderer (el validador limita a 3 niveles; esto solo evita un árbol hostil). */
 const DECISION_RENDER_MAX_DEPTH = 8;
 
 /**
- * Píldora de la rama (↙ Sí / ↘ No). `bar`: en un par lado a lado la columna es angosta (≈150 px a
- * 390): el rótulo va en una barra de bloque delineada que envuelve limpio, no en un <span> con borde
- * que se partiría en dos líneas.
+ * Píldora de la rama («Sí:» / «No:»). El texto plano (lectores de pantalla, Moodle sin estilos) dice
+ * «Sí: …» / «No: …»: los dos puntos van FUERA del <span class="nolink"> (rótulo del renderer) y el
+ * conector ↙ / ↘ es decorativo: lo dibuja SOLO el <style> de ENHANCED (::before, texto alternativo
+ * vacío), que además oculta los dos puntos. En CLEAN_SAFE el conector es el filete o la barra.
+ * `bar`: en un par lado a lado la columna es angosta (≈150 px a 390): el rótulo va en una barra de
+ * bloque delineada que envuelve limpio, no en un <span> con borde que se partiría en dos líneas.
  */
 function decisionPill(r: R, side: 'yes' | 'no', label: string | undefined, s: Surf, bar = false): string {
   const acc = readable(s.bg, [r.t.color.accentStrong, r.t.color.accent], s.fg);
-  const text = label !== undefined ? inlineHtml(label, HYPHEN_TABLE) : labelHtml(DECISION_DEFAULT_LABEL[side]);
-  const arrow = `<span class="cvc-dt-arrow"${ea(r, { 'aria-hidden': 'true' })}${st(r, [['color', acc], ['font-weight', '700']])}>${labelHtml(DECISION_GLYPH[side])}</span> `;
+  const text = (label !== undefined ? inlineHtml(label, HYPHEN_TABLE) : labelHtml(DECISION_DEFAULT_LABEL[side])) + '<span class="cvc-dt-sep">:</span>';
   if (bar) {
     return (
       `<p class="cvc-dt-pill cvc-dt-bar"${st(
         r,
         [['background-color', s.bg], ['color', acc], ['border', `2px solid ${acc}`], ['margin', `0 0 ${D(r, 8)}px 0`], ['padding', '2px 10px'], ['font-weight', '700'], ['line-height', '1.5'], ['text-align', 'center']],
         [['border-radius', '999px']],
-      )}>${arrow}<span class="cvc-dt-lbl">${text}</span></p>`
+      )}><span class="cvc-dt-lbl">${text}</span></p>`
     );
   }
   return (
     `<p class="cvc-dt-pill"${st(r, [['margin', `0 0 ${D(r, 8)}px 0`], ['padding', 0], ['color', s.fg], ['line-height', '1.6']])}>` +
-    arrow +
     `<span class="cvc-dt-lbl"${st(
       r,
       [['background-color', s.bg], ['color', acc], ['border', `2px solid ${acc}`], ['padding', '2px 12px'], ['font-weight', '700']],
