@@ -58,7 +58,7 @@ const TRIGGER = `${names.join(' y ')} (y) (i) :-) 8-) https://example.com/recurs
 
 function withTriggers(c) {
   const walk = (v, key) => {
-    if (key === 'type' || key === 'variant') return v;
+    if (key === 'type' || key === 'variant' || key === 'kind') return v;
     if (typeof v === 'string') return `${v} ${TRIGGER}`;
     if (Array.isArray(v)) return v.map((x) => walk(x, null));
     if (v && typeof v === 'object') {
