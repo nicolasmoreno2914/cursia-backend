@@ -562,7 +562,15 @@ async function dbChecks() {
       eq(m.module.chapters[0].activityEnabled, true, 'primer capítulo del módulo nuevo');
     });
     await check('DB estructura (Task 4, GET en una sola sentencia): capítulos por position, otro owner → 404, curso inexistente → 404', async () => {
+      // Orden real por position (no por orden de inserción): se invierte y se restaura.
+      const s0 = await structure.getStructure(cid, OWNER);
+      const ids = s0.modules[0].chapters.map((c) => c.id);
+      await structure.reorderChapters(cid, pre.moduleId, OWNER, { order: ids.slice().reverse(), expectedCounter: s0.structureVersionCounter });
+      const sRev = await structure.getStructure(cid, OWNER);
+      eq(sRev.modules[0].chapters.map((c) => c.id), ids.slice().reverse(), 'GET sigue position, no el orden de inserción');
+      await structure.reorderChapters(cid, pre.moduleId, OWNER, { order: ids, expectedCounter: sRev.structureVersionCounter });
       const s = await structure.getStructure(cid, OWNER);
+      eq(s.modules[0].chapters.map((c) => c.id), ids, 'orden restaurado');
       const pos = s.modules[0].chapters.map((c) => c.position);
       eq(pos, pos.slice().sort((a, b) => a - b), 'capítulos ordenados por position');
       eq(s.modules.map((m) => m.position), s.modules.map((m) => m.position).slice().sort((a, b) => a - b), 'módulos ordenados');
@@ -612,6 +620,8 @@ async function dbChecks() {
       eq([again.created, again.blueprint.blueprintNumber], [false, v2Number], 'idempotente');
       const st = await structure.getStructure(cid, OWNER);
       eq([st.currentBlueprint.schemaVersion, st.liveMatchesCurrentBlueprint], [2, true], 'estructura viva = Blueprint v2');
+      const cur = await blueprints.getCurrent(cid, OWNER);
+      eq([st.currentBlueprint.number, st.currentBlueprint.lockedAt], [v2Number, cur.lockedAt], 'Blueprint vigente del GET = getCurrent (número y lockedAt ISO)');
     });
 
     await check('DB perfiles: GET sin versiones → default con isDefault:true (assessment según finalExam del curso)', async () => {
