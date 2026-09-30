@@ -153,3 +153,25 @@ export function mergeDescription(existing: string | null | undefined, split: str
   if (!sp || e.includes(sp)) return e;
   return `${e} ${sp}`;
 }
+
+/**
+ * EV5 — título para MOSTRAR en el paquete (Moodle, H5P, labels): nunca > STRUCTURE_TITLE_MAX.
+ * Cursos creados antes de Title Normalization (o importados) pueden traer «Título + descripción»
+ * cortado a 255 a mitad de palabra; al empaquetar se usa el título normalizado. Sin corte natural,
+ * se corta en el último límite de palabra ≤ max sin dejar una palabra funcional ni puntuación al
+ * final (nunca «…» ni media palabra). Títulos ≤ max: solo espacios colapsados (idéntico al actual).
+ */
+export function displayStructureTitle(raw: string, max: number = STRUCTURE_TITLE_MAX): string {
+  const n = normalizeStructureTitle(raw, max);
+  if (n && n.title.length <= max) return n.title;
+  const words = collapse(String(raw ?? '')).split(' ');
+  let out = '';
+  for (const w of words) {
+    const next = out ? `${out} ${w}` : w;
+    if (next.length > max) break;
+    out = next;
+  }
+  let parts = cleanHead(out || collapse(String(raw ?? '')).slice(0, max)).split(' ');
+  while (parts.length > 2 && FUNCTION_WORDS.has(parts[parts.length - 1].toLowerCase())) parts = parts.slice(0, -1);
+  return cleanHead(parts.join(' '));
+}

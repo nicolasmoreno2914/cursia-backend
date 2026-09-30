@@ -38,8 +38,17 @@ export const GRADE_METHOD_ES: Readonly<Record<GradeMethod, string>> = Object.fre
   last: 'la calificación del último intento',
 });
 
-export function activityInstruction(passingGrade: number, attempts: number): string {
-  return `La actividad práctica que sigue es calificada. ${passingText(passingGrade)} ${attemptsText(attempts)}`;
+/** EV5 — qué hará el estudiante, según el tipo de actividad (antes: la misma frase en todas). */
+const ACTIVITY_TASK_ES: Readonly<Record<string, string>> = Object.freeze({
+  questionset: 'Responderás preguntas sobre situaciones del capítulo y verás la retroalimentación de cada una.',
+  dragtext: 'Arrastrarás cada término al lugar que le corresponde dentro de un texto.',
+  blanks: 'Completarás un texto escribiendo la palabra que falta en cada espacio.',
+  scorm: 'Resolverás un reto interactivo por etapas con lo que aprendiste en el capítulo.',
+});
+
+export function activityInstruction(passingGrade: number, attempts: number, activityType?: string | null): string {
+  const task = activityType ? ACTIVITY_TASK_ES[activityType] : undefined;
+  return `${task ? `${task} ` : ''}La actividad práctica que sigue es calificada. ${passingText(passingGrade)} ${attemptsText(attempts)}`;
 }
 
 export function continueWith(next: { number: number; title: string }): string {

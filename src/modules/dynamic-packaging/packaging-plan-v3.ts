@@ -16,6 +16,7 @@
  * un item desconocido o faltante es un Manifest roto → PackagingPlanV3Error.
  */
 import { createHash } from 'crypto';
+import { displayStructureTitle } from '../course-structure/structure-titles';
 import type { GenerationManifestV1, ManifestItem } from '../generation-manifests/generation-manifest-builder';
 import { BlueprintSnapshotV2, snapshotSha256V2 } from '../course-blueprints/blueprint-snapshot';
 
@@ -126,7 +127,7 @@ export function buildPackagingPlanV3(
         moduleId: mm.moduleId,
         chapterNumber: mc.chapterNumber,
         moduleNumber: mm.moduleNumber,
-        title: bc.title,
+        title: displayStructureTitle(bc.title),
         videoEnabled: mc.videoEnabled === true,
         activityEnabled,
         activityVariant: variant,
@@ -145,7 +146,7 @@ export function buildPackagingPlanV3(
       moduleId: mm.moduleId,
       moduleNumber: mm.moduleNumber,
       sectionNum: 1 + mm.moduleNumber,
-      title: bm.title,
+      title: displayStructureTitle(bm.title),
       examEnabled: mm.examEnabled === true,
       keys: {
         moduleIntro: take(`module_intro:${mm.moduleId}`, 'module_intro'),

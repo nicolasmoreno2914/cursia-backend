@@ -47,15 +47,51 @@ export function escapeHtml(s: string): string {
     .replace(/'/g, '&#39;');
 }
 
+const VOWEL_RE = /[aeiouáéíóúüAEIOUÁÉÍÓÚÜ]/;
+const LETTER_RE = /\p{L}/u;
+/** Grupos consonánticos que no se separan (van juntos al inicio de la sílaba). */
+const ONSET_CLUSTERS = new Set(['bl', 'br', 'cl', 'cr', 'dr', 'fl', 'fr', 'gl', 'gr', 'kl', 'kr', 'pl', 'pr', 'tr', 'ch', 'll', 'rr', 'qu', 'gu']);
+
+/**
+ * EV5 — posiciones donde un guion suave cae entre sílabas del español (aproximación segura):
+ * V·CV (antes de una consonante entre vocales) y VC·CV (entre dos consonantes, salvo grupos
+ * inseparables: «ha·bla», «o·tro»). Nunca entre vocales ni fuera de letras.
+ */
+function syllableBreaks(cps: string[]): Set<number> {
+  const out = new Set<number>();
+  const isV = (c: string | undefined) => !!c && VOWEL_RE.test(c);
+  const isC = (c: string | undefined) => !!c && LETTER_RE.test(c) && !VOWEL_RE.test(c);
+  for (let i = 1; i < cps.length - 1; i++) {
+    const a = cps[i - 1];
+    const b = cps[i];
+    const c = cps[i + 1];
+    if (isV(a) && isC(b) && isV(c)) out.add(i); // ca·sa
+    if (isC(a) && isC(b) && isV(c) && isV(cps[i - 2]) && !ONSET_CLUSTERS.has((a + b).toLowerCase())) out.add(i); // can·to
+    if (isC(a) && isC(b) && isV(c) && isV(cps[i - 2]) && ONSET_CLUSTERS.has((a + b).toLowerCase())) out.add(i - 1); // o·tro
+  }
+  return out;
+}
+
 function hyphenateWord(word: string, h: HyphenOpts): string {
   const cps = Array.from(word);
   if (cps.length < h.minLen) return word;
+  const breaks = syllableBreaks(cps);
+  const cuts = new Set<number>();
+  // Un corte cerca de cada múltiplo de `every`: la frontera de sílaba más cercana (± 3);
+  // sin frontera cerca (siglas, URLs, códigos) el corte fijo de siempre, para no desbordar.
+  for (let target = h.every; cps.length - target >= 3; target += h.every) {
+    let best = -1;
+    for (let d = 0; d <= 3 && best < 0; d++) {
+      for (const cand of [target - d, target + d]) {
+        if (best < 0 && breaks.has(cand) && cand >= 2 && cps.length - cand >= 3 && ![...cuts].some((x) => Math.abs(x - cand) < 2)) best = cand;
+      }
+    }
+    cuts.add(best >= 0 ? best : target);
+  }
   let out = '';
   for (let i = 0; i < cps.length; i++) {
+    if (cuts.has(i)) out += SHY;
     out += cps[i];
-    const pos = i + 1;
-    // no cortar dejando menos de 3 caracteres al final
-    if (pos % h.every === 0 && cps.length - pos >= 3) out += SHY;
   }
   return out;
 }
@@ -66,9 +102,17 @@ function escapeRun(text: string, h: HyphenOpts): string {
   return escapeHtml(hy).split(SHY).join('&shy;');
 }
 
+/**
+ * EV5 — `*énfasis*` de un solo asterisco (markdown que el LLM a veces usa) no debe llegar literal:
+ * se quita el par de asteriscos y queda el texto. No toca `**…**` ni asteriscos sueltos («5 * 3»).
+ */
+function stripSingleStars(text: string): string {
+  return text.replace(/(^|[^*\p{L}\p{N}])\*(?![\s*])([^*\n]*?[^\s*])\*(?![*\p{L}\p{N}])/gu, '$1$2');
+}
+
 /** Sustituye los pares `**` por marcadores internos (emparejados en todo el campo). */
 function markEmphasis(text: string): string {
-  const parts = text.replace(INVISIBLE_CHARS_RE, '').split('**');
+  const parts = stripSingleStars(text.replace(INVISIBLE_CHARS_RE, '')).split('**');
   const unbalanced = parts.length % 2 === 0;
   let out = '';
   for (let i = 0; i < parts.length; i++) {

@@ -155,7 +155,7 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     const inner =
       eyebrow(h, 'Práctica calificada', s) +
       heading(h, 'h3', COPY.activityTitle, s) +
-      pHtml(h, labelHtml(activityInstruction(k.passingGrade, k.attempts)), s, { last: true }) +
+      pHtml(h, labelHtml(activityInstruction(k.passingGrade, k.attempts, ch.activityVariant === 'scorm' ? 'scorm' : ch.activityType)), s, { last: true }) +
       // Edu EV3: botón a la actividad (el builder resuelve el marcador al crearla).
       ctaButton(h, CTA_ACTIVITY, `Iniciar actividad del capítulo ${ch.number} →`, s);
     slots.push(label('activity_instruction', 'Práctica', root(h, uid('activity_instruction'), inner)));
@@ -180,9 +180,9 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     }
     const q = mod.examQuestionCount as number;
     const pg = assessment.kinds.exam.passingGrade;
-    nextStep = input.nextChapter
-      ? `${moduleExamTransition({ number: mod.number, examQuestionCount: q }, pg)} ${continueWith(input.nextChapter)}`
-      : `${COPY.lastChapterOfCourse} A continuación encontrarás la evaluación del módulo ${mod.number}: ${q} ${q === 1 ? 'pregunta' : 'preguntas'} y una nota mínima de ${pg} de 100.`;
+    // EV5: solo la evaluación. El paso siguiente (módulo o cierre) lo da el label module_next
+    // después del examen; antes esta línea anunciaba el examen Y «Continúa con el capítulo…».
+    nextStep = moduleExamTransition({ number: mod.number, examQuestionCount: q }, pg);
   } else {
     nextStep = input.nextChapter ? continueWith(input.nextChapter) : COPY.lastChapterOfCourse;
   }

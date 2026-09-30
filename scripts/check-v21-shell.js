@@ -313,8 +313,10 @@ async function pureChecks() {
         eq(has, last && mod.examEnabled, `cap ${chapterNumber}`);
         if (has) assert(t.includes(`${mod.examQuestionCount} preguntas`) && t.includes('70 de 100'), `datos del examen: ${t}`);
         const next = facts.chapters[chapterNumber];
-        if (next) assert(t.includes(`Continúa con el capítulo ${next.number}: ${next.title}.`), `puente al siguiente: ${t}`);
-        else assert(t.includes('terminas el recorrido de los contenidos'), 'último capítulo del curso');
+        // EV5: tras el anuncio del examen no hay «Continúa con el capítulo…» (lo dice el label module_next).
+        if (next && !has) assert(t.includes(`Continúa con el capítulo ${next.number}: ${next.title}.`), `puente al siguiente: ${t}`);
+        if (has) assert(!/Continúa con el capítulo|terminas el recorrido/.test(t), `mensajes contradictorios: ${t}`);
+        if (!next && !has) assert(t.includes('terminas el recorrido de los contenidos'), 'último capítulo del curso');
       }
     }
     // Entradas incoherentes → fallo fuerte.
@@ -347,6 +349,7 @@ async function pureChecks() {
           } else {
             const instr = vc.extractText(slots.find((s) => s.role === 'activity_instruction').html);
             assert(/actividad práctica que sigue es calificada/.test(instr) && instr.includes('70 de 100') && /todas las veces que quieras/.test(instr), `instrucción: ${instr}`);
+            assert(/Pon a prueba lo aprendido (Responderás|Arrastrarás|Completarás|Resolverás) /.test(instr), `cap ${chapterNumber}: la instrucción no dice qué hará el estudiante: ${instr}`);
             assert(instr.includes(`Iniciar actividad del capítulo ${chapterNumber} →`) && slots.find((s) => s.role === 'activity_instruction').html.includes('href="cursia-cta://next-activity"'), `cap ${chapterNumber}: botón «Iniciar actividad»`);
           }
         }
