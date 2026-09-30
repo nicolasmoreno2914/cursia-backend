@@ -31,6 +31,7 @@ import {
 } from '../course-profiles/course-profiles';
 import { formatDurationEs, formatDurationShortEs } from '../../package/audio';
 import { H5pActivityType, activityTypeForChapter } from './activity-type';
+import { displayStructureTitle } from '../course-structure/structure-titles';
 
 export const COURSE_FACTS_VERSION = 1;
 export const HOURS_SOURCE_LABEL = 'definida por la institución';
@@ -194,7 +195,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
         moduleId: mm.moduleId,
         moduleNumber: mm.moduleNumber,
         indexInModule: idx + 1,
-        title: sc.title,
+        title: displayStructureTitle(sc.title),
         videoEnabled: mc.videoEnabled,
         activityEnabled,
         activityVariant: variant,
@@ -208,7 +209,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
     modules.push({
       id: mm.moduleId,
       number: mm.moduleNumber,
-      title: sm.title,
+      title: displayStructureTitle(sm.title),
       chapterNumbers: mm.chapters.map((c) => c.chapterNumber),
       examEnabled: mm.examEnabled,
       examQuestionCount: mm.examEnabled ? (q as number) : null,

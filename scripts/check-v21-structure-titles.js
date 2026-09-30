@@ -80,6 +80,21 @@ const LONG_240 =
 const REST_240 = 'Principios y técnicas de almacenamiento, condiciones de temperatura, humedad, ventilación e higiene, control de inventarios, manejo de plagas y prevención de pérdidas';
 
 async function pureChecks() {
+  await check('EV5 displayStructureTitle: título legado cortado a 255 a mitad de palabra (curso #292) → ≤ 80, sin media palabra ni «…»; ≤ 80 intacto', () => {
+    const c292 = 'Almacenamiento y conservación de productos agrícolas Principios y técnicas de almacenamiento, condiciones de temperatura, humedad, ventilación e higiene, control de inventarios, manejo de plagas y enfermedades durante la conservación de los prod';
+    const a = T.displayStructureTitle(c292);
+    assert(a === 'Almacenamiento y conservación de productos agrícolas', `split: ${a}`);
+    const noSplit = 'palabra '.repeat(40) + 'cortad';
+    const b = T.displayStructureTitle(noSplit);
+    assert(b.length <= 80 && !/…|cortad$/.test(b) && !/ (de|la|y)$/.test(b), `corte de respaldo: ${b}`);
+    const tricky = 'gestión integral de riesgos en la operación de plantas de beneficio y de los centros de acopio de la región';
+    const c = T.displayStructureTitle(tricky);
+    assert(c.length <= 80 && !/ (de|la|y|en|los)$/.test(c) && tricky.startsWith(c), `sin palabra funcional final: ${c}`);
+    assert(T.displayStructureTitle('  Logística   poscosecha ') === 'Logística poscosecha', 'corto: solo espacios');
+    const excel = T.displayStructureTitle('Introducción a Excel Avanzado para análisis de datos financieros de pequeñas y medianas empresas en Latinoamérica hoy');
+    assert(excel.length <= 80 && excel.length >= 32 && excel.startsWith('Introducción a Excel Avanzado'), `un corte demasiado corto no cambia el sentido: ${excel}`);
+    assert(T.displayStructureTitle('Título normal de capítulo') === 'Título normal de capítulo', 'idéntico');
+  });
   await check('normalizador: título de 240 caracteres (nombre + descripción pegados) → título ≤ 80 sin «…» y la descripción conserva TODO el resto', () => {
     assert(LONG_240.length >= 200, `fixture ${LONG_240.length}`);
     const r = T.normalizeChapterTitle(LONG_240);

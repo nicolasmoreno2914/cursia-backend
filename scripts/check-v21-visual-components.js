@@ -101,6 +101,41 @@ check('espejo del frontend (44): DYN_VC_COMPONENT_SPECS, nodos por diagrama y ti
   if (vc.VC_PEDAGOGY) assert(JSON.stringify(canon(ctx.__ped)) === JSON.stringify(canon(vc.VC_PEDAGOGY)), `VC_PEDAGOGY: FE ${JSON.stringify(ctx.__ped)} ≠ BE ${JSON.stringify(vc.VC_PEDAGOGY)}`);
 });
 
+check('EV5: guiones suaves en fronteras de sílaba, *énfasis* simple sin asteriscos literales, hero sin repetir el título', () => {
+  const T = require(path.join(path.dirname(modPath), 'text.js'));
+  const hy = (w, o) => T.inlineHtml(w, o).replace(/<[^>]+>/g, '').split('&shy;').join('-');
+  const o = { minLen: 10, every: 6 };
+  for (const [w, want] of [['estudiantes', 'estu-diantes'], ['potencialmente', 'poten-cial-mente'], ['acondicionamiento', 'acondi-ciona-miento']]) {
+    assert(hy(w, o) === want, `${w} → ${hy(w, o)} (esperaba ${want})`);
+  }
+  assert(hy('ABCDEFGHIJKLMNOPQRSTUVWXYZ', o).includes('-'), 'sin sílabas (sigla/código): igual se corta para no desbordar');
+  // Garantía anti-desborde intacta: ningún tramo supera every + 2 (el último), en los 3 perfiles.
+  let seed = 7;
+  const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+  const L = 'abcdefghilmnoprstuáéíóñ';
+  for (const prof of [T.HYPHEN_TABLE, T.HYPHEN_HEADING, T.HYPHEN_DEFAULT]) {
+    let worst = 0;
+    for (let i = 0; i < 4000; i++) {
+      let w = '';
+      const n = prof.minLen + Math.floor(rnd() * 30);
+      for (let j = 0; j < n; j++) w += L[Math.floor(rnd() * L.length)];
+      for (const piece of T.inlineHtml(w, prof).replace(/<[^>]+>/g, '').split('&shy;')) worst = Math.max(worst, Array.from(piece).length);
+    }
+    assert(worst <= prof.every + 2, `every ${prof.every}: tramo de ${worst}`);
+  }
+  const em = T.inlineHtml('requiere *tu* contexto, *tu* voz; 5 * 3 = 15; **fuerte**');
+  assert(!/\*tu\*/.test(em) && em.includes('requiere tu contexto, tu voz') && em.includes('5 * 3 = 15') && em.includes('<strong>fuerte</strong>'), `énfasis: ${em}`);
+  assert(T.inlineHtml('Los campos (*) son obligatorios (*).').includes('(*) son obligatorios (*)'), 'marcas de nota (*) intactas');
+  const t0 = themes[0].theme;
+  const op = { title: 'Cómo funciona la IA generativa', kicker: 'Módulo 1 · Capítulo 1', numeral: '01' };
+  const dup = vc.renderComponent({ type: 'hero', title: 'Cómo funciona la IA generativa.', lead: 'Una idea clara para empezar.' }, t0, { uid: 'h', opener: op });
+  assert(vc.extractText(dup).split('Cómo funciona la IA generativa').length === 2, `hero repite el título: ${vc.extractText(dup).slice(0, 120)}`);
+  const own = vc.renderComponent({ type: 'hero', title: 'Una tesis distinta del título.', lead: 'Una idea clara para empezar.' }, t0, { uid: 'h', opener: op });
+  assert(vc.extractText(own).includes('Una tesis distinta del título.'), 'el enunciado propio se conserva');
+  const legacy = vc.renderComponent({ type: 'hero', title: 'Cómo funciona la IA generativa en el aula de secundaria y qué cambia para docentes y estudiantes', lead: 'Una idea clara para empezar.' }, t0, { uid: 'h', opener: op });
+  assert(vc.extractText(legacy).split('Cómo funciona la IA generativa').length === 2, 'hero con el título legado largo (nombre + descripción) no se repite');
+});
+
 check('Edu EV4: bloques como piezas de curso (tarjetas, panel de objetivos, insignias) sin kicker repetido', () => {
   for (const { combo, theme } of themes) {
     for (const level of LEVELS) {

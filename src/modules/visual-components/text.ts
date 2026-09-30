@@ -47,15 +47,57 @@ export function escapeHtml(s: string): string {
     .replace(/'/g, '&#39;');
 }
 
+const VOWEL_RE = /[aeiouáéíóúüAEIOUÁÉÍÓÚÜ]/;
+const LETTER_RE = /\p{L}/u;
+/** Grupos consonánticos que no se separan (van juntos al inicio de la sílaba). */
+const ONSET_CLUSTERS = new Set(['bl', 'br', 'cl', 'cr', 'dr', 'fl', 'fr', 'gl', 'gr', 'kl', 'kr', 'pl', 'pr', 'tr', 'ch', 'll', 'rr', 'qu', 'gu']);
+
+/**
+ * EV5 — posiciones donde un guion suave cae entre sílabas del español (aproximación segura):
+ * V·CV (antes de una consonante entre vocales) y VC·CV (entre dos consonantes, salvo grupos
+ * inseparables: «ha·bla», «o·tro»). Nunca entre vocales ni fuera de letras.
+ */
+function syllableBreaks(cps: string[]): Set<number> {
+  const out = new Set<number>();
+  const isV = (c: string | undefined) => !!c && VOWEL_RE.test(c);
+  const isC = (c: string | undefined) => !!c && LETTER_RE.test(c) && !VOWEL_RE.test(c);
+  for (let i = 1; i < cps.length - 1; i++) {
+    const a = cps[i - 1];
+    const b = cps[i];
+    const c = cps[i + 1];
+    if (isV(a) && isC(b) && isV(c)) out.add(i); // ca·sa
+    if (/[aeoáéíóú]/i.test(a) && /[aeoáéíóú]/i.test(b)) out.add(i); // hiato: electro·en·cefalo, pa·ís
+    if (isC(a) && isC(b) && isV(c) && isV(cps[i - 2]) && !ONSET_CLUSTERS.has((a + b).toLowerCase())) out.add(i); // can·to
+    // o·tro, elec·tro, ins·truc: el grupo inseparable abre la sílaba aunque antes haya otra consonante.
+    if (isC(a) && isC(b) && isV(c) && i - 1 >= 2 && LETTER_RE.test(cps[i - 2] ?? '') && ONSET_CLUSTERS.has((a + b).toLowerCase())) out.add(i - 1);
+  }
+  return out;
+}
+
 function hyphenateWord(word: string, h: HyphenOpts): string {
   const cps = Array.from(word);
   if (cps.length < h.minLen) return word;
+  const breaks = syllableBreaks(cps);
+  const isWordChar = (c: string | undefined) => !!c && /[\p{L}\p{N}]/u.test(c);
+  const cuts = new Set<number>();
+  // Cada tramo mide ≤ `every` (la garantía anti-desborde de siempre): el corte se busca HACIA ATRÁS
+  // desde prev+every, primero en una frontera de sílaba y si no, entre dos letras (nunca junto a
+  // «-», «/» o «:»); sin nada de eso, el corte fijo.
+  let prev = 0;
+  while (cps.length - (prev + h.every) >= 3) {
+    const hi = prev + h.every;
+    const lo = Math.max(prev + 2, hi - 3);
+    let pick = -1;
+    for (let c = hi; c >= lo && pick < 0; c--) if (breaks.has(c)) pick = c;
+    for (let c = hi; c >= lo && pick < 0; c--) if (isWordChar(cps[c - 1]) && isWordChar(cps[c])) pick = c;
+    if (pick < 0) pick = hi;
+    cuts.add(pick);
+    prev = pick;
+  }
   let out = '';
   for (let i = 0; i < cps.length; i++) {
+    if (cuts.has(i)) out += SHY;
     out += cps[i];
-    const pos = i + 1;
-    // no cortar dejando menos de 3 caracteres al final
-    if (pos % h.every === 0 && cps.length - pos >= 3) out += SHY;
   }
   return out;
 }
@@ -66,9 +108,17 @@ function escapeRun(text: string, h: HyphenOpts): string {
   return escapeHtml(hy).split(SHY).join('&shy;');
 }
 
+/**
+ * EV5 — `*énfasis*` de un solo asterisco (markdown que el LLM a veces usa) no debe llegar literal:
+ * se quita el par de asteriscos y queda el texto. No toca `**…**` ni asteriscos sueltos («5 * 3»).
+ */
+function stripSingleStars(text: string): string {
+  return text.replace(/(^|[^*\p{L}\p{N}])\*(?=[\p{L}\p{N}])([^*\n]*?[\p{L}\p{N}.!?])\*(?![*\p{L}\p{N}])/gu, '$1$2');
+}
+
 /** Sustituye los pares `**` por marcadores internos (emparejados en todo el campo). */
 function markEmphasis(text: string): string {
-  const parts = text.replace(INVISIBLE_CHARS_RE, '').split('**');
+  const parts = stripSingleStars(text.replace(INVISIBLE_CHARS_RE, '')).split('**');
   const unbalanced = parts.length % 2 === 0;
   let out = '';
   for (let i = 0; i < parts.length; i++) {

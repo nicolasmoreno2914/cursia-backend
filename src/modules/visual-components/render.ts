@@ -432,6 +432,19 @@ function panel(r: R, inner: string, s: Surf, opts: { cls?: string; tag?: 'div' |
   );
 }
 
+/** Mismo texto visible (sin énfasis, puntuación, mayúsculas ni espacios extra). */
+function sameText(a: string | undefined, b: string | undefined): boolean {
+  const n = (x: string | undefined) => String(x ?? '').replace(/\*+/g, '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+  return !!n(a) && n(a) === n(b);
+}
+
+/** Título legado «Nombre + descripción» cuyo nombre es el título del capítulo ya mostrado. */
+function startsWithTitle(a: string | undefined, title: string | undefined): boolean {
+  const n = (x: string | undefined) => String(x ?? '').replace(/\*+/g, '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+  const t = n(title);
+  return t.length >= 20 && n(a).startsWith(t + ' ') && n(a).length > 80;
+}
+
 /** El título del LLM que repetiría el kicker de objetivos (evita «Objetivos de aprendizaje» dos veces). */
 const OBJ_KICKER_RE = /^objetivos( de aprendizaje)?[.:]?$/i;
 
@@ -564,7 +577,8 @@ function renderHero(r: R, c: VcHero): string {
     main =
       heading(r, 'h2', op.title, s, 'display') +
       accentRule(r, s) +
-      paragraphs(r, c.title, s, { role: 'statement', italic: p.thesisItalic }) +
+      // EV5: el enunciado del hero no repite el título del capítulo.
+      (sameText(c.title, op.title) || startsWithTitle(c.title, op.title) ? '' : paragraphs(r, c.title, s, { role: 'statement', italic: p.thesisItalic })) +
       paragraphs(r, c.lead, s, { role: 'lead', last: true });
   } else {
     main = heading(r, 'h4', c.title, s, 'display') + accentRule(r, s) + paragraphs(r, c.lead, s, { role: 'lead', last: true });
