@@ -7,6 +7,8 @@ import { AppModule } from './app.module';
 import { AllExceptionsFilter } from './common/filters/http-exception.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
 import { warnIfNearMissDynamicFlag } from './modules/features/dynamic-features';
+import { RunsService } from './modules/dynamic-generation/runs.service';
+import { startAutoHealTimer } from './modules/dynamic-generation/auto-heal';
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
@@ -55,6 +57,10 @@ async function bootstrap() {
   logger.log(`🚀 Cursia Backend running on http://localhost:${port}`);
   logger.log(`   Health:  GET /health`);
   logger.log(`   API:     GET /api/v1`);
+
+  // R16 (#2): auto-healer de items dinámicos fallidos por errores transitorios. Solo en la API (los
+  // workers cargan el mismo AppModule y no barren). Apagado con DYNAMIC_AUTO_HEAL_ENABLED=false.
+  startAutoHealTimer(app.get(RunsService), new Logger('DynamicAutoHeal'));
 }
 
 bootstrap();

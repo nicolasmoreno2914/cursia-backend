@@ -62,6 +62,7 @@ import {
 } from './provider-readiness';
 import { INVALIDATION_V3_NOT_IMPLEMENTED, assertInvalidationRulesSupported } from '../invalidation/plan';
 import { latestGenerationPredicate } from './item-generations';
+import { AutoHealPolicy, AutoHealSweepResult, DEFAULT_AUTO_HEAL_POLICY, autoHealDecision } from './auto-heal';
 import { FinopsBudgetService, StartBudgetEvaluation } from '../finops/finops-budget.service';
 import {
   BUDGET_APPROVAL_REQUIRED,
@@ -1425,6 +1426,13 @@ export class RunsService {
    *   failed sigue blocked);
    * - si el run había terminado (p.ej. failed), se reabre a 'queued'.
    * Un run cancelado no admite reintentos (409).
+   *
+   * R16 (#2): `auto` = reapertura del auto-healer (misma transacción, sin
+   * controlador). Solo items `failed` (nunca bloqueos de presupuesto), la
+   * política se re-evalúa BAJO LOCK (allow-list, tope de rondas, espera), el
+   * gate de presupuesto se evalúa sin registrar estimados (insuficiente → 409
+   * y el item queda para un humano), concede `policy.attemptsPerRound`
+   * intentos y deja la ronda en output_summary.autoHeal + previousErrors.
    */
   async retryItem(
     courseId: number,
@@ -1434,7 +1442,11 @@ export class RunsService {
     itemKey: string,
     resubmitVideo = false,
     resubmitProvider = false,
+    auto?: { policy: AutoHealPolicy; now?: Date },
   ): Promise<ItemRunDto> {
+    if (auto && (resubmitVideo || resubmitProvider)) {
+      throw new BadRequestException('auto-heal: nunca reenvía a un proveedor (resubmitVideo/resubmitProvider)');
+    }
     // G3 (fix wave / review I1): un retry es un entry point como cualquier
     // otro — requiere la allow-list de V2, antes de tocar manifest o run.
     assertDynamicOwnerAllowed(ownerId);
@@ -1458,6 +1470,9 @@ export class RunsService {
         [job.id],
       );
     const preTarget = preRows.find((i) => i.item_key === itemKey);
+    if (auto && preTarget?.status !== 'failed') {
+      throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" no está failed`, code: 'auto_heal_not_eligible' });
+    }
     let uploadPhaseRetry = false;
     if (preTarget && (preTarget.status === 'failed' || isBudgetBlocked(preTarget))) {
       if (preTarget.type === 'video' && frozenDelivery === 'youtube' && !resubmitVideo) {
@@ -1487,7 +1502,7 @@ export class RunsService {
         const paidItems = isPaid(preTarget)
           ? (newPaid(preTarget, resubmitVideo) ? [preTarget] : [])
           : preRows.filter((r) => r.status === 'blocked' && isPaid(r) && newPaid(r, false));
-        await this.finopsPaidWorkGate({ courseId, ownerId, manifest, job, paidKeys: paidItems.map((r) => r.item_key) });
+        await this.finopsPaidWorkGate({ courseId, ownerId, manifest, job, paidKeys: paidItems.map((r) => r.item_key), dryRun: !!auto });
       }
     }
 
@@ -1520,10 +1535,12 @@ export class RunsService {
         type: string;
         error: string | null;
         output_summary: Record<string, any> | null;
+        finished_at: Date | null;
+        updated_at: Date | null;
       }> = await qr.query(
         // F78-BE2: la generación VIGENTE de cada item (una regeneración
         // fallida se reintenta sobre su propia fila, nunca sobre la histórica).
-        `select id, item_key, status, depends_on, type, error, output_summary
+        `select id, item_key, status, depends_on, type, error, output_summary, finished_at, updated_at
             from public.generation_item_runs g
             where g.job_id = $1 and ${latestGenerationPredicate('g')}
             order by id
@@ -1540,6 +1557,16 @@ export class RunsService {
         throw new ConflictException(
           `Solo se puede reintentar un item en estado "failed" (o "blocked" por ${BUDGET_EXCEEDED}); "${itemKey}" está en "${target.status}"`,
         );
+      }
+      // R16 (#2): la política del auto-healer se re-evalúa con la fila bloqueada (otro barrido, un retry
+      // manual o un fallo nuevo pudieron cambiarla entre la lectura y este lock).
+      let autoMeta: { round: number; code: string } | null = null;
+      if (auto) {
+        const d = autoHealDecision(target, auto.now ?? new Date(), auto.policy);
+        if (d.heal === false) {
+          throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (${d.reason})`, code: 'auto_heal_not_eligible' });
+        }
+        autoMeta = { round: d.round, code: d.rule.code };
       }
 
       // I1 (fix wave / review controller ruling: "un retry NO es un resume").
@@ -1611,7 +1638,7 @@ export class RunsService {
                       'attemptCount', attempt_count,
                       'maxAttempts', max_attempts,
                       'retriedAt', now()
-                    ))
+                    ) || $3::jsonb)
                   )`;
       const outputSummaryExpr = resubmitVideo || resubmitProvider
         ? `((${previousErrorsExpr}) || jsonb_build_object(
@@ -1626,14 +1653,21 @@ export class RunsService {
                     -- Calibración #2: decisión humana explícita → las operaciones pagadas de los
                     -- intentos hasta acá quedan reconocidas (el worker ya no las trata como ambiguas).
                     'reconciliationAcknowledgedThroughAttempt', attempt_count
-                  ))${resubmitSetSql}`
-        : previousErrorsExpr;
+                  ) || $4::jsonb)${resubmitSetSql}`
+        : `(${previousErrorsExpr}) || $4::jsonb`;
+      // R16 (#2): la reapertura automática queda registrada (auditoría) en la misma escritura.
+      const nowIso = (auto?.now ?? new Date()).toISOString();
+      const entryExtra = autoMeta ? { auto: true, autoHealRound: autoMeta.round, autoHealCode: autoMeta.code } : {};
+      const topExtra = autoMeta
+        ? { autoHeal: { rounds: autoMeta.round, lastAt: nowIso, lastCode: autoMeta.code, maxRounds: auto!.policy.maxRounds } }
+        : {};
+      const attemptsGranted = auto ? Math.max(1, Math.floor(auto.policy.attemptsPerRound)) : 3;
 
       const updated = returningRows(
         await qr.query(
           `update public.generation_item_runs
               set status = 'pending',
-                  max_attempts = attempt_count + 3,
+                  max_attempts = attempt_count + $2::int,
                   output_summary = ${outputSummaryExpr},
                   error = null,
                   next_retry_at = null,
@@ -1644,7 +1678,7 @@ export class RunsService {
             where id = $1 and status = 'failed'
                or (id = $1 and status = 'blocked' and error like '${BUDGET_EXCEEDED}%')
             returning id`,
-          [target.id],
+          [target.id, attemptsGranted, JSON.stringify(entryExtra), JSON.stringify(topExtra)],
         ),
       );
       if (updated.length !== 1) {
@@ -1694,6 +1728,75 @@ export class RunsService {
 
     const [row] = await this.dataSource.query(`select * from public.generation_item_runs where id = $1`, [targetId]);
     return this.toItemDto(row, frozenDelivery);
+  }
+
+  /** R16 (#2): último motivo logueado por item (evita repetir el mismo "no se reabre" en cada barrido). */
+  private readonly autoHealLastSkip = new Map<string, string>();
+
+  /**
+   * R16 (#2 + #16) — barrido del auto-healer (lo dispara el timer de la API,
+   * ver auto-heal.ts/startAutoHealTimer). Lee sin locks los items `failed`
+   * (generación vigente) de runs dinámicos no cancelados con rondas
+   * automáticas disponibles, evalúa la política pura y reabre los elegibles
+   * con retryItem(auto) — que re-evalúa todo bajo lock. Un item que no se
+   * puede reabrir (presupuesto, run reemplazado, otro run activo, owner fuera
+   * de la allow-list…) se deja para un humano, con un log por motivo.
+   */
+  async autoHealFailedItems(opts: { policy?: AutoHealPolicy; now?: Date; limit?: number } = {}): Promise<AutoHealSweepResult> {
+    const policy = opts.policy ?? DEFAULT_AUTO_HEAL_POLICY;
+    const limit = Math.max(1, Math.floor(opts.limit ?? 50));
+    const result: AutoHealSweepResult = { reopened: [], skipped: [] };
+    const rows: Array<{
+      id: string; job_id: string; item_key: string; status: string; error: string | null; output_summary: Record<string, any> | null;
+      finished_at: Date | null; updated_at: Date | null; course_id: number; owner_id: string; blueprint_number: number;
+    }> = await this.dataSource.query(
+      `select g.id, g.job_id, g.item_key, g.status, g.error, g.output_summary, g.finished_at, g.updated_at,
+              pj.course_id, pj.owner_id, b.blueprint_number
+         from public.generation_item_runs g
+         join public.production_jobs pj on pj.id = g.job_id
+         join public.course_generation_manifests m on m.id = g.manifest_id
+         join public.course_blueprints b on b.id = m.blueprint_id
+        where pj.execution_mode = 'dynamic_generation'
+          and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+          and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed')
+          and g.status = 'failed'
+          and ${latestGenerationPredicate('g')}
+          and (case when jsonb_typeof(g.output_summary->'autoHeal'->'rounds') = 'number'
+                    then (g.output_summary->'autoHeal'->>'rounds')::numeric else 0 end) < $1
+        order by g.finished_at nulls first, g.id
+        limit $2`,
+      [policy.maxRounds, limit],
+    );
+    const now = opts.now ?? new Date();
+    for (const r of rows) {
+      const d = autoHealDecision(r, now, policy);
+      if (d.heal === false) {
+        // backoff = todavía no; el resto = nunca automático (sin log por item: muchos son no-transitorios).
+        if (d.reason !== 'backoff') result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: d.reason });
+        continue;
+      }
+      try {
+        await this.retryItem(r.course_id, r.owner_id, Number(r.blueprint_number), r.job_id, r.item_key, false, false, { policy, now });
+        this.autoHealLastSkip.delete(r.id);
+        result.reopened.push({ runId: r.job_id, itemKey: r.item_key, code: d.rule.code, round: d.round });
+        this.logger.warn(
+          `auto-heal: reabierto ${r.item_key} (run ${r.job_id}) — ronda ${d.round}/${policy.maxRounds}, ` +
+            `código ${d.rule.code}; error previo: ${String(r.error ?? '').slice(0, 200)}`,
+        );
+      } catch (err) {
+        const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
+        const code = (resp && typeof resp === 'object' && (resp as any).code) || (err instanceof Error ? err.name : 'error');
+        const msg = err instanceof Error ? err.message : String(err);
+        result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: String(code) });
+        const key = `${code}:${msg.slice(0, 120)}`;
+        if (this.autoHealLastSkip.get(r.id) !== key) {
+          this.autoHealLastSkip.set(r.id, key);
+          this.logger.warn(`auto-heal: ${r.item_key} (run ${r.job_id}) no se reabre automáticamente (${code}): ${msg.slice(0, 300)}`);
+        }
+      }
+    }
+    if (this.autoHealLastSkip.size > 5000) this.autoHealLastSkip.clear();
+    return result;
   }
 
   /**
@@ -2575,7 +2678,7 @@ export class RunsService {
    * actual + incremental esperado; si no → 409 budget_approval_required con el
    * estimateId. AUTO_WITHIN_POLICY nunca cubre proveedores pagados.
    */
-  private async finopsPaidWorkGate(a: { courseId: number; ownerId: string; manifest: ManifestDto; job: any; paidKeys: string[] }): Promise<void> {
+  private async finopsPaidWorkGate(a: { courseId: number; ownerId: string; manifest: ManifestDto; job: any; paidKeys: string[]; dryRun?: boolean }): Promise<void> {
     // Solo los items cuyo proveedor está congelado en `real` para este run (video: videoMode; Gamma/TTS: providerModes).
     const modes = this.spendModesOf(a.job);
     const typeOf = new Map(a.manifest.manifest.items.map((it) => [it.key, it.type]));
@@ -2603,6 +2706,13 @@ export class RunsService {
     ]);
     const g = runtimeGuard({ authorizedBudget, actualSoFar, reservedInFlight: '0', next: estimate.totals.expected });
     if (g.allow) return;
+    if (a.dryRun) {
+      // R16 (#2): el auto-healer no registra estimados (correría en cada barrido): el item queda para un humano.
+      throw new ConflictException({
+        code: BUDGET_APPROVAL_REQUIRED,
+        message: `${BUDGET_APPROVAL_REQUIRED}: reabrir ${keys.join(', ')} excede el presupuesto autorizado (${g.reason}); no se reabre automáticamente.`,
+      });
+    }
     const est = await this.finopsBudget.recordEstimate({
       scope: 'regeneration', ownerId: a.ownerId, courseId: a.courseId, manifestId: a.manifest.id, runId: a.job.id, estimate,
     });
