@@ -51,6 +51,7 @@ import {
   themeSha256,
 } from '../theme-engine';
 import { PackagingPlanV3 } from './packaging-plan-v3';
+import { runOrderedWithLimit } from './ordered-limit';
 import type { DynamicPackageContentsV3, ActivityContentV3 } from '../../package/dynamic-mbz-builder-v3';
 import {
   AssessmentPackageSummary,
@@ -465,6 +466,13 @@ function json(text: string, key: string): any {
 }
 
 
+/**
+ * R16: descargas de artifacts en vuelo a la vez al armar un paquete v3. Chico y fijo:
+ * suficiente para esconder la latencia de Storage (~3 idas y vueltas por archivo) sin
+ * multiplicar la memoria ni saturar el pool de la base (cada descarga hace un findOne).
+ */
+export const PACKAGING_V3_DOWNLOAD_CONCURRENCY = 6;
+
 export async function loadContentsV3(
   L: ContentLoadersV3,
   plan: PackagingPlanV3,
@@ -503,7 +511,135 @@ export async function loadContentsV3(
     return bytes;
   };
 
-  const courseIntro = json(await validatedText(L, byItem, plan.keys.courseIntro, 'dynamic_course_intro_json'), plan.keys.courseIntro);
+  // R16 (rendimiento): las descargas corren con a lo sumo PACKAGING_V3_DOWNLOAD_CONCURRENCY
+  // en vuelo (antes, una detrás de otra: ~55–60 descargas × 3 idas y vueltas en un curso
+  // mediano). Cada tarea escribe en su propia ranura y los Maps se arman DESPUÉS, en el
+  // orden del plan, así el contenido y el orden de inserción son idénticos a los del loop
+  // secuencial; los avisos también se juntan en ese orden. Errores: runOrderedWithLimit
+  // no arranca nada nuevo tras una falla y rechaza con el error de la tarea de menor
+  // índice (el mismo que daba el loop secuencial).
+  type PresentationSlot = { value: { pdf: Buffer; cover: Buffer; mock?: boolean }; warnings: string[] };
+  type ChapterSlots = {
+    content?: string;
+    experience?: unknown;
+    presentation?: PresentationSlot;
+    video?: { youtubeId: string; durationSec: number };
+    videoInteractions?: unknown;
+    activityPayload?: unknown;
+    scormHtml?: string;
+    scormManifest?: string;
+    audio?: Buffer;
+  };
+  const tasks: Array<() => Promise<void>> = [];
+  let courseIntro: any;
+  const moduleIntroSlots = new Map<string, unknown>();
+  const examSlots = new Map<string, string>();
+  const chapterSlots = new Map<string, ChapterSlots>();
+  let finalExamGift: string | null = null;
+  let audioWelcome: Buffer | undefined;
+
+  const loadPresentation = async (ch: PackagingPlanV3['modules'][number]['chapters'][number]): Promise<PresentationSlot> => {
+    // Presentación (R9): real = PDF + portada en Storage (sha verificado); simulada = medios sintéticos.
+    const pa = one(byItem, ch.keys.presentation, 'dynamic_presentation');
+    const pres = json(await L.loadText(pa), ch.keys.presentation);
+    if (assertArtifactMockAllowed(run, pa, pres)) {
+      const n = Number(pres.slideCount);
+      if (!Number.isInteger(n) || n < 1 || n > 500) throw new Error(`${PACKAGING_V3}: fixture ${ch.keys.presentation} sin slideCount válido (G6 M3)`);
+      const pdf = syntheticPdf(n);
+      mockProviderItems.push(ch.keys.presentation);
+      return { value: { pdf, cover: syntheticCoverPng(MOCK_COVER.w, MOCK_COVER.h, MOCK_COVER.color), mock: true }, warnings: [] };
+    }
+    const w: string[] = [];
+    const errs = validatePresentationArtifact(pres);
+    if (errs.length) throw new Error(`${PACKAGING_V3}: ${ch.keys.presentation} inválido: ${errs.map((e) => e.code).join(', ')}`);
+    if (pres.chapterId !== ch.chapterId) throw new Error(`${PACKAGING_V3}: ${ch.keys.presentation} es de otro capítulo (${pres.chapterId})`);
+    assertSafeStoragePath(pres.pdf.storagePath);
+    assertSafeStoragePath(pres.cover.storagePath);
+    const bucket = pa.storageBucket || 'cursia-artifacts';
+    const pdf = await L.loadStorageBytes(bucket, pres.pdf.storagePath);
+    const cover = await L.loadStorageBytes(bucket, pres.cover.storagePath);
+    if (sha256(pdf) !== pres.pdf.sha256 || sha256(cover) !== pres.cover.sha256) {
+      throw new Error(`${PACKAGING_V3}: los archivos de ${ch.keys.presentation} no coinciden con su sha256 declarado`);
+    }
+    if (pdfPageCount(pdf) !== pres.slideCount) w.push(`slide_count_declared_mismatch:${ch.keys.presentation}`);
+    try {
+      const tm = themeMismatch(pres, currentTheme as any);
+      if (tm.mismatch) w.push(`theme_mismatch:${ch.keys.presentation}:${tm.changed.join('+')}`);
+    } catch (err) {
+      w.push(`theme_mismatch_unknown:${ch.keys.presentation}:${err instanceof Error ? err.message.split(':')[0] : 'error'}`);
+    }
+    return { value: { pdf, cover }, warnings: w };
+  };
+
+  const loadVideo = async (ch: PackagingPlanV3['modules'][number]['chapters'][number]): Promise<{ youtubeId: string; durationSec: number }> => {
+    if (delivery !== 'youtube') {
+      throw new PackagingNotReadyError(
+        [`${ch.keys.video}:${V3_VIDEO_REQUIRES_YOUTUBE}`],
+        `${V3_VIDEO_REQUIRES_YOUTUBE}: el video interactivo H5P de V2.1 necesita el video publicado en YouTube (el run está congelado en ${delivery}).`,
+      );
+    }
+    const va = one(byItem, ch.keys.video as string, 'dynamic_video');
+    const data = json(await L.loadText(va), ch.keys.video as string);
+    const parsed = parseDynamicVideo(data, 'youtube');
+    const check = checkYoutubeDeliveryUrl(parsed.url);
+    if (check.ok === false) throw new Error(`${PACKAGING_V3}: ${ch.keys.video}: ${check.reason}`);
+    const dur = Number(data.durationSec ?? va.metadata?.durationSec);
+    if (!Number.isFinite(dur) || dur <= 0) {
+      throw new PackagingNotReadyError([`${ch.keys.video}:VIDEO_DURATION_MISSING`], `VIDEO_DURATION_MISSING: ${ch.keys.video} no tiene la duración medida del video.`);
+    }
+    return { youtubeId: check.videoId, durationSec: dur };
+  };
+
+  // Tareas en el MISMO orden que el loop secuencial de antes.
+  tasks.push(async () => {
+    courseIntro = json(await validatedText(L, byItem, plan.keys.courseIntro, 'dynamic_course_intro_json'), plan.keys.courseIntro);
+  });
+  for (const m of plan.modules) {
+    tasks.push(async () => {
+      moduleIntroSlots.set(m.moduleId, json(await validatedText(L, byItem, m.keys.moduleIntro, 'dynamic_module_intro_json'), m.keys.moduleIntro));
+    });
+    if (m.keys.exam) {
+      const examKey = m.keys.exam;
+      tasks.push(async () => {
+        examSlots.set(m.moduleId, await validatedText(L, byItem, examKey, 'dynamic_exam_gift'));
+      });
+    }
+    for (const ch of m.chapters) {
+      const slot: ChapterSlots = {};
+      chapterSlots.set(ch.chapterId, slot);
+      tasks.push(async () => { slot.content = await validatedText(L, byItem, ch.keys.content, 'dynamic_content_md'); });
+      tasks.push(async () => { slot.experience = json(await validatedText(L, byItem, ch.keys.experience, 'dynamic_experience_json'), ch.keys.experience); });
+      tasks.push(async () => { slot.presentation = await loadPresentation(ch); });
+      if (ch.keys.video) {
+        tasks.push(async () => { slot.video = await loadVideo(ch); });
+        tasks.push(async () => {
+          slot.videoInteractions = json(
+            await validatedText(L, byItem, ch.keys.videoInteractions as string, 'dynamic_video_interactions_json'),
+            ch.keys.videoInteractions as string,
+          );
+        });
+      }
+      if (ch.keys.activity) {
+        const activityKey = ch.keys.activity;
+        if (ch.activityVariant === 'h5p') {
+          tasks.push(async () => { slot.activityPayload = json(await validatedText(L, byItem, activityKey, 'dynamic_h5p_params_json'), activityKey); });
+        } else {
+          tasks.push(async () => { slot.scormHtml = await validatedText(L, byItem, activityKey, 'dynamic_scorm_html'); });
+          tasks.push(async () => { slot.scormManifest = await validatedText(L, byItem, activityKey, 'dynamic_scorm_manifest'); });
+        }
+      }
+      tasks.push(async () => { slot.audio = await audio(ch.keys.audiobookChapter); });
+    }
+  }
+  if (plan.keys.finalExam) {
+    const finalKey = plan.keys.finalExam;
+    tasks.push(async () => { finalExamGift = await validatedText(L, byItem, finalKey, 'dynamic_exam_gift'); });
+  }
+  tasks.push(async () => { audioWelcome = await audio(plan.keys.audioWelcome); });
+
+  await runOrderedWithLimit(tasks, PACKAGING_V3_DOWNLOAD_CONCURRENCY);
+
+  // Armado en el orden del plan (mismo orden de inserción que antes).
   const moduleIntros = new Map<string, unknown>();
   const examGift = new Map<string, string>();
   const contentMd = new Map<string, string>();
@@ -513,86 +649,30 @@ export async function loadContentsV3(
   const videoInteractions = new Map<string, unknown>();
   const activities = new Map<string, ActivityContentV3>();
   const audiobookChapters = new Map<string, Buffer>();
-
   for (const m of plan.modules) {
-    moduleIntros.set(m.moduleId, json(await validatedText(L, byItem, m.keys.moduleIntro, 'dynamic_module_intro_json'), m.keys.moduleIntro));
-    if (m.keys.exam) examGift.set(m.moduleId, await validatedText(L, byItem, m.keys.exam, 'dynamic_exam_gift'));
+    moduleIntros.set(m.moduleId, moduleIntroSlots.get(m.moduleId));
+    if (m.keys.exam) examGift.set(m.moduleId, examSlots.get(m.moduleId) as string);
     for (const ch of m.chapters) {
-      contentMd.set(ch.chapterId, await validatedText(L, byItem, ch.keys.content, 'dynamic_content_md'));
-      experiences.set(ch.chapterId, json(await validatedText(L, byItem, ch.keys.experience, 'dynamic_experience_json'), ch.keys.experience));
-
-      // Presentación (R9): real = PDF + portada en Storage (sha verificado); simulada = medios sintéticos.
-      const pa = one(byItem, ch.keys.presentation, 'dynamic_presentation');
-      const pres = json(await L.loadText(pa), ch.keys.presentation);
-      if (assertArtifactMockAllowed(run, pa, pres)) {
-        const n = Number(pres.slideCount);
-        if (!Number.isInteger(n) || n < 1 || n > 500) throw new Error(`${PACKAGING_V3}: fixture ${ch.keys.presentation} sin slideCount válido (G6 M3)`);
-        const pdf = syntheticPdf(n);
-        presentations.set(ch.chapterId, { pdf, cover: syntheticCoverPng(MOCK_COVER.w, MOCK_COVER.h, MOCK_COVER.color), mock: true });
-        mockProviderItems.push(ch.keys.presentation);
-      } else {
-        const errs = validatePresentationArtifact(pres);
-        if (errs.length) throw new Error(`${PACKAGING_V3}: ${ch.keys.presentation} inválido: ${errs.map((e) => e.code).join(', ')}`);
-        if (pres.chapterId !== ch.chapterId) throw new Error(`${PACKAGING_V3}: ${ch.keys.presentation} es de otro capítulo (${pres.chapterId})`);
-        assertSafeStoragePath(pres.pdf.storagePath);
-        assertSafeStoragePath(pres.cover.storagePath);
-        const bucket = pa.storageBucket || 'cursia-artifacts';
-        const pdf = await L.loadStorageBytes(bucket, pres.pdf.storagePath);
-        const cover = await L.loadStorageBytes(bucket, pres.cover.storagePath);
-        if (sha256(pdf) !== pres.pdf.sha256 || sha256(cover) !== pres.cover.sha256) {
-          throw new Error(`${PACKAGING_V3}: los archivos de ${ch.keys.presentation} no coinciden con su sha256 declarado`);
-        }
-        if (pdfPageCount(pdf) !== pres.slideCount) warnings.push(`slide_count_declared_mismatch:${ch.keys.presentation}`);
-        try {
-          const tm = themeMismatch(pres, currentTheme as any);
-          if (tm.mismatch) warnings.push(`theme_mismatch:${ch.keys.presentation}:${tm.changed.join('+')}`);
-        } catch (err) {
-          warnings.push(`theme_mismatch_unknown:${ch.keys.presentation}:${err instanceof Error ? err.message.split(':')[0] : 'error'}`);
-        }
-        presentations.set(ch.chapterId, { pdf, cover });
-      }
-
+      const slot = chapterSlots.get(ch.chapterId) as ChapterSlots;
+      contentMd.set(ch.chapterId, slot.content as string);
+      experiences.set(ch.chapterId, slot.experience);
+      const pres = slot.presentation as PresentationSlot;
+      warnings.push(...pres.warnings);
+      presentations.set(ch.chapterId, pres.value);
       if (ch.keys.video) {
-        if (delivery !== 'youtube') {
-          throw new PackagingNotReadyError(
-            [`${ch.keys.video}:${V3_VIDEO_REQUIRES_YOUTUBE}`],
-            `${V3_VIDEO_REQUIRES_YOUTUBE}: el video interactivo H5P de V2.1 necesita el video publicado en YouTube (el run está congelado en ${delivery}).`,
-          );
-        }
-        const va = one(byItem, ch.keys.video, 'dynamic_video');
-        const data = json(await L.loadText(va), ch.keys.video);
-        const parsed = parseDynamicVideo(data, 'youtube');
-        const check = checkYoutubeDeliveryUrl(parsed.url);
-        if (check.ok === false) throw new Error(`${PACKAGING_V3}: ${ch.keys.video}: ${check.reason}`);
-        const dur = Number(data.durationSec ?? va.metadata?.durationSec);
-        if (!Number.isFinite(dur) || dur <= 0) {
-          throw new PackagingNotReadyError([`${ch.keys.video}:VIDEO_DURATION_MISSING`], `VIDEO_DURATION_MISSING: ${ch.keys.video} no tiene la duración medida del video.`);
-        }
-        videos.set(ch.chapterId, { youtubeId: check.videoId, durationSec: dur });
-        videoInteractions.set(
-          ch.chapterId,
-          json(await validatedText(L, byItem, ch.keys.videoInteractions as string, 'dynamic_video_interactions_json'), ch.keys.videoInteractions as string),
-        );
+        videos.set(ch.chapterId, slot.video as { youtubeId: string; durationSec: number });
+        videoInteractions.set(ch.chapterId, slot.videoInteractions);
       }
       if (ch.keys.activity) {
         if (ch.activityVariant === 'h5p') {
-          activities.set(ch.chapterId, {
-            variant: 'h5p',
-            payload: json(await validatedText(L, byItem, ch.keys.activity, 'dynamic_h5p_params_json'), ch.keys.activity),
-          });
+          activities.set(ch.chapterId, { variant: 'h5p', payload: slot.activityPayload });
         } else {
-          activities.set(ch.chapterId, {
-            variant: 'scorm',
-            html: await validatedText(L, byItem, ch.keys.activity, 'dynamic_scorm_html'),
-            manifestXml: await validatedText(L, byItem, ch.keys.activity, 'dynamic_scorm_manifest'),
-          });
+          activities.set(ch.chapterId, { variant: 'scorm', html: slot.scormHtml as string, manifestXml: slot.scormManifest as string });
         }
       }
-      audiobookChapters.set(ch.chapterId, await audio(ch.keys.audiobookChapter));
+      audiobookChapters.set(ch.chapterId, slot.audio as Buffer);
     }
   }
-  const finalExamGift = plan.keys.finalExam ? await validatedText(L, byItem, plan.keys.finalExam, 'dynamic_exam_gift') : null;
-  const audioWelcome = await audio(plan.keys.audioWelcome);
   return {
     contents: {
       courseIntro,
@@ -605,7 +685,7 @@ export async function loadContentsV3(
       activities,
       examGift,
       finalExamGift,
-      audioWelcome,
+      audioWelcome: audioWelcome as Buffer,
       audiobookChapters,
     },
     warnings,
