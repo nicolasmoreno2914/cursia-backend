@@ -1,4 +1,5 @@
 import type { BlueprintSnapshotV2 } from '../course-blueprints/blueprint-snapshot';
+import { ACTIVITY_H5P_ROTATION, resolveActivityType } from '../course-shell/activity-type';
 import { cmpStr, sha256Canonical } from '../coherence/canonical-json';
 import { Outline } from '../coherence/coherence-types';
 import {
@@ -54,7 +55,11 @@ import {
  *  - experience: content nuevo ⇒ REGENERATE; content en REVIEW por moverse de
  *    módulo o por cambio del módulo ⇒ REVIEW; reorder ⇒ REUSE.
  *  - activity: content nuevo ⇒ REGENERATE; variant (motor) distinto ⇒
- *    REGENERATE solo de activity; si no ⇒ REUSE.
+ *    REGENERATE solo de activity; tipo h5p resuelto distinto (EV5-C:
+ *    resolveActivityType(from) ≠ resolveActivityType(to), p.ej. un Manifest
+ *    legacy por hash → uno con reglas por objetivo) ⇒ REGENERATE
+ *    `activity_type_changed`; si no ⇒ REUSE (mismo tipo resuelto aunque uno
+ *    sea explícito y el otro por hash).
  *  - presentation / audiobook_chapter / video: content nuevo ⇒ STALE_NO_AUTO.
  *  - video_interactions: sigue al video. Video GENERATE/REGENERATE ⇒
  *    REGENERATE (describen un video nuevo); video STALE_NO_AUTO ⇒
@@ -158,6 +163,14 @@ function assertItemsMatchBlueprintV3(items: Map<string, InvalidationManifestItem
     if (type !== 'activity' && it.variant != null) {
       throw new Error(`INVALID_INVALIDATION_INPUT: ${label} ${key} declara variant pero no es activity`);
     }
+    if (it.h5pType != null) {
+      if (type !== 'activity' || it.variant !== 'h5p') {
+        throw new Error(`INVALID_INVALIDATION_INPUT: ${label} ${key} declara h5pType pero no es una activity h5p`);
+      }
+      if (!(ACTIVITY_H5P_ROTATION as readonly string[]).includes(it.h5pType)) {
+        throw new Error(`INVALID_INVALIDATION_INPUT: ${label} ${key} con h5pType inválido (fue ${JSON.stringify(it.h5pType)})`);
+      }
+    }
   }
 }
 
@@ -193,7 +206,10 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
   /** Extras de huella de un item del ORIGEN (variant del Manifest A, video vigente en A). */
   const fromExtras = (key: string): FingerprintExtrasV3 => {
     const { type, entityId } = parseItemKey(key);
-    if (type === 'activity') return { variant: fromItems.get(key)?.variant ?? null };
+    if (type === 'activity') {
+      const it = fromItems.get(key);
+      return { variant: it?.variant ?? null, h5pType: it?.h5pType ?? null };
+    }
     if (type === 'video_interactions') {
       // Fix round 1 (I3): la identidad REGISTRADA al generarse las
       // interacciones, no la del video actual (que pudo regenerarse después).
@@ -345,13 +361,15 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
         settleReuse(a, review.length ? 'REVIEW' : 'REUSE');
       }
     } else if (type === 'activity') {
-      a = base(key, true, { variant: toItem.variant ?? null });
+      a = base(key, true, { variant: toItem.variant ?? null, h5pType: toItem.h5pType ?? null });
       if (!inFrom) {
         decideNewItem(a, chapterIsNew ? 'chapter_added' : 'activity_toggled_on', contentNew);
       } else if (contentNew) {
         regenerate(a, 'content_regenerated');
       } else if ((fromItems.get(key)!.variant ?? null) !== (toItem.variant ?? null)) {
         regenerate(a, 'activity_engine_changed');
+      } else if (resolveActivityType({ ...fromItems.get(key)!, key }) !== resolveActivityType({ ...toItem, key })) {
+        regenerate(a, 'activity_type_changed');
       } else {
         a.reasons.push('content_reused');
         settleReuse(a, 'REUSE');

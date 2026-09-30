@@ -188,6 +188,8 @@ export function matchFingerprint(fps: BlueprintFingerprints, key: string): strin
 //       match = `own` del content del capítulo (como scorm/video en v1/v2).
 //   activity:<ch>
 //       match = sha(own, variant). Cambiar el motor ⇒ solo activity cambia.
+//       EV5-C: + h5pType SOLO si el item lo trae explícito (Manifest con
+//       activityTypeRules=1); sin él la huella es byte-idéntica a la de antes.
 //   video_interactions:<ch>
 //       match = sha(own, identidad del video vigente). La identidad es la del
 //       output del video (storage paths, ver `artifactOutputIdentity`): si el
@@ -217,6 +219,8 @@ export interface BlueprintFingerprintsV3 extends BlueprintFingerprints {
 export interface FingerprintExtrasV3 {
   /** Solo `activity`: el motor del item ('h5p' | 'scorm'). */
   variant?: string | null;
+  /** Solo `activity` h5p con tipo congelado en el Manifest (EV5-C); ausente/null = no entra en la huella. */
+  h5pType?: string | null;
   /** Solo `video_interactions`: identidad del output del video vigente (null = desconocida). */
   videoIdentity?: string | null;
 }
@@ -286,6 +290,11 @@ function activityVariantOf(key: string, extras: FingerprintExtrasV3): string {
   return variant;
 }
 
+/** EV5-C: `h5pType` entra en la huella de activity solo si es explícito (las huellas legacy no cambian). */
+function h5pTypeField(extras: FingerprintExtrasV3): { h5pType?: string } {
+  return extras.h5pType ? { h5pType: extras.h5pType } : {};
+}
+
 /** Huella "completa" v3 de un item (null si la entidad no existe o si falta la identidad del video). */
 export function itemFingerprintV3(fps: BlueprintFingerprintsV3, key: string, extras: FingerprintExtrasV3 = {}): string | null {
   const v = INVALIDATION_FINGERPRINT_VERSION_V3;
@@ -294,7 +303,7 @@ export function itemFingerprintV3(fps: BlueprintFingerprintsV3, key: string, ext
   if (OWN_MATCH_TYPES_V3.has(type)) return fps.content.get(entityId)?.full ?? null;
   if (type === 'activity') {
     const c = fps.content.get(entityId);
-    return c ? sha256Canonical({ v, kind: 'activity', content: c.full, variant: activityVariantOf(key, extras) }) : null;
+    return c ? sha256Canonical({ v, kind: 'activity', content: c.full, variant: activityVariantOf(key, extras), ...h5pTypeField(extras) }) : null;
   }
   if (type === 'video_interactions') {
     const c = fps.content.get(entityId);
@@ -315,7 +324,7 @@ export function matchFingerprintV3(fps: BlueprintFingerprintsV3, key: string, ex
   if (OWN_MATCH_TYPES_V3.has(type)) return fps.content.get(entityId)?.own ?? null;
   if (type === 'activity') {
     const c = fps.content.get(entityId);
-    return c ? sha256Canonical({ v, kind: 'activity', own: c.own, variant: activityVariantOf(key, extras) }) : null;
+    return c ? sha256Canonical({ v, kind: 'activity', own: c.own, variant: activityVariantOf(key, extras), ...h5pTypeField(extras) }) : null;
   }
   if (type === 'video_interactions') {
     const c = fps.content.get(entityId);
