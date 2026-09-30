@@ -330,6 +330,24 @@ async function pureChecks() {
     throwsRe(() => S.assembleChapter({ ...base, experience: bad }), /VC_INVALID.*RESOURCE_MENTION/, 'experience con recurso');
   });
 
+  await check('EV4b: «En este capítulo» muestra el recorrido real del capítulo (video, práctica/repaso, evaluación) y el número es una insignia', () => {
+    for (const [course, facts] of [[c2, f2], [c4, f4]]) {
+      for (const { chapterNumber, slots } of S.assembleAllChapters(facts, F.experiencesFor(course.manifest), THEME, { level: 'enhanced' })) {
+        const ch = facts.chapters[chapterNumber - 1];
+        const mod = facts.modules.find((m) => m.id === ch.moduleId);
+        const last = mod.chapterNumbers[mod.chapterNumbers.length - 1] === ch.number;
+        const html = slots.find((s) => s.role === 'opening').html;
+        const route = vc.extractText(html.slice(html.indexOf('cvc-route')));
+        assert(route.includes('En este capítulo') && route.includes('Presentación') && route.includes('Síntesis'), `cap ${chapterNumber}: ${route}`);
+        eq(route.includes('Video interactivo'), ch.videoEnabled, `cap ${chapterNumber} video`);
+        eq(route.includes('Práctica calificada'), ch.activityEnabled, `cap ${chapterNumber} práctica`);
+        eq(route.includes('Repaso'), !ch.activityEnabled, `cap ${chapterNumber} repaso`);
+        eq(route.includes('Evaluación del módulo'), last && mod.examEnabled, `cap ${chapterNumber} evaluación`);
+        assert(/class="cvc-op-num"><div class="cvc-badge"/.test(html), `cap ${chapterNumber}: insignia del capítulo`);
+      }
+    }
+  });
+
   await check('sin referencias fantasma: video OFF → ningún "video"; actividad OFF → sin "actividad"/"práctica" en transiciones; ON → sí', () => {
     for (const [course, facts] of [[c2, f2], [c4, f4]]) {
       for (const { theme } of [THEMES[0], THEMES[6]]) {

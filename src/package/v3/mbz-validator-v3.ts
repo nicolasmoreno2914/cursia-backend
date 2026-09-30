@@ -117,7 +117,10 @@ function transitionTexts(html: string): string[] {
   const out: string[] = [];
   const walk = (n: HtmlNode) => {
     if (n.kind !== 'el') return;
-    if ((n.attrs.class || '').split(/\s+/).includes('cvc-transition')) {
+    // EV4b: el recorrido «En este capítulo» (cvc-route) también es navegación determinística:
+    // pasa por las mismas reglas (no promete video, práctica ni evaluación que no existan).
+    const cls = (n.attrs.class || '').split(/\s+/);
+    if (cls.includes('cvc-transition') || cls.includes('cvc-route')) {
       out.push(extractText(serialize(n)));
       return;
     }
