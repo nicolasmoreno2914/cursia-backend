@@ -447,6 +447,11 @@ const MATRIX = [
       const forum = find(/^cv3:shell:forum$/);
       return { [`${a.dir}/label.xml`]: (x) => x.replace(/contextid="\d+"/, () => `contextid="${forumCtx}"`) };
     }],
+    // EV4b: el recorrido «En este capítulo» no puede prometer un video que el capítulo no tiene.
+    ['TRANSITION_DISABLED_RESOURCE', () => {
+      const a = bacts.find((x) => x.idnumber === `cv3:ch:${noVideoCh.chapterId}:opening`);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace('En este capítulo', 'En este capítulo con video') };
+    }],
     // Edu EV3: botones de navegación mal resueltos o con cifras inventadas.
     ['TOKEN_INVALID', () => {
       const a = find(/^cv3:module_next:/);

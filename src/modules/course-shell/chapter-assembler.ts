@@ -137,7 +137,8 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   const opening = exp.movements.opening;
   const headsWithHero = Array.isArray(opening) && opening.length > 0 && (opening[0] as { type?: string }).type === 'hero';
   const head = headsWithHero ? '' : eyebrow(h, opener.kicker, s) + heading(h, 'h2', ch.title, s);
-  slots.push(label('opening', 'Apertura', injectIntoMovement(mv('opening'), head, chapterRoute(h, ch, lastOfModule && mod.examEnabled))));
+  const examNext = lastOfModule && mod.examEnabled;
+  slots.push(label('opening', 'Apertura', injectIntoMovement(mv('opening'), head, chapterRoute(h, ch, examNext))));
   // [2] Presentación (obligatoria en V2.1).
   slots.push({ kind: 'presentation' });
   // [3] Profundización.
@@ -170,7 +171,6 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   // M12: el puente del LLM ("a continuación…") solo cuando realmente sigue otro
   // capítulo; antes de un examen de módulo o al final del curso manda la
   // transición determinística (nunca dos mensajes de navegación contradictorios).
-  const examNext = lastOfModule && mod.examEnabled;
   let after = input.nextChapter && !examNext ? paras(h, exp.bridge_to_next, s) : '';
   // R14-A (I5): la transición dice primero qué repasar/reintentar y después el siguiente paso,
   // sin repetir "Con este capítulo terminas…" dos veces.

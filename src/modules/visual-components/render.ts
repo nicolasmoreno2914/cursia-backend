@@ -482,7 +482,8 @@ function badge(r: R, text: string, size: 'md' | 'lg' = 'md'): string {
   const b = surf(r.t, r.t.color.accentStrong, [r.t.color.textOnAccent]);
   const px = size === 'lg' ? 56 : 36;
   return (
-    `<div class="cvc-badge"` +
+    // La insignia del capítulo repite «Capítulo N» del kicker: oculta para lectores de pantalla.
+    `<div class="cvc-badge"${size === 'lg' ? ea(r, { 'aria-hidden': 'true' }) : ''}` +
     st(
       r,
       [
