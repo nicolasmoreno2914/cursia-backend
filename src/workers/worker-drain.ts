@@ -15,7 +15,8 @@
 //
 // #15: un error de la DB al reclamar (pool agotado, conexión caída) ya no tumba
 // el proceso (antes `throw err` → exit(1) → PM2 lo reiniciaba matando el item en
-// vuelo): se loguea y se reintenta con backoff exponencial acotado.
+// vuelo): se loguea y se reintenta con backoff exponencial acotado (base = el poll
+// del worker, mín. 1 s — 5 s con el default de 5000 ms —, duplicándose hasta 60 s).
 // ─────────────────────────────────────────────────────────────────────────────
 import { MissingSchemaBackoff } from './dynamic-worker-gate';
 
@@ -134,6 +135,7 @@ export async function runClaimLoop<T>(opts: ClaimLoopOptions<T>): Promise<void> 
   const { logger, drain } = opts;
   const active = opts.active ?? new Set<Promise<void>>();
   const schema = opts.schema ?? new MissingSchemaBackoff(logger, opts.name);
+  // Base = poll del worker (mín. 1 s; 5 s con DYNAMIC_*_POLL_MS por defecto) → 5, 10, 20, 40, 60, 60… s.
   const backoff = opts.claimBackoff ?? new ClaimErrorBackoff(Math.max(opts.pollMs, 1000));
   const concurrency = Math.max(1, Math.floor(opts.concurrency));
   while (!drain.isDraining) {
