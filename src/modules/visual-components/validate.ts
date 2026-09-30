@@ -49,6 +49,8 @@ export type VcErrorCode =
   | 'RESOURCE_MENTION'
   | 'QUANTITY_CLAIM'
   | 'DIAGRAM_SHAPE'
+  | 'PEDAGOGY_MISSING'
+  | 'TEXT_DENSE'
   | 'CHAPTER_ID';
 
 export interface VcValidationError {

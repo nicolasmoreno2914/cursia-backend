@@ -643,6 +643,8 @@ async function pureChecks() {
       [ok[3][0], JSON.stringify({ ...vdoc, videoItemKey: 'video:otro' }), 'H5P_INPUT_INVALID'],
       [ok[4][0], JSON.stringify(F.h5pPayload('questionset')), 'ACTIVITY_TYPE_MISMATCH'],
       [ok[5][0], 'sin preguntas', 'GIFT_NO_QUESTIONS'],
+      // Edu EV2: una experiencia NUEVA sin recurso visual en deepening se rechaza (el empaque no lo exige).
+      [ok[2][0], JSON.stringify((() => { const e = F.experienceFor('c1'); e.movements.deepening = e.movements.deepening.filter((c) => !['comparison', 'diagram', 'process_steps', 'timeline'].includes(c.type)); return e; })()), 'PEDAGOGY_MISSING'],
     ];
     for (const [ctx, text, code] of bad) {
       const r = V(ctx, text);
