@@ -987,7 +987,9 @@ export class CourseStructureService implements OnModuleInit {
       // Mover dentro del mismo módulo no es "move" — usar reorderChapters
       // (la resecuenciación asume origen != destino). Se calcula en JS con la
       // misma comparación de strings de siempre y se chequea en su turno.
-      const sameModule = dto.targetModuleId === sourceModuleId;
+      // UUID sin distinción de mayúsculas (ParseUUIDPipe/IsUUID aceptan mayúsculas): el mismo módulo
+      // escrito distinto no debe pasar como «otro» módulo y duplicar filas en el plan.
+      const sameModule = String(dto.targetModuleId).toLowerCase() === String(sourceModuleId).toLowerCase();
       const rows = await queryRunner.query(
         `with f as (
            select exists(select 1 from public.course_chapters where id = $3 and module_id = $2 and course_id = $1) as chapter_found,
