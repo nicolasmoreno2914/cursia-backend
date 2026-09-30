@@ -23,7 +23,7 @@ const JSZip = require('jszip');
 
 const ROOT = path.resolve(__dirname, '..');
 const SCRATCH = '/private/tmp/claude-501/-Users-nicolas-Documents-Claude-course-gen/c3707ccd-9a84-4474-8052-2f6dfeb251b1/scratchpad';
-const MOODLE_LOCAL_DIR = process.env.MOODLE_LOCAL_DIR || path.join(SCRATCH, 'moodle-local');
+const MOODLE_LOCAL_DIR = process.env.MOODLE_LOCAL_DIR || process.env.E2E_MOODLE_DIR || path.join(SCRATCH, 'moodle-local');
 const OUT_DIR = process.env.R12_OUT_DIR || path.join(MOODLE_LOCAL_DIR, 'r12-packaging-out');
 const PHP = process.env.PHP_BIN || '/opt/homebrew/opt/php@8.3/bin/php';
 const PHPINI = path.join(MOODLE_LOCAL_DIR, 'php.ini');

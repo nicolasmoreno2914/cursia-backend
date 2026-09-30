@@ -11,7 +11,8 @@ const { spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const SCRATCH = '/private/tmp/claude-501/-Users-nicolas-Documents-Claude-course-gen/c3707ccd-9a84-4474-8052-2f6dfeb251b1/scratchpad/moodle-local';
+// Moodle local: E2E_MOODLE_DIR (lo pasa el gate); la ruta de sesión queda solo como último recurso.
+const SCRATCH = process.env.E2E_MOODLE_DIR || '/private/tmp/claude-501/-Users-nicolas-Documents-Claude-course-gen/c3707ccd-9a84-4474-8052-2f6dfeb251b1/scratchpad/moodle-local';
 const PHP_BIN = process.env.PHP_BIN || '/opt/homebrew/opt/php@8.3/bin/php';
 const PHP_INI = process.env.PHP_INI || path.join(SCRATCH, 'php.ini');
 const MOODLE_CONFIG = process.env.MOODLE_CONFIG || path.join(SCRATCH, 'source', 'config.php');
