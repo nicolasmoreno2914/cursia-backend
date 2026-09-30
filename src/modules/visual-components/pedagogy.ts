@@ -91,19 +91,22 @@ export const VC_ARROW_CHAIN_MIN = 2;
 
 /**
  * Encabezado de paso que codifica una rama (texto normalizado: minúsculas, sin acentos, sin comillas
- * ni numeración inicial «2 », «3. », «4) »). Coincide:
- *  - «Sí» / «No» solos (o con punto), o seguidos de flecha, «,», «;», «(» o «:» / «-» / «–» / «—» + espacio;
- *  - «Si no…», «En caso contrario…», «De lo contrario…»;
- *  - una condición corta que termina en flecha o dos puntos: «Si responde → …», «Si respira: …».
+ * ni numeración inicial «2 », «3. », «4) »). Dos fuerzas (fix round 2):
+ *  - FUERTE (marca solo): «Sí» / «No» solos (o con punto); «Sí» / «No» + flecha o «:» / «-» / «–» / «—»
+ *    + espacio; «Si no…», «En caso contrario…», «De lo contrario…»; una condición corta que termina en
+ *    flecha o dos puntos: «Si responde → …», «Si respira: …».
+ *  - DÉBIL: «Sí,» «No,» «Sí;» «No;» «Sí (» «No (». Es también una advertencia o confirmación normal
+ *    («No, nunca la muevas», «Sí, siempre»): cuenta SOLO si la misma secuencia tiene otro encabezado
+ *    de la polaridad opuesta, o si sigue inmediatamente a una pregunta «¿…?».
  * No coinciden: «Sistema…», «Nota: …», «No-conformidad», «No olvides…» (imperativo normal),
  * «Si el equipo vibra, detén la línea» (paso con condición, sin flecha ni dos puntos).
  */
 const WORD_END = '(?![\\p{L}\\p{N}_])';
-const BRANCH_HEAD_RE = new RegExp(
+const STRONG_HEAD_RE = new RegExp(
   '^(?:' +
     [
       '(?:si|no)[.!]?$',
-      '(?:si|no)\\s*(?:→|->|⇒|[,;(]|[:\\-–—](?=\\s|$))',
+      '(?:si|no)\\s*(?:→|->|⇒|[:\\-–—](?=\\s|$))',
       `si\\s+no${WORD_END}`,
       `en\\s+caso\\s+contrario${WORD_END}`,
       `de\\s+lo\\s+contrario${WORD_END}`,
@@ -112,6 +115,15 @@ const BRANCH_HEAD_RE = new RegExp(
     ')',
   'u',
 );
+const WEAK_HEAD_RE = /^(?:si|no)\s*[,;(]/u;
+/** Polaridad de la rama: «no» para «No…», «Si no…», «En caso contrario…», «De lo contrario…». */
+const NEGATIVE_HEAD_RE = new RegExp(`^(?:no${WORD_END}|si\\s+no${WORD_END}|en\\s+caso\\s+contrario|de\\s+lo\\s+contrario)`, 'u');
+
+export interface VcBranchHead {
+  strength: 'strong' | 'weak';
+  polarity: 'yes' | 'no';
+}
+
 /** Numeración y comillas iniciales («2 Sí → …», «"Sí" → …») no esconden la rama. */
 const QUOTES_RE = /["'«»“”‘’„]/g;
 const LEAD_NUM_RE = /^\s*\d{1,2}\s*[.)\-–:]?\s+/;
@@ -136,9 +148,32 @@ export function arrowChainLength(text: string): number {
   return best;
 }
 
-/** ¿El rótulo/encabezado de un paso codifica una rama (Sí/No/Si no/En caso contrario/«Si X →»)? */
+/** Clasifica un encabezado: rama FUERTE, DÉBIL (depende de la secuencia) o null. */
+export function branchHead(text: string): VcBranchHead | null {
+  const h = headView(text);
+  const strength = STRONG_HEAD_RE.test(h) ? 'strong' : WEAK_HEAD_RE.test(h) ? 'weak' : null;
+  return strength ? { strength, polarity: NEGATIVE_HEAD_RE.test(h) ? 'no' : 'yes' } : null;
+}
+
+/** ¿El encabezado codifica una rama por sí solo (FUERTE)? Los DÉBILES dependen de la secuencia. */
 export function isBranchHead(text: string): boolean {
-  return BRANCH_HEAD_RE.test(headView(text));
+  return branchHead(text)?.strength === 'strong';
+}
+
+/**
+ * Índices de los encabezados que codifican ramas en UNA secuencia: los FUERTES; los DÉBILES con otro
+ * encabezado de polaridad opuesta en la misma secuencia o justo después de una pregunta.
+ */
+export function branchingHeadIndexes(heads: string[]): number[] {
+  const kinds = heads.map((h) => (h ? branchHead(h) : null));
+  const isQ = heads.map((h) => !!h && isQuestionHead(h));
+  const out: number[] = [];
+  kinds.forEach((k, j) => {
+    if (!k) return;
+    if (k.strength === 'strong') out.push(j);
+    else if ((j > 0 && isQ[j - 1]) || kinds.some((o, i) => i !== j && !!o && o.polarity !== k.polarity)) out.push(j);
+  });
+  return out;
 }
 
 /** ¿El rótulo es una pregunta («¿…?»)? */
@@ -183,7 +218,8 @@ export function validateSimulatedDiagrams(doc: Pick<ChapterExperience, 'movement
           const h = it && typeof it === 'object' ? (it as Record<string, unknown>)[seq.field] : undefined;
           return typeof h === 'string' ? h : '';
         });
-        const branchAt = heads.map((h) => !!h && isBranchHead(h));
+        const flagged = new Set(branchingHeadIndexes(heads));
+        const branchAt = heads.map((_h, j) => flagged.has(j));
         heads.forEach((h, j) => {
           if (branchAt[j]) {
             errors.push({

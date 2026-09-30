@@ -68,7 +68,26 @@ const components = F.loadComponents();
 const LEVELS = [undefined, 'enhanced'];
 
 // Fix round 1 (I1): mismos vectores en el harness del frontend (test-45-v3-items.mjs).
-const VC_BRANCH_POSITIVES = ['Sí', 'No', 'No.', 'Sí, está consciente', 'No, llama al 131', 'No; espera la señal', 'Sí (consciente)', 'Si responde → consciente', 'Si respira: posición lateral', '2 Sí → Consciente', '3. No → Inconsciente', '«Sí» → x', '"No": detén la máquina', 'Si no hay pulso, inicia RCP'];
+// Fix round 2: FUERTES marcan solos; DÉBILES («Sí,» «No;» «Sí (») solo en pareja de polaridad opuesta o tras «¿…?».
+const VC_BRANCH_POSITIVES = ['Sí', 'No', 'No.', 'Si responde → consciente', 'Si respira: posición lateral', '2 Sí → Consciente', '3. No → Inconsciente', '«Sí» → x', '"No": detén la máquina', 'Si no hay pulso, inicia RCP', 'No: pero primero verifica'];
+const VC_BRANCH_WEAK = ['Sí, está consciente', 'No, llama al 123', 'No; espera la señal', 'Sí (consciente)', 'No, nunca la muevas', 'Sí, siempre', 'No, no uses agua en un incendio eléctrico', 'Sí; continúa con el protocolo', 'Si, siempre usa casco', 'Sí, aplica presión constante', 'No, jamás dejes la máquina encendida'];
+/** Secuencias realistas: [encabezados, índices esperados]. */
+const VC_BRANCH_SEQ_CASES = [
+  // una advertencia DÉBIL sola dentro de un procedimiento normal: nada
+  [['Asegura la escena', 'Evalúa la respuesta', 'No, nunca la muevas', 'Llama a emergencias', 'Mantén la vigilancia'], []],
+  [['Revisa el EPP', 'Sí, siempre', 'Colócate el arnés', 'Verifica el anclaje'], []],
+  [['Corta la energía', 'No, no uses agua en un incendio eléctrico', 'Usa un extintor de CO2', 'Evacúa el área', 'Informa al supervisor'], []],
+  [['Confirma el diagnóstico', 'Sí; continúa con el protocolo', 'Registra la atención', 'Deriva si corresponde'], []],
+  [['Ingresa a la obra', 'Si, siempre usa casco', 'Revisa el andamio', 'Firma el permiso'], []],
+  [['Sí, aplica presión constante', 'Eleva la extremidad', 'Sí, revisa el pulso distal', 'Pide ayuda'], []],
+  // pareja de polaridad opuesta: ambas cuentan
+  [['Evalúa la respuesta', 'Sí, está consciente', 'No, llama al 123', 'Vigila la respiración'], [1, 2]],
+  // DÉBIL justo después de una pregunta
+  [['¿Responde?', 'Sí, está consciente', 'Colócala de lado'], [1]],
+  // FUERTE solo
+  [['Evalúa', 'Sí → Consciente', 'Actúa'], [1]],
+];
+const VC_BRANCH_SEQUENCES = VC_BRANCH_SEQ_CASES.map(([h]) => h);
 const VC_BRANCH_NEGATIVES = ['Sistema de bloqueo', 'Silencio operativo', 'Nota: revisa el tablero', 'No-conformidades del lote', 'Normas vigentes', 'Si el equipo vibra, detén la línea', 'Señales de alerta', 'No olvides el casco', 'No toques el tablero energizado', 'No uses agua en un fuego eléctrico', 'Nunca trabajes solo', 'Si bien es simple, requiere práctica', 'Sin tensión: verifica'];
 
 // ─── Validador ──────────────────────────────────────────────────────────────
@@ -105,9 +124,13 @@ check('espejo del frontend (44): DYN_VC_COMPONENT_SPECS, nodos por diagrama y ti
   if (vc.VC_PEDAGOGY) assert(JSON.stringify(canon(ctx.__ped)) === JSON.stringify(canon(vc.VC_PEDAGOGY)), `VC_PEDAGOGY: FE ${JSON.stringify(ctx.__ped)} ≠ BE ${JSON.stringify(vc.VC_PEDAGOGY)}`);
   // Fix round 1: lints anti-simulación del ejecutor (45) idénticos al backend sobre los vectores compartidos.
   const f45 = path.join(FE, 'src/js/45-dynamic-generation-executor.js');
-  vm.runInContext(fs.readFileSync(f45, 'utf8') + '\n;this.__br = dynIsBranchHead; this.__q = dynIsQuestionHead; this.__ar = dynArrowChainLength; this.__sim = dynValidateSimulatedDiagramsV3;', ctx);
-  for (const t of [...VC_BRANCH_POSITIVES, ...VC_BRANCH_NEGATIVES, '¿Responde?', '1. ¿Respira?', 'Calor → dilatación\nFrío → contracción', 'a → b → c', 'x -> y ⇒ z']) {
+  vm.runInContext(fs.readFileSync(f45, 'utf8') + '\n;this.__br = dynIsBranchHead; this.__q = dynIsQuestionHead; this.__ar = dynArrowChainLength; this.__sim = dynValidateSimulatedDiagramsV3; this.__bk = dynBranchHead; this.__bi = dynBranchingHeadIndexes;', ctx);
+  for (const t of [...VC_BRANCH_POSITIVES, ...VC_BRANCH_WEAK, ...VC_BRANCH_NEGATIVES, '¿Responde?', '1. ¿Respira?', 'Calor → dilatación\nFrío → contracción', 'a → b → c', 'x -> y ⇒ z']) {
     assert(ctx.__br(t) === vc.isBranchHead(t) && ctx.__q(t) === vc.isQuestionHead(t) && ctx.__ar(t) === vc.arrowChainLength(t), `lint FE ≠ BE en "${t}"`);
+    assert(JSON.stringify(JSON.parse(JSON.stringify(ctx.__bk(t)))) === JSON.stringify(vc.branchHead(t)), `branchHead FE ≠ BE en "${t}"`);
+  }
+  for (const seq of VC_BRANCH_SEQUENCES) {
+    assert(JSON.stringify(Array.from(ctx.__bi(seq))) === JSON.stringify(vc.branchingHeadIndexes(seq)), `branchingHeadIndexes FE ≠ BE en ${JSON.stringify(seq)}`);
   }
   const simDoc = F.buildExperience();
   simDoc.movements.deepening[1] = { type: 'diagram', kind: 'flow', title: 'V', nodes: ['¿Responde?', 'Sí', 'Consciente', 'No, llama', 'Inconsciente'].map((label) => ({ label })) };
@@ -333,6 +356,24 @@ check('EV6: validateSimulatedDiagrams — DIAGRAM_BRANCHING_IN_SEQUENCE y TEXT_S
   assert(bc.length === 3, 'solo pregunta + ramas: ' + JSON.stringify(bc));
   const qOnly = { type: 'process_steps', steps: [{ heading: '¿Qué riesgo ves?', body: 'a' }, { heading: 'Evalúa el riesgo', body: 'b' }, { heading: 'Controla', body: 'c' }] };
   assert(codesAt(doc(qOnly)).length === 0, 'una pregunta sin ramas no es un árbol');
+  // Fix round 2: DÉBILES — nunca solos; sí en pareja de polaridad opuesta o tras una pregunta
+  for (const head of VC_BRANCH_WEAK) {
+    assert(!vc.isBranchHead(head) && vc.branchHead(head).strength === 'weak', `débil "${head}"`);
+    const alone = { type: 'process_steps', steps: [{ heading: 'Asegura la escena', body: 'a' }, { heading: head, body: 'b' }, { heading: 'Llama a emergencias', body: 'c' }, { heading: 'Mantén la vigilancia', body: 'd' }] };
+    assert(codesAt(doc(alone)).length === 0, `débil solo en un procedimiento "${head}": ${JSON.stringify(codesAt(doc(alone)))}`);
+    const afterQ = { type: 'diagram', kind: 'flow', title: 'V', nodes: [{ label: '¿Responde?' }, { label: head }, { label: 'Actúa' }] };
+    const aq = codesAt(doc(afterQ));
+    assert(aq.includes('DIAGRAM_BRANCHING_IN_SEQUENCE $.movements.deepening[1].nodes[1].label') && aq.includes('DIAGRAM_BRANCHING_IN_SEQUENCE $.movements.deepening[1].nodes[0].label'), `débil tras pregunta "${head}": ${JSON.stringify(aq)}`);
+  }
+  for (const [heads, want] of VC_BRANCH_SEQ_CASES) {
+    assert(JSON.stringify(vc.branchingHeadIndexes(heads)) === JSON.stringify(want), `${JSON.stringify(heads)} → ${JSON.stringify(vc.branchingHeadIndexes(heads))}, esperado ${JSON.stringify(want)}`);
+    const c = { type: 'process_steps', steps: heads.map((heading) => ({ heading, body: 'Detalle.' })) };
+    const extraQ = heads.filter((h, i) => vc.isQuestionHead(h) && want.some((k) => k > i)).length; // la pregunta que anuncia ramas también se marca
+    assert(codesAt(doc(c)).length === want.length + extraQ, `procedimiento ${JSON.stringify(heads)}: ${JSON.stringify(codesAt(doc(c)))}`);
+  }
+  const paired = { type: 'diagram', kind: 'flow', title: 'Valoración', nodes: ['Evalúa la respuesta', 'Sí, está consciente', 'No, llama al 123', 'Vigila la respiración'].map((label) => ({ label })) };
+  const pc = codesAt(doc(paired));
+  assert(pc.length === 2 && pc.includes('DIAGRAM_BRANCHING_IN_SEQUENCE $.movements.deepening[1].nodes[1].label') && pc.includes('DIAGRAM_BRANCHING_IN_SEQUENCE $.movements.deepening[1].nodes[2].label'), 'pareja «Sí, …» + «No, …»: ' + JSON.stringify(pc));
   for (const head of VC_BRANCH_NEGATIVES) {
     const c = { type: 'process_steps', steps: [{ heading: head, body: 'Detalle.' }, { heading: 'Otro paso', body: 'Detalle.' }, { heading: 'Cierre', body: 'Detalle.' }] };
     assert(codesAt(doc(c)).length === 0, `falso positivo "${head}": ${JSON.stringify(codesAt(doc(c)))}`);
