@@ -117,9 +117,24 @@ export class CourseStructureService implements OnModuleInit {
     ownerId: string,
     expectedCounter: number,
   ): Promise<number> {
+    return (await this.lockAndVerifyEx(queryRunner, courseId, ownerId, expectedCounter)).counter;
+  }
+
+  /**
+   * R16 (rendimiento del editor): igual que lockAndVerify, y además informa si
+   * el curso tiene Blueprint vigente (misma sentencia, sin ida y vuelta extra)
+   * para que las mutaciones estructurales sepan si hace falta calcular
+   * `liveMatchesCurrentBlueprint` antes de responder.
+   */
+  private async lockAndVerifyEx(
+    queryRunner: QueryRunner,
+    courseId: number,
+    ownerId: string,
+    expectedCounter: number,
+  ): Promise<{ counter: number; hasBlueprint: boolean }> {
     const allowUnowned = process.env.ALLOW_UNOWNED_COURSES === 'true';
     const rows = await queryRunner.query(
-      `select structure_version, structure_version_counter
+      `select structure_version, structure_version_counter, current_blueprint_id
        from public.courses
        where id = $1 and (owner_id = $2 OR ($3 = true AND owner_id IS NULL))
        for update`,
@@ -144,7 +159,24 @@ export class CourseStructureService implements OnModuleInit {
         currentCounter: actualCounter,
       });
     }
-    return actualCounter;
+    return { counter: actualCounter, hasBlueprint: rows[0].current_blueprint_id != null };
+  }
+
+  /**
+   * R16: `liveMatchesCurrentBlueprint` tras una mutación estructural, leído en
+   * la MISMA transacción (ve la mutación antes del COMMIT). Sin Blueprint
+   * vigente es `false` sin consultar nada (igual que el GET). Así el editor
+   * no necesita un GET completo para saber si la estructura volvió a
+   * coincidir con la versión confirmada.
+   */
+  private async liveMatchesAfterMutation(
+    queryRunner: QueryRunner,
+    courseId: number,
+    ownerId: string,
+    hasBlueprint: boolean,
+  ): Promise<boolean> {
+    if (!hasBlueprint) return false;
+    return (await this.readStructure(queryRunner, courseId, ownerId)).liveMatchesCurrentBlueprint;
   }
 
   private async bumpCounter(queryRunner: QueryRunner, courseId: number): Promise<number> {
@@ -165,7 +197,19 @@ export class CourseStructureService implements OnModuleInit {
   async getStructure(courseId: number, ownerId: string) {
     // V2.1 fix round 1 (I5): sin la migración R3 → 503 schema_not_migrated_v21 (nunca un 500 crudo).
     await assertV21StructureSchema(this.dataSource);
+    return this.readStructure(this.dataSource, courseId, ownerId);
+  }
 
+  /**
+   * Lectura completa de la estructura (la forma del GET). `exec` es el
+   * DataSource (GET) o el queryRunner de una mutación (R16: ve la mutación
+   * aún sin commit).
+   */
+  private async readStructure(
+    exec: { query(sql: string, params?: any[]): Promise<any> },
+    courseId: number,
+    ownerId: string,
+  ) {
     // Task 4 (rendimiento del editor): ownership + curso + toggles V2.1 + counter + Blueprint
     // vigente + módulos/capítulos en UNA sola sentencia. Antes eran ~9 idas y vueltas a la base
     // (findOne con join a course_versions, BEGIN REPEATABLE READ, counter, módulos, toggles,
@@ -173,7 +217,7 @@ export class CourseStructureService implements OnModuleInit {
     // snapshot, así que se conserva la garantía de review G2 M10 (toggles y counter del mismo
     // estado) sin transacción explícita. Mismo filtro de ownership que CoursesService.findOne.
     const allowUnowned = process.env.ALLOW_UNOWNED_COURSES === 'true';
-    const rows = await this.dataSource.query(
+    const rows = await exec.query(
       `select c.id, c.title, c.structure_version, c.structure_version_counter,
               c.final_exam_enabled, c.activity_engine,
               b.id as bp_id, b.blueprint_number as bp_number, b.locked_at as bp_locked_at,
@@ -525,29 +569,43 @@ export class CourseStructureService implements OnModuleInit {
     try {
       await queryRunner.connect();
       await queryRunner.startTransaction();
-      await this.lockAndVerify(queryRunner, courseId, ownerId, expectedCounter);
+      const lock = await this.lockAndVerifyEx(queryRunner, courseId, ownerId, expectedCounter);
 
-      const countRows = await queryRunner.query(
-        `select count(*)::int as n from public.course_modules where course_id = $1`,
-        [courseId],
+      // R16: conteo + DELETE + counter en una sentencia (antes 3 idas y vueltas).
+      // Misma precedencia: último módulo → 400 antes que inexistente → 404.
+      // Las posiciones del resto NO se resecuencian (igual que antes).
+      const rows = await queryRunner.query(
+        `with n as (
+           select count(*)::int as n from public.course_modules where course_id = $1
+         ),
+         d as (
+           delete from public.course_modules m using n
+            where n.n > 1 and m.id = $2 and m.course_id = $1
+           returning m.id
+         ),
+         c as (
+           update public.courses co
+              set structure_version_counter = co.structure_version_counter + 1
+            where co.id = $1 and exists (select 1 from d)
+           returning co.structure_version_counter
+         )
+         select n.n, (select count(*)::int from d) as deleted, (select structure_version_counter from c) as counter from n`,
+        [courseId, moduleId],
       );
-      if (countRows[0].n <= 1) {
+      const r = rows[0];
+      if (Number(r.n) <= 1) {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException('No se puede eliminar el último módulo del curso.');
       }
-
-      const deleted = returningRows(await queryRunner.query(
-        `delete from public.course_modules where id = $1 and course_id = $2 returning id`,
-        [moduleId, courseId],
-      ));
-      if (deleted.length === 0) {
+      if (Number(r.deleted) === 0) {
         await queryRunner.rollbackTransaction();
         throw new NotFoundException(`Module ${moduleId} not found in course #${courseId}`);
       }
 
-      const newCounter = await this.bumpCounter(queryRunner, courseId);
+      const newCounter = this.counterOrThrow(r.counter, courseId);
+      const liveMatchesCurrentBlueprint = await this.liveMatchesAfterMutation(queryRunner, courseId, ownerId, lock.hasBlueprint);
       await queryRunner.commitTransaction();
-      return { structureVersionCounter: newCounter };
+      return { structureVersionCounter: newCounter, deletedModuleId: moduleId, liveMatchesCurrentBlueprint };
     } catch (err) {
       if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
       throw err;
@@ -658,29 +716,41 @@ export class CourseStructureService implements OnModuleInit {
     try {
       await queryRunner.connect();
       await queryRunner.startTransaction();
-      await this.lockAndVerify(queryRunner, courseId, ownerId, expectedCounter);
+      const lock = await this.lockAndVerifyEx(queryRunner, courseId, ownerId, expectedCounter);
 
-      const countRows = await queryRunner.query(
-        `select count(*)::int as n from public.course_chapters where module_id = $1`,
-        [moduleId],
+      // R16: conteo + DELETE + counter en una sentencia (ver deleteModule).
+      const rows = await queryRunner.query(
+        `with n as (
+           select count(*)::int as n from public.course_chapters where module_id = $2
+         ),
+         d as (
+           delete from public.course_chapters ch using n
+            where n.n > 1 and ch.id = $3 and ch.module_id = $2 and ch.course_id = $1
+           returning ch.id
+         ),
+         c as (
+           update public.courses co
+              set structure_version_counter = co.structure_version_counter + 1
+            where co.id = $1 and exists (select 1 from d)
+           returning co.structure_version_counter
+         )
+         select n.n, (select count(*)::int from d) as deleted, (select structure_version_counter from c) as counter from n`,
+        [courseId, moduleId, chapterId],
       );
-      if (countRows[0].n <= 1) {
+      const r = rows[0];
+      if (Number(r.n) <= 1) {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException('No se puede eliminar el último capítulo del módulo.');
       }
-
-      const deleted = returningRows(await queryRunner.query(
-        `delete from public.course_chapters where id = $1 and module_id = $2 and course_id = $3 returning id`,
-        [chapterId, moduleId, courseId],
-      ));
-      if (deleted.length === 0) {
+      if (Number(r.deleted) === 0) {
         await queryRunner.rollbackTransaction();
         throw new NotFoundException(`Chapter ${chapterId} not found in module ${moduleId}`);
       }
 
-      const newCounter = await this.bumpCounter(queryRunner, courseId);
+      const newCounter = this.counterOrThrow(r.counter, courseId);
+      const liveMatchesCurrentBlueprint = await this.liveMatchesAfterMutation(queryRunner, courseId, ownerId, lock.hasBlueprint);
       await queryRunner.commitTransaction();
-      return { structureVersionCounter: newCounter };
+      return { structureVersionCounter: newCounter, deletedChapterId: chapterId, moduleId, liveMatchesCurrentBlueprint };
     } catch (err) {
       if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
       throw err;
@@ -689,37 +759,75 @@ export class CourseStructureService implements OnModuleInit {
     }
   }
 
+  /**
+   * R16 (rendimiento del editor): el reorden es UNA sentencia (unnest … with
+   * ordinality) con la validación del set de ids y el +1 del counter dentro
+   * del mismo statement — antes era un UPDATE por fila en un loop + select +
+   * bump (5+N idas y vueltas → 4). Los unique (course_id, position) /
+   * (module_id, position) son `deferrable initially deferred`
+   * (supabase-migration-dynamic-course-structure.sql), así que los choques
+   * intermedios de posiciones no importan. La validación es la misma de
+   * antes: el multiconjunto de ids pedido == los ids existentes (comparados
+   * como texto, igual que el JSON.stringify de las listas ordenadas).
+   *
+   * Respuesta: además del counter (lo único que había), las filas cambiadas
+   * `modules: [{id, position}]` y `liveMatchesCurrentBlueprint`, para que el
+   * editor aplique el cambio sin volver a pedir la estructura.
+   */
   async reorderModules(courseId: number, ownerId: string, dto: ReorderDto) {
     assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();
       await queryRunner.startTransaction();
-      await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
+      const lock = await this.lockAndVerifyEx(queryRunner, courseId, ownerId, dto.expectedCounter);
 
-      const existingRows = await queryRunner.query(
-        `select id from public.course_modules where course_id = $1`,
-        [courseId],
+      const order: string[] = Array.isArray(dto.order) ? dto.order.map((x) => String(x)) : [];
+      const rows = await queryRunner.query(
+        `with req as (
+           select r.id, r.ord from unnest($2::text[]) with ordinality as r(id, ord)
+         ),
+         chk as (
+           select (select count(*) from public.course_modules where course_id = $1) = $3::int
+              and (select count(distinct id) from req) = $3::int
+              and (select count(*) from public.course_modules m join req on m.id::text = req.id where m.course_id = $1) = $3::int
+              as ok
+         ),
+         u as (
+           update public.course_modules m
+              set position = (req.ord - 1)::int, updated_at = now()
+             from req, chk
+            where chk.ok and m.id::text = req.id and m.course_id = $1
+           returning m.id, m.position
+         ),
+         c as (
+           update public.courses co
+              set structure_version_counter = co.structure_version_counter + 1
+             from chk
+            where chk.ok and co.id = $1
+           returning co.structure_version_counter
+         )
+         select chk.ok,
+                (select structure_version_counter from c) as counter,
+                coalesce((select json_agg(json_build_object('id', u.id, 'position', u.position) order by u.position) from u), '[]'::json) as rows
+           from chk`,
+        [courseId, order, order.length],
       );
-      const existingIds = existingRows.map((r: any) => r.id).sort();
-      const requestedIds = [...dto.order].sort();
-      if (JSON.stringify(existingIds) !== JSON.stringify(requestedIds)) {
+      const r = rows[0];
+      if (!r || r.ok !== true) {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException(
           'El set de ids en "order" no coincide exactamente con los módulos existentes del curso.',
         );
       }
-
-      for (let position = 0; position < dto.order.length; position++) {
-        await queryRunner.query(
-          `update public.course_modules set position = $1, updated_at = now() where id = $2 and course_id = $3`,
-          [position, dto.order[position], courseId],
-        );
-      }
-
-      const newCounter = await this.bumpCounter(queryRunner, courseId);
+      const newCounter = this.counterOrThrow(r.counter, courseId);
+      const liveMatchesCurrentBlueprint = await this.liveMatchesAfterMutation(queryRunner, courseId, ownerId, lock.hasBlueprint);
       await queryRunner.commitTransaction();
-      return { structureVersionCounter: newCounter };
+      return {
+        structureVersionCounter: newCounter,
+        modules: this.jsonRows(r.rows).map((m: any) => ({ id: m.id as string, position: Number(m.position) })),
+        liveMatchesCurrentBlueprint,
+      };
     } catch (err) {
       if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
       throw err;
@@ -734,40 +842,66 @@ export class CourseStructureService implements OnModuleInit {
     try {
       await queryRunner.connect();
       await queryRunner.startTransaction();
-      await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
+      const lock = await this.lockAndVerifyEx(queryRunner, courseId, ownerId, dto.expectedCounter);
 
-      const moduleRows = await queryRunner.query(
-        `select id from public.course_modules where id = $1 and course_id = $2`,
-        [moduleId, courseId],
+      // R16: una sentencia (ver reorderModules). Misma precedencia de errores:
+      // módulo inexistente → 404 antes que el 400 del set de ids.
+      const order: string[] = Array.isArray(dto.order) ? dto.order.map((x) => String(x)) : [];
+      const rows = await queryRunner.query(
+        `with req as (
+           select r.id, r.ord from unnest($3::text[]) with ordinality as r(id, ord)
+         ),
+         md as (
+           select exists(select 1 from public.course_modules where id = $2 and course_id = $1) as found
+         ),
+         chk as (
+           select md.found,
+                  md.found
+                  and (select count(*) from public.course_chapters where module_id = $2) = $4::int
+                  and (select count(distinct id) from req) = $4::int
+                  and (select count(*) from public.course_chapters ch join req on ch.id::text = req.id where ch.module_id = $2) = $4::int
+                  as ok
+             from md
+         ),
+         u as (
+           update public.course_chapters ch
+              set position = (req.ord - 1)::int, updated_at = now()
+             from req, chk
+            where chk.ok and ch.id::text = req.id and ch.module_id = $2
+           returning ch.id, ch.module_id, ch.position
+         ),
+         c as (
+           update public.courses co
+              set structure_version_counter = co.structure_version_counter + 1
+             from chk
+            where chk.ok and co.id = $1
+           returning co.structure_version_counter
+         )
+         select chk.found, chk.ok,
+                (select structure_version_counter from c) as counter,
+                coalesce((select json_agg(json_build_object('id', u.id, 'moduleId', u.module_id, 'position', u.position) order by u.position) from u), '[]'::json) as rows
+           from chk`,
+        [courseId, moduleId, order, order.length],
       );
-      if (moduleRows.length === 0) {
+      const r = rows[0];
+      if (!r || r.found !== true) {
         await queryRunner.rollbackTransaction();
         throw new NotFoundException(`Module ${moduleId} not found in course #${courseId}`);
       }
-
-      const existingRows = await queryRunner.query(
-        `select id from public.course_chapters where module_id = $1`,
-        [moduleId],
-      );
-      const existingIds = existingRows.map((r: any) => r.id).sort();
-      const requestedIds = [...dto.order].sort();
-      if (JSON.stringify(existingIds) !== JSON.stringify(requestedIds)) {
+      if (r.ok !== true) {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException(
           'El set de ids en "order" no coincide exactamente con los capítulos existentes del módulo.',
         );
       }
-
-      for (let position = 0; position < dto.order.length; position++) {
-        await queryRunner.query(
-          `update public.course_chapters set position = $1, updated_at = now() where id = $2 and module_id = $3`,
-          [position, dto.order[position], moduleId],
-        );
-      }
-
-      const newCounter = await this.bumpCounter(queryRunner, courseId);
+      const newCounter = this.counterOrThrow(r.counter, courseId);
+      const liveMatchesCurrentBlueprint = await this.liveMatchesAfterMutation(queryRunner, courseId, ownerId, lock.hasBlueprint);
       await queryRunner.commitTransaction();
-      return { structureVersionCounter: newCounter };
+      return {
+        structureVersionCounter: newCounter,
+        chapters: this.jsonRows(r.rows).map((c: any) => ({ id: c.id as string, moduleId: c.moduleId as string, position: Number(c.position) })),
+        liveMatchesCurrentBlueprint,
+      };
     } catch (err) {
       if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
       throw err;
@@ -776,97 +910,125 @@ export class CourseStructureService implements OnModuleInit {
     }
   }
 
+  /**
+   * R16: el move es UNA sentencia. Calcula el plan completo (módulo origen
+   * resecuenciado sin el capítulo, destino con el capítulo insertado en
+   * min(targetPosition, T)) con row_number() sobre el orden actual y lo
+   * aplica con un solo UPDATE … FROM (el cambio de module_id va en el mismo
+   * statement), más el +1 del counter. Antes: 10+S+T idas y vueltas → 4.
+   * Mismas validaciones y en el mismo orden: capítulo inexistente en el
+   * origen → 404; destino inexistente/de otro curso → 400; destino == origen
+   * → 400; último capítulo del origen → 400. Como antes, el move no toca
+   * `updated_at`.
+   */
   async moveChapter(courseId: number, sourceModuleId: string, chapterId: string, ownerId: string, dto: MoveChapterDto) {
     assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();
       await queryRunner.startTransaction();
-      await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
+      const lock = await this.lockAndVerifyEx(queryRunner, courseId, ownerId, dto.expectedCounter);
 
-      // El capítulo debe existir en el módulo origen indicado.
-      const chapterRows = await queryRunner.query(
-        `select id from public.course_chapters where id = $1 and module_id = $2 and course_id = $3`,
-        [chapterId, sourceModuleId, courseId],
+      // Mover dentro del mismo módulo no es "move" — usar reorderChapters
+      // (la resecuenciación asume origen != destino). Se calcula en JS con la
+      // misma comparación de strings de siempre y se chequea en su turno.
+      const sameModule = dto.targetModuleId === sourceModuleId;
+      const rows = await queryRunner.query(
+        `with f as (
+           select exists(select 1 from public.course_chapters where id = $3 and module_id = $2 and course_id = $1) as chapter_found,
+                  exists(select 1 from public.course_modules where id = $4 and course_id = $1) as target_found,
+                  (select count(*)::int from public.course_chapters where module_id = $2) as source_count
+         ),
+         ok as (
+           select (f.chapter_found and f.target_found and not $6::boolean and f.source_count > 1) as ok from f
+         ),
+         src as (
+           select id, (row_number() over (order by position asc) - 1)::int as pos
+             from public.course_chapters where module_id = $2 and id <> $3
+         ),
+         tgt as (
+           select id, (row_number() over (order by position asc) - 1)::int as r
+             from public.course_chapters where module_id = $4
+         ),
+         clamp as (
+           select least($5::int, (select count(*)::int from tgt)) as p
+         ),
+         plan as (
+           select src.id, src.pos, $2::uuid as module_id from src
+           union all
+           select tgt.id, case when tgt.r < clamp.p then tgt.r else tgt.r + 1 end, $4::uuid from tgt, clamp
+           union all
+           select $3::uuid, clamp.p, $4::uuid from clamp
+         ),
+         u as (
+           update public.course_chapters ch
+              set position = plan.pos, module_id = plan.module_id
+             from plan, ok
+            where ok.ok and ch.id = plan.id
+           returning ch.id, ch.module_id, ch.position
+         ),
+         c as (
+           update public.courses co
+              set structure_version_counter = co.structure_version_counter + 1
+             from ok
+            where ok.ok and co.id = $1
+           returning co.structure_version_counter
+         )
+         select f.chapter_found, f.target_found, f.source_count, ok.ok,
+                (select structure_version_counter from c) as counter,
+                coalesce((select json_agg(json_build_object('id', u.id, 'moduleId', u.module_id, 'position', u.position) order by u.module_id, u.position) from u), '[]'::json) as rows
+           from f, ok`,
+        [courseId, sourceModuleId, chapterId, dto.targetModuleId, dto.targetPosition, sameModule],
       );
-      if (chapterRows.length === 0) {
+      const r = rows[0];
+      if (!r || r.chapter_found !== true) {
         await queryRunner.rollbackTransaction();
         throw new NotFoundException(`Chapter ${chapterId} not found in module ${sourceModuleId}`);
       }
-
-      // El módulo destino debe ser del MISMO curso.
-      const targetModuleRows = await queryRunner.query(
-        `select id from public.course_modules where id = $1 and course_id = $2`,
-        [dto.targetModuleId, courseId],
-      );
-      if (targetModuleRows.length === 0) {
+      if (r.target_found !== true) {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException('El módulo destino no existe o no pertenece a este curso.');
       }
-
-      // Mover dentro del mismo módulo no es "move" — usar reorderChapters,
-      // porque la resecuenciación de abajo asume origen != destino (si no,
-      // se contaría el capítulo movido dos veces).
-      if (dto.targetModuleId === sourceModuleId) {
+      if (sameModule) {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException(
           'El módulo destino es igual al origen — usar reorder para mover dentro del mismo módulo.',
         );
       }
-
-      // Nunca dejar el módulo origen con 0 capítulos.
-      const sourceCountRows = await queryRunner.query(
-        `select count(*)::int as n from public.course_chapters where module_id = $1`,
-        [sourceModuleId],
-      );
-      if (sourceCountRows[0].n <= 1) {
+      if (Number(r.source_count) <= 1) {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException('No se puede mover el último capítulo del módulo origen.');
       }
+      if (r.ok !== true) throw new Error(`moveChapter: el plan no se aplicó en el curso #${courseId}`);
 
-      // Resequenciar el módulo origen (sin el capítulo movido), por orden actual.
-      const remainingSource = await queryRunner.query(
-        `select id from public.course_chapters where module_id = $1 and id != $2 order by position asc`,
-        [sourceModuleId, chapterId],
-      );
-      for (let i = 0; i < remainingSource.length; i++) {
-        await queryRunner.query(
-          `update public.course_chapters set position = $1 where id = $2`,
-          [i, remainingSource[i].id],
-        );
-      }
-
-      // Insertar el capítulo movido en targetPosition dentro del destino,
-      // desplazando lo que ya estaba desde esa posición en adelante.
-      const targetExisting = await queryRunner.query(
-        `select id from public.course_chapters where module_id = $1 order by position asc`,
-        [dto.targetModuleId],
-      );
-      const clampedPosition = Math.min(dto.targetPosition, targetExisting.length);
-      const finalOrder = [...targetExisting.map((r: any) => r.id)];
-      finalOrder.splice(clampedPosition, 0, chapterId);
-
-      // Mover el capítulo de módulo primero (fuera del rango de la unique
-      // constraint del módulo origen, ya resequenciado arriba).
-      await queryRunner.query(
-        `update public.course_chapters set module_id = $1 where id = $2`,
-        [dto.targetModuleId, chapterId],
-      );
-      for (let i = 0; i < finalOrder.length; i++) {
-        await queryRunner.query(
-          `update public.course_chapters set position = $1 where id = $2`,
-          [i, finalOrder[i]],
-        );
-      }
-
-      const newCounter = await this.bumpCounter(queryRunner, courseId);
+      const newCounter = this.counterOrThrow(r.counter, courseId);
+      const liveMatchesCurrentBlueprint = await this.liveMatchesAfterMutation(queryRunner, courseId, ownerId, lock.hasBlueprint);
       await queryRunner.commitTransaction();
-      return { structureVersionCounter: newCounter };
+      return {
+        structureVersionCounter: newCounter,
+        chapters: this.jsonRows(r.rows).map((c: any) => ({ id: c.id as string, moduleId: c.moduleId as string, position: Number(c.position) })),
+        liveMatchesCurrentBlueprint,
+      };
     } catch (err) {
       if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
       throw err;
     } finally {
       await queryRunner.release();
     }
+  }
+
+  /** Counter devuelto por un UPDATE plegado en una sentencia; nunca un 200 sin counter (ver bumpCounter). */
+  private counterOrThrow(v: unknown, courseId: number): number {
+    const n = typeof v === 'string' ? Number(v) : v;
+    if (typeof n !== 'number' || !Number.isInteger(n)) {
+      throw new Error(`bumpCounter: no se pudo leer structure_version_counter del curso #${courseId}`);
+    }
+    return n;
+  }
+
+  /** json/json_agg del driver: objeto ya parseado o string (según versión/driver). */
+  private jsonRows(v: unknown): any[] {
+    const parsed = typeof v === 'string' ? JSON.parse(v) : v;
+    return Array.isArray(parsed) ? parsed : [];
   }
 }
