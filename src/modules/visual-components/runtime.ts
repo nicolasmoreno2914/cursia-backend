@@ -116,7 +116,7 @@ export function scopedStyle(uid: string, theme: ResolvedTheme): string {
     `${S} .cvc-dg-matrix table{table-layout:fixed}`,
     `${S} .cvc-we-result{margin-bottom:0!important}`,
     // apertura de capítulo
-    `${S} .cvc-op-num .cvc-num{margin:0!important}`,
+    `${S} .cvc-op-num .cvc-num,${S} .cvc-op-num .cvc-badge{margin:0!important}`,
     // comparación: tabla completa construida por el runtime
     `${S} .cvc-scroll{overflow-x:auto;max-width:100%}`,
     `${S} .cvc-cmp-full table{border-collapse:collapse;width:100%;min-width:34rem}`,

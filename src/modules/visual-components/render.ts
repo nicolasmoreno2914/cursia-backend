@@ -478,21 +478,22 @@ function tile(r: R, inner: string, s: Surf, opts: { cls?: string; tag?: 'div' | 
 }
 
 /** Edu EV4 — insignia numerada (paso): cifra clara sobre el acento, no un numeral gigante. */
-function badge(r: R, text: string): string {
+function badge(r: R, text: string, size: 'md' | 'lg' = 'md'): string {
   const b = surf(r.t, r.t.color.accentStrong, [r.t.color.textOnAccent]);
+  const px = size === 'lg' ? 56 : 36;
   return (
     `<div class="cvc-badge"` +
     st(
       r,
       [
-        ['width', '36px'],
+        ['width', `${px}px`],
         ['margin', '0 0 8px 0'],
         ['background-color', b.bg],
         ['color', b.fg],
         ['font-family', r.t.personality.fontNumeral],
-        ['font-size', r.t.typography.sizeSmallPx],
+        ['font-size', size === 'lg' ? r.t.typography.sizeH3Px : r.t.typography.sizeSmallPx],
         ['font-weight', '700'],
-        ['line-height', '36px'],
+        ['line-height', `${px}px`],
         ['text-align', 'center'],
       ],
       [['border-radius', '50%'], ['font-variant-numeric', 'tabular-nums lining-nums']],
@@ -583,7 +584,8 @@ function renderHero(r: R, c: VcHero): string {
   } else {
     main = heading(r, 'h4', c.title, s, 'display') + accentRule(r, s) + paragraphs(r, c.lead, s, { role: 'lead', last: true });
   }
-  const num = op && op.numeral ? `<div class="cvc-op-num">${numeral(r, op.numeral, s, 'xl')}</div>` : '';
+  // EV4b: el número del capítulo es una insignia (mismo lenguaje que los pasos), no un numeral de revista.
+  const num = op && op.numeral ? `<div class="cvc-op-num">${badge(r, op.numeral, 'lg')}</div>` : '';
   const body = `<div class="cvc-op${num ? ' cvc-op-split' : ''}"><div class="cvc-op-lead">${head}</div>${num}<div class="cvc-op-main">${main}</div></div>`;
   if (plate) {
     return componentWrap(
