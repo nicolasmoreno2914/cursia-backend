@@ -16,7 +16,8 @@ import {
   manifestSha256,
   validateGenerationManifest,
 } from './generation-manifest-builder';
-import { readManifestRulesVersionConfig } from './manifest-rules-config';
+import { readActivityTypeRulesConfig, readManifestRulesVersionConfig } from './manifest-rules-config';
+import type { ActivityTypeRulesVersion } from './activity-type-rules';
 
 export interface ManifestDto {
   id: number;
@@ -41,6 +42,29 @@ function describeErrors(errors: ManifestValidationError[]): string {
   const codes = [...new Set(errors.map((e) => e.code))].join(', ');
   const detail = errors.slice(0, 5).map((e) => `${e.code}: ${e.message}`).join('; ');
   return `[${codes}] ${detail}${errors.length > 5 ? ` (+${errors.length - 5} más)` : ''}`;
+}
+
+/**
+ * EV5-C: marcador `features.activityTypeRules` de una fila guardada (ausente =
+ * 0 = legacy/hash). Cualquier otro valor es integridad rota → 500 (nunca se
+ * interpreta como 0).
+ */
+function storedActivityTypeRules(row: any): ActivityTypeRulesVersion {
+  const stored = typeof row?.manifest_json === 'string' ? JSON.parse(row.manifest_json) : row?.manifest_json;
+  return activityTypeRulesValue(stored?.features?.activityTypeRules, row?.id);
+}
+
+/**
+ * Valor crudo del marcador (jsonb → number | null). Solo acepta el número 0/1
+ * de JS o ausente (null/undefined → 0). Un string (p.ej. "1") o cualquier otra
+ * cosa es integridad rota → 500 explícito; nunca se interpreta con JSON.parse.
+ */
+function activityTypeRulesValue(raw: unknown, id: unknown): ActivityTypeRulesVersion {
+  if (raw === undefined || raw === null) return 0;
+  if (raw === 0 || raw === 1) return raw;
+  throw new InternalServerErrorException(
+    `Generation Manifest #${String(id)}: features.activityTypeRules guardado inválido (${JSON.stringify(raw)})`,
+  );
 }
 
 function sourceOf(bp: AnyBlueprintDto): ManifestSource {
@@ -76,19 +100,28 @@ export class GenerationManifestsService {
     // es lazy: configuredRulesVersion() lanza en cada uso de las rutas dynamic
     // que dependen de la config (crear un Manifest, leer "el Manifest actual").
     // Acá solo se deja el error bien visible en el log de arranque.
-    try {
-      readManifestRulesVersionConfig();
-    } catch (err) {
-      this.logger.error(
-        `${err instanceof Error ? err.message : String(err)} — las rutas dynamic que crean/leen el Manifest ` +
-          'configurado van a fallar hasta corregirlo; el resto del backend arranca normal',
-      );
+    // Review EV5-C (7): cada config en su propio try, para que un valor inválido
+    // en una no esconda el error de la otra en el log de arranque.
+    for (const read of [readManifestRulesVersionConfig, readActivityTypeRulesConfig]) {
+      try {
+        read();
+      } catch (err) {
+        this.logger.error(
+          `${err instanceof Error ? err.message : String(err)} — las rutas dynamic que crean/leen el Manifest ` +
+            'configurado van a fallar hasta corregirlo; el resto del backend arranca normal',
+        );
+      }
     }
   }
 
   /** rulesVersion configurado (DYNAMIC_MANIFEST_RULES_VERSION, default 1); lanza si es inválido (fail loud en uso). */
   configuredRulesVersion(): ManifestRulesVersion {
     return readManifestRulesVersionConfig();
+  }
+
+  /** EV5-C: reglas de tipo de actividad para Manifests v3 NUEVOS (DYNAMIC_ACTIVITY_TYPE_RULES, default 0); lanza si es inválido. */
+  configuredActivityTypeRules(): ActivityTypeRulesVersion {
+    return readActivityTypeRulesConfig();
   }
 
   /**
@@ -105,7 +138,20 @@ export class GenerationManifestsService {
     const rulesVersion = this.configuredRulesVersion();
     const bp = await this.blueprintForRules(courseId, ownerId, blueprintNumber, rulesVersion);
     const source = sourceOf(bp);
-    const m = buildGenerationManifest(bp.snapshot, source, { rulesVersion });
+    // EV5-C: reglas de tipo de actividad (solo v3). Ruling del dueño: los
+    // cursos existentes conservan el tipo por hash PARA SIEMPRE. Por eso el
+    // marcador se hereda del Manifest v3 más reciente del CURSO (cualquier
+    // versión de Blueprint, incluida la fila de este mismo Blueprint si ya
+    // existe); solo un curso sin ningún Manifest v3 previo lee la config
+    // DYNAMIC_ACTIVITY_TYPE_RULES. Así una versión nueva del Blueprint de un
+    // curso legacy nunca adopta las reglas por objetivo (ni regenera sus
+    // actividades por activity_type_changed). La fila existente de ESTE
+    // Blueprint se verifica igual más abajo con su marcador guardado.
+    // ROLLBACK: volver DYNAMIC_ACTIVITY_TYPE_RULES a 0 solo afecta a los cursos
+    // creados DESPUÉS (su primer Manifest v3); los cursos que ya tienen un
+    // Manifest con reglas 1 las conservan en todas sus versiones siguientes.
+    const activityTypeRules: ActivityTypeRulesVersion = rulesVersion === 3 ? await this.activityTypeRulesForNewRow(courseId) : 0;
+    const m = buildGenerationManifest(bp.snapshot, source, { rulesVersion, activityTypeRules });
 
     const errors = validateGenerationManifest(m, bp.snapshot, source);
     if (errors.length > 0) {
@@ -167,11 +213,21 @@ export class GenerationManifestsService {
           'el insert chocó con el UNIQUE pero no se encontró la fila existente',
       );
     }
-    if (existing.manifest_sha256 !== sha) {
+    // EV5-C: el Manifest ya guardado conserva sus reglas de tipo de actividad
+    // (ruling: los existentes no adoptan las reglas nuevas; legacy = hash). Si la
+    // config actual difiere del marcador guardado, el determinismo se verifica
+    // reconstruyendo con el marcador guardado, nunca con la config.
+    let expectedSha = sha;
+    const storedRules = rulesVersion === 3 ? storedActivityTypeRules(existing) : 0;
+    if (storedRules !== activityTypeRules) {
+      const rebuilt = buildGenerationManifest(bp.snapshot, source, { rulesVersion, activityTypeRules: storedRules });
+      expectedSha = manifestSha256(rebuilt);
+    }
+    if (existing.manifest_sha256 !== expectedSha) {
       throw new InternalServerErrorException(
         `Generation Manifest no determinístico: el guardado #${existing.id} del Blueprint v${bp.blueprintNumber} ` +
-          `(curso #${courseId}, rulesVersion ${rulesVersion}) tiene sha256 ${existing.manifest_sha256} ` +
-          `pero el recién calculado es ${sha}`,
+          `(curso #${courseId}, rulesVersion ${rulesVersion}, activityTypeRules ${storedRules}) tiene sha256 ` +
+          `${existing.manifest_sha256} pero el recién calculado es ${expectedSha}`,
       );
     }
     return { created: false, manifest: this.toDto(existing, bp) };
@@ -235,6 +291,25 @@ export class GenerationManifestsService {
       });
     }
     return bp;
+  }
+
+  /**
+   * EV5-C: marcador para una fila v3 nueva = el del Manifest v3 más reciente
+   * del curso (`features.activityTypeRules ?? 0`); sin Manifest v3 previo →
+   * config (lanza si es inválida). Un curso con Manifests nunca lee la config.
+   */
+  private async activityTypeRulesForNewRow(courseId: number): Promise<ActivityTypeRulesVersion> {
+    // Review EV5-C (4): solo el marcador (jsonb), no el documento entero.
+    const [prev] = await this.dataSource.query(
+      `select id, manifest_json->'features'->'activityTypeRules' as activity_type_rules
+         from public.course_generation_manifests
+        where course_id = $1 and rules_version = 3
+        order by created_at desc, id desc
+        limit 1`,
+      [courseId],
+    );
+    if (!prev) return this.configuredActivityTypeRules();
+    return activityTypeRulesValue(prev.activity_type_rules, prev.id);
   }
 
   /** INSERT v3: columnas de conteo v2 + v3 (supabase-migration-v21-manifest-v3.sql); scorm_count = 0. */

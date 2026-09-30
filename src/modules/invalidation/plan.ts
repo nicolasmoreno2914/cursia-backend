@@ -66,6 +66,8 @@ export interface InvalidationManifestItem {
   chapterId?: string | null;
   /** Solo rulesVersion 3, items `activity`: motor ('h5p' | 'scorm'). */
   variant?: string | null;
+  /** EV5-C: solo activity h5p de un Manifest con activityTypeRules=1 (tipo congelado). */
+  h5pType?: string | null;
 }
 
 export interface InvalidationManifest {

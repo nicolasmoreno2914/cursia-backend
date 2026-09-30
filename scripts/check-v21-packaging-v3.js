@@ -224,6 +224,8 @@ const MATRIX = [
     for (const p of acts) {
       const chapterId = p.itemKey.slice('activity:'.length);
       eq(p.mainLibrary, LIB[SHELL.activityTypeForChapter(chapterId)], `tipo de ${p.itemKey}`);
+      // EV5-C: Manifest legacy (sin h5pType) ⇒ el resolvedor único da exactamente el hash.
+      eq(SHELL.resolveActivityType(input.manifest.items.find((i) => i.key === p.itemKey)), SHELL.activityTypeForChapter(chapterId), `resolver legacy ${p.itemKey}`);
       assert(p.mainLibrary !== 'H5P.SingleChoiceSet', 'SCS nunca calificable (R-011)');
     }
     assert(r.summary.h5pPackages.filter((p) => p.mainLibrary === 'H5P.InteractiveVideo').length === 2, 'dos IV');

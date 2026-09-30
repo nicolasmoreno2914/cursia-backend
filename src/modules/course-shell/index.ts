@@ -2,7 +2,7 @@
  * R11a — Course Shell V2.1 (audit §E, §F, §M.3, §O):
  *  - facts.ts              — buildCourseFacts, factsNumberSet, lintShellNumbers
  *  - intro-schemas.ts      — course_intro / module_intro v3 (JSON LLM) + validadores
- *  - activity-type.ts      — activityTypeForChapter (rotación), validateH5pActivityPayload
+ *  - activity-type.ts      — activityTypeForChapter (rotación), resolveActivityType (EV5-C), validateH5pActivityPayload
  *  - final-exam.ts         — validateExamGift (parseGIFT, conteo, tope 40)
  *  - v3-validation.ts      — validación server-side por tipo de item v3 + datos del video
  *  - shell.ts              — labels del shell (CLEAN_SAFE + ENHANCED)

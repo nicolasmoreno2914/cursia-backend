@@ -83,6 +83,54 @@ export function activityTypeForChapter(chapterId: string): H5pActivityType {
   return ACTIVITY_H5P_ROTATION[fnv1a32(chapterId.toLowerCase()) % ACTIVITY_H5P_ROTATION.length];
 }
 
+/** Origen del tipo de una actividad h5p: congelado en el Manifest (EV5-C) o rotación por hash. */
+export type ActivityTypeSource = 'manifest' | 'rotation';
+
+/** Forma mínima de un item de Manifest que necesita el resolvedor (ManifestItem, item de invalidación, JSON crudo). */
+export interface ActivityTypeItemLike {
+  key?: string;
+  type?: string;
+  variant?: string | null;
+  chapterId?: string | null;
+  h5pType?: string | null;
+}
+
+function chapterIdOfItem(item: ActivityTypeItemLike): string {
+  if (typeof item.chapterId === 'string' && item.chapterId) return item.chapterId;
+  const k = typeof item.key === 'string' ? item.key : '';
+  const i = k.indexOf(':');
+  return i >= 0 ? k.slice(i + 1) : '';
+}
+
+/**
+ * EV5-C — ÚNICO resolvedor del tipo H5P de un item del Manifest. Todos los
+ * consumidores (claim del scheduler, validación al completar, facts del
+ * shell → validador del .mbz, invalidación) pasan por acá:
+ *   activity variant 'h5p' → `item.h5pType` (Manifest con activityTypeRules=1)
+ *                            ?? activityTypeForChapter(chapterId) (legacy: hash);
+ *   cualquier otro item    → null.
+ * Un `h5pType` fuera de la rotación calificada lanza (integridad rota: nunca
+ * se cae en silencio al hash).
+ */
+export function resolveActivityType(item: ActivityTypeItemLike | null | undefined): H5pActivityType | null {
+  return resolveActivityTypeWithSource(item)?.type ?? null;
+}
+
+export function resolveActivityTypeWithSource(
+  item: ActivityTypeItemLike | null | undefined,
+): { type: H5pActivityType; source: ActivityTypeSource } | null {
+  if (!item) return null;
+  const type = item.type ?? (typeof item.key === 'string' ? item.key.slice(0, Math.max(0, item.key.indexOf(':'))) : undefined);
+  if (type !== 'activity' || item.variant !== 'h5p') return null;
+  if (item.h5pType !== undefined && item.h5pType !== null) {
+    if (!(ACTIVITY_H5P_ROTATION as readonly string[]).includes(item.h5pType)) {
+      throw new Error(`ACTIVITY_TYPE_INVALID_MANIFEST: h5pType ${JSON.stringify(item.h5pType)} de ${item.key ?? 'activity'} no es un tipo calificado`);
+    }
+    return { type: item.h5pType as H5pActivityType, source: 'manifest' };
+  }
+  return { type: activityTypeForChapter(chapterIdOfItem(item)), source: 'rotation' };
+}
+
 /** Campos de `data` que escribe el LLM por tipo (además, Cursia agrega itemKey y, en QS/SCS, passPercentage). */
 export const H5P_ACTIVITY_DATA_FIELDS: Readonly<Record<H5pActivityType, readonly string[]>> = Object.freeze({
   questionset: ['title', 'questions'],
@@ -111,15 +159,17 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 
 /**
  * Valida el payload h5p de `activity:<ch>`: forma `{type, data}`, tipo igual
- * al de la rotación y `data` válido para el validador estricto de R7.
- * Junta todos los errores.
+ * al esperado y `data` válido para el validador estricto de R7.
+ * `expectedType` (EV5-C) = `resolveActivityType(item del Manifest)`; sin él,
+ * la rotación por hash de siempre. Junta todos los errores.
  */
 export function validateH5pActivityPayload(
   payload: unknown,
-  expect: { chapterId: string; itemKey: string },
+  expect: { chapterId: string; itemKey: string; expectedType?: H5pActivityType | null },
 ): H5pActivityPayloadResult {
   const errors: ShellValidationError[] = [];
-  const expectedType = activityTypeForChapter(expect.chapterId);
+  const fromManifest = !!expect.expectedType;
+  const expectedType = expect.expectedType ?? activityTypeForChapter(expect.chapterId);
   if (!isPlainObject(payload)) {
     return { ok: false, errors: [{ path: '$', code: 'NOT_OBJECT', message: 'el payload debe ser un objeto {type, data}' }] };
   }
@@ -146,7 +196,7 @@ export function validateH5pActivityPayload(
     errors.push({
       path: '$.type',
       code: 'ACTIVITY_TYPE_MISMATCH',
-      message: `el capítulo ${expect.chapterId} exige "${expectedType}" (rotación), llegó "${type}"`,
+      message: `el capítulo ${expect.chapterId} exige "${expectedType}" (${fromManifest ? 'Manifest' : 'rotación'}), llegó "${type}"`,
     });
     return { ok: false, errors };
   }

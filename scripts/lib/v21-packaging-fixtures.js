@@ -68,9 +68,15 @@ function packagingInput(distRoot, o = {}) {
   const engine = o.engine || 'h5p';
   const finalExam = o.finalExam !== undefined ? o.finalExam : true;
   // F1: `o.modules` (forma de SF.buildCourse) permite cursos a medida (sin exámenes, sin práctica…).
+  // EV5-C: `o.activityTypeRules` / `o.chapterObjectives` → Manifest con h5pType por objetivo.
+  const ev5c = {
+    ...(o.activityTypeRules ? { activityTypeRules: o.activityTypeRules } : {}),
+    ...(o.chapterObjectives ? { chapterObjectives: o.chapterObjectives } : {}),
+  };
   const { snapshot, manifest } = o.modules
-    ? SF.buildCourse(distRoot, { engine, finalExam, courseId: o.courseId || 601, modules: o.modules, ...(o.chapterTitles ? { chapterTitles: o.chapterTitles } : {}) })
-    : SF.course2(distRoot, { engine, finalExam, courseId: o.courseId || 601 });
+    ? SF.buildCourse(distRoot, { engine, finalExam, courseId: o.courseId || 601, modules: o.modules, ...(o.chapterTitles ? { chapterTitles: o.chapterTitles } : {}), ...ev5c })
+    : SF.course2(distRoot, { engine, finalExam, courseId: o.courseId || 601, ...ev5c });
+  const itemByKey = new Map(manifest.items.map((i) => [i.key, i]));
   const chapters = manifest.modules.flatMap((m) => m.chapters);
   const titleOf = new Map();
   for (const m of snapshot.modules) for (const c of m.chapters) titleOf.set(c.id, c.title);
@@ -101,7 +107,8 @@ function packagingInput(distRoot, o = {}) {
     }
     if (c.activityEnabled) {
       if (engine === 'h5p') {
-        const payload = SF.h5pPayload(shell.activityTypeForChapter(c.chapterId));
+        // EV5-C: el tipo que produciría el ejecutor = resolveActivityType(item del Manifest).
+        const payload = SF.h5pPayload(shell.resolveActivityType(itemByKey.get(`activity:${c.chapterId}`)));
         payload.data.itemKey = `activity:${c.chapterId}`;
         if (payload.type === 'questionset') payload.data.passPercentage = 70; // el empaque lo reemplaza por el perfil
         activities.set(c.chapterId, { variant: 'h5p', payload });

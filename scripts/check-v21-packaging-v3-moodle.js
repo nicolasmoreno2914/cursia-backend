@@ -160,12 +160,12 @@ async function runConfig(cfg) {
       eq([s.maxgrade, s.grademethod, s.whatgrade, s.maxattempt, s.masteryoverride, s.completionstatusrequired, s.completionscorerequired, s.scoes], [100, 1, WHATGRADE[k.gradeMethod], k.attempts, 1, null, null, 2], id);
     }
     eq(Object.keys(o.scorms).length, cfg.engine === 'scorm' ? facts.counts.activities : 0, 'scorms');
-    const shellMod = require(path.join(dist, 'modules/course-shell/index.js'));
     for (const [id, h] of Object.entries(o.h5ps)) {
       const k = resolved.kinds[kindOf(id)];
       eq([h.grade, h.grademethod, h.enabletracking, h.reviewmode, h.displayoptions], [100, H5P_GM[k.gradeMethod], 1, 1, 15], id);
       assert(h.deploy.h5pid && !h.deploy.exception && h.deploy.messages.length === 0, `${id} no despliega: ${JSON.stringify(h.deploy)}`);
-      const want = kindOf(id) === 'video' ? 'H5P.InteractiveVideo 1.27' : LIB[shellMod.activityTypeForChapter(id.split(':')[2])];
+      // EV5-C: el tipo esperado sale de facts (resolveActivityType del Manifest), no del hash directo.
+      const want = kindOf(id) === 'video' ? 'H5P.InteractiveVideo 1.27' : LIB[facts.chapters.find((c) => c.id === id.split(':')[2]).activityType];
       eq(h.deploy.library, want, `librería ${id}`);
       const files = cm[id].files;
       const pkg = files.find((f) => f.area === 'package');

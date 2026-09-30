@@ -28,9 +28,11 @@ const MODULE_TITLES = ['Bases del servicio', 'Relación con el cliente', 'Gesti�
 
 /**
  * Curso: `modules` = [{ examEnabled, chapters: [{ video, activity }] }].
+ * EV5-C: `chapterObjectives` (por índice global de capítulo) y
+ * `activityTypeRules` (0 = Manifest legacy por hash, default; 1 = h5pType por objetivo).
  * Devuelve { snapshot, manifest, source, ids }.
  */
-function buildCourse(distRoot, { courseId = 501, title = 'Atención al cliente de excelencia', finalExam = true, engine = 'h5p', modules, chapterTitles = CHAPTER_TITLES, moduleTitles = MODULE_TITLES }) {
+function buildCourse(distRoot, { courseId = 501, title = 'Atención al cliente de excelencia', finalExam = true, engine = 'h5p', modules, chapterTitles = CHAPTER_TITLES, moduleTitles = MODULE_TITLES, chapterObjectives = null, activityTypeRules = 0 }) {
   const snap = loadDist(distRoot, 'modules/course-blueprints/blueprint-snapshot.js');
   const B = loadDist(distRoot, 'modules/generation-manifests/generation-manifest-builder.js');
   const mrows = [];
@@ -46,7 +48,7 @@ function buildCourse(distRoot, { courseId = 501, title = 'Atención al cliente d
         module_id: mid,
         position: k,
         title: chapterTitles[(ci - 1) % chapterTitles.length],
-        objective: null,
+        objective: chapterObjectives ? chapterObjectives[(ci - 1) % chapterObjectives.length] ?? null : null,
         video_enabled: !!c.video,
         activity_enabled: !!c.activity,
       });
@@ -54,7 +56,7 @@ function buildCourse(distRoot, { courseId = 501, title = 'Atención al cliente d
   });
   const snapshot = snap.buildBlueprintSnapshotV2({ id: courseId, title, finalExam, activityEngine: engine }, mrows, crows);
   const source = { courseId, blueprintId: courseId + 7000, blueprintNumber: 1, blueprintSha256: snap.snapshotSha256V2(snapshot) };
-  const manifest = B.buildGenerationManifestV3(snapshot, source);
+  const manifest = activityTypeRules ? B.buildGenerationManifestV3(snapshot, source, { activityTypeRules }) : B.buildGenerationManifestV3(snapshot, source);
   return { snapshot, manifest, source };
 }
 

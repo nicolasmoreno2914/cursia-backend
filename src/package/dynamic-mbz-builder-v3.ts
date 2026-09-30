@@ -109,6 +109,7 @@ import {
   validateH5pActivityPayload,
   welcomeLabel,
 } from '../modules/course-shell';
+import type { H5pActivityType } from '../modules/course-shell';
 import { PackagingPlanV3, buildPackagingPlanV3, packagingPlanV3Sha256 } from '../modules/dynamic-packaging/packaging-plan-v3';
 import { compileLibroHtmlV3, libroWordCount } from './v3/libro-v3';
 import { downscaleCoverPng } from './v3/png-downscale';
@@ -443,14 +444,20 @@ function collectMissing(plan: PackagingPlanV3, c: DynamicPackageContentsV3): str
   return missing;
 }
 
-/** Construye el `.h5p` de la actividad de un capítulo (R7) con la nota del perfil vigente. */
+/**
+ * Construye el `.h5p` de la actividad de un capítulo (R7) con la nota del perfil vigente.
+ * EV5-C: `expectedType` = facts.activityType (resolveActivityType del Manifest:
+ * h5pType congelado o, legacy, el hash del UUID).
+ */
 async function buildActivityH5p(
   payload: unknown,
   chapterId: string,
   itemKey: string,
   passingGrade: number,
+  expectedType: H5pActivityType | null,
 ): Promise<{ h5p: Buffer; mainLibrary: string }> {
-  const check = validateH5pActivityPayload(payload, { chapterId, itemKey });
+  if (!expectedType) throw new Error(`MBZ_V3_INVARIANT: facts sin tipo h5p para ${itemKey}`);
+  const check = validateH5pActivityPayload(payload, { chapterId, itemKey, expectedType });
   if (!check.ok) {
     throw new Error(`H5P_ACTIVITY_PAYLOAD_INVALID: ${itemKey}: ${check.errors.map((e) => `${e.code} ${e.path}: ${e.message}`).join('; ')}`);
   }
@@ -784,7 +791,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
         const key = ch.keys.activity as string;
         const name = safeActivityName(`Actividad práctica · Capítulo ${ch.chapterNumber}: ${ch.title}`);
         if (act.variant === 'h5p') {
-          const built = await buildActivityH5p(act.payload, ch.chapterId, key, resolved.kinds.activity.passingGrade);
+          const built = await buildActivityH5p(act.payload, ch.chapterId, key, resolved.kinds.activity.passingGrade, cf.activityType);
           const filename = activityPackageFilename(key);
           addH5pActivity(sec, `${idp}:activity`, name, 'activity', key, filename, built.h5p, built.mainLibrary, (mid) =>
             h5pActivityInlineIntroHtml({ packageFilename: filename, title: ch.title, activityMid: mid, theme: introTheme }),
