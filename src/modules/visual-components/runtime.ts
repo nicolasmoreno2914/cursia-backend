@@ -101,7 +101,6 @@ export function scopedStyle(uid: string, theme: ResolvedTheme): string {
     `${S} .cvc-cards{display:grid;gap:16px}`,
     `${S} .cvc-cards>li{margin:0!important}`,
     // Edu Phase A — diagramas (layout SOLO acá: sin <style> todo queda como lista/tabla legible)
-    `${S} .cvc-dg-list{counter-reset:none}`,
     `${S} .cvc-dg-flow .cvc-dg-step{position:relative}`,
     `${S} .cvc-dg-flow .cvc-dg-step:not(:last-child)::after{content:"\\2193";position:absolute;left:50%;bottom:-1.3em;transform:translateX(-50%);color:${c.accentStrong};font-weight:700;line-height:1}`,
     `${S} .cvc-dg-flow .cvc-dg-step:not(:last-child){margin-bottom:1.6em!important}`,
@@ -127,13 +126,14 @@ export function scopedStyle(uid: string, theme: ResolvedTheme): string {
       `${S} .cvc-cols2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:40px}` +
       `${S} .cvc-cards{grid-template-columns:repeat(2,minmax(0,1fr))}` +
       `${S} .cvc-step{grid-template-columns:4.25rem minmax(0,1fr)}` +
-      `${S} .cvc-dg-flow .cvc-dg-list{display:flex;flex-wrap:wrap;align-items:stretch;gap:12px 36px}` +
-      `${S} .cvc-dg-flow .cvc-dg-step,${S} .cvc-dg-flow .cvc-dg-step:not(:last-child){flex:1 1 0;min-width:9rem;margin:0!important}` +
-      `${S} .cvc-dg-flow .cvc-dg-step:not(:last-child)::after{content:"\\2192";left:auto;right:-26px;bottom:auto;top:50%;transform:translateY(-50%)}` +
+      `${S} .cvc-dg-flow:not(.cvc-dg-long) .cvc-dg-list{display:flex;align-items:stretch;gap:12px 36px}` +
+      `${S} .cvc-dg-flow:not(.cvc-dg-long) .cvc-dg-step,${S} .cvc-dg-flow:not(.cvc-dg-long) .cvc-dg-step:not(:last-child){flex:1 1 0;min-width:0;margin:0!important}` +
+      `${S} .cvc-dg-flow:not(.cvc-dg-long) .cvc-dg-step:not(:last-child)::after{content:"\\2192";left:auto;right:-26px;bottom:auto;top:50%;transform:translateY(-50%)}` +
       `${S} .cvc-dg-cycle{display:grid;grid-template-columns:180px minmax(0,1fr);column-gap:32px;align-items:center}` +
       `${S} .cvc-dg-ring{width:180px;height:180px;margin:0}` +
-      `${S} .cvc-dg-kids{grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));margin-left:0!important;padding-left:0!important;border-left:0;padding-top:14px!important;border-top:2px solid ${c.borderStrong}}` +
+      `${S} .cvc-dg-kids{grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:30px 12px;margin-left:0!important;padding-left:0!important;border-left:0;padding-top:14px!important;border-top:2px solid ${c.borderStrong}}` +
       `${S} .cvc-dg-kids>li::before{left:50%;top:-16px;width:2px;height:14px}` +
+      `${S} .cvc-dg-hierarchy .cvc-dg-root::after{content:"";position:absolute;left:50%;bottom:-14px;width:2px;height:12px;background-color:${c.borderStrong}}` +
       `${S} .cvc-mr{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:40px;align-items:start}` +
       `${S} .cvc-op-split{display:grid;grid-template-columns:auto minmax(0,1fr);grid-template-areas:"num lead" "num main";column-gap:clamp(20px,3vw,40px)}` +
       `${S} .cvc-op-split>.cvc-op-num{grid-area:num}` +

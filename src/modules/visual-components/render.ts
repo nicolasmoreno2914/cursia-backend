@@ -998,16 +998,21 @@ function cycleRing(r: R, n: number, s: Surf): string {
 function renderDiagram(r: R, c: VcDiagram): string {
   const s = ground(r);
   const nodes = list(c.nodes, 'diagram.nodes');
+  if (typeof c.kind !== 'string' || !hasOwn(DIAGRAM_KIND_LABEL, c.kind)) renderFail(`diagram: forma desconocida "${String(c.kind)}"`);
+  if (c.kind === 'matrix' && nodes.length !== 4) renderFail('diagram: una matriz necesita exactamente 4 nodos');
+  if (c.kind === 'hierarchy' && nodes.length < 2) renderFail('diagram: una jerarquía necesita raíz y al menos un hijo');
   const head =
-    sectionKicker(r, `Diagrama · ${DIAGRAM_KIND_LABEL[c.kind] ?? 'Esquema'}`, s) +
+    sectionKicker(r, `Diagrama · ${DIAGRAM_KIND_LABEL[c.kind]}`, s) +
     heading(r, 'h4', c.title, s, 'title') +
     (c.caption ? paragraphs(r, c.caption, s, { secondary: true }) : '');
   let body = '';
   if (c.kind === 'cycle' || c.kind === 'flow') {
     const items = nodes.map((n, i) => diagramNode(r, n, s, String(i + 1), c.kind === 'flow' ? 'cvc-dg-step' : 'cvc-dg-stage')).join('');
     const loop = c.kind === 'cycle' ? paragraphs(r, `Después de «${nodes[nodes.length - 1].label}», el ciclo vuelve a empezar en «${nodes[0].label}».`, s, { secondary: true, last: true }) : '';
+    // Flujos largos (> 4 pasos) quedan en columna también en pantallas anchas: una fila que se parte
+    // dejaría flechas apuntando al vacío al final de cada fila.
     body =
-      `<div class="cvc-dg cvc-dg-${c.kind}">` +
+      `<div class="cvc-dg cvc-dg-${c.kind}${c.kind === 'flow' && nodes.length > 4 ? ' cvc-dg-long' : ''}">` +
       (c.kind === 'cycle' && r.enh ? cycleRing(r, nodes.length, s) : '') +
       `<div class="cvc-dg-body">${bareList(r, 'ol', items, 'cvc-dg-list')}${loop}</div>` +
       `</div>`;
