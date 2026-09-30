@@ -17,6 +17,7 @@ export {
   VcValidationResult,
   VcTextLintHit,
 } from './validate';
+export { validatePedagogy, VC_PEDAGOGY } from './pedagogy';
 export { renderComponent, renderMovement, VcRenderContext, VcRenderLevel, VC_TABLE_MAX_COLUMNS, VC_CRITERION_HEADER_RE, normalizeLegacyLabelColumn } from './render';
 export { VC_RUNTIME_VERSION } from './runtime';
 export {

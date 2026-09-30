@@ -88,7 +88,7 @@ check('espejo del frontend (44): DYN_VC_COMPONENT_SPECS, nodos por diagrama y ti
   const ctx = { console: { log() {}, warn() {}, error() {} } };
   ctx.window = ctx;
   vm.createContext(ctx);
-  vm.runInContext(fs.readFileSync(file, 'utf8') + '\n;this.__specs = DYN_VC_COMPONENT_SPECS; this.__nodes = DYN_VC_DIAGRAM_NODES; this.__ill = DYN_VC_ILLUSTRATIVE_TYPES;', ctx);
+  vm.runInContext(fs.readFileSync(file, 'utf8') + '\n;this.__specs = DYN_VC_COMPONENT_SPECS; this.__nodes = DYN_VC_DIAGRAM_NODES; this.__ill = DYN_VC_ILLUSTRATIVE_TYPES; this.__limits = DYN_VC_MOVEMENT_LIMITS; this.__ped = typeof DYN_VC_PEDAGOGY !== "undefined" ? DYN_VC_PEDAGOGY : null;', ctx);
   const canon = (v) => (Array.isArray(v) ? v.map(canon) : v && typeof v === 'object' ? Object.keys(v).sort().reduce((o, k) => ((o[k] = canon(v[k])), o), {}) : v);
   const norm = (spec) => canon(JSON.parse(JSON.stringify(spec, (k, v) => (k === 'optional' && v === false ? undefined : v))));
   const be = norm(vc.VC_COMPONENT_SPECS);
@@ -97,6 +97,39 @@ check('espejo del frontend (44): DYN_VC_COMPONENT_SPECS, nodos por diagrama y ti
   for (const t of Object.keys(be)) assert(JSON.stringify(fe[t]) === JSON.stringify(be[t]), `${t}: FE ${JSON.stringify(fe[t])} ≠ BE ${JSON.stringify(be[t])}`);
   assert(JSON.stringify(canon(ctx.__nodes)) === JSON.stringify(canon(vc.VC_DIAGRAM_NODES)), 'VC_DIAGRAM_NODES');
   assert(JSON.stringify(Array.from(ctx.__ill)) === JSON.stringify(Array.from(vc.VC_ILLUSTRATIVE_TYPES)), 'VC_ILLUSTRATIVE_TYPES');
+  assert(JSON.stringify(canon(ctx.__limits)) === JSON.stringify(canon(vc.VC_MOVEMENT_LIMITS)), `VC_MOVEMENT_LIMITS: FE ${JSON.stringify(ctx.__limits)} ≠ BE ${JSON.stringify(vc.VC_MOVEMENT_LIMITS)}`);
+  if (vc.VC_PEDAGOGY) assert(JSON.stringify(canon(ctx.__ped)) === JSON.stringify(canon(vc.VC_PEDAGOGY)), `VC_PEDAGOGY: FE ${JSON.stringify(ctx.__ped)} ≠ BE ${JSON.stringify(vc.VC_PEDAGOGY)}`);
+});
+
+check('Edu EV2: validatePedagogy — introducción visual, conceptos clave, ejemplo práctico, recurso visual y sin muros de texto', () => {
+  const base = () => {
+    const d = F.buildExperience();
+    d.movements.deepening = [
+      F.clone(components.find((c) => c.type === 'concept_cards')),
+      F.clone(components.find((c) => c.type === 'accordion')),
+      F.clone(components.find((c) => c.type === 'worked_example')),
+      F.clone(components.find((c) => c.type === 'diagram')),
+    ];
+    return d;
+  };
+  const codes = (d) => vc.validatePedagogy(d).map((e) => e.code + ' ' + e.path);
+  assert(vc.validateExperience(base()).ok, 'base válida por schema: ' + JSON.stringify(vc.validateExperience(base()).errors));
+  assert(codes(base()).length === 0, 'base cumple: ' + codes(base()));
+  let d = base(); d.movements.opening.shift();
+  assert(codes(d).some((c) => c.startsWith('PEDAGOGY_MISSING $.movements.opening[0]')), 'sin hero al inicio');
+  d = base(); d.movements.deepening = d.movements.deepening.filter((c) => c.type !== 'concept_cards');
+  assert(codes(d).length === 1 && /concept_cards|conceptos/.test(vc.validatePedagogy(d)[0].message), 'sin conceptos clave');
+  d = base(); d.movements.deepening = d.movements.deepening.filter((c) => c.type !== 'worked_example');
+  d.movements.closing = [{ type: 'reflection', prompt: '¿Qué harías distinto?' }];
+  assert(vc.validatePedagogy(d).some((e) => /ejemplo práctico/.test(e.message)), 'sin ejemplo');
+  d = base(); d.movements.deepening = d.movements.deepening.filter((c) => c.type !== 'diagram');
+  assert(vc.validatePedagogy(d).some((e) => /recurso visual/.test(e.message)), 'sin recurso visual');
+  d = base(); d.movements.deepening[1].items[0].body = 'Una idea extensa sobre la escucha. '.repeat(20);
+  assert(codes(d).some((c) => c.startsWith('TEXT_DENSE $.movements.deepening[1].items[0].body')), 'muro de texto');
+  // el schema R2 NO cambia: un capítulo viejo sin estas piezas sigue siendo válido para empaquetar
+  const old = F.buildExperience();
+  old.movements.opening.shift();
+  assert(vc.validateExperience(old).ok && vc.validatePedagogy(old).length > 0, 'compatibilidad: schema ok, pedagogía solo para lo nuevo');
 });
 
 check('validador acepta el fixture completo (capítulo) y cada componente suelto', () => {
@@ -218,7 +251,8 @@ check('R14: comparación almacenada con la columna del rótulo + relleno "—" �
 });
 
 check('validador: límites por movimiento, self_check exclusivo, diversidad y repetición de tipos', () => {
-  expectCode(mutate((d) => d.movements.deepening.push(d.movements.opening[1])), 'MOVEMENT_RANGE', 'deepening');
+  // Edu EV2: deepening admite hasta 5 (4 del fixture + 2 = 6 → fuera de rango).
+  expectCode(mutate((d) => d.movements.deepening.push(d.movements.opening[1], d.movements.opening[2])), 'MOVEMENT_RANGE', 'deepening');
   expectCode(mutate((d) => (d.movements.opening = [])), 'MOVEMENT_RANGE', 'opening');
   expectCode(mutate((d) => d.movements.opening.push(d.movements.closing[0])), 'MOVEMENT_RANGE', 'opening');
   expectCode(mutate((d) => d.movements.synthesis.push(d.movements.closing[0])), 'MOVEMENT_RANGE', 'synthesis');

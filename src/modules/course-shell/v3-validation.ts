@@ -6,7 +6,7 @@
  * |--------------------|------------------------------------|--------------------------------------------|
  * | course_intro       | dynamic_course_intro_json          | validateCourseIntroV3 (+ lints R2)         |
  * | module_intro       | dynamic_module_intro_json          | validateModuleIntroV3 (journey = capítulos)|
- * | experience         | dynamic_experience_json            | validateExperience (R2) + chapterId        |
+ * | experience         | dynamic_experience_json            | validateExperience (R2) + validatePedagogy (EV2) + chapterId |
  * | video_interactions | dynamic_video_interactions_json    | validateVideoInteractionsDoc (R8)          |
  * | activity (h5p)     | dynamic_h5p_params_json            | validateH5pActivityPayload (R7 + rotación) |
  * | final_exam         | dynamic_exam_gift                  | validateExamGift (parseGIFT)               |
@@ -14,7 +14,7 @@
  * `activity` scorm y `exam` de módulo siguen con sus artifacts existentes
  * (solo el chequeo de roles de R4). Todo lo demás de v1/v2: sin cambios.
  */
-import { validateExperience } from '../visual-components';
+import { validateExperience, validatePedagogy } from '../visual-components';
 import { H5pInputError, VideoPlanError, planInteractionCheckpoints, validateVideoInteractionsDoc } from '../../package/h5p';
 import type { VideoCheckpoint } from '../../package/h5p';
 import { ShellValidationError, activityTypeForChapter, validateH5pActivityPayload } from './activity-type';
@@ -54,6 +54,20 @@ export interface V3ItemValidationContext {
   moduleChapterIds?: string[];
   /** video_interactions: video completado del capítulo. */
   video?: { videoItemKey: string; durationSec: number } | null;
+  /** Edu EV2: promptVersion que reporta el ejecutor (summary). La estructura educativa se exige solo a partir de v21-exp-4. */
+  promptVersion?: string | null;
+}
+
+/**
+ * Edu EV2 — compatibilidad de despliegue: la estructura educativa (validatePedagogy) se exige solo a
+ * experiencias generadas con el prompt que la pide (≥ v21-exp-4). Una pestaña con el bundle anterior
+ * no queda reintentando (y pagando) contra una regla que su prompt no conoce. No es un control de
+ * seguridad: el ejecutor es de Cursia.
+ */
+export const PEDAGOGY_MIN_EXPERIENCE_PROMPT = 4;
+export function pedagogyApplies(promptVersion: string | null | undefined): boolean {
+  const m = /^v21-exp-(\d+)$/.exec(String(promptVersion ?? ''));
+  return !!m && Number(m[1]) >= PEDAGOGY_MIN_EXPERIENCE_PROMPT;
 }
 
 export interface V3ItemValidationResult {
@@ -107,6 +121,9 @@ export function validateV3ItemArtifact(ctx: V3ItemValidationContext, text: strin
       if (!ctx.chapterId) throw new Error(`V3_VALIDATION_CONTEXT: experience ${ctx.itemKey} sin chapterId`);
       const r = validateExperience(doc);
       const errors: ShellValidationError[] = r.errors.map((e) => ({ path: e.path, code: e.code, message: e.message }));
+      // Edu EV2: estructura educativa mínima, solo para experiencias NUEVAS (el empaque no la exige:
+      // los cursos ya generados siguen siendo válidos).
+      if (r.ok && pedagogyApplies(ctx.promptVersion)) for (const e of validatePedagogy(doc as never)) errors.push({ path: e.path, code: e.code, message: e.message });
       const cid = doc && typeof doc === 'object' ? (doc as Record<string, unknown>).chapterId : undefined;
       if (typeof cid === 'string' && cid !== ctx.chapterId) {
         errors.push({ path: '$.chapterId', code: 'CHAPTER_ID_MISMATCH', message: `chapterId debe ser "${ctx.chapterId}"` });

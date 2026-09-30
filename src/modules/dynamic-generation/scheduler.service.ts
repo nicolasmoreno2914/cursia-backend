@@ -640,7 +640,7 @@ export class SchedulerService {
     // del artifact ANTES de aceptar (fuera de la transacción: la descarga no
     // retiene locks). Inválido → el item falla reintentable con los códigos
     // del validador (nunca se acepta en silencio). v1/v2: no aplica.
-    const pre = await this.prevalidateV3(itemRunId, executorId, ids, ownerId);
+    const pre = await this.prevalidateV3(itemRunId, executorId, ids, ownerId, typeof summary.promptVersion === 'string' ? summary.promptVersion : null);
     if (pre.kind === 'invalid') {
       const failed = await this.failItemDetailed(itemRunId, executorId, pre.message, pre.retryable, ownerId);
       return failed.ok ? { ok: false, reason: V3_PAYLOAD_INVALID, errors: pre.codes } : failed;
@@ -897,6 +897,7 @@ export class SchedulerService {
     executorId: string,
     artifactIds: string[],
     ownerId?: string,
+    promptVersion: string | null = null,
   ): Promise<
     | { kind: 'skip' }
     | { kind: 'invalid'; message: string; codes: string[]; retryable: boolean }
@@ -950,6 +951,7 @@ export class SchedulerService {
       itemKey: g.item_key,
       chapterId: g.chapter_id ?? null,
       chapterNumber: mItem.chapterNumber ?? null,
+      promptVersion,
     };
     if (g.type === 'module_intro') {
       const mod = (manifest.modules ?? []).find((m: any) => m.moduleId === g.module_id);

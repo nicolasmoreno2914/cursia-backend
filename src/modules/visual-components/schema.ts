@@ -228,7 +228,8 @@ export const VC_MOVEMENT_IDS: readonly VcMovementId[] = [
 /** [min, max] componentes por movimiento. */
 export const VC_MOVEMENT_LIMITS: Record<VcMovementId, [number, number]> = {
   opening: [1, 3],
-  deepening: [1, 4],
+  // Edu EV2: conceptos + explicación + ejemplo + recurso visual (+ uno más) → hasta 5.
+  deepening: [1, 5],
   synthesis: [1, 2],
   closing: [1, 2],
   video_primer: [1, 2],

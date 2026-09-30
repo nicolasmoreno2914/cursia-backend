@@ -643,7 +643,14 @@ async function pureChecks() {
       [ok[3][0], JSON.stringify({ ...vdoc, videoItemKey: 'video:otro' }), 'H5P_INPUT_INVALID'],
       [ok[4][0], JSON.stringify(F.h5pPayload('questionset')), 'ACTIVITY_TYPE_MISMATCH'],
       [ok[5][0], 'sin preguntas', 'GIFT_NO_QUESTIONS'],
+      // Edu EV2: una experiencia NUEVA sin recurso visual en deepening se rechaza (el empaque no lo exige).
+      [{ ...ok[2][0], promptVersion: 'v21-exp-4' }, JSON.stringify((() => { const e = F.experienceFor('c1'); e.movements.deepening = e.movements.deepening.filter((c) => !['comparison', 'diagram', 'process_steps', 'timeline'].includes(c.type)); return e; })()), 'PEDAGOGY_MISSING'],
     ];
+    // Edu EV2: sin promptVersion nuevo (pestaña con el bundle anterior) la estructura educativa no se exige.
+    const noVisual = (() => { const e = F.experienceFor('c1'); e.movements.deepening = e.movements.deepening.filter((c) => !['comparison', 'diagram', 'process_steps', 'timeline'].includes(c.type)); return JSON.stringify(e); })();
+    eq(V(ok[2][0], noVisual).ok, true, 'sin promptVersion: compatibilidad con el bundle anterior');
+    eq(V({ ...ok[2][0], promptVersion: 'v21-exp-3' }, noVisual).ok, true, 'v21-exp-3: sin exigir estructura');
+    eq(S.pedagogyApplies('v21-exp-4') && S.pedagogyApplies('v21-exp-12') && !S.pedagogyApplies('v21-exp-3') && !S.pedagogyApplies(null), true, 'pedagogyApplies');
     for (const [ctx, text, code] of bad) {
       const r = V(ctx, text);
       assert(!r.ok && codes(r).includes(code), `${ctx.type}: ${JSON.stringify(codes(r))} sin ${code}`);
