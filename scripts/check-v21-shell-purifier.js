@@ -68,12 +68,23 @@ function resolveTokens(html) {
     .replace(/cursia-cta:\/\/section\/(\d+)/g, (_m, n) => `${WWW}/course/section.php?id=${4300 + Number(n)}`);
 }
 
-/** Edu EV3: cierre de cada módulo con botón al siguiente (o al cierre del curso). */
+/**
+ * Edu EV3: cierre de cada módulo con botón al siguiente (o a la evaluación final / cierre del curso).
+ * EV6: + los botones entre secciones («Comenzar el curso →», «Comenzar con el capítulo N →»,
+ * «Ir al cierre del curso →» tras la evaluación final), con las secciones del layout real.
+ */
 function moduleNextLabels(facts, theme, o) {
-  return facts.modules.map((m, i) => {
+  const L = S.sectionLayoutFromFacts(facts);
+  const first = L.moduleFirstSection[facts.modules[0].id];
+  // Fix 1 (I1): «siguiente paso» solo en módulos con examen; la rama «closing» se purifica siempre.
+  const out = facts.modules.flatMap((m, i) => {
     const nx = facts.modules[i + 1];
-    return S.moduleNextLabel(m, nx ? { kind: 'module', module: nx, sectionNum: 2 + nx.number } : { kind: 'closing', sectionNum: 2 + facts.modules.length }, facts, theme, o);
+    return m.examEnabled ? [S.moduleNextLabel(m, nx ? { kind: 'module', module: nx, sectionNum: L.moduleFirstSection[nx.id] } : { kind: 'closing', sectionNum: L.finalExamSection ?? L.closingSection }, facts, theme, o)] : [];
   });
+  out.push(S.moduleNextLabel(facts.modules[facts.modules.length - 1], { kind: 'closing', sectionNum: L.finalExamSection ?? L.closingSection }, facts, theme, o));
+  out.push(S.welcomeStartLabel(first, facts, theme, o), S.routeStartLabel(first, facts, theme, o));
+  if (facts.finalExam.enabled) out.push(S.finalExamNextLabel(L.closingSection, facts, theme, o));
+  return out;
 }
 
 function factsOf(course, hours) {

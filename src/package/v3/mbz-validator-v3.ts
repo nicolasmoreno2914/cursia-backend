@@ -13,6 +13,9 @@
  *   H5P_FILES / H5P_LIBRARIES              package + intro por h5pactivity; solo librerías del perfil
  *   AUDIO_DURATION                         las duraciones mostradas = las medidas de los MP3 del paquete
  *   FILES_INTEGRITY / STRUCTURE / LIBRO    blobs, inforef, secuencias, Libro Guía
+ *   SECTIONS / NAVIGATION                  EV6: una sección por capítulo/evaluación, cierre al final
+ *                                          (después del examen final), coursedisplay = 1 y cada
+ *                                          botón «Continuar…» → la sección que corresponde
  * Identifica cada módulo por su `idnumber` `cv3:…` (estructura por UUID).
  * Puro salvo el unzip en memoria; nunca lanza por un hallazgo: los devuelve todos.
  */
@@ -27,7 +30,8 @@ import type { AssessmentCategoryKey } from '../assessment/resolve-assessment';
 import type { AssessableType } from '../../modules/course-profiles/course-profiles';
 import { extractText, lintCleanSafe, lintResourceMentions, parseHtml } from '../../modules/visual-components';
 import type { HtmlNode } from '../../modules/visual-components';
-import { CourseFacts, lintShellNumbers } from '../../modules/course-shell';
+import { CourseFacts, chapterNextSteps, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles } from '../../modules/course-shell';
+import { safeActivityName } from '../mbz-common';
 import { formatDurationEs, mp3DurationSeconds } from '../audio';
 import { CURSIA_H5P_PROFILE_V1, H5P_MOODLE_GRADING } from '../h5p';
 
@@ -272,17 +276,90 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
 
   // ── secciones ──
   const sectionIds = new Set<number>();
+  const sectionList: Array<{ num: number; name: string }> = [];
   for (const b of blocks(tag(contentsXml, 'sections') ?? '', 'section')) {
     const dir = tag(b, 'directory') ?? '';
     const sx = (await text(`${dir}/section.xml`)) ?? '';
     const sid = /<section id="(\d+)"/.exec(sx)?.[1];
     if (sid !== undefined) sectionIds.add(Number(sid));
     const secnum = num(tag(sx, 'number'));
+    sectionList.push({ num: secnum, name: unxml(tag(sx, 'name') ?? '') });
     const seq = (tag(sx, 'sequence') ?? '').split(',').filter(Boolean).map(Number);
     const expected = acts.filter((a) => a.sectionid === secnum).map((a) => a.mid);
     if (JSON.stringify(seq) !== JSON.stringify(expected)) add('STRUCTURE', dir, `sequence ${seq.join(',')} ≠ actividades de la sección ${expected.join(',')}`);
     for (const m of seq) if (!byMid.has(m)) add('STRUCTURE', dir, `sequence referencia el módulo ${m} inexistente`);
   }
+
+  // ── EV6: layout de secciones (una por capítulo / evaluación; cierre al final) ──
+  const layout = sectionLayoutFromFacts(facts);
+  const steps = chapterNextSteps(facts, layout);
+  const gotSecs = sectionList.map((x) => [x.num, x.name]);
+  const wantSecs = layout.sections.map((x) => [x.sectionNum, safeActivityName(x.title, 255)]);
+  if (JSON.stringify(gotSecs) !== JSON.stringify(wantSecs)) add('SECTIONS', 'sections', `secciones ${JSON.stringify(gotSecs)} ≠ ${JSON.stringify(wantSecs)}`);
+  const lastSec = layout.sections[layout.sections.length - 1];
+  if (lastSec.kind !== 'closing') add('SECTIONS', 'sections', 'la última sección no es el cierre del curso');
+  if (layout.finalExamSection !== null && !(layout.finalExamSection < layout.closingSection)) add('SECTIONS', 'sections', 'el cierre aparece antes de la evaluación final');
+  const courseXml = (await text('course/course.xml')) ?? '';
+  if (!/<name>coursedisplay<\/name><value>1<\/value>/.test(courseXml)) add('SECTIONS', 'course/course.xml', 'coursedisplay ≠ 1 (una sección por página)');
+  const expectedSection = (idn: string): number | undefined => {
+    if (/^cv3:shell:(forum|welcome|audio_welcome|competencies|methodology|start)$/.test(idn)) return 0;
+    if (/^cv3:shell:(route|libro|libro_card|audiobook|route_start)$/.test(idn)) return 1;
+    if (idn === 'cv3:shell:closing') return layout.closingSection;
+    if (/^cv3:final_exam(_info|_next)?$/.test(idn)) return layout.finalExamSection ?? undefined;
+    let m = /^cv3:ch:([^:]+):/.exec(idn);
+    if (m) return layout.chapterSection[m[1]];
+    m = /^cv3:module_intro:(.+)$/.exec(idn);
+    if (m) return layout.moduleFirstSection[m[1]];
+    m = /^cv3:(?:exam_info|exam):(.+)$/.exec(idn);
+    if (m) return layout.examSection[m[1]];
+    // Fix 1 (I1): module_next solo existe en la sección de evaluación (módulos con examen).
+    m = /^cv3:module_next:(.+)$/.exec(idn);
+    if (m) return layout.examSection[m[1]];
+    return undefined;
+  };
+  for (const a of acts) {
+    const want = expectedSection(a.idnumber);
+    if (want === undefined) add('SECTIONS', a.idnumber, 'actividad sin sección esperada en el layout');
+    else if (a.sectionid !== want) add('SECTIONS', a.idnumber, `en la sección ${a.sectionid}, esperada ${want}`);
+  }
+  // Botones «Continuar…»: exactamente UN enlace de sección por label de navegación, al destino correcto.
+  const firstChapterSection = layout.moduleFirstSection[facts.modules[0]?.id];
+  const ctaTarget = (idn: string): number | undefined => {
+    if (idn === 'cv3:shell:start' || idn === 'cv3:shell:route_start') return firstChapterSection;
+    if (idn === 'cv3:final_exam_next') return layout.closingSection;
+    let m = /^cv3:ch:([^:]+):closing$/.exec(idn);
+    if (m) return steps[m[1]]?.sectionNum;
+    m = /^cv3:module_next:(.+)$/.exec(idn);
+    if (m) {
+      const i = facts.modules.findIndex((x) => x.id === m![1]);
+      const nx = facts.modules[i + 1];
+      return nx ? layout.moduleFirstSection[nx.id] : layout.finalExamSection ?? layout.closingSection;
+    }
+    return undefined;
+  };
+  const navIds = new Set<string>();
+  const navBySectionTarget = new Map<string, string[]>();
+  for (const a of acts) {
+    const secLinks = Array.from(a.intro.matchAll(/\$@COURSESECTIONBYID\*(\d+)@\$/g), (x) => Number(x[1]));
+    // Fix 1 (I1): dos botones de navegación de la MISMA sección al MISMO destino = botón duplicado.
+    for (const t of new Set(secLinks)) {
+      const k = `${a.sectionid}→${t}`;
+      navBySectionTarget.set(k, [...(navBySectionTarget.get(k) ?? []), a.idnumber]);
+    }
+    const want = ctaTarget(a.idnumber);
+    if (want === undefined) {
+      if (secLinks.length) add('NAVIGATION', a.idnumber, `enlace a sección fuera de un label de navegación (${secLinks.join(',')})`);
+      continue;
+    }
+    navIds.add(a.idnumber);
+    if (JSON.stringify(secLinks) !== JSON.stringify([want])) add('NAVIGATION', a.idnumber, `botón de sección ${secLinks.join(',') || '(ninguno)'} ≠ sección ${want}`);
+  }
+  for (const [k, ids] of navBySectionTarget) {
+    if (ids.length > 1) add('NAVIGATION', ids.join(', '), `${ids.length} botones en la sección ${k.split('→')[0]} llevan a la misma sección ${k.split('→')[1]}`);
+  }
+  const wantNav = ['cv3:shell:start', 'cv3:shell:route_start', ...facts.chapters.map((c) => `cv3:ch:${c.id}:closing`), ...facts.modules.filter((m) => m.examEnabled).map((m) => `cv3:module_next:${m.id}`)];
+  if (facts.finalExam.enabled) wantNav.push('cv3:final_exam_next');
+  for (const idn of wantNav) if (!navIds.has(idn)) add('NAVIGATION', idn, 'falta el label de navegación');
 
   // ── gradebook ──
   const gb = (await text('gradebook.xml')) ?? '';
@@ -380,7 +457,10 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       if (!ch) return null;
       const mod = moduleById.get(ch.moduleId);
       const last = !!mod && mod.chapterNumbers[mod.chapterNumbers.length - 1] === ch.number;
-      return { video: ch.videoEnabled, activity: ch.activityEnabled, exam: !!mod?.examEnabled && last, final_exam: false, presentation: true, other: false };
+      // EV6: el último capítulo del curso (módulo sin examen) lleva el botón «Ir a la evaluación final →».
+      // Fix 1 (I2): SOLO su label de cierre (el botón determinístico); el resto del capítulo, nunca.
+      const toFinal = steps[ch.id]?.kind === 'final_exam' && /:closing$/.test(a.idnumber);
+      return { video: ch.videoEnabled, activity: ch.activityEnabled, exam: !!mod?.examEnabled && last, final_exam: toFinal, presentation: true, other: false };
     }
     const mm = /^cv3:(?:module_intro|exam_info):(.+)$/.exec(a.idnumber);
     if (mm) {
@@ -400,25 +480,26 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     const mn = /^cv3:module_next:(.+)$/.exec(a.idnumber);
     if (!allowed || (mn && !moduleById.has(mn[1]))) add('STRUCTURE', a.idnumber, 'idnumber apunta a un capítulo/módulo que no está en facts');
     else {
-      for (const hit of lintResourceMentions(`${a.name}. ${txt}`)) {
+      // Fix 1 (m4): los títulos del Blueprint (p. ej. el módulo siguiente en un botón) no son menciones de recursos.
+      for (const hit of lintResourceMentions(stripStructureTitles(`${a.name}. ${txt}`, facts))) {
         const kind = resourceMentionKind(hit.match);
         if (!allowed[kind]) add('RESOURCE_DISABLED', a.idnumber, `menciona "${hit.match}" (${kind}) y ese recurso no existe aquí`);
       }
     }
-    const deterministic = /^cv3:(shell:|module_intro:|exam_info:|module_next:|final_exam_info)/.test(a.idnumber) || /^cv3:ch:[^:]+:presentation$/.test(a.idnumber);
+    const deterministic = /^cv3:(shell:|module_intro:|exam_info:|module_next:|final_exam_info|final_exam_next)/.test(a.idnumber) || /^cv3:ch:[^:]+:presentation$/.test(a.idnumber);
     if (deterministic) {
       const bad = lintShellNumbers(`${a.name} ${txt}`, facts);
       if (bad.length) add('NUMBER_NOT_FROM_FACTS', a.idnumber, `cifras fuera de facts: ${bad.join(', ')}`);
     }
     const chm = /^cv3:ch:([^:]+):/.exec(a.idnumber);
     if (chm && allowed) {
-      for (const t of transitionTexts(a.intro)) {
+      for (const t of transitionTexts(a.intro).map((x) => stripStructureTitles(x, facts))) {
         const bad = lintShellNumbers(t, facts);
         if (bad.length) add('NUMBER_NOT_FROM_FACTS', a.idnumber, `transición con cifras fuera de facts: ${bad.join(', ')}`);
         if (!allowed.video && /\bvideos?\b/i.test(t)) add('TRANSITION_DISABLED_RESOURCE', a.idnumber, 'transición habla de video sin video');
         if (!allowed.activity && /\b(actividad|práctica|practica)\b/i.test(t)) add('TRANSITION_DISABLED_RESOURCE', a.idnumber, 'transición habla de práctica sin actividad');
         if (!allowed.exam && /evaluaci[oó]n del m[oó]dulo/i.test(t)) add('TRANSITION_DISABLED_RESOURCE', a.idnumber, 'transición promete una evaluación del módulo inexistente');
-        if (/evaluaci[oó]n final|examen final/i.test(t)) add('TRANSITION_DISABLED_RESOURCE', a.idnumber, 'un capítulo no promete el examen final');
+        if (!allowed.final_exam && /evaluaci[oó]n final|examen final/i.test(t)) add('TRANSITION_DISABLED_RESOURCE', a.idnumber, 'un capítulo no promete el examen final');
       }
     }
   }

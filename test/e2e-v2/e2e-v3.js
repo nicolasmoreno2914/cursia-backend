@@ -725,21 +725,36 @@ function reservationBookkeeping(ev) {
         eq([o.restoreLogFound, o.restoreLogLines, o.restoreDbLogWarnings], [true, [], []], `${label}: log del restore y backup_logs sin warnings`);
         // Estructura por UUID (idnumber cv3:…) = Manifest + chapterSlotSequence (orden del ensamblador).
         const M = { modules: info.manifestModules, features: info.features };
+        // EV6: una sección por capítulo (la presentación del módulo arriba del primero), una por
+        // evaluación de módulo, la evaluación final y, ÚLTIMO, el cierre del curso.
         const want = [];
-        want.push([0, ['cv3:shell:forum', 'cv3:shell:welcome', 'cv3:shell:audio_welcome', 'cv3:shell:competencies', 'cv3:shell:methodology']]);
-        want.push([1, ['cv3:shell:route', 'cv3:shell:libro', 'cv3:shell:libro_card', 'cv3:shell:audiobook']]);
+        want.push([0, ['cv3:shell:forum', 'cv3:shell:welcome', 'cv3:shell:audio_welcome', 'cv3:shell:competencies', 'cv3:shell:methodology', 'cv3:shell:start']]);
+        want.push([1, ['cv3:shell:route', 'cv3:shell:libro', 'cv3:shell:libro_card', 'cv3:shell:audiobook', 'cv3:shell:route_start']]);
+        const secOfCh = {}; const secOfExam = {}; const firstSecOfMod = {};
+        let sn = 2;
         for (const mod of M.modules) {
-          const ids = [`cv3:module_intro:${mod.moduleId}`];
-          for (const ch of mod.chapters) for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled })) {
-            const role = s.startsWith('label:') ? s.slice(6) : s === 'video_h5p' ? 'video' : s;
-            ids.push(`cv3:ch:${ch.chapterId}:${role}`);
-          }
-          if (mod.examEnabled) ids.push(`cv3:exam_info:${mod.moduleId}`, `cv3:exam:${mod.moduleId}`);
-          ids.push(`cv3:module_next:${mod.moduleId}`); // Edu EV3: cierre de sección con botón al siguiente módulo
-          want.push([1 + mod.moduleNumber, ids]);
+          mod.chapters.forEach((ch, ci) => {
+            const ids = ci === 0 ? [`cv3:module_intro:${mod.moduleId}`] : [];
+            for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled })) {
+              const role = s.startsWith('label:') ? s.slice(6) : s === 'video_h5p' ? 'video' : s;
+              ids.push(`cv3:ch:${ch.chapterId}:${role}`);
+            }
+            // EV6 fix 1 (I1): sin examen no hay module_next (el cierre del último capítulo es el siguiente paso).
+            if (ci === 0) firstSecOfMod[mod.moduleId] = sn;
+            secOfCh[ch.chapterId] = sn;
+            want.push([sn++, ids]);
+          });
+          if (mod.examEnabled) { secOfExam[mod.moduleId] = sn; want.push([sn++, [`cv3:exam_info:${mod.moduleId}`, `cv3:exam:${mod.moduleId}`, `cv3:module_next:${mod.moduleId}`]]); }
         }
-        want.push([2 + M.modules.length, M.features.finalExam ? ['cv3:shell:closing', 'cv3:final_exam_info', 'cv3:final_exam'] : ['cv3:shell:closing']]);
-        eq(o.sections.map((s) => [s.section, s.cms.map((c) => c.idnumber)]), want, `${label}: secciones × actividades por UUID = orden del ensamblador de capítulo`);
+        const finalSec = M.features.finalExam ? sn : null;
+        if (M.features.finalExam) want.push([sn++, ['cv3:final_exam_info', 'cv3:final_exam', 'cv3:final_exam_next']]);
+        const closingSec = sn;
+        want.push([closingSec, ['cv3:shell:closing']]);
+        eq(o.sections.map((s) => [s.section, s.cms.map((c) => c.idnumber)]), want, `${label}: secciones × actividades por UUID = orden del ensamblador de capítulo (una sección por capítulo / evaluación)`);
+        const secIdx = (idn) => o.sections.findIndex((s) => s.cms.some((c) => c.idnumber === idn));
+        ok(secIdx('cv3:shell:closing') === o.sections.length - 1 && (!M.features.finalExam || secIdx('cv3:final_exam') < secIdx('cv3:shell:closing')),
+          `${label}: el cierre del curso es la última sección y va DESPUÉS de la evaluación final`, o.sections.map((s) => s.name));
+        eq(o.courseFormat, { format: 'topics', coursedisplay: 1 }, `${label}: formato topics, una sección por página (coursedisplay = 1)`);
         const cms = o.sections.flatMap((s) => s.cms);
         const cm = Object.fromEntries(cms.map((c) => [c.idnumber, c]));
         // Sin video/actividad fantasma: V− sin primer/video; A− sin instrucción/actividad; y ningún label de esos capítulos las menciona.
@@ -839,12 +854,39 @@ function reservationBookkeeping(ev) {
           const hs = hrefs(`cv3:ch:${ch.chapterId}:activity_instruction`);
           if (!hs.some((h) => /\/mod\/(h5pactivity|scorm)\/view\.php\?id=\d+$/.test(h))) ctaBad.push(`${ch.chapterId.slice(0, 8)}: «Iniciar actividad» sin enlace a la actividad (${hs.join(' ')})`);
         }
-        for (const m of M.modules) {
+        // EV6: cada botón de sección → /course/section.php?id=<id REAL de la sección destino> (exactamente uno).
+        const sidOf = (num) => (o.sections.find((x) => x.section === num) || {}).id;
+        const secLinks = (idn) => hrefs(idn).map((h) => /\/course\/section\.php\?id=(\d+)$/.exec(h)).filter(Boolean).map((m) => Number(m[1]));
+        const navWant = { 'cv3:shell:start': firstSecOfMod[M.modules[0].moduleId], 'cv3:shell:route_start': firstSecOfMod[M.modules[0].moduleId] };
+        M.modules.forEach((m, mi) => {
           if (m.examEnabled && !hrefs(`cv3:exam_info:${m.moduleId}`).some((h) => /\/mod\/quiz\/view\.php\?id=\d+$/.test(h))) ctaBad.push(`${m.moduleId.slice(0, 8)}: «Presentar evaluación» sin enlace al cuestionario`);
-          if (!hrefs(`cv3:module_next:${m.moduleId}`).some((h) => /\/course\/section\.php\?id=\d+$/.test(h))) ctaBad.push(`${m.moduleId.slice(0, 8)}: «Continuar» sin enlace a la sección siguiente`);
+          const nm = M.modules[mi + 1];
+          const after = nm ? firstSecOfMod[nm.moduleId] : finalSec ?? closingSec;
+          if (m.examEnabled) navWant[`cv3:module_next:${m.moduleId}`] = after;
+          m.chapters.forEach((ch, ci) => {
+            const nc = m.chapters[ci + 1];
+            navWant[`cv3:ch:${ch.chapterId}:closing`] = nc ? secOfCh[nc.chapterId] : m.examEnabled ? secOfExam[m.moduleId] : after;
+          });
+        });
+        if (M.features.finalExam) {
+          if (!hrefs('cv3:final_exam_info').some((h) => /\/mod\/quiz\/view\.php\?id=\d+$/.test(h))) ctaBad.push('evaluación final sin enlace');
+          navWant['cv3:final_exam_next'] = closingSec;
         }
-        if (M.features.finalExam && !hrefs('cv3:final_exam_info').some((h) => /\/mod\/quiz\/view\.php\?id=\d+$/.test(h))) ctaBad.push('evaluación final sin enlace');
-        eq(ctaBad, [], `${label}: botones de navegación (actividad, evaluación, sección siguiente) enlazan a URLs reales tras el restore`);
+        for (const [idn, num] of Object.entries(navWant)) {
+          const got = secLinks(idn);
+          if (!(got.length === 1 && sidOf(num) && got[0] === sidOf(num))) ctaBad.push(`${idn}: botón de sección ${JSON.stringify(got)} ≠ sección ${num} (id ${sidOf(num)})`);
+        }
+        for (const idn of Object.keys(L.labels || {})) if (!(idn in navWant) && secLinks(idn).length) ctaBad.push(`${idn}: enlace de sección fuera de un botón de navegación`);
+        for (const m of M.modules) if (!m.examEnabled && (`cv3:module_next:${m.moduleId}` in (L.labels || {}))) ctaBad.push(`${m.moduleId.slice(0, 8)}: module_next en un módulo sin examen (botón duplicado)`);
+        // Fix 1 (I1): ninguna sección tiene dos botones al mismo destino.
+        const dupNav = [];
+        for (const sec of o.sections) {
+          const seen = {};
+          for (const c of sec.cms) for (const t of new Set(secLinks(c.idnumber))) (seen[t] = seen[t] || []).push(c.idnumber);
+          for (const [t, ids] of Object.entries(seen)) if (ids.length > 1) dupNav.push(`sección ${sec.section} → ${t}: ${ids.join(', ')}`);
+        }
+        eq(dupNav, [], `${label}: ninguna sección repite un botón al mismo destino`);
+        eq(ctaBad, [], `${label}: botones de navegación (actividad, evaluación, ${Object.keys(navWant).length} botones de sección — uno por cierre de capítulo) enlazan a la URL real de su destino tras el restore`);
         // ── simulación de notas por la API de Moodle ──
         const plan = { pass: {}, fail: {}, mixed: {} };
         const gradedList = graded.map((c) => ({ idnumber: c.idnumber, modname: c.modname, kind: kindOf(c.idnumber) }));
@@ -882,6 +924,8 @@ function reservationBookkeeping(ev) {
         }
         results.moodle[label].sim = so.sim;
         results.moodle[label].cms = cms.map((c) => ({ cmid: c.cmid, idnumber: c.idnumber, modname: c.modname }));
+        // EV6 (browser QA): una página por sección → el QA recorre /course/section.php?id=<id>.
+        results.moodle[label].sections = o.sections.map((x) => ({ section: x.section, id: x.id, name: x.name, cmids: x.cms.map((c) => c.cmid) }));
       }, { fatal: false });
     }
 

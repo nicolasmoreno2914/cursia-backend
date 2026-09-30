@@ -57,6 +57,11 @@ export function continueWith(next: { number: number; title: string }): string {
   return `Continúa con el capítulo ${next.number}: ${next.title}.`;
 }
 
+/** EV6 — último capítulo de un módulo SIN examen (el botón lleva al módulo siguiente). */
+export function moduleEndText(moduleNumber: number): string {
+  return `Con este capítulo terminas el módulo ${moduleNumber}.`;
+}
+
 /** Puente determinístico al final del capítulo (§F.3: con actividad OFF habla de "repasar"). */
 export function bridgeText(opts: {
   activityEnabled: boolean;

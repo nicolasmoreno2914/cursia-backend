@@ -398,8 +398,10 @@ export function finalExamInfoLabel(facts: CourseFacts, theme: ResolvedTheme, opt
 }
 
 /**
- * Edu EV3 — cierre de la sección de un módulo: «Cuando termines el módulo N…» + botón a la sección del
- * módulo siguiente (o al cierre del curso). Toda cifra sale de facts (número de módulo).
+ * Edu EV3 — cierre de un módulo: «Cuando termines el módulo N…» + botón a la sección del
+ * módulo siguiente. EV6: `{ kind: 'closing' }` = después del último módulo: con examen final
+ * el botón lleva a la sección «Evaluación final» (el cierre va DESPUÉS del examen final); sin
+ * examen final, al cierre. `sectionNum` es la sección destino. Toda cifra sale de facts.
  */
 export function moduleNextLabel(
   module: ModuleFacts,
@@ -411,9 +413,49 @@ export function moduleNextLabel(
   const h = hx(theme, opts);
   const s = bgSurf(h);
   const done = `Cuando termines el módulo ${module.number} («${module.title}»), continúa por aquí.`;
-  const text = next.kind === 'module' ? `Continuar con el módulo ${next.module.number}: ${next.module.title} →` : 'Ir al cierre del curso →';
+  const text =
+    next.kind === 'module'
+      ? `Continuar con el módulo ${next.module.number}: ${next.module.title} →`
+      : facts.finalExam.enabled
+        ? 'Ir a la evaluación final →'
+        : 'Ir al cierre del curso →';
   const inner = pHtml(h, labelHtml(done), s, { weight: 600 }) + ctaButton(h, ctaSection(next.sectionNum), text, s);
   return out(`Módulo ${module.number}: siguiente paso`, root(h, `shell-module-next-${module.number}`, inner), facts);
+}
+
+// ─── EV6: botones de navegación entre secciones (una sección por página) ────
+
+/** Fin de la sección 0 (Bienvenida): «Comenzar el curso →» a la sección del primer capítulo. */
+export function welcomeStartLabel(firstChapterSectionNum: number, facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
+  const h = hx(theme, opts);
+  const s = bgSurf(h);
+  const inner =
+    pHtml(h, labelHtml('Empieza por aquí. La ruta de aprendizaje y el Libro Guía están en la sección siguiente, para consultarlos cuando quieras.'), s, { weight: 600 }) +
+    ctaButton(h, ctaSection(firstChapterSectionNum), 'Comenzar el curso →', s);
+  return out('Comenzar el curso', root(h, 'shell-start', inner), facts);
+}
+
+/** Fin de la sección 1 (Ruta y Libro Guía): «Comenzar con el capítulo N →» (N = primer capítulo de facts). */
+export function routeStartLabel(firstChapterSectionNum: number, facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
+  const first = facts.chapters[0];
+  if (!first) shellFail('el curso no tiene capítulos');
+  const h = hx(theme, opts);
+  const s = bgSurf(h);
+  const inner =
+    pHtml(h, labelHtml('Ya conoces el recorrido. Es momento de empezar.'), s, { weight: 600 }) +
+    ctaButton(h, ctaSection(firstChapterSectionNum), `Comenzar con el capítulo ${first.number} →`, s);
+  return out('Comenzar con el primer capítulo', root(h, 'shell-route-start', inner), facts);
+}
+
+/** Después del examen final: «Ir al cierre del curso →» (solo si el curso tiene examen final). */
+export function finalExamNextLabel(closingSectionNum: number, facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
+  if (!facts.finalExam.enabled) shellFail('el curso no tiene examen final');
+  const h = hx(theme, opts);
+  const s = bgSurf(h);
+  const inner =
+    pHtml(h, labelHtml('Cuando termines la evaluación final, continúa por aquí.'), s, { weight: 600 }) +
+    ctaButton(h, ctaSection(closingSectionNum), 'Ir al cierre del curso →', s);
+  return out('Evaluación final: siguiente paso', root(h, 'shell-final-exam-next', inner), facts);
 }
 
 // ─── SZ Cierre ──────────────────────────────────────────────────────────────
@@ -422,8 +464,9 @@ export function closingLabel(facts: CourseFacts, courseIntro: CourseIntroV3, the
   const intro = assertValidCourseIntroV3(courseIntro);
   const h = hx(theme, opts);
   const s = bgSurf(h);
+  // EV6: el cierre va DESPUÉS de la evaluación final: constata que terminó (nunca la anuncia como pendiente).
   const next = facts.finalExam.enabled
-    ? 'Para terminar, completa la evaluación final.'
+    ? 'Has completado el recorrido del curso y su evaluación final.'
     : 'Has completado el recorrido del curso.';
   const inner =
     eyebrow(h, 'Cierre', s) +

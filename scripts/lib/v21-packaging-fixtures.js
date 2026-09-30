@@ -152,29 +152,35 @@ function packagingInput(distRoot, o = {}) {
   };
 }
 
-/** Secuencia esperada de idnumbers `cv3:…` por sección, derivada SOLO del Manifest + chapterSlotSequence (R11a). */
+/**
+ * Secuencia esperada de idnumbers `cv3:…` por sección, derivada SOLO del Manifest + chapterSlotSequence (R11a).
+ * EV6 (derivación independiente de section-layout.ts): 0 bienvenida, 1 ruta; por módulo una sección por
+ * capítulo (la presentación del módulo arriba del primero) y, si tiene examen, «Módulo m · Evaluación»
+ * (info + quiz + siguiente paso; sin examen NO hay label de siguiente paso: el botón del cierre de su
+ * último capítulo lo es — fix 1, I1); después la
+ * evaluación final (si hay: info + quiz + botón al cierre) y, ÚLTIMA, el cierre del curso.
+ */
 function expectedSequence(distRoot, input) {
   const SHELL = SF.loadDist(distRoot, 'modules/course-shell/index.js');
   const m = input.manifest;
   const seq = [];
-  seq.push([0, ['cv3:shell:forum', 'cv3:shell:welcome', 'cv3:shell:audio_welcome', 'cv3:shell:competencies', 'cv3:shell:methodology']]);
-  seq.push([1, ['cv3:shell:route', 'cv3:shell:libro', 'cv3:shell:libro_card', 'cv3:shell:audiobook']]);
+  seq.push([0, ['cv3:shell:forum', 'cv3:shell:welcome', 'cv3:shell:audio_welcome', 'cv3:shell:competencies', 'cv3:shell:methodology', 'cv3:shell:start']]);
+  seq.push([1, ['cv3:shell:route', 'cv3:shell:libro', 'cv3:shell:libro_card', 'cv3:shell:audiobook', 'cv3:shell:route_start']]);
+  let n = 2;
   for (const mod of m.modules) {
-    const ids = [`cv3:module_intro:${mod.moduleId}`];
-    for (const ch of mod.chapters) {
+    mod.chapters.forEach((ch, i) => {
+      const ids = i === 0 ? [`cv3:module_intro:${mod.moduleId}`] : [];
       for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled })) {
         const role = s.startsWith('label:') ? s.slice(6) : s === 'video_h5p' ? 'video' : s;
         ids.push(`cv3:ch:${ch.chapterId}:${role}`);
       }
-    }
-    if (mod.examEnabled) ids.push(`cv3:exam_info:${mod.moduleId}`, `cv3:exam:${mod.moduleId}`);
-    // Edu EV3: cada sección de módulo cierra con el botón al módulo siguiente (o al cierre del curso).
-    ids.push(`cv3:module_next:${mod.moduleId}`);
-    seq.push([1 + mod.moduleNumber, ids]);
+      seq.push([n++, ids]);
+    });
+    // Edu EV3: la evaluación del módulo cierra con el botón al módulo siguiente (o a la evaluación final / cierre).
+    if (mod.examEnabled) seq.push([n++, [`cv3:exam_info:${mod.moduleId}`, `cv3:exam:${mod.moduleId}`, `cv3:module_next:${mod.moduleId}`]]);
   }
-  const closing = ['cv3:shell:closing'];
-  if (m.features.finalExam) closing.push('cv3:final_exam_info', 'cv3:final_exam');
-  seq.push([2 + m.modules.length, closing]);
+  if (m.features.finalExam) seq.push([n++, ['cv3:final_exam_info', 'cv3:final_exam', 'cv3:final_exam_next']]);
+  seq.push([n, ['cv3:shell:closing']]);
   return seq;
 }
 

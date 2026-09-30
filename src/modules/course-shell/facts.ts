@@ -353,10 +353,20 @@ export function factsNumberSet(facts: CourseFacts): Set<number> {
  */
 export function lintShellNumbers(text: string, facts: CourseFacts): number[] {
   const allowed = factsNumberSet(facts);
+  return numbersInText(stripStructureTitles(text, facts)).filter((n) => !allowed.has(n));
+}
+
+/**
+ * Quita del texto los títulos del Blueprint (curso, módulos, capítulos), del más largo al más
+ * corto. EV6: también antes de los lints de recursos del validador, porque los botones de
+ * navegación nombran el capítulo/módulo siguiente («Continuar con el módulo 3: Producción de
+ * video →») y un título no es una promesa de recurso.
+ */
+export function stripStructureTitles(text: string, facts: CourseFacts): string {
   const titles = [facts.course.title, ...facts.modules.map((m) => m.title), ...facts.chapters.map((c) => c.title)]
     .filter((t) => typeof t === 'string' && t.trim().length > 0)
     .sort((a, b) => b.length - a.length);
   let t = String(text ?? '');
   for (const title of titles) t = t.split(title).join(' ');
-  return numbersInText(t).filter((n) => !allowed.has(n));
+  return t;
 }

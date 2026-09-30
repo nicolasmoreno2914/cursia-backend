@@ -113,8 +113,18 @@ async function runConfig(cfg) {
   });
   check(`${tag} estructura por UUID: secciones × idnumber cv3:… = Manifest + chapterSlotSequence`, () => {
     eq(o.sections.map((s) => [s.section, s.cms.map((c) => c.idnumber)]), PF.expectedSequence(dist, input), 'secuencia');
-    eq(o.sections.map((s) => s.name), ['Bienvenida', 'Ruta de aprendizaje y Libro Guía',
-      ...input.manifest.modules.map((m) => `Módulo ${m.moduleNumber} — ${input.blueprint.modules.find((b) => b.id === m.moduleId).title}`), 'Cierre del curso'], 'nombres');
+    // EV6: una sección por capítulo («Módulo m · Capítulo n: título»), una por evaluación de módulo,
+    // la evaluación final (si hay) y el cierre SIEMPRE al final.
+    const names = ['Bienvenida', 'Ruta de aprendizaje y Libro Guía'];
+    for (const m of input.manifest.modules) {
+      const bm = input.blueprint.modules.find((b) => b.id === m.moduleId);
+      for (const ch of m.chapters) names.push(`Módulo ${m.moduleNumber} · Capítulo ${ch.chapterNumber}: ${bm.chapters.find((c) => c.id === ch.chapterId).title}`);
+      if (m.examEnabled) names.push(`Módulo ${m.moduleNumber} · Evaluación`);
+    }
+    if (input.manifest.features.finalExam) names.push('Evaluación final');
+    names.push('Cierre del curso');
+    eq(o.sections.map((s) => s.name), names, 'nombres');
+    eq(o.courseFormat, { format: 'topics', coursedisplay: 1 }, 'formato topics, una sección por página (coursedisplay = 1)');
   });
   check(`${tag} ítems calificables: gradepass = perfil, 0–100, categoría; completion 2/0/1 y showdescription`, () => {
     const graded = cms.filter((c) => kindOf(c.idnumber));

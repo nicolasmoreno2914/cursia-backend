@@ -101,13 +101,17 @@ import {
   competenciesLabel,
   examInfoLabel,
   finalExamInfoLabel,
+  finalExamNextLabel,
   libroCardLabel,
   methodologyLabel,
   moduleIntroLabel,
   moduleNextLabel,
   routeLabel,
+  routeStartLabel,
+  sectionLayoutFromFacts,
   validateH5pActivityPayload,
   welcomeLabel,
+  welcomeStartLabel,
 } from '../modules/course-shell';
 import type { H5pActivityType } from '../modules/course-shell';
 import { PackagingPlanV3, buildPackagingPlanV3, packagingPlanV3Sha256 } from '../modules/dynamic-packaging/packaging-plan-v3';
@@ -133,8 +137,11 @@ import { IdAllocator, buildQuizV3, parseScormManifestIds, scormActivityXmlV3 } f
  * (shell, tarjeta, intros, Libro) y sin reintento dentro del intento en IV/QuestionSet (HD-V21-22).
  * 3.0.4 (R14): bibliografía verificada del Libro (verified-bibliography.ts) y normalización de
  * comparaciones con la columna del rótulo (render.ts, #28) — un paquete anterior no se reutiliza.
+ * 3.1.0 (EV6): una sección por capítulo / evaluación / examen final / cierre (cierre DESPUÉS del
+ * examen final), `coursedisplay` = 1 (una sección por página) y botones de navegación entre
+ * secciones («Comenzar el curso →», «Continuar con el capítulo N →», …).
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.0.4';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.1.0';
 /** Versión del renderer de Visual Components que entra en la clave de reuse. */
 export const VC_RENDERER_VERSION = `vc${VC_SCHEMA_VERSION}-rt${VC_RUNTIME_VERSION}-theme${THEME_ENGINE_VERSION}`;
 
@@ -578,6 +585,16 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     finalExam: facts.finalExam.enabled ? 1 : 0,
   });
 
+  // EV6: el shell (facts) y el plan (Manifest) derivan las MISMAS secciones; si difieren, los
+  // botones «Continuar…» apuntarían a otra sección → falla fuerte.
+  const factsLayout = sectionLayoutFromFacts(facts);
+  const shape = (xs: PackagingPlanV3['sections']) => JSON.stringify(xs.map((x) => [x.sectionNum, x.kind, x.moduleId ?? null, x.chapterId ?? null]));
+  if (shape(factsLayout.sections) !== shape(plan.sections)) {
+    throw new Error('MBZ_V3_INVARIANT: las secciones del plan no coinciden con las derivadas de facts');
+  }
+  const firstChapterSection = plan.modules[0]?.firstSectionNum;
+  if (!Number.isInteger(firstChapterSection)) throw new Error('MBZ_V3_INVARIANT: el curso no tiene capítulos');
+
   // ── Capítulos (R11a) ─────────────────────────────────────────────────────
   const experiences: Record<string, ChapterExperience> = {};
   for (const ch of allChapters) experiences[ch.chapterId] = c.experiences.get(ch.chapterId) as ChapterExperience;
@@ -687,6 +704,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   ]);
   addLabel(0, 'cv3:shell:competencies', competenciesLabel(facts, courseIntro, theme, opts));
   addLabel(0, 'cv3:shell:methodology', methodologyLabel(facts, courseIntro, theme, opts));
+  addLabel(0, 'cv3:shell:start', welcomeStartLabel(firstChapterSection as number, facts, theme, opts));
 
   // ── Sección 1 — ruta, Libro Guía, audiolibro ─────────────────────────────
   addLabel(1, 'cv3:shell:route', routeLabel(facts, theme, opts));
@@ -723,15 +741,16 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   addLabel(1, 'cv3:shell:audiobook', audiobookLabel(facts, theme, opts), [
     { name: SHELL_AUDIOBOOK_FILE, data: audiobook.buffer, mime: 'audio/mp3' },
   ]);
+  addLabel(1, 'cv3:shell:route_start', routeStartLabel(firstChapterSection as number, facts, theme, opts));
 
-  // ── Una sección por módulo ───────────────────────────────────────────────
+  // ── EV6: una sección por capítulo (+ una por evaluación de módulo) ──────
   const chapterSlots = new Map(assembled.map((x) => [x.chapterNumber, x.slots]));
   for (const m of plan.modules) {
     const mf = facts.modules.find((x) => x.id === m.moduleId);
     if (!mf) throw new Error(`MBZ_V3_INVARIANT: módulo ${m.moduleId} ausente en facts`);
-    const sec = m.sectionNum;
-    addLabel(sec, `cv3:module_intro:${m.moduleId}`, moduleIntroLabel(mf, moduleIntros.get(m.moduleId) as ModuleIntroV3, facts, theme, opts));
+    addLabel(m.firstSectionNum, `cv3:module_intro:${m.moduleId}`, moduleIntroLabel(mf, moduleIntros.get(m.moduleId) as ModuleIntroV3, facts, theme, opts));
     for (const ch of m.chapters) {
+      const sec = ch.sectionNum;
       const slots = chapterSlots.get(ch.chapterNumber);
       if (!slots) throw new Error(`MBZ_V3_INVARIANT: capítulo ${ch.chapterNumber} sin slots`);
       const cf = facts.chapters.find((x) => x.id === ch.chapterId);
@@ -821,20 +840,27 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
         }
       }
     }
-    if (m.keys.exam) {
-      addLabel(sec, `cv3:exam_info:${m.moduleId}`, examInfoLabel(mf, facts, theme, opts));
-      addQuiz(sec, `cv3:exam:${m.moduleId}`, safeActivityName(`Evaluación del módulo ${m.moduleNumber}: ${m.title}`), 'exam', c.examGift.get(m.moduleId) as string, m.keys.exam);
-    }
-    // Edu EV3: cierre de la sección → botón al módulo siguiente (o al cierre del curso).
+    // Sección «Módulo m · Evaluación» (solo si el módulo tiene examen). EV6 fix 1 (I1): SIN examen
+    // no hay label module_next — el botón del cierre de su último capítulo ya es el siguiente paso
+    // (antes quedaban dos botones iguales seguidos).
+    if (!m.keys.exam) continue;
+    const nextSec = m.examSectionNum as number;
+    if (!Number.isInteger(nextSec)) throw new Error(`MBZ_V3_INVARIANT: módulo ${m.moduleId} con examen sin sección`);
+    addLabel(nextSec, `cv3:exam_info:${m.moduleId}`, examInfoLabel(mf, facts, theme, opts));
+    addQuiz(nextSec, `cv3:exam:${m.moduleId}`, safeActivityName(`Evaluación del módulo ${m.moduleNumber}: ${m.title}`), 'exam', c.examGift.get(m.moduleId) as string, m.keys.exam);
+    // Edu EV3 / EV6: tras la evaluación → botón al primer capítulo del módulo siguiente, o a la
+    // evaluación final / cierre.
     const nextPlan = plan.modules[plan.modules.indexOf(m) + 1];
     const nextFacts = nextPlan ? facts.modules.find((x) => x.id === nextPlan.moduleId) : undefined;
     if (nextPlan && !nextFacts) throw new Error(`MBZ_V3_INVARIANT: módulo ${nextPlan.moduleId} ausente en facts`);
     addLabel(
-      sec,
+      nextSec,
       `cv3:module_next:${m.moduleId}`,
       moduleNextLabel(
         mf,
-        nextPlan && nextFacts ? { kind: 'module', module: nextFacts, sectionNum: nextPlan.sectionNum } : { kind: 'closing', sectionNum: plan.closingSectionNum },
+        nextPlan && nextFacts
+          ? { kind: 'module', module: nextFacts, sectionNum: nextPlan.firstSectionNum }
+          : { kind: 'closing', sectionNum: plan.finalExamSectionNum ?? plan.closingSectionNum },
         facts,
         theme,
         opts,
@@ -842,13 +868,16 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     );
   }
 
-  // ── Sección de cierre ────────────────────────────────────────────────────
+  // ── EV6: «Evaluación final» (si hay) y, al final, «Cierre del curso» ────
   const closing = plan.closingSectionNum;
-  addLabel(closing, 'cv3:shell:closing', closingLabel(facts, courseIntro, theme, opts));
   if (plan.keys.finalExam) {
-    addLabel(closing, 'cv3:final_exam_info', finalExamInfoLabel(facts, theme, opts));
-    addQuiz(closing, 'cv3:final_exam', 'Evaluación final', 'finalExam', c.finalExamGift as string, plan.keys.finalExam);
+    const fsec = plan.finalExamSectionNum;
+    if (fsec === null || !(fsec < closing)) throw new Error('MBZ_V3_INVARIANT: la evaluación final debe ir antes del cierre');
+    addLabel(fsec, 'cv3:final_exam_info', finalExamInfoLabel(facts, theme, opts));
+    addQuiz(fsec, 'cv3:final_exam', 'Evaluación final', 'finalExam', c.finalExamGift as string, plan.keys.finalExam);
+    addLabel(fsec, 'cv3:final_exam_next', finalExamNextLabel(closing, facts, theme, opts));
   }
+  addLabel(closing, 'cv3:shell:closing', closingLabel(facts, courseIntro, theme, opts));
 
   // ── Tokens (fail loud) ───────────────────────────────────────────────────
   const sectionNums = new Set(plan.sections.map((s) => s.sectionNum));
@@ -883,7 +912,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   <enablecompletion>1</enablecompletion><completionnotify>0</completionnotify>
   <tags></tags><customfields></customfields>
   <courseformatoptions>
-    <courseformatoption><format>topics</format><sectionid>0</sectionid><name>coursedisplay</name><value>0</value></courseformatoption>
+    <courseformatoption><format>topics</format><sectionid>0</sectionid><name>coursedisplay</name><value>1</value></courseformatoption>
     <courseformatoption><format>topics</format><sectionid>0</sectionid><name>hiddensections</name><value>1</value></courseformatoption>
   </courseformatoptions>
 </course>`);

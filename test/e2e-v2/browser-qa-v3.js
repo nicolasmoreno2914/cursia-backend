@@ -221,6 +221,8 @@ async function mouseDrag(b, from, to) {
   await b.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', buttons: 0, clickCount: 1 });
   await sleep(300);
 }
+// Re-arrastres del flujo DragText (harness), reportados en el resultado para no esconder la señal.
+const dtRedrags = [];
 // Respuestas correctas de las fixtures del LLM falso (llm-v3.js) ⇒ nota 100.
 const FLOWS = {
   async questionset(b) {
@@ -244,15 +246,25 @@ const FLOWS = {
       const word = words[i];
       const fromSel = `[...d.querySelectorAll('.h5p-drag-draggables-container .h5p-draggable')].find(e=>e.innerText.split('\\n')[0].trim()===${JSON.stringify(word)})`;
       const toSel = `d.querySelectorAll('.h5p-dropzone')[${i}]`;
-      let from = null; let to = null;
-      for (let k = 0; k < 20; k++) {
-        const f1 = await b.evaluate(centerOf(fromSel)); const t1 = await b.evaluate(centerOf(toSel));
-        await sleep(250);
-        from = await b.evaluate(centerOf(fromSel)); to = await b.evaluate(centerOf(toSel));
-        if (!from) throw new Error(`DT: no está "${word}"`);
-        if (JSON.stringify([f1, t1]) === JSON.stringify([from, to])) break;
+      // Harness (EV6 fix round 1): a veces el PRIMER arrastre sintético justo después de cargar se
+      // pierde (la palabra vuelve a la lista; visto también antes de EV6, r14/gate15 → 3/4). Como un
+      // estudiante real, si la palabra no quedó en su hueco se vuelve a arrastrar (máx. 3 veces).
+      // Nunca se toca el estado del H5P: la nota sigue saliendo de las respuestas en el reproductor.
+      let placed = false;
+      for (let attempt = 0; attempt < 3 && !placed; attempt++) {
+        let from = null; let to = null;
+        for (let k = 0; k < 20; k++) {
+          const f1 = await b.evaluate(centerOf(fromSel)); const t1 = await b.evaluate(centerOf(toSel));
+          await sleep(250);
+          from = await b.evaluate(centerOf(fromSel)); to = await b.evaluate(centerOf(toSel));
+          if (!from) throw new Error(`DT: no está "${word}"`);
+          if (JSON.stringify([f1, t1]) === JSON.stringify([from, to])) break;
+        }
+        await mouseDrag(b, from, to);
+        placed = (await b.evaluate(inH5p(`const z=d.querySelectorAll('.h5p-dropzone')[${i}];return z?z.innerText.trim():'';`))) === word;
+        if (!placed) dtRedrags.push({ word, attempt: attempt + 1 });
       }
-      await mouseDrag(b, from, to);
+      if (!placed) throw new Error(`DT: "${word}" no quedó en el hueco ${i + 1} tras 3 arrastres`);
     }
     const k = await clickBtn(b, ['Comprobar']);
     if (k !== 'ok') throw new Error(`DT Comprobar: ${k}`);
@@ -300,10 +312,45 @@ const FLOWS = {
   },
 };
 
-// Texto de cada label/descripción tal como lo sirve Moodle (HTML del servidor, sin ejecutar JS).
-async function serverTexts(b, courseid, cmids) {
-  const html = await b.evaluate(`fetch('/course/view.php?id=${courseid}',{credentials:'same-origin'}).then(r=>r.text()).then(t=>{const doc=new DOMParser().parseFromString(t,'text/html');const o={};for(const id of ${JSON.stringify(cmids)}){const li=doc.getElementById('module-'+id);o[id]=li?[...li.querySelectorAll('.activity-altcontent, .activity-description, .contentafterlink')].map(e=>e.innerHTML).join('\\n'):null}return o})`);
+// EV6: el curso es de una sección por página (coursedisplay = 1). La sección 0 se ve completa en
+// /course/view.php; cada otra sección en /course/section.php?id=<id real> (ids del inspector PHP).
+function sectionPages(c) {
+  const secs = c.moodle.sections;
+  if (!Array.isArray(secs) || !secs.length || secs.some((x) => !Number.isInteger(x.id))) throw new Error(`${c.key}: results sin moodle.sections (id por sección)`);
+  return secs.map((x) => ({
+    num: x.section,
+    name: x.name,
+    path: x.section === 0 ? `/course/view.php?id=${c.moodle.courseid}` : `/course/section.php?id=${x.id}`,
+    cmids: x.cmids,
+  }));
+}
+
+// Texto de cada label/descripción tal como lo sirve Moodle (HTML del servidor, sin ejecutar JS), página por página.
+async function serverTexts(b, c, cmids) {
+  const html = {};
+  for (const pg of sectionPages(c)) {
+    const mine = cmids.filter((id) => pg.cmids.includes(id));
+    if (!mine.length) continue;
+    Object.assign(html, await b.evaluate(`fetch(${JSON.stringify(pg.path)},{credentials:'same-origin'}).then(r=>r.text()).then(t=>{const doc=new DOMParser().parseFromString(t,'text/html');const o={};for(const id of ${JSON.stringify(mine)}){const li=doc.getElementById('module-'+id);o[id]=li?[...li.querySelectorAll('.activity-altcontent, .activity-description, .contentafterlink')].map(e=>e.innerHTML).join('\\n'):null}return o})`));
+  }
+  for (const id of cmids) if (!(id in html)) html[id] = null;
   return Object.fromEntries(Object.entries(html).map(([k, v]) => [k, v === null ? null : VC.extractText(v)]));
+}
+
+// Suma las métricas de varias páginas (máximos para anchos, sumas para conteos, listas concatenadas).
+function mergeMetrics(list) {
+  const m = { scrollW: 0, innerW: 0, bodyScrollW: 0, maxRight: 0, textEls: 0, openedDetails: 0, tabsVisited: 0, gradientBg: 0, metaChips: 0,
+    media: { fallback: 0, srOnly: 0, hidden: 0, visible: 0, visibleSmall: 0 }, small: [], lowContrast: [], clipped: [], internalScroll: [], hiddenText: [],
+    closedSkipped: 0, cursiaText: '', missingCms: [], pages: list.length };
+  for (const x of list) {
+    for (const k of ['scrollW', 'innerW', 'bodyScrollW', 'maxRight']) m[k] = Math.max(m[k], x[k]);
+    for (const k of ['textEls', 'openedDetails', 'tabsVisited', 'gradientBg', 'metaChips', 'closedSkipped']) m[k] += x[k];
+    for (const k of Object.keys(m.media)) m.media[k] += x.media[k];
+    for (const k of ['small', 'lowContrast', 'clipped', 'internalScroll', 'hiddenText', 'missingCms']) m[k] = m[k].concat(x[k]);
+    m.cursiaText += x.cursiaText;
+  }
+  for (const k of ['small', 'lowContrast', 'clipped', 'hiddenText', 'internalScroll']) m[k] = m[k].slice(0, 40);
+  return m;
 }
 
 async function main() {
@@ -338,18 +385,52 @@ async function main() {
   if (!ok(await login(b, creds), 'login del estudiante local de prueba')) return;
 
   const cmsOf = (c) => c.moodle.cms.filter((x) => x.idnumber && (x.modname === 'label' || x.modname === 'h5pactivity')).map((x) => [x.cmid, x.idnumber]);
-  const pageMetrics = async (c, width, label, { mobile = false, openAll = false, shot = true } = {}) => {
+  // EV6: se mide CADA página de sección (una sección por página) y se suman las métricas;
+  // `perPage` corre en cada página ya cargada (p. ej. enlaces de respaldo de los videos).
+  const pageMetrics = async (c, width, label, { mobile = false, openAll = false, shot = true, perPage = null } = {}) => {
     await b.setViewport(width, 900, mobile);
-    await b.navigate(`${WWW}/course/view.php?id=${c.moodle.courseid}`);
-    await sleep(1200);
-    const m = await b.evaluate(MEASURE(cmsOf(c), width, openAll));
-    if (shot) {
-      const file = path.join(SHOTS, `${c.key}-${label}.png`);
-      await b.screenshot(file, { fullPage: true });
-      out.shots.push(file);
+    const list = [];
+    const extra = [];
+    for (const pg of sectionPages(c)) {
+      const cms = cmsOf(c).filter(([id]) => pg.cmids.includes(id));
+      await b.navigate(`${WWW}${pg.path}`);
+      await sleep(1200);
+      list.push(await b.evaluate(MEASURE(cms, width, openAll)));
+      if (perPage) extra.push(await perPage(pg));
+      if (shot) {
+        const file = path.join(SHOTS, `${c.key}-${label}-s${pg.num}.png`);
+        await b.screenshot(file, { fullPage: true });
+        out.shots.push(file);
+      }
     }
+    const m = mergeMetrics(list);
+    m.perPage = extra;
     return m;
   };
+  const videoFallbacks = (c, pg) => {
+    const vids = c.moodle.cms.filter((x) => /:video$/.test(x.idnumber || '') && pg.cmids.includes(x.cmid));
+    if (!vids.length) return [];
+    return b.evaluate(`(()=>${JSON.stringify(vids.map((v) => v.cmid))}.map(id=>{const li=document.getElementById('module-'+id);const a=li&&li.querySelector('.cursia-iv-open a');const y=li&&li.querySelector('.cursia-iv-fallback a');const r=a&&a.getBoundingClientRect();return {id,open:!!a&&r.width>0&&r.height>0&&getComputedStyle(a).visibility!=='hidden',href:a&&a.getAttribute('href'),yt:!!y&&y.getBoundingClientRect().width>0}}))()`);
+  };
+  const sectionPath = (c, cmid) => { const pg = sectionPages(c).find((x) => x.cmids.includes(cmid)); if (!pg) throw new Error(`${c.key}: cm ${cmid} sin sección`); return pg.path; };
+
+  // EV6: el curso NO es una sola página gigante — /course/view.php muestra la sección 0 completa y el
+  // resto solo como enlaces; cada capítulo vive en su propia página de sección.
+  area = 'browser-sections';
+  for (const c of courses) {
+    await b.setViewport(390, 900, true);
+    await b.navigate(`${WWW}/course/view.php?id=${c.moodle.courseid}`);
+    await sleep(1200);
+    const pages = sectionPages(c);
+    const s0 = new Set(pages[0].cmids);
+    const others = cmsOf(c).filter(([id]) => !s0.has(id)).map(([id]) => id);
+    const r = await b.evaluate(`(()=>({present:${JSON.stringify(others)}.filter(id=>document.getElementById('module-'+id)).length,height:document.documentElement.scrollHeight,links:[...document.querySelectorAll('a[href*="/course/section.php?id="]')].map(a=>a.getAttribute('href'))}))()`);
+    ok(others.length > 0 && r.present === 0, `${c.key}: la página del curso muestra solo la sección 0 (0 de ${others.length} actividades de capítulos/evaluaciones en /course/view.php)`, r.present);
+    const linked = pages.slice(1).filter((pg) => r.links.some((h) => new RegExp(`/course/section\\.php\\?id=${pg.path.split('=')[1]}(?!\\d)`).test(h)));
+    ok(linked.length === pages.length - 1, `${c.key}: la página del curso enlaza las ${pages.length - 1} secciones (una página por capítulo / evaluación / cierre)`, { linked: linked.length, links: r.links.slice(0, 20) });
+    out.metrics[`${c.key}-course-page-390`] = { height: r.height, sections: pages.map((pg) => pg.name) };
+  }
+  area = 'browser';
   const assertMetrics = (m, tag, width, { lang = true } = {}) => {
     eq0(m.missingCms, `${tag}: todas las actividades Cursia presentes en la página`);
     // Referencia = el ancho configurado (no innerWidth, que el modo móvil ensancha si hay overflow).
@@ -368,7 +449,7 @@ async function main() {
     area = `browser-${c.key}`;
     for (const width of [390, 768, 1280]) {
       const tag = `${c.key} (${theme}) @${width}`;
-      const m = await pageMetrics(c, width, `${width}`);
+      const m = await pageMetrics(c, width, `${width}`, { perPage: (pg) => videoFallbacks(c, pg) });
       ok(m.innerW === width, `${tag}: viewport de referencia = ${width} (mobile:false)`, m.innerW);
       assertMetrics(m, tag, width);
       ok(m.closedSkipped > 0, `${tag}: ENHANCED carga con controles cerrados (${m.closedSkipped} textos dentro de <details> cerrados)`);
@@ -378,13 +459,13 @@ async function main() {
       ok(mo.textEls > m.textEls, `${tag} TODO ABIERTO: se midió más texto (${mo.textEls} > ${m.textEls})`);
       out.metrics[`${c.key}-${width}`] = { closed: summarize(m), open: summarize(mo) };
       const vids = c.moodle.cms.filter((x) => /:video$/.test(x.idnumber || ''));
-      const fb = await b.evaluate(`(()=>${JSON.stringify(vids.map((v) => v.cmid))}.map(id=>{const li=document.getElementById('module-'+id);const a=li&&li.querySelector('.cursia-iv-open a');const y=li&&li.querySelector('.cursia-iv-fallback a');const r=a&&a.getBoundingClientRect();return {id,open:!!a&&r.width>0&&r.height>0&&getComputedStyle(a).visibility!=='hidden',href:a&&a.getAttribute('href'),yt:!!y&&y.getBoundingClientRect().width>0}}))()`);
-      ok(vids.length > 0 && fb.every((x) => x.open && /\/mod\/h5pactivity\/view\.php\?id=\d+/.test(x.href) && x.yt), `${tag}: enlace de respaldo visible en los ${vids.length} videos (→ view.php de la actividad + YouTube)`, fb);
+      const fb = m.perPage.flat();
+      ok(vids.length > 0 && fb.length === vids.length && fb.every((x) => x.open && /\/mod\/h5pactivity\/view\.php\?id=\d+/.test(x.href) && x.yt), `${tag}: enlace de respaldo visible en los ${vids.length} videos (→ view.php de la actividad + YouTube)`, fb);
     }
     // IV inline: carga diferida + reproduce (1280).
     await b.setViewport(1280, 900, false);
-    await b.navigate(`${WWW}/course/view.php?id=${c.moodle.courseid}`);
     const vid = c.moodle.cms.find((x) => /:video$/.test(x.idnumber || ''));
+    await b.navigate(`${WWW}${sectionPath(c, vid.cmid)}`); // EV6: el video vive en la página de su capítulo
     const before = await b.evaluate(`(()=>{const f=document.querySelector('#module-${vid.cmid} .cursia-iv-inline iframe');return f?{src:f.getAttribute('src')||'',data:!!f.getAttribute('data-cursia-src'),lazy:f.getAttribute('loading')}:null})()`);
     await b.evaluate(`(()=>{const e=document.getElementById('module-${vid.cmid}');e&&e.scrollIntoView({block:'center'});return 1})()`);
     const info = await b.waitFor(`(()=>{const f=document.querySelector('#module-${vid.cmid} .cursia-iv-inline iframe');return f&&f.src&&f.offsetWidth>300?JSON.stringify({src:f.src,w:f.offsetWidth,lazy:f.getAttribute('loading')}):null})()`, { timeoutMs: 20000, what: 'iframe inline' }).then((v) => JSON.parse(v), (e) => ({ error: e.message }));
@@ -436,7 +517,7 @@ async function main() {
       ok(lib === LIB[t], `${t}: el reproductor real despliega y carga ${LIB[t]} (${target.key}, cm ${target.cmid})`, lib);
       let answered = true;
       try { await FLOWS[t](b); } catch (e) { answered = ok(false, `${t}: respondido a través del DOM`, e.message); }
-      if (answered) ok(true, `${t}: respondido a través del DOM (todas correctas)`);
+      if (answered) ok(true, `${t}: respondido a través del DOM (todas correctas)${t === 'dragtext' && dtRedrags.length ? `; re-arrastres del harness: ${JSON.stringify(dtRedrags)}` : ''}`);
       await sleep(3000); // deja terminar el POST xAPI
       const file = path.join(SHOTS, `h5p-${t}-answered.png`);
       await b.screenshot(file);
@@ -463,7 +544,7 @@ async function main() {
   // Texto de referencia SIN forceclean (HTML del servidor, antes de tocar la configuración).
   area = 'browser-forceclean';
   const noclean = {};
-  for (const c of courses) noclean[c.key] = await serverTexts(b, c.moodle.courseid, cmsOf(c).map(([id]) => id));
+  for (const c of courses) noclean[c.key] = await serverTexts(b, c, cmsOf(c).map(([id]) => id));
 
   // forceclean=1 TEMPORAL.
   forcecleanOriginal = cfg('forceclean');
@@ -482,7 +563,7 @@ async function main() {
     ok(cfg('forceclean') === '1', 'forceclean=1 aplicado temporalmente + caches purgadas');
     for (const c of courses) {
       const ids = cmsOf(c).map(([id]) => id);
-      const clean = await serverTexts(b, c.moodle.courseid, ids);
+      const clean = await serverTexts(b, c, ids);
       const diff = ids.filter((id) => !noclean[c.key][id] || clean[id] !== noclean[c.key][id]).map((id) => {
         const a = noclean[c.key][id] || ''; const z = clean[id] || '';
         let i = 0; while (i < a.length && a[i] === z[i]) i++;
@@ -492,14 +573,19 @@ async function main() {
       const chapters = c.info.modules.flatMap((m) => m.chapters);
       for (const width of [390, 1280]) {
         const tag = `${c.key} @${width} forceclean=1`;
-        const m = await pageMetrics(c, width, `forceclean-${width}`, { openAll: true });
+        const vidsOf = (pg) => c.moodle.cms.filter((x) => /:video$/.test(x.idnumber || '') && pg.cmids.includes(x.cmid));
+        // EV6: conteos por página de sección (una sección por página), sumados.
+        const m = await pageMetrics(c, width, `forceclean-${width}`, { openAll: true, perPage: async (pg) => ({
+          r: await b.evaluate(`(()=>{const t=document.body.innerText;return {counts:${JSON.stringify(KEY.map((k) => k.text))}.map(s=>t.split(s).length-1),iframes:document.querySelectorAll('.cursia-iv-inline iframe').length,scripts:[...document.querySelectorAll('.activity-altcontent script, .activity-description script')].length}})()`),
+          fb: vidsOf(pg).length ? await b.evaluate(`(()=>${JSON.stringify(vidsOf(pg).map((v) => v.cmid))}.map(id=>{const li=document.getElementById('module-'+id);const as=li?[...li.querySelectorAll('.activity-altcontent a, .activity-description a')]:[];const v=as.find(a=>/h5pactivity\\/view\\.php\\?id=/.test(a.href));const y=as.find(a=>/youtube\\.com\\/watch\\?v=IdwOipZAeqY/.test(a.href));const vis=(a)=>!!a&&a.getBoundingClientRect().width>0;return {id,view:vis(v),yt:vis(y)}}))()`) : [],
+        }) });
         assertMetrics(m, tag, width);
-        const r = await b.evaluate(`(()=>{const t=document.body.innerText;return {counts:${JSON.stringify(KEY.map((k) => k.text))}.map(s=>t.split(s).length-1),iframes:document.querySelectorAll('.cursia-iv-inline iframe').length,scripts:[...document.querySelectorAll('.activity-altcontent script, .activity-description script')].length}})()`);
+        const r = m.perPage.reduce((acc, x) => ({ counts: acc.counts.map((n, i) => n + x.r.counts[i]), iframes: acc.iframes + x.r.iframes, scripts: acc.scripts + x.r.scripts }), { counts: KEY.map(() => 0), iframes: 0, scripts: 0 });
         const want = KEY.map((k) => chapters.filter(k.of).length);
         eq(r.counts, want, `${tag}: textos de acordeón/tarjeta/reflexión/autoevaluación/antesala del video VISIBLES exactamente una vez por capítulo que los tiene (${want.join('/')}, ${chapters.length} capítulos)`);
         ok(r.iframes === 0 && r.scripts === 0, `${tag}: sin iframe ni script en los labels (Moodle los elimina)`, r);
         const vids = c.moodle.cms.filter((x) => /:video$/.test(x.idnumber || ''));
-        const fb = await b.evaluate(`(()=>${JSON.stringify(vids.map((v) => v.cmid))}.map(id=>{const li=document.getElementById('module-'+id);const as=li?[...li.querySelectorAll('.activity-altcontent a, .activity-description a')]:[];const v=as.find(a=>/h5pactivity\\/view\\.php\\?id=/.test(a.href));const y=as.find(a=>/youtube\\.com\\/watch\\?v=IdwOipZAeqY/.test(a.href));const vis=(a)=>!!a&&a.getBoundingClientRect().width>0;return {id,view:vis(v),yt:vis(y)}}))()`);
+        const fb = m.perPage.flatMap((x) => x.fb);
         ok(vids.length > 0 && fb.length === vids.length && fb.every((x) => x.view && x.yt), `${tag}: enlace de respaldo visible en los ${vids.length} videos (actividad + YouTube)`, fb);
         out.metrics[`${c.key}-forceclean-${width}`] = summarize(m);
       }
