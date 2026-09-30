@@ -405,7 +405,8 @@ function row(r: R, inner: string, s: Surf, opts: { tag?: 'div' | 'li'; cls?: str
       ['margin', 0],
       ['padding', `${D(r, 18)}px 0 ${D(r, 18)}px 0`],
       ['color', s.fg],
-      ['border-top', `1px solid ${r.t.personality.gridRules ? r.t.color.borderStrong : r.t.color.border}`],
+      // Edu EV4: la primera fila dentro de un panel no lleva filete (el panel ya separa).
+      ...(opts.first ? [] : ([['border-top', `1px solid ${r.t.personality.gridRules ? r.t.color.borderStrong : r.t.color.border}`]] as Decl[])),
     ]) +
     `>${inner}</${tag}>`
   );
@@ -428,6 +429,52 @@ function panel(r: R, inner: string, s: Surf, opts: { cls?: string; tag?: 'div' |
       [['border-radius', r.t.shape.radiusMd]],
     ) +
     `>${inner}</${tag}>`
+  );
+}
+
+/**
+ * Edu EV4 — tarjeta de aprendizaje: superficie tintada con relleno (no una fila entre filetes),
+ * para que un bloque didáctico se lea como pieza del curso y no como párrafo de revista.
+ */
+function tile(r: R, inner: string, s: Surf, opts: { cls?: string; tag?: 'div' | 'li' } = {}): string {
+  const tag = opts.tag || 'li';
+  return (
+    `<${tag} class="cvc-tile${opts.cls ? ' ' + opts.cls : ''}"` +
+    st(
+      r,
+      [
+        ['background-color', s.bg],
+        ['color', s.fg],
+        ['margin', `0 0 ${D(r, 12)}px 0`],
+        ['padding', `${D(r, 18)}px ${D(r, 20)}px`],
+      ],
+      [['border-radius', r.t.shape.radiusMd]],
+    ) +
+    `>${inner}</${tag}>`
+  );
+}
+
+/** Edu EV4 — insignia numerada (paso): cifra clara sobre el acento, no un numeral gigante. */
+function badge(r: R, text: string): string {
+  const b = surf(r.t, r.t.color.accentStrong, [r.t.color.textOnAccent]);
+  return (
+    `<div class="cvc-badge"` +
+    st(
+      r,
+      [
+        ['width', '36px'],
+        ['margin', '0 0 8px 0'],
+        ['background-color', b.bg],
+        ['color', b.fg],
+        ['font-family', r.t.personality.fontNumeral],
+        ['font-size', r.t.typography.sizeSmallPx],
+        ['font-weight', '700'],
+        ['line-height', '36px'],
+        ['text-align', 'center'],
+      ],
+      [['border-radius', '50%'], ['font-variant-numeric', 'tabular-nums lining-nums']],
+    ) +
+    `>${labelHtml(text)}</div>`
   );
 }
 
@@ -530,16 +577,17 @@ function renderHero(r: R, c: VcHero): string {
 
 function renderLearningObjectives(r: R, c: VcLearningObjectives): string {
   const s = ground(r);
+  const ps = surf(r.t, panelBg(r));
   const items = list(c.items, 'learning_objectives.items');
   const lis = items
     .map(
       (it, i) =>
         row(
           r,
-          `<div class="cvc-li-n"${st(r, [['margin', '0 0 4px 0'], ['color', readable(s.bg, [r.t.color.accentStrong], s.fg)], ['font-family', r.t.personality.fontNumeral], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700']], [['font-variant-numeric', 'tabular-nums']])}>${labelHtml(indexText(r, i))}</div>` +
-            `<div class="cvc-li-t"${st(r, [['color', s.fg]])}>${inlineHtml(it)}</div>`,
-          s,
-          { tag: 'li', cls: 'cvc-obj' },
+          `<div class="cvc-li-n"${st(r, [['margin', '0 0 4px 0'], ['color', readable(ps.bg, [r.t.color.accentStrong], ps.fg)], ['font-family', r.t.personality.fontNumeral], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700']], [['font-variant-numeric', 'tabular-nums']])}>${labelHtml(indexText(r, i))}</div>` +
+            `<div class="cvc-li-t"${st(r, [['color', ps.fg]])}>${inlineHtml(it)}</div>`,
+          ps,
+          { tag: 'li', cls: 'cvc-obj', first: i === 0 },
         ),
     )
     .join('');
@@ -547,7 +595,10 @@ function renderLearningObjectives(r: R, c: VcLearningObjectives): string {
   return componentWrap(
     r,
     'learning_objectives',
-    sectionKicker(r, 'Al terminar podrás', s) + titleIf(r, c.title, s, 'Al terminar podrás') + bareList(r, 'ol', lis, cls),
+    // Edu EV4: el kicker ya no repite el título; la lista vive en un panel tintado.
+    sectionKicker(r, 'Objetivos de aprendizaje', s) +
+      titleIf(r, c.title, s, 'Al terminar podrás') +
+      panel(r, bareList(r, 'ol', lis, cls), ps, { cls: 'cvc-obj-panel', border: ps.bg, padding: `${D(r, 6)}px ${D(r, 24)}px` }),
     s,
   );
 }
@@ -556,13 +607,14 @@ function renderConceptCards(r: R, c: VcConceptCards): string {
   const s = ground(r);
   const ht = itemTag(c.title, 'Glosario');
   const cards = list(c.cards, 'concept_cards.cards');
+  const ts = surf(r.t, panelBg(r));
   const items = cards
-    .map((k) => row(r, heading(r, ht, k.term, s, 'item') + paragraphs(r, k.definition, s, { last: true, secondary: true }), s, { tag: 'li', cls: 'cvc-term' }))
+    .map((k) => tile(r, heading(r, ht, k.term, ts, 'item') + paragraphs(r, k.definition, ts, { last: true, secondary: true }), ts, { cls: 'cvc-term' }))
     .join('');
   return componentWrap(
     r,
     'concept_cards',
-    sectionKicker(r, 'Glosario', s) + titleIf(r, c.title, s, 'Conceptos clave') + bareList(r, 'ul', items, 'cvc-cols2'),
+    sectionKicker(r, 'Glosario', s) + titleIf(r, c.title, s, 'Conceptos clave') + bareList(r, 'ul', items, 'cvc-cards'),
     s,
   );
 }
@@ -655,7 +707,7 @@ function renderProcessSteps(r: R, c: VcProcessSteps): string {
     .map((sp, i) =>
       row(
         r,
-        `<div class="cvc-step-n">${numeral(r, String(i + 1), s, 'md')}</div>` +
+        `<div class="cvc-step-n">${badge(r, String(i + 1))}</div>` +
           `<div class="cvc-step-b">${heading(r, ht, stripStepPrefix(sp.heading), s, 'item')}${paragraphs(r, sp.body, s, { last: true, secondary: true })}</div>`,
         s,
         { tag: 'li', cls: 'cvc-step' },
@@ -935,7 +987,7 @@ function renderWorkedExample(r: R, c: VcWorkedExample): string {
     .map((sp, i) =>
       row(
         r,
-        `<div class="cvc-step-n">${numeral(r, String(i + 1), s, 'md')}</div>` +
+        `<div class="cvc-step-n">${badge(r, String(i + 1))}</div>` +
           `<div class="cvc-step-b">${heading(r, 'h5', stripStepPrefix(sp.action), s, 'item')}${paragraphs(r, sp.detail, s, { last: true, secondary: true })}</div>`,
         s,
         { tag: 'li', cls: 'cvc-step' },
