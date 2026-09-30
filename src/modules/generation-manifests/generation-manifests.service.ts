@@ -51,11 +51,16 @@ function describeErrors(errors: ManifestValidationError[]): string {
  */
 function storedActivityTypeRules(row: any): ActivityTypeRulesVersion {
   const stored = typeof row?.manifest_json === 'string' ? JSON.parse(row.manifest_json) : row?.manifest_json;
-  const v = stored?.features?.activityTypeRules;
+  return activityTypeRulesValue(stored?.features?.activityTypeRules, row?.id);
+}
+
+/** Valor crudo del marcador (jsonb → number | null; un driver que devuelva texto también sirve). */
+function activityTypeRulesValue(raw: unknown, id: unknown): ActivityTypeRulesVersion {
+  const v = typeof raw === 'string' ? JSON.parse(raw) : raw;
   if (v === undefined || v === null) return 0;
   if (v === 1) return 1;
   throw new InternalServerErrorException(
-    `Generation Manifest #${row?.id}: features.activityTypeRules guardado inválido (${JSON.stringify(v)})`,
+    `Generation Manifest #${String(id)}: features.activityTypeRules guardado inválido (${JSON.stringify(v)})`,
   );
 }
 
@@ -92,14 +97,17 @@ export class GenerationManifestsService {
     // es lazy: configuredRulesVersion() lanza en cada uso de las rutas dynamic
     // que dependen de la config (crear un Manifest, leer "el Manifest actual").
     // Acá solo se deja el error bien visible en el log de arranque.
-    try {
-      readManifestRulesVersionConfig();
-      readActivityTypeRulesConfig();
-    } catch (err) {
-      this.logger.error(
-        `${err instanceof Error ? err.message : String(err)} — las rutas dynamic que crean/leen el Manifest ` +
-          'configurado van a fallar hasta corregirlo; el resto del backend arranca normal',
-      );
+    // Review EV5-C (7): cada config en su propio try, para que un valor inválido
+    // en una no esconda el error de la otra en el log de arranque.
+    for (const read of [readManifestRulesVersionConfig, readActivityTypeRulesConfig]) {
+      try {
+        read();
+      } catch (err) {
+        this.logger.error(
+          `${err instanceof Error ? err.message : String(err)} — las rutas dynamic que crean/leen el Manifest ` +
+            'configurado van a fallar hasta corregirlo; el resto del backend arranca normal',
+        );
+      }
     }
   }
 
@@ -136,6 +144,9 @@ export class GenerationManifestsService {
     // curso legacy nunca adopta las reglas por objetivo (ni regenera sus
     // actividades por activity_type_changed). La fila existente de ESTE
     // Blueprint se verifica igual más abajo con su marcador guardado.
+    // ROLLBACK: volver DYNAMIC_ACTIVITY_TYPE_RULES a 0 solo afecta a los cursos
+    // creados DESPUÉS (su primer Manifest v3); los cursos que ya tienen un
+    // Manifest con reglas 1 las conservan en todas sus versiones siguientes.
     const activityTypeRules: ActivityTypeRulesVersion = rulesVersion === 3 ? await this.activityTypeRulesForNewRow(courseId) : 0;
     const m = buildGenerationManifest(bp.snapshot, source, { rulesVersion, activityTypeRules });
 
@@ -285,14 +296,17 @@ export class GenerationManifestsService {
    * config (lanza si es inválida). Un curso con Manifests nunca lee la config.
    */
   private async activityTypeRulesForNewRow(courseId: number): Promise<ActivityTypeRulesVersion> {
+    // Review EV5-C (4): solo el marcador (jsonb), no el documento entero.
     const [prev] = await this.dataSource.query(
-      `select id, manifest_json from public.course_generation_manifests
+      `select id, manifest_json->'features'->'activityTypeRules' as activity_type_rules
+         from public.course_generation_manifests
         where course_id = $1 and rules_version = 3
         order by created_at desc, id desc
         limit 1`,
       [courseId],
     );
-    return prev ? storedActivityTypeRules(prev) : this.configuredActivityTypeRules();
+    if (!prev) return this.configuredActivityTypeRules();
+    return activityTypeRulesValue(prev.activity_type_rules, prev.id);
   }
 
   /** INSERT v3: columnas de conteo v2 + v3 (supabase-migration-v21-manifest-v3.sql); scorm_count = 0. */

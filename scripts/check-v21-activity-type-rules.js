@@ -360,10 +360,12 @@ async function main() {
           state.rows.push(row);
           return [row];
         }
-        if (/select id, manifest_json from public\.course_generation_manifests/.test(sql)) {
+        if (/select id, manifest_json->'features'->'activityTypeRules' as activity_type_rules/.test(sql)) {
+          // Review (4): solo el marcador jsonb, no el documento. jsonb ausente → null (como Postgres).
           assert(/rules_version = 3/.test(sql) && /order by created_at desc, id desc/.test(sql), 'consulta del Manifest previo');
           return state.rows.filter((r) => r.course_id === params[0] && r.rules_version === 3)
-            .sort((a, b) => b.created_at - a.created_at || b.id - a.id).slice(0, 1);
+            .sort((a, b) => b.created_at - a.created_at || b.id - a.id).slice(0, 1)
+            .map((r) => ({ id: r.id, activity_type_rules: r.manifest_json.features.activityTypeRules ?? null }));
         }
         if (/select \* from public\.course_generation_manifests/.test(sql)) {
           return state.rows.filter((r) => r.blueprint_id === params[0] && r.course_id === params[1] && r.rules_version === params[2]);
@@ -438,6 +440,22 @@ async function main() {
     await withEnv({ ...gcEnv, DYNAMIC_ACTIVITY_TYPE_RULES: 'yes' }, async () => {
       await rejectsRe(new GenerationManifestsService(fakeDs(), blueprints).getOrCreate(COURSE_ID, OWNER, 3), /DYNAMIC_ACTIVITY_TYPE_RULES inválido/, 'basura');
     });
+  });
+
+  await check('arranque: cada config inválida se loguea por separado (una no esconde a la otra)', async () => {
+    const { Logger } = require(require.resolve('@nestjs/common', { paths: [distRoot] }));
+    const orig = Logger.prototype.error;
+    const logged = [];
+    Logger.prototype.error = function (msg) { logged.push(String(msg)); };
+    try {
+      await withEnv({ DYNAMIC_MANIFEST_RULES_VERSION: 'v9', DYNAMIC_ACTIVITY_TYPE_RULES: 'yes' }, async () => {
+        new GenerationManifestsService(fakeDs(), blueprints);
+      });
+    } finally {
+      Logger.prototype.error = orig;
+    }
+    assert(logged.some((m) => /DYNAMIC_MANIFEST_RULES_VERSION inválido/.test(m)), `sin error de rulesVersion: ${logged}`);
+    assert(logged.some((m) => /DYNAMIC_ACTIVITY_TYPE_RULES inválido/.test(m)), `sin error de activityTypeRules: ${logged}`);
   });
 
   // ── 7. Resolvedor + claim + validación al completar ─────────────────────
