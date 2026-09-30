@@ -10,6 +10,10 @@
 //       ensure_pm2_process (pm2 restart --update-env | pm2 start npm -- run
 //       <script>) en el MISMO step y el mismo bloque que los demás workers;
 //       nombres: cursia-dynamic-{item,package}-worker (+ -staging en staging).
+//     - R16 (#1): en deploy-staging.yml los 3 workers dinámicos usan
+//       ensure_pm2_drain_worker (node dist/workers/<w>.js directo, kill_timeout
+//       300 s, reload; un proceso heredado de npm se recrea una vez) —
+//       ejecutado contra un pm2 falso. deploy.yml (producción) sigue igual.
 //     - deploy.yml == deploy.yml de origin/main + EXACTAMENTE las 2 líneas de
 //       los workers (nada más cambió). Base configurable con
 //       DEPLOY_YML_BASE_REF (default origin/main). Si la base ya las contiene
@@ -117,7 +121,18 @@ function pm2StepOf(text, wfName) {
   return steps[0];
 }
 
-function assertWorkersInStep(step, suffix, wfName) {
+/**
+ * R16 (#1): en staging los 3 workers dinámicos se arrancan con
+ * ensure_pm2_drain_worker (node directo + kill_timeout 300 s, reload); el resto
+ * de los procesos sigue con ensure_pm2_process. `drain=false` (producción,
+ * deploy.yml sin cambios en R16): los 3 con ensure_pm2_process como antes.
+ */
+const DRAIN_KILL_TIMEOUT_MS = 300000;
+function workerCall(w, suffix, drain) {
+  return drain ? `ensure_pm2_drain_worker ${w.pm2}${suffix} dist/workers/${w.script}` : `ensure_pm2_process ${w.pm2}${suffix} ${w.npm}`;
+}
+
+function assertWorkersInStep(step, suffix, wfName, drain = false) {
   const script = remoteScriptOf(step.text);
   // Definición de ensure_pm2_process: restart --update-env si existe, si no pm2 start npm -- run <script>.
   const def = /ensure_pm2_process\(\) \{([\s\S]*?)\n\}/.exec(script);
@@ -125,11 +140,20 @@ function assertWorkersInStep(step, suffix, wfName) {
   assert(/sudo pm2 describe "\$name"/.test(def[1]), `${wfName}: ensure_pm2_process no usa pm2 describe`);
   assert(/sudo pm2 restart "\$name" --update-env/.test(def[1]), `${wfName}: ensure_pm2_process no recarga con --update-env`);
   assert(/sudo pm2 start npm --name "\$name" -- run "\$start_script"/.test(def[1]), `${wfName}: ensure_pm2_process no arranca con pm2 start npm -- run`);
-  const calls = script.split('\n').filter((l) => /^ensure_pm2_process /.test(l));
+  if (drain) {
+    const dd = /ensure_pm2_drain_worker\(\) \{([\s\S]*?)\n\}/.exec(script);
+    assert(dd, `${wfName}: falta la definición de ensure_pm2_drain_worker()`);
+    assert(script.includes(`DRAIN_KILL_TIMEOUT_MS=${DRAIN_KILL_TIMEOUT_MS}`), `${wfName}: DRAIN_KILL_TIMEOUT_MS=${DRAIN_KILL_TIMEOUT_MS}`);
+    assert(/sudo pm2 jlist \| node scripts\/pm2-drain-config\.js check "\$name" "\$script" "\$DRAIN_KILL_TIMEOUT_MS"/.test(dd[1]), `${wfName}: drain worker sin pm2-drain-config check`);
+    assert(/sudo pm2 reload "\$name" --update-env/.test(dd[1]), `${wfName}: drain worker no recarga con reload --update-env`);
+    assert(/sudo pm2 start "\$script" --name "\$name" --kill-timeout "\$DRAIN_KILL_TIMEOUT_MS"/.test(dd[1]), `${wfName}: drain worker no arranca node directo con --kill-timeout`);
+    assert(!/npm/.test(dd[1]), `${wfName}: drain worker no debe pasar por npm (la señal no llegaría a Node)`);
+  }
+  const calls = script.split('\n').filter((l) => /^ensure_pm2_(process|drain_worker) /.test(l));
   const fullIdx = calls.indexOf(`ensure_pm2_process cursia-full-worker${suffix} start:full-worker`);
   assert(fullIdx >= 0, `${wfName}: no se encontró el full-worker (referencia del bloque de workers)`);
   for (const w of WORKERS) {
-    const want = `ensure_pm2_process ${w.pm2}${suffix} ${w.npm}`;
+    const want = workerCall(w, suffix, drain);
     eq(calls.filter((c) => c === want).length, 1, `${wfName}: "${want}" (una sola vez)`);
     assert(calls.indexOf(want) > fullIdx, `${wfName}: "${want}" debe ir en el bloque de workers, después del full-worker`);
   }
@@ -138,7 +162,7 @@ function assertWorkersInStep(step, suffix, wfName) {
   const saveIdx = lines.indexOf('sudo pm2 save');
   assert(saveIdx > 0, `${wfName}: falta sudo pm2 save`);
   for (const w of WORKERS) {
-    const i = lines.indexOf(`ensure_pm2_process ${w.pm2}${suffix} ${w.npm}`);
+    const i = lines.indexOf(workerCall(w, suffix, drain));
     assert(i >= 0 && i < saveIdx, `${wfName}: ${w.pm2}${suffix} debe arrancarse antes de "sudo pm2 save"`);
   }
   // Nombres PM2 coherentes: sin sufijo en prod, todos con -staging en staging.
@@ -150,6 +174,7 @@ function assertWorkersInStep(step, suffix, wfName) {
   // Los scripts npm existen y apuntan al worker compilado.
   const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
   for (const w of WORKERS) eq(pkg.scripts[w.npm], `node dist/workers/${w.script}`, `package.json ${w.npm}`);
+  if (drain) for (const w of WORKERS) assert(fs.existsSync(path.join(distRoot, 'workers', w.script)), `dist/workers/${w.script} no existe`);
   return script;
 }
 
@@ -376,10 +401,63 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     bashSyntaxOk(script, 'deploy.yml (script remoto)');
   });
 
-  await check('(a) deploy-staging.yml: arranca/recarga los 3 workers dinámicos -staging con PM2 en el step de los workers', () => {
+  await check('(a) deploy-staging.yml: arranca/recarga los 3 workers dinámicos -staging con PM2 en el step de los workers (R16: node directo + kill_timeout 300 s)', () => {
     const step = pm2StepOf(stagingText, 'deploy-staging.yml');
-    const script = assertWorkersInStep(step, '-staging', 'deploy-staging.yml');
+    const script = assertWorkersInStep(step, '-staging', 'deploy-staging.yml', true);
     bashSyntaxOk(script, 'deploy-staging.yml (script remoto)');
+  });
+
+  await check('(R16 #1) ensure_pm2_drain_worker ejecutado con pm2 falso: ausente → start node directo --kill-timeout 300000; heredado (npm run / 1,6 s) → delete + start UNA vez; ya configurado → reload --update-env; nunca npm', () => {
+    const script = remoteScriptOf(pm2StepOf(stagingText, 'deploy-staging.yml').text);
+    const lines = script.split('\n');
+    const a = lines.findIndex((l) => l.startsWith('DRAIN_KILL_TIMEOUT_MS='));
+    const b = lines.findIndex((l, i) => i > a && l === '}');
+    assert(a >= 0 && b > a, 'no se pudo aislar ensure_pm2_drain_worker');
+    const fn = lines.slice(a, b + 1).join('\n');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'r16-pm2-drain-'));
+    try {
+      fs.mkdirSync(path.join(dir, 'bin'));
+      fs.mkdirSync(path.join(dir, 'scripts'));
+      fs.copyFileSync(path.join(repoRoot, 'scripts', 'pm2-drain-config.js'), path.join(dir, 'scripts', 'pm2-drain-config.js'));
+      // sudo falso: ejecuta el resto; pm2 falso: registra argumentos, describe según PM2_EXISTS, jlist desde PM2_JLIST.
+      fs.writeFileSync(path.join(dir, 'bin', 'sudo'), '#!/bin/sh\nexec "$@"\n', { mode: 0o755 });
+      fs.writeFileSync(path.join(dir, 'bin', 'pm2'),
+        '#!/bin/sh\necho "pm2 $*" >> "$PM2_LOG"\ncase "$1" in\n  describe) [ "$PM2_EXISTS" = 1 ] && exit 0 || exit 1 ;;\n  jlist) cat "$PM2_JLIST" ;;\nesac\nexit 0\n', { mode: 0o755 });
+      const name = 'cursia-dynamic-item-worker-staging';
+      const scriptRel = 'dist/workers/dynamic-item-worker.js';
+      const runCase = (exists, jlist) => {
+        const log = path.join(dir, `log-${Math.random().toString(36).slice(2)}`);
+        const jl = path.join(dir, 'jlist.json');
+        fs.writeFileSync(jl, JSON.stringify(jlist));
+        const r = spawnSync('bash', ['-c', `set -e\n${fn}\nensure_pm2_drain_worker ${name} ${scriptRel}`], {
+          cwd: dir, encoding: 'utf8',
+          env: { PATH: `${path.join(dir, 'bin')}:${process.env.PATH}`, PM2_LOG: log, PM2_EXISTS: exists ? '1' : '0', PM2_JLIST: jl },
+        });
+        assert(r.status === 0, `bash falló: ${r.stderr}`);
+        return fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : [];
+      };
+      const startLine = `pm2 start ${scriptRel} --name ${name} --kill-timeout 300000`;
+      eq(runCase(false, []), [`pm2 describe ${name}`, startLine], 'ausente → start directo');
+      const legacy = [{ name, pm2_env: { pm_exec_path: '/usr/bin/npm', kill_timeout: 1600, env: { SECRET: 'nunca-impreso' } } }];
+      eq(runCase(true, legacy), [`pm2 describe ${name}`, 'pm2 jlist', `pm2 delete ${name}`, startLine], 'heredado npm → recrear');
+      const shortKt = [{ name, pm2_env: { pm_exec_path: `/var/www/x/${scriptRel}`, kill_timeout: 1600 } }];
+      eq(runCase(true, shortKt), [`pm2 describe ${name}`, 'pm2 jlist', `pm2 delete ${name}`, startLine], 'kill_timeout corto → recrear');
+      const ok = [{ name, pm2_env: { pm_exec_path: `/var/www/x/${scriptRel}`, kill_timeout: 300000 } }];
+      eq(runCase(true, ok), [`pm2 describe ${name}`, 'pm2 jlist', `pm2 reload ${name} --update-env`], 'configurado → reload');
+      // Pura: nunca imprime el entorno; exit 2 con uso inválido.
+      const { drainConfigStatus } = require(path.join(repoRoot, 'scripts', 'pm2-drain-config.js'));
+      eq(drainConfigStatus(ok, name, scriptRel, 300000).ok, true, 'pura ok');
+      eq(drainConfigStatus(legacy, name, scriptRel, 300000).ok, false, 'pura heredado');
+      const cli = spawnSync(process.execPath, [path.join(repoRoot, 'scripts', 'pm2-drain-config.js'), 'check', name, scriptRel, '300000'], { input: JSON.stringify(legacy), encoding: 'utf8' });
+      eq(cli.status, 1, 'CLI heredado → 1');
+      assert(!/nunca-impreso/.test(cli.stdout + cli.stderr), 'no imprime el entorno');
+      eq(spawnSync(process.execPath, [path.join(repoRoot, 'scripts', 'pm2-drain-config.js'), 'check'], { input: '[]', encoding: 'utf8' }).status, 2, 'uso inválido → 2');
+      // El tope interno de drenado queda por debajo del kill_timeout de PM2.
+      const WD = require(path.join(distRoot, 'workers', 'worker-drain.js'));
+      assert(WD.DEFAULT_DRAIN_TIMEOUT_MS < DRAIN_KILL_TIMEOUT_MS && WD.PM2_KILL_TIMEOUT_MS === DRAIN_KILL_TIMEOUT_MS, 'drenado (270 s) < kill_timeout (300 s)');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   await check(`(a) deploy.yml = base (origin/main) + EXACTAMENTE las ${PROD_ADDED_LINES.length} líneas de los workers dinámicos (ningún otro step cambió)`, () => {
