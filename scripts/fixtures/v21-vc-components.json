@@ -222,6 +222,58 @@
           "a": "No. Es reconocer que su emoción es comprensible, sin juzgar el contenido."
         }
       ]
+    },
+    {
+      "type": "worked_example",
+      "title": "Calcular el costo real de una hora de escucha activa en un centro de llamadas",
+      "situation": "Una supervisora quiere saber cuánto cuesta capacitar a su equipo en escucha activa y si se recupera la inversión con menos reclamos repetidos.",
+      "data": [
+        "Equipo: 12 agentes",
+        "Costo por agente del taller: $180.000",
+        "Reclamos repetidos por mes antes: 40",
+        "Costo de atender un reclamo repetido: $25.000",
+        "Reducción esperada tras el taller: 30 %"
+      ],
+      "steps": [
+        {
+          "action": "Calcula la inversión total",
+          "detail": "Multiplica los agentes por el costo del taller: 12 × $180.000 = $2.160.000."
+        },
+        {
+          "action": "Estima el ahorro mensual",
+          "detail": "El 30 % de 40 reclamos son 12 reclamos menos; 12 × $25.000 = $300.000 al mes."
+        },
+        {
+          "action": "Calcula el tiempo de recuperación",
+          "detail": "Divide la inversión entre el ahorro mensual: $2.160.000 ÷ $300.000 = 7,2 meses."
+        }
+      ],
+      "result": "La inversión se recupera en poco más de 7 meses; desde ahí, cada mes el centro ahorra $300.000.",
+      "takeaway": "Compara siempre la inversión con un ahorro medible del proceso, no con una impresión general."
+    },
+    {
+      "type": "diagram",
+      "kind": "cycle",
+      "title": "El ciclo de la escucha activa",
+      "caption": "Cada conversación recorre estas etapas; la última alimenta la siguiente conversación.",
+      "nodes": [
+        {
+          "label": "Atender",
+          "detail": "Contacto visual y cuerpo orientado hacia quien habla."
+        },
+        {
+          "label": "Comprender",
+          "detail": "Preguntas abiertas para aclarar lo que no quedó claro."
+        },
+        {
+          "label": "Parafrasear",
+          "detail": "Repetir con tus palabras para confirmar."
+        },
+        {
+          "label": "Responder",
+          "detail": "Proponer un siguiente paso concreto."
+        }
+      ]
     }
   ],
   "callout_variants": [
@@ -399,6 +451,76 @@
             "Cambia de tema sin resolver",
             "Reconoce, explora y acuerda"
           ]
+        }
+      ]
+    }
+  ],
+  "diagram_variants": [
+    {
+      "type": "diagram",
+      "kind": "flow",
+      "title": "Del reclamo a la solución",
+      "nodes": [
+        {
+          "label": "Recibir el reclamo"
+        },
+        {
+          "label": "Escuchar sin interrumpir",
+          "detail": "Anota palabras clave del cliente."
+        },
+        {
+          "label": "Confirmar el problema"
+        },
+        {
+          "label": "Acordar una solución"
+        }
+      ]
+    },
+    {
+      "type": "diagram",
+      "kind": "hierarchy",
+      "title": "Tipos de escucha",
+      "nodes": [
+        {
+          "label": "Escucha",
+          "detail": "Forma en que prestamos atención al otro."
+        },
+        {
+          "label": "Pasiva",
+          "detail": "Oyes sin intervenir."
+        },
+        {
+          "label": "Selectiva",
+          "detail": "Solo captas lo que te interesa."
+        },
+        {
+          "label": "Activa",
+          "detail": "Comprendes, confirmas y respondes."
+        }
+      ]
+    },
+    {
+      "type": "diagram",
+      "kind": "matrix",
+      "title": "Priorizar reclamos",
+      "x_axis": "Urgencia",
+      "y_axis": "Impacto en el cliente",
+      "nodes": [
+        {
+          "label": "Planificar",
+          "detail": "Alto impacto, baja urgencia."
+        },
+        {
+          "label": "Atender ya",
+          "detail": "Alto impacto, alta urgencia."
+        },
+        {
+          "label": "Registrar",
+          "detail": "Bajo impacto, baja urgencia."
+        },
+        {
+          "label": "Delegar",
+          "detail": "Bajo impacto, alta urgencia."
         }
       ]
     }

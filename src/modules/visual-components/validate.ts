@@ -13,12 +13,15 @@ import {
   VC_BRIDGE_MAX,
   VC_CHAPTER_ID_MAX,
   VC_COMPONENT_SPECS,
+  VC_DIAGRAM_NODES,
+  VC_ILLUSTRATIVE_TYPES,
   VC_MAX_SAME_TYPE,
   VC_MIN_DISTINCT_TYPES,
   VC_MOVEMENT_IDS,
   VC_MOVEMENT_LIMITS,
   VC_SCHEMA_VERSION,
   VcComponentType,
+  VcDiagramKind,
   VcFieldSpec,
 } from './schema';
 import { lintView } from './text';
@@ -45,6 +48,7 @@ export type VcErrorCode =
   | 'HTML_IN_TEXT'
   | 'RESOURCE_MENTION'
   | 'QUANTITY_CLAIM'
+  | 'DIAGRAM_SHAPE'
   | 'CHAPTER_ID';
 
 export interface VcValidationError {
@@ -145,9 +149,23 @@ export function lintResourceMentions(text: string): VcTextLintHit[] {
   return Array.from(norm.matchAll(RESOURCE_RE), (m) => ({ code: 'RESOURCE_MENTION' as const, match: m[0] }));
 }
 
-export function lintQuantityClaims(text: string): VcTextLintHit[] {
+/**
+ * Modo ILUSTRATIVO (Edu Phase A, `worked_example`): un caso resuelto necesita datos ("margen del
+ * 30 %", "tarda 3 horas"); son hipotéticos y rotulados como tales. Se siguen prohibiendo las
+ * cantidades de la ESTRUCTURA del curso ("3 módulos", "capítulo 2", "10 preguntas").
+ */
+const COURSE_STRUCTURE_WORDS = ['modulos?', 'capitulos?', 'videos?', 'actividad(?:es)?', 'preguntas?', 'intentos?'].join('|');
+const QUANTITY_ILLUSTRATIVE_RE = new RegExp(
+  [
+    `${WB_START}${NUM}\\s*(?:${COURSE_STRUCTURE_WORDS})${WB_END}`,
+    `${WB_START}(?:${COURSE_STRUCTURE_WORDS})\\s*(?:n\\s*[°º.]?\\s*)?${NUM}`,
+  ].join('|'),
+  'gu',
+);
+
+export function lintQuantityClaims(text: string, illustrative = false): VcTextLintHit[] {
   const norm = normalizeForLint(lintView(String(text ?? '')));
-  return Array.from(norm.matchAll(QUANTITY_RE), (m) => ({ code: 'QUANTITY_CLAIM' as const, match: m[0] }));
+  return Array.from(norm.matchAll(illustrative ? QUANTITY_ILLUSTRATIVE_RE : QUANTITY_RE), (m) => ({ code: 'QUANTITY_CLAIM' as const, match: m[0] }));
 }
 
 // ─── Plain-text checks ──────────────────────────────────────────────────────
@@ -159,7 +177,7 @@ const CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
 // Invisibles que evadirían los lints ("vid\u200Beo") o romperían el renderer (uso privado).
 const INVISIBLE_RE = /[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\uE000-\uF8FF]/;
 
-function checkText(value: unknown, path: string, max: number, errors: VcValidationError[]): void {
+function checkText(value: unknown, path: string, max: number, errors: VcValidationError[], illustrative = false): void {
   if (typeof value !== 'string') {
     errors.push({ path, code: 'TYPE_MISMATCH', message: 'se esperaba texto (string)' });
     return;
@@ -188,7 +206,7 @@ function checkText(value: unknown, path: string, max: number, errors: VcValidati
   for (const hit of lintResourceMentions(value)) {
     errors.push({ path, code: 'RESOURCE_MENTION', message: `menciona un recurso: "${hit.match}"` });
   }
-  for (const hit of lintQuantityClaims(value)) {
+  for (const hit of lintQuantityClaims(value, illustrative)) {
     errors.push({ path, code: 'QUANTITY_CLAIM', message: `afirma una cantidad: "${hit.match}"` });
   }
 }
@@ -203,10 +221,10 @@ function checkCount(arr: unknown[], min: number, max: number, path: string, erro
   }
 }
 
-function checkField(spec: VcFieldSpec, value: unknown, path: string, errors: VcValidationError[]): void {
+function checkField(spec: VcFieldSpec, value: unknown, path: string, errors: VcValidationError[], illustrative = false): void {
   switch (spec.kind) {
     case 'text':
-      checkText(value, path, spec.max, errors);
+      checkText(value, path, spec.max, errors, illustrative);
       return;
     case 'enum':
       if (typeof value !== 'string' || !spec.values.includes(value)) {
@@ -219,7 +237,7 @@ function checkField(spec: VcFieldSpec, value: unknown, path: string, errors: VcV
         return;
       }
       checkCount(value, spec.min, spec.max, path, errors);
-      value.forEach((item, i) => checkText(item, `${path}[${i}]`, spec.itemMax, errors));
+      value.forEach((item, i) => checkText(item, `${path}[${i}]`, spec.itemMax, errors, illustrative));
       return;
     case 'objList':
       if (!Array.isArray(value)) {
@@ -227,7 +245,7 @@ function checkField(spec: VcFieldSpec, value: unknown, path: string, errors: VcV
         return;
       }
       checkCount(value, spec.min, spec.max, path, errors);
-      value.forEach((item, i) => checkObject(spec.fields, item, `${path}[${i}]`, errors));
+      value.forEach((item, i) => checkObject(spec.fields, item, `${path}[${i}]`, errors, [], illustrative));
       return;
   }
 }
@@ -238,6 +256,7 @@ function checkObject(
   path: string,
   errors: VcValidationError[],
   implicit: string[] = [],
+  illustrative = false,
 ): void {
   if (!isPlainObject(value)) {
     errors.push({ path, code: 'NOT_OBJECT', message: 'se esperaba un objeto' });
@@ -254,7 +273,7 @@ function checkObject(
       if (!spec.optional) errors.push({ path: `${path}.${key}`, code: 'MISSING_FIELD', message: `falta "${key}"` });
       continue;
     }
-    checkField(spec, v, `${path}.${key}`, errors);
+    checkField(spec, v, `${path}.${key}`, errors, illustrative);
   }
 }
 
@@ -270,7 +289,22 @@ export function validateComponent(c: unknown, path = 'component'): VcValidationE
     errors.push({ path: `${path}.type`, code: 'UNKNOWN_COMPONENT', message: `tipo de componente desconocido "${String(type)}"` });
     return errors;
   }
-  checkObject(VC_COMPONENT_SPECS[type as VcComponentType], c, path, errors, ['type']);
+  checkObject(VC_COMPONENT_SPECS[type as VcComponentType], c, path, errors, ['type'], VC_ILLUSTRATIVE_TYPES.includes(type as VcComponentType));
+  if (type === 'diagram' && typeof c.kind === 'string' && hasOwn(VC_DIAGRAM_NODES, c.kind)) {
+    const kind = c.kind as VcDiagramKind;
+    const [nmin, nmax] = VC_DIAGRAM_NODES[kind];
+    if (Array.isArray(c.nodes) && (c.nodes.length < nmin || c.nodes.length > nmax)) {
+      errors.push({ path: `${path}.nodes`, code: 'DIAGRAM_SHAPE', message: `un diagrama "${kind}" lleva ${nmin === nmax ? nmin : `${nmin}–${nmax}`} nodos (hay ${c.nodes.length})` });
+    }
+    for (const ax of ['x_axis', 'y_axis'] as const) {
+      if (kind === 'matrix' && c[ax] === undefined) {
+        errors.push({ path: `${path}.${ax}`, code: 'DIAGRAM_SHAPE', message: `una matriz necesita "${ax}"` });
+      }
+      if (kind !== 'matrix' && c[ax] !== undefined) {
+        errors.push({ path: `${path}.${ax}`, code: 'DIAGRAM_SHAPE', message: `"${ax}" solo aplica a diagramas "matrix"` });
+      }
+    }
+  }
   const columns = c.columns;
   if (type === 'comparison' && Array.isArray(columns) && Array.isArray(c.rows)) {
     c.rows.forEach((row, i) => {

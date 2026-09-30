@@ -27,10 +27,10 @@ function loadFixture() {
   return JSON.parse(fs.readFileSync(FIXTURE, 'utf8'));
 }
 
-/** Un componente de cada tipo (16) + variantes de callout + comparaciones de 3 y 4 columnas × 8 filas. */
+/** Un componente de cada tipo (18) + variantes de diagrama (flow/hierarchy/matrix) + variantes de callout + comparaciones de 3 y 4 columnas × 8 filas. */
 function loadComponents() {
   const f = loadFixture();
-  return [...f.components, ...f.callout_variants, ...(f.comparison_variants || [])].map(clone);
+  return [...f.components, ...f.callout_variants, ...(f.comparison_variants || []), ...(f.diagram_variants || [])].map(clone);
 }
 
 function byType(type, variant) {
@@ -67,7 +67,7 @@ const LONG_WORD = ('Responsabilidad' + 'Interdepartamental').repeat(12).slice(0,
 function longVariant(c) {
   const sentence = ' ' + 'La escucha activa se demuestra con acciones concretas y verificables. '.repeat(4).trim();
   const walk = (v, key) => {
-    if (key === 'type' || key === 'variant') return v;
+    if (key === 'type' || key === 'variant' || key === 'kind') return v;
     if (typeof v === 'string') return LONG_WORD + sentence;
     if (Array.isArray(v)) return v.map((x) => walk(x, null));
     if (v && typeof v === 'object') {
@@ -84,6 +84,7 @@ function longVariant(c) {
 function fixtureName(c) {
   if (c.type === 'callout') return `callout-${c.variant}`;
   if (c.type === 'comparison') return `comparison-${c.columns.length}col`;
+  if (c.type === 'diagram') return `diagram-${c.kind}`;
   return c.type;
 }
 
@@ -91,7 +92,7 @@ function fixtureName(c) {
 function textsOf(c) {
   const out = [];
   const walk = (v, key) => {
-    if (key === 'type' || key === 'variant') return;
+    if (key === 'type' || key === 'variant' || key === 'kind') return;
     if (typeof v === 'string') out.push(v.split('**').join(''));
     else if (Array.isArray(v)) v.forEach((x) => walk(x, null));
     else if (v && typeof v === 'object') Object.keys(v).forEach((k) => walk(v[k], k));

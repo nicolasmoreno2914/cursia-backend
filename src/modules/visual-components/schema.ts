@@ -27,7 +27,9 @@ export type VcComponentType =
   | 'reflection'
   | 'callout'
   | 'summary_visual'
-  | 'self_check';
+  | 'self_check'
+  | 'worked_example'
+  | 'diagram';
 
 export type VcCalloutVariant = 'tip' | 'warning' | 'info' | 'example';
 
@@ -54,6 +56,38 @@ export interface VcReflection { type: 'reflection'; prompt: string; hint?: strin
 export interface VcCallout { type: 'callout'; variant: VcCalloutVariant; title?: string; body: string }
 export interface VcSummaryVisual { type: 'summary_visual'; central: string; points: string[] }
 export interface VcSelfCheck { type: 'self_check'; title?: string; items: { q: string; a: string }[] }
+/**
+ * Edu Phase A — ejemplo resuelto: un caso COMPLETO (situación con datos → proceso → resultado).
+ * Los datos son ilustrativos (hipotéticos): se permiten cifras y porcentajes en este componente,
+ * nunca cantidades de la estructura del curso (ver lintQuantityClaims, modo ilustrativo).
+ */
+export interface VcWorkedExample {
+  type: 'worked_example';
+  title: string;
+  situation: string;
+  data: string[];
+  steps: { action: string; detail: string }[];
+  result: string;
+  takeaway?: string;
+}
+export type VcDiagramKind = 'cycle' | 'flow' | 'hierarchy' | 'matrix';
+/**
+ * Edu Phase A — diagrama educativo. Formas fijas; el LLM llena nodos, Cursia dibuja
+ * (HTML/CSS + SVG decorativo en ENHANCED; lista/tabla legible en CLEAN_SAFE).
+ *  - cycle / flow: 3–6 nodos en orden.
+ *  - hierarchy: nodes[0] = raíz, el resto (2–5) sus componentes.
+ *  - matrix: exactamente 4 cuadrantes [arriba-izq, arriba-der, abajo-izq, abajo-der] + x_axis/y_axis
+ *    (cada eje crece hacia la derecha / hacia arriba).
+ */
+export interface VcDiagram {
+  type: 'diagram';
+  kind: VcDiagramKind;
+  title: string;
+  caption?: string;
+  nodes: { label: string; detail?: string }[];
+  x_axis?: string;
+  y_axis?: string;
+}
 
 export type VcComponent =
   | VcHero
@@ -71,7 +105,9 @@ export type VcComponent =
   | VcReflection
   | VcCallout
   | VcSummaryVisual
-  | VcSelfCheck;
+  | VcSelfCheck
+  | VcWorkedExample
+  | VcDiagram;
 
 export type VcMovementId = 'opening' | 'deepening' | 'synthesis' | 'closing' | 'video_primer' | 'self_check';
 
@@ -94,6 +130,16 @@ const T = (max: number, optional = false): VcFieldSpec => ({ kind: 'text', max, 
 const TITLE = T(120, true);
 
 export const VC_CALLOUT_VARIANTS: readonly VcCalloutVariant[] = ['tip', 'warning', 'info', 'example'];
+export const VC_DIAGRAM_KINDS: readonly VcDiagramKind[] = ['cycle', 'flow', 'hierarchy', 'matrix'];
+/** Nodos por forma de diagrama [min, max] (además del rango genérico 2–8 del spec). */
+export const VC_DIAGRAM_NODES: Record<VcDiagramKind, [number, number]> = {
+  cycle: [3, 6],
+  flow: [3, 6],
+  hierarchy: [3, 6],
+  matrix: [4, 4],
+};
+/** Tipos cuyos textos son datos ILUSTRATIVOS: cifras y % permitidos (no cantidades del curso). */
+export const VC_ILLUSTRATIVE_TYPES: readonly VcComponentType[] = ['worked_example'];
 
 /** Campos permitidos por tipo (additionalProperties: false). `type` es implícito. */
 export const VC_COMPONENT_SPECS: Record<VcComponentType, Record<string, VcFieldSpec>> = {
@@ -149,6 +195,22 @@ export const VC_COMPONENT_SPECS: Record<VcComponentType, Record<string, VcFieldS
   self_check: {
     title: TITLE,
     items: { kind: 'objList', min: 2, max: 4, fields: { q: T(300), a: T(600) } },
+  },
+  worked_example: {
+    title: T(120),
+    situation: T(500),
+    data: { kind: 'textList', min: 2, max: 6, itemMax: 160 },
+    steps: { kind: 'objList', min: 3, max: 6, fields: { action: T(120), detail: T(400) } },
+    result: T(400),
+    takeaway: T(300, true),
+  },
+  diagram: {
+    kind: { kind: 'enum', values: VC_DIAGRAM_KINDS },
+    title: T(120),
+    caption: T(300, true),
+    nodes: { kind: 'objList', min: 2, max: 8, fields: { label: T(48), detail: T(160, true) } },
+    x_axis: T(48, true),
+    y_axis: T(48, true),
   },
 };
 

@@ -44,6 +44,8 @@ import {
   VcSummaryVisual,
   VcTabs,
   VcTimeline,
+  VcWorkedExample,
+  VcDiagram,
 } from './schema';
 import { HYPHEN_HEADING, HYPHEN_TABLE, HyphenOpts, inlineHtml, labelHtml, richParagraphs } from './text';
 import { runtimeScript, scopedStyle } from './runtime';
@@ -238,7 +240,7 @@ function indexText(r: R, i: number): string {
 // ─── Primitivas tipográficas ────────────────────────────────────────────────
 
 /** Ritmo: los componentes "mayores" respiran más antes del siguiente (64 vs 44, × densidad). */
-const MAJOR_TYPES = new Set(['hero', 'process_steps', 'comparison', 'summary_visual', 'case_scenario', 'timeline', 'accordion', 'concept_cards', 'tabs']);
+const MAJOR_TYPES = new Set(['hero', 'process_steps', 'comparison', 'summary_visual', 'case_scenario', 'timeline', 'accordion', 'concept_cards', 'tabs', 'worked_example', 'diagram']);
 
 function componentWrap(r: R, type: string, inner: string, s: Surf, extraSafe: Decl[] = [], extraEnh: Decl[] = [], cls = ''): string {
   const ty = r.t.typography;
@@ -919,6 +921,130 @@ function renderSelfCheck(r: R, c: VcSelfCheck): string {
   return componentWrap(r, 'self_check', sectionKicker(r, counted(r, 'Autoevaluación', its.length, 'pregunta', 'preguntas'), s) + titleIf(r, c.title, s, 'Repaso rápido') + bareList(r, 'ol', items), s);
 }
 
+/**
+ * Edu Phase A — ejemplo resuelto: situación → datos (ilustrativos) → resolución paso a paso →
+ * resultado (panel, la única superficie) → para recordar. Todo abierto: es contenido, no revelado.
+ */
+function renderWorkedExample(r: R, c: VcWorkedExample): string {
+  const s = ground(r);
+  const ps = surf(r.t, panelBg(r));
+  const data = list(c.data, 'worked_example.data')
+    .map((d) => row(r, `<span class="cvc-li-t">${inlineHtml(d)}</span>`, s, { tag: 'li', cls: 'cvc-we-datum' }))
+    .join('');
+  const steps = list(c.steps, 'worked_example.steps')
+    .map((sp, i) =>
+      row(
+        r,
+        `<div class="cvc-step-n">${numeral(r, String(i + 1), s, 'md')}</div>` +
+          `<div class="cvc-step-b">${heading(r, 'h5', stripStepPrefix(sp.action), s, 'item')}${paragraphs(r, sp.detail, s, { last: true, secondary: true })}</div>`,
+        s,
+        { tag: 'li', cls: 'cvc-step' },
+      ),
+    )
+    .join('');
+  const result =
+    kicker(r, 'Resultado', ps, { color: r.t.color.success }) +
+    paragraphs(r, c.result, ps, { weight: 600, last: !c.takeaway }) +
+    (c.takeaway ? kicker(r, 'Para recordar', ps, { margin: `${D(r, 16)}px 0 6px 0` }) + paragraphs(r, c.takeaway, ps, { last: true, secondary: true }) : '');
+  const inner =
+    sectionKicker(r, 'Ejemplo resuelto', s) +
+    heading(r, 'h4', c.title, s, 'title') +
+    paragraphs(r, c.situation, s) +
+    kicker(r, 'Datos del caso (ilustrativos)', s, { margin: `${D(r, 20)}px 0 4px 0` }) +
+    bareList(r, 'ul', data, 'cvc-cols2 cvc-we-data') +
+    kicker(r, 'Resolución paso a paso', s, { margin: `${D(r, 24)}px 0 4px 0` }) +
+    bareList(r, 'ol', steps, 'cvc-steps') +
+    `<div${st(r, [['margin', `${D(r, 20)}px 0 0 0`]])}>${panel(r, result, ps, { cls: 'cvc-we-result', border: readable(ps.bg, [r.t.color.success], r.t.color.border), borderWidth: 2 })}</div>`;
+  return componentWrap(r, 'worked_example', inner, s);
+}
+
+const DIAGRAM_KIND_LABEL: Record<VcDiagram['kind'], string> = {
+  cycle: 'Ciclo',
+  flow: 'Flujo',
+  hierarchy: 'Estructura',
+  matrix: 'Matriz',
+};
+
+/** Nodo de diagrama: etiqueta (h5) + detalle opcional. En ENHANCED el CSS lo convierte en caja. */
+function diagramNode(r: R, n: { label: string; detail?: string }, s: Surf, idx: string | null, cls: string): string {
+  const num = idx === null ? '' : `<span class="cvc-dg-i"${st(r, [['color', readable(s.bg, [r.t.color.accentStrong, r.t.color.accent], s.fg)], ['font-family', r.t.personality.fontNumeral], ['font-weight', '700']], [['font-variant-numeric', 'tabular-nums']])}>${labelHtml(idx)}</span> `;
+  return (
+    `<li class="cvc-dg-node ${cls}"${st(r, [['margin', `0 0 ${D(r, 10)}px 0`], ['padding', '10px 14px'], ['background-color', s.bg], ['color', s.fg], ['border', `1px solid ${r.t.color.borderStrong}`]], [['border-radius', r.t.shape.radiusMd]])}>` +
+    `<p${st(r, [['margin', 0], ['padding', 0], ['color', s.fg], ['font-weight', '700'], ['line-height', '1.35']])}>${num}${inlineHtml(n.label)}</p>` +
+    (n.detail ? paragraphs(r, n.detail, s, { last: true, secondary: true }) : '') +
+    `</li>`
+  );
+}
+
+/** Anillo decorativo (solo ENHANCED, aria-hidden, sin texto): un punto por etapa y el sentido de giro. */
+function cycleRing(r: R, n: number, s: Surf): string {
+  const acc = readable(s.bg, [r.t.color.accent, r.t.color.accentStrong], r.t.color.borderStrong);
+  const R0 = 70;
+  const dots = Array.from({ length: n }, (_, i) => {
+    const a = -Math.PI / 2 + (2 * Math.PI * i) / n;
+    const x = (100 + R0 * Math.cos(a)).toFixed(1);
+    const y = (100 + R0 * Math.sin(a)).toFixed(1);
+    return `<circle cx="${x}" cy="${y}" r="${i === 0 ? 11 : 9}" fill="${acc}"/>`;
+  }).join('');
+  return (
+    `<svg class="cvc-dg-ring" viewBox="0 0 200 200" width="160" height="160" aria-hidden="true" focusable="false">` +
+    `<circle cx="100" cy="100" r="${R0}" fill="none" stroke="${r.t.color.borderStrong}" stroke-width="3"/>` +
+    `<path d="M150 42 L162 50 L148 56 Z" fill="${r.t.color.borderStrong}"/>` +
+    dots +
+    `</svg>`
+  );
+}
+
+function renderDiagram(r: R, c: VcDiagram): string {
+  const s = ground(r);
+  const nodes = list(c.nodes, 'diagram.nodes');
+  const head =
+    sectionKicker(r, `Diagrama · ${DIAGRAM_KIND_LABEL[c.kind] ?? 'Esquema'}`, s) +
+    heading(r, 'h4', c.title, s, 'title') +
+    (c.caption ? paragraphs(r, c.caption, s, { secondary: true }) : '');
+  let body = '';
+  if (c.kind === 'cycle' || c.kind === 'flow') {
+    const items = nodes.map((n, i) => diagramNode(r, n, s, String(i + 1), c.kind === 'flow' ? 'cvc-dg-step' : 'cvc-dg-stage')).join('');
+    const loop = c.kind === 'cycle' ? paragraphs(r, `Después de «${nodes[nodes.length - 1].label}», el ciclo vuelve a empezar en «${nodes[0].label}».`, s, { secondary: true, last: true }) : '';
+    body =
+      `<div class="cvc-dg cvc-dg-${c.kind}">` +
+      (c.kind === 'cycle' && r.enh ? cycleRing(r, nodes.length, s) : '') +
+      `<div class="cvc-dg-body">${bareList(r, 'ol', items, 'cvc-dg-list')}${loop}</div>` +
+      `</div>`;
+  } else if (c.kind === 'hierarchy') {
+    const [root, ...kids] = nodes;
+    const ps = surf(r.t, panelBg(r));
+    const rootBox =
+      `<div class="cvc-dg-root"${st(r, [['margin', `0 0 ${D(r, 12)}px 0`], ['padding', '12px 16px'], ['background-color', ps.bg], ['color', ps.fg], ['border', `2px solid ${readable(ps.bg, [r.t.color.accent, r.t.color.accentStrong], r.t.color.borderStrong)}`]], [['border-radius', r.t.shape.radiusMd]])}>` +
+      `<p${st(r, [['margin', 0], ['padding', 0], ['color', ps.fg], ['font-weight', '700']])}>${inlineHtml(root.label)}</p>` +
+      (root.detail ? paragraphs(r, root.detail, ps, { last: true, secondary: true }) : '') +
+      `</div>`;
+    body = `<div class="cvc-dg cvc-dg-hierarchy">${rootBox}${bareList(r, 'ul', kids.map((n) => diagramNode(r, n, s, null, 'cvc-dg-child')).join(''), 'cvc-dg-kids')}</div>`;
+  } else {
+    // matrix: tabla 2×2 real (sobrevive a forceclean y cabe a 390 px); ejes como encabezados.
+    const ps = surf(r.t, panelBg(r));
+    const cell = (n: { label: string; detail?: string }, hi: boolean): string => {
+      const x = hi ? ps : s;
+      return (
+        `<td class="cvc-dg-q"${st(r, [['background-color', x.bg], ['color', x.fg], ['border', `1px solid ${r.t.color.borderStrong}`], ['padding', '12px 14px'], ['vertical-align', 'top'], ['width', '50%']])}>` +
+        `<p${st(r, [['margin', 0], ['padding', 0], ['color', x.fg], ['font-weight', '700']])}>${inlineHtml(n.label)}</p>` +
+        (n.detail ? paragraphs(r, n.detail, x, { last: true, secondary: true }) : '') +
+        `</td>`
+      );
+    };
+    const axis = (text: string) => `<p class="cvc-dg-axis"${st(r, [['margin', '0 0 8px 0'], ['padding', 0], ['color', s.fg2], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '600']])}>${inlineHtml(text)}</p>`;
+    body =
+      `<div class="cvc-dg cvc-dg-matrix">` +
+      axis(`Eje horizontal: ${c.x_axis ?? ''} (más a la derecha = más)`) +
+      axis(`Eje vertical: ${c.y_axis ?? ''} (más arriba = más)`) +
+      `<table${st(r, [['border-collapse', 'collapse'], ['width', '100%'], ['margin', 0]])}><tbody>` +
+      `<tr>${cell(nodes[0], false)}${cell(nodes[1], false)}</tr>` +
+      `<tr>${cell(nodes[2], false)}${cell(nodes[3], false)}</tr>` +
+      `</tbody></table></div>`;
+  }
+  return componentWrap(r, 'diagram', head + body, s);
+}
+
 const RENDERERS: { [K in VcComponent['type']]: (r: R, c: Extract<VcComponent, { type: K }>) => string } = {
   hero: renderHero,
   learning_objectives: renderLearningObjectives,
@@ -936,6 +1062,8 @@ const RENDERERS: { [K in VcComponent['type']]: (r: R, c: Extract<VcComponent, { 
   callout: renderCallout,
   summary_visual: renderSummaryVisual,
   self_check: renderSelfCheck,
+  worked_example: renderWorkedExample,
+  diagram: renderDiagram,
 };
 
 function renderWith(r: R, c: VcComponent): string {
