@@ -488,6 +488,16 @@ async function pureChecks() {
     const sin = txt(f2, undefined);
     assert(!/certificad/i.test(sin) && !S.closingLabel(f2, ci, THEME).html.includes('cursia-cta://badges'), 'sin certificate no hay panel');
     eq(S.CTA_BADGES, 'cursia-cta://badges', 'marcador');
+    // Fix 0b: label solo para docentes (el builder lo oculta).
+    for (const level of [undefined, 'enhanced']) {
+      const tl = S.certificateTeacherLabel(`Certificado: ${f2.course.title}`, f2, THEME, level ? { level } : undefined);
+      assert(vc.lintCleanSafe(tl.html).ok && tl.html.includes('href="cursia-cta://badges"'), `${level}: docente CLEAN_SAFE + botón`);
+      const t = vc.extractText(tl.html);
+      for (const w of ['Para docentes: activa el certificado del curso', 'Moodle deja la insignia desactivada al restaurar.', `Entra a Insignias → «Certificado: ${f2.course.title}» → «Habilitar acceso».`, 'Solo se hace una vez.', 'Abrir las insignias del curso →']) {
+        assert(t.includes(w), `${level}: docente «${w}»: ${t}`);
+      }
+    }
+    throwsRe(() => S.certificateTeacherLabel('Otra cosa', f2, THEME), /nombre de insignia inválido/, 'nombre inválido');
     assert(Array.from('x cursia-cta://badges y'.matchAll(S.CTA_RE)).length === 1, 'CTA_RE reconoce el marcador');
   });
   await check('shell: datos medidos y tokens (audio, duración R10, Libro, horas) + CLEAN_SAFE/ENHANCED mismo texto', () => {

@@ -98,6 +98,7 @@ import {
   audioWelcomeLabel,
   audiobookLabel,
   buildCourseFacts,
+  certificateTeacherLabel,
   closingLabel,
   competenciesLabel,
   examInfoLabel,
@@ -121,7 +122,7 @@ import { compileLibroHtmlV3, libroWordCount } from './v3/libro-v3';
 import { downscaleCoverPng } from './v3/png-downscale';
 import { activityPackageFilename, h5pActivityInlineIntroHtml, introThemeFrom, scormIntroHtml } from './v3/activity-intro';
 import { IdAllocator, buildQuizV3, parseScormManifestIds, scormActivityXmlV3 } from './v3/moodle-activities-v3';
-import { COURSE_BADGE_BACKUP_ID, COURSE_BADGE_DEFAULT_ISSUER, courseBadgeImages, courseBadgeXml } from './v3/course-badge';
+import { COURSE_BADGE_BACKUP_ID, COURSE_BADGE_DEFAULT_ISSUER, courseBadgeImages, courseBadgeName, courseBadgeXml } from './v3/course-badge';
 
 /**
  * Id del curso DENTRO del backup (`<course id>`, `original_course_id`) y su contexto
@@ -157,7 +158,8 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * secciones («Comenzar el curso →», «Continuar con el capítulo N →», …).
  * 3.2.0 (EV6 T3): certificado nativo = insignia de curso (badges.xml + imagen f1/f2/f3,
  * setting `badges` = 1), la evaluación final SIEMPRE es criterio de completion y el cierre
- * trae el panel «Tu certificado» con el enlace $@BADGESVIEWBYID*1@$.
+ * trae el panel «Tu certificado» con el enlace $@BADGESVIEWBYID*1@$; fix 0b: label oculto
+ * (visible=0) para docentes en el cierre con el paso «Habilitar acceso» de la insignia.
  */
 export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.2.0';
 /** Versión del renderer de Visual Components que entra en la clave de reuse. */
@@ -947,6 +949,13 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     : undefined;
   if (!hasCertificate) warnings.push('certificate_omitted:no_completion_criteria');
   addLabel(closing, 'cv3:shell:closing', closingLabel(facts, courseIntro, theme, opts, certificate));
+  // Fix 0b: Moodle restaura la insignia DESACTIVADA → label oculto (visible=0) para el docente con
+  // el paso único «Habilitar acceso» y el botón a las insignias del curso. El estudiante no lo ve.
+  if (hasCertificate) {
+    const badgeName = courseBadgeName(safeActivityName(plan.course.title, 254));
+    const t = addLabel(closing, 'cv3:shell:certificate_teacher', certificateTeacherLabel(badgeName, facts, theme, opts));
+    W.put(`${t.dir}/module.xml`, applyXmlFields(withIdnumber(moduleXml(t.mid, 'label', closing, ts, MV.bv), t.idnumber), { visible: '0', visibleold: '0' }));
+  }
 
   // ── Tokens (fail loud) ───────────────────────────────────────────────────
   const sectionNums = new Set(plan.sections.map((s) => s.sectionNum));

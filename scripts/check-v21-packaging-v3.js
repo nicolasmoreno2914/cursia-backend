@@ -589,6 +589,18 @@ const MATRIX = [
       assert(lx.includes('$@BADGESVIEWBYID*1@$') && lx.includes('Tu certificado') && lx.includes('Ver mi certificado →'), `${cfg.id}: panel del cierre`);
       const want = cfg.finalExam ? 'y apruebes la evaluación final, Moodle te otorga el certificado del curso' : 'Cuando completes todas las actividades calificadas, Moodle te otorga el certificado del curso';
       assert(lx.includes(want), `${cfg.id}: texto del panel`);
+      // Fix 0b: label oculto para docentes, justo después del cierre, en la misma sección.
+      const teacher = acts.find((a) => a.idnumber === 'cv3:shell:certificate_teacher');
+      assert(teacher && teacher.section === closing.section && acts.indexOf(teacher) === acts.indexOf(closing) + 1, `${cfg.id}: label docente tras el cierre`);
+      const tm = await z.file(`${teacher.dir}/module.xml`).async('string');
+      assert(tm.includes('<visible>0</visible>') && tm.includes('<visibleold>0</visibleold>'), `${cfg.id}: label docente oculto`);
+      const tx = await z.file(`${teacher.dir}/label.xml`).async('string');
+      for (const t of ['Para docentes: activa el certificado del curso', 'Moodle deja la insignia desactivada al restaurar.', `Entra a Insignias → «Certificado: ${title}» → «Habilitar acceso».`, 'Solo se hace una vez.', 'Abrir las insignias del curso →', '$@BADGESVIEWBYID*1@$']) {
+        assert(tx.includes(t.replace(/"/g, '&quot;')), `${cfg.id}: label docente «${t}»`);
+      }
+      const hidden = [];
+      for (const a of acts) if ((await z.file(`${a.dir}/module.xml`).async('string')).includes('<visible>0</visible>')) hidden.push(a.idnumber);
+      eq(hidden, ['cv3:shell:certificate_teacher'], `${cfg.id}: único módulo oculto`);
       if (cfg.finalExam) {
         const fin = acts.find((a) => a.idnumber === 'cv3:final_exam');
         const comp = await z.file('completion.xml').async('string');
@@ -631,6 +643,7 @@ const MATRIX = [
     assert(!(await z.file('files.xml').async('string')).includes('<component>badges</component>'), 'sin imagen');
     const lx = await z.file(`${acts.find((a) => a.idnumber === 'cv3:shell:closing').dir}/label.xml`).async('string');
     assert(!/BADGESVIEWBYID|certificado/i.test(lx), 'sin panel');
+    assert(!acts.some((a) => a.idnumber === 'cv3:shell:certificate_teacher'), 'sin label docente');
   });
   {
     const certCases = [
@@ -641,6 +654,22 @@ const MATRIX = [
       ['falta f3.png', () => ({ 'files.xml': (x) => x.replace('<filename>f3.png</filename>', '<filename>f9.png</filename>') })],
       ['contexto del curso = contexto de sistema', () => ({ 'moodle_backup.xml': (x) => x.replace('<original_course_contextid>2</original_course_contextid>', '<original_course_contextid>1</original_course_contextid>') })],
       ['imagen con otro itemid', () => ({ 'files.xml': (x) => x.replace(/(<filearea>badgeimage<\/filearea>\n    <itemid>)1/, '$17') })],
+      ['label docente visible para estudiantes', () => {
+        const a = find(/^cv3:shell:certificate_teacher$/);
+        return { [`${a.dir}/module.xml`]: (x) => x.replace('<visible>0</visible>', '<visible>1</visible>') };
+      }],
+      ['label docente sin «Habilitar acceso»', () => {
+        const a = find(/^cv3:shell:certificate_teacher$/);
+        return { [`${a.dir}/label.xml`]: (x) => x.replace('Habilitar acceso', 'Activar') };
+      }],
+      ['otro módulo oculto', () => {
+        const a = find(/^cv3:shell:welcome$/);
+        return { [`${a.dir}/module.xml`]: (x) => x.replace('<visible>1</visible>', '<visible>0</visible>') };
+      }],
+      ['falta el label docente', () => {
+        const a = find(/^cv3:shell:certificate_teacher$/);
+        return { [`${a.dir}/module.xml`]: (x) => x.replace('<idnumber>cv3:shell:certificate_teacher</idnumber>', '<idnumber>cv3:shell:otro</idnumber>') };
+      }],
       ['cierre sin enlace a la insignia', () => {
         const a = find(/^cv3:shell:closing$/);
         return { [`${a.dir}/label.xml`]: (x) => x.split('$@BADGESVIEWBYID*1@$').join('#') };

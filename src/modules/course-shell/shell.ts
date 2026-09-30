@@ -523,3 +523,25 @@ export function closingLabel(
   }
   return out('Cierre del curso', root(h, 'shell-closing', inner), facts);
 }
+
+/**
+ * EV6 T3 (fix 0b): label SOLO PARA DOCENTES (el builder lo empaqueta con `visible=0`: el docente lo
+ * ve atenuado, el estudiante nunca). Moodle restaura la insignia desactivada: aquí se explica cómo
+ * habilitarla una vez. `badgeName` = nombre exacto de la insignia del paquete.
+ */
+export function certificateTeacherLabel(badgeName: string, facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
+  const name = String(badgeName ?? '').trim();
+  if (!name.startsWith('Certificado: ')) shellFail(`certificado (docentes): nombre de insignia inválido (${name})`);
+  const h = hx(theme, opts);
+  const cs = toneSurf(h, 'alt');
+  const inner =
+    eyebrow(h, 'Solo docentes', cs.s) +
+    heading(h, 'h4', 'Para docentes: activa el certificado del curso', cs.s) +
+    pHtml(
+      h,
+      labelHtml(`Moodle deja la insignia desactivada al restaurar. Entra a Insignias → «${name}» → «Habilitar acceso». Solo se hace una vez.`),
+      cs.s,
+    ) +
+    ctaButton(h, CTA_BADGES, 'Abrir las insignias del curso →', cs.s);
+  return out('Para docentes: activar el certificado', root(h, 'shell-certificate-teacher', box(h, inner, cs, { cls: 'cvc-certificate-teacher' })), facts);
+}

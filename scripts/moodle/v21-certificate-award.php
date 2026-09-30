@@ -57,6 +57,35 @@ $studentrole = $DB->get_field('role', 'id', ['shortname' => 'student'], MUST_EXI
 $manual->enrol_user($instance, $userid, $studentrole);
 $out['userid'] = (int)$userid;
 
+// Fix 0b: label oculto para docentes (cv3:shell:certificate_teacher) — lo ve un docente con edición
+// (atenuado: visible=0 + moodle/course:viewhiddenactivities), nunca un estudiante.
+$tname = 'cursia_t3_doc_' . $courseid . '_' . substr(sha1(uniqid('', true)), 0, 8);
+$teacherid = user_create_user(['username' => $tname, 'password' => 'Cursia-T3-' . random_string(12), 'firstname' => 'Docente',
+    'lastname' => 'Certificado', 'email' => $tname . '@example.invalid', 'auth' => 'manual', 'confirmed' => 1,
+    'mnethostid' => $CFG->mnet_localhost_id], false, false);
+$manual->enrol_user($instance, $teacherid, $DB->get_field('role', 'id', ['shortname' => 'editingteacher'], MUST_EXIST));
+$visibility = [];
+foreach (['student' => $userid, 'editingteacher' => $teacherid] as $role => $uid) {
+    $mi = get_fast_modinfo($course, $uid);
+    foreach ($mi->get_cms() as $cmx) {
+        if (!in_array($cmx->idnumber, ['cv3:shell:closing', 'cv3:shell:certificate_teacher'], true)) continue;
+        $visibility[$role][$cmx->idnumber] = ['visible' => (int)$cmx->visible, 'uservisible' => (bool)$cmx->uservisible,
+            'onCoursePage' => (bool)$cmx->is_visible_on_course_page() && (bool)$cmx->uservisible];
+    }
+}
+$out['visibility'] = $visibility;
+$tcm = null;
+foreach (get_fast_modinfo($course)->get_cms() as $cmx) { if ($cmx->idnumber === 'cv3:shell:certificate_teacher') $tcm = $cmx; }
+if ($tcm) {
+    $intro = $DB->get_field('label', 'intro', ['id' => $tcm->instance]);
+    preg_match_all('#href="([^"]*badges/index\.php[^"]*)"#', $intro, $m);
+    $out['teacherLabel'] = ['section' => (int)$tcm->sectionnum, 'links' => array_map('html_entity_decode', $m[1]),
+        'text' => trim(preg_replace('/\s+/', ' ', html_entity_decode(strip_tags($intro))))];
+}
+$hidden = [];
+foreach (get_fast_modinfo($course)->get_cms() as $cmx) { if (!$cmx->visible) $hidden[] = $cmx->idnumber; }
+$out['hiddenModules'] = $hidden;
+
 $state = function () use ($courseid, $userid, $badge): array {
     $cc = new completion_completion(['userid' => $userid, 'course' => $courseid]);
     return ['courseComplete' => (bool)$cc->is_complete(), 'issued' => (new badge($badge->id))->is_issued($userid)];

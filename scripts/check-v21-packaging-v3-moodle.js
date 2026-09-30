@@ -181,6 +181,15 @@ async function runConfig(cfg) {
     const aw = JSON.parse(fs.readFileSync(awPath, 'utf8'));
     awards.push({ id: cfg.id, courseid, ...aw });
     eq([aw.statusAfterRestore, aw.statusAfterEnable], [0, 1], 'habilitar acceso (acción única del gestor)');
+    // Fix 0b: el label para docentes existe oculto: el docente con edición lo ve, el estudiante no.
+    eq(aw.hiddenModules, ['cv3:shell:certificate_teacher'], 'único módulo oculto');
+    eq(aw.visibility.student['cv3:shell:certificate_teacher'], { visible: 0, uservisible: false, onCoursePage: false }, 'estudiante NO ve el label docente');
+    eq(aw.visibility.editingteacher['cv3:shell:certificate_teacher'], { visible: 0, uservisible: true, onCoursePage: true }, 'docente lo ve (atenuado)');
+    eq(aw.visibility.student['cv3:shell:closing'].uservisible, true, 'el estudiante sí ve el cierre');
+    const closingSec = o.sections.find((s) => s.cms.some((c) => c.idnumber === 'cv3:shell:closing')).section;
+    eq(aw.teacherLabel.section, closingSec, 'label docente en «Cierre del curso»');
+    eq(aw.teacherLabel.links, [`${o.wwwroot}/badges/index.php?type=2&id=${courseid}`], 'botón a las insignias del curso nuevo');
+    assert(aw.teacherLabel.text.includes(`Entra a Insignias → «Certificado: ${facts.course.title}» → «Habilitar acceso». Solo se hace una vez.`), aw.teacherLabel.text);
     eq([aw.beforeAny.courseComplete, aw.beforeAny.issued], [false, false], 'sin nada completado');
     if (aw.withoutLast) eq([aw.withoutLast.courseComplete, aw.withoutLast.issued], [false, false], `falta ${aw.lastIdnumber}: sin completar ni insignia`);
     if (facts.finalExam.enabled) {
@@ -263,6 +272,7 @@ async function runConfig(cfg) {
     }
   }
   console.log(`\ncursos restaurados: ${courses.join(', ')}`);
+  for (const a of awards) console.log(`docentes [${a.id} → curso ${a.courseid}]: ${JSON.stringify({ ocultos: a.hiddenModules, visibilidad: a.visibility, enlace: a.teacherLabel && a.teacherLabel.links })}`);
   for (const a of awards) console.log(`certificado [${a.id} → curso ${a.courseid}]: ${JSON.stringify({ badgeid: a.badgeid, criterios: a.criteriaCount, ultimo: a.lastIdnumber, sinElUltimo: a.withoutLast, ultimoReprobado: a.lastFailed, despues: a.after })}`);
   console.log(`${passed} ok, ${failures} fallos`);
   process.exit(failures ? 1 : 0);

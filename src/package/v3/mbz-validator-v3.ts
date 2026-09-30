@@ -227,7 +227,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     const inf = (await text(`${dir}/inforef.xml`)) ?? '';
     const fileref = tag(inf, 'fileref') ?? '';
     const module: Record<string, string> = {};
-    for (const k of ['idnumber', 'completion', 'completiongradeitemnumber', 'completionpassgrade', 'completionview', 'sectionnumber']) {
+    for (const k of ['idnumber', 'completion', 'completiongradeitemnumber', 'completionpassgrade', 'completionview', 'sectionnumber', 'visible']) {
       module[k] = tag(moduleXml, k) ?? '';
     }
     let grade: Record<string, string> | null = null;
@@ -310,7 +310,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   const expectedSection = (idn: string): number | undefined => {
     if (/^cv3:shell:(forum|welcome|audio_welcome|competencies|methodology|start)$/.test(idn)) return 0;
     if (/^cv3:shell:(route|libro|libro_card|audiobook|route_start)$/.test(idn)) return 1;
-    if (idn === 'cv3:shell:closing') return layout.closingSection;
+    if (idn === 'cv3:shell:closing' || idn === 'cv3:shell:certificate_teacher') return layout.closingSection;
     if (/^cv3:final_exam(_info|_next)?$/.test(idn)) return layout.finalExamSection ?? undefined;
     let m = /^cv3:ch:([^:]+):/.exec(idn);
     if (m) return layout.chapterSection[m[1]];
@@ -454,6 +454,13 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
 
   const backupCourseId = num(tag(mb, 'original_course_id'));
   const backupCourseCtx = num(tag(mb, 'original_course_contextid'));
+  // Fix 0b: el ÚNICO módulo oculto del paquete es el label para docentes del certificado (si hay insignia).
+  const checkHidden = (allowed: string | null): void => {
+    for (const a of acts) {
+      if (a.module.visible === '1') continue;
+      if (a.idnumber !== allowed) add('CERTIFICATE', a.idnumber, `módulo oculto inesperado (visible=${a.module.visible}): solo el label para docentes del certificado puede estarlo`);
+    }
+  };
   const checkCertificate = async (): Promise<void> => {
     const W = 'badges.xml';
     const courseXml = (await text('course/course.xml')) ?? '';
@@ -469,6 +476,8 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       const closing0 = acts.find((a) => a.idnumber === 'cv3:shell:closing');
       if (blocks(bx0, 'badge').length > 0) add('CERTIFICATE', 'completion.xml', 'el curso no tiene criterios de completion: la insignia nunca se otorgaría');
       if (closing0 && /BADGESVIEWBYID/.test(closing0.intro)) add('CERTIFICATE', 'cv3:shell:closing', 'promete un certificado inalcanzable (sin criterios de completion)');
+      if (acts.some((a) => a.idnumber === 'cv3:shell:certificate_teacher')) add('CERTIFICATE', 'cv3:shell:certificate_teacher', 'label para docentes sin insignia en el paquete');
+      checkHidden(null);
       return;
     }
     const settingsXml = tag(mb, 'settings') ?? '';
@@ -527,6 +536,17 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     if (!closingLbl || !closingLbl.intro.includes(`href="${tok}"`) || !extractText(closingLbl.intro).includes('Tu certificado')) {
       add('CERTIFICATE', 'cv3:shell:closing', `el cierre no trae el panel «Tu certificado» con el enlace ${tok}`);
     }
+    // Fix 0b: label solo para docentes (oculto) con el paso «Habilitar acceso» y el botón a las insignias.
+    const teacher = acts.find((a) => a.idnumber === 'cv3:shell:certificate_teacher');
+    if (!teacher) add('CERTIFICATE', 'cv3:shell:certificate_teacher', 'falta el label oculto para docentes (la insignia se restaura desactivada)');
+    else {
+      const t = extractText(teacher.intro);
+      if (teacher.modname !== 'label' || teacher.module.visible !== '0') add('CERTIFICATE', teacher.idnumber, `debe ser un label oculto (visible=0), es ${teacher.modname} visible=${teacher.module.visible}`);
+      if (!teacher.intro.includes(`href="${tok}"`) || !t.includes('Habilitar acceso') || !t.includes(`«${name}»`)) {
+        add('CERTIFICATE', teacher.idnumber, `sin el paso «Habilitar acceso» de «${name}» o sin el enlace ${tok}`);
+      }
+    }
+    checkHidden('cv3:shell:certificate_teacher');
   };
 
   // ── labels: CLEAN_SAFE, menciones, cifras, tokens ──
