@@ -182,7 +182,7 @@ async function fail(
   item: ClaimedItem,
   message: string,
   retryable: boolean,
-  opts: { knownOutcome?: boolean } = {},
+  opts: { knownOutcome?: boolean; grantAttempt?: boolean } = {},
 ): Promise<never> {
   // Review I4: resultado CONOCIDO del proveedor (guion rechazado por validación, audio no medible):
   // no es ambiguo → reintento acotado normal. El intento queda reconocido de forma durable ANTES de
@@ -200,9 +200,21 @@ async function fail(
     message = reconciliationMessage(amb.provider, amb.what, `${message}${amb.opIds.length ? ` (operación del proveedor: ${amb.opIds.join(', ')})` : ''}`);
     retryable = false;
   }
-  await deps.scheduler.failItem(item.itemRunId, deps.executorId, message.slice(0, 1900), retryable);
+  if (retryable && opts.grantAttempt) {
+    // R16 (#16): espera gratuita (re-poll de un id persistido): no consume max_attempts.
+    await deps.scheduler.failItem(item.itemRunId, deps.executorId, message.slice(0, 1900), true, undefined, { grantAttempt: true });
+  } else {
+    await deps.scheduler.failItem(item.itemRunId, deps.executorId, message.slice(0, 1900), retryable);
+  }
   throw new ProviderItemFailed(message, retryable);
 }
+
+/**
+ * R16 (#16): tope de reloj (desde el primer poll de la generación) durante el cual un
+ * `gamma_timeout` NO consume intentos — pollear un generationId persistido es gratis.
+ * Pasado el tope, cada timeout vuelve a consumir un intento (y el auto-healer acota las rondas).
+ */
+export const GAMMA_TIMEOUT_FREE_WALL_MS = 60 * 60_000;
 
 /**
  * R16 (#1): el proceso está drenando y NO hay gasto en el aire (nada enviado sin
@@ -443,13 +455,19 @@ export async function processRealPresentation(deps: RealProviderDeps, item: Clai
   const pollMs = deps.gammaPollMs ?? positiveInt(env.DYNAMIC_GAMMA_POLL_MS, 6000);
   const timeoutMs = deps.gammaTimeoutMs ?? positiveInt(env.DYNAMIC_GAMMA_TIMEOUT_MS, 5 * 60_000);
   const t0 = Date.now();
+  // R16 (#16): inicio (durable) de la espera de ESTA generación, para el tope de reloj de los timeouts gratuitos.
+  const pollSinceRaw = item.outputSummary?.gammaPollSince;
+  const pollSince = typeof pollSinceRaw === 'string' && Number.isFinite(Date.parse(pollSinceRaw)) ? Date.parse(pollSinceRaw) : t0;
+  if (typeof pollSinceRaw !== 'string') await record(deps, item, { gammaPollSince: new Date(t0).toISOString() });
   let st = await pollOnce(deps, item, client, generationId!);
   while (st.status !== 'completed' && st.status !== 'failed') {
     // R16 (#1): la generación ya está persistida → otro worker la re-pollea gratis.
     if (await handBackIfDraining(deps, item, `mientras esperaba la generación ${generationId} de Gamma (se retoma sin reenviar)`)) return;
     if (Date.now() - t0 > timeoutMs) {
-      // Reintentable: el próximo claim sigue polleando la MISMA generación.
-      await fail(deps, item, `gamma_timeout: la generación ${generationId} no terminó en ${Math.round(timeoutMs / 1000)} s (se retoma sin reenviar)`, true);
+      // Reintentable: el próximo claim sigue polleando la MISMA generación. Dentro del tope de reloj no consume intentos.
+      await fail(deps, item, `gamma_timeout: la generación ${generationId} no terminó en ${Math.round(timeoutMs / 1000)} s (se retoma sin reenviar)`, true, {
+        grantAttempt: Date.now() - pollSince < GAMMA_TIMEOUT_FREE_WALL_MS,
+      });
     }
     await heartbeat(deps, item);
     await sleep(pollMs);

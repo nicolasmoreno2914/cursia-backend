@@ -209,6 +209,14 @@ export interface DynamicItemWorkerDeps {
  */
 export const VIDEO_DURATION_UNMEASURED = 'video_duration_unmeasured';
 
+/**
+ * R16 (#16): tope de reloj (desde el primer poll del job) durante el cual un
+ * `video_timeout` NO consume intentos: re-pollear un job de Videogen ya
+ * persistido es gratis. Pasado el tope vuelve a consumir (y el auto-healer
+ * acota las rondas).
+ */
+export const VIDEO_TIMEOUT_FREE_WALL_MS = 3 * 60 * 60_000;
+
 /** R16 (#7): el video interactivo (video_interactions, solo v3) planifica sus preguntas con la duración medida. */
 export function videoRequiresMeasuredDuration(item: Pick<ClaimedItem, 'rulesVersion'>): boolean {
   return Number(item.rulesVersion) === 3;
@@ -705,12 +713,23 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
     // ── Paso 3: poll hasta completar/fallar/timeout ──────────────────────────
     const timeoutMs = deps.videoTimeoutMin * 60_000;
     const startedAt = Date.now();
+    // R16 (#16): inicio durable de la espera de ESTE job (tope de reloj de los video_timeout gratuitos).
+    const pollSinceRaw = item.outputSummary?.videoPollSince;
+    const pollSince = typeof pollSinceRaw === 'string' && Number.isFinite(Date.parse(pollSinceRaw)) ? Date.parse(pollSinceRaw) : startedAt;
+    if (typeof pollSinceRaw !== 'string') {
+      if (!(await scheduler.recordItemExternal(item.itemRunId, deps.executorId, { videoPollSince: new Date(startedAt).toISOString() }))) return;
+    }
     while (true) {
       if (leaseLost) return;
       // R16 (#1): el job ya está persistido → re-pollearlo desde otro worker es gratis.
       if (await handBackIfDraining(deps, item, `mientras esperaba el render del job ${jobId} (se retoma sin reenviar)`)) return;
       if (Date.now() - startedAt > timeoutMs) {
-        await scheduler.failItem(item.itemRunId, deps.executorId, 'video_timeout', true);
+        // R16 (#16): re-pollear un job persistido es gratis → dentro del tope de reloj no consume intentos.
+        if (Date.now() - pollSince < VIDEO_TIMEOUT_FREE_WALL_MS) {
+          await scheduler.failItem(item.itemRunId, deps.executorId, 'video_timeout', true, undefined, { grantAttempt: true });
+        } else {
+          await scheduler.failItem(item.itemRunId, deps.executorId, 'video_timeout', true);
+        }
         return;
       }
 
