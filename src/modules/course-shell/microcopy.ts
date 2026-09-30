@@ -6,6 +6,7 @@
  * flags del capítulo/módulo/curso.
  */
 import type { GradeMethod } from '../course-profiles/course-profiles';
+import type { H5pActivityType } from './activity-type';
 
 export const COPY = Object.freeze({
   videoPrimerTitle: 'Antes de ver el video',
@@ -39,15 +40,16 @@ export const GRADE_METHOD_ES: Readonly<Record<GradeMethod, string>> = Object.fre
 });
 
 /** EV5 — qué hará el estudiante, según el tipo de actividad (antes: la misma frase en todas). */
-const ACTIVITY_TASK_ES: Readonly<Record<string, string>> = Object.freeze({
-  questionset: 'Responderás preguntas sobre situaciones del capítulo y verás la retroalimentación de cada una.',
+const ACTIVITY_TASK_ES: Readonly<Record<H5pActivityType | 'scorm', string>> = Object.freeze({
+  questionset: 'Responderás preguntas de opción múltiple y de verdadero o falso sobre el capítulo.',
+  singlechoiceset: 'Responderás preguntas de opción única sobre el capítulo.',
   dragtext: 'Arrastrarás cada término al lugar que le corresponde dentro de un texto.',
   blanks: 'Completarás un texto escribiendo la palabra que falta en cada espacio.',
   scorm: 'Resolverás un reto interactivo por etapas con lo que aprendiste en el capítulo.',
 });
 
 export function activityInstruction(passingGrade: number, attempts: number, activityType?: string | null): string {
-  const task = activityType ? ACTIVITY_TASK_ES[activityType] : undefined;
+  const task = activityType ? ACTIVITY_TASK_ES[activityType as H5pActivityType | 'scorm'] : undefined;
   return `${task ? `${task} ` : ''}La actividad práctica que sigue es calificada. ${passingText(passingGrade)} ${attemptsText(attempts)}`;
 }
 

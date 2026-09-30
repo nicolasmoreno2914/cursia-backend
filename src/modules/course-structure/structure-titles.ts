@@ -161,9 +161,12 @@ export function mergeDescription(existing: string | null | undefined, split: str
  * se corta en el último límite de palabra ≤ max sin dejar una palabra funcional ni puntuación al
  * final (nunca «…» ni media palabra). Títulos ≤ max: solo espacios colapsados (idéntico al actual).
  */
+const DISPLAY_TITLE_MIN_SPLIT = 32;
 export function displayStructureTitle(raw: string, max: number = STRUCTURE_TITLE_MAX): string {
   const n = normalizeStructureTitle(raw, max);
-  if (n && n.title.length <= max) return n.title;
+  // Un título separado muy corto («Introducción a Excel» de un título de 120) cambia el sentido:
+  // en ese caso se prefiere el corte por palabra, que conserva más del nombre.
+  if (n && n.title.length <= max && (!n.changed || n.description === null || n.title.length >= DISPLAY_TITLE_MIN_SPLIT)) return n.title;
   const words = collapse(String(raw ?? '')).split(' ');
   let out = '';
   for (const w of words) {

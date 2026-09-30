@@ -91,6 +91,8 @@ async function pureChecks() {
     const c = T.displayStructureTitle(tricky);
     assert(c.length <= 80 && !/ (de|la|y|en|los)$/.test(c) && tricky.startsWith(c), `sin palabra funcional final: ${c}`);
     assert(T.displayStructureTitle('  Logística   poscosecha ') === 'Logística poscosecha', 'corto: solo espacios');
+    const excel = T.displayStructureTitle('Introducción a Excel Avanzado para análisis de datos financieros de pequeñas y medianas empresas en Latinoamérica hoy');
+    assert(excel.length <= 80 && excel.length >= 32 && excel.startsWith('Introducción a Excel Avanzado'), `un corte demasiado corto no cambia el sentido: ${excel}`);
     assert(T.displayStructureTitle('Título normal de capítulo') === 'Título normal de capítulo', 'idéntico');
   });
   await check('normalizador: título de 240 caracteres (nombre + descripción pegados) → título ≤ 80 sin «…» y la descripción conserva TODO el resto', () => {

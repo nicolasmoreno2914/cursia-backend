@@ -66,8 +66,10 @@ function syllableBreaks(cps: string[]): Set<number> {
     const b = cps[i];
     const c = cps[i + 1];
     if (isV(a) && isC(b) && isV(c)) out.add(i); // ca·sa
+    if (/[aeoáéíóú]/i.test(a) && /[aeoáéíóú]/i.test(b)) out.add(i); // hiato: electro·en·cefalo, pa·ís
     if (isC(a) && isC(b) && isV(c) && isV(cps[i - 2]) && !ONSET_CLUSTERS.has((a + b).toLowerCase())) out.add(i); // can·to
-    if (isC(a) && isC(b) && isV(c) && isV(cps[i - 2]) && ONSET_CLUSTERS.has((a + b).toLowerCase())) out.add(i - 1); // o·tro
+    // o·tro, elec·tro, ins·truc: el grupo inseparable abre la sílaba aunque antes haya otra consonante.
+    if (isC(a) && isC(b) && isV(c) && i - 1 >= 2 && LETTER_RE.test(cps[i - 2] ?? '') && ONSET_CLUSTERS.has((a + b).toLowerCase())) out.add(i - 1);
   }
   return out;
 }
@@ -76,17 +78,21 @@ function hyphenateWord(word: string, h: HyphenOpts): string {
   const cps = Array.from(word);
   if (cps.length < h.minLen) return word;
   const breaks = syllableBreaks(cps);
+  const isWordChar = (c: string | undefined) => !!c && /[\p{L}\p{N}]/u.test(c);
   const cuts = new Set<number>();
-  // Un corte cerca de cada múltiplo de `every`: la frontera de sílaba más cercana (± 3);
-  // sin frontera cerca (siglas, URLs, códigos) el corte fijo de siempre, para no desbordar.
-  for (let target = h.every; cps.length - target >= 3; target += h.every) {
-    let best = -1;
-    for (let d = 0; d <= 3 && best < 0; d++) {
-      for (const cand of [target - d, target + d]) {
-        if (best < 0 && breaks.has(cand) && cand >= 2 && cps.length - cand >= 3 && ![...cuts].some((x) => Math.abs(x - cand) < 2)) best = cand;
-      }
-    }
-    cuts.add(best >= 0 ? best : target);
+  // Cada tramo mide ≤ `every` (la garantía anti-desborde de siempre): el corte se busca HACIA ATRÁS
+  // desde prev+every, primero en una frontera de sílaba y si no, entre dos letras (nunca junto a
+  // «-», «/» o «:»); sin nada de eso, el corte fijo.
+  let prev = 0;
+  while (cps.length - (prev + h.every) >= 3) {
+    const hi = prev + h.every;
+    const lo = Math.max(prev + 2, hi - 3);
+    let pick = -1;
+    for (let c = hi; c >= lo && pick < 0; c--) if (breaks.has(c)) pick = c;
+    for (let c = hi; c >= lo && pick < 0; c--) if (isWordChar(cps[c - 1]) && isWordChar(cps[c])) pick = c;
+    if (pick < 0) pick = hi;
+    cuts.add(pick);
+    prev = pick;
   }
   let out = '';
   for (let i = 0; i < cps.length; i++) {
@@ -107,7 +113,7 @@ function escapeRun(text: string, h: HyphenOpts): string {
  * se quita el par de asteriscos y queda el texto. No toca `**…**` ni asteriscos sueltos («5 * 3»).
  */
 function stripSingleStars(text: string): string {
-  return text.replace(/(^|[^*\p{L}\p{N}])\*(?![\s*])([^*\n]*?[^\s*])\*(?![*\p{L}\p{N}])/gu, '$1$2');
+  return text.replace(/(^|[^*\p{L}\p{N}])\*(?=[\p{L}\p{N}])([^*\n]*?[\p{L}\p{N}.!?])\*(?![*\p{L}\p{N}])/gu, '$1$2');
 }
 
 /** Sustituye los pares `**` por marcadores internos (emparejados en todo el campo). */
