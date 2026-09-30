@@ -441,7 +441,8 @@ check('EV6: render de decision — CLEAN_SAFE sin <style>/flex/grid/height, orde
   const plain3 = vc.extractText(h3).replace(/\s+/g, ' ');
   assert(plain3.includes('Consciente: Pregúntale') && plain3.includes('Sí: Posición lateral'), 'rótulo propio con «:»: ' + plain3);
   const enh1 = vc.renderMovement([DEPTH1], themes[0].theme, { uid: 'g', level: 'enhanced' });
-  assert(enh1.includes('.cvc-dt-sep{display:none}') && enh1.includes('content:"\\2199" / ""') && enh1.includes('content:"\\2198" / ""'), 'conectores decorativos en ENHANCED');
+  // fix round 4: los «:» se VEN también en ENHANCED (regla del producto: ningún texto oculto en un label)
+  assert(!/cvc-dt-sep\{[^}]*display:\s*none/.test(enh1) && enh1.includes('<span class="cvc-dt-sep">:</span>') && enh1.includes('content:"\\2199" / ""') && enh1.includes('content:"\\2198" / ""'), 'conectores decorativos en ENHANCED');
   assert(vc.renderComponent(DEPTH1, themes[0].theme, { uid: 's' }) === h1, 'determinista');
   // sin decision en el label: <style> byte-idéntico al de siempre (sin reglas cvc-dt)
   const flow = components.find((x) => x.kind === 'flow');

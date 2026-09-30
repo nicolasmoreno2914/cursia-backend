@@ -57,8 +57,8 @@ export function decisionStyle(S: string, c: ResolvedTheme['color']): string {
   const acc = c.accentStrong;
   return [
     `${S} .cvc-dt-pair{table-layout:fixed}`,
-    // conector decorativo (texto alternativo vacío: el lector dice «Sí», no «flecha»); los «:» del texto plano se ocultan
-    `${S} .cvc-dt-sep{display:none}`,
+    // conector decorativo (texto alternativo vacío: el lector dice «Sí», no «flecha»). Los «:» del rótulo
+    // quedan VISIBLES (fix round 4): ningún texto de un label se oculta, en ningún nivel.
     `${S} .cvc-dt-yes>.cvc-dt-pill>.cvc-dt-lbl::before{content:"\\2199";content:"\\2199" / "";margin-right:.4em;color:${acc}}`,
     `${S} .cvc-dt-no>.cvc-dt-pill>.cvc-dt-lbl::before{content:"\\2198";content:"\\2198" / "";margin-right:.4em;color:${acc}}`,
     `${S} .cvc-dt-d1>.cvc-dt-q{text-align:center}`,

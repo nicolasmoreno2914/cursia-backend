@@ -1099,7 +1099,8 @@ const DECISION_RENDER_MAX_DEPTH = 8;
  * Píldora de la rama («Sí:» / «No:»). El texto plano (lectores de pantalla, Moodle sin estilos) dice
  * «Sí: …» / «No: …»: los dos puntos van FUERA del <span class="nolink"> (rótulo del renderer) y el
  * conector ↙ / ↘ es decorativo: lo dibuja SOLO el <style> de ENHANCED (::before, texto alternativo
- * vacío), que además oculta los dos puntos. En CLEAN_SAFE el conector es el filete o la barra.
+ * vacío). Los dos puntos se ven en ambos niveles (ningún texto de un label se oculta). En CLEAN_SAFE el
+ * conector es el filete o la barra.
  * `bar`: en un par lado a lado la columna es angosta (≈150 px a 390): el rótulo va en una barra de
  * bloque delineada que envuelve limpio, no en un <span> con borde que se partiría en dos líneas.
  */
