@@ -205,6 +205,13 @@ function createLlmV3({ base, chapterIdFromText }) {
         rec('final_exam', String(st.courseId), { invalid: bad, split });
         return { text: giftBlocks('EF', 1, split, bad ? { multichoice: split.multichoice, truefalse: split.truefalse, match: 0 } : split) };
       }
+      // EV5 (P4): corrección dirigida de preguntas cuya correcta es la opción más larga. Devuelve
+      // los mismos ::ID:: y enunciados con opciones de longitud pareja (el ejecutor lo re-valida).
+      if (prompt.indexOf('la respuesta correcta (=) es claramente la opción más larga') >= 0) {
+        const blocks = [...prompt.matchAll(/::([A-Z0-9-]+)::([^{]*)\{/g)];
+        rec('exam_balance', String(st.courseId), { count: blocks.length });
+        return { text: blocks.map((b) => `::${b[1]}::${b[2]}{\n =Registrar y bloquear el equipo\n ~Intervenir sin registrar nada\n ~Esperar a que el equipo falle\n ~Cambiar las piezas al azar\n}`).join('\n\n') };
+      }
       if (prompt.indexOf('Generaste el examen FINAL de') >= 0) {
         const from = Number((/desde ::EF-(\d+)::/.exec(prompt) || [])[1]);
         const miss = {};
