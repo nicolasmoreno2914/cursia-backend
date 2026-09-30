@@ -8,7 +8,9 @@
  *    Gamma, Libro Guía y audiolibro son obligatorios en V2.1 (DECISIONES);
  *  - nada de "certificado", "PDF" del curso, "narración profesional", "minutos
  *    por pregunta" ni horas inventadas: las horas solo si vienen del setup,
- *    etiquetadas "(definida por la institución)";
+ *    etiquetadas "(definida por la institución)". Única excepción (EV6 T3): el
+ *    panel «Tu certificado» del cierre, que existe SOLO cuando el paquete trae la
+ *    insignia de curso nativa de Moodle (`certificate` en closingLabel);
  *  - CLEAN_SAFE siempre (se verifica con `lintCleanSafe` de R2 antes de
  *    devolver: un label que no pasa → throw SHELL_RENDER), ENHANCED opcional;
  *  - la bibliografía NO va en los labels (va al Libro Guía, R12).
@@ -20,7 +22,7 @@ import { labelHtml, inlineHtml } from '../visual-components/text';
 import { formatDurationEs } from '../../package/audio';
 import type { AssessableType } from '../course-profiles/course-profiles';
 import { CourseFacts, ModuleFacts, lintShellNumbers } from './facts';
-import { CTA_EXAM, ctaButton, ctaSection } from './cta';
+import { CTA_BADGES, CTA_EXAM, ctaButton, ctaSection } from './cta';
 import {
   CourseIntroV3,
   ModuleIntroV3,
@@ -51,6 +53,7 @@ import {
   st,
   statRow,
   surfOn,
+  toneSurf,
   unprotectedText,
 } from './html';
 import { GRADE_METHOD_ES, attemptsValue } from './microcopy';
@@ -460,7 +463,38 @@ export function finalExamNextLabel(closingSectionNum: number, facts: CourseFacts
 
 // ─── SZ Cierre ──────────────────────────────────────────────────────────────
 
-export function closingLabel(facts: CourseFacts, courseIntro: CourseIntroV3, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
+/**
+ * EV6 (T3): el paquete trae una insignia de curso nativa de Moodle (el certificado). Qué exige
+ * la completion del curso según los criterios REALES del paquete (el texto no promete de más).
+ */
+export interface ClosingCertificate {
+  /** La completion exige ítems calificables además de la evaluación final. */
+  requiresGradedItems: boolean;
+  /** La completion exige aprobar la evaluación final. */
+  requiresFinalExam: boolean;
+}
+
+export function closingCertificateText(c: ClosingCertificate, facts: CourseFacts): string {
+  // Sin actividades de capítulo (solo videos/exámenes) no se nombran «actividades» (RESOURCE_DISABLED).
+  const graded = facts.counts.activities > 0 ? 'todas las actividades calificadas' : 'todos los elementos calificados';
+  const when =
+    c.requiresGradedItems && c.requiresFinalExam
+      ? `Cuando completes ${graded} y apruebes la evaluación final`
+      : c.requiresFinalExam
+        ? 'Cuando apruebes la evaluación final'
+        : c.requiresGradedItems
+          ? `Cuando completes ${graded}`
+          : 'Cuando completes el curso';
+  return `${when}, Moodle te otorga el certificado del curso. Lo encuentras en tu perfil, en Insignias.`;
+}
+
+export function closingLabel(
+  facts: CourseFacts,
+  courseIntro: CourseIntroV3,
+  theme: ResolvedTheme,
+  opts?: ShellRenderOptions,
+  certificate?: ClosingCertificate,
+): ShellLabel {
   const intro = assertValidCourseIntroV3(courseIntro);
   const h = hx(theme, opts);
   const s = bgSurf(h);
@@ -468,11 +502,24 @@ export function closingLabel(facts: CourseFacts, courseIntro: CourseIntroV3, the
   const next = facts.finalExam.enabled
     ? 'Has completado el recorrido del curso y su evaluación final.'
     : 'Has completado el recorrido del curso.';
-  const inner =
+  let inner =
     eyebrow(h, 'Cierre', s) +
     heading(h, 'h3', 'Cierre del curso', s) +
     accentRule(h, s) +
     lead(h, intro.closing, s) +
-    pHtml(h, labelHtml(next), s, { weight: 700, last: true });
+    pHtml(h, labelHtml(next), s, { weight: 700, last: !certificate });
+  if (certificate) {
+    if (certificate.requiresFinalExam && !facts.finalExam.enabled) shellFail('certificado: exige una evaluación final que el curso no tiene');
+    const cs = toneSurf(h, 'soft');
+    inner += box(
+      h,
+      eyebrow(h, 'Certificado', cs.s) +
+        heading(h, 'h4', 'Tu certificado', cs.s) +
+        pHtml(h, labelHtml(closingCertificateText(certificate, facts)), cs.s) +
+        ctaButton(h, CTA_BADGES, 'Ver mi certificado →', cs.s),
+      cs,
+      { cls: 'cvc-certificate' },
+    );
+  }
   return out('Cierre del curso', root(h, 'shell-closing', inner), facts);
 }

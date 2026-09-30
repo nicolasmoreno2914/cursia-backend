@@ -34,6 +34,7 @@ const A = require(path.join(dist, 'package/assessment/index.js'));
 const PF = require('./lib/v21-packaging-fixtures');
 
 let passed = 0;
+const awards = [];
 let failures = 0;
 function check(name, fn) {
   try {
@@ -157,6 +158,39 @@ async function runConfig(cfg) {
     eq(o.criteria.filter((c) => c.criteriatype === 6).length, resolved.courseCompletion.requireCourseGradePass ? 1 : 0, 'criterio de nota');
     eq(o.aggr, [{ criteriatype: null, method: 1 }], 'agregación');
   });
+  check(`${tag} EV6 T3: certificado = insignia de curso restaurada (criterio del curso NUEVO, imagen f1/f2/f3, enlace del cierre)`, () => {
+    eq(o.badges.length, 1, 'una insignia');
+    const b = o.badges[0];
+    const title = facts.course.title;
+    eq([b.name, b.type, b.issuername, b.language, b.notification], [`Certificado: ${title}`, 2, 'Cursia', 'es', 0], 'insignia');
+    assert(b.description === (facts.finalExam.enabled ? `Otorgado al completar el curso «${title}» y aprobar la evaluación final.` : `Otorgado al completar el curso «${title}».`), `descripción: ${b.description}`);
+    assert(b.message.includes('%badgename%'), 'mensaje con %badgename%');
+    // Moodle core SIEMPRE restaura las insignias inactivas (restore_badges_structure_step): hay que habilitarla una vez.
+    eq(b.status, 0, 'status tras restaurar (core fuerza INACTIVE)');
+    eq(b.criteria, [{ criteriatype: 0, method: 1, params: [] }, { criteriatype: 4, method: 1, params: [[`course_${courseid}`, String(courseid)]] }], 'criterios remapeados al curso nuevo');
+    eq(b.images.map((i) => [i.name, i.mime, i.w, i.h]), [['f1.png', 'image/png', 100, 100], ['f2.png', 'image/png', 35, 35], ['f3.png', 'image/png', 512, 512]], 'imagen');
+    eq(o.closingBadgeLinks, [`${o.wwwroot}/badges/index.php?type=2&id=${courseid}`], 'enlace «Ver mi certificado →» decodificado');
+    if (facts.finalExam.enabled) {
+      assert(o.criteria.some((c) => c.criteriatype === 4 && c.idnumber === 'cv3:final_exam'), 'la evaluación final es criterio de completion');
+      eq(cm['cv3:final_exam'].completionpassgrade, 1, 'la evaluación final solo cuenta aprobada');
+    }
+  });
+  check(`${tag} EV6 T3: la insignia se otorga sola al completar el curso (usuario de prueba, cron de completion real)`, () => {
+    const awPath = path.join(OUT_DIR, `r12-${cfg.id}.award.json`);
+    execFileSync(PHP, ['-c', PHPINI, path.join(__dirname, 'moodle/v21-certificate-award.php'), inPath, awPath], { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 });
+    const aw = JSON.parse(fs.readFileSync(awPath, 'utf8'));
+    awards.push({ id: cfg.id, courseid, ...aw });
+    eq([aw.statusAfterRestore, aw.statusAfterEnable], [0, 1], 'habilitar acceso (acción única del gestor)');
+    eq([aw.beforeAny.courseComplete, aw.beforeAny.issued], [false, false], 'sin nada completado');
+    if (aw.withoutLast) eq([aw.withoutLast.courseComplete, aw.withoutLast.issued], [false, false], `falta ${aw.lastIdnumber}: sin completar ni insignia`);
+    if (facts.finalExam.enabled) {
+      eq(aw.lastIdnumber, 'cv3:final_exam', 'el último criterio es la evaluación final');
+      eq([aw.lastFailed.courseComplete, aw.lastFailed.issued], [false, false], 'evaluación final reprobada: sin completar ni insignia');
+      eq(aw.marks.filter((m) => m.idnumber === 'cv3:final_exam').map((m) => m.completionstate), [3, 2], 'final: COMPLETE_FAIL y luego COMPLETE_PASS');
+    }
+    eq([aw.after.courseComplete, aw.after.issued], [true, true], 'curso completo → insignia otorgada');
+    assert(aw.after.bakedPng && aw.after.bakedPng.w === 512, `PNG horneado: ${JSON.stringify(aw.after.bakedPng)}`);
+  });
   check(`${tag} quiz: intentos/método del perfil, sumgrades = Σ maxmark = 100, preguntas = GIFT`, () => {
     for (const [id, q] of Object.entries(o.quizzes)) {
       const k = resolved.kinds[kindOf(id)];
@@ -229,6 +263,7 @@ async function runConfig(cfg) {
     }
   }
   console.log(`\ncursos restaurados: ${courses.join(', ')}`);
+  for (const a of awards) console.log(`certificado [${a.id} → curso ${a.courseid}]: ${JSON.stringify({ badgeid: a.badgeid, criterios: a.criteriaCount, ultimo: a.lastIdnumber, sinElUltimo: a.withoutLast, ultimoReprobado: a.lastFailed, despues: a.after })}`);
   console.log(`${passed} ok, ${failures} fallos`);
   process.exit(failures ? 1 : 0);
 })();

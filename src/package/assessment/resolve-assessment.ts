@@ -350,7 +350,10 @@ export interface CompletionCandidate {
  * Criterios de actividad del curso según la política:
  * - `requireAllChapterActivities` → todos los ítems `activity` y `video`
  *   (todo lo calificable de "Práctica de capítulos");
- * - `requireExams` → todos los `exam` y el `finalExam`.
+ * - `requireExams` → todos los `exam` y el `finalExam`;
+ * - EV6 (T3): el `finalExam` es SIEMPRE criterio cuando existe (decisión de producto: «Curso
+ *   completo → Evaluación final aprobada → Cierre → Certificado»; su módulo lleva
+ *   `completionpassgrade=1`, así que cuenta solo al aprobarla), aunque `requireExams` sea false.
  * Orden estable: el de `items`.
  */
 export function completionCriteriaFor(
@@ -362,7 +365,7 @@ export function completionCriteriaFor(
     const chapter = it.kind === 'activity' || it.kind === 'video';
     const exam = it.kind === 'exam' || it.kind === 'finalExam';
     if (!chapter && !exam) throw new Error(`ASSESSMENT_UNKNOWN_KIND: ${String(it.kind)}`);
-    if ((chapter && policy.requireAllChapterActivities) || (exam && policy.requireExams)) {
+    if ((chapter && policy.requireAllChapterActivities) || (exam && policy.requireExams) || it.kind === 'finalExam') {
       out.push({ moduleId: it.moduleId, modname: it.modname });
     }
   }

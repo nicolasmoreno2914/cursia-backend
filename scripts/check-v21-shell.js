@@ -119,7 +119,8 @@ function shellLabels(facts, course, theme, level) {
     S.routeLabel(facts, theme, o),
     S.libroCardLabel(77, facts, theme, o),
     S.audiobookLabel(facts, theme, o),
-    S.closingLabel(facts, ci, theme, o),
+    // EV6 T3: el cierre del paquete siempre trae el panel del certificado (insignia nativa).
+    S.closingLabel(facts, ci, theme, o, { requiresGradedItems: true, requiresFinalExam: facts.finalExam.enabled }),
   ];
   facts.modules.forEach((m, i) => {
     out.push(S.moduleIntroLabel(m, F.moduleIntroFixture(course.manifest, i), facts, theme, o));
@@ -468,6 +469,27 @@ async function pureChecks() {
     for (const n of [2, 4, 12, 20, 70, 3, 100, 18432, 40, 58]) assert(set.has(n), `factsNumberSet sin ${n}`);
   });
 
+  await check('EV6 T3: cierre con panel «Tu certificado» (texto según los criterios reales, botón a la insignia, CLEAN_SAFE y ENHANCED)', () => {
+    const ci = F.courseIntroFixture();
+    const txt = (f, cert, level) => vc.extractText(S.closingLabel(f, ci, THEME, level ? { level } : undefined, cert).html);
+    const both = { requiresGradedItems: true, requiresFinalExam: true };
+    for (const level of [undefined, 'enhanced']) {
+      const html = S.closingLabel(f2, ci, THEME, level ? { level } : undefined, both).html;
+      assert(html.includes('href="cursia-cta://badges"') && /cvc-btn-link/.test(html), `${level}: botón a la insignia`);
+      assert(vc.lintCleanSafe(html).ok, `${level}: CLEAN_SAFE`);
+      const t = vc.extractText(html);
+      assert(t.includes('Tu certificado') && t.includes('Ver mi certificado →'), `${level}: panel`);
+      assert(t.includes('Cuando completes todas las actividades calificadas y apruebes la evaluación final, Moodle te otorga el certificado del curso. Lo encuentras en tu perfil, en Insignias.'), `${level}: texto del brief: ${t}`);
+    }
+    assert(txt(f2, { requiresGradedItems: false, requiresFinalExam: true }).includes('Cuando apruebes la evaluación final, Moodle te otorga'), 'solo final');
+    assert(txt(f4, { requiresGradedItems: true, requiresFinalExam: false }).includes('Cuando completes todas las actividades calificadas, Moodle te otorga'), 'solo calificables');
+    assert(txt(f4, { requiresGradedItems: false, requiresFinalExam: false }).includes('Cuando completes el curso, Moodle te otorga'), 'sin nota');
+    throwsRe(() => S.closingLabel(f4, ci, THEME, undefined, both), /evaluación final que el curso no tiene/, 'certificado con final en un curso sin final');
+    const sin = txt(f2, undefined);
+    assert(!/certificad/i.test(sin) && !S.closingLabel(f2, ci, THEME).html.includes('cursia-cta://badges'), 'sin certificate no hay panel');
+    eq(S.CTA_BADGES, 'cursia-cta://badges', 'marcador');
+    assert(Array.from('x cursia-cta://badges y'.matchAll(S.CTA_RE)).length === 1, 'CTA_RE reconoce el marcador');
+  });
   await check('shell: datos medidos y tokens (audio, duración R10, Libro, horas) + CLEAN_SAFE/ENHANCED mismo texto', () => {
     const labels = shellLabels(f2, c2, THEME);
     const byName = Object.fromEntries(labels.map((l) => [l.name, l]));
@@ -479,7 +501,9 @@ async function pureChecks() {
     assert(byName['Libro Guía'].html.includes('href="$@RESOURCEVIEWBYID*77@$"'), 'token del Libro');
     assert(vc.extractText(byName['Bienvenida'].html).includes('Duración estimada: 40 h (definida por la institución).'), 'horas etiquetadas');
     for (const w of ['certificado', 'narración profesional', 'minutos por pregunta']) {
-      assert(!labels.some((l) => vc.extractText(l.html).toLowerCase().includes(w)), `afirma "${w}"`);
+      // EV6 T3: «certificado» solo en el panel «Tu certificado» del cierre (la insignia nativa existe en el paquete).
+      const sinPanel = (l) => (l.name === 'Cierre del curso' ? l.html.replace(/<div class="cvc-certificate"[\s\S]*$/, '') : l.html);
+      assert(!labels.some((l) => vc.extractText(sinPanel(l)).toLowerCase().includes(w)), `afirma "${w}"`);
     }
     const enh = shellLabels(f2, c2, THEME, 'enhanced');
     labels.forEach((l, i) => eq(vc.extractText(enh[i].html), vc.extractText(l.html), `texto CLEAN_SAFE = ENHANCED (${l.name})`));

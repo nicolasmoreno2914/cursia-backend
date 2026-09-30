@@ -85,6 +85,7 @@ import {
 } from '../modules/theme-engine';
 import { ChapterExperience, VC_RUNTIME_VERSION, VC_SCHEMA_VERSION } from '../modules/visual-components';
 import {
+  CTA_BADGES,
   CourseFacts,
   CourseIntroV3,
   ModuleIntroV3,
@@ -120,6 +121,19 @@ import { compileLibroHtmlV3, libroWordCount } from './v3/libro-v3';
 import { downscaleCoverPng } from './v3/png-downscale';
 import { activityPackageFilename, h5pActivityInlineIntroHtml, introThemeFrom, scormIntroHtml } from './v3/activity-intro';
 import { IdAllocator, buildQuizV3, parseScormManifestIds, scormActivityXmlV3 } from './v3/moodle-activities-v3';
+import { COURSE_BADGE_BACKUP_ID, COURSE_BADGE_DEFAULT_ISSUER, courseBadgeImages, courseBadgeXml } from './v3/course-badge';
+
+/**
+ * Id del curso DENTRO del backup (`<course id>`, `original_course_id`) y su contexto
+ * (`original_course_contextid`). La restauración los remapea al curso nuevo: el token
+ * $@BADGESVIEWBYID*1@$ (decode rule 'course') y el criterio `course_1` de la insignia.
+ * EV6 T3: el contexto del curso NO puede ser 1 = `original_system_contextid`: la restauración
+ * mapea el contexto viejo 1 al de SISTEMA y los archivos del curso (la imagen de la insignia,
+ * `badges/badgeimage`) terminaban en el contexto de sistema (probado en el Moodle local).
+ */
+export const MBZ_V3_COURSE_BACKUP_ID = 1;
+export const MBZ_V3_COURSE_BACKUP_CONTEXTID = 2;
+export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
 
 /**
  * Versión del builder v3. Entra en la clave de reuse v3 (y SOLO en la v3:
@@ -141,8 +155,11 @@ import { IdAllocator, buildQuizV3, parseScormManifestIds, scormActivityXmlV3 } f
  * 3.1.0 (EV6): una sección por capítulo / evaluación / examen final / cierre (cierre DESPUÉS del
  * examen final), `coursedisplay` = 1 (una sección por página) y botones de navegación entre
  * secciones («Comenzar el curso →», «Continuar con el capítulo N →», …).
+ * 3.2.0 (EV6 T3): certificado nativo = insignia de curso (badges.xml + imagen f1/f2/f3,
+ * setting `badges` = 1), la evaluación final SIEMPRE es criterio de completion y el cierre
+ * trae el panel «Tu certificado» con el enlace $@BADGESVIEWBYID*1@$.
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.1.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.2.0';
 /** Versión del renderer de Visual Components que entra en la clave de reuse. */
 export const VC_RENDERER_VERSION = `vc${VC_SCHEMA_VERSION}-rt${VC_RUNTIME_VERSION}-theme${THEME_ENGINE_VERSION}`;
 
@@ -304,6 +321,8 @@ interface FileEntry {
   filename: string;
   size: number;
   mime: string | null;
+  /** itemid del archivo (0 salvo la imagen de la insignia: id de la insignia en el backup). */
+  itemid?: number;
 }
 
 interface ActivityRef {
@@ -349,10 +368,10 @@ class MbzWriter {
     return { hash, size: buf.length };
   }
 
-  addFile(ctx: number, component: string, filearea: string, filename: string, data: Buffer | string, mime: string): number {
+  addFile(ctx: number, component: string, filearea: string, filename: string, data: Buffer | string, mime: string, itemid = 0): number {
     const { hash, size } = this.blob(data);
     const id = this.fileId++;
-    this.files.push({ id, hash, ctx, component, filearea, filename, size, mime });
+    this.files.push({ id, hash, ctx, component, filearea, filename, size, mime, ...(itemid ? { itemid } : {}) });
     return id;
   }
 
@@ -412,7 +431,7 @@ const TOKEN_MODNAME: Record<string, string> = {
 };
 
 /** Falla fuerte ante cualquier token `$@…$` que no apunte a un módulo del paquete del tipo correcto. */
-export function assertTokensV3(html: string, modnameByMid: Map<number, string>, where: string, sectionNums?: Set<number>): void {
+export function assertTokensV3(html: string, modnameByMid: Map<number, string>, where: string, sectionNums?: Set<number>, courseBackupId?: number): void {
   const bad: string[] = [];
   if (/cursia-cta:\/\//.test(html)) bad.push('marcador cursia-cta sin resolver');
   for (const m of html.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?@\$/g)) {
@@ -421,6 +440,11 @@ export function assertTokensV3(html: string, modnameByMid: Map<number, string>, 
     // Edu EV3: enlace a una sección del paquete (botón «Continuar con el módulo…»).
     if (kind === 'COURSESECTIONBYID') {
       if (!idStr || !sectionNums || !sectionNums.has(Number(idStr))) bad.push(m[0]);
+      continue;
+    }
+    // EV6 (T3): página de insignias (certificado) del curso del backup.
+    if (kind === 'BADGESVIEWBYID') {
+      if (!idStr || courseBackupId === undefined || Number(idStr) !== courseBackupId) bad.push(m[0]);
       continue;
     }
     const want = /^(.+)VIEWBYID$/.exec(kind)?.[1];
@@ -651,7 +675,13 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const addLabel = (secnum: number, idnumber: string, label: ShellLabel, files: Array<{ name: string; data: Buffer | string; mime: string }> = []): ActivityRef => {
     const a = W.newActivity('label', secnum, label.name, idnumber);
     const fileIds = files.map((f) => W.addFile(a.ctx, 'mod_label', 'intro', f.name, f.data, f.mime));
-    label = { ...label, html: label.html.replace(/cursia-cta:\/\/section\/(\d+)/g, (_m, n: string) => `$@COURSESECTIONBYID*${n}@$`) };
+    label = {
+      ...label,
+      html: label.html
+        .replace(/cursia-cta:\/\/section\/(\d+)/g, (_m, n: string) => `$@COURSESECTIONBYID*${n}@$`)
+        .split(CTA_BADGES)
+        .join(`$@BADGESVIEWBYID*${MBZ_V3_COURSE_BACKUP_ID}@$`),
+    };
     if (label.html.includes('cursia-cta://')) pendingCtas.push({ a, name: label.name, html: label.html, secnum, logIdx: labelsHtml.length });
     W.put(`${a.dir}/label.xml`, labelXmlWithCtx(a.aid, a.mid, a.ctx, label.name, label.html, ts));
     W.put(`${a.dir}/module.xml`, withIdnumber(moduleXml(a.mid, 'label', secnum, ts, MV.bv), idnumber));
@@ -898,11 +928,29 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     addQuiz(fsec, 'cv3:final_exam', 'Evaluación final', 'finalExam', c.finalExamGift as string, plan.keys.finalExam);
     addLabel(fsec, 'cv3:final_exam_next', finalExamNextLabel(closing, facts, theme, opts));
   }
-  addLabel(closing, 'cv3:shell:closing', closingLabel(facts, courseIntro, theme, opts));
+  // EV6 (T3): criterios de completion del curso (la insignia-certificado se otorga al completarlo).
+  const finalExamMid = W.activities.find((a) => a.idnumber === 'cv3:final_exam')?.mid ?? null;
+  const completionCriteria: Array<{ moduleId: number; modname: 'quiz' | 'scorm' | 'h5pactivity' | 'resource' }> = resolved.withoutGrades
+    ? [{ moduleId: libroMid, modname: 'resource' as const }]
+    : completionCriteriaFor(graded.map((g) => ({ moduleId: g.moduleId, modname: g.modname, kind: g.kind })), resolved.courseCompletion);
+  if (finalExamMid !== null && !completionCriteria.some((x) => x.moduleId === finalExamMid)) {
+    throw new Error('MBZ_V3_INVARIANT: la evaluación final no es criterio de completion del curso');
+  }
+  // Sin ningún criterio (perfil sin exigencias y sin evaluación final) el curso nunca se completa:
+  // no se empaqueta una insignia inalcanzable ni se promete en el cierre.
+  const hasCertificate = completionCriteria.length > 0 || resolved.courseCompletion.requireCourseGradePass;
+  const certificate = hasCertificate
+    ? {
+        requiresFinalExam: finalExamMid !== null,
+        requiresGradedItems: !resolved.withoutGrades && completionCriteria.some((x) => x.moduleId !== finalExamMid),
+      }
+    : undefined;
+  if (!hasCertificate) warnings.push('certificate_omitted:no_completion_criteria');
+  addLabel(closing, 'cv3:shell:closing', closingLabel(facts, courseIntro, theme, opts, certificate));
 
   // ── Tokens (fail loud) ───────────────────────────────────────────────────
   const sectionNums = new Set(plan.sections.map((s) => s.sectionNum));
-  for (const l of labelsHtml) assertTokensV3(l.html, W.modnameByMid, l.where, sectionNums);
+  for (const l of labelsHtml) assertTokensV3(l.html, W.modnameByMid, l.where, sectionNums, MBZ_V3_COURSE_BACKUP_ID);
   if (pendingCtas.length) throw new Error(`MBZ_V3_INVARIANT: botones de navegación sin destino: ${pendingCtas.map((p) => p.name).join(', ')}`);
 
   // ── Secciones ────────────────────────────────────────────────────────────
@@ -918,7 +966,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   // ── Curso ────────────────────────────────────────────────────────────────
   const courseTitle = safeActivityName(plan.course.title, 254);
   W.put('course/course.xml', `<?xml version="1.0" encoding="UTF-8"?>
-<course id="1" contextid="1">
+<course id="${MBZ_V3_COURSE_BACKUP_ID}" contextid="${MBZ_V3_COURSE_BACKUP_CONTEXTID}">
   <shortname>${esc(courseTitle)}</shortname><fullname>${esc(courseTitle)}</fullname>
   <idnumber></idnumber><summary></summary><summaryformat>1</summaryformat>
   <format>topics</format><showgrades>1</showgrades><newsitems>5</newsitems>
@@ -960,9 +1008,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     throw new Error(`ASSESSMENT_INVALID_FACTS: curso sin nota con ${graded.length} ítem(s) calificable(s) en el paquete`);
   }
   W.put('completion.xml', courseCompletionXml({
-    criteria: resolved.withoutGrades
-      ? [{ moduleId: libroMid, modname: 'resource' as const }]
-      : completionCriteriaFor(graded.map((g) => ({ moduleId: g.moduleId, modname: g.modname, kind: g.kind })), resolved.courseCompletion),
+    criteria: completionCriteria,
     aggregation: 'all',
     requireCourseGradePass: resolved.courseCompletion.requireCourseGradePass,
     courseGradepass: resolved.courseCompletion.courseGradepass,
@@ -972,7 +1018,21 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   W.put('roles.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<roles_definition>\n</roles_definition>');
   W.put('scales.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<scales_definition>\n</scales_definition>');
   W.put('outcomes.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<outcomes_definition>\n</outcomes_definition>');
-  W.put('badges.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<badges>\n</badges>');
+  // EV6 (T3): certificado = insignia de curso (criterio: completion del curso) + su imagen.
+  if (hasCertificate) {
+    W.put('badges.xml', courseBadgeXml({
+      courseTitle: courseTitle,
+      courseBackupId: MBZ_V3_COURSE_BACKUP_ID,
+      hasFinalExam: finalExamMid !== null,
+      ts,
+      issuerName: COURSE_BADGE_DEFAULT_ISSUER,
+    }));
+    for (const img of courseBadgeImages(theme)) {
+      W.addFile(MBZ_V3_COURSE_BACKUP_CONTEXTID, 'badges', 'badgeimage', img.filename, img.png, 'image/png', COURSE_BADGE_BACKUP_ID);
+    }
+  } else {
+    W.put('badges.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<badges>\n</badges>');
+  }
   W.put('users.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<users>\n</users>');
   W.put('grade_history.xml', BOIL.gradeHistory);
   W.put('groups.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<groups>\n  <groupcustomfields>\n  </groupcustomfields>\n  <groupings>\n    <groupingcustomfields>\n    </groupingcustomfields>\n  </groupings>\n</groups>');
@@ -982,7 +1042,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   for (const f of W.files) {
     filesXml +=
       `  <file id="${f.id}">\n    <contenthash>${f.hash}</contenthash>\n    <contextid>${f.ctx}</contextid>\n` +
-      `    <component>${f.component}</component>\n    <filearea>${f.filearea}</filearea>\n    <itemid>0</itemid>\n` +
+      `    <component>${f.component}</component>\n    <filearea>${f.filearea}</filearea>\n    <itemid>${f.itemid ?? 0}</itemid>\n` +
       `    <filepath>/</filepath>\n    <filename>${xmlEsc(f.filename)}</filename>\n    <userid>${NULL}</userid>\n` +
       `    <filesize>${f.size}</filesize>\n    <mimetype>${f.mime ?? NULL}</mimetype>\n    <status>0</status>\n` +
       `    <timecreated>${ts}</timecreated>\n    <timemodified>${ts}</timemodified>\n` +
@@ -997,7 +1057,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   let sett = '';
   const rootSettings: Record<string, string> = {
     filename: `cursia-v3-${plan.course.id}.mbz`, imscc11: '0', users: '0', anonymize: '0', role_assignments: '0',
-    activities: '1', blocks: '0', files: '1', filters: '1', comments: '0', badges: '0',
+    activities: '1', blocks: '0', files: '1', filters: '1', comments: '0', badges: hasCertificate ? '1' : '0',
     calendarevents: '1', userscompletion: '0', logs: '0', grade_histories: '0',
     questionbank: '1', groups: '0', competencies: '0', customfield: '0',
     contentbankcontent: '0', xapistate: '0', legacyfiles: '1',
@@ -1032,14 +1092,14 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   <include_file_references_to_external_content>0</include_file_references_to_external_content>
   <original_wwwroot>https://cursia.nomaddi.com</original_wwwroot>
   <original_site_identifier_hash>7723815fd5e7880d12bcade15abbbfc8</original_site_identifier_hash>
-  <original_course_id>1</original_course_id>
+  <original_course_id>${MBZ_V3_COURSE_BACKUP_ID}</original_course_id>
   <original_course_fullname>${esc(courseTitle)}</original_course_fullname>
   <original_course_shortname>${esc(courseTitle)}</original_course_shortname>
   <original_course_format>topics</original_course_format>
   <original_course_startdate>${ts}</original_course_startdate>
   <original_course_enddate>0</original_course_enddate>
-  <original_course_contextid>1</original_course_contextid>
-  <original_system_contextid>1</original_system_contextid>
+  <original_course_contextid>${MBZ_V3_COURSE_BACKUP_CONTEXTID}</original_course_contextid>
+  <original_system_contextid>${MBZ_V3_SYSTEM_BACKUP_CONTEXTID}</original_system_contextid>
   <details>
     <detail backup_id="cursiav3${plan.course.id}${ts}">
       <type>course</type><format>moodle2</format><interactive>1</interactive>
@@ -1050,7 +1110,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     <activities>\n${acts}    </activities>
     <sections>\n${secs}    </sections>
     <course>
-      <courseid>1</courseid>
+      <courseid>${MBZ_V3_COURSE_BACKUP_ID}</courseid>
       <title>${esc(courseTitle)}</title>
       <directory>course</directory>
     </course>

@@ -105,6 +105,38 @@ foreach ($DB->get_records('course_completion_criteria', ['course' => $courseid],
 $out['aggr'] = array_values(array_map(fn($a) => ['criteriatype' => $a->criteriatype === null ? null : (int)$a->criteriatype,
     'method' => (int)$a->method], $DB->get_records('course_completion_aggr_methd', ['course' => $courseid], 'id')));
 
+// ── 5b. EV6 T3: insignia-certificado del curso (solo lectura) ──
+require_once($CFG->libdir . '/badgeslib.php');
+$coursectx = context_course::instance($courseid);
+$out['badges'] = [];
+foreach ($DB->get_records('badge', ['courseid' => $courseid], 'id') as $b) {
+    $crit = [];
+    foreach ($DB->get_records('badge_criteria', ['badgeid' => $b->id], 'criteriatype') as $c) {
+        $params = [];
+        foreach ($DB->get_records('badge_criteria_param', ['critid' => $c->id], 'id') as $p) { $params[] = [$p->name, $p->value]; }
+        $crit[] = ['criteriatype' => (int)$c->criteriatype, 'method' => (int)$c->method, 'params' => $params];
+    }
+    $imgs = [];
+    foreach ($fs->get_area_files($coursectx->id, 'badges', 'badgeimage', $b->id, 'filename', false) as $f) {
+        $info = getimagesizefromstring($f->get_content());
+        $imgs[] = ['name' => $f->get_filename(), 'mime' => $f->get_mimetype(), 'w' => $info ? $info[0] : null, 'h' => $info ? $info[1] : null];
+    }
+    $out['badges'][] = ['name' => $b->name, 'description' => $b->description, 'type' => (int)$b->type, 'status' => (int)$b->status,
+        'issuername' => $b->issuername, 'language' => $b->language, 'notification' => (int)$b->notification,
+        'messagesubject' => $b->messagesubject, 'message' => $b->message, 'criteria' => $crit, 'images' => $imgs];
+}
+// Enlace «Ver mi certificado →» del cierre, ya decodificado por la restauración.
+$out['closingBadgeLinks'] = [];
+foreach ($sections as $s) {
+    foreach ($s['cms'] as $c) {
+        if ($c['idnumber'] !== 'cv3:shell:closing') continue;
+        $intro = $DB->get_field('label', 'intro', ['id' => $modinfo->get_cm($c['cmid'])->instance]);
+        preg_match_all('#href="([^"]*badges/index\.php[^"]*)"#', $intro, $m);
+        $out['closingBadgeLinks'] = array_map(fn($u) => html_entity_decode($u), $m[1]);
+    }
+}
+$out['wwwroot'] = $CFG->wwwroot;
+
 // ── 6. Módulos calificables ──
 $out['quizzes'] = [];
 foreach ($DB->get_records('quiz', ['course' => $courseid]) as $q) {

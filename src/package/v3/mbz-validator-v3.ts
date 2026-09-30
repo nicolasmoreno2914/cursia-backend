@@ -16,6 +16,10 @@
  *   SECTIONS / NAVIGATION                  EV6: una sección por capítulo/evaluación, cierre al final
  *                                          (después del examen final), coursedisplay = 1 y cada
  *                                          botón «Continuar…» → la sección que corresponde
+ *   CERTIFICATE                            EV6 T3: insignia de curso (badges.xml) con criterio de
+ *                                          completion del curso del backup, setting badges = 1,
+ *                                          imagen f1/f2/f3 PNG, examen final como criterio y el
+ *                                          panel «Tu certificado» con $@BADGESVIEWBYID*curso@$
  * Identifica cada módulo por su `idnumber` `cv3:…` (estructura por UUID).
  * Puro salvo el unzip en memoria; nunca lanza por un hallazgo: los devuelve todos.
  */
@@ -85,6 +89,7 @@ interface ParsedFile {
   filearea: string;
   filename: string;
   size: number;
+  itemid: number;
 }
 
 function tag(xml: string, name: string): string | null {
@@ -190,6 +195,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     filearea: tag(b, 'filearea') ?? '',
     filename: unxml(tag(b, 'filename') ?? ''),
     size: num(tag(b, 'filesize')),
+    itemid: num(tag(b, 'itemid')),
   }));
   const fileById = new Map(files.map((f) => [f.id, f]));
   for (const f of files) {
@@ -446,6 +452,83 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   if (resolved.courseCompletion.requireCourseGradePass !== (gradeCrit.length === 1)) add('COURSE_COMPLETION', 'completion.xml', 'criterio de nota del curso incoherente con el perfil');
   if (gradeCrit.length === 1 && num(gradeCrit[0].gp) !== resolved.courseGradepass) add('COURSE_COMPLETION', 'completion.xml', 'gradepass del criterio de curso ≠ perfil');
 
+  const backupCourseId = num(tag(mb, 'original_course_id'));
+  const backupCourseCtx = num(tag(mb, 'original_course_contextid'));
+  const checkCertificate = async (): Promise<void> => {
+    const W = 'badges.xml';
+    const courseXml = (await text('course/course.xml')) ?? '';
+    const cid = num(/<course id="(\d+)"/.exec(courseXml)?.[1]);
+    if (!(backupCourseId >= 1) || cid !== backupCourseId) add('CERTIFICATE', 'course/course.xml', `id del curso ${cid} ≠ original_course_id ${backupCourseId}`);
+    const cctx = num(/<course id="\d+" contextid="(\d+)"/.exec(courseXml)?.[1]);
+    if (cctx !== backupCourseCtx || backupCourseCtx === num(tag(mb, 'original_system_contextid'))) {
+      add('CERTIFICATE', 'moodle_backup.xml', `contexto del curso ${cctx}/${backupCourseCtx} inválido (no puede ser el de sistema: la imagen de la insignia se restauraría en el contexto de sistema)`);
+    }
+    // Sin criterios de completion el curso nunca se completa: no debe haber insignia ni panel.
+    if (gotCrit.length + gradeCrit.length === 0) {
+      const bx0 = (await text('badges.xml')) ?? '';
+      const closing0 = acts.find((a) => a.idnumber === 'cv3:shell:closing');
+      if (blocks(bx0, 'badge').length > 0) add('CERTIFICATE', 'completion.xml', 'el curso no tiene criterios de completion: la insignia nunca se otorgaría');
+      if (closing0 && /BADGESVIEWBYID/.test(closing0.intro)) add('CERTIFICATE', 'cv3:shell:closing', 'promete un certificado inalcanzable (sin criterios de completion)');
+      return;
+    }
+    const settingsXml = tag(mb, 'settings') ?? '';
+    const badgesSetting = blocks(settingsXml, 'setting').find((b) => tag(b, 'level') === 'root' && tag(b, 'name') === 'badges');
+    if (!badgesSetting || tag(badgesSetting, 'value') !== '1') add('CERTIFICATE', 'moodle_backup.xml', 'el setting raíz badges debe ser 1 (si no, Moodle no restaura la insignia)');
+    const bx = await text('badges.xml');
+    const badges = bx ? blocks(bx, 'badge') : [];
+    if (badges.length !== 1) {
+      add('CERTIFICATE', W, `se esperaba exactamente una insignia de curso (hay ${badges.length})`);
+      return;
+    }
+    const b = badges[0];
+    const bid = num(/<badge id="(\d+)"/.exec(b)?.[1]);
+    const name = unxml(tag(b, 'name') ?? '');
+    if (!name.startsWith('Certificado: ') || [...name].length > 255) add('CERTIFICATE', W, `nombre inválido: ${name}`);
+    const fields: Record<string, string> = { type: '2', courseid: String(backupCourseId), status: '1', notification: '0', language: 'es' };
+    for (const [k, v] of Object.entries(fields)) if (tag(b, k) !== v) add('CERTIFICATE', W, `<${k}> ${tag(b, k)} ≠ ${v}`);
+    if (!(tag(b, 'issuername') ?? '').trim()) add('CERTIFICATE', W, 'sin emisor');
+    if (!(unxml(tag(b, 'message') ?? '')).includes('%badgename%')) add('CERTIFICATE', W, 'el mensaje no usa %badgename%');
+    const wantDesc = facts.finalExam.enabled ? 'aprobar la evaluación final' : null;
+    const desc = unxml(tag(b, 'description') ?? '');
+    if (wantDesc ? !desc.includes(wantDesc) : /evaluaci[oó]n final/i.test(desc)) add('CERTIFICATE', W, `descripción incoherente con el examen final: ${desc}`);
+    const crits = blocks(b, 'criterion').map((c) => ({
+      type: num(tag(c, 'criteriatype')),
+      method: num(tag(c, 'method')),
+      params: blocks(c, 'parameter').map((p) => [tag(p, 'name'), tag(p, 'value')]),
+    }));
+    const overall = crits.filter((c) => c.type === 0);
+    const course = crits.filter((c) => c.type === 4);
+    if (crits.length !== 2 || overall.length !== 1 || course.length !== 1) add('CERTIFICATE', W, `criterios: se esperaba global + completion del curso (hay ${crits.map((c) => c.type).join(',')})`);
+    else {
+      if (overall[0].method !== 1 || course[0].method !== 1) add('CERTIFICATE', W, 'la agregación de criterios debe ser ALL (1)');
+      if (JSON.stringify(course[0].params) !== JSON.stringify([[`course_${backupCourseId}`, String(backupCourseId)]])) {
+        add('CERTIFICATE', W, `parámetro del criterio de curso ${JSON.stringify(course[0].params)} ≠ course_${backupCourseId}`);
+      }
+    }
+    for (const [fn, size] of [['f1.png', 100], ['f2.png', 35], ['f3.png', 512]] as const) {
+      const f = files.find((x) => x.component === 'badges' && x.filearea === 'badgeimage' && x.filename === fn);
+      if (!f) {
+        add('CERTIFICATE', 'files.xml', `falta la imagen de la insignia ${fn}`);
+        continue;
+      }
+      if (f.itemid !== bid || f.ctx !== backupCourseCtx) add('CERTIFICATE', 'files.xml', `${fn}: itemid ${f.itemid}/contextid ${f.ctx} ≠ insignia ${bid}/contexto del curso ${backupCourseCtx}`);
+      const blob = await bin(`files/${f.hash.slice(0, 2)}/${f.hash}`);
+      const png = blob && blob.length > 24 && blob.readUInt32BE(0) === 0x89504e47 && blob.toString('latin1', 12, 16) === 'IHDR';
+      if (!png || blob.readUInt32BE(16) !== size || blob.readUInt32BE(20) !== size) add('CERTIFICATE', 'files.xml', `${fn} no es una PNG de ${size}×${size}`);
+    }
+    // Completion del curso: el examen final (si hay) es criterio y solo cuenta aprobado.
+    const fin = gradedActs.find((g) => g.kind === 'finalExam');
+    if (fin) {
+      if (!gotCrit.includes(fin.a.mid)) add('CERTIFICATE', 'completion.xml', 'la evaluación final no es criterio de completion del curso');
+      if (fin.a.module.completionpassgrade !== '1') add('CERTIFICATE', fin.a.dir, 'la evaluación final no exige nota aprobatoria (completionpassgrade)');
+    }
+    const closingLbl = acts.find((a) => a.idnumber === 'cv3:shell:closing');
+    const tok = `$@BADGESVIEWBYID*${backupCourseId}@$`;
+    if (!closingLbl || !closingLbl.intro.includes(`href="${tok}"`) || !extractText(closingLbl.intro).includes('Tu certificado')) {
+      add('CERTIFICATE', 'cv3:shell:closing', `el cierre no trae el panel «Tu certificado» con el enlace ${tok}`);
+    }
+  };
+
   // ── labels: CLEAN_SAFE, menciones, cifras, tokens ──
   const chapterById = new Map(facts.chapters.map((c) => [c.id, c]));
   const moduleById = new Map(facts.modules.map((m) => [m.id, m]));
@@ -520,6 +603,11 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
         if (!m[2] || !sectionIds.has(Number(m[2]))) add('TOKEN_INVALID', a.idnumber, `token ${m[0]} no resuelve a una sección del paquete`);
         continue;
       }
+      // EV6 T3: página de insignias (certificado) del curso DEL BACKUP (decode rule 'course').
+      if (m[1] === 'BADGESVIEWBYID') {
+        if (!m[2] || Number(m[2]) !== backupCourseId) add('TOKEN_INVALID', a.idnumber, `token ${m[0]} no apunta al curso del backup (${backupCourseId})`);
+        continue;
+      }
       const kind = /^(.+)VIEWBYID$/.exec(m[1])?.[1]?.toLowerCase();
       const target = m[2] ? byMid.get(Number(m[2])) : undefined;
       if (!kind || !target || target.modname !== kind) add('TOKEN_INVALID', a.idnumber, `token ${m[0]} no resuelve a un ${kind ?? '?'} del paquete`);
@@ -533,6 +621,9 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       }
     }
   }
+
+  // ── EV6 T3: certificado (insignia de curso nativa) ──
+  await checkCertificate();
 
   // ── H5P ──
   const profileKeys = new Set(CURSIA_H5P_PROFILE_V1.libraries.map((l) => `${l.machineName} ${l.majorVersion}.${l.minorVersion}`));
