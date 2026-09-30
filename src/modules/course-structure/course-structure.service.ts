@@ -187,7 +187,7 @@ export class CourseStructureService implements OnModuleInit {
                                     'id', ch.id, 'position', ch.position, 'title', ch.title, 'objective', ch.objective,
                                     'description', ch.description, 'videoEnabled', ch.video_enabled,
                                     'activityEnabled', ch.activity_enabled) order by ch.position, ch.id)
-                             from public.course_chapters ch where ch.module_id = m.id), '[]'::json)
+                             from public.course_chapters ch where ch.module_id = m.id and ch.course_id = c.id), '[]'::json)
                        ) order by m.position, m.id)
                   from public.course_modules m where m.course_id = c.id), '[]'::json) as modules
          from public.courses c
@@ -377,25 +377,6 @@ export class CourseStructureService implements OnModuleInit {
       );
     }
     return { finalExam: row.final_exam_enabled, activityEngine: row.activity_engine };
-  }
-
-  /**
-   * V2.1 (R3): `course_chapters.activity_enabled` por capítulo. Fail loud si
-   * a algún capítulo le falta el valor (no debería: NOT NULL DEFAULT true).
-   */
-  private async readActivityEnabled(courseId: number, runner?: QueryRunner): Promise<Map<string, boolean>> {
-    const q = `select id, activity_enabled from public.course_chapters where course_id = $1`;
-    const rows: { id: string; activity_enabled: unknown }[] = runner
-      ? await runner.query(q, [courseId])
-      : await this.dataSource.query(q, [courseId]);
-    const out = new Map<string, boolean>();
-    for (const r of rows) {
-      if (typeof r.activity_enabled !== 'boolean') {
-        throw new Error(`Capítulo ${r.id}: activity_enabled ilegible (${JSON.stringify(r.activity_enabled)})`);
-      }
-      out.set(r.id, r.activity_enabled);
-    }
-    return out;
   }
 
   /**
