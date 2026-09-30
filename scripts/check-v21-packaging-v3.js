@@ -360,6 +360,32 @@ const MATRIX = [
   const { z: bz, acts: bacts } = await actDirs(base.r.mbz);
   const noVideoCh = base.input.manifest.modules.flatMap((m) => m.chapters).find((c) => !c.videoEnabled);
   const find = (re) => bacts.find((a) => re.test(a.idnumber));
+  await check('Edu EV3: cada botón queda resuelto al token de su destino (actividad del capítulo, evaluación, sección siguiente)', async () => {
+    const intro = async (a) => bz.file(`${a.dir}/label.xml`).async('string');
+    const secOf = new Map(bacts.map((a) => [a.idnumber, a.section]));
+    for (let i = 0; i < bacts.length; i++) {
+      const a = bacts[i];
+      const x = await intro(a).catch(() => '');
+      assert(!x.includes('cursia-cta://'), `${a.idnumber}: marcador sin resolver`);
+      if (/:activity_instruction$/.test(a.idnumber)) {
+        const next = bacts[i + 1];
+        const mid = /_(\d+)$/.exec(next.dir)[1];
+        const tok = next.modname === 'scorm' ? 'SCORMVIEWBYID' : 'H5PACTIVITYVIEWBYID';
+        assert(x.includes(`$@${tok}*${mid}@$`), `${a.idnumber}: el botón no apunta a ${next.idnumber}`);
+      }
+      if (/^cv3:(exam_info:|final_exam_info)/.test(a.idnumber)) {
+        const mid = /_(\d+)$/.exec(bacts[i + 1].dir)[1];
+        assert(bacts[i + 1].modname === 'quiz' && x.includes(`$@QUIZVIEWBYID*${mid}@$`), `${a.idnumber}: el botón no apunta a su evaluación`);
+      }
+    }
+    const nexts = bacts.filter((a) => /^cv3:module_next:/.test(a.idnumber));
+    assert(nexts.length === base.input.manifest.modules.length, `module_next ${nexts.length}`);
+    for (const a of nexts) {
+      const n = Number(/\$@COURSESECTIONBYID\*(\d+)@\$/.exec(await intro(a))?.[1]);
+      assert(n === a.section + 1, `${a.idnumber}: apunta a la sección ${n}, esperaba ${a.section + 1}`);
+    }
+    assert(secOf.get('cv3:shell:closing') === nexts[nexts.length - 1].section + 1, 'el último botón lleva al cierre');
+  });
   const cases = [
     ['GRADEPASS', () => {
       const a = find(/:activity$/);
@@ -418,6 +444,27 @@ const MATRIX = [
       const a = find(/^cv3:shell:competencies$/);
       const forum = find(/^cv3:shell:forum$/);
       return { [`${a.dir}/label.xml`]: (x) => x.replace(/contextid="\d+"/, () => `contextid="${forumCtx}"`) };
+    }],
+    // Edu EV3: botones de navegación mal resueltos o con cifras inventadas.
+    ['TOKEN_INVALID', () => {
+      const a = find(/^cv3:module_next:/);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace(/\$@COURSESECTIONBYID\*\d+@\$/, '$@COURSESECTIONBYID*99@$') };
+    }],
+    ['TOKEN_INVALID', () => {
+      const a = find(/^cv3:module_next:/);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace(/\$@COURSESECTIONBYID\*(\d+)@\$/, 'cursia-cta://section/$1') };
+    }],
+    ['TOKEN_INVALID', () => {
+      const a = find(/^cv3:ch:[^:]+:activity_instruction$/);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace(/\$@(SCORM|H5PACTIVITY)VIEWBYID\*\d+@\$/, 'cursia-cta://next-activity') };
+    }],
+    ['NUMBER_NOT_FROM_FACTS', () => {
+      const a = find(/^cv3:module_next:/);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace('continúa por aquí.', 'continúa por aquí en 97 minutos.') };
+    }],
+    ['STRUCTURE', () => {
+      const a = find(/^cv3:module_next:/);
+      return { [`${a.dir}/module.xml`]: (x) => x.replace(/<idnumber>cv3:module_next:[^<]+<\/idnumber>/, '<idnumber>cv3:module_next:no-existe</idnumber>') };
     }],
     ['STRUCTURE', () => {
       const a = find(/^cv3:exam:/);
@@ -649,6 +696,11 @@ const MATRIX = [
     i2.contents.videos.set(vid, { youtubeId: PF.YOUTUBE_ID, durationSec: 600 });
     await rejects(B.buildDynamicMbzV3(i2), /H5P_INPUT_INVALID\(VideoInteractions\)|durationSec/, 'duración');
     throwsSync(() => B.assertTokensV3('<a href="$@QUIZVIEWBYID*5@$">x</a>', new Map([[5, 'label']]), 'x'), /MBZ_V3_TOKEN_INVALID/, 'token');
+    // Edu EV3: marcador sin resolver, sección inexistente o sin lista de secciones → fallo fuerte.
+    throwsSync(() => B.assertTokensV3('<a href="cursia-cta://next-exam">x</a>', new Map(), 'x', new Set([1])), /MBZ_V3_TOKEN_INVALID.*cursia-cta sin resolver/, 'marcador');
+    throwsSync(() => B.assertTokensV3('<a href="$@COURSESECTIONBYID*9@$">x</a>', new Map(), 'x', new Set([1, 2])), /MBZ_V3_TOKEN_INVALID/, 'sección inexistente');
+    throwsSync(() => B.assertTokensV3('<a href="$@COURSESECTIONBYID*1@$">x</a>', new Map(), 'x'), /MBZ_V3_TOKEN_INVALID/, 'sin secciones');
+    B.assertTokensV3('<a href="$@COURSESECTIONBYID*1@$">x</a><a href="$@QUIZVIEWBYID*5@$">y</a>', new Map([[5, 'quiz']]), 'x', new Set([1]));
   });
 
   // ── Guardas, tema, clave ─────────────────────────────────────────────────

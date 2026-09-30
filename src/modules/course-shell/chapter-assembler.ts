@@ -39,6 +39,7 @@ import {
   unprotectedText,
 } from './html';
 import { COPY, activityInstruction, bridgeLead, continueWith, moduleExamTransition } from './microcopy';
+import { CTA_ACTIVITY, ctaButton } from './cta';
 
 export type ChapterSlot =
   | { kind: 'label'; role: ChapterLabelRole; name: string; html: string }
@@ -154,7 +155,9 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     const inner =
       eyebrow(h, 'Práctica calificada', s) +
       heading(h, 'h3', COPY.activityTitle, s) +
-      pHtml(h, labelHtml(activityInstruction(k.passingGrade, k.attempts)), s, { last: true });
+      pHtml(h, labelHtml(activityInstruction(k.passingGrade, k.attempts)), s, { last: true }) +
+      // Edu EV3: botón a la actividad (el builder resuelve el marcador al crearla).
+      ctaButton(h, CTA_ACTIVITY, `Iniciar actividad del capítulo ${ch.number} →`, s);
     slots.push(label('activity_instruction', 'Práctica', root(h, uid('activity_instruction'), inner)));
     slots.push({ kind: 'activity', variant: ch.activityVariant as 'h5p' | 'scorm' });
   } else {

@@ -104,6 +104,7 @@ import {
   libroCardLabel,
   methodologyLabel,
   moduleIntroLabel,
+  moduleNextLabel,
   routeLabel,
   validateH5pActivityPayload,
   welcomeLabel,
@@ -395,11 +396,17 @@ const TOKEN_MODNAME: Record<string, string> = {
 };
 
 /** Falla fuerte ante cualquier token `$@…$` que no apunte a un módulo del paquete del tipo correcto. */
-export function assertTokensV3(html: string, modnameByMid: Map<number, string>, where: string): void {
+export function assertTokensV3(html: string, modnameByMid: Map<number, string>, where: string, sectionNums?: Set<number>): void {
   const bad: string[] = [];
+  if (/cursia-cta:\/\//.test(html)) bad.push('marcador cursia-cta sin resolver');
   for (const m of html.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?@\$/g)) {
     const kind = m[1];
     const idStr = m[2];
+    // Edu EV3: enlace a una sección del paquete (botón «Continuar con el módulo…»).
+    if (kind === 'COURSESECTIONBYID') {
+      if (!idStr || !sectionNums || !sectionNums.has(Number(idStr))) bad.push(m[0]);
+      continue;
+    }
     const want = /^(.+)VIEWBYID$/.exec(kind)?.[1];
     const modname = want ? TOKEN_MODNAME[want] : undefined;
     if (!modname || !idStr || modnameByMid.get(Number(idStr)) !== modname) bad.push(m[0]);
@@ -581,9 +588,26 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const mockPresentationChapters: string[] = [];
   const introTheme = introThemeFrom(theme);
 
+  // Edu EV3 — botones de navegación: el shell deja marcadores cursia-cta://…; las secciones se
+  // resuelven al instante y «siguiente actividad / evaluación» cuando el builder crea esa actividad
+  // en la misma sección (se reescribe el label.xml). assertTokensV3 falla ante uno sin resolver.
+  const pendingCtas: Array<{ a: ActivityRef; name: string; html: string; secnum: number; logIdx: number }> = [];
+  const resolveCta = (marker: 'next-activity' | 'next-exam', secnum: number, token: string): void => {
+    for (let i = pendingCtas.length - 1; i >= 0; i--) {
+      const p = pendingCtas[i];
+      if (p.secnum !== secnum || !p.html.includes(`cursia-cta://${marker}`)) continue;
+      p.html = p.html.split(`cursia-cta://${marker}`).join(token);
+      W.put(`${p.a.dir}/label.xml`, labelXmlWithCtx(p.a.aid, p.a.mid, p.a.ctx, p.name, p.html, ts));
+      labelsHtml[p.logIdx].html = p.html;
+      if (!p.html.includes('cursia-cta://')) pendingCtas.splice(i, 1);
+      return;
+    }
+  };
   const addLabel = (secnum: number, idnumber: string, label: ShellLabel, files: Array<{ name: string; data: Buffer | string; mime: string }> = []): ActivityRef => {
     const a = W.newActivity('label', secnum, label.name, idnumber);
     const fileIds = files.map((f) => W.addFile(a.ctx, 'mod_label', 'intro', f.name, f.data, f.mime));
+    label = { ...label, html: label.html.replace(/cursia-cta:\/\/section\/(\d+)/g, (_m, n: string) => `$@COURSESECTIONBYID*${n}@$`) };
+    if (label.html.includes('cursia-cta://')) pendingCtas.push({ a, name: label.name, html: label.html, secnum, logIdx: labelsHtml.length });
     W.put(`${a.dir}/label.xml`, labelXmlWithCtx(a.aid, a.mid, a.ctx, label.name, label.html, ts));
     W.put(`${a.dir}/module.xml`, withIdnumber(moduleXml(a.mid, 'label', secnum, ts, MV.bv), idnumber));
     W.put(`${a.dir}/inforef.xml`, inforef(fileIds));
@@ -619,6 +643,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     }));
     gradedCommon(a, kind, name, [fPkg, fIntro]);
     labelsHtml.push({ where: `${idnumber}#intro`, html: introHtml });
+    if (kind === 'activity') resolveCta('next-activity', secnum, `$@H5PACTIVITYVIEWBYID*${a.mid}@$`);
     h5pPackages.push({ itemKey, filename, mainLibrary, sha1: sha1Buf(h5p), bytes: h5p.length });
   };
 
@@ -633,6 +658,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     W.put(`${a.dir}/quiz.xml`, q.quizXml);
     questionCategories.push(q.questionCategoriesXml);
     gradedCommon(a, kind, name, [], q.categoryIds);
+    resolveCta('next-exam', secnum, `$@QUIZVIEWBYID*${a.mid}@$`);
   };
 
   // ── Sección 0 — shell ────────────────────────────────────────────────────
@@ -784,6 +810,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
           }));
           gradedCommon(a, 'activity', name, fileIds);
           labelsHtml.push({ where: `${idp}:activity#intro`, html: introHtml });
+          resolveCta('next-activity', sec, `$@SCORMVIEWBYID*${a.mid}@$`);
         }
       }
     }
@@ -791,6 +818,21 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       addLabel(sec, `cv3:exam_info:${m.moduleId}`, examInfoLabel(mf, facts, theme, opts));
       addQuiz(sec, `cv3:exam:${m.moduleId}`, safeActivityName(`Evaluación del módulo ${m.moduleNumber}: ${m.title}`), 'exam', c.examGift.get(m.moduleId) as string, m.keys.exam);
     }
+    // Edu EV3: cierre de la sección → botón al módulo siguiente (o al cierre del curso).
+    const nextPlan = plan.modules[plan.modules.indexOf(m) + 1];
+    const nextFacts = nextPlan ? facts.modules.find((x) => x.id === nextPlan.moduleId) : undefined;
+    if (nextPlan && !nextFacts) throw new Error(`MBZ_V3_INVARIANT: módulo ${nextPlan.moduleId} ausente en facts`);
+    addLabel(
+      sec,
+      `cv3:module_next:${m.moduleId}`,
+      moduleNextLabel(
+        mf,
+        nextPlan && nextFacts ? { kind: 'module', module: nextFacts, sectionNum: nextPlan.sectionNum } : { kind: 'closing', sectionNum: plan.closingSectionNum },
+        facts,
+        theme,
+        opts,
+      ),
+    );
   }
 
   // ── Sección de cierre ────────────────────────────────────────────────────
@@ -802,7 +844,9 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   }
 
   // ── Tokens (fail loud) ───────────────────────────────────────────────────
-  for (const l of labelsHtml) assertTokensV3(l.html, W.modnameByMid, l.where);
+  const sectionNums = new Set(plan.sections.map((s) => s.sectionNum));
+  for (const l of labelsHtml) assertTokensV3(l.html, W.modnameByMid, l.where, sectionNums);
+  if (pendingCtas.length) throw new Error(`MBZ_V3_INVARIANT: botones de navegación sin destino: ${pendingCtas.map((p) => p.name).join(', ')}`);
 
   // ── Secciones ────────────────────────────────────────────────────────────
   for (const s of plan.sections) {

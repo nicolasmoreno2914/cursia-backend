@@ -20,6 +20,7 @@ import { labelHtml, inlineHtml } from '../visual-components/text';
 import { formatDurationEs } from '../../package/audio';
 import type { AssessableType } from '../course-profiles/course-profiles';
 import { CourseFacts, ModuleFacts, lintShellNumbers } from './facts';
+import { CTA_EXAM, ctaButton, ctaSection } from './cta';
 import {
   CourseIntroV3,
   ModuleIntroV3,
@@ -340,6 +341,7 @@ function examInfo(
   questionCount: number,
   kind: AssessableType,
   facts: CourseFacts,
+  ctaText: string,
 ): ShellLabel {
   const k = facts.assessment.kinds[kind];
   const cs = { s: panelSurf(h), border: h.t.color.border };
@@ -351,7 +353,8 @@ function examInfo(
   ]
     .map((it) => numRow(h, it, cs.s))
     .join('');
-  const inner = eyebrow(h, 'Evaluación', cs.s) + heading(h, 'h3', title, cs.s) + pHtml(h, labelHtml(leadText), cs.s, { secondary: true }) + rows(h, items, { cls: 'cvc-cols2' });
+  // Edu EV3: el botón lleva al cuestionario (el builder resuelve el marcador al crearlo).
+  const inner = eyebrow(h, 'Evaluación', cs.s) + heading(h, 'h3', title, cs.s) + pHtml(h, labelHtml(leadText), cs.s, { secondary: true }) + rows(h, items, { cls: 'cvc-cols2' }) + ctaButton(h, CTA_EXAM, ctaText, cs.s);
   return out(name, root(h, uid, box(h, inner, cs)), facts);
 }
 
@@ -374,6 +377,7 @@ export function examInfoLabel(
     module.examQuestionCount as number,
     'exam',
     facts,
+    `Presentar evaluación del módulo ${module.number} →`,
   );
 }
 
@@ -389,7 +393,27 @@ export function finalExamInfoLabel(facts: CourseFacts, theme: ResolvedTheme, opt
     facts.finalExam.questionCount,
     'finalExam',
     facts,
+    'Presentar evaluación final →',
   );
+}
+
+/**
+ * Edu EV3 — cierre de la sección de un módulo: «Cuando termines el módulo N…» + botón a la sección del
+ * módulo siguiente (o al cierre del curso). Toda cifra sale de facts (número de módulo).
+ */
+export function moduleNextLabel(
+  module: ModuleFacts,
+  next: { kind: 'module'; module: ModuleFacts; sectionNum: number } | { kind: 'closing'; sectionNum: number },
+  facts: CourseFacts,
+  theme: ResolvedTheme,
+  opts?: ShellRenderOptions,
+): ShellLabel {
+  const h = hx(theme, opts);
+  const s = bgSurf(h);
+  const done = `Cuando termines el módulo ${module.number} («${module.title}»), continúa por aquí.`;
+  const text = next.kind === 'module' ? `Continuar con el módulo ${next.module.number}: ${next.module.title} →` : 'Ir al cierre del curso →';
+  const inner = pHtml(h, labelHtml(done), s, { weight: 600 }) + ctaButton(h, ctaSection(next.sectionNum), text, s);
+  return out(`Módulo ${module.number}: siguiente paso`, root(h, `shell-module-next-${module.number}`, inner), facts);
 }
 
 // ─── SZ Cierre ──────────────────────────────────────────────────────────────
