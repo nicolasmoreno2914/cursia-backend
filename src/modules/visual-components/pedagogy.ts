@@ -50,13 +50,13 @@ export function validatePedagogy(doc: Doc): VcValidationError[] {
     errors.push({ path: '$.movements.opening[0]', code: 'PEDAGOGY_MISSING', message: 'la apertura debe empezar con una introducción visual ("hero")' });
   }
   if (!hasAny(typesIn(doc, ['opening', 'deepening']), VC_PEDAGOGY.keyConcepts)) {
-    errors.push({ path: '$.movements.deepening', code: 'PEDAGOGY_MISSING', message: 'faltan los conceptos clave: agrega un "concept_cards" en opening o deepening' });
+    errors.push({ path: '$.movements.deepening', code: 'PEDAGOGY_MISSING', message: 'faltan los conceptos clave: agrega un "concept_cards" en opening o deepening (o reemplaza un componente de menor prioridad: deepening admite hasta 5)' });
   }
   if (!hasAny(typesIn(doc, ['deepening', 'closing']), VC_PEDAGOGY.example)) {
-    errors.push({ path: '$.movements.deepening', code: 'PEDAGOGY_MISSING', message: 'falta un ejemplo práctico: agrega un "worked_example" (o un "case_scenario") en deepening' });
+    errors.push({ path: '$.movements.deepening', code: 'PEDAGOGY_MISSING', message: 'falta un ejemplo práctico: agrega un "worked_example" (o un "case_scenario") en deepening (o reemplaza un componente de menor prioridad: deepening admite hasta 5)' });
   }
   if (!hasAny(typesIn(doc, ['deepening']), VC_PEDAGOGY.visual)) {
-    errors.push({ path: '$.movements.deepening', code: 'PEDAGOGY_MISSING', message: 'falta un recurso visual en deepening: agrega un "diagram", "comparison", "process_steps" o "timeline"' });
+    errors.push({ path: '$.movements.deepening', code: 'PEDAGOGY_MISSING', message: 'falta un recurso visual en deepening: agrega un "diagram", "comparison", "process_steps" o "timeline" (o reemplaza un componente de menor prioridad: deepening admite hasta 5)' });
   }
   for (const m of ['opening', 'deepening', 'synthesis', 'closing', 'video_primer'] as const) {
     const list = doc.movements[m];
