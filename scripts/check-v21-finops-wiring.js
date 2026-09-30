@@ -338,12 +338,14 @@ async function pureChecks() {
     const pkg = JSON.parse(fs.readFileSync(path.join(REPO, 'package.json'), 'utf8'));
     eq(pkg.scripts['start:dynamic-provider-worker'], 'node dist/workers/dynamic-provider-worker.js', 'npm script');
     const yml = fs.readFileSync(path.join(REPO, '.github/workflows/deploy-staging.yml'), 'utf8');
-    assert(yml.includes('ensure_pm2_process cursia-dynamic-provider-worker-staging start:dynamic-provider-worker'), 'staging PM2');
+    // R16 (#1): en staging el worker corre con node directo + kill_timeout (drenado ordenado).
+    assert(yml.includes('ensure_pm2_drain_worker cursia-dynamic-provider-worker-staging dist/workers/dynamic-provider-worker.js'), 'staging PM2');
     assert(fs.readFileSync(path.join(REPO, '.github/workflows/deploy.yml'), 'utf8').includes('ensure_pm2_process cursia-dynamic-provider-worker start:dynamic-provider-worker'), 'prod PM2');
     const iMig = yml.indexOf('MIGRATION_ENV=staging node scripts/migrate-v21-finops.js');
     const iVer = yml.indexOf('MIGRATION_ENV=staging node scripts/verify-v21-finops-schema.js');
     assert(iMig > 0 && iVer > iMig, 'deploy-staging: migrate + verify FinOps');
-    assert(iMig < yml.indexOf('ensure_pm2_process cursia-dynamic-item-worker-staging'), 'la migración corre antes de recargar los workers');
+    const iItemWorker = yml.indexOf('ensure_pm2_drain_worker cursia-dynamic-item-worker-staging');
+    assert(iItemWorker > 0 && iMig < iItemWorker, 'la migración corre antes de recargar los workers');
     assert(yml.includes('node scripts/check-v21-finops-wiring.js --pure-only'), 'CI');
     const iRls = yml.indexOf('MIGRATION_ENV=staging node scripts/migrate-v21-finops-rls.js');
     const iRlsV = yml.indexOf('MIGRATION_ENV=staging node scripts/verify-v21-finops-rls.js');

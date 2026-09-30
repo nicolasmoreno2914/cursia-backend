@@ -62,6 +62,18 @@ import {
 } from './provider-readiness';
 import { INVALIDATION_V3_NOT_IMPLEMENTED, assertInvalidationRulesSupported } from '../invalidation/plan';
 import { latestGenerationPredicate } from './item-generations';
+import {
+  AUTO_HEAL_SQL_ALLOW_REGEX,
+  AUTO_HEAL_SQL_DENY_REGEX,
+  AUTO_HEAL_MAX_AGE_HOURS_RANGE,
+  AUTO_HEAL_SKIP_COOLDOWN_SECONDS,
+  AUTO_HEAL_WORKER_ITEM_TYPES,
+  AutoHealPolicy,
+  AutoHealSweepResult,
+  autoHealDecision,
+  autoHealMaxRoundsFor,
+  autoHealPolicyFromEnv,
+} from './auto-heal';
 import { FinopsBudgetService, StartBudgetEvaluation } from '../finops/finops-budget.service';
 import {
   BUDGET_APPROVAL_REQUIRED,
@@ -1425,6 +1437,13 @@ export class RunsService {
    *   failed sigue blocked);
    * - si el run había terminado (p.ej. failed), se reabre a 'queued'.
    * Un run cancelado no admite reintentos (409).
+   *
+   * R16 (#2): `auto` = reapertura del auto-healer (misma transacción, sin
+   * controlador). Solo items `failed` (nunca bloqueos de presupuesto), la
+   * política se re-evalúa BAJO LOCK (allow-list, tope de rondas, espera), el
+   * gate de presupuesto se evalúa sin registrar estimados (insuficiente → 409
+   * y el item queda para un humano), concede `policy.attemptsPerRound`
+   * intentos y deja la ronda en output_summary.autoHeal + previousErrors.
    */
   async retryItem(
     courseId: number,
@@ -1434,7 +1453,11 @@ export class RunsService {
     itemKey: string,
     resubmitVideo = false,
     resubmitProvider = false,
+    auto?: { policy: AutoHealPolicy; now?: Date },
   ): Promise<ItemRunDto> {
+    if (auto && (resubmitVideo || resubmitProvider)) {
+      throw new BadRequestException('auto-heal: nunca reenvía a un proveedor (resubmitVideo/resubmitProvider)');
+    }
     // G3 (fix wave / review I1): un retry es un entry point como cualquier
     // otro — requiere la allow-list de V2, antes de tocar manifest o run.
     assertDynamicOwnerAllowed(ownerId);
@@ -1458,6 +1481,9 @@ export class RunsService {
         [job.id],
       );
     const preTarget = preRows.find((i) => i.item_key === itemKey);
+    if (auto && preTarget?.status !== 'failed') {
+      throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" no está failed`, code: 'auto_heal_not_eligible' });
+    }
     let uploadPhaseRetry = false;
     if (preTarget && (preTarget.status === 'failed' || isBudgetBlocked(preTarget))) {
       if (preTarget.type === 'video' && frozenDelivery === 'youtube' && !resubmitVideo) {
@@ -1482,12 +1508,18 @@ export class RunsService {
       // se desbloquean) exige una aprobación ADMIN que cubra el incremental.
       if (!uploadPhaseRetry) {
         const isPaid = (r: { type: string }) => paidProviderOfItemType(r.type) !== null;
-        const newPaid = (r: { type: string; output_summary: Record<string, any> | null }, resubmit: boolean) =>
-          r.type !== 'video' || resubmit || !r.output_summary?.external?.videogenJobId;
+        // R16 fix M1: igual que un video con su job persistido, una presentación con su generationId de Gamma
+        // persistido solo se re-pollea (nunca reenvía sin resubmitProvider): no es trabajo pagado nuevo.
+        const newPaid = (r: { type: string; output_summary: Record<string, any> | null }, resubmit: boolean) => {
+          if (resubmit) return true;
+          if (r.type === 'video') return !r.output_summary?.external?.videogenJobId;
+          if (r.type === 'presentation') return !r.output_summary?.external?.gammaGenerationId;
+          return true;
+        };
         const paidItems = isPaid(preTarget)
-          ? (newPaid(preTarget, resubmitVideo) ? [preTarget] : [])
+          ? (newPaid(preTarget, resubmitVideo || resubmitProvider) ? [preTarget] : [])
           : preRows.filter((r) => r.status === 'blocked' && isPaid(r) && newPaid(r, false));
-        await this.finopsPaidWorkGate({ courseId, ownerId, manifest, job, paidKeys: paidItems.map((r) => r.item_key) });
+        await this.finopsPaidWorkGate({ courseId, ownerId, manifest, job, paidKeys: paidItems.map((r) => r.item_key), dryRun: !!auto });
       }
     }
 
@@ -1520,10 +1552,12 @@ export class RunsService {
         type: string;
         error: string | null;
         output_summary: Record<string, any> | null;
+        finished_at: Date | null;
+        updated_at: Date | null;
       }> = await qr.query(
         // F78-BE2: la generación VIGENTE de cada item (una regeneración
         // fallida se reintenta sobre su propia fila, nunca sobre la histórica).
-        `select id, item_key, status, depends_on, type, error, output_summary
+        `select id, item_key, status, depends_on, type, error, output_summary, finished_at, updated_at
             from public.generation_item_runs g
             where g.job_id = $1 and ${latestGenerationPredicate('g')}
             order by id
@@ -1540,6 +1574,16 @@ export class RunsService {
         throw new ConflictException(
           `Solo se puede reintentar un item en estado "failed" (o "blocked" por ${BUDGET_EXCEEDED}); "${itemKey}" está en "${target.status}"`,
         );
+      }
+      // R16 (#2): la política del auto-healer se re-evalúa con la fila bloqueada (otro barrido, un retry
+      // manual o un fallo nuevo pudieron cambiarla entre la lectura y este lock).
+      let autoMeta: { round: number; code: string } | null = null;
+      if (auto) {
+        const d = autoHealDecision(target, auto.now ?? new Date(), auto.policy);
+        if (d.heal === false) {
+          throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (${d.reason})`, code: 'auto_heal_not_eligible' });
+        }
+        autoMeta = { round: d.round, code: d.rule.code };
       }
 
       // I1 (fix wave / review controller ruling: "un retry NO es un resume").
@@ -1583,7 +1627,8 @@ export class RunsService {
           );
         }
         this.logger.warn(`retryItem: resubmitProvider=true para "${itemKey}" (run ${job.id}) — error previo "${err}"; archivando la generación anterior`);
-        resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey'`;
+        // R16 fix M3: el reenvío empieza una espera nueva (tope de reloj de los timeouts gratuitos).
+        resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey' - 'gammaPollSince' - 'videoPollSince'`;
       }
       if (resubmitVideo) {
         if (target.type !== 'video') {
@@ -1601,7 +1646,8 @@ export class RunsService {
           `retryItem: resubmitVideo=true para item "${itemKey}" (run ${job.id}) — error previo "${err}"; ` +
             'archivando external/externalSubmitStartedAt en previousExternals y sometiendo un video nuevo',
         );
-        resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey'`;
+        // R16 fix M3: el reenvío empieza una espera nueva (tope de reloj de los timeouts gratuitos).
+        resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey' - 'gammaPollSince' - 'videoPollSince'`;
       }
 
       const previousErrorsExpr = `coalesce(output_summary, '{}'::jsonb) || jsonb_build_object(
@@ -1611,7 +1657,7 @@ export class RunsService {
                       'attemptCount', attempt_count,
                       'maxAttempts', max_attempts,
                       'retriedAt', now()
-                    ))
+                    ) || $3::jsonb)
                   )`;
       const outputSummaryExpr = resubmitVideo || resubmitProvider
         ? `((${previousErrorsExpr}) || jsonb_build_object(
@@ -1626,14 +1672,21 @@ export class RunsService {
                     -- Calibración #2: decisión humana explícita → las operaciones pagadas de los
                     -- intentos hasta acá quedan reconocidas (el worker ya no las trata como ambiguas).
                     'reconciliationAcknowledgedThroughAttempt', attempt_count
-                  ))${resubmitSetSql}`
-        : previousErrorsExpr;
+                  ) || $4::jsonb)${resubmitSetSql}`
+        : `(${previousErrorsExpr}) || $4::jsonb`;
+      // R16 (#2): la reapertura automática queda registrada (auditoría) en la misma escritura.
+      const nowIso = (auto?.now ?? new Date()).toISOString();
+      const entryExtra = autoMeta ? { auto: true, autoHealRound: autoMeta.round, autoHealCode: autoMeta.code } : {};
+      const topExtra = autoMeta
+        ? { autoHeal: { rounds: autoMeta.round, lastAt: nowIso, lastCode: autoMeta.code, maxRounds: autoHealMaxRoundsFor(target.type, auto!.policy) } }
+        : {};
+      const attemptsGranted = auto ? Math.max(1, Math.floor(auto.policy.attemptsPerRound)) : 3;
 
       const updated = returningRows(
         await qr.query(
           `update public.generation_item_runs
               set status = 'pending',
-                  max_attempts = attempt_count + 3,
+                  max_attempts = attempt_count + $2::int,
                   output_summary = ${outputSummaryExpr},
                   error = null,
                   next_retry_at = null,
@@ -1644,7 +1697,7 @@ export class RunsService {
             where id = $1 and status = 'failed'
                or (id = $1 and status = 'blocked' and error like '${BUDGET_EXCEEDED}%')
             returning id`,
-          [target.id],
+          [target.id, attemptsGranted, JSON.stringify(entryExtra), JSON.stringify(topExtra)],
         ),
       );
       if (updated.length !== 1) {
@@ -1694,6 +1747,146 @@ export class RunsService {
 
     const [row] = await this.dataSource.query(`select * from public.generation_item_runs where id = $1`, [targetId]);
     return this.toItemDto(row, frozenDelivery);
+  }
+
+  /** R16 (#2): último motivo logueado por item (evita repetir el mismo "no se reabre" en cada barrido). */
+  private readonly autoHealLastSkip = new Map<string, string>();
+
+  /**
+   * R16 (#2 + #16) — barrido del auto-healer (lo dispara el timer de la API,
+   * ver auto-heal.ts/startAutoHealTimer). Lee sin locks los items `failed`
+   * (generación vigente) y reabre los elegibles con retryItem(auto), que
+   * re-evalúa todo bajo lock. Un item que no se puede reabrir (presupuesto,
+   * run reemplazado, otro run activo, owner fuera de la allow-list…) se deja
+   * para un humano, con un log por motivo.
+   *
+   * Fix round 1 (review I1/I2): el SQL ya filtra lo que el healer reabriría —
+   * fallos RECIENTES (policy.maxAgeHours) de la ejecución VIGENTE del curso (sin
+   * run ni Manifest más nuevos), allow/deny-list gruesa, precondición del id
+   * del proveedor, tope de rondas por tipo y espera —, los más nuevos primero,
+   * con paginación por clave (finished_at, id): filas no elegibles nunca tapan
+   * a una elegible. Un log por barrido con los conteos.
+   */
+  async autoHealFailedItems(
+    opts: { policy?: AutoHealPolicy; now?: Date; limit?: number; maxCandidates?: number } = {},
+  ): Promise<AutoHealSweepResult> {
+    const policy = opts.policy ?? autoHealPolicyFromEnv();
+    const pageSize = Math.max(1, Math.floor(opts.limit ?? 50));
+    const maxCandidates = Math.max(pageSize, Math.floor(opts.maxCandidates ?? 200));
+    const now = opts.now ?? new Date();
+    const result: AutoHealSweepResult = { candidates: 0, reopened: [], skipped: [] };
+    // Fix m3: acotado antes del cast (un valor enorme en el jsonb no desborda ::int).
+    const roundsSql = `least(floor(case when jsonb_typeof(g.output_summary->'autoHeal'->'rounds') = 'number'
+                                  then (g.output_summary->'autoHeal'->>'rounds')::numeric else 0 end), 1000000)::int`;
+    // Fix m1: cursor exacto al microsegundo (un Date de JS trunca a ms y podía saltear filas).
+    const finishedUsSql = `(extract(epoch from g.finished_at) * 1000000)::bigint`;
+    const backoffs = (policy.backoffSeconds.length ? policy.backoffSeconds : [0]).map((x) => Math.max(0, Math.floor(x)));
+    let cursor: { finishedUs: string; id: string } | null = null;
+    while (result.candidates! < maxCandidates) {
+      const rows: Array<{
+        id: string; job_id: string; item_key: string; type: string; status: string; error: string | null; output_summary: Record<string, any> | null;
+        finished_at: Date; finished_us: string; updated_at: Date | null; course_id: number; owner_id: string; blueprint_number: number;
+      }> = await this.dataSource.query(
+        `select g.id, g.job_id, g.item_key, g.type, g.status, g.error, g.output_summary, g.finished_at, g.updated_at,
+                ${finishedUsSql}::text as finished_us, pj.course_id, pj.owner_id, b.blueprint_number
+           from public.generation_item_runs g
+           join public.production_jobs pj on pj.id = g.job_id
+           join public.course_generation_manifests m on m.id = g.manifest_id
+           join public.course_blueprints b on b.id = m.blueprint_id
+          where pj.execution_mode = 'dynamic_generation'
+            and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+            and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed')
+            and g.status = 'failed'
+            and ${latestGenerationPredicate('g')}
+            -- I1: solo fallos recientes
+            and g.finished_at > $1::timestamptz - make_interval(secs => $2::int)
+            -- I1: solo la ejecución vigente del curso (ningún run más nuevo, ni un Manifest más nuevo)
+            and not exists (
+              select 1 from public.production_jobs pj2
+               where pj2.execution_mode = 'dynamic_generation' and pj2.course_id = pj.course_id and pj2.id <> pj.id
+                 and (pj2.created_at > pj.created_at or (pj2.created_at = pj.created_at and pj2.id > pj.id)))
+            and not exists (select 1 from public.course_generation_manifests m2 where m2.course_id = m.course_id and m2.id > m.id)
+            -- I2: allow/deny-list gruesa + precondición del id del proveedor
+            and g.error ~* $3 and g.error !~* $4
+            and not (g.error ~ '^(gamma_timeout|gamma_poll_failed|gamma_export_missing)'
+                     and coalesce(g.output_summary->'external'->>'gammaGenerationId', '') = '')
+            and not (g.error ~ '^(video_timeout|video_duration_unmeasured|youtube_upload_failed)'
+                     and coalesce(g.output_summary->'external'->>'videogenJobId', '') = '')
+            -- M6 + tope: rondas por tipo; espera creciente desde el fallo
+            and ${roundsSql} < case when g.type = any($5::text[]) then $6::int else $7::int end
+            and g.finished_at <= $1::timestamptz - make_interval(secs => ($8::int[])[least(${roundsSql}, cardinality($8::int[]) - 1) + 1])
+            -- m2: enfriamiento tras un rechazo de retryItem (presupuesto, run reemplazado, otro run activo…)
+            and not (case when jsonb_typeof(g.output_summary->'autoHeal'->'skipUntilMs') = 'number'
+                          then (g.output_summary->'autoHeal'->>'skipUntilMs')::numeric > $12::numeric else false end)
+            and ($9::bigint is null or (${finishedUsSql}, g.id) < ($9::bigint, $10::uuid))
+          order by ${finishedUsSql} desc, g.id desc
+          limit $11`,
+        [
+          now.toISOString(), Math.round(Math.min(Math.max(policy.maxAgeHours, 0), AUTO_HEAL_MAX_AGE_HOURS_RANGE.max) * 3600), AUTO_HEAL_SQL_ALLOW_REGEX, AUTO_HEAL_SQL_DENY_REGEX,
+          [...AUTO_HEAL_WORKER_ITEM_TYPES], policy.maxRounds, policy.browserMaxRounds, backoffs,
+          cursor ? cursor.finishedUs : null, cursor ? cursor.id : null, pageSize, now.getTime(),
+        ],
+      );
+      if (rows.length === 0) break;
+      result.candidates! += rows.length;
+      cursor = { finishedUs: rows[rows.length - 1].finished_us, id: rows[rows.length - 1].id };
+      for (const r of rows) await this.autoHealOne(r, now, policy, result);
+      if (rows.length < pageSize) break;
+    }
+    if (this.autoHealLastSkip.size > 5000) this.autoHealLastSkip.clear();
+    const byReason: Record<string, number> = {};
+    for (const s of result.skipped) byReason[s.reason] = (byReason[s.reason] ?? 0) + 1;
+    this.logger.log(
+      `auto-heal: barrido — candidatos ${result.candidates}, reabiertos ${result.reopened.length}, ` +
+        `omitidos ${result.skipped.length}${result.skipped.length ? ` ${JSON.stringify(byReason)}` : ''}`,
+    );
+    return result;
+  }
+
+  private async autoHealOne(
+    r: { id: string; job_id: string; item_key: string; type: string; status: string; error: string | null; output_summary: Record<string, any> | null;
+      finished_at: Date; updated_at: Date | null; course_id: number; owner_id: string; blueprint_number: number },
+    now: Date,
+    policy: AutoHealPolicy,
+    result: AutoHealSweepResult,
+  ): Promise<void> {
+    const d = autoHealDecision(r, now, policy);
+    if (d.heal === false) {
+      result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: d.reason });
+      return;
+    }
+    try {
+      await this.retryItem(r.course_id, r.owner_id, Number(r.blueprint_number), r.job_id, r.item_key, false, false, { policy, now });
+      this.autoHealLastSkip.delete(r.id);
+      result.reopened.push({ runId: r.job_id, itemKey: r.item_key, code: d.rule.code, round: d.round });
+      this.logger.warn(
+        `auto-heal: reabierto ${r.item_key} (run ${r.job_id}) — ronda ${d.round}/${autoHealMaxRoundsFor(r.type, policy)}, ` +
+          `código ${d.rule.code}; error previo: ${String(r.error ?? '').slice(0, 200)}`,
+      );
+    } catch (err) {
+      const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
+      const code = (resp && typeof resp === 'object' && (resp as any).code) || (err instanceof Error ? err.name : 'error');
+      const msg = err instanceof Error ? err.message : String(err);
+      result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: String(code) });
+      // Fix m2: enfriamiento durable en el item (el SQL lo filtra): un rechazo no vuelve a tomar locks en cada barrido
+      // ni a ocupar lugar frente a los elegibles. Solo si sigue failed (nunca pisa un item que cambió).
+      try {
+        await this.dataSource.query(
+          `update public.generation_item_runs
+              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('autoHeal',
+                    coalesce(output_summary->'autoHeal', '{}'::jsonb) || jsonb_build_object('skipUntilMs', $2::bigint, 'lastSkipReason', $3::text))
+            where id = $1 and status = 'failed'`,
+          [r.id, now.getTime() + AUTO_HEAL_SKIP_COOLDOWN_SECONDS * 1000, String(code).slice(0, 100)],
+        );
+      } catch (e) {
+        this.logger.warn(`auto-heal: no se pudo registrar el enfriamiento de ${r.item_key}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      const key = `${code}:${msg.slice(0, 120)}`;
+      if (this.autoHealLastSkip.get(r.id) !== key) {
+        this.autoHealLastSkip.set(r.id, key);
+        this.logger.warn(`auto-heal: ${r.item_key} (run ${r.job_id}) no se reabre automáticamente (${code}): ${msg.slice(0, 300)}`);
+      }
+    }
   }
 
   /**
@@ -2575,7 +2768,7 @@ export class RunsService {
    * actual + incremental esperado; si no → 409 budget_approval_required con el
    * estimateId. AUTO_WITHIN_POLICY nunca cubre proveedores pagados.
    */
-  private async finopsPaidWorkGate(a: { courseId: number; ownerId: string; manifest: ManifestDto; job: any; paidKeys: string[] }): Promise<void> {
+  private async finopsPaidWorkGate(a: { courseId: number; ownerId: string; manifest: ManifestDto; job: any; paidKeys: string[]; dryRun?: boolean }): Promise<void> {
     // Solo los items cuyo proveedor está congelado en `real` para este run (video: videoMode; Gamma/TTS: providerModes).
     const modes = this.spendModesOf(a.job);
     const typeOf = new Map(a.manifest.manifest.items.map((it) => [it.key, it.type]));
@@ -2603,6 +2796,13 @@ export class RunsService {
     ]);
     const g = runtimeGuard({ authorizedBudget, actualSoFar, reservedInFlight: '0', next: estimate.totals.expected });
     if (g.allow) return;
+    if (a.dryRun) {
+      // R16 (#2): el auto-healer no registra estimados (correría en cada barrido): el item queda para un humano.
+      throw new ConflictException({
+        code: BUDGET_APPROVAL_REQUIRED,
+        message: `${BUDGET_APPROVAL_REQUIRED}: reabrir ${keys.join(', ')} excede el presupuesto autorizado (${g.reason}); no se reabre automáticamente.`,
+      });
+    }
     const est = await this.finopsBudget.recordEstimate({
       scope: 'regeneration', ownerId: a.ownerId, courseId: a.courseId, manifestId: a.manifest.id, runId: a.job.id, estimate,
     });

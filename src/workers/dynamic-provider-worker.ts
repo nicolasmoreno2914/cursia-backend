@@ -4,7 +4,8 @@ import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DataSource } from 'typeorm';
 import { AppModule } from '../app.module';
-import { MissingSchemaBackoff, holdIdleIfDynamicDisabled, holdIdleIfProviderWorkerDisabled } from './dynamic-worker-gate';
+import { holdIdleIfDynamicDisabled, holdIdleIfProviderWorkerDisabled } from './dynamic-worker-gate';
+import { DrainSignal, awaitDrain, drainTimeoutMs, installDrainHandlers, runClaimLoop } from './worker-drain';
 import { ClaimedItem, DEFAULT_LEASE_SECONDS, SchedulerService } from '../modules/dynamic-generation/scheduler.service';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import type { ManifestItemType } from '../modules/generation-manifests/generation-manifest-builder';
@@ -157,6 +158,8 @@ export interface ProviderWorkerDeps {
   rasterizer?: CoverRasterizer;
   gammaPollMs?: number;
   gammaTimeoutMs?: number;
+  /** R16 (#1): señal de drenado del proceso; el modo real devuelve el item en puntos sin gasto en el aire. */
+  drain?: DrainSignal | null;
 }
 
 async function loadRunHead(
@@ -217,6 +220,7 @@ export async function processProviderItem(deps: ProviderWorkerDeps, item: Claime
         rasterizer: deps.rasterizer,
         gammaPollMs: deps.gammaPollMs,
         gammaTimeoutMs: deps.gammaTimeoutMs,
+        drain: deps.drain ?? null,
       },
       item,
       head.ownerId,
@@ -305,29 +309,36 @@ async function bootstrap() {
     budget: app.get(FinopsBudgetService),
   };
   const pollMs = readPositiveInt('DYNAMIC_PROVIDER_WORKER_POLL_MS', 5000);
-  let shuttingDown = false;
-  const stop = async () => {
-    shuttingDown = true;
-  };
-  process.on('SIGINT', () => void stop());
-  process.on('SIGTERM', () => void stop());
-  logger.log(`dynamic-provider-worker iniciado (executorId=${deps.executorId}, pollMs=${pollMs}, tipos=${PROVIDER_WORKER_TYPES.join(',')})`);
-  const schema = new MissingSchemaBackoff(logger, 'dynamic-provider-worker');
-  while (!shuttingDown) {
-    let wait = pollMs;
-    try {
-      const r = await runProviderOnce(deps);
-      schema.onClaimOk();
-      if (r === 'claimed') wait = 0;
-    } catch (err) {
-      const w = schema.onClaimError(err);
-      if (w === null) throw err;
-      wait = w;
-    }
-    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
-  }
-  await app.close();
-  process.exit(0);
+  // R16 (#1): antes `stop()` solo prendía un flag y PM2 (1,6 s) mataba el item en vuelo. Ahora: deja de reclamar,
+  // el item en vuelo termina o se devuelve en un punto sin gasto en el aire, tope DYNAMIC_WORKER_DRAIN_TIMEOUT_MS.
+  // R16 (#15): un error de claim se loguea y se reintenta con backoff (antes `throw err` → exit(1)).
+  const drain = new DrainSignal();
+  deps.drain = drain;
+  const active = new Set<Promise<void>>();
+  installDrainHandlers({ name: 'dynamic-provider-worker', logger, drain, active, close: () => app.close() });
+  logger.log(
+    `dynamic-provider-worker iniciado (executorId=${deps.executorId}, pollMs=${pollMs}, tipos=${PROVIDER_WORKER_TYPES.join(',')}, ` +
+      `drainTimeoutMs=${drainTimeoutMs()})`,
+  );
+  // Serial (concurrency 1), como antes.
+  await runClaimLoop<ClaimedItem>({
+    name: 'dynamic-provider-worker',
+    logger,
+    concurrency: 1,
+    pollMs,
+    drain,
+    active,
+    claim: () => deps.scheduler.claimNextItem({ executorId: deps.executorId, types: [...PROVIDER_WORKER_TYPES], leaseSeconds: deps.leaseSeconds }),
+    process: async (item) => {
+      try {
+        await processProviderItem(deps, item);
+      } catch (err) {
+        logger.error(`Item ${item.itemKey}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    },
+    describe: (item) => `item ${item.itemKey}`,
+  });
+  await awaitDrain(active, drainTimeoutMs());
 }
 
 if (require.main === module) {

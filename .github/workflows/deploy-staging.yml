@@ -407,6 +407,30 @@ jobs:
                  fi
                }
 
+               # R16 (#1): workers dinámicos con drenado ordenado. Corren con node directo (la señal de PM2 llega a
+               # Node, no a un wrapper npm) y kill_timeout de 300 s: al recargar, PM2 manda SIGINT y espera a que el
+               # worker deje de reclamar y termine o devuelva sus items (tope interno 270 s) antes de matarlo.
+               # Un proceso heredado (npm run, kill_timeout 1,6 s) se recrea UNA vez; los deploys siguientes recargan.
+               # pm2 jlist ilegible (exit 2 del helper) → no se recrea nada: se recarga el proceso existente.
+               DRAIN_KILL_TIMEOUT_MS=300000
+               ensure_pm2_drain_worker() {
+                 local name="$1"
+                 local script="$2"
+                 local rc=0
+                 if sudo pm2 describe "$name" > /dev/null 2>&1; then
+                   sudo pm2 jlist | node scripts/pm2-drain-config.js check "$name" "$script" "$DRAIN_KILL_TIMEOUT_MS" || rc=$?
+                   if [ "$rc" = "1" ]; then
+                     sudo pm2 delete "$name"
+                     sudo pm2 start "$script" --name "$name" --kill-timeout "$DRAIN_KILL_TIMEOUT_MS"
+                   else
+                     [ "$rc" = "0" ] || echo "⚠️ ${name}: no se pudo leer pm2 jlist (rc=${rc}); se recarga sin recrear"
+                     sudo pm2 reload "$name" --update-env
+                   fi
+                 else
+                   sudo pm2 start "$script" --name "$name" --kill-timeout "$DRAIN_KILL_TIMEOUT_MS"
+                 fi
+               }
+
                echo "━━━ [0/6] Verificar poppler-utils (pdftoppm — portadas de Gamma) ━━━"
                command -v pdftoppm > /dev/null 2>&1 || sudo apt-get install -y poppler-utils
 
@@ -534,9 +558,9 @@ jobs:
                ensure_pm2_process cursia-gamma-worker-staging start:gamma-worker
                ensure_pm2_process cursia-package-worker-staging start:package-worker
                ensure_pm2_process cursia-full-worker-staging start:full-worker
-               ensure_pm2_process cursia-dynamic-item-worker-staging start:dynamic-item-worker
-               ensure_pm2_process cursia-dynamic-package-worker-staging start:dynamic-package-worker
-               ensure_pm2_process cursia-dynamic-provider-worker-staging start:dynamic-provider-worker
+               ensure_pm2_drain_worker cursia-dynamic-item-worker-staging dist/workers/dynamic-item-worker.js
+               ensure_pm2_drain_worker cursia-dynamic-package-worker-staging dist/workers/dynamic-package-worker.js
+               ensure_pm2_drain_worker cursia-dynamic-provider-worker-staging dist/workers/dynamic-provider-worker.js
                sudo pm2 save
                sudo pm2 status
 

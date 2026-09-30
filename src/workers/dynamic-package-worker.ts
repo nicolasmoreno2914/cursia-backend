@@ -4,6 +4,7 @@ import { NestFactory } from '@nestjs/core';
 import { DataSource } from 'typeorm';
 import { AppModule } from '../app.module';
 import { MissingSchemaBackoff, holdIdleIfDynamicDisabled } from './dynamic-worker-gate';
+import { awaitDrain, drainTimeoutMs } from './worker-drain';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import { GenerationManifestsService, ManifestDto } from '../modules/generation-manifests/generation-manifests.service';
 import { CourseBlueprintsService } from '../modules/course-blueprints/course-blueprints.service';
@@ -758,8 +759,13 @@ async function bootstrap() {
   const shutdown = async (signal: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    logger.warn(`Recibido ${signal}; esperando ${activeJobs.size} job(s) activo(s)`);
-    await Promise.allSettled(Array.from(activeJobs));
+    // R16 (#1): espera acotada (DYNAMIC_WORKER_DRAIN_TIMEOUT_MS, por debajo del kill_timeout de PM2). El empaque
+    // no llama a proveedores pagados: un job cortado queda con su lease vencido y se reintenta (restore-first).
+    const timeoutMs = drainTimeoutMs();
+    logger.warn(`Recibido ${signal}; deja de reclamar y espera ${activeJobs.size} job(s) activo(s) (tope ${Math.round(timeoutMs / 1000)} s)`);
+    if ((await awaitDrain(activeJobs, timeoutMs)) === 'timeout') {
+      logger.error(`${activeJobs.size} job(s) de empaque siguen en vuelo tras ${Math.round(timeoutMs / 1000)} s; se sale igual (lease vencido → reintento)`);
+    }
     await app.close();
     logger.log('dynamic-package-worker detenido');
     process.exit(0);

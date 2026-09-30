@@ -61,6 +61,17 @@ export async function applyItemFailure(
    * propios en output_summary, fuera de max_attempts).
    */
   refundAttempt = false,
+  /**
+   * R16 (#1/#16): el intento NO cuenta contra max_attempts, pero sin reusar su
+   * número: attempt_count se conserva (sigue creciendo en cada claim) y se
+   * concede uno más (max_attempts + 1). A diferencia de `refundAttempt`, el
+   * próximo claim recibe un número de intento NUEVO, así una reserva pagada sin
+   * liquidar del intento interrumpido sigue siendo "de un intento anterior"
+   * (priorPaidOperations la detecta → reconciliación, nunca un pago ciego).
+   * Uso: lease vencido (laptop dormida, pestaña cerrada, worker reiniciado) y
+   * devolución ordenada de un worker que drena (SIGTERM).
+   */
+  grantAttempt = false,
 ): Promise<FailedTransition | null> {
   const retryAfter =
     typeof retryAfterSeconds === 'number' && Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
@@ -69,19 +80,21 @@ export async function applyItemFailure(
   const [row] = returningRows(
     await qr.query(
       `update public.generation_item_runs
-          set status = case when $3::boolean and ($7::boolean or attempt_count < max_attempts) then 'retrying' else 'failed' end,
-              next_retry_at = case when $3::boolean and ($7::boolean or attempt_count < max_attempts)
+          set status = case when $3::boolean and ($7::boolean or $8::boolean or attempt_count < max_attempts) then 'retrying' else 'failed' end,
+              next_retry_at = case when $3::boolean and ($7::boolean or $8::boolean or attempt_count < max_attempts)
                 then now() + make_interval(secs => coalesce($6::int, least($5::int, $4::int * power(2, greatest(attempt_count, 1) - 1))))
                 else null end,
-              finished_at = case when $3::boolean and ($7::boolean or attempt_count < max_attempts) then null else now() end,
+              finished_at = case when $3::boolean and ($7::boolean or $8::boolean or attempt_count < max_attempts) then null else now() end,
               attempt_count = case when $3::boolean and $7::boolean then greatest(attempt_count - 1, 0) else attempt_count end,
+              max_attempts = case when $3::boolean and $8::boolean and not $7::boolean
+                then greatest(max_attempts, attempt_count) + 1 else max_attempts end,
               worker_id = null,
               lease_until = null,
               error = $2,
               updated_at = now()
         where id = $1 and status = 'running'
         returning id, status, job_id, manifest_id, generation, item_key`,
-      [itemRunId, error, retryable, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS, retryAfter, !!refundAttempt],
+      [itemRunId, error, retryable, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS, retryAfter, !!refundAttempt, !!grantAttempt],
     ),
   );
   if (!row) return null;
@@ -122,15 +135,34 @@ export async function blockDependents(qr: QueryRunner, jobId: string, itemKey: s
 }
 
 /**
+ * R16 (#2/#16): cuántos leases vencidos por item se conceden GRATIS (sin
+ * consumir max_attempts). Un lease vence por causas ajenas al contenido
+ * (laptop dormida, pestaña cerrada, worker reiniciado en un deploy); pasado
+ * este tope, un item que mata a su ejecutor una y otra vez vuelve a consumir
+ * intentos (nunca un bucle infinito). Contador propio en
+ * output_summary.leaseExpiryGrants.
+ */
+export const LEASE_EXPIRY_FREE_GRANTS = 6;
+export const LEASE_EXPIRED_ERROR = 'lease_expired';
+
+function grantsOf(outputSummary: unknown): number {
+  const n = Number((outputSummary as Record<string, unknown> | null)?.leaseExpiryGrants ?? 0);
+  return Number.isInteger(n) && n > 0 ? n : 0;
+}
+
+/**
  * Barrido de leases vencidos de UN run (fila del run ya bloqueada por el
  * caller): `running` con lease_until < now() → mismo camino que
  * failItem(retryable) con error 'lease_expired'. SKIP LOCKED: un item que
  * otro está tocando en este instante (p.ej. un heartbeat) se deja para el
  * próximo barrido. Devuelve cuántos items transicionó.
+ * R16 (#16): mientras el item no agote LEASE_EXPIRY_FREE_GRANTS, el lease
+ * vencido no consume un intento (grantAttempt: el número de intento sigue
+ * creciendo, solo se concede uno más).
  */
 export async function sweepRunExpiredLeases(qr: QueryRunner, jobId: string): Promise<number> {
-  const expired: Array<{ id: string }> = await qr.query(
-    `select id from public.generation_item_runs
+  const expired: Array<{ id: string; output_summary: Record<string, unknown> | null }> = await qr.query(
+    `select id, output_summary from public.generation_item_runs
       where job_id = $1 and status = 'running' and lease_until < now()
       order by id
       for update skip locked`,
@@ -138,7 +170,19 @@ export async function sweepRunExpiredLeases(qr: QueryRunner, jobId: string): Pro
   );
   let n = 0;
   for (const it of expired) {
-    if (await applyItemFailure(qr, it.id, 'lease_expired', true)) n++;
+    const used = grantsOf(it.output_summary);
+    const free = used < LEASE_EXPIRY_FREE_GRANTS;
+    if (await applyItemFailure(qr, it.id, LEASE_EXPIRED_ERROR, true, null, false, free)) {
+      n++;
+      if (free) {
+        await qr.query(
+          `update public.generation_item_runs
+              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('leaseExpiryGrants', $2::int)
+            where id = $1`,
+          [it.id, used + 1],
+        );
+      }
+    }
   }
   return n;
 }

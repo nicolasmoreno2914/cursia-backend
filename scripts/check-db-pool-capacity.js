@@ -46,6 +46,8 @@ function stagingProcesses() {
     const entry = (cmd || '').split(/\s+/)[1];
     return { name: m[1], script: m[2], entry };
   });
+  // R16 (#1): los workers dinámicos se arrancan con node directo (ensure_pm2_drain_worker <nombre> <entry>).
+  for (const m of yml.matchAll(/^\s*ensure_pm2_drain_worker (\S+) (\S+)\s*$/gm)) procs.push({ name: m[1], script: null, entry: m[2] });
   const env = {};
   for (const m of yml.matchAll(/^\s*ensure_env_(?:exact|default_if_absent) (DB_POOL_\w+) (\S+)\s*$/gm)) env[m[1]] = m[2];
   return { procs, env };
