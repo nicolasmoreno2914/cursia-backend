@@ -163,50 +163,86 @@ export class CourseStructureService implements OnModuleInit {
   }
 
   async getStructure(courseId: number, ownerId: string) {
-    const course = await this.coursesService.findOne(courseId, ownerId);
     // V2.1 fix round 1 (I5): sin la migración R3 → 503 schema_not_migrated_v21 (nunca un 500 crudo).
     await assertV21StructureSchema(this.dataSource);
 
-    // V2.1 fix round 1 (review G2 M10): estructura, toggles V2.1 y counter en
-    // UN snapshot (REPEATABLE READ): un capítulo creado o un PATCH commiteado
-    // entre lecturas nunca devuelve toggles de otro estado que el counter.
-    // Los toggles V2.1 se leen por query propia (NO mapeados en las entidades
-    // Course/CourseChapter).
-    const qr = this.dataSource.createQueryRunner();
-    let modules: CourseModuleEntity[];
-    let settings: { finalExam: boolean; activityEngine: 'h5p' | 'scorm' };
-    let activityByChapter: Map<string, boolean>;
-    let counter: number;
-    try {
-      await qr.connect();
-      await qr.startTransaction('REPEATABLE READ');
-      const [crow] = await qr.query(`select structure_version_counter from public.courses where id = $1`, [courseId]);
-      if (!crow) throw new NotFoundException(`Course #${courseId} not found`);
-      counter = Number(crow.structure_version_counter);
-      modules = await qr.manager.find(CourseModuleEntity, {
-        where: { courseId },
-        relations: ['chapters'],
-        order: { position: 'ASC' },
-      });
-      settings = await this.readCourseSettings(courseId, qr);
-      activityByChapter = await this.readActivityEnabled(courseId, qr);
-      await qr.commitTransaction();
-    } catch (err) {
-      if (qr.isTransactionActive) await qr.rollbackTransaction();
-      throw err;
-    } finally {
-      await qr.release();
+    // Task 4 (rendimiento del editor): ownership + curso + toggles V2.1 + counter + Blueprint
+    // vigente + módulos/capítulos en UNA sola sentencia. Antes eran ~9 idas y vueltas a la base
+    // (findOne con join a course_versions, BEGIN REPEATABLE READ, counter, módulos, toggles,
+    // activity, COMMIT, currentInfo): medido en staging ≈ 2 s por GET. Una sentencia ve un único
+    // snapshot, así que se conserva la garantía de review G2 M10 (toggles y counter del mismo
+    // estado) sin transacción explícita. Mismo filtro de ownership que CoursesService.findOne.
+    const allowUnowned = process.env.ALLOW_UNOWNED_COURSES === 'true';
+    const rows = await this.dataSource.query(
+      `select c.id, c.title, c.structure_version, c.structure_version_counter,
+              c.final_exam_enabled, c.activity_engine,
+              b.id as bp_id, b.blueprint_number as bp_number, b.locked_at as bp_locked_at,
+              b.snapshot_sha256 as bp_sha256, b.schema_version as bp_schema_version,
+              coalesce((
+                select json_agg(json_build_object(
+                         'id', m.id, 'position', m.position, 'title', m.title, 'objective', m.objective,
+                         'description', m.description, 'examEnabled', m.exam_enabled,
+                         'chapters', coalesce((
+                           select json_agg(json_build_object(
+                                    'id', ch.id, 'position', ch.position, 'title', ch.title, 'objective', ch.objective,
+                                    'description', ch.description, 'videoEnabled', ch.video_enabled,
+                                    'activityEnabled', ch.activity_enabled) order by ch.position, ch.id)
+                             from public.course_chapters ch where ch.module_id = m.id), '[]'::json)
+                       ) order by m.position, m.id)
+                  from public.course_modules m where m.course_id = c.id), '[]'::json) as modules
+         from public.courses c
+         left join public.course_blueprints b on b.id = c.current_blueprint_id and b.course_id = c.id
+        where c.id = $1 and (c.owner_id = $2 or ($3 = true and c.owner_id is null))`,
+      [courseId, ownerId, allowUnowned],
+    );
+    const row = rows[0];
+    if (!row) throw new NotFoundException(`Course #${courseId} not found`);
+    const course = { id: Number(row.id), title: row.title as string, structureVersion: row.structure_version };
+    const counter = Number(row.structure_version_counter);
+    if (typeof row.final_exam_enabled !== 'boolean' || !isActivityEngine(row.activity_engine)) {
+      throw new Error(
+        `Curso #${courseId}: toggles de curso inválidos (final_exam_enabled=${JSON.stringify(row.final_exam_enabled)}, ` +
+          `activity_engine=${JSON.stringify(row.activity_engine)})`,
+      );
     }
-    modules.forEach((m) => m.chapters.sort((a, b) => a.position - b.position));
-    for (const m of modules) {
-      for (const c of m.chapters) {
-        if (!activityByChapter.has(c.id)) throw new Error(`Capítulo ${c.id}: activity_enabled ausente en el mismo snapshot (integridad rota)`);
-      }
-    }
+    const settings: { finalExam: boolean; activityEngine: 'h5p' | 'scorm' } = {
+      finalExam: row.final_exam_enabled,
+      activityEngine: row.activity_engine,
+    };
+    const rawModules: any[] = typeof row.modules === 'string' ? JSON.parse(row.modules) : row.modules || [];
+    const activityByChapter = new Map<string, boolean>();
+    const modules = rawModules.map((m) => ({
+      id: m.id as string,
+      position: Number(m.position),
+      title: m.title as string,
+      objective: m.objective ?? null,
+      description: m.description ?? null,
+      examEnabled: m.examEnabled as boolean,
+      chapters: (m.chapters || []).map((c: any) => {
+        if (typeof c.activityEnabled !== 'boolean') {
+          throw new Error(`Capítulo ${c.id}: activity_enabled ilegible (${JSON.stringify(c.activityEnabled)})`);
+        }
+        activityByChapter.set(c.id, c.activityEnabled);
+        return {
+          id: c.id as string,
+          position: Number(c.position),
+          title: c.title as string,
+          objective: c.objective ?? null,
+          description: c.description ?? null,
+          videoEnabled: c.videoEnabled as boolean,
+        };
+      }),
+    })) as unknown as CourseModuleEntity[];
 
-    // Task 4 / Ruling R1: currentInfo no verifica ownership ni "dynamic" —
-    // ya lo hizo coursesService.findOne arriba, así que se llama después.
-    const currentBlueprint = await this.blueprintsService.currentInfo(courseId);
+    const currentBlueprint = row.bp_id == null
+      ? null
+      : {
+          id: row.bp_id,
+          number: row.bp_number,
+          lockedAt: (row.bp_locked_at instanceof Date ? row.bp_locked_at : new Date(row.bp_locked_at)).toISOString(),
+          sha256: row.bp_sha256,
+          schemaVersion: Number(row.bp_schema_version),
+        };
     const liveMatchesCurrentBlueprint = this.computeLiveMatchesCurrentBlueprint(
       course,
       modules,
