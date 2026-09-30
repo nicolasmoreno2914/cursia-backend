@@ -127,9 +127,16 @@ export class GenerationManifestsService {
     const rulesVersion = this.configuredRulesVersion();
     const bp = await this.blueprintForRules(courseId, ownerId, blueprintNumber, rulesVersion);
     const source = sourceOf(bp);
-    // EV5-C: una fila NUEVA usa la config (solo v3); una existente se
-    // reconstruye más abajo con SU marcador guardado.
-    const activityTypeRules: ActivityTypeRulesVersion = rulesVersion === 3 ? this.configuredActivityTypeRules() : 0;
+    // EV5-C: reglas de tipo de actividad (solo v3). Ruling del dueño: los
+    // cursos existentes conservan el tipo por hash PARA SIEMPRE. Por eso el
+    // marcador se hereda del Manifest v3 más reciente del CURSO (cualquier
+    // versión de Blueprint, incluida la fila de este mismo Blueprint si ya
+    // existe); solo un curso sin ningún Manifest v3 previo lee la config
+    // DYNAMIC_ACTIVITY_TYPE_RULES. Así una versión nueva del Blueprint de un
+    // curso legacy nunca adopta las reglas por objetivo (ni regenera sus
+    // actividades por activity_type_changed). La fila existente de ESTE
+    // Blueprint se verifica igual más abajo con su marcador guardado.
+    const activityTypeRules: ActivityTypeRulesVersion = rulesVersion === 3 ? await this.activityTypeRulesForNewRow(courseId) : 0;
     const m = buildGenerationManifest(bp.snapshot, source, { rulesVersion, activityTypeRules });
 
     const errors = validateGenerationManifest(m, bp.snapshot, source);
@@ -270,6 +277,22 @@ export class GenerationManifestsService {
       });
     }
     return bp;
+  }
+
+  /**
+   * EV5-C: marcador para una fila v3 nueva = el del Manifest v3 más reciente
+   * del curso (`features.activityTypeRules ?? 0`); sin Manifest v3 previo →
+   * config (lanza si es inválida). Un curso con Manifests nunca lee la config.
+   */
+  private async activityTypeRulesForNewRow(courseId: number): Promise<ActivityTypeRulesVersion> {
+    const [prev] = await this.dataSource.query(
+      `select id, manifest_json from public.course_generation_manifests
+        where course_id = $1 and rules_version = 3
+        order by created_at desc, id desc
+        limit 1`,
+      [courseId],
+    );
+    return prev ? storedActivityTypeRules(prev) : this.configuredActivityTypeRules();
   }
 
   /** INSERT v3: columnas de conteo v2 + v3 (supabase-migration-v21-manifest-v3.sql); scorm_count = 0. */

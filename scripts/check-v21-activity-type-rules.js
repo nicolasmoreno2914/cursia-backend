@@ -12,7 +12,8 @@
 //   - validador: MISSING_H5P_TYPE / WRONG_H5P_TYPE / UNEXPECTED_H5P_TYPE / FEATURES_MISMATCH;
 //   - config DYNAMIC_ACTIVITY_TYPE_RULES (default 0, ruidosa ante basura);
 //   - GenerationManifestsService.getOrCreate con DataSource falso: fila legacy +
-//     flag 1 sin error de determinismo; fila nueva con flag 1; fila rules 1 + flag 0;
+//     flag 1 sin error de determinismo; Blueprint nuevo de un curso legacy hereda
+//     el hash (ruling); curso nuevo con flag 1; fila rules 1 + flag 0;
 //   - resolveActivityType + claim (activityTypeSource) + validación al completar;
 //   - invalidación v3: legacy → reglas 1 REGENERATE activity_type_changed solo
 //     donde cambia el tipo resuelto, REUSE donde no; huellas legacy intactas;
@@ -321,61 +322,104 @@ async function main() {
   });
 
   // ── 6. getOrCreate (DataSource falso, mismo contrato de filas que Postgres) ──
+  // Varias filas (cursos / versiones de Blueprint); el INSERT guarda lo que el
+  // servicio manda de verdad (canonical + sha de los parámetros).
   const OWNER = '11111111-1111-4111-8111-111111111111';
   const bpSnap = goldenObj;
-  const bpDto = { id: 77, courseId: COURSE_ID, blueprintNumber: 3, sha256: 'a'.repeat(64), schemaVersion: 2, snapshot: bpSnap };
-  const blueprints = { getByNumberAnySchema: async () => bpDto, getByNumber: async () => { throw new Error('no v1'); } };
-  const rowOf = (m, id = 900) => {
+  const bpSnap4 = (() => { const x = clone(goldenObj); x.modules[0].chapters[0].title = 'Capítulo reescrito en v4'; return x; })();
+  const BP = {
+    3: { id: 77, courseId: COURSE_ID, blueprintNumber: 3, sha256: 'a'.repeat(64), schemaVersion: 2, snapshot: bpSnap },
+    4: { id: 78, courseId: COURSE_ID, blueprintNumber: 4, sha256: 'b'.repeat(64), schemaVersion: 2, snapshot: bpSnap4 },
+  };
+  const blueprints = { getByNumberAnySchema: async (_c, _o, n) => BP[n], getByNumber: async () => { throw new Error('no v1'); } };
+  const srcFor = (n) => ({ courseId: COURSE_ID, blueprintId: BP[n].id, blueprintNumber: n, blueprintSha256: BP[n].sha256 });
+  const rowOf = (m, id = 900, courseId = COURSE_ID) => {
     const t = m.totals;
     return {
-      id, course_id: COURSE_ID, blueprint_id: 77, rules_version: 3, manifest_schema_version: 1,
-      manifest_json: shuffleKeys(JSON.parse(B.canonicalManifestJson(m))), manifest_sha256: B.manifestSha256(m), blueprint_sha256: 'a'.repeat(64),
+      id, course_id: courseId, blueprint_id: m.source.blueprintId, rules_version: 3, manifest_schema_version: 1,
+      manifest_json: shuffleKeys(JSON.parse(B.canonicalManifestJson(m))), manifest_sha256: B.manifestSha256(m), blueprint_sha256: m.source.blueprintSha256,
       module_count: t.moduleCount, chapter_count: t.chapterCount, content_count: t.contentCount, scorm_count: 0, video_count: t.videoCount,
       exam_count: t.examCount, total_jobs: t.totalJobs, course_plan_count: t.coursePlanCount, course_intro_count: t.courseIntroCount,
       module_intro_count: t.moduleIntroCount, experience_count: t.experienceCount, presentation_count: t.presentationCount,
       video_interactions_count: t.videoInteractionsCount, activity_count: t.activityCount, audiobook_chapter_count: t.audiobookChapterCount,
-      audio_welcome_count: t.audioWelcomeCount, final_exam_count: t.finalExamCount, created_at: new Date('2026-09-30T00:00:00Z'), created_by: OWNER,
+      audio_welcome_count: t.audioWelcomeCount, final_exam_count: t.finalExamCount, created_at: new Date(Date.UTC(2026, 8, 1) + id * 1000), created_by: OWNER,
     };
   };
-  function fakeDs(existing) {
-    const state = { row: existing || null, inserts: 0 };
+  function fakeDs(...existing) {
+    const state = { rows: existing.filter(Boolean), inserts: 0, nextId: 950 };
     return {
       state,
-      async query(sql) {
+      async query(sql, params) {
         if (/insert into public\.course_generation_manifests/.test(sql)) {
-          if (state.row) return [];
+          const [courseId, blueprintId] = params;
+          if (state.rows.some((r) => r.blueprint_id === blueprintId && r.rules_version === 3)) return [];
+          const m = JSON.parse(params[3]);
+          assert(B.manifestSha256(m) === params[4], 'sha del INSERT = sha del canonical');
           state.inserts++;
-          state.row = rowOf(state.pending, 901);
-          return [state.row];
+          const row = rowOf(m, state.nextId++, courseId);
+          state.rows.push(row);
+          return [row];
         }
-        if (/select \* from public\.course_generation_manifests/.test(sql)) return state.row ? [state.row] : [];
+        if (/select id, manifest_json from public\.course_generation_manifests/.test(sql)) {
+          assert(/rules_version = 3/.test(sql) && /order by created_at desc, id desc/.test(sql), 'consulta del Manifest previo');
+          return state.rows.filter((r) => r.course_id === params[0] && r.rules_version === 3)
+            .sort((a, b) => b.created_at - a.created_at || b.id - a.id).slice(0, 1);
+        }
+        if (/select \* from public\.course_generation_manifests/.test(sql)) {
+          return state.rows.filter((r) => r.blueprint_id === params[0] && r.course_id === params[1] && r.rules_version === params[2]);
+        }
         throw new Error(`query inesperada: ${sql.slice(0, 80)}`);
       },
     };
   }
   const gcEnv = { DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_V2_ALLOWED_OWNERS: undefined, DYNAMIC_MANIFEST_RULES_VERSION: '3' };
-  const legacy = B.buildGenerationManifest(bpSnap, { courseId: COURSE_ID, blueprintId: 77, blueprintNumber: 3, blueprintSha256: 'a'.repeat(64) }, { rulesVersion: 3 });
-  const withRules = B.buildGenerationManifest(bpSnap, { courseId: COURSE_ID, blueprintId: 77, blueprintNumber: 3, blueprintSha256: 'a'.repeat(64) }, { rulesVersion: 3, activityTypeRules: 1 });
+  const legacy = B.buildGenerationManifest(bpSnap, srcFor(3), { rulesVersion: 3 });
+  const withRules = B.buildGenerationManifest(bpSnap, srcFor(3), { rulesVersion: 3, activityTypeRules: 1 });
+  const noMarker = (m) => m.features.activityTypeRules === undefined && m.items.every((i) => i.h5pType === undefined);
 
   await check('getOrCreate: fila legacy (sin marcador) + DYNAMIC_ACTIVITY_TYPE_RULES=1 → devuelve la legacy, sin error de determinismo', async () => {
     await withEnv({ ...gcEnv, DYNAMIC_ACTIVITY_TYPE_RULES: '1' }, async () => {
       const ds = fakeDs(rowOf(legacy));
       const res = await new GenerationManifestsService(ds, blueprints).getOrCreate(COURSE_ID, OWNER, 3);
-      eq(res.created, false, 'created');
+      eq([res.created, ds.state.inserts], [false, 0], 'created');
       eq(res.manifest.sha256, B.manifestSha256(legacy), 'sha legacy');
-      assert(res.manifest.manifest.features.activityTypeRules === undefined, 'sin marcador');
-      assert(res.manifest.manifest.items.every((i) => i.h5pType === undefined), 'sin h5pType');
+      assert(noMarker(res.manifest.manifest), 'sin marcador ni h5pType');
     });
   });
-  await check('getOrCreate: fila NUEVA con flag 1 → marcador + h5pType guardados; flag 0 sobre esa fila → la conserva', async () => {
+  await check('getOrCreate (ruling: cursos existentes conservan el hash para siempre): curso con Manifest legacy + flag 1 + Blueprint NUEVO → Manifest nuevo SIN marcador ni h5pType', async () => {
     await withEnv({ ...gcEnv, DYNAMIC_ACTIVITY_TYPE_RULES: '1' }, async () => {
-      const ds = fakeDs(null);
-      ds.state.pending = withRules;
+      // Otro curso con reglas 1 en la misma tabla: no se hereda de otro curso.
+      const otherCourse = rowOf(B.buildGenerationManifest(bpSnap, { ...srcFor(3), courseId: 999, blueprintId: 55 }, { rulesVersion: 3, activityTypeRules: 1 }), 990, 999);
+      const ds = fakeDs(rowOf(legacy, 900), otherCourse);
+      const res = await new GenerationManifestsService(ds, blueprints).getOrCreate(COURSE_ID, OWNER, 4);
+      eq([res.created, ds.state.inserts, res.manifest.blueprintId], [true, 1, 78], 'insertó v4');
+      assert(noMarker(res.manifest.manifest), 'v4 hereda legacy (sin marcador ni h5pType)');
+      eq(res.manifest.sha256, B.manifestSha256(B.buildGenerationManifest(bpSnap4, srcFor(4), { rulesVersion: 3 })), 'sha = build legacy de v4');
+      // Idempotente: repetir el POST devuelve la misma fila (determinismo intacto).
+      const again = await new GenerationManifestsService(ds, blueprints).getOrCreate(COURSE_ID, OWNER, 4);
+      eq([again.created, again.manifest.sha256, ds.state.inserts], [false, res.manifest.sha256, 1], 'repetido');
+    });
+    // Un curso que ya tiene reglas 1 las conserva en su versión siguiente aunque la config vuelva a 0 o sea basura.
+    for (const flag of ['0', 'yes']) {
+      await withEnv({ ...gcEnv, DYNAMIC_ACTIVITY_TYPE_RULES: flag }, async () => {
+        const res = await new GenerationManifestsService(fakeDs(rowOf(withRules, 900)), blueprints).getOrCreate(COURSE_ID, OWNER, 4);
+        eq([res.created, res.manifest.manifest.features.activityTypeRules], [true, 1], `hereda reglas 1 con flag ${flag}`);
+      });
+    }
+  });
+  await check('getOrCreate: curso SIN Manifest v3 previo + flag 1 → fila nueva con marcador + h5pType; flag 0 sobre esa fila → la conserva', async () => {
+    await withEnv({ ...gcEnv, DYNAMIC_ACTIVITY_TYPE_RULES: '1' }, async () => {
+      const ds = fakeDs();
       const res = await new GenerationManifestsService(ds, blueprints).getOrCreate(COURSE_ID, OWNER, 3);
       eq([res.created, ds.state.inserts], [true, 1], 'insertó');
       eq(res.manifest.sha256, B.manifestSha256(withRules), 'sha reglas 1');
       eq(res.manifest.manifest.features.activityTypeRules, 1, 'marcador');
       assert(res.manifest.manifest.items.filter((i) => i.type === 'activity').every((i) => typeof i.h5pType === 'string'), 'h5pType');
+    });
+    await withEnv({ ...gcEnv, DYNAMIC_ACTIVITY_TYPE_RULES: '0' }, async () => {
+      const ds = fakeDs();
+      const res = await new GenerationManifestsService(ds, blueprints).getOrCreate(COURSE_ID, OWNER, 3);
+      assert(res.created && noMarker(res.manifest.manifest), 'curso nuevo con flag 0 → legacy');
     });
     for (const flag of ['0', undefined]) {
       await withEnv({ ...gcEnv, DYNAMIC_ACTIVITY_TYPE_RULES: flag }, async () => {
@@ -384,7 +428,7 @@ async function main() {
       });
     }
   });
-  await check('getOrCreate: una fila con marcador cuyo h5pType no es el recalculado → "no determinístico" (500); flag basura → error ruidoso', async () => {
+  await check('getOrCreate: una fila con marcador cuyo h5pType no es el recalculado → "no determinístico" (500); curso nuevo con flag basura → error ruidoso', async () => {
     const bad = clone(withRules);
     const it = bad.items.find((i) => i.type === 'activity');
     it.h5pType = it.h5pType === 'blanks' ? 'dragtext' : 'blanks';
@@ -392,7 +436,7 @@ async function main() {
       await rejectsRe(new GenerationManifestsService(fakeDs(rowOf(bad)), blueprints).getOrCreate(COURSE_ID, OWNER, 3), /no determinístico.*activityTypeRules 1/, 'tampered');
     });
     await withEnv({ ...gcEnv, DYNAMIC_ACTIVITY_TYPE_RULES: 'yes' }, async () => {
-      await rejectsRe(new GenerationManifestsService(fakeDs(null), blueprints).getOrCreate(COURSE_ID, OWNER, 3), /DYNAMIC_ACTIVITY_TYPE_RULES inválido/, 'basura');
+      await rejectsRe(new GenerationManifestsService(fakeDs(), blueprints).getOrCreate(COURSE_ID, OWNER, 3), /DYNAMIC_ACTIVITY_TYPE_RULES inválido/, 'basura');
     });
   });
 
