@@ -561,6 +561,15 @@ async function dbChecks() {
       const m = await structure.createModule(cid, OWNER, { title: 'Módulo 2', expectedCounter: await counter() });
       eq(m.module.chapters[0].activityEnabled, true, 'primer capítulo del módulo nuevo');
     });
+    await check('DB estructura (Task 4, GET en una sola sentencia): capítulos por position, otro owner → 404, curso inexistente → 404', async () => {
+      const s = await structure.getStructure(cid, OWNER);
+      const pos = s.modules[0].chapters.map((c) => c.position);
+      eq(pos, pos.slice().sort((a, b) => a - b), 'capítulos ordenados por position');
+      eq(s.modules.map((m) => m.position), s.modules.map((m) => m.position).slice().sort((a, b) => a - b), 'módulos ordenados');
+      eq(typeof s.structureVersionCounter, 'number', 'counter numérico');
+      await rejectsRe(structure.getStructure(cid, '00000000-0000-4000-8000-00000000beef'), /not found/, 'otro owner', 404);
+      await rejectsRe(structure.getStructure(987654321, OWNER), /not found/, 'curso inexistente', 404);
+    });
     await check('DB estructura: PATCH de settings (finalExam/activityEngine) con concurrencia optimista; vacío → 400; ajeno → 404', async () => {
       const c0 = await counter();
       const res = await structure.updateSettings(cid, OWNER, { finalExam: false, activityEngine: 'scorm', expectedCounter: c0 });

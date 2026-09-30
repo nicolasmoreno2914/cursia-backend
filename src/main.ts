@@ -26,6 +26,9 @@ async function bootstrap() {
     methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: false,
+    // Task 4 (rendimiento): cada request con Authorization lleva un preflight OPTIONS (~200 ms de
+    // ida y vuelta desde LatAm). Cachearlo 10 min en el navegador (Chrome topa en 2 h).
+    maxAge: 600,
   });
 
   // Global validation pipe
