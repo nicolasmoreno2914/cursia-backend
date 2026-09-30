@@ -107,7 +107,9 @@ export function scopedStyle(uid: string, theme: ResolvedTheme): string {
     `${S} .cvc-dg-ring{display:block;width:140px;height:140px;margin:0 auto 16px auto}`,
     `${S} .cvc-dg-hierarchy .cvc-dg-root{text-align:center;max-width:28rem;margin-left:auto!important;margin-right:auto!important;position:relative}`,
     // jerarquía angosta: árbol indentado (línea a la izquierda + rama por hijo)
-    `${S} .cvc-dg-kids{display:grid;gap:12px;position:relative;margin-left:12px!important;padding-left:18px!important;border-left:2px solid ${c.borderStrong}}`,
+    // (la línea del árbol es un ::before, no un border-left: el Visual System prohíbe franjas laterales > 1px)
+    `${S} .cvc-dg-kids{display:grid;gap:12px;position:relative;margin-left:12px!important;padding-left:18px!important}`,
+    `${S} .cvc-dg-kids::before{content:"";position:absolute;left:0;top:0;bottom:1.4em;width:2px;background-color:${c.borderStrong}}`,
     `${S} .cvc-dg-kids>li{margin:0!important;position:relative}`,
     `${S} .cvc-dg-kids>li::before{content:"";position:absolute;left:-20px;top:1.4em;width:18px;height:2px;background-color:${c.borderStrong}}`,
     `${S} .cvc-dg-matrix table{table-layout:fixed}`,
@@ -131,7 +133,8 @@ export function scopedStyle(uid: string, theme: ResolvedTheme): string {
       `${S} .cvc-dg-flow:not(.cvc-dg-long) .cvc-dg-step:not(:last-child)::after{content:"\\2192";left:auto;right:-26px;bottom:auto;top:50%;transform:translateY(-50%)}` +
       `${S} .cvc-dg-cycle{display:grid;grid-template-columns:180px minmax(0,1fr);column-gap:32px;align-items:center}` +
       `${S} .cvc-dg-ring{width:180px;height:180px;margin:0}` +
-      `${S} .cvc-dg-kids{grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:30px 12px;margin-left:0!important;padding-left:0!important;border-left:0;padding-top:14px!important;border-top:2px solid ${c.borderStrong}}` +
+      `${S} .cvc-dg-kids{grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:30px 12px;margin-left:0!important;padding-left:0!important;padding-top:14px!important;border-top:2px solid ${c.borderStrong}}` +
+      `${S} .cvc-dg-kids::before{display:none}` +
       `${S} .cvc-dg-kids>li::before{left:50%;top:-16px;width:2px;height:14px}` +
       `${S} .cvc-dg-hierarchy .cvc-dg-root::after{content:"";position:absolute;left:50%;bottom:-14px;width:2px;height:12px;background-color:${c.borderStrong}}` +
       `${S} .cvc-mr{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:40px;align-items:start}` +
