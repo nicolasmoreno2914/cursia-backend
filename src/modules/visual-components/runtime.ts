@@ -128,6 +128,7 @@ export function scopedStyle(uid: string, theme: ResolvedTheme): string {
     `@container (min-width:600px){` +
       `${S} .cvc-cols2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:40px}` +
       `${S} .cvc-cards{grid-template-columns:repeat(2,minmax(0,1fr))}` +
+      `${S} .cvc-obj-panel .cvc-cols2>li:nth-child(2){border-top:0!important}` +
       `${S} .cvc-step{grid-template-columns:3.5rem minmax(0,1fr)}` +
       `${S} .cvc-dg-flow:not(.cvc-dg-long) .cvc-dg-list{display:flex;align-items:stretch;gap:12px 36px}` +
       `${S} .cvc-dg-flow:not(.cvc-dg-long) .cvc-dg-step,${S} .cvc-dg-flow:not(.cvc-dg-long) .cvc-dg-step:not(:last-child){flex:1 1 0;min-width:0;margin:0!important}` +

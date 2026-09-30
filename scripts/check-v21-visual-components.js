@@ -108,7 +108,12 @@ check('Edu EV4: bloques como piezas de curso (tarjetas, panel de objetivos, insi
       // Objetivos: kicker distinto del título; en 2 columnas los ítems 0 y 1 sin filete superior.
       const four = vc.renderComponent({ type: 'learning_objectives', items: ['Uno claro', 'Dos claro', 'Tres claro', 'Cuatro claro'] }, theme, o);
       const lis = four.match(/<li class="cvc-obj"[^>]*>/g) || [];
-      assert(lis.length === 4 && !/border-top/.test(lis[0]) && !/border-top/.test(lis[1]) && /border-top/.test(lis[2]), `${combo.themeFamily}: filetes de la primera fila (${lis.map((l) => /border-top/.test(l)).join(',')})`);
+      // Inline (apilado, una columna): solo el primero sin filete; en 2 columnas el runtime quita el del 2.º.
+      assert(lis.length === 4 && !/border-top/.test(lis[0]) && /border-top/.test(lis[1]) && /border-top/.test(lis[2]), `${combo.themeFamily}: filetes (${lis.map((l) => /border-top/.test(l)).join(',')})`);
+      if (level) {
+        const lblObj = vc.renderMovement([{ type: 'learning_objectives', items: ['Uno claro', 'Dos claro', 'Tres claro', 'Cuatro claro'] }], theme, o);
+        assert(/@container \(min-width:600px\)\{[^]*\.cvc-obj-panel \.cvc-cols2>li:nth-child\(2\)\{border-top:0!important\}/.test(lblObj), 'en 2 columnas el 2.º objetivo pierde el filete solo en ≥600px');
+      }
       assert(four.includes('Objetivos de aprendizaje') && four.includes('Al terminar podrás') && four.includes('cvc-obj-panel'), 'kicker + título + panel');
       const dup = vc.extractText(vc.renderComponent({ type: 'learning_objectives', title: 'Objetivos de aprendizaje', items: ['Uno claro', 'Dos claro'] }, theme, o));
       assert(dup.split('Objetivos de aprendizaje').length === 2, `${combo.themeFamily}: kicker repite el título del LLM: ${dup.slice(0, 80)}`);

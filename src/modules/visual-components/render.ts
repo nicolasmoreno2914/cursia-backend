@@ -597,8 +597,8 @@ function renderLearningObjectives(r: R, c: VcLearningObjectives): string {
           `<div class="cvc-li-n"${st(r, [['margin', '0 0 4px 0'], ['color', readable(ps.bg, [r.t.color.accentStrong], ps.fg)], ['font-family', r.t.personality.fontNumeral], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700']], [['font-variant-numeric', 'tabular-nums']])}>${labelHtml(indexText(r, i))}</div>` +
             `<div class="cvc-li-t"${st(r, [['color', ps.fg]])}>${inlineHtml(it)}</div>`,
           ps,
-          // En 2 columnas (≥ 4 ítems) la primera fila visual son los ítems 0 y 1.
-          { tag: 'li', cls: 'cvc-obj', first: i < (items.length >= 4 ? 2 : 1) },
+          // Solo el primero sin filete (apilado = una columna); en 2 columnas el runtime quita el del 2.º.
+          { tag: 'li', cls: 'cvc-obj', first: i === 0 },
         ),
     )
     .join('');
