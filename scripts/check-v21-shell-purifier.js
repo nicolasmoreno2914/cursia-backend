@@ -61,7 +61,19 @@ const WWW = 'http://127.0.0.1:8099';
 function resolveTokens(html) {
   return html
     .replace(/@@PLUGINFILE@@/g, `${WWW}/pluginfile.php/4242/mod_label/intro`)
-    .replace(/\$@RESOURCEVIEWBYID\*(\d+)@\$/g, (_m, id) => `${WWW}/mod/resource/view.php?id=${id}`);
+    .replace(/\$@RESOURCEVIEWBYID\*(\d+)@\$/g, (_m, id) => `${WWW}/mod/resource/view.php?id=${id}`)
+    // Edu EV3: marcadores de los botones → la URL que Moodle deja tras restaurar.
+    .replace(/cursia-cta:\/\/next-activity/g, `${WWW}/mod/scorm/view.php?id=4243`)
+    .replace(/cursia-cta:\/\/next-exam/g, `${WWW}/mod/quiz/view.php?id=4244`)
+    .replace(/cursia-cta:\/\/section\/(\d+)/g, (_m, n) => `${WWW}/course/section.php?id=${4300 + Number(n)}`);
+}
+
+/** Edu EV3: cierre de cada módulo con botón al siguiente (o al cierre del curso). */
+function moduleNextLabels(facts, theme, o) {
+  return facts.modules.map((m, i) => {
+    const nx = facts.modules[i + 1];
+    return S.moduleNextLabel(m, nx ? { kind: 'module', module: nx, sectionNum: 2 + nx.number } : { kind: 'closing', sectionNum: 2 + facts.modules.length }, facts, theme, o);
+  });
 }
 
 function factsOf(course, hours) {
@@ -103,6 +115,7 @@ for (const combo of F.THEME_COMBOS) {
         if (m.examEnabled) labels.push(S.examInfoLabel(m, facts, theme, o));
       });
       if (facts.finalExam.enabled) labels.push(S.finalExamInfoLabel(facts, theme, o));
+      labels.push(...moduleNextLabels(facts, theme, o));
       for (const { slots } of S.assembleAllChapters(facts, F.experiencesFor(course.manifest), theme, o)) {
         for (const s of slots) if (s.kind === 'label') labels.push(s);
       }
@@ -169,6 +182,19 @@ check('100 % del texto sobrevive forceclean (extractText idéntico) en todos los
     }
   });
   assert(bad.length === 0, `${bad.length} casos:\n   ${bad.slice(0, 5).join('\n   ')}`);
+});
+
+check('Edu EV3: los botones de navegación siguen siendo enlaces tras forceclean (actividad, evaluación, sección)', () => {
+  const seen = { scorm: 0, quiz: 0, section: 0 };
+  cases.forEach((c, i) => {
+    const want = attrValues(c.html, 'a', 'href').filter((h) => /\/(mod\/(scorm|quiz)\/view|course\/section)\.php/.test(h));
+    const got = attrValues(purified[i], 'a', 'href');
+    for (const h of want) {
+      assert(got.includes(h), `${c.name}: el botón ${h} no sobrevivió a forceclean`);
+      seen[/scorm/.test(h) ? 'scorm' : /quiz/.test(h) ? 'quiz' : 'section']++;
+    }
+  });
+  assert(seen.scorm > 0 && seen.quiz > 0 && seen.section > 0, `faltan botones en los casos: ${JSON.stringify(seen)}`);
 });
 
 check('lintCleanSafe pasa sobre el HTML purificado en todos los labels', () => {
@@ -265,6 +291,7 @@ if (probe) {
         ls.push(S.moduleIntroLabel(m, F.moduleIntroFixture(course.manifest, i), facts, theme, o));
         if (m.examEnabled) ls.push(S.examInfoLabel(m, facts, theme, o));
       });
+      ls.push(...moduleNextLabels(facts, theme, o));
       for (const { slots } of S.assembleAllChapters(facts, F.experiencesFor(course.manifest), theme, o)) for (const s of slots) if (s.kind === 'label') ls.push(s);
       facts.chapters.forEach((ch) => ls.push({ name: `card ${ch.number}`, html: P.presentationCardHtml({ chapterNumber: ch.number, chapterTitle: ch.title, coverUrl: 'c.png', pdfUrl: 'p.pdf', slideCount: ch.slideCount, theme, moduleColor: te.moduleColor(theme, 0), level }) }));
       for (const l of ls) fcases.push({ name: `${F.themeLabel(combo)}/${level || 'clean'}/${l.name}`, html: resolveTokens(l.html) });

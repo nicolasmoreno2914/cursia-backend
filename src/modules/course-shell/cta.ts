@@ -1,6 +1,6 @@
 /**
  * Edu EV3 — navegación del estudiante: botones de llamada a la acción (V1 los tenía) que llevan
- * a la siguiente pieza del curso: «Iniciar actividad →», «Presentar evaluación →»,
+ * a la siguiente pieza del curso: «Iniciar actividad del capítulo N →», «Presentar evaluación del módulo N →»,
  * «Continuar con el módulo N →».
  *
  * El shell no conoce los ids de Moodle: escribe un marcador `cursia-cta://…` en el href y el

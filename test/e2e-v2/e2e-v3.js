@@ -735,6 +735,7 @@ function reservationBookkeeping(ev) {
             ids.push(`cv3:ch:${ch.chapterId}:${role}`);
           }
           if (mod.examEnabled) ids.push(`cv3:exam_info:${mod.moduleId}`, `cv3:exam:${mod.moduleId}`);
+          ids.push(`cv3:module_next:${mod.moduleId}`); // Edu EV3: cierre de sección con botón al siguiente módulo
           want.push([1 + mod.moduleNumber, ids]);
         }
         want.push([2 + M.modules.length, M.features.finalExam ? ['cv3:shell:closing', 'cv3:final_exam_info', 'cv3:final_exam'] : ['cv3:shell:closing']]);

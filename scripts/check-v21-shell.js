@@ -126,6 +126,11 @@ function shellLabels(facts, course, theme, level) {
     if (m.examEnabled) out.push(S.examInfoLabel(m, facts, theme, o));
   });
   if (facts.finalExam.enabled) out.push(S.finalExamInfoLabel(facts, theme, o));
+  // Edu EV3: cierre de cada módulo con botón al siguiente (o al cierre del curso).
+  facts.modules.forEach((m, i) => {
+    const nx = facts.modules[i + 1];
+    out.push(S.moduleNextLabel(m, nx ? { kind: 'module', module: nx, sectionNum: 2 + nx.number } : { kind: 'closing', sectionNum: 2 + facts.modules.length }, facts, theme, o));
+  });
   return out;
 }
 
@@ -342,6 +347,7 @@ async function pureChecks() {
           } else {
             const instr = vc.extractText(slots.find((s) => s.role === 'activity_instruction').html);
             assert(/actividad práctica que sigue es calificada/.test(instr) && instr.includes('70 de 100') && /todas las veces que quieras/.test(instr), `instrucción: ${instr}`);
+            assert(instr.includes(`Iniciar actividad del capítulo ${chapterNumber} →`) && slots.find((s) => s.role === 'activity_instruction').html.includes('href="cursia-cta://next-activity"'), `cap ${chapterNumber}: botón «Iniciar actividad»`);
           }
         }
       }
@@ -355,6 +361,15 @@ async function pureChecks() {
     const t2 = shellLabels(f2, c2, THEME).map((l) => vc.extractText(l.html)).join(' ');
     for (const w of ['Video interactivo', 'Actividad práctica', 'Evaluación del módulo', 'Evaluación final', 'Libro Guía', 'Audiolibro']) assert(t2.includes(w), `falta "${w}"`);
     assert(/En los capítulos que lo incluyen, un video/.test(t2) && /Al cierre de los módulos que la incluyen/.test(t2), 'metodología: alcance parcial');
+    // Edu EV3: botones de navegación con texto específico y marcador (el builder lo resuelve).
+    const all2 = shellLabels(f2, c2, THEME);
+    const nextHtml = all2.filter((l) => /siguiente paso/.test(l.name)).map((l) => l.html);
+    assert(nextHtml.length === f2.modules.length, `module_next: ${nextHtml.length} ≠ ${f2.modules.length}`);
+    assert(/Continuar con el módulo 2: /.test(vc.extractText(nextHtml[0])) && nextHtml[0].includes('href="cursia-cta://section/4"'), 'module_next 1 → sección del módulo 2');
+    assert(/Ir al cierre del curso/.test(vc.extractText(nextHtml[nextHtml.length - 1])) && nextHtml[nextHtml.length - 1].includes(`href="cursia-cta://section/${2 + f2.modules.length}"`), 'último module_next → cierre');
+    assert(/Cuando termines el módulo 1 /.test(vc.extractText(nextHtml[0])) && !/Terminaste/.test(nextHtml.join('')), 'copy «Cuando termines»');
+    assert(t2.includes('Presentar evaluación del módulo 1 →') && t2.includes('Presentar evaluación final →'), 'botón de evaluación específico');
+    assert(all2.filter((l) => /cursia-cta:\/\/next-exam/.test(l.html)).length === f2.modules.filter((m) => m.examEnabled).length + (f2.finalExam.enabled ? 1 : 0), 'un botón por evaluación');
     throwsRe(() => S.examInfoLabel(f2.modules[1], f2, THEME), /no tiene examen/, 'examen inexistente');
     throwsRe(() => S.finalExamInfoLabel(f4, THEME), /no tiene examen final/, 'final inexistente');
   });

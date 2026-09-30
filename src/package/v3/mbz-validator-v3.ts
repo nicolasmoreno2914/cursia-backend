@@ -379,14 +379,15 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     if (!lint.ok) add('CLEAN_SAFE', a.idnumber, lint.errors.slice(0, 3).map((e) => `${e.code} ${e.message}`).join('; '));
     const txt = extractText(a.intro);
     const allowed = allowedFor(a);
-    if (!allowed) add('STRUCTURE', a.idnumber, 'idnumber apunta a un capítulo/módulo que no está en facts');
+    const mn = /^cv3:module_next:(.+)$/.exec(a.idnumber);
+    if (!allowed || (mn && !moduleById.has(mn[1]))) add('STRUCTURE', a.idnumber, 'idnumber apunta a un capítulo/módulo que no está en facts');
     else {
       for (const hit of lintResourceMentions(`${a.name}. ${txt}`)) {
         const kind = resourceMentionKind(hit.match);
         if (!allowed[kind]) add('RESOURCE_DISABLED', a.idnumber, `menciona "${hit.match}" (${kind}) y ese recurso no existe aquí`);
       }
     }
-    const deterministic = /^cv3:(shell:|module_intro:|exam_info:|final_exam_info)/.test(a.idnumber) || /^cv3:ch:[^:]+:presentation$/.test(a.idnumber);
+    const deterministic = /^cv3:(shell:|module_intro:|exam_info:|module_next:|final_exam_info)/.test(a.idnumber) || /^cv3:ch:[^:]+:presentation$/.test(a.idnumber);
     if (deterministic) {
       const bad = lintShellNumbers(`${a.name} ${txt}`, facts);
       if (bad.length) add('NUMBER_NOT_FROM_FACTS', a.idnumber, `cifras fuera de facts: ${bad.join(', ')}`);

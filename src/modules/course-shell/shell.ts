@@ -377,7 +377,7 @@ export function examInfoLabel(
     module.examQuestionCount as number,
     'exam',
     facts,
-    'Presentar evaluación →',
+    `Presentar evaluación del módulo ${module.number} →`,
   );
 }
 
@@ -398,7 +398,7 @@ export function finalExamInfoLabel(facts: CourseFacts, theme: ResolvedTheme, opt
 }
 
 /**
- * Edu EV3 — cierre de la sección de un módulo: «Terminaste el módulo N» + botón a la sección del
+ * Edu EV3 — cierre de la sección de un módulo: «Cuando termines el módulo N…» + botón a la sección del
  * módulo siguiente (o al cierre del curso). Toda cifra sale de facts (número de módulo).
  */
 export function moduleNextLabel(
@@ -410,7 +410,7 @@ export function moduleNextLabel(
 ): ShellLabel {
   const h = hx(theme, opts);
   const s = bgSurf(h);
-  const done = `Terminaste el módulo ${module.number}: «${module.title}».`;
+  const done = `Cuando termines el módulo ${module.number} («${module.title}»), continúa por aquí.`;
   const text = next.kind === 'module' ? `Continuar con el módulo ${next.module.number}: ${next.module.title} →` : 'Ir al cierre del curso →';
   const inner = pHtml(h, labelHtml(done), s, { weight: 600 }) + ctaButton(h, ctaSection(next.sectionNum), text, s);
   return out(`Módulo ${module.number}: siguiente paso`, root(h, `shell-module-next-${module.number}`, inner), facts);
