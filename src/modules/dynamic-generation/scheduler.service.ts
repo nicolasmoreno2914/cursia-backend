@@ -787,7 +787,7 @@ export class SchedulerService {
     error: string,
     retryable: boolean,
     ownerId?: string,
-    opts?: { retryAfterSeconds?: number; refundAttempt?: boolean },
+    opts?: { retryAfterSeconds?: number; refundAttempt?: boolean; grantAttempt?: boolean },
   ): Promise<boolean> {
     return (await this.failItemDetailed(itemRunId, executorId, error, retryable, ownerId, opts)).ok;
   }
@@ -802,12 +802,14 @@ export class SchedulerService {
     error: string,
     retryable: boolean,
     ownerId?: string,
-    opts?: { retryAfterSeconds?: number; refundAttempt?: boolean },
+    opts?: { retryAfterSeconds?: number; refundAttempt?: boolean; grantAttempt?: boolean },
   ): Promise<ItemOpResult> {
     executorId = this.checkExecutorId(executorId);
     const msg = String(error ?? '').trim().slice(0, MAX_ERROR_LENGTH) || 'unknown_error';
     return this.guardedItemOp(itemRunId, executorId, ownerId, 'update', async (qr, job, item) => {
-      const t = await applyItemFailure(qr, item.id, msg, !!retryable, opts?.retryAfterSeconds ?? null, opts?.refundAttempt === true);
+      const t = await applyItemFailure(
+        qr, item.id, msg, !!retryable, opts?.retryAfterSeconds ?? null, opts?.refundAttempt === true, opts?.grantAttempt === true,
+      );
       if (!t) throw new GuardRejection('not_running');
       await recomputeRunStatus(qr, job.id);
     });
@@ -1085,7 +1087,8 @@ export class SchedulerService {
   /**
    * `running` con lease_until < now() → failItem(retryable) con
    * 'lease_expired' (el intento ya se contó en el claim; la idempotency_key
-   * no cambia). Con runId: ese run (esperando su lock). Sin runId: todos los
+   * no cambia; R16: hasta LEASE_EXPIRY_FREE_GRANTS leases vencidos por item
+   * se compensan con un intento extra, ver sweepRunExpiredLeases). Con runId: ese run (esperando su lock). Sin runId: todos los
    * runs con leases vencidos, una transacción por run, saltando runs cuyo
    * lock está tomado (los barre el próximo claim/lectura). Devuelve cuántos
    * items transicionó.
