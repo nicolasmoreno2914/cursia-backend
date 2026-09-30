@@ -192,6 +192,11 @@ async function pureChecks() {
     eq(AH.autoHealDecision(failedRow('lease_expired', {}, 25 * 3600), NOW, P).reason, 'too_old', '25 h');
     eq(AH.autoHealPolicyFromEnv({ DYNAMIC_AUTO_HEAL_MAX_AGE_HOURS: '48' }).maxAgeHours, 48, 'env');
     eq(AH.autoHealPolicyFromEnv({ DYNAMIC_AUTO_HEAL_MAX_AGE_HOURS: 'x' }).maxAgeHours, 24, 'basura → 24');
+    // Fix m3: ventana acotada a 1..168 h.
+    eq(AH.autoHealPolicyFromEnv({ DYNAMIC_AUTO_HEAL_MAX_AGE_HOURS: '100000000000' }).maxAgeHours, 168, 'enorme → 168');
+    eq(AH.autoHealPolicyFromEnv({ DYNAMIC_AUTO_HEAL_MAX_AGE_HOURS: '0.01' }).maxAgeHours, 1, 'mínimo 1');
+    eq(AH.autoHealPolicyFromEnv({ DYNAMIC_AUTO_HEAL_MAX_AGE_HOURS: '-5' }).maxAgeHours, 24, 'negativo → default');
+    eq(AH.AUTO_HEAL_SKIP_COOLDOWN_SECONDS, 1800, 'enfriamiento 30 min');
   });
 
   await check('puro: kill-switch — apagado sin el flag dinámico o con DYNAMIC_AUTO_HEAL_ENABLED=false; timer sin solapamiento y null si está apagado', async () => {
@@ -561,7 +566,34 @@ async function dbChecks() {
       eq(r.reopened.map((x) => x.itemKey), [intro[0].item_key, `content:${C.c2}`], 'elegibles reabiertos, el más nuevo primero');
       eq(r.skipped.map((x) => [x.itemKey, x.reason]), [[audio.item_key, 'budget_approval_required'], [presKey, 'budget_approval_required']], 'rechazados en orden (más nuevo primero)');
       eq(r.candidates, 4, 'los errores de contenido no cuentan (filtro SQL)');
+      // Fix m2: los rechazados quedan con enfriamiento durable → el próximo barrido no los vuelve a tomar.
+      for (const k of [audio.item_key, presKey]) {
+        const ah = (await itemRow(C.runId, k)).output_summary.autoHeal;
+        assert(ah && Math.abs(ah.skipUntilMs - (Date.now() + AH.AUTO_HEAL_SKIP_COOLDOWN_SECONDS * 1000)) < 60_000 && ah.lastSkipReason === 'budget_approval_required', `${k}: ${JSON.stringify(ah)}`);
+      }
+      const r2 = await runs.autoHealFailedItems({ now: new Date(), limit: 1 });
+      eq([r2.candidates, r2.skipped.length], [0, 0], 'en enfriamiento: ni candidatos ni locks');
+      const r3 = await runs.autoHealFailedItems({ now: new Date(Date.now() + (AH.AUTO_HEAL_SKIP_COOLDOWN_SECONDS + 60) * 1000), limit: 1 });
+      eq(r3.candidates, 2, 'pasado el enfriamiento vuelven a evaluarse');
       await reauthorize(estId);
+    });
+
+    await check('DB fix m1: cursor exacto al µs — dos elegibles en el MISMO milisegundo con limit 1 → se procesan ambos (ninguno se saltea)', async () => {
+      const others = await ds.query(`select id, item_key from public.generation_item_runs where job_id = $1 and type in ('final_exam', 'module_intro', 'experience', 'activity', 'video_interactions') order by item_key`, [C.runId]);
+      const [a, b] = others;
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'lease_expired', output_summary = '{}'::jsonb,
+                        finished_at = date_trunc('milliseconds', now() - interval '40 minutes') + interval '100 microseconds' where id = $1`, [a.id]);
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'lease_expired', output_summary = '{}'::jsonb,
+                        finished_at = date_trunc('milliseconds', now() - interval '40 minutes') + interval '700 microseconds' where id = $1`, [b.id]);
+      const r = await runs.autoHealFailedItems({ now: new Date(), limit: 1 });
+      eq(r.reopened.map((x) => x.itemKey), [b.item_key, a.item_key], 'ambos, el más nuevo (µs) primero');
+    });
+
+    await check('DB fix m3: autoHeal.rounds enorme en el jsonb (1e30) no rompe el barrido (cast acotado) y el item no se reabre', async () => {
+      const it = await itemRow(C.runId, presKey);
+      await failAt(it.id, 'gamma_timeout: x', 60, `jsonb_build_object('external', jsonb_build_object('gammaGenerationId', 'g'), 'autoHeal', jsonb_build_object('rounds', 1e30::numeric))`);
+      const r = await heal(0);
+      eq(r.reopened.map((x) => x.itemKey).includes(presKey), false, 'no reabre');
     });
 
     await check('DB fix I2: el filtro grueso SQL coincide con la política JS (allow/deny) en los códigos de la allow-list y de la deny-list', async () => {

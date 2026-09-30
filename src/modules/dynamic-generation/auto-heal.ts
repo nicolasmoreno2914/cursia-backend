@@ -38,6 +38,14 @@ export const DEFAULT_AUTO_HEAL_INTERVAL_MS = 60_000;
 export const AUTO_HEAL_MAX_AGE_ENV = 'DYNAMIC_AUTO_HEAL_MAX_AGE_HOURS';
 /** Ventana de recencia: un fallo más viejo que esto nunca se reabre solo (run abandonado). */
 export const DEFAULT_AUTO_HEAL_MAX_AGE_HOURS = 24;
+/** Fix m3: rango admitido de la ventana (1 h … 7 días). */
+export const AUTO_HEAL_MAX_AGE_HOURS_RANGE = Object.freeze({ min: 1, max: 168 });
+/**
+ * Fix m2: si retryItem rechaza un candidato (presupuesto, run reemplazado, otro
+ * run activo, owner fuera de la allow-list…) el item no vuelve a evaluarse hasta
+ * dentro de 30 min (autoHeal.skipUntilMs en output_summary, filtrado en SQL).
+ */
+export const AUTO_HEAL_SKIP_COOLDOWN_SECONDS = 1800;
 
 /**
  * Tipos que ejecutan los workers del servidor (espejo de WORKER_ONLY_TYPES del
@@ -224,7 +232,8 @@ export function autoHealEnabled(env: Record<string, string | undefined> = proces
 /** Política efectiva (ventana de recencia configurable por env). */
 export function autoHealPolicyFromEnv(env: Record<string, string | undefined> = process.env): AutoHealPolicy {
   const raw = Number(env[AUTO_HEAL_MAX_AGE_ENV]);
-  const maxAgeHours = Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_AUTO_HEAL_MAX_AGE_HOURS;
+  const { min, max } = AUTO_HEAL_MAX_AGE_HOURS_RANGE;
+  const maxAgeHours = Number.isFinite(raw) && raw > 0 ? Math.min(max, Math.max(min, raw)) : DEFAULT_AUTO_HEAL_MAX_AGE_HOURS;
   return { ...DEFAULT_AUTO_HEAL_POLICY, maxAgeHours };
 }
 
