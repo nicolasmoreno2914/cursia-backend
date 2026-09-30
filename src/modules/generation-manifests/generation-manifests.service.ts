@@ -54,13 +54,16 @@ function storedActivityTypeRules(row: any): ActivityTypeRulesVersion {
   return activityTypeRulesValue(stored?.features?.activityTypeRules, row?.id);
 }
 
-/** Valor crudo del marcador (jsonb → number | null; un driver que devuelva texto también sirve). */
+/**
+ * Valor crudo del marcador (jsonb → number | null). Solo acepta el número 0/1
+ * de JS o ausente (null/undefined → 0). Un string (p.ej. "1") o cualquier otra
+ * cosa es integridad rota → 500 explícito; nunca se interpreta con JSON.parse.
+ */
 function activityTypeRulesValue(raw: unknown, id: unknown): ActivityTypeRulesVersion {
-  const v = typeof raw === 'string' ? JSON.parse(raw) : raw;
-  if (v === undefined || v === null) return 0;
-  if (v === 1) return 1;
+  if (raw === undefined || raw === null) return 0;
+  if (raw === 0 || raw === 1) return raw;
   throw new InternalServerErrorException(
-    `Generation Manifest #${String(id)}: features.activityTypeRules guardado inválido (${JSON.stringify(v)})`,
+    `Generation Manifest #${String(id)}: features.activityTypeRules guardado inválido (${JSON.stringify(raw)})`,
   );
 }
 

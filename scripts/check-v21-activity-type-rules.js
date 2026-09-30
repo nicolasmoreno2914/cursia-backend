@@ -468,6 +468,24 @@ async function main() {
     });
   });
 
+  await check('getOrCreate: marcador heredado solo como número JS 0/1 (null → 0); un string "1" u otro valor → 500 explícito', async () => {
+    const dsWith = (val) => {
+      const base = fakeDs();
+      const q = base.query;
+      base.query = async (sql, params) => (/as activity_type_rules/.test(sql) ? [{ id: 7, activity_type_rules: val }] : q(sql, params));
+      return base;
+    };
+    await withEnv({ ...gcEnv, DYNAMIC_ACTIVITY_TYPE_RULES: '1' }, async () => {
+      for (const [val, want] of [[null, undefined], [0, undefined], [1, 1]]) {
+        const res = await new GenerationManifestsService(dsWith(val), blueprints).getOrCreate(COURSE_ID, OWNER, 3);
+        eq(res.manifest.manifest.features.activityTypeRules, want, `valor ${JSON.stringify(val)}`);
+      }
+      for (const val of ['1', '0', 2, true, {}, [1]]) {
+        await rejectsRe(new GenerationManifestsService(dsWith(val), blueprints).getOrCreate(COURSE_ID, OWNER, 3),
+          /Generation Manifest #7: features\.activityTypeRules guardado inválido/, `valor ${JSON.stringify(val)}`);
+      }
+    });
+  });
   await check('arranque: cada config inválida se loguea por separado (una no esconde a la otra)', async () => {
     const { Logger } = require(require.resolve('@nestjs/common', { paths: [distRoot] }));
     const orig = Logger.prototype.error;
