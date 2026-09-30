@@ -464,6 +464,25 @@ async function main() {
       const g = capsOf(await S.getStructure(cid, OWNER), m0.id)[0];
       eq([g.title, g.description], [r.out.title, r.out.description], 'persistido');
     });
+
+    await check('coherencia en vivo (liveSnapshot): UNA consulta y el mismo snapshot que las 4 consultas de antes; 404 dueño ajeno, 400 legacy', async () => {
+      const snap = loadDist('modules/course-blueprints/blueprint-snapshot.js');
+      const [course] = await ds.query(`select id, title from public.courses where id = $1`, [cid]);
+      const mods = await ds.query(`select id, position, title, objective, exam_enabled from public.course_modules where course_id = $1`, [cid]);
+      const chs = await ds.query(`select id, module_id, position, title, objective, video_enabled from public.course_chapters where course_id = $1`, [cid]);
+      const expected = snap.buildBlueprintSnapshot({ id: course.id, title: course.title }, mods, chs);
+      let n = 0;
+      const origQuery = ds.query.bind(ds);
+      ds.query = (...a) => { n++; return origQuery(...a); };
+      let got;
+      try { got = await blueprints.liveSnapshot(cid, OWNER); } finally { ds.query = origQuery; }
+      eq(n, 1, 'consultas');
+      eq(snap.snapshotSha256(got), snap.snapshotSha256(expected), 'sha del snapshot');
+      eq(got, expected, 'snapshot');
+      await rejectsWith(blueprints.liveSnapshot(cid, '99999999-2222-4333-8444-555555555555'), 404, /not found/, 'dueño ajeno');
+      const legacy = (await ds.query(`insert into public.courses (owner_id, title, structure_version) values ($1, 'L', 'legacy') returning id`, [OWNER]))[0].id;
+      await rejectsWith(blueprints.liveSnapshot(legacy, OWNER), 400, /solo admite cursos "dynamic"/, 'legacy');
+    });
   } finally {
     if (ds && ds.isInitialized) await ds.destroy().catch(() => {});
     for (const [k, envk] of [['flag', 'DYNAMIC_COURSE_STRUCTURE'], ['allow', 'DYNAMIC_V2_ALLOWED_OWNERS'], ['rules', 'DYNAMIC_MANIFEST_RULES_VERSION'], ['unowned', 'ALLOW_UNOWNED_COURSES']]) {
