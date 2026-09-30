@@ -5,6 +5,11 @@ import type {
   BlueprintSnapshotV1,
   BlueprintSnapshotV2,
 } from '../course-blueprints/blueprint-snapshot';
+import {
+  ActivityTypeRulesVersion,
+  GradedH5pActivityType,
+  chooseActivityTypesV1,
+} from './activity-type-rules';
 
 /**
  * rulesVersion por defecto (y el único que existía hasta 5B.2.B/Fase 6). La
@@ -122,12 +127,25 @@ export interface ManifestItem {
   dependsOn: string[];
   /** Solo en items `activity` de rulesVersion 3 ('h5p' | 'scorm'); ningún otro item lo tiene. */
   variant?: ActivityVariant;
+  /**
+   * EV5-C: tipo H5P congelado de un item `activity` variant 'h5p', SOLO en
+   * Manifests con `features.activityTypeRules = 1` (reglas por objetivo,
+   * activity-type-rules.ts). Ausente = rotación por hash (`activityTypeForChapter`).
+   */
+  h5pType?: GradedH5pActivityType;
 }
 
 /** Solo rulesVersion 3: flags de curso del Blueprint v2 que cambian el conjunto de items. */
 export interface ManifestFeatures {
   finalExam: boolean;
   activityEngine: ActivityEngine;
+  /**
+   * EV5-C: marcador de las reglas de tipo de actividad. Ausente = Manifest
+   * legacy (tipo h5p por hash del UUID); 1 = cada activity h5p lleva `h5pType`
+   * (chooseActivityTypesV1). El canonical lo escribe solo si está presente:
+   * los sha de los Manifests existentes no cambian.
+   */
+  activityTypeRules?: 1;
 }
 
 /**
@@ -219,13 +237,19 @@ export function moduleIntroKey(moduleId: string): string {
 export function buildGenerationManifest(
   snapshotIn: AnyBlueprintSnapshot,
   source: ManifestSource,
-  opts?: { rulesVersion?: ManifestRulesVersion },
+  opts?: { rulesVersion?: ManifestRulesVersion; activityTypeRules?: ActivityTypeRulesVersion },
 ): GenerationManifestV1 {
   const rulesVersion: ManifestRulesVersion = opts?.rulesVersion ?? 1;
   if (!SUPPORTED_RULES_VERSIONS.includes(rulesVersion)) {
     throw new Error(`buildGenerationManifest: rulesVersion no soportado: ${String(rulesVersion)}`);
   }
-  if (rulesVersion === 3) return buildGenerationManifestV3(snapshotIn as BlueprintSnapshotV2, source);
+  if (rulesVersion === 3) {
+    return buildGenerationManifestV3(snapshotIn as BlueprintSnapshotV2, source, { activityTypeRules: opts?.activityTypeRules ?? 0 });
+  }
+  if ((opts?.activityTypeRules ?? 0) !== 0) {
+    // Las reglas de tipo de actividad solo existen en rulesVersion 3 (items activity).
+    throw new Error(`buildGenerationManifest: activityTypeRules ${String(opts?.activityTypeRules)} requiere rulesVersion 3`);
+  }
   if ((snapshotIn as any)?.schemaVersion !== 1) {
     // v1/v2 nunca procesan un Blueprint v2: perderían en silencio activityEnabled/finalExam.
     throw new Error(
@@ -1052,8 +1076,16 @@ function assertV2Snapshot(snapshot: any, where: string): asserts snapshot is Blu
  * flags nuevos NO se coercionan: un Blueprint v2 mal formado (activityEnabled
  * no boolean, engine desconocido) tira en vez de apagar actividades en silencio.
  */
-export function buildGenerationManifestV3(snapshot: BlueprintSnapshotV2, source: ManifestSource): GenerationManifestV1 {
+export function buildGenerationManifestV3(
+  snapshot: BlueprintSnapshotV2,
+  source: ManifestSource,
+  opts?: { activityTypeRules?: ActivityTypeRulesVersion },
+): GenerationManifestV1 {
   assertV2Snapshot(snapshot, 'buildGenerationManifestV3');
+  const activityTypeRules = opts?.activityTypeRules ?? 0;
+  if (activityTypeRules !== 0 && activityTypeRules !== 1) {
+    throw new Error(`buildGenerationManifestV3: activityTypeRules inválido: ${JSON.stringify(activityTypeRules)} (0 | 1)`);
+  }
   const course = snapshot.course;
   if (typeof course?.finalExam !== 'boolean') {
     throw new Error(`BLUEPRINT_V2_INVALID_INPUT: course.finalExam debe ser boolean (fue ${JSON.stringify(course?.finalExam)})`);
@@ -1062,6 +1094,8 @@ export function buildGenerationManifestV3(snapshot: BlueprintSnapshotV2, source:
     throw new Error(`BLUEPRINT_V2_INVALID_INPUT: course.activityEngine inválido: ${JSON.stringify(course.activityEngine)}`);
   }
   const variant: ActivityVariant = course.activityEngine;
+  // EV5-C: con el marcador, el tipo h5p de cada actividad se decide y congela acá.
+  const chosenTypes = activityTypeRules === 1 ? chooseActivityTypesV1(snapshot) : null;
   const planKey = coursePlanKey(source.courseId);
   const introKey = courseIntroKey(source.courseId);
   const courseBase = { scope: 'course' as const, moduleId: null, chapterId: null, moduleNumber: null, chapterNumber: null };
@@ -1106,7 +1140,14 @@ export function buildGenerationManifestV3(snapshot: BlueprintSnapshotV2, source:
         });
       }
       if (c.activityEnabled) {
-        items.push({ key: `activity:${c.id}`, type: 'activity', ...base, dependsOn: [contentKey], variant });
+        const h5pType = variant === 'h5p' && chosenTypes ? chosenTypes.get(c.id)?.type : undefined;
+        if (chosenTypes && variant === 'h5p' && !h5pType) {
+          throw new Error(`buildGenerationManifestV3: sin tipo h5p para la actividad del capítulo ${c.id}`);
+        }
+        items.push({
+          key: `activity:${c.id}`, type: 'activity', ...base, dependsOn: [contentKey], variant,
+          ...(h5pType ? { h5pType } : {}),
+        });
       }
       items.push({ key: `audiobook_chapter:${c.id}`, type: 'audiobook_chapter', ...base, dependsOn: [contentKey] });
     }
@@ -1132,7 +1173,11 @@ export function buildGenerationManifestV3(snapshot: BlueprintSnapshotV2, source:
       blueprintNumber: source.blueprintNumber,
       blueprintSha256: source.blueprintSha256,
     },
-    features: { finalExam: course.finalExam, activityEngine: course.activityEngine },
+    features: {
+      finalExam: course.finalExam,
+      activityEngine: course.activityEngine,
+      ...(activityTypeRules === 1 ? { activityTypeRules: 1 as const } : {}),
+    },
     modules,
     items,
     totals: totalsV3From({
@@ -1197,7 +1242,12 @@ export function canonicalManifestJsonV3(m: GenerationManifestV1): string {
       blueprintNumber: m.source.blueprintNumber,
       blueprintSha256: m.source.blueprintSha256,
     },
-    features: { finalExam: m.features?.finalExam, activityEngine: m.features?.activityEngine },
+    // EV5-C: activityTypeRules / h5pType solo si están presentes (sha legacy intacto).
+    features: {
+      finalExam: m.features?.finalExam,
+      activityEngine: m.features?.activityEngine,
+      ...(m.features?.activityTypeRules !== undefined ? { activityTypeRules: m.features.activityTypeRules } : {}),
+    },
     modules: m.modules.map((mod) => ({
       moduleId: mod.moduleId,
       position: mod.position,
@@ -1221,6 +1271,7 @@ export function canonicalManifestJsonV3(m: GenerationManifestV1): string {
       chapterNumber: i.chapterNumber,
       dependsOn: [...i.dependsOn],
       ...(i.variant !== undefined ? { variant: i.variant } : {}),
+      ...(i.h5pType !== undefined ? { h5pType: i.h5pType } : {}),
     })),
     // Se copian TODAS las claves que traiga (en orden v3 primero, luego
     // cualquier extra como scormCount) para que el validador vea un totals
@@ -1259,6 +1310,11 @@ interface ExpectedItemV3 {
  *  - UNEXPECTED_VARIANT: un item que no es activity trae `variant`.
  *  - UNEXPECTED_ITEM: key de un tipo v3 válido que el snapshot no produce por otra razón.
  *  - MISSING_<TYPE>: p. ej. MISSING_EXPERIENCE, MISSING_AUDIOBOOK_CHAPTER, MISSING_FINAL_EXAM.
+ * EV5-C (tipo de actividad por objetivo):
+ *  - FEATURES_MISMATCH también si `features.activityTypeRules` no es ausente o 1.
+ *  - MISSING_H5P_TYPE: marcador 1 y una activity h5p sin `h5pType`.
+ *  - WRONG_H5P_TYPE: marcador 1 y `h5pType` ≠ el recalculado (chooseActivityTypesV1).
+ *  - UNEXPECTED_H5P_TYPE: `h5pType` sin marcador, o en un item que no es activity h5p.
  */
 export function validateGenerationManifestV3(
   m: GenerationManifestV1,
@@ -1297,6 +1353,15 @@ export function validateGenerationManifestV3(
       message: `features esperado ${JSON.stringify({ finalExam, activityEngine: engine })}, encontrado ${JSON.stringify(m.features ?? null)}`,
     });
   }
+  const rulesMarker = (m.features as any)?.activityTypeRules;
+  if (rulesMarker !== undefined && rulesMarker !== 1) {
+    errors.push({
+      code: 'FEATURES_MISMATCH',
+      message: `features.activityTypeRules debe estar ausente o ser 1, encontrado ${JSON.stringify(rulesMarker)}`,
+    });
+  }
+  // Recalculado desde el snapshot (módulo puro de reglas, no el builder).
+  const expectedH5pTypes = rulesMarker === 1 ? chooseActivityTypesV1(snapshot) : null;
 
   // --- Recalcular lo esperado desde el snapshot ---
   const planKey = `course_plan:${source.courseId}`;
@@ -1421,6 +1486,28 @@ export function validateGenerationManifestV3(
       }
     } else if (it.variant !== undefined) {
       errors.push({ code: 'UNEXPECTED_VARIANT', message: `item ${it.key}: solo los items activity llevan variant`, key: it.key });
+    }
+    const h5pType = (it as any).h5pType;
+    const isH5pActivity = it.type === 'activity' && it.variant === 'h5p';
+    if (expectedH5pTypes && isH5pActivity) {
+      const want = it.chapterId ? expectedH5pTypes.get(it.chapterId)?.type : undefined;
+      if (h5pType === undefined) {
+        errors.push({ code: 'MISSING_H5P_TYPE', message: `item ${it.key}: con activityTypeRules=1 la actividad h5p debe llevar h5pType (${JSON.stringify(want ?? null)})`, key: it.key });
+      } else if (h5pType !== want) {
+        errors.push({
+          code: 'WRONG_H5P_TYPE',
+          message: `item ${it.key}: h5pType esperado ${JSON.stringify(want ?? null)} (reglas por objetivo), encontrado ${JSON.stringify(h5pType)}`,
+          key: it.key,
+        });
+      }
+    } else if (h5pType !== undefined) {
+      errors.push({
+        code: 'UNEXPECTED_H5P_TYPE',
+        message: expectedH5pTypes
+          ? `item ${it.key}: solo las actividades h5p llevan h5pType`
+          : `item ${it.key}: h5pType sin features.activityTypeRules (Manifest legacy: el tipo sale del hash)`,
+        key: it.key,
+      });
     }
     for (const dep of Array.isArray(it.dependsOn) ? it.dependsOn : []) {
       if (!presentKeys.has(dep)) {

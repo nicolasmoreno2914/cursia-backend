@@ -1,4 +1,5 @@
 import type { ManifestRulesVersion } from './generation-manifest-builder';
+import type { ActivityTypeRulesVersion } from './activity-type-rules';
 
 /**
  * rulesVersion que crea `POST …/manifest` (y que leen los endpoints "del
@@ -54,4 +55,23 @@ export function blueprintSchemaVersionForRules(rules: ConfiguredRulesVersion): 1
  */
 export function readManifestRulesVersionConfig(env: NodeJS.ProcessEnv = process.env): ManifestRulesVersion {
   return readConfiguredRulesVersion(env);
+}
+
+/**
+ * EV5-C — reglas de tipo de actividad para Manifests v3 NUEVOS
+ * (`features.activityTypeRules`). Config `DYNAMIC_ACTIVITY_TYPE_RULES` ∈ {0, 1},
+ * default 0 (= rotación por hash, byte-idéntico a antes). Mismo criterio que
+ * DYNAMIC_MANIFEST_RULES_VERSION: cualquier otro valor ("true", " 1", "2")
+ * lanza, nunca se cae en silencio a 0. Un Manifest YA guardado conserva su
+ * marcador (GenerationManifestsService lo reconstruye con el guardado).
+ */
+export const ACTIVITY_TYPE_RULES_ENV = 'DYNAMIC_ACTIVITY_TYPE_RULES';
+
+export function readActivityTypeRulesConfig(env: NodeJS.ProcessEnv = process.env): ActivityTypeRulesVersion {
+  const raw = env[ACTIVITY_TYPE_RULES_ENV];
+  if (raw === undefined || raw === '' || raw === '0') return 0;
+  if (raw === '1') return 1;
+  throw new Error(
+    `${ACTIVITY_TYPE_RULES_ENV} inválido: ${JSON.stringify(raw)} (valores permitidos: "0" o "1"; ausente = 0)`,
+  );
 }
