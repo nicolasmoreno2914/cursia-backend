@@ -828,6 +828,22 @@ function reservationBookkeeping(ev) {
           if (/actividad práctica/.test(seg) !== ch.activityEnabled) routeBad.push(`${titleOf[ch.chapterId]}: actividad ${ch.activityEnabled}`);
         }
         eq(routeBad, [], `${label}: la ruta de aprendizaje lista por capítulo exactamente video/actividad según sus flags`);
+        // Edu EV3: los botones de navegación quedan como URLs reales de Moodle tras restaurar
+        // (tokens decodificados por el restore): actividad, evaluación y sección siguiente.
+        const hrefs = (idn) => Array.from(((L.labels || {})[idn] || '').matchAll(/href="([^"]+)"/g), (m) => m[1]);
+        const ctaBad = [];
+        for (const [idn, html] of Object.entries(L.labels || {})) if (/cursia-cta:|\$@[A-Z]/.test(html)) ctaBad.push(`${idn}: marcador o token sin resolver`);
+        for (const ch of chFlags) {
+          if (!ch.activityEnabled) continue;
+          const hs = hrefs(`cv3:ch:${ch.chapterId}:activity_instruction`);
+          if (!hs.some((h) => /\/mod\/(h5pactivity|scorm)\/view\.php\?id=\d+$/.test(h))) ctaBad.push(`${ch.chapterId.slice(0, 8)}: «Iniciar actividad» sin enlace a la actividad (${hs.join(' ')})`);
+        }
+        for (const m of M.modules) {
+          if (m.examEnabled && !hrefs(`cv3:exam_info:${m.moduleId}`).some((h) => /\/mod\/quiz\/view\.php\?id=\d+$/.test(h))) ctaBad.push(`${m.moduleId.slice(0, 8)}: «Presentar evaluación» sin enlace al cuestionario`);
+          if (!hrefs(`cv3:module_next:${m.moduleId}`).some((h) => /\/course\/section\.php\?id=\d+$/.test(h))) ctaBad.push(`${m.moduleId.slice(0, 8)}: «Continuar» sin enlace a la sección siguiente`);
+        }
+        if (M.features.finalExam && !hrefs('cv3:final_exam_info').some((h) => /\/mod\/quiz\/view\.php\?id=\d+$/.test(h))) ctaBad.push('evaluación final sin enlace');
+        eq(ctaBad, [], `${label}: botones de navegación (actividad, evaluación, sección siguiente) enlazan a URLs reales tras el restore`);
         // ── simulación de notas por la API de Moodle ──
         const plan = { pass: {}, fail: {}, mixed: {} };
         const gradedList = graded.map((c) => ({ idnumber: c.idnumber, modname: c.modname, kind: kindOf(c.idnumber) }));

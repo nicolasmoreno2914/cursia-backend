@@ -253,9 +253,12 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   }
 
   // ── secciones ──
+  const sectionIds = new Set<number>();
   for (const b of blocks(tag(contentsXml, 'sections') ?? '', 'section')) {
     const dir = tag(b, 'directory') ?? '';
     const sx = (await text(`${dir}/section.xml`)) ?? '';
+    const sid = /<section id="(\d+)"/.exec(sx)?.[1];
+    if (sid !== undefined) sectionIds.add(Number(sid));
     const secnum = num(tag(sx, 'number'));
     const seq = (tag(sx, 'sequence') ?? '').split(',').filter(Boolean).map(Number);
     const expected = acts.filter((a) => a.sectionid === secnum).map((a) => a.mid);
@@ -401,7 +404,13 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     }
   }
   for (const a of acts) {
+    if (`${a.intro}`.includes('cursia-cta://')) add('TOKEN_INVALID', a.idnumber, 'botón de navegación con marcador cursia-cta sin resolver');
     for (const m of `${a.intro}`.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?@\$/g)) {
+      // Edu EV3: botón «Continuar con el módulo…» → sección del paquete (id de section.xml).
+      if (m[1] === 'COURSESECTIONBYID') {
+        if (!m[2] || !sectionIds.has(Number(m[2]))) add('TOKEN_INVALID', a.idnumber, `token ${m[0]} no resuelve a una sección del paquete`);
+        continue;
+      }
       const kind = /^(.+)VIEWBYID$/.exec(m[1])?.[1]?.toLowerCase();
       const target = m[2] ? byMid.get(Number(m[2])) : undefined;
       if (!kind || !target || target.modname !== kind) add('TOKEN_INVALID', a.idnumber, `token ${m[0]} no resuelve a un ${kind ?? '?'} del paquete`);

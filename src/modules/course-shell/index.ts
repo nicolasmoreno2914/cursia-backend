@@ -17,4 +17,5 @@ export * from './v3-validation';
 export * from './shell';
 export * from './chapter-assembler';
 export * from './microcopy';
+export * from './cta';
 export { ShellRenderOptions, ShellLevel, injectIntoMovement, unprotectedText } from './html';

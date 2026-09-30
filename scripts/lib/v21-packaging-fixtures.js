@@ -161,6 +161,8 @@ function expectedSequence(distRoot, input) {
       }
     }
     if (mod.examEnabled) ids.push(`cv3:exam_info:${mod.moduleId}`, `cv3:exam:${mod.moduleId}`);
+    // Edu EV3: cada sección de módulo cierra con el botón al módulo siguiente (o al cierre del curso).
+    ids.push(`cv3:module_next:${mod.moduleId}`);
     seq.push([1 + mod.moduleNumber, ids]);
   }
   const closing = ['cv3:shell:closing'];
