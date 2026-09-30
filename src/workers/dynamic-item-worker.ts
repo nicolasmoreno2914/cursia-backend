@@ -4,7 +4,7 @@ import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DataSource } from 'typeorm';
 import { AppModule } from '../app.module';
-import { MissingSchemaBackoff, holdIdleIfDynamicDisabled } from './dynamic-worker-gate';
+import { holdIdleIfDynamicDisabled } from './dynamic-worker-gate';
 import { isRealVideoAllowedForOwner } from '../modules/features/dynamic-features';
 import { ClaimedItem, DEFAULT_LEASE_SECONDS, SchedulerService } from '../modules/dynamic-generation/scheduler.service';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
@@ -59,6 +59,15 @@ import {
   videogenChargeInput,
 } from './finops-worker-hooks';
 import { MOCK_VIDEO_DURATION_SEC, VideoDuration, parseMp4DurationSec, plausibleSeconds, resolveVideoDuration } from './video-duration';
+import {
+  DRAIN_HANDBACK_RETRY_SECONDS,
+  DrainSignal,
+  awaitDrain,
+  drainHandbackMessage,
+  drainTimeoutMs,
+  installDrainHandlers,
+  runClaimLoop,
+} from './worker-drain';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fase 5A Task 4 — dynamic-item-worker: ejecuta items type='video' de un run
@@ -174,6 +183,28 @@ export interface DynamicItemWorkerDeps {
    * reintentable SIN enviar (fail closed).
    */
   budget?: WorkerBudget | null;
+  /**
+   * R16 (#1): señal de drenado del proceso (SIGINT/SIGTERM). Con ella pedida,
+   * el item se DEVUELVE en un punto seguro (antes de un envío nuevo a
+   * Videogen, durante el poll de un job ya persistido, antes de subir a
+   * YouTube) en vez de seguir. Nunca se corta una llamada ya enviada.
+   */
+  drain?: DrainSignal | null;
+}
+
+/**
+ * R16 (#1): si el proceso está drenando, devuelve el item (retrying, intento
+ * concedido — no consume max_attempts) y responde true. Solo se llama en
+ * puntos SIN gasto en el aire.
+ */
+async function handBackIfDraining(deps: DynamicItemWorkerDeps, item: ClaimedItem, where: string): Promise<boolean> {
+  if (!deps.drain?.isDraining) return false;
+  const ok = await deps.scheduler.failItem(item.itemRunId, deps.executorId, drainHandbackMessage(where), true, undefined, {
+    retryAfterSeconds: DRAIN_HANDBACK_RETRY_SECONDS,
+    grantAttempt: true,
+  });
+  deps.logger.warn(`Item ${item.itemKey} (run ${item.runId}): drenado — devuelto ${where}${ok ? '' : ' (el item ya no era de este worker)'}`);
+  return true;
 }
 
 /**
@@ -454,6 +485,8 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
       await scheduler.failItem(item.itemRunId, deps.executorId, 'ambiguous_video_submission', false);
       return;
     } else {
+      // R16 (#1): drenando → no se empieza un envío pagado nuevo.
+      if (await handBackIfDraining(deps, item, 'antes de enviar el video a Videogen (sin gasto)')) return;
       mode = runHead.videoMode;
       // Toda precondición que pueda fallar SIN llamar a Videogen debe
       // resolverse ANTES de marcar externalSubmitStartedAt (fix round 1,
@@ -636,6 +669,8 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
     const startedAt = Date.now();
     while (true) {
       if (leaseLost) return;
+      // R16 (#1): el job ya está persistido → re-pollearlo desde otro worker es gratis.
+      if (await handBackIfDraining(deps, item, `mientras esperaba el render del job ${jobId} (se retoma sin reenviar)`)) return;
       if (Date.now() - startedAt > timeoutMs) {
         await scheduler.failItem(item.itemRunId, deps.executorId, 'video_timeout', true);
         return;
@@ -1045,6 +1080,8 @@ async function publishYoutubeAndComplete(
     let result: YoutubeUploadResult | null = null;
     for (let attempt = 1; attempt <= maxTries && !result; attempt++) {
       if (isLeaseLost()) return;
+      // R16 (#1): antes de (re)empezar una subida no hay marcador de subida vigente → devolver es seguro.
+      if (await handBackIfDraining(deps, item, 'antes de subir el video a YouTube (el render ya está pago y se conserva)')) return;
       const marked = await scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
         delivery: 'uploading_youtube',
         youtubeUploadAttempts: Number(summary.youtubeUploadAttempts ?? 0) + attempt,
@@ -1324,50 +1361,36 @@ async function bootstrap() {
   const pollMs = readPositiveInt('DYNAMIC_ITEM_WORKER_POLL_MS', 5000);
   const concurrency = readPositiveInt('DYNAMIC_ITEM_WORKER_CONCURRENCY', 1);
 
-  let shuttingDown = false;
+  // R16 (#1 + #15): drenado ordenado con SIGINT/SIGTERM (deja de reclamar, los items en vuelo terminan o se
+  // devuelven en un punto seguro, tope DYNAMIC_WORKER_DRAIN_TIMEOUT_MS) y un error de claim nunca tumba el proceso.
+  const drain = new DrainSignal();
+  deps.drain = drain;
   const activeItems = new Set<Promise<void>>();
-  const shutdown = async (signal: string) => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    logger.warn(`Recibido ${signal}; esperando ${activeItems.size} item(s) activo(s)`);
-    await Promise.allSettled(Array.from(activeItems));
-    await app.close();
-    logger.log('dynamic-item-worker detenido');
-    process.exit(0);
-  };
-  process.on('SIGINT', () => void shutdown('SIGINT'));
-  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  installDrainHandlers({ name: 'dynamic-item-worker', logger, drain, active: activeItems, close: () => app.close() });
 
   logger.log(
     `dynamic-item-worker iniciado (executorId=${deps.executorId}, pollMs=${pollMs}, ` +
       `leaseSeconds=${deps.leaseSeconds}, concurrency=${concurrency}, videoTimeoutMin=${deps.videoTimeoutMin}, ` +
-      `videoDeliveryConfig=${configuredDelivery})`,
+      `videoDeliveryConfig=${configuredDelivery}, drainTimeoutMs=${drainTimeoutMs()})`,
   );
 
-  // M5: esquema V2 ausente (42P01) → inactivo con backoff, sin crash-loop.
-  const schema = new MissingSchemaBackoff(logger, 'dynamic-item-worker');
-  while (!shuttingDown) {
-    let waitOverrideMs: number | null = null;
-    while (!shuttingDown && activeItems.size < concurrency) {
-      let item: ClaimedItem | null;
-      try {
-        item = await deps.scheduler.claimNextItem({ executorId: deps.executorId, types: ['video'], leaseSeconds: deps.leaseSeconds });
-      } catch (err) {
-        const wait = schema.onClaimError(err);
-        if (wait === null) throw err; // otros errores: igual que antes
-        waitOverrideMs = wait;
-        break;
-      }
-      schema.onClaimOk();
-      if (!item) break;
+  // M5: esquema V2 ausente (42P01) → inactivo con backoff, sin crash-loop (dentro de runClaimLoop).
+  await runClaimLoop<ClaimedItem>({
+    name: 'dynamic-item-worker',
+    logger,
+    concurrency,
+    pollMs,
+    drain,
+    active: activeItems,
+    claim: () => deps.scheduler.claimNextItem({ executorId: deps.executorId, types: ['video'], leaseSeconds: deps.leaseSeconds }),
+    process: (item) => {
       logger.log(`Item reclamado: ${item.itemKey} (run ${item.runId})`);
-      const promise = processItem(deps, item)
-        .catch((err) => logger.error(`Error no manejado en item ${item.itemKey}: ${err instanceof Error ? err.message : String(err)}`))
-        .finally(() => { activeItems.delete(promise); });
-      activeItems.add(promise);
-    }
-    await sleep(waitOverrideMs ?? (activeItems.size >= concurrency ? 500 : pollMs));
-  }
+      return processItem(deps, item);
+    },
+    describe: (item) => `item ${item.itemKey}`,
+  });
+  // El handler de la señal espera a los items en vuelo (con tope) y sale del proceso.
+  await awaitDrain(activeItems, drainTimeoutMs());
 }
 
 if (require.main === module) {

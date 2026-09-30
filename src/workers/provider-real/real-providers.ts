@@ -61,6 +61,7 @@ import {
 } from '../finops-worker-hooks';
 import { AnthropicClient, GammaClient, OpenAiTtsClient, ProviderCallError } from './provider-clients';
 import { CoverError, CoverRasterizer, GAMMA_COVER_RASTERIZER_UNAVAILABLE, pdftoppmRasterizer } from './pdf-cover';
+import { DRAIN_HANDBACK_RETRY_SECONDS, DrainSignal, drainHandbackMessage } from '../worker-drain';
 import {
   AUDIOBOOK_SCRIPT_MODEL_DEFAULT,
   AUDIOBOOK_SCRIPT_MODEL_ENV,
@@ -113,6 +114,8 @@ export interface RealProviderDeps {
   gammaTimeoutMs?: number;
   /** Estado de la llamada pagada en curso (lo crea processRealProviderItem por item). */
   tracker?: PaidCallTracker;
+  /** R16 (#1): señal de drenado del proceso (SIGINT/SIGTERM). */
+  drain?: DrainSignal | null;
 }
 
 /**
@@ -199,6 +202,23 @@ async function fail(
   }
   await deps.scheduler.failItem(item.itemRunId, deps.executorId, message.slice(0, 1900), retryable);
   throw new ProviderItemFailed(message, retryable);
+}
+
+/**
+ * R16 (#1): el proceso está drenando y NO hay gasto en el aire (nada enviado sin
+ * liquidar, ningún resultado pagado sin persistir) → el item se devuelve
+ * (retrying, intento concedido) y responde true. Con gasto en el aire nunca
+ * devuelve: el item sigue hasta persistir lo pagado.
+ */
+async function handBackIfDraining(deps: RealProviderDeps, item: ClaimedItem, where: string): Promise<boolean> {
+  if (!deps.drain?.isDraining) return false;
+  if (deps.tracker?.inFlight || deps.tracker?.unpersistedPaidOutput) return false;
+  const ok = await deps.scheduler.failItem(item.itemRunId, deps.executorId, drainHandbackMessage(where), true, undefined, {
+    retryAfterSeconds: DRAIN_HANDBACK_RETRY_SECONDS,
+    grantAttempt: true,
+  });
+  deps.logger.warn(`Item ${item.itemKey}: drenado — devuelto ${where}${ok ? '' : ' (el item ya no era de este worker)'}`);
+  return true;
 }
 
 /** Runtime guard antes de una llamada pagada NUEVA. false = item bloqueado (sin llamada). */
@@ -344,6 +364,8 @@ export async function processRealPresentation(deps: RealProviderDeps, item: Clai
     );
     return;
   } else {
+    // R16 (#1): drenando → no se empieza un envío pagado nuevo a Gamma.
+    if (await handBackIfDraining(deps, item, 'antes de enviar a Gamma (sin gasto)')) return;
     // Envío NUEVO: guard de presupuesto → configuración → marcador → envío.
     if (!(await guard(deps, item))) return;
     if (!apiKey) await fail(deps, item, notReady(item, ['GAMMA_API_KEY']), false);
@@ -423,6 +445,8 @@ export async function processRealPresentation(deps: RealProviderDeps, item: Clai
   const t0 = Date.now();
   let st = await pollOnce(deps, item, client, generationId!);
   while (st.status !== 'completed' && st.status !== 'failed') {
+    // R16 (#1): la generación ya está persistida → otro worker la re-pollea gratis.
+    if (await handBackIfDraining(deps, item, `mientras esperaba la generación ${generationId} de Gamma (se retoma sin reenviar)`)) return;
     if (Date.now() - t0 > timeoutMs) {
       // Reintentable: el próximo claim sigue polleando la MISMA generación.
       await fail(deps, item, `gamma_timeout: la generación ${generationId} no terminó en ${Math.round(timeoutMs / 1000)} s (se retoma sin reenviar)`, true);
@@ -602,6 +626,8 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
     script = recorded!.text as string;
     scriptMeta = { words: recorded!.words ?? null, messageIds: recorded!.messageIds ?? [], model: recorded!.model ?? null, reused: true };
   } else {
+    // R16 (#1): drenando → no se empieza la llamada pagada al LLM del guion.
+    if (await handBackIfDraining(deps, item, 'antes de pedir el guion del audiolibro (sin gasto)')) return;
     const markdown = markdownOf(await dependencyText(deps, item, ownerId, 'dynamic_content_md'));
     if (!(await guard(deps, item, 'anthropic'))) return;
     const model = trimmed(env, AUDIOBOOK_SCRIPT_MODEL_ENV) || AUDIOBOOK_SCRIPT_MODEL_DEFAULT;
@@ -688,6 +714,9 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
   const ttsTracker = deps.tracker;
   const paidTtsOps: string[] = [];
   for (let i = 0; i < chunks.length; i++) {
+    // R16 (#1): solo ANTES del primer chunk (guion ya persistido, nada pagado sin persistir). A mitad del audio
+    // se termina: devolverlo dejaría chunks pagados sin persistir (reconciliación).
+    if (i === 0 && (await handBackIfDraining(deps, item, 'antes de sintetizar el audio (sin gasto; el guion ya está guardado)'))) return;
     await heartbeat(deps, item);
     const chunkIdx = i;
     // Calibración #2: reserva DURABLE del chunk antes de llamar (si falla, no se llama a OpenAI).
