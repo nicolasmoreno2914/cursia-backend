@@ -124,6 +124,38 @@ async function main() {
       failures.push('Tras el move, el capítulo en la posición 1 de Módulo 2 debería ser Cap 2.');
     }
 
+    // R16: la respuesta del move trae lo que usa el editor para no pedir el GET.
+    if (!Array.isArray(moveResult.chapters) || typeof moveResult.liveMatchesCurrentBlueprint !== 'boolean') {
+      failures.push('moveChapter debería devolver chapters[] y liveMatchesCurrentBlueprint (R16).');
+    } else {
+      var expectedMoveRows = [mod1.id, mod2.id].sort().flatMap((mid) => finalStructure.modules.find((m) => m.id === mid).chapters
+        .slice().sort((a, b) => a.position - b.position).map((c) => ({ id: c.id, moduleId: mid, position: c.position })));
+      if (JSON.stringify(moveResult.chapters) !== JSON.stringify(expectedMoveRows)) {
+        failures.push('moveChapter: las filas de la respuesta no coinciden con el GET.');
+      }
+    }
+
+    // R16: reorder set-based — counter +1, filas = GET, y 409 con counter viejo sin escribir.
+    var reorderResult = await structureService.reorderModules(courseId, TEST_OWNER_ID, { order: [mod2.id, mod1.id], expectedCounter: counter });
+    if (reorderResult.structureVersionCounter !== counter + 1) failures.push(`reorderModules debería subir el counter a ${counter + 1}, devolvió ${reorderResult.structureVersionCounter}`);
+    counter = reorderResult.structureVersionCounter;
+    var afterReorder = await structureService.getStructure(courseId, TEST_OWNER_ID);
+    var reorderExpected = afterReorder.modules.slice().sort((a, b) => a.position - b.position).map((m) => ({ id: m.id, position: m.position }));
+    if (JSON.stringify(reorderResult.modules) !== JSON.stringify(reorderExpected) || reorderExpected[0].id !== mod2.id) {
+      failures.push('reorderModules: la respuesta/GET no reflejan el orden pedido.');
+    }
+    let reorderConflict = null;
+    try {
+      await structureService.reorderModules(courseId, TEST_OWNER_ID, { order: [mod1.id, mod2.id], expectedCounter: counter - 1 });
+    } catch (e) {
+      reorderConflict = e;
+    }
+    if (!reorderConflict || reorderConflict.status !== 409) failures.push('reorderModules con expectedCounter viejo debería tirar 409.');
+    var afterConflict = await structureService.getStructure(courseId, TEST_OWNER_ID);
+    if (afterConflict.structureVersionCounter !== counter || JSON.stringify(afterConflict.modules.map((m) => m.id)) !== JSON.stringify(afterReorder.modules.map((m) => m.id))) {
+      failures.push('reorderModules con 409 no debería escribir nada.');
+    }
+
     // Caso de rechazo: expectedCounter desactualizado debe tirar ConflictException
     let conflictThrown = false;
     try {

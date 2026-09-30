@@ -449,17 +449,34 @@ export class CourseBlueprintsService {
    * un capítulo sin módulo) → 400 con el detalle.
    */
   async liveSnapshot(courseId: number, ownerId: string): Promise<BlueprintSnapshotV1> {
-    await this.loadReadableCourse(courseId, ownerId);
-    const [course] = await this.dataSource.query(`select id, title from public.courses where id = $1`, [courseId]);
-    const modules: RawModuleRow[] = await this.dataSource.query(
-      `select id, position, title, objective, exam_enabled from public.course_modules where course_id = $1`,
-      [courseId],
+    // R16 (rendimiento): ownership + `dynamic` + curso + módulos + capítulos en UNA
+    // sentencia (antes 4 idas y vueltas, llamadas en cada render del editor por el
+    // chequeo de coherencia). Mismas columnas y tipos que las filas de antes.
+    const [row] = await this.dataSource.query(
+      `select c.id, c.title, c.structure_version,
+              coalesce((select json_agg(json_build_object('id', m.id, 'position', m.position, 'title', m.title,
+                                                          'objective', m.objective, 'exam_enabled', m.exam_enabled))
+                          from public.course_modules m where m.course_id = c.id), '[]'::json) as modules,
+              coalesce((select json_agg(json_build_object('id', ch.id, 'module_id', ch.module_id, 'position', ch.position,
+                                                          'title', ch.title, 'objective', ch.objective, 'video_enabled', ch.video_enabled))
+                          from public.course_chapters ch where ch.course_id = c.id), '[]'::json) as chapters
+         from public.courses c
+        where c.id = $1 and ${OWNERSHIP_FILTER}`,
+      [courseId, ownerId, allowUnownedCourses()],
     );
-    const chapters: RawChapterRow[] = await this.dataSource.query(
-      `select id, module_id, position, title, objective, video_enabled from public.course_chapters where course_id = $1`,
-      [courseId],
-    );
-    const courseRef = { id: course.id, title: course.title };
+    if (!row) throw new NotFoundException(`Course #${courseId} not found`);
+    if (row.structure_version !== 'dynamic') {
+      throw new BadRequestException(
+        `El curso #${courseId} es "${row.structure_version}" — esta API solo admite cursos "dynamic".`,
+      );
+    }
+    const asRows = (v: unknown): any[] => {
+      const parsed = typeof v === 'string' ? JSON.parse(v) : v;
+      return Array.isArray(parsed) ? parsed : [];
+    };
+    const modules: RawModuleRow[] = asRows(row.modules);
+    const chapters: RawChapterRow[] = asRows(row.chapters);
+    const courseRef = { id: row.id, title: row.title };
     const errors = validateBlueprintInput(courseRef, modules, chapters);
     if (errors.length > 0) {
       throw new BadRequestException({
