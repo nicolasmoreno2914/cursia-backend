@@ -210,6 +210,14 @@ export interface DynamicItemWorkerDeps {
 export const VIDEO_DURATION_UNMEASURED = 'video_duration_unmeasured';
 
 /**
+ * R16 fix M2: el MP4 se descargó y NO trae una duración legible (sin `mvhd`, o
+ * fuera del rango plausible). Es determinístico — reintentar solo quemaría
+ * intentos —, así que falla NO reintentable con este código para un admin
+ * (regenerar el video es una decisión con costo). Nunca hay llamada pagada.
+ */
+export const VIDEO_DURATION_UNMEASURABLE = 'video_duration_unmeasurable';
+
+/**
  * R16 (#16): tope de reloj (desde el primer poll del job) durante el cual un
  * `video_timeout` NO consume intentos: re-pollear un job de Videogen ya
  * persistido es gratis. Pasado el tope vuelve a consumir (y el auto-healer
@@ -228,6 +236,34 @@ async function defaultFetchMp4(url: string): Promise<Uint8Array> {
   const res = await fetch(url, { signal: AbortSignal.timeout(MP4_REMEASURE_TIMEOUT_MS) });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return new Uint8Array(await res.arrayBuffer());
+}
+
+type Remeasure =
+  | { kind: 'measured'; duration: VideoDuration }
+  | { kind: 'unreadable'; duration: VideoDuration }
+  | { kind: 'unavailable'; detail: string };
+
+/** R16 (#7, fix M2): re-medición GRATIS (descarga del MP4 ya renderizado, nunca una llamada pagada). */
+async function remeasureFromMp4(deps: DynamicItemWorkerDeps, url: string | null | undefined): Promise<Remeasure> {
+  if (!url) return { kind: 'unavailable', detail: 'sin URL de descarga del MP4 para medirlo' };
+  let bytes: Uint8Array;
+  try {
+    bytes = await (deps.fetchMp4 ?? defaultFetchMp4)(url);
+  } catch (err) {
+    return { kind: 'unavailable', detail: `no se pudo descargar el MP4 para medirlo (${errMsg(err).slice(0, 200)})` };
+  }
+  const sec = parseMp4DurationSec(bytes);
+  return sec === null
+    ? { kind: 'unreadable', duration: { durationSec: null, durationSource: 'unknown' } }
+    : { kind: 'measured', duration: { durationSec: sec, durationSource: 'mp4_mvhd' } };
+}
+
+function durationUnmeasurableMessage(item: ClaimedItem): string {
+  return (
+    `${VIDEO_DURATION_UNMEASURABLE}: el MP4 del video ${item.itemKey} no trae una duración legible (caja mvhd ausente o fuera de rango) ` +
+    'y Videogen no la informó. No se completa (el video interactivo necesita la duración) y no se reintenta solo: ' +
+    'revisar el render y, si corresponde, regenerar el video.'
+  );
 }
 
 function durationUnmeasuredMessage(item: ClaimedItem, detail: string): string {
@@ -844,9 +880,19 @@ async function completeVideoItem(
   duration: VideoDuration,
 ): Promise<void> {
   if (videoRequiresMeasuredDuration(item) && duration.durationSec === null) {
-    // El re-claim re-pollea el MISMO job (gratis) y vuelve a leer la duración.
-    await deps.scheduler.failItem(item.itemRunId, deps.executorId, durationUnmeasuredMessage(item, `Videogen no informó la duración del job ${jobId}`), true);
-    return;
+    // R16 fix M2: como en la entrega YouTube, se mide gratis el MP4 ya renderizado (status.download_url).
+    const m = await remeasureFromMp4(deps, status.download_url);
+    if (m.kind === 'unreadable') {
+      await deps.scheduler.failItem(item.itemRunId, deps.executorId, durationUnmeasurableMessage(item), false);
+      return;
+    }
+    if (m.kind === 'unavailable') {
+      // Transitorio (descarga): el re-claim re-pollea el MISMO job (gratis) y vuelve a medir.
+      await deps.scheduler.failItem(item.itemRunId, deps.executorId, durationUnmeasuredMessage(item, m.detail), true);
+      return;
+    }
+    duration = m.duration;
+    deps.logger.log(`Item ${item.itemKey}: duración medida desde el MP4 de Videogen (${duration.durationSec} s)`);
   }
   const payload = {
     videogenJobId: jobId,
@@ -1280,26 +1326,27 @@ async function publishYoutubeAndComplete(
   if (videoRequiresMeasuredDuration(item) && duration.durationSec === null) {
     // R16 (#7): nunca se completa un video v3 sin duración. Si el MP4 todavía no se midió en ningún
     // intento (p.ej. subido por un camino sin bytes), se re-descarga (gratis) y se mide su `mvhd`.
-    let detail = 'ni el mvhd del MP4 ni Videogen la informaron';
-    if (!measuredMp4 && !summary.mp4Duration && downloadUrl) {
-      try {
-        const bytes = await (deps.fetchMp4 ?? defaultFetchMp4)(downloadUrl);
-        const sec = parseMp4DurationSec(bytes);
-        const remeasured: VideoDuration = sec === null ? { durationSec: null, durationSource: 'unknown' } : { durationSec: sec, durationSource: 'mp4_mvhd' };
-        if (!(await scheduler.recordItemExternal(item.itemRunId, deps.executorId, { mp4Duration: remeasured }))) {
-          logger.warn(`Item ${item.itemKey}: lease perdida al registrar la duración re-medida`);
-          return;
-        }
-        duration = finalVideoDuration(remeasured, external);
-        if (sec === null) detail = 'el MP4 re-descargado no trae una caja mvhd legible';
-      } catch (err) {
-        detail = `no se pudo re-descargar el MP4 para medirlo (${errMsg(err).slice(0, 200)})`;
+    // Fix M2: un MP4 YA medido como ilegible es determinístico → no reintentable (admin), sin quemar intentos.
+    const prior = (measuredMp4 ?? summary.mp4Duration ?? null) as VideoDuration | null;
+    let m: Remeasure;
+    if (prior) {
+      m = { kind: 'unreadable', duration: { durationSec: null, durationSource: 'unknown' } };
+    } else {
+      m = await remeasureFromMp4(deps, downloadUrl);
+      if (m.kind !== 'unavailable' && !(await scheduler.recordItemExternal(item.itemRunId, deps.executorId, { mp4Duration: m.duration }))) {
+        logger.warn(`Item ${item.itemKey}: lease perdida al registrar la duración re-medida`);
+        return;
       }
     }
-    if (duration.durationSec === null) {
-      await scheduler.failItem(item.itemRunId, deps.executorId, durationUnmeasuredMessage(item, detail), true);
+    if (m.kind === 'unreadable') {
+      await scheduler.failItem(item.itemRunId, deps.executorId, durationUnmeasurableMessage(item), false);
       return;
     }
+    if (m.kind === 'unavailable') {
+      await scheduler.failItem(item.itemRunId, deps.executorId, durationUnmeasuredMessage(item, m.detail), true);
+      return;
+    }
+    duration = finalVideoDuration(m.duration, external);
     logger.log(`Item ${item.itemKey}: duración re-medida desde el MP4 (${duration.durationSec} s)`);
   }
   const payload = {

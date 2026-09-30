@@ -310,14 +310,14 @@ function ytPublisher(mp4, st) {
     external: { videogenBatchId: 'b', videogenJobId: 'vg-1', mode: 'real', durationSec: null, durationSource: 'unknown' }, ...extra,
   });
 
-  await check('#7 v3 + YouTube: MP4 sin mvhd y Videogen sin duración → video_duration_unmeasured (reintentable), NO completa ni sube el artifact', async () => {
+  await check('#7 v3 + YouTube: MP4 sin mvhd y Videogen sin duración → video_duration_unmeasurable (NO reintentable, fix M2: determinístico), NO completa ni sube el artifact', async () => {
     const s = fakeScheduler({ external: { videogenBatchId: 'b', videogenJobId: 'vg-1', mode: 'real' } });
     const st = {};
     const deps = videoDeps(s, YT_RUN, { youtube: ytPublisher(Buffer.from('no-es-un-mp4'), st) });
     await IW.processItem(deps, videoItem({ rulesVersion: 3, outputSummary: s.st.summary }));
     eq([s.st.completed.length, (s.st.uploaded || []).length, st.uploads], [0, 0, 1], 'no completó (el video sí se subió una vez)');
     const f = s.st.failed[0];
-    assert(f && f.retryable === true && f.msg.startsWith(`${IW.VIDEO_DURATION_UNMEASURED}:`), JSON.stringify(s.st.failed));
+    assert(f && f.retryable === false && f.msg.startsWith(`${IW.VIDEO_DURATION_UNMEASURABLE}:`), JSON.stringify(s.st.failed));
     eq(s.st.summary.external.youtubeVideoId, 'AbCdEfGhIjK', 'el id quedó persistido (el reintento no re-sube)');
   });
 
@@ -333,24 +333,39 @@ function ytPublisher(mp4, st) {
     eq(s.st.summary.mp4Duration, { durationSec: 300, durationSource: 'mp4_mvhd' }, 'medición persistida');
   });
 
-  await check('#7 reintento con el MP4 ya medido como ilegible → no re-descarga; falla reintentable otra vez (sin completar)', async () => {
+  await check('#7 reintento con el MP4 ya medido como ilegible → no re-descarga; falla NO reintentable (video_duration_unmeasurable, sin completar)', async () => {
     const s = fakeScheduler(ytResume({ mp4Duration: { durationSec: null, durationSource: 'unknown' }, external: { videogenBatchId: 'b', videogenJobId: 'vg-1', mode: 'real', durationSec: null, durationSource: 'unknown', youtubeVideoId: 'AbCdEfGhIjK', youtubeUrl: 'https://www.youtube.com/watch?v=AbCdEfGhIjK' } }));
     let fetched = 0;
     await IW.processItem(videoDeps(s, YT_RUN, { youtube: ytPublisher(null, {}), fetchMp4: async () => { fetched++; return Buffer.alloc(0); } }), videoItem({ rulesVersion: 3, outputSummary: s.st.summary }));
-    eq([fetched, s.st.completed.length, s.st.failed[0] && s.st.failed[0].retryable], [0, 0, true], 'sin completar');
+    eq([fetched, s.st.completed.length, s.st.failed[0] && s.st.failed[0].retryable, s.st.failed[0] && s.st.failed[0].msg.startsWith(IW.VIDEO_DURATION_UNMEASURABLE)], [0, 0, false, true], 'sin completar');
   });
 
-  await check('#7 v3 videogen_direct sin duración → no completa (reintentable); v2 (sin video interactivo) mantiene el comportamiento: completa con null', async () => {
-    const prev = process.env.VIDEOGEN_API_KEY;
+  await check('#7 YouTube sin medición previa y la re-descarga del MP4 falla (red) → video_duration_unmeasured REINTENTABLE (transitorio)', async () => {
+    const s = fakeScheduler(ytResume({ external: { videogenBatchId: 'b', videogenJobId: 'vg-1', mode: 'real', durationSec: null, durationSource: 'unknown', youtubeVideoId: 'AbCdEfGhIjK', youtubeUrl: 'https://www.youtube.com/watch?v=AbCdEfGhIjK' } }));
+    await IW.processItem(videoDeps(s, YT_RUN, { youtube: ytPublisher(null, {}), fetchMp4: async () => { throw new Error('ECONNRESET'); } }), videoItem({ rulesVersion: 3, outputSummary: s.st.summary }));
+    const f = s.st.failed[0];
+    eq([s.st.completed.length, f && f.retryable, f && f.msg.startsWith(`${IW.VIDEO_DURATION_UNMEASURED}:`)], [0, true, true], JSON.stringify(s.st.failed));
+  });
+
+  await check('#7 fix M2: v3 videogen_direct sin duración → se mide GRATIS el MP4 de status.download_url: mvhd → completa; ilegible → no reintentable; red → reintentable; v2 sin cambios', async () => {
     const ext = { external: { videogenBatchId: 'b', videogenJobId: 'vg-1', mode: 'real' } };
-    const s3 = fakeScheduler(ext);
-    await IW.processItem(videoDeps(s3, DIRECT_REAL_RUN), videoItem({ rulesVersion: 3, outputSummary: s3.st.summary }));
-    eq([s3.st.completed.length, s3.st.failed[0] && s3.st.failed[0].msg.startsWith(IW.VIDEO_DURATION_UNMEASURED), s3.st.failed[0] && s3.st.failed[0].retryable], [0, true, true], 'v3');
-    const s2 = fakeScheduler(ext);
-    await IW.processItem(videoDeps(s2, DIRECT_REAL_RUN), videoItem({ rulesVersion: 2, outputSummary: s2.st.summary }));
-    eq([s2.st.completed.length, s2.st.failed.length], [1, 0], 'v2 completa');
-    eq(s2.st.completed[0].summary.external, { durationSec: null, durationSource: 'unknown' }, 'v2: null + unknown como antes');
-    if (prev === undefined) delete process.env.VIDEOGEN_API_KEY; else process.env.VIDEOGEN_API_KEY = prev;
+    const run = async (fetchMp4, rulesVersion = 3) => {
+      const s = fakeScheduler(ext);
+      const fetched = [];
+      await IW.processItem(videoDeps(s, DIRECT_REAL_RUN, { fetchMp4: async (u) => { fetched.push(u); return fetchMp4(u); } }), videoItem({ rulesVersion, outputSummary: s.st.summary }));
+      return { s, fetched };
+    };
+    let r = await run(async () => syntheticMp4WithMvhd(240));
+    eq([r.s.st.failed.length, r.s.st.completed.length, r.fetched], [0, 1, ['https://videogen.invalid/x.mp4']], 'mide y completa');
+    eq([r.s.st.uploaded[0].payload.durationSec, r.s.st.uploaded[0].payload.durationSource], [240, 'mp4_mvhd'], 'duración medida en el artifact');
+    eq(r.s.st.completed[0].summary.external, { durationSec: 240, durationSource: 'mp4_mvhd' }, 'summary');
+    r = await run(async () => Buffer.from('sin-mvhd'));
+    eq([r.s.st.completed.length, r.s.st.failed[0].retryable, r.s.st.failed[0].msg.startsWith(IW.VIDEO_DURATION_UNMEASURABLE)], [0, false, true], 'ilegible → admin');
+    r = await run(async () => { throw new Error('HTTP 502'); });
+    eq([r.s.st.completed.length, r.s.st.failed[0].retryable, r.s.st.failed[0].msg.startsWith(`${IW.VIDEO_DURATION_UNMEASURED}:`)], [0, true, true], 'red → reintentable');
+    r = await run(async () => { throw new Error('no debería medir'); }, 2);
+    eq([r.s.st.completed.length, r.s.st.failed.length, r.fetched.length], [1, 0, 0], 'v2 completa sin medir');
+    eq(r.s.st.completed[0].summary.external, { durationSec: null, durationSource: 'unknown' }, 'v2: null + unknown como antes');
   });
 
   // ═══ #1 / #16: worker de proveedores (proveedores FALSOS en 127.0.0.1) ═════
