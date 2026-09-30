@@ -148,7 +148,23 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   const add = (code: string, where: string, message: string) => issues.push({ code, where, message });
   const zip = await JSZip.loadAsync(mbz);
   const text = async (p: string): Promise<string | null> => (zip.file(p) ? zip.file(p)!.async('string') : null);
-  const bin = async (p: string): Promise<Buffer | null> => (zip.file(p) ? zip.file(p)!.async('nodebuffer') : null);
+  // R16: un blob compartido (p. ej. el paquete H5P y su intro, mismo hash) se inflaba
+  // una vez por cada entrada de files.xml y otra al abrir el .h5p. Se memoiza por ruta,
+  // solo para blobs chicos (≤ 1 MiB descomprimido: los .h5p/zip de actividades) para no
+  // retener en memoria audios y PDFs grandes. Nadie muta los buffers devueltos.
+  const binCache = new Map<string, Promise<Buffer | null>>();
+  const BIN_CACHE_MAX_BYTES = 1024 * 1024;
+  const bin = async (p: string): Promise<Buffer | null> => {
+    const hit = binCache.get(p);
+    if (hit) return hit;
+    const f = zip.file(p);
+    if (!f) return null;
+    const pr = f.async('nodebuffer');
+    binCache.set(p, pr);
+    const buf = await pr;
+    if (buf.length > BIN_CACHE_MAX_BYTES) binCache.delete(p);
+    return buf;
+  };
   const { facts, resolved } = exp;
 
   const mb = await text('moodle_backup.xml');
