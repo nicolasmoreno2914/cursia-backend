@@ -411,16 +411,20 @@ jobs:
                # Node, no a un wrapper npm) y kill_timeout de 300 s: al recargar, PM2 manda SIGINT y espera a que el
                # worker deje de reclamar y termine o devuelva sus items (tope interno 270 s) antes de matarlo.
                # Un proceso heredado (npm run, kill_timeout 1,6 s) se recrea UNA vez; los deploys siguientes recargan.
+               # pm2 jlist ilegible (exit 2 del helper) → no se recrea nada: se recarga el proceso existente.
                DRAIN_KILL_TIMEOUT_MS=300000
                ensure_pm2_drain_worker() {
                  local name="$1"
                  local script="$2"
+                 local rc=0
                  if sudo pm2 describe "$name" > /dev/null 2>&1; then
-                   if sudo pm2 jlist | node scripts/pm2-drain-config.js check "$name" "$script" "$DRAIN_KILL_TIMEOUT_MS"; then
-                     sudo pm2 reload "$name" --update-env
-                   else
+                   sudo pm2 jlist | node scripts/pm2-drain-config.js check "$name" "$script" "$DRAIN_KILL_TIMEOUT_MS" || rc=$?
+                   if [ "$rc" = "1" ]; then
                      sudo pm2 delete "$name"
                      sudo pm2 start "$script" --name "$name" --kill-timeout "$DRAIN_KILL_TIMEOUT_MS"
+                   else
+                     [ "$rc" = "0" ] || echo "⚠️ ${name}: no se pudo leer pm2 jlist (rc=${rc}); se recarga sin recrear"
+                     sudo pm2 reload "$name" --update-env
                    fi
                  else
                    sudo pm2 start "$script" --name "$name" --kill-timeout "$DRAIN_KILL_TIMEOUT_MS"

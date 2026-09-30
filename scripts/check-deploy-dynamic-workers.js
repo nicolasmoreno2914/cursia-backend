@@ -407,7 +407,7 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     bashSyntaxOk(script, 'deploy-staging.yml (script remoto)');
   });
 
-  await check('(R16 #1) ensure_pm2_drain_worker ejecutado con pm2 falso: ausente → start node directo --kill-timeout 300000; heredado (npm run / 1,6 s) → delete + start UNA vez; ya configurado → reload --update-env; nunca npm', () => {
+  await check('(R16 #1) ensure_pm2_drain_worker ejecutado con pm2 falso: ausente → start node directo --kill-timeout 300000; heredado (npm run / 1,6 s) → delete + start UNA vez; ya configurado o jlist ilegible → reload --update-env; nunca npm', () => {
     const script = remoteScriptOf(pm2StepOf(stagingText, 'deploy-staging.yml').text);
     const lines = script.split('\n');
     const a = lines.findIndex((l) => l.startsWith('DRAIN_KILL_TIMEOUT_MS='));
@@ -428,7 +428,7 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       const runCase = (exists, jlist) => {
         const log = path.join(dir, `log-${Math.random().toString(36).slice(2)}`);
         const jl = path.join(dir, 'jlist.json');
-        fs.writeFileSync(jl, JSON.stringify(jlist));
+        fs.writeFileSync(jl, typeof jlist === 'string' ? jlist : JSON.stringify(jlist));
         const r = spawnSync('bash', ['-c', `set -e\n${fn}\nensure_pm2_drain_worker ${name} ${scriptRel}`], {
           cwd: dir, encoding: 'utf8',
           env: { PATH: `${path.join(dir, 'bin')}:${process.env.PATH}`, PM2_LOG: log, PM2_EXISTS: exists ? '1' : '0', PM2_JLIST: jl },
@@ -444,6 +444,8 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       eq(runCase(true, shortKt), [`pm2 describe ${name}`, 'pm2 jlist', `pm2 delete ${name}`, startLine], 'kill_timeout corto → recrear');
       const ok = [{ name, pm2_env: { pm_exec_path: `/var/www/x/${scriptRel}`, kill_timeout: 300000 } }];
       eq(runCase(true, ok), [`pm2 describe ${name}`, 'pm2 jlist', `pm2 reload ${name} --update-env`], 'configurado → reload');
+      // Fix M4: pm2 jlist ilegible (helper exit 2) → nunca recrea en cada deploy: recarga el existente.
+      eq(runCase(true, 'no-es-json'), [`pm2 describe ${name}`, 'pm2 jlist', `pm2 reload ${name} --update-env`], 'jlist ilegible → reload, sin delete');
       // Pura: nunca imprime el entorno; exit 2 con uso inválido.
       const { drainConfigStatus } = require(path.join(repoRoot, 'scripts', 'pm2-drain-config.js'));
       eq(drainConfigStatus(ok, name, scriptRel, 300000).ok, true, 'pura ok');
