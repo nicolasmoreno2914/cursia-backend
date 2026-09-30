@@ -179,21 +179,6 @@ export class CourseStructureService implements OnModuleInit {
     return (await this.readStructure(queryRunner, courseId, ownerId)).liveMatchesCurrentBlueprint;
   }
 
-  private async bumpCounter(queryRunner: QueryRunner, courseId: number): Promise<number> {
-    const rows = returningRows(await queryRunner.query(
-      `update public.courses set structure_version_counter = structure_version_counter + 1
-       where id = $1 returning structure_version_counter`,
-      [courseId],
-    ));
-    const counter = rows[0]?.structure_version_counter;
-    if (typeof counter !== 'number') {
-      // Nunca responder 200 sin counter: el cliente lo necesita para su
-      // próximo expectedCounter (sin él, cada escritura siguiente da 409).
-      throw new Error(`bumpCounter: no se pudo leer structure_version_counter del curso #${courseId}`);
-    }
-    return counter;
-  }
-
   async getStructure(courseId: number, ownerId: string) {
     // V2.1 fix round 1 (I5): sin la migración R3 → 503 schema_not_migrated_v21 (nunca un 500 crudo).
     await assertV21StructureSchema(this.dataSource);
@@ -402,28 +387,6 @@ export class CourseStructureService implements OnModuleInit {
   }
 
   /**
-   * V2.1 (R3): `courses.final_exam_enabled` / `courses.activity_engine`.
-   * Fail loud: un valor fuera de contrato (no debería pasar: NOT NULL +
-   * CHECK) tira en vez de devolverse "arreglado".
-   */
-  private async readCourseSettings(
-    courseId: number,
-    runner?: QueryRunner,
-  ): Promise<{ finalExam: boolean; activityEngine: 'h5p' | 'scorm' }> {
-    const q = `select final_exam_enabled, activity_engine from public.courses where id = $1`;
-    const rows = runner ? await runner.query(q, [courseId]) : await this.dataSource.query(q, [courseId]);
-    const row = rows[0];
-    if (!row) throw new NotFoundException(`Course #${courseId} not found`);
-    if (typeof row.final_exam_enabled !== 'boolean' || !isActivityEngine(row.activity_engine)) {
-      throw new Error(
-        `Curso #${courseId}: toggles de curso inválidos (final_exam_enabled=${JSON.stringify(row.final_exam_enabled)}, ` +
-          `activity_engine=${JSON.stringify(row.activity_engine)})`,
-      );
-    }
-    return { finalExam: row.final_exam_enabled, activityEngine: row.activity_engine };
-  }
-
-  /**
    * V2.1 (R3): PATCH de los toggles de curso (`finalExam`, `activityEngine`).
    * Mismo lockAndVerify (ownership + dynamic + expectedCounter → 409) y
    * mismo bump de counter que cualquier otra mutación de estructura: estos
@@ -447,10 +410,27 @@ export class CourseStructureService implements OnModuleInit {
       if (dto.finalExam !== undefined) { sets.push(`final_exam_enabled = $${i++}`); params.push(dto.finalExam); }
       if (dto.activityEngine !== undefined) { sets.push(`activity_engine = $${i++}`); params.push(dto.activityEngine); }
       params.push(courseId);
-      await queryRunner.query(`update public.courses set ${sets.join(', ')} where id = $${i}`, params);
-
-      const newCounter = await this.bumpCounter(queryRunner, courseId);
-      const settings = await this.readCourseSettings(courseId, queryRunner);
+      // R16: toggles + counter + relectura en UNA sentencia (antes UPDATE, bump y select aparte).
+      const rows = returningRows(await queryRunner.query(
+        `update public.courses
+            set ${sets.join(', ')}, structure_version_counter = structure_version_counter + 1
+          where id = $${i}
+          returning structure_version_counter, final_exam_enabled, activity_engine`,
+        params,
+      ));
+      const row = rows[0];
+      if (!row) throw new NotFoundException(`Course #${courseId} not found`);
+      const newCounter = this.counterOrThrow(row.structure_version_counter, courseId);
+      if (typeof row.final_exam_enabled !== 'boolean' || !isActivityEngine(row.activity_engine)) {
+        throw new Error(
+          `Curso #${courseId}: toggles de curso inválidos (final_exam_enabled=${JSON.stringify(row.final_exam_enabled)}, ` +
+            `activity_engine=${JSON.stringify(row.activity_engine)})`,
+        );
+      }
+      const settings: { finalExam: boolean; activityEngine: 'h5p' | 'scorm' } = {
+        finalExam: row.final_exam_enabled,
+        activityEngine: row.activity_engine,
+      };
       await queryRunner.commitTransaction();
       return { structureVersionCounter: newCounter, ...settings };
     } catch (err) {
@@ -470,37 +450,47 @@ export class CourseStructureService implements OnModuleInit {
       await queryRunner.startTransaction();
       await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
 
-      const maxRows = await queryRunner.query(
-        `select coalesce(max(position), -1) as max_pos from public.course_modules where course_id = $1`,
-        [courseId],
-      );
-      const nextPosition = Number(maxRows[0].max_pos) + 1;
-
       const nt = normalizeTitleOrThrow('module', dto.title);
-      const inserted = await queryRunner.query(
-        `insert into public.course_modules (course_id, position, title, objective, exam_enabled, description)
-         values ($1, $2, $3, $4, $5, $6)
-         returning id, position, title, objective, description, exam_enabled as "examEnabled"`,
-        [courseId, nextPosition, nt.title, dto.objective || null, dto.examEnabled ?? true,
-          checkedDescription(mergeDescription(cleanDescription(dto.description), nt.description))],
-      );
-      const newModuleId = inserted[0].id;
+      const description = checkedDescription(mergeDescription(cleanDescription(dto.description), nt.description));
 
-      // Ruling R3: createModule también crea el primer capítulo del módulo,
-      // en la MISMA transacción — el resto del plan asume que todo módulo
-      // tiene ≥1 capítulo (deleteModule/deleteChapter/move rechazan llegar
-      // a 0), así que la creación no puede producir un módulo con 0.
-      const insertedChapter = await queryRunner.query(
-        `insert into public.course_chapters (course_id, module_id, position, title, video_enabled)
-         values ($1, $2, $3, $4, $5)
-         returning id, position, title, objective, description, video_enabled as "videoEnabled", activity_enabled as "activityEnabled"`,
-        [courseId, newModuleId, 0, 'Nuevo capítulo', false],
+      // R16: max(position) + INSERT módulo + INSERT del capítulo default + counter en
+      // UNA sentencia (antes 4 idas y vueltas). Ruling R3: createModule también crea
+      // el primer capítulo del módulo, en la MISMA transacción — el resto del plan
+      // asume que todo módulo tiene ≥1 capítulo (deleteModule/deleteChapter/move
+      // rechazan llegar a 0), así que la creación no puede producir un módulo con 0.
+      const rows = await queryRunner.query(
+        `with nm as (
+           insert into public.course_modules (course_id, position, title, objective, exam_enabled, description)
+           select $1::int, coalesce(max(position), -1) + 1, $2::text, $3::text, $4::boolean, $5::text
+             from public.course_modules where course_id = $1
+           returning id, position, title, objective, description, exam_enabled
+         ),
+         nc as (
+           insert into public.course_chapters (course_id, module_id, position, title, video_enabled)
+           select $1::int, nm.id, $6::int, $7::text, $8::boolean from nm
+           returning id, position, title, objective, description, video_enabled, activity_enabled
+         ),
+         c as (
+           update public.courses co
+              set structure_version_counter = co.structure_version_counter + 1
+            where co.id = $1
+           returning co.structure_version_counter
+         )
+         select json_build_object('id', nm.id, 'position', nm.position, 'title', nm.title, 'objective', nm.objective,
+                                  'description', nm.description, 'examEnabled', nm.exam_enabled) as module,
+                json_build_object('id', nc.id, 'position', nc.position, 'title', nc.title, 'objective', nc.objective,
+                                  'description', nc.description, 'videoEnabled', nc.video_enabled,
+                                  'activityEnabled', nc.activity_enabled) as chapter,
+                c.structure_version_counter as counter
+           from nm, nc, c`,
+        [courseId, nt.title, dto.objective || null, dto.examEnabled ?? true, description, 0, 'Nuevo capítulo', false],
       );
-
-      const newCounter = await this.bumpCounter(queryRunner, courseId);
+      const r = rows[0];
+      if (!r) throw new Error(`createModule: el INSERT no devolvió filas en el curso #${courseId}`);
+      const newCounter = this.counterOrThrow(r.counter, courseId);
       await queryRunner.commitTransaction();
       return {
-        module: { ...inserted[0], chapters: [insertedChapter[0]] },
+        module: { ...this.jsonObject(r.module), chapters: [this.jsonObject(r.chapter)] },
         structureVersionCounter: newCounter,
         titleNormalized: nt.changed,
       };
@@ -520,35 +510,53 @@ export class CourseStructureService implements OnModuleInit {
       await queryRunner.startTransaction();
       await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
 
-      const existing = await queryRunner.query(
-        `select id, description from public.course_modules where id = $1 and course_id = $2`,
-        [moduleId, courseId],
-      );
-      if (existing.length === 0) {
-        await queryRunner.rollbackTransaction();
-        throw new NotFoundException(`Module ${moduleId} not found in course #${courseId}`);
+      // R16: la fila existente solo se lee si hace falta su descripción (título
+      // largo separado sin descripción nueva) o para respetar la precedencia de
+      // siempre (módulo inexistente → 404 antes que un título inválido → 400).
+      const notFound = () => new NotFoundException(`Module ${moduleId} not found in course #${courseId}`);
+      const readExisting = async (): Promise<{ description: string | null }> => {
+        const existing = await queryRunner.query(
+          `select id, description from public.course_modules where id = $1 and course_id = $2`,
+          [moduleId, courseId],
+        );
+        if (existing.length === 0) {
+          await queryRunner.rollbackTransaction();
+          throw notFound();
+        }
+        return existing[0];
+      };
+      let nt: StructureTitleSplit | null = null;
+      try {
+        nt = dto.title !== undefined ? normalizeTitleOrThrow('module', dto.title) : null;
+      } catch (err) {
+        await readExisting();
+        throw err;
       }
 
       const sets: string[] = [];
       const params: any[] = [];
       let i = 1;
-      const nt = dto.title !== undefined ? normalizeTitleOrThrow('module', dto.title) : null;
       if (nt) { sets.push(`title = $${i++}`); params.push(nt.title); }
       if (dto.objective !== undefined) { sets.push(`objective = $${i++}`); params.push(dto.objective); }
       if (dto.examEnabled !== undefined) { sets.push(`exam_enabled = $${i++}`); params.push(dto.examEnabled); }
       let description: string | null | undefined;
-      if (nt?.description) description = checkedDescription(mergeDescription(dto.description !== undefined ? cleanDescription(dto.description) : existing[0].description, nt.description));
-      else if (dto.description !== undefined) description = cleanDescription(dto.description);
+      if (nt?.description) {
+        const base = dto.description !== undefined ? cleanDescription(dto.description) : (await readExisting()).description;
+        try {
+          description = checkedDescription(mergeDescription(base, nt.description));
+        } catch (err) {
+          if (dto.description !== undefined) await readExisting();
+          throw err;
+        }
+      } else if (dto.description !== undefined) description = cleanDescription(dto.description);
       if (description !== undefined) { sets.push(`description = $${i++}`); params.push(description); }
-      if (sets.length > 0) {
-        params.push(moduleId);
-        await queryRunner.query(
-          `update public.course_modules set ${sets.join(', ')}, updated_at = now() where id = $${i}`,
-          params,
-        );
-      }
 
-      const newCounter = await this.bumpCounter(queryRunner, courseId);
+      const found = await this.updateRowAndBump(queryRunner, 'course_modules', sets, params, i, { id: moduleId, course_id: courseId }, courseId);
+      if (!found.found) {
+        await queryRunner.rollbackTransaction();
+        throw notFound();
+      }
+      const newCounter = found.counter;
       await queryRunner.commitTransaction();
       return {
         structureVersionCounter: newCounter,
@@ -623,32 +631,60 @@ export class CourseStructureService implements OnModuleInit {
       await queryRunner.startTransaction();
       await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
 
-      const moduleRows = await queryRunner.query(
-        `select id from public.course_modules where id = $1 and course_id = $2`,
-        [moduleId, courseId],
-      );
-      if (moduleRows.length === 0) {
-        await queryRunner.rollbackTransaction();
-        throw new NotFoundException(`Module ${moduleId} not found in course #${courseId}`);
+      // R16: chequeo del módulo + max(position) + INSERT + counter en UNA sentencia
+      // (antes 4 idas y vueltas). Precedencia de siempre: módulo inexistente → 404
+      // antes que un título/descripción inválidos → 400 (solo en ese caso se consulta
+      // el módulo por separado).
+      const notFound = () => new NotFoundException(`Module ${moduleId} not found in course #${courseId}`);
+      let nt: StructureTitleSplit;
+      let description: string | null;
+      try {
+        nt = normalizeTitleOrThrow('chapter', dto.title);
+        description = checkedDescription(mergeDescription(cleanDescription(dto.description), nt.description));
+      } catch (err) {
+        const moduleRows = await queryRunner.query(
+          `select id from public.course_modules where id = $1 and course_id = $2`,
+          [moduleId, courseId],
+        );
+        if (moduleRows.length === 0) {
+          await queryRunner.rollbackTransaction();
+          throw notFound();
+        }
+        throw err;
       }
-
-      const maxRows = await queryRunner.query(
-        `select coalesce(max(position), -1) as max_pos from public.course_chapters where module_id = $1`,
-        [moduleId],
+      const rows = await queryRunner.query(
+        `with m as (
+           select id from public.course_modules where id = $2 and course_id = $1
+         ),
+         ins as (
+           insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled, activity_enabled, description)
+           select $1::int, m.id,
+                  coalesce((select max(position) from public.course_chapters where module_id = m.id), -1) + 1,
+                  $3::text, $4::text, $5::boolean, $6::boolean, $7::text
+             from m
+           returning id, position, title, objective, description, video_enabled, activity_enabled
+         ),
+         c as (
+           update public.courses co
+              set structure_version_counter = co.structure_version_counter + 1
+            where co.id = $1 and exists (select 1 from ins)
+           returning co.structure_version_counter
+         )
+         select (select count(*)::int from m) as found,
+                (select json_build_object('id', ins.id, 'position', ins.position, 'title', ins.title, 'objective', ins.objective,
+                                          'description', ins.description, 'videoEnabled', ins.video_enabled,
+                                          'activityEnabled', ins.activity_enabled) from ins) as chapter,
+                (select structure_version_counter from c) as counter`,
+        [courseId, moduleId, nt.title, dto.objective || null, dto.videoEnabled ?? false, dto.activityEnabled ?? true, description],
       );
-      const nextPosition = Number(maxRows[0].max_pos) + 1;
-
-      const nt = normalizeTitleOrThrow('chapter', dto.title);
-      const inserted = await queryRunner.query(
-        `insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled, activity_enabled, description)
-         values ($1, $2, $3, $4, $5, $6, $7, $8)
-         returning id, position, title, objective, description, video_enabled as "videoEnabled", activity_enabled as "activityEnabled"`,
-        [courseId, moduleId, nextPosition, nt.title, dto.objective || null, dto.videoEnabled ?? false,
-          dto.activityEnabled ?? true, checkedDescription(mergeDescription(cleanDescription(dto.description), nt.description))],
-      );
-      const newCounter = await this.bumpCounter(queryRunner, courseId);
+      const r = rows[0];
+      if (!r || Number(r.found) === 0) {
+        await queryRunner.rollbackTransaction();
+        throw notFound();
+      }
+      const newCounter = this.counterOrThrow(r.counter, courseId);
       await queryRunner.commitTransaction();
-      return { chapter: inserted[0], structureVersionCounter: newCounter, titleNormalized: nt.changed };
+      return { chapter: this.jsonObject(r.chapter), structureVersionCounter: newCounter, titleNormalized: nt.changed };
     } catch (err) {
       if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
       throw err;
@@ -666,36 +702,55 @@ export class CourseStructureService implements OnModuleInit {
       await queryRunner.startTransaction();
       await this.lockAndVerify(queryRunner, courseId, ownerId, dto.expectedCounter);
 
-      const existing = await queryRunner.query(
-        `select id, description from public.course_chapters where id = $1 and module_id = $2 and course_id = $3`,
-        [chapterId, moduleId, courseId],
-      );
-      if (existing.length === 0) {
-        await queryRunner.rollbackTransaction();
-        throw new NotFoundException(`Chapter ${chapterId} not found in module ${moduleId}`);
+      // R16: igual que updateModule — la fila solo se lee si hace falta su
+      // descripción o para respetar la precedencia 404 → 400.
+      const notFound = () => new NotFoundException(`Chapter ${chapterId} not found in module ${moduleId}`);
+      const readExisting = async (): Promise<{ description: string | null }> => {
+        const existing = await queryRunner.query(
+          `select id, description from public.course_chapters where id = $1 and module_id = $2 and course_id = $3`,
+          [chapterId, moduleId, courseId],
+        );
+        if (existing.length === 0) {
+          await queryRunner.rollbackTransaction();
+          throw notFound();
+        }
+        return existing[0];
+      };
+      let nt: StructureTitleSplit | null = null;
+      try {
+        nt = dto.title !== undefined ? normalizeTitleOrThrow('chapter', dto.title) : null;
+      } catch (err) {
+        await readExisting();
+        throw err;
       }
 
       const sets: string[] = [];
       const params: any[] = [];
       let i = 1;
-      const nt = dto.title !== undefined ? normalizeTitleOrThrow('chapter', dto.title) : null;
       if (nt) { sets.push(`title = $${i++}`); params.push(nt.title); }
       if (dto.objective !== undefined) { sets.push(`objective = $${i++}`); params.push(dto.objective); }
       let description: string | null | undefined;
-      if (nt?.description) description = checkedDescription(mergeDescription(dto.description !== undefined ? cleanDescription(dto.description) : existing[0].description, nt.description));
-      else if (dto.description !== undefined) description = cleanDescription(dto.description);
+      if (nt?.description) {
+        const base = dto.description !== undefined ? cleanDescription(dto.description) : (await readExisting()).description;
+        try {
+          description = checkedDescription(mergeDescription(base, nt.description));
+        } catch (err) {
+          if (dto.description !== undefined) await readExisting();
+          throw err;
+        }
+      } else if (dto.description !== undefined) description = cleanDescription(dto.description);
       if (description !== undefined) { sets.push(`description = $${i++}`); params.push(description); }
       if (dto.videoEnabled !== undefined) { sets.push(`video_enabled = $${i++}`); params.push(dto.videoEnabled); }
       if (dto.activityEnabled !== undefined) { sets.push(`activity_enabled = $${i++}`); params.push(dto.activityEnabled); }
-      if (sets.length > 0) {
-        params.push(chapterId);
-        await queryRunner.query(
-          `update public.course_chapters set ${sets.join(', ')}, updated_at = now() where id = $${i}`,
-          params,
-        );
-      }
 
-      const newCounter = await this.bumpCounter(queryRunner, courseId);
+      const found = await this.updateRowAndBump(
+        queryRunner, 'course_chapters', sets, params, i, { id: chapterId, module_id: moduleId, course_id: courseId }, courseId,
+      );
+      if (!found.found) {
+        await queryRunner.rollbackTransaction();
+        throw notFound();
+      }
+      const newCounter = found.counter;
       await queryRunner.commitTransaction();
       return {
         structureVersionCounter: newCounter,
@@ -1024,6 +1079,58 @@ export class CourseStructureService implements OnModuleInit {
       throw new Error(`bumpCounter: no se pudo leer structure_version_counter del curso #${courseId}`);
     }
     return n;
+  }
+
+  /**
+   * R16: UPDATE de una fila (o, sin campos, solo su existencia) + el +1 del
+   * counter en UNA sentencia. `where` usa el mismo filtro que la lectura de
+   * existencia de antes (id + módulo + curso), así "0 filas" = 404. Si la fila
+   * no existe, el counter NO se toca. Sin campos, igual se sube el counter
+   * (como antes).
+   */
+  private async updateRowAndBump(
+    queryRunner: QueryRunner,
+    table: 'course_modules' | 'course_chapters',
+    sets: string[],
+    params: any[],
+    nextIdx: number,
+    where: Record<'id' | 'course_id', string | number> & { module_id?: string },
+    courseId: number,
+  ): Promise<{ found: boolean; counter: number }> {
+    const p = params.slice();
+    let i = nextIdx;
+    const conds: string[] = [];
+    for (const [col, v] of Object.entries(where)) {
+      if (v === undefined) continue;
+      conds.push(`t.${col} = $${i++}`);
+      p.push(v);
+    }
+    const courseIdx = i++;
+    p.push(courseId);
+    const target = sets.length > 0
+      ? `update public.${table} t set ${sets.join(', ')}, updated_at = now() where ${conds.join(' and ')} returning t.id`
+      : `select t.id from public.${table} t where ${conds.join(' and ')}`;
+    const rows = await queryRunner.query(
+      `with u as (${target}),
+       c as (
+         update public.courses co
+            set structure_version_counter = co.structure_version_counter + 1
+          where co.id = $${courseIdx} and exists (select 1 from u)
+         returning co.structure_version_counter
+       )
+       select (select count(*)::int from u) as n, (select structure_version_counter from c) as counter`,
+      p,
+    );
+    const r = rows[0];
+    if (!r || Number(r.n) === 0) return { found: false, counter: NaN };
+    return { found: true, counter: this.counterOrThrow(r.counter, courseId) };
+  }
+
+  /** json_build_object del driver: objeto ya parseado o string. */
+  private jsonObject(v: unknown): Record<string, any> {
+    const parsed = typeof v === 'string' ? JSON.parse(v) : v;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('fila JSON inválida');
+    return parsed as Record<string, any>;
   }
 
   /** json/json_agg del driver: objeto ya parseado o string (según versión/driver). */
