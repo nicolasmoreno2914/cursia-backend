@@ -8,8 +8,10 @@
  * (validación del item v3); NUNCA al empaquetar: los cursos ya generados siguen siendo
  * válidos con el schema R2 (validateExperience / assertValidExperience no cambian).
  */
+import { VC_MOVEMENT_IDS } from './schema';
 import type { ChapterExperience, VcComponentType } from './schema';
 import type { VcValidationError } from './validate';
+import { lintView } from './text';
 
 export const VC_PEDAGOGY = {
   /** La apertura empieza con una introducción visual. */
@@ -72,6 +74,183 @@ export function validatePedagogy(doc: Doc): VcValidationError[] {
         }
       });
     });
+  }
+  return errors;
+}
+
+// ─── EV6 — diagramas simulados con texto ────────────────────────────────────
+//
+// Auditoría #413 (primeros auxilios): un árbol de decisión llegó como flujo lineal
+// «1 ¿Responde? → 2 Sí → Consciente → 3 No → …», enseñando una secuencia que no existe.
+// Igual que validatePedagogy, se aplica SOLO al aceptar una experiencia nueva (nunca al empaquetar).
+
+/** Flechas que dibujan un diagrama dentro del texto. */
+const ARROW_RE = /→|->|⇒/g;
+/** Mínimo de flechas en UN párrafo para considerarlo un diagrama simulado («A → B → C»). */
+export const VC_ARROW_CHAIN_MIN = 2;
+
+/**
+ * Encabezado de paso que codifica una rama (texto normalizado: minúsculas, sin acentos, sin comillas
+ * ni numeración inicial «2 », «3. », «4) »). Dos fuerzas (fix round 2):
+ *  - FUERTE (marca solo): «Sí» / «No» solos (o con punto); «Sí» / «No» + flecha; «Si no…», «En caso
+ *    contrario…», «De lo contrario…»; una condición corta que termina en flecha: «Si responde → …».
+ *  - DÉBIL (fix round 3): «Sí» / «No» + «,» «;» «(» o «:» / «-» / «–» / «—» + espacio, y una condición
+ *    corta con dos puntos («Si respira: …»). También son advertencias o confirmaciones normales
+ *    («No, nunca la muevas», «Sí - revisa el manómetro cada hora», «No: pero primero verifica»): cuentan
+ *    SOLO si la misma secuencia tiene otro encabezado de la polaridad opuesta, o si siguen
+ *    inmediatamente a una pregunta «¿…?».
+ * No coinciden: «Sistema…», «Nota: …», «No-conformidad», «No olvides…» (imperativo normal),
+ * «Si el equipo vibra, detén la línea» (paso con condición, sin flecha ni dos puntos).
+ */
+const WORD_END = '(?![\\p{L}\\p{N}_])';
+/** Condición corta: 1–4 palabras sin puntuación de corte. */
+const SHORT_CLAUSE = '[^\\s,;:→]+(?:\\s+[^\\s,;:→]+){0,3}';
+const STRONG_HEAD_RE = new RegExp(
+  '^(?:' +
+    [
+      '(?:si|no)[.!]?$',
+      '(?:si|no)\\s*(?:→|->|⇒)',
+      `si\\s+no${WORD_END}`,
+      `en\\s+caso\\s+contrario${WORD_END}`,
+      `de\\s+lo\\s+contrario${WORD_END}`,
+      `si\\s+${SHORT_CLAUSE}\\s*(?:→|->|⇒)`,
+    ].join('|') +
+    ')',
+  'u',
+);
+const WEAK_HEAD_RE = new RegExp(`^(?:(?:si|no)\\s*(?:[,;(]|[:\\-–—](?=\\s|$))|si\\s+${SHORT_CLAUSE}\\s*:)`, 'u');
+/** Polaridad de la rama: «no» para «No…», «Si no…», «En caso contrario…», «De lo contrario…». */
+const NEGATIVE_HEAD_RE = new RegExp(`^(?:no${WORD_END}|si\\s+no${WORD_END}|en\\s+caso\\s+contrario|de\\s+lo\\s+contrario)`, 'u');
+
+export interface VcBranchHead {
+  strength: 'strong' | 'weak';
+  polarity: 'yes' | 'no';
+}
+
+/** Numeración y comillas iniciales («2 Sí → …», «"Sí" → …») no esconden la rama. */
+const QUOTES_RE = /["'«»“”‘’„]/g;
+const LEAD_NUM_RE = /^\s*\d{1,2}\s*[.)\-–:]?\s+/;
+/** Encabezado que es una pregunta («¿Responde?»): en una secuencia, anuncia ramas. */
+const QUESTION_HEAD_RE = /^¿.*\?$/su;
+
+function foldLint(text: string): string {
+  return lintView(String(text ?? '')).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+}
+
+function headView(text: string): string {
+  return foldLint(text).replace(QUOTES_RE, '').replace(LEAD_NUM_RE, '').trim();
+}
+
+/** Nº máximo de flechas en una misma LÍNEA del texto («A → B\nC → D» son dos pares, no una cadena). */
+export function arrowChainLength(text: string): number {
+  let best = 0;
+  for (const line of String(text ?? '').split(/\r?\n/)) {
+    const n = (line.match(ARROW_RE) || []).length;
+    if (n > best) best = n;
+  }
+  return best;
+}
+
+/** Clasifica un encabezado: rama FUERTE, DÉBIL (depende de la secuencia) o null. */
+export function branchHead(text: string): VcBranchHead | null {
+  const h = headView(text);
+  const strength = STRONG_HEAD_RE.test(h) ? 'strong' : WEAK_HEAD_RE.test(h) ? 'weak' : null;
+  return strength ? { strength, polarity: NEGATIVE_HEAD_RE.test(h) ? 'no' : 'yes' } : null;
+}
+
+/** ¿El encabezado codifica una rama por sí solo (FUERTE)? Los DÉBILES dependen de la secuencia. */
+export function isBranchHead(text: string): boolean {
+  return branchHead(text)?.strength === 'strong';
+}
+
+/**
+ * Índices de los encabezados que codifican ramas en UNA secuencia: los FUERTES; los DÉBILES con otro
+ * encabezado de polaridad opuesta en la misma secuencia o justo después de una pregunta.
+ */
+export function branchingHeadIndexes(heads: string[]): number[] {
+  const kinds = heads.map((h) => (h ? branchHead(h) : null));
+  const isQ = heads.map((h) => !!h && isQuestionHead(h));
+  const out: number[] = [];
+  kinds.forEach((k, j) => {
+    if (!k) return;
+    if (k.strength === 'strong') out.push(j);
+    else if ((j > 0 && isQ[j - 1]) || kinds.some((o, i) => i !== j && !!o && o.polarity !== k.polarity)) out.push(j);
+  });
+  return out;
+}
+
+/** ¿El rótulo es una pregunta («¿…?»)? */
+export function isQuestionHead(text: string): boolean {
+  return QUESTION_HEAD_RE.test(headView(text));
+}
+
+/** Rótulos de ítems de secuencia por tipo: [lista, campo]. */
+function sequenceHeads(c: Record<string, unknown>): { list: string; field: string } | null {
+  if (c.type === 'diagram' && (c.kind === 'flow' || c.kind === 'cycle')) return { list: 'nodes', field: 'label' };
+  if (c.type === 'process_steps') return { list: 'steps', field: 'heading' };
+  if (c.type === 'timeline') return { list: 'events', field: 'heading' };
+  return null;
+}
+
+const SKIP_KEYS = new Set(['type', 'kind', 'variant']);
+
+function walkTexts(v: unknown, path: string, out: Array<{ path: string; text: string }>): void {
+  if (typeof v === 'string') out.push({ path, text: v });
+  else if (Array.isArray(v)) v.forEach((x, i) => walkTexts(x, `${path}[${i}]`, out));
+  else if (v && typeof v === 'object') for (const [k, x] of Object.entries(v)) if (!SKIP_KEYS.has(k)) walkTexts(x, `${path}.${k}`, out);
+}
+
+/**
+ * Errores DIAGRAM_BRANCHING_IN_SEQUENCE / TEXT_SIMULATED_DIAGRAM (vacío = cumple). Espera un
+ * documento que ya pasó validateExperience. Solo textos del LLM (el shell escribe los suyos aparte).
+ */
+export function validateSimulatedDiagrams(doc: Pick<ChapterExperience, 'movements'> & { bridge_to_next?: unknown }): VcValidationError[] {
+  const errors: VcValidationError[] = [];
+  if (!doc || typeof doc !== 'object' || !doc.movements) return errors;
+  for (const m of VC_MOVEMENT_IDS) {
+    const list = doc.movements[m];
+    if (!Array.isArray(list)) continue;
+    list.forEach((raw, i) => {
+      if (!raw || typeof raw !== 'object') return;
+      const c = raw as unknown as Record<string, unknown>;
+      const cpath = `$.movements.${m}[${i}]`;
+      const seq = sequenceHeads(c);
+      const items = seq ? c[seq.list] : undefined;
+      if (seq && Array.isArray(items)) {
+        const heads = items.map((it) => {
+          const h = it && typeof it === 'object' ? (it as Record<string, unknown>)[seq.field] : undefined;
+          return typeof h === 'string' ? h : '';
+        });
+        const flagged = new Set(branchingHeadIndexes(heads));
+        const branchAt = heads.map((_h, j) => flagged.has(j));
+        heads.forEach((h, j) => {
+          if (branchAt[j]) {
+            errors.push({
+              path: `${cpath}.${seq.list}[${j}].${seq.field}`,
+              code: 'DIAGRAM_BRANCHING_IN_SEQUENCE',
+              message: 'este paso codifica una rama («Sí → …», «No: …», «Si no…»): una secuencia no se ramifica; si hay condiciones usa un diagram con kind "decision"',
+            });
+          } else if (h && isQuestionHead(h) && branchAt.some((x, k) => x && k > j)) {
+            // Señal estructural: una pregunta seguida de pasos-rama es un árbol aplanado (auditoría #413).
+            errors.push({
+              path: `${cpath}.${seq.list}[${j}].${seq.field}`,
+              code: 'DIAGRAM_BRANCHING_IN_SEQUENCE',
+              message: 'una pregunta seguida de pasos «Sí/No» es un árbol de decisión aplanado: usa un diagram con kind "decision" (la pregunta es "question" y cada respuesta, una rama)',
+            });
+          }
+        });
+      }
+      const texts: Array<{ path: string; text: string }> = [];
+      walkTexts(c, cpath, texts);
+      for (const t of texts) {
+        if (arrowChainLength(t.text) >= VC_ARROW_CHAIN_MIN) {
+          errors.push({ path: t.path, code: 'TEXT_SIMULATED_DIAGRAM', message: 'el texto dibuja un diagrama con flechas («A → B → C»): escribe frases o usa process_steps o un diagram' });
+        }
+      }
+    });
+  }
+  if (typeof doc.bridge_to_next === 'string' && arrowChainLength(doc.bridge_to_next) >= VC_ARROW_CHAIN_MIN) {
+    errors.push({ path: '$.bridge_to_next', code: 'TEXT_SIMULATED_DIAGRAM', message: 'el texto dibuja un diagrama con flechas («A → B → C»): escribe frases o usa process_steps o un diagram' });
   }
   return errors;
 }

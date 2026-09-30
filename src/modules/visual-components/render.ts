@@ -46,6 +46,9 @@ import {
   VcTimeline,
   VcWorkedExample,
   VcDiagram,
+  VcDecisionBranch,
+  VcDecisionDiagram,
+  VcDecisionNode,
 } from './schema';
 import { HYPHEN_HEADING, HYPHEN_TABLE, HyphenOpts, inlineHtml, labelHtml, richParagraphs } from './text';
 import { runtimeScript, scopedStyle } from './runtime';
@@ -1043,6 +1046,7 @@ const DIAGRAM_KIND_LABEL: Record<VcDiagram['kind'], string> = {
   flow: 'Flujo',
   hierarchy: 'Estructura',
   matrix: 'Matriz',
+  decision: 'Decisión',
 };
 
 /** Nodo de diagrama: etiqueta (h5) + detalle opcional. En ENHANCED el CSS lo convierte en caja. */
@@ -1075,7 +1079,116 @@ function cycleRing(r: R, n: number, s: Surf): string {
   );
 }
 
+// ─── EV6 — árbol de decisión ────────────────────────────────────────────────
+//
+// CLEAN_SAFE (sin flex/grid ni <style>): la pregunta es una caja DELINEADA; cada rama abre con su
+// píldora («Sí:» / «No:»; ENHANCED le suma el conector ↙ / ↘) y termina en una acción (caja TINTADA) o en otra pregunta. Un par de
+// acciones finales en los dos primeros niveles va lado a lado en una <table> de 2 columnas (lo único
+// que da columnas bajo forceclean y cabe a 390 px); una rama que abre otra pregunta se apila con un
+// filete de 1 px a la izquierda (nunca se aprieta un subárbol en media columna de teléfono).
+// ENHANCED: el <style> del label pone las ramas en dos columnas desde 600 px (nivel 1) y 960 px (nivel 2).
+// Orden de lectura (y texto sin estilos): pregunta → «Sí» → su rama → «No» → su rama.
+
+const DECISION_DEFAULT_LABEL = { yes: 'Sí', no: 'No' } as const;
+/** Pares de acciones finales lado a lado solo hasta este nivel (más adentro se apilan). */
+const DECISION_TABLE_MAX_DEPTH = 2;
+/** Tope de recursión del renderer (el validador limita a 3 niveles; esto solo evita un árbol hostil). */
+const DECISION_RENDER_MAX_DEPTH = 8;
+
+/**
+ * Píldora de la rama («Sí:» / «No:»). El texto plano (lectores de pantalla, Moodle sin estilos) dice
+ * «Sí: …» / «No: …»: los dos puntos van FUERA del <span class="nolink"> (rótulo del renderer) y el
+ * conector ↙ / ↘ es decorativo: lo dibuja SOLO el <style> de ENHANCED (::before, texto alternativo
+ * vacío). Los dos puntos se ven en ambos niveles (ningún texto de un label se oculta). En CLEAN_SAFE el
+ * conector es el filete o la barra.
+ * `bar`: en un par lado a lado la columna es angosta (≈150 px a 390): el rótulo va en una barra de
+ * bloque delineada que envuelve limpio, no en un <span> con borde que se partiría en dos líneas.
+ */
+function decisionPill(r: R, side: 'yes' | 'no', label: string | undefined, s: Surf, bar = false): string {
+  const acc = readable(s.bg, [r.t.color.accentStrong, r.t.color.accent], s.fg);
+  const text = (label !== undefined ? inlineHtml(label, HYPHEN_TABLE) : labelHtml(DECISION_DEFAULT_LABEL[side])) + '<span class="cvc-dt-sep">:</span>';
+  if (bar) {
+    return (
+      `<p class="cvc-dt-pill cvc-dt-bar"${st(
+        r,
+        [['background-color', s.bg], ['color', acc], ['border', `2px solid ${acc}`], ['margin', `0 0 ${D(r, 8)}px 0`], ['padding', '2px 10px'], ['font-weight', '700'], ['line-height', '1.5'], ['text-align', 'center']],
+        [['border-radius', '999px']],
+      )}><span class="cvc-dt-lbl">${text}</span></p>`
+    );
+  }
+  return (
+    `<p class="cvc-dt-pill"${st(r, [['margin', `0 0 ${D(r, 8)}px 0`], ['padding', 0], ['color', s.fg], ['line-height', '1.6']])}>` +
+    `<span class="cvc-dt-lbl"${st(
+      r,
+      [['background-color', s.bg], ['color', acc], ['border', `2px solid ${acc}`], ['padding', '2px 12px'], ['font-weight', '700']],
+      [['border-radius', '999px'], ['display', 'inline-block']],
+    )}>${text}</span></p>`
+  );
+}
+
+function decisionAction(r: R, text: string): string {
+  const ps = surf(r.t, panelBg(r));
+  return (
+    `<div class="cvc-dt-act"${st(r, [['background-color', ps.bg], ['color', ps.fg], ['border', `1px solid ${edgeOf(r, ps)}`], ['margin', 0], ['padding', '12px 14px']], [['border-radius', r.t.shape.radiusMd]])}>` +
+    `<p${st(r, [['margin', 0], ['padding', 0], ['color', ps.fg], ['font-weight', '600'], ['line-height', '1.45']])}>${inlineHtml(text)}</p>` +
+    `</div>`
+  );
+}
+
+function decisionQuestion(r: R, q: string, s: Surf, depth: number): string {
+  const acc = readable(s.bg, [r.t.color.accent, r.t.color.accentStrong], r.t.color.borderStrong);
+  return (
+    `<div class="cvc-dt-q"${st(r, [['background-color', s.bg], ['color', s.fg], ['border', `2px solid ${acc}`], ['margin', `0 0 ${D(r, 12)}px 0`], ['padding', '12px 16px']], [['border-radius', r.t.shape.radiusMd]])}>` +
+    kicker(r, depth === 1 ? 'Pregunta' : 'Siguiente pregunta', s, { margin: '0 0 4px 0' }) +
+    `<p class="cvc-dt-qt"${st(r, [['margin', 0], ['padding', 0], ['color', s.fg], ['font-size', depth === 1 ? r.t.typography.sizeItemPx : r.t.typography.sizeBodyPx], ['font-weight', '700'], ['line-height', '1.35']])}>${inlineHtml(q)}</p>` +
+    `</div>`
+  );
+}
+
+function decisionBranchBody(r: R, b: VcDecisionBranch, s: Surf, depth: number): string {
+  if (b.tree !== undefined) return decisionNode(r, b.tree, s, depth + 1);
+  if (typeof b.action !== 'string') renderFail('diagram: una rama de decisión necesita "action" o "tree"');
+  return decisionAction(r, b.action);
+}
+
+function decisionNode(r: R, n: VcDecisionNode, s: Surf, depth: number): string {
+  if (depth > DECISION_RENDER_MAX_DEPTH) renderFail('diagram: árbol de decisión demasiado profundo');
+  if (!n || typeof n !== 'object' || typeof n.question !== 'string' || !n.yes || typeof n.yes !== 'object' || !n.no || typeof n.no !== 'object') {
+    renderFail('diagram: nodo de decisión inválido (se espera {question, yes, no})');
+  }
+  const sides = ['yes', 'no'] as const;
+  let branches: string;
+  if (n.yes.tree === undefined && n.no.tree === undefined && depth <= DECISION_TABLE_MAX_DEPTH) {
+    // Dos acciones finales: lado a lado, cada columna encabezada por su barra ↙ Sí / ↘ No.
+    const cell = (side: 'yes' | 'no') =>
+      `<td class="cvc-dt-br cvc-dt-${side}"${st(r, [['background-color', s.bg], ['color', s.fg], ['width', '50%'], ['vertical-align', 'top'], ['padding', side === 'yes' ? '0 6px 0 0' : '0 0 0 6px']])}>` +
+      decisionPill(r, side, n[side].label, s, true) +
+      decisionBranchBody(r, n[side], s, depth) +
+      `</td>`;
+    branches = `<table class="cvc-dt-pair"${st(r, [['border-collapse', 'collapse'], ['width', '100%'], ['margin', 0]])}><tbody><tr>${cell('yes')}${cell('no')}</tr></tbody></table>`;
+  } else {
+    const br = (side: 'yes' | 'no') =>
+      `<div class="cvc-dt-br cvc-dt-${side}"${st(r, [['margin', side === 'yes' ? `0 0 ${D(r, 16)}px 0` : '0'], ['padding', '0 0 0 14px'], ['border-left', `1px solid ${r.t.color.borderStrong}`]])}>` +
+      decisionPill(r, side, n[side].label, s) +
+      decisionBranchBody(r, n[side], s, depth) +
+      `</div>`;
+    branches = `<div class="cvc-dt-branches">${sides.map(br).join('')}</div>`;
+  }
+  return `<div class="cvc-dt-node cvc-dt-d${depth}">${decisionQuestion(r, n.question, s, depth)}${branches}</div>`;
+}
+
+function renderDecision(r: R, c: VcDecisionDiagram): string {
+  const s = ground(r);
+  if (!c.tree || typeof c.tree !== 'object') renderFail('diagram: un árbol de decisión necesita "tree"');
+  const head =
+    sectionKicker(r, `Diagrama · ${DIAGRAM_KIND_LABEL.decision}`, s) +
+    titleIf(r, c.title, s) +
+    (c.caption ? paragraphs(r, c.caption, s, { secondary: true }) : '');
+  return componentWrap(r, 'diagram', head + `<div class="cvc-dg cvc-dg-decision">${decisionNode(r, c.tree, s, 1)}</div>`, s);
+}
+
 function renderDiagram(r: R, c: VcDiagram): string {
+  if (c.kind === 'decision') return renderDecision(r, c);
   const s = ground(r);
   const nodes = list(c.nodes, 'diagram.nodes');
   if (typeof c.kind !== 'string' || !hasOwn(DIAGRAM_KIND_LABEL, c.kind)) renderFail(`diagram: forma desconocida "${String(c.kind)}"`);
@@ -1203,7 +1316,9 @@ export function renderMovement(components: VcComponent[], theme: ResolvedTheme, 
       return renderComponent(c, theme, { uid: `${ctx.uid}-${i}`, level: ctx.level, opener: useOpener ? ctx.opener : undefined });
     })
     .join('');
-  const style = enh ? `<style>${scopedStyle(ctx.uid, theme)}</style>` : '';
+  // EV6: las reglas del árbol de decisión solo viajan en labels que lo usan (el resto, byte-idéntico).
+  const decision = components.some((c) => !!c && (c as { type?: unknown }).type === 'diagram' && (c as { kind?: unknown }).kind === 'decision');
+  const style = enh ? `<style>${scopedStyle(ctx.uid, theme, { decision })}</style>` : '';
   const script = enh ? `<script>${runtimeScript(ctx.uid)}</script>` : '';
   const plateCls = theme.personality && theme.personality.plate ? ' cvc-plate' : '';
   return `<div class="cvc cvc-${ctx.uid}${plateCls}"${ea(r, { 'data-cvc-uid': ctx.uid, 'data-cvc-v': '2' })} lang="es"` + labelRootStyle(theme, enh) + `>${style}${body}${script}</div>`;

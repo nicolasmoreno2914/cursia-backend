@@ -6,7 +6,7 @@
  * |--------------------|------------------------------------|--------------------------------------------|
  * | course_intro       | dynamic_course_intro_json          | validateCourseIntroV3 (+ lints R2)         |
  * | module_intro       | dynamic_module_intro_json          | validateModuleIntroV3 (journey = capítulos)|
- * | experience         | dynamic_experience_json            | validateExperience (R2) + validatePedagogy (EV2) + chapterId |
+ * | experience         | dynamic_experience_json            | validateExperience (R2) + validatePedagogy (EV2) + validateSimulatedDiagrams (EV6) + chapterId |
  * | video_interactions | dynamic_video_interactions_json    | validateVideoInteractionsDoc (R8)          |
  * | activity (h5p)     | dynamic_h5p_params_json            | validateH5pActivityPayload (R7 + rotación) |
  * | final_exam         | dynamic_exam_gift                  | validateExamGift (parseGIFT)               |
@@ -14,7 +14,7 @@
  * `activity` scorm y `exam` de módulo siguen con sus artifacts existentes
  * (solo el chequeo de roles de R4). Todo lo demás de v1/v2: sin cambios.
  */
-import { validateExperience, validatePedagogy } from '../visual-components';
+import { validateExperience, validatePedagogy, validateSimulatedDiagrams } from '../visual-components';
 import { H5pInputError, VideoPlanError, planInteractionCheckpoints, validateVideoInteractionsDoc } from '../../package/h5p';
 import type { VideoCheckpoint } from '../../package/h5p';
 import { H5pActivityType, ShellValidationError, activityTypeForChapter, validateH5pActivityPayload } from './activity-type';
@@ -75,6 +75,16 @@ export function pedagogyApplies(promptVersion: string | null | undefined): boole
   return !!m && Number(m[1]) >= PEDAGOGY_MIN_EXPERIENCE_PROMPT;
 }
 
+/**
+ * EV6 — diagramas simulados con texto (DIAGRAM_BRANCHING_IN_SEQUENCE / TEXT_SIMULATED_DIAGRAM): mismo
+ * criterio de despliegue que la pedagogía, a partir del prompt que describe el kind "decision" (v21-exp-5).
+ */
+export const ANTI_SIMULATION_MIN_EXPERIENCE_PROMPT = 5;
+export function antiSimulationApplies(promptVersion: string | null | undefined): boolean {
+  const m = /^v21-exp-(\d+)$/.exec(String(promptVersion ?? ''));
+  return !!m && Number(m[1]) >= ANTI_SIMULATION_MIN_EXPERIENCE_PROMPT;
+}
+
 export interface V3ItemValidationResult {
   ok: boolean;
   errors: ShellValidationError[];
@@ -129,6 +139,7 @@ export function validateV3ItemArtifact(ctx: V3ItemValidationContext, text: strin
       // Edu EV2: estructura educativa mínima, solo para experiencias NUEVAS (el empaque no la exige:
       // los cursos ya generados siguen siendo válidos).
       if (r.ok && pedagogyApplies(ctx.promptVersion)) for (const e of validatePedagogy(doc as never)) errors.push({ path: e.path, code: e.code, message: e.message });
+      if (r.ok && antiSimulationApplies(ctx.promptVersion)) for (const e of validateSimulatedDiagrams(doc as never)) errors.push({ path: e.path, code: e.code, message: e.message });
       const cid = doc && typeof doc === 'object' ? (doc as Record<string, unknown>).chapterId : undefined;
       if (typeof cid === 'string' && cid !== ctx.chapterId) {
         errors.push({ path: '$.chapterId', code: 'CHAPTER_ID_MISMATCH', message: `chapterId debe ser "${ctx.chapterId}"` });

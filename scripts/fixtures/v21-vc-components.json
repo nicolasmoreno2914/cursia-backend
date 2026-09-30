@@ -523,6 +523,29 @@
           "detail": "Bajo impacto, alta urgencia."
         }
       ]
+    },
+    {
+      "type": "diagram",
+      "kind": "decision",
+      "title": "¿Resolver o escalar el reclamo?",
+      "tree": {
+        "question": "¿El cliente describe el problema con claridad?",
+        "yes": {
+          "tree": {
+            "question": "¿Puedes resolverlo durante esta misma conversación?",
+            "yes": {
+              "action": "Resuélvelo y confirma con el cliente que quedó conforme."
+            },
+            "no": {
+              "label": "Todavía no",
+              "action": "Escala el caso al área técnica con un resumen claro."
+            }
+          }
+        },
+        "no": {
+          "action": "Haz preguntas abiertas hasta entender qué necesita el cliente."
+        }
+      }
     }
   ]
 }
