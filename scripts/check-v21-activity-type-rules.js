@@ -145,6 +145,9 @@ const OBJECTIVES = [
   'Comparar métodos de conservación',
 ];
 // sha256 del Manifest v3 con reglas 1 de buildConfig({...GOLDEN_CFG, objectives: OBJECTIVES}).
+// sha256 de TODAS las listas de las reglas v1 (verbos, raíces, terminaciones, lista negra, pistas, rangos, mapeo).
+// CONGELADO: si cambia, no es rules 1 — nuevas reglas (activityTypeRules 2) con despacho propio.
+const PINNED_RULES_V1_LISTS_SHA = 'c3e7f395a95bed0faf123d66421fd58bae92d8f56806c958021c966eee10fb67';
 const PINNED_SHA_V3_RULES1 = 'c9ad40c71ef93f797c35e6cded78f439217b1e8b16a5b297e9ac4b62d4414b48';
 
 /** Blueprint v2 a medida: chapters = [{ id, objective, title?, activity }] en un solo módulo. */
@@ -171,12 +174,35 @@ async function main() {
   await check('clasificador de capítulo: objective → title → description; nada → null', () => {
     for (const v of VECTORS.chapter) eq(RULES.classifyChapterIntent(v.chapter), v.intent, v.note);
   });
-  await check('plegado: minúsculas, sin tildes (ñ → n), gana el verbo más temprano', () => {
+  await check('plegado + mayor nivel cognitivo: con varios verbos gana apply > reflect > relate > understand > recall (no el más temprano)', () => {
     eq(RULES.foldText('Diseñar ESTRATEGIAS, análisis!'), ['disenar', 'estrategias', 'analisis'], 'fold');
-    eq(RULES.classifyTextIntent('Comparar y luego aplicar'), 'relate', 'primero comparar');
-    eq(RULES.classifyTextIntent('Aplicar y luego comparar'), 'apply', 'primero aplicar');
-    // Un verbo en cualquier posición gana a una pista de sustantivo anterior.
+    eq(RULES.classifyTextIntent('Comparar y luego aplicar'), 'apply', 'comparar + aplicar');
+    eq(RULES.classifyTextIntent('Aplicar y luego comparar'), 'apply', 'aplicar + comparar');
+    eq(RULES.classifyTextIntent('Identificar y comparar'), 'relate', 'recall + relate');
+    eq(RULES.classifyTextIntent('Describir y valorar'), 'reflect', 'understand + reflect');
+    // Un verbo en cualquier posición gana a cualquier pista de sustantivo.
     eq(RULES.classifyTextIntent('Glosario para aplicar en planta'), 'apply', 'verbo > sustantivo');
+    eq(RULES.classifyTextIntent('Análisis de casos para identificar'), 'recall', 'hay verbo ⇒ las pistas no cuentan');
+    eq(RULES.INTENT_RANK_V1, { apply: 5, reflect: 4, relate: 3, understand: 2, recall: 1 }, 'rangos');
+  });
+  await check('solo formas verbales: nominalizaciones (-ción/-sión/-miento/-anza/-ncia/-dor/-dora), participios y -mente nunca son verbo', () => {
+    const nouns = ['aplicacion', 'aplicaciones', 'identificacion', 'construccion', 'valoracion', 'conocimiento', 'conocimientos', 'ordenamiento',
+      'nombramiento', 'ordenador', 'ordenadora', 'evaluacion', 'comprension', 'diferenciacion', 'aplicado', 'aplicada', 'definido', 'definida',
+      'organizadamente', 'comparativamente', 'confianza', 'diferencia', 'secuencia', 'resumen', 'nombre', 'uso', 'diseno', 'calculo', 'negocio',
+      'mejora', 'formula', 'contraste', 'compartir', 'relevancia'];
+    for (const w of nouns) eq(RULES.verbIntentOfWord(w), null, w);
+    const verbs = { aplicar: 'apply', aplique: 'apply', apliquen: 'apply', aplicando: 'apply', aplicarlos: 'apply', analice: 'apply', elija: 'apply',
+      resuelva: 'apply', construya: 'apply', establezca: 'apply', prevenga: 'apply', convierta: 'apply', usar: 'apply', utilice: 'apply',
+      negocie: 'apply', fije: 'apply', conozca: 'recall', reconozca: 'recall', recuerde: 'recall', identifique: 'recall', distinga: 'relate',
+      distingue: 'relate', organice: 'relate', clasifique: 'relate', ordene: 'relate', entienda: 'understand', explique: 'understand', resume: 'understand' };
+    for (const [w, i] of Object.entries(verbs)) eq(RULES.verbIntentOfWord(w), i, w);
+    // Las apply agregadas en la review.
+    for (const v of ['elegir', 'establecer', 'usar', 'utilizar', 'adaptar', 'detectar', 'revisar', 'auditar', 'formular', 'redactar', 'prevenir', 'crear', 'convertir', 'generar', 'negociar', 'fijar']) {
+      eq(RULES.verbIntentOfWord(v), 'apply', v);
+    }
+  });
+  await check('CONGELADO: sha256 de la serialización canónica de todas las listas v1 = el fijado (cambiarlas exige activityTypeRules 2)', () => {
+    eq(RULES.activityTypeRulesV1ListsSha256(), PINNED_RULES_V1_LISTS_SHA, 'listas v1');
   });
 
   // ── 2. chooseActivityTypesV1 ────────────────────────────────────────────

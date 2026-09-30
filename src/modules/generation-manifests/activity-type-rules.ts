@@ -3,18 +3,37 @@
  * capítulo (auditoría P2: 7/7 actividades reales eran DragText/Blanks de
  * recordar vocabulario bajo objetivos como «Diseñar estrategias…»).
  *
+ * ════════════════════════════════════════════════════════════════════════════
+ * CONGELADO: cambiar cualquier lista = nuevas reglas (activityTypeRules 2) con
+ * despacho propio; rules 1 debe quedar byte-idéntico para siempre.
+ * El validador del Manifest recalcula `h5pType` con ESTE código para todo
+ * Manifest guardado con activityTypeRules = 1: si una lista (verbos, raíces
+ * irregulares, terminaciones, lista negra, pistas de sustantivo, rangos,
+ * mapeo) cambia, esos Manifests dejan de validar (500 de integridad). El test
+ * `check-v21-activity-type-rules.js` fija el sha256 de la serialización
+ * canónica de todas las listas (`activityTypeRulesV1ListsSha256`).
+ * ════════════════════════════════════════════════════════════════════════════
+ *
  * Módulo PURO (sin DB, reloj ni azar) y determinístico: el tipo se decide y se
  * CONGELA al construir el Manifest v3 (`item.h5pType`, solo con el marcador
  * `features.activityTypeRules = 1`). Los Manifests guardados sin marcador
- * siguen con la rotación por hash (`activityTypeForChapter`), así que nada de
- * lo ya generado cambia de tipo.
+ * siguen con la rotación por hash (`activityTypeForChapter`).
  *
- * Reglas v1 (rulings del dueño, 2026-09-30):
- *  - Entrada por capítulo: objective; si no clasifica, title; si no,
- *    description. Texto plegado (minúsculas, sin tildes: «Diseñar» → «disenar»).
- *    Dentro de un texto gana el verbo (raíz) que aparece PRIMERO; si ningún
- *    verbo clasifica, se prueban las pistas de sustantivo (títulos nominales:
- *    «Análisis de…», «Glosario de…»), también la primera que aparece.
+ * Reglas v1 (rulings del dueño, 2026-09-30 + review fix round 1):
+ *  - Cascada por capítulo: objective → title → description (el primero que
+ *    clasifique). En objective y title cuentan verbos y, si no hay ninguno,
+ *    pistas de sustantivo; en description SOLO pistas de sustantivo (una
+ *    descripción narra, no declara la intención).
+ *  - Un VERBO es solo una forma verbal: raíz + terminación de VERB_ENDINGS_V1
+ *    (infinitivo, 3.ª persona/imperativo, subjuntivo, gerundio, enclíticos).
+ *    Las nominalizaciones (-ción, -sión, -miento, -anza, -ncia, -dor/-dora),
+ *    los participios/adjetivos (-ado, -ido) y los adverbios (-mente) nunca
+ *    calzan porque no son terminaciones de la lista; los sustantivos que SÍ
+ *    coinciden con una forma verbal («nombre», «resumen», «secuencia»,
+ *    «diferencia», «fórmula»…) están en NON_VERB_WORDS_V1.
+ *  - Con varios verbos (o varias pistas) gana el de MAYOR nivel cognitivo
+ *    (INTENT_RANK_V1: apply > reflect > relate > understand > recall):
+ *    «Identificar … y aplicar …» ⇒ apply. Ya no gana el más temprano.
  *  - Intención → tipo (INTENT_TO_TYPE_V1):
  *      recall     → blanks      (ruling: recordar = completar huecos, no dragtext)
  *      relate     → dragtext
@@ -24,17 +43,14 @@
  *  - Nada clasificado → la rotación de siempre `activityTypeForChapter(id)`.
  *  - Sin override por capítulo (ruling): el tipo sale solo de estas reglas.
  *  - Balance por curso (ruling): al menos max(1, floor(n/3)) questionset entre
- *    las n actividades h5p, SIN tope. Si faltan, se promueven a questionset
- *    en este orden de grupo: fallback (sin clasificar) → relate → recall;
- *    dentro del grupo por fnv1a32(chapterId en minúsculas) ascendente (empate
- *    → chapterId). Nunca depende del orden de módulos/capítulos: el mismo
- *    conjunto de capítulos da el mismo resultado (reordenar es REUSE).
+ *    las n actividades h5p, SIN tope (ver chooseActivityTypesV1).
  *
  * Extensión: el clasificador devuelve una intención; `INTENT_TO_TYPE` por
  * versión de reglas. Unas reglas 2 podrían mapear a dialogcards /
  * branchingscenario cuando exista el pack H5P v2 (verificar que califiquen en
  * Moodle antes).
  */
+import { createHash } from 'crypto';
 import type { BlueprintSnapshotV2 } from '../course-blueprints/blueprint-snapshot';
 import { ACTIVITY_H5P_ROTATION, activityTypeForChapter, fnv1a32 } from '../course-shell/activity-type';
 
@@ -55,47 +71,133 @@ export const INTENT_TO_TYPE_V1: Readonly<Record<ActivityIntent, GradedH5pActivit
 });
 
 /**
- * Raíces verbales (texto plegado, prefijo de palabra). Incluye las formas del
- * subjuntivo que cambian la raíz («conozca», «analice», «organice», «resuelva»,
- * «distinga») porque los objetivos suelen redactarse «Que el estudiante …».
+ * Nivel cognitivo (mayor gana cuando un texto trae varias intenciones).
+ * Requisito de la review: aplicar/decidir/diseñar > relacionar > recordar.
+ * reflect (evaluar/argumentar) va debajo de apply; understand (explicar)
+ * entre relate y recall, como en Bloom (comprender < analizar).
  */
-export const VERB_STEMS_V1: Readonly<Record<ActivityIntent, readonly string[]>> = Object.freeze({
-  recall: ['recorda', 'recuerd', 'identific', 'defin', 'reconoc', 'reconozc', 'nombr', 'enumer', 'memoriz', 'memoric', 'conoc', 'conozc'],
+export const INTENT_RANK_V1: Readonly<Record<ActivityIntent, number>> = Object.freeze({
+  apply: 5,
+  reflect: 4,
+  relate: 3,
+  understand: 2,
+  recall: 1,
+});
+
+/** Verbos por intención, en infinitivo plegado (sin tildes, ñ → n). */
+export const VERBS_V1: Readonly<Record<ActivityIntent, readonly string[]>> = Object.freeze({
+  recall: [
+    'recordar', 'identificar', 'definir', 'reconocer', 'nombrar', 'enumerar', 'memorizar', 'conocer', 'mencionar', 'senalar',
+  ],
   relate: [
-    'relacion', 'clasific', 'compar', 'disting', 'diferenci', 'asoci', 'orden', 'organiz', 'organic',
-    'secuenci', 'vincul', 'contrast', 'categoriz', 'categoric',
+    'relacionar', 'clasificar', 'comparar', 'distinguir', 'diferenciar', 'asociar', 'ordenar', 'organizar', 'secuenciar',
+    'vincular', 'contrastar', 'categorizar', 'jerarquizar',
   ],
   apply: [
-    'aplic', 'decid', 'analiz', 'analic', 'evalu', 'disen', 'resolv', 'resuelv', 'calcul', 'implement', 'planific',
-    'elabor', 'constru', 'gestion', 'ejecut', 'selecc', 'propon', 'diagnost', 'negoci',
+    'aplicar', 'decidir', 'analizar', 'evaluar', 'disenar', 'resolver', 'calcular', 'implementar', 'planificar', 'elaborar',
+    'construir', 'gestionar', 'ejecutar', 'seleccionar', 'proponer', 'diagnosticar', 'negociar', 'elegir', 'establecer',
+    'usar', 'utilizar', 'adaptar', 'detectar', 'revisar', 'auditar', 'formular', 'redactar', 'prevenir', 'crear',
+    'convertir', 'generar', 'fijar', 'desarrollar', 'solucionar', 'optimizar', 'controlar', 'administrar', 'manejar',
+    'preparar', 'estimar', 'priorizar', 'verificar', 'liderar', 'atender', 'operar', 'mejorar',
   ],
-  reflect: ['reflexion', 'argument', 'valor'],
-  understand: ['explic', 'describ', 'comprend', 'interpret', 'resum', 'entend', 'entiend'],
+  reflect: ['reflexionar', 'argumentar', 'valorar', 'justificar', 'debatir'],
+  understand: ['explicar', 'describir', 'comprender', 'interpretar', 'resumir', 'entender', 'parafrasear', 'ejemplificar', 'ilustrar'],
+});
+
+/** Raíces irregulares (cambio de vocal/consonante que las reglas ortográficas no derivan). */
+export const IRREGULAR_ROOTS_V1: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  recordar: ['recuerd'],
+  elegir: ['elig', 'elij'],
+  resolver: ['resuelv'],
+  entender: ['entiend'],
+  atender: ['atiend'],
+  proponer: ['propong'],
+  convertir: ['conviert', 'convirt'],
+  prevenir: ['preveng', 'previen'],
 });
 
 /**
- * Palabras que empiezan con una raíz verbal pero en los títulos suelen ser
- * sustantivos sin intención («cadena de valor», «orden de compra», «nombre
- * comercial»): no clasifican.
+ * Terminaciones verbales aceptadas tras la raíz: infinitivo, 3.ª persona e
+ * imperativo (-a/-an/-e/-en), subjuntivo (-a/-e…), gerundio y enclíticos.
+ * Deliberadamente SIN -o/-os/-as/-es/-ado/-ido/-ción/-miento/-dor/-mente: esas
+ * terminaciones producen sobre todo sustantivos/adjetivos («diseño», «uso»,
+ * «cálculo», «negocio», «aplicado», «ordenador», «conocimiento»).
  */
+export const VERB_ENDINGS_V1: readonly string[] = Object.freeze([
+  'ar', 'er', 'ir', 'a', 'an', 'e', 'en', 'ando', 'iendo', 'yendo',
+  'arlo', 'arla', 'arlos', 'arlas', 'arse', 'erlo', 'erla', 'erlos', 'erlas', 'erse', 'irlo', 'irla', 'irlos', 'irlas', 'irse',
+]);
+
+/** Sustantivos/adjetivos que coinciden EXACTO con una forma verbal generada: nunca cuentan como verbo. */
 export const NON_VERB_WORDS_V1: ReadonlySet<string> = new Set([
-  'valor', 'valores', 'orden', 'ordenes', 'nombre', 'nombres',
+  'nombre', 'resumen', 'secuencia', 'diferencia', 'contraste', 'formula', 'fija', 'cree', 'creen', 'mejora', 'opera',
+  'estima', 'interprete', 'valor', 'valores', 'orden', 'ordenes', 'uso', 'usos', 'diseno', 'calculo', 'negocio',
+  'lista', 'critica', 'practica', 'debate',
 ]);
 
 /**
- * Pistas de sustantivo (prefijo de palabra plegada) para títulos nominales;
- * solo cuentan si ningún verbo clasificó ese mismo texto.
+ * Pistas de sustantivo (palabra plegada EXACTA) para títulos nominales y
+ * descripciones. Solo cuentan si el texto no trae ningún verbo (en
+ * description, siempre: allí no cuentan verbos).
  */
 export const NOUN_CUES_V1: Readonly<Record<ActivityIntent, readonly string[]>> = Object.freeze({
-  recall: ['glosari', 'terminolog', 'vocabulari', 'nomenclatur'],
-  relate: ['tipos', 'tipolog', 'etapas', 'fases'],
-  apply: ['analisis', 'estrategi', 'caso', 'practica', 'resolucion', 'solucion'],
+  recall: ['glosario', 'terminologia', 'vocabulario', 'nomenclatura'],
+  relate: ['tipos', 'tipologia', 'tipologias', 'etapas', 'fases', 'clasificacion', 'comparacion', 'diferencias'],
+  apply: [
+    'analisis', 'estrategia', 'estrategias', 'caso', 'casos', 'diseno', 'planificacion', 'diagnostico', 'negociacion',
+    'resolucion', 'solucion', 'soluciones', 'gestion', 'calculo', 'calculos', 'prevencion',
+  ],
   reflect: ['etica'],
-  understand: ['concepto', 'fundamento', 'introduccion', 'principio'],
+  understand: ['concepto', 'conceptos', 'fundamentos', 'introduccion', 'principios', 'nociones'],
 });
 
-/** Orden fijo de intenciones para resolver una palabra que calce con dos raíces (no ocurre con las listas v1). */
-const INTENT_ORDER: readonly ActivityIntent[] = ['recall', 'relate', 'apply', 'reflect', 'understand'];
+const INTENTS_BY_RANK: readonly ActivityIntent[] = (Object.keys(INTENT_RANK_V1) as ActivityIntent[])
+  .sort((a, b) => INTENT_RANK_V1[b] - INTENT_RANK_V1[a]);
+
+/** Raíces de un infinitivo: la base + variantes ortográficas del subjuntivo + irregulares. */
+export function verbRootsV1(infinitive: string): string[] {
+  const root = infinitive.slice(0, -2);
+  const roots = [root];
+  if (infinitive.endsWith('car')) roots.push(`${root.slice(0, -1)}qu`); // aplicar → apliqu-e
+  if (infinitive.endsWith('zar')) roots.push(`${root.slice(0, -1)}c`); // analizar → analic-e
+  if (infinitive.endsWith('guir')) roots.push(root.slice(0, -1)); // distinguir → disting-a
+  else if (infinitive.endsWith('ger') || infinitive.endsWith('gir')) roots.push(`${root.slice(0, -1)}j`); // elegir → elij-a
+  if (infinitive.endsWith('cer')) roots.push(`${root.slice(0, -1)}zc`); // conocer → conozc-a
+  if (infinitive.endsWith('uir')) roots.push(`${root}y`); // construir → construy-a
+  for (const r of IRREGULAR_ROOTS_V1[infinitive] ?? []) roots.push(r);
+  return roots;
+}
+
+/** forma verbal plegada → intención (se arma una vez; un choque entre intenciones es un bug de las listas). */
+const VERB_FORMS_V1: ReadonlyMap<string, ActivityIntent> = (() => {
+  const out = new Map<string, ActivityIntent>();
+  for (const intent of INTENTS_BY_RANK) {
+    for (const inf of VERBS_V1[intent]) {
+      for (const root of verbRootsV1(inf)) {
+        for (const end of VERB_ENDINGS_V1) {
+          const form = root + end;
+          if (NON_VERB_WORDS_V1.has(form)) continue;
+          const prev = out.get(form);
+          if (prev && prev !== intent) {
+            throw new Error(`ACTIVITY_TYPE_RULES_V1: la forma "${form}" calza con ${prev} y ${intent}`);
+          }
+          out.set(form, intent);
+        }
+      }
+    }
+  }
+  return out;
+})();
+
+/** Intención verbal de una palabra plegada (null si no es una forma verbal de las listas). */
+export function verbIntentOfWord(word: string): ActivityIntent | null {
+  return VERB_FORMS_V1.get(word) ?? null;
+}
+
+function nounIntentOfWord(word: string): ActivityIntent | null {
+  for (const intent of INTENTS_BY_RANK) if (NOUN_CUES_V1[intent].includes(word)) return intent;
+  return null;
+}
 
 /** Minúsculas, sin tildes/diéresis (ñ → n), palabras [a-z0-9]. */
 export function foldText(s: string): string[] {
@@ -107,39 +209,49 @@ export function foldText(s: string): string[] {
     .filter((w) => w.length > 0);
 }
 
-function verbIntentOf(word: string): ActivityIntent | null {
-  if (NON_VERB_WORDS_V1.has(word)) return null;
-  for (const intent of INTENT_ORDER) {
-    if (VERB_STEMS_V1[intent].some((stem) => word.startsWith(stem))) return intent;
-  }
-  return null;
+function highest(intents: ActivityIntent[]): ActivityIntent | null {
+  let best: ActivityIntent | null = null;
+  for (const i of intents) if (!best || INTENT_RANK_V1[i] > INTENT_RANK_V1[best]) best = i;
+  return best;
 }
 
-function nounIntentOf(word: string): ActivityIntent | null {
-  for (const intent of INTENT_ORDER) {
-    if (NOUN_CUES_V1[intent].some((c) => word.startsWith(c))) return intent;
-  }
-  return null;
-}
-
-/** Intención de un texto: primer verbo que clasifica; si no hay, primera pista de sustantivo. */
-export function classifyTextIntent(text: string | null | undefined): ActivityIntent | null {
+/**
+ * Intención de un texto: la de MAYOR nivel entre sus verbos; si no hay
+ * verbos, la de mayor nivel entre sus pistas de sustantivo.
+ * `nounsOnly` (description): solo pistas de sustantivo.
+ */
+export function classifyTextIntent(text: string | null | undefined, opts: { nounsOnly?: boolean } = {}): ActivityIntent | null {
   if (typeof text !== 'string' || !text.trim()) return null;
   const words = foldText(text);
-  for (const w of words) {
-    const v = verbIntentOf(w);
+  if (!opts.nounsOnly) {
+    const v = highest(words.map(verbIntentOfWord).filter((x): x is ActivityIntent => x !== null));
     if (v) return v;
   }
-  for (const w of words) {
-    const n = nounIntentOf(w);
-    if (n) return n;
-  }
-  return null;
+  return highest(words.map(nounIntentOfWord).filter((x): x is ActivityIntent => x !== null));
 }
 
-/** Intención del capítulo: objective → title → description (el primero que clasifique). */
+/** Intención del capítulo: objective → title → description (esta última solo con pistas de sustantivo). */
 export function classifyChapterIntent(ch: { objective?: string | null; title?: string | null; description?: string | null }): ActivityIntent | null {
-  return classifyTextIntent(ch.objective) ?? classifyTextIntent(ch.title) ?? classifyTextIntent(ch.description);
+  return classifyTextIntent(ch.objective) ?? classifyTextIntent(ch.title) ?? classifyTextIntent(ch.description, { nounsOnly: true });
+}
+
+/**
+ * sha256 de la serialización canónica de TODAS las listas de las reglas v1
+ * (orden fijo de claves; los arreglos en su orden declarado). El test lo fija:
+ * si cambia, no es rules 1 (ver el encabezado CONGELADO).
+ */
+export function activityTypeRulesV1ListsSha256(): string {
+  const intents: ActivityIntent[] = ['recall', 'relate', 'apply', 'reflect', 'understand'];
+  const canonical = {
+    intentToType: intents.map((i) => [i, INTENT_TO_TYPE_V1[i]]),
+    intentRank: intents.map((i) => [i, INTENT_RANK_V1[i]]),
+    verbs: intents.map((i) => [i, [...VERBS_V1[i]]]),
+    irregularRoots: Object.keys(IRREGULAR_ROOTS_V1).sort().map((k) => [k, [...IRREGULAR_ROOTS_V1[k]]]),
+    verbEndings: [...VERB_ENDINGS_V1],
+    nonVerbWords: [...NON_VERB_WORDS_V1].sort(),
+    nounCues: intents.map((i) => [i, [...NOUN_CUES_V1[i]]]),
+  };
+  return createHash('sha256').update(JSON.stringify(canonical), 'utf8').digest('hex');
 }
 
 export interface ActivityTypeDecision {
@@ -160,6 +272,18 @@ export function minQuestionsetsFor(n: number): number {
  * Reglas v1 sobre un Blueprint v2: tipo de cada capítulo con actividad h5p
  * (activityEnabled y course.activityEngine = 'h5p'). Motor scorm → mapa vacío.
  * Resultado indexado por chapterId; independiente del orden de entrada.
+ *
+ * Balance (ruling): al menos max(1, floor(n/3)) questionset, sin tope. Si
+ * faltan, se promueven en orden de grupo fallback (sin clasificar) → relate →
+ * recall; dentro del grupo por fnv1a32(chapterId en minúsculas) ascendente
+ * (empate → chapterId). No depende del orden de módulos/capítulos.
+ *
+ * OJO (review, costo): el balance ACOPLA capítulos entre versiones del
+ * Blueprint. Cambiar el objetivo de un capítulo, agregar/quitar uno o
+ * prender/apagar una actividad puede cambiar cuántos questionset faltan y
+ * así voltear el tipo de OTRO capítulo que no se tocó; la invalidación lo ve
+ * como activity_type_changed y regenera esa actividad (costo LLM). Es
+ * intencional (el curso nunca queda sin questionset), no un bug.
  */
 export function chooseActivityTypesV1(snapshot: BlueprintSnapshotV2): Map<string, ActivityTypeDecision> {
   const out = new Map<string, ActivityTypeDecision>();
