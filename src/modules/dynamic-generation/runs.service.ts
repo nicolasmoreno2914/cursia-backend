@@ -1497,10 +1497,16 @@ export class RunsService {
       // se desbloquean) exige una aprobación ADMIN que cubra el incremental.
       if (!uploadPhaseRetry) {
         const isPaid = (r: { type: string }) => paidProviderOfItemType(r.type) !== null;
-        const newPaid = (r: { type: string; output_summary: Record<string, any> | null }, resubmit: boolean) =>
-          r.type !== 'video' || resubmit || !r.output_summary?.external?.videogenJobId;
+        // R16 fix M1: igual que un video con su job persistido, una presentación con su generationId de Gamma
+        // persistido solo se re-pollea (nunca reenvía sin resubmitProvider): no es trabajo pagado nuevo.
+        const newPaid = (r: { type: string; output_summary: Record<string, any> | null }, resubmit: boolean) => {
+          if (resubmit) return true;
+          if (r.type === 'video') return !r.output_summary?.external?.videogenJobId;
+          if (r.type === 'presentation') return !r.output_summary?.external?.gammaGenerationId;
+          return true;
+        };
         const paidItems = isPaid(preTarget)
-          ? (newPaid(preTarget, resubmitVideo) ? [preTarget] : [])
+          ? (newPaid(preTarget, resubmitVideo || resubmitProvider) ? [preTarget] : [])
           : preRows.filter((r) => r.status === 'blocked' && isPaid(r) && newPaid(r, false));
         await this.finopsPaidWorkGate({ courseId, ownerId, manifest, job, paidKeys: paidItems.map((r) => r.item_key), dryRun: !!auto });
       }
@@ -1610,7 +1616,8 @@ export class RunsService {
           );
         }
         this.logger.warn(`retryItem: resubmitProvider=true para "${itemKey}" (run ${job.id}) — error previo "${err}"; archivando la generación anterior`);
-        resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey'`;
+        // R16 fix M3: el reenvío empieza una espera nueva (tope de reloj de los timeouts gratuitos).
+        resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey' - 'gammaPollSince' - 'videoPollSince'`;
       }
       if (resubmitVideo) {
         if (target.type !== 'video') {
@@ -1628,7 +1635,8 @@ export class RunsService {
           `retryItem: resubmitVideo=true para item "${itemKey}" (run ${job.id}) — error previo "${err}"; ` +
             'archivando external/externalSubmitStartedAt en previousExternals y sometiendo un video nuevo',
         );
-        resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey'`;
+        // R16 fix M3: el reenvío empieza una espera nueva (tope de reloj de los timeouts gratuitos).
+        resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey' - 'gammaPollSince' - 'videoPollSince'`;
       }
 
       const previousErrorsExpr = `coalesce(output_summary, '{}'::jsonb) || jsonb_build_object(
