@@ -30,7 +30,7 @@ import {
   validateAssessmentProfile,
 } from '../course-profiles/course-profiles';
 import { formatDurationEs, formatDurationShortEs } from '../../package/audio';
-import { H5pActivityType, activityTypeForChapter } from './activity-type';
+import { H5pActivityType, resolveActivityType } from './activity-type';
 import { displayStructureTitle } from '../course-structure/structure-titles';
 
 export const COURSE_FACTS_VERSION = 1;
@@ -74,7 +74,11 @@ export interface ChapterFacts {
   activityEnabled: boolean;
   /** null si la actividad está OFF. */
   activityVariant: 'h5p' | 'scorm' | null;
-  /** Solo variant h5p (activityTypeForChapter(chapterId): estable ante reordenamientos). */
+  /**
+   * Solo variant h5p: resolveActivityType(item activity del Manifest) — `h5pType`
+   * congelado (EV5-C) o, en Manifests legacy, activityTypeForChapter(chapterId).
+   * El validador del .mbz lee este dato (nunca recalcula el hash).
+   */
   activityType: H5pActivityType | null;
   slideCount: number;
 }
@@ -175,6 +179,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
   }
 
   const itemKeys = new Set(manifest.items.map((i) => i.key));
+  const itemByKey = new Map(manifest.items.map((i) => [i.key, i]));
   const chapters: ChapterFacts[] = [];
   const modules: ModuleFacts[] = [];
   const knownChapterIds = new Set<string>();
@@ -199,7 +204,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
         videoEnabled: mc.videoEnabled,
         activityEnabled,
         activityVariant: variant,
-        activityType: variant === 'h5p' ? activityTypeForChapter(mc.chapterId) : null,
+        activityType: variant === 'h5p' ? resolveActivityType(itemByKey.get(`activity:${mc.chapterId}`)) : null,
         slideCount: posInt(artifacts.slideCountByChapter?.[mc.chapterId], `slideCount del capítulo ${mc.chapterNumber}`),
       });
     });

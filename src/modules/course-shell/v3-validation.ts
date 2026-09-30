@@ -17,7 +17,7 @@
 import { validateExperience, validatePedagogy } from '../visual-components';
 import { H5pInputError, VideoPlanError, planInteractionCheckpoints, validateVideoInteractionsDoc } from '../../package/h5p';
 import type { VideoCheckpoint } from '../../package/h5p';
-import { ShellValidationError, activityTypeForChapter, validateH5pActivityPayload } from './activity-type';
+import { H5pActivityType, ShellValidationError, activityTypeForChapter, validateH5pActivityPayload } from './activity-type';
 import { validateCourseIntroV3, validateModuleIntroV3 } from './intro-schemas';
 import { FINAL_EXAM_QUESTION_RANGE, validateExamGift } from './final-exam';
 
@@ -48,8 +48,13 @@ export interface V3ItemValidationContext {
   variant?: string | null;
   itemKey: string;
   chapterId?: string | null;
-  /** Numeración global del Manifest (informativo; el tipo h5p sale de chapterId). */
+  /** Numeración global del Manifest (informativo). */
   chapterNumber?: number | null;
+  /**
+   * EV5-C: tipo h5p esperado = resolveActivityType(item del Manifest congelado).
+   * Ausente → rotación por hash del chapterId (compatibilidad).
+   */
+  expectedActivityType?: H5pActivityType | null;
   /** module_intro: capítulos del módulo en orden del Manifest. */
   moduleChapterIds?: string[];
   /** video_interactions: video completado del capítulo. */
@@ -141,8 +146,9 @@ export function validateV3ItemArtifact(ctx: V3ItemValidationContext, text: strin
     }
     case 'activity': {
       if (!ctx.chapterId) throw new Error(`V3_VALIDATION_CONTEXT: activity ${ctx.itemKey} sin chapterId`);
-      const r = validateH5pActivityPayload(doc, { chapterId: ctx.chapterId, itemKey: ctx.itemKey });
-      return { ...r, summary: { activityType: activityTypeForChapter(ctx.chapterId) } };
+      const expectedType = ctx.expectedActivityType ?? activityTypeForChapter(ctx.chapterId);
+      const r = validateH5pActivityPayload(doc, { chapterId: ctx.chapterId, itemKey: ctx.itemKey, expectedType });
+      return { ...r, summary: { activityType: expectedType } };
     }
     default:
       throw new Error(`V3_VALIDATION_CONTEXT: tipo ${ctx.type} sin validador`);

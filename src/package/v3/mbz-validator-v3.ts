@@ -30,7 +30,6 @@ import type { HtmlNode } from '../../modules/visual-components';
 import { CourseFacts, lintShellNumbers } from '../../modules/course-shell';
 import { formatDurationEs, mp3DurationSeconds } from '../audio';
 import { CURSIA_H5P_PROFILE_V1, H5P_MOODLE_GRADING } from '../h5p';
-import { activityTypeForChapter } from '../../modules/course-shell/activity-type';
 
 const ACTIVITY_MAIN_LIBRARY: Record<string, string> = {
   questionset: 'H5P.QuestionSet',
@@ -449,15 +448,18 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       if (extra.length) add('H5P_LIBRARIES', a.idnumber, `el paquete no es content-only: ${extra.slice(0, 3).join(', ')}`);
       const hj = JSON.parse(await hz.file('h5p.json')!.async('string'));
       if (!mainKeys.has(hj.mainLibrary)) add('H5P_LIBRARIES', a.idnumber, `librería principal fuera del perfil: ${hj.mainLibrary}`);
-      // G6 M7: la librería principal debe corresponder al rol (video → IV; actividad → tipo R-012 del UUID, calificable en Moodle).
+      // G6 M7: la librería principal debe corresponder al rol (video → IV; actividad → tipo de facts: h5pType del Manifest o, legacy, R-012 del UUID; calificable en Moodle).
       const role = /^cv3:ch:([^:]+):(video|activity)$/.exec(a.idnumber);
       if (role && role[2] === 'video' && hj.mainLibrary !== 'H5P.InteractiveVideo') {
         add('H5P_LIBRARIES', a.idnumber, `un video debe ser H5P.InteractiveVideo (vino ${hj.mainLibrary})`);
       }
       if (role && role[2] === 'activity') {
-        const want = ACTIVITY_MAIN_LIBRARY[activityTypeForChapter(role[1])];
+        // EV5-C: el tipo esperado sale de facts (resolveActivityType del Manifest), nunca del hash directo.
+        const factType = chapterById.get(role[1])?.activityType ?? null;
+        const want = factType ? ACTIVITY_MAIN_LIBRARY[factType] : undefined;
+        if (!want) add('H5P_LIBRARIES', a.idnumber, `facts no declara un tipo h5p para la actividad del capítulo ${role[1]}`);
         if (!H5P_MOODLE_GRADING[hj.mainLibrary]?.gradable) add('H5P_LIBRARIES', a.idnumber, `${hj.mainLibrary} no es calificable en Moodle (R-011)`);
-        if (hj.mainLibrary !== want) add('H5P_LIBRARIES', a.idnumber, `la actividad del capítulo debe ser ${want} (R-012), vino ${hj.mainLibrary}`);
+        if (want && hj.mainLibrary !== want) add('H5P_LIBRARIES', a.idnumber, `la actividad del capítulo debe ser ${want} (R-012), vino ${hj.mainLibrary}`);
       }
       for (const d of hj.preloadedDependencies ?? []) {
         const k = `${d.machineName} ${d.majorVersion}.${d.minorVersion}`;

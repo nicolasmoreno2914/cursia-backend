@@ -48,10 +48,12 @@ import { latestGenerationPredicate } from './item-generations';
 import { artifactOutputIdentity } from '../invalidation/invalidation-apply';
 import {
   FINAL_EXAM_QUESTION_RANGE,
+  ActivityTypeSource,
   H5pActivityType,
   V3_PAYLOAD_INVALID,
   VideoClaimFacts,
-  activityTypeForChapter,
+  resolveActivityType,
+  resolveActivityTypeWithSource,
   v3ValidatedArtifactType,
   v3ValidationErrorMessage,
   validateV3ItemArtifact,
@@ -213,6 +215,12 @@ export interface ClaimPayloadV3 {
   /** Artifact cuyo contenido valida el servidor al completar (null = solo roles). */
   validatedArtifactType: string | null;
   activityType?: H5pActivityType;
+  /**
+   * EV5-C: 'manifest' = `activityType` congelado en el Manifest (h5pType,
+   * reglas por objetivo): el ejecutor debe confiar en él. 'rotation' = hash del
+   * UUID de siempre (Manifest legacy): el ejecutor conserva su chequeo local.
+   */
+  activityTypeSource?: ActivityTypeSource;
   video?: VideoClaimFacts;
   finalExam?: { minQuestions: number; maxQuestions: number };
   moduleChapterIds?: string[];
@@ -953,6 +961,10 @@ export class SchedulerService {
       chapterNumber: mItem.chapterNumber ?? null,
       promptVersion,
     };
+    if (g.type === 'activity') {
+      // EV5-C: tipo esperado del Manifest congelado del run (h5pType o, legacy, hash).
+      ctx.expectedActivityType = resolveActivityType({ ...mItem, chapterId: g.chapter_id ?? mItem.chapterId ?? null });
+    }
     if (g.type === 'module_intro') {
       const mod = (manifest.modules ?? []).find((m: any) => m.moduleId === g.module_id);
       ctx.moduleChapterIds = mod ? mod.chapters.map((c: any) => c.chapterId) : [];
@@ -1053,7 +1065,13 @@ export class SchedulerService {
       const mod = manifest.modules.find((m) => m.moduleId === row.module_id);
       out.moduleChapterIds = mod ? mod.chapters.map((c) => c.chapterId) : [];
     }
-    if (row.type === 'activity' && mItem.variant === 'h5p') out.activityType = activityTypeForChapter(row.chapter_id);
+    if (row.type === 'activity' && mItem.variant === 'h5p') {
+      const r = resolveActivityTypeWithSource({ ...mItem, chapterId: row.chapter_id });
+      if (r) {
+        out.activityType = r.type;
+        out.activityTypeSource = r.source;
+      }
+    }
     if (row.type === 'video_interactions') {
       const vf = await this.loadVideoFacts(qr, row.job_id, row.manifest_id, `video:${row.chapter_id}`);
       if (vf.ok === false) throw new ClaimPayloadUnavailable(vf.code, vf.message);
