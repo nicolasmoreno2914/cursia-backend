@@ -92,30 +92,33 @@ export const VC_ARROW_CHAIN_MIN = 2;
 /**
  * Encabezado de paso que codifica una rama (texto normalizado: minúsculas, sin acentos, sin comillas
  * ni numeración inicial «2 », «3. », «4) »). Dos fuerzas (fix round 2):
- *  - FUERTE (marca solo): «Sí» / «No» solos (o con punto); «Sí» / «No» + flecha o «:» / «-» / «–» / «—»
- *    + espacio; «Si no…», «En caso contrario…», «De lo contrario…»; una condición corta que termina en
- *    flecha o dos puntos: «Si responde → …», «Si respira: …».
- *  - DÉBIL: «Sí,» «No,» «Sí;» «No;» «Sí (» «No (». Es también una advertencia o confirmación normal
- *    («No, nunca la muevas», «Sí, siempre»): cuenta SOLO si la misma secuencia tiene otro encabezado
- *    de la polaridad opuesta, o si sigue inmediatamente a una pregunta «¿…?».
+ *  - FUERTE (marca solo): «Sí» / «No» solos (o con punto); «Sí» / «No» + flecha; «Si no…», «En caso
+ *    contrario…», «De lo contrario…»; una condición corta que termina en flecha: «Si responde → …».
+ *  - DÉBIL (fix round 3): «Sí» / «No» + «,» «;» «(» o «:» / «-» / «–» / «—» + espacio, y una condición
+ *    corta con dos puntos («Si respira: …»). También son advertencias o confirmaciones normales
+ *    («No, nunca la muevas», «Sí - revisa el manómetro cada hora», «No: pero primero verifica»): cuentan
+ *    SOLO si la misma secuencia tiene otro encabezado de la polaridad opuesta, o si siguen
+ *    inmediatamente a una pregunta «¿…?».
  * No coinciden: «Sistema…», «Nota: …», «No-conformidad», «No olvides…» (imperativo normal),
  * «Si el equipo vibra, detén la línea» (paso con condición, sin flecha ni dos puntos).
  */
 const WORD_END = '(?![\\p{L}\\p{N}_])';
+/** Condición corta: 1–4 palabras sin puntuación de corte. */
+const SHORT_CLAUSE = '[^\\s,;:→]+(?:\\s+[^\\s,;:→]+){0,3}';
 const STRONG_HEAD_RE = new RegExp(
   '^(?:' +
     [
       '(?:si|no)[.!]?$',
-      '(?:si|no)\\s*(?:→|->|⇒|[:\\-–—](?=\\s|$))',
+      '(?:si|no)\\s*(?:→|->|⇒)',
       `si\\s+no${WORD_END}`,
       `en\\s+caso\\s+contrario${WORD_END}`,
       `de\\s+lo\\s+contrario${WORD_END}`,
-      'si\\s+[^\\s,;:→]+(?:\\s+[^\\s,;:→]+){0,3}\\s*(?:→|->|⇒|:)',
+      `si\\s+${SHORT_CLAUSE}\\s*(?:→|->|⇒)`,
     ].join('|') +
     ')',
   'u',
 );
-const WEAK_HEAD_RE = /^(?:si|no)\s*[,;(]/u;
+const WEAK_HEAD_RE = new RegExp(`^(?:(?:si|no)\\s*(?:[,;(]|[:\\-–—](?=\\s|$))|si\\s+${SHORT_CLAUSE}\\s*:)`, 'u');
 /** Polaridad de la rama: «no» para «No…», «Si no…», «En caso contrario…», «De lo contrario…». */
 const NEGATIVE_HEAD_RE = new RegExp(`^(?:no${WORD_END}|si\\s+no${WORD_END}|en\\s+caso\\s+contrario|de\\s+lo\\s+contrario)`, 'u');
 

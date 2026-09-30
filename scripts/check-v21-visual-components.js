@@ -68,9 +68,9 @@ const components = F.loadComponents();
 const LEVELS = [undefined, 'enhanced'];
 
 // Fix round 1 (I1): mismos vectores en el harness del frontend (test-45-v3-items.mjs).
-// Fix round 2: FUERTES marcan solos; DÉBILES («Sí,» «No;» «Sí (») solo en pareja de polaridad opuesta o tras «¿…?».
-const VC_BRANCH_POSITIVES = ['Sí', 'No', 'No.', 'Si responde → consciente', 'Si respira: posición lateral', '2 Sí → Consciente', '3. No → Inconsciente', '«Sí» → x', '"No": detén la máquina', 'Si no hay pulso, inicia RCP', 'No: pero primero verifica'];
-const VC_BRANCH_WEAK = ['Sí, está consciente', 'No, llama al 123', 'No; espera la señal', 'Sí (consciente)', 'No, nunca la muevas', 'Sí, siempre', 'No, no uses agua en un incendio eléctrico', 'Sí; continúa con el protocolo', 'Si, siempre usa casco', 'Sí, aplica presión constante', 'No, jamás dejes la máquina encendida'];
+// Fix round 3: «Sí/No» + «:» o guion y «Si X:» también son DÉBILES. Fix round 2: FUERTES marcan solos; DÉBILES («Sí,» «No;» «Sí (») solo en pareja de polaridad opuesta o tras «¿…?».
+const VC_BRANCH_POSITIVES = ['Sí', 'No', 'No.', 'Si responde → consciente', '2 Sí → Consciente', '3. No → Inconsciente', '«Sí» → x', 'Si no hay pulso, inicia RCP', 'No -> detén la máquina'];
+const VC_BRANCH_WEAK = ['Sí, está consciente', 'No, llama al 123', 'No; espera la señal', 'Sí (consciente)', 'No, nunca la muevas', 'Sí, siempre', 'No, no uses agua en un incendio eléctrico', 'Sí; continúa con el protocolo', 'Si, siempre usa casco', 'Sí, aplica presión constante', 'No, jamás dejes la máquina encendida', 'Si respira: posición lateral', '"No": detén la máquina', 'No: pero primero verifica', 'No - pero antes verifica el nivel de aceite', 'Sí - revisa el manómetro cada hora', 'Sí – está consciente', 'No: llama al 123', 'Sí: llama al supervisor', 'No - espera la señal', 'No — detén la línea'];
 /** Secuencias realistas: [encabezados, índices esperados]. */
 const VC_BRANCH_SEQ_CASES = [
   // una advertencia DÉBIL sola dentro de un procedimiento normal: nada
@@ -86,6 +86,11 @@ const VC_BRANCH_SEQ_CASES = [
   [['¿Responde?', 'Sí, está consciente', 'Colócala de lado'], [1]],
   // FUERTE solo
   [['Evalúa', 'Sí → Consciente', 'Actúa'], [1]],
+  [['Revisa el nivel', 'No - pero antes verifica el nivel de aceite', 'Arranca el motor', 'Registra la lectura'], []],
+  [['Enciende el equipo', 'Sí - revisa el manómetro cada hora', 'Anota la presión', 'Apaga al final'], []],
+  [['Prepara la herramienta', 'No: pero primero verifica', 'Ajusta la válvula', 'Prueba la línea', 'Cierra el permiso'], []],
+  [['Evalúa la respuesta', 'Sí – está consciente', 'No: llama al 123', 'Vigila la respiración'], [1, 2]],
+  [['Evalúa', 'Si respira: posición lateral', 'Si no respira: inicia RCP'], [1, 2]],
 ];
 const VC_BRANCH_SEQUENCES = VC_BRANCH_SEQ_CASES.map(([h]) => h);
 const VC_BRANCH_NEGATIVES = ['Sistema de bloqueo', 'Silencio operativo', 'Nota: revisa el tablero', 'No-conformidades del lote', 'Normas vigentes', 'Si el equipo vibra, detén la línea', 'Señales de alerta', 'No olvides el casco', 'No toques el tablero energizado', 'No uses agua en un fuego eléctrico', 'Nunca trabajes solo', 'Si bien es simple, requiere práctica', 'Sin tensión: verifica'];
@@ -337,7 +342,7 @@ check('EV6: validateSimulatedDiagrams — DIAGRAM_BRANCHING_IN_SEQUENCE y TEXT_S
   const fc = codesAt(doc(flat));
   assert(fc.includes('DIAGRAM_BRANCHING_IN_SEQUENCE $.movements.deepening[1].nodes[1].label') && fc.includes('DIAGRAM_BRANCHING_IN_SEQUENCE $.movements.deepening[1].nodes[2].label'), 'flujo aplanado: ' + JSON.stringify(fc));
   for (const [type, list, field] of [['process_steps', 'steps', 'heading'], ['timeline', 'events', 'heading']]) {
-    for (const head of ['Sí: llama al supervisor', 'No - espera la señal', 'Si no responde, pide ayuda', 'En caso contrario, detén la máquina', 'SÍ → sigue', 'no: detén']) {
+    for (const head of ['Si no responde, pide ayuda', 'En caso contrario, detén la máquina', 'SÍ → sigue', 'No -> detén', 'Si responde → sigue']) {
       const items = [0, 1, 2].map((i) => Object.assign({ heading: i === 1 ? head : 'Paso normal ' + 'abc'[i], body: 'Detalle del paso.' }, type === 'timeline' ? { marker: 'Etapa' } : {}));
       const c = { type, [list]: items };
       assert(codesAt(doc(c)).includes(`DIAGRAM_BRANCHING_IN_SEQUENCE $.movements.deepening[1].${list}[1].${field}`), `${type} "${head}": ${JSON.stringify(codesAt(doc(c)))}`);
@@ -374,6 +379,9 @@ check('EV6: validateSimulatedDiagrams — DIAGRAM_BRANCHING_IN_SEQUENCE y TEXT_S
   const paired = { type: 'diagram', kind: 'flow', title: 'Valoración', nodes: ['Evalúa la respuesta', 'Sí, está consciente', 'No, llama al 123', 'Vigila la respiración'].map((label) => ({ label })) };
   const pc = codesAt(doc(paired));
   assert(pc.length === 2 && pc.includes('DIAGRAM_BRANCHING_IN_SEQUENCE $.movements.deepening[1].nodes[1].label') && pc.includes('DIAGRAM_BRANCHING_IN_SEQUENCE $.movements.deepening[1].nodes[2].label'), 'pareja «Sí, …» + «No, …»: ' + JSON.stringify(pc));
+  // Fix round 3: pareja con guion y dos puntos («Sí – …» / «No: …») en un flujo
+  const paired3 = { type: 'diagram', kind: 'flow', title: 'Valoración', nodes: ['Evalúa la respuesta', 'Sí – está consciente', 'No: llama al 123', 'Vigila la respiración'].map((label) => ({ label })) };
+  assert(JSON.stringify(codesAt(doc(paired3))) === JSON.stringify([1, 2].map((j) => `DIAGRAM_BRANCHING_IN_SEQUENCE $.movements.deepening[1].nodes[${j}].label`)), 'pareja «Sí – …» + «No: …»: ' + JSON.stringify(codesAt(doc(paired3))));
   for (const head of VC_BRANCH_NEGATIVES) {
     const c = { type: 'process_steps', steps: [{ heading: head, body: 'Detalle.' }, { heading: 'Otro paso', body: 'Detalle.' }, { heading: 'Cierre', body: 'Detalle.' }] };
     assert(codesAt(doc(c)).length === 0, `falso positivo "${head}": ${JSON.stringify(codesAt(doc(c)))}`);
