@@ -410,7 +410,8 @@ function summarizeEvents(ev) {
 
 /** Tope por reserva conciliada como cobrada (una llamada TTS/LLM ambigua cuesta centavos). */
 const RECONCILE_CHARGED_MAX_USD = 0.5;
-const TERMINAL_JOB_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+// EV6 DoD (fix round 1, M1): `preview` también es un run terminado (puede tener gasto real de Gamma/TTS).
+const TERMINAL_JOB_STATUSES = new Set(['completed', 'preview', 'failed', 'cancelled']);
 
 /**
  * R14 (pura): reservas SIN liquidar del curso que se pueden conciliar como cobradas. Solo las de

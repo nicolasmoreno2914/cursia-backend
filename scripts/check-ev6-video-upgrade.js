@@ -89,12 +89,15 @@ const OWNER = '11111111-2222-4333-8444-555555555555';
 const OTHER = '22222222-3333-4444-8555-666666666666';
 const CONTEXT = { nombre: 'Curso EV6 B2', sector: 'Salud', pais: 'Chile', contexto: 'x', nivel: 'Básico', tono: 'Formal' };
 const MOCK_CTX = { ...CONTEXT, videoMode: 'mock', providerModes: { presentation: 'mock', audio: 'mock' } };
+// EV6 DoD (BE-A): previewCourse congela Gamma/TTS como REALES (fixture comercial fuera de los videos); una pestaña
+// vieja que reanuda manda el mismo cuerpo que congeló el run: video de vista previa + proveedores reales.
+const RESUME_CTX = { ...CONTEXT, videoMode: 'mock', providerModes: { presentation: 'real', audio: 'real' } };
 const ADMIN = { id: OWNER, email: 'Admin@Cursia.test' };
 const NOT_ADMIN = { id: OWNER, email: 'owner@cursia.test' };
 const ENV_KEYS = [
   'DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_ALLOWED_OWNERS', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION',
   'DYNAMIC_VIDEO_DELIVERY', 'DYNAMIC_ALLOW_VIDEOGEN_DIRECT', 'VIDEOGEN_API_KEY', 'ALLOW_UNOWNED_COURSES',
-  'DYNAMIC_PROVIDER_WORKER_ENABLED', 'DYNAMIC_ALLOW_PROVIDER_MOCK', 'SUPER_ADMIN_EMAILS',
+  'DYNAMIC_PROVIDER_WORKER_ENABLED', 'DYNAMIC_ALLOW_PROVIDER_MOCK', 'SUPER_ADMIN_EMAILS', 'DYNAMIC_ALLOW_VIDEO_PREVIEW',
 ];
 
 (async () => {
@@ -177,6 +180,8 @@ const ENV_KEYS = [
     process.env.DYNAMIC_PROVIDER_WORKER_ENABLED = 'true';
     process.env.DYNAMIC_ALLOW_PROVIDER_MOCK = 'true';
     process.env.SUPER_ADMIN_EMAILS = 'admin@cursia.test';
+    // EV6 DoD (BE-A): los runs de vista previa de este check nacen por el camino QA (escape explícito).
+    process.env.DYNAMIC_ALLOW_VIDEO_PREVIEW = 'true';
 
     ds = new DataSource({ type: 'postgres', host: '127.0.0.1', port, username: 'postgres', database: DB, entities: [], synchronize: false });
     await ds.initialize();
@@ -230,6 +235,13 @@ const ENV_KEYS = [
       const runId = res.run.id;
       // Vista previa completada: todas las partes listas; los videos con el publicador simulado (mode mock).
       await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() where job_id = $1`, [runId]);
+      // EV6 DoD (BE-A): este check prueba los VIDEOS. El resto del curso es el de un run comercial: Gamma/TTS
+      // congelados reales (se crean por el camino QA para no gastar; nada los re-ejecuta) y los tipos v3 que el
+      // servidor valida llevan su v3Validation. Así, tras el upgrade, el run queda `completed` solo por sus videos.
+      await ds.query(`update public.production_jobs set input_payload = input_payload || '{"providerModes":{"presentation":"real","audio":"real"}}'::jsonb where id = $1`, [runId]);
+      await ds.query(`update public.generation_item_runs set output_summary = output_summary || $2::jsonb
+                       where job_id = $1 and type in ('course_intro', 'module_intro', 'experience', 'video_interactions', 'activity', 'exam', 'final_exam')`,
+        [runId, JSON.stringify({ v3Validation: { artifactType: 'fixture', artifactId: crypto.randomUUID(), contentSha256: 'x'.repeat(64) } })]);
       for (const c of [c1, c2]) {
         await ds.query(`update public.generation_item_runs set output_summary = output_summary || $2::jsonb where job_id = $1 and item_key = $3`,
           [runId, JSON.stringify({ mode: 'mock', delivery: 'completed', youtubeVideoId: 'MockMockM' + c.slice(0, 2), external: { durationSec: 468 } }), `video:${c}`]);
@@ -255,7 +267,8 @@ const ENV_KEYS = [
       assert(dec(pvA.approval.amount) >= dec(pvA.estimate.expected), 'monto cubre el esperado');
       assert(/^[0-9a-f]{64}$/.test(pvA.estimateHash), 'huella');
       eq(await counts(A.cid), before, 'sin escrituras');
-      eq((await runs.previewVideoUpgrade(A.cid, NOT_ADMIN, 1, A.runId)).approval.canApprove, false, 'sin rol no aprueba (ve el estimado)');
+      // EV6 DoD (BE-A, R5): «Generar videos reales» es herramienta de admin → la vista previa también es 403 a un no admin.
+      await rejectsRe(runs.previewVideoUpgrade(A.cid, NOT_ADMIN, 1, A.runId), /admin_recovery_only/, 'sin rol no ve el estimado', 403);
     });
 
     await check('confirmación sin rol de administrador → 403 approval_forbidden; nada escrito', async () => {
@@ -427,7 +440,7 @@ const ENV_KEYS = [
         async completeItem(id, _e, payload) {
           st.completed.push({ id, payload });
           await patchSummary(id, payload.summary || {});
-          await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() where id = $1`, [id]);
+          await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now(), output_summary = coalesce(output_summary, '{}'::jsonb) || '{"v3Validation":{"artifactType":"fixture"}}'::jsonb where id = $1`, [id]);
           return true;
         },
         async blockItemForBudget(id, _e, msg) { st.failed.push({ id, msg, blocked: true }); return true; },
@@ -496,12 +509,12 @@ const ENV_KEYS = [
     await check('flujo falso: interacciones listas (ejecutor del navegador) → run completed; el precheck del paquete pasa (videos reales publicados, sin pendientes)', async () => {
       for (const c of [A.c1, A.c2]) {
         const row = await latest(A.runId, `video_interactions:${c}`);
-        await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() where id = $1`, [row.id]);
+        await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now(), output_summary = coalesce(output_summary, '{}'::jsonb) || '{"v3Validation":{"artifactType":"fixture"}}'::jsonb where id = $1`, [row.id]);
       }
       await runs.tx((qr) => L('modules/dynamic-generation/item-transitions.js').recomputeRunStatus(qr, A.runId));
       const job = await jobOf(A.runId);
       eq(job.worker_status, 'completed', 'run completed');
-      await packaging.assertRunReady(job, { rulesVersion: 3, manifest: A.manifest.manifest ?? A.manifest });
+      await packaging.assertRunReady(job, { rulesVersion: 3, manifest: A.manifest.manifest ?? A.manifest }, { email: ADMIN.email });
       const pv = await runs.previewVideoUpgrade(A.cid, ADMIN, 1, A.runId);
       eq([pv.upgrade.id, pv.eligible], [upA.id, false], 'sigue el mismo upgrade; nada más que generar');
       const before = await counts(A.cid);
@@ -521,17 +534,17 @@ const ENV_KEYS = [
       const i2 = await latest(D.runId, `video_interactions:${D.c2}`);
       await ds.query(`update public.generation_item_runs set status = 'blocked' where id = $1`, [i2.id]);
       const i1 = await latest(D.runId, `video_interactions:${D.c1}`);
-      await ds.query(`update public.generation_item_runs set status = 'completed' where id = $1`, [i1.id]);
+      await ds.query(`update public.generation_item_runs set status = 'completed', output_summary = coalesce(output_summary, '{}'::jsonb) || '{"v3Validation":{"artifactType":"fixture"}}'::jsonb where id = $1`, [i1.id]);
       await runs.tx((qr) => L('modules/dynamic-generation/item-transitions.js').recomputeRunStatus(qr, D.runId));
       const job = await jobOf(D.runId);
       eq(job.worker_status, 'failed', 'run failed');
       eq(await VU.runIsUpgradeOnlyFailure(ds, job), true, 'fallo solo del upgrade');
-      await packaging.assertRunReady(job, { rulesVersion: 3, manifest: D.manifest.manifest ?? D.manifest });
+      await packaging.assertRunReady(job, { rulesVersion: 3, manifest: D.manifest.manifest ?? D.manifest }, { email: ADMIN.email });
       // Un fallo de OTRA parte (no del upgrade) sigue bloqueando el paquete.
       const content = await latest(D.runId, `content:${D.c1}`);
       await ds.query(`update public.generation_item_runs set status = 'failed' where id = $1`, [content.id]);
       eq(await VU.runIsUpgradeOnlyFailure(ds, job), false, 'fallo ajeno');
-      await rejectsRe(packaging.assertRunReady(job, { rulesVersion: 3, manifest: D.manifest.manifest ?? D.manifest }), /no está lista para empaquetar/, 'bloquea', 409);
+      await rejectsRe(packaging.assertRunReady(job, { rulesVersion: 3, manifest: D.manifest.manifest ?? D.manifest }, { email: ADMIN.email }), /no está lista para empaquetar/, 'bloquea', 409);
     });
 
     await check('puro: huella del upgrade estable (orden de items irrelevante) y sensible a generación / monto / gasto del run; isUpgradeOnlyFailure exige upgrade + run failed + solo items del upgrade terminados con generación completada previa', async () => {
@@ -559,7 +572,7 @@ const ENV_KEYS = [
       const pv = await runs.previewVideoUpgrade(Q2.cid, ADMIN, 1, Q2.runId);
       await runs.confirmVideoUpgrade(Q2.cid, ADMIN, 1, Q2.runId, pv.estimateHash);
       eq((await jobOf(Q2.runId)).worker_status, 'queued', 'upgrade en vuelo');
-      const res = await runs.startRun(Q2.cid, OWNER, 1, MOCK_CTX);
+      const res = await runs.startRun(Q2.cid, OWNER, 1, RESUME_CTX);
       eq([res.created, res.run.id, res.run.videoMode], [false, Q2.runId, 'real'], 'mismo run');
     });
 
@@ -577,17 +590,17 @@ const ENV_KEYS = [
       const v2 = await latest(C.runId, `video:${C.c2}`);
       await patchSummary(v2.id, { external: { videogenJobId: 'vg_cancelled_job', mode: 'real', batchId: 'b_x' }, mode: 'real' });
       chargesBeforeCancel = (await chargesOf(C.runId)).length;
-      await runs.cancelRun(C.cid, OWNER, 1, C.runId);
+      await runs.cancelRun(C.cid, OWNER, 1, C.runId, { email: ADMIN.email });
       const job = await jobOf(C.runId);
       eq(job.worker_status, 'cancelled', 'cancelado');
       eq(await VU.runIsUpgradeOnlyFailure(ds, job), true, 'solo partes del upgrade sin terminar');
-      await packaging.assertRunReady(job, { rulesVersion: 3, manifest: C.manifest.manifest ?? C.manifest });
+      await packaging.assertRunReady(job, { rulesVersion: 3, manifest: C.manifest.manifest ?? C.manifest }, { email: ADMIN.email });
       eq((await chargesOf(C.runId)).length, chargesBeforeCancel, 'cancelar no cobra ni libera nada');
     });
 
     await check('I-1 reanudar con el modo ORIGINAL (mock) tras cancelar → reabre SIN 409 y SIN volver a encolar el video pago cancelado (solo las preguntas del video que sí terminó)', async () => {
       const gensBefore = (await counts(C.cid)).gens;
-      const res = await runs.startRun(C.cid, OWNER, 1, MOCK_CTX);
+      const res = await runs.startRun(C.cid, OWNER, 1, RESUME_CTX);
       eq([res.reopened, res.run.id], [true, C.runId], 'reabierto');
       eq((await counts(C.cid)).gens, gensBefore, 'sin generaciones nuevas');
       eq((await latest(C.runId, `video:${C.c2}`)).status, 'cancelled', 'el video pago cancelado NO se re-encola');
@@ -596,11 +609,11 @@ const ENV_KEYS = [
       eq((await chargesOf(C.runId)).length, chargesBeforeCancel, 'sin cargos nuevos');
       // Las preguntas del 1º terminan → el run queda failed SOLO por el upgrade cancelado → empaquetable.
       const i1 = await latest(C.runId, `video_interactions:${C.c1}`);
-      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() where id = $1`, [i1.id]);
+      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now(), output_summary = coalesce(output_summary, '{}'::jsonb) || '{"v3Validation":{"artifactType":"fixture"}}'::jsonb where id = $1`, [i1.id]);
       await runs.tx((qr) => L('modules/dynamic-generation/item-transitions.js').recomputeRunStatus(qr, C.runId));
       const job = await jobOf(C.runId);
       eq(job.worker_status, 'failed', 'failed solo por el upgrade');
-      await packaging.assertRunReady(job, { rulesVersion: 3, manifest: C.manifest.manifest ?? C.manifest });
+      await packaging.assertRunReady(job, { rulesVersion: 3, manifest: C.manifest.manifest ?? C.manifest }, { email: ADMIN.email });
     });
 
     let upC2 = null;
@@ -651,7 +664,7 @@ const ENV_KEYS = [
       await runs.confirmVideoUpgrade(X.cid, ADMIN, 1, X.runId, pv.estimateHash);
       await itemWorker.processItem(deps(dbScheduler(), fakeVideogen()), await claim(X.runId, `video:${X.c1}`, X.c1));
       const i1 = await latest(X.runId, `video_interactions:${X.c1}`);
-      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() where id = $1`, [i1.id]);
+      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now(), output_summary = coalesce(output_summary, '{}'::jsonb) || '{"v3Validation":{"artifactType":"fixture"}}'::jsonb where id = $1`, [i1.id]);
       return X;
     }
 
@@ -696,7 +709,7 @@ const ENV_KEYS = [
       const pv = await runs.previewVideoUpgrade(X.cid, ADMIN, 1, X.runId);
       await runs.confirmVideoUpgrade(X.cid, ADMIN, 1, X.runId, pv.estimateHash);
       await itemWorker.processItem(deps(dbScheduler(), fakeVideogen()), await claim(X.runId, `video:${X.c1}`, X.c1));
-      await runs.cancelRun(X.cid, OWNER, 1, X.runId);
+      await runs.cancelRun(X.cid, OWNER, 1, X.runId, { email: ADMIN.email });
       const v1 = await latest(X.runId, `video:${X.c1}`);
       eq([v1.status, v1.output_summary.mode], ['completed', 'real'], 'video 1 real y pagado');
       const pv2 = await runs.previewVideoUpgrade(X.cid, ADMIN, 1, X.runId);
@@ -711,7 +724,7 @@ const ENV_KEYS = [
       await itemWorker.processItem(deps(dbScheduler(), fakeVideogen()), await claim(X.runId, `video:${X.c2}`, X.c2));
       for (const c of [X.c1, X.c2]) {
         const ir = await latest(X.runId, `video_interactions:${c}`);
-        await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() where id = $1`, [ir.id]);
+        await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now(), output_summary = coalesce(output_summary, '{}'::jsonb) || '{"v3Validation":{"artifactType":"fixture"}}'::jsonb where id = $1`, [ir.id]);
       }
       await recompute(X.runId);
       eq((await jobOf(X.runId)).worker_status, 'completed', 'run completed');
@@ -725,7 +738,7 @@ const ENV_KEYS = [
       const mf = { items: eff.map((r) => ({ key: r.item_key, type: r.type, chapterId: r.chapter_id })) };
       const split = PK.splitPendingVideosV3(mf, byItem, job.input_payload.videoMode, { videoUpgrade: true, upgradedKeys: VU.upgradedVideoKeysOf(job.input_payload), fallbackMode: VU.fallbackVideoModeOf(job.input_payload), runId: X.runId });
       eq(split.pendingVideos, [], 'el paquete incluye ambos videos reales con sus preguntas');
-      await packaging.assertRunReady(job, { rulesVersion: 3, manifest: X.manifest.manifest ?? X.manifest });
+      await packaging.assertRunReady(job, { rulesVersion: 3, manifest: X.manifest.manifest ?? X.manifest }, { email: ADMIN.email });
     });
 
     await check('fix round 2 (m-8): un video con envío AMBIGUO queda fuera (needsReconciliation) y el resto del 2º upgrade sigue', async () => {
@@ -748,7 +761,7 @@ const ENV_KEYS = [
       await itemWorker.processItem(deps(dbScheduler(), fakeVideogen()), await claim(X.runId, `video:${X.c1}`, X.c1));
       const v2 = await latest(X.runId, `video:${X.c2}`);
       await patchSummary(v2.id, { external: { videogenJobId: 'vg_published', mode: 'real', youtubeVideoId: 'PubVid12345', youtubeUrl: 'https://www.youtube.com/watch?v=PubVid12345' }, mode: 'real' });
-      await runs.cancelRun(X.cid, OWNER, 1, X.runId);
+      await runs.cancelRun(X.cid, OWNER, 1, X.runId, { email: ADMIN.email });
       const pv2 = await runs.previewVideoUpgrade(X.cid, ADMIN, 1, X.runId);
       eq(pv2.pendingVideos.map((p) => [p.itemKey, !!p.reusesVideogenJob]), [[`video:${X.c2}`, true]], 'reutiliza');
       await runs.confirmVideoUpgrade(X.cid, ADMIN, 1, X.runId, pv2.estimateHash);
@@ -781,7 +794,7 @@ const ENV_KEYS = [
       for (const c of [X.c1, X.c2]) {
         const ir = await latest(X.runId, `video_interactions:${c}`);
         eq(ir.output_summary.sourceVideoItemRunId, (await latest(X.runId, `video:${c}`)).id, 'el upgrade la registra al crearla');
-        await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() where id = $1`, [ir.id]);
+        await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now(), output_summary = coalesce(output_summary, '{}'::jsonb) || '{"v3Validation":{"artifactType":"fixture"}}'::jsonb where id = $1`, [ir.id]);
       }
       await recompute(X.runId);
       eq((await splitOf(X.runId)).pendingVideos, [], 'nada pendiente tras el upgrade');
@@ -793,7 +806,7 @@ const ENV_KEYS = [
       const v1 = await latest(X.runId, `video:${X.c1}`);
       const q3 = await latest(X.runId, `video_interactions:${X.c1}`);
       eq([q3.generation, q3.output_summary.sourceVideoItemRunId], [3, v1.id], 'el CLAIM registra la procedencia');
-      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now(), lease_until = null where id = $1`, [q3.id]);
+      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now(), lease_until = null, output_summary = coalesce(output_summary, '{}'::jsonb) || '{"v3Validation":{"artifactType":"fixture"}}'::jsonb where id = $1`, [q3.id]);
       await recompute(X.runId);
       eq((await jobOf(X.runId)).worker_status, 'completed', 'run completed');
       eq((await splitOf(X.runId)).pendingVideos, [], 'el paquete incluye el video real con las preguntas nuevas');

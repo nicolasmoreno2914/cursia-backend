@@ -255,7 +255,16 @@ export interface BuildDynamicMbzV3Input {
    * omiten del paquete; nunca se presenta un video simulado como real.
    */
   pendingVideoChapterIds?: readonly string[] | null;
+  /**
+   * EV6 DoD (BE-A): paquete de QA (run de vista previa o §2.6 degradado), NUNCA entregable. Aviso
+   * visible al inicio de la bienvenida y sufijo «[QA — vista previa, no entregable]» en el nombre
+   * del curso. Ausente/false → bytes idénticos a los de antes.
+   */
+  qaPreviewNotice?: boolean;
 }
+
+/** EV6 DoD: sufijo del nombre del curso de un paquete de QA. */
+export const QA_PREVIEW_COURSE_SUFFIX = ' [QA — vista previa, no entregable]';
 
 export interface MbzV3H5pPackage {
   itemKey: string;
@@ -1032,7 +1041,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     W.put(`${a.dir}/discussions.xml`, '<?xml version="1.0" encoding="UTF-8"?><discussions></discussions>');
     W.boilerplate(a.dir);
   }
-  addLabel(0, 'cv3:shell:welcome', welcomeLabel(facts, courseIntro, theme, opts));
+  addLabel(0, 'cv3:shell:welcome', welcomeLabel(facts, courseIntro, theme, opts, input.qaPreviewNotice === true));
   addLabel(0, 'cv3:shell:audio_welcome', audioWelcomeLabel(facts, theme, opts), [
     { name: SHELL_AUDIO_WELCOME_FILE, data: c.audioWelcome, mime: 'audio/mp3' },
   ]);
@@ -1306,7 +1315,12 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   }
 
   // ── Curso ────────────────────────────────────────────────────────────────
-  const courseTitle = safeActivityName(plan.course.title, 254);
+  // EV6 DoD: un paquete de QA lleva el sufijo «[QA — vista previa, no entregable]» (siempre entero).
+  // La insignia-certificado conserva el título del curso (no se emite desde un paquete QA a nadie).
+  const certificateTitle = safeActivityName(plan.course.title, 254);
+  const courseTitle = input.qaPreviewNotice === true
+    ? safeActivityName(plan.course.title, 254 - QA_PREVIEW_COURSE_SUFFIX.length) + QA_PREVIEW_COURSE_SUFFIX
+    : certificateTitle;
   W.put('course/course.xml', `<?xml version="1.0" encoding="UTF-8"?>
 <course id="${MBZ_V3_COURSE_BACKUP_ID}" contextid="${MBZ_V3_COURSE_BACKUP_CONTEXTID}">
   <shortname>${esc(courseTitle)}</shortname><fullname>${esc(courseTitle)}</fullname>
@@ -1364,7 +1378,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   // EV6 (T3): certificado = insignia de curso (criterio: completion del curso) + su imagen.
   if (hasCertificate) {
     W.put('badges.xml', courseBadgeXml({
-      courseTitle: courseTitle,
+      courseTitle: certificateTitle,
       courseBackupId: MBZ_V3_COURSE_BACKUP_ID,
       requirements: certificateReq,
       ts,

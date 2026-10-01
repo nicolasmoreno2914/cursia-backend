@@ -4,6 +4,7 @@ import { GenerationManifestsController } from '../generation-manifests/generatio
 import { RunsController } from '../dynamic-generation/runs.controller';
 import { ExecutorController } from '../dynamic-generation/executor.controller';
 import { DynamicYoutubeController } from '../dynamic-generation/dynamic-youtube.controller';
+import { AdminDynamicRunsController } from '../dynamic-generation/admin-runs.controller';
 import { PackagingController } from '../dynamic-packaging/packaging.controller';
 import { CoursesController } from '../courses/courses.controller';
 import { CoherenceController } from '../coherence/coherence.controller';
@@ -34,6 +35,7 @@ export const DYNAMIC_CONTROLLERS: ReadonlySet<Function> = new Set<Function>([
   DynamicYoutubeController, // DN-1: GET /dynamic/youtube/preflight
   CourseStructureSettingsController, // V2.1 R3: PATCH /courses/:id/structure-settings
   CourseProfilesController,          // V2.1 R3: /courses/:id/profiles/:kind
+  AdminDynamicRunsController,        // EV6 DoD BE-B: GET /admin/dynamic-runs/needs-attention (SUPER_ADMIN)
 ]);
 
 export const DYNAMIC_HANDLERS: ReadonlySet<Function> = new Set<Function>([

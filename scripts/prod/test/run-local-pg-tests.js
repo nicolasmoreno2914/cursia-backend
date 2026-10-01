@@ -457,7 +457,7 @@ async function main() {
         await withClient('schemafirst', (c) => c.query(`delete from production_jobs where execution_mode = 'dynamic_generation' and owner_id = 'u'`));
       }
     });
-    await test('M5/N1: el SQL de constraint del script de deploy.yml es el de main + SOLO dynamic_generation/dynamic_package (PG16, pg_get_constraintdef)', async () => {
+    await test('M5/N1: el SQL de constraint del script de deploy.yml es el de main + SOLO dynamic_generation/dynamic_package (execution_mode) y + SOLO preview (worker_status, EV6 DoD) (PG16, pg_get_constraintdef)', async () => {
       const m = run(MAIN_CONSTRAINTS_SCRIPT, [], localEnv('cmpmain'));
       const c = run(CONSTRAINTS_SCRIPT, [], localEnv('cmpcur'));
       assert(m.code === 0 && c.code === 0, m.out + c.out);
@@ -466,7 +466,9 @@ async function main() {
       assert(dm.length === 2 && dc.length === 2, JSON.stringify([dm, dc]));
       const stripped = dc[0].def.replace(", 'dynamic_generation'::text, 'dynamic_package'::text", '');
       assert(dc[0].def !== stripped && stripped === dm[0].def, `execution_mode\nmain ${dm[0].def}\ncur  ${dc[0].def}`);
-      assert(dc[1].def === dm[1].def, `worker_status\nmain ${dm[1].def}\ncur  ${dc[1].def}`);
+      // EV6 DoD (BE-A): worker_status agrega SOLO 'preview' (run terminado con componentes de vista previa).
+      const strippedWs = dc[1].def.replace(", 'preview'::text", '');
+      assert(dc[1].def !== strippedWs && strippedWs === dm[1].def, `worker_status\nmain ${dm[1].def}\ncur  ${dc[1].def}`);
     });
     await test('M5: el script de deploy.yml fija lock_timeout — con production_jobs bloqueada por otra sesión falla rápido (55P03) en vez de colgarse', async () => {
       const holder = new Client({ host: '127.0.0.1', port: PG_PORT, user: 'postgres', database: 'locktest' });

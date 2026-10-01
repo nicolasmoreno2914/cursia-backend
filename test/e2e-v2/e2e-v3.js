@@ -118,6 +118,9 @@ function baseEnv() {
     DYNAMIC_REAL_VIDEO_OWNERS: OWNER, DYNAMIC_V2_ALLOWED_OWNERS: OWNER,
     // rulesVersion 3: worker de proveedor desplegado + mocks de Gamma/TTS permitidos (escape de no-producción).
     DYNAMIC_PROVIDER_WORKER_ENABLED: 'true', DYNAMIC_ALLOW_PROVIDER_MOCK: 'true',
+    // EV6 DoD (BE-A): SOLO en este sandbox — escape de QA para video de vista previa y el owner de la
+    // prueba como SUPER_ADMIN (E1–E3 terminan `preview` por Gamma/TTS mock: su paquete es QA, rotulado).
+    DYNAMIC_ALLOW_VIDEO_PREVIEW: 'true', SUPER_ADMIN_EMAILS: 'e2e-v3-owner@example.com',
     // Config de producción del video: entrega YouTube (sin DYNAMIC_VIDEO_DELIVERY ni el escape videogen_direct).
     YOUTUBE_TOKEN_SECRET: YT_SECRET, YOUTUBE_CLIENT_ID: 'fake-client-id', YOUTUBE_CLIENT_SECRET: 'fake-client-secret',
     VIDEOGEN_API_URL: FAKES.videogenUrl, VIDEOGEN_API_KEY: VIDEOGEN_KEY,
@@ -217,10 +220,21 @@ async function artifactsOfRun(runId) {
 async function itemRuns(runId) {
   return q(`select id, item_key, type, status, worker_id, attempt_count, output_summary, chapter_id, module_id, error as error_message from public.generation_item_runs where job_id = $1 order by item_key`, [runId]);
 }
-async function waitRunTerminal(ctl, label, timeoutMs = 15 * 60 * 1000) {
+async function waitRunTerminal(ctl, label, timeoutMs = 15 * 60 * 1000, runId = null) {
   const t0 = Date.now();
+  let lastDb = 0;
   while (Date.now() - t0 < timeoutMs) {
-    if (['completed', 'failed', 'cancelled', 'fatal', 'stopped'].includes(ctl.state.status)) return ctl.state;
+    if (['completed', 'preview', 'failed', 'cancelled', 'fatal', 'stopped'].includes(ctl.state.status)) return ctl.state;
+    // EV6 DoD (BE-A): `preview` es terminal en el backend; un ejecutor del navegador anterior a la DoD no
+    // lo conoce y seguiría consultando → se lee el estado del run y se detiene al ejecutor (solo la prueba).
+    if (runId && Date.now() - lastDb > 2000) {
+      lastDb = Date.now();
+      const [r] = await q(`select worker_status from public.production_jobs where id = $1`, [runId]);
+      if (r && r.worker_status === 'preview') {
+        ctl.stop();
+        return { ...ctl.state, status: 'preview', stoppedByHarness: true };
+      }
+    }
     await sleep(500);
   }
   throw new Error(`${label}: el ejecutor no terminó en ${timeoutMs} ms (estado ${JSON.stringify(ctl.state)})`);
@@ -410,7 +424,7 @@ function reservationBookkeeping(ev) {
     await step('v3-0-arranque', async () => {
       app = await startApp();
       const f = await api('GET', '/features');
-      eq(f.data, { dynamicCourseStructure: true, realVideo: true, coherenceLlm: false, manifestRulesVersion: 3 }, 'GET /features → rulesVersion 3 activo');
+      eq(f.data, { dynamicCourseStructure: true, realVideo: true, coherenceLlm: false, manifestRulesVersion: 3, dodContract: true, superAdmin: true }, 'GET /features → rulesVersion 3 activo (+ contrato DoD; el owner del sandbox es SUPER_ADMIN)');
       S.front = newFront('v3');
       const tplIds = S.front.SCORM_V2_TEMPLATES.map((t) => t.id);
       S.templates = tplIds.filter((t) => S.front.scormV2ValidateRoomData(t, JSON.parse(JSON.stringify(S.front.SV2_PREVIEW_FIXTURES[t]))).ok);
@@ -488,10 +502,11 @@ function reservationBookkeeping(ev) {
         S.front.DYN_EXAM_BANK_MODE_ENABLED = C.examBank === true;
         const t0 = Date.now();
         const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
-        const stt = await waitRunTerminal(ctl, `${C.key} run`);
+        const stt = await waitRunTerminal(ctl, `${C.key} run`, undefined, c.runId);
         const items = await waitItemsDone(c.runId);
         results.timings[`${C.key}-run`] = Date.now() - t0;
-        ok(stt.status === 'completed' && stt.rulesVersion === 3, `${C.key}: ejecutor del navegador terminó (rulesVersion 3)`, stt);
+        // EV6 DoD: Gamma/TTS congelados en mock → el run termina `preview` (nunca `completed`).
+        ok(stt.status === 'preview' && stt.rulesVersion === 3, `${C.key}: ejecutor del navegador terminó (rulesVersion 3) con el run en vista previa`, stt);
         ok(stt.failed === 0 && !stt.fatalError, `${C.key}: ejecutor sin items fallidos`, stt);
         ok(llm.st.unknown.length === 0, `${C.key}: LLM falso sin prompts no reconocidos`, llm.st.unknown);
         const keys = c.manifest.manifest.items.map((i) => i.key).sort();
@@ -508,7 +523,12 @@ function reservationBookkeeping(ev) {
           ok(os.durationSec === 468 && os.durationSource === 'mp4_mvhd' && os.mp4Duration && os.mp4Duration.durationSource === 'mp4_mvhd', `${C.key}: video ${v.chapter_id.slice(0, 8)}: duración medida del mvhd del MP4 subido (468 s, mp4_mvhd)`, { d: os.durationSec, s: os.durationSource, m: os.mp4Duration });
         }
         const run = await api('GET', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs/${c.runId}`);
-        ok(run.data && run.data.status === 'completed', `${C.key}: GET run → completed`, run.data && run.data.status);
+        // EV6 DoD (BE-A): todos los items completados pero Gamma/TTS de vista previa → `preview`, nunca «Curso listo».
+        const cpl = run.data && run.data.completion;
+        ok(run.data && run.data.status === 'preview' && cpl && cpl.state === 'preview' && cpl.complete === false && cpl.generationComplete === false,
+          `${C.key}: GET run → preview (completion.state preview, complete false)`, run.data && { status: run.data.status, completion: cpl });
+        const provKeys = c.manifest.manifest.items.filter((i) => ['presentation', 'audio_welcome', 'audiobook_chapter'].includes(i.type)).map((i) => i.key).sort();
+        eq([...(cpl ? cpl.previewComponents : [])].sort(), provKeys, `${C.key}: componentes de vista previa = los ${provKeys.length} items de Gamma/TTS (los videos son reales)`);
         c.items = items;
         c.artifacts = await artifactsOfRun(c.runId);
         // P2-B6: exam/final_exam → banco (E1, E3) o GIFT (E2): exactamente un artifact del tipo esperado por item.
@@ -541,6 +561,20 @@ function reservationBookkeeping(ev) {
         const c = S[C.key];
         const P = await packageRun(C.key, c.courseId, c.n, c.runId);
         const os = P.job.output_summary || {};
+        // EV6 DoD (BE-A): run de vista previa → paquete de QA (SUPER_ADMIN + escape del sandbox), rotulado y NO entregable.
+        ok(os.packageKind === 'qa_preview' && os.deliverable === false && P.status.packageKind === 'qa_preview' && P.status.deliverable === false &&
+          P.status.complete === false && /^QA-VISTA-PREVIA-/.test(String(P.status.downloadFilename || '')),
+          `${C.key}: paquete QA (qa_preview, deliverable false, complete false, QA-VISTA-PREVIA-…)`, { kind: os.packageKind, st: P.status });
+        {
+          const zq = await JSZip.loadAsync(P.buf);
+          const courseXml = await zq.file('course/course.xml').async('string');
+          ok(/<fullname>[^<]*\[QA — vista previa, no entregable\]<\/fullname>/.test(courseXml), `${C.key}: el nombre del curso lleva «[QA — vista previa, no entregable]»`);
+          const lbls = await Promise.all(Object.keys(zq.files).filter((f) => /activities\/label_\d+\/label\.xml$/.test(f)).map((f) => zq.file(f).async('string')));
+          ok(lbls.some((x) => /QA — vista previa, no entregable/.test(x) && /no es el curso final/.test(x)), `${C.key}: aviso visible «QA — vista previa, no entregable» en la bienvenida`);
+        }
+        const runDto = await api('GET', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs/${c.runId}`);
+        ok(runDto.data && runDto.data.completion && runDto.data.completion.packageReady === false && runDto.data.completion.state === 'preview',
+          `${C.key}: con el paquete QA el run sigue en vista previa (packageReady false)`, runDto.data && runDto.data.completion);
         const TE = D('modules/theme-engine/index.js');
         const wantTheme = TE.themeSha256(TE.resolveTheme({ ...C.theme, themeVersion: 1 }));
         const BV = D('package/dynamic-mbz-builder-v3.js').DYNAMIC_MBZ_BUILDER_VERSION_V3;
@@ -741,7 +775,7 @@ function reservationBookkeeping(ev) {
       S.front.DYN_EXAM_BANK_MODE_ENABLED = false; // P2-B6: E4 cubre el camino GIFT (examen de módulo + final)
       const finalGift0 = { inv: llm.st.invalidSent.final_exam || 0, ret: llm.st.retriesSeen.final_exam || 0 };
       const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
-      const stt = await waitRunTerminal(ctl, 'E4 run');
+      const stt = await waitRunTerminal(ctl, 'E4 run', undefined, c.runId);
       const items = await waitItemsDone(c.runId);
       ok(stt.status === 'completed' && stt.failed === 0, 'E4: ejecutor del navegador terminó sin fallidos', stt);
       ok(items.length > 0 && items.every((i) => i.status === 'completed'), `E4: los ${items.length} items completed`, items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, i.error_message && i.error_message.slice(0, 300)]));
@@ -763,8 +797,29 @@ function reservationBookkeeping(ev) {
       eq(PFAKES.st.badAuth, [], 'E4: los fakes recibieron SU clave (0 rechazos)');
       const vid = items.find((i) => i.type === 'video');
       ok(vid && vid.output_summary.durationSource === 'mp4_mvhd' && vid.output_summary.durationSec === 468, 'E4: video con duración medida del mvhd (468 s)', vid && vid.output_summary);
+      // EV6 DoD (BE-A): camino real — todo real y validado → `completed`; sin paquete = «packaging»; con él = completo.
+      const runE4 = await api('GET', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs/${c.runId}`);
+      const c4 = runE4.data && runE4.data.completion;
+      // EV6 DoD (BE-B): al pasar a `completed` el servidor encola SOLO el paquete final (sin clic); según el
+      // ritmo del worker de empaquetado el run se lee `packaging` (armándose) o ya `complete`.
+      ok(runE4.data && runE4.data.status === 'completed' && c4 && ['packaging', 'complete'].includes(c4.state) && c4.generationComplete === true && c4.missingComponents.length === 0 && c4.previewComponents.length === 0,
+        'E4: run completed, completion = packaging/complete (generación completa; paquete automático)', runE4.data && { status: runE4.data.status, completion: c4 });
+      const autoJobs = await q(`select id, input_payload from public.production_jobs where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1 order by created_at`, [c.runId]);
+      ok(autoJobs.length === 1 && autoJobs[0].input_payload && autoJobs[0].input_payload.auto === true && !autoJobs[0].input_payload.packageKind,
+        'E4: el servidor encoló UN paquete final automático (input_payload.auto, sin packageKind)', autoJobs);
       const P = await packageRun('E4', c.courseId, c.n, c.runId);
+      ok(autoJobs[0] && P.job.id === autoJobs[0].id, 'E4: POST …/package (botón manual) reusa el job automático (idempotente, nunca un segundo build)', { auto: autoJobs[0] && autoJobs[0].id, manual: P.job.id });
       const os = P.job.output_summary || {};
+      ok(!os.packageKind && P.status.packageKind === 'final' && P.status.deliverable === true && P.status.complete === true && !/^QA-/.test(String(P.status.downloadFilename || '')),
+        'E4: paquete FINAL entregable (sin rótulo QA) y GET …/package complete:true', { kind: os.packageKind, st: P.status });
+      {
+        const z4 = await JSZip.loadAsync(P.buf);
+        const cx = await z4.file('course/course.xml').async('string');
+        ok(!/QA — vista previa/.test(cx), 'E4: el nombre del curso NO lleva el rótulo QA');
+      }
+      const runE4b = await api('GET', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs/${c.runId}`);
+      const c4b = runE4b.data && runE4b.data.completion;
+      ok(c4b && c4b.state === 'complete' && c4b.packageReady === true && c4b.complete === true, 'E4: con el paquete final el curso queda COMPLETO (completion.state complete)', c4b);
       eq((os.warnings || []).filter((w) => /mock/i.test(JSON.stringify(w))), [], 'E4: el empaque no usó ninguna fixture mock');
       ok(Array.isArray(os.mockPresentationChapters) ? os.mockPresentationChapters.length === 0 : true, 'E4: 0 capítulos con presentación mock', os.mockPresentationChapters);
       const z = await JSZip.loadAsync(P.buf);

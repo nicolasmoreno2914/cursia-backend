@@ -224,6 +224,102 @@ export function autoHealDecision(row: AutoHealRow, now: Date, policy: AutoHealPo
   return { heal: true, rule, round: rounds + 1 };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// EV6 DoD BE-B (reglas 3–4 del usuario) — reintento automático SEGURO de un rechazo DEFINITIVO.
+//
+// Un llamado a un proveedor pagado cuyo resultado es INCIERTO nunca se reenvía solo
+// (ambiguous_video_submission, provider_reconciliation_required, cualquier fallo después de que el
+// proveedor aceptó el trabajo — incluido `videogen_failed`: no está confirmado que un render fallido
+// no se cobre). Solo un fallo que el código PRUEBA como «no se creó nada / no se cobró nada» puede
+// reintentarse solo, UNA vez, dentro del presupuesto ya aprobado del run (el gate de FinOps en modo
+// simulación + el runtime guard del worker siguen delante; nunca se crea una aprobación nueva):
+//  - `videogen_submit_rejected`: batchCreate respondió 4xx (dynamic-item-worker.ts, rama
+//    isVideogenDefinitiveRejection): no hay job, la reserva se liberó ANTES de marcar el fallo. Se
+//    exige además que el 4xx no sea 408/409 (mismo criterio que isDefinitiveRejection de los
+//    proveedores: un timeout/conflicto del lado del proveedor no prueba que no se procesó) y que no
+//    haya ningún job de Videogen registrado. El reintento archiva el marcador del envío (mismo camino
+//    que resubmitVideo) — sin eso el próximo claim lo leería como envío ambiguo.
+//  - `gamma_submit_failed`: createGeneration respondió 4xx definitivo (real-providers.ts): la reserva
+//    se liberó y el marcador se limpió; sin generationId registrado. Reintento común (sin reenvío forzado).
+// TTS (`tts_failed`) NO entra: el mismo código cubre fallos después de trozos ya cobrados (re-pagaría).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface SafeAutoRetryRule {
+  code: string;
+  type: string;
+  match: RegExp;
+  /** El reintento debe archivar el marcador del envío (camino resubmitVideo). */
+  resubmitVideo: boolean;
+  requires: (os: Record<string, any>, error: string) => boolean;
+  why: string;
+}
+
+/** 4xx con respuesta, salvo 408/409 (igual que isDefinitiveRejection de real-providers.ts). */
+export function isProvenDefinitive4xx(error: string): boolean {
+  const m = /\(HTTP (4\d\d)\)/.exec(error);
+  if (!m) return false;
+  const status = Number(m[1]);
+  return status !== 408 && status !== 409;
+}
+
+export const SAFE_AUTO_RETRY_RULES: readonly SafeAutoRetryRule[] = Object.freeze([
+  {
+    code: 'videogen_submit_rejected',
+    type: 'video',
+    match: /^videogen_submit_rejected\b/,
+    resubmitVideo: true,
+    requires: (os, error) => !hasVideogenJob(os) && isProvenDefinitive4xx(error),
+    why: 'Videogen rechazó el envío (4xx) sin crear job; la reserva se liberó (sin gasto)',
+  },
+  {
+    code: 'gamma_submit_failed',
+    type: 'presentation',
+    match: /^gamma_submit_failed\b/,
+    resubmitVideo: false,
+    requires: (os) => !hasGammaId(os) && !os?.externalSubmitStartedAt,
+    why: 'Gamma rechazó el envío (4xx definitivo); la reserva se liberó y el marcador se limpió (sin gasto)',
+  },
+] as SafeAutoRetryRule[]);
+
+/** A lo sumo UN reintento automático por item (regla 4 del usuario). */
+export const SAFE_AUTO_RETRY_MAX_ROUNDS = 1;
+/** Espera desde el rechazo antes del reintento automático. */
+export const SAFE_AUTO_RETRY_BACKOFF_SECONDS = 120;
+/** Regex POSIX gruesa del barrido (la decisión fina es safeAutoRetryDecision). */
+export const SAFE_AUTO_RETRY_SQL_REGEX = '^(videogen_submit_rejected|gamma_submit_failed)';
+
+export function safeAutoRetryRoundsOf(outputSummary: Record<string, any> | null | undefined): number {
+  const n = Number(outputSummary?.safeAutoRetry?.rounds ?? 0);
+  return Number.isInteger(n) && n > 0 ? n : 0;
+}
+
+export type SafeAutoRetryDecision =
+  | { heal: true; rule: SafeAutoRetryRule; round: number }
+  | { heal: false; reason: AutoHealSkipReason | 'declined'; rule?: SafeAutoRetryRule; retryAt?: Date };
+
+/** Decisión pura del reintento automático seguro (una sola vez, solo rechazos probados sin gasto). */
+export function safeAutoRetryDecision(row: AutoHealRow, now: Date, policy: AutoHealPolicy = DEFAULT_AUTO_HEAL_POLICY): SafeAutoRetryDecision {
+  if (row.status !== 'failed') return { heal: false, reason: 'not_failed' };
+  const error = String(row.error ?? '').trim();
+  if (!error) return { heal: false, reason: 'no_error' };
+  const rule = SAFE_AUTO_RETRY_RULES.find((r) => r.match.test(error)) ?? null;
+  if (!rule || (row.type && row.type !== rule.type)) return { heal: false, reason: 'not_allow_listed' };
+  // La deny-list del auto-healer también gana acá (ambiguo, cuota, presupuesto, configuración…).
+  if (isAutoHealDenied(error)) return { heal: false, reason: 'denied', rule };
+  const os = (row.output_summary ?? {}) as Record<string, any>;
+  if (!rule.requires(os, error)) return { heal: false, reason: 'missing_precondition', rule };
+  if (os.safeAutoRetry?.declined) return { heal: false, reason: 'declined', rule };
+  const rounds = safeAutoRetryRoundsOf(os);
+  if (rounds >= SAFE_AUTO_RETRY_MAX_ROUNDS) return { heal: false, reason: 'cap_reached', rule };
+  const failedAt = toDate(row.finished_at) ?? toDate(row.updated_at);
+  if (failedAt && now.getTime() - failedAt.getTime() > policy.maxAgeHours * 3_600_000) return { heal: false, reason: 'too_old', rule };
+  if (failedAt) {
+    const retryAt = new Date(failedAt.getTime() + SAFE_AUTO_RETRY_BACKOFF_SECONDS * 1000);
+    if (now.getTime() < retryAt.getTime()) return { heal: false, reason: 'backoff', rule, retryAt };
+  }
+  return { heal: true, rule, round: rounds + 1 };
+}
+
 export function autoHealEnabled(env: Record<string, string | undefined> = process.env): boolean {
   if (!isDynamicCourseStructureEnabled(env)) return false;
   return String(env[AUTO_HEAL_ENABLED_ENV] ?? '').trim().toLowerCase() !== 'false';
@@ -263,6 +359,11 @@ export function startAutoHealTimer(
   runs: { autoHealFailedItems(): Promise<AutoHealSweepResult> },
   logger: TimerLogger,
   env: Record<string, string | undefined> = process.env,
+  /**
+   * EV6 DoD BE-B: barridos extra del MISMO tick (reintento automático seguro, empaque automático
+   * pendiente). Corren después del auto-healer, en serie; un error de uno no frena a los demás.
+   */
+  extraSweeps: ReadonlyArray<{ name: string; run: () => Promise<unknown> }> = [],
 ): NodeJS.Timeout | null {
   if (!autoHealEnabled(env)) {
     logger.log(`auto-healer de generación dinámica apagado (${AUTO_HEAL_ENABLED_ENV}=false o flag dinámico apagado)`);
@@ -276,6 +377,15 @@ export function startAutoHealTimer(
     runs
       .autoHealFailedItems()
       .catch((err) => logger.warn(`auto-healer: el barrido falló (${err instanceof Error ? err.message : String(err)}); se reintenta en el próximo tick`))
+      .then(async () => {
+        for (const x of extraSweeps) {
+          try {
+            await x.run();
+          } catch (err) {
+            logger.warn(`${x.name}: el barrido falló (${err instanceof Error ? err.message : String(err)}); se reintenta en el próximo tick`);
+          }
+        }
+      })
       .finally(() => {
         running = false;
       });

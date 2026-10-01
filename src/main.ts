@@ -9,6 +9,7 @@ import { ResponseInterceptor } from './common/interceptors/response.interceptor'
 import { warnIfNearMissDynamicFlag } from './modules/features/dynamic-features';
 import { RunsService } from './modules/dynamic-generation/runs.service';
 import { startAutoHealTimer } from './modules/dynamic-generation/auto-heal';
+import { AutoPackageService } from './modules/dynamic-packaging/auto-package.service';
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
@@ -60,7 +61,14 @@ async function bootstrap() {
 
   // R16 (#2): auto-healer de items dinámicos fallidos por errores transitorios. Solo en la API (los
   // workers cargan el mismo AppModule y no barren). Apagado con DYNAMIC_AUTO_HEAL_ENABLED=false.
-  startAutoHealTimer(app.get(RunsService), new Logger('DynamicAutoHeal'));
+  // EV6 DoD BE-B: el mismo tick corre el reintento automático SEGURO (rechazos definitivos sin gasto, una
+  // vez) y el barrido del empaque final automático (DYNAMIC_AUTO_PACKAGE_ENABLED=false lo apaga).
+  const runsService = app.get(RunsService);
+  const autoPackage = app.get(AutoPackageService);
+  startAutoHealTimer(runsService, new Logger('DynamicAutoHeal'), process.env, [
+    { name: 'reintento automático seguro', run: () => runsService.autoRetrySafeRejections() },
+    { name: 'empaque automático', run: () => autoPackage.sweep() },
+  ]);
 }
 
 bootstrap();

@@ -36,7 +36,7 @@ import {
   youtubeVideoVerifyMessage,
 } from './dynamic-video-delivery';
 import { DynamicYoutubePreflightService } from './dynamic-youtube';
-import { assertDynamicOwnerAllowed, assertRealVideoAllowed } from '../features/dynamic-features';
+import { assertDynamicOwnerAllowed, assertRealVideoAllowed, assertVideoPreviewAllowed } from '../features/dynamic-features';
 import { FromRunDto, isFromRunRequest } from '../invalidation/dto/from-run.dto';
 import { computePlanFromDb, executeApplyWrites, planApplyWrites } from '../invalidation/invalidation-apply';
 import { requiredArtifactTypesForPresent } from '../dynamic-packaging/artifact-resolver';
@@ -73,6 +73,9 @@ import {
   autoHealDecision,
   autoHealMaxRoundsFor,
   autoHealPolicyFromEnv,
+  SAFE_AUTO_RETRY_MAX_ROUNDS,
+  SAFE_AUTO_RETRY_SQL_REGEX,
+  safeAutoRetryDecision,
 } from './auto-heal';
 import { FinopsBudgetService, StartBudgetEvaluation } from '../finops/finops-budget.service';
 import {
@@ -121,12 +124,16 @@ import {
 } from './video-upgrade';
 import { estimateCategories, estimateFingerprint, planNormalApproval, NormalApprovalPlan } from '../finops/normal-approval';
 import { isSuperAdminEmail } from '../../auth/super-admin';
+import { RunCompletion, attachCarryChains, evaluateRunCompletion, loadValidationCutoffs } from './run-completion';
+import { hasDeliverablePackage } from '../dynamic-packaging/package-freshness';
+import { autoPackageEnabled, loadAutoPackageState } from '../dynamic-packaging/auto-package-state';
 import {
   ACTIVE_RUN_WORKER_STATUSES,
   isActiveRun,
   isCancelledLike,
   recomputeRunStatus,
   sweepRunExpiredLeases,
+  takeCompletedRunsInTx,
 } from './item-transitions';
 
 export type ItemRunStatus = 'pending' | 'running' | 'retrying' | 'completed' | 'failed' | 'blocked' | 'cancelled';
@@ -143,8 +150,13 @@ const ACTIVE_RUN_INDEX = 'uq_dynamic_generation_active_run';
  * del MISMO run; la vigente de cada item la decide item-generations.ts.
  */
 const GENERATION = 1;
-/** R17: default cuando el body no manda videoMode. */
-const DEFAULT_VIDEO_MODE: RunVideoMode = 'mock';
+/**
+ * R17 + EV6 DoD (BE-A): default cuando el body no manda videoMode = REAL (un curso completo incluye
+ * sus videos). `mock` solo con el escape de QA DYNAMIC_ALLOW_VIDEO_PREVIEW=true (403 si no).
+ */
+const DEFAULT_VIDEO_MODE: RunVideoMode = 'real';
+/** Runs creados antes de R17 (sin `input_payload.videoMode`) nacieron en vista previa: se leen 'mock'. */
+const LEGACY_VIDEO_MODE: RunVideoMode = 'mock';
 /**
  * I1 (review-rv2): namespace del advisory lock por curso (pg_advisory_xact_lock(ns, courseId))
  * que serializa crear/reabrir/reintentar-con-reapertura runs de un curso.
@@ -248,6 +260,12 @@ export interface RunDto {
   finishedAt: string | null;
   progress: RunProgress;
   items: ItemRunDto[];
+  /**
+   * EV6 DoD (BE-A): completitud COMPUTADA en cada lectura (run-completion.ts). `status` sigue siendo
+   * el worker_status crudo; la UI decide «Curso listo» SOLO con `completion.complete`. Un run viejo
+   * `completed` con componentes de vista previa se lee `state:'preview'` sin escribir nada.
+   */
+  completion: RunCompletion;
 }
 
 function toIso(v: Date | string | null | undefined): string | null {
@@ -504,6 +522,33 @@ export function budgetBlockedConflict(blockedBy: NormalApprovalPlan['blockedBy']
   });
 }
 export const APPROVAL_FORBIDDEN = 'approval_forbidden';
+/**
+ * EV6 DoD (BE-A): «Generar videos reales» (vista previa + confirmación), cancelar un upgrade en
+ * vuelo y el reenvío pago de un video fallido son herramientas de RECUPERACIÓN de admin
+ * (SUPER_ADMIN): 403 a cualquier otro usuario, dueño incluido. Los reintentos sin gasto siguen
+ * disponibles para el dueño.
+ */
+export const ADMIN_RECOVERY_ONLY = 'admin_recovery_only';
+
+/**
+ * Fix round 1 (C2): ¿el item video ya intentó un render PAGADO en Videogen? (envío iniciado, job
+ * registrado o archivado, o un error que solo ocurre después de enviar). Un video que nunca llegó a
+ * enviarse (bloqueado por dependencia o presupuesto, falla previa al envío) devuelve false.
+ */
+export function videoRenderWasAttempted(r: { error?: string | null; output_summary?: Record<string, any> | null }): boolean {
+  const os = r.output_summary ?? {};
+  const err = String(r.error ?? '');
+  return !!os.externalSubmitStartedAt || !!os.external?.videogenJobId ||
+    (Array.isArray(os.previousExternals) && os.previousExternals.length > 0) ||
+    /^(videogen_failed|videogen_submit_rejected|ambiguous_video_submission)/.test(err) || err.includes(PROVIDER_RECONCILIATION_REQUIRED);
+}
+
+function adminRecoveryForbidden(what: string): ForbiddenException {
+  return new ForbiddenException({
+    code: ADMIN_RECOVERY_ONLY,
+    message: `${ADMIN_RECOVERY_ONLY}: ${what} es una herramienta de recuperación de un administrador de Cursia. No se hizo nada.`,
+  });
+}
 
 export interface StartPreview {
   manifestId: number;
@@ -645,6 +690,9 @@ export function publicVideoUpgradePreview(pv: VideoUpgradePreview): Omit<VideoUp
 @Injectable()
 export class RunsService {
   private readonly logger = new Logger(RunsService.name);
+  /** EV6 DoD BE-B: oyentes de «el run pasó a completed» (después del commit; empaque automático). */
+  private readonly runCompletedListeners: Array<(runId: string) => unknown> = [];
+  private readonly pendingRunCompletedHooks = new Set<Promise<unknown>>();
 
   constructor(
     private readonly dataSource: DataSource,
@@ -778,7 +826,8 @@ export class RunsService {
     // Mismos 409/403 que startRun daría para un run nuevo, ANTES de ofrecer autorizar.
     const other = await this.findActiveRunOnOtherManifest(this.dataSource, courseId, manifest.id);
     if (other) throw this.otherActiveRunConflict(other, manifest);
-    if (videoMode === 'real') assertRealVideoAllowed(ownerId);
+    // Fix round 1 (I1): la elegibilidad de video real solo aplica si la estructura confirmada tiene videos.
+    if (videoMode === 'real' && this.videoCountOf(manifest) > 0) assertRealVideoAllowed(ownerId);
     const modes = runSpendModes(videoMode, providerModes ?? null);
     if (!this.finopsBudget) {
       const paid = paidRealProviders(estimateItemsForRun(manifest.manifest.items, modes, null), modes);
@@ -1088,6 +1137,8 @@ export class RunsService {
         // Gate de video real (review 5C I1): B va a pagar Videogen solo si
         // GENERA/REGENERA algún video (STALE_NO_AUTO nunca regenera solo).
         if (videoMode === 'real' && writes.videoItemsToGenerate.length > 0) assertRealVideoAllowed(ownerId);
+        // EV6 DoD (BE-A): B hereda el modo de A; generar videos NUEVOS de vista previa exige el escape de QA.
+        if (videoMode === 'mock' && writes.videoItemsToGenerate.length > 0) assertVideoPreviewAllowed();
         // DN-1: B hereda la estrategia de A; si va a GENERAR videos reales,
         // entrega YouTube + preflight OK. El preflight hace red → se corre FUERA
         // de la tx (rollback: nada escrito) y se reintenta una sola vez.
@@ -1230,7 +1281,7 @@ export class RunsService {
         });
       }
       // I1 (5C): reabrir un run 'real' vuelve a gastar Videogen → allow-list DYNAMIC_REAL_VIDEO_OWNERS.
-      if (latestVideoMode === 'real') assertRealVideoAllowed(ownerId);
+      if (latestVideoMode === 'real' && this.videoCountOf(manifest) > 0) assertRealVideoAllowed(ownerId);
       // Fix wave (M5): un run reemplazado por uno creado desde él no se reabre.
       const superseding = await this.findSupersedingRun(this.dataSource, latest.id);
       if (superseding) throw this.supersededConflict(latest.id, superseding);
@@ -1271,7 +1322,8 @@ export class RunsService {
     await this.assertNoPreviousItems(manifest);
     // I1 (5C): un run NUEVO con video real requiere DYNAMIC_REAL_VIDEO_OWNERS (fail closed). Un run
     // 'real' ya activo se devuelve arriba sin pasar por acá (reanudar no se bloquea).
-    if (videoMode === 'real') assertRealVideoAllowed(ownerId);
+    // Fix round 1 (I1): un curso SIN videos arranca para cualquier owner (no hay Videogen que gastar).
+    if (videoMode === 'real' && this.videoCountOf(manifest) > 0) assertRealVideoAllowed(ownerId);
     // DN-1: ≥1 video + videoMode real → se congela 'youtube' (o videogen_direct
     // solo con el permiso de staging) y el preflight de YouTube tiene que pasar
     // en el servidor. Si no → 409 sin escribir nada ni llamar a Videogen.
@@ -1515,19 +1567,36 @@ export class RunsService {
    * complete exigirá status='running'). completed/failed se conservan.
    * Idempotente sobre un run ya cancelado; 409 si el run ya está completed.
    */
-  async cancelRun(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<RunDto> {
+  async cancelRun(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+    runId: string,
+    /** EV6 DoD (R5): quién cancela (cancelar un upgrade de videos en vuelo es solo de SUPER_ADMIN). */
+    actor?: { id?: string | null; email?: string | null },
+  ): Promise<RunDto> {
+    // Fix round 1 (I2): un SUPER_ADMIN cancela sobre el run del dueño real del curso.
+    const actorId = actor?.id ?? ownerId;
+    ownerId = await this.ownerForActor(courseId, ownerId, actor);
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     const job = await this.loadRunRow(courseId, manifest, runId);
+    if (videoUpgradeOf(job.input_payload) && isActive(job) && !isSuperAdminEmail(actor?.email) && (await this.upgradeInFlight(this.dataSource, job))) {
+      throw adminRecoveryForbidden('Cancelar la generación de los videos reales');
+    }
 
     await this.tx(async (qr) => {
       const [locked] = await qr.query(
         `select id, status, worker_status from public.production_jobs where id = $1 for update`,
         [job.id],
       );
+      // EV6 DoD: `preview` también es terminal (no hay nada que cancelar).
       if (locked.worker_status === 'completed') {
         throw new ConflictException(`La ejecución ${job.id} ya está completada; no se puede cancelar`);
       }
-      await this.markRunCancelled(qr, job.id, ownerId, 'user_cancelled');
+      if (locked.worker_status === 'preview') {
+        throw new ConflictException(`La ejecución ${job.id} ya terminó (vista previa); no se puede cancelar`);
+      }
+      await this.markRunCancelled(qr, job.id, actorId, 'user_cancelled');
       await this.cancelOpenItems(qr, job.id);
     });
     return this.buildRunDto(await this.loadJobById(job.id), manifest);
@@ -1559,11 +1628,19 @@ export class RunsService {
     itemKey: string,
     resubmitVideo = false,
     resubmitProvider = false,
-    auto?: { policy: AutoHealPolicy; now?: Date },
+    auto?: { policy: AutoHealPolicy; now?: Date; safe?: boolean },
+    /** EV6 DoD (R5): quién reintenta (la recuperación PAGA de un video es solo de SUPER_ADMIN). */
+    actor?: { id?: string | null; email?: string | null },
   ): Promise<ItemRunDto> {
-    if (auto && (resubmitVideo || resubmitProvider)) {
+    // EV6 DoD BE-B: el ÚNICO reenvío automático permitido es el reintento seguro (`auto.safe`) de un
+    // rechazo DEFINITIVO de Videogen sin gasto (videogen_submit_rejected), re-evaluado bajo lock.
+    if (auto && (resubmitProvider || (resubmitVideo && !auto.safe))) {
       throw new BadRequestException('auto-heal: nunca reenvía a un proveedor (resubmitVideo/resubmitProvider)');
     }
+    // Fix round 1 (I2): un SUPER_ADMIN reintenta sobre el run del dueño real del curso (FinOps, YouTube
+    // y ownership se evalúan contra ese dueño); queda registrado quién actuó.
+    const actorId = actor?.id ?? ownerId;
+    if (!auto && actor) ownerId = await this.ownerForActor(courseId, ownerId, actor);
     // G3 (fix wave / review I1): un retry es un entry point como cualquier
     // otro — requiere la allow-list de V2, antes de tocar manifest o run.
     assertDynamicOwnerAllowed(ownerId);
@@ -1625,6 +1702,15 @@ export class RunsService {
         const paidItems = isPaid(preTarget)
           ? (newPaid(preTarget, resubmitVideo || resubmitProvider) ? [preTarget] : [])
           : preRows.filter((r) => r.status === 'blocked' && isPaid(r) && newPaid(r, false));
+        // EV6 DoD (R5) + fix round 1 (C2): solo un reintento que vuelve a RENDERIZAR un video que ya
+        // intentó un render pagado (reenvío explícito, render fallido/rechazado/ambiguo) es recuperación
+        // de admin. Un video que nunca se envió (p.ej. bloqueado por una dependencia o por presupuesto)
+        // sigue siendo del dueño: su primer render va por el gate de FinOps de siempre (presupuesto
+        // aprobado). Re-poll, re-subida a YouTube e items no pagos: dueño.
+        if (!auto && this.videoModeOf(job) === 'real' && !isSuperAdminEmail(actor?.email) &&
+          (resubmitVideo || paidItems.some((r) => r.type === 'video' && videoRenderWasAttempted(r)))) {
+          throw adminRecoveryForbidden('Volver a generar un video (con costo)');
+        }
         await this.finopsPaidWorkGate({ courseId, ownerId, manifest, job, paidKeys: paidItems.map((r) => r.item_key), dryRun: !!auto });
       }
     }
@@ -1684,7 +1770,14 @@ export class RunsService {
       // R16 (#2): la política del auto-healer se re-evalúa con la fila bloqueada (otro barrido, un retry
       // manual o un fallo nuevo pudieron cambiarla entre la lectura y este lock).
       let autoMeta: { round: number; code: string } | null = null;
-      if (auto) {
+      if (auto && auto.safe) {
+        // BE-B: reintento automático seguro (una vez; solo rechazos probados sin gasto).
+        const d = safeAutoRetryDecision(target, auto.now ?? new Date(), auto.policy);
+        if (d.heal === false || d.rule.resubmitVideo !== resubmitVideo) {
+          throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (${d.heal === false ? d.reason : 'mode_mismatch'})`, code: 'auto_heal_not_eligible' });
+        }
+        autoMeta = { round: d.round, code: d.rule.code };
+      } else if (auto) {
         const d = autoHealDecision(target, auto.now ?? new Date(), auto.policy);
         if (d.heal === false) {
           throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (${d.reason})`, code: 'auto_heal_not_eligible' });
@@ -1702,9 +1795,21 @@ export class RunsService {
       if (
         this.videoModeOf(job) === 'real' &&
         !uploadPhaseRetry &&
-        (target.type === 'video' || resubmitVideo || !isActive(locked))
+        (target.type === 'video' || resubmitVideo || !isActive(locked)) &&
+        // Fix round 1 (I1): sin videos en el Manifest no hay gasto de Videogen que proteger.
+        this.videoCountOf(manifest) > 0
       ) {
         assertRealVideoAllowed(ownerId);
+      }
+      // Fix round 3 (N5): el gate de recuperación de admin se re-evalúa sobre las filas BLOQUEADAS (un cambio
+      // entre la lectura previa y el lock no puede colar un re-render pago de un no admin).
+      if (!auto && this.videoModeOf(job) === 'real' && !isSuperAdminEmail(actor?.email) && !uploadPhaseRetry) {
+        const reRender = (r: { type: string; error: string | null; output_summary: Record<string, any> | null }) =>
+          r.type === 'video' && !r.output_summary?.external?.videogenJobId && videoRenderWasAttempted(r);
+        const unblockKeys = new Set(this.dependentsToUnblock(items, itemKey).map(String));
+        if (resubmitVideo || reRender(target) || items.some((i) => unblockKeys.has(String(i.id)) && reRender(i))) {
+          throw adminRecoveryForbidden('Volver a generar un video (con costo)');
+        }
       }
 
       // I4/R23: resubmitVideo solo para items type='video' en 'failed' cuyo
@@ -1777,16 +1882,25 @@ export class RunsService {
                     )),
                     -- Calibración #2: decisión humana explícita → las operaciones pagadas de los
                     -- intentos hasta acá quedan reconocidas (el worker ya no las trata como ambiguas).
-                    'reconciliationAcknowledgedThroughAttempt', attempt_count
+                    -- BE-B: el reintento automático seguro NO reconoce nada (no es una decisión humana):
+                    -- conserva el valor previo; su reserva rechazada ya está liquidada (no bloquea).
+                    'reconciliationAcknowledgedThroughAttempt', ${auto ? `coalesce(output_summary->'reconciliationAcknowledgedThroughAttempt', '0'::jsonb)` : 'attempt_count'}
                   ) || $4::jsonb)${resubmitSetSql}`
         : `(${previousErrorsExpr}) || $4::jsonb`;
       // R16 (#2): la reapertura automática queda registrada (auditoría) en la misma escritura.
       const nowIso = (auto?.now ?? new Date()).toISOString();
-      const entryExtra = autoMeta ? { auto: true, autoHealRound: autoMeta.round, autoHealCode: autoMeta.code } : {};
-      const topExtra = autoMeta
-        ? { autoHeal: { rounds: autoMeta.round, lastAt: nowIso, lastCode: autoMeta.code, maxRounds: autoHealMaxRoundsFor(target.type, auto!.policy) } }
-        : {};
-      const attemptsGranted = auto ? Math.max(1, Math.floor(auto.policy.attemptsPerRound)) : 3;
+      const entryExtra = autoMeta && auto?.safe
+        ? { auto: true, safeAutoRetry: true, safeAutoRetryRound: autoMeta.round, autoHealCode: autoMeta.code }
+        : autoMeta
+          ? { auto: true, autoHealRound: autoMeta.round, autoHealCode: autoMeta.code }
+          : actorId !== ownerId ? { retriedBy: actorId } : {};
+      const topExtra = autoMeta && auto?.safe
+        ? { safeAutoRetry: { rounds: autoMeta.round, lastAt: nowIso, lastCode: autoMeta.code, maxRounds: SAFE_AUTO_RETRY_MAX_ROUNDS } }
+        : autoMeta
+          ? { autoHeal: { rounds: autoMeta.round, lastAt: nowIso, lastCode: autoMeta.code, maxRounds: autoHealMaxRoundsFor(target.type, auto!.policy) } }
+          : {};
+      // BE-B: el reintento seguro concede UN intento (un único reenvío; si vuelve a fallar, humano).
+      const attemptsGranted = auto?.safe ? 1 : auto ? Math.max(1, Math.floor(auto.policy.attemptsPerRound)) : 3;
 
       const updated = returningRows(
         await qr.query(
@@ -1901,7 +2015,7 @@ export class RunsService {
            join public.course_blueprints b on b.id = m.blueprint_id
           where pj.execution_mode = 'dynamic_generation'
             and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
-            and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed')
+            and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed', 'preview')
             and g.status = 'failed'
             and ${latestGenerationPredicate('g')}
             -- I1: solo fallos recientes
@@ -1996,6 +2110,87 @@ export class RunsService {
   }
 
   /**
+   * EV6 DoD BE-B (reglas 3–4 del usuario) — barrido del reintento automático SEGURO (mismo tick que el
+   * auto-healer). Solo items `failed` de la ejecución vigente del curso cuyo último error es un rechazo
+   * DEFINITIVO sin gasto (auto-heal.ts SAFE_AUTO_RETRY_RULES: videogen_submit_rejected,
+   * gamma_submit_failed), recientes, sin su único reintento usado. Cada uno pasa por retryItem(auto.safe):
+   * misma transacción y locks, política re-evaluada bajo lock, gate de FinOps en modo simulación (dentro
+   * del presupuesto YA aprobado; nunca crea un estimado ni una aprobación) y, en el worker, el runtime
+   * guard antes del envío. Un rechazo de retryItem (presupuesto, run reemplazado…) marca el item
+   * `safeAutoRetry.declined` → queda para un admin (sin reintentos en cada tick).
+   */
+  async autoRetrySafeRejections(
+    opts: { policy?: AutoHealPolicy; now?: Date; limit?: number } = {},
+  ): Promise<{ candidates: number; retried: Array<{ runId: string; itemKey: string; code: string }>; skipped: Array<{ runId: string; itemKey: string; reason: string }> }> {
+    const policy = opts.policy ?? autoHealPolicyFromEnv();
+    const now = opts.now ?? new Date();
+    const limit = Math.max(1, Math.floor(opts.limit ?? 50));
+    const result = { candidates: 0, retried: [] as Array<{ runId: string; itemKey: string; code: string }>, skipped: [] as Array<{ runId: string; itemKey: string; reason: string }> };
+    const rows: Array<{
+      id: string; job_id: string; item_key: string; type: string; status: string; error: string | null; output_summary: Record<string, any> | null;
+      finished_at: Date; updated_at: Date | null; course_id: number; owner_id: string; blueprint_number: number;
+    }> = await this.dataSource.query(
+      `select g.id, g.job_id, g.item_key, g.type, g.status, g.error, g.output_summary, g.finished_at, g.updated_at,
+              pj.course_id, pj.owner_id, b.blueprint_number
+         from public.generation_item_runs g
+         join public.production_jobs pj on pj.id = g.job_id
+         join public.course_generation_manifests m on m.id = g.manifest_id
+         join public.course_blueprints b on b.id = m.blueprint_id
+        where pj.execution_mode = 'dynamic_generation'
+          and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+          and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed', 'preview')
+          and g.status = 'failed'
+          and ${latestGenerationPredicate('g')}
+          and g.finished_at > $1::timestamptz - make_interval(secs => $2::int)
+          and not exists (
+            select 1 from public.production_jobs pj2
+             where pj2.execution_mode = 'dynamic_generation' and pj2.course_id = pj.course_id and pj2.id <> pj.id
+               and (pj2.created_at > pj.created_at or (pj2.created_at = pj.created_at and pj2.id > pj.id)))
+          and not exists (select 1 from public.course_generation_manifests m2 where m2.course_id = m.course_id and m2.id > m.id)
+          and g.error ~ $3
+          and not (g.output_summary ? 'safeAutoRetry' and (g.output_summary->'safeAutoRetry' ? 'declined'
+                   or coalesce((g.output_summary->'safeAutoRetry'->>'rounds')::numeric, 0) >= $4::int))
+        order by g.finished_at desc, g.id desc
+        limit $5`,
+      [now.toISOString(), Math.round(Math.min(Math.max(policy.maxAgeHours, 0), AUTO_HEAL_MAX_AGE_HOURS_RANGE.max) * 3600), SAFE_AUTO_RETRY_SQL_REGEX,
+        SAFE_AUTO_RETRY_MAX_ROUNDS, limit],
+    );
+    result.candidates = rows.length;
+    for (const r of rows) {
+      const d = safeAutoRetryDecision(r, now, policy);
+      if (d.heal === false) {
+        result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: d.reason });
+        continue;
+      }
+      try {
+        await this.retryItem(r.course_id, r.owner_id, Number(r.blueprint_number), r.job_id, r.item_key, d.rule.resubmitVideo, false, { policy, now, safe: true });
+        result.retried.push({ runId: r.job_id, itemKey: r.item_key, code: d.rule.code });
+        this.logger.warn(`reintento automático seguro: ${r.item_key} (run ${r.job_id}) — ${d.rule.code} (rechazo definitivo sin gasto), única vez`);
+      } catch (err) {
+        const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
+        const code = String((resp && typeof resp === 'object' && (resp as any).code) || (err instanceof Error ? err.name : 'error')).slice(0, 100);
+        result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: code });
+        try {
+          await this.dataSource.query(
+            `update public.generation_item_runs
+                set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('safeAutoRetry',
+                      coalesce(output_summary->'safeAutoRetry', '{}'::jsonb) || jsonb_build_object('declined', $2::text, 'declinedAt', $3::text))
+              where id = $1 and status = 'failed'`,
+            [r.id, code, now.toISOString()],
+          );
+        } catch (e) {
+          this.logger.warn(`reintento automático seguro: no se pudo registrar el rechazo de ${r.item_key}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+        this.logger.warn(`reintento automático seguro: ${r.item_key} (run ${r.job_id}) no se reintenta (${code}); queda para un admin`);
+      }
+    }
+    if (rows.length) {
+      this.logger.log(`reintento automático seguro: candidatos ${result.candidates}, reintentados ${result.retried.length}, omitidos ${result.skipped.length}`);
+    }
+    return result;
+  }
+
+  /**
    * DN-1 (follow-up 5B.2.A): resolución EXPLÍCITA de una subida a YouTube
    * ambigua (`youtubeUploadStartedAt` sin `youtubeVideoId`: crash, lease
    * perdida, red/timeout a mitad del PUT). Nunca es automática:
@@ -2016,7 +2211,10 @@ export class RunsService {
     itemKey: string,
     action: YoutubeResolutionAction,
     youtubeVideoId?: string,
+    /** EV6 DoD BE-B: un SUPER_ADMIN resuelve sobre el curso de cualquier dueño (cola de recuperación). */
+    actor?: { id?: string | null; email?: string | null },
   ): Promise<ItemRunDto> {
+    if (actor) ownerId = await this.ownerForActor(courseId, ownerId, actor);
     assertDynamicOwnerAllowed(ownerId);
     if (action !== 'confirm_existing' && action !== 'authorize_reupload') {
       throw new BadRequestException('action debe ser "confirm_existing" o "authorize_reupload"');
@@ -2222,8 +2420,11 @@ export class RunsService {
     runId: string,
     itemKey: string,
     opts: RegenerateItemOptions | boolean | undefined,
+    /** EV6 DoD BE-B: un SUPER_ADMIN regenera sobre el curso de cualquier dueño (cola de recuperación). */
+    actor?: { id?: string | null; email?: string | null },
   ): Promise<RegenerateItemResult | RegenerateDryRunResult> {
     const o: RegenerateItemOptions = typeof opts === 'object' && opts !== null ? opts : { confirmPaid: opts as boolean | undefined };
+    if (actor) ownerId = await this.ownerForActor(courseId, ownerId, actor);
     assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     let job = await this.loadRunRow(courseId, manifest, runId);
@@ -2422,7 +2623,8 @@ export class RunsService {
       block('item_not_completed', message, () => new ConflictException({ message, code: 'item_not_completed' }));
     }
     const runActive = ACTIVE_RUN_WORKER_STATUSES.includes(String(job.worker_status));
-    if (!runActive && job.worker_status !== 'completed' && !isCancelledLike(job)) {
+    // EV6 DoD: `preview` es un run terminado igual que completed (se puede regenerar un item).
+    if (!runActive && job.worker_status !== 'completed' && job.worker_status !== 'preview' && !isCancelledLike(job)) {
       const message = `La ejecución ${job.id} terminó en "${job.worker_status}"; reintenta sus items fallidos (retry) antes de regenerar otros`;
       block('run_not_regenerable', message, () => new ConflictException({ message, code: 'run_not_regenerable' }));
     }
@@ -2640,10 +2842,28 @@ export class RunsService {
     blueprintNumber: number,
     runId: string,
   ): Promise<VideoUpgradePreview> {
-    assertDynamicOwnerAllowed(user.id);
-    const manifest = await this.manifestOfRun(courseId, user.id, blueprintNumber, runId);
+    // EV6 DoD (R5): herramienta de recuperación de admin; el estimado tampoco se muestra a un no admin.
+    if (!isSuperAdminEmail(user.email)) {
+      assertDynamicOwnerAllowed(user.id);
+      throw adminRecoveryForbidden('Generar los videos reales de un curso');
+    }
+    // Fix round 1 (I2): un SUPER_ADMIN actúa sobre el run de CUALQUIER owner (el curso del cliente).
+    const acting = { id: await this.ownerForActor(courseId, user.id, user), email: user.email };
+    assertDynamicOwnerAllowed(acting.id);
+    const manifest = await this.manifestOfRun(courseId, acting.id, blueprintNumber, runId);
     const job = await this.reconcileCancellation(await this.loadRunRow(courseId, manifest, runId));
-    return this.videoUpgradePreviewOf(this.dataSource, courseId, user, job, manifest);
+    return this.videoUpgradePreviewOf(this.dataSource, courseId, acting, job, manifest);
+  }
+
+  /**
+   * Fix round 1 (I2): owner efectivo para las herramientas de recuperación de admin. Un SUPER_ADMIN
+   * actúa sobre el curso de cualquier owner (se resuelve el dueño real del curso; si no existe, el
+   * 404 de siempre lo da manifestOfRun). Cualquier otro usuario: él mismo (ownership sin cambios).
+   */
+  async ownerForActor(courseId: number, actorId: string, actor?: { email?: string | null } | null): Promise<string> {
+    if (!isSuperAdminEmail(actor?.email)) return actorId;
+    const [c] = await this.dataSource.query(`select owner_id from public.courses where id = $1`, [courseId]);
+    return c?.owner_id ? String(c.owner_id) : actorId;
   }
 
   /**
@@ -2662,14 +2882,24 @@ export class RunsService {
     runId: string,
     estimateHash: string,
   ): Promise<VideoUpgradeResult> {
-    const ownerId = user.id;
+    // EV6 DoD (R5): solo SUPER_ADMIN (antes de leer o escribir nada; también la respuesta idempotente).
+    if (!isSuperAdminEmail(user.email)) {
+      assertDynamicOwnerAllowed(user.id);
+      throw new ForbiddenException({
+        code: APPROVAL_FORBIDDEN,
+        message: `${APPROVAL_FORBIDDEN}: generar los videos reales es una herramienta de recuperación de un administrador de Cursia. No se generó nada.`,
+      });
+    }
+    // Fix round 1 (I2): el SUPER_ADMIN actúa sobre el run del dueño real del curso.
+    const ownerId = await this.ownerForActor(courseId, user.id, user);
     assertDynamicOwnerAllowed(ownerId);
+    const acting = { id: ownerId, email: user.email };
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     const job = await this.reconcileCancellation(await this.loadRunRow(courseId, manifest, runId));
     const already = await this.existingUpgradeFor(this.dataSource, job, estimateHash);
     if (already) return { created: false, upgrade: already, run: await this.buildRunDto(job, manifest) };
 
-    const pv = await this.videoUpgradePreviewOf(this.dataSource, courseId, user, job, manifest, true);
+    const pv = await this.videoUpgradePreviewOf(this.dataSource, courseId, acting, job, manifest, true);
     if (pv.upgradeInFlight && pv.upgrade) return { created: false, upgrade: pv.upgrade, run: await this.buildRunDto(await this.loadJobById(job.id), manifest) };
     if (pv._blockers && pv._blockers.length) throw pv._blockers[0].error();
     if (!pv.estimateHash || pv.estimateHash !== estimateHash) {
@@ -2716,6 +2946,8 @@ export class RunsService {
         at: requestedAt,
         by: ownerId,
         confirmedBy: user.email ?? null,
+        // Fix round 1 (I2): quién actuó (el admin) si no es el dueño del curso.
+        ...(user.id !== ownerId ? { actedBy: user.id } : {}),
         estimateHash,
         itemKeys: plan.pending.map((r) => r.item_key).sort(),
         interactionKeys: [...plan.interactions, ...plan.questionsOnly.map((x) => x.interactions)].map((r) => r.item_key).sort(),
@@ -2758,13 +2990,13 @@ export class RunsService {
         const newId = await insertGeneration(prev, {
           reason: VIDEO_UPGRADE_REASON, upgradeId: upgrade.id, fromItemRunId: prev.id, fromGeneration: Number(prev.generation),
           costKind: carriedKeys.has(prev.item_key) ? 'none' : 'videogen', ...(carriedKeys.has(prev.item_key) ? { reusedVideogenJob: true } : {}),
-          requestedBy: ownerId, requestedAt,
+          requestedBy: user.id, requestedAt,
         }, carry);
         const inter = plan.interactions.find((r) => r.chapter_id === prev.chapter_id);
         if (inter) {
           await insertGeneration(inter, {
             reason: VIDEO_UPGRADE_CASCADE_REASON, upgradeId: upgrade.id, fromItemRunId: inter.id, fromGeneration: Number(inter.generation),
-            cascadeFromItemRunId: newId, cascadeFromItemKey: prev.item_key, costKind: 'llm', requestedBy: ownerId, requestedAt,
+            cascadeFromItemRunId: newId, cascadeFromItemKey: prev.item_key, costKind: 'llm', requestedBy: user.id, requestedAt,
           }, { sourceVideoItemRunId: newId });
         }
       }
@@ -2772,7 +3004,7 @@ export class RunsService {
       for (const x of plan.questionsOnly) {
         await insertGeneration(x.interactions, {
           reason: VIDEO_UPGRADE_CASCADE_REASON, upgradeId: upgrade.id, fromItemRunId: x.interactions.id, fromGeneration: Number(x.interactions.generation),
-          cascadeFromItemRunId: x.video.id, cascadeFromItemKey: x.video.item_key, costKind: 'llm', questionsOnly: true, requestedBy: ownerId, requestedAt,
+          cascadeFromItemRunId: x.video.id, cascadeFromItemKey: x.video.item_key, costKind: 'llm', questionsOnly: true, requestedBy: user.id, requestedAt,
         }, { sourceVideoItemRunId: x.video.id });
       }
       const note = JSON.stringify({ kind: VIDEO_UPGRADE_REASON, upgradeId: upgrade.id, requestedAt, affected: [...upgrade.itemKeys, ...upgrade.interactionKeys] });
@@ -2896,8 +3128,10 @@ export class RunsService {
       block('real_video_not_allowed', msg, () => err as Error);
     }
     // Terminado; o (fix round 1, I-1) terminado `failed`/`cancelled` SOLO por un upgrade anterior.
-    const degraded = job.worker_status !== 'completed' && (await runIsUpgradeOnlyFailure(q, job));
-    if ((isCancelledLike(job) && !degraded) || (job.worker_status !== 'completed' && !degraded)) {
+    // EV6 DoD: un run `preview` (terminado con videos de vista previa) se mejora igual que un completed con mocks.
+    const finished = job.worker_status === 'completed' || job.worker_status === 'preview';
+    const degraded = !finished && (await runIsUpgradeOnlyFailure(q, job));
+    if ((isCancelledLike(job) && !degraded) || (!finished && !degraded)) {
       const m = `la generación del curso tiene que estar terminada para generar sus videos reales (estado: ${job.worker_status}).`;
       block(VIDEO_UPGRADE_RUN_NOT_READY, m, conflict(VIDEO_UPGRADE_RUN_NOT_READY, m));
     }
@@ -3688,8 +3922,16 @@ export class RunsService {
     return { created: false, reopened: false, run: await this.buildRunDto(job, manifest) };
   }
 
-  /** R17: 'mock' si se omite o viene vacío; cualquier otro valor ya fue rechazado por el DTO (400). */
+  /**
+   * EV6 DoD: 'real' si se omite o viene vacío; 'mock' SOLO con el escape de QA (403
+   * `video_preview_not_allowed` antes de escribir o estimar nada). Cualquier otro valor ya fue
+   * rechazado por el DTO (400).
+   */
   private normalizeVideoMode(v: unknown): RunVideoMode {
+    if (v === 'mock') {
+      assertVideoPreviewAllowed();
+      return 'mock';
+    }
     return v === 'real' ? 'real' : DEFAULT_VIDEO_MODE;
   }
 
@@ -3701,7 +3943,7 @@ export class RunsService {
 
   private videoModeOf(job: any): RunVideoMode {
     const v = job?.input_payload?.videoMode;
-    return (RUN_VIDEO_MODES as readonly string[]).includes(v) ? v : DEFAULT_VIDEO_MODE;
+    return (RUN_VIDEO_MODES as readonly string[]).includes(v) ? v : LEGACY_VIDEO_MODE;
   }
 
   /**
@@ -3842,8 +4084,11 @@ export class RunsService {
       await qr.startTransaction();
       const out = await fn(qr);
       await qr.commitTransaction();
+      // EV6 DoD BE-B: recién DESPUÉS del commit se avisa que un run pasó a `completed` (empaque automático).
+      this.fireRunCompleted(takeCompletedRunsInTx(qr));
       return out;
     } catch (err) {
+      takeCompletedRunsInTx(qr); // rollback: lo anotado no ocurrió
       if (qr.isTransactionActive) {
         try {
           await qr.rollbackTransaction();
@@ -3859,6 +4104,32 @@ export class RunsService {
         await qr.release();
       } catch {
         /* conexión ya liberada o nunca obtenida */
+      }
+    }
+  }
+
+  /**
+   * EV6 DoD BE-B: registra un oyente de «el run pasó a completed» (lo usa AutoPackageService). Se llama
+   * después del commit, sin esperar (fire-and-forget con log); un error nunca afecta a la transición.
+   */
+  onRunCompleted(listener: (runId: string) => unknown): void {
+    this.runCompletedListeners.push(listener);
+  }
+
+  /** Para tests/harnesses: espera a que terminen los avisos de runs completados en curso. */
+  async settleRunCompletedHooks(): Promise<void> {
+    while (this.pendingRunCompletedHooks.size) await Promise.allSettled([...this.pendingRunCompletedHooks]);
+  }
+
+  private fireRunCompleted(runIds: string[]): void {
+    if (!runIds.length || !this.runCompletedListeners.length) return;
+    for (const runId of runIds) {
+      for (const l of this.runCompletedListeners) {
+        const p: Promise<unknown> = Promise.resolve()
+          .then(() => l(runId))
+          .catch((err) => this.logger.warn(`run ${runId} completado: el aviso posterior falló (${err instanceof Error ? err.message : String(err)})`))
+          .finally(() => this.pendingRunCompletedHooks.delete(p));
+        this.pendingRunCompletedHooks.add(p);
       }
     }
   }
@@ -4055,6 +4326,7 @@ export class RunsService {
     rows.sort((a: any, b: any) => (order.get(a.item_key) ?? 1e9) - (order.get(b.item_key) ?? 1e9));
     const strategy = frozenVideoDeliveryOf(job.input_payload);
     const itemDtos = rows.map((r: any) => this.toItemDto(r, strategy));
+    const completion = await this.completionOf(job, rows, manifest);
 
     return {
       id: job.id,
@@ -4078,7 +4350,54 @@ export class RunsService {
       finishedAt: toIso(job.finished_at),
       progress,
       items: itemDtos,
+      completion,
     };
+  }
+
+  /**
+   * EV6 DoD: `RunDto.completion`. El paquete solo se consulta cuando la generación está completa
+   * (misma clave de reuse que el empaque: package-freshness.ts); §2.6 solo en runs failed/cancelled
+   * con upgrade.
+   */
+  private async completionOf(job: any, rows: any[], manifest: ManifestDto): Promise<RunCompletion> {
+    const m = { rulesVersion: manifest.rulesVersion, items: manifest.manifest.items };
+    // Fix round 1 (C1): procedencia de los videos arrastrados por fromRun (preguntas arrastradas con ellos).
+    rows = await attachCarryChains(this.dataSource, rows.map((r) => ({ ...r })));
+    const upgradeOnlyFailure = !!videoUpgradeOf(job.input_payload) && (job.worker_status === 'failed' || isCancelledLike(job))
+      ? await runIsUpgradeOnlyFailure(this.dataSource, job)
+      : false;
+    // Fix round 2: items completados antes de la validación de servidor de su tipo (cursos viejos) cuentan validados.
+    const validationCutoffs = await loadValidationCutoffs(this.dataSource);
+    const first = evaluateRunCompletion(job, rows, m, null, { upgradeOnlyFailure, validationCutoffs });
+    if (!first.generationComplete) return first;
+    const q = { query: this.dataSource.query.bind(this.dataSource) };
+    const ready = await hasDeliverablePackage(q, job, manifest, this.logger);
+    // BE-B: `packaging` mientras el paquete final se arma o el servidor lo reintenta solo; fallido sin
+    // reintento automático → needs_attention + retry_package.
+    const pk = await loadAutoPackageState(q, job, new Date(), process.env, manifest.rulesVersion);
+    // Fix round 1 (I1): un job final completado que ya no es el build vigente = `stale`; se re-arma solo si el
+    // estado lo declara pendiente (builder nuevo / re-completitud sin confirmar), si no queda una acción visible.
+    const stale = !ready && pk.status === 'completed';
+    return evaluateRunCompletion(job, rows, m, {
+      ready,
+      status: stale ? 'stale' : pk.status,
+      autoRetryPending: stale ? pk.rebuildPending : pk.autoRetryPending,
+      auto: pk.eligible && autoPackageEnabled(),
+      blocked: pk.blocked ? { code: pk.blocked.code, message: pk.blocked.message, missing: pk.blocked.missing } : null,
+    }, { upgradeOnlyFailure, validationCutoffs });
+  }
+
+  /**
+   * EV6 DoD BE-B: completitud de un run para la cola de recuperación de admin. SOLO LECTURA (a diferencia
+   * de buildRunDto no barre leases ni recalcula: el listado nunca escribe). El caller ya resolvió el run
+   * y su Manifest congelado (con el dueño real).
+   */
+  async completionForAdmin(job: any, manifest: ManifestDto): Promise<{ completion: RunCompletion; rows: any[] }> {
+    const rows = await this.dataSource.query(
+      `select * from public.generation_item_runs g where g.job_id = $1 and ${latestGenerationPredicate('g')}`,
+      [job.id],
+    );
+    return { completion: await this.completionOf(job, rows, manifest), rows };
   }
 
   /**

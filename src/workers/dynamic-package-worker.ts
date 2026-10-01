@@ -19,6 +19,8 @@ import type { DynamicPackageContents, PackagingPlan, ResolvedArtifact } from '..
 import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
 import { WorkerLedger, recordPackageBuild } from './finops-worker-hooks';
 import { buildDynamicMbzV3, DYNAMIC_MBZ_BUILDER_VERSION_V3 } from '../package/dynamic-mbz-builder-v3';
+import { PACKAGE_KINDS, PackageKind, QA_INTERNAL_STORAGE_PREFIX, QA_PACKAGE_FILENAME_PREFIX, summaryLooksPreview } from '../modules/dynamic-packaging/package-freshness';
+import { frozenProviderModesOf } from '../modules/dynamic-generation/provider-modes';
 import { validateMbzV3 } from '../package/v3/mbz-validator-v3';
 import { buildPackagingPlanV3 } from '../modules/dynamic-packaging/packaging-plan-v3';
 import {
@@ -136,7 +138,8 @@ export interface PackageJobRow {
   frontend_course_id: string | null;
   worker_status: string;
   status: string;
-  input_payload: { runId: string; manifestId: number; blueprintNumber: number };
+  /** EV6 DoD: `packageKind` solo en paquetes QA (`qa_preview` | `degraded`); ausente = final. */
+  input_payload: { runId: string; manifestId: number; blueprintNumber: number; packageKind?: string };
   output_summary: Record<string, any>;
   attempt_count: number | null;
   max_attempts: number | null;
@@ -454,9 +457,27 @@ export async function processV3PackageJob(
 ): Promise<void> {
   const { logger } = deps;
   const { runId, blueprintNumber } = job.input_payload;
+  // EV6 DoD (BE-A): tipo de paquete decidido por PackagingService (QA solo para SUPER_ADMIN).
+  const packageKind: PackageKind = (PACKAGE_KINDS as readonly string[]).includes(String(job.input_payload?.packageKind))
+    ? (job.input_payload.packageKind as PackageKind)
+    : 'final';
+  const qa = packageKind !== 'final';
   const q = { query: deps.dataSource.query.bind(deps.dataSource) };
   const prepared = await prepareV3Package(q, runId, manifest, job.course_id, moodleVersion);
   const { sourceIdsHash, sourceArtifactIds: ids } = prepared;
+  // EV6 DoD: un paquete FINAL nunca lleva componentes de vista previa (videos omitidos o Gamma/TTS
+  // simulados). Defensa en el worker (un job viejo o encolado por otro camino): falla fuerte.
+  if (!qa) {
+    const pm = frozenProviderModesOf(prepared.run?.input_payload);
+    const mockProviders = !!pm && (pm.presentation === 'mock' || pm.audio === 'mock');
+    if (prepared.pendingVideos.length > 0 || mockProviders) {
+      throw new Error(
+        `preview_not_deliverable: el run ${runId} tiene componentes de vista previa ` +
+          `(${prepared.pendingVideos.length} video(s) pendiente(s)${mockProviders ? ', Gamma/TTS simulados' : ''}); ` +
+          'un paquete final solo se arma con todos los componentes reales (el paquete QA lo pide un administrador).',
+      );
+    }
+  }
   const baseSummary = {
     sourceArtifactIds: ids,
     sourceIdsHash,
@@ -471,6 +492,8 @@ export async function processV3PackageJob(
     assessment: prepared.assessment,
     // EV6 T5: videos de vista previa omitidos del paquete (la UI avisa «videos pendientes»).
     pendingVideos: pendingVideosSummary(manifest, prepared.pendingVideos.map((p) => p.itemKey)),
+    // EV6 DoD: solo los paquetes QA lo declaran (el resumen de un final no cambia).
+    ...(qa ? { packageKind, deliverable: false } : {}),
   };
   // F1: avisos de perfiles (tema por defecto, pesos normalizados, curso sin nota) — también en un paquete reutilizado.
   const profileWarnings = prepared.profileWarnings.map((w) => ({ code: w.split(':')[0], detail: w }));
@@ -479,7 +502,7 @@ export async function processV3PackageJob(
   // EV6 T5 (fix round 1, m-2): el aviso de video pendiente de cada capítulo solo se decide al
   // construir; un .mbz reutilizado lo trae en su metadata (mismo sourceIdsHash = mismos textos).
   const pendingWarnings = baseSummary.pendingVideos.map((p) => ({ code: 'pending_video_omitted', detail: `pending_video_omitted:${p.itemKey}` }));
-  const existing = await findExistingDynamicMbzV3(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash);
+  const existing = await findExistingDynamicMbzV3(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash, packageKind);
   if (existing) {
     logger.log(`Job ${job.id}: dynamic_mbz v3 ya existe (${existing.id}) para runId=${runId} — reutilizando sin reconstruir`);
     const reusedPending: any[] = Array.isArray(existing.metadata?.pendingVideos) ? existing.metadata.pendingVideos : baseSummary.pendingVideos;
@@ -520,6 +543,8 @@ export async function processV3PackageJob(
     ts: (deps.nowSeconds ?? (() => Math.floor(Date.now() / 1000)))(),
     moodleVersion: moodleRequested,
     pendingVideoChapterIds,
+    // EV6 DoD: paquete QA → aviso visible en la bienvenida + nombre del curso «[QA — vista previa, no entregable]».
+    ...(qa ? { qaPreviewNotice: true } : {}),
   });
   // §Q.8: el validador corre sobre los BYTES del paquete, antes de subir. Un hallazgo = fail loud.
   // G6 M1: la evaluación esperada se resuelve ACÁ, del perfil que cargó el worker (no se confía en la del builder).
@@ -546,13 +571,21 @@ export async function processV3PackageJob(
   const pendingVideos = baseSummary.pendingVideos.map((p) => ({ ...p, notice: noticeByKey.get(p.itemKey) === true }));
   const pendingSummary = { pendingVideos, pendingVideoNoticeCount: pendingVideos.filter((p) => p.notice).length };
 
-  const storagePath = `${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${sourceIdsHash}.mbz`;
+  // EV6 DoD: un paquete QA va a OTRA ruta/nombre (`QA-VISTA-PREVIA-…`): nunca adopta ni pisa el .mbz
+  // de un paquete anterior con la misma clave (p.ej. uno B1 sin rótulo).
+  const mbzFilename = `${qa ? QA_PACKAGE_FILENAME_PREFIX : ''}${sourceIdsHash}.mbz`;
+  // Fix round 3 (N2): un paquete QA / degradado va bajo un prefijo INTERNO (primer segmento ≠ uid del
+  // dueño): ninguna política de Storage de `authenticated` (own-folder) lo cubre → solo el backend
+  // (service role, para un SUPER_ADMIN) lo firma. El paquete final conserva la ruta de siempre.
+  const storagePath = qa
+    ? `${QA_INTERNAL_STORAGE_PREFIX}/${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${mbzFilename}`
+    : `${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${mbzFilename}`;
   const artifact = await deps.artifacts.uploadBufferArtifact({
     ownerId: job.owner_id,
     courseId: artifactCourseId(job),
     jobId: job.id,
     type: 'dynamic_mbz',
-    filename: `${sourceIdsHash}.mbz`,
+    filename: mbzFilename,
     storagePath,
     buffer: built.mbz,
     mimeType: 'application/vnd.moodle.backup',
@@ -616,11 +649,16 @@ async function findExistingDynamicMbzV3(
   courseId: string,
   runId: string,
   sourceIdsHash: string,
+  packageKind: PackageKind = 'final',
 ): Promise<{ id: string; metadata: Record<string, any> | null } | null> {
   const list = await artifacts.findAll(ownerId, { courseId, type: 'dynamic_mbz' });
   const match = list.find((a) => {
     const meta = a.metadata as Record<string, any> | null;
-    return meta?.runId === runId && meta?.sourceIdsHash === sourceIdsHash && meta?.builderVersion === DYNAMIC_MBZ_BUILDER_VERSION_V3;
+    if (!(meta?.runId === runId && meta?.sourceIdsHash === sourceIdsHash && meta?.builderVersion === DYNAMIC_MBZ_BUILDER_VERSION_V3)) return false;
+    // EV6 DoD: solo se reutiliza un .mbz del MISMO tipo. Un paquete QA nunca reutiliza uno sin
+    // rótulo (B1, anterior a EV6 DoD) y un final nunca reutiliza uno de vista previa.
+    if (packageKind !== 'final') return meta?.packageKind === packageKind;
+    return !meta?.packageKind && !summaryLooksPreview(meta);
   });
   return match ? { id: match.id, metadata: (match.metadata as Record<string, any> | null) ?? null } : null;
 }

@@ -348,7 +348,7 @@ async function packageRun(label, courseId, n, runId, fakes) {
       ok(true, `app Nest real (dist/main.js) en 127.0.0.1:${APP_PORT}, DYNAMIC_COURSE_STRUCTURE=true, rulesVersion 2, videogen_direct`);
       const f = await api('GET', '/features');
       // V2.1 R3/R13: /features expone además manifestRulesVersion (2 en esta fase).
-      eq(f.data, { dynamicCourseStructure: true, realVideo: true, coherenceLlm: false, manifestRulesVersion: 2 }, 'GET /features con el JWT local → dynamic ON, realVideo ON para el owner de prueba, coherenceLlm OFF (fail-closed sin DYNAMIC_COHERENCE_LLM), manifestRulesVersion 2');
+      eq(f.data, { dynamicCourseStructure: true, realVideo: true, coherenceLlm: false, manifestRulesVersion: 2, dodContract: true, superAdmin: false }, 'GET /features con el JWT local → dynamic ON, realVideo ON para el owner de prueba, coherenceLlm OFF (fail-closed sin DYNAMIC_COHERENCE_LLM), manifestRulesVersion 2');
       const noAuth = await api('GET', '/features', undefined, null);
       ok(noAuth.status === 401, 'sin token → 401 (guard JWT real, HS256 con SUPABASE_JWT_SECRET local)');
       const bad = await api('GET', '/features', undefined, jwt.sign({ sub: OWNER }, 'otro-secreto'));
@@ -916,7 +916,7 @@ async function packageRun(label, courseId, n, runId, fakes) {
       await stopProc(app);
       app = await startApp(fakes, { flag: false });
       const f = await api('GET', '/features');
-      eq(f.data, { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false }, 'flag OFF: GET /features → false/false/false');
+      eq(f.data, { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false, dodContract: true, superAdmin: false }, 'flag OFF: GET /features → false/false/false (+ contrato DoD, no admin)');
       const routes = [
         ['POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID() }],
         ['GET', `/courses/${S.courseId}/modules`],
@@ -951,7 +951,7 @@ async function packageRun(label, courseId, n, runId, fakes) {
       await stopProc(app);
       app = await startApp(fakes);
       const f2 = await api('GET', '/features');
-      eq(f2.data, { dynamicCourseStructure: true, realVideo: true, coherenceLlm: false, manifestRulesVersion: 2 }, 'flag ON de nuevo: /features true (restart sin pérdida)');
+      eq(f2.data, { dynamicCourseStructure: true, realVideo: true, coherenceLlm: false, manifestRulesVersion: 2, dodContract: true, superAdmin: false }, 'flag ON de nuevo: /features true (restart sin pérdida)');
       const rB = await api('GET', `/courses/${S.courseId}/blueprints/${S.nB}/manifest/runs/${S.runB}`);
       ok(rB.status === 200 && rB.data.status === 'completed', 'flag ON de nuevo: el run B sigue legible y completed');
     });

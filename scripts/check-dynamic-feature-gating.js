@@ -76,6 +76,9 @@ const { InvalidationController } = loadDist('modules/invalidation/invalidation.c
 const { InvalidationService } = loadDist('modules/invalidation/invalidation.service.js');
 const { DynamicYoutubeController } = loadDist('modules/dynamic-generation/dynamic-youtube.controller.js');
 const { DynamicYoutubePreflightService } = loadDist('modules/dynamic-generation/dynamic-youtube.js');
+// EV6 DoD BE-B: cola de recuperación de admin (ruta V2, SUPER_ADMIN).
+const { AdminDynamicRunsController } = loadDist('modules/dynamic-generation/admin-runs.controller.js');
+const { AdminRecoveryService } = loadDist('modules/dynamic-generation/admin-recovery.service.js');
 const { SchedulerService } = loadDist('modules/dynamic-generation/scheduler.service.js');
 const { PackagingController } = loadDist('modules/dynamic-packaging/packaging.controller.js');
 const { PackagingService } = loadDist('modules/dynamic-packaging/packaging.service.js');
@@ -126,6 +129,7 @@ const DYNAMIC_CONTROLLER_CLASS_NAMES = new Set([
   'DynamicYoutubeController', // DN-1: GET /dynamic/youtube/preflight
   'CourseStructureSettingsController', // V2.1 R3
   'CourseProfilesController', // V2.1 R3
+  'AdminDynamicRunsController', // EV6 DoD BE-B: GET /admin/dynamic-runs/needs-attention (SUPER_ADMIN)
 ]);
 /**
  * Todo lo demás: legacy sin ninguna ruta dynamic, EXCEPTO CoursesController
@@ -205,7 +209,10 @@ async function withEnv(vars, fn) {
     }
   }
 }
-const ENV_CLEAN = { [FLAG]: undefined, [ALLOW]: undefined, [REAL]: undefined, [COH_LLM]: undefined, DYNAMIC_MANIFEST_RULES_VERSION: undefined };
+const ENV_CLEAN = { [FLAG]: undefined, [ALLOW]: undefined, [REAL]: undefined, [COH_LLM]: undefined, DYNAMIC_MANIFEST_RULES_VERSION: undefined,
+  DYNAMIC_ALLOW_VIDEO_PREVIEW: undefined, DYNAMIC_REAL_VIDEO_ALL_OWNERS: undefined, SUPER_ADMIN_EMAILS: undefined };
+// EV6 DoD (BE-A): `videoMode:'mock'` exige el escape de QA; estos casos (que prueban la allow-list) lo setean.
+const PREVIEW_ESCAPE = { DYNAMIC_ALLOW_VIDEO_PREVIEW: 'true' };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // App Nest HTTP real con servicios falsos
@@ -255,8 +262,10 @@ async function buildApp() {
       DynamicYoutubeController,
       CourseStructureSettingsController,
       CourseProfilesController,
+      AdminDynamicRunsController,
     ],
     providers: [
+      { provide: AdminRecoveryService, useValue: fakeService('AdminRecoveryService') },
       AppService,
       { provide: CoursesService, useValue: fakeService('CoursesService') },
       { provide: CourseStructureService, useValue: fakeService('CourseStructureService') },
@@ -421,6 +430,12 @@ async function runWorkerProcess(script, env, { waitMs }) {
     eq(r(OWNER_B, { [FLAG]: 'true', [REAL]: OWNER_A }).realVideo, false, 'no listado');
     eq(r(OWNER_A, { [REAL]: OWNER_A }).realVideo, false, 'flag OFF');
     eq(r(OWNER_A, { [FLAG]: 'true', [ALLOW]: OWNER_B, [REAL]: OWNER_A }).realVideo, false, 'V2 no permitida para el owner');
+    // EV6 DoD (BE-A): DYNAMIC_REAL_VIDEO_ALL_OWNERS=true (solo el string exacto) → todo owner con V2 es elegible.
+    eq(r(OWNER_B, { [FLAG]: 'true', [REAL]: OWNER_A, DYNAMIC_REAL_VIDEO_ALL_OWNERS: 'true' }).realVideo, true, 'ALL_OWNERS: no listado elegible');
+    eq(r(OWNER_C, { [FLAG]: 'true', DYNAMIC_REAL_VIDEO_ALL_OWNERS: 'true' }).realVideo, true, 'ALL_OWNERS sin lista');
+    for (const v of ['TRUE', 'True', '1', ' true']) eq(r(OWNER_B, { [FLAG]: 'true', DYNAMIC_REAL_VIDEO_ALL_OWNERS: v }).realVideo, false, `ALL_OWNERS "${v}" no activa`);
+    eq(r(OWNER_A, { [FLAG]: 'true', [ALLOW]: OWNER_B, DYNAMIC_REAL_VIDEO_ALL_OWNERS: 'true' }).realVideo, false, 'ALL_OWNERS no salta la allow-list V2');
+    eq(r(OWNER_A, { DYNAMIC_REAL_VIDEO_ALL_OWNERS: 'true' }).realVideo, false, 'ALL_OWNERS con flag OFF');
   });
 
   await check('G3 lista inválida: DynamicFeatureConfigError nombrando la variable y la entrada', () => {
@@ -448,7 +463,7 @@ async function runWorkerProcess(script, env, { waitMs }) {
   });
 
   await check('G1 set de rutas: los 11 controllers dynamic (incl. Coherence/Invalidation, Fase 7/8, YouTube preflight DN-1 y V2.1 R3 settings/profiles) + solo POST /courses/dynamic de CoursesController', () => {
-    for (const C of [CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController, CoherenceController, InvalidationController, DynamicYoutubeController, CourseStructureSettingsController, CourseProfilesController]) {
+    for (const C of [CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController, CoherenceController, InvalidationController, DynamicYoutubeController, CourseStructureSettingsController, CourseProfilesController, AdminDynamicRunsController]) {
       assert(DYNAMIC_CONTROLLERS.has(C), `${C.name} no está en el set`);
     }
     assert(isDynamicRoute(CoursesController, CoursesController.prototype.createOrGetDynamic), 'POST /courses/dynamic');
@@ -491,7 +506,7 @@ async function runWorkerProcess(script, env, { waitMs }) {
   // ── HTTP real ──────────────────────────────────────────────────────────────
   const { app, base } = await buildApp();
   const dynamicRoutes = [
-    ...[CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController, CoherenceController, InvalidationController, DynamicYoutubeController, CourseStructureSettingsController, CourseProfilesController].flatMap(routesOf),
+    ...[CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController, CoherenceController, InvalidationController, DynamicYoutubeController, CourseStructureSettingsController, CourseProfilesController, AdminDynamicRunsController].flatMap(routesOf),
     ...routesOf(CoursesController).filter((r) => r.name === 'createOrGetDynamic'),
   ];
   const legacyRoutes = [
@@ -543,8 +558,9 @@ async function runWorkerProcess(script, env, { waitMs }) {
         }));
     }
 
+    // EV6 DoD BE-B: la cola de recuperación es SUPER_ADMIN (SuperAdminGuard): el usuario de prueba es admin acá.
     await check('G1 flag ON: todas las rutas dynamic llegan al controller (nunca 404 del gate)', () =>
-      withEnv({ ...ENV_CLEAN, [FLAG]: 'true' }, async () => {
+      withEnv({ ...ENV_CLEAN, [FLAG]: 'true', SUPER_ADMIN_EMAILS: 'test@example.com' }, async () => {
         for (const r of dynamicRoutes) {
           serviceCalls.length = 0;
           const res = await call(base, r.method, r.path, { user: OWNER_A });
@@ -613,6 +629,14 @@ async function runWorkerProcess(script, env, { waitMs }) {
       // V2.1 fix round 1 (review G2 I4): el editor muestra los toggles V2.1 solo con rulesVersion 3.
       { label: 'ON + reglas v3 (DYNAMIC_MANIFEST_RULES_VERSION=3)', env: { [FLAG]: 'true', DYNAMIC_MANIFEST_RULES_VERSION: '3' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false, manifestRulesVersion: 3 } },
     ];
+    // EV6 DoD BE-B: la respuesta HTTP agrega `dodContract: true` y `superAdmin` (mismo chequeo del servidor).
+    for (const m of featureMatrix) m.want = { ...m.want, dodContract: true, superAdmin: false };
+    featureMatrix.push(
+      { label: 'BE-B: SUPER_ADMIN → superAdmin:true (sin lista de admins en la respuesta)', env: { [FLAG]: 'true', SUPER_ADMIN_EMAILS: 'otro@cursia.test, TEST@example.com' }, user: OWNER_C,
+        want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false, manifestRulesVersion: 1, dodContract: true, superAdmin: true } },
+      { label: 'BE-B: flag OFF también informa el contrato DoD y superAdmin', env: { SUPER_ADMIN_EMAILS: 'test@example.com' }, user: OWNER_A,
+        want: { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false, dodContract: true, superAdmin: true } },
+    );
     for (const m of featureMatrix) {
       await check(`GET /api/v1/features — ${m.label}`, () =>
         withEnv({ ...ENV_CLEAN, ...m.env }, async () => {
@@ -680,7 +704,7 @@ async function runWorkerProcess(script, env, { waitMs }) {
       withEnv({ ...ENV_CLEAN, ...m.env }, async () => {
         let manifestsCalled = false;
         const svc = new RunsService({ query: async () => { throw new Error('DB no esperada'); } }, { async get() { manifestsCalled = true; throw new Error(SENTINEL); } }, {});
-        const p = svc.startRun(1, m.owner, 1, { videoMode: 'mock' });
+        const p = svc.startRun(1, m.owner, 1, { videoMode: 'real' });
         if (m.allowed) await rejects(p, null, new RegExp(SENTINEL), 'debería llegar al manifest');
         else {
           await rejects(p, ForbiddenException, /no está habilitad/, 'debería ser 403');
@@ -828,9 +852,10 @@ async function runWorkerProcess(script, env, { waitMs }) {
    *  - 'active' → hay un run activo con `frozenMode`.
    *  - 'reopen' → el último run está cancelled con `frozenMode` (mismo contexto).
    */
-  function runsServiceFor(scenario, frozenMode) {
+  function runsServiceFor(scenario, frozenMode, { noVideos = false } = {}) {
     const state = { created: false, reopened: false };
-    const manifest = { id: 42, manifest: { items: [] } };
+    // EV6 DoD fix round 1 (I1): la elegibilidad de video real solo aplica si el Manifest tiene videos.
+    const manifest = { id: 42, manifest: { items: noVideos ? [] : [{ key: 'video:x', type: 'video', chapterId: 'x' }] } };
     const svc = new RunsService({ query: async () => [{ frontend_course_id: 'front-1' }] }, { async get() { return manifest; } }, {});
     const run = (status) => ({ id: 'run-1', status, worker_status: status, input_payload: { videoMode: frozenMode } });
     svc.findActiveRunRow = async () => (scenario === 'active' ? run('running') : null);
@@ -850,6 +875,10 @@ async function runWorkerProcess(script, env, { waitMs }) {
     // DN-1: estos escenarios prueban SOLO la allow-list de video real (I1); el
     // gate de entrega (YouTube) tiene su propio check (check-dynamic-youtube-delivery.js).
     svc.videoSubmissionsIfReopened = async () => 0;
+    svc.enforceVideoGate = async () => {};
+    // Sin FinopsBudgetService (harness): el gate de presupuesto tiene sus propios checks (check-v21-finops*).
+    svc.finopsStartGate = async () => null;
+    svc.finopsPaidWorkGate = async () => {};
     const hashOf = loadDist('modules/dynamic-generation/run-hash.js');
     contextHash = hashOf.canonicalContextHash(hashOf.normalizeCourseContext(CONTEXT));
     return { svc, state };
@@ -860,17 +889,25 @@ async function runWorkerProcess(script, env, { waitMs }) {
     { label: 'lista real vacía + real → 403', env: { ...REAL_ON, [REAL]: '' }, owner: OWNER_A, mode: 'real', scenario: 'new', ok: false },
     { label: 'listado + real → crea', env: { ...REAL_ON, [REAL]: OWNER_A }, owner: OWNER_A, mode: 'real', scenario: 'new', ok: true },
     { label: 'no listado + real → 403', env: { ...REAL_ON, [REAL]: OWNER_A }, owner: OWNER_B, mode: 'real', scenario: 'new', ok: false },
-    { label: 'lista real ausente + mock → crea', env: REAL_ON, owner: OWNER_B, mode: 'mock', scenario: 'new', ok: true },
-    { label: 'no listado + sin videoMode (default mock) → crea', env: { ...REAL_ON, [REAL]: OWNER_A }, owner: OWNER_B, mode: undefined, scenario: 'new', ok: true },
+    // EV6 DoD (BE-A): mock solo con el escape de QA; sin él → 403 video_preview_not_allowed.
+    { label: 'lista real ausente + mock + escape QA → crea', env: { ...REAL_ON, ...PREVIEW_ESCAPE }, owner: OWNER_B, mode: 'mock', scenario: 'new', ok: true },
+    { label: 'lista real ausente + mock SIN escape QA → 403 video_preview_not_allowed', env: REAL_ON, owner: OWNER_B, mode: 'mock', scenario: 'new', ok: false, re: /video_preview_not_allowed/ },
+    // EV6 DoD (BE-A): el default es REAL → un owner no listado recibe 403 claro (nunca una bajada silenciosa a mock).
+    { label: 'no listado + sin videoMode (default REAL) → 403 real_video_not_enabled', env: { ...REAL_ON, [REAL]: OWNER_A }, owner: OWNER_B, mode: undefined, frozen: 'real', scenario: 'new', ok: false, re: /real_video_not_enabled/ },
+    { label: 'listado + sin videoMode (default REAL) → crea', env: { ...REAL_ON, [REAL]: OWNER_A }, owner: OWNER_A, mode: undefined, frozen: 'real', scenario: 'new', ok: true },
+    // EV6 DoD fix round 1 (I1): un curso SIN videos arranca para cualquier owner (no hay Videogen que habilitar).
+    { label: 'no listado + sin videoMode, curso SIN videos → crea', env: { ...REAL_ON, [REAL]: OWNER_A }, owner: OWNER_B, mode: undefined, frozen: 'real', scenario: 'new', ok: true, noVideos: true },
+    { label: 'reabrir run real cancelado SIN videos, no listado → reabre', env: REAL_ON, owner: OWNER_B, mode: 'real', scenario: 'reopen', ok: true, noVideos: true },
+    { label: 'no listado + DYNAMIC_REAL_VIDEO_ALL_OWNERS=true + real → crea', env: { ...REAL_ON, [REAL]: OWNER_A, DYNAMIC_REAL_VIDEO_ALL_OWNERS: 'true' }, owner: OWNER_B, mode: 'real', scenario: 'new', ok: true },
     { label: 'run real ACTIVO existente, owner no listado → se reanuda (200)', env: REAL_ON, owner: OWNER_B, mode: 'real', scenario: 'active', ok: true },
     { label: 'reabrir run real cancelado, no listado → 403 (nuevo gasto)', env: REAL_ON, owner: OWNER_B, mode: 'real', scenario: 'reopen', ok: false },
     { label: 'reabrir run real cancelado, listado → reabre', env: { ...REAL_ON, [REAL]: OWNER_B }, owner: OWNER_B, mode: 'real', scenario: 'reopen', ok: true },
-    { label: 'reabrir run mock cancelado, no listado → reabre', env: REAL_ON, owner: OWNER_B, mode: 'mock', scenario: 'reopen', ok: true },
+    { label: 'reabrir run mock cancelado (escape QA), no listado → reabre', env: { ...REAL_ON, ...PREVIEW_ESCAPE }, owner: OWNER_B, mode: 'mock', scenario: 'reopen', ok: true },
   ];
   for (const m of realMatrix) {
     await check(`I1 startRun videoMode — ${m.label}`, () =>
       withEnv({ ...ENV_CLEAN, ...m.env }, async () => {
-        const { svc, state } = runsServiceFor(m.scenario, m.mode === undefined ? 'mock' : m.mode);
+        const { svc, state } = runsServiceFor(m.scenario, m.frozen || (m.mode === undefined ? 'mock' : m.mode), { noVideos: !!m.noVideos });
         const body = { ...CONTEXT };
         if (m.mode !== undefined) body.videoMode = m.mode;
         const p = svc.startRun(1, m.owner, 1, body);
@@ -880,13 +917,13 @@ async function runWorkerProcess(script, env, { waitMs }) {
           if (m.scenario === 'active') assert(!state.created && res.created === false && res.run.id === 'run-1', 'no devolvió el run activo');
           if (m.scenario === 'reopen') assert(state.reopened, 'no reabrió');
         } else {
-          await rejects(p, ForbiddenException, /video real/i, 'debería ser 403');
+          await rejects(p, ForbiddenException, m.re || /video real/i, 'debería ser 403');
           assert(!state.created && !state.reopened, 'creó/reabrió pese al 403');
         }
       }));
   }
   await check('I1 lista real inválida + real → 500 ruidoso; + mock → no afecta', () =>
-    withEnv({ ...ENV_CLEAN, [FLAG]: 'true', [REAL]: 'zz' }, async () => {
+    withEnv({ ...ENV_CLEAN, [FLAG]: 'true', [REAL]: 'zz', ...PREVIEW_ESCAPE }, async () => {
       const a = runsServiceFor('new', 'real');
       await rejects(a.svc.startRun(1, OWNER_A, 1, { ...CONTEXT, videoMode: 'real' }), InternalServerErrorException, /DYNAMIC_REAL_VIDEO_OWNERS/, 'real');
       assert(!a.state.created, 'creó');
@@ -919,7 +956,8 @@ async function runWorkerProcess(script, env, { waitMs }) {
       error: itemError ?? 'some_error',
       output_summary: {},
     };
-    const svc = new RunsService({ query: async () => [{ id: target.id, item_key: target.item_key, type: itemType, status: 'pending' }] }, { async get() { return { id: 42, manifest: { items: [] } }; } }, {});
+    // EV6 DoD fix round 1 (I1): el Manifest tiene un video (la allow-list de video real solo aplica con videos).
+    const svc = new RunsService({ query: async () => [{ id: target.id, item_key: target.item_key, type: itemType, status: 'pending' }] }, { async get() { return { id: 42, manifest: { items: [{ key: 'video:x', type: 'video', chapterId: 'x' }] } }; } }, {});
     svc.loadRunRow = async () => job;
     // Fix wave review-rv2: retryItem resuelve el Manifest DEL RUN (manifestOfRun), no el configurado.
     svc.manifestOfRun = async () => svc.manifests.get();
