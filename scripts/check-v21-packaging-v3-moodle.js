@@ -161,10 +161,13 @@ async function runConfig(cfg) {
   const hasCert = facts.finalExam.enabled;
   if (!hasCert) {
     // Fix round 1b (decisión M5): sin evaluación final no hay certificado.
-    check(`${tag} EV6 T3: sin evaluación final → sin insignia, sin enlace en el cierre y sin módulos ocultos`, () => {
+    // EV6 P2-B4 (ruling 3): sin certificado, el único oculto es la nota para docentes de «Respuestas
+    // explicadas» (solo si hay evaluaciones de módulo).
+    const wantHidden = facts.counts.exams > 0 ? ['cv3:shell:exams_teacher'] : [];
+    check(`${tag} EV6 T3: sin evaluación final → sin insignia, sin enlace en el cierre y sin más módulos ocultos que la nota para docentes de las evaluaciones`, () => {
       eq(o.badges, [], 'sin insignia');
       eq(o.closingBadgeLinks, [], 'sin enlace a insignias');
-      eq(cms.filter((c) => c.visible !== 1).map((c) => c.idnumber), [], 'sin módulos ocultos');
+      eq(cms.filter((c) => c.visible !== 1).map((c) => c.idnumber), wantHidden, 'módulos ocultos');
     });
   }
   if (hasCert) check(`${tag} EV6 T3: certificado = insignia de curso restaurada (criterio del curso NUEVO, imagen f1/f2/f3, enlace del cierre)`, () => {

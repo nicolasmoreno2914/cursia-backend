@@ -57,6 +57,7 @@ import {
   unprotectedText,
 } from './html';
 import { GRADE_METHOD_ES, attemptsValue } from './microcopy';
+import { EXAMS_TEACHER_NOTE, EXAMS_TEACHER_NOTE_ATTEMPTS, EXAMS_TEACHER_NOTE_AVAILABILITY, examExplanationsInfoText } from './exam-explanations';
 
 export interface ShellLabel {
   name: string;
@@ -345,6 +346,7 @@ function examInfo(
   kind: AssessableType,
   facts: CourseFacts,
   ctaText: string,
+  explained: boolean,
 ): ShellLabel {
   const k = facts.assessment.kinds[kind];
   const cs = { s: panelSurf(h), border: h.t.color.border };
@@ -357,7 +359,15 @@ function examInfo(
     .map((it) => numRow(h, it, cs.s))
     .join('');
   // Edu EV3: el botón lleva al cuestionario (el builder resuelve el marcador al crearlo).
-  const inner = eyebrow(h, 'Evaluación', cs.s) + heading(h, 'h3', title, cs.s) + pHtml(h, labelHtml(leadText), cs.s, { secondary: true }) + rows(h, items, { cls: 'cvc-cols2' }) + ctaButton(h, CTA_EXAM, ctaText, cs.s);
+  // EV6 P2-B4: la página «Respuestas explicadas» se anuncia aquí (está oculta hasta aprobar o agotar
+  // los intentos); los intentos salen de facts.
+  const inner =
+    eyebrow(h, 'Evaluación', cs.s) +
+    heading(h, 'h3', title, cs.s) +
+    pHtml(h, labelHtml(leadText), cs.s, { secondary: true }) +
+    rows(h, items, { cls: 'cvc-cols2' }) +
+    pHtml(h, labelHtml(examExplanationsInfoText(k.attempts, explained)), cs.s, { secondary: true, last: true }) +
+    ctaButton(h, CTA_EXAM, ctaText, cs.s);
   return out(name, root(h, uid, box(h, inner, cs)), facts);
 }
 
@@ -381,6 +391,7 @@ export function examInfoLabel(
     'exam',
     facts,
     `Presentar evaluación del módulo ${module.number} →`,
+    module.examBankSize !== undefined,
   );
 }
 
@@ -397,6 +408,7 @@ export function finalExamInfoLabel(facts: CourseFacts, theme: ResolvedTheme, opt
     'finalExam',
     facts,
     'Presentar evaluación final →',
+    facts.finalExam.bankSize !== undefined,
   );
 }
 
@@ -573,6 +585,36 @@ export function certificateTeacherLabel(badgeName: string, facts: CourseFacts, t
       ),
       cs.s,
     ) +
-    ctaButton(h, CTA_BADGES, 'Abrir las insignias del curso →', cs.s);
+    ctaButton(h, CTA_BADGES, 'Abrir las insignias del curso →', cs.s) +
+    // EV6 P2-B4 (rulings 2 + 3): el certificado exige la evaluación final → siempre hay «Respuestas
+    // explicadas»; su nota para docentes va aquí, un párrafo más.
+    // Fix 1 (M2): con su propio subtítulo, para no leerse como parte del paso de la insignia.
+    (hasExams(facts)
+      ? `<div${st(h, [['margin', '24px 0 0 0'], ['padding', '16px 0 0 0'], ['color', cs.s.fg], ['border-top', `1px solid ${cs.border}`]])}>` +
+        heading(h, 'h4', 'Respuestas explicadas', cs.s) +
+        pHtml(h, labelHtml(EXAMS_TEACHER_NOTE), cs.s, { last: true }) +
+        `</div>`
+      : '');
   return out('Para docentes: activar el certificado', root(h, 'shell-certificate-teacher', box(h, inner, cs, { cls: 'cvc-certificate-teacher' })), facts);
+}
+
+function hasExams(facts: CourseFacts): boolean {
+  return facts.counts.exams > 0 || facts.finalExam.enabled;
+}
+
+/**
+ * EV6 P2-B4 (rulings 2 + 3): label SOLO PARA DOCENTES (el builder lo empaqueta con `visible=0`) cuando
+ * el curso tiene evaluaciones pero no trae el label del certificado: el acceso condicional que
+ * necesitan las páginas «Respuestas explicadas» y la decisión de dar intentos adicionales.
+ */
+export function examsTeacherLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
+  if (!hasExams(facts)) shellFail('nota para docentes de las evaluaciones en un curso sin evaluaciones');
+  const h = hx(theme, opts);
+  const cs = toneSurf(h, 'alt');
+  const inner =
+    eyebrow(h, 'Solo docentes', cs.s) +
+    heading(h, 'h4', 'Para docentes: respuestas explicadas', cs.s) +
+    pHtml(h, labelHtml(EXAMS_TEACHER_NOTE_AVAILABILITY), cs.s) +
+    pHtml(h, labelHtml(EXAMS_TEACHER_NOTE_ATTEMPTS), cs.s, { last: true });
+  return out('Para docentes: respuestas explicadas', root(h, 'shell-exams-teacher', box(h, inner, cs, { cls: 'cvc-exams-teacher' })), facts);
 }

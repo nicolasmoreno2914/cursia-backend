@@ -386,8 +386,15 @@ async function main() {
 
   // EV6 T3: el label para docentes del certificado está OCULTO (visible=0): el estudiante no debe
   // verlo, así que no se mide aquí; su ausencia se comprueba aparte (browser-sections).
+  // EV6 P2-B4: sin certificado (sin evaluación final) la nota para docentes de «Respuestas explicadas»
+  // es su propio label oculto `cv3:shell:exams_teacher` (primera sección de evaluación): mismo trato.
   const TEACHER_ONLY = 'cv3:shell:certificate_teacher';
-  const cmsOf = (c) => c.moodle.cms.filter((x) => x.idnumber && x.idnumber !== TEACHER_ONLY && (x.modname === 'label' || x.modname === 'h5pactivity')).map((x) => [x.cmid, x.idnumber]);
+  const EXAMS_TEACHER = 'cv3:shell:exams_teacher';
+  const TEACHER_LABELS = new Set([TEACHER_ONLY, EXAMS_TEACHER]);
+  const cmsOf = (c) => c.moodle.cms.filter((x) => x.idnumber && !TEACHER_LABELS.has(x.idnumber) && (x.modname === 'label' || x.modname === 'h5pactivity')).map((x) => [x.cmid, x.idnumber]);
+  // EV6 P2-B4: páginas «Respuestas explicadas» (mod_page, availability show:false hasta aprobar o agotar
+  // intentos). El estudiante del QA no presenta evaluaciones → deben estar AUSENTES de su página de sección.
+  const explanationPagesOf = (c) => c.moodle.cms.filter((x) => /^cv3:(exam_explanations:.+|final_exam_explanations)$/.test(x.idnumber || ''));
   // EV6: se mide CADA página de sección (una sección por página) y se suman las métricas;
   // `perPage` corre en cada página ya cargada (p. ej. enlaces de respaldo de los videos).
   const pageMetrics = async (c, width, label, { mobile = false, openAll = false, shot = true, perPage = null } = {}) => {
@@ -437,14 +444,34 @@ async function main() {
     const hidden = c.moodle.cms.filter((x) => x.visible === 0);
     // Fix round 1b: el certificado (y su label para docentes) existe SOLO con evaluación final.
     const withCert = c.moodle.cms.some((x) => x.idnumber === 'cv3:final_exam');
-    eq(hidden.map((x) => x.idnumber), withCert ? [TEACHER_ONLY] : [], `${c.key}: módulos ocultos = ${withCert ? 'solo el label para docentes del certificado' : 'ninguno (sin evaluación final no hay certificado)'}`);
+    // P2-B4: sin certificado, el único oculto es la nota para docentes de las evaluaciones (si hay evaluación de módulo).
+    const withModuleExam = c.moodle.cms.some((x) => /^cv3:exam:/.test(x.idnumber || ''));
+    const wantHidden = withCert ? [TEACHER_ONLY] : withModuleExam ? [EXAMS_TEACHER] : [];
+    eq(hidden.map((x) => x.idnumber), wantHidden, `${c.key}: módulos ocultos = ${withCert ? 'solo el label para docentes del certificado' : withModuleExam ? 'solo la nota para docentes de «Respuestas explicadas» (sin evaluación final no hay certificado)' : 'ninguno'}`);
     const t = hidden[0];
     const closing = c.moodle.cms.find((x) => x.idnumber === 'cv3:shell:closing');
-    if (t && closing) {
+    if (t) {
+      // El label para docentes vive en el cierre (certificado) o en la primera sección de evaluación (P2-B4).
       await b.navigate(`${WWW}${sectionPath(c, t.cmid)}`);
       await sleep(1200);
-      const v = await b.evaluate(`(()=>({teacher:!!document.getElementById('module-${t.cmid}'),closing:!!document.getElementById('module-${closing.cmid}'),txt:/Para docentes|Habilitar acceso/.test(document.body.innerText)}))()`);
-      eq(v, { teacher: false, closing: true, txt: false }, `${c.key}: el estudiante NO ve el label para docentes (sí el cierre) en la sección del cierre`);
+      const v = await b.evaluate(`(()=>({teacher:!!document.getElementById('module-${t.cmid}'),txt:/Para docentes|Habilitar acceso|Solo docentes/.test(document.body.innerText)}))()`);
+      eq(v, { teacher: false, txt: false }, `${c.key}: el estudiante NO ve el label para docentes (${t.idnumber}) en su sección`);
+    }
+    if (closing) {
+      await b.navigate(`${WWW}${sectionPath(c, closing.cmid)}`);
+      await sleep(1200);
+      const v = await b.evaluate(`(()=>({closing:!!document.getElementById('module-${closing.cmid}'),txt:/Para docentes|Habilitar acceso|Solo docentes/.test(document.body.innerText)}))()`);
+      eq(v, { closing: true, txt: false }, `${c.key}: el estudiante ve el cierre en «Cierre del curso» y ningún texto para docentes`);
+    }
+    // P2-B4: antes de aprobar/agotar, cada página «Respuestas explicadas» está AUSENTE para el estudiante
+    // (ni el módulo ni un enlace a mod/page/view.php en su sección; show:false = sin aviso de restricción).
+    const gated = explanationPagesOf(c);
+    eq(gated.length, c.moodle.cms.filter((x) => x.modname === 'quiz').length, `${c.key}: una página «Respuestas explicadas» por evaluación en el curso restaurado`);
+    for (const p of gated) {
+      await b.navigate(`${WWW}${sectionPath(c, p.cmid)}`);
+      await sleep(1000);
+      const v = await b.evaluate(`(()=>({module:!!document.getElementById('module-${p.cmid}'),link:!!document.querySelector('a[href*="/mod/page/view.php?id=${p.cmid}"]'),name:/Respuestas explicadas —/.test(document.body.innerText)}))()`);
+      eq(v, { module: false, link: false, name: false }, `${c.key}: ${p.idnumber} ausente para el estudiante antes de aprobar o agotar los intentos`);
     }
   }
   area = 'browser';

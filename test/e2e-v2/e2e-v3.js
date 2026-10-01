@@ -752,6 +752,9 @@ function reservationBookkeeping(ev) {
         want.push([1, ['cv3:shell:route', 'cv3:shell:libro', 'cv3:shell:libro_card', 'cv3:shell:audiobook', 'cv3:shell:route_start']]);
         const secOfCh = {}; const secOfExam = {}; const firstSecOfMod = {};
         let sn = 2;
+        // EV6 P2-B4: sin evaluación final (= sin certificado) la nota oculta para docentes de «Respuestas
+        // explicadas» abre la PRIMERA sección de evaluación; cada quiz va seguido de su página.
+        let examsTeacherNote = !M.features.finalExam;
         for (const mod of M.modules) {
           mod.chapters.forEach((ch, ci) => {
             const ids = ci === 0 ? [`cv3:module_intro:${mod.moduleId}`] : [];
@@ -764,10 +767,16 @@ function reservationBookkeeping(ev) {
             secOfCh[ch.chapterId] = sn;
             want.push([sn++, ids]);
           });
-          if (mod.examEnabled) { secOfExam[mod.moduleId] = sn; want.push([sn++, [`cv3:exam_info:${mod.moduleId}`, `cv3:exam:${mod.moduleId}`, `cv3:module_next:${mod.moduleId}`]]); }
+          if (mod.examEnabled) {
+            secOfExam[mod.moduleId] = sn;
+            const ids = [`cv3:exam_info:${mod.moduleId}`, `cv3:exam:${mod.moduleId}`, `cv3:exam_explanations:${mod.moduleId}`, `cv3:module_next:${mod.moduleId}`];
+            if (examsTeacherNote) ids.unshift('cv3:shell:exams_teacher');
+            examsTeacherNote = false;
+            want.push([sn++, ids]);
+          }
         }
         const finalSec = M.features.finalExam ? sn : null;
-        if (M.features.finalExam) want.push([sn++, ['cv3:final_exam_info', 'cv3:final_exam', 'cv3:final_exam_next']]);
+        if (M.features.finalExam) want.push([sn++, ['cv3:final_exam_info', 'cv3:final_exam', 'cv3:final_exam_explanations', 'cv3:final_exam_next']]);
         const closingSec = sn;
         // EV6 T3: + label oculto para docentes (activar la insignia-certificado) al final del cierre;
         // fix round 1b: el certificado existe SOLO con evaluación final.
