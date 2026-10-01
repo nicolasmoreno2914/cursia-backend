@@ -435,7 +435,9 @@ async function main() {
     // EV6 T3: el ÚNICO módulo oculto es el label para docentes del certificado y el estudiante NO lo ve
     // (ni en su página de sección, que es la del cierre); el cierre sí está.
     const hidden = c.moodle.cms.filter((x) => x.visible === 0);
-    eq(hidden.map((x) => x.idnumber), [TEACHER_ONLY], `${c.key}: único módulo oculto = label para docentes del certificado`);
+    // Fix round 1b: el certificado (y su label para docentes) existe SOLO con evaluación final.
+    const withCert = c.moodle.cms.some((x) => x.idnumber === 'cv3:final_exam');
+    eq(hidden.map((x) => x.idnumber), withCert ? [TEACHER_ONLY] : [], `${c.key}: módulos ocultos = ${withCert ? 'solo el label para docentes del certificado' : 'ninguno (sin evaluación final no hay certificado)'}`);
     const t = hidden[0];
     const closing = c.moodle.cms.find((x) => x.idnumber === 'cv3:shell:closing');
     if (t && closing) {

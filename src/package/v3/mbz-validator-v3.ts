@@ -471,12 +471,16 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     if (cctx !== backupCourseCtx || backupCourseCtx === num(tag(mb, 'original_system_contextid'))) {
       add('CERTIFICATE', 'moodle_backup.xml', `contexto del curso ${cctx}/${backupCourseCtx} inválido (no puede ser el de sistema: la imagen de la insignia se restauraría en el contexto de sistema)`);
     }
-    // Sin criterios de completion el curso nunca se completa: no debe haber insignia ni panel.
-    if (gotCrit.length + gradeCrit.length === 0) {
+    // Fix round 1b (decisión M5): el certificado existe SOLO con evaluación final. Sin ella: ni
+    // insignia, ni imagen, ni setting badges, ni panel, ni label para docentes.
+    if (!gradedActs.some((g) => g.kind === 'finalExam')) {
       const bx0 = (await text('badges.xml')) ?? '';
       const closing0 = acts.find((a) => a.idnumber === 'cv3:shell:closing');
-      if (blocks(bx0, 'badge').length > 0) add('CERTIFICATE', 'completion.xml', 'el curso no tiene criterios de completion: la insignia nunca se otorgaría');
-      if (closing0 && /BADGESVIEWBYID/.test(closing0.intro)) add('CERTIFICATE', 'cv3:shell:closing', 'promete un certificado inalcanzable (sin criterios de completion)');
+      const set0 = blocks(tag(mb, 'settings') ?? '', 'setting').find((b) => tag(b, 'level') === 'root' && tag(b, 'name') === 'badges');
+      if (blocks(bx0, 'badge').length > 0) add('CERTIFICATE', W, 'curso sin evaluación final con insignia-certificado');
+      if (set0 && tag(set0, 'value') !== '0') add('CERTIFICATE', 'moodle_backup.xml', 'curso sin evaluación final con el setting badges ≠ 0');
+      if (files.some((f) => f.component === 'badges')) add('CERTIFICATE', 'files.xml', 'curso sin evaluación final con imagen de insignia');
+      if (closing0 && /BADGESVIEWBYID|certificad/i.test(`${closing0.intro} ${extractText(closing0.intro)}`)) add('CERTIFICATE', 'cv3:shell:closing', 'curso sin evaluación final que promete un certificado');
       if (acts.some((a) => a.idnumber === 'cv3:shell:certificate_teacher')) add('CERTIFICATE', 'cv3:shell:certificate_teacher', 'label para docentes sin insignia en el paquete');
       checkHidden(null);
       return;
@@ -508,13 +512,17 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       moduleExams: kindsReq.has('exam'),
       finalExam: kindsReq.has('finalExam'),
       courseGrade: gradeCrit.length > 0,
-      libroView: acts.some((a) => viewCompletion(a) && critSet.has(a.mid)),
     };
-    const wantDesc = courseBadgeDescription(safeActivityName(facts.course.title, 254), req);
-    const desc = unxml(tag(b, 'description') ?? '');
-    if (desc !== wantDesc) add('CERTIFICATE', W, `descripción «${desc}» ≠ criterios reales «${wantDesc}»`);
-    const closingTxt = extractText(acts.find((a) => a.idnumber === 'cv3:shell:closing')?.intro ?? '');
-    if (!closingTxt.includes(closingCertificateText(req))) add('CERTIFICATE', 'cv3:shell:closing', `el panel no enuncia los criterios reales: «${closingCertificateText(req)}»`);
+    if (!req.finalExam) {
+      // (el chequeo de completion de abajo también lo reporta) — el validador nunca lanza.
+      add('CERTIFICATE', 'completion.xml', 'la insignia existe pero la evaluación final no es criterio de completion');
+    } else {
+      const wantDesc = courseBadgeDescription(safeActivityName(facts.course.title, 254), req);
+      const desc = unxml(tag(b, 'description') ?? '');
+      if (desc !== wantDesc) add('CERTIFICATE', W, `descripción «${desc}» ≠ criterios reales «${wantDesc}»`);
+      const closingTxt = extractText(acts.find((a) => a.idnumber === 'cv3:shell:closing')?.intro ?? '');
+      if (!closingTxt.includes(closingCertificateText(req))) add('CERTIFICATE', 'cv3:shell:closing', `el panel no enuncia los criterios reales: «${closingCertificateText(req)}»`);
+    }
     const crits = blocks(b, 'criterion').map((c) => ({
       type: num(tag(c, 'criteriatype')),
       method: num(tag(c, 'method')),

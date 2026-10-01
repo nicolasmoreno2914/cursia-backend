@@ -765,8 +765,10 @@ function reservationBookkeeping(ev) {
         const finalSec = M.features.finalExam ? sn : null;
         if (M.features.finalExam) want.push([sn++, ['cv3:final_exam_info', 'cv3:final_exam', 'cv3:final_exam_next']]);
         const closingSec = sn;
-        // EV6 T3: + label oculto para docentes (activar la insignia-certificado) al final del cierre.
-        want.push([closingSec, ['cv3:shell:closing', 'cv3:shell:certificate_teacher']]);
+        // EV6 T3: + label oculto para docentes (activar la insignia-certificado) al final del cierre;
+        // fix round 1b: el certificado existe SOLO con evaluación final.
+        want.push([closingSec, M.features.finalExam ? ['cv3:shell:closing', 'cv3:shell:certificate_teacher'] : ['cv3:shell:closing']]);
+        eq((o.badges || []).length, M.features.finalExam ? 1 : 0, `${label}: insignia-certificado ${M.features.finalExam ? 'presente (hay evaluación final)' : 'ausente (sin evaluación final)'}`);
         eq(o.sections.map((s) => [s.section, s.cms.map((c) => c.idnumber)]), want, `${label}: secciones × actividades por UUID = orden del ensamblador de capítulo (una sección por capítulo / evaluación)`);
         const secIdx = (idn) => o.sections.findIndex((s) => s.cms.some((c) => c.idnumber === idn));
         ok(secIdx('cv3:shell:closing') === o.sections.length - 1 && (!M.features.finalExam || secIdx('cv3:final_exam') < secIdx('cv3:shell:closing')),

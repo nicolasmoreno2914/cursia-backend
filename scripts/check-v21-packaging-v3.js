@@ -567,10 +567,23 @@ const MATRIX = [
       const { r } = built[cfg.id];
       const z = await JSZip.loadAsync(r.mbz);
       const bx = await z.file('badges.xml').async('string');
+      if (!cfg.finalExam) {
+        // Fix round 1b (decisión M5): sin evaluación final no hay certificado (ni insignia, ni imagen,
+        // ni setting, ni panel, ni label para docentes) y el resumen lo avisa.
+        assert(!/<badge id/.test(bx), `${cfg.id}: sin insignia`);
+        assert(/<name>badges<\/name>\n      <value>0<\/value>/.test(await z.file('moodle_backup.xml').async('string')), `${cfg.id}: setting badges = 0`);
+        assert(!(await z.file('files.xml').async('string')).includes('<component>badges</component>'), `${cfg.id}: sin imagen`);
+        const { acts } = await actDirs(r.mbz);
+        const lx = await z.file(`${acts.find((a) => a.idnumber === 'cv3:shell:closing').dir}/label.xml`).async('string');
+        assert(!/BADGESVIEWBYID|certificad/i.test(lx), `${cfg.id}: el cierre no promete certificado`);
+        assert(!acts.some((a) => a.idnumber === 'cv3:shell:certificate_teacher'), `${cfg.id}: sin label docente`);
+        assert(r.summary.warnings.includes('certificate_omitted:no_final_exam'), `${cfg.id}: aviso certificate_omitted:no_final_exam`);
+        continue;
+      }
       const title = r.expectations.facts.course.title;
       assert(bx.includes(`<name>Certificado: ${title}</name>`), `${cfg.id}: nombre`);
       // Fix round 1 (review I1): perfil por defecto → se exige aprobar TODO lo calificable, nombrado por tipo.
-      const kinds = ['todas las actividades prácticas', 'todos los videos interactivos', 'todas las evaluaciones de módulo', ...(cfg.finalExam ? ['la evaluación final'] : [])];
+      const kinds = ['todas las actividades prácticas', 'todos los videos interactivos', 'todas las evaluaciones de módulo', 'la evaluación final'];
       const list = `${kinds.slice(0, -1).join(', ')} y ${kinds[kinds.length - 1]}`;
       const desc = `Otorgado al completar el curso «${title}»: aprobar ${list}.`;
       assert(bx.includes(`<description>${desc}</description>`), `${cfg.id}: descripción`);
@@ -646,14 +659,14 @@ const MATRIX = [
     assert(lx.includes('Cuando apruebes todas las evaluaciones de módulo y la evaluación final y alcances la nota mínima del curso, Moodle te otorga'), 'panel');
     assert(!/actividades prácticas|videos interactivos/.test(lx), 'no nombra lo que no se exige');
   });
-  await check('EV6 T3: perfil sin criterios de completion y sin evaluación final → sin insignia inalcanzable (badges.xml vacío, setting 0, sin panel) y lo avisa', async () => {
+  await check('EV6 T3: sin evaluación final (aunque el perfil exija todo lo demás o nada) → sin certificado y aviso certificate_omitted:no_final_exam', async () => {
     const input = PF.packagingInput(distRoot, MATRIX[1]);
     input.assessmentProfile = JSON.parse(JSON.stringify(input.assessmentProfile));
     input.assessmentProfile.courseCompletion = { requireAllChapterActivities: false, requireExams: false, requireCourseGradePass: false };
     const r = await B.buildDynamicMbzV3(input);
     const v = await validate(r);
     assert(v.ok, JSON.stringify(v.issues.slice(0, 3)));
-    assert(r.summary.warnings.includes('certificate_omitted:no_completion_criteria'), 'aviso');
+    assert(r.summary.warnings.includes('certificate_omitted:no_final_exam'), 'aviso');
     const { z, acts } = await actDirs(r.mbz);
     assert(!/<badge id/.test(await z.file('badges.xml').async('string')), 'sin insignia');
     assert(/<name>badges<\/name>\n      <value>0<\/value>/.test(await z.file('moodle_backup.xml').async('string')), 'setting badges = 0');
@@ -713,6 +726,13 @@ const MATRIX = [
         assert(!v.ok && v.issues.some((i) => i.code === 'CERTIFICATE'), `esperaba CERTIFICATE, hallazgos: ${JSON.stringify(v.issues.slice(0, 4))}`);
       });
     }
+    await check('validador detecta CERTIFICATE: insignia en un curso SIN evaluación final (fix round 1b)', async () => {
+      const nf = built['scorm-nofinal-dark'].r;
+      const bxWith = await (await JSZip.loadAsync(base.r.mbz)).file('badges.xml').async('string');
+      const bad = await mutate(nf.mbz, { 'badges.xml': () => bxWith });
+      const v = await V.validateMbzV3(bad, nf.expectations);
+      assert(!v.ok && v.issues.some((i) => i.code === 'CERTIFICATE' && /sin evaluación final/.test(i.message)), JSON.stringify(v.issues.slice(0, 4)));
+    });
     await check('validador detecta TOKEN_INVALID: $@BADGESVIEWBYID@$ que no apunta al curso del backup', async () => {
       const a = find(/^cv3:shell:closing$/);
       const bad = await mutate(base.r.mbz, { [`${a.dir}/label.xml`]: (x) => x.split('$@BADGESVIEWBYID*1@$').join('$@BADGESVIEWBYID*7@$') });

@@ -481,8 +481,6 @@ export interface CertificateRequirements {
   finalExam: boolean;
   /** Criterio de nota del curso (`requireCourseGradePass`). */
   courseGrade: boolean;
-  /** Curso sin nota: la completion es abrir el Libro Guía. */
-  libroView: boolean;
 }
 
 function joinEs(xs: string[]): string {
@@ -491,7 +489,10 @@ function joinEs(xs: string[]): string {
 
 /** Condiciones de la insignia en subjuntivo («apruebes…») o infinitivo («aprobar…»). */
 export function certificateRequirementClauses(r: CertificateRequirements, mood: 'sub' | 'inf'): string {
-  const v = mood === 'sub' ? { pass: 'apruebes', reach: 'alcances', open: 'abras' } : { pass: 'aprobar', reach: 'alcanzar', open: 'abrir' };
+  // Fix round 1b (decisión M5): «Curso completo → Evaluación final aprobada → Cierre → Certificado»:
+  // el certificado existe SOLO si el curso tiene evaluación final (y siempre la exige aprobada).
+  if (!r.finalExam) shellFail('certificado: solo existe con evaluación final (y la exige aprobada)');
+  const v = mood === 'sub' ? { pass: 'apruebes', reach: 'alcances' } : { pass: 'aprobar', reach: 'alcanzar' };
   const items: string[] = [];
   if (r.activities) items.push('todas las actividades prácticas');
   if (r.videos) items.push('todos los videos interactivos');
@@ -500,8 +501,6 @@ export function certificateRequirementClauses(r: CertificateRequirements, mood: 
   const clauses: string[] = [];
   if (items.length) clauses.push(`${v.pass} ${joinEs(items)}`);
   if (r.courseGrade) clauses.push(`${v.reach} la nota mínima del curso`);
-  if (r.libroView) clauses.push(`${v.open} el Libro Guía`);
-  if (!clauses.length) shellFail('certificado: sin criterios de completion (la insignia nunca se otorgaría)');
   return joinEs(clauses);
 }
 

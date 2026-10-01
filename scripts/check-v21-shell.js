@@ -107,12 +107,14 @@ function factsOf(course, opts = {}) {
   });
 }
 
-/** EV6 T3: requisitos de la insignia como los arma el builder con el perfil por defecto (todo lo calificable). */
+/**
+ * EV6 T3: requisitos de la insignia como los arma el builder con el perfil por defecto (todo lo
+ * calificable). Fix round 1b: SIN evaluación final no hay certificado (undefined → sin panel).
+ */
 function certReqOf(facts) {
   const c = facts.counts;
-  const r = { activities: c.activities > 0, videos: c.videos > 0, moduleExams: c.exams > 0, finalExam: facts.finalExam.enabled, courseGrade: false, libroView: false };
-  // Curso sin nada calificable (sin nota): la completion es abrir el Libro Guía.
-  return Object.values(r).some(Boolean) ? r : { ...r, libroView: true };
+  if (!facts.finalExam.enabled) return undefined;
+  return { activities: c.activities > 0, videos: c.videos > 0, moduleExams: c.exams > 0, finalExam: true, courseGrade: false };
 }
 
 /** Todos los labels del shell de un curso. */
@@ -480,7 +482,7 @@ async function pureChecks() {
   await check('EV6 T3: cierre con panel «Tu certificado» (texto según los criterios reales, botón a la insignia, CLEAN_SAFE y ENHANCED)', () => {
     const ci = F.courseIntroFixture();
     const txt = (f, cert, level) => vc.extractText(S.closingLabel(f, ci, THEME, level ? { level } : undefined, cert).html);
-    const R0 = { activities: false, videos: false, moduleExams: false, finalExam: false, courseGrade: false, libroView: false };
+    const R0 = { activities: false, videos: false, moduleExams: false, finalExam: true, courseGrade: false };
     const all2 = certReqOf(f2);
     assert(all2.activities && all2.videos && all2.moduleExams && all2.finalExam, 'f2 tiene los cuatro tipos');
     for (const level of [undefined, 'enhanced']) {
@@ -493,19 +495,19 @@ async function pureChecks() {
     }
     // Fix round 1 (review I1): cada combinación nombra SOLO lo que la completion exige.
     const cases = [
-      [{ ...R0, finalExam: true }, 'Cuando apruebes la evaluación final, Moodle'],
-      [{ ...R0, moduleExams: true, finalExam: true }, 'Cuando apruebes todas las evaluaciones de módulo y la evaluación final, Moodle'],
+      [R0, 'Cuando apruebes la evaluación final, Moodle'],
+      [{ ...R0, moduleExams: true }, 'Cuando apruebes todas las evaluaciones de módulo y la evaluación final, Moodle'],
       [{ ...all2, courseGrade: true }, 'y la evaluación final y alcances la nota mínima del curso, Moodle'],
-      [{ ...R0, courseGrade: true }, 'Cuando alcances la nota mínima del curso, Moodle'],
-      [{ ...R0, activities: true }, 'Cuando apruebes todas las actividades prácticas, Moodle'],
-      [{ ...R0, libroView: true }, 'Cuando abras el Libro Guía, Moodle'],
+      [{ ...R0, courseGrade: true }, 'Cuando apruebes la evaluación final y alcances la nota mínima del curso, Moodle'],
+      [{ ...R0, activities: true }, 'Cuando apruebes todas las actividades prácticas y la evaluación final, Moodle'],
     ];
     for (const [req, want] of cases) assert(txt(f2, req).includes(want), `${JSON.stringify(req)} → «${want}»: ${txt(f2, req)}`);
     for (const [req] of cases) assert(!/complet(es|a) todas/.test(txt(f2, req)), 'nunca «completes» para un ítem que exige aprobar');
-    throwsRe(() => S.closingLabel(f2, ci, THEME, undefined, R0), /sin criterios de completion/, 'sin criterios no hay panel posible');
-    throwsRe(() => S.closingLabel(f4, ci, THEME, undefined, { ...R0, finalExam: true }), /evaluación final que el curso no tiene/, 'certificado con final en un curso sin final');
-    const f4noVid = f4.counts.videos === 0;
-    if (f4noVid) throwsRe(() => S.closingLabel(f4, ci, THEME, undefined, { ...R0, videos: true }), /tipo de ítem que el curso no tiene/, 'videos inexistentes');
+    // Fix round 1b (decisión M5): el certificado existe SOLO con evaluación final.
+    throwsRe(() => S.closingLabel(f2, ci, THEME, undefined, { ...all2, finalExam: false }), /solo existe con evaluación final/, 'sin final no hay panel posible');
+    throwsRe(() => S.closingLabel(f4, ci, THEME, undefined, R0), /evaluación final que el curso no tiene/, 'certificado con final en un curso sin final');
+    eq(certReqOf(f4), undefined, 'f4 (sin evaluación final): sin certificado');
+    assert(!/certificad|Libro Guía, Moodle/i.test(vc.extractText(S.closingLabel(f4, ci, THEME, undefined, certReqOf(f4)).html)), 'f4: el cierre no promete certificado');
     const sin = txt(f2, undefined);
     assert(!/certificad/i.test(sin) && !S.closingLabel(f2, ci, THEME).html.includes('cursia-cta://badges'), 'sin certificate no hay panel');
     eq(S.CTA_BADGES, 'cursia-cta://badges', 'marcador');

@@ -947,13 +947,12 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     moduleExams: critKinds.has('exam'),
     finalExam: critKinds.has('finalExam'),
     courseGrade: resolved.courseCompletion.requireCourseGradePass,
-    libroView: !!resolved.withoutGrades && completionCriteria.some((x) => x.moduleId === libroMid),
   };
-  // Sin ningún criterio (perfil sin exigencias y sin evaluación final) el curso nunca se completa:
-  // no se empaqueta una insignia inalcanzable ni se promete en el cierre.
-  const hasCertificate = Object.values(certificateReq).some(Boolean);
+  // Fix round 1b (decisión M5, flujo del usuario «Curso completo → Evaluación final aprobada →
+  // Cierre → Certificado»): insignia, panel y label para docentes SOLO si hay evaluación final.
+  const hasCertificate = finalExamMid !== null && certificateReq.finalExam;
   const certificate = hasCertificate ? certificateReq : undefined;
-  if (!hasCertificate) warnings.push('certificate_omitted:no_completion_criteria');
+  if (!hasCertificate) warnings.push('certificate_omitted:no_final_exam');
   addLabel(closing, 'cv3:shell:closing', closingLabel(facts, courseIntro, theme, opts, certificate));
   // Fix 0b: Moodle restaura la insignia DESACTIVADA → label oculto (visible=0) para el docente con
   // el paso único «Habilitar acceso» y el botón a las insignias del curso. El estudiante no lo ve.
