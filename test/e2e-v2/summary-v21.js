@@ -95,6 +95,12 @@ if (v3 && v3.counters) {
   const c = v3.counters;
   console.log(`  fakes locales alcanzados (v3): ${JSON.stringify(c.fakeReached)}`);
   console.log(`  LLM inválido 1 vez por tipo: ${JSON.stringify(c.fakeLlmInvalidFirst)} → reintentos: ${JSON.stringify(c.fakeLlmRetriesSeen)}`);
+  // P2-B6: evaluaciones como bancos (E1/E3, override de la prueba) — una falla inyectada → una reparación.
+  if (c.examBank) {
+    console.log(`  bancos de preguntas (P2-B6): ${c.examBank.calls} llamadas de banco, ${c.examBank.repairs} reparación(es); ` +
+      (c.examBank.items || []).map((x) => `${x.course} ${x.itemKey.split(':')[0]} ${x.bankSize}/${x.slots}${x.repaired ? ` (${x.repaired} reparadas)` : ''}`).join(', '));
+    if (c.examBank.repairs !== 1) rows.push(['Bancos de preguntas (P2-B6)', 0, 1, `reparaciones = ${c.examBank.repairs} (se esperaba exactamente 1)`]);
+  } else if (v3 && !v3.aborted && v3.courses && v3.courses.E1) rows.push(['Bancos de preguntas (P2-B6)', 0, 1, 'sin contadores examBank en results-v3.json']);
 }
 if (v3 && v3.finops) console.log(`  ledger v3 (proveedor/fuente/operación): ${JSON.stringify(v3.finops.ledgerV3)}`);
 const fcFile = path.join(S, 'forceclean-final.txt');
