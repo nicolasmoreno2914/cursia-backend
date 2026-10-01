@@ -471,6 +471,13 @@ export function courseCompletionXml(p: CourseCompletionXmlInput): string {
  * Campos de evaluación de `quiz.xml` (§K.3). En el backup el campo de
  * intentos se llama `attempts_number` (mod/quiz/backup/moodle2). `sumgrades`
  * y `grade` = 100: los `maxmark` de las preguntas deben sumar 100.
+ *
+ * P2-B1 (EV6 Fase 2): `completionattemptsexhausted` se fija aquí mismo, junto
+ * a `attempts_number`, para que los dos nunca puedan quedar en desacuerdo —
+ * 1 cuando hay un tope de intentos (se agotan), 0 con intentos ilimitados
+ * (`attempts = 0`, que por definición nunca se agota). Sin esta bandera, un
+ * solo intento fallido ya marcaría el quiz como completado-sin-aprobar
+ * (`mod/quiz/classes/completion/custom_completion.php`); ver P2-design.md §1.
  */
 export function quizAttemptsXmlFields(p: { attempts: number; grademethod: GradeMethod }): Record<string, string> {
   assertInt(p.attempts, 'attempts', 0);
@@ -480,6 +487,7 @@ export function quizAttemptsXmlFields(p: { attempts: number; grademethod: GradeM
     grademethod: String(gradeMethodCode(QUIZ_GRADE_METHOD, p.grademethod, 'grademethod')),
     sumgrades: moodleDecimal(100),
     grade: moodleDecimal(100),
+    completionattemptsexhausted: p.attempts > 0 ? '1' : '0',
   };
 }
 

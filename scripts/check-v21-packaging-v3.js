@@ -200,6 +200,47 @@ const MATRIX = [
     });
   }
 
+  // P2-B1 (EV6 Fase 2 — exámenes): cada quiz_*/quiz.xml (examen de módulo y examen final) de TODA la
+  // matriz lleva exactamente los 8 campos de revisión de QUIZ_REVIEW_V3 y, con el perfil por defecto
+  // (intentos 3), completionattemptsexhausted 1.
+  await check('P2-B1: todo quiz.xml de la matriz tiene la política de revisión y completionattemptsexhausted = (attempts_number > 0)', async () => {
+    let quizzes = 0;
+    for (const cfg of MATRIX) {
+      const { z, acts } = await actDirs(built[cfg.id].r.mbz);
+      for (const a of acts.filter((x) => x.modname === 'quiz')) {
+        const x = await z.file(`${a.dir}/quiz.xml`).async('string');
+        for (const [field, want] of Object.entries(MA.QUIZ_REVIEW_V3)) {
+          const got = new RegExp(`<${field}>(\\d+)</${field}>`).exec(x)?.[1];
+          eq(Number(got), want, `${cfg.id} ${a.idnumber}: ${field}`);
+        }
+        const attempts = Number(/<attempts_number>(\d+)<\/attempts_number>/.exec(x)[1]);
+        const exhausted = /<completionattemptsexhausted>(\d+)<\/completionattemptsexhausted>/.exec(x)[1];
+        eq(exhausted, attempts > 0 ? '1' : '0', `${cfg.id} ${a.idnumber}: completionattemptsexhausted vs attempts_number ${attempts}`);
+        quizzes++;
+      }
+    }
+    assert(quizzes >= MATRIX.filter((c) => c.finalExam).length + MATRIX.length, `se revisaron ${quizzes} quizzes`);
+  });
+
+  // P2-B1 acceptance A1: `attempts: { exam: 0 }` → completionattemptsexhausted 0 solo en el examen de
+  // módulo (intentos ilimitados nunca se agotan); el examen final, con el perfil por defecto, sigue en 1.
+  await check('P2-B1: attempts.exam = 0 (ilimitado) → completionattemptsexhausted 0 en el examen de módulo', async () => {
+    const defaults = PROF.defaultAssessmentProfile({ finalExam: true });
+    const profile = { ...defaults, attempts: { ...defaults.attempts, exam: 0 } };
+    const { r } = await build({ engine: 'h5p', finalExam: true, profile });
+    const v = await validate(r);
+    assert(v.ok, `hallazgos: ${JSON.stringify(v.issues.slice(0, 5))}`);
+    const { z, acts } = await actDirs(r.mbz);
+    const moduleExam = acts.find((a) => /^cv3:exam:/.test(a.idnumber));
+    const finalExam = acts.find((a) => a.idnumber === 'cv3:final_exam');
+    const examXml = await z.file(`${moduleExam.dir}/quiz.xml`).async('string');
+    const finalXml = await z.file(`${finalExam.dir}/quiz.xml`).async('string');
+    eq(/<attempts_number>(\d+)<\/attempts_number>/.exec(examXml)[1], '0', 'examen de módulo: intentos ilimitados');
+    eq(/<completionattemptsexhausted>(\d+)<\/completionattemptsexhausted>/.exec(examXml)[1], '0', 'examen de módulo: nunca se agota');
+    eq(/<attempts_number>(\d+)<\/attempts_number>/.exec(finalXml)[1], '3', 'examen final: intentos del perfil sin tocar');
+    eq(/<completionattemptsexhausted>(\d+)<\/completionattemptsexhausted>/.exec(finalXml)[1], '1', 'examen final: sigue agotándose');
+  });
+
   // Aceptación staging V2.1: el Visual System prohíbe franjas laterales (border-left/right > 1px como acento).
   // Se escanea TODO texto del paquete: XML de actividades/labels (HTML escapado), Libro, blobs de texto.
   await check('Visual System: ningún HTML del paquete v3 usa franja lateral (border-left/right > 1px), en toda la matriz', async () => {
@@ -542,6 +583,21 @@ const MATRIX = [
     ['STRUCTURE', () => {
       const a = find(/^cv3:exam:/);
       return { [`${a.dir}/inforef.xml`]: (x) => x.replace(/(<grade_itemref>\s*<grade_item><id>)(\d+)/, (m, pre, id) => `${pre}${Number(id) + 999}`) };
+    }],
+    // P2-B1 (EV6 Fase 2): un campo de revisión alterado → QUIZ_REVIEW.
+    ['QUIZ_REVIEW', () => {
+      const a = find(/^cv3:exam:/);
+      return { [`${a.dir}/quiz.xml`]: (x) => x.replace('<reviewcorrectness>16</reviewcorrectness>', '<reviewcorrectness>4352</reviewcorrectness>') };
+    }],
+    // completionattemptsexhausted en 0 con intentos > 0 (el fixture base tiene attempts_number 3) → QUIZ_COMPLETION.
+    ['QUIZ_COMPLETION', () => {
+      const a = find(/^cv3:exam:/);
+      return { [`${a.dir}/quiz.xml`]: (x) => x.replace('<completionattemptsexhausted>1</completionattemptsexhausted>', '<completionattemptsexhausted>0</completionattemptsexhausted>') };
+    }],
+    // completionattemptsexhausted en 1 con intentos = 0 (ilimitado, nunca se agota) → QUIZ_COMPLETION.
+    ['QUIZ_COMPLETION', () => {
+      const a = find(/^cv3:exam:/);
+      return { [`${a.dir}/quiz.xml`]: (x) => x.replace('<attempts_number>3</attempts_number>', '<attempts_number>0</attempts_number>') };
     }],
   );
   await check('validador (fix 1, I1): dos botones de la MISMA sección al MISMO destino → NAVIGATION «misma sección»', async () => {

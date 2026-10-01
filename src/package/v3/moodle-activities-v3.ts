@@ -33,6 +33,28 @@ function sha1(s: string): string {
   return createHash('sha1').update(s, 'utf8').digest('hex');
 }
 
+/**
+ * P2-B1 (EV6 Fase 2 — exámenes que certifican): política de revisión del
+ * quiz. El estudiante nunca ve corrección, retroalimentación ni la respuesta
+ * correcta tras un intento — solo su nota (y la nota máxima), durante el
+ * intento y después (inmediatamente / más tarde mientras está abierto); todo
+ * se revela solo si un profesor fija `timeclose` en el pasado (AFTER_CLOSE).
+ * Bits de Moodle (`mod/quiz/classes/question/display_options.php`):
+ * D(URING)=0x10000, I(MMEDIATELY_AFTER)=0x1000, O(PEN, "later while
+ * open")=0x100, C(LOSE, "after close")=0x10. Probado en Moodle 4.5.14+
+ * contra una restauración real — ver `scratchpad/r18/P2-design.md` §1.
+ */
+export const QUIZ_REVIEW_V3 = {
+  reviewattempt: 65552, // D|C — sin página de revisión del intento hasta el cierre
+  reviewcorrectness: 16, // C
+  reviewmaxmarks: 69904, // D|I|O|C
+  reviewmarks: 4368, // I|O|C — columna de nota en la vista de intentos
+  reviewspecificfeedback: 16, // C
+  reviewgeneralfeedback: 16, // C
+  reviewrightanswer: 16, // C
+  reviewoverallfeedback: 16, // C
+} as const satisfies Record<string, number>;
+
 /** `maxmark` por pregunta con 7 decimales cuya suma es exactamente 100. */
 export function quizMaxMarks(n: number): string[] {
   if (!Number.isInteger(n) || n < 1) throw new Error(`QUIZ_V3_INVALID: cantidad de preguntas ${n}`);
@@ -142,10 +164,10 @@ export function buildQuizV3(p: QuizV3Input): QuizV3Output {
     <preferredbehaviour>deferredfeedback</preferredbehaviour><canredoquestions>0</canredoquestions>
     <attempts_number>0</attempts_number><attemptonlast>0</attemptonlast>
     <grademethod>1</grademethod><decimalpoints>2</decimalpoints><questiondecimalpoints>-1</questiondecimalpoints>
-    <reviewattempt>69888</reviewattempt><reviewcorrectness>4352</reviewcorrectness>
-    <reviewmaxmarks>69888</reviewmaxmarks><reviewmarks>4352</reviewmarks>
-    <reviewspecificfeedback>4352</reviewspecificfeedback><reviewgeneralfeedback>4352</reviewgeneralfeedback>
-    <reviewrightanswer>4352</reviewrightanswer><reviewoverallfeedback>4352</reviewoverallfeedback>
+    <reviewattempt>${QUIZ_REVIEW_V3.reviewattempt}</reviewattempt><reviewcorrectness>${QUIZ_REVIEW_V3.reviewcorrectness}</reviewcorrectness>
+    <reviewmaxmarks>${QUIZ_REVIEW_V3.reviewmaxmarks}</reviewmaxmarks><reviewmarks>${QUIZ_REVIEW_V3.reviewmarks}</reviewmarks>
+    <reviewspecificfeedback>${QUIZ_REVIEW_V3.reviewspecificfeedback}</reviewspecificfeedback><reviewgeneralfeedback>${QUIZ_REVIEW_V3.reviewgeneralfeedback}</reviewgeneralfeedback>
+    <reviewrightanswer>${QUIZ_REVIEW_V3.reviewrightanswer}</reviewrightanswer><reviewoverallfeedback>${QUIZ_REVIEW_V3.reviewoverallfeedback}</reviewoverallfeedback>
     <questionsperpage>5</questionsperpage><navmethod>free</navmethod><shuffleanswers>1</shuffleanswers>
     <sumgrades>0.00000</sumgrades><grade>0.00000</grade>
     <timecreated>${p.ts}</timecreated><timemodified>${p.ts}</timemodified>

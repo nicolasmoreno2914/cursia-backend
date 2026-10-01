@@ -37,6 +37,7 @@ import type { HtmlNode } from '../../modules/visual-components';
 import { CERTIFICATE_TEACHER_TROUBLESHOOTING, CertificateRequirements, CourseFacts, chapterNextSteps, closingCertificateText, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles } from '../../modules/course-shell';
 import { safeActivityName } from '../mbz-common';
 import { courseBadgeDescription } from './course-badge';
+import { QUIZ_REVIEW_V3 } from './moodle-activities-v3';
 import { formatDurationEs, mp3DurationSeconds } from '../audio';
 import { CURSIA_H5P_PROFILE_V1, H5P_MOODLE_GRADING } from '../h5p';
 
@@ -80,6 +81,8 @@ interface ParsedActivity {
   gradeItemId: number | null;
   moduleXmlId: number;
   actXmlModuleId: number;
+  /** P2-B1: solo para modname 'quiz' — campos crudos de quiz.xml que no tienen otro lugar en ParsedActivity. */
+  quiz: { attempts_number: string; completionattemptsexhausted: string } & Record<keyof typeof QUIZ_REVIEW_V3, string> | null;
 }
 
 interface ParsedFile {
@@ -252,6 +255,13 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       gradeItemId: gi ? num(/<grade_item id="(\d+)"/.exec(gi)?.[1]) : null,
       moduleXmlId: num(/<module id="(\d+)"/.exec(moduleXml)?.[1]),
       actXmlModuleId: num(/moduleid="(\d+)"/.exec(actXml)?.[1]),
+      quiz: modname === 'quiz'
+        ? {
+            attempts_number: tag(actXml, 'attempts_number') ?? '',
+            completionattemptsexhausted: tag(actXml, 'completionattemptsexhausted') ?? '',
+            ...(Object.fromEntries(Object.keys(QUIZ_REVIEW_V3).map((k) => [k, tag(actXml, k) ?? ''])) as Record<keyof typeof QUIZ_REVIEW_V3, string>),
+          }
+        : null,
     });
   }
   const byMid = new Map(acts.map((a) => [a.mid, a]));
@@ -421,6 +431,21 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     const md = a.module;
     if (md.completion !== '2' || md.completiongradeitemnumber !== '0' || md.completionpassgrade !== '1') {
       add('COMPLETION', a.dir, `completion ${md.completion}/${md.completiongradeitemnumber}/${md.completionpassgrade} ≠ 2/0/1`);
+    }
+    // P2-B1: el quiz nunca revela corrección/retroalimentación/respuesta tras un intento, y
+    // `completionattemptsexhausted` debe seguir a `attempts_number` (si no, un intento fallido con
+    // intentos restantes ya marcaría el quiz como completado-sin-aprobar). Ver P2-design.md §1.
+    if (a.modname === 'quiz' && a.quiz) {
+      const q = a.quiz;
+      for (const key of Object.keys(QUIZ_REVIEW_V3) as (keyof typeof QUIZ_REVIEW_V3)[]) {
+        if (q[key] !== String(QUIZ_REVIEW_V3[key])) {
+          add('QUIZ_REVIEW', a.dir, `${key} ${q[key]} ≠ ${QUIZ_REVIEW_V3[key]}`);
+        }
+      }
+      const wantExhausted = Number(q.attempts_number) > 0 ? '1' : '0';
+      if (q.completionattemptsexhausted !== wantExhausted) {
+        add('QUIZ_COMPLETION', a.dir, `completionattemptsexhausted ${q.completionattemptsexhausted} ≠ ${wantExhausted} (attempts_number ${q.attempts_number})`);
+      }
     }
   }
   // F1 (I3): en un curso sin nota el Libro Guía se completa por vista (criterio del curso); el resto, 0.
