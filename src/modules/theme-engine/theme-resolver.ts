@@ -14,6 +14,7 @@ import {
   clamp01,
   contrastRatio,
   correctForegroundForBackgrounds,
+  deltaE2000,
   hexToHsl,
   hslToHex,
   isPureBlackOrWhite,
@@ -255,6 +256,7 @@ export function resolveTheme(input: PresentationProfileInput): ResolvedTheme {
     blocks: resolveBlocks(input.mode),
     adjustments,
     moduleColorsBasis,
+    moduleColorsSource: (input.brandSeed?.moduleColors ?? []).some((c) => typeof c === 'string' && c.length > 0) ? 'brand' : 'family',
   };
 
   // Correcciones de los colores de módulo ancla (semilla o familia), registradas (§H.5).
@@ -319,6 +321,17 @@ export function roleHueDistance(theme: ResolvedTheme, hex: string): number {
   return Math.min(...roleHues(theme).map((r) => hueDelta(h, r)), 360);
 }
 
+/** El color de módulo `i` es de Cursia (no de la marca del cliente): anclas de familia o módulos generados. */
+function cursiaOwned(theme: ResolvedTheme, i: number, basisLength: number): boolean {
+  return theme.moduleColorsSource !== 'brand' || i >= basisLength;
+}
+
+/**
+ * P3 (fix I1-R2): las anclas por defecto de Cursia quedan PERCEPTUALMENTE lejos de todo rol: ΔE2000 ≥
+ * DEFAULT_MODULE_MIN_DELTA_E entre el tono del módulo (ink y relleno de moduleTone, y el main) y cada ink de rol.
+ */
+export const DEFAULT_MODULE_MIN_DELTA_E = 20;
+
 /** Tono más cercano a `h` que queda a ≥ ROLE_HUE_TARGET de todo rol (determinista: +d antes que −d). */
 function roleSafeHue(h: number, roles: number[]): number {
   const ok = (x: number) => roles.every((r) => hueDelta(x, r) >= ROLE_HUE_TARGET);
@@ -366,8 +379,10 @@ function computeModuleColors(theme: ResolvedTheme, count: number): ModuleColorsC
       baseHex = hslToHex(h, s, l);
     }
 
-    // P3 (fix I1): fuera de los tonos de rol (una semilla guardada que choca se desplaza, nunca falla).
-    const roles = roleHues(theme);
+    // P3 (fix I1 / I1-R1): fuera de los tonos de rol SOLO los colores de Cursia (anclas de la familia y
+    // módulos generados más allá de las anclas). Un color de MARCA (semilla) nunca se altera: los bloques
+    // de rol se distinguen igual por ícono + rótulo + tinte.
+    const roles = cursiaOwned(theme, i, basis.length) ? roleHues(theme) : [];
     if (s >= MODULE_NEUTRAL_SAT && roles.length) {
       const safe = roleSafeHue(h, roles);
       if (safe !== h) {
@@ -508,8 +523,15 @@ export function validateTheme(t: ResolvedTheme, opts?: { moduleCount?: number })
     checkHex(m.border, `moduleColor(${i}).border`);
     for (const k of ['main', 'soft', 'onMain', 'onSoft', 'border'] as const) checkNotPure(m[k], `moduleColor(${i}).${k}`);
     checkContrast(`moduleColor(${i}).onMain`, m.onMain, `moduleColor(${i}).main`, m.main, CONTRAST_BODY);
-    // P3 (fix I1): ningún color de módulo (con tono) cae en el tono de un rol pedagógico.
-    if (t.blocks && hexToHsl(m.main).s >= MODULE_NEUTRAL_SAT && roleHueDistance(t, m.main) < ROLE_HUE_MIN_DISTANCE) {
+    // P3 (fix I1-R2): las anclas por defecto de Cursia quedan perceptualmente lejos de todo ink de rol.
+    if (t.blocks && t.moduleColorsSource !== 'brand' && i < t.moduleColorsBasis.length) {
+      for (const role of EDU_BLOCK_ROLES) {
+        const d = deltaE2000(m.main, t.blocks[role].ink);
+        if (d < DEFAULT_MODULE_MIN_DELTA_E) errors.push({ code: 'MODULE_ROLE_DELTAE', message: `moduleColor(${i}).main ${m.main} a ΔE2000 ${d.toFixed(1)} del rol ${role} (< ${DEFAULT_MODULE_MIN_DELTA_E})` });
+      }
+    }
+    // P3 (fix I1): ningún color de módulo DE CURSIA (con tono) cae en el tono de un rol pedagógico.
+    if (t.blocks && cursiaOwned(t, i, t.moduleColorsBasis.length) && hexToHsl(m.main).s >= MODULE_NEUTRAL_SAT && roleHueDistance(t, m.main) < ROLE_HUE_MIN_DISTANCE) {
       errors.push({ code: 'MODULE_ROLE_HUE', message: `moduleColor(${i}).main ${m.main} a ${roleHueDistance(t, m.main).toFixed(0)}° de un tono de rol (< ${ROLE_HUE_MIN_DISTANCE}°)` });
     }
     checkContrast(`moduleColor(${i}).onSoft`, m.onSoft, `moduleColor(${i}).soft`, m.soft, CONTRAST_BODY);

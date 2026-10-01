@@ -202,6 +202,13 @@ export interface ResolvedTheme {
    * given resolution used. See r1-theme.report.md "rulings".
    */
   moduleColorsBasis: string[];
+  /**
+   * P3 (fix I1-R1): de dónde salen las anclas de módulo. 'brand' = BrandSeed.moduleColors (marca del
+   * cliente o paleta guardada/legacy): esos colores NUNCA se alteran por pedagogía. 'family' = anclas
+   * propias de Cursia (role-safe y perceptualmente lejos de los roles). Los módulos generados más allá
+   * de las anclas son de Cursia en ambos casos.
+   */
+  moduleColorsSource: 'brand' | 'family';
 }
 
 export interface ModuleColor {

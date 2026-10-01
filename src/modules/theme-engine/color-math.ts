@@ -195,3 +195,48 @@ export function correctForegroundForBackgrounds(
   if (worst(ON_LIGHT) >= min) return { color: ON_LIGHT, changed: true };
   throw new Error(`THEME_INVALID: no se pudo corregir "${fg}" contra [${backgrounds.join(', ')}]`);
 }
+
+// ─── P3 (fix I1-R2): diferencia perceptual CIEDE2000 ────────────────────────
+
+/** sRGB hex → CIELAB (D65). */
+export function hexToLab(hex: string): { L: number; a: number; b: number } {
+  const { r, g, b } = hexToRgb(hex);
+  const lin = (c: number) => {
+    const v = c / 255;
+    return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  };
+  const R = lin(r), G = lin(g), B = lin(b);
+  const X = (R * 0.4124564 + G * 0.3575761 + B * 0.1804375) / 0.95047;
+  const Y = R * 0.2126729 + G * 0.7151522 + B * 0.072175;
+  const Z = (R * 0.0193339 + G * 0.119192 + B * 0.9503041) / 1.08883;
+  const f = (t: number) => (t > 216 / 24389 ? Math.cbrt(t) : (24389 / 27 * t + 16) / 116);
+  const fx = f(X), fy = f(Y), fz = f(Z);
+  return { L: 116 * fy - 16, a: 500 * (fx - fy), b: 200 * (fy - fz) };
+}
+
+/** ΔE CIEDE2000 entre dos colores hex (kL = kC = kH = 1). */
+export function deltaE2000(hexA: string, hexB: string): number {
+  const p = hexToLab(hexA), q = hexToLab(hexB);
+  const rad = Math.PI / 180;
+  const C1 = Math.hypot(p.a, p.b), C2 = Math.hypot(q.a, q.b);
+  const Cm = (C1 + C2) / 2;
+  const G = 0.5 * (1 - Math.sqrt(Math.pow(Cm, 7) / (Math.pow(Cm, 7) + Math.pow(25, 7))));
+  const a1 = (1 + G) * p.a, a2 = (1 + G) * q.a;
+  const C1p = Math.hypot(a1, p.b), C2p = Math.hypot(a2, q.b);
+  const h = (b: number, a: number) => { if (a === 0 && b === 0) return 0; const x = Math.atan2(b, a) / rad; return x < 0 ? x + 360 : x; };
+  const h1 = h(p.b, a1), h2 = h(q.b, a2);
+  const dL = q.L - p.L, dC = C2p - C1p;
+  let dh = 0;
+  if (C1p * C2p !== 0) { dh = h2 - h1; if (dh > 180) dh -= 360; else if (dh < -180) dh += 360; }
+  const dH = 2 * Math.sqrt(C1p * C2p) * Math.sin((dh * rad) / 2);
+  const Lm = (p.L + q.L) / 2, Cmp = (C1p + C2p) / 2;
+  let hm = h1 + h2;
+  if (C1p * C2p !== 0) { if (Math.abs(h1 - h2) > 180) hm += h1 + h2 < 360 ? 360 : -360; hm /= 2; }
+  const T = 1 - 0.17 * Math.cos((hm - 30) * rad) + 0.24 * Math.cos(2 * hm * rad) + 0.32 * Math.cos((3 * hm + 6) * rad) - 0.2 * Math.cos((4 * hm - 63) * rad);
+  const dTheta = 30 * Math.exp(-Math.pow((hm - 275) / 25, 2));
+  const RC = 2 * Math.sqrt(Math.pow(Cmp, 7) / (Math.pow(Cmp, 7) + Math.pow(25, 7)));
+  const SL = 1 + (0.015 * Math.pow(Lm - 50, 2)) / Math.sqrt(20 + Math.pow(Lm - 50, 2));
+  const SC = 1 + 0.045 * Cmp, SH = 1 + 0.015 * Cmp * T;
+  const RT = -Math.sin(2 * dTheta * rad) * RC;
+  return Math.sqrt(Math.pow(dL / SL, 2) + Math.pow(dC / SC, 2) + Math.pow(dH / SH, 2) + RT * (dC / SC) * (dH / SH));
+}

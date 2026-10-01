@@ -352,10 +352,8 @@ check('THEME_ENGINE_VERSION === 1 y ResolvedTheme.version usa themeVersion o el 
 });
 
 // ── Fix round 1 / I3: la BrandSeed de módulos se respeta en orden ──
-// P3 (fix I1): las semillas se respetan en orden cuando su tono no choca con un rol pedagógico; rojo/azul/
-// verde chocan (error/concepto/ejemplo) y se desplazan (ver el check P3 de abajo). Semillas fuera de los roles:
-check('I3: seed ciruela/oliva/frambuesa → módulos 0/1/2 con su tono (Δtono ≤ 10°), en todas las familias', () => {
-  const seedColors = ['#7A2E73', '#5F6410', '#9C2463'];
+check('I3: seed rojo/azul/verde → módulos 0/1/2 rojo/azul/verde (Δtono ≤ 10°), en todas las familias', () => {
+  const seedColors = ['#E11D48', '#2563EB', '#16A34A'];
   for (const familyId of Object.keys(THEME_FAMILIES)) {
     for (const mode of THEME_FAMILIES[familyId].supportedModes) {
       const theme = resolveTheme({ themeFamily: familyId, mode, brandSeed: { moduleColors: seedColors } });
@@ -379,7 +377,7 @@ check('I3: paletas legacy conservan el orden de tonos m1/m2/m3 (anclas no neutra
     [p.m1, p.m2, p.m3].forEach((m, i) => {
       const anchor = m.toUpperCase();
       const sat = hexSat(anchor);
-      const collided = notes.some((n) => n.startsWith(`moduleColor(${i}).main ajustado`) || n.startsWith(`moduleColor(${i}) desplazado`));
+      const collided = notes.some((n) => n.startsWith(`moduleColor(${i}).main ajustado`));
       if (sat < 0.2 || collided) return;
       const main = moduleColor(theme, i).main;
       const d = hueDiffDeg(hexToHueDeg(main), hexToHueDeg(anchor));
@@ -387,8 +385,7 @@ check('I3: paletas legacy conservan el orden de tonos m1/m2/m3 (anclas no neutra
       checked++;
     });
   }
-  // P3 (fix I1): muchas anclas legacy (azules, verdes, ámbar) chocan con un rol y se desplazan con nota.
-  assertTrue(checked >= 5, `pocas anclas verificadas: ${checked}`);
+  assertTrue(checked >= 60, `pocas anclas verificadas: ${checked}`);
 });
 
 check('I3/M5: correcciones de color de módulo quedan en adjustments y en moduleColorAdjustments', () => {
@@ -397,7 +394,7 @@ check('I3/M5: correcciones de color de módulo quedan en adjustments y en module
   const notes = te.moduleColorAdjustments(theme, 2);
   assertTrue(notes.some((n) => n.startsWith('moduleColor(0).main corregido')), `nota de corrección: ${JSON.stringify(notes)}`);
   assertTrue(theme.adjustments.some((n) => n.startsWith('moduleColor(0).main corregido')), `adjustments: ${JSON.stringify(theme.adjustments)}`);
-  assertTrue(te.moduleColorAdjustments(resolveTheme({ themeFamily: 'aula-clara', mode: 'light', brandSeed: { moduleColors: ['#7A2E73'] } }), 1).length === 0, 'sin corrección, sin nota');
+  assertTrue(te.moduleColorAdjustments(resolveTheme({ themeFamily: 'aula-clara', mode: 'light', brandSeed: { moduleColors: ['#2563EB'] } }), 1).length === 0, 'sin corrección, sin nota');
 });
 
 check('M3: ningún color emitido es #FFFFFF/#000000 puro; una seed pura se sustituye y se registra', () => {
@@ -455,50 +452,77 @@ check('P3: tipografía de curso — display ≤ 32 px base, sin cursiva de tesis
   eqJson(te.defaultPresentationProfile(), { themeFamily: 'aula-clara', mode: 'light' }, 'default de cursos nuevos: Aula Clara claro');
 });
 
-check('P3 (fix I1): ningún color de módulo cae en el tono de un rol (≥ 25°) — familias, 12 módulos, paletas legacy y semillas al azar; una semilla que choca se desplaza (determinista, con nota), nunca falla', () => {
+check('P3 (fix I1 / I1-R1 / I1-R2): colores de MARCA intactos; los de Cursia (anclas por defecto y generados) fuera de los tonos de rol, sin verde y a ΔE2000 ≥ 20 de todo rol', () => {
   const D = te.ROLE_HUE_MIN_DISTANCE;
-  assertEqual(D, 25, 'umbral');
+  const DE = te.DEFAULT_MODULE_MIN_DELTA_E;
+  assertEqual(`${D}/${DE}`, '25/20', 'umbrales');
   const sat = (hex) => { const n = parseInt(hex.slice(1), 16); const r = (n >> 16) / 255, g = ((n >> 8) & 255) / 255, b = (n & 255) / 255; const mx = Math.max(r, g, b), mn = Math.min(r, g, b); const l = (mx + mn) / 2; return mx === mn ? 0 : (mx - mn) / (1 - Math.abs(2 * l - 1)); };
-  const assertSafe = (t, label, n = 12) => {
-    for (let i = 0; i < n; i++) {
-      const m = moduleColor(t, i).main;
-      assertTrue(sat(m) < te.MODULE_NEUTRAL_SAT || te.roleHueDistance(t, m) >= D, `${label}: módulo ${i} ${m} a ${te.roleHueDistance(t, m).toFixed(1)}° de un rol`);
-    }
-  };
+  const VCE = require(path.resolve(process.cwd(), 'dist/modules/visual-components/edu.js'));
+  // (1) anclas por defecto de cada familia: role-safe, sin verde (ejemplo) y ΔE2000 ≥ 20 (main, ink y relleno de moduleTone)
   for (const familyId of Object.keys(THEME_FAMILIES)) {
     for (const mode of THEME_FAMILIES[familyId].supportedModes) {
       const t = resolveTheme({ themeFamily: familyId, mode });
-      assertSafe(t, `${familyId}/${mode}`);
-      // las anclas propias de la familia ya están fuera de los roles: sin desplazamientos
-      assertTrue(!t.adjustments.some((a) => /desplazado fuera de los tonos de rol/.test(a)), `${familyId}/${mode}: anclas propias sin desplazar (${t.adjustments.join(' | ')})`);
+      assertEqual(t.moduleColorsSource, 'family', `${familyId}/${mode}: fuente`);
+      assertTrue(validateTheme(t).length === 0, `${familyId}/${mode}: ${JSON.stringify(validateTheme(t))}`);
+      const g = t.personality.plate ? t.color.bg : t.color.surface;
+      for (let i = 0; i < 12; i++) {
+        const mc = moduleColor(t, i);
+        assertTrue(sat(mc.main) < te.MODULE_NEUTRAL_SAT || te.roleHueDistance(t, mc.main) >= D, `${familyId}/${mode}: módulo ${i} ${mc.main} en tono de rol`);
+        if (i >= t.moduleColorsBasis.length) continue;
+        const k = VCE.moduleTone(t, mc, g);
+        const hue = hexToHueDeg(mc.main);
+        assertTrue(sat(mc.main) < te.MODULE_NEUTRAL_SAT || hue < 80 || hue > 175, `${familyId}/${mode}: ancla ${i} ${mc.main} es verde`);
+        for (const [role, b] of Object.entries(t.blocks)) {
+          for (const x of [mc.main, k.ink, k.fill]) assertTrue(te.deltaE2000(x, b.ink) >= DE, `${familyId}/${mode}: ancla ${i} ${x} a ΔE ${te.deltaE2000(x, b.ink).toFixed(1)} de ${role}`);
+        }
+      }
     }
   }
+  // (2) la paleta por defecto de cursos nuevos (aula-clara) cumple lo mismo (es semilla, así que nunca se toca)
+  const ac = LEGACY_PALETTES.find((p) => p.id === 'aula-clara');
+  const tac = resolveTheme(te.presentationProfileFromPaletteId('aula-clara'));
+  [ac.m1, ac.m2, ac.m3].forEach((m, i) => {
+    assertEqual(moduleColor(tac, i).main, m.toUpperCase(), `aula-clara m${i + 1} intacto`);
+    for (const [role, b] of Object.entries(tac.blocks)) assertTrue(te.deltaE2000(m, b.ink) >= DE && (te.roleHueDistance(tac, m) >= D || sat(m) < te.MODULE_NEUTRAL_SAT), `aula-clara m${i + 1} ${m} cerca de ${role}`);
+    const h = hexToHueDeg(m);
+    assertTrue(h < 80 || h > 175, `aula-clara m${i + 1} ${m} es verde`);
+  });
+  // (3) I1-R1: los colores de MARCA nunca cambian por pedagogía — las 28 paletas legacy conservan sus colores
+  // de módulo exactos (salvo la corrección de contraste de siempre, que conserva el tono).
+  let exact = 0;
   for (const p of LEGACY_PALETTES) {
-    const pp = te.presentationProfileFromPaletteId(p.id);
-    const t = resolveTheme(pp);
-    assertSafe(t, `legacy ${p.id}`);
+    const t = resolveTheme(te.presentationProfileFromPaletteId(p.id));
+    assertEqual(t.moduleColorsSource, 'brand', `${p.id}: fuente marca`);
+    assertTrue(!t.adjustments.some((a) => /desplazado fuera de los tonos de rol/.test(a)), `${p.id}: semilla desplazada (${t.adjustments.join(' | ')})`);
+    const notes = te.moduleColorAdjustments(t, 3);
+    [p.m1, p.m2, p.m3].forEach((m, i) => {
+      const main = moduleColor(t, i).main;
+      const corrected = notes.some((n) => n.startsWith(`moduleColor(${i}).main`));
+      if (!corrected) { assertEqual(main, m.toUpperCase(), `${p.id}: m${i + 1}`); exact++; } else assertTrue(hueDiffDeg(hexToHueDeg(main), hexToHueDeg(m)) <= 10, `${p.id}: m${i + 1} corregido solo en contraste`);
+    });
   }
-  // semilla que choca: desplazada, determinista y anotada (rojo = error, azul = concepto)
-  const seed = { moduleColors: ['#E11D48', '#2563EB'] };
-  const a = resolveTheme({ themeFamily: 'aula-clara', mode: 'light', brandSeed: seed });
-  const b = resolveTheme({ themeFamily: 'aula-clara', mode: 'light', brandSeed: seed });
-  assertEqual(moduleColor(a, 0).main, moduleColor(b, 0).main, 'determinista');
-  assertTrue(a.adjustments.filter((x) => /desplazado fuera de los tonos de rol/.test(x)).length === 2, `notas: ${a.adjustments.join(' | ')}`);
-  assertTrue(validateTheme(a).length === 0, 'tema válido');
-  // 500 semillas pseudoaleatorias (LCG): nunca falla, siempre fuera de los roles
+  assertTrue(exact >= 60, `pocos colores exactos: ${exact}`);
+  const navy = resolveTheme(te.presentationProfileFromPaletteId('navy-teal'));
+  assertEqual(moduleColor(navy, 0).main, '#1A3C5E', 'navy-teal (#413) conserva el navy');
+  // (4) módulos GENERADOS más allá de la marca: de Cursia → fuera de los tonos de rol
+  const seeded = resolveTheme({ themeFamily: 'aula-clara', mode: 'light', brandSeed: { moduleColors: ['#1E3A8A', '#C8102E'] } });
+  eqJson([moduleColor(seeded, 0).main, moduleColor(seeded, 1).main], ['#1E3A8A', '#C8102E'], 'marca intacta');
+  for (let i = 2; i < 12; i++) { const m = moduleColor(seeded, i).main; assertTrue(sat(m) < te.MODULE_NEUTRAL_SAT || te.roleHueDistance(seeded, m) >= D, `generado ${i} ${m} en tono de rol`); }
+  // determinismo + 500 semillas: nunca falla, la marca queda intacta
   let x = 12345;
   const rnd = () => ((x = (x * 1103515245 + 12345) % 2147483648) / 2147483648);
   for (let k = 0; k < 500; k++) {
     const hex = () => '#' + Math.floor(rnd() * 0xffffff).toString(16).padStart(6, '0').toUpperCase();
     const fam = Object.keys(THEME_FAMILIES)[k % 6];
     const mode = THEME_FAMILIES[fam].supportedModes[k % THEME_FAMILIES[fam].supportedModes.length];
-    const t = resolveTheme({ themeFamily: fam, mode, brandSeed: { moduleColors: [hex(), hex(), hex()] } });
-    assertSafe(t, `semilla ${k}`, 6);
+    const t = resolveTheme({ themeFamily: fam, mode, brandSeed: { moduleColors: [hex(), hex()] } });
+    assertTrue(!t.adjustments.some((a) => /desplazado fuera de los tonos de rol/.test(a) && /moduleColor\([01]\)/.test(a)), `semilla ${k}: marca desplazada`);
+    for (let i = 2; i < 6; i++) { const m = moduleColor(t, i).main; assertTrue(sat(m) < te.MODULE_NEUTRAL_SAT || te.roleHueDistance(t, m) >= D, `semilla ${k}: generado ${i} ${m}`); }
   }
-  // roleHueDistance (base del check MODULE_ROLE_HUE de validateTheme, defensa en profundidad: el cálculo
-  // de módulos ya desplaza, así que un tema resuelto nunca lo dispara)
+  // validateTheme detecta un ancla por defecto perceptualmente cerca de un rol
   const t0 = resolveTheme({ themeFamily: 'aula-clara', mode: 'light' });
-  assertTrue(te.roleHueDistance(t0, '#1D4FB8') < 1 && te.roleHueDistance(t0, '#7A2E73') >= D, 'roleHueDistance');
+  assertTrue(validateTheme({ ...t0, moduleColorsBasis: ['#13683A', ...t0.moduleColorsBasis.slice(1)] }).some((e) => e.code === 'MODULE_ROLE_DELTAE' || e.code === 'MODULE_ROLE_HUE'), 'MODULE_ROLE_DELTAE');
+  assertTrue(te.roleHueDistance(t0, '#1D4FB8') < 1 && te.deltaE2000('#FFFFFF', '#000000') > 99, 'utilidades');
 });
 
 console.log('');

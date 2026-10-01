@@ -243,10 +243,12 @@ async function pureChecks() {
   // 645 15bcd96c3dc9ce69811320f5eb2ac7f533eff9c740b0932b019d841a3bf9a532.
   // Prueba (fix round 1, p3impl/proof.js): con los MISMOS insumos, staging (3.4.0) da sus dorados de arriba y
   // esta rama cambia SOLO label.xml (labels del shell y del capítulo), el intro de la actividad
-  // (h5pactivity.xml / scorm.xml), files.xml y el blob de libro_guia_completo.html (colores de módulo, fix I1).
+  // (h5pactivity.xml / scorm.xml), files.xml y el blob de libro_guia_completo.html. Fix round 2: con una
+  // semilla de marca (navy-teal) el Libro conserva EXACTAMENTE los colores de staging y solo cambia la
+  // familia tipográfica (T1); 644/645 no tienen semilla (anclas por defecto de Cursia, nuevas en P3).
   const GOLDEN_PRE_T5 = {
-    644: ['b5c37c6f33c1504ac785d10d07a5b0011934faf283fafaf40770e80c4cc78a97', { engine: 'h5p', finalExam: true, courseId: 644 }],
-    645: ['516182d6ee4822d55b84c9c17f5965578b5ee42e8b1d417d7fd4117cbb1ce2dc', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
+    644: ['800aea31b3c198341df277b8dfce4dadc9d62eec0573d3a77718b9626beeddac', { engine: 'h5p', finalExam: true, courseId: 644 }],
+    645: ['bef9261dfed571ab61a64034614c87528ea03d640cf1b4a11c43ed31b08ed9f6', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
   };
   await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P3 (sistema visual 2.0 sobre certificado + política de revisión del quiz, builder 3.5.0), con y sin el campo', async () => {
     for (const [id, [want, o]] of Object.entries(GOLDEN_PRE_T5)) {
