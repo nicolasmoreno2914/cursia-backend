@@ -434,6 +434,38 @@ const SRC = (bp) => ({ courseId: 777, blueprintId: 1, blueprintNumber: 1, bluepr
     assert(!('videoInteractionsSchemaVersion' in claim1) && !('reflectionPlan' in claim1.video), 'claim legacy sin campos v2');
   });
 
+  await check('fix round 2: getPackageStatus devuelve `restore` del job; reviewCardsAvailable = columna + h5p + reglas 2 (Manifest heredado o config)', async () => {
+    const { PackagingService } = L('modules/dynamic-packaging/packaging.service.js');
+    const pkg = (summary) => {
+      const svc = Object.create(PackagingService.prototype);
+      svc.manifestOfRun = async () => ({ rulesVersion: 3 });
+      svc.loadRunRow = async () => ({});
+      svc.findLatestPackageJob = async () => ({ worker_status: 'running', output_summary: summary });
+      return svc.getPackageStatus(1, 'o', 1, 'r');
+    };
+    eq((await pkg({ restore: built2.summary.restore })).restore, { as: 'admin_or_manager', note: B.H5P_V2_RESTORE_NOTE.note }, 'con librerías incluidas');
+    assert(!('restore' in (await pkg({}))), 'paquete de siempre: sin restore');
+    assert(!('restore' in (await pkg({ restore: { as: 'otro', note: 'x' } }))), 'forma inesperada: se ignora');
+    const { CourseStructureService } = L('modules/course-structure/course-structure.service.js');
+    const cs = Object.create(CourseStructureService.prototype);
+    const exec = (rows, fail = false) => ({ calls: 0, async query() { this.calls++; if (fail) throw new Error('relation does not exist'); return rows; } });
+    const withEnv = async (v, fn) => {
+      const saved = process.env.DYNAMIC_ACTIVITY_TYPE_RULES;
+      if (v === undefined) delete process.env.DYNAMIC_ACTIVITY_TYPE_RULES; else process.env.DYNAMIC_ACTIVITY_TYPE_RULES = v;
+      try { return await fn(); } finally { if (saved === undefined) delete process.env.DYNAMIC_ACTIVITY_TYPE_RULES; else process.env.DYNAMIC_ACTIVITY_TYPE_RULES = saved; }
+    };
+    const e0 = exec([]);
+    eq(await withEnv('2', () => cs.reviewCardsAvailable(e0, 1, false, 'h5p')), false, 'sin columna');
+    eq(await withEnv('2', () => cs.reviewCardsAvailable(e0, 1, true, 'scorm')), false, 'SCORM');
+    eq(e0.calls, 0, 'sin columna / SCORM: sin consultar la base');
+    eq(await withEnv(undefined, () => cs.reviewCardsAvailable(exec([{ activity_type_rules: 2 }]), 1, true, 'h5p')), true, 'Manifest heredado con reglas 2 (config sin definir)');
+    eq(await withEnv('2', () => cs.reviewCardsAvailable(exec([{ activity_type_rules: 1 }]), 1, true, 'h5p')), false, 'Manifest heredado con reglas 1 (aunque la config sea 2)');
+    eq(await withEnv('2', () => cs.reviewCardsAvailable(exec([{ activity_type_rules: null }]), 1, true, 'h5p')), false, 'Manifest legacy');
+    eq(await withEnv('2', () => cs.reviewCardsAvailable(exec([]), 1, true, 'h5p')), true, 'curso sin Manifest v3: config 2');
+    eq(await withEnv(undefined, () => cs.reviewCardsAvailable(exec([]), 1, true, 'h5p')), false, 'curso sin Manifest v3: config sin definir');
+    eq(await withEnv('2', () => cs.reviewCardsAvailable(exec([], true), 1, true, 'h5p')), true, 'base sin tabla de Manifests: decide la config');
+  });
+
   // ══ 5. Validador: negativos del add-on ═════════════════════════════════════
   await check('mbz-validator-v3: «Repaso» con ítem de nota, sin facts o «calificable» ⇒ ADDON; criterio de curso ⇒ COURSE_COMPLETION', async () => {
     const reviews = acts.filter((x) => /:review_cards$/.test(x.idnumber));

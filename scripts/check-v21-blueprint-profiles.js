@@ -581,8 +581,8 @@ async function dbChecks() {
     await check('DB estructura: PATCH de settings (finalExam/activityEngine) con concurrencia optimista; vacío → 400; ajeno → 404', async () => {
       const c0 = await counter();
       const res = await structure.updateSettings(cid, OWNER, { finalExam: false, activityEngine: 'scorm', expectedCounter: c0 });
-      // EV6 H5P v2: la respuesta incluye reviewCardsEnabled (sin la migración EV6 la columna no existe → false).
-      eq(res, { structureVersionCounter: c0 + 1, finalExam: false, activityEngine: 'scorm', reviewCardsEnabled: false }, 'respuesta');
+      // EV6 H5P v2 (fix round 2): sin la migración EV6 la respuesta es la de siempre (sin reviewCardsEnabled).
+      eq(res, { structureVersionCounter: c0 + 1, finalExam: false, activityEngine: 'scorm' }, 'respuesta');
       const s = await structure.getStructure(cid, OWNER);
       eq([s.finalExam, s.activityEngine], [false, 'scorm'], 'GET');
       await rejectsRe(structure.updateSettings(cid, OWNER, { finalExam: true, expectedCounter: c0 }), /expectedCounter desactualizado/, 'counter viejo', 409);
@@ -678,6 +678,13 @@ async function dbChecks() {
       process.env.DYNAMIC_MANIFEST_RULES_VERSION = '3';
       try {
         await rejectsRe(structure.updateSettings(cid, OWNER, { reviewCardsEnabled: true, expectedCounter: await counter() }), /schema_not_migrated_ev6_h5p2/, 'sin migración', 503);
+        // Fix round 2: sin columna el GET avisa de antemano (reviewCardsAvailable=false) aunque la config sea 2.
+        process.env.DYNAMIC_ACTIVITY_TYPE_RULES = '2';
+        try {
+          eq((await structure.getStructure(cid, OWNER)).reviewCardsAvailable, false, 'GET sin migración: no disponible');
+        } finally {
+          delete process.env.DYNAMIC_ACTIVITY_TYPE_RULES;
+        }
         const MIGRATE_EV6 = path.join(REPO, 'scripts/migrate-ev6-h5p2.js');
         const VERIFY_EV6 = path.join(REPO, 'scripts/verify-ev6-h5p2-schema.js');
         const v0 = runScript(VERIFY_EV6, localEnv({ MIGRATION_ENV: 'staging' }));
@@ -721,6 +728,24 @@ async function dbChecks() {
         eq(st0.reviewCardsEnabled, false, 'GET: NULL = apagado');
         const re = await blueprints.lock(cid, OWNER, await counter());
         assert(!('reviewCards' in re.blueprint.snapshot.course), 'NULL no entra al snapshot');
+        // Fix round 2: con la columna, la respuesta del PATCH trae reviewCardsEnabled (misma sentencia).
+        const r0 = await structure.updateSettings(cid, OWNER, { finalExam: true, expectedCounter: await counter() });
+        eq(Object.keys(r0), ['structureVersionCounter', 'finalExam', 'activityEngine', 'reviewCardsEnabled'], 'forma con la columna');
+        // reviewCardsAvailable: columna + h5p + reglas 2 (sin Manifests v3 en esta base decide la config).
+        const avail = async (env) => {
+          if (env === undefined) delete process.env.DYNAMIC_ACTIVITY_TYPE_RULES;
+          else process.env.DYNAMIC_ACTIVITY_TYPE_RULES = env;
+          try {
+            return (await structure.getStructure(cid, OWNER)).reviewCardsAvailable;
+          } finally {
+            delete process.env.DYNAMIC_ACTIVITY_TYPE_RULES;
+          }
+        };
+        eq(await structure.getStructure(cid, OWNER).then((x) => x.activityEngine), 'h5p', 'motor h5p');
+        eq([await avail(undefined), await avail('1'), await avail('2')], [false, false, true], 'disponible solo con reglas 2');
+        await structure.updateSettings(cid, OWNER, { activityEngine: 'scorm', expectedCounter: await counter() });
+        eq(await avail('2'), false, 'SCORM: no disponible');
+        await structure.updateSettings(cid, OWNER, { activityEngine: 'h5p', expectedCounter: await counter() });
         const r = await structure.updateSettings(cid, OWNER, { reviewCardsEnabled: true, expectedCounter: await counter() });
         eq(r.reviewCardsEnabled, true, 'PATCH');
         const st1 = await structure.getStructure(cid, OWNER);
