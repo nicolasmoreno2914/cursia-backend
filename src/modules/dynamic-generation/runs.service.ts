@@ -89,6 +89,7 @@ import {
   estimateSummary,
   paidProviderOfItemType,
   paidRealProviders,
+  decideRunBudget,
 } from '../finops/run-budget';
 import { incrementalCostForPlan } from '../finops/incremental';
 import { FinopsError } from '../finops/errors';
@@ -97,6 +98,19 @@ import { runtimeGuard, SpentSoFar } from '../finops/budget';
 import { MONTH_CAP_LOCK } from '../finops/finops-budget.service';
 import type { EstimateResult, MinExpMax } from '../finops/estimator';
 import { assertAssessmentProfileResolvableForRun } from '../course-profiles/assessment-preflight';
+import { randomUUID } from 'crypto';
+import {
+  VIDEO_MODE_INCONSISTENT,
+  VIDEO_UPGRADE_CASCADE_REASON,
+  VIDEO_UPGRADE_NOT_ALLOWED_RULES,
+  VIDEO_UPGRADE_NOTHING_PENDING,
+  VIDEO_UPGRADE_REASON,
+  VIDEO_UPGRADE_RUN_NOT_READY,
+  VideoUpgradeRecord,
+  videoModeInconsistentMessage,
+  videoUpgradeFingerprint,
+  videoUpgradeOf,
+} from './video-upgrade';
 import { estimateCategories, estimateFingerprint, planNormalApproval, NormalApprovalPlan } from '../finops/normal-approval';
 import { isSuperAdminEmail } from '../../auth/super-admin';
 import {
@@ -200,8 +214,15 @@ export interface RunDto {
   rulesVersion: number;
   status: string;
   workerStatus: string;
-  /** R17: fijado al crear el run, nunca se actualiza (ni al reabrir). */
+  /**
+   * R17: fijado al crear el run. Única excepción (EV6 T5 B2): el upgrade «Generar videos reales»
+   * lo pasa UNA vez de 'mock' a 'real' (monótono); el original queda en `videoModeOriginal`.
+   */
   videoMode: RunVideoMode;
+  /** EV6 T5 B2: modo con el que nació el run si hubo upgrade de video (si no, ausente). */
+  videoModeOriginal?: RunVideoMode;
+  /** EV6 T5 B2: upgrade de videos de vista previa a reales (null si no hubo). */
+  videoUpgrade?: VideoUpgradeRecord | null;
   /**
    * 5B.2.A: estrategia de entrega final del video, congelada al crear el
    * run desde DYNAMIC_VIDEO_DELIVERY; runs anteriores sin el campo →
@@ -538,6 +559,64 @@ export function previewCounts(manifest: { manifest: { items: ReadonlyArray<{ typ
 /** Preview sin los campos internos. */
 export function publicPreview(pv: StartPreview): Omit<StartPreview, '_plan' | '_evaluation'> {
   const { _plan, _evaluation, ...rest } = pv;
+  return rest;
+}
+
+// ── EV6 T5 B2: «Generar videos reales» ──────────────────────────────────────
+
+export interface VideoUpgradePreview {
+  runId: string;
+  rulesVersion: number;
+  /** true = se puede confirmar (sin trabas y con videos pendientes); la aprobación se ve en `approval`. */
+  eligible: boolean;
+  pendingVideos: Array<{ itemKey: string; chapterId: string | null; generation: number }>;
+  interactions: Array<{ itemKey: string; generation: number }>;
+  estimate: {
+    currency: string; min: string; expected: string; max: string;
+    byProvider: Record<string, MinExpMax>; byItemType: Record<string, MinExpMax>; byCategory: Record<string, MinExpMax>;
+  } | null;
+  approval: {
+    required: boolean; canApprove: boolean; withinPolicy: boolean; amount: string | null;
+    cappedByLimit: string | null; blockedBy: NormalApprovalPlan['blockedBy']; existing: { amount: string } | null;
+  } | null;
+  blockers: Array<{ code: string; message: string }>;
+  /** Huella del estimado: la confirmación la exige igual (si no → 409 estimate_stale). */
+  estimateHash: string | null;
+  /** Upgrade ya hecho (idempotencia): con él, no hay nada que confirmar. */
+  upgrade: VideoUpgradeRecord | null;
+  /** Interno (no viaja al cliente). */
+  _blockers?: VideoUpgradeBlocker[];
+}
+
+export interface VideoUpgradeResult {
+  /** true = se creó el upgrade (201); false = ya existía (200, mismo upgrade, nada escrito). */
+  created: boolean;
+  upgrade: VideoUpgradeRecord;
+  run: RunDto;
+}
+
+interface VideoUpgradeBlocker {
+  code: string;
+  message: string;
+  error: () => Error;
+}
+
+interface VideoUpgradePlan {
+  pending: any[];
+  interactions: any[];
+  blockers: VideoUpgradeBlocker[];
+}
+
+interface VideoUpgradeEconomics {
+  estimate: EstimateResult;
+  plan: NormalApprovalPlan;
+  policyId: string | null;
+  runActual: string;
+  estimateHash: string;
+}
+
+export function publicVideoUpgradePreview(pv: VideoUpgradePreview): Omit<VideoUpgradePreview, '_blockers'> {
+  const { _blockers, ...rest } = pv;
   return rest;
 }
 
@@ -2520,6 +2599,364 @@ export class RunsService {
     return { kind: 'created', itemRunId: primary.id, previousItemRunId: latest.id, previousGeneration: Number(latest.generation), affected };
   }
 
+  // ── EV6 T5 B2: «Generar videos reales» (upgrade de los videos pendientes del run) ──
+
+  /**
+   * Vista previa (SOLO lectura: no escribe estimados, aprobaciones ni generaciones) del upgrade de
+   * los videos de vista previa del run actual a videos reales: qué videos (y sus interacciones) se
+   * generarían, el estimado en USD de EXACTAMENTE eso, la decisión de aprobación y las trabas que la
+   * confirmación respondería con 403/409. Si el run ya tiene un upgrade, lo devuelve (`upgrade`).
+   */
+  async previewVideoUpgrade(
+    courseId: number,
+    user: { id: string; email?: string | null },
+    blueprintNumber: number,
+    runId: string,
+  ): Promise<VideoUpgradePreview> {
+    assertDynamicOwnerAllowed(user.id);
+    const manifest = await this.manifestOfRun(courseId, user.id, blueprintNumber, runId);
+    const job = await this.reconcileCancellation(await this.loadRunRow(courseId, manifest, runId));
+    return this.videoUpgradePreviewOf(this.dataSource, courseId, user, job, manifest);
+  }
+
+  /**
+   * «Generar videos reales» (confirmación explícita). Re-valida TODO en el servidor y escribe en
+   * UNA transacción (lock del curso + lock global del tope mensual): la aprobación del upgrade
+   * (estimado scope regeneration + autorización ADMIN_APPROVED del run), una generación nueva
+   * `pending` por cada video pendiente y su video_interactions, y el upgrade del run (videoMode
+   * real, videoModeOriginal, videoUpgrade; run reabierto). Idempotente: si el run ya tiene un
+   * upgrade (doble clic, dos pestañas, reintento tras un timeout) devuelve ESE (`created:false`)
+   * sin escribir nada — nunca un segundo juego de generaciones pagas.
+   */
+  async confirmVideoUpgrade(
+    courseId: number,
+    user: { id: string; email?: string | null },
+    blueprintNumber: number,
+    runId: string,
+    estimateHash: string,
+  ): Promise<VideoUpgradeResult> {
+    const ownerId = user.id;
+    assertDynamicOwnerAllowed(ownerId);
+    const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
+    const job = await this.reconcileCancellation(await this.loadRunRow(courseId, manifest, runId));
+    const already = videoUpgradeOf(job.input_payload);
+    if (already) return { created: false, upgrade: already, run: await this.buildRunDto(job, manifest) };
+
+    const pv = await this.videoUpgradePreviewOf(this.dataSource, courseId, user, job, manifest, true);
+    if (pv.upgrade) return { created: false, upgrade: pv.upgrade, run: await this.buildRunDto(await this.loadJobById(job.id), manifest) };
+    if (pv._blockers && pv._blockers.length) throw pv._blockers[0].error();
+    if (!pv.estimateHash || pv.estimateHash !== estimateHash) {
+      throw new ConflictException({
+        code: ESTIMATE_STALE,
+        message: `${ESTIMATE_STALE}: el costo estimado cambió desde que lo viste (videos, precios, política o gasto); revisa el estimado nuevo. No se generó nada.`,
+        preview: publicVideoUpgradePreview(pv),
+      });
+    }
+    if (!pv.approval || !pv.approval.canApprove) {
+      throw new ForbiddenException({
+        code: APPROVAL_FORBIDDEN,
+        message: `${APPROVAL_FORBIDDEN}: generar los videos reales requiere la autorización de un administrador (esperado USD ${pv.estimate?.expected}, máximo USD ${pv.estimate?.max}). No se generó nada.`,
+      });
+    }
+    if (!pv.approval.withinPolicy) throw budgetBlockedConflict(pv.approval.blockedBy, publicVideoUpgradePreview(pv));
+    // DN-1: los videos reales se publican en YouTube → preflight del dueño ANTES de escribir (hace red: fuera de la tx).
+    await this.enforceVideoGate(ownerId, frozenRunVideoGate({ videoWork: pv.pendingVideos.length, videoMode: 'real', strategy: frozenVideoDeliveryOf(job.input_payload) }));
+
+    const outcome = await this.tx(async (qr) => {
+      await this.lockCourseRuns(qr, courseId);
+      const [locked] = await qr.query(`select * from public.production_jobs where id = $1 for update`, [job.id]);
+      const existing = videoUpgradeOf(locked?.input_payload);
+      if (existing) return { kind: 'existing' as const, upgrade: existing };
+      const plan = await this.planVideoUpgrade(qr, true, courseId, ownerId, locked, manifest);
+      if (plan.blockers.length) throw plan.blockers[0].error();
+      // Tope mensual compartido: una sola aprobación a la vez, con el plan recalculado acá.
+      await qr.query(`select pg_advisory_xact_lock(hashtext($1))`, [MONTH_CAP_LOCK]);
+      const econ = await this.videoUpgradeEconomics(qr, courseId, ownerId, locked, manifest, plan);
+      if (econ.estimateHash !== estimateHash) {
+        throw new ConflictException({
+          code: ESTIMATE_STALE,
+          message: `${ESTIMATE_STALE}: el costo o el gasto cambió mientras confirmabas; revisa el estimado nuevo. No se generó nada.`,
+        });
+      }
+      if (!econ.plan.withinPolicy || !econ.plan.amount) throw budgetBlockedConflict(econ.plan.blockedBy);
+      const rec = await this.finopsBudget!.recordRunUpgradeApproval(qr, {
+        courseId, ownerId, manifestId: manifest.id, runId: locked.id, estimate: econ.estimate, amount: econ.plan.amount,
+        runActual: econ.runActual, policyId: econ.policyId, approvedBy: String(user.email), fingerprint: estimateHash,
+      });
+      const requestedAt = new Date().toISOString();
+      const upgrade: VideoUpgradeRecord = {
+        id: randomUUID(),
+        at: requestedAt,
+        by: ownerId,
+        confirmedBy: user.email ?? null,
+        estimateHash,
+        itemKeys: plan.pending.map((r) => r.item_key).sort(),
+        interactionKeys: plan.interactions.map((r) => r.item_key).sort(),
+        estimateId: rec.estimateId,
+        authorizationId: rec.authorizationId,
+        amount: econ.plan.amount,
+        authorizedRunBudget: rec.authorizedRunBudget,
+      };
+      const insertGeneration = async (prev: any, regeneration: Record<string, any>): Promise<string> => {
+        const generation = Number(prev.generation) + 1;
+        const [row] = await qr.query(
+          `insert into public.generation_item_runs
+             (job_id, course_id, blueprint_id, manifest_id, item_key, generation, type, module_id, chapter_id,
+              depends_on, idempotency_key, status, output_summary)
+           values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::text[], $11, 'pending', $12::jsonb)
+           returning id`,
+          [locked.id, prev.course_id, prev.blueprint_id, prev.manifest_id, prev.item_key, generation, prev.type,
+            prev.module_id, prev.chapter_id, prev.depends_on ?? [], itemIdempotencyKey(manifest.id, prev.item_key, generation),
+            JSON.stringify({ regeneration })],
+        );
+        await qr.query(
+          `update public.artifacts
+              set status = 'stale',
+                  metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object(
+                    'staleReason', coalesce(metadata->>'staleReason', $2::text),
+                    'supersededByItemRunId', $3::text, 'supersededAt', $4::text),
+                  updated_at = now()
+            where item_run_id = $1 and status is distinct from 'disabled'`,
+          [prev.id, String(regeneration.reason), row.id, requestedAt],
+        );
+        return row.id as string;
+      };
+      for (const prev of plan.pending) {
+        const newId = await insertGeneration(prev, {
+          reason: VIDEO_UPGRADE_REASON, upgradeId: upgrade.id, fromItemRunId: prev.id, fromGeneration: Number(prev.generation),
+          costKind: 'videogen', requestedBy: ownerId, requestedAt,
+        });
+        const inter = plan.interactions.find((r) => r.chapter_id === prev.chapter_id);
+        if (inter) {
+          await insertGeneration(inter, {
+            reason: VIDEO_UPGRADE_CASCADE_REASON, upgradeId: upgrade.id, fromItemRunId: inter.id, fromGeneration: Number(inter.generation),
+            cascadeFromItemRunId: newId, cascadeFromItemKey: prev.item_key, costKind: 'llm', requestedBy: ownerId, requestedAt,
+          });
+        }
+      }
+      const note = JSON.stringify({ kind: VIDEO_UPGRADE_REASON, upgradeId: upgrade.id, requestedAt, affected: [...upgrade.itemKeys, ...upgrade.interactionKeys] });
+      try {
+        await qr.query(
+          `update public.production_jobs
+              set input_payload = input_payload || jsonb_build_object('videoMode', 'real', 'videoModeOriginal', $2::text, 'videoUpgrade', $3::jsonb),
+                  status = 'queued', worker_status = 'queued', finished_at = null, error_message = null, next_retry_at = null,
+                  output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('lastRegeneration', $4::jsonb),
+                  updated_at = now()
+            where id = $1`,
+          [locked.id, this.videoModeOf(locked), JSON.stringify(upgrade), note],
+        );
+      } catch (err) {
+        if (isActiveRunConflict(err)) {
+          throw new ConflictException(`Ya hay otra ejecución activa para el Manifest #${manifest.id}; no se puede reabrir ${locked.id}`);
+        }
+        throw err;
+      }
+      return { kind: 'created' as const, upgrade };
+    });
+    const fresh = await this.loadJobById(job.id);
+    return {
+      created: outcome.kind === 'created',
+      upgrade: outcome.upgrade,
+      run: await this.buildRunDto(fresh, manifest),
+    };
+  }
+
+  /** Vista previa (con o sin las trabas internas para la confirmación). */
+  private async videoUpgradePreviewOf(
+    q: { query: (sql: string, params?: any[]) => Promise<any> },
+    courseId: number,
+    user: { id: string; email?: string | null },
+    job: any,
+    manifest: ManifestDto,
+    keepInternals = false,
+  ): Promise<VideoUpgradePreview> {
+    const upgrade = videoUpgradeOf(job.input_payload);
+    const base: VideoUpgradePreview = {
+      runId: job.id, rulesVersion: manifest.rulesVersion, eligible: false, pendingVideos: [], interactions: [],
+      estimate: null, approval: null, blockers: [], estimateHash: null, upgrade,
+    };
+    if (upgrade) return base;
+    const plan = await this.planVideoUpgrade(q, false, courseId, user.id, job, manifest);
+    const blockers = [...plan.blockers];
+    const out: VideoUpgradePreview = {
+      ...base,
+      pendingVideos: plan.pending.map((r) => ({ itemKey: r.item_key, chapterId: r.chapter_id ?? null, generation: Number(r.generation) })),
+      interactions: plan.interactions.map((r) => ({ itemKey: r.item_key, generation: Number(r.generation) })),
+    };
+    if (plan.pending.length) {
+      // DN-1 (después del 403 de video real, igual que la confirmación): YouTube conectado y verificado.
+      const gb = await this.videoGateBlocker(user.id, frozenRunVideoGate({ videoWork: plan.pending.length, videoMode: 'real', strategy: frozenVideoDeliveryOf(job.input_payload) }));
+      if (gb) blockers.push({ code: gb.code, message: gb.message, error: () => new ConflictException({ message: gb.message, code: gb.code, ...(gb.reason ? { reason: gb.reason } : {}) }) });
+      let econ: VideoUpgradeEconomics;
+      try {
+        econ = await this.videoUpgradeEconomics(q, courseId, user.id, job, manifest, plan);
+      } catch (err) {
+        throw this.finopsUnavailable(err);
+      }
+      const sum = estimateSummary(econ.estimate);
+      out.estimate = {
+        currency: sum.currency, min: sum.min, expected: sum.expected, max: sum.max,
+        byProvider: sum.byProvider, byItemType: econ.estimate.totals.byItemType, byCategory: estimateCategories(sum.byProvider),
+      };
+      out.approval = {
+        // Video real = proveedor pagado real → siempre aprobación humana; nunca reutiliza un saldo autorizado antes.
+        required: true,
+        canApprove: isSuperAdminEmail(user.email),
+        withinPolicy: econ.plan.withinPolicy,
+        amount: econ.plan.amount,
+        cappedByLimit: econ.plan.cappedByLimit,
+        blockedBy: econ.plan.blockedBy,
+        existing: null,
+      };
+      out.estimateHash = econ.estimateHash;
+    }
+    out.blockers = blockers.map((b) => ({ code: b.code, message: b.message }));
+    out.eligible = blockers.length === 0 && plan.pending.length > 0;
+    if (keepInternals) out._blockers = blockers;
+    return out;
+  }
+
+  /**
+   * Planificador ÚNICO del upgrade (vista previa y confirmación). Solo lee; con `forUpdate`
+   * (dentro de la tx, tras el lock del curso y el FOR UPDATE del run) bloquea las filas.
+   */
+  private async planVideoUpgrade(
+    q: { query: (sql: string, params?: any[]) => Promise<any> },
+    forUpdate: boolean,
+    courseId: number,
+    ownerId: string,
+    job: any,
+    manifest: ManifestDto,
+  ): Promise<VideoUpgradePlan> {
+    const lock = forUpdate ? ' for update' : '';
+    const blockers: VideoUpgradeBlocker[] = [];
+    const block = (code: string, message: string, error: () => Error) => blockers.push({ code, message, error });
+    const conflict = (code: string, message: string) => () => new ConflictException({ message: `${code}: ${message}`, code });
+    if (manifest.rulesVersion !== 3) {
+      const m = 'generar los videos reales de un curso ya generado solo está disponible para la estructura actual (V2.1).';
+      block(VIDEO_UPGRADE_NOT_ALLOWED_RULES, m, conflict(VIDEO_UPGRADE_NOT_ALLOWED_RULES, m));
+      return { pending: [], interactions: [], blockers };
+    }
+    try {
+      assertRealVideoAllowed(ownerId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      block('real_video_not_allowed', msg, () => err as Error);
+    }
+    if (isCancelledLike(job) || job.worker_status !== 'completed') {
+      const m = `la generación del curso tiene que estar terminada para generar sus videos reales (estado: ${job.worker_status}).`;
+      block(VIDEO_UPGRADE_RUN_NOT_READY, m, conflict(VIDEO_UPGRADE_RUN_NOT_READY, m));
+    }
+    const superseding = await this.findSupersedingRun(q, job.id);
+    if (superseding) {
+      const err = this.supersededConflict(job.id, superseding);
+      block('superseded_run', err.message, () => err);
+    }
+    const other = await this.findActiveRunOnOtherManifest(q, courseId, manifest.id);
+    if (other) {
+      const err = this.otherActiveRunConflict(other, manifest);
+      block('active_run_on_other_manifest', err.message, () => err);
+    }
+    const videos: any[] = await q.query(
+      `select * from public.generation_item_runs g
+        where g.job_id = $1 and g.type = 'video' and ${latestGenerationPredicate('g')}
+        order by g.item_key${lock}`,
+      [job.id],
+    );
+    const runMode = this.videoModeOf(job);
+    const modeOf = (r: any) => r.output_summary?.mode;
+    // Ruling 6: run real sin upgrade con un video de vista previa = inconsistencia → fallar fuerte.
+    const inconsistent = runMode === 'real' ? videos.filter((r) => modeOf(r) === 'mock').map((r) => r.item_key) : [];
+    if (inconsistent.length) {
+      const msg = videoModeInconsistentMessage(inconsistent, job.id);
+      block(VIDEO_MODE_INCONSISTENT, msg, () => new ConflictException({ message: msg, code: VIDEO_MODE_INCONSISTENT, keys: inconsistent }));
+    }
+    const pending = runMode === 'real' ? [] : videos.filter((r) => r.status === 'completed' && modeOf(r) !== 'real');
+    if (!pending.length && !inconsistent.length) {
+      const m = 'este curso no tiene videos pendientes de generación.';
+      block(VIDEO_UPGRADE_NOTHING_PENDING, m, conflict(VIDEO_UPGRADE_NOTHING_PENDING, m));
+    }
+    const interKeys = pending.map((r) => `video_interactions:${r.chapter_id}`).filter((k) => manifest.manifest.items.some((it) => it.key === k));
+    const interactions: any[] = interKeys.length
+      ? await q.query(
+          `select * from public.generation_item_runs g
+            where g.job_id = $1 and g.item_key = any($2::text[]) and ${latestGenerationPredicate('g')}
+            order by g.item_key${lock}`,
+          [job.id, interKeys],
+        )
+      : [];
+    if (interactions.length !== interKeys.length) {
+      throw new InternalServerErrorException(`La ejecución ${job.id} no tiene filas de video_interactions para todos sus videos (integridad rota)`);
+    }
+    for (const r of [...pending, ...interactions]) {
+      if (r.status === 'running' || REGENERATION_IN_FLIGHT.has(r.status)) {
+        const m = `"${r.item_key}" se está generando; espera a que termine.`;
+        block('dependent_running', m, conflict('dependent_running', m));
+      }
+    }
+    if (pending.length) {
+      const missing = providerReadinessMissing({ providerModes: { presentation: 'mock', audio: 'mock' }, videoMode: 'real', videoCount: pending.length });
+      if (missing.length) {
+        const m = providerNotReadyMessage(missing);
+        block(PROVIDER_NOT_READY, m, () => new ConflictException({ message: m, code: PROVIDER_NOT_READY, missing }));
+      }
+    }
+    return { pending, interactions, blockers };
+  }
+
+  /** Estimado + plan de aprobación + huella del upgrade, todo sobre `runner` (la tx en la confirmación). */
+  private async videoUpgradeEconomics(
+    runner: { query: (sql: string, params?: any[]) => Promise<any> },
+    courseId: number,
+    ownerId: string,
+    job: any,
+    manifest: ManifestDto,
+    plan: VideoUpgradePlan,
+  ): Promise<VideoUpgradeEconomics> {
+    if (!this.finopsBudget) {
+      throw new ServiceUnavailableException({
+        code: FINOPS_UNAVAILABLE,
+        message: `${FINOPS_UNAVAILABLE}: no se puede estimar el costo de los videos reales; no se generó nada.`,
+      });
+    }
+    const fb = this.finopsBudget;
+    const modes = runSpendModes('real', frozenProviderModesOf(job.input_payload));
+    const byKey = new Map(manifest.manifest.items.map((it) => [it.key, it]));
+    const keys = [...plan.pending, ...plan.interactions].map((r) => r.item_key);
+    const items = keys.map((k) => byKey.get(k)).filter(Boolean) as RunManifestItem[];
+    if (items.length !== keys.length) throw new InternalServerErrorException('upgrade de video: items fuera del Manifest (integridad rota)');
+    const actions: Record<string, string> = {};
+    for (const k of keys) actions[k] = 'REGENERATE';
+    const estimateItems = estimateItemsForRun(items, modes, actions);
+    const estimate = await fb.estimate(estimateItems, { runner });
+    // En serie: `runner` puede ser la conexión de la tx (una consulta a la vez por conexión).
+    const policy = await fb.policyFor(courseId, ownerId, runner);
+    const spent = await fb.spentSoFar(courseId, runner);
+    const month = await fb.monthCommitted(runner);
+    const runActual = await fb.runActual(job.id, runner);
+    const runPaidAuthorized = await fb.runPaidAuthorizedBudget(job.id, runner);
+    const decision = decideRunBudget({ estimate, policy, spentSoFar: spent, paidRealProviders: paidRealProviders(estimateItems, modes) });
+    let np = planNormalApproval({ estimate, policy, courseSpent: spent.course, monthSpent: month.total, providerSpent: spent.byProvider });
+    if (decision.decision === 'BLOCK' && np.withinPolicy) {
+      np = { ...np, withinPolicy: false, amount: null, cappedByLimit: null,
+        blockedBy: [{ limit: 'policy_block', limitValue: null, spent: normalizeDecimal(spent.course), expected: estimate.totals.expected, over: 'expected' }] };
+    }
+    const estimateHash = videoUpgradeFingerprint({
+      runId: job.id,
+      manifestId: manifest.id,
+      pending: plan.pending.map((r) => ({ itemKey: r.item_key, generation: Number(r.generation) })),
+      interactions: plan.interactions.map((r) => ({ itemKey: r.item_key, generation: Number(r.generation) })),
+      modes,
+      estimate,
+      policyId: policy?.id ?? null,
+      plan: { amount: np.amount, withinPolicy: np.withinPolicy },
+      courseSpent: normalizeDecimal(spent.course),
+      runActual: normalizeDecimal(runActual),
+      runPaidAuthorized: runPaidAuthorized === null ? null : normalizeDecimal(runPaidAuthorized),
+    });
+    return { estimate, plan: np, policyId: policy?.id ?? null, runActual: normalizeDecimal(runActual), estimateHash };
+  }
+
   // ── V2.1 RF-b: estimado + gates de presupuesto (audit §W.6/§W.7) ─────────
 
   /**
@@ -3099,7 +3536,9 @@ export class RunsService {
       );
     }
     const existingVideoMode = this.videoModeOf(job);
-    if (existingVideoMode !== videoMode) {
+    // EV6 T5 B2: tras un upgrade de video, una pestaña vieja que reanuda con el modo ORIGINAL no es un conflicto.
+    const upgradedFrom = videoUpgradeOf(job.input_payload) ? job.input_payload?.videoModeOriginal : undefined;
+    if (existingVideoMode !== videoMode && upgradedFrom !== videoMode) {
       throw new ConflictException(
         `Ya hay una ejecución activa para este Manifest con otro modo de video (guardado ${existingVideoMode}, ` +
           `enviado ${videoMode}). El modo de video de una ejecución iniciada no cambia. runId=${job.id}`,
@@ -3484,6 +3923,8 @@ export class RunsService {
       status: job.status,
       workerStatus: job.worker_status,
       videoMode: this.videoModeOf(job),
+      ...(job.input_payload?.videoModeOriginal ? { videoModeOriginal: job.input_payload.videoModeOriginal } : {}),
+      videoUpgrade: videoUpgradeOf(job.input_payload),
       videoDelivery: strategy,
       videoDeliverySummary: this.videoDeliverySummaryOf(itemDtos),
       courseContextSha256: ctx.context_hash,

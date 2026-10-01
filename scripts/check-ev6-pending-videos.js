@@ -329,7 +329,7 @@ async function pureChecks() {
 }
 
 // ── worker v3 con dependencias falsas ─────────────────────────────────────
-function workerHarness({ videoMode = 'mock', videoModeByItem = null, omitMode = false } = {}) {
+function workerHarness({ videoMode = 'mock', videoModeByItem = null, omitMode = false, runPayload = {}, workerStatus = 'completed', upgradeFailures = null } = {}) {
   const fx = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true, courseId: 651 });
   const manifest = fx.manifest;
   const RUN_ID = '22222222-2222-4222-8222-222222222222';
@@ -373,7 +373,7 @@ function workerHarness({ videoMode = 'mock', videoModeByItem = null, omitMode = 
     }
   }
   const state = { completed: [], failed: [], uploads: [], dynamicMbz: [] };
-  const runRow = { id: RUN_ID, owner_id: OWNER, execution_mode: 'dynamic_generation', worker_status: 'completed', status: 'completed', input_payload: { videoMode, videoDelivery: 'youtube', providerModes: { presentation: 'mock', audio: 'mock' } } };
+  const runRow = { id: RUN_ID, owner_id: OWNER, execution_mode: 'dynamic_generation', worker_status: workerStatus, status: workerStatus, input_payload: { videoMode, videoDelivery: 'youtube', providerModes: { presentation: 'mock', audio: 'mock' }, ...runPayload } };
   const ds = {
     async query(sql, params) {
       if (/set status = 'completed'/.test(sql)) { state.completed.push(JSON.parse(params[2])); return [{ id: params[0] }]; }
@@ -381,6 +381,9 @@ function workerHarness({ videoMode = 'mock', videoModeByItem = null, omitMode = 
       if (/set lease_until = now\(\)/.test(sql)) return [{ id: params[0] }];
       if (/from public\.course_profiles/.test(sql)) return [];
       if (/from public\.courses where id = \$1/.test(sql)) return [{ metadata: {} }];
+      // EV6 T5 B2 (§2.6): consultas de runIsUpgradeOnlyFailure (filas vigentes no completadas / keys con generación completada).
+      if (/g\.status <> 'completed'/.test(sql)) return upgradeFailures || [];
+      if (/select distinct item_key from public\.generation_item_runs/.test(sql)) return (upgradeFailures || []).map((r) => ({ item_key: r.item_key }));
       if (/generation_item_runs/.test(sql)) return rows;
       if (/from public\.production_jobs where id = \$1/.test(sql)) return [runRow];
       throw new Error(`SQL no esperado en el fake: ${sql.slice(0, 80)}`);
@@ -483,6 +486,57 @@ async function workerChecks() {
   });
 }
 
+async function upgradeChecks() {
+  await check('B2 repaquete tras el upgrade: run real con videoUpgrade y videos de generación real → el paquete INCLUYE los videos (sin pendientes, clave nueva)', async () => {
+    const pre = workerHarness({ videoMode: 'mock' });
+    await W.processItem(pre.deps, pre.job);
+    const preSummary = pre.state.completed[0];
+    const h = workerHarness({ videoMode: 'real', runPayload: { videoModeOriginal: 'mock', videoUpgrade: { id: 'up-1', itemKeys: videoChapters(pre.manifest).map((c) => `video:${c}`) } } });
+    await W.processItem(h.deps, h.job);
+    eq(h.state.failed, [], 'sin fallos');
+    const s = h.state.completed[0];
+    eq([s.pendingVideos, s.pendingVideoNoticeCount], [[], 0], 'sin pendientes');
+    assert(s.sourceIdsHash !== preSummary.sourceIdsHash, 'clave distinta del paquete de vista previa');
+    const acts = await mbzActs(h.state.uploads[0].buffer);
+    for (const c of videoChapters(h.manifest)) assert(acts.some((a) => a.idnumber === `cv3:ch:${c}:video` && a.modname === 'h5pactivity'), `video real ${c}`);
+  });
+  await check('B2 §2.6: run FAILED solo por un video del upgrade → se empaqueta igual con ese capítulo pendiente; el otro video (real) entra', async () => {
+    const probe = workerHarness();
+    const vids = videoChapters(probe.manifest);
+    const failed = [
+      { item_key: `video:${vids[1]}`, type: 'video', status: 'failed', output_summary: { regeneration: { reason: 'video_upgrade' } } },
+      { item_key: `video_interactions:${vids[1]}`, type: 'video_interactions', status: 'blocked', output_summary: { regeneration: { reason: 'cascade_from_video', cascadeFromItemKey: `video:${vids[1]}` } } },
+    ];
+    const h = workerHarness({
+      videoMode: 'real', videoModeByItem: (ch) => (ch === vids[0] ? 'real' : 'mock'), workerStatus: 'failed',
+      runPayload: { videoModeOriginal: 'mock', videoUpgrade: { id: 'up-2', itemKeys: vids.map((c) => `video:${c}`) } }, upgradeFailures: failed,
+    });
+    await W.processItem(h.deps, h.job);
+    eq(h.state.failed, [], `sin fallos: ${h.state.failed}`);
+    const s = h.state.completed[0];
+    eq(s.pendingVideos.map((p) => p.itemKey), [`video:${vids[1]}`], 'el que falló queda pendiente');
+    const acts = await mbzActs(h.state.uploads[0].buffer);
+    assert(acts.some((a) => a.idnumber === `cv3:ch:${vids[0]}:video`), 'el real entra');
+    assert(!acts.some((a) => a.idnumber === `cv3:ch:${vids[1]}:video`), 'el fallido no');
+  });
+  await check('B2 §2.6: run FAILED por algo AJENO al upgrade (o sin upgrade) → NO se empaqueta (falla fuerte)', async () => {
+    const h = workerHarness({ videoMode: 'mock', workerStatus: 'failed', upgradeFailures: [{ item_key: 'content:x', type: 'content', status: 'failed', output_summary: {} }] });
+    await W.processItem(h.deps, h.job);
+    eq(h.state.uploads.length, 0, 'sin upload');
+    assert(h.state.failed.length === 1 && /not_completed/.test(h.state.failed[0]), `falla: ${h.state.failed[0]}`);
+  });
+  await check('B2 ruling 6: run REAL sin upgrade con un video de vista previa → video_mode_inconsistent (el worker falla fuerte, nada se sube; nunca «pendiente»)', async () => {
+    const h = workerHarness({ videoMode: 'real', videoModeByItem: () => 'mock' });
+    await W.processItem(h.deps, h.job);
+    eq(h.state.uploads.length, 0, 'sin upload');
+    assert(h.state.failed.length === 1 && /video_mode_inconsistent/.test(h.state.failed[0]), `falla: ${h.state.failed[0]}`);
+    // Con el upgrade registrado, el mismo estado es «pendiente» (degradado legítimo).
+    const ok = workerHarness({ videoMode: 'real', videoModeByItem: () => 'mock', runPayload: { videoUpgrade: { id: 'u', itemKeys: [] } } });
+    await W.processItem(ok.deps, ok.job);
+    eq([ok.state.failed.length, ok.state.uploads.length], [0, 1], 'con upgrade empaqueta');
+  });
+}
+
 async function serviceChecks() {
   await check('PackagingService.assertRunReady: v3 con videos mock → SIN 409 (sigue al chequeo de items); v1/v2 mock → 409 mock_video_not_packageable', async () => {
     const SENT = 'LLEGO_A_LA_DB';
@@ -559,6 +613,7 @@ async function moodleChecks() {
 (async () => {
   await pureChecks();
   await workerChecks();
+  await upgradeChecks();
   await serviceChecks();
   if (WITH_MOODLE) {
     if (!workerMbz) { failures++; console.error('❌ Moodle: no hay paquete del worker'); } else await moodleChecks();

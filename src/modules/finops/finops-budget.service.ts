@@ -217,6 +217,41 @@ export class FinopsBudgetService {
   }
 
   /**
+   * EV6 T5 B2 — «Generar videos reales»: dentro de la tx del upgrade (course lock + MONTH_CAP_LOCK
+   * ya tomados por el caller) guarda el estimado del upgrade (scope regeneration, con run_id) y una
+   * autorización ADMIN_APPROVED del run por su nuevo presupuesto TOTAL = gasto real hasta hoy +
+   * monto aprobado del upgrade (el runtime guard de los workers la usa: nunca se gasta más que eso).
+   */
+  async recordRunUpgradeApproval(runner: Runner, a: {
+    courseId: number;
+    ownerId: string;
+    manifestId: number;
+    runId: string;
+    estimate: EstimateResult;
+    amount: DecimalLike;
+    runActual: DecimalLike;
+    policyId: string | null;
+    approvedBy: string;
+    fingerprint: string;
+  }): Promise<{ estimateId: string; authorizationId: string; authorizedRunBudget: string }> {
+    if (typeof a.approvedBy !== 'string' || !a.approvedBy.trim()) throw new FinopsError('INVALID_INPUT', 'approvedBy es obligatorio');
+    if (typeof a.runId !== 'string' || !UUID_RE.test(a.runId)) throw new FinopsError('INVALID_INPUT', 'runId debe ser UUID');
+    const amount = normalizeDecimal(a.amount, 'amount');
+    if (cmpDec(amount, a.estimate.totals.expected) < 0) {
+      throw new FinopsError('INVALID_INPUT', `el monto aprobado (${amount}) no cubre el esperado (${a.estimate.totals.expected})`);
+    }
+    const total = addDec(normalizeDecimal(a.runActual, 'runActual'), amount);
+    const est = await this.recordEstimate({
+      scope: 'regeneration', ownerId: a.ownerId, courseId: a.courseId, manifestId: a.manifestId, runId: a.runId, estimate: a.estimate,
+    }, runner);
+    const auth = await this.ledger.authorize({
+      runId: a.runId, courseId: a.courseId, estimateId: est.id, authorizedBudget: total, policyId: a.policyId,
+      decision: 'ADMIN_APPROVED', approvedBy: a.approvedBy.trim(), reason: `video_upgrade:${a.fingerprint}`,
+    }, runner);
+    return { estimateId: est.id, authorizationId: auth.id, authorizedRunBudget: total };
+  }
+
+  /**
    * Aprobación ADMIN_APPROVED de este curso, para un estimado del MISMO
    * Manifest, todavía no vinculada a ningún run y que cubre `minBudget`.
    * Vence a las APPROVAL_TTL_HOURS: una aprobación vieja no se reutiliza.

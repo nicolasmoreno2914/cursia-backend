@@ -33,6 +33,7 @@ import { frozenVideoDeliveryOf, checkYoutubeDeliveryUrl } from '../dynamic-gener
 import { GuardArtifact, MockArtifactInRealRunError, assertNoMockArtifactsForRealPackage } from './packaging-guards';
 import { frozenProviderModesOf, providerKindOfArtifactType } from '../dynamic-generation/provider-modes';
 import { assertSafeStoragePath } from '../artifacts/artifacts.service';
+import { VideoModeInconsistentError, runIsUpgradeOnlyFailure, videoUpgradeOf } from '../dynamic-generation/video-upgrade';
 import { ResolvedAssessment, assertCategoriesPopulated, assessmentItemCountsForPackage } from '../../package/assessment';
 import {
   AssessmentProfile,
@@ -103,12 +104,15 @@ function parseJson(v: any): any {
 /** Resuelve los artifacts de TODOS los items de un run v3 completado. Lanza PackagingNotReadyError con la lista completa de faltantes. */
 export async function resolveRunArtifactsV3(q: QueryExecutor, runId: string, manifest: GenerationManifestV1): Promise<Map<string, ResolvedItemV3>> {
   if (manifest?.rulesVersion !== 3) throw new Error(`${PACKAGING_V3}: resolveRunArtifactsV3 exige un Manifest rulesVersion 3`);
-  const [job] = await q.query(`select id, execution_mode, worker_status, status from public.production_jobs where id = $1`, [runId]);
+  const [job] = await q.query(`select id, execution_mode, worker_status, status, input_payload from public.production_jobs where id = $1`, [runId]);
   if (!job) throw new PackagingNotReadyError([`run:${runId}:not_found`], `Empaquetado no listo: el run ${runId} no existe.`);
   if (job.execution_mode !== 'dynamic_generation') {
     throw new PackagingNotReadyError([`run:${runId}:wrong_execution_mode=${job.execution_mode}`]);
   }
-  if (job.worker_status !== 'completed' && job.status !== 'completed') {
+  job.input_payload = parseJson(job.input_payload);
+  // EV6 T5 B2 (§2.6): un run que terminó sin completar SOLO por videos del upgrade se empaqueta igual
+  // (esos capítulos quedan con su video pendiente: la generación completada vigente es la de vista previa).
+  if (job.worker_status !== 'completed' && job.status !== 'completed' && !(await runIsUpgradeOnlyFailure(q, job))) {
     throw new PackagingNotReadyError([`run:${runId}:not_completed:worker_status=${job.worker_status},status=${job.status}`]);
   }
   const rows: any[] = await q.query(
@@ -753,16 +757,24 @@ export function splitPendingVideosV3(
   manifest: GenerationManifestV1,
   byItem: Map<string, ResolvedItemV3>,
   runVideoMode: unknown,
+  opts: { videoUpgrade?: boolean; runId?: string } = {},
 ): { pendingVideos: PendingVideoV3[]; byItem: Map<string, ResolvedItemV3> } {
   const pendingVideos: PendingVideoV3[] = [];
+  const inconsistent: string[] = [];
   for (const it of manifest.items) {
     if (it.type !== 'video') continue;
     const r = byItem.get(it.key);
     if (!r) continue; // resolveRunArtifactsV3 ya exigió todos los items
     if (isRealVideoOutput(r.outputSummary, runVideoMode)) continue;
+    // Ruling 6 (B2): run real + item de vista previa solo es «pendiente» si hubo un upgrade.
+    if (runVideoMode === 'real' && !opts.videoUpgrade) {
+      inconsistent.push(it.key);
+      continue;
+    }
     const chapterId = String(it.chapterId ?? it.key.slice('video:'.length));
     pendingVideos.push({ itemKey: it.key, chapterId, videoInteractionsKey: `video_interactions:${chapterId}` });
   }
+  if (inconsistent.length) throw new VideoModeInconsistentError(inconsistent, opts.runId);
   if (!pendingVideos.length) return { pendingVideos, byItem };
   const drop = new Set(pendingVideos.flatMap((p) => [p.itemKey, p.videoInteractionsKey]));
   return { pendingVideos, byItem: new Map([...byItem].filter(([k]) => !drop.has(k))) };
@@ -794,7 +806,10 @@ export async function prepareV3Package(
   run.input_payload = parseJson(run.input_payload);
   const resolvedAll = await resolveRunArtifactsV3(q, runId, manifest.manifest);
   // EV6 T5: los videos de vista previa quedan fuera del paquete (nunca un video simulado como real).
-  const { pendingVideos, byItem } = splitPendingVideosV3(manifest.manifest, resolvedAll, run.input_payload?.videoMode);
+  const { pendingVideos, byItem } = splitPendingVideosV3(manifest.manifest, resolvedAll, run.input_payload?.videoMode, {
+    videoUpgrade: !!videoUpgradeOf(run.input_payload),
+    runId,
+  });
   const omittedVideoKeys = pendingVideos.map((p) => p.itemKey);
   assertRunArtifactsPackageable(run, byItem);
   const pendingKeys = new Set(omittedVideoKeys);
