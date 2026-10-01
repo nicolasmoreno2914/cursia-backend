@@ -384,7 +384,10 @@ async function main() {
   await b.setViewport(1280, 900, false);
   if (!ok(await login(b, creds), 'login del estudiante local de prueba')) return;
 
-  const cmsOf = (c) => c.moodle.cms.filter((x) => x.idnumber && (x.modname === 'label' || x.modname === 'h5pactivity')).map((x) => [x.cmid, x.idnumber]);
+  // EV6 T3: el label para docentes del certificado está OCULTO (visible=0): el estudiante no debe
+  // verlo, así que no se mide aquí; su ausencia se comprueba aparte (browser-sections).
+  const TEACHER_ONLY = 'cv3:shell:certificate_teacher';
+  const cmsOf = (c) => c.moodle.cms.filter((x) => x.idnumber && x.idnumber !== TEACHER_ONLY && (x.modname === 'label' || x.modname === 'h5pactivity')).map((x) => [x.cmid, x.idnumber]);
   // EV6: se mide CADA página de sección (una sección por página) y se suman las métricas;
   // `perPage` corre en cada página ya cargada (p. ej. enlaces de respaldo de los videos).
   const pageMetrics = async (c, width, label, { mobile = false, openAll = false, shot = true, perPage = null } = {}) => {
@@ -429,6 +432,18 @@ async function main() {
     const linked = pages.slice(1).filter((pg) => r.links.some((h) => new RegExp(`/course/section\\.php\\?id=${pg.path.split('=')[1]}(?!\\d)`).test(h)));
     ok(linked.length === pages.length - 1, `${c.key}: la página del curso enlaza las ${pages.length - 1} secciones (una página por capítulo / evaluación / cierre)`, { linked: linked.length, links: r.links.slice(0, 20) });
     out.metrics[`${c.key}-course-page-390`] = { height: r.height, sections: pages.map((pg) => pg.name) };
+    // EV6 T3: el ÚNICO módulo oculto es el label para docentes del certificado y el estudiante NO lo ve
+    // (ni en su página de sección, que es la del cierre); el cierre sí está.
+    const hidden = c.moodle.cms.filter((x) => x.visible === 0);
+    eq(hidden.map((x) => x.idnumber), [TEACHER_ONLY], `${c.key}: único módulo oculto = label para docentes del certificado`);
+    const t = hidden[0];
+    const closing = c.moodle.cms.find((x) => x.idnumber === 'cv3:shell:closing');
+    if (t && closing) {
+      await b.navigate(`${WWW}${sectionPath(c, t.cmid)}`);
+      await sleep(1200);
+      const v = await b.evaluate(`(()=>({teacher:!!document.getElementById('module-${t.cmid}'),closing:!!document.getElementById('module-${closing.cmid}'),txt:/Para docentes|Habilitar acceso/.test(document.body.innerText)}))()`);
+      eq(v, { teacher: false, closing: true, txt: false }, `${c.key}: el estudiante NO ve el label para docentes (sí el cierre) en la sección del cierre`);
+    }
   }
   area = 'browser';
   const assertMetrics = (m, tag, width, { lang = true } = {}) => {

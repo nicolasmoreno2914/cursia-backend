@@ -531,6 +531,8 @@ function reservationBookkeeping(ev) {
             const fx = await z.file('files.xml').async('string');
             const m = {};
             for (const f of fx.match(/<file id="\d+">[\s\S]*?<\/file>/g) || []) {
+              // EV6 T3: la imagen de la insignia-certificado depende del TEMA (acento): se compara aparte.
+              if (/<component>badges<\/component>/.test(f)) continue;
               const fnm = (/<filename>([^<]*)<\/filename>/.exec(f) || [])[1] || '';
               const ext = (/\.(mp3|pdf|png|h5p|html)$/.exec(fnm) || [])[1];
               if (ext) (m[ext] = m[ext] || new Set()).add(/<contenthash>(\w+)<\/contenthash>/.exec(f)[1]);
@@ -539,6 +541,20 @@ function reservationBookkeeping(ev) {
           };
           const b1 = await blobs(z1); const b2 = await blobs(z2);
           eq([b2.mp3, b2.pdf, b2.png], [b1.mp3, b1.pdf, b1.png], `E1-repack: MP3 (${(b1.mp3 || []).length}), PDF (${(b1.pdf || []).length}) y PNG (${(b1.png || []).length}) byte-idénticos entre E1 y E1-repack`);
+          // EV6 T3: la imagen de la insignia es función SOLO del tema: cambia con el tema nuevo y es
+          // exactamente la que renderiza ese tema (mismos bytes que courseBadgeImages(resolveTheme(perfil nuevo))).
+          const badgeBlobs = async (z) => {
+            const fx = await z.file('files.xml').async('string');
+            return Object.fromEntries((fx.match(/<file id="\d+">[\s\S]*?<\/file>/g) || []).filter((f) => /<component>badges<\/component>/.test(f))
+              .map((f) => [(/<filename>([^<]*)<\/filename>/.exec(f) || [])[1], /<contenthash>(\w+)<\/contenthash>/.exec(f)[1]]));
+          };
+          const g1 = await badgeBlobs(z1); const g2 = await badgeBlobs(z2);
+          const BADGE = D('package/v3/course-badge.js');
+          const sha1 = (b) => crypto.createHash('sha1').update(b).digest('hex');
+          const wantBadge = Object.fromEntries(BADGE.courseBadgeImages(TE.resolveTheme({ themeFamily: 'tecnico', mode: 'dark', themeVersion: 1 })).map((x) => [x.filename, sha1(x.png)]));
+          eq(Object.keys(g1).sort(), ['f1.png', 'f2.png', 'f3.png'], 'E1: imagen de la insignia-certificado (f1/f2/f3)');
+          eq(g2, wantBadge, 'E1-repack: imagen de la insignia = render determinístico del tema nuevo (tecnico/dark)');
+          ok(['f1.png', 'f2.png', 'f3.png'].every((n) => g1[n] && g1[n] !== g2[n]), 'E1-repack: la imagen de la insignia cambia con el tema (y solo ella entre los PNG)', { g1, g2 });
           ok((b1.h5p || []).length > 0 && (b1.h5p || []).length === (b2.h5p || []).length, `E1-repack: misma cantidad de paquetes .h5p (${(b1.h5p || []).length}); cambian solo por passPercentage/tema`);
           results.courses.E1repack = { ...results.courses.E1, theme: { themeFamily: 'tecnico', mode: 'dark' }, passing: 80, packageSummary: os };
         });
@@ -749,7 +765,8 @@ function reservationBookkeeping(ev) {
         const finalSec = M.features.finalExam ? sn : null;
         if (M.features.finalExam) want.push([sn++, ['cv3:final_exam_info', 'cv3:final_exam', 'cv3:final_exam_next']]);
         const closingSec = sn;
-        want.push([closingSec, ['cv3:shell:closing']]);
+        // EV6 T3: + label oculto para docentes (activar la insignia-certificado) al final del cierre.
+        want.push([closingSec, ['cv3:shell:closing', 'cv3:shell:certificate_teacher']]);
         eq(o.sections.map((s) => [s.section, s.cms.map((c) => c.idnumber)]), want, `${label}: secciones × actividades por UUID = orden del ensamblador de capítulo (una sección por capítulo / evaluación)`);
         const secIdx = (idn) => o.sections.findIndex((s) => s.cms.some((c) => c.idnumber === idn));
         ok(secIdx('cv3:shell:closing') === o.sections.length - 1 && (!M.features.finalExam || secIdx('cv3:final_exam') < secIdx('cv3:shell:closing')),
@@ -923,7 +940,7 @@ function reservationBookkeeping(ev) {
           if (who === 'fail') ok(r.courseComplete === false, `${label} [fail]: curso NO completo`, r);
         }
         results.moodle[label].sim = so.sim;
-        results.moodle[label].cms = cms.map((c) => ({ cmid: c.cmid, idnumber: c.idnumber, modname: c.modname }));
+        results.moodle[label].cms = cms.map((c) => ({ cmid: c.cmid, idnumber: c.idnumber, modname: c.modname, visible: c.visible }));
         // EV6 (browser QA): una página por sección → el QA recorre /course/section.php?id=<id>.
         results.moodle[label].sections = o.sections.map((x) => ({ section: x.section, id: x.id, name: x.name, cmids: x.cms.map((c) => c.cmid) }));
       }, { fatal: false });

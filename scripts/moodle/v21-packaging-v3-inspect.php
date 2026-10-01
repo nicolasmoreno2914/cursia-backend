@@ -60,7 +60,7 @@ foreach ($modinfo->get_section_info_all() as $si) {
         $cms[] = ['cmid' => (int)$cm->id, 'modname' => $cm->modname, 'name' => $cm->name, 'idnumber' => $row->idnumber,
             'completion' => (int)$row->completion, 'completiongradeitemnumber' => $row->completiongradeitemnumber,
             'completionpassgrade' => (int)$row->completionpassgrade, 'completionview' => (int)$row->completionview,
-            'showdescription' => (int)$row->showdescription,
+            'showdescription' => (int)$row->showdescription, 'visible' => (int)$row->visible,
             'files' => $files];
     }
     // EV6: id real de la sección (destino de los botones /course/section.php?id=…).
