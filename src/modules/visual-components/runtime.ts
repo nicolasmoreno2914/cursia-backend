@@ -54,17 +54,58 @@ export function decisionStyle(S: string, c: ResolvedTheme['color']): string {
     `${S} .cvc-dt-d${d}>.cvc-dt-branches{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:28px;align-items:start}` +
     `${S} .cvc-dt-d${d}>.cvc-dt-branches>.cvc-dt-br{border-left:0!important;padding-left:0!important;margin-bottom:0!important}` +
     `${S} .cvc-dt-d${d}>.cvc-dt-branches>.cvc-dt-yes>.cvc-dt-pill{text-align:right}`;
-  const acc = c.accentStrong;
   return [
     `${S} .cvc-dt-pair{table-layout:fixed}`,
     // conector decorativo (texto alternativo vacío: el lector dice «Sí», no «flecha»). Los «:» del rótulo
     // quedan VISIBLES (fix round 4): ningún texto de un label se oculta, en ningún nivel.
-    `${S} .cvc-dt-yes>.cvc-dt-pill>.cvc-dt-lbl::before{content:"\\2199";content:"\\2199" / "";margin-right:.4em;color:${acc}}`,
-    `${S} .cvc-dt-no>.cvc-dt-pill>.cvc-dt-lbl::before{content:"\\2198";content:"\\2198" / "";margin-right:.4em;color:${acc}}`,
+    `${S} .cvc-dt-yes>.cvc-dt-pill>.cvc-dt-lbl::before{content:"\\2199";content:"\\2199" / "";margin-right:.4em;color:inherit}`,
+    `${S} .cvc-dt-no>.cvc-dt-pill>.cvc-dt-lbl::before{content:"\\2198";content:"\\2198" / "";margin-right:.4em;color:inherit}`,
     `${S} .cvc-dt-d1>.cvc-dt-q{text-align:center}`,
     `@container (min-width:600px){${S} .cvc-dt-d1>.cvc-dt-q{max-width:36rem;margin-left:auto!important;margin-right:auto!important}${cols(1)}}`,
     `@container (min-width:960px){${cols(2)}}`,
   ].join('\n');
+}
+
+/** P3 — reglas del sistema educativo (compartidas con el shell). Sin ellas todo queda en una columna legible. */
+export function eduStyle(S: string, c: ResolvedTheme['color']): string[] {
+  return [
+    `${S} .cvc-ic{display:inline-block;vertical-align:-0.22em;flex:none}`,
+    `${S} .cvc-chip .cvc-ic{display:block}`,
+    `${S} .cvc-chip+h4,${S} .cvc-chip+h5{margin-top:2px!important}`,
+    `${S} .cvc-chip{margin-bottom:14px!important}`,
+    `${S} p.cvc-chip{width:max-content;max-width:100%}`,
+    // riel del proceso: conector vertical entre insignias
+    `${S} .cvc-rail>li{position:relative}`,
+    `${S} .cvc-rail>li:not(:last-child)::before{content:"";position:absolute;left:17px;top:44px;bottom:-12px;width:2px;background-color:${c.border}}`,
+    `${S} .cvc-rail .cvc-step-b h4,${S} .cvc-rail .cvc-step-b h5{margin-top:5px!important}`,
+    `${S} .cvc-obj{align-items:start!important}`,
+    `${S} .cvc-obj .cvc-badge{margin:0!important}`,
+    `${S} .cvc-obj .cvc-li-t{padding-top:3px}`,
+    `${S} .cvc-pt{grid-template-columns:2.25rem minmax(0,1fr)!important}`,
+    `${S} .cvc-pt .cvc-ic{margin-top:2px}`,
+    `${S} .cvc-check{grid-template-columns:2rem minmax(0,1fr)!important;align-items:start!important}`,
+    `${S} .cvc-check .cvc-ic{margin-top:4px}`,
+    `${S} .cvc-mr>div{margin:0!important}`,
+    `${S} .cvc-mr{gap:12px;margin-bottom:12px!important;display:grid}`,
+    `${S} .cvc-case{overflow:hidden}`,
+    `${S} .cvc-op-num .cvc-badge{margin:0!important}`,
+    // ruta del capítulo: pasos con ícono, en fila desde 560 px
+    `${S} .cvc-route-steps{display:flex;flex-direction:column;gap:6px}`,
+    `${S} .cvc-route-steps>li{display:flex;align-items:center;gap:10px;margin:0!important}`,
+    // riel del módulo
+    `${S} .cvc-mrail>li{display:grid;grid-template-columns:2.5rem minmax(0,1fr);align-items:center;column-gap:10px}`,
+    `${S} .cvc-mrail>li .cvc-badge{margin:0!important}`,
+    `${S} .cvc-mrail>li{position:relative}`,
+    `${S} .cvc-mrail>li:not(:last-child)::before{content:"";position:absolute;left:calc(1.25rem - 1px);top:40px;bottom:-8px;width:2px;background-color:${c.border}}`,
+    `${S} .cvc-facts-row{display:flex;flex-wrap:wrap;gap:8px 20px}`,
+    `${S} .cvc-facts-row>span{display:inline-flex;align-items:center;gap:6px}`,
+    `@container (min-width:600px){` +
+      `${S} .cvc-cols2.cvc-terms>li:nth-child(2),${S} .cvc-cols2.cvc-objs>li:nth-child(2){border-top:0!important}` +
+      `${S} .cvc-mr{grid-template-columns:repeat(2,minmax(0,1fr))}` +
+      `${S} .cvc-route-steps{flex-direction:row;flex-wrap:wrap;align-items:center;gap:8px 10px}` +
+      `${S} .cvc-route-steps>li:not(:last-child)::after{content:"\\2192";content:"\\2192" / "";margin-left:4px;color:${c.borderStrong};font-weight:700}` +
+      `}`,
+  ];
 }
 
 export function scopedStyle(uid: string, theme: ResolvedTheme, opts: { decision?: boolean } = {}): string {
@@ -174,6 +215,11 @@ export function scopedStyle(uid: string, theme: ResolvedTheme, opts: { decision?
     `@keyframes cvc-${uid}-in{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}`,
     `@media (prefers-reduced-motion:reduce){${S} *,${S} *::before,${S} *::after{animation:none!important;transition:none!important}}`,
     `${S} .cvc-tabpanel[hidden]{display:none}`,
+    // P3 — sistema visual educativo 2.0
+    ...eduStyle(S, c),
+    `${S} .cvc-t-timeline .cvc-ev::before{background-color:${theme.blocks.visual.ink}}`,
+    `${S} .cvc-t-tabs [role="tab"][aria-selected="true"]{border-bottom-color:${theme.blocks.concepto.ink}}`,
+    `${S} summary.cvc-btn::after{color:inherit}`,
     `${S} :where(h2,h4,h5){text-wrap:balance}`,
     `${S} :where(p){text-wrap:pretty}`,
   ]

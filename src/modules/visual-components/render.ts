@@ -24,8 +24,16 @@
  * Jerarquía de encabezados: el nombre de la sección Moodle es <h3>; la apertura de capítulo
  * (ctx.opener) usa <h2> para el título del capítulo; dentro del label los títulos de
  * componente son <h4> y los encabezados de ítem <h5> (o <h4> si el componente no tiene título).
+ *
+ * P3 (EV6 sistema visual educativo 2.0): cada bloque abre con su RÓTULO (ícono + etiqueta del rol
+ * pedagógico, en el color del rol) y toma la FORMA de su rol (ficha tintada, riel de pasos, expediente,
+ * par error/correcto, árbol, pausa, figura enmarcada). La estructura (apertura, objetivos, síntesis,
+ * repaso) usa el color del MÓDULO (ctx.module). `why` / `apply` (opcionales) se muestran como «Por qué
+ * importa:» bajo el título y «Cómo lo aplicas:» al pie; sin ellos no se muestra nada (experiencias viejas).
+ * Un acordeón cuyos encabezados son «Paso N: …» se dibuja como proceso (pasos siempre visibles).
  */
-import { contrastRatio, isValidHex, ResolvedTheme } from '../theme-engine';
+import { contrastRatio, isValidHex, ModuleColor, ResolvedTheme, EduBlockRole } from '../theme-engine';
+import { EduIcon, Tone, eduIcon, moduleTone, roleTone } from './edu';
 import {
   VcAccordion,
   VcCallout,
@@ -49,11 +57,19 @@ import {
   VcDecisionBranch,
   VcDecisionDiagram,
   VcDecisionNode,
+  VcNodeDiagram,
 } from './schema';
 import { HYPHEN_HEADING, HYPHEN_TABLE, HyphenOpts, inlineHtml, labelHtml, richParagraphs } from './text';
 import { runtimeScript, scopedStyle } from './runtime';
 
 export type VcRenderLevel = 'enhanced';
+
+/**
+ * P3 — generación del lenguaje visual del renderer (entra en VC_RENDERER_VERSION → clave de reuse del
+ * paquete): un cambio de estilo que no toca el schema ni el runtime JS igual debe re-empaquetar.
+ * 1 = R14-A/EV4 (diseño editorial), 2 = sistema visual educativo 2.0.
+ */
+export const VC_RENDER_STYLE_VERSION = 2;
 
 /** R14-A — contexto de apertura de capítulo: el título del capítulo es el pico de la página. */
 export interface VcOpener {
@@ -63,6 +79,10 @@ export interface VcOpener {
   title: string;
   /** Numeral grande (p. ej. "02"); opcional. */
   numeral?: string;
+  /** P3 — línea de progreso «Módulo 1 · Capítulo 2 de 6» (de facts); reemplaza a `kicker` si está. */
+  progress?: string;
+  /** P3 — minutos estimados del capítulo (de facts). */
+  minutes?: number;
 }
 
 export interface VcRenderContext {
@@ -81,6 +101,8 @@ export interface VcRenderContext {
    * así que sin conteos en los kickers ni numerales de índice.
    */
   countless?: boolean;
+  /** P3 — color del módulo del capítulo (moduleColor del tema): apertura, síntesis, repaso. */
+  module?: ModuleColor;
 }
 
 const UID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
@@ -106,6 +128,7 @@ interface R {
   seq: number;
   opener?: VcOpener;
   countless?: boolean;
+  mod?: ModuleColor;
 }
 
 type Decl = [string, string | number];
@@ -161,6 +184,8 @@ function checkTheme(t: ResolvedTheme): void {
   if (!['flat', 'outline', 'tinted'].includes(t.variants.card) || !['flat', 'outline', 'tinted'].includes(t.variants.callout) || !['solid', 'soft'].includes(t.variants.hero)) {
     renderFail('tema: variants inválidas');
   }
+  if (!t.blocks) renderFail('tema sin blocks (P3)');
+  for (const [role, b] of Object.entries(t.blocks)) for (const [k, v] of Object.entries(b)) if (!isValidHex(v)) renderFail(`tema: blocks.${role}.${k} no es #RRGGBB`);
   if (!['rule', 'band', 'plate'].includes(p.heroTreatment) || !['compact', 'regular', 'airy'].includes(p.density)) renderFail('tema: personality inválida');
   for (const k of ['displayWeight', 'metaTracking'] as const) {
     if (typeof p[k] !== 'number' || !Number.isFinite(p[k]) || p[k] < 0) renderFail(`tema: personality.${k} inválido`);
@@ -235,10 +260,6 @@ function counted(r: R, label: string, n: number, one: string, many: string): str
   return r.countless ? label : `${label} · ${plural(n, one, many)}`;
 }
 
-/** Índice "01"; en countless un glifo neutro (sin cifras). */
-function indexText(r: R, i: number): string {
-  return r.countless ? '—' : pad2(i + 1);
-}
 
 // ─── Primitivas tipográficas ────────────────────────────────────────────────
 
@@ -247,7 +268,7 @@ const MAJOR_TYPES = new Set(['hero', 'process_steps', 'comparison', 'summary_vis
 
 function componentWrap(r: R, type: string, inner: string, s: Surf, extraSafe: Decl[] = [], extraEnh: Decl[] = [], cls = ''): string {
   const ty = r.t.typography;
-  const gap = D(r, MAJOR_TYPES.has(type) ? 64 : 44);
+  const gap = D(r, MAJOR_TYPES.has(type) ? 56 : 40);
   return (
     `<div class="cvc-c cvc-t-${type}${cls ? ' ' + cls : ''}"` +
     st(
@@ -290,12 +311,6 @@ function kicker(r: R, text: string, s: Surf, opts: { color?: string; margin?: st
   );
 }
 
-/** Kicker que abre un componente: en familias con `sectionRule` lleva un filete de acento a todo el ancho. */
-function sectionKicker(r: R, text: string, s: Surf): string {
-  if (!r.t.personality.sectionRule) return kicker(r, text, s);
-  const col = readable(s.bg, [r.t.color.accent, r.t.color.accentStrong], r.t.color.borderStrong);
-  return `<div class="cvc-secrule"${st(r, [['margin', '0 0 14px 0'], ['padding', '12px 0 0 0'], ['border-top', `2px solid ${col}`]])}>${kicker(r, text, s, { margin: '0' })}</div>`;
-}
 
 type Role = 'display' | 'title' | 'item' | 'statement';
 
@@ -364,40 +379,8 @@ function paragraphs(
     .join('');
 }
 
-/** Filete de acento (40–56 × 3 px): marca la apertura y la idea central, nada más (§4). */
-function accentRule(r: R, s: Surf, margin?: string): string {
-  const col = readable(s.bg, [r.t.color.accent, r.t.color.accentStrong], r.t.color.borderStrong);
-  return `<div class="cvc-rule"${ea(r, { 'aria-hidden': 'true' })}${st(r, [['width', '48px'], ['max-width', '48px'], ['margin', margin ?? `0 0 ${D(r, 20)}px 0`], ['border-top', `3px solid ${col}`]])}></div>`;
-}
 
-/** Numeral grande (capítulo, paso). */
-function numeral(r: R, text: string, s: Surf, size: 'xl' | 'md' | 'sm' = 'md'): string {
-  const ty = r.t.typography;
-  const col = readable(s.bg, [r.t.color.accentStrong, r.t.color.accent], s.fg);
-  const px = size === 'xl' ? Math.round(ty.sizeNumeralPx * 1.6) : size === 'md' ? ty.sizeNumeralPx : ty.sizeItemPx;
-  const fl = size === 'xl' ? 'clamp(3.25rem, 2.2rem + 4vw, 5.5rem)' : size === 'md' ? ty.scale.numeral : ty.scale.item;
-  return (
-    `<div class="cvc-num"` +
-    st(
-      r,
-      [
-        ['margin', size === 'sm' ? '0 0 4px 0' : '0 0 8px 0'],
-        ['color', col],
-        ['font-family', r.t.personality.fontNumeral],
-        ['font-size', px],
-        ['font-weight', String(Math.max(600, Math.min(900, Math.round(r.t.personality.displayWeight / 100) * 100)))],
-        ['line-height', '1'],
-        ['letter-spacing', '-0.02em'],
-      ],
-      [['font-size', fl], ['font-variant-numeric', 'tabular-nums lining-nums']],
-    ) +
-    `>${labelHtml(text)}</div>`
-  );
-}
 
-function pad2(n: number): string {
-  return n < 10 ? `0${n}` : String(n);
-}
 
 /** Fila separada por filete superior (el separador de todo contenido abierto). */
 function row(r: R, inner: string, s: Surf, opts: { tag?: 'div' | 'li'; cls?: string; first?: boolean; id?: string } = {}): string {
@@ -456,55 +439,7 @@ function edgeOf(r: R, s: Surf): string {
   return r.t.personality.plate ? r.t.color.border : s.bg;
 }
 
-/**
- * Edu EV4 — tarjeta de aprendizaje: superficie tintada con relleno (no una fila entre filetes),
- * para que un bloque didáctico se lea como pieza del curso y no como párrafo de revista.
- */
-function tile(r: R, inner: string, s: Surf, opts: { cls?: string; tag?: 'div' | 'li' } = {}): string {
-  const tag = opts.tag || 'li';
-  const edge = edgeOf(r, s);
-  return (
-    `<${tag} class="cvc-tile${opts.cls ? ' ' + opts.cls : ''}"` +
-    st(
-      r,
-      [
-        ['background-color', s.bg],
-        ['color', s.fg],
-        ['border', `1px solid ${edge}`],
-        ['margin', `0 0 ${D(r, 12)}px 0`],
-        ['padding', `${D(r, 18)}px ${D(r, 20)}px`],
-      ],
-      [['border-radius', r.t.shape.radiusMd]],
-    ) +
-    `>${inner}</${tag}>`
-  );
-}
 
-/** Edu EV4 — insignia numerada (paso): cifra clara sobre el acento, no un numeral gigante. */
-function badge(r: R, text: string, size: 'md' | 'lg' = 'md'): string {
-  const b = surf(r.t, r.t.color.accentStrong, [r.t.color.textOnAccent]);
-  const px = size === 'lg' ? 56 : 36;
-  return (
-    // La insignia del capítulo repite «Capítulo N» del kicker: oculta para lectores de pantalla.
-    `<div class="cvc-badge"${size === 'lg' ? ea(r, { 'aria-hidden': 'true' }) : ''}` +
-    st(
-      r,
-      [
-        ['width', `${px}px`],
-        ['margin', '0 0 8px 0'],
-        ['background-color', b.bg],
-        ['color', b.fg],
-        ['font-family', r.t.personality.fontNumeral],
-        ['font-size', size === 'lg' ? r.t.typography.sizeH3Px : r.t.typography.sizeSmallPx],
-        ['font-weight', '700'],
-        ['line-height', `${px}px`],
-        ['text-align', 'center'],
-      ],
-      [['border-radius', '50%'], ['font-variant-numeric', 'tabular-nums lining-nums']],
-    ) +
-    `>${labelHtml(text)}</div>`
-  );
-}
 
 /** <ul>/<ol> sin viñetas: en ENHANCED se devuelve role="list" (Safari/VoiceOver lo pierde). */
 function bareList(r: R, tag: 'ul' | 'ol', inner: string, cls?: string): string {
@@ -546,9 +481,6 @@ function list<T>(v: T[] | undefined, what: string): T[] {
   return v;
 }
 
-function glyph(r: R, ch: string, color: string, cls = 'cvc-glyph'): string {
-  return `<span class="${cls}"${ea(r, { 'aria-hidden': 'true' })}${st(r, [['color', color], ['font-weight', '700']])}>${ch}</span> `;
-}
 
 /** "Paso 3: Frota…" → "Frota…" (el numeral ya dice el orden). */
 const STEP_PREFIX_RE = /^\s*(?:paso|etapa|fase|step)\s*\d{1,2}\s*[:.\-–—)]\s*/i;
@@ -559,98 +491,11 @@ function stripStepPrefix(h: string): string {
 
 // ─── Componentes (una función por tipo) ─────────────────────────────────────
 
-function renderHero(r: R, c: VcHero): string {
-  const col = r.t.color;
-  const p = r.t.personality;
-  const g = ground(r);
-  const op = r.opener;
-  const plate = p.heroTreatment === 'plate';
-  const s = plate ? surf(r.t, col.accentSoft) : g;
-  const metaParts = [op ? op.kicker : '', c.eyebrow ?? ''].filter((x) => x && x.trim());
-  let head = '';
-  if (p.heroTreatment === 'band' && metaParts.length) {
-    const bs = surf(r.t, col.accent, [col.textOnAccent]);
-    head =
-      `<div class="cvc-band"${st(r, [['background-color', bs.bg], ['color', bs.fg], ['margin', `0 0 ${D(r, 24)}px 0`], ['padding', '10px 16px']], [['border-radius', r.t.shape.radiusSm]])}>` +
-      kicker(r, metaParts.join(' · '), bs, { color: bs.fg, margin: '0', llm: true }) +
-      `</div>`;
-  } else if (metaParts.length) {
-    head = kicker(r, metaParts.join(' · '), s, { llm: true });
-  }
-  let main: string;
-  if (op) {
-    main =
-      heading(r, 'h2', op.title, s, 'display') +
-      accentRule(r, s) +
-      // EV5: el enunciado del hero no repite el título del capítulo.
-      (sameText(c.title, op.title) || startsWithTitle(c.title, op.title) ? '' : paragraphs(r, c.title, s, { role: 'statement', italic: p.thesisItalic })) +
-      paragraphs(r, c.lead, s, { role: 'lead', last: true });
-  } else {
-    main = heading(r, 'h4', c.title, s, 'display') + accentRule(r, s) + paragraphs(r, c.lead, s, { role: 'lead', last: true });
-  }
-  // EV4b: el número del capítulo es una insignia (mismo lenguaje que los pasos), no un numeral de revista.
-  const num = op && op.numeral ? `<div class="cvc-op-num">${badge(r, op.numeral, 'lg')}</div>` : '';
-  const body = `<div class="cvc-op${num ? ' cvc-op-split' : ''}"><div class="cvc-op-lead">${head}</div>${num}<div class="cvc-op-main">${main}</div></div>`;
-  if (plate) {
-    return componentWrap(
-      r,
-      'hero',
-      body,
-      s,
-      [['padding', `${D(r, 32)}px ${D(r, 28)}px`], ['border', `1px solid ${col.accentSoft}`]],
-      [['border-radius', r.t.shape.radiusLg], ['padding', 'clamp(24px, 4vw, 48px)']],
-      op ? 'cvc-opener' : '',
-    );
-  }
-  return componentWrap(r, 'hero', body, s, [['padding', `${D(r, 8)}px 0 0 0`]], [], op ? 'cvc-opener' : '');
-}
 
-function renderLearningObjectives(r: R, c: VcLearningObjectives): string {
-  const s = ground(r);
-  const ps = surf(r.t, panelBg(r));
-  const items = list(c.items, 'learning_objectives.items');
-  const lis = items
-    .map(
-      (it, i) =>
-        row(
-          r,
-          `<div class="cvc-li-n"${st(r, [['margin', '0 0 4px 0'], ['color', readable(ps.bg, [r.t.color.accentStrong], ps.fg)], ['font-family', r.t.personality.fontNumeral], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700']], [['font-variant-numeric', 'tabular-nums']])}>${labelHtml(indexText(r, i))}</div>` +
-            `<div class="cvc-li-t"${st(r, [['color', ps.fg]])}>${inlineHtml(it)}</div>`,
-          ps,
-          // Solo el primero sin filete (apilado = una columna); en 2 columnas el runtime quita el del 2.º.
-          { tag: 'li', cls: 'cvc-obj', first: i === 0 },
-        ),
-    )
-    .join('');
-  const cls = items.length >= 4 ? 'cvc-cols2 cvc-objs' : 'cvc-objs';
-  return componentWrap(
-    r,
-    'learning_objectives',
-    // Edu EV4: el kicker ya no repite el título; la lista vive en un panel tintado.
-    sectionKicker(r, OBJ_KICKER_RE.test((c.title ?? '').trim()) ? 'Al terminar podrás' : 'Objetivos de aprendizaje', s) +
-      titleIf(r, c.title, s, 'Al terminar podrás') +
-      panel(r, bareList(r, 'ol', lis, cls), ps, { cls: 'cvc-obj-panel', border: edgeOf(r, ps), padding: `${D(r, 6)}px ${D(r, 24)}px` }),
-    s,
-  );
-}
 
-function renderConceptCards(r: R, c: VcConceptCards): string {
-  const s = ground(r);
-  const ht = itemTag(c.title, 'Glosario');
-  const cards = list(c.cards, 'concept_cards.cards');
-  const ts = surf(r.t, panelBg(r));
-  const items = cards
-    .map((k) => tile(r, heading(r, ht, k.term, ts, 'item') + paragraphs(r, k.definition, ts, { last: true, secondary: true }), ts, { cls: 'cvc-term' }))
-    .join('');
-  return componentWrap(
-    r,
-    'concept_cards',
-    sectionKicker(r, 'Glosario', s) + titleIf(r, c.title, s, 'Conceptos clave') + bareList(r, 'ul', items, 'cvc-cards'),
-    s,
-  );
-}
 
-function renderRevealCards(r: R, c: VcRevealCards): string {
+/** Cuerpo de las tarjetas de revelado (título + tarjetas); el rótulo lo pone renderReveal. */
+function revealCardsBody(r: R, c: VcRevealCards): string {
   const s = ground(r);
   const ps = surf(r.t, panelBg(r));
   const cards = list(c.cards, 'reveal_cards.cards');
@@ -665,35 +510,11 @@ function renderRevealCards(r: R, c: VcRevealCards): string {
       return panel(r, front + back, ps, { tag: 'li', cls: 'cvc-reveal-card' });
     })
     .join('');
-  return componentWrap(
-    r,
-    'reveal_cards',
-    sectionKicker(r, 'Pon a prueba', s) + titleIf(r, c.title, s) + bareList(r, 'ul', items, 'cvc-cols2 cvc-cards'),
-    s,
-  );
+  return titleIf(r, c.title, s) + bareList(r, 'ul', items, 'cvc-cols2 cvc-cards');
 }
 
-function renderAccordion(r: R, c: VcAccordion): string {
-  const s = ground(r);
-  const ht = itemTag(c.title);
-  const its = list(c.items, 'accordion.items');
-  const items = its
-    .map((it, i) => {
-      const h = heading(r, ht, it.heading, s, 'item', { margin: '0' });
-      return row(r, reveal(r, 'cvc-acc', h, h, `<div${st(r, [['padding', '10px 0 0 0']])}>${paragraphs(r, it.body, s, { last: true, secondary: true })}</div>`, { keepOpen: i === 0 }), s, {
-        cls: 'cvc-acc-row',
-      });
-    })
-    .join('');
-  return componentWrap(
-    r,
-    'accordion',
-    sectionKicker(r, 'Profundiza', s) + titleIf(r, c.title, s) + `<div class="cvc-rows"${st(r, [['border-bottom', `1px solid ${r.t.color.border}`]])}>${items}</div>`,
-    s,
-  );
-}
 
-function renderTabs(r: R, c: VcTabs): string {
+function tabsBody(r: R, c: VcTabs, afterTitle = ''): string {
   const s = ground(r);
   const ht = itemTag(c.title);
   const titleId = r.enh && c.title ? nextId(r, 'tt') : undefined;
@@ -705,12 +526,11 @@ function renderTabs(r: R, c: VcTabs): string {
     })
     .join('');
   const box = `<div class="cvc-tabs"${ea(r, titleId ? { 'data-cvc-labelledby': titleId } : { 'data-cvc-label': 'Pestañas' })}>${panels}</div>`;
-  return componentWrap(r, 'tabs', sectionKicker(r, 'Perspectivas', s) + titleIf(r, c.title, s, undefined, titleId) + box, s);
+  return titleIf(r, c.title, s, undefined, titleId) + afterTitle + box;
 }
 
-function renderTimeline(r: R, c: VcTimeline): string {
+function timelineBody(r: R, c: VcTimeline, afterTitle = ''): string {
   const s = ground(r);
-  const col = r.t.color;
   const ht = itemTag(c.title);
   const evs = list(c.events, 'timeline.events');
   const events = evs
@@ -725,33 +545,10 @@ function renderTimeline(r: R, c: VcTimeline): string {
       );
     })
     .join('');
-  void col;
   const axis = `<ol class="cvc-axis"${ea(r, { role: 'list' })}${st(r, [['list-style', 'none'], ['margin', '0 0 0 6px'], ['padding', `${D(r, 4)}px 0 0 0`]])}>${events}</ol>`;
-  return componentWrap(r, 'timeline', sectionKicker(r, counted(r, 'Línea de tiempo', evs.length, 'hito', 'hitos'), s) + titleIf(r, c.title, s) + axis, s);
+  return titleIf(r, c.title, s) + afterTitle + axis;
 }
 
-function renderProcessSteps(r: R, c: VcProcessSteps): string {
-  const s = ground(r);
-  const ht = itemTag(c.title);
-  const sps = list(c.steps, 'process_steps.steps');
-  const steps = sps
-    .map((sp, i) =>
-      row(
-        r,
-        `<div class="cvc-step-n">${badge(r, String(i + 1))}</div>` +
-          `<div class="cvc-step-b">${heading(r, ht, stripStepPrefix(sp.heading), s, 'item')}${paragraphs(r, sp.body, s, { last: true, secondary: true })}</div>`,
-        s,
-        { tag: 'li', cls: 'cvc-step' },
-      ),
-    )
-    .join('');
-  return componentWrap(
-    r,
-    'process_steps',
-    sectionKicker(r, counted(r, 'Proceso', sps.length, 'paso', 'pasos'), s) + titleIf(r, c.title, s) + bareList(r, 'ol', steps, 'cvc-steps'),
-    s,
-  );
-}
 
 /** ≤ 2 columnas: <table> real (cabe a 390 px); en ENHANCED dentro de una región desplazable accesible. */
 function comparisonTable(r: R, columns: string[], rows: VcComparison['rows'], titleId?: string): string {
@@ -853,7 +650,7 @@ export function normalizeLegacyLabelColumn(
   return { columns: columns.slice(1), rows: rows.map((rw) => ({ ...rw, cells: rw.cells.slice(0, -1) })) };
 }
 
-function renderComparison(r: R, c: VcComparison): string {
+function comparisonBody(r: R, c: VcComparison, afterTitle = ''): string {
   const s = ground(r);
   const rawColumns = list(c.columns, 'comparison.columns');
   const rawRows = list(c.rows, 'comparison.rows');
@@ -862,134 +659,17 @@ function renderComparison(r: R, c: VcComparison): string {
   const rows = legacy ? legacy.rows : rawRows;
   const titleId = r.enh && c.title ? nextId(r, 'cmp') : undefined;
   const body = columns.length > VC_TABLE_MAX_COLUMNS ? comparisonStack(r, columns, rows, c.title) : comparisonTable(r, columns, rows, titleId);
-  return componentWrap(r, 'comparison', sectionKicker(r, 'Comparación', s) + titleIf(r, c.title, s, undefined, titleId) + body, s);
+  return titleIf(r, c.title, s, undefined, titleId) + afterTitle + body;
 }
 
-function renderMythReality(r: R, c: VcMythReality): string {
-  const s = ground(r);
-  const col = r.t.color;
-  const pairs = list(c.pairs, 'myth_reality.pairs');
-  const rowsHtml = pairs
-    .map((p, i) => {
-      const myth = `<div class="cvc-myth-a">${kicker(r, 'Mito', s, { color: col.danger, margin: '0 0 6px 0' })}${paragraphs(r, p.myth, s, { secondary: true, last: true })}</div>`;
-      const lead = kicker(r, 'Realidad', s, { color: col.success, margin: '0 0 6px 0' });
-      const real = `<div class="cvc-myth-b">${reveal(r, 'cvc-myth', btnLabel(r, 'Realidad', s), lead, paragraphs(r, p.reality, s, { weight: 600, last: true }), {
-        ariaLabel: `Realidad: mito ${i + 1}`,
-        button: true,
-      })}</div>`;
-      return row(r, myth + real, s, { tag: 'li', cls: 'cvc-mr' });
-    })
-    .join('');
-  return componentWrap(r, 'myth_reality', sectionKicker(r, 'Mito y realidad', s) + titleIf(r, c.title, s) + bareList(r, 'ul', rowsHtml), s);
-}
 
-function renderCaseScenario(r: R, c: VcCaseScenario): string {
-  const ps = surf(r.t, panelBg(r));
-  const qs = list(c.questions, 'case_scenario.questions')
-    .map(
-      (q, i) =>
-        `<li class="cvc-q"${st(r, [['margin', '0 0 12px 0'], ['padding', 0], ['color', ps.fg]])}>` +
-        `<span class="cvc-q-n"${st(r, [['color', readable(ps.bg, [r.t.color.accentStrong], ps.fg)], ['font-family', r.t.personality.fontNumeral], ['font-weight', '700']])}>${labelHtml(`${i + 1}.`)}</span> ` +
-        `<span class="cvc-q-t">${inlineHtml(q)}</span></li>`,
-    )
-    .join('');
-  const inner =
-    kicker(r, 'Caso', ps) +
-    heading(r, 'h4', c.title, ps, 'title') +
-    paragraphs(r, c.narrative, ps) +
-    kicker(r, 'Preguntas guía', ps, { margin: `${D(r, 20)}px 0 12px 0` }) +
-    bareList(r, 'ol', qs, 'cvc-qs');
-  return componentWrap(r, 'case_scenario', panel(r, inner, ps, { padding: `${D(r, 28)}px ${D(r, 28)}px` }), ground(r), [], [], 'cvc-case');
-}
 
-function renderChecklist(r: R, c: VcChecklist): string {
-  const s = ground(r);
-  const its = list(c.items, 'checklist.items');
-  const items = its
-    .map((it) => row(r, glyph(r, '☐', readable(s.bg, [r.t.color.accentStrong], s.fg)) + `<span class="cvc-li-t">${inlineHtml(it)}</span>`, s, { tag: 'li', cls: 'cvc-check' }))
-    .join('');
-  return componentWrap(r, 'checklist', sectionKicker(r, 'Lista de verificación', s) + titleIf(r, c.title, s) + bareList(r, 'ul', items), s);
-}
 
-function renderReflection(r: R, c: VcReflection): string {
-  const s = ground(r);
-  const p = r.t.personality;
-  const q = `<div class="cvc-quote"${ea(r, { 'aria-hidden': 'true' })}${st(r, [['margin', '0 0 -8px 0'], ['color', readable(s.bg, [r.t.color.accent, r.t.color.accentStrong], s.fg)], ['font-family', "Georgia, 'Times New Roman', serif"], ['font-size', 64], ['font-weight', '700'], ['line-height', '1']])}>${labelHtml('“')}</div>`;
-  let inner = q + kicker(r, 'Para reflexionar', s) + paragraphs(r, c.prompt, s, { role: 'statement', italic: p.thesisItalic, last: !c.hint });
-  if (c.hint) {
-    inner += reveal(r, 'cvc-hint', btnLabel(r, 'Pista', s), kicker(r, 'Pista', s, { margin: '0 0 6px 0' }), paragraphs(r, c.hint, s, { last: true, secondary: true }), {
-      ariaLabel: 'Pista para la reflexión',
-      button: true,
-    });
-  }
-  return componentWrap(
-    r,
-    'reflection',
-    inner,
-    s,
-    [['padding', `${D(r, 24)}px 0 ${D(r, 8)}px 0`], ['border-top', `1px solid ${r.t.color.borderStrong}`]],
-  );
-}
 
-const CALLOUT_LABEL: Record<VcCallout['variant'], string> = {
-  tip: 'Consejo',
-  warning: 'Atención',
-  info: 'Dato',
-  example: 'Ejemplo',
-};
 
-function renderCallout(r: R, c: VcCallout): string {
-  const col = r.t.color;
-  const tone: Record<VcCallout['variant'], string> = {
-    tip: col.success,
-    warning: col.warning,
-    info: col.info,
-    example: col.accent,
-  };
-  if (typeof c.variant !== 'string' || !hasOwn(tone, c.variant)) renderFail(`callout.variant desconocido "${String(c.variant)}"`);
-  const s = ground(r);
-  const border = tone[c.variant];
-  const inner =
-    kicker(r, CALLOUT_LABEL[c.variant], s, { color: border, margin: '0 0 8px 0' }) +
-    (c.title ? heading(r, 'h5', c.title, s, 'item') : '') +
-    paragraphs(r, c.body, s, { last: true });
-  return componentWrap(
-    r,
-    'callout',
-    inner,
-    s,
-    [['padding', `${D(r, 20)}px ${D(r, 24)}px`], ['border', `${c.variant === 'warning' ? 2 : 1}px solid ${border}`]],
-    [['border-radius', r.t.shape.radiusMd]],
-  );
-}
 
-function renderSummaryVisual(r: R, c: VcSummaryVisual): string {
-  const ts = surf(r.t, panelBg(r));
-  const pts = list(c.points, 'summary_visual.points');
-  const points = pts
-    .map(
-      (p, i) =>
-        `<li class="cvc-pt"${st(r, [['margin', 0], ['padding', `${D(r, 14)}px 0 ${D(r, 14)}px 0`], ['color', ts.fg], ['border-top', `1px solid ${r.t.color.border}`]])}>` +
-        `<div class="cvc-li-n"${st(r, [['margin', '0 0 4px 0'], ['color', readable(ts.bg, [r.t.color.accentStrong], ts.fg)], ['font-family', r.t.personality.fontNumeral], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700']], [['font-variant-numeric', 'tabular-nums']])}>${labelHtml(indexText(r, i))}</div>` +
-        `<div class="cvc-li-t">${inlineHtml(p)}</div></li>`,
-    )
-    .join('');
-  const inner =
-    kicker(r, 'Ideas clave', ts) +
-    accentRule(r, ts, `0 0 ${D(r, 16)}px 0`) +
-    `<div class="cvc-central">${paragraphs(r, c.central, ts, { role: 'statement', italic: r.t.personality.thesisItalic, last: true, climax: true })}</div>` +
-    `<div${st(r, [['margin', `${D(r, 24)}px 0 0 0`]])}>${bareList(r, 'ol', points, pts.reduce((a, x) => a + x.length, 0) / pts.length > 90 ? 'cvc-pts' : 'cvc-cols2 cvc-pts')}</div>`;
-  return componentWrap(
-    r,
-    'summary_visual',
-    inner,
-    ts,
-    [['padding', `${D(r, 32)}px ${D(r, 28)}px ${D(r, 20)}px ${D(r, 28)}px`]],
-    [['border-radius', r.t.shape.radiusLg], ['padding', `clamp(24px, 3.4vw, ${D(r, 44)}px)`]],
-  );
-}
 
-function renderSelfCheck(r: R, c: VcSelfCheck): string {
+function selfCheckBody(r: R, c: VcSelfCheck): string {
   const s = ground(r);
   const its = list(c.items, 'self_check.items');
   const items = its
@@ -1001,45 +681,13 @@ function renderSelfCheck(r: R, c: VcSelfCheck): string {
       });
     })
     .join('');
-  return componentWrap(r, 'self_check', sectionKicker(r, counted(r, 'Autoevaluación', its.length, 'pregunta', 'preguntas'), s) + titleIf(r, c.title, s, 'Repaso rápido') + bareList(r, 'ol', items), s);
+  return titleIf(r, c.title, s, 'Repaso rápido') + bareList(r, 'ol', items);
 }
 
 /**
  * Edu Phase A — ejemplo resuelto: situación → datos (ilustrativos) → resolución paso a paso →
  * resultado (panel, la única superficie) → para recordar. Todo abierto: es contenido, no revelado.
  */
-function renderWorkedExample(r: R, c: VcWorkedExample): string {
-  const s = ground(r);
-  const ps = surf(r.t, panelBg(r));
-  const data = list(c.data, 'worked_example.data')
-    .map((d) => row(r, `<span class="cvc-li-t">${inlineHtml(d)}</span>`, s, { tag: 'li', cls: 'cvc-we-datum' }))
-    .join('');
-  const steps = list(c.steps, 'worked_example.steps')
-    .map((sp, i) =>
-      row(
-        r,
-        `<div class="cvc-step-n">${badge(r, String(i + 1))}</div>` +
-          `<div class="cvc-step-b">${heading(r, 'h5', stripStepPrefix(sp.action), s, 'item')}${paragraphs(r, sp.detail, s, { last: true, secondary: true })}</div>`,
-        s,
-        { tag: 'li', cls: 'cvc-step' },
-      ),
-    )
-    .join('');
-  const result =
-    kicker(r, 'Resultado', ps, { color: r.t.color.success }) +
-    paragraphs(r, c.result, ps, { weight: 600, last: !c.takeaway }) +
-    (c.takeaway ? kicker(r, 'Para recordar', ps, { margin: `${D(r, 16)}px 0 6px 0` }) + paragraphs(r, c.takeaway, ps, { last: true, secondary: true }) : '');
-  const inner =
-    sectionKicker(r, 'Ejemplo resuelto', s) +
-    heading(r, 'h4', c.title, s, 'title') +
-    paragraphs(r, c.situation, s) +
-    kicker(r, 'Datos del caso (ilustrativos)', s, { margin: `${D(r, 20)}px 0 4px 0` }) +
-    bareList(r, 'ul', data, 'cvc-cols2 cvc-we-data') +
-    kicker(r, 'Resolución paso a paso', s, { margin: `${D(r, 24)}px 0 4px 0` }) +
-    bareList(r, 'ol', steps, 'cvc-steps') +
-    `<div${st(r, [['margin', `${D(r, 20)}px 0 0 0`]])}>${panel(r, result, ps, { cls: 'cvc-we-result', border: readable(ps.bg, [r.t.color.success], r.t.color.border), borderWidth: 2 })}</div>`;
-  return componentWrap(r, 'worked_example', inner, s);
-}
 
 const DIAGRAM_KIND_LABEL: Record<VcDiagram['kind'], string> = {
   cycle: 'Ciclo',
@@ -1177,26 +825,17 @@ function decisionNode(r: R, n: VcDecisionNode, s: Surf, depth: number): string {
   return `<div class="cvc-dt-node cvc-dt-d${depth}">${decisionQuestion(r, n.question, s, depth)}${branches}</div>`;
 }
 
-function renderDecision(r: R, c: VcDecisionDiagram): string {
-  const s = ground(r);
-  if (!c.tree || typeof c.tree !== 'object') renderFail('diagram: un árbol de decisión necesita "tree"');
-  const head =
-    sectionKicker(r, `Diagrama · ${DIAGRAM_KIND_LABEL.decision}`, s) +
-    titleIf(r, c.title, s) +
-    (c.caption ? paragraphs(r, c.caption, s, { secondary: true }) : '');
-  return componentWrap(r, 'diagram', head + `<div class="cvc-dg cvc-dg-decision">${decisionNode(r, c.tree, s, 1)}</div>`, s);
-}
 
-function renderDiagram(r: R, c: VcDiagram): string {
-  if (c.kind === 'decision') return renderDecision(r, c);
+/** Cuerpo de un diagrama de nodos (título + leyenda + dibujo); el rótulo lo pone renderDiagram. */
+function nodeDiagramBody(r: R, c: VcNodeDiagram, afterTitle = ''): string {
   const s = ground(r);
   const nodes = list(c.nodes, 'diagram.nodes');
   if (typeof c.kind !== 'string' || !hasOwn(DIAGRAM_KIND_LABEL, c.kind)) renderFail(`diagram: forma desconocida "${String(c.kind)}"`);
   if (c.kind === 'matrix' && nodes.length !== 4) renderFail('diagram: una matriz necesita exactamente 4 nodos');
   if (c.kind === 'hierarchy' && nodes.length < 2) renderFail('diagram: una jerarquía necesita raíz y al menos un hijo');
   const head =
-    sectionKicker(r, `Diagrama · ${DIAGRAM_KIND_LABEL[c.kind]}`, s) +
     heading(r, 'h4', c.title, s, 'title') +
+    afterTitle +
     (c.caption ? paragraphs(r, c.caption, s, { secondary: true }) : '');
   let body = '';
   if (c.kind === 'cycle' || c.kind === 'flow') {
@@ -1240,29 +879,466 @@ function renderDiagram(r: R, c: VcDiagram): string {
       `<tr>${cell(nodes[2], false)}${cell(nodes[3], false)}</tr>` +
       `</tbody></table></div>`;
   }
-  return componentWrap(r, 'diagram', head + body, s);
+  return head + body;
+}
+
+// ─── P3 — Sistema visual educativo 2.0 ──────────────────────────────────────
+//
+// Cada bloque pedagógico abre con su RÓTULO (ícono + etiqueta del rol, en el color del rol) y toma
+// la FORMA de su rol: concepto = ficha tintada · ejemplo = franjas (datos → pasos → resultado) ·
+// caso = expediente con cabecera · error = par error/correcto · proceso = riel numerado abierto ·
+// decisión = árbol · reflexión = pausa tintada cálida · recurso visual = figura enmarcada.
+// Estructura (apertura, objetivos, síntesis, repaso) usa el COLOR DEL MÓDULO.
+// `why` / `apply` (opcionales) responden «¿Por qué importa?» / «¿Cómo lo aplicas?».
+
+function tn(r: R, role: EduBlockRole): Tone {
+  return roleTone(r.t, role);
+}
+
+function modTn(r: R): Tone {
+  if (r.mod) return moduleTone(r.t, r.mod, groundColor(r.t));
+  const c = r.t.color;
+  return { ink: c.accentStrong, soft: c.accentSoft, edge: c.border, fill: c.accentStrong, onFill: c.textOnAccent };
+}
+
+/** Tema derivado: el acento y la superficie de panel pasan a ser los del tono (reusa los dibujos existentes). */
+function tinted(r: R, k: Tone): R {
+  const plate = !!r.t.personality.plate;
+  const color = { ...r.t.color, accent: k.ink, accentStrong: k.ink, ...(plate ? { surface: k.soft } : { surfaceAlt: k.soft }) };
+  return { ...r, t: { ...r.t, color } };
+}
+
+/** Rótulo del bloque: ícono + etiqueta en el color del rol. ENHANCED: píldora. */
+function chip(r: R, icon: EduIcon, label: string, k: Tone, s: Surf, opts: { margin?: string; onPanel?: boolean } = {}): string {
+  const ink = readable(s.bg, [k.ink], s.fg);
+  const pill = opts.onPanel ? groundColor(r.t) : k.soft;
+  return (
+    `<p class="cvc-meta cvc-chip"` +
+    st(
+      r,
+      [
+        ['margin', opts.margin ?? `0 0 ${D(r, 12)}px 0`],
+        ['color', ink],
+        ['font-family', r.t.personality.fontMeta],
+        ['font-size', r.t.typography.sizeSmallPx],
+        ['font-weight', '700'],
+        ['line-height', '1.4'],
+        ['letter-spacing', '0.01em'],
+      ],
+      [['display', 'inline-flex'], ['align-items', 'center'], ['gap', '8px'], ['background-color', pill], ['padding', '5px 14px 5px 10px'], ['border-radius', '999px']],
+    ) +
+    `>${eduIcon(r.enh, icon, ink, 20)} <span class="cvc-chip-t">${labelHtml(label)}</span></p>`
+  );
+}
+
+/** «¿Por qué importa?» bajo el título (opcional, generado). */
+function whyLine(r: R, why: string | undefined, k: Tone, s: Surf): string {
+  if (!why || !why.trim()) return '';
+  const ink = readable(s.bg, [k.ink], s.fg);
+  return (
+    `<p class="cvc-why"${st(r, [['margin', `0 0 ${D(r, 18)}px 0`], ['padding', 0], ['color', s.fg2], ['font-size', r.t.typography.sizeBodyPx], ['line-height', '1.5'], ['max-width', `${r.t.typography.measureCh}ch`]])}>` +
+    `<strong${st(r, [['color', ink]])}>${labelHtml('Por qué importa: ')}</strong>${inlineHtml(why)}</p>`
+  );
+}
+
+/** «¿Cómo lo aplicas?» al pie del bloque (opcional, generado). */
+function applyLine(r: R, apply: string | undefined, k: Tone, s: Surf): string {
+  if (!apply || !apply.trim()) return '';
+  const ink = readable(s.bg, [k.ink], s.fg);
+  return (
+    `<div class="cvc-apply"${st(r, [['margin', `${D(r, 20)}px 0 0 0`], ['padding', `${D(r, 14)}px 0 0 0`], ['color', s.fg], ['border-top', `1px solid ${k.edge}`]])}>` +
+    `<p${st(r, [['margin', 0], ['padding', 0], ['color', s.fg], ['line-height', '1.5'], ['max-width', `${r.t.typography.measureCh}ch`]])}>` +
+    `${eduIcon(r.enh, 'flecha', ink, 18)} <strong${st(r, [['color', ink]])}>${labelHtml('Cómo lo aplicas: ')}</strong>${inlineHtml(apply)}</p></div>`
+  );
+}
+
+type Shape = 'open' | 'tinted' | 'framed';
+
+/** Contenedor del bloque según su forma. */
+function block(r: R, type: string, shape: Shape, k: Tone, inner: (s: Surf) => string, cls = ''): string {
+  const g = ground(r);
+  if (shape === 'open') return componentWrap(r, type, inner(g), g, [], [], cls);
+  const s = shape === 'tinted' ? surf(r.t, k.soft) : g;
+  return componentWrap(
+    r,
+    type,
+    inner(s),
+    s,
+    // Figura enmarcada: 16 px a los lados en la base (una tabla de 2 columnas cabe a 390 px dentro de la lámina oscura).
+    [['padding', shape === 'tinted' ? `${D(r, 24)}px ${D(r, 24)}px` : `${D(r, 20)}px 16px`], ['border', `1px solid ${k.edge}`]],
+    [['border-radius', r.t.shape.radiusLg], ['padding', `clamp(16px, 3vw, ${D(r, 32)}px)`]],
+    cls,
+  );
+}
+
+const why = (c: VcComponent): string | undefined => (c as { why?: string }).why;
+const apply = (c: VcComponent): string | undefined => (c as { apply?: string }).apply;
+
+/** Insignia rellena (número de paso / capítulo) en el tono dado. */
+function fillBadge(r: R, text: string, k: Tone, px = 36, iconHtml?: string): string {
+  return (
+    `<div class="cvc-badge"` +
+    st(
+      r,
+      [
+        ['width', `${px}px`],
+        ['margin', '0 0 8px 0'],
+        ['background-color', k.fill],
+        ['color', k.onFill],
+        ['font-family', r.t.personality.fontNumeral],
+        ['font-size', px >= 44 ? r.t.typography.sizeItemPx : r.t.typography.sizeSmallPx],
+        ['font-weight', '700'],
+        ['line-height', `${px}px`],
+        ['text-align', 'center'],
+      ],
+      [['border-radius', '50%'], ['font-variant-numeric', 'tabular-nums lining-nums']],
+    ) +
+    `>${iconHtml ?? labelHtml(text)}</div>`
+  );
+}
+
+// ── Apertura ──
+function renderHero(r: R, c: VcHero): string {
+  const op = r.opener;
+  if (!op) {
+    const g = ground(r);
+    return componentWrap(r, 'hero', (c.eyebrow ? kicker(r, c.eyebrow, g, { llm: true }) : '') + heading(r, 'h4', c.title, g, 'display') + paragraphs(r, c.lead, g, { role: 'lead', last: true }), g);
+  }
+  const k = modTn(r);
+  const s = surf(r.t, k.soft);
+  const ink = readable(s.bg, [k.ink], s.fg);
+  const meta =
+    `<p class="cvc-meta cvc-progress"${st(r, [['margin', `0 0 ${D(r, 10)}px 0`], ['padding', 0], ['color', ink], ['font-family', r.t.personality.fontMeta], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700'], ['line-height', '1.5']])}>` +
+    labelHtml(op.progress ?? op.kicker) +
+    (op.minutes ? `<span class="cvc-sep"${st(r, [['color', s.fg2]])}>${labelHtml('  ·  ')}</span><span class="cvc-min"${st(r, [['color', ink]], [['white-space', 'nowrap']])}>${eduIcon(r.enh, 'reloj', ink, 18)} ${labelHtml(`~${op.minutes} min`)}</span>` : '') +
+    `</p>` +
+    // el eyebrow del LLM (tema del capítulo) se conserva como segunda línea meta
+    (c.eyebrow && c.eyebrow.trim() ? `<p class="cvc-meta cvc-topic"${st(r, [['margin', `0 0 ${D(r, 12)}px 0`], ['padding', 0], ['color', s.fg2], ['font-size', r.t.typography.sizeSmallPx], ['line-height', '1.4']])}>${inlineHtml(c.eyebrow)}</p>` : '');
+  const main =
+    heading(r, 'h2', op.title, s, 'display', { margin: `0 0 ${D(r, 14)}px 0` }) +
+    (sameText(c.title, op.title) || startsWithTitle(c.title, op.title) ? '' : paragraphs(r, c.title, s, { role: 'statement', weight: 600 })) +
+    paragraphs(r, c.lead, s, { role: 'lead', last: true });
+  const num = op.numeral ? `<div class="cvc-op-num">${fillBadge(r, String(Number(op.numeral)), k, 52)}</div>` : '';
+  const body = `<div class="cvc-op${num ? ' cvc-op-split' : ''}">${num}<div class="cvc-op-lead">${meta}</div><div class="cvc-op-main">${main}</div></div>`;
+  return componentWrap(
+    r,
+    'hero',
+    body,
+    s,
+    [['padding', `${D(r, 28)}px ${D(r, 24)}px`], ['border', `1px solid ${k.edge}`], ['border-top', `6px solid ${k.fill}`]],
+    [['border-radius', r.t.shape.radiusLg], ['padding', 'clamp(18px, 3.6vw, 40px)']],
+    'cvc-opener',
+  );
+}
+
+function renderObjectives(r: R, c: VcLearningObjectives): string {
+  const k = modTn(r);
+  const items = list(c.items, 'learning_objectives.items');
+  return block(r, 'learning_objectives', 'framed', k, (s) => {
+    const lis = items
+      .map(
+        (it, i) =>
+          `<li class="cvc-obj"${st(r, [['margin', 0], ['padding', `${D(r, 12)}px 0`], ['color', s.fg], ...(i === 0 ? [] : ([['border-top', `1px solid ${r.t.color.border}`]] as Decl[]))])}>` +
+          // Labels del shell (countless): sin cifras que no salgan de facts → la insignia lleva un ícono.
+          `<div class="cvc-li-n">${r.countless ? fillBadge(r, '', k, 30, eduIcon(r.enh, 'check', k.onFill, 16)) : fillBadge(r, String(i + 1), k, 30)}</div>` +
+          `<div class="cvc-li-t"${st(r, [['color', s.fg]])}>${inlineHtml(it)}</div></li>`,
+      )
+      .join('');
+    const title = c.title && !OBJ_KICKER_RE.test(c.title.trim()) ? c.title : r.countless ? 'Al terminar podrás:' : 'Al terminar este capítulo podrás:';
+    return chip(r, 'objetivo', 'Objetivos de aprendizaje', k, s) + heading(r, 'h4', title, s, 'item', { margin: `0 0 ${D(r, 8)}px 0` }) + bareList(r, 'ol', lis, items.length >= 4 ? 'cvc-cols2 cvc-objs' : 'cvc-objs');
+  });
+}
+
+// ── Concepto ──
+function renderConcept(r: R, c: VcConceptCards): string {
+  const k = tn(r, 'concepto');
+  const cards = list(c.cards, 'concept_cards.cards');
+  return block(r, 'concept_cards', 'tinted', k, (s) => {
+    const ink = readable(s.bg, [k.ink], s.fg);
+    const ht = itemTag(c.title, 'x');
+    const rows = cards
+      .map(
+        (cd, i) =>
+          `<li class="cvc-term"${st(r, [['margin', 0], ['padding', `${D(r, 14)}px 0`], ['color', s.fg], ...(i === 0 ? [] : ([['border-top', `1px solid ${k.edge}`]] as Decl[]))])}>` +
+          `<${ht}${st(r, [['margin', '0 0 4px 0'], ['padding', 0], ['color', ink], ['font-family', r.t.typography.fontHeading], ['font-size', r.t.typography.sizeItemPx], ['font-weight', '700'], ['line-height', '1.3']])}>${inlineHtml(cd.term)}</${ht}>` +
+          paragraphs(r, cd.definition, s, { last: true }) +
+          `</li>`,
+      )
+      .join('');
+    return chip(r, 'concepto', 'Concepto clave', k, s, { onPanel: true }) + titleIf(r, c.title, s, 'Conceptos clave') + whyLine(r, why(c), k, s) + bareList(r, 'ul', rows, 'cvc-cols2 cvc-terms') + applyLine(r, apply(c), k, s);
+  });
+}
+
+// ── Proceso ──
+function processRail(r: R, steps: { heading: string; body: string }[], k: Tone, s: Surf, ht: HTag): string {
+  const lis = steps
+    .map(
+      (sp, i) =>
+        `<li class="cvc-step cvc-rail-i"${st(r, [['margin', `0 0 ${D(r, 18)}px 0`], ['padding', 0], ['color', s.fg]])}>` +
+        `<div class="cvc-step-n">${fillBadge(r, String(i + 1), k, 36)}</div>` +
+        `<div class="cvc-step-b">${heading(r, ht, stripStepPrefix(sp.heading), s, 'item')}${paragraphs(r, sp.body, s, { last: true })}</div></li>`,
+    )
+    .join('');
+  return bareList(r, 'ol', lis, 'cvc-steps cvc-rail');
+}
+
+function renderProcess(r: R, c: VcProcessSteps): string {
+  const k = tn(r, 'proceso');
+  const sps = list(c.steps, 'process_steps.steps');
+  return block(r, 'process_steps', 'open', k, (s) =>
+    chip(r, 'proceso', counted(r, 'Proceso paso a paso', sps.length, 'paso', 'pasos'), k, s) + titleIf(r, c.title, s) + whyLine(r, why(c), k, s) + processRail(r, sps, k, s, itemTag(c.title)) + applyLine(r, apply(c), k, s),
+  );
+}
+
+/** Acordeón cuyos encabezados son pasos («Paso 1: …»): es un proceso → riel visible (nunca escondido). */
+function looksLikeSteps(items: { heading: string }[]): boolean {
+  return items.length >= 2 && items.filter((it) => STEP_PREFIX_RE.test(it.heading)).length >= Math.max(2, Math.ceil(items.length * 0.6));
+}
+
+function renderAccordion(r: R, c: VcAccordion): string {
+  const its = list(c.items, 'accordion.items');
+  if (looksLikeSteps(its)) {
+    return renderProcess(r, { type: 'process_steps', title: c.title, steps: its.map((i) => ({ heading: i.heading, body: i.body })), ...({ why: why(c), apply: apply(c) } as object) } as VcProcessSteps);
+  }
+  const k = tn(r, 'concepto');
+  return block(r, 'accordion', 'open', k, (s) => {
+    const ht = itemTag(c.title);
+    const rows = its
+      .map((it, i) => {
+        const h = heading(r, ht, it.heading, s, 'item', { margin: '0' });
+        return row(r, reveal(r, 'cvc-acc', h, h, `<div${st(r, [['padding', '10px 0 0 0']])}>${paragraphs(r, it.body, s, { last: true })}</div>`, { keepOpen: i === 0 }), s, { cls: 'cvc-acc-row' });
+      })
+      .join('');
+    return chip(r, 'concepto', 'Para profundizar', k, s) + titleIf(r, c.title, s) + whyLine(r, why(c), k, s) + `<div class="cvc-rows"${st(r, [['border-bottom', `1px solid ${r.t.color.border}`]])}>${rows}</div>` + applyLine(r, apply(c), k, s);
+  });
+}
+
+function renderTabs(r: R, c: VcTabs): string {
+  const k = tn(r, 'concepto');
+  return block(r, 'tabs', 'open', k, (s) => chip(r, 'concepto', 'Perspectivas', k, s) + tabsBody(tinted(r, k), c, whyLine(r, why(c), k, s)) + applyLine(r, apply(c), k, s));
+}
+
+
+
+// ── Recurso visual ──
+function renderTimeline(r: R, c: VcTimeline): string {
+  const k = tn(r, 'visual');
+  const evs = list(c.events, 'timeline.events');
+  return block(r, 'timeline', 'framed', k, (s) => chip(r, 'visual', counted(r, 'Línea de tiempo', evs.length, 'hito', 'hitos'), k, s) + timelineBody(tinted(r, k), c, whyLine(r, why(c), k, s)) + applyLine(r, apply(c), k, s));
+}
+
+function renderComparison(r: R, c: VcComparison): string {
+  const k = tn(r, 'visual');
+  return block(r, 'comparison', 'framed', k, (s) => chip(r, 'visual', 'Comparación', k, s) + comparisonBody(tinted(r, k), c, whyLine(r, why(c), k, s)) + applyLine(r, apply(c), k, s));
+}
+
+function renderDiagram(r: R, c: VcDiagram): string {
+  if (c.kind === 'decision') {
+    const k = tn(r, 'decision');
+    const r2 = tinted(r, k);
+    if (!c.tree || typeof c.tree !== 'object') renderFail('diagram: un árbol de decisión necesita "tree"');
+    return block(r, 'diagram', 'open', k, (s) =>
+      chip(r, 'decision', 'Decisión', k, s) +
+      titleIf(r, c.title, s) +
+      whyLine(r, why(c), k, s) +
+      (c.caption ? paragraphs(r, c.caption, s, { secondary: true }) : '') +
+      `<div class="cvc-dg cvc-dg-decision">${decisionNode(r2, c.tree, s, 1)}</div>` +
+      applyLine(r, apply(c), k, s),
+    );
+  }
+  const k = tn(r, 'visual');
+  const label = `Diagrama · ${DIAGRAM_KIND_LABEL[c.kind] ?? ''}`;
+  return block(r, 'diagram', 'framed', k, (s) => chip(r, 'visual', label, k, s) + nodeDiagramBody(tinted(r, k), c, whyLine(r, why(c), k, s)) + applyLine(r, apply(c), k, s));
+}
+
+// ── Error frecuente ──
+function renderMyth(r: R, c: VcMythReality): string {
+  const k = tn(r, 'error');
+  const ok = tn(r, 'ejemplo');
+  const pairs = list(c.pairs, 'myth_reality.pairs');
+  return block(r, 'myth_reality', 'open', k, (g) => {
+    // `reveal`: «Lo correcto» queda tras un botón en ENHANCED (el estudiante piensa primero); en CLEAN_SAFE
+    // y sin JS, rótulo + texto siempre visibles (mismo texto en ambos niveles).
+    const cell = (kt: Tone, icon: EduIcon, label: string, body: string, extraCls: string, revealIdx?: number) => {
+      const s = surf(r.t, kt.soft);
+      const ink = readable(s.bg, [kt.ink], s.fg);
+      const lead = `<p class="cvc-meta"${st(r, [['margin', '0 0 6px 0'], ['padding', 0], ['color', ink], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700']])}>${eduIcon(r.enh, icon, ink, 18)} ${labelHtml(label)}</p>`;
+      const content =
+        revealIdx === undefined
+          ? lead + body
+          : reveal(tinted(r, kt), 'cvc-myth', btnLabel(tinted(r, kt), label, s), lead, body, { ariaLabel: `${label}: error ${revealIdx + 1}`, button: true });
+      return (
+        `<div class="${extraCls}"${st(r, [['background-color', s.bg], ['color', s.fg], ['border', `1px solid ${kt.edge}`], ['margin', `0 0 ${D(r, 10)}px 0`], ['padding', `${D(r, 16)}px ${D(r, 18)}px`]], [['border-radius', r.t.shape.radiusMd]])}>` +
+        content +
+        `</div>`
+      );
+    };
+    const rows = pairs
+      .map((p, i) => {
+        const sm = surf(r.t, k.soft);
+        const sr = surf(r.t, ok.soft);
+        return (
+          `<li class="cvc-mr"${st(r, [['margin', `0 0 ${D(r, 8)}px 0`], ['padding', 0], ['color', g.fg]])}>` +
+          cell(k, 'error', 'Lo que se suele hacer', paragraphs(r, p.myth, sm, { last: true }), 'cvc-myth-a') +
+          cell(ok, 'check', 'Lo correcto', paragraphs(r, p.reality, sr, { last: true, weight: 600 }), 'cvc-myth-b', i) +
+          `</li>`
+        );
+      })
+      .join('');
+    return chip(r, 'error', 'Error frecuente', k, g) + titleIf(r, c.title, g) + whyLine(r, why(c), k, g) + bareList(r, 'ul', rows) + applyLine(r, apply(c), k, g);
+  });
+}
+
+// ── Caso ──
+function renderCase(r: R, c: VcCaseScenario): string {
+  const k = tn(r, 'caso');
+  const g = ground(r);
+  const hs = surf(r.t, k.soft);
+  const ink = readable(g.bg, [k.ink], g.fg);
+  const head =
+    `<div class="cvc-case-h"${st(r, [['background-color', hs.bg], ['color', hs.fg], ['margin', 0], ['padding', `${D(r, 18)}px ${D(r, 24)}px ${D(r, 14)}px ${D(r, 24)}px`], ['border-bottom', `1px solid ${k.edge}`]])}>` +
+    chip(r, 'caso', 'Caso práctico', k, hs, { onPanel: true, margin: '0 0 10px 0' }) +
+    heading(r, 'h4', c.title, hs, 'title', { margin: '0' }) +
+    `</div>`;
+  const qs = list(c.questions, 'case_scenario.questions')
+    .map(
+      (q, i) =>
+        `<li class="cvc-q"${st(r, [['margin', '0 0 10px 0'], ['padding', 0], ['color', g.fg]])}>` +
+        `<span class="cvc-q-n"${st(r, [['color', ink], ['font-family', r.t.personality.fontNumeral], ['font-weight', '700']])}>${labelHtml(`${i + 1}.`)}</span> ` +
+        `<span class="cvc-q-t">${inlineHtml(q)}</span></li>`,
+    )
+    .join('');
+  const body =
+    `<div class="cvc-case-b"${st(r, [['background-color', g.bg], ['color', g.fg], ['margin', 0], ['padding', `${D(r, 20)}px ${D(r, 24)}px ${D(r, 22)}px ${D(r, 24)}px`]])}>` +
+    whyLine(r, why(c), k, g) +
+    paragraphs(r, c.narrative, g) +
+    `<p class="cvc-meta"${st(r, [['margin', `${D(r, 18)}px 0 10px 0`], ['padding', 0], ['color', ink], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700']])}>${eduIcon(r.enh, 'repaso', ink, 18)} ${labelHtml('Analiza el caso')}</p>` +
+    bareList(r, 'ol', qs, 'cvc-qs') +
+    applyLine(r, apply(c), k, g) +
+    `</div>`;
+  return componentWrap(r, 'case_scenario', head + body, g, [['border', `1px solid ${k.edge}`]], [['border-radius', r.t.shape.radiusLg], ['overflow', 'hidden']], 'cvc-case');
+}
+
+// ── Ejemplo / aplicación ──
+function renderChecklist(r: R, c: VcChecklist): string {
+  const k = tn(r, 'ejemplo');
+  const its = list(c.items, 'checklist.items');
+  return block(r, 'checklist', 'open', k, (s) => {
+    const ink = readable(s.bg, [k.ink], s.fg);
+    const items = its
+      .map((it, i) => `<li class="cvc-check"${st(r, [['margin', 0], ['padding', `${D(r, 12)}px 0`], ['color', s.fg], ...(i === 0 ? [] : ([['border-top', `1px solid ${r.t.color.border}`]] as Decl[]))])}>${eduIcon(r.enh, 'check', ink, 20)} <span class="cvc-li-t">${inlineHtml(it)}</span></li>`)
+      .join('');
+    return chip(r, 'ejemplo', 'Lista de verificación', k, s) + titleIf(r, c.title, s) + whyLine(r, why(c), k, s) + bareList(r, 'ul', items) + applyLine(r, apply(c), k, s);
+  });
+}
+
+function renderWorked(r: R, c: VcWorkedExample): string {
+  const k = tn(r, 'ejemplo');
+  return block(r, 'worked_example', 'open', k, (g) => {
+    const ds = surf(r.t, k.soft);
+    const ink = readable(ds.bg, [k.ink], ds.fg);
+    const data = list(c.data, 'worked_example.data')
+      .map((d) => `<li${st(r, [['margin', '0 0 6px 0'], ['padding', 0], ['color', ds.fg]])}>${eduIcon(r.enh, 'check', ink, 16)} ${inlineHtml(d)}</li>`)
+      .join('');
+    const dataBand =
+      `<div class="cvc-we-facts"${st(r, [['background-color', ds.bg], ['color', ds.fg], ['border', `1px solid ${k.edge}`], ['margin', `0 0 ${D(r, 18)}px 0`], ['padding', `${D(r, 14)}px ${D(r, 18)}px`]], [['border-radius', r.t.shape.radiusMd]])}>` +
+      `<p class="cvc-meta"${st(r, [['margin', '0 0 8px 0'], ['padding', 0], ['color', ink], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700']])}>${labelHtml('1 · Datos del caso (ilustrativos)')}</p>` +
+      bareList(r, 'ul', data, 'cvc-cols2 cvc-we-data') +
+      `</div>`;
+    const gk = readable(g.bg, [k.ink], g.fg);
+    const stepsHead = `<p class="cvc-meta"${st(r, [['margin', '0 0 12px 0'], ['padding', 0], ['color', gk], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700']])}>${labelHtml('2 · Resolución paso a paso')}</p>`;
+    const steps = processRail(r, list(c.steps, 'worked_example.steps').map((x) => ({ heading: x.action, body: x.detail })), k, g, 'h5');
+    const result =
+      `<div class="cvc-we-result"${st(r, [['background-color', g.bg], ['color', g.fg], ['border', `2px solid ${gk}`], ['margin', `${D(r, 6)}px 0 0 0`], ['padding', `${D(r, 16)}px ${D(r, 18)}px`]], [['border-radius', r.t.shape.radiusMd]])}>` +
+      `<p class="cvc-meta"${st(r, [['margin', '0 0 6px 0'], ['padding', 0], ['color', gk], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700']])}>${eduIcon(r.enh, 'logro', gk, 18)} ${labelHtml('3 · Resultado')}</p>` +
+      paragraphs(r, c.result, g, { weight: 600, last: !c.takeaway }) +
+      (c.takeaway ? `<p${st(r, [['margin', '10px 0 0 0'], ['padding', 0], ['color', g.fg2]])}><strong${st(r, [['color', g.fg]])}>${labelHtml('Para recordar: ')}</strong>${inlineHtml(c.takeaway)}</p>` : '') +
+      `</div>`;
+    return chip(r, 'ejemplo', 'Ejemplo resuelto', k, g) + heading(r, 'h4', c.title, g, 'title') + whyLine(r, why(c), k, g) + paragraphs(r, c.situation, g) + dataBand + stepsHead + steps + result + applyLine(r, apply(c), k, g);
+  });
+}
+
+const CALLOUT_EDU: Record<VcCallout['variant'], { role: EduBlockRole; label: string }> = {
+  tip: { role: 'ejemplo', label: 'Consejo práctico' },
+  warning: { role: 'error', label: 'Atención' },
+  info: { role: 'concepto', label: 'Dato clave' },
+  example: { role: 'ejemplo', label: 'Ejemplo' },
+};
+
+function renderCallout(r: R, c: VcCallout): string {
+  if (typeof c.variant !== 'string' || !hasOwn(CALLOUT_EDU, c.variant)) renderFail(`callout.variant desconocido "${String(c.variant)}"`);
+  const m = CALLOUT_EDU[c.variant];
+  const k = tn(r, m.role);
+  return block(r, 'callout', 'tinted', k, (s) =>
+    chip(r, m.role as EduIcon, m.label, k, s, { onPanel: true }) + (c.title ? heading(r, 'h5', c.title, s, 'item') : '') + paragraphs(r, c.body, s, { last: true }) + applyLine(r, apply(c), k, s),
+  );
+}
+
+// ── Reflexión ──
+function renderReflection(r: R, c: VcReflection): string {
+  const k = tn(r, 'reflexion');
+  return block(r, 'reflection', 'tinted', k, (s) => {
+    let inner = chip(r, 'reflexion', 'Para reflexionar', k, s, { onPanel: true }) + paragraphs(r, c.prompt, s, { role: 'statement', weight: 600, last: !c.hint });
+    if (c.hint) {
+      inner += reveal(r, 'cvc-hint', btnLabel(tinted(r, k), 'Pista', s), kicker(r, 'Pista', s, { margin: '0 0 6px 0' }), paragraphs(r, c.hint, s, { last: true, secondary: true }), { ariaLabel: 'Pista para la reflexión', button: true });
+    }
+    return inner;
+  });
+}
+
+// ── Estructura: síntesis y repaso (color del módulo) ──
+function renderSummary(r: R, c: VcSummaryVisual): string {
+  const k = modTn(r);
+  const pts = list(c.points, 'summary_visual.points');
+  return block(r, 'summary_visual', 'tinted', k, (s) => {
+    const ink = readable(s.bg, [k.ink], s.fg);
+    const points = pts
+      .map(
+        (p, i) =>
+          `<li class="cvc-pt"${st(r, [['margin', 0], ['padding', `${D(r, 12)}px 0`], ['color', s.fg], ...(i === 0 ? [] : ([['border-top', `1px solid ${k.edge}`]] as Decl[]))])}>` +
+          `<div class="cvc-li-n">${eduIcon(r.enh, 'check', ink, 22)}</div><div class="cvc-li-t">${inlineHtml(p)}</div></li>`,
+      )
+      .join('');
+    return (
+      chip(r, 'logro', 'Ideas clave del capítulo', k, s, { onPanel: true }) +
+      `<div class="cvc-central">${paragraphs(r, c.central, s, { role: 'statement', weight: 700, last: true })}</div>` +
+      `<div${st(r, [['margin', `${D(r, 14)}px 0 0 0`]])}>${bareList(r, 'ol', points, 'cvc-pts')}</div>`
+    );
+  });
+}
+
+function renderSelfCheck(r: R, c: VcSelfCheck): string {
+  const k = modTn(r);
+  const its = list(c.items, 'self_check.items');
+  return block(r, 'self_check', 'framed', k, (s) => chip(r, 'repaso', counted(r, 'Comprueba lo aprendido', its.length, 'pregunta', 'preguntas'), k, s) + selfCheckBody(tinted(r, k), c));
+}
+
+function renderReveal(r: R, c: VcRevealCards): string {
+  const k = modTn(r);
+  return block(r, 'reveal_cards', 'open', k, (s) => chip(r, 'repaso', 'Pon a prueba', k, s) + revealCardsBody(tinted(r, k), c));
 }
 
 const RENDERERS: { [K in VcComponent['type']]: (r: R, c: Extract<VcComponent, { type: K }>) => string } = {
   hero: renderHero,
-  learning_objectives: renderLearningObjectives,
-  concept_cards: renderConceptCards,
-  reveal_cards: renderRevealCards,
+  learning_objectives: renderObjectives,
+  concept_cards: renderConcept,
+  reveal_cards: renderReveal,
   accordion: renderAccordion,
   tabs: renderTabs,
   timeline: renderTimeline,
-  process_steps: renderProcessSteps,
+  process_steps: renderProcess,
   comparison: renderComparison,
-  myth_reality: renderMythReality,
-  case_scenario: renderCaseScenario,
+  myth_reality: renderMyth,
+  case_scenario: renderCase,
   checklist: renderChecklist,
   reflection: renderReflection,
   callout: renderCallout,
-  summary_visual: renderSummaryVisual,
+  summary_visual: renderSummary,
   self_check: renderSelfCheck,
-  worked_example: renderWorkedExample,
+  worked_example: renderWorked,
   diagram: renderDiagram,
 };
+
 
 function renderWith(r: R, c: VcComponent): string {
   if (!c || typeof c !== 'object') renderFail('componente no es un objeto');
@@ -1279,7 +1355,7 @@ function renderWith(r: R, c: VcComponent): string {
 export function renderComponent(c: VcComponent, theme: ResolvedTheme, ctx: VcRenderContext): string {
   checkCtx(ctx);
   checkTheme(theme);
-  return renderWith({ t: theme, enh: ctx.level === 'enhanced', uid: ctx.uid, seq: 0, opener: ctx.opener, countless: !!ctx.countless }, c);
+  return renderWith({ t: theme, enh: ctx.level === 'enhanced', uid: ctx.uid, seq: 0, opener: ctx.opener, countless: !!ctx.countless, mod: ctx.module }, c);
 }
 
 /** Estilos de la raíz de un label (compartidos con el shell): lámina en familias oscuras, abierta en claras. */
@@ -1313,7 +1389,7 @@ export function renderMovement(components: VcComponent[], theme: ResolvedTheme, 
     .map((c, i) => {
       const useOpener = !!ctx.opener && !openerUsed && i === 0 && c && (c as { type?: unknown }).type === 'hero';
       if (useOpener) openerUsed = true;
-      return renderComponent(c, theme, { uid: `${ctx.uid}-${i}`, level: ctx.level, opener: useOpener ? ctx.opener : undefined });
+      return renderComponent(c, theme, { uid: `${ctx.uid}-${i}`, level: ctx.level, opener: useOpener ? ctx.opener : undefined, module: ctx.module });
     })
     .join('');
   // EV6: las reglas del árbol de decisión solo viajan en labels que lo usan (el resto, byte-idéntico).

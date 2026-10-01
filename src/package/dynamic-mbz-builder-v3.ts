@@ -83,7 +83,7 @@ import {
   themeSha256,
   validateTheme,
 } from '../modules/theme-engine';
-import { ChapterExperience, VC_RUNTIME_VERSION, VC_SCHEMA_VERSION } from '../modules/visual-components';
+import { ChapterExperience, VC_RENDER_STYLE_VERSION, VC_RUNTIME_VERSION, VC_SCHEMA_VERSION } from '../modules/visual-components';
 import {
   CTA_BADGES,
   CourseFacts,
@@ -171,7 +171,7 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  */
 export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.4.0';
 /** Versión del renderer de Visual Components que entra en la clave de reuse. */
-export const VC_RENDERER_VERSION = `vc${VC_SCHEMA_VERSION}-rt${VC_RUNTIME_VERSION}-theme${THEME_ENGINE_VERSION}`;
+export const VC_RENDERER_VERSION = `vc${VC_SCHEMA_VERSION}-rt${VC_RUNTIME_VERSION}-theme${THEME_ENGINE_VERSION}-style${VC_RENDER_STYLE_VERSION}`;
 
 /** Fecha fija de toda entrada del zip (UTC). */
 export const MBZ_V3_ZIP_FIXED_DATE = new Date(Date.UTC(2026, 0, 1, 0, 0, 0));

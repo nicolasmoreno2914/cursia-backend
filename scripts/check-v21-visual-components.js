@@ -181,32 +181,73 @@ check('EV5: guiones suaves en fronteras de sílaba, *énfasis* simple sin asteri
   assert(vc.extractText(legacy).split('Cómo funciona la IA generativa').length === 2, 'hero con el título legado largo (nombre + descripción) no se repite');
 });
 
-check('Edu EV4: bloques como piezas de curso (tarjetas, panel de objetivos, insignias) sin kicker repetido', () => {
+check('P3: anatomía de bloque — rótulo e ícono del rol, forma por rol, objetivos con insignias del módulo, sin rótulo repetido', () => {
+  // [tipo, (variante), rol, rótulo visible]
+  const ROLE = [
+    ['concept_cards', null, 'concepto', 'Concepto clave'], ['tabs', null, 'concepto', 'Perspectivas'], ['accordion', null, 'concepto', 'Para profundizar'],
+    ['process_steps', null, 'proceso', 'Proceso paso a paso'], ['worked_example', null, 'ejemplo', 'Ejemplo resuelto'], ['checklist', null, 'ejemplo', 'Lista de verificación'],
+    ['case_scenario', null, 'caso', 'Caso práctico'], ['myth_reality', null, 'error', 'Error frecuente'], ['reflection', null, 'reflexion', 'Para reflexionar'],
+    ['comparison', null, 'visual', 'Comparación'], ['timeline', null, 'visual', 'Línea de tiempo'], ['diagram', null, 'visual', 'Diagrama · Ciclo'],
+  ];
   for (const { combo, theme } of themes) {
     for (const level of LEVELS) {
-      const o = { uid: 'ev4', level };
-      // Objetivos: kicker distinto del título; en 2 columnas los ítems 0 y 1 sin filete superior.
-      const four = vc.renderComponent({ type: 'learning_objectives', items: ['Uno claro', 'Dos claro', 'Tres claro', 'Cuatro claro'] }, theme, o);
+      const o = { uid: 'p3', level };
+      const tag = `${combo.themeFamily}/${combo.mode}/${level || 'clean'}`;
+      for (const [type, , role, label] of ROLE) {
+        const c = components.find((x) => x.type === type);
+        const html = vc.renderComponent(c, theme, o);
+        const chip = (html.match(/<p class="cvc-meta cvc-chip"[^>]*>[^]*?<\/p>/) || [''])[0];
+        assert(chip.includes(`>${label}`) && chip.includes(`color:${theme.blocks[role].ink}`), `${tag}/${type}: rótulo «${label}» en el color de ${role}`);
+        assert(level ? chip.includes('<svg class="cvc-ic"') && !chip.includes('cvc-glyph') : chip.includes('cvc-glyph') && !chip.includes('<svg'), `${tag}/${type}: ícono por nivel`);
+        assert(!html.includes('cvc-kicker">' + label), `${tag}/${type}: sin kicker viejo`);
+      }
+      // Objetivos: insignias del módulo, filetes por fila; el rótulo no repite el título del LLM.
+      const mod = te.moduleColor(theme, 1);
+      const four = vc.renderComponent({ type: 'learning_objectives', items: ['Uno claro', 'Dos claro', 'Tres claro', 'Cuatro claro'] }, theme, { ...o, module: mod });
       const lis = four.match(/<li class="cvc-obj"[^>]*>/g) || [];
-      // Inline (apilado, una columna): solo el primero sin filete; en 2 columnas el runtime quita el del 2.º.
-      assert(lis.length === 4 && !/border-top/.test(lis[0]) && /border-top/.test(lis[1]) && /border-top/.test(lis[2]), `${combo.themeFamily}: filetes (${lis.map((l) => /border-top/.test(l)).join(',')})`);
+      assert(lis.length === 4 && !/border-top/.test(lis[0]) && /border-top/.test(lis[1]) && /border-top/.test(lis[2]), `${tag}: filetes de objetivos`);
+      assert((four.match(/class="cvc-badge"/g) || []).length === 4 && four.includes('Objetivos de aprendizaje') && four.includes('Al terminar este capítulo podrás'), `${tag}: objetivos`);
+      const dup = vc.extractText(vc.renderComponent({ type: 'learning_objectives', title: 'Objetivos de aprendizaje', items: ['Uno claro', 'Dos claro'] }, theme, o));
+      assert(dup.split('Objetivos de aprendizaje').length === 2, `${tag}: el rótulo repite el título del LLM: ${dup.slice(0, 80)}`);
+      // Labels del shell (countless): sin cifras en las insignias.
+      const shellObj = vc.extractText(vc.renderComponent({ type: 'learning_objectives', items: ['Uno claro', 'Dos claro'] }, theme, { ...o, countless: true }));
+      assert(!/\d/.test(shellObj), `${tag}: cifras en objetivos del shell: ${shellObj}`);
+      // Conceptos: UNA ficha tintada (sin tarjetas dentro), términos en filas.
+      const cards = vc.renderComponent({ type: 'concept_cards', cards: [{ term: 'Término', definition: 'Definición breve.' }, { term: 'Otro', definition: 'Otra definición.' }] }, theme, o);
+      assert(cards.includes(`background-color:${theme.blocks.concepto.soft}`) && (cards.match(/<li class="cvc-term"/g) || []).length === 2 && !cards.includes('cvc-tile'), `${tag}: ficha de conceptos`);
+      // Pasos: insignias rellenas del rol proceso, no numeral gigante, nunca escondidos.
+      const steps = vc.renderComponent({ type: 'process_steps', steps: [{ heading: 'Primero', body: 'Hacer algo.' }, { heading: 'Luego', body: 'Hacer otra cosa.' }, { heading: 'Final', body: 'Cerrar.' }] }, theme, o);
+      assert((steps.match(/class="cvc-badge"[^>]*background-color:([^;]+);/g) || []).filter((m) => m.includes(theme.blocks.proceso.ink)).length === 3 && !steps.includes('class="cvc-num"') && !steps.includes('<details'), `${tag}: riel de pasos`);
+      // Acordeón de «Paso N: …» → proceso visible; acordeón normal → sigue siendo acordeón.
+      const accSteps = vc.renderComponent({ type: 'accordion', title: 'Cómo evaluar', items: [{ heading: 'Paso 1: Observa', body: 'Mira.' }, { heading: 'Paso 2: Decide', body: 'Elige.' }, { heading: 'Paso 3: Actúa', body: 'Haz.' }] }, theme, o);
+      assert(accSteps.includes('cvc-t-process_steps') && accSteps.includes('cvc-rail') && !accSteps.includes('<details') && !accSteps.includes('Paso 1:'), `${tag}: acordeón de pasos → proceso`);
+      const accPlain = vc.renderComponent(components.find((x) => x.type === 'accordion'), theme, o);
+      assert(accPlain.includes('cvc-t-accordion') && (!level || accPlain.includes('<details')), `${tag}: acordeón normal`);
       if (level) {
         const lblObj = vc.renderMovement([{ type: 'learning_objectives', items: ['Uno claro', 'Dos claro', 'Tres claro', 'Cuatro claro'] }], theme, o);
-        assert(/@container \(min-width:600px\)\{[^]*\.cvc-obj-panel \.cvc-cols2>li:nth-child\(2\)\{border-top:0!important\}/.test(lblObj), 'en 2 columnas el 2.º objetivo pierde el filete solo en ≥600px');
-      }
-      assert(four.includes('Objetivos de aprendizaje') && four.includes('Al terminar podrás') && four.includes('cvc-obj-panel'), 'kicker + título + panel');
-      const dup = vc.extractText(vc.renderComponent({ type: 'learning_objectives', title: 'Objetivos de aprendizaje', items: ['Uno claro', 'Dos claro'] }, theme, o));
-      assert(dup.split('Objetivos de aprendizaje').length === 2, `${combo.themeFamily}: kicker repite el título del LLM: ${dup.slice(0, 80)}`);
-      // Conceptos: tarjetas con borde (visible también en familias con lámina).
-      const cards = vc.renderComponent({ type: 'concept_cards', cards: [{ term: 'Término', definition: 'Definición breve.' }, { term: 'Otro', definition: 'Otra definición.' }] }, theme, o);
-      assert((cards.match(/class="cvc-tile cvc-term"[^>]*border:1px solid/g) || []).length === 2 && cards.includes('class="cvc-cards"'), `${combo.themeFamily}: tarjetas de conceptos`);
-      // Pasos: insignia, no numeral gigante.
-      const steps = vc.renderComponent({ type: 'process_steps', steps: [{ heading: 'Primero', body: 'Hacer algo.' }, { heading: 'Luego', body: 'Hacer otra cosa.' }, { heading: 'Final', body: 'Cerrar.' }] }, theme, o);
-      assert((steps.match(/class="cvc-badge"/g) || []).length === 3 && !steps.includes('class="cvc-num"'), `${combo.themeFamily}: insignias de paso`);
-      if (level) {
-        const lbl = vc.renderMovement([{ type: 'concept_cards', cards: [{ term: 'Término', definition: 'Definición breve.' }] }], theme, o);
+        assert(/@container \(min-width:600px\)\{[^]*\.cvc-cols2\.cvc-objs>li:nth-child\(2\)\{border-top:0!important\}/.test(lblObj), 'en 2 columnas el 2.º objetivo pierde el filete solo en ≥600px');
+        const lbl = vc.renderMovement([{ type: 'reveal_cards', cards: [{ front: 'a', back: 'b' }, { front: 'c', back: 'd' }] }], theme, o);
         assert(/\.cvc-cards\{display:grid;grid-template-columns:minmax\(0,1fr\)/.test(lbl), 'la grilla de tarjetas no desborda en angosto');
       }
+    }
+  }
+});
+
+check('P3: «¿Por qué importa?» / «¿Cómo lo aplicas?» — se muestran solo si el JSON los trae (experiencias viejas sin cambios de texto)', () => {
+  const t = themes[0].theme;
+  for (const level of LEVELS) {
+    for (const type of ['concept_cards', 'accordion', 'tabs', 'timeline', 'process_steps', 'comparison', 'myth_reality', 'case_scenario', 'checklist', 'worked_example', 'diagram']) {
+      const c = components.find((x) => x.type === type);
+      const plain = vc.extractText(vc.renderComponent(c, t, { uid: 'w', level }));
+      assert(!plain.includes('Por qué importa') && !plain.includes('Cómo lo aplicas'), `${type}: sin campos no hay líneas`);
+      const html = vc.renderComponent({ ...c, why: 'Porque evita un error caro.', apply: 'Úsalo mañana en tu turno.' }, t, { uid: 'w', level });
+      const txt = vc.extractText(html);
+      const iw = txt.indexOf('Por qué importa: Porque evita un error caro.');
+      const ia = txt.indexOf('Cómo lo aplicas: Úsalo mañana en tu turno.');
+      assert(iw > 0 && ia > iw, `${type}/${level || 'clean'}: por qué/cómo en orden: ${txt.slice(0, 160)}`);
+      // el «por qué» va después del título del bloque (si lo tiene)
+      if (c.title) assert(txt.indexOf(vc.extractText(`<p>${c.title}</p>`)) < iw, `${type}: por qué después del título`);
+      assert(vc.lintCleanSafe(html).ok, `${type}: CLEAN_SAFE con por qué/cómo`);
     }
   }
 });
@@ -420,7 +461,8 @@ check('EV6: render de decision — CLEAN_SAFE sin <style>/flex/grid/height, orde
     }
   }
   const text = vc.extractText(vc.renderComponent(DEPTH1, themes[0].theme, { uid: 'o' }));
-  const order = ['Diagrama · Decisión', 'Valoración inicial', '¿Responde cuando le hablas?', 'Sí', 'Mantenla acompañada', 'No', 'Llama a emergencias'];
+  // P3: el rótulo del rol decisión es «Decisión» (antes «Diagrama · Decisión»).
+  const order = ['Decisión', 'Valoración inicial', '¿Responde cuando le hablas?', 'Sí', 'Mantenla acompañada', 'No', 'Llama a emergencias'];
   let from = 0;
   for (const s of order) { const i = text.indexOf(s, from); assert(i >= 0, `orden: falta "${s}" después de ${from} en "${text}"`); from = i + s.length; }
   // d3: el orden de lectura recorre el árbol en profundidad, «Sí» antes que «No» en cada nivel
@@ -650,7 +692,8 @@ check('I1: énfasis que cruza saltos de línea se renderiza sin ** literales ni 
   assert(!html.includes('**'), `quedaron ** literales: ${html}`);
   assert(html.includes('<strong>esta idea</strong><br><strong>clave</strong> siempre.'), `línea con énfasis: ${html}`);
   assert(html.includes('<strong>párrafo</strong>') && html.includes('<strong>con énfasis</strong> largo y <strong>fin</strong>.'), `párrafos con énfasis: ${html}`);
-  assert(vc.extractText(html) === 'Dato Recuerda esta idea clave siempre. Otro párrafo con énfasis largo y fin.', vc.extractText(html));
+  // P3: el callout info es el rol concepto con rótulo «Dato clave» (el glifo del ícono no es texto).
+  assert(vc.extractText(html) === 'Dato clave Recuerda esta idea clave siempre. Otro párrafo con énfasis largo y fin.', vc.extractText(html));
   // strong siempre balanceado
   const opens = (html.match(/<strong>/g) || []).length;
   const closes = (html.match(/<\/strong>/g) || []).length;
