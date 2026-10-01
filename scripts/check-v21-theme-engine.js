@@ -89,6 +89,9 @@ function assertEqual(actual, expected, msg) {
 function assertTrue(cond, msg) {
   if (!cond) throw new Error(msg);
 }
+function eqJson(actual, expected, msg) {
+  assertEqual(JSON.stringify(actual), JSON.stringify(expected), msg);
+}
 
 const HEX_RE = /^#[0-9A-F]{6}$/;
 
@@ -411,6 +414,42 @@ check('M3: ningún color emitido es #FFFFFF/#000000 puro; una seed pura se susti
   assertTrue(t.moduleColorsBasis[0] !== '#FFFFFF' && t.adjustments.some((a) => a.includes('brandSeed.moduleColors[0]')), 'módulo puro sustituido');
   const bad = { ...t, color: { ...t.color, surface: '#FFFFFF' } };
   assertTrue(validateTheme(bad).some((e) => e.code === 'PURE_BLACK_WHITE'), 'validateTheme detecta blanco puro');
+});
+
+// ─── P3 — sistema visual educativo 2.0: tonos por rol pedagógico ────────────
+check('P3: blocks — 8 roles en todo tema resuelto; ink ≥ 4.5 sobre soft/bg/surface, textPrimary ≥ 4.5 sobre soft, onInk ≥ 4.5 sobre ink', () => {
+  const roles = te.EDU_BLOCK_ROLES;
+  assertTrue(Array.isArray(roles) && roles.join(',') === 'concepto,ejemplo,caso,error,proceso,decision,reflexion,visual', 'EDU_BLOCK_ROLES');
+  for (const familyId of Object.keys(THEME_FAMILIES)) {
+    for (const mode of THEME_FAMILIES[familyId].supportedModes) {
+      const t = resolveTheme({ themeFamily: familyId, mode });
+      assertTrue(t.blocks && Object.keys(t.blocks).length === roles.length, `${familyId}/${mode}: blocks`);
+      for (const r of roles) {
+        const b = t.blocks[r];
+        assertTrue(contrastRatio(b.ink, b.soft) >= 4.5 && contrastRatio(b.ink, t.color.bg) >= 4.5 && contrastRatio(b.ink, t.color.surface) >= 4.5, `${familyId}/${mode}/${r}: ink`);
+        assertTrue(contrastRatio(t.color.textPrimary, b.soft) >= 4.5, `${familyId}/${mode}/${r}: textPrimary sobre soft`);
+        assertTrue(contrastRatio(b.onInk, b.ink) >= 4.5, `${familyId}/${mode}/${r}: onInk`);
+      }
+      // semánticos: mismos tonos en todas las familias de un modo
+      eqJson(Object.fromEntries(roles.map((r) => [r, { ink: t.blocks[r].ink, soft: t.blocks[r].soft, edge: t.blocks[r].edge }])), te.EDU_BLOCKS[mode], `${familyId}/${mode}: EDU_BLOCKS`);
+    }
+  }
+  const t = resolveTheme({ themeFamily: 'aula-clara', mode: 'light' });
+  const bad = { ...t, blocks: { ...t.blocks, error: { ...t.blocks.error, ink: '#F2C3BD' } } };
+  assertTrue(validateTheme(bad).some((e) => e.code === 'CONTRAST_TOO_LOW' && e.message.includes('blocks.error.ink')), 'validateTheme detecta un ink ilegible');
+});
+
+check('P3: tipografía de curso — display ≤ 32 px base, sin cursiva de tesis; Oscuro Premium en sans humanista', () => {
+  for (const familyId of Object.keys(THEME_FAMILIES)) {
+    for (const mode of THEME_FAMILIES[familyId].supportedModes) {
+      const t = resolveTheme({ themeFamily: familyId, mode });
+      assertTrue(t.typography.sizeDisplayPx === 32 && t.typography.sizeTitlePx === 24 && t.typography.sizeBodyPx === 18, `${familyId}/${mode}: escala`);
+      assertTrue(t.personality.thesisItalic === false, `${familyId}/${mode}: sin cursiva de tesis`);
+    }
+  }
+  const op = resolveTheme({ themeFamily: 'oscuro-premium', mode: 'dark' });
+  assertTrue(!/serif/i.test(op.personality.fontDisplay.replace(/sans-serif/g, '')) && !/serif/i.test(op.typography.fontBody.replace(/sans-serif/g, '')), 'Oscuro Premium sin serif');
+  eqJson(te.defaultPresentationProfile(), { themeFamily: 'aula-clara', mode: 'light' }, 'default de cursos nuevos: Aula Clara claro');
 });
 
 console.log('');

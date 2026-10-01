@@ -8,7 +8,7 @@
  *  - legacy-palettes-data.ts — LEGACY_PALETTES (28 entries, mirrors the frontend)
  */
 export * from './types';
-export { THEME_FAMILIES, SPACE_SCALE } from './families';
+export { THEME_FAMILIES, SPACE_SCALE, EDU_BLOCKS } from './families';
 export { contrastRatio, relativeLuminance, normalizeHex, isValidHex, isPureBlackOrWhite, ON_LIGHT, ON_DARK } from './color-math';
 export { resolveTheme, validateTheme, moduleColor, moduleColorAdjustments, themeSha256, defaultPresentationProfile } from './theme-resolver';
 export { brandSeedFromLegacyPalette, legacyPaletteThemeFallback, presentationProfileFromPalette, presentationProfileFromPaletteId } from './brand-seed';

@@ -23,7 +23,7 @@ import {
   ON_LIGHT,
   resolveReadableOn,
 } from './color-math';
-import { SPACE_SCALE, THEME_FAMILIES } from './families';
+import { EDU_BLOCKS, SPACE_SCALE, THEME_FAMILIES } from './families';
 import {
   BrandSeed,
   ModuleColor,
@@ -33,6 +33,9 @@ import {
   ThemeMode,
   ThemeValidationError,
   THEME_ENGINE_VERSION,
+  EDU_BLOCK_ROLES,
+  EduBlockRole,
+  EduBlockTone,
 } from './types';
 
 const GOLDEN_ANGLE_DEG = 137.50776;
@@ -229,25 +232,27 @@ export function resolveTheme(input: PresentationProfileInput): ResolvedTheme {
         sizeH1Fluid: 'clamp(1.75rem, 1.4rem + 1.6vw, 2.25rem)',
       },
       // R14-A — escala editorial (Design Language V1 §1).
-      sizeDisplayPx: 40,
-      sizeTitlePx: 26,
-      sizeItemPx: 20,
-      sizeLeadPx: 21,
-      sizeStatementPx: 26,
-      sizeNumeralPx: 36,
+      // P3 — escala de curso (no de revista): 34 / 24 / 19 / 18 / 16, display ≤ 40 px en escritorio.
+      sizeDisplayPx: 32,
+      sizeTitlePx: 24,
+      sizeItemPx: 19,
+      sizeLeadPx: 20,
+      sizeStatementPx: 22,
+      sizeNumeralPx: 28,
       scale: {
-        display: 'clamp(2rem, 1.3rem + 2.8vw, 3.25rem)',
-        title: 'clamp(1.375rem, 1.1rem + 1.1vw, 1.875rem)',
-        item: 'clamp(1.125rem, 1.05rem + 0.4vw, 1.3125rem)',
-        lead: 'clamp(1.1875rem, 1.05rem + 0.6vw, 1.375rem)',
-        statement: 'clamp(1.375rem, 1.1rem + 1.2vw, 1.875rem)',
-        numeral: 'clamp(2.25rem, 1.6rem + 2.4vw, 3.5rem)',
+        display: 'clamp(1.75rem, 1.35rem + 1.6vw, 2.5rem)',
+        title: 'clamp(1.3125rem, 1.15rem + 0.7vw, 1.625rem)',
+        item: 'clamp(1.125rem, 1.07rem + 0.25vw, 1.25rem)',
+        lead: 'clamp(1.125rem, 1.05rem + 0.4vw, 1.3125rem)',
+        statement: 'clamp(1.25rem, 1.1rem + 0.6vw, 1.5rem)',
+        numeral: 'clamp(1.75rem, 1.5rem + 1vw, 2.25rem)',
       },
     },
     space: [...SPACE_SCALE],
     shape: { ...baseMode.shape },
     variants: { ...baseMode.variants },
     personality: { ...baseMode.personality },
+    blocks: resolveBlocks(input.mode),
     adjustments,
     moduleColorsBasis,
   };
@@ -264,6 +269,18 @@ export function resolveTheme(input: PresentationProfileInput): ResolvedTheme {
     );
   }
   return theme;
+}
+
+/** P3 — tonos de bloque del modo + `onInk` legible; falla fuerte si un tono no llega al contraste. */
+function resolveBlocks(mode: ThemeMode): Record<EduBlockRole, EduBlockTone> {
+  const src = EDU_BLOCKS[mode];
+  const out = {} as Record<EduBlockRole, EduBlockTone>;
+  for (const role of EDU_BLOCK_ROLES) {
+    const b = src[role];
+    const on = contrastRatio(ON_LIGHT, b.ink) >= CONTRAST_BODY ? ON_LIGHT : ON_DARK;
+    out[role] = { ink: b.ink, soft: b.soft, edge: b.edge, onInk: on };
+  }
+  return out;
 }
 
 interface ModuleColorsComputation {
@@ -443,6 +460,20 @@ export function validateTheme(t: ResolvedTheme, opts?: { moduleCount?: number })
     for (const k of ['main', 'soft', 'onMain', 'onSoft', 'border'] as const) checkNotPure(m[k], `moduleColor(${i}).${k}`);
     checkContrast(`moduleColor(${i}).onMain`, m.onMain, `moduleColor(${i}).main`, m.main, CONTRAST_BODY);
     checkContrast(`moduleColor(${i}).onSoft`, m.onSoft, `moduleColor(${i}).soft`, m.soft, CONTRAST_BODY);
+  }
+
+  // P3 — tonos de bloque
+  if (t.blocks) {
+    for (const role of EDU_BLOCK_ROLES) {
+      const b = t.blocks[role];
+      if (!b) { errors.push({ code: 'BLOCK_MISSING', message: `blocks.${role} ausente` }); continue; }
+      for (const k of ['ink', 'soft', 'edge', 'onInk'] as const) checkHex(b[k], `blocks.${role}.${k}`);
+      checkContrast(`blocks.${role}.ink`, b.ink, `blocks.${role}.soft`, b.soft, CONTRAST_BODY);
+      checkContrast(`blocks.${role}.ink`, b.ink, 'bg', c.bg, CONTRAST_BODY);
+      checkContrast(`blocks.${role}.ink`, b.ink, 'surface', c.surface, CONTRAST_BODY);
+      checkContrast('textPrimary', c.textPrimary, `blocks.${role}.soft`, b.soft, CONTRAST_BODY);
+      checkContrast(`blocks.${role}.onInk`, b.onInk, `blocks.${role}.ink`, b.ink, CONTRAST_BODY);
+    }
   }
 
   if (t.typography.sizeBodyPx < 16) {

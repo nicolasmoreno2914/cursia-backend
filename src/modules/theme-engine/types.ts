@@ -158,6 +158,22 @@ export interface PresentationProfileInput {
   themeVersion?: number;
 }
 
+/** P3 — Sistema visual educativo 2.0: rol pedagógico de un bloque (ícono + color + forma). */
+export type EduBlockRole = 'concepto' | 'ejemplo' | 'caso' | 'error' | 'proceso' | 'decision' | 'reflexion' | 'visual';
+export const EDU_BLOCK_ROLES: readonly EduBlockRole[] = ['concepto', 'ejemplo', 'caso', 'error', 'proceso', 'decision', 'reflexion', 'visual'];
+/**
+ * ink   = texto del rótulo / ícono / filete (≥ 4.5:1 sobre soft Y sobre el fondo del label)
+ * soft  = superficie tintada del bloque (textPrimary ≥ 4.5:1 encima)
+ * edge  = borde de 1 px de la superficie (decorativo, sin requisito de contraste)
+ * onInk = texto sobre una insignia rellena de ink (≥ 4.5:1)
+ */
+export interface EduBlockTone {
+  ink: string;
+  soft: string;
+  edge: string;
+  onInk: string;
+}
+
 export interface ResolvedTheme {
   version: number;
   familyId: ThemeFamilyId;
@@ -168,6 +184,8 @@ export interface ResolvedTheme {
   shape: ThemeShapeTokens;
   variants: ThemeVariantTokens;
   personality: ThemePersonality;
+  /** P3 — tonos por rol pedagógico (semánticos: iguales en todas las familias de un mismo modo). */
+  blocks: Record<EduBlockRole, EduBlockTone>;
   /** Every automatic contrast correction resolveTheme applied, in order, human-readable (Spanish). */
   adjustments: string[];
   /**

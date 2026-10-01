@@ -237,9 +237,13 @@ async function pureChecks() {
   // Dorados antes de eso (4f60353, builder 3.1.0, pre-T3):
   // 644 6dd79270155faaa6c83db25be0df26c3bf659e11b93e5a4ae8fa615badecb232,
   // 645 6b35ed0bf50e3d2496081dde232851ce2db87c2725a1245ea4952dd581ddd745.
+  // P3 (EV6 sistema visual 2.0: tonos por rol, tipografía de curso, bloques, apertura/riel/práctica del
+  // shell y marco de la actividad) cambia el .mbz OTRA VEZ a propósito (todos los labels). Dorados post-P2-B1
+  // (builder 3.3.0): 644 8dd9815429b31929ad0bae4bb2d21d6730622e76a21bec96633a838b62ab7f0d,
+  // 645 15bcd96c3dc9ce69811320f5eb2ac7f533eff9c740b0932b019d841a3bf9a532.
   const GOLDEN_PRE_T5 = {
-    644: ['8dd9815429b31929ad0bae4bb2d21d6730622e76a21bec96633a838b62ab7f0d', { engine: 'h5p', finalExam: true, courseId: 644 }],
-    645: ['15bcd96c3dc9ce69811320f5eb2ac7f533eff9c740b0932b019d841a3bf9a532', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
+    644: ['9b544fe21c94c35d6d24753e94273902daa3539f26bd086a4758e09fa04f6cb4', { engine: 'h5p', finalExam: true, courseId: 644 }],
+    645: ['06b36d3619acf2d500eb1b3214486f24998e144e3ef76150e74564c4331fb360', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
   };
   await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B1+T3 (certificado + política de revisión del quiz, builder 3.3.0), con y sin el campo', async () => {
     for (const [id, [want, o]] of Object.entries(GOLDEN_PRE_T5)) {
