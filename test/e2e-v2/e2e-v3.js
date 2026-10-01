@@ -933,19 +933,40 @@ function reservationBookkeeping(ev) {
           for (const [k, arr] of Object.entries(byCat)) { const mean = arr.reduce((a, b) => a + b, 0) / arr.length; num2 += (weights[k] || 0) * mean; den += weights[k] || 0; }
           return num2 / den;
         };
+        // P2-B1 (EV6 Fase 2 — exámenes): un quiz (exam/finalExam) con completionattemptsexhausted =
+        // (attempts > 0) ya NO completa solo con la nota — reprobar con intentos REALES sin agotar
+        // queda INCOMPLETE(0), no COMPLETE_FAIL(3) (ver P2-design.md §1). moodle-v3-grades.php escribe
+        // la nota a mano (grade_update), nunca toma un intento real, así que un quiz reprobado aquí
+        // nunca agota attempts y se queda INCOMPLETE; H5P/SCORM (video/activity) no dependen de
+        // intentos agotados y siguen yendo directo a COMPLETE_FAIL bajo la nota aprobatoria.
+        const isQuizKind = (idn) => { const k = kindOf(idn); return k === 'exam' || k === 'finalExam'; };
         for (const who of ['pass', 'fail', 'mixed']) {
           const r = so.sim[who];
           const badG = gradedList.filter((c) => r.grades[c.idnumber] !== plan[who][c.idnumber] || r.grades[c.idnumber] < 0 || r.grades[c.idnumber] > 100).map((c) => [c.idnumber, r.grades[c.idnumber]]);
           eq(badG, [], `${label} [${who}]: notas registradas en 0–100 = las simuladas`);
-          const wantState = (c) => (plan[who][c.idnumber] >= passing ? 2 : 3);
+          const wantState = (c) => (plan[who][c.idnumber] >= passing ? 2 : isQuizKind(c.idnumber) ? 0 : 3);
           const badS = gradedList.filter((c) => r.states[c.idnumber] !== wantState(c)).map((c) => [c.idnumber, r.states[c.idnumber], plan[who][c.idnumber]]);
-          eq(badS, [], `${label} [${who}]: COMPLETE_PASS(2)/COMPLETE_FAIL(3) alrededor de la nota aprobatoria ${passing}`);
+          eq(badS, [], `${label} [${who}]: COMPLETE_PASS(2) sobre la nota aprobatoria ${passing} / COMPLETE_FAIL(3) bajo nota sin intentos agotados (H5P, SCORM) / INCOMPLETE(0) en un quiz reprobado por nota SIN agotar intentos reales (P2-B1)`);
           const et = expectTotal(who);
           ok(r.courseTotal !== null && Math.abs(r.courseTotal - et) < 0.01, `${label} [${who}]: total ponderado del curso ${r.courseTotal} ≈ ${et.toFixed(2)}`, { got: r.courseTotal, want: et });
           if (who === 'pass') ok(r.courseComplete === true, `${label} [pass]: curso completo (criterios por actividad/examen cumplidos)`, r);
           if (who === 'fail') ok(r.courseComplete === false, `${label} [fail]: curso NO completo`, r);
         }
         results.moodle[label].sim = so.sim;
+        // P2-B1: la nota sola nunca basta para reprobar un quiz (arriba, INCOMPLETE). Para probar que
+        // COMPLETE_FAIL(3) SIGUE siendo alcanzable, un usuario dedicado agota intentos REALES
+        // (mod_quiz_generator, como simulate-b1.php) sobre el primer quiz calificable del curso.
+        const quizForExhaust = gradedList.find((c) => isQuizKind(c.idnumber));
+        if (quizForExhaust) {
+          const exIn = path.join(V3OUT, `moodle-${label}.quizexhaust.in.json`);
+          const exOut = path.join(V3OUT, `moodle-${label}.quizexhaust.json`);
+          fs.writeFileSync(exIn, JSON.stringify({ moodleRoot: process.env.MOODLE_ROOT, courseid, idnumber: quizForExhaust.idnumber }));
+          const exr = spawnSync(PHP, ['-c', PHPINI, path.join(HERE, 'moodle-v3-quiz-exhaust.php'), exIn, exOut], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+          ok(exr.status === 0 && !/warning|notice|deprecated/i.test(exr.stderr || ''), `${label}: agotar intentos REALES de ${quizForExhaust.idnumber} (PHP) sin error`, (exr.stderr || exr.stdout || '').slice(-800));
+          const exo = JSON.parse(fs.readFileSync(exOut, 'utf8'));
+          eq(exo.completionstate, 3, `${label}: ${quizForExhaust.idnumber} con sus ${exo.attemptsConfigured} intentos REALES agotados y reprobados → COMPLETE_FAIL(3) (P2-B1)`, exo);
+          ok(exo.courseComplete === false, `${label}: curso NO completo tras agotar intentos reales de ${quizForExhaust.idnumber}`, exo);
+        }
         results.moodle[label].cms = cms.map((c) => ({ cmid: c.cmid, idnumber: c.idnumber, modname: c.modname, visible: c.visible }));
         // EV6 (browser QA): una página por sección → el QA recorre /course/section.php?id=<id>.
         results.moodle[label].sections = o.sections.map((x) => ({ section: x.section, id: x.id, name: x.name, cmids: x.cms.map((c) => c.cmid) }));
