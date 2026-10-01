@@ -13,7 +13,7 @@
 //      queda completo (rejectedByCode EXAM_BANK_EVIDENCE + EXAM_BANK_LENGTH_BIAS, repaired 2);
 //   3. A1: un desvío del contrato hace fallar AL FAKE (respuesta 400 + st.unknown);
 //   4. el modo banco solo se enciende con el override de la prueba: el frontend trae
-//      DYN_EXAM_BANK_MODE_ENABLED = false y, sin override, exam/final_exam siguen por GIFT.
+//      DYN_EXAM_BANK_MODE_ENABLED = true (encendido desde EV6 fase 2) y, con el interruptor en false, exam/final_exam siguen por GIFT.
 //
 // Uso: CURSIA_FRONTEND_REPO=<campuscloud-gen> node scripts/check-p2-exam-bank-e2e-fake.js
 //      (requiere `npm run build`; sin CURSIA_FRONTEND_REPO usa ../campuscloud-gen).
@@ -102,10 +102,12 @@ function validateArtifact(res, item, md) {
   // ── 0. El interruptor de producción sigue apagado; el override es solo de la prueba ──
   {
     const src = fs.readFileSync(path.join(FE, 'src/js/45-dynamic-generation-executor.js'), 'utf8');
-    ok(/^var DYN_EXAM_BANK_MODE_ENABLED = false;$/m.test(src), 'frontend: DYN_EXAM_BANK_MODE_ENABLED = false en 45 (producción sigue en GIFT)');
+    ok(/^var DYN_EXAM_BANK_MODE_ENABLED = true;$/m.test(src), 'frontend: DYN_EXAM_BANK_MODE_ENABLED = true en 45 (modo banco encendido)');
     const { f, llm } = setup('off');
     const calls0 = llm.st.calls.length; // setup() pidió el Markdown de los capítulos al LLM v2
-    ok(f.DYN_EXAM_BANK_MODE_ENABLED === false && f._dynExamBankModeOn(examItem('module', OUTLINE[0].id)) === false, 'sin override: _dynExamBankModeOn(exam con examBank) = false → GIFT');
+    ok(f.DYN_EXAM_BANK_MODE_ENABLED === true, 'sin override: el interruptor viene encendido');
+    f.DYN_EXAM_BANK_MODE_ENABLED = false; // kill switch
+    ok(f._dynExamBankModeOn(examItem('module', OUTLINE[0].id)) === false, 'con el interruptor en false: _dynExamBankModeOn(exam con examBank) = false → GIFT');
     f.DYN_EXAM_BANK_MODE_ENABLED = true; // override del E2E: DESPUÉS de cargar 45 (el `var` del script lo pisaría antes)
     ok(f._dynExamBankModeOn(examItem('module', OUTLINE[0].id)) === true && f._dynExamBankModeOn(examItem('final')) === true, 'con el override del harness: modo banco encendido para exam y final_exam');
     ok(llm.st.calls.length === calls0, 'el override no llama al LLM');
