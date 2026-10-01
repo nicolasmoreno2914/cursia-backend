@@ -1022,6 +1022,44 @@ check('M2: runtime versionado, localiza su label por currentScript y genera ids 
   assert(html.includes('N.id=function'), 'ids derivados');
 });
 
+// ─── P3 — íconos y tonos (edu.ts) ───────────────────────────────────────────
+check('P3: íconos — SVG decorativo solo en ENHANCED, glifo monocromo (nunca emoji) dentro de nolink en CLEAN', () => {
+  const EMOJI_RE = /\p{Emoji_Presentation}/u;
+  const ids = Object.keys(vc.EDU_ICONS);
+  assert(ids.length >= 14, `${ids.length} íconos`);
+  for (const id of ids) {
+    const ic = vc.EDU_ICONS[id];
+    assert(/^[MLHVCSQTAZmlhvcsqtaz0-9 .,\-]+$/.test(ic.d), `${id}: path`);
+    // Los glifos de texto (✦ ✓ ✕ ⇢ …) no son emoji; ☰/★ etc. tampoco llevan VS16.
+    assert(Array.from(ic.glyph).length === 1 && !/\uFE0F/.test(ic.glyph) && !/[\p{L}\p{N}]/u.test(ic.glyph), `${id}: glifo "${ic.glyph}"`);
+    // Sin presentación emoji por defecto (iOS/Android los pintarían a color y fuera de la paleta).
+    assert(!EMOJI_RE.test(ic.glyph), `${id}: "${ic.glyph}" se presenta como emoji`);
+    const enh = vc.eduIcon(true, id, '#123456');
+    assert(enh.startsWith('<svg class="cvc-ic"') && enh.includes('aria-hidden="true"') && enh.includes('focusable="false"') && !/>[^<]*[\p{L}\p{N}][^<]*</u.test(enh), `${id}: svg sin texto`);
+    const clean = vc.eduIcon(false, id, '#123456');
+    assert(new RegExp(`^<span class="cvc-glyph" style="color:#123456;font-weight:700"><span class="nolink">${ic.glyph.replace(/[?*+.]/g, '\\$&')}</span></span>$`).test(clean), `${id}: glifo en nolink`);
+  }
+});
+
+check('P3: moduleTone — legible (≥ 4.5) sobre su soft y el fondo del label en toda familia × modo × 12 módulos, incluso con semillas extremas', () => {
+  for (const f of Object.keys(te.THEME_FAMILIES)) {
+    for (const m of te.THEME_FAMILIES[f].supportedModes) {
+      for (const seed of [undefined, { moduleColors: ['#FFEE00', '#00FFAA', '#111111', '#777777'] }]) {
+        const t = te.resolveTheme({ themeFamily: f, mode: m, brandSeed: seed });
+        const g = t.personality.plate ? t.color.bg : t.color.surface;
+        for (let i = 0; i < 12; i++) {
+          const k = vc.moduleTone(t, te.moduleColor(t, i), g);
+          assert(te.contrastRatio(k.ink, k.soft) >= 4.5 && te.contrastRatio(k.ink, g) >= 4.5, `${f}/${m}/${i}: ink`);
+          assert(te.contrastRatio(k.onFill, k.fill) >= 4.5, `${f}/${m}/${i}: relleno`);
+          assert(te.contrastRatio(t.color.textPrimary, k.soft) >= 4.5, `${f}/${m}/${i}: texto sobre soft`);
+        }
+        const rt = vc.roleTone(t, 'decision');
+        assert(rt.ink === t.blocks.decision.ink && rt.fill === t.blocks.decision.ink && rt.onFill === t.blocks.decision.onInk, `${f}/${m}: roleTone`);
+      }
+    }
+  }
+});
+
 if (failures > 0) {
   console.error(`\n${failures} check(s) fallaron.`);
   process.exit(1);
