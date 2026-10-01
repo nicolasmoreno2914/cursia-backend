@@ -285,7 +285,7 @@ function chapterRoute(h: Hx, ch: ChapterFacts, examNext: boolean, mt: Tone): str
     .join('');
   return (
     `<div class="cvc-route"${st(h, [['margin', '24px 0 0 0'], ['padding', '16px 0 0 0'], ['color', s.fg], ['border-top', `1px solid ${h.t.color.border}`]])}>` +
-    eyebrow(h, 'Tu recorrido en este capítulo', s, { color: mt.ink }) +
+    eyebrow(h, 'Tu recorrido en este capítulo', s, { color: mt.ink, sentence: true }) +
     `<ol class="cvc-route-steps"${st(h, [['list-style', 'none'], ['margin', 0], ['padding', 0]])}>${items}</ol></div>`
   );
 }
@@ -330,7 +330,7 @@ function moduleRail(h: Hx, mod: ModuleFacts, ch: ChapterFacts, chapters: Array<{
     : '';
   return (
     `<div class="cvc-modrail"${st(h, [['margin', '40px 0 0 0'], ['padding', '20px 0 0 0'], ['color', s.fg], ['border-top', `1px solid ${h.t.color.border}`]])}>` +
-    eyebrow(h, `Dónde estás · Módulo ${mod.number}: ${mod.title}`, s, { color: mt.ink }) +
+    eyebrow(h, `Dónde estás · Módulo ${mod.number}: ${mod.title}`, s, { color: mt.ink, sentence: true }) +
     `<ol class="cvc-mrail"${st(h, [['list-style', 'none'], ['margin', '12px 0 0 0'], ['padding', 0]])}>${items}${exam}</ol></div>`
   );
 }

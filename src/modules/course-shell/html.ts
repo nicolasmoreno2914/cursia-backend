@@ -245,8 +245,10 @@ export function pHtml(h: Hx, html: string, s: Surf, opts: { secondary?: boolean;
 }
 
 /** Línea meta / kicker (cvc-meta, 14 px, mayúsculas con tracking de la familia). */
-export function eyebrow(h: Hx, text: string, s: Surf, opts: { color?: string; margin?: string } = {}): string {
-  const p = h.t.personality;
+export function eyebrow(h: Hx, text: string, s: Surf, opts: { color?: string; margin?: string; sentence?: boolean } = {}): string {
+  // P3: `sentence` — encabezado de navegación largo (riel, recorrido): 16 px en caja de oración en toda familia
+  // (en mayúsculas a 14 px solo cabe un chip corto de una línea, regla del QA del navegador).
+  const p = opts.sentence ? { ...h.t.personality, metaCase: 'sentence' as const } : h.t.personality;
   const color = readable(s.bg, [opts.color ?? h.t.color.accentStrong, h.t.color.accent, s.fg2], s.fg);
   return (
     `<p class="cvc-meta cvc-kicker"${st(h, [
