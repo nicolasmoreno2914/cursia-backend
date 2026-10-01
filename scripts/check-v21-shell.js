@@ -468,9 +468,20 @@ async function pureChecks() {
     // experienceWordCount: solo texto que lee el estudiante (sin type/kind/variant/chapterId).
     eq(S.experienceWordCount({ type: 'hero', title: 'Uno dos', lead: 'tres', chapterId: 'cap-x', items: ['cuatro cinco', 7] }), 5, 'experienceWordCount');
     eq([S.estimateChapterMinutes({ words: 1800, slideCount: 10, videoEnabled: true, activityEnabled: true }), S.estimateChapterMinutes({ words: 10, slideCount: 0, videoEnabled: false, activityEnabled: false })], [30, 5], 'estimateChapterMinutes');
+    // fix M2: la duración MEDIDA del video reemplaza el estimado fijo (6 min) — 20 min de video → 45, no 30.
+    eq(S.estimateChapterMinutes({ words: 1800, slideCount: 10, videoEnabled: true, activityEnabled: true, videoSeconds: 1200 }), 45, 'video medido');
     const words = {};
     const exps = F.experiencesFor(c2.manifest);
-    for (const id of Object.keys(exps)) words[id] = S.experienceWordCount(exps[id]);
+    for (const id of Object.keys(exps)) words[id] = S.experienceMovementWords(exps[id]);
+    // fix M2: solo cuentan los movimientos que el capítulo muestra (sin video → sin guía previa; con actividad → sin repaso).
+    const onlyHidden = {};
+    for (const id of Object.keys(exps)) onlyHidden[id] = { ...words[id], video_primer: 5000, self_check: 5000 };
+    const fh = factsOf(c2, { artifacts: { ...F.measuredArtifacts(c2.manifest), experienceWordsByChapter: onlyHidden } });
+    const fb = factsOf(c2, { artifacts: { ...F.measuredArtifacts(c2.manifest), experienceWordsByChapter: words } });
+    fb.chapters.forEach((c, i) => {
+      if (!c.videoEnabled && c.activityEnabled) eq(fh.chapters[i].estimatedMinutes, c.estimatedMinutes, `cap ${c.number}: guía de video y repaso ocultos no suman minutos`);
+      else assert(fh.chapters[i].estimatedMinutes > c.estimatedMinutes, `cap ${c.number}: lo que se muestra sí suma`);
+    });
     const fw = factsOf(c2, { artifacts: { ...F.measuredArtifacts(c2.manifest), experienceWordsByChapter: words } });
     assert(fw.chapters.every((c) => Number.isInteger(c.estimatedMinutes) && c.estimatedMinutes >= 5 && c.estimatedMinutes % 5 === 0), 'minutos en facts');
     assert(S.factsNumberSet(fw).has(fw.chapters[0].estimatedMinutes), 'los minutos son números de facts');
@@ -1059,7 +1070,8 @@ async function dbChecks() {
 
     await check('DB claim v3: experience/module_intro/final_exam/activity traen su bloque v3 (artifact validado, rotación, journey, rango)', async () => {
       const e = await claim(['experience']);
-      eq([e.type, e.chapterId, e.claimPayload], ['experience', C1, { validatedArtifactType: 'dynamic_experience_json', chapterId: C1 }], 'experience');
+      // P3 (fix I3): el claim anuncia que este backend acepta why/apply (el ejecutor usa v21-exp-6 solo con esto).
+      eq([e.type, e.chapterId, e.claimPayload], ['experience', C1, { validatedArtifactType: 'dynamic_experience_json', chapterId: C1, experienceFeatures: { eduFields: true } }], 'experience');
       assert(e.dependencyArtifacts !== undefined, 'dependencyArtifacts');
       const mi = await claim(['module_intro']);
       eq([mi.type, mi.claimPayload.moduleChapterIds], ['module_intro', [C1, C2]], 'module_intro');

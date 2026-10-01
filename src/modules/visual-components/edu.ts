@@ -48,7 +48,8 @@ export const EDU_ICONS: Record<EduIcon, { d: string; glyph: string }> = {
   logro: { d: 'M8 4h8v5a4 4 0 0 1-8 0zM8 6H5a3 3 0 0 0 3 4M16 6h3a3 3 0 0 1-3 4M12 13v4M8 20h8', glyph: '★' },
   libro: { d: 'M4 5h6a2 2 0 0 1 2 2v13a2 2 0 0 0-2-2H4zM20 5h-6a2 2 0 0 0-2 2v13a2 2 0 0 1 2-2h6z', glyph: '▥' },
   objetivo: { d: 'M12 3a9 9 0 1 0 0 18a9 9 0 0 0 0-18zM12 7.5a4.5 4.5 0 1 0 0 9a4.5 4.5 0 0 0 0-9zM12 11.2v1.6', glyph: '◎' },
-  repaso: { d: 'M12 3a9 9 0 1 0 0 18a9 9 0 0 0 0-18zM9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .8-1 1.5v.7M12 16.8v.4', glyph: '?' },
+  // fix M1: «↻» (repasar) y no «?», que en CLEAN_SAFE se leía como un signo de puntuación suelto.
+  repaso: { d: 'M12 3a9 9 0 1 0 0 18a9 9 0 0 0 0-18zM9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .8-1 1.5v.7M12 16.8v.4', glyph: '↻' },
   presentacion: { d: 'M3 4h18v12H3zM8 20l4-4 4 4', glyph: '▭' },
 };
 

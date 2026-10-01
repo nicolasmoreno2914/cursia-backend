@@ -106,6 +106,11 @@ export interface ThemePersonality {
   /** El label pinta su fondo como una lámina (familias oscuras); si no, el contenido va abierto sobre la página. */
   plate: boolean;
   /** Filete de acento de 2 px a todo el ancho sobre el kicker de cada componente (membrete, Institucional). */
+  /**
+   * @deprecated P3 (sistema visual 2.0): el filete de sección sobre el kicker fue reemplazado por el rótulo
+   * del rol pedagógico en todo componente; el campo se conserva (datos de familias y temas guardados) y no
+   * tiene efecto en el renderer.
+   */
   sectionRule: boolean;
   /** Filetes de ítem en borderStrong (retícula de ficha técnica, Técnico). */
   gridRules: boolean;

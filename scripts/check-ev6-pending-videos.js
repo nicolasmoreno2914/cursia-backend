@@ -241,9 +241,12 @@ async function pureChecks() {
   // apertura/riel/práctica del shell y marco de la actividad) cambia el .mbz OTRA VEZ a propósito (todos los labels). Dorados post-P2-B1
   // (builder 3.3.0): 644 8dd9815429b31929ad0bae4bb2d21d6730622e76a21bec96633a838b62ab7f0d,
   // 645 15bcd96c3dc9ce69811320f5eb2ac7f533eff9c740b0932b019d841a3bf9a532.
+  // Prueba (fix round 1, p3impl/proof.js): con los MISMOS insumos, staging (3.4.0) da sus dorados de arriba y
+  // esta rama cambia SOLO label.xml (labels del shell y del capítulo), el intro de la actividad
+  // (h5pactivity.xml / scorm.xml), files.xml y el blob de libro_guia_completo.html (colores de módulo, fix I1).
   const GOLDEN_PRE_T5 = {
-    644: ['307e7379c439585e7de00162c0a6cc9635cbec9ff2f86a87f72789114b49a055', { engine: 'h5p', finalExam: true, courseId: 644 }],
-    645: ['fd222f855029d9bf0af9cce7e91e7a177f17679839a9cb0a5644cb11df5a42f1', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
+    644: ['b5c37c6f33c1504ac785d10d07a5b0011934faf283fafaf40770e80c4cc78a97', { engine: 'h5p', finalExam: true, courseId: 644 }],
+    645: ['516182d6ee4822d55b84c9c17f5965578b5ee42e8b1d417d7fd4117cbb1ce2dc', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
   };
   await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P3 (sistema visual 2.0 sobre certificado + política de revisión del quiz, builder 3.5.0), con y sin el campo', async () => {
     for (const [id, [want, o]] of Object.entries(GOLDEN_PRE_T5)) {

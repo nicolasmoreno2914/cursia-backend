@@ -260,7 +260,6 @@ function counted(r: R, label: string, n: number, one: string, many: string): str
   return r.countless ? label : `${label} · ${plural(n, one, many)}`;
 }
 
-
 // ─── Primitivas tipográficas ────────────────────────────────────────────────
 
 /** Ritmo: los componentes "mayores" respiran más antes del siguiente (64 vs 44, × densidad). */
@@ -310,7 +309,6 @@ function kicker(r: R, text: string, s: Surf, opts: { color?: string; margin?: st
     `>${opts.llm ? inlineHtml(text) : labelHtml(text)}</${tag}>`
   );
 }
-
 
 type Role = 'display' | 'title' | 'item' | 'statement';
 
@@ -379,9 +377,6 @@ function paragraphs(
     .join('');
 }
 
-
-
-
 /** Fila separada por filete superior (el separador de todo contenido abierto). */
 function row(r: R, inner: string, s: Surf, opts: { tag?: 'div' | 'li'; cls?: string; first?: boolean; id?: string } = {}): string {
   const tag = opts.tag ?? 'div';
@@ -439,8 +434,6 @@ function edgeOf(r: R, s: Surf): string {
   return r.t.personality.plate ? r.t.color.border : s.bg;
 }
 
-
-
 /** <ul>/<ol> sin viñetas: en ENHANCED se devuelve role="list" (Safari/VoiceOver lo pierde). */
 function bareList(r: R, tag: 'ul' | 'ol', inner: string, cls?: string): string {
   return `<${tag}${cls ? ` class="${cls}"` : ''}${ea(r, { role: 'list' })}${st(r, [['list-style', 'none'], ['margin', 0], ['padding', 0]])}>${inner}</${tag}>`;
@@ -481,7 +474,6 @@ function list<T>(v: T[] | undefined, what: string): T[] {
   return v;
 }
 
-
 /** "Paso 3: Frota…" → "Frota…" (el numeral ya dice el orden). */
 const STEP_PREFIX_RE = /^\s*(?:paso|etapa|fase|step)\s*\d{1,2}\s*[:.\-–—)]\s*/i;
 function stripStepPrefix(h: string): string {
@@ -490,9 +482,6 @@ function stripStepPrefix(h: string): string {
 }
 
 // ─── Componentes (una función por tipo) ─────────────────────────────────────
-
-
-
 
 /** Cuerpo de las tarjetas de revelado (título + tarjetas); el rótulo lo pone renderReveal. */
 function revealCardsBody(r: R, c: VcRevealCards): string {
@@ -512,7 +501,6 @@ function revealCardsBody(r: R, c: VcRevealCards): string {
     .join('');
   return titleIf(r, c.title, s) + bareList(r, 'ul', items, 'cvc-cols2 cvc-cards');
 }
-
 
 function tabsBody(r: R, c: VcTabs, afterTitle = ''): string {
   const s = ground(r);
@@ -548,7 +536,6 @@ function timelineBody(r: R, c: VcTimeline, afterTitle = ''): string {
   const axis = `<ol class="cvc-axis"${ea(r, { role: 'list' })}${st(r, [['list-style', 'none'], ['margin', '0 0 0 6px'], ['padding', `${D(r, 4)}px 0 0 0`]])}>${events}</ol>`;
   return titleIf(r, c.title, s) + afterTitle + axis;
 }
-
 
 /** ≤ 2 columnas: <table> real (cabe a 390 px); en ENHANCED dentro de una región desplazable accesible. */
 function comparisonTable(r: R, columns: string[], rows: VcComparison['rows'], titleId?: string): string {
@@ -661,13 +648,6 @@ function comparisonBody(r: R, c: VcComparison, afterTitle = ''): string {
   const body = columns.length > VC_TABLE_MAX_COLUMNS ? comparisonStack(r, columns, rows, c.title) : comparisonTable(r, columns, rows, titleId);
   return titleIf(r, c.title, s, undefined, titleId) + afterTitle + body;
 }
-
-
-
-
-
-
-
 
 function selfCheckBody(r: R, c: VcSelfCheck): string {
   const s = ground(r);
@@ -824,7 +804,6 @@ function decisionNode(r: R, n: VcDecisionNode, s: Surf, depth: number): string {
   }
   return `<div class="cvc-dt-node cvc-dt-d${depth}">${decisionQuestion(r, n.question, s, depth)}${branches}</div>`;
 }
-
 
 /** Cuerpo de un diagrama de nodos (título + leyenda + dibujo); el rótulo lo pone renderDiagram. */
 function nodeDiagramBody(r: R, c: VcNodeDiagram, afterTitle = ''): string {
@@ -1040,8 +1019,9 @@ function renderObjectives(r: R, c: VcLearningObjectives): string {
         (it, i) =>
           `<li class="cvc-obj"${st(r, [['margin', 0], ['padding', `${D(r, 12)}px 0`], ['color', s.fg], ...(i === 0 ? [] : ([['border-top', `1px solid ${r.t.color.border}`]] as Decl[]))])}>` +
           // Labels del shell (countless): sin cifras que no salgan de facts → la insignia lleva un ícono.
-          `<div class="cvc-li-n">${r.countless ? fillBadge(r, '', k, 30, eduIcon(r.enh, 'check', k.onFill, 16)) : fillBadge(r, String(i + 1), k, 30)}</div>` +
-          `<div class="cvc-li-t"${st(r, [['color', s.fg]])}>${inlineHtml(it)}</div></li>`,
+          // fix M4: MISMO markup en ambos niveles — número (o ícono, en el shell) en la línea del texto. En
+          // CLEAN_SAFE se lee «1 Identificar…»; en ENHANCED el <style> lo dibuja como insignia del módulo.
+          `<div class="cvc-li-t"${st(r, [['color', s.fg]])}><strong class="cvc-n"${st(r, [['color', readable(s.bg, [k.ink], s.fg)]])}>${r.countless ? eduIcon(r.enh, 'check', readable(s.bg, [k.ink], s.fg), 16) : labelHtml(String(i + 1))}</strong> <span class="cvc-t">${inlineHtml(it)}</span></div></li>`,
       )
       .join('');
     const title = c.title && !OBJ_KICKER_RE.test(c.title.trim()) ? c.title : r.countless ? 'Al terminar podrás:' : 'Al terminar este capítulo podrás:';
@@ -1117,8 +1097,6 @@ function renderTabs(r: R, c: VcTabs): string {
   const k = tn(r, 'concepto');
   return block(r, 'tabs', 'open', k, (s) => chip(r, 'concepto', 'Perspectivas', k, s) + tabsBody(tinted(r, k), c, whyLine(r, why(c), k, s)) + applyLine(r, apply(c), k, s));
 }
-
-
 
 // ── Recurso visual ──
 function renderTimeline(r: R, c: VcTimeline): string {
@@ -1296,7 +1274,7 @@ function renderSummary(r: R, c: VcSummaryVisual): string {
       .map(
         (p, i) =>
           `<li class="cvc-pt"${st(r, [['margin', 0], ['padding', `${D(r, 12)}px 0`], ['color', s.fg], ...(i === 0 ? [] : ([['border-top', `1px solid ${k.edge}`]] as Decl[]))])}>` +
-          `<div class="cvc-li-n">${eduIcon(r.enh, 'check', ink, 22)}</div><div class="cvc-li-t">${inlineHtml(p)}</div></li>`,
+          `<div class="cvc-li-t">${eduIcon(r.enh, 'check', ink, 22)} <span class="cvc-t">${inlineHtml(p)}</span></div></li>`, // fix M4: ícono en la línea
       )
       .join('');
     return (
@@ -1338,7 +1316,6 @@ const RENDERERS: { [K in VcComponent['type']]: (r: R, c: Extract<VcComponent, { 
   worked_example: renderWorked,
   diagram: renderDiagram,
 };
-
 
 function renderWith(r: R, c: VcComponent): string {
   if (!c || typeof c !== 'object') renderFail('componente no es un objeto');
@@ -1394,7 +1371,7 @@ export function renderMovement(components: VcComponent[], theme: ResolvedTheme, 
     .join('');
   // EV6: las reglas del árbol de decisión solo viajan en labels que lo usan (el resto, byte-idéntico).
   const decision = components.some((c) => !!c && (c as { type?: unknown }).type === 'diagram' && (c as { kind?: unknown }).kind === 'decision');
-  const style = enh ? `<style>${scopedStyle(ctx.uid, theme, { decision })}</style>` : '';
+  const style = enh ? `<style>${scopedStyle(ctx.uid, theme, { decision, module: modTn({ ...r, mod: ctx.module }) })}</style>` : '';
   const script = enh ? `<script>${runtimeScript(ctx.uid)}</script>` : '';
   const plateCls = theme.personality && theme.personality.plate ? ' cvc-plate' : '';
   return `<div class="cvc cvc-${ctx.uid}${plateCls}"${ea(r, { 'data-cvc-uid': ctx.uid, 'data-cvc-v': '2' })} lang="es"` + labelRootStyle(theme, enh) + `>${style}${body}${script}</div>`;

@@ -17,6 +17,7 @@
  * Oculta contenido SOLO después de inicializar. Sin JS todo queda visible.
  */
 import { ResolvedTheme } from '../theme-engine';
+import type { Tone } from './edu';
 
 export const VC_RUNTIME_VERSION = 3;
 
@@ -67,8 +68,22 @@ export function decisionStyle(S: string, c: ResolvedTheme['color']): string {
 }
 
 /** P3 — reglas del sistema educativo (compartidas con el shell). Sin ellas todo queda en una columna legible. */
-export function eduStyle(S: string, c: ResolvedTheme['color']): string[] {
+export function eduStyle(S: string, c: ResolvedTheme['color'], k?: Tone): string[] {
+  // Tono de las insignias de estructura (módulo); sin él, el acento del tema.
+  const m: Tone = k ?? { ink: c.accentStrong, soft: c.accentSoft, edge: c.border, fill: c.accentStrong, onFill: c.textOnAccent };
   return [
+    // fix M4: el número/ícono va EN la línea del texto (mismo markup en ambos niveles); acá se vuelve insignia.
+    `${S} .cvc-obj,${S} .cvc-pt{display:block!important}`,
+    `${S} .cvc-obj>.cvc-li-t,${S} .cvc-pt>.cvc-li-t{display:grid;grid-template-columns:auto minmax(0,1fr);column-gap:12px;align-items:start}`,
+    `${S} .cvc-obj .cvc-n{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:50%;background-color:${m.fill};color:${m.onFill}!important;font-size:16px;line-height:1;font-variant-numeric:tabular-nums}`,
+    `${S} .cvc-obj .cvc-n .cvc-ic{stroke:${m.onFill}}`,
+    `${S} .cvc-obj .cvc-n .cvc-ic path{stroke:${m.onFill}}`,
+    `${S} .cvc-obj .cvc-t{padding-top:3px}`,
+    `${S} .cvc-pt .cvc-ic{margin-top:3px}`,
+    `${S} .cvc-mrail>li{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;column-gap:12px;position:relative}`,
+    `${S} .cvc-mrail .cvc-n{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:50%;border:2px solid ${m.edge};background-color:${c.surface};color:${m.ink}!important;font-size:16px;line-height:1}`,
+    `${S} .cvc-mrail .cvc-cur .cvc-n{background-color:${m.fill};border-color:${m.fill};color:${m.onFill}!important}`,
+    `${S} .cvc-mrail>li:not(:last-child)::before{content:"";position:absolute;left:17px;top:38px;bottom:-10px;width:2px;background-color:${c.border}}`,
     `${S} .cvc-ic{display:inline-block;vertical-align:-0.22em;flex:none}`,
     `${S} .cvc-chip .cvc-ic{display:block}`,
     `${S} .cvc-chip+h4,${S} .cvc-chip+h5{margin-top:2px!important}`,
@@ -78,11 +93,6 @@ export function eduStyle(S: string, c: ResolvedTheme['color']): string[] {
     `${S} .cvc-rail>li{position:relative}`,
     `${S} .cvc-rail>li:not(:last-child)::before{content:"";position:absolute;left:17px;top:44px;bottom:-12px;width:2px;background-color:${c.border}}`,
     `${S} .cvc-rail .cvc-step-b h4,${S} .cvc-rail .cvc-step-b h5{margin-top:5px!important}`,
-    `${S} .cvc-obj{align-items:start!important}`,
-    `${S} .cvc-obj .cvc-badge{margin:0!important}`,
-    `${S} .cvc-obj .cvc-li-t{padding-top:3px}`,
-    `${S} .cvc-pt{grid-template-columns:2.25rem minmax(0,1fr)!important}`,
-    `${S} .cvc-pt .cvc-ic{margin-top:2px}`,
     `${S} .cvc-check{grid-template-columns:2rem minmax(0,1fr)!important;align-items:start!important}`,
     `${S} .cvc-check .cvc-ic{margin-top:4px}`,
     `${S} .cvc-mr>div{margin:0!important}`,
@@ -93,10 +103,6 @@ export function eduStyle(S: string, c: ResolvedTheme['color']): string[] {
     `${S} .cvc-route-steps{display:flex;flex-direction:column;gap:6px}`,
     `${S} .cvc-route-steps>li{display:flex;align-items:center;gap:10px;margin:0!important}`,
     // riel del módulo
-    `${S} .cvc-mrail>li{display:grid;grid-template-columns:2.5rem minmax(0,1fr);align-items:center;column-gap:10px}`,
-    `${S} .cvc-mrail>li .cvc-badge{margin:0!important}`,
-    `${S} .cvc-mrail>li{position:relative}`,
-    `${S} .cvc-mrail>li:not(:last-child)::before{content:"";position:absolute;left:calc(1.25rem - 1px);top:40px;bottom:-8px;width:2px;background-color:${c.border}}`,
     `${S} .cvc-facts-row{display:flex;flex-wrap:wrap;gap:8px 20px}`,
     `${S} .cvc-facts-row>span{display:inline-flex;align-items:center;gap:6px}`,
     `@container (min-width:600px){` +
@@ -108,7 +114,7 @@ export function eduStyle(S: string, c: ResolvedTheme['color']): string[] {
   ];
 }
 
-export function scopedStyle(uid: string, theme: ResolvedTheme, opts: { decision?: boolean } = {}): string {
+export function scopedStyle(uid: string, theme: ResolvedTheme, opts: { decision?: boolean; module?: Tone } = {}): string {
   const S = `.cvc-${uid}`;
   const c = theme.color;
   const p = theme.personality;
@@ -216,7 +222,7 @@ export function scopedStyle(uid: string, theme: ResolvedTheme, opts: { decision?
     `@media (prefers-reduced-motion:reduce){${S} *,${S} *::before,${S} *::after{animation:none!important;transition:none!important}}`,
     `${S} .cvc-tabpanel[hidden]{display:none}`,
     // P3 — sistema visual educativo 2.0
-    ...eduStyle(S, c),
+    ...eduStyle(S, c, opts.module),
     `${S} .cvc-t-timeline .cvc-ev::before{background-color:${theme.blocks.visual.ink}}`,
     `${S} .cvc-t-tabs [role="tab"][aria-selected="true"]{border-bottom-color:${theme.blocks.concepto.ink}}`,
     `${S} summary.cvc-btn::after{color:inherit}`,

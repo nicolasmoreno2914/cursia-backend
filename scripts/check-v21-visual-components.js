@@ -218,7 +218,9 @@ check('P3: anatomía de bloque — rótulo e ícono del rol, forma por rol, obje
       const four = vc.renderComponent({ type: 'learning_objectives', items: ['Uno claro', 'Dos claro', 'Tres claro', 'Cuatro claro'] }, theme, { ...o, module: mod });
       const lis = four.match(/<li class="cvc-obj"[^>]*>/g) || [];
       assert(lis.length === 4 && !/border-top/.test(lis[0]) && /border-top/.test(lis[1]) && /border-top/.test(lis[2]), `${tag}: filetes de objetivos`);
-      assert((four.match(/class="cvc-badge"/g) || []).length === 4 && four.includes('Objetivos de aprendizaje') && four.includes('Al terminar este capítulo podrás'), `${tag}: objetivos`);
+      // fix M4: el número va en la línea (strong.cvc-n, mismo markup en ambos niveles); ENHANCED lo dibuja como insignia.
+      assert((four.match(/<strong class="cvc-n"/g) || []).length === 4 && vc.extractText(four).includes('1 Uno claro') && four.includes('Objetivos de aprendizaje') && four.includes('Al terminar este capítulo podrás'), `${tag}: objetivos`);
+      if (level) assert(/\.cvc-obj \.cvc-n\{display:inline-flex[^}]*border-radius:50%/.test(vc.renderMovement([{ type: 'learning_objectives', items: ['Uno claro', 'Dos claro'] }], theme, { ...o, module: mod })), `${tag}: insignia por CSS`);
       const dup = vc.extractText(vc.renderComponent({ type: 'learning_objectives', title: 'Objetivos de aprendizaje', items: ['Uno claro', 'Dos claro'] }, theme, o));
       assert(dup.split('Objetivos de aprendizaje').length === 2, `${tag}: el rótulo repite el título del LLM: ${dup.slice(0, 80)}`);
       // Labels del shell (countless): sin cifras en las insignias.

@@ -102,7 +102,7 @@ import {
   closingLabel,
   competenciesLabel,
   examInfoLabel,
-  experienceWordCount,
+  experienceMovementWords,
   finalExamInfoLabel,
   finalExamNextLabel,
   libroCardLabel,
@@ -723,7 +723,13 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       ...(finalExamBankSize !== undefined ? { finalExamBankSize } : {}),
       libroWordCount: libroWordCount(libroHtml),
       // P3: palabras MEDIDAS del experience → minutos estimados del capítulo (facts).
-      experienceWordsByChapter: Object.fromEntries(allChapters.map((ch) => [ch.chapterId, experienceWordCount(c.experiences.get(ch.chapterId))])),
+      experienceWordsByChapter: Object.fromEntries(allChapters.map((ch) => [ch.chapterId, experienceMovementWords(c.experiences.get(ch.chapterId))])),
+      // P3 (fix M2): duración medida de los videos reales (los pendientes no están en c.videos).
+      videoSecondsByChapter: Object.fromEntries(
+        allChapters
+          .map((ch) => [ch.chapterId, (c.videos.get(ch.chapterId) as { durationSec?: number } | undefined)?.durationSec] as const)
+          .filter(([, s]) => typeof s === 'number' && Number.isFinite(s) && s > 0),
+      ),
       libroHasBibliography: libroHtml.includes('id="bibliografia"'),
     },
   });

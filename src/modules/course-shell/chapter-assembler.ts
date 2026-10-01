@@ -205,7 +205,8 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     const pss = surfOn(h.t, mt.soft);
     const factsRow =
       `<p class="cvc-facts-row"${st(h, [['margin', '0 0 14px 0'], ['padding', 0], ['color', pss.fg], ['font-size', h.t.typography.sizeSmallPx], ['font-weight', '600'], ['line-height', '1.6']])}>` +
-      `<span>${eduIcon(h.enh, 'check', mt.ink, 18)} ${labelHtml(`Nota mínima: ${k.passingGrade} de 100`)}</span>${labelHtml('   ')}` +
+      // fix M1: separador visible «·» entre los dos datos (en CLEAN los espacios colapsan).
+      `<span>${eduIcon(h.enh, 'check', mt.ink, 18)} ${labelHtml(`Nota mínima: ${k.passingGrade} de 100`)}</span><span class="cvc-sep"${st(h, [['color', pss.fg2]])}>${labelHtml(' · ')}</span>` +
       `<span>${eduIcon(h.enh, 'repaso', mt.ink, 18)} ${labelHtml(k.attempts === 0 ? 'Intentos: sin límite' : `Intentos: ${k.attempts}`)}</span></p>`;
     const inner = box(
       h,
@@ -309,24 +310,21 @@ function chipH(h: Hx, icon: EduIcon, text: string, mt: Tone, s: { bg: string; fg
 function moduleRail(h: Hx, mod: ModuleFacts, ch: ChapterFacts, chapters: Array<{ number: number; title: string }> | undefined, mt: Tone): string {
   if (!chapters || !chapters.length) return '';
   const s = bgSurf(h);
-  const badge = (txt: string, current: boolean) =>
-    `<div class="cvc-badge"${st(
-      h,
-      [['width', '36px'], ['margin', '0 0 4px 0'], ['background-color', current ? mt.fill : s.bg], ['color', current ? mt.onFill : mt.ink], ['border', `2px solid ${current ? mt.fill : mt.edge}`], ['font-size', h.t.typography.sizeSmallPx], ['font-weight', '700'], ['line-height', '32px'], ['text-align', 'center']],
-      [['border-radius', '50%']],
-    )}>${txt}</div>`;
+  // fix M4: MISMO markup en ambos niveles — número en la línea del título (CLEAN_SAFE: «1 Título»); en
+  // ENHANCED el <style> del label lo dibuja como insignia (rellena en el capítulo actual).
+  const num = (inner: string) => `<strong class="cvc-n"${st(h, [['color', mt.ink]])}>${inner}</strong> `;
   const items = chapters
     .map((c) => {
       const cur = c.number === ch.number;
       return (
-        `<li${st(h, [['margin', '0 0 10px 0'], ['padding', 0], ['color', s.fg]])}>` +
-        badge(labelHtml(String(c.number)), cur) +
-        `<div${st(h, [['color', cur ? s.fg : s.fg2], ['font-weight', cur ? '700' : '400'], ['line-height', '1.4']])}>${labelHtml(c.title)}${cur ? `<span${st(h, [['color', mt.ink], ['font-weight', '700']])}>${labelHtml(' · estás aquí')}</span>` : ''}</div></li>`
+        `<li${cur ? ' class="cvc-cur"' : ''}${st(h, [['margin', '0 0 10px 0'], ['padding', 0], ['color', cur ? s.fg : s.fg2], ['font-weight', cur ? '700' : '400'], ['line-height', '1.4']])}>` +
+        num(labelHtml(String(c.number))) +
+        `<span class="cvc-t">${labelHtml(c.title)}${cur ? `<span${st(h, [['color', mt.ink], ['font-weight', '700']])}>${labelHtml(' · estás aquí')}</span>` : ''}</span></li>`
       );
     })
     .join('');
   const exam = mod.examEnabled
-    ? `<li${st(h, [['margin', '0'], ['padding', 0], ['color', s.fg]])}>${badge(eduIcon(h.enh, 'examen', mt.ink, 18), false)}<div${st(h, [['color', s.fg2], ['line-height', '1.4']])}>${labelHtml(`Evaluación del módulo ${mod.number}`)}</div></li>`
+    ? `<li${st(h, [['margin', '0'], ['padding', 0], ['color', s.fg2], ['line-height', '1.4']])}>${num(eduIcon(h.enh, 'examen', mt.ink, 18))}<span class="cvc-t">${labelHtml(`Evaluación del módulo ${mod.number}`)}</span></li>`
     : '';
   return (
     `<div class="cvc-modrail"${st(h, [['margin', '40px 0 0 0'], ['padding', '20px 0 0 0'], ['color', s.fg], ['border-top', `1px solid ${h.t.color.border}`]])}>` +

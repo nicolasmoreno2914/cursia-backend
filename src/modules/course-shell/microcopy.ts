@@ -55,10 +55,6 @@ export function activityTask(activityType?: string | null): string {
   return (activityType ? ACTIVITY_TASK_ES[activityType as H5pActivityType | 'scorm'] : undefined) ?? 'Aplicarás lo aprendido en el capítulo en una actividad calificada.';
 }
 
-export function activityInstruction(passingGrade: number, attempts: number, activityType?: string | null): string {
-  const task = activityType ? ACTIVITY_TASK_ES[activityType as H5pActivityType | 'scorm'] : undefined;
-  return `${task ? `${task} ` : ''}La actividad práctica que sigue es calificada. ${passingText(passingGrade)} ${attemptsText(attempts)}`;
-}
 
 export function continueWith(next: { number: number; title: string }): string {
   return `Continúa con el capítulo ${next.number}: ${next.title}.`;

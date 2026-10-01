@@ -21,8 +21,9 @@ export const ACTIVITY_INTRO_COPY = Object.freeze({
   openLink: 'Abrir la actividad práctica',
   scormBody: 'Abre la actividad para practicar lo aprendido en este capítulo. Tu resultado queda registrado como la nota de esta actividad.',
   /** P3: cabecera del marco (texto, sin cifras salvo el número de capítulo de facts). */
-  frameHeading: 'Responde aquí: tu resultado queda como la nota de la práctica del capítulo',
-  frameScormHeading: 'Actividad calificada del capítulo',
+  // fix M3: «Práctica del capítulo N · Responde aquí: …» (el número va después de «capítulo», de facts).
+  frameHeading: 'Práctica del capítulo {n} · Responde aquí: tu resultado queda registrado como nota',
+  frameScormHeading: 'Práctica calificada del capítulo {n}',
   frameFallbackLead: '¿No se ve la actividad? ',
   frameFallbackLink: 'Ábrela en su propia página →',
 });
@@ -47,7 +48,7 @@ function checkFrame(t: VideoIntroTheme, f: ActivityFrameTone): void {
 function frameHead(t: VideoIntroTheme, f: ActivityFrameTone, text: string): string {
   return (
     `<div class="cvc-act-h" style="background-color:${f.soft};color:${t.textPrimary};margin:0;padding:12px 18px;border-bottom:1px solid ${f.edge};">` +
-    `<p class="cvc-meta" style="margin:0;color:${f.ink};font-size:16px;font-weight:700;line-height:1.4;"><span class="nolink">✎  ${esc(text)} ${f.chapterNumber}</span></p></div>`
+    `<p class="cvc-meta" style="margin:0;color:${f.ink};font-size:16px;font-weight:700;line-height:1.4;"><span class="nolink">✎  ${esc(text.replace('{n}', String(f.chapterNumber)))}</span></p></div>`
   );
 }
 

@@ -642,7 +642,7 @@ const MATRIX = [
         const xml = await z.file(`${a.dir}/${a.modname}.xml`).async('string');
         const intro = /<intro>([\s\S]*?)<\/intro>/.exec(xml)[1].replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&');
         const mt = VC.moduleTone(theme, TE.moduleColor(theme, ch.moduleNumber - 1), ground);
-        assert(intro.includes('class="cvc-act-h"') && intro.includes(`background-color:${mt.soft}`) && intro.includes(`color:${mt.ink}`) && intro.includes(` ${ch.number}</span>`), `${cfg.id} cap ${ch.number}: marco del módulo`);
+        assert(intro.includes('class="cvc-act-h"') && intro.includes(`background-color:${mt.soft}`) && intro.includes(`color:${mt.ink}`) && (intro.includes(`Práctica del capítulo ${ch.number} · Responde aquí`) || intro.includes(`Práctica calificada del capítulo ${ch.number}</span>`)), `${cfg.id} cap ${ch.number}: marco del módulo`);
         if (a.modname === 'h5pactivity') assert(['cursia-iv', 'cursia-iv-inline', 'cursia-iv-fallback', 'cursia-iv-open'].every((c) => intro.includes(`class="${c}`)) && intro.includes('data-cursia-src='), `${cfg.id} cap ${ch.number}: clases del cargador`);
       }
     }
