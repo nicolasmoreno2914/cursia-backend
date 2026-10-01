@@ -21,9 +21,16 @@ import {
   checkPlainText,
   isPlainObject,
 } from '../types/common';
-import { VideoCheckpoint, planInteractionCheckpoints, videoPlanDurationSec } from './plan';
+import { REFLECTION_PAUSE_RULES, ReflectionPlan, VideoCheckpoint, planInteractionCheckpoints, planReflectionPauses, videoPlanDurationSec } from './plan';
 
 export const VIDEO_INTERACTIONS_SCHEMA_VERSION = 1;
+/**
+ * EV6 H5P v2 — IV avanzado (Manifest `features.ivAdvanced = 1`): v1 + `reflections`
+ * [{ index, prompt ≤200, hint? ≤200 }] en los índices fijos de planReflectionPauses.
+ * La remediación (adaptivity) no la escribe el LLM: sale del plan (inicio del segmento).
+ */
+export const VIDEO_INTERACTIONS_SCHEMA_VERSION_V2 = 2;
+export const VIDEO_REFLECTION_LIMITS = Object.freeze({ promptMax: 200, hintMax: 200 });
 
 export const VIDEO_INTERACTIONS_LIMITS = Object.freeze({
   questionMax: 250,
@@ -48,11 +55,19 @@ export interface VideoInteractionCheckpoint {
   feedbackIncorrect?: string;
 }
 
+export interface VideoReflection {
+  index: number;
+  prompt: string;
+  hint?: string;
+}
+
 export interface VideoInteractionsDoc {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   videoItemKey: string;
   durationSec: number;
   checkpoints: VideoInteractionCheckpoint[];
+  /** Solo schemaVersion 2. */
+  reflections?: VideoReflection[];
 }
 
 export interface VideoInteractionsExpectations {
@@ -60,6 +75,17 @@ export interface VideoInteractionsExpectations {
   videoItemKey?: string;
   /** Duración real (artifact de Videogen). Si se da, `doc.durationSec` debe coincidir (en segundos enteros). */
   durationSec?: number;
+  /**
+   * EV6: versión exigida (1 = legacy; 2 = IV avanzado, Manifest `features.ivAdvanced = 1`).
+   * Ausente ⇒ 1 (comportamiento de siempre: un documento v2 sin el marcador se rechaza).
+   */
+  schemaVersion?: 1 | 2;
+}
+
+export interface VideoInteractionsPlan {
+  checkpoints: VideoCheckpoint[];
+  /** Vacío en schemaVersion 1. */
+  reflectionPlan: ReflectionPlan;
 }
 
 /**
@@ -67,6 +93,11 @@ export interface VideoInteractionsExpectations {
  * Lanza H5pInputError("H5P_INPUT_INVALID(VideoInteractions): …") con TODOS los errores.
  */
 export function validateVideoInteractionsDoc(doc: unknown, expect: VideoInteractionsExpectations = {}): VideoCheckpoint[] {
+  return validateVideoInteractionsDocFull(doc, expect).checkpoints;
+}
+
+/** Igual que validateVideoInteractionsDoc, más el plan de pausas de reflexión (v2). */
+export function validateVideoInteractionsDocFull(doc: unknown, expect: VideoInteractionsExpectations = {}): VideoInteractionsPlan {
   const L = VIDEO_INTERACTIONS_LIMITS;
   const issues = new Issues();
   if (!isPlainObject(doc)) {
@@ -74,9 +105,11 @@ export function validateVideoInteractionsDoc(doc: unknown, expect: VideoInteract
     issues.throwIfAny('VideoInteractions');
   }
   const d = doc as Record<string, unknown>;
-  checkKeys(issues, '$', d, ['schemaVersion', 'videoItemKey', 'durationSec', 'checkpoints']);
-  if (d.schemaVersion !== VIDEO_INTERACTIONS_SCHEMA_VERSION) {
-    issues.add('schemaVersion', `debe ser ${VIDEO_INTERACTIONS_SCHEMA_VERSION}`);
+  const wantVersion = expect.schemaVersion ?? VIDEO_INTERACTIONS_SCHEMA_VERSION;
+  const v2 = wantVersion === VIDEO_INTERACTIONS_SCHEMA_VERSION_V2;
+  checkKeys(issues, '$', d, ['schemaVersion', 'videoItemKey', 'durationSec', 'checkpoints', ...(v2 ? ['reflections'] : [])]);
+  if (d.schemaVersion !== wantVersion) {
+    issues.add('schemaVersion', `debe ser ${wantVersion}`);
   }
   const keyIssues = new Issues();
   if (!checkItemKey(keyIssues, d.videoItemKey)) {
@@ -138,8 +171,57 @@ export function validateVideoInteractionsDoc(doc: unknown, expect: VideoInteract
       }
     });
   }
+  let reflectionPlan: ReflectionPlan = { reflections: [], droppedReflections: [] };
+  if (v2 && plan && planDur !== null) {
+    reflectionPlan = planReflectionPauses(planDur, plan);
+    const want = reflectionPlan.reflections;
+    // Fix round 1 (m-6): sin pausas planificadas (d < 180 s) `reflections` puede omitirse o venir vacío.
+    if (want.length === 0 && d.reflections === undefined) {
+      // nada que validar
+    } else if (checkArray(issues, 'reflections', d.reflections, want.length, want.length)) {
+      (d.reflections as unknown[]).forEach((r, i) => {
+        const p = `reflections[${i}]`;
+        if (!isPlainObject(r)) {
+          issues.add(p, 'debe ser un objeto');
+          return;
+        }
+        checkKeys(issues, p, r, ['index', 'prompt', 'hint']);
+        if (r.index !== want[i].index) issues.add(`${p}.index`, `debe ser ${want[i].index} (recibido ${String(r.index)})`);
+        checkPlainText(issues, `${p}.prompt`, r.prompt, { max: VIDEO_REFLECTION_LIMITS.promptMax });
+        if (r.hint !== undefined) checkPlainText(issues, `${p}.hint`, r.hint, { max: VIDEO_REFLECTION_LIMITS.hintMax });
+      });
+    }
+  }
   issues.throwIfAny('VideoInteractions');
-  return plan as VideoCheckpoint[];
+  return { checkpoints: plan as VideoCheckpoint[], reflectionPlan };
+}
+
+/** Mensaje de remediación por defecto (pregunta sin feedbackIncorrect). */
+export const VIDEO_REMEDIATION_DEFAULT_MESSAGE = 'Revisa este tramo del video antes de seguir.';
+
+/**
+ * EV6 IV avanzado: remediación de un checkpoint validado. El salto (seekTo) es el
+ * INICIO del segmento del plan (o el fin de la ventana de una pausa dentro del tramo); nunca lo decide el LLM.
+ */
+export function checkpointRemediation(
+  c: VideoInteractionCheckpoint,
+  planned: VideoCheckpoint,
+  reflections: ReadonlyArray<{ atSec: number }> = [],
+): { seekToSec: number; correctMessage: string; wrongMessage: string } {
+  // Fix round 1 (m-1): si una pausa de reflexión cae dentro del tramo, el salto va justo DESPUÉS de su
+  // ventana (no se vuelve a pausar con la misma reflexión); nunca en o después de la propia pregunta.
+  let seek = planned.segment[0];
+  for (const r of reflections) {
+    if (r.atSec >= planned.segment[0] && r.atSec < planned.atSec) {
+      const after = r.atSec + REFLECTION_PAUSE_RULES.windowSec;
+      if (after < planned.atSec) seek = Math.max(seek, after);
+    }
+  }
+  return {
+    seekToSec: seek,
+    correctMessage: c.feedbackCorrect ?? '',
+    wrongMessage: c.feedbackIncorrect ?? VIDEO_REMEDIATION_DEFAULT_MESSAGE,
+  };
 }
 
 /** Convierte un checkpoint validado a la entrada de R7 (`buildInteractiveVideo`). */

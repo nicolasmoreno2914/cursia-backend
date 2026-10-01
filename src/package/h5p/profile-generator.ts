@@ -40,6 +40,24 @@ export interface H5pProfile {
   contentLibrariesByMain: Record<string, H5pDependencyRef[]>;
   libraries: H5pLibraryRef[];
   closureByMain: Record<string, H5pMainClosure>;
+  /**
+   * EV6 H5P v2 — solo en perfiles derivados (v2): perfil base que el sitio ya
+   * tiene (preflight de v1) y, por librería principal NUEVA, la "delta" =
+   * clausura full − librerías del base. Esas carpetas viajan dentro del `.h5p`
+   * (buildBundledH5p). Ausente en v1 (su JSON no cambia).
+   */
+  baseProfileId?: string;
+  deltaByMain?: Record<string, H5pLibraryRef[]>;
+}
+
+/** Especificación (congelada) de un perfil: principales certificadas + sub-contenidos que inserta Cursia. */
+export interface H5pProfileSpec {
+  profileId: string;
+  version: number;
+  mainLibraries: ReadonlyArray<H5pDependencyRef>;
+  contentLibrariesByMain: Readonly<Record<string, ReadonlyArray<H5pDependencyRef>>>;
+  /** Perfil base (solo perfiles derivados): las principales que NO están en el base llevan `deltaByMain`. */
+  base?: H5pProfileSpec;
 }
 
 export const CURSIA_H5P_PROFILE_ID_V1 = 'CURSIA_H5P_PROFILE_V1';
@@ -71,6 +89,39 @@ export const CURSIA_H5P_CONTENT_LIBRARIES_V1: Readonly<Record<string, ReadonlyAr
   'H5P.SingleChoiceSet': [],
   'H5P.DragText': [],
   'H5P.Blanks': [],
+});
+
+export const CURSIA_H5P_PROFILE_SPEC_V1: H5pProfileSpec = Object.freeze({
+  profileId: CURSIA_H5P_PROFILE_ID_V1,
+  version: 1,
+  mainLibraries: CURSIA_H5P_MAIN_LIBRARIES_V1,
+  contentLibrariesByMain: CURSIA_H5P_CONTENT_LIBRARIES_V1,
+});
+
+// ── EV6 H5P v2 (rulings 2026-10-01: Branching Scenario 1.10 pineado, Dialog Cards 1.9) ──
+
+export const CURSIA_H5P_PROFILE_ID_V2 = 'CURSIA_H5P_PROFILE_V2';
+
+/** Principales NUEVAS de v2 (además de las 7 de v1, que no cambian). */
+export const CURSIA_H5P_NEW_MAIN_LIBRARIES_V2: ReadonlyArray<H5pDependencyRef> = Object.freeze([
+  { machineName: 'H5P.BranchingScenario', majorVersion: 1, minorVersion: 10 },
+  { machineName: 'H5P.Dialogcards', majorVersion: 1, minorVersion: 9 },
+]);
+
+export const CURSIA_H5P_PROFILE_SPEC_V2: H5pProfileSpec = Object.freeze({
+  profileId: CURSIA_H5P_PROFILE_ID_V2,
+  version: 2,
+  mainLibraries: Object.freeze([...CURSIA_H5P_MAIN_LIBRARIES_V1, ...CURSIA_H5P_NEW_MAIN_LIBRARIES_V2]),
+  contentLibrariesByMain: Object.freeze({
+    ...CURSIA_H5P_CONTENT_LIBRARIES_V1,
+    // Nodo 0 (situación) = AdvancedText; decisiones = BranchingQuestion. Nada más (sin CP/IV/Image dentro del caso).
+    'H5P.BranchingScenario': Object.freeze([
+      { machineName: 'H5P.BranchingQuestion', majorVersion: 1, minorVersion: 0 },
+      { machineName: 'H5P.AdvancedText', majorVersion: 1, minorVersion: 1 },
+    ]),
+    'H5P.Dialogcards': Object.freeze([]),
+  }),
+  base: CURSIA_H5P_PROFILE_SPEC_V1,
 });
 
 export function h5pLibraryDirName(ref: H5pDependencyRef): string {
@@ -136,17 +187,22 @@ function closure(
   return [...seen.values()].sort(compareH5pRefs);
 }
 
-/** Calcula el perfil completo. Pura y determinística. */
-export function computeH5pProfile(libraryJsons: Record<string, H5pLibraryJson>): H5pProfile {
+/**
+ * Calcula el perfil completo. Pura y determinística. Sin `spec` = CURSIA_H5P_PROFILE_V1
+ * (salida byte-idéntica a la de siempre). Con un spec derivado (v2) agrega
+ * `baseProfileId` y `deltaByMain` (clausura full de cada principal nueva − librerías del base).
+ */
+export function computeH5pProfile(libraryJsons: Record<string, H5pLibraryJson>, spec: H5pProfileSpec = CURSIA_H5P_PROFILE_SPEC_V1): H5pProfile {
   const mainLibraries: Record<string, H5pLibraryRef> = {};
   const contentLibrariesByMain: Record<string, H5pDependencyRef[]> = {};
   const closureByMain: Record<string, H5pMainClosure> = {};
   const union = new Map<string, H5pLibraryRef>();
+  const listName = spec.profileId === CURSIA_H5P_PROFILE_ID_V1 ? 'CURSIA_H5P_MAIN_LIBRARIES_V1' : `${spec.profileId}.mainLibraries`;
 
-  for (const main of CURSIA_H5P_MAIN_LIBRARIES_V1) {
-    const lib = getLib(libraryJsons, main, 'CURSIA_H5P_MAIN_LIBRARIES_V1');
+  for (const main of spec.mainLibraries) {
+    const lib = getLib(libraryJsons, main, listName);
     mainLibraries[main.machineName] = toRef(lib);
-    const contentLibs = (CURSIA_H5P_CONTENT_LIBRARIES_V1[main.machineName] || []).map((d) => ({ ...d }));
+    const contentLibs = (spec.contentLibrariesByMain[main.machineName] || []).map((d) => ({ ...d }));
     contentLibrariesByMain[main.machineName] = contentLibs;
     const roots = [main, ...contentLibs];
     const runtime = closure(libraryJsons, roots, false);
@@ -155,14 +211,33 @@ export function computeH5pProfile(libraryJsons: Record<string, H5pLibraryJson>):
     for (const r of full) union.set(h5pLibraryDirName(r), r);
   }
 
-  return {
-    profileId: CURSIA_H5P_PROFILE_ID_V1,
-    version: 1,
+  const profile: H5pProfile = {
+    profileId: spec.profileId,
+    version: spec.version,
     mainLibraries,
     contentLibrariesByMain,
     libraries: [...union.values()].sort(compareH5pRefs),
     closureByMain,
   };
+  if (!spec.base) return profile;
+
+  const base = computeH5pProfile(libraryJsons, spec.base);
+  const baseDirs = new Map(base.libraries.map((r) => [h5pLibraryDirName(r), r]));
+  for (const r of profile.libraries) {
+    const b = baseDirs.get(h5pLibraryDirName(r));
+    if (b && b.patchVersion !== r.patchVersion) {
+      throw new Error(`H5P_PROFILE_BASE_MISMATCH: ${h5pLibraryDirName(r)} patch ${r.patchVersion} ≠ ${b.patchVersion} del perfil base`);
+    }
+  }
+  for (const k of Object.keys(base.mainLibraries)) {
+    if (!profile.mainLibraries[k]) throw new Error(`H5P_PROFILE_BASE_MISMATCH: ${spec.profileId} no incluye la principal ${k} del perfil base`);
+  }
+  const deltaByMain: Record<string, H5pLibraryRef[]> = {};
+  for (const main of spec.mainLibraries) {
+    if (base.mainLibraries[main.machineName]) continue;
+    deltaByMain[main.machineName] = closureByMain[main.machineName].full.filter((r) => !baseDirs.has(h5pLibraryDirName(r)));
+  }
+  return { ...profile, baseProfileId: base.profileId, deltaByMain };
 }
 
 /** Serialización canónica del perfil (la que se guarda en el JSON committed). */

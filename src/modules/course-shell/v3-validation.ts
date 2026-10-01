@@ -19,9 +19,10 @@
  * Todo lo demás de v1/v2: sin cambios.
  */
 import { eduMetrics, validateEduFields, validateExperience, validatePedagogy, validateSimulatedDiagrams } from '../visual-components';
-import { H5pInputError, VideoPlanError, planInteractionCheckpoints, validateVideoInteractionsDoc } from '../../package/h5p';
+import { H5pInputError, VideoPlanError, planInteractionCheckpoints, planReflectionPauses, validateVideoInteractionsDocFull } from '../../package/h5p';
+import type { ReflectionPlan } from '../../package/h5p';
 import type { VideoCheckpoint } from '../../package/h5p';
-import { H5pActivityType, ShellValidationError, activityTypeForChapter, validateH5pActivityPayload } from './activity-type';
+import { H5pActivityTypeV2, ShellValidationError, activityTypeForChapter, validateH5pActivityPayload } from './activity-type';
 import { validateCourseIntroV3, validateModuleIntroV3 } from './intro-schemas';
 import { FINAL_EXAM_QUESTION_RANGE, validateExamGift } from './final-exam';
 import { EXAM_BANK_ARTIFACT_TYPE, EXAM_BANK_VERSION, EXAM_GIFT_ARTIFACT_TYPE, ExamPlanLeaf, expectedExamPlan, validateExamBank } from './exam-bank';
@@ -71,7 +72,11 @@ export interface V3ItemValidationContext {
    * EV5-C: tipo h5p esperado = resolveActivityType(item del Manifest congelado).
    * Ausente → rotación por hash del chapterId (compatibilidad).
    */
-  expectedActivityType?: H5pActivityType | null;
+  expectedActivityType?: H5pActivityTypeV2 | null;
+  /** EV6 H5P v2: marcador `features.activityTypeRules` del Manifest (2 habilita branchingscenario). */
+  activityTypeRules?: number | null;
+  /** EV6 IV avanzado: 2 si el Manifest declara `features.ivAdvanced = 1`; ausente ⇒ 1 (legacy). */
+  videoInteractionsSchemaVersion?: 1 | 2 | null;
   /** module_intro: capítulos del módulo en orden del Manifest. */
   moduleChapterIds?: string[];
   /** video_interactions: video completado del capítulo. */
@@ -205,8 +210,22 @@ export function validateV3ItemArtifact(ctx: V3ItemValidationContext, text: strin
     case 'video_interactions': {
       if (!ctx.video) throw new Error(`V3_VALIDATION_CONTEXT: video_interactions ${ctx.itemKey} sin datos del video`);
       try {
-        const plan = validateVideoInteractionsDoc(doc, { videoItemKey: ctx.video.videoItemKey, durationSec: ctx.video.durationSec });
-        return { ok: true, errors: [], summary: { interactionCount: plan.length } };
+        const v2 = ctx.videoInteractionsSchemaVersion === 2;
+        const r = validateVideoInteractionsDocFull(doc, {
+          videoItemKey: ctx.video.videoItemKey,
+          durationSec: ctx.video.durationSec,
+          ...(v2 ? { schemaVersion: 2 as const } : {}),
+        });
+        if (!v2) return { ok: true, errors: [], summary: { interactionCount: r.checkpoints.length } };
+        return {
+          ok: true,
+          errors: [],
+          summary: {
+            interactionCount: r.checkpoints.length,
+            reflectionCount: r.reflectionPlan.reflections.length,
+            droppedReflections: r.reflectionPlan.droppedReflections,
+          },
+        };
       } catch (err) {
         return { ok: false, errors: h5pErrors(err) };
       }
@@ -214,7 +233,12 @@ export function validateV3ItemArtifact(ctx: V3ItemValidationContext, text: strin
     case 'activity': {
       if (!ctx.chapterId) throw new Error(`V3_VALIDATION_CONTEXT: activity ${ctx.itemKey} sin chapterId`);
       const expectedType = ctx.expectedActivityType ?? activityTypeForChapter(ctx.chapterId);
-      const r = validateH5pActivityPayload(doc, { chapterId: ctx.chapterId, itemKey: ctx.itemKey, expectedType });
+      const r = validateH5pActivityPayload(doc, {
+        chapterId: ctx.chapterId,
+        itemKey: ctx.itemKey,
+        expectedType,
+        ...(ctx.activityTypeRules !== undefined && ctx.activityTypeRules !== null ? { activityTypeRules: ctx.activityTypeRules } : {}),
+      });
       return { ...r, summary: { activityType: expectedType } };
     }
     default:
@@ -278,6 +302,8 @@ export interface VideoClaimFacts {
   youtubeId: string;
   durationSec: number;
   checkpoints: VideoCheckpoint[];
+  /** EV6 IV avanzado (solo con `ivAdvanced`): pausas de reflexión planificadas sobre la duración MEDIDA. */
+  reflectionPlan?: ReflectionPlan;
 }
 
 export type VideoClaimFactsResult = { ok: true; video: VideoClaimFacts } | { ok: false; code: string; message: string };
@@ -294,6 +320,8 @@ export function videoClaimFacts(input: {
   videoItemKey: string;
   outputSummary?: Record<string, any> | null;
   artifactMetadata?: Record<string, any> | null;
+  /** EV6: Manifest con `features.ivAdvanced = 1` ⇒ también el plan de pausas de reflexión. */
+  ivAdvanced?: boolean;
 }): VideoClaimFactsResult {
   const os = input.outputSummary ?? {};
   const md = input.artifactMetadata ?? {};
@@ -315,6 +343,10 @@ export function videoClaimFacts(input: {
   }
   try {
     const checkpoints = planInteractionCheckpoints(durationSec);
+    if (input.ivAdvanced) {
+      const reflectionPlan = planReflectionPauses(durationSec, checkpoints);
+      return { ok: true, video: { videoItemKey: input.videoItemKey, youtubeId, durationSec, checkpoints, reflectionPlan } };
+    }
     return { ok: true, video: { videoItemKey: input.videoItemKey, youtubeId, durationSec, checkpoints } };
   } catch (err) {
     if (err instanceof VideoPlanError) return { ok: false, code: err.code, message: err.message };

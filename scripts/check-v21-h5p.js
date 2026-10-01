@@ -565,8 +565,9 @@ async function unzip(buf) {
     assertDeepEqual(b.content.choices.map((c) => c.subContentId), b.content.choices.map((_, i) => h.h5pSubContentId(inputs.scs().itemKey, i, 1)), 'ids');
     assertDeepEqual(b.subContentIds, b.content.choices.map((c) => c.subContentId), 'subContentIds');
   });
-  await check('H5P_MOODLE_GRADING: cubre las 7 principales; SCS no calificable ⇒ assertH5pGradableInMoodle lanza', () => {
-    assertDeepEqual(Object.keys(h.H5P_MOODLE_GRADING).sort(), Object.keys(P.mainLibraries).sort(), 'claves');
+  await check('H5P_MOODLE_GRADING: cubre las principales (7 de v1 + EV6: las de CURSIA_H5P_PROFILE_V2); SCS no calificable ⇒ assertH5pGradableInMoodle lanza', () => {
+    assertDeepEqual(Object.keys(h.H5P_MOODLE_GRADING).sort(), Object.keys(h.CURSIA_H5P_PROFILE_V2.mainLibraries).sort(), 'claves');
+    for (const k of Object.keys(P.mainLibraries)) assert(h.H5P_MOODLE_GRADING[k], `falta ${k}`);
     for (const lib of ['H5P.InteractiveVideo', 'H5P.QuestionSet', 'H5P.DragText', 'H5P.Blanks']) h.assertH5pGradableInMoodle(lib);
     expectThrow(() => h.assertH5pGradableInMoodle('H5P.SingleChoiceSet'), /^H5P_NOT_GRADABLE_IN_MOODLE: H5P\.SingleChoiceSet/, 'SCS');
     expectThrow(() => h.assertH5pGradableInMoodle('H5P.Accordion'), /H5P_NOT_GRADABLE_IN_MOODLE/, 'desconocida');

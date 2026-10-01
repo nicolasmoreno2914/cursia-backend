@@ -1,0 +1,22 @@
+{
+  "semantics": [
+    {
+      "label": "Label",
+      "description": "Label/pennawd am ateb pan fydd defnyddiwr yn allforio pob ateb"
+    },
+    {
+      "label": "Placeholder text",
+      "description": "Example value or other placeholder text. Should not be used to replace the description of the input field."
+    },
+    {
+      "label": "Index"
+    },
+    {
+      "label": "Label am allforio heb ei gynnal",
+      "default": "Does dim modd allforio (heb ei gynnal) ar y ddyfais hon"
+    },
+    {
+      "label": "Cynnwys sylwadau yn y ddogfen i'w hallforio"
+    }
+  ]
+}
