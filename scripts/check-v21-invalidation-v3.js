@@ -546,6 +546,52 @@ async function pureChecks() {
     }
   });
 
+  await check('EV6 P2 fix 1 (C1): REUSE de un examen en banco no pide el GIFT (roles resueltos contra lo presente); banco + GIFT → rol ambiguo', () => {
+    const { plan, mB } = planOf(bp0, bp0);
+    const bankType = (id) => { const [, key, role] = String(id).split('|'); return /^(exam|final_exam):/.test(key) && role === 'dynamic_exam_gift' ? 'dynamic_exam_bank_json' : role; };
+    const real = { required: (t, v, present) => R.requiredArtifactTypesForPresent(3, t, v, present), typeOf: bankType };
+    eq(A.planApplyWrites(plan, mB.items, bp0, CTX, () => 'ready', () => null, real).missingRoles, [], 'banco reutilizable');
+    // sin resolver contra lo presente (antes del fix) el banco se reportaba como GIFT faltante
+    const old = A.planApplyWrites(plan, mB.items, bp0, CTX, () => 'ready', () => null, { required: (t, v) => R.requiredArtifactTypes(3, t, v), typeOf: bankType });
+    assert(old.missingRoles.includes(`${K('exam', M1)}:dynamic_exam_gift:missing_role`), `antes: ${old.missingRoles}`);
+    const both = planOf(bp0, bp0, { over: { [K('exam', M1)]: { artifactIds: [`A|${K('exam', M1)}|dynamic_exam_gift`, `A|${K('exam', M1)}|dynamic_exam_bank_json`] } } });
+    const w = A.planApplyWrites(both.plan, both.mB.items, bp0, CTX, () => 'ready', () => null, { required: real.required, typeOf: typeOfId });
+    eq(w.missingRoles, [`${K('exam', M1)}:EXAM_ARTIFACT_AMBIGUOUS:missing_role`], 'ambiguo');
+    // v1/v2: sin cambios
+    eq(R.requiredArtifactTypesForPresent(2, 'exam', null, new Set(['dynamic_exam_bank_json'])), ['dynamic_exam_gift'], 'v2');
+  });
+
+  await check('EV6 P2 fix 1 (C2): reordenar capítulos/módulos o mover un capítulo entre módulos existentes ⇒ exámenes por banco reutilizables; cambios de pertenencia los regeneran', () => {
+    // reorden dentro del módulo y de módulos: exam y final_exam REUSE
+    const r1 = baseSpec(); r1.modules[0].chapters.reverse();
+    const r2 = baseSpec(); r2.modules.reverse();
+    for (const [name, sp] of [['capítulos', r1], ['módulos', r2]]) {
+      const m = byKey(planOf(bp0, buildBp(sp)).plan);
+      eq([m[K('exam', M1)].action, m[K('exam', M2)].action, m[CK('final_exam')].action], ['REUSE', 'REUSE', 'REUSE'], `reorden de ${name}`);
+    }
+    // mover C3 de M1 a M2 (ambos siguen): exámenes de ambos RG; final REUSE (el banco empaqueta con su plan congelado)
+    const mv = baseSpec(); mv.modules[1].chapters.push(mv.modules[0].chapters.pop());
+    const pm = byKey(planOf(bp0, buildBp(mv)).plan);
+    eq([pm[K('exam', M1)].action, pm[K('exam', M2)].action, pm[CK('final_exam')].action], ['REGENERATE', 'REGENERATE', 'REUSE'], 'mover');
+    // vaciar y borrar M3 (C6 pasa a M2): el conjunto de módulos del final cambia ⇒ final RG
+    const del = baseSpec(); del.modules[1].chapters.push(del.modules[2].chapters[0]); del.modules.pop();
+    const pd = planOf(bp0, buildBp(del)).plan;
+    eq(byKey(pd)[CK('final_exam')].action, 'REGENERATE', 'módulo borrado');
+    assertReason(pd, CK('final_exam'), 'course_modules_changed');
+    // módulo nuevo con un capítulo movido ⇒ final RG
+    const nw = baseSpec(); nw.modules.push({ id: M4, title: 'Nuevo', objective: 'Nuevo', exam: false, chapters: [nw.modules[1].chapters.pop()] });
+    const pn = planOf(bp0, buildBp(nw)).plan;
+    assertReason(pn, CK('final_exam'), 'course_modules_changed');
+    eq(byKey(pn)[K('exam', M2)].action, 'REGENERATE', 'exam del módulo que perdió el capítulo');
+    // borrar / agregar un capítulo ⇒ exam del módulo y final RG
+    const rm = baseSpec(); rm.modules[1].chapters.pop();
+    const pr = byKey(planOf(bp0, buildBp(rm)).plan);
+    eq([pr[K('exam', M2)].action, pr[CK('final_exam')].action], ['REGENERATE', 'REGENERATE'], 'capítulo borrado');
+    const ad = baseSpec(); ad.modules[0].chapters.push({ id: C7, title: 'Capítulo siete', objective: 'Objetivo siete' });
+    const pa = byKey(planOf(bp0, buildBp(ad)).plan);
+    eq([pa[K('exam', M1)].action, pa[CK('final_exam')].action], ['REGENERATE', 'REGENERATE'], 'capítulo agregado');
+  });
+
   await check('determinismo: items/registros mezclados y Blueprint con claves reordenadas ⇒ mismo plan; sha fijado', () => {
     const s = baseSpec(); chapterOf(s, C1).title = 'Capítulo uno (revisado)';
     const bp1 = buildBp(s);
@@ -980,7 +1026,7 @@ async function dbChecks() {
      * completed + un artifact por rol; las interacciones registran la
      * identidad del video contra el que se generaron (fix round 1, I3).
      */
-    const seedCompletedRun = async (cidX, m, bpNumber, spec, extraPayload = {}) => {
+    const seedCompletedRun = async (cidX, m, bpNumber, spec, extraPayload = {}, seedOpts = {}) => {
       const [job] = await ds.query(
         `insert into public.production_jobs (owner_id, course_id, execution_mode, status, worker_status, current_step, progress, input_payload, output_summary, options, result)
          values ($1, $2, 'dynamic_generation', 'completed', 'completed', 'dynamic_generation', 100, $3::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb) returning id`,
@@ -999,7 +1045,9 @@ async function dbChecks() {
            values ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9::text[], $10, 'completed', now(), $11::jsonb) returning id`,
           [job.id, cidX, m.blueprintId, m.id, it.key, it.type, it.moduleId, it.chapterId, it.dependsOn, itemIdempotencyKey(m.id, it.key, 1), JSON.stringify(summary)]);
         const arts = [];
-        for (const role of R.requiredArtifactTypesV3(it.type, it.variant)) {
+        for (const role0 of R.requiredArtifactTypesV3(it.type, it.variant)) {
+          // EV6 P2 fix 1 (C1): exámenes sembrados como banco JSON en vez de GIFT.
+          const role = seedOpts.bankExams && role0 === 'dynamic_exam_gift' ? 'dynamic_exam_bank_json' : role0;
           const path1 = `r5/${job.id}/${it.key}/${role}`;
           const [a] = await ds.query(
             `insert into public.artifacts (owner_id, course_id, job_id, type, storage_provider, storage_bucket, storage_path, filename, mime_type, metadata, module_id, chapter_id, manifest_id, manifest_item_key, item_run_id)
@@ -1176,6 +1224,26 @@ async function dbChecks() {
       const vdry = await runs.regenerateItem(K4.cid, OWNER, 1, job4.id, `video:${K4.dc(1)}`, { dryRun: true });
       eq(vdry.affected.map((x) => [x.itemKey, x.action]), [[`video:${K4.dc(1)}`, 'REGENERATE'], [`video_interactions:${K4.dc(1)}`, 'REGENERATE']], 'video → interacciones');
       await rejectsRe(runs.regenerateItem(K4.cid, OWNER, 1, job4.id, `video:${K4.dc(1)}`, {}), /confirm_paid_required.*video_interactions/, 'cascada paga', 400);
+    });
+
+    await check('DB EV6 P2 fix 1 (C1): «Generar los cambios» en un curso con exámenes en BANCO reutiliza el banco (sin missing_role, carried con su tipo)', async () => {
+      const K5 = await makeCourse('05', 'Curso R5 banco');
+      await K5.insertBp(1, K5.spec);
+      // Blueprint 2: solo cambia el título de C3 (M2, sin examen) ⇒ exam:M1 REUSE, final_exam REGENERATE.
+      const sp2 = clone(K5.spec); sp2.chapters[2].title = 'C3 revisado';
+      await K5.insertBp(2, sp2);
+      const m5a = (await manifests.getOrCreate(K5.cid, OWNER, 1)).manifest;
+      await manifests.getOrCreate(K5.cid, OWNER, 2);
+      const job5 = await seedCompletedRun(K5.cid, m5a, 1, K5.spec, {}, { bankExams: true });
+      const p5 = await invalidation.getPlan(K5.cid, OWNER, 2, job5.id);
+      eq(p5.blockers, [], 'sin blockers');
+      eq([byKey(p5.plan)[K('exam', K5.dm(1))].action, byKey(p5.plan)[`final_exam:${K5.cid}`].action], ['REUSE', 'REGENERATE'], 'acciones');
+      const res = await runs.startRun(K5.cid, OWNER, 2, { fromRun: job5.id });
+      eq(res.created, true, 'run B creado (antes: reuse_missing_roles 409)');
+      const [ex] = await ds.query(`select status, carried_from_item_run_id from public.generation_item_runs where job_id = $1 and item_key = $2`, [res.run.id, K('exam', K5.dm(1))]);
+      eq([ex.status, !!ex.carried_from_item_run_id], ['completed', true], 'exam reutilizado');
+      const carried = await ds.query(`select type from public.artifacts where job_id = $1 and manifest_item_key = $2`, [res.run.id, K('exam', K5.dm(1))]);
+      eq(carried.map((x) => x.type), ['dynamic_exam_bank_json'], 'artifact carried = banco');
     });
 
     await check('DB fix round 1 I3: completar video_interactions registra la identidad del video vigente (output_summary.videoIdentity); sin video completado → 409', async () => {

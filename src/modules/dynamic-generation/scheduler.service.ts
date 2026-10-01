@@ -1009,6 +1009,12 @@ export class SchedulerService {
       if (artifactType === EXAM_BANK_ARTIFACT_TYPE && ctx.examChapters.length === 0) {
         throw new InternalServerErrorException(`v3_validation_context: el ${g.type} ${g.item_key} no tiene capítulos en el Manifest; no se completa sin validar`);
       }
+      if (artifactType === EXAM_BANK_ARTIFACT_TYPE && this.v3Reader) {
+        // Fix 1 (I1): la evidencia se verifica YA contra el dynamic_content_md vigente de cada capítulo
+        // (dependencias completadas del item): una evidencia falsa falla el item (reintentable, el
+        // ejecutor repara) en vez de trabar el empaque más tarde.
+        ctx.examChapterMd = await this.loadExamChapterMd(g, ctx.examChapters.map((c) => c.id));
+      }
     }
     if (g.type === 'activity') {
       // EV5-C: tipo esperado del Manifest congelado del run (h5pType o, legacy, hash).
@@ -1067,6 +1073,54 @@ export class SchedulerService {
       contentSha256: createHash('sha256').update(text, 'utf8').digest('hex'),
       summary: (r.summary ?? {}) as Record<string, unknown>,
     };
+  }
+
+  /**
+   * EV6 P2 fix 1 (I1): Markdown vigente de los capítulos de un examen (dynamic_content_md de la
+   * generación vigente completada de `content:<chapterId>` en este run). Falta alguno → 409
+   * (el examen depende de todos sus content; nunca se valida contra un capítulo ausente).
+   */
+  private async loadExamChapterMd(
+    g: { job_id: string; manifest_id: number; item_key: string; owner_id: string },
+    chapterIds: string[],
+  ): Promise<Map<string, string>> {
+    const keys = chapterIds.map((id) => `content:${id}`);
+    const rows: any[] = await this.dataSource.query(
+      `select d.item_key, d.id as item_run_id, a.id, a.type, a.storage_bucket, a.storage_path
+         from public.generation_item_runs d
+         join public.artifacts a on a.item_run_id = d.id and a.type = 'dynamic_content_md' and a.status is distinct from 'disabled'
+        where d.job_id = $1 and d.manifest_id = $2 and d.item_key = any($3::text[])
+          and d.status = 'completed' and ${latestGenerationPredicate('d')}
+        order by d.item_key, a.created_at desc, a.id`,
+      [g.job_id, g.manifest_id, keys],
+    );
+    const out = new Map<string, string>();
+    for (const r of rows) {
+      const chapterId = String(r.item_key).slice('content:'.length);
+      if (out.has(chapterId)) continue;
+      try {
+        out.set(
+          chapterId,
+          await (this.v3Reader as V3ArtifactTextReader).readText({
+            id: r.id, ownerId: g.owner_id, itemKey: r.item_key, itemRunId: r.item_run_id, type: r.type,
+            storageBucket: r.storage_bucket, storagePath: r.storage_path,
+          }),
+        );
+      } catch (err) {
+        throw new ServiceUnavailableException(
+          `v3_artifact_unreadable: no se pudo leer dynamic_content_md de ${r.item_key} para validar la evidencia de ${g.item_key}: ` +
+            (err instanceof Error ? err.message : String(err)),
+        );
+      }
+    }
+    const missing = chapterIds.filter((id) => !out.has(id));
+    if (missing.length) {
+      throw new ConflictException({
+        message: `exam_content_missing: ${g.item_key} no se valida sin el dynamic_content_md vigente de ${missing.map((id) => `content:${id}`).join(', ')}`,
+        code: 'exam_content_missing',
+      });
+    }
+    return out;
   }
 
   /** Datos del video completado (vigente) del capítulo: output_summary + metadata de su dynamic_video. */

@@ -56,8 +56,6 @@ export const EXAM_BANK_LIMITS = Object.freeze({
 });
 
 export const EXAM_BANK_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
-/** Opciones prohibidas (Moodle baraja las opciones). Byte-idéntica en el frontend. */
-export const EXAM_OPTION_FORBIDDEN_RE = /\b(todas|ninguna) (de )?las (anteriores|opciones)\b|todas son correctas/i;
 
 // ─── 1. Plan de slots ──────────────────────────────────────────────────────
 
@@ -184,18 +182,68 @@ export function expectedExamPlan(scope: ExamBankScope, chapters: ReadonlyArray<{
   return finalExamPlan(mods);
 }
 
-// ─── Normalización (F2 la replica) ──────────────────────────────────────────
+// ─── Normalización (F2 la replica byte a byte) ──────────────────────────────
 
-/** NFD, sin diacríticos, minúsculas, sin `*_#>\`[]()|`, espacios colapsados, trim. */
+/**
+ * Normalización de texto del contrato (evidencia, duplicados, lints). Pasos, EN ESTE ORDEN:
+ *  1. `normalize('NFD')` y quitar U+0300–U+036F (diacríticos); minúsculas.
+ *  2. Quitar invisibles: U+00AD (guion blando), U+200B–U+200D, U+2060, U+FEFF.
+ *  3. Por línea, quitar la viñeta inicial (con citas `>` delante):
+ *     `^[ \t>]*(?:[-+*•‣◦▪]|\d{1,3}[.)])[ \t]+` (flag m; •‣◦▪ = U+2022 U+2023 U+25E6 U+25AA).
+ *  4. Quitar los caracteres de Markdown `* _ # > \` [ ] ( ) |`.
+ *  5. Plegar tipografía: «»“”„‟″ → `"`; ‘’‚‛′‹› → `'`; ‐‑‒–—―− → `-`; … → `...`.
+ *  6. Colapsar `\s+` (incluye NBSP U+00A0, U+202F, U+2007…) a un espacio; trim.
+ */
 export function normalizeExamText(s: string): string {
   return String(s ?? '')
     .normalize('NFD')
-    .replace(/[̀-ͯ]/g, '')
+    .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
+    .replace(/[\u00ad\u200b-\u200d\u2060\ufeff]/g, '')
+    .replace(/^[ \t>]*(?:[-+*\u2022\u2023\u25e6\u25aa]|\d{1,3}[.)])[ \t]+/gm, '')
     .replace(/[*_#>`[\]()|]/g, '')
+    .replace(/[\u00ab\u00bb\u201c\u201d\u201e\u201f\u2033]/g, '"')
+    .replace(/[\u2018\u2019\u201a\u201b\u2032\u2039\u203a]/g, "'")
+    .replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, '-')
+    .replace(/\u2026/g, '...')
     .replace(/\s+/g, ' ')
     .trim();
 }
+
+/** Tokens de un texto ya normalizado: números con separadores decimales/miles como UN token; palabras. */
+export const EXAM_TOKEN_RE = /\p{N}+(?:[.,]\p{N}+)*|\p{L}+/gu;
+export function examTokens(normalized: string): string[] {
+  return normalized.match(EXAM_TOKEN_RE) ?? [];
+}
+
+/**
+ * ¿`inner` está contenido en `outer` por palabras completas? (secuencia contigua de tokens;
+ * «5 mg/L» NO está en «15 mg/L», «2 horas» NO está en «12 horas», «agua» SÍ está en «agua tibia»).
+ * Ambos se normalizan con `normalizeExamText`; un texto sin tokens nunca está contenido.
+ */
+export function examTextContains(outer: string, inner: string): boolean {
+  const o = examTokens(normalizeExamText(outer));
+  const i = examTokens(normalizeExamText(inner));
+  if (i.length === 0 || i.length > o.length) return false;
+  for (let k = 0; k + i.length <= o.length; k++) {
+    let ok = true;
+    for (let j = 0; j < i.length; j++) {
+      if (o[k + j] !== i[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
+/**
+ * Opciones prohibidas (Moodle baraja las opciones). Se aplica sobre `normalizeExamText(option)`
+ * (sin acentos, minúsculas). Byte-idéntica en el frontend.
+ */
+export const EXAM_OPTION_FORBIDDEN_RE =
+  /\b(?:todas|ninguna|ambas) (?:de )?(?:las |los )?(?:otras |otros |demas )?(?:anteriores|opciones|respuestas|alternativas|demas)\b|\b(?:todas|ambas|ninguna) (?:son|es) (?:correctas?|incorrectas?|validas?)\b|\b[a-e] y [a-e] (?:son )?correctas?\b/;
 
 // ─── Tipos del documento ────────────────────────────────────────────────────
 
@@ -236,23 +284,33 @@ export interface ExamBankV1 {
   questions: ExamBankQuestion[];
 }
 
+
 export interface ExamBankValidationContext {
   scope: ExamBankScope;
-  /** Capítulos del examen en orden del Manifest, con su módulo. */
+  /** Capítulos ACTUALES del examen en orden del Manifest, con su módulo (exam: los del módulo; final: todos). */
   chapters: ReadonlyArray<{ id: string; moduleId: string }>;
-  /** Markdown de cada capítulo (solo cuando está disponible: empaque). */
+  /** Markdown de cada capítulo (completeItem lee el dynamic_content_md vigente; el empaque también). */
   chapterMd?: ReadonlyMap<string, string>;
+  /**
+   * Origen del plan esperado:
+   *  - 'manifest' (default, completeItem): `doc.plan` debe ser EXACTAMENTE `expectedExamPlan(scope, chapters)`.
+   *  - 'frozen' (empaque, C2): se usa el plan CONGELADO del banco (bien formado) + pertenencia:
+   *    exam → cada capítulo del plan existe y sigue en el módulo del banco; final → cada módulo
+   *    del plan existe. Un reorden (capítulos dentro del módulo, módulos) no invalida el banco.
+   */
+  planSource?: 'manifest' | 'frozen';
 }
 
 export interface ExamBankValidationResult {
   ok: boolean;
   errors: ShellValidationError[];
-  /** Slots del plan esperado (= preguntas que ve el estudiante). */
+  /** Slots del plan usado (= preguntas que ve el estudiante). */
   slotCount: number;
   /** Preguntas del banco (0 si el documento no es legible). */
   bankSize: number;
+  /** Plan usado para validar (el del Manifest o el congelado; null si el congelado es inválido). */
+  plan: ExamPlanLeaf[] | null;
 }
-
 // ─── 3. Validación ──────────────────────────────────────────────────────────
 
 const TOP_KEYS = ['bankVersion', 'scope', 'moduleId', 'plan', 'questions'];
@@ -318,20 +376,65 @@ function sameLeaf(a: Record<string, unknown>, b: ExamPlanLeaf): boolean {
   return ka.length === kb.length && ka.every((k, i) => k === kb[i] && a[k] === (b as any)[k]);
 }
 
+
 /**
- * Valida un banco `dynamic_exam_bank_json` contra el contexto del examen (Manifest).
+ * Plan congelado del banco bien formado: lista no vacía de hojas con las claves exactas del scope,
+ * tipo válido, slots entero ≥ 1, sin hojas repetidas (dueño × tipo). null si no.
+ */
+export function wellFormedFrozenPlan(plan: unknown, scope: ExamBankScope): ExamPlanLeaf[] | null {
+  if (!Array.isArray(plan) || plan.length === 0) return null;
+  const ownerKey = scope === 'module' ? 'chapterId' : 'moduleId';
+  const seen = new Set<string>();
+  for (const l of plan) {
+    if (!isObj(l)) return null;
+    const keys = Object.keys(l).sort();
+    if (keys.join(',') !== [ownerKey, 'slots', 'type'].sort().join(',')) return null;
+    if (typeof l[ownerKey] !== 'string' || !l[ownerKey]) return null;
+    if (!(EXAM_QUESTION_TYPES as readonly string[]).includes(l.type)) return null;
+    if (!Number.isInteger(l.slots) || l.slots < 1) return null;
+    const k = `${l[ownerKey]}\u0000${l.type}`;
+    if (seen.has(k)) return null;
+    seen.add(k);
+  }
+  return plan.map((l) => ({ ...l })) as ExamPlanLeaf[];
+}
+
+/**
+ * Valida un banco `dynamic_exam_bank_json` contra el contexto del examen.
  * Códigos: MISSING_FIELD, UNKNOWN_FIELD, EXAM_BANK_SCHEMA, EXAM_BANK_PLAN,
  * EXAM_BANK_LEAF_COUNT, EXAM_BANK_DUPLICATE, EXAM_BANK_LENGTH_BIAS,
  * EXAM_BANK_OPTION_LINT, EXAM_BANK_TF_BALANCE, EXAM_BANK_MATCH, EXAM_BANK_EVIDENCE.
+ * Los mensajes de errores por pregunta o de banco citan los `id` de las preguntas.
  * Lanza SOLO si el contexto es inválido (bug de integración, no contenido).
  */
 export function validateExamBank(doc: unknown, ctx: ExamBankValidationContext): ExamBankValidationResult {
   if (ctx.scope !== 'module' && ctx.scope !== 'final') throw new Error(`EXAM_BANK_CONTEXT: scope inválido ${String(ctx.scope)}`);
   if (!ctx.chapters?.length) throw new Error('EXAM_BANK_CONTEXT: el examen no tiene capítulos');
-  const expectedPlan = expectedExamPlan(ctx.scope, ctx.chapters);
-  const slotCount = planSlotCount(expectedPlan);
+  const frozen = ctx.planSource === 'frozen';
   const E = new Errs();
-  const done = (bankSize: number): ExamBankValidationResult => ({ ok: E.list.length === 0, errors: E.list, slotCount, bankSize });
+  const chapterModule = new Map(ctx.chapters.map((c) => [c.id, c.moduleId]));
+  const examModule = ctx.scope === 'module' ? ctx.chapters[0].moduleId : null;
+
+  // Plan de referencia: el del Manifest (completeItem) o el congelado del banco (empaque).
+  let plan: ExamPlanLeaf[] | null = frozen ? null : expectedExamPlan(ctx.scope, ctx.chapters);
+  if (frozen && isObj(doc)) {
+    plan = wellFormedFrozenPlan(doc.plan, ctx.scope);
+    if (!plan && doc.plan !== undefined) E.push('$.plan', 'EXAM_BANK_PLAN', 'el plan congelado del banco no está bien formado');
+    if (plan) {
+      const currentModules = new Set(ctx.chapters.map((c) => c.moduleId));
+      for (const l of plan) {
+        if ('chapterId' in l) {
+          if (chapterModule.get(l.chapterId) !== examModule) {
+            E.push('$.plan', 'EXAM_BANK_PLAN', `el capítulo ${l.chapterId} del plan congelado ya no existe o ya no pertenece al módulo ${examModule}`);
+          }
+        } else if (!currentModules.has(l.moduleId)) {
+          E.push('$.plan', 'EXAM_BANK_PLAN', `el módulo ${l.moduleId} del plan congelado ya no existe en el curso`);
+        }
+      }
+    }
+  }
+  const slotCount = plan ? planSlotCount(plan) : 0;
+  const done = (bankSize: number): ExamBankValidationResult => ({ ok: E.list.length === 0, errors: E.list, slotCount, bankSize, plan });
 
   if (!isObj(doc)) {
     E.push('$', 'EXAM_BANK_SCHEMA', 'el banco debe ser un objeto JSON');
@@ -340,22 +443,20 @@ export function validateExamBank(doc: unknown, ctx: ExamBankValidationContext): 
   E.keys(doc, TOP_KEYS, '$');
   if (doc.bankVersion !== undefined && doc.bankVersion !== EXAM_BANK_VERSION) E.push('$.bankVersion', 'EXAM_BANK_SCHEMA', `bankVersion debe ser ${EXAM_BANK_VERSION}`);
   if (doc.scope !== undefined && doc.scope !== ctx.scope) E.push('$.scope', 'EXAM_BANK_SCHEMA', `scope debe ser "${ctx.scope}"`);
-  const chapterModule = new Map(ctx.chapters.map((c) => [c.id, c.moduleId]));
   if ('moduleId' in doc) {
     if (ctx.scope === 'module') {
-      const expectedModule = ctx.chapters[0].moduleId;
-      if (doc.moduleId !== expectedModule) E.push('$.moduleId', 'EXAM_BANK_SCHEMA', `moduleId debe ser "${expectedModule}"`);
+      if (doc.moduleId !== examModule) E.push('$.moduleId', 'EXAM_BANK_SCHEMA', `moduleId debe ser "${examModule}"`);
     } else if (doc.moduleId !== null) {
       E.push('$.moduleId', 'EXAM_BANK_SCHEMA', 'moduleId debe ser null en el examen final');
     }
   }
-
-  // Plan: idéntico (mismas hojas, mismo orden) al del servidor.
-  if (doc.plan !== undefined) {
+  if (!frozen && doc.plan !== undefined) {
     const p = doc.plan;
-    const same = Array.isArray(p) && p.length === expectedPlan.length && p.every((l, i) => isObj(l) && sameLeaf(l, expectedPlan[i]));
-    if (!same) E.push('$.plan', 'EXAM_BANK_PLAN', `el plan no coincide con el del Manifest (${JSON.stringify(expectedPlan)})`);
+    const exp = plan as ExamPlanLeaf[];
+    const same = Array.isArray(p) && p.length === exp.length && p.every((l, i) => isObj(l) && sameLeaf(l, exp[i]));
+    if (!same) E.push('$.plan', 'EXAM_BANK_PLAN', `el plan no coincide con el del Manifest (${JSON.stringify(exp)})`);
   }
+  const planModules = new Set((plan ?? []).filter((l): l is FinalExamLeaf => 'moduleId' in l).map((l) => l.moduleId));
 
   if (doc.questions === undefined) return done(0);
   if (!Array.isArray(doc.questions)) {
@@ -363,6 +464,8 @@ export function validateExamBank(doc: unknown, ctx: ExamBankValidationContext): 
     return done(0);
   }
   const questions: unknown[] = doc.questions;
+  const str = (v: unknown): string => (typeof v === 'string' ? v : '');
+  const idOf = (q: Record<string, any>, i: number): string => (typeof q.id === 'string' && q.id ? q.id : `#${i}`);
 
   // ── Esquema por pregunta ──
   const valid: Array<{ q: Record<string, any>; i: number; type: ExamQuestionType | null }> = [];
@@ -373,17 +476,24 @@ export function validateExamBank(doc: unknown, ctx: ExamBankValidationContext): 
       return;
     }
     const type = (EXAM_QUESTION_TYPES as readonly string[]).includes(q.type) ? (q.type as ExamQuestionType) : null;
-    if (q.type !== undefined && !type) E.push(`${path}.type`, 'EXAM_BANK_SCHEMA', `type debe ser ${EXAM_QUESTION_TYPES.join('|')}`);
+    if (q.type !== undefined && !type) E.push(`${path}.type`, 'EXAM_BANK_SCHEMA', `${idOf(q, i)}: type debe ser ${EXAM_QUESTION_TYPES.join('|')}`);
     const allowed = [...COMMON_KEYS, ...(ctx.scope === 'final' ? ['moduleId'] : []), ...(type ? TYPE_KEYS[type] : [])];
     E.keys(q, allowed, path);
     if (q.id !== undefined && (typeof q.id !== 'string' || !EXAM_BANK_ID_RE.test(q.id))) E.push(`${path}.id`, 'EXAM_BANK_SCHEMA', 'id debe cumplir /^[A-Za-z0-9_-]{1,40}$/');
     if (q.chapterId !== undefined && (typeof q.chapterId !== 'string' || !chapterModule.has(q.chapterId))) {
-      E.push(`${path}.chapterId`, 'EXAM_BANK_SCHEMA', 'chapterId no es un capítulo de este examen');
+      E.push(`${path}.chapterId`, 'EXAM_BANK_SCHEMA', `${idOf(q, i)}: chapterId no es un capítulo de este examen`);
     }
-    if (ctx.scope === 'final' && q.moduleId !== undefined && typeof q.chapterId === 'string' && chapterModule.has(q.chapterId) && q.moduleId !== chapterModule.get(q.chapterId)) {
-      E.push(`${path}.moduleId`, 'EXAM_BANK_SCHEMA', `moduleId debe ser el módulo del capítulo ("${chapterModule.get(q.chapterId)}")`);
+    if (ctx.scope === 'final' && q.moduleId !== undefined) {
+      if (frozen) {
+        // C2: el módulo declarado es el de la hoja congelada (el capítulo pudo cambiar de módulo después).
+        if (typeof q.moduleId !== 'string' || !planModules.has(q.moduleId)) {
+          E.push(`${path}.moduleId`, 'EXAM_BANK_SCHEMA', `${idOf(q, i)}: moduleId no es un módulo del plan congelado`);
+        }
+      } else if (typeof q.chapterId === 'string' && chapterModule.has(q.chapterId) && q.moduleId !== chapterModule.get(q.chapterId)) {
+        E.push(`${path}.moduleId`, 'EXAM_BANK_SCHEMA', `${idOf(q, i)}: moduleId debe ser el módulo del capítulo ("${chapterModule.get(q.chapterId)}")`);
+      }
     }
-    if (q.level !== undefined && !(EXAM_LEVELS as readonly string[]).includes(q.level)) E.push(`${path}.level`, 'EXAM_BANK_SCHEMA', `level debe ser ${EXAM_LEVELS.join('|')}`);
+    if (q.level !== undefined && !(EXAM_LEVELS as readonly string[]).includes(q.level)) E.push(`${path}.level`, 'EXAM_BANK_SCHEMA', `${idOf(q, i)}: level debe ser ${EXAM_LEVELS.join('|')}`);
     E.text(q.stem, `${path}.stem`, EXAM_BANK_LIMITS.stem);
     E.text(q.explanation, `${path}.explanation`, EXAM_BANK_LIMITS.explanation);
     E.text(q.evidence, `${path}.evidence`, EXAM_BANK_LIMITS.evidence);
@@ -391,17 +501,17 @@ export function validateExamBank(doc: unknown, ctx: ExamBankValidationContext): 
       E.option(q.correct, `${path}.correct`);
       if (q.distractors !== undefined) {
         if (!Array.isArray(q.distractors) || q.distractors.length !== EXAM_BANK_LIMITS.distractors) {
-          E.push(`${path}.distractors`, 'EXAM_BANK_SCHEMA', `se esperaban exactamente ${EXAM_BANK_LIMITS.distractors} distractores`);
+          E.push(`${path}.distractors`, 'EXAM_BANK_SCHEMA', `${idOf(q, i)}: se esperaban exactamente ${EXAM_BANK_LIMITS.distractors} distractores`);
         } else q.distractors.forEach((d: unknown, j: number) => E.option(d, `${path}.distractors[${j}]`));
       }
     } else if (type === 'truefalse') {
-      if (q.answer !== undefined && typeof q.answer !== 'boolean') E.push(`${path}.answer`, 'EXAM_BANK_SCHEMA', 'answer debe ser booleano');
+      if (q.answer !== undefined && typeof q.answer !== 'boolean') E.push(`${path}.answer`, 'EXAM_BANK_SCHEMA', `${idOf(q, i)}: answer debe ser booleano`);
       E.text(q.whyWrong, `${path}.whyWrong`, EXAM_BANK_LIMITS.whyWrong);
     } else if (type === 'match') {
       if (q.pairs !== undefined) {
         const [pmin, pmax] = EXAM_BANK_LIMITS.pairs;
         if (!Array.isArray(q.pairs) || q.pairs.length < pmin || q.pairs.length > pmax) {
-          E.push(`${path}.pairs`, 'EXAM_BANK_SCHEMA', `se esperaban ${pmin}–${pmax} pares`);
+          E.push(`${path}.pairs`, 'EXAM_BANK_SCHEMA', `${idOf(q, i)}: se esperaban ${pmin}–${pmax} pares`);
         } else {
           q.pairs.forEach((p: unknown, j: number) => {
             const pp = `${path}.pairs[${j}]`;
@@ -416,20 +526,18 @@ export function validateExamBank(doc: unknown, ctx: ExamBankValidationContext): 
     valid.push({ q, i, type });
   });
 
-  const str = (v: unknown): string => (typeof v === 'string' ? v : '');
-
   // ── Duplicados (id, enunciado normalizado) ──
   const seenId = new Map<string, number>();
-  const seenStem = new Map<string, number>();
+  const seenStem = new Map<string, string>();
   for (const { q, i } of valid) {
     if (typeof q.id === 'string') {
-      if (seenId.has(q.id)) E.push(`$.questions[${i}].id`, 'EXAM_BANK_DUPLICATE', `id "${q.id}" repetido (pregunta ${seenId.get(q.id)})`);
+      if (seenId.has(q.id)) E.push(`$.questions[${i}].id`, 'EXAM_BANK_DUPLICATE', `id "${q.id}" repetido (preguntas ${seenId.get(q.id)} y ${i})`);
       else seenId.set(q.id, i);
     }
     const ns = normalizeExamText(str(q.stem));
     if (ns) {
-      if (seenStem.has(ns)) E.push(`$.questions[${i}].stem`, 'EXAM_BANK_DUPLICATE', `enunciado repetido (pregunta ${seenStem.get(ns)})`);
-      else seenStem.set(ns, i);
+      if (seenStem.has(ns)) E.push(`$.questions[${i}].stem`, 'EXAM_BANK_DUPLICATE', `${idOf(q, i)}: enunciado repetido de ${seenStem.get(ns)}`);
+      else seenStem.set(ns, idOf(q, i));
     }
   }
 
@@ -437,102 +545,110 @@ export function validateExamBank(doc: unknown, ctx: ExamBankValidationContext): 
   const leafKey = (owner: string, type: string) => `${owner}\u0000${type}`;
   const ownerOf = (q: Record<string, any>): string | null => {
     if (typeof q.chapterId !== 'string' || !chapterModule.has(q.chapterId)) return null;
-    return ctx.scope === 'module' ? q.chapterId : (chapterModule.get(q.chapterId) as string);
+    if (ctx.scope === 'module') return q.chapterId;
+    if (frozen) return typeof q.moduleId === 'string' && planModules.has(q.moduleId) ? q.moduleId : null;
+    return chapterModule.get(q.chapterId) as string;
   };
-  const byLeaf = new Map<string, number>();
-  for (const { q, type } of valid) {
+  const byLeaf = new Map<string, string[]>();
+  for (const { q, i, type } of valid) {
     const owner = ownerOf(q);
     if (!owner || !type) continue;
-    byLeaf.set(leafKey(owner, type), (byLeaf.get(leafKey(owner, type)) ?? 0) + 1);
+    const k = leafKey(owner, type);
+    byLeaf.set(k, [...(byLeaf.get(k) ?? []), idOf(q, i)]);
   }
-  const planned = new Set<string>();
-  for (const leaf of expectedPlan) {
-    const owner = 'chapterId' in leaf ? leaf.chapterId : leaf.moduleId;
-    const k = leafKey(owner, leaf.type);
-    planned.add(k);
-    const n = byLeaf.get(k) ?? 0;
-    const min = bankFloor(leaf.slots);
-    const max = bankMax(leaf.slots);
-    if (n < min || n > max) {
-      E.push('$.questions', 'EXAM_BANK_LEAF_COUNT', `${owner} × ${leaf.type}: ${n} preguntas, se esperaban ${min}–${max} (slots ${leaf.slots})`);
+  if (plan) {
+    const planned = new Set<string>();
+    for (const leaf of plan) {
+      const owner = 'chapterId' in leaf ? leaf.chapterId : leaf.moduleId;
+      const k = leafKey(owner, leaf.type);
+      planned.add(k);
+      const n = byLeaf.get(k)?.length ?? 0;
+      const min = bankFloor(leaf.slots);
+      const max = bankMax(leaf.slots);
+      if (n < min || n > max) {
+        E.push('$.questions', 'EXAM_BANK_LEAF_COUNT', `${owner} × ${leaf.type}: ${n} preguntas, se esperaban ${min}–${max} (slots ${leaf.slots})`);
+      }
     }
-  }
-  for (const [k, n] of byLeaf) {
-    if (!planned.has(k)) {
-      const [owner, type] = k.split('\u0000');
-      E.push('$.questions', 'EXAM_BANK_LEAF_COUNT', `${owner} × ${type}: ${n} preguntas fuera del plan (la hoja no tiene slots)`);
+    for (const [k, ids] of byLeaf) {
+      if (!planned.has(k)) {
+        const [owner, type] = k.split('\u0000');
+        E.push('$.questions', 'EXAM_BANK_LEAF_COUNT', `${owner} × ${type}: ${ids.length} preguntas fuera del plan (${ids.join(', ')})`);
+      }
     }
   }
 
   // ── Selección múltiple: sesgo de longitud + lint de opciones ──
   let mcTotal = 0;
-  let correctLongest = 0;
+  const longestIds: string[] = [];
   for (const { q, i, type } of valid) {
     if (type !== 'multichoice') continue;
     if (!isObj(q.correct) || typeof q.correct.text !== 'string' || !Array.isArray(q.distractors)) continue;
     const distractors = q.distractors.filter((d: unknown) => isObj(d) && typeof (d as any).text === 'string') as ExamOption[];
     if (distractors.length !== q.distractors.length || distractors.length === 0) continue;
     const path = `$.questions[${i}]`;
+    const id = idOf(q, i);
     const c = len(q.correct.text);
     const longestD = Math.max(...distractors.map((d) => len(d.text)));
     mcTotal++;
-    if (c > longestD) correctLongest++;
+    if (c > longestD) longestIds.push(id);
     if (c - longestD >= 8 && 100 * (c - longestD) >= 15 * longestD) {
-      E.push(`${path}.correct.text`, 'EXAM_BANK_LENGTH_BIAS', `la correcta (${c}) supera al distractor más largo (${longestD}) por ≥ 8 caracteres y ≥ 15 %`);
+      E.push(`${path}.correct.text`, 'EXAM_BANK_LENGTH_BIAS', `${id}: la correcta (${c}) supera al distractor más largo (${longestD}) por ≥ 8 caracteres y ≥ 15 %`);
     }
     const options = [q.correct.text, ...distractors.map((d) => d.text)];
     options.forEach((t, j) => {
-      if (EXAM_OPTION_FORBIDDEN_RE.test(t)) {
-        E.push(j === 0 ? `${path}.correct.text` : `${path}.distractors[${j - 1}].text`, 'EXAM_BANK_OPTION_LINT', 'opción del tipo «todas/ninguna de las anteriores»');
+      if (EXAM_OPTION_FORBIDDEN_RE.test(normalizeExamText(t))) {
+        E.push(j === 0 ? `${path}.correct.text` : `${path}.distractors[${j - 1}].text`, 'EXAM_BANK_OPTION_LINT', `${id}: opción del tipo «todas/ninguna de las anteriores»`);
       }
     });
     const norm = options.map(normalizeExamText);
-    for (let a = 0; a < norm.length; a++) {
-      for (let b = a + 1; b < norm.length; b++) {
+    for (let a = 0; a < options.length; a++) {
+      for (let b = a + 1; b < options.length; b++) {
         if (!norm[a] || !norm[b]) continue;
-        if (norm[a] === norm[b] || norm[a].includes(norm[b]) || norm[b].includes(norm[a])) {
-          E.push(`${path}`, 'EXAM_BANK_OPTION_LINT', `las opciones ${a} y ${b} son iguales o una contiene a la otra`);
+        if (norm[a] === norm[b] || examTextContains(options[a], options[b]) || examTextContains(options[b], options[a])) {
+          E.push(path, 'EXAM_BANK_OPTION_LINT', `${id}: las opciones ${a} y ${b} son iguales o una contiene a la otra (palabras completas)`);
         }
       }
     }
   }
-  if (mcTotal > 0 && 10 * correctLongest > 3 * mcTotal) {
-    E.push('$.questions', 'EXAM_BANK_LENGTH_BIAS', `la correcta es la opción más larga en ${correctLongest}/${mcTotal} preguntas (> 30 %)`);
+  if (mcTotal > 0 && 10 * longestIds.length > 3 * mcTotal) {
+    E.push('$.questions', 'EXAM_BANK_LENGTH_BIAS', `la correcta es la opción más larga en ${longestIds.length}/${mcTotal} preguntas (> 30 %): ${longestIds.join(', ')}`);
   }
 
   // ── Verdadero/falso: balance por hoja (capítulo en módulo, módulo en final) ──
-  const tf = new Map<string, { t: number; n: number }>();
-  for (const { q, type } of valid) {
+  const tf = new Map<string, { t: string[]; f: string[] }>();
+  for (const { q, i, type } of valid) {
     if (type !== 'truefalse' || typeof q.answer !== 'boolean') continue;
     const owner = ownerOf(q);
     if (!owner) continue;
-    const s = tf.get(owner) ?? { t: 0, n: 0 };
-    s.n++;
-    if (q.answer) s.t++;
+    const s = tf.get(owner) ?? { t: [], f: [] };
+    (q.answer ? s.t : s.f).push(idOf(q, i));
     tf.set(owner, s);
   }
-  for (const [owner, { t, n }] of tf) {
+  for (const [owner, { t: ts, f: fs }] of tf) {
+    const t = ts.length;
+    const n = t + fs.length;
     if (n >= 4 && (5 * t < 2 * n || 5 * t > 3 * n)) {
-      E.push('$.questions', 'EXAM_BANK_TF_BALANCE', `${owner}: ${t}/${n} verdaderas (fuera de 40–60 %)`);
+      E.push('$.questions', 'EXAM_BANK_TF_BALANCE', `${owner}: ${t}/${n} verdaderas (fuera de 40–60 %); verdaderas: ${ts.join(', ') || '—'}; falsas: ${fs.join(', ') || '—'}`);
     } else if (n >= 2 && n <= 3 && (t === 0 || t === n)) {
-      E.push('$.questions', 'EXAM_BANK_TF_BALANCE', `${owner}: ${n} preguntas V/F todas con la misma respuesta`);
+      E.push('$.questions', 'EXAM_BANK_TF_BALANCE', `${owner}: ${n} preguntas V/F todas ${t ? 'verdaderas' : 'falsas'} (${[...ts, ...fs].join(', ')})`);
     }
   }
 
   // ── Emparejamiento ──
   for (const { q, i, type } of valid) {
     if (type !== 'match' || !Array.isArray(q.pairs)) continue;
+    const id = idOf(q, i);
     const pairs = q.pairs.filter((p: unknown) => isObj(p) && typeof (p as any).term === 'string' && typeof (p as any).definition === 'string');
     const terms = pairs.map((p: any) => normalizeExamText(p.term));
     const defs = pairs.map((p: any) => normalizeExamText(p.definition));
-    if (new Set(terms).size !== terms.length) E.push(`$.questions[${i}].pairs`, 'EXAM_BANK_MATCH', 'términos repetidos');
-    if (new Set(defs).size !== defs.length) E.push(`$.questions[${i}].pairs`, 'EXAM_BANK_MATCH', 'definiciones repetidas');
-    terms.forEach((t: string, j: number) => {
-      if (t && defs[j].includes(t)) E.push(`$.questions[${i}].pairs[${j}]`, 'EXAM_BANK_MATCH', 'la definición contiene su propio término');
+    if (new Set(terms).size !== terms.length) E.push(`$.questions[${i}].pairs`, 'EXAM_BANK_MATCH', `${id}: términos repetidos`);
+    if (new Set(defs).size !== defs.length) E.push(`$.questions[${i}].pairs`, 'EXAM_BANK_MATCH', `${id}: definiciones repetidas`);
+    pairs.forEach((p: any, j: number) => {
+      if (examTextContains(p.definition, p.term)) E.push(`$.questions[${i}].pairs[${j}]`, 'EXAM_BANK_MATCH', `${id}: la definición contiene su propio término`);
     });
   }
 
-  // ── Evidencia en el capítulo (solo si hay Markdown) ──
+  // ── Evidencia en el capítulo (si hay Markdown) ──
   if (ctx.chapterMd) {
     const normMd = new Map<string, string>();
     for (const { q, i } of valid) {
@@ -542,7 +658,7 @@ export function validateExamBank(doc: unknown, ctx: ExamBankValidationContext): 
       if (!normMd.has(q.chapterId)) normMd.set(q.chapterId, normalizeExamText(md));
       const ev = normalizeExamText(q.evidence);
       if (!ev || !(normMd.get(q.chapterId) as string).includes(ev)) {
-        E.push(`$.questions[${i}].evidence`, 'EXAM_BANK_EVIDENCE', 'la evidencia no aparece en el texto del capítulo');
+        E.push(`$.questions[${i}].evidence`, 'EXAM_BANK_EVIDENCE', `${idOf(q, i)}: la evidencia no aparece en el texto del capítulo ${q.chapterId}`);
       }
     }
   }

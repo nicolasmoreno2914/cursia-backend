@@ -85,6 +85,8 @@ export interface V3ItemValidationContext {
   artifactType?: string | null;
   /** EV6 P2: capítulos del examen (orden del Manifest congelado) con su módulo; exigidos para validar un banco. */
   examChapters?: Array<{ id: string; moduleId: string }>;
+  /** EV6 P2 fix 1 (I1): Markdown vigente (dynamic_content_md) de los capítulos del examen → EXAM_BANK_EVIDENCE al completar. */
+  examChapterMd?: ReadonlyMap<string, string>;
 }
 
 /**
@@ -152,7 +154,11 @@ export function validateV3ItemArtifact(ctx: V3ItemValidationContext, text: strin
     }
     const parsedBank = parseJson(text);
     if (parsedBank.ok === false) return { ok: false, errors: [parsedBank.error] };
-    const r = validateExamBank(parsedBank.value, { scope: ctx.type === 'exam' ? 'module' : 'final', chapters: ctx.examChapters });
+    const r = validateExamBank(parsedBank.value, {
+      scope: ctx.type === 'exam' ? 'module' : 'final',
+      chapters: ctx.examChapters,
+      ...(ctx.examChapterMd ? { chapterMd: ctx.examChapterMd } : {}),
+    });
     // questionCount = slots (lo que ve el estudiante), no el tamaño del banco.
     return { ok: r.ok, errors: r.errors, summary: { questionCount: r.slotCount, bankSize: r.bankSize, bankVersion: EXAM_BANK_VERSION } };
   }

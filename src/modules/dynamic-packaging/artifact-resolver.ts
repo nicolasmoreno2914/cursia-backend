@@ -127,6 +127,24 @@ export function resolveRequiredArtifactTypesV3(
   return { ok: true, types: base.map((t) => (alts.includes(t) ? found[0] : t)) };
 }
 
+/**
+ * EV6 P2 (fix 1, C1): roles obligatorios según el rulesVersion resueltos contra los tipos
+ * PRESENTES (reuso / invalidación). v3: `resolveRequiredArtifactTypesV3`; ambiguo (banco y
+ * GIFT a la vez) → un rol imposible `EXAM_ARTIFACT_AMBIGUOUS` (se reporta como faltante).
+ * v1/v2: igual que `requiredArtifactTypes`.
+ */
+export function requiredArtifactTypesForPresent(
+  rulesVersion: number,
+  type: ManifestItemType,
+  variant: string | null | undefined,
+  present: Iterable<string> | undefined,
+): string[] | undefined {
+  if (rulesVersion !== 3 || !present) return requiredArtifactTypes(rulesVersion, type, variant);
+  const r = resolveRequiredArtifactTypesV3(type, variant, present);
+  if (!r) return undefined;
+  return r.ok ? r.types : ['EXAM_ARTIFACT_AMBIGUOUS'];
+}
+
 /** Nombre legible de un rol faltante (las alternativas se listan juntas). */
 export function missingRoleLabelV3(type: ManifestItemType | string, role: string): string {
   const alts = artifactAlternativesV3(type);

@@ -159,16 +159,30 @@ async function main() {
     eq([1, 2, 5].map(EB.bankMax), [4, 6, 12], 'máximo 2s+2');
   });
 
-  await check('normalizeExamText: NFD sin diacríticos, minúsculas, sin *_#>`[]()|, espacios colapsados (valores dorados para el frontend)', () => {
+  await check('normalizeExamText: NFD sin diacríticos, minúsculas, invisibles, viñetas, sin *_#>`[]()|, tipografía plegada, espacios colapsados (valores dorados para el frontend)', () => {
     const gold = [
       ['  **Árbol**  de\n\tdecisión  ', 'arbol de decision'],
       ['> Nota: el `PH` [ver](x) | Ñandú_2 #tag', 'nota: el ph verx nandu2 tag'],
-      ['Señal — “única”, 30 %', 'senal — “unica”, 30 %'],
+      ['Señal \u2014 \u201cúnica\u201d, 30\u00a0%', 'senal - "unica", 30 %'],
+      ['\u00abHola\u00bb \u2018tú\u2019 \u2013 fin\u00ad! \u2026', '"hola" \'tu\' - fin! ...'],
+      ['- 1. Primero\n2) Segundo\u202fpaso\n* tercero\n  + cuarto\n> - cita\n\u2022 punto', '1. primero segundo paso tercero cuarto cita punto'],
+      ['**Regla 1:** texto\u200b', 'regla 1: texto'],
       ['', ''],
     ];
     for (const [i, o] of gold) eq(EB.normalizeExamText(i), o, JSON.stringify(i));
-    eq(EB.EXAM_OPTION_FORBIDDEN_RE.source, '\\b(todas|ninguna) (de )?las (anteriores|opciones)\\b|todas son correctas', 'regex literal (byte-idéntica en F2)');
-    eq(EB.EXAM_OPTION_FORBIDDEN_RE.flags, 'i', 'flags');
+    // evidencia que cruza dos viñetas del capítulo
+    const md = '- **Paso 1:** cerrar la válvula principal.\n- **Paso 2:** abrir la purga lentamente.';
+    assert(EB.normalizeExamText(md).includes(EB.normalizeExamText('Paso 1: cerrar la válvula principal. Paso 2: abrir la purga')), 'evidencia entre viñetas');
+    // el fuente no tiene caracteres combinantes crudos (M6): todo escape \uXXXX
+    const src = fs.readFileSync(path.join(ROOT, 'src/modules/course-shell/exam-bank.ts'), 'utf8');
+    const fn = src.slice(src.indexOf('export function normalizeExamText'), src.indexOf('/** Tokens de un texto'));
+    assert(/^[\x00-\x7f]*$/.test(fn), 'normalizeExamText con caracteres no ASCII en el fuente');
+    eq(EB.EXAM_OPTION_FORBIDDEN_RE.source,
+      '\\b(?:todas|ninguna|ambas) (?:de )?(?:las |los )?(?:otras |otros |demas )?(?:anteriores|opciones|respuestas|alternativas|demas)\\b|\\b(?:todas|ambas|ninguna) (?:son|es) (?:correctas?|incorrectas?|validas?)\\b|\\b[a-e] y [a-e] (?:son )?correctas?\\b',
+      'regex literal (byte-idéntica en F2)');
+    eq(EB.EXAM_OPTION_FORBIDDEN_RE.flags, '', 'flags (se aplica al texto normalizado)');
+    eq(EB.EXAM_TOKEN_RE.source, '\\p{N}+(?:[.,]\\p{N}+)*|\\p{L}+', 'regex de tokens');
+    eq(EB.EXAM_TOKEN_RE.flags, 'gu', 'flags tokens');
     eq(EB.EXAM_BANK_ID_RE.source, '^[A-Za-z0-9_-]{1,40}$', 'regex id');
   });
 
@@ -259,6 +273,79 @@ async function main() {
     let threw = false; try { EB.validateExamBank(MOD, { scope: 'module', chapters: [] }); } catch (e) { threw = /EXAM_BANK_CONTEXT/.test(e.message); } assert(threw, 'contexto sin capítulos lanza');
   });
 
+  await check('lints por palabras completas (I2/M4) y opciones prohibidas (M3)', () => {
+    const C = EB.examTextContains;
+    eq([C('15 mg/L de cloro libre', '5 mg/L de cloro libre'), C('50 mg/L', '5 mg/L'), C('12 horas', '2 horas'), C('2,5 horas', '5 horas'), C('Fosfato (phosphate)', 'pH')],
+      [false, false, false, false, false], 'no contenidos');
+    eq([C('agua tibia', 'agua'), C('Agua  TIBIA.', 'agua tibia'), C('el pH del agua', 'pH'), C('cerrar la válvula', 'Válvula')], [true, true, true, true], 'contenidos');
+    eq(C('algo', ''), false, 'vacío');
+    const F = (t) => EB.EXAM_OPTION_FORBIDDEN_RE.test(EB.normalizeExamText(t));
+    for (const t of ['Ninguna de las anteriores', 'Todas las anteriores', 'Todas son correctas', 'Ninguna es correcta', 'Todas las respuestas anteriores',
+      'Ninguna de las otras opciones', 'A y B son correctas', 'b y c correctas', 'Ambas son válidas', 'Todas las demás', 'NINGUNA DE LAS ALTERNATIVAS']) assert(F(t), `prohibida: ${t}`);
+    for (const t of ['Revisar todas las válvulas', 'Ninguna válvula abierta', 'Ambas bombas en paralelo', 'Las respuestas del equipo']) assert(!F(t), `permitida: ${t}`);
+    // en un banco: distractores numéricos con la misma unidad pasan
+    const d = clone(MOD);
+    const q = d.questions[0];
+    q.correct.text = '5 mg/L de cloro libre';
+    q.distractors = [{ text: '15 mg/L de cloro libre', why: q.distractors[0].why }, { text: '50 mg/L de cloro libre', why: q.distractors[1].why }, { text: '0,5 mg/L de cloro libre', why: q.distractors[2].why }];
+    eq(codes(vMod(d)), [], 'numéricos misma unidad');
+    q.distractors[0].text = '5 mg/L de cloro libre con agua tibia';
+    assert(codes(vMod(d)).includes('EXAM_BANK_OPTION_LINT'), 'contención real');
+  });
+
+  await check('mensajes con ids de pregunta (M5): duplicados, conteo fuera del plan, balance V/F, sesgo de longitud', () => {
+    const d = clone(MOD);
+    d.questions[1].stem = d.questions[0].stem;
+    const tf = d.questions.filter((q) => q.type === 'truefalse' && q.chapterId === ch(1));
+    tf.forEach((q) => { q.answer = true; });
+    d.questions.filter((q) => q.type === 'multichoice').slice(0, 10).forEach((q) => { q.correct.text = q.correct.text.replace('Revisar', 'Revisarlo'); });
+    const r = vMod(d);
+    const msg = (code) => r.errors.filter((e) => e.code === code).map((e) => e.message).join(' | ');
+    assert(msg('EXAM_BANK_DUPLICATE').includes(d.questions[1].id) && msg('EXAM_BANK_DUPLICATE').includes(d.questions[0].id), msg('EXAM_BANK_DUPLICATE'));
+    assert(tf.every((q) => msg('EXAM_BANK_TF_BALANCE').includes(q.id)), msg('EXAM_BANK_TF_BALANCE'));
+    assert(msg('EXAM_BANK_LENGTH_BIAS').includes(d.questions[0].id), msg('EXAM_BANK_LENGTH_BIAS'));
+  });
+
+  await check('C2: el empaque valida el banco contra SU plan congelado + pertenencia (planSource frozen); completeItem exige el plan del Manifest', () => {
+    const fz = (doc, scope, chapters) => EB.validateExamBank(doc, { scope, chapters, chapterMd: MD, planSource: 'frozen' });
+    const rev = [...MOD_CH].reverse();
+    // reorden de capítulos dentro del módulo: Manifest ≠, congelado OK
+    assert(codes(EB.validateExamBank(MOD, { scope: 'module', chapters: rev, chapterMd: MD })).includes('EXAM_BANK_PLAN'), 'manifest: reorden ≠ plan');
+    const r1 = fz(MOD, 'module', rev);
+    eq([r1.ok, r1.slotCount, r1.plan], [true, 25, MOD.plan], 'módulo reordenado (congelado)');
+    // módulos reordenados / capítulo movido entre módulos que siguen existiendo: el final empaqueta
+    const reMods = [...ALL_CH.filter((c) => c.moduleId === M2), ...ALL_CH.filter((c) => c.moduleId === M1)];
+    eq(fz(FIN, 'final', reMods).ok, true, 'final, módulos reordenados');
+    const moved = ALL_CH.map((c) => (c.id === ch(3) ? { ...c, moduleId: M2 } : c));
+    eq(fz(FIN, 'final', moved).ok, true, 'final, capítulo movido (módulos existentes)');
+    assert(!EB.validateExamBank(FIN, { scope: 'final', chapters: moved }).ok, 'manifest: movido ≠ plan');
+    // pertenencia rota: falla fuerte (la invalidación ya regeneró el examen en estos casos)
+    const gone = MOD_CH.filter((c) => c.id !== ch(2));
+    assert(codes(fz(MOD, 'module', gone)).includes('EXAM_BANK_PLAN'), 'capítulo borrado del módulo');
+    const out = MOD_CH.map((c) => (c.id === ch(2) ? { ...c, moduleId: M2 } : c));
+    assert(codes(fz(MOD, 'module', out.filter((c) => c.moduleId === M1))).includes('EXAM_BANK_PLAN'), 'capítulo movido fuera del módulo');
+    const noM2 = ALL_CH.map((c) => ({ ...c, moduleId: M1 }));
+    assert(codes(fz(FIN, 'final', noM2)).includes('EXAM_BANK_PLAN'), 'módulo del plan inexistente');
+    // plan congelado mal formado
+    for (const bad of [[], [{ chapterId: ch(1), type: 'multichoice', slots: 0 }], [{ chapterId: ch(1), type: 'x', slots: 1 }], [{ moduleId: M1, type: 'multichoice', slots: 1 }],
+      [...MOD.plan, MOD.plan[0]]]) {
+      const d = clone(MOD); d.plan = bad;
+      assert(codes(fz(d, 'module', MOD_CH)).includes('EXAM_BANK_PLAN'), `mal formado ${JSON.stringify(bad).slice(0, 60)}`);
+    }
+    // el plan congelado manda en los conteos: un plan propio coherente y su banco empaquetan aunque el Manifest diga otra cosa
+    const small = EBF.makeExamBank({ scope: 'module', moduleId: M1, chapters: MOD_CH, plan: EB.moduleExamPlan([ch(2), ch(1), ch(3)]) });
+    eq(fz(small, 'module', MOD_CH).ok, true, 'plan propio (otro orden)');
+  });
+
+  await check('p2probe/reorder.js: las 3 variantes del review empaquetan con el plan congelado', () => {
+    const m1 = MOD_CH;
+    const mods = [M1, M2];
+    const reMods = [...ALL_CH.filter((c) => c.moduleId === mods[1]), ...ALL_CH.filter((c) => c.moduleId === mods[0])];
+    const moved = ALL_CH.map((c, i) => (i === 2 ? { ...c, moduleId: mods[1] } : c));
+    const fz = (doc, scope, chapters) => codes(EB.validateExamBank(doc, { scope, chapters, chapterMd: MD, planSource: 'frozen' }));
+    eq([fz(MOD, 'module', [...m1].reverse()), fz(FIN, 'final', reMods), fz(FIN, 'final', moved)], [[], [], []], 'sin errores');
+  });
+
   // ── 3. Dispatcher server-side + roles ──
   await check('validateV3ItemArtifact: banco de exam (questionCount = 25 slots) y final_exam (40); GIFT final como siempre; GIFT de módulo sin validación', () => {
     eq([S.v3ValidatedArtifactTypes('exam'), S.v3ValidatedArtifactTypes('final_exam'), S.v3ValidatedArtifactTypes('content'), S.v3ValidatedArtifactTypes('activity', 'h5p')],
@@ -330,7 +417,7 @@ async function main() {
     const bankFor = (type, moduleId) => {
       const chs = type === 'exam' ? allChapters.filter((c) => c.moduleId === moduleId) : allChapters;
       const bank = EBF.makeExamBank({ scope: type === 'exam' ? 'module' : 'final', moduleId: type === 'exam' ? moduleId : null, chapters: chs, chapterIndex: gIndex, plan: EB.expectedExamPlan(type === 'exam' ? 'module' : 'final', chs) });
-      if (mutateBank) mutateBank(type, bank);
+      if (mutateBank) mutateBank(type, bank, { chs, gIndex });
       return JSON.stringify(bank);
     };
     const c = input.contents;
@@ -402,6 +489,17 @@ async function main() {
     let err = null;
     try { await load(both); } catch (e) { err = e; }
     assert(err && err.name === 'PackagingNotReadyError' && err.missing.some((m) => /^exam:.*:EXAM_ARTIFACT_AMBIGUOUS=dynamic_exam_bank_json\+dynamic_exam_gift$/.test(m)), `ambiguo: ${err && (err.missing || err.message)}`);
+  });
+
+  await check('empaque (C2): bancos con plan congelado en OTRO orden que el Manifest actual (reorden posterior) → se cargan (no EXAM_BANK_INVALID) y llegan al builder', async () => {
+    const f = runFixture('bank', (type, bank, { chs, gIndex }) => {
+      const rev = [...chs].reverse();
+      const plan = type === 'exam' ? EB.moduleExamPlan(rev.map((c) => c.id)) : EB.expectedExamPlan('final', rev);
+      Object.assign(bank, EBF.makeExamBank({ scope: bank.scope, moduleId: bank.moduleId, chapters: rev, chapterIndex: gIndex, plan }));
+    });
+    const { loaded } = await load(f);
+    assert([...loaded.exams.modules.values()].every((s) => s.kind === 'bank') && loaded.exams.final.kind === 'bank', 'bancos cargados');
+    await rejects(B.buildDynamicMbzV3({ ...f.input, contents: loaded.contents }), /^EXAM_BANK_UNSUPPORTED/, 'builder');
   });
 
   await check('empaque con GIFT: ExamSource "gift" y el .mbz es byte a byte el de la entrada directa' + (process.env.BASE_DIST ? ' y el del builder de la base (BASE_DIST)' : ''), async () => {

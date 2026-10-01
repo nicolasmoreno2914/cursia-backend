@@ -2,7 +2,7 @@ import { ConflictException, Injectable, NotFoundException, NotImplementedExcepti
 import { DataSource } from 'typeorm';
 import { GenerationManifestsService } from '../generation-manifests/generation-manifests.service';
 import type { ManifestItemType } from '../generation-manifests/generation-manifest-builder';
-import { requiredArtifactTypes } from '../dynamic-packaging/artifact-resolver';
+import { requiredArtifactTypesForPresent } from '../dynamic-packaging/artifact-resolver';
 import { assertDynamicOwnerAllowed, isRealVideoAllowedForOwner, toHttpConfigError } from '../features/dynamic-features';
 import { ACTIVE_RUN_WORKER_STATUSES } from '../dynamic-generation/item-transitions';
 import { canonicalContextHash } from '../dynamic-generation/run-hash';
@@ -142,7 +142,7 @@ export class InvalidationService {
       ctx.context_hash,
       (id) => byId.get(id)?.status ?? null,
       (id) => byId.get(id)?.metadata?.inputFingerprint ?? null,
-      { required: (t, variant) => requiredArtifactTypes(manifestB.rulesVersion, t as ManifestItemType, variant), typeOf: (id) => byId.get(id)?.type },
+      { required: (t, variant, present) => requiredArtifactTypesForPresent(manifestB.rulesVersion, t as ManifestItemType, variant, present), typeOf: (id) => byId.get(id)?.type },
     );
     const blockers: string[] = [];
     const [superseding] = await this.dataSource.query(

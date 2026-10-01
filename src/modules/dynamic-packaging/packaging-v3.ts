@@ -704,6 +704,8 @@ export async function loadContentsV3(
     }
   }
   // EV6 P2: un banco se re-valida con el Markdown de sus capítulos (evidencia) antes de empaquetar; falla fuerte.
+  // Fix 1 (C2): contra SU plan congelado + pertenencia (un reorden del Blueprint reusa el banco sin costo;
+  // un cambio de pertenencia ya regeneró el examen por invalidación).
   const finalSrc = finalExamSource as ExamSource | null;
   const banksToCheck: Array<{ key: string; scope: 'module' | 'final'; bank: ExamBankV1; chapters: Array<{ id: string; moduleId: string }> }> = [];
   for (const m of plan.modules) {
@@ -714,7 +716,7 @@ export async function loadContentsV3(
     banksToCheck.push({ key: plan.keys.finalExam as string, scope: 'final', bank: finalSrc.bank, chapters: plan.modules.flatMap((m) => m.chapters.map((c) => ({ id: c.chapterId, moduleId: m.moduleId }))) });
   }
   for (const b of banksToCheck) {
-    const r = validateExamBank(b.bank, { scope: b.scope, chapters: b.chapters, chapterMd: contentMd });
+    const r = validateExamBank(b.bank, { scope: b.scope, chapters: b.chapters, chapterMd: contentMd, planSource: 'frozen' });
     if (!r.ok) {
       const codes = [...new Set(r.errors.map((e) => e.code))].sort();
       throw new Error(`${EXAM_BANK_INVALID}: ${b.key} [${codes.join(', ')}] ${r.errors.slice(0, 5).map((e) => `${e.path} ${e.code}: ${e.message}`).join(' | ')}`);
