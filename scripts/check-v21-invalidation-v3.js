@@ -573,16 +573,21 @@ async function pureChecks() {
     const mv = baseSpec(); mv.modules[1].chapters.push(mv.modules[0].chapters.pop());
     const pm = byKey(planOf(bp0, buildBp(mv)).plan);
     eq([pm[K('exam', M1)].action, pm[K('exam', M2)].action, pm[CK('final_exam')].action], ['REGENERATE', 'REGENERATE', 'REUSE'], 'mover');
-    // vaciar y borrar M3 (C6 pasa a M2): el conjunto de módulos del final cambia ⇒ final RG
+    // vaciar y borrar M3 (C6 pasa a M2) / módulo nuevo con un capítulo movido: el conjunto de módulos
+    // con capítulos cambia. Final BANCO ⇒ RG course_modules_changed; final GIFT ⇒ REUSE ['unchanged'] (fix 2, R1).
     const del = baseSpec(); del.modules[1].chapters.push(del.modules[2].chapters[0]); del.modules.pop();
-    const pd = planOf(bp0, buildBp(del)).plan;
-    eq(byKey(pd)[CK('final_exam')].action, 'REGENERATE', 'módulo borrado');
-    assertReason(pd, CK('final_exam'), 'course_modules_changed');
-    // módulo nuevo con un capítulo movido ⇒ final RG
     const nw = baseSpec(); nw.modules.push({ id: M4, title: 'Nuevo', objective: 'Nuevo', exam: false, chapters: [nw.modules[1].chapters.pop()] });
-    const pn = planOf(bp0, buildBp(nw)).plan;
-    assertReason(pn, CK('final_exam'), 'course_modules_changed');
-    eq(byKey(pn)[K('exam', M2)].action, 'REGENERATE', 'exam del módulo que perdió el capítulo');
+    const bankFinal = { [CK('final_exam')]: { artifactTypes: ['dynamic_exam_bank_json'] } };
+    for (const [name, sp] of [['módulo borrado', del], ['módulo nuevo', nw]]) {
+      const pb = planOf(bp0, buildBp(sp), { over: bankFinal }).plan;
+      eq(byKey(pb)[CK('final_exam')].action, 'REGENERATE', `${name}: final banco`);
+      assertReason(pb, CK('final_exam'), 'course_modules_changed');
+      for (const [twin, over] of [['sin tipos', {}], ['GIFT', { [CK('final_exam')]: { artifactTypes: ['dynamic_exam_gift'] } }]]) {
+        const pg = byKey(planOf(bp0, buildBp(sp), { over }).plan)[CK('final_exam')];
+        eq([pg.action, pg.reasons], ['REUSE', ['unchanged']], `${name}: final ${twin}`);
+      }
+    }
+    eq(byKey(planOf(bp0, buildBp(nw)).plan)[K('exam', M2)].action, 'REGENERATE', 'exam del módulo que perdió el capítulo');
     // borrar / agregar un capítulo ⇒ exam del módulo y final RG
     const rm = baseSpec(); rm.modules[1].chapters.pop();
     const pr = byKey(planOf(bp0, buildBp(rm)).plan);
@@ -590,6 +595,33 @@ async function pureChecks() {
     const ad = baseSpec(); ad.modules[0].chapters.push({ id: C7, title: 'Capítulo siete', objective: 'Objetivo siete' });
     const pa = byKey(planOf(bp0, buildBp(ad)).plan);
     eq([pa[K('exam', M1)].action, pa[CK('final_exam')].action], ['REGENERATE', 'REGENERATE'], 'capítulo agregado');
+  });
+
+  await check('EV6 P2 fix 2 (R1): plan GIFT de las ediciones de módulos (borrado / nuevo) = el de la base b236bf0 (sha fijado; con BASE_DIST también se recalcula)', () => {
+    const del = baseSpec(); del.modules[1].chapters.push(del.modules[2].chapters[0]); del.modules.pop();
+    const nw = baseSpec(); nw.modules.push({ id: M4, title: 'Nuevo', objective: 'Nuevo', exam: false, chapters: [nw.modules[1].chapters.pop()] });
+    const shas = [del, nw].map((sp) => planOf(bp0, buildBp(sp)).plan.planSha256);
+    eq(shas, PINNED_GIFT_MODULE_EDIT_SHAS, 'sha GIFT = base');
+    if (process.env.BASE_DIST) {
+      const baseRoot = path.resolve(process.env.BASE_DIST);
+      const PB = require(path.join(baseRoot, 'modules/invalidation/plan.js'));
+      const BB = require(path.join(baseRoot, 'modules/generation-manifests/generation-manifest-builder.js'));
+      const SB = require(path.join(baseRoot, 'modules/course-blueprints/blueprint-snapshot.js'));
+      const RB = require(path.join(baseRoot, 'modules/dynamic-packaging/artifact-resolver.js'));
+      const mk = (bp, n) => BB.buildGenerationManifest(bp, { courseId: COURSE_ID, blueprintId: n, blueprintNumber: n, blueprintSha256: SB.snapshotSha256V2(bp) }, { rulesVersion: 3 });
+      const baseShas = [del, nw].map((sp) => {
+        const bpB = buildBp(sp);
+        const mA = mk(bp0, 1);
+        const items = mA.items.map((it) => ({
+          itemKey: it.key, itemRunId: `A#${it.key}`, status: 'completed', artifactIds: RB.requiredArtifactTypesV3(it.type, it.variant).map((r) => `A|${it.key}|${r}`),
+          artifactStatus: 'ready', inputFingerprint: null, outputIdentity: `out/A/${it.key}`,
+          ...(it.type === 'video_interactions' ? { consumedVideoIdentity: `out/A/video:${it.chapterId}` } : {}),
+        }));
+        return PB.computeInvalidationPlan({ from: { blueprint: bp0, manifest: mA, items, courseContextSha256: CTX }, to: { blueprint: bpB, manifest: mk(bpB, 2), courseContextSha256: CTX } }).planSha256;
+      });
+      eq(shas, baseShas, 'sha GIFT = el que calcula la base');
+      console.log(`   base ${baseRoot}: ${baseShas.join(', ')}`);
+    }
   });
 
   await check('determinismo: items/registros mezclados y Blueprint con claves reordenadas ⇒ mismo plan; sha fijado', () => {
@@ -862,6 +894,7 @@ async function pureChecks() {
 // Sha fijado del plan "título de C1 editado" (fixture de arriba). Cambia solo
 // si cambian las huellas v3, las reglas o la forma del plan: en ese caso,
 // revisar el diff y actualizar a propósito.
+const PINNED_GIFT_MODULE_EDIT_SHAS = ['6f45161fe25affe9b3bb9e43aa3d39f1c2dbe95d37c4117faabd848139cced82', '7dbad6f598aa05cfb9d546734b09249e763afde7147eb6bb260ff32caca43edb']; // = dist de la base b236bf0 (fix 2, R1)
 const PINNED_PLAN_SHA = '4b299d6f5384576a6ebacd81bb2264064d566fa6ae95e5edbaddb8b1d3c0acd9';
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1235,6 +1268,12 @@ async function dbChecks() {
       const m5a = (await manifests.getOrCreate(K5.cid, OWNER, 1)).manifest;
       await manifests.getOrCreate(K5.cid, OWNER, 2);
       const job5 = await seedCompletedRun(K5.cid, m5a, 1, K5.spec, {}, { bankExams: true });
+      // Fix 2 (R1): loadFromItemsFromDb trae los tipos de artifact del origen (el planner los usa para el final).
+      const [j5] = await ds.query(`select id, course_id, input_payload from public.production_jobs where id = $1`, [job5.id]);
+      const keys5 = new Set(m5a.manifest.items.map((i) => i.key));
+      const from5 = await A.loadFromItemsFromDb(ds, j5, keys5, keys5);
+      const f5 = Object.fromEntries(from5.map((r) => [r.itemKey, r.artifactTypes]));
+      eq([f5[`final_exam:${K5.cid}`], f5[K('exam', K5.dm(1))]], [['dynamic_exam_bank_json'], ['dynamic_exam_bank_json']], 'artifactTypes del origen');
       const p5 = await invalidation.getPlan(K5.cid, OWNER, 2, job5.id);
       eq(p5.blockers, [], 'sin blockers');
       eq([byKey(p5.plan)[K('exam', K5.dm(1))].action, byKey(p5.plan)[`final_exam:${K5.cid}`].action], ['REUSE', 'REGENERATE'], 'acciones');

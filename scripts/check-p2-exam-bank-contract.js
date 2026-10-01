@@ -178,7 +178,7 @@ async function main() {
     const fn = src.slice(src.indexOf('export function normalizeExamText'), src.indexOf('/** Tokens de un texto'));
     assert(/^[\x00-\x7f]*$/.test(fn), 'normalizeExamText con caracteres no ASCII en el fuente');
     eq(EB.EXAM_OPTION_FORBIDDEN_RE.source,
-      '\\b(?:todas|ninguna|ambas) (?:de )?(?:las |los )?(?:otras |otros |demas )?(?:anteriores|opciones|respuestas|alternativas|demas)\\b|\\b(?:todas|ambas|ninguna) (?:son|es) (?:correctas?|incorrectas?|validas?)\\b|\\b[a-e] y [a-e] (?:son )?correctas?\\b',
+      '^(?:(?:todas|ninguna|ambas) (?:de )?(?:las |los )?(?:otras |otros |demas )?(?:anteriores|opciones|respuestas|alternativas|demas)(?: anteriores)?(?: (?:son|es) (?:correctas?|incorrectas?|validas?))?|(?:todas|ambas|ninguna) (?:son|es) (?:correctas?|incorrectas?|validas?)|[a-e] y [a-e] (?:son )?correctas?)[.!]?$',
       'regex literal (byte-idéntica en F2)');
     eq(EB.EXAM_OPTION_FORBIDDEN_RE.flags, '', 'flags (se aplica al texto normalizado)');
     eq(EB.EXAM_TOKEN_RE.source, '\\p{N}+(?:[.,]\\p{N}+)*|\\p{L}+', 'regex de tokens');
@@ -282,7 +282,9 @@ async function main() {
     const F = (t) => EB.EXAM_OPTION_FORBIDDEN_RE.test(EB.normalizeExamText(t));
     for (const t of ['Ninguna de las anteriores', 'Todas las anteriores', 'Todas son correctas', 'Ninguna es correcta', 'Todas las respuestas anteriores',
       'Ninguna de las otras opciones', 'A y B son correctas', 'b y c correctas', 'Ambas son válidas', 'Todas las demás', 'NINGUNA DE LAS ALTERNATIVAS']) assert(F(t), `prohibida: ${t}`);
-    for (const t of ['Revisar todas las válvulas', 'Ninguna válvula abierta', 'Ambas bombas en paralelo', 'Las respuestas del equipo']) assert(!F(t), `permitida: ${t}`);
+    for (const t of ['Todas las anteriores son correctas', 'Ninguna de las anteriores.', 'c y d son correctas']) assert(F(t), `prohibida: ${t}`);
+    for (const t of ['Revisar todas las válvulas', 'Ninguna válvula abierta', 'Ambas bombas en paralelo', 'Las respuestas del equipo',
+      'Revisar todas las opciones de filtrado', 'La vitamina a y e son correctas', 'Ninguna de las anteriores al arranque se registra']) assert(!F(t), `permitida (anclada): ${t}`);
     // en un banco: distractores numéricos con la misma unidad pasan
     const d = clone(MOD);
     const q = d.questions[0];

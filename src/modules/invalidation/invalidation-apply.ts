@@ -112,6 +112,7 @@ export async function loadFromItemsFromDb(
       artifactStatus: aggregateArtifactStatus(r.arts.map((a) => a.status)),
       inputFingerprint: uniformFingerprint(r.arts.map((a) => a.fp)),
       outputIdentity: artifactOutputIdentity(r.arts),
+      artifactTypes: r.arts.map((a) => a.type).filter((t): t is string => typeof t === 'string'),
       ...(r.consumed_video_identity ? { consumedVideoIdentity: r.consumed_video_identity } : {}),
     });
   }
@@ -141,6 +142,7 @@ export async function loadFromItemsFromDb(
         // un deshabilitado sin huella (REGENERATE, fix wave).
         inputFingerprint: uniformFingerprint(r.arts.map((a) => a.fp)),
         outputIdentity: artifactOutputIdentity(r.arts),
+        artifactTypes: r.arts.map((a) => a.type).filter((t): t is string => typeof t === 'string'),
         ...(r.consumed_video_identity ? { consumedVideoIdentity: r.consumed_video_identity } : {}),
       });
       wanted.delete(r.item_key);

@@ -240,10 +240,11 @@ export function examTextContains(outer: string, inner: string): boolean {
 
 /**
  * Opciones prohibidas (Moodle baraja las opciones). Se aplica sobre `normalizeExamText(option)`
- * (sin acentos, minúsculas). Byte-idéntica en el frontend.
+ * (sin acentos, minúsculas) y está ANCLADA a la opción completa (fix 2): «Revisar todas las opciones
+ * de filtrado» o «vitamina a y e son correctas» no se marcan. Byte-idéntica en el frontend.
  */
 export const EXAM_OPTION_FORBIDDEN_RE =
-  /\b(?:todas|ninguna|ambas) (?:de )?(?:las |los )?(?:otras |otros |demas )?(?:anteriores|opciones|respuestas|alternativas|demas)\b|\b(?:todas|ambas|ninguna) (?:son|es) (?:correctas?|incorrectas?|validas?)\b|\b[a-e] y [a-e] (?:son )?correctas?\b/;
+  /^(?:(?:todas|ninguna|ambas) (?:de )?(?:las |los )?(?:otras |otros |demas )?(?:anteriores|opciones|respuestas|alternativas|demas)(?: anteriores)?(?: (?:son|es) (?:correctas?|incorrectas?|validas?))?|(?:todas|ambas|ninguna) (?:son|es) (?:correctas?|incorrectas?|validas?)|[a-e] y [a-e] (?:son )?correctas?)[.!]?$/;
 
 // ─── Tipos del documento ────────────────────────────────────────────────────
 
