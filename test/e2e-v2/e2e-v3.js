@@ -16,6 +16,12 @@
 //
 // Salida: $OUT/results-v3.json (+ MBZ, JSON de Moodle) para el QA de
 // navegador (browser-qa-v3.js) y el resumen (run-e2e-v21.sh).
+//
+// EV6 P2-B6 — evaluaciones como BANCOS (dynamic_exam_bank_json): E1 y E3 corren con el modo banco
+// del ejecutor ENCENDIDO solo dentro de esta prueba (override `S.front.DYN_EXAM_BANK_MODE_ENABLED =
+// true` sobre el vm, DESPUÉS de cargar 45; el frontend de producción trae la constante en false).
+// E2 y E4 siguen por GIFT (cobertura del camino de siempre). El LLM falso de bancos
+// (llm-exam-bank.js) inyecta una falla UNA vez → exactamente una reparación.
 'use strict';
 const path = require('path');
 const fs = require('fs');
@@ -157,7 +163,7 @@ const q = async (sql, params) => (await db.query(sql, params)).rows;
 // ─── Cursos de la matriz ───────────────────────────────────────────────────
 const CTX = { sector: 'Minería', pais: 'Chile', ciudad: 'Antofagasta', contexto: 'Técnicos de mantenimiento de planta concentradora', nivel: 'Intermedio', tono: 'cercano y técnico', obj: 'Formar técnicos que mantengan sistemas hidráulicos', comp: 'Diagnostica y mantiene sistemas hidráulicos' };
 const COURSES = [
-  { key: 'E1', title: '[E2E V2.1 E1] Hidráulica de planta', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'h5p', modules: [
+  { key: 'E1', title: '[E2E V2.1 E1] Hidráulica de planta', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'h5p', examBank: true, modules: [
     { title: 'Fundamentos del circuito', objective: 'Comprender presión y caudal', exam: true, chapters: [
       { title: 'Presión y caudal en planta', v: true, a: true, h5p: 'questionset' },
       { title: 'Fluidos y contaminación del aceite', v: false, a: true, h5p: 'dragtext' },
@@ -167,7 +173,7 @@ const COURSES = [
       { title: 'Cilindros de doble efecto', v: false, a: false },
     ] },
   ] },
-  { key: 'E2', title: '[E2E V2.1 E2] Mantenimiento predictivo', theme: { themeFamily: 'oscuro-premium', mode: 'dark' }, passing: 60, finalExam: false, engine: 'scorm', modules: [
+  { key: 'E2', title: '[E2E V2.1 E2] Mantenimiento predictivo', theme: { themeFamily: 'oscuro-premium', mode: 'dark' }, passing: 60, finalExam: false, engine: 'scorm', examBank: false, modules: [
     { title: 'Diagnóstico por síntomas', objective: 'Aislar la causa de una falla', exam: true, chapters: [{ title: 'Síntomas de falla en bombas', v: true, a: true }] },
     { title: 'Análisis del aceite', objective: 'Interpretar un informe de aceite', exam: true, chapters: [
       { title: 'Muestreo de aceite en terreno', v: false, a: true },
@@ -179,7 +185,7 @@ const COURSES = [
       { title: 'Indicadores de confiabilidad', v: false, a: true },
     ] },
   ] },
-  { key: 'E3', title: '[E2E V2.1 E3] Válvulas y control', theme: { themeFamily: 'tecnico', mode: 'dark' }, passing: 80, finalExam: true, engine: 'h5p', modules: [
+  { key: 'E3', title: '[E2E V2.1 E3] Válvulas y control', theme: { themeFamily: 'tecnico', mode: 'dark' }, passing: 80, finalExam: true, engine: 'h5p', examBank: true, modules: [
     { title: 'Válvulas direccionales', objective: 'Leer esquemas de válvulas', exam: true, chapters: [
       { title: 'Esquemas de centros de válvula', v: true, a: true, h5p: 'blanks' },
       { title: 'Solenoides y mando', v: false, a: false },
@@ -295,6 +301,28 @@ async function createCourse(C, llm) {
   return { courseId, frontendCourseId: fc, n, manifest, mods, assessment };
 }
 
+// P2-B6: evaluaciones dentro del .mbz (lector del validador B5): banco ⇒ todos los slots aleatorios,
+// GIFT ⇒ todos fijos; una página «Respuestas explicadas» por quiz (con las explicaciones del banco);
+// la nota para docentes EXACTAMENTE una vez; y examChecksV3 (QUIZ_RANDOM / EXPLANATIONS_GATE /
+// ANSWER_LEAK) sin issues.
+async function assertExamPackage(label, buf, bank) {
+  const EV = D('package/v3/exam-validator-v3.js');
+  const EXPL = D('modules/course-shell/exam-explanations.js');
+  const pkg = await EV.readExamPackageV3(await JSZip.loadAsync(buf));
+  const quizzes = pkg.acts.filter((a) => a.modname === 'quiz');
+  const slots = quizzes.map((q) => ({ idnumber: q.idnumber, random: (q.actXml.match(/<question_set_reference\b/g) || []).length, fixed: (q.actXml.match(/<question_reference\b/g) || []).length }));
+  ok(quizzes.length > 0 && slots.every((x) => (bank ? x.random > 0 && x.fixed === 0 : x.fixed > 0 && x.random === 0)),
+    `${label}: ${quizzes.length} quiz(zes) con slots ${bank ? 'ALEATORIOS por hoja del banco (question_set_reference)' : 'FIJOS (GIFT)'}: ${slots.map((x) => `${x.idnumber} ${bank ? x.random : x.fixed}`).join(', ')}`, slots);
+  const pageOf = (q) => pkg.acts.find((a) => a.modname === 'page' && a.idnumber === EV.explanationsIdnumberFor(q.idnumber));
+  const badPages = quizzes.filter((q) => { const pg = pageOf(q); return !pg || !pg.content.trim() || (bank && !/Antes de intervenir se mide y se compara/.test(pg.content)); }).map((q) => q.idnumber);
+  ok(badPages.length === 0, `${label}: una página «Respuestas explicadas» por quiz${bank ? ' con las explicaciones del banco' : ''}`, badPages);
+  const plain = (h) => h.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/&amp;/g, '&').replace(/\s+/g, ' ');
+  const note = pkg.acts.filter((a) => a.modname === 'label' && plain(a.intro).includes(EXPL.EXAMS_TEACHER_NOTE_ATTEMPTS)).map((a) => a.idnumber);
+  ok(note.length === 1 && /^cv3:shell:(certificate_teacher|exams_teacher)$/.test(note[0]), `${label}: nota para docentes de «Respuestas explicadas» exactamente una vez (${note.join(', ')})`, note);
+  const issues = EV.examChecksV3(pkg);
+  eq(issues, [], `${label}: examChecksV3 (QUIZ_RANDOM / EXPLANATIONS_GATE / ANSWER_LEAK) sin issues`);
+}
+
 /** POST package + espera + descarga. */
 async function packageRun(label, courseId, n, runId) {
   const t0 = Date.now();
@@ -347,7 +375,9 @@ function reservationBookkeeping(ev) {
   let app, itemWorker, providerWorker, pkgWorker;
   const S = {};
   const llmBase = createLlm({ getFixtures: () => S.front.SV2_PREVIEW_FIXTURES, getSplit: (n) => S.front.dynExamQuestionSplit(n) });
-  const llm = createLlmV3({ base: llmBase });
+  // P2-B6: el fake de bancos valida cada respuesta con validateExamBank de B2 (dist) antes de devolverla.
+  const EXAM_BANK = D('modules/course-shell/exam-bank.js');
+  const llm = createLlmV3({ base: llmBase, examBankContract: EXAM_BANK });
   const claimLog = [];
   function newFront(label) {
     const f = makeFront({ feRoot: FE, backendUrl: `http://127.0.0.1:${APP_PORT}`, storageUrl: FAKES.storageUrl, token: TOKEN, ownerId: OWNER, llm, logFile: path.join(V3OUT, `front-${label}.log`), netViolations: frontNet });
@@ -442,6 +472,8 @@ function reservationBookkeeping(ev) {
         const pm = job.input_payload.providerModes || {};
         eq([pm.presentation, pm.audio], ['mock', 'mock'], `${C.key}: providerModes congelados en el run`);
         llm.st.tag = 'A';
+        // P2-B6: override SOLO de la prueba (el `var` de 45 ya se evaluó en el vm; el ejecutor lo lee en cada item).
+        S.front.DYN_EXAM_BANK_MODE_ENABLED = C.examBank === true;
         const t0 = Date.now();
         const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
         const stt = await waitRunTerminal(ctl, `${C.key} run`);
@@ -467,12 +499,30 @@ function reservationBookkeeping(ev) {
         ok(run.data && run.data.status === 'completed', `${C.key}: GET run → completed`, run.data && run.data.status);
         c.items = items;
         c.artifacts = await artifactsOfRun(c.runId);
+        // P2-B6: exam/final_exam → banco (E1, E3) o GIFT (E2): exactamente un artifact del tipo esperado por item.
+        {
+          const examItems = [...byType('exam'), ...byType('final_exam')];
+          const wantType = C.examBank ? 'dynamic_exam_bank_json' : 'dynamic_exam_gift';
+          const badExam = examItems.filter((i) => {
+            const t = c.artifacts.filter((a) => a.item_key === i.item_key && a.status !== 'disabled' && /^dynamic_exam_(bank_json|gift)$/.test(a.type)).map((a) => a.type);
+            return !(t.length === 1 && t[0] === wantType);
+          }).map((i) => [i.item_key, c.artifacts.filter((a) => a.item_key === i.item_key).map((a) => a.type)]);
+          ok(examItems.length > 0 && badExam.length === 0, `${C.key}: ${examItems.length} evaluaciones generadas como ${wantType}${C.examBank ? ' (modo banco, override de la prueba)' : ' (GIFT, modo banco apagado)'}`, badExam);
+          if (C.examBank) {
+            const badSum = examItems.filter((i) => {
+              const os = i.output_summary || {};
+              return !(os.evidenceChecked === true && os.bankSize >= os.slots && os.slots > 0 && os.correctLongestShare <= 0.3 && Array.isArray(os.perLeaf) && os.perLeaf.every((l) => l.kept >= l.floor));
+            }).map((i) => [i.item_key, i.output_summary]);
+            ok(badSum.length === 0, `${C.key}: resumen de cada banco (evidencia verificada, hojas ≥ piso, «correcta = la más larga» ≤ 30 %): ${examItems.map((i) => `${i.type} ${(i.output_summary || {}).bankSize}/${(i.output_summary || {}).slots}`).join(', ')}`, badSum);
+            c.examBankSummaries = examItems.map((i) => ({ itemKey: i.item_key, type: i.type, ...(i.output_summary || {}) }));
+          }
+        }
         const mockArts = c.artifacts.filter((a) => ['dynamic_presentation', 'dynamic_audio_mp3'].includes(a.type));
         ok(mockArts.length === byType('presentation').length + byType('audio_welcome').length + byType('audiobook_chapter').length && mockArts.every((a) => a.metadata && (a.metadata.mock === true || a.metadata.fixture === true)),
           `${C.key}: artifacts de Gamma/TTS marcados mock (${mockArts.length})`, mockArts.map((a) => [a.item_key, a.metadata]));
         results.courses[C.key] = { courseId: c.courseId, frontendCourseId: c.frontendCourseId, blueprintNumber: c.n, runId: c.runId, items: items.length, spec: C,
           modules: c.mods, manifestItems: c.manifest.manifest.items.map((i) => ({ key: i.key, type: i.type, variant: i.variant || null })), manifestModules: c.manifest.manifest.modules,
-          features: c.manifest.manifest.features, assessment: c.assessment };
+          features: c.manifest.manifest.features, assessment: c.assessment, examBank: C.examBank === true, examBankSummaries: c.examBankSummaries || [] };
       });
 
       await step(`v3-${C.key}-empaquetado`, async () => {
@@ -489,6 +539,7 @@ function reservationBookkeeping(ev) {
         eq((os.warnings || []).filter((w) => !/mock/i.test(JSON.stringify(w)) && !(!C.finalExam && certOmitted(w))), [], `${C.key}: 0 warnings del worker (salvo los avisos de fixtures mock de Gamma/TTS${C.finalExam ? '' : ' y certificate_omitted:no_final_exam'})`);
         eq((os.warnings || []).filter(certOmitted).length, C.finalExam ? 0 : 1, `${C.key}: aviso certificate_omitted:no_final_exam ${C.finalExam ? 'ausente (hay evaluación final)' : 'presente (sin evaluación final)'}`);
         results.courses[C.key].packageSummary = os;
+        await assertExamPackage(C.key, P.buf, C.examBank === true);
         c.pkg = P;
       });
 
@@ -560,6 +611,7 @@ function reservationBookkeeping(ev) {
           eq(g2, wantBadge, 'E1-repack: imagen de la insignia = render determinístico del tema nuevo (tecnico/dark)');
           ok(['f1.png', 'f2.png', 'f3.png'].every((n) => g1[n] && g1[n] !== g2[n]), 'E1-repack: la imagen de la insignia cambia con el tema (y solo ella entre los PNG)', { g1, g2 });
           ok((b1.h5p || []).length > 0 && (b1.h5p || []).length === (b2.h5p || []).length, `E1-repack: misma cantidad de paquetes .h5p (${(b1.h5p || []).length}); cambian solo por passPercentage/tema`);
+          await assertExamPackage('E1-repack', P.buf, true);
           results.courses.E1repack = { ...results.courses.E1, theme: { themeFamily: 'tecnico', mode: 'dark' }, passing: 80, packageSummary: os };
         });
       }
@@ -633,9 +685,23 @@ function reservationBookkeeping(ev) {
       const types = [...new Set(['E1', 'E3'].flatMap((k) => results.courses[k].modules.flatMap((m) => m.chapters)).filter((x) => x.a).map((x) => SHELL_TYPES.activityTypeForChapter(x.id)))].sort();
       eq(types, ['blanks', 'dragtext', 'questionset'], 'E1+E3: los 3 tipos H5P calificables (questionset, dragtext, blanks) por la rotación del UUID');
       // Reintento dirigido: una respuesta inválida por tipo, una sola vez, y luego exactamente 1 reintento.
-      const kinds = ['experience', 'course_intro', 'module_intro', 'video_interactions', 'h5p_questionset', 'h5p_dragtext', 'h5p_blanks', 'final_exam'];
+      // P2-B6: el examen final de E1/E3 es un banco; la falla del banco (exam_bank) produce UNA reparación.
+      // La falla GIFT del examen final (final_exam → corrección) se comprueba en E4 (GIFT).
+      const kinds = ['experience', 'course_intro', 'module_intro', 'video_interactions', 'h5p_questionset', 'h5p_dragtext', 'h5p_blanks', 'exam_bank'];
       eq(kinds.map((k) => llm.st.invalidSent[k] || 0), kinds.map(() => 1), `LLM falso: exactamente 1 respuesta inválida por cada uno de los ${kinds.length} tipos v3`);
       eq(kinds.map((k) => llm.st.retriesSeen[k] || 0), kinds.map(() => 1), 'cada respuesta inválida produjo EXACTAMENTE 1 reintento dirigido (validation_retry / continuation) y luego pasó');
+      // P2-B6 (A2): bancos — falla inyectada una vez, EXACTAMENTE una reparación, y el item que la recibió
+      // la registra (rechazos EVIDENCE + LENGTH_BIAS, 2 reparadas); ningún otro banco necesitó reparación.
+      const bankCalls = llm.st.v3calls.filter((x) => /^(exam_bank|final_exam_bank|exam_bank_repair)$/.test(x.kind));
+      const repairs = bankCalls.filter((x) => x.kind === 'exam_bank_repair');
+      ok(repairs.length === 1 && (llm.st.examBank.faults || []).length === 1, `bancos: exam_bank_repair registrado UNA vez (${bankCalls.length} llamadas de banco al LLM falso, ${repairs.length} reparación)`, { repairs, faults: llm.st.examBank.faults });
+      const bankSums = COURSES.filter((C) => C.examBank).flatMap((C) => (results.courses[C.key].examBankSummaries || []).map((x) => ({ course: C.key, ...x })));
+      const repairedItems = bankSums.filter((x) => (x.repaired || 0) > 0 || ((x.calls || {}).continuation || 0) > 0);
+      ok(repairedItems.length === 1 && repairedItems[0].repaired === 2 && repairedItems[0].calls.continuation === 1 && (repairedItems[0].rejectedByCode || {}).EXAM_BANK_EVIDENCE >= 1 && (repairedItems[0].rejectedByCode || {}).EXAM_BANK_LENGTH_BIAS >= 1,
+        `bancos: la reparación quedó en UN solo item (${repairedItems.map((x) => `${x.course} ${x.itemKey}`).join(', ')}): rechazos EVIDENCE + LENGTH_BIAS, 2 preguntas reparadas en 1 llamada`, repairedItems);
+      ok(bankSums.length === COURSES.filter((C) => C.examBank).reduce((n, C) => n + C.modules.filter((m) => m.exam).length + (C.finalExam ? 1 : 0), 0),
+        `bancos: ${bankSums.length} evaluaciones como banco en E1/E3 (todas las de esos cursos)`, bankSums.map((x) => x.itemKey));
+      results.counters.examBank = { calls: bankCalls.length, repairs: repairs.length, faults: llm.st.examBank.faults, items: bankSums.map((x) => ({ course: x.course, itemKey: x.itemKey, bankSize: x.bankSize, slots: x.slots, repaired: x.repaired, rejectedByCode: x.rejectedByCode, correctLongestShare: x.correctLongestShare })) };
     }, { fatal: false });
 
     // ═══ V2.1 F2: E4 — Gamma / TTS / guion LLM REALES contra fakes locales ═══
@@ -660,11 +726,18 @@ function reservationBookkeeping(ev) {
       c.runId = start.data.run.id;
       const [job] = await q(`select input_payload from public.production_jobs where id = $1`, [c.runId]);
       eq([job.input_payload.providerModes.presentation, job.input_payload.providerModes.audio], ['real', 'real'], 'E4: providerModes REAL congelados');
+      S.front.DYN_EXAM_BANK_MODE_ENABLED = false; // P2-B6: E4 cubre el camino GIFT (examen de módulo + final)
+      const finalGift0 = { inv: llm.st.invalidSent.final_exam || 0, ret: llm.st.retriesSeen.final_exam || 0 };
       const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
       const stt = await waitRunTerminal(ctl, 'E4 run');
       const items = await waitItemsDone(c.runId);
       ok(stt.status === 'completed' && stt.failed === 0, 'E4: ejecutor del navegador terminó sin fallidos', stt);
       ok(items.length > 0 && items.every((i) => i.status === 'completed'), `E4: los ${items.length} items completed`, items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, i.error_message && i.error_message.slice(0, 300)]));
+      // P2-B6: GIFT en E4 — la respuesta inválida del examen final GIFT (una vez por corrida) y su corrección.
+      eq([finalGift0.inv, finalGift0.ret, llm.st.invalidSent.final_exam || 0, llm.st.retriesSeen.final_exam || 0], [0, 0, 1, 1], 'E4: examen final GIFT — 1 respuesta inválida y EXACTAMENTE 1 corrección (continuation), luego pasó');
+      const e4Arts = await artifactsOfRun(c.runId);
+      const e4Exams = items.filter((i) => i.type === 'exam' || i.type === 'final_exam');
+      ok(e4Exams.length === 2 && e4Exams.every((i) => e4Arts.filter((a) => a.item_key === i.item_key && a.status !== 'disabled' && /^dynamic_exam_/.test(a.type)).map((a) => a.type).join() === 'dynamic_exam_gift'), 'E4: examen de módulo y final como GIFT (modo banco apagado)', e4Exams.map((i) => [i.item_key, e4Arts.filter((a) => a.item_key === i.item_key).map((a) => a.type)]));
       const prov = items.filter((i) => ['presentation', 'audio_welcome', 'audiobook_chapter'].includes(i.type));
       ok(prov.length === 5 && prov.every((i) => i.worker_id === 'e2e-v3-provider-worker' && i.output_summary && i.output_summary.mode === 'real'), 'E4: Gamma/TTS por el dynamic-provider-worker en modo REAL', prov.map((i) => [i.item_key, i.worker_id, i.output_summary && i.output_summary.mode]));
       const arts = await artifactsOfRun(c.runId);
@@ -994,6 +1067,9 @@ function reservationBookkeeping(ev) {
           ok(p2.status === 0 && p2o.pass === true && p2o.assertions > 0, `${label}: ${p2o.assertions} aserciones de evaluaciones con intentos reales (revisión, página gated, completion del curso${Object.values(p2o.quizzes || {}).some((q) => q.mode === 'bank') ? ', sorteo por hoja' : ''})`, p2o.failed);
           const modes = Object.values(p2o.quizzes || {}).map((q) => q.mode);
           ok(modes.length > 0 && modes.every((m) => m === 'bank' || m === 'gift'), `${label}: quizzes todo-aleatorio (banco) o todo-fijo (GIFT): ${modes.join(',')}`, p2o.quizzes);
+          // P2-B6: E1/E1-repack/E3 son bancos (sorteo por hoja con intentos reales); E2 sigue GIFT.
+          const wantMode = info.examBank ? 'bank' : 'gift';
+          ok(modes.length > 0 && modes.every((m) => m === wantMode), `${label}: todas las evaluaciones restauradas en modo ${wantMode} (${info.examBank ? 'banco generado por el ejecutor real' : 'GIFT'})`, p2o.quizzes);
           results.moodle[label].p2exams = { pass: p2o.pass, assertions: p2o.assertions, quizzes: p2o.quizzes, steps: p2o.steps };
         }
         results.moodle[label].cms = cms.map((c) => ({ cmid: c.cmid, idnumber: c.idnumber, modname: c.modname, visible: c.visible }));

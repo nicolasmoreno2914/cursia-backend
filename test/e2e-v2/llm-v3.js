@@ -10,10 +10,17 @@
 // en el examen final, la llamada de corrección (continuation). Todo lo demás es
 // válido a la primera.
 //
+// EV6 P2-B6: los BANCOS de preguntas (modo banco del ejecutor, prompts EXAM_BANK_* v1) los
+// responde llm-exam-bank.js (falla inyectada una vez → una reparación; cada respuesta validada
+// contra validateExamBank de B2 antes de salir). Las ramas GIFT de abajo siguen para los cursos
+// que corren con el modo banco apagado (E2, E4).
+//
 // Los textos de intros y experiencia NO llevan dígitos ni marcadores con UUID
 // (las reglas v3 los prohíben): la identidad por UUID se verifica por el
 // idnumber cv3:… del paquete y por los artifacts de cada item run.
 'use strict';
+
+const { createExamBankFake } = require('./llm-exam-bank');
 
 const RETRY_MARK = 'TU RESPUESTA ANTERIOR FUE RECHAZADA';
 
@@ -153,13 +160,16 @@ function giftBlocks(prefix, from, split, typesOnly) {
   return out.join('\n\n');
 }
 
-function createLlmV3({ base, chapterIdFromText }) {
+// examBankContract: módulo compilado course-shell/exam-bank.js (validateExamBank) para validar las
+// respuestas de banco ANTES de devolverlas (A1 de P2-B6).
+function createLlmV3({ base, chapterIdFromText, examBankContract }) {
   const st = base.st;
   st.v3calls = st.v3calls || [];
   st.invalidSent = st.invalidSent || {}; // kind → número de respuestas inválidas enviadas
   st.retriesSeen = st.retriesSeen || {}; // kind → prompts de reintento recibidos
   function rec(kind, id, extra) { st.v3calls.push({ kind, id, tag: st.tag, ...(extra || {}) }); st.calls.push({ kind, id, tag: st.tag }); }
   function once(kind) { if (st.invalidSent[kind]) return false; st.invalidSent[kind] = 1; return true; }
+  const respondBank = createExamBankFake({ contract: examBankContract, rec, once, st });
   function chapterFromContent(prompt) {
     const m = /MARKCH-([0-9a-f-]{36})-/.exec(prompt);
     if (!m) throw new Error('fake LLM v3: el prompt no trae el contenido del capítulo con su marcador');
@@ -173,6 +183,10 @@ function createLlmV3({ base, chapterIdFromText }) {
     const retry = prompt.indexOf(RETRY_MARK) >= 0;
     const J = (o) => ({ text: JSON.stringify(o) });
     try {
+      // Bancos de preguntas (marcador en la 1.ª línea): antes que cualquier otra rama (el prompt trae
+      // <<<CAPITULO, que el LLM v2 tomaría por un reintento del sidecar).
+      const bank = respondBank(prompt);
+      if (bank) return bank;
       if (prompt.indexOf('Genera la EXPERIENCIA del capítulo') >= 0) {
         const title = (/CAPÍTULO: "([^"]*)"/.exec(prompt) || [])[1] || '';
         const id = st.chapterByTitle.get(title) || chapterFromContent(prompt);
