@@ -26,6 +26,21 @@ import type { ExamBankQuestion, ExamBankV1 } from './exam-bank';
 import { EXAM_QUESTION_TYPES } from './exam-bank';
 import { Hx, Surf, bgSurf, eyebrow, hx, pHtml, root, shellFail, st, unprotectedText } from './html';
 
+/**
+ * EV6 P2-B4 (P2-design §1.3, ruling 1): con intentos limitados la página se desbloquea si el quiz está
+ * completo (e=1, que también acepta COMPLETE_PASS) O completo-y-reprobado (e=3 = intentos agotados,
+ * gracias a completionattemptsexhausted=1). `show:false`: oculta hasta entonces.
+ * Fix 1 (C1): con intentos ILIMITADOS (attempts 0) B1 emite completionattemptsexhausted=0 y Moodle marca
+ * COMPLETE_FAIL tras UN intento reprobado → e=3 abriría el banco y el estudiante reintentaría con las
+ * respuestas. Ahí la condición es SOLO aprobar (e=1).
+ */
+export function examExplanationsAvailability(quizMid: number, attempts: number): string {
+  if (!Number.isInteger(quizMid) || quizMid < 1) throw new Error(`MBZ_V3_INVARIANT: moduleid de quiz inválido (${quizMid})`);
+  if (!Number.isInteger(attempts) || attempts < 0) throw new Error(`MBZ_V3_INVARIANT: intentos inválidos (${attempts})`);
+  if (attempts === 0) return `{"op":"|","show":false,"c":[{"type":"completion","cm":${quizMid},"e":1}]}`;
+  return `{"op":"|","show":false,"c":[{"type":"completion","cm":${quizMid},"e":1},{"type":"completion","cm":${quizMid},"e":3}]}`;
+}
+
 /** Nombre de la página (P2-task-B4 §1). */
 export function examExplanationsName(scope: { kind: 'module'; moduleNumber: number } | { kind: 'final' }): string {
   return scope.kind === 'final' ? 'Respuestas explicadas — Evaluación final' : `Respuestas explicadas — Evaluación del módulo ${scope.moduleNumber}`;

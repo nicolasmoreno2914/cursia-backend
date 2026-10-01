@@ -20,6 +20,12 @@
  *                                          completion del curso del backup, setting badges = 1,
  *                                          imagen f1/f2/f3 PNG, examen final como criterio y el
  *                                          panel «Tu certificado» con $@BADGESVIEWBYID*curso@$
+ *   QUIZ_REVIEW / QUIZ_COMPLETION          EV6 P2-B1: revisión solo con nota; attemptsexhausted = intentos > 0
+ *   QUIZ_RANDOM / EXPLANATIONS_GATE /      EV6 P2-B5 (exam-validator-v3.ts): banco aleatorio por hoja,
+ *   ANSWER_LEAK                            página «Respuestas explicadas» gated por SU quiz, ninguna
+ *                                          respuesta/explicación fuera de su página (Libro excluido)
+ *   TEACHER_NOTE                           EV6 P2-B5: nota para docentes de las evaluaciones exactamente
+ *                                          una vez, oculta, con las dos oraciones, sii hay ≥ 1 evaluación
  * Identifica cada módulo por su `idnumber` `cv3:…` (estructura por UUID).
  * Puro salvo el unzip en memoria; nunca lanza por un hallazgo: los devuelve todos.
  */
@@ -39,6 +45,7 @@ import { safeActivityName } from '../mbz-common';
 import { courseBadgeDescription } from './course-badge';
 import { QUIZ_REVIEW_V3 } from './moodle-activities-v3';
 import { formatDurationEs, mp3DurationSeconds } from '../audio';
+import { ExamBankPlans, examChecksV3, readExamPackageV3 } from './exam-validator-v3';
 import { CURSIA_H5P_PROFILE_V1, H5P_MOODLE_GRADING } from '../h5p';
 
 const ACTIVITY_MAIN_LIBRARY: Record<string, string> = {
@@ -57,6 +64,8 @@ export interface MbzV3Issue {
 export interface MbzV3ValidationExpectations {
   facts: CourseFacts;
   resolved: ResolvedAssessment;
+  /** EV6 P2-B5: plan por hoja de cada quiz con banco (del builder). Sin él, QUIZ_RANDOM exige solo coherencia interna. */
+  examBankPlans?: ExamBankPlans;
 }
 
 export interface MbzV3ValidationResult {
@@ -503,22 +512,22 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     const own = acts.find((a) => a.idnumber === 'cv3:shell:exams_teacher');
     const holders = acts.filter((a) => extractText(a.intro).includes(EXAMS_TEACHER_NOTE_AVAILABILITY));
     if (!hasExams) {
-      if (own || holders.length) add('STRUCTURE', 'cv3:shell:exams_teacher', 'nota para docentes de las evaluaciones en un curso sin evaluaciones');
+      if (own || holders.length) add('TEACHER_NOTE', 'cv3:shell:exams_teacher', 'nota para docentes de las evaluaciones en un curso sin evaluaciones');
       return;
     }
     const want = withCertificate ? 'cv3:shell:certificate_teacher' : 'cv3:shell:exams_teacher';
-    if (withCertificate && own) add('STRUCTURE', own.idnumber, 'con certificado la nota va en el label del certificado, no en un label propio');
+    if (withCertificate && own) add('TEACHER_NOTE', own.idnumber, 'con certificado la nota va en el label del certificado, no en un label propio');
     if (holders.length !== 1 || holders[0].idnumber !== want) {
-      add('STRUCTURE', want, `la nota para docentes de las evaluaciones debe estar exactamente una vez, en ${want} (está en ${holders.map((h) => h.idnumber).join(', ') || 'ninguno'})`);
+      add('TEACHER_NOTE', want, `la nota para docentes de las evaluaciones debe estar exactamente una vez, en ${want} (está en ${holders.map((h) => h.idnumber).join(', ') || 'ninguno'})`);
       return;
     }
     const h = holders[0];
     const t = extractText(h.intro);
-    if (h.modname !== 'label' || h.module.visible !== '0') add('STRUCTURE', h.idnumber, `la nota para docentes debe ir en un label oculto (visible=0), es ${h.modname} visible=${h.module.visible}`);
-    if (!t.includes(withCertificate ? EXAMS_TEACHER_NOTE : EXAMS_TEACHER_NOTE_ATTEMPTS)) add('STRUCTURE', h.idnumber, 'la nota para docentes no trae las dos oraciones (acceso condicional + intentos adicionales)');
+    if (h.modname !== 'label' || h.module.visible !== '0') add('TEACHER_NOTE', h.idnumber, `la nota para docentes debe ir en un label oculto (visible=0), es ${h.modname} visible=${h.module.visible}`);
+    if (!t.includes(withCertificate ? EXAMS_TEACHER_NOTE : EXAMS_TEACHER_NOTE_ATTEMPTS)) add('TEACHER_NOTE', h.idnumber, 'la nota para docentes no trae las dos oraciones (acceso condicional + intentos adicionales)');
     if (!withCertificate) {
       const first = acts.find((a) => a.sectionid === h.sectionid);
-      if (first !== h) add('STRUCTURE', h.idnumber, 'la nota para docentes debe ser lo primero de su sección');
+      if (first !== h) add('TEACHER_NOTE', h.idnumber, 'la nota para docentes debe ser lo primero de su sección');
     }
   };
   const checkCertificate = async (): Promise<void> => {
@@ -737,6 +746,9 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
 
   // ── EV6 T3: certificado (insignia de curso nativa) ──
   await checkCertificate();
+
+  // ── EV6 P2-B5: banco aleatorio, página gated, fugas de respuestas ──
+  for (const i of examChecksV3(await readExamPackageV3(zip), { facts, examBankPlans: exp.examBankPlans })) add(i.code, i.where, i.message);
 
   // ── H5P ──
   const profileKeys = new Set(CURSIA_H5P_PROFILE_V1.libraries.map((l) => `${l.machineName} ${l.majorVersion}.${l.minorVersion}`));
