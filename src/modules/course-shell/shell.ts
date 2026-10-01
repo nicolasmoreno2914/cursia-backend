@@ -102,7 +102,20 @@ function lvl(h: Hx): 'enhanced' | undefined {
 
 // ─── S0.2 Bienvenida ────────────────────────────────────────────────────────
 
-export function welcomeLabel(facts: CourseFacts, courseIntro: CourseIntroV3, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
+/** EV6 DoD (BE-A): texto del aviso de un paquete de QA (sin cifras ni nombres de recursos). */
+export const QA_PREVIEW_NOTICE_TITLE = 'QA — vista previa, no entregable';
+export const QA_PREVIEW_NOTICE_TEXT =
+  'Este paquete es una copia interna de control de calidad. Contiene componentes simulados o pendientes y no es ' +
+  'el curso final: no lo entregues a estudiantes ni a clientes.';
+
+export function welcomeLabel(
+  facts: CourseFacts,
+  courseIntro: CourseIntroV3,
+  theme: ResolvedTheme,
+  opts?: ShellRenderOptions,
+  /** EV6 DoD: paquete de QA → aviso visible antes de la bienvenida (default: sin aviso, bytes de siempre). */
+  qaPreviewNotice = false,
+): ShellLabel {
   const intro = assertValidCourseIntroV3(courseIntro);
   const h = hx(theme, opts);
   const c = facts.counts;
@@ -122,7 +135,12 @@ export function welcomeLabel(facts: CourseFacts, courseIntro: CourseIntroV3, the
   const hours = facts.hours
     ? pHtml(h, labelHtml(`Duración estimada: ${facts.hours.value} h (${facts.hours.source}).`), s, { secondary: true, last: true })
     : '';
-  return out('Bienvenida', root(h, 'shell-welcome', hero + statRow(h, stats) + hours), facts);
+  let qa = '';
+  if (qaPreviewNotice) {
+    const cs = toneSurf(h, 'alt');
+    qa = box(h, eyebrow(h, QA_PREVIEW_NOTICE_TITLE, cs.s) + pHtml(h, labelHtml(QA_PREVIEW_NOTICE_TEXT), cs.s, { last: true }), cs, { cls: 'cvc-qa-preview' });
+  }
+  return out('Bienvenida', root(h, 'shell-welcome', qa + hero + statRow(h, stats) + hours), facts);
 }
 
 // ─── S0.3 Audio de bienvenida ───────────────────────────────────────────────

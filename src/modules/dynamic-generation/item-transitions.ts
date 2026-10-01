@@ -1,6 +1,7 @@
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
 import { latestGenerationPredicate } from './item-generations';
+import { evaluateRunCompletion, loadCompletionInputs, terminalStatusFor } from './run-completion';
 
 /**
  * Transiciones de estado de items/run compartidas por RunsService (lecturas:
@@ -193,7 +194,8 @@ export async function sweepRunExpiredLeases(qr: QueryRunner, jobId: string): Pro
  * (terminal → activo lo hacen únicamente retryItem/reopen de Task 2):
  * - algún item pending|running|retrying → sigue activo (queued hasta el
  *   primer claim, que lo pasa a running; running se mantiene);
- * - todos completed → completed;
+ * - todos completed → completed SOLO si todo es real y validado (EV6 DoD, run-completion.ts);
+ *   con algún componente de vista previa → preview (terminal); sin validar → failed;
  * - si no (quedan failed/blocked/cancelled, p.ej. un run reabierto con solo
  *   items failed) → failed.
  * lease_until/worker_id del run nunca se tocan (quedan NULL).
@@ -225,14 +227,34 @@ export async function recomputeRunStatus(qr: QueryRunner, jobId: string): Promis
   }
 
   if (total > 0 && (c.completed ?? 0) === total) {
+    // EV6 DoD (BE-A): «todos completed» ya no alcanza. Un componente de vista previa (video o
+    // Gamma/TTS mock) → `preview` (terminal, nunca `completed`); uno completado sin su validación
+    // (video sin entrega YouTube, preguntas de otro video, item v3 sin v3Validation) → `failed`
+    // con la lista (recuperación de admin). Solo un run 100 % real y validado queda `completed`.
+    const inputs = await loadCompletionInputs(qr, jobId);
+    const verdict = inputs
+      ? terminalStatusFor(evaluateRunCompletion({ ...inputs.job, worker_status: 'completed', status: 'completed' }, inputs.rows, inputs.manifest))
+      : 'completed';
+    if (verdict === 'completed' || verdict === 'preview') {
+      await qr.query(
+        `update public.production_jobs
+            set status = $2::text, worker_status = $2::text, progress = 100,
+                finished_at = now(), error_message = null, next_retry_at = null, updated_at = now()
+          where id = $1`,
+        [jobId, verdict],
+      );
+      return verdict;
+    }
+    const completion = evaluateRunCompletion({ ...inputs!.job, worker_status: 'completed', status: 'completed' }, inputs!.rows, inputs!.manifest);
+    const unvalidated = completion.missingComponents.filter((k) => !completion.previewComponents.includes(k));
     await qr.query(
       `update public.production_jobs
-          set status = 'completed', worker_status = 'completed', progress = 100,
-              finished_at = now(), error_message = null, next_retry_at = null, updated_at = now()
+          set status = 'failed', worker_status = 'failed', finished_at = now(), error_message = $2,
+              next_retry_at = null, updated_at = now()
         where id = $1`,
-      [jobId],
+      [jobId, `Generación dinámica terminada con componentes sin validar (${unvalidated.length}): ${unvalidated.slice(0, 20).join(', ')}`],
     );
-    return 'completed';
+    return 'failed';
   }
 
   const summary =

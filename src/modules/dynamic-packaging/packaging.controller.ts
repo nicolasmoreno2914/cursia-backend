@@ -16,8 +16,9 @@ export class PackagingController {
   constructor(private readonly packaging: PackagingService) {}
 
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/package
-  // 202 con {jobId, status}: get-or-create del job dynamic_package. 409 con
-  // {missing:[]} si el run no está 31/31 completed.
+  // 202 con {jobId, status, packageKind, deliverable}: get-or-create del job dynamic_package. 409 con
+  // {missing:[]} si el run no está 31/31 completed. EV6 DoD: run de vista previa → 409
+  // preview_not_deliverable salvo SUPER_ADMIN + DYNAMIC_ALLOW_VIDEO_PREVIEW=true (paquete QA).
   @Post()
   @HttpCode(HttpStatus.ACCEPTED)
   request(
@@ -26,7 +27,7 @@ export class PackagingController {
     @Param('runId', ParseUUIDPipe) runId: string,
     @CurrentUser() user: AuthUser,
   ) {
-    return this.packaging.requestPackage(courseId, user.id, number, runId);
+    return this.packaging.requestPackage(courseId, user.id, number, runId, { email: user.email });
   }
 
   // GET /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/package

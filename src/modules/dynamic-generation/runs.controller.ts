@@ -153,7 +153,7 @@ export class RunsController {
     @Param('runId', ParseUUIDPipe) runId: string,
     @CurrentUser() user: AuthUser,
   ) {
-    return this.runs.cancelRun(courseId, user.id, number, runId);
+    return this.runs.cancelRun(courseId, user.id, number, runId, { email: user.email });
   }
 
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/items/:itemKey/retry
@@ -168,7 +168,7 @@ export class RunsController {
     @Body() dto: RetryItemDto,
     @CurrentUser() user: AuthUser,
   ) {
-    return this.runs.retryItem(courseId, user.id, number, runId, itemKey, dto?.resubmitVideo === true, dto?.resubmitProvider === true);
+    return this.runs.retryItem(courseId, user.id, number, runId, itemKey, dto?.resubmitVideo === true, dto?.resubmitProvider === true, undefined, { email: user.email });
   }
 
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/items/:itemKey/youtube-resolution

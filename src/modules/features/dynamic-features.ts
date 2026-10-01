@@ -12,6 +12,12 @@ import { readConfiguredRulesVersion } from '../generation-manifests/manifest-rul
  *   flag ON + lista → solo esos owners.
  * - `DYNAMIC_REAL_VIDEO_OWNERS`: UUIDs de owner que pueden iniciar runs con
  *   `videoMode: 'real'` (Videogen pago). FAIL CLOSED: ausente/vacía → nadie.
+ * - `DYNAMIC_REAL_VIDEO_ALL_OWNERS` (EV6 DoD): SOLO el string exacto `'true'`
+ *   hace elegible para video real a TODO owner con V2 (preparado para el
+ *   rollout comercial; default OFF). No cambia aprobación ni presupuesto.
+ * - `DYNAMIC_ALLOW_VIDEO_PREVIEW` (EV6 DoD): SOLO `'true'` permite pedir
+ *   `videoMode: 'mock'` (escape de QA/staging, mismo criterio fail-closed que
+ *   DYNAMIC_ALLOW_PROVIDER_MOCK). Sin él → 403 `video_preview_not_allowed`.
  * - `DYNAMIC_COHERENCE_LLM` (F78-BE2): SOLO el string exacto `'true'` habilita
  *   la revisión de coherencia con IA (entrada compacta `…/coherence/llm-input`
  *   + UI) para los owners que YA tienen V2. Ausente / otro valor → nadie
@@ -26,12 +32,21 @@ export const DYNAMIC_FLAG_ENV = 'DYNAMIC_COURSE_STRUCTURE';
 export const DYNAMIC_ALLOWED_OWNERS_ENV = 'DYNAMIC_V2_ALLOWED_OWNERS';
 export const REAL_VIDEO_OWNERS_ENV = 'DYNAMIC_REAL_VIDEO_OWNERS';
 export const COHERENCE_LLM_ENV = 'DYNAMIC_COHERENCE_LLM';
+export const REAL_VIDEO_ALL_OWNERS_ENV = 'DYNAMIC_REAL_VIDEO_ALL_OWNERS';
+export const ALLOW_VIDEO_PREVIEW_ENV = 'DYNAMIC_ALLOW_VIDEO_PREVIEW';
+/** EV6 DoD: código estable del 403 de un owner sin video real habilitado (nunca se baja a vista previa en silencio). */
+export const REAL_VIDEO_NOT_ENABLED = 'real_video_not_enabled';
+/** EV6 DoD: código estable del 403 de `videoMode:'mock'` sin el escape de QA. */
+export const VIDEO_PREVIEW_NOT_ALLOWED = 'video_preview_not_allowed';
 
 export const DYNAMIC_NOT_ALLOWED_MESSAGE =
   'La estructura dinámica de cursos (V2) no está habilitada para esta cuenta.';
 export const REAL_VIDEO_NOT_ALLOWED_MESSAGE =
-  'El video real (Videogen, con costo) no está habilitado para esta cuenta. Usa el modo de video "mock" ' +
-  'o pide que habiliten tu cuenta.';
+  'El video real de los cursos todavía no está habilitado para esta cuenta. Un curso completo incluye sus videos, ' +
+  'así que no iniciamos la generación sin ellos. Escríbele al equipo de Cursia para habilitarlo; no se creó ni se cobró nada.';
+export const VIDEO_PREVIEW_NOT_ALLOWED_MESSAGE =
+  'Los videos de vista previa (simulados) son solo para pruebas internas; un curso se genera con sus videos reales. ' +
+  'No se creó nada.';
 export const COHERENCE_LLM_NOT_ALLOWED_MESSAGE =
   'La revisión de coherencia con IA no está habilitada para esta cuenta.';
 
@@ -128,7 +143,21 @@ export function isDynamicAllowedForOwner(ownerId: string, env: Env = process.env
 export function isRealVideoAllowedForOwner(ownerId: string, env: Env = process.env): boolean {
   if (!isDynamicAllowedForOwner(ownerId, env)) return false;
   const allowed = parseOwnerList(REAL_VIDEO_OWNERS_ENV, env);
+  // EV6 DoD: rollout comercial — todo owner con V2 es elegible (aprobación/presupuesto sin cambios).
+  if (env[REAL_VIDEO_ALL_OWNERS_ENV] === 'true') return true;
   return allowed.includes(String(ownerId ?? '').toLowerCase());
+}
+
+/** EV6 DoD: ¿se puede pedir `videoMode:'mock'`? Solo con el escape de QA exacto `'true'` (fail closed). */
+export function isVideoPreviewAllowed(env: Env = process.env): boolean {
+  return env[ALLOW_VIDEO_PREVIEW_ENV] === 'true';
+}
+
+/** EV6 DoD: 403 `video_preview_not_allowed` si se pide video de vista previa sin el escape de QA. */
+export function assertVideoPreviewAllowed(env: Env = process.env): void {
+  if (!isVideoPreviewAllowed(env)) {
+    throw new ForbiddenException({ code: VIDEO_PREVIEW_NOT_ALLOWED, message: `${VIDEO_PREVIEW_NOT_ALLOWED}: ${VIDEO_PREVIEW_NOT_ALLOWED_MESSAGE}` });
+  }
 }
 
 /** F78-BE2: fail closed — solo `DYNAMIC_COHERENCE_LLM === 'true'` y solo para owners con V2 permitida. */
@@ -189,7 +218,7 @@ export function assertRealVideoAllowed(ownerId: string, env: Env = process.env):
   } catch (err) {
     toHttpConfigError(err);
   }
-  if (!allowed) throw new ForbiddenException(REAL_VIDEO_NOT_ALLOWED_MESSAGE);
+  if (!allowed) throw new ForbiddenException({ code: REAL_VIDEO_NOT_ENABLED, message: `${REAL_VIDEO_NOT_ENABLED}: ${REAL_VIDEO_NOT_ALLOWED_MESSAGE}` });
 }
 
 /** F78-BE2: 403 si el owner no tiene la revisión de coherencia con IA (fail closed); 500 si una lista es inválida. */

@@ -177,7 +177,7 @@ export class FinopsBudgetService {
          join public.production_jobs j on j.id = a.run_id
          left join (select run_id, sum(amount) as spent from public.generation_cost_events
                      where run_id is not null and billing_account <> 'user_key' group by run_id) sp on sp.run_id = a.run_id
-        where coalesce(j.worker_status, '') not in ('completed', 'failed', 'cancelled', 'cancelling')
+        where coalesce(j.worker_status, '') not in ('completed', 'preview', 'failed', 'cancelled', 'cancelling')
           and coalesce(j.status, '') not in ('cancelled', 'cancelling')`,
     );
     const spent = normalizeDecimal(s?.total ?? 0);

@@ -36,7 +36,7 @@ import {
   youtubeVideoVerifyMessage,
 } from './dynamic-video-delivery';
 import { DynamicYoutubePreflightService } from './dynamic-youtube';
-import { assertDynamicOwnerAllowed, assertRealVideoAllowed } from '../features/dynamic-features';
+import { assertDynamicOwnerAllowed, assertRealVideoAllowed, assertVideoPreviewAllowed } from '../features/dynamic-features';
 import { FromRunDto, isFromRunRequest } from '../invalidation/dto/from-run.dto';
 import { computePlanFromDb, executeApplyWrites, planApplyWrites } from '../invalidation/invalidation-apply';
 import { requiredArtifactTypesForPresent } from '../dynamic-packaging/artifact-resolver';
@@ -121,6 +121,8 @@ import {
 } from './video-upgrade';
 import { estimateCategories, estimateFingerprint, planNormalApproval, NormalApprovalPlan } from '../finops/normal-approval';
 import { isSuperAdminEmail } from '../../auth/super-admin';
+import { RunCompletion, evaluateRunCompletion } from './run-completion';
+import { hasDeliverablePackage } from '../dynamic-packaging/package-freshness';
 import {
   ACTIVE_RUN_WORKER_STATUSES,
   isActiveRun,
@@ -143,8 +145,13 @@ const ACTIVE_RUN_INDEX = 'uq_dynamic_generation_active_run';
  * del MISMO run; la vigente de cada item la decide item-generations.ts.
  */
 const GENERATION = 1;
-/** R17: default cuando el body no manda videoMode. */
-const DEFAULT_VIDEO_MODE: RunVideoMode = 'mock';
+/**
+ * R17 + EV6 DoD (BE-A): default cuando el body no manda videoMode = REAL (un curso completo incluye
+ * sus videos). `mock` solo con el escape de QA DYNAMIC_ALLOW_VIDEO_PREVIEW=true (403 si no).
+ */
+const DEFAULT_VIDEO_MODE: RunVideoMode = 'real';
+/** Runs creados antes de R17 (sin `input_payload.videoMode`) nacieron en vista previa: se leen 'mock'. */
+const LEGACY_VIDEO_MODE: RunVideoMode = 'mock';
 /**
  * I1 (review-rv2): namespace del advisory lock por curso (pg_advisory_xact_lock(ns, courseId))
  * que serializa crear/reabrir/reintentar-con-reapertura runs de un curso.
@@ -248,6 +255,12 @@ export interface RunDto {
   finishedAt: string | null;
   progress: RunProgress;
   items: ItemRunDto[];
+  /**
+   * EV6 DoD (BE-A): completitud COMPUTADA en cada lectura (run-completion.ts). `status` sigue siendo
+   * el worker_status crudo; la UI decide «Curso listo» SOLO con `completion.complete`. Un run viejo
+   * `completed` con componentes de vista previa se lee `state:'preview'` sin escribir nada.
+   */
+  completion: RunCompletion;
 }
 
 function toIso(v: Date | string | null | undefined): string | null {
@@ -504,6 +517,20 @@ export function budgetBlockedConflict(blockedBy: NormalApprovalPlan['blockedBy']
   });
 }
 export const APPROVAL_FORBIDDEN = 'approval_forbidden';
+/**
+ * EV6 DoD (BE-A): «Generar videos reales» (vista previa + confirmación), cancelar un upgrade en
+ * vuelo y el reenvío pago de un video fallido son herramientas de RECUPERACIÓN de admin
+ * (SUPER_ADMIN): 403 a cualquier otro usuario, dueño incluido. Los reintentos sin gasto siguen
+ * disponibles para el dueño.
+ */
+export const ADMIN_RECOVERY_ONLY = 'admin_recovery_only';
+
+function adminRecoveryForbidden(what: string): ForbiddenException {
+  return new ForbiddenException({
+    code: ADMIN_RECOVERY_ONLY,
+    message: `${ADMIN_RECOVERY_ONLY}: ${what} es una herramienta de recuperación de un administrador de Cursia. No se hizo nada.`,
+  });
+}
 
 export interface StartPreview {
   manifestId: number;
@@ -1088,6 +1115,8 @@ export class RunsService {
         // Gate de video real (review 5C I1): B va a pagar Videogen solo si
         // GENERA/REGENERA algún video (STALE_NO_AUTO nunca regenera solo).
         if (videoMode === 'real' && writes.videoItemsToGenerate.length > 0) assertRealVideoAllowed(ownerId);
+        // EV6 DoD (BE-A): B hereda el modo de A; generar videos NUEVOS de vista previa exige el escape de QA.
+        if (videoMode === 'mock' && writes.videoItemsToGenerate.length > 0) assertVideoPreviewAllowed();
         // DN-1: B hereda la estrategia de A; si va a GENERAR videos reales,
         // entrega YouTube + preflight OK. El preflight hace red → se corre FUERA
         // de la tx (rollback: nada escrito) y se reintenta una sola vez.
@@ -1515,17 +1544,31 @@ export class RunsService {
    * complete exigirá status='running'). completed/failed se conservan.
    * Idempotente sobre un run ya cancelado; 409 si el run ya está completed.
    */
-  async cancelRun(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<RunDto> {
+  async cancelRun(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+    runId: string,
+    /** EV6 DoD (R5): quién cancela (cancelar un upgrade de videos en vuelo es solo de SUPER_ADMIN). */
+    actor?: { email?: string | null },
+  ): Promise<RunDto> {
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     const job = await this.loadRunRow(courseId, manifest, runId);
+    if (videoUpgradeOf(job.input_payload) && isActive(job) && !isSuperAdminEmail(actor?.email) && (await this.upgradeInFlight(this.dataSource, job))) {
+      throw adminRecoveryForbidden('Cancelar la generación de los videos reales');
+    }
 
     await this.tx(async (qr) => {
       const [locked] = await qr.query(
         `select id, status, worker_status from public.production_jobs where id = $1 for update`,
         [job.id],
       );
+      // EV6 DoD: `preview` también es terminal (no hay nada que cancelar).
       if (locked.worker_status === 'completed') {
         throw new ConflictException(`La ejecución ${job.id} ya está completada; no se puede cancelar`);
+      }
+      if (locked.worker_status === 'preview') {
+        throw new ConflictException(`La ejecución ${job.id} ya terminó (vista previa); no se puede cancelar`);
       }
       await this.markRunCancelled(qr, job.id, ownerId, 'user_cancelled');
       await this.cancelOpenItems(qr, job.id);
@@ -1560,6 +1603,8 @@ export class RunsService {
     resubmitVideo = false,
     resubmitProvider = false,
     auto?: { policy: AutoHealPolicy; now?: Date },
+    /** EV6 DoD (R5): quién reintenta (la recuperación PAGA de un video es solo de SUPER_ADMIN). */
+    actor?: { email?: string | null },
   ): Promise<ItemRunDto> {
     if (auto && (resubmitVideo || resubmitProvider)) {
       throw new BadRequestException('auto-heal: nunca reenvía a un proveedor (resubmitVideo/resubmitProvider)');
@@ -1625,6 +1670,12 @@ export class RunsService {
         const paidItems = isPaid(preTarget)
           ? (newPaid(preTarget, resubmitVideo || resubmitProvider) ? [preTarget] : [])
           : preRows.filter((r) => r.status === 'blocked' && isPaid(r) && newPaid(r, false));
+        // EV6 DoD (R5): un reintento que envía un render NUEVO a Videogen (video fallido sin job,
+        // reenvío explícito o videos bloqueados que se desbloquean) es recuperación de admin. Los
+        // reintentos sin gasto (re-poll, re-subida a YouTube, items no pagos) siguen siendo del dueño.
+        if (!auto && this.videoModeOf(job) === 'real' && !isSuperAdminEmail(actor?.email) && (resubmitVideo || paidItems.some((r) => r.type === 'video'))) {
+          throw adminRecoveryForbidden('Volver a generar un video (con costo)');
+        }
         await this.finopsPaidWorkGate({ courseId, ownerId, manifest, job, paidKeys: paidItems.map((r) => r.item_key), dryRun: !!auto });
       }
     }
@@ -1901,7 +1952,7 @@ export class RunsService {
            join public.course_blueprints b on b.id = m.blueprint_id
           where pj.execution_mode = 'dynamic_generation'
             and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
-            and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed')
+            and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed', 'preview')
             and g.status = 'failed'
             and ${latestGenerationPredicate('g')}
             -- I1: solo fallos recientes
@@ -2422,7 +2473,8 @@ export class RunsService {
       block('item_not_completed', message, () => new ConflictException({ message, code: 'item_not_completed' }));
     }
     const runActive = ACTIVE_RUN_WORKER_STATUSES.includes(String(job.worker_status));
-    if (!runActive && job.worker_status !== 'completed' && !isCancelledLike(job)) {
+    // EV6 DoD: `preview` es un run terminado igual que completed (se puede regenerar un item).
+    if (!runActive && job.worker_status !== 'completed' && job.worker_status !== 'preview' && !isCancelledLike(job)) {
       const message = `La ejecución ${job.id} terminó en "${job.worker_status}"; reintenta sus items fallidos (retry) antes de regenerar otros`;
       block('run_not_regenerable', message, () => new ConflictException({ message, code: 'run_not_regenerable' }));
     }
@@ -2641,6 +2693,8 @@ export class RunsService {
     runId: string,
   ): Promise<VideoUpgradePreview> {
     assertDynamicOwnerAllowed(user.id);
+    // EV6 DoD (R5): herramienta de recuperación de admin; el estimado tampoco se muestra a un no admin.
+    if (!isSuperAdminEmail(user.email)) throw adminRecoveryForbidden('Generar los videos reales de un curso');
     const manifest = await this.manifestOfRun(courseId, user.id, blueprintNumber, runId);
     const job = await this.reconcileCancellation(await this.loadRunRow(courseId, manifest, runId));
     return this.videoUpgradePreviewOf(this.dataSource, courseId, user, job, manifest);
@@ -2664,6 +2718,13 @@ export class RunsService {
   ): Promise<VideoUpgradeResult> {
     const ownerId = user.id;
     assertDynamicOwnerAllowed(ownerId);
+    // EV6 DoD (R5): solo SUPER_ADMIN (antes de leer o escribir nada; también la respuesta idempotente).
+    if (!isSuperAdminEmail(user.email)) {
+      throw new ForbiddenException({
+        code: APPROVAL_FORBIDDEN,
+        message: `${APPROVAL_FORBIDDEN}: generar los videos reales es una herramienta de recuperación de un administrador de Cursia. No se generó nada.`,
+      });
+    }
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     const job = await this.reconcileCancellation(await this.loadRunRow(courseId, manifest, runId));
     const already = await this.existingUpgradeFor(this.dataSource, job, estimateHash);
@@ -2896,8 +2957,10 @@ export class RunsService {
       block('real_video_not_allowed', msg, () => err as Error);
     }
     // Terminado; o (fix round 1, I-1) terminado `failed`/`cancelled` SOLO por un upgrade anterior.
-    const degraded = job.worker_status !== 'completed' && (await runIsUpgradeOnlyFailure(q, job));
-    if ((isCancelledLike(job) && !degraded) || (job.worker_status !== 'completed' && !degraded)) {
+    // EV6 DoD: un run `preview` (terminado con videos de vista previa) se mejora igual que un completed con mocks.
+    const finished = job.worker_status === 'completed' || job.worker_status === 'preview';
+    const degraded = !finished && (await runIsUpgradeOnlyFailure(q, job));
+    if ((isCancelledLike(job) && !degraded) || (!finished && !degraded)) {
       const m = `la generación del curso tiene que estar terminada para generar sus videos reales (estado: ${job.worker_status}).`;
       block(VIDEO_UPGRADE_RUN_NOT_READY, m, conflict(VIDEO_UPGRADE_RUN_NOT_READY, m));
     }
@@ -3688,8 +3751,16 @@ export class RunsService {
     return { created: false, reopened: false, run: await this.buildRunDto(job, manifest) };
   }
 
-  /** R17: 'mock' si se omite o viene vacío; cualquier otro valor ya fue rechazado por el DTO (400). */
+  /**
+   * EV6 DoD: 'real' si se omite o viene vacío; 'mock' SOLO con el escape de QA (403
+   * `video_preview_not_allowed` antes de escribir o estimar nada). Cualquier otro valor ya fue
+   * rechazado por el DTO (400).
+   */
   private normalizeVideoMode(v: unknown): RunVideoMode {
+    if (v === 'mock') {
+      assertVideoPreviewAllowed();
+      return 'mock';
+    }
     return v === 'real' ? 'real' : DEFAULT_VIDEO_MODE;
   }
 
@@ -3701,7 +3772,7 @@ export class RunsService {
 
   private videoModeOf(job: any): RunVideoMode {
     const v = job?.input_payload?.videoMode;
-    return (RUN_VIDEO_MODES as readonly string[]).includes(v) ? v : DEFAULT_VIDEO_MODE;
+    return (RUN_VIDEO_MODES as readonly string[]).includes(v) ? v : LEGACY_VIDEO_MODE;
   }
 
   /**
@@ -4055,6 +4126,7 @@ export class RunsService {
     rows.sort((a: any, b: any) => (order.get(a.item_key) ?? 1e9) - (order.get(b.item_key) ?? 1e9));
     const strategy = frozenVideoDeliveryOf(job.input_payload);
     const itemDtos = rows.map((r: any) => this.toItemDto(r, strategy));
+    const completion = await this.completionOf(job, rows, manifest);
 
     return {
       id: job.id,
@@ -4078,7 +4150,24 @@ export class RunsService {
       finishedAt: toIso(job.finished_at),
       progress,
       items: itemDtos,
+      completion,
     };
+  }
+
+  /**
+   * EV6 DoD: `RunDto.completion`. El paquete solo se consulta cuando la generación está completa
+   * (misma clave de reuse que el empaque: package-freshness.ts); §2.6 solo en runs failed/cancelled
+   * con upgrade.
+   */
+  private async completionOf(job: any, rows: any[], manifest: ManifestDto): Promise<RunCompletion> {
+    const m = { rulesVersion: manifest.rulesVersion, items: manifest.manifest.items };
+    const upgradeOnlyFailure = !!videoUpgradeOf(job.input_payload) && (job.worker_status === 'failed' || isCancelledLike(job))
+      ? await runIsUpgradeOnlyFailure(this.dataSource, job)
+      : false;
+    const first = evaluateRunCompletion(job, rows, m, null, { upgradeOnlyFailure });
+    if (!first.generationComplete) return first;
+    const ready = await hasDeliverablePackage({ query: this.dataSource.query.bind(this.dataSource) }, job, manifest, this.logger);
+    return evaluateRunCompletion(job, rows, m, { ready }, { upgradeOnlyFailure });
   }
 
   /**

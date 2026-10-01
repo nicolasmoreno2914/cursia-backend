@@ -3,7 +3,7 @@ import { DataSource } from 'typeorm';
 import { GenerationManifestsService } from '../generation-manifests/generation-manifests.service';
 import type { ManifestItemType } from '../generation-manifests/generation-manifest-builder';
 import { requiredArtifactTypesForPresent } from '../dynamic-packaging/artifact-resolver';
-import { assertDynamicOwnerAllowed, isRealVideoAllowedForOwner, toHttpConfigError } from '../features/dynamic-features';
+import { assertDynamicOwnerAllowed, isRealVideoAllowedForOwner, isVideoPreviewAllowed, toHttpConfigError } from '../features/dynamic-features';
 import { ACTIVE_RUN_WORKER_STATUSES } from '../dynamic-generation/item-transitions';
 import { canonicalContextHash } from '../dynamic-generation/run-hash';
 import { computePlanFromDb, planApplyWrites } from './invalidation-apply';
@@ -178,6 +178,8 @@ export class InvalidationService {
       }
       if (!allowed) blockers.push('real_video_not_allowed');
     }
+    // EV6 DoD (BE-A): mismo gate que el apply — videos NUEVOS de vista previa solo con el escape de QA.
+    if (base.videoMode === 'mock' && writes.videoItemsToGenerate.length > 0 && !isVideoPreviewAllowed()) blockers.push('video_preview_not_allowed');
     // V2.1 fix round 1 (M1): mismo 501 que el apply si B genera Gamma/TTS sin worker de proveedor.
     if (writes.providerItemsToGenerate.length > 0 && !isProviderWorkerDeployed()) blockers.push('provider_worker_not_deployed');
     blockers.push(...writes.missingRoles);

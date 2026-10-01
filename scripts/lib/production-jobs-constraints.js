@@ -49,6 +49,10 @@ const WORKER_STATUSES = Object.freeze([
   'needs_reconnect',
   'blocked_quota',
   'cancelled',
+  // EV6 DoD (BE-A): run dinámico TERMINADO con todos sus items completados pero
+  // algún componente de vista previa (video o Gamma/TTS mock). Terminal, nunca
+  // `completed` (supabase-migration-ev6-dod-preview-status.sql, mismo listado).
+  'preview',
 ]);
 
 const quoteList = (xs) => xs.map((x) => `'${x}'`).join(', ');
