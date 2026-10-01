@@ -1175,6 +1175,15 @@ pg.Client.prototype.query = function (sql, ...rest) { const t = typeof sql === '
       await bad(`create policy ev6_bad on storage.objects for insert to anon with check (true)`, /ev6_bad: no exige la carpeta propia/, 'anon insert');
       await bad(`create policy ev6_bad on storage.objects for all to public using ((storage.foldername(name))[1] = (select auth.uid())::text) with check (bucket_id = 'cursia-artifacts')`, /ev6_bad: no exige la carpeta propia.* en ALL para public/, 'ALL a public, with_check flojo');
       await bad(`create policy ev6_bad on storage.objects for select to authenticated using (bucket_id = 'cursia-artifacts' and name like 'qa-internal/%')`, /ev6_bad/, 'lectura de qa-internal/');
+      // Fix round 1 (m4): negaciones → falla cerrada (el regex no puede probar que excluyan qa-internal/).
+      await bad(`create policy ev6_bad on storage.objects for select to authenticated using (not (bucket_id = 'avatars'))`, /ev6_bad: usa una negación/, 'NOT otro bucket');
+      await bad(`create policy ev6_bad on storage.objects for select to authenticated using (bucket_id = 'cursia-artifacts' and not ((storage.foldername(name))[1] = (select auth.uid())::text))`, /ev6_bad: usa una negación/, 'NOT carpeta propia');
+      await bad(`create policy ev6_bad on storage.objects for select to authenticated using (bucket_id <> 'avatars')`, /ev6_bad: usa una negación/, '<> otro bucket');
+      await bad(`create policy ev6_bad on storage.objects for select to authenticated using (bucket_id = 'cursia-artifacts' and (storage.foldername(name))[1] = (select auth.uid())::text and name is not null)`, /ev6_bad: usa una negación/, 'IS NOT');
+      eq([SP.policyRisk({ roles: '{authenticated}', cmd: 'SELECT', qual: "(NOT (bucket_id = 'avatars'::text))" }) !== null,
+        SP.policyRisk({ roles: '{authenticated}', cmd: 'SELECT', qual: "((bucket_id = 'cursia-artifacts'::text) AND (NOT ((storage.foldername(name))[1] = (( SELECT auth.uid() AS uid))::text)))" }) !== null,
+        SP.policyRisk({ roles: '{authenticated}', cmd: 'SELECT', qual: "((bucket_id = 'cursia-artifacts'::text) AND ((storage.foldername(name))[1] = (( SELECT auth.uid() AS uid))::text))" })],
+        [true, true, null], 'puro: las formas del review');
       // Ignoradas: service_role, restrictiva, otro bucket.
       for (const sql of [
         `create policy ev6_bad on storage.objects for select to service_role using (true)`,

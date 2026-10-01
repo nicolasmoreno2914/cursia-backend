@@ -670,6 +670,27 @@ const ENV_KEYS = [
       eq(ad.status, 'pending', 'el admin sí');
     });
 
+    await check('dod', 'follow-up fix round 1 m1: el gate de FinOps del reintento del dueño cuenta SOLO los items pagos que ESTE reintento desbloquea: sin presupuesto del run para videos, un video ajeno bloqueado (render intentado) no le pide aprobación de admin al reintento gratis de un content; un video dependiente sin render sí pasa por el gate de siempre', async () => {
+      const R = await finishedRun('DoD m1', { videoMode: 'real', providerModes: { presentation: 'real', audio: 'real' }, videoItemMode: 'real' });
+      const c1 = await latest(R.runId, `content:${R.c1}`);
+      const v2 = await latest(R.runId, `video:${R.c2}`);
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'Falló después de 3 intentos' where id = $1`, [c1.id]);
+      await ds.query(`update public.generation_item_runs set status = 'blocked', error = 'videogen_failed: render rechazado',
+        output_summary = (output_summary - 'external' - 'delivery' - 'youtubeVideoId' - 'youtubeUrl') || '{"externalSubmitStartedAt":"2026-10-01T00:00:00Z"}'::jsonb where id = $1`, [v2.id]);
+      await recompute(R.runId);
+      // El presupuesto aprobado del run (el del arranque por el camino QA, sin videos pagos) no cubre un video:
+      // si el gate contara el video ajeno, el reintento gratis pediría aprobación de admin (409).
+      const owner = { id: OWNER, email: 'owner@cursia.test' };
+      const it = await runs.retryItem(R.cid, OWNER, 1, R.runId, `content:${R.c1}`, false, false, undefined, owner);
+      eq([it.status, (await latest(R.runId, `video:${R.c2}`)).status], ['pending', 'blocked'], 'reintento gratis sin aprobación; el video ajeno no se toca');
+      // Un video DEPENDIENTE que nunca renderizó: su primer render sigue pasando por el gate de FinOps.
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'Falló después de 3 intentos', finished_at = now() where id = $1`, [(await latest(R.runId, `content:${R.c1}`)).id]);
+      const v1 = await latest(R.runId, `video:${R.c1}`);
+      await ds.query(`update public.generation_item_runs set status = 'blocked', error = null, output_summary = output_summary - 'external' - 'delivery' - 'youtubeVideoId' - 'youtubeUrl' - 'mode' where id = $1`, [v1.id]);
+      await recompute(R.runId);
+      await rejectsRe(runs.retryItem(R.cid, OWNER, 1, R.runId, `content:${R.c1}`, false, false, undefined, owner), /budget_approval_required/, 'dependiente sin render: FinOps', 409);
+    });
+
     await check('dod', 'fix I1: un curso SIN videos arranca (default real) para un owner NO elegible para video real; con videos sigue el 403 real_video_not_enabled', async () => {
       const C = await confirmedCourse('DoD I1 sin videos', CUSTOMER, { videos: false });
       eq(C.manifest.manifest.items.filter((i) => i.type === 'video').length, 0, 'Manifest sin videos');
@@ -1033,6 +1054,25 @@ const ENV_KEYS = [
       assert(meta.includes(OwnerSafeRunInterceptor), 'RunsController usa OwnerSafeRunInterceptor');
     });
 
+    await check('dod', 'follow-up fix round 1 m2: GET /jobs y /jobs/:id no le muestran a un no admin el mensaje ni los faltantes del bloqueo del paquete (output_summary.autoPackage.blocked): solo el código; un SUPER_ADMIN ve todo; otras filas intactas y sin mutar', async () => {
+      const { ProductionJobsController } = L('modules/production-jobs/production-jobs.controller.js');
+      const blockedRun = () => ({ id: 'r', executionMode: 'dynamic_generation', steps: [{ id: 's' }],
+        outputSummary: { x: 1, autoPackage: { eligibleAt: '2026-10-01T00:00:00Z', blocked: { code: 'youtube_delivery_incomplete', message: 'youtube_delivery_incomplete: … missingJson=["video:x:missing_youtube_url"]', missing: ['video:x:missing_youtube_url'], at: '2026-10-01T00:01:00Z' } } } });
+      const legacy = { id: 'l', executionMode: 'legacy', outputSummary: { autoPackage: { blocked: { message: 'no es un run dinámico' } } } };
+      const rows = [blockedRun(), legacy];
+      const svc = { async findAll() { return rows; }, async findOne(id) { return rows.find((r) => r.id === id); } };
+      const ctl = new ProductionJobsController(svc);
+      const owner = { id: OWNER, email: 'owner@cursia.test' };
+      const list = (await ctl.findAll(owner)).data.jobs;
+      eq(list[0].outputSummary.autoPackage, { eligibleAt: '2026-10-01T00:00:00Z', blocked: { code: 'youtube_delivery_incomplete', at: '2026-10-01T00:01:00Z', message: null } }, 'listado: solo el código');
+      eq([list[0].outputSummary.x, list[0].steps, list[1]], [1, [{ id: 's' }], legacy], 'resto intacto');
+      eq((await ctl.findOne('r', owner)).data.outputSummary.autoPackage.blocked.message, null, 'detalle: sin el mensaje');
+      assert(/missingJson/.test(rows[0].outputSummary.autoPackage.blocked.message), 'la fila original no se muta');
+      const admin = { id: OWNER, email: ADMIN.email };
+      eq((await ctl.findOne('r', admin)).data.outputSummary.autoPackage.blocked.missing, ['video:x:missing_youtube_url'], 'admin: detalle completo');
+      eq((await ctl.findAll(admin)).data.jobs[0], rows[0], 'admin: fila cruda');
+    });
+
     await check('dod', 'follow-up R4: DELETE /artifacts/:id de un .mbz QA / degradado NUEVO → 404 para un no admin (ni la fila ni el objeto qa-internal/ se borran); un SUPER_ADMIN sí lo borra; un .mbz anterior / final del dueño se borra como siempre', async () => {
       const { ArtifactsService } = L('modules/artifacts/artifacts.service.js');
       const { ArtifactsController } = L('modules/artifacts/artifacts.controller.js');
@@ -1049,8 +1089,14 @@ const ENV_KEYS = [
         const ctl = new ArtifactsController(svc);
         await rejectsRe(ctl.remove(qaId, OWNER_NOT_ADMIN), /not found/i, 'dueño', 404);
         eq([(await ds.query(`select count(*)::int n from public.artifacts where id = $1`, [qaId]))[0].n, deleted.length], [1, 0], 'nada borrado');
-        await ctl.remove(qaId, { id: OWNER, email: ADMIN.email });
-        eq([(await ds.query(`select count(*)::int n from public.artifacts where id = $1`, [qaId]))[0].n, deleted.length, /qa-internal/.test(deleted[0] || '')], [0, 1, true], 'admin lo borra');
+        // Fix round 1 (m3): el SUPER_ADMIN NO es el dueño del curso (caso real: el QA es del curso del cliente).
+        const ADMIN_OTHER = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', email: ADMIN.email };
+        await ctl.remove(qaId, ADMIN_OTHER);
+        eq([(await ds.query(`select count(*)::int n from public.artifacts where id = $1`, [qaId]))[0].n, deleted.length, /qa-internal/.test(deleted[0] || '')], [0, 1, true], 'un admin (no dueño) lo borra');
+        // ... pero solo los QA / degradados: cualquier otro artifact del cliente sigue siendo del dueño (404).
+        const otherFin = await ins(`${OWNER}/dynamic/1/1/dynamic_mbz/r/z.mbz`, {});
+        await rejectsRe(ctl.remove(otherFin, ADMIN_OTHER), /not found/i, 'admin no dueño, artifact final del cliente', 404);
+        eq((await ds.query(`select count(*)::int n from public.artifacts where id = $1`, [otherFin]))[0].n, 1, 'el final del cliente sigue');
         const finId = await ins(`${OWNER}/dynamic/1/1/dynamic_mbz/r/y.mbz`, {});
         await ctl.remove(finId, OWNER_NOT_ADMIN);
         eq((await ds.query(`select count(*)::int n from public.artifacts where id = $1`, [finId]))[0].n, 0, 'final del dueño: borrado como siempre');
