@@ -17,9 +17,12 @@
 //  - inforef.xml del quiz lista TODAS sus categorías;
 //  - preguntas: name = id, questiontext = enunciado, generalfeedback = explicación (format 1),
 //    MC: correcta + 3 distractores con su `why` (feedbackformat 1), V/F: `whyWrong` en la opción
-//    equivocada, emparejamiento: pares; combinados vacíos; todo escapado (XML bien formado);
+//    equivocada, emparejamiento (fix 1): DEFINICIÓN = subpregunta (format 2), TÉRMINO = opción del
+//    desplegable; combinados vacíos; todo escapado (XML bien formado);
 //  - facts: preguntas del examen = slots, bankSize = banco; validateMbzV3 ok; determinista;
 //  - A4: evidencia que no está en el Markdown del capítulo → EXAM_BANK_INVALID [EXAM_BANK_EVIDENCE];
+//    fix 1: término con < > → [EXAM_BANK_MATCH]; control C0 → [EXAM_BANK_SCHEMA]; plan congelado que
+//    no cubre un capítulo actual → [EXAM_BANK_PLAN];
 //  - GIFT: sin question_set_reference y (BASE_DIST=<dist de la base>) byte a byte el builder anterior.
 //
 // Usage: node scripts/check-p2-bank-xml.js [path/to/dist] [--out paquete.mbz]
@@ -376,8 +379,10 @@ async function main() {
               { text: 'Falso', format: '0', fraction: b.answer ? '0.0000000' : '1.0000000', feedback: b.answer ? para(b.whyWrong) : '', ff: '1' },
             ], `${b.id}: V/F`);
           } else {
-            const pairs = [...x.matchAll(/<match id="\d+"><questiontext>([\s\S]*?)<\/questiontext><questiontextformat>2<\/questiontextformat><answertext>([\s\S]*?)<\/answertext><\/match>/g)].map((m) => ({ term: dx(m[1]), definition: dx(m[2]) }));
-            eq(pairs, b.pairs, `${b.id}: pares`);
+            // fix 1: subpregunta = definición, opción del desplegable = término
+            const pairs = [...x.matchAll(/<match id="\d+"><questiontext>([\s\S]*?)<\/questiontext><questiontextformat>2<\/questiontextformat><answertext>([\s\S]*?)<\/answertext><\/match>/g)].map((m) => ({ term: dx(m[2]), definition: dx(m[1]) }));
+            eq(pairs, b.pairs, `${b.id}: pares (definición → subpregunta, término → opción)`);
+            assert(b.pairs.every((p) => !/[<>]/.test(p.term) && p.term.trim().length <= 60), `${b.id}: términos cortos sin < >`);
           }
         }
       }
@@ -427,6 +432,21 @@ async function main() {
       b.questions = b.questions.filter((x) => !victims.includes(x));
     });
     await rejects(B.buildDynamicMbzV3(short.input), /^EXAM_BANK_INVALID: exam:\S+ \[.*EXAM_BANK_LEAF_COUNT/, 'piso');
+  });
+
+  await check('fix 1: término con < > → EXAM_BANK_MATCH; carácter de control C0 → EXAM_BANK_SCHEMA; plan congelado que no cubre un capítulo actual → EXAM_BANK_PLAN (builder, falla fuerte)', async () => {
+    const lt = bankInput((mods) => { [...mods.values()][0].questions.find((x) => x.type === 'match').pairs[0].term = 'Carga <5 kg'; });
+    await rejects(B.buildDynamicMbzV3(lt.input), /^EXAM_BANK_INVALID: exam:\S+ \[EXAM_BANK_MATCH\]/, 'término con <');
+    const ctl = bankInput((_m, f) => { f.questions[0].explanation += '\u0007'; });
+    await rejects(B.buildDynamicMbzV3(ctl.input), /^EXAM_BANK_INVALID: final_exam\S* \[EXAM_BANK_SCHEMA\]/, 'control');
+    const cut = bankInput((mods) => {
+      // banco «viejo» cuyo plan congelado (bien formado, pertenencia OK) omite el último capítulo del módulo
+      const b = [...mods.values()][0];
+      const last = b.plan[b.plan.length - 1].chapterId;
+      b.plan = b.plan.filter((l) => l.chapterId !== last);
+      b.questions = b.questions.filter((x) => x.chapterId !== last);
+    });
+    await rejects(B.buildDynamicMbzV3(cut.input), /^EXAM_BANK_INVALID: exam:\S+ \[EXAM_BANK_PLAN\] el plan congelado del banco no cubre/, 'cobertura');
   });
 
   await check('GIFT: sin question_set_reference (slots fijos de siempre)' + (process.env.BASE_DIST ? ' y byte a byte el builder de la base (BASE_DIST)' : ''), async () => {

@@ -9,10 +9,13 @@
 //      de la hoja de SU slot (filtercondition restaurado), cobertura capítulo × tipo, nota y completion;
 //   3. el mismo estudiante aprueba el examen final (100 %);
 //   4. un profesor fija `timeclose` en el pasado → opciones de revisión AFTER_CLOSE (feedback 1,
-//      generalfeedback 1) y el HTML de la pregunta revisada contiene la explicación y el `why`.
+//      generalfeedback 1) y el HTML de la pregunta revisada contiene la explicación y el `why`;
+//   5. (fix 1) emparejamiento: la DEFINICIÓN es la subpregunta y el TÉRMINO la opción del desplegable,
+//      y cada término se ve LITERAL en las <option> renderizadas (format_string no le come texto).
+//      Con <banks.json> (sidecar de check-p2-bank-xml.js --out) compara contra los pares del banco.
 // Crea usuarios/intentos solo en ESE curso de prueba; no cambia configuración del sitio.
 //
-// Uso: php -c php.ini p2-bank-attempts.php <moodleRoot> <courseid> <output.json>
+// Uso: php -c php.ini p2-bank-attempts.php <moodleRoot> <courseid> <output.json> [banks.json]
 namespace PHPUnit\Framework { if (!class_exists('PHPUnit\Framework\TestCase', false)) { abstract class TestCase { public function __construct($name = null) {} } } }
 namespace PHPUnit\Framework\Constraint { if (!class_exists('PHPUnit\Framework\Constraint\Constraint', false)) { abstract class Constraint {} } }
 namespace {
@@ -37,6 +40,13 @@ $modinfo = get_fast_modinfo($course);
 $quizzes = [];
 foreach ($modinfo->get_cms() as $cm) {
     if ($cm->modname === 'quiz') $quizzes[$cm->idnumber] = $cm;
+}
+$bankpairs = [];
+if (!empty($argv[4])) {
+    $banks = json_decode(file_get_contents($argv[4]), true);
+    foreach (array_merge(array_values($banks['modules']), [$banks['final']]) as $b) {
+        foreach ($b['questions'] as $bq) { if ($bq['type'] === 'match') $bankpairs[$bq['id']] = $bq['pairs']; }
+    }
 }
 $names = [0 => 'INCOMPLETE', 1 => 'COMPLETE', 2 => 'COMPLETE_PASS', 3 => 'COMPLETE_FAIL'];
 
@@ -210,6 +220,23 @@ foreach (array_slice($ao->get_slots(), 0, 40) as $slot) {
         $fb = trim(html_entity_decode(strip_tags($fbraw), ENT_QUOTES));
         $row['chosenOptionFeedbackShown'] = $fb !== '' && str_contains(html_entity_decode(strip_tags($html), ENT_QUOTES), $fb);
     }
+    if ($q->get_type_name() === 'match') {
+        // Opciones del desplegable tal como las ve el estudiante (format_string + escape del <select>).
+        preg_match_all('#<option[^>]*>(.*?)</option>#s', $html, $m);
+        $shown = array_map(fn($o) => html_entity_decode($o, ENT_QUOTES | ENT_HTML5), $m[1]);
+        $choices = array_values(array_unique(array_values($q->choices)));
+        $stems = array_values($q->stems);
+        $row['matchChoicesRenderedVerbatim'] = count($choices) > 0 && !array_diff($choices, $shown);
+        $text = html_entity_decode(strip_tags($html), ENT_QUOTES | ENT_HTML5);
+        $row['matchStemsRenderedVerbatim'] = !array_filter($stems, fn($st) => !str_contains($text, $st));
+        if (isset($bankpairs[$q->name])) {
+            $defs = array_column($bankpairs[$q->name], 'definition');
+            $terms = array_column($bankpairs[$q->name], 'term');
+            sort($defs); sort($terms); $s2 = $stems; sort($s2); $c2 = $choices; sort($c2);
+            $row['matchOrientation'] = ($s2 === $defs && $c2 === $terms) ? 'definición→subpregunta, término→opción' : 'DISTINTA';
+        }
+        $row['sampleChoice'] = $choices[0] ?? null;
+    }
     $checked[] = $row;
 }
 \core\session\manager::set_user($admin);
@@ -217,6 +244,12 @@ $out['afterClose']['questions'] = count($checked);
 $out['afterClose']['generalfeedbackShownAll'] = count(array_filter($checked, fn($r) => $r['generalfeedbackShown'])) === count($checked);
 $withfb = array_filter($checked, fn($r) => array_key_exists('chosenOptionFeedbackShown', $r));
 $out['afterClose']['chosenOptionFeedbackShownAll'] = count(array_filter($withfb, fn($r) => $r['chosenOptionFeedbackShown'])) === count($withfb);
+$matchrows = array_values(array_filter($checked, fn($r) => $r['qtype'] === 'match'));
+$out['afterClose']['match'] = ['questions' => count($matchrows),
+    'choicesRenderedVerbatimAll' => count($matchrows) > 0 && !array_filter($matchrows, fn($r) => !$r['matchChoicesRenderedVerbatim']),
+    'stemsRenderedVerbatimAll' => count($matchrows) > 0 && !array_filter($matchrows, fn($r) => !$r['matchStemsRenderedVerbatim']),
+    'orientationAll' => array_values(array_unique(array_map(fn($r) => $r['matchOrientation'] ?? 'sin banco', $matchrows))),
+    'sample' => $matchrows[0] ?? null];
 $out['afterClose']['sample'] = array_slice($checked, 0, 6);
 $DB->set_field('quiz', 'timeclose', 0, ['id' => $examcm->instance]);
 

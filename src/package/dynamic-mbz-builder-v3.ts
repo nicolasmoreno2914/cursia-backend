@@ -122,7 +122,7 @@ import { compileLibroHtmlV3, libroWordCount } from './v3/libro-v3';
 import { downscaleCoverPng } from './v3/png-downscale';
 import { activityPackageFilename, h5pActivityInlineIntroHtml, introThemeFrom, scormIntroHtml } from './v3/activity-intro';
 import { IdAllocator, buildQuizV3, parseScormManifestIds, scormActivityXmlV3 } from './v3/moodle-activities-v3';
-import { planSlotCount, validateExamBank } from '../modules/course-shell/exam-bank';
+import { expectedExamPlan, planSlotCount, validateExamBank } from '../modules/course-shell/exam-bank';
 import type { ExamBankV1 } from '../modules/course-shell/exam-bank';
 import { COURSE_BADGE_BACKUP_ID, COURSE_BADGE_DEFAULT_ISSUER, courseBadgeImages, courseBadgeName, courseBadgeXml } from './v3/course-badge';
 
@@ -165,7 +165,8 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * 3.3.0 (EV6 P2-B1): política de revisión del quiz (solo nota hasta el cierre) y
  * `completionattemptsexhausted`.
  * 3.4.0 (EV6 P2-B3): exámenes con banco `dynamic_exam_bank_json` → categorías por capítulo|módulo ×
- * tipo y slots aleatorios (`question_set_reference`), retroalimentación por opción + general. Los
+ * tipo y slots aleatorios (`question_set_reference`), retroalimentación por opción + general;
+ * emparejamiento del banco = definición como subpregunta y término como opción (fix 1). Los
  * paquetes con exámenes GIFT quedan byte a byte iguales a 3.3.0 (el bump invalida solo el reuse).
  */
 export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.4.0';
@@ -571,6 +572,14 @@ function resolveExamSources(plan: PackagingPlanV3, c: DynamicPackageContentsV3):
       const codes = [...new Set(r.errors.map((e) => e.code))].sort();
       throw new Error(`${EXAM_BANK_INVALID_BUILDER}: ${key} [${codes.join(', ')}] ${r.errors.slice(0, 5).map((e) => `${e.path} ${e.code}: ${e.message}`).join(' | ')}`);
     }
+    // Fix 1 (M4): el plan CONGELADO debe cubrir cada capítulo (módulo, en el final) que el plan ACTUAL
+    // cubre; un reuse viejo que omita uno dejaría ese capítulo sin evaluar → falla fuerte.
+    const owner = (l: ExamBankV1['plan'][number]): string => ('chapterId' in l ? l.chapterId : l.moduleId);
+    const frozen = new Set(bank.plan.map(owner));
+    const uncovered = [...new Set(expectedExamPlan(scope, chapters).map(owner))].filter((o) => !frozen.has(o));
+    if (uncovered.length) {
+      throw new Error(`${EXAM_BANK_INVALID_BUILDER}: ${key} [EXAM_BANK_PLAN] el plan congelado del banco no cubre ${scope === 'module' ? 'los capítulos' : 'los módulos'} ${uncovered.join(', ')}`);
+    }
   };
   const examModules = new Set(plan.modules.filter((m) => m.keys.exam).map((m) => m.moduleId));
   for (const id of c.examBanks?.keys() ?? []) {
@@ -826,6 +835,12 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       ...(src.kind === 'bank' ? { bank: { doc: src.bank, groups: bankGroups } } : { gift: src.gift }),
       attempts: k.attempts, grademethod: k.gradeMethod, ts, stampSeed, ids,
     });
+    // Fix 1 (M5): los slots del quiz y las «preguntas» que anuncia el shell (facts) salen de la misma
+    // fuente; si difieren, el texto del curso mentiría → falla fuerte.
+    const announced = kind === 'finalExam' ? facts.finalExam.questionCount : facts.modules.find((x) => `cv3:exam:${x.id}` === idnumber)?.examQuestionCount;
+    if (q.questionCount !== announced) {
+      throw new Error(`MBZ_V3_INVARIANT: ${idnumber} tiene ${q.questionCount} slots pero facts anuncia ${announced} preguntas`);
+    }
     W.put(`${a.dir}/quiz.xml`, q.quizXml);
     questionCategories.push(q.questionCategoriesXml);
     gradedCommon(a, kind, name, [], q.categoryIds);

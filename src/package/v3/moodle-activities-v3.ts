@@ -264,9 +264,13 @@ function bankQuestionPluginXml(q: ExamBankQuestion, ids: IdAllocator): string {
     const fbFalse = q.answer ? xmlEsc(htmlPara(q.whyWrong)) : '';
     return `<plugin_qtype_truefalse_question><answers><answer id="${t}"><answertext>Verdadero</answertext><answerformat>0</answerformat><fraction>${q.answer ? '1.0000000' : '0.0000000'}</fraction><feedback>${fbTrue}</feedback><feedbackformat>1</feedbackformat></answer><answer id="${f}"><answertext>Falso</answertext><answerformat>0</answerformat><fraction>${!q.answer ? '1.0000000' : '0.0000000'}</fraction><feedback>${fbFalse}</feedback><feedbackformat>1</feedbackformat></answer></answers><truefalse id="${ids.take('qoptions')}"><trueanswer>${t}</trueanswer><falseanswer>${f}</falseanswer><showstandardinstruction>0</showstandardinstruction></truefalse></plugin_qtype_truefalse_question>`;
   }
-  // match: pares como en GIFT (término → subpregunta, definición → opción); la explicación va en generalfeedback.
+  // match (fix 1, ruling del coordinador): la DEFINICIÓN es la subpregunta (FORMAT_PLAIN, texto largo
+  // bien renderizado) y el TÉRMINO es la opción del desplegable (corta; `answertext` no tiene formato y
+  // Moodle la pasa por format_string → el contrato prohíbe < > en `term`). Moodle arma las opciones con
+  // los `answertext` distintos: los términos son únicos (EXAM_BANK_MATCH). El GIFT no cambia.
+  // La explicación va en generalfeedback.
   const matches = q.pairs
-    .map((pr) => `<match id="${ids.take('match')}"><questiontext>${xmlEsc(pr.term)}</questiontext><questiontextformat>2</questiontextformat><answertext>${xmlEsc(pr.definition)}</answertext></match>`)
+    .map((pr) => `<match id="${ids.take('match')}"><questiontext>${xmlEsc(pr.definition)}</questiontext><questiontextformat>2</questiontextformat><answertext>${xmlEsc(pr.term)}</answertext></match>`)
     .join('');
   return `<plugin_qtype_match_question><matchoptions id="${ids.take('qoptions')}"><shuffleanswers>1</shuffleanswers><correctfeedback></correctfeedback><correctfeedbackformat>1</correctfeedbackformat><partiallycorrectfeedback></partiallycorrectfeedback><partiallycorrectfeedbackformat>1</partiallycorrectfeedbackformat><incorrectfeedback></incorrectfeedback><incorrectfeedbackformat>1</incorrectfeedbackformat><shownumcorrect>0</shownumcorrect></matchoptions><matches>${matches}</matches></plugin_qtype_match_question>`;
 }

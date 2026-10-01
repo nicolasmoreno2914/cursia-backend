@@ -250,6 +250,10 @@ async function main() {
     ['EXAM_BANK_MATCH (término repetido)', vMod, (d) => { const q = d.questions.find((x) => x.type === 'match'); q.pairs[1].term = q.pairs[0].term.toLowerCase(); }, 'EXAM_BANK_MATCH'],
     ['EXAM_BANK_MATCH (definición repetida)', vMod, (d) => { const q = d.questions.find((x) => x.type === 'match'); q.pairs[1].definition = q.pairs[0].definition; }, 'EXAM_BANK_MATCH'],
     ['EXAM_BANK_MATCH (la definición contiene su término)', vMod, (d) => { const q = d.questions.find((x) => x.type === 'match'); q.pairs[0].definition = `La ${q.pairs[0].term} del turno`; }, 'EXAM_BANK_MATCH'],
+    ['EXAM_BANK_MATCH (término con < o >, fix 1 P2-B3)', vMod, (d) => { const q = d.questions.find((x) => x.type === 'match'); q.pairs[0].term = 'Carga <5 kg'; }, 'EXAM_BANK_MATCH'],
+    ['EXAM_BANK_SCHEMA (término > 60, fix 1 P2-B3)', vMod, (d) => { const q = d.questions.find((x) => x.type === 'match'); q.pairs[0].term = 'T'.repeat(61); }, 'EXAM_BANK_SCHEMA'],
+    ['EXAM_BANK_SCHEMA (carácter de control C0, fix 1 P2-B3)', vMod, (d) => { d.questions[0].correct.why += '\u0000'; }, 'EXAM_BANK_SCHEMA'],
+    ['EXAM_BANK_SCHEMA (CR, fix 1 P2-B3)', vFin, (d) => { d.questions[0].stem += '\r'; }, 'EXAM_BANK_SCHEMA'],
     ['EXAM_BANK_EVIDENCE (no está en el capítulo)', vMod, (d) => { d.questions[0].evidence = 'Una frase inventada que el capítulo nunca dijo sobre la planta ni sobre el turno.'; }, 'EXAM_BANK_EVIDENCE'],
     ['EXAM_BANK_EVIDENCE (está en OTRO capítulo)', vMod, (d) => { d.questions[0].evidence = EBF.evidenceSentence(1, 0); }, 'EXAM_BANK_EVIDENCE'],
   ];
