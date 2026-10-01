@@ -55,6 +55,7 @@ import {
   FINAL_EXAM_QUESTION_RANGE,
   ActivityTypeSource,
   H5pActivityType,
+  H5pActivityTypeV2,
   V3_PAYLOAD_INVALID,
   VideoClaimFacts,
   resolveActivityType,
@@ -224,7 +225,7 @@ export interface ClaimedItem {
 export interface ClaimPayloadV3 {
   /** Artifact cuyo contenido valida el servidor al completar (null = solo roles). */
   validatedArtifactType: string | null;
-  activityType?: H5pActivityType;
+  activityType?: H5pActivityTypeV2;
   /**
    * EV5-C: 'manifest' = `activityType` congelado en el Manifest (h5pType,
    * reglas por objetivo): el ejecutor debe confiar en él. 'rotation' = hash del
@@ -243,6 +244,8 @@ export interface ClaimPayloadV3 {
    * comporta como v21-exp-5 y no manda why/apply. Así el orden de deploy FE/BE no rompe la generación.
    */
   experienceFeatures?: { eduFields: boolean };
+  /** EV6 IV avanzado: 2 si el Manifest declara `features.ivAdvanced = 1` (ausente = 1). */
+  videoInteractionsSchemaVersion?: 2;
 }
 
 /**
@@ -1056,7 +1059,10 @@ export class SchedulerService {
     }
     if (g.type === 'activity') {
       // EV5-C: tipo esperado del Manifest congelado del run (h5pType o, legacy, hash).
-      ctx.expectedActivityType = resolveActivityType({ ...mItem, chapterId: g.chapter_id ?? mItem.chapterId ?? null });
+      const rules = manifest?.features?.activityTypeRules;
+      ctx.expectedActivityType = resolveActivityType({ ...mItem, chapterId: g.chapter_id ?? mItem.chapterId ?? null }, { activityTypeRules: rules });
+      // EV6 H5P v2: el validador acepta branchingscenario solo con el marcador 2 del Manifest congelado.
+      if (rules !== undefined && rules !== null) ctx.activityTypeRules = rules;
     }
     if (g.type === 'module_intro') {
       const mod = (manifest.modules ?? []).find((m: any) => m.moduleId === g.module_id);
@@ -1066,12 +1072,15 @@ export class SchedulerService {
       }
     }
     if (g.type === 'video_interactions') {
-      const vf = await this.loadVideoFacts(this.dataSource, g.job_id, g.manifest_id, `video:${g.chapter_id}`);
+      const ivAdvanced = manifest?.features?.ivAdvanced === 1;
+      const vf = await this.loadVideoFacts(this.dataSource, g.job_id, g.manifest_id, `video:${g.chapter_id}`, ivAdvanced);
       if (vf.ok === false) {
         // M6: reintentable — si el video se regenera, un claim nuevo trae el plan vigente.
         return { kind: 'invalid', message: `${V3_PAYLOAD_INVALID}: ${vf.code}: ${vf.message}`, codes: [vf.code], retryable: true };
       }
       ctx.video = { videoItemKey: vf.video.videoItemKey, durationSec: vf.video.durationSec };
+      // EV6 IV avanzado: schemaVersion 2 (pausas validadas contra la duración MEDIDA del video).
+      if (ivAdvanced) ctx.videoInteractionsSchemaVersion = 2;
     }
 
     let text: string;
@@ -1167,6 +1176,7 @@ export class SchedulerService {
     jobId: string,
     manifestId: number,
     videoItemKey: string,
+    ivAdvanced = false,
   ): Promise<ReturnType<typeof videoClaimFacts>> {
     const [v] = await q.query(
       `select d.id as video_item_run_id, d.output_summary, a.metadata
@@ -1179,7 +1189,7 @@ export class SchedulerService {
       [jobId, manifestId, videoItemKey],
     );
     if (!v) return { ok: false, code: 'VIDEO_NOT_COMPLETED', message: `el video ${videoItemKey} no está completado` };
-    const facts = videoClaimFacts({ videoItemKey, outputSummary: v.output_summary, artifactMetadata: v.metadata });
+    const facts = videoClaimFacts({ videoItemKey, outputSummary: v.output_summary, artifactMetadata: v.metadata, ...(ivAdvanced ? { ivAdvanced: true } : {}) });
     if (facts.ok) (facts as any).videoItemRunId = v.video_item_run_id;
     return facts;
   }
@@ -1218,16 +1228,20 @@ export class SchedulerService {
       out.moduleChapterIds = mod ? mod.chapters.map((c) => c.chapterId) : [];
     }
     if (row.type === 'activity' && mItem.variant === 'h5p') {
-      const r = resolveActivityTypeWithSource({ ...mItem, chapterId: row.chapter_id });
+      const r = resolveActivityTypeWithSource({ ...mItem, chapterId: row.chapter_id }, { activityTypeRules: manifest.features?.activityTypeRules });
       if (r) {
         out.activityType = r.type;
         out.activityTypeSource = r.source;
       }
     }
     if (row.type === 'video_interactions') {
-      const vf = await this.loadVideoFacts(qr, row.job_id, row.manifest_id, `video:${row.chapter_id}`);
+      const ivAdvanced = manifest.features?.ivAdvanced === 1;
+      const vf = await this.loadVideoFacts(qr, row.job_id, row.manifest_id, `video:${row.chapter_id}`, ivAdvanced);
       if (vf.ok === false) throw new ClaimPayloadUnavailable(vf.code, vf.message);
       out.video = vf.video;
+      // EV6 IV avanzado: el ejecutor escribe video_interactions schemaVersion 2 (reflections en
+      // los índices de video.reflectionPlan). Ausente = schemaVersion 1 (Manifests anteriores).
+      if (ivAdvanced) out.videoInteractionsSchemaVersion = 2;
       // EV6 T5 fix round 3 (I-4): procedencia explícita — estas preguntas se construyen con ESTA
       // generación del video (cualquier camino: generación inicial, «Regenerar», upgrade).
       const src = (vf as any).videoItemRunId;

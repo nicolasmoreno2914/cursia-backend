@@ -61,7 +61,7 @@ function storedActivityTypeRules(row: any): ActivityTypeRulesVersion {
  */
 function activityTypeRulesValue(raw: unknown, id: unknown): ActivityTypeRulesVersion {
   if (raw === undefined || raw === null) return 0;
-  if (raw === 0 || raw === 1) return raw;
+  if (raw === 0 || raw === 1 || raw === 2) return raw;
   throw new InternalServerErrorException(
     `Generation Manifest #${String(id)}: features.activityTypeRules guardado inválido (${JSON.stringify(raw)})`,
   );

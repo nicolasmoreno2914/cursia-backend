@@ -141,7 +141,7 @@ function assertV3Input(input: InvalidationPlanInput): { from: BlueprintSnapshotV
 }
 
 /** Cada item referencia una entidad existente y de su clase; activity lleva variant válido. */
-function assertItemsMatchBlueprintV3(items: Map<string, InvalidationManifestItem>, outline: Outline, courseId: number, label: string) {
+function assertItemsMatchBlueprintV3(items: Map<string, InvalidationManifestItem>, outline: Outline, courseId: number, label: string, activityTypeRules?: number) {
   for (const [key, it] of items) {
     const { type, entityId } = parseItemKey(key);
     if (CHAPTER_ITEM_TYPES_V3.includes(type)) {
@@ -170,7 +170,9 @@ function assertItemsMatchBlueprintV3(items: Map<string, InvalidationManifestItem
       if (type !== 'activity' || it.variant !== 'h5p') {
         throw new Error(`INVALID_INVALIDATION_INPUT: ${label} ${key} declara h5pType pero no es una activity h5p`);
       }
-      if (!(ACTIVITY_H5P_ROTATION as readonly string[]).includes(it.h5pType)) {
+      // EV6 H5P v2: 'branchingscenario' solo en Manifests con activityTypeRules = 2.
+      const allowed = activityTypeRules === 2 ? [...ACTIVITY_H5P_ROTATION, 'branchingscenario'] : (ACTIVITY_H5P_ROTATION as readonly string[]);
+      if (!allowed.includes(it.h5pType)) {
         throw new Error(`INVALID_INVALIDATION_INPUT: ${label} ${key} con h5pType inválido (fue ${JSON.stringify(it.h5pType)})`);
       }
     }
@@ -190,8 +192,10 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
   if (bps.from.course.id !== bps.to.course.id) {
     throw new Error(`INVALID_INVALIDATION_INPUT: los Blueprints son de cursos distintos (${bps.from.course.id} vs ${bps.to.course.id})`);
   }
-  assertItemsMatchBlueprintV3(fromItems, fromFp.outline, bps.from.course.id, 'from.manifest');
-  assertItemsMatchBlueprintV3(toItems, toFp.outline, bps.to.course.id, 'to.manifest');
+  const fromRules = input.from.manifest.features?.activityTypeRules;
+  const toRules = input.to.manifest.features?.activityTypeRules;
+  assertItemsMatchBlueprintV3(fromItems, fromFp.outline, bps.from.course.id, 'from.manifest', fromRules);
+  assertItemsMatchBlueprintV3(toItems, toFp.outline, bps.to.course.id, 'to.manifest', toRules);
 
   const records = new Map<string, InvalidationFromItem>();
   for (const r of input.from.items ?? []) {
@@ -371,7 +375,10 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
         regenerate(a, 'content_regenerated');
       } else if ((fromItems.get(key)!.variant ?? null) !== (toItem.variant ?? null)) {
         regenerate(a, 'activity_engine_changed');
-      } else if (resolveActivityType({ ...fromItems.get(key)!, key }) !== resolveActivityType({ ...toItem, key })) {
+      } else if (
+        resolveActivityType({ ...fromItems.get(key)!, key }, { activityTypeRules: fromRules }) !==
+        resolveActivityType({ ...toItem, key }, { activityTypeRules: toRules })
+      ) {
         regenerate(a, 'activity_type_changed');
       } else {
         a.reasons.push('content_reused');
