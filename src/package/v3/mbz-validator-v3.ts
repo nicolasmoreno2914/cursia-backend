@@ -22,8 +22,8 @@
  *                                          panel «Tu certificado» con $@BADGESVIEWBYID*curso@$
  *   QUIZ_REVIEW / QUIZ_COMPLETION          EV6 P2-B1: revisión solo con nota; attemptsexhausted = intentos > 0
  *   QUIZ_RANDOM / EXPLANATIONS_GATE /      EV6 P2-B5 (exam-validator-v3.ts): banco aleatorio por hoja,
- *   ANSWER_LEAK                            página «Respuestas explicadas» gated por SU quiz, ninguna
- *                                          respuesta/explicación fuera de su página (Libro excluido)
+ *   ANSWER_LEAK                            página «Respuestas explicadas» gated por SU quiz, ningún par
+ *                                          enunciado + respuesta correcta fuera de su página
  *   TEACHER_NOTE                           EV6 P2-B5: nota para docentes de las evaluaciones exactamente
  *                                          una vez, oculta, con las dos oraciones, sii hay ≥ 1 evaluación
  * Identifica cada módulo por su `idnumber` `cv3:…` (estructura por UUID).

@@ -127,7 +127,7 @@ import { downscaleCoverPng } from './v3/png-downscale';
 import { ActivityFrameTone, activityPackageFilename, h5pActivityInlineIntroHtml, introThemeFrom, scormIntroHtml } from './v3/activity-intro';
 import { moduleTone } from '../modules/visual-components/edu';
 import { groundColor } from '../modules/visual-components/render';
-import { IdAllocator, bankLeafPlan, buildQuizV3, parseScormManifestIds, scormActivityXmlV3 } from './v3/moodle-activities-v3';
+import { IdAllocator, buildQuizV3, parseScormManifestIds, scormActivityXmlV3 } from './v3/moodle-activities-v3';
 import { expectedExamPlan, planSlotCount, validateExamBank } from '../modules/course-shell/exam-bank';
 import type { ExamBankV1 } from '../modules/course-shell/exam-bank';
 import { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';
@@ -878,7 +878,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       throw new Error(`MBZ_V3_INVARIANT: ${idnumber} tiene ${q.questionCount} slots pero facts anuncia ${announced} preguntas`);
     }
     W.put(`${a.dir}/quiz.xml`, q.quizXml);
-    if (src.kind === 'bank') examBankPlans[idnumber] = bankLeafPlan({ doc: src.bank, groups: bankGroups });
+    if (src.kind === 'bank') examBankPlans[idnumber] = q.leaves ?? [];
     questionCategories.push(q.questionCategoriesXml);
     gradedCommon(a, kind, name, [], q.categoryIds);
     resolveCta('next-exam', secnum, `$@QUIZVIEWBYID*${a.mid}@$`);

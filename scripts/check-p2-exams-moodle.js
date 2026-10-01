@@ -26,6 +26,8 @@ const PHP = process.env.PHP_BIN || '/opt/homebrew/opt/php@8.3/bin/php';
 const PHPINI = path.join(MOODLE, 'php.ini');
 const OUT = process.env.P2_EXAMS_OUT_DIR || path.join(MOODLE, 'p2-exams-out');
 const SCENARIO = path.join(ROOT, 'test/e2e-v2/moodle-p2-exams.php');
+/** Fix 1 (M3): un PHP colgado (lock, correo) no detiene el gate. */
+const PHP_TIMEOUT_MS = 300000;
 
 let passed = 0;
 let failures = 0;
@@ -42,14 +44,15 @@ function check(name, fn) {
 function assert(c, m) { if (!c) throw new Error(m); }
 
 function restore(file) {
-  const r = spawnSync(PHP, ['-c', PHPINI, 'admin/cli/restore_backup.php', `--file=${file}`, '--categoryid=1'], { cwd: path.join(MOODLE, 'source'), encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const r = spawnSync(PHP, ['-c', PHPINI, 'admin/cli/restore_backup.php', `--file=${file}`, '--categoryid=1'], { cwd: path.join(MOODLE, 'source'), encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: PHP_TIMEOUT_MS });
   const m = /Restored course ID:\s*(\d+)/i.exec(`${r.stdout}\n${r.stderr}`);
-  assert(r.status === 0 && m, `restore de ${path.basename(file)} falló: ${(r.stderr || r.stdout || '').slice(-600)}`);
+  assert(r.status === 0 && m, `restore de ${path.basename(file)} falló${r.error ? ` (${r.error.message})` : ''}: ${(r.stderr || r.stdout || '').slice(-600)}`);
   return Number(m[1]);
 }
 function scenario(courseid, tagname) {
   const out = path.join(OUT, `p2exams-${tagname}-${courseid}.json`);
-  const r = spawnSync(PHP, ['-c', PHPINI, SCENARIO, path.join(MOODLE, 'source'), String(courseid), out], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const r = spawnSync(PHP, ['-c', PHPINI, SCENARIO, path.join(MOODLE, 'source'), String(courseid), out], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: PHP_TIMEOUT_MS });
+  assert(!r.error, `PHP: ${r.error && r.error.message}`);
   assert(!/warning|notice|deprecated|exception/i.test(r.stderr || ''), `PHP: ${(r.stderr || '').slice(-600)}`);
   assert(fs.existsSync(out), `sin salida: ${(r.stdout || '').slice(-400)} ${(r.stderr || '').slice(-400)}`);
   return { status: r.status, o: JSON.parse(fs.readFileSync(out, 'utf8')) };
@@ -59,7 +62,7 @@ const summary = (o) => Object.entries(o.quizzes).map(([k, q]) => `${k.replace(/^
 (async () => {
   assert(fs.existsSync(path.join(MOODLE, 'source/config.php')), `no hay Moodle local en ${MOODLE}`);
   fs.mkdirSync(OUT, { recursive: true });
-  const build = spawnSync(process.execPath, [path.join(__dirname, 'check-p2-exam-validators.js'), path.join(ROOT, 'dist'), '--out', OUT], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const build = spawnSync(process.execPath, [path.join(__dirname, 'check-p2-exam-validators.js'), path.join(ROOT, 'dist'), '--out', OUT], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: PHP_TIMEOUT_MS });
   check('paquetes banco / GIFT / ilimitados / sin final armados y validados (check-p2-exam-validators)', () => {
     assert(build.status === 0, (build.stderr || build.stdout || '').slice(-1200));
     for (const n of ['bank', 'gift', 'unlimited', 'nofinal']) assert(fs.existsSync(path.join(OUT, `${n}.mbz`)), `falta ${n}.mbz`);

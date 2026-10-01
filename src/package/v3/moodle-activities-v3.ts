@@ -110,6 +110,8 @@ export interface QuizV3Output {
   questionCount: number;
   /** Solo banco: preguntas del banco (todas las hojas). */
   bankSize?: number;
+  /** EV6 P2-B5: solo banco — las hojas TAL COMO se escribieron (orden de categorías), expectativa de QUIZ_RANDOM. */
+  leaves?: Array<{ category: string; type: ExamQuestionType; slots: number }>;
 }
 
 /** Nombre visible del tipo en la categoría hoja. */
@@ -118,22 +120,6 @@ export const EXAM_LEAF_TYPE_LABEL: Record<ExamQuestionType, string> = {
   truefalse: 'Verdadero o falso',
   match: 'Emparejamiento',
 };
-
-/**
- * EV6 P2-B5: hojas que el builder escribe para un banco (orden de categorías: grupo, luego tipo), con
- * los slots del plan CONGELADO. Expectativa del validador (QUIZ_RANDOM); no toca los bytes del paquete.
- */
-export function bankLeafPlan(bank: QuizV3Bank): Array<{ category: string; type: ExamQuestionType; slots: number }> {
-  const owner = (l: ExamBankV1['plan'][number]): string => ('chapterId' in l ? l.chapterId : l.moduleId);
-  const out: Array<{ category: string; type: ExamQuestionType; slots: number }> = [];
-  for (const g of bank.groups) {
-    for (const type of EXAM_QUESTION_TYPES) {
-      const l = bank.doc.plan.find((x) => owner(x) === g.ownerId && x.type === type);
-      if (l) out.push({ category: safeActivityName(`${g.name} · ${EXAM_LEAF_TYPE_LABEL[type]}`, 255), type, slots: l.slots });
-    }
-  }
-  return out;
-}
 
 export function buildQuizV3(p: QuizV3Input): QuizV3Output {
   if ((p.gift === undefined) === (p.bank === undefined)) throw new Error(`QUIZ_V3_INVALID: "${p.name}" necesita exactamente uno de gift | bank`);
@@ -397,6 +383,7 @@ function buildBankQuizV3(p: QuizV3Input, bank: QuizV3Bank): QuizV3Output {
     categoryIds: [catTop, catDefault, ...groups.flatMap((g) => [g.id, ...g.leaves.map((l) => l.id)])],
     questionCount: slotCount,
     bankSize: doc.questions.length,
+    leaves: leaves.map((l) => ({ category: l.name, type: l.type, slots: l.slots })),
   };
 }
 

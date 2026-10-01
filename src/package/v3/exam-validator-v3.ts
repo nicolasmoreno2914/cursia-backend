@@ -10,15 +10,11 @@
  *                      después del quiz; availability BYTE-EXACTA según `attempts_number` del quiz
  *                      (> 0: e=1 | e=3; 0: solo e=1), show:false, downloadcontent 0, completion 0,
  *                      fuera de los criterios del curso, contenido no vacío y CLEAN_SAFE.
- *   ANSWER_LEAK        ninguna respuesta correcta (≥ 12 caracteres) ni explicación de un quiz aparece
- *                      en un label, en la intro de una actividad o en una página que no sea la
- *                      página «Respuestas explicadas» del MISMO quiz. Se compara por palabras
- *                      completas con la normalización del contrato B2 (`examTextContains`).
- *                      Excluido: el Libro Guía (el contenido enseñado reformula las respuestas
- *                      correctas; la regla de evidencia lo exige). Por la misma razón, en el texto
- *                      enseñado de los labels (capítulos, presentación del módulo, bienvenida…)
- *                      una respuesta correcta solo cuenta junto con su enunciado — ver
- *                      `answerLeakSurfaceKind`.
+ *   ANSWER_LEAK        la respuesta correcta de una pregunta JUNTO con su enunciado (mismo label/página,
+ *                      normalización del contrato B2, por palabras completas) en cualquier superficie
+ *                      (intro de toda actividad, contenido de páginas) salvo la página «Respuestas
+ *                      explicadas» del MISMO quiz. Una respuesta sola o una explicación nunca son fuga.
+ *                      El Libro Guía no se lee. Ver `answerLeakIssues`.
  * (TEACHER_NOTE vive en mbz-validator-v3.ts: depende del certificado.)
  *
  * Puro salvo el unzip en memoria; nunca lanza por un hallazgo.
@@ -51,7 +47,6 @@ export interface ExamBankLeafPlan {
 export type ExamBankPlans = Record<string, ExamBankLeafPlan[]>;
 
 /** Largo mínimo (caracteres, sin espacios extremos) de una respuesta correcta para contar como fuga. */
-export const ANSWER_LEAK_MIN_CHARS = 12;
 // Dónde se busca: labels (intro), intro de TODA actividad y páginas (intro + contenido) salvo la página
 // gated del mismo quiz. Nunca: el archivo del Libro Guía (resource), los textos de las preguntas, los
 // paquetes H5P/SCORM.
@@ -104,8 +99,6 @@ export interface ExamPkg {
   categories: ExamPkgCategory[];
   /** moduleinstance de los criterios de actividad (criteriatype 4) del curso. */
   courseCriteria: number[];
-  /** Títulos de la estructura legibles del paquete: nombre del curso, secciones, quizzes y páginas. */
-  titles: string[];
 }
 
 function tag(xml: string, name: string): string | null {
@@ -152,14 +145,10 @@ export async function readExamPackageV3(zip: JSZip): Promise<ExamPkg> {
     });
   }
   const sequences = new Map<number, number[]>();
-  const titles: string[] = [];
   for (const b of blocks(tag(contents, 'sections') ?? '', 'section')) {
     const sx = await text(`${tag(b, 'directory') ?? ''}/section.xml`);
     sequences.set(num(tag(sx, 'number')), (tag(sx, 'sequence') ?? '').split(',').filter(Boolean).map(Number));
-    titles.push(unxml(tag(sx, 'name') ?? ''));
   }
-  titles.push(unxml(tag(await text('course/course.xml'), 'fullname') ?? ''));
-  for (const a of acts) if (a.modname === 'quiz' || a.modname === 'page') titles.push(unxml(tag(a.actXml, 'name') ?? ''));
   const qx = await text('questions.xml');
   const categories: ExamPkgCategory[] = blocks(qx, 'question_category').map((c) => ({
     id: num(/<question_category id="(\d+)"/.exec(c)?.[1]),
@@ -189,7 +178,7 @@ export async function readExamPackageV3(zip: JSZip): Promise<ExamPkg> {
   const courseCriteria = blocks(comp, 'course_completion_criteria')
     .filter((c) => num(tag(c, 'criteriatype')) === 4)
     .map((c) => num(tag(c, 'moduleinstance')));
-  return { acts, sequences, categories, courseCriteria, titles: titles.filter((t) => t.trim()) };
+  return { acts, sequences, categories, courseCriteria };
 }
 
 // ─── chequeos ───────────────────────────────────────────────────────────────
@@ -212,8 +201,7 @@ export interface ExamCheckOptions {
 }
 
 export function examChecksV3(pkg: ExamPkg, opts: ExamCheckOptions = {}): ExamIssue[] {
-  const titles = opts.facts ? [opts.facts.course.title, ...opts.facts.modules.map((m) => m.title), ...opts.facts.chapters.map((c) => c.title)] : [];
-  return [...quizRandomIssues(pkg, opts), ...explanationsGateIssues(pkg), ...answerLeakIssues(pkg, { titles })];
+  return [...quizRandomIssues(pkg, opts), ...explanationsGateIssues(pkg), ...answerLeakIssues(pkg)];
 }
 
 const quizzesOf = (pkg: ExamPkg): ExamPkgActivity[] => pkg.acts.filter((a) => a.modname === 'quiz');
@@ -288,8 +276,10 @@ export function quizRandomIssues(pkg: ExamPkg, opts: ExamCheckOptions = {}): Exa
       if (!refsByLeaf.has(c.id)) add(W, `hoja «${c.name}» con ${c.questions.length} preguntas y ninguna referencia (nadie la sortea)`);
     }
     // Hojas = plan (si el builder lo declaró).
-    const plan = opts.examBankPlans?.[q.idnumber];
-    if (opts.examBankPlans && !plan) add(W, 'quiz con banco sin plan en las expectativas');
+    // Fix 1 (M1): un mapa vacío = sin planes (expectativas viejas o serializadas por defecto).
+    const plans = opts.examBankPlans && Object.keys(opts.examBankPlans).length ? opts.examBankPlans : undefined;
+    const plan = plans?.[q.idnumber];
+    if (plans && !plan) add(W, 'quiz con banco sin plan en las expectativas');
     if (plan) {
       const got = [...refsByLeaf].map(([id, refs]) => [catById.get(id)?.name ?? `#${id}`, refs] as [string, number]).sort((a, b) => a[0].localeCompare(b[0]));
       const want = plan.map((l) => [l.category, l.slots] as [string, number]).sort((a, b) => a[0].localeCompare(b[0]));
@@ -354,57 +344,43 @@ export function explanationsGateIssues(pkg: ExamPkg): ExamIssue[] {
 
 // ─── ANSWER_LEAK ────────────────────────────────────────────────────────────
 
-type SurfaceKind = 'teaching' | 'deterministic' | 'gated';
-
 /**
- * Clase de cada superficie donde se busca (Libro Guía: nunca se lee).
- *  - teaching: texto ENSEÑADO o del LLM del curso (labels de capítulo salvo la tarjeta de
- *    presentación, presentación del módulo, bienvenida, competencias, metodología, cierre). Ahí las
- *    respuestas correctas aparecen legítimamente (la regla de evidencia lo exige, como en el Libro):
- *    solo cuenta una respuesta correcta JUNTO con su enunciado (el par pregunta→respuesta) o una
- *    explicación completa.
- *  - gated: página «Respuestas explicadas» de OTRO quiz: muestra el material de su propio quiz; una
- *    cadena que ese material ya contiene (p. ej. la misma respuesta correcta en el examen final y en
- *    el de módulo) no es fuga.
- *  - deterministic: el resto (labels armados con facts y títulos, intros de actividades, otras
- *    páginas): cualquier respuesta correcta o explicación es fuga, salvo que la respuesta sea parte
- *    de un título de la estructura (curso, módulo, capítulo, sección), que esos labels imprimen.
+ * Regla (P2-design §5, ruling P2-B5 fix 1): en TODA superficie que no sea la página «Respuestas
+ * explicadas» del MISMO quiz, hay fuga si la respuesta correcta aparece JUNTO con el enunciado de su
+ * pregunta (mismo label/página, texto normalizado). Una respuesta correcta sola nunca es fuga (títulos,
+ * textos del shell, contenido enseñado, páginas de otros quizzes); una explicación tampoco (reformula
+ * el contenido enseñado). Material compartido: en la página de OTRO quiz, un par que ese quiz también
+ * tiene como pregunta propia (mismo enunciado en su material) es suyo, no fuga.
  */
-export function answerLeakSurfaceKind(a: Pick<ExamPkgActivity, 'idnumber' | 'modname'>): SurfaceKind {
-  if (a.modname === 'page' && /^cv3:(exam_explanations:|final_exam_explanations$)/.test(a.idnumber)) return 'gated';
-  if (/^cv3:ch:[^:]+:/.test(a.idnumber) && !/:presentation$/.test(a.idnumber)) return 'teaching';
-  if (/^cv3:module_intro:/.test(a.idnumber) || /^cv3:shell:(welcome|competencies|methodology|closing)$/.test(a.idnumber)) return 'teaching';
-  return 'deterministic';
-}
+export const ANSWER_LEAK_MIN_STEM_CHARS = 20;
 
 interface Needle {
   quiz: ExamPkgActivity;
-  kind: 'respuesta correcta' | 'explicación';
   question: string;
-  text: string;
+  answer: string;
   tokens: string[];
-  /** Solo respuesta correcta: tokens del enunciado de su pregunta. */
   stem: string[];
 }
 
 const toks = (s: string): string[] => examTokens(normalizeExamText(s));
 
-/** Respuestas correctas (≥ 12 caracteres) y explicaciones de cada quiz del paquete. */
+/** Pares (enunciado ≥ 20 caracteres, respuesta correcta) de cada quiz del paquete. */
 export function answerLeakNeedles(pkg: ExamPkg): Needle[] {
   const out: Needle[] = [];
   for (const q of quizzesOf(pkg)) {
     for (const c of pkg.categories.filter((x) => x.contextinstanceid === q.mid)) {
       for (const qq of c.questions) {
+        if ([...qq.stem.trim()].length < ANSWER_LEAK_MIN_STEM_CHARS) continue;
         const stem = toks(qq.stem);
-        const push = (kind: Needle['kind'], text: string) => {
-          const t = text.trim();
-          if ([...t].length < ANSWER_LEAK_MIN_CHARS) return;
-          const tokens = toks(t);
-          if (tokens.length) out.push({ quiz: q, kind, question: qq.name, text: t, tokens, stem });
-        };
-        // MC: la(s) opción(es) con fracción completa. (V/F: «Verdadero»/«Falso» < 12; emparejamiento: no aplica.)
-        if (qq.qtype === 'multichoice') for (const a of qq.answers) if (a.fraction >= 0.9999999) push('respuesta correcta', a.text);
-        push('explicación', qq.generalfeedback);
+        if (!stem.length) continue;
+        // Respuestas con fracción completa (selección múltiple, respuesta corta, numérica). V/F y
+        // emparejamiento no tienen una «respuesta» textual que filtrar.
+        if (!['multichoice', 'shortanswer', 'numerical'].includes(qq.qtype)) continue;
+        for (const a of qq.answers) {
+          if (!(a.fraction >= 0.9999999)) continue;
+          const tokens = toks(a.text);
+          if (tokens.length) out.push({ quiz: q, question: qq.name, answer: a.text.trim(), tokens, stem });
+        }
       }
     }
   }
@@ -442,54 +418,39 @@ function contains(h: Hay, needle: string[]): boolean {
   return false;
 }
 
-export interface AnswerLeakOptions {
-  /** Títulos de la estructura (curso, módulos, capítulos); se suman a los del paquete. */
-  titles?: string[];
-}
-
-export function answerLeakIssues(pkg: ExamPkg, opts: AnswerLeakOptions = {}): ExamIssue[] {
+export function answerLeakIssues(pkg: ExamPkg): ExamIssue[] {
   const out: ExamIssue[] = [];
   const needles = answerLeakNeedles(pkg);
   if (!needles.length) return out;
-  const quizByPage = new Map<number, ExamPkgActivity>(); // mid de la página gated → su quiz
+  const quizByPage = new Map<number, ExamPkgActivity>(); // mid de una página gated → su quiz
   for (const q of quizzesOf(pkg)) {
     const p = pkg.acts.find((a) => a.modname === 'page' && a.idnumber === explanationsIdnumberFor(q.idnumber));
     if (p) quizByPage.set(p.mid, q);
   }
-  // Material propio de cada quiz (todo texto de sus preguntas), para las páginas gated de otro quiz.
-  const material = new Map<number, Hay[]>();
+  // Enunciados propios de cada quiz (material compartido).
+  const ownStems = new Map<number, Hay[]>();
   for (const q of quizzesOf(pkg)) {
-    material.set(q.mid, pkg.categories.filter((c) => c.contextinstanceid === q.mid).flatMap((c) => c.questions.flatMap((x) => x.texts.map(hay))));
+    ownStems.set(q.mid, pkg.categories.filter((c) => c.contextinstanceid === q.mid).flatMap((c) => c.questions.map((x) => hay(x.stem))));
   }
-  const titles = [...pkg.titles, ...(opts.titles ?? [])].map(hay);
-  const isTitle = (n: Needle): boolean => titles.some((t) => contains(t, n.tokens));
-  const hays = pkg.acts.map((a) => ({ a, kind: answerLeakSurfaceKind(a), h: hay(`${extractText(a.intro)} ${a.modname === 'page' ? extractText(a.content) : ''}`) }));
+  const hays = pkg.acts.map((a) => ({ a, h: hay(`${extractText(a.intro)} ${a.modname === 'page' ? extractText(a.content) : ''}`) }));
   for (const n of needles) {
-    for (const { a, kind, h } of hays) {
-      let leak = false;
-      if (kind === 'gated') {
-        const owner = quizByPage.get(a.mid);
-        if (owner?.mid === n.quiz.mid) continue; // su propia página
-        leak = contains(h, n.tokens) && !(owner && (material.get(owner.mid) ?? []).some((m) => contains(m, n.tokens)));
-      } else if (kind === 'teaching') {
-        leak = contains(h, n.tokens) && (n.kind === 'explicación' || contains(h, n.stem));
-      } else {
-        leak = contains(h, n.tokens) && (n.kind === 'explicación' || !isTitle(n));
-      }
-      if (leak) {
-        out.push({
-          code: 'ANSWER_LEAK',
-          where: a.idnumber || a.dir,
-          message: `${n.kind}${kind === 'teaching' && n.kind !== 'explicación' ? ' (con su enunciado)' : ''} de ${n.question} (${n.quiz.idnumber}) visible fuera de su página gated: «${n.text.slice(0, 80)}${n.text.length > 80 ? '…' : ''}»`,
-        });
-      }
+    for (const { a, h } of hays) {
+      const owner = quizByPage.get(a.mid);
+      if (owner?.mid === n.quiz.mid) continue; // su propia página
+      if (!contains(h, n.stem) || !contains(h, n.tokens)) continue;
+      if (owner && (ownStems.get(owner.mid) ?? []).some((m) => contains(m, n.stem))) continue; // pregunta compartida
+      out.push({
+        code: 'ANSWER_LEAK',
+        where: a.idnumber || a.dir,
+        message: `enunciado + respuesta correcta de ${n.question} (${n.quiz.idnumber}) visibles fuera de su página gated: «${n.answer.slice(0, 80)}${n.answer.length > 80 ? '…' : ''}»`,
+      });
     }
   }
   return out;
 }
 
 /** Atajo para corpus/scripts: lee el .mbz y corre solo ANSWER_LEAK (no necesita facts). */
-export async function scanAnswerLeaksV3(mbz: Buffer, opts: AnswerLeakOptions = {}): Promise<{ needles: number; issues: ExamIssue[] }> {
+export async function scanAnswerLeaksV3(mbz: Buffer): Promise<{ needles: number; issues: ExamIssue[] }> {
   const pkg = await readExamPackageV3(await JSZip.loadAsync(mbz));
-  return { needles: answerLeakNeedles(pkg).length, issues: answerLeakIssues(pkg, opts) };
+  return { needles: answerLeakNeedles(pkg).length, issues: answerLeakIssues(pkg) };
 }

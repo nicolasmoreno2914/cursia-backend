@@ -8,9 +8,8 @@
 //  - el paquete BUENO con bancos (+ final + certificado), sin final, con intentos ilimitados y uno GIFT
 //    validan limpios (también sin `examBankPlans` en las expectativas: expectativas viejas);
 //  - cada mutación de un paquete bueno → EXACTAMENTE su código (nada más);
-//  - ANSWER_LEAK sin falsos positivos: una respuesta correcta sola en el texto enseñado de un capítulo
-//    (la regla de evidencia lo exige) o la misma respuesta en dos exámenes NO son fuga; con su
-//    enunciado, o una explicación, sí.
+//  - ANSWER_LEAK (fix 1): fuga = enunciado + respuesta correcta juntos fuera de su página; una respuesta
+//    sola o una explicación nunca; regresiones del probe de la revisión (C1/C2) y respuestas cortas.
 //  - opcional: `--corpus a.mbz b.mbz …` corre ANSWER_LEAK sobre paquetes existentes (reales/E2E): 0 hallazgos.
 //
 // Usage: node scripts/check-p2-exam-validators.js [path/to/dist] [--out dir] [--corpus x.mbz …]
@@ -287,55 +286,97 @@ async function main() {
     await expectOnly(bad, builtU.expectations, 'EXPLANATIONS_GATE', 'ilimitados e=3');
   });
 
-  // ── ANSWER_LEAK ──
+  // ── ANSWER_LEAK (fix 1: solo el par enunciado + respuesta correcta fuera de su página) ──
   const ch = Object.keys(I.byId).find((k) => /^cv3:ch:.*:deepening$/.test(k));
   const CHX = `${I.byId[ch].dir}/label.xml`;
   const FQX = `${fquiz.dir}/quiz.xml`;
   const FPX = `${fpage.dir}/page.xml`;
-  await check('ANSWER_LEAK: respuesta correcta del examen de módulo en la intro del examen final → solo ANSWER_LEAK', async () => {
-    const iss = await expectOnly(await mutate(built.mbz, { [FQX]: (x) => insertText(x, 'intro', mc.correct.text) }), exp, 'ANSWER_LEAK', 'intro');
-    assert(iss.every((i) => i.where === 'cv3:final_exam') && iss.some((i) => i.message.includes(mc.id)), JSON.stringify(iss));
+  const pair = (q) => `${q.stem} Respuesta: ${q.correct.text}.`;
+  await check('ANSWER_LEAK (verdadero positivo): enunciado + respuesta correcta pegados en el texto de un capítulo → solo ANSWER_LEAK', async () => {
+    const iss = await expectOnly(await mutate(built.mbz, { [CHX]: (x) => insertText(x, 'intro', pair(mc)) }), exp, 'ANSWER_LEAK', 'par en capítulo');
+    assert(iss.every((i) => i.where === ch) && iss.some((i) => i.message.includes(mc.id)), JSON.stringify(iss));
   });
-  await check('ANSWER_LEAK: explicación en el texto de un capítulo → solo ANSWER_LEAK', async () => {
-    await expectOnly(await mutate(built.mbz, { [CHX]: (x) => insertText(x, 'intro', mc.explanation) }), exp, 'ANSWER_LEAK', 'explicación en capítulo');
+  await check('ANSWER_LEAK: par del examen de módulo en la intro del examen final → solo ANSWER_LEAK', async () => {
+    await expectOnly(await mutate(built.mbz, { [FQX]: (x) => insertText(x, 'intro', pair(mc)) }), exp, 'ANSWER_LEAK', 'intro');
   });
-  await check('ANSWER_LEAK: enunciado + respuesta correcta (el par) en el texto de un capítulo → solo ANSWER_LEAK', async () => {
-    await expectOnly(await mutate(built.mbz, { [CHX]: (x) => insertText(x, 'intro', `${mc.stem} Respuesta: ${mc.correct.text}.`) }), exp, 'ANSWER_LEAK', 'par en capítulo');
+  await check('ANSWER_LEAK: par del examen de módulo en la página del examen FINAL (otra página gated) → solo ANSWER_LEAK', async () => {
+    await expectOnly(await mutate(built.mbz, { [FPX]: (x) => insertText(x, 'content', pair(mc)) }), exp, 'ANSWER_LEAK', 'otra página');
   });
-  await check('ANSWER_LEAK: explicación del examen de módulo en la página del examen FINAL (otra página gated) → solo ANSWER_LEAK', async () => {
-    await expectOnly(await mutate(built.mbz, { [FPX]: (x) => insertText(x, 'content', mc.explanation) }), exp, 'ANSWER_LEAK', 'otra página');
-  });
-  await check('ANSWER_LEAK: respuesta correcta GIFT (≥ 12) en la intro de otro quiz → solo ANSWER_LEAK', async () => {
+  await check('ANSWER_LEAK: par GIFT (enunciado + respuesta correcta) en la intro de otro quiz → solo ANSWER_LEAK', async () => {
     const IG = await index(builtG.mbz);
     const fq = IG.byId['cv3:final_exam'];
-    const qxg = await IG.z.file('questions.xml').async('string');
-    // una respuesta correcta (fraction 1) ≥ 12 caracteres de un examen de MÓDULO
     const modQuiz = IG.byId[Object.keys(IG.byId).find((k) => /^cv3:exam:/.test(k))];
+    const qxg = await IG.z.file('questions.xml').async('string');
+    const un = (t) => t.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&');
     const cats = Array.from(qxg.matchAll(/<question_category id="\d+">[\s\S]*?<\/question_category>/g), (m) => m[0]).filter((c) => tag(c, 'contextinstanceid') === String(modQuiz.mid));
-    const right = cats.flatMap((c) => Array.from(c.matchAll(/<answertext>([^<]*)<\/answertext><answerformat>\d<\/answerformat><fraction>1\.0000000<\/fraction>/g), (m) => m[1]))
-      .map((t) => t.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&')).find((t) => t.length >= 12 && !/^(Verdadero|Falso)$/.test(t));
-    assert(right, 'fixture GIFT sin respuesta correcta ≥ 12');
-    await expectOnly(await mutate(builtG.mbz, { [`${fq.dir}/quiz.xml`]: (x) => insertText(x, 'intro', right) }), builtG.expectations, 'ANSWER_LEAK', 'GIFT');
+    const mcq = cats.flatMap((c) => Array.from(c.matchAll(/<question id="\d+">[\s\S]*?<\/question>/g), (m) => m[0])).find((q) => tag(q, 'qtype') === 'multichoice' && un(tag(q, 'questiontext')).length >= 20);
+    const right = un(/<answertext>([^<]*)<\/answertext><answerformat>\d<\/answerformat><fraction>1\.0000000<\/fraction>/.exec(mcq)[1]);
+    await expectOnly(await mutate(builtG.mbz, { [`${fq.dir}/quiz.xml`]: (x) => insertText(x, 'intro', `${un(tag(mcq, 'questiontext'))} ${right}`) }), builtG.expectations, 'ANSWER_LEAK', 'GIFT');
   });
-  await check('ANSWER_LEAK sin falsos positivos: respuesta correcta SOLA en el texto enseñado de un capítulo; misma respuesta en módulo y final; título = respuesta', async () => {
-    // 1) la respuesta correcta sola en un capítulo = contenido enseñado (como el Libro Guía)
-    let r = await codes(await mutate(built.mbz, { [CHX]: (x) => insertText(x, 'intro', mc.correct.text) }), exp);
-    eq(r.codes, [], 'respuesta sola en capítulo');
-    // 2) la misma respuesta correcta en el examen final: la página final la muestra como SUYA
-    const B2 = bankInput({ courseId: 758 });
-    const m2 = B2.banks.get(modId) || [...B2.banks.values()][0];
-    const f2 = B2.fin.questions.find((q) => q.type === 'multichoice');
-    const m2q = m2.questions.find((q) => q.type === 'multichoice');
-    f2.correct.text = m2q.correct.text; // misma respuesta correcta en los dos exámenes
-    const v = EB.validateExamBank(B2.fin, { scope: 'final', chapters: B2.input.manifest.modules.flatMap((m) => m.chapters.map((c) => ({ id: c.chapterId, moduleId: m.moduleId }))), chapterMd: B2.input.contents.contentMd });
-    assert(v.ok, `fixture: ${JSON.stringify(v.errors.slice(0, 2))}`);
-    const b2 = await B.buildDynamicMbzV3(B2.input);
-    const v2 = await V.validateMbzV3(b2.mbz, b2.expectations);
-    assert(v2.ok, `misma respuesta en módulo y final: ${JSON.stringify(v2.issues.slice(0, 3))}`);
-    // 3) helper: clases de superficie
-    eq([EV.answerLeakSurfaceKind({ idnumber: 'cv3:ch:x:deepening', modname: 'label' }), EV.answerLeakSurfaceKind({ idnumber: 'cv3:ch:x:presentation', modname: 'label' }),
-      EV.answerLeakSurfaceKind({ idnumber: 'cv3:exam_info:m', modname: 'label' }), EV.answerLeakSurfaceKind({ idnumber: 'cv3:final_exam_explanations', modname: 'page' }),
-      EV.answerLeakSurfaceKind({ idnumber: 'cv3:shell:welcome', modname: 'label' })], ['teaching', 'deterministic', 'deterministic', 'gated', 'teaching'], 'clases');
+  await check('ANSWER_LEAK sin falsos positivos (mutaciones): respuesta sola en un capítulo / en la intro de otro quiz; explicación en un capítulo / en la página de otro quiz', async () => {
+    for (const [label, edits] of [
+      ['respuesta sola en capítulo', { [CHX]: (x) => insertText(x, 'intro', mc.correct.text) }],
+      ['respuesta sola en la intro del final', { [FQX]: (x) => insertText(x, 'intro', mc.correct.text) }],
+      ['explicación en capítulo', { [CHX]: (x) => insertText(x, 'intro', mc.explanation) }],
+      ['explicación en la página final', { [FPX]: (x) => insertText(x, 'content', mc.explanation) }],
+      ['enunciado solo en capítulo', { [CHX]: (x) => insertText(x, 'intro', mc.stem) }],
+    ]) {
+      const r = await codes(await mutate(built.mbz, edits), exp);
+      eq(r.codes, [], label);
+    }
+  });
+
+  // Regresiones del probe de la revisión (b5rev-probe.js, C1 + C2) y respuestas cortas realistas:
+  // paquetes VÁLIDOS del builder de hoy → validateMbzV3 limpio con sus propias expectativas.
+  const cleanBuild = async (label, input, expOf) => {
+    const b = await B.buildDynamicMbzV3(input);
+    const v = await V.validateMbzV3(b.mbz, expOf ? expOf(b) : b.expectations);
+    assert(v.ok, `${label}: ${JSON.stringify(v.issues.slice(0, 3))}`);
+  };
+  const giftWith = (correct, n) => [
+    `::M${n}P1:: ¿Cuál es el recurso que corresponde al caso descrito? {\n=${correct}\n~Interrumpir al cliente\n~Derivar sin explicar\n}`,
+    `::M${n}P2:: ¿Qué conducta mejora la atención en el caso B? {\n=Escuchar y confirmar\n~Interrumpir\n~Derivar sin explicar\n}`,
+    `::M${n}VF:: Confirmar lo entendido reduce malentendidos. {TRUE}`,
+  ].join('\n\n');
+  await check('ANSWER_LEAK regresión C2 + respuestas cortas: GIFT con respuesta correcta = microcopy del shell / título / «Sí» / número / palabra común → limpio', async () => {
+    for (const ans of ['Video interactivo', 'Actividad práctica', 'Ruta de aprendizaje', 'Evaluación final', 'Nota mínima para aprobar', 'Material de estudio', 'Audio de bienvenida', 'Evaluación del módulo', 'Sí', 'No', '3', '70', 'Agua', 'Capítulo', 'Bienvenida']) {
+      const input = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true, courseId: 760 });
+      const first = input.manifest.modules.find((m) => m.examEnabled);
+      input.contents.examGift.set(first.moduleId, giftWith(ans, first.moduleNumber));
+      input.contents.finalExamGift = giftWith(ans, 9);
+      await cleanBuild(`GIFT «${ans}»`, input);
+    }
+  });
+  await check('ANSWER_LEAK regresión C1: banco con respuesta correcta = parte de un título de capítulo (final) / título del módulo (examen de módulo), que las páginas imprimen → limpio', async () => {
+    const X = bankInput({ courseId: 761 });
+    X.fin.questions.find((q) => q.type === 'multichoice').correct.text = 'Fundamentos de la atención';
+    await cleanBuild('final = título de capítulo', X.input);
+    const Y = bankInput({ courseId: 762 });
+    const m1 = (await B.buildDynamicMbzV3(bankInput({ courseId: 762 }).input)).expectations.facts.modules[0];
+    const t = m1.title.length >= 12 ? m1.title : `${m1.title} del servicio`;
+    Y.banks.get(m1.id).questions.find((q) => q.type === 'multichoice').correct.text = t;
+    await cleanBuild(`módulo = título del módulo «${t}»`, Y.input);
+  });
+  await check('ANSWER_LEAK regresión: respuestas cortas en un banco («Sí», número) y la MISMA pregunta (enunciado + respuesta) en el examen de módulo y en el final → limpio (material compartido)', async () => {
+    const X = bankInput({ courseId: 763 });
+    const mq = [...X.banks.values()][0].questions.filter((q) => q.type === 'multichoice');
+    mq[0].correct.text = 'Sí';
+    mq[1].correct.text = '12';
+    const fq = X.fin.questions.find((q) => q.type === 'multichoice');
+    fq.stem = mq[2].stem;
+    fq.correct.text = mq[2].correct.text;
+    await cleanBuild('cortas + compartida', X.input);
+  });
+  await check('M1: examBankPlans = {} (vacío/serializado) se trata como ausente → limpio', async () => {
+    await cleanBuild('plans {}', bankInput({ courseId: 764 }).input, (b) => ({ facts: b.expectations.facts, resolved: b.expectations.resolved, examBankPlans: {} }));
+  });
+  await check('probe: banco + scorm + intentos ilimitados en módulo y final → limpio', async () => {
+    const d = P.defaultAssessmentProfile({ finalExam: true });
+    await cleanBuild('scorm ilimitados', bankInput({ courseId: 765, engine: 'scorm', profile: { ...d, attempts: { ...d.attempts, exam: 0, finalExam: 0 } } }).input);
+  });
+  await check('M2: las hojas del plan (expectativas) son las categorías que el builder escribió', async () => {
+    const names = Array.from(qxml.matchAll(/<question_category id="\d+">\s*<name>([^<]*)<\/name>/g), (m) => m[1].replace(/&amp;/g, '&'));
+    for (const l of exp.examBankPlans[examIdn]) assert(names.includes(l.category), `hoja ${l.category} no está en questions.xml`);
   });
 
   // ── TEACHER_NOTE ──
@@ -375,7 +416,7 @@ async function main() {
         const issues = withPages ? EV.examChecksV3(pkg) : EV.answerLeakIssues(pkg);
         if (issues.length) bad.push([path.basename(f), issues.slice(0, 3)]);
       }
-      console.log(`   ${CORPUS.length} paquetes (${full} con páginas gated), ${needles} respuestas/explicaciones buscadas`);
+      console.log(`   ${CORPUS.length} paquetes (${full} con páginas gated), ${needles} pares enunciado + respuesta buscados`);
       eq(bad, [], 'hallazgos');
     });
   }
