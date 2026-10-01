@@ -412,7 +412,7 @@ function reservationBookkeeping(ev) {
     await step('v3-0-arranque', async () => {
       app = await startApp();
       const f = await api('GET', '/features');
-      eq(f.data, { dynamicCourseStructure: true, realVideo: true, coherenceLlm: false, manifestRulesVersion: 3 }, 'GET /features → rulesVersion 3 activo');
+      eq(f.data, { dynamicCourseStructure: true, realVideo: true, coherenceLlm: false, manifestRulesVersion: 3, dodContract: true, superAdmin: true }, 'GET /features → rulesVersion 3 activo (+ contrato DoD; el owner del sandbox es SUPER_ADMIN)');
       S.front = newFront('v3');
       const tplIds = S.front.SCORM_V2_TEMPLATES.map((t) => t.id);
       S.templates = tplIds.filter((t) => S.front.scormV2ValidateRoomData(t, JSON.parse(JSON.stringify(S.front.SV2_PREVIEW_FIXTURES[t]))).ok);
@@ -788,9 +788,15 @@ function reservationBookkeeping(ev) {
       // EV6 DoD (BE-A): camino real — todo real y validado → `completed`; sin paquete = «packaging»; con él = completo.
       const runE4 = await api('GET', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs/${c.runId}`);
       const c4 = runE4.data && runE4.data.completion;
-      ok(runE4.data && runE4.data.status === 'completed' && c4 && c4.state === 'packaging' && c4.generationComplete === true && c4.missingComponents.length === 0 && c4.previewComponents.length === 0,
-        'E4: run completed, completion = packaging (generación completa, sin paquete todavía)', runE4.data && { status: runE4.data.status, completion: c4 });
+      // EV6 DoD (BE-B): al pasar a `completed` el servidor encola SOLO el paquete final (sin clic); según el
+      // ritmo del worker de empaquetado el run se lee `packaging` (armándose) o ya `complete`.
+      ok(runE4.data && runE4.data.status === 'completed' && c4 && ['packaging', 'complete'].includes(c4.state) && c4.generationComplete === true && c4.missingComponents.length === 0 && c4.previewComponents.length === 0,
+        'E4: run completed, completion = packaging/complete (generación completa; paquete automático)', runE4.data && { status: runE4.data.status, completion: c4 });
+      const autoJobs = await q(`select id, input_payload from public.production_jobs where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1 order by created_at`, [c.runId]);
+      ok(autoJobs.length === 1 && autoJobs[0].input_payload && autoJobs[0].input_payload.auto === true && !autoJobs[0].input_payload.packageKind,
+        'E4: el servidor encoló UN paquete final automático (input_payload.auto, sin packageKind)', autoJobs);
       const P = await packageRun('E4', c.courseId, c.n, c.runId);
+      ok(autoJobs[0] && P.job.id === autoJobs[0].id, 'E4: POST …/package (botón manual) reusa el job automático (idempotente, nunca un segundo build)', { auto: autoJobs[0] && autoJobs[0].id, manual: P.job.id });
       const os = P.job.output_summary || {};
       ok(!os.packageKind && P.status.packageKind === 'final' && P.status.deliverable === true && P.status.complete === true && !/^QA-/.test(String(P.status.downloadFilename || '')),
         'E4: paquete FINAL entregable (sin rótulo QA) y GET …/package complete:true', { kind: os.packageKind, st: P.status });

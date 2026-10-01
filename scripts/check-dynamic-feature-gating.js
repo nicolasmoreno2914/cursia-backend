@@ -76,6 +76,9 @@ const { InvalidationController } = loadDist('modules/invalidation/invalidation.c
 const { InvalidationService } = loadDist('modules/invalidation/invalidation.service.js');
 const { DynamicYoutubeController } = loadDist('modules/dynamic-generation/dynamic-youtube.controller.js');
 const { DynamicYoutubePreflightService } = loadDist('modules/dynamic-generation/dynamic-youtube.js');
+// EV6 DoD BE-B: cola de recuperación de admin (ruta V2, SUPER_ADMIN).
+const { AdminDynamicRunsController } = loadDist('modules/dynamic-generation/admin-runs.controller.js');
+const { AdminRecoveryService } = loadDist('modules/dynamic-generation/admin-recovery.service.js');
 const { SchedulerService } = loadDist('modules/dynamic-generation/scheduler.service.js');
 const { PackagingController } = loadDist('modules/dynamic-packaging/packaging.controller.js');
 const { PackagingService } = loadDist('modules/dynamic-packaging/packaging.service.js');
@@ -126,6 +129,7 @@ const DYNAMIC_CONTROLLER_CLASS_NAMES = new Set([
   'DynamicYoutubeController', // DN-1: GET /dynamic/youtube/preflight
   'CourseStructureSettingsController', // V2.1 R3
   'CourseProfilesController', // V2.1 R3
+  'AdminDynamicRunsController', // EV6 DoD BE-B: GET /admin/dynamic-runs/needs-attention (SUPER_ADMIN)
 ]);
 /**
  * Todo lo demás: legacy sin ninguna ruta dynamic, EXCEPTO CoursesController
@@ -206,7 +210,7 @@ async function withEnv(vars, fn) {
   }
 }
 const ENV_CLEAN = { [FLAG]: undefined, [ALLOW]: undefined, [REAL]: undefined, [COH_LLM]: undefined, DYNAMIC_MANIFEST_RULES_VERSION: undefined,
-  DYNAMIC_ALLOW_VIDEO_PREVIEW: undefined, DYNAMIC_REAL_VIDEO_ALL_OWNERS: undefined };
+  DYNAMIC_ALLOW_VIDEO_PREVIEW: undefined, DYNAMIC_REAL_VIDEO_ALL_OWNERS: undefined, SUPER_ADMIN_EMAILS: undefined };
 // EV6 DoD (BE-A): `videoMode:'mock'` exige el escape de QA; estos casos (que prueban la allow-list) lo setean.
 const PREVIEW_ESCAPE = { DYNAMIC_ALLOW_VIDEO_PREVIEW: 'true' };
 
@@ -258,8 +262,10 @@ async function buildApp() {
       DynamicYoutubeController,
       CourseStructureSettingsController,
       CourseProfilesController,
+      AdminDynamicRunsController,
     ],
     providers: [
+      { provide: AdminRecoveryService, useValue: fakeService('AdminRecoveryService') },
       AppService,
       { provide: CoursesService, useValue: fakeService('CoursesService') },
       { provide: CourseStructureService, useValue: fakeService('CourseStructureService') },
@@ -457,7 +463,7 @@ async function runWorkerProcess(script, env, { waitMs }) {
   });
 
   await check('G1 set de rutas: los 11 controllers dynamic (incl. Coherence/Invalidation, Fase 7/8, YouTube preflight DN-1 y V2.1 R3 settings/profiles) + solo POST /courses/dynamic de CoursesController', () => {
-    for (const C of [CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController, CoherenceController, InvalidationController, DynamicYoutubeController, CourseStructureSettingsController, CourseProfilesController]) {
+    for (const C of [CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController, CoherenceController, InvalidationController, DynamicYoutubeController, CourseStructureSettingsController, CourseProfilesController, AdminDynamicRunsController]) {
       assert(DYNAMIC_CONTROLLERS.has(C), `${C.name} no está en el set`);
     }
     assert(isDynamicRoute(CoursesController, CoursesController.prototype.createOrGetDynamic), 'POST /courses/dynamic');
@@ -500,7 +506,7 @@ async function runWorkerProcess(script, env, { waitMs }) {
   // ── HTTP real ──────────────────────────────────────────────────────────────
   const { app, base } = await buildApp();
   const dynamicRoutes = [
-    ...[CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController, CoherenceController, InvalidationController, DynamicYoutubeController, CourseStructureSettingsController, CourseProfilesController].flatMap(routesOf),
+    ...[CourseStructureController, CourseBlueprintsController, GenerationManifestsController, RunsController, ExecutorController, PackagingController, CoherenceController, InvalidationController, DynamicYoutubeController, CourseStructureSettingsController, CourseProfilesController, AdminDynamicRunsController].flatMap(routesOf),
     ...routesOf(CoursesController).filter((r) => r.name === 'createOrGetDynamic'),
   ];
   const legacyRoutes = [
@@ -552,8 +558,9 @@ async function runWorkerProcess(script, env, { waitMs }) {
         }));
     }
 
+    // EV6 DoD BE-B: la cola de recuperación es SUPER_ADMIN (SuperAdminGuard): el usuario de prueba es admin acá.
     await check('G1 flag ON: todas las rutas dynamic llegan al controller (nunca 404 del gate)', () =>
-      withEnv({ ...ENV_CLEAN, [FLAG]: 'true' }, async () => {
+      withEnv({ ...ENV_CLEAN, [FLAG]: 'true', SUPER_ADMIN_EMAILS: 'test@example.com' }, async () => {
         for (const r of dynamicRoutes) {
           serviceCalls.length = 0;
           const res = await call(base, r.method, r.path, { user: OWNER_A });
@@ -622,6 +629,14 @@ async function runWorkerProcess(script, env, { waitMs }) {
       // V2.1 fix round 1 (review G2 I4): el editor muestra los toggles V2.1 solo con rulesVersion 3.
       { label: 'ON + reglas v3 (DYNAMIC_MANIFEST_RULES_VERSION=3)', env: { [FLAG]: 'true', DYNAMIC_MANIFEST_RULES_VERSION: '3' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false, manifestRulesVersion: 3 } },
     ];
+    // EV6 DoD BE-B: la respuesta HTTP agrega `dodContract: true` y `superAdmin` (mismo chequeo del servidor).
+    for (const m of featureMatrix) m.want = { ...m.want, dodContract: true, superAdmin: false };
+    featureMatrix.push(
+      { label: 'BE-B: SUPER_ADMIN → superAdmin:true (sin lista de admins en la respuesta)', env: { [FLAG]: 'true', SUPER_ADMIN_EMAILS: 'otro@cursia.test, TEST@example.com' }, user: OWNER_C,
+        want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false, manifestRulesVersion: 1, dodContract: true, superAdmin: true } },
+      { label: 'BE-B: flag OFF también informa el contrato DoD y superAdmin', env: { SUPER_ADMIN_EMAILS: 'test@example.com' }, user: OWNER_A,
+        want: { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false, dodContract: true, superAdmin: true } },
+    );
     for (const m of featureMatrix) {
       await check(`GET /api/v1/features — ${m.label}`, () =>
         withEnv({ ...ENV_CLEAN, ...m.env }, async () => {
