@@ -21,7 +21,8 @@ function loadEnvFile(envPath) {
   }
 }
 
-// Cursia EV6 — H5P pack v2 (H2): courses.review_cards_enabled (ajuste «Repaso» del
+// Cursia EV6 — H5P pack v2 (H2 fix round 1, M-3): VERIFICA (solo lectura) courses.review_cards_enabled
+// después de migrate-ev6-h5p2.js. Columna del ajuste «Repaso» del
 // Blueprint v2; NULL en cursos existentes, default false). Aditiva, idempotente y SOLO
 // staging: la cablea deploy-staging.yml (nunca deploy.yml), después de
 // migrate-v21-blueprint-profiles.js. Producción: el paso 'ev6-h5p2' de
@@ -36,7 +37,7 @@ function assertExplicitStagingIntent() {
       '❌ MIGRATION_ENV no es "staging" — esta migración es para el entorno de\n' +
       '   staging únicamente (spec: docs/v21 cursia-v21-experience-audit §S).\n' +
       '   deploy-staging.yml lo setea automáticamente; si la corrés a mano contra\n' +
-      '   staging, usá: MIGRATION_ENV=staging node scripts/migrate-ev6-h5p2.js'
+      '   staging, usá: MIGRATION_ENV=staging node scripts/verify-ev6-h5p2-schema.js'
     );
     process.exit(1);
   }
@@ -108,24 +109,38 @@ async function main() {
 
   await client.connect();
   try {
-    const sql = fs.readFileSync(
-      path.resolve(__dirname, '../supabase-migration-ev6-h5p2.sql'),
-      'utf8',
+    const { rows } = await client.query(
+      `select data_type, is_nullable, column_default from information_schema.columns
+        where table_schema = 'public' and table_name = 'courses' and column_name = 'review_cards_enabled'`,
     );
-    await client.query('begin');
-    await client.query(sql);
-    await client.query('commit');
-    console.log('✅ Migración EV6 H5P v2 (courses.review_cards_enabled, default false) aplicada (o ya estaba aplicada — es idempotente).');
+    const problems = verifyReviewCardsColumn(rows[0] || null);
+    if (problems.length) {
+      console.error('❌ courses.review_cards_enabled: ' + problems.join('; '));
+      process.exitCode = 1;
+    } else {
+      console.log('✅ courses.review_cards_enabled: boolean, nullable, default false.');
+    }
   } catch (err) {
-    await client.query('rollback');
-    console.error('❌ Migración falló, rollback aplicado:', err.message);
+    console.error('❌ Verificación falló:', err.message);
     process.exitCode = 1;
   } finally {
     await client.end();
   }
 }
 
-main().catch((err) => {
+/** Puro (testeable): problemas de la columna leída de information_schema (null = no existe). */
+function verifyReviewCardsColumn(col) {
+  if (!col) return ['no existe (correr scripts/migrate-ev6-h5p2.js)'];
+  const out = [];
+  if (col.data_type !== 'boolean') out.push(`tipo ${col.data_type} ≠ boolean`);
+  if (col.is_nullable !== 'YES') out.push('debe ser nullable (NULL = cursos anteriores, apagado)');
+  if (!/^false$/i.test(String(col.column_default || '').trim())) out.push(`default ${JSON.stringify(col.column_default)} ≠ false`);
+  return out;
+}
+
+module.exports = { verifyReviewCardsColumn };
+
+if (require.main === module) main().catch((err) => {
   console.error('❌ Error inesperado:', err.message);
   process.exitCode = 1;
 });

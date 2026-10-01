@@ -194,6 +194,8 @@ async function main() {
           'supabase-migration-v21-manifest-v3.sql',
           // V2.1 RF (FinOps ledger + seed de precios por hook) y RF-b (RLS de FinOps + course_profiles).
           'supabase-migration-v21-finops.sql', 'supabase-migration-v21-finops-rls.sql',
+          // EV6 H5P v2 (H2): courses.review_cards_enabled (preparación; default false).
+          'supabase-migration-ev6-h5p2.sql',
           'supabase-migration-storage-artifacts-policies.sql']), 'orden: ' + files.join(','));
         for (const s of plan.steps.filter((x) => x.status === 'included')) {
           const h = crypto.createHash('sha256').update(fs.readFileSync(path.join(REPO, s.file))).digest('hex');
