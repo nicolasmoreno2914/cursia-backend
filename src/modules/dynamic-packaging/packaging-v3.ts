@@ -27,7 +27,7 @@ import type { GenerationManifestV1, ManifestItemType } from '../generation-manif
 import { effectiveOutputRowsSql } from '../dynamic-generation/item-generations';
 import { PackagingNotReadyError } from './packaging-types';
 import type { QueryExecutor } from './artifact-resolver';
-import { artifactDownloadTimeoutMs, parseDynamicVideo, requiredArtifactTypesV3 } from './artifact-resolver';
+import { artifactDownloadTimeoutMs, parseDynamicVideo, resolveRequiredArtifactTypesV3 } from './artifact-resolver';
 import type { ArtifactsService } from '../artifacts/artifacts.service';
 import { frozenVideoDeliveryOf, checkYoutubeDeliveryUrl } from '../dynamic-generation/dynamic-video-delivery';
 import { GuardArtifact, MockArtifactInRealRunError, assertNoMockArtifactsForRealPackage } from './packaging-guards';
@@ -52,7 +52,11 @@ import {
 } from '../theme-engine';
 import { PackagingPlanV3 } from './packaging-plan-v3';
 import { runOrderedWithLimit } from './ordered-limit';
-import type { DynamicPackageContentsV3, ActivityContentV3 } from '../../package/dynamic-mbz-builder-v3';
+import type { DynamicPackageContentsV3, ActivityContentV3, ExamSource } from '../../package/dynamic-mbz-builder-v3';
+import { EXAM_BANK_ARTIFACT_TYPE, ExamBankV1, validateExamBank } from '../course-shell/exam-bank';
+
+/** EV6 P2: un banco que no pasa la re-validación con el Markdown de sus capítulos no se empaqueta. */
+export const EXAM_BANK_INVALID = 'EXAM_BANK_INVALID';
 import {
   AssessmentPackageSummary,
   DYNAMIC_MBZ_BUILDER_VERSION_V3,
@@ -139,11 +143,17 @@ export async function resolveRunArtifactsV3(q: QueryExecutor, runId: string, man
       missing.push(`${item.key}:status=${list[0].gir_status}`);
       continue;
     }
-    const roles = requiredArtifactTypesV3(item.type, item.variant);
-    if (!roles) {
+    // EV6 P2: exam/final_exam → el rol de examen es el banco JSON o el GIFT (exactamente uno).
+    const rolesR = resolveRequiredArtifactTypesV3(item.type, item.variant, list.filter((r) => r.artifact_id).map((r) => r.artifact_type));
+    if (!rolesR) {
       missing.push(`${item.key}:unknown_item_type=${item.type}`);
       continue;
     }
+    if (rolesR.ok === false) {
+      missing.push(`${item.key}:EXAM_ARTIFACT_AMBIGUOUS=${rolesR.types.join('+')}`);
+      continue;
+    }
+    const roles = rolesR.types;
     const arts: ResolvedArtifactV3[] = [];
     for (const role of roles) {
       const matches = list.filter((r) => r.artifact_type === role && r.artifact_id);
@@ -425,6 +435,8 @@ export function assertOwnerStoragePath(ownerId: string, storagePath: string): st
 
 export interface LoadedContentsV3 {
   contents: DynamicPackageContentsV3;
+  /** EV6 P2: fuente de cada examen (GIFT de siempre o banco JSON validado), en orden del plan. */
+  exams: { modules: Map<string, ExamSource>; final: ExamSource | null };
   warnings: string[];
   mockProviderItems: string[];
 }
@@ -537,9 +549,16 @@ export async function loadContentsV3(
   const tasks: Array<() => Promise<void>> = [];
   let courseIntro: any;
   const moduleIntroSlots = new Map<string, unknown>();
-  const examSlots = new Map<string, string>();
+  const examSlots = new Map<string, ExamSource>();
   const chapterSlots = new Map<string, ChapterSlots>();
-  let finalExamGift: string | null = null;
+  let finalExamSource: ExamSource | null = null;
+  // EV6 P2: el examen se carga según el artifact que resolvió el item (banco JSON o GIFT).
+  const loadExam = async (key: string): Promise<ExamSource> => {
+    if (byItem.get(key)?.artifacts.some((a) => a.type === EXAM_BANK_ARTIFACT_TYPE)) {
+      return { kind: 'bank', bank: json(await validatedText(L, byItem, key, EXAM_BANK_ARTIFACT_TYPE), key) };
+    }
+    return { kind: 'gift', gift: await validatedText(L, byItem, key, 'dynamic_exam_gift') };
+  };
   let audioWelcome: Buffer | undefined;
 
   const loadPresentation = async (ch: PackagingPlanV3['modules'][number]['chapters'][number]): Promise<PresentationSlot> => {
@@ -605,7 +624,7 @@ export async function loadContentsV3(
     if (m.keys.exam) {
       const examKey = m.keys.exam;
       tasks.push(async () => {
-        examSlots.set(m.moduleId, await validatedText(L, byItem, examKey, 'dynamic_exam_gift'));
+        examSlots.set(m.moduleId, await loadExam(examKey));
       });
     }
     for (const ch of m.chapters) {
@@ -637,7 +656,7 @@ export async function loadContentsV3(
   }
   if (plan.keys.finalExam) {
     const finalKey = plan.keys.finalExam;
-    tasks.push(async () => { finalExamGift = await validatedText(L, byItem, finalKey, 'dynamic_exam_gift'); });
+    tasks.push(async () => { finalExamSource = await loadExam(finalKey); });
   }
   tasks.push(async () => { audioWelcome = await audio(plan.keys.audioWelcome); });
 
@@ -646,6 +665,8 @@ export async function loadContentsV3(
   // Armado en el orden del plan (mismo orden de inserción que antes).
   const moduleIntros = new Map<string, unknown>();
   const examGift = new Map<string, string>();
+  const examBanks = new Map<string, ExamBankV1>();
+  const examSources = new Map<string, ExamSource>();
   const contentMd = new Map<string, string>();
   const experiences = new Map<string, unknown>();
   const presentations = new Map<string, { pdf: Buffer; cover: Buffer; mock?: boolean }>();
@@ -655,7 +676,12 @@ export async function loadContentsV3(
   const audiobookChapters = new Map<string, Buffer>();
   for (const m of plan.modules) {
     moduleIntros.set(m.moduleId, moduleIntroSlots.get(m.moduleId));
-    if (m.keys.exam) examGift.set(m.moduleId, examSlots.get(m.moduleId) as string);
+    if (m.keys.exam) {
+      const src = examSlots.get(m.moduleId) as ExamSource;
+      examSources.set(m.moduleId, src);
+      if (src.kind === 'gift') examGift.set(m.moduleId, src.gift);
+      else examBanks.set(m.moduleId, src.bank);
+    }
     for (const ch of m.chapters) {
       const slot = chapterSlots.get(ch.chapterId) as ChapterSlots;
       contentMd.set(ch.chapterId, slot.content as string);
@@ -677,6 +703,24 @@ export async function loadContentsV3(
       audiobookChapters.set(ch.chapterId, slot.audio as Buffer);
     }
   }
+  // EV6 P2: un banco se re-valida con el Markdown de sus capítulos (evidencia) antes de empaquetar; falla fuerte.
+  const finalSrc = finalExamSource as ExamSource | null;
+  const banksToCheck: Array<{ key: string; scope: 'module' | 'final'; bank: ExamBankV1; chapters: Array<{ id: string; moduleId: string }> }> = [];
+  for (const m of plan.modules) {
+    const src = examSources.get(m.moduleId);
+    if (src?.kind === 'bank') banksToCheck.push({ key: m.keys.exam as string, scope: 'module', bank: src.bank, chapters: m.chapters.map((c) => ({ id: c.chapterId, moduleId: m.moduleId })) });
+  }
+  if (finalSrc?.kind === 'bank') {
+    banksToCheck.push({ key: plan.keys.finalExam as string, scope: 'final', bank: finalSrc.bank, chapters: plan.modules.flatMap((m) => m.chapters.map((c) => ({ id: c.chapterId, moduleId: m.moduleId }))) });
+  }
+  for (const b of banksToCheck) {
+    const r = validateExamBank(b.bank, { scope: b.scope, chapters: b.chapters, chapterMd: contentMd });
+    if (!r.ok) {
+      const codes = [...new Set(r.errors.map((e) => e.code))].sort();
+      throw new Error(`${EXAM_BANK_INVALID}: ${b.key} [${codes.join(', ')}] ${r.errors.slice(0, 5).map((e) => `${e.path} ${e.code}: ${e.message}`).join(' | ')}`);
+    }
+  }
+
   return {
     contents: {
       courseIntro,
@@ -688,10 +732,13 @@ export async function loadContentsV3(
       videoInteractions,
       activities,
       examGift,
-      finalExamGift,
+      finalExamGift: finalSrc && finalSrc.kind === 'gift' ? finalSrc.gift : null,
+      ...(examBanks.size ? { examBanks } : {}),
+      ...(finalSrc && finalSrc.kind === 'bank' ? { finalExamBank: finalSrc.bank } : {}),
       audioWelcome: audioWelcome as Buffer,
       audiobookChapters,
     },
+    exams: { modules: examSources, final: finalSrc },
     warnings,
     mockProviderItems: mockProviderItems.sort(),
   };

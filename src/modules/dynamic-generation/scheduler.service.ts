@@ -31,7 +31,12 @@ import {
   manifestSha256,
   validateGenerationManifest,
 } from '../generation-manifests/generation-manifest-builder';
-import { requiredArtifactTypes, requiredArtifactTypesV3 } from '../dynamic-packaging/artifact-resolver';
+import {
+  EXAM_ARTIFACT_TYPES_V3,
+  missingRoleLabelV3,
+  requiredArtifactTypes,
+  resolveRequiredArtifactTypesV3,
+} from '../dynamic-packaging/artifact-resolver';
 import { RunsService } from './runs.service';
 import { canonicalContextHash, sortKeysDeep } from './run-hash';
 import {
@@ -54,7 +59,12 @@ import {
   VideoClaimFacts,
   resolveActivityType,
   resolveActivityTypeWithSource,
+  EXAM_BANK_ARTIFACT_TYPE,
+  ExamBankClaimFacts,
+  examBankClaimFacts,
+  examChaptersFromManifest,
   v3ValidatedArtifactType,
+  v3ValidatedArtifactTypes,
   v3ValidationErrorMessage,
   validateV3ItemArtifact,
   videoClaimFacts,
@@ -223,6 +233,8 @@ export interface ClaimPayloadV3 {
   activityTypeSource?: ActivityTypeSource;
   video?: VideoClaimFacts;
   finalExam?: { minQuestions: number; maxQuestions: number };
+  /** EV6 P2: contrato del banco (`dynamic_exam_bank_json`) para exam / final_exam. */
+  examBank?: ExamBankClaimFacts;
   moduleChapterIds?: string[];
   chapterId?: string;
 }
@@ -713,10 +725,24 @@ export class SchedulerService {
         // V2.1 (R4): v3 usa su tabla de roles; activity según el variant del
         // item en el Manifest congelado. Sin tabla para el tipo → 409 (nunca
         // se completa un item v3 sin saber qué debía producir).
+        const linkedTypes = new Set<string>(
+          (await qr.query(`select type from public.artifacts where id = any($1::uuid[])`, [ids])).map((r: any) => r.type),
+        );
         let required: string[];
         if (itemRulesVersion === 3) {
           const variant = await this.manifestItemVariant(qr, item.manifest_id, item.item_key);
-          const v3 = requiredArtifactTypesV3(item.type, variant);
+          // EV6 P2: exam/final_exam → banco JSON o GIFT (exactamente uno).
+          const v3r = resolveRequiredArtifactTypesV3(item.type, variant, linkedTypes);
+          if (v3r && v3r.ok === false) {
+            throw new ConflictException({
+              message:
+                `EXAM_ARTIFACT_AMBIGUOUS: el item ${item.item_key} (${item.type}) subió más de un artifact de examen ` +
+                `(${v3r.types.join(', ')}); debe ser exactamente uno`,
+              code: 'EXAM_ARTIFACT_AMBIGUOUS',
+              missing: [],
+            });
+          }
+          const v3 = v3r?.types;
           if (!v3) {
             throw new ConflictException({
               message:
@@ -730,10 +756,8 @@ export class SchedulerService {
         } else {
           required = requiredArtifactTypes(2, item.type) ?? [];
         }
-        const linkedTypes = new Set(
-          (await qr.query(`select type from public.artifacts where id = any($1::uuid[])`, [ids])).map((r: any) => r.type),
-        );
-        const missingTypes: string[] = required.filter((t) => !linkedTypes.has(t));
+        const missingTypes: string[] = required.filter((t) => !linkedTypes.has(t))
+          .map((t) => (itemRulesVersion === 3 ? missingRoleLabelV3(item.type, t) : t));
         // El resumen del capítulo (dynamic_context_summary_json) es opcional,
         // pero su ausencia tiene que quedar MARCADA (output_summary.
         // contextSummary='missing', mismo invariante que la auditoría [4j]):
@@ -938,16 +962,31 @@ export class SchedulerService {
       // M5 (fail closed): un item v3 running sin su entrada del Manifest es integridad rota.
       throw new InternalServerErrorException(`v3_validation_context: el item ${g.item_key} no está en su Manifest congelado; no se completa sin validar`);
     }
-    const artifactType = v3ValidatedArtifactType(g.type, mItem.variant ?? null);
-    if (!artifactType) return { kind: 'skip' };
+    const validatedTypes = v3ValidatedArtifactTypes(g.type, mItem.variant ?? null);
+    if (validatedTypes.length === 0) return { kind: 'skip' };
+    const artifactCourse = g.frontend_course_id ?? String(g.job_course_id);
+
+    // EV6 P2: exam/final_exam suben EXACTAMENTE uno de banco | GIFT; ambos → inválido (reintentable).
+    if (g.type === 'exam' || g.type === 'final_exam') {
+      const examTypes: any[] = await this.dataSource.query(
+        `select distinct type from public.artifacts
+          where id = any($1::uuid[]) and type = any($2::text[]) and owner_id = $3 and course_id = $4 and item_run_id is null`,
+        [artifactIds, [...EXAM_ARTIFACT_TYPES_V3], g.owner_id, artifactCourse],
+      );
+      if (examTypes.length > 1) {
+        const errors = [{ path: '$', code: 'EXAM_ARTIFACT_AMBIGUOUS', message: `se subieron ${examTypes.map((r) => r.type).sort().join(' y ')}; debe ser exactamente uno` }];
+        return { kind: 'invalid', message: v3ValidationErrorMessage({ itemKey: g.item_key, type: g.type }, errors), codes: ['EXAM_ARTIFACT_AMBIGUOUS'], retryable: true };
+      }
+    }
 
     const rows = await this.dataSource.query(
       `select id, type, storage_bucket, storage_path from public.artifacts
-        where id = any($1::uuid[]) and type = $2 and owner_id = $3 and course_id = $4 and item_run_id is null`,
-      [artifactIds, artifactType, g.owner_id, g.frontend_course_id ?? String(g.job_course_id)],
+        where id = any($1::uuid[]) and type = any($2::text[]) and owner_id = $3 and course_id = $4 and item_run_id is null`,
+      [artifactIds, validatedTypes, g.owner_id, artifactCourse],
     );
     if (rows.length !== 1) return { kind: 'skip' };
     const art = rows[0];
+    const artifactType: string = art.type;
     if (!this.v3Reader) {
       throw new InternalServerErrorException(
         `v3_validator_unavailable: el item ${g.item_key} (${g.type}, rulesVersion 3) exige validar ${artifactType} en el servidor ` +
@@ -962,7 +1001,15 @@ export class SchedulerService {
       chapterId: g.chapter_id ?? null,
       chapterNumber: mItem.chapterNumber ?? null,
       promptVersion,
+      artifactType,
     };
+    if (g.type === 'exam' || g.type === 'final_exam') {
+      // EV6 P2: el plan del banco sale de los capítulos del Manifest congelado.
+      ctx.examChapters = examChaptersFromManifest(manifest, g.type, g.module_id ?? mItem.moduleId ?? null);
+      if (artifactType === EXAM_BANK_ARTIFACT_TYPE && ctx.examChapters.length === 0) {
+        throw new InternalServerErrorException(`v3_validation_context: el ${g.type} ${g.item_key} no tiene capítulos en el Manifest; no se completa sin validar`);
+      }
+    }
     if (g.type === 'activity') {
       // EV5-C: tipo esperado del Manifest congelado del run (h5pType o, legacy, hash).
       ctx.expectedActivityType = resolveActivityType({ ...mItem, chapterId: g.chapter_id ?? mItem.chapterId ?? null });
@@ -1050,6 +1097,7 @@ export class SchedulerService {
     const out: ClaimPayloadV3 = { validatedArtifactType };
     switch (row.type) {
       case 'course_intro':
+      case 'exam':
       case 'final_exam':
       case 'experience':
       case 'module_intro':
@@ -1062,6 +1110,11 @@ export class SchedulerService {
     if (row.type === 'experience') out.chapterId = row.chapter_id;
     if (row.type === 'final_exam') {
       out.finalExam = { minQuestions: FINAL_EXAM_QUESTION_RANGE.min, maxQuestions: FINAL_EXAM_QUESTION_RANGE.max };
+    }
+    if (row.type === 'exam' || row.type === 'final_exam') {
+      // EV6 P2: plan del banco (el mismo que valida completeItem). Sin capítulos → sin bloque (el GIFT sigue aceptado).
+      const facts = examBankClaimFacts(manifest as any, row.type, row.module_id ?? mItem.moduleId ?? null);
+      if (facts) out.examBank = facts;
     }
     if (row.type === 'module_intro') {
       const mod = manifest.modules.find((m) => m.moduleId === row.module_id);

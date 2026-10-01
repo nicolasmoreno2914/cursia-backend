@@ -87,6 +87,52 @@ const ACTIVITY_ARTIFACT_TYPES_V3: Record<'h5p' | 'scorm', ResolvedArtifact['type
   scorm: ['dynamic_scorm_html', 'dynamic_scorm_manifest'],
 };
 
+/**
+ * EV6 P2 (despliegue mixto): el rol "examen" de `exam` / `final_exam` en v3 se
+ * cumple con EXACTAMENTE uno de estos tipos — el banco JSON nuevo o el GIFT de
+ * siempre (pestañas/bundles anteriores, cursos ya generados). `requiredArtifactTypesV3`
+ * sigue devolviendo el rol canónico (`dynamic_exam_gift`); quien verifica artifacts
+ * presentes usa `resolveRequiredArtifactTypesV3`, que lo sustituye por el que se subió.
+ */
+export const EXAM_ARTIFACT_TYPES_V3: readonly ResolvedArtifact['type'][] = Object.freeze(['dynamic_exam_bank_json', 'dynamic_exam_gift']);
+
+/** Alternativas del rol de examen para un tipo de item v3 (undefined = el tipo no tiene roles alternativos). */
+export function artifactAlternativesV3(type: ManifestItemType | string): readonly ResolvedArtifact['type'][] | undefined {
+  return type === 'exam' || type === 'final_exam' ? EXAM_ARTIFACT_TYPES_V3 : undefined;
+}
+
+export type RequiredArtifactResolutionV3 =
+  | { ok: true; types: ResolvedArtifact['type'][] }
+  | { ok: false; code: 'EXAM_ARTIFACT_AMBIGUOUS'; types: ResolvedArtifact['type'][] };
+
+/**
+ * Roles obligatorios de un item v3 resueltos contra los tipos PRESENTES: el rol
+ * con alternativas se reemplaza por la alternativa presente (ninguna → el rol
+ * canónico, que se reportará faltante); dos o más presentes → EXAM_ARTIFACT_AMBIGUOUS.
+ * undefined = sin tabla de roles (igual que `requiredArtifactTypesV3`).
+ */
+export function resolveRequiredArtifactTypesV3(
+  type: ManifestItemType,
+  variant: string | null | undefined,
+  present: Iterable<string>,
+): RequiredArtifactResolutionV3 | undefined {
+  const base = requiredArtifactTypesV3(type, variant);
+  if (!base) return undefined;
+  const alts = artifactAlternativesV3(type);
+  if (!alts) return { ok: true, types: base };
+  const have = new Set(present);
+  const found = alts.filter((t) => have.has(t));
+  if (found.length > 1) return { ok: false, code: 'EXAM_ARTIFACT_AMBIGUOUS', types: found };
+  if (found.length === 0) return { ok: true, types: base };
+  return { ok: true, types: base.map((t) => (alts.includes(t) ? found[0] : t)) };
+}
+
+/** Nombre legible de un rol faltante (las alternativas se listan juntas). */
+export function missingRoleLabelV3(type: ManifestItemType | string, role: string): string {
+  const alts = artifactAlternativesV3(type);
+  return alts && alts.includes(role as ResolvedArtifact['type']) ? alts.join('|') : role;
+}
+
 /** Roles obligatorios de un item v3; `activity` exige su `variant` (sin variant → undefined: el caller falla fuerte). */
 export function requiredArtifactTypesV3(
   type: ManifestItemType,

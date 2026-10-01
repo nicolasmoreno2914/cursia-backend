@@ -10,9 +10,13 @@
  * | video_interactions | dynamic_video_interactions_json    | validateVideoInteractionsDoc (R8)          |
  * | activity (h5p)     | dynamic_h5p_params_json            | validateH5pActivityPayload (R7 + rotación) |
  * | final_exam         | dynamic_exam_gift                  | validateExamGift (parseGIFT)               |
+ * | exam / final_exam  | dynamic_exam_bank_json (EV6 P2)    | validateExamBank (plan del Manifest)       |
  *
- * `activity` scorm y `exam` de módulo siguen con sus artifacts existentes
- * (solo el chequeo de roles de R4). Todo lo demás de v1/v2: sin cambios.
+ * EV6 P2 (despliegue mixto): `exam` y `final_exam` aceptan EXACTAMENTE uno de
+ * `dynamic_exam_bank_json` | `dynamic_exam_gift`; se valida según el tipo que
+ * se subió (ambos → EXAM_ARTIFACT_AMBIGUOUS). El GIFT de módulo sigue sin
+ * validación de contenido (como antes). `activity` scorm: solo roles de R4.
+ * Todo lo demás de v1/v2: sin cambios.
  */
 import { validateExperience, validatePedagogy, validateSimulatedDiagrams } from '../visual-components';
 import { H5pInputError, VideoPlanError, planInteractionCheckpoints, validateVideoInteractionsDoc } from '../../package/h5p';
@@ -20,10 +24,22 @@ import type { VideoCheckpoint } from '../../package/h5p';
 import { H5pActivityType, ShellValidationError, activityTypeForChapter, validateH5pActivityPayload } from './activity-type';
 import { validateCourseIntroV3, validateModuleIntroV3 } from './intro-schemas';
 import { FINAL_EXAM_QUESTION_RANGE, validateExamGift } from './final-exam';
+import { EXAM_BANK_ARTIFACT_TYPE, EXAM_BANK_VERSION, EXAM_GIFT_ARTIFACT_TYPE, ExamPlanLeaf, expectedExamPlan, validateExamBank } from './exam-bank';
 
 export const V3_PAYLOAD_INVALID = 'v3_payload_invalid';
 
-/** Artifact que se valida por tipo de item v3 (null = sin validación de contenido en R11a). */
+/**
+ * EV6 P2: artifacts cuyo contenido valida el servidor, por tipo de item v3 (lista vacía = solo roles).
+ * `exam`: solo el banco (el GIFT de módulo sigue sin validación de contenido); `final_exam`: banco o GIFT.
+ */
+export function v3ValidatedArtifactTypes(type: string, variant?: string | null): string[] {
+  if (type === 'exam') return [EXAM_BANK_ARTIFACT_TYPE];
+  if (type === 'final_exam') return [EXAM_BANK_ARTIFACT_TYPE, EXAM_GIFT_ARTIFACT_TYPE];
+  const t = v3ValidatedArtifactType(type, variant);
+  return t ? [t] : [];
+}
+
+/** Artifact preferido que se valida por tipo de item v3 (null = sin validación de contenido). EV6 P2: exámenes → el banco. */
 export function v3ValidatedArtifactType(type: string, variant?: string | null): string | null {
   switch (type) {
     case 'course_intro':
@@ -36,8 +52,9 @@ export function v3ValidatedArtifactType(type: string, variant?: string | null): 
       return 'dynamic_video_interactions_json';
     case 'activity':
       return variant === 'h5p' ? 'dynamic_h5p_params_json' : null;
+    case 'exam':
     case 'final_exam':
-      return 'dynamic_exam_gift';
+      return EXAM_BANK_ARTIFACT_TYPE;
     default:
       return null;
   }
@@ -61,6 +78,13 @@ export interface V3ItemValidationContext {
   video?: { videoItemKey: string; durationSec: number } | null;
   /** Edu EV2: promptVersion que reporta el ejecutor (summary). La estructura educativa se exige solo a partir de v21-exp-4. */
   promptVersion?: string | null;
+  /**
+   * EV6 P2: tipo del artifact que se valida (exam/final_exam aceptan banco o GIFT).
+   * Ausente en final_exam → GIFT (compatibilidad).
+   */
+  artifactType?: string | null;
+  /** EV6 P2: capítulos del examen (orden del Manifest congelado) con su módulo; exigidos para validar un banco. */
+  examChapters?: Array<{ id: string; moduleId: string }>;
 }
 
 /**
@@ -114,9 +138,23 @@ export function validateV3ItemArtifact(ctx: V3ItemValidationContext, text: strin
   const expected = v3ValidatedArtifactType(ctx.type, ctx.variant);
   if (!expected) throw new Error(`V3_VALIDATION_CONTEXT: el item ${ctx.itemKey} (${ctx.type}) no tiene validación de contenido`);
 
-  if (ctx.type === 'final_exam') {
-    const r = validateExamGift(text, FINAL_EXAM_QUESTION_RANGE);
-    return { ok: r.ok, errors: r.errors, summary: { questionCount: r.questionCount } };
+  if (ctx.type === 'exam' || ctx.type === 'final_exam') {
+    const artifactType = ctx.artifactType ?? (ctx.type === 'final_exam' ? EXAM_GIFT_ARTIFACT_TYPE : null);
+    if (artifactType === EXAM_GIFT_ARTIFACT_TYPE && ctx.type === 'final_exam') {
+      const r = validateExamGift(text, FINAL_EXAM_QUESTION_RANGE);
+      return { ok: r.ok, errors: r.errors, summary: { questionCount: r.questionCount } };
+    }
+    if (artifactType !== EXAM_BANK_ARTIFACT_TYPE) {
+      throw new Error(`V3_VALIDATION_CONTEXT: el item ${ctx.itemKey} (${ctx.type}) no tiene validación de contenido para ${String(artifactType)}`);
+    }
+    if (!ctx.examChapters || ctx.examChapters.length === 0) {
+      throw new Error(`V3_VALIDATION_CONTEXT: ${ctx.type} ${ctx.itemKey} sin capítulos del examen`);
+    }
+    const parsedBank = parseJson(text);
+    if (parsedBank.ok === false) return { ok: false, errors: [parsedBank.error] };
+    const r = validateExamBank(parsedBank.value, { scope: ctx.type === 'exam' ? 'module' : 'final', chapters: ctx.examChapters });
+    // questionCount = slots (lo que ve el estudiante), no el tamaño del banco.
+    return { ok: r.ok, errors: r.errors, summary: { questionCount: r.slotCount, bankSize: r.bankSize, bankVersion: EXAM_BANK_VERSION } };
   }
 
   const parsed = parseJson(text);
@@ -164,6 +202,48 @@ export function validateV3ItemArtifact(ctx: V3ItemValidationContext, text: strin
     default:
       throw new Error(`V3_VALIDATION_CONTEXT: tipo ${ctx.type} sin validador`);
   }
+}
+
+/**
+ * EV6 P2: capítulos de un examen según el Manifest congelado (orden del Manifest):
+ * `exam` → los del módulo `moduleId`; `final_exam` → todos los del curso. Vacío si
+ * el módulo no existe (el caller falla fuerte).
+ */
+export function examChaptersFromManifest(
+  manifest: { modules?: Array<{ moduleId: string; chapters?: Array<{ chapterId: string }> }> } | null | undefined,
+  type: 'exam' | 'final_exam',
+  moduleId?: string | null,
+): Array<{ id: string; moduleId: string }> {
+  const mods = (manifest?.modules ?? []).filter((m) => type === 'final_exam' || m.moduleId === moduleId);
+  return mods.flatMap((m) => (m.chapters ?? []).map((c) => ({ id: c.chapterId, moduleId: m.moduleId })));
+}
+
+/** EV6 P2: lo que el claim de un examen v3 entrega al ejecutor para armar el banco (el plan es el que valida el servidor). */
+export interface ExamBankClaimFacts {
+  artifactType: typeof EXAM_BANK_ARTIFACT_TYPE;
+  bankVersion: typeof EXAM_BANK_VERSION;
+  scope: 'module' | 'final';
+  moduleId: string | null;
+  chapters: Array<{ chapterId: string; moduleId: string }>;
+  plan: ExamPlanLeaf[];
+}
+
+export function examBankClaimFacts(
+  manifest: Parameters<typeof examChaptersFromManifest>[0],
+  type: 'exam' | 'final_exam',
+  moduleId?: string | null,
+): ExamBankClaimFacts | null {
+  const chapters = examChaptersFromManifest(manifest, type, moduleId);
+  if (chapters.length === 0) return null;
+  const scope = type === 'exam' ? 'module' : 'final';
+  return {
+    artifactType: EXAM_BANK_ARTIFACT_TYPE,
+    bankVersion: EXAM_BANK_VERSION,
+    scope,
+    moduleId: scope === 'module' ? (moduleId as string) : null,
+    chapters: chapters.map((c) => ({ chapterId: c.id, moduleId: c.moduleId })),
+    plan: expectedExamPlan(scope, chapters),
+  };
 }
 
 /** Mensaje de error del item (persistido en generation_item_runs.error). */

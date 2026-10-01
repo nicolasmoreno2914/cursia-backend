@@ -1,0 +1,1244 @@
+{
+  "bankVersion": 1,
+  "scope": "module",
+  "moduleId": "00000000-0000-4000-8000-0000000e0a01",
+  "plan": [
+    {
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "type": "multichoice",
+      "slots": 5
+    },
+    {
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "type": "multichoice",
+      "slots": 5
+    },
+    {
+      "chapterId": "00000000-0000-4000-8000-0000000e0c03",
+      "type": "multichoice",
+      "slots": 5
+    },
+    {
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "type": "truefalse",
+      "slots": 2
+    },
+    {
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "type": "truefalse",
+      "slots": 2
+    },
+    {
+      "chapterId": "00000000-0000-4000-8000-0000000e0c03",
+      "type": "truefalse",
+      "slots": 1
+    },
+    {
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "type": "match",
+      "slots": 2
+    },
+    {
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "type": "match",
+      "slots": 2
+    },
+    {
+      "chapterId": "00000000-0000-4000-8000-0000000e0c03",
+      "type": "match",
+      "slots": 1
+    }
+  ],
+  "questions": [
+    {
+      "id": "M1-MC-01",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "level": "recordar",
+      "stem": "Caso M1-MC-01: durante el turno, una supervisora debe decidir qué hacer con el punto de control 1.1 de la planta.",
+      "explanation": "El punto de control 1.1 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M1-MC-01).",
+      "evidence": "En la planta 1, la regla operativa 1 indica que el equipo revisa el punto de control 1.1 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M1-MC-01",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M1-MC-01",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M1-MC-01",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M1-MC-01",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M1-MC-02",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "level": "comprender",
+      "stem": "Caso M1-MC-02: durante el turno, una supervisora debe decidir qué hacer con el punto de control 1.2 de la planta.",
+      "explanation": "El punto de control 1.2 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M1-MC-02).",
+      "evidence": "En la planta 1, la regla operativa 2 indica que el equipo revisa el punto de control 1.2 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M1-MC-02",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M1-MC-02",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M1-MC-02",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M1-MC-02",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M1-MC-03",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "level": "aplicar",
+      "stem": "Caso M1-MC-03: durante el turno, una supervisora debe decidir qué hacer con el punto de control 1.3 de la planta.",
+      "explanation": "El punto de control 1.3 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M1-MC-03).",
+      "evidence": "En la planta 1, la regla operativa 3 indica que el equipo revisa el punto de control 1.3 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M1-MC-03",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M1-MC-03",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M1-MC-03",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M1-MC-03",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M1-MC-04",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "level": "analizar",
+      "stem": "Caso M1-MC-04: durante el turno, una supervisora debe decidir qué hacer con el punto de control 1.4 de la planta.",
+      "explanation": "El punto de control 1.4 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M1-MC-04).",
+      "evidence": "En la planta 1, la regla operativa 4 indica que el equipo revisa el punto de control 1.4 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M1-MC-04",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M1-MC-04",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M1-MC-04",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M1-MC-04",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M1-MC-05",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "level": "recordar",
+      "stem": "Caso M1-MC-05: durante el turno, una supervisora debe decidir qué hacer con el punto de control 1.5 de la planta.",
+      "explanation": "El punto de control 1.5 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M1-MC-05).",
+      "evidence": "En la planta 1, la regla operativa 5 indica que el equipo revisa el punto de control 1.5 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Documentar el control M1-MC-05",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M1-MC-05",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M1-MC-05",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M1-MC-05",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M1-MC-06",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "level": "comprender",
+      "stem": "Caso M1-MC-06: durante el turno, una supervisora debe decidir qué hacer con el punto de control 1.6 de la planta.",
+      "explanation": "El punto de control 1.6 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M1-MC-06).",
+      "evidence": "En la planta 1, la regla operativa 6 indica que el equipo revisa el punto de control 1.6 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M1-MC-06",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M1-MC-06",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M1-MC-06",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M1-MC-06",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M1-MC-07",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "level": "aplicar",
+      "stem": "Caso M1-MC-07: durante el turno, una supervisora debe decidir qué hacer con el punto de control 1.7 de la planta.",
+      "explanation": "El punto de control 1.7 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M1-MC-07).",
+      "evidence": "En la planta 1, la regla operativa 7 indica que el equipo revisa el punto de control 1.7 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M1-MC-07",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M1-MC-07",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M1-MC-07",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M1-MC-07",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M1-MC-08",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "level": "analizar",
+      "stem": "Caso M1-MC-08: durante el turno, una supervisora debe decidir qué hacer con el punto de control 1.8 de la planta.",
+      "explanation": "El punto de control 1.8 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M1-MC-08).",
+      "evidence": "En la planta 1, la regla operativa 8 indica que el equipo revisa el punto de control 1.8 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M1-MC-08",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M1-MC-08",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M1-MC-08",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M1-MC-08",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M1-MC-09",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "level": "recordar",
+      "stem": "Caso M1-MC-09: durante el turno, una supervisora debe decidir qué hacer con el punto de control 1.9 de la planta.",
+      "explanation": "El punto de control 1.9 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M1-MC-09).",
+      "evidence": "En la planta 1, la regla operativa 9 indica que el equipo revisa el punto de control 1.9 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M1-MC-09",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M1-MC-09",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M1-MC-09",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M1-MC-09",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M1-MC-10",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "level": "comprender",
+      "stem": "Caso M1-MC-10: durante el turno, una supervisora debe decidir qué hacer con el punto de control 1.10 de la planta.",
+      "explanation": "El punto de control 1.10 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M1-MC-10).",
+      "evidence": "En la planta 1, la regla operativa 10 indica que el equipo revisa el punto de control 1.10 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Documentar el control M1-MC-10",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M1-MC-10",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M1-MC-10",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M1-MC-10",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M2-MC-01",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "level": "comprender",
+      "stem": "Caso M2-MC-01: durante el turno, una supervisora debe decidir qué hacer con el punto de control 2.1 de la planta.",
+      "explanation": "El punto de control 2.1 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M2-MC-01).",
+      "evidence": "En la planta 2, la regla operativa 1 indica que el equipo revisa el punto de control 2.1 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M2-MC-01",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M2-MC-01",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M2-MC-01",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M2-MC-01",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M2-MC-02",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "level": "aplicar",
+      "stem": "Caso M2-MC-02: durante el turno, una supervisora debe decidir qué hacer con el punto de control 2.2 de la planta.",
+      "explanation": "El punto de control 2.2 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M2-MC-02).",
+      "evidence": "En la planta 2, la regla operativa 2 indica que el equipo revisa el punto de control 2.2 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M2-MC-02",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M2-MC-02",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M2-MC-02",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M2-MC-02",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M2-MC-03",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "level": "analizar",
+      "stem": "Caso M2-MC-03: durante el turno, una supervisora debe decidir qué hacer con el punto de control 2.3 de la planta.",
+      "explanation": "El punto de control 2.3 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M2-MC-03).",
+      "evidence": "En la planta 2, la regla operativa 3 indica que el equipo revisa el punto de control 2.3 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M2-MC-03",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M2-MC-03",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M2-MC-03",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M2-MC-03",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M2-MC-04",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "level": "recordar",
+      "stem": "Caso M2-MC-04: durante el turno, una supervisora debe decidir qué hacer con el punto de control 2.4 de la planta.",
+      "explanation": "El punto de control 2.4 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M2-MC-04).",
+      "evidence": "En la planta 2, la regla operativa 4 indica que el equipo revisa el punto de control 2.4 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M2-MC-04",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M2-MC-04",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M2-MC-04",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M2-MC-04",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M2-MC-05",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "level": "comprender",
+      "stem": "Caso M2-MC-05: durante el turno, una supervisora debe decidir qué hacer con el punto de control 2.5 de la planta.",
+      "explanation": "El punto de control 2.5 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M2-MC-05).",
+      "evidence": "En la planta 2, la regla operativa 5 indica que el equipo revisa el punto de control 2.5 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Documentar el control M2-MC-05",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M2-MC-05",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M2-MC-05",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M2-MC-05",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M2-MC-06",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "level": "aplicar",
+      "stem": "Caso M2-MC-06: durante el turno, una supervisora debe decidir qué hacer con el punto de control 2.6 de la planta.",
+      "explanation": "El punto de control 2.6 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M2-MC-06).",
+      "evidence": "En la planta 2, la regla operativa 6 indica que el equipo revisa el punto de control 2.6 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M2-MC-06",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M2-MC-06",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M2-MC-06",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M2-MC-06",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M2-MC-07",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "level": "analizar",
+      "stem": "Caso M2-MC-07: durante el turno, una supervisora debe decidir qué hacer con el punto de control 2.7 de la planta.",
+      "explanation": "El punto de control 2.7 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M2-MC-07).",
+      "evidence": "En la planta 2, la regla operativa 7 indica que el equipo revisa el punto de control 2.7 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M2-MC-07",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M2-MC-07",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M2-MC-07",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M2-MC-07",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M2-MC-08",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "level": "recordar",
+      "stem": "Caso M2-MC-08: durante el turno, una supervisora debe decidir qué hacer con el punto de control 2.8 de la planta.",
+      "explanation": "El punto de control 2.8 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M2-MC-08).",
+      "evidence": "En la planta 2, la regla operativa 8 indica que el equipo revisa el punto de control 2.8 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M2-MC-08",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M2-MC-08",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M2-MC-08",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M2-MC-08",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M2-MC-09",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "level": "comprender",
+      "stem": "Caso M2-MC-09: durante el turno, una supervisora debe decidir qué hacer con el punto de control 2.9 de la planta.",
+      "explanation": "El punto de control 2.9 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M2-MC-09).",
+      "evidence": "En la planta 2, la regla operativa 9 indica que el equipo revisa el punto de control 2.9 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M2-MC-09",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M2-MC-09",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M2-MC-09",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M2-MC-09",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M2-MC-10",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "level": "aplicar",
+      "stem": "Caso M2-MC-10: durante el turno, una supervisora debe decidir qué hacer con el punto de control 2.10 de la planta.",
+      "explanation": "El punto de control 2.10 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M2-MC-10).",
+      "evidence": "En la planta 2, la regla operativa 10 indica que el equipo revisa el punto de control 2.10 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Documentar el control M2-MC-10",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M2-MC-10",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M2-MC-10",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M2-MC-10",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M3-MC-01",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c03",
+      "level": "aplicar",
+      "stem": "Caso M3-MC-01: durante el turno, una supervisora debe decidir qué hacer con el punto de control 3.1 de la planta.",
+      "explanation": "El punto de control 3.1 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M3-MC-01).",
+      "evidence": "En la planta 3, la regla operativa 1 indica que el equipo revisa el punto de control 3.1 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M3-MC-01",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M3-MC-01",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M3-MC-01",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M3-MC-01",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M3-MC-02",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c03",
+      "level": "analizar",
+      "stem": "Caso M3-MC-02: durante el turno, una supervisora debe decidir qué hacer con el punto de control 3.2 de la planta.",
+      "explanation": "El punto de control 3.2 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M3-MC-02).",
+      "evidence": "En la planta 3, la regla operativa 2 indica que el equipo revisa el punto de control 3.2 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M3-MC-02",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M3-MC-02",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M3-MC-02",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M3-MC-02",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M3-MC-03",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c03",
+      "level": "recordar",
+      "stem": "Caso M3-MC-03: durante el turno, una supervisora debe decidir qué hacer con el punto de control 3.3 de la planta.",
+      "explanation": "El punto de control 3.3 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M3-MC-03).",
+      "evidence": "En la planta 3, la regla operativa 3 indica que el equipo revisa el punto de control 3.3 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M3-MC-03",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M3-MC-03",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M3-MC-03",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M3-MC-03",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M3-MC-04",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c03",
+      "level": "comprender",
+      "stem": "Caso M3-MC-04: durante el turno, una supervisora debe decidir qué hacer con el punto de control 3.4 de la planta.",
+      "explanation": "El punto de control 3.4 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M3-MC-04).",
+      "evidence": "En la planta 3, la regla operativa 4 indica que el equipo revisa el punto de control 3.4 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M3-MC-04",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M3-MC-04",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M3-MC-04",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M3-MC-04",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M3-MC-05",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c03",
+      "level": "aplicar",
+      "stem": "Caso M3-MC-05: durante el turno, una supervisora debe decidir qué hacer con el punto de control 3.5 de la planta.",
+      "explanation": "El punto de control 3.5 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M3-MC-05).",
+      "evidence": "En la planta 3, la regla operativa 5 indica que el equipo revisa el punto de control 3.5 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Documentar el control M3-MC-05",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M3-MC-05",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M3-MC-05",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M3-MC-05",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M3-MC-06",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c03",
+      "level": "analizar",
+      "stem": "Caso M3-MC-06: durante el turno, una supervisora debe decidir qué hacer con el punto de control 3.6 de la planta.",
+      "explanation": "El punto de control 3.6 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M3-MC-06).",
+      "evidence": "En la planta 3, la regla operativa 6 indica que el equipo revisa el punto de control 3.6 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M3-MC-06",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M3-MC-06",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M3-MC-06",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M3-MC-06",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M3-MC-07",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c03",
+      "level": "recordar",
+      "stem": "Caso M3-MC-07: durante el turno, una supervisora debe decidir qué hacer con el punto de control 3.7 de la planta.",
+      "explanation": "El punto de control 3.7 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M3-MC-07).",
+      "evidence": "En la planta 3, la regla operativa 7 indica que el equipo revisa el punto de control 3.7 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M3-MC-07",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M3-MC-07",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M3-MC-07",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M3-MC-07",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M3-MC-08",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c03",
+      "level": "comprender",
+      "stem": "Caso M3-MC-08: durante el turno, una supervisora debe decidir qué hacer con el punto de control 3.8 de la planta.",
+      "explanation": "El punto de control 3.8 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M3-MC-08).",
+      "evidence": "En la planta 3, la regla operativa 8 indica que el equipo revisa el punto de control 3.8 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M3-MC-08",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M3-MC-08",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M3-MC-08",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M3-MC-08",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M3-MC-09",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c03",
+      "level": "aplicar",
+      "stem": "Caso M3-MC-09: durante el turno, una supervisora debe decidir qué hacer con el punto de control 3.9 de la planta.",
+      "explanation": "El punto de control 3.9 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M3-MC-09).",
+      "evidence": "En la planta 3, la regla operativa 9 indica que el equipo revisa el punto de control 3.9 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Revisar el control M3-MC-09",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M3-MC-09",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M3-MC-09",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M3-MC-09",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M3-MC-10",
+      "type": "multichoice",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c03",
+      "level": "analizar",
+      "stem": "Caso M3-MC-10: durante el turno, una supervisora debe decidir qué hacer con el punto de control 3.10 de la planta.",
+      "explanation": "El punto de control 3.10 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M3-MC-10).",
+      "evidence": "En la planta 3, la regla operativa 10 indica que el equipo revisa el punto de control 3.10 antes de iniciar cada turno de trabajo.",
+      "correct": {
+        "text": "Documentar el control M3-MC-10",
+        "why": "Es lo que indica la regla operativa del capítulo para ese punto."
+      },
+      "distractors": [
+        {
+          "text": "Omitir el control M3-MC-10",
+          "why": "Confunde un control obligatorio con uno opcional del turno."
+        },
+        {
+          "text": "Aplazar el control M3-MC-10",
+          "why": "Supone que revisar después del arranque tiene el mismo efecto."
+        },
+        {
+          "text": "Delegar el control M3-MC-10",
+          "why": "Cree que la responsabilidad del control pasa a otra área."
+        }
+      ]
+    },
+    {
+      "id": "M4-TF-01",
+      "type": "truefalse",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "level": "analizar",
+      "stem": "Caso M4-TF-01: durante el turno, una supervisora debe decidir qué hacer con el punto de control 1.11 de la planta.",
+      "explanation": "El punto de control 1.11 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M4-TF-01).",
+      "evidence": "En la planta 1, la regla operativa 11 indica que el equipo revisa el punto de control 1.11 antes de iniciar cada turno de trabajo.",
+      "answer": true,
+      "whyWrong": "Responder falso ignora que la regla exige la revisión antes del turno."
+    },
+    {
+      "id": "M4-TF-02",
+      "type": "truefalse",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "level": "recordar",
+      "stem": "Caso M4-TF-02: durante el turno, una supervisora debe decidir qué hacer con el punto de control 1.12 de la planta.",
+      "explanation": "El punto de control 1.12 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M4-TF-02).",
+      "evidence": "En la planta 1, la regla operativa 12 indica que el equipo revisa el punto de control 1.12 antes de iniciar cada turno de trabajo.",
+      "answer": false,
+      "whyWrong": "Responder verdadero acepta una práctica que la regla del capítulo descarta."
+    },
+    {
+      "id": "M4-TF-03",
+      "type": "truefalse",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "level": "comprender",
+      "stem": "Caso M4-TF-03: durante el turno, una supervisora debe decidir qué hacer con el punto de control 1.13 de la planta.",
+      "explanation": "El punto de control 1.13 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M4-TF-03).",
+      "evidence": "En la planta 1, la regla operativa 13 indica que el equipo revisa el punto de control 1.13 antes de iniciar cada turno de trabajo.",
+      "answer": true,
+      "whyWrong": "Responder falso ignora que la regla exige la revisión antes del turno."
+    },
+    {
+      "id": "M4-TF-04",
+      "type": "truefalse",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "level": "aplicar",
+      "stem": "Caso M4-TF-04: durante el turno, una supervisora debe decidir qué hacer con el punto de control 1.14 de la planta.",
+      "explanation": "El punto de control 1.14 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M4-TF-04).",
+      "evidence": "En la planta 1, la regla operativa 14 indica que el equipo revisa el punto de control 1.14 antes de iniciar cada turno de trabajo.",
+      "answer": false,
+      "whyWrong": "Responder verdadero acepta una práctica que la regla del capítulo descarta."
+    },
+    {
+      "id": "M5-TF-01",
+      "type": "truefalse",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "level": "recordar",
+      "stem": "Caso M5-TF-01: durante el turno, una supervisora debe decidir qué hacer con el punto de control 2.11 de la planta.",
+      "explanation": "El punto de control 2.11 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M5-TF-01).",
+      "evidence": "En la planta 2, la regla operativa 11 indica que el equipo revisa el punto de control 2.11 antes de iniciar cada turno de trabajo.",
+      "answer": true,
+      "whyWrong": "Responder falso ignora que la regla exige la revisión antes del turno."
+    },
+    {
+      "id": "M5-TF-02",
+      "type": "truefalse",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "level": "comprender",
+      "stem": "Caso M5-TF-02: durante el turno, una supervisora debe decidir qué hacer con el punto de control 2.12 de la planta.",
+      "explanation": "El punto de control 2.12 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M5-TF-02).",
+      "evidence": "En la planta 2, la regla operativa 12 indica que el equipo revisa el punto de control 2.12 antes de iniciar cada turno de trabajo.",
+      "answer": false,
+      "whyWrong": "Responder verdadero acepta una práctica que la regla del capítulo descarta."
+    },
+    {
+      "id": "M5-TF-03",
+      "type": "truefalse",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "level": "aplicar",
+      "stem": "Caso M5-TF-03: durante el turno, una supervisora debe decidir qué hacer con el punto de control 2.13 de la planta.",
+      "explanation": "El punto de control 2.13 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M5-TF-03).",
+      "evidence": "En la planta 2, la regla operativa 13 indica que el equipo revisa el punto de control 2.13 antes de iniciar cada turno de trabajo.",
+      "answer": true,
+      "whyWrong": "Responder falso ignora que la regla exige la revisión antes del turno."
+    },
+    {
+      "id": "M5-TF-04",
+      "type": "truefalse",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "level": "analizar",
+      "stem": "Caso M5-TF-04: durante el turno, una supervisora debe decidir qué hacer con el punto de control 2.14 de la planta.",
+      "explanation": "El punto de control 2.14 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M5-TF-04).",
+      "evidence": "En la planta 2, la regla operativa 14 indica que el equipo revisa el punto de control 2.14 antes de iniciar cada turno de trabajo.",
+      "answer": false,
+      "whyWrong": "Responder verdadero acepta una práctica que la regla del capítulo descarta."
+    },
+    {
+      "id": "M6-TF-01",
+      "type": "truefalse",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c03",
+      "level": "comprender",
+      "stem": "Caso M6-TF-01: durante el turno, una supervisora debe decidir qué hacer con el punto de control 3.11 de la planta.",
+      "explanation": "El punto de control 3.11 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M6-TF-01).",
+      "evidence": "En la planta 3, la regla operativa 11 indica que el equipo revisa el punto de control 3.11 antes de iniciar cada turno de trabajo.",
+      "answer": true,
+      "whyWrong": "Responder falso ignora que la regla exige la revisión antes del turno."
+    },
+    {
+      "id": "M6-TF-02",
+      "type": "truefalse",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c03",
+      "level": "aplicar",
+      "stem": "Caso M6-TF-02: durante el turno, una supervisora debe decidir qué hacer con el punto de control 3.12 de la planta.",
+      "explanation": "El punto de control 3.12 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M6-TF-02).",
+      "evidence": "En la planta 3, la regla operativa 12 indica que el equipo revisa el punto de control 3.12 antes de iniciar cada turno de trabajo.",
+      "answer": false,
+      "whyWrong": "Responder verdadero acepta una práctica que la regla del capítulo descarta."
+    },
+    {
+      "id": "M7-MA-01",
+      "type": "match",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "level": "aplicar",
+      "stem": "Caso M7-MA-01: durante el turno, una supervisora debe decidir qué hacer con el punto de control 1.15 de la planta.",
+      "explanation": "El punto de control 1.15 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M7-MA-01).",
+      "evidence": "En la planta 1, la regla operativa 15 indica que el equipo revisa el punto de control 1.15 antes de iniciar cada turno de trabajo.",
+      "pairs": [
+        {
+          "term": "Bitácora M7-MA-01",
+          "definition": "Registro escrito de cada revisión del turno"
+        },
+        {
+          "term": "Control M7-MA-01",
+          "definition": "Verificación previa al arranque de la línea"
+        },
+        {
+          "term": "Turno M7-MA-01",
+          "definition": "Periodo de trabajo de un mismo equipo"
+        },
+        {
+          "term": "Supervisora M7-MA-01",
+          "definition": "Persona que decide si la línea puede arrancar"
+        }
+      ]
+    },
+    {
+      "id": "M7-MA-02",
+      "type": "match",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "level": "analizar",
+      "stem": "Caso M7-MA-02: durante el turno, una supervisora debe decidir qué hacer con el punto de control 1.16 de la planta.",
+      "explanation": "El punto de control 1.16 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M7-MA-02).",
+      "evidence": "En la planta 1, la regla operativa 16 indica que el equipo revisa el punto de control 1.16 antes de iniciar cada turno de trabajo.",
+      "pairs": [
+        {
+          "term": "Bitácora M7-MA-02",
+          "definition": "Registro escrito de cada revisión del turno"
+        },
+        {
+          "term": "Control M7-MA-02",
+          "definition": "Verificación previa al arranque de la línea"
+        },
+        {
+          "term": "Turno M7-MA-02",
+          "definition": "Periodo de trabajo de un mismo equipo"
+        },
+        {
+          "term": "Supervisora M7-MA-02",
+          "definition": "Persona que decide si la línea puede arrancar"
+        }
+      ]
+    },
+    {
+      "id": "M7-MA-03",
+      "type": "match",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "level": "recordar",
+      "stem": "Caso M7-MA-03: durante el turno, una supervisora debe decidir qué hacer con el punto de control 1.17 de la planta.",
+      "explanation": "El punto de control 1.17 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M7-MA-03).",
+      "evidence": "En la planta 1, la regla operativa 17 indica que el equipo revisa el punto de control 1.17 antes de iniciar cada turno de trabajo.",
+      "pairs": [
+        {
+          "term": "Bitácora M7-MA-03",
+          "definition": "Registro escrito de cada revisión del turno"
+        },
+        {
+          "term": "Control M7-MA-03",
+          "definition": "Verificación previa al arranque de la línea"
+        },
+        {
+          "term": "Turno M7-MA-03",
+          "definition": "Periodo de trabajo de un mismo equipo"
+        },
+        {
+          "term": "Supervisora M7-MA-03",
+          "definition": "Persona que decide si la línea puede arrancar"
+        }
+      ]
+    },
+    {
+      "id": "M7-MA-04",
+      "type": "match",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c01",
+      "level": "comprender",
+      "stem": "Caso M7-MA-04: durante el turno, una supervisora debe decidir qué hacer con el punto de control 1.18 de la planta.",
+      "explanation": "El punto de control 1.18 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M7-MA-04).",
+      "evidence": "En la planta 1, la regla operativa 18 indica que el equipo revisa el punto de control 1.18 antes de iniciar cada turno de trabajo.",
+      "pairs": [
+        {
+          "term": "Bitácora M7-MA-04",
+          "definition": "Registro escrito de cada revisión del turno"
+        },
+        {
+          "term": "Control M7-MA-04",
+          "definition": "Verificación previa al arranque de la línea"
+        },
+        {
+          "term": "Turno M7-MA-04",
+          "definition": "Periodo de trabajo de un mismo equipo"
+        },
+        {
+          "term": "Supervisora M7-MA-04",
+          "definition": "Persona que decide si la línea puede arrancar"
+        }
+      ]
+    },
+    {
+      "id": "M8-MA-01",
+      "type": "match",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "level": "analizar",
+      "stem": "Caso M8-MA-01: durante el turno, una supervisora debe decidir qué hacer con el punto de control 2.15 de la planta.",
+      "explanation": "El punto de control 2.15 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M8-MA-01).",
+      "evidence": "En la planta 2, la regla operativa 15 indica que el equipo revisa el punto de control 2.15 antes de iniciar cada turno de trabajo.",
+      "pairs": [
+        {
+          "term": "Bitácora M8-MA-01",
+          "definition": "Registro escrito de cada revisión del turno"
+        },
+        {
+          "term": "Control M8-MA-01",
+          "definition": "Verificación previa al arranque de la línea"
+        },
+        {
+          "term": "Turno M8-MA-01",
+          "definition": "Periodo de trabajo de un mismo equipo"
+        },
+        {
+          "term": "Supervisora M8-MA-01",
+          "definition": "Persona que decide si la línea puede arrancar"
+        }
+      ]
+    },
+    {
+      "id": "M8-MA-02",
+      "type": "match",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "level": "recordar",
+      "stem": "Caso M8-MA-02: durante el turno, una supervisora debe decidir qué hacer con el punto de control 2.16 de la planta.",
+      "explanation": "El punto de control 2.16 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M8-MA-02).",
+      "evidence": "En la planta 2, la regla operativa 16 indica que el equipo revisa el punto de control 2.16 antes de iniciar cada turno de trabajo.",
+      "pairs": [
+        {
+          "term": "Bitácora M8-MA-02",
+          "definition": "Registro escrito de cada revisión del turno"
+        },
+        {
+          "term": "Control M8-MA-02",
+          "definition": "Verificación previa al arranque de la línea"
+        },
+        {
+          "term": "Turno M8-MA-02",
+          "definition": "Periodo de trabajo de un mismo equipo"
+        },
+        {
+          "term": "Supervisora M8-MA-02",
+          "definition": "Persona que decide si la línea puede arrancar"
+        }
+      ]
+    },
+    {
+      "id": "M8-MA-03",
+      "type": "match",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "level": "comprender",
+      "stem": "Caso M8-MA-03: durante el turno, una supervisora debe decidir qué hacer con el punto de control 2.17 de la planta.",
+      "explanation": "El punto de control 2.17 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M8-MA-03).",
+      "evidence": "En la planta 2, la regla operativa 17 indica que el equipo revisa el punto de control 2.17 antes de iniciar cada turno de trabajo.",
+      "pairs": [
+        {
+          "term": "Bitácora M8-MA-03",
+          "definition": "Registro escrito de cada revisión del turno"
+        },
+        {
+          "term": "Control M8-MA-03",
+          "definition": "Verificación previa al arranque de la línea"
+        },
+        {
+          "term": "Turno M8-MA-03",
+          "definition": "Periodo de trabajo de un mismo equipo"
+        },
+        {
+          "term": "Supervisora M8-MA-03",
+          "definition": "Persona que decide si la línea puede arrancar"
+        }
+      ]
+    },
+    {
+      "id": "M8-MA-04",
+      "type": "match",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c02",
+      "level": "aplicar",
+      "stem": "Caso M8-MA-04: durante el turno, una supervisora debe decidir qué hacer con el punto de control 2.18 de la planta.",
+      "explanation": "El punto de control 2.18 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M8-MA-04).",
+      "evidence": "En la planta 2, la regla operativa 18 indica que el equipo revisa el punto de control 2.18 antes de iniciar cada turno de trabajo.",
+      "pairs": [
+        {
+          "term": "Bitácora M8-MA-04",
+          "definition": "Registro escrito de cada revisión del turno"
+        },
+        {
+          "term": "Control M8-MA-04",
+          "definition": "Verificación previa al arranque de la línea"
+        },
+        {
+          "term": "Turno M8-MA-04",
+          "definition": "Periodo de trabajo de un mismo equipo"
+        },
+        {
+          "term": "Supervisora M8-MA-04",
+          "definition": "Persona que decide si la línea puede arrancar"
+        }
+      ]
+    },
+    {
+      "id": "M9-MA-01",
+      "type": "match",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c03",
+      "level": "recordar",
+      "stem": "Caso M9-MA-01: durante el turno, una supervisora debe decidir qué hacer con el punto de control 3.13 de la planta.",
+      "explanation": "El punto de control 3.13 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M9-MA-01).",
+      "evidence": "En la planta 3, la regla operativa 13 indica que el equipo revisa el punto de control 3.13 antes de iniciar cada turno de trabajo.",
+      "pairs": [
+        {
+          "term": "Bitácora M9-MA-01",
+          "definition": "Registro escrito de cada revisión del turno"
+        },
+        {
+          "term": "Control M9-MA-01",
+          "definition": "Verificación previa al arranque de la línea"
+        },
+        {
+          "term": "Turno M9-MA-01",
+          "definition": "Periodo de trabajo de un mismo equipo"
+        },
+        {
+          "term": "Supervisora M9-MA-01",
+          "definition": "Persona que decide si la línea puede arrancar"
+        }
+      ]
+    },
+    {
+      "id": "M9-MA-02",
+      "type": "match",
+      "chapterId": "00000000-0000-4000-8000-0000000e0c03",
+      "level": "comprender",
+      "stem": "Caso M9-MA-02: durante el turno, una supervisora debe decidir qué hacer con el punto de control 3.14 de la planta.",
+      "explanation": "El punto de control 3.14 se revisa antes de iniciar el turno porque así se detectan fallas cuando todavía es barato corregirlas (M9-MA-02).",
+      "evidence": "En la planta 3, la regla operativa 14 indica que el equipo revisa el punto de control 3.14 antes de iniciar cada turno de trabajo.",
+      "pairs": [
+        {
+          "term": "Bitácora M9-MA-02",
+          "definition": "Registro escrito de cada revisión del turno"
+        },
+        {
+          "term": "Control M9-MA-02",
+          "definition": "Verificación previa al arranque de la línea"
+        },
+        {
+          "term": "Turno M9-MA-02",
+          "definition": "Periodo de trabajo de un mismo equipo"
+        },
+        {
+          "term": "Supervisora M9-MA-02",
+          "definition": "Persona que decide si la línea puede arrancar"
+        }
+      ]
+    }
+  ]
+}

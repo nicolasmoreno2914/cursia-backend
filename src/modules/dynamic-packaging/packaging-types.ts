@@ -93,7 +93,9 @@ export interface ResolvedArtifact {
     | 'dynamic_presentation'
     | 'dynamic_video_interactions_json'
     | 'dynamic_h5p_params_json'
-    | 'dynamic_audio_mp3';
+    | 'dynamic_audio_mp3'
+    // EV6 P2: banco de preguntas de exam/final_exam (alternativa a dynamic_exam_gift):
+    | 'dynamic_exam_bank_json';
   /** Fase 8: 'stale' si el artifact se empaqueta marcado (STALE_NO_AUTO). Ausente = vigente. */
   status?: 'stale';
   storageBucket: string;

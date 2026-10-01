@@ -122,6 +122,7 @@ import { compileLibroHtmlV3, libroWordCount } from './v3/libro-v3';
 import { downscaleCoverPng } from './v3/png-downscale';
 import { activityPackageFilename, h5pActivityInlineIntroHtml, introThemeFrom, scormIntroHtml } from './v3/activity-intro';
 import { IdAllocator, buildQuizV3, parseScormManifestIds, scormActivityXmlV3 } from './v3/moodle-activities-v3';
+import type { ExamBankV1 } from '../modules/course-shell/exam-bank';
 import { COURSE_BADGE_BACKUP_ID, COURSE_BADGE_DEFAULT_ISSUER, courseBadgeImages, courseBadgeName, courseBadgeXml } from './v3/course-badge';
 
 /**
@@ -187,6 +188,12 @@ export interface DynamicPackageContentsV3 {
   activities: Map<string, ActivityContentV3>;
   examGift: Map<string, string>;
   finalExamGift?: string | null;
+  /**
+   * EV6 P2: exámenes cuyo artifact es el banco `dynamic_exam_bank_json` (moduleId → banco).
+   * Hasta B3 el builder NO los empaqueta: lanza EXAM_BANK_UNSUPPORTED (nunca los ignora).
+   */
+  examBanks?: Map<string, ExamBankV1>;
+  finalExamBank?: ExamBankV1 | null;
   audioWelcome: Buffer;
   audiobookChapters: Map<string, Buffer>;
 }
@@ -536,9 +543,20 @@ async function scormZip(launch: string, html: string, manifestXml: string): Prom
   return z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 9 } });
 }
 
+/** EV6 P2: fuente de un examen v3 — GIFT de siempre o banco JSON (`dynamic_exam_bank_json`). */
+export type ExamSource = { kind: 'gift'; gift: string } | { kind: 'bank'; bank: ExamBankV1 };
+
+export const EXAM_BANK_UNSUPPORTED = 'EXAM_BANK_UNSUPPORTED';
+
 export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<BuildDynamicMbzV3Result> {
   if (!Number.isInteger(input?.ts) || input.ts <= 0) throw new Error('MBZ_V3_INVALID: ts (reloj inyectado) debe ser un entero > 0');
   const { manifest, blueprint, contents: c, ts } = input;
+  // EV6 P2: el modo banco del quiz llega con B3; hasta entonces un banco falla fuerte (nunca se ignora en silencio).
+  const bankKeys = [...(c.examBanks?.keys() ?? [])].map((id) => `exam:${id}`);
+  if (c.finalExamBank) bankKeys.push('final_exam');
+  if (bankKeys.length) {
+    throw new Error(`${EXAM_BANK_UNSUPPORTED}: este builder todavía no empaqueta bancos de preguntas (${bankKeys.join(', ')})`);
+  }
   const pendingIds = [...new Set(input.pendingVideoChapterIds ?? [])];
   const plan = buildPackagingPlanV3(manifest, blueprint, { manifestId: input.manifestId ?? null, omitVideoChapterIds: pendingIds });
   const omittedVideoKeys = plan.omittedVideos.map((v) => v.videoKey);

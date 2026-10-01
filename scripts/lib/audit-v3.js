@@ -57,6 +57,13 @@ const V3_ACTIVITY_ROLES = {
   scorm: ['dynamic_scorm_html', 'dynamic_scorm_manifest'],
 };
 
+/**
+ * EV6 P2: el rol de examen (exam / final_exam) se cumple con EXACTAMENTE uno de
+ * estos tipos (artifact-resolver.ts `EXAM_ARTIFACT_TYPES_V3`); el rol canónico
+ * de la tabla de arriba es dynamic_exam_gift.
+ */
+const V3_EXAM_ARTIFACT_ALTERNATIVES = ['dynamic_exam_bank_json', 'dynamic_exam_gift'];
+
 /** Roles v3 de un tipo (activity: por variant). undefined = tipo/variant desconocido. */
 function requiredRolesV3(type, variant) {
   if (type === 'activity') return V3_ACTIVITY_ROLES[variant] ? [...V3_ACTIVITY_ROLES[variant]] : undefined;
@@ -187,6 +194,11 @@ function auditItemRolesV3(row) {
   const types = row.artifact_types || [];
   const out = [];
   for (const r of roles) {
+    if ((row.type === 'exam' || row.type === 'final_exam') && V3_EXAM_ARTIFACT_ALTERNATIVES.includes(r)) {
+      const n = types.filter((t) => V3_EXAM_ARTIFACT_ALTERNATIVES.includes(t)).length;
+      if (n !== 1) out.push(`${label}: esperado exactamente 1 artifact ${V3_EXAM_ARTIFACT_ALTERNATIVES.join('|')}, encontrados ${n}.`);
+      continue;
+    }
     const n = types.filter((t) => t === r).length;
     if (n !== 1) out.push(`${label}: esperado exactamente 1 artifact ${r}, encontrados ${n}.`);
   }
@@ -223,6 +235,7 @@ module.exports = {
   V3_COUNT_COLUMNS,
   V3_ARTIFACT_ROLES,
   V3_ACTIVITY_ROLES,
+  V3_EXAM_ARTIFACT_ALTERNATIVES,
   requiredRolesV3,
   auditManifestV3,
   auditItemRolesV3,
