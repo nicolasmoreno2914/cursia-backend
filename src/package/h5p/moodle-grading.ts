@@ -37,7 +37,8 @@ export const H5P_MOODLE_GRADING: Readonly<Record<string, Readonly<H5pMoodleGradi
   'H5P.BranchingScenario': Object.freeze({
     gradable: true,
     evidence:
-      "BS 1.10.1 static-end-score: xAPI 'completed' del contenido principal con rawscore = puntaje del final, maxscore 10 (reproductor real, curso 1008: camino óptimo 10/10 → nota 100 COMPLETE_PASS; «Reiniciar el caso» abre el intento 2, camino aceptable 6/10 success 0; la nota queda en 100)",
+      "BS 1.10.1 static-end-score: xAPI 'completed' del contenido principal con rawscore = puntaje del final, maxscore 10 (reproductor real, curso 1008: camino óptimo 10/10 → nota 100 COMPLETE_PASS; «Reiniciar el caso» abre el intento 2, camino aceptable — entonces 6/10 — con success 0; la nota queda en 100). " +
+      'Con el ruling Q3 el aceptable vale 7/10 = 70 = nota de aprobación: aprobado solo por aritmética, PENDIENTE de prueba en reproductor (T6: 7/10 → COMPLETE_PASS y cómo se ve en el reporte de intentos un intento aprobado con success 0, porque BS pone success = 1 solo con puntaje máximo)',
   }),
   'H5P.Dialogcards': Object.freeze({
     gradable: false,

@@ -237,12 +237,19 @@ export function validateBranchingScenarioData(data: unknown, opts: { allowItemKe
   });
 
   // Análisis del grafo: solo si la forma básica es válida (si no, los errores de arriba bastan).
-  const graphable = decisionsOk && endingsOk && !out.some((e) => e.code === 'BS_SHAPE' && /\.id$|^decisions$|^endings$|options$/.test(e.path));
+  // Fix round 1 (m-2): con aristas inválidas (BS_REF / BS_DEAD_END / BS_FORWARD_ONLY) el análisis del
+  // grafo solo agregaría hallazgos derivados (inalcanzables, profundidad, finales) al reintento del LLM.
+  const edgeErrors = out.some((e) => e.code === 'BS_REF' || e.code === 'BS_DEAD_END' || e.code === 'BS_FORWARD_ONLY');
+  const graphable =
+    decisionsOk && endingsOk && !edgeErrors && !out.some((e) => e.code === 'BS_SHAPE' && /\.id$|^decisions$|^endings$|options$/.test(e.path));
   if (graphable && decisions.length) {
     const facts = analyzeGraph(edges);
     const reachedDecisions = facts.reachedDecisions;
     decisions.forEach((d, i) => {
-      if (!reachedDecisions.has(i)) out.push({ code: 'BS_UNREACHABLE', path: `decisions[${i}]`, message: `la decisión ${String((d as Record<string, unknown>).id)} no se alcanza desde la situación` });
+      if (!reachedDecisions.has(i)) {
+        const id = isPlainObject(d) && typeof d.id === 'string' ? d.id : `#${i + 1}`;
+        out.push({ code: 'BS_UNREACHABLE', path: `decisions[${i}]`, message: `la decisión ${id} (posición ${i + 1}) no se alcanza desde la situación` });
+      }
     });
     for (const [eid, e] of endings) {
       if (!(eid in facts.endingDepth)) out.push({ code: 'BS_UNREACHABLE', path: `endings[${e.index}]`, message: `el final ${eid} no se alcanza desde la situación` });

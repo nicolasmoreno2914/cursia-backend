@@ -50,7 +50,23 @@ import { courseBadgeDescription } from './course-badge';
 import { QUIZ_REVIEW_V3 } from './moodle-activities-v3';
 import { formatDurationEs, mp3DurationSeconds } from '../audio';
 import { ExamBankPlans, examChecksV3, readExamPackageV3 } from './exam-validator-v3';
-import { CURSIA_H5P_PROFILE_V1, CURSIA_H5P_PROFILE_V2, H5P_MOODLE_GRADING, h5pLibraryDirName, profileBundledMainLibraries, profileDeltaDirs } from '../h5p';
+import {
+  CURSIA_H5P_PROFILE_V1,
+  CURSIA_H5P_PROFILE_V2,
+  H5P_MOODLE_GRADING,
+  H5pLibraryStoreManifest,
+  h5pLibraryDirName,
+  openH5pLibraryStore,
+  profileBundledMainLibraries,
+  profileDeltaDirs,
+} from '../h5p';
+
+// EV6 H5P v2 (fix round 1, m-3): manifest del store (lista de archivos y sha256 por carpeta delta), leído una vez.
+let storeManifestMemo: H5pLibraryStoreManifest | null = null;
+function storeManifest(): H5pLibraryStoreManifest {
+  if (!storeManifestMemo) storeManifestMemo = openH5pLibraryStore(CURSIA_H5P_PROFILE_V2).manifest;
+  return storeManifestMemo;
+}
 
 const ACTIVITY_MAIN_LIBRARY: Record<string, string> = {
   questionset: 'H5P.QuestionSet',
@@ -775,7 +791,6 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   const mainKeys = new Set(Object.values(CURSIA_H5P_PROFILE_V1.mainLibraries).map((l) => l.machineName));
   // EV6 H5P v2: principales con delta bundling y su perfil.
   const bundledMains = new Set(profileBundledMainLibraries(CURSIA_H5P_PROFILE_V2));
-  const v2Keys = new Set(CURSIA_H5P_PROFILE_V2.libraries.map((l) => `${l.machineName} ${l.majorVersion}.${l.minorVersion}`));
   const v2ByDir = new Map(CURSIA_H5P_PROFILE_V2.libraries.map((l) => [h5pLibraryDirName(l), l]));
   const h5pActs = acts.filter((a) => a.modname === 'h5pactivity');
   for (const a of h5pActs) {
@@ -812,13 +827,27 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
         const extraDirs = tops.filter((d) => !want.includes(d));
         if (missingDirs.length) add('H5P_LIBRARIES', a.idnumber, `faltan carpetas de librería del delta v2: ${missingDirs.slice(0, 5).join(', ')}`);
         if (extraDirs.length) add('H5P_LIBRARIES', a.idnumber, `carpetas fuera del delta v2 de ${hj.mainLibrary}: ${extraDirs.slice(0, 5).join(', ')}`);
+        const storeLibs = new Map(storeManifest().libraries.map((l) => [l.dir, l]));
         for (const d of tops.filter((x) => want.includes(x))) {
+          // Archivos de la carpeta == los del store (nombres; sha256 de library.json). Los JS/CSS no se inflan.
+          const st = storeLibs.get(d);
+          const inPkg = extra.filter((n) => n.startsWith(`${d}/`)).map((n) => n.slice(d.length + 1)).sort();
+          const inStore = st ? st.files.map((f) => f.path).sort() : [];
+          const missingFiles = inStore.filter((f) => !inPkg.includes(f));
+          const extraFiles = inPkg.filter((f) => !inStore.includes(f));
+          if (missingFiles.length) add('H5P_LIBRARIES', a.idnumber, `${d}: faltan archivos del store: ${missingFiles.slice(0, 3).join(', ')}${missingFiles.length > 3 ? ` (+${missingFiles.length - 3})` : ''}`);
+          if (extraFiles.length) add('H5P_LIBRARIES', a.idnumber, `${d}: archivos que no están en el store: ${extraFiles.slice(0, 3).join(', ')}${extraFiles.length > 3 ? ` (+${extraFiles.length - 3})` : ''}`);
           const lf = hz.file(`${d}/library.json`);
           if (!lf) {
             add('H5P_LIBRARIES', a.idnumber, `${d} sin library.json`);
             continue;
           }
-          const lj = JSON.parse(await lf.async('string'));
+          const ljBuf = await lf.async('nodebuffer');
+          const ljStore = st?.files.find((f) => f.path === 'library.json');
+          if (ljStore && createHash('sha256').update(ljBuf).digest('hex') !== ljStore.sha256) {
+            add('H5P_LIBRARIES', a.idnumber, `${d}: library.json distinto del store (sha256)`);
+          }
+          const lj = JSON.parse(ljBuf.toString('utf8'));
           const ref = v2ByDir.get(d)!;
           if (lj.machineName !== ref.machineName || lj.majorVersion !== ref.majorVersion || lj.minorVersion !== ref.minorVersion || lj.patchVersion !== ref.patchVersion) {
             add('H5P_LIBRARIES', a.idnumber, `${d}: library.json ${lj.machineName} ${lj.majorVersion}.${lj.minorVersion}.${lj.patchVersion} ≠ perfil v2 ${ref.patchVersion}`);
@@ -838,10 +867,16 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
         if (!H5P_MOODLE_GRADING[hj.mainLibrary]?.gradable) add('H5P_LIBRARIES', a.idnumber, `${hj.mainLibrary} no es calificable en Moodle (R-011)`);
         if (want && hj.mainLibrary !== want) add('H5P_LIBRARIES', a.idnumber, `la actividad del capítulo debe ser ${want} (R-012), vino ${hj.mainLibrary}`);
       }
-      const allowedDeps = bundled ? v2Keys : profileKeys;
+      // Fix round 1 (I-1): un paquete bundled solo puede declarar lo que el sitio ya tiene (perfil v1)
+      // o lo que trae adentro (SU delta) — nunca otra librería de v2 que no viaja en el paquete.
+      const allowedDeps = bundled
+        ? new Set([...profileKeys, ...(CURSIA_H5P_PROFILE_V2.deltaByMain![hj.mainLibrary] || []).map((l) => `${l.machineName} ${l.majorVersion}.${l.minorVersion}`)])
+        : profileKeys;
       for (const d of hj.preloadedDependencies ?? []) {
         const k = `${d.machineName} ${d.majorVersion}.${d.minorVersion}`;
-        if (!allowedDeps.has(k)) add('H5P_LIBRARIES', a.idnumber, `dependencia fuera del perfil${bundled ? ' v2' : ''}: ${k}`);
+        if (!allowedDeps.has(k)) {
+          add('H5P_LIBRARIES', a.idnumber, bundled ? `dependencia ni en el perfil v1 ni en la delta de ${hj.mainLibrary}: ${k}` : `dependencia fuera del perfil: ${k}`);
+        }
       }
     } catch (err) {
       add('H5P_LIBRARIES', a.idnumber, `no se pudo leer el .h5p: ${err instanceof Error ? err.message : String(err)}`);

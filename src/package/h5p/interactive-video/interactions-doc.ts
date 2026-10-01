@@ -21,7 +21,7 @@ import {
   checkPlainText,
   isPlainObject,
 } from '../types/common';
-import { ReflectionPlan, VideoCheckpoint, planInteractionCheckpoints, planReflectionPauses, videoPlanDurationSec } from './plan';
+import { REFLECTION_PAUSE_RULES, ReflectionPlan, VideoCheckpoint, planInteractionCheckpoints, planReflectionPauses, videoPlanDurationSec } from './plan';
 
 export const VIDEO_INTERACTIONS_SCHEMA_VERSION = 1;
 /**
@@ -175,7 +175,10 @@ export function validateVideoInteractionsDocFull(doc: unknown, expect: VideoInte
   if (v2 && plan && planDur !== null) {
     reflectionPlan = planReflectionPauses(planDur, plan);
     const want = reflectionPlan.reflections;
-    if (checkArray(issues, 'reflections', d.reflections, want.length, want.length)) {
+    // Fix round 1 (m-6): sin pausas planificadas (d < 180 s) `reflections` puede omitirse o venir vacío.
+    if (want.length === 0 && d.reflections === undefined) {
+      // nada que validar
+    } else if (checkArray(issues, 'reflections', d.reflections, want.length, want.length)) {
       (d.reflections as unknown[]).forEach((r, i) => {
         const p = `reflections[${i}]`;
         if (!isPlainObject(r)) {
@@ -198,11 +201,24 @@ export const VIDEO_REMEDIATION_DEFAULT_MESSAGE = 'Revisa este tramo del video an
 
 /**
  * EV6 IV avanzado: remediación de un checkpoint validado. El salto (seekTo) es el
- * INICIO del segmento del plan; nunca lo decide el LLM.
+ * INICIO del segmento del plan (o el fin de la ventana de una pausa dentro del tramo); nunca lo decide el LLM.
  */
-export function checkpointRemediation(c: VideoInteractionCheckpoint, planned: VideoCheckpoint): { seekToSec: number; correctMessage: string; wrongMessage: string } {
+export function checkpointRemediation(
+  c: VideoInteractionCheckpoint,
+  planned: VideoCheckpoint,
+  reflections: ReadonlyArray<{ atSec: number }> = [],
+): { seekToSec: number; correctMessage: string; wrongMessage: string } {
+  // Fix round 1 (m-1): si una pausa de reflexión cae dentro del tramo, el salto va justo DESPUÉS de su
+  // ventana (no se vuelve a pausar con la misma reflexión); nunca en o después de la propia pregunta.
+  let seek = planned.segment[0];
+  for (const r of reflections) {
+    if (r.atSec >= planned.segment[0] && r.atSec < planned.atSec) {
+      const after = r.atSec + REFLECTION_PAUSE_RULES.windowSec;
+      if (after < planned.atSec) seek = Math.max(seek, after);
+    }
+  }
   return {
-    seekToSec: planned.segment[0],
+    seekToSec: seek,
     correctMessage: c.feedbackCorrect ?? '',
     wrongMessage: c.feedbackIncorrect ?? VIDEO_REMEDIATION_DEFAULT_MESSAGE,
   };

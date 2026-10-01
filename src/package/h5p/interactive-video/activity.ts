@@ -67,7 +67,7 @@ export async function buildVideoActivity(input: BuildVideoActivityInput): Promis
     interactions: doc.checkpoints.map((c, i) => ({
       ...checkpointToChoiceInput(c),
       atSec: plan[i].atSec,
-      ...(advanced ? { remediation: checkpointRemediation(c, plan[i]) } : {}),
+      ...(advanced ? { remediation: checkpointRemediation(c, plan[i], full.reflectionPlan.reflections) } : {}),
     })),
     ...(advanced
       ? {

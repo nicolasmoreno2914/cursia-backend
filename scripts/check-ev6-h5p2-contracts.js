@@ -221,6 +221,18 @@ function lintAndConform(mainLib, content) {
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 const IK = 'activity:7a1c0de0-0000-4000-8000-0000000000b5';
+/** Fix round 1 (I-2): fuente exacta de la licencia de cada librería del store (el resto: library.json). */
+const LICENCE_EXPECTED = {
+  'H5P.ContinuousText-1.2': 'upstream repository verified 2026-10-01',
+  'H5P.ExportableTextArea-1.3': 'upstream repository verified 2026-10-01',
+  'H5PEditor.BranchingQuestion-1.0': 'upstream repository verified 2026-10-01',
+  'H5PEditor.ImageCoordinateSelector-1.2': 'upstream repository verified 2026-10-01',
+  'H5PEditor.RadioSelector-1.2': 'upstream repository verified 2026-10-01',
+  'H5PEditor.Shape-1.0': 'upstream repository verified 2026-10-01',
+  'H5PEditor.CoursePresentation-1.26': 'local LICENCE/README file',
+};
+/** Repos que el controlador verificó en línea el 2026-10-01. */
+const REPO_VERIFIED = new Set(['h5p-continuous-text', 'h5p-exportable-text-area', 'h5p-editor-branching-question', 'h5p-editor-image-coordinate-selector', 'h5p-editor-radio-selector', 'h5p-editor-shape', 'h5p-drag-question', 'h5p-audio-recorder', 'h5p-shape']);
 function bsData() {
   return {
     title: 'Caso: un cliente molesto en caja',
@@ -337,7 +349,7 @@ function v2Doc(durationSec, videoItemKey = 'video:ch9') {
       const ref = P2.libraries.find((r) => dirName(r) === l.dir);
       eq([l.machineName, l.majorVersion, l.minorVersion, l.patchVersion, l.upstreamVersion], [ref.machineName, ref.majorVersion, ref.minorVersion, ref.patchVersion, `${ref.majorVersion}.${ref.minorVersion}.${ref.patchVersion}`], `${l.dir} versión`);
       assert(/^https:\/\/github\.com\/h5p\/h5p-[a-z0-9-]+$/.test(l.repoUrl), `${l.dir} repoUrl ${l.repoUrl}`);
-      eq([l.licence, l.licenceSource], ['MIT', 'upstream repository README/LICENSE, checked 2026-10-01'], `${l.dir} licencia`);
+      eq([l.licence, l.licenceSource, l.repoUrlVerified], ['MIT', LICENCE_EXPECTED[l.dir] || 'library.json', REPO_VERIFIED.has(l.repoUrl.replace('https://github.com/h5p/', ''))], `${l.dir} licencia / fuente / repo verificado`);
       assert(lic.includes(`| ${l.machineName} | ${l.upstreamVersion} |`) && lic.includes(l.repoUrl), `${l.dir} no figura en LICENSES.md`);
       const lj = JSON.parse(fs.readFileSync(path.join(STORE, l.dir, 'library.json'), 'utf8'));
       eq([lj.machineName, lj.majorVersion, lj.minorVersion, lj.patchVersion], [l.machineName, l.majorVersion, l.minorVersion, l.patchVersion], `${l.dir} library.json`);
@@ -354,6 +366,30 @@ function v2Doc(durationSec, videoItemKey = 'video:ch9') {
       }
     }
     assert(nfiles > 800, `solo ${nfiles} archivos`);
+  });
+  await check('sync del store (fix round 1, I-2): licencia de library.json o archivo local; si no hay, solo repos verificados; no-MIT o sin evidencia → falla', () => {
+    const SY = require('./sync-h5p-library-store-v2.js');
+    eq([...SY.UPSTREAM_VERIFIED_MIT].sort(), [...REPO_VERIFIED].sort(), 'repos verificados por el controlador');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'h5p2-lic-'));
+    try {
+      const mk = (name, files) => {
+        const d = path.join(tmp, name);
+        fs.mkdirSync(d);
+        for (const [f, t] of Object.entries(files)) fs.writeFileSync(path.join(d, f), t);
+        return d;
+      };
+      const MIT = 'MIT License\n\nCopyright (c) 2020 Joubel AS\n\nPermission is hereby granted, free of charge, to any person…';
+      eq(SY.licenceOf(mk('a', {}), { license: 'MIT' }, 'h5p-x', 'a').licenceSource, 'library.json', 'library.json');
+      eq(SY.licenceOf(mk('b', { 'LICENCE.md': MIT }), {}, 'h5p-x', 'b').licenceSource, 'local LICENCE/README file', 'archivo local');
+      eq(SY.licenceOf(mk('c', { 'README.md': '# X\n\n## License\n\n' + MIT }), {}, 'h5p-x', 'c').licenceSource, 'local LICENCE/README file', 'README con licencia');
+      eq(SY.licenceOf(mk('d', { 'README.md': '# Sin licencia' }), {}, 'h5p-shape', 'd').licenceSource, 'upstream repository verified 2026-10-01', 'repo verificado');
+      throws(() => SY.licenceOf(mk('e', {}), { license: 'GPL-3.0' }, 'h5p-shape', 'e'), /^H5P_STORE_LICENCE_MISMATCH: e library\.json license="GPL-3\.0"/, 'library.json no MIT');
+      throws(() => SY.licenceOf(mk('f', { 'LICENSE': 'GNU GENERAL PUBLIC LICENSE Version 3' }), { license: 'MIT' }, 'h5p-x', 'f'), /^H5P_STORE_LICENCE_MISMATCH: f LICENSE no es MIT/, 'archivo local no MIT');
+      throws(() => SY.licenceOf(mk('g', { 'README.md': '# X\n\n## License\n\nGPL' }), {}, 'h5p-shape', 'g'), /H5P_STORE_LICENCE_MISMATCH: g README\.md no es MIT/, 'README no MIT aunque el repo esté verificado');
+      throws(() => SY.licenceOf(mk('h', {}), {}, 'h5p-image-hotspots', 'h'), /^H5P_STORE_LICENCE_MISSING: h /, 'sin evidencia y repo no verificado');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
   await check('store: un manifest de otro perfil o desactualizado se rechaza (H5P_STORE_PROFILE_MISMATCH)', () => {
     throws(() => h.openH5pLibraryStore(P1), /H5P_STORE_PROFILE_MISMATCH/, 'perfil v1');
@@ -471,6 +507,17 @@ function v2Doc(durationSec, videoItemKey = 'video:ch9') {
       const got = codes(h.validateBranchingScenarioData(d));
       assert(got.includes(code), `${code} esperado, hallado ${JSON.stringify(got)} para ${mut.toString().slice(0, 120)}`);
     }
+  });
+  await check('BS (fix round 1, m-2/m-7): una arista inválida da SOLO su código (sin inalcanzables/profundidad derivados); mensaje con posición', () => {
+    const d = bsData();
+    d.decisions[0].options[0].next = ' d3';
+    eq(codes(h.validateBranchingScenarioData(d)), ['BS_REF'], 'solo BS_REF');
+    const f = bsData();
+    f.decisions[1].options[0].next = 'd1';
+    eq(codes(h.validateBranchingScenarioData(f)), ['BS_FORWARD_ONLY'], 'solo BS_FORWARD_ONLY');
+    const u = bsData();
+    u.decisions[0].options[1].next = 'd3';
+    eq(h.validateBranchingScenarioData(u).find((i) => i.code === 'BS_UNREACHABLE').message, 'la decisión d2 (posición 2) no se alcanza desde la situación', 'mensaje');
   });
   await check('BS_PATHS (> 16 caminos), BS_DEPTH (camino de 6 decisiones) y BS_NODES (> 8 nodos)', () => {
     const chain = () => {
@@ -592,6 +639,14 @@ function v2Doc(durationSec, videoItemKey = 'video:ch9') {
     const html = clone(doc);
     html.reflections[1].prompt = '<p>hola</p>';
     throws(() => h.validateVideoInteractionsDoc(html, { durationSec: d, schemaVersion: 2 }), /reflections\[1\]\.prompt: no se permite HTML/, 'HTML');
+    // m-6: sin pausas planificadas (140 s) `reflections` puede omitirse o venir vacío.
+    const noRef = v2Doc(140);
+    delete noRef.reflections;
+    eq(h.validateVideoInteractionsDocFull(noRef, { durationSec: 140, schemaVersion: 2 }).reflectionPlan.reflections, [], 'omitido con 0 pausas');
+    eq(h.validateVideoInteractionsDocFull({ ...noRef, reflections: [] }, { durationSec: 140, schemaVersion: 2 }).checkpoints.length, 3, 'vacío con 0 pausas');
+    const missing = clone(doc);
+    delete missing.reflections;
+    throws(() => h.validateVideoInteractionsDoc(missing, { durationSec: d, schemaVersion: 2 }), /reflections: debe ser una lista/, 'omitido con 2 pausas');
     // Documento del LLM con una duración inventada (300) ≠ medida (468) → rechazo.
     const liar = v2Doc(300);
     throws(() => h.validateVideoInteractionsDoc(liar, { durationSec: 468, schemaVersion: 2 }), /durationSec: debe coincidir con la duración real 468/, 'duración medida');
@@ -627,10 +682,15 @@ function v2Doc(durationSec, videoItemKey = 'video:ch9') {
       assert(/^<p><strong>Pausa para pensar:<\/strong> /.test(t.action.params.text) && /<p><em>Pista:<\/em> Piensa en un caso real\.<\/p>$/.test(t.action.params.text), t.action.params.text);
     }
     qs.forEach((q, i) => {
-      eq(q.adaptivity.wrong.seekTo, r.checkpoints[i].segment[0], `seekTo ${i}`);
+      const cp = r.checkpoints[i];
+      const pause = r.reflections.find((x) => x.atSec >= cp.segment[0] && x.atSec < cp.atSec);
+      // m-1: con una pausa dentro del tramo, el salto va al fin de su ventana (no se re-pausa); si no, al inicio del tramo.
+      eq(q.adaptivity.wrong.seekTo, pause ? pause.atSec + 10 : cp.segment[0], `seekTo ${i}`);
+      assert(q.adaptivity.wrong.seekTo < cp.atSec, `seekTo ${i} antes de la pregunta`);
       eq([q.adaptivity.wrong.allowOptOut, q.adaptivity.wrong.seekLabel, q.adaptivity.requireCompletion, q.adaptivity.correct.allowOptOut], [true, 'Volver a ver este tramo', false, true], `adaptivity ${i}`);
       assert(q.adaptivity.wrong.message.length > 0, 'mensaje de remediación');
     });
+    eq(r.reflections.filter((x) => qs.some((q, i) => x.atSec >= r.checkpoints[i].segment[0] && x.atSec < r.checkpoints[i].atSec)).length, 2, 'd=468: ambas pausas caen dentro de un tramo (caso m-1 ejercitado)');
     eq(c.override.retryButton, 'off', 'sin reintento');
     eq(h.assertH5pSubContentIds('H5P.InteractiveVideo', c).length, 7, 'UUID únicos (5 preguntas + 2 pausas)');
     eq(r.subContentIds, qs.map((q) => q.action.subContentId), 'subContentIds = preguntas (p1, igual que v1)');
@@ -738,7 +798,25 @@ function v2Doc(durationSec, videoItemKey = 'video:ch9') {
       z.file('H5P.Shape-1.0/library.json', JSON.stringify(lj));
     }));
     v = await V.validateMbzV3(r.mbz, exp(r.target));
-    eq(h5pIssues(v, r.target.idnumber).map((i) => i.message), ['H5P.Shape-1.0: library.json H5P.Shape 1.0.6 ≠ perfil v2 5'], 'versión');
+    eq(h5pIssues(v, r.target.idnumber).map((i) => i.message), ['H5P.Shape-1.0: library.json distinto del store (sha256)', 'H5P.Shape-1.0: library.json H5P.Shape 1.0.6 ≠ perfil v2 5'], 'versión');
+    // m-3: archivos de la carpeta delta = los del store (uno de menos, uno de más).
+    const shapeFile = store.manifest.libraries.find((l) => l.dir === 'H5P.Shape-1.0').files.find((f) => f.path !== 'library.json').path;
+    r = await swapActivityPackage(base.mbz, bsPkg, mut((z) => { z.remove(`H5P.Shape-1.0/${shapeFile}`); z.file('H5P.Shape-1.0/extra.js', 'x'); }));
+    v = await V.validateMbzV3(r.mbz, exp(r.target));
+    eq(h5pIssues(v, r.target.idnumber).map((i) => i.message), [`H5P.Shape-1.0: faltan archivos del store: ${shapeFile}`, 'H5P.Shape-1.0: archivos que no están en el store: extra.js'], 'archivos');
+    // I-1: dependencias declaradas ⊆ perfil v1 ∪ SU delta. Dialog Cards declarando BS 1.10 (de v2, pero no viaja en el paquete) → rechazo.
+    const dcI1 = h.buildDialogCardsFromExperience({ chapterTitle: 'Atención', experience: experienceWithCards(4, 0, 0) });
+    const withDep = (dep) => mut(async (z) => {
+      const hj = JSON.parse(await z.file('h5p.json').async('string'));
+      hj.preloadedDependencies.push(dep);
+      z.file('h5p.json', JSON.stringify(hj));
+    });
+    r = await swapActivityPackage(base.mbz, await bundle(dcI1), withDep({ machineName: 'H5P.BranchingScenario', majorVersion: 1, minorVersion: 10 }));
+    v = await V.validateMbzV3(r.mbz, base.expectations);
+    assert(h5pIssues(v, r.target.idnumber).some((i) => i.message === 'dependencia ni en el perfil v1 ni en la delta de H5P.Dialogcards: H5P.BranchingScenario 1.10'), JSON.stringify(h5pIssues(v, r.target.idnumber)));
+    r = await swapActivityPackage(base.mbz, bsPkg, withDep({ machineName: 'H5P.CoursePresentation', majorVersion: 1, minorVersion: 27 }));
+    v = await V.validateMbzV3(r.mbz, exp(r.target));
+    eq(h5pIssues(v, r.target.idnumber), [], 'BS declarando una librería de SU delta: aceptado');
     // Un paquete con BS pero facts dice questionset (Manifest v1) → R-012.
     r = await swapActivityPackage(base.mbz, bsPkg);
     v = await V.validateMbzV3(r.mbz, base.expectations);
