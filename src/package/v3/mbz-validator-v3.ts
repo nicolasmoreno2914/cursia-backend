@@ -34,8 +34,9 @@ import type { AssessmentCategoryKey } from '../assessment/resolve-assessment';
 import type { AssessableType } from '../../modules/course-profiles/course-profiles';
 import { extractText, lintCleanSafe, lintResourceMentions, parseHtml } from '../../modules/visual-components';
 import type { HtmlNode } from '../../modules/visual-components';
-import { CourseFacts, chapterNextSteps, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles } from '../../modules/course-shell';
+import { CERTIFICATE_TEACHER_TROUBLESHOOTING, CertificateRequirements, CourseFacts, chapterNextSteps, closingCertificateText, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles } from '../../modules/course-shell';
 import { safeActivityName } from '../mbz-common';
+import { courseBadgeDescription } from './course-badge';
 import { formatDurationEs, mp3DurationSeconds } from '../audio';
 import { CURSIA_H5P_PROFILE_V1, H5P_MOODLE_GRADING } from '../h5p';
 
@@ -487,6 +488,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     const badges = bx ? blocks(bx, 'badge') : [];
     if (badges.length !== 1) {
       add('CERTIFICATE', W, `se esperaba exactamente una insignia de curso (hay ${badges.length})`);
+      checkHidden('cv3:shell:certificate_teacher'); // review M3: no ocultar un segundo hallazgo
       return;
     }
     const b = badges[0];
@@ -497,9 +499,22 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     for (const [k, v] of Object.entries(fields)) if (tag(b, k) !== v) add('CERTIFICATE', W, `<${k}> ${tag(b, k)} ≠ ${v}`);
     if (!(tag(b, 'issuername') ?? '').trim()) add('CERTIFICATE', W, 'sin emisor');
     if (!(unxml(tag(b, 'message') ?? '')).includes('%badgename%')) add('CERTIFICATE', W, 'el mensaje no usa %badgename%');
-    const wantDesc = facts.finalExam.enabled ? 'aprobar la evaluación final' : null;
+    // Fix round 1 (review I1): descripción y panel nombran EXACTAMENTE los criterios reales.
+    const critSet = new Set(gotCrit);
+    const kindsReq = new Set(gradedActs.filter((g) => critSet.has(g.a.mid)).map((g) => g.kind));
+    const req: CertificateRequirements = {
+      activities: kindsReq.has('activity'),
+      videos: kindsReq.has('video'),
+      moduleExams: kindsReq.has('exam'),
+      finalExam: kindsReq.has('finalExam'),
+      courseGrade: gradeCrit.length > 0,
+      libroView: acts.some((a) => viewCompletion(a) && critSet.has(a.mid)),
+    };
+    const wantDesc = courseBadgeDescription(safeActivityName(facts.course.title, 254), req);
     const desc = unxml(tag(b, 'description') ?? '');
-    if (wantDesc ? !desc.includes(wantDesc) : /evaluaci[oó]n final/i.test(desc)) add('CERTIFICATE', W, `descripción incoherente con el examen final: ${desc}`);
+    if (desc !== wantDesc) add('CERTIFICATE', W, `descripción «${desc}» ≠ criterios reales «${wantDesc}»`);
+    const closingTxt = extractText(acts.find((a) => a.idnumber === 'cv3:shell:closing')?.intro ?? '');
+    if (!closingTxt.includes(closingCertificateText(req))) add('CERTIFICATE', 'cv3:shell:closing', `el panel no enuncia los criterios reales: «${closingCertificateText(req)}»`);
     const crits = blocks(b, 'criterion').map((c) => ({
       type: num(tag(c, 'criteriatype')),
       method: num(tag(c, 'method')),
@@ -542,7 +557,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     else {
       const t = extractText(teacher.intro);
       if (teacher.modname !== 'label' || teacher.module.visible !== '0') add('CERTIFICATE', teacher.idnumber, `debe ser un label oculto (visible=0), es ${teacher.modname} visible=${teacher.module.visible}`);
-      if (!teacher.intro.includes(`href="${tok}"`) || !t.includes('Habilitar acceso') || !t.includes(`«${name}»`)) {
+      if (!teacher.intro.includes(`href="${tok}"`) || !t.includes('Habilitar acceso') || !t.includes(`«${name}»`) || !t.includes(CERTIFICATE_TEACHER_TROUBLESHOOTING)) {
         add('CERTIFICATE', teacher.idnumber, `sin el paso «Habilitar acceso» de «${name}» o sin el enlace ${tok}`);
       }
     }

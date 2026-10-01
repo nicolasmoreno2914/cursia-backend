@@ -938,15 +938,21 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   if (finalExamMid !== null && !completionCriteria.some((x) => x.moduleId === finalExamMid)) {
     throw new Error('MBZ_V3_INVARIANT: la evaluación final no es criterio de completion del curso');
   }
+  // Fix round 1 (review I1): requisitos de la insignia = criterios REALES del paquete, por tipo.
+  const kindByMid = new Map(graded.map((g) => [g.moduleId, g.kind]));
+  const critKinds = new Set(completionCriteria.map((x) => kindByMid.get(x.moduleId)));
+  const certificateReq = {
+    activities: critKinds.has('activity'),
+    videos: critKinds.has('video'),
+    moduleExams: critKinds.has('exam'),
+    finalExam: critKinds.has('finalExam'),
+    courseGrade: resolved.courseCompletion.requireCourseGradePass,
+    libroView: !!resolved.withoutGrades && completionCriteria.some((x) => x.moduleId === libroMid),
+  };
   // Sin ningún criterio (perfil sin exigencias y sin evaluación final) el curso nunca se completa:
   // no se empaqueta una insignia inalcanzable ni se promete en el cierre.
-  const hasCertificate = completionCriteria.length > 0 || resolved.courseCompletion.requireCourseGradePass;
-  const certificate = hasCertificate
-    ? {
-        requiresFinalExam: finalExamMid !== null,
-        requiresGradedItems: !resolved.withoutGrades && completionCriteria.some((x) => x.moduleId !== finalExamMid),
-      }
-    : undefined;
+  const hasCertificate = Object.values(certificateReq).some(Boolean);
+  const certificate = hasCertificate ? certificateReq : undefined;
   if (!hasCertificate) warnings.push('certificate_omitted:no_completion_criteria');
   addLabel(closing, 'cv3:shell:closing', closingLabel(facts, courseIntro, theme, opts, certificate));
   // Fix 0b: Moodle restaura la insignia DESACTIVADA → label oculto (visible=0) para el docente con
@@ -1019,6 +1025,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   W.put('completion.xml', courseCompletionXml({
     criteria: completionCriteria,
     aggregation: 'all',
+    courseId: MBZ_V3_COURSE_BACKUP_ID,
     requireCourseGradePass: resolved.courseCompletion.requireCourseGradePass,
     courseGradepass: resolved.courseCompletion.courseGradepass,
   }));
@@ -1032,7 +1039,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     W.put('badges.xml', courseBadgeXml({
       courseTitle: courseTitle,
       courseBackupId: MBZ_V3_COURSE_BACKUP_ID,
-      hasFinalExam: finalExamMid !== null,
+      requirements: certificateReq,
       ts,
       issuerName: COURSE_BADGE_DEFAULT_ISSUER,
     }));

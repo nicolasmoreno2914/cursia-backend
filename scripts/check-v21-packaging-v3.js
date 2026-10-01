@@ -569,7 +569,10 @@ const MATRIX = [
       const bx = await z.file('badges.xml').async('string');
       const title = r.expectations.facts.course.title;
       assert(bx.includes(`<name>Certificado: ${title}</name>`), `${cfg.id}: nombre`);
-      const desc = cfg.finalExam ? `Otorgado al completar el curso «${title}» y aprobar la evaluación final.` : `Otorgado al completar el curso «${title}».`;
+      // Fix round 1 (review I1): perfil por defecto → se exige aprobar TODO lo calificable, nombrado por tipo.
+      const kinds = ['todas las actividades prácticas', 'todos los videos interactivos', 'todas las evaluaciones de módulo', ...(cfg.finalExam ? ['la evaluación final'] : [])];
+      const list = `${kinds.slice(0, -1).join(', ')} y ${kinds[kinds.length - 1]}`;
+      const desc = `Otorgado al completar el curso «${title}»: aprobar ${list}.`;
       assert(bx.includes(`<description>${desc}</description>`), `${cfg.id}: descripción`);
       for (const t of ['<type>2</type>', '<courseid>1</courseid>', '<status>1</status>', '<notification>0</notification>', '<language>es</language>', '<issuername>Cursia</issuername>', '<name>course_1</name>', '<value>1</value>']) assert(bx.includes(t), `${cfg.id}: ${t}`);
       assert(/%badgename%/.test(bx), `${cfg.id}: %badgename%`);
@@ -587,7 +590,7 @@ const MATRIX = [
       const closing = acts.find((a) => a.idnumber === 'cv3:shell:closing');
       const lx = await z.file(`${closing.dir}/label.xml`).async('string');
       assert(lx.includes('$@BADGESVIEWBYID*1@$') && lx.includes('Tu certificado') && lx.includes('Ver mi certificado →'), `${cfg.id}: panel del cierre`);
-      const want = cfg.finalExam ? 'y apruebes la evaluación final, Moodle te otorga el certificado del curso' : 'Cuando completes todas las actividades calificadas, Moodle te otorga el certificado del curso';
+      const want = `Cuando apruebes ${list}, Moodle te otorga el certificado del curso. Lo encuentras en tu perfil, en Insignias.`;
       assert(lx.includes(want), `${cfg.id}: texto del panel`);
       // Fix 0b: label oculto para docentes, justo después del cierre, en la misma sección.
       const teacher = acts.find((a) => a.idnumber === 'cv3:shell:certificate_teacher');
@@ -629,6 +632,20 @@ const MATRIX = [
     assert(inst.includes(mid(acts.find((a) => a.idnumber === 'cv3:final_exam'))), 'el final es criterio');
     assert(!acts.filter((a) => /^cv3:exam:/.test(a.idnumber)).some((a) => inst.includes(mid(a))), 'los exámenes de módulo no');
   });
+  await check('EV6 T3 (review I1): perfil con requireCourseGradePass y sin prácticas → panel y descripción nombran SOLO evaluaciones + nota mínima', async () => {
+    const input = PF.packagingInput(distRoot, MATRIX[0]);
+    input.assessmentProfile = JSON.parse(JSON.stringify(input.assessmentProfile));
+    input.assessmentProfile.courseCompletion = { requireAllChapterActivities: false, requireExams: true, requireCourseGradePass: true };
+    const r = await B.buildDynamicMbzV3(input);
+    const v = await validate(r);
+    assert(v.ok, JSON.stringify(v.issues.slice(0, 3)));
+    const { z, acts } = await actDirs(r.mbz);
+    const title = r.expectations.facts.course.title;
+    assert((await z.file('badges.xml').async('string')).includes(`<description>Otorgado al completar el curso «${title}»: aprobar todas las evaluaciones de módulo y la evaluación final y alcanzar la nota mínima del curso.</description>`), 'descripción');
+    const lx = await z.file(`${acts.find((a) => a.idnumber === 'cv3:shell:closing').dir}/label.xml`).async('string');
+    assert(lx.includes('Cuando apruebes todas las evaluaciones de módulo y la evaluación final y alcances la nota mínima del curso, Moodle te otorga'), 'panel');
+    assert(!/actividades prácticas|videos interactivos/.test(lx), 'no nombra lo que no se exige');
+  });
   await check('EV6 T3: perfil sin criterios de completion y sin evaluación final → sin insignia inalcanzable (badges.xml vacío, setting 0, sin panel) y lo avisa', async () => {
     const input = PF.packagingInput(distRoot, MATRIX[1]);
     input.assessmentProfile = JSON.parse(JSON.stringify(input.assessmentProfile));
@@ -651,6 +668,15 @@ const MATRIX = [
       ['sin insignia', () => ({ 'badges.xml': (x) => x.replace(/<badge id[\s\S]*<\/badge>/, '') })],
       ['criterio de curso con otro id', () => ({ 'badges.xml': (x) => x.replace('<name>course_1</name>', '<name>course_2</name>') })],
       ['insignia inactiva', () => ({ 'badges.xml': (x) => x.replace('<status>1</status>', '<status>0</status>') })],
+      ['descripción que omite la evaluación final', () => ({ 'badges.xml': (x) => x.replace(' y la evaluación final.</description>', '.</description>') })],
+      ['panel que no enuncia los criterios reales', () => {
+        const a = find(/^cv3:shell:closing$/);
+        return { [`${a.dir}/label.xml`]: (x) => x.replace('Cuando apruebes todas las actividades prácticas', 'Cuando completes todas las actividades calificadas') };
+      }],
+      ['label docente sin la nota de diagnóstico', () => {
+        const a = find(/^cv3:shell:certificate_teacher$/);
+        return { [`${a.dir}/label.xml`]: (x) => x.replace('Si no ves la insignia', 'Si no aparece') };
+      }],
       ['falta f3.png', () => ({ 'files.xml': (x) => x.replace('<filename>f3.png</filename>', '<filename>f9.png</filename>') })],
       ['contexto del curso = contexto de sistema', () => ({ 'moodle_backup.xml': (x) => x.replace('<original_course_contextid>2</original_course_contextid>', '<original_course_contextid>1</original_course_contextid>') })],
       ['imagen con otro itemid', () => ({ 'files.xml': (x) => x.replace(/(<filearea>badgeimage<\/filearea>\n    <itemid>)1/, '$17') })],

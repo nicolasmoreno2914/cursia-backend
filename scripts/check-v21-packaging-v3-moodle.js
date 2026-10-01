@@ -163,7 +163,9 @@ async function runConfig(cfg) {
     const b = o.badges[0];
     const title = facts.course.title;
     eq([b.name, b.type, b.issuername, b.language, b.notification], [`Certificado: ${title}`, 2, 'Cursia', 'es', 0], 'insignia');
-    assert(b.description === (facts.finalExam.enabled ? `Otorgado al completar el curso «${title}» y aprobar la evaluación final.` : `Otorgado al completar el curso «${title}».`), `descripción: ${b.description}`);
+    // Fix round 1 (review I1): la descripción enuncia los criterios reales (por tipo) del paquete.
+    assert(b.description.startsWith(`Otorgado al completar el curso «${title}»: `) && (facts.finalExam.enabled ? b.description.includes('la evaluación final') : !/evaluación final/.test(b.description)), `descripción: ${b.description}`);
+    assert(resolved.withoutGrades ? b.description.includes('abrir el Libro Guía') : b.description.includes(': aprobar '), `descripción según el tipo de curso: ${b.description}`);
     assert(b.message.includes('%badgename%'), 'mensaje con %badgename%');
     // Moodle core SIEMPRE restaura las insignias inactivas (restore_badges_structure_step): hay que habilitarla una vez.
     eq(b.status, 0, 'status tras restaurar (core fuerza INACTIVE)');
@@ -189,7 +191,7 @@ async function runConfig(cfg) {
     const closingSec = o.sections.find((s) => s.cms.some((c) => c.idnumber === 'cv3:shell:closing')).section;
     eq(aw.teacherLabel.section, closingSec, 'label docente en «Cierre del curso»');
     eq(aw.teacherLabel.links, [`${o.wwwroot}/badges/index.php?type=2&id=${courseid}`], 'botón a las insignias del curso nuevo');
-    assert(aw.teacherLabel.text.includes(`Entra a Insignias → «Certificado: ${facts.course.title}» → «Habilitar acceso». Solo se hace una vez.`), aw.teacherLabel.text);
+    assert(aw.teacherLabel.text.includes(`Entra a Insignias → «Certificado: ${facts.course.title}» → «Habilitar acceso». Solo se hace una vez. Si no ves la insignia, revisa que las insignias estén habilitadas en el sitio y en el curso, y que la restauración haya incluido todas las actividades.`), aw.teacherLabel.text);
     eq([aw.beforeAny.courseComplete, aw.beforeAny.issued], [false, false], 'sin nada completado');
     if (aw.withoutLast) eq([aw.withoutLast.courseComplete, aw.withoutLast.issued], [false, false], `falta ${aw.lastIdnumber}: sin completar ni insignia`);
     if (facts.finalExam.enabled) {

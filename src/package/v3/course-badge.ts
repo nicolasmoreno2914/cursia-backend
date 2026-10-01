@@ -23,6 +23,7 @@
  * +, −, ×, ÷, sqrt, min/max, round) y se codifica con `encodePng` (deflate nivel 9).
  */
 import type { ResolvedTheme } from '../../modules/theme-engine';
+import { CertificateRequirements, certificateRequirementClauses } from '../../modules/course-shell';
 import { safeActivityName, xmlEsc } from '../mbz-common';
 import { encodePng } from './synthetic-media';
 
@@ -45,14 +46,14 @@ export const BADGE_CRITERIA_AGGREGATION_ALL = 1;
 
 export const COURSE_BADGE_MESSAGE_SUBJECT = '¡Felicitaciones! Obtuviste tu certificado';
 export const COURSE_BADGE_MESSAGE =
-  'Completaste el curso y obtuviste el certificado «%badgename%». Lo encuentras en tu perfil, en Insignias, y puedes descargarlo desde ahí.';
+  'Completaste el curso y obtuviste «%badgename%». Lo encuentras en tu perfil, en Insignias, y puedes descargarlo desde ahí.';
 
 export interface CourseBadgeInput {
   courseTitle: string;
   /** `<course id>` del backup (el que la restauración remapea). */
   courseBackupId: number;
-  /** true → el curso tiene evaluación final (y la completion la exige). */
-  hasFinalExam: boolean;
+  /** Criterios REALES de completion del paquete (fix round 1, review I1). */
+  requirements: CertificateRequirements;
   ts: number;
   issuerName?: string;
 }
@@ -64,11 +65,10 @@ export function courseBadgeName(courseTitle: string): string {
   return safeActivityName(`Certificado: ${title}`, 254);
 }
 
-export function courseBadgeDescription(courseTitle: string, hasFinalExam: boolean): string {
+/** «Otorgado al completar el curso «X»: aprobar … y la evaluación final[, y alcanzar la nota mínima del curso].» */
+export function courseBadgeDescription(courseTitle: string, requirements: CertificateRequirements): string {
   const title = String(courseTitle ?? '').trim();
-  return hasFinalExam
-    ? `Otorgado al completar el curso «${title}» y aprobar la evaluación final.`
-    : `Otorgado al completar el curso «${title}».`;
+  return `Otorgado al completar el curso «${title}»: ${certificateRequirementClauses(requirements, 'inf')}.`;
 }
 
 /** `badges.xml` raíz con UNA insignia de curso: criterio global ALL + completion del curso. */
@@ -82,7 +82,7 @@ export function courseBadgeXml(p: CourseBadgeInput): string {
 <badges>
   <badge id="${id}">
     <name>${xmlEsc(courseBadgeName(p.courseTitle))}</name>
-    <description>${xmlEsc(courseBadgeDescription(p.courseTitle, p.hasFinalExam))}</description>
+    <description>${xmlEsc(courseBadgeDescription(p.courseTitle, p.requirements))}</description>
     <timecreated>${p.ts}</timecreated>
     <timemodified>${p.ts}</timemodified>
     <usercreated>0</usercreated>

@@ -107,6 +107,14 @@ function factsOf(course, opts = {}) {
   });
 }
 
+/** EV6 T3: requisitos de la insignia como los arma el builder con el perfil por defecto (todo lo calificable). */
+function certReqOf(facts) {
+  const c = facts.counts;
+  const r = { activities: c.activities > 0, videos: c.videos > 0, moduleExams: c.exams > 0, finalExam: facts.finalExam.enabled, courseGrade: false, libroView: false };
+  // Curso sin nada calificable (sin nota): la completion es abrir el Libro Guía.
+  return Object.values(r).some(Boolean) ? r : { ...r, libroView: true };
+}
+
 /** Todos los labels del shell de un curso. */
 function shellLabels(facts, course, theme, level) {
   const o = level ? { level } : undefined;
@@ -120,7 +128,7 @@ function shellLabels(facts, course, theme, level) {
     S.libroCardLabel(77, facts, theme, o),
     S.audiobookLabel(facts, theme, o),
     // EV6 T3: el cierre del paquete siempre trae el panel del certificado (insignia nativa).
-    S.closingLabel(facts, ci, theme, o, { requiresGradedItems: true, requiresFinalExam: facts.finalExam.enabled }),
+    S.closingLabel(facts, ci, theme, o, certReqOf(facts)),
   ];
   facts.modules.forEach((m, i) => {
     out.push(S.moduleIntroLabel(m, F.moduleIntroFixture(course.manifest, i), facts, theme, o));
@@ -472,19 +480,32 @@ async function pureChecks() {
   await check('EV6 T3: cierre con panel «Tu certificado» (texto según los criterios reales, botón a la insignia, CLEAN_SAFE y ENHANCED)', () => {
     const ci = F.courseIntroFixture();
     const txt = (f, cert, level) => vc.extractText(S.closingLabel(f, ci, THEME, level ? { level } : undefined, cert).html);
-    const both = { requiresGradedItems: true, requiresFinalExam: true };
+    const R0 = { activities: false, videos: false, moduleExams: false, finalExam: false, courseGrade: false, libroView: false };
+    const all2 = certReqOf(f2);
+    assert(all2.activities && all2.videos && all2.moduleExams && all2.finalExam, 'f2 tiene los cuatro tipos');
     for (const level of [undefined, 'enhanced']) {
-      const html = S.closingLabel(f2, ci, THEME, level ? { level } : undefined, both).html;
+      const html = S.closingLabel(f2, ci, THEME, level ? { level } : undefined, all2).html;
       assert(html.includes('href="cursia-cta://badges"') && /cvc-btn-link/.test(html), `${level}: botón a la insignia`);
       assert(vc.lintCleanSafe(html).ok, `${level}: CLEAN_SAFE`);
       const t = vc.extractText(html);
       assert(t.includes('Tu certificado') && t.includes('Ver mi certificado →'), `${level}: panel`);
-      assert(t.includes('Cuando completes todas las actividades calificadas y apruebes la evaluación final, Moodle te otorga el certificado del curso. Lo encuentras en tu perfil, en Insignias.'), `${level}: texto del brief: ${t}`);
+      assert(t.includes('Cuando apruebes todas las actividades prácticas, todos los videos interactivos, todas las evaluaciones de módulo y la evaluación final, Moodle te otorga el certificado del curso. Lo encuentras en tu perfil, en Insignias.'), `${level}: criterios reales: ${t}`);
     }
-    assert(txt(f2, { requiresGradedItems: false, requiresFinalExam: true }).includes('Cuando apruebes la evaluación final, Moodle te otorga'), 'solo final');
-    assert(txt(f4, { requiresGradedItems: true, requiresFinalExam: false }).includes('Cuando completes todas las actividades calificadas, Moodle te otorga'), 'solo calificables');
-    assert(txt(f4, { requiresGradedItems: false, requiresFinalExam: false }).includes('Cuando completes el curso, Moodle te otorga'), 'sin nota');
-    throwsRe(() => S.closingLabel(f4, ci, THEME, undefined, both), /evaluación final que el curso no tiene/, 'certificado con final en un curso sin final');
+    // Fix round 1 (review I1): cada combinación nombra SOLO lo que la completion exige.
+    const cases = [
+      [{ ...R0, finalExam: true }, 'Cuando apruebes la evaluación final, Moodle'],
+      [{ ...R0, moduleExams: true, finalExam: true }, 'Cuando apruebes todas las evaluaciones de módulo y la evaluación final, Moodle'],
+      [{ ...all2, courseGrade: true }, 'y la evaluación final y alcances la nota mínima del curso, Moodle'],
+      [{ ...R0, courseGrade: true }, 'Cuando alcances la nota mínima del curso, Moodle'],
+      [{ ...R0, activities: true }, 'Cuando apruebes todas las actividades prácticas, Moodle'],
+      [{ ...R0, libroView: true }, 'Cuando abras el Libro Guía, Moodle'],
+    ];
+    for (const [req, want] of cases) assert(txt(f2, req).includes(want), `${JSON.stringify(req)} → «${want}»: ${txt(f2, req)}`);
+    for (const [req] of cases) assert(!/complet(es|a) todas/.test(txt(f2, req)), 'nunca «completes» para un ítem que exige aprobar');
+    throwsRe(() => S.closingLabel(f2, ci, THEME, undefined, R0), /sin criterios de completion/, 'sin criterios no hay panel posible');
+    throwsRe(() => S.closingLabel(f4, ci, THEME, undefined, { ...R0, finalExam: true }), /evaluación final que el curso no tiene/, 'certificado con final en un curso sin final');
+    const f4noVid = f4.counts.videos === 0;
+    if (f4noVid) throwsRe(() => S.closingLabel(f4, ci, THEME, undefined, { ...R0, videos: true }), /tipo de ítem que el curso no tiene/, 'videos inexistentes');
     const sin = txt(f2, undefined);
     assert(!/certificad/i.test(sin) && !S.closingLabel(f2, ci, THEME).html.includes('cursia-cta://badges'), 'sin certificate no hay panel');
     eq(S.CTA_BADGES, 'cursia-cta://badges', 'marcador');
@@ -493,7 +514,7 @@ async function pureChecks() {
       const tl = S.certificateTeacherLabel(`Certificado: ${f2.course.title}`, f2, THEME, level ? { level } : undefined);
       assert(vc.lintCleanSafe(tl.html).ok && tl.html.includes('href="cursia-cta://badges"'), `${level}: docente CLEAN_SAFE + botón`);
       const t = vc.extractText(tl.html);
-      for (const w of ['Para docentes: activa el certificado del curso', 'Moodle deja la insignia desactivada al restaurar.', `Entra a Insignias → «Certificado: ${f2.course.title}» → «Habilitar acceso».`, 'Solo se hace una vez.', 'Abrir las insignias del curso →']) {
+      for (const w of ['Para docentes: activa el certificado del curso', 'Moodle deja la insignia desactivada al restaurar.', `Entra a Insignias → «Certificado: ${f2.course.title}» → «Habilitar acceso».`, 'Solo se hace una vez.', 'Si no ves la insignia, revisa que las insignias estén habilitadas en el sitio y en el curso, y que la restauración haya incluido todas las actividades.', 'Abrir las insignias del curso →']) {
         assert(t.includes(w), `${level}: docente «${w}»: ${t}`);
       }
     }

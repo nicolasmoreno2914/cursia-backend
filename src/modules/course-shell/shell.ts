@@ -464,28 +464,49 @@ export function finalExamNextLabel(closingSectionNum: number, facts: CourseFacts
 // ─── SZ Cierre ──────────────────────────────────────────────────────────────
 
 /**
- * EV6 (T3): el paquete trae una insignia de curso nativa de Moodle (el certificado). Qué exige
- * la completion del curso según los criterios REALES del paquete (el texto no promete de más).
+ * EV6 (T3): el paquete trae una insignia de curso nativa de Moodle (el certificado), que se otorga
+ * al completar el curso. Fix round 1 (review I1): el texto nombra EXACTAMENTE los criterios de
+ * completion del paquete (por tipo de ítem) y nunca promete algo que la insignia no cumple:
+ * cada ítem calificable cuenta solo APROBADO (`completionpassgrade=1`) y, si el perfil lo exige,
+ * también la nota mínima del curso (criterio de nota, sin cifras: la cifra no sale de facts).
  */
-export interface ClosingCertificate {
-  /** La completion exige ítems calificables además de la evaluación final. */
-  requiresGradedItems: boolean;
-  /** La completion exige aprobar la evaluación final. */
-  requiresFinalExam: boolean;
+export interface CertificateRequirements {
+  /** Criterios: actividades prácticas de capítulo (H5P/SCORM). */
+  activities: boolean;
+  /** Criterios: videos interactivos (calificables). */
+  videos: boolean;
+  /** Criterios: evaluaciones de módulo. */
+  moduleExams: boolean;
+  /** Criterio: evaluación final (aprobada). */
+  finalExam: boolean;
+  /** Criterio de nota del curso (`requireCourseGradePass`). */
+  courseGrade: boolean;
+  /** Curso sin nota: la completion es abrir el Libro Guía. */
+  libroView: boolean;
 }
 
-export function closingCertificateText(c: ClosingCertificate, facts: CourseFacts): string {
-  // Sin actividades de capítulo (solo videos/exámenes) no se nombran «actividades» (RESOURCE_DISABLED).
-  const graded = facts.counts.activities > 0 ? 'todas las actividades calificadas' : 'todos los elementos calificados';
-  const when =
-    c.requiresGradedItems && c.requiresFinalExam
-      ? `Cuando completes ${graded} y apruebes la evaluación final`
-      : c.requiresFinalExam
-        ? 'Cuando apruebes la evaluación final'
-        : c.requiresGradedItems
-          ? `Cuando completes ${graded}`
-          : 'Cuando completes el curso';
-  return `${when}, Moodle te otorga el certificado del curso. Lo encuentras en tu perfil, en Insignias.`;
+function joinEs(xs: string[]): string {
+  return xs.length <= 1 ? xs.join('') : `${xs.slice(0, -1).join(', ')} y ${xs[xs.length - 1]}`;
+}
+
+/** Condiciones de la insignia en subjuntivo («apruebes…») o infinitivo («aprobar…»). */
+export function certificateRequirementClauses(r: CertificateRequirements, mood: 'sub' | 'inf'): string {
+  const v = mood === 'sub' ? { pass: 'apruebes', reach: 'alcances', open: 'abras' } : { pass: 'aprobar', reach: 'alcanzar', open: 'abrir' };
+  const items: string[] = [];
+  if (r.activities) items.push('todas las actividades prácticas');
+  if (r.videos) items.push('todos los videos interactivos');
+  if (r.moduleExams) items.push('todas las evaluaciones de módulo');
+  if (r.finalExam) items.push('la evaluación final');
+  const clauses: string[] = [];
+  if (items.length) clauses.push(`${v.pass} ${joinEs(items)}`);
+  if (r.courseGrade) clauses.push(`${v.reach} la nota mínima del curso`);
+  if (r.libroView) clauses.push(`${v.open} el Libro Guía`);
+  if (!clauses.length) shellFail('certificado: sin criterios de completion (la insignia nunca se otorgaría)');
+  return joinEs(clauses);
+}
+
+export function closingCertificateText(r: CertificateRequirements): string {
+  return `Cuando ${certificateRequirementClauses(r, 'sub')}, Moodle te otorga el certificado del curso. Lo encuentras en tu perfil, en Insignias.`;
 }
 
 export function closingLabel(
@@ -493,7 +514,7 @@ export function closingLabel(
   courseIntro: CourseIntroV3,
   theme: ResolvedTheme,
   opts?: ShellRenderOptions,
-  certificate?: ClosingCertificate,
+  certificate?: CertificateRequirements,
 ): ShellLabel {
   const intro = assertValidCourseIntroV3(courseIntro);
   const h = hx(theme, opts);
@@ -509,13 +530,17 @@ export function closingLabel(
     lead(h, intro.closing, s) +
     pHtml(h, labelHtml(next), s, { weight: 700, last: !certificate });
   if (certificate) {
-    if (certificate.requiresFinalExam && !facts.finalExam.enabled) shellFail('certificado: exige una evaluación final que el curso no tiene');
+    const c = facts.counts;
+    if (certificate.finalExam && !facts.finalExam.enabled) shellFail('certificado: exige una evaluación final que el curso no tiene');
+    if ((certificate.activities && c.activities < 1) || (certificate.videos && c.videos < 1) || (certificate.moduleExams && c.exams < 1)) {
+      shellFail('certificado: exige un tipo de ítem que el curso no tiene');
+    }
     const cs = toneSurf(h, 'soft');
     inner += box(
       h,
       eyebrow(h, 'Certificado', cs.s) +
         heading(h, 'h4', 'Tu certificado', cs.s) +
-        pHtml(h, labelHtml(closingCertificateText(certificate, facts)), cs.s) +
+        pHtml(h, labelHtml(closingCertificateText(certificate)), cs.s) +
         ctaButton(h, CTA_BADGES, 'Ver mi certificado →', cs.s),
       cs,
       { cls: 'cvc-certificate' },
@@ -529,6 +554,10 @@ export function closingLabel(
  * ve atenuado, el estudiante nunca). Moodle restaura la insignia desactivada: aquí se explica cómo
  * habilitarla una vez. `badgeName` = nombre exacto de la insignia del paquete.
  */
+/** Fix round 1 (review I2): la restauración puede omitir la insignia sin aviso (execute_condition). */
+export const CERTIFICATE_TEACHER_TROUBLESHOOTING =
+  'Si no ves la insignia, revisa que las insignias estén habilitadas en el sitio y en el curso, y que la restauración haya incluido todas las actividades.';
+
 export function certificateTeacherLabel(badgeName: string, facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
   const name = String(badgeName ?? '').trim();
   if (!name.startsWith('Certificado: ')) shellFail(`certificado (docentes): nombre de insignia inválido (${name})`);
@@ -539,7 +568,10 @@ export function certificateTeacherLabel(badgeName: string, facts: CourseFacts, t
     heading(h, 'h4', 'Para docentes: activa el certificado del curso', cs.s) +
     pHtml(
       h,
-      labelHtml(`Moodle deja la insignia desactivada al restaurar. Entra a Insignias → «${name}» → «Habilitar acceso». Solo se hace una vez.`),
+      labelHtml(
+        `Moodle deja la insignia desactivada al restaurar. Entra a Insignias → «${name}» → «Habilitar acceso». Solo se hace una vez. ` +
+          CERTIFICATE_TEACHER_TROUBLESHOOTING,
+      ),
       cs.s,
     ) +
     ctaButton(h, CTA_BADGES, 'Abrir las insignias del curso →', cs.s);
