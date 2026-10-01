@@ -530,10 +530,15 @@ async function upgradeChecks() {
     await W.processItem(h.deps, h.job);
     eq(h.state.uploads.length, 0, 'sin upload');
     assert(h.state.failed.length === 1 && /video_mode_inconsistent/.test(h.state.failed[0]), `falla: ${h.state.failed[0]}`);
-    // Con el upgrade registrado, el mismo estado es «pendiente» (degradado legítimo).
-    const ok = workerHarness({ videoMode: 'real', videoModeByItem: () => 'mock', runPayload: { videoUpgrade: { id: 'u', itemKeys: [] } } });
+    // Con un upgrade que INCLUYÓ esos videos, el mismo estado es «pendiente» (degradado legítimo)…
+    const keys = videoChapters(h.manifest).map((c) => `video:${c}`);
+    const ok = workerHarness({ videoMode: 'real', videoModeByItem: () => 'mock', runPayload: { videoModeOriginal: 'mock', videoUpgrade: { id: 'u', itemKeys: keys } } });
     await W.processItem(ok.deps, ok.job);
     eq([ok.state.failed.length, ok.state.uploads.length], [0, 1], 'con upgrade empaqueta');
+    // …pero (fix round 1, m-6) un video de vista previa que NINGÚN upgrade incluyó sigue siendo inconsistente.
+    const partial = workerHarness({ videoMode: 'real', videoModeByItem: () => 'mock', runPayload: { videoModeOriginal: 'mock', videoUpgrade: { id: 'u', itemKeys: [keys[0]] } } });
+    await W.processItem(partial.deps, partial.job);
+    assert(partial.state.uploads.length === 0 && /video_mode_inconsistent/.test(partial.state.failed[0] || ''), `fuera del upgrade: ${partial.state.failed[0]}`);
   });
 }
 

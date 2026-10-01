@@ -11,7 +11,7 @@ import { packageReuseHash, resolveDynamicMoodleVersion, sortedArtifactIds } from
 import { DYNAMIC_MBZ_BUILDER_VERSION } from '../../package/dynamic-mbz-builder';
 import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import { isRealVideoOutput, prepareV3Package } from './packaging-v3';
-import { VIDEO_MODE_INCONSISTENT, runIsUpgradeOnlyFailure } from '../dynamic-generation/video-upgrade';
+import { VIDEO_MODE_INCONSISTENT, fallbackVideoModeOf, runIsUpgradeOnlyFailure } from '../dynamic-generation/video-upgrade';
 import { MOCK_ARTIFACT_IN_REAL_RUN } from './packaging-guards';
 import { DYNAMIC_MBZ_BUILDER_VERSION_V3 } from '../../package/dynamic-mbz-builder-v3';
 
@@ -446,7 +446,7 @@ export class PackagingService {
       const ytMissing = manifest.manifest.items
         .filter((it) => it.type === 'video')
         // EV6 T5: un video pendiente (vista previa) no se empaqueta → no se le exige YouTube.
-        .filter((it) => manifest.rulesVersion !== 3 || isRealVideoOutput(byKey.get(it.key)?.output_summary ?? null, videoMode))
+        .filter((it) => manifest.rulesVersion !== 3 || isRealVideoOutput(byKey.get(it.key)?.output_summary ?? null, fallbackVideoModeOf(run.input_payload)))
         .flatMap((it) => {
           const r = byKey.get(it.key);
           return youtubeDeliveryProblems(it.key, r?.status ?? null, r?.output_summary ?? null);

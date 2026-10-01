@@ -33,7 +33,13 @@ import { frozenVideoDeliveryOf, checkYoutubeDeliveryUrl } from '../dynamic-gener
 import { GuardArtifact, MockArtifactInRealRunError, assertNoMockArtifactsForRealPackage } from './packaging-guards';
 import { frozenProviderModesOf, providerKindOfArtifactType } from '../dynamic-generation/provider-modes';
 import { assertSafeStoragePath } from '../artifacts/artifacts.service';
-import { VideoModeInconsistentError, runIsUpgradeOnlyFailure, videoUpgradeOf } from '../dynamic-generation/video-upgrade';
+import {
+  VideoModeInconsistentError,
+  fallbackVideoModeOf,
+  runIsUpgradeOnlyFailure,
+  upgradedVideoKeysOf,
+  videoUpgradeOf,
+} from '../dynamic-generation/video-upgrade';
 import { ResolvedAssessment, assertCategoriesPopulated, assessmentItemCountsForPackage } from '../../package/assessment';
 import {
   AssessmentProfile,
@@ -757,7 +763,14 @@ export function splitPendingVideosV3(
   manifest: GenerationManifestV1,
   byItem: Map<string, ResolvedItemV3>,
   runVideoMode: unknown,
-  opts: { videoUpgrade?: boolean; runId?: string } = {},
+  opts: {
+    videoUpgrade?: boolean;
+    runId?: string;
+    /** Fix round 1 (m-6): keys de video de los upgrades del run (solo esas pueden quedar pendientes en un run real). */
+    upgradedKeys?: ReadonlySet<string>;
+    /** Fix round 1 (m-6): modo para items sin `mode` = el ORIGINAL del run (default: runVideoMode). */
+    fallbackMode?: unknown;
+  } = {},
 ): { pendingVideos: PendingVideoV3[]; byItem: Map<string, ResolvedItemV3> } {
   const pendingVideos: PendingVideoV3[] = [];
   const inconsistent: string[] = [];
@@ -765,9 +778,18 @@ export function splitPendingVideosV3(
     if (it.type !== 'video') continue;
     const r = byItem.get(it.key);
     if (!r) continue; // resolveRunArtifactsV3 ya exigió todos los items
-    if (isRealVideoOutput(r.outputSummary, runVideoMode)) continue;
-    // Ruling 6 (B2): run real + item de vista previa solo es «pendiente» si hubo un upgrade.
-    if (runVideoMode === 'real' && !opts.videoUpgrade) {
+    const chapterIdOf = String(it.chapterId ?? it.key.slice('video:'.length));
+    if (isRealVideoOutput(r.outputSummary, opts.fallbackMode !== undefined ? opts.fallbackMode : runVideoMode)) {
+      // Fix round 1 (I-1): un video REAL de un upgrade cuyas preguntas todavía son las del video de vista
+      // previa (el upgrade se canceló antes de generarlas) NO se empaqueta con esas preguntas: queda
+      // pendiente hasta que se generen sus interacciones (reanudar el curso), nunca un H5P incoherente.
+      const vRunId = r.artifacts[0]?.itemRunId;
+      const inter = byItem.get(`video_interactions:${chapterIdOf}`);
+      const fromUpgrade = r.outputSummary?.regeneration?.reason === 'video_upgrade';
+      if (!fromUpgrade || !inter || inter.outputSummary?.regeneration?.cascadeFromItemRunId === vRunId) continue;
+    }
+    // Ruling 6 (B2): run real + item de vista previa solo es «pendiente» si un upgrade lo incluyó.
+    if (runVideoMode === 'real' && (!opts.videoUpgrade || (opts.upgradedKeys && !opts.upgradedKeys.has(it.key)))) {
       inconsistent.push(it.key);
       continue;
     }
@@ -809,6 +831,8 @@ export async function prepareV3Package(
   const { pendingVideos, byItem } = splitPendingVideosV3(manifest.manifest, resolvedAll, run.input_payload?.videoMode, {
     videoUpgrade: !!videoUpgradeOf(run.input_payload),
     runId,
+    upgradedKeys: upgradedVideoKeysOf(run.input_payload),
+    fallbackMode: fallbackVideoModeOf(run.input_payload),
   });
   const omittedVideoKeys = pendingVideos.map((p) => p.itemKey);
   assertRunArtifactsPackageable(run, byItem);

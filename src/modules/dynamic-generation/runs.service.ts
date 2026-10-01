@@ -106,10 +106,17 @@ import {
   VIDEO_UPGRADE_NOTHING_PENDING,
   VIDEO_UPGRADE_REASON,
   VIDEO_UPGRADE_RUN_NOT_READY,
+  VIDEO_UPGRADE_AMBIGUOUS_SUBMISSION,
+  VIDEO_UPGRADE_IN_FLIGHT_STATES,
   VideoUpgradeRecord,
+  fallbackVideoModeOf,
+  isUpgradeGeneration,
+  runIsUpgradeOnlyFailure,
+  upgradedVideoKeysOf,
   videoModeInconsistentMessage,
   videoUpgradeFingerprint,
   videoUpgradeOf,
+  videoUpgradesOf,
 } from './video-upgrade';
 import { estimateCategories, estimateFingerprint, planNormalApproval, NormalApprovalPlan } from '../finops/normal-approval';
 import { isSuperAdminEmail } from '../../auth/super-admin';
@@ -569,7 +576,7 @@ export interface VideoUpgradePreview {
   rulesVersion: number;
   /** true = se puede confirmar (sin trabas y con videos pendientes); la aprobación se ve en `approval`. */
   eligible: boolean;
-  pendingVideos: Array<{ itemKey: string; chapterId: string | null; generation: number }>;
+  pendingVideos: Array<{ itemKey: string; chapterId: string | null; generation: number; reusesVideogenJob?: boolean }>;
   interactions: Array<{ itemKey: string; generation: number }>;
   estimate: {
     currency: string; min: string; expected: string; max: string;
@@ -582,8 +589,10 @@ export interface VideoUpgradePreview {
   blockers: Array<{ code: string; message: string }>;
   /** Huella del estimado: la confirmación la exige igual (si no → 409 estimate_stale). */
   estimateHash: string | null;
-  /** Upgrade ya hecho (idempotencia): con él, no hay nada que confirmar. */
+  /** Último upgrade del run (informativo). */
   upgrade: VideoUpgradeRecord | null;
+  /** true = el último upgrade todavía tiene videos/preguntas en vuelo: no hay nada que confirmar. */
+  upgradeInFlight: boolean;
   /** Interno (no viaja al cliente). */
   _blockers?: VideoUpgradeBlocker[];
 }
@@ -605,6 +614,8 @@ interface VideoUpgradePlan {
   pending: any[];
   interactions: any[];
   blockers: VideoUpgradeBlocker[];
+  /** Pendientes cuyo intento anterior ya tiene un job REAL en Videogen (se reutiliza, sin gasto nuevo). */
+  carried: any[];
 }
 
 interface VideoUpgradeEconomics {
@@ -1193,7 +1204,9 @@ export class RunsService {
         );
       }
       const latestVideoMode = this.videoModeOf(latest);
-      if (latestVideoMode !== videoMode) {
+      // EV6 T5 B2 fix round 1 (I-1): tras un upgrade de video, reanudar con el modo ORIGINAL no es un cambio de modo.
+      const latestOriginal = videoUpgradeOf(latest.input_payload) ? latest.input_payload?.videoModeOriginal : undefined;
+      if (latestVideoMode !== videoMode && latestOriginal !== videoMode) {
         throw new ConflictException(
           `La ejecución anterior usó otro modo de video (${latestVideoMode}); cambiarlo requiere regeneración ` +
             `(Fase 8). runId=${latest.id}`,
@@ -1213,7 +1226,9 @@ export class RunsService {
       // DN-1: reabrir re-encola los items cancelled; si alguno es un video sin
       // job de Videogen (envío NUEVO), aplica el gate de entrega (YouTube +
       // preflight) ANTES de escribir nada.
-      const videoWork = await this.videoSubmissionsIfReopened(this.dataSource, latest.id, ['cancelled']);
+      // EV6 T5 B2 (I-1): los videos de un upgrade cancelado NO se reabren (nunca se vuelve a pagar
+      // por reanudar): quedan pendientes y se generan solo con un upgrade nuevo (vista previa + aprobación).
+      const videoWork = await this.videoSubmissionsIfReopened(this.dataSource, latest.id, ['cancelled'], true);
       await this.enforceVideoGate(
         ownerId,
         frozenRunVideoGate({ videoWork, videoMode: latestVideoMode, strategy: frozenVideoDeliveryOf(latest.input_payload) }),
@@ -1227,6 +1242,7 @@ export class RunsService {
           [latest.id],
         );
         const paidKeys = cancelled
+          .filter((r) => !isUpgradeGeneration(r.output_summary))
           .filter((r) => paidProviderOfItemType(r.type) !== null && (r.type !== 'video' || !r.output_summary?.external?.videogenJobId))
           .map((r) => r.item_key);
         await this.finopsPaidWorkGate({ courseId, ownerId, manifest, job: latest, paidKeys });
@@ -2639,11 +2655,11 @@ export class RunsService {
     assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     const job = await this.reconcileCancellation(await this.loadRunRow(courseId, manifest, runId));
-    const already = videoUpgradeOf(job.input_payload);
+    const already = await this.existingUpgradeFor(this.dataSource, job, estimateHash);
     if (already) return { created: false, upgrade: already, run: await this.buildRunDto(job, manifest) };
 
     const pv = await this.videoUpgradePreviewOf(this.dataSource, courseId, user, job, manifest, true);
-    if (pv.upgrade) return { created: false, upgrade: pv.upgrade, run: await this.buildRunDto(await this.loadJobById(job.id), manifest) };
+    if (pv.upgradeInFlight && pv.upgrade) return { created: false, upgrade: pv.upgrade, run: await this.buildRunDto(await this.loadJobById(job.id), manifest) };
     if (pv._blockers && pv._blockers.length) throw pv._blockers[0].error();
     if (!pv.estimateHash || pv.estimateHash !== estimateHash) {
       throw new ConflictException({
@@ -2665,7 +2681,7 @@ export class RunsService {
     const outcome = await this.tx(async (qr) => {
       await this.lockCourseRuns(qr, courseId);
       const [locked] = await qr.query(`select * from public.production_jobs where id = $1 for update`, [job.id]);
-      const existing = videoUpgradeOf(locked?.input_payload);
+      const existing = await this.existingUpgradeFor(qr, locked, estimateHash);
       if (existing) return { kind: 'existing' as const, upgrade: existing };
       const plan = await this.planVideoUpgrade(qr, true, courseId, ownerId, locked, manifest);
       if (plan.blockers.length) throw plan.blockers[0].error();
@@ -2697,7 +2713,7 @@ export class RunsService {
         amount: econ.plan.amount,
         authorizedRunBudget: rec.authorizedRunBudget,
       };
-      const insertGeneration = async (prev: any, regeneration: Record<string, any>): Promise<string> => {
+      const insertGeneration = async (prev: any, regeneration: Record<string, any>, carry: Record<string, any> = {}): Promise<string> => {
         const generation = Number(prev.generation) + 1;
         const [row] = await qr.query(
           `insert into public.generation_item_runs
@@ -2707,7 +2723,7 @@ export class RunsService {
            returning id`,
           [locked.id, prev.course_id, prev.blueprint_id, prev.manifest_id, prev.item_key, generation, prev.type,
             prev.module_id, prev.chapter_id, prev.depends_on ?? [], itemIdempotencyKey(manifest.id, prev.item_key, generation),
-            JSON.stringify({ regeneration })],
+            JSON.stringify({ ...carry, regeneration })],
         );
         await qr.query(
           `update public.artifacts
@@ -2721,11 +2737,18 @@ export class RunsService {
         );
         return row.id as string;
       };
+      const carriedKeys = new Set(plan.carried.map((r) => r.item_key));
       for (const prev of plan.pending) {
+        // Un intento anterior (upgrade cancelado) que ya tenía un render REAL en Videogen: la generación
+        // nueva reutiliza ese job (el worker lo vuelve a consultar; el ledger cobra una vez por job).
+        const carry = carriedKeys.has(prev.item_key)
+          ? { external: prev.output_summary.external, ...(prev.output_summary.externalReservationKey ? { externalReservationKey: prev.output_summary.externalReservationKey } : {}) }
+          : {};
         const newId = await insertGeneration(prev, {
           reason: VIDEO_UPGRADE_REASON, upgradeId: upgrade.id, fromItemRunId: prev.id, fromGeneration: Number(prev.generation),
-          costKind: 'videogen', requestedBy: ownerId, requestedAt,
-        });
+          costKind: carriedKeys.has(prev.item_key) ? 'none' : 'videogen', ...(carriedKeys.has(prev.item_key) ? { reusedVideogenJob: true } : {}),
+          requestedBy: ownerId, requestedAt,
+        }, carry);
         const inter = plan.interactions.find((r) => r.chapter_id === prev.chapter_id);
         if (inter) {
           await insertGeneration(inter, {
@@ -2738,12 +2761,15 @@ export class RunsService {
       try {
         await qr.query(
           `update public.production_jobs
-              set input_payload = input_payload || jsonb_build_object('videoMode', 'real', 'videoModeOriginal', $2::text, 'videoUpgrade', $3::jsonb),
+              set input_payload = input_payload || jsonb_build_object('videoMode', 'real', 'videoModeOriginal', $2::text, 'videoUpgrade', $3::jsonb,
+                                                                      'videoUpgradeHistory', $5::jsonb),
                   status = 'queued', worker_status = 'queued', finished_at = null, error_message = null, next_retry_at = null,
+                  lease_until = null, worker_id = null,
                   output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('lastRegeneration', $4::jsonb),
                   updated_at = now()
             where id = $1`,
-          [locked.id, this.videoModeOf(locked), JSON.stringify(upgrade), note],
+          [locked.id, locked.input_payload?.videoModeOriginal ?? this.videoModeOf(locked), JSON.stringify(upgrade), note,
+            JSON.stringify(videoUpgradesOf(locked.input_payload))],
         );
       } catch (err) {
         if (isActiveRunConflict(err)) {
@@ -2771,20 +2797,26 @@ export class RunsService {
     keepInternals = false,
   ): Promise<VideoUpgradePreview> {
     const upgrade = videoUpgradeOf(job.input_payload);
+    const upgradeInFlight = !!upgrade && (await this.upgradeInFlight(q, job));
     const base: VideoUpgradePreview = {
       runId: job.id, rulesVersion: manifest.rulesVersion, eligible: false, pendingVideos: [], interactions: [],
-      estimate: null, approval: null, blockers: [], estimateHash: null, upgrade,
+      estimate: null, approval: null, blockers: [], estimateHash: null, upgrade, upgradeInFlight,
     };
-    if (upgrade) return base;
+    // Un upgrade en vuelo: nada que confirmar (idempotencia). Uno terminado: se puede pedir otro para lo que quedó pendiente.
+    if (upgradeInFlight) return base;
     const plan = await this.planVideoUpgrade(q, false, courseId, user.id, job, manifest);
     const blockers = [...plan.blockers];
     const out: VideoUpgradePreview = {
       ...base,
-      pendingVideos: plan.pending.map((r) => ({ itemKey: r.item_key, chapterId: r.chapter_id ?? null, generation: Number(r.generation) })),
+      pendingVideos: plan.pending.map((r) => ({
+        itemKey: r.item_key, chapterId: r.chapter_id ?? null, generation: Number(r.generation),
+        ...(plan.carried.some((c) => c.item_key === r.item_key) ? { reusesVideogenJob: true } : {}),
+      })),
       interactions: plan.interactions.map((r) => ({ itemKey: r.item_key, generation: Number(r.generation) })),
     };
     if (plan.pending.length) {
       // DN-1 (después del 403 de video real, igual que la confirmación): YouTube conectado y verificado.
+      // (Un video que reutiliza su job de Videogen igual se publica en YouTube: cuenta para el gate.)
       const gb = await this.videoGateBlocker(user.id, frozenRunVideoGate({ videoWork: plan.pending.length, videoMode: 'real', strategy: frozenVideoDeliveryOf(job.input_payload) }));
       if (gb) blockers.push({ code: gb.code, message: gb.message, error: () => new ConflictException({ message: gb.message, code: gb.code, ...(gb.reason ? { reason: gb.reason } : {}) }) });
       let econ: VideoUpgradeEconomics;
@@ -2835,7 +2867,7 @@ export class RunsService {
     if (manifest.rulesVersion !== 3) {
       const m = 'generar los videos reales de un curso ya generado solo está disponible para la estructura actual (V2.1).';
       block(VIDEO_UPGRADE_NOT_ALLOWED_RULES, m, conflict(VIDEO_UPGRADE_NOT_ALLOWED_RULES, m));
-      return { pending: [], interactions: [], blockers };
+      return { pending: [], interactions: [], blockers, carried: [] };
     }
     try {
       assertRealVideoAllowed(ownerId);
@@ -2843,7 +2875,9 @@ export class RunsService {
       const msg = err instanceof Error ? err.message : String(err);
       block('real_video_not_allowed', msg, () => err as Error);
     }
-    if (isCancelledLike(job) || job.worker_status !== 'completed') {
+    // Terminado; o (fix round 1, I-1) terminado `failed`/`cancelled` SOLO por un upgrade anterior.
+    const degraded = job.worker_status !== 'completed' && (await runIsUpgradeOnlyFailure(q, job));
+    if ((isCancelledLike(job) && !degraded) || (job.worker_status !== 'completed' && !degraded)) {
       const m = `la generación del curso tiene que estar terminada para generar sus videos reales (estado: ${job.worker_status}).`;
       block(VIDEO_UPGRADE_RUN_NOT_READY, m, conflict(VIDEO_UPGRADE_RUN_NOT_READY, m));
     }
@@ -2864,14 +2898,32 @@ export class RunsService {
       [job.id],
     );
     const runMode = this.videoModeOf(job);
+    const upgraded = upgradedVideoKeysOf(job.input_payload);
+    const fallback = fallbackVideoModeOf(job.input_payload);
     const modeOf = (r: any) => r.output_summary?.mode;
-    // Ruling 6: run real sin upgrade con un video de vista previa = inconsistencia → fallar fuerte.
-    const inconsistent = runMode === 'real' ? videos.filter((r) => modeOf(r) === 'mock').map((r) => r.item_key) : [];
+    const isReal = (r: any) => modeOf(r) === 'real' || (modeOf(r) === undefined && fallback === 'real');
+    // Ruling 6: en un run real, un video de vista previa solo es aceptable si un upgrade lo incluyó.
+    const inconsistent = runMode === 'real'
+      ? videos.filter((r) => r.status === 'completed' && modeOf(r) === 'mock' && !upgraded.has(r.item_key)).map((r) => r.item_key)
+      : [];
     if (inconsistent.length) {
       const msg = videoModeInconsistentMessage(inconsistent, job.id);
       block(VIDEO_MODE_INCONSISTENT, msg, () => new ConflictException({ message: msg, code: VIDEO_MODE_INCONSISTENT, keys: inconsistent }));
     }
-    const pending = runMode === 'real' ? [] : videos.filter((r) => r.status === 'completed' && modeOf(r) !== 'real');
+    const TERMINAL_NOT_DONE = new Set(['failed', 'blocked', 'cancelled']);
+    const pending = runMode !== 'real' && !upgraded.size
+      ? videos.filter((r) => r.status === 'completed' && !isReal(r))
+      // Tras un upgrade: solo videos de un upgrade que quedaron de vista previa o terminaron sin completar.
+      : videos.filter((r) => upgraded.has(r.item_key) &&
+          ((r.status === 'completed' && modeOf(r) === 'mock') || (TERMINAL_NOT_DONE.has(r.status) && isUpgradeGeneration(r.output_summary))));
+    // Un envío a Videogen que quedó ambiguo (sin id de job) nunca se reenvía a ciegas.
+    const ambiguous = pending.filter((r) => r.output_summary?.externalSubmitStartedAt && !r.output_summary?.external?.videogenJobId).map((r) => r.item_key);
+    if (ambiguous.length) {
+      const m = `el envío a Videogen de ${ambiguous.join(', ')} quedó sin confirmar; resuélvelo antes de pedir videos nuevos (nunca se envía de nuevo a ciegas).`;
+      block(VIDEO_UPGRADE_AMBIGUOUS_SUBMISSION, m, conflict(VIDEO_UPGRADE_AMBIGUOUS_SUBMISSION, m));
+    }
+    // Un intento cancelado/fallido que ya tiene un job REAL en Videogen se reutiliza (no se vuelve a pagar).
+    const carried = pending.filter((r) => r.output_summary?.external?.videogenJobId && (r.output_summary?.external?.mode === 'real' || r.output_summary?.mode === 'real'));
     if (!pending.length && !inconsistent.length) {
       const m = 'este curso no tiene videos pendientes de generación.';
       block(VIDEO_UPGRADE_NOTHING_PENDING, m, conflict(VIDEO_UPGRADE_NOTHING_PENDING, m));
@@ -2901,7 +2953,35 @@ export class RunsService {
         block(PROVIDER_NOT_READY, m, () => new ConflictException({ message: m, code: PROVIDER_NOT_READY, missing }));
       }
     }
-    return { pending, interactions, blockers };
+    return { pending, interactions, blockers, carried };
+  }
+
+  /** ¿Algún item del ÚLTIMO upgrade (video o interacciones) sigue en vuelo? */
+  private async upgradeInFlight(q: { query: (sql: string, params?: any[]) => Promise<any> }, job: any): Promise<boolean> {
+    const up = videoUpgradeOf(job?.input_payload);
+    if (!up) return false;
+    const keys = [...(up.itemKeys ?? []), ...(up.interactionKeys ?? [])];
+    if (!keys.length) return false;
+    const rows: any[] = await q.query(
+      `select g.status from public.generation_item_runs g
+        where g.job_id = $1 and g.item_key = any($2::text[]) and ${latestGenerationPredicate('g')}`,
+      [job.id, keys],
+    );
+    return rows.some((r) => VIDEO_UPGRADE_IN_FLIGHT_STATES.includes(r.status));
+  }
+
+  /**
+   * Idempotencia POR UPGRADE: la confirmación con la huella de un upgrade ya registrado (el último o
+   * uno del historial) devuelve ESE; con un upgrade en vuelo, cualquier confirmación devuelve el que
+   * está en vuelo. Si no → null (se puede planificar un upgrade nuevo con lo que quedó pendiente).
+   */
+  private async existingUpgradeFor(q: { query: (sql: string, params?: any[]) => Promise<any> }, job: any, estimateHash: string): Promise<VideoUpgradeRecord | null> {
+    const all = videoUpgradesOf(job?.input_payload);
+    const same = all.find((u) => u.estimateHash === estimateHash);
+    if (same) return same;
+    const last = videoUpgradeOf(job?.input_payload);
+    if (last && (await this.upgradeInFlight(q, job))) return last;
+    return null;
   }
 
   /** Estimado + plan de aprobación + huella del upgrade, todo sobre `runner` (la tx en la confirmación). */
@@ -2922,7 +3002,9 @@ export class RunsService {
     const fb = this.finopsBudget;
     const modes = runSpendModes('real', frozenProviderModesOf(job.input_payload));
     const byKey = new Map(manifest.manifest.items.map((it) => [it.key, it]));
-    const keys = [...plan.pending, ...plan.interactions].map((r) => r.item_key);
+    const carried = new Set(plan.carried.map((r) => r.item_key));
+    // Los videos que reutilizan su job de Videogen no tienen gasto nuevo de Videogen: fuera del estimado.
+    const keys = [...plan.pending.filter((r) => !carried.has(r.item_key)), ...plan.interactions].map((r) => r.item_key);
     const items = keys.map((k) => byKey.get(k)).filter(Boolean) as RunManifestItem[];
     if (items.length !== keys.length) throw new InternalServerErrorException('upgrade de video: items fuera del Manifest (integridad rota)');
     const actions: Record<string, string> = {};
@@ -2946,6 +3028,7 @@ export class RunsService {
       manifestId: manifest.id,
       pending: plan.pending.map((r) => ({ itemKey: r.item_key, generation: Number(r.generation) })),
       interactions: plan.interactions.map((r) => ({ itemKey: r.item_key, generation: Number(r.generation) })),
+      carried: [...carried].sort(),
       modes,
       estimate,
       policyId: policy?.id ?? null,
@@ -3351,13 +3434,15 @@ export class RunsService {
     q: { query: (sql: string, params?: any[]) => Promise<any> },
     jobId: string,
     statuses: string[],
+    /** EV6 T5 B2: la reapertura no re-encola generaciones de un upgrade de video. */
+    excludeUpgrade = false,
   ): Promise<number> {
     const rows: Array<{ output_summary: Record<string, any> | null }> = await q.query(
       `select g.output_summary from public.generation_item_runs g
         where g.job_id = $1 and g.type = 'video' and g.status = any($2::text[]) and ${latestGenerationPredicate('g')}`,
       [jobId, statuses],
     );
-    return rows.filter((r) => !r.output_summary?.external?.videogenJobId).length;
+    return rows.filter((r) => !r.output_summary?.external?.videogenJobId && !(excludeUpgrade && isUpgradeGeneration(r.output_summary))).length;
   }
 
   /** Preflight de YouTube del servidor; sin el servicio (harness) → falla cerrado. */
@@ -3602,14 +3687,22 @@ export class RunsService {
           );
         }
 
-        const items: Array<{ id: string; item_key: string; status: ItemRunStatus; depends_on: string[] }> =
+        const items: Array<{ id: string; item_key: string; status: ItemRunStatus; depends_on: string[]; output_summary: Record<string, any> | null }> =
           await qr.query(
-            `select id, item_key, status, depends_on from public.generation_item_runs g
+            `select id, item_key, status, depends_on, output_summary from public.generation_item_runs g
               where g.job_id = $1 and ${latestGenerationPredicate('g')} order by id for update`,
             [jobId],
           );
         const status = new Map<string, ItemRunStatus>(items.map((i) => [i.item_key, i.status]));
-        const reopen = items.filter((i) => i.status === 'cancelled');
+        // EV6 T5 B2 (I-1): las generaciones de un upgrade de video cancelado quedan canceladas (el run
+        // puede terminar `failed` solo por ellas → empaquetable con esos videos pendientes, §2.6). Volver
+        // a generarlas exige un upgrade NUEVO con vista previa y aprobación: reabrir nunca re-cobra.
+        // Las PREGUNTAS (LLM) de un video del upgrade que sí terminó se reabren: describen ese video real.
+        const cascadeSourceDone = (i: { output_summary: Record<string, any> | null }) => {
+          const src = i.output_summary?.regeneration?.cascadeFromItemKey;
+          return i.output_summary?.regeneration?.reason === VIDEO_UPGRADE_CASCADE_REASON && !!src && status.get(src) === 'completed';
+        };
+        const reopen = items.filter((i) => i.status === 'cancelled' && (!isUpgradeGeneration(i.output_summary) || cascadeSourceDone(i)));
         for (const i of reopen) status.set(i.item_key, 'pending');
         let changed = true;
         while (changed) {

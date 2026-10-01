@@ -554,9 +554,104 @@ const ENV_KEYS = [
       eq(VU.isUpgradeOnlyFailure(run, [vfail, { item_key: 'content:a', type: 'content', status: 'failed', output_summary: {} }], done), false, 'fallo ajeno');
     });
 
-    await check('existingRunOrConflict: tras el upgrade, una pestaña vieja que reanuda con videoMode mock NO es un 409', async () => {
-      const res = await runs.startRun(A.cid, OWNER, 1, MOCK_CTX).catch((e) => e);
-      assert(!(res instanceof Error) || !/otro modo de video/.test(res.message), `no debe ser conflicto de modo: ${res && res.message}`);
+    await check('fix round 1 (m-4) existingRunOrConflict: con el upgrade EN VUELO, una pestaña vieja que reanuda con videoMode mock recibe el run (no 409)', async () => {
+      const Q2 = await previewCourse('Curso B2 pestaña vieja');
+      const pv = await runs.previewVideoUpgrade(Q2.cid, ADMIN, 1, Q2.runId);
+      await runs.confirmVideoUpgrade(Q2.cid, ADMIN, 1, Q2.runId, pv.estimateHash);
+      eq((await jobOf(Q2.runId)).worker_status, 'queued', 'upgrade en vuelo');
+      const res = await runs.startRun(Q2.cid, OWNER, 1, MOCK_CTX);
+      eq([res.created, res.run.id, res.run.videoMode], [false, Q2.runId, 'real'], 'mismo run');
+    });
+
+    // ════ Fix round 1 (I-1): cancelar durante el upgrade ═══════════════════
+    const C = await previewCourse('Curso B2 cancelado');
+    let pvC = null;
+    let upC = null;
+    let chargesBeforeCancel = null;
+    await check('I-1 cancelar DURANTE el upgrade (un video ya terminó real, el otro no): run cancelado SIGUE empaquetable (precheck OK) y el ledger no cambia', async () => {
+      pvC = await runs.previewVideoUpgrade(C.cid, ADMIN, 1, C.runId);
+      upC = (await runs.confirmVideoUpgrade(C.cid, ADMIN, 1, C.runId, pvC.estimateHash)).upgrade;
+      const vg = fakeVideogen();
+      await itemWorker.processItem(deps(dbScheduler(), vg), await claim(C.runId, `video:${C.c1}`, C.c1));
+      // El 2º video ya estaba en Videogen (job real registrado) cuando se canceló.
+      const v2 = await latest(C.runId, `video:${C.c2}`);
+      await patchSummary(v2.id, { external: { videogenJobId: 'vg_cancelled_job', mode: 'real', batchId: 'b_x' }, mode: 'real' });
+      chargesBeforeCancel = (await chargesOf(C.runId)).length;
+      await runs.cancelRun(C.cid, OWNER, 1, C.runId);
+      const job = await jobOf(C.runId);
+      eq(job.worker_status, 'cancelled', 'cancelado');
+      eq(await VU.runIsUpgradeOnlyFailure(ds, job), true, 'solo partes del upgrade sin terminar');
+      await packaging.assertRunReady(job, { rulesVersion: 3, manifest: C.manifest.manifest ?? C.manifest });
+      eq((await chargesOf(C.runId)).length, chargesBeforeCancel, 'cancelar no cobra ni libera nada');
+    });
+
+    await check('I-1 reanudar con el modo ORIGINAL (mock) tras cancelar → reabre SIN 409 y SIN volver a encolar el video pago cancelado (solo las preguntas del video que sí terminó)', async () => {
+      const gensBefore = (await counts(C.cid)).gens;
+      const res = await runs.startRun(C.cid, OWNER, 1, MOCK_CTX);
+      eq([res.reopened, res.run.id], [true, C.runId], 'reabierto');
+      eq((await counts(C.cid)).gens, gensBefore, 'sin generaciones nuevas');
+      eq((await latest(C.runId, `video:${C.c2}`)).status, 'cancelled', 'el video pago cancelado NO se re-encola');
+      eq((await latest(C.runId, `video_interactions:${C.c2}`)).status, 'cancelled', 'sus preguntas tampoco');
+      eq((await latest(C.runId, `video_interactions:${C.c1}`)).status, 'pending', 'las preguntas del video real que terminó sí (LLM)');
+      eq((await chargesOf(C.runId)).length, chargesBeforeCancel, 'sin cargos nuevos');
+      // Las preguntas del 1º terminan → el run queda failed SOLO por el upgrade cancelado → empaquetable.
+      const i1 = await latest(C.runId, `video_interactions:${C.c1}`);
+      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() where id = $1`, [i1.id]);
+      await runs.tx((qr) => L('modules/dynamic-generation/item-transitions.js').recomputeRunStatus(qr, C.runId));
+      const job = await jobOf(C.runId);
+      eq(job.worker_status, 'failed', 'failed solo por el upgrade');
+      await packaging.assertRunReady(job, { rulesVersion: 3, manifest: C.manifest.manifest ?? C.manifest });
+    });
+
+    let upC2 = null;
+    await check('I-1 SEGUNDO upgrade en el mismo run: vista previa NUEVA solo con el video que quedó pendiente; reutiliza su job de Videogen (fuera del estimado, sin envío nuevo, sin cargo duplicado)', async () => {
+      const pv2 = await runs.previewVideoUpgrade(C.cid, ADMIN, 1, C.runId);
+      eq([pv2.upgradeInFlight, pv2.eligible, pv2.blockers], [false, true, []], 'se puede pedir otro');
+      eq(pv2.pendingVideos.map((p) => [p.itemKey, p.reusesVideogenJob === true]), [[`video:${C.c2}`, true]], 'solo el pendiente, reutilizando su job');
+      eq(Object.keys(pv2.estimate.byItemType), ['video_interactions'], 'sin costo nuevo de Videogen');
+      assert(pv2.estimateHash !== pvC.estimateHash, 'huella nueva');
+      const before = await counts(C.cid);
+      const r2 = await runs.confirmVideoUpgrade(C.cid, ADMIN, 1, C.runId, pv2.estimateHash);
+      upC2 = r2.upgrade;
+      eq([r2.created, upC2.itemKeys], [true, [`video:${C.c2}`]], 'creado solo para ese video');
+      const after = await counts(C.cid);
+      eq([after.gens - before.gens, after.auths - before.auths], [2, 1], 'video + preguntas, aprobación nueva');
+      const job = await jobOf(C.runId);
+      eq([job.input_payload.videoModeOriginal, job.input_payload.videoUpgradeHistory.map((u) => u.id)], ['mock', [upC.id]], 'original e historial');
+      const v3 = await latest(C.runId, `video:${C.c2}`);
+      eq([v3.generation, v3.output_summary.external.videogenJobId], [3, 'vg_cancelled_job'], 'job reutilizado');
+      const vg = fakeVideogen();
+      const s = dbScheduler();
+      await itemWorker.processItem(deps(s, vg), await claim(C.runId, `video:${C.c2}`, C.c2));
+      eq([s.st.failed.length, s.st.completed.length, vg.st.submits], [0, 1, 0], `re-consulta el job, sin envío nuevo: ${JSON.stringify(s.st.failed)}`);
+      const vgCharges = (await chargesOf(C.runId)).filter((e) => e.provider === 'videogen' && e.event_kind === 'CHARGE' && e.metadata?.reservation !== true && e.metadata?.reservation !== 'true');
+      const byJob = {};
+      for (const e of await ds.query(`select external_operation_id from public.generation_cost_events where run_id = $1 and provider = 'videogen' and event_kind = 'CHARGE' and coalesce(metadata->>'reservation','false') <> 'true'`, [C.runId])) byJob[e.external_operation_id] = (byJob[e.external_operation_id] || 0) + 1;
+      assert(Object.values(byJob).every((n) => n === 1), `un cargo por job: ${JSON.stringify(byJob)}`);
+      assert(vgCharges.length === 2, `2 videos, 2 cargos en total: ${vgCharges.length}`);
+    });
+
+    await check('I-1 idempotencia POR UPGRADE: la huella del 1º devuelve el 1º; la del 2º devuelve el 2º; con el 2º en vuelo cualquier otra devuelve el 2º; nada escrito', async () => {
+      const before = await counts(C.cid);
+      const a = await runs.confirmVideoUpgrade(C.cid, ADMIN, 1, C.runId, pvC.estimateHash);
+      eq([a.created, a.upgrade.id], [false, upC.id], '1º');
+      const b = await runs.confirmVideoUpgrade(C.cid, ADMIN, 1, C.runId, upC2.estimateHash);
+      eq([b.created, b.upgrade.id], [false, upC2.id], '2º');
+      const c = await runs.confirmVideoUpgrade(C.cid, ADMIN, 1, C.runId, 'e'.repeat(64));
+      eq([c.created, c.upgrade.id], [false, upC2.id], 'en vuelo');
+      eq(await counts(C.cid), before, 'nada escrito');
+    });
+
+    await check('I-1 empaquetado: un video real del upgrade cuyas preguntas siguen siendo las de la vista previa (upgrade cancelado antes) se OMITE (pendiente), nunca un H5P con preguntas de otro video', async () => {
+      const PK = L('modules/dynamic-packaging/packaging-v3.js');
+      const mf = { items: [{ key: 'video:x', type: 'video', chapterId: 'x' }, { key: 'video_interactions:x', type: 'video_interactions', chapterId: 'x' }] };
+      const mk = (cascade) => new Map([
+        ['video:x', { itemKey: 'video:x', type: 'video', artifacts: [{ artifactId: 'a1', itemRunId: 'gen2' }], outputSummary: { mode: 'real', regeneration: { reason: 'video_upgrade' } } }],
+        ['video_interactions:x', { itemKey: 'video_interactions:x', type: 'video_interactions', artifacts: [{ artifactId: 'a2', itemRunId: 'i' }], outputSummary: cascade ? { regeneration: { reason: 'cascade_from_video', cascadeFromItemRunId: cascade } } : {} }],
+      ]);
+      const opts = { videoUpgrade: true, upgradedKeys: new Set(['video:x']), fallbackMode: 'mock' };
+      eq(PK.splitPendingVideosV3(mf, mk(null), 'real', opts).pendingVideos.map((p) => p.itemKey), ['video:x'], 'preguntas viejas → pendiente');
+      eq(PK.splitPendingVideosV3(mf, mk('gen2'), 'real', opts).pendingVideos, [], 'preguntas del video nuevo → se empaqueta');
     });
   } catch (err) {
     failures++;

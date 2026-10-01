@@ -12,9 +12,18 @@
  *  - Ruling 6: en un run con `videoMode:'real'`, un item video con `output_summary.mode:'mock'`
  *    solo es aceptable (como pendiente) si existe `videoUpgrade`; si no, es una inconsistencia y
  *    se falla fuerte (nunca se empaqueta en silencio ni se ofrece pagarlo otra vez).
- *  - Empaque degradado (§2.6): si un video del upgrade falla definitivamente, el run termina
- *    `failed`; igual se puede empaquetar con ese capítulo sin video (su generación completada
- *    vigente sigue siendo la de vista previa → pendiente).
+ *  - Empaque degradado (§2.6): si un video del upgrade falla definitivamente, o el usuario CANCELA
+ *    el run mientras se generan (fix round 1, I-1), el run termina `failed`/`cancelled`; igual se
+ *    puede empaquetar con ese capítulo sin video (su generación completada vigente sigue siendo la
+ *    de vista previa → pendiente). Reabrir el run NO vuelve a encolar esos videos pagos.
+ *  - Un SEGUNDO upgrade en el mismo run está permitido cuando el anterior ya no tiene nada en
+ *    vuelo y quedan videos pendientes (fallidos o cancelados): siempre con vista previa y aprobación
+ *    NUEVAS y solo para esos videos. La idempotencia es POR UPGRADE: una confirmación con la huella
+ *    de un upgrade ya registrado (vigente o del historial) devuelve ESE upgrade; mientras uno está en
+ *    vuelo, cualquier confirmación devuelve el que está en vuelo; y la huella incluye la generación
+ *    vigente de cada video, así que una pestaña vieja nunca crea un segundo upgrade (estimate_stale).
+ *    Un video cuyo intento cancelado ya tenía un render en Videogen REUTILIZA ese job (se vuelve a
+ *    consultar, no se vuelve a pagar) y no entra en el estimado.
  */
 import { createHash } from 'crypto';
 
@@ -25,6 +34,12 @@ export const VIDEO_MODE_INCONSISTENT = 'video_mode_inconsistent';
 export const VIDEO_UPGRADE_NOT_ALLOWED_RULES = 'video_upgrade_rules_version_unsupported';
 export const VIDEO_UPGRADE_RUN_NOT_READY = 'video_upgrade_run_not_ready';
 export const VIDEO_UPGRADE_NOTHING_PENDING = 'video_upgrade_nothing_pending';
+/** Un intento anterior quedó con un envío a Videogen ambiguo: resolverlo antes (nunca un envío nuevo a ciegas). */
+export const VIDEO_UPGRADE_AMBIGUOUS_SUBMISSION = 'video_upgrade_ambiguous_submission';
+/** Motivos de regeneración que escribe el upgrade (videos y sus interacciones). */
+export const VIDEO_UPGRADE_REASONS = [VIDEO_UPGRADE_REASON, VIDEO_UPGRADE_CASCADE_REASON];
+/** Estados de una generación EN VUELO. */
+export const VIDEO_UPGRADE_IN_FLIGHT_STATES = ['pending', 'running', 'retrying'];
 
 export interface VideoUpgradeRecord {
   id: string;
@@ -45,12 +60,40 @@ export interface VideoUpgradeRecord {
   authorizedRunBudget: string | null;
 }
 
-/** `input_payload.videoUpgrade` válido, o null. */
-export function videoUpgradeOf(inputPayload: any): VideoUpgradeRecord | null {
-  const u = inputPayload?.videoUpgrade;
+function asRecord(u: any): VideoUpgradeRecord | null {
   if (!u || typeof u !== 'object' || typeof u.id !== 'string' || !Array.isArray(u.itemKeys)) return null;
   return u as VideoUpgradeRecord;
 }
+
+/** `input_payload.videoUpgrade` (el ÚLTIMO upgrade) válido, o null. */
+export function videoUpgradeOf(inputPayload: any): VideoUpgradeRecord | null {
+  return asRecord(inputPayload?.videoUpgrade);
+}
+
+/** Todos los upgrades del run (historial + el último), del más viejo al más nuevo. */
+export function videoUpgradesOf(inputPayload: any): VideoUpgradeRecord[] {
+  const hist = Array.isArray(inputPayload?.videoUpgradeHistory) ? inputPayload.videoUpgradeHistory.map(asRecord).filter(Boolean) : [];
+  const last = videoUpgradeOf(inputPayload);
+  return last ? [...hist, last] : hist;
+}
+
+/** Keys de video de TODOS los upgrades del run. */
+export function upgradedVideoKeysOf(inputPayload: any): Set<string> {
+  return new Set(videoUpgradesOf(inputPayload).flatMap((u) => u.itemKeys));
+}
+
+/** Modo de video para items sin `output_summary.mode`: el ORIGINAL del run (antes de cualquier upgrade). */
+export function fallbackVideoModeOf(inputPayload: any): unknown {
+  return inputPayload?.videoModeOriginal ?? inputPayload?.videoMode;
+}
+
+/** ¿La generación es parte de un upgrade (video o sus interacciones)? */
+export function isUpgradeGeneration(outputSummary: any): boolean {
+  return VIDEO_UPGRADE_REASONS.includes(String(outputSummary?.regeneration?.reason ?? ''));
+}
+
+/** Estados finales de un run donde el §2.6 aplica. */
+export const UPGRADE_DEGRADED_RUN_STATES = ['failed', 'cancelled'];
 
 /** Huella del estimado del upgrade que vio el usuario (canónica, sha256). */
 export function videoUpgradeFingerprint(input: {
@@ -58,6 +101,8 @@ export function videoUpgradeFingerprint(input: {
   manifestId: number;
   pending: Array<{ itemKey: string; generation: number }>;
   interactions: Array<{ itemKey: string; generation: number }>;
+  /** Videos que reutilizan su job de Videogen (sin gasto nuevo); entra en la huella solo si hay. */
+  carried?: string[];
   modes: unknown;
   estimate: { estimatorVersion?: unknown; usageModelVersion?: unknown; pricingVersions?: unknown; totals: unknown };
   policyId: string | null;
@@ -74,6 +119,7 @@ export function videoUpgradeFingerprint(input: {
     manifestId: input.manifestId,
     pending: sortBy(input.pending),
     interactions: sortBy(input.interactions),
+    ...(input.carried && input.carried.length ? { carried: [...input.carried].sort() } : {}),
     modes: input.modes ?? null,
     estimatorVersion: input.estimate.estimatorVersion ?? null,
     usageModelVersion: input.estimate.usageModelVersion ?? null,
@@ -118,9 +164,9 @@ export function isUpgradeOnlyFailure(
 ): boolean {
   const up = videoUpgradeOf(run?.input_payload);
   if (!up) return false;
-  if (String(run?.worker_status ?? '') !== 'failed') return false;
+  if (!UPGRADE_DEGRADED_RUN_STATES.includes(String(run?.worker_status ?? ''))) return false;
   if (notCompletedLatest.length === 0) return false;
-  const upgraded = new Set(up.itemKeys);
+  const upgraded = upgradedVideoKeysOf(run?.input_payload);
   for (const r of notCompletedLatest) {
     if (!TERMINAL_NOT_DONE.has(String(r.status))) return false;
     const reg = r.output_summary?.regeneration ?? {};
@@ -137,7 +183,7 @@ type Q = { query: (sql: string, params?: any[]) => Promise<any> };
 
 /** §2.6 con la DB: filas vigentes no completadas + keys con alguna generación completed. */
 export async function runIsUpgradeOnlyFailure(q: Q, run: { id: string; worker_status?: string | null; status?: string | null; input_payload?: any }): Promise<boolean> {
-  if (!videoUpgradeOf(run?.input_payload) || String(run?.worker_status ?? '') !== 'failed') return false;
+  if (!videoUpgradeOf(run?.input_payload) || !UPGRADE_DEGRADED_RUN_STATES.includes(String(run?.worker_status ?? ''))) return false;
   const rows: any[] = await q.query(
     `select g.item_key, g.type, g.status, g.output_summary from public.generation_item_runs g
       where g.job_id = $1 and g.status <> 'completed'
