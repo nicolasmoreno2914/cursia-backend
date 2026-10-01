@@ -4374,8 +4374,17 @@ export class RunsService {
     const ready = await hasDeliverablePackage(q, job, manifest, this.logger);
     // BE-B: `packaging` mientras el paquete final se arma o el servidor lo reintenta solo; fallido sin
     // reintento automático → needs_attention + retry_package.
-    const pk = await loadAutoPackageState(q, job);
-    return evaluateRunCompletion(job, rows, m, { ready, status: pk.status, autoRetryPending: pk.autoRetryPending, auto: pk.eligible && autoPackageEnabled() }, { upgradeOnlyFailure, validationCutoffs });
+    const pk = await loadAutoPackageState(q, job, new Date(), process.env, manifest.rulesVersion);
+    // Fix round 1 (I1): un job final completado que ya no es el build vigente = `stale`; se re-arma solo si el
+    // estado lo declara pendiente (builder nuevo / re-completitud sin confirmar), si no queda una acción visible.
+    const stale = !ready && pk.status === 'completed';
+    return evaluateRunCompletion(job, rows, m, {
+      ready,
+      status: stale ? 'stale' : pk.status,
+      autoRetryPending: stale ? pk.rebuildPending : pk.autoRetryPending,
+      auto: pk.eligible && autoPackageEnabled(),
+      blocked: pk.blocked ? { code: pk.blocked.code, message: pk.blocked.message, missing: pk.blocked.missing } : null,
+    }, { upgradeOnlyFailure, validationCutoffs });
   }
 
   /**

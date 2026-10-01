@@ -179,6 +179,12 @@ export class PackagingService {
 
     // EV6 DoD BE-B: get-or-create SERIALIZADO por run (lock de transacción): el disparo automático, el
     // barrido y un pedido manual simultáneos nunca crean dos jobs para el mismo build.
+    // Fix round 1 (M3): la comparación de build (pesada, con su propia conexión) se calcula ANTES del lock;
+    // bajo el lock solo se usa si el último job sigue siendo el mismo (si no, se recalcula: caso raro).
+    const pre = await this.findLatestPackageJob(runId);
+    const preSame = pre && packageKindOf(pre) === packageKind && pre.worker_status === RUN_DONE_STATUS
+      ? { id: pre.id, same: await this.isSameBuild(run, manifest, pre) }
+      : null;
     const qr = this.dataSource.createQueryRunner();
     try {
       await qr.connect();
@@ -191,7 +197,7 @@ export class PackagingService {
         if (IN_PROGRESS_PACKAGE_STATUSES.includes(existing.worker_status)) {
           reuse = { jobId: existing.id, status: existing.worker_status, created: false, packageKind, deliverable };
         } else if (existing.worker_status === RUN_DONE_STATUS) {
-          const sameBuild = await this.isSameBuild(run, manifest, existing);
+          const sameBuild = preSame && preSame.id === existing.id ? preSame.same : await this.isSameBuild(run, manifest, existing);
           if (sameBuild) {
             reuse = { jobId: existing.id, status: existing.worker_status, created: false, packageKind, deliverable };
           } else {

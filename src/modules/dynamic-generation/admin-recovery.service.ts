@@ -55,6 +55,12 @@ export interface NeedsAttentionListing {
   needsAttention: NeedsAttentionEntry[];
   /** Cursos de VISTA PREVIA anteriores a la DoD (run `completed` que hoy se evalúa `preview`). */
   legacyPreview: Array<NeedsAttentionEntry & { legacyPreview: true; packageBuilt: boolean; packageDownloadable: boolean }>;
+  /**
+   * Fix round 1 (M7): runs con la generación COMPLETA sin paquete final vigente y fuera del empaque
+   * automático (completados antes de BE-B, o con el empaque automático apagado): `packageJob.status`
+   * none|stale. Acción: `retry_package` (POST …/package, idempotente).
+   */
+  manualPackage: NeedsAttentionEntry[];
   /** Ejecuciones que no se pudieron evaluar (integridad): solo ids y un código. */
   errors: Array<{ runId: string; courseId: number; code: string }>;
 }
@@ -108,6 +114,11 @@ export function endpointForAction(a: RunAdminAction, ids: { courseId: number; bl
       };
     case 'retry_package':
       return { method: 'POST', path: `${run}/package`, note: 'vuelve a armar el paquete final (idempotente con el empaque automático)' };
+    case 'resolve_package_block':
+      return {
+        method: 'POST', path: `${run}/package`,
+        note: `el paquete está bloqueado (${a.reason ?? 'precheck'}): resolver primero la causa (ver packageJob.blocked.message); después pedir el paquete`,
+      };
     default:
       return { method: 'POST', path: run, note: 'sin endpoint dedicado' };
   }
@@ -142,14 +153,16 @@ export class AdminRecoveryService {
         limit $1`,
       [limit],
     );
-    const out: NeedsAttentionListing = { generatedAt: new Date().toISOString(), scanned: runs.length, needsAttention: [], legacyPreview: [], errors: [] };
+    const out: NeedsAttentionListing = { generatedAt: new Date().toISOString(), scanned: runs.length, needsAttention: [], legacyPreview: [], manualPackage: [], errors: [] };
     for (const job of runs) {
       try {
         const bp = Number(job.blueprint_number);
         const manifest = await this.manifests.getById(Number(job.course_id), String(job.owner_id), bp, Number(job.manifest_id_num));
         const { completion, rows } = await this.runs.completionForAdmin(job, manifest);
         const legacy = completion.state === 'preview' && job.worker_status === 'completed';
-        if (completion.state !== 'needs_attention' && !legacy) continue;
+        const manual = completion.state === 'packaging' && !!completion.packageJob && !completion.packageJob.auto &&
+          ['none', 'stale'].includes(completion.packageJob.status);
+        if (completion.state !== 'needs_attention' && !legacy && !manual) continue;
         const ids = { courseId: Number(job.course_id), blueprintNumber: bp, runId: String(job.id) };
         const byKey = new Map<string, any>(rows.map((r: any) => [r.item_key, r]));
         const failed = completion.missingComponents
@@ -173,9 +186,18 @@ export class AdminRecoveryService {
           missingComponents: completion.missingComponents,
           previewComponents: completion.previewComponents,
           packageJob: completion.packageJob ?? null,
-          adminActions: completion.adminActions.map((a) => ({ ...a, endpoint: endpointForAction(a, ids) })),
+          adminActions: completion.adminActions.map((a) => {
+            const endpoint = endpointForAction(a, ids);
+            // Fix round 1 (I2): acción derivada de un bloqueo del paquete → se dice por qué.
+            if (a.reason && a.code !== 'resolve_package_block') endpoint.note = `${endpoint.note} — bloquea el paquete final (${a.reason}); al resolverlo el paquete se arma solo`;
+            return { ...a, endpoint };
+          }),
         };
         if (completion.state === 'needs_attention') out.needsAttention.push(entry);
+        if (manual) {
+          const a: RunAdminAction = { code: 'retry_package' };
+          out.manualPackage.push({ ...entry, adminActions: [{ ...a, endpoint: endpointForAction(a, ids) }] });
+        }
         if (legacy) {
           const [pkg] = await this.dataSource.query(
             `select count(*)::int as built,

@@ -31,7 +31,7 @@
 import { frozenProviderModesOf, providerKindOfItemType } from './provider-modes';
 import { fallbackVideoModeOf, questionsBelongToVideo } from './video-upgrade';
 import { v3ValidatedArtifactTypes } from '../course-shell/v3-validation';
-import { autoHealDecision, safeAutoRetryDecision } from './auto-heal';
+import { autoHealDecision, autoHealEnabled, safeAutoRetryDecision } from './auto-heal';
 import { BUDGET_EXCEEDED, PROVIDER_RECONCILIATION_REQUIRED } from '../finops/run-budget';
 
 export type RunCompletionState = 'in_progress' | 'packaging' | 'complete' | 'preview' | 'needs_attention' | 'cancelled';
@@ -49,12 +49,19 @@ export type RunAdminActionCode =
   | 'retry_item'
   | 'regenerate_item'
   | 'generate_real_videos'
-  /** BE-B: el paquete final automático falló (o no se pudo armar) y no queda reintento automático. */
-  | 'retry_package';
+  /** BE-B: el paquete final falló (build o error transitorio) y no queda reintento automático: reintentar puede funcionar. */
+  | 'retry_package'
+  /**
+   * BE-B fix round 1 (I2): el precheck del paquete lo bloquea por algo que no es de un componente concreto
+   * (p.ej. el dueño quedó fuera de la allow-list): resolver la causa (`reason`) y después pedir el paquete.
+   */
+  | 'resolve_package_block';
 
 export interface RunAdminAction {
   code: RunAdminActionCode;
   itemKey?: string;
+  /** BE-B fix round 1 (I2): código del bloqueo del paquete que originó esta acción (nunca texto técnico). */
+  reason?: string;
 }
 
 export interface RunCompletion {
@@ -77,7 +84,13 @@ export interface RunCompletion {
    * está cubierto por el empaque automático (completado desde BE-B y encendido); `false` = run anterior
    * (o empaque automático apagado): con `status:'none'` el paquete se pide a mano.
    */
-  packageJob?: { status: string; autoRetryPending: boolean; auto: boolean } | null;
+  packageJob?: {
+    status: string;
+    autoRetryPending: boolean;
+    auto: boolean;
+    /** Fix round 1 (I2): el precheck no dejó armar el paquete (código + mensaje para admin). */
+    blocked?: { code: string; message: string | null };
+  } | null;
 }
 
 /**
@@ -91,6 +104,28 @@ export interface CompletionPackageInfo {
   autoRetryPending?: boolean;
   /** El run está cubierto por el empaque automático. */
   auto?: boolean;
+  /** Fix round 1 (I2): bloqueo del precheck (código, mensaje para admin, faltantes `<itemKey>:<problema>`). */
+  blocked?: { code: string; message?: string | null; missing?: string[] } | null;
+}
+
+/**
+ * BE-B fix round 1 (I2): acciones de admin para un paquete BLOQUEADO por el precheck — la del componente
+ * que lo bloquea (nunca `retry_package`, que devolvería el mismo 409/403). Una vez resuelto el componente,
+ * el run se reabre y al volver a completarse el paquete se arma solo.
+ */
+export function packageBlockActions(
+  blocked: { code: string; missing?: string[] | null },
+  manifest: CompletionManifest,
+): RunAdminAction[] {
+  const missing = Array.isArray(blocked.missing) ? blocked.missing : [];
+  const out: RunAdminAction[] = [];
+  for (const it of manifest.items) {
+    if (!missing.some((m) => m === it.key || m.startsWith(`${it.key}:`))) continue;
+    const yt = it.type === 'video' && (blocked.code === 'youtube_delivery_incomplete' || missing.some((m) => m.startsWith(`${it.key}:`) && /youtube/.test(m)));
+    out.push({ code: yt ? 'resolve_youtube' : 'regenerate_item', itemKey: it.key, reason: blocked.code });
+  }
+  if (!out.length) out.push({ code: 'resolve_package_block', reason: blocked.code });
+  return out;
 }
 
 export interface CompletionJob {
@@ -399,12 +434,14 @@ export function adminActionFor(r: CompletionRow | undefined, cls: ItemCompletion
   if (r.status === 'cancelled') return null;
   // El auto-healer todavía lo va a reabrir (allow-list, dentro de su ventana): sin acción humana.
   const ahRow = { status: r.status, type: r.type, error: r.error ?? null, output_summary: s, finished_at: r.finished_at ?? null, updated_at: r.updated_at ?? null };
+  // Fix round 1 (M5): solo si el tick del auto-healer corre (si está apagado nadie lo va a reabrir).
+  const tickOn = autoHealEnabled(process.env);
   const d = autoHealDecision(ahRow, now);
-  if (d.heal === true || (d.heal === false && d.reason === 'backoff')) return null;
+  if (tickOn && (d.heal === true || (d.heal === false && d.reason === 'backoff'))) return null;
   // BE-B: rechazo definitivo SIN gasto (videogen_submit_rejected / gamma_submit_failed) con su ÚNICO
   // reintento automático todavía disponible: lo toma el servidor, sin acción humana.
   const sd = safeAutoRetryDecision(ahRow, now);
-  if (sd.heal === true || (sd.heal === false && sd.reason === 'backoff')) return null;
+  if (tickOn && (sd.heal === true || (sd.heal === false && sd.reason === 'backoff'))) return null;
   if (err.includes(PROVIDER_RECONCILIATION_REQUIRED)) {
     return { code: r.type === 'video' ? 'reconcile_videogen' : 'reconcile_provider', itemKey: key };
   }
@@ -475,10 +512,18 @@ export function evaluateRunCompletion(
   else if (generationComplete) {
     // BE-B: `packaging` mientras el paquete final se arma (o el servidor lo va a armar/reintentar solo);
     // un paquete que falló sin reintento automático pendiente → recuperación de admin (`retry_package`).
+    // Fix round 1 (I1/I2): nunca `packaging` sin un job activo, un (re)intento automático pendiente o una
+    // acción visible: run cubierto por el empaque automático sin nada pendiente → needs_attention.
     const st = pkg?.status ?? null;
-    const failed = !packageReady && st === 'failed' && !pkg?.autoRetryPending;
+    const pending = !!pkg?.autoRetryPending;
     if (packageReady) state = 'complete';
-    else if (failed) {
+    else if (pkg?.blocked) {
+      state = 'needs_attention';
+      for (const a of packageBlockActions(pkg.blocked, manifest)) push(a);
+    } else if (st === 'failed' && !pending) {
+      state = 'needs_attention';
+      push({ code: 'retry_package' });
+    } else if ((st === 'none' || st === 'stale') && !pending && pkg?.auto) {
       state = 'needs_attention';
       push({ code: 'retry_package' });
     } else state = 'packaging';
@@ -497,7 +542,12 @@ export function evaluateRunCompletion(
     previewComponents,
     adminActions: actions,
     ...(generationComplete && pkg && pkg.status !== undefined
-      ? { packageJob: { status: packageReady ? 'completed' : String(pkg.status ?? 'none'), autoRetryPending: !!pkg.autoRetryPending, auto: !!pkg.auto } }
+      ? { packageJob: {
+          status: packageReady ? 'completed' : String(pkg.status ?? 'none'),
+          autoRetryPending: !packageReady && !!pkg.autoRetryPending,
+          auto: !!pkg.auto,
+          ...(pkg.blocked && !packageReady ? { blocked: { code: pkg.blocked.code, message: pkg.blocked.message ?? null } } : {}),
+        } }
       : {}),
   };
 }

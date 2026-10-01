@@ -19,7 +19,7 @@ import {
 } from '@nestjs/common';
 import { Request } from 'express';
 import { AuthUser } from './auth.types';
-import { superAdminEmails } from './super-admin';
+import { isSuperAdminEmail, superAdminEmails } from './super-admin';
 
 @Injectable()
 export class SuperAdminGuard implements CanActivate {
@@ -38,7 +38,8 @@ export class SuperAdminGuard implements CanActivate {
       throw new ForbiddenException('Panel de administración no configurado');
     }
 
-    if (!allowedEmails.includes(user.email.toLowerCase())) {
+    // BE-B fix round 1 (M6): EXACTAMENTE el mismo chequeo que /features (superAdmin) y los servicios.
+    if (!isSuperAdminEmail(user.email)) {
       throw new ForbiddenException('No tienes permisos de administrador');
     }
 
