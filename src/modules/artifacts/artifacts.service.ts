@@ -468,7 +468,14 @@ export class ArtifactsService {
     await qr.connect();
     try {
       await qr.startTransaction();
-      [row] = await qr.query(`select * from public.artifacts where id = $1 and owner_id = $2 for update`, [id, ownerId]);
+      // DoD follow-up fix round 1 (m3): un SUPER_ADMIN (allowAdminOnlyPackage) borra un .mbz QA / degradado
+      // NUEVO de CUALQUIER dueño (son suyos de administrar); cualquier otro artifact sigue siendo del dueño.
+      [row] = opts.allowAdminOnlyPackage
+        ? await qr.query(
+          `select * from public.artifacts
+            where id = $1 and (owner_id = $2 or (type = 'dynamic_mbz' and metadata->>'packageKind' in ('qa_preview', 'degraded')))
+            for update`, [id, ownerId])
+        : await qr.query(`select * from public.artifacts where id = $1 and owner_id = $2 for update`, [id, ownerId]);
       if (!row) throw new NotFoundException(`Artifact ${id} not found`);
       // DoD follow-up (R4): un .mbz QA / degradado NUEVO es solo de SUPER_ADMIN; para el dueño no existe
       // (mismo 404 que GET /artifacts/:id) — nunca se borra la fila ni el objeto `qa-internal/`.

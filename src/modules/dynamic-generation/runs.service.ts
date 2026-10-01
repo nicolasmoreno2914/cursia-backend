@@ -1699,9 +1699,15 @@ export class RunsService {
           if (r.type === 'presentation') return !r.output_summary?.external?.gammaGenerationId;
           return true;
         };
+        // DoD follow-up fix round 1 (m1): los items pagos que ESTE reintento desbloquea (dependentsToUnblock,
+        // la misma función que hace el desbloqueo bajo lock): solo esas filas salen de `blocked`. Antes se
+        // contaba cualquier item pago bloqueado del run, y un reintento gratis podía pedir aprobación de admin.
+        const unblockIds = new Set(this.dependentsToUnblock(
+          preRows.map((r) => ({ id: r.id, item_key: r.item_key, status: r.status as ItemRunStatus, depends_on: r.depends_on ?? [] })), itemKey,
+        ).map(String));
         const paidItems = isPaid(preTarget)
           ? (newPaid(preTarget, resubmitVideo || resubmitProvider) ? [preTarget] : [])
-          : preRows.filter((r) => r.status === 'blocked' && isPaid(r) && newPaid(r, false));
+          : preRows.filter((r) => unblockIds.has(String(r.id)) && r.status === 'blocked' && isPaid(r) && newPaid(r, false));
         // EV6 DoD (R5) + fix round 1 (C2): solo un reintento que vuelve a RENDERIZAR un video que ya
         // intentó un render pagado (reenvío explícito, render fallido/rechazado/ambiguo) es recuperación
         // de admin. Un video que nunca se envió (p.ej. bloqueado por una dependencia o por presupuesto)
@@ -1714,9 +1720,6 @@ export class RunsService {
         if (!auto && this.videoModeOf(job) === 'real' && !isSuperAdminEmail(actor?.email)) {
           const reRender = (r: { type: string; error: string | null; output_summary: Record<string, any> | null }) =>
             r.type === 'video' && !r.output_summary?.external?.videogenJobId && videoRenderWasAttempted(r);
-          const unblockIds = new Set(this.dependentsToUnblock(
-            preRows.map((r) => ({ id: r.id, item_key: r.item_key, status: r.status as ItemRunStatus, depends_on: r.depends_on ?? [] })), itemKey,
-          ).map(String));
           if (resubmitVideo || reRender(preTarget) || preRows.some((r) => unblockIds.has(String(r.id)) && reRender(r))) {
             throw adminRecoveryForbidden('Volver a generar un video (con costo)');
           }

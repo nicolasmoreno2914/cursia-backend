@@ -34,8 +34,8 @@ function loadEnvFile(envPath) {
 //   - storage.objects no tiene ROW LEVEL SECURITY;
 //   - alguna política PERMISIVA de un rol que no es de servicio (anon, authenticated, public, …) que
 //     pueda aplicar al bucket (lo nombra o no restringe el bucket) no exige la carpeta propia
-//     (`(storage.foldername(name))[1] = auth.uid()`) en TODAS sus expresiones, o usa OR (no se puede
-//     probar que la restricción aplique siempre → se trata como que puede coincidir: falla cerrada).
+//     (`(storage.foldername(name))[1] = auth.uid()`) en TODAS sus expresiones, o usa OR o una negación
+//     (NOT / IS NOT / <> / !=): no se puede probar que excluya qa-internal/ → falla cerrada.
 //
 // Nunca escribe: todo corre dentro de `BEGIN … READ ONLY` y solo emite SELECT. Solo STAGING:
 // MIGRATION_ENV=staging obligatorio y nunca contra el proyecto de producción (lo cablea deploy-staging.yml;
@@ -86,6 +86,8 @@ function rolesOf(v) {
 
 const OWN_FOLDER_RE = /\(\s*storage\.foldername\(\s*name\s*\)\s*\)\s*\[\s*1\s*\]\s*=\s*\(*\s*(?:select\s+)?auth\.uid\(\)/i;
 const OR_RE = /\bor\b/i;
+/** Fix round 1 (m4): cualquier negación (`NOT`, `IS NOT`, `<>`, `!=`) invierte lo que el regex reconoce. */
+const NEG_RE = /\bnot\b|<>|!=/i;
 
 /** Buckets nombrados en una expresión (`bucket_id = 'x'::text`). */
 function bucketsNamed(expr) {
@@ -114,8 +116,11 @@ function policyRisk(p, bucket = DEFAULT_BUCKET) {
   }
   for (const e of exprs) {
     if (e == null || !e.trim()) return `sin expresión (${cmd}) para ${clientRoles.join(',')}: coincide con cualquier objeto`;
+    // Fix round 1 (m4): falla cerrada — con una negación no se puede probar (con un regex) que la expresión
+    // excluya qa-internal/ (p.ej. `NOT (bucket_id = 'otro')` o `NOT (foldername(name)[1] = auth.uid())`).
+    if (NEG_RE.test(e)) return `usa una negación (NOT / <> / !=) en ${cmd} para ${clientRoles.join(',')}: no se puede probar que excluya qa-internal/`;
     const named = bucketsNamed(e);
-    // Una expresión sin OR que solo nombra OTROS buckets no aplica a este.
+    // Una expresión sin OR ni negación que solo nombra OTROS buckets (conjunción positiva) no aplica a este.
     if (!OR_RE.test(e) && named.length && !named.includes(bucket)) continue;
     if (OR_RE.test(e)) return `usa OR (${cmd}) para ${clientRoles.join(',')}: no se puede probar que exija la carpeta propia`;
     if (!OWN_FOLDER_RE.test(e)) return `no exige la carpeta propia (foldername(name)[1] = auth.uid()) en ${cmd} para ${clientRoles.join(',')}`;
