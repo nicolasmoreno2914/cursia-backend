@@ -581,7 +581,8 @@ async function dbChecks() {
     await check('DB estructura: PATCH de settings (finalExam/activityEngine) con concurrencia optimista; vacío → 400; ajeno → 404', async () => {
       const c0 = await counter();
       const res = await structure.updateSettings(cid, OWNER, { finalExam: false, activityEngine: 'scorm', expectedCounter: c0 });
-      eq(res, { structureVersionCounter: c0 + 1, finalExam: false, activityEngine: 'scorm' }, 'respuesta');
+      // EV6 H5P v2: la respuesta incluye reviewCardsEnabled (sin la migración EV6 la columna no existe → false).
+      eq(res, { structureVersionCounter: c0 + 1, finalExam: false, activityEngine: 'scorm', reviewCardsEnabled: false }, 'respuesta');
       const s = await structure.getStructure(cid, OWNER);
       eq([s.finalExam, s.activityEngine], [false, 'scorm'], 'GET');
       await rejectsRe(structure.updateSettings(cid, OWNER, { finalExam: true, expectedCounter: c0 }), /expectedCounter desactualizado/, 'counter viejo', 409);
@@ -672,6 +673,34 @@ async function dbChecks() {
       eq(a.warnings.map((w) => w.code), ['WEIGHTS_FINAL_EXAM_MISMATCH'], 'warnings');
       const st = await structure.getStructure(cid, OWNER);
       eq(st.liveMatchesCurrentBlueprint, false, 'toggle de curso sí cambia la estructura vs. el Blueprint v2');
+    });
+    await check('DB EV6 H5P v2: «Repaso» — PATCH sin migración → 503; migración idempotente: cursos existentes NULL (apagado, snapshot sin cambios), cursos nuevos true; PATCH + lock v2 con reviewCards', async () => {
+      process.env.DYNAMIC_MANIFEST_RULES_VERSION = '3';
+      try {
+        await rejectsRe(structure.updateSettings(cid, OWNER, { reviewCardsEnabled: true, expectedCounter: await counter() }), /schema_not_migrated_ev6_h5p2/, 'sin migración', 503);
+        const sql = fs.readFileSync(path.join(REPO, 'supabase-migration-ev6-h5p2.sql'), 'utf8');
+        await withClient(DB, async (c) => { await c.query(sql); await c.query(sql); });
+        const [{ review_cards_enabled: existing }] = await ds.query(`select review_cards_enabled from public.courses where id = $1`, [cid]);
+        eq(existing, null, 'curso existente → NULL');
+        const [nc] = await ds.query(`insert into public.courses (owner_id, title, structure_version) values ($1, 'Curso EV6 nuevo', 'dynamic') returning id, review_cards_enabled`, [OWNER]);
+        eq(nc.review_cards_enabled, true, 'curso nuevo → true (default solo para filas nuevas)');
+        const st0 = await structure.getStructure(cid, OWNER);
+        eq(st0.reviewCardsEnabled, false, 'GET: NULL = apagado');
+        const re = await blueprints.lock(cid, OWNER, await counter());
+        assert(!('reviewCards' in re.blueprint.snapshot.course), 'NULL no entra al snapshot');
+        const r = await structure.updateSettings(cid, OWNER, { reviewCardsEnabled: true, expectedCounter: await counter() });
+        eq(r.reviewCardsEnabled, true, 'PATCH');
+        const st1 = await structure.getStructure(cid, OWNER);
+        eq([st1.reviewCardsEnabled, st1.liveMatchesCurrentBlueprint], [true, false], 'GET encendido; la estructura viva ya no coincide con el Blueprint');
+        const lk = await blueprints.lock(cid, OWNER, await counter());
+        eq([lk.created, lk.blueprint.snapshot.course.reviewCards], [true, true], 'lock v2 con reviewCards');
+        eq((await structure.getStructure(cid, OWNER)).liveMatchesCurrentBlueprint, true, 'coincide tras el lock');
+        await structure.updateSettings(cid, OWNER, { reviewCardsEnabled: false, expectedCounter: await counter() });
+        const lk2 = await blueprints.lock(cid, OWNER, await counter());
+        assert(!('reviewCards' in lk2.blueprint.snapshot.course), 'false no entra al snapshot');
+      } finally {
+        process.env.DYNAMIC_MANIFEST_RULES_VERSION = '3';
+      }
     });
     await check('DB perfiles: escritura con owner fuera de la allow-list V2 → 403', async () => {
       process.env.DYNAMIC_V2_ALLOWED_OWNERS = OTHER;

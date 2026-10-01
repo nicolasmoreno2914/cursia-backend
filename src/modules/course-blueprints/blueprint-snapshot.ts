@@ -333,6 +333,11 @@ export interface BlueprintCourseInputV2 {
   title: string;
   finalExam: boolean;
   activityEngine: ActivityEngine;
+  /**
+   * EV6 H5P v2: ajuste «Repaso» (Dialog Cards opcional por capítulo). courses.review_cards_enabled:
+   * NULL en cursos anteriores (= apagado), default true en cursos nuevos. Solo `true` entra al snapshot.
+   */
+  reviewCards?: boolean | null;
 }
 
 export interface BlueprintChapterV2 extends BlueprintChapter {
@@ -360,6 +365,11 @@ export interface BlueprintSnapshotV2 {
     structureVersion: 'dynamic';
     finalExam: boolean;
     activityEngine: ActivityEngine;
+    /**
+     * EV6 H5P v2: «Repaso» con Dialog Cards en los capítulos cuya experiencia trae ≥ 4 tarjetas.
+     * La clave existe SOLO cuando está encendido: los snapshots sin ella conservan su sha.
+     */
+    reviewCards?: true;
   };
   modules: BlueprintModuleV2[];
 }
@@ -402,6 +412,9 @@ export function buildBlueprintSnapshotV2(
       `BLUEPRINT_V2_INVALID_INPUT: course.activityEngine debe ser 'h5p' o 'scorm' (fue ${JSON.stringify(course.activityEngine)})`,
     );
   }
+  if (course.reviewCards !== undefined && course.reviewCards !== null && typeof course.reviewCards !== 'boolean') {
+    throw new Error(`BLUEPRINT_V2_INVALID_INPUT: course.reviewCards debe ser boolean o null (fue ${JSON.stringify(course.reviewCards)})`);
+  }
   const badChapter = chapters.find((c) => typeof c.activity_enabled !== 'boolean');
   if (badChapter) {
     throw new Error(
@@ -434,6 +447,7 @@ export function buildBlueprintSnapshotV2(
       structureVersion: 'dynamic',
       finalExam: course.finalExam,
       activityEngine: course.activityEngine,
+      ...(course.reviewCards === true ? { reviewCards: true as const } : {}),
     },
     modules: sortedModules.map((m) => {
       const moduleChapters = [...(chaptersByModule.get(m.id) ?? [])].sort(
@@ -492,7 +506,13 @@ export function recanonicalizeBlueprintSnapshotV2(stored: any): BlueprintSnapsho
     }
   }
   return buildBlueprintSnapshotV2(
-    { id: s.course.id, title: s.course.title, finalExam: s.course.finalExam, activityEngine: s.course.activityEngine },
+    {
+      id: s.course.id,
+      title: s.course.title,
+      finalExam: s.course.finalExam,
+      activityEngine: s.course.activityEngine,
+      ...(s.course.reviewCards !== undefined ? { reviewCards: s.course.reviewCards } : {}),
+    },
     modules,
     chapters,
   );
@@ -568,6 +588,9 @@ export function validateBlueprintInputV2(
       code: 'INVALID_ACTIVITY_ENGINE',
       message: `course.activityEngine inválido: ${JSON.stringify(course.activityEngine)} (permitidos: h5p, scorm)`,
     });
+  }
+  if (course.reviewCards !== undefined && course.reviewCards !== null && typeof course.reviewCards !== 'boolean') {
+    errors.push({ path: 'course.reviewCards', code: 'INVALID_REVIEW_CARDS', message: 'course.reviewCards debe ser boolean o null' });
   }
   chapters.forEach((c, idx) => {
     if (typeof c.activity_enabled !== 'boolean') {

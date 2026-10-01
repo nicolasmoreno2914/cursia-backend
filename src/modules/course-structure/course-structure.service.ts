@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException, NotFoundException, ConflictException, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, BadRequestException, NotFoundException, ConflictException, Logger, OnModuleInit, ServiceUnavailableException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
 import { CourseModule as CourseModuleEntity } from './entities/course-module.entity';
@@ -205,6 +205,7 @@ export class CourseStructureService implements OnModuleInit {
     const rows = await exec.query(
       `select c.id, c.title, c.structure_version, c.structure_version_counter,
               c.final_exam_enabled, c.activity_engine,
+              (to_jsonb(c) ->> 'review_cards_enabled')::boolean as review_cards_enabled,
               b.id as bp_id, b.blueprint_number as bp_number, b.locked_at as bp_locked_at,
               b.snapshot_sha256 as bp_sha256, b.schema_version as bp_schema_version,
               coalesce((
@@ -234,9 +235,11 @@ export class CourseStructureService implements OnModuleInit {
           `activity_engine=${JSON.stringify(row.activity_engine)})`,
       );
     }
-    const settings: { finalExam: boolean; activityEngine: 'h5p' | 'scorm' } = {
+    const settings: { finalExam: boolean; activityEngine: 'h5p' | 'scorm'; reviewCardsEnabled: boolean } = {
       finalExam: row.final_exam_enabled,
       activityEngine: row.activity_engine,
+      // EV6 H5P v2: NULL (curso anterior o columna sin migrar) = apagado.
+      reviewCardsEnabled: row.review_cards_enabled === true,
     };
     const rawModules: any[] = typeof row.modules === 'string' ? JSON.parse(row.modules) : row.modules || [];
     const activityByChapter = new Map<string, boolean>();
@@ -285,6 +288,7 @@ export class CourseStructureService implements OnModuleInit {
       structureVersionCounter: counter,
       finalExam: settings.finalExam,
       activityEngine: settings.activityEngine,
+      reviewCardsEnabled: settings.reviewCardsEnabled,
       modules: modules.map((m) => ({
         id: m.id,
         position: m.position,
@@ -322,7 +326,7 @@ export class CourseStructureService implements OnModuleInit {
     course: { id: number; title: string },
     modules: CourseModuleEntity[],
     currentBlueprint: { sha256: string; schemaVersion?: number } | null,
-    settings?: { finalExam: boolean; activityEngine: 'h5p' | 'scorm' },
+    settings?: { finalExam: boolean; activityEngine: 'h5p' | 'scorm'; reviewCardsEnabled?: boolean },
     activityByChapter?: Map<string, boolean>,
   ): boolean {
     if (!currentBlueprint) return false;
@@ -347,7 +351,7 @@ export class CourseStructureService implements OnModuleInit {
           })),
         );
         const snapshotV2 = buildBlueprintSnapshotV2(
-          { id: course.id, title: course.title, finalExam: settings.finalExam, activityEngine: settings.activityEngine },
+          { id: course.id, title: course.title, finalExam: settings.finalExam, activityEngine: settings.activityEngine, reviewCards: settings.reviewCardsEnabled === true },
           rawModulesV2,
           rawChaptersV2,
         );
@@ -395,8 +399,21 @@ export class CourseStructureService implements OnModuleInit {
   async updateSettings(courseId: number, ownerId: string, dto: UpdateStructureSettingsDto) {
     assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     await assertV21StructureSchema(this.dataSource); // V2.1 fix round 1 (I5): 503 si falta la migración R3
-    if (dto.finalExam === undefined && dto.activityEngine === undefined) {
-      throw new BadRequestException('Nada para actualizar: enviá "finalExam" y/o "activityEngine".');
+    if (dto.finalExam === undefined && dto.activityEngine === undefined && dto.reviewCardsEnabled === undefined) {
+      throw new BadRequestException('Nada para actualizar: enviá "finalExam", "activityEngine" y/o "reviewCardsEnabled".');
+    }
+    if (dto.reviewCardsEnabled !== undefined) {
+      // EV6 H5P v2: la columna la agrega supabase-migration-ev6-h5p2.sql; sin ella → 503 explícito.
+      const [col] = await this.dataSource.query(
+        `select 1 from information_schema.columns
+          where table_schema = 'public' and table_name = 'courses' and column_name = 'review_cards_enabled'`,
+      );
+      if (!col) {
+        throw new ServiceUnavailableException({
+          code: 'schema_not_migrated_ev6_h5p2',
+          message: 'schema_not_migrated_ev6_h5p2: falta courses.review_cards_enabled (supabase-migration-ev6-h5p2.sql); correr la migración antes de cambiar «Repaso».',
+        });
+      }
     }
     const queryRunner = this.dataSource.createQueryRunner();
     try {
@@ -409,13 +426,15 @@ export class CourseStructureService implements OnModuleInit {
       let i = 1;
       if (dto.finalExam !== undefined) { sets.push(`final_exam_enabled = $${i++}`); params.push(dto.finalExam); }
       if (dto.activityEngine !== undefined) { sets.push(`activity_engine = $${i++}`); params.push(dto.activityEngine); }
+      if (dto.reviewCardsEnabled !== undefined) { sets.push(`review_cards_enabled = $${i++}`); params.push(dto.reviewCardsEnabled); }
       params.push(courseId);
       // R16: toggles + counter + relectura en UNA sentencia (antes UPDATE, bump y select aparte).
       const rows = returningRows(await queryRunner.query(
         `update public.courses
             set ${sets.join(', ')}, structure_version_counter = structure_version_counter + 1
           where id = $${i}
-          returning structure_version_counter, final_exam_enabled, activity_engine`,
+          returning structure_version_counter, final_exam_enabled, activity_engine,
+                    (to_jsonb(courses) ->> 'review_cards_enabled')::boolean as review_cards_enabled`,
         params,
       ));
       const row = rows[0];
@@ -427,9 +446,10 @@ export class CourseStructureService implements OnModuleInit {
             `activity_engine=${JSON.stringify(row.activity_engine)})`,
         );
       }
-      const settings: { finalExam: boolean; activityEngine: 'h5p' | 'scorm' } = {
+      const settings: { finalExam: boolean; activityEngine: 'h5p' | 'scorm'; reviewCardsEnabled: boolean } = {
         finalExam: row.final_exam_enabled,
         activityEngine: row.activity_engine,
+        reviewCardsEnabled: row.review_cards_enabled === true,
       };
       await queryRunner.commitTransaction();
       return { structureVersionCounter: newCounter, ...settings };

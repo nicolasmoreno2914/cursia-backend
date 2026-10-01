@@ -14,6 +14,11 @@ export class UpdateStructureSettingsDto {
   @IsOptional()
   activityEngine?: 'h5p' | 'scorm';
 
+  /** EV6 H5P v2: «Repaso» con Dialog Cards (courses.review_cards_enabled). */
+  @IsBoolean()
+  @IsOptional()
+  reviewCardsEnabled?: boolean;
+
   @IsInt()
   @Min(0)
   expectedCounter: number;
