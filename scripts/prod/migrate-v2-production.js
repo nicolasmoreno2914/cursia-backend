@@ -142,6 +142,16 @@ const MIGRATION_STEPS = [
     summary: 'V2.1 RF-b: ENABLE ROW LEVEL SECURITY + REVOKE ALL (anon, authenticated) en FinOps y course_profiles',
   },
   {
+    // EV6 H5P v2 (H2): ajuste «Repaso» del Blueprint v2. Preparación (ruling H2 fix round 1):
+    // columna nullable con default FALSE — aplicarla nunca enciende «Repaso»; solo los cursos
+    // nuevos creados con DYNAMIC_ACTIVITY_TYPE_RULES=2 lo traen encendido. El código tolera su
+    // ausencia (lee NULL) salvo el PATCH del ajuste, que responde 503 sin la columna.
+    id: 'ev6-h5p2',
+    file: 'supabase-migration-ev6-h5p2.sql',
+    stagingStep: '4d4 (migrate-ev6-h5p2.js)',
+    summary: 'EV6 H5P v2: courses.review_cards_enabled (nullable, default false; NULL en cursos existentes)',
+  },
+  {
     // Decisión: SÍ se necesita en producción. El ejecutor dynamic de V2 (y el
     // artifactUpload legacy de 39-brandkit/41-course-setup) sube a
     // cursia-artifacts DESDE EL NAVEGADOR con el JWT del usuario; el

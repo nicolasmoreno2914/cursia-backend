@@ -126,17 +126,28 @@ function chapterIdOfItem(item: ActivityTypeItemLike): string {
  * Un `h5pType` fuera de la rotación calificada lanza (integridad rota: nunca
  * se cae en silencio al hash).
  */
-export function resolveActivityType(item: ActivityTypeItemLike | null | undefined): H5pActivityType | null {
-  return resolveActivityTypeWithSource(item)?.type ?? null;
+export function resolveActivityType(
+  item: ActivityTypeItemLike | null | undefined,
+  opts?: { activityTypeRules?: number | null },
+): H5pActivityTypeV2 | null {
+  return resolveActivityTypeWithSource(item, opts)?.type ?? null;
 }
 
+/**
+ * EV6 H5P v2: `opts.activityTypeRules` = marcador del Manifest del item. Solo con 2 se acepta
+ * `h5pType: 'branchingscenario'`; con cualquier otro (o sin opts) lanza como siempre.
+ */
 export function resolveActivityTypeWithSource(
   item: ActivityTypeItemLike | null | undefined,
-): { type: H5pActivityType; source: ActivityTypeSource } | null {
+  opts?: { activityTypeRules?: number | null },
+): { type: H5pActivityTypeV2; source: ActivityTypeSource } | null {
   if (!item) return null;
   const type = item.type ?? (typeof item.key === 'string' ? item.key.slice(0, Math.max(0, item.key.indexOf(':'))) : undefined);
   if (type !== 'activity' || item.variant !== 'h5p') return null;
   if (item.h5pType !== undefined && item.h5pType !== null) {
+    if (opts?.activityTypeRules === ACTIVITY_TYPE_RULES_H5P_V2 && (H5P_ACTIVITY_TYPES_RULES2_ONLY as readonly string[]).includes(item.h5pType)) {
+      return { type: item.h5pType as H5pActivityTypeV2, source: 'manifest' };
+    }
     if (!(ACTIVITY_H5P_ROTATION as readonly string[]).includes(item.h5pType)) {
       throw new Error(`ACTIVITY_TYPE_INVALID_MANIFEST: h5pType ${JSON.stringify(item.h5pType)} de ${item.key ?? 'activity'} no es un tipo calificado`);
     }

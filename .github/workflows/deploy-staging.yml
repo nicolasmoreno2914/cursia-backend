@@ -501,6 +501,12 @@ jobs:
                echo "━━━ [4d3] V2.1 R3: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-v21-blueprint-profiles-schema.js
 
+               echo "━━━ [4d4] EV6 H5P v2: ajuste «Repaso» del Blueprint (courses.review_cards_enabled) — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-ev6-h5p2.js
+
+               echo "━━━ [4d5] EV6 H5P v2: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-ev6-h5p2-schema.js
+
                echo "━━━ [4e] Generation Manifests: migración (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-generation-manifests.js
 

@@ -15,6 +15,11 @@
 // contra validateExamBank de B2 antes de salir). Las ramas GIFT de abajo siguen para los cursos
 // que corren con el modo banco apagado (E2, E4).
 //
+// EV6 H5P v2 (H4): con `h5p2` (fixtures del frontend H3, fixtures/h5p2/fake-llm-h5p2.json) responde
+// el CASO RAMIFICADO (primera respuesta con BS_FORWARD_ONLY → reintento dirigido → válida) y, en el
+// prompt v2 de video_interactions («PAUSAS PARA PENSAR (fijas»), agrega `reflections` (una por línea
+// «- reflexión index N:»).
+//
 // Los textos de intros y experiencia NO llevan dígitos ni marcadores con UUID
 // (las reglas v3 los prohíben): la identidad por UUID se verifica por el
 // idnumber cv3:… del paquete y por los artifacts de cada item run.
@@ -162,7 +167,7 @@ function giftBlocks(prefix, from, split, typesOnly) {
 
 // examBankContract: módulo compilado course-shell/exam-bank.js (validateExamBank) para validar las
 // respuestas de banco ANTES de devolverlas (A1 de P2-B6).
-function createLlmV3({ base, chapterIdFromText, examBankContract }) {
+function createLlmV3({ base, chapterIdFromText, examBankContract, h5p2 }) {
   const st = base.st;
   st.v3calls = st.v3calls || [];
   st.invalidSent = st.invalidSent || {}; // kind → número de respuestas inválidas enviadas
@@ -200,8 +205,32 @@ function createLlmV3({ base, chapterIdFromText, examBankContract }) {
         const indices = [...prompt.matchAll(/^- index (\d+) \(segundo/gm)].map((m) => Number(m[1]));
         if (retry) st.retriesSeen.video_interactions = (st.retriesSeen.video_interactions || 0) + 1;
         const bad = !retry && once('video_interactions');
-        rec('video_interactions', id, { invalid: bad, retry, checkpoints: indices.length });
-        return J(bad ? INVALID.video_interactions(indices) : interactions(indices));
+        // EV6 IV avanzado (v2): una reflexión por cada pausa planificada que trae el prompt.
+        const v2 = !!(h5p2 && prompt.indexOf(h5p2.markers.videoInteractionsV2Prompt) >= 0);
+        const reflIdx = v2 ? [...prompt.matchAll(new RegExp(h5p2.markers.reflectionLineRegex, 'gm'))].map((m) => Number(m[1])) : [];
+        rec(v2 ? 'video_interactions_v2' : 'video_interactions', id, { invalid: bad, retry, checkpoints: indices.length, reflections: reflIdx.length });
+        const doc = bad ? INVALID.video_interactions(indices) : interactions(indices);
+        if (v2 && reflIdx.length) {
+          const R = h5p2.videoInteractionsV2.reflections;
+          doc.reflections = reflIdx.map((index, i) => ({ index, ...R[i % R.length] }));
+        }
+        return J(doc);
+      }
+      // EV6 H5P v2: caso ramificado (marcador del prompt de H3). Inválido UNA vez (BS_FORWARD_ONLY).
+      if (h5p2 && prompt.indexOf(h5p2.markers.branchingScenarioPrompt) >= 0) {
+        const id = chapterFromContent(prompt);
+        const k = 'h5p_branchingscenario';
+        if (retry) st.retriesSeen[k] = (st.retriesSeen[k] || 0) + 1;
+        const bad = !retry && once(k);
+        rec(k, id, { invalid: bad, retry });
+        const doc = JSON.parse(JSON.stringify(h5p2.branchingScenario.valid));
+        if (bad) {
+          const { path: pth, value } = h5p2.branchingScenario.invalidForwardOnly.patch;
+          let o = doc;
+          for (const seg of pth.slice(0, -1)) o = o[seg];
+          o[pth[pth.length - 1]] = value;
+        }
+        return J(doc);
       }
       const h5pType = prompt.indexOf('Genera un CUESTIONARIO de comprensión') >= 0 ? 'questionset'
         : prompt.indexOf('Genera un ejercicio de ARRASTRAR PALABRAS') >= 0 ? 'dragtext'

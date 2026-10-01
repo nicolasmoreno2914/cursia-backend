@@ -59,6 +59,8 @@ const req = (p) => require(path.join(BUILD, p));
     'supabase-migration-v21-finops.sql',
     // V2.1 RF-b fix C2: RLS + REVOKE de anon/authenticated (FinOps + course_profiles).
     'supabase-migration-v21-finops-rls.sql',
+    // EV6 H5P v2 (H2): courses.review_cards_enabled (ajuste «Repaso» del Blueprint).
+    'supabase-migration-ev6-h5p2.sql',
   ]) {
     await ds.query(fs.readFileSync(path.join(REPO, f), 'utf8'));
     console.log('applied', f);

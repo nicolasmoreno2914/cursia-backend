@@ -29,6 +29,39 @@ export const ACTIVITY_INTRO_COPY = Object.freeze({
 });
 
 /**
+ * EV6 H5P v2 — «Repaso» (Dialog Cards): opcional y SIN nota. Nunca dice «calificable»
+ * ni «nota de esta actividad» (ruling Q5: no cuenta para la nota ni para completar el curso).
+ */
+export const REVIEW_CARDS_INTRO_COPY = Object.freeze({
+  frameHeading: 'Repaso del capítulo {n} · Tarjetas opcionales: gira cada una y comprueba si la sabías (no tiene nota)',
+  frameFallbackLead: '¿No se ven las tarjetas? ',
+  frameFallbackLink: 'Ábrelas en su propia página →',
+});
+
+/** Intro del «Repaso»: mismo marco y cargador diferido que la práctica, con el texto del repaso. */
+export function reviewCardsIntroHtml(input: { packageFilename: string; title: string; activityMid: number; theme: VideoIntroTheme; frame: ActivityFrameTone }): string {
+  const { packageFilename, title, activityMid, theme: t, frame: f } = input;
+  if (!PACKAGE_FILENAME_RE.test(packageFilename)) throw new Error(`ACTIVITY_INTRO_INVALID: packageFilename ${packageFilename}`);
+  if (typeof title !== 'string' || !title.trim()) throw new Error('ACTIVITY_INTRO_INVALID: title vacío');
+  if (!Number.isInteger(activityMid) || activityMid < 1) throw new Error(`ACTIVITY_INTRO_INVALID: activityMid ${activityMid}`);
+  checkFrame(t, f);
+  const C = REVIEW_CARDS_INTRO_COPY;
+  const src = `${H5P_EMBED_FROM_PLUGINFILE}?url=@@PLUGINFILE@@/${packageFilename}&amp;component=mod_h5pactivity`;
+  return [
+    `<div class="cursia-iv cvc-act cvc-review" style="max-width:960px;margin:0 0 16px 0;padding:0;background-color:${t.surface};color:${t.textPrimary};border:1px solid ${f.edge};border-radius:14px;overflow:hidden;">`,
+    frameHead(t, f, C.frameHeading),
+    `<div class="cursia-iv-inline" style="display:none;margin:0;padding:14px;">`,
+    `<iframe title="${esc(title.trim())}" data-cursia-src="${src}" loading="lazy" width="100%" height="520" style="width:100%;border:0;" allowfullscreen="allowfullscreen"></iframe>`,
+    `</div>`,
+    `<div class="cursia-iv-fallback" style="background-color:${t.surface};color:${t.textPrimary};margin:0;padding:12px 18px 14px 18px;font-size:16px;line-height:1.5;border-top:1px solid ${f.edge};">`,
+    `<p class="cursia-iv-open" style="margin:0;color:${t.textSecondary};"><span class="nolink">${esc(C.frameFallbackLead)}</span><a href="$@H5PACTIVITYVIEWBYID*${activityMid}@$" style="color:${f.ink};font-weight:bold;"><span class="nolink">${esc(C.frameFallbackLink)}</span></a></p>`,
+    `</div>`,
+    `<script>${CURSIA_IV_INLINE_SCRIPT}</script>`,
+    `</div>`,
+  ].join('\n');
+}
+
+/**
  * P3 — marco de la actividad con el tono del módulo del capítulo (moduleTone): la actividad H5P (cuya
  * interfaz no se puede estilar) se lee como «una ventana del curso». ink ≥ 4.5 sobre soft y surface.
  */

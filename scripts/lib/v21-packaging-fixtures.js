@@ -72,6 +72,8 @@ function packagingInput(distRoot, o = {}) {
   const ev5c = {
     ...(o.activityTypeRules ? { activityTypeRules: o.activityTypeRules } : {}),
     ...(o.chapterObjectives ? { chapterObjectives: o.chapterObjectives } : {}),
+    // EV6 H5P v2: ajuste «Repaso» del Blueprint.
+    ...(o.reviewCards ? { reviewCards: true } : {}),
   };
   const { snapshot, manifest } = o.modules
     ? SF.buildCourse(distRoot, { engine, finalExam, courseId: o.courseId || 601, modules: o.modules, ...(o.chapterTitles ? { chapterTitles: o.chapterTitles } : {}), ...ev5c })
@@ -103,12 +105,22 @@ function packagingInput(distRoot, o = {}) {
     if (c.videoEnabled) {
       const key = `video:${c.chapterId}`;
       videos.set(c.chapterId, { youtubeId: YOUTUBE_ID, durationSec: VIDEO_SECONDS });
-      videoInteractions.set(c.chapterId, VF.makeInteractionsDoc(h5p.planInteractionCheckpoints(VIDEO_SECONDS), { videoItemKey: key, durationSec: VIDEO_SECONDS }));
+      const doc = VF.makeInteractionsDoc(h5p.planInteractionCheckpoints(VIDEO_SECONDS), { videoItemKey: key, durationSec: VIDEO_SECONDS });
+      if (manifest.features && manifest.features.ivAdvanced === 1) {
+        // EV6 IV avanzado: schemaVersion 2 con las pausas del plan (salida simulada del LLM).
+        doc.schemaVersion = 2;
+        doc.reflections = h5p.planReflectionPauses(VIDEO_SECONDS, h5p.planInteractionCheckpoints(VIDEO_SECONDS)).reflections.map((r) => ({
+          index: r.index,
+          prompt: '¿Cómo aplicarías lo que acabas de ver con un cliente real?',
+          hint: 'Piensa en tu último reclamo.',
+        }));
+      }
+      videoInteractions.set(c.chapterId, doc);
     }
     if (c.activityEnabled) {
       if (engine === 'h5p') {
         // EV5-C: el tipo que produciría el ejecutor = resolveActivityType(item del Manifest).
-        const payload = SF.h5pPayload(shell.resolveActivityType(itemByKey.get(`activity:${c.chapterId}`)));
+        const payload = SF.h5pPayload(shell.resolveActivityType(itemByKey.get(`activity:${c.chapterId}`), { activityTypeRules: manifest.features && manifest.features.activityTypeRules }));
         payload.data.itemKey = `activity:${c.chapterId}`;
         if (payload.type === 'questionset') payload.data.passPercentage = 70; // el empaque lo reemplaza por el perfil
         activities.set(c.chapterId, { variant: 'h5p', payload });
@@ -162,7 +174,11 @@ function packagingInput(distRoot, o = {}) {
  */
 function expectedSequence(distRoot, input) {
   const SHELL = SF.loadDist(distRoot, 'modules/course-shell/index.js');
+  const H5P = SF.loadDist(distRoot, 'package/h5p/index.js');
   const m = input.manifest;
+  // EV6 H5P v2: «Repaso» iff ajuste del Blueprint + experiencia con ≥ 4 tarjetas.
+  const reviewOn = !!(input.blueprint && input.blueprint.course && input.blueprint.course.reviewCards === true);
+  const hasReview = (chapterId) => reviewOn && !!H5P.buildDialogCardsFromExperience({ chapterTitle: 'x', experience: input.contents.experiences.get(chapterId) });
   const seq = [];
   seq.push([0, ['cv3:shell:forum', 'cv3:shell:welcome', 'cv3:shell:audio_welcome', 'cv3:shell:competencies', 'cv3:shell:methodology', 'cv3:shell:start']]);
   seq.push([1, ['cv3:shell:route', 'cv3:shell:libro', 'cv3:shell:libro_card', 'cv3:shell:audiobook', 'cv3:shell:route_start']]);
@@ -173,7 +189,7 @@ function expectedSequence(distRoot, input) {
   for (const mod of m.modules) {
     mod.chapters.forEach((ch, i) => {
       const ids = i === 0 ? [`cv3:module_intro:${mod.moduleId}`] : [];
-      for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled })) {
+      for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled, reviewCards: hasReview(ch.chapterId) })) {
         const role = s.startsWith('label:') ? s.slice(6) : s === 'video_h5p' ? 'video' : s;
         ids.push(`cv3:ch:${ch.chapterId}:${role}`);
       }

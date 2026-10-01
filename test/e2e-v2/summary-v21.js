@@ -10,6 +10,8 @@ const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); }
 const v2 = readJson(path.join(OUT, 'results.json'));
 const v3 = readJson(path.join(OUT, 'v3', 'results-v3.json'));
 const qa = readJson(path.join(OUT, 'v3', 'browser-qa-v3.json'));
+// EV6 H5P v2 (H4): QA de reproductor del curso E5 (rules 2), solo si E5 corrió.
+const qa2 = readJson(path.join(OUT, 'v3', 'browser-h5p2.json'));
 const rows = [];
 const count = (list) => ({ pass: list.filter((a) => a.ok).length, fail: list.filter((a) => !a.ok).length });
 const add = (area, list, note) => { const c = count(list || []); rows.push([area, c.pass, c.fail, note || '']); };
@@ -22,12 +24,17 @@ if (v3) {
   add('E2E v3: generación E1/E2/E3 (ejecutor real + workers)', by(/^v3-E\d-generacion$/));
   add('E2E v3: empaque v3 + re-empaque E1 (tema/nota)', by(/^v3-E\d-(empaquetado|reempaque)/));
   add('E2E v3: FinOps (ledger, estimates, contadores)', by(/^v3-finops$|^v3-red-final$/));
+  if (v3.h5p2 && v3.h5p2.skipped) rows.push(['E2E v3: H5P v2 (E5, rules 2)', 0, 0, `omitido: ${v3.h5p2.reason}`]);
+  else add('E2E v3: H5P v2 (E5, rules 2: BS + «Repaso» + IV v2)', by(/^v3-E5-h5p2-/));
   add('Moodle 4.5: restore + inspección + notas simuladas', by(/^moodle-/));
   if (v3.aborted) rows.push(['E2E v3', 0, 1, `ABORT: ${v3.aborted}`]);
 } else rows.push(['E2E v3', 0, 1, 'sin results-v3.json']);
 if (qa) {
   for (const a of [...new Set(qa.assertions.map((x) => x.area))]) add(`Navegador: ${a}`, qa.assertions.filter((x) => x.area === a));
 } else rows.push(['Navegador', 0, 1, 'sin browser-qa-v3.json']);
+if (qa2) {
+  for (const a of [...new Set(qa2.assertions.map((x) => x.area))]) add(`Navegador H5P v2: ${a}`, qa2.assertions.filter((x) => x.area === a));
+} else if (v3 && v3.moodle && v3.moodle.E5) rows.push(['Navegador H5P v2', 0, 1, 'E5 restaurado pero sin browser-h5p2.json']);
 const REG = path.join(S, 'regression');
 const reg = { be: [0, 0, 0, 0], fe: [0, 0, 0, 0] };
 const regFails = [];

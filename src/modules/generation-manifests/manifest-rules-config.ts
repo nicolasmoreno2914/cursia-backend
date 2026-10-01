@@ -59,7 +59,7 @@ export function readManifestRulesVersionConfig(env: NodeJS.ProcessEnv = process.
 
 /**
  * EV5-C — reglas de tipo de actividad para Manifests v3 NUEVOS
- * (`features.activityTypeRules`). Config `DYNAMIC_ACTIVITY_TYPE_RULES` ∈ {0, 1},
+ * (`features.activityTypeRules`). Config `DYNAMIC_ACTIVITY_TYPE_RULES` ∈ {0, 1, 2} (EV6: 2 = H5P v2),
  * default 0 (= rotación por hash, byte-idéntico a antes). Mismo criterio que
  * DYNAMIC_MANIFEST_RULES_VERSION: cualquier otro valor ("true", " 1", "2")
  * lanza, nunca se cae en silencio a 0. Un Manifest YA guardado conserva su
@@ -71,7 +71,10 @@ export function readActivityTypeRulesConfig(env: NodeJS.ProcessEnv = process.env
   const raw = env[ACTIVITY_TYPE_RULES_ENV];
   if (raw === undefined || raw === '' || raw === '0') return 0;
   if (raw === '1') return 1;
+  // EV6 H5P v2: "2" = reglas v2 (Branching Scenario + IV avanzado) para Manifests v3 NUEVOS.
+  // El default sigue siendo 0; el controlador decide cuándo activarlo en staging.
+  if (raw === '2') return 2;
   throw new Error(
-    `${ACTIVITY_TYPE_RULES_ENV} inválido: ${JSON.stringify(raw)} (valores permitidos: "0" o "1"; ausente = 0)`,
+    `${ACTIVITY_TYPE_RULES_ENV} inválido: ${JSON.stringify(raw)} (valores permitidos: "0", "1" o "2"; ausente = 0)`,
   );
 }

@@ -95,6 +95,12 @@ export interface PackageStatusResult {
    */
   pendingVideos?: Array<{ itemKey: string; chapterId: string; chapterNumber: number | null }>;
   /**
+   * EV6 H5P v2: el paquete lleva librerías H5P incluidas (Branching Scenario / «Repaso») ⇒ la UI
+   * muestra en «Cómo restaurarlo en Moodle» que hay que restaurar como administrador o gestor.
+   * Ausente en los paquetes de siempre.
+   */
+  restore?: { as: 'admin_or_manager'; note: string };
+  /**
    * EV6 DoD: tipo de paquete. Solo `final` es entregable al cliente; `qa_preview` (run de vista
    * previa) y `degraded` (§2.6) son paquetes de QA rotulados «QA — vista previa, no entregable».
    * Paquetes anteriores sin el campo: inferido de su resumen (videos omitidos / mocks → qa_preview).
@@ -312,6 +318,10 @@ export class PackagingService {
     const result: PackageStatusResult = { status: job.worker_status, stale: false, packageKind, deliverable, complete: false };
     if (newerAttemptFailed) result.newerAttemptFailed = newerAttemptFailed;
     if (Array.isArray(job.output_summary?.pendingVideos)) result.pendingVideos = job.output_summary.pendingVideos;
+    // EV6 H5P v2: el worker copia `restore` al output_summary del job tanto al construir como al
+    // reutilizar un .mbz (desde la metadata del artifact), así que el job basta.
+    const restore = job.output_summary?.restore;
+    if (restore && restore.as === 'admin_or_manager' && typeof restore.note === 'string') result.restore = { as: 'admin_or_manager', note: restore.note };
     if (job.worker_status === 'completed') {
       const base = `${String(job.output_summary?.sourceIdsHash ?? job.id)}.mbz`;
       result.downloadFilename = deliverable ? base : `${QA_PACKAGE_FILENAME_PREFIX}${base}`;

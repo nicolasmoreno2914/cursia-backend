@@ -73,6 +73,8 @@ export interface InvalidationManifestItem {
 export interface InvalidationManifest {
   rulesVersion?: number;
   items: InvalidationManifestItem[];
+  /** rulesVersion 3: marcadores (EV6 H5P v2: activityTypeRules 2 habilita h5pType 'branchingscenario'). */
+  features?: { activityTypeRules?: number; ivAdvanced?: number } | null;
 }
 
 export interface InvalidationFromItem {

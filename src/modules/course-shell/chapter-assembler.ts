@@ -55,7 +55,9 @@ export type ChapterSlot =
   | { kind: 'label'; role: ChapterLabelRole; name: string; html: string }
   | { kind: 'presentation' }
   | { kind: 'video_h5p' }
-  | { kind: 'activity'; variant: 'h5p' | 'scorm' };
+  | { kind: 'activity'; variant: 'h5p' | 'scorm' }
+  /** EV6 H5P v2: «Repaso» opcional con Dialog Cards (sin nota); solo si chapterFacts.reviewCards. */
+  | { kind: 'review_cards' };
 
 export type ChapterLabelRole =
   | 'opening'
@@ -88,13 +90,14 @@ export interface AssembleChapterInput {
 }
 
 /** Secuencia de slots (solo `kind`/`role`) — útil para tests y para R12. */
-export function chapterSlotSequence(flags: { videoEnabled: boolean; activityEnabled: boolean; videoPendingNotice?: boolean }): string[] {
+export function chapterSlotSequence(flags: { videoEnabled: boolean; activityEnabled: boolean; videoPendingNotice?: boolean; reviewCards?: boolean }): string[] {
   const seq = ['label:opening', 'presentation', 'label:deepening'];
   if (flags.videoEnabled) seq.push('label:video_primer', 'video_h5p');
   else if (flags.videoPendingNotice) seq.push('label:video_pending');
   seq.push('label:synthesis');
   if (flags.activityEnabled) seq.push('label:activity_instruction', 'activity');
   else seq.push('label:self_check');
+  if (flags.reviewCards) seq.push('review_cards');
   seq.push('label:closing');
   return seq;
 }
@@ -223,8 +226,11 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     slots.push({ kind: 'activity', variant: ch.activityVariant as 'h5p' | 'scorm' });
   } else {
     const before = pHtml(h, labelHtml(COPY.selfCheckLead), s);
-    slots.push(label('self_check', 'Repaso', injectIntoMovement(mv('self_check'), before, '')));
+    // H2 fix round 1 (M-6): con «Repaso» (Dialog Cards) el label no repite el nombre «Repaso».
+    slots.push(label('self_check', ch.reviewCards === true ? 'Comprueba lo aprendido' : 'Repaso', injectIntoMovement(mv('self_check'), before, '')));
   }
+  // EV6 H5P v2: «Repaso» opcional (Dialog Cards desde la experiencia) antes del cierre. Sin nota.
+  if (ch.reviewCards === true) slots.push({ kind: 'review_cards' });
   // [7] Cierre + puente (LLM, sin recursos) + transiciones determinísticas.
   // M12: el puente del LLM ("a continuación…") solo cuando realmente sigue otro
   // capítulo; antes de un examen de módulo o al final del curso manda la

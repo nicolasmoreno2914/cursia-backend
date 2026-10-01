@@ -19,6 +19,9 @@ import { buildSingleChoiceSet } from './types/single-choice-set';
 import { buildDragText } from './types/drag-text';
 import { buildBlanks } from './types/blanks';
 import { buildInteractiveVideo } from './types/interactive-video';
+import { buildBranchingScenario } from './types/branching-scenario';
+import { buildDialogCardsFromExperience } from './types/dialog-cards';
+import { openH5pLibraryStore } from './library-store';
 
 const PACK_ITEM_KEY = 'cursia-h5p-library-pack';
 /** Video público y neutro (Big Buck Bunny, Blender Foundation, CC-BY) solo para el contenido de instalación. */
@@ -83,6 +86,44 @@ export function libraryPackSampleContent(mainLibrary: string): H5pBuiltContent {
       const sub = buildChoiceSubContent(mainLibrary === 'H5P.MultiChoice' ? mc : tf, PACK_ITEM_KEY, 0, title);
       return { mainLibrary, title, content: sub.params, subContentIds: [], maxScore: 1 };
     }
+    // EV6 H5P v2 (CURSIA_H5P_PROFILE_V2): contenido neutro de instalación.
+    case 'H5P.BranchingScenario':
+      return buildBranchingScenario({
+        itemKey: PACK_ITEM_KEY,
+        title: 'Cursia: instalación del caso ramificado',
+        situation: 'Este caso solo instala el tipo de contenido Branching Scenario en el sitio.',
+        decisions: [
+          { id: 'd1', question: '¿Instalaste el paquete como administrador?', options: [{ text: 'Sí, como administrador.', next: 'd2' }, { text: 'No.', next: 'end:e3' }] },
+          { id: 'd2', question: '¿Lo vas a subir una sola vez?', options: [{ text: 'Sí, una vez por sitio.', next: 'end:e1' }, { text: 'En cada curso.', next: 'end:e2' }] },
+        ],
+        endings: [
+          { id: 'e1', quality: 'optimal', title: 'Listo', text: 'El tipo de contenido queda instalado para todo el sitio.' },
+          { id: 'e2', quality: 'acceptable', title: 'Funciona', text: 'No hace falta repetirlo en cada curso.' },
+          { id: 'e3', quality: 'poor', title: 'Falta el permiso', text: 'Solo un administrador o gestor puede instalar tipos de contenido.' },
+        ],
+      });
+    case 'H5P.Dialogcards': {
+      const deck = buildDialogCardsFromExperience({
+        chapterTitle: 'instalación de Cursia',
+        experience: {
+          movements: {
+            deepening: [
+              {
+                type: 'concept_cards',
+                cards: [
+                  { term: 'Paquete de librerías', definition: 'Instala los tipos de contenido H5P de Cursia.' },
+                  { term: 'Administrador', definition: 'Quien sube el paquete, una sola vez por sitio.' },
+                  { term: 'Docente', definition: 'Después puede restaurar cursos de Cursia sin pasos extra.' },
+                  { term: 'Tarjetas de repaso', definition: 'Este es el tipo de contenido que se instala.' },
+                ],
+              },
+            ],
+          },
+        },
+      });
+      if (!deck) throw new Error('H5P_PACK_SAMPLE_INVALID: H5P.Dialogcards');
+      return deck;
+    }
     default:
       throw new Error(`H5P_PACK_UNKNOWN_MAIN_LIBRARY: ${mainLibrary}`);
   }
@@ -123,8 +164,8 @@ export interface LibraryPackManifest {
   libraries: Array<H5pLibraryRef & { folderSha256: string; files: number }>;
 }
 
-export function libraryPackFileName(ref: H5pLibraryRef): string {
-  return `cursia-h5p-pack-v${h5pProfileVersion}-${ref.machineName}-${ref.majorVersion}.${ref.minorVersion}.${ref.patchVersion}.h5p`;
+export function libraryPackFileName(ref: H5pLibraryRef, packVersion: number = h5pProfileVersion): string {
+  return `cursia-h5p-pack-v${packVersion}-${ref.machineName}-${ref.majorVersion}.${ref.minorVersion}.${ref.patchVersion}.h5p`;
 }
 
 /**
@@ -139,8 +180,19 @@ export async function buildCursiaH5pLibraryPack(opts: {
   const profile = opts.profile || CURSIA_H5P_PROFILE_V1;
   const libFiles: Record<string, Record<string, Buffer>> = {};
   const libraries: LibraryPackManifest['libraries'] = [];
+  // EV6 H5P v2: en un perfil derivado, las carpetas delta salen del store versionado (sha256
+  // verificado, procedencia en su manifest); las del perfil base, de `libsDir` como en v1.
+  const store = profile.deltaByMain ? openH5pLibraryStore(profile) : null;
+  const deltaDirs = new Set(Object.values(profile.deltaByMain || {}).flat().map(h5pLibraryDirName));
   for (const ref of profile.libraries) {
     const dir = h5pLibraryDirName(ref);
+    if (store && deltaDirs.has(dir)) {
+      const files = store.libraryFiles(dir);
+      if (!files) throw new Error(`H5P_PACK_MISSING_LIBRARY: ${dir} en el store v2`);
+      libFiles[dir] = files;
+      libraries.push({ ...ref, folderSha256: libraryFolderHash(files), files: Object.keys(files).length });
+      continue;
+    }
     const abs = path.join(opts.libsDir, dir);
     if (!fs.existsSync(path.join(abs, 'library.json'))) throw new Error(`H5P_PACK_MISSING_LIBRARY: ${dir} en ${opts.libsDir}`);
     const lj = JSON.parse(fs.readFileSync(path.join(abs, 'library.json'), 'utf8'));
@@ -171,15 +223,15 @@ export async function buildCursiaH5pLibraryPack(opts: {
       profile,
       libraryFiles,
     });
-    const file = libraryPackFileName(mainRef);
+    const file = libraryPackFileName(mainRef, profile.version);
     fs.writeFileSync(path.join(opts.outDir, file), buf);
     packages.push({ file, mainLibrary: { ...mainRef }, bytes: buf.length, sha256: sha256Hex(buf), libraries: dirs });
   }
 
   const manifest: LibraryPackManifest = {
-    packId: `CURSIA_H5P_LIBRARY_PACK_V${h5pProfileVersion}`,
+    packId: `CURSIA_H5P_LIBRARY_PACK_V${profile.version}`,
     profileId: profile.profileId,
-    h5pProfileVersion,
+    h5pProfileVersion: profile.version,
     packages,
     libraries,
   };

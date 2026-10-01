@@ -31,7 +31,7 @@ import {
   validateAssessmentProfile,
 } from '../course-profiles/course-profiles';
 import { formatDurationEs, formatDurationShortEs } from '../../package/audio';
-import { H5pActivityType, resolveActivityType } from './activity-type';
+import { H5pActivityTypeV2, resolveActivityType } from './activity-type';
 import { displayStructureTitle } from '../course-structure/structure-titles';
 
 export const COURSE_FACTS_VERSION = 1;
@@ -82,6 +82,11 @@ export interface BuildCourseFactsInput {
    * «El video interactivo de este capítulo estará disponible…» (sus textos mencionan el video).
    */
   pendingVideos?: { chapterIds: readonly string[]; noticeChapterIds?: readonly string[] } | null;
+  /**
+   * EV6 H5P v2: capítulos con «Repaso» (Dialog Cards, sin nota). Solo con el ajuste del Blueprint
+   * `course.reviewCards` encendido; el builder los elige (experiencia con ≥ 4 tarjetas).
+   */
+  reviewCardsChapterIds?: readonly string[] | null;
 }
 
 export interface ChapterFacts {
@@ -101,12 +106,14 @@ export interface ChapterFacts {
   activityEnabled: boolean;
   /** null si la actividad está OFF. */
   activityVariant: 'h5p' | 'scorm' | null;
+  /** EV6 H5P v2: el capítulo lleva «Repaso» (Dialog Cards, sin nota, completion por vista). Solo si true. */
+  reviewCards?: true;
   /**
    * Solo variant h5p: resolveActivityType(item activity del Manifest) — `h5pType`
    * congelado (EV5-C) o, en Manifests legacy, activityTypeForChapter(chapterId).
    * El validador del .mbz lee este dato (nunca recalcula el hash).
    */
-  activityType: H5pActivityType | null;
+  activityType: H5pActivityTypeV2 | null;
   slideCount: number;
   /**
    * P3: minutos estimados del capítulo (estimateChapterMinutes) desde las palabras MEDIDAS del
@@ -149,6 +156,8 @@ export interface CourseFacts {
     finalExam: boolean;
     /** Exámenes de módulo + examen final. */
     evaluations: number;
+    /** EV6 H5P v2: capítulos con «Repaso» (add-on sin nota). Solo si > 0. */
+    reviewCards?: number;
   };
   chapters: ChapterFacts[];
   modules: ModuleFacts[];
@@ -245,7 +254,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
         ...(videoPending ? { videoPending: true, videoPendingNotice: noticeIds.has(mc.chapterId) } : {}),
         activityEnabled,
         activityVariant: variant,
-        activityType: variant === 'h5p' ? resolveActivityType(itemByKey.get(`activity:${mc.chapterId}`)) : null,
+        activityType: variant === 'h5p' ? resolveActivityType(itemByKey.get(`activity:${mc.chapterId}`), { activityTypeRules: manifest.features?.activityTypeRules }) : null,
         slideCount: posInt(artifacts.slideCountByChapter?.[mc.chapterId], `slideCount del capítulo ${mc.chapterNumber}`),
       });
       if (artifacts.experienceWordsByChapter) {
@@ -288,6 +297,15 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
     });
   }
   for (const id of pendingIds) if (!knownChapterIds.has(id)) fail(`video pendiente de un capítulo que no está en el Manifest (${id})`);
+  // EV6 H5P v2: «Repaso» solo con el ajuste del Blueprint y en capítulos del Manifest.
+  const reviewIds = new Set<string>(input.reviewCardsChapterIds ?? []);
+  if (reviewIds.size && bp.course.reviewCards !== true) fail('«Repaso» (Dialog Cards) sin el ajuste course.reviewCards del Blueprint');
+  // H2 fix round 1 (I-2, M-4): solo con H5P v2 (marcador 2 del Manifest) y motor h5p.
+  if (reviewIds.size && (features.activityTypeRules !== 2 || features.activityEngine !== 'h5p')) {
+    fail('«Repaso» (Dialog Cards) solo con H5P v2 (activityTypeRules=2) y motor h5p');
+  }
+  for (const id of reviewIds) if (!knownChapterIds.has(id)) fail(`«Repaso» de un capítulo que no está en el Manifest (${id})`);
+  for (const ch of chapters) if (reviewIds.has(ch.id)) ch.reviewCards = true;
   for (const id of Object.keys(artifacts.slideCountByChapter ?? {})) {
     if (!knownChapterIds.has(id)) fail(`slideCount de un capítulo que no está en el Manifest (${id})`);
   }
@@ -360,6 +378,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
       exams,
       finalExam: features.finalExam,
       evaluations: exams + (features.finalExam ? 1 : 0),
+      ...(reviewIds.size ? { reviewCards: reviewIds.size } : {}),
     },
     chapters,
     modules,

@@ -5,6 +5,10 @@
 #      ambos sobre el mismo PG16 descartable (run-e2e.sh con E2E_AFTER).
 #   2. QA de navegador (browser-qa-v3.js): servidor PHP 127.0.0.1:8099 solo durante
 #      la prueba, estudiante local de prueba, forceclean=1 temporal → 0 siempre.
+#   2b. EV6 H5P v2 (browser-h5p2.js): reproductor real del curso E5 (rules 2) — caminos
+#      del Branching Scenario (0 / 70 / 100), «Repaso» por vista, IV v2 (pausa de reflexión
+#      + remediación con seek; API de YouTube por stub local, sin red) y 390 px. Solo si E5
+#      se restauró; si el frontend no trae H5P v2 (E2E_H5P2=auto), E5 queda omitido.
 #   3. Regresión: todos los scripts/check-*.js del backend (incluidos los de Moodle
 #      local), harness-blueprint-snapshot, runner de producción local y los
 #      harnesses del frontend.
@@ -79,6 +83,20 @@ else
   echo "sin results-v3.json: QA de navegador omitido (FALLA)"
 fi
 
+echo "== 2b. QA de reproductor H5P v2 (E5) =="
+H2_RC=0
+R3="$OUT/v3/results-v3.json"
+if [ -f "$R3" ] && node -e 'const r=require(process.argv[1]);process.exit(r.moodle&&r.moodle.E5?0:1)' "$R3"; then
+  node "$HERE/browser-h5p2.js" "$R3" --moodle "$MOODLE" --creds "$CREDS" --shots "$SHOTS" --repo "$REPO" > "$OUT/browser-h5p2.log" 2>&1
+  H2_RC=$?
+  tail -1 "$OUT/browser-h5p2.log"
+elif [ -f "$R3" ] && node -e 'const r=require(process.argv[1]);process.exit(r.h5p2&&r.h5p2.skipped?0:1)' "$R3"; then
+  echo "E5 omitido por el E2E (frontend sin H5P v2): QA H5P v2 omitido"
+else
+  echo "sin curso E5 restaurado: QA H5P v2 no corrió (FALLA)"
+  H2_RC=1
+fi
+
 REG_RC=0
 # Regresión bajo netguard (toda conexión fuera de 127.0.0.1 se bloquea y se registra por
 # proveedor) y con un entorno LIMPIO: sin claves ni URLs de proveedores del shell del usuario.
@@ -138,8 +156,9 @@ node "$HERE/summary-v21.js" "$SCRATCH" | tee "$SCRATCH/summary.txt"
 RC=0
 [ $E2E_RC -ne 0 ] && RC=1
 [ $QA_RC -ne 0 ] && RC=1
+[ $H2_RC -ne 0 ] && RC=1
 [ $REG_RC -ne 0 ] && RC=1
 [ $FC_RC -ne 0 ] && RC=1
 grep -q "^RESULTADO: PASS" "$SCRATCH/summary.txt" || RC=1
-echo "run-e2e-v21 exit=$RC (e2e=$E2E_RC qa=$QA_RC regresión=$REG_RC forceclean/servidores=$FC_RC)"
+echo "run-e2e-v21 exit=$RC (e2e=$E2E_RC qa=$QA_RC qa-h5p2=$H2_RC regresión=$REG_RC forceclean/servidores=$FC_RC)"
 exit $RC

@@ -290,7 +290,8 @@ export class CourseBlueprintsService {
 
       const [course] = await qr.query(
         `select id, title, structure_version, structure_version_counter, current_blueprint_id,
-                final_exam_enabled, activity_engine
+                final_exam_enabled, activity_engine,
+                (to_jsonb(courses) ->> 'review_cards_enabled')::boolean as review_cards_enabled
            from public.courses
           where id = $1 and ${OWNERSHIP_FILTER}
           for update`,
@@ -331,6 +332,8 @@ export class CourseBlueprintsService {
         title: course.title,
         finalExam: course.final_exam_enabled,
         activityEngine: course.activity_engine,
+        // EV6 H5P v2: NULL (curso anterior / columna sin migrar) = apagado; solo true entra al snapshot.
+        reviewCards: course.review_cards_enabled === true,
       };
       const errors = validateBlueprintInputV2(courseRef, modules, chapters);
       if (errors.length > 0) {

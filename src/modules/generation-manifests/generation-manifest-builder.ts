@@ -10,6 +10,7 @@ import {
   GradedH5pActivityType,
   chooseActivityTypesV1,
 } from './activity-type-rules';
+import { chooseActivityTypesV2 } from './activity-type-rules-v2';
 
 /**
  * rulesVersion por defecto (y el único que existía hasta 5B.2.B/Fase 6). La
@@ -132,7 +133,7 @@ export interface ManifestItem {
    * Manifests con `features.activityTypeRules = 1` (reglas por objetivo,
    * activity-type-rules.ts). Ausente = rotación por hash (`activityTypeForChapter`).
    */
-  h5pType?: GradedH5pActivityType;
+  h5pType?: GradedH5pActivityType | 'branchingscenario';
 }
 
 /** Solo rulesVersion 3: flags de curso del Blueprint v2 que cambian el conjunto de items. */
@@ -145,7 +146,13 @@ export interface ManifestFeatures {
    * (chooseActivityTypesV1). El canonical lo escribe solo si está presente:
    * los sha de los Manifests existentes no cambian.
    */
-  activityTypeRules?: 1;
+  activityTypeRules?: 1 | 2;
+  /**
+   * EV6 H5P v2: IV avanzado (video_interactions schemaVersion 2: pausas de reflexión +
+   * remediación). Presente (= 1) SOLO junto con activityTypeRules = 2 — un único
+   * interruptor de H5P v2 (ruling Q2). Ausente = schemaVersion 1, bytes de siempre.
+   */
+  ivAdvanced?: 1;
 }
 
 /**
@@ -1083,8 +1090,8 @@ export function buildGenerationManifestV3(
 ): GenerationManifestV1 {
   assertV2Snapshot(snapshot, 'buildGenerationManifestV3');
   const activityTypeRules = opts?.activityTypeRules ?? 0;
-  if (activityTypeRules !== 0 && activityTypeRules !== 1) {
-    throw new Error(`buildGenerationManifestV3: activityTypeRules inválido: ${JSON.stringify(activityTypeRules)} (0 | 1)`);
+  if (activityTypeRules !== 0 && activityTypeRules !== 1 && activityTypeRules !== 2) {
+    throw new Error(`buildGenerationManifestV3: activityTypeRules inválido: ${JSON.stringify(activityTypeRules)} (0 | 1 | 2)`);
   }
   const course = snapshot.course;
   if (typeof course?.finalExam !== 'boolean') {
@@ -1095,7 +1102,9 @@ export function buildGenerationManifestV3(
   }
   const variant: ActivityVariant = course.activityEngine;
   // EV5-C: con el marcador, el tipo h5p de cada actividad se decide y congela acá.
-  const chosenTypes = activityTypeRules === 1 ? chooseActivityTypesV1(snapshot) : null;
+  // EV6 H5P v2: con el marcador 2, reglas v2 (decide → branchingscenario, tope y balance propios).
+  const chosenTypes: Map<string, { type: GradedH5pActivityType | 'branchingscenario' }> | null =
+    activityTypeRules === 1 ? chooseActivityTypesV1(snapshot) : activityTypeRules === 2 ? chooseActivityTypesV2(snapshot) : null;
   const planKey = coursePlanKey(source.courseId);
   const introKey = courseIntroKey(source.courseId);
   const courseBase = { scope: 'course' as const, moduleId: null, chapterId: null, moduleNumber: null, chapterNumber: null };
@@ -1177,6 +1186,7 @@ export function buildGenerationManifestV3(
       finalExam: course.finalExam,
       activityEngine: course.activityEngine,
       ...(activityTypeRules === 1 ? { activityTypeRules: 1 as const } : {}),
+      ...(activityTypeRules === 2 ? { activityTypeRules: 2 as const, ivAdvanced: 1 as const } : {}),
     },
     modules,
     items,
@@ -1247,6 +1257,7 @@ export function canonicalManifestJsonV3(m: GenerationManifestV1): string {
       finalExam: m.features?.finalExam,
       activityEngine: m.features?.activityEngine,
       ...(m.features?.activityTypeRules !== undefined ? { activityTypeRules: m.features.activityTypeRules } : {}),
+      ...(m.features?.ivAdvanced !== undefined ? { ivAdvanced: m.features.ivAdvanced } : {}),
     },
     modules: m.modules.map((mod) => ({
       moduleId: mod.moduleId,
@@ -1354,14 +1365,23 @@ export function validateGenerationManifestV3(
     });
   }
   const rulesMarker = (m.features as any)?.activityTypeRules;
-  if (rulesMarker !== undefined && rulesMarker !== 1) {
+  if (rulesMarker !== undefined && rulesMarker !== 1 && rulesMarker !== 2) {
     errors.push({
       code: 'FEATURES_MISMATCH',
-      message: `features.activityTypeRules debe estar ausente o ser 1, encontrado ${JSON.stringify(rulesMarker)}`,
+      message: `features.activityTypeRules debe estar ausente o ser 1 o 2, encontrado ${JSON.stringify(rulesMarker)}`,
+    });
+  }
+  // EV6 H5P v2: ivAdvanced = 1 exactamente cuando activityTypeRules = 2.
+  const ivAdvanced = (m.features as any)?.ivAdvanced;
+  if ((rulesMarker === 2) !== (ivAdvanced === 1) || (ivAdvanced !== undefined && ivAdvanced !== 1)) {
+    errors.push({
+      code: 'FEATURES_MISMATCH',
+      message: `features.ivAdvanced debe ser 1 con activityTypeRules=2 y estar ausente si no (encontrado ${JSON.stringify(ivAdvanced ?? null)}, reglas ${JSON.stringify(rulesMarker ?? null)})`,
     });
   }
   // Recalculado desde el snapshot (módulo puro de reglas, no el builder).
-  const expectedH5pTypes = rulesMarker === 1 ? chooseActivityTypesV1(snapshot) : null;
+  const expectedH5pTypes: Map<string, { type: string }> | null =
+    rulesMarker === 1 ? chooseActivityTypesV1(snapshot) : rulesMarker === 2 ? chooseActivityTypesV2(snapshot) : null;
 
   // --- Recalcular lo esperado desde el snapshot ---
   const planKey = `course_plan:${source.courseId}`;
@@ -1492,7 +1512,7 @@ export function validateGenerationManifestV3(
     if (expectedH5pTypes && isH5pActivity) {
       const want = it.chapterId ? expectedH5pTypes.get(it.chapterId)?.type : undefined;
       if (h5pType === undefined) {
-        errors.push({ code: 'MISSING_H5P_TYPE', message: `item ${it.key}: con activityTypeRules=1 la actividad h5p debe llevar h5pType (${JSON.stringify(want ?? null)})`, key: it.key });
+        errors.push({ code: 'MISSING_H5P_TYPE', message: `item ${it.key}: con activityTypeRules=${rulesMarker} la actividad h5p debe llevar h5pType (${JSON.stringify(want ?? null)})`, key: it.key });
       } else if (h5pType !== want) {
         errors.push({
           code: 'WRONG_H5P_TYPE',

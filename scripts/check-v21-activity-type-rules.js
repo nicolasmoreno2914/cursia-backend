@@ -336,7 +336,8 @@ async function main() {
     }
   });
   await check('builder: activityTypeRules inválido o con rulesVersion 1/2 → throw', () => {
-    throwsRe(() => B.buildGenerationManifestV3(golden, SOURCE, { activityTypeRules: 2 }), /activityTypeRules inválido/, 'valor 2');
+    // EV6 H5P v2: 2 pasó a ser válido (reglas v2, check-ev6-h5p2-wire.js); 3 sigue siendo inválido.
+    throwsRe(() => B.buildGenerationManifestV3(golden, SOURCE, { activityTypeRules: 3 }), /activityTypeRules inválido/, 'valor 3');
     throwsRe(() => B.buildGenerationManifest({ schemaVersion: 1, course: { id: 1, title: 'x', structureVersion: 'dynamic' }, modules: [] }, SOURCE, { rulesVersion: 1, activityTypeRules: 1 }), /requiere rulesVersion 3/, 'v1 con reglas 1');
   });
 
@@ -353,7 +354,8 @@ async function main() {
     eq(mut(m1, (x) => { x.items.find((i) => i.type === 'content').h5pType = 'blanks'; }), ['UNEXPECTED_H5P_TYPE'], 'h5pType en content');
     eq(mut(m1, (x) => { delete x.features.activityTypeRules; }), ['UNEXPECTED_H5P_TYPE'], 'marcador borrado');
     // Marcador inválido: no se toma como 1 ⇒ además cada h5pType queda sin marcador válido.
-    eq(mut(m1, (x) => { x.features.activityTypeRules = 2; }), ['FEATURES_MISMATCH', 'UNEXPECTED_H5P_TYPE'], 'marcador 2');
+    // EV6 H5P v2: 2 es un marcador válido (exige ivAdvanced y los tipos de las reglas v2); 3 sigue inválido.
+    eq(mut(m1, (x) => { x.features.activityTypeRules = 3; }), ['FEATURES_MISMATCH', 'UNEXPECTED_H5P_TYPE'], 'marcador 3');
     eq(mut(m0, (x) => { x.features.activityTypeRules = 0; }), ['FEATURES_MISMATCH'], 'marcador 0 explícito');
     // El canonical conserva los campos para que el validador los vea (no los esconde).
     const tampered = clone(m0);
@@ -366,7 +368,8 @@ async function main() {
     eq(CFG.ACTIVITY_TYPE_RULES_ENV, 'DYNAMIC_ACTIVITY_TYPE_RULES', 'nombre');
     eq([CFG.readActivityTypeRulesConfig({}), CFG.readActivityTypeRulesConfig({ DYNAMIC_ACTIVITY_TYPE_RULES: '' }),
       CFG.readActivityTypeRulesConfig({ DYNAMIC_ACTIVITY_TYPE_RULES: '0' }), CFG.readActivityTypeRulesConfig({ DYNAMIC_ACTIVITY_TYPE_RULES: '1' })], [0, 0, 0, 1], 'válidos');
-    for (const bad of ['true', ' 1', '2', 'on', '01']) {
+    // EV6 H5P v2: "2" pasó a ser válido (check-ev6-h5p2-wire.js); "3" no.
+    for (const bad of ['true', ' 1', '3', 'on', '01']) {
       throwsRe(() => CFG.readActivityTypeRulesConfig({ DYNAMIC_ACTIVITY_TYPE_RULES: bad }), /DYNAMIC_ACTIVITY_TYPE_RULES inválido/, JSON.stringify(bad));
     }
   });
@@ -504,7 +507,7 @@ async function main() {
         const res = await new GenerationManifestsService(dsWith(val), blueprints).getOrCreate(COURSE_ID, OWNER, 3);
         eq(res.manifest.manifest.features.activityTypeRules, want, `valor ${JSON.stringify(val)}`);
       }
-      for (const val of ['1', '0', 2, true, {}, [1]]) {
+      for (const val of ['1', '0', 3, '2', true, {}, [1]]) {
         await rejectsRe(new GenerationManifestsService(dsWith(val), blueprints).getOrCreate(COURSE_ID, OWNER, 3),
           /Generation Manifest #7: features\.activityTypeRules guardado inválido/, `valor ${JSON.stringify(val)}`);
       }

@@ -22,6 +22,13 @@
 // true` sobre el vm, DESPUÉS de cargar 45; el frontend de producción trae la constante en false).
 // E2 y E4 siguen por GIFT (cobertura del camino de siempre). El LLM falso de bancos
 // (llm-exam-bank.js) inyecta una falla UNA vez → exactamente una reparación.
+//
+// EV6 H5P v2 (H4) — E5: curso con DYNAMIC_ACTIVITY_TYPE_RULES=2 (la app se REINICIA con ese env solo
+// para E5, después de E1–E4, que siguen con rules 0/1 y sus aserciones de siempre): capítulo «decidir…»
+// → Branching Scenario (respuesta inválida una vez → reintento dirigido), «Repaso» encendido por ser un
+// curso nuevo con H5P v2, IV avanzado (video de 468 s → 2 pausas de reflexión) → empaque → restore en
+// Moodle 4.5 → inspección. Necesita el frontend de H3 (fixtures/h5p2/fake-llm-h5p2.json); con un
+// frontend sin H5P v2, E2E_H5P2=auto (default) omite E5 (queda registrado) y E2E_H5P2=require falla.
 'use strict';
 const path = require('path');
 const fs = require('fs');
@@ -43,6 +50,10 @@ const { createLlmV3 } = require('./llm-v3');
 const D = (p) => require(path.join(REPO, 'dist', p));
 const SHELL_TYPES = require(path.join(REPO, 'dist', 'modules/course-shell/index.js'));
 const PV = require('./providers');
+// EV6 H5P v2: fixtures del LLM falso del frontend H3 (null si el frontend no trae H5P v2).
+const H5P2_FIXTURE = path.join(FE, 'fixtures/h5p2/fake-llm-h5p2.json');
+const H5P2 = fs.existsSync(H5P2_FIXTURE) ? JSON.parse(fs.readFileSync(H5P2_FIXTURE, 'utf8')) : null;
+const H5P2_MODE = process.env.E2E_H5P2 || 'auto'; // auto | require | off
 
 const PGPORT = Number(process.env.PGPORT_T);
 const APP_PORT = Number(process.env.APP_PORT || 38471) + 7;
@@ -138,8 +149,8 @@ async function stopProc(ch, timeoutMs = 20000) {
   if (!ch.exited) { ch.kill('SIGKILL'); await sleep(300); }
   return ch.exited;
 }
-async function startApp() {
-  const ch = spawnProc('app-v3', 'main.js', { ...baseEnv(), PORT: String(APP_PORT) });
+async function startApp(extraEnv = {}, label = 'app-v3') {
+  const ch = spawnProc(label, 'main.js', { ...baseEnv(), ...extraEnv, PORT: String(APP_PORT) });
   const t0 = Date.now();
   while (Date.now() - t0 < 60000) {
     if (ch.exited) throw new Error(`app terminó al arrancar: ${JSON.stringify(ch.exited)} (ver ${ch.logFile})`);
@@ -259,7 +270,8 @@ async function createCourse(C, llm) {
     const auto = cm.data.module.chapters || [];
     for (let i = 0; i < ms.chapters.length; i++) {
       const cs = ms.chapters[i];
-      const body = { title: cs.title, objective: `Aplicar ${cs.title.toLowerCase()}`, videoEnabled: cs.v, activityEnabled: cs.a, expectedCounter: counter };
+      // EV6 H5P v2: `cs.objective` explícito (p. ej. «Decidir…» → Branching Scenario con rules 2).
+      const body = { title: cs.title, objective: cs.objective || `Aplicar ${cs.title.toLowerCase()}`, videoEnabled: cs.v, activityEnabled: cs.a, expectedCounter: counter };
       const isAuto = i === 0 && auto.length === 1;
       const r = isAuto
         ? await api('PATCH', `/courses/${courseId}/modules/${mid}/chapters/${auto[0].id}`, body)
@@ -391,7 +403,7 @@ function reservationBookkeeping(ev) {
   const llmBase = createLlm({ getFixtures: () => S.front.SV2_PREVIEW_FIXTURES, getSplit: (n) => S.front.dynExamQuestionSplit(n) });
   // P2-B6: el fake de bancos valida cada respuesta con validateExamBank de B2 (dist) antes de devolverla.
   const EXAM_BANK = D('modules/course-shell/exam-bank.js');
-  const llm = createLlmV3({ base: llmBase, examBankContract: EXAM_BANK });
+  const llm = createLlmV3({ base: llmBase, examBankContract: EXAM_BANK, h5p2: H5P2 });
   const claimLog = [];
   function newFront(label) {
     const f = makeFront({ feRoot: FE, backendUrl: `http://127.0.0.1:${APP_PORT}`, storageUrl: FAKES.storageUrl, token: TOKEN, ownerId: OWNER, llm, logFile: path.join(V3OUT, `front-${label}.log`), netViolations: frontNet });
@@ -836,8 +848,114 @@ function reservationBookkeeping(ev) {
       results.counters.providerFakes = { gammaGenerations: PFAKES.st.gammaPosts.length, ttsCalls: PFAKES.st.tts.length, llmServerCalls: PFAKES.st.llm.length };
     }, { fatal: false });
 
+    // ═══ EV6 H5P v2 (H4) — E5: rules 2 + «Repaso» + IV avanzado ═══
+    const RUN_E5 = !ONLY_REAL_PROVIDERS && H5P2_MODE !== 'off' && (H5P2 || H5P2_MODE === 'require');
+    if (!ONLY_REAL_PROVIDERS && !RUN_E5) {
+      results.h5p2 = { skipped: true, reason: H5P2_MODE === 'off' ? 'E2E_H5P2=off' : `el frontend no trae ${path.relative(FE, H5P2_FIXTURE)} (H5P v2 del frontend H3)` };
+      console.log(`\n(E5 H5P v2 omitido: ${results.h5p2.reason})`);
+    }
+    if (RUN_E5) await step('v3-E5-h5p2-generacion', async () => {
+      ok(!!H5P2, `E5: fixtures H5P v2 del frontend presentes (${path.relative(FE, H5P2_FIXTURE)})`);
+      if (!H5P2) throw new Error('E5 sin fixtures H5P v2 del frontend');
+      // La app vuelve a arrancar con H5P v2 SOLO para E5 (el env se lee al crear el curso y su primer Manifest).
+      await stopProc(app);
+      app = await startApp({ DYNAMIC_ACTIVITY_TYPE_RULES: '2' }, 'app-v3-h5p2');
+      const C = { key: 'E5', title: '[E2E EV6 E5] Decisiones de mantenimiento (H5P v2)', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'h5p', examBank: false, modules: [
+        { title: 'Decisiones en terreno', objective: 'Decidir intervenciones seguras', exam: true, chapters: [
+          { title: 'Intervenir una pala con baja presión', v: true, a: true, objective: 'Decidir cómo intervenir una pala hidráulica con baja presión' },
+          { title: 'Componentes del circuito', v: false, a: true, objective: 'Identificar los componentes del circuito hidráulico' },
+        ] }] };
+      const c = await createCourse(C, llm);
+      S.E5 = c;
+      const st0 = await readStructure(c.courseId);
+      eq([st0.reviewCardsEnabled, st0.reviewCardsAvailable], [true, true], 'E5: curso NUEVO con H5P v2 → «Repaso» encendido y disponible (GET estructura)');
+      const M = c.manifest.manifest;
+      eq(M.features, { finalExam: true, activityEngine: 'h5p', activityTypeRules: 2, ivAdvanced: 1 }, 'E5: Manifest rules 2 (activityTypeRules 2 + ivAdvanced 1)');
+      const decideCh = c.mods[0].chapters[0].id;
+      const acts = M.items.filter((i) => i.type === 'activity');
+      eq(acts.map((i) => [i.chapterId === decideCh, i.h5pType]), [[true, 'branchingscenario'], [false, 'blanks']], 'E5: «decidir» → branchingscenario; «identificar» → blanks (rules 2)');
+      const ctx = { nombre: C.title, ...CTX, scormTemplateIds: S.templates };
+      const body = { ...ctx, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
+      let start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, body);
+      const estM = /estimateId=([0-9a-f-]{36})/.exec(String(start.error || ''));
+      ok(start.status === 409 && !!estM, 'E5: run con video real sin aprobación → 409 con estimateId', { s: start.status, e: start.error });
+      await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+               values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e EV6 E5: aprobación (Videogen FALSO local)')`, [c.courseId, estM && estM[1]]);
+      start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, body);
+      ok(start.status === 201, 'E5: run creado (201)', { s: start.status, e: start.error });
+      c.runId = start.data.run.id;
+      llm.st.tag = 'E5';
+      S.front.DYN_EXAM_BANK_MODE_ENABLED = false;
+      const bs0 = { inv: llm.st.invalidSent.h5p_branchingscenario || 0, ret: llm.st.retriesSeen.h5p_branchingscenario || 0 };
+      const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
+      const stt = await waitRunTerminal(ctl, 'E5 run');
+      const items = await waitItemsDone(c.runId);
+      // EV6 DoD: el sandbox genera videos de vista previa (mock) → el run termina en `preview`, nunca `completed`
+      // (mismo criterio que E1–E3); el paquete que sigue es de QA (owner SUPER_ADMIN + escape del sandbox).
+      ok(stt.status === 'preview' && stt.failed === 0 && !stt.fatalError, 'E5: ejecutor del navegador terminó sin fallidos (run en vista previa: videos mock)', stt);
+      ok(items.every((i) => i.status === 'completed'), `E5: los ${items.length} items completed`, items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, i.error_message && i.error_message.slice(0, 400)]));
+      ok(llm.st.unknown.length === 0, 'E5: LLM falso sin prompts no reconocidos', llm.st.unknown);
+      eq([bs0.inv, bs0.ret, llm.st.invalidSent.h5p_branchingscenario || 0, llm.st.retriesSeen.h5p_branchingscenario || 0], [0, 0, 1, 1], 'E5: caso ramificado — 1 respuesta inválida (BS_FORWARD_ONLY) y EXACTAMENTE 1 reintento dirigido, luego pasó');
+      const arts = await artifactsOfRun(c.runId);
+      const textOf = async (a) => { const r = await fetch(`${FAKES.storageUrl}/storage/v1/object/authenticated/${a.storage_bucket}/${a.storage_path}`); return r.ok ? r.text() : null; };
+      const bsArt = arts.find((a) => a.item_key === `activity:${decideCh}` && a.type === 'dynamic_h5p_params_json' && a.status !== 'disabled');
+      const bsDoc = bsArt ? JSON.parse((await textOf(bsArt)) || 'null') : null;
+      ok(bsDoc && bsDoc.type === 'branchingscenario' && bsDoc.data.decisions.length === 3 && bsDoc.data.endings.length === 3, 'E5: artifact de la actividad = branchingscenario (3 decisiones, 3 finales)', bsDoc && { type: bsDoc.type });
+      const viArt = arts.find((a) => a.item_key === `video_interactions:${decideCh}` && a.type === 'dynamic_video_interactions_json' && a.status !== 'disabled');
+      const viDoc = viArt ? JSON.parse((await textOf(viArt)) || 'null') : null;
+      ok(viDoc && viDoc.schemaVersion === 2 && Array.isArray(viDoc.reflections) && viDoc.reflections.length === 2, 'E5: video_interactions schemaVersion 2 con 2 reflexiones (video de 468 s)', viDoc && { v: viDoc.schemaVersion, r: viDoc.reflections && viDoc.reflections.length });
+      const viItem = items.find((i) => i.item_key === `video_interactions:${decideCh}`);
+      ok(viItem && viItem.output_summary && viItem.output_summary.reflectionCount === 2, 'E5: resumen del item video_interactions con reflectionCount 2 (validado contra la duración MEDIDA)', viItem && viItem.output_summary);
+      results.courses.E5 = { courseId: c.courseId, frontendCourseId: c.frontendCourseId, blueprintNumber: c.n, runId: c.runId, items: items.length, spec: C,
+        modules: c.mods, manifestItems: M.items.map((i) => ({ key: i.key, type: i.type, variant: i.variant || null, h5pType: i.h5pType || null })), manifestModules: M.modules,
+        features: M.features, assessment: c.assessment, examBank: false, examBankSummaries: [], decideChapterId: decideCh, bsAnswers: H5P2.branchingScenario.valid };
+    }, { fatal: false });
+    if (RUN_E5 && S.E5 && S.E5.runId) await step('v3-E5-h5p2-empaquetado', async () => {
+      const c = S.E5;
+      const P = await packageRun('E5', c.courseId, c.n, c.runId);
+      const os = P.job.output_summary || {};
+      const libs = (os.h5pPackages || []).map((p) => p.mainLibrary);
+      ok(libs.includes('H5P.BranchingScenario') && libs.filter((l) => l === 'H5P.Dialogcards').length === 2, 'E5: paquete con el Branching Scenario y un «Repaso» (Dialog Cards) por capítulo', libs);
+      eq(P.status.restore && P.status.restore.as, 'admin_or_manager', 'E5: GET …/package devuelve la nota «restaurar como administrador o gestor»');
+      results.courses.E5.packageSummary = os;
+      results.courses.E5.reviewCardsChapterIds = (os.h5pPackages || []).filter((p) => /^review_cards:/.test(p.itemKey)).map((p) => p.itemKey.slice('review_cards:'.length));
+      // El paquete BS lleva su delta de librerías (+ LICENSE.txt) y el IV v2 pausas + remediación.
+      const z = await JSZip.loadAsync(P.buf);
+      const pkgOf = async (mainLibrary, keyPrefix) => {
+        const p = (os.h5pPackages || []).find((x) => x.mainLibrary === mainLibrary && (!keyPrefix || x.itemKey.startsWith(keyPrefix)));
+        return p ? JSZip.loadAsync(await z.file(`files/${p.sha1.slice(0, 2)}/${p.sha1}`).async('nodebuffer')) : null;
+      };
+      const H = D('package/h5p/index.js');
+      const bsz = await pkgOf('H5P.BranchingScenario');
+      const tops = bsz ? [...new Set(Object.keys(bsz.files).filter((n) => !bsz.files[n].dir && n !== 'h5p.json' && !n.startsWith('content/')).map((n) => n.split('/')[0]))].sort() : [];
+      eq(tops, H.profileDeltaDirs(H.CURSIA_H5P_PROFILE_V2, 'H5P.BranchingScenario'), 'E5: el .h5p del caso ramificado lleva EXACTAMENTE las 19 carpetas delta de librerías');
+      ok(tops.length > 0 && tops.every((d) => bsz.file(`${d}/LICENSE.txt`)), 'E5: cada carpeta delta trae su aviso LICENSE.txt (MIT)');
+      const ivz = await pkgOf('H5P.InteractiveVideo', `video:${c.mods[0].chapters[0].id}`);
+      const iv = ivz ? JSON.parse(await ivz.file('content/content.json').async('string')) : null;
+      const ints = iv ? iv.interactiveVideo.assets.interactions : [];
+      const pauses = ints.filter((i) => i.action.library === 'H5P.Text 1.1');
+      const qs = ints.filter((i) => i.action.library !== 'H5P.Text 1.1');
+      ok(pauses.length === 2 && pauses.every((p) => p.pause === true && /Pausa para pensar:/.test(p.action.params.text)), 'E5: IV v2 con 2 pausas de reflexión (H5P.Text, pausan el video)', pauses.map((p) => p.duration));
+      ok(qs.length > 0 && qs.every((x) => x.adaptivity && Number.isInteger(x.adaptivity.wrong.seekTo) && x.adaptivity.wrong.seekLabel === 'Volver a ver este tramo'), 'E5: cada pregunta del IV v2 con remediación (seekTo del plan, «Volver a ver este tramo»)', qs.map((x) => x.adaptivity));
+      // Para browser-h5p2.js: tramos de las pausas y, por pregunta, una respuesta INCORRECTA (texto visible).
+      const plain = (h) => String(h || '').replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').trim();
+      results.courses.E5.iv = {
+        chapterId: c.mods[0].chapters[0].id,
+        pauses: pauses.map((p) => ({ from: p.duration.from, to: p.duration.to })),
+        questions: qs.map((x) => {
+          const pr = x.action.params;
+          const wrongText = /^H5P\.TrueFalse /.test(x.action.library)
+            ? (String(pr.correct) === 'true' ? 'Falso' : 'Verdadero')
+            : plain(((pr.answers || []).find((a) => !a.correct) || {}).text);
+          return { from: x.duration.from, to: x.duration.to, seekTo: x.adaptivity.wrong.seekTo, library: x.action.library, wrongText };
+        }),
+      };
+    }, { fatal: false });
+
     // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══
     const MOODLE_JOBS = ONLY_REAL_PROVIDERS ? [] : [['E1', 'E1'], ['E1-repack', 'E1repack'], ['E2', 'E2'], ['E3', 'E3']];
+    // EV6 H5P v2: E5 entra al mismo restore + inspección (con los «Repaso» del paquete).
+    if (results.mbz.E5) MOODLE_JOBS.push(['E5', 'E5']);
     const SHELL = D('modules/course-shell/index.js');
     const AS = D('package/assessment/index.js');
     const { mp3DurationSeconds } = D('package/audio/mp3-parser.js');
@@ -886,7 +1004,9 @@ function reservationBookkeeping(ev) {
         for (const mod of M.modules) {
           mod.chapters.forEach((ch, ci) => {
             const ids = ci === 0 ? [`cv3:module_intro:${mod.moduleId}`] : [];
-            for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled })) {
+            // EV6 H5P v2: los «Repaso» salen de los paquetes H5P del empaque (vacío en E1–E4: secuencia de siempre).
+            const reviewSet = new Set(info.reviewCardsChapterIds || []);
+            for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled, reviewCards: reviewSet.has(ch.chapterId) })) {
               const role = s.startsWith('label:') ? s.slice(6) : s === 'video_h5p' ? 'video' : s;
               ids.push(`cv3:ch:${ch.chapterId}:${role}`);
             }
@@ -1126,6 +1246,26 @@ function reservationBookkeeping(ev) {
           const wantMode = info.examBank ? 'bank' : 'gift';
           ok(modes.length > 0 && modes.every((m) => m === wantMode), `${label}: todas las evaluaciones restauradas en modo ${wantMode} (${info.examBank ? 'banco generado por el ejecutor real' : 'GIFT'})`, p2o.quizzes);
           results.moodle[label].p2exams = { pass: p2o.pass, assertions: p2o.assertions, quizzes: p2o.quizzes, steps: p2o.steps };
+        }
+        // ── EV6 H5P v2 (E5): BS calificado y criterio; «Repaso» sin nota, por vista, fuera de los criterios ──
+        if (label === 'E5') {
+          const bsIdn = `cv3:ch:${info.decideChapterId}:activity`;
+          const bsH = o.h5ps[bsIdn];
+          ok(bsH && bsH.deploy.h5pid && bsH.deploy.library === 'H5P.BranchingScenario 1.10' && bsH.grade === 100 && bsH.enabletracking === 1, `${label}: el caso ramificado despliega (H5P.BranchingScenario 1.10, librerías del paquete con restore de administrador) y califica sobre 100`, bsH);
+          const bsItem = o.items.find((i) => i.idnumber === bsIdn);
+          ok(bsItem && bsItem.gradepass === 70 && bsItem.grademax === 100, `${label}: BS con ítem de calificación (aprobación 70, máximo 100)`, bsItem);
+          ok(o.criteria.filter((x) => x.criteriatype === 4).some((x) => x.idnumber === bsIdn), `${label}: BS es criterio de completion del curso`, o.criteria);
+          const reviews = cms.filter((c) => /:review_cards$/.test(c.idnumber));
+          eq(reviews.length, (info.reviewCardsChapterIds || []).length, `${label}: ${reviews.length} «Repaso» restaurados (uno por capítulo del paquete)`);
+          const badR = reviews.filter((c) => {
+            const h = o.h5ps[c.idnumber];
+            return !(c.completion === 2 && c.completionview === 1 && c.completionpassgrade === 0 && h && h.grade === 0 && h.enabletracking === 0
+              && h.deploy.h5pid && h.deploy.library === 'H5P.Dialogcards 1.9' && !o.items.some((i) => i.idnumber === c.idnumber));
+          }).map((c) => [c.idnumber, c.completion, c.completionview, o.h5ps[c.idnumber]]);
+          eq(badR, [], `${label}: cada «Repaso» = Dialog Cards 1.9 desplegado, grade 0, sin tracking, sin ítem de calificación, completion por vista`);
+          ok(!o.criteria.some((x) => reviews.some((r) => r.idnumber === x.idnumber)), `${label}: ningún «Repaso» es criterio de completion del curso`, o.criteria);
+          ok(!Object.values((L.labels || {})).some((h) => /Repaso[^<]{0,40}calificab/i.test(h)), `${label}: ningún texto presenta el «Repaso» como calificable`);
+          results.moodle[label].h5p2 = { bs: bsIdn, reviews: reviews.map((c) => ({ cmid: c.cmid, idnumber: c.idnumber })) };
         }
         results.moodle[label].cms = cms.map((c) => ({ cmid: c.cmid, idnumber: c.idnumber, modname: c.modname, visible: c.visible }));
         // EV6 (browser QA): una página por sección → el QA recorre /course/section.php?id=<id>.

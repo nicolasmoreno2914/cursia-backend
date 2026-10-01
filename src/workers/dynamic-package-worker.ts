@@ -530,6 +530,8 @@ export async function processV3PackageJob(
       ...baseSummary,
       pendingVideos: reusedPending,
       pendingVideoNoticeCount: reusedPending.filter((p) => p && p.notice === true).length,
+      // EV6 H5P v2: la instrucción de restauración viaja en la metadata del .mbz reutilizado.
+      ...(existing.metadata?.restore ? { restore: existing.metadata.restore } : {}),
       ...(reuseWarnings.length ? { warnings: reuseWarnings } : {}),
     });
     if (!ok) logger.warn(`Job ${job.id}: completeJob devolvió false (lease perdida) tras reutilizar ${existing.id}`);
@@ -606,7 +608,7 @@ export async function processV3PackageJob(
     mimeType: 'application/vnd.moodle.backup',
     upsert: false,
     adoptExistingOnConflict: true,
-    metadata: { runId, manifestId: manifest.id, ...baseSummary, ...pendingSummary },
+    metadata: { runId, manifestId: manifest.id, ...baseSummary, ...pendingSummary, ...(built.summary.restore ? { restore: built.summary.restore } : {}) },
   });
   if (isLeaseLost()) return;
 
@@ -630,6 +632,8 @@ export async function processV3PackageJob(
     planSha256: built.summary.planSha256,
     counts: built.summary.counts,
     h5pPackages: built.summary.h5pPackages,
+    // EV6 H5P v2: «restaurar como administrador o gestor» (solo paquetes con librerías incluidas).
+    ...(built.summary.restore ? { restore: built.summary.restore } : {}),
     mockProviderItems: loaded.mockProviderItems,
     validation: validation.stats,
     ...(warnings.length ? { warnings } : {}),

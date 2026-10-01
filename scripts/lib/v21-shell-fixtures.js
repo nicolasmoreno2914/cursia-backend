@@ -32,7 +32,7 @@ const MODULE_TITLES = ['Bases del servicio', 'Relación con el cliente', 'Gesti�
  * `activityTypeRules` (0 = Manifest legacy por hash, default; 1 = h5pType por objetivo).
  * Devuelve { snapshot, manifest, source, ids }.
  */
-function buildCourse(distRoot, { courseId = 501, title = 'Atención al cliente de excelencia', finalExam = true, engine = 'h5p', modules, chapterTitles = CHAPTER_TITLES, moduleTitles = MODULE_TITLES, chapterObjectives = null, activityTypeRules = 0 }) {
+function buildCourse(distRoot, { courseId = 501, title = 'Atención al cliente de excelencia', finalExam = true, engine = 'h5p', modules, chapterTitles = CHAPTER_TITLES, moduleTitles = MODULE_TITLES, chapterObjectives = null, activityTypeRules = 0, reviewCards = false }) {
   const snap = loadDist(distRoot, 'modules/course-blueprints/blueprint-snapshot.js');
   const B = loadDist(distRoot, 'modules/generation-manifests/generation-manifest-builder.js');
   const mrows = [];
@@ -54,7 +54,8 @@ function buildCourse(distRoot, { courseId = 501, title = 'Atención al cliente d
       });
     });
   });
-  const snapshot = snap.buildBlueprintSnapshotV2({ id: courseId, title, finalExam, activityEngine: engine }, mrows, crows);
+  // EV6 H5P v2: `reviewCards` (ajuste «Repaso» del Blueprint) solo cuando se pide: los fixtures legacy no cambian.
+  const snapshot = snap.buildBlueprintSnapshotV2({ id: courseId, title, finalExam, activityEngine: engine, ...(reviewCards ? { reviewCards: true } : {}) }, mrows, crows);
   const source = { courseId, blueprintId: courseId + 7000, blueprintNumber: 1, blueprintSha256: snap.snapshotSha256V2(snapshot) };
   const manifest = activityTypeRules ? B.buildGenerationManifestV3(snapshot, source, { activityTypeRules }) : B.buildGenerationManifestV3(snapshot, source);
   return { snapshot, manifest, source };
@@ -214,6 +215,39 @@ function h5pPayload(type) {
         questions: [
           { question: '¿Qué frase es más clara?', answers: [{ text: 'Le envío el detalle hoy antes de las seis', correct: true }, { text: 'Veremos qué se puede hacer', correct: false }] },
           { question: '¿Qué evitar al explicar?', answers: [{ text: 'Tecnicismos sin aclarar', correct: true }, { text: 'Ejemplos concretos', correct: false }] },
+        ],
+      },
+    };
+  }
+  if (type === 'branchingscenario') {
+    // EV6 H5P v2: caso ramificado válido (2 decisiones que convergen, 3 finales).
+    return {
+      type,
+      data: {
+        title: 'Un cliente molesto en caja',
+        situation: 'Son las 18:00 en una tienda de Bogotá. Un cliente trae un producto defectuoso y la boleta vencida hace 2 días. Hay fila detrás.',
+        decisions: [
+          {
+            id: 'd1',
+            question: '¿Qué haces primero?',
+            options: [
+              { text: 'Lo escucho sin interrumpir y resumo su problema.', next: 'd2', consequence: 'El cliente baja la voz: se siente escuchado.' },
+              { text: 'Llamo al supervisor y atiendo al siguiente.', next: 'end:e3' },
+            ],
+          },
+          {
+            id: 'd2',
+            question: 'Ya está más calmado. ¿Qué ofreces?',
+            options: [
+              { text: 'Un cambio excepcional registrando el motivo.', next: 'end:e1' },
+              { text: 'Derivarlo a servicio técnico con un número de caso.', next: 'end:e2' },
+            ],
+          },
+        ],
+        endings: [
+          { id: 'e1', quality: 'optimal', title: 'Final óptimo', text: 'Resolviste en el primer contacto y dejaste trazabilidad.' },
+          { id: 'e2', quality: 'acceptable', title: 'Final aceptable', text: 'Diste una salida, pero el cliente debe volver.' },
+          { id: 'e3', quality: 'poor', title: 'Final: escalaste sin escuchar', text: 'El cliente se sintió ignorado.' },
         ],
       },
     };

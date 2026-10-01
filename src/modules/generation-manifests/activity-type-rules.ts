@@ -71,8 +71,11 @@ function deepFreeze<T>(v: T): T {
 
 export type GradedH5pActivityType = 'questionset' | 'dragtext' | 'blanks';
 
-/** Valores del marcador `features.activityTypeRules` (0 = ausente = rotación por hash). */
-export type ActivityTypeRulesVersion = 0 | 1;
+/**
+ * Valores del marcador `features.activityTypeRules` (0 = ausente = rotación por hash).
+ * EV6 H5P v2: 2 = reglas v2 (activity-type-rules-v2.ts: intención «decide» → branchingscenario).
+ */
+export type ActivityTypeRulesVersion = 0 | 1 | 2;
 
 export type ActivityIntent = 'recall' | 'relate' | 'apply' | 'reflect' | 'understand';
 
@@ -292,6 +295,15 @@ function verbIntentOfToken(t: WordToken): ActivityIntent | null {
   // verbal de la lista: «diagnóstica», «cálculo» (sí vale «evalúe»).
   if (t.accents.some((i) => i < f.rootLen - 1)) return null;
   return f.intent;
+}
+
+/**
+ * EV6 H5P v2 — tokenizador de v1 expuesto para las reglas 2 (mismas reglas de plegado y de
+ * tildes). Solo lectura: no cambia nada de rules 1 (sus listas y su comportamiento siguen
+ * fijados por los sha de check-v21-activity-type-rules.js).
+ */
+export function tokenizeRulesV1(s: string): Array<{ folded: string; accents: number[] }> {
+  return tokenize(s).map((t) => ({ folded: t.folded, accents: [...t.accents] }));
 }
 
 /** Intención verbal de UNA palabra tal como se escribe (acepta tildes; null si no es una forma de las listas). */
