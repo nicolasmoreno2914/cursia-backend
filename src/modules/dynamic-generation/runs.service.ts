@@ -121,7 +121,7 @@ import {
 } from './video-upgrade';
 import { estimateCategories, estimateFingerprint, planNormalApproval, NormalApprovalPlan } from '../finops/normal-approval';
 import { isSuperAdminEmail } from '../../auth/super-admin';
-import { RunCompletion, attachCarryChains, evaluateRunCompletion } from './run-completion';
+import { RunCompletion, attachCarryChains, evaluateRunCompletion, loadValidationCutoffs } from './run-completion';
 import { hasDeliverablePackage } from '../dynamic-packaging/package-freshness';
 import {
   ACTIVE_RUN_WORKER_STATUSES,
@@ -4216,10 +4216,12 @@ export class RunsService {
     const upgradeOnlyFailure = !!videoUpgradeOf(job.input_payload) && (job.worker_status === 'failed' || isCancelledLike(job))
       ? await runIsUpgradeOnlyFailure(this.dataSource, job)
       : false;
-    const first = evaluateRunCompletion(job, rows, m, null, { upgradeOnlyFailure });
+    // Fix round 2: items completados antes de la validación de servidor de su tipo (cursos viejos) cuentan validados.
+    const validationCutoffs = await loadValidationCutoffs(this.dataSource);
+    const first = evaluateRunCompletion(job, rows, m, null, { upgradeOnlyFailure, validationCutoffs });
     if (!first.generationComplete) return first;
     const ready = await hasDeliverablePackage({ query: this.dataSource.query.bind(this.dataSource) }, job, manifest, this.logger);
-    return evaluateRunCompletion(job, rows, m, { ready }, { upgradeOnlyFailure });
+    return evaluateRunCompletion(job, rows, m, { ready }, { upgradeOnlyFailure, validationCutoffs });
   }
 
   /**

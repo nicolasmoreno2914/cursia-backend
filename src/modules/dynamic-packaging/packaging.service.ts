@@ -104,6 +104,14 @@ export interface PackageStatusResult {
   downloadFilename?: string;
   /** EV6 DoD: el curso está COMPLETO = paquete entregable, vigente y completado. */
   complete: boolean;
+  /** Fix round 2 (M4): paquete QA/degradado nuevo pedido por un no admin → sin artifactId ni URL. */
+  downloadRestricted?: boolean;
+}
+
+/** Fix round 2 (M4): job de paquete QA / degradado DECLARADO (los nuevos; los anteriores no tienen el campo). */
+export function isAdminOnlyPackageJob(job: { input_payload?: any } | null | undefined): boolean {
+  const k = job?.input_payload?.packageKind;
+  return k === 'qa_preview' || k === 'degraded';
 }
 
 /**
@@ -246,7 +254,12 @@ export class PackagingService {
         if (fresh.staleItemKeys) result.staleItemKeys = fresh.staleItemKeys;
       }
       const artifactId = job.output_summary?.artifactId as string | undefined;
-      if (artifactId) {
+      // Fix round 2 (M4): un paquete QA / degradado NUEVO (declarado en el job por PackagingService) es
+      // solo de SUPER_ADMIN, también para descargar. Los paquetes ya construidos antes (sin packageKind
+      // declarado, p.ej. B1) siguen descargables por su dueño, sin cambios (el DTO los marca no entregables).
+      if (artifactId && isAdminOnlyPackageJob(job) && !isSuperAdminEmail(actor?.email)) {
+        result.downloadRestricted = true;
+      } else if (artifactId) {
         result.artifactId = artifactId;
         try {
           const { url } = await this.artifacts.getDownloadUrl(artifactId, ownerId, DOWNLOAD_URL_TTL_SECONDS);
@@ -275,7 +288,7 @@ export class PackagingService {
     // está completa (todo real y validado). Un paquete QA / degradado / viejo de vista previa nunca.
     if (job.worker_status === 'completed' && deliverable && !result.stale && !!result.artifactId) {
       const inputs = await loadCompletionInputs({ query: this.dataSource.query.bind(this.dataSource) }, run.id);
-      result.complete = !!inputs && evaluateRunCompletion(inputs.job, inputs.rows, inputs.manifest, { ready: true }).complete;
+      result.complete = !!inputs && evaluateRunCompletion(inputs.job, inputs.rows, inputs.manifest, { ready: true }, { validationCutoffs: inputs.validationCutoffs }).complete;
     }
     return result;
   }
@@ -441,7 +454,7 @@ export class PackagingService {
     const inputs = await loadCompletionInputs({ query: this.dataSource.query.bind(this.dataSource) }, run.id);
     // Fix round 1 (M2/I3): sin datos para evaluar → nunca un paquete entregable (fail closed).
     if (!inputs) throw this.previewNotDeliverable(run.id, [], 'no se pudo evaluar la completitud del curso (integridad)');
-    const completion = evaluateRunCompletion(inputs.job, inputs.rows, inputs.manifest, null, { upgradeOnlyFailure });
+    const completion = evaluateRunCompletion(inputs.job, inputs.rows, inputs.manifest, null, { upgradeOnlyFailure, validationCutoffs: inputs.validationCutoffs });
     const preview = completion.previewComponents;
     const admin = isSuperAdminEmail(actor?.email);
     if (upgradeOnlyFailure) {

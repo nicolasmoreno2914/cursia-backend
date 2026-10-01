@@ -243,7 +243,7 @@ export async function recomputeRunStatus(qr: QueryRunner, jobId: string): Promis
       );
       return 'failed';
     }
-    const verdict = terminalStatusFor(evaluateRunCompletion({ ...inputs.job, worker_status: 'completed', status: 'completed' }, inputs.rows, inputs.manifest));
+    const verdict = terminalStatusFor(evaluateRunCompletion({ ...inputs.job, worker_status: 'completed', status: 'completed' }, inputs.rows, inputs.manifest, null, { validationCutoffs: inputs.validationCutoffs }));
     if (verdict === 'completed' || verdict === 'preview') {
       await qr.query(
         `update public.production_jobs
@@ -254,7 +254,7 @@ export async function recomputeRunStatus(qr: QueryRunner, jobId: string): Promis
       );
       return verdict;
     }
-    const completion = evaluateRunCompletion({ ...inputs.job, worker_status: 'completed', status: 'completed' }, inputs.rows, inputs.manifest);
+    const completion = evaluateRunCompletion({ ...inputs.job, worker_status: 'completed', status: 'completed' }, inputs.rows, inputs.manifest, null, { validationCutoffs: inputs.validationCutoffs });
     const unvalidated = completion.missingComponents.filter((k) => !completion.previewComponents.includes(k));
     await qr.query(
       `update public.production_jobs

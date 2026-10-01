@@ -10,7 +10,9 @@ import {
   HttpStatus,
   UseGuards,
   ParseUUIDPipe,
+  ForbiddenException,
 } from '@nestjs/common';
+import { isSuperAdminEmail } from '../../auth/super-admin';
 import { ArtifactsService } from './artifacts.service';
 import { CreateArtifactDto } from './dto/create-artifact.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
@@ -81,6 +83,16 @@ export class ArtifactsController {
     @Query('expires') expires?: string,
   ) {
     const expiresIn = expires ? parseInt(expires, 10) : 3600;
+    // EV6 DoD fix round 2 (M4): un .mbz de QA / degradado NUEVO (metadata.packageKind) es solo de
+    // SUPER_ADMIN también por esta ruta genérica. Los .mbz anteriores (sin el campo) no cambian.
+    const artifact = await this.artifactsService.findOne(id, user.id);
+    const kind = (artifact.metadata as Record<string, any> | null)?.packageKind;
+    if (artifact.type === 'dynamic_mbz' && (kind === 'qa_preview' || kind === 'degraded') && !isSuperAdminEmail(user.email)) {
+      throw new ForbiddenException({
+        code: 'admin_recovery_only',
+        message: 'admin_recovery_only: este paquete es una copia interna de control de calidad (no entregable); solo un administrador de Cursia puede descargarlo.',
+      });
+    }
     const result = await this.artifactsService.getDownloadUrl(
       id,
       user.id,

@@ -105,6 +105,13 @@ export interface CompletionOptions {
   upgradeOnlyFailure?: boolean;
   /** Reloj para decidir si el auto-healer todavía va a reabrir un item (default: ahora). */
   now?: Date;
+  /**
+   * Fix round 2: inicio de la validación de servidor por tipo de item en ESTA base (el primer
+   * `finished_at` de una fila completada con `v3Validation`, ver `loadValidationCutoffs`). Un item
+   * completado ANTES de ese instante sin `v3Validation` es anterior a la validación (curso viejo) y
+   * cuenta como validado; uno posterior sin ella sigue «sin validar». Sin dato del tipo → sin excepción.
+   */
+  validationCutoffs?: Readonly<Record<string, Date>> | null;
 }
 
 /** Clasificación de UN item requerido. */
@@ -172,6 +179,20 @@ export function requiresV3Validation(type: string, variant?: string | null): boo
   return v3ValidatedArtifactTypes(type, variant ?? null).length > 0;
 }
 
+function msOf(v: unknown): number {
+  if (v instanceof Date) return v.getTime();
+  if (typeof v === 'string') return Date.parse(v);
+  return NaN;
+}
+
+/** Fix round 2: ¿la fila completó antes de que existiera la validación de servidor de su tipo? */
+export function predatesValidation(r: CompletionRow, type: string, cutoffs?: Readonly<Record<string, Date>> | null): boolean {
+  const cut = cutoffs?.[type];
+  if (!cut) return false;
+  const done = msOf(r.finished_at);
+  return Number.isFinite(done) && done < cut.getTime();
+}
+
 /**
  * Clasifica cada item del Manifest. Pura. `rowsByKey` = generación vigente por item_key.
  */
@@ -179,6 +200,7 @@ export function classifyRunItems(
   job: CompletionJob,
   rowsByKey: ReadonlyMap<string, CompletionRow>,
   manifest: CompletionManifest,
+  validationCutoffs?: Readonly<Record<string, Date>> | null,
 ): Map<string, ItemCompletionClass> {
   const payload = payloadOf(job);
   const modes = frozenProviderModesOf(payload);
@@ -255,7 +277,7 @@ export function classifyRunItems(
     }
     if (manifest.rulesVersion === 3 && requiresV3Validation(it.type, it.variant ?? null)) {
       const v = s.v3Validation;
-      if (!v || typeof v !== 'object') {
+      if ((!v || typeof v !== 'object') && !predatesValidation(r, it.type, validationCutoffs)) {
         out.set(it.key, 'unvalidated');
         continue;
       }
@@ -371,7 +393,7 @@ export function evaluateRunCompletion(
   opts: CompletionOptions = {},
 ): RunCompletion {
   const rowsByKey = new Map(rows.map((r) => [r.item_key, r]));
-  const classes = classifyRunItems(job, rowsByKey, manifest);
+  const classes = classifyRunItems(job, rowsByKey, manifest, opts.validationCutoffs);
   const missingComponents: string[] = [];
   const previewComponents: string[] = [];
   let inFlight = 0;
@@ -435,10 +457,46 @@ export function terminalStatusFor(c: RunCompletion): 'completed' | 'preview' | '
 type Q = { query: (sql: string, params?: any[]) => Promise<any> };
 
 /**
+ * Fix round 2 (cursos viejos): inicio REAL de la validación de servidor por tipo, medido en la propia
+ * base — el `finished_at` más antiguo de una fila `completed` con `output_summary.v3Validation`.
+ * Desde V2.1 R11a todo item validado que completa lo registra; por eso un item del mismo tipo que
+ * completó ANTES de ese instante (sin `v3Validation`) es anterior a la validación y no se marca «sin
+ * validar». Se eligió este marcador porque los datos no guardan la versión del validador ni la
+ * fecha de despliegue (promptVersion/rulesVersion no distinguen antes/después de R11a: rulesVersion 3
+ * ya existía y promptVersion no viaja en todos los tipos). Cache por proceso: un mínimo encontrado
+ * solo puede bajar (se re-consulta cada 60 s y se combina); un tipo sin filas validadas no exime nada.
+ */
+let cutoffCache: { checkedAt: number; value: Record<string, Date> } | null = null;
+const CUTOFF_RECHECK_MS = 60_000;
+
+export async function loadValidationCutoffs(q: Q, now = Date.now()): Promise<Record<string, Date>> {
+  if (cutoffCache && now - cutoffCache.checkedAt < CUTOFF_RECHECK_MS) return cutoffCache.value;
+  const rows: Array<{ type: string; first: Date | string | null }> = await q.query(
+    `select type, min(finished_at) as first from public.generation_item_runs
+      where status = 'completed' and output_summary ? 'v3Validation' and finished_at is not null
+      group by type`,
+  );
+  const value: Record<string, Date> = { ...(cutoffCache?.value ?? {}) };
+  for (const r of rows) {
+    const d = r.first instanceof Date ? r.first : r.first ? new Date(r.first) : null;
+    if (!d || !Number.isFinite(d.getTime())) continue;
+    if (!value[r.type] || d.getTime() < value[r.type].getTime()) value[r.type] = d;
+  }
+  cutoffCache = { checkedAt: now, value };
+  return value;
+}
+
+/** Solo para tests: olvida el cache de `loadValidationCutoffs`. */
+export function _resetValidationCutoffsForTests(): void {
+  cutoffCache = null;
+}
+
+/**
  * Carga lo que el evaluador necesita de un run (job, generación vigente de cada item y el
  * Manifest congelado). Solo lectura.
  */
 export async function loadCompletionInputs(q: Q, jobId: string): Promise<{
+  validationCutoffs: Record<string, Date>;
   job: CompletionJob & { id: string };
   rows: CompletionRow[];
   manifest: CompletionManifest;
@@ -465,7 +523,9 @@ export async function loadCompletionInputs(q: Q, jobId: string): Promise<{
     [jobId],
   );
   await attachCarryChains(q, rows);
+  const validationCutoffs = await loadValidationCutoffs(q);
   return {
+    validationCutoffs,
     job: { ...job, input_payload: payload },
     rows,
     manifest: { rulesVersion: Number(m.rules_version), items: Array.isArray(mj?.items) ? mj.items : [] },
