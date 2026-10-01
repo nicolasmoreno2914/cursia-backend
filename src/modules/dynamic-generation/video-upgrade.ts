@@ -103,6 +103,8 @@ export function videoUpgradeFingerprint(input: {
   interactions: Array<{ itemKey: string; generation: number }>;
   /** Videos que reutilizan su job de Videogen (sin gasto nuevo); entra en la huella solo si hay. */
   carried?: string[];
+  /** I-3: preguntas de videos reales ya pagados (solo LLM); entra en la huella solo si hay. */
+  questionsOnly?: Array<{ itemKey: string; generation: number }>;
   modes: unknown;
   estimate: { estimatorVersion?: unknown; usageModelVersion?: unknown; pricingVersions?: unknown; totals: unknown };
   policyId: string | null;
@@ -120,6 +122,7 @@ export function videoUpgradeFingerprint(input: {
     pending: sortBy(input.pending),
     interactions: sortBy(input.interactions),
     ...(input.carried && input.carried.length ? { carried: [...input.carried].sort() } : {}),
+    ...(input.questionsOnly && input.questionsOnly.length ? { questionsOnly: sortBy(input.questionsOnly) } : {}),
     modes: input.modes ?? null,
     estimatorVersion: input.estimate.estimatorVersion ?? null,
     usageModelVersion: input.estimate.usageModelVersion ?? null,

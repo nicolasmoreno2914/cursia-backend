@@ -642,6 +642,124 @@ const ENV_KEYS = [
       eq(await counts(C.cid), before, 'nada escrito');
     });
 
+    // ════ Fix round 2 ═══════════════════════════════════════════════════
+    const recompute = (runId) => runs.tx((qr) => L('modules/dynamic-generation/item-transitions.js').recomputeRunStatus(qr, runId));
+    /** Upgrade 1 confirmado; el video 1 termina REAL (worker) con sus preguntas propias completadas. */
+    async function upgradedWithFirstDone(title) {
+      const X = await previewCourse(title);
+      const pv = await runs.previewVideoUpgrade(X.cid, ADMIN, 1, X.runId);
+      await runs.confirmVideoUpgrade(X.cid, ADMIN, 1, X.runId, pv.estimateHash);
+      await itemWorker.processItem(deps(dbScheduler(), fakeVideogen()), await claim(X.runId, `video:${X.c1}`, X.c1));
+      const i1 = await latest(X.runId, `video_interactions:${X.c1}`);
+      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() where id = $1`, [i1.id]);
+      return X;
+    }
+
+    await check('fix round 2 (I-2): render FALLIDO en Videogen → 2º upgrade elegible (sus preguntas `blocked` no son «en curso»), el video NO reutiliza el job fallido: se estima Videogen y se envía UNA vez como nuevo', async () => {
+      const X = await upgradedWithFirstDone('Curso B2 render fallido');
+      const v2 = await latest(X.runId, `video:${X.c2}`);
+      await patchSummary(v2.id, { external: { videogenJobId: 'vg_failed_render', mode: 'real' }, mode: 'real' });
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'videogen_failed: render error' where id = $1`, [v2.id]);
+      const i2 = await latest(X.runId, `video_interactions:${X.c2}`);
+      await ds.query(`update public.generation_item_runs set status = 'blocked' where id = $1`, [i2.id]);
+      await recompute(X.runId);
+      eq((await jobOf(X.runId)).worker_status, 'failed', 'run failed solo por el upgrade');
+      const pv2 = await runs.previewVideoUpgrade(X.cid, ADMIN, 1, X.runId);
+      eq([pv2.eligible, pv2.blockers.map((b) => b.code)], [true, []], 'elegible, sin dependent_running');
+      eq(pv2.pendingVideos.map((p) => [p.itemKey, !!p.reusesVideogenJob]), [[`video:${X.c2}`, false]], 'no reutiliza un render fallido');
+      assert(Object.keys(pv2.estimate.byItemType).includes('video') && dec(pv2.estimate.byCategory.videos.expected) > 0, 'Videogen estimado y aprobado');
+      await runs.confirmVideoUpgrade(X.cid, ADMIN, 1, X.runId, pv2.estimateHash);
+      const v3 = await latest(X.runId, `video:${X.c2}`);
+      eq([v3.generation, v3.output_summary.external], [3, undefined], 'generación nueva sin job heredado');
+      const vg = fakeVideogen();
+      const s = dbScheduler();
+      await itemWorker.processItem(deps(s, vg), await claim(X.runId, `video:${X.c2}`, X.c2));
+      eq([vg.st.submits, s.st.completed.length, s.st.failed.length], [1, 1, 0], `un envío nuevo: ${JSON.stringify(s.st.failed)}`);
+    });
+
+    await check('fix round 2 (I-2): video del upgrade FRENADO por presupuesto (`blocked`) → 2º upgrade elegible con aprobación nueva (sin dependent_running)', async () => {
+      const X = await upgradedWithFirstDone('Curso B2 presupuesto');
+      const v2 = await latest(X.runId, `video:${X.c2}`);
+      await ds.query(`update public.generation_item_runs set status = 'blocked', error = 'budget_exceeded: sin presupuesto' where id = $1`, [v2.id]);
+      const i2 = await latest(X.runId, `video_interactions:${X.c2}`);
+      await ds.query(`update public.generation_item_runs set status = 'blocked' where id = $1`, [i2.id]);
+      await recompute(X.runId);
+      const pv2 = await runs.previewVideoUpgrade(X.cid, ADMIN, 1, X.runId);
+      eq([pv2.eligible, pv2.blockers.map((b) => b.code), pv2.pendingVideos.map((p) => p.itemKey)], [true, [], [`video:${X.c2}`]], 'elegible');
+      const before = await counts(X.cid);
+      const r = await runs.confirmVideoUpgrade(X.cid, ADMIN, 1, X.runId, pv2.estimateHash);
+      eq([r.created, (await counts(X.cid)).auths - before.auths], [true, 1], 'aprobación nueva');
+    });
+
+    await check('fix round 2 (I-3): cancelado DESPUÉS de que el video 1 quedó real (pagado) pero ANTES de sus preguntas → el 2º upgrade regenera SOLO sus preguntas (LLM, sin costo de video) + el video 2; al terminar, el paquete INCLUYE el video 1 con SUS preguntas', async () => {
+      const X = await previewCourse('Curso B2 preguntas');
+      const pv = await runs.previewVideoUpgrade(X.cid, ADMIN, 1, X.runId);
+      await runs.confirmVideoUpgrade(X.cid, ADMIN, 1, X.runId, pv.estimateHash);
+      await itemWorker.processItem(deps(dbScheduler(), fakeVideogen()), await claim(X.runId, `video:${X.c1}`, X.c1));
+      await runs.cancelRun(X.cid, OWNER, 1, X.runId);
+      const v1 = await latest(X.runId, `video:${X.c1}`);
+      eq([v1.status, v1.output_summary.mode], ['completed', 'real'], 'video 1 real y pagado');
+      const pv2 = await runs.previewVideoUpgrade(X.cid, ADMIN, 1, X.runId);
+      eq(pv2.pendingVideos.map((p) => p.itemKey), [`video:${X.c2}`], 'video pendiente');
+      eq(pv2.questionsOnly.map((q) => [q.videoItemKey, q.itemKey]), [[`video:${X.c1}`, `video_interactions:${X.c1}`]], 'preguntas del video 1');
+      const chargesBefore = (await chargesOf(X.runId)).filter((e) => e.provider === 'videogen').length;
+      await runs.confirmVideoUpgrade(X.cid, ADMIN, 1, X.runId, pv2.estimateHash);
+      const i1 = await latest(X.runId, `video_interactions:${X.c1}`);
+      eq([i1.generation, i1.status, i1.output_summary.regeneration.cascadeFromItemRunId], [3, 'pending', v1.id], 'preguntas nuevas DE ese video');
+      eq((await latest(X.runId, `video:${X.c1}`)).generation, 2, 'el video 1 no se regenera');
+      // El video 2 se genera; las preguntas (ejecutor del navegador) terminan.
+      await itemWorker.processItem(deps(dbScheduler(), fakeVideogen()), await claim(X.runId, `video:${X.c2}`, X.c2));
+      for (const c of [X.c1, X.c2]) {
+        const ir = await latest(X.runId, `video_interactions:${c}`);
+        await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() where id = $1`, [ir.id]);
+      }
+      await recompute(X.runId);
+      eq((await jobOf(X.runId)).worker_status, 'completed', 'run completed');
+      eq((await chargesOf(X.runId)).filter((e) => e.provider === 'videogen').length > chargesBefore, true, 'solo el video 2 cobró');
+      // Lo que el empaque vería: filas efectivas reales → ningún video pendiente (video 1 CON sus preguntas).
+      const PK = L('modules/dynamic-packaging/packaging-v3.js');
+      const job = await jobOf(X.runId);
+      const eff = await ds.query(`select distinct on (item_key) * from public.generation_item_runs where job_id = $1 and type in ('video','video_interactions')
+                                  order by item_key, (status = 'completed') desc, generation desc`, [X.runId]);
+      const byItem = new Map(eff.map((r) => [r.item_key, { itemKey: r.item_key, type: r.type, artifacts: [{ artifactId: 'a-' + r.id, itemRunId: r.id }], outputSummary: r.output_summary }]));
+      const mf = { items: eff.map((r) => ({ key: r.item_key, type: r.type, chapterId: r.chapter_id })) };
+      const split = PK.splitPendingVideosV3(mf, byItem, job.input_payload.videoMode, { videoUpgrade: true, upgradedKeys: VU.upgradedVideoKeysOf(job.input_payload), fallbackMode: VU.fallbackVideoModeOf(job.input_payload), runId: X.runId });
+      eq(split.pendingVideos, [], 'el paquete incluye ambos videos reales con sus preguntas');
+      await packaging.assertRunReady(job, { rulesVersion: 3, manifest: X.manifest.manifest ?? X.manifest });
+    });
+
+    await check('fix round 2 (m-8): un video con envío AMBIGUO queda fuera (needsReconciliation) y el resto del 2º upgrade sigue', async () => {
+      const X = await upgradedWithFirstDone('Curso B2 ambiguo');
+      const v2 = await latest(X.runId, `video:${X.c2}`);
+      await patchSummary(v2.id, { externalSubmitStartedAt: new Date().toISOString() });
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'ambiguous_video_submission: timeout' where id = $1`, [v2.id]);
+      const i2 = await latest(X.runId, `video_interactions:${X.c2}`);
+      await ds.query(`update public.generation_item_runs set status = 'blocked' where id = $1`, [i2.id]);
+      await recompute(X.runId);
+      const pv2 = await runs.previewVideoUpgrade(X.cid, ADMIN, 1, X.runId);
+      eq([pv2.pendingVideos, pv2.needsReconciliation.map((r) => r.itemKey)], [[], [`video:${X.c2}`]], 'ambiguo fuera');
+      assert(pv2.blockers.some((b) => b.code === VU.VIDEO_UPGRADE_AMBIGUOUS_SUBMISSION), 'si no queda nada más, traba clara');
+    });
+
+    await check('fix round 2 (m-7): reutilizar un job cuyo 1er intento YA publicó en YouTube → reutiliza ese id, 0 subidas nuevas', async () => {
+      const X = await previewCourse('Curso B2 youtube');
+      const pv = await runs.previewVideoUpgrade(X.cid, ADMIN, 1, X.runId);
+      await runs.confirmVideoUpgrade(X.cid, ADMIN, 1, X.runId, pv.estimateHash);
+      await itemWorker.processItem(deps(dbScheduler(), fakeVideogen()), await claim(X.runId, `video:${X.c1}`, X.c1));
+      const v2 = await latest(X.runId, `video:${X.c2}`);
+      await patchSummary(v2.id, { external: { videogenJobId: 'vg_published', mode: 'real', youtubeVideoId: 'PubVid12345', youtubeUrl: 'https://www.youtube.com/watch?v=PubVid12345' }, mode: 'real' });
+      await runs.cancelRun(X.cid, OWNER, 1, X.runId);
+      const pv2 = await runs.previewVideoUpgrade(X.cid, ADMIN, 1, X.runId);
+      eq(pv2.pendingVideos.map((p) => [p.itemKey, !!p.reusesVideogenJob]), [[`video:${X.c2}`, true]], 'reutiliza');
+      await runs.confirmVideoUpgrade(X.cid, ADMIN, 1, X.runId, pv2.estimateHash);
+      const uploadsBefore = yt.uploads;
+      const vg = fakeVideogen();
+      const s = dbScheduler();
+      await itemWorker.processItem(deps(s, vg), await claim(X.runId, `video:${X.c2}`, X.c2));
+      eq([s.st.failed.length, s.st.completed.length, vg.st.submits, yt.uploads - uploadsBefore], [0, 1, 0, 0], `sin envío ni subida nuevos: ${JSON.stringify(s.st.failed)}`);
+      eq((await latest(X.runId, `video:${X.c2}`)).output_summary.youtubeVideoId, 'PubVid12345', 'mismo id de YouTube');
+    });
+
     await check('I-1 empaquetado: un video real del upgrade cuyas preguntas siguen siendo las de la vista previa (upgrade cancelado antes) se OMITE (pendiente), nunca un H5P con preguntas de otro video', async () => {
       const PK = L('modules/dynamic-packaging/packaging-v3.js');
       const mf = { items: [{ key: 'video:x', type: 'video', chapterId: 'x' }, { key: 'video_interactions:x', type: 'video_interactions', chapterId: 'x' }] };
