@@ -8,7 +8,7 @@
  * (validación del item v3); NUNCA al empaquetar: los cursos ya generados siguen siendo
  * válidos con el schema R2 (validateExperience / assertValidExperience no cambian).
  */
-import { VC_MOVEMENT_IDS } from './schema';
+import { VC_EDU_APPLY_TYPES, VC_EDU_WHY_TYPES, VC_MOVEMENT_IDS } from './schema';
 import type { ChapterExperience, VcComponentType } from './schema';
 import type { VcValidationError } from './validate';
 import { lintView } from './text';
@@ -253,4 +253,67 @@ export function validateSimulatedDiagrams(doc: Pick<ChapterExperience, 'movement
     errors.push({ path: '$.bridge_to_next', code: 'TEXT_SIMULATED_DIAGRAM', message: 'el texto dibuja un diagrama con flechas («A → B → C»): escribe frases o usa process_steps o un diagram' });
   }
   return errors;
+}
+
+// ─── P3 — «¿Por qué importa?» / «¿Cómo lo aplicas?» ─────────────────────────
+
+/** Mínimo de bloques con `why` y con `apply` en una experiencia NUEVA (≥ v21-exp-6); tope del prompt: 6. */
+export const VC_EDU_FIELDS_MIN = 2;
+
+/** Tipos «de texto» (sin estructura visual propia): una racha de ellos es lo que el estudiante lee seguido. */
+export const VC_TEXT_RUN_TYPES: readonly VcComponentType[] = ['accordion', 'tabs', 'callout', 'case_scenario', 'reflection'];
+/** Recomendación del sistema visual 2.0: ~250 palabras como máximo entre elementos visuales (métrica, no error). */
+export const VC_TEXT_RUN_TARGET_WORDS = 250;
+
+function componentsOf(doc: Doc): Array<{ m: string; i: number; c: Record<string, unknown> }> {
+  const out: Array<{ m: string; i: number; c: Record<string, unknown> }> = [];
+  for (const m of VC_MOVEMENT_IDS) {
+    const list = doc?.movements?.[m];
+    if (Array.isArray(list)) list.forEach((c, i) => { if (c && typeof c === 'object') out.push({ m, i, c: c as unknown as Record<string, unknown> }); });
+  }
+  return out;
+}
+
+const filled = (v: unknown) => typeof v === 'string' && v.trim().length > 0;
+
+/**
+ * EDU_FIELDS_MISSING si la experiencia trae menos de VC_EDU_FIELDS_MIN bloques con `why` o con `apply`
+ * (o menos que los bloques que los admiten, si hay pocos). Solo experiencias NUEVAS (el empaque nunca
+ * lo exige: las viejas se dibujan sin esas líneas).
+ */
+export function validateEduFields(doc: Doc): VcValidationError[] {
+  const all = componentsOf(doc);
+  const whyOk = all.filter((x) => VC_EDU_WHY_TYPES.includes(x.c.type as VcComponentType));
+  const applyOk = all.filter((x) => VC_EDU_APPLY_TYPES.includes(x.c.type as VcComponentType));
+  const errors: VcValidationError[] = [];
+  const needWhy = Math.min(VC_EDU_FIELDS_MIN, whyOk.length);
+  const needApply = Math.min(VC_EDU_FIELDS_MIN, applyOk.length);
+  const haveWhy = whyOk.filter((x) => filled(x.c.why)).length;
+  const haveApply = applyOk.filter((x) => filled(x.c.apply)).length;
+  if (haveWhy < needWhy) errors.push({ path: '$.movements', code: 'EDU_FIELDS_MISSING', message: `${haveWhy} bloque(s) con "why": agrega "why" (por qué le importa al estudiante, una frase) en al menos ${needWhy} bloques de contenido (${VC_EDU_WHY_TYPES.join(', ')})` });
+  if (haveApply < needApply) errors.push({ path: '$.movements', code: 'EDU_FIELDS_MISSING', message: `${haveApply} bloque(s) con "apply": agrega "apply" (una acción concreta en su trabajo, una frase) en al menos ${needApply} bloques de contenido` });
+  return errors;
+}
+
+/** Métricas P3 para el output_summary: bloques con why/apply y la racha de texto más larga (palabras). */
+export function eduMetrics(doc: Doc): { why: number; apply: number; longestTextRunWords: number } {
+  const all = componentsOf(doc);
+  let longest = 0;
+  for (const m of VC_MOVEMENT_IDS) {
+    let run = 0;
+    for (const x of all.filter((y) => y.m === m)) {
+      if (VC_TEXT_RUN_TYPES.includes(x.c.type as VcComponentType)) {
+        run += wordsOf(x.c);
+        longest = Math.max(longest, run);
+      } else run = 0;
+    }
+  }
+  return { why: all.filter((x) => filled(x.c.why)).length, apply: all.filter((x) => filled(x.c.apply)).length, longestTextRunWords: longest };
+}
+
+function wordsOf(v: unknown, key?: string): number {
+  if (typeof v === 'string') return key === 'type' || key === 'variant' ? 0 : lintView(v).split(/\s+/).filter(Boolean).length;
+  if (Array.isArray(v)) return v.reduce((a: number, x) => a + wordsOf(x), 0);
+  if (v && typeof v === 'object') return Object.entries(v).reduce((a, [k, x]) => a + wordsOf(x, k), 0);
+  return 0;
 }

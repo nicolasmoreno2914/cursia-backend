@@ -819,6 +819,22 @@ async function pureChecks() {
     for (const [ctx, text] of ok) eq(V(ctx, text).ok, true, `válido ${ctx.type}`);
     eq(V(ok[5][0], F.FINAL_GIFT).summary, { questionCount: 12 }, 'summary GIFT');
     eq(V(ok[3][0], JSON.stringify(vdoc)).summary, { interactionCount: 5 }, 'summary video');
+    // P3: why/apply se exigen desde v21-exp-6 (antes, la experiencia sin ellos sigue válida); métricas en el summary.
+    const expCtx = (pv) => ({ type: 'experience', itemKey: 'experience:c1', chapterId: 'c1', promptVersion: pv });
+    const plainExp = F.experienceFor('c1');
+    eq(S.eduFieldsApply('v21-exp-6') && S.eduFieldsApply('v21-exp-12') && !S.eduFieldsApply('v21-exp-5') && !S.eduFieldsApply(null), true, 'eduFieldsApply');
+    eq(V(expCtx('v21-exp-5'), JSON.stringify(plainExp)).ok, true, 'v21-exp-5 sin why/apply: válida');
+    const missing = V(expCtx('v21-exp-6'), JSON.stringify(plainExp));
+    eq([codes(missing), missing.errors.length, /"why"/.test(missing.errors[0].message) && /"apply"/.test(missing.errors[1].message)], [['EDU_FIELDS_MISSING'], 2, true], 'v21-exp-6 sin why/apply: EDU_FIELDS_MISSING (why y apply)');
+    const withEdu = JSON.parse(JSON.stringify(plainExp));
+    const dp = withEdu.movements.deepening;
+    dp[0].why = 'Te ahorra malentendidos con el cliente.'; dp[0].apply = 'Usa una pregunta abierta en tu próxima llamada.';
+    dp[1].why = 'Ordena una conversación difícil.'; dp[1].apply = 'Anota las fases antes de tu siguiente reunión.';
+    const vr = V(expCtx('v21-exp-6'), JSON.stringify(withEdu));
+    eq(vr.ok, true, `v21-exp-6 con why/apply: ${JSON.stringify(vr.errors)}`);
+    eq([vr.summary.edu.why, vr.summary.edu.apply, vr.summary.edu.longestTextRunWords > 0], [2, 2, true], 'métricas P3 en el summary');
+    dp[0].why = 'Revisa el video del capítulo.';
+    eq(codes(V(expCtx('v21-exp-6'), JSON.stringify(withEdu))).includes('RESOURCE_MENTION'), true, 'why pasa por los lints de recursos');
     const bad = [
       [ok[0][0], '{no json', 'JSON_INVALID'],
       [ok[0][0], JSON.stringify({ ...F.courseIntroFixture(), closing: 'Revisa el video del capítulo para cerrar el recorrido completo y seguir aprendiendo siempre con tu equipo.' }), 'RESOURCE_MENTION'],

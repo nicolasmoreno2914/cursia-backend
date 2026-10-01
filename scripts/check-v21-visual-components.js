@@ -44,6 +44,9 @@ function check(name, fn) {
     console.error(`   ${err && err.message ? err.message : err}`);
   }
 }
+function eq(a, b, msg) {
+  if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`${msg}: got ${JSON.stringify(a)}, want ${JSON.stringify(b)}`);
+}
 function assert(cond, msg) {
   if (!cond) throw new Error(msg);
 }
@@ -1063,6 +1066,40 @@ check('M2: runtime versionado, localiza su label por currentScript y genera ids 
   assert(html.includes(`var V=${vc.VC_RUNTIME_VERSION}`) && html.includes('(N.v|0)<V'), 'version gate');
   assert(html.includes('document.currentScript'), 'currentScript');
   assert(html.includes('N.id=function'), 'ids derivados');
+});
+
+// ─── P3 — campos why/apply (schema + validador) ────────────────────────────
+check('P3: why/apply opcionales en los bloques de contenido (callout: solo apply); límites y lints como cualquier texto; validateEduFields', () => {
+  const doc = F.buildExperience();
+  assert(vc.validateExperience(doc).ok, 'fixture sin why/apply sigue válido');
+  for (const type of vc.VC_EDU_WHY_TYPES) {
+    const c = F.clone(components.find((x) => x.type === type));
+    const r = vc.validateComponent({ ...c, why: 'Te evita un error caro.', apply: 'Úsalo mañana en tu turno.' });
+    assert(r.length === 0, `${type}: acepta why/apply ${JSON.stringify(r)}`);
+    const long = vc.validateComponent({ ...c, why: 'x'.repeat(161) });
+    assert(long.some((e) => e.code === 'TEXT_TOO_LONG' && /why/.test(e.path)), `${type}: why > 160`);
+    const html = vc.validateComponent({ ...c, apply: 'usa <b>esto</b>' });
+    assert(html.some((e) => e.code === 'HTML_IN_TEXT'), `${type}: HTML en apply`);
+  }
+  const callout = components.find((x) => x.type === 'callout');
+  assert(vc.validateComponent({ ...callout, apply: 'Hazlo hoy.' }).length === 0 && vc.validateComponent({ ...callout, why: 'x' }).some((e) => e.code === 'UNKNOWN_FIELD'), 'callout: apply sí, why no');
+  for (const type of ['hero', 'learning_objectives', 'summary_visual', 'self_check', 'reflection', 'reveal_cards']) {
+    const c = components.find((x) => x.type === type);
+    assert(vc.validateComponent({ ...c, why: 'x' }).some((e) => e.code === 'UNKNOWN_FIELD'), `${type}: why no permitido`);
+  }
+  // decisión: why/apply también en el diagrama de decisión
+  const dec = { type: 'diagram', kind: 'decision', title: 'Decide', tree: { question: '¿Responde?', yes: { action: 'Acompáñala.' }, no: { action: 'Llama a emergencias.' } } };
+  assert(vc.validateComponent({ ...dec, why: 'Ahorra segundos.', apply: 'Pégalo junto al botiquín.' }).length === 0, 'decision con why/apply');
+  // validateEduFields: mínimo 2 why y 2 apply (o los que admitan los bloques)
+  eq(vc.validateEduFields(doc).map((e) => e.code), ['EDU_FIELDS_MISSING', 'EDU_FIELDS_MISSING'], 'sin campos');
+  const d2 = F.clone(doc);
+  d2.movements.deepening[0].why = 'a b'; d2.movements.deepening[1].why = 'c d';
+  d2.movements.deepening[0].apply = 'e f'; d2.movements.closing.find((c) => c.type === 'case_scenario').apply = 'g h';
+  eq(vc.validateEduFields(d2), [], 'con 2 why y 2 apply');
+  const one = { movements: { opening: [], deepening: [{ type: 'concept_cards', why: 'a', apply: 'b', cards: [] }], synthesis: [], closing: [], video_primer: [], self_check: [] } };
+  eq(vc.validateEduFields(one), [], 'un solo bloque elegible: basta con 1');
+  const m = vc.eduMetrics(d2);
+  assert(m.why === 2 && m.apply === 2 && m.longestTextRunWords > 0, JSON.stringify(m));
 });
 
 // ─── P3 — íconos y tonos (edu.ts) ───────────────────────────────────────────
