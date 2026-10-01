@@ -890,7 +890,9 @@ function reservationBookkeeping(ev) {
       const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
       const stt = await waitRunTerminal(ctl, 'E5 run');
       const items = await waitItemsDone(c.runId);
-      ok(stt.status === 'completed' && stt.failed === 0 && !stt.fatalError, 'E5: ejecutor del navegador terminó sin fallidos', stt);
+      // EV6 DoD: el sandbox genera videos de vista previa (mock) → el run termina en `preview`, nunca `completed`
+      // (mismo criterio que E1–E3); el paquete que sigue es de QA (owner SUPER_ADMIN + escape del sandbox).
+      ok(stt.status === 'preview' && stt.failed === 0 && !stt.fatalError, 'E5: ejecutor del navegador terminó sin fallidos (run en vista previa: videos mock)', stt);
       ok(items.every((i) => i.status === 'completed'), `E5: los ${items.length} items completed`, items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, i.error_message && i.error_message.slice(0, 400)]));
       ok(llm.st.unknown.length === 0, 'E5: LLM falso sin prompts no reconocidos', llm.st.unknown);
       eq([bs0.inv, bs0.ret, llm.st.invalidSent.h5p_branchingscenario || 0, llm.st.retriesSeen.h5p_branchingscenario || 0], [0, 0, 1, 1], 'E5: caso ramificado — 1 respuesta inválida (BS_FORWARD_ONLY) y EXACTAMENTE 1 reintento dirigido, luego pasó');
