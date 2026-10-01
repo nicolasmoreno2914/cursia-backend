@@ -130,6 +130,11 @@ export interface BuildDynamicMbzInput {
   /** Colores de módulo, ciclados por colorIndex. Hex sin '#'. */
   palette?: { dark: string; accent: string; modules: Array<{ main: string; accent: string }> };
   moodleVersion?: string; // default igual al builder legacy
+  /**
+   * DoD follow-up (R7): paquete QA (v1/v2) → aviso visible al inicio de la bienvenida y sufijo
+   * «[QA — vista previa, no entregable]» en el nombre del curso. Ausente/false = bytes de siempre.
+   */
+  qaPreviewNotice?: boolean;
 }
 
 export class PackagingNotReadyError extends Error {

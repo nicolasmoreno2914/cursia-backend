@@ -1657,9 +1657,9 @@ export class RunsService {
     // reintenta a ciegas (409 → endpoint de resolución explícita); cualquier
     // otro retry que pueda enviar un video NUEVO a Videogen pasa por el gate.
     const frozenDelivery = frozenVideoDeliveryOf(job.input_payload);
-    const preRows: Array<{ item_key: string; type: string; status: string; error: string | null; output_summary: Record<string, any> | null }> =
+    const preRows: Array<{ id: string; item_key: string; type: string; status: string; error: string | null; output_summary: Record<string, any> | null; depends_on: string[] | null }> =
       await this.dataSource.query(
-        `select item_key, type, status, error, output_summary from public.generation_item_runs g
+        `select id, item_key, type, status, error, output_summary, depends_on from public.generation_item_runs g
           where g.job_id = $1 and ${latestGenerationPredicate('g')}`,
         [job.id],
       );
@@ -1707,9 +1707,19 @@ export class RunsService {
         // de admin. Un video que nunca se envió (p.ej. bloqueado por una dependencia o por presupuesto)
         // sigue siendo del dueño: su primer render va por el gate de FinOps de siempre (presupuesto
         // aprobado). Re-poll, re-subida a YouTube e items no pagos: dueño.
-        if (!auto && this.videoModeOf(job) === 'real' && !isSuperAdminEmail(actor?.email) &&
-          (resubmitVideo || paidItems.some((r) => r.type === 'video' && videoRenderWasAttempted(r)))) {
-          throw adminRecoveryForbidden('Volver a generar un video (con costo)');
+        // DoD follow-up (n5): MISMA regla que el chequeo bajo lock (y que el espejo del frontend): el propio
+        // video que se re-renderizaría, o un video que ESTE reintento desbloquea (dependentsToUnblock). Un
+        // video bloqueado que este reintento no toca no lo vuelve recuperación de admin (antes: cualquier
+        // video bloqueado del run con un render intentado le ocultaba al dueño un reintento gratis).
+        if (!auto && this.videoModeOf(job) === 'real' && !isSuperAdminEmail(actor?.email)) {
+          const reRender = (r: { type: string; error: string | null; output_summary: Record<string, any> | null }) =>
+            r.type === 'video' && !r.output_summary?.external?.videogenJobId && videoRenderWasAttempted(r);
+          const unblockIds = new Set(this.dependentsToUnblock(
+            preRows.map((r) => ({ id: r.id, item_key: r.item_key, status: r.status as ItemRunStatus, depends_on: r.depends_on ?? [] })), itemKey,
+          ).map(String));
+          if (resubmitVideo || reRender(preTarget) || preRows.some((r) => unblockIds.has(String(r.id)) && reRender(r))) {
+            throw adminRecoveryForbidden('Volver a generar un video (con costo)');
+          }
         }
         await this.finopsPaidWorkGate({ courseId, ownerId, manifest, job, paidKeys: paidItems.map((r) => r.item_key), dryRun: !!auto });
       }

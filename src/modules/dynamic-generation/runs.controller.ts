@@ -11,6 +11,7 @@ import {
   Post,
   Res,
   UseGuards,
+  UseInterceptors,
   ValidationPipe,
 } from '@nestjs/common';
 import type { Response } from 'express';
@@ -22,6 +23,7 @@ import { FromRunDto, isFromRunRequest } from '../invalidation/dto/from-run.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
+import { OwnerSafeRunInterceptor } from './owner-safe-run.interceptor';
 
 /**
  * Runs de generación dinámica de un Manifest (Fase 5A). Ownership + `dynamic`
@@ -37,6 +39,8 @@ const START_BODY_PIPE = new ValidationPipe({
 
 @Controller('courses/:courseId/blueprints/:number/manifest/runs')
 @UseGuards(SupabaseJwtGuard)
+// DoD follow-up (R3): el RunDto del dueño nunca lleva el texto de admin del bloqueo del paquete.
+@UseInterceptors(OwnerSafeRunInterceptor)
 export class RunsController {
   constructor(private readonly runs: RunsService) {}
 

@@ -23,6 +23,9 @@
 
 import { Logger } from '@nestjs/common';
 import * as JSZip from 'jszip';
+import { QA_PREVIEW_NOTICE_TEXT, QA_PREVIEW_NOTICE_TITLE } from '../modules/course-shell/shell';
+/** Mismo sufijo que el builder v3 (`QA_PREVIEW_COURSE_SUFFIX`), sin importarlo (v3 → libro-v3 → este módulo). */
+const QA_PREVIEW_COURSE_SUFFIX = ` [${QA_PREVIEW_NOTICE_TITLE}]`;
 import {
   resolveMoodleVersion,
   sha1Buf,
@@ -239,11 +242,18 @@ export function stripLeadingDuplicateTitle(md: string, chapterTitle: string, cha
 
 // ─── Deterministic templates (sin LLM — ver spec §5 "Determinísticos") ─────
 
-function welcomeLabelHtml(plan: PackagingPlan): string {
+function welcomeLabelHtml(plan: PackagingPlan, qaPreviewNotice = false): string {
   const modItems = plan.modules
     .map((m) => `<li>Módulo ${m.moduleNumber}: ${esc(m.title)}</li>`)
     .join('\n');
+  // DoD follow-up (R7): paquete QA → aviso visible primero (estilos inline: Moodle quita <style>).
+  const qa = qaPreviewNotice
+    ? `<div style="border:2px solid #b45309;background:#fffbeb;color:#78350f;padding:12px 16px;border-radius:8px;margin:0 0 16px 0;">`
+      + `<p style="margin:0 0 4px 0;font-weight:700;">${esc(QA_PREVIEW_NOTICE_TITLE)}</p>`
+      + `<p style="margin:0;">${esc(QA_PREVIEW_NOTICE_TEXT)}</p></div>`
+    : '';
   return `<div style="font-family:'Segoe UI',Arial,sans-serif;">`
+    + qa
     + `<h1>${esc(plan.course.title)}</h1>`
     + (plan.course.summary ? `<p>${esc(plan.course.summary)}</p>` : '')
     + `<h2>Módulos del curso</h2>`
@@ -776,7 +786,7 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
   }
 
   // ── Bienvenida (sección 0) ──────────────────────────────────────────────
-  addLabel(0, '🏠 Bienvenida al Curso', welcomeLabelHtml(plan));
+  addLabel(0, '🏠 Bienvenida al Curso', welcomeLabelHtml(plan, input.qaPreviewNotice === true));
 
   // ── v2: Introducción al curso (sección 0, después de la bienvenida) ─────
   if (isV2) {
@@ -1102,7 +1112,10 @@ export async function buildDynamicMbz(input: BuildDynamicMbzInput): Promise<Buff
   }
 
   // ── course/* (mbz-builder.service.ts:1478-1505, adaptado) ───────────────
-  const courseTitle = plan.course.title;
+  // DoD follow-up (R7): un paquete QA lleva el sufijo «[QA — vista previa, no entregable]» (siempre entero).
+  const courseTitle = input.qaPreviewNotice === true
+    ? safeActivityName(plan.course.title, 254 - QA_PREVIEW_COURSE_SUFFIX.length) + QA_PREVIEW_COURSE_SUFFIX
+    : plan.course.title;
   // course.fullname es varchar(254) en Moodle (shortname también encaja en
   // ese límite) — truncar como las secciones/actividades, no a mitad de un
   // carácter multibyte.

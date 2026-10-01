@@ -156,6 +156,7 @@ async function findExistingDynamicMbz(
   runId: string,
   sourceIdsHash: string,
   moodleVersion: string,
+  packageKind: PackageKind = 'final',
 ): Promise<{ id: string } | null> {
   const list = await artifacts.findAll(ownerId, { courseId, type: 'dynamic_mbz' });
   const match = list.find((a) => {
@@ -163,10 +164,13 @@ async function findExistingDynamicMbz(
     // I3: la clave ya incluye la versión (salvo el default, byte-idéntico);
     // además se exige que la versión registrada coincida — sin campo (.mbz
     // anteriores a M11) = 4.1, el default del builder.
-    return meta?.runId === runId
+    if (!(meta?.runId === runId
       && meta?.sourceIdsHash === sourceIdsHash
       && meta?.builderVersion === DYNAMIC_MBZ_BUILDER_VERSION
-      && (meta?.moodleVersion ?? '4.1') === moodleVersion;
+      && (meta?.moodleVersion ?? '4.1') === moodleVersion)) return false;
+    // DoD follow-up (R7): solo un .mbz del MISMO tipo (un QA nunca reutiliza el final ni al revés).
+    if (packageKind !== 'final') return meta?.packageKind === packageKind;
+    return !meta?.packageKind;
   });
   return match ? { id: match.id } : null;
 }
@@ -337,6 +341,13 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
       return;
     }
 
+    // DoD follow-up (R7): v1/v2 también puede armar un paquete QA (solo SUPER_ADMIN con el escape de QA,
+    // decidido por PackagingService). Un paquete final: bytes, ruta y resumen de siempre.
+    const packageKind: PackageKind = (PACKAGE_KINDS as readonly string[]).includes(String(job.input_payload?.packageKind))
+      ? (job.input_payload.packageKind as PackageKind)
+      : 'final';
+    const qa = packageKind !== 'final';
+    const qaSummary = qa ? { packageKind, deliverable: false } : {};
     const byItem = await deps.resolveArtifacts({ query: deps.dataSource.query.bind(deps.dataSource) }, runId, manifest.manifest);
     const ids = sortedArtifactIds(byItem);
     const sourceIdsHash = packageReuseHash(DYNAMIC_MBZ_BUILDER_VERSION, ids, moodle.resolved);
@@ -346,7 +357,7 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
     if (leaseLost) return;
 
     // Restore-first: mismo runId + mismo set de artifacts de origen + misma versión -> reusar.
-    const existing = await findExistingDynamicMbz(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash, moodle.resolved);
+    const existing = await findExistingDynamicMbz(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash, moodle.resolved, packageKind);
     if (existing) {
       logger.log(`Job ${job.id}: dynamic_mbz ya existe (${existing.id}) para runId=${runId} — reutilizando sin reconstruir`);
       const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
@@ -355,6 +366,7 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
         sourceIdsHash,
         builderVersion: DYNAMIC_MBZ_BUILDER_VERSION,
         reused: true,
+        ...qaSummary,
         ...warningsSummary,
       });
       if (!ok) logger.warn(`Job ${job.id}: completeJob devolvió false (lease perdida) tras reutilizar ${existing.id}`);
@@ -371,16 +383,19 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
     if (leaseLost) return;
 
     // Sin env se pasa undefined (el builder aplica su default: mismo .mbz que antes).
-    const buffer = await deps.buildMbz({ plan, contents, moodleVersion: moodle.requested });
+    const buffer = await deps.buildMbz({ plan, contents, moodleVersion: moodle.requested, ...(qa ? { qaPreviewNotice: true } : {}) });
     if (leaseLost) return;
 
-    const storagePath = `${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${sourceIdsHash}.mbz`;
+    // DoD follow-up (R7): un paquete QA va con el prefijo `QA-VISTA-PREVIA-` y bajo `qa-internal/` (fuera de
+    // las políticas own-folder del dueño), igual que en v3.
+    const mbzFilename = `${qa ? QA_PACKAGE_FILENAME_PREFIX : ''}${sourceIdsHash}.mbz`;
+    const storagePath = `${qa ? `${QA_INTERNAL_STORAGE_PREFIX}/` : ''}${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${mbzFilename}`;
     const artifact = await deps.artifacts.uploadBufferArtifact({
       ownerId: job.owner_id,
       courseId: artifactCourseId(job),
       jobId: job.id,
       type: 'dynamic_mbz',
-      filename: `${sourceIdsHash}.mbz`,
+      filename: mbzFilename,
       storagePath,
       buffer,
       mimeType: 'application/vnd.moodle.backup',
@@ -398,6 +413,7 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
         sourceIdsHash,
         builderVersion: DYNAMIC_MBZ_BUILDER_VERSION,
         moodleVersion: moodle.resolved,
+        ...qaSummary,
       },
     });
     if (leaseLost) return;
@@ -417,6 +433,7 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
       sourceIdsHash,
       builderVersion: DYNAMIC_MBZ_BUILDER_VERSION,
       reused: false,
+      ...qaSummary,
       ...warningsSummary,
     });
     if (!ok) {

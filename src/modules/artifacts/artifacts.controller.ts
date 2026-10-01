@@ -116,6 +116,7 @@ export class ArtifactsController {
     @Param('id', new ParseUUIDPipe()) id: string,
     @CurrentUser() user: AuthUser,
   ) {
-    await this.artifactsService.remove(id, user.id);
+    // DoD follow-up (R4): un .mbz QA / degradado NUEVO no existe para un no admin (404, igual que GET).
+    await this.artifactsService.remove(id, user.id, { allowAdminOnlyPackage: isSuperAdminEmail(user.email) });
   }
 }
