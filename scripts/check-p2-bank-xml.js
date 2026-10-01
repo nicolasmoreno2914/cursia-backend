@@ -417,7 +417,7 @@ async function main() {
     assert(v.ok, `validador: ${JSON.stringify(v.issues.slice(0, 5))}`);
     const again = await B.buildDynamicMbzV3(bankInput().input);
     eq(sha(again.mbz), sha(built.mbz), 'sha');
-    eq(built.summary.builderVersion, '3.4.0', 'versión');
+    eq(built.summary.builderVersion, B.DYNAMIC_MBZ_BUILDER_VERSION_V3, 'versión');
   });
 
   await check('A4: evidencia que no está en el Markdown de su capítulo → EXAM_BANK_INVALID [EXAM_BANK_EVIDENCE] (builder); banco bajo el piso → EXAM_BANK_INVALID', async () => {
@@ -461,7 +461,7 @@ async function main() {
         const mine = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, o));
         const base = await BB.buildDynamicMbzV3(PF.packagingInput(baseRoot, o));
         eq(sha(mine.mbz), sha(base.mbz), `sha GIFT ${o.engine}`);
-        eq([mine.summary.builderVersion, base.summary.builderVersion], ['3.4.0', '3.3.0'], 'solo cambia la versión');
+        eq([mine.summary.builderVersion, base.summary.builderVersion], [B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.3.0'], 'solo cambia la versión');
         console.log(`   sha256 GIFT (${o.engine}, ${o.courseId}) = base: ${sha(mine.mbz)}`);
       }
     }
