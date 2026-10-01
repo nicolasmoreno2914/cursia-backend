@@ -42,17 +42,19 @@ export const GRADE_METHOD_ES: Readonly<Record<GradeMethod, string>> = Object.fre
 });
 
 /** EV5 — qué hará el estudiante, según el tipo de actividad (antes: la misma frase en todas). */
-const ACTIVITY_TASK_ES: Readonly<Record<H5pActivityType | 'scorm', string>> = Object.freeze({
+const ACTIVITY_TASK_ES: Readonly<Record<H5pActivityType | 'branchingscenario' | 'scorm', string>> = Object.freeze({
   questionset: 'Responderás preguntas de opción múltiple y de verdadero o falso sobre el capítulo.',
   singlechoiceset: 'Responderás preguntas de opción única sobre el capítulo.',
   dragtext: 'Arrastrarás cada término al lugar que le corresponde dentro de un texto.',
   blanks: 'Completarás un texto escribiendo la palabra que falta en cada espacio.',
+  // EV6 H5P v2: caso ramificado (solo Manifests con activityTypeRules = 2).
+  branchingscenario: 'Tomarás decisiones en un caso de tu trabajo; cada camino lleva a un final con su puntaje.',
   scorm: 'Resolverás un reto interactivo por etapas con lo que aprendiste en el capítulo.',
 });
 
 /** P3 — solo la tarea («Arrastrarás cada término…»): la nota mínima y los intentos van en la fila de datos. */
 export function activityTask(activityType?: string | null): string {
-  return (activityType ? ACTIVITY_TASK_ES[activityType as H5pActivityType | 'scorm'] : undefined) ?? 'Aplicarás lo aprendido en el capítulo en una actividad calificada.';
+  return (activityType ? ACTIVITY_TASK_ES[activityType as H5pActivityType | 'branchingscenario' | 'scorm'] : undefined) ?? 'Aplicarás lo aprendido en el capítulo en una actividad calificada.';
 }
 
 

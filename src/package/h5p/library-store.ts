@@ -55,6 +55,49 @@ export interface H5pLibraryStoreManifest {
 export interface H5pLibrarySource {
   readonly profileId: string;
   libraryFiles(dir: string): Record<string, Buffer> | null;
+  /**
+   * EV6 H5P v2 (H2, review m-8): aviso MIT que viaja DENTRO de cada carpeta delta del `.h5p`
+   * (`LICENSE.txt`), o null si la carpeta ya trae ese archivo. Opcional: sin él, el paquete
+   * lleva solo los archivos upstream.
+   */
+  licenseNotice?(dir: string): string | null;
+}
+
+/** Nombre del aviso de licencia que Cursia agrega a cada carpeta delta del `.h5p` (extensión del whitelist H5P). */
+export const H5P_BUNDLE_LICENSE_NOTICE_FILE = 'LICENSE.txt';
+
+export const MIT_LICENSE_TEXT = [
+  'Permission is hereby granted, free of charge, to any person obtaining a copy',
+  'of this software and associated documentation files (the "Software"), to deal',
+  'in the Software without restriction, including without limitation the rights',
+  'to use, copy, modify, merge, publish, distribute, sublicense, and/or sell',
+  'copies of the Software, and to permit persons to whom the Software is',
+  'furnished to do so, subject to the following conditions:',
+  '',
+  'The above copyright notice and this permission notice shall be included in all',
+  'copies or substantial portions of the Software.',
+  '',
+  'THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR',
+  'IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,',
+  'FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE',
+  'AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER',
+  'LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,',
+  'OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE',
+  'SOFTWARE.',
+].join('\n');
+
+/** Aviso MIT determinístico de una librería del store (texto plano). */
+export function h5pLibraryLicenseNotice(entry: H5pLibraryStoreEntry): string {
+  if (entry.licence !== 'MIT') throw new Error(`H5P_STORE_LICENCE_MISMATCH: ${entry.dir} no es MIT (${entry.licence})`);
+  return [
+    `${entry.machineName} ${entry.upstreamVersion} — MIT License`,
+    `Copyright (c) ${entry.copyrightHolder}`,
+    `Upstream: ${entry.repoUrl}`,
+    `Licence evidence: ${entry.licenceSource}`,
+    '',
+    MIT_LICENSE_TEXT,
+    '',
+  ].join('\n');
 }
 
 const sha256 = (b: Buffer): string => createHash('sha256').update(b).digest('hex');
@@ -80,6 +123,12 @@ export function openH5pLibraryStore(profile: H5pProfile, dir: string = H5P_LIBRA
   return {
     profileId: manifest.profileId,
     manifest,
+    licenseNotice(libDir: string): string | null {
+      const entry = byDir.get(libDir);
+      if (!entry) return null;
+      if (entry.files.some((f) => f.path === H5P_BUNDLE_LICENSE_NOTICE_FILE)) return null;
+      return h5pLibraryLicenseNotice(entry);
+    },
     libraryFiles(libDir: string): Record<string, Buffer> | null {
       const hit = memo.get(libDir);
       if (hit) return hit;

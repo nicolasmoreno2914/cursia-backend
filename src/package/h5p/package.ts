@@ -13,7 +13,7 @@ import * as JSZip from 'jszip';
 import { createHash } from 'crypto';
 import { isUuid } from './ids';
 import { CURSIA_H5P_PROFILE_V1, profileDeltaDirs, profileMainLibrary, profileRuntimeDependencies } from './profile';
-import { H5pLibrarySource } from './library-store';
+import { H5P_BUNDLE_LICENSE_NOTICE_FILE, H5pLibrarySource } from './library-store';
 import { H5pDependencyRef, H5pLibraryRef, H5pProfile, compareH5pRefs, h5pLibraryDirName } from './profile-generator';
 
 /** Fecha fija de todas las entradas del zip (UTC; JSZip escribe la hora DOS en UTC). */
@@ -224,7 +224,7 @@ export interface BundledH5pInput extends ContentOnlyH5pInput {
  * EXACTAMENTE las carpetas de `profile.deltaByMain[mainLibrary]` (clausura full
  * de la principal − librerías de v1, que el preflight ya exige en el sitio).
  * Un admin/manager que restaura instala esas librerías al primer uso (prueba H5P2,
- * curso 1007). Bytes determinísticos. Falla fuerte con
+ * curso 1007). Cada carpeta lleva además `LICENSE.txt` (aviso MIT del store) si el store lo da. Bytes determinísticos. Falla fuerte con
  * H5P_PACKAGE_MISSING_LIBRARY_FILES si falta cualquier archivo del store.
  */
 export async function buildBundledH5p(input: BundledH5pInput): Promise<Buffer> {
@@ -252,6 +252,10 @@ export async function buildBundledH5p(input: BundledH5pInput): Promise<Buffer> {
       continue;
     }
     for (const rel of Object.keys(files).sort()) entries.push([`${d}/${rel}`, files[rel]]);
+    // EV6 H5P v2 (H2, m-8): aviso MIT dentro de la carpeta (Moodle 4.5 lo acepta: .txt está en el
+    // whitelist de librerías; validado con api::is_valid_package como autor administrador).
+    const notice = input.libraryStore.licenseNotice ? input.libraryStore.licenseNotice(d) : null;
+    if (notice !== null) entries.push([`${d}/${H5P_BUNDLE_LICENSE_NOTICE_FILE}`, notice]);
   }
   if (missing.length) throw new Error(`H5P_PACKAGE_MISSING_LIBRARY_FILES: ${missing.join(', ')}`);
   return zipDeterministic(entries);

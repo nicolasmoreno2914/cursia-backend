@@ -409,7 +409,14 @@ function v2Doc(durationSec, videoItemKey = 'video:ch9') {
     eq(tops, BS_DELTA, 'carpetas');
     eq(names.filter((n) => n === 'h5p.json' || n.startsWith('content/')), ['content/content.json', 'h5p.json'], 'contenido');
     const nLib = store.manifest.libraries.reduce((a, l) => a + l.files.length, 0);
-    eq(names.length, nLib + 2, 'cantidad de entradas');
+    // EV6 H5P v2 (H2, m-8): + un LICENSE.txt (aviso MIT) por carpeta delta.
+    eq(names.length, nLib + 2 + BS_DELTA.length, 'cantidad de entradas');
+    for (const d of BS_DELTA) {
+      const notice = await z.file(`${d}/LICENSE.txt`).async('string');
+      const e = store.manifest.libraries.find((l) => l.dir === d);
+      assert(notice.startsWith(`${e.machineName} ${e.upstreamVersion} — MIT License\nCopyright (c) ${e.copyrightHolder}\nUpstream: ${e.repoUrl}\nLicence evidence: ${e.licenceSource}\n`), `${d}: aviso`);
+      assert(notice.includes('Permission is hereby granted, free of charge'), `${d}: texto MIT`);
+    }
     for (const l of store.manifest.libraries) for (const f of l.files.slice(0, 3)) eq(sha256(await z.file(`${l.dir}/${f.path}`).async('nodebuffer')), f.sha256, `${l.dir}/${f.path}`);
     const hj = JSON.parse(await z.file('h5p.json').async('string'));
     eq(hj.mainLibrary, 'H5P.BranchingScenario', 'main');

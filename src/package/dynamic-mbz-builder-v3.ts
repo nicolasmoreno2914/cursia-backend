@@ -54,10 +54,19 @@ import {
 import type { AssessmentCategoryKey, CompletionCandidate } from './assessment/resolve-assessment';
 import {
   CURSIA_H5P_PROFILE_V1,
+  CURSIA_H5P_PROFILE_V2,
+  H5P_MOODLE_GRADING,
   H5P_PACKAGE_MIMETYPE,
+  H5pBuiltContent,
+  H5pLibrarySource,
   assertH5pGradableInMoodle,
   buildBlanks,
+  buildBranchingScenario,
+  buildBundledH5p,
   buildContentOnlyH5p,
+  buildDialogCardsFromExperience,
+  openH5pLibraryStore,
+  validateBranchingScenarioInput,
   buildDragText,
   buildQuestionSet,
   buildVideoActivity,
@@ -120,11 +129,11 @@ import {
   welcomeLabel,
   welcomeStartLabel,
 } from '../modules/course-shell';
-import type { H5pActivityType } from '../modules/course-shell';
+import type { H5pActivityTypeV2 } from '../modules/course-shell';
 import { PackagingPlanV3, buildPackagingPlanV3, packagingPlanV3Sha256 } from '../modules/dynamic-packaging/packaging-plan-v3';
 import { compileLibroHtmlV3, libroWordCount } from './v3/libro-v3';
 import { downscaleCoverPng } from './v3/png-downscale';
-import { ActivityFrameTone, activityPackageFilename, h5pActivityInlineIntroHtml, introThemeFrom, scormIntroHtml } from './v3/activity-intro';
+import { ActivityFrameTone, activityPackageFilename, h5pActivityInlineIntroHtml, introThemeFrom, reviewCardsIntroHtml, scormIntroHtml } from './v3/activity-intro';
 import { moduleTone } from '../modules/visual-components/edu';
 import { groundColor } from '../modules/visual-components/render';
 import { IdAllocator, buildQuizV3, parseScormManifestIds, scormActivityXmlV3 } from './v3/moodle-activities-v3';
@@ -284,6 +293,8 @@ export interface BuildDynamicMbzV3Result {
     counts: CourseFacts['counts'];
     /** F1 (I3): resultado de la normalización de pesos (ver `assessmentPackageSummary`). */
     assessment: AssessmentPackageSummary;
+    /** EV6 H5P v2: solo si el paquete lleva librerías H5P incluidas (restaurar como administrador o gestor). */
+    restore?: { as: 'admin_or_manager'; note: string };
   };
 }
 
@@ -531,10 +542,17 @@ async function buildActivityH5p(
   chapterId: string,
   itemKey: string,
   passingGrade: number,
-  expectedType: H5pActivityType | null,
+  expectedType: H5pActivityTypeV2 | null,
+  activityTypeRules: number | undefined,
+  libraryStore: () => H5pLibrarySource,
 ): Promise<{ h5p: Buffer; mainLibrary: string }> {
   if (!expectedType) throw new Error(`MBZ_V3_INVARIANT: facts sin tipo h5p para ${itemKey}`);
-  const check = validateH5pActivityPayload(payload, { chapterId, itemKey, expectedType });
+  const check = validateH5pActivityPayload(payload, {
+    chapterId,
+    itemKey,
+    expectedType,
+    ...(activityTypeRules !== undefined ? { activityTypeRules } : {}),
+  });
   if (!check.ok) {
     throw new Error(`H5P_ACTIVITY_PAYLOAD_INVALID: ${itemKey}: ${check.errors.map((e) => `${e.code} ${e.path}: ${e.message}`).join('; ')}`);
   }
@@ -555,6 +573,23 @@ async function buildActivityH5p(
     delete input.passPercentage;
     validateBlanksInput(input);
     built = buildBlanks(input);
+  } else if (p.type === 'branchingscenario') {
+    // EV6 H5P v2 (solo activityTypeRules = 2, ya verificado arriba): caso ramificado calificado,
+    // con sus librerías delta DENTRO del .h5p (perfil v2 + store versionado; nada se descarga).
+    delete input.passPercentage;
+    if (typeof input.title === 'string') input.title = h5pTitle(input.title, 120);
+    validateBranchingScenarioInput(input);
+    const bs = buildBranchingScenario(input);
+    assertH5pGradableInMoodle(bs.mainLibrary);
+    const h5p = await buildBundledH5p({
+      mainLibrary: bs.mainLibrary,
+      content: bs.content,
+      title: bs.title,
+      language: 'es',
+      profile: CURSIA_H5P_PROFILE_V2,
+      libraryStore: libraryStore(),
+    });
+    return { h5p, mainLibrary: bs.mainLibrary };
   } else {
     throw new Error(`H5P_NOT_GRADABLE_IN_MOODLE: tipo ${p.type} no es una actividad calificable (R-011)`);
   }
@@ -721,9 +756,19 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     moduleIntros,
     experiences: c.experiences,
   });
+  // EV6 H5P v2 — «Repaso» (Dialog Cards) desde la experiencia validada, solo con el ajuste del
+  // Blueprint. Capítulos con < 4 tarjetas no llevan repaso (nunca un mazo de 1–3).
+  const reviewDecks = new Map<string, H5pBuiltContent>();
+  if (blueprint.course.reviewCards === true) {
+    for (const ch of allChapters) {
+      const deck = buildDialogCardsFromExperience({ chapterTitle: ch.title, experience: c.experiences.get(ch.chapterId) });
+      if (deck) reviewDecks.set(ch.chapterId, deck);
+    }
+  }
   const facts = buildCourseFacts({
     manifest,
     blueprint,
+    ...(reviewDecks.size ? { reviewCardsChapterIds: [...reviewDecks.keys()] } : {}),
     assessment: input.assessmentProfile,
     hours: input.hours ?? null,
     pendingVideos: plan.omittedVideos.length ? { chapterIds: plan.omittedVideos.map((v) => v.chapterId), noticeChapterIds } : null,
@@ -852,6 +897,42 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     if (kind === 'activity') resolveCta('next-activity', secnum, `$@H5PACTIVITYVIEWBYID*${a.mid}@$`);
     h5pPackages.push({ itemKey, filename, mainLibrary, sha1: sha1Buf(h5p), bytes: h5p.length });
   };
+
+  /**
+   * EV6 H5P v2 — add-on SIN nota (Dialog Cards «Repaso»): sin grade item, enabletracking 0,
+   * completion 2 por vista (completionview 1), fuera de los criterios de completion del curso
+   * y de la agregación del gradebook (no entra en `graded`).
+   */
+  const addUngradedH5pActivity = (secnum: number, idnumber: string, name: string, itemKey: string, filename: string, h5p: Buffer, mainLibrary: string, intro: (mid: number) => string): void => {
+    if (H5P_MOODLE_GRADING[mainLibrary]?.gradable !== false) throw new Error(`MBZ_V3_INVARIANT: ${mainLibrary} no es un add-on sin nota`);
+    const a = W.newActivity('h5pactivity', secnum, name, idnumber);
+    const fPkg = W.addFile(a.ctx, 'mod_h5pactivity', 'package', filename, h5p, H5P_PACKAGE_MIMETYPE);
+    const fIntro = W.addFile(a.ctx, 'mod_h5pactivity', 'intro', filename, h5p, H5P_PACKAGE_MIMETYPE);
+    const introHtml = intro(a.mid);
+    W.put(
+      `${a.dir}/h5pactivity.xml`,
+      applyXmlFields(
+        h5pactivityXml({
+          aid: a.aid, mid: a.mid, ctx: a.ctx, name, intro: introHtml, grade: 100,
+          grademethod: resolved.kinds.activity.gradeMethod, enabletracking: 1, reviewmode: 1,
+          displayoptions: { frame: false, download: false, embed: false, copyright: false }, ts,
+        }),
+        { grade: '0', enabletracking: '0' },
+      ),
+    );
+    W.put(
+      `${a.dir}/module.xml`,
+      applyXmlFields(withIdnumber(moduleXml(a.mid, 'h5pactivity', secnum, ts, MV.bv), idnumber), { completion: '2', completionview: '1', showdescription: '1' }),
+    );
+    W.put(`${a.dir}/grades.xml`, gradesXml(a.aid));
+    W.put(`${a.dir}/inforef.xml`, inforef([fPkg, fIntro]));
+    W.boilerplate(a.dir);
+    labelsHtml.push({ where: `${idnumber}#intro`, html: introHtml });
+    h5pPackages.push({ itemKey, filename, mainLibrary, sha1: sha1Buf(h5p), bytes: h5p.length });
+  };
+  // EV6 H5P v2: store de librerías (perfil v2) abierto solo si el paquete lleva BS o «Repaso».
+  let storeMemo: H5pLibrarySource | null = null;
+  const libraryStore = (): H5pLibrarySource => (storeMemo ??= openH5pLibraryStore(CURSIA_H5P_PROFILE_V2));
 
   const questionCategories: string[] = [];
   const examBankPlans: ExamBankPlans = {};
@@ -1047,6 +1128,8 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
             youtubeId: video.youtubeId,
             durationSec: video.durationSec,
             interactionsDoc: c.videoInteractions.get(ch.chapterId),
+            // EV6 IV avanzado: solo Manifests con features.ivAdvanced = 1 (schemaVersion 2).
+            ...(manifest.features?.ivAdvanced === 1 ? { ivAdvanced: true } : {}),
           });
           assertH5pGradableInMoodle('H5P.InteractiveVideo');
           const filename = videoPackageFilename(key);
@@ -1056,12 +1139,39 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
           );
           continue;
         }
+        if (slot.kind === 'review_cards') {
+          const deck = reviewDecks.get(ch.chapterId);
+          if (!deck || cf.reviewCards !== true) throw new Error(`MBZ_V3_INVARIANT: «Repaso» del capítulo ${ch.chapterNumber} sin mazo`);
+          const key = `review_cards:${ch.chapterId}`;
+          const filename = activityPackageFilename(key);
+          const h5p = await buildBundledH5p({
+            mainLibrary: deck.mainLibrary,
+            content: deck.content,
+            title: deck.title,
+            language: 'es',
+            profile: CURSIA_H5P_PROFILE_V2,
+            libraryStore: libraryStore(),
+          });
+          const name = safeActivityName(`Repaso · Capítulo ${ch.chapterNumber}: ${ch.title}`);
+          addUngradedH5pActivity(sec, `${idp}:review_cards`, name, key, filename, h5p, deck.mainLibrary, (mid) =>
+            reviewCardsIntroHtml({ packageFilename: filename, title: deck.title, activityMid: mid, theme: introTheme, frame: frameFor(ch.chapterNumber) }),
+          );
+          continue;
+        }
         // slot.kind === 'activity'
         const act = c.activities.get(ch.chapterId) as ActivityContentV3;
         const key = ch.keys.activity as string;
         const name = safeActivityName(`Actividad práctica · Capítulo ${ch.chapterNumber}: ${ch.title}`);
         if (act.variant === 'h5p') {
-          const built = await buildActivityH5p(act.payload, ch.chapterId, key, resolved.kinds.activity.passingGrade, cf.activityType);
+          const built = await buildActivityH5p(
+            act.payload,
+            ch.chapterId,
+            key,
+            resolved.kinds.activity.passingGrade,
+            cf.activityType,
+            manifest.features?.activityTypeRules,
+            libraryStore,
+          );
           const filename = activityPackageFilename(key);
           addH5pActivity(sec, `${idp}:activity`, name, 'activity', key, filename, built.h5p, built.mainLibrary, (mid) =>
             h5pActivityInlineIntroHtml({ packageFilename: filename, title: ch.title, activityMid: mid, theme: introTheme, frame: frameFor(ch.chapterNumber) }),
@@ -1371,9 +1481,23 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       warnings,
       counts: facts.counts,
       assessment: assessmentPackageSummary(resolved),
+      // EV6 H5P v2: con paquetes que traen sus librerías (Branching Scenario / «Repaso») la entrega
+      // pide restaurar como administrador o gestor (rulings Q1). Ausente en los paquetes de siempre.
+      ...(h5pPackages.some((p) => p.mainLibrary in (CURSIA_H5P_PROFILE_V2.deltaByMain ?? {})) ? { restore: H5P_V2_RESTORE_NOTE } : {}),
     },
   };
 }
+
+/**
+ * EV6 H5P v2 — instrucción de entrega (rulings Q1) para paquetes con librerías H5P incluidas. El
+ * frontend la muestra en «Cómo restaurarlo en Moodle» (summary.restore del paquete).
+ */
+export const H5P_V2_RESTORE_NOTE = Object.freeze({
+  as: 'admin_or_manager' as const,
+  note:
+    'Restaura este curso como administrador o gestor: así Moodle instala solo los tipos de contenido nuevos (caso ramificado y tarjetas de repaso). ' +
+    'Si lo restaura un docente en un sitio que aún no los tiene, un administrador debe subir antes el Cursia H5P Library Pack v2.',
+});
 
 /** Librerías del perfil (para el validador): "Machine major.minor". */
 export function h5pProfileLibraryKeys(): Set<string> {

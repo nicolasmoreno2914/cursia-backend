@@ -54,6 +54,7 @@ import {
   CURSIA_H5P_PROFILE_V1,
   CURSIA_H5P_PROFILE_V2,
   H5P_MOODLE_GRADING,
+  H5P_BUNDLE_LICENSE_NOTICE_FILE,
   H5pLibraryStoreManifest,
   h5pLibraryDirName,
   openH5pLibraryStore,
@@ -192,6 +193,9 @@ function kindOfGraded(idnumber: string): AssessableType | null {
 }
 
 const GRADED = new Set(['quiz', 'scorm', 'h5pactivity']);
+
+/** EV6 H5P v2: add-on «Repaso» (Dialog Cards) — h5pactivity SIN nota, completion por vista. */
+const REVIEW_CARDS_RE = /^cv3:ch:([^:]+):review_cards$/;
 
 export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectations): Promise<MbzV3ValidationResult> {
   const issues: MbzV3Issue[] = [];
@@ -463,7 +467,12 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
 
   // ── ítems calificables ──
   const gradedActs: Array<{ a: ParsedActivity; kind: AssessableType }> = [];
+  const reviewActs: ParsedActivity[] = [];
   for (const a of acts) {
+    if (REVIEW_CARDS_RE.test(a.idnumber)) {
+      reviewActs.push(a);
+      continue;
+    }
     const kind = kindOfGraded(a.idnumber);
     if (GRADED.has(a.modname) !== (kind !== null)) {
       add('STRUCTURE', a.dir, `modname ${a.modname} incoherente con idnumber ${a.idnumber}`);
@@ -510,6 +519,22 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       }
     } else if (a.module.completion !== '0') add('COMPLETION', a.dir, `módulo no calificable con completion ${a.module.completion}`);
   }
+  // EV6 H5P v2: «Repaso» = h5pactivity sin nota (sin grade item, grade 0, sin tracking), completion
+  // por vista, solo en capítulos que facts declara con reviewCards (nunca criterio del curso: ver abajo).
+  for (const a of reviewActs) {
+    const chId = (REVIEW_CARDS_RE.exec(a.idnumber) as RegExpExecArray)[1];
+    if (a.modname !== 'h5pactivity') add('ADDON', a.dir, `«Repaso» debe ser h5pactivity (vino ${a.modname})`);
+    if (a.grade || a.inforefGradeItems.length) add('ADDON', a.dir, '«Repaso» con ítem de calificación');
+    const md = a.module;
+    if (md.completion !== '2' || md.completionview !== '1' || md.completionpassgrade !== '0' || md.completiongradeitemnumber !== '$@NULL@$') {
+      add('ADDON', a.dir, `«Repaso» con completion ${md.completion}/${md.completionview}/${md.completionpassgrade}/${md.completiongradeitemnumber} ≠ 2/1/0/NULL`);
+    }
+    const hx = (await text(`${a.dir}/h5pactivity.xml`)) ?? '';
+    if (tag(hx, 'grade') !== '0' || tag(hx, 'enabletracking') !== '0') add('ADDON', a.dir, `«Repaso» con grade ${tag(hx, 'grade')} / enabletracking ${tag(hx, 'enabletracking')} ≠ 0/0`);
+    if (facts.chapters.find((c) => c.id === chId)?.reviewCards !== true) add('ADDON', a.dir, `facts no declara «Repaso» en el capítulo ${chId}`);
+    if (/calificab|nota de esta actividad/i.test(a.intro) || /calificab/i.test(a.name)) add('ADDON', a.dir, '«Repaso» presentado como calificable');
+  }
+  if (reviewActs.length !== (facts.counts.reviewCards ?? 0)) add('ADDON', 'review_cards', `${reviewActs.length} «Repaso» en el paquete ≠ facts ${facts.counts.reviewCards ?? 0}`);
   if (resolved.withoutGrades === true && gradedActs.length > 0) add('STRUCTURE', 'graded', `curso sin nota con ${gradedActs.length} ítem(s) calificable(s)`);
   const practice = gradedActs.filter((g) => g.kind === 'activity' || g.kind === 'video').length;
   const expectedPractice = facts.counts.activities + facts.counts.videos;
@@ -832,7 +857,10 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
           // Archivos de la carpeta == los del store (nombres; sha256 de library.json). Los JS/CSS no se inflan.
           const st = storeLibs.get(d);
           const inPkg = extra.filter((n) => n.startsWith(`${d}/`)).map((n) => n.slice(d.length + 1)).sort();
-          const inStore = st ? st.files.map((f) => f.path).sort() : [];
+          // EV6 H5P v2 (H2, m-8): + el aviso LICENSE.txt que agrega buildBundledH5p (si el store no lo trae).
+          const inStore = st
+            ? [...st.files.map((f) => f.path), ...(st.files.some((f) => f.path === H5P_BUNDLE_LICENSE_NOTICE_FILE) ? [] : [H5P_BUNDLE_LICENSE_NOTICE_FILE])].sort()
+            : [];
           const missingFiles = inStore.filter((f) => !inPkg.includes(f));
           const extraFiles = inPkg.filter((f) => !inStore.includes(f));
           if (missingFiles.length) add('H5P_LIBRARIES', a.idnumber, `${d}: faltan archivos del store: ${missingFiles.slice(0, 3).join(', ')}${missingFiles.length > 3 ? ` (+${missingFiles.length - 3})` : ''}`);
@@ -855,7 +883,10 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
         }
       }
       // G6 M7: la librería principal debe corresponder al rol (video → IV; actividad → tipo de facts: h5pType del Manifest o, legacy, R-012 del UUID; calificable en Moodle).
-      const role = /^cv3:ch:([^:]+):(video|activity)$/.exec(a.idnumber);
+      const role = /^cv3:ch:([^:]+):(video|activity|review_cards)$/.exec(a.idnumber);
+      if (role && role[2] === 'review_cards' && hj.mainLibrary !== 'H5P.Dialogcards') {
+        add('H5P_LIBRARIES', a.idnumber, `un «Repaso» debe ser H5P.Dialogcards (vino ${hj.mainLibrary})`);
+      }
       if (role && role[2] === 'video' && hj.mainLibrary !== 'H5P.InteractiveVideo') {
         add('H5P_LIBRARIES', a.idnumber, `un video debe ser H5P.InteractiveVideo (vino ${hj.mainLibrary})`);
       }
