@@ -1,0 +1,22 @@
+{
+  "semantics": [
+    {
+      "label": "Etichetă",
+      "description": "Etichetă/antet pentru răspuns atunci când utilizatorul exportă toate răspunsurile"
+    },
+    {
+      "label": "Placeholder text",
+      "description": "Example value or other placeholder text. Should not be used to replace the description of the input field."
+    },
+    {
+      "label": "Index"
+    },
+    {
+      "label": "Etichetă export nesuportat",
+      "default": "Exportul nu este suportat pe dispozitivul dumneavoastră"
+    },
+    {
+      "label": "Includeți comentariile în documentul exportat"
+    }
+  ]
+}

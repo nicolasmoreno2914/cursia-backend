@@ -17,3 +17,7 @@ qa_*.json
 # Cursia H5P Library Pack y paquetes .h5p: salida de build, nunca se versionan
 *.h5p
 h5p-library-pack/
+
+# EV6 H5P v2: el store versionado de librerías H5P SÍ se versiona, incluidas sus
+# carpetas `dist/` (código de las librerías upstream, no salida de build de Cursia).
+!assets/h5p-libs/v2/*/dist/

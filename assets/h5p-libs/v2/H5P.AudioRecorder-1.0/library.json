@@ -1,0 +1,45 @@
+{
+  "title": "Audio Recorder",
+  "description": "Record audio and download it",
+  "machineName": "H5P.AudioRecorder",
+  "majorVersion": 1,
+  "minorVersion": 0,
+  "patchVersion": 54,
+  "runnable": 1,
+  "author": "Joubel",
+  "license": "MIT",
+  "coreApi": {
+    "majorVersion": 1,
+    "minorVersion": 28
+  },
+  "embedTypes": [
+    "iframe"
+  ],
+  "preloadedCss": [
+    {
+      "path": "fonts/h5p-audio-recorder-font-open-sans.css"
+    }
+  ],
+  "preloadedJs": [
+    {
+      "path": "dist/h5p-audio-recorder.js"
+    }
+  ],
+  "preloadedDependencies": [
+    {
+      "machineName": "FontAwesome",
+      "majorVersion": 4,
+      "minorVersion": 5
+    },
+    {
+      "machineName": "H5P.FontIcons",
+      "majorVersion": 1,
+      "minorVersion": 0
+    },
+    {
+      "machineName": "H5P.Components",
+      "majorVersion": 1,
+      "minorVersion": 0
+    }
+  ]
+}

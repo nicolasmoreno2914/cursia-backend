@@ -1,0 +1,22 @@
+{
+  "semantics": [
+    {
+      "label": "Oznaka",
+      "description": "Oznaka/naslov odgovorov, ko uporabnik izvozi vse odgovore"
+    },
+    {
+      "label": "Placeholder text",
+      "description": "Example value or other placeholder text. Should not be used to replace the description of the input field."
+    },
+    {
+      "label": "Index"
+    },
+    {
+      "label": "Besedilo ob nepodprtosti izvoza",
+      "default": "Izvoz na napravi ni podprt"
+    },
+    {
+      "label": "Pri izvozu v dokument vključi tudi komentarje"
+    }
+  ]
+}

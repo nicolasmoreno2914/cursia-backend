@@ -9,6 +9,13 @@
 //
 // Uso:
 //   node scripts/generate-h5p-profile.js <libsDir> [--out <file>] [--sync-fixture]
+//   node scripts/generate-h5p-profile.js <libsDir> --profile v2 [--out <file>]
+//
+// --profile v2    EV6 H5P v2: genera `cursia-h5p-profile.v2.json`
+//                 (CURSIA_H5P_PROFILE_V2 = v1 ∪ Branching Scenario 1.10 + Dialog
+//                 Cards 1.9, con `deltaByMain`). v1 no se toca. El store de
+//                 librerías (assets/h5p-libs/v2) se sincroniza aparte con
+//                 `scripts/sync-h5p-library-store-v2.js`.
 //
 // --sync-fixture  además copia `library.json` de cada librería del perfil y
 //                 `semantics.json` de las librerías principales a
@@ -20,14 +27,20 @@ const fs = require('fs');
 const path = require('path');
 
 const args = process.argv.slice(2);
-const libsDir = args.find((a) => !a.startsWith('--'));
-if (!libsDir) {
-  console.error('uso: node scripts/generate-h5p-profile.js <libsDir> [--out <file>] [--sync-fixture]');
+const profIdx = args.indexOf('--profile');
+const profileName = profIdx >= 0 ? args[profIdx + 1] : 'v1';
+const positional = args.filter((a, i) => !a.startsWith('--') && args[i - 1] !== '--out' && args[i - 1] !== '--profile');
+if (!positional.length || !['v1', 'v2'].includes(profileName)) {
+  console.error('uso: node scripts/generate-h5p-profile.js <libsDir> [--profile v1|v2] [--out <file>] [--sync-fixture]');
   process.exit(2);
 }
 const outIdx = args.indexOf('--out');
-const outFile = path.resolve(outIdx >= 0 ? args[outIdx + 1] : 'src/package/h5p/cursia-h5p-profile.v1.json');
+const outFile = path.resolve(outIdx >= 0 ? args[outIdx + 1] : `src/package/h5p/cursia-h5p-profile.${profileName}.json`);
 const syncFixture = args.includes('--sync-fixture');
+if (syncFixture && profileName !== 'v1') {
+  console.error('--sync-fixture solo aplica al perfil v1 (el v2 se verifica contra assets/h5p-libs/v2)');
+  process.exit(2);
+}
 
 const gen = require(path.resolve('dist/package/h5p/profile-generator.js'));
 
@@ -40,8 +53,9 @@ function readLibraryJsons(dir) {
   return out;
 }
 
+const libsDir = positional[0];
 const libraryJsons = readLibraryJsons(path.resolve(libsDir));
-const profile = gen.computeH5pProfile(libraryJsons);
+const profile = gen.computeH5pProfile(libraryJsons, profileName === 'v2' ? gen.CURSIA_H5P_PROFILE_SPEC_V2 : gen.CURSIA_H5P_PROFILE_SPEC_V1);
 fs.writeFileSync(outFile, gen.serializeH5pProfile(profile));
 console.log(`perfil ${profile.profileId} v${profile.version}: ${profile.libraries.length} librerías → ${outFile}`);
 
