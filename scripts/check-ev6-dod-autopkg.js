@@ -150,10 +150,19 @@ const ENV_KEYS = [
     eq(c5.state, 'packaging', 'sin job todavía');
     const c6 = RC.evaluateRunCompletion(job, rows, manifest, { ready: true });
     eq([c6.state, 'packageJob' in c6], ['complete', false], 'llamador viejo ({ready}) sin packageJob');
+    // Fix round 1: no vigente / sin job y SIN nada automático pendiente: auto → needs_attention; viejo → packaging (manual).
+    eq(RC.evaluateRunCompletion(job, rows, manifest, { ready: false, status: 'stale', autoRetryPending: false, auto: true }).state, 'needs_attention', 'stale auto');
+    eq(RC.evaluateRunCompletion(job, rows, manifest, { ready: false, status: 'stale', autoRetryPending: true, auto: true }).state, 'packaging', 'stale con re-armado pendiente');
+    eq(RC.evaluateRunCompletion(job, rows, manifest, { ready: false, status: 'stale', autoRetryPending: false, auto: false }).state, 'packaging', 'stale viejo');
+    eq(RC.evaluateRunCompletion(job, rows, manifest, { ready: false, status: 'none', autoRetryPending: false, auto: true }).adminActions, [{ code: 'retry_package' }], 'none sin pendiente');
+    const cb = RC.evaluateRunCompletion(job, rows, manifest, { ready: false, status: 'failed', blocked: { code: 'package_not_ready', message: 'm', missing: ['content:a:missing_artifact'] }, auto: true });
+    eq([cb.state, cb.adminActions, cb.packageJob.blocked], ['needs_attention', [{ code: 'regenerate_item', itemKey: 'content:a', reason: 'package_not_ready' }], { code: 'package_not_ready', message: 'm' }], 'bloqueo → acción del componente');
   });
 
   await check('[AR] puro: clasificación — videogen_submit_rejected (4xx probado, sin job) → 1 reintento automático tras la espera; 408/409, con job, «quota», videogen_failed, ambiguous, provider_reconciliation, tts_failed → nunca; gamma_submit_failed sin generationId → 1 reintento', () => {
     const now = new Date();
+    const prevDyn = process.env.DYNAMIC_COURSE_STRUCTURE;
+    process.env.DYNAMIC_COURSE_STRUCTURE = 'true'; // el tick del auto-healer corre (fix M5)
     const ago = (s) => new Date(now.getTime() - s * 1000);
     const d = (error, os, type = 'video', at = ago(600)) => AH.safeAutoRetryDecision({ status: 'failed', type, error, output_summary: os, finished_at: at }, now);
     const rej = 'videogen_submit_rejected: Error: Videogen batch-create failed (HTTP 422): invalid content';
@@ -177,6 +186,15 @@ const ENV_KEYS = [
     eq(RC.adminActionFor(row({}, ago(30)), 'not_done', now), null, 'pendiente (espera) → sin acción');
     eq(RC.adminActionFor(row({}, ago(600)), 'not_done', now), null, 'pendiente → sin acción');
     eq(RC.adminActionFor(row({ safeAutoRetry: { rounds: 1 } }, ago(600)), 'not_done', now), { code: 'retry_video_render', itemKey: 'video:x' }, 'usado → admin');
+    // Fix M5: con el tick del auto-healer apagado nadie lo reintenta → la acción de admin se muestra ya.
+    const prevAH = process.env.DYNAMIC_AUTO_HEAL_ENABLED;
+    process.env.DYNAMIC_AUTO_HEAL_ENABLED = 'false';
+    try {
+      eq(RC.adminActionFor(row({}, ago(30)), 'not_done', now), { code: 'retry_video_render', itemKey: 'video:x' }, 'tick apagado → admin');
+    } finally {
+      if (prevAH === undefined) delete process.env.DYNAMIC_AUTO_HEAL_ENABLED; else process.env.DYNAMIC_AUTO_HEAL_ENABLED = prevAH;
+      if (prevDyn === undefined) delete process.env.DYNAMIC_COURSE_STRUCTURE; else process.env.DYNAMIC_COURSE_STRUCTURE = prevDyn;
+    }
   });
 
   // ════ DB ═══════════════════════════════════════════════════════════════════
@@ -273,10 +291,25 @@ const ENV_KEYS = [
     // estado: el precheck v3 y la comparación de build se sustituyen (por run, para poder simular un precheck 409).
     const blockedPrecheck = new Map();
     packaging.prepareV3OrConflict = async (run) => {
-      const code = blockedPrecheck.get(run.id);
-      if (code) throw new ConflictException({ message: `${code}: precheck simulado`, missing: [], code });
+      const b = blockedPrecheck.get(run.id);
+      if (b && b.status === 403) {
+        const { ForbiddenException } = require('@nestjs/common');
+        throw new ForbiddenException('La estructura dinámica no está habilitada para esta cuenta (simulado)');
+      }
+      if (b) throw new ConflictException({ message: `${b.code}: precheck simulado`, missing: b.missing || [], code: b.code });
     };
-    packaging.isSameBuild = async () => true;
+    // Fix round 1 (I1/M8): la vigencia del paquete se controla por run/job (antes: siempre «mismo build»).
+    const staleBuildRuns = new Set();
+    packaging.isSameBuild = async (run) => !staleBuildRuns.has(run.id);
+    const PFR = L('modules/dynamic-packaging/package-freshness.js');
+    const deliverableJobs = new Set();
+    PFR.hasDeliverablePackage = async (q, run) => {
+      const [j] = await q.query(`select id from public.production_jobs where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1
+                                   and worker_status = 'completed' order by created_at desc, id desc limit 1`, [run.id]);
+      return !!j && deliverableJobs.has(j.id);
+    };
+    const completeJob = (id, builder = '3.6.0') => ds.query(`update public.production_jobs set status = 'completed', worker_status = 'completed', finished_at = now(),
+      output_summary = $2::jsonb where id = $1`, [id, JSON.stringify({ artifactId: crypto.randomUUID(), builderVersion: builder, sourceIdsHash: 'h'.repeat(64) })]);
     const autoPkg = new AutoPackageService(ds, packaging, runs);
     autoPkg.onModuleInit();
     const recovery = new AdminRecoveryService(ds, manifests, runs);
@@ -379,7 +412,8 @@ const ENV_KEYS = [
       const { C, runId, firstJob } = AP;
       const o1 = await autoPkg.ensure(runId);
       const o2 = await autoPkg.ensure(runId, 'sweep');
-      eq([o1.action, o1.jobId, o2.action, o2.jobId], ['reused', firstJob, 'reused', firstJob], 're-disparos');
+      // Fix round 1: el barrido solo actúa si el estado declara algo pendiente (un job en cola no lo es).
+      eq([o1.action, o1.jobId, o2.action, o2.reason], ['reused', firstJob, 'skipped', 'nothing_pending'], 're-disparos');
       const sw = await autoPkg.sweep();
       assert(!sw.some((o) => o.runId === runId), 'el barrido no toma un run con job activo');
       const man = await packaging.requestPackage(C.cid, OWNER, 1, runId, OWNER_ACTOR);
@@ -421,19 +455,31 @@ const ENV_KEYS = [
     });
 
     let BLK = null;
-    await check('[AP] precheck que no deja encolar (409, p.ej. youtube_delivery_incomplete) → nada encolado, el código queda en la marca del run → needs_attention + retry_package; el barrido no lo reintenta solo', async () => {
+    let BLK403 = null;
+    await check('[AP] fix I2: precheck que no deja encolar (409 youtube_delivery_incomplete con el video que falta) → nada encolado; código + mensaje + faltantes en la marca y en completion.packageJob.blocked; la acción es la del COMPONENTE (resolve_youtube del video), nunca retry_package; el barrido no lo reintenta', async () => {
       const C = await confirmedCourse('BE-B precheck');
       const runId = await seededRealRun(C);
-      blockedPrecheck.set(runId, 'youtube_delivery_incomplete');
+      blockedPrecheck.set(runId, { code: 'youtube_delivery_incomplete', missing: [`video:${C.c2}:missing_youtube_url`, `video:${C.c2}:youtube_delivery_not_completed`] });
       eq(await recompute(runId), 'completed', 'run completed');
       eq((await pkgJobs(runId)).length, 0, 'sin job');
       const run = await jobOf(runId);
-      eq(run.output_summary.autoPackage.blocked.code, 'youtube_delivery_incomplete', 'código registrado (sin texto)');
+      eq([run.output_summary.autoPackage.blocked.code, run.output_summary.autoPackage.blocked.missing.length], ['youtube_delivery_incomplete', 2], 'bloqueo registrado');
       const dto = await runs.getRun(C.cid, OWNER, 1, runId);
-      eq([dto.completion.state, dto.completion.adminActions], ['needs_attention', [{ code: 'retry_package' }]], 'completion');
+      eq([dto.completion.state, dto.completion.adminActions], ['needs_attention', [{ code: 'resolve_youtube', itemKey: `video:${C.c2}`, reason: 'youtube_delivery_incomplete' }]], 'acción del componente');
+      eq([dto.completion.packageJob.status, dto.completion.packageJob.blocked.code, /precheck simulado/.test(dto.completion.packageJob.blocked.message)], ['failed', 'youtube_delivery_incomplete', true], 'packageJob.blocked');
+      assert(!dto.completion.adminActions.some((a) => a.code === 'retry_package'), 'sin retry_package');
       assert(!(await autoPkg.sweep()).some((o) => o.runId === runId), 'el barrido no lo toma');
       blockedPrecheck.delete(runId);
       BLK = { C, runId };
+      // Bloqueo sin componente (403: dueño fuera de la allow-list) → resolve_package_block con el código.
+      const C2 = await confirmedCourse('BE-B precheck 403');
+      const r2 = await seededRealRun(C2);
+      blockedPrecheck.set(r2, { status: 403 });
+      eq(await recompute(r2), 'completed', 'run completed');
+      const d2 = await runs.getRun(C2.cid, OWNER, 1, r2);
+      eq([d2.completion.state, d2.completion.adminActions, d2.completion.packageJob.blocked.code], ['needs_attention', [{ code: 'resolve_package_block', reason: 'http_403' }], 'http_403'], '403');
+      blockedPrecheck.delete(r2);
+      BLK403 = { C: C2, runId: r2 };
     });
 
     await check('[AP] runs de vista previa y fallidos → NUNCA un paquete automático (ni marca); el disparo manual de ensure tampoco', async () => {
@@ -489,6 +535,98 @@ const ENV_KEYS = [
         eq((await packaging.requestPackage(C.cid, OWNER, 1, runId, OWNER_ACTOR)).created, true, 'manual sigue');
       } finally {
         delete process.env.DYNAMIC_AUTO_PACKAGE_ENABLED;
+      }
+    });
+
+    let STALE_OLD = null;
+    await check('[AP] fix I1: paquete automático COMPLETADO y vigente → complete; deja de ser vigente sin builder nuevo (p.ej. tema) → needs_attention + retry_package (nunca packaging sin nada pendiente); con builder nuevo → packaging y el barrido lo RE-ARMA (mismos topes)', async () => {
+      const C = await confirmedCourse('BE-B vigencia');
+      const runId = await seededRealRun(C);
+      eq(await recompute(runId), 'completed', 'completed');
+      const [j1] = await pkgJobs(runId);
+      await completeJob(j1.id);
+      deliverableJobs.add(j1.id);
+      let dto = await runs.getRun(C.cid, OWNER, 1, runId);
+      eq([dto.completion.state, dto.completion.complete, dto.completion.packageJob], ['complete', true, { status: 'completed', autoRetryPending: false, auto: true }], 'vigente');
+      // Deja de ser vigente (mismo builder): no hay reconstrucción automática → acción visible.
+      deliverableJobs.delete(j1.id);
+      dto = await runs.getRun(C.cid, OWNER, 1, runId);
+      eq([dto.completion.state, dto.completion.adminActions, dto.completion.packageJob], ['needs_attention', [{ code: 'retry_package' }], { status: 'stale', autoRetryPending: false, auto: true }], 'no vigente sin reconstrucción automática');
+      assert(!(await autoPkg.sweep()).some((o) => o.runId === runId), 'el barrido no lo toma');
+      // Builder nuevo (el job se armó con otra versión): pendiente → packaging, y el barrido lo re-arma.
+      await ds.query(`update public.production_jobs set output_summary = output_summary || '{"builderVersion":"3.5.0"}'::jsonb where id = $1`, [j1.id]);
+      staleBuildRuns.add(runId);
+      dto = await runs.getRun(C.cid, OWNER, 1, runId);
+      eq([dto.completion.state, dto.completion.packageJob], ['packaging', { status: 'stale', autoRetryPending: true, auto: true }], 'builder nuevo: re-armado pendiente');
+      const sw = await autoPkg.sweep();
+      eq(sw.filter((o) => o.runId === runId).map((o) => o.action), ['enqueued'], 're-armado por el barrido');
+      eq((await pkgJobs(runId)).map((j) => j.worker_status), ['completed', 'queued'], 'un job nuevo');
+      dto = await runs.getRun(C.cid, OWNER, 1, runId);
+      eq([dto.completion.state, dto.completion.packageJob.status], ['packaging', 'queued'], 'armándose');
+      // Mismos topes: 3 fallos desde la marca → agotado → needs_attention + retry_package.
+      for (let i = 0; i < 3; i++) {
+        const jobs = await pkgJobs(runId);
+        const last = jobs[jobs.length - 1];
+        if (last.worker_status === 'queued') await failPkg(last.id);
+        await autoPkg.sweep();
+      }
+      const fails = (await pkgJobs(runId)).filter((j) => j.worker_status === 'failed').length;
+      eq(fails, 3, 'tres intentos fallidos');
+      eq((await pkgJobs(runId)).filter((j) => j.worker_status === 'queued').length, 0, 'sin un cuarto intento');
+      dto = await runs.getRun(C.cid, OWNER, 1, runId);
+      eq([dto.completion.state, dto.completion.adminActions], ['needs_attention', [{ code: 'retry_package' }]], 'agotado');
+      staleBuildRuns.delete(runId);
+      // Run VIEJO (sin marca) con un paquete final de un builder anterior → packaging con auto:false; nunca se toca solo.
+      const Co = await confirmedCourse('BE-B viejo builder');
+      const ro = await seededRealRun(Co);
+      await ds.query(`update public.production_jobs set status = 'completed', worker_status = 'completed', finished_at = now() - interval '9 days' where id = $1`, [ro]);
+      const [jo] = await ds.query(`insert into public.production_jobs (owner_id, course_id, execution_mode, status, worker_status, current_step, input_payload, output_summary, options, result)
+        values ($1, $2, 'dynamic_package', 'completed', 'completed', 'dynamic_package', $3::jsonb, $4::jsonb, '{}'::jsonb, '{}'::jsonb) returning id`,
+        [OWNER, Co.cid, JSON.stringify({ runId: ro, manifestId: Co.manifest.id, blueprintNumber: 1 }), JSON.stringify({ artifactId: crypto.randomUUID(), builderVersion: '3.0.0', sourceIdsHash: 'o'.repeat(64) })]);
+      const before = JSON.stringify(await jobOf(ro));
+      dto = await runs.getRun(Co.cid, OWNER, 1, ro);
+      eq([dto.completion.state, dto.completion.packageJob, dto.completion.adminActions], ['packaging', { status: 'stale', autoRetryPending: false, auto: false }, []], 'viejo: acción manual');
+      assert(!(await autoPkg.sweep()).some((o) => o.runId === ro), 'el barrido no toca runs viejos');
+      eq([JSON.stringify(await jobOf(ro)), (await pkgJobs(ro)).length, jo.id.length > 0], [before, 1, true], 'run viejo intacto, sin jobs nuevos');
+      STALE_OLD = { C: Co, runId: ro };
+    });
+
+    await check('[AP] fix M2: re-completitud con el MISMO build (job completado antes de la marca nueva) → el barrido lo confirma UNA vez (satisfiedJobId) y no lo vuelve a evaluar en cada tick', async () => {
+      const C = await confirmedCourse('BE-B mismo build');
+      const runId = await seededRealRun(C);
+      await ds.query(`update public.production_jobs set status = 'completed', worker_status = 'completed', finished_at = now() where id = $1`, [runId]);
+      const [j] = await ds.query(`insert into public.production_jobs (owner_id, course_id, execution_mode, status, worker_status, current_step, input_payload, output_summary, options, result, created_at)
+        values ($1, $2, 'dynamic_package', 'completed', 'completed', 'dynamic_package', $3::jsonb, $4::jsonb, '{}'::jsonb, '{}'::jsonb, now() - interval '1 hour') returning id`,
+        [OWNER, C.cid, JSON.stringify({ runId, manifestId: C.manifest.id, blueprintNumber: 1 }), JSON.stringify({ artifactId: crypto.randomUUID(), builderVersion: '3.6.0', sourceIdsHash: 's'.repeat(64) })]);
+      // Marca de una re-completitud cuyo disparo se perdió.
+      await ds.query(`update public.production_jobs set output_summary = output_summary || jsonb_build_object('autoPackage', jsonb_build_object('eligibleAt', now())) where id = $1`, [runId]);
+      let sw = await autoPkg.sweep();
+      eq(sw.filter((o) => o.runId === runId).map((o) => [o.action, o.jobId]), [['reused', j.id]], 'confirmado (mismo build)');
+      eq((await jobOf(runId)).output_summary.autoPackage.satisfiedJobId, j.id, 'satisfiedJobId');
+      sw = await autoPkg.sweep();
+      eq(sw.filter((o) => o.runId === runId).length, 0, 'no vuelve a evaluarlo');
+      eq((await pkgJobs(runId)).length, 1, 'sin jobs nuevos');
+    });
+
+    await check('[AP] fix M1: error transitorio del empaque automático (sin job) → cuenta contra su tope con espera; agotado → needs_attention + retry_package', async () => {
+      const C = await confirmedCourse('BE-B transitorio');
+      const runId = await seededRealRun(C);
+      const orig = packaging.requestPackage.bind(packaging);
+      packaging.requestPackage = async (...a) => { if (a[3] === runId) throw new Error('EMAXCONNSESSION simulado'); return orig(...a); };
+      try {
+        eq(await recompute(runId), 'completed', 'completed');
+        eq((await jobOf(runId)).output_summary.autoPackage.transient.count, 1, 'transitorio contado');
+        assert(!(await autoPkg.sweep()).some((o) => o.runId === runId), 'dentro de la espera no reintenta');
+        await ds.query(`update public.production_jobs set output_summary = jsonb_set(output_summary, '{autoPackage,transient,at}', to_jsonb((now() - interval '10 minutes')::text)) where id = $1`, [runId]);
+        eq((await autoPkg.sweep()).filter((o) => o.runId === runId).map((o) => o.reason), ['transient_error'], 'pasada la espera reintenta');
+        let dto = await runs.getRun(C.cid, OWNER, 1, runId);
+        eq([dto.completion.state, dto.completion.packageJob], ['packaging', { status: 'none', autoRetryPending: true, auto: true }], 'pendiente');
+        await ds.query(`update public.production_jobs set output_summary = jsonb_set(output_summary, '{autoPackage,transient}', jsonb_build_object('count', 5, 'at', (now() - interval '1 hour')::text)) where id = $1`, [runId]);
+        assert(!(await autoPkg.sweep()).some((o) => o.runId === runId), 'agotado: el barrido no lo toma');
+        dto = await runs.getRun(C.cid, OWNER, 1, runId);
+        eq([dto.completion.state, dto.completion.adminActions], ['needs_attention', [{ code: 'retry_package' }]], 'agotado → acción visible');
+      } finally {
+        packaging.requestPackage = orig;
       }
     });
 
@@ -715,6 +853,9 @@ const ENV_KEYS = [
       const o = await get('/api/v1/admin/dynamic-runs/needs-attention', OWNER_ACTOR);
       eq(o.status, 403, `dueño ${JSON.stringify(o.json)}`);
       eq((await get('/api/v1/admin/dynamic-runs/needs-attention', { id: crypto.randomUUID(), email: 'otro@cliente.test' })).status, 403, 'otro usuario');
+      // Fix M6: el guard usa EXACTAMENTE isSuperAdminEmail (mismo resultado que /features.superAdmin).
+      eq((await get('/api/v1/admin/dynamic-runs/needs-attention?limit=1', { id: ADMIN_X.id, email: ' Admin@Cursia.test ' })).status, 200, 'email con espacios/mayúsculas');
+      eq((await get('/api/v1/features', { id: ADMIN_X.id, email: ' Admin@Cursia.test ' })).json.data.superAdmin, true, '/features coincide');
       const fp = async () => (await ds.query(`select md5(string_agg(t::text, '|' order by t.id)) as h from public.production_jobs t`))[0].h +
         (await ds.query(`select md5(string_agg(t::text, '|' order by t.id)) as h from public.generation_item_runs t`))[0].h;
       const before = await fp();
@@ -735,7 +876,14 @@ const ENV_KEYS = [
       eq([ep.courseId, ep.ownerId, ep.state, ep.workerStatus, ep.failedComponents], [AP.C.cid, OWNER, 'needs_attention', 'completed', []], 'entrada del paquete');
       eq(ep.adminActions.map((x) => [x.code, x.endpoint.method, x.endpoint.path]), [['retry_package', 'POST', `${runBase(AP.C.cid, AP.runId)}/package`]], 'retry_package → POST …/package');
       // Precheck bloqueado
-      assert(byRun.get(BLK.runId) && byRun.get(BLK.runId).adminActions[0].code === 'retry_package', 'precheck bloqueado listado');
+      // Fix I2: el bloqueo se muestra (código + mensaje) y la acción es la del componente, con su porqué.
+      const eb0 = byRun.get(BLK.runId);
+      assert(eb0, 'precheck bloqueado listado');
+      eq([eb0.packageJob.blocked.code, eb0.adminActions.map((x) => [x.code, x.itemKey, x.reason, x.endpoint.path])],
+        ['youtube_delivery_incomplete', [['resolve_youtube', `video:${BLK.C.c2}`, 'youtube_delivery_incomplete', `${runBase(BLK.C.cid, BLK.runId)}/items/${encodeURIComponent(`video:${BLK.C.c2}`)}/youtube-resolution`]]], 'acción del componente');
+      assert(/bloquea el paquete final/.test(eb0.adminActions[0].endpoint.note), 'la nota dice por qué');
+      const e403 = byRun.get(BLK403.runId);
+      eq([e403.adminActions[0].code, e403.adminActions[0].endpoint.path, /http_403/.test(e403.adminActions[0].endpoint.note)], ['resolve_package_block', `${runBase(BLK403.C.cid, BLK403.runId)}/package`, true], '403 → resolver la causa');
       // Video rechazado dos veces
       const ev = byRun.get(REJ2.rid);
       assert(ev, 'video rechazado listado');
@@ -758,7 +906,12 @@ const ENV_KEYS = [
       eq([lg.legacyPreview, lg.state, lg.packageBuilt, lg.packageDownloadable, lg.previewComponents.includes(`video:${Cleg.c1}`)], [true, 'preview', true, true, true], 'entrada legacy');
       assert(!L0.needsAttention.some((x) => x.runId === rleg), 'no mezclado con needs_attention');
       // Los que no necesitan atención no aparecen (run viejo real sin paquete = packaging).
-      assert(!byRun.has(OLD.runId) && !L0.legacyPreview.some((x) => x.runId === OLD.runId), 'run sano fuera de la cola');
+      assert(!byRun.has(OLD.runId) && !L0.legacyPreview.some((x) => x.runId === OLD.runId), 'run viejo sin paquete: fuera de needs_attention');
+      // Fix M7: runs completos fuera del empaque automático sin paquete vigente → tercer grupo, con la acción manual.
+      for (const rid of [OLD.runId, STALE_OLD.runId]) {
+        const m = L0.manualPackage.find((x) => x.runId === rid);
+        assert(m && m.adminActions[0].code === 'retry_package' && /\/package$/.test(m.adminActions[0].endpoint.path), `manualPackage ${rid}: ${JSON.stringify(m)}`);
+      }
       const dump = JSON.stringify(a.json);
       assert(!dump.includes('TEXTO-TECNICO-SECRETO') && !dump.includes('render rechazado') && !dump.includes('build falló'), 'sin texto técnico de errores');
       assert(!/@/.test(dump), 'sin emails');
