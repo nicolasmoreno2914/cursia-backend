@@ -1,6 +1,7 @@
 import type { BlueprintSnapshotV2 } from '../course-blueprints/blueprint-snapshot';
 import { ACTIVITY_H5P_ROTATION, resolveActivityType } from '../course-shell/activity-type';
 import { cmpStr, sha256Canonical } from '../coherence/canonical-json';
+import { EXAM_BANK_ARTIFACT_TYPE } from '../course-shell/exam-bank';
 import { Outline } from '../coherence/coherence-types';
 import {
   BlueprintFingerprintsV3,
@@ -71,6 +72,8 @@ import {
  *    capítulos (§P: editar un capítulo regenera la intro de su módulo).
  *  - final_exam: huella = conjunto de capítulos + `own`; cualquier content
  *    nuevo o cambio de membresía ⇒ REGENERATE; reorder / mover ⇒ REUSE.
+ *    EV6 P2 (fix 1/2): origen BANCO (`dynamic_exam_bank_json`) y cambio del conjunto de módulos con capítulos ⇒ REGENERATE
+ *    (`course_modules_changed`; el banco congela hojas por módulo).
  *  - audio_welcome: course_intro produce salida nueva (outline cambió) ⇒
  *    STALE_NO_AUTO.
  */
@@ -452,6 +455,14 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
         const oldIds = fromFp.outline.chapters.map((c) => c.id).sort(cmpStr).join(',');
         const newIds = toFp.outline.chapters.map((c) => c.id).sort(cmpStr).join(',');
         if (oldIds !== newIds) reasons.push('course_membership_changed');
+        // EV6 P2 fix 1 (C2): el banco del final congela hojas módulo × tipo. Si cambia el CONJUNTO de
+        // módulos con capítulos (módulo borrado/vaciado o creado con capítulos movidos), el plan
+        // congelado ya no describe el curso ⇒ REGENERATE. Mover un capítulo entre módulos que siguen
+        // existiendo, o reordenar, sigue siendo REUSE (el banco empaqueta con su plan congelado).
+        // Fix 2 (R1): solo si el origen es un BANCO; un final GIFT (o de tipo desconocido) se comporta como siempre.
+        const finalIsBank = (records.get(key)?.artifactTypes ?? []).includes(EXAM_BANK_ARTIFACT_TYPE);
+        const moduleSet = (fp: typeof fromFp) => fp.outline.modules.filter((m) => m.chapters.length > 0).map((m) => m.id).sort(cmpStr).join(',');
+        if (finalIsBank && moduleSet(fromFp) !== moduleSet(toFp)) reasons.push('course_modules_changed');
         const existingContentNew = toFp.outline.chapters.some((c) => contentProducesNew.has(c.id) && fromFp.outline.chapterById.has(c.id));
         if (existingContentNew || (reasons.length === 0 && fromFp.finalExam !== toFp.finalExam)) reasons.push('member_content_changed');
         if (reasons.length) regenerate(a, ...reasons);

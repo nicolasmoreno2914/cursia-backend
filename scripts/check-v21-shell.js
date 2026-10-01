@@ -54,6 +54,7 @@ const cp = loadDist('modules/course-profiles/course-profiles.js');
 const h5p = loadDist('package/h5p/index.js');
 const F = require('./lib/v21-shell-fixtures');
 const VF = require('./lib/v21-video-fixture');
+const EBF = require('./lib/exam-bank-fixtures');
 
 let passes = 0;
 let failures = 0;
@@ -765,7 +766,8 @@ async function pureChecks() {
     eq([S.v3ValidatedArtifactType('course_intro'), S.v3ValidatedArtifactType('module_intro'), S.v3ValidatedArtifactType('experience'),
       S.v3ValidatedArtifactType('video_interactions'), S.v3ValidatedArtifactType('activity', 'h5p'), S.v3ValidatedArtifactType('activity', 'scorm'),
       S.v3ValidatedArtifactType('final_exam'), S.v3ValidatedArtifactType('exam'), S.v3ValidatedArtifactType('content')],
-    ['dynamic_course_intro_json', 'dynamic_module_intro_json', 'dynamic_experience_json', 'dynamic_video_interactions_json', 'dynamic_h5p_params_json', null, 'dynamic_exam_gift', null, null], 'tabla');
+    // EV6 P2: el artifact preferido de exam/final_exam es el banco (el GIFT sigue aceptado: v3ValidatedArtifactTypes).
+    ['dynamic_course_intro_json', 'dynamic_module_intro_json', 'dynamic_experience_json', 'dynamic_video_interactions_json', 'dynamic_h5p_params_json', null, 'dynamic_exam_bank_json', 'dynamic_exam_bank_json', null], 'tabla');
     const V = S.validateV3ItemArtifact;
     const ids = c2.manifest.modules[0].chapters.map((c) => c.chapterId);
     const plan = h5p.planInteractionCheckpoints(468);
@@ -1073,6 +1075,73 @@ async function dbChecks() {
       const ok = await sched.completeItemDetailed(again.itemRunId, 'b1', { artifactIds: [await upload('dynamic_exam_gift', F.FINAL_GIFT)], summary: {} }, OWNER);
       eq(ok, { ok: true }, 'final completo');
       eq((await item(`final_exam:${cid}`)).output_summary.v3Validation.questionCount, 12, 'questionCount medido');
+    });
+
+    await check('DB EV6 P2: exam y final_exam aceptan el banco dynamic_exam_bank_json (plan del claim, questionCount = slots); plan ≠ Manifest → EXAM_BANK_PLAN; banco + GIFT → EXAM_ARTIFACT_AMBIGUOUS; evidencia falsa → EXAM_BANK_EVIDENCE al completar', async () => {
+      const examKey = `exam:${M1}`;
+      // Fix 1 (I1): completeItem lee el dynamic_content_md vigente de cada capítulo del examen para la evidencia.
+      const gIndex = new Map([[C1, 0], [C2, 1], [C3, 2]]);
+      for (const [cId, gi] of gIndex) {
+        const ci = await item(`content:${cId}`);
+        const p = `r11/content/${cId}`;
+        store.set(p, `# Capítulo ${gi + 1}\n\n${EBF.chapterMarkdown(gi, 'Reglas')}`);
+        await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path, item_run_id) values ($1, $2, 'dynamic_content_md', $3, $4)`, [OWNER, String(cid), p, ci.id]);
+      }
+      // cuatro intentos en este check (evidencia, plan, ambiguo, válido): más que el tope por defecto
+      await ds.query(`update public.generation_item_runs set max_attempts = 10 where job_id = $1 and item_key = $2`, [job.id, examKey]);
+      const ex = await claim(['exam']);
+      assert(ex, 'claim exam: ' + JSON.stringify(await item(examKey)));
+      const modCh = [{ id: C1, moduleId: M1 }, { id: C2, moduleId: M1 }];
+      eq([ex.type, ex.claimPayload.validatedArtifactType, ex.claimPayload.examBank.scope, ex.claimPayload.examBank.moduleId, ex.claimPayload.examBank.plan],
+        ['exam', 'dynamic_exam_bank_json', 'module', M1, S.moduleExamPlan([C1, C2])], 'claim exam con el plan');
+      const good = EBF.makeExamBank({ scope: 'module', moduleId: M1, chapters: modCh, chapterIndex: gIndex, plan: ex.claimPayload.examBank.plan });
+      const badEv = clone(good); badEv.questions[3].evidence = 'Una frase que el capítulo nunca dijo sobre la planta ni sobre el turno de trabajo.';
+      const r0 = await sched.completeItemDetailed(ex.itemRunId, 'b1', { artifactIds: [await upload('dynamic_exam_bank_json', badEv)], summary: {} }, OWNER);
+      eq([r0.ok, r0.reason, r0.errors], [false, 'v3_payload_invalid', ['EXAM_BANK_EVIDENCE']], 'evidencia falsa al completar (I1)');
+      assert((await item(examKey)).error.includes(badEv.questions[3].id), 'el error cita el id de la pregunta');
+      await readyAgain(examKey);
+      const ex1 = await claim(['exam']);
+      assert(ex1, 'claim exam 1b');
+      const badPlan = clone(good); badPlan.plan[0].slots += 1;
+      const r1 = await sched.completeItemDetailed(ex1.itemRunId, 'b1', { artifactIds: [await upload('dynamic_exam_bank_json', badPlan)], summary: {} }, OWNER);
+      eq([r1.ok, r1.reason, r1.errors], [false, 'v3_payload_invalid', ['EXAM_BANK_PLAN']], 'plan distinto');
+      eq((await item(examKey)).status, 'retrying', 'retrying');
+      await readyAgain(examKey);
+      const ex2 = await claim(['exam']);
+      assert(ex2, 'claim exam 2: ' + JSON.stringify(await item(examKey)));
+      const both = [await upload('dynamic_exam_bank_json', good), await upload('dynamic_exam_gift', F.FINAL_GIFT)];
+      const r2 = await sched.completeItemDetailed(ex2.itemRunId, 'b1', { artifactIds: both, summary: {} }, OWNER);
+      eq([r2.ok, r2.reason, r2.errors], [false, 'v3_payload_invalid', ['EXAM_ARTIFACT_AMBIGUOUS']], 'ambos tipos');
+      eq([await linked(both[0]), await linked(both[1])], [null, null], 'nada vinculado');
+      await readyAgain(examKey);
+      const ex3 = await claim(['exam']);
+      assert(ex3, 'claim exam 3: ' + JSON.stringify(await item(examKey)));
+      const art = await upload('dynamic_exam_bank_json', good);
+      eq(await sched.completeItemDetailed(ex3.itemRunId, 'b1', { artifactIds: [art], summary: {} }, OWNER), { ok: true }, 'banco válido');
+      const done = await item(examKey);
+      eq([done.status, done.output_summary.v3Validation.artifactType, done.output_summary.v3Validation.questionCount, done.output_summary.v3Validation.bankSize],
+        ['completed', 'dynamic_exam_bank_json', 17, 34], 'summary (slots, banco)');
+      eq(await linked(art), done.id, 'vinculado');
+
+      // final_exam (ya completado con GIFT arriba): se reabre como un intento nuevo para probar el banco.
+      const feKey = `final_exam:${cid}`;
+      await ds.query(`update public.artifacts set item_run_id = null where item_run_id = (select id from public.generation_item_runs where job_id = $1 and item_key = $2)`, [job.id, feKey]);
+      await ds.query(`update public.generation_item_runs set status = 'pending', worker_id = null, lease_until = null, attempt_count = 0, error = null, finished_at = null, output_summary = '{}'::jsonb, next_retry_at = null where job_id = $1 and item_key = $2`, [job.id, feKey]);
+      const fe = await claim(['final_exam']);
+      assert(fe, 'claim final: ' + JSON.stringify(await item(feKey)));
+      const allCh = [{ id: C1, moduleId: M1 }, { id: C2, moduleId: M1 }, { id: C3, moduleId: M2 }];
+      eq([fe.type, fe.claimPayload.finalExam, fe.claimPayload.examBank.scope, fe.claimPayload.examBank.moduleId, fe.claimPayload.examBank.plan],
+        ['final_exam', { minQuestions: 5, maxQuestions: 40 }, 'final', null, S.expectedExamPlan('final', allCh)], 'claim final con el plan');
+      const fgood = EBF.makeExamBank({ scope: 'final', moduleId: null, chapters: allCh, chapterIndex: gIndex, plan: fe.claimPayload.examBank.plan });
+      const fbad = clone(fgood); fbad.plan = S.moduleExamPlan([C1, C2, C3]);
+      const r3 = await sched.completeItemDetailed(fe.itemRunId, 'b1', { artifactIds: [await upload('dynamic_exam_bank_json', fbad)], summary: {} }, OWNER);
+      eq([r3.reason, r3.errors.includes('EXAM_BANK_PLAN')], ['v3_payload_invalid', true], 'final con plan de módulo');
+      await readyAgain(feKey);
+      const fe2 = await claim(['final_exam']);
+      assert(fe2, 'claim final 2: ' + JSON.stringify(await item(feKey)));
+      eq(await sched.completeItemDetailed(fe2.itemRunId, 'b1', { artifactIds: [await upload('dynamic_exam_bank_json', fgood)], summary: {} }, OWNER), { ok: true }, 'final banco válido');
+      const fdone = await item(feKey);
+      eq([fdone.output_summary.v3Validation.artifactType, fdone.output_summary.v3Validation.questionCount, fdone.output_summary.v3Validation.bankSize], ['dynamic_exam_bank_json', 25, 50], 'summary final');
     });
 
     await check('DB course_intro: QUANTITY_CLAIM rechazado; válido completo', async () => {

@@ -112,6 +112,7 @@ export async function loadFromItemsFromDb(
       artifactStatus: aggregateArtifactStatus(r.arts.map((a) => a.status)),
       inputFingerprint: uniformFingerprint(r.arts.map((a) => a.fp)),
       outputIdentity: artifactOutputIdentity(r.arts),
+      artifactTypes: r.arts.map((a) => a.type).filter((t): t is string => typeof t === 'string'),
       ...(r.consumed_video_identity ? { consumedVideoIdentity: r.consumed_video_identity } : {}),
     });
   }
@@ -141,6 +142,7 @@ export async function loadFromItemsFromDb(
         // un deshabilitado sin huella (REGENERATE, fix wave).
         inputFingerprint: uniformFingerprint(r.arts.map((a) => a.fp)),
         outputIdentity: artifactOutputIdentity(r.arts),
+        artifactTypes: r.arts.map((a) => a.type).filter((t): t is string => typeof t === 'string'),
         ...(r.consumed_video_identity ? { consumedVideoIdentity: r.consumed_video_identity } : {}),
       });
       wanted.delete(r.item_key);
@@ -244,8 +246,12 @@ export interface ApplyWrites {
 }
 
 export interface RoleCheck {
-  /** `variant`: solo items `activity` de rulesVersion 3 (el motor define los roles). */
-  required: (itemType: string, variant?: string | null) => readonly string[] | undefined;
+  /**
+   * `variant`: solo items `activity` de rulesVersion 3 (el motor define los roles).
+   * `present` (EV6 P2): tipos de artifact que tiene el origen; un rol con alternativas
+   * (exam/final_exam: banco JSON | GIFT) se resuelve contra lo presente.
+   */
+  required: (itemType: string, variant?: string | null, present?: ReadonlySet<string>) => readonly string[] | undefined;
   typeOf: (artifactId: string) => string | null | undefined;
 }
 
@@ -310,8 +316,8 @@ export function planApplyWrites(
       reviewMarks,
     });
     if (reuse && roles) {
-      const have = new Set(a.fromArtifactIds.map((id) => roles.typeOf(id)));
-      const required = roles.required(it.type, it.variant ?? null);
+      const have = new Set(a.fromArtifactIds.map((id) => roles.typeOf(id)).filter((t): t is string => typeof t === 'string'));
+      const required = roles.required(it.type, it.variant ?? null, have);
       // v3: un tipo sin roles conocidos nunca se reutiliza a ciegas (fail loud en el apply).
       if (isV3 && !required) missingRoles.push(`${it.key}:*:unknown_roles`);
       for (const t of required ?? []) if (!have.has(t)) missingRoles.push(`${it.key}:${t}:missing_role`);

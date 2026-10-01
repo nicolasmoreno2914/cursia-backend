@@ -39,7 +39,7 @@ import { DynamicYoutubePreflightService } from './dynamic-youtube';
 import { assertDynamicOwnerAllowed, assertRealVideoAllowed } from '../features/dynamic-features';
 import { FromRunDto, isFromRunRequest } from '../invalidation/dto/from-run.dto';
 import { computePlanFromDb, executeApplyWrites, planApplyWrites } from '../invalidation/invalidation-apply';
-import { requiredArtifactTypes } from '../dynamic-packaging/artifact-resolver';
+import { requiredArtifactTypesForPresent } from '../dynamic-packaging/artifact-resolver';
 import { regenerationCascade } from './regeneration-cascade';
 import {
   PROVIDER_MODES_CONFLICT,
@@ -1075,7 +1075,7 @@ export class RunsService {
           ctxA.context_hash,
           (id) => sources.get(id)?.status ?? null,
           (id) => sources.get(id)?.metadata?.inputFingerprint ?? null,
-          { required: (t, variant) => requiredArtifactTypes(manifestB.rulesVersion, t as ManifestItemType, variant), typeOf: (id) => sources.get(id)?.type },
+          { required: (t, variant, present) => requiredArtifactTypesForPresent(manifestB.rulesVersion, t as ManifestItemType, variant, present), typeOf: (id) => sources.get(id)?.type },
         );
         if (writes.missingRoles.length > 0) {
           const message =

@@ -101,6 +101,12 @@ export interface InvalidationFromItem {
    * (nunca se reutilizan a ciegas).
    */
   consumedVideoIdentity?: string | null;
+  /**
+   * Solo rulesVersion 3 (EV6 P2): tipos de los artifacts del origen. Hoy lo usa
+   * `final_exam` para saber si el origen es un banco (`dynamic_exam_bank_json`);
+   * ausente/desconocido = comportamiento de siempre (GIFT).
+   */
+  artifactTypes?: string[] | null;
 }
 
 export interface InvalidationPlanInput {
