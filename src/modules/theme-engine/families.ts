@@ -62,8 +62,9 @@ export const THEME_FAMILIES: Record<ThemeFamilyId, ThemeFamily> = {
         typography: { fontBody: HUMANIST, fontHeading: HUMANIST, weightHeading: 700, lineHeading: 1.25, measureCh: 70 },
         shape: { radiusSm: 8, radiusMd: 12, radiusLg: 20, borderWidth: 1 },
         variants: { card: 'outline', callout: 'tinted', hero: 'soft' },
-        // P3: anclas fuera de los tonos de rol ámbar (proceso) y café (reflexión): el color de módulo es estructura.
-        moduleColors: ['#0F6E5C', '#1E3A5F', '#8A3B12', '#4A4E8C'],
+        // P3 (fix I1): anclas en las dos ventanas libres de tonos de rol (verde musgo/oliva 58–123° y
+        // ciruela/frambuesa 284–338°): el color de módulo es estructura, nunca se lee como un rol.
+        moduleColors: ['#2F6B1F', '#7A2E73', '#5F6410', '#9C2463'],
         personality: persona({ fontDisplay: HUMANIST, fontMeta: HUMANIST, fontNumeral: HUMANIST, displayWeight: 700, thesisItalic: false, heroTreatment: 'rule', density: 'regular', ruleBetween: false, metaTracking: 0.08, plate: false, sectionRule: false, gridRules: false, metaCase: 'sentence' }),
       }),
     },
@@ -100,7 +101,8 @@ export const THEME_FAMILIES: Record<ThemeFamilyId, ThemeFamily> = {
         typography: { fontBody: SANS, fontHeading: SANS, weightHeading: 600, lineHeading: 1.3, measureCh: 68 },
         shape: { radiusSm: 4, radiusMd: 8, radiusLg: 12, borderWidth: 1 },
         variants: { card: 'flat', callout: 'outline', hero: 'solid' },
-        moduleColors: ['#334155', '#1D4ED8', '#0F766E', '#7C2D12'],
+        // P3 (fix I1): anclas fuera de los tonos de rol pedagógico.
+        moduleColors: ['#5E2D6B', '#56611A', '#7A1F4E', '#2F5A1C'],
         personality: persona({ fontDisplay: SANS, fontMeta: SANS, fontNumeral: SANS, displayWeight: 700, thesisItalic: false, heroTreatment: 'band', density: 'regular', ruleBetween: false, metaTracking: 0.1, plate: false, sectionRule: true, gridRules: false, metaCase: 'upper' }),
       }),
     },
@@ -137,7 +139,8 @@ export const THEME_FAMILIES: Record<ThemeFamilyId, ThemeFamily> = {
         typography: { fontBody: SERIF_TEXT, fontHeading: SERIF_DISPLAY, weightHeading: 600, lineHeading: 1.2, measureCh: 62 },
         shape: { radiusSm: 2, radiusMd: 4, radiusLg: 8, borderWidth: 1 },
         variants: { card: 'flat', callout: 'outline', hero: 'soft' },
-        moduleColors: ['#7C2D12', '#1E3A5F', '#3F6212', '#5B3A8E'],
+        // P3 (fix I1): anclas fuera de los tonos de rol pedagógico.
+        moduleColors: ['#7C123E', '#5F2A6B', '#3F6212', '#5E6412'],
         personality: persona({ fontDisplay: SERIF_DISPLAY, fontMeta: SANS, fontNumeral: SERIF_DISPLAY, displayWeight: 600, thesisItalic: false, heroTreatment: 'rule', density: 'airy', ruleBetween: true, metaTracking: 0.12, plate: false, sectionRule: false, gridRules: false, metaCase: 'upper' }),
       }),
     },
@@ -174,7 +177,8 @@ export const THEME_FAMILIES: Record<ThemeFamilyId, ThemeFamily> = {
         typography: { fontBody: SANS, fontHeading: SANS, weightHeading: 600, lineHeading: 1.3, measureCh: 74 },
         shape: { radiusSm: 0, radiusMd: 2, radiusLg: 4, borderWidth: 1 },
         variants: { card: 'outline', callout: 'flat', hero: 'solid' },
-        moduleColors: ['#0E7490', '#B45309', '#334155', '#3F6212'],
+        // P3 (fix I1): anclas fuera de los tonos de rol pedagógico.
+        moduleColors: ['#3F6212', '#6B2E7A', '#5F6410', '#8A2257'],
         personality: persona({ fontDisplay: SANS, fontMeta: MONO, fontNumeral: MONO, displayWeight: 700, thesisItalic: false, heroTreatment: 'rule', density: 'compact', ruleBetween: false, metaTracking: 0.04, plate: false, sectionRule: false, gridRules: true, metaCase: 'upper' }),
       }),
       dark: base({
@@ -202,7 +206,8 @@ export const THEME_FAMILIES: Record<ThemeFamilyId, ThemeFamily> = {
         typography: { fontBody: SANS, fontHeading: SANS, weightHeading: 600, lineHeading: 1.3, measureCh: 74 },
         shape: { radiusSm: 0, radiusMd: 2, radiusLg: 4, borderWidth: 1 },
         variants: { card: 'outline', callout: 'flat', hero: 'solid' },
-        moduleColors: ['#22D3EE', '#FBBF24', '#818CF8', '#4ADE80'],
+        // P3 (fix I1): anclas fuera de los tonos de rol pedagógico.
+        moduleColors: ['#A3D65C', '#D58AE6', '#B8D65C', '#F08AB8'],
         personality: persona({ fontDisplay: SANS, fontMeta: MONO, fontNumeral: MONO, displayWeight: 700, thesisItalic: false, heroTreatment: 'rule', density: 'compact', ruleBetween: false, metaTracking: 0.04, plate: true, sectionRule: false, gridRules: true, metaCase: 'upper' }),
       }),
     },
@@ -239,7 +244,8 @@ export const THEME_FAMILIES: Record<ThemeFamilyId, ThemeFamily> = {
         typography: { fontBody: HUMANIST, fontHeading: ROUNDED, weightHeading: 800, lineHeading: 1.25, measureCh: 68 },
         shape: { radiusSm: 12, radiusMd: 20, radiusLg: 28, borderWidth: 1 },
         variants: { card: 'tinted', callout: 'tinted', hero: 'solid' },
-        moduleColors: ['#C026D3', '#0EA5E9', '#65A30D', '#F97316', '#DB2777'],
+        // P3 (fix I1): anclas fuera de los tonos de rol pedagógico.
+        moduleColors: ['#C026D3', '#65A30D', '#D42372', '#5B8A0A', '#8C1FAD'],
         personality: persona({ fontDisplay: ROUNDED, fontMeta: ROUNDED, fontNumeral: ROUNDED, displayWeight: 800, thesisItalic: false, heroTreatment: 'plate', density: 'regular', ruleBetween: false, metaTracking: 0.06, plate: false, sectionRule: false, gridRules: false, metaCase: 'upper' }),
       }),
     },
@@ -276,7 +282,8 @@ export const THEME_FAMILIES: Record<ThemeFamilyId, ThemeFamily> = {
         typography: { fontBody: HUMANIST, fontHeading: HUMANIST, weightHeading: 700, lineHeading: 1.28, measureCh: 68 },
         shape: { radiusSm: 8, radiusMd: 14, radiusLg: 20, borderWidth: 1 },
         variants: { card: 'tinted', callout: 'outline', hero: 'solid' },
-        moduleColors: ['#1A3C5E', '#0B6B56', '#7D3C98', '#9B1C1C'],
+        // P3 (fix I1): ciruela, oliva, frambuesa y musgo (fuera de los tonos de rol del modo oscuro).
+        moduleColors: ['#6B2E7A', '#4E6B12', '#8A2257', '#2E5E1E'],
         personality: persona({ fontDisplay: HUMANIST, fontMeta: HUMANIST, fontNumeral: HUMANIST, displayWeight: 700, thesisItalic: false, heroTreatment: 'rule', density: 'regular', ruleBetween: false, metaTracking: 0.06, plate: true, sectionRule: false, gridRules: false, metaCase: 'sentence' }),
       }),
     },

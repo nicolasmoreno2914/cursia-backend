@@ -41,7 +41,7 @@ export const LEGACY_PALETTES: LegacyPalette[] = [
 
   // ── CLARO ──
   { id: 'blanco-corp', cat: 'claro', mode: 'light', m1: '#1E3A5F', m1a: '#DCE9FB', m2: '#0F6E5C', m2a: '#D6F5EE', m3: '#5B3A8E', m3a: '#EAE0F7', accent: '#1D4ED8', dark: '#0F172A', bg: '#FFFFFF', text: '#1B2430', textMuted: '#475569', cardBg: '#F1F5F9', cardHeaderBg: '#E7ECF1' },
-  { id: 'aula-clara', cat: 'claro', mode: 'light', m1: '#0F6E5C', m1a: '#D6F5EE', m2: '#7A4E12', m2a: '#FBE6C2', m3: '#1E3A5F', m3a: '#DCE9FB', accent: '#B45309', dark: '#111827', bg: '#FAFAF7', text: '#20261E', textMuted: '#525B4F', cardBg: '#F0F1EC', cardHeaderBg: '#E4E6DE' },
+  { id: 'aula-clara', cat: 'claro', mode: 'light', m1: '#2F6B1F', m1a: '#E3F2DC', m2: '#7A2E73', m2a: '#F5E3F3', m3: '#5F6410', m3a: '#F1F2D8', accent: '#B45309', dark: '#111827', bg: '#FAFAF7', text: '#20261E', textMuted: '#525B4F', cardBg: '#F0F1EC', cardHeaderBg: '#E4E6DE' },
   { id: 'salud-bienestar', cat: 'claro', mode: 'light', m1: '#0F766E', m1a: '#CCFBF1', m2: '#0369A1', m2a: '#E0F2FE', m3: '#334155', m3a: '#F1F5F9', accent: '#047857', dark: '#06231C', bg: '#F7FBFA', text: '#14261F', textMuted: '#4B5D57', cardBg: '#EAF3F0', cardHeaderBg: '#DCEAE5' },
   { id: 'menta-fresca', cat: 'claro', mode: 'light', m1: '#047857', m1a: '#D1FAE5', m2: '#0E7490', m2a: '#CFFAFE', m3: '#6D28D9', m3a: '#EDE9FE', accent: '#0F766E', dark: '#052220', bg: '#F6FBFA', text: '#14231F', textMuted: '#4A5A55', cardBg: '#E9F5F2', cardHeaderBg: '#DBEBE7' },
   { id: 'arena-calida', cat: 'claro', mode: 'light', m1: '#B45309', m1a: '#FEF3C7', m2: '#44403C', m2a: '#F5F5F4', m3: '#0F766E', m3a: '#CCFBF1', accent: '#C2410C', dark: '#1F1710', bg: '#FBF8F3', text: '#2B211A', textMuted: '#6B5D50', cardBg: '#F3ECE1', cardHeaderBg: '#E9DFCF' },

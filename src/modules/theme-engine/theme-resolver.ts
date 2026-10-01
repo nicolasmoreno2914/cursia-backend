@@ -300,6 +300,39 @@ function tooSimilar(a: string, b: string): boolean {
 }
 
 /**
+ * P3 (fix I1) — el color de módulo es ESTRUCTURA y nunca debe leerse como un rol pedagógico: su tono
+ * queda a ≥ ROLE_HUE_MIN_DISTANCE° del tono de todo `ink` de rol (theme.blocks) del modo. Un color casi
+ * gris (saturación < MODULE_NEUTRAL_SAT) no tiene tono y queda exento.
+ */
+export const ROLE_HUE_MIN_DISTANCE = 25;
+export const MODULE_NEUTRAL_SAT = 0.15;
+/** Margen al desplazar (redondeo hex ↔ hsl): el tono final queda a ≥ 27° para que el check de 25° pase siempre. */
+const ROLE_HUE_TARGET = ROLE_HUE_MIN_DISTANCE + 2;
+
+function roleHues(theme: ResolvedTheme): number[] {
+  return theme.blocks ? EDU_BLOCK_ROLES.map((r) => hexToHsl(theme.blocks[r].ink).h) : [];
+}
+
+/** Distancia mínima (°) de un tono a los tonos de rol. */
+export function roleHueDistance(theme: ResolvedTheme, hex: string): number {
+  const { h } = hexToHsl(hex);
+  return Math.min(...roleHues(theme).map((r) => hueDelta(h, r)), 360);
+}
+
+/** Tono más cercano a `h` que queda a ≥ ROLE_HUE_TARGET de todo rol (determinista: +d antes que −d). */
+function roleSafeHue(h: number, roles: number[]): number {
+  const ok = (x: number) => roles.every((r) => hueDelta(x, r) >= ROLE_HUE_TARGET);
+  if (ok(h)) return h;
+  for (let d = 1; d <= 180; d++) {
+    const up = (h + d) % 360;
+    if (ok(up)) return up;
+    const down = (h - d + 360) % 360;
+    if (ok(down)) return down;
+  }
+  return h;
+}
+
+/**
  * Calcula los colores de módulo 0..count-1 en orden.
  *
  * - Índices < anclas: el ancla i (BrandSeed.moduleColors[i] o el ancla i de la familia) se
@@ -333,6 +366,21 @@ function computeModuleColors(theme: ResolvedTheme, count: number): ModuleColorsC
       baseHex = hslToHex(h, s, l);
     }
 
+    // P3 (fix I1): fuera de los tonos de rol (una semilla guardada que choca se desplaza, nunca falla).
+    const roles = roleHues(theme);
+    if (s >= MODULE_NEUTRAL_SAT && roles.length) {
+      const safe = roleSafeHue(h, roles);
+      if (safe !== h) {
+        const before = baseHex;
+        h = safe;
+        // El tono desplazado cae en verde-oliva o ciruela-frambuesa: saturación y luminosidad sobrias
+        // (sin neones) para que siga leyéndose como un color institucional de estructura.
+        s = Math.min(s, 0.55);
+        l = isDark ? Math.min(Math.max(l, 0.3), 0.45) : Math.min(l, 0.32);
+        baseHex = hslToHex(h, s, l);
+        if (i < basis.length) note.push(`moduleColor(${i}) desplazado fuera de los tonos de rol pedagógico (${before} → ${baseHex})`);
+      }
+    }
     let main = resolveReadableOn(baseHex, CONTRAST_BODY);
     if (main.changed && i < basis.length) {
       note.push(`moduleColor(${i}).main corregido para contraste ≥ ${CONTRAST_BODY} (${baseHex} → ${main.bg})`);
@@ -351,8 +399,9 @@ function computeModuleColors(theme: ResolvedTheme, count: number): ModuleColorsC
           break;
         }
       }
-      for (let k = 1; !fixed && k <= 12; k++) {
-        const cand = resolveReadableOn(hslToHex(h + GOLDEN_ANGLE_DEG * k, Math.max(s, 0.45), l), CONTRAST_BODY);
+      for (let k = 1; !fixed && k <= 24; k++) {
+        const hk = roles.length ? roleSafeHue((h + GOLDEN_ANGLE_DEG * k) % 360, roles) : h + GOLDEN_ANGLE_DEG * k;
+        const cand = resolveReadableOn(hslToHex(hk, Math.max(s, 0.45), l), CONTRAST_BODY);
         if (!collides(cand.bg)) {
           main = cand;
           fixed = true;
@@ -459,6 +508,10 @@ export function validateTheme(t: ResolvedTheme, opts?: { moduleCount?: number })
     checkHex(m.border, `moduleColor(${i}).border`);
     for (const k of ['main', 'soft', 'onMain', 'onSoft', 'border'] as const) checkNotPure(m[k], `moduleColor(${i}).${k}`);
     checkContrast(`moduleColor(${i}).onMain`, m.onMain, `moduleColor(${i}).main`, m.main, CONTRAST_BODY);
+    // P3 (fix I1): ningún color de módulo (con tono) cae en el tono de un rol pedagógico.
+    if (t.blocks && hexToHsl(m.main).s >= MODULE_NEUTRAL_SAT && roleHueDistance(t, m.main) < ROLE_HUE_MIN_DISTANCE) {
+      errors.push({ code: 'MODULE_ROLE_HUE', message: `moduleColor(${i}).main ${m.main} a ${roleHueDistance(t, m.main).toFixed(0)}° de un tono de rol (< ${ROLE_HUE_MIN_DISTANCE}°)` });
+    }
     checkContrast(`moduleColor(${i}).onSoft`, m.onSoft, `moduleColor(${i}).soft`, m.soft, CONTRAST_BODY);
   }
 
