@@ -483,7 +483,11 @@ function reservationBookkeeping(ev) {
         const wantTheme = TE.themeSha256(TE.resolveTheme({ ...C.theme, themeVersion: 1 }));
         const BV = D('package/dynamic-mbz-builder-v3.js').DYNAMIC_MBZ_BUILDER_VERSION_V3;
         ok(os.builderVersion === BV && os.rulesVersion === 3 && os.themeSource === 'profile' && os.themeSha256 === wantTheme, `${C.key}: builder ${BV}, tema del perfil ${C.theme.themeFamily}/${C.theme.mode} (themeSha256 = resolveTheme del perfil)`, { b: os.builderVersion, src: os.themeSource, t: os.themeSha256, want: wantTheme });
-        eq((os.warnings || []).filter((w) => !/mock/i.test(JSON.stringify(w))), [], `${C.key}: 0 warnings del worker (salvo los avisos de fixtures mock de Gamma/TTS)`);
+        // EV6 T3: sin evaluación final no hay certificado y el worker lo avisa con EXACTAMENTE
+        // certificate_omitted:no_final_exam (intencional); con evaluación final ese aviso no existe.
+        const certOmitted = (w) => w && w.code === 'certificate_omitted' && w.detail === 'certificate_omitted:no_final_exam';
+        eq((os.warnings || []).filter((w) => !/mock/i.test(JSON.stringify(w)) && !(!C.finalExam && certOmitted(w))), [], `${C.key}: 0 warnings del worker (salvo los avisos de fixtures mock de Gamma/TTS${C.finalExam ? '' : ' y certificate_omitted:no_final_exam'})`);
+        eq((os.warnings || []).filter(certOmitted).length, C.finalExam ? 0 : 1, `${C.key}: aviso certificate_omitted:no_final_exam ${C.finalExam ? 'ausente (hay evaluación final)' : 'presente (sin evaluación final)'}`);
         results.courses[C.key].packageSummary = os;
         c.pkg = P;
       });
