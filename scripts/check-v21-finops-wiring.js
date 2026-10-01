@@ -394,8 +394,10 @@ const MOCK_CTX = { ...CONTEXT, videoMode: 'mock', providerModes: { presentation:
 const ENV_KEYS = [
   'DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_ALLOWED_OWNERS', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION',
   'DYNAMIC_VIDEO_DELIVERY', 'DYNAMIC_ALLOW_VIDEOGEN_DIRECT', 'VIDEOGEN_API_KEY', 'ALLOW_UNOWNED_COURSES', 'FINOPS_INGEST_TOKEN',
-  'DYNAMIC_PROVIDER_WORKER_ENABLED', 'DYNAMIC_ALLOW_PROVIDER_MOCK', 'SUPER_ADMIN_EMAILS',
+  'DYNAMIC_PROVIDER_WORKER_ENABLED', 'DYNAMIC_ALLOW_PROVIDER_MOCK', 'SUPER_ADMIN_EMAILS', 'DYNAMIC_ALLOW_VIDEO_PREVIEW',
 ];
+// EV6 DoD (BE-A): la recuperación PAGA de un video (reenvío / render nuevo) es de SUPER_ADMIN.
+const RECOVERY_ADMIN = { email: 'admin@cursia.test' };
 
 async function dbChecks() {
   const { Client } = require('pg');
@@ -530,6 +532,8 @@ async function dbChecks() {
     process.env.VIDEOGEN_API_KEY = 'fake-key-never-used-no-network';
     process.env.DYNAMIC_PROVIDER_WORKER_ENABLED = 'true'; // R5: sin él, runs v3 con Gamma/TTS → 501
     process.env.DYNAMIC_ALLOW_PROVIDER_MOCK = 'true';     // R5: providerModes mock (escape de no-producción)
+    process.env.DYNAMIC_ALLOW_VIDEO_PREVIEW = 'true';     // EV6 DoD: videoMode mock solo con el escape de QA
+    process.env.SUPER_ADMIN_EMAILS = 'admin@cursia.test'; // EV6 DoD: recuperación paga de videos = SUPER_ADMIN
 
     ds = new DataSource({ type: 'postgres', host: '127.0.0.1', port, username: 'postgres', database: DB, entities: [], synchronize: false });
     await ds.initialize();
@@ -809,7 +813,9 @@ async function dbChecks() {
       assert(dependents.length > 0 && dependents.every((d) => d.status === 'blocked'), `dependientes ${JSON.stringify(dependents)}`);
       const [runEst] = await ds.query(`select id from public.cost_estimates where run_id = $1 and scope = 'run'`, [runB]);
       await admin.authorize(Bc.cid, { estimateId: runEst.id, authorizedBudget: '200' }, ADMIN_USER);
-      const retried = await runs.retryItem(Bc.cid, OWNER, 1, runB, claimed.itemKey);
+      // EV6 DoD (BE-A): reanudar un video frenado por presupuesto envía un render nuevo → solo admin (403 al dueño).
+      await rejectsRe(runs.retryItem(Bc.cid, OWNER, 1, runB, claimed.itemKey, false, false, undefined, { email: 'owner@cursia.test' }), /admin_recovery_only/, 'dueño', 403);
+      const retried = await runs.retryItem(Bc.cid, OWNER, 1, runB, claimed.itemKey, false, false, undefined, RECOVERY_ADMIN);
       eq(retried.status, 'pending', 'reanudado');
       const after = await ds.query(`select status from public.generation_item_runs where job_id = $1 and $2 = any(depends_on)`, [runB, claimed.itemKey]);
       assert(after.every((d) => d.status === 'pending'), 'dependientes desbloqueados');
@@ -1038,13 +1044,14 @@ async function dbChecks() {
     await check('DB I1 retry: video fallido sin job y resubmitVideo → 409 budget_approval_required con estimado (scope regeneration) y el item sigue failed', async () => {
       const key = `video:${E.c2}`;
       await ds.query(`update public.generation_item_runs set status = 'failed', error = 'video_timeout' where job_id = $1 and item_key = $2`, [runE, key]);
-      const err = await rejectsRe(runs.retryItem(E.cid, OWNER, 1, runE, key), /budget_approval_required/, 'retry', 409);
+      await rejectsRe(runs.retryItem(E.cid, OWNER, 1, runE, key), /admin_recovery_only/, 'retry del dueño (EV6 DoD: recuperación paga = admin)', 403);
+      const err = await rejectsRe(runs.retryItem(E.cid, OWNER, 1, runE, key, false, false, undefined, RECOVERY_ADMIN), /budget_approval_required/, 'retry', 409);
       const [est] = await ds.query(`select scope, run_id from public.cost_estimates where id = $1`, [err.getResponse().estimateId]);
       eq([est.scope, est.run_id], ['regeneration', runE], 'estimado');
       await ds.query(`update public.generation_item_runs set error = 'videogen_failed: x',
                         output_summary = output_summary || '{"external":{"videogenJobId":"vg_old","mode":"real"}}'::jsonb
                       where job_id = $1 and item_key = $2`, [runE, key]);
-      await rejectsRe(runs.retryItem(E.cid, OWNER, 1, runE, key, true), /budget_approval_required/, 'resubmitVideo', 409);
+      await rejectsRe(runs.retryItem(E.cid, OWNER, 1, runE, key, true, false, undefined, RECOVERY_ADMIN), /budget_approval_required/, 'resubmitVideo', 409);
       eq((await itemRow(runE, key)).status, 'failed', 'sigue failed');
     });
 

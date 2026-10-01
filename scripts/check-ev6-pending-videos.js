@@ -352,7 +352,9 @@ async function pureChecks() {
 }
 
 // ── worker v3 con dependencias falsas ─────────────────────────────────────
-function workerHarness({ videoMode = 'mock', videoModeByItem = null, omitMode = false, runPayload = {}, workerStatus = 'completed', upgradeFailures = null } = {}) {
+// EV6 DoD (BE-A): los fixtures de este harness congelan Gamma/TTS en mock → todo paquete que arman es de
+// QA (`packageKind` lo decide PackagingService y viaja en el job). Un job `final` sobre estos runs falla fuerte.
+function workerHarness({ videoMode = 'mock', videoModeByItem = null, omitMode = false, runPayload = {}, workerStatus = 'completed', upgradeFailures = null, packageKind = 'qa_preview' } = {}) {
   const fx = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true, courseId: 651 });
   const manifest = fx.manifest;
   const RUN_ID = '22222222-2222-4222-8222-222222222222';
@@ -445,7 +447,7 @@ function workerHarness({ videoMode = 'mock', videoModeByItem = null, omitMode = 
     }),
     nowSeconds: () => 1790600000,
   };
-  const job = { id: 'job-ev6', owner_id: OWNER, course_id: manifest.source.courseId, frontend_course_id: null, worker_status: 'running', status: 'running', input_payload: { runId: RUN_ID, manifestId: 9001, blueprintNumber: 1 }, output_summary: {}, attempt_count: 1, max_attempts: 3 };
+  const job = { id: 'job-ev6', owner_id: OWNER, course_id: manifest.source.courseId, frontend_course_id: null, worker_status: 'running', status: 'running', input_payload: { runId: RUN_ID, manifestId: 9001, blueprintNumber: 1, ...(packageKind !== 'final' ? { packageKind } : {}) }, output_summary: {}, attempt_count: 1, max_attempts: 3 };
   return { deps, job, state, manifest, fx };
 }
 let workerMbz = null;
@@ -472,6 +474,13 @@ async function workerChecks() {
       const route = VC.extractText((/<div class="cvc-route"[\s\S]*$/.exec(a.intro) || [''])[0]).slice(0, 200);
       assert(!/video/i.test(route), `recorrido promete video: ${route}`);
     }
+    // EV6 DoD (BE-A): paquete QA → nombre «[QA — vista previa, no entregable]», archivo QA-VISTA-PREVIA-…, resumen qa_preview.
+    {
+      const z = await JSZip.loadAsync(h.state.uploads[0].buffer);
+      assert(/<fullname>[^<]*\[QA — vista previa, no entregable\]<\/fullname>/.test(await z.file('course/course.xml').async('string')), 'fullname QA');
+      assert(/^QA-VISTA-PREVIA-/.test(h.state.uploads[0].filename) && /\/QA-VISTA-PREVIA-[0-9a-f]+\.mbz$/.test(h.state.uploads[0].storagePath), `archivo QA: ${h.state.uploads[0].filename}`);
+      eq([s.packageKind, s.deliverable, h.state.uploads[0].metadata.packageKind], ['qa_preview', false, 'qa_preview'], 'resumen/metadata QA');
+    }
     workerMbz = h.state.uploads[0].buffer;
     // restore-first: mismo run → reutiliza, con pendingVideos también en el resumen reutilizado
     h.state.completed.length = 0;
@@ -491,6 +500,25 @@ async function workerChecks() {
     eq(s.pendingVideos.map((p) => p.itemKey), [`video:${vids[1]}`], 'solo el mock pendiente');
     const acts = await mbzActs(h.state.uploads[0].buffer);
     assert(acts.some((a) => a.idnumber === `cv3:ch:${vids[0]}:video` && a.modname === 'h5pactivity'), 'el video real está');
+  });
+  await check('EV6 DoD: un job de paquete FINAL sobre un run con componentes de vista previa (videos o Gamma/TTS mock) falla fuerte preview_not_deliverable; nada se sube', async () => {
+    for (const o of [{ videoMode: 'mock' }, { videoMode: 'real', runPayload: { videoModeOriginal: 'mock', videoUpgrade: { id: 'u', itemKeys: [] } } }]) {
+      const h = workerHarness({ ...o, packageKind: 'final' });
+      await W.processItem(h.deps, h.job);
+      eq(h.state.uploads.length, 0, 'sin upload');
+      assert(h.state.failed.length === 1 && /^preview_not_deliverable/.test(h.state.failed[0]), `falla: ${h.state.failed[0]}`);
+    }
+  });
+  await check('EV6 DoD: un paquete QA nunca reutiliza un .mbz anterior SIN rótulo (B1) con la misma clave; uno final nunca reutiliza uno de vista previa', async () => {
+    const h = workerHarness({ videoMode: 'mock' });
+    // .mbz B1 anterior a la DoD: misma clave, sin packageKind, con videos omitidos en su metadata.
+    const probe = workerHarness({ videoMode: 'mock' });
+    await W.processItem(probe.deps, probe.job);
+    const meta = { ...probe.state.uploads[0].metadata };
+    delete meta.packageKind; delete meta.deliverable;
+    h.state.dynamicMbz.push({ id: 'mbz-b1-viejo', metadata: meta });
+    await W.processItem(h.deps, h.job);
+    eq([h.state.uploads.length, h.state.completed[0].reused, h.state.completed[0].artifactId !== 'mbz-b1-viejo'], [1, false, true], 'construye uno QA nuevo');
   });
   await check('worker v3: run REAL con items sin output_summary.mode (anteriores) → los videos se exigen como siempre (sin omitir)', async () => {
     const h = workerHarness({ videoMode: 'real', omitMode: true });
@@ -543,6 +571,7 @@ async function upgradeChecks() {
     const h = workerHarness({
       videoMode: 'real', videoModeByItem: (ch) => (ch === vids[0] ? 'real' : 'mock'), workerStatus: 'failed',
       runPayload: { videoModeOriginal: 'mock', videoUpgrade: { id: 'up-2', itemKeys: vids.map((c) => `video:${c}`) } }, upgradeFailures: failed,
+      packageKind: 'degraded', // EV6 DoD: §2.6 = paquete degradado (solo SUPER_ADMIN), rotulado QA
     });
     await W.processItem(h.deps, h.job);
     eq(h.state.failed, [], `sin fallos: ${h.state.failed}`);

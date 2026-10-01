@@ -250,7 +250,8 @@ function cleanEnv(extra) {
 const OWNER = '11111111-2222-4333-8444-555555555555';
 const CONTEXT = { nombre: 'Curso R16', sector: 'Minería', pais: 'Chile', contexto: 'Planta', nivel: 'Intermedio', tono: 'cercano' };
 const ENV_KEYS = ['DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_ALLOWED_OWNERS', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION',
-  'DYNAMIC_VIDEO_DELIVERY', 'DYNAMIC_ALLOW_VIDEOGEN_DIRECT', 'ALLOW_UNOWNED_COURSES', 'DYNAMIC_PROVIDER_WORKER_ENABLED', 'VIDEOGEN_API_KEY'];
+  'DYNAMIC_VIDEO_DELIVERY', 'DYNAMIC_ALLOW_VIDEOGEN_DIRECT', 'ALLOW_UNOWNED_COURSES', 'DYNAMIC_PROVIDER_WORKER_ENABLED', 'VIDEOGEN_API_KEY',
+  'SUPER_ADMIN_EMAILS'];
 
 async function dbChecks() {
   const { Client } = require('pg');
@@ -327,6 +328,7 @@ async function dbChecks() {
     delete process.env.DYNAMIC_ALLOW_VIDEOGEN_DIRECT;
     process.env.DYNAMIC_PROVIDER_WORKER_ENABLED = 'true';
     process.env.VIDEOGEN_API_KEY = 'fake-videogen-key-never-used-no-network';
+    process.env.SUPER_ADMIN_EMAILS = 'admin@cursia.test';
 
     ds = new DataSource({ type: 'postgres', host: '127.0.0.1', port, username: 'postgres', database: DB, entities: [Artifact], synchronize: false });
     await ds.initialize();
@@ -516,7 +518,8 @@ async function dbChecks() {
       const vid = await itemRow(C.runId, `video:${C.c1}`);
       await failAt(vid.id, 'videogen_failed: render', 60,
         `jsonb_build_object('external', jsonb_build_object('videogenJobId', 'vg_old', 'mode', 'real'), 'videoPollSince', '2026-09-30T00:00:00Z')`);
-      await runs.retryItem(C.cid, OWNER, 1, C.runId, `video:${C.c1}`, true, false);
+      // EV6 DoD (BE-A): el reenvío PAGO de un video es recuperación de admin → lo pide un SUPER_ADMIN.
+      await runs.retryItem(C.cid, OWNER, 1, C.runId, `video:${C.c1}`, true, false, undefined, { email: 'admin@cursia.test' });
       row = await itemRow(C.runId, `video:${C.c1}`);
       eq([row.status, 'videoPollSince' in row.output_summary, 'external' in row.output_summary], ['pending', false, false], 'video');
     });

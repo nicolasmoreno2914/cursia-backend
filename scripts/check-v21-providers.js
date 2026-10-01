@@ -294,7 +294,7 @@ const ENV_KEYS = [
   'DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_ALLOWED_OWNERS', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION',
   'DYNAMIC_VIDEO_DELIVERY', 'DYNAMIC_ALLOW_VIDEOGEN_DIRECT', 'ALLOW_UNOWNED_COURSES', 'DYNAMIC_PROVIDER_WORKER_ENABLED',
   'DYNAMIC_ALLOW_PROVIDER_MOCK', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'GAMMA_API_BASE_URL', 'OPENAI_API_BASE_URL',
-  'ANTHROPIC_API_BASE_URL', ...PROVIDER_ENV_KEYS,
+  'ANTHROPIC_API_BASE_URL', 'DYNAMIC_ALLOW_VIDEO_PREVIEW', 'SUPER_ADMIN_EMAILS', ...PROVIDER_ENV_KEYS,
 ];
 
 async function dbChecks() {
@@ -380,6 +380,9 @@ async function dbChecks() {
     delete process.env.DYNAMIC_ALLOW_VIDEOGEN_DIRECT;
     process.env.DYNAMIC_PROVIDER_WORKER_ENABLED = 'true';
     delete process.env.DYNAMIC_ALLOW_PROVIDER_MOCK;
+    // EV6 DoD (BE-A): los casos con video de vista previa usan el escape de QA (los de proveedores reales no cambian).
+    process.env.DYNAMIC_ALLOW_VIDEO_PREVIEW = 'true';
+    process.env.SUPER_ADMIN_EMAILS = 'admin@cursia.test';
     process.env.SUPABASE_URL = storageUrl;
     process.env.SUPABASE_SERVICE_ROLE_KEY = 'fake-service-role-local-only';
     process.env.GAMMA_API_BASE_URL = urls.gammaUrl;
@@ -1081,7 +1084,9 @@ async function dbChecks() {
       eq([row.status, vg.st.submits], ['failed', 1], 'timeout: failed tras 1 envío');
       assert(/^ambiguous_video_submission: .*timeout/.test(row.error), row.error);
       eq((await reservationsOf(row.id, 'videogen')).map((x) => x.settled), [false], 'reserva pendiente');
-      await runs.retryItem(R.cid, OWNER, 1, R.rid, item.itemKey);
+      // EV6 DoD (BE-A): un video con envío ambiguo es recuperación de admin (reconcile_videogen) → lo reintenta un SUPER_ADMIN.
+      await rejectsRe(runs.retryItem(R.cid, OWNER, 1, R.rid, item.itemKey), /admin_recovery_only/, 'dueño', 403);
+      await runs.retryItem(R.cid, OWNER, 1, R.rid, item.itemKey, false, false, undefined, { email: 'admin@cursia.test' });
       await IW.processItem(videoDeps(vg), await claimVideo(R.rid));
       eq(vg.st.submits, 1, 'retry común: 0 envíos nuevos');
       const R2 = await freshRun('Fault video B', true);

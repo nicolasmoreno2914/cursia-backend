@@ -1200,7 +1200,10 @@ async function workerChecks() {
       }),
       nowSeconds: () => 1790600000,
     };
-    const job = { id: 'job-1', owner_id: OWNER, course_id: manifest.source.courseId, frontend_course_id: null, worker_status: 'running', status: 'running', input_payload: { runId: RUN_ID, manifestId: 9001, blueprintNumber: 1 }, output_summary: {}, attempt_count: 1, max_attempts: 3 };
+    // EV6 DoD (BE-A): un run con Gamma/TTS mock es de vista previa → su paquete es QA (lo declara el job,
+    // como lo encola PackagingService para un SUPER_ADMIN con el escape); un run real → paquete final.
+    const qa = !!providerModes && (providerModes.presentation === 'mock' || providerModes.audio === 'mock');
+    const job = { id: 'job-1', owner_id: OWNER, course_id: manifest.source.courseId, frontend_course_id: null, worker_status: 'running', status: 'running', input_payload: { runId: RUN_ID, manifestId: 9001, blueprintNumber: 1, ...(qa ? { packageKind: 'qa_preview' } : {}) }, output_summary: {}, attempt_count: 1, max_attempts: 3 };
     return { deps, job, state };
   }
 
@@ -1217,7 +1220,9 @@ async function workerChecks() {
     eq(s.mockProviderItems.length, manifest.items.filter((i) => ['presentation', 'audio_welcome', 'audiobook_chapter'].includes(i.type)).length, 'fixtures materializadas');
     eq(h.state.ledger.map((e) => [e.kind, e.externalId, e.attributionRunId]), [['package', 'job-1', RUN_ID]], 'ZERO_BY_DESIGN');
     const up = h.state.uploads[0];
-    assert(up.storagePath.endsWith(`/${s.sourceIdsHash}.mbz`) && up.upsert === false, 'path direccionado por la clave');
+    // EV6 DoD: paquete QA → archivo QA-VISTA-PREVIA-<clave>.mbz (nunca adopta el path de un paquete sin rótulo).
+    assert(up.storagePath.endsWith(`/QA-VISTA-PREVIA-${s.sourceIdsHash}.mbz`) && up.upsert === false, 'path direccionado por la clave');
+    eq([s.packageKind, s.deliverable], ['qa_preview', false], 'resumen QA');
     const z = await JSZip.loadAsync(up.buffer);
     assert(z.file('moodle_backup.xml'), 'es un .mbz');
     // restore-first: el mismo job otra vez reutiliza el .mbz subido
