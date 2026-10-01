@@ -171,8 +171,11 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * tipo y slots aleatorios (`question_set_reference`), retroalimentación por opción + general;
  * emparejamiento del banco = definición como subpregunta y término como opción (fix 1). Los
  * paquetes con exámenes GIFT quedan byte a byte iguales a 3.3.0 (el bump invalida solo el reuse).
+ * 3.5.0 (P3, sistema visual educativo 2.0): labels con rótulo/forma/color por rol pedagógico, apertura
+ * «Capítulo N de T · ~X min» (minutos en facts desde las palabras medidas del experience), riel
+ * «Dónde estás» del módulo y la actividad H5P/SCORM enmarcada con el tono del módulo.
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.4.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.5.0';
 /** Versión del renderer de Visual Components que entra en la clave de reuse. */
 export const VC_RENDERER_VERSION = `vc${VC_SCHEMA_VERSION}-rt${VC_RUNTIME_VERSION}-theme${THEME_ENGINE_VERSION}-style${VC_RENDER_STYLE_VERSION}`;
 
