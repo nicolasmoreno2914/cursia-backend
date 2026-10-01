@@ -643,6 +643,54 @@ const ENV_KEYS = [
       eq((await latest(R.runId, `video:${R.c1}`)).status, 'pending', 'el video dependiente se desbloquea (primer render, gate de FinOps de siempre)');
     });
 
+    await check('dod', 'follow-up n5: el gate de recuperación de admin del reintento es el MISMO antes y bajo lock (dependentsToUnblock): un video bloqueado con render intentado que ESTE reintento no desbloquea no le quita al dueño un reintento gratis; uno que sí desbloquea → 403 admin_recovery_only al dueño, el admin sí', async () => {
+      const R = await finishedRun('DoD n5', { videoMode: 'real', providerModes: { presentation: 'real', audio: 'real' }, videoItemMode: 'real' });
+      await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, authorized_budget, decision, approved_by, reason)
+                      values ($1, $2, 1000, 'ADMIN_APPROVED', 'admin@cursia.test', 'DoD n5: presupuesto del run')`, [R.runId, R.cid]);
+      const c1 = await latest(R.runId, `content:${R.c1}`);
+      const v1 = await latest(R.runId, `video:${R.c1}`);
+      const v2 = await latest(R.runId, `video:${R.c2}`);
+      assert((v1.depends_on || []).includes(`content:${R.c1}`) && !(v2.depends_on || []).includes(`content:${R.c1}`), `precondición de dependencias: ${JSON.stringify([v1.depends_on, v2.depends_on])}`);
+      const attempted = (id) => ds.query(`update public.generation_item_runs set status = 'blocked', error = 'videogen_failed: render rechazado',
+        output_summary = (output_summary - 'external' - 'delivery' - 'youtubeVideoId' - 'youtubeUrl') || '{"externalSubmitStartedAt":"2026-10-01T00:00:00Z"}'::jsonb where id = $1`, [id]);
+      const owner = { id: OWNER, email: 'owner@cursia.test' };
+      // (a) video AJENO (de otro capítulo) bloqueado con render intentado: el dueño reintenta su content gratis.
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'Falló después de 3 intentos' where id = $1`, [c1.id]);
+      await attempted(v2.id);
+      await recompute(R.runId);
+      const it = await runs.retryItem(R.cid, OWNER, 1, R.runId, `content:${R.c1}`, false, false, undefined, owner);
+      eq([it.status, (await latest(R.runId, `video:${R.c2}`)).status], ['pending', 'blocked'], 'reintento del dueño; el video ajeno no se toca');
+      // (b) el video DEPENDIENTE intentó un render: desbloquearlo lo re-renderizaría → admin.
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'Falló después de 3 intentos', finished_at = now() where id = $1`, [(await latest(R.runId, `content:${R.c1}`)).id]);
+      await attempted(v1.id);
+      await recompute(R.runId);
+      await rejectsRe(runs.retryItem(R.cid, OWNER, 1, R.runId, `content:${R.c1}`, false, false, undefined, owner), /admin_recovery_only/, 'dependiente con render intentado: dueño', 403);
+      eq((await latest(R.runId, `content:${R.c1}`)).status, 'failed', 'nada cambió');
+      const ad = await runs.retryItem(R.cid, OWNER, 1, R.runId, `content:${R.c1}`, false, false, undefined, { id: OWNER, email: ADMIN.email });
+      eq(ad.status, 'pending', 'el admin sí');
+    });
+
+    await check('dod', 'follow-up fix round 1 m1: el gate de FinOps del reintento del dueño cuenta SOLO los items pagos que ESTE reintento desbloquea: sin presupuesto del run para videos, un video ajeno bloqueado (render intentado) no le pide aprobación de admin al reintento gratis de un content; un video dependiente sin render sí pasa por el gate de siempre', async () => {
+      const R = await finishedRun('DoD m1', { videoMode: 'real', providerModes: { presentation: 'real', audio: 'real' }, videoItemMode: 'real' });
+      const c1 = await latest(R.runId, `content:${R.c1}`);
+      const v2 = await latest(R.runId, `video:${R.c2}`);
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'Falló después de 3 intentos' where id = $1`, [c1.id]);
+      await ds.query(`update public.generation_item_runs set status = 'blocked', error = 'videogen_failed: render rechazado',
+        output_summary = (output_summary - 'external' - 'delivery' - 'youtubeVideoId' - 'youtubeUrl') || '{"externalSubmitStartedAt":"2026-10-01T00:00:00Z"}'::jsonb where id = $1`, [v2.id]);
+      await recompute(R.runId);
+      // El presupuesto aprobado del run (el del arranque por el camino QA, sin videos pagos) no cubre un video:
+      // si el gate contara el video ajeno, el reintento gratis pediría aprobación de admin (409).
+      const owner = { id: OWNER, email: 'owner@cursia.test' };
+      const it = await runs.retryItem(R.cid, OWNER, 1, R.runId, `content:${R.c1}`, false, false, undefined, owner);
+      eq([it.status, (await latest(R.runId, `video:${R.c2}`)).status], ['pending', 'blocked'], 'reintento gratis sin aprobación; el video ajeno no se toca');
+      // Un video DEPENDIENTE que nunca renderizó: su primer render sigue pasando por el gate de FinOps.
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'Falló después de 3 intentos', finished_at = now() where id = $1`, [(await latest(R.runId, `content:${R.c1}`)).id]);
+      const v1 = await latest(R.runId, `video:${R.c1}`);
+      await ds.query(`update public.generation_item_runs set status = 'blocked', error = null, output_summary = output_summary - 'external' - 'delivery' - 'youtubeVideoId' - 'youtubeUrl' - 'mode' where id = $1`, [v1.id]);
+      await recompute(R.runId);
+      await rejectsRe(runs.retryItem(R.cid, OWNER, 1, R.runId, `content:${R.c1}`, false, false, undefined, owner), /budget_approval_required/, 'dependiente sin render: FinOps', 409);
+    });
+
     await check('dod', 'fix I1: un curso SIN videos arranca (default real) para un owner NO elegible para video real; con videos sigue el 403 real_video_not_enabled', async () => {
       const C = await confirmedCourse('DoD I1 sin videos', CUSTOMER, { videos: false });
       eq(C.manifest.manifest.items.filter((i) => i.type === 'video').length, 0, 'Manifest sin videos');
@@ -837,14 +885,224 @@ const ENV_KEYS = [
       eq(adm.packageKind, 'degraded', 'admin ve el QA más nuevo');
     });
 
-    await check('dod', 'fix round 3 N4: v1/v2 tampoco dan un paquete FINAL sin la generación completa (409 preview_not_deliverable)', async () => {
+    await check('dod', 'fix round 3 N4 + follow-up R7: v1/v2 nunca dan un paquete FINAL sin la generación completa (409 preview_not_deliverable al dueño y a un admin SIN el escape); un SUPER_ADMIN CON el escape de QA arma un paquete QA (vista previa → qa_preview; sin validar → degraded), nunca final; el empaque automático tampoco', async () => {
       const R = await finishedRun('DoD N4', { videoMode: 'real', providerModes: { presentation: 'real', audio: 'real' }, videoItemMode: 'real' });
       eq(await recompute(R.runId), 'completed', 'precondición');
       const pres = await latest(R.runId, `presentation:${R.c1}`);
       await ds.query(`update public.generation_item_runs set output_summary = output_summary || '{"mock":true}'::jsonb where id = $1`, [pres.id]);
       const job = await jobOf(R.runId);
       // Mismo run, por la rama v1/v2 de assertRunReady (rulesVersion 2): la completitud igual se exige.
-      await rejectsRe(packaging.assertRunReady(job, { rulesVersion: 2, manifest: R.manifest.manifest ?? R.manifest }, { email: ADMIN.email }), /preview_not_deliverable/, 'v2 incompleto', 409);
+      const v2 = { rulesVersion: 2, manifest: R.manifest.manifest ?? R.manifest };
+      await rejectsRe(packaging.assertRunReady(job, v2, OWNER_NOT_ADMIN), /preview_not_deliverable/, 'v2 incompleto, dueño', 409);
+      const prevV = process.env.DYNAMIC_ALLOW_VIDEO_PREVIEW;
+      delete process.env.DYNAMIC_ALLOW_VIDEO_PREVIEW;
+      try {
+        await rejectsRe(packaging.assertRunReady(job, v2, { email: ADMIN.email }), /preview_not_deliverable/, 'v2 incompleto, admin sin escape', 409);
+      } finally {
+        process.env.DYNAMIC_ALLOW_VIDEO_PREVIEW = prevV;
+      }
+      eq(await packaging.assertRunReady(job, v2, { email: ADMIN.email }), 'qa_preview', 'R7: admin + escape → QA de vista previa');
+      // Sin validar (no de vista previa): course_intro completado DESPUÉS de la validación sin v3Validation.
+      await ds.query(`update public.generation_item_runs set output_summary = output_summary - 'mock' where id = $1`, [pres.id]);
+      const ci = (await ds.query(`select id from public.generation_item_runs where job_id = $1 and type = 'course_intro'`, [R.runId]))[0];
+      await ds.query(`update public.generation_item_runs set output_summary = output_summary - 'v3Validation', finished_at = now() where id = $1`, [ci.id]);
+      eq(await packaging.assertRunReady(job, v2, { email: ADMIN.email }), 'degraded', 'R7: admin + escape, sin validar → degradado (QA)');
+      await rejectsRe(packaging.assertRunReady(job, v2, OWNER_NOT_ADMIN), /preview_not_deliverable/, 'sin validar, dueño', 409);
+    });
+
+    // ════ 10. DoD follow-up (R1, R3, R4, R7) ═══════════════════════════════════
+    await check('dod', 'follow-up R7 (worker v1/v2): un job QA arma el .mbz con el aviso QA (qaPreviewNotice), nombre QA-VISTA-PREVIA-…, bajo qa-internal/ y declarado (packageKind, deliverable:false) en metadata y resumen; nunca reutiliza el .mbz final (ni el final al QA); un job final sale como siempre', async () => {
+      const PW = L('workers/dynamic-package-worker.js');
+      const reuseKey = L('modules/dynamic-packaging/packaging-reuse-key.js');
+      const { DYNAMIC_MBZ_BUILDER_VERSION } = L('package/dynamic-mbz-builder.js');
+      const RESOLVED = new Map([['content_cap1', [{ artifactId: 'bbbb', type: 'dynamic_content_md' }]], ['scorm_cap1', [{ artifactId: 'aaaa', type: 'dynamic_scorm_html' }]]]);
+      const hash = reuseKey.packageReuseHash(DYNAMIC_MBZ_BUILDER_VERSION, ['aaaa', 'bbbb'], '4.1');
+      const mkDs = () => {
+        const st = { completed: [], failed: [] };
+        return {
+          st,
+          async query(sql, params) {
+            if (/set lease_until/.test(sql)) return [{ id: params[0] }];
+            if (/select input_payload from public\.production_jobs/.test(sql)) return [{ input_payload: {} }];
+            if (/set status = 'completed'/.test(sql)) { st.completed.push(JSON.parse(params[2])); return [{ id: params[0] }]; }
+            if (/set status = 'failed'/.test(sql)) { st.failed.push(params[2]); return []; }
+            return [];
+          },
+          createQueryRunner() { return { async connect() {}, async release() {}, async query() { return [{}]; } }; },
+        };
+      };
+      const runJob = async (input, existing = []) => {
+        const dsF = mkDs();
+        const uploads = [];
+        const built = [];
+        const silent = { log() {}, warn() {}, error() {} };
+        const deps = {
+          dataSource: dsF,
+          artifacts: { async findAll() { return existing; }, async uploadBufferArtifact(i) { uploads.push(i); return { id: `art-${uploads.length}` }; } },
+          manifests: { async getById() { return { id: 1, blueprintNumber: 1, rulesVersion: 2, manifest: { items: [] } }; } },
+          blueprints: { async getByNumber() { return { snapshot: {} }; } },
+          buildPlan: () => ({ planVersion: 1, manifestId: 1, course: { id: 1, title: 'x', summary: null }, sections: [], modules: [], totals: {} }),
+          resolveArtifacts: async () => RESOLVED,
+          loadText: async () => '', parseVideo: () => ({ url: '', videogenJobId: '' }),
+          buildMbz: async (i) => { built.push(i); return Buffer.from('mbz'); },
+          logger: silent, workerId: 'w', leaseSeconds: 60, heartbeatMs: 999999,
+        };
+        await PW.processItem(deps, { id: 'job-1', owner_id: 'owner-1', course_id: 1, frontend_course_id: 'fc', worker_status: 'running', status: 'running',
+          input_payload: { runId: 'run-1', manifestId: 1, blueprintNumber: 1, ...input }, output_summary: {}, attempt_count: 1, max_attempts: 3 });
+        return { dsF, uploads, built };
+      };
+      const qa = await runJob({ packageKind: 'qa_preview' });
+      eq([qa.built.length, qa.built[0].qaPreviewNotice, qa.uploads.length], [1, true, 1], 'QA: build con aviso');
+      const u = qa.uploads[0];
+      assert(u.storagePath.startsWith('qa-internal/owner-1/') && u.filename === `QA-VISTA-PREVIA-${hash}.mbz` && u.storagePath.endsWith(`/QA-VISTA-PREVIA-${hash}.mbz`), `QA: ruta ${u.storagePath} ${u.filename}`);
+      eq([u.metadata.packageKind, u.metadata.deliverable, qa.dsF.st.completed[0].packageKind, qa.dsF.st.completed[0].deliverable], ['qa_preview', false, 'qa_preview', false], 'QA declarado');
+      const fin = await runJob({});
+      eq(['qaPreviewNotice' in fin.built[0], fin.uploads[0].storagePath, fin.uploads[0].filename, 'packageKind' in fin.uploads[0].metadata, 'packageKind' in fin.dsF.st.completed[0]],
+        [false, `owner-1/dynamic/fc/1/dynamic_mbz/run-1/${hash}.mbz`, `${hash}.mbz`, false, false], 'final: como siempre');
+      const finalArt = { id: 'final-old', metadata: { runId: 'run-1', sourceIdsHash: hash, builderVersion: DYNAMIC_MBZ_BUILDER_VERSION, moodleVersion: '4.1' } };
+      const qaArt = { id: 'qa-old', metadata: { ...finalArt.metadata, packageKind: 'degraded', deliverable: false } };
+      const qa2 = await runJob({ packageKind: 'degraded' }, [finalArt]);
+      eq([qa2.built.length, qa2.uploads.length], [1, 1], 'un QA nunca reutiliza el .mbz final');
+      const qa3 = await runJob({ packageKind: 'degraded' }, [finalArt, qaArt]);
+      eq([qa3.built.length, qa3.dsF.st.completed[0].artifactId, qa3.dsF.st.completed[0].packageKind], [0, 'qa-old', 'degraded'], 'QA reutiliza su propio .mbz QA');
+      const fin2 = await runJob({}, [qaArt]);
+      eq(fin2.built.length, 1, 'el final nunca reutiliza un .mbz QA');
+      const fin3 = await runJob({}, [qaArt, finalArt]);
+      eq([fin3.built.length, fin3.dsF.st.completed[0].artifactId], [0, 'final-old'], 'el final reutiliza el final');
+    });
+
+    await check('dod', 'follow-up R7 (builder v1/v2): qaPreviewNotice → aviso «QA — vista previa, no entregable» al inicio de la bienvenida y sufijo en el nombre del curso; ausente/false → sin rastro de QA (mismo course.xml y misma bienvenida)', async () => {
+      const JSZip = require('jszip');
+      const { buildDynamicMbz } = L('package/dynamic-mbz-builder.js');
+      const plan = { planVersion: 1, manifestId: 1, rulesVersion: 1, course: { id: 1, title: 'Curso R7', summary: null }, sections: [{ kind: 'welcome', sectionNum: 0, title: 'Bienvenida' }], modules: [], totals: { modules: 0, chapters: 0, scorms: 0, videos: 0, exams: 0 } };
+      const contents = { contentMd: new Map(), scorm: new Map(), examGift: new Map(), videos: new Map() };
+      const read = async (opts) => {
+        const z = await JSZip.loadAsync(await buildDynamicMbz({ plan, contents, ...opts }));
+        const course = await z.file('course/course.xml').async('string');
+        let welcome = '';
+        for (const f of Object.keys(z.files).filter((x) => /^activities\/label_\d+\/label\.xml$/.test(x))) {
+          const t = await z.file(f).async('string');
+          if (/Bienvenida al Curso/.test(t)) welcome = t;
+        }
+        const norm = (x) => x.replace(/<(timecreated|timemodified|startdate)>\d+</g, '<$1>T<');
+        return { course: norm(course), welcome: norm(welcome) };
+      };
+      const def = await read({});
+      const off = await read({ qaPreviewNotice: false });
+      const on = await read({ qaPreviewNotice: true });
+      eq([off.course === def.course, off.welcome === def.welcome, /QA — vista previa/.test(def.course + def.welcome)], [true, true, false], 'sin QA: igual que siempre');
+      assert(/<fullname>Curso R7 \[QA — vista previa, no entregable\]<\/fullname>/.test(on.course), `fullname QA: ${on.course.match(/<fullname>[^<]*/)}`);
+      assert(/QA — vista previa, no entregable/.test(on.welcome) && /copia interna de control de calidad/.test(on.welcome), 'aviso visible en la bienvenida');
+      assert(on.welcome.indexOf('QA — vista previa') < on.welcome.indexOf('Curso R7'), 'el aviso va primero');
+    });
+
+    await check('dod', 'follow-up R1: un re-armado FINAL fallido (p.ej. builder nuevo) NO le oculta al dueño el paquete final anterior: GET …/package le sigue dando ese .mbz (URL), marcado no vigente (stale, newerAttemptFailed) y nunca «completo»; el admin ve el intento fallido', async () => {
+      const R = await finishedRun('DoD R1', { videoMode: 'real', providerModes: { presentation: 'real', audio: 'real' }, videoItemMode: 'real' });
+      eq(await recompute(R.runId), 'completed', 'run completed');
+      const run = await jobOf(R.runId);
+      const mk = async (status, os, err = null) => (await ds.query(
+        `insert into public.production_jobs (owner_id, course_id, execution_mode, status, worker_status, current_step, input_payload, output_summary, options, result, error_message)
+         values ($1, $2, 'dynamic_package', $3::text, $3::text, 'dynamic_package', $4::jsonb, $5::jsonb, '{}'::jsonb, '{}'::jsonb, $6) returning id`,
+        [OWNER, R.cid, status, JSON.stringify({ runId: R.runId, manifestId: Number(run.input_payload.manifestId), blueprintNumber: 1, auto: true }), JSON.stringify(os), err]))[0].id;
+      const prevArt = crypto.randomUUID();
+      await mk('completed', { artifactId: prevArt, sourceIdsHash: 'p0'.repeat(32), builderVersion: '3.0.0' });
+      await new Promise((r) => setTimeout(r, 20));
+      await mk('failed', {}, 'MBZ_V3_VALIDATION_FAILED: simulado');
+      const signer = { async getDownloadUrl(id) { return { url: `https://signed.invalid/${id}` }; } };
+      const pk = new PackagingService(ds, manifests, signer);
+      const own = await pk.getPackageStatus(R.cid, OWNER, 1, R.runId, OWNER_NOT_ADMIN);
+      eq([own.status, own.artifactId, own.downloadUrl, own.stale, /^builder_changed/.test(own.staleReason), own.newerAttemptFailed, own.complete, own.deliverable, own.error],
+        ['completed', prevArt, `https://signed.invalid/${prevArt}`, true, true, 'failed', false, true, undefined], 'dueño: paquete anterior, no vigente');
+      const adm = await pk.getPackageStatus(R.cid, OWNER, 1, R.runId, { id: OWNER, email: ADMIN.email });
+      eq([adm.status, adm.artifactId, adm.newerAttemptFailed, /simulado/.test(adm.error)], ['failed', undefined, undefined, true], 'admin: el intento fallido');
+      // Sin paquete final anterior: el dueño ve el fallo como siempre.
+      const R2 = await finishedRun('DoD R1 sin anterior', { videoMode: 'real', providerModes: { presentation: 'real', audio: 'real' }, videoItemMode: 'real' });
+      await recompute(R2.runId);
+      const run2 = await jobOf(R2.runId);
+      await ds.query(`insert into public.production_jobs (owner_id, course_id, execution_mode, status, worker_status, current_step, input_payload, output_summary, options, result)
+        values ($1, $2, 'dynamic_package', 'failed', 'failed', 'dynamic_package', $3::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb)`,
+        [OWNER, R2.cid, JSON.stringify({ runId: R2.runId, manifestId: Number(run2.input_payload.manifestId), blueprintNumber: 1 })]);
+      const own2 = await pk.getPackageStatus(R2.cid, OWNER, 1, R2.runId, OWNER_NOT_ADMIN);
+      eq([own2.status, own2.newerAttemptFailed], ['failed', undefined], 'sin anterior: el fallo');
+    });
+
+    await check('dod', 'follow-up R3: el RunDto del DUEÑO (RunsController, cualquier respuesta con `completion`, también `{run}`) no lleva el mensaje de admin del bloqueo del paquete (solo el código); un SUPER_ADMIN recibe el detalle completo; la respuesta original no se muta', async () => {
+      const { OwnerSafeRunInterceptor, redactRunPayloadForOwner } = L('modules/dynamic-generation/owner-safe-run.interceptor.js');
+      const { of, lastValueFrom } = require('rxjs');
+      const blocked = { code: 'youtube_delivery_incomplete', message: 'youtube_delivery_incomplete: … missingJson=["video:x:missing_youtube_url"]' };
+      const completion = () => ({ state: 'needs_attention', adminActions: [{ code: 'resolve_youtube', itemKey: 'video:x', reason: 'youtube_delivery_incomplete' }],
+        packageJob: { status: 'failed', autoRetryPending: false, auto: true, blocked: { ...blocked } } });
+      const dto = { id: 'r', courseContext: { a: 1 }, items: [{ itemKey: 'video:x' }], completion: completion() };
+      const wrapped = { created: false, reopened: false, run: { id: 'r', completion: completion() } };
+      const ctx = (email) => ({ switchToHttp: () => ({ getRequest: () => ({ user: { id: OWNER, email } }) }) });
+      const icp = new OwnerSafeRunInterceptor();
+      const viaOwner = await lastValueFrom(icp.intercept(ctx('owner@cursia.test'), { handle: () => of(dto) }));
+      eq(viaOwner.completion.packageJob.blocked, { code: 'youtube_delivery_incomplete', message: null }, 'dueño: solo el código');
+      eq([viaOwner.completion.state, viaOwner.completion.adminActions.length, viaOwner.completion.packageJob.status, viaOwner.courseContext, viaOwner.items], ['needs_attention', 1, 'failed', { a: 1 }, [{ itemKey: 'video:x' }]], 'resto intacto');
+      eq(dto.completion.packageJob.blocked.message, blocked.message, 'original sin mutar');
+      const wOwner = await lastValueFrom(icp.intercept(ctx('owner@cursia.test'), { handle: () => of(wrapped) }));
+      eq(wOwner.run.completion.packageJob.blocked.message, null, '{run}: también');
+      const viaAdmin = await lastValueFrom(icp.intercept(ctx('Admin@Cursia.test'), { handle: () => of(dto) }));
+      eq(viaAdmin.completion.packageJob.blocked.message, blocked.message, 'admin: detalle completo');
+      const noUser = await lastValueFrom(icp.intercept({ switchToHttp: () => ({ getRequest: () => ({}) }) }, { handle: () => of(dto) }));
+      eq(noUser.completion.packageJob.blocked.message, null, 'sin usuario: redactado');
+      eq(redactRunPayloadForOwner(null), null, 'null');
+      eq(redactRunPayloadForOwner({ completion: { state: 'complete', packageJob: { status: 'completed' } } }), { completion: { state: 'complete', packageJob: { status: 'completed' } } }, 'sin bloqueo: igual');
+      // El controller está decorado con el interceptor.
+      const { RunsController } = L('modules/dynamic-generation/runs.controller.js');
+      const meta = Reflect.getMetadata('__interceptors__', RunsController) || [];
+      assert(meta.includes(OwnerSafeRunInterceptor), 'RunsController usa OwnerSafeRunInterceptor');
+    });
+
+    await check('dod', 'follow-up fix round 1 m2: GET /jobs y /jobs/:id no le muestran a un no admin el mensaje ni los faltantes del bloqueo del paquete (output_summary.autoPackage.blocked): solo el código; un SUPER_ADMIN ve todo; otras filas intactas y sin mutar', async () => {
+      const { ProductionJobsController } = L('modules/production-jobs/production-jobs.controller.js');
+      const blockedRun = () => ({ id: 'r', executionMode: 'dynamic_generation', steps: [{ id: 's' }],
+        outputSummary: { x: 1, autoPackage: { eligibleAt: '2026-10-01T00:00:00Z', blocked: { code: 'youtube_delivery_incomplete', message: 'youtube_delivery_incomplete: … missingJson=["video:x:missing_youtube_url"]', missing: ['video:x:missing_youtube_url'], at: '2026-10-01T00:01:00Z' } } } });
+      const legacy = { id: 'l', executionMode: 'legacy', outputSummary: { autoPackage: { blocked: { message: 'no es un run dinámico' } } } };
+      const rows = [blockedRun(), legacy];
+      const svc = { async findAll() { return rows; }, async findOne(id) { return rows.find((r) => r.id === id); } };
+      const ctl = new ProductionJobsController(svc);
+      const owner = { id: OWNER, email: 'owner@cursia.test' };
+      const list = (await ctl.findAll(owner)).data.jobs;
+      eq(list[0].outputSummary.autoPackage, { eligibleAt: '2026-10-01T00:00:00Z', blocked: { code: 'youtube_delivery_incomplete', at: '2026-10-01T00:01:00Z', message: null } }, 'listado: solo el código');
+      eq([list[0].outputSummary.x, list[0].steps, list[1]], [1, [{ id: 's' }], legacy], 'resto intacto');
+      eq((await ctl.findOne('r', owner)).data.outputSummary.autoPackage.blocked.message, null, 'detalle: sin el mensaje');
+      assert(/missingJson/.test(rows[0].outputSummary.autoPackage.blocked.message), 'la fila original no se muta');
+      const admin = { id: OWNER, email: ADMIN.email };
+      eq((await ctl.findOne('r', admin)).data.outputSummary.autoPackage.blocked.missing, ['video:x:missing_youtube_url'], 'admin: detalle completo');
+      eq((await ctl.findAll(admin)).data.jobs[0], rows[0], 'admin: fila cruda');
+    });
+
+    await check('dod', 'follow-up R4: DELETE /artifacts/:id de un .mbz QA / degradado NUEVO → 404 para un no admin (ni la fila ni el objeto qa-internal/ se borran); un SUPER_ADMIN sí lo borra; un .mbz anterior / final del dueño se borra como siempre', async () => {
+      const { ArtifactsService } = L('modules/artifacts/artifacts.service.js');
+      const { ArtifactsController } = L('modules/artifacts/artifacts.controller.js');
+      const deleted = [];
+      const realFetchLocal = global.fetch;
+      global.fetch = async (u, o) => { if (o && o.method === 'DELETE') { deleted.push(String(u)); return { ok: true, status: 200 }; } return realFetchLocal(u, o); };
+      try {
+        const svc = new ArtifactsService({ manager: { connection: ds } }, { get: (k) => ({ SUPABASE_URL: 'http://127.0.0.1:1', SUPABASE_SERVICE_ROLE_KEY: 'fake-local' })[k] });
+        const ins = async (pathS, meta) => (await ds.query(
+          `insert into public.artifacts (owner_id, course_id, type, storage_provider, storage_bucket, storage_path, filename, mime_type, metadata)
+           values ($1, '1', 'dynamic_mbz', 'supabase', 'cursia-artifacts', $2, 'f.mbz', 'application/vnd.moodle.backup', $3::jsonb) returning id`,
+          [OWNER, pathS, JSON.stringify(meta)]))[0].id;
+        const qaId = await ins(`qa-internal/${OWNER}/dynamic/1/1/dynamic_mbz/r/QA-VISTA-PREVIA-x.mbz`, { packageKind: 'qa_preview', deliverable: false });
+        const ctl = new ArtifactsController(svc);
+        await rejectsRe(ctl.remove(qaId, OWNER_NOT_ADMIN), /not found/i, 'dueño', 404);
+        eq([(await ds.query(`select count(*)::int n from public.artifacts where id = $1`, [qaId]))[0].n, deleted.length], [1, 0], 'nada borrado');
+        // Fix round 1 (m3): el SUPER_ADMIN NO es el dueño del curso (caso real: el QA es del curso del cliente).
+        const ADMIN_OTHER = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', email: ADMIN.email };
+        await ctl.remove(qaId, ADMIN_OTHER);
+        eq([(await ds.query(`select count(*)::int n from public.artifacts where id = $1`, [qaId]))[0].n, deleted.length, /qa-internal/.test(deleted[0] || '')], [0, 1, true], 'un admin (no dueño) lo borra');
+        // ... pero solo los QA / degradados: cualquier otro artifact del cliente sigue siendo del dueño (404).
+        const otherFin = await ins(`${OWNER}/dynamic/1/1/dynamic_mbz/r/z.mbz`, {});
+        await rejectsRe(ctl.remove(otherFin, ADMIN_OTHER), /not found/i, 'admin no dueño, artifact final del cliente', 404);
+        eq((await ds.query(`select count(*)::int n from public.artifacts where id = $1`, [otherFin]))[0].n, 1, 'el final del cliente sigue');
+        const finId = await ins(`${OWNER}/dynamic/1/1/dynamic_mbz/r/y.mbz`, {});
+        await ctl.remove(finId, OWNER_NOT_ADMIN);
+        eq((await ds.query(`select count(*)::int n from public.artifacts where id = $1`, [finId]))[0].n, 0, 'final del dueño: borrado como siempre');
+      } finally {
+        global.fetch = realFetchLocal;
+      }
     });
 
     await check('dod', 'migración: supabase-migration-ev6-dod-preview-status.sql lista EXACTAMENTE los worker_status del lib (fuente única) y es idempotente; el CHECK aplicado acepta preview y rechaza un valor desconocido', async () => {

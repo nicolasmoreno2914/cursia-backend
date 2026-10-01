@@ -101,6 +101,7 @@ const ENV_KEYS = [
   'DYNAMIC_ALLOW_PROVIDER_MOCK', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'DYNAMIC_ALLOW_VIDEO_PREVIEW', 'SUPER_ADMIN_EMAILS',
   'GAMMA_API_KEY', 'GAMMA_THEME_V21_LIGHT_DEFAULT', 'GAMMA_THEME_V21_DARK_DEFAULT', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY',
   'VIDEOGEN_API_KEY', 'SUPABASE_JWT_SECRET', 'DYNAMIC_AUTO_PACKAGE_ENABLED', 'DYNAMIC_REAL_VIDEO_ALL_OWNERS',
+  'DYNAMIC_AUTO_HEAL_ENABLED',
 ];
 
 (async () => {
@@ -630,6 +631,149 @@ const ENV_KEYS = [
       }
     });
 
+    // ════ DoD follow-up: R2 (tick apagado) y R8 (SQL ≡ estado) ═══════════════
+    const withAutoHealOff = async (fn) => {
+      const prev = process.env.DYNAMIC_AUTO_HEAL_ENABLED;
+      process.env.DYNAMIC_AUTO_HEAL_ENABLED = 'false';
+      try { return await fn(); } finally { if (prev === undefined) delete process.env.DYNAMIC_AUTO_HEAL_ENABLED; else process.env.DYNAMIC_AUTO_HEAL_ENABLED = prev; }
+    };
+    let R2RUN = null;
+    await check('[AP] follow-up R2: con el tick del barrido apagado (DYNAMIC_AUTO_HEAL_ENABLED=false) nada queda «pendiente»: re-armado por builder nuevo, reintento de un fallo o run sin job → needs_attention + retry_package (acción manual/admin), nunca `packaging` para siempre; solo un run recién marcado sin job (el aviso post-commit lo encola) espera la gracia; con el tick encendido → packaging como antes', async () => {
+      const C = await confirmedCourse('BE-B R2 builder');
+      const runId = await seededRealRun(C);
+      eq(await recompute(runId), 'completed', 'completed');
+      const [j1] = await pkgJobs(runId);
+      await completeJob(j1.id, '3.5.0'); // builder anterior
+      staleBuildRuns.add(runId);
+      try {
+        let dto = await runs.getRun(C.cid, OWNER, 1, runId);
+        eq([dto.completion.state, dto.completion.packageJob], ['packaging', { status: 'stale', autoRetryPending: true, auto: true }], 'tick encendido: re-armado pendiente');
+        await withAutoHealOff(async () => {
+          dto = await runs.getRun(C.cid, OWNER, 1, runId);
+          eq([dto.completion.state, dto.completion.adminActions, dto.completion.packageJob], ['needs_attention', [{ code: 'retry_package' }], { status: 'stale', autoRetryPending: false, auto: true }], 'tick apagado: acción visible');
+          const list = await recovery.listNeedsAttention({ limit: 500 });
+          assert(list.needsAttention.some((e) => e.runId === runId && e.adminActions.some((a) => a.code === 'retry_package')), 'aparece en la cola de admin con retry_package');
+        });
+        // Fallo con reintento disponible: igual (nadie lo reintenta sin el tick).
+        const res = await packaging.requestPackage(C.cid, ADMIN_X.id, 1, runId, ADMIN_X);
+        await failPkg(res.jobId);
+        dto = await runs.getRun(C.cid, OWNER, 1, runId);
+        eq([dto.completion.state, dto.completion.packageJob.status, dto.completion.packageJob.autoRetryPending], ['packaging', 'failed', true], 'tick encendido: reintento pendiente');
+        await withAutoHealOff(async () => {
+          dto = await runs.getRun(C.cid, OWNER, 1, runId);
+          eq([dto.completion.state, dto.completion.adminActions], ['needs_attention', [{ code: 'retry_package' }]], 'tick apagado: fallo → acción');
+        });
+      } finally {
+        staleBuildRuns.delete(runId);
+      }
+      // Run recién marcado SIN job (el aviso post-commit todavía no encoló): gracia; vencida → acción.
+      const C2 = await confirmedCourse('BE-B R2 sin job');
+      const r2 = await seededRealRun(C2);
+      await ds.query(`update public.production_jobs set status = 'completed', worker_status = 'completed', finished_at = now(),
+        output_summary = output_summary || jsonb_build_object('autoPackage', jsonb_build_object('eligibleAt', now())) where id = $1`, [r2]);
+      await withAutoHealOff(async () => {
+        let d2 = await runs.getRun(C2.cid, OWNER, 1, r2);
+        eq([d2.completion.state, d2.completion.packageJob], ['packaging', { status: 'none', autoRetryPending: true, auto: true }], 'gracia del aviso post-commit');
+        await ds.query(`update public.production_jobs set output_summary = jsonb_set(output_summary, '{autoPackage,eligibleAt}', to_jsonb((now() - interval '10 minutes')::text)) where id = $1`, [r2]);
+        d2 = await runs.getRun(C2.cid, OWNER, 1, r2);
+        eq([d2.completion.state, d2.completion.adminActions, d2.completion.packageJob], ['needs_attention', [{ code: 'retry_package' }], { status: 'none', autoRetryPending: false, auto: true }], 'gracia vencida → acción');
+      });
+      const d3 = await runs.getRun(C2.cid, OWNER, 1, r2);
+      eq([d3.completion.state, d3.completion.packageJob.autoRetryPending], ['packaging', true], 'tick encendido: el barrido lo toma');
+      R2RUN = { C: C2, runId: r2 };
+    });
+
+    await check('[AP] follow-up R8: el SQL del barrido clasifica «final» EXACTAMENTE como packageKindOf (mismos jobs, también los anteriores sin packageKind con videos omitidos / mocks)', async () => {
+      const C = await confirmedCourse('BE-B R8 clasificación');
+      const runId = await seededRealRun(C);
+      const PFR2 = L('modules/dynamic-packaging/package-freshness.js');
+      const variants = [
+        [{}, {}], [{ packageKind: 'qa_preview' }, {}], [{ packageKind: 'degraded' }, {}], [{}, { packageKind: 'qa_preview' }], [{ packageKind: 'final' }, { packageKind: 'degraded' }],
+        [{}, { packageKind: 'raro', pendingVideos: [] }], [{}, { pendingVideos: [{ itemKey: 'video:x' }] }], [{}, { pendingVideos: [] }], [{}, { pendingVideos: 'x' }],
+        [{}, { mockProviderItems: ['presentation:x'] }], [{}, { mockProviderItems: [] }], [{}, { mockProviderItems: 2 }], [{}, { mockProviderItems: 0 }],
+        [{}, { mockProviderItems: '3' }], [{}, { mockProviderItems: ' 0 ' }], [{}, { mockProviderItems: true }], [{}, { mockProviderItems: false }], [{}, { mockProviderItems: 'abc' }],
+        [{ packageKind: 'raro' }, { mockProviderItems: 1 }], [{ packageKind: 'qa_preview' }, { packageKind: 'final' }],
+      ];
+      const ids = [];
+      for (const [ip, os] of variants) {
+        const [j] = await ds.query(`insert into public.production_jobs (owner_id, course_id, execution_mode, status, worker_status, current_step, input_payload, output_summary, options, result)
+          values ($1, $2, 'dynamic_package', 'failed', 'failed', 'dynamic_package', $3::jsonb, $4::jsonb, '{}'::jsonb, '{}'::jsonb) returning id`,
+          [OWNER, C.cid, JSON.stringify({ runId, manifestId: C.manifest.id, blueprintNumber: 1, ...ip }), JSON.stringify(os)]);
+        ids.push(j.id);
+      }
+      const rows = await ds.query(`select p.id, p.input_payload, p.output_summary, ${APS.finalPackageKindSql('p')} as fin from public.production_jobs p where p.id = any($1::uuid[])`, [ids]);
+      const diff = rows.filter((r) => r.fin !== (PFR2.packageKindOf(r) === 'final')).map((r) => [r.input_payload.packageKind, r.output_summary, r.fin]);
+      eq(diff, [], 'SQL ≡ packageKindOf');
+      eq(rows.length, variants.length, 'todas evaluadas');
+      await ds.query(`delete from public.production_jobs where id = any($1::uuid[])`, [ids]);
+    });
+
+    await check('[AP] follow-up R8: un run nunca queda «seleccionado y saltado» en cada tick — un paquete anterior de vista previa (sin packageKind) con builder viejo no lo selecciona fuera de la ventana; un bloqueo superado por un job final posterior vuelve a contar como en el estado; lo que el SQL elige y el estado no declara pendiente queda registrado (lastSkip) y espera; los saltos por Blueprint irresoluble o error de lectura cuentan como transitorios', async () => {
+      // (a) job anterior «de vista previa» (pendingVideos, sin packageKind) con builder viejo; marca fuera de la ventana.
+      const C = await confirmedCourse('BE-B R8 preview viejo');
+      const runId = await seededRealRun(C);
+      await ds.query(`update public.production_jobs set status = 'completed', worker_status = 'completed', finished_at = now(),
+        output_summary = output_summary || jsonb_build_object('autoPackage', jsonb_build_object('eligibleAt', (now() - interval '100 hours')::text)) where id = $1`, [runId]);
+      await ds.query(`insert into public.production_jobs (owner_id, course_id, execution_mode, status, worker_status, current_step, input_payload, output_summary, options, result, created_at)
+        values ($1, $2, 'dynamic_package', 'completed', 'completed', 'dynamic_package', $3::jsonb, $4::jsonb, '{}'::jsonb, '{}'::jsonb, now() - interval '101 hours')`,
+        [OWNER, C.cid, JSON.stringify({ runId, manifestId: C.manifest.id, blueprintNumber: 1 }),
+          JSON.stringify({ artifactId: crypto.randomUUID(), builderVersion: '3.0.0', sourceIdsHash: 'v'.repeat(64), pendingVideos: [{ itemKey: `video:${C.c1}` }] })]);
+      let cands = await APS.findAutoPackageCandidates(ds, new Date(), 500);
+      assert(!cands.includes(runId), 'el SQL no lo selecciona (el estado tampoco lo ve pendiente)');
+      let dto = await runs.getRun(C.cid, OWNER, 1, runId);
+      eq([dto.completion.state, dto.completion.packageJob], ['needs_attention', { status: 'none', autoRetryPending: false, auto: true }], 'estado: acción visible, sin pendiente');
+      // (b) bloqueo superado por un job final posterior (p.ej. el POST del admin) que falló: SQL y estado coinciden.
+      const C2 = await confirmedCourse('BE-B R8 bloqueo superado');
+      const r2 = await seededRealRun(C2);
+      blockedPrecheck.set(r2, { code: 'youtube_delivery_incomplete', missing: [`video:${C2.c2}:missing_youtube_url`] });
+      eq(await recompute(r2), 'completed', 'completed (bloqueado)');
+      blockedPrecheck.delete(r2);
+      const adm = await packaging.requestPackage(C2.cid, ADMIN_X.id, 1, r2, ADMIN_X);
+      await failPkg(adm.jobId);
+      dto = await runs.getRun(C2.cid, OWNER, 1, r2);
+      eq([dto.completion.state, dto.completion.packageJob.status, dto.completion.packageJob.autoRetryPending], ['packaging', 'failed', true], 'estado: reintento pendiente (el bloqueo quedó atrás)');
+      cands = await APS.findAutoPackageCandidates(ds, new Date(), 500);
+      assert(cands.includes(r2), 'el SQL también lo selecciona (antes lo excluía para siempre)');
+      eq((await autoPkg.sweep({ limit: 500 })).filter((o) => o.runId === r2).map((o) => o.action), ['enqueued'], 'el barrido lo reintenta');
+      // (c) seleccionado por el SQL y sin nada pendiente para el estado (barrido corriendo con el tick apagado) → lastSkip + espera.
+      const C3 = await confirmedCourse('BE-B R8 lastSkip');
+      const r3 = await seededRealRun(C3);
+      eq(await recompute(r3), 'completed', 'completed');
+      const [j3] = await pkgJobs(r3);
+      await completeJob(j3.id, '3.5.0');
+      staleBuildRuns.add(r3);
+      try {
+        await withAutoHealOff(async () => {
+          const o1 = (await autoPkg.sweep({ limit: 500 })).filter((o) => o.runId === r3);
+          eq(o1.map((o) => o.reason), ['nothing_pending'], 'seleccionado y saltado una vez');
+          eq((await jobOf(r3)).output_summary.autoPackage.lastSkip.reason, 'nothing_pending', 'registrado');
+          eq((await autoPkg.sweep({ limit: 500 })).filter((o) => o.runId === r3).length, 0, 'no se vuelve a seleccionar en el tick siguiente');
+        });
+        await ds.query(`update public.production_jobs set output_summary = jsonb_set(output_summary, '{autoPackage,lastSkip,at}', to_jsonb((now() - interval '10 minutes')::text)) where id = $1`, [r3]);
+        eq((await autoPkg.sweep({ limit: 500 })).filter((o) => o.runId === r3).map((o) => o.action), ['enqueued'], 'pasada la espera, con el tick: re-armado');
+      } finally {
+        staleBuildRuns.delete(r3);
+      }
+      // (d) Blueprint irresoluble y error de lectura → transitorios (tope + espera), nunca un salto mudo.
+      const C4 = await confirmedCourse('BE-B R8 transitorios');
+      const r4 = await seededRealRun(C4);
+      await ds.query(`update public.production_jobs set status = 'completed', worker_status = 'completed', finished_at = now(),
+        output_summary = output_summary || jsonb_build_object('autoPackage', jsonb_build_object('eligibleAt', now())),
+        input_payload = input_payload || '{"manifestId": 987654321}'::jsonb where id = $1`, [r4]);
+      eq((await autoPkg.ensure(r4)).reason, 'manifest_unresolvable', 'Blueprint irresoluble');
+      eq((await jobOf(r4)).output_summary.autoPackage.transient.count, 1, 'contado como transitorio');
+      const origQ = ds.query.bind(ds);
+      ds.query = async (sql, params) => { if (/limit 50/.test(String(sql)) && params && params[0] === r4) throw new Error('ECONNRESET simulado'); return origQ(sql, params); };
+      try {
+        eq((await autoPkg.ensure(r4)).reason, 'transient_error', 'error de lectura');
+      } finally {
+        ds.query = origQ;
+      }
+      eq((await jobOf(r4)).output_summary.autoPackage.transient.count, 2, 'contado como transitorio');
+      // Sin dejar un run roto para la cola de admin de los casos siguientes.
+      await ds.query(`update public.production_jobs set input_payload = input_payload || jsonb_build_object('manifestId', $2::bigint) where id = $1`, [r4, C4.manifest.id]);
+    });
+
     // ════ [AR] reintento automático SEGURO (worker real + Videogen falso) ══════
     const ytPublisher = {
       async getConnection() { return { userId: OWNER, status: 'active', scopes: 'youtube.upload,youtube.readonly' }; },
@@ -973,6 +1117,118 @@ pg.Client.prototype.query = function (sql, ...rest) { const t = typeof sql === '
       assert(!ids.includes(OLD.runId) && !ids.includes(AP.runId), 'los runs reales no aparecen');
       eq([out.summary.readOnly, out.summary.downloadsTracked, out.summary.target], [true, false, 'local'], 'resumen');
       assert(!/@/.test(r3.stdout) && !r3.stdout.includes('BE-B'), 'sin emails ni títulos');
+    });
+
+    await check('[RP] follow-up R5: el reporte (solo lectura) lista además los .mbz QA / degradados DECLARADOS que quedaron en la carpeta del dueño (anteriores a qa-internal/), con ids; nunca los que ya están en qa-internal/ ni los finales', async () => {
+      const ins = async (pathS, meta) => (await ds.query(
+        `insert into public.artifacts (owner_id, course_id, type, storage_provider, storage_bucket, storage_path, filename, mime_type, metadata)
+         values ($1, '1', 'dynamic_mbz', 'supabase', 'cursia-artifacts', $2, 'f.mbz', 'application/vnd.moodle.backup', $3::jsonb) returning id`,
+        [OWNER, pathS, JSON.stringify(meta)]))[0].id;
+      const legacyQa = await ins(`${OWNER}/dynamic/1/1/dynamic_mbz/r5/QA-VISTA-PREVIA-a.mbz`, { runId: 'r5-run', packageKind: 'qa_preview', deliverable: false });
+      const legacyDeg = await ins(`${OWNER}/dynamic/1/1/dynamic_mbz/r5/QA-VISTA-PREVIA-b.mbz`, { runId: 'r5-run', packageKind: 'degraded', deliverable: false });
+      const internal = await ins(`qa-internal/${OWNER}/dynamic/1/1/dynamic_mbz/r5/QA-VISTA-PREVIA-c.mbz`, { runId: 'r5-run', packageKind: 'qa_preview', deliverable: false });
+      const fin = await ins(`${OWNER}/dynamic/1/1/dynamic_mbz/r5/d.mbz`, { runId: 'r5-run' });
+      const r = runScript(REPORT, localEnv({ REPORT_TARGET: 'local' }), ['--json']);
+      eq(r.code, 0, `exit ${r.out.slice(-800)}`);
+      const out = JSON.parse(r.stdout);
+      const got = out.qaPackagesInOwnerFolder.map((a) => a.artifactId);
+      assert(got.includes(legacyQa) && got.includes(legacyDeg), `lista los QA en la carpeta del dueño: ${JSON.stringify(got)}`);
+      assert(!got.includes(internal) && !got.includes(fin), 'nunca los de qa-internal/ ni los finales');
+      const e = out.qaPackagesInOwnerFolder.find((a) => a.artifactId === legacyQa);
+      eq([e.ownerId, e.runId, e.packageKind, e.storageFolder, 'storagePath' in e], [OWNER, 'r5-run', 'qa_preview', 'owner', false], 'entrada (ids, sin ruta)');
+      eq(out.summary.qaPackagesInOwnerFolder, got.length, 'resumen');
+      const t = runScript(REPORT, localEnv({ REPORT_TARGET: 'local' }), []);
+      assert(t.code === 0 && /paquetes QA\/degradados en la carpeta del dueño/.test(t.out) && t.out.includes(legacyQa), 'salida de texto');
+      await ds.query(`delete from public.artifacts where id = any($1::uuid[])`, [[legacyQa, legacyDeg, internal, fin]]);
+    });
+
+    const VERIFY = 'scripts/verify-ev6-storage-policies.js';
+    await check('[SP] follow-up R6: verify-ev6-storage-policies (solo lectura) — con las políticas del repo (own-folder) y el bucket privado pasa; falla si una política de un rol de cliente puede coincidir con qa-internal/ (sin carpeta propia, con OR, sin expresión, para `public`) o si el bucket es público; ignora service_role, restrictivas y otros buckets; nunca escribe; exige MIGRATION_ENV=staging y rechaza el ref de producción SIN conectarse; cableado solo en deploy-staging.yml', async () => {
+      const SP = require(path.join(REPO, VERIFY));
+      await withClient(DB, async (c) => {
+        await c.query(`do $$ begin
+          if not exists (select 1 from pg_roles where rolname = 'anon') then create role anon nologin; end if;
+          if not exists (select 1 from pg_roles where rolname = 'service_role') then create role service_role nologin; end if;
+        end $$`);
+        await c.query(`create table if not exists storage.buckets (id text primary key, name text, public boolean not null default false)`);
+        await c.query(`insert into storage.buckets (id, name, public) values ('cursia-artifacts', 'cursia-artifacts', false) on conflict (id) do update set public = false`);
+        await c.query(fs.readFileSync(path.join(REPO, 'supabase-migration-storage-artifacts-policies.sql'), 'utf8'));
+      });
+      const fpPol = async () => JSON.stringify(await ds.query(`select policyname, cmd, roles::text, qual, with_check from pg_policies where schemaname = 'storage' order by 1`));
+      const verify = () => withClient(DB, (c) => SP.verifyEv6StoragePolicies(c));
+      const before = await fpPol();
+      let r = await verify();
+      eq(r.failures, [], 'políticas del repo: sin problemas');
+      eq(r.policies, 4, 'cuatro políticas own-folder');
+      eq(await fpPol(), before, 'no escribió');
+      const bad = async (sql, re, why) => {
+        await ds.query(sql);
+        try {
+          const v = await verify();
+          assert(v.failures.some((f) => re.test(f)), `${why}: ${JSON.stringify(v.failures)}`);
+        } finally {
+          await ds.query(`drop policy if exists ev6_bad on storage.objects`);
+        }
+      };
+      await bad(`create policy ev6_bad on storage.objects for select to authenticated using (bucket_id = 'cursia-artifacts')`, /ev6_bad: no exige la carpeta propia/, 'solo bucket');
+      await bad(`create policy ev6_bad on storage.objects for select to authenticated using (bucket_id = 'cursia-artifacts' and ((storage.foldername(name))[1] = (select auth.uid())::text or name like 'qa-internal/%'))`, /ev6_bad: usa OR/, 'OR');
+      await bad(`create policy ev6_bad on storage.objects for insert to anon with check (true)`, /ev6_bad: no exige la carpeta propia/, 'anon insert');
+      await bad(`create policy ev6_bad on storage.objects for all to public using ((storage.foldername(name))[1] = (select auth.uid())::text) with check (bucket_id = 'cursia-artifacts')`, /ev6_bad: no exige la carpeta propia.* en ALL para public/, 'ALL a public, with_check flojo');
+      await bad(`create policy ev6_bad on storage.objects for select to authenticated using (bucket_id = 'cursia-artifacts' and name like 'qa-internal/%')`, /ev6_bad/, 'lectura de qa-internal/');
+      // Fix round 1 (m4): negaciones → falla cerrada (el regex no puede probar que excluyan qa-internal/).
+      await bad(`create policy ev6_bad on storage.objects for select to authenticated using (not (bucket_id = 'avatars'))`, /ev6_bad: usa una negación/, 'NOT otro bucket');
+      await bad(`create policy ev6_bad on storage.objects for select to authenticated using (bucket_id = 'cursia-artifacts' and not ((storage.foldername(name))[1] = (select auth.uid())::text))`, /ev6_bad: usa una negación/, 'NOT carpeta propia');
+      await bad(`create policy ev6_bad on storage.objects for select to authenticated using (bucket_id <> 'avatars')`, /ev6_bad: usa una negación/, '<> otro bucket');
+      await bad(`create policy ev6_bad on storage.objects for select to authenticated using (bucket_id = 'cursia-artifacts' and (storage.foldername(name))[1] = (select auth.uid())::text and name is not null)`, /ev6_bad: usa una negación/, 'IS NOT');
+      eq([SP.policyRisk({ roles: '{authenticated}', cmd: 'SELECT', qual: "(NOT (bucket_id = 'avatars'::text))" }) !== null,
+        SP.policyRisk({ roles: '{authenticated}', cmd: 'SELECT', qual: "((bucket_id = 'cursia-artifacts'::text) AND (NOT ((storage.foldername(name))[1] = (( SELECT auth.uid() AS uid))::text)))" }) !== null,
+        SP.policyRisk({ roles: '{authenticated}', cmd: 'SELECT', qual: "((bucket_id = 'cursia-artifacts'::text) AND ((storage.foldername(name))[1] = (( SELECT auth.uid() AS uid))::text))" })],
+        [true, true, null], 'puro: las formas del review');
+      // Ignoradas: service_role, restrictiva, otro bucket.
+      for (const sql of [
+        `create policy ev6_bad on storage.objects for select to service_role using (true)`,
+        `create policy ev6_bad on storage.objects as restrictive for select to authenticated using (bucket_id = 'cursia-artifacts')`,
+        `create policy ev6_bad on storage.objects for select to authenticated using (bucket_id = 'avatars')`,
+      ]) {
+        await ds.query(sql);
+        try {
+          r = await verify();
+          eq(r.failures, [], `ignorada: ${sql.slice(0, 80)}`);
+        } finally {
+          await ds.query(`drop policy if exists ev6_bad on storage.objects`);
+        }
+      }
+      await ds.query(`update storage.buckets set public = true where id = 'cursia-artifacts'`);
+      r = await verify();
+      assert(r.failures.some((f) => /PÚBLICO/.test(f)), `bucket público: ${JSON.stringify(r.failures)}`);
+      await ds.query(`update storage.buckets set public = false where id = 'cursia-artifacts'`);
+      await ds.query(`alter table storage.objects disable row level security`);
+      r = await verify();
+      assert(r.failures.some((f) => /ROW LEVEL SECURITY/.test(f)), 'sin RLS');
+      await ds.query(`alter table storage.objects enable row level security`);
+      // CLI: guardas antes de conectar; contra la base local (ref ≠ producción) pasa; con un problema sale 1.
+      const unreachable = { DB_HOST: '127.0.0.1', DB_PORT: '1', DB_USER: 'x', DB_PASS: 'x', DB_NAME: 'x', DB_SSL: 'false' };
+      let cli = runScript(VERIFY, unreachable);
+      assert(cli.code === 1 && /MIGRATION_ENV no es "staging"/.test(cli.out), `sin MIGRATION_ENV: ${cli.out}`);
+      cli = runScript(VERIFY, { ...unreachable, MIGRATION_ENV: 'staging', DB_USER: 'postgres.hriwbakbuypaiovvvkqh' });
+      assert(cli.code === 1 && /PRODUCCIÓN/.test(cli.out) && !/ECONNREFUSED/.test(cli.out), `producción: ${cli.out}`);
+      cli = runScript(VERIFY, localEnv({ MIGRATION_ENV: 'staging' }));
+      assert(cli.code === 0 && /Storage verificado/.test(cli.out), `local limpio: ${cli.out}`);
+      await ds.query(`create policy ev6_bad on storage.objects for select to authenticated using (bucket_id = 'cursia-artifacts')`);
+      try {
+        cli = runScript(VERIFY, localEnv({ MIGRATION_ENV: 'staging' }));
+        assert(cli.code === 1 && /ev6_bad/.test(cli.out), `local con problema: ${cli.out}`);
+      } finally {
+        await ds.query(`drop policy if exists ev6_bad on storage.objects`);
+      }
+      eq(await fpPol(), before, 'políticas como al principio');
+      const stg = fs.readFileSync(path.join(REPO, '.github/workflows/deploy-staging.yml'), 'utf8');
+      const prod = fs.readFileSync(path.join(REPO, '.github/workflows/deploy.yml'), 'utf8');
+      assert(/MIGRATION_ENV=staging node scripts\/verify-ev6-storage-policies\.js/.test(stg), 'cableado en deploy-staging.yml');
+      assert(!/verify-ev6-storage-policies/.test(prod), 'nunca en el workflow de producción');
+      for (const f of fs.readdirSync(path.join(REPO, '.github/workflows'))) {
+        if (f !== 'deploy-staging.yml') assert(!fs.readFileSync(path.join(REPO, '.github/workflows', f), 'utf8').includes('verify-ev6-storage-policies'), `no en ${f}`);
+      }
     });
   } catch (err) {
     failures++;

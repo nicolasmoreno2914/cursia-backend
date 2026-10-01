@@ -8,6 +8,11 @@
 // un paquete (.mbz) y si ese paquete tiene un archivo descargable. El servidor NO registra descargas:
 // «descargable» = el job de paquete completó con artifact (lo pudo bajar el dueño), no «descargado».
 //
+// DoD follow-up (R5): además lista los .mbz QA / degradados DECLARADOS (metadata.packageKind) que quedaron
+// en la carpeta del dueño (`<owner>/…`, armados antes de que los paquetes QA fueran a `qa-internal/`):
+// las políticas own-folder de Storage se los dejan leer al dueño por URL directa. Solo existen en
+// staging (los paquetes QA son posteriores a EV6 DoD); el reporte no los mueve ni los borra.
+//
 // Garantías:
 //   - nunca escribe: todas las consultas corren dentro de una transacción `READ ONLY` (Postgres rechaza
 //     cualquier escritura) y el script solo emite SELECT; cualquier flag de escritura (--apply, --write,
@@ -120,6 +125,26 @@ const READ_SQL = /^\s*(select|with)\b/i;
         packageDownloadable: (pkg && pkg.downloadable) > 0,
       });
     }
+    // DoD follow-up (R5): paquetes QA / degradados declarados fuera de `qa-internal/` (legibles por el dueño).
+    const ownerFolderQa = (await q.query(
+      `select a.id, a.owner_id, a.course_id, a.job_id, a.metadata->>'runId' as run_id, a.metadata->>'packageKind' as package_kind,
+              a.storage_bucket
+         from public.artifacts a
+        where a.type = 'dynamic_mbz' and (a.metadata->>'packageKind') in ('qa_preview', 'degraded')
+          and a.storage_path not like 'qa-internal/%'
+        order by a.created_at desc nulls last, a.id desc
+        limit $1`,
+      [LIMIT],
+    )).map((a) => ({
+      artifactId: a.id,
+      ownerId: a.owner_id,
+      courseId: a.course_id,
+      packageJobId: a.job_id,
+      runId: a.run_id,
+      packageKind: a.package_kind,
+      bucket: a.storage_bucket,
+      storageFolder: 'owner',
+    }));
     await client.query('rollback');
     const summary = {
       target: TARGET,
@@ -130,9 +155,10 @@ const READ_SQL = /^\s*(select|with)\b/i;
       withPackageBuilt: legacy.filter((x) => x.packageBuilt).length,
       withDownloadablePackage: legacy.filter((x) => x.packageDownloadable).length,
       downloadsTracked: false,
+      qaPackagesInOwnerFolder: ownerFolderQa.length,
     };
     if (JSON_OUT) {
-      console.log(JSON.stringify({ summary, runs: legacy }, null, 2));
+      console.log(JSON.stringify({ summary, runs: legacy, qaPackagesInOwnerFolder: ownerFolderQa }, null, 2));
     } else {
       console.log(`EV6 DoD — cursos viejos de vista previa (solo lectura, destino ${TARGET})`);
       console.log(`  runs completed revisados: ${summary.completedRunsScanned} (sin evaluar: ${unevaluable})`);
@@ -142,6 +168,10 @@ const READ_SQL = /^\s*(select|with)\b/i;
       for (const x of legacy) {
         console.log(`  - run ${x.runId} curso ${x.courseId} dueño ${x.ownerId} manifest ${x.manifestId} ` +
           `preview=${x.previewComponents.length} paquete=${x.packageBuilt ? 'sí' : 'no'} descargable=${x.packageDownloadable ? 'sí' : 'no'}`);
+      }
+      console.log(`  paquetes QA/degradados en la carpeta del dueño (legibles por el dueño vía Storage; solo staging): ${ownerFolderQa.length}`);
+      for (const a of ownerFolderQa) {
+        console.log(`  - artifact ${a.artifactId} (${a.packageKind}) run ${a.runId} job ${a.packageJobId} curso ${a.courseId} dueño ${a.ownerId}`);
       }
     }
   } catch (err) {

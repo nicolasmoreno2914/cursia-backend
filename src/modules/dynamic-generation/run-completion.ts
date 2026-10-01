@@ -552,6 +552,20 @@ export function evaluateRunCompletion(
   };
 }
 
+/**
+ * DoD follow-up (R3): `RunDto.completion` para quien NO es SUPER_ADMIN. El mensaje del bloqueo del
+ * paquete (`packageJob.blocked.message`) es texto del servidor para el admin (hasta 400 caracteres, con
+ * `missingJson=[…]` y códigos internos): al dueño solo le llega el código del bloqueo (`message: null`).
+ * Los códigos (`blocked.code`, `reason` de las acciones) son identificadores estables, nunca texto técnico.
+ * Pura; devuelve una copia (nunca toca la original).
+ */
+export function redactCompletionForOwner<T extends Partial<RunCompletion> | null | undefined>(c: T): T {
+  if (!c || typeof c !== 'object') return c;
+  const pj = (c as RunCompletion).packageJob;
+  if (!pj || typeof pj !== 'object' || !pj.blocked || typeof pj.blocked !== 'object') return c;
+  return { ...c, packageJob: { ...pj, blocked: { code: pj.blocked.code, message: null } } } as T;
+}
+
 /** ¿El run terminado debe quedar `preview` (todo completado; algún componente de vista previa; nada más falta)? */
 export function terminalStatusFor(c: RunCompletion): 'completed' | 'preview' | 'failed' {
   if (c.generationComplete) return 'completed';
