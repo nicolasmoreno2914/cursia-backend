@@ -16,6 +16,8 @@ export const COPY = Object.freeze({
   activityTitle: 'Pon a prueba lo aprendido',
   selfCheckLead: 'Antes de seguir, repasa lo aprendido: intenta responder cada pregunta y después revisa la respuesta.',
   lastChapterOfCourse: 'Con este capítulo terminas el recorrido de los contenidos del curso.',
+  /** EV6 T5 (ruling 3): aviso neutral en lugar del video pendiente (vista previa) de un capítulo. */
+  videoPendingNotice: 'El video interactivo de este capítulo estará disponible en una próxima versión del curso.',
 });
 
 export function attemptsText(attempts: number): string {

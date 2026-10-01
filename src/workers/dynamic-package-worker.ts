@@ -28,7 +28,7 @@ import {
   prepareV3Package,
 } from '../modules/dynamic-packaging/packaging-v3';
 import { resolveTheme } from '../modules/theme-engine';
-import { assessmentItemCountsFromManifest, resolveAssessment } from '../package/assessment';
+import { assessmentItemCountsForPackage, resolveAssessment } from '../package/assessment';
 import type { BlueprintSnapshotV2 } from '../modules/course-blueprints/blueprint-snapshot';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -469,19 +469,28 @@ export async function processV3PackageJob(
     themeSha256: prepared.profiles.themeSha256,
     // F1 (I3): weightsNormalized + pesos originales/finales, o curso sin nota.
     assessment: prepared.assessment,
+    // EV6 T5: videos de vista previa omitidos del paquete (la UI avisa «videos pendientes»).
+    pendingVideos: pendingVideosSummary(manifest, prepared.pendingVideos.map((p) => p.itemKey)),
   };
   // F1: avisos de perfiles (tema por defecto, pesos normalizados, curso sin nota) — también en un paquete reutilizado.
   const profileWarnings = prepared.profileWarnings.map((w) => ({ code: w.split(':')[0], detail: w }));
   if (isLeaseLost()) return;
 
+  // EV6 T5 (fix round 1, m-2): el aviso de video pendiente de cada capítulo solo se decide al
+  // construir; un .mbz reutilizado lo trae en su metadata (mismo sourceIdsHash = mismos textos).
+  const pendingWarnings = baseSummary.pendingVideos.map((p) => ({ code: 'pending_video_omitted', detail: `pending_video_omitted:${p.itemKey}` }));
   const existing = await findExistingDynamicMbzV3(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash);
   if (existing) {
     logger.log(`Job ${job.id}: dynamic_mbz v3 ya existe (${existing.id}) para runId=${runId} — reutilizando sin reconstruir`);
+    const reusedPending: any[] = Array.isArray(existing.metadata?.pendingVideos) ? existing.metadata.pendingVideos : baseSummary.pendingVideos;
+    const reuseWarnings = [...prepared.staleWarnings, ...profileWarnings, ...pendingWarnings];
     const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
       artifactId: existing.id,
       reused: true,
       ...baseSummary,
-      ...(prepared.staleWarnings.length || profileWarnings.length ? { warnings: [...prepared.staleWarnings, ...profileWarnings] } : {}),
+      pendingVideos: reusedPending,
+      pendingVideoNoticeCount: reusedPending.filter((p) => p && p.notice === true).length,
+      ...(reuseWarnings.length ? { warnings: reuseWarnings } : {}),
     });
     if (!ok) logger.warn(`Job ${job.id}: completeJob devolvió false (lease perdida) tras reutilizar ${existing.id}`);
     return;
@@ -490,7 +499,9 @@ export async function processV3PackageJob(
   const blueprint = await deps.blueprints.getByNumberAnySchema(job.course_id, job.owner_id, blueprintNumber);
   if (blueprint.schemaVersion !== 2) throw new Error(`el run v3 exige un Blueprint schemaVersion 2 (vino ${blueprint.schemaVersion})`);
   const snapshot = blueprint.snapshot as BlueprintSnapshotV2;
-  const plan = buildPackagingPlanV3(manifest.manifest, snapshot, { manifestId: manifest.id });
+  const pendingVideoChapterIds = prepared.pendingVideos.map((p) => p.chapterId);
+  const omittedVideoKeys = prepared.pendingVideos.map((p) => p.itemKey);
+  const plan = buildPackagingPlanV3(manifest.manifest, snapshot, { manifestId: manifest.id, omitVideoChapterIds: pendingVideoChapterIds });
   const theme = resolveTheme(prepared.profiles.theme.input);
   const loaders = deps.loadersV3 ? deps.loadersV3(job.owner_id) : artifactsServiceLoadersV3(deps.artifacts, job.owner_id);
   const loaded = await loadContentsV3(loaders, plan, prepared.byItem, prepared.run, { familyId: theme.familyId, mode: theme.mode });
@@ -506,6 +517,7 @@ export async function processV3PackageJob(
     contents: loaded.contents,
     ts: (deps.nowSeconds ?? (() => Math.floor(Date.now() / 1000)))(),
     moodleVersion: moodleRequested,
+    pendingVideoChapterIds,
   });
   // §Q.8: el validador corre sobre los BYTES del paquete, antes de subir. Un hallazgo = fail loud.
   // G6 M1: la evaluación esperada se resuelve ACÁ, del perfil que cargó el worker (no se confía en la del builder).
@@ -513,7 +525,7 @@ export async function processV3PackageJob(
   const resolved = resolveAssessment(prepared.profiles.assessment, {
     hasFinalExam: manifest.manifest.features?.finalExam === true,
     activityEngine: manifest.manifest.features?.activityEngine,
-    itemCounts: assessmentItemCountsFromManifest(manifest.manifest),
+    itemCounts: assessmentItemCountsForPackage(manifest.manifest, omittedVideoKeys),
   });
   if (JSON.stringify(resolved) !== JSON.stringify(built.expectations.resolved)) {
     throw new Error('MBZ_V3_VALIDATION_FAILED: el builder resolvió una evaluación distinta de la del perfil vigente');
@@ -527,6 +539,11 @@ export async function processV3PackageJob(
   }
   if (isLeaseLost()) return;
 
+  // EV6 T5 (fix round 1, m-2): pendientes con el flag `notice` del builder (ruling 3, medible).
+  const noticeByKey = new Map(built.summary.pendingVideos.map((p) => [p.itemKey, p.notice === true]));
+  const pendingVideos = baseSummary.pendingVideos.map((p) => ({ ...p, notice: noticeByKey.get(p.itemKey) === true }));
+  const pendingSummary = { pendingVideos, pendingVideoNoticeCount: pendingVideos.filter((p) => p.notice).length };
+
   const storagePath = `${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${sourceIdsHash}.mbz`;
   const artifact = await deps.artifacts.uploadBufferArtifact({
     ownerId: job.owner_id,
@@ -539,7 +556,7 @@ export async function processV3PackageJob(
     mimeType: 'application/vnd.moodle.backup',
     upsert: false,
     adoptExistingOnConflict: true,
-    metadata: { runId, manifestId: manifest.id, ...baseSummary },
+    metadata: { runId, manifestId: manifest.id, ...baseSummary, ...pendingSummary },
   });
   if (isLeaseLost()) return;
 
@@ -559,6 +576,7 @@ export async function processV3PackageJob(
     artifactId: artifact.id,
     reused: false,
     ...baseSummary,
+    ...pendingSummary,
     planSha256: built.summary.planSha256,
     counts: built.summary.counts,
     h5pPackages: built.summary.h5pPackages,
@@ -569,19 +587,38 @@ export async function processV3PackageJob(
   if (!ok) logger.warn(`Job ${job.id}: el .mbz v3 se subió (artifact ${artifact.id}) pero completeJob devolvió false (lease perdida)`);
 }
 
+/**
+ * EV6 T5: videos pendientes del paquete para el resumen del job / metadata del .mbz
+ * (orden del Manifest). La UI solo necesita saber cuáles y cuántos.
+ */
+export function pendingVideosSummary(
+  manifest: ManifestDto,
+  itemKeys: string[],
+): Array<{ itemKey: string; chapterId: string; chapterNumber: number | null }> {
+  const keys = new Set(itemKeys);
+  const out: Array<{ itemKey: string; chapterId: string; chapterNumber: number | null }> = [];
+  for (const m of manifest.manifest.modules ?? []) {
+    for (const c of m.chapters ?? []) {
+      const key = `video:${c.chapterId}`;
+      if (keys.has(key)) out.push({ itemKey: key, chapterId: c.chapterId, chapterNumber: Number.isInteger(c.chapterNumber) ? c.chapterNumber : null });
+    }
+  }
+  return out;
+}
+
 async function findExistingDynamicMbzV3(
   artifacts: ArtifactsService,
   ownerId: string,
   courseId: string,
   runId: string,
   sourceIdsHash: string,
-): Promise<{ id: string } | null> {
+): Promise<{ id: string; metadata: Record<string, any> | null } | null> {
   const list = await artifacts.findAll(ownerId, { courseId, type: 'dynamic_mbz' });
   const match = list.find((a) => {
     const meta = a.metadata as Record<string, any> | null;
     return meta?.runId === runId && meta?.sourceIdsHash === sourceIdsHash && meta?.builderVersion === DYNAMIC_MBZ_BUILDER_VERSION_V3;
   });
-  return match ? { id: match.id } : null;
+  return match ? { id: match.id, metadata: (match.metadata as Record<string, any> | null) ?? null } : null;
 }
 
 /**

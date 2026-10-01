@@ -9,6 +9,7 @@
  *  - chapter-assembler.ts  — slots ordenados del capítulo según video/actividad
  *  - microcopy.ts          — transiciones determinísticas en español
  *  - section-layout.ts     — EV6: una sección Moodle por capítulo / evaluación (plan + shell)
+ *  - pending-video.ts      — EV6 T5: aviso de video pendiente (vista previa)
  */
 export * from './facts';
 export * from './intro-schemas';
@@ -20,4 +21,5 @@ export * from './chapter-assembler';
 export * from './microcopy';
 export * from './cta';
 export * from './section-layout';
+export * from './pending-video';
 export { ShellRenderOptions, ShellLevel, injectIntoMovement, unprotectedText } from './html';

@@ -139,6 +139,22 @@ export function assessmentItemCountsFromManifest(manifest: { items: ReadonlyArra
 }
 
 /**
+ * EV6 T5: ítems calificables del PAQUETE — los del Manifest menos los videos pendientes (vista
+ * previa) que el paquete omite. Única fuente para servicio, worker y builder.
+ */
+export function assessmentItemCountsForPackage(
+  manifest: { items: ReadonlyArray<{ type: string; key?: string }> },
+  omittedVideoKeys: readonly string[] = [],
+): Record<AssessmentCategoryKey, number> {
+  const counts = assessmentItemCountsFromManifest(manifest);
+  const videoKeys = new Set(manifest.items.filter((i) => i && i.type === 'video').map((i) => i.key));
+  for (const k of new Set(omittedVideoKeys)) {
+    if (!videoKeys.has(k)) throw new Error(`ASSESSMENT_INVALID_FACTS: video omitido desconocido (${k})`);
+  }
+  return { ...counts, practice: counts.practice - new Set(omittedVideoKeys).size };
+}
+
+/**
  * F1 (I3): reparte 100 entre `keys` en proporción a `weights` (enteros ≥ 0),
  * con el método del resto mayor: piso de cada cuota exacta y los puntos que
  * faltan van a los restos más grandes; empate → orden fijo de categorías.
