@@ -14,6 +14,30 @@ import { evaluateRunCompletion, loadCompletionInputs, terminalStatusFor } from '
  * production_jobs (FOR UPDATE) antes de tocar items.
  */
 
+/**
+ * EV6 DoD BE-B — runs que pasaron a `completed` dentro de una transacción. El empaque automático NO se
+ * encola adentro de la transacción (podría deshacerse después de encolar): `recomputeRunStatus` solo
+ * anota el run acá y `RunsService.tx` lo entrega a los oyentes DESPUÉS del commit (en un rollback se
+ * descarta). Clave = el QueryRunner de la transacción.
+ */
+const COMPLETED_IN_TX = new WeakMap<object, Set<string>>();
+
+export function noteRunCompletedInTx(qr: object, jobId: string): void {
+  let set = COMPLETED_IN_TX.get(qr);
+  if (!set) {
+    set = new Set<string>();
+    COMPLETED_IN_TX.set(qr, set);
+  }
+  set.add(jobId);
+}
+
+/** Lee y olvida los runs completados anotados en esta transacción. */
+export function takeCompletedRunsInTx(qr: object): string[] {
+  const set = COMPLETED_IN_TX.get(qr);
+  COMPLETED_IN_TX.delete(qr);
+  return set ? [...set] : [];
+}
+
 /** worker_status "activo" del run — el mismo set que el predicado de uq_dynamic_generation_active_run. */
 export const ACTIVE_RUN_WORKER_STATUSES = ['queued', 'running', 'retrying'];
 const CANCELLED_LIKE = new Set(['cancelled', 'cancelling']);
@@ -245,13 +269,20 @@ export async function recomputeRunStatus(qr: QueryRunner, jobId: string): Promis
     }
     const verdict = terminalStatusFor(evaluateRunCompletion({ ...inputs.job, worker_status: 'completed', status: 'completed' }, inputs.rows, inputs.manifest, null, { validationCutoffs: inputs.validationCutoffs }));
     if (verdict === 'completed' || verdict === 'preview') {
+      // EV6 DoD BE-B: un run que llega a `completed` DESDE ESTE CAMBIO queda marcado para el empaque
+      // automático (`output_summary.autoPackage.eligibleAt`, el inicio de su ventana de intentos). Los
+      // runs completados antes nunca tienen la marca → el empaque automático jamás los toca.
       await qr.query(
         `update public.production_jobs
             set status = $2::text, worker_status = $2::text, progress = 100,
-                finished_at = now(), error_message = null, next_retry_at = null, updated_at = now()
+                finished_at = now(), error_message = null, next_retry_at = null, updated_at = now(),
+                output_summary = case when $2::text = 'completed'
+                  then coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('autoPackage', jsonb_build_object('eligibleAt', now()))
+                  else output_summary end
           where id = $1`,
         [jobId, verdict],
       );
+      if (verdict === 'completed') noteRunCompletedInTx(qr, jobId);
       return verdict;
     }
     const completion = evaluateRunCompletion({ ...inputs.job, worker_status: 'completed', status: 'completed' }, inputs.rows, inputs.manifest, null, { validationCutoffs: inputs.validationCutoffs });

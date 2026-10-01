@@ -152,7 +152,15 @@ export class PackagingService {
    * - Un job `failed`/`failed_retryable`/`cancelled` NUNCA se reusa — un job
    *   huérfano o fallido no debe bloquear un reintento.
    */
-  async requestPackage(courseId: number, ownerId: string, blueprintNumber: number, runId: string, actor?: PackageActor): Promise<RequestPackageResult> {
+  async requestPackage(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+    runId: string,
+    actor?: PackageActor,
+    /** EV6 DoD BE-B: pedido del empaque AUTOMÁTICO (sistema): solo un paquete `final`, nunca QA. */
+    opts: { auto?: boolean } = {},
+  ): Promise<RequestPackageResult> {
     // Fix round 1 (I2): un SUPER_ADMIN pide el paquete (QA / degradado) sobre el curso de cualquier owner.
     ownerId = await this.ownerForActor(courseId, ownerId, actor);
     // G3: flag V2 + allow-list por owner (403 antes de tocar la DB).
@@ -161,31 +169,62 @@ export class PackagingService {
     const run = await this.loadRunRow(courseId, manifest, runId);
     const packageKind = await this.assertRunReady(run, manifest, actor);
     const deliverable = isDeliverableKind(packageKind);
+    if (opts.auto && packageKind !== 'final') {
+      throw this.previewNotDeliverable(run.id, [], 'el empaque automático solo arma el paquete final entregable');
+    }
     if (manifest.rulesVersion === 2) await this.assertV2ArtifactsResolvable(run, manifest);
     // V2.1 R12: rulesVersion 3 — artifacts completos, sin mocks en runs reales, video en YouTube y perfil
     // aplicable, TODO antes de encolar (409 con la lista). Nunca se empaqueta un v3 con las reglas v1/v2.
     if (manifest.rulesVersion === 3) await this.prepareV3OrConflict(run, manifest);
 
-    const existing = await this.findLatestPackageJob(runId);
-    // EV6 DoD: un job se reusa solo si es del MISMO tipo (un paquete QA nunca pasa por final ni al revés).
-    if (existing && packageKindOf(existing) === packageKind) {
-      if (IN_PROGRESS_PACKAGE_STATUSES.includes(existing.worker_status)) {
-        return { jobId: existing.id, status: existing.worker_status, created: false, packageKind, deliverable };
-      }
-      if (existing.worker_status === RUN_DONE_STATUS) {
-        const sameBuild = await this.isSameBuild(run, manifest, existing);
-        if (sameBuild) {
-          return { jobId: existing.id, status: existing.worker_status, created: false, packageKind, deliverable };
+    // EV6 DoD BE-B: get-or-create SERIALIZADO por run (lock de transacción): el disparo automático, el
+    // barrido y un pedido manual simultáneos nunca crean dos jobs para el mismo build.
+    const qr = this.dataSource.createQueryRunner();
+    try {
+      await qr.connect();
+      await qr.startTransaction();
+      await qr.query('select pg_advisory_xact_lock(hashtextextended($1, 0))', [`dynamic_package_request:${runId}`]);
+      const existing = await this.findLatestPackageJob(runId, qr);
+      let reuse: RequestPackageResult | null = null;
+      // EV6 DoD: un job se reusa solo si es del MISMO tipo (un paquete QA nunca pasa por final ni al revés).
+      if (existing && packageKindOf(existing) === packageKind) {
+        if (IN_PROGRESS_PACKAGE_STATUSES.includes(existing.worker_status)) {
+          reuse = { jobId: existing.id, status: existing.worker_status, created: false, packageKind, deliverable };
+        } else if (existing.worker_status === RUN_DONE_STATUS) {
+          const sameBuild = await this.isSameBuild(run, manifest, existing);
+          if (sameBuild) {
+            reuse = { jobId: existing.id, status: existing.worker_status, created: false, packageKind, deliverable };
+          } else {
+            this.logger.log(
+              `requestPackage: job ${existing.id} completado con un build distinto (builderVersion u origen de artifacts cambió) — se crea un job nuevo para runId=${runId}`,
+            );
+          }
         }
-        this.logger.log(
-          `requestPackage: job ${existing.id} completado con un build distinto (builderVersion u origen de artifacts cambió) — se crea un job nuevo para runId=${runId}`,
-        );
+        // FAILED_PACKAGE_STATUSES u otro status no contemplado: no se reusa, se crea uno nuevo.
       }
-      // FAILED_PACKAGE_STATUSES u otro status no contemplado: no se reusa, se crea uno nuevo.
+      if (reuse) {
+        await qr.commitTransaction();
+        return reuse;
+      }
+      const jobId = await this.insertPackageJob(run, manifest, blueprintNumber, runId, packageKind, actor?.id ?? null, qr, opts.auto === true);
+      await qr.commitTransaction();
+      return { jobId, status: 'queued', created: true, packageKind, deliverable };
+    } catch (err) {
+      if (qr.isTransactionActive) {
+        try {
+          await qr.rollbackTransaction();
+        } catch {
+          /* se conserva el error original */
+        }
+      }
+      throw err;
+    } finally {
+      try {
+        await qr.release();
+      } catch {
+        /* conexión ya liberada o nunca obtenida */
+      }
     }
-
-    const jobId = await this.insertPackageJob(run, manifest, blueprintNumber, runId, packageKind, actor?.id ?? null);
-    return { jobId, status: 'queued', created: true, packageKind, deliverable };
   }
 
   /**
@@ -482,8 +521,8 @@ export class PackagingService {
     return new ConflictException({ message, missing: preview, code: PREVIEW_NOT_DELIVERABLE });
   }
 
-  private async findLatestPackageJob(runId: string): Promise<PackageJobRow | null> {
-    const [row] = await this.dataSource.query(
+  private async findLatestPackageJob(runId: string, q: { query: (sql: string, params?: any[]) => Promise<any> } = this.dataSource): Promise<PackageJobRow | null> {
+    const [row] = await q.query(
       `select id, owner_id, course_id, worker_status, status, input_payload, output_summary, error_message
          from public.production_jobs
         where execution_mode = $1 and input_payload->>'runId' = $2
@@ -494,10 +533,25 @@ export class PackagingService {
     return row ?? null;
   }
 
-  private async insertPackageJob(run: any, manifest: ManifestDto, blueprintNumber: number, runId: string, packageKind: PackageKind = 'final', requestedBy?: string | null): Promise<string> {
+  private async insertPackageJob(
+    run: any,
+    manifest: ManifestDto,
+    blueprintNumber: number,
+    runId: string,
+    packageKind: PackageKind = 'final',
+    requestedBy?: string | null,
+    q: { query: (sql: string, params?: any[]) => Promise<any> } = this.dataSource,
+    auto = false,
+  ): Promise<string> {
     // EV6 DoD: un paquete final conserva el input_payload de siempre; QA / degradado lo declaran.
-    const inputPayload = { runId, manifestId: manifest.id, blueprintNumber, ...(packageKind !== 'final' ? { packageKind, ...(requestedBy ? { requestedBy } : {}) } : {}) };
-    const [job] = await this.dataSource.query(
+    // BE-B: el job del empaque automático lo declara (`auto:true`, auditoría); el build y la clave de
+    // reuse no dependen del input_payload (mismo .mbz).
+    const inputPayload = {
+      runId, manifestId: manifest.id, blueprintNumber,
+      ...(packageKind !== 'final' ? { packageKind, ...(requestedBy ? { requestedBy } : {}) } : {}),
+      ...(auto ? { auto: true } : {}),
+    };
+    const [job] = await q.query(
       `insert into public.production_jobs
          (owner_id, course_id, frontend_course_id, execution_mode, status, worker_status, current_step,
           progress, blueprint_version_id, input_payload, output_summary, options, result,

@@ -31,7 +31,7 @@
 import { frozenProviderModesOf, providerKindOfItemType } from './provider-modes';
 import { fallbackVideoModeOf, questionsBelongToVideo } from './video-upgrade';
 import { v3ValidatedArtifactTypes } from '../course-shell/v3-validation';
-import { autoHealDecision } from './auto-heal';
+import { autoHealDecision, safeAutoRetryDecision } from './auto-heal';
 import { BUDGET_EXCEEDED, PROVIDER_RECONCILIATION_REQUIRED } from '../finops/run-budget';
 
 export type RunCompletionState = 'in_progress' | 'packaging' | 'complete' | 'preview' | 'needs_attention' | 'cancelled';
@@ -48,7 +48,9 @@ export type RunAdminActionCode =
   | 'approve_budget'
   | 'retry_item'
   | 'regenerate_item'
-  | 'generate_real_videos';
+  | 'generate_real_videos'
+  /** BE-B: el paquete final automático falló (o no se pudo armar) y no queda reintento automático. */
+  | 'retry_package';
 
 export interface RunAdminAction {
   code: RunAdminActionCode;
@@ -68,6 +70,27 @@ export interface RunCompletion {
   /** Items completados pero de vista previa (mock). Orden del Manifest. */
   previewComponents: string[];
   adminActions: RunAdminAction[];
+  /**
+   * BE-B: estado del último job de paquete FINAL del run (solo cuando la generación está completa):
+   * `none` (todavía no hay job), `queued`/`running`/`retrying` (armándose), `completed`, `failed`
+   * (falló o no se pudo armar). `autoRetryPending`: el servidor lo va a reintentar solo. `auto`: el run
+   * está cubierto por el empaque automático (completado desde BE-B y encendido); `false` = run anterior
+   * (o empaque automático apagado): con `status:'none'` el paquete se pide a mano.
+   */
+  packageJob?: { status: string; autoRetryPending: boolean; auto: boolean } | null;
+}
+
+/**
+ * BE-B: lo que el evaluador necesita saber del paquete. `ready` = paquete VIGENTE y ENTREGABLE;
+ * `status` = estado del último job de paquete FINAL (ver RunCompletion.packageJob);
+ * `autoRetryPending` = el servidor lo reintenta solo (empaque automático, intentos acotados).
+ */
+export interface CompletionPackageInfo {
+  ready: boolean;
+  status?: string | null;
+  autoRetryPending?: boolean;
+  /** El run está cubierto por el empaque automático. */
+  auto?: boolean;
 }
 
 export interface CompletionJob {
@@ -359,8 +382,13 @@ export function adminActionFor(r: CompletionRow | undefined, cls: ItemCompletion
   }
   if (r.status === 'cancelled') return null;
   // El auto-healer todavía lo va a reabrir (allow-list, dentro de su ventana): sin acción humana.
-  const d = autoHealDecision({ status: r.status, type: r.type, error: r.error ?? null, output_summary: s, finished_at: r.finished_at ?? null, updated_at: r.updated_at ?? null }, now);
+  const ahRow = { status: r.status, type: r.type, error: r.error ?? null, output_summary: s, finished_at: r.finished_at ?? null, updated_at: r.updated_at ?? null };
+  const d = autoHealDecision(ahRow, now);
   if (d.heal === true || (d.heal === false && d.reason === 'backoff')) return null;
+  // BE-B: rechazo definitivo SIN gasto (videogen_submit_rejected / gamma_submit_failed) con su ÚNICO
+  // reintento automático todavía disponible: lo toma el servidor, sin acción humana.
+  const sd = safeAutoRetryDecision(ahRow, now);
+  if (sd.heal === true || (sd.heal === false && sd.reason === 'backoff')) return null;
   if (err.includes(PROVIDER_RECONCILIATION_REQUIRED)) {
     return { code: r.type === 'video' ? 'reconcile_videogen' : 'reconcile_provider', itemKey: key };
   }
@@ -389,7 +417,7 @@ export function evaluateRunCompletion(
   job: CompletionJob,
   rows: ReadonlyArray<CompletionRow>,
   manifest: CompletionManifest,
-  pkg?: { ready: boolean } | null,
+  pkg?: CompletionPackageInfo | null,
   opts: CompletionOptions = {},
 ): RunCompletion {
   const rowsByKey = new Map(rows.map((r) => [r.item_key, r]));
@@ -428,8 +456,17 @@ export function evaluateRunCompletion(
   let state: RunCompletionState;
   if (isCancelledLike(job) && !opts.upgradeOnlyFailure) state = 'cancelled';
   else if (!isCancelledLike(job) && (isActiveRun(job) || inFlight > 0)) state = 'in_progress';
-  else if (generationComplete) state = packageReady ? 'complete' : 'packaging';
-  else if (nonPreviewMissing === 0 && previewComponents.length > 0) state = 'preview';
+  else if (generationComplete) {
+    // BE-B: `packaging` mientras el paquete final se arma (o el servidor lo va a armar/reintentar solo);
+    // un paquete que falló sin reintento automático pendiente → recuperación de admin (`retry_package`).
+    const st = pkg?.status ?? null;
+    const failed = !packageReady && st === 'failed' && !pkg?.autoRetryPending;
+    if (packageReady) state = 'complete';
+    else if (failed) {
+      state = 'needs_attention';
+      push({ code: 'retry_package' });
+    } else state = 'packaging';
+  } else if (nonPreviewMissing === 0 && previewComponents.length > 0) state = 'preview';
   else state = 'needs_attention';
 
   // §2.6: upgrade fallido de un run de vista previa → siempre recuperación (nunca «listo»).
@@ -443,6 +480,9 @@ export function evaluateRunCompletion(
     missingComponents,
     previewComponents,
     adminActions: actions,
+    ...(generationComplete && pkg && pkg.status !== undefined
+      ? { packageJob: { status: packageReady ? 'completed' : String(pkg.status ?? 'none'), autoRetryPending: !!pkg.autoRetryPending, auto: !!pkg.auto } }
+      : {}),
   };
 }
 

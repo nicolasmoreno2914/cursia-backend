@@ -4,6 +4,8 @@ import { PackagingService } from './packaging.service';
 import { GenerationManifestsModule } from '../generation-manifests/generation-manifests.module';
 import { ArtifactsModule } from '../artifacts/artifacts.module';
 import { AuthModule } from '../../auth/auth.module';
+import { DynamicGenerationModule } from '../dynamic-generation/dynamic-generation.module';
+import { AutoPackageService } from './auto-package.service';
 
 /**
  * Empaquetado Moodle dinámico (Fase 5B.1). No importa ProductionJobsModule:
@@ -17,9 +19,10 @@ import { AuthModule } from '../../auth/auth.module';
     GenerationManifestsModule, // expone GenerationManifestsService.get (ownership + dynamic + Manifest verificado)
     ArtifactsModule,           // expone ArtifactsService.getDownloadUrl (signed URL de descarga)
     AuthModule,                // expone SupabaseJwtGuard para el controlador
+    DynamicGenerationModule,   // EV6 DoD BE-B: RunsService (aviso «run completed» → empaque automático)
   ],
   controllers: [PackagingController],
-  providers: [PackagingService],
-  exports: [PackagingService],
+  providers: [PackagingService, AutoPackageService],
+  exports: [PackagingService, AutoPackageService],
 })
 export class DynamicPackagingModule {}

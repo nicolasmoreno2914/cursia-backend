@@ -190,7 +190,7 @@ export class RunsController {
     if (extra.length > 0) throw new BadRequestException(`campos no permitidos: ${extra.join(', ')}`);
     const action = b.action as YoutubeResolutionAction;
     const videoId = b.youtubeVideoId === undefined ? undefined : String(b.youtubeVideoId);
-    return this.runs.resolveYoutubeUpload(courseId, user.id, number, runId, itemKey, action, videoId);
+    return this.runs.resolveYoutubeUpload(courseId, user.id, number, runId, itemKey, action, videoId, { id: user.id, email: user.email });
   }
 
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/video-upgrade/preview
@@ -248,7 +248,7 @@ export class RunsController {
     @Res({ passthrough: true }) res: Response,
   ) {
     const opts = parseRegenerateItemBody(body);
-    const result = await this.runs.regenerateItem(courseId, user.id, number, runId, itemKey, opts);
+    const result = await this.runs.regenerateItem(courseId, user.id, number, runId, itemKey, opts, { id: user.id, email: user.email });
     // dryRun → 200 (no escribe); real → 201 si creó, 200 si ya estaba en vuelo.
     res.status('dryRun' in result ? 200 : result.created ? 201 : 200);
     return result;
