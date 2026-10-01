@@ -8,8 +8,9 @@
 //  - el paquete BUENO con bancos (+ final + certificado), sin final, con intentos ilimitados y uno GIFT
 //    validan limpios (también sin `examBankPlans` en las expectativas: expectativas viejas);
 //  - cada mutación de un paquete bueno → EXACTAMENTE su código (nada más);
-//  - ANSWER_LEAK (fix 1): fuga = enunciado + respuesta correcta juntos fuera de su página; una respuesta
-//    sola o una explicación nunca; regresiones del probe de la revisión (C1/C2) y respuestas cortas.
+//  - ANSWER_LEAK (fix 1 + 2): fuga = enunciado + respuesta correcta juntos fuera de su página (en el texto
+//    enseñado, además con una opción incorrecta); una respuesta sola o una explicación nunca; regresiones
+//    del probe de la revisión (C1/C2, I3 worked.js) y respuestas cortas.
 //  - opcional: `--corpus a.mbz b.mbz …` corre ANSWER_LEAK sobre paquetes existentes (reales/E2E): 0 hallazgos.
 //
 // Usage: node scripts/check-p2-exam-validators.js [path/to/dist] [--out dir] [--corpus x.mbz …]
@@ -292,9 +293,14 @@ async function main() {
   const FQX = `${fquiz.dir}/quiz.xml`;
   const FPX = `${fpage.dir}/page.xml`;
   const pair = (q) => `${q.stem} Respuesta: ${q.correct.text}.`;
-  await check('ANSWER_LEAK (verdadero positivo): enunciado + respuesta correcta pegados en el texto de un capítulo → solo ANSWER_LEAK', async () => {
-    const iss = await expectOnly(await mutate(built.mbz, { [CHX]: (x) => insertText(x, 'intro', pair(mc)) }), exp, 'ANSWER_LEAK', 'par en capítulo');
+  const pasted = (q) => `${q.stem} a) ${q.correct.text} b) ${q.distractors[0].text} c) ${q.distractors[1].text}`;
+  await check('ANSWER_LEAK (verdadero positivo, fix 2): pregunta pegada CON sus opciones en el texto de un capítulo → solo ANSWER_LEAK', async () => {
+    const iss = await expectOnly(await mutate(built.mbz, { [CHX]: (x) => insertText(x, 'intro', pasted(mc)) }), exp, 'ANSWER_LEAK', 'pregunta en capítulo');
     assert(iss.every((i) => i.where === ch) && iss.some((i) => i.message.includes(mc.id)), JSON.stringify(iss));
+  });
+  await check('ANSWER_LEAK sin falso positivo (fix 2, I3): enunciado + respuesta SIN opciones en el texto enseñado (el capítulo enuncia el hecho) → limpio', async () => {
+    const r = await codes(await mutate(built.mbz, { [CHX]: (x) => insertText(x, 'intro', pair(mc)) }), exp);
+    eq(r.codes, [], 'par sin opciones en capítulo');
   });
   await check('ANSWER_LEAK: par del examen de módulo en la intro del examen final → solo ANSWER_LEAK', async () => {
     await expectOnly(await mutate(built.mbz, { [FQX]: (x) => insertText(x, 'intro', pair(mc)) }), exp, 'ANSWER_LEAK', 'intro');
@@ -366,6 +372,21 @@ async function main() {
     fq.stem = mq[2].stem;
     fq.correct.text = mq[2].correct.text;
     await cleanBuild('cortas + compartida', X.input);
+  });
+  await check('ANSWER_LEAK regresión I3 (b5r1/worked.js): pregunta de completar cuyo enunciado + respuesta son una oración del texto de un capítulo → limpio', async () => {
+    const base = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true, courseId: 770 }));
+    const pkg = await EV.readExamPackageV3(await JSZip.loadAsync(base.mbz));
+    const lab = pkg.acts.find((a) => /^cv3:ch:.*:deepening$/.test(a.idnumber));
+    const VC = loadDist('modules/visual-components/index.js');
+    const sent = VC.extractText(lab.intro).replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/).find((x) => x.length > 60 && x.length < 200 && !/[{}=~#:]/.test(x));
+    assert(sent, 'fixture: sin oración en el capítulo');
+    const words = sent.replace(/[.!?]$/, '').split(' ');
+    const cut = Math.ceil(words.length * 0.6);
+    const input = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true, courseId: 771 });
+    const first = input.manifest.modules.find((m) => m.examEnabled);
+    const g = input.contents.examGift.get(first.moduleId);
+    input.contents.examGift.set(first.moduleId, `::W1:: ${words.slice(0, cut).join(' ')}: {\n=${words.slice(cut).join(' ')}\n~Una opción distinta del caso\n~Otra opción sin relación\n}\n\n` + g.split('\n\n').slice(1).join('\n\n'));
+    await cleanBuild('worked.js', input);
   });
   await check('M1: examBankPlans = {} (vacío/serializado) se trata como ausente → limpio', async () => {
     await cleanBuild('plans {}', bankInput({ courseId: 764 }).input, (b) => ({ facts: b.expectations.facts, resolved: b.expectations.resolved, examBankPlans: {} }));

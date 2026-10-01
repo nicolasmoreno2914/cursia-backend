@@ -11,9 +11,9 @@
  *                      (> 0: e=1 | e=3; 0: solo e=1), show:false, downloadcontent 0, completion 0,
  *                      fuera de los criterios del curso, contenido no vacío y CLEAN_SAFE.
  *   ANSWER_LEAK        la respuesta correcta de una pregunta JUNTO con su enunciado (mismo label/página,
- *                      normalización del contrato B2, por palabras completas) en cualquier superficie
- *                      (intro de toda actividad, contenido de páginas) salvo la página «Respuestas
- *                      explicadas» del MISMO quiz. Una respuesta sola o una explicación nunca son fuga.
+ *                      normalización del contrato B2, por palabras completas) fuera de la página
+ *                      «Respuestas explicadas» del MISMO quiz; en el texto enseñado, además con al
+ *                      menos una opción incorrecta. Una respuesta sola o una explicación nunca son fuga.
  *                      El Libro Guía no se lee. Ver `answerLeakIssues`.
  * (TEACHER_NOTE vive en mbz-validator-v3.ts: depende del certificado.)
  *
@@ -345,12 +345,18 @@ export function explanationsGateIssues(pkg: ExamPkg): ExamIssue[] {
 // ─── ANSWER_LEAK ────────────────────────────────────────────────────────────
 
 /**
- * Regla (P2-design §5, ruling P2-B5 fix 1): en TODA superficie que no sea la página «Respuestas
- * explicadas» del MISMO quiz, hay fuga si la respuesta correcta aparece JUNTO con el enunciado de su
- * pregunta (mismo label/página, texto normalizado). Una respuesta correcta sola nunca es fuga (títulos,
- * textos del shell, contenido enseñado, páginas de otros quizzes); una explicación tampoco (reformula
- * el contenido enseñado). Material compartido: en la página de OTRO quiz, un par que ese quiz también
- * tiene como pregunta propia (mismo enunciado en su material) es suyo, no fuga.
+ * Regla (P2-design §5, ruling 5 — P2-B5 fix 1 + fix 2). Fuera de la página «Respuestas explicadas» del
+ * MISMO quiz:
+ *  - superficies NO enseñadas (labels del shell, tarjetas de presentación, info/siguiente de evaluación,
+ *    intros de quiz/actividad/recurso, páginas de OTROS quizzes): fuga = el enunciado de la pregunta
+ *    JUNTO con su respuesta correcta (mismo label/página, texto normalizado);
+ *  - superficies ENSEÑADAS (`answerLeakTaughtSurface`: labels de capítulo salvo la presentación,
+ *    presentación del módulo, bienvenida, competencias, metodología, cierre): además debe aparecer al
+ *    menos una opción INCORRECTA de esa pregunta (la pregunta mostrada como pregunta). El texto
+ *    enseñado puede enunciar el mismo hecho con las mismas palabras (fix 2, I3), pero no repite los
+ *    distractores.
+ * Una respuesta correcta sola o una explicación nunca son fuga. Material compartido: en la página de
+ * OTRO quiz, un par cuyo enunciado es pregunta propia de ese quiz es suyo, no fuga.
  */
 export const ANSWER_LEAK_MIN_STEM_CHARS = 20;
 
@@ -360,6 +366,15 @@ interface Needle {
   answer: string;
   tokens: string[];
   stem: string[];
+  /** Opciones incorrectas de la pregunta (selección múltiple); vacío si no tiene. */
+  wrong: string[][];
+}
+
+/** ¿Superficie de contenido enseñado (o del LLM del curso)? Ahí solo cuenta la pregunta con sus opciones. */
+export function answerLeakTaughtSurface(a: Pick<ExamPkgActivity, 'idnumber' | 'modname'>): boolean {
+  if (a.modname !== 'label') return false;
+  if (/^cv3:ch:[^:]+:/.test(a.idnumber)) return !/:presentation$/.test(a.idnumber);
+  return /^cv3:module_intro:/.test(a.idnumber) || /^cv3:shell:(welcome|competencies|methodology|closing)$/.test(a.idnumber);
 }
 
 const toks = (s: string): string[] => examTokens(normalizeExamText(s));
@@ -376,10 +391,11 @@ export function answerLeakNeedles(pkg: ExamPkg): Needle[] {
         // Respuestas con fracción completa (selección múltiple, respuesta corta, numérica). V/F y
         // emparejamiento no tienen una «respuesta» textual que filtrar.
         if (!['multichoice', 'shortanswer', 'numerical'].includes(qq.qtype)) continue;
+        const wrong = qq.answers.filter((a) => !(a.fraction > 0)).map((a) => toks(a.text)).filter((t) => t.length);
         for (const a of qq.answers) {
           if (!(a.fraction >= 0.9999999)) continue;
           const tokens = toks(a.text);
-          if (tokens.length) out.push({ quiz: q, question: qq.name, answer: a.text.trim(), tokens, stem });
+          if (tokens.length) out.push({ quiz: q, question: qq.name, answer: a.text.trim(), tokens, stem, wrong });
         }
       }
     }
@@ -432,17 +448,18 @@ export function answerLeakIssues(pkg: ExamPkg): ExamIssue[] {
   for (const q of quizzesOf(pkg)) {
     ownStems.set(q.mid, pkg.categories.filter((c) => c.contextinstanceid === q.mid).flatMap((c) => c.questions.map((x) => hay(x.stem))));
   }
-  const hays = pkg.acts.map((a) => ({ a, h: hay(`${extractText(a.intro)} ${a.modname === 'page' ? extractText(a.content) : ''}`) }));
+  const hays = pkg.acts.map((a) => ({ a, taught: answerLeakTaughtSurface(a), h: hay(`${extractText(a.intro)} ${a.modname === 'page' ? extractText(a.content) : ''}`) }));
   for (const n of needles) {
-    for (const { a, h } of hays) {
+    for (const { a, taught, h } of hays) {
       const owner = quizByPage.get(a.mid);
       if (owner?.mid === n.quiz.mid) continue; // su propia página
       if (!contains(h, n.stem) || !contains(h, n.tokens)) continue;
+      if (taught && !n.wrong.some((w) => contains(h, w))) continue; // fix 2 (I3): el hecho enseñado, no la pregunta
       if (owner && (ownStems.get(owner.mid) ?? []).some((m) => contains(m, n.stem))) continue; // pregunta compartida
       out.push({
         code: 'ANSWER_LEAK',
         where: a.idnumber || a.dir,
-        message: `enunciado + respuesta correcta de ${n.question} (${n.quiz.idnumber}) visibles fuera de su página gated: «${n.answer.slice(0, 80)}${n.answer.length > 80 ? '…' : ''}»`,
+        message: `${taught ? 'pregunta con sus opciones' : 'enunciado + respuesta correcta'} de ${n.question} (${n.quiz.idnumber}) visibles fuera de su página gated: «${n.answer.slice(0, 80)}${n.answer.length > 80 ? '…' : ''}»`,
       });
     }
   }
