@@ -960,6 +960,12 @@ function reservationBookkeeping(ev) {
           ok(r.courseTotal !== null && Math.abs(r.courseTotal - et) < 0.01, `${label} [${who}]: total ponderado del curso ${r.courseTotal} ≈ ${et.toFixed(2)}`, { got: r.courseTotal, want: et });
           if (who === 'pass') ok(r.courseComplete === true, `${label} [pass]: curso completo (criterios por actividad/examen cumplidos)`, r);
           if (who === 'fail') ok(r.courseComplete === false, `${label} [fail]: curso NO completo`, r);
+          // EV6 P2-B5: «Respuestas explicadas» — una página por quiz; disponible SOLO si su quiz está aprobado
+          // (con notas escritas nunca se agotan intentos: reprobado = INCOMPLETE → bloqueada).
+          const pages = Object.entries(r.pages || {});
+          const nQuiz = gradedList.filter((c) => isQuizKind(c.idnumber)).length;
+          const badP = pages.filter(([, p]) => p.available !== (r.states[p.quiz] === 2) || p.uservisible !== p.available).map(([id, p]) => [id, p, r.states[p.quiz]]);
+          ok(pages.length === nQuiz && badP.length === 0, `${label} [${who}]: ${pages.length} página(s) «Respuestas explicadas»: disponible ⇔ su quiz aprobado (P2-B5)`, { pages: r.pages, badP });
         }
         results.moodle[label].sim = so.sim;
         // P2-B1: la nota sola nunca basta para reprobar un quiz (arriba, INCOMPLETE). Para probar que
@@ -975,6 +981,20 @@ function reservationBookkeeping(ev) {
           const exo = JSON.parse(fs.readFileSync(exOut, 'utf8'));
           eq(exo.completionstate, 3, `${label}: ${quizForExhaust.idnumber} con sus ${exo.attemptsConfigured} intentos REALES agotados y reprobados → COMPLETE_FAIL(3) (P2-B1)`, exo);
           ok(exo.courseComplete === false, `${label}: curso NO completo tras agotar intentos reales de ${quizForExhaust.idnumber}`, exo);
+        }
+        // EV6 P2-B5: evaluaciones que certifican con intentos REALES (moodle-p2-exams.php): revisión solo
+        // con nota tras un intento reprobado, «Respuestas explicadas» bloqueada → disponible al agotar (o
+        // al aprobar; con intentos ilimitados solo al aprobar), curso completo solo aprobando, sorteo por
+        // hoja si el examen es un banco. Usuarios propios (p2b5_*), nunca los de la simulación de notas.
+        if (quizForExhaust) {
+          const p2Out = path.join(V3OUT, `moodle-${label}.p2exams.json`);
+          const p2 = spawnSync(PHP, ['-c', PHPINI, path.join(HERE, 'moodle-p2-exams.php'), process.env.MOODLE_ROOT, String(courseid), p2Out], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+          ok(!/warning|notice|deprecated/i.test(p2.stderr || '') && fs.existsSync(p2Out), `${label}: escenarios de evaluaciones (moodle-p2-exams.php) sin error de PHP`, (p2.stderr || p2.stdout || '').slice(-800));
+          const p2o = fs.existsSync(p2Out) ? JSON.parse(fs.readFileSync(p2Out, 'utf8')) : { pass: false, failed: ['sin salida'], assertions: 0 };
+          ok(p2.status === 0 && p2o.pass === true && p2o.assertions > 0, `${label}: ${p2o.assertions} aserciones de evaluaciones con intentos reales (revisión, página gated, completion del curso${Object.values(p2o.quizzes || {}).some((q) => q.mode === 'bank') ? ', sorteo por hoja' : ''})`, p2o.failed);
+          const modes = Object.values(p2o.quizzes || {}).map((q) => q.mode);
+          ok(modes.length > 0 && modes.every((m) => m === 'bank' || m === 'gift'), `${label}: quizzes todo-aleatorio (banco) o todo-fijo (GIFT): ${modes.join(',')}`, p2o.quizzes);
+          results.moodle[label].p2exams = { pass: p2o.pass, assertions: p2o.assertions, quizzes: p2o.quizzes, steps: p2o.steps };
         }
         results.moodle[label].cms = cms.map((c) => ({ cmid: c.cmid, idnumber: c.idnumber, modname: c.modname, visible: c.visible }));
         // EV6 (browser QA): una página por sección → el QA recorre /course/section.php?id=<id>.

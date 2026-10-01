@@ -4,6 +4,10 @@
 // quiz y h5pactivity; pistas SCORM 1.2 + scorm_update_grades para SCORM. Usa
 // usuarios de prueba locales r13grade{pass,fail,mixed} (se crean si no
 // existen; nunca se borra nada). Luego revisa completion por ítem y del curso.
+// EV6 P2-B5: también la disponibilidad (para cada usuario) de cada página «Respuestas explicadas»
+// (`pages`: idnumber → { quiz, available, uservisible }). Con notas escritas un quiz reprobado queda
+// INCOMPLETE (sin intentos agotados) → su página sigue bloqueada; aprobado → disponible. Los intentos
+// REALES (revisión, agotar, ilimitados, curso) los cubre moodle-p2-exams.php.
 // Uso: php -c php.ini moodle-v3-grades.php <input.json> <output.json>
 //   input: { moodleRoot, courseid, grades: { pass|fail|mixed: { <idnumber cv3:…>: nota } } }
 define('CLI_SCRIPT', 1);
@@ -79,7 +83,15 @@ foreach ($users as $k => $u) {
     }
     $ccid = $DB->get_field('course_completions', 'id', ['course' => $courseid, 'userid' => $u->id]);
     if ($ccid) aggregate_completions((int)$ccid);
-    $out['sim'][$k] = ['states' => $states, 'grades' => $grades,
+    $pages = [];
+    get_fast_modinfo($courseid, 0, true);
+    $mi = get_fast_modinfo($course, $u->id);
+    foreach ($cms as $idn => $c) {
+        if ($c['modname'] !== 'page' || !preg_match('/^cv3:(exam_explanations:(.+)|final_exam_explanations)$/', $idn, $m)) continue;
+        $pcm = $mi->get_cm($c['cmid']);
+        $pages[$idn] = ['quiz' => isset($m[2]) ? 'cv3:exam:' . $m[2] : 'cv3:final_exam', 'available' => (bool)$pcm->available, 'uservisible' => (bool)$pcm->uservisible];
+    }
+    $out['sim'][$k] = ['states' => $states, 'grades' => $grades, 'pages' => $pages,
         'courseTotal' => $cf && $cf->finalgrade !== null ? (float)$cf->finalgrade : null,
         'courseComplete' => $ci->is_course_complete($u->id)];
 }
