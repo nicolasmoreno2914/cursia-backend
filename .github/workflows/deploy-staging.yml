@@ -166,16 +166,21 @@ jobs:
           # V2.1 FinOps: secreto del environment "staging" de GitHub. Viaja por stdin
           # (nunca en argv ni en el log) y se escribe en el .env de staging sin imprimirse.
           FINOPS_INGEST_TOKEN_STAGING: ${{ secrets.FINOPS_INGEST_TOKEN_STAGING }}
+          # El script de abajo NO usa expresiones ${{ }}: GitHub limita a ~21000 caracteres un `run`
+          # que las contiene (el workflow se rechaza sin correr). Los valores entran por env.
+          DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
+          DEPLOY_VPS_PATH_STAGING: ${{ secrets.VPS_PATH_STAGING }}
         run: |
           printf "%s\n" "$FINOPS_INGEST_TOKEN_STAGING" | ssh -i ~/.ssh/deploy_key \
               -o StrictHostKeyChecking=no \
-              "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+              "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
               'set -e
-               cd '"${{ secrets.VPS_PATH_STAGING }}"'
+               cd '"$DEPLOY_VPS_PATH_STAGING"'
                IFS= read -r _FIT || true
 
                if [ ! -f .env ]; then
-                 echo "❌ Falta .env en '"${{ secrets.VPS_PATH_STAGING }}"' — créalo a mano una sola vez"
+                 echo "❌ Falta .env en '"$DEPLOY_VPS_PATH_STAGING"' — créalo a mano una sola vez"
                  echo "   (PORT distinto al de producción + credenciales del proyecto de Supabase de staging)."
                  exit 1
                fi

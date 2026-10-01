@@ -110,6 +110,9 @@ function remoteScriptOf(stepText) {
   let body = stepText.slice(start + 1, end);
   // `'"${{ secrets.X }}"'` = cerrar comilla, secret, reabrir → placeholder de ruta.
   body = body.replace(/'"\$\{\{ secrets\.[A-Z_]+ \}\}"'/g, '/tmp/vps-path');
+  // Mismo patrón con la ruta por env (`'"$DEPLOY_VPS_PATH_STAGING"'`): el step de staging no usa
+  // expresiones ${{ }} en el `run` (GitHub limita a ~21000 caracteres un `run` que las contiene).
+  body = body.replace(/'"\$DEPLOY_VPS_[A-Z_]+"'/g, '/tmp/vps-path');
   assert(!body.includes("'"), 'el script remoto contiene una comilla simple suelta (cortaría el string de ssh)');
   // Quitar la indentación YAML (15 espacios en ambos workflows).
   return body.split('\n').map((l) => l.replace(/^ {15}/, '')).join('\n');
@@ -856,6 +859,21 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       assert(r.termExit && r.termExit.code === 0, `SIGTERM: ${JSON.stringify(r.termExit)}`);
     });
   }
+
+  // ── Límite de GitHub: un `run` con expresiones ${{ }} se rechaza (≈21000 caracteres) y el workflow
+  // falla en 0 s sin correr ("workflow file issue"). Pasó en staging con #66/#67 (20976 y 21327 bytes).
+  await check('workflows: ningún `run` con expresiones ${{ }} supera 20000 bytes (margen bajo el límite de GitHub)', async () => {
+    for (const wf of ['.github/workflows/deploy-staging.yml', '.github/workflows/deploy.yml']) {
+      for (const st of stepsOf(readWf(wf))) {
+        const i = st.text.indexOf('run: |');
+        if (i < 0) continue;
+        const run = st.text.slice(i);
+        if (!run.includes('${{')) continue;
+        const bytes = Buffer.byteLength(run, 'utf8');
+        assert(bytes < 20000, `${wf} «${st.name}»: run con expresiones de ${bytes} bytes — pasar los secrets por env`);
+      }
+    }
+  });
 
   console.log(`\n${passes} ok, ${failures} fail`);
   process.exit(failures ? 1 : 0);
