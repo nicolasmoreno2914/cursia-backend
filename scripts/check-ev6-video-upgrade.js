@@ -760,12 +760,79 @@ const ENV_KEYS = [
       eq((await latest(X.runId, `video:${X.c2}`)).output_summary.youtubeVideoId, 'PubVid12345', 'mismo id de YouTube');
     });
 
+    // ════ Fix round 3 (I-4): procedencia explícita de las preguntas ═════════
+    const { SchedulerService } = L('modules/dynamic-generation/scheduler.service.js');
+    const sched = new SchedulerService(ds, runs);
+    const splitOf = async (runId) => {
+      const PK = L('modules/dynamic-packaging/packaging-v3.js');
+      const job = await jobOf(runId);
+      const eff = await ds.query(`select distinct on (item_key) * from public.generation_item_runs where job_id = $1 and type in ('video','video_interactions')
+                                  order by item_key, (status = 'completed') desc, generation desc`, [runId]);
+      const byItem = new Map(eff.map((r) => [r.item_key, { itemKey: r.item_key, type: r.type, artifacts: [{ artifactId: 'a-' + r.id, itemRunId: r.id }], outputSummary: r.output_summary, finishedAt: r.finished_at }]));
+      const mf = { items: eff.map((r) => ({ key: r.item_key, type: r.type, chapterId: r.chapter_id })) };
+      return PK.splitPendingVideosV3(mf, byItem, job.input_payload.videoMode, { videoUpgrade: true, upgradedKeys: VU.upgradedVideoKeysOf(job.input_payload), fallbackMode: VU.fallbackVideoModeOf(job.input_payload), runId });
+    };
+    let I4 = null;
+    await check('fix round 3 (I-4): upgrade COMPLETO → el dueño «Regenera» las preguntas del video 1 (regenerateItem normal) → el claim registra sourceVideoItemRunId = video vigente; el paquete INCLUYE el video real con las preguntas nuevas, el planificador no muestra nada pendiente y no pide aprobación', async () => {
+      const X = await previewCourse('Curso B2 regenerar preguntas');
+      const pv = await runs.previewVideoUpgrade(X.cid, ADMIN, 1, X.runId);
+      await runs.confirmVideoUpgrade(X.cid, ADMIN, 1, X.runId, pv.estimateHash);
+      for (const c of [X.c1, X.c2]) await itemWorker.processItem(deps(dbScheduler(), fakeVideogen()), await claim(X.runId, `video:${c}`, c));
+      for (const c of [X.c1, X.c2]) {
+        const ir = await latest(X.runId, `video_interactions:${c}`);
+        eq(ir.output_summary.sourceVideoItemRunId, (await latest(X.runId, `video:${c}`)).id, 'el upgrade la registra al crearla');
+        await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() where id = $1`, [ir.id]);
+      }
+      await recompute(X.runId);
+      eq((await splitOf(X.runId)).pendingVideos, [], 'nada pendiente tras el upgrade');
+      // El dueño regenera las preguntas del video 1 con el «Regenerar» normal (sin cascada del upgrade).
+      const res = await runs.regenerateItem(X.cid, OWNER, 1, X.runId, `video_interactions:${X.c1}`, { confirmPaid: true });
+      eq([res.created, res.item.generation], [true, 3], 'generación 3 de las preguntas');
+      const claimed = await sched.claimNextItem({ executorId: 'b-ev6', types: ['video_interactions'], runId: X.runId, ownerId: OWNER, leaseSeconds: 60 });
+      assert(claimed && claimed.itemKey === `video_interactions:${X.c1}`, `claim: ${claimed && claimed.itemKey}`);
+      const v1 = await latest(X.runId, `video:${X.c1}`);
+      const q3 = await latest(X.runId, `video_interactions:${X.c1}`);
+      eq([q3.generation, q3.output_summary.sourceVideoItemRunId], [3, v1.id], 'el CLAIM registra la procedencia');
+      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now(), lease_until = null where id = $1`, [q3.id]);
+      await recompute(X.runId);
+      eq((await jobOf(X.runId)).worker_status, 'completed', 'run completed');
+      eq((await splitOf(X.runId)).pendingVideos, [], 'el paquete incluye el video real con las preguntas nuevas');
+      const before = await counts(X.cid);
+      const pv2 = await runs.previewVideoUpgrade(X.cid, ADMIN, 1, X.runId);
+      eq([pv2.eligible, pv2.pendingVideos, pv2.questionsOnly, pv2.estimate], [false, [], [], null], 'nada pendiente, sin estimado ni aprobación');
+      assert(pv2.blockers.some((b) => b.code === VU.VIDEO_UPGRADE_NOTHING_PENDING), 'nada que generar');
+      eq(await counts(X.cid), before, 'sin escrituras');
+      await packaging.assertRunReady(await jobOf(X.runId), { rulesVersion: 3, manifest: X.manifest.manifest ?? X.manifest });
+      I4 = X;
+    });
+
+    await check('fix round 3 (I-4) legacy: preguntas SIN sourceVideoItemRunId → son del video si completaron DESPUÉS que su generación vigente; si completaron antes → pendientes (questionsOnly) y el paquete las omite', async () => {
+      const X = I4;
+      const v1 = await latest(X.runId, `video:${X.c1}`);
+      const q = await latest(X.runId, `video_interactions:${X.c1}`);
+      await ds.query(`update public.generation_item_runs set output_summary = output_summary - 'sourceVideoItemRunId', finished_at = $2::timestamptz + interval '1 minute' where id = $1`, [q.id, v1.finished_at]);
+      eq((await splitOf(X.runId)).pendingVideos, [], 'legacy completada después → suya');
+      eq((await runs.previewVideoUpgrade(X.cid, ADMIN, 1, X.runId)).questionsOnly, [], 'planificador: nada');
+      await ds.query(`update public.generation_item_runs set finished_at = $2::timestamptz - interval '1 minute' where id = $1`, [q.id, v1.finished_at]);
+      eq((await splitOf(X.runId)).pendingVideos.map((p) => p.itemKey), [`video:${X.c1}`], 'legacy completada antes → pendiente');
+      eq((await runs.previewVideoUpgrade(X.cid, ADMIN, 1, X.runId)).questionsOnly.map((x) => x.itemKey), [`video_interactions:${X.c1}`], 'planificador: preguntas del video');
+      // Pura: la regla única.
+      eq([
+        VU.questionsBelongToVideo({ id: 'v', finishedAt: '2026-01-01T00:00:00Z' }, { status: 'completed', outputSummary: { sourceVideoItemRunId: 'v' } }),
+        VU.questionsBelongToVideo({ id: 'v', finishedAt: '2026-01-01T00:00:00Z' }, { status: 'completed', outputSummary: { sourceVideoItemRunId: 'old' }, finishedAt: '2027-01-01T00:00:00Z' }),
+        VU.questionsBelongToVideo({ id: 'v', finishedAt: '2026-01-01T00:00:00Z' }, { status: 'pending', outputSummary: { sourceVideoItemRunId: 'v' } }),
+        VU.questionsBelongToVideo({ id: 'v', finishedAt: new Date('2026-01-01T00:00:00Z') }, { status: 'completed', outputSummary: {}, finishedAt: new Date('2026-01-01T00:00:00.500Z') }),
+        VU.questionsBelongToVideo({ id: 'v', finishedAt: '2026-01-01T00:00:01Z' }, { status: 'completed', outputSummary: {}, finishedAt: '2026-01-01T00:00:00Z' }),
+        VU.questionsBelongToVideo({ id: 'v', finishedAt: null }, { status: 'completed', outputSummary: {}, finishedAt: '2026-01-01T00:00:00Z' }),
+      ], [true, false, false, true, false, false], 'regla');
+    });
+
     await check('I-1 empaquetado: un video real del upgrade cuyas preguntas siguen siendo las de la vista previa (upgrade cancelado antes) se OMITE (pendiente), nunca un H5P con preguntas de otro video', async () => {
       const PK = L('modules/dynamic-packaging/packaging-v3.js');
       const mf = { items: [{ key: 'video:x', type: 'video', chapterId: 'x' }, { key: 'video_interactions:x', type: 'video_interactions', chapterId: 'x' }] };
       const mk = (cascade) => new Map([
         ['video:x', { itemKey: 'video:x', type: 'video', artifacts: [{ artifactId: 'a1', itemRunId: 'gen2' }], outputSummary: { mode: 'real', regeneration: { reason: 'video_upgrade' } } }],
-        ['video_interactions:x', { itemKey: 'video_interactions:x', type: 'video_interactions', artifacts: [{ artifactId: 'a2', itemRunId: 'i' }], outputSummary: cascade ? { regeneration: { reason: 'cascade_from_video', cascadeFromItemRunId: cascade } } : {} }],
+        ['video_interactions:x', { itemKey: 'video_interactions:x', type: 'video_interactions', artifacts: [{ artifactId: 'a2', itemRunId: 'i' }], outputSummary: cascade ? { sourceVideoItemRunId: cascade } : {} }],
       ]);
       const opts = { videoUpgrade: true, upgradedKeys: new Set(['video:x']), fallbackMode: 'mock' };
       eq(PK.splitPendingVideosV3(mf, mk(null), 'real', opts).pendingVideos.map((p) => p.itemKey), ['video:x'], 'preguntas viejas → pendiente');

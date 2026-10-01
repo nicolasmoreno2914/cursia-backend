@@ -156,6 +156,28 @@ export class VideoModeInconsistentError extends Error {
 const TERMINAL_NOT_DONE = new Set(['failed', 'blocked', 'cancelled']);
 
 /**
+ * Fix round 3 (I-4) — procedencia EXPLÍCITA de las preguntas de un video. Toda generación de
+ * `video_interactions` registra `output_summary.sourceVideoItemRunId` = item run de la generación
+ * del video con la que se construyó (al crearla en un upgrade y, siempre, al reclamarla: el claim
+ * resuelve el video vigente). Regla ÚNICA (empaque, planificador y — espejo — el frontend):
+ * las preguntas son del video si y solo si están completadas y su `sourceVideoItemRunId` es la
+ * generación vigente del video; filas anteriores sin el campo se aceptan si y solo si completaron
+ * DESPUÉS de que completó esa generación del video.
+ */
+export function questionsBelongToVideo(
+  video: { id: string; finishedAt?: unknown },
+  questions: { status?: string | null; outputSummary?: any; finishedAt?: unknown } | null | undefined,
+): boolean {
+  if (!questions || questions.status !== 'completed') return false;
+  const src = questions.outputSummary?.sourceVideoItemRunId;
+  if (typeof src === 'string' && src) return src === video.id;
+  const ms = (v: unknown): number => (v instanceof Date ? v.getTime() : typeof v === 'string' ? Date.parse(v) : NaN);
+  const vf = ms(video.finishedAt);
+  const qf = ms(questions.finishedAt);
+  return Number.isFinite(vf) && Number.isFinite(qf) && qf >= vf;
+}
+
+/**
  * §2.6 — ¿el run terminó sin completar SOLO por items del upgrade de video? Recibe las filas de
  * la generación VIGENTE (más alta) de cada item que NO está completed, más el conjunto de keys
  * que tienen alguna generación completed. Pura.

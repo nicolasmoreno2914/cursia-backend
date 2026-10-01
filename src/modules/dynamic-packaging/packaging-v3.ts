@@ -36,6 +36,7 @@ import { assertSafeStoragePath } from '../artifacts/artifacts.service';
 import {
   VideoModeInconsistentError,
   fallbackVideoModeOf,
+  questionsBelongToVideo,
   runIsUpgradeOnlyFailure,
   upgradedVideoKeysOf,
   videoUpgradeOf,
@@ -94,6 +95,8 @@ export interface ResolvedItemV3 {
   type: ManifestItemType;
   artifacts: ResolvedArtifactV3[];
   outputSummary: Record<string, any>;
+  /** Fix round 3 (I-4): fin de la generación vigente (regla de procedencia de las preguntas, filas legacy). */
+  finishedAt?: unknown;
 }
 
 function parseJson(v: any): any {
@@ -123,7 +126,7 @@ export async function resolveRunArtifactsV3(q: QueryExecutor, runId: string, man
   }
   const rows: any[] = await q.query(
     `select gir.item_key as item_key, gir.id as item_run_id, gir.status as gir_status, gir.type as gir_type,
-            gir.output_summary as output_summary,
+            gir.output_summary as output_summary, gir.finished_at as finished_at,
             a.id as artifact_id, a.type as artifact_type, a.storage_bucket as storage_bucket,
             a.storage_path as storage_path, a.mime_type as mime_type, a.status as artifact_status, a.metadata as metadata
        from ${effectiveOutputRowsSql('$1')} gir
@@ -179,7 +182,9 @@ export async function resolveRunArtifactsV3(q: QueryExecutor, runId: string, man
         ...(m.artifact_status === 'stale' ? { status: 'stale' as const } : {}),
       });
     }
-    if (arts.length === roles.length) out.set(item.key, { itemKey: item.key, type: item.type, artifacts: arts, outputSummary: parseJson(list[0].output_summary) });
+    if (arts.length === roles.length) {
+      out.set(item.key, { itemKey: item.key, type: item.type, artifacts: arts, outputSummary: parseJson(list[0].output_summary), finishedAt: list[0].finished_at ?? null });
+    }
   }
   if (missing.length) throw new PackagingNotReadyError(missing);
   return out;
@@ -780,13 +785,14 @@ export function splitPendingVideosV3(
     if (!r) continue; // resolveRunArtifactsV3 ya exigió todos los items
     const chapterIdOf = String(it.chapterId ?? it.key.slice('video:'.length));
     if (isRealVideoOutput(r.outputSummary, opts.fallbackMode !== undefined ? opts.fallbackMode : runVideoMode)) {
-      // Fix round 1 (I-1): un video REAL de un upgrade cuyas preguntas todavía son las del video de vista
-      // previa (el upgrade se canceló antes de generarlas) NO se empaqueta con esas preguntas: queda
-      // pendiente hasta que se generen sus interacciones (reanudar el curso), nunca un H5P incoherente.
+      // Fix round 1 (I-1) / round 3 (I-4): un video REAL de un upgrade cuyas preguntas NO se
+      // construyeron con ESA generación del video (regla única de procedencia, video-upgrade.ts) NO
+      // se empaqueta con esas preguntas: queda pendiente, nunca un H5P incoherente.
       const vRunId = r.artifacts[0]?.itemRunId;
       const inter = byItem.get(`video_interactions:${chapterIdOf}`);
       const fromUpgrade = r.outputSummary?.regeneration?.reason === 'video_upgrade';
-      if (!fromUpgrade || !inter || inter.outputSummary?.regeneration?.cascadeFromItemRunId === vRunId) continue;
+      if (!fromUpgrade || !inter ||
+        questionsBelongToVideo({ id: String(vRunId), finishedAt: r.finishedAt }, { status: 'completed', outputSummary: inter.outputSummary, finishedAt: inter.finishedAt })) continue;
     }
     // Ruling 6 (B2): run real + item de vista previa solo es «pendiente» si un upgrade lo incluyó.
     if (runVideoMode === 'real' && (!opts.videoUpgrade || (opts.upgradedKeys && !opts.upgradedKeys.has(it.key)))) {

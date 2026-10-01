@@ -1030,7 +1030,7 @@ export class SchedulerService {
     videoItemKey: string,
   ): Promise<ReturnType<typeof videoClaimFacts>> {
     const [v] = await q.query(
-      `select d.output_summary, a.metadata
+      `select d.id as video_item_run_id, d.output_summary, a.metadata
          from public.generation_item_runs d
          left join public.artifacts a on a.item_run_id = d.id and a.type = 'dynamic_video'
         where d.job_id = $1 and d.manifest_id = $2 and d.item_key = $3 and d.status = 'completed'
@@ -1040,7 +1040,9 @@ export class SchedulerService {
       [jobId, manifestId, videoItemKey],
     );
     if (!v) return { ok: false, code: 'VIDEO_NOT_COMPLETED', message: `el video ${videoItemKey} no está completado` };
-    return videoClaimFacts({ videoItemKey, outputSummary: v.output_summary, artifactMetadata: v.metadata });
+    const facts = videoClaimFacts({ videoItemKey, outputSummary: v.output_summary, artifactMetadata: v.metadata });
+    if (facts.ok) (facts as any).videoItemRunId = v.video_item_run_id;
+    return facts;
   }
 
   /** Bloque `claimPayload` del ClaimedItem (solo rulesVersion 3 y tipos validados por el servidor). */
@@ -1078,6 +1080,17 @@ export class SchedulerService {
       const vf = await this.loadVideoFacts(qr, row.job_id, row.manifest_id, `video:${row.chapter_id}`);
       if (vf.ok === false) throw new ClaimPayloadUnavailable(vf.code, vf.message);
       out.video = vf.video;
+      // EV6 T5 fix round 3 (I-4): procedencia explícita — estas preguntas se construyen con ESTA
+      // generación del video (cualquier camino: generación inicial, «Regenerar», upgrade).
+      const src = (vf as any).videoItemRunId;
+      if (typeof src === 'string' && src) {
+        await qr.query(
+          `update public.generation_item_runs
+              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('sourceVideoItemRunId', $2::text)
+            where id = $1`,
+          [row.id, src],
+        );
+      }
     }
     return out;
   }

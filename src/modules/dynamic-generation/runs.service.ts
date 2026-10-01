@@ -111,6 +111,7 @@ import {
   VideoUpgradeRecord,
   fallbackVideoModeOf,
   isUpgradeGeneration,
+  questionsBelongToVideo,
   runIsUpgradeOnlyFailure,
   upgradedVideoKeysOf,
   videoModeInconsistentMessage,
@@ -2764,15 +2765,15 @@ export class RunsService {
           await insertGeneration(inter, {
             reason: VIDEO_UPGRADE_CASCADE_REASON, upgradeId: upgrade.id, fromItemRunId: inter.id, fromGeneration: Number(inter.generation),
             cascadeFromItemRunId: newId, cascadeFromItemKey: prev.item_key, costKind: 'llm', requestedBy: ownerId, requestedAt,
-          });
+          }, { sourceVideoItemRunId: newId });
         }
       }
-      // I-3: preguntas de videos reales ya pagados (solo LLM): describen ESE video (cascadeFromItemRunId).
+      // I-3: preguntas de videos reales ya pagados (solo LLM): describen ESE video (sourceVideoItemRunId).
       for (const x of plan.questionsOnly) {
         await insertGeneration(x.interactions, {
           reason: VIDEO_UPGRADE_CASCADE_REASON, upgradeId: upgrade.id, fromItemRunId: x.interactions.id, fromGeneration: Number(x.interactions.generation),
           cascadeFromItemRunId: x.video.id, cascadeFromItemKey: x.video.item_key, costKind: 'llm', questionsOnly: true, requestedBy: ownerId, requestedAt,
-        });
+        }, { sourceVideoItemRunId: x.video.id });
       }
       const note = JSON.stringify({ kind: VIDEO_UPGRADE_REASON, upgradeId: upgrade.id, requestedAt, affected: [...upgrade.itemKeys, ...upgrade.interactionKeys] });
       try {
@@ -2970,7 +2971,8 @@ export class RunsService {
     const questionsOnly: Array<{ video: any; interactions: any }> = [];
     for (const v of realUpgraded) {
       const ir = interByKey.get(`video_interactions:${v.chapter_id}`);
-      const own = ir.status === 'completed' && ir.output_summary?.regeneration?.cascadeFromItemRunId === v.id;
+      // Fix round 3 (I-4): regla única de procedencia (sourceVideoItemRunId, o legacy por fecha).
+      const own = questionsBelongToVideo({ id: v.id, finishedAt: v.finished_at }, { status: ir.status, outputSummary: ir.output_summary, finishedAt: ir.finished_at });
       const active = VIDEO_UPGRADE_IN_FLIGHT_STATES.includes(ir.status);
       if (!own && !active) questionsOnly.push({ video: v, interactions: ir });
     }
