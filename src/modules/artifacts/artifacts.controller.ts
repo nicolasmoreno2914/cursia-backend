@@ -10,7 +10,11 @@ import {
   HttpStatus,
   UseGuards,
   ParseUUIDPipe,
+  ForbiddenException,
+  NotFoundException,
 } from '@nestjs/common';
+import { isSuperAdminEmail } from '../../auth/super-admin';
+import { isAdminOnlyPackageArtifact } from '../dynamic-packaging/qa-package';
 import { ArtifactsService } from './artifacts.service';
 import { CreateArtifactDto } from './dto/create-artifact.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
@@ -52,7 +56,9 @@ export class ArtifactsController {
       type,
       jobId,
     });
-    return { ok: true, data: artifacts };
+    // EV6 DoD fix round 3 (N2): los .mbz QA / degradados NUEVOS no se listan a un no admin (ni su storagePath).
+    const admin = isSuperAdminEmail(user.email);
+    return { ok: true, data: admin ? artifacts : artifacts.filter((a) => !isAdminOnlyPackageArtifact(a)) };
   }
 
   /**
@@ -65,6 +71,8 @@ export class ArtifactsController {
     @CurrentUser() user: AuthUser,
   ) {
     const artifact = await this.artifactsService.findOne(id, user.id);
+    // EV6 DoD fix round 3 (N2): un .mbz QA / degradado NUEVO no existe para un no admin.
+    if (isAdminOnlyPackageArtifact(artifact) && !isSuperAdminEmail(user.email)) throw new NotFoundException(`Artifact ${id} not found`);
     return { ok: true, data: artifact };
   }
 
@@ -81,6 +89,15 @@ export class ArtifactsController {
     @Query('expires') expires?: string,
   ) {
     const expiresIn = expires ? parseInt(expires, 10) : 3600;
+    // EV6 DoD fix round 2 (M4): un .mbz de QA / degradado NUEVO (metadata.packageKind) es solo de
+    // SUPER_ADMIN también por esta ruta genérica. Los .mbz anteriores (sin el campo) no cambian.
+    const artifact = await this.artifactsService.findOne(id, user.id);
+    if (isAdminOnlyPackageArtifact(artifact) && !isSuperAdminEmail(user.email)) {
+      throw new ForbiddenException({
+        code: 'admin_recovery_only',
+        message: 'admin_recovery_only: este paquete es una copia interna de control de calidad (no entregable); solo un administrador de Cursia puede descargarlo.',
+      });
+    }
     const result = await this.artifactsService.getDownloadUrl(
       id,
       user.id,

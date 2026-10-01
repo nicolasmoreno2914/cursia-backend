@@ -304,7 +304,8 @@ export class CoherenceService {
    * anterior), excluyendo artifacts `disabled`.
    */
   private async loadRunInputs(job: any, manifest: ManifestDto, ownerId: string, blueprintNumber: number): Promise<RunCoherenceInputs> {
-    if (job.worker_status !== 'completed') {
+    // EV6 DoD: `preview` también es un run terminado con TODA su salida (solo algún componente es de vista previa).
+    if (job.worker_status !== 'completed' && job.worker_status !== 'preview') {
       throw new ConflictException(
         `La ejecución ${job.id} no está completada (worker_status=${job.worker_status}); la coherencia de contenido se ` +
           'calcula sobre un run terminado (nunca sobre salida parcial).',

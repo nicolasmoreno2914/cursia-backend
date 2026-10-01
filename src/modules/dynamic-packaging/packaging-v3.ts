@@ -125,7 +125,9 @@ export async function resolveRunArtifactsV3(q: QueryExecutor, runId: string, man
   job.input_payload = parseJson(job.input_payload);
   // EV6 T5 B2 (§2.6): un run que terminó sin completar SOLO por videos del upgrade se empaqueta igual
   // (esos capítulos quedan con su video pendiente: la generación completada vigente es la de vista previa).
-  if (job.worker_status !== 'completed' && job.status !== 'completed' && !(await runIsUpgradeOnlyFailure(q, job))) {
+  // EV6 DoD: `preview` (todo completado, algún componente de vista previa) se resuelve igual; su paquete es QA.
+  const done = ['completed', 'preview'].includes(String(job.worker_status)) || ['completed', 'preview'].includes(String(job.status));
+  if (!done && !(await runIsUpgradeOnlyFailure(q, job))) {
     throw new PackagingNotReadyError([`run:${runId}:not_completed:worker_status=${job.worker_status},status=${job.status}`]);
   }
   const rows: any[] = await q.query(

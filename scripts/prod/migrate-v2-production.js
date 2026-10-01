@@ -190,6 +190,7 @@ const EXCLUDED = [
   { file: 'supabase-migration-p2-content-worker.sql', reason: 'legacy (P2.1), ya aplicada en producción' },
   { file: 'supabase-migration-brand-extraction-execution-mode.sql', reason: 'legacy, no V2' },
   { file: 'supabase-migration-dashboard-course-costs.sql', reason: 'legacy, no V2' },
+  { file: 'supabase-migration-ev6-dod-preview-status.sql', reason: "EV6 DoD: el CHECK de worker_status con 'preview' lo aplica el PASO 0 (scripts/lib/production-jobs-constraints.js, misma lista); este .sql es su equivalente manual" },
 ];
 
 // M2 (fix wave): cada paso fija SUS PROPIOS timeouts antes del .sql (el .sql

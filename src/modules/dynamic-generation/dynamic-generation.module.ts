@@ -15,6 +15,8 @@ import { ArtifactsModule } from '../artifacts/artifacts.module';
 import { ArtifactsService } from '../artifacts/artifacts.service';
 import { ArtifactsServiceTextReader, V3_ARTIFACT_TEXT_READER } from './v3-artifact-reader';
 import { FinopsModule } from '../finops/finops.module';
+import { AdminDynamicRunsController } from './admin-runs.controller';
+import { AdminRecoveryService } from './admin-recovery.service';
 
 /**
  * Generación dinámica (Fase 5A): runs sobre un Generation Manifest. No
@@ -32,9 +34,10 @@ import { FinopsModule } from '../finops/finops.module';
     ArtifactsModule,           // V2.1 R11a: lector de artifacts para validar items LLM v3 al completar
     FinopsModule,              // V2.1 RF-b: estimado + gates de presupuesto (FinopsBudgetService)
   ],
-  controllers: [RunsController, ExecutorController, DynamicYoutubeController],
+  controllers: [RunsController, ExecutorController, DynamicYoutubeController, AdminDynamicRunsController],
   providers: [
     RunsService,
+    AdminRecoveryService, // EV6 DoD BE-B: cola de recuperación de admin (solo lectura)
     SchedulerService,
     DynamicYoutubePreflightService,
     {

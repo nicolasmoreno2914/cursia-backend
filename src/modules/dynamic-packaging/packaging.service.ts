@@ -1,23 +1,41 @@
 import { BadRequestException, ConflictException, Injectable, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common';
 import { effectiveOutputRowsSql } from '../dynamic-generation/item-generations';
-import { ACTIVE_RUN_WORKER_STATUSES } from '../dynamic-generation/item-transitions';
 import { DataSource } from 'typeorm';
 import { GenerationManifestsService, ManifestDto } from '../generation-manifests/generation-manifests.service';
 import { ArtifactsService } from '../artifacts/artifacts.service';
 import { MOCK_VIDEO_NOT_PACKAGEABLE, resolveRunArtifacts } from './artifact-resolver';
 import { PackagingNotReadyError } from './packaging-types';
 import { frozenVideoDeliveryOf, youtubeDeliveryProblems } from '../dynamic-generation/dynamic-video-delivery';
-import { packageReuseHash, resolveDynamicMoodleVersion, sortedArtifactIds } from './packaging-reuse-key';
-import { DYNAMIC_MBZ_BUILDER_VERSION } from '../../package/dynamic-mbz-builder';
-import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
+import { resolveDynamicMoodleVersion } from './packaging-reuse-key';
+import { assertDynamicOwnerAllowed, isVideoPreviewAllowed } from '../features/dynamic-features';
 import { isRealVideoOutput, prepareV3Package } from './packaging-v3';
 import { VIDEO_MODE_INCONSISTENT, fallbackVideoModeOf, runIsUpgradeOnlyFailure } from '../dynamic-generation/video-upgrade';
 import { MOCK_ARTIFACT_IN_REAL_RUN } from './packaging-guards';
-import { DYNAMIC_MBZ_BUILDER_VERSION_V3 } from '../../package/dynamic-mbz-builder-v3';
+import { isSuperAdminEmail } from '../../auth/super-admin';
+import { evaluateRunCompletion, loadCompletionInputs } from '../dynamic-generation/run-completion';
+import {
+  BuildFreshness,
+  PackageKind,
+  QA_PACKAGE_FILENAME_PREFIX,
+  buildPackageFreshness,
+  isDeliverableKind,
+  packageKindOf,
+} from './package-freshness';
 
 export const EXECUTION_MODE = 'dynamic_package';
-/** worker_status del job de run (dynamic_generation) que cuentan como "terminado con éxito". */
+/** worker_status de un job de PAQUETE terminado con éxito. */
 const RUN_DONE_STATUS = 'completed';
+/**
+ * EV6 DoD (BE-A): un run con componentes de vista previa (video o Gamma/TTS mock) no produce un
+ * paquete entregable. Sin el escape de QA (DYNAMIC_ALLOW_VIDEO_PREVIEW=true) + SUPER_ADMIN → 409.
+ */
+export const PREVIEW_NOT_DELIVERABLE = 'preview_not_deliverable';
+
+/** Quién pide el paquete (los paquetes QA / degradados son solo de SUPER_ADMIN). */
+export interface PackageActor {
+  id?: string | null;
+  email?: string | null;
+}
 /** worker_status del job de package en curso — una segunda POST reutiliza el mismo job sin crear otro. */
 const IN_PROGRESS_PACKAGE_STATUSES = ['queued', 'running', 'retrying'];
 // worker_status terminal-fallido ('failed', 'failed_retryable', 'cancelled') y cualquier otro
@@ -47,6 +65,9 @@ export interface RequestPackageResult {
   jobId: string;
   status: string;
   created: boolean;
+  /** EV6 DoD: `final` (entregable) | `qa_preview` | `degraded` (QA, nunca entregable). */
+  packageKind: PackageKind;
+  deliverable: boolean;
 }
 
 export interface PackageStatusResult {
@@ -72,12 +93,25 @@ export interface PackageStatusResult {
    * reales). La UI muestra «Este curso contiene videos pendientes de generación…».
    */
   pendingVideos?: Array<{ itemKey: string; chapterId: string; chapterNumber: number | null }>;
+  /**
+   * EV6 DoD: tipo de paquete. Solo `final` es entregable al cliente; `qa_preview` (run de vista
+   * previa) y `degraded` (§2.6) son paquetes de QA rotulados «QA — vista previa, no entregable».
+   * Paquetes anteriores sin el campo: inferido de su resumen (videos omitidos / mocks → qa_preview).
+   */
+  packageKind: PackageKind;
+  deliverable: boolean;
+  /** Nombre sugerido para la descarga (`QA-VISTA-PREVIA-…` si no es entregable). */
+  downloadFilename?: string;
+  /** EV6 DoD: el curso está COMPLETO = paquete entregable, vigente y completado. */
+  complete: boolean;
+  /** Fix round 2 (M4): paquete QA/degradado nuevo pedido por un no admin → sin artifactId ni URL. */
+  downloadRestricted?: boolean;
 }
 
-interface BuildFreshness {
-  stale: boolean;
-  reason?: string;
-  staleItemKeys?: string[];
+/** Fix round 2 (M4): job de paquete QA / degradado DECLARADO (los nuevos; los anteriores no tienen el campo). */
+export function isAdminOnlyPackageJob(job: { input_payload?: any } | null | undefined): boolean {
+  const k = job?.input_payload?.packageKind;
+  return k === 'qa_preview' || k === 'degraded';
 }
 
 /**
@@ -118,36 +152,85 @@ export class PackagingService {
    * - Un job `failed`/`failed_retryable`/`cancelled` NUNCA se reusa — un job
    *   huérfano o fallido no debe bloquear un reintento.
    */
-  async requestPackage(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<RequestPackageResult> {
+  async requestPackage(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+    runId: string,
+    actor?: PackageActor,
+    /** EV6 DoD BE-B: pedido del empaque AUTOMÁTICO (sistema): solo un paquete `final`, nunca QA. */
+    opts: { auto?: boolean } = {},
+  ): Promise<RequestPackageResult> {
+    // Fix round 1 (I2): un SUPER_ADMIN pide el paquete (QA / degradado) sobre el curso de cualquier owner.
+    ownerId = await this.ownerForActor(courseId, ownerId, actor);
     // G3: flag V2 + allow-list por owner (403 antes de tocar la DB).
     assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     const run = await this.loadRunRow(courseId, manifest, runId);
-    await this.assertRunReady(run, manifest);
+    const packageKind = await this.assertRunReady(run, manifest, actor);
+    const deliverable = isDeliverableKind(packageKind);
+    if (opts.auto && packageKind !== 'final') {
+      throw this.previewNotDeliverable(run.id, [], 'el empaque automático solo arma el paquete final entregable');
+    }
     if (manifest.rulesVersion === 2) await this.assertV2ArtifactsResolvable(run, manifest);
     // V2.1 R12: rulesVersion 3 — artifacts completos, sin mocks en runs reales, video en YouTube y perfil
     // aplicable, TODO antes de encolar (409 con la lista). Nunca se empaqueta un v3 con las reglas v1/v2.
     if (manifest.rulesVersion === 3) await this.prepareV3OrConflict(run, manifest);
 
-    const existing = await this.findLatestPackageJob(runId);
-    if (existing) {
-      if (IN_PROGRESS_PACKAGE_STATUSES.includes(existing.worker_status)) {
-        return { jobId: existing.id, status: existing.worker_status, created: false };
-      }
-      if (existing.worker_status === RUN_DONE_STATUS) {
-        const sameBuild = await this.isSameBuild(run, manifest, existing);
-        if (sameBuild) {
-          return { jobId: existing.id, status: existing.worker_status, created: false };
+    // EV6 DoD BE-B: get-or-create SERIALIZADO por run (lock de transacción): el disparo automático, el
+    // barrido y un pedido manual simultáneos nunca crean dos jobs para el mismo build.
+    // Fix round 1 (M3): la comparación de build (pesada, con su propia conexión) se calcula ANTES del lock;
+    // bajo el lock solo se usa si el último job sigue siendo el mismo (si no, se recalcula: caso raro).
+    const pre = await this.findLatestPackageJob(runId);
+    const preSame = pre && packageKindOf(pre) === packageKind && pre.worker_status === RUN_DONE_STATUS
+      ? { id: pre.id, same: await this.isSameBuild(run, manifest, pre) }
+      : null;
+    const qr = this.dataSource.createQueryRunner();
+    try {
+      await qr.connect();
+      await qr.startTransaction();
+      await qr.query('select pg_advisory_xact_lock(hashtextextended($1, 0))', [`dynamic_package_request:${runId}`]);
+      const existing = await this.findLatestPackageJob(runId, qr);
+      let reuse: RequestPackageResult | null = null;
+      // EV6 DoD: un job se reusa solo si es del MISMO tipo (un paquete QA nunca pasa por final ni al revés).
+      if (existing && packageKindOf(existing) === packageKind) {
+        if (IN_PROGRESS_PACKAGE_STATUSES.includes(existing.worker_status)) {
+          reuse = { jobId: existing.id, status: existing.worker_status, created: false, packageKind, deliverable };
+        } else if (existing.worker_status === RUN_DONE_STATUS) {
+          const sameBuild = preSame && preSame.id === existing.id ? preSame.same : await this.isSameBuild(run, manifest, existing);
+          if (sameBuild) {
+            reuse = { jobId: existing.id, status: existing.worker_status, created: false, packageKind, deliverable };
+          } else {
+            this.logger.log(
+              `requestPackage: job ${existing.id} completado con un build distinto (builderVersion u origen de artifacts cambió) — se crea un job nuevo para runId=${runId}`,
+            );
+          }
         }
-        this.logger.log(
-          `requestPackage: job ${existing.id} completado con un build distinto (builderVersion u origen de artifacts cambió) — se crea un job nuevo para runId=${runId}`,
-        );
+        // FAILED_PACKAGE_STATUSES u otro status no contemplado: no se reusa, se crea uno nuevo.
       }
-      // FAILED_PACKAGE_STATUSES u otro status no contemplado: no se reusa, se crea uno nuevo.
+      if (reuse) {
+        await qr.commitTransaction();
+        return reuse;
+      }
+      const jobId = await this.insertPackageJob(run, manifest, blueprintNumber, runId, packageKind, actor?.id ?? null, qr, opts.auto === true);
+      await qr.commitTransaction();
+      return { jobId, status: 'queued', created: true, packageKind, deliverable };
+    } catch (err) {
+      if (qr.isTransactionActive) {
+        try {
+          await qr.rollbackTransaction();
+        } catch {
+          /* se conserva el error original */
+        }
+      }
+      throw err;
+    } finally {
+      try {
+        await qr.release();
+      } catch {
+        /* conexión ya liberada o nunca obtenida */
+      }
     }
-
-    const jobId = await this.insertPackageJob(run, manifest, blueprintNumber, runId);
-    return { jobId, status: 'queued', created: true };
   }
 
   /**
@@ -161,102 +244,12 @@ export class PackagingService {
   }
 
   /**
-   * F78-BE2: compara el job `completed` contra el build que saldría HOY del
-   * run: mismo `builderVersion` y misma clave de reuse (packageReuseHash sobre
-   * los artifacts resueltos con la generación completed vigente de cada item
-   * — el mismo resolver que usa el worker). Fuente única para el reuse de
-   * requestPackage y el `stale` de getPackageStatus.
+   * F78-BE2: compara el job `completed` contra el build que saldría HOY del run (misma clave de
+   * reuse que el worker). EV6 DoD: la lógica vive en package-freshness.ts (la comparte
+   * RunsService para `RunDto.completion.packageReady`).
    */
   private async buildFreshness(run: any, manifest: ManifestDto, existing: PackageJobRow): Promise<BuildFreshness> {
-    if (manifest.rulesVersion === 3) return this.buildFreshnessV3(run, manifest, existing);
-    const runDone = run.worker_status === RUN_DONE_STATUS || run.status === RUN_DONE_STATUS;
-    if (!runDone) {
-      // Fix wave M1: activo (regenerando) ≠ terminado sin completar (p.ej. una regeneración falló).
-      if (ACTIVE_RUN_WORKER_STATUSES.includes(String(run.worker_status))) {
-        return { stale: true, reason: `run_in_progress: la ejecución está ${run.worker_status} (hay items regenerándose); el paquete puede no incluir su salida nueva` };
-      }
-      return { stale: true, reason: `run_not_completed: la ejecución terminó en ${run.worker_status} (p.ej. una regeneración falló); reintenta los items fallidos` };
-    }
-    const existingBuilderVersion = existing.output_summary?.builderVersion;
-    if (existingBuilderVersion !== DYNAMIC_MBZ_BUILDER_VERSION) {
-      return { stale: true, reason: `builder_changed: el paquete se construyó con el builder ${existingBuilderVersion ?? '?'} (actual ${DYNAMIC_MBZ_BUILDER_VERSION})` };
-    }
-    try {
-      const byItem = await resolveRunArtifacts({ query: this.dataSource.query.bind(this.dataSource) }, run.id, manifest.manifest);
-      const ids = sortedArtifactIds(byItem);
-      // I3 (review-it2): misma clave que el worker (incluye la versión de
-      // Moodle resuelta; idéntica a la de antes con la versión default). Un
-      // DYNAMIC_MBZ_MOODLE_VERSION inválido lanza acá → stale → el job
-      // nuevo falla ruidoso en el worker con el mensaje de config.
-      const currentHash = packageReuseHash(DYNAMIC_MBZ_BUILDER_VERSION, ids, resolveDynamicMoodleVersion().resolved);
-      if (currentHash === existing.output_summary?.sourceIdsHash) return { stale: false };
-      const packaged = new Set<string>(Array.isArray(existing.output_summary?.sourceArtifactIds) ? existing.output_summary.sourceArtifactIds : []);
-      const staleItemKeys = [...byItem.entries()]
-        .filter(([, list]) => list.some((a) => !packaged.has(a.artifactId)))
-        .map(([key]) => key)
-        .sort();
-      if (staleItemKeys.length === 0) {
-        // Fix wave M2: mismos artifacts y mismo builder → lo único que cambió es la versión de Moodle de la clave.
-        return {
-          stale: true,
-          reason: `moodle_version_changed: el paquete se construyó para Moodle ${existing.output_summary?.moodleVersion ?? '4.1'} (actual ${resolveDynamicMoodleVersion().resolved})`,
-        };
-      }
-      return {
-        stale: true,
-        reason: `sources_changed: ${staleItemKeys.length} item(s) tienen salida más nueva que el paquete (p.ej. se regeneraron después de empaquetar)`,
-        staleItemKeys,
-      };
-    } catch (err) {
-      // Si el run ya no resuelve limpio (p.ej. artifacts borrados), no se
-      // puede confirmar que sea el mismo build — nunca se lo presenta como vigente.
-      const detail = err instanceof Error ? err.message : String(err);
-      this.logger.warn(`buildFreshness: no se pudo resolver artifacts para runId=${run.id}: ${detail}`);
-      return { stale: true, reason: `artifacts_unresolvable: ${detail.slice(0, 300)}` };
-    }
-  }
-
-  /**
-   * V2.1 R12: ¿el paquete v3 completado sigue siendo el vigente? Misma clave que
-   * el worker (`prepareV3Package`): cambian los artifacts, el tema, la nota
-   * mínima/perfil, el builder, el renderer, el perfil H5P o la versión de Moodle
-   * → stale (y POST …/package arma uno nuevo, sin generar nada).
-   */
-  private async buildFreshnessV3(run: any, manifest: ManifestDto, existing: PackageJobRow): Promise<BuildFreshness> {
-    const runDone = run.worker_status === RUN_DONE_STATUS || run.status === RUN_DONE_STATUS ||
-      (await runIsUpgradeOnlyFailure({ query: this.dataSource.query.bind(this.dataSource) }, run));
-    if (!runDone) {
-      if (ACTIVE_RUN_WORKER_STATUSES.includes(String(run.worker_status))) {
-        return { stale: true, reason: `run_in_progress: la ejecución está ${run.worker_status} (hay items regenerándose); el paquete puede no incluir su salida nueva` };
-      }
-      return { stale: true, reason: `run_not_completed: la ejecución terminó en ${run.worker_status} (p.ej. una regeneración falló); reintenta los items fallidos` };
-    }
-    const existingBuilderVersion = existing.output_summary?.builderVersion;
-    if (existingBuilderVersion !== DYNAMIC_MBZ_BUILDER_VERSION_V3) {
-      return { stale: true, reason: `builder_changed: el paquete se construyó con el builder ${existingBuilderVersion ?? '?'} (actual ${DYNAMIC_MBZ_BUILDER_VERSION_V3})` };
-    }
-    try {
-      const prepared = await prepareV3Package(
-        { query: this.dataSource.query.bind(this.dataSource) }, run.id, manifest, run.course_id, resolveDynamicMoodleVersion().resolved,
-      );
-      if (prepared.sourceIdsHash === existing.output_summary?.sourceIdsHash) return { stale: false };
-      const packaged = new Set<string>(Array.isArray(existing.output_summary?.sourceArtifactIds) ? existing.output_summary.sourceArtifactIds : []);
-      const staleItemKeys = [...prepared.byItem.entries()]
-        .filter(([, it]) => it.artifacts.some((a) => !packaged.has(a.artifactId)))
-        .map(([key]) => key)
-        .sort();
-      if (staleItemKeys.length) {
-        return { stale: true, reason: `sources_changed: ${staleItemKeys.length} item(s) tienen salida más nueva que el paquete`, staleItemKeys };
-      }
-      return {
-        stale: true,
-        reason: 'profile_or_theme_changed: cambió el perfil de evaluación, el tema, el renderer o la versión de Moodle desde que se armó el paquete (se re-empaqueta sin generar nada)',
-      };
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      this.logger.warn(`buildFreshnessV3: no se pudo preparar el paquete v3 del run ${run.id}: ${detail}`);
-      return { stale: true, reason: `artifacts_unresolvable: ${detail.slice(0, 300)}` };
-    }
+    return buildPackageFreshness({ query: this.dataSource.query.bind(this.dataSource) }, run, manifest, existing, this.logger);
   }
 
   /** 409 (con la lista) si el run v3 no se puede empaquetar tal como está. */
@@ -280,18 +273,30 @@ export class PackagingService {
   }
 
   /** GET …/runs/:runId/package. */
-  async getPackageStatus(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<PackageStatusResult> {
+  async getPackageStatus(courseId: number, ownerId: string, blueprintNumber: number, runId: string, actor?: PackageActor): Promise<PackageStatusResult> {
+    // Fix round 1 (I2): un SUPER_ADMIN lee (y descarga) el paquete del curso de cualquier owner.
+    ownerId = await this.ownerForActor(courseId, ownerId, actor);
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     const run = await this.loadRunRow(courseId, manifest, runId); // valida ownership + que el run pertenezca al curso/Manifest
 
-    const job = await this.findLatestPackageJob(runId);
+    let job = await this.findLatestPackageJob(runId);
     if (!job) {
       throw new NotFoundException(`No hay ningún empaquetado iniciado para la ejecución ${runId}`);
     }
+    // Fix round 3 (N3): a un no admin, un job QA / degradado nuevo (solo admin) no le tapa el paquete FINAL
+    // completado más reciente del run (si existe): ve ese.
+    if (isAdminOnlyPackageJob(job) && !isSuperAdminEmail(actor?.email)) {
+      const fin = await this.findLatestCompletedFinalJob(runId);
+      if (fin) job = fin;
+    }
 
-    const result: PackageStatusResult = { status: job.worker_status, stale: false };
+    const packageKind = packageKindOf(job);
+    const deliverable = isDeliverableKind(packageKind);
+    const result: PackageStatusResult = { status: job.worker_status, stale: false, packageKind, deliverable, complete: false };
     if (Array.isArray(job.output_summary?.pendingVideos)) result.pendingVideos = job.output_summary.pendingVideos;
     if (job.worker_status === 'completed') {
+      const base = `${String(job.output_summary?.sourceIdsHash ?? job.id)}.mbz`;
+      result.downloadFilename = deliverable ? base : `${QA_PACKAGE_FILENAME_PREFIX}${base}`;
       // F78-BE2: nunca devolver un paquete desactualizado como si fuera el vigente.
       const fresh = await this.buildFreshness(run, manifest, job);
       if (fresh.stale) {
@@ -300,7 +305,12 @@ export class PackagingService {
         if (fresh.staleItemKeys) result.staleItemKeys = fresh.staleItemKeys;
       }
       const artifactId = job.output_summary?.artifactId as string | undefined;
-      if (artifactId) {
+      // Fix round 2 (M4): un paquete QA / degradado NUEVO (declarado en el job por PackagingService) es
+      // solo de SUPER_ADMIN, también para descargar. Los paquetes ya construidos antes (sin packageKind
+      // declarado, p.ej. B1) siguen descargables por su dueño, sin cambios (el DTO los marca no entregables).
+      if (artifactId && isAdminOnlyPackageJob(job) && !isSuperAdminEmail(actor?.email)) {
+        result.downloadRestricted = true;
+      } else if (artifactId) {
         result.artifactId = artifactId;
         try {
           const { url } = await this.artifacts.getDownloadUrl(artifactId, ownerId, DOWNLOAD_URL_TTL_SECONDS);
@@ -325,10 +335,23 @@ export class PackagingService {
     // signing — un job fallido es un problema más grave que no poder firmar
     // la URL de un job completado.
     if (job.error_message) result.error = job.error_message;
+    // EV6 DoD: «curso completo» = paquete ENTREGABLE, vigente y completado de un run cuya generación
+    // está completa (todo real y validado). Un paquete QA / degradado / viejo de vista previa nunca.
+    if (job.worker_status === 'completed' && deliverable && !result.stale && !!result.artifactId) {
+      const inputs = await loadCompletionInputs({ query: this.dataSource.query.bind(this.dataSource) }, run.id);
+      result.complete = !!inputs && evaluateRunCompletion(inputs.job, inputs.rows, inputs.manifest, { ready: true }, { validationCutoffs: inputs.validationCutoffs }).complete;
+    }
     return result;
   }
 
   // ── internals ────────────────────────────────────────────────────────────
+
+  /** Fix round 1 (I2): dueño real del curso cuando actúa un SUPER_ADMIN; si no, el propio usuario (sin cambios). */
+  private async ownerForActor(courseId: number, ownerId: string, actor?: PackageActor): Promise<string> {
+    if (!isSuperAdminEmail(actor?.email)) return ownerId;
+    const [c] = await this.dataSource.query(`select owner_id from public.courses where id = $1`, [courseId]);
+    return c?.owner_id ? String(c.owner_id) : ownerId;
+  }
 
   /**
    * Manifest congelado del run (input_payload.manifestId), no el "actual" de
@@ -387,8 +410,14 @@ export class PackagingService {
     return row;
   }
 
-  /** 409 con `missing[]` si el run no terminó `completed` o hay items sin completar (falla fuerte, spec §"Trampas"). */
-  private async assertRunReady(run: any, manifest: ManifestDto): Promise<void> {
+  /**
+   * 409 con `missing[]` si el run no terminó `completed` o hay items sin completar (falla fuerte,
+   * spec §"Trampas"). EV6 DoD (BE-A): devuelve el TIPO de paquete que corresponde —
+   * `final` (todo real), `qa_preview` (run con componentes de vista previa: solo SUPER_ADMIN y con
+   * DYNAMIC_ALLOW_VIDEO_PREVIEW=true; si no 409 `preview_not_deliverable`) o `degraded` (§2.6:
+   * upgrade de videos fallido, solo SUPER_ADMIN). Público para los checks.
+   */
+  async assertRunReady(run: any, manifest: ManifestDto, actor?: PackageActor): Promise<PackageKind> {
     // I4 (integral-review): un run con videoMode='mock' (el default en
     // staging) nunca se empaqueta — el .mbz saldría "completed" con
     // actividades url que apuntan a mock-cdn.cursia.local. Falla fuerte y
@@ -418,9 +447,11 @@ export class PackagingService {
       .map((it) => it.key);
 
     // EV6 T5 B2 (§2.6): run terminado solo con videos del upgrade fallidos → se empaqueta (pendientes).
-    const upgradeOnlyFailure = manifest.rulesVersion === 3 && run.worker_status !== RUN_DONE_STATUS && missing.length === 0 &&
+    // EV6 DoD: `preview` es un run terminado (todos sus items completados) — su paquete es solo QA.
+    const runDone = run.worker_status === 'completed' || (manifest.rulesVersion === 3 && run.worker_status === 'preview');
+    const upgradeOnlyFailure = manifest.rulesVersion === 3 && !runDone && missing.length === 0 &&
       (await runIsUpgradeOnlyFailure({ query: this.dataSource.query.bind(this.dataSource) }, run));
-    if ((run.worker_status !== RUN_DONE_STATUS && !upgradeOnlyFailure) || missing.length > 0) {
+    if ((!runDone && !upgradeOnlyFailure) || missing.length > 0) {
       // El filtro global de excepciones (AllExceptionsFilter) aplana
       // `exception.getResponse()` a un string (`error: message.message`) y
       // descarta cualquier otro campo — así que `missing` viaja también
@@ -459,10 +490,72 @@ export class PackagingService {
         throw new ConflictException({ message, missing: ytMissing, code: 'youtube_delivery_incomplete' });
       }
     }
+    if (manifest.rulesVersion !== 3) {
+      // Fix round 3 (N4): v1/v2 tampoco dan un paquete FINAL sin la generación completa (no tienen QA).
+      const inputs = await loadCompletionInputs({ query: this.dataSource.query.bind(this.dataSource) }, run.id);
+      const c = inputs ? evaluateRunCompletion(inputs.job, inputs.rows, inputs.manifest, null, { validationCutoffs: inputs.validationCutoffs }) : null;
+      if (!c || !c.generationComplete) {
+        throw this.previewNotDeliverable(run.id, c ? c.missingComponents : [], 'la generación del curso no está completa (componentes de vista previa o sin validar)');
+      }
+      return 'final';
+    }
+    return this.packageKindFor(run, manifest, upgradeOnlyFailure, actor);
   }
 
-  private async findLatestPackageJob(runId: string): Promise<PackageJobRow | null> {
-    const [row] = await this.dataSource.query(
+  /**
+   * EV6 DoD (R4): ¿qué paquete se puede armar para este run v3 y quién puede pedirlo?
+   * - todos los componentes reales → `final` (byte-idéntico a antes);
+   * - §2.6 (upgrade de videos fallido) → `degraded`, solo SUPER_ADMIN;
+   * - algún componente de vista previa (videos o Gamma/TTS mock) → `qa_preview`, solo SUPER_ADMIN
+   *   con DYNAMIC_ALLOW_VIDEO_PREVIEW=true. Si no → 409 `preview_not_deliverable` (nada encolado).
+   */
+  private async packageKindFor(run: any, manifest: ManifestDto, upgradeOnlyFailure: boolean, actor?: PackageActor): Promise<PackageKind> {
+    const inputs = await loadCompletionInputs({ query: this.dataSource.query.bind(this.dataSource) }, run.id);
+    // Fix round 1 (M2/I3): sin datos para evaluar → nunca un paquete entregable (fail closed).
+    if (!inputs) throw this.previewNotDeliverable(run.id, [], 'no se pudo evaluar la completitud del curso (integridad)');
+    const completion = evaluateRunCompletion(inputs.job, inputs.rows, inputs.manifest, null, { upgradeOnlyFailure, validationCutoffs: inputs.validationCutoffs });
+    const preview = completion.previewComponents;
+    const admin = isSuperAdminEmail(actor?.email);
+    if (upgradeOnlyFailure) {
+      if (admin) return 'degraded';
+      throw this.previewNotDeliverable(run.id, preview, 'el curso tiene videos que no se pudieron generar; el paquete con videos pendientes es solo para un administrador de Cursia');
+    }
+    // Fix round 1 (I3): un paquete FINAL (entregable) exige la generación COMPLETA: todo real y validado.
+    if (completion.generationComplete) return 'final';
+    const unvalidated = completion.missingComponents.filter((k) => !preview.includes(k));
+    if (unvalidated.length === 0) {
+      if (admin && isVideoPreviewAllowed()) return 'qa_preview';
+      throw this.previewNotDeliverable(run.id, preview, 'el curso tiene componentes de vista previa (simulados); no se entrega un paquete sin todos sus componentes reales');
+    }
+    // Componentes completados SIN su validación (p.ej. filas anteriores a la validación del servidor):
+    // nunca entregable; un administrador puede armar un paquete degradado rotulado QA para revisarlo.
+    if (admin) return 'degraded';
+    throw this.previewNotDeliverable(run.id, completion.missingComponents,
+      `el curso tiene componentes sin validar (${unvalidated.length}); el paquete entregable exige todos los componentes reales y validados`);
+  }
+
+  private previewNotDeliverable(runId: string, preview: string[], why: string): ConflictException {
+    const message =
+      `${PREVIEW_NOT_DELIVERABLE}: ${why}. La ejecución ${runId} no se empaqueta como curso entregable ` +
+      `(${preview.length} componente(s) de vista previa) missingJson=${JSON.stringify(preview)}`;
+    return new ConflictException({ message, missing: preview, code: PREVIEW_NOT_DELIVERABLE });
+  }
+
+  /** Fix round 3 (N3): el job FINAL completado más reciente del run (o null). */
+  private async findLatestCompletedFinalJob(runId: string): Promise<PackageJobRow | null> {
+    const rows: PackageJobRow[] = await this.dataSource.query(
+      `select id, owner_id, course_id, worker_status, status, input_payload, output_summary, error_message
+         from public.production_jobs
+        where execution_mode = $1 and input_payload->>'runId' = $2 and worker_status = 'completed'
+        order by created_at desc, id desc
+        limit 20`,
+      [EXECUTION_MODE, runId],
+    );
+    return rows.find((j) => isDeliverableKind(packageKindOf(j))) ?? null;
+  }
+
+  private async findLatestPackageJob(runId: string, q: { query: (sql: string, params?: any[]) => Promise<any> } = this.dataSource): Promise<PackageJobRow | null> {
+    const [row] = await q.query(
       `select id, owner_id, course_id, worker_status, status, input_payload, output_summary, error_message
          from public.production_jobs
         where execution_mode = $1 and input_payload->>'runId' = $2
@@ -473,9 +566,25 @@ export class PackagingService {
     return row ?? null;
   }
 
-  private async insertPackageJob(run: any, manifest: ManifestDto, blueprintNumber: number, runId: string): Promise<string> {
-    const inputPayload = { runId, manifestId: manifest.id, blueprintNumber };
-    const [job] = await this.dataSource.query(
+  private async insertPackageJob(
+    run: any,
+    manifest: ManifestDto,
+    blueprintNumber: number,
+    runId: string,
+    packageKind: PackageKind = 'final',
+    requestedBy?: string | null,
+    q: { query: (sql: string, params?: any[]) => Promise<any> } = this.dataSource,
+    auto = false,
+  ): Promise<string> {
+    // EV6 DoD: un paquete final conserva el input_payload de siempre; QA / degradado lo declaran.
+    // BE-B: el job del empaque automático lo declara (`auto:true`, auditoría); el build y la clave de
+    // reuse no dependen del input_payload (mismo .mbz).
+    const inputPayload = {
+      runId, manifestId: manifest.id, blueprintNumber,
+      ...(packageKind !== 'final' ? { packageKind, ...(requestedBy ? { requestedBy } : {}) } : {}),
+      ...(auto ? { auto: true } : {}),
+    };
+    const [job] = await q.query(
       `insert into public.production_jobs
          (owner_id, course_id, frontend_course_id, execution_mode, status, worker_status, current_step,
           progress, blueprint_version_id, input_payload, output_summary, options, result,

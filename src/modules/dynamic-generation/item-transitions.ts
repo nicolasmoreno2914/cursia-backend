@@ -1,6 +1,7 @@
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
 import { latestGenerationPredicate } from './item-generations';
+import { evaluateRunCompletion, loadCompletionInputs, terminalStatusFor } from './run-completion';
 
 /**
  * Transiciones de estado de items/run compartidas por RunsService (lecturas:
@@ -12,6 +13,30 @@ import { latestGenerationPredicate } from './item-generations';
  * estas funciones debe tener ya bloqueada la fila del run en
  * production_jobs (FOR UPDATE) antes de tocar items.
  */
+
+/**
+ * EV6 DoD BE-B — runs que pasaron a `completed` dentro de una transacción. El empaque automático NO se
+ * encola adentro de la transacción (podría deshacerse después de encolar): `recomputeRunStatus` solo
+ * anota el run acá y `RunsService.tx` lo entrega a los oyentes DESPUÉS del commit (en un rollback se
+ * descarta). Clave = el QueryRunner de la transacción.
+ */
+const COMPLETED_IN_TX = new WeakMap<object, Set<string>>();
+
+export function noteRunCompletedInTx(qr: object, jobId: string): void {
+  let set = COMPLETED_IN_TX.get(qr);
+  if (!set) {
+    set = new Set<string>();
+    COMPLETED_IN_TX.set(qr, set);
+  }
+  set.add(jobId);
+}
+
+/** Lee y olvida los runs completados anotados en esta transacción. */
+export function takeCompletedRunsInTx(qr: object): string[] {
+  const set = COMPLETED_IN_TX.get(qr);
+  COMPLETED_IN_TX.delete(qr);
+  return set ? [...set] : [];
+}
 
 /** worker_status "activo" del run — el mismo set que el predicado de uq_dynamic_generation_active_run. */
 export const ACTIVE_RUN_WORKER_STATUSES = ['queued', 'running', 'retrying'];
@@ -193,7 +218,8 @@ export async function sweepRunExpiredLeases(qr: QueryRunner, jobId: string): Pro
  * (terminal → activo lo hacen únicamente retryItem/reopen de Task 2):
  * - algún item pending|running|retrying → sigue activo (queued hasta el
  *   primer claim, que lo pasa a running; running se mantiene);
- * - todos completed → completed;
+ * - todos completed → completed SOLO si todo es real y validado (EV6 DoD, run-completion.ts);
+ *   con algún componente de vista previa → preview (terminal); sin validar → failed;
  * - si no (quedan failed/blocked/cancelled, p.ej. un run reabierto con solo
  *   items failed) → failed.
  * lease_until/worker_id del run nunca se tocan (quedan NULL).
@@ -225,14 +251,50 @@ export async function recomputeRunStatus(qr: QueryRunner, jobId: string): Promis
   }
 
   if (total > 0 && (c.completed ?? 0) === total) {
+    // EV6 DoD (BE-A): «todos completed» ya no alcanza. Un componente de vista previa (video o
+    // Gamma/TTS mock) → `preview` (terminal, nunca `completed`); uno completado sin su validación
+    // (video sin entrega YouTube, preguntas de otro video, item v3 sin v3Validation) → `failed`
+    // con la lista (recuperación de admin). Solo un run 100 % real y validado queda `completed`.
+    const inputs = await loadCompletionInputs(qr, jobId);
+    if (!inputs) {
+      // Fix round 1 (M2): sin Manifest del run no se puede validar nada → nunca `completed` (fail closed).
+      await qr.query(
+        `update public.production_jobs
+            set status = 'failed', worker_status = 'failed', finished_at = now(), error_message = $2,
+                next_retry_at = null, updated_at = now()
+          where id = $1`,
+        [jobId, 'Generación dinámica sin su Manifest congelado (integridad): no se puede validar que el curso esté completo'],
+      );
+      return 'failed';
+    }
+    const verdict = terminalStatusFor(evaluateRunCompletion({ ...inputs.job, worker_status: 'completed', status: 'completed' }, inputs.rows, inputs.manifest, null, { validationCutoffs: inputs.validationCutoffs }));
+    if (verdict === 'completed' || verdict === 'preview') {
+      // EV6 DoD BE-B: un run que llega a `completed` DESDE ESTE CAMBIO queda marcado para el empaque
+      // automático (`output_summary.autoPackage.eligibleAt`, el inicio de su ventana de intentos). Los
+      // runs completados antes nunca tienen la marca → el empaque automático jamás los toca.
+      await qr.query(
+        `update public.production_jobs
+            set status = $2::text, worker_status = $2::text, progress = 100,
+                finished_at = now(), error_message = null, next_retry_at = null, updated_at = now(),
+                output_summary = case when $2::text = 'completed'
+                  then coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('autoPackage', jsonb_build_object('eligibleAt', now()))
+                  else output_summary end
+          where id = $1`,
+        [jobId, verdict],
+      );
+      if (verdict === 'completed') noteRunCompletedInTx(qr, jobId);
+      return verdict;
+    }
+    const completion = evaluateRunCompletion({ ...inputs.job, worker_status: 'completed', status: 'completed' }, inputs.rows, inputs.manifest, null, { validationCutoffs: inputs.validationCutoffs });
+    const unvalidated = completion.missingComponents.filter((k) => !completion.previewComponents.includes(k));
     await qr.query(
       `update public.production_jobs
-          set status = 'completed', worker_status = 'completed', progress = 100,
-              finished_at = now(), error_message = null, next_retry_at = null, updated_at = now()
+          set status = 'failed', worker_status = 'failed', finished_at = now(), error_message = $2,
+              next_retry_at = null, updated_at = now()
         where id = $1`,
-      [jobId],
+      [jobId, `Generación dinámica terminada con componentes sin validar (${unvalidated.length}): ${unvalidated.slice(0, 20).join(', ')}`],
     );
-    return 'completed';
+    return 'failed';
   }
 
   const summary =
