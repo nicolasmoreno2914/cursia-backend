@@ -185,12 +185,17 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
 export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.6.0';
 
 /**
- * EV6 P2-B4 (P2-design §1.3, ruling 1): la página se desbloquea si el quiz está completo (e=1, que
- * también acepta COMPLETE_PASS) O completo-y-reprobado (e=3, intentos agotados). `show:false`: oculta
- * hasta entonces. Con intentos ilimitados el quiz nunca se agota y solo `e=1` puede ocurrir (mismo JSON).
+ * EV6 P2-B4 (P2-design §1.3, ruling 1): con intentos limitados la página se desbloquea si el quiz está
+ * completo (e=1, que también acepta COMPLETE_PASS) O completo-y-reprobado (e=3 = intentos agotados,
+ * gracias a completionattemptsexhausted=1). `show:false`: oculta hasta entonces.
+ * Fix 1 (C1): con intentos ILIMITADOS (attempts 0) B1 emite completionattemptsexhausted=0 y Moodle marca
+ * COMPLETE_FAIL tras UN intento reprobado → e=3 abriría el banco y el estudiante reintentaría con las
+ * respuestas. Ahí la condición es SOLO aprobar (e=1).
  */
-export function examExplanationsAvailability(quizMid: number): string {
+export function examExplanationsAvailability(quizMid: number, attempts: number): string {
   if (!Number.isInteger(quizMid) || quizMid < 1) throw new Error(`MBZ_V3_INVARIANT: moduleid de quiz inválido (${quizMid})`);
+  if (!Number.isInteger(attempts) || attempts < 0) throw new Error(`MBZ_V3_INVARIANT: intentos inválidos (${attempts})`);
+  if (attempts === 0) return `{"op":"|","show":false,"c":[{"type":"completion","cm":${quizMid},"e":1}]}`;
   return `{"op":"|","show":false,"c":[{"type":"completion","cm":${quizMid},"e":1},{"type":"completion","cm":${quizMid},"e":3}]}`;
 }
 /** Versión del renderer de Visual Components que entra en la clave de reuse. */
@@ -893,6 +898,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     scope: { kind: 'module'; moduleNumber: number; title: string } | { kind: 'final' },
     src: ExamSource,
     bankGroups: Array<{ ownerId: string; name: string }>,
+    attempts: number,
   ): ActivityRef => {
     const page = src.kind === 'bank'
       ? examExplanationsBankPage({ scope, bank: src.bank, groups: bankGroups }, theme)
@@ -916,7 +922,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
 </activity>`);
     W.put(`${a.dir}/module.xml`, applyXmlFields(withIdnumber(moduleXml(a.mid, 'page', quiz.secnum, ts, MV.bv), idnumber), {
       completion: '0',
-      availability: examExplanationsAvailability(quiz.mid),
+      availability: examExplanationsAvailability(quiz.mid, attempts),
       downloadcontent: '0',
     }));
     W.put(`${a.dir}/inforef.xml`, inforef([]));
@@ -1110,7 +1116,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       m.keys.exam,
       examGroups,
     );
-    addExplanationsPage(quiz, `cv3:exam_explanations:${m.moduleId}`, { kind: 'module', moduleNumber: m.moduleNumber, title: m.title }, examSrc, examGroups);
+    addExplanationsPage(quiz, `cv3:exam_explanations:${m.moduleId}`, { kind: 'module', moduleNumber: m.moduleNumber, title: m.title }, examSrc, examGroups, resolved.kinds.exam.attempts);
     // Edu EV3 / EV6: tras la evaluación → botón al primer capítulo del módulo siguiente, o a la
     // evaluación final / cierre.
     const nextPlan = plan.modules[plan.modules.indexOf(m) + 1];
@@ -1141,7 +1147,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     const finalSrc = examSources.final as ExamSource;
     const finalGroups = plan.modules.map((m) => ({ ownerId: m.moduleId, name: `Módulo ${m.moduleNumber}: ${m.title}` }));
     const quiz = addQuiz(fsec, 'cv3:final_exam', 'Evaluación final', 'finalExam', finalSrc, plan.keys.finalExam, finalGroups);
-    addExplanationsPage(quiz, 'cv3:final_exam_explanations', { kind: 'final' }, finalSrc, finalGroups);
+    addExplanationsPage(quiz, 'cv3:final_exam_explanations', { kind: 'final' }, finalSrc, finalGroups, resolved.kinds.finalExam.attempts);
     addLabel(fsec, 'cv3:final_exam_next', finalExamNextLabel(closing, facts, theme, opts));
   }
   // EV6 (T3): criterios de completion del curso (la insignia-certificado se otorga al completarlo).

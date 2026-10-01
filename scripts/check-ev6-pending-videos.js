@@ -249,11 +249,14 @@ async function pureChecks() {
   // P2-B4 (builder 3.5.0 → 3.6.0) cambia el .mbz OTRA VEZ a propósito: página «Respuestas explicadas»
   // (mod_page) después de cada quiz, línea nueva en la info del examen, nota para docentes (en el label
   // del certificado o en cv3:shell:exams_teacher) y, por eso, los moduleid siguientes se corren.
+  // Fix 1 de P2-B4 (availability e=1 con intentos ilimitados, nota y rótulo de la página) cambia labels y página:
+  // dorados del primer commit de B4: 644 afefaaec84b9209b23b49cae0005ae3a3218db1bc0ac23489687909378116a71,
+  // 645 2dc8dc4ec6bea13e3946abb496faca73f34774e84b4daf48bc83015cad1870ec.
   // Dorados post-P3 (builder 3.5.0): 644 800aea31b3c198341df277b8dfce4dadc9d62eec0573d3a77718b9626beeddac,
   // 645 bef9261dfed571ab61a64034614c87528ea03d640cf1b4a11c43ed31b08ed9f6.
   const GOLDEN_PRE_T5 = {
-    644: ['afefaaec84b9209b23b49cae0005ae3a3218db1bc0ac23489687909378116a71', { engine: 'h5p', finalExam: true, courseId: 644 }],
-    645: ['2dc8dc4ec6bea13e3946abb496faca73f34774e84b4daf48bc83015cad1870ec', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
+    644: ['5de36d0645bcc04a2189f33849a53e1a2250991b4b3cd10ed0aaa3a11c3b0c1f', { engine: 'h5p', finalExam: true, courseId: 644 }],
+    645: ['58408d0e6a04774d5ca7df08deac6cd46a23a3326836047c7b1ad16cb13f458f', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
   };
   await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B4 (respuestas explicadas sobre sistema visual 2.0 + certificado + política de revisión del quiz, builder 3.6.0), con y sin el campo', async () => {
     for (const [id, [want, o]] of Object.entries(GOLDEN_PRE_T5)) {

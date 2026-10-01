@@ -24,7 +24,7 @@ import { inlineHtml, labelHtml } from '../visual-components/text';
 import type { GiftQuestion } from '../../package/mbz-common';
 import type { ExamBankQuestion, ExamBankV1 } from './exam-bank';
 import { EXAM_QUESTION_TYPES } from './exam-bank';
-import { Hx, Surf, bgSurf, eyebrow, heading, hx, pHtml, root, shellFail, st, unprotectedText } from './html';
+import { Hx, Surf, bgSurf, eyebrow, hx, pHtml, root, shellFail, st, unprotectedText } from './html';
 
 /** Nombre de la página (P2-task-B4 §1). */
 export function examExplanationsName(scope: { kind: 'module'; moduleNumber: number } | { kind: 'final' }): string {
@@ -39,7 +39,8 @@ export const EXAM_EXPLANATIONS_LEAD_GIFT = 'Aquí tienes todas las preguntas de 
 
 /** Rulings 2 + 3: texto EXACTO de la nota para docentes (dos oraciones). */
 export const EXAMS_TEACHER_NOTE_AVAILABILITY =
-  'Las páginas de “Respuestas explicadas” necesitan el acceso condicional de Moodle activado; si un estudiante las ve antes de presentar la evaluación, actívalo en Administración del sitio.';
+  'Las páginas de “Respuestas explicadas” necesitan el acceso condicional de Moodle activado; si un estudiante las ve antes de presentar la evaluación, actívalo en Administración del sitio. ' +
+  'Si el curso ya se restauró con el acceso condicional desactivado, actívalo y vuelve a restaurar el curso, o agrega a cada página “Respuestas explicadas” la restricción “Finalización de actividad” de su evaluación.';
 export const EXAMS_TEACHER_NOTE_ATTEMPTS =
   'Dar intentos adicionales a un estudiante que agotó una evaluación sin aprobar es decisión tuya: ten en cuenta que ya pudo leer sus “Respuestas explicadas”.';
 export const EXAMS_TEACHER_NOTE = `${EXAMS_TEACHER_NOTE_AVAILABILITY} ${EXAMS_TEACHER_NOTE_ATTEMPTS}`;
@@ -146,7 +147,7 @@ function bankQuestionBody(h: Hx, q: ExamBankQuestion, s: Surf): string {
   }
   // match: definición → término (la orientación del quiz).
   const pairs = q.pairs.map((p) => `${inlineHtml(p.definition)}${labelHtml(' → ')}<strong>${inlineHtml(p.term)}</strong>`);
-  return roleLine(h, 'check', ok, 'Respuesta correcta', s, labelHtml('cada definición con su término')) + subList(h, pairs, s) + explanation;
+  return roleLine(h, 'check', ok, 'Pares correctos (definición → término)', s, '') + subList(h, pairs, s) + explanation;
 }
 
 function giftQuestionBody(h: Hx, q: GiftQuestion, s: Surf): string {
@@ -166,13 +167,17 @@ function giftQuestionBody(h: Hx, q: GiftQuestion, s: Surf): string {
   return roleLine(h, 'check', ok, 'Respuesta correcta', s, '') + subList(h, q.pairs.map((p) => `${inlineHtml(p.q)}${labelHtml(' → ')}<strong>${inlineHtml(p.a)}</strong>`), s);
 }
 
+/**
+ * Fix 1 (M1): Moodle ya imprime el nombre de la página («Respuestas explicadas — Evaluación …») como
+ * encabezado; el contenido abre solo con el rótulo (ícono + evaluación) y el lead, sin repetir un h3.
+ */
 function header(h: Hx, scope: ExamExplanationsScope, tone: Tone, leadText: string, s: Surf): string {
   const c = ink(s.bg, [tone.ink], s.fg);
+  const what = scope.kind === 'final' ? 'Evaluación final' : `Evaluación del módulo ${scope.moduleNumber}: ${scope.title}`;
   const chip =
     `<p class="cvc-meta cvc-chip"${st(h, [['margin', '0 0 12px 0'], ['color', c], ['font-size', h.t.typography.sizeSmallPx], ['font-weight', '700'], ['line-height', '1.4']])}>` +
-    `${eduIcon(h.enh, 'examen', c, 20)} ${labelHtml(EXAM_EXPLANATIONS_SHORT)}</p>`;
-  const title = scope.kind === 'final' ? 'Evaluación final' : `Evaluación del módulo ${scope.moduleNumber}: ${scope.title}`;
-  return chip + heading(h, 'h3', title, s) + pHtml(h, labelHtml(leadText), s, { secondary: true });
+    `${eduIcon(h.enh, 'examen', c, 20)} ${inlineHtml(what)}</p>`;
+  return chip + pHtml(h, labelHtml(leadText), s, { secondary: true });
 }
 
 function finish(name: string, uid: string, h: Hx, inner: string): ExamExplanationsPage {

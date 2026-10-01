@@ -6,8 +6,9 @@
 // A1 (P2-task-B4.md):
 //  - una página por quiz, en la MISMA sección justo después del quiz (exam_info → quiz → página →
 //    module_next | final_exam_next), registrada en moodle_backup.xml (activity + settings);
-//  - module.xml: availability BYTE-EXACTA {"op":"|","show":false,"c":[{… "cm":QUIZ_MID,"e":1},{… "e":3}]}
-//    con el moduleid de SU quiz, completion 0, downloadcontent 0, visible 1; nunca en completion.xml;
+//  - module.xml: availability BYTE-EXACTA con el moduleid de SU quiz — intentos > 0:
+//    {"op":"|","show":false,"c":[{… "cm":QUIZ_MID,"e":1},{… "e":3}]}; intentos 0 (fix 1, C1): solo {… "e":1}
+//    (sin completionattemptsexhausted un intento reprobado ya es COMPLETE_FAIL); completion 0, downloadcontent 0, visible 1; nunca en completion.xml;
 //  - page.xml: nombre, contentformat 1, display 0, printintro/printlastmodified 0; contenido sin
 //    <style>/<script>/<details>, CLEAN_SAFE y todo texto con nolink;
 //  - banco: contiene el enunciado, la respuesta correcta y la explicación de CADA pregunta del banco
@@ -20,7 +21,7 @@
 //  - info del examen: la línea nueva con los intentos de facts (y la variante de intentos ilimitados);
 //  - validateMbzV3 sin hallazgos en todos los casos.
 //
-// Usage: node scripts/check-p2-explanations.js [path/to/dist] [--out paquete-banco.mbz]  (también escribe <out>-nofinal.mbz)
+// Usage: node scripts/check-p2-explanations.js [path/to/dist] [--out paquete-banco.mbz]  (también escribe <out>-nofinal.mbz y <out>-unlimited.mbz)
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -146,7 +147,9 @@ async function readPkg(mbz) {
   return { z, mb, acts, seq, completion: await T('completion.xml'), byId: (id) => acts.find((a) => a.idnumber === id) };
 }
 
-const AVAIL = (mid) => `{"op":"|","show":false,"c":[{"type":"completion","cm":${mid},"e":1},{"type":"completion","cm":${mid},"e":3}]}`;
+const AVAIL = (mid, attempts) => attempts === 0
+  ? `{"op":"|","show":false,"c":[{"type":"completion","cm":${mid},"e":1}]}`
+  : `{"op":"|","show":false,"c":[{"type":"completion","cm":${mid},"e":1},{"type":"completion","cm":${mid},"e":3}]}`;
 
 /** Comprobaciones de estructura comunes a todo paquete con exámenes. */
 function checkPages(R, manifest) {
@@ -169,7 +172,10 @@ function checkPages(R, manifest) {
     const before = R.acts.find((a) => a.mid === s[i - 1]);
     eq(before && before.idnumber, final ? 'cv3:final_exam_info' : `cv3:exam_info:${modId}`, `${pid}: el quiz sigue a su info`);
     // module.xml
-    eq(tag(p.module, 'availability'), AVAIL(q.mid), `${pid}: availability byte-exacta`);
+    const attempts = Number(tag(q.act, 'attempts_number'));
+    assert(Number.isInteger(attempts), `${q.idnumber}: attempts_number`);
+    eq(tag(p.module, 'availability'), AVAIL(q.mid, attempts), `${pid}: availability byte-exacta (intentos ${attempts})`);
+    p.attempts = attempts;
     eq([tag(p.module, 'completion'), tag(p.module, 'downloadcontent'), tag(p.module, 'visible'), tag(p.module, 'modulename')], ['0', '0', '1', 'page'], `${pid}: completion/downloadcontent/visible`);
     assert(!critMids.includes(p.mid), `${pid}: es criterio de completion del curso`);
     // page.xml
@@ -211,6 +217,16 @@ async function main() {
   await check('(a) una página por quiz, después del quiz, availability exacta a SU quiz, completion 0, downloadcontent 0, fuera de completion.xml, registrada', () => {
     pagesA = checkPages(RA, MA);
     eq(pagesA.length, A.banks.size + 1, 'módulos con examen + final');
+  });
+  await check('fix 1 (M1/M5): sin h3 repetido (Moodle ya imprime el nombre), rótulo con la evaluación; «Pares correctos (definición → término):»', () => {
+    for (const p of pagesA) {
+      assert(!/<h[1-6]\b/.test(p.html), `${p.idnumber}: la página no lleva encabezados propios`);
+      const t = txt(p.html);
+      assert(!t.includes('Respuestas explicadas'), `${p.idnumber}: no repite el nombre de la página`);
+      assert(t.startsWith(p.quiz.idnumber === 'cv3:final_exam' ? 'Evaluación final' : 'Evaluación del módulo'), `${p.idnumber}: rótulo`);
+      assert(t.includes('Pares correctos (definición → término):') && !t.includes('cada definición con su término'), `${p.idnumber}: copy de emparejamiento`);
+      eq(p.attempts, 3, `${p.idnumber}: perfil por defecto`);
+    }
   });
   await check('(a) banco: la página trae TODAS las preguntas del banco con enunciado, correcta, explicación, distractores+why, whyWrong y pares «definición → término»', () => {
     for (const p of pagesA) {
@@ -261,7 +277,7 @@ async function main() {
     assert(txt(holders[0].intro).includes(S.EXAMS_TEACHER_NOTE), 'dos oraciones');
     eq([tag(holders[0].module, 'visible'), tag(holders[0].module, 'visibleold')], ['0', '0'], 'oculto');
     assert(!RA.byId('cv3:shell:exams_teacher'), 'sin label propio');
-    eq(S.EXAMS_TEACHER_NOTE, 'Las páginas de “Respuestas explicadas” necesitan el acceso condicional de Moodle activado; si un estudiante las ve antes de presentar la evaluación, actívalo en Administración del sitio. Dar intentos adicionales a un estudiante que agotó una evaluación sin aprobar es decisión tuya: ten en cuenta que ya pudo leer sus “Respuestas explicadas”.', 'texto exacto');
+    eq(S.EXAMS_TEACHER_NOTE, 'Las páginas de “Respuestas explicadas” necesitan el acceso condicional de Moodle activado; si un estudiante las ve antes de presentar la evaluación, actívalo en Administración del sitio. Si el curso ya se restauró con el acceso condicional desactivado, actívalo y vuelve a restaurar el curso, o agrega a cada página “Respuestas explicadas” la restricción “Finalización de actividad” de su evaluación. Dar intentos adicionales a un estudiante que agotó una evaluación sin aprobar es decisión tuya: ten en cuenta que ya pudo leer sus “Respuestas explicadas”.', 'texto exacto');
     eq(RA.acts.filter((a) => tag(a.module, 'visible') !== '1').map((a) => a.idnumber), ['cv3:shell:certificate_teacher'], 'único oculto');
   });
   await check('(a) info del examen: «Al terminar cada intento…» con los intentos de facts; preguntas = slots', () => {
@@ -360,14 +376,20 @@ async function main() {
   });
 
   // ── Intentos ilimitados ──
-  await check('intentos ilimitados (exam 0): «… cuando apruebes.» y la MISMA availability (solo e=1 puede ocurrir)', async () => {
+  await check('fix 1 (C1) intentos ilimitados (exam 0): «… cuando apruebes.», availability SOLO e=1 en el examen de módulo y e=1|e=3 en el final (3 intentos)', async () => {
     const defaults = P.defaultAssessmentProfile({ finalExam: true });
     const X = bankInput({ courseId: 748, profile: { ...defaults, attempts: { ...defaults.attempts, exam: 0 } } });
     const r = await B.buildDynamicMbzV3(X.input);
+    if (OUT) fs.writeFileSync(OUT.replace(/\.mbz$/, '') + '-unlimited.mbz', r.mbz);
     const v = await V.validateMbzV3(r.mbz, r.expectations);
     assert(v.ok, JSON.stringify(v.issues.slice(0, 5)));
     const R = await readPkg(r.mbz);
-    checkPages(R, X.input.manifest);
+    const pg = checkPages(R, X.input.manifest);
+    for (const p of pg) {
+      const unl = p.quiz.idnumber !== 'cv3:final_exam';
+      eq(p.attempts, unl ? 0 : 3, `${p.idnumber}: intentos`);
+      eq(/"e":3/.test(tag(p.module, 'availability')), !unl, `${p.idnumber}: e=3 solo con intentos limitados`);
+    }
     for (const m of X.input.manifest.modules.filter((x) => x.examEnabled)) {
       const t = txt(R.byId(`cv3:exam_info:${m.moduleId}`).intro);
       assert(t.includes('Las respuestas correctas y su explicación se habilitan en «Respuestas explicadas» cuando apruebes.'), t.slice(-300));

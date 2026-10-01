@@ -588,7 +588,13 @@ export function certificateTeacherLabel(badgeName: string, facts: CourseFacts, t
     ctaButton(h, CTA_BADGES, 'Abrir las insignias del curso →', cs.s) +
     // EV6 P2-B4 (rulings 2 + 3): el certificado exige la evaluación final → siempre hay «Respuestas
     // explicadas»; su nota para docentes va aquí, un párrafo más.
-    (hasExams(facts) ? `<div${st(h, [['margin', '20px 0 0 0'], ['padding', 0], ['color', cs.s.fg]])}>${pHtml(h, labelHtml(EXAMS_TEACHER_NOTE), cs.s, { last: true })}</div>` : '');
+    // Fix 1 (M2): con su propio subtítulo, para no leerse como parte del paso de la insignia.
+    (hasExams(facts)
+      ? `<div${st(h, [['margin', '24px 0 0 0'], ['padding', '16px 0 0 0'], ['color', cs.s.fg], ['border-top', `1px solid ${cs.border}`]])}>` +
+        heading(h, 'h4', 'Respuestas explicadas', cs.s) +
+        pHtml(h, labelHtml(EXAMS_TEACHER_NOTE), cs.s, { last: true }) +
+        `</div>`
+      : '');
   return out('Para docentes: activar el certificado', root(h, 'shell-certificate-teacher', box(h, inner, cs, { cls: 'cvc-certificate-teacher' })), facts);
 }
 
