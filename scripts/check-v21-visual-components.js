@@ -130,9 +130,13 @@ check('espejo del frontend (44): DYN_VC_COMPONENT_SPECS, nodos por diagrama y ti
   assert(JSON.stringify(Array.from(ctx.__ill)) === JSON.stringify(Array.from(vc.VC_ILLUSTRATIVE_TYPES)), 'VC_ILLUSTRATIVE_TYPES');
   assert(JSON.stringify(canon(ctx.__limits)) === JSON.stringify(canon(vc.VC_MOVEMENT_LIMITS)), `VC_MOVEMENT_LIMITS: FE ${JSON.stringify(ctx.__limits)} ≠ BE ${JSON.stringify(vc.VC_MOVEMENT_LIMITS)}`);
   if (vc.VC_PEDAGOGY) assert(JSON.stringify(canon(ctx.__ped)) === JSON.stringify(canon(vc.VC_PEDAGOGY)), `VC_PEDAGOGY: FE ${JSON.stringify(ctx.__ped)} ≠ BE ${JSON.stringify(vc.VC_PEDAGOGY)}`);
+  // P3: why/apply — tipos, mínimo y la validación de experiencias nuevas, idénticos al backend.
+  vm.runInContext(';this.__ew = typeof DYN_VC_EDU_WHY_TYPES !== "undefined" ? DYN_VC_EDU_WHY_TYPES : null; this.__ea = typeof DYN_VC_EDU_APPLY_TYPES !== "undefined" ? DYN_VC_EDU_APPLY_TYPES : null; this.__emin = typeof DYN_VC_EDU_FIELDS_MIN !== "undefined" ? DYN_VC_EDU_FIELDS_MIN : null;', ctx);
+  assert(JSON.stringify(Array.from(ctx.__ew || [])) === JSON.stringify(Array.from(vc.VC_EDU_WHY_TYPES)) && JSON.stringify(Array.from(ctx.__ea || [])) === JSON.stringify(Array.from(vc.VC_EDU_APPLY_TYPES)) && ctx.__emin === vc.VC_EDU_FIELDS_MIN, 'P3: tipos/mínimo de why/apply');
+  assert(JSON.stringify(norm(ctx.__decSpec)) === JSON.stringify(norm(vc.VC_DECISION_DIAGRAM_SPEC)), `VC_DECISION_DIAGRAM_SPEC: FE ${JSON.stringify(ctx.__decSpec)}`);
   // Fix round 1: lints anti-simulación del ejecutor (45) idénticos al backend sobre los vectores compartidos.
   const f45 = path.join(FE, 'src/js/45-dynamic-generation-executor.js');
-  vm.runInContext(fs.readFileSync(f45, 'utf8') + '\n;this.__br = dynIsBranchHead; this.__q = dynIsQuestionHead; this.__ar = dynArrowChainLength; this.__sim = dynValidateSimulatedDiagramsV3; this.__bk = dynBranchHead; this.__bi = dynBranchingHeadIndexes;', ctx);
+  vm.runInContext(fs.readFileSync(f45, 'utf8') + '\n;this.__edu = dynValidateEduFieldsV3; this.__br = dynIsBranchHead; this.__q = dynIsQuestionHead; this.__ar = dynArrowChainLength; this.__sim = dynValidateSimulatedDiagramsV3; this.__bk = dynBranchHead; this.__bi = dynBranchingHeadIndexes;', ctx);
   for (const t of [...VC_BRANCH_POSITIVES, ...VC_BRANCH_WEAK, ...VC_BRANCH_NEGATIVES, '¿Responde?', '1. ¿Respira?', 'Calor → dilatación\nFrío → contracción', 'a → b → c', 'x -> y ⇒ z']) {
     assert(ctx.__br(t) === vc.isBranchHead(t) && ctx.__q(t) === vc.isQuestionHead(t) && ctx.__ar(t) === vc.arrowChainLength(t), `lint FE ≠ BE en "${t}"`);
     assert(JSON.stringify(JSON.parse(JSON.stringify(ctx.__bk(t)))) === JSON.stringify(vc.branchHead(t)), `branchHead FE ≠ BE en "${t}"`);
@@ -144,6 +148,11 @@ check('espejo del frontend (44): DYN_VC_COMPONENT_SPECS, nodos por diagrama y ti
   simDoc.movements.deepening[1] = { type: 'diagram', kind: 'flow', title: 'V', nodes: ['¿Responde?', 'Sí', 'Consciente', 'No, llama', 'Inconsciente'].map((label) => ({ label })) };
   simDoc.bridge_to_next = 'Observa → decide → actúa.';
   assert(JSON.stringify(JSON.parse(JSON.stringify(ctx.__sim(simDoc)))) === JSON.stringify(vc.validateSimulatedDiagrams(simDoc)), 'validateSimulatedDiagrams FE ≠ BE');
+  // P3: validateEduFields FE ≡ BE (sin campos, con 1, con 2+2, con un solo bloque elegible)
+  const eduDocs = [F.buildExperience()];
+  const e1 = F.buildExperience(); e1.movements.deepening[0].why = 'a'; e1.movements.deepening[0].apply = 'b'; eduDocs.push(e1);
+  const e2 = F.clone(e1); e2.movements.deepening[1].why = 'c'; e2.movements.closing.find((c) => c.type === 'case_scenario').apply = 'd'; eduDocs.push(e2);
+  for (const d of eduDocs) assert(JSON.stringify(JSON.parse(JSON.stringify(ctx.__edu(d)))) === JSON.stringify(vc.validateEduFields(d)), `validateEduFields FE ≠ BE: ${JSON.stringify(ctx.__edu(d))}`);
   // EV6: árbol de decisión (límites + spec de primer nivel)
   assert(JSON.stringify(canon(ctx.__dec)) === JSON.stringify(canon(vc.VC_DECISION_LIMITS)), `VC_DECISION_LIMITS: FE ${JSON.stringify(ctx.__dec)} ≠ BE ${JSON.stringify(vc.VC_DECISION_LIMITS)}`);
   assert(JSON.stringify(norm(ctx.__decSpec)) === JSON.stringify(norm(vc.VC_DECISION_DIAGRAM_SPEC)), `VC_DECISION_DIAGRAM_SPEC: FE ${JSON.stringify(ctx.__decSpec)} ≠ BE`);
