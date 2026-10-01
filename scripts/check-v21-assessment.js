@@ -254,8 +254,10 @@ check('completionCriteriaFor: según requireAllChapterActivities / requireExams'
   ];
   const base = { requireAllChapterActivities: true, requireExams: true, requireCourseGradePass: false, courseGradepass: 70, aggregation: 'all' };
   eq(A.completionCriteriaFor(items, base).map((c) => c.moduleId), [11, 12, 13, 14]);
-  eq(A.completionCriteriaFor(items, { ...base, requireExams: false }).map((c) => c.moduleId), [11, 12]);
+  eq(A.completionCriteriaFor(items, { ...base, requireExams: false }).map((c) => c.moduleId), [11, 12, 14]); // EV6 T3: el final siempre
   eq(A.completionCriteriaFor(items, { ...base, requireAllChapterActivities: false }).map((c) => c.moduleId), [13, 14]);
+  eq(A.completionCriteriaFor(items, { ...base, requireAllChapterActivities: false, requireExams: false }).map((c) => c.moduleId), [14]);
+  eq(A.completionCriteriaFor(items.slice(0, 3), { ...base, requireExams: false }).map((c) => c.moduleId), [11, 12]);
   throws(() => A.completionCriteriaFor([{ moduleId: 1, modname: 'quiz', kind: 'x' }], base), /UNKNOWN_KIND/);
 });
 

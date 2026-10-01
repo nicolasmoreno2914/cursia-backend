@@ -65,7 +65,9 @@ function resolveTokens(html) {
     // Edu EV3: marcadores de los botones → la URL que Moodle deja tras restaurar.
     .replace(/cursia-cta:\/\/next-activity/g, `${WWW}/mod/scorm/view.php?id=4243`)
     .replace(/cursia-cta:\/\/next-exam/g, `${WWW}/mod/quiz/view.php?id=4244`)
-    .replace(/cursia-cta:\/\/section\/(\d+)/g, (_m, n) => `${WWW}/course/section.php?id=${4300 + Number(n)}`);
+    .replace(/cursia-cta:\/\/section\/(\d+)/g, (_m, n) => `${WWW}/course/section.php?id=${4300 + Number(n)}`)
+    // EV6 T3: $@BADGESVIEWBYID*curso@$ → decode rule de restore_course_task.
+    .replace(/cursia-cta:\/\/badges/g, `${WWW}/badges/index.php?type=2&id=4400`);
 }
 
 /**
@@ -119,7 +121,7 @@ for (const combo of F.THEME_COMBOS) {
         S.routeLabel(facts, theme, o),
         S.libroCardLabel(77, facts, theme, o),
         S.audiobookLabel(facts, theme, o),
-        S.closingLabel(facts, ci, theme, o),
+        S.closingLabel(facts, ci, theme, o, facts.finalExam.enabled ? { activities: facts.counts.activities > 0, videos: facts.counts.videos > 0, moduleExams: facts.counts.exams > 0, finalExam: true, courseGrade: true } : undefined), S.certificateTeacherLabel(`Certificado: ${facts.course.title}`, facts, theme, o),
       ];
       facts.modules.forEach((m, i) => {
         labels.push(S.moduleIntroLabel(m, F.moduleIntroFixture(course.manifest, i), facts, theme, o));
@@ -296,7 +298,7 @@ if (probe) {
       const ls = [
         S.welcomeLabel(facts, ci, theme, o), S.audioWelcomeLabel(facts, theme, o), S.competenciesLabel(facts, ci, theme, o),
         S.methodologyLabel(facts, ci, theme, o), S.routeLabel(facts, theme, o), S.libroCardLabel(77, facts, theme, o),
-        S.audiobookLabel(facts, theme, o), S.closingLabel(facts, ci, theme, o), S.finalExamInfoLabel(facts, theme, o),
+        S.audiobookLabel(facts, theme, o), S.closingLabel(facts, ci, theme, o, facts.finalExam.enabled ? { activities: facts.counts.activities > 0, videos: facts.counts.videos > 0, moduleExams: facts.counts.exams > 0, finalExam: true, courseGrade: true } : undefined), S.certificateTeacherLabel(`Certificado: ${facts.course.title}`, facts, theme, o), S.finalExamInfoLabel(facts, theme, o),
       ];
       facts.modules.forEach((m, i) => {
         ls.push(S.moduleIntroLabel(m, F.moduleIntroFixture(course.manifest, i), facts, theme, o));

@@ -180,7 +180,9 @@ function expectedSequence(distRoot, input) {
     if (mod.examEnabled) seq.push([n++, [`cv3:exam_info:${mod.moduleId}`, `cv3:exam:${mod.moduleId}`, `cv3:module_next:${mod.moduleId}`]]);
   }
   if (m.features.finalExam) seq.push([n++, ['cv3:final_exam_info', 'cv3:final_exam', 'cv3:final_exam_next']]);
-  seq.push([n, ['cv3:shell:closing']]);
+  // EV6 T3 fix 0b: + label oculto para docentes (activar la insignia-certificado); fix round 1b:
+  // el certificado existe SOLO con evaluación final.
+  seq.push([n, m.features.finalExam ? ['cv3:shell:closing', 'cv3:shell:certificate_teacher'] : ['cv3:shell:closing']]);
   return seq;
 }
 

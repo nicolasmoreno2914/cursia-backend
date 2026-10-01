@@ -561,6 +561,185 @@ const MATRIX = [
       assert(!v.ok && v.issues.some((i) => i.code === code), `esperaba ${code}, hallazgos: ${JSON.stringify(v.issues.slice(0, 4))}`);
     });
   }
+  // ── EV6 T3: certificado nativo (insignia de curso) ─────────────────────────
+  await check('EV6 T3: insignia-certificado en toda la matriz (badges.xml, setting badges=1, imagen f1/f2/f3, examen final como criterio, panel del cierre)', async () => {
+    for (const cfg of MATRIX) {
+      const { r } = built[cfg.id];
+      const z = await JSZip.loadAsync(r.mbz);
+      const bx = await z.file('badges.xml').async('string');
+      if (!cfg.finalExam) {
+        // Fix round 1b (decisión M5): sin evaluación final no hay certificado (ni insignia, ni imagen,
+        // ni setting, ni panel, ni label para docentes) y el resumen lo avisa.
+        assert(!/<badge id/.test(bx), `${cfg.id}: sin insignia`);
+        assert(/<name>badges<\/name>\n      <value>0<\/value>/.test(await z.file('moodle_backup.xml').async('string')), `${cfg.id}: setting badges = 0`);
+        assert(!(await z.file('files.xml').async('string')).includes('<component>badges</component>'), `${cfg.id}: sin imagen`);
+        const { acts } = await actDirs(r.mbz);
+        const lx = await z.file(`${acts.find((a) => a.idnumber === 'cv3:shell:closing').dir}/label.xml`).async('string');
+        assert(!/BADGESVIEWBYID|certificad/i.test(lx), `${cfg.id}: el cierre no promete certificado`);
+        assert(!acts.some((a) => a.idnumber === 'cv3:shell:certificate_teacher'), `${cfg.id}: sin label docente`);
+        assert(r.summary.warnings.includes('certificate_omitted:no_final_exam'), `${cfg.id}: aviso certificate_omitted:no_final_exam`);
+        continue;
+      }
+      const title = r.expectations.facts.course.title;
+      assert(bx.includes(`<name>Certificado: ${title}</name>`), `${cfg.id}: nombre`);
+      // Fix round 1 (review I1): perfil por defecto → se exige aprobar TODO lo calificable, nombrado por tipo.
+      const kinds = ['todas las actividades prácticas', 'todos los videos interactivos', 'todas las evaluaciones de módulo', 'la evaluación final'];
+      const list = `${kinds.slice(0, -1).join(', ')} y ${kinds[kinds.length - 1]}`;
+      const desc = `Otorgado al completar el curso «${title}»: aprobar ${list}.`;
+      assert(bx.includes(`<description>${desc}</description>`), `${cfg.id}: descripción`);
+      for (const t of ['<type>2</type>', '<courseid>1</courseid>', '<status>1</status>', '<notification>0</notification>', '<language>es</language>', '<issuername>Cursia</issuername>', '<name>course_1</name>', '<value>1</value>']) assert(bx.includes(t), `${cfg.id}: ${t}`);
+      assert(/%badgename%/.test(bx), `${cfg.id}: %badgename%`);
+      const mb = await z.file('moodle_backup.xml').async('string');
+      assert(/<level>root<\/level>\n      <name>badges<\/name>\n      <value>1<\/value>/.test(mb), `${cfg.id}: setting badges`);
+      const fx = await z.file('files.xml').async('string');
+      for (const [fn, size] of [['f1.png', 100], ['f2.png', 35], ['f3.png', 512]]) {
+        const f = fx.match(/<file id="\d+">[\s\S]*?<\/file>/g).find((x) => x.includes('<component>badges</component>') && x.includes(`<filename>${fn}</filename>`));
+        assert(f && f.includes('<contextid>2</contextid>') && f.includes('<filearea>badgeimage</filearea>') && f.includes('<itemid>1</itemid>'), `${cfg.id}: ${fn} en files.xml`);
+        const h = /<contenthash>(\w+)<\/contenthash>/.exec(f)[1];
+        const png = await z.file(`files/${h.slice(0, 2)}/${h}`).async('nodebuffer');
+        eq([png.readUInt32BE(16), png.readUInt32BE(20), png[25]], [size, size, 6], `${cfg.id}: ${fn} RGBA ${size}px`);
+      }
+      const { acts } = await actDirs(r.mbz);
+      const closing = acts.find((a) => a.idnumber === 'cv3:shell:closing');
+      const lx = await z.file(`${closing.dir}/label.xml`).async('string');
+      assert(lx.includes('$@BADGESVIEWBYID*1@$') && lx.includes('Tu certificado') && lx.includes('Ver mi certificado →'), `${cfg.id}: panel del cierre`);
+      const want = `Cuando apruebes ${list}, Moodle te otorga el certificado del curso. Lo encuentras en tu perfil, en Insignias.`;
+      assert(lx.includes(want), `${cfg.id}: texto del panel`);
+      // Fix 0b: label oculto para docentes, justo después del cierre, en la misma sección.
+      const teacher = acts.find((a) => a.idnumber === 'cv3:shell:certificate_teacher');
+      assert(teacher && teacher.section === closing.section && acts.indexOf(teacher) === acts.indexOf(closing) + 1, `${cfg.id}: label docente tras el cierre`);
+      const tm = await z.file(`${teacher.dir}/module.xml`).async('string');
+      assert(tm.includes('<visible>0</visible>') && tm.includes('<visibleold>0</visibleold>'), `${cfg.id}: label docente oculto`);
+      const tx = await z.file(`${teacher.dir}/label.xml`).async('string');
+      for (const t of ['Para docentes: activa el certificado del curso', 'Moodle deja la insignia desactivada al restaurar.', `Entra a Insignias → «Certificado: ${title}» → «Habilitar acceso».`, 'Solo se hace una vez.', 'Abrir las insignias del curso →', '$@BADGESVIEWBYID*1@$']) {
+        assert(tx.includes(t.replace(/"/g, '&quot;')), `${cfg.id}: label docente «${t}»`);
+      }
+      const hidden = [];
+      for (const a of acts) if ((await z.file(`${a.dir}/module.xml`).async('string')).includes('<visible>0</visible>')) hidden.push(a.idnumber);
+      eq(hidden, ['cv3:shell:certificate_teacher'], `${cfg.id}: único módulo oculto`);
+      if (cfg.finalExam) {
+        const fin = acts.find((a) => a.idnumber === 'cv3:final_exam');
+        const comp = await z.file('completion.xml').async('string');
+        assert(comp.includes(`<module>quiz</module>\n    <moduleinstance>${/_(\d+)$/.exec(fin.dir)[1]}</moduleinstance>`), `${cfg.id}: final como criterio`);
+      }
+    }
+    // Imagen determinística y con los colores del tema (acento en el centro de la medalla).
+    const t = { color: { accent: '#1D4ED8', accentStrong: '#1E3A8A', textOnAccent: '#FFFFFF' } };
+    const BADGE = loadDist('package/v3/course-badge.js');
+    const a1 = BADGE.renderCourseBadgePng(t, 512);
+    assert(a1.equals(BADGE.renderCourseBadgePng(t, 512)), 'determinismo de la imagen');
+    assert(!a1.equals(BADGE.renderCourseBadgePng({ color: { ...t.color, accent: '#B91C1C' } }, 512)), 'la imagen cambia con el acento');
+    eq(BADGE.courseBadgeName('x'.repeat(400)).length <= 255, true, 'nombre ≤ 255');
+  });
+  await check('EV6 T3: perfil con requireExams=false → la evaluación final sigue siendo criterio (los exámenes de módulo no)', async () => {
+    const input = PF.packagingInput(distRoot, MATRIX[0]);
+    input.assessmentProfile = JSON.parse(JSON.stringify(input.assessmentProfile));
+    input.assessmentProfile.courseCompletion.requireExams = false;
+    const r = await B.buildDynamicMbzV3(input);
+    const v = await validate(r);
+    assert(v.ok, JSON.stringify(v.issues.slice(0, 3)));
+    const { z, acts } = await actDirs(r.mbz);
+    const comp = await z.file('completion.xml').async('string');
+    const inst = [...comp.matchAll(/<moduleinstance>(\d+)<\/moduleinstance>/g)].map((m) => Number(m[1]));
+    const mid = (a) => Number(/_(\d+)$/.exec(a.dir)[1]);
+    assert(inst.includes(mid(acts.find((a) => a.idnumber === 'cv3:final_exam'))), 'el final es criterio');
+    assert(!acts.filter((a) => /^cv3:exam:/.test(a.idnumber)).some((a) => inst.includes(mid(a))), 'los exámenes de módulo no');
+  });
+  await check('EV6 T3 (review I1): perfil con requireCourseGradePass y sin prácticas → panel y descripción nombran SOLO evaluaciones + nota mínima', async () => {
+    const input = PF.packagingInput(distRoot, MATRIX[0]);
+    input.assessmentProfile = JSON.parse(JSON.stringify(input.assessmentProfile));
+    input.assessmentProfile.courseCompletion = { requireAllChapterActivities: false, requireExams: true, requireCourseGradePass: true };
+    const r = await B.buildDynamicMbzV3(input);
+    const v = await validate(r);
+    assert(v.ok, JSON.stringify(v.issues.slice(0, 3)));
+    const { z, acts } = await actDirs(r.mbz);
+    const title = r.expectations.facts.course.title;
+    assert((await z.file('badges.xml').async('string')).includes(`<description>Otorgado al completar el curso «${title}»: aprobar todas las evaluaciones de módulo y la evaluación final y alcanzar la nota mínima del curso.</description>`), 'descripción');
+    const lx = await z.file(`${acts.find((a) => a.idnumber === 'cv3:shell:closing').dir}/label.xml`).async('string');
+    assert(lx.includes('Cuando apruebes todas las evaluaciones de módulo y la evaluación final y alcances la nota mínima del curso, Moodle te otorga'), 'panel');
+    assert(!/actividades prácticas|videos interactivos/.test(lx), 'no nombra lo que no se exige');
+  });
+  await check('EV6 T3: sin evaluación final (aunque el perfil exija todo lo demás o nada) → sin certificado y aviso certificate_omitted:no_final_exam', async () => {
+    const input = PF.packagingInput(distRoot, MATRIX[1]);
+    input.assessmentProfile = JSON.parse(JSON.stringify(input.assessmentProfile));
+    input.assessmentProfile.courseCompletion = { requireAllChapterActivities: false, requireExams: false, requireCourseGradePass: false };
+    const r = await B.buildDynamicMbzV3(input);
+    const v = await validate(r);
+    assert(v.ok, JSON.stringify(v.issues.slice(0, 3)));
+    assert(r.summary.warnings.includes('certificate_omitted:no_final_exam'), 'aviso');
+    const { z, acts } = await actDirs(r.mbz);
+    assert(!/<badge id/.test(await z.file('badges.xml').async('string')), 'sin insignia');
+    assert(/<name>badges<\/name>\n      <value>0<\/value>/.test(await z.file('moodle_backup.xml').async('string')), 'setting badges = 0');
+    assert(!(await z.file('files.xml').async('string')).includes('<component>badges</component>'), 'sin imagen');
+    const lx = await z.file(`${acts.find((a) => a.idnumber === 'cv3:shell:closing').dir}/label.xml`).async('string');
+    assert(!/BADGESVIEWBYID|certificado/i.test(lx), 'sin panel');
+    assert(!acts.some((a) => a.idnumber === 'cv3:shell:certificate_teacher'), 'sin label docente');
+  });
+  {
+    const certCases = [
+      ['setting badges = 0', () => ({ 'moodle_backup.xml': (x) => x.replace(/(<name>badges<\/name>\n      <value>)1/, '$10') })],
+      ['sin insignia', () => ({ 'badges.xml': (x) => x.replace(/<badge id[\s\S]*<\/badge>/, '') })],
+      ['criterio de curso con otro id', () => ({ 'badges.xml': (x) => x.replace('<name>course_1</name>', '<name>course_2</name>') })],
+      ['insignia inactiva', () => ({ 'badges.xml': (x) => x.replace('<status>1</status>', '<status>0</status>') })],
+      ['descripción que omite la evaluación final', () => ({ 'badges.xml': (x) => x.replace(' y la evaluación final.</description>', '.</description>') })],
+      ['panel que no enuncia los criterios reales', () => {
+        const a = find(/^cv3:shell:closing$/);
+        return { [`${a.dir}/label.xml`]: (x) => x.replace('Cuando apruebes todas las actividades prácticas', 'Cuando completes todas las actividades calificadas') };
+      }],
+      ['label docente sin la nota de diagnóstico', () => {
+        const a = find(/^cv3:shell:certificate_teacher$/);
+        return { [`${a.dir}/label.xml`]: (x) => x.replace('Si no ves la insignia', 'Si no aparece') };
+      }],
+      ['falta f3.png', () => ({ 'files.xml': (x) => x.replace('<filename>f3.png</filename>', '<filename>f9.png</filename>') })],
+      ['contexto del curso = contexto de sistema', () => ({ 'moodle_backup.xml': (x) => x.replace('<original_course_contextid>2</original_course_contextid>', '<original_course_contextid>1</original_course_contextid>') })],
+      ['imagen con otro itemid', () => ({ 'files.xml': (x) => x.replace(/(<filearea>badgeimage<\/filearea>\n    <itemid>)1/, '$17') })],
+      ['label docente visible para estudiantes', () => {
+        const a = find(/^cv3:shell:certificate_teacher$/);
+        return { [`${a.dir}/module.xml`]: (x) => x.replace('<visible>0</visible>', '<visible>1</visible>') };
+      }],
+      ['label docente sin «Habilitar acceso»', () => {
+        const a = find(/^cv3:shell:certificate_teacher$/);
+        return { [`${a.dir}/label.xml`]: (x) => x.replace('Habilitar acceso', 'Activar') };
+      }],
+      ['otro módulo oculto', () => {
+        const a = find(/^cv3:shell:welcome$/);
+        return { [`${a.dir}/module.xml`]: (x) => x.replace('<visible>1</visible>', '<visible>0</visible>') };
+      }],
+      ['falta el label docente', () => {
+        const a = find(/^cv3:shell:certificate_teacher$/);
+        return { [`${a.dir}/module.xml`]: (x) => x.replace('<idnumber>cv3:shell:certificate_teacher</idnumber>', '<idnumber>cv3:shell:otro</idnumber>') };
+      }],
+      ['cierre sin enlace a la insignia', () => {
+        const a = find(/^cv3:shell:closing$/);
+        return { [`${a.dir}/label.xml`]: (x) => x.split('$@BADGESVIEWBYID*1@$').join('#') };
+      }],
+      ['evaluación final fuera de la completion del curso', () => {
+        const a = find(/^cv3:final_exam$/);
+        const mid = /_(\d+)$/.exec(a.dir)[1];
+        return { 'completion.xml': (x) => x.replace(new RegExp(`  <course_completion_criteria id="\\d+">\\n    <course>1</course>\\n    <criteriatype>4</criteriatype>\\n    <module>quiz</module>\\n    <moduleinstance>${mid}</moduleinstance>[\\s\\S]*?</course_completion_criteria>\\n`), '') };
+      }],
+    ];
+    for (const [what, mk] of certCases) {
+      await check(`validador detecta CERTIFICATE: ${what}`, async () => {
+        const bad = await mutate(base.r.mbz, mk());
+        const v = await V.validateMbzV3(bad, base.r.expectations);
+        assert(!v.ok && v.issues.some((i) => i.code === 'CERTIFICATE'), `esperaba CERTIFICATE, hallazgos: ${JSON.stringify(v.issues.slice(0, 4))}`);
+      });
+    }
+    await check('validador detecta CERTIFICATE: insignia en un curso SIN evaluación final (fix round 1b)', async () => {
+      const nf = built['scorm-nofinal-dark'].r;
+      const bxWith = await (await JSZip.loadAsync(base.r.mbz)).file('badges.xml').async('string');
+      const bad = await mutate(nf.mbz, { 'badges.xml': () => bxWith });
+      const v = await V.validateMbzV3(bad, nf.expectations);
+      assert(!v.ok && v.issues.some((i) => i.code === 'CERTIFICATE' && /sin evaluación final/.test(i.message)), JSON.stringify(v.issues.slice(0, 4)));
+    });
+    await check('validador detecta TOKEN_INVALID: $@BADGESVIEWBYID@$ que no apunta al curso del backup', async () => {
+      const a = find(/^cv3:shell:closing$/);
+      const bad = await mutate(base.r.mbz, { [`${a.dir}/label.xml`]: (x) => x.split('$@BADGESVIEWBYID*1@$').join('$@BADGESVIEWBYID*7@$') });
+      const v = await V.validateMbzV3(bad, base.r.expectations);
+      assert(v.issues.some((i) => i.code === 'TOKEN_INVALID' && /BADGESVIEWBYID\*7/.test(i.message)), JSON.stringify(v.issues.slice(0, 4)));
+    });
+  }
   await check('validador detecta H5P_LIBRARIES (dependencia fuera del perfil) y FILES_INTEGRITY (blob alterado)', async () => {
     const z = await JSZip.loadAsync(base.r.mbz);
     const pkg = base.r.summary.h5pPackages[0];
@@ -812,7 +991,7 @@ const MATRIX = [
     for (const [f, v] of [['builderVersion', '3.0.1'], ['manifestSha256', 'm2'], ['sourceArtifactIds', ['a']], ['themeSha256', 't2'], ['assessmentProfileSha256', 'p2'], ['h5pProfileVersion', 2], ['vcRendererVersion', 'r2'], ['moodleVersion', '4.5']]) {
       assert(PK.packageReuseHashV3({ ...baseK, [f]: v }) !== k0, `cambia con ${f}`);
     }
-    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.1.0' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
+    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.2.0' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
   });
 
   // ── Medios ────────────────────────────────────────────────────────────────

@@ -193,6 +193,23 @@ async function pureChecks() {
       eq(r.expectations.facts.counts.videos, videoChapters(input.manifest).length - ids.length, 'facts.counts.videos');
       const graded = acts.filter((a) => /:(video|activity)$/.test(a.idnumber)).length;
       eq(graded, r.expectations.facts.counts.activities + r.expectations.facts.counts.videos, 'práctica calificable');
+      // EV6 T3 (certificado) × T5: un video omitido no es criterio de completion; el certificado
+      // (solo con evaluación final) nombra «videos interactivos» solo si queda alguno real.
+      const z = await JSZip.loadAsync(r.mbz);
+      const comp = await z.file('completion.xml').async('string');
+      const critMids = [...comp.matchAll(/<moduleinstance>(\d+)<\/moduleinstance>/g)].map((m) => Number(m[1]));
+      const midOf = new Map(acts.map((a) => [a.idnumber, Number(/_(\d+)$/.exec(a.dir || '')?.[1] ?? a.mid)]));
+      for (const id of ids) assert(!midOf.has(`cv3:ch:${id}:video`), `video omitido ${id} sin módulo`);
+      eq(critMids.length, graded + r.expectations.facts.counts.exams + (o.finalExam ? 1 : 0), 'criterios = ítems calificables reales (sin los videos omitidos)');
+      const bx = await z.file('badges.xml').async('string');
+      const closing = VC.extractText(acts.find((a) => a.idnumber === 'cv3:shell:closing').intro);
+      if (o.finalExam) {
+        const realVideos = r.expectations.facts.counts.videos > 0;
+        assert(/<badge id=/.test(bx) && /Tu certificado/.test(closing), 'con evaluación final hay certificado');
+        eq([/videos interactivos/.test(bx), /videos interactivos/.test(closing)], [realVideos, realVideos], `el certificado nombra videos solo si quedan reales (${r.expectations.facts.counts.videos})`);
+      } else {
+        assert(!/<badge id=/.test(bx) && !/certificad/i.test(closing) && r.summary.warnings.includes('certificate_omitted:no_final_exam'), 'sin evaluación final no hay certificado');
+      }
     });
   }
   await check('builder v3: curso de SOLO videos (sin actividades) todos pendientes → «Práctica» vacía se omite y sus pesos se normalizan; validador OK', async () => {
@@ -204,14 +221,21 @@ async function pureChecks() {
     eq([res.weightsNormalized, res.emptyCategories, res.categories.map((c) => c.key)], [true, ['practice'], ['moduleExams', 'finalExam']], 'normalización');
     eq(res.categories.reduce((s, c) => s + c.weight, 0), 100, 'suma 100');
   });
-  // Fix round 1 (m-3): sha256 dorados tomados de un build de 4f60353 (ANTES de T5) con los mismos
-  // fixtures; el revisor lo verificó por su lado. Si un cambio posterior altera el .mbz a propósito,
-  // actualizar estos valores Y subir DYNAMIC_MBZ_BUILDER_VERSION_V3 (regla G6 M9).
+  // Fix round 1 (m-3): sha256 dorados tomados de un build SIN T5 con los mismos fixtures. Si un cambio
+  // posterior altera el .mbz a propósito, actualizar estos valores Y subir DYNAMIC_MBZ_BUILDER_VERSION_V3
+  // (regla G6 M9).
+  // EV6 T3 (builder 3.2.0, certificado) cambió el .mbz a propósito: badges.xml + imagen f1/f2/f3,
+  // setting badges, contexto del curso 2, panel «Tu certificado» y label oculto para docentes (con
+  // evaluación final). Los dorados se re-tomaron de 094b7d3 = T3 SIN T5 (antes del rebase sobre
+  // #53); el build de T3+T5 sin pendientes da los MISMOS bytes, o sea T5 sigue sin tocar el .mbz
+  // cuando no hay videos pendientes. Dorados anteriores (4f60353, builder 3.1.0, pre-T3):
+  // 644 6dd79270155faaa6c83db25be0df26c3bf659e11b93e5a4ae8fa615badecb232,
+  // 645 6b35ed0bf50e3d2496081dde232851ce2db87c2725a1245ea4952dd581ddd745.
   const GOLDEN_PRE_T5 = {
-    644: ['6dd79270155faaa6c83db25be0df26c3bf659e11b93e5a4ae8fa615badecb232', { engine: 'h5p', finalExam: true, courseId: 644 }],
-    645: ['6b35ed0bf50e3d2496081dde232851ce2db87c2725a1245ea4952dd581ddd745', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
+    644: ['8dff6102b2185377bc220284af9464afe769e07fdbaec890bdb43363431195bc', { engine: 'h5p', finalExam: true, courseId: 644 }],
+    645: ['8ac9bc6537e2ef1ffad7a5339e0d8cccca66d96d59d2bfd885f28ca73d65b7a4', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
   };
-  await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al de antes de T5 (sha256 dorado de 4f60353), con y sin el campo', async () => {
+  await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al de antes de T5 (sha256 dorado de 094b7d3 = T3 sin T5, builder 3.2.0), con y sin el campo', async () => {
     for (const [id, [want, o]] of Object.entries(GOLDEN_PRE_T5)) {
       const i1 = PF.packagingInput(distRoot, o);
       const i2 = PF.packagingInput(distRoot, o);

@@ -107,6 +107,16 @@ function factsOf(course, opts = {}) {
   });
 }
 
+/**
+ * EV6 T3: requisitos de la insignia como los arma el builder con el perfil por defecto (todo lo
+ * calificable). Fix round 1b: SIN evaluación final no hay certificado (undefined → sin panel).
+ */
+function certReqOf(facts) {
+  const c = facts.counts;
+  if (!facts.finalExam.enabled) return undefined;
+  return { activities: c.activities > 0, videos: c.videos > 0, moduleExams: c.exams > 0, finalExam: true, courseGrade: false };
+}
+
 /** Todos los labels del shell de un curso. */
 function shellLabels(facts, course, theme, level) {
   const o = level ? { level } : undefined;
@@ -119,7 +129,8 @@ function shellLabels(facts, course, theme, level) {
     S.routeLabel(facts, theme, o),
     S.libroCardLabel(77, facts, theme, o),
     S.audiobookLabel(facts, theme, o),
-    S.closingLabel(facts, ci, theme, o),
+    // EV6 T3: el cierre del paquete siempre trae el panel del certificado (insignia nativa).
+    S.closingLabel(facts, ci, theme, o, certReqOf(facts)),
   ];
   facts.modules.forEach((m, i) => {
     out.push(S.moduleIntroLabel(m, F.moduleIntroFixture(course.manifest, i), facts, theme, o));
@@ -468,6 +479,50 @@ async function pureChecks() {
     for (const n of [2, 4, 12, 20, 70, 3, 100, 18432, 40, 58]) assert(set.has(n), `factsNumberSet sin ${n}`);
   });
 
+  await check('EV6 T3: cierre con panel «Tu certificado» (texto según los criterios reales, botón a la insignia, CLEAN_SAFE y ENHANCED)', () => {
+    const ci = F.courseIntroFixture();
+    const txt = (f, cert, level) => vc.extractText(S.closingLabel(f, ci, THEME, level ? { level } : undefined, cert).html);
+    const R0 = { activities: false, videos: false, moduleExams: false, finalExam: true, courseGrade: false };
+    const all2 = certReqOf(f2);
+    assert(all2.activities && all2.videos && all2.moduleExams && all2.finalExam, 'f2 tiene los cuatro tipos');
+    for (const level of [undefined, 'enhanced']) {
+      const html = S.closingLabel(f2, ci, THEME, level ? { level } : undefined, all2).html;
+      assert(html.includes('href="cursia-cta://badges"') && /cvc-btn-link/.test(html), `${level}: botón a la insignia`);
+      assert(vc.lintCleanSafe(html).ok, `${level}: CLEAN_SAFE`);
+      const t = vc.extractText(html);
+      assert(t.includes('Tu certificado') && t.includes('Ver mi certificado →'), `${level}: panel`);
+      assert(t.includes('Cuando apruebes todas las actividades prácticas, todos los videos interactivos, todas las evaluaciones de módulo y la evaluación final, Moodle te otorga el certificado del curso. Lo encuentras en tu perfil, en Insignias.'), `${level}: criterios reales: ${t}`);
+    }
+    // Fix round 1 (review I1): cada combinación nombra SOLO lo que la completion exige.
+    const cases = [
+      [R0, 'Cuando apruebes la evaluación final, Moodle'],
+      [{ ...R0, moduleExams: true }, 'Cuando apruebes todas las evaluaciones de módulo y la evaluación final, Moodle'],
+      [{ ...all2, courseGrade: true }, 'y la evaluación final y alcances la nota mínima del curso, Moodle'],
+      [{ ...R0, courseGrade: true }, 'Cuando apruebes la evaluación final y alcances la nota mínima del curso, Moodle'],
+      [{ ...R0, activities: true }, 'Cuando apruebes todas las actividades prácticas y la evaluación final, Moodle'],
+    ];
+    for (const [req, want] of cases) assert(txt(f2, req).includes(want), `${JSON.stringify(req)} → «${want}»: ${txt(f2, req)}`);
+    for (const [req] of cases) assert(!/complet(es|a) todas/.test(txt(f2, req)), 'nunca «completes» para un ítem que exige aprobar');
+    // Fix round 1b (decisión M5): el certificado existe SOLO con evaluación final.
+    throwsRe(() => S.closingLabel(f2, ci, THEME, undefined, { ...all2, finalExam: false }), /solo existe con evaluación final/, 'sin final no hay panel posible');
+    throwsRe(() => S.closingLabel(f4, ci, THEME, undefined, R0), /evaluación final que el curso no tiene/, 'certificado con final en un curso sin final');
+    eq(certReqOf(f4), undefined, 'f4 (sin evaluación final): sin certificado');
+    assert(!/certificad|Libro Guía, Moodle/i.test(vc.extractText(S.closingLabel(f4, ci, THEME, undefined, certReqOf(f4)).html)), 'f4: el cierre no promete certificado');
+    const sin = txt(f2, undefined);
+    assert(!/certificad/i.test(sin) && !S.closingLabel(f2, ci, THEME).html.includes('cursia-cta://badges'), 'sin certificate no hay panel');
+    eq(S.CTA_BADGES, 'cursia-cta://badges', 'marcador');
+    // Fix 0b: label solo para docentes (el builder lo oculta).
+    for (const level of [undefined, 'enhanced']) {
+      const tl = S.certificateTeacherLabel(`Certificado: ${f2.course.title}`, f2, THEME, level ? { level } : undefined);
+      assert(vc.lintCleanSafe(tl.html).ok && tl.html.includes('href="cursia-cta://badges"'), `${level}: docente CLEAN_SAFE + botón`);
+      const t = vc.extractText(tl.html);
+      for (const w of ['Para docentes: activa el certificado del curso', 'Moodle deja la insignia desactivada al restaurar.', `Entra a Insignias → «Certificado: ${f2.course.title}» → «Habilitar acceso».`, 'Solo se hace una vez.', 'Si no ves la insignia, revisa que las insignias estén habilitadas en el sitio y en el curso, y que la restauración haya incluido todas las actividades.', 'Abrir las insignias del curso →']) {
+        assert(t.includes(w), `${level}: docente «${w}»: ${t}`);
+      }
+    }
+    throwsRe(() => S.certificateTeacherLabel('Otra cosa', f2, THEME), /nombre de insignia inválido/, 'nombre inválido');
+    assert(Array.from('x cursia-cta://badges y'.matchAll(S.CTA_RE)).length === 1, 'CTA_RE reconoce el marcador');
+  });
   await check('shell: datos medidos y tokens (audio, duración R10, Libro, horas) + CLEAN_SAFE/ENHANCED mismo texto', () => {
     const labels = shellLabels(f2, c2, THEME);
     const byName = Object.fromEntries(labels.map((l) => [l.name, l]));
@@ -479,7 +534,9 @@ async function pureChecks() {
     assert(byName['Libro Guía'].html.includes('href="$@RESOURCEVIEWBYID*77@$"'), 'token del Libro');
     assert(vc.extractText(byName['Bienvenida'].html).includes('Duración estimada: 40 h (definida por la institución).'), 'horas etiquetadas');
     for (const w of ['certificado', 'narración profesional', 'minutos por pregunta']) {
-      assert(!labels.some((l) => vc.extractText(l.html).toLowerCase().includes(w)), `afirma "${w}"`);
+      // EV6 T3: «certificado» solo en el panel «Tu certificado» del cierre (la insignia nativa existe en el paquete).
+      const sinPanel = (l) => (l.name === 'Cierre del curso' ? l.html.replace(/<div class="cvc-certificate"[\s\S]*$/, '') : l.html);
+      assert(!labels.some((l) => vc.extractText(sinPanel(l)).toLowerCase().includes(w)), `afirma "${w}"`);
     }
     const enh = shellLabels(f2, c2, THEME, 'enhanced');
     labels.forEach((l, i) => eq(vc.extractText(enh[i].html), vc.extractText(l.html), `texto CLEAN_SAFE = ENHANCED (${l.name})`));
