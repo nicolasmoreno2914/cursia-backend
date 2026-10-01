@@ -32,7 +32,25 @@ export const H5P_MOODLE_GRADING: Readonly<Record<string, Readonly<H5pMoodleGradi
   // Solo se usan como sub-contenido de IV/QS (nunca como actividad suelta en la primera ola).
   'H5P.MultiChoice': Object.freeze({ gradable: true, evidence: 'como sub-contenido de IV/QS' }),
   'H5P.TrueFalse': Object.freeze({ gradable: true, evidence: 'como sub-contenido de IV/QS' }),
+  // EV6 H5P v2 (CURSIA_H5P_PROFILE_V2). Prueba H5P2 con reproductor real en Moodle 4.5
+  // (scratchpad r18/h5p2, cursos 1007/1008; capturas h5p2shots, drive-log-bs.json / drive-log-dc.json).
+  'H5P.BranchingScenario': Object.freeze({
+    gradable: true,
+    evidence:
+      "BS 1.10.1 static-end-score: xAPI 'completed' del contenido principal con rawscore = puntaje del final, maxscore 10 (reproductor real, curso 1008: camino óptimo 10/10 → nota 100 COMPLETE_PASS; «Reiniciar el caso» abre el intento 2, camino aceptable 6/10 success 0; la nota queda en 100)",
+  }),
+  'H5P.Dialogcards': Object.freeze({
+    gradable: false,
+    evidence:
+      'Dialogcards 1.9.40 no emite xAPI (reproductor real, curso 1007: 4 tarjetas giradas y navegadas ⇒ 0 intentos, nota null, INCOMPLETE). Solo «Repaso» opcional: completion por vista, sin ítem de calificación',
+  }),
 });
+
+/**
+ * EV6 H5P v2 — librerías principales NO calificables que sí se usan como actividad
+ * opcional sin nota (completion por vista, fuera de los criterios de completion del curso).
+ */
+export const H5P_UNGRADED_ADDON_LIBRARIES: ReadonlyArray<string> = Object.freeze(['H5P.Dialogcards']);
 
 /** Lanza H5P_NOT_GRADABLE_IN_MOODLE si la librería no califica en mod_h5pactivity (o es desconocida). */
 export function assertH5pGradableInMoodle(mainLibrary: string): void {

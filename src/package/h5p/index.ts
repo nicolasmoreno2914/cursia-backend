@@ -7,7 +7,12 @@ export {
   profileLibraryString,
   profileRuntimeDependencies,
   profileFullDependencies,
+  CURSIA_H5P_PROFILE_V2,
+  h5pProfileVersionV2,
+  profileBundledMainLibraries,
+  profileDeltaDirs,
 } from './profile';
+export * from './library-store';
 export * from './preflight';
 export * from './ids';
 export * from './l10n';
@@ -18,6 +23,8 @@ export * from './types/single-choice-set';
 export * from './types/drag-text';
 export * from './types/blanks';
 export * from './types/interactive-video';
+export * from './types/branching-scenario';
+export * from './types/dialog-cards';
 export * from './package';
 export * from './library-pack';
 export * from './moodle-grading';

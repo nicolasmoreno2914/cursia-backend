@@ -3,6 +3,7 @@
 // dependencias. El JSON se genera con `scripts/generate-h5p-profile.js <libsDir>`
 // (nunca a mano) y se versiona junto al código.
 import * as profileJson from './cursia-h5p-profile.v1.json';
+import * as profileV2Json from './cursia-h5p-profile.v2.json';
 import {
   H5pDependencyRef,
   H5pLibraryRef,
@@ -24,9 +25,10 @@ function deepFreeze<T>(o: T): T {
 
 function stripModuleDefault(raw: any): H5pProfile {
   // `import * as` de un JSON puede traer una propiedad `default` sintética.
-  const { profileId, version, mainLibraries, contentLibrariesByMain, libraries, closureByMain } = raw;
+  // EV6 H5P v2: baseProfileId/deltaByMain solo existen en perfiles derivados (v1 queda igual).
+  const { profileId, version, mainLibraries, contentLibrariesByMain, libraries, closureByMain, baseProfileId, deltaByMain } = raw;
   return JSON.parse(
-    JSON.stringify({ profileId, version, mainLibraries, contentLibrariesByMain, libraries, closureByMain }),
+    JSON.stringify({ profileId, version, mainLibraries, contentLibrariesByMain, libraries, closureByMain, baseProfileId, deltaByMain }),
   );
 }
 
@@ -34,6 +36,37 @@ export const CURSIA_H5P_PROFILE_V1: H5pProfile = deepFreeze(stripModuleDefault(p
 
 if (CURSIA_H5P_PROFILE_V1.version !== h5pProfileVersion || CURSIA_H5P_PROFILE_V1.profileId !== 'CURSIA_H5P_PROFILE_V1') {
   throw new Error('H5P_PROFILE_CORRUPT: cursia-h5p-profile.v1.json no corresponde a CURSIA_H5P_PROFILE_V1');
+}
+
+/**
+ * EV6 H5P v2 — CURSIA_H5P_PROFILE_V2 = v1 ∪ Branching Scenario 1.10 + Dialog Cards 1.9
+ * (`cursia-h5p-profile.v2.json`, generado con `scripts/generate-h5p-profile.js <libsDir> --profile v2`).
+ * Los tipos nuevos derivan sus subContentId con `h5pProfileVersionV2` (`#p2`); los tipos de v1
+ * siguen con `h5pProfileVersion` = 1 (bytes idénticos).
+ */
+export const h5pProfileVersionV2 = 2;
+
+export const CURSIA_H5P_PROFILE_V2: H5pProfile = deepFreeze(stripModuleDefault(profileV2Json));
+
+if (
+  CURSIA_H5P_PROFILE_V2.version !== h5pProfileVersionV2 ||
+  CURSIA_H5P_PROFILE_V2.profileId !== 'CURSIA_H5P_PROFILE_V2' ||
+  CURSIA_H5P_PROFILE_V2.baseProfileId !== CURSIA_H5P_PROFILE_V1.profileId ||
+  !CURSIA_H5P_PROFILE_V2.deltaByMain
+) {
+  throw new Error('H5P_PROFILE_CORRUPT: cursia-h5p-profile.v2.json no corresponde a CURSIA_H5P_PROFILE_V2');
+}
+
+/** Principales cuyo `.h5p` lleva sus librerías delta adentro (buildBundledH5p). */
+export function profileBundledMainLibraries(profile: H5pProfile): string[] {
+  return Object.keys(profile.deltaByMain || {}).sort();
+}
+
+/** Carpetas delta (`Machine-maj.min`) de una principal nueva; falla fuerte si la principal no es bundled. */
+export function profileDeltaDirs(profile: H5pProfile, machineName: string): string[] {
+  const d = profile.deltaByMain && profile.deltaByMain[machineName];
+  if (!d) throw new Error(`H5P_PROFILE_NOT_BUNDLED_MAIN: ${machineName} no tiene delta en ${profile.profileId}`);
+  return d.map(h5pLibraryDirName).sort();
 }
 
 /** Referencia exacta (con patch) de una librería principal del perfil. Falla fuerte si no existe. */

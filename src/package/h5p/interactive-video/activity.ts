@@ -3,8 +3,14 @@
 import { createHash } from 'crypto';
 import { buildContentOnlyH5p } from '../package';
 import { buildInteractiveVideo } from '../types/interactive-video';
-import { VideoCheckpoint, planInteractionCheckpoints, videoPlanDurationSec } from './plan';
-import { VideoInteractionsDoc, checkpointToChoiceInput, validateVideoInteractionsDoc } from './interactions-doc';
+import { DroppedReflection, ReflectionPause, VideoCheckpoint, planInteractionCheckpoints, videoPlanDurationSec } from './plan';
+import {
+  VIDEO_INTERACTIONS_SCHEMA_VERSION_V2,
+  VideoInteractionsDoc,
+  checkpointRemediation,
+  checkpointToChoiceInput,
+  validateVideoInteractionsDocFull,
+} from './interactions-doc';
 
 export interface BuildVideoActivityInput {
   /** item_key del video (`video:<ch>`); también semilla de los subContentId UUID. */
@@ -14,6 +20,11 @@ export interface BuildVideoActivityInput {
   /** Duración REAL del video (artifact de Videogen), no la del LLM. */
   durationSec: number;
   interactionsDoc: VideoInteractionsDoc | unknown;
+  /**
+   * EV6 IV avanzado (Manifest `features.ivAdvanced = 1`): exige `video_interactions`
+   * schemaVersion 2 → pausas de reflexión + remediación. Ausente/false ⇒ v1, bytes de siempre.
+   */
+  ivAdvanced?: boolean;
 }
 
 export interface VideoActivityBuild {
@@ -25,6 +36,9 @@ export interface VideoActivityBuild {
   checkpoints: VideoCheckpoint[];
   sha1: string;
   sha256: string;
+  /** EV6 IV avanzado: pausas colocadas y descartadas (vacías en v1). */
+  reflections?: ReflectionPause[];
+  droppedReflections?: DroppedReflection[];
 }
 
 /**
@@ -37,19 +51,43 @@ export async function buildVideoActivity(input: BuildVideoActivityInput): Promis
   // Primero el plan de la duración REAL: un video corto falla con VIDEO_TOO_SHORT_FOR_INTERACTIONS
   // antes de mirar el documento del LLM.
   planInteractionCheckpoints(durationSec);
-  const plan = validateVideoInteractionsDoc(input.interactionsDoc, { videoItemKey: input.itemKey, durationSec });
+  const advanced = input.ivAdvanced === true;
+  const full = validateVideoInteractionsDocFull(input.interactionsDoc, {
+    videoItemKey: input.itemKey,
+    durationSec,
+    ...(advanced ? { schemaVersion: VIDEO_INTERACTIONS_SCHEMA_VERSION_V2 } : {}),
+  });
+  const plan = full.checkpoints;
   const doc = input.interactionsDoc as VideoInteractionsDoc;
   const built = buildInteractiveVideo({
     itemKey: input.itemKey,
     title: input.title,
     youtubeId: input.youtubeId,
     durationSec,
-    interactions: doc.checkpoints.map((c, i) => ({ ...checkpointToChoiceInput(c), atSec: plan[i].atSec })),
+    interactions: doc.checkpoints.map((c, i) => ({
+      ...checkpointToChoiceInput(c),
+      atSec: plan[i].atSec,
+      ...(advanced ? { remediation: checkpointRemediation(c, plan[i]) } : {}),
+    })),
+    ...(advanced
+      ? {
+          reflections: full.reflectionPlan.reflections.map((r, i) => {
+            const d = doc.reflections![i];
+            return { index: r.index, atSec: r.atSec, prompt: d.prompt, ...(d.hint !== undefined ? { hint: d.hint } : {}) };
+          }),
+        }
+      : {}),
   });
   if (built.maxScore !== plan.length || built.subContentIds.length !== plan.length) {
     throw new Error(`VIDEO_ACTIVITY_INVARIANT: maxScore ${built.maxScore} / subContentIds ${built.subContentIds.length} ≠ ${plan.length}`);
   }
-  const h5p = await buildContentOnlyH5p({ mainLibrary: built.mainLibrary, content: built.content, title: built.title, language: 'es' });
+  const h5p = await buildContentOnlyH5p({
+    mainLibrary: built.mainLibrary,
+    content: built.content,
+    title: built.title,
+    language: 'es',
+    ...(built.extraDependencies ? { extraDependencies: built.extraDependencies } : {}),
+  });
   return {
     h5p,
     interactionCount: plan.length,
@@ -58,6 +96,7 @@ export async function buildVideoActivity(input: BuildVideoActivityInput): Promis
     checkpoints: plan,
     sha1: createHash('sha1').update(h5p).digest('hex'),
     sha256: createHash('sha256').update(h5p).digest('hex'),
+    ...(advanced ? { reflections: full.reflectionPlan.reflections, droppedReflections: full.reflectionPlan.droppedReflections } : {}),
   };
 }
 

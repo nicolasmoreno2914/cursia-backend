@@ -27,12 +27,26 @@
 import {
   H5pInputError,
   validateBlanksInput,
+  validateBranchingScenarioData,
   validateDragTextInput,
   validateQuestionSetInput,
   validateSingleChoiceSetInput,
 } from '../../package/h5p';
+import { lintResourceMentions } from '../visual-components';
 
 export type H5pActivityType = 'questionset' | 'singlechoiceset' | 'dragtext' | 'blanks';
+
+/**
+ * EV6 H5P v2 — tipos de actividad calificada que SOLO existen bajo el marcador
+ * `features.activityTypeRules = 2` (CURSIA_H5P_PROFILE_V2). Con cualquier otro
+ * marcador (0/1/ausente) un payload con estos tipos se trata exactamente como
+ * antes: ACTIVITY_TYPE_UNKNOWN.
+ */
+export type H5pActivityTypeRules2Only = 'branchingscenario';
+export type H5pActivityTypeV2 = H5pActivityType | H5pActivityTypeRules2Only;
+export const H5P_ACTIVITY_TYPES_RULES2_ONLY: readonly H5pActivityTypeRules2Only[] = Object.freeze(['branchingscenario']);
+/** Valor del marcador `features.activityTypeRules` que habilita los tipos de H5P v2. */
+export const ACTIVITY_TYPE_RULES_H5P_V2 = 2;
 
 /**
  * Tipos H5P reconocidos por el validador de payload (incluye 'singlechoiceset',
@@ -165,10 +179,29 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
  */
 export function validateH5pActivityPayload(
   payload: unknown,
-  expect: { chapterId: string; itemKey: string; expectedType?: H5pActivityType | null },
+  expect: {
+    chapterId: string;
+    itemKey: string;
+    expectedType?: H5pActivityTypeV2 | null;
+    /** EV6: marcador `features.activityTypeRules` del Manifest congelado (2 habilita branchingscenario). */
+    activityTypeRules?: number | null;
+  },
 ): H5pActivityPayloadResult {
   const errors: ShellValidationError[] = [];
   const fromManifest = !!expect.expectedType;
+  const rules2 = expect.activityTypeRules === ACTIVITY_TYPE_RULES_H5P_V2;
+  if (expect.expectedType && (H5P_ACTIVITY_TYPES_RULES2_ONLY as readonly string[]).includes(expect.expectedType) && !rules2) {
+    return {
+      ok: false,
+      errors: [
+        {
+          path: '$.type',
+          code: 'ACTIVITY_TYPE_RULES',
+          message: `"${expect.expectedType}" solo es válido con activityTypeRules=${ACTIVITY_TYPE_RULES_H5P_V2} (recibido ${JSON.stringify(expect.activityTypeRules ?? null)})`,
+        },
+      ],
+    };
+  }
   const expectedType = expect.expectedType ?? activityTypeForChapter(expect.chapterId);
   if (!isPlainObject(payload)) {
     return { ok: false, errors: [{ path: '$', code: 'NOT_OBJECT', message: 'el payload debe ser un objeto {type, data}' }] };
@@ -177,7 +210,8 @@ export function validateH5pActivityPayload(
     if (k !== 'type' && k !== 'data') errors.push({ path: `$.${k}`, code: 'UNKNOWN_FIELD', message: `campo no permitido "${k}"` });
   }
   const type = payload.type;
-  if (typeof type !== 'string' || !(KNOWN_H5P_TYPES as readonly string[]).includes(type)) {
+  const known: readonly string[] = rules2 ? [...KNOWN_H5P_TYPES, ...H5P_ACTIVITY_TYPES_RULES2_ONLY] : KNOWN_H5P_TYPES;
+  if (typeof type !== 'string' || !known.includes(type)) {
     errors.push({ path: '$.type', code: 'ACTIVITY_TYPE_UNKNOWN', message: `tipo desconocido ${JSON.stringify(type)}` });
     return { ok: false, errors };
   }
@@ -208,6 +242,15 @@ export function validateH5pActivityPayload(
   if ('itemKey' in data && data.itemKey !== expect.itemKey) {
     errors.push({ path: '$.data.itemKey', code: 'ITEM_KEY_MISMATCH', message: `itemKey debe ser "${expect.itemKey}"` });
   }
+  if (type === 'branchingscenario') {
+    for (const e of validateBranchingScenarioData(data, { allowItemKey: true })) errors.push({ path: `$.data.${e.path}`.replace(/\.\$$/, ''), code: e.code, message: e.message });
+    for (const [p, txt] of branchingScenarioTexts(data)) {
+      for (const hit of lintResourceMentions(txt)) {
+        errors.push({ path: `$.data.${p}`, code: 'RESOURCE_MENTION', message: `menciona un recurso del curso ("${hit.match}"): el caso debe sostenerse solo` });
+      }
+    }
+    return { ok: errors.length === 0, errors };
+  }
   const t = type as H5pActivityType;
   const input: Record<string, unknown> = { ...data, itemKey: expect.itemKey };
   if ((t === 'questionset' || t === 'singlechoiceset') && !('passPercentage' in data)) input.passPercentage = VALIDATION_PASS_PERCENTAGE;
@@ -224,4 +267,35 @@ export function validateH5pActivityPayload(
     }
   }
   return { ok: errors.length === 0, errors };
+}
+
+/** Textos (ruta, valor) de un payload branchingscenario para los lints livianos. */
+function branchingScenarioTexts(data: Record<string, unknown>): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  const take = (p: string, v: unknown) => {
+    if (typeof v === 'string') out.push([p, v]);
+  };
+  take('title', data.title);
+  take('situation', data.situation);
+  if (Array.isArray(data.decisions)) {
+    data.decisions.forEach((d, i) => {
+      if (!isPlainObject(d)) return;
+      take(`decisions[${i}].question`, d.question);
+      if (Array.isArray(d.options)) {
+        d.options.forEach((o, j) => {
+          if (!isPlainObject(o)) return;
+          take(`decisions[${i}].options[${j}].text`, o.text);
+          take(`decisions[${i}].options[${j}].consequence`, o.consequence);
+        });
+      }
+    });
+  }
+  if (Array.isArray(data.endings)) {
+    data.endings.forEach((e, i) => {
+      if (!isPlainObject(e)) return;
+      take(`endings[${i}].title`, e.title);
+      take(`endings[${i}].text`, e.text);
+    });
+  }
+  return out;
 }

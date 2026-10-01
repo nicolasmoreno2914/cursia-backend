@@ -279,6 +279,12 @@ export interface H5pBuiltContent {
   subContentIds: string[];
   /** Puntaje máximo esperado (1 por pregunta / hueco / interacción). */
   maxScore: number;
+  /**
+   * EV6: sub-contenidos fuera de la clausura de runtime de la principal que el
+   * empaque debe declarar en h5p.json (hoy: H5P.Text de las pausas del IV avanzado).
+   * Ausente en todos los builders de v1.
+   */
+  extraDependencies?: Array<{ machineName: string; majorVersion: number; minorVersion: number }>;
 }
 
 export const H5P_TITLE_MAX = 200;

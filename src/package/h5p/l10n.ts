@@ -1,5 +1,6 @@
 // Cursia V2.1 / R7-core — textos de interfaz en español latinoamericano (es-419)
-// para las 7 librerías de CURSIA_H5P_PROFILE_V1.
+// para las 7 librerías de CURSIA_H5P_PROFILE_V1 y las 2 principales nuevas de
+// CURSIA_H5P_PROFILE_V2 (EV6: Branching Scenario, Dialog Cards).
 //
 // Las claves son rutas punteadas de `semantics.json` de cada librería: todos los
 // campos de texto con `default` en inglés (grupos l10n, texts, UI, a11y,
@@ -210,6 +211,47 @@ export const H5P_L10N_ES419: Readonly<Record<string, Readonly<Record<string, str
       'Respondiste la @question que apareció a los @minutes minutos y @seconds segundos.',
     'l10n.videoProgressBar': 'Progreso del video',
     'l10n.howToCreateInteractions': 'Reproduce el video para empezar a crear interacciones',
+  }),
+  // ── EV6 H5P v2 (CURSIA_H5P_PROFILE_V2) ──
+  // proceedButtonText de cada nodo ('Continuar') lo pone el builder (es por nodo, no global).
+  'H5P.BranchingScenario': Object.freeze({
+    'branchingScenario.l10n.startScreenButtonText': 'Comenzar',
+    'branchingScenario.l10n.endScreenButtonText': 'Reiniciar el caso',
+    'branchingScenario.l10n.backButtonText': 'Atrás',
+    'branchingScenario.l10n.disableProceedButtonText': 'Completa este paso para continuar',
+    'branchingScenario.l10n.replayButtonText': 'Repetir el video',
+    'branchingScenario.l10n.scoreText': 'Tu puntaje:',
+    'branchingScenario.l10n.fullscreenAria': 'Pantalla completa',
+  }),
+  'H5P.Dialogcards': Object.freeze({
+    answer: 'Girar',
+    next: 'Siguiente',
+    prev: 'Anterior',
+    retry: 'Reintentar',
+    correctAnswer: 'Lo sabía',
+    incorrectAnswer: 'No lo sabía',
+    round: 'Ronda @round',
+    cardsLeft: 'Tarjetas restantes: @number',
+    nextRound: 'Pasar a la ronda @round',
+    startOver: 'Empezar de nuevo',
+    showSummary: 'Siguiente',
+    summary: 'Resumen',
+    summaryCardsRight: 'Tarjetas que sabías:',
+    summaryCardsWrong: 'Tarjetas que no sabías:',
+    summaryCardsNotShown: 'Tarjetas no mostradas:',
+    summaryOverallScore: 'Puntaje total',
+    summaryCardsCompleted: 'Tarjetas dominadas:',
+    summaryCompletedRounds: 'Rondas completadas:',
+    summaryAllDone: '¡Muy bien! Dominaste las @cards tarjetas: acertaste cada una @max veces.',
+    progressText: 'Tarjeta @card de @total',
+    cardFrontLabel: 'Frente de la tarjeta',
+    cardBackLabel: 'Reverso de la tarjeta',
+    tipButtonLabel: 'Ver pista',
+    audioNotSupported: 'Tu navegador no reproduce este audio',
+    'confirmStartingOver.header': '¿Empezar de nuevo?',
+    'confirmStartingOver.body': 'Se perderá tu avance. ¿Seguro que quieres empezar de nuevo?',
+    'confirmStartingOver.cancelLabel': 'Cancelar',
+    'confirmStartingOver.confirmLabel': 'Empezar de nuevo',
   }),
 });
 

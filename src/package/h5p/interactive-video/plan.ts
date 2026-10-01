@@ -100,3 +100,91 @@ export function planInteractionCheckpoints(durationSec: number): VideoCheckpoint
   });
   return out;
 }
+
+// ── EV6 H5P v2 — IV avanzado: pausas de reflexión (H5P.Text, sin puntaje) ──────
+//
+//   cantidad: 0 si d < 180 s, 1 si 180–299 s, 2 si ≥ 300 s
+//   ranuras (1-based sobre los n checkpoints): k1 = ⌈n/3⌉, k2 = ⌈2n/3⌉; se usan las
+//   primeras `cantidad`. La pausa j va en el punto medio (s enteros) entre los
+//   checkpoints kj y kj+1.
+//   Reglas: dentro de [30, d−15]; ≥ 10 s DESPUÉS del cierre de toda ventana de pregunta
+//   [at, at+10] anterior y ≥ 10 s ANTES de la pregunta siguiente; sin chocar con otra
+//   pausa (≥ 10 s). Una ranura que no cumple se DESCARTA de forma determinística y queda
+//   en `droppedReflections` (nunca en silencio).
+export const REFLECTION_PAUSE_RULES = Object.freeze({
+  oneFromSec: 180,
+  twoFromSec: 300,
+  windowSec: INTERACTIVE_VIDEO_RULES.windowSec, // 10
+  afterWindowSec: 10,
+  beforeQuestionSec: 10,
+  minGapBetweenPausesSec: 10,
+});
+
+export interface ReflectionPause {
+  /** 1 o 2 (número de ranura); es el `index` que debe devolver el LLM en `reflections`. */
+  index: number;
+  atSec: number;
+  /** Checkpoint (1-based) después del cual va la pausa. */
+  afterCheckpoint: number;
+}
+
+export interface DroppedReflection extends ReflectionPause {
+  reason: string;
+}
+
+export interface ReflectionPlan {
+  reflections: ReflectionPause[];
+  droppedReflections: DroppedReflection[];
+}
+
+export function reflectionPauseCount(durationSec: number): number {
+  const d = videoPlanDurationSec(durationSec);
+  return d < REFLECTION_PAUSE_RULES.oneFromSec ? 0 : d < REFLECTION_PAUSE_RULES.twoFromSec ? 1 : 2;
+}
+
+/** Plan determinístico de pausas de reflexión. Puro: misma duración + checkpoints ⇒ mismo plan. */
+export function planReflectionPauses(durationSec: number, checkpoints: VideoCheckpoint[]): ReflectionPlan {
+  const R = REFLECTION_PAUSE_RULES;
+  const d = videoPlanDurationSec(durationSec);
+  const count = reflectionPauseCount(d);
+  const n = Array.isArray(checkpoints) ? checkpoints.length : 0;
+  const reflections: ReflectionPause[] = [];
+  const droppedReflections: DroppedReflection[] = [];
+  if (count === 0) return { reflections, droppedReflections };
+  if (n === 0) throw new VideoPlanError('VIDEO_PLAN_INVARIANT', 'planReflectionPauses sin checkpoints');
+  const slots = [Math.ceil(n / 3), Math.ceil((2 * n) / 3)].slice(0, count);
+  const lo = VIDEO_CHECKPOINT_RULES.noInteractionFirstSec;
+  const hi = d - VIDEO_CHECKPOINT_RULES.noInteractionLastSec;
+  slots.forEach((k, j) => {
+    const index = j + 1;
+    const a = checkpoints[k - 1];
+    const b = checkpoints[k];
+    if (!a || !b) {
+      droppedReflections.push({ index, atSec: a ? a.atSec : -1, afterCheckpoint: k, reason: `no hay checkpoint ${k + 1} después del ${k}` });
+      return;
+    }
+    const atSec = Math.round((a.atSec + b.atSec) / 2);
+    const base = { index, atSec, afterCheckpoint: k };
+    if (atSec < lo || atSec > hi) {
+      droppedReflections.push({ ...base, reason: `fuera de [${lo}, ${hi}]` });
+      return;
+    }
+    const clash = checkpoints.find((c) =>
+      c.atSec <= atSec ? atSec < c.atSec + R.windowSec + R.afterWindowSec : c.atSec - atSec < R.beforeQuestionSec,
+    );
+    if (clash) {
+      droppedReflections.push({
+        ...base,
+        reason: `choca con la pregunta ${clash.index} (${clash.atSec} s): se exige ≥ ${R.afterWindowSec} s tras su ventana y ≥ ${R.beforeQuestionSec} s antes`,
+      });
+      return;
+    }
+    const other = reflections.find((r) => Math.abs(r.atSec - atSec) < R.minGapBetweenPausesSec);
+    if (other) {
+      droppedReflections.push({ ...base, reason: `colisión con la pausa ${other.index} (${other.atSec} s)` });
+      return;
+    }
+    reflections.push(base);
+  });
+  return { reflections, droppedReflections };
+}
