@@ -759,7 +759,9 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   // EV6 H5P v2 — «Repaso» (Dialog Cards) desde la experiencia validada, solo con el ajuste del
   // Blueprint. Capítulos con < 4 tarjetas no llevan repaso (nunca un mazo de 1–3).
   const reviewDecks = new Map<string, H5pBuiltContent>();
-  if (blueprint.course.reviewCards === true) {
+  // H2 fix round 1 (I-2, M-4): solo con H5P v2 (marcador activityTypeRules=2 del Manifest) y motor h5p
+  // (un curso SCORM puede ir a un sitio sin las librerías v1 de las que depende Dialog Cards).
+  if (reviewCardsApply(blueprint, manifest)) {
     for (const ch of allChapters) {
       const deck = buildDialogCardsFromExperience({ chapterTitle: ch.title, experience: c.experiences.get(ch.chapterId) });
       if (deck) reviewDecks.set(ch.chapterId, deck);
@@ -1486,6 +1488,14 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       ...(h5pPackages.some((p) => p.mainLibrary in (CURSIA_H5P_PROFILE_V2.deltaByMain ?? {})) ? { restore: H5P_V2_RESTORE_NOTE } : {}),
     },
   };
+}
+
+/**
+ * EV6 H5P v2 (H2 fix round 1, I-2/M-4): «Repaso» se arma SOLO si el Blueprint lo pide, el Manifest es
+ * de H5P v2 (activityTypeRules = 2) y el motor de actividades es h5p. Cualquier otro caso: apagado.
+ */
+export function reviewCardsApply(blueprint: BlueprintSnapshotV2, manifest: GenerationManifestV1): boolean {
+  return blueprint.course.reviewCards === true && manifest.features?.activityTypeRules === 2 && blueprint.course.activityEngine === 'h5p';
 }
 
 /**

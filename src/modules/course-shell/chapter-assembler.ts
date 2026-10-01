@@ -226,7 +226,8 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     slots.push({ kind: 'activity', variant: ch.activityVariant as 'h5p' | 'scorm' });
   } else {
     const before = pHtml(h, labelHtml(COPY.selfCheckLead), s);
-    slots.push(label('self_check', 'Repaso', injectIntoMovement(mv('self_check'), before, '')));
+    // H2 fix round 1 (M-6): con «Repaso» (Dialog Cards) el label no repite el nombre «Repaso».
+    slots.push(label('self_check', ch.reviewCards === true ? 'Comprueba lo aprendido' : 'Repaso', injectIntoMovement(mv('self_check'), before, '')));
   }
   // EV6 H5P v2: «Repaso» opcional (Dialog Cards desde la experiencia) antes del cierre. Sin nota.
   if (ch.reviewCards === true) slots.push({ kind: 'review_cards' });

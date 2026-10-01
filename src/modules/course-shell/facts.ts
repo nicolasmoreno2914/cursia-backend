@@ -300,6 +300,10 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
   // EV6 H5P v2: «Repaso» solo con el ajuste del Blueprint y en capítulos del Manifest.
   const reviewIds = new Set<string>(input.reviewCardsChapterIds ?? []);
   if (reviewIds.size && bp.course.reviewCards !== true) fail('«Repaso» (Dialog Cards) sin el ajuste course.reviewCards del Blueprint');
+  // H2 fix round 1 (I-2, M-4): solo con H5P v2 (marcador 2 del Manifest) y motor h5p.
+  if (reviewIds.size && (features.activityTypeRules !== 2 || features.activityEngine !== 'h5p')) {
+    fail('«Repaso» (Dialog Cards) solo con H5P v2 (activityTypeRules=2) y motor h5p');
+  }
   for (const id of reviewIds) if (!knownChapterIds.has(id)) fail(`«Repaso» de un capítulo que no está en el Manifest (${id})`);
   for (const ch of chapters) if (reviewIds.has(ch.id)) ch.reviewCards = true;
   for (const id of Object.keys(artifacts.slideCountByChapter ?? {})) {

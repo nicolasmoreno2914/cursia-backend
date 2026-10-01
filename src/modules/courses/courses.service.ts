@@ -6,6 +6,21 @@ import { CreateCourseDto } from './dto/create-course.dto';
 import { UpdateCourseDto } from './dto/update-course.dto';
 import { AdminDashboardService } from '../../admin/services/admin-dashboard.service';
 import { assertDynamicCreationAllowed, assertDynamicOwnerAllowed } from '../features/dynamic-features';
+import { readActivityTypeRulesConfig } from '../generation-manifests/manifest-rules-config';
+
+/**
+ * EV6 H5P v2 (H2 fix round 1, I-2): «Repaso» (Dialog Cards) arranca ENCENDIDO solo en cursos
+ * NUEVOS creados mientras la generación usa H5P v2 (DYNAMIC_ACTIVITY_TYPE_RULES=2). Con el flag
+ * sin definir (o 0/1, o inválido) queda apagado (default false de la columna). Los cursos
+ * existentes nunca cambian. El empaque igual exige el marcador activityTypeRules=2 del Manifest.
+ */
+export function reviewCardsDefaultForNewCourse(env: NodeJS.ProcessEnv = process.env): boolean {
+  try {
+    return readActivityTypeRulesConfig(env) === 2;
+  } catch {
+    return false; // config inválida: la creación del curso no falla por esto (el Manifest sí falla fuerte)
+  }
+}
 
 @Injectable()
 export class CoursesService {
@@ -38,7 +53,21 @@ export class CoursesService {
       ownerId,
       ownerEmail,
     });
-    return this.courseRepo.save(course);
+    const saved = await this.courseRepo.save(course);
+    if (dto?.structureVersion === 'dynamic') await this.applyNewCourseH5pV2Defaults(saved.id);
+    return saved;
+  }
+
+  /** EV6 H5P v2: «Repaso» encendido en un curso NUEVO solo con H5P v2 (ver reviewCardsDefaultForNewCourse). */
+  private async applyNewCourseH5pV2Defaults(courseId: number): Promise<void> {
+    if (!reviewCardsDefaultForNewCourse()) return;
+    // Sin la migración EV6 la columna no existe: el curso queda sin «Repaso» (nunca falla la creación).
+    const [col] = await this.courseRepo.query(
+      `select 1 from information_schema.columns
+        where table_schema = 'public' and table_name = 'courses' and column_name = 'review_cards_enabled'`,
+    );
+    if (!col) return;
+    await this.courseRepo.query(`update public.courses set review_cards_enabled = true where id = $1`, [courseId]);
   }
 
   // ── FIND OR CREATE DYNAMIC ───────────────────────────────────────────────
@@ -89,7 +118,9 @@ export class CoursesService {
       status: 'draft',
       metadata: { courseId: frontendCourseId },
     });
-    return { course: await this.courseRepo.save(course), created: true };
+    const saved = await this.courseRepo.save(course);
+    await this.applyNewCourseH5pV2Defaults(saved.id);
+    return { course: saved, created: true };
   }
 
   // ── FIND ALL ──────────────────────────────────────────────────────────────

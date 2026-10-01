@@ -69,8 +69,9 @@ Un pack nuevo implica un perfil nuevo (`CURSIA_H5P_PROFILE_V2`,
 
 ## Pack v2 (CURSIA_H5P_PROFILE_V2): caso ramificado y tarjetas de repaso
 
-Los cursos generados con las reglas H5P v2 (`activityTypeRules = 2`) traen dos
-tipos de contenido nuevos:
+Los cursos generados con las reglas H5P v2 (`activityTypeRules = 2`) pueden traer
+dos tipos de contenido nuevos (el «Repaso» solo si el curso lo tiene encendido: sale
+encendido en los cursos nuevos creados con H5P v2 y nunca en cursos de motor SCORM):
 
 | Archivo | Tipo de contenido | Nota |
 |---|---|---|
