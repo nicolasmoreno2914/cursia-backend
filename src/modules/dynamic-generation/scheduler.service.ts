@@ -278,6 +278,31 @@ function sameJson(a: any, b: any): boolean {
  * (p.ej. batchId y luego videoId) pero no cambiar una existente; si no son
  * objetos deben ser iguales.
  */
+/**
+ * EV6 T5 B2 (m-11): claves de `output_summary` que escribe SOLO el servidor (procedencia de las
+ * preguntas, upgrade de video, modo/entrega del video, validación, invalidación). El ejecutor del
+ * NAVEGADOR (POST …/items/:id/complete, con ownerId) nunca las puede fijar ni pisar: se descartan
+ * de su `summary` antes de mezclar. Los workers internos del servidor (sin ownerId) no pasan por acá.
+ */
+export const SERVER_OWNED_SUMMARY_KEYS: readonly string[] = Object.freeze([
+  'sourceVideoItemRunId', 'cascadeFromItemRunId', 'regeneration', 'invalidation',
+  'upgradeId', 'videoUpgrade', 'videoUpgradeHistory', 'reusedVideogenJob', 'questionsOnly',
+  'mode', 'videoMode', 'videoModeOriginal', 'external', 'externalReservationKey', 'externalSubmitStartedAt',
+  'delivery', 'youtubeVideoId', 'youtubeUrl', 'youtubeUploadStartedAt', 'videogenStatus', 'videogenDownloadUrl',
+  'videoIdentity', 'v3Validation', 'artifactIds',
+]);
+
+/** `summary` del ejecutor del navegador sin las claves del servidor (y la lista de las descartadas). */
+export function stripServerOwnedSummaryKeys(summary: Record<string, any>): { summary: Record<string, any>; dropped: string[] } {
+  const out: Record<string, any> = {};
+  const dropped: string[] = [];
+  for (const [k, v] of Object.entries(summary ?? {})) {
+    if (SERVER_OWNED_SUMMARY_KEYS.includes(k)) dropped.push(k);
+    else out[k] = v;
+  }
+  return { summary: out, dropped };
+}
+
 export function mergeOutputSummary(
   existing: Record<string, any>,
   patch: Record<string, any>,
@@ -641,8 +666,15 @@ export class SchedulerService {
     const ids = [...new Set((output?.artifactIds ?? []).map(String))];
     if (ids.length === 0) return { ok: false, reason: 'no_artifacts' };
     if (ids.some((id) => !UUID_RE.test(id))) return { ok: false, reason: 'invalid_artifact_id' };
-    const summary = output?.summary ?? {};
-    if (!isPlainObject(summary)) return { ok: false, reason: 'invalid_summary' };
+    const rawSummary = output?.summary ?? {};
+    if (!isPlainObject(rawSummary)) return { ok: false, reason: 'invalid_summary' };
+    // m-11: el ejecutor del navegador (ownerId presente) nunca fija claves del servidor.
+    let summary: Record<string, any> = rawSummary;
+    if (ownerId !== undefined) {
+      const st = stripServerOwnedSummaryKeys(rawSummary);
+      summary = st.summary;
+      if (st.dropped.length) this.logger.warn(`completeItem ${itemRunId}: el ejecutor envió claves del servidor (descartadas): ${st.dropped.join(', ')}`);
+    }
 
     // V2.1 R11a: items LLM de rulesVersion 3 → el servidor valida el contenido
     // del artifact ANTES de aceptar (fuera de la transacción: la descarga no

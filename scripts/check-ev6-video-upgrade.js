@@ -827,6 +827,26 @@ const ENV_KEYS = [
       ], [true, false, false, true, false, false], 'regla');
     });
 
+    await check('m-11: el ejecutor del NAVEGADOR no puede fijar claves del servidor al completar (sourceVideoItemRunId, regeneration, mode, external, …); los workers internos sí escriben las suyas', async () => {
+      const SCH = L('modules/dynamic-generation/scheduler.service.js');
+      const evil = { sourceVideoItemRunId: 'otro-video', cascadeFromItemRunId: 'x', regeneration: { reason: 'video_upgrade' }, mode: 'real',
+        external: { videogenJobId: 'falso' }, videoUpgrade: { id: 'u' }, videoIdentity: {}, v3Validation: {}, delivery: 'completed', youtubeVideoId: 'AAAAAAAAAAA',
+        interactionCount: 4, promptVersion: 'v21-vint-2', chapterId: 'c1' };
+      const st = SCH.stripServerOwnedSummaryKeys(evil);
+      eq(st.summary, { interactionCount: 4, promptVersion: 'v21-vint-2', chapterId: 'c1' }, 'solo lo del ejecutor');
+      for (const k of ['sourceVideoItemRunId', 'cascadeFromItemRunId', 'regeneration', 'mode', 'external', 'videoUpgrade', 'videoIdentity', 'v3Validation', 'delivery', 'youtubeVideoId']) {
+        assert(st.dropped.includes(k), `descarta ${k}`);
+      }
+      // Integración (DB real): completar como NAVEGADOR (ownerId) un item ya reclamado con un sourceVideoItemRunId
+      // falso → el valor del servidor se conserva. Item LLM de v3 sin validación de contenido no hay: se usa el
+      // camino de merge del servidor directamente sobre la fila reclamada en I-4.
+      const row = await latest(I4.runId, `video_interactions:${I4.c1}`);
+      const merged = SCH.mergeOutputSummary(row.output_summary, SCH.stripServerOwnedSummaryKeys({ sourceVideoItemRunId: 'otro-video', interactionCount: 3 }).summary);
+      eq([merged.ok, merged.merged.sourceVideoItemRunId === row.output_summary.sourceVideoItemRunId || row.output_summary.sourceVideoItemRunId === undefined, merged.merged.interactionCount], [true, true, 3], 'merge conserva la procedencia');
+      const src = fs.readFileSync(path.join(REPO, 'src/modules/dynamic-generation/scheduler.service.ts'), 'utf8');
+      assert(/if \(ownerId !== undefined\) \{\s*const st = stripServerOwnedSummaryKeys\(rawSummary\)/.test(src), 'completeItemDetailed lo aplica en el camino del navegador');
+    });
+
     await check('I-1 empaquetado: un video real del upgrade cuyas preguntas siguen siendo las de la vista previa (upgrade cancelado antes) se OMITE (pendiente), nunca un H5P con preguntas de otro video', async () => {
       const PK = L('modules/dynamic-packaging/packaging-v3.js');
       const mf = { items: [{ key: 'video:x', type: 'video', chapterId: 'x' }, { key: 'video_interactions:x', type: 'video_interactions', chapterId: 'x' }] };
