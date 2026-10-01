@@ -237,6 +237,12 @@ export interface ClaimPayloadV3 {
   examBank?: ExamBankClaimFacts;
   moduleChapterIds?: string[];
   chapterId?: string;
+  /**
+   * P3 (fix I3): capacidades del schema de la experiencia que este backend acepta. El ejecutor del navegador
+   * usa el prompt v21-exp-6 (why/apply) SOLO si ve `eduFields: true`; si falta (backend anterior), se
+   * comporta como v21-exp-5 y no manda why/apply. Así el orden de deploy FE/BE no rompe la generación.
+   */
+  experienceFeatures?: { eduFields: boolean };
 }
 
 /**
@@ -1195,7 +1201,10 @@ export class SchedulerService {
       default:
         return undefined;
     }
-    if (row.type === 'experience') out.chapterId = row.chapter_id;
+    if (row.type === 'experience') {
+      out.chapterId = row.chapter_id;
+      out.experienceFeatures = { eduFields: true };
+    }
     if (row.type === 'final_exam') {
       out.finalExam = { minQuestions: FINAL_EXAM_QUESTION_RANGE.min, maxQuestions: FINAL_EXAM_QUESTION_RANGE.max };
     }

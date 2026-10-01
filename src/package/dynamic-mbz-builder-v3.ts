@@ -83,7 +83,7 @@ import {
   themeSha256,
   validateTheme,
 } from '../modules/theme-engine';
-import { ChapterExperience, VC_RUNTIME_VERSION, VC_SCHEMA_VERSION } from '../modules/visual-components';
+import { ChapterExperience, VC_RENDER_STYLE_VERSION, VC_RUNTIME_VERSION, VC_SCHEMA_VERSION } from '../modules/visual-components';
 import {
   CTA_BADGES,
   CourseFacts,
@@ -102,6 +102,7 @@ import {
   closingLabel,
   competenciesLabel,
   examInfoLabel,
+  experienceMovementWords,
   finalExamInfoLabel,
   finalExamNextLabel,
   libroCardLabel,
@@ -120,7 +121,9 @@ import type { H5pActivityType } from '../modules/course-shell';
 import { PackagingPlanV3, buildPackagingPlanV3, packagingPlanV3Sha256 } from '../modules/dynamic-packaging/packaging-plan-v3';
 import { compileLibroHtmlV3, libroWordCount } from './v3/libro-v3';
 import { downscaleCoverPng } from './v3/png-downscale';
-import { activityPackageFilename, h5pActivityInlineIntroHtml, introThemeFrom, scormIntroHtml } from './v3/activity-intro';
+import { ActivityFrameTone, activityPackageFilename, h5pActivityInlineIntroHtml, introThemeFrom, scormIntroHtml } from './v3/activity-intro';
+import { moduleTone } from '../modules/visual-components/edu';
+import { groundColor } from '../modules/visual-components/render';
 import { IdAllocator, buildQuizV3, parseScormManifestIds, scormActivityXmlV3 } from './v3/moodle-activities-v3';
 import { expectedExamPlan, planSlotCount, validateExamBank } from '../modules/course-shell/exam-bank';
 import type { ExamBankV1 } from '../modules/course-shell/exam-bank';
@@ -168,10 +171,13 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * tipo y slots aleatorios (`question_set_reference`), retroalimentación por opción + general;
  * emparejamiento del banco = definición como subpregunta y término como opción (fix 1). Los
  * paquetes con exámenes GIFT quedan byte a byte iguales a 3.3.0 (el bump invalida solo el reuse).
+ * 3.5.0 (P3, sistema visual educativo 2.0): labels con rótulo/forma/color por rol pedagógico, apertura
+ * «Capítulo N de T · ~X min» (minutos en facts desde las palabras medidas del experience), riel
+ * «Dónde estás» del módulo y la actividad H5P/SCORM enmarcada con el tono del módulo.
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.4.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.5.0';
 /** Versión del renderer de Visual Components que entra en la clave de reuse. */
-export const VC_RENDERER_VERSION = `vc${VC_SCHEMA_VERSION}-rt${VC_RUNTIME_VERSION}-theme${THEME_ENGINE_VERSION}`;
+export const VC_RENDERER_VERSION = `vc${VC_SCHEMA_VERSION}-rt${VC_RUNTIME_VERSION}-theme${THEME_ENGINE_VERSION}-style${VC_RENDER_STYLE_VERSION}`;
 
 /** Fecha fija de toda entrada del zip (UTC). */
 export const MBZ_V3_ZIP_FIXED_DATE = new Date(Date.UTC(2026, 0, 1, 0, 0, 0));
@@ -716,6 +722,14 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       ...(Object.keys(examBankSizeByModule).length ? { examBankSizeByModule } : {}),
       ...(finalExamBankSize !== undefined ? { finalExamBankSize } : {}),
       libroWordCount: libroWordCount(libroHtml),
+      // P3: palabras MEDIDAS del experience → minutos estimados del capítulo (facts).
+      experienceWordsByChapter: Object.fromEntries(allChapters.map((ch) => [ch.chapterId, experienceMovementWords(c.experiences.get(ch.chapterId))])),
+      // P3 (fix M2): duración medida de los videos reales (los pendientes no están en c.videos).
+      videoSecondsByChapter: Object.fromEntries(
+        allChapters
+          .map((ch) => [ch.chapterId, (c.videos.get(ch.chapterId) as { durationSec?: number } | undefined)?.durationSec] as const)
+          .filter(([, s]) => typeof s === 'number' && Number.isFinite(s) && s > 0),
+      ),
       libroHasBibliography: libroHtml.includes('id="bibliografia"'),
     },
   });
@@ -752,6 +766,13 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const h5pPackages: MbzV3H5pPackage[] = [];
   const mockPresentationChapters: string[] = [];
   const introTheme = introThemeFrom(theme);
+  // P3: marco de la actividad con el tono del módulo del capítulo (mismo que la tarjeta «Práctica calificada»).
+  const frameFor = (chapterNumber: number): ActivityFrameTone => {
+    const cf = facts.chapters.find((x) => x.number === chapterNumber);
+    if (!cf) throw new Error(`MBZ_V3_INVARIANT: capítulo ${chapterNumber} sin facts para el marco de la actividad`);
+    const mt = moduleTone(theme, moduleColor(theme, cf.moduleNumber - 1), groundColor(theme));
+    return { ink: mt.ink, soft: mt.soft, edge: mt.edge, chapterNumber };
+  };
 
   // Edu EV3 — botones de navegación: el shell deja marcadores cursia-cta://…; las secciones se
   // resuelven al instante y «siguiente actividad / evaluación» cuando el builder crea esa actividad
@@ -975,7 +996,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
           const built = await buildActivityH5p(act.payload, ch.chapterId, key, resolved.kinds.activity.passingGrade, cf.activityType);
           const filename = activityPackageFilename(key);
           addH5pActivity(sec, `${idp}:activity`, name, 'activity', key, filename, built.h5p, built.mainLibrary, (mid) =>
-            h5pActivityInlineIntroHtml({ packageFilename: filename, title: ch.title, activityMid: mid, theme: introTheme }),
+            h5pActivityInlineIntroHtml({ packageFilename: filename, title: ch.title, activityMid: mid, theme: introTheme, frame: frameFor(ch.chapterNumber) }),
           );
         } else {
           const a = W.newActivity('scorm', sec, name, `${idp}:activity`);
@@ -989,7 +1010,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
             W.addFile(a.ctx, 'mod_scorm', 'package', zipName, zipData, 'application/zip'),
             W.addDirEntry(a.ctx, 'mod_scorm', 'package'),
           ];
-          const introHtml = scormIntroHtml(introTheme);
+          const introHtml = scormIntroHtml(introTheme, frameFor(ch.chapterNumber));
           const k = resolved.kinds.activity;
           W.put(`${a.dir}/scorm.xml`, scormActivityXmlV3({
             aid: a.aid, mid: a.mid, ctx: a.ctx, name, introHtml, zipName, zipHash: sha1Buf(zipData), ids: mids,

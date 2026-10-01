@@ -4,7 +4,7 @@
  * HTML que emite el renderer y el que devuelve purify_html() de Moodle.
  *
  * - lintCleanSafe(html): el nivel base funciona con forceclean=1 (§X.1).
- * - extractText(html): texto en orden de lectura, para comparar equivalencias.
+ * - extractText(html): texto en orden de lectura, para comparar equivalencias (sin glifos decorativos .cvc-glyph).
  */
 
 import { contrastRatio } from '../theme-engine';
@@ -128,6 +128,8 @@ export function extractText(html: string): string {
       return;
     }
     if (NON_CONTENT.has(node.tag)) return;
+    // P3: el glifo de un ícono (solo en CLEAN_SAFE; en ENHANCED es un SVG sin texto) es decorativo.
+    if ((node.attrs.class || '').split(/\s+/).includes('cvc-glyph')) return;
     const block = BLOCK.has(node.tag);
     if (block) out.push(' ');
     node.children.forEach(walk);

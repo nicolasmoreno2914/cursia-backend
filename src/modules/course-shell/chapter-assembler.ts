@@ -22,13 +22,17 @@
  * Las transiciones son microcopy determinístico (microcopy.ts); el LLM nunca
  * escribe navegación ni nombra recursos (lo garantiza validateExperience).
  */
-import type { ResolvedTheme } from '../theme-engine';
+import { moduleColor, ResolvedTheme } from '../theme-engine';
+import { eduIcon, EduIcon, moduleTone, Tone } from '../visual-components/edu';
+import { groundColor } from '../visual-components/render';
 import { ChapterExperience, assertValidExperience, lintCleanSafe, renderMovement } from '../visual-components';
 import { labelHtml, inlineHtml } from '../visual-components/text';
 import type { ChapterFacts, CourseFacts, ModuleFacts } from './facts';
 import {
   Hx,
   ShellRenderOptions,
+  st,
+  surfOn,
   bgSurf,
   box,
   eyebrow,
@@ -43,7 +47,7 @@ import {
   transitionBox,
   unprotectedText,
 } from './html';
-import { COPY, activityInstruction, bridgeLead, moduleEndText, moduleExamTransition } from './microcopy';
+import { COPY, activityTask, bridgeLead, moduleEndText, moduleExamTransition } from './microcopy';
 import { CTA_ACTIVITY, ctaButton, ctaSection } from './cta';
 import { ChapterNextStep, chapterNextSteps } from './section-layout';
 
@@ -77,6 +81,10 @@ export interface AssembleChapterInput {
   finalExamEnabled: boolean;
   theme: ResolvedTheme;
   options?: ShellRenderOptions;
+  /** P3 — total de capítulos del curso (facts.counts.chapters) para «Capítulo N de T»; omitido = sin «de T». */
+  courseChapterCount?: number;
+  /** P3 — capítulos del módulo (de facts) para el riel del cierre. */
+  moduleChapters?: Array<{ number: number; title: string }>;
 }
 
 /** Secuencia de slots (solo `kind`/`role`) — útil para tests y para R12. */
@@ -145,9 +153,14 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     kicker: `Módulo ${mod.number} · Capítulo ${ch.number}`,
     title: ch.title,
     numeral: ch.number < 10 ? `0${ch.number}` : String(ch.number),
+    progress: input.courseChapterCount ? `Módulo ${mod.number} · Capítulo ${ch.number} de ${input.courseChapterCount}` : undefined,
+    minutes: ch.estimatedMinutes,
   };
+  const mc = moduleColor(theme, mod.number - 1);
+  const mt = moduleTone(theme, mc, groundColor(theme));
+  const fill = { bg: mt.fill, fg: mt.onFill };
   const mv = (role: 'opening' | 'deepening' | 'video_primer' | 'synthesis' | 'self_check' | 'closing') =>
-    renderMovement(exp.movements[role], theme, { uid: uid(role), level, opener: role === 'opening' ? opener : undefined });
+    renderMovement(exp.movements[role], theme, { uid: uid(role), level, opener: role === 'opening' ? opener : undefined, module: mc });
   const label = (role: ChapterLabelRole, name: string, html: string): ChapterSlot => ({
     kind: 'label',
     role,
@@ -165,15 +178,15 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   const headsWithHero = Array.isArray(opening) && opening.length > 0 && (opening[0] as { type?: string }).type === 'hero';
   const head = headsWithHero ? '' : eyebrow(h, opener.kicker, s) + heading(h, 'h2', ch.title, s);
   const examNext = lastOfModule && mod.examEnabled;
-  slots.push(label('opening', 'Apertura', injectIntoMovement(mv('opening'), head, chapterRoute(h, ch, examNext))));
+  slots.push(label('opening', 'Apertura', injectIntoMovement(mv('opening'), head, chapterRoute(h, ch, examNext, mt))));
   // [2] Presentación (obligatoria en V2.1).
   slots.push({ kind: 'presentation' });
   // [3] Profundización.
   slots.push(label('deepening', 'Profundización', mv('deepening')));
   // [4] Video: guía previa (plantilla + conceptos del LLM) + transición → video.
   if (ch.videoEnabled) {
-    const before = eyebrow(h, 'Video interactivo', s) + heading(h, 'h3', COPY.videoPrimerTitle, s) + pHtml(h, labelHtml(COPY.videoPrimerLead), s);
-    const after = transitionBox(h, pHtml(h, labelHtml(COPY.videoGo), alt, { last: true }));
+    const before = chipH(h, 'video', 'Video interactivo', mt, s) + heading(h, 'h3', COPY.videoPrimerTitle, s) + pHtml(h, labelHtml(COPY.videoPrimerLead), s);
+    const after = transitionBox(h, pHtml(h, labelHtml(COPY.videoGo), alt, { last: true }), mt.ink);
     slots.push(label('video_primer', 'Antes del video', injectIntoMovement(mv('video_primer'), before, after)));
     slots.push({ kind: 'video_h5p' });
   } else if (ch.videoPendingNotice) {
@@ -189,12 +202,23 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   // [6] Actividad (instrucción determinística con nota mínima/intentos de facts) o repaso no calificado.
   if (ch.activityEnabled) {
     const k = assessment.kinds.activity;
-    const inner =
-      eyebrow(h, 'Práctica calificada', s) +
-      heading(h, 'h3', COPY.activityTitle, s) +
-      pHtml(h, labelHtml(activityInstruction(k.passingGrade, k.attempts, ch.activityVariant === 'scorm' ? 'scorm' : ch.activityType)), s, { last: true }) +
-      // Edu EV3: botón a la actividad (el builder resuelve el marcador al crearla).
-      ctaButton(h, CTA_ACTIVITY, `Iniciar actividad del capítulo ${ch.number} →`, s);
+    const pss = surfOn(h.t, mt.soft);
+    const factsRow =
+      `<p class="cvc-facts-row"${st(h, [['margin', '0 0 14px 0'], ['padding', 0], ['color', pss.fg], ['font-size', h.t.typography.sizeSmallPx], ['font-weight', '600'], ['line-height', '1.6']])}>` +
+      // fix M1: separador visible «·» entre los dos datos (en CLEAN los espacios colapsan).
+      `<span>${eduIcon(h.enh, 'check', mt.ink, 18)} ${labelHtml(`Nota mínima: ${k.passingGrade} de 100`)}</span><span class="cvc-sep"${st(h, [['color', pss.fg2]])}>${labelHtml(' · ')}</span>` +
+      `<span>${eduIcon(h.enh, 'repaso', mt.ink, 18)} ${labelHtml(k.attempts === 0 ? 'Intentos: sin límite' : `Intentos: ${k.attempts}`)}</span></p>`;
+    const inner = box(
+      h,
+      chipH(h, 'practica', `Práctica calificada · Capítulo ${ch.number}`, mt, pss, true) +
+        heading(h, 'h3', COPY.activityTitle, pss) +
+        factsRow +
+        pHtml(h, labelHtml(activityTask(ch.activityVariant === 'scorm' ? 'scorm' : ch.activityType)), pss, { last: true }) +
+        // Edu EV3: botón a la actividad (el builder resuelve el marcador al crearla).
+        ctaButton(h, CTA_ACTIVITY, `Iniciar actividad →`, pss, fill),
+      { s: pss, border: mt.edge },
+      { cls: 'cvc-practice' },
+    );
     slots.push(label('activity_instruction', 'Práctica', root(h, uid('activity_instruction'), inner)));
     slots.push({ kind: 'activity', variant: ch.activityVariant as 'h5p' | 'scorm' });
   } else {
@@ -205,7 +229,7 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   // M12: el puente del LLM ("a continuación…") solo cuando realmente sigue otro
   // capítulo; antes de un examen de módulo o al final del curso manda la
   // transición determinística (nunca dos mensajes de navegación contradictorios).
-  let after = input.nextChapter && !examNext ? paras(h, exp.bridge_to_next, s) : '';
+  let after = input.nextChapter && !examNext ? `<div class="cvc-bridge"${st(h, [['margin', '28px 0 0 0'], ['color', s.fg]])}>${paras(h, exp.bridge_to_next, s)}</div>` : '';
   // R14-A (I5): la transición dice primero qué repasar/reintentar y después el siguiente paso,
   // sin repetir "Con este capítulo terminas…" dos veces.
   const bridgeLeadText = bridgeLead({ activityEnabled: ch.activityEnabled, activityAttempts: assessment.kinds.activity.attempts });
@@ -233,11 +257,13 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     nextText = COPY.lastChapterOfCourse;
     button = step.kind === 'final_exam' ? 'Ir a la evaluación final →' : 'Ir al cierre del curso →';
   }
+  after += moduleRail(h, mod, ch, input.moduleChapters, mt);
   after += transitionBox(
     h,
     pHtml(h, labelHtml(bridgeLeadText), alt, nextText ? { secondary: true } : { secondary: true, last: true }) +
       (nextText ? pHtml(h, inlineHtml(nextText), alt, { last: true }) : '') +
-      ctaButton(h, ctaSection(step.sectionNum), button, alt),
+      ctaButton(h, ctaSection(step.sectionNum), button, alt, fill),
+    mt.ink,
   );
   slots.push(label('closing', 'Cierre', injectIntoMovement(mv('closing'), '', after)));
   return slots;
@@ -248,15 +274,63 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
  * flags del capítulo (nunca nombra un recurso que no existe). El estudiante sabe qué viene y en qué
  * orden, como en un curso, no como en un artículo.
  */
-function chapterRoute(h: Hx, ch: ChapterFacts, examNext: boolean): string {
-  const steps = ['Presentación', 'Profundización'];
-  if (ch.videoEnabled) steps.push('Video interactivo');
-  steps.push('Síntesis');
-  steps.push(ch.activityEnabled ? 'Práctica calificada' : 'Repaso');
-  if (examNext) steps.push('Evaluación del módulo');
-  const cs = toneSurf(h, 'alt');
-  const line = steps.map((x) => `<strong>${labelHtml(x)}</strong>`).join(labelHtml(' → '));
-  return box(h, eyebrow(h, 'En este capítulo', cs.s) + pHtml(h, line, cs.s, { last: true }), cs, { cls: 'cvc-route' });
+function chapterRoute(h: Hx, ch: ChapterFacts, examNext: boolean, mt: Tone): string {
+  const steps: Array<[EduIcon, string]> = [['presentacion', 'Presentación'], ['libro', 'Profundización']];
+  if (ch.videoEnabled) steps.push(['video', 'Video interactivo']);
+  steps.push(['logro', 'Síntesis']);
+  steps.push(ch.activityEnabled ? ['practica', 'Práctica calificada'] : ['repaso', 'Repaso']);
+  if (examNext) steps.push(['examen', 'Evaluación del módulo']);
+  const s = bgSurf(h);
+  const items = steps
+    .map(([ic, x]) => `<li${st(h, [['margin', '0 0 6px 0'], ['padding', 0], ['color', s.fg], ['font-weight', '600']])}>${eduIcon(h.enh, ic, mt.ink, 20)} ${labelHtml(x)}</li>`)
+    .join('');
+  return (
+    `<div class="cvc-route"${st(h, [['margin', '24px 0 0 0'], ['padding', '16px 0 0 0'], ['color', s.fg], ['border-top', `1px solid ${h.t.color.border}`]])}>` +
+    eyebrow(h, 'Tu recorrido en este capítulo', s, { color: mt.ink, sentence: true }) +
+    `<ol class="cvc-route-steps"${st(h, [['list-style', 'none'], ['margin', 0], ['padding', 0]])}>${items}</ol></div>`
+  );
+}
+
+/** P3 — rótulo (ícono + etiqueta) del shell, mismo lenguaje que los bloques. */
+function chipH(h: Hx, icon: EduIcon, text: string, mt: Tone, s: { bg: string; fg: string }, onPanel = false): string {
+  const ink = mt.ink;
+  return (
+    `<p class="cvc-meta cvc-chip"${st(
+      h,
+      [['margin', '0 0 12px 0'], ['color', ink], ['font-size', h.t.typography.sizeSmallPx], ['font-weight', '700'], ['line-height', '1.4']],
+      [['display', 'inline-flex'], ['align-items', 'center'], ['gap', '8px'], ['background-color', onPanel ? groundColor(h.t) : mt.soft], ['padding', '5px 14px 5px 10px'], ['border-radius', '999px']],
+    )}>${eduIcon(h.enh, icon, ink, 20)} ${labelHtml(text)}</p>`
+  );
+}
+
+/**
+ * P3 — «Dónde estás en el módulo»: posición del capítulo en su módulo (de facts), nunca datos del
+ * estudiante. El capítulo actual va relleno con el color del módulo; los demás, delineados.
+ */
+function moduleRail(h: Hx, mod: ModuleFacts, ch: ChapterFacts, chapters: Array<{ number: number; title: string }> | undefined, mt: Tone): string {
+  if (!chapters || !chapters.length) return '';
+  const s = bgSurf(h);
+  // fix M4: MISMO markup en ambos niveles — número en la línea del título (CLEAN_SAFE: «1 Título»); en
+  // ENHANCED el <style> del label lo dibuja como insignia (rellena en el capítulo actual).
+  const num = (inner: string) => `<strong class="cvc-n"${st(h, [['color', mt.ink]])}>${inner}</strong> `;
+  const items = chapters
+    .map((c) => {
+      const cur = c.number === ch.number;
+      return (
+        `<li${cur ? ' class="cvc-cur"' : ''}${st(h, [['margin', '0 0 10px 0'], ['padding', 0], ['color', cur ? s.fg : s.fg2], ['font-weight', cur ? '700' : '400'], ['line-height', '1.4']])}>` +
+        num(labelHtml(String(c.number))) +
+        `<span class="cvc-t">${labelHtml(c.title)}${cur ? `<span${st(h, [['color', mt.ink], ['font-weight', '700']])}>${labelHtml(' · estás aquí')}</span>` : ''}</span></li>`
+      );
+    })
+    .join('');
+  const exam = mod.examEnabled
+    ? `<li${st(h, [['margin', '0'], ['padding', 0], ['color', s.fg2], ['line-height', '1.4']])}>${num(eduIcon(h.enh, 'examen', mt.ink, 18))}<span class="cvc-t">${labelHtml(`Evaluación del módulo ${mod.number}`)}</span></li>`
+    : '';
+  return (
+    `<div class="cvc-modrail"${st(h, [['margin', '40px 0 0 0'], ['padding', '20px 0 0 0'], ['color', s.fg], ['border-top', `1px solid ${h.t.color.border}`]])}>` +
+    eyebrow(h, `Dónde estás · Módulo ${mod.number}: ${mod.title}`, s, { color: mt.ink, sentence: true }) +
+    `<ol class="cvc-mrail"${st(h, [['list-style', 'none'], ['margin', '12px 0 0 0'], ['padding', 0]])}>${items}${exam}</ol></div>`
+  );
 }
 
 /** Slots de todos los capítulos del curso, en orden (atajo para R12 y los tests). */
@@ -286,7 +360,10 @@ export function assembleAllChapters(
         finalExamEnabled: facts.finalExam.enabled,
         theme,
         options,
+        courseChapterCount: facts.counts.chapters,
+        moduleChapters: facts.chapters.filter((x) => x.moduleId === mod.id).map((x) => ({ number: x.number, title: x.title })),
       }),
     };
   });
 }
+

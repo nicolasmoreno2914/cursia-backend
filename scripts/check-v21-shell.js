@@ -390,8 +390,9 @@ async function pureChecks() {
         const mod = facts.modules.find((m) => m.id === ch.moduleId);
         const last = mod.chapterNumbers[mod.chapterNumbers.length - 1] === ch.number;
         const html = slots.find((s) => s.role === 'opening').html;
-        const route = vc.extractText(html.slice(html.indexOf('cvc-route')));
-        assert(route.includes('En este capítulo') && route.includes('Presentación') && route.includes('Síntesis'), `cap ${chapterNumber}: ${route}`);
+        // P3: el recorrido es una lista de pasos con ícono («Tu recorrido en este capítulo»); el <style> también nombra .cvc-route-steps.
+        const route = vc.extractText(html.slice(html.indexOf('<div class="cvc-route"')));
+        assert(route.includes('Tu recorrido en este capítulo') && route.includes('Presentación') && route.includes('Síntesis'), `cap ${chapterNumber}: ${route}`);
         eq(route.includes('Video interactivo'), ch.videoEnabled, `cap ${chapterNumber} video`);
         eq(route.includes('Práctica calificada'), ch.activityEnabled, `cap ${chapterNumber} práctica`);
         eq(route.includes('Repaso'), !ch.activityEnabled, `cap ${chapterNumber} repaso`);
@@ -419,9 +420,10 @@ async function pureChecks() {
             assert(/repasa/.test(trans) && /repasa lo aprendido/.test(selfLead), `cap ${chapterNumber}: el puente no dice "repasa"`);
           } else {
             const instr = vc.extractText(slots.find((s) => s.role === 'activity_instruction').html);
-            assert(/actividad práctica que sigue es calificada/.test(instr) && instr.includes('70 de 100') && /todas las veces que quieras/.test(instr), `instrucción: ${instr}`);
-            assert(/Pon a prueba lo aprendido (Responderás|Arrastrarás|Completarás|Resolverás) /.test(instr), `cap ${chapterNumber}: la instrucción no dice qué hará el estudiante: ${instr}`);
-            assert(instr.includes(`Iniciar actividad del capítulo ${chapterNumber} →`) && slots.find((s) => s.role === 'activity_instruction').html.includes('href="cursia-cta://next-activity"'), `cap ${chapterNumber}: botón «Iniciar actividad»`);
+            // P3: tarjeta «Práctica calificada · Capítulo N» con la fila de datos (de facts) y la tarea; el botón no repite el capítulo.
+            assert(instr.startsWith(`Práctica calificada · Capítulo ${chapterNumber} Pon a prueba lo aprendido`) && instr.includes('Nota mínima: 70 de 100') && instr.includes('Intentos: sin límite'), `instrucción: ${instr}`);
+            assert(/Intentos: sin límite (Responderás|Arrastrarás|Completarás|Resolverás) /.test(instr), `cap ${chapterNumber}: la instrucción no dice qué hará el estudiante: ${instr}`);
+            assert(instr.endsWith('Iniciar actividad →') && slots.find((s) => s.role === 'activity_instruction').html.includes('href="cursia-cta://next-activity"'), `cap ${chapterNumber}: botón «Iniciar actividad»`);
           }
         }
       }
@@ -460,6 +462,51 @@ async function pureChecks() {
     assert(all2.filter((l) => /cursia-cta:\/\/next-exam/.test(l.html)).length === f2.modules.filter((m) => m.examEnabled).length + (f2.finalExam.enabled ? 1 : 0), 'un botón por evaluación');
     throwsRe(() => S.examInfoLabel(f2.modules[1], f2, THEME), /no tiene examen/, 'examen inexistente');
     throwsRe(() => S.finalExamInfoLabel(f4, THEME), /no tiene examen final/, 'final inexistente');
+  });
+
+  await check('P3: apertura «Módulo M · Capítulo N de T · ~X min» (X de facts, palabras medidas), riel «Dónde estás» del módulo y CTA en el color del módulo', () => {
+    // experienceWordCount: solo texto que lee el estudiante (sin type/kind/variant/chapterId).
+    eq(S.experienceWordCount({ type: 'hero', title: 'Uno dos', lead: 'tres', chapterId: 'cap-x', items: ['cuatro cinco', 7] }), 5, 'experienceWordCount');
+    eq([S.estimateChapterMinutes({ words: 1800, slideCount: 10, videoEnabled: true, activityEnabled: true }), S.estimateChapterMinutes({ words: 10, slideCount: 0, videoEnabled: false, activityEnabled: false })], [30, 5], 'estimateChapterMinutes');
+    // fix M2: la duración MEDIDA del video reemplaza el estimado fijo (6 min) — 20 min de video → 45, no 30.
+    eq(S.estimateChapterMinutes({ words: 1800, slideCount: 10, videoEnabled: true, activityEnabled: true, videoSeconds: 1200 }), 45, 'video medido');
+    const words = {};
+    const exps = F.experiencesFor(c2.manifest);
+    for (const id of Object.keys(exps)) words[id] = S.experienceMovementWords(exps[id]);
+    // fix M2: solo cuentan los movimientos que el capítulo muestra (sin video → sin guía previa; con actividad → sin repaso).
+    const onlyHidden = {};
+    for (const id of Object.keys(exps)) onlyHidden[id] = { ...words[id], video_primer: 5000, self_check: 5000 };
+    const fh = factsOf(c2, { artifacts: { ...F.measuredArtifacts(c2.manifest), experienceWordsByChapter: onlyHidden } });
+    const fb = factsOf(c2, { artifacts: { ...F.measuredArtifacts(c2.manifest), experienceWordsByChapter: words } });
+    fb.chapters.forEach((c, i) => {
+      if (!c.videoEnabled && c.activityEnabled) eq(fh.chapters[i].estimatedMinutes, c.estimatedMinutes, `cap ${c.number}: guía de video y repaso ocultos no suman minutos`);
+      else assert(fh.chapters[i].estimatedMinutes > c.estimatedMinutes, `cap ${c.number}: lo que se muestra sí suma`);
+    });
+    const fw = factsOf(c2, { artifacts: { ...F.measuredArtifacts(c2.manifest), experienceWordsByChapter: words } });
+    assert(fw.chapters.every((c) => Number.isInteger(c.estimatedMinutes) && c.estimatedMinutes >= 5 && c.estimatedMinutes % 5 === 0), 'minutos en facts');
+    assert(S.factsNumberSet(fw).has(fw.chapters[0].estimatedMinutes), 'los minutos son números de facts');
+    eq(f2.chapters.some((c) => c.estimatedMinutes !== undefined), false, 'sin palabras medidas no hay minutos');
+    let threw = false;
+    try { factsOf(c2, { artifacts: { ...F.measuredArtifacts(c2.manifest), experienceWordsByChapter: { ...words, intruso: 3 } } }); } catch (e) { threw = /no está en el Manifest/.test(e.message); }
+    assert(threw, 'palabras de un capítulo desconocido → falla');
+    for (const theme of [THEMES[0], THEMES[6]].map((x) => x.theme)) {
+      for (const level of [undefined, 'enhanced']) {
+        const all = S.assembleAllChapters(fw, exps, theme, level ? { level } : undefined);
+        for (const { chapterNumber, slots } of all) {
+          const ch = fw.chapters[chapterNumber - 1];
+          const mod = fw.modules.find((m) => m.id === ch.moduleId);
+          const open = vc.extractText(slots.find((s) => s.role === 'opening').html);
+          assert(open.includes(`Módulo ${mod.number} · Capítulo ${chapterNumber} de ${fw.counts.chapters}`) && open.includes(`~${ch.estimatedMinutes} min`), `cap ${chapterNumber}: progreso: ${open.slice(0, 120)}`);
+          const closing = slots.find((s) => s.role === 'closing').html;
+          const rail = vc.extractText(closing.slice(closing.indexOf('<div class="cvc-modrail"')));
+          assert(rail.startsWith(`Dónde estás · Módulo ${mod.number}: ${mod.title}`) && rail.includes(`${ch.title} · estás aquí`), `cap ${chapterNumber}: riel: ${rail.slice(0, 160)}`);
+          for (const n of mod.chapterNumbers) assert(rail.includes(fw.chapters[n - 1].title), `cap ${chapterNumber}: el riel lista el capítulo ${n}`);
+          eq(rail.includes(`Evaluación del módulo ${mod.number}`), mod.examEnabled, `cap ${chapterNumber}: evaluación en el riel`);
+          const mt = vc.moduleTone(theme, te.moduleColor(theme, mod.number - 1), theme.personality.plate ? theme.color.bg : theme.color.surface);
+          assert(closing.includes(`class="cvc-btn-wrap" style="background-color:${mt.fill}`), `cap ${chapterNumber}: botón del cierre en el color del módulo`);
+        }
+      }
+    }
   });
 
   await check('lint de números: todo número del shell y de las transiciones ∈ factsNumberSet (2 y 4 módulos, con horas)', () => {
@@ -783,6 +830,22 @@ async function pureChecks() {
     for (const [ctx, text] of ok) eq(V(ctx, text).ok, true, `válido ${ctx.type}`);
     eq(V(ok[5][0], F.FINAL_GIFT).summary, { questionCount: 12 }, 'summary GIFT');
     eq(V(ok[3][0], JSON.stringify(vdoc)).summary, { interactionCount: 5 }, 'summary video');
+    // P3: why/apply se exigen desde v21-exp-6 (antes, la experiencia sin ellos sigue válida); métricas en el summary.
+    const expCtx = (pv) => ({ type: 'experience', itemKey: 'experience:c1', chapterId: 'c1', promptVersion: pv });
+    const plainExp = F.experienceFor('c1');
+    eq(S.eduFieldsApply('v21-exp-6') && S.eduFieldsApply('v21-exp-12') && !S.eduFieldsApply('v21-exp-5') && !S.eduFieldsApply(null), true, 'eduFieldsApply');
+    eq(V(expCtx('v21-exp-5'), JSON.stringify(plainExp)).ok, true, 'v21-exp-5 sin why/apply: válida');
+    const missing = V(expCtx('v21-exp-6'), JSON.stringify(plainExp));
+    eq([codes(missing), missing.errors.length, /"why"/.test(missing.errors[0].message) && /"apply"/.test(missing.errors[1].message)], [['EDU_FIELDS_MISSING'], 2, true], 'v21-exp-6 sin why/apply: EDU_FIELDS_MISSING (why y apply)');
+    const withEdu = JSON.parse(JSON.stringify(plainExp));
+    const dp = withEdu.movements.deepening;
+    dp[0].why = 'Te ahorra malentendidos con el cliente.'; dp[0].apply = 'Usa una pregunta abierta en tu próxima llamada.';
+    dp[1].why = 'Ordena una conversación difícil.'; dp[1].apply = 'Anota las fases antes de tu siguiente reunión.';
+    const vr = V(expCtx('v21-exp-6'), JSON.stringify(withEdu));
+    eq(vr.ok, true, `v21-exp-6 con why/apply: ${JSON.stringify(vr.errors)}`);
+    eq([vr.summary.edu.why, vr.summary.edu.apply, vr.summary.edu.longestTextRunWords > 0], [2, 2, true], 'métricas P3 en el summary');
+    dp[0].why = 'Revisa el video del capítulo.';
+    eq(codes(V(expCtx('v21-exp-6'), JSON.stringify(withEdu))).includes('RESOURCE_MENTION'), true, 'why pasa por los lints de recursos');
     const bad = [
       [ok[0][0], '{no json', 'JSON_INVALID'],
       [ok[0][0], JSON.stringify({ ...F.courseIntroFixture(), closing: 'Revisa el video del capítulo para cerrar el recorrido completo y seguir aprendiendo siempre con tu equipo.' }), 'RESOURCE_MENTION'],
@@ -1007,7 +1070,8 @@ async function dbChecks() {
 
     await check('DB claim v3: experience/module_intro/final_exam/activity traen su bloque v3 (artifact validado, rotación, journey, rango)', async () => {
       const e = await claim(['experience']);
-      eq([e.type, e.chapterId, e.claimPayload], ['experience', C1, { validatedArtifactType: 'dynamic_experience_json', chapterId: C1 }], 'experience');
+      // P3 (fix I3): el claim anuncia que este backend acepta why/apply (el ejecutor usa v21-exp-6 solo con esto).
+      eq([e.type, e.chapterId, e.claimPayload], ['experience', C1, { validatedArtifactType: 'dynamic_experience_json', chapterId: C1, experienceFeatures: { eduFields: true } }], 'experience');
       assert(e.dependencyArtifacts !== undefined, 'dependencyArtifacts');
       const mi = await claim(['module_intro']);
       eq([mi.type, mi.claimPayload.moduleChapterIds], ['module_intro', [C1, C2]], 'module_intro');

@@ -126,14 +126,17 @@ export function resourceMentionKind(match: string): ResourceKind {
   return 'other';
 }
 
-function transitionTexts(html: string): string[] {
+function transitionTexts(html: string, kind: 'nav' | 'rail' = 'nav'): string[] {
   const out: string[] = [];
   const walk = (n: HtmlNode) => {
     if (n.kind !== 'el') return;
     // EV4b: el recorrido «En este capítulo» (cvc-route) también es navegación determinística:
     // pasa por las mismas reglas (no promete video, práctica ni evaluación que no existan).
     const cls = (n.attrs.class || '').split(/\s+/);
-    if (cls.includes('cvc-transition') || cls.includes('cvc-route')) {
+    // P3: la línea de progreso de la apertura también es navegación (cifras de facts). El riel «Dónde
+    // estás» (cvc-modrail) describe el MÓDULO: se devuelve aparte (kind 'rail') con sus propias reglas.
+    const isRail = cls.includes('cvc-modrail');
+    if (kind === 'rail' ? isRail : !isRail && (cls.includes('cvc-transition') || cls.includes('cvc-route') || cls.includes('cvc-progress'))) {
       out.push(extractText(serialize(n)));
       return;
     }
@@ -653,6 +656,15 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
         if (!allowed.activity && /\b(actividad|práctica|practica)\b/i.test(t)) add('TRANSITION_DISABLED_RESOURCE', a.idnumber, 'transición habla de práctica sin actividad');
         if (!allowed.exam && /evaluaci[oó]n del m[oó]dulo/i.test(t)) add('TRANSITION_DISABLED_RESOURCE', a.idnumber, 'transición promete una evaluación del módulo inexistente');
         if (!allowed.final_exam && /evaluaci[oó]n final|examen final/i.test(t)) add('TRANSITION_DISABLED_RESOURCE', a.idnumber, 'un capítulo no promete el examen final');
+      }
+      // P3: el riel del módulo — cifras de facts; nombra la evaluación del módulo solo si el módulo la tiene,
+      // y nunca video, práctica ni evaluación final.
+      const railMod = moduleById.get(chapterById.get(chm[1])?.moduleId ?? '');
+      for (const t of transitionTexts(a.intro, 'rail').map((x) => stripStructureTitles(x, facts))) {
+        const bad = lintShellNumbers(t, facts);
+        if (bad.length) add('NUMBER_NOT_FROM_FACTS', a.idnumber, `riel del módulo con cifras fuera de facts: ${bad.join(', ')}`);
+        if (!railMod?.examEnabled && /evaluaci[oó]n del m[oó]dulo/i.test(t)) add('TRANSITION_DISABLED_RESOURCE', a.idnumber, 'el riel promete una evaluación del módulo inexistente');
+        if (/\bvideos?\b|\b(actividad|práctica|practica)\b|evaluaci[oó]n final|examen final/i.test(t)) add('TRANSITION_DISABLED_RESOURCE', a.idnumber, 'el riel del módulo nombra un recurso que no es un capítulo ni la evaluación del módulo');
       }
     }
   }

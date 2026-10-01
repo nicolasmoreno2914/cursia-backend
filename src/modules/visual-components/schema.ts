@@ -33,15 +33,21 @@ export type VcComponentType =
 
 export type VcCalloutVariant = 'tip' | 'warning' | 'info' | 'example';
 
+/** P3 — «¿Por qué importa?» (why) y «¿Cómo lo aplicas?» (apply), opcionales. */
+export interface VcEduFields {
+  why?: string;
+  apply?: string;
+}
+
 export interface VcHero { type: 'hero'; eyebrow?: string; title: string; lead: string }
 export interface VcLearningObjectives { type: 'learning_objectives'; title?: string; items: string[] }
-export interface VcConceptCards { type: 'concept_cards'; title?: string; cards: { term: string; definition: string }[] }
+export interface VcConceptCards extends VcEduFields { type: 'concept_cards'; title?: string; cards: { term: string; definition: string }[] }
 export interface VcRevealCards { type: 'reveal_cards'; title?: string; cards: { front: string; back: string }[] }
-export interface VcAccordion { type: 'accordion'; title?: string; items: { heading: string; body: string }[] }
-export interface VcTabs { type: 'tabs'; title?: string; tabs: { label: string; body: string }[] }
-export interface VcTimeline { type: 'timeline'; title?: string; events: { marker: string; heading: string; body: string }[] }
-export interface VcProcessSteps { type: 'process_steps'; title?: string; steps: { heading: string; body: string }[] }
-export interface VcComparison {
+export interface VcAccordion extends VcEduFields { type: 'accordion'; title?: string; items: { heading: string; body: string }[] }
+export interface VcTabs extends VcEduFields { type: 'tabs'; title?: string; tabs: { label: string; body: string }[] }
+export interface VcTimeline extends VcEduFields { type: 'timeline'; title?: string; events: { marker: string; heading: string; body: string }[] }
+export interface VcProcessSteps extends VcEduFields { type: 'process_steps'; title?: string; steps: { heading: string; body: string }[] }
+export interface VcComparison extends VcEduFields {
   type: 'comparison';
   title?: string;
   /** Sujetos comparados (encabezados de columna), 2–4. */
@@ -49,11 +55,11 @@ export interface VcComparison {
   /** Criterios (filas), 2–8; `cells.length === columns.length`. */
   rows: { label: string; cells: string[] }[];
 }
-export interface VcMythReality { type: 'myth_reality'; title?: string; pairs: { myth: string; reality: string }[] }
-export interface VcCaseScenario { type: 'case_scenario'; title: string; narrative: string; questions: string[] }
-export interface VcChecklist { type: 'checklist'; title?: string; items: string[] }
+export interface VcMythReality extends VcEduFields { type: 'myth_reality'; title?: string; pairs: { myth: string; reality: string }[] }
+export interface VcCaseScenario extends VcEduFields { type: 'case_scenario'; title: string; narrative: string; questions: string[] }
+export interface VcChecklist extends VcEduFields { type: 'checklist'; title?: string; items: string[] }
 export interface VcReflection { type: 'reflection'; prompt: string; hint?: string }
-export interface VcCallout { type: 'callout'; variant: VcCalloutVariant; title?: string; body: string }
+export interface VcCallout { type: 'callout'; variant: VcCalloutVariant; title?: string; body: string; apply?: string }
 export interface VcSummaryVisual { type: 'summary_visual'; central: string; points: string[] }
 export interface VcSelfCheck { type: 'self_check'; title?: string; items: { q: string; a: string }[] }
 /**
@@ -61,7 +67,7 @@ export interface VcSelfCheck { type: 'self_check'; title?: string; items: { q: s
  * Los datos son ilustrativos (hipotéticos): se permiten cifras y porcentajes en este componente,
  * nunca cantidades de la estructura del curso (ver lintQuantityClaims, modo ilustrativo).
  */
-export interface VcWorkedExample {
+export interface VcWorkedExample extends VcEduFields {
   type: 'worked_example';
   title: string;
   situation: string;
@@ -81,7 +87,7 @@ export type VcDiagramKind = VcNodeDiagramKind | 'decision';
  *  - matrix: exactamente 4 cuadrantes [arriba-izq, arriba-der, abajo-izq, abajo-der] + x_axis/y_axis
  *    (cada eje crece hacia la derecha / hacia arriba).
  */
-export interface VcNodeDiagram {
+export interface VcNodeDiagram extends VcEduFields {
   type: 'diagram';
   kind: VcNodeDiagramKind;
   title: string;
@@ -108,7 +114,7 @@ export interface VcDecisionNode {
   yes: VcDecisionBranch;
   no: VcDecisionBranch;
 }
-export interface VcDecisionDiagram {
+export interface VcDecisionDiagram extends VcEduFields {
   type: 'diagram';
   kind: 'decision';
   title?: string;
@@ -156,6 +162,14 @@ export type VcFieldSpec =
 
 const T = (max: number, optional = false): VcFieldSpec => ({ kind: 'text', max, optional });
 const TITLE = T(120, true);
+/**
+ * P3 — campos opcionales «¿Por qué importa?» / «¿Cómo lo aplicas?» (una frase cada uno) en los bloques
+ * de contenido. Opcionales SIEMPRE en el schema (las experiencias viejas no los tienen); desde el
+ * prompt v21-exp-6 la validación del item exige un mínimo (validateEduFields, pedagogy.ts).
+ */
+const WHY = T(160, true);
+const APPLY = T(200, true);
+const EDU = { why: WHY, apply: APPLY };
 
 export const VC_CALLOUT_VARIANTS: readonly VcCalloutVariant[] = ['tip', 'warning', 'info', 'example'];
 export const VC_DIAGRAM_KINDS: readonly VcDiagramKind[] = ['cycle', 'flow', 'hierarchy', 'matrix', 'decision'];
@@ -177,6 +191,7 @@ export const VC_DECISION_DIAGRAM_SPEC: Record<string, VcFieldSpec> = {
   kind: { kind: 'enum', values: ['decision'] },
   title: T(120, true),
   caption: T(300, true),
+  ...EDU,
 };
 /** Tipos cuyos textos son datos ILUSTRATIVOS: cifras y % permitidos (no cantidades del curso). */
 export const VC_ILLUSTRATIVE_TYPES: readonly VcComponentType[] = ['worked_example'];
@@ -186,6 +201,7 @@ export const VC_COMPONENT_SPECS: Record<VcComponentType, Record<string, VcFieldS
   hero: { eyebrow: T(60, true), title: T(120), lead: T(400) },
   learning_objectives: { title: TITLE, items: { kind: 'textList', min: 2, max: 6, itemMax: 200 } },
   concept_cards: {
+    ...EDU,
     title: TITLE,
     cards: { kind: 'objList', min: 2, max: 6, fields: { term: T(80), definition: T(400) } },
   },
@@ -194,22 +210,27 @@ export const VC_COMPONENT_SPECS: Record<VcComponentType, Record<string, VcFieldS
     cards: { kind: 'objList', min: 2, max: 6, fields: { front: T(200), back: T(500) } },
   },
   accordion: {
+    ...EDU,
     title: TITLE,
     items: { kind: 'objList', min: 2, max: 8, fields: { heading: T(120), body: T(900) } },
   },
   tabs: {
+    ...EDU,
     title: TITLE,
     tabs: { kind: 'objList', min: 2, max: 5, fields: { label: T(40), body: T(900) } },
   },
   timeline: {
+    ...EDU,
     title: TITLE,
     events: { kind: 'objList', min: 3, max: 8, fields: { marker: T(40), heading: T(120), body: T(400) } },
   },
   process_steps: {
+    ...EDU,
     title: TITLE,
     steps: { kind: 'objList', min: 3, max: 8, fields: { heading: T(120), body: T(400) } },
   },
   comparison: {
+    ...EDU,
     title: TITLE,
     columns: { kind: 'textList', min: 2, max: 4, itemMax: 60 },
     rows: {
@@ -220,23 +241,26 @@ export const VC_COMPONENT_SPECS: Record<VcComponentType, Record<string, VcFieldS
     },
   },
   myth_reality: {
+    ...EDU,
     title: TITLE,
     pairs: { kind: 'objList', min: 1, max: 5, fields: { myth: T(240), reality: T(500) } },
   },
   case_scenario: {
+    ...EDU,
     title: T(120),
     narrative: T(1200),
     questions: { kind: 'textList', min: 1, max: 4, itemMax: 240 },
   },
-  checklist: { title: TITLE, items: { kind: 'textList', min: 3, max: 10, itemMax: 200 } },
+  checklist: { ...EDU, title: TITLE, items: { kind: 'textList', min: 3, max: 10, itemMax: 200 } },
   reflection: { prompt: T(400), hint: T(400, true) },
-  callout: { variant: { kind: 'enum', values: VC_CALLOUT_VARIANTS }, title: T(80, true), body: T(600) },
+  callout: { variant: { kind: 'enum', values: VC_CALLOUT_VARIANTS }, title: T(80, true), body: T(600), apply: APPLY },
   summary_visual: { central: T(120), points: { kind: 'textList', min: 3, max: 5, itemMax: 200 } },
   self_check: {
     title: TITLE,
     items: { kind: 'objList', min: 2, max: 4, fields: { q: T(300), a: T(600) } },
   },
   worked_example: {
+    ...EDU,
     title: T(120),
     situation: T(500),
     data: { kind: 'textList', min: 2, max: 6, itemMax: 160 },
@@ -245,6 +269,7 @@ export const VC_COMPONENT_SPECS: Record<VcComponentType, Record<string, VcFieldS
     takeaway: T(300, true),
   },
   diagram: {
+    ...EDU,
     kind: { kind: 'enum', values: VC_DIAGRAM_KINDS },
     title: T(120),
     caption: T(300, true),
@@ -283,3 +308,7 @@ export const VC_MAX_SAME_TYPE = 2;
 
 export const VC_CHAPTER_ID_MAX = 80;
 export const VC_BRIDGE_MAX = 300;
+
+/** P3 — tipos que admiten `why` / `apply` (callout: solo `apply`). */
+export const VC_EDU_WHY_TYPES: readonly VcComponentType[] = ['concept_cards', 'accordion', 'tabs', 'timeline', 'process_steps', 'comparison', 'myth_reality', 'case_scenario', 'checklist', 'worked_example', 'diagram'];
+export const VC_EDU_APPLY_TYPES: readonly VcComponentType[] = [...VC_EDU_WHY_TYPES, 'callout'];

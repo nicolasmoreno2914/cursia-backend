@@ -13,6 +13,7 @@
  * Cualquier dato faltante o incoherente → throw FACTS_INVALID (nunca un
  * default inventado).
  */
+import { VC_MOVEMENT_IDS, VcMovementId } from '../visual-components/schema';
 import {
   AnyBlueprintSnapshot,
   BlueprintSnapshotV2,
@@ -58,6 +59,13 @@ export interface CourseFactsArtifactsInput {
   libroWordCount: number;
   /** R14: el Libro publica una sección de bibliografía (verificada). Omitido = sí (compatibilidad). */
   libroHasBibliography?: boolean;
+  /**
+   * P3: palabras MEDIDAS del experience por chapterId y por movimiento (experienceMovementWords); si se
+   * informa, para TODOS los capítulos. Los minutos cuentan SOLO los movimientos que el capítulo muestra.
+   */
+  experienceWordsByChapter?: Record<string, Partial<Record<VcMovementId, number>>>;
+  /** P3 (fix M2): duración MEDIDA del video real por chapterId (segundos); sin ella, el estimado fijo. */
+  videoSecondsByChapter?: Record<string, number>;
 }
 
 export interface BuildCourseFactsInput {
@@ -100,6 +108,11 @@ export interface ChapterFacts {
    */
   activityType: H5pActivityType | null;
   slideCount: number;
+  /**
+   * P3: minutos estimados del capítulo (estimateChapterMinutes) desde las palabras MEDIDAS del
+   * experience + diapositivas + video real + actividad. Ausente si el empaque no informó las palabras.
+   */
+  estimatedMinutes?: number;
 }
 
 export interface ModuleFacts {
@@ -235,6 +248,26 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
         activityType: variant === 'h5p' ? resolveActivityType(itemByKey.get(`activity:${mc.chapterId}`)) : null,
         slideCount: posInt(artifacts.slideCountByChapter?.[mc.chapterId], `slideCount del capítulo ${mc.chapterNumber}`),
       });
+      if (artifacts.experienceWordsByChapter) {
+        const ch = chapters[chapters.length - 1];
+        const per = artifacts.experienceWordsByChapter[mc.chapterId];
+        if (!per || typeof per !== 'object') fail(`palabras del experience del capítulo ${mc.chapterNumber} ausentes`);
+        // Solo lo que el capítulo MUESTRA (mismas reglas que chapterSlotSequence): la guía previa al video
+        // solo con video real; el repaso solo sin actividad.
+        const shown: VcMovementId[] = ['opening', 'deepening', 'synthesis', 'closing'];
+        if (ch.videoEnabled) shown.push('video_primer');
+        if (!ch.activityEnabled) shown.push('self_check');
+        let words = 0;
+        for (const m of shown) {
+          const n = (per as Record<string, unknown>)[m] ?? 0;
+          if (!Number.isInteger(n) || (n as number) < 0) fail(`palabras del movimiento ${m} del capítulo ${mc.chapterNumber} inválidas (${JSON.stringify(n)})`);
+          words += n as number;
+        }
+        if (words < 1) fail(`el experience del capítulo ${mc.chapterNumber} no tiene palabras medidas`);
+        const vs = artifacts.videoSecondsByChapter?.[mc.chapterId];
+        if (vs !== undefined && (!Number.isFinite(vs) || vs <= 0)) fail(`duración del video del capítulo ${mc.chapterNumber} inválida (${JSON.stringify(vs)})`);
+        ch.estimatedMinutes = estimateChapterMinutes({ words, slideCount: ch.slideCount, videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled, videoSeconds: ch.videoEnabled ? vs : undefined });
+      }
     });
     const q = artifacts.examQuestionCountByModule?.[mm.moduleId];
     if (mm.examEnabled) posInt(q, `preguntas del examen del módulo ${mm.moduleNumber}`);
@@ -257,6 +290,12 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
   for (const id of pendingIds) if (!knownChapterIds.has(id)) fail(`video pendiente de un capítulo que no está en el Manifest (${id})`);
   for (const id of Object.keys(artifacts.slideCountByChapter ?? {})) {
     if (!knownChapterIds.has(id)) fail(`slideCount de un capítulo que no está en el Manifest (${id})`);
+  }
+  for (const id of Object.keys(artifacts.experienceWordsByChapter ?? {})) {
+    if (!knownChapterIds.has(id)) fail(`palabras del experience de un capítulo que no está en el Manifest (${id})`);
+  }
+  for (const id of Object.keys(artifacts.videoSecondsByChapter ?? {})) {
+    if (!knownChapterIds.has(id)) fail(`duración de video de un capítulo que no está en el Manifest (${id})`);
   }
   const moduleIds = new Set(manifest.modules.map((m) => m.moduleId));
   for (const id of Object.keys(artifacts.examQuestionCountByModule ?? {})) {
@@ -340,6 +379,45 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
   return deepFreeze(facts);
 }
 
+// ─── P3: tiempo estimado del capítulo ───────────────────────────────────────
+
+/** Ritmo de lectura (palabras/min) y tiempos fijos del estimado (constantes del producto, no del LLM). */
+export const CHAPTER_MINUTES_RULES = Object.freeze({ wordsPerMinute: 180, minutesPerSlide: 0.5, videoMinutes: 6, activityMinutes: 8, roundTo: 5, min: 5 });
+
+/**
+ * Minutos estimados de un capítulo, redondeados a 5 (mínimo 5). Determinista. El video usa su duración
+ * MEDIDA (`videoSeconds`) cuando el empaque la informa; si no, el estimado fijo.
+ */
+export function estimateChapterMinutes(x: { words: number; slideCount: number; videoEnabled: boolean; activityEnabled: boolean; videoSeconds?: number }): number {
+  const R = CHAPTER_MINUTES_RULES;
+  const video = !x.videoEnabled ? 0 : x.videoSeconds !== undefined ? x.videoSeconds / 60 : R.videoMinutes;
+  const raw = x.words / R.wordsPerMinute + x.slideCount * R.minutesPerSlide + video + (x.activityEnabled ? R.activityMinutes : 0);
+  return Math.max(R.min, Math.round(raw / R.roundTo) * R.roundTo);
+}
+
+const NON_TEXT_KEYS = new Set(['type', 'variant', 'kind', 'vcSchemaVersion', 'chapterId']);
+
+/** Palabras por movimiento de un experience (lo que el estudiante lee en cada label). */
+export function experienceMovementWords(exp: unknown): Partial<Record<VcMovementId, number>> {
+  const out: Partial<Record<VcMovementId, number>> = {};
+  const mv = exp && typeof exp === 'object' ? (exp as { movements?: Record<string, unknown> }).movements : undefined;
+  for (const m of VC_MOVEMENT_IDS) out[m] = mv ? experienceWordCount(mv[m]) : 0;
+  return out;
+}
+
+/** Palabras de todo el texto (lo que el estudiante lee), sin claves estructurales. */
+export function experienceWordCount(exp: unknown): number {
+  let n = 0;
+  const walk = (v: unknown, key?: string) => {
+    if (typeof v === 'string') {
+      if (!key || !NON_TEXT_KEYS.has(key)) n += v.split(/\s+/).filter((w) => /[\p{L}\p{N}]/u.test(w)).length;
+    } else if (Array.isArray(v)) v.forEach((x) => walk(x));
+    else if (v && typeof v === 'object') for (const [k, x] of Object.entries(v)) walk(x, k);
+  };
+  walk(exp);
+  return n;
+}
+
 // ─── Conjunto de números permitidos (lint del shell) ────────────────────────
 
 /** Números que aparecen en un texto (enteros y decimales con , o .). */
@@ -374,6 +452,7 @@ export function factsNumberSet(facts: CourseFacts): Set<number> {
     add(ch.number);
     add(ch.indexInModule);
     add(ch.slideCount);
+    add(ch.estimatedMinutes);
   }
   add(facts.finalExam.questionCount);
   add(facts.finalExam.bankSize);

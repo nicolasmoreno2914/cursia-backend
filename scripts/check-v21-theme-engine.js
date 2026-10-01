@@ -89,6 +89,9 @@ function assertEqual(actual, expected, msg) {
 function assertTrue(cond, msg) {
   if (!cond) throw new Error(msg);
 }
+function eqJson(actual, expected, msg) {
+  assertEqual(JSON.stringify(actual), JSON.stringify(expected), msg);
+}
 
 const HEX_RE = /^#[0-9A-F]{6}$/;
 
@@ -411,6 +414,136 @@ check('M3: ningún color emitido es #FFFFFF/#000000 puro; una seed pura se susti
   assertTrue(t.moduleColorsBasis[0] !== '#FFFFFF' && t.adjustments.some((a) => a.includes('brandSeed.moduleColors[0]')), 'módulo puro sustituido');
   const bad = { ...t, color: { ...t.color, surface: '#FFFFFF' } };
   assertTrue(validateTheme(bad).some((e) => e.code === 'PURE_BLACK_WHITE'), 'validateTheme detecta blanco puro');
+});
+
+// ─── P3 — sistema visual educativo 2.0: tonos por rol pedagógico ────────────
+check('P3: blocks — 8 roles en todo tema resuelto; ink ≥ 4.5 sobre soft/bg/surface, textPrimary ≥ 4.5 sobre soft, onInk ≥ 4.5 sobre ink', () => {
+  const roles = te.EDU_BLOCK_ROLES;
+  assertTrue(Array.isArray(roles) && roles.join(',') === 'concepto,ejemplo,caso,error,proceso,decision,reflexion,visual', 'EDU_BLOCK_ROLES');
+  for (const familyId of Object.keys(THEME_FAMILIES)) {
+    for (const mode of THEME_FAMILIES[familyId].supportedModes) {
+      const t = resolveTheme({ themeFamily: familyId, mode });
+      assertTrue(t.blocks && Object.keys(t.blocks).length === roles.length, `${familyId}/${mode}: blocks`);
+      for (const r of roles) {
+        const b = t.blocks[r];
+        assertTrue(contrastRatio(b.ink, b.soft) >= 4.5 && contrastRatio(b.ink, t.color.bg) >= 4.5 && contrastRatio(b.ink, t.color.surface) >= 4.5, `${familyId}/${mode}/${r}: ink`);
+        assertTrue(contrastRatio(t.color.textPrimary, b.soft) >= 4.5, `${familyId}/${mode}/${r}: textPrimary sobre soft`);
+        assertTrue(contrastRatio(b.onInk, b.ink) >= 4.5, `${familyId}/${mode}/${r}: onInk`);
+      }
+      // semánticos: mismos tonos en todas las familias de un modo
+      eqJson(Object.fromEntries(roles.map((r) => [r, { ink: t.blocks[r].ink, soft: t.blocks[r].soft, edge: t.blocks[r].edge }])), te.EDU_BLOCKS[mode], `${familyId}/${mode}: EDU_BLOCKS`);
+    }
+  }
+  const t = resolveTheme({ themeFamily: 'aula-clara', mode: 'light' });
+  const bad = { ...t, blocks: { ...t.blocks, error: { ...t.blocks.error, ink: '#F2C3BD' } } };
+  assertTrue(validateTheme(bad).some((e) => e.code === 'CONTRAST_TOO_LOW' && e.message.includes('blocks.error.ink')), 'validateTheme detecta un ink ilegible');
+});
+
+check('P3: tipografía de curso — display ≤ 32 px base, sin cursiva de tesis; Oscuro Premium en sans humanista', () => {
+  for (const familyId of Object.keys(THEME_FAMILIES)) {
+    for (const mode of THEME_FAMILIES[familyId].supportedModes) {
+      const t = resolveTheme({ themeFamily: familyId, mode });
+      assertTrue(t.typography.sizeDisplayPx === 32 && t.typography.sizeTitlePx === 24 && t.typography.sizeBodyPx === 18, `${familyId}/${mode}: escala`);
+      assertTrue(t.personality.thesisItalic === false, `${familyId}/${mode}: sin cursiva de tesis`);
+    }
+  }
+  const op = resolveTheme({ themeFamily: 'oscuro-premium', mode: 'dark' });
+  assertTrue(!/serif/i.test(op.personality.fontDisplay.replace(/sans-serif/g, '')) && !/serif/i.test(op.typography.fontBody.replace(/sans-serif/g, '')), 'Oscuro Premium sin serif');
+  eqJson(te.defaultPresentationProfile(), { themeFamily: 'aula-clara', mode: 'light' }, 'default de cursos nuevos: Aula Clara claro');
+});
+
+check('P3 (fix I1 / I1-R1 / I1-R2): colores de MARCA intactos; los de Cursia (anclas por defecto y generados) fuera de los tonos de rol, sin verde y a ΔE2000 ≥ 20 de todo rol', () => {
+  const D = te.ROLE_HUE_MIN_DISTANCE;
+  const DE = te.DEFAULT_MODULE_MIN_DELTA_E;
+  assertEqual(`${D}/${DE}`, '25/20', 'umbrales');
+  const sat = (hex) => { const n = parseInt(hex.slice(1), 16); const r = (n >> 16) / 255, g = ((n >> 8) & 255) / 255, b = (n & 255) / 255; const mx = Math.max(r, g, b), mn = Math.min(r, g, b); const l = (mx + mn) / 2; return mx === mn ? 0 : (mx - mn) / (1 - Math.abs(2 * l - 1)); };
+  const VCE = require(path.resolve(process.cwd(), 'dist/modules/visual-components/edu.js'));
+  // (1) anclas por defecto de cada familia: role-safe, sin verde (ejemplo) y ΔE2000 ≥ 20 (main, ink y relleno de moduleTone)
+  for (const familyId of Object.keys(THEME_FAMILIES)) {
+    for (const mode of THEME_FAMILIES[familyId].supportedModes) {
+      const t = resolveTheme({ themeFamily: familyId, mode });
+      assertEqual(t.moduleColorsSource, 'family', `${familyId}/${mode}: fuente`);
+      assertTrue(validateTheme(t).length === 0, `${familyId}/${mode}: ${JSON.stringify(validateTheme(t))}`);
+      const g = t.personality.plate ? t.color.bg : t.color.surface;
+      for (let i = 0; i < 12; i++) {
+        const mc = moduleColor(t, i);
+        assertTrue(sat(mc.main) < te.MODULE_NEUTRAL_SAT || te.roleHueDistance(t, mc.main) >= D, `${familyId}/${mode}: módulo ${i} ${mc.main} en tono de rol`);
+        // fix I1-R3: anclas Y módulos generados (1–12) cumplen lo mismo
+        const k = VCE.moduleTone(t, mc, g);
+        const hue = hexToHueDeg(mc.main);
+        assertTrue(sat(mc.main) < te.MODULE_NEUTRAL_SAT || hue < 80 || hue > 175, `${familyId}/${mode}: módulo ${i} ${mc.main} es verde`);
+        // distinto del módulo anterior (ΔE ≥ 10) y nunca repetido
+        if (i > 0) assertTrue(te.deltaE2000(mc.main, moduleColor(t, i - 1).main) >= 10, `${familyId}/${mode}: módulo ${i} ${mc.main} ≈ módulo ${i - 1}`);
+        for (let j = 0; j < i; j++) assertTrue(mc.main !== moduleColor(t, j).main, `${familyId}/${mode}: módulo ${i} repite el ${j}`);
+        for (const [role, b] of Object.entries(t.blocks)) {
+          for (const x of [mc.main, k.ink, k.fill]) assertTrue(te.deltaE2000(x, b.ink) >= DE, `${familyId}/${mode}: ancla ${i} ${x} a ΔE ${te.deltaE2000(x, b.ink).toFixed(1)} de ${role}`);
+        }
+      }
+    }
+  }
+  // (2) la paleta por defecto de cursos nuevos (aula-clara) cumple lo mismo (es semilla, así que nunca se toca)
+  const ac = LEGACY_PALETTES.find((p) => p.id === 'aula-clara');
+  const tac = resolveTheme(te.presentationProfileFromPaletteId('aula-clara'));
+  [ac.m1, ac.m2, ac.m3].forEach((m, i) => {
+    assertEqual(moduleColor(tac, i).main, m.toUpperCase(), `aula-clara m${i + 1} intacto`);
+    for (const [role, b] of Object.entries(tac.blocks)) assertTrue(te.deltaE2000(m, b.ink) >= DE && (te.roleHueDistance(tac, m) >= D || sat(m) < te.MODULE_NEUTRAL_SAT), `aula-clara m${i + 1} ${m} cerca de ${role}`);
+    const h = hexToHueDeg(m);
+    assertTrue(h < 80 || h > 175, `aula-clara m${i + 1} ${m} es verde`);
+  });
+  // (3) I1-R1: los colores de MARCA nunca cambian por pedagogía — las 28 paletas legacy conservan sus colores
+  // de módulo exactos (salvo la corrección de contraste de siempre, que conserva el tono).
+  let exact = 0;
+  for (const p of LEGACY_PALETTES) {
+    const t = resolveTheme(te.presentationProfileFromPaletteId(p.id));
+    assertEqual(t.moduleColorsSource, 'brand', `${p.id}: fuente marca`);
+    assertTrue(!t.adjustments.some((a) => /desplazado fuera de los tonos de rol/.test(a)), `${p.id}: semilla desplazada (${t.adjustments.join(' | ')})`);
+    const notes = te.moduleColorAdjustments(t, 3);
+    [p.m1, p.m2, p.m3].forEach((m, i) => {
+      const main = moduleColor(t, i).main;
+      const corrected = notes.some((n) => n.startsWith(`moduleColor(${i}).main`));
+      if (!corrected) { assertEqual(main, m.toUpperCase(), `${p.id}: m${i + 1}`); exact++; } else assertTrue(hueDiffDeg(hexToHueDeg(main), hexToHueDeg(m)) <= 10, `${p.id}: m${i + 1} corregido solo en contraste`);
+    });
+  }
+  assertTrue(exact >= 60, `pocos colores exactos: ${exact}`);
+  const navy = resolveTheme(te.presentationProfileFromPaletteId('navy-teal'));
+  assertEqual(moduleColor(navy, 0).main, '#1A3C5E', 'navy-teal (#413) conserva el navy');
+  // (4b) fix I1-R3: paleta de marca de 3 colores (navy-teal, berry): módulos 1–3 intactos, 4–12 generados por
+  // Cursia a ΔE2000 ≥ 20 de todo rol (main, ink y relleno), sin verde y distintos de los anteriores.
+  for (const pid of ['navy-teal', 'berry']) {
+    const t = resolveTheme(te.presentationProfileFromPaletteId(pid));
+    const p = LEGACY_PALETTES.find((x) => x.id === pid);
+    const g = t.personality.plate ? t.color.bg : t.color.surface;
+    for (let i = 3; i < 12; i++) {
+      const mc = moduleColor(t, i);
+      const k = VCE.moduleTone(t, mc, g);
+      for (const [role, b] of Object.entries(t.blocks)) for (const x of [mc.main, k.ink, k.fill]) assertTrue(te.deltaE2000(x, b.ink) >= DE, `${pid}: módulo ${i + 1} ${x} a ΔE ${te.deltaE2000(x, b.ink).toFixed(1)} de ${role}`);
+      const h = hexToHueDeg(mc.main);
+      assertTrue(sat(mc.main) < te.MODULE_NEUTRAL_SAT || h < 80 || h > 175, `${pid}: módulo ${i + 1} ${mc.main} es verde`);
+      assertTrue(te.deltaE2000(mc.main, moduleColor(t, i - 1).main) >= 10, `${pid}: módulo ${i + 1} ≈ módulo ${i}`);
+      for (let j = 0; j < i; j++) assertTrue(mc.main !== moduleColor(t, j).main, `${pid}: módulo ${i + 1} repite el ${j + 1}`);
+    }
+    assertTrue(validateTheme(t).length === 0, `${pid}: ${JSON.stringify(validateTheme(t))}`);
+    void p;
+  }
+  // (4) módulos GENERADOS más allá de la marca: de Cursia → fuera de los tonos de rol
+  const seeded = resolveTheme({ themeFamily: 'aula-clara', mode: 'light', brandSeed: { moduleColors: ['#1E3A8A', '#C8102E'] } });
+  eqJson([moduleColor(seeded, 0).main, moduleColor(seeded, 1).main], ['#1E3A8A', '#C8102E'], 'marca intacta');
+  for (let i = 2; i < 12; i++) { const m = moduleColor(seeded, i).main; assertTrue(sat(m) < te.MODULE_NEUTRAL_SAT || te.roleHueDistance(seeded, m) >= D, `generado ${i} ${m} en tono de rol`); }
+  // determinismo + 500 semillas: nunca falla, la marca queda intacta
+  let x = 12345;
+  const rnd = () => ((x = (x * 1103515245 + 12345) % 2147483648) / 2147483648);
+  for (let k = 0; k < 500; k++) {
+    const hex = () => '#' + Math.floor(rnd() * 0xffffff).toString(16).padStart(6, '0').toUpperCase();
+    const fam = Object.keys(THEME_FAMILIES)[k % 6];
+    const mode = THEME_FAMILIES[fam].supportedModes[k % THEME_FAMILIES[fam].supportedModes.length];
+    const t = resolveTheme({ themeFamily: fam, mode, brandSeed: { moduleColors: [hex(), hex()] } });
+    assertTrue(!t.adjustments.some((a) => /desplazado fuera de los tonos de rol/.test(a) && /moduleColor\([01]\)/.test(a)), `semilla ${k}: marca desplazada`);
+    for (let i = 2; i < 6; i++) { const m = moduleColor(t, i).main; assertTrue(sat(m) < te.MODULE_NEUTRAL_SAT || te.roleHueDistance(t, m) >= D, `semilla ${k}: generado ${i} ${m}`); }
+  }
+  // validateTheme detecta un ancla por defecto perceptualmente cerca de un rol
+  const t0 = resolveTheme({ themeFamily: 'aula-clara', mode: 'light' });
+  assertTrue(validateTheme({ ...t0, moduleColorsBasis: ['#13683A', ...t0.moduleColorsBasis.slice(1)] }).some((e) => e.code === 'MODULE_ROLE_DELTAE' || e.code === 'MODULE_ROLE_HUE'), 'MODULE_ROLE_DELTAE');
+  assertTrue(te.roleHueDistance(t0, '#1D4FB8') < 1 && te.deltaE2000('#FFFFFF', '#000000') > 99, 'utilidades');
 });
 
 console.log('');

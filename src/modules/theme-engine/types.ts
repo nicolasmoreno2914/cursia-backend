@@ -106,6 +106,11 @@ export interface ThemePersonality {
   /** El label pinta su fondo como una lámina (familias oscuras); si no, el contenido va abierto sobre la página. */
   plate: boolean;
   /** Filete de acento de 2 px a todo el ancho sobre el kicker de cada componente (membrete, Institucional). */
+  /**
+   * @deprecated P3 (sistema visual 2.0): el filete de sección sobre el kicker fue reemplazado por el rótulo
+   * del rol pedagógico en todo componente; el campo se conserva (datos de familias y temas guardados) y no
+   * tiene efecto en el renderer.
+   */
   sectionRule: boolean;
   /** Filetes de ítem en borderStrong (retícula de ficha técnica, Técnico). */
   gridRules: boolean;
@@ -158,6 +163,22 @@ export interface PresentationProfileInput {
   themeVersion?: number;
 }
 
+/** P3 — Sistema visual educativo 2.0: rol pedagógico de un bloque (ícono + color + forma). */
+export type EduBlockRole = 'concepto' | 'ejemplo' | 'caso' | 'error' | 'proceso' | 'decision' | 'reflexion' | 'visual';
+export const EDU_BLOCK_ROLES: readonly EduBlockRole[] = ['concepto', 'ejemplo', 'caso', 'error', 'proceso', 'decision', 'reflexion', 'visual'];
+/**
+ * ink   = texto del rótulo / ícono / filete (≥ 4.5:1 sobre soft Y sobre el fondo del label)
+ * soft  = superficie tintada del bloque (textPrimary ≥ 4.5:1 encima)
+ * edge  = borde de 1 px de la superficie (decorativo, sin requisito de contraste)
+ * onInk = texto sobre una insignia rellena de ink (≥ 4.5:1)
+ */
+export interface EduBlockTone {
+  ink: string;
+  soft: string;
+  edge: string;
+  onInk: string;
+}
+
 export interface ResolvedTheme {
   version: number;
   familyId: ThemeFamilyId;
@@ -168,6 +189,8 @@ export interface ResolvedTheme {
   shape: ThemeShapeTokens;
   variants: ThemeVariantTokens;
   personality: ThemePersonality;
+  /** P3 — tonos por rol pedagógico (semánticos: iguales en todas las familias de un mismo modo). */
+  blocks: Record<EduBlockRole, EduBlockTone>;
   /** Every automatic contrast correction resolveTheme applied, in order, human-readable (Spanish). */
   adjustments: string[];
   /**
@@ -179,6 +202,13 @@ export interface ResolvedTheme {
    * given resolution used. See r1-theme.report.md "rulings".
    */
   moduleColorsBasis: string[];
+  /**
+   * P3 (fix I1-R1): de dónde salen las anclas de módulo. 'brand' = BrandSeed.moduleColors (marca del
+   * cliente o paleta guardada/legacy): esos colores NUNCA se alteran por pedagogía. 'family' = anclas
+   * propias de Cursia (role-safe y perceptualmente lejos de los roles). Los módulos generados más allá
+   * de las anclas son de Cursia en ambos casos.
+   */
+  moduleColorsSource: 'brand' | 'family';
 }
 
 export interface ModuleColor {
