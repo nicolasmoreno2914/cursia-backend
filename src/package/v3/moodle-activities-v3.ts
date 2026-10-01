@@ -110,6 +110,8 @@ export interface QuizV3Output {
   questionCount: number;
   /** Solo banco: preguntas del banco (todas las hojas). */
   bankSize?: number;
+  /** EV6 P2-B5: solo banco — las hojas TAL COMO se escribieron (orden de categorías), expectativa de QUIZ_RANDOM. */
+  leaves?: Array<{ category: string; type: ExamQuestionType; slots: number }>;
 }
 
 /** Nombre visible del tipo en la categoría hoja. */
@@ -381,6 +383,7 @@ function buildBankQuizV3(p: QuizV3Input, bank: QuizV3Bank): QuizV3Output {
     categoryIds: [catTop, catDefault, ...groups.flatMap((g) => [g.id, ...g.leaves.map((l) => l.id)])],
     questionCount: slotCount,
     bankSize: doc.questions.length,
+    leaves: leaves.map((l) => ({ category: l.name, type: l.type, slots: l.slots })),
   };
 }
 

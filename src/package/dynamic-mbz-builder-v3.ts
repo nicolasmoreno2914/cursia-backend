@@ -130,6 +130,8 @@ import { groundColor } from '../modules/visual-components/render';
 import { IdAllocator, buildQuizV3, parseScormManifestIds, scormActivityXmlV3 } from './v3/moodle-activities-v3';
 import { expectedExamPlan, planSlotCount, validateExamBank } from '../modules/course-shell/exam-bank';
 import type { ExamBankV1 } from '../modules/course-shell/exam-bank';
+import { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';
+import type { ExamBankPlans } from './v3/exam-validator-v3';
 import { COURSE_BADGE_BACKUP_ID, COURSE_BADGE_DEFAULT_ISSUER, courseBadgeImages, courseBadgeName, courseBadgeXml } from './v3/course-badge';
 
 /**
@@ -184,20 +186,8 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  */
 export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.6.0';
 
-/**
- * EV6 P2-B4 (P2-design §1.3, ruling 1): con intentos limitados la página se desbloquea si el quiz está
- * completo (e=1, que también acepta COMPLETE_PASS) O completo-y-reprobado (e=3 = intentos agotados,
- * gracias a completionattemptsexhausted=1). `show:false`: oculta hasta entonces.
- * Fix 1 (C1): con intentos ILIMITADOS (attempts 0) B1 emite completionattemptsexhausted=0 y Moodle marca
- * COMPLETE_FAIL tras UN intento reprobado → e=3 abriría el banco y el estudiante reintentaría con las
- * respuestas. Ahí la condición es SOLO aprobar (e=1).
- */
-export function examExplanationsAvailability(quizMid: number, attempts: number): string {
-  if (!Number.isInteger(quizMid) || quizMid < 1) throw new Error(`MBZ_V3_INVARIANT: moduleid de quiz inválido (${quizMid})`);
-  if (!Number.isInteger(attempts) || attempts < 0) throw new Error(`MBZ_V3_INVARIANT: intentos inválidos (${attempts})`);
-  if (attempts === 0) return `{"op":"|","show":false,"c":[{"type":"completion","cm":${quizMid},"e":1}]}`;
-  return `{"op":"|","show":false,"c":[{"type":"completion","cm":${quizMid},"e":1},{"type":"completion","cm":${quizMid},"e":3}]}`;
-}
+// EV6 P2-B5: `examExplanationsAvailability` vive en course-shell/exam-explanations (lo usa también el validador).
+export { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';
 /** Versión del renderer de Visual Components que entra en la clave de reuse. */
 export const VC_RENDERER_VERSION = `vc${VC_SCHEMA_VERSION}-rt${VC_RUNTIME_VERSION}-theme${THEME_ENGINE_VERSION}-style${VC_RENDER_STYLE_VERSION}`;
 
@@ -270,6 +260,8 @@ export interface MbzV3Expectations {
   facts: CourseFacts;
   resolved: ResolvedAssessment;
   h5pProfileVersion: number;
+  /** EV6 P2-B5: hojas (categoría, tipo, slots) de cada quiz con banco, del plan congelado → QUIZ_RANDOM. */
+  examBankPlans: ExamBankPlans;
 }
 
 export interface BuildDynamicMbzV3Result {
@@ -862,6 +854,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   };
 
   const questionCategories: string[] = [];
+  const examBankPlans: ExamBankPlans = {};
   const addQuiz = (
     secnum: number,
     idnumber: string,
@@ -885,6 +878,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       throw new Error(`MBZ_V3_INVARIANT: ${idnumber} tiene ${q.questionCount} slots pero facts anuncia ${announced} preguntas`);
     }
     W.put(`${a.dir}/quiz.xml`, q.quizXml);
+    if (src.kind === 'bank') examBankPlans[idnumber] = q.leaves ?? [];
     questionCategories.push(q.questionCategoriesXml);
     gradedCommon(a, kind, name, [], q.categoryIds);
     resolveCta('next-exam', secnum, `$@QUIZVIEWBYID*${a.mid}@$`);
@@ -1359,7 +1353,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const mbz = (await W.zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } })) as Buffer;
   return {
     mbz,
-    expectations: { facts, resolved, h5pProfileVersion },
+    expectations: { facts, resolved, h5pProfileVersion, examBankPlans },
     summary: {
       builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3,
       moodleVersion: MV.br,
