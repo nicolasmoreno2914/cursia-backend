@@ -66,3 +66,35 @@ Compatible = mismo major.minor y patch instalado mayor o igual al del perfil.
 
 Un pack nuevo implica un perfil nuevo (`CURSIA_H5P_PROFILE_V2`,
 `h5pProfileVersion = 2`). Las versiones de un perfil publicado no cambian.
+
+## Pack v2 (CURSIA_H5P_PROFILE_V2): caso ramificado y tarjetas de repaso
+
+Los cursos generados con las reglas H5P v2 (`activityTypeRules = 2`) traen dos
+tipos de contenido nuevos:
+
+| Archivo | Tipo de contenido | Nota |
+|---|---|---|
+| `cursia-h5p-pack-v2-H5P.BranchingScenario-1.10.1.h5p` | Caso ramificado (decisiones con finales) | Calificable |
+| `cursia-h5p-pack-v2-H5P.Dialogcards-1.9.40.h5p` | Tarjetas de «Repaso» | Sin nota (completion por vista) |
+
+El pack v2 también incluye de nuevo los 7 paquetes de v1 (mismas versiones), así
+que un sitio nuevo puede usar solo el pack v2.
+
+**Restaurar como administrador o gestor.** Los paquetes `.h5p` de estos dos tipos
+llevan sus librerías ADENTRO: si el curso lo restaura un **administrador o un
+gestor**, Moodle instala esas librerías automáticamente la primera vez que se abre
+la actividad y no hace falta ningún paso manual. Si lo restaura un **docente** en
+un sitio que todavía no tiene esos tipos de contenido, Moodle muestra «Missing main
+library» en esas actividades: en ese caso un administrador sube una vez el pack v2
+(mismos pasos de la opción A) y desde ahí cualquier docente puede restaurar.
+
+Construcción y verificación:
+
+```bash
+node scripts/build-h5p-library-pack.js <libsDir> <outDir> --profile v2
+node scripts/h5p-preflight-moodle.js <moodleDir> <php.ini> --profile v2
+```
+
+Las librerías nuevas salen del store versionado `assets/h5p-libs/v2` (versiones
+exactas, sha256 por archivo y licencia MIT de cada una en su `manifest.json` y
+`LICENSES.md`); nada se descarga.
