@@ -43,10 +43,17 @@ export interface CourseFactsArtifactsInput {
   audiobookParts: Array<{ chapterId: string; seconds: number }>;
   /** Diapositivas medidas (pdfPageCount) por chapterId; obligatorio para TODOS los capítulos. */
   slideCountByChapter: Record<string, number>;
-  /** Preguntas del GIFT parseado por moduleId; exactamente los módulos con examen. */
+  /**
+   * Preguntas que ve el estudiante por moduleId; exactamente los módulos con examen. GIFT: preguntas
+   * parseadas; banco (EV6 P2-B3): SLOTS del plan (no el tamaño del banco).
+   */
   examQuestionCountByModule: Record<string, number>;
-  /** Preguntas del GIFT final parseado; obligatorio si course.finalExam. */
+  /** Preguntas del examen final (GIFT parseado | slots del banco); obligatorio si course.finalExam. */
   finalExamQuestionCount?: number;
+  /** EV6 P2-B3: preguntas del BANCO por moduleId (solo módulos cuyo examen es banco). */
+  examBankSizeByModule?: Record<string, number>;
+  /** EV6 P2-B3: preguntas del banco del examen final (solo si es banco). */
+  finalExamBankSize?: number;
   /** Palabras del Libro Guía compilado. */
   libroWordCount: number;
   /** R14: el Libro publica una sección de bibliografía (verificada). Omitido = sí (compatibilidad). */
@@ -103,6 +110,8 @@ export interface ModuleFacts {
   examEnabled: boolean;
   /** null si el módulo no tiene examen. */
   examQuestionCount: number | null;
+  /** EV6 P2-B3: solo si el examen del módulo es un banco — preguntas del banco (≥ slots). */
+  examBankSize?: number;
 }
 
 export interface AssessmentFactsKind {
@@ -130,7 +139,8 @@ export interface CourseFacts {
   };
   chapters: ChapterFacts[];
   modules: ModuleFacts[];
-  finalExam: { enabled: boolean; questionCount: number | null };
+  /** `bankSize` solo si el examen final es un banco (EV6 P2-B3). */
+  finalExam: { enabled: boolean; questionCount: number | null; bankSize?: number };
   assessment: {
     assessmentProfileVersion: number;
     kinds: Record<AssessableType, AssessmentFactsKind>;
@@ -229,6 +239,11 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
     const q = artifacts.examQuestionCountByModule?.[mm.moduleId];
     if (mm.examEnabled) posInt(q, `preguntas del examen del módulo ${mm.moduleNumber}`);
     else if (q !== undefined) fail(`el módulo ${mm.moduleNumber} no tiene examen pero se informaron ${JSON.stringify(q)} preguntas`);
+    const bankSize = artifacts.examBankSizeByModule?.[mm.moduleId];
+    if (bankSize !== undefined) {
+      if (!mm.examEnabled) fail(`el módulo ${mm.moduleNumber} no tiene examen pero se informó un banco`);
+      if (posInt(bankSize, `banco del examen del módulo ${mm.moduleNumber}`) < (q as number)) fail(`el banco del examen del módulo ${mm.moduleNumber} es menor que sus slots`);
+    }
     modules.push({
       id: mm.moduleId,
       number: mm.moduleNumber,
@@ -236,6 +251,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
       chapterNumbers: mm.chapters.map((c) => c.chapterNumber),
       examEnabled: mm.examEnabled,
       examQuestionCount: mm.examEnabled ? (q as number) : null,
+      ...(bankSize !== undefined ? { examBankSize: bankSize } : {}),
     });
   }
   for (const id of pendingIds) if (!knownChapterIds.has(id)) fail(`video pendiente de un capítulo que no está en el Manifest (${id})`);
@@ -246,11 +262,20 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
   for (const id of Object.keys(artifacts.examQuestionCountByModule ?? {})) {
     if (!moduleIds.has(id)) fail(`preguntas de examen de un módulo que no está en el Manifest (${id})`);
   }
+  for (const id of Object.keys(artifacts.examBankSizeByModule ?? {})) {
+    if (!moduleIds.has(id)) fail(`banco de examen de un módulo que no está en el Manifest (${id})`);
+  }
 
   let finalQ: number | null = null;
   if (features.finalExam) finalQ = posInt(artifacts.finalExamQuestionCount, 'preguntas del examen final');
   else if (artifacts.finalExamQuestionCount !== undefined && artifacts.finalExamQuestionCount !== null) {
     fail('el curso no tiene examen final pero se informaron preguntas');
+  }
+  let finalBank: number | undefined;
+  if (artifacts.finalExamBankSize !== undefined) {
+    if (!features.finalExam) fail('el curso no tiene examen final pero se informó un banco');
+    finalBank = posInt(artifacts.finalExamBankSize, 'banco del examen final');
+    if (finalBank < (finalQ as number)) fail('el banco del examen final es menor que sus slots');
   }
 
   const welcomeSeconds = posSeconds(artifacts.audioWelcomeSeconds, 'audioWelcomeSeconds');
@@ -299,7 +324,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
     },
     chapters,
     modules,
-    finalExam: { enabled: features.finalExam, questionCount: finalQ },
+    finalExam: { enabled: features.finalExam, questionCount: finalQ, ...(finalBank !== undefined ? { bankSize: finalBank } : {}) },
     assessment: { assessmentProfileVersion: assessment.assessmentProfileVersion, kinds },
     audio: { welcomeSeconds, audiobookSeconds: offset, audiobookParts },
     libro: { wordCount: libroWordCount, hasBibliography: artifacts.libroHasBibliography !== false },
@@ -343,6 +368,7 @@ export function factsNumberSet(facts: CourseFacts): Set<number> {
     add(m.number);
     add(m.chapterNumbers.length);
     add(m.examQuestionCount);
+    add(m.examBankSize);
   }
   for (const ch of facts.chapters) {
     add(ch.number);
@@ -350,6 +376,7 @@ export function factsNumberSet(facts: CourseFacts): Set<number> {
     add(ch.slideCount);
   }
   add(facts.finalExam.questionCount);
+  add(facts.finalExam.bankSize);
   for (const k of ASSESSABLE_TYPES) {
     add(facts.assessment.kinds[k].passingGrade);
     add(facts.assessment.kinds[k].attempts);

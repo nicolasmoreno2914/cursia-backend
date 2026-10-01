@@ -15,7 +15,7 @@
 //    GIFT final como siempre, GIFT de módulo sin validación; roles con alternativas
 //    (resolveRequiredArtifactTypesV3 / EXAM_ARTIFACT_AMBIGUOUS);
 //  - empaque: resolveRunArtifactsV3 + loadContentsV3 con bancos → ExamSource 'bank', evidencia mala →
-//    EXAM_BANK_INVALID, builder → EXAM_BANK_UNSUPPORTED; con GIFT el .mbz es byte a byte el de la
+//    EXAM_BANK_INVALID, builder (P2-B3) → quiz de slots aleatorios; con GIFT el .mbz es byte a byte el de la
 //    entrada directa (y, con BASE_DIST=<dist de la base>, el mismo sha256 que el builder anterior).
 //
 // Usage: node scripts/check-p2-exam-bank-contract.js [path/to/dist] [--write-fixtures]
@@ -471,7 +471,7 @@ async function main() {
     return { byItem, loaded: await PK.loadContentsV3(f.L, plan, byItem, f.run, { familyId: 'aula-clara', mode: 'light' }) };
   }
 
-  await check('empaque con bancos: resolve → ExamSource "bank" por módulo y final; el builder lanza EXAM_BANK_UNSUPPORTED (nunca los ignora)', async () => {
+  await check('empaque con bancos: resolve → ExamSource "bank" por módulo y final; el builder (P2-B3) los empaqueta como slots aleatorios (nunca los ignora)', async () => {
     const f = runFixture('bank');
     const { byItem, loaded } = await load(f);
     const examKeys = f.manifest.items.filter((i) => i.type === 'exam' || i.type === 'final_exam').map((i) => i.key);
@@ -479,9 +479,11 @@ async function main() {
     eq([...loaded.exams.modules.values()].map((s) => s.kind), f.manifest.modules.filter((m) => m.examEnabled).map(() => 'bank'), 'módulos');
     eq(loaded.exams.final.kind, 'bank', 'final');
     eq([loaded.contents.examGift.size, loaded.contents.finalExamGift, loaded.contents.examBanks.size, !!loaded.contents.finalExamBank], [0, null, examKeys.length - 1, true], 'contenidos');
-    await rejects(B.buildDynamicMbzV3({ ...f.input, contents: loaded.contents }), /^EXAM_BANK_UNSUPPORTED: .*final_exam/, 'builder');
-    // solo el final como banco también falla fuerte
-    await rejects(B.buildDynamicMbzV3({ ...f.input, contents: { ...f.input.contents, finalExamBank: FIN } }), /^EXAM_BANK_UNSUPPORTED/, 'final banco');
+    const built = await B.buildDynamicMbzV3({ ...f.input, contents: loaded.contents });
+    eq(built.expectations.facts.modules.filter((m) => m.examEnabled).map((m) => m.examQuestionCount), [...loaded.contents.examBanks.values()].map((b) => EB.planSlotCount(b.plan)), 'facts: slots (no banco)');
+    eq(built.expectations.facts.finalExam.questionCount, EB.planSlotCount(loaded.contents.finalExamBank.plan), 'facts final: slots');
+    // banco + GIFT del mismo examen en el builder → falla fuerte (nunca elige uno en silencio)
+    await rejects(B.buildDynamicMbzV3({ ...f.input, contents: { ...f.input.contents, finalExamBank: FIN } }), /^MBZ_V3_INVARIANT: .*GIFT y banco/, 'final banco + GIFT');
   });
 
   await check('empaque: banco con evidencia que no está en el capítulo → EXAM_BANK_INVALID (re-validación con el Markdown); banco + GIFT del mismo item → EXAM_ARTIFACT_AMBIGUOUS', async () => {
@@ -501,7 +503,8 @@ async function main() {
     });
     const { loaded } = await load(f);
     assert([...loaded.exams.modules.values()].every((s) => s.kind === 'bank') && loaded.exams.final.kind === 'bank', 'bancos cargados');
-    await rejects(B.buildDynamicMbzV3({ ...f.input, contents: loaded.contents }), /^EXAM_BANK_UNSUPPORTED/, 'builder');
+    const built = await B.buildDynamicMbzV3({ ...f.input, contents: loaded.contents });
+    assert(Buffer.isBuffer(built.mbz) && built.mbz.length > 0, 'builder empaqueta el banco reordenado');
   });
 
   await check('empaque con GIFT: ExamSource "gift" y el .mbz es byte a byte el de la entrada directa' + (process.env.BASE_DIST ? ' y el del builder de la base (BASE_DIST)' : ''), async () => {

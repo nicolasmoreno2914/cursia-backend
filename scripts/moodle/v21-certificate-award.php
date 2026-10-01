@@ -146,12 +146,16 @@ $doQuizAttempt = function ($cm, $correct) use (&$gen, $userid): int {
         $q = $qa->get_question();
         $right = $q->get_correct_response();
         if ($q->get_type_name() === 'multichoice') {
-            $val = $correct ? $right['answer'] : (($right['answer'] + 1) % count($q->get_order($qa)));
+            $resp = ['answer' => $correct ? $right['answer'] : (($right['answer'] + 1) % count($q->get_order($qa)))];
+        } else if ($q->get_type_name() === 'match') {
+            // P2-B3: los bancos traen emparejamiento; incorrecto = rotar las elecciones correctas (todas distintas).
+            $vals = array_values($right);
+            $resp = $correct ? $right : array_combine(array_keys($right), array_merge(array_slice($vals, 1), array_slice($vals, 0, 1)));
         } else { // truefalse
-            $val = $correct ? $right['answer'] : 1 - $right['answer'];
+            $resp = ['answer' => $correct ? $right['answer'] : 1 - $right['answer']];
         }
         $post[$qa->get_control_field_name('sequencecheck')] = (string)$qa->get_sequence_check_count();
-        $post[$qa->get_qt_field_name('answer')] = (string)$val;
+        foreach ($resp as $k => $v) { $post[$qa->get_qt_field_name($k)] = (string)$v; }
     }
     $ao->process_submitted_actions(time(), false, $post);
     $ao->process_finish(time(), false);
