@@ -25,8 +25,30 @@ const ROOT = path.resolve(__dirname, '..');
 const STORE = path.join(ROOT, 'assets/h5p-libs/v2');
 const PROFILE_JSON = path.join(ROOT, 'src/package/h5p/cursia-h5p-profile.v2.json');
 
-const LICENCE_SOURCE = 'upstream repository README/LICENSE, checked 2026-10-01';
+// Fuente de la licencia de cada librería (fix round 1, I-2): la evidencia EXACTA que aplica.
+const LICENCE_SOURCE = Object.freeze({
+  libraryJson: 'library.json',
+  localFile: 'local LICENCE/README file',
+  upstream: 'upstream repository verified 2026-10-01',
+});
 const DEFAULT_HOLDER = 'Joubel AS (H5P Group AS)';
+
+/**
+ * Repos upstream que el controlador verificó EN LÍNEA el 2026-10-01 (licencia MIT).
+ * Solo estos cuentan como evidencia de licencia cuando la librería no trae ni
+ * `license` en library.json ni un archivo LICENCE/README con licencia.
+ */
+const UPSTREAM_VERIFIED_MIT = Object.freeze([
+  'h5p-continuous-text',
+  'h5p-exportable-text-area',
+  'h5p-editor-branching-question',
+  'h5p-editor-image-coordinate-selector',
+  'h5p-editor-radio-selector',
+  'h5p-editor-shape',
+  'h5p-drag-question',
+  'h5p-audio-recorder',
+  'h5p-shape',
+]);
 
 /** Repositorio upstream oficial (organización h5p en GitHub) por machineName. */
 const UPSTREAM_REPO = {
@@ -87,17 +109,35 @@ function walk(root, rel = '') {
 
 const sha256 = (b) => crypto.createHash('sha256').update(b).digest('hex');
 
+/**
+ * Licencia declarada en un archivo local de la librería: LICENCE/LICENSE/COPYING
+ * (siempre es una declaración) o README con sección de licencia. null = sin evidencia local.
+ */
 function localLicence(dir) {
-  for (const f of ['LICENCE.md', 'LICENSE.md', 'LICENSE', 'README.md']) {
-    const p = path.join(dir, f);
-    if (!fs.existsSync(p)) continue;
-    const t = fs.readFileSync(p, 'utf8');
-    if (/MIT License/.test(t)) {
-      const m = /Copyright \(c\) ([^\n]+)/.exec(t);
-      return { file: f, holder: m ? m[1].trim() : null };
-    }
+  const names = fs.readdirSync(dir).sort();
+  const pick = (re) => names.filter((n) => re.test(n));
+  for (const f of [...pick(/^(licen[cs]e|copying)(\.[a-z]+)?$/i), ...pick(/^readme(\.[a-z]+)?$/i)]) {
+    const t = fs.readFileSync(path.join(dir, f), 'utf8');
+    const isReadme = /^readme/i.test(f);
+    if (isReadme && !/licen[cs]e/i.test(t)) continue; // un README sin licencia no es evidencia
+    const mit = /(The )?MIT License/.test(t) && /Permission is hereby granted, free of charge/.test(t);
+    const m = /Copyright \(c\) ([^\n]+)/.exec(t);
+    return { file: f, mit, holder: m ? m[1].trim() : null };
   }
   return null;
+}
+
+/** Licencia y su fuente exacta, o error (H5P_STORE_LICENCE_*) si no es MIT o no hay evidencia. */
+function licenceOf(src, lj, repo, dirLabel) {
+  const lic = localLicence(src);
+  if (lj.license !== undefined && lj.license !== null && lj.license !== 'MIT') {
+    throw new Error(`H5P_STORE_LICENCE_MISMATCH: ${dirLabel} library.json license=${JSON.stringify(lj.license)} (se exige MIT)`);
+  }
+  if (lic && !lic.mit) throw new Error(`H5P_STORE_LICENCE_MISMATCH: ${dirLabel} ${lic.file} no es MIT`);
+  if (lj.license === 'MIT') return { licence: 'MIT', licenceSource: LICENCE_SOURCE.libraryJson, lic };
+  if (lic) return { licence: 'MIT', licenceSource: LICENCE_SOURCE.localFile, lic };
+  if (UPSTREAM_VERIFIED_MIT.includes(repo)) return { licence: 'MIT', licenceSource: LICENCE_SOURCE.upstream, lic };
+  throw new Error(`H5P_STORE_LICENCE_MISSING: ${dirLabel} sin licencia en library.json, sin LICENCE/README y su repo ${repo} no está verificado`);
 }
 
 function buildStore(libsDir) {
@@ -123,7 +163,7 @@ function buildStore(libsDir) {
     }
     const repo = UPSTREAM_REPO[ref.machineName];
     if (!repo) throw new Error(`H5P_STORE_NO_PROVENANCE: ${ref.machineName} sin repo upstream registrado`);
-    const lic = localLicence(src);
+    const { licence, licenceSource, lic } = licenceOf(src, lj, repo, d);
     const fileList = walk(src).map((rel) => {
       const buf = fs.readFileSync(path.join(src, rel));
       files.set(`${d}/${rel}`, buf);
@@ -137,9 +177,11 @@ function buildStore(libsDir) {
       patchVersion: ref.patchVersion,
       upstreamVersion: `${ref.majorVersion}.${ref.minorVersion}.${ref.patchVersion}`,
       author: lj.author ?? null,
-      licence: 'MIT',
-      licenceSource: LICENCE_SOURCE,
+      licence,
+      licenceSource,
       repoUrl: `https://github.com/h5p/${repo}`,
+      // true solo si el controlador verificó el repo en línea; los demás se derivan del nombre (h5p-<kebab>).
+      repoUrlVerified: UPSTREAM_VERIFIED_MIT.includes(repo),
       libraryJsonLicense: lj.license ?? null,
       localLicenceFile: lic ? lic.file : null,
       copyrightHolder: lic && lic.holder ? lic.holder : DEFAULT_HOLDER,
@@ -156,7 +198,7 @@ function buildStore(libsDir) {
     profileSha256: sha256(Buffer.from(profileText, 'utf8')),
     source: 'copia local de una carpeta de librerías H5P oficiales (sin descargas)',
     provenance:
-      'machineName/author/version del library.json + repositorio upstream github.com/h5p/<repo> + licencia MIT (ruling del controlador 2026-10-01)',
+      'machineName/author/version del library.json + repositorio upstream github.com/h5p/<repo> + licencia MIT; licenceSource dice qué evidencia aplica a cada librería (ruling del controlador 2026-10-01, fix round 1)',
     deltaByMain: Object.fromEntries(Object.entries(profile.deltaByMain).map(([k, v]) => [k, v.map(dirName)])),
     libraries,
   };
@@ -168,11 +210,20 @@ function buildStore(libsDir) {
     'Branching Scenario y Dialog Cards («delta» sobre CURSIA_H5P_PROFILE_V1). Versiones',
     'exactas y sha256 de cada archivo: `manifest.json`.',
     '',
-    `Procedencia: ${manifest.provenance}. Fuente de la licencia: ${LICENCE_SOURCE}.`,
+    `Procedencia: ${manifest.provenance}.`,
     '',
-    '| Librería | Versión | Copyright | Licencia | Repositorio |',
-    '|---|---|---|---|---|',
-    ...libraries.map((l) => `| ${l.machineName} | ${l.upstreamVersion} | ${l.copyrightHolder} | MIT | ${l.repoUrl} |`),
+    'Fuente de la licencia (columna «Evidencia»): `library.json` = campo `license` de la librería;',
+    '`local LICENCE/README file` = archivo de licencia dentro de su carpeta; `upstream repository verified',
+    '2026-10-01` = repositorio upstream verificado en línea por el controlador. Columna «Repo verificado»:',
+    '«no» = URL deducido del nombre (h5p-<kebab>), sin verificación en línea.',
+    '',
+    'Los paquetes `.h5p` de Cursia redistribuyen estas carpetas tal como las publica H5P (sin agregar',
+    'archivos): las que no traen su propio archivo de licencia viajan, como upstream, sin aviso dentro',
+    'de la carpeta; este archivo y `manifest.json` son el aviso MIT de Cursia.',
+    '',
+    '| Librería | Versión | Copyright | Licencia | Evidencia | Repositorio | Repo verificado |',
+    '|---|---|---|---|---|---|---|',
+    ...libraries.map((l) => `| ${l.machineName} | ${l.upstreamVersion} | ${l.copyrightHolder} | ${l.licence} | ${l.licenceSource}${l.localLicenceFile ? ` (${l.localLicenceFile})` : ''} | ${l.repoUrl} | ${l.repoUrlVerified ? 'sí' : 'no'} |`),
     '',
     '## MIT License',
     '',
@@ -221,4 +272,6 @@ function main() {
   console.log(`store v2 → ${STORE}: ${files.size} archivos de librería + manifest.json + LICENSES.md`);
 }
 
-main();
+module.exports = { licenceOf, localLicence, buildStore, LICENCE_SOURCE, UPSTREAM_VERIFIED_MIT, UPSTREAM_REPO };
+
+if (require.main === module) main();

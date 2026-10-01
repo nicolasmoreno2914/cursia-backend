@@ -5,29 +5,38 @@ Las carpetas de este directorio son copias sin modificar de librerías H5P ofici
 Branching Scenario y Dialog Cards («delta» sobre CURSIA_H5P_PROFILE_V1). Versiones
 exactas y sha256 de cada archivo: `manifest.json`.
 
-Procedencia: machineName/author/version del library.json + repositorio upstream github.com/h5p/<repo> + licencia MIT (ruling del controlador 2026-10-01). Fuente de la licencia: upstream repository README/LICENSE, checked 2026-10-01.
+Procedencia: machineName/author/version del library.json + repositorio upstream github.com/h5p/<repo> + licencia MIT; licenceSource dice qué evidencia aplica a cada librería (ruling del controlador 2026-10-01, fix round 1).
 
-| Librería | Versión | Copyright | Licencia | Repositorio |
-|---|---|---|---|---|
-| H5P.AudioRecorder | 1.0.54 | 2017 H5P | MIT | https://github.com/h5p/h5p-audio-recorder |
-| H5P.BranchingQuestion | 1.0.20 | Joubel AS (H5P Group AS) | MIT | https://github.com/h5p/h5p-branching-question |
-| H5P.BranchingScenario | 1.10.1 | Joubel AS (H5P Group AS) | MIT | https://github.com/h5p/h5p-branching-scenario |
-| H5P.ContinuousText | 1.2.16 | Joubel AS (H5P Group AS) | MIT | https://github.com/h5p/h5p-continuous-text |
-| H5P.CoursePresentation | 1.27.17 | 2012-2017 Joubel | MIT | https://github.com/h5p/h5p-course-presentation |
-| H5P.Dialogcards | 1.9.40 | Joubel AS (H5P Group AS) | MIT | https://github.com/h5p/h5p-dialogcards |
-| H5P.DragQuestion | 1.15.37 | Joubel AS (H5P Group AS) | MIT | https://github.com/h5p/h5p-drag-question |
-| H5P.ExportableTextArea | 1.3.22 | Joubel AS (H5P Group AS) | MIT | https://github.com/h5p/h5p-exportable-text-area |
-| H5P.ImageHotspots | 1.10.31 | 2015 Joubel AS | MIT | https://github.com/h5p/h5p-image-hotspots |
-| H5P.InteractiveVideo | 1.28.37 | 2017 H5P | MIT | https://github.com/h5p/h5p-interactive-video |
-| H5P.Shape | 1.0.5 | Joubel AS (H5P Group AS) | MIT | https://github.com/h5p/h5p-shape |
-| H5P.TwitterUserFeed | 1.0.21 | Joubel AS (H5P Group AS) | MIT | https://github.com/h5p/h5p-twitter-user-feed |
-| H5PEditor.BranchingQuestion | 1.0.5 | Joubel AS (H5P Group AS) | MIT | https://github.com/h5p/h5p-editor-branching-question |
-| H5PEditor.BranchingScenario | 1.5.13 | Joubel AS (H5P Group AS) | MIT | https://github.com/h5p/h5p-editor-branching-scenario |
-| H5PEditor.CoursePresentation | 1.26.6 | 2012-2014 Joubel AS | MIT | https://github.com/h5p/h5p-editor-course-presentation |
-| H5PEditor.ImageCoordinateSelector | 1.2.7 | Joubel AS (H5P Group AS) | MIT | https://github.com/h5p/h5p-editor-image-coordinate-selector |
-| H5PEditor.InteractiveVideo | 1.26.3 | 2012-2014 Joubel AS | MIT | https://github.com/h5p/h5p-editor-interactive-video |
-| H5PEditor.RadioSelector | 1.2.2 | Joubel AS (H5P Group AS) | MIT | https://github.com/h5p/h5p-editor-radio-selector |
-| H5PEditor.Shape | 1.0.0 | Joubel AS (H5P Group AS) | MIT | https://github.com/h5p/h5p-editor-shape |
+Fuente de la licencia (columna «Evidencia»): `library.json` = campo `license` de la librería;
+`local LICENCE/README file` = archivo de licencia dentro de su carpeta; `upstream repository verified
+2026-10-01` = repositorio upstream verificado en línea por el controlador. Columna «Repo verificado»:
+«no» = URL deducido del nombre (h5p-<kebab>), sin verificación en línea.
+
+Los paquetes `.h5p` de Cursia redistribuyen estas carpetas tal como las publica H5P (sin agregar
+archivos): las que no traen su propio archivo de licencia viajan, como upstream, sin aviso dentro
+de la carpeta; este archivo y `manifest.json` son el aviso MIT de Cursia.
+
+| Librería | Versión | Copyright | Licencia | Evidencia | Repositorio | Repo verificado |
+|---|---|---|---|---|---|---|
+| H5P.AudioRecorder | 1.0.54 | 2017 H5P | MIT | library.json (LICENCE.md) | https://github.com/h5p/h5p-audio-recorder | sí |
+| H5P.BranchingQuestion | 1.0.20 | Joubel AS (H5P Group AS) | MIT | library.json | https://github.com/h5p/h5p-branching-question | no |
+| H5P.BranchingScenario | 1.10.1 | Joubel AS (H5P Group AS) | MIT | library.json | https://github.com/h5p/h5p-branching-scenario | no |
+| H5P.ContinuousText | 1.2.16 | Joubel AS (H5P Group AS) | MIT | upstream repository verified 2026-10-01 | https://github.com/h5p/h5p-continuous-text | sí |
+| H5P.CoursePresentation | 1.27.17 | 2012-2017 Joubel | MIT | library.json (LICENCE.md) | https://github.com/h5p/h5p-course-presentation | no |
+| H5P.Dialogcards | 1.9.40 | Joubel AS (H5P Group AS) | MIT | library.json | https://github.com/h5p/h5p-dialogcards | no |
+| H5P.DragQuestion | 1.15.37 | Joubel AS (H5P Group AS) | MIT | library.json | https://github.com/h5p/h5p-drag-question | sí |
+| H5P.ExportableTextArea | 1.3.22 | Joubel AS (H5P Group AS) | MIT | upstream repository verified 2026-10-01 | https://github.com/h5p/h5p-exportable-text-area | sí |
+| H5P.ImageHotspots | 1.10.31 | 2015 Joubel AS | MIT | library.json (README.md) | https://github.com/h5p/h5p-image-hotspots | no |
+| H5P.InteractiveVideo | 1.28.37 | 2017 H5P | MIT | library.json (LICENCE.md) | https://github.com/h5p/h5p-interactive-video | no |
+| H5P.Shape | 1.0.5 | Joubel AS (H5P Group AS) | MIT | library.json | https://github.com/h5p/h5p-shape | sí |
+| H5P.TwitterUserFeed | 1.0.21 | Joubel AS (H5P Group AS) | MIT | library.json | https://github.com/h5p/h5p-twitter-user-feed | no |
+| H5PEditor.BranchingQuestion | 1.0.5 | Joubel AS (H5P Group AS) | MIT | upstream repository verified 2026-10-01 | https://github.com/h5p/h5p-editor-branching-question | sí |
+| H5PEditor.BranchingScenario | 1.5.13 | Joubel AS (H5P Group AS) | MIT | library.json | https://github.com/h5p/h5p-editor-branching-scenario | no |
+| H5PEditor.CoursePresentation | 1.26.6 | 2012-2014 Joubel AS | MIT | local LICENCE/README file (README.md) | https://github.com/h5p/h5p-editor-course-presentation | no |
+| H5PEditor.ImageCoordinateSelector | 1.2.7 | Joubel AS (H5P Group AS) | MIT | upstream repository verified 2026-10-01 | https://github.com/h5p/h5p-editor-image-coordinate-selector | sí |
+| H5PEditor.InteractiveVideo | 1.26.3 | 2012-2014 Joubel AS | MIT | library.json (README.md) | https://github.com/h5p/h5p-editor-interactive-video | no |
+| H5PEditor.RadioSelector | 1.2.2 | Joubel AS (H5P Group AS) | MIT | upstream repository verified 2026-10-01 | https://github.com/h5p/h5p-editor-radio-selector | sí |
+| H5PEditor.Shape | 1.0.0 | Joubel AS (H5P Group AS) | MIT | upstream repository verified 2026-10-01 | https://github.com/h5p/h5p-editor-shape | sí |
 
 ## MIT License
 
