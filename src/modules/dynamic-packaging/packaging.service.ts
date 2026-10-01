@@ -11,6 +11,7 @@ import { packageReuseHash, resolveDynamicMoodleVersion, sortedArtifactIds } from
 import { DYNAMIC_MBZ_BUILDER_VERSION } from '../../package/dynamic-mbz-builder';
 import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import { isRealVideoOutput, prepareV3Package } from './packaging-v3';
+import { VIDEO_MODE_INCONSISTENT, fallbackVideoModeOf, runIsUpgradeOnlyFailure } from '../dynamic-generation/video-upgrade';
 import { MOCK_ARTIFACT_IN_REAL_RUN } from './packaging-guards';
 import { DYNAMIC_MBZ_BUILDER_VERSION_V3 } from '../../package/dynamic-mbz-builder-v3';
 
@@ -222,7 +223,8 @@ export class PackagingService {
    * → stale (y POST …/package arma uno nuevo, sin generar nada).
    */
   private async buildFreshnessV3(run: any, manifest: ManifestDto, existing: PackageJobRow): Promise<BuildFreshness> {
-    const runDone = run.worker_status === RUN_DONE_STATUS || run.status === RUN_DONE_STATUS;
+    const runDone = run.worker_status === RUN_DONE_STATUS || run.status === RUN_DONE_STATUS ||
+      (await runIsUpgradeOnlyFailure({ query: this.dataSource.query.bind(this.dataSource) }, run));
     if (!runDone) {
       if (ACTIVE_RUN_WORKER_STATUSES.includes(String(run.worker_status))) {
         return { stale: true, reason: `run_in_progress: la ejecución está ${run.worker_status} (hay items regenerándose); el paquete puede no incluir su salida nueva` };
@@ -269,7 +271,8 @@ export class PackagingService {
         throw new ConflictException({ message, missing: err.missing });
       }
       const msg = err instanceof Error ? err.message : String(err);
-      if ((err as any)?.code === MOCK_ARTIFACT_IN_REAL_RUN || /^(ASSESSMENT_|THEME_INVALID|PROFILE_INVALID|STORAGE_PATH_INVALID)/.test(msg)) {
+      if ((err as any)?.code === MOCK_ARTIFACT_IN_REAL_RUN || (err as any)?.code === VIDEO_MODE_INCONSISTENT ||
+        /^(ASSESSMENT_|THEME_INVALID|PROFILE_INVALID|STORAGE_PATH_INVALID)/.test(msg)) {
         throw new ConflictException({ message: msg, missing: [], code: (err as any)?.code ?? msg.split(':')[0] });
       }
       throw err;
@@ -414,7 +417,10 @@ export class PackagingService {
       .filter((it) => statusByKey.get(it.key) !== 'completed')
       .map((it) => it.key);
 
-    if (run.worker_status !== RUN_DONE_STATUS || missing.length > 0) {
+    // EV6 T5 B2 (§2.6): run terminado solo con videos del upgrade fallidos → se empaqueta (pendientes).
+    const upgradeOnlyFailure = manifest.rulesVersion === 3 && run.worker_status !== RUN_DONE_STATUS && missing.length === 0 &&
+      (await runIsUpgradeOnlyFailure({ query: this.dataSource.query.bind(this.dataSource) }, run));
+    if ((run.worker_status !== RUN_DONE_STATUS && !upgradeOnlyFailure) || missing.length > 0) {
       // El filtro global de excepciones (AllExceptionsFilter) aplana
       // `exception.getResponse()` a un string (`error: message.message`) y
       // descarta cualquier otro campo — así que `missing` viaja también
@@ -440,7 +446,7 @@ export class PackagingService {
       const ytMissing = manifest.manifest.items
         .filter((it) => it.type === 'video')
         // EV6 T5: un video pendiente (vista previa) no se empaqueta → no se le exige YouTube.
-        .filter((it) => manifest.rulesVersion !== 3 || isRealVideoOutput(byKey.get(it.key)?.output_summary ?? null, videoMode))
+        .filter((it) => manifest.rulesVersion !== 3 || isRealVideoOutput(byKey.get(it.key)?.output_summary ?? null, fallbackVideoModeOf(run.input_payload)))
         .flatMap((it) => {
           const r = byKey.get(it.key);
           return youtubeDeliveryProblems(it.key, r?.status ?? null, r?.output_summary ?? null);

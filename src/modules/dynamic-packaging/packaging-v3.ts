@@ -33,6 +33,14 @@ import { frozenVideoDeliveryOf, checkYoutubeDeliveryUrl } from '../dynamic-gener
 import { GuardArtifact, MockArtifactInRealRunError, assertNoMockArtifactsForRealPackage } from './packaging-guards';
 import { frozenProviderModesOf, providerKindOfArtifactType } from '../dynamic-generation/provider-modes';
 import { assertSafeStoragePath } from '../artifacts/artifacts.service';
+import {
+  VideoModeInconsistentError,
+  fallbackVideoModeOf,
+  questionsBelongToVideo,
+  runIsUpgradeOnlyFailure,
+  upgradedVideoKeysOf,
+  videoUpgradeOf,
+} from '../dynamic-generation/video-upgrade';
 import { ResolvedAssessment, assertCategoriesPopulated, assessmentItemCountsForPackage } from '../../package/assessment';
 import {
   AssessmentProfile,
@@ -87,6 +95,8 @@ export interface ResolvedItemV3 {
   type: ManifestItemType;
   artifacts: ResolvedArtifactV3[];
   outputSummary: Record<string, any>;
+  /** Fix round 3 (I-4): fin de la generación vigente (regla de procedencia de las preguntas, filas legacy). */
+  finishedAt?: unknown;
 }
 
 function parseJson(v: any): any {
@@ -103,17 +113,20 @@ function parseJson(v: any): any {
 /** Resuelve los artifacts de TODOS los items de un run v3 completado. Lanza PackagingNotReadyError con la lista completa de faltantes. */
 export async function resolveRunArtifactsV3(q: QueryExecutor, runId: string, manifest: GenerationManifestV1): Promise<Map<string, ResolvedItemV3>> {
   if (manifest?.rulesVersion !== 3) throw new Error(`${PACKAGING_V3}: resolveRunArtifactsV3 exige un Manifest rulesVersion 3`);
-  const [job] = await q.query(`select id, execution_mode, worker_status, status from public.production_jobs where id = $1`, [runId]);
+  const [job] = await q.query(`select id, execution_mode, worker_status, status, input_payload from public.production_jobs where id = $1`, [runId]);
   if (!job) throw new PackagingNotReadyError([`run:${runId}:not_found`], `Empaquetado no listo: el run ${runId} no existe.`);
   if (job.execution_mode !== 'dynamic_generation') {
     throw new PackagingNotReadyError([`run:${runId}:wrong_execution_mode=${job.execution_mode}`]);
   }
-  if (job.worker_status !== 'completed' && job.status !== 'completed') {
+  job.input_payload = parseJson(job.input_payload);
+  // EV6 T5 B2 (§2.6): un run que terminó sin completar SOLO por videos del upgrade se empaqueta igual
+  // (esos capítulos quedan con su video pendiente: la generación completada vigente es la de vista previa).
+  if (job.worker_status !== 'completed' && job.status !== 'completed' && !(await runIsUpgradeOnlyFailure(q, job))) {
     throw new PackagingNotReadyError([`run:${runId}:not_completed:worker_status=${job.worker_status},status=${job.status}`]);
   }
   const rows: any[] = await q.query(
     `select gir.item_key as item_key, gir.id as item_run_id, gir.status as gir_status, gir.type as gir_type,
-            gir.output_summary as output_summary,
+            gir.output_summary as output_summary, gir.finished_at as finished_at,
             a.id as artifact_id, a.type as artifact_type, a.storage_bucket as storage_bucket,
             a.storage_path as storage_path, a.mime_type as mime_type, a.status as artifact_status, a.metadata as metadata
        from ${effectiveOutputRowsSql('$1')} gir
@@ -169,7 +182,9 @@ export async function resolveRunArtifactsV3(q: QueryExecutor, runId: string, man
         ...(m.artifact_status === 'stale' ? { status: 'stale' as const } : {}),
       });
     }
-    if (arts.length === roles.length) out.set(item.key, { itemKey: item.key, type: item.type, artifacts: arts, outputSummary: parseJson(list[0].output_summary) });
+    if (arts.length === roles.length) {
+      out.set(item.key, { itemKey: item.key, type: item.type, artifacts: arts, outputSummary: parseJson(list[0].output_summary), finishedAt: list[0].finished_at ?? null });
+    }
   }
   if (missing.length) throw new PackagingNotReadyError(missing);
   return out;
@@ -753,16 +768,41 @@ export function splitPendingVideosV3(
   manifest: GenerationManifestV1,
   byItem: Map<string, ResolvedItemV3>,
   runVideoMode: unknown,
+  opts: {
+    videoUpgrade?: boolean;
+    runId?: string;
+    /** Fix round 1 (m-6): keys de video de los upgrades del run (solo esas pueden quedar pendientes en un run real). */
+    upgradedKeys?: ReadonlySet<string>;
+    /** Fix round 1 (m-6): modo para items sin `mode` = el ORIGINAL del run (default: runVideoMode). */
+    fallbackMode?: unknown;
+  } = {},
 ): { pendingVideos: PendingVideoV3[]; byItem: Map<string, ResolvedItemV3> } {
   const pendingVideos: PendingVideoV3[] = [];
+  const inconsistent: string[] = [];
   for (const it of manifest.items) {
     if (it.type !== 'video') continue;
     const r = byItem.get(it.key);
     if (!r) continue; // resolveRunArtifactsV3 ya exigió todos los items
-    if (isRealVideoOutput(r.outputSummary, runVideoMode)) continue;
+    const chapterIdOf = String(it.chapterId ?? it.key.slice('video:'.length));
+    if (isRealVideoOutput(r.outputSummary, opts.fallbackMode !== undefined ? opts.fallbackMode : runVideoMode)) {
+      // Fix round 1 (I-1) / round 3 (I-4): un video REAL de un upgrade cuyas preguntas NO se
+      // construyeron con ESA generación del video (regla única de procedencia, video-upgrade.ts) NO
+      // se empaqueta con esas preguntas: queda pendiente, nunca un H5P incoherente.
+      const vRunId = r.artifacts[0]?.itemRunId;
+      const inter = byItem.get(`video_interactions:${chapterIdOf}`);
+      const fromUpgrade = r.outputSummary?.regeneration?.reason === 'video_upgrade';
+      if (!fromUpgrade || !inter ||
+        questionsBelongToVideo({ id: String(vRunId), finishedAt: r.finishedAt }, { status: 'completed', outputSummary: inter.outputSummary, finishedAt: inter.finishedAt })) continue;
+    }
+    // Ruling 6 (B2): run real + item de vista previa solo es «pendiente» si un upgrade lo incluyó.
+    if (runVideoMode === 'real' && (!opts.videoUpgrade || (opts.upgradedKeys && !opts.upgradedKeys.has(it.key)))) {
+      inconsistent.push(it.key);
+      continue;
+    }
     const chapterId = String(it.chapterId ?? it.key.slice('video:'.length));
     pendingVideos.push({ itemKey: it.key, chapterId, videoInteractionsKey: `video_interactions:${chapterId}` });
   }
+  if (inconsistent.length) throw new VideoModeInconsistentError(inconsistent, opts.runId);
   if (!pendingVideos.length) return { pendingVideos, byItem };
   const drop = new Set(pendingVideos.flatMap((p) => [p.itemKey, p.videoInteractionsKey]));
   return { pendingVideos, byItem: new Map([...byItem].filter(([k]) => !drop.has(k))) };
@@ -794,7 +834,12 @@ export async function prepareV3Package(
   run.input_payload = parseJson(run.input_payload);
   const resolvedAll = await resolveRunArtifactsV3(q, runId, manifest.manifest);
   // EV6 T5: los videos de vista previa quedan fuera del paquete (nunca un video simulado como real).
-  const { pendingVideos, byItem } = splitPendingVideosV3(manifest.manifest, resolvedAll, run.input_payload?.videoMode);
+  const { pendingVideos, byItem } = splitPendingVideosV3(manifest.manifest, resolvedAll, run.input_payload?.videoMode, {
+    videoUpgrade: !!videoUpgradeOf(run.input_payload),
+    runId,
+    upgradedKeys: upgradedVideoKeysOf(run.input_payload),
+    fallbackMode: fallbackVideoModeOf(run.input_payload),
+  });
   const omittedVideoKeys = pendingVideos.map((p) => p.itemKey);
   assertRunArtifactsPackageable(run, byItem);
   const pendingKeys = new Set(omittedVideoKeys);

@@ -14,7 +14,7 @@ import {
   ValidationPipe,
 } from '@nestjs/common';
 import type { Response } from 'express';
-import { RunsService, YoutubeResolutionAction, publicPreview } from './runs.service';
+import { RunsService, YoutubeResolutionAction, publicPreview, publicVideoUpgradePreview } from './runs.service';
 import { CourseContextDto } from './dto/course-context.dto';
 import { RetryItemDto } from './dto/executor.dto';
 import { parseRegenerateItemBody } from './dto/regenerate-item.dto';
@@ -191,6 +191,44 @@ export class RunsController {
     const action = b.action as YoutubeResolutionAction;
     const videoId = b.youtubeVideoId === undefined ? undefined : String(b.youtubeVideoId);
     return this.runs.resolveYoutubeUpload(courseId, user.id, number, runId, itemKey, action, videoId);
+  }
+
+  // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/video-upgrade/preview
+  // EV6 T5 B2: «Generar videos reales» — vista previa SOLO lectura (videos pendientes del run,
+  // estimado USD de exactamente eso, aprobación y trabas). Sin body.
+  @Post(':runId/video-upgrade/preview')
+  @HttpCode(HttpStatus.OK)
+  async videoUpgradePreview(
+    @Param('courseId', ParseIntPipe) courseId: number,
+    @Param('number', ParseIntPipe) number: number,
+    @Param('runId', ParseUUIDPipe) runId: string,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return publicVideoUpgradePreview(await this.runs.previewVideoUpgrade(courseId, { id: user.id, email: user.email }, number, runId));
+  }
+
+  // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/video-upgrade
+  // Body {estimateHash} (la huella de la vista previa que vio el usuario). 201 si se creó el
+  // upgrade; 200 si ya existía (idempotente: nunca un segundo juego de videos pagos).
+  @Post(':runId/video-upgrade')
+  async videoUpgrade(
+    @Param('courseId', ParseIntPipe) courseId: number,
+    @Param('number', ParseIntPipe) number: number,
+    @Param('runId', ParseUUIDPipe) runId: string,
+    @Body() body: Record<string, unknown>,
+    @CurrentUser() user: AuthUser,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const b = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+    const extra = Object.keys(b).filter((k) => k !== 'estimateHash');
+    if (extra.length > 0) throw new BadRequestException(`campos no permitidos: ${extra.join(', ')}`);
+    const estimateHash = b.estimateHash;
+    if (typeof estimateHash !== 'string' || !/^[0-9a-f]{64}$/.test(estimateHash)) {
+      throw new BadRequestException('estimateHash es obligatorio (la huella del estimado que se mostró)');
+    }
+    const result = await this.runs.confirmVideoUpgrade(courseId, { id: user.id, email: user.email }, number, runId, estimateHash);
+    res.status(result.created ? 201 : 200);
+    return result;
   }
 
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/items/:itemKey/regenerate
