@@ -1221,7 +1221,8 @@ async function workerChecks() {
     eq(h.state.ledger.map((e) => [e.kind, e.externalId, e.attributionRunId]), [['package', 'job-1', RUN_ID]], 'ZERO_BY_DESIGN');
     const up = h.state.uploads[0];
     // EV6 DoD: paquete QA → archivo QA-VISTA-PREVIA-<clave>.mbz (nunca adopta el path de un paquete sin rótulo).
-    assert(up.storagePath.endsWith(`/QA-VISTA-PREVIA-${s.sourceIdsHash}.mbz`) && up.upsert === false, 'path direccionado por la clave');
+    // Fix round 3 (N2): bajo el prefijo interno (fuera de la carpeta del dueño).
+    assert(up.storagePath.startsWith(`qa-internal/${OWNER}/`) && up.storagePath.endsWith(`/QA-VISTA-PREVIA-${s.sourceIdsHash}.mbz`) && up.upsert === false, `path direccionado por la clave: ${up.storagePath}`);
     eq([s.packageKind, s.deliverable], ['qa_preview', false], 'resumen QA');
     const z = await JSZip.loadAsync(up.buffer);
     assert(z.file('moodle_backup.xml'), 'es un .mbz');

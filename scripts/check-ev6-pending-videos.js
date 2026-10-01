@@ -478,7 +478,8 @@ async function workerChecks() {
     {
       const z = await JSZip.loadAsync(h.state.uploads[0].buffer);
       assert(/<fullname>[^<]*\[QA — vista previa, no entregable\]<\/fullname>/.test(await z.file('course/course.xml').async('string')), 'fullname QA');
-      assert(/^QA-VISTA-PREVIA-/.test(h.state.uploads[0].filename) && /\/QA-VISTA-PREVIA-[0-9a-f]+\.mbz$/.test(h.state.uploads[0].storagePath), `archivo QA: ${h.state.uploads[0].filename}`);
+      assert(/^QA-VISTA-PREVIA-/.test(h.state.uploads[0].filename) && /\/QA-VISTA-PREVIA-[0-9a-f]+\.mbz$/.test(h.state.uploads[0].storagePath) &&
+        /^qa-internal\//.test(h.state.uploads[0].storagePath), `archivo QA (prefijo interno, fix round 3 N2): ${h.state.uploads[0].storagePath}`);
       eq([s.packageKind, s.deliverable, h.state.uploads[0].metadata.packageKind], ['qa_preview', false, 'qa_preview'], 'resumen/metadata QA');
     }
     workerMbz = h.state.uploads[0].buffer;

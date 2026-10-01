@@ -19,7 +19,7 @@ import type { DynamicPackageContents, PackagingPlan, ResolvedArtifact } from '..
 import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
 import { WorkerLedger, recordPackageBuild } from './finops-worker-hooks';
 import { buildDynamicMbzV3, DYNAMIC_MBZ_BUILDER_VERSION_V3 } from '../package/dynamic-mbz-builder-v3';
-import { PACKAGE_KINDS, PackageKind, QA_PACKAGE_FILENAME_PREFIX, summaryLooksPreview } from '../modules/dynamic-packaging/package-freshness';
+import { PACKAGE_KINDS, PackageKind, QA_INTERNAL_STORAGE_PREFIX, QA_PACKAGE_FILENAME_PREFIX, summaryLooksPreview } from '../modules/dynamic-packaging/package-freshness';
 import { frozenProviderModesOf } from '../modules/dynamic-generation/provider-modes';
 import { validateMbzV3 } from '../package/v3/mbz-validator-v3';
 import { buildPackagingPlanV3 } from '../modules/dynamic-packaging/packaging-plan-v3';
@@ -572,7 +572,12 @@ export async function processV3PackageJob(
   // EV6 DoD: un paquete QA va a OTRA ruta/nombre (`QA-VISTA-PREVIA-…`): nunca adopta ni pisa el .mbz
   // de un paquete anterior con la misma clave (p.ej. uno B1 sin rótulo).
   const mbzFilename = `${qa ? QA_PACKAGE_FILENAME_PREFIX : ''}${sourceIdsHash}.mbz`;
-  const storagePath = `${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${mbzFilename}`;
+  // Fix round 3 (N2): un paquete QA / degradado va bajo un prefijo INTERNO (primer segmento ≠ uid del
+  // dueño): ninguna política de Storage de `authenticated` (own-folder) lo cubre → solo el backend
+  // (service role, para un SUPER_ADMIN) lo firma. El paquete final conserva la ruta de siempre.
+  const storagePath = qa
+    ? `${QA_INTERNAL_STORAGE_PREFIX}/${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${mbzFilename}`
+    : `${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${mbzFilename}`;
   const artifact = await deps.artifacts.uploadBufferArtifact({
     ownerId: job.owner_id,
     courseId: artifactCourseId(job),

@@ -273,9 +273,15 @@ export class PackagingService {
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     const run = await this.loadRunRow(courseId, manifest, runId); // valida ownership + que el run pertenezca al curso/Manifest
 
-    const job = await this.findLatestPackageJob(runId);
+    let job = await this.findLatestPackageJob(runId);
     if (!job) {
       throw new NotFoundException(`No hay ningún empaquetado iniciado para la ejecución ${runId}`);
+    }
+    // Fix round 3 (N3): a un no admin, un job QA / degradado nuevo (solo admin) no le tapa el paquete FINAL
+    // completado más reciente del run (si existe): ve ese.
+    if (isAdminOnlyPackageJob(job) && !isSuperAdminEmail(actor?.email)) {
+      const fin = await this.findLatestCompletedFinalJob(runId);
+      if (fin) job = fin;
     }
 
     const packageKind = packageKindOf(job);
@@ -478,7 +484,15 @@ export class PackagingService {
         throw new ConflictException({ message, missing: ytMissing, code: 'youtube_delivery_incomplete' });
       }
     }
-    if (manifest.rulesVersion !== 3) return 'final';
+    if (manifest.rulesVersion !== 3) {
+      // Fix round 3 (N4): v1/v2 tampoco dan un paquete FINAL sin la generación completa (no tienen QA).
+      const inputs = await loadCompletionInputs({ query: this.dataSource.query.bind(this.dataSource) }, run.id);
+      const c = inputs ? evaluateRunCompletion(inputs.job, inputs.rows, inputs.manifest, null, { validationCutoffs: inputs.validationCutoffs }) : null;
+      if (!c || !c.generationComplete) {
+        throw this.previewNotDeliverable(run.id, c ? c.missingComponents : [], 'la generación del curso no está completa (componentes de vista previa o sin validar)');
+      }
+      return 'final';
+    }
     return this.packageKindFor(run, manifest, upgradeOnlyFailure, actor);
   }
 
@@ -519,6 +533,19 @@ export class PackagingService {
       `${PREVIEW_NOT_DELIVERABLE}: ${why}. La ejecución ${runId} no se empaqueta como curso entregable ` +
       `(${preview.length} componente(s) de vista previa) missingJson=${JSON.stringify(preview)}`;
     return new ConflictException({ message, missing: preview, code: PREVIEW_NOT_DELIVERABLE });
+  }
+
+  /** Fix round 3 (N3): el job FINAL completado más reciente del run (o null). */
+  private async findLatestCompletedFinalJob(runId: string): Promise<PackageJobRow | null> {
+    const rows: PackageJobRow[] = await this.dataSource.query(
+      `select id, owner_id, course_id, worker_status, status, input_payload, output_summary, error_message
+         from public.production_jobs
+        where execution_mode = $1 and input_payload->>'runId' = $2 and worker_status = 'completed'
+        order by created_at desc, id desc
+        limit 20`,
+      [EXECUTION_MODE, runId],
+    );
+    return rows.find((j) => isDeliverableKind(packageKindOf(j))) ?? null;
   }
 
   private async findLatestPackageJob(runId: string, q: { query: (sql: string, params?: any[]) => Promise<any> } = this.dataSource): Promise<PackageJobRow | null> {

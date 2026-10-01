@@ -1801,6 +1801,16 @@ export class RunsService {
       ) {
         assertRealVideoAllowed(ownerId);
       }
+      // Fix round 3 (N5): el gate de recuperación de admin se re-evalúa sobre las filas BLOQUEADAS (un cambio
+      // entre la lectura previa y el lock no puede colar un re-render pago de un no admin).
+      if (!auto && this.videoModeOf(job) === 'real' && !isSuperAdminEmail(actor?.email) && !uploadPhaseRetry) {
+        const reRender = (r: { type: string; error: string | null; output_summary: Record<string, any> | null }) =>
+          r.type === 'video' && !r.output_summary?.external?.videogenJobId && videoRenderWasAttempted(r);
+        const unblockKeys = new Set(this.dependentsToUnblock(items, itemKey).map(String));
+        if (resubmitVideo || reRender(target) || items.some((i) => unblockKeys.has(String(i.id)) && reRender(i))) {
+          throw adminRecoveryForbidden('Volver a generar un video (con costo)');
+        }
+      }
 
       // I4/R23: resubmitVideo solo para items type='video' en 'failed' cuyo
       // último error sea 'videogen_failed' (job terminal, no hay video → no

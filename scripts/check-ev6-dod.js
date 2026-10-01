@@ -715,13 +715,15 @@ const ENV_KEYS = [
     await check('dod', 'fix round 2 (cursos viejos): un run REAL que completó ANTES de la validación de servidor (sin v3Validation) se lee completo-en-generación (packaging) y empaqueta FINAL; un run viejo MOCK se lee preview; uno nuevo sin v3Validation sigue «sin validar»', async () => {
       RC._resetValidationCutoffsForTests();
       const age = async (runId) => {
-        await ds.query(`update public.generation_item_runs set output_summary = output_summary - 'v3Validation', finished_at = now() - interval '30 days' where job_id = $1`, [runId]);
-        await ds.query(`update public.production_jobs set status = 'completed', worker_status = 'completed', finished_at = now() - interval '30 days' where id = $1`, [runId]);
+        await ds.query(`update public.generation_item_runs set output_summary = output_summary - 'v3Validation', finished_at = '2026-09-20T12:00:00Z' where job_id = $1`, [runId]);
+        await ds.query(`update public.production_jobs set status = 'completed', worker_status = 'completed', finished_at = '2026-09-20T12:00:00Z' where id = $1`, [runId]);
       };
       const R = await finishedRun('DoD viejo real', { videoMode: 'real', providerModes: { presentation: 'real', audio: 'real' }, videoItemMode: 'real' });
       await age(R.runId);
       const cut = await RC.loadValidationCutoffs(ds, Date.now() + 120000);
-      assert(cut.course_intro && cut.course_intro.getTime() > Date.now() - 86400e3, `marcador de inicio de la validación: ${JSON.stringify(cut)}`);
+      // Marcador = primera fila validada de esta base, con el techo fijo de fix round 3 (N6).
+      assert(cut.course_intro && cut.course_intro.getTime() <= RC.VALIDATION_CUTOFF_CEILING.getTime() && cut.course_intro.getTime() > Date.parse('2026-09-20T12:00:00Z'),
+        `marcador de inicio de la validación: ${JSON.stringify(cut)}`);
       const dto = await runs.getRun(R.cid, OWNER, 1, R.runId);
       eq([dto.status, dto.completion.state, dto.completion.generationComplete, dto.completion.missingComponents], ['completed', 'packaging', true, []], 'viejo real');
       eq(await packaging.assertRunReady(await jobOf(R.runId), { rulesVersion: 3, manifest: R.manifest.manifest ?? R.manifest }, { email: 'owner@cursia.test' }), 'final', 'paquete final del dueño');
@@ -762,6 +764,87 @@ const ENV_KEYS = [
       await rejectsRe(new ArtifactsController(svc({ packageKind: 'qa_preview' })).getDownloadUrl(qaArt, { id: OWNER, email: 'owner@cursia.test' }), /admin_recovery_only/, 'QA nuevo, dueño', 403);
       eq((await new ArtifactsController(svc({ packageKind: 'degraded' })).getDownloadUrl(qaArt, { id: OWNER, email: ADMIN.email })).data.url, 'u', 'admin');
       eq((await new ArtifactsController(svc({ pendingVideos: [{}] })).getDownloadUrl(qaArt, { id: OWNER, email: 'owner@cursia.test' })).data.url, 'u', 'B1 anterior, dueño');
+    });
+
+    // ════ 9. Fix round 3 ═══════════════════════════════════════════════════════
+    const OLD_AT = '2026-09-20T12:00:00Z'; // antes de la validación de servidor (y del techo N6)
+    await check('dod', 'fix round 3 N1: «Generar los cambios» (fromRun) de un curso VIEJO real (sin v3Validation, anterior a la validación) → el run B (filas arrastradas que nacen con finished_at = ahora) nace `completed`, no «sin validar»', async () => {
+      const C = await confirmedCourse('DoD N1 viejo fromRun');
+      const runA = await seededRealRun(C);
+      await ds.query(`update public.generation_item_runs set output_summary = output_summary - 'v3Validation', finished_at = $2 where job_id = $1`, [runA, OLD_AT]);
+      eq(await recompute(runA), 'completed', 'run A viejo real completed (exento: anterior a la validación)');
+      await ds.query(
+        `insert into public.course_blueprints (course_id, blueprint_number, schema_version, snapshot_json, snapshot_sha256, structure_counter_at_lock, module_count, chapter_count)
+         values ($1, 2, 2, $2::jsonb, $3, 0, 1, 2)`, [C.cid, snap.canonicalJsonV2(C.snapshot), snap.snapshotSha256V2(C.snapshot)]);
+      await manifests.getOrCreate(C.cid, OWNER, 2);
+      const res = await runs.startRun(C.cid, OWNER, 2, { fromRun: runA });
+      const rowsB = await ds.query(`select item_key, status, finished_at, output_summary from public.generation_item_runs where job_id = $1`, [res.run.id]);
+      assert(rowsB.every((r) => r.status === 'completed' && !r.output_summary.v3Validation && new Date(r.finished_at).getTime() > Date.parse(OLD_AT) + 86400e3),
+        'precondición: filas arrastradas nuevas, sin v3Validation');
+      eq((await jobOf(res.run.id)).worker_status, 'completed', 'run B completed');
+      const dto = await runs.getRun(C.cid, OWNER, 2, res.run.id);
+      eq([dto.completion.state, dto.completion.missingComponents], ['packaging', []], 'completion de B');
+      // Pura: una fila arrastrada sin origen viejo (o una NUEVA sin validar) no queda exenta.
+      const cuts = { course_intro: new Date('2026-09-26T00:00:00Z') };
+      eq(RC.predatesValidation({ finished_at: new Date(), carried_from_item_run_id: 'x', carry_origin_finished_at: OLD_AT }, 'course_intro', cuts), true, 'arrastrada de origen viejo');
+      eq(RC.predatesValidation({ finished_at: new Date(), carried_from_item_run_id: 'x', carry_origin_finished_at: new Date() }, 'course_intro', cuts), false, 'arrastrada de origen nuevo');
+      eq(RC.predatesValidation({ finished_at: new Date(), carry_origin_finished_at: OLD_AT }, 'course_intro', cuts), false, 'no arrastrada: su propio finished_at');
+    });
+
+    await check('dod', 'fix round 3 N6: el marcador de inicio de la validación nunca pasa del techo fijo (borrar las primeras filas validadas no lo corre después)', async () => {
+      RC._resetValidationCutoffsForTests();
+      const cut = await RC.loadValidationCutoffs(ds);
+      assert(Object.values(cut).length > 0 && Object.values(cut).every((d) => d.getTime() <= RC.VALIDATION_CUTOFF_CEILING.getTime()), JSON.stringify(cut));
+    });
+
+    await check('dod', 'fix round 3 N2: un .mbz QA / degradado NUEVO no aparece en GET /artifacts ni en GET /artifacts/:id para un no admin (sin storagePath); un admin sí; los .mbz anteriores no cambian', async () => {
+      const { ArtifactsController } = L('modules/artifacts/artifacts.controller.js');
+      const qa = { id: 'qa', type: 'dynamic_mbz', storagePath: 'qa-internal/o/x.mbz', metadata: { packageKind: 'qa_preview' } };
+      const dg = { id: 'dg', type: 'dynamic_mbz', storagePath: 'qa-internal/o/y.mbz', metadata: { packageKind: 'degraded' } };
+      const old = { id: 'b1', type: 'dynamic_mbz', storagePath: 'o/z.mbz', metadata: { pendingVideos: [{}] } };
+      const fin = { id: 'f', type: 'dynamic_mbz', storagePath: 'o/f.mbz', metadata: {} };
+      const all = [qa, dg, old, fin];
+      const svc = { async findAll() { return all; }, async findOne(id) { return all.find((a) => a.id === id); }, async getDownloadUrl() { return { url: 'u' }; } };
+      const ctl = new ArtifactsController(svc);
+      const owner = { id: OWNER, email: 'owner@cursia.test' };
+      eq((await ctl.findAll(owner)).data.map((a) => a.id), ['b1', 'f'], 'listado del dueño');
+      eq((await ctl.findAll({ id: OWNER, email: ADMIN.email })).data.map((a) => a.id), ['qa', 'dg', 'b1', 'f'], 'listado del admin');
+      await rejectsRe(ctl.findOne('qa', owner), /not found/i, 'detalle QA al dueño', 404);
+      eq((await ctl.findOne('b1', owner)).data.storagePath, 'o/z.mbz', 'paquete anterior: detalle intacto');
+      eq((await ctl.findOne('qa', { id: OWNER, email: ADMIN.email })).data.id, 'qa', 'admin');
+      const QP = L('modules/dynamic-packaging/qa-package.js');
+      eq(QP.QA_INTERNAL_STORAGE_PREFIX, 'qa-internal', 'prefijo interno (≠ uid del dueño: ninguna política own-folder lo cubre)');
+      assert(!/^[0-9a-f]{8}-/.test(QP.QA_INTERNAL_STORAGE_PREFIX), 'el prefijo nunca es un uid');
+    });
+
+    await check('dod', 'fix round 3 N3: con un paquete FINAL completado y un job QA más nuevo, el dueño ve (y descarga) el final; el admin ve el QA', async () => {
+      const R = await finishedRun('DoD N3', { videoMode: 'real', providerModes: { presentation: 'real', audio: 'real' }, videoItemMode: 'real' });
+      eq(await recompute(R.runId), 'completed', 'run completed');
+      const run = await jobOf(R.runId);
+      const mk = async (input, os) => (await ds.query(
+        `insert into public.production_jobs (owner_id, course_id, execution_mode, status, worker_status, current_step, input_payload, output_summary, options, result)
+         values ($1, $2, 'dynamic_package', 'completed', 'completed', 'dynamic_package', $3::jsonb, $4::jsonb, '{}'::jsonb, '{}'::jsonb) returning id`,
+        [OWNER, R.cid, JSON.stringify({ runId: R.runId, manifestId: Number(run.input_payload.manifestId), blueprintNumber: 1, ...input }), JSON.stringify(os)]))[0].id;
+      const finArt = crypto.randomUUID();
+      await mk({}, { artifactId: finArt, sourceIdsHash: 'f0'.repeat(32), builderVersion: '3.6.0' });
+      await new Promise((r) => setTimeout(r, 20));
+      await mk({ packageKind: 'degraded' }, { artifactId: crypto.randomUUID(), sourceIdsHash: 'd0'.repeat(32), builderVersion: '3.6.0', packageKind: 'degraded', deliverable: false });
+      const signer = { async getDownloadUrl(id) { return { url: `https://signed.invalid/${id}` }; } };
+      const pk = new PackagingService(ds, manifests, signer);
+      const own = await pk.getPackageStatus(R.cid, OWNER, 1, R.runId, { id: OWNER, email: 'owner@cursia.test' });
+      eq([own.packageKind, own.deliverable, own.artifactId, !!own.downloadUrl, own.downloadRestricted], ['final', true, finArt, true, undefined], 'dueño ve el final');
+      const adm = await pk.getPackageStatus(R.cid, OWNER, 1, R.runId, { id: OWNER, email: ADMIN.email });
+      eq(adm.packageKind, 'degraded', 'admin ve el QA más nuevo');
+    });
+
+    await check('dod', 'fix round 3 N4: v1/v2 tampoco dan un paquete FINAL sin la generación completa (409 preview_not_deliverable)', async () => {
+      const R = await finishedRun('DoD N4', { videoMode: 'real', providerModes: { presentation: 'real', audio: 'real' }, videoItemMode: 'real' });
+      eq(await recompute(R.runId), 'completed', 'precondición');
+      const pres = await latest(R.runId, `presentation:${R.c1}`);
+      await ds.query(`update public.generation_item_runs set output_summary = output_summary || '{"mock":true}'::jsonb where id = $1`, [pres.id]);
+      const job = await jobOf(R.runId);
+      // Mismo run, por la rama v1/v2 de assertRunReady (rulesVersion 2): la completitud igual se exige.
+      await rejectsRe(packaging.assertRunReady(job, { rulesVersion: 2, manifest: R.manifest.manifest ?? R.manifest }, { email: ADMIN.email }), /preview_not_deliverable/, 'v2 incompleto', 409);
     });
 
     await check('dod', 'migración: supabase-migration-ev6-dod-preview-status.sql lista EXACTAMENTE los worker_status del lib (fuente única) y es idempotente; el CHECK aplicado acepta preview y rechaza un valor desconocido', async () => {

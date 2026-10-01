@@ -116,6 +116,8 @@ export interface CompletionRow {
    * del más cercano al más lejano). La completa `attachCarryChains`; ausente = sin arrastre conocido.
    */
   carry_chain?: string[] | null;
+  /** Fix round 3 (N1): `finished_at` de la fila ORIGINAL de la cadena de arrastre (la que produjo la salida). */
+  carry_origin_finished_at?: Date | string | null;
 }
 
 export interface CompletionManifest {
@@ -212,7 +214,9 @@ function msOf(v: unknown): number {
 export function predatesValidation(r: CompletionRow, type: string, cutoffs?: Readonly<Record<string, Date>> | null): boolean {
   const cut = cutoffs?.[type];
   if (!cut) return false;
-  const done = msOf(r.finished_at);
+  // Fix round 3 (N1): una fila arrastrada por fromRun (nace con finished_at = ahora) hereda la exención
+  // de la fila original de la que se copió (su salida y su output_summary son los de esa fila).
+  const done = msOf(r.carried_from_item_run_id && r.carry_origin_finished_at ? r.carry_origin_finished_at : r.finished_at);
   return Number.isFinite(done) && done < cut.getTime();
 }
 
@@ -330,23 +334,27 @@ export function questionsOfVideo(v: CompletionRow, q: CompletionRow, qs?: Record
  * `carried_from_item_run_id` hasta el origen; tope de 32 saltos). Solo lectura.
  */
 export async function attachCarryChains<T extends CompletionRow>(q: Q, rows: T[]): Promise<T[]> {
-  const videos = rows.filter((r) => r.type === 'video' && r.carried_from_item_run_id);
-  if (!videos.length) return rows;
+  // Fix round 3 (N1): TODAS las filas arrastradas (no solo videos) — la exención de «anterior a la
+  // validación» se juzga contra el `finished_at` de la fila ORIGINAL (la raíz de la cadena).
+  const carried = rows.filter((r) => r.carried_from_item_run_id);
+  if (!carried.length) return rows;
   const parent = new Map<string, string | null>();
-  let frontier = [...new Set(videos.map((r) => String(r.carried_from_item_run_id)))];
+  const finished = new Map<string, Date | string | null>();
+  let frontier = [...new Set(carried.map((r) => String(r.carried_from_item_run_id)))];
   for (let hop = 0; hop < 32 && frontier.length; hop++) {
-    const got: Array<{ id: string; carried_from_item_run_id: string | null }> = await q.query(
-      `select id, carried_from_item_run_id from public.generation_item_runs where id = any($1::uuid[])`,
+    const got: Array<{ id: string; carried_from_item_run_id: string | null; finished_at: Date | string | null }> = await q.query(
+      `select id, carried_from_item_run_id, finished_at from public.generation_item_runs where id = any($1::uuid[])`,
       [frontier],
     );
     const next: string[] = [];
     for (const g of got) {
       parent.set(g.id, g.carried_from_item_run_id ?? null);
+      finished.set(g.id, g.finished_at ?? null);
       if (g.carried_from_item_run_id && !parent.has(g.carried_from_item_run_id)) next.push(g.carried_from_item_run_id);
     }
     frontier = [...new Set(next)];
   }
-  for (const r of videos) {
+  for (const r of carried) {
     const chain: string[] = [];
     let cur: string | null | undefined = r.carried_from_item_run_id;
     while (cur && !chain.includes(cur) && chain.length < 32) {
@@ -354,6 +362,14 @@ export async function attachCarryChains<T extends CompletionRow>(q: Q, rows: T[]
       cur = parent.get(cur) ?? null;
     }
     r.carry_chain = chain;
+    // La raíz conocida más lejana con finished_at (la salida original de la que se copió esta fila).
+    for (let i = chain.length - 1; i >= 0; i--) {
+      const f = finished.get(chain[i]);
+      if (f) {
+        r.carry_origin_finished_at = f;
+        break;
+      }
+    }
   }
   return rows;
 }
@@ -507,6 +523,8 @@ type Q = { query: (sql: string, params?: any[]) => Promise<any> };
  * solo puede bajar (se re-consulta cada 60 s y se combina); un tipo sin filas validadas no exime nada.
  */
 let cutoffCache: { checkedAt: number; value: Record<string, Date> } | null = null;
+/** Fix round 3 (N6): techo del marcador (ver loadValidationCutoffs). */
+export const VALIDATION_CUTOFF_CEILING = new Date('2026-10-01T00:00:00Z');
 const CUTOFF_RECHECK_MS = 60_000;
 
 export async function loadValidationCutoffs(q: Q, now = Date.now()): Promise<Record<string, Date>> {
@@ -522,6 +540,11 @@ export async function loadValidationCutoffs(q: Q, now = Date.now()): Promise<Rec
     if (!d || !Number.isFinite(d.getTime())) continue;
     if (!value[r.type] || d.getTime() < value[r.type].getTime()) value[r.type] = d;
   }
+  // Fix round 3 (N6): techo fijo — para esta fecha la validación de servidor ya estaba desplegada en todo
+  // entorno con runs v3 (R11a, 2026-09-26; staging la usa desde entonces y producción recibe V2.1 con
+  // ella). Si las primeras filas validadas se borraran (cascada de un curso), el marcador NO puede
+  // correrse después de este techo: nada completado después sin v3Validation queda exento.
+  for (const t of Object.keys(value)) if (value[t].getTime() > VALIDATION_CUTOFF_CEILING.getTime()) value[t] = VALIDATION_CUTOFF_CEILING;
   cutoffCache = { checkedAt: now, value };
   return value;
 }

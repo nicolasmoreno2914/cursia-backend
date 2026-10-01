@@ -25,6 +25,7 @@ export type PackageKind = 'final' | 'qa_preview' | 'degraded';
 export const PACKAGE_KINDS: readonly PackageKind[] = ['final', 'qa_preview', 'degraded'];
 /** Prefijo del nombre de archivo de un paquete que NO es entregable (QA / degradado). */
 export const QA_PACKAGE_FILENAME_PREFIX = 'QA-VISTA-PREVIA-';
+export { QA_INTERNAL_STORAGE_PREFIX, isAdminOnlyPackageArtifact } from './qa-package';
 
 /** worker_status del run que cuentan como "terminado" para empaquetar (EV6 DoD: + preview, solo QA). */
 export const RUN_DONE_STATUSES: readonly string[] = ['completed', 'preview'];
