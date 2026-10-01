@@ -210,7 +210,7 @@ const ENV_KEYS = [
     const recompute = (runId) => runs.tx((qr) => T.recomputeRunStatus(qr, runId));
 
     /** Curso v3 confirmado (1 módulo, 2 capítulos con video, uno con actividad, examen de módulo + final). Sin run. */
-    async function confirmedCourse(title, owner = OWNER) {
+    async function confirmedCourse(title, owner = OWNER, { videos = true } = {}) {
       const [course] = await ds.query(`insert into public.courses (owner_id, title, structure_version) values ($1, $2, 'dynamic') returning id`, [owner, title]);
       const cid = course.id;
       const m1 = crypto.randomUUID();
@@ -219,8 +219,8 @@ const ENV_KEYS = [
       const s2 = snap.buildBlueprintSnapshotV2(
         { id: cid, title, finalExam: true, activityEngine: 'h5p' },
         [{ id: m1, position: 0, title: 'M1', objective: null, exam_enabled: true }],
-        [{ id: c1, module_id: m1, position: 0, title: 'C1', objective: null, video_enabled: true, activity_enabled: true },
-          { id: c2, module_id: m1, position: 1, title: 'C2', objective: null, video_enabled: true, activity_enabled: false }],
+        [{ id: c1, module_id: m1, position: 0, title: 'C1', objective: null, video_enabled: videos, activity_enabled: true },
+          { id: c2, module_id: m1, position: 1, title: 'C2', objective: null, video_enabled: videos, activity_enabled: false }],
       );
       for (const m of s2.modules) {
         await ds.query(`insert into public.course_modules (id, course_id, position, title) values ($1, $2, $3, $4)`, [m.id, cid, m.position, m.title]);
@@ -236,7 +236,7 @@ const ENV_KEYS = [
       await ds.query(
         `insert into public.cost_budget_policies (scope, scope_id, version, limits, on_exceed) values ('course', $1, 1, $2::jsonb, 'ADMIN_APPROVAL')`,
         [String(cid), JSON.stringify({ maxCostPerRun: '1000', maxCostPerCourse: '1000', monthlyCap: '1000000000' })]);
-      return { cid, c1, c2, m1, manifest: mf.manifest };
+      return { cid, c1, c2, m1, manifest: mf.manifest, snapshot: s2, owner };
     }
 
     /**
@@ -258,7 +258,7 @@ const ENV_KEYS = [
       for (const c of [C.c1, C.c2]) {
         await ds.query(`update public.generation_item_runs set output_summary = output_summary || $2::jsonb where job_id = $1 and item_key = $3`,
           [runId, JSON.stringify({ mode: typeof videoItemMode === 'function' ? videoItemMode(c) : videoItemMode, delivery: 'completed',
-            youtubeVideoId: 'Yt' + c.replace(/-/g, '').slice(0, 9), youtubeUrl: 'https://youtu.be/x', external: { durationSec: 468 } }), `video:${c}`]);
+            youtubeVideoId: 'Yt' + c.replace(/-/g, '').slice(0, 9), youtubeUrl: 'https://youtu.be/Yt' + c.replace(/-/g, '').slice(0, 9), external: { durationSec: 468 } }), `video:${c}`]);
       }
       return { ...C, runId };
     }
@@ -544,6 +544,171 @@ const ENV_KEYS = [
       const welcome = labels.find((x) => /QA — vista previa, no entregable/.test(x));
       assert(welcome && /no es el curso final/.test(welcome), 'aviso visible en un label');
       eq(rq.summary.counts, r0.summary.counts, 'mismas actividades (el aviso va dentro de la bienvenida)');
+    });
+
+    // ════ 7. Fix round 1 (review BE-A) ════════════════════════════════════════
+    const RC = L('modules/dynamic-generation/run-completion.js');
+    const IA = L('modules/invalidation/invalidation-apply.js');
+    const AR = L('modules/dynamic-packaging/artifact-resolver.js');
+    const RH = L('modules/dynamic-generation/run-hash.js');
+    const ADMIN_X = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', email: 'admin@cursia.test' }; // SUPER_ADMIN que NO es el dueño
+    const V3VAL = { v3Validation: { artifactType: 'fixture', artifactId: crypto.randomUUID(), contentSha256: 'x'.repeat(64) } };
+
+    /** Run v3 100 % REAL sembrado como lo deja un run real (items + un artifact por rol), todavía activo. */
+    async function seededRealRun(C) {
+      const ctx = { ...CONTEXT };
+      const contextHash = RH.canonicalContextHash(RH.normalizeCourseContext(ctx));
+      const m = C.manifest;
+      const [job] = await ds.query(
+        `insert into public.production_jobs (owner_id, course_id, execution_mode, status, worker_status, current_step, progress, input_payload, output_summary, options, result)
+         values ($1, $2, 'dynamic_generation', 'running', 'running', 'dynamic_generation', 0, $3::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb) returning id`,
+        [C.owner, C.cid, JSON.stringify({ manifestId: m.id, blueprintNumber: 1, contextHash, videoMode: 'real', videoDelivery: 'youtube', providerModes: { presentation: 'real', audio: 'real' } })]);
+      await ds.query(`insert into public.generation_run_contexts (job_id, manifest_id, context, context_hash) values ($1, $2, $3::jsonb, $4)`,
+        [job.id, m.id, JSON.stringify(RH.normalizeCourseContext(ctx)), contextHash]);
+      const items = [...m.manifest.items].sort((a, b) => (a.type === 'video' ? -1 : 0) - (b.type === 'video' ? -1 : 0));
+      const videoOf = new Map();
+      for (const it of items) {
+        let summary = {};
+        if (it.type === 'video') summary = { mode: 'real', delivery: 'completed', youtubeVideoId: 'AbCdEfGhIjK', youtubeUrl: 'https://youtu.be/AbCdEfGhIjK', external: { durationSec: 468, videogenJobId: 'vg-' + it.chapterId } };
+        if (['presentation', 'audio_welcome', 'audiobook_chapter'].includes(it.type)) summary = { mode: 'real' };
+        if (RC.requiresV3Validation(it.type, it.variant)) summary = { ...summary, ...V3VAL };
+        if (it.type === 'video_interactions') {
+          const v = videoOf.get(it.chapterId);
+          summary = { ...summary, sourceVideoItemRunId: v.itemRunId, videoIdentity: v };
+        }
+        const [ir] = await ds.query(
+          `insert into public.generation_item_runs (job_id, course_id, blueprint_id, manifest_id, item_key, generation, type, module_id, chapter_id, depends_on, idempotency_key, status, finished_at, output_summary)
+           values ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9::text[], $10, 'completed', now(), $11::jsonb) returning id`,
+          [job.id, C.cid, m.blueprintId, m.id, it.key, it.type, it.moduleId, it.chapterId, it.dependsOn, RH.itemIdempotencyKey(m.id, it.key, 1), JSON.stringify(summary)]);
+        const arts = [];
+        for (const role of AR.requiredArtifactTypesV3(it.type, it.variant)) {
+          const p1 = `dod/${job.id}/${it.key}/${role}`;
+          const [a] = await ds.query(
+            `insert into public.artifacts (owner_id, course_id, job_id, type, storage_provider, storage_bucket, storage_path, filename, mime_type, metadata, module_id, chapter_id, manifest_id, manifest_item_key, item_run_id)
+             values ($1, $2, $3, $4, 'supabase', 'cursia-artifacts', $5, 'f', 'application/json', $6::jsonb, $7, $8, $9, $10, $11) returning id`,
+            [C.owner, String(C.cid), job.id, role, p1, JSON.stringify(['dynamic_presentation', 'dynamic_audio_mp3'].includes(role) ? { mode: 'real' } : {}), it.moduleId, it.chapterId, m.id, it.key, ir.id]);
+          arts.push({ id: a.id, type: role, bucket: 'cursia-artifacts', path: p1 });
+        }
+        if (it.type === 'video') videoOf.set(it.chapterId, { identity: IA.artifactOutputIdentity(arts), itemRunId: ir.id, generation: 1, artifactIds: arts.map((x) => x.id) });
+      }
+      return job.id;
+    }
+
+    await check('dod', 'fix C1: «Generar los cambios» (fromRun) de un curso 100 % REAL con videos → el run B (todo reutilizado, preguntas arrastradas con el sourceVideoItemRunId del run A) nace `completed` (completion packaging), nunca «sin validar»', async () => {
+      const C = await confirmedCourse('DoD C1 fromRun real');
+      const runA = await seededRealRun(C);
+      eq(await recompute(runA), 'completed', 'run A real completed');
+      // Blueprint 2 = misma estructura (p.ej. un reorden revertido): todo se REUTILIZA.
+      await ds.query(
+        `insert into public.course_blueprints (course_id, blueprint_number, schema_version, snapshot_json, snapshot_sha256, structure_counter_at_lock, module_count, chapter_count)
+         values ($1, 2, 2, $2::jsonb, $3, 0, 1, 2)`, [C.cid, snap.canonicalJsonV2(C.snapshot), snap.snapshotSha256V2(C.snapshot)]);
+      await manifests.getOrCreate(C.cid, OWNER, 2);
+      const res = await runs.startRun(C.cid, OWNER, 2, { fromRun: runA });
+      eq(res.created, true, 'run B creado');
+      const rowsB = await ds.query(`select item_key, status, carried_from_item_run_id, output_summary from public.generation_item_runs where job_id = $1`, [res.run.id]);
+      assert(rowsB.every((r) => r.status === 'completed' && r.carried_from_item_run_id), 'todo reutilizado (arrastrado)');
+      const vi = rowsB.find((r) => r.item_key === `video_interactions:${C.c1}`);
+      const vB = rowsB.find((r) => r.item_key === `video:${C.c1}`);
+      assert(vi.output_summary.sourceVideoItemRunId === vB.carried_from_item_run_id, 'las preguntas siguen apuntando al video del run A (precondición de C1)');
+      const job = await jobOf(res.run.id);
+      eq(job.worker_status, 'completed', 'run B completed');
+      const dto = await runs.getRun(C.cid, OWNER, 2, res.run.id);
+      eq([dto.completion.state, dto.completion.generationComplete, dto.completion.missingComponents], ['packaging', true, []], 'completion de B');
+      // Un C desde B (arrastre de 2 saltos) sigue siendo válido: cadena completa de procedencia.
+      const chainRows = await RC.attachCarryChains(ds, (await ds.query(`select * from public.generation_item_runs where job_id = $1`, [res.run.id])));
+      const vChain = chainRows.find((r) => r.item_key === `video:${C.c1}`).carry_chain;
+      eq(vChain.length, 1, 'cadena de B = [video de A]');
+      // Pura: arrastre multi-salto (preguntas de A, video de C ← B ← A).
+      const pure = RC.questionsOfVideo({ id: 'C-v', carried_from_item_run_id: 'B-v', carry_chain: ['B-v', 'A-v'] },
+        { id: 'C-q', status: 'completed', carried_from_item_run_id: 'B-q', output_summary: { sourceVideoItemRunId: 'A-v' } });
+      eq(pure, true, 'multi-salto');
+      eq(RC.questionsOfVideo({ id: 'C-v', carry_chain: ['B-v'] }, { id: 'q', status: 'completed', output_summary: { sourceVideoItemRunId: 'otro' }, carried_from_item_run_id: 'x' }), false, 'otro video → no');
+      eq(RC.questionsOfVideo({ id: 'C-v', carry_chain: ['A-v'] }, { id: 'q', status: 'completed', output_summary: { sourceVideoItemRunId: 'A-v' } }), false, 'preguntas NO arrastradas apuntando a un ancestro → no');
+    });
+
+    await check('dod', 'fix C2: el dueño reintenta un item NO pago (content fallido) cuyo video dependiente quedó blocked sin haber renderizado nunca → permitido (pending); un video con render fallido sigue siendo de admin', async () => {
+      const R = await finishedRun('DoD C2', { videoMode: 'real', providerModes: { presentation: 'real', audio: 'real' }, videoItemMode: 'real' });
+      const c1 = await latest(R.runId, `content:${R.c1}`);
+      const v1 = await latest(R.runId, `video:${R.c1}`);
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'Falló después de 3 intentos' where id = $1`, [c1.id]);
+      await ds.query(`update public.generation_item_runs set status = 'blocked', error = null, output_summary = output_summary - 'external' - 'delivery' - 'youtubeVideoId' - 'youtubeUrl' - 'mode' where id = $1`, [v1.id]);
+      await recompute(R.runId);
+      const owner = { id: OWNER, email: 'owner@cursia.test' };
+      // Sin presupuesto del run para el primer render: el gate de FinOps de siempre (no el de recuperación de admin).
+      await rejectsRe(runs.retryItem(R.cid, OWNER, 1, R.runId, `content:${R.c1}`, false, false, undefined, owner), /budget_approval_required/, 'FinOps, no admin_recovery_only', 409);
+      await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, authorized_budget, decision, approved_by, reason)
+                      values ($1, $2, 1000, 'ADMIN_APPROVED', 'admin@cursia.test', 'DoD C2: presupuesto del run')`, [R.runId, R.cid]);
+      const it = await runs.retryItem(R.cid, OWNER, 1, R.runId, `content:${R.c1}`, false, false, undefined, owner);
+      eq(it.status, 'pending', 'reintento del dueño');
+      eq((await latest(R.runId, `video:${R.c1}`)).status, 'pending', 'el video dependiente se desbloquea (primer render, gate de FinOps de siempre)');
+    });
+
+    await check('dod', 'fix I1: un curso SIN videos arranca (default real) para un owner NO elegible para video real; con videos sigue el 403 real_video_not_enabled', async () => {
+      const C = await confirmedCourse('DoD I1 sin videos', CUSTOMER, { videos: false });
+      eq(C.manifest.manifest.items.filter((i) => i.type === 'video').length, 0, 'Manifest sin videos');
+      const body = { ...CONTEXT, providerModes: { presentation: 'mock', audio: 'mock' } };
+      const pv = await runs.previewStart(C.cid, { id: CUSTOMER, email: 'cliente@cursia.test' }, 1, body);
+      assert(!(pv.paidRealProviders || []).includes('videogen'), `sin videogen: ${JSON.stringify(pv.paidRealProviders)}`);
+      const res = await runs.startRun(C.cid, CUSTOMER, 1, body);
+      eq([res.created, res.run.videoMode], [true, 'real'], 'creado');
+    });
+
+    await check('dod', 'fix I2: un SUPER_ADMIN que NO es el dueño opera las herramientas de recuperación sobre el curso del cliente (vista previa + confirmación del upgrade con actedBy, reintento pago, cancelación); un no admin ajeno sigue con 404', async () => {
+      const R = await finishedRun('DoD I2');
+      await recompute(R.runId);
+      await rejectsRe(runs.previewVideoUpgrade(R.cid, { id: ADMIN_X.id, email: 'otro@cursia.test' }, 1, R.runId), /admin_recovery_only/, 'no admin', 403);
+      await rejectsRe(runs.getRun(R.cid, ADMIN_X.id, 1, R.runId), /not found|no existe/i, 'ajeno sin rol: ownership intacto', 404);
+      const pv = await runs.previewVideoUpgrade(R.cid, ADMIN_X, 1, R.runId);
+      eq([pv.eligible, pv.pendingVideos.length], [true, 2], 'vista previa del admin');
+      const up = await runs.confirmVideoUpgrade(R.cid, ADMIN_X, 1, R.runId, pv.estimateHash);
+      eq([up.created, up.upgrade.by, up.upgrade.actedBy, up.upgrade.confirmedBy], [true, OWNER, ADMIN_X.id, ADMIN_X.email], 'upgrade a nombre del dueño, actuado por el admin');
+      const gen = await latest(R.runId, `video:${R.c1}`);
+      eq(gen.output_summary.regeneration.requestedBy, ADMIN_X.id, 'regeneración registra al admin que actuó');
+      const dto = await runs.cancelRun(R.cid, ADMIN_X.id, 1, R.runId, ADMIN_X);
+      eq(dto.status, 'cancelled', 'el admin cancela el upgrade en vuelo');
+      const [cj] = await ds.query(`select output_summary from public.production_jobs where id = $1`, [R.runId]);
+      eq(cj.output_summary.cancellation.requestedBy, ADMIN_X.id, 'la cancelación registra al admin que actuó');
+      // Reintento pago (render fallido) por el admin sobre el curso del cliente.
+      const R2 = await finishedRun('DoD I2 retry', { videoMode: 'real', providerModes: { presentation: 'real', audio: 'real' }, videoItemMode: 'real' });
+      const v2 = await latest(R2.runId, `video:${R2.c2}`);
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'videogen_failed: render rechazado', output_summary = output_summary - 'external' - 'delivery' - 'youtubeVideoId' - 'youtubeUrl' where id = $1`, [v2.id]);
+      await recompute(R2.runId);
+      // El dueño (no admin) no puede reenviar el render; el admin ajeno pasa el gate de recuperación y, con el
+      // presupuesto del run aprobado, el video vuelve a pending con el reenvío registrado a su nombre.
+      await rejectsRe(runs.retryItem(R2.cid, OWNER, 1, R2.runId, `video:${R2.c2}`, true, false, undefined, { id: OWNER, email: 'owner@cursia.test' }), /admin_recovery_only/, 'dueño', 403);
+      await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, authorized_budget, decision, approved_by, reason)
+                      values ($1, $2, 1000, 'ADMIN_APPROVED', 'admin@cursia.test', 'DoD I2: presupuesto del run')`, [R2.runId, R2.cid]);
+      const it = await runs.retryItem(R2.cid, ADMIN_X.id, 1, R2.runId, `video:${R2.c2}`, true, false, undefined, ADMIN_X);
+      eq(it.status, 'pending', 'el admin reenvía el render del cliente');
+      const prevErr = it.outputSummary.previousErrors.slice(-1)[0];
+      eq(prevErr.retriedBy, ADMIN_X.id, 'el reintento registra al admin que actuó');
+    });
+
+    await check('dod', 'fix I3: un run `completed` con un componente SIN validar (fila anterior a la validación del servidor) nunca da un paquete FINAL: dueño → 409 preview_not_deliverable; SUPER_ADMIN → degraded (rotulado QA)', async () => {
+      const R = await finishedRun('DoD I3', { videoMode: 'real', providerModes: { presentation: 'real', audio: 'real' }, videoItemMode: 'real' });
+      eq(await recompute(R.runId), 'completed', 'precondición');
+      const ci = await latest(R.runId, `course_intro:${R.cid}`);
+      await ds.query(`update public.generation_item_runs set output_summary = output_summary - 'v3Validation' where id = $1`, [ci.id]);
+      const job = await jobOf(R.runId);
+      const mf = { rulesVersion: 3, manifest: R.manifest.manifest ?? R.manifest };
+      const e = await rejectsRe(packaging.assertRunReady(job, mf, { email: 'owner@cursia.test' }), /preview_not_deliverable/, 'dueño', 409);
+      assert(/sin validar/.test(e.message), e.message);
+      eq(await packaging.assertRunReady(job, mf, { email: ADMIN.email }), 'degraded', 'admin');
+      const dto = await runs.getRun(R.cid, OWNER, 1, R.runId);
+      eq(dto.completion.state, 'needs_attention', 'completion');
+    });
+
+    await check('dod', 'fix M2/M5: recompute sin Manifest del run → failed (nunca completed); v3 con video real entregado por videogen_direct → sin validar (nunca empaquetable)', async () => {
+      const R = await finishedRun('DoD M2', { videoMode: 'real', providerModes: { presentation: 'real', audio: 'real' }, videoItemMode: 'real' });
+      await ds.query(`update public.production_jobs set input_payload = input_payload - 'manifestId' where id = $1`, [R.runId]);
+      eq(await recompute(R.runId), 'failed', 'sin Manifest');
+      const job = { worker_status: 'completed', input_payload: { videoMode: 'real', videoDelivery: 'videogen_direct', providerModes: { presentation: 'real', audio: 'real' } } };
+      const c = RC.evaluateRunCompletion(job, [{ id: 'v', item_key: 'video:c', type: 'video', status: 'completed', output_summary: { mode: 'real' } }],
+        { rulesVersion: 3, items: [{ key: 'video:c', type: 'video', chapterId: 'c' }] });
+      eq([c.state, c.missingComponents], ['needs_attention', ['video:c']], 'v3 + videogen_direct');
+      const c2 = RC.evaluateRunCompletion(job, [{ id: 'v', item_key: 'video:c', type: 'video', status: 'completed', output_summary: { mode: 'real' } }],
+        { rulesVersion: 2, items: [{ key: 'video:c', type: 'video', chapterId: 'c' }] });
+      eq(c2.generationComplete, true, 'v2 + videogen_direct sigue siendo válido');
     });
 
     await check('dod', 'migración: supabase-migration-ev6-dod-preview-status.sql lista EXACTAMENTE los worker_status del lib (fuente única) y es idempotente; el CHECK aplicado acepta preview y rechaza un valor desconocido', async () => {

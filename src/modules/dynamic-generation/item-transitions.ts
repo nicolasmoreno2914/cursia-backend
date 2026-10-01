@@ -232,9 +232,18 @@ export async function recomputeRunStatus(qr: QueryRunner, jobId: string): Promis
     // (video sin entrega YouTube, preguntas de otro video, item v3 sin v3Validation) → `failed`
     // con la lista (recuperación de admin). Solo un run 100 % real y validado queda `completed`.
     const inputs = await loadCompletionInputs(qr, jobId);
-    const verdict = inputs
-      ? terminalStatusFor(evaluateRunCompletion({ ...inputs.job, worker_status: 'completed', status: 'completed' }, inputs.rows, inputs.manifest))
-      : 'completed';
+    if (!inputs) {
+      // Fix round 1 (M2): sin Manifest del run no se puede validar nada → nunca `completed` (fail closed).
+      await qr.query(
+        `update public.production_jobs
+            set status = 'failed', worker_status = 'failed', finished_at = now(), error_message = $2,
+                next_retry_at = null, updated_at = now()
+          where id = $1`,
+        [jobId, 'Generación dinámica sin su Manifest congelado (integridad): no se puede validar que el curso esté completo'],
+      );
+      return 'failed';
+    }
+    const verdict = terminalStatusFor(evaluateRunCompletion({ ...inputs.job, worker_status: 'completed', status: 'completed' }, inputs.rows, inputs.manifest));
     if (verdict === 'completed' || verdict === 'preview') {
       await qr.query(
         `update public.production_jobs
@@ -245,7 +254,7 @@ export async function recomputeRunStatus(qr: QueryRunner, jobId: string): Promis
       );
       return verdict;
     }
-    const completion = evaluateRunCompletion({ ...inputs!.job, worker_status: 'completed', status: 'completed' }, inputs!.rows, inputs!.manifest);
+    const completion = evaluateRunCompletion({ ...inputs.job, worker_status: 'completed', status: 'completed' }, inputs.rows, inputs.manifest);
     const unvalidated = completion.missingComponents.filter((k) => !completion.previewComponents.includes(k));
     await qr.query(
       `update public.production_jobs

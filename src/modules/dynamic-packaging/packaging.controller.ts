@@ -27,7 +27,7 @@ export class PackagingController {
     @Param('runId', ParseUUIDPipe) runId: string,
     @CurrentUser() user: AuthUser,
   ) {
-    return this.packaging.requestPackage(courseId, user.id, number, runId, { email: user.email });
+    return this.packaging.requestPackage(courseId, user.id, number, runId, { id: user.id, email: user.email });
   }
 
   // GET /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/package
@@ -39,6 +39,6 @@ export class PackagingController {
     @Param('runId', ParseUUIDPipe) runId: string,
     @CurrentUser() user: AuthUser,
   ) {
-    return this.packaging.getPackageStatus(courseId, user.id, number, runId);
+    return this.packaging.getPackageStatus(courseId, user.id, number, runId, { id: user.id, email: user.email });
   }
 }

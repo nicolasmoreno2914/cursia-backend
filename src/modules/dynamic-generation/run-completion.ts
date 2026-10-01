@@ -86,6 +86,13 @@ export interface CompletionRow {
   finished_at?: Date | string | null;
   updated_at?: Date | string | null;
   chapter_id?: string | null;
+  /** Fase 8: item run de otro run del que se arrastró esta fila (fromRun). */
+  carried_from_item_run_id?: string | null;
+  /**
+   * Fix round 1 (C1): cadena de procedencia de la fila (ids de los item runs de los que se arrastró,
+   * del más cercano al más lejano). La completa `attachCarryChains`; ausente = sin arrastre conocido.
+   */
+  carry_chain?: string[] | null;
 }
 
 export interface CompletionManifest {
@@ -186,6 +193,9 @@ export function classifyRunItems(
     if (r.status !== 'completed') return 'not_done';
     const s = os(r);
     if (!videoIsReal(s, payload)) return 'preview';
+    // Fix round 1 (M5): en v3 el video interactivo exige YouTube (el empaque v3 rechaza otra entrega):
+    // un video real entregado por videogen_direct nunca quedaría empaquetable → sin validar.
+    if (manifest.rulesVersion === 3 && strategy !== 'youtube') return 'unvalidated';
     if (strategy === 'youtube') {
       const id = (typeof s.youtubeVideoId === 'string' && s.youtubeVideoId) || s.external?.youtubeVideoId;
       if (s.delivery !== 'completed' || !id) return 'unvalidated';
@@ -238,8 +248,7 @@ export function classifyRunItems(
         continue;
       }
       const v = rowsByKey.get(vKey);
-      if (v && v.status === 'completed' &&
-        !questionsBelongToVideo({ id: v.id, finishedAt: v.finished_at }, { status: r.status, outputSummary: s, finishedAt: r.finished_at })) {
+      if (v && v.status === 'completed' && !questionsOfVideo(v, r, s)) {
         out.set(it.key, 'unvalidated');
         continue;
       }
@@ -254,6 +263,54 @@ export function classifyRunItems(
     out.set(it.key, 'done');
   }
   return out;
+}
+
+/**
+ * ¿Las preguntas (`q`) son de la generación vigente del video (`v`)? Misma regla que el empaque
+ * (`questionsBelongToVideo`) y, además (fix round 1, C1), una fila de preguntas ARRASTRADA por
+ * fromRun conserva el `sourceVideoItemRunId` del run de origen: es válida si ese id está en la
+ * cadena de procedencia del video vigente (el video también se arrastró, la misma salida).
+ */
+export function questionsOfVideo(v: CompletionRow, q: CompletionRow, qs?: Record<string, any>): boolean {
+  const s = qs ?? os(q);
+  if (questionsBelongToVideo({ id: v.id, finishedAt: v.finished_at }, { status: q.status, outputSummary: s, finishedAt: q.finished_at })) return true;
+  const src = s.sourceVideoItemRunId;
+  if (typeof src !== 'string' || !src || !q.carried_from_item_run_id) return false;
+  const chain = Array.isArray(v.carry_chain) ? v.carry_chain : (v.carried_from_item_run_id ? [v.carried_from_item_run_id] : []);
+  return chain.includes(src);
+}
+
+/**
+ * Fix round 1 (C1): completa `carry_chain` de las filas de video arrastradas (sigue
+ * `carried_from_item_run_id` hasta el origen; tope de 32 saltos). Solo lectura.
+ */
+export async function attachCarryChains<T extends CompletionRow>(q: Q, rows: T[]): Promise<T[]> {
+  const videos = rows.filter((r) => r.type === 'video' && r.carried_from_item_run_id);
+  if (!videos.length) return rows;
+  const parent = new Map<string, string | null>();
+  let frontier = [...new Set(videos.map((r) => String(r.carried_from_item_run_id)))];
+  for (let hop = 0; hop < 32 && frontier.length; hop++) {
+    const got: Array<{ id: string; carried_from_item_run_id: string | null }> = await q.query(
+      `select id, carried_from_item_run_id from public.generation_item_runs where id = any($1::uuid[])`,
+      [frontier],
+    );
+    const next: string[] = [];
+    for (const g of got) {
+      parent.set(g.id, g.carried_from_item_run_id ?? null);
+      if (g.carried_from_item_run_id && !parent.has(g.carried_from_item_run_id)) next.push(g.carried_from_item_run_id);
+    }
+    frontier = [...new Set(next)];
+  }
+  for (const r of videos) {
+    const chain: string[] = [];
+    let cur: string | null | undefined = r.carried_from_item_run_id;
+    while (cur && !chain.includes(cur) && chain.length < 32) {
+      chain.push(cur);
+      cur = parent.get(cur) ?? null;
+    }
+    r.carry_chain = chain;
+  }
+  return rows;
 }
 
 function isAmbiguousYoutube(r: CompletionRow): boolean {
@@ -398,7 +455,8 @@ export async function loadCompletionInputs(q: Q, jobId: string): Promise<{
   if (!m) return null;
   const mj = typeof m.manifest_json === 'string' ? JSON.parse(m.manifest_json) : m.manifest_json;
   const rows: CompletionRow[] = await q.query(
-    `select g.id, g.item_key, g.type, g.status, g.error, g.output_summary, g.finished_at, g.updated_at, g.chapter_id
+    `select g.id, g.item_key, g.type, g.status, g.error, g.output_summary, g.finished_at, g.updated_at, g.chapter_id,
+            g.carried_from_item_run_id
        from public.generation_item_runs g
       where g.job_id = $1
         and not exists (select 1 from public.generation_item_runs n
@@ -406,6 +464,7 @@ export async function loadCompletionInputs(q: Q, jobId: string): Promise<{
                            and n.generation > g.generation)`,
     [jobId],
   );
+  await attachCarryChains(q, rows);
   return {
     job: { ...job, input_payload: payload },
     rows,

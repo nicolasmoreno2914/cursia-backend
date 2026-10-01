@@ -813,9 +813,8 @@ async function dbChecks() {
       assert(dependents.length > 0 && dependents.every((d) => d.status === 'blocked'), `dependientes ${JSON.stringify(dependents)}`);
       const [runEst] = await ds.query(`select id from public.cost_estimates where run_id = $1 and scope = 'run'`, [runB]);
       await admin.authorize(Bc.cid, { estimateId: runEst.id, authorizedBudget: '200' }, ADMIN_USER);
-      // EV6 DoD (BE-A): reanudar un video frenado por presupuesto envía un render nuevo → solo admin (403 al dueño).
-      await rejectsRe(runs.retryItem(Bc.cid, OWNER, 1, runB, claimed.itemKey, false, false, undefined, { email: 'owner@cursia.test' }), /admin_recovery_only/, 'dueño', 403);
-      const retried = await runs.retryItem(Bc.cid, OWNER, 1, runB, claimed.itemKey, false, false, undefined, RECOVERY_ADMIN);
+      // EV6 DoD (fix round 1, C2): un video frenado por presupuesto ANTES de enviarse nunca renderizó → el dueño lo reanuda.
+      const retried = await runs.retryItem(Bc.cid, OWNER, 1, runB, claimed.itemKey, false, false, undefined, { email: 'owner@cursia.test' });
       eq(retried.status, 'pending', 'reanudado');
       const after = await ds.query(`select status from public.generation_item_runs where job_id = $1 and $2 = any(depends_on)`, [runB, claimed.itemKey]);
       assert(after.every((d) => d.status === 'pending'), 'dependientes desbloqueados');
@@ -1044,13 +1043,15 @@ async function dbChecks() {
     await check('DB I1 retry: video fallido sin job y resubmitVideo → 409 budget_approval_required con estimado (scope regeneration) y el item sigue failed', async () => {
       const key = `video:${E.c2}`;
       await ds.query(`update public.generation_item_runs set status = 'failed', error = 'video_timeout' where job_id = $1 and item_key = $2`, [runE, key]);
-      await rejectsRe(runs.retryItem(E.cid, OWNER, 1, runE, key), /admin_recovery_only/, 'retry del dueño (EV6 DoD: recuperación paga = admin)', 403);
-      const err = await rejectsRe(runs.retryItem(E.cid, OWNER, 1, runE, key, false, false, undefined, RECOVERY_ADMIN), /budget_approval_required/, 'retry', 409);
+      // EV6 DoD (fix round 1, C2): sin render previo (video_timeout sin job) el dueño reintenta → el gate de FinOps de siempre.
+      const err = await rejectsRe(runs.retryItem(E.cid, OWNER, 1, runE, key), /budget_approval_required/, 'retry', 409);
       const [est] = await ds.query(`select scope, run_id from public.cost_estimates where id = $1`, [err.getResponse().estimateId]);
       eq([est.scope, est.run_id], ['regeneration', runE], 'estimado');
       await ds.query(`update public.generation_item_runs set error = 'videogen_failed: x',
                         output_summary = output_summary || '{"external":{"videogenJobId":"vg_old","mode":"real"}}'::jsonb
                       where job_id = $1 and item_key = $2`, [runE, key]);
+      // EV6 DoD (BE-A): el REENVÍO de un render fallido es recuperación de admin (403 al dueño); el admin pasa al gate de FinOps.
+      await rejectsRe(runs.retryItem(E.cid, OWNER, 1, runE, key, true), /admin_recovery_only/, 'resubmit del dueño', 403);
       await rejectsRe(runs.retryItem(E.cid, OWNER, 1, runE, key, true, false, undefined, RECOVERY_ADMIN), /budget_approval_required/, 'resubmitVideo', 409);
       eq((await itemRow(runE, key)).status, 'failed', 'sigue failed');
     });

@@ -48,6 +48,8 @@ export interface VideoUpgradeRecord {
   by: string;
   /** email de quien confirmó (aprobó) — SUPER_ADMIN o el owner con una autorización vigente. */
   confirmedBy: string | null;
+  /** EV6 DoD fix round 1 (I2): id del SUPER_ADMIN que actuó sobre el curso de otro owner (ausente si es el dueño). */
+  actedBy?: string;
   estimateHash: string;
   /** Keys `video:<ch>` regenerados en modo real. */
   itemKeys: string[];

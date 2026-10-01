@@ -183,9 +183,18 @@ async function buildFreshnessV3(q: Q, run: any, manifest: ManifestDto, existing:
  */
 export async function hasDeliverablePackage(q: Q, run: any, manifest: ManifestDto, logger?: Log): Promise<boolean> {
   try {
-    const job = await findLatestPackageJob(q, run.id);
-    if (!job || job.worker_status !== 'completed' || !isDeliverableKind(packageKindOf(job))) return false;
-    if (!job.output_summary?.artifactId) return false;
+    // Fix round 1 (M3): el job FINAL completado más reciente (un re-empaque posterior fallido, en cola o
+    // QA no oculta un paquete final vigente).
+    const done: PackageJobLike[] = await q.query(
+      `select id, worker_status, status, input_payload, output_summary, error_message
+         from public.production_jobs
+        where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1 and worker_status = 'completed'
+        order by created_at desc, id desc
+        limit 20`,
+      [run.id],
+    );
+    const job = done.find((j) => isDeliverableKind(packageKindOf(j)));
+    if (!job || !job.output_summary?.artifactId) return false;
     const fresh = await buildPackageFreshness(q, run, manifest, job, logger);
     return !fresh.stale;
   } catch (err) {

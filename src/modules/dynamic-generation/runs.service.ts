@@ -121,7 +121,7 @@ import {
 } from './video-upgrade';
 import { estimateCategories, estimateFingerprint, planNormalApproval, NormalApprovalPlan } from '../finops/normal-approval';
 import { isSuperAdminEmail } from '../../auth/super-admin';
-import { RunCompletion, evaluateRunCompletion } from './run-completion';
+import { RunCompletion, attachCarryChains, evaluateRunCompletion } from './run-completion';
 import { hasDeliverablePackage } from '../dynamic-packaging/package-freshness';
 import {
   ACTIVE_RUN_WORKER_STATUSES,
@@ -525,6 +525,19 @@ export const APPROVAL_FORBIDDEN = 'approval_forbidden';
  */
 export const ADMIN_RECOVERY_ONLY = 'admin_recovery_only';
 
+/**
+ * Fix round 1 (C2): ¿el item video ya intentó un render PAGADO en Videogen? (envío iniciado, job
+ * registrado o archivado, o un error que solo ocurre después de enviar). Un video que nunca llegó a
+ * enviarse (bloqueado por dependencia o presupuesto, falla previa al envío) devuelve false.
+ */
+export function videoRenderWasAttempted(r: { error?: string | null; output_summary?: Record<string, any> | null }): boolean {
+  const os = r.output_summary ?? {};
+  const err = String(r.error ?? '');
+  return !!os.externalSubmitStartedAt || !!os.external?.videogenJobId ||
+    (Array.isArray(os.previousExternals) && os.previousExternals.length > 0) ||
+    /^(videogen_failed|videogen_submit_rejected|ambiguous_video_submission)/.test(err) || err.includes(PROVIDER_RECONCILIATION_REQUIRED);
+}
+
 function adminRecoveryForbidden(what: string): ForbiddenException {
   return new ForbiddenException({
     code: ADMIN_RECOVERY_ONLY,
@@ -805,7 +818,8 @@ export class RunsService {
     // Mismos 409/403 que startRun daría para un run nuevo, ANTES de ofrecer autorizar.
     const other = await this.findActiveRunOnOtherManifest(this.dataSource, courseId, manifest.id);
     if (other) throw this.otherActiveRunConflict(other, manifest);
-    if (videoMode === 'real') assertRealVideoAllowed(ownerId);
+    // Fix round 1 (I1): la elegibilidad de video real solo aplica si la estructura confirmada tiene videos.
+    if (videoMode === 'real' && this.videoCountOf(manifest) > 0) assertRealVideoAllowed(ownerId);
     const modes = runSpendModes(videoMode, providerModes ?? null);
     if (!this.finopsBudget) {
       const paid = paidRealProviders(estimateItemsForRun(manifest.manifest.items, modes, null), modes);
@@ -1259,7 +1273,7 @@ export class RunsService {
         });
       }
       // I1 (5C): reabrir un run 'real' vuelve a gastar Videogen → allow-list DYNAMIC_REAL_VIDEO_OWNERS.
-      if (latestVideoMode === 'real') assertRealVideoAllowed(ownerId);
+      if (latestVideoMode === 'real' && this.videoCountOf(manifest) > 0) assertRealVideoAllowed(ownerId);
       // Fix wave (M5): un run reemplazado por uno creado desde él no se reabre.
       const superseding = await this.findSupersedingRun(this.dataSource, latest.id);
       if (superseding) throw this.supersededConflict(latest.id, superseding);
@@ -1300,7 +1314,8 @@ export class RunsService {
     await this.assertNoPreviousItems(manifest);
     // I1 (5C): un run NUEVO con video real requiere DYNAMIC_REAL_VIDEO_OWNERS (fail closed). Un run
     // 'real' ya activo se devuelve arriba sin pasar por acá (reanudar no se bloquea).
-    if (videoMode === 'real') assertRealVideoAllowed(ownerId);
+    // Fix round 1 (I1): un curso SIN videos arranca para cualquier owner (no hay Videogen que gastar).
+    if (videoMode === 'real' && this.videoCountOf(manifest) > 0) assertRealVideoAllowed(ownerId);
     // DN-1: ≥1 video + videoMode real → se congela 'youtube' (o videogen_direct
     // solo con el permiso de staging) y el preflight de YouTube tiene que pasar
     // en el servidor. Si no → 409 sin escribir nada ni llamar a Videogen.
@@ -1550,8 +1565,11 @@ export class RunsService {
     blueprintNumber: number,
     runId: string,
     /** EV6 DoD (R5): quién cancela (cancelar un upgrade de videos en vuelo es solo de SUPER_ADMIN). */
-    actor?: { email?: string | null },
+    actor?: { id?: string | null; email?: string | null },
   ): Promise<RunDto> {
+    // Fix round 1 (I2): un SUPER_ADMIN cancela sobre el run del dueño real del curso.
+    const actorId = actor?.id ?? ownerId;
+    ownerId = await this.ownerForActor(courseId, ownerId, actor);
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     const job = await this.loadRunRow(courseId, manifest, runId);
     if (videoUpgradeOf(job.input_payload) && isActive(job) && !isSuperAdminEmail(actor?.email) && (await this.upgradeInFlight(this.dataSource, job))) {
@@ -1570,7 +1588,7 @@ export class RunsService {
       if (locked.worker_status === 'preview') {
         throw new ConflictException(`La ejecución ${job.id} ya terminó (vista previa); no se puede cancelar`);
       }
-      await this.markRunCancelled(qr, job.id, ownerId, 'user_cancelled');
+      await this.markRunCancelled(qr, job.id, actorId, 'user_cancelled');
       await this.cancelOpenItems(qr, job.id);
     });
     return this.buildRunDto(await this.loadJobById(job.id), manifest);
@@ -1604,11 +1622,15 @@ export class RunsService {
     resubmitProvider = false,
     auto?: { policy: AutoHealPolicy; now?: Date },
     /** EV6 DoD (R5): quién reintenta (la recuperación PAGA de un video es solo de SUPER_ADMIN). */
-    actor?: { email?: string | null },
+    actor?: { id?: string | null; email?: string | null },
   ): Promise<ItemRunDto> {
     if (auto && (resubmitVideo || resubmitProvider)) {
       throw new BadRequestException('auto-heal: nunca reenvía a un proveedor (resubmitVideo/resubmitProvider)');
     }
+    // Fix round 1 (I2): un SUPER_ADMIN reintenta sobre el run del dueño real del curso (FinOps, YouTube
+    // y ownership se evalúan contra ese dueño); queda registrado quién actuó.
+    const actorId = actor?.id ?? ownerId;
+    if (!auto && actor) ownerId = await this.ownerForActor(courseId, ownerId, actor);
     // G3 (fix wave / review I1): un retry es un entry point como cualquier
     // otro — requiere la allow-list de V2, antes de tocar manifest o run.
     assertDynamicOwnerAllowed(ownerId);
@@ -1670,10 +1692,13 @@ export class RunsService {
         const paidItems = isPaid(preTarget)
           ? (newPaid(preTarget, resubmitVideo || resubmitProvider) ? [preTarget] : [])
           : preRows.filter((r) => r.status === 'blocked' && isPaid(r) && newPaid(r, false));
-        // EV6 DoD (R5): un reintento que envía un render NUEVO a Videogen (video fallido sin job,
-        // reenvío explícito o videos bloqueados que se desbloquean) es recuperación de admin. Los
-        // reintentos sin gasto (re-poll, re-subida a YouTube, items no pagos) siguen siendo del dueño.
-        if (!auto && this.videoModeOf(job) === 'real' && !isSuperAdminEmail(actor?.email) && (resubmitVideo || paidItems.some((r) => r.type === 'video'))) {
+        // EV6 DoD (R5) + fix round 1 (C2): solo un reintento que vuelve a RENDERIZAR un video que ya
+        // intentó un render pagado (reenvío explícito, render fallido/rechazado/ambiguo) es recuperación
+        // de admin. Un video que nunca se envió (p.ej. bloqueado por una dependencia o por presupuesto)
+        // sigue siendo del dueño: su primer render va por el gate de FinOps de siempre (presupuesto
+        // aprobado). Re-poll, re-subida a YouTube e items no pagos: dueño.
+        if (!auto && this.videoModeOf(job) === 'real' && !isSuperAdminEmail(actor?.email) &&
+          (resubmitVideo || paidItems.some((r) => r.type === 'video' && videoRenderWasAttempted(r)))) {
           throw adminRecoveryForbidden('Volver a generar un video (con costo)');
         }
         await this.finopsPaidWorkGate({ courseId, ownerId, manifest, job, paidKeys: paidItems.map((r) => r.item_key), dryRun: !!auto });
@@ -1753,7 +1778,9 @@ export class RunsService {
       if (
         this.videoModeOf(job) === 'real' &&
         !uploadPhaseRetry &&
-        (target.type === 'video' || resubmitVideo || !isActive(locked))
+        (target.type === 'video' || resubmitVideo || !isActive(locked)) &&
+        // Fix round 1 (I1): sin videos en el Manifest no hay gasto de Videogen que proteger.
+        this.videoCountOf(manifest) > 0
       ) {
         assertRealVideoAllowed(ownerId);
       }
@@ -1833,7 +1860,9 @@ export class RunsService {
         : `(${previousErrorsExpr}) || $4::jsonb`;
       // R16 (#2): la reapertura automática queda registrada (auditoría) en la misma escritura.
       const nowIso = (auto?.now ?? new Date()).toISOString();
-      const entryExtra = autoMeta ? { auto: true, autoHealRound: autoMeta.round, autoHealCode: autoMeta.code } : {};
+      const entryExtra = autoMeta
+        ? { auto: true, autoHealRound: autoMeta.round, autoHealCode: autoMeta.code }
+        : actorId !== ownerId ? { retriedBy: actorId } : {};
       const topExtra = autoMeta
         ? { autoHeal: { rounds: autoMeta.round, lastAt: nowIso, lastCode: autoMeta.code, maxRounds: autoHealMaxRoundsFor(target.type, auto!.policy) } }
         : {};
@@ -2692,12 +2721,28 @@ export class RunsService {
     blueprintNumber: number,
     runId: string,
   ): Promise<VideoUpgradePreview> {
-    assertDynamicOwnerAllowed(user.id);
     // EV6 DoD (R5): herramienta de recuperación de admin; el estimado tampoco se muestra a un no admin.
-    if (!isSuperAdminEmail(user.email)) throw adminRecoveryForbidden('Generar los videos reales de un curso');
-    const manifest = await this.manifestOfRun(courseId, user.id, blueprintNumber, runId);
+    if (!isSuperAdminEmail(user.email)) {
+      assertDynamicOwnerAllowed(user.id);
+      throw adminRecoveryForbidden('Generar los videos reales de un curso');
+    }
+    // Fix round 1 (I2): un SUPER_ADMIN actúa sobre el run de CUALQUIER owner (el curso del cliente).
+    const acting = { id: await this.ownerForActor(courseId, user.id, user), email: user.email };
+    assertDynamicOwnerAllowed(acting.id);
+    const manifest = await this.manifestOfRun(courseId, acting.id, blueprintNumber, runId);
     const job = await this.reconcileCancellation(await this.loadRunRow(courseId, manifest, runId));
-    return this.videoUpgradePreviewOf(this.dataSource, courseId, user, job, manifest);
+    return this.videoUpgradePreviewOf(this.dataSource, courseId, acting, job, manifest);
+  }
+
+  /**
+   * Fix round 1 (I2): owner efectivo para las herramientas de recuperación de admin. Un SUPER_ADMIN
+   * actúa sobre el curso de cualquier owner (se resuelve el dueño real del curso; si no existe, el
+   * 404 de siempre lo da manifestOfRun). Cualquier otro usuario: él mismo (ownership sin cambios).
+   */
+  async ownerForActor(courseId: number, actorId: string, actor?: { email?: string | null } | null): Promise<string> {
+    if (!isSuperAdminEmail(actor?.email)) return actorId;
+    const [c] = await this.dataSource.query(`select owner_id from public.courses where id = $1`, [courseId]);
+    return c?.owner_id ? String(c.owner_id) : actorId;
   }
 
   /**
@@ -2716,21 +2761,24 @@ export class RunsService {
     runId: string,
     estimateHash: string,
   ): Promise<VideoUpgradeResult> {
-    const ownerId = user.id;
-    assertDynamicOwnerAllowed(ownerId);
     // EV6 DoD (R5): solo SUPER_ADMIN (antes de leer o escribir nada; también la respuesta idempotente).
     if (!isSuperAdminEmail(user.email)) {
+      assertDynamicOwnerAllowed(user.id);
       throw new ForbiddenException({
         code: APPROVAL_FORBIDDEN,
         message: `${APPROVAL_FORBIDDEN}: generar los videos reales es una herramienta de recuperación de un administrador de Cursia. No se generó nada.`,
       });
     }
+    // Fix round 1 (I2): el SUPER_ADMIN actúa sobre el run del dueño real del curso.
+    const ownerId = await this.ownerForActor(courseId, user.id, user);
+    assertDynamicOwnerAllowed(ownerId);
+    const acting = { id: ownerId, email: user.email };
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     const job = await this.reconcileCancellation(await this.loadRunRow(courseId, manifest, runId));
     const already = await this.existingUpgradeFor(this.dataSource, job, estimateHash);
     if (already) return { created: false, upgrade: already, run: await this.buildRunDto(job, manifest) };
 
-    const pv = await this.videoUpgradePreviewOf(this.dataSource, courseId, user, job, manifest, true);
+    const pv = await this.videoUpgradePreviewOf(this.dataSource, courseId, acting, job, manifest, true);
     if (pv.upgradeInFlight && pv.upgrade) return { created: false, upgrade: pv.upgrade, run: await this.buildRunDto(await this.loadJobById(job.id), manifest) };
     if (pv._blockers && pv._blockers.length) throw pv._blockers[0].error();
     if (!pv.estimateHash || pv.estimateHash !== estimateHash) {
@@ -2777,6 +2825,8 @@ export class RunsService {
         at: requestedAt,
         by: ownerId,
         confirmedBy: user.email ?? null,
+        // Fix round 1 (I2): quién actuó (el admin) si no es el dueño del curso.
+        ...(user.id !== ownerId ? { actedBy: user.id } : {}),
         estimateHash,
         itemKeys: plan.pending.map((r) => r.item_key).sort(),
         interactionKeys: [...plan.interactions, ...plan.questionsOnly.map((x) => x.interactions)].map((r) => r.item_key).sort(),
@@ -2819,13 +2869,13 @@ export class RunsService {
         const newId = await insertGeneration(prev, {
           reason: VIDEO_UPGRADE_REASON, upgradeId: upgrade.id, fromItemRunId: prev.id, fromGeneration: Number(prev.generation),
           costKind: carriedKeys.has(prev.item_key) ? 'none' : 'videogen', ...(carriedKeys.has(prev.item_key) ? { reusedVideogenJob: true } : {}),
-          requestedBy: ownerId, requestedAt,
+          requestedBy: user.id, requestedAt,
         }, carry);
         const inter = plan.interactions.find((r) => r.chapter_id === prev.chapter_id);
         if (inter) {
           await insertGeneration(inter, {
             reason: VIDEO_UPGRADE_CASCADE_REASON, upgradeId: upgrade.id, fromItemRunId: inter.id, fromGeneration: Number(inter.generation),
-            cascadeFromItemRunId: newId, cascadeFromItemKey: prev.item_key, costKind: 'llm', requestedBy: ownerId, requestedAt,
+            cascadeFromItemRunId: newId, cascadeFromItemKey: prev.item_key, costKind: 'llm', requestedBy: user.id, requestedAt,
           }, { sourceVideoItemRunId: newId });
         }
       }
@@ -2833,7 +2883,7 @@ export class RunsService {
       for (const x of plan.questionsOnly) {
         await insertGeneration(x.interactions, {
           reason: VIDEO_UPGRADE_CASCADE_REASON, upgradeId: upgrade.id, fromItemRunId: x.interactions.id, fromGeneration: Number(x.interactions.generation),
-          cascadeFromItemRunId: x.video.id, cascadeFromItemKey: x.video.item_key, costKind: 'llm', questionsOnly: true, requestedBy: ownerId, requestedAt,
+          cascadeFromItemRunId: x.video.id, cascadeFromItemKey: x.video.item_key, costKind: 'llm', questionsOnly: true, requestedBy: user.id, requestedAt,
         }, { sourceVideoItemRunId: x.video.id });
       }
       const note = JSON.stringify({ kind: VIDEO_UPGRADE_REASON, upgradeId: upgrade.id, requestedAt, affected: [...upgrade.itemKeys, ...upgrade.interactionKeys] });
@@ -4161,6 +4211,8 @@ export class RunsService {
    */
   private async completionOf(job: any, rows: any[], manifest: ManifestDto): Promise<RunCompletion> {
     const m = { rulesVersion: manifest.rulesVersion, items: manifest.manifest.items };
+    // Fix round 1 (C1): procedencia de los videos arrastrados por fromRun (preguntas arrastradas con ellos).
+    rows = await attachCarryChains(this.dataSource, rows.map((r) => ({ ...r })));
     const upgradeOnlyFailure = !!videoUpgradeOf(job.input_payload) && (job.worker_status === 'failed' || isCancelledLike(job))
       ? await runIsUpgradeOnlyFailure(this.dataSource, job)
       : false;

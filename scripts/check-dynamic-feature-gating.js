@@ -837,9 +837,10 @@ async function runWorkerProcess(script, env, { waitMs }) {
    *  - 'active' → hay un run activo con `frozenMode`.
    *  - 'reopen' → el último run está cancelled con `frozenMode` (mismo contexto).
    */
-  function runsServiceFor(scenario, frozenMode) {
+  function runsServiceFor(scenario, frozenMode, { noVideos = false } = {}) {
     const state = { created: false, reopened: false };
-    const manifest = { id: 42, manifest: { items: [] } };
+    // EV6 DoD fix round 1 (I1): la elegibilidad de video real solo aplica si el Manifest tiene videos.
+    const manifest = { id: 42, manifest: { items: noVideos ? [] : [{ key: 'video:x', type: 'video', chapterId: 'x' }] } };
     const svc = new RunsService({ query: async () => [{ frontend_course_id: 'front-1' }] }, { async get() { return manifest; } }, {});
     const run = (status) => ({ id: 'run-1', status, worker_status: status, input_payload: { videoMode: frozenMode } });
     svc.findActiveRunRow = async () => (scenario === 'active' ? run('running') : null);
@@ -859,6 +860,10 @@ async function runWorkerProcess(script, env, { waitMs }) {
     // DN-1: estos escenarios prueban SOLO la allow-list de video real (I1); el
     // gate de entrega (YouTube) tiene su propio check (check-dynamic-youtube-delivery.js).
     svc.videoSubmissionsIfReopened = async () => 0;
+    svc.enforceVideoGate = async () => {};
+    // Sin FinopsBudgetService (harness): el gate de presupuesto tiene sus propios checks (check-v21-finops*).
+    svc.finopsStartGate = async () => null;
+    svc.finopsPaidWorkGate = async () => {};
     const hashOf = loadDist('modules/dynamic-generation/run-hash.js');
     contextHash = hashOf.canonicalContextHash(hashOf.normalizeCourseContext(CONTEXT));
     return { svc, state };
@@ -875,6 +880,9 @@ async function runWorkerProcess(script, env, { waitMs }) {
     // EV6 DoD (BE-A): el default es REAL → un owner no listado recibe 403 claro (nunca una bajada silenciosa a mock).
     { label: 'no listado + sin videoMode (default REAL) → 403 real_video_not_enabled', env: { ...REAL_ON, [REAL]: OWNER_A }, owner: OWNER_B, mode: undefined, frozen: 'real', scenario: 'new', ok: false, re: /real_video_not_enabled/ },
     { label: 'listado + sin videoMode (default REAL) → crea', env: { ...REAL_ON, [REAL]: OWNER_A }, owner: OWNER_A, mode: undefined, frozen: 'real', scenario: 'new', ok: true },
+    // EV6 DoD fix round 1 (I1): un curso SIN videos arranca para cualquier owner (no hay Videogen que habilitar).
+    { label: 'no listado + sin videoMode, curso SIN videos → crea', env: { ...REAL_ON, [REAL]: OWNER_A }, owner: OWNER_B, mode: undefined, frozen: 'real', scenario: 'new', ok: true, noVideos: true },
+    { label: 'reabrir run real cancelado SIN videos, no listado → reabre', env: REAL_ON, owner: OWNER_B, mode: 'real', scenario: 'reopen', ok: true, noVideos: true },
     { label: 'no listado + DYNAMIC_REAL_VIDEO_ALL_OWNERS=true + real → crea', env: { ...REAL_ON, [REAL]: OWNER_A, DYNAMIC_REAL_VIDEO_ALL_OWNERS: 'true' }, owner: OWNER_B, mode: 'real', scenario: 'new', ok: true },
     { label: 'run real ACTIVO existente, owner no listado → se reanuda (200)', env: REAL_ON, owner: OWNER_B, mode: 'real', scenario: 'active', ok: true },
     { label: 'reabrir run real cancelado, no listado → 403 (nuevo gasto)', env: REAL_ON, owner: OWNER_B, mode: 'real', scenario: 'reopen', ok: false },
@@ -884,7 +892,7 @@ async function runWorkerProcess(script, env, { waitMs }) {
   for (const m of realMatrix) {
     await check(`I1 startRun videoMode — ${m.label}`, () =>
       withEnv({ ...ENV_CLEAN, ...m.env }, async () => {
-        const { svc, state } = runsServiceFor(m.scenario, m.frozen || (m.mode === undefined ? 'mock' : m.mode));
+        const { svc, state } = runsServiceFor(m.scenario, m.frozen || (m.mode === undefined ? 'mock' : m.mode), { noVideos: !!m.noVideos });
         const body = { ...CONTEXT };
         if (m.mode !== undefined) body.videoMode = m.mode;
         const p = svc.startRun(1, m.owner, 1, body);
@@ -933,7 +941,8 @@ async function runWorkerProcess(script, env, { waitMs }) {
       error: itemError ?? 'some_error',
       output_summary: {},
     };
-    const svc = new RunsService({ query: async () => [{ id: target.id, item_key: target.item_key, type: itemType, status: 'pending' }] }, { async get() { return { id: 42, manifest: { items: [] } }; } }, {});
+    // EV6 DoD fix round 1 (I1): el Manifest tiene un video (la allow-list de video real solo aplica con videos).
+    const svc = new RunsService({ query: async () => [{ id: target.id, item_key: target.item_key, type: itemType, status: 'pending' }] }, { async get() { return { id: 42, manifest: { items: [{ key: 'video:x', type: 'video', chapterId: 'x' }] } }; } }, {});
     svc.loadRunRow = async () => job;
     // Fix wave review-rv2: retryItem resuelve el Manifest DEL RUN (manifestOfRun), no el configurado.
     svc.manifestOfRun = async () => svc.manifests.get();

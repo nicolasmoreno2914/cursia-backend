@@ -33,6 +33,7 @@ export const PREVIEW_NOT_DELIVERABLE = 'preview_not_deliverable';
 
 /** Quién pide el paquete (los paquetes QA / degradados son solo de SUPER_ADMIN). */
 export interface PackageActor {
+  id?: string | null;
   email?: string | null;
 }
 /** worker_status del job de package en curso — una segunda POST reutiliza el mismo job sin crear otro. */
@@ -144,6 +145,8 @@ export class PackagingService {
    *   huérfano o fallido no debe bloquear un reintento.
    */
   async requestPackage(courseId: number, ownerId: string, blueprintNumber: number, runId: string, actor?: PackageActor): Promise<RequestPackageResult> {
+    // Fix round 1 (I2): un SUPER_ADMIN pide el paquete (QA / degradado) sobre el curso de cualquier owner.
+    ownerId = await this.ownerForActor(courseId, ownerId, actor);
     // G3: flag V2 + allow-list por owner (403 antes de tocar la DB).
     assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
@@ -173,7 +176,7 @@ export class PackagingService {
       // FAILED_PACKAGE_STATUSES u otro status no contemplado: no se reusa, se crea uno nuevo.
     }
 
-    const jobId = await this.insertPackageJob(run, manifest, blueprintNumber, runId, packageKind);
+    const jobId = await this.insertPackageJob(run, manifest, blueprintNumber, runId, packageKind, actor?.id ?? null);
     return { jobId, status: 'queued', created: true, packageKind, deliverable };
   }
 
@@ -217,7 +220,9 @@ export class PackagingService {
   }
 
   /** GET …/runs/:runId/package. */
-  async getPackageStatus(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<PackageStatusResult> {
+  async getPackageStatus(courseId: number, ownerId: string, blueprintNumber: number, runId: string, actor?: PackageActor): Promise<PackageStatusResult> {
+    // Fix round 1 (I2): un SUPER_ADMIN lee (y descarga) el paquete del curso de cualquier owner.
+    ownerId = await this.ownerForActor(courseId, ownerId, actor);
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     const run = await this.loadRunRow(courseId, manifest, runId); // valida ownership + que el run pertenezca al curso/Manifest
 
@@ -276,6 +281,13 @@ export class PackagingService {
   }
 
   // ── internals ────────────────────────────────────────────────────────────
+
+  /** Fix round 1 (I2): dueño real del curso cuando actúa un SUPER_ADMIN; si no, el propio usuario (sin cambios). */
+  private async ownerForActor(courseId: number, ownerId: string, actor?: PackageActor): Promise<string> {
+    if (!isSuperAdminEmail(actor?.email)) return ownerId;
+    const [c] = await this.dataSource.query(`select owner_id from public.courses where id = $1`, [courseId]);
+    return c?.owner_id ? String(c.owner_id) : ownerId;
+  }
 
   /**
    * Manifest congelado del run (input_payload.manifestId), no el "actual" de
@@ -427,16 +439,27 @@ export class PackagingService {
    */
   private async packageKindFor(run: any, manifest: ManifestDto, upgradeOnlyFailure: boolean, actor?: PackageActor): Promise<PackageKind> {
     const inputs = await loadCompletionInputs({ query: this.dataSource.query.bind(this.dataSource) }, run.id);
-    const completion = inputs ? evaluateRunCompletion(inputs.job, inputs.rows, inputs.manifest, null, { upgradeOnlyFailure }) : null;
-    const preview = completion?.previewComponents ?? [];
+    // Fix round 1 (M2/I3): sin datos para evaluar → nunca un paquete entregable (fail closed).
+    if (!inputs) throw this.previewNotDeliverable(run.id, [], 'no se pudo evaluar la completitud del curso (integridad)');
+    const completion = evaluateRunCompletion(inputs.job, inputs.rows, inputs.manifest, null, { upgradeOnlyFailure });
+    const preview = completion.previewComponents;
     const admin = isSuperAdminEmail(actor?.email);
     if (upgradeOnlyFailure) {
       if (admin) return 'degraded';
       throw this.previewNotDeliverable(run.id, preview, 'el curso tiene videos que no se pudieron generar; el paquete con videos pendientes es solo para un administrador de Cursia');
     }
-    if (preview.length === 0) return 'final';
-    if (admin && isVideoPreviewAllowed()) return 'qa_preview';
-    throw this.previewNotDeliverable(run.id, preview, 'el curso tiene componentes de vista previa (simulados); no se entrega un paquete sin todos sus componentes reales');
+    // Fix round 1 (I3): un paquete FINAL (entregable) exige la generación COMPLETA: todo real y validado.
+    if (completion.generationComplete) return 'final';
+    const unvalidated = completion.missingComponents.filter((k) => !preview.includes(k));
+    if (unvalidated.length === 0) {
+      if (admin && isVideoPreviewAllowed()) return 'qa_preview';
+      throw this.previewNotDeliverable(run.id, preview, 'el curso tiene componentes de vista previa (simulados); no se entrega un paquete sin todos sus componentes reales');
+    }
+    // Componentes completados SIN su validación (p.ej. filas anteriores a la validación del servidor):
+    // nunca entregable; un administrador puede armar un paquete degradado rotulado QA para revisarlo.
+    if (admin) return 'degraded';
+    throw this.previewNotDeliverable(run.id, completion.missingComponents,
+      `el curso tiene componentes sin validar (${unvalidated.length}); el paquete entregable exige todos los componentes reales y validados`);
   }
 
   private previewNotDeliverable(runId: string, preview: string[], why: string): ConflictException {
@@ -458,9 +481,9 @@ export class PackagingService {
     return row ?? null;
   }
 
-  private async insertPackageJob(run: any, manifest: ManifestDto, blueprintNumber: number, runId: string, packageKind: PackageKind = 'final'): Promise<string> {
+  private async insertPackageJob(run: any, manifest: ManifestDto, blueprintNumber: number, runId: string, packageKind: PackageKind = 'final', requestedBy?: string | null): Promise<string> {
     // EV6 DoD: un paquete final conserva el input_payload de siempre; QA / degradado lo declaran.
-    const inputPayload = { runId, manifestId: manifest.id, blueprintNumber, ...(packageKind !== 'final' ? { packageKind } : {}) };
+    const inputPayload = { runId, manifestId: manifest.id, blueprintNumber, ...(packageKind !== 'final' ? { packageKind, ...(requestedBy ? { requestedBy } : {}) } : {}) };
     const [job] = await this.dataSource.query(
       `insert into public.production_jobs
          (owner_id, course_id, frontend_course_id, execution_mode, status, worker_status, current_step,
