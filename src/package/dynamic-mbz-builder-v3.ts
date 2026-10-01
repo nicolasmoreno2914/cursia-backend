@@ -122,6 +122,7 @@ import { compileLibroHtmlV3, libroWordCount } from './v3/libro-v3';
 import { downscaleCoverPng } from './v3/png-downscale';
 import { activityPackageFilename, h5pActivityInlineIntroHtml, introThemeFrom, scormIntroHtml } from './v3/activity-intro';
 import { IdAllocator, buildQuizV3, parseScormManifestIds, scormActivityXmlV3 } from './v3/moodle-activities-v3';
+import { expectedExamPlan, planSlotCount, validateExamBank } from '../modules/course-shell/exam-bank';
 import type { ExamBankV1 } from '../modules/course-shell/exam-bank';
 import { COURSE_BADGE_BACKUP_ID, COURSE_BADGE_DEFAULT_ISSUER, courseBadgeImages, courseBadgeName, courseBadgeXml } from './v3/course-badge';
 
@@ -161,8 +162,14 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * setting `badges` = 1), la evaluación final SIEMPRE es criterio de completion y el cierre
  * trae el panel «Tu certificado» con el enlace $@BADGESVIEWBYID*1@$; fix 0b: label oculto
  * (visible=0) para docentes en el cierre con el paso «Habilitar acceso» de la insignia.
+ * 3.3.0 (EV6 P2-B1): política de revisión del quiz (solo nota hasta el cierre) y
+ * `completionattemptsexhausted`.
+ * 3.4.0 (EV6 P2-B3): exámenes con banco `dynamic_exam_bank_json` → categorías por capítulo|módulo ×
+ * tipo y slots aleatorios (`question_set_reference`), retroalimentación por opción + general;
+ * emparejamiento del banco = definición como subpregunta y término como opción (fix 1). Los
+ * paquetes con exámenes GIFT quedan byte a byte iguales a 3.3.0 (el bump invalida solo el reuse).
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.3.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.4.0';
 /** Versión del renderer de Visual Components que entra en la clave de reuse. */
 export const VC_RENDERER_VERSION = `vc${VC_SCHEMA_VERSION}-rt${VC_RUNTIME_VERSION}-theme${THEME_ENGINE_VERSION}`;
 
@@ -190,7 +197,9 @@ export interface DynamicPackageContentsV3 {
   finalExamGift?: string | null;
   /**
    * EV6 P2: exámenes cuyo artifact es el banco `dynamic_exam_bank_json` (moduleId → banco).
-   * Hasta B3 el builder NO los empaqueta: lanza EXAM_BANK_UNSUPPORTED (nunca los ignora).
+   * P2-B3: se empaquetan como quiz de slots aleatorios por hoja (capítulo|módulo × tipo); un
+   * módulo trae GIFT o banco, nunca ambos. El builder re-valida cada banco (plan congelado +
+   * evidencia contra `contentMd`) y falla fuerte con EXAM_BANK_INVALID.
    */
   examBanks?: Map<string, ExamBankV1>;
   finalExamBank?: ExamBankV1 | null;
@@ -469,10 +478,10 @@ function collectMissing(plan: PackagingPlanV3, c: DynamicPackageContentsV3): str
   const missing: string[] = [];
   if (!c.courseIntro) missing.push(plan.keys.courseIntro);
   if (!Buffer.isBuffer(c.audioWelcome) || c.audioWelcome.length === 0) missing.push(plan.keys.audioWelcome);
-  if (plan.keys.finalExam && (typeof c.finalExamGift !== 'string' || !c.finalExamGift.trim())) missing.push(plan.keys.finalExam);
+  if (plan.keys.finalExam && !c.finalExamBank && (typeof c.finalExamGift !== 'string' || !c.finalExamGift.trim())) missing.push(plan.keys.finalExam);
   for (const m of plan.modules) {
     if (!c.moduleIntros.has(m.moduleId)) missing.push(m.keys.moduleIntro);
-    if (m.keys.exam && !(c.examGift.get(m.moduleId) ?? '').trim()) missing.push(m.keys.exam);
+    if (m.keys.exam && !c.examBanks?.has(m.moduleId) && !(c.examGift.get(m.moduleId) ?? '').trim()) missing.push(m.keys.exam);
     for (const ch of m.chapters) {
       const id = ch.chapterId;
       if (!(c.contentMd.get(id) ?? '').trim()) missing.push(ch.keys.content);
@@ -546,22 +555,72 @@ async function scormZip(launch: string, html: string, manifestXml: string): Prom
 /** EV6 P2: fuente de un examen v3 — GIFT de siempre o banco JSON (`dynamic_exam_bank_json`). */
 export type ExamSource = { kind: 'gift'; gift: string } | { kind: 'bank'; bank: ExamBankV1 };
 
+/** Histórico (P2-B2): el builder ya empaqueta bancos desde 3.4.0 (P2-B3); se conserva el código exportado. */
 export const EXAM_BANK_UNSUPPORTED = 'EXAM_BANK_UNSUPPORTED';
+export const EXAM_BANK_INVALID_BUILDER = 'EXAM_BANK_INVALID';
+
+/**
+ * EV6 P2-B3: fuente de cada examen (GIFT | banco). Un módulo con GIFT y banco a la vez es un
+ * error del caller (falla fuerte). Cada banco se re-valida contra su plan CONGELADO + pertenencia
+ * y la evidencia en el Markdown del capítulo (`contentMd`) → EXAM_BANK_INVALID.
+ */
+function resolveExamSources(plan: PackagingPlanV3, c: DynamicPackageContentsV3): { modules: Map<string, ExamSource>; final: ExamSource | null } {
+  const modules = new Map<string, ExamSource>();
+  const check = (key: string, scope: 'module' | 'final', bank: ExamBankV1, chapters: Array<{ id: string; moduleId: string }>): void => {
+    const r = validateExamBank(bank, { scope, chapters, chapterMd: c.contentMd, planSource: 'frozen' });
+    if (!r.ok) {
+      const codes = [...new Set(r.errors.map((e) => e.code))].sort();
+      throw new Error(`${EXAM_BANK_INVALID_BUILDER}: ${key} [${codes.join(', ')}] ${r.errors.slice(0, 5).map((e) => `${e.path} ${e.code}: ${e.message}`).join(' | ')}`);
+    }
+    // Fix 1 (M4): el plan CONGELADO debe cubrir cada capítulo (módulo, en el final) que el plan ACTUAL
+    // cubre; un reuse viejo que omita uno dejaría ese capítulo sin evaluar → falla fuerte.
+    const owner = (l: ExamBankV1['plan'][number]): string => ('chapterId' in l ? l.chapterId : l.moduleId);
+    const frozen = new Set(bank.plan.map(owner));
+    const uncovered = [...new Set(expectedExamPlan(scope, chapters).map(owner))].filter((o) => !frozen.has(o));
+    if (uncovered.length) {
+      throw new Error(`${EXAM_BANK_INVALID_BUILDER}: ${key} [EXAM_BANK_PLAN] el plan congelado del banco no cubre ${scope === 'module' ? 'los capítulos' : 'los módulos'} ${uncovered.join(', ')}`);
+    }
+  };
+  const examModules = new Set(plan.modules.filter((m) => m.keys.exam).map((m) => m.moduleId));
+  for (const id of c.examBanks?.keys() ?? []) {
+    if (!examModules.has(id)) throw new Error(`MBZ_V3_INVARIANT: banco de examen para un módulo sin examen (${id})`);
+  }
+  for (const m of plan.modules) {
+    if (!m.keys.exam) continue;
+    const bank = c.examBanks?.get(m.moduleId);
+    const gift = c.examGift.get(m.moduleId);
+    if (bank && (gift ?? '').trim()) throw new Error(`MBZ_V3_INVARIANT: ${m.keys.exam} trae GIFT y banco a la vez`);
+    if (bank) {
+      check(m.keys.exam, 'module', bank, m.chapters.map((ch) => ({ id: ch.chapterId, moduleId: m.moduleId })));
+      modules.set(m.moduleId, { kind: 'bank', bank });
+    } else {
+      modules.set(m.moduleId, { kind: 'gift', gift: gift as string });
+    }
+  }
+  let final: ExamSource | null = null;
+  if (plan.keys.finalExam) {
+    if (c.finalExamBank && (c.finalExamGift ?? '').trim()) throw new Error(`MBZ_V3_INVARIANT: ${plan.keys.finalExam} trae GIFT y banco a la vez`);
+    if (c.finalExamBank) {
+      check(plan.keys.finalExam, 'final', c.finalExamBank, plan.modules.flatMap((m) => m.chapters.map((ch) => ({ id: ch.chapterId, moduleId: m.moduleId }))));
+      final = { kind: 'bank', bank: c.finalExamBank };
+    } else {
+      final = { kind: 'gift', gift: c.finalExamGift as string };
+    }
+  } else if (c.finalExamBank) {
+    throw new Error('MBZ_V3_INVARIANT: banco de examen final en un curso sin examen final');
+  }
+  return { modules, final };
+}
 
 export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<BuildDynamicMbzV3Result> {
   if (!Number.isInteger(input?.ts) || input.ts <= 0) throw new Error('MBZ_V3_INVALID: ts (reloj inyectado) debe ser un entero > 0');
   const { manifest, blueprint, contents: c, ts } = input;
-  // EV6 P2: el modo banco del quiz llega con B3; hasta entonces un banco falla fuerte (nunca se ignora en silencio).
-  const bankKeys = [...(c.examBanks?.keys() ?? [])].map((id) => `exam:${id}`);
-  if (c.finalExamBank) bankKeys.push('final_exam');
-  if (bankKeys.length) {
-    throw new Error(`${EXAM_BANK_UNSUPPORTED}: este builder todavía no empaqueta bancos de preguntas (${bankKeys.join(', ')})`);
-  }
   const pendingIds = [...new Set(input.pendingVideoChapterIds ?? [])];
   const plan = buildPackagingPlanV3(manifest, blueprint, { manifestId: input.manifestId ?? null, omitVideoChapterIds: pendingIds });
   const omittedVideoKeys = plan.omittedVideos.map((v) => v.videoKey);
   const missing = collectMissing(plan, c);
   if (missing.length) throw new PackagingV3ContentMissingError(missing);
+  const examSources = resolveExamSources(plan, c);
   const MV = resolveMoodleVersion(input.moodleVersion);
   const level = input.level === 'clean_safe' ? undefined : ('enhanced' as const);
   const opts = level ? { level } : undefined;
@@ -595,17 +654,32 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const audiobook = assembleAudiobook(
     allChapters.map((ch) => ({ chapterId: ch.chapterId, chapterNumber: ch.chapterNumber, mp3: c.audiobookChapters.get(ch.chapterId) })),
   );
+  // EV6 P2-B3: con banco, las «preguntas del examen» que ve el estudiante son los SLOTS (no el banco).
   const examQuestionCountByModule: Record<string, number> = {};
+  const examBankSizeByModule: Record<string, number> = {};
   for (const m of plan.modules) {
     if (!m.keys.exam) continue;
-    const n = parseGIFT(c.examGift.get(m.moduleId) as string).length;
+    const src = examSources.modules.get(m.moduleId) as ExamSource;
+    if (src.kind === 'bank') {
+      examQuestionCountByModule[m.moduleId] = planSlotCount(src.bank.plan);
+      examBankSizeByModule[m.moduleId] = src.bank.questions.length;
+      continue;
+    }
+    const n = parseGIFT(src.gift).length;
     if (n < 1) throw new Error(`QUIZ_V3_EMPTY: el GIFT de ${m.keys.exam} no produjo preguntas`);
     examQuestionCountByModule[m.moduleId] = n;
   }
   let finalExamQuestionCount: number | undefined;
+  let finalExamBankSize: number | undefined;
   if (plan.keys.finalExam) {
-    finalExamQuestionCount = parseGIFT(c.finalExamGift as string).length;
-    if (finalExamQuestionCount < 1) throw new Error(`QUIZ_V3_EMPTY: el GIFT de ${plan.keys.finalExam} no produjo preguntas`);
+    const src = examSources.final as ExamSource;
+    if (src.kind === 'bank') {
+      finalExamQuestionCount = planSlotCount(src.bank.plan);
+      finalExamBankSize = src.bank.questions.length;
+    } else {
+      finalExamQuestionCount = parseGIFT(src.gift).length;
+      if (finalExamQuestionCount < 1) throw new Error(`QUIZ_V3_EMPTY: el GIFT de ${plan.keys.finalExam} no produjo preguntas`);
+    }
   }
   const libroHtml = compileLibroHtmlV3({
     courseTitle: plan.course.title,
@@ -639,6 +713,8 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       slideCountByChapter,
       examQuestionCountByModule,
       ...(finalExamQuestionCount !== undefined ? { finalExamQuestionCount } : {}),
+      ...(Object.keys(examBankSizeByModule).length ? { examBankSizeByModule } : {}),
+      ...(finalExamBankSize !== undefined ? { finalExamBankSize } : {}),
       libroWordCount: libroWordCount(libroHtml),
       libroHasBibliography: libroHtml.includes('id="bibliografia"'),
     },
@@ -668,7 +744,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   // ── Zip ──────────────────────────────────────────────────────────────────
   const W = new MbzWriter(ts, MV);
   const ids = new IdAllocator({
-    qcat: 1000, qbe: 1000, qversion: 1000, question: 1000, qinstance: 1000, qref: 1000, answer: 1000,
+    qcat: 1000, qbe: 1000, qversion: 1000, question: 1000, qinstance: 1000, qref: 1000, qsetref: 1000, answer: 1000,
     match: 1000, qoptions: 1000, qsection: 1000, sco: 50000, scodata: 60000,
   });
   const graded: Array<CompletionCandidate & { name: string }> = [];
@@ -743,13 +819,28 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   };
 
   const questionCategories: string[] = [];
-  const addQuiz = (secnum: number, idnumber: string, name: string, kind: 'exam' | 'finalExam', gift: string, stampSeed: string): void => {
+  const addQuiz = (
+    secnum: number,
+    idnumber: string,
+    name: string,
+    kind: 'exam' | 'finalExam',
+    src: ExamSource,
+    stampSeed: string,
+    bankGroups: Array<{ ownerId: string; name: string }>,
+  ): void => {
     const a = W.newActivity('quiz', secnum, name, idnumber);
     const k = resolved.kinds[kind];
     const q = buildQuizV3({
-      aid: a.aid, mid: a.mid, ctx: a.ctx, name, introHtml: `<p>${esc(name)}</p>`, gift,
+      aid: a.aid, mid: a.mid, ctx: a.ctx, name, introHtml: `<p>${esc(name)}</p>`,
+      ...(src.kind === 'bank' ? { bank: { doc: src.bank, groups: bankGroups } } : { gift: src.gift }),
       attempts: k.attempts, grademethod: k.gradeMethod, ts, stampSeed, ids,
     });
+    // Fix 1 (M5): los slots del quiz y las «preguntas» que anuncia el shell (facts) salen de la misma
+    // fuente; si difieren, el texto del curso mentiría → falla fuerte.
+    const announced = kind === 'finalExam' ? facts.finalExam.questionCount : facts.modules.find((x) => `cv3:exam:${x.id}` === idnumber)?.examQuestionCount;
+    if (q.questionCount !== announced) {
+      throw new Error(`MBZ_V3_INVARIANT: ${idnumber} tiene ${q.questionCount} slots pero facts anuncia ${announced} preguntas`);
+    }
     W.put(`${a.dir}/quiz.xml`, q.quizXml);
     questionCategories.push(q.questionCategoriesXml);
     gradedCommon(a, kind, name, [], q.categoryIds);
@@ -918,7 +1009,15 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     const nextSec = m.examSectionNum as number;
     if (!Number.isInteger(nextSec)) throw new Error(`MBZ_V3_INVARIANT: módulo ${m.moduleId} con examen sin sección`);
     addLabel(nextSec, `cv3:exam_info:${m.moduleId}`, examInfoLabel(mf, facts, theme, opts));
-    addQuiz(nextSec, `cv3:exam:${m.moduleId}`, safeActivityName(`Evaluación del módulo ${m.moduleNumber}: ${m.title}`), 'exam', c.examGift.get(m.moduleId) as string, m.keys.exam);
+    addQuiz(
+      nextSec,
+      `cv3:exam:${m.moduleId}`,
+      safeActivityName(`Evaluación del módulo ${m.moduleNumber}: ${m.title}`),
+      'exam',
+      examSources.modules.get(m.moduleId) as ExamSource,
+      m.keys.exam,
+      m.chapters.map((ch) => ({ ownerId: ch.chapterId, name: `Capítulo ${ch.chapterNumber}: ${ch.title}` })),
+    );
     // Edu EV3 / EV6: tras la evaluación → botón al primer capítulo del módulo siguiente, o a la
     // evaluación final / cierre.
     const nextPlan = plan.modules[plan.modules.indexOf(m) + 1];
@@ -945,7 +1044,15 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     const fsec = plan.finalExamSectionNum;
     if (fsec === null || !(fsec < closing)) throw new Error('MBZ_V3_INVARIANT: la evaluación final debe ir antes del cierre');
     addLabel(fsec, 'cv3:final_exam_info', finalExamInfoLabel(facts, theme, opts));
-    addQuiz(fsec, 'cv3:final_exam', 'Evaluación final', 'finalExam', c.finalExamGift as string, plan.keys.finalExam);
+    addQuiz(
+      fsec,
+      'cv3:final_exam',
+      'Evaluación final',
+      'finalExam',
+      examSources.final as ExamSource,
+      plan.keys.finalExam,
+      plan.modules.map((m) => ({ ownerId: m.moduleId, name: `Módulo ${m.moduleNumber}: ${m.title}` })),
+    );
     addLabel(fsec, 'cv3:final_exam_next', finalExamNextLabel(closing, facts, theme, opts));
   }
   // EV6 (T3): criterios de completion del curso (la insignia-certificado se otorga al completarlo).

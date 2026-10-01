@@ -12,9 +12,11 @@
  * Puro.
  */
 import { createHash } from 'crypto';
-import { GiftQuestion, parseGIFT, xmlEsc } from '../mbz-common';
+import { GiftQuestion, esc, parseGIFT, safeActivityName, xmlEsc } from '../mbz-common';
 import { applyXmlFields, quizAttemptsXmlFields, scormAssessmentFields } from '../assessment';
 import type { GradeMethod } from '../../modules/course-profiles/course-profiles';
+import { EXAM_QUESTION_TYPES, bankFloor } from '../../modules/course-shell/exam-bank';
+import type { ExamBankQuestion, ExamBankV1, ExamQuestionType } from '../../modules/course-shell/exam-bank';
 
 /** Asignador monotónico de ids por "tabla" del backup (determinístico por orden de uso). */
 export class IdAllocator {
@@ -76,7 +78,10 @@ export interface QuizV3Input {
   ctx: number;
   name: string;
   introHtml: string;
-  gift: string;
+  /** GIFT (slots fijos, una `question_reference` por pregunta). Exactamente uno de `gift` | `bank`. */
+  gift?: string;
+  /** EV6 P2-B3: banco JSON → slots aleatorios por hoja (capítulo|módulo × tipo). */
+  bank?: QuizV3Bank;
   attempts: number;
   grademethod: GradeMethod;
   ts: number;
@@ -85,15 +90,39 @@ export interface QuizV3Input {
   ids: IdAllocator;
 }
 
+/**
+ * EV6 P2-B3: banco del quiz. `groups` = categorías padre en orden del Manifest (examen de
+ * módulo: un grupo por capítulo, `Capítulo N: título`; final: uno por módulo, `Módulo N:
+ * título`); `ownerId` = chapterId | moduleId según `doc.scope`. Cada grupo tiene una hoja por
+ * tipo con slots en `doc.plan` (orden multichoice, truefalse, match).
+ */
+export interface QuizV3Bank {
+  doc: ExamBankV1;
+  groups: Array<{ ownerId: string; name: string }>;
+}
+
 export interface QuizV3Output {
   quizXml: string;
   questionCategoriesXml: string;
-  categoryIds: [number, number, number];
+  /** TODAS las categorías del quiz (inforef): top, por defecto y, en banco, padres y hojas. */
+  categoryIds: number[];
+  /** Slots del quiz (= preguntas que ve el estudiante por intento). */
   questionCount: number;
+  /** Solo banco: preguntas del banco (todas las hojas). */
+  bankSize?: number;
 }
 
+/** Nombre visible del tipo en la categoría hoja. */
+export const EXAM_LEAF_TYPE_LABEL: Record<ExamQuestionType, string> = {
+  multichoice: 'Selección múltiple',
+  truefalse: 'Verdadero o falso',
+  match: 'Emparejamiento',
+};
+
 export function buildQuizV3(p: QuizV3Input): QuizV3Output {
-  const qs: GiftQuestion[] = parseGIFT(p.gift);
+  if ((p.gift === undefined) === (p.bank === undefined)) throw new Error(`QUIZ_V3_INVALID: "${p.name}" necesita exactamente uno de gift | bank`);
+  if (p.bank) return buildBankQuizV3(p, p.bank);
+  const qs: GiftQuestion[] = parseGIFT(p.gift as string);
   if (qs.length === 0) throw new Error(`QUIZ_V3_EMPTY: el GIFT de "${p.name}" no produjo ninguna pregunta parseable (no se genera un quiz vacío)`);
   const marks = quizMaxMarks(qs.length);
   const catTop = p.ids.take('qcat');
@@ -155,6 +184,17 @@ export function buildQuizV3(p: QuizV3Input): QuizV3Output {
       </question_bank_entry>\n`;
   });
 
+  const quizXml = quizActivityXmlV3(p, instances);
+
+  const questionCategoriesXml =
+    catXml(p, catTop, 'top', 0, 0, '', '') +
+    catXml(p, catDefault, `Por defecto en ${p.name}`, catTop, 999, `Categoría por defecto para preguntas compartidas en el contexto ${p.name}.`, '') +
+    catXml(p, cat, p.name, catTop, 999, '', entries);
+  return { quizXml, questionCategoriesXml, categoryIds: [catTop, catDefault, cat], questionCount: qs.length };
+}
+
+/** `quiz.xml` (mismo template para GIFT y banco; `instances` = los `question_instance`). */
+function quizActivityXmlV3(p: QuizV3Input, instances: string): string {
   const quizXmlBase = `<?xml version="1.0" encoding="UTF-8"?>
 <activity id="${p.aid}" moduleid="${p.mid}" modulename="quiz" contextid="${p.ctx}">
   <quiz id="${p.aid}">
@@ -183,9 +223,12 @@ export function buildQuizV3(p: QuizV3Input): QuizV3Output {
     <overrides></overrides><grades></grades><attempts></attempts>
   </quiz>
 </activity>`;
-  const quizXml = applyXmlFields(quizXmlBase, quizAttemptsXmlFields({ attempts: p.attempts, grademethod: p.grademethod }));
+  return applyXmlFields(quizXmlBase, quizAttemptsXmlFields({ attempts: p.attempts, grademethod: p.grademethod }));
+}
 
-  const catXml = (id: number, name: string, parent: number, sortorder: number, info: string, qbe: string) => `  <question_category id="${id}">
+/** Una `question_category` del contexto del quiz (contextlevel 70). */
+function catXml(p: QuizV3Input, id: number, name: string, parent: number, sortorder: number, info: string, qbe: string): string {
+  return `  <question_category id="${id}">
     <name>${xmlEsc(name)}</name>
     <contextid>${p.ctx}</contextid><contextlevel>70</contextlevel><contextinstanceid>${p.mid}</contextinstanceid>
     <info>${xmlEsc(info)}</info><infoformat>0</infoformat>
@@ -194,11 +237,151 @@ export function buildQuizV3(p: QuizV3Input): QuizV3Output {
     <question_bank_entries>${qbe ? `\n${qbe}    ` : ''}</question_bank_entries>
   </question_category>
 `;
-  const questionCategoriesXml =
-    catXml(catTop, 'top', 0, 0, '', '') +
-    catXml(catDefault, `Por defecto en ${p.name}`, catTop, 999, `Categoría por defecto para preguntas compartidas en el contexto ${p.name}.`, '') +
-    catXml(cat, p.name, catTop, 999, '', entries);
-  return { quizXml, questionCategoriesXml, categoryIds: [catTop, catDefault, cat], questionCount: qs.length };
+}
+
+// ─── EV6 P2-B3: modo banco (slots aleatorios por hoja) ─────────────────────
+
+/** `<p>texto</p>` con el texto plano escapado como HTML (FORMAT_HTML). */
+function htmlPara(text: string): string {
+  return `<p>${esc(text)}</p>`;
+}
+
+/** XML de los datos del qtype de una pregunta del banco (retroalimentación por opción, §2.2). */
+function bankQuestionPluginXml(q: ExamBankQuestion, ids: IdAllocator): string {
+  if (q.type === 'multichoice') {
+    // La correcta primero; Moodle baraja las opciones (shuffleanswers 1) en cada intento.
+    const opts = [{ ...q.correct, fraction: '1.0000000' }, ...q.distractors.map((d) => ({ ...d, fraction: '0.0000000' }))];
+    const ans = opts
+      .map((o) => `<answer id="${ids.take('answer')}"><answertext>${xmlEsc(o.text)}</answertext><answerformat>2</answerformat><fraction>${o.fraction}</fraction><feedback>${xmlEsc(htmlPara(o.why))}</feedback><feedbackformat>1</feedbackformat></answer>`)
+      .join('');
+    return `<plugin_qtype_multichoice_question><answers>${ans}</answers><multichoice id="${ids.take('qoptions')}"><layout>0</layout><single>1</single><shuffleanswers>1</shuffleanswers><correctfeedback></correctfeedback><correctfeedbackformat>1</correctfeedbackformat><partiallycorrectfeedback></partiallycorrectfeedback><partiallycorrectfeedbackformat>1</partiallycorrectfeedbackformat><incorrectfeedback></incorrectfeedback><incorrectfeedbackformat>1</incorrectfeedbackformat><answernumbering>abc</answernumbering><shownumcorrect>0</shownumcorrect><showstandardinstruction>0</showstandardinstruction></multichoice></plugin_qtype_multichoice_question>`;
+  }
+  if (q.type === 'truefalse') {
+    // La respuesta equivocada lleva `whyWrong`; la correcta queda vacía (la explicación va en generalfeedback).
+    const t = ids.take('answer');
+    const f = ids.take('answer');
+    const fbTrue = q.answer ? '' : xmlEsc(htmlPara(q.whyWrong));
+    const fbFalse = q.answer ? xmlEsc(htmlPara(q.whyWrong)) : '';
+    return `<plugin_qtype_truefalse_question><answers><answer id="${t}"><answertext>Verdadero</answertext><answerformat>0</answerformat><fraction>${q.answer ? '1.0000000' : '0.0000000'}</fraction><feedback>${fbTrue}</feedback><feedbackformat>1</feedbackformat></answer><answer id="${f}"><answertext>Falso</answertext><answerformat>0</answerformat><fraction>${!q.answer ? '1.0000000' : '0.0000000'}</fraction><feedback>${fbFalse}</feedback><feedbackformat>1</feedbackformat></answer></answers><truefalse id="${ids.take('qoptions')}"><trueanswer>${t}</trueanswer><falseanswer>${f}</falseanswer><showstandardinstruction>0</showstandardinstruction></truefalse></plugin_qtype_truefalse_question>`;
+  }
+  // match (fix 1, ruling del coordinador): la DEFINICIÓN es la subpregunta (FORMAT_PLAIN, texto largo
+  // bien renderizado) y el TÉRMINO es la opción del desplegable (corta; `answertext` no tiene formato y
+  // Moodle la pasa por format_string → el contrato prohíbe < > en `term`). Moodle arma las opciones con
+  // los `answertext` distintos: los términos son únicos (EXAM_BANK_MATCH). El GIFT no cambia.
+  // La explicación va en generalfeedback.
+  const matches = q.pairs
+    .map((pr) => `<match id="${ids.take('match')}"><questiontext>${xmlEsc(pr.definition)}</questiontext><questiontextformat>2</questiontextformat><answertext>${xmlEsc(pr.term)}</answertext></match>`)
+    .join('');
+  return `<plugin_qtype_match_question><matchoptions id="${ids.take('qoptions')}"><shuffleanswers>1</shuffleanswers><correctfeedback></correctfeedback><correctfeedbackformat>1</correctfeedbackformat><partiallycorrectfeedback></partiallycorrectfeedback><partiallycorrectfeedbackformat>1</partiallycorrectfeedbackformat><incorrectfeedback></incorrectfeedback><incorrectfeedbackformat>1</incorrectfeedbackformat><shownumcorrect>0</shownumcorrect></matchoptions><matches>${matches}</matches></plugin_qtype_match_question>`;
+}
+
+/**
+ * Quiz con banco (P2-design §2.2): categorías top → «Por defecto en …» → padre por capítulo
+ * (módulo en el final) → hojas por tipo con sus preguntas; un `question_instance` por slot con
+ * `question_set_reference` a SU hoja (`includesubcategories` false, sin `cat`: lo agrega el
+ * restore). `maxmark` suma exactamente 100 sobre los slots. Falla fuerte si el banco no cubre el
+ * plan (hoja bajo el piso, pregunta o hoja sin grupo).
+ */
+function buildBankQuizV3(p: QuizV3Input, bank: QuizV3Bank): QuizV3Output {
+  const doc = bank.doc;
+  const fail = (msg: string): never => {
+    throw new Error(`QUIZ_V3_BANK_INVALID: "${p.name}": ${msg}`);
+  };
+  if (!doc || !Array.isArray(doc.plan) || !Array.isArray(doc.questions)) fail('banco sin plan/preguntas');
+  const leafOwner = (l: ExamBankV1['plan'][number]): string => ('chapterId' in l ? l.chapterId : l.moduleId);
+  const qOwner = (q: ExamBankQuestion): string => (doc.scope === 'final' ? (q.moduleId as string) : q.chapterId);
+  const slotsByLeaf = new Map<string, number>();
+  for (const l of doc.plan) slotsByLeaf.set(`${leafOwner(l)}|${l.type}`, l.slots);
+  const groupOwners = new Set(bank.groups.map((g) => g.ownerId));
+  for (const l of doc.plan) if (!groupOwners.has(leafOwner(l))) fail(`la hoja ${leafOwner(l)}/${l.type} no tiene categoría padre`);
+
+  const catTop = p.ids.take('qcat');
+  const catDefault = p.ids.take('qcat');
+  type Leaf = { id: number; name: string; type: ExamQuestionType; slots: number; questions: ExamBankQuestion[] };
+  const groups: Array<{ id: number; name: string; leaves: Leaf[] }> = [];
+  let placed = 0;
+  for (const g of bank.groups) {
+    const types = EXAM_QUESTION_TYPES.filter((t) => slotsByLeaf.has(`${g.ownerId}|${t}`));
+    if (!types.length) continue;
+    const parentName = safeActivityName(g.name, 255);
+    const group = { id: p.ids.take('qcat'), name: parentName, leaves: [] as Leaf[] };
+    for (const type of types) {
+      const slots = slotsByLeaf.get(`${g.ownerId}|${type}`) as number;
+      if (!Number.isInteger(slots) || slots < 1) fail(`slots inválidos en ${g.ownerId}/${type}`);
+      const questions = doc.questions.filter((q) => q.type === type && qOwner(q) === g.ownerId);
+      if (questions.length < bankFloor(slots)) fail(`la hoja ${g.ownerId}/${type} tiene ${questions.length} preguntas (mínimo ${bankFloor(slots)} para ${slots} slots)`);
+      placed += questions.length;
+      group.leaves.push({ id: p.ids.take('qcat'), name: safeActivityName(`${g.name} · ${EXAM_LEAF_TYPE_LABEL[type]}`, 255), type, slots, questions });
+    }
+    groups.push(group);
+  }
+  if (placed !== doc.questions.length) fail(`${doc.questions.length - placed} preguntas no pertenecen a ninguna hoja del plan`);
+  const leaves = groups.flatMap((g) => g.leaves);
+  const slotCount = leaves.reduce((a, l) => a + l.slots, 0);
+  const marks = quizMaxMarks(slotCount);
+
+  let instances = '';
+  let slot = 0;
+  for (const leaf of leaves) {
+    const filter = JSON.stringify({ filter: { category: { jointype: 1, values: [leaf.id], filteroptions: { includesubcategories: false } } } });
+    for (let k = 0; k < leaf.slots; k++) {
+      slot++;
+      instances += `      <question_instance id="${p.ids.take('qinstance')}">
+        <quizid>${p.aid}</quizid><slot>${slot}</slot><page>${Math.ceil(slot / 5)}</page>
+        <displaynumber>$@NULL@$</displaynumber><requireprevious>0</requireprevious>
+        <maxmark>${marks[slot - 1]}</maxmark><quizgradeitemid>$@NULL@$</quizgradeitemid>
+        <question_set_reference id="${p.ids.take('qsetref')}">
+          <usingcontextid>${p.ctx}</usingcontextid><component>mod_quiz</component>
+          <questionarea>slot</questionarea><questionscontextid>${p.ctx}</questionscontextid>
+          <filtercondition>${filter}</filtercondition>
+        </question_set_reference>
+      </question_instance>\n`;
+    }
+  }
+
+  const entriesOf = (leaf: Leaf): string =>
+    leaf.questions
+      .map((q) => {
+        const qbe = p.ids.take('qbe');
+        const qv = p.ids.take('qversion');
+        const qid = p.ids.take('question');
+        const plugin = bankQuestionPluginXml(q, p.ids);
+        const stamp = `cursia.v3+${sha1(`${p.stampSeed}#bank#${q.id}`).slice(0, 20)}`;
+        return `      <question_bank_entry id="${qbe}">
+        <questioncategoryid>${leaf.id}</questioncategoryid><idnumber>$@NULL@$</idnumber><ownerid>2</ownerid>
+        <question_version><question_versions id="${qv}"><version>1</version><status>ready</status>
+        <questions><question id="${qid}">
+          <parent>0</parent><name>${xmlEsc(q.id)}</name>
+          <questiontext>${xmlEsc(htmlPara(q.stem))}</questiontext><questiontextformat>1</questiontextformat>
+          <generalfeedback>${xmlEsc(htmlPara(q.explanation))}</generalfeedback><generalfeedbackformat>1</generalfeedbackformat>
+          <defaultmark>1.0000000</defaultmark><penalty>0.3333333</penalty><qtype>${q.type}</qtype>
+          <length>1</length><stamp>${stamp}</stamp>
+          <timecreated>${p.ts}</timecreated><timemodified>${p.ts}</timemodified>
+          <createdby>2</createdby><modifiedby>2</modifiedby>
+          ${plugin}
+          <plugin_qbank_comment_question><comments></comments></plugin_qbank_comment_question>
+        </question></questions></question_versions></question_version>
+      </question_bank_entry>\n`;
+      })
+      .join('');
+
+  let questionCategoriesXml =
+    catXml(p, catTop, 'top', 0, 0, '', '') +
+    catXml(p, catDefault, `Por defecto en ${p.name}`, catTop, 999, `Categoría por defecto para preguntas compartidas en el contexto ${p.name}.`, '');
+  groups.forEach((g, gi) => {
+    questionCategoriesXml += catXml(p, g.id, g.name, catTop, gi + 1, '', '');
+    g.leaves.forEach((leaf, li) => {
+      questionCategoriesXml += catXml(p, leaf.id, leaf.name, g.id, li + 1, '', entriesOf(leaf));
+    });
+  });
+  const quizXml = quizActivityXmlV3(p, instances);
+  return {
+    quizXml,
+    questionCategoriesXml,
+    categoryIds: [catTop, catDefault, ...groups.flatMap((g) => [g.id, ...g.leaves.map((l) => l.id)])],
+    questionCount: slotCount,
+    bankSize: doc.questions.length,
+  };
 }
 
 // ─── SCORM ──────────────────────────────────────────────────────────────────

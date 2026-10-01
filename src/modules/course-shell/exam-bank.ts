@@ -49,13 +49,26 @@ export const EXAM_BANK_LIMITS = Object.freeze({
   optionText: [1, 200] as const,
   optionWhy: [20, 400] as const,
   whyWrong: [20, 400] as const,
-  term: [1, 120] as const,
+  /** P2-B3 fix 1: el término es la opción del desplegable de Moodle (corta en móvil). */
+  term: [1, 60] as const,
   definition: [1, 200] as const,
   pairs: [4, 6] as const,
   distractors: 3,
 });
 
 export const EXAM_BANK_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
+
+/**
+ * P2-B3 fix 1 (M1): caracteres de control C0 (salvo \t y \n) y DEL — inválidos en XML 1.0 o
+ * invisibles; en CUALQUIER texto del banco → EXAM_BANK_SCHEMA. El frontend replica el literal.
+ */
+export const EXAM_BANK_CONTROL_RE = /[\u0000-\u0008\u000B-\u001F\u007F]/;
+/**
+ * P2-B3 fix 1 (I1): el término de un par de emparejamiento es la opción del desplegable de Moodle,
+ * que pasa por format_string() → strip_tags (formatstringstriptags = 1): «<5 %» se comería texto.
+ * `<` o `>` en `term` → EXAM_BANK_MATCH. El frontend replica el literal.
+ */
+export const EXAM_MATCH_TERM_FORBIDDEN_RE = /[<>]/;
 
 // ─── 1. Plan de slots ──────────────────────────────────────────────────────
 
@@ -356,6 +369,7 @@ class Errs {
     }
     const n = len(v);
     if (n < min || n > max) this.push(path, 'EXAM_BANK_SCHEMA', `longitud ${n} fuera de ${min}–${max}`);
+    if (EXAM_BANK_CONTROL_RE.test(v)) this.push(path, 'EXAM_BANK_SCHEMA', 'caracteres de control no permitidos (solo \\t y \\n)');
     return v;
   }
   option(v: unknown, path: string): ExamOption | null {
@@ -646,6 +660,7 @@ export function validateExamBank(doc: unknown, ctx: ExamBankValidationContext): 
     if (new Set(defs).size !== defs.length) E.push(`$.questions[${i}].pairs`, 'EXAM_BANK_MATCH', `${id}: definiciones repetidas`);
     pairs.forEach((p: any, j: number) => {
       if (examTextContains(p.definition, p.term)) E.push(`$.questions[${i}].pairs[${j}]`, 'EXAM_BANK_MATCH', `${id}: la definición contiene su propio término`);
+      if (EXAM_MATCH_TERM_FORBIDDEN_RE.test(p.term)) E.push(`$.questions[${i}].pairs[${j}].term`, 'EXAM_BANK_MATCH', `${id}: el término no puede llevar < ni > (Moodle los borra en el desplegable)`);
     });
   }
 
