@@ -25,15 +25,17 @@
 
 const path = require('path');
 const F = require('./lib/v21-shell-fixtures');
+const EBF = require('./lib/exam-bank-fixtures');
 const { purifyMany, moodleFormat, MOODLE_CONFIG } = require('./lib/v21-moodle-purify');
 
-let S, vc, te, cp, P;
+let S, vc, te, cp, P, MC;
 try {
   P = require(path.resolve(process.cwd(), 'dist/package/presentation/index.js'));
   S = require(path.resolve(process.cwd(), 'dist/modules/course-shell/index.js'));
   vc = require(path.resolve(process.cwd(), 'dist/modules/visual-components/index.js'));
   te = require(path.resolve(process.cwd(), 'dist/modules/theme-engine/index.js'));
   cp = require(path.resolve(process.cwd(), 'dist/modules/course-profiles/course-profiles.js'));
+  MC = require(path.resolve(process.cwd(), 'dist/package/mbz-common.js'));
 } catch (err) {
   console.error('❌ No se pudo cargar dist/ (¿corriste "npm run build"?)');
   console.error(`   ${err.message}`);
@@ -128,6 +130,15 @@ for (const combo of F.THEME_COMBOS) {
         if (m.examEnabled) labels.push(S.examInfoLabel(m, facts, theme, o));
       });
       if (facts.finalExam.enabled) labels.push(S.finalExamInfoLabel(facts, theme, o));
+      // EV6 P2-B4: nota oculta para docentes y la página «Respuestas explicadas» (siempre CLEAN_SAFE:
+      // banco con todos los tipos + GIFT) por el MISMO purificador.
+      labels.push(S.examsTeacherLabel(facts, theme, o));
+      if (!level) {
+        const chs = course.manifest.modules.flatMap((m) => m.chapters.map((c) => ({ id: c.chapterId, moduleId: m.moduleId })));
+        const bank = EBF.makeExamBank({ scope: 'final', moduleId: null, chapters: chs, chapterIndex: new Map(chs.map((c, i) => [c.id, i])), prefix: 'PF', plan: S.expectedExamPlan('final', chs) });
+        labels.push(S.examExplanationsBankPage({ scope: { kind: 'final' }, bank, groups: facts.modules.map((m) => ({ ownerId: m.id, name: `Módulo ${m.number}: ${m.title}` })) }, theme));
+        labels.push(S.examExplanationsGiftPage({ scope: { kind: 'module', moduleNumber: 1, title: facts.modules[0].title }, questions: MC.parseGIFT(F.FINAL_GIFT) }, theme));
+      }
       labels.push(...moduleNextLabels(facts, theme, o));
       for (const { slots } of S.assembleAllChapters(facts, F.experiencesFor(course.manifest), theme, o)) {
         for (const s of slots) if (s.kind === 'label') labels.push(s);

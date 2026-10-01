@@ -101,7 +101,10 @@ import {
   certificateTeacherLabel,
   closingLabel,
   competenciesLabel,
+  examExplanationsBankPage,
+  examExplanationsGiftPage,
   examInfoLabel,
+  examsTeacherLabel,
   experienceMovementWords,
   finalExamInfoLabel,
   finalExamNextLabel,
@@ -174,8 +177,22 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * 3.5.0 (P3, sistema visual educativo 2.0): labels con rótulo/forma/color por rol pedagógico, apertura
  * «Capítulo N de T · ~X min» (minutos en facts desde las palabras medidas del experience), riel
  * «Dónde estás» del módulo y la actividad H5P/SCORM enmarcada con el tono del módulo.
+ * 3.6.0 (EV6 P2-B4): página «Respuestas explicadas» (mod_page) después de cada evaluación, visible
+ * solo al aprobar o agotar los intentos (availability e=1 | e=3, show:false, downloadcontent 0);
+ * la info del examen la anuncia; nota para docentes (acceso condicional, intentos adicionales) en el
+ * label oculto del certificado o en `cv3:shell:exams_teacher` al inicio de la primera evaluación.
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.5.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.6.0';
+
+/**
+ * EV6 P2-B4 (P2-design §1.3, ruling 1): la página se desbloquea si el quiz está completo (e=1, que
+ * también acepta COMPLETE_PASS) O completo-y-reprobado (e=3, intentos agotados). `show:false`: oculta
+ * hasta entonces. Con intentos ilimitados el quiz nunca se agota y solo `e=1` puede ocurrir (mismo JSON).
+ */
+export function examExplanationsAvailability(quizMid: number): string {
+  if (!Number.isInteger(quizMid) || quizMid < 1) throw new Error(`MBZ_V3_INVARIANT: moduleid de quiz inválido (${quizMid})`);
+  return `{"op":"|","show":false,"c":[{"type":"completion","cm":${quizMid},"e":1},{"type":"completion","cm":${quizMid},"e":3}]}`;
+}
 /** Versión del renderer de Visual Components que entra en la clave de reuse. */
 export const VC_RENDERER_VERSION = `vc${VC_SCHEMA_VERSION}-rt${VC_RUNTIME_VERSION}-theme${THEME_ENGINE_VERSION}-style${VC_RENDER_STYLE_VERSION}`;
 
@@ -848,7 +865,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     src: ExamSource,
     stampSeed: string,
     bankGroups: Array<{ ownerId: string; name: string }>,
-  ): void => {
+  ): ActivityRef => {
     const a = W.newActivity('quiz', secnum, name, idnumber);
     const k = resolved.kinds[kind];
     const q = buildQuizV3({
@@ -866,6 +883,57 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     questionCategories.push(q.questionCategoriesXml);
     gradedCommon(a, kind, name, [], q.categoryIds);
     resolveCta('next-exam', secnum, `$@QUIZVIEWBYID*${a.mid}@$`);
+    return a;
+  };
+
+  // EV6 P2-B4: «Respuestas explicadas» justo después del quiz (misma sección), gated por su completion.
+  const addExplanationsPage = (
+    quiz: ActivityRef,
+    idnumber: string,
+    scope: { kind: 'module'; moduleNumber: number; title: string } | { kind: 'final' },
+    src: ExamSource,
+    bankGroups: Array<{ ownerId: string; name: string }>,
+  ): ActivityRef => {
+    const page = src.kind === 'bank'
+      ? examExplanationsBankPage({ scope, bank: src.bank, groups: bankGroups }, theme)
+      : examExplanationsGiftPage({ scope, questions: parseGIFT(src.gift) }, theme);
+    const a = W.newActivity('page', quiz.secnum, page.name, idnumber);
+    W.put(`${a.dir}/page.xml`, `<?xml version="1.0" encoding="UTF-8"?>
+<activity id="${a.aid}" moduleid="${a.mid}" modulename="page" contextid="${a.ctx}">
+  <page id="${a.aid}">
+    <name>${xmlEsc(page.name)}</name>
+    <intro></intro>
+    <introformat>1</introformat>
+    <content>${xmlEsc(page.html)}</content>
+    <contentformat>1</contentformat>
+    <legacyfiles>0</legacyfiles>
+    <legacyfileslast>${NULL}</legacyfileslast>
+    <display>0</display>
+    <displayoptions>a:2:{s:10:"printintro";i:0;s:17:"printlastmodified";i:0;}</displayoptions>
+    <revision>1</revision>
+    <timemodified>${ts}</timemodified>
+  </page>
+</activity>`);
+    W.put(`${a.dir}/module.xml`, applyXmlFields(withIdnumber(moduleXml(a.mid, 'page', quiz.secnum, ts, MV.bv), idnumber), {
+      completion: '0',
+      availability: examExplanationsAvailability(quiz.mid),
+      downloadcontent: '0',
+    }));
+    W.put(`${a.dir}/inforef.xml`, inforef([]));
+    W.put(`${a.dir}/grades.xml`, gradesXml(a.aid));
+    W.boilerplate(a.dir);
+    return a;
+  };
+  // EV6 P2-B4 (ruling 3): con certificado la nota para docentes va en su label oculto del cierre; sin
+  // él, un label oculto propio al INICIO de la primera sección con una evaluación.
+  const willHaveCertificate = !!plan.keys.finalExam;
+  let examsTeacherPlaced = false;
+  const addExamsTeacherLabel = (secnum: number): void => {
+    if (willHaveCertificate || examsTeacherPlaced) return;
+    if ((W.sectionSeq.get(secnum) ?? []).length) throw new Error('MBZ_V3_INVARIANT: la nota para docentes de las evaluaciones debe ser lo primero de su sección');
+    const t = addLabel(secnum, 'cv3:shell:exams_teacher', examsTeacherLabel(facts, theme, opts));
+    W.put(`${t.dir}/module.xml`, applyXmlFields(withIdnumber(moduleXml(t.mid, 'label', secnum, ts, MV.bv), t.idnumber), { visible: '0', visibleold: '0' }));
+    examsTeacherPlaced = true;
   };
 
   // ── Sección 0 — shell ────────────────────────────────────────────────────
@@ -1029,16 +1097,20 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     if (!m.keys.exam) continue;
     const nextSec = m.examSectionNum as number;
     if (!Number.isInteger(nextSec)) throw new Error(`MBZ_V3_INVARIANT: módulo ${m.moduleId} con examen sin sección`);
+    addExamsTeacherLabel(nextSec);
     addLabel(nextSec, `cv3:exam_info:${m.moduleId}`, examInfoLabel(mf, facts, theme, opts));
-    addQuiz(
+    const examSrc = examSources.modules.get(m.moduleId) as ExamSource;
+    const examGroups = m.chapters.map((ch) => ({ ownerId: ch.chapterId, name: `Capítulo ${ch.chapterNumber}: ${ch.title}` }));
+    const quiz = addQuiz(
       nextSec,
       `cv3:exam:${m.moduleId}`,
       safeActivityName(`Evaluación del módulo ${m.moduleNumber}: ${m.title}`),
       'exam',
-      examSources.modules.get(m.moduleId) as ExamSource,
+      examSrc,
       m.keys.exam,
-      m.chapters.map((ch) => ({ ownerId: ch.chapterId, name: `Capítulo ${ch.chapterNumber}: ${ch.title}` })),
+      examGroups,
     );
+    addExplanationsPage(quiz, `cv3:exam_explanations:${m.moduleId}`, { kind: 'module', moduleNumber: m.moduleNumber, title: m.title }, examSrc, examGroups);
     // Edu EV3 / EV6: tras la evaluación → botón al primer capítulo del módulo siguiente, o a la
     // evaluación final / cierre.
     const nextPlan = plan.modules[plan.modules.indexOf(m) + 1];
@@ -1064,16 +1136,12 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   if (plan.keys.finalExam) {
     const fsec = plan.finalExamSectionNum;
     if (fsec === null || !(fsec < closing)) throw new Error('MBZ_V3_INVARIANT: la evaluación final debe ir antes del cierre');
+    addExamsTeacherLabel(fsec);
     addLabel(fsec, 'cv3:final_exam_info', finalExamInfoLabel(facts, theme, opts));
-    addQuiz(
-      fsec,
-      'cv3:final_exam',
-      'Evaluación final',
-      'finalExam',
-      examSources.final as ExamSource,
-      plan.keys.finalExam,
-      plan.modules.map((m) => ({ ownerId: m.moduleId, name: `Módulo ${m.moduleNumber}: ${m.title}` })),
-    );
+    const finalSrc = examSources.final as ExamSource;
+    const finalGroups = plan.modules.map((m) => ({ ownerId: m.moduleId, name: `Módulo ${m.moduleNumber}: ${m.title}` }));
+    const quiz = addQuiz(fsec, 'cv3:final_exam', 'Evaluación final', 'finalExam', finalSrc, plan.keys.finalExam, finalGroups);
+    addExplanationsPage(quiz, 'cv3:final_exam_explanations', { kind: 'final' }, finalSrc, finalGroups);
     addLabel(fsec, 'cv3:final_exam_next', finalExamNextLabel(closing, facts, theme, opts));
   }
   // EV6 (T3): criterios de completion del curso (la insignia-certificado se otorga al completarlo).
@@ -1098,6 +1166,8 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   // Cierre → Certificado»): insignia, panel y label para docentes SOLO si hay evaluación final.
   const hasCertificate = finalExamMid !== null && certificateReq.finalExam;
   const certificate = hasCertificate ? certificateReq : undefined;
+  if (hasCertificate !== willHaveCertificate) throw new Error('MBZ_V3_INVARIANT: certificado ≠ evaluación final (nota para docentes de las evaluaciones mal ubicada)');
+  if (!hasCertificate && (facts.counts.exams > 0) !== examsTeacherPlaced) throw new Error('MBZ_V3_INVARIANT: nota para docentes de las evaluaciones ausente o sobrante');
   if (!hasCertificate) warnings.push('certificate_omitted:no_final_exam');
   addLabel(closing, 'cv3:shell:closing', closingLabel(facts, courseIntro, theme, opts, certificate));
   // Fix 0b: Moodle restaura la insignia DESACTIVADA → label oculto (visible=0) para el docente con

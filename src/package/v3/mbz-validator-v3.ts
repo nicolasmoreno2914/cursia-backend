@@ -34,7 +34,7 @@ import type { AssessmentCategoryKey } from '../assessment/resolve-assessment';
 import type { AssessableType } from '../../modules/course-profiles/course-profiles';
 import { extractText, lintCleanSafe, lintResourceMentions, parseHtml } from '../../modules/visual-components';
 import type { HtmlNode } from '../../modules/visual-components';
-import { CERTIFICATE_TEACHER_TROUBLESHOOTING, CertificateRequirements, CourseFacts, chapterNextSteps, closingCertificateText, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles } from '../../modules/course-shell';
+import { CERTIFICATE_TEACHER_TROUBLESHOOTING, EXAMS_TEACHER_NOTE, EXAMS_TEACHER_NOTE_ATTEMPTS, EXAMS_TEACHER_NOTE_AVAILABILITY, CertificateRequirements, CourseFacts, chapterNextSteps, closingCertificateText, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles } from '../../modules/course-shell';
 import { safeActivityName } from '../mbz-common';
 import { courseBadgeDescription } from './course-badge';
 import { QUIZ_REVIEW_V3 } from './moodle-activities-v3';
@@ -325,12 +325,17 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     if (/^cv3:shell:(forum|welcome|audio_welcome|competencies|methodology|start)$/.test(idn)) return 0;
     if (/^cv3:shell:(route|libro|libro_card|audiobook|route_start)$/.test(idn)) return 1;
     if (idn === 'cv3:shell:closing' || idn === 'cv3:shell:certificate_teacher') return layout.closingSection;
-    if (/^cv3:final_exam(_info|_next)?$/.test(idn)) return layout.finalExamSection ?? undefined;
+    if (/^cv3:final_exam(_info|_next|_explanations)?$/.test(idn)) return layout.finalExamSection ?? undefined;
+    // EV6 P2-B4: nota para docentes (sin certificado) = primera sección con una evaluación.
+    if (idn === 'cv3:shell:exams_teacher') {
+      const secs = [...Object.values(layout.examSection), ...(layout.finalExamSection !== null ? [layout.finalExamSection] : [])].filter((x): x is number => Number.isInteger(x));
+      return secs.length ? Math.min(...secs) : undefined;
+    }
     let m = /^cv3:ch:([^:]+):/.exec(idn);
     if (m) return layout.chapterSection[m[1]];
     m = /^cv3:module_intro:(.+)$/.exec(idn);
     if (m) return layout.moduleFirstSection[m[1]];
-    m = /^cv3:(?:exam_info|exam):(.+)$/.exec(idn);
+    m = /^cv3:(?:exam_info|exam|exam_explanations):(.+)$/.exec(idn);
     if (m) return layout.examSection[m[1]];
     // Fix 1 (I1): module_next solo existe en la sección de evaluación (módulos con examen).
     m = /^cv3:module_next:(.+)$/.exec(idn);
@@ -484,10 +489,36 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   const backupCourseId = num(tag(mb, 'original_course_id'));
   const backupCourseCtx = num(tag(mb, 'original_course_contextid'));
   // Fix 0b: el ÚNICO módulo oculto del paquete es el label para docentes del certificado (si hay insignia).
+  // EV6 P2-B4: sin insignia, el único oculto posible es la nota para docentes de las evaluaciones.
   const checkHidden = (allowed: string | null): void => {
     for (const a of acts) {
       if (a.module.visible === '1') continue;
-      if (a.idnumber !== allowed) add('CERTIFICATE', a.idnumber, `módulo oculto inesperado (visible=${a.module.visible}): solo el label para docentes del certificado puede estarlo`);
+      if (a.idnumber !== allowed) add('CERTIFICATE', a.idnumber, `módulo oculto inesperado (visible=${a.module.visible}): solo el label para docentes del certificado (o, sin él, el de las evaluaciones) puede estarlo`);
+    }
+  };
+  // EV6 P2-B4 (rulings 2 + 3): nota para docentes de «Respuestas explicadas» — exactamente una vez, oculta:
+  // en el label del certificado si lo hay; si no, `cv3:shell:exams_teacher` primero de su sección.
+  const checkExamsTeacher = (withCertificate: boolean): void => {
+    const hasExams = gradedActs.some((g) => g.kind === 'exam' || g.kind === 'finalExam');
+    const own = acts.find((a) => a.idnumber === 'cv3:shell:exams_teacher');
+    const holders = acts.filter((a) => extractText(a.intro).includes(EXAMS_TEACHER_NOTE_AVAILABILITY));
+    if (!hasExams) {
+      if (own || holders.length) add('STRUCTURE', 'cv3:shell:exams_teacher', 'nota para docentes de las evaluaciones en un curso sin evaluaciones');
+      return;
+    }
+    const want = withCertificate ? 'cv3:shell:certificate_teacher' : 'cv3:shell:exams_teacher';
+    if (withCertificate && own) add('STRUCTURE', own.idnumber, 'con certificado la nota va en el label del certificado, no en un label propio');
+    if (holders.length !== 1 || holders[0].idnumber !== want) {
+      add('STRUCTURE', want, `la nota para docentes de las evaluaciones debe estar exactamente una vez, en ${want} (está en ${holders.map((h) => h.idnumber).join(', ') || 'ninguno'})`);
+      return;
+    }
+    const h = holders[0];
+    const t = extractText(h.intro);
+    if (h.modname !== 'label' || h.module.visible !== '0') add('STRUCTURE', h.idnumber, `la nota para docentes debe ir en un label oculto (visible=0), es ${h.modname} visible=${h.module.visible}`);
+    if (!t.includes(withCertificate ? EXAMS_TEACHER_NOTE : EXAMS_TEACHER_NOTE_ATTEMPTS)) add('STRUCTURE', h.idnumber, 'la nota para docentes no trae las dos oraciones (acceso condicional + intentos adicionales)');
+    if (!withCertificate) {
+      const first = acts.find((a) => a.sectionid === h.sectionid);
+      if (first !== h) add('STRUCTURE', h.idnumber, 'la nota para docentes debe ser lo primero de su sección');
     }
   };
   const checkCertificate = async (): Promise<void> => {
@@ -510,7 +541,8 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       if (files.some((f) => f.component === 'badges')) add('CERTIFICATE', 'files.xml', 'curso sin evaluación final con imagen de insignia');
       if (closing0 && /BADGESVIEWBYID|certificad/i.test(`${closing0.intro} ${extractText(closing0.intro)}`)) add('CERTIFICATE', 'cv3:shell:closing', 'curso sin evaluación final que promete un certificado');
       if (acts.some((a) => a.idnumber === 'cv3:shell:certificate_teacher')) add('CERTIFICATE', 'cv3:shell:certificate_teacher', 'label para docentes sin insignia en el paquete');
-      checkHidden(null);
+      checkHidden(gradedActs.some((g) => g.kind === 'exam') ? 'cv3:shell:exams_teacher' : null);
+      checkExamsTeacher(false);
       return;
     }
     const settingsXml = tag(mb, 'settings') ?? '';
@@ -598,6 +630,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       }
     }
     checkHidden('cv3:shell:certificate_teacher');
+    checkExamsTeacher(true);
   };
 
   // ── labels: CLEAN_SAFE, menciones, cifras, tokens ──

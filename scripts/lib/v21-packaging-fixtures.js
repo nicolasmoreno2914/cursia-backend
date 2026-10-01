@@ -156,7 +156,7 @@ function packagingInput(distRoot, o = {}) {
  * Secuencia esperada de idnumbers `cv3:…` por sección, derivada SOLO del Manifest + chapterSlotSequence (R11a).
  * EV6 (derivación independiente de section-layout.ts): 0 bienvenida, 1 ruta; por módulo una sección por
  * capítulo (la presentación del módulo arriba del primero) y, si tiene examen, «Módulo m · Evaluación»
- * (info + quiz + siguiente paso; sin examen NO hay label de siguiente paso: el botón del cierre de su
+ * (info + quiz + «Respuestas explicadas» (P2-B4) + siguiente paso; sin examen NO hay label de siguiente paso: el botón del cierre de su
  * último capítulo lo es — fix 1, I1); después la
  * evaluación final (si hay: info + quiz + botón al cierre) y, ÚLTIMA, el cierre del curso.
  */
@@ -167,6 +167,9 @@ function expectedSequence(distRoot, input) {
   seq.push([0, ['cv3:shell:forum', 'cv3:shell:welcome', 'cv3:shell:audio_welcome', 'cv3:shell:competencies', 'cv3:shell:methodology', 'cv3:shell:start']]);
   seq.push([1, ['cv3:shell:route', 'cv3:shell:libro', 'cv3:shell:libro_card', 'cv3:shell:audiobook', 'cv3:shell:route_start']]);
   let n = 2;
+  // EV6 P2-B4: sin certificado (= sin evaluación final) la nota oculta para docentes de «Respuestas
+  // explicadas» abre la PRIMERA sección de evaluación; cada quiz lleva su página justo después.
+  let teacherNote = !m.features.finalExam;
   for (const mod of m.modules) {
     mod.chapters.forEach((ch, i) => {
       const ids = i === 0 ? [`cv3:module_intro:${mod.moduleId}`] : [];
@@ -177,9 +180,14 @@ function expectedSequence(distRoot, input) {
       seq.push([n++, ids]);
     });
     // Edu EV3: la evaluación del módulo cierra con el botón al módulo siguiente (o a la evaluación final / cierre).
-    if (mod.examEnabled) seq.push([n++, [`cv3:exam_info:${mod.moduleId}`, `cv3:exam:${mod.moduleId}`, `cv3:module_next:${mod.moduleId}`]]);
+    if (mod.examEnabled) {
+      const ids = [`cv3:exam_info:${mod.moduleId}`, `cv3:exam:${mod.moduleId}`, `cv3:exam_explanations:${mod.moduleId}`, `cv3:module_next:${mod.moduleId}`];
+      if (teacherNote) ids.unshift('cv3:shell:exams_teacher');
+      teacherNote = false;
+      seq.push([n++, ids]);
+    }
   }
-  if (m.features.finalExam) seq.push([n++, ['cv3:final_exam_info', 'cv3:final_exam', 'cv3:final_exam_next']]);
+  if (m.features.finalExam) seq.push([n++, ['cv3:final_exam_info', 'cv3:final_exam', 'cv3:final_exam_explanations', 'cv3:final_exam_next']]);
   // EV6 T3 fix 0b: + label oculto para docentes (activar la insignia-certificado); fix round 1b:
   // el certificado existe SOLO con evaluación final.
   seq.push([n, m.features.finalExam ? ['cv3:shell:closing', 'cv3:shell:certificate_teacher'] : ['cv3:shell:closing']]);
