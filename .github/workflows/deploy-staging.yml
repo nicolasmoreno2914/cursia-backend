@@ -452,6 +452,10 @@ jobs:
                # staging. Revertir = cambiar este 3 por 2 (los runs existentes conservan
                # su rulesVersion congelado). El worker de proveedores se fija en [0c].
                ensure_env_exact DYNAMIC_MANIFEST_RULES_VERSION 3
+               # EV6 H5P v2 (decisión 5 aprobada por Nicolás, 2026-09-30; validación 2026-10-01): reglas de
+               # actividad 2 en staging (objetivo «decidir» → Branching Scenario, IV avanzado, «Repaso» en
+               # cursos nuevos). Revertir = 0 (los runs existentes conservan su marcador congelado).
+               ensure_env_exact DYNAMIC_ACTIVITY_TYPE_RULES 2
                if grep -q "^DYNAMIC_COHERENCE_LLM=" .env; then
                  echo "⚠️  DYNAMIC_COHERENCE_LLM está en el .env de staging — no se toca (la decisión de pre-aceptación es dejarlo OFF)"
                else
