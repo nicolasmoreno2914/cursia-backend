@@ -499,6 +499,16 @@ async function upgradeChecks() {
     assert(s.sourceIdsHash !== preSummary.sourceIdsHash, 'clave distinta del paquete de vista previa');
     const acts = await mbzActs(h.state.uploads[0].buffer);
     for (const c of videoChapters(h.manifest)) assert(acts.some((a) => a.idnumber === `cv3:ch:${c}:video` && a.modname === 'h5pactivity'), `video real ${c}`);
+    // EV6 T3 × B2: el certificado (insignia + panel del cierre) cuenta los videos SOLO cuando son reales:
+    // el paquete de vista previa no los nombra; el repaquete tras el upgrade sí.
+    const certOf = async (buf) => {
+      const z = await JSZip.loadAsync(buf);
+      const bx = await z.file('badges.xml').async('string');
+      const closing = VC.extractText((await mbzActs(buf)).find((a) => a.idnumber === 'cv3:shell:closing').intro);
+      return [/videos interactivos/.test(bx), /videos interactivos/.test(closing)];
+    };
+    eq(await certOf(pre.state.uploads[0].buffer), [false, false], 'vista previa: el certificado no exige videos');
+    eq(await certOf(h.state.uploads[0].buffer), [true, true], 'tras el upgrade: el certificado exige los videos reales');
   });
   await check('B2 §2.6: run FAILED solo por un video del upgrade → se empaqueta igual con ese capítulo pendiente; el otro video (real) entra', async () => {
     const probe = workerHarness();
