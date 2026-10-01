@@ -14,6 +14,16 @@
 // Crea un usuario y datos de completion en ESE curso de prueba; no cambia configuración del sitio.
 //
 // Uso: php -c php.ini v21-certificate-award.php <input.json> <output.json>   (input: { moodleRoot, courseid })
+//
+// P2-B1 (EV6 Fase 2 — exámenes) rebase sobre T3: el quiz de la evaluación final ahora lleva
+// completionattemptsexhausted = (attempts > 0), así que su completion YA NO es pura nota (reprobar
+// con intentos restantes = INCOMPLETE, no COMPLETE_FAIL — ver P2-design.md §1). Reprobar/aprobar un
+// quiz con grade_update() directo (como hacía esta prueba antes de B1) ya no reproduce
+// COMPLETE_FAIL: no hay ningún intento REAL agotado. Para el último criterio, cuando es un quiz, se
+// toman intentos REALES (como simulate-b1.php) en vez de escribir la nota a mano.
+namespace PHPUnit\Framework { if (!class_exists('PHPUnit\Framework\TestCase', false)) { abstract class TestCase { public function __construct($name = null) {} } } }
+namespace PHPUnit\Framework\Constraint { if (!class_exists('PHPUnit\Framework\Constraint\Constraint', false)) { abstract class Constraint {} } }
+namespace {
 define('CLI_SCRIPT', 1);
 $in = json_decode(file_get_contents($argv[1]), true);
 require($in['moodleRoot'] . '/config.php');
@@ -23,6 +33,10 @@ require_once($CFG->libdir . '/enrollib.php');
 require_once($CFG->libdir . '/gradelib.php');
 require_once($CFG->dirroot . '/user/lib.php');
 require_once($CFG->dirroot . '/completion/completion_completion.php');
+require_once($CFG->libdir . '/testing/generator/lib.php');
+require_once($CFG->dirroot . '/mod/quiz/locallib.php');
+
+use mod_quiz\quiz_attempt;
 
 global $DB, $CFG;
 \core\session\manager::set_user(get_admin());
@@ -113,10 +127,54 @@ $last = end($crit);
 $out['lastIdnumber'] = $last ? $last->idnumber : null;
 
 $completion = new completion_info($course);
+// P2-B1: un quiz con completionattemptsexhausted = 1 (attempts > 0) ya NO completa solo con la nota
+// — reprobar con intentos restantes queda INCOMPLETE (ver P2-design.md §1). Para reproducir
+// COMPLETE_FAIL de verdad hace falta agotar intentos REALES (como simulate-b1.php), no escribir la
+// nota a mano. $gen se crea perezosamente: solo si hay algún quiz entre los criterios.
+$gen = null;
+$doQuizAttempt = function ($cm, $correct) use (&$gen, $userid): int {
+    global $DB;
+    if ($gen === null) $gen = new \testing_data_generator();
+    $admin = get_admin();
+    \core\session\manager::set_user($DB->get_record('user', ['id' => $userid]));
+    $quizgen = $gen->get_plugin_generator('mod_quiz');
+    $attempt = $quizgen->create_attempt($cm->instance, $userid);
+    $ao = quiz_attempt::create($attempt->id);
+    $post = [];
+    foreach ($ao->get_slots() as $slot) {
+        $qa = $ao->get_question_attempt($slot);
+        $q = $qa->get_question();
+        $right = $q->get_correct_response();
+        if ($q->get_type_name() === 'multichoice') {
+            $val = $correct ? $right['answer'] : (($right['answer'] + 1) % count($q->get_order($qa)));
+        } else { // truefalse
+            $val = $correct ? $right['answer'] : 1 - $right['answer'];
+        }
+        $post[$qa->get_control_field_name('sequencecheck')] = (string)$qa->get_sequence_check_count();
+        $post[$qa->get_qt_field_name('answer')] = (string)$val;
+    }
+    $ao->process_submitted_actions(time(), false, $post);
+    $ao->process_finish(time(), false);
+    \core\session\manager::set_user($admin);
+    return (int)$attempt->id;
+};
 // Ítem calificable: nota REAL en su grade_item (la completion por nota aprobatoria la calcula Moodle);
-// ítem por vista (Libro Guía de un curso sin nota): completion marcada.
-$mark = function ($cm, bool $pass) use ($completion, $userid, $courseid): array {
-    if ((int)$cm->completionpassgrade === 1) {
+// ítem por vista (Libro Guía de un curso sin nota): completion marcada. Un quiz toma intentos REALES
+// (fallidos hasta agotar `attempts`, o uno correcto para aprobar) en vez de escribir la nota a mano,
+// para que `completionattemptsexhausted` participe de verdad en la completion (P2-B1).
+$mark = function ($cm, bool $pass) use ($completion, $userid, $courseid, $doQuizAttempt): array {
+    global $DB;
+    if ($cm->modname === 'quiz') {
+        $attempts = (int)$DB->get_field('quiz', 'attempts', ['id' => $cm->instance]);
+        if ($pass) {
+            $doQuizAttempt($cm, true);
+        } else {
+            // Agota TODOS los intentos permitidos (o uno solo si son ilimitados — nunca se agota).
+            foreach (range(1, max(1, $attempts)) as $_) { $doQuizAttempt($cm, false); }
+        }
+        $raw = null;
+        $completion->update_state($cm, COMPLETION_UNKNOWN, $userid);
+    } else if ((int)$cm->completionpassgrade === 1) {
         $gi = grade_item::fetch(['courseid' => $courseid, 'itemtype' => 'mod', 'itemmodule' => $cm->modname, 'iteminstance' => $cm->instance, 'itemnumber' => 0]);
         $raw = $pass ? min(100, (float)$gi->gradepass + 20) : max(0, (float)$gi->gradepass - 30);
         grade_update('mod/' . $cm->modname, $courseid, 'mod', $cm->modname, $cm->instance, 0, ['userid' => $userid, 'rawgrade' => $raw]);
@@ -158,3 +216,4 @@ if ($issued) {
 }
 $out['after'] = $after;
 file_put_contents($argv[2], json_encode($out, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+}

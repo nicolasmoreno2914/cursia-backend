@@ -381,13 +381,16 @@ check('courseCompletionXml: sin criterios → course_completion vacío; entradas
 });
 
 // ── quiz / scorm / h5pactivity ────────────────────────────────────────────
-const SAMPLE_QUIZ = '<?xml version="1.0" encoding="UTF-8"?>\n<activity><quiz id="1"><preferredbehaviour>deferredfeedback</preferredbehaviour><attempts_number>0</attempts_number><attemptonlast>0</attemptonlast><grademethod>1</grademethod><sumgrades>100.00000</sumgrades><grade>100.00000</grade><feedbacks><feedback id="1"><maxgrade>101.00000</maxgrade></feedback></feedbacks></quiz></activity>';
-check('quizAttemptsXmlFields: attempts_number, grademethod (constantes de mod/quiz), sumgrades/grade 100', () => {
-  eq(A.quizAttemptsXmlFields({ attempts: 3, grademethod: 'highest' }), { preferredbehaviour: 'deferredfeedback', attempts_number: '3', grademethod: '1', sumgrades: '100.00000', grade: '100.00000' });
+const SAMPLE_QUIZ = '<?xml version="1.0" encoding="UTF-8"?>\n<activity><quiz id="1"><preferredbehaviour>deferredfeedback</preferredbehaviour><attempts_number>0</attempts_number><attemptonlast>0</attemptonlast><grademethod>1</grademethod><sumgrades>100.00000</sumgrades><grade>100.00000</grade><completionattemptsexhausted>0</completionattemptsexhausted><feedbacks><feedback id="1"><maxgrade>101.00000</maxgrade></feedback></feedbacks></quiz></activity>';
+// P2-B1 (EV6 Fase 2 — exámenes): completionattemptsexhausted vive aquí, junto a attempts_number, para
+// que los dos nunca puedan quedar en desacuerdo (1 si hay tope de intentos, 0 con intentos ilimitados).
+check('quizAttemptsXmlFields: attempts_number, grademethod (constantes de mod/quiz), sumgrades/grade 100, completionattemptsexhausted = (attempts > 0)', () => {
+  eq(A.quizAttemptsXmlFields({ attempts: 3, grademethod: 'highest' }), { preferredbehaviour: 'deferredfeedback', attempts_number: '3', grademethod: '1', sumgrades: '100.00000', grade: '100.00000', completionattemptsexhausted: '1' });
+  eq(A.quizAttemptsXmlFields({ attempts: 0, grademethod: 'highest' }).completionattemptsexhausted, '0', 'intentos ilimitados nunca se agotan');
   eq(['highest', 'average', 'first', 'last'].map((m) => A.quizAttemptsXmlFields({ attempts: 0, grademethod: m }).grademethod), ['1', '2', '3', '4']);
   const x = A.applyXmlFields(SAMPLE_QUIZ, A.quizAttemptsXmlFields({ attempts: 2, grademethod: 'average' }));
   assertXml(x);
-  eq([val(x, 'attempts_number'), val(x, 'grademethod'), val(x, 'maxgrade')], ['2', '2', '101.00000']);
+  eq([val(x, 'attempts_number'), val(x, 'grademethod'), val(x, 'maxgrade'), val(x, 'completionattemptsexhausted')], ['2', '2', '101.00000', '1']);
   throws(() => A.quizAttemptsXmlFields({ attempts: -1, grademethod: 'highest' }), /attempts/);
   throws(() => A.quizAttemptsXmlFields({ attempts: 1, grademethod: 'best' }), /grademethod/);
 });

@@ -228,14 +228,20 @@ async function pureChecks() {
   // setting badges, contexto del curso 2, panel «Tu certificado» y label oculto para docentes (con
   // evaluación final). Los dorados se re-tomaron de 094b7d3 = T3 SIN T5 (antes del rebase sobre
   // #53); el build de T3+T5 sin pendientes da los MISMOS bytes, o sea T5 sigue sin tocar el .mbz
-  // cuando no hay videos pendientes. Dorados anteriores (4f60353, builder 3.1.0, pre-T3):
+  // cuando no hay videos pendientes.
+  // P2-B1 (EV6 Fase 2 — exámenes, rebase sobre T3, builder 3.2.0 → 3.3.0) cambió el .mbz OTRA VEZ a
+  // propósito: política de revisión del quiz (reviewattempt/…) y completionattemptsexhausted en TODO
+  // quiz v3. Dorados anteriores (094b7d3, T3 sin T5, builder 3.2.0):
+  // 644 8dff6102b2185377bc220284af9464afe769e07fdbaec890bdb43363431195bc,
+  // 645 8ac9bc6537e2ef1ffad7a5339e0d8cccca66d96d59d2bfd885f28ca73d65b7a4.
+  // Dorados antes de eso (4f60353, builder 3.1.0, pre-T3):
   // 644 6dd79270155faaa6c83db25be0df26c3bf659e11b93e5a4ae8fa615badecb232,
   // 645 6b35ed0bf50e3d2496081dde232851ce2db87c2725a1245ea4952dd581ddd745.
   const GOLDEN_PRE_T5 = {
-    644: ['8dff6102b2185377bc220284af9464afe769e07fdbaec890bdb43363431195bc', { engine: 'h5p', finalExam: true, courseId: 644 }],
-    645: ['8ac9bc6537e2ef1ffad7a5339e0d8cccca66d96d59d2bfd885f28ca73d65b7a4', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
+    644: ['8dd9815429b31929ad0bae4bb2d21d6730622e76a21bec96633a838b62ab7f0d', { engine: 'h5p', finalExam: true, courseId: 644 }],
+    645: ['15bcd96c3dc9ce69811320f5eb2ac7f533eff9c740b0932b019d841a3bf9a532', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
   };
-  await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al de antes de T5 (sha256 dorado de 094b7d3 = T3 sin T5, builder 3.2.0), con y sin el campo', async () => {
+  await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B1+T3 (certificado + política de revisión del quiz, builder 3.3.0), con y sin el campo', async () => {
     for (const [id, [want, o]] of Object.entries(GOLDEN_PRE_T5)) {
       const i1 = PF.packagingInput(distRoot, o);
       const i2 = PF.packagingInput(distRoot, o);

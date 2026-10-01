@@ -161,7 +161,7 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * trae el panel «Tu certificado» con el enlace $@BADGESVIEWBYID*1@$; fix 0b: label oculto
  * (visible=0) para docentes en el cierre con el paso «Habilitar acceso» de la insignia.
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.2.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.3.0';
 /** Versión del renderer de Visual Components que entra en la clave de reuse. */
 export const VC_RENDERER_VERSION = `vc${VC_SCHEMA_VERSION}-rt${VC_RUNTIME_VERSION}-theme${THEME_ENGINE_VERSION}`;
 
