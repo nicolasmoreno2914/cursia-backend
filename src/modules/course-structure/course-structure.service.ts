@@ -73,7 +73,7 @@ function cleanDescription(v: string | undefined | null): string | null {
   const t = String(v ?? '').replace(/\s+/g, ' ').trim();
   return t ? t : null;
 }
-import { blueprintSchemaVersionForRules, readConfiguredRulesVersion } from '../generation-manifests/manifest-rules-config';
+import { blueprintSchemaVersionForRules, readActivityTypeRulesConfig, readConfiguredRulesVersion } from '../generation-manifests/manifest-rules-config';
 
 @Injectable()
 export class CourseStructureService implements OnModuleInit {
@@ -182,7 +182,7 @@ export class CourseStructureService implements OnModuleInit {
   async getStructure(courseId: number, ownerId: string) {
     // V2.1 fix round 1 (I5): sin la migración R3 → 503 schema_not_migrated_v21 (nunca un 500 crudo).
     await assertV21StructureSchema(this.dataSource);
-    return this.readStructure(this.dataSource, courseId, ownerId);
+    return this.readStructure(this.dataSource, courseId, ownerId, { reviewCardsAvailability: true });
   }
 
   /**
@@ -194,6 +194,9 @@ export class CourseStructureService implements OnModuleInit {
     exec: { query(sql: string, params?: any[]): Promise<any> },
     courseId: number,
     ownerId: string,
+    // EV6 H5P v2 (H2 fix round 2): solo el GET calcula `reviewCardsAvailable` (fuera de toda
+    // transacción de mutación: su consulta opcional nunca aborta ni suma idas y vueltas a una mutación).
+    opts: { reviewCardsAvailability?: boolean } = {},
   ) {
     // Task 4 (rendimiento del editor): ownership + curso + toggles V2.1 + counter + Blueprint
     // vigente + módulos/capítulos en UNA sola sentencia. Antes eran ~9 idas y vueltas a la base
@@ -206,6 +209,7 @@ export class CourseStructureService implements OnModuleInit {
       `select c.id, c.title, c.structure_version, c.structure_version_counter,
               c.final_exam_enabled, c.activity_engine,
               (to_jsonb(c) ->> 'review_cards_enabled')::boolean as review_cards_enabled,
+              (to_jsonb(c) ? 'review_cards_enabled') as review_cards_migrated,
               b.id as bp_id, b.blueprint_number as bp_number, b.locked_at as bp_locked_at,
               b.snapshot_sha256 as bp_sha256, b.schema_version as bp_schema_version,
               coalesce((
@@ -289,6 +293,11 @@ export class CourseStructureService implements OnModuleInit {
       finalExam: settings.finalExam,
       activityEngine: settings.activityEngine,
       reviewCardsEnabled: settings.reviewCardsEnabled,
+      // EV6 H5P v2 (H2 fix round 2): el editor muestra el ajuste «Repaso» solo si tendrá efecto:
+      // columna migrada, motor h5p y la generación del curso usa las reglas 2.
+      reviewCardsAvailable: opts.reviewCardsAvailability
+        ? await this.reviewCardsAvailable(exec, courseId, row.review_cards_migrated === true, settings.activityEngine)
+        : false,
       modules: modules.map((m) => ({
         id: m.id,
         position: m.position,
@@ -309,6 +318,44 @@ export class CourseStructureService implements OnModuleInit {
       currentBlueprint,
       liveMatchesCurrentBlueprint,
     };
+  }
+
+  /**
+   * EV6 H5P v2 (H2 fix round 2): ¿el ajuste «Repaso» tendrá efecto en este curso? Columna migrada,
+   * motor h5p y reglas de tipo 2 para su próxima generación (el marcador del Manifest v3 más reciente
+   * del curso — se hereda — o, sin Manifest v3, DYNAMIC_ACTIVITY_TYPE_RULES). Sin columna o con
+   * SCORM responde false SIN consultar la base (el GET de siempre no suma idas y vueltas).
+   */
+  private async reviewCardsAvailable(
+    exec: { query(sql: string, params?: any[]): Promise<any> },
+    courseId: number,
+    migrated: boolean,
+    engine: 'h5p' | 'scorm',
+  ): Promise<boolean> {
+    if (!migrated || engine !== 'h5p') return false;
+    const fromConfig = (): boolean => {
+      try {
+        return readActivityTypeRulesConfig() === 2;
+      } catch {
+        return false;
+      }
+    };
+    let rows: any[];
+    try {
+      rows = await exec.query(
+        `select manifest_json->'features'->'activityTypeRules' as activity_type_rules
+           from public.course_generation_manifests
+          where course_id = $1 and rules_version = 3
+          order by created_at desc, id desc
+          limit 1`,
+        [courseId],
+      );
+    } catch {
+      return fromConfig(); // base sin la tabla de Manifests: decide la config, como un curso sin Manifests
+    }
+    const r = Array.isArray(rows) ? rows[0] : (rows as any)?.rows?.[0];
+    if (!r) return fromConfig();
+    return r.activity_type_rules === 2;
   }
 
   /**
@@ -434,7 +481,8 @@ export class CourseStructureService implements OnModuleInit {
             set ${sets.join(', ')}, structure_version_counter = structure_version_counter + 1
           where id = $${i}
           returning structure_version_counter, final_exam_enabled, activity_engine,
-                    (to_jsonb(courses) ->> 'review_cards_enabled')::boolean as review_cards_enabled`,
+                    (to_jsonb(courses) ->> 'review_cards_enabled')::boolean as review_cards_enabled,
+                    (to_jsonb(courses) ? 'review_cards_enabled') as review_cards_migrated`,
         params,
       ));
       const row = rows[0];
@@ -446,10 +494,12 @@ export class CourseStructureService implements OnModuleInit {
             `activity_engine=${JSON.stringify(row.activity_engine)})`,
         );
       }
-      const settings: { finalExam: boolean; activityEngine: 'h5p' | 'scorm'; reviewCardsEnabled: boolean } = {
+      // H2 fix round 2: misma forma de respuesta que antes de EV6; `reviewCardsEnabled` solo con la
+      // columna migrada (se sabe en la MISMA sentencia: sin idas y vueltas extra).
+      const settings: { finalExam: boolean; activityEngine: 'h5p' | 'scorm'; reviewCardsEnabled?: boolean } = {
         finalExam: row.final_exam_enabled,
         activityEngine: row.activity_engine,
-        reviewCardsEnabled: row.review_cards_enabled === true,
+        ...(row.review_cards_migrated === true ? { reviewCardsEnabled: row.review_cards_enabled === true } : {}),
       };
       await queryRunner.commitTransaction();
       return { structureVersionCounter: newCounter, ...settings };
