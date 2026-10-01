@@ -674,16 +674,49 @@ async function dbChecks() {
       const st = await structure.getStructure(cid, OWNER);
       eq(st.liveMatchesCurrentBlueprint, false, 'toggle de curso sí cambia la estructura vs. el Blueprint v2');
     });
-    await check('DB EV6 H5P v2: «Repaso» — PATCH sin migración → 503; migración idempotente: cursos existentes NULL (apagado, snapshot sin cambios), cursos nuevos true; PATCH + lock v2 con reviewCards', async () => {
+    await check('DB EV6 H5P v2: «Repaso» — PATCH sin migración → 503; migración real idempotente + verificador (default FALSE); existentes NULL; curso nuevo: false sin H5P v2, true SOLO con DYNAMIC_ACTIVITY_TYPE_RULES=2; PATCH + lock v2', async () => {
       process.env.DYNAMIC_MANIFEST_RULES_VERSION = '3';
       try {
         await rejectsRe(structure.updateSettings(cid, OWNER, { reviewCardsEnabled: true, expectedCounter: await counter() }), /schema_not_migrated_ev6_h5p2/, 'sin migración', 503);
-        const sql = fs.readFileSync(path.join(REPO, 'supabase-migration-ev6-h5p2.sql'), 'utf8');
-        await withClient(DB, async (c) => { await c.query(sql); await c.query(sql); });
+        const MIGRATE_EV6 = path.join(REPO, 'scripts/migrate-ev6-h5p2.js');
+        const VERIFY_EV6 = path.join(REPO, 'scripts/verify-ev6-h5p2-schema.js');
+        const v0 = runScript(VERIFY_EV6, localEnv({ MIGRATION_ENV: 'staging' }));
+        assert(v0.code !== 0 && /no existe/.test(v0.out), `verify sin migrar: exit ${v0.code}\n${v0.out}`);
+        for (let i = 0; i < 2; i++) {
+          const m = runScript(MIGRATE_EV6, localEnv({ MIGRATION_ENV: 'staging' }));
+          assert(m.code === 0, `migración EV6 corrida ${i + 1}: exit ${m.code}\n${m.out}`);
+        }
+        const v1 = runScript(VERIFY_EV6, localEnv({ MIGRATION_ENV: 'staging' }));
+        assert(v1.code === 0 && /boolean, nullable, default false/.test(v1.out), `verify: exit ${v1.code}\n${v1.out}`);
         const [{ review_cards_enabled: existing }] = await ds.query(`select review_cards_enabled from public.courses where id = $1`, [cid]);
         eq(existing, null, 'curso existente → NULL');
         const [nc] = await ds.query(`insert into public.courses (owner_id, title, structure_version) values ($1, 'Curso EV6 nuevo', 'dynamic') returning id, review_cards_enabled`, [OWNER]);
-        eq(nc.review_cards_enabled, true, 'curso nuevo → true (default solo para filas nuevas)');
+        eq(nc.review_cards_enabled, false, 'fila nueva sin código → false (default de la DDL)');
+        // Fix round 1 (I-2): CoursesService enciende «Repaso» en un curso NUEVO solo con H5P v2.
+        const { CoursesService } = loadDist('modules/courses/courses.service.js');
+        const repo = {
+          create: (x) => ({ ...x }),
+          save: async (c) => ({ ...c, id: (await ds.query(`insert into public.courses (owner_id, title, structure_version) values ($1, $2, $3) returning id`, [c.ownerId, c.title, c.structureVersion || 'legacy']))[0].id }),
+          query: (sql, params) => ds.query(sql, params),
+        };
+        const courses = new CoursesService(repo, {});
+        const reviewOf = async (id) => (await ds.query(`select review_cards_enabled from public.courses where id = $1`, [id]))[0].review_cards_enabled;
+        const savedRules = process.env.DYNAMIC_ACTIVITY_TYPE_RULES;
+        try {
+          for (const [env, want] of [[undefined, false], ['0', false], ['1', false], ['basura', false], ['2', true]]) {
+            if (env === undefined) delete process.env.DYNAMIC_ACTIVITY_TYPE_RULES;
+            else process.env.DYNAMIC_ACTIVITY_TYPE_RULES = env;
+            const c = await courses.create({ title: `EV6 ${env}`, structureVersion: 'dynamic' }, OWNER, 'o@x');
+            eq(await reviewOf(c.id), want, `curso nuevo con DYNAMIC_ACTIVITY_TYPE_RULES=${env}`);
+          }
+          process.env.DYNAMIC_ACTIVITY_TYPE_RULES = '2';
+          const leg = await courses.create({ title: 'legacy' }, OWNER, 'o@x');
+          eq(await reviewOf(leg.id), false, 'curso legacy nunca');
+          eq(await reviewOf(cid), null, 'el curso existente no cambia');
+        } finally {
+          if (savedRules === undefined) delete process.env.DYNAMIC_ACTIVITY_TYPE_RULES;
+          else process.env.DYNAMIC_ACTIVITY_TYPE_RULES = savedRules;
+        }
         const st0 = await structure.getStructure(cid, OWNER);
         eq(st0.reviewCardsEnabled, false, 'GET: NULL = apagado');
         const re = await blueprints.lock(cid, OWNER, await counter());

@@ -314,6 +314,126 @@ const SRC = (bp) => ({ courseId: 777, blueprintId: 1, blueprintNumber: 1, bluepr
     assert(!r1.summary.restore, 'rules 1: sin nota de restauración');
   });
 
+  await check('fix round 1 (I-2/M-4): «Repaso» SOLO con H5P v2 y motor h5p — reviewCards con rules 0/1 o motor SCORM ⇒ sin Dialog Cards, sin nota de restauración; facts lo rechaza', async () => {
+    for (const cfg of [{ ...V2CFG, activityTypeRules: 1 }, { ...V2CFG, activityTypeRules: 0 }, { ...V2CFG, engine: 'scorm' }]) {
+      const inp = PF.packagingInput(distRoot, cfg);
+      eq(inp.blueprint.course.reviewCards, true, 'el Blueprint lo pide');
+      eq(B.reviewCardsApply(inp.blueprint, inp.manifest), false, `apagado (${cfg.engine}, rules ${cfg.activityTypeRules})`);
+      const r = await B.buildDynamicMbzV3(inp);
+      assert(!r.summary.h5pPackages.some((p) => p.mainLibrary === 'H5P.Dialogcards'), `sin Dialog Cards (${cfg.engine}, rules ${cfg.activityTypeRules})`);
+      assert(!r.expectations.facts.counts.reviewCards, 'facts sin «Repaso»');
+      if (cfg.engine === 'h5p' && cfg.activityTypeRules !== 2) assert(!r.summary.restore, 'sin nota de restauración');
+      const v = await V.validateMbzV3(r.mbz, r.expectations);
+      assert(v.ok, JSON.stringify(v.issues.slice(0, 3)));
+    }
+    eq(B.reviewCardsApply(input2.blueprint, input2.manifest), true, 'v2 + h5p + ajuste ⇒ encendido');
+    const inp1 = PF.packagingInput(distRoot, { ...V2CFG, activityTypeRules: 1 });
+    const f = built2.expectations.facts;
+    throws(() => SHELL.buildCourseFacts({
+      manifest: inp1.manifest, blueprint: inp1.blueprint, assessment: inp1.assessmentProfile,
+      reviewCardsChapterIds: [f.chapters[0].id],
+      artifacts: {
+        audioWelcomeSeconds: 10, audiobookParts: f.chapters.map((c) => ({ chapterId: c.id, seconds: 10 })),
+        slideCountByChapter: Object.fromEntries(f.chapters.map((c) => [c.id, 8])), examQuestionCountByModule: Object.fromEntries(f.modules.filter((m) => m.examEnabled).map((m) => [m.id, 8])),
+        finalExamQuestionCount: 12, libroWordCount: 1000,
+      },
+    }), /solo con H5P v2 \(activityTypeRules=2\) y motor h5p/, 'facts con rules 1');
+  });
+  await check('fix round 1 (M-5/M-6): un capítulo con < 4 tarjetas no lleva «Repaso»; facts, secuencia y validador coherentes; el label de autoevaluación no repite «Repaso»', async () => {
+    const VCF = require('./lib/v21-vc-fixtures');
+    const inp = PF.packagingInput(distRoot, V2CFG);
+    const chs = inp.manifest.modules.flatMap((m) => m.chapters);
+    const few = VCF.buildExperience();
+    few.chapterId = chs[1].chapterId;
+    few.movements.deepening = few.movements.deepening.filter((c) => c.type !== 'concept_cards');
+    eq(h.dialogCardsFromExperience(few).length, 2, 'fixture: 2 tarjetas');
+    inp.contents.experiences.set(chs[1].chapterId, few);
+    const r = await B.buildDynamicMbzV3(inp);
+    const reviewKeys = r.summary.h5pPackages.filter((p) => p.itemKey.startsWith('review_cards:')).map((p) => p.itemKey.slice('review_cards:'.length));
+    eq(reviewKeys.sort(), chs.filter((c, i) => i !== 1).map((c) => c.chapterId).sort(), '«Repaso» en todos menos el de 2 tarjetas');
+    eq(r.expectations.facts.counts.reviewCards, chs.length - 1, 'facts');
+    assert(!r.expectations.facts.chapters.find((c) => c.id === chs[1].chapterId).reviewCards, 'facts: el capítulo sin mazo');
+    const v = await V.validateMbzV3(r.mbz, r.expectations);
+    assert(v.ok, JSON.stringify(v.issues.slice(0, 3)));
+    const z = await JSZip.loadAsync(r.mbz);
+    const mbx = await z.file('moodle_backup.xml').async('string');
+    const bySec = [];
+    for (const m of mbx.matchAll(/<activity>[\s\S]*?<directory>([^<]+)<\/directory>[\s\S]*?<\/activity>/g)) {
+      const mod = await z.file(`${m[1]}/module.xml`).async('string');
+      (bySec[Number(/<sectionnumber>(\d+)<\/sectionnumber>/.exec(mod)[1])] = bySec[Number(/<sectionnumber>(\d+)<\/sectionnumber>/.exec(mod)[1])] || []).push(/<idnumber>([^<]*)<\/idnumber>/.exec(mod)[1]);
+    }
+    eq(bySec.map((x, i) => [i, x]).filter((x) => x[1]), PF.expectedSequence(distRoot, inp), 'secuencia');
+    // M-6: capítulo sin actividad y con «Repaso»: el label del self_check se llama «Comprueba lo aprendido».
+    const noAct = chs.find((c, i) => i !== 1 && !c.activityEnabled);
+    const dir = [...mbx.matchAll(/<activity>[\s\S]*?<title>([^<]*)<\/title>[\s\S]*?<directory>([^<]+)<\/directory>[\s\S]*?<\/activity>/g)];
+    const labels = [];
+    for (const d of dir) {
+      const mod = await z.file(`${d[2]}/module.xml`).async('string');
+      if (/<idnumber>([^<]*)<\/idnumber>/.exec(mod)[1] === `cv3:ch:${noAct.chapterId}:self_check`) labels.push(d[1]);
+    }
+    eq(labels, [`Capítulo ${noAct.chapterNumber} · Comprueba lo aprendido`], 'nombre del label con «Repaso»');
+  });
+
+  await check('fix round 1 (M-1): scheduler — prevalidateV3 y claim con un Manifest rules 2 (BS) e ivAdvanced (video_interactions v2)', async () => {
+    const { SchedulerService } = L('modules/dynamic-generation/scheduler.service.js');
+    const VF = require('./lib/v21-video-fixture');
+    const SFX = require('./lib/v21-shell-fixtures');
+    const OWNER = '11111111-2222-4333-8444-555555555555';
+    const runId = '33333333-3333-4333-8333-333333333333';
+    const chId = uuid(100);
+    const bsItem = { key: `activity:${chId}`, type: 'activity', variant: 'h5p', chapterId: chId, h5pType: 'branchingscenario' };
+    const viItem = { key: `video_interactions:${chId}`, type: 'video_interactions', chapterId: chId, chapterNumber: 1 };
+    const DUR = 468;
+    const videoRow = { video_item_run_id: 'vrun', output_summary: { youtubeVideoId: 'IdwOipZAeqY', durationSec: DUR }, metadata: {} };
+    const mkSvc = (mItem, features, payload, type) => {
+      const svc = Object.create(SchedulerService.prototype);
+      svc.dataSource = {
+        async query(sql) {
+          if (/from public\.generation_item_runs d\b/.test(sql)) return [videoRow];
+          if (/from public\.generation_item_runs g\b/.test(sql)) {
+            return [{ id: runId, job_id: 'j', manifest_id: 1, item_key: mItem.key, type, status: 'running', worker_id: 'ex', chapter_id: chId,
+              module_id: 'm', owner_id: OWNER, job_course_id: 1, frontend_course_id: 'fc', rules_version: 3,
+              manifest_json: { rulesVersion: 3, features: { finalExam: false, activityEngine: 'h5p', ...features }, items: [mItem] } }];
+          }
+          if (/from public\.artifacts/.test(sql)) return [{ id: 'a1', type: type === 'activity' ? 'dynamic_h5p_params_json' : 'dynamic_video_interactions_json', storage_bucket: 'b', storage_path: 'p' }];
+          throw new Error(`query inesperada ${sql.slice(0, 60)}`);
+        },
+      };
+      svc.v3Reader = { readText: async () => JSON.stringify(payload) };
+      return svc;
+    };
+    const bsPayload = SFX.h5pPayload('branchingscenario');
+    const ok = await mkSvc(bsItem, { activityTypeRules: 2, ivAdvanced: 1 }, bsPayload, 'activity').prevalidateV3(runId, 'ex', ['a1'], OWNER, null);
+    eq([ok.kind, ok.summary.activityType], ['valid', 'branchingscenario'], 'BS aceptado con marcador 2');
+    let err = null;
+    try {
+      await mkSvc(bsItem, { activityTypeRules: 1 }, bsPayload, 'activity').prevalidateV3(runId, 'ex', ['a1'], OWNER, null);
+    } catch (e) {
+      err = e;
+    }
+    assert(err && /ACTIVITY_TYPE_INVALID_MANIFEST/.test(err.message), `marcador 1: ${err && err.message}`);
+    const plan = h.planInteractionCheckpoints(DUR);
+    const docV2 = VF.makeInteractionsDoc(plan, { videoItemKey: `video:${chId}`, durationSec: DUR });
+    docV2.schemaVersion = 2;
+    docV2.reflections = h.planReflectionPauses(DUR, plan).reflections.map((r) => ({ index: r.index, prompt: '¿Cómo lo aplicarías?' }));
+    const v2ok = await mkSvc(viItem, { activityTypeRules: 2, ivAdvanced: 1 }, docV2, 'video_interactions').prevalidateV3(runId, 'ex', ['a1'], OWNER, null);
+    assert(v2ok.kind === 'valid', JSON.stringify(v2ok)); eq(v2ok.summary.reflectionCount, 2, 'video_interactions v2 con ivAdvanced');
+    const v2bad = await mkSvc(viItem, {}, docV2, 'video_interactions').prevalidateV3(runId, 'ex', ['a1'], OWNER, null);
+    eq(v2bad.kind, 'invalid', 'v2 sin ivAdvanced se rechaza');
+    const v1 = VF.makeInteractionsDoc(plan, { videoItemKey: `video:${chId}`, durationSec: DUR });
+    eq((await mkSvc(viItem, {}, v1, 'video_interactions').prevalidateV3(runId, 'ex', ['a1'], OWNER, null)).summary, { interactionCount: plan.length }, 'v1 legacy igual que siempre');
+    // Claim
+    const svc = Object.create(SchedulerService.prototype);
+    const manifest2 = { rulesVersion: 3, features: { activityTypeRules: 2, ivAdvanced: 1 }, modules: [], items: [] };
+    eq(await svc.buildClaimV3({}, { type: 'activity', chapter_id: chId }, bsItem, manifest2), { validatedArtifactType: 'dynamic_h5p_params_json', activityType: 'branchingscenario', activityTypeSource: 'manifest' }, 'claim BS');
+    const writes = [];
+    const qr = { async query(sql, params) { if (/update public\.generation_item_runs/.test(sql)) { writes.push(params); return []; } return [videoRow]; } };
+    const claim = await svc.buildClaimV3(qr, { type: 'video_interactions', chapter_id: chId, id: 'run1', job_id: 'j', manifest_id: 1 }, viItem, manifest2);
+    eq([claim.videoInteractionsSchemaVersion, claim.video.reflectionPlan.reflections.length], [2, 2], 'claim v2 con plan de pausas');
+    const claim1 = await svc.buildClaimV3(qr, { type: 'video_interactions', chapter_id: chId, id: 'run1', job_id: 'j', manifest_id: 1 }, viItem, { rulesVersion: 3, features: {}, modules: [], items: [] });
+    assert(!('videoInteractionsSchemaVersion' in claim1) && !('reflectionPlan' in claim1.video), 'claim legacy sin campos v2');
+  });
+
   // ══ 5. Validador: negativos del add-on ═════════════════════════════════════
   await check('mbz-validator-v3: «Repaso» con ítem de nota, sin facts o «calificable» ⇒ ADDON; criterio de curso ⇒ COURSE_COMPLETION', async () => {
     const reviews = acts.filter((x) => /:review_cards$/.test(x.idnumber));
@@ -386,16 +506,26 @@ const SRC = (bp) => ({ courseId: 777, blueprintId: 1, blueprintNumber: 1, bluepr
     const plan = planOf(a, ma, b, mbm);
     assert(plan.actions.every((x) => x.action === 'REUSE'), plan.actions.filter((x) => x.action !== 'REUSE').map((x) => `${x.itemKey}=${x.action}`).join(', '));
   });
-  await check('invalidación: un objetivo que pasa a decide (rules 2) ⇒ la actividad se regenera por activity_type_changed; lo demás REUSE', () => {
-    const a = bpWith([{ id: uuid(100), objective: 'Identificar partes' }, { id: uuid(101), objective: 'Clasificar tipos' }]);
-    // Se edita solo el objetivo del capítulo 2 (pasa a «decidir»).
-    const b2 = bpWith([{ id: uuid(100), objective: 'Identificar partes' }, { id: uuid(101), objective: 'Decidir qué clasificar' }]);
+  await check('invalidación (fix round 1, M-2): el tope de BS sube 1 → 2 al agregar un capítulo ⇒ SOLO la actividad que pasa a BS se regenera (activity_type_changed); el resto REUSE', () => {
+    const objs7 = Array.from({ length: 7 }, (_, i) => ({ id: uuid(200 + i), objective: `Decidir el caso ${i + 1}` }));
+    const a = bpWith(objs7);
+    const b = bpWith([...objs7, { id: uuid(299), objective: 'Identificar partes' }]);
     const ma = MB.buildGenerationManifestV3(a, SRC(a), { activityTypeRules: 2 });
-    const mb2 = MB.buildGenerationManifestV3(b2, { ...SRC(b2), blueprintId: 2, blueprintNumber: 2 }, { activityTypeRules: 2 });
-    eq(mb2.items.find((i) => i.chapterId === uuid(101) && i.type === 'activity').h5pType, 'branchingscenario', 'tipo nuevo');
-    const plan = planOf(a, ma, b2, mb2);
-    const act = plan.actions.find((x) => x.itemKey === `activity:${uuid(101)}`);
-    assert(act && act.action === 'REGENERATE', `activity: ${act && act.action} ${act && act.reasons}`);
+    const mb2 = MB.buildGenerationManifestV3(b, { ...SRC(b), blueprintId: 2, blueprintNumber: 2 }, { activityTypeRules: 2 });
+    const bsOf = (m) => m.items.filter((i) => i.h5pType === 'branchingscenario').map((i) => i.chapterId).sort();
+    eq([bsOf(ma).length, bsOf(mb2).length], [1, 2], 'tope 1 → 2');
+    const flipped = bsOf(mb2).filter((id) => !bsOf(ma).includes(id));
+    eq(flipped.length, 1, 'un capítulo pasa de questionset a BS');
+    const plan = planOf(a, ma, b, mb2);
+    const byKey = Object.fromEntries(plan.actions.map((x) => [x.itemKey, x]));
+    const act = byKey[`activity:${flipped[0]}`];
+    eq([act.action, act.reasons], ['REGENERATE', ['activity_type_changed']], 'la actividad que cambia de tipo');
+    for (const o of objs7.filter((o) => o.id !== flipped[0])) eq(byKey[`activity:${o.id}`].action, 'REUSE', `activity:${o.id}`);
+    for (const x of plan.actions) {
+      if (x.itemKey === `activity:${flipped[0]}` || x.itemKey.endsWith(uuid(299))) continue;
+      if (/^(module_intro|final_exam|exam|course_intro|course_plan|audio_welcome):/.test(x.itemKey)) continue;
+      eq(x.action, 'REUSE', `${x.itemKey} (capítulo existente)`);
+    }
   });
 
   // ══ 7. Golden legacy ═══════════════════════════════════════════════════════
