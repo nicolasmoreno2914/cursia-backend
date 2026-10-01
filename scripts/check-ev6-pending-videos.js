@@ -242,8 +242,8 @@ async function pureChecks() {
   // (builder 3.3.0): 644 8dd9815429b31929ad0bae4bb2d21d6730622e76a21bec96633a838b62ab7f0d,
   // 645 15bcd96c3dc9ce69811320f5eb2ac7f533eff9c740b0932b019d841a3bf9a532.
   const GOLDEN_PRE_T5 = {
-    644: ['e577ac100a1c2f1d01e185b88179d19ed0ec262625fe96c486fc10cdb10bf412', { engine: 'h5p', finalExam: true, courseId: 644 }],
-    645: ['1a0b24c44cba34ad2b0b707c590286ea711182315426b549af56ef0093b8a5e7', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
+    644: ['307e7379c439585e7de00162c0a6cc9635cbec9ff2f86a87f72789114b49a055', { engine: 'h5p', finalExam: true, courseId: 644 }],
+    645: ['fd222f855029d9bf0af9cce7e91e7a177f17679839a9cb0a5644cb11df5a42f1', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
   };
   await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B1+T3 (certificado + política de revisión del quiz, builder 3.3.0), con y sin el campo', async () => {
     for (const [id, [want, o]] of Object.entries(GOLDEN_PRE_T5)) {

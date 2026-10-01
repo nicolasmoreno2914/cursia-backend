@@ -20,7 +20,36 @@ export const ACTIVITY_INTRO_COPY = Object.freeze({
   body: 'Responde dentro de este recuadro. Al terminar, tu resultado queda registrado como la nota de esta actividad.',
   openLink: 'Abrir la actividad práctica',
   scormBody: 'Abre la actividad para practicar lo aprendido en este capítulo. Tu resultado queda registrado como la nota de esta actividad.',
+  /** P3: cabecera del marco (texto, sin cifras salvo el número de capítulo de facts). */
+  frameHeading: 'Responde aquí: tu resultado queda como la nota de la práctica del capítulo',
+  frameScormHeading: 'Actividad calificada del capítulo',
+  frameFallbackLead: '¿No se ve la actividad? ',
+  frameFallbackLink: 'Ábrela en su propia página →',
 });
+
+/**
+ * P3 — marco de la actividad con el tono del módulo del capítulo (moduleTone): la actividad H5P (cuya
+ * interfaz no se puede estilar) se lee como «una ventana del curso». ink ≥ 4.5 sobre soft y surface.
+ */
+export interface ActivityFrameTone {
+  ink: string;
+  soft: string;
+  edge: string;
+  chapterNumber: number;
+}
+
+function checkFrame(t: VideoIntroTheme, f: ActivityFrameTone): void {
+  for (const [k, v] of Object.entries({ ink: f.ink, soft: f.soft, edge: f.edge })) if (!/^#[0-9A-F]{6}$/.test(v)) throw new Error(`ACTIVITY_INTRO_INVALID: frame.${k} ${v}`);
+  if (!Number.isInteger(f.chapterNumber) || f.chapterNumber < 1) throw new Error(`ACTIVITY_INTRO_INVALID: frame.chapterNumber ${f.chapterNumber}`);
+  if (contrastRatio(f.ink, f.soft) < 4.5 || contrastRatio(f.ink, t.surface) < 4.5 || contrastRatio(t.textPrimary, f.soft) < 4.5) throw new Error('ACTIVITY_INTRO_THEME: el marco no alcanza 4.5:1');
+}
+
+function frameHead(t: VideoIntroTheme, f: ActivityFrameTone, text: string): string {
+  return (
+    `<div class="cvc-act-h" style="background-color:${f.soft};color:${t.textPrimary};margin:0;padding:12px 18px;border-bottom:1px solid ${f.edge};">` +
+    `<p class="cvc-meta" style="margin:0;color:${f.ink};font-size:16px;font-weight:700;line-height:1.4;"><span class="nolink">✎  ${esc(text)} ${f.chapterNumber}</span></p></div>`
+  );
+}
 
 const PACKAGE_FILENAME_RE = /^[a-z0-9][a-z0-9._-]{0,120}\.h5p$/;
 
@@ -51,8 +80,9 @@ export function activityPackageFilename(itemKey: string): string {
   return name;
 }
 
-export function h5pActivityInlineIntroHtml(input: { packageFilename: string; title: string; activityMid: number; theme: VideoIntroTheme }): string {
+export function h5pActivityInlineIntroHtml(input: { packageFilename: string; title: string; activityMid: number; theme: VideoIntroTheme; frame?: ActivityFrameTone }): string {
   const { packageFilename, title, activityMid, theme: t } = input;
+  if (input.frame) return framedH5pIntro({ ...input, frame: input.frame });
   if (!PACKAGE_FILENAME_RE.test(packageFilename)) throw new Error(`ACTIVITY_INTRO_INVALID: packageFilename ${packageFilename}`);
   if (typeof title !== 'string' || !title.trim()) throw new Error('ACTIVITY_INTRO_INVALID: title vacío');
   if (!Number.isInteger(activityMid) || activityMid < 1) throw new Error(`ACTIVITY_INTRO_INVALID: activityMid ${activityMid}`);
@@ -73,9 +103,40 @@ export function h5pActivityInlineIntroHtml(input: { packageFilename: string; tit
   ].join('\n');
 }
 
-export function scormIntroHtml(theme: VideoIntroTheme): string {
+export function scormIntroHtml(theme: VideoIntroTheme, frame?: ActivityFrameTone): string {
+  if (frame) {
+    checkFrame(theme, frame);
+    return (
+      `<div class="cvc-act" style="background-color:${theme.surface};color:${theme.textPrimary};border:1px solid ${frame.edge};margin:0;padding:0;font-size:16px;line-height:1.5;">` +
+      frameHead(theme, frame, ACTIVITY_INTRO_COPY.frameScormHeading) +
+      `<p style="margin:0;padding:12px 18px 14px 18px;color:${theme.textPrimary};"><span class="nolink">${esc(ACTIVITY_INTRO_COPY.scormBody)}</span></p></div>`
+    );
+  }
   return (
     `<div style="background-color:${theme.surface};color:${theme.textPrimary};border-top:1px solid ${theme.border};padding:16px 20px 14px 20px;margin:0;font-size:16px;line-height:1.5;">` +
     `<p style="margin:0;color:${theme.textPrimary};">${esc(ACTIVITY_INTRO_COPY.scormBody)}</p></div>`
   );
+}
+
+/**
+ * P3 — H5P enmarcado: cabecera del módulo, el iframe (mismo cargador diferido R8) y al pie el acceso
+ * alternativo. Clases cursia-iv / -inline / -open / -fallback intactas (script y QA del navegador).
+ */
+function framedH5pIntro(input: { packageFilename: string; title: string; activityMid: number; theme: VideoIntroTheme; frame: ActivityFrameTone }): string {
+  const { packageFilename, title, activityMid, theme: t, frame: f } = input;
+  checkFrame(t, f);
+  const C = ACTIVITY_INTRO_COPY;
+  const src = `${H5P_EMBED_FROM_PLUGINFILE}?url=@@PLUGINFILE@@/${packageFilename}&amp;component=mod_h5pactivity`;
+  return [
+    `<div class="cursia-iv cvc-act" style="max-width:960px;margin:0 0 16px 0;padding:0;background-color:${t.surface};color:${t.textPrimary};border:1px solid ${f.edge};border-radius:14px;overflow:hidden;">`,
+    frameHead(t, f, C.frameHeading),
+    `<div class="cursia-iv-inline" style="display:none;margin:0;padding:14px;">`,
+    `<iframe title="${esc(title.trim())}" data-cursia-src="${src}" loading="lazy" width="100%" height="560" style="width:100%;border:0;" allowfullscreen="allowfullscreen"></iframe>`,
+    `</div>`,
+    `<div class="cursia-iv-fallback" style="background-color:${t.surface};color:${t.textPrimary};margin:0;padding:12px 18px 14px 18px;font-size:16px;line-height:1.5;border-top:1px solid ${f.edge};">`,
+    `<p class="cursia-iv-open" style="margin:0;color:${t.textSecondary};"><span class="nolink">${esc(C.frameFallbackLead)}</span><a href="$@H5PACTIVITYVIEWBYID*${activityMid}@$" style="color:${f.ink};font-weight:bold;"><span class="nolink">${esc(C.frameFallbackLink)}</span></a></p>`,
+    `</div>`,
+    `<script>${CURSIA_IV_INLINE_SCRIPT}</script>`,
+    `</div>`,
+  ].join('\n');
 }

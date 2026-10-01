@@ -390,8 +390,9 @@ async function pureChecks() {
         const mod = facts.modules.find((m) => m.id === ch.moduleId);
         const last = mod.chapterNumbers[mod.chapterNumbers.length - 1] === ch.number;
         const html = slots.find((s) => s.role === 'opening').html;
-        const route = vc.extractText(html.slice(html.indexOf('cvc-route')));
-        assert(route.includes('En este capítulo') && route.includes('Presentación') && route.includes('Síntesis'), `cap ${chapterNumber}: ${route}`);
+        // P3: el recorrido es una lista de pasos con ícono («Tu recorrido en este capítulo»); el <style> también nombra .cvc-route-steps.
+        const route = vc.extractText(html.slice(html.indexOf('<div class="cvc-route"')));
+        assert(route.includes('Tu recorrido en este capítulo') && route.includes('Presentación') && route.includes('Síntesis'), `cap ${chapterNumber}: ${route}`);
         eq(route.includes('Video interactivo'), ch.videoEnabled, `cap ${chapterNumber} video`);
         eq(route.includes('Práctica calificada'), ch.activityEnabled, `cap ${chapterNumber} práctica`);
         eq(route.includes('Repaso'), !ch.activityEnabled, `cap ${chapterNumber} repaso`);
@@ -419,9 +420,10 @@ async function pureChecks() {
             assert(/repasa/.test(trans) && /repasa lo aprendido/.test(selfLead), `cap ${chapterNumber}: el puente no dice "repasa"`);
           } else {
             const instr = vc.extractText(slots.find((s) => s.role === 'activity_instruction').html);
-            assert(/actividad práctica que sigue es calificada/.test(instr) && instr.includes('70 de 100') && /todas las veces que quieras/.test(instr), `instrucción: ${instr}`);
-            assert(/Pon a prueba lo aprendido (Responderás|Arrastrarás|Completarás|Resolverás) /.test(instr), `cap ${chapterNumber}: la instrucción no dice qué hará el estudiante: ${instr}`);
-            assert(instr.includes(`Iniciar actividad del capítulo ${chapterNumber} →`) && slots.find((s) => s.role === 'activity_instruction').html.includes('href="cursia-cta://next-activity"'), `cap ${chapterNumber}: botón «Iniciar actividad»`);
+            // P3: tarjeta «Práctica calificada · Capítulo N» con la fila de datos (de facts) y la tarea; el botón no repite el capítulo.
+            assert(instr.startsWith(`Práctica calificada · Capítulo ${chapterNumber} Pon a prueba lo aprendido`) && instr.includes('Nota mínima: 70 de 100') && instr.includes('Intentos: sin límite'), `instrucción: ${instr}`);
+            assert(/Intentos: sin límite (Responderás|Arrastrarás|Completarás|Resolverás) /.test(instr), `cap ${chapterNumber}: la instrucción no dice qué hará el estudiante: ${instr}`);
+            assert(instr.endsWith('Iniciar actividad →') && slots.find((s) => s.role === 'activity_instruction').html.includes('href="cursia-cta://next-activity"'), `cap ${chapterNumber}: botón «Iniciar actividad»`);
           }
         }
       }
@@ -460,6 +462,40 @@ async function pureChecks() {
     assert(all2.filter((l) => /cursia-cta:\/\/next-exam/.test(l.html)).length === f2.modules.filter((m) => m.examEnabled).length + (f2.finalExam.enabled ? 1 : 0), 'un botón por evaluación');
     throwsRe(() => S.examInfoLabel(f2.modules[1], f2, THEME), /no tiene examen/, 'examen inexistente');
     throwsRe(() => S.finalExamInfoLabel(f4, THEME), /no tiene examen final/, 'final inexistente');
+  });
+
+  await check('P3: apertura «Módulo M · Capítulo N de T · ~X min» (X de facts, palabras medidas), riel «Dónde estás» del módulo y CTA en el color del módulo', () => {
+    // experienceWordCount: solo texto que lee el estudiante (sin type/kind/variant/chapterId).
+    eq(S.experienceWordCount({ type: 'hero', title: 'Uno dos', lead: 'tres', chapterId: 'cap-x', items: ['cuatro cinco', 7] }), 5, 'experienceWordCount');
+    eq([S.estimateChapterMinutes({ words: 1800, slideCount: 10, videoEnabled: true, activityEnabled: true }), S.estimateChapterMinutes({ words: 10, slideCount: 0, videoEnabled: false, activityEnabled: false })], [30, 5], 'estimateChapterMinutes');
+    const words = {};
+    const exps = F.experiencesFor(c2.manifest);
+    for (const id of Object.keys(exps)) words[id] = S.experienceWordCount(exps[id]);
+    const fw = factsOf(c2, { artifacts: { ...F.measuredArtifacts(c2.manifest), experienceWordsByChapter: words } });
+    assert(fw.chapters.every((c) => Number.isInteger(c.estimatedMinutes) && c.estimatedMinutes >= 5 && c.estimatedMinutes % 5 === 0), 'minutos en facts');
+    assert(S.factsNumberSet(fw).has(fw.chapters[0].estimatedMinutes), 'los minutos son números de facts');
+    eq(f2.chapters.some((c) => c.estimatedMinutes !== undefined), false, 'sin palabras medidas no hay minutos');
+    let threw = false;
+    try { factsOf(c2, { artifacts: { ...F.measuredArtifacts(c2.manifest), experienceWordsByChapter: { ...words, intruso: 3 } } }); } catch (e) { threw = /no está en el Manifest/.test(e.message); }
+    assert(threw, 'palabras de un capítulo desconocido → falla');
+    for (const theme of [THEMES[0], THEMES[6]].map((x) => x.theme)) {
+      for (const level of [undefined, 'enhanced']) {
+        const all = S.assembleAllChapters(fw, exps, theme, level ? { level } : undefined);
+        for (const { chapterNumber, slots } of all) {
+          const ch = fw.chapters[chapterNumber - 1];
+          const mod = fw.modules.find((m) => m.id === ch.moduleId);
+          const open = vc.extractText(slots.find((s) => s.role === 'opening').html);
+          assert(open.includes(`Módulo ${mod.number} · Capítulo ${chapterNumber} de ${fw.counts.chapters}`) && open.includes(`~${ch.estimatedMinutes} min`), `cap ${chapterNumber}: progreso: ${open.slice(0, 120)}`);
+          const closing = slots.find((s) => s.role === 'closing').html;
+          const rail = vc.extractText(closing.slice(closing.indexOf('<div class="cvc-modrail"')));
+          assert(rail.startsWith(`Dónde estás · Módulo ${mod.number}: ${mod.title}`) && rail.includes(`${ch.title} · estás aquí`), `cap ${chapterNumber}: riel: ${rail.slice(0, 160)}`);
+          for (const n of mod.chapterNumbers) assert(rail.includes(fw.chapters[n - 1].title), `cap ${chapterNumber}: el riel lista el capítulo ${n}`);
+          eq(rail.includes(`Evaluación del módulo ${mod.number}`), mod.examEnabled, `cap ${chapterNumber}: evaluación en el riel`);
+          const mt = vc.moduleTone(theme, te.moduleColor(theme, mod.number - 1), theme.personality.plate ? theme.color.bg : theme.color.surface);
+          assert(closing.includes(`class="cvc-btn-wrap" style="background-color:${mt.fill}`), `cap ${chapterNumber}: botón del cierre en el color del módulo`);
+        }
+      }
+    }
   });
 
   await check('lint de números: todo número del shell y de las transiciones ∈ factsNumberSet (2 y 4 módulos, con horas)', () => {

@@ -23,6 +23,6 @@ export function ctaSection(sectionNum: number): string {
 export const CTA_RE = /cursia-cta:\/\/(next-activity|next-exam|badges|section\/(\d+))/g;
 
 /** Botón de acción (bloque con fondo de acento; píldora en ENHANCED), separado del texto de arriba. */
-export function ctaButton(h: Hx, href: string, text: string, s: Surf): string {
-  return link(h, href, text, s, { button: true, margin: '20px 0 0 0' });
+export function ctaButton(h: Hx, href: string, text: string, s: Surf, fill?: { bg: string; fg: string }): string {
+  return link(h, href, text, s, { button: true, margin: '20px 0 0 0', fill });
 }

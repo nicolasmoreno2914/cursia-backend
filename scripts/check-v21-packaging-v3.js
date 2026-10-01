@@ -44,6 +44,8 @@ const G = loadDist('modules/dynamic-packaging/packaging-guards.js');
 const MEDIA = loadDist('package/v3/synthetic-media.js');
 const PNG = loadDist('package/v3/png-downscale.js');
 const PRES = loadDist('package/presentation/index.js');
+const TE = loadDist('modules/theme-engine/index.js');
+const VC = loadDist('modules/visual-components/index.js');
 const AUDIO = loadDist('package/audio/index.js');
 const SHELL = loadDist('modules/course-shell/index.js');
 const PROF = loadDist('modules/course-profiles/course-profiles.js');
@@ -529,7 +531,17 @@ const MATRIX = [
     // EV4b: el recorrido «En este capítulo» no puede prometer un video que el capítulo no tiene.
     ['TRANSITION_DISABLED_RESOURCE', () => {
       const a = bacts.find((x) => x.idnumber === `cv3:ch:${noVideoCh.chapterId}:opening`);
-      return { [`${a.dir}/label.xml`]: (x) => x.replace('En este capítulo', 'En este capítulo con video') };
+      // P3: el recorrido se titula «Tu recorrido en este capítulo».
+      return { [`${a.dir}/label.xml`]: (x) => x.replace('Tu recorrido en este capítulo', 'Tu recorrido en este capítulo con video') };
+    }],
+    // P3: el riel «Dónde estás» del cierre no nombra recursos que no sean capítulos o la evaluación del módulo.
+    ['TRANSITION_DISABLED_RESOURCE', () => {
+      const a = bacts.find((x) => x.idnumber === `cv3:ch:${noVideoCh.chapterId}:closing`);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace('Dónde estás · ', 'Dónde estás (con video) · ') };
+    }],
+    ['NUMBER_NOT_FROM_FACTS', () => {
+      const a = bacts.find((x) => x.idnumber === `cv3:ch:${noVideoCh.chapterId}:opening`);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace(/ min&lt;\/span&gt;/, ' min · 917 minutos más&lt;/span&gt;') };
     }],
     // Edu EV3: botones de navegación mal resueltos o con cifras inventadas.
     ['TOKEN_INVALID', () => {
@@ -617,6 +629,24 @@ const MATRIX = [
       assert(!v.ok && v.issues.some((i) => i.code === code), `esperaba ${code}, hallazgos: ${JSON.stringify(v.issues.slice(0, 4))}`);
     });
   }
+  // ── P3: la actividad del capítulo va enmarcada con el tono de su módulo ─────
+  await check('P3: intro de la actividad (H5P y SCORM) enmarcada con el tono del módulo; clases del cargador y del QA intactas', async () => {
+    for (const cfg of MATRIX) {
+      const { r } = built[cfg.id];
+      const z = await JSZip.loadAsync(r.mbz);
+      const { acts } = await actDirs(r.mbz);
+      const theme = TE.resolveTheme(cfg.theme);
+      const ground = theme.personality.plate ? theme.color.bg : theme.color.surface;
+      for (const ch of r.expectations.facts.chapters.filter((c) => c.activityEnabled)) {
+        const a = acts.find((x) => x.idnumber === `cv3:ch:${ch.id}:activity`);
+        const xml = await z.file(`${a.dir}/${a.modname}.xml`).async('string');
+        const intro = /<intro>([\s\S]*?)<\/intro>/.exec(xml)[1].replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+        const mt = VC.moduleTone(theme, TE.moduleColor(theme, ch.moduleNumber - 1), ground);
+        assert(intro.includes('class="cvc-act-h"') && intro.includes(`background-color:${mt.soft}`) && intro.includes(`color:${mt.ink}`) && intro.includes(` ${ch.number}</span>`), `${cfg.id} cap ${ch.number}: marco del módulo`);
+        if (a.modname === 'h5pactivity') assert(['cursia-iv', 'cursia-iv-inline', 'cursia-iv-fallback', 'cursia-iv-open'].every((c) => intro.includes(`class="${c}`)) && intro.includes('data-cursia-src='), `${cfg.id} cap ${ch.number}: clases del cargador`);
+      }
+    }
+  });
   // ── EV6 T3: certificado nativo (insignia de curso) ─────────────────────────
   await check('EV6 T3: insignia-certificado en toda la matriz (badges.xml, setting badges=1, imagen f1/f2/f3, examen final como criterio, panel del cierre)', async () => {
     for (const cfg of MATRIX) {

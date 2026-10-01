@@ -50,6 +50,11 @@ const ACTIVITY_TASK_ES: Readonly<Record<H5pActivityType | 'scorm', string>> = Ob
   scorm: 'Resolverás un reto interactivo por etapas con lo que aprendiste en el capítulo.',
 });
 
+/** P3 — solo la tarea («Arrastrarás cada término…»): la nota mínima y los intentos van en la fila de datos. */
+export function activityTask(activityType?: string | null): string {
+  return (activityType ? ACTIVITY_TASK_ES[activityType as H5pActivityType | 'scorm'] : undefined) ?? 'Aplicarás lo aprendido en el capítulo en una actividad calificada.';
+}
+
 export function activityInstruction(passingGrade: number, attempts: number, activityType?: string | null): string {
   const task = activityType ? ACTIVITY_TASK_ES[activityType as H5pActivityType | 'scorm'] : undefined;
   return `${task ? `${task} ` : ''}La actividad práctica que sigue es calificada. ${passingText(passingGrade)} ${attemptsText(attempts)}`;

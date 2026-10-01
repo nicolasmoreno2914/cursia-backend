@@ -15,7 +15,7 @@ import { contrastRatio, ResolvedTheme } from '../theme-engine';
 import { HtmlNode, parseHtml } from '../visual-components/lint-output';
 import { HYPHEN_HEADING, inlineHtml, labelHtml, richParagraphs } from '../visual-components/text';
 import { groundColor, labelRootStyle } from '../visual-components/render';
-import { plateJoinStyle } from '../visual-components/runtime';
+import { eduStyle, plateJoinStyle } from '../visual-components/runtime';
 
 export type ShellLevel = 'enhanced';
 
@@ -95,6 +95,7 @@ function shellStyle(uid: string, t: ResolvedTheme): string {
     `${S} .cvc-facts strong,${S} .cvc-facts span{display:block}`,
     `@container (min-width:560px){${S} .cvc-facts{grid-template-columns:repeat(auto-fit,minmax(6.5rem,1fr))}${S} .cvc-facts>li{padding:0 16px!important;border-left:1px solid ${t.color.border}}${S} .cvc-facts>li:first-child{padding-left:0!important;border-left:0}}`,
     `@container (min-width:600px){${S} .cvc-cols2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:40px}}`,
+    ...eduStyle(S, t.color),
   ].join('\n');
 }
 
@@ -305,12 +306,13 @@ export function ul(h: Hx, itemsHtml: string[], s: Surf, opts: { ordered?: boolea
 }
 
 /** Enlace con color de acento legible sobre `s.bg`. `button`: píldora con fondo de acento (CTA). */
-export function link(h: Hx, href: string, text: string, s: Surf, opts: { button?: boolean; margin?: string } = {}): string {
+export function link(h: Hx, href: string, text: string, s: Surf, opts: { button?: boolean; margin?: string; fill?: { bg: string; fg: string } } = {}): string {
   const c = h.t.color;
   if (opts.button) {
     // CLEAN_SAFE: un BLOQUE con fondo de acento (el <a> en línea partía el fondo al envolver a
     // 390 px). ENHANCED: el bloque se vuelve píldora (inline-block, radio 999).
-    const b = surfOn(h.t, c.accent, [c.textOnAccent]);
+    // P3: el botón toma el color del módulo cuando el shell lo pasa (fill).
+    const b = opts.fill ? surfOn(h.t, opts.fill.bg, [opts.fill.fg]) : surfOn(h.t, c.accent, [c.textOnAccent]);
     return (
       `<div class="cvc-btn-wrap"${st(h, [['background-color', b.bg], ['color', b.fg], ['padding', '12px 20px'], ['margin', opts.margin ?? '0'], ['text-align', 'center']], [['display', 'table'], ['border-radius', '999px'], ['max-width', '100%']])}>` +
       `<a class="cvc-btn-link" href="${attr(href)}"${st(h, [['color', b.fg], ['font-weight', '700'], ['text-decoration', 'none']])}>${inlineHtml(text)}</a></div>`
@@ -347,12 +349,12 @@ export function statRow(h: Hx, stats: Array<{ value: number; label: string }>): 
 }
 
 /** Transición "a continuación": filete de acento de 2 px + kicker, sin caja (Design Language §5). */
-export function transitionBox(h: Hx, inner: string): string {
+export function transitionBox(h: Hx, inner: string, ink?: string): string {
   const s = bgSurf(h);
-  const col = readable(s.bg, [h.t.color.accent, h.t.color.accentStrong], h.t.color.borderStrong);
+  const col = readable(s.bg, [...(ink ? [ink] : []), h.t.color.accent, h.t.color.accentStrong], h.t.color.borderStrong);
   return (
     `<div class="cvc-transition"${st(h, [['margin', '40px 0 8px 0'], ['padding', '20px 0 0 0'], ['color', s.fg], ['border-top', `2px solid ${col}`]])}>` +
-    eyebrow(h, 'A continuación', s) +
+    eyebrow(h, 'A continuación', s, ink ? { color: ink } : {}) +
     inner +
     `</div>`
   );

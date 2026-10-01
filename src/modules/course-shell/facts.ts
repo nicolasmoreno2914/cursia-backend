@@ -58,6 +58,8 @@ export interface CourseFactsArtifactsInput {
   libroWordCount: number;
   /** R14: el Libro publica una sección de bibliografía (verificada). Omitido = sí (compatibilidad). */
   libroHasBibliography?: boolean;
+  /** P3: palabras MEDIDAS del experience por chapterId (experienceWordCount); si se informa, para TODOS los capítulos. */
+  experienceWordsByChapter?: Record<string, number>;
 }
 
 export interface BuildCourseFactsInput {
@@ -100,6 +102,11 @@ export interface ChapterFacts {
    */
   activityType: H5pActivityType | null;
   slideCount: number;
+  /**
+   * P3: minutos estimados del capítulo (estimateChapterMinutes) desde las palabras MEDIDAS del
+   * experience + diapositivas + video real + actividad. Ausente si el empaque no informó las palabras.
+   */
+  estimatedMinutes?: number;
 }
 
 export interface ModuleFacts {
@@ -235,6 +242,12 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
         activityType: variant === 'h5p' ? resolveActivityType(itemByKey.get(`activity:${mc.chapterId}`)) : null,
         slideCount: posInt(artifacts.slideCountByChapter?.[mc.chapterId], `slideCount del capítulo ${mc.chapterNumber}`),
       });
+      if (artifacts.experienceWordsByChapter) {
+        const ch = chapters[chapters.length - 1];
+        const words = artifacts.experienceWordsByChapter[mc.chapterId];
+        if (!Number.isInteger(words) || (words as number) < 1) fail(`palabras del experience del capítulo ${mc.chapterNumber} inválidas (${JSON.stringify(words)})`);
+        ch.estimatedMinutes = estimateChapterMinutes({ words: words as number, slideCount: ch.slideCount, videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled });
+      }
     });
     const q = artifacts.examQuestionCountByModule?.[mm.moduleId];
     if (mm.examEnabled) posInt(q, `preguntas del examen del módulo ${mm.moduleNumber}`);
@@ -257,6 +270,9 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
   for (const id of pendingIds) if (!knownChapterIds.has(id)) fail(`video pendiente de un capítulo que no está en el Manifest (${id})`);
   for (const id of Object.keys(artifacts.slideCountByChapter ?? {})) {
     if (!knownChapterIds.has(id)) fail(`slideCount de un capítulo que no está en el Manifest (${id})`);
+  }
+  for (const id of Object.keys(artifacts.experienceWordsByChapter ?? {})) {
+    if (!knownChapterIds.has(id)) fail(`palabras del experience de un capítulo que no está en el Manifest (${id})`);
   }
   const moduleIds = new Set(manifest.modules.map((m) => m.moduleId));
   for (const id of Object.keys(artifacts.examQuestionCountByModule ?? {})) {
@@ -340,6 +356,33 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
   return deepFreeze(facts);
 }
 
+// ─── P3: tiempo estimado del capítulo ───────────────────────────────────────
+
+/** Ritmo de lectura (palabras/min) y tiempos fijos del estimado (constantes del producto, no del LLM). */
+export const CHAPTER_MINUTES_RULES = Object.freeze({ wordsPerMinute: 180, minutesPerSlide: 0.5, videoMinutes: 6, activityMinutes: 8, roundTo: 5, min: 5 });
+
+/** Minutos estimados de un capítulo, redondeados a 5 (mínimo 5). Determinista. */
+export function estimateChapterMinutes(x: { words: number; slideCount: number; videoEnabled: boolean; activityEnabled: boolean }): number {
+  const R = CHAPTER_MINUTES_RULES;
+  const raw = x.words / R.wordsPerMinute + x.slideCount * R.minutesPerSlide + (x.videoEnabled ? R.videoMinutes : 0) + (x.activityEnabled ? R.activityMinutes : 0);
+  return Math.max(R.min, Math.round(raw / R.roundTo) * R.roundTo);
+}
+
+const NON_TEXT_KEYS = new Set(['type', 'variant', 'kind', 'vcSchemaVersion', 'chapterId']);
+
+/** Palabras de todo el texto de un experience (lo que el estudiante lee), sin claves estructurales. */
+export function experienceWordCount(exp: unknown): number {
+  let n = 0;
+  const walk = (v: unknown, key?: string) => {
+    if (typeof v === 'string') {
+      if (!key || !NON_TEXT_KEYS.has(key)) n += v.split(/\s+/).filter((w) => /[\p{L}\p{N}]/u.test(w)).length;
+    } else if (Array.isArray(v)) v.forEach((x) => walk(x));
+    else if (v && typeof v === 'object') for (const [k, x] of Object.entries(v)) walk(x, k);
+  };
+  walk(exp);
+  return n;
+}
+
 // ─── Conjunto de números permitidos (lint del shell) ────────────────────────
 
 /** Números que aparecen en un texto (enteros y decimales con , o .). */
@@ -374,6 +417,7 @@ export function factsNumberSet(facts: CourseFacts): Set<number> {
     add(ch.number);
     add(ch.indexInModule);
     add(ch.slideCount);
+    add(ch.estimatedMinutes);
   }
   add(facts.finalExam.questionCount);
   add(facts.finalExam.bankSize);
