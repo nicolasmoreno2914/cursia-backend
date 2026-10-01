@@ -345,6 +345,70 @@ function roleSafeHue(h: number, roles: number[]): number {
   return h;
 }
 
+/** soft/border/on de un color de módulo ya decidido (misma receta que computeModuleColors). */
+function moduleColorFrom(main: string, h: number, s: number, isDark: boolean): ModuleColor {
+  const m = resolveReadableOn(main, CONTRAST_BODY);
+  const soft = resolveReadableOn(hslToHex(h, Math.min(s, isDark ? 0.35 : 0.3), isDark ? 0.22 : 0.92), CONTRAST_BODY);
+  return { main: m.bg, onMain: m.on, soft: soft.bg, onSoft: soft.on, border: hslToHex(h, Math.min(s, 0.5), isDark ? 0.42 : 0.55) };
+}
+
+/** Margen sobre DEFAULT_MODULE_MIN_DELTA_E para los candidatos generados (redondeo y variaciones de familia). */
+const GENERATED_DELTA_E_MARGIN = 0.5;
+const POOL_CACHE = new Map<string, string[]>();
+
+/**
+ * P3 (fix I1-R3): candidatos para módulos generados en este tema: legibles tal cual (el main no se corrige por
+ * contraste y vale como ink de moduleTone: ≥ 4.5 sobre su soft y sobre bg/surface), sin verde, a ≥ 27° de tono
+ * de todo rol y a ΔE2000 ≥ 20.5 de todo ink de rol. Orden determinista (tono, saturación, luminosidad).
+ */
+function generatedPool(theme: ResolvedTheme): string[] {
+  const isDark = theme.mode === 'dark';
+  const inks = EDU_BLOCK_ROLES.map((r) => theme.blocks[r].ink);
+  const key = [theme.mode, theme.color.bg, theme.color.surface, ...inks].join('|');
+  const hit = POOL_CACHE.get(key);
+  if (hit) return hit;
+  const roles = roleHues(theme);
+  const out: string[] = [];
+  const ls = isDark ? [0.5, 0.56, 0.62, 0.68, 0.74, 0.8] : [0.18, 0.22, 0.26, 0.3, 0.34, 0.38, 0.42];
+  for (let h = 0; h < 360; h += 4) {
+    for (const s of [0.08, 0.12, 0.4, 0.55, 0.7, 0.85]) {
+      const neutral = s < MODULE_NEUTRAL_SAT;
+      if (!neutral && h >= 80 && h <= 175) continue; // sin verde (verde = rol «ejemplo»)
+      if (!neutral && roles.some((r) => hueDelta(h, r) < ROLE_HUE_TARGET)) continue;
+      for (const l of ls) {
+        const hex = hslToHex(h, s, l);
+        if (resolveReadableOn(hex, CONTRAST_BODY).bg !== hex) continue;
+        const { h: hh, s: ss } = hexToHsl(hex);
+        const soft = isDark ? hslToHex(hh, Math.min(ss, 0.4), 0.17) : resolveReadableOn(hslToHex(hh, Math.min(ss, 0.3), 0.92), CONTRAST_BODY).bg;
+        if (contrastRatio(hex, soft) < CONTRAST_BODY || contrastRatio(hex, theme.color.bg) < CONTRAST_BODY || contrastRatio(hex, theme.color.surface) < CONTRAST_BODY) continue;
+        if (inks.some((ink) => deltaE2000(hex, ink) < DEFAULT_MODULE_MIN_DELTA_E + GENERATED_DELTA_E_MARGIN)) continue;
+        out.push(hex);
+      }
+    }
+  }
+  POOL_CACHE.set(key, out);
+  return out;
+}
+
+/** Candidato del conjunto seguro más distinto (máx–mín ΔE) de los módulos anteriores; null si no hay conjunto. */
+function pickGeneratedModule(theme: ResolvedTheme, prev: string[]): string | null {
+  if (!theme.blocks) return null;
+  const pool = generatedPool(theme);
+  let best: string | null = null;
+  let bestD = -1;
+  for (const c of pool) {
+    if (prev.includes(c)) continue;
+    // vecino inmediato: nunca «demasiado parecido» (misma regla que las anclas) y a ΔE ≥ 10
+    if (prev.length && (tooSimilar(c, prev[prev.length - 1]) || deltaE2000(c, prev[prev.length - 1]) < 10)) continue;
+    const d = prev.length ? Math.min(...prev.map((p) => deltaE2000(c, p))) : 100;
+    if (d > bestD) {
+      bestD = d;
+      best = c;
+    }
+  }
+  return best;
+}
+
 /**
  * Calcula los colores de módulo 0..count-1 en orden.
  *
@@ -373,6 +437,17 @@ function computeModuleColors(theme: ResolvedTheme, count: number): ModuleColorsC
       baseHex = basis[i];
       ({ h, s, l } = hexToHsl(baseHex));
     } else {
+      // P3 (fix I1-R3): un módulo GENERADO (más allá de las anclas de la familia o de la marca) es de Cursia:
+      // sale del conjunto seguro (ΔE2000 ≥ 20 contra todo rol, sin verde, legible) eligiendo el candidato más
+      // distinto de los módulos anteriores (máx–mín ΔE). Determinista.
+      const prev = colors.map((c) => c.main);
+      const pick = pickGeneratedModule(theme, prev);
+      if (pick) {
+        const { h: ph, s: ps, l: pl } = hexToHsl(pick);
+        colors.push(moduleColorFrom(pick, ph, ps, isDark));
+        notes.push(note);
+        continue;
+      }
       h = (hue0 + GOLDEN_ANGLE_DEG * i) % 360;
       s = Math.max(hexToHsl(basis[i % basis.length]).s, 0.45);
       l = isDark ? 0.58 : 0.4;
@@ -523,8 +598,9 @@ export function validateTheme(t: ResolvedTheme, opts?: { moduleCount?: number })
     checkHex(m.border, `moduleColor(${i}).border`);
     for (const k of ['main', 'soft', 'onMain', 'onSoft', 'border'] as const) checkNotPure(m[k], `moduleColor(${i}).${k}`);
     checkContrast(`moduleColor(${i}).onMain`, m.onMain, `moduleColor(${i}).main`, m.main, CONTRAST_BODY);
-    // P3 (fix I1-R2): las anclas por defecto de Cursia quedan perceptualmente lejos de todo ink de rol.
-    if (t.blocks && t.moduleColorsSource !== 'brand' && i < t.moduleColorsBasis.length) {
+    // P3 (fix I1-R2 / I1-R3): los colores de Cursia quedan perceptualmente lejos de todo ink de rol.
+    // fix I1-R3: TODO módulo de Cursia (anclas por defecto y generados), hasta moduleCount.
+    if (t.blocks && cursiaOwned(t, i, t.moduleColorsBasis.length)) {
       for (const role of EDU_BLOCK_ROLES) {
         const d = deltaE2000(m.main, t.blocks[role].ink);
         if (d < DEFAULT_MODULE_MIN_DELTA_E) errors.push({ code: 'MODULE_ROLE_DELTAE', message: `moduleColor(${i}).main ${m.main} a ΔE2000 ${d.toFixed(1)} del rol ${role} (< ${DEFAULT_MODULE_MIN_DELTA_E})` });

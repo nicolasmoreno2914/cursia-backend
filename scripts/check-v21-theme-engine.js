@@ -468,10 +468,13 @@ check('P3 (fix I1 / I1-R1 / I1-R2): colores de MARCA intactos; los de Cursia (an
       for (let i = 0; i < 12; i++) {
         const mc = moduleColor(t, i);
         assertTrue(sat(mc.main) < te.MODULE_NEUTRAL_SAT || te.roleHueDistance(t, mc.main) >= D, `${familyId}/${mode}: módulo ${i} ${mc.main} en tono de rol`);
-        if (i >= t.moduleColorsBasis.length) continue;
+        // fix I1-R3: anclas Y módulos generados (1–12) cumplen lo mismo
         const k = VCE.moduleTone(t, mc, g);
         const hue = hexToHueDeg(mc.main);
-        assertTrue(sat(mc.main) < te.MODULE_NEUTRAL_SAT || hue < 80 || hue > 175, `${familyId}/${mode}: ancla ${i} ${mc.main} es verde`);
+        assertTrue(sat(mc.main) < te.MODULE_NEUTRAL_SAT || hue < 80 || hue > 175, `${familyId}/${mode}: módulo ${i} ${mc.main} es verde`);
+        // distinto del módulo anterior (ΔE ≥ 10) y nunca repetido
+        if (i > 0) assertTrue(te.deltaE2000(mc.main, moduleColor(t, i - 1).main) >= 10, `${familyId}/${mode}: módulo ${i} ${mc.main} ≈ módulo ${i - 1}`);
+        for (let j = 0; j < i; j++) assertTrue(mc.main !== moduleColor(t, j).main, `${familyId}/${mode}: módulo ${i} repite el ${j}`);
         for (const [role, b] of Object.entries(t.blocks)) {
           for (const x of [mc.main, k.ink, k.fill]) assertTrue(te.deltaE2000(x, b.ink) >= DE, `${familyId}/${mode}: ancla ${i} ${x} a ΔE ${te.deltaE2000(x, b.ink).toFixed(1)} de ${role}`);
         }
@@ -504,6 +507,24 @@ check('P3 (fix I1 / I1-R1 / I1-R2): colores de MARCA intactos; los de Cursia (an
   assertTrue(exact >= 60, `pocos colores exactos: ${exact}`);
   const navy = resolveTheme(te.presentationProfileFromPaletteId('navy-teal'));
   assertEqual(moduleColor(navy, 0).main, '#1A3C5E', 'navy-teal (#413) conserva el navy');
+  // (4b) fix I1-R3: paleta de marca de 3 colores (navy-teal, berry): módulos 1–3 intactos, 4–12 generados por
+  // Cursia a ΔE2000 ≥ 20 de todo rol (main, ink y relleno), sin verde y distintos de los anteriores.
+  for (const pid of ['navy-teal', 'berry']) {
+    const t = resolveTheme(te.presentationProfileFromPaletteId(pid));
+    const p = LEGACY_PALETTES.find((x) => x.id === pid);
+    const g = t.personality.plate ? t.color.bg : t.color.surface;
+    for (let i = 3; i < 12; i++) {
+      const mc = moduleColor(t, i);
+      const k = VCE.moduleTone(t, mc, g);
+      for (const [role, b] of Object.entries(t.blocks)) for (const x of [mc.main, k.ink, k.fill]) assertTrue(te.deltaE2000(x, b.ink) >= DE, `${pid}: módulo ${i + 1} ${x} a ΔE ${te.deltaE2000(x, b.ink).toFixed(1)} de ${role}`);
+      const h = hexToHueDeg(mc.main);
+      assertTrue(sat(mc.main) < te.MODULE_NEUTRAL_SAT || h < 80 || h > 175, `${pid}: módulo ${i + 1} ${mc.main} es verde`);
+      assertTrue(te.deltaE2000(mc.main, moduleColor(t, i - 1).main) >= 10, `${pid}: módulo ${i + 1} ≈ módulo ${i}`);
+      for (let j = 0; j < i; j++) assertTrue(mc.main !== moduleColor(t, j).main, `${pid}: módulo ${i + 1} repite el ${j + 1}`);
+    }
+    assertTrue(validateTheme(t).length === 0, `${pid}: ${JSON.stringify(validateTheme(t))}`);
+    void p;
+  }
   // (4) módulos GENERADOS más allá de la marca: de Cursia → fuera de los tonos de rol
   const seeded = resolveTheme({ themeFamily: 'aula-clara', mode: 'light', brandSeed: { moduleColors: ['#1E3A8A', '#C8102E'] } });
   eqJson([moduleColor(seeded, 0).main, moduleColor(seeded, 1).main], ['#1E3A8A', '#C8102E'], 'marca intacta');
