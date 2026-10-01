@@ -24,6 +24,8 @@ import { UpdateStepDto } from './dto/update-step.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
+import { isSuperAdminEmail } from '../../auth/super-admin';
+import { redactJobForOwner } from './owner-safe-job';
 
 @Controller('jobs')
 @UseGuards(SupabaseJwtGuard)
@@ -136,7 +138,8 @@ export class ProductionJobsController {
     @Query('course_id') courseId?: string,
   ) {
     const jobs = await this.jobsService.findAll(user.id, courseId);
-    return { ok: true, data: { jobs } };
+    // DoD follow-up fix round 1 (m2): sin el texto de admin del bloqueo del paquete para no admins.
+    return { ok: true, data: { jobs: isSuperAdminEmail(user.email) ? jobs : jobs.map((j) => redactJobForOwner(j)) } };
   }
 
   /**
@@ -149,7 +152,7 @@ export class ProductionJobsController {
     @CurrentUser() user: AuthUser,
   ) {
     const job = await this.jobsService.findOne(id, user.id);
-    return { ok: true, data: job };
+    return { ok: true, data: isSuperAdminEmail(user.email) ? job : redactJobForOwner(job) };
   }
 
   /**

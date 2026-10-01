@@ -12,6 +12,7 @@ import { isRealVideoOutput, prepareV3Package } from './packaging-v3';
 import { VIDEO_MODE_INCONSISTENT, fallbackVideoModeOf, runIsUpgradeOnlyFailure } from '../dynamic-generation/video-upgrade';
 import { MOCK_ARTIFACT_IN_REAL_RUN } from './packaging-guards';
 import { isSuperAdminEmail } from '../../auth/super-admin';
+import { PACKAGE_JOB_FAILED_STATUSES } from './auto-package-state';
 import { evaluateRunCompletion, loadCompletionInputs } from '../dynamic-generation/run-completion';
 import {
   BuildFreshness,
@@ -112,6 +113,12 @@ export interface PackageStatusResult {
   complete: boolean;
   /** Fix round 2 (M4): paquete QA/degradado nuevo pedido por un no admin → sin artifactId ni URL. */
   downloadRestricted?: boolean;
+  /**
+   * DoD follow-up (R1): (no admin) el intento de paquete FINAL más reciente falló, así que se devuelve el
+   * paquete final COMPLETADO anterior (sigue descargable; `stale`/`staleReason` dicen si ya no es el
+   * vigente). Valor = worker_status del intento fallido. Ausente = se devuelve el job más reciente.
+   */
+  newerAttemptFailed?: string;
 }
 
 /** Fix round 2 (M4): job de paquete QA / degradado DECLARADO (los nuevos; los anteriores no tienen el campo). */
@@ -291,14 +298,25 @@ export class PackagingService {
     }
     // Fix round 3 (N3): a un no admin, un job QA / degradado nuevo (solo admin) no le tapa el paquete FINAL
     // completado más reciente del run (si existe): ve ese.
+    let newerAttemptFailed: string | undefined;
     if (isAdminOnlyPackageJob(job) && !isSuperAdminEmail(actor?.email)) {
       const fin = await this.findLatestCompletedFinalJob(runId);
       if (fin) job = fin;
+    } else if (!isSuperAdminEmail(actor?.email) && packageKindOf(job) === 'final' && PACKAGE_JOB_FAILED_STATUSES.includes(job.worker_status)) {
+      // DoD follow-up (R1): un re-armado FINAL fallido (p.ej. builder nuevo) no le oculta al dueño el paquete
+      // final anterior: se le sigue ofreciendo (marcado no vigente por la frescura) hasta que haya uno nuevo.
+      // La completitud del run no cambia (un paquete no vigente nunca da «curso completo»). El admin ve el fallo.
+      const fin = await this.findLatestCompletedFinalJob(runId);
+      if (fin) {
+        newerAttemptFailed = job.worker_status;
+        job = fin;
+      }
     }
 
     const packageKind = packageKindOf(job);
     const deliverable = isDeliverableKind(packageKind);
     const result: PackageStatusResult = { status: job.worker_status, stale: false, packageKind, deliverable, complete: false };
+    if (newerAttemptFailed) result.newerAttemptFailed = newerAttemptFailed;
     if (Array.isArray(job.output_summary?.pendingVideos)) result.pendingVideos = job.output_summary.pendingVideos;
     // EV6 H5P v2: el worker copia `restore` al output_summary del job tanto al construir como al
     // reutilizar un .mbz (desde la metadata del artifact), así que el job basta.
@@ -505,6 +523,13 @@ export class PackagingService {
       const inputs = await loadCompletionInputs({ query: this.dataSource.query.bind(this.dataSource) }, run.id);
       const c = inputs ? evaluateRunCompletion(inputs.job, inputs.rows, inputs.manifest, null, { validationCutoffs: inputs.validationCutoffs }) : null;
       if (!c || !c.generationComplete) {
+        // DoD follow-up (R7): un run v1/v2 viejo con componentes de vista previa o sin validar sigue
+        // empaquetable SOLO como paquete QA rotulado (nunca final), por un SUPER_ADMIN con el escape de QA
+        // (DYNAMIC_ALLOW_VIDEO_PREVIEW=true). Todos sus items ya están completados (chequeado arriba).
+        if (c && isSuperAdminEmail(actor?.email) && isVideoPreviewAllowed()) {
+          const unvalidated = c.missingComponents.filter((k) => !c.previewComponents.includes(k));
+          return unvalidated.length ? 'degraded' : 'qa_preview';
+        }
         throw this.previewNotDeliverable(run.id, c ? c.missingComponents : [], 'la generación del curso no está completa (componentes de vista previa o sin validar)');
       }
       return 'final';

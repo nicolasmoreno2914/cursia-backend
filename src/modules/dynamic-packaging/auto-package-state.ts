@@ -18,6 +18,7 @@
 import { packageKindOf } from './package-freshness';
 import { DYNAMIC_MBZ_BUILDER_VERSION } from '../../package/dynamic-mbz-builder';
 import { DYNAMIC_MBZ_BUILDER_VERSION_V3 } from '../../package/dynamic-mbz-builder-v3';
+import { autoHealEnabled } from '../dynamic-generation/auto-heal';
 
 /** `DYNAMIC_AUTO_PACKAGE_ENABLED=false` apaga el empaque automático (disparo y barrido). Default: encendido. */
 export const AUTO_PACKAGE_ENABLED_ENV = 'DYNAMIC_AUTO_PACKAGE_ENABLED';
@@ -33,6 +34,40 @@ export const AUTO_PACKAGE_MAX_AGE_HOURS = 72;
  */
 export const AUTO_PACKAGE_MAX_TRANSIENT = 5;
 export const AUTO_PACKAGE_TRANSIENT_BACKOFF_SECONDS = 300;
+/**
+ * DoD follow-up (R2): el barrido corre en el tick del auto-healer. Con el tick apagado
+ * (`DYNAMIC_AUTO_HEAL_ENABLED=false`) nadie reintenta ni re-arma solo → nada queda «pendiente» (el run
+ * pasa a la acción manual / de admin). Única excepción: un run recién marcado sin job todavía (el aviso
+ * post-commit lo está encolando), durante esta gracia.
+ */
+export const AUTO_PACKAGE_HOOK_GRACE_SECONDS = 120;
+/**
+ * DoD follow-up (R8): un run que el barrido seleccionó y `ensure` saltó por «nada pendiente» queda
+ * registrado (`autoPackage.lastSkip`) y el SQL no lo vuelve a seleccionar durante esta espera (no
+ * cuenta contra el tope de transitorios: no es un fallo).
+ */
+export const AUTO_PACKAGE_SKIP_BACKOFF_SECONDS = 300;
+
+/**
+ * DoD follow-up (R8): MISMA clasificación que `packageKindOf` (package-freshness.ts) en SQL, para que el
+ * barrido y el estado vean los mismos jobs FINALES: el `packageKind` declarado (output_summary, si no
+ * input_payload) si es uno conocido; si no, un resumen con videos omitidos o proveedores simulados es
+ * de vista previa (paquetes anteriores a EV6 DoD); el resto, final.
+ */
+export function finalPackageKindSql(p: string): string {
+  const k = `coalesce(${p}.output_summary->>'packageKind', ${p}.input_payload->>'packageKind')`;
+  const mp = `${p}.output_summary->'mockProviderItems'`;
+  return `(case
+      when ${k} in ('final', 'qa_preview', 'degraded') then ${k} = 'final'
+      when jsonb_typeof(${p}.output_summary->'pendingVideos') = 'array' and jsonb_array_length(${p}.output_summary->'pendingVideos') > 0 then false
+      when jsonb_typeof(${mp}) = 'array' then jsonb_array_length(${mp}) = 0
+      when jsonb_typeof(${mp}) = 'number' then (${mp})::text::numeric <= 0
+      when jsonb_typeof(${mp}) = 'boolean' then (${mp})::text <> 'true'
+      when jsonb_typeof(${mp}) = 'string' and (${p}.output_summary->>'mockProviderItems') ~ '^\\s*[0-9]+(\\.[0-9]+)?\\s*$'
+        then trim(${p}.output_summary->>'mockProviderItems')::numeric <= 0
+      else true
+    end)`;
+}
 
 /** Versión del builder vigente según las reglas del Manifest (la misma que usa la clave de reuse). */
 export function currentBuilderVersionFor(rulesVersion: number): string {
@@ -158,9 +193,14 @@ export async function loadAutoPackageState(
   const withinWindow = !!mark && now.getTime() - mark.eligibleAt.getTime() <= AUTO_PACKAGE_MAX_AGE_HOURS * 3_600_000;
   const capsOk = eligible && autoPackageEnabled(env) && !blocked && failed.length < AUTO_PACKAGE_MAX_ATTEMPTS &&
     (mark?.transient.count ?? 0) < AUTO_PACKAGE_MAX_TRANSIENT;
-  const autoRetryPending = (status === 'failed' || status === 'none') && capsOk && withinWindow;
+  // DoD follow-up (R2): sin el tick del barrido nadie reintenta ni re-arma: nada queda pendiente (salvo el
+  // aviso post-commit de un run recién marcado, que encola sin el tick).
+  const sweepOn = autoHealEnabled(env);
+  const hookGrace = status === 'none' && !!mark && failed.length === 0 && (mark.transient.count ?? 0) === 0 &&
+    now.getTime() - mark.eligibleAt.getTime() <= AUTO_PACKAGE_HOOK_GRACE_SECONDS * 1000;
+  const autoRetryPending = (status === 'failed' || status === 'none') && capsOk && withinWindow && (sweepOn || hookGrace);
   let rebuildPending = false;
-  if (status === 'completed' && latest && mark && capsOk) {
+  if (status === 'completed' && latest && mark && capsOk && sweepOn) {
     const builder = obj(latest.output_summary).builderVersion;
     const builderChanged = builder !== currentBuilderVersionFor(rulesVersion);
     const unconfirmed = new Date(latest.created_at).getTime() < mark.eligibleAt.getTime() && mark.satisfiedJobId !== latest.id;
@@ -171,14 +211,18 @@ export async function loadAutoPackageState(
 
 /**
  * Candidatos del barrido (grueso, SQL; `AutoPackageService.ensure` decide fino con el mismo
- * `loadAutoPackageState`): runs `completed` CON la marca, sin bloqueo de precheck, sin job final activo,
- * con intentos disponibles (fallidos desde la marca y transitorios), pasada la espera, y además:
+ * `loadAutoPackageState`): runs `completed` CON la marca, sin bloqueo de precheck vigente, sin job final
+ * activo, con intentos disponibles (fallidos desde la marca y transitorios), pasada la espera, y además:
  *  - sin job final o con el último fallido — dentro de la ventana;
  *  - último job final completado con OTRA versión del builder — en cualquier momento (fix round 1, I1);
  *  - último job final completado ANTES de la marca vigente sin confirmar como mismo build — dentro de la
  *    ventana (re-completitud cuyo disparo se perdió; fix round 1, I1/M2).
+ * DoD follow-up (R8): «final» se clasifica igual que `packageKindOf` (`finalPackageKindSql`), un bloqueo
+ * deja de contar si después se creó un job final (igual que el estado), y un run saltado por «nada
+ * pendiente» espera `AUTO_PACKAGE_SKIP_BACKOFF_SECONDS` antes de volver a seleccionarse.
  */
 export async function findAutoPackageCandidates(q: Q, now: Date, limit = 50): Promise<string[]> {
+  const isFinal = finalPackageKindSql('p');
   const rows: Array<{ id: string }> = await q.query(
     `with marked as (
        select r.id, r.output_summary->'autoPackage' as ap,
@@ -189,8 +233,6 @@ export async function findAutoPackageCandidates(q: Q, now: Date, limit = 50): Pr
         where r.execution_mode = 'dynamic_generation' and r.worker_status = 'completed'
           and jsonb_typeof(r.output_summary->'autoPackage') = 'object'
           and r.output_summary->'autoPackage' ? 'eligibleAt'
-          and not (r.output_summary->'autoPackage' ? 'blocked'
-                   and (r.output_summary->'autoPackage'->'blocked'->>'at')::timestamptz >= (r.output_summary->'autoPackage'->>'eligibleAt')::timestamptz)
      ),
      c as (
        select mk.*, l.id as job_id, l.worker_status as job_status, l.created_at as job_created, l.builder
@@ -199,23 +241,30 @@ export async function findAutoPackageCandidates(q: Q, now: Date, limit = 50): Pr
            select p.id, p.worker_status, p.created_at, p.output_summary->>'builderVersion' as builder
              from public.production_jobs p
             where p.execution_mode = 'dynamic_package' and p.input_payload->>'runId' = mk.id::text
-              and coalesce(p.input_payload->>'packageKind', 'final') = 'final'
+              and ${isFinal}
             order by p.created_at desc, p.id desc
             limit 1
          ) l on true
      )
      select c.id from c
-      where (c.job_id is null or not (c.job_status = any($3::text[])))
+      where not (c.ap ? 'blocked'
+                 and jsonb_typeof(c.ap->'blocked') = 'object'
+                 and (c.ap->'blocked'->>'code') is not null
+                 and (c.ap->'blocked'->>'at')::timestamptz >= c.eligible_at
+                 and (c.job_id is null or c.job_created <= (c.ap->'blocked'->>'at')::timestamptz))
+        and (c.job_id is null or not (c.job_status = any($3::text[])))
         and (select count(*) from public.production_jobs p
               where p.execution_mode = 'dynamic_package' and p.input_payload->>'runId' = c.id::text
                 and p.worker_status = any($4::text[]) and p.created_at >= c.eligible_at
-                and coalesce(p.input_payload->>'packageKind', 'final') = 'final') < $5::int
+                and ${isFinal}) < $5::int
         and not exists (select 1 from public.production_jobs p
                          where p.execution_mode = 'dynamic_package' and p.input_payload->>'runId' = c.id::text
                            and p.worker_status = any($4::text[]) and p.created_at >= c.eligible_at
+                           and ${isFinal}
                            and coalesce(p.finished_at, p.updated_at) > $1::timestamptz - make_interval(secs => $6::int))
         and coalesce((c.ap->'transient'->>'count')::int, 0) < $8::int
         and coalesce((c.ap->'transient'->>'at')::timestamptz, '-infinity'::timestamptz) <= $1::timestamptz - make_interval(secs => $9::int)
+        and coalesce((c.ap->'lastSkip'->>'at')::timestamptz, '-infinity'::timestamptz) <= $1::timestamptz - make_interval(secs => $12::int)
         and (
           ((c.job_id is null or c.job_status = any($4::text[])) and c.eligible_at > $1::timestamptz - make_interval(hours => $2::int))
           or (c.job_status = 'completed' and c.builder is distinct from (case when c.rules_version = 3 then $10 else $11 end))
@@ -227,7 +276,8 @@ export async function findAutoPackageCandidates(q: Q, now: Date, limit = 50): Pr
       limit $7`,
     [now.toISOString(), AUTO_PACKAGE_MAX_AGE_HOURS, [...PACKAGE_JOB_ACTIVE_STATUSES], [...PACKAGE_JOB_FAILED_STATUSES],
       AUTO_PACKAGE_MAX_ATTEMPTS, AUTO_PACKAGE_RETRY_BACKOFF_SECONDS, limit, AUTO_PACKAGE_MAX_TRANSIENT,
-      AUTO_PACKAGE_TRANSIENT_BACKOFF_SECONDS, DYNAMIC_MBZ_BUILDER_VERSION_V3, DYNAMIC_MBZ_BUILDER_VERSION],
+      AUTO_PACKAGE_TRANSIENT_BACKOFF_SECONDS, DYNAMIC_MBZ_BUILDER_VERSION_V3, DYNAMIC_MBZ_BUILDER_VERSION,
+      AUTO_PACKAGE_SKIP_BACKOFF_SECONDS],
   );
   return rows.map((r) => r.id);
 }
