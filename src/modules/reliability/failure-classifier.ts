@@ -1,0 +1,614 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// REL R1 — clasificador CENTRAL de fallos (diseño REL §3). Único lugar que decide la clase
+// (A recuperable / B regenerable / C pago incierto / D irrecuperable) y la estrategia de
+// recuperación de un fallo de item, de paquete o de restauración.
+//
+// Estado en R1/R2: la clasificación se REGISTRA y se EXPONE (generation_item_runs.failure_*,
+// generation_item_attempts, RunDto.items[].recovery), pero NO se actúa sobre ella: el auto-healer
+// (R16) y el reintento automático seguro (EV6 DoD BE-B) siguen decidiendo exactamente como antes
+// con sus propias reglas (reliability/auto-heal-rules.ts). `currentRecovery` informa qué hace HOY
+// el sistema con cada fallo; `targetRounds`/`strategy` describen la política objetivo de R3.
+//
+// Reglas (diseño §3.1):
+// - un `errorCode` EXPLÍCITO y conocido gana; si no, el código sale del mensaje (prefijo
+//   `codigo:` / `CODIGO:`, el envoltorio «❌ Falló después de N intentos», frases estables del
+//   ejecutor del navegador, o el status HTTP de la IA);
+// - código desconocido → clase A con 1 ronda (`unclassified: true`, alerta de ingeniería); nunca
+//   «desconocido = silencio para siempre» ni reintento ilimitado;
+// - la tabla cubre TODOS los códigos que el backend/workers/ejecutor emiten hoy:
+//   scripts/check-rel-failure-classes.js escanea los emisores y falla ante un código nuevo sin
+//   regla explícita.
+// Puro (sin I/O).
+// ─────────────────────────────────────────────────────────────────────────────
+import type { RunAdminActionCode } from '../dynamic-generation/run-completion';
+import {
+  AUTO_HEAL_ALLOW_LIST,
+  AUTO_HEAL_DENY_PATTERNS,
+  SAFE_AUTO_RETRY_RULES,
+} from './auto-heal-rules';
+
+export type FailureClass = 'A' | 'B' | 'C' | 'D';
+export const FAILURE_CLASSES: readonly FailureClass[] = Object.freeze(['A', 'B', 'C', 'D']);
+
+export type Strategy =
+  | 'retry_backoff' // A: la misma tarea otra vez, backoff exponencial + jitter
+  | 'repoll_external' // A: re-pollear / re-descargar un id del proveedor ya persistido (gratis)
+  | 'wait_provider' // A (scope provider): esperar al proveedor (cuota, breaker); no consume intento
+  | 'regenerate_targeted' // B: regenerar SOLO este componente (prompt de reparación / borrador por hoja)
+  | 'regenerate_split' // B: regenerar con una pista de recuperación (llamadas más chicas / partes)
+  | 'regenerate_dependency' // B: el artifact de entrada está corrupto → regenerar el item productor
+  | 'provider_check' // C: consultar al proveedor (lookup por id / referencia) y re-clasificar
+  | 'auto_resubmit_once' // C: un reenvío acotado permitido por regla del usuario (TTS)
+  | 'hold_for_human' // C/D: needs_attention con una acción de admin
+  | 'repackage'
+  | 'repair_package'
+  | 'reverify';
+export const STRATEGIES: readonly Strategy[] = Object.freeze([
+  'retry_backoff', 'repoll_external', 'wait_provider', 'regenerate_targeted', 'regenerate_split', 'regenerate_dependency',
+  'provider_check', 'auto_resubmit_once', 'hold_for_human', 'repackage', 'repair_package', 'reverify',
+] as Strategy[]);
+
+export type Scope = 'item' | 'provider' | 'run' | 'package';
+export type PaidRisk = 'none' | 'measured' | 'uncertain';
+export type HumanReason = 'budget' | 'config' | 'duplicate_charge' | 'unrecoverable' | 'product_bug';
+export const HUMAN_REASONS: readonly HumanReason[] = Object.freeze(['budget', 'config', 'duplicate_charge', 'unrecoverable', 'product_bug'] as HumanReason[]);
+
+export type FailureSource =
+  | 'browser_executor' | 'server_executor' | 'llm_gateway' | 'video_worker' | 'provider_worker'
+  | 'scheduler' | 'package_worker' | 'restore_worker';
+
+export type FailureProvider = 'anthropic' | 'openai' | 'gamma' | 'videogen' | 'youtube' | 'storage' | 'finops';
+
+export interface FailureInput {
+  source?: FailureSource | null;
+  itemType?: string | null;
+  /** Código explícito del emisor (FailItemDto.errorCode). Gana si es conocido. */
+  errorCode?: string | null;
+  error: string;
+  httpStatus?: number | null;
+  provider?: FailureProvider | null;
+  outputSummary?: Record<string, any> | null;
+}
+
+/** Qué hace HOY el sistema con este fallo (antes de R3): reglas de auto-heal.ts sin cambios. */
+export type CurrentRecovery =
+  | 'executor_retry' // retryable en el item (attempt_count < max_attempts): el scheduler lo reintenta
+  | 'auto_heal' // allow-list del auto-healer (R16)
+  | 'safe_auto_retry' // reintento automático seguro (EV6 DoD BE-B)
+  | 'denied' // deny-list: nunca se reabre solo
+  | 'manual'; // nada automático: humano (retry/regenerate)
+
+export interface FailureVerdict {
+  class: FailureClass;
+  /** Código estable (≤ 64). */
+  code: string;
+  strategy: Strategy;
+  scope: Scope;
+  paidRisk: PaidRisk;
+  /** Rondas automáticas objetivo de la política (R3). 0 = ninguna. */
+  targetRounds: number;
+  /** Proveedor afectado (breakers de R3). */
+  provider?: FailureProvider | null;
+  retryAfterSeconds?: number | null;
+  adminAction?: RunAdminActionCode | null;
+  humanReason?: HumanReason | null;
+  /** Id de la regla que decidió (auditoría / check). */
+  rule: string;
+  /** true = ninguna regla explícita: A ×1 → D `unclassified_error` + alerta de ingeniería. */
+  unclassified: boolean;
+  /** Códigos internos del validador (v3_payload_invalid [..], presentation_artifact_invalid: ..). */
+  innerCodes?: string[];
+  /** Status HTTP detectado en el mensaje (IA / proveedor), si lo hay. */
+  httpStatus?: number | null;
+}
+
+/** Longitud máxima de un código estable (columna failure_code). */
+export const FAILURE_CODE_MAX = 64;
+const CODE_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+
+export function isValidFailureCode(code: unknown): code is string {
+  return typeof code === 'string' && CODE_RE.test(code);
+}
+
+// ─── Tabla ───────────────────────────────────────────────────────────────────
+
+interface Rule {
+  id: string;
+  /** Códigos exactos. */
+  codes?: readonly string[];
+  /** Familia (regex sobre el código). */
+  family?: RegExp;
+  class: FailureClass;
+  strategy: Strategy;
+  scope?: Scope;
+  paidRisk?: PaidRisk;
+  rounds: number;
+  provider?: FailureProvider;
+  adminAction?: RunAdminActionCode;
+  humanReason?: HumanReason;
+  /** Variante por mensaje/contexto: devuelve un parche del veredicto o null (se usa la base). */
+  refine?: (ctx: RefineCtx) => Partial<Rule> | null;
+}
+
+interface RefineCtx {
+  code: string;
+  error: string;
+  httpStatus: number | null;
+  outputSummary: Record<string, any>;
+  itemType: string | null;
+}
+
+const hasGammaId = (os: Record<string, any>) => typeof os?.external?.gammaGenerationId === 'string' && os.external.gammaGenerationId !== '';
+const hasVideogenJob = (os: Record<string, any>) => typeof os?.external?.videogenJobId === 'string' && os.external.videogenJobId !== '';
+
+/**
+ * Motivos de guard del scheduler (ItemOpResult.reason): NO son fallos del item — el ejecutor
+ * abandona y no hay cambio de estado (diseño §3.2, fila «guard reasons»). Nunca llegan a
+ * applyItemFailure; se listan para que el check sepa que existen.
+ */
+export const GUARD_REASON_CODES: readonly string[] = Object.freeze([
+  'lease_lost', 'not_running', 'run_cancelled', 'run_not_active', 'superseded_run', 'generation_changed', 'item_not_completed',
+  'not_found', 'no_artifacts', 'invalid_artifact_id', 'invalid_summary', 'invalid_patch', 'external_conflict',
+  'artifact_changed_after_validation',
+]);
+
+/**
+ * Códigos internos de validación (dentro de `v3_payload_invalid [..]`, del ejecutor y de los validadores
+ * de banco/H5P/GIFT). Todos son de clase B (salida de la IA inválida → regenerar solo el componente).
+ */
+export const VALIDATION_INNER_CODES: readonly string[] = Object.freeze([
+  // course-shell / visual-components / intro-schemas / final-exam / activity-type
+  'ACTIVITY_TYPE_MISMATCH', 'ACTIVITY_TYPE_RULES', 'ACTIVITY_TYPE_UNKNOWN', 'ANSWER_LEAK', 'ARITY_MISMATCH', 'CHAPTER_ID',
+  'CHAPTER_ID_MISMATCH', 'COMPONENT_NOT_ALLOWED', 'COUNT_RANGE', 'DIGIT_IN_TEXT', 'EDU_FIELDS_MISSING', 'ENUM_VALUE',
+  'EXPLANATIONS_GATE', 'FORBIDDEN_CLAIM', 'HTML_IN_TEXT', 'ITEM_KEY_MISMATCH', 'JOURNEY_MISMATCH', 'JSON_INVALID',
+  'MISSING_FIELD', 'MOVEMENT_RANGE', 'NOT_OBJECT', 'PEDAGOGY_MISSING', 'QUANTITY_CLAIM', 'QUIZ_RANDOM', 'RESOURCE_MENTION',
+  'SCHEMA_VERSION', 'TEXT_DENSE', 'TEXT_EMPTY', 'TEXT_FORMAT', 'TEXT_SIMULATED_DIAGRAM', 'TEXT_TOO_LONG', 'TYPE_DIVERSITY',
+  'TYPE_MISMATCH', 'TYPE_REPEATED', 'UNKNOWN_COMPONENT', 'UNKNOWN_FIELD', 'URL_IN_TEXT', 'VIDEO_DURATION_MISSING',
+  'VIDEO_YOUTUBE_ID_MISSING', 'WORD_RANGE', 'FABRICATED_DATA', 'REAL_LABEL', 'OUTDATED_CLAIM', 'FOREIGN_LAW',
+  'GRAMMAR_PERSON', 'ANSWER_LENGTH_BIAS', 'TF_BALANCE', 'H5P_INPUT_INVALID', 'H5P_TYPE_NOT_GRADABLE',
+  'VIDEO_TOO_SHORT_FOR_INTERACTIONS', 'VIDEO_PLAN_INVARIANT', 'VIDEO_DURATION_INVALID', 'EXAM_ARTIFACT_AMBIGUOUS',
+  'GIFT_EMPTY', 'GIFT_EMPTY_QUESTION', 'GIFT_NO_QUESTIONS', 'GIFT_QUESTION_COUNT', 'GIFT_UNPARSEABLE_BLOCK',
+  'EXAM_NEUROMYTH', 'PRESENTATION_CARD_SLIDE_COUNT', 'SLIDE_COUNT',
+]);
+/** Familias de códigos internos de validación (clase B). */
+export const VALIDATION_INNER_FAMILIES: readonly RegExp[] = Object.freeze([
+  /^TEXT_[A-Z0-9_]+$/, /^BS_[A-Z0-9_]+$/, /^DIAGRAM_[A-Z0-9_]+$/, /^CONTENT_TRUTH[A-Z0-9_]*$/, /^EXAM_BANK_[A-Z0-9_]+$/,
+  /^GIFT_[A-Z0-9_]+$/, /^PDF_[A-Z0-9_]+$/, /^COVER_[A-Z0-9_]+$/, /^PNG_[A-Z0-9_]+$/, /^H5P_[A-Z0-9_]+_INVALID$/,
+]);
+
+export function isKnownValidationCode(code: string): boolean {
+  return VALIDATION_INNER_CODES.includes(code) || VALIDATION_INNER_FAMILIES.some((re) => re.test(code));
+}
+
+const ITEM_RULES: readonly Rule[] = Object.freeze([
+  // ── Infraestructura, lease y transporte ────────────────────────────────────
+  { id: 'lease_expired', codes: ['lease_expired'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', rounds: 3 },
+  { id: 'worker_draining', codes: ['worker_draining'], class: 'A', strategy: 'retry_backoff', rounds: 3 },
+  { id: 'unexpected_error', codes: ['unexpected_error'], class: 'A', strategy: 'retry_backoff', rounds: 3 },
+  { id: 'unknown_error', codes: ['unknown_error'], class: 'A', strategy: 'retry_backoff', rounds: 1 },
+  {
+    id: 'download_failed',
+    codes: ['download_failed', 'text_fetch_failed', 'download_url_failed', 'sign_failed', 'storage_unavailable'],
+    family: /^[a-z0-9_]+_download_failed$/,
+    class: 'A', strategy: 'retry_backoff', provider: 'storage', rounds: 3,
+  },
+  {
+    // Variante de descarga (A) vs. de contrato (D: el capítulo llegó con ≠ 1 artifacts).
+    id: 'exam_bank_chapter_md_missing', codes: ['EXAM_BANK_CHAPTER_MD_MISSING'], class: 'A', strategy: 'retry_backoff', provider: 'storage', rounds: 3,
+    refine: ({ error }) => (/llegó con \d+ artifacts|se esperaba 1/.test(error)
+      ? { class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'product_bug', adminAction: 'regenerate_item', provider: undefined }
+      : null),
+  },
+  { id: 'artifact_upload_failed', codes: ['artifact_upload_failed', 'upload_failed'], class: 'A', strategy: 'retry_backoff', provider: 'storage', rounds: 3 },
+  { id: 'complete_rejected', codes: ['complete_rejected'], class: 'A', strategy: 'retry_backoff', rounds: 1 },
+  { id: 'finops_unavailable', codes: ['finops_unavailable', 'finops_ledger_write_failed'], class: 'A', strategy: 'wait_provider', scope: 'run', provider: 'finops', rounds: 3 },
+  { id: 'browser_auth', codes: ['token_refresh_failed', 'browser_auth', 'browser_session_missing'], class: 'A', strategy: 'retry_backoff', rounds: 3 },
+  { id: 'user_stopped', codes: ['user_stopped'], class: 'A', strategy: 'retry_backoff', rounds: 1 },
+
+  // ── IA (Anthropic; proxy del navegador o gateway del servidor) ─────────────
+  { id: 'llm_transient', codes: ['browser_llm_transient', 'llm_transient', 'llm_empty_response', 'llm_network'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'anthropic', rounds: 3 },
+  {
+    id: 'llm_config',
+    codes: ['llm_credit_exhausted', 'llm_auth_rejected', 'proxy_misconfigured', 'llm_model_config', 'llm_model_not_allowed', 'llm_api_key_missing', 'llm_model_missing'],
+    class: 'D', strategy: 'wait_provider', scope: 'provider', provider: 'anthropic', rounds: 0, humanReason: 'config',
+  },
+  {
+    // 400 de la IA sin otra pista: si es por tamaño → B split; si no, D (bug de producto: el mismo pedido vuelve a fallar).
+    id: 'llm_request_rejected', codes: ['llm_request_rejected'], class: 'D', strategy: 'hold_for_human', provider: 'anthropic', rounds: 0, humanReason: 'product_bug', adminAction: 'retry_item',
+    refine: ({ error }) => (/too long|demasiado grande|prompt is too long|max_tokens|context/i.test(error)
+      ? { class: 'B', strategy: 'regenerate_split', rounds: 2, humanReason: undefined, adminAction: undefined }
+      : null),
+  },
+  { id: 'llm_too_large', codes: ['llm_request_too_large', 'EXAM_BANK_PROMPT_TOO_LARGE'], class: 'B', strategy: 'regenerate_split', provider: 'anthropic', rounds: 2 },
+  {
+    id: 'output_truncated',
+    codes: ['OUTPUT_TRUNCATED_MAX_TOKENS', 'CONTENT_TRUNCATED_MAX_TOKENS', 'CONTENT_TRUNCATED', 'llm_output_truncated'],
+    class: 'B', strategy: 'regenerate_split', rounds: 2,
+  },
+  { id: 'budget', codes: ['budget_exceeded', 'budget_approval_required', 'budget_blocked'], class: 'D', strategy: 'hold_for_human', scope: 'run', rounds: 0, humanReason: 'budget', adminAction: 'approve_budget' },
+
+  // ── Validación (B: regenerar solo el componente) ───────────────────────────
+  { id: 'v3_payload_invalid', codes: ['v3_payload_invalid'], class: 'B', strategy: 'regenerate_targeted', rounds: 2 },
+  {
+    id: 'validation_invalid',
+    codes: ['validation_invalid', 'content_empty', 'gift_invalid', 'llm_output_invalid', 'scorm_invalid', 'concept_plan_invalid',
+      'CONTENT_TRUTH', 'CONTENT_TRUTH_RETRY_INVALID', 'EXAM_NEUROMYTH', 'AUDIOBOOK_SCRIPT_TOO_SHORT'],
+    family: /^(GIFT|BS|TEXT|DIAGRAM)_[A-Z0-9_]+$/,
+    class: 'B', strategy: 'regenerate_targeted', rounds: 2,
+  },
+  {
+    id: 'exam_bank_invalid',
+    family: /^EXAM_BANK_[A-Z0-9_]+$/,
+    class: 'B', strategy: 'regenerate_targeted', rounds: 2,
+    // EXAM_BANK_CLAIM: el claim no trae examBank válido → contrato (D), no salida de la IA.
+    refine: ({ code }) => (code === 'EXAM_BANK_CLAIM' ? { class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'product_bug', adminAction: 'regenerate_item' } : null),
+  },
+  {
+    id: 'corrupt_dependency',
+    codes: ['context_package_failed', 'context_package_invalid_json', 'course_plan_invalid', 'AUDIO_SCRIPT_EMPTY', 'AUDIOBOOK_CONTENT_EMPTY', 'AUDIO_WELCOME_TEXT_MISSING'],
+    family: /^[a-z0-9_]+_empty$/,
+    class: 'B', strategy: 'regenerate_dependency', rounds: 1,
+  },
+  {
+    id: 'presentation_invalid',
+    codes: ['gamma_generation_failed', 'gamma_pdf_invalid', 'presentation_artifact_invalid', 'PRESENTATION_CARD_SLIDE_COUNT', 'SLIDE_COUNT'],
+    family: /^(PDF|COVER|PNG)_[A-Z0-9_]+$/,
+    class: 'B', strategy: 'regenerate_targeted', paidRisk: 'measured', provider: 'gamma', rounds: 1,
+  },
+  {
+    id: 'audio_invalid',
+    codes: ['TTS_AUDIO_INVALID', 'AUDIOBOOK_PART_MISSING', 'MP3_INVALID', 'MP3_INCOMPATIBLE_PARTS', 'AUDIO_DURATION'],
+    family: /^MP3_[A-Z0-9_]+$/,
+    class: 'B', strategy: 'regenerate_targeted', paidRisk: 'measured', provider: 'openai', rounds: 2,
+  },
+  { id: 'audiobook_script_failed', codes: ['audiobook_script_failed'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'anthropic', rounds: 3 },
+
+  // ── Contrato y producto (D) ────────────────────────────────────────────────
+  {
+    id: 'contract',
+    codes: ['missing_dependency_artifact', 'missing_content_artifact', 'missing_course_plan_artifact', 'ambiguous_course_plan_artifact',
+      'duplicate_artifact_type', 'artifact_mismatch', 'artifacts_not_linkable', 'exam_content_missing', 'EXAM_ARTIFACT_AMBIGUOUS',
+      'claim_contract', 'VIDEO_PLAN_MISMATCH', 'VIDEO_REFLECTION_PLAN_MISMATCH', 'ACTIVITY_TYPE_NOT_IN_MANIFEST', 'unsupported_item_type',
+      'unsupported_rules_version', 'rules_version_mismatch', 'claim_payload_unavailable', 'video_duration_unmeasurable',
+      'missing_artifact_id', 'artifact_download_unavailable', 'unsupported_download_method', 'provider_worker_wrong_type',
+      'missing_required_artifacts', 'ACTIVITY_TYPE_MISMATCH'],
+    family: /^(missing|ambiguous)_[a-z0-9_]+_artifact$/,
+    class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'product_bug', adminAction: 'regenerate_item',
+  },
+  { id: 'v3_validator_infra', codes: ['v3_validator_unavailable', 'v3_artifact_unreadable', 'V3_VALIDATION_CONTEXT'], class: 'A', strategy: 'retry_backoff', rounds: 2 },
+
+  // ── Video (Videogen) ───────────────────────────────────────────────────────
+  {
+    id: 'video_repoll', codes: ['video_timeout', 'video_duration_unmeasured'], class: 'A', strategy: 'repoll_external', provider: 'videogen', rounds: 3,
+    refine: ({ outputSummary }) => (hasVideogenJob(outputSummary) ? null : { strategy: 'retry_backoff' }),
+  },
+  { id: 'videogen_submit_rejected', codes: ['videogen_submit_rejected'], class: 'A', strategy: 'retry_backoff', provider: 'videogen', rounds: 1 },
+  {
+    id: 'video_ambiguous',
+    codes: ['ambiguous_video_submission', 'video_upgrade_ambiguous_submission', 'reserved_without_submit_marker'],
+    class: 'C', strategy: 'provider_check', paidRisk: 'uncertain', provider: 'videogen', rounds: 1, humanReason: 'duplicate_charge', adminAction: 'reconcile_videogen',
+  },
+  // Decisión D4 pendiente: hasta entonces, humano (retry_video_render).
+  { id: 'videogen_failed', codes: ['videogen_failed'], class: 'C', strategy: 'hold_for_human', paidRisk: 'uncertain', provider: 'videogen', rounds: 0, humanReason: 'duplicate_charge', adminAction: 'retry_video_render' },
+  {
+    id: 'provider_config',
+    codes: ['videogen_not_configured', 'real_video_not_allowed', 'video_preview_not_allowed', 'PROVIDER_MODE_UNSET', 'provider_mode_unset',
+      'mock_not_allowed', 'provider_mock_not_allowed', 'paid_real_provider_requires_admin_approval', 'real_spend_requires_human_approval',
+      'provider_not_ready', 'video_delivery_not_youtube', 'videogen_rejected_definitively', 'GAMMA_COVER_RASTERIZER_UNAVAILABLE',
+      'theme_resolution_failed', 'gamma_rejected_definitively', 'openai_tts_rejected_definitively', 'insufficient_quota'],
+    family: /^(provider_mode_[a-z_]+|GAMMA_THEME_[A-Z0-9_]+)$/,
+    class: 'D', strategy: 'hold_for_human', scope: 'provider', rounds: 0, humanReason: 'config', adminAction: 'retry_item',
+  },
+
+  // ── YouTube ────────────────────────────────────────────────────────────────
+  { id: 'youtube_upload_failed', codes: ['youtube_upload_failed'], class: 'A', strategy: 'retry_backoff', provider: 'youtube', rounds: 3 },
+  {
+    id: 'youtube_ambiguous', codes: ['youtube_upload_ambiguous', 'ambiguous_youtube_upload', 'youtube_ambiguous'],
+    class: 'C', strategy: 'provider_check', paidRisk: 'none', provider: 'youtube', rounds: 1, adminAction: 'resolve_youtube',
+  },
+  { id: 'youtube_quota', codes: ['youtube_blocked_quota', 'wait_quota', 'blocked_quota'], class: 'A', strategy: 'wait_provider', scope: 'provider', provider: 'youtube', rounds: 3 },
+  {
+    id: 'youtube_auth',
+    codes: ['youtube_blocked_auth', 'blocked_auth', 'reauth_required', 'reconnect_youtube', 'youtube_preflight_failed', 'needs_youtube_preflight',
+      'channel_unresolved', 'youtube_publisher_not_configured', 'oauth_failed'],
+    class: 'D', strategy: 'hold_for_human', scope: 'provider', provider: 'youtube', rounds: 0, humanReason: 'config', adminAction: 'resolve_youtube',
+  },
+  {
+    id: 'youtube_verify',
+    codes: ['youtube_video_not_verified', 'video_not_unlisted', 'video_not_found', 'video_not_owned', 'video_id_invalid', 'youtube_invalid_url', 'video_lookup_failed'],
+    class: 'A', strategy: 'repoll_external', provider: 'youtube', rounds: 2,
+  },
+  {
+    id: 'youtube_delivery',
+    codes: ['youtube_delivery_incomplete', 'youtube_delivery_without_videogen_job', 'youtube_missing_videogen_download_url',
+      'v3_requires_youtube_delivery', 'invalid_video_delivery'],
+    class: 'B', strategy: 'regenerate_dependency', provider: 'youtube', rounds: 1,
+  },
+
+  // ── Gamma ──────────────────────────────────────────────────────────────────
+  {
+    id: 'gamma_repoll', codes: ['gamma_timeout', 'gamma_poll_failed', 'gamma_export_missing', 'gamma_pdf_download_failed'],
+    class: 'A', strategy: 'repoll_external', provider: 'gamma', rounds: 3,
+    refine: ({ outputSummary }) => (hasGammaId(outputSummary) ? null : { strategy: 'retry_backoff' }),
+  },
+  { id: 'gamma_submit_failed', codes: ['gamma_submit_failed'], class: 'A', strategy: 'retry_backoff', provider: 'gamma', rounds: 1 },
+  // Decisión D3 pendiente: hasta entonces, humano (reconcile_provider).
+  {
+    id: 'gamma_ambiguous', codes: ['gamma_submit_ambiguous', 'ambiguous_gamma_submission'],
+    class: 'C', strategy: 'hold_for_human', paidRisk: 'uncertain', provider: 'gamma', rounds: 0, humanReason: 'duplicate_charge', adminAction: 'reconcile_provider',
+  },
+  { id: 'gamma_cover_render', codes: ['GAMMA_COVER_RENDER_FAILED'], class: 'A', strategy: 'retry_backoff', provider: 'gamma', rounds: 1 },
+
+  // ── TTS (OpenAI) ───────────────────────────────────────────────────────────
+  {
+    // Antes del primer trozo cobrado → A. Después de trozos ya cobrados (chunk N/M, N > 1) → C (user decision 1).
+    id: 'tts_failed', codes: ['tts_failed'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'openai', rounds: 3,
+    refine: ({ error }) => {
+      const m = /chunk (\d+)\/(\d+)/.exec(error);
+      return m && Number(m[1]) > 1 ? { class: 'C', strategy: 'auto_resubmit_once', rounds: 1, adminAction: 'reconcile_provider', humanReason: 'duplicate_charge' } : null;
+    },
+  },
+  {
+    id: 'provider_reconciliation',
+    codes: ['provider_reconciliation_required', 'confirm_paid_required', 'may_have_rendered_ack_required'],
+    class: 'C', strategy: 'provider_check', paidRisk: 'uncertain', rounds: 1, humanReason: 'duplicate_charge', adminAction: 'reconcile_provider',
+  },
+] as Rule[]);
+
+/** Empaque (scope package, R9). El código sale de CUALQUIER token en mayúsculas conocido del mensaje. */
+const PACKAGE_RULES: readonly Rule[] = Object.freeze([
+  { id: 'package_transient', codes: ['PACKAGING_V3_CONTENT_MISSING', 'ERR_BUFFER_TOO_LARGE', 'package_transient'], class: 'A', strategy: 'repackage', scope: 'package', rounds: 5 },
+  {
+    id: 'package_component',
+    codes: ['EXAM_BANK_INVALID', 'QUIZ_V3_BANK_INVALID', 'QUIZ_V3_EMPTY', 'QUIZ_V3_INVALID', 'H5P_ACTIVITY_PAYLOAD_INVALID', 'H5P_INPUT_INVALID',
+      'H5P_BS_INVARIANT', 'H5P_DIALOG_CARDS_INVALID', 'VIDEO_INTRO_INVALID', 'VIDEO_YOUTUBE_ID_MISSING', 'VIDEO_DURATION_MISSING',
+      'ACTIVITY_INTRO_INVALID', 'LIBRO_V3_INVALID', 'MODULE_INTRO_V3', 'COURSE_INTRO_V3', 'MODULE_INTRO_EXPECT_INVALID', 'SCORM_MANIFEST_INVALID',
+      'ANSWER_LEAK', 'NUMBER_NOT_FROM_FACTS', 'SHELL_NUMBER_NOT_FROM_FACTS', 'EXAM_BANK_PLAN', 'EXAM_BANK_CONTEXT', 'VIDEO_PLAN_INVARIANT',
+      'VIDEO_DURATION_INVALID', 'VIDEO_TOO_SHORT_FOR_INTERACTIONS', 'PRESENTATION_CARD_SLIDE_COUNT'],
+    family: /^(H5P_PACKAGE_[A-Z0-9_]+|VIDEO_ACTIVITY_[A-Z0-9_]+)$/,
+    class: 'B', strategy: 'repair_package', scope: 'package', rounds: 1,
+  },
+  {
+    id: 'package_product',
+    codes: ['SHELL_RENDER', 'LOW_CONTRAST', 'PACKAGING_PLAN_V3_INVALID', 'PACKAGING_V3_NOT_IMPLEMENTED', 'ID_ALLOCATOR', 'FILES_INTEGRITY',
+      'SECTION_LAYOUT_INVALID', 'COURSE_BADGE_INVALID', 'SYNTHETIC_MEDIA_INVALID', 'TOKEN_INVALID', 'VC_INVALID', 'VC_RENDER',
+      'CURSIA_IV_INLINE_SCRIPT_PKG', 'H5P_NOT_GRADABLE_IN_MOODLE', 'ACTIVITY_INTRO_THEME', 'GAMMA_THEME_CONFIG', 'FACTS_INVALID',
+      'VIDEO_PACKAGE_FILENAME_INVALID', 'ACTIVITY_PACKAGE_FILENAME_INVALID', 'V3_VALIDATION_CONTEXT', 'PNG_ENCODE', 'PNG_UNSUPPORTED',
+      'PACKAGE_BUILDER_ERROR'],
+    family: /^(MBZ_V3_[A-Z0-9_]+|ASSESSMENT_[A-Z0-9_]+|WEIGHTS_[A-Z0-9_]+|THEME_[A-Z0-9_]+|H5P_PROFILE_[A-Z0-9_]+|H5P_PACK_[A-Z0-9_]+|H5P_L10N_[A-Z0-9_]+|H5P_PREFLIGHT_[A-Z0-9_]+|H5P_STORE_[A-Z0-9_]+|H5P_UUID_[A-Z0-9_]+|H5P_SUBCONTENT_[A-Z0-9_]+|MOCK_[A-Z0-9_]+|ACTIVITY_TYPE_INVALID_[A-Z0-9_]+)$/,
+    class: 'D', strategy: 'hold_for_human', scope: 'package', rounds: 0, humanReason: 'product_bug', adminAction: 'retry_package',
+  },
+  {
+    id: 'package_precheck', codes: ['pending_video_omitted', 'preview_not_deliverable', 'qa_preview', 'owner_not_allowed'],
+    class: 'D', strategy: 'hold_for_human', scope: 'package', rounds: 0, humanReason: 'config', adminAction: 'resolve_package_block',
+  },
+] as Rule[]);
+
+/** Restauración en Moodle (scope package, R10). */
+const RESTORE_RULES: readonly Rule[] = Object.freeze([
+  { id: 'restore_infra', family: /^RESTORE_INFRA_[A-Z0-9_]+$/, class: 'A', strategy: 'reverify', scope: 'package', rounds: 5 },
+  { id: 'restore_precheck', codes: ['RESTORE_PRECHECK_ERROR'], class: 'B', strategy: 'repair_package', scope: 'package', rounds: 1 },
+  {
+    id: 'restore_product', codes: ['RESTORE_EXECUTE_FAILED', 'RESTORE_COUNTS_MISMATCH', 'RESTORE_H5P_DEPLOY_FAILED'],
+    class: 'D', strategy: 'hold_for_human', scope: 'package', rounds: 0, humanReason: 'product_bug', adminAction: 'retry_package',
+  },
+] as Rule[]);
+
+function ruleFor(rules: readonly Rule[], code: string): Rule | null {
+  for (const r of rules) if (r.codes?.includes(code)) return r;
+  for (const r of rules) if (r.family && r.family.test(code)) return r;
+  return null;
+}
+
+/** ¿Hay una regla EXPLÍCITA (item, paquete o restauración) para este código? */
+export function isFailureCodeClassified(code: string): boolean {
+  return !!(ruleFor(ITEM_RULES, code) || ruleFor(PACKAGE_RULES, code) || ruleFor(RESTORE_RULES, code));
+}
+
+/** Todos los códigos exactos de la tabla (para el check y la documentación). */
+export function classifiedCodes(): string[] {
+  return [...new Set([...ITEM_RULES, ...PACKAGE_RULES, ...RESTORE_RULES].flatMap((r) => r.codes ?? []))].sort();
+}
+
+// ─── Extracción del código desde el mensaje ─────────────────────────────────
+
+/** Tipos de item que el ejecutor usa como prefijo de un mensaje de contrato del claim («video_interactions: …»). */
+const ITEM_TYPE_PREFIXES = new Set([
+  'content', 'scorm', 'exam', 'video', 'course_plan', 'course_intro', 'module_intro', 'experience', 'video_interactions', 'activity',
+  'final_exam', 'presentation', 'audio_welcome', 'audiobook_chapter',
+]);
+
+/** Frases estables del ejecutor del navegador / de api() (04-api.js) → código. Orden = prioridad. */
+const PHRASES: ReadonlyArray<[RegExp, string]> = [
+  [/^(?:❌\s*)?Fall[oó] despu[eé]s de \d+ intentos\b/i, 'browser_llm_transient'],
+  [/^no se pudo subir el artifact\b/i, 'artifact_upload_failed'],
+  [/^complete rechazado\b/i, 'complete_rejected'],
+  [/^OUTPUT_TRUNCATED_MAX_TOKENS\b/, 'OUTPUT_TRUNCATED_MAX_TOKENS'],
+  [/^respuesta truncada \(stop_reason=max_tokens\)/i, 'llm_output_truncated'],
+  [/inv[aá]lido tras reintento dirigido\b/i, 'validation_invalid'],
+  [/^plan de conceptos( fusionado)? inv[aá]lido\b/i, 'concept_plan_invalid'],
+  [/^SCORM v2 inv[aá]lido\b/i, 'scorm_invalid'],
+  [/^contenido vac[ií]o\b/i, 'content_empty'],
+  [/^GIFT\b.*\b(incompleto|inv[aá]lido)\b/i, 'gift_invalid'],
+  [/^JSON inv[aá]lido\b/i, 'llm_output_invalid'],
+  [/^falta la lista "questions"/i, 'llm_output_invalid'],
+  [/^tipo no soportado\b/i, 'unsupported_item_type'],
+  [/^rulesVersion no soportado\b/i, 'unsupported_rules_version'],
+  [/^(?:❌\s*)?No tienes acceso\b/i, 'browser_auth'],
+  [/^Sin sesi[oó]n activa\b/i, 'browser_session_missing'],
+  [/^(?:❌\s*)?El servicio de IA de este entorno no est[aá] configurado/i, 'proxy_misconfigured'],
+  [/^(?:❌\s*)?Sin disponibilidad de generaci[oó]n/i, 'llm_credit_exhausted'],
+  [/^(?:❌\s*)?Error de configuraci[oó]n interna/i, 'llm_model_config'],
+  [/^(?:❌\s*)?Error al procesar la solicitud\b/i, 'llm_request_rejected'],
+  [/^Modelo no (?:seleccionado|permitido)\b/i, 'llm_model_missing'],
+  [/^API key no configurada\b/i, 'llm_api_key_missing'],
+  [/^Petici[oó]n demasiado grande\b/i, 'llm_request_too_large'],
+  [/^Servidor ocupado\b|^Error del servidor\b|^Error de red\b/i, 'llm_transient'],
+  [/^Respuesta vac[ií]a\b/i, 'llm_empty_response'],
+  [/^Generaci[oó]n detenida por el usuario\b/i, 'user_stopped'],
+  [/^(fetch failed|network error|socket hang up|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN)\b/i, 'llm_network'],
+];
+
+const UPPER_TOKEN_RE = /\b([A-Z][A-Z0-9]*_[A-Z0-9_]+)\b/g;
+
+/** Códigos internos entre corchetes de v3ValidationErrorMessage / tras `presentation_artifact_invalid:`. */
+function innerCodesOf(error: string): string[] {
+  const out = new Set<string>();
+  const br = /\[([A-Z0-9_,\s]+)\]/.exec(error);
+  if (br) for (const c of br[1].split(',').map((x) => x.trim()).filter(Boolean)) out.add(c);
+  const m = /^(?:presentation_artifact_invalid|v3_payload_invalid):\s*([A-Z][A-Z0-9_]+(?:,\s*[A-Z][A-Z0-9_]+)*)/.exec(error);
+  if (m) for (const c of m[1].split(',').map((x) => x.trim())) out.add(c);
+  return [...out];
+}
+
+function httpStatusOf(error: string): number | null {
+  const m = /\(HTTP (\d{3})\)|\bHTTP (\d{3})\b|^(?:❌\s*)?(?:Servidor ocupado|Error del servidor|Error de red) \((\d{3})\)|\bstatus[ =:]+(\d{3})\b/i.exec(error);
+  if (!m) return null;
+  const n = Number(m[1] ?? m[2] ?? m[3] ?? m[4]);
+  return Number.isInteger(n) && n >= 100 && n <= 599 ? n : null;
+}
+
+/** Código estable de un mensaje de error (sin errorCode explícito). */
+export function extractFailureCode(error: string): string {
+  const e = String(error ?? '').trim();
+  if (!e) return 'unknown_error';
+  for (const [re, code] of PHRASES) if (re.test(e)) return code;
+  const lead = /^([A-Za-z][A-Za-z0-9_]*)(?=$|[\s:(—\-,.])/.exec(e);
+  if (lead) {
+    const tok = lead[1];
+    // «<tipo>: …» / «activity h5p: …» = mensaje de contrato del claim del ejecutor: código interno si lo hay.
+    if (ITEM_TYPE_PREFIXES.has(tok) && /^[a-z_]+(?: h5p)?:/.test(e)) {
+      UPPER_TOKEN_RE.lastIndex = 0;
+      for (const m of e.matchAll(UPPER_TOKEN_RE)) if (isFailureCodeClassified(m[1])) return m[1];
+      return 'claim_contract';
+    }
+    if (/^[A-Z][A-Z0-9]*$/.test(tok) && !tok.includes('_')) {
+      // Palabra en mayúsculas sin '_' (p.ej. «HTTP 503 …»): no es un código.
+    } else if (tok.length <= FAILURE_CODE_MAX) {
+      return tok;
+    }
+  }
+  return 'unknown_error';
+}
+
+// ─── Comportamiento ACTUAL (auto-heal.ts, sin cambios) ──────────────────────
+
+/** Qué haría HOY el sistema con este fallo (auto-healer R16 / reintento seguro BE-B). Informativo. */
+export function currentRecoveryOf(error: string, itemType: string | null | undefined, outputSummary: Record<string, any> | null | undefined): CurrentRecovery {
+  const e = String(error ?? '').trim();
+  const os = outputSummary ?? {};
+  const denied = AUTO_HEAL_DENY_PATTERNS.some((re) => re.test(e));
+  const safe = SAFE_AUTO_RETRY_RULES.find((r) => r.match.test(e) && (!itemType || itemType === r.type));
+  if (safe && !denied && safe.requires(os, e)) return 'safe_auto_retry';
+  if (denied) return 'denied';
+  const rule = AUTO_HEAL_ALLOW_LIST.find((r) => r.match.test(e));
+  if (rule && (!rule.requires || rule.requires(os))) return 'auto_heal';
+  return 'manual';
+}
+
+// ─── Clasificación ──────────────────────────────────────────────────────────
+
+function verdictOf(rule: Rule, code: string, ctx: RefineCtx, extra: Partial<FailureVerdict>): FailureVerdict {
+  const patch = rule.refine ? rule.refine(ctx) : null;
+  const r: Rule = patch ? { ...rule, ...patch } : rule;
+  return {
+    class: r.class,
+    code: code.slice(0, FAILURE_CODE_MAX),
+    strategy: r.strategy,
+    scope: r.scope ?? 'item',
+    paidRisk: r.paidRisk ?? 'none',
+    targetRounds: r.rounds,
+    provider: r.provider ?? null,
+    adminAction: r.adminAction ?? null,
+    humanReason: r.humanReason ?? null,
+    rule: rule.id,
+    unclassified: false,
+    httpStatus: ctx.httpStatus,
+    ...extra,
+  };
+}
+
+/** HTTP de la IA sin código reconocible (gateway del servidor / mensajes crudos). */
+function httpFallbackCode(status: number, error: string): string | null {
+  if (status === 413) return 'llm_request_too_large';
+  if (status === 429 || status === 408 || status === 529 || (status >= 500 && status <= 599)) return 'llm_transient';
+  if (status === 400 && /credit|balance/i.test(error)) return 'llm_credit_exhausted';
+  if (status === 401 || status === 403) return 'llm_auth_rejected';
+  if (status === 400) return 'llm_request_rejected';
+  return null;
+}
+
+/**
+ * Clasifica un fallo. Nunca lanza. `source: 'package_worker' | 'restore_worker'` usa las tablas de
+ * empaque/restauración (códigos en mayúsculas en cualquier parte del mensaje); el resto, la de items.
+ */
+export function classifyFailure(input: FailureInput): FailureVerdict {
+  const error = String(input?.error ?? '').trim();
+  const os = (input?.outputSummary ?? {}) as Record<string, any>;
+  const itemType = input?.itemType ?? null;
+  const httpStatus = (typeof input?.httpStatus === 'number' ? input.httpStatus : null) ?? httpStatusOf(error);
+  const ctxBase = { error, httpStatus, outputSummary: os, itemType };
+  const scoped = input?.source === 'package_worker' ? PACKAGE_RULES : input?.source === 'restore_worker' ? RESTORE_RULES : null;
+
+  if (scoped) {
+    const explicit = isValidFailureCode(input.errorCode) ? ruleFor(scoped, input.errorCode) : null;
+    if (explicit) return verdictOf(explicit, input.errorCode as string, { ...ctxBase, code: input.errorCode as string }, {});
+    const lead = extractFailureCode(error);
+    const lr = ruleFor(scoped, lead);
+    if (lr) return verdictOf(lr, lead, { ...ctxBase, code: lead }, {});
+    for (const m of error.matchAll(UPPER_TOKEN_RE)) {
+      const r = ruleFor(scoped, m[1]);
+      if (r) return verdictOf(r, m[1], { ...ctxBase, code: m[1] }, {});
+    }
+    if (/download|timeout|ETIMEDOUT|ECONNRESET|fetch failed|HTTP 5\d\d|storage/i.test(error)) {
+      const tc = scoped === PACKAGE_RULES ? 'package_transient' : 'RESTORE_INFRA_UNKNOWN';
+      const r = ruleFor(scoped, tc);
+      if (r) return verdictOf(r, tc, { ...ctxBase, code: tc }, {});
+    }
+    return unclassifiedVerdict(isValidFailureCode(input.errorCode) ? input.errorCode : extractFailureCode(error), httpStatus, 'package');
+  }
+
+  // 1. errorCode explícito y conocido.
+  if (isValidFailureCode(input?.errorCode)) {
+    const r = ruleFor(ITEM_RULES, input.errorCode);
+    if (r) return verdictOf(r, input.errorCode, { ...ctxBase, code: input.errorCode }, withInner(input.errorCode, error));
+  }
+  // 2. Código del mensaje.
+  const code = extractFailureCode(error);
+  const rule = ruleFor(ITEM_RULES, code);
+  if (rule) return verdictOf(rule, code, { ...ctxBase, code }, withInner(code, error));
+  // 3. Status HTTP de la IA / proveedor.
+  if (httpStatus !== null) {
+    const hc = httpFallbackCode(httpStatus, error);
+    const hr = hc ? ruleFor(ITEM_RULES, hc) : null;
+    if (hr && hc) return verdictOf(hr, hc, { ...ctxBase, code: hc }, {});
+  }
+  // 4. Desconocido: A ×1 → D `unclassified_error` (R3) + alerta de ingeniería.
+  return unclassifiedVerdict(isValidFailureCode(input?.errorCode) ? input.errorCode : code, httpStatus, 'item');
+}
+
+function withInner(code: string, error: string): Partial<FailureVerdict> {
+  if (code !== 'v3_payload_invalid' && code !== 'presentation_artifact_invalid') return {};
+  const inner = innerCodesOf(error);
+  return inner.length ? { innerCodes: inner } : {};
+}
+
+function unclassifiedVerdict(code: string, httpStatus: number | null, scope: Scope): FailureVerdict {
+  return {
+    class: 'A',
+    code: (isValidFailureCode(code) ? code : 'unknown_error').slice(0, FAILURE_CODE_MAX),
+    strategy: 'retry_backoff',
+    scope,
+    paidRisk: 'none',
+    targetRounds: 1,
+    provider: null,
+    adminAction: null,
+    humanReason: null,
+    rule: 'unclassified',
+    unclassified: true,
+    httpStatus,
+  };
+}
+
+/** Código terminal de R3 para un desconocido que agotó su ronda (documentación / R3). */
+export const UNCLASSIFIED_TERMINAL_CODE = 'unclassified_error';
