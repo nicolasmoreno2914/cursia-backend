@@ -67,10 +67,13 @@ export class ExecutorController {
     @Body() dto: FailItemDto,
     @CurrentUser() user: AuthUser,
   ): Promise<ItemOpResult> {
+    // id = borrador nuevo; null explícito = borrar el anterior (R4); ausente = conservar.
+    const opts: { examBankDraftArtifactId?: string | null; errorCode?: string } = {};
+    if (dto.examBankDraftArtifactId !== undefined) opts.examBankDraftArtifactId = dto.examBankDraftArtifactId;
+    // REL R1: código explícito opcional (solo clasificación).
+    if (dto.errorCode !== undefined) opts.errorCode = dto.errorCode;
     return this.scheduler.failItemDetailed(
-      id, dto.executorId, dto.error, dto.retryable, user.id,
-      // id = borrador nuevo; null explícito = borrar el anterior (R4); ausente = conservar.
-      dto.examBankDraftArtifactId !== undefined ? { examBankDraftArtifactId: dto.examBankDraftArtifactId } : undefined,
+      id, dto.executorId, dto.error, dto.retryable, user.id, Object.keys(opts).length ? opts : undefined,
     );
   }
 }

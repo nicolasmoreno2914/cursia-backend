@@ -71,6 +71,9 @@ env $STG node "$REPO/scripts/verify-v21-manifest-v3-schema.js" > "$OUT/verify-v2
 # V2.1 RF-b: seed de pricing_catalog (las tablas ya las creó setup-schema.js sql; el script es idempotente).
 env $STG node "$REPO/scripts/migrate-v21-finops.js" > "$OUT/migrate-v21-finops.log" 2>&1 || { cat "$OUT/migrate-v21-finops.log"; exit 9; }
 env $STG node "$REPO/scripts/verify-v21-finops-schema.js" > "$OUT/verify-v21-finops.log" 2>&1 || { cat "$OUT/verify-v21-finops.log"; exit 9; }
+# REL R2: log de intentos + columnas de recuperación por item (después del ledger: la vista de costo lo lee).
+env $STG node "$REPO/scripts/migrate-rel-recovery.js" > "$OUT/migrate-rel-recovery.log" 2>&1 || { cat "$OUT/migrate-rel-recovery.log"; exit 9; }
+env $STG node "$REPO/scripts/verify-rel-recovery-schema.js" > "$OUT/verify-rel-recovery.log" 2>&1 || { cat "$OUT/verify-rel-recovery.log"; exit 9; }
 echo "schema + migraciones reales OK"
 
 echo "== Moodle 4.5 local =="

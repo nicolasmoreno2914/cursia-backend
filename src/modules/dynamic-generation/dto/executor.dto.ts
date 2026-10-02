@@ -10,6 +10,7 @@ import {
   IsOptional,
   IsString,
   IsUUID,
+  Matches,
   Max,
   MaxLength,
   Min,
@@ -94,6 +95,19 @@ export class FailItemDto extends ExecutorBaseDto {
   @IsOptional()
   @IsUUID('all')
   examBankDraftArtifactId?: string;
+
+  /**
+   * REL R1: código estable del fallo (p.ej. `EXAM_BANK_INCOMPLETE`, `content_empty`). Opcional y
+   * compatible hacia atrás (un ejecutor viejo no lo manda; uno nuevo contra un backend viejo recibe 400
+   * por forbidNonWhitelisted y reintenta sin él). El servidor lo usa SOLO para clasificar
+   * (reliability/failure-classifier.ts: un código conocido gana sobre el texto); nunca cambia la
+   * transición del item. Formato de código: letra + [A-Za-z0-9_], ≤ 64.
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  @Matches(/^[A-Za-z][A-Za-z0-9_]{0,63}$/)
+  errorCode?: string;
 }
 
 /**

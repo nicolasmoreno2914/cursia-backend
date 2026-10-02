@@ -2,6 +2,10 @@ import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
 import { latestGenerationPredicate } from './item-generations';
 import { evaluateRunCompletion, loadCompletionInputs, terminalStatusFor } from './run-completion';
+import { FailureSource, classifyFailure, currentRecoveryOf } from '../reliability/failure-classifier';
+import { recordItemFailure } from '../reliability/attempt-log';
+import { autoHealMaxRoundsFor } from './auto-heal';
+import { SAFE_AUTO_RETRY_MAX_ROUNDS } from '../reliability/auto-heal-rules';
 
 /**
  * Transiciones de estado de items/run compartidas por RunsService (lecturas:
@@ -97,6 +101,11 @@ export async function applyItemFailure(
    * devolución ordenada de un worker que drena (SIGTERM).
    */
   grantAttempt = false,
+  /**
+   * REL R1/R2: código explícito del emisor (FailItemDto.errorCode) y origen del fallo. Solo se
+   * REGISTRAN (clase/código/estrategia en el item + log de intentos); no cambian la transición.
+   */
+  meta?: { errorCode?: string | null; source?: FailureSource | null },
 ): Promise<FailedTransition | null> {
   const retryAfter =
     typeof retryAfterSeconds === 'number' && Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
@@ -118,13 +127,31 @@ export async function applyItemFailure(
               error = $2,
               updated_at = now()
         where id = $1 and status = 'running'
-        returning id, status, job_id, manifest_id, generation, item_key`,
+        returning id, status, job_id, manifest_id, generation, item_key, type, output_summary`,
       [itemRunId, error, retryable, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS, retryAfter, !!refundAttempt, !!grantAttempt],
     ),
   );
   if (!row) return null;
+  // REL R2: misma transacción — columnas de recuperación del item + cierre del intento (no-op sin esquema).
+  const verdict = classifyFailure({
+    error, errorCode: meta?.errorCode ?? null, source: meta?.source ?? null, itemType: row.type, outputSummary: row.output_summary ?? {},
+  });
+  await recordItemFailure(qr, {
+    itemRunId: row.id, status: row.status, error, verdict,
+    maxRoundsToday: maxAutomaticRoundsToday(error, row.type, row.output_summary ?? {}),
+  });
   const blocked = row.status === 'failed' ? await blockDependents(qr, row.job_id, row.item_key) : [];
   return { id: row.id, status: row.status, blocked };
+}
+
+/**
+ * REL R2: rondas automáticas que el sistema hace HOY con este fallo una vez `failed` (auto-healer R16 o
+ * reintento seguro BE-B, mismas reglas y topes que auto-heal.ts); 0 = solo humano. Informativo.
+ */
+export function maxAutomaticRoundsToday(error: string, type: string | null | undefined, outputSummary: Record<string, any>): number {
+  const cur = currentRecoveryOf(error, type, outputSummary);
+  if (cur === 'safe_auto_retry') return SAFE_AUTO_RETRY_MAX_ROUNDS;
+  return cur === 'auto_heal' ? autoHealMaxRoundsFor(type) : 0;
 }
 
 /**

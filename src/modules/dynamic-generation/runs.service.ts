@@ -135,6 +135,8 @@ import {
   sweepRunExpiredLeases,
   takeCompletedRunsInTx,
 } from './item-transitions';
+import { adminActor, recordItemReopened, recordItemsAbandoned } from '../reliability/attempt-log';
+import { ItemCostView, ItemRecoveryView, loadItemCosts, recoveryViewOf } from './item-recovery-view';
 
 export type ItemRunStatus = 'pending' | 'running' | 'retrying' | 'completed' | 'failed' | 'blocked' | 'cancelled';
 
@@ -211,6 +213,13 @@ export interface ItemRunDto {
    * blocked_auth|blocked_quota|upload_failed|ambiguous) + acciones posibles.
    */
   delivery?: VideoDeliveryView;
+  /**
+   * REL R2 (aditivo): clase/código/estrategia del último fallo, rondas automáticas, próximo reintento,
+   * espera y motivo de atención humana. Solo códigos (el texto sigue en `error`).
+   */
+  recovery: ItemRecoveryView;
+  /** REL R2 (aditivo, solo en la vista del run): costo estimado / real / pendiente del item (ledger). Solo SUPER_ADMIN. */
+  cost?: ItemCostView;
   createdAt: string;
   updatedAt: string;
   finishedAt: string | null;
@@ -1941,6 +1950,13 @@ export class RunsService {
       if (updated.length !== 1) {
         throw new InternalServerErrorException(`No se pudo reabrir el item "${itemKey}" (fila no actualizada)`);
       }
+      // REL R2: la reapertura queda en el log de intentos (misma transacción; no-op sin esquema).
+      await recordItemReopened(qr, target.id, {
+        actor: auto ? 'auto_heal' : isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : actorId !== ownerId ? adminActor(actorId) : 'owner',
+        strategy: auto?.safe ? 'safe_auto_retry' : auto ? 'auto_heal'
+          : resubmitVideo ? 'manual_resubmit_video' : resubmitProvider ? 'manual_resubmit_provider' : 'manual_retry',
+        automatic: !!auto,
+      });
 
       const toUnblock = this.dependentsToUnblock(items, itemKey);
       if (toUnblock.length > 0) {
@@ -2369,6 +2385,10 @@ export class RunsService {
         ),
       );
       if (updated.length !== 1) throw new InternalServerErrorException(`No se pudo reabrir el item "${itemKey}" (fila no actualizada)`);
+      await recordItemReopened(qr, target.id, {
+        actor: isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : actor?.id && actor.id !== ownerId ? adminActor(actor.id) : 'owner',
+        strategy: `youtube_${action}`,
+      });
       const toUnblock = this.dependentsToUnblock(items, itemKey);
       if (toUnblock.length > 0) {
         await qr.query(
@@ -4045,6 +4065,7 @@ export class RunsService {
               `Reapertura inconsistente de la ejecución ${jobId} (${rows.length}/${ids.length} items → ${target})`,
             );
           }
+          for (const id of ids) await recordItemReopened(qr, id, { actor: 'owner', strategy: 'reopen_run' });
         }
 
         await qr.query(
@@ -4280,7 +4301,10 @@ export class RunsService {
         [jobId, NON_TERMINAL_ITEM_STATUSES],
       ),
     );
-    return rows.map((r: any) => r.id);
+    const ids = rows.map((r: any) => r.id);
+    // REL R2: los intentos abiertos de los items cancelados quedan `abandoned` (misma transacción).
+    await recordItemsAbandoned(qr, ids);
+    return ids;
   }
 
   /**
@@ -4344,7 +4368,8 @@ export class RunsService {
     const order = new Map(manifest.manifest.items.map((it, i) => [it.key, i]));
     rows.sort((a: any, b: any) => (order.get(a.item_key) ?? 1e9) - (order.get(b.item_key) ?? 1e9));
     const strategy = frozenVideoDeliveryOf(job.input_payload);
-    const itemDtos = rows.map((r: any) => this.toItemDto(r, strategy));
+    const costs = await loadItemCosts(this.dataSource, job.id);
+    const itemDtos = rows.map((r: any) => this.toItemDto(r, strategy, costs));
     const completion = await this.completionOf(job, rows, manifest);
 
     return {
@@ -4464,7 +4489,7 @@ export class RunsService {
     return { total: videos.length, byState, needsAttention };
   }
 
-  private toItemDto(r: any, strategy?: VideoDeliveryStrategy): ItemRunDto {
+  private toItemDto(r: any, strategy?: VideoDeliveryStrategy, costs?: Map<string, ItemCostView> | null): ItemRunDto {
     const delivery =
       r.type === 'video' && strategy
         ? deliveryViewOf({ strategy, itemStatus: r.status, error: r.error ?? null, outputSummary: r.output_summary ?? {}, nextRetryAt: r.next_retry_at ?? null })
@@ -4485,6 +4510,8 @@ export class RunsService {
       idempotencyKey: r.idempotency_key,
       outputSummary: r.output_summary ?? {},
       ...(delivery ? { delivery } : {}),
+      recovery: recoveryViewOf(r),
+      ...(costs ? { cost: costs.get(r.item_key) ?? { estimated: null, actual: '0', pending: '0', currency: 'USD' as const } } : {}),
       createdAt: toIso(r.created_at),
       updatedAt: toIso(r.updated_at),
       finishedAt: toIso(r.finished_at),

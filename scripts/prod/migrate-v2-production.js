@@ -152,6 +152,16 @@ const MIGRATION_STEPS = [
     summary: 'EV6 H5P v2: courses.review_cards_enabled (nullable, default false; NULL en cursos existentes)',
   },
   {
+    // REL R2 (preparación; nada lo corre desde staging): log de intentos + columnas de recuperación por
+    // item. Aditiva; el código tolera su ausencia (sonda de esquema en reliability/attempt-log.ts: sin
+    // la migración no registra nada y se comporta como antes). Va DESPUÉS del ledger FinOps (la vista
+    // de costo por intento lee generation_cost_events) y de dynamic-generation (generation_item_runs).
+    id: 'rel-recovery',
+    file: 'supabase-migration-rel-recovery.sql',
+    stagingStep: '4h10 (migrate-rel-recovery.js)',
+    summary: 'REL R2: generation_item_attempts (append-only por fila cerrada, RLS) + failure_class/failure_code/recovery_*/cooldown_until/attention_reason en generation_item_runs + vista generation_item_attempt_costs',
+  },
+  {
     // Decisión: SÍ se necesita en producción. El ejecutor dynamic de V2 (y el
     // artifactUpload legacy de 39-brandkit/41-course-setup) sube a
     // cursia-artifacts DESDE EL NAVEGADOR con el JWT del usuario; el

@@ -72,6 +72,8 @@ import {
 } from '../course-shell';
 import { V3_ARTIFACT_TEXT_READER, V3ArtifactTextReader } from './v3-artifact-reader';
 import { EXAM_BANK_DRAFT_ARTIFACT_TYPE, clearExamBankDraft, recordExamBankDraft } from './exam-bank-draft';
+import { FailureSource, classifyFailure, isValidFailureCode } from '../reliability/failure-classifier';
+import { executorKindFor, openItemAttempt, recordItemCompleted, recordItemFailure } from '../reliability/attempt-log';
 
 export type ItemType = ManifestItemType;
 
@@ -535,12 +537,14 @@ export class SchedulerService {
         ),
       );
       if (!row) throw new InternalServerErrorException(`No se pudo reclamar el item ${cand.id} (fila no actualizada)`);
+      // REL R2: el intento se abre en la MISMA transacción del claim (no-op sin el esquema de R2).
+      await openItemAttempt(qr, row, { executorKind: executorKindFor(row.type, ownerId !== undefined), executorId });
       await markRunRunning(qr, job.id);
       try {
         return await this.buildClaimedItem(qr, job, row);
       } catch (err) {
         if (!(err instanceof ClaimPayloadUnavailable)) throw err;
-        await applyItemFailure(qr, row.id, `claim_payload_unavailable: ${err.message}`.slice(0, MAX_ERROR_LENGTH), false);
+        await applyItemFailure(qr, row.id, `claim_payload_unavailable: ${err.message}`.slice(0, MAX_ERROR_LENGTH), false, null, false, false, { source: 'scheduler' });
         await recomputeRunStatus(qr, job.id);
         unavailable = `${row.item_key}: ${err.message}`;
         return null;
@@ -848,6 +852,7 @@ export class SchedulerService {
         ),
       );
       if (done.length !== 1) throw new GuardRejection('not_running');
+      await recordItemCompleted(qr, item.id);
       await recomputeRunStatus(qr, job.id);
     });
   }
@@ -858,7 +863,8 @@ export class SchedulerService {
     error: string,
     retryable: boolean,
     ownerId?: string,
-    opts?: { retryAfterSeconds?: number; refundAttempt?: boolean; grantAttempt?: boolean },
+    /** errorCode (REL R1): código explícito opcional del worker; solo clasificación. */
+    opts?: { retryAfterSeconds?: number; refundAttempt?: boolean; grantAttempt?: boolean; errorCode?: string | null },
   ): Promise<boolean> {
     return (await this.failItemDetailed(itemRunId, executorId, error, retryable, ownerId, opts)).ok;
   }
@@ -873,8 +879,11 @@ export class SchedulerService {
     error: string,
     retryable: boolean,
     ownerId?: string,
-    /** examBankDraftArtifactId: id = borrador nuevo; null = borrar el anterior (falla sin faltante); ausente = conservar. */
-    opts?: { retryAfterSeconds?: number; refundAttempt?: boolean; grantAttempt?: boolean; examBankDraftArtifactId?: string | null },
+    /**
+     * examBankDraftArtifactId: id = borrador nuevo; null = borrar el anterior (falla sin faltante); ausente = conservar.
+     * errorCode (REL R1): código explícito del emisor; solo se registra (clasificación), nunca cambia la transición.
+     */
+    opts?: { retryAfterSeconds?: number; refundAttempt?: boolean; grantAttempt?: boolean; examBankDraftArtifactId?: string | null; errorCode?: string | null },
   ): Promise<ItemOpResult> {
     executorId = this.checkExecutorId(executorId);
     const msg = String(error ?? '').trim().slice(0, MAX_ERROR_LENGTH) || 'unknown_error';
@@ -889,6 +898,7 @@ export class SchedulerService {
       if (d.recorded === false && opts?.examBankDraftArtifactId === null) await clearExamBankDraft(qr, item);
       const t = await applyItemFailure(
         qr, item.id, msg, !!retryable, opts?.retryAfterSeconds ?? null, opts?.refundAttempt === true, opts?.grantAttempt === true,
+        { errorCode: isValidFailureCode(opts?.errorCode) ? opts!.errorCode : null, source: failureSourceFor(item.type, ownerId) },
       );
       if (!t) throw new GuardRejection('not_running');
       await recomputeRunStatus(qr, job.id);
@@ -918,6 +928,11 @@ export class SchedulerService {
         ),
       );
       if (rows.length !== 1) throw new GuardRejection('not_running');
+      // REL R2: runtime guard de presupuesto = fallo D (budget), registrado en la misma transacción.
+      await recordItemFailure(qr, {
+        itemRunId: item.id, status: 'blocked', error: msg, maxRoundsToday: 0,
+        verdict: classifyFailure({ error: msg, itemType: item.type, source: failureSourceFor(item.type, ownerId) }),
+      });
       await blockDependents(qr, job.id, item.item_key);
       await recomputeRunStatus(qr, job.id);
     });
@@ -1739,4 +1754,12 @@ export class SchedulerService {
       throw fail(`snapshot del Blueprint inválido (${err instanceof Error ? err.message : String(err)})`);
     }
   }
+}
+
+/** REL R1: origen de un fallo según quién ejecuta el item (navegador = ownerId presente). */
+function failureSourceFor(type: string, ownerId: string | undefined): FailureSource {
+  if (ownerId !== undefined) return 'browser_executor';
+  if (type === 'video') return 'video_worker';
+  if (type === 'presentation' || type === 'audio_welcome' || type === 'audiobook_chapter') return 'provider_worker';
+  return 'server_executor';
 }
