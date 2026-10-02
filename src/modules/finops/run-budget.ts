@@ -15,7 +15,7 @@ import { FinopsError } from './errors';
 import { cmpDec, normalizeDecimal, DecimalLike } from './decimal';
 import { BudgetDecision, BudgetPolicy, EvaluateBudgetResult, SpentSoFar, evaluateBudget } from './budget';
 import type { EstimateItem, EstimateResult } from './estimator';
-import { bankRequested, expectedExamPlan } from '../course-shell/exam-bank';
+import { bankAskCount, expectedExamPlan } from '../course-shell/exam-bank';
 
 export const BUDGET_APPROVAL_REQUIRED = 'budget_approval_required';
 export const BUDGET_BLOCKED = 'budget_blocked';
@@ -94,8 +94,8 @@ const GENERATING = new Set(['GENERATE', 'REGENERATE']);
  * V542 — escala del banco de un examen para el estimador. Los priors de `llm.exam` / `llm.final_exam`
  * (usage-model.priors.v1.json v1.2) están calibrados con el curso #542 (2 módulos × 2 capítulos): un
  * examen de módulo de 2 capítulos y un final de 2×2. El banco se genera como el ejecutor del navegador
- * (45-dynamic-generation-executor.js, `_dynRunExamBank`): por hoja se piden 2·slots + 1 preguntas
- * (`bankRequested`), repartidas entre los capítulos de la hoja; cada capítulo es una unidad que se parte
+ * (45-dynamic-generation-executor.js, `_dynRunExamBank`): por hoja se piden 2·slots + 2 (selección
+ * múltiple) o 2·slots + 1 (V/F, emparejamiento) preguntas (`bankAskCount`, holgura BANKOPT), repartidas entre los capítulos de la hoja; cada capítulo es una unidad que se parte
  * en llamadas de ≤ 6500 tokens de salida estimados (MC 560, VF 200, EM 300 por pregunta), y CADA
  * llamada lleva el texto del capítulo. Por eso la entrada escala con las llamadas y la salida con los
  * tokens pedidos: { input_tokens: llamadas / llamadas_ref, output_tokens: salida / salida_ref }.
@@ -109,11 +109,11 @@ export const EXAM_BANK_REFERENCE = Object.freeze({
 export const EXAM_BANK_TOKENS_EST = Object.freeze({ multichoice: 560, truefalse: 200, match: 300 } as Record<string, number>);
 export const EXAM_BANK_CALL_OUTPUT_EST = 6500;
 
-export function examBankShape(scope: 'module' | 'final', chapters: ReadonlyArray<{ id: string; moduleId: string }>): { questions: number; calls: number; outputEst: number } {
+export function examBankShape(scope: 'module' | 'final', chapters: ReadonlyArray<{ id: string; moduleId: string }>): { questions: number; calls: number; outputEst: number; units: number } {
   const perChapter = new Map<string, number>();
   let questions = 0;
   for (const leaf of expectedExamPlan(scope, chapters)) {
-    const n = bankRequested(leaf.slots);
+    const n = bankAskCount(leaf.slots, leaf.type);
     questions += n;
     const owners = 'chapterId' in leaf ? [leaf.chapterId] : chapters.filter((c) => c.moduleId === leaf.moduleId).map((c) => c.id);
     const base = Math.floor(n / owners.length);
@@ -122,21 +122,37 @@ export function examBankShape(scope: 'module' | 'final', chapters: ReadonlyArray
   }
   let calls = 0;
   let outputEst = 0;
+  let units = 0;
   for (const est of perChapter.values()) {
     if (est <= 0) continue;
+    units++;
     calls += Math.max(1, Math.ceil(est / EXAM_BANK_CALL_OUTPUT_EST));
     outputEst += est;
   }
-  return { questions, calls, outputEst };
+  return { questions, calls, outputEst, units };
 }
 
-export function examBankUsageScale(itemType: 'exam' | 'final_exam', chapters: ReadonlyArray<{ id: string; moduleId: string }>): { input_tokens: number; output_tokens: number } | null {
+/**
+ * BANKOPT (caché de prompts): cada capítulo (unidad) ESCRIBE su prefijo una vez (fuente + tarea) y las demás
+ * llamadas del capítulo lo LEEN → cache_write_tokens escala con las unidades y cache_read_tokens con las
+ * llamadas (input_tokens, el tail sin caché, también).
+ */
+export type ExamBankUsageScale = { input_tokens: number; output_tokens: number; cache_write_tokens: number; cache_read_tokens: number };
+
+export function examBankUsageScale(itemType: 'exam' | 'final_exam', chapters: ReadonlyArray<{ id: string; moduleId: string }>): ExamBankUsageScale | null {
   if (!chapters.length) return null;
   const scope = itemType === 'exam' ? 'module' : 'final';
   const ref = examBankShape(scope, EXAM_BANK_REFERENCE[itemType]);
   const got = examBankShape(scope, chapters);
   const r4 = (x: number) => Math.round(x * 10000) / 10000;
-  return { input_tokens: r4(got.calls / ref.calls), output_tokens: r4(got.outputEst / ref.outputEst) };
+  // Lecturas: las llamadas que siguen a la primera de cada capítulo (hermanas y reparaciones) crecen con las
+  // llamadas, igual que el tail sin caché.
+  return {
+    input_tokens: r4(got.calls / ref.calls),
+    output_tokens: r4(got.outputEst / ref.outputEst),
+    cache_write_tokens: r4(got.units / ref.units),
+    cache_read_tokens: r4(got.calls / ref.calls),
+  };
 }
 
 /** Capítulos (orden del Manifest) por módulo, desde los items de capítulo. */
@@ -177,7 +193,7 @@ export function estimateItemsForRun(
       moduleId: it.moduleId ?? null,
       chapterId: it.chapterId ?? null,
       action: (actions && actions[it.key]) || 'GENERATE',
-      ...(scale !== null && (scale.input_tokens !== 1 || scale.output_tokens !== 1) ? { usageScale: scale } : {}),
+      ...(scale !== null && Object.values(scale).some((v) => v !== 1) ? { usageScale: scale } : {}),
     });
   }
   return out;

@@ -71,6 +71,7 @@ import {
   videoClaimFacts,
 } from '../course-shell';
 import { V3_ARTIFACT_TEXT_READER, V3ArtifactTextReader } from './v3-artifact-reader';
+import { EXAM_BANK_DRAFT_ARTIFACT_TYPE, recordExamBankDraft } from './exam-bank-draft';
 
 export type ItemType = ManifestItemType;
 
@@ -867,11 +868,16 @@ export class SchedulerService {
     error: string,
     retryable: boolean,
     ownerId?: string,
-    opts?: { retryAfterSeconds?: number; refundAttempt?: boolean; grantAttempt?: boolean },
+    opts?: { retryAfterSeconds?: number; refundAttempt?: boolean; grantAttempt?: boolean; examBankDraftArtifactId?: string | null },
   ): Promise<ItemOpResult> {
     executorId = this.checkExecutorId(executorId);
     const msg = String(error ?? '').trim().slice(0, MAX_ERROR_LENGTH) || 'unknown_error';
     return this.guardedItemOp(itemRunId, executorId, ownerId, 'update', async (qr, job, item) => {
+      // BANKOPT (1e): borrador del banco de un examen incompleto (validado; si no corresponde, se ignora).
+      if (opts?.examBankDraftArtifactId) {
+        const d = await recordExamBankDraft(qr, item, job.owner_id, opts.examBankDraftArtifactId, !!retryable);
+        if (d.recorded === false) this.logger.warn(`failItem ${item.id}: borrador del banco ignorado (${d.reason})`);
+      }
       const t = await applyItemFailure(
         qr, item.id, msg, !!retryable, opts?.retryAfterSeconds ?? null, opts?.refundAttempt === true, opts?.grantAttempt === true,
       );
@@ -1221,7 +1227,8 @@ export class SchedulerService {
     if (row.type === 'exam' || row.type === 'final_exam') {
       // EV6 P2: plan del banco (el mismo que valida completeItem). Sin capítulos → sin bloque (el GIFT sigue aceptado).
       const facts = examBankClaimFacts(manifest as any, row.type, row.module_id ?? mItem.moduleId ?? null);
-      if (facts) out.examBank = facts;
+      // BANKOPT (1e): anuncia que el fail acepta `examBankDraftArtifactId` (borrador entre intentos).
+      if (facts) out.examBank = { ...facts, draftArtifactType: EXAM_BANK_DRAFT_ARTIFACT_TYPE };
     }
     if (row.type === 'module_intro') {
       const mod = manifest.modules.find((m) => m.moduleId === row.module_id);

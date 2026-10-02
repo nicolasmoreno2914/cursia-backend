@@ -528,6 +528,25 @@ async function main() {
     }
   });
 
+  await check('BANKOPT: bankAskCount = lo que pide el ejecutor (MC 2s+2, V/F y EM 2s+1), nunca más que bankMax; el banco subido sigue con bankTarget', () => {
+    for (const sl of [1, 2, 5, 12]) {
+      eq([EB.bankAskCount(sl, 'multichoice'), EB.bankAskCount(sl, 'truefalse'), EB.bankAskCount(sl, 'match')], [2 * sl + 2, 2 * sl + 1, 2 * sl + 1], 'slots ' + sl);
+      assert(EB.bankAskCount(sl, 'multichoice') <= EB.bankMax(sl), 'dentro del máximo del contrato');
+      eq(EB.bankTarget(sl), 2 * sl, 'objetivo sin cambio (2×)');
+    }
+  });
+  await check('BANKOPT: FailItemDto acepta examBankDraftArtifactId (UUID, opcional) y rechaza otra cosa; whitelist estricta como en main.ts', async () => {
+    const { plainToInstance } = require('class-transformer');
+    const { validate } = require('class-validator');
+    const { FailItemDto } = loadDist('modules/dynamic-generation/dto/executor.dto.js');
+    const errs = async (body) => (await validate(plainToInstance(FailItemDto, body), { whitelist: true, forbidNonWhitelisted: true })).map((e) => e.property).sort();
+    const base = { executorId: 'ex-1', error: 'EXAM_BANK_INCOMPLETE: x', retryable: true };
+    eq(await errs(base), [], 'sin borrador');
+    eq(await errs({ ...base, examBankDraftArtifactId: '0b6b6b6b-0000-4000-8000-000000000001' }), [], 'con borrador');
+    eq(await errs({ ...base, examBankDraftArtifactId: 'no-es-uuid' }), ['examBankDraftArtifactId'], 'no UUID');
+    eq(await errs({ ...base, draft: 'x' }), ['draft'], 'otro campo sigue rechazado');
+  });
+
   console.log(`\n${passes} OK, ${failures} FALLAS`);
   process.exit(failures ? 1 : 0);
 }

@@ -1,5 +1,5 @@
 {
-  "version": "usage-priors-v1.2",
+  "version": "usage-priors-v1.3",
   "learnedFromLedger": false,
   "minSamplesToLearn": 20,
   "defaultRetryRate": 0.15,
@@ -33,6 +33,24 @@
     "notCalibrated": "gamma (estimado 0.69/presentación vs 0.425 medido, 4 muestras) se deja alto a propósito (lado seguro); videogen 0.94/render coincide; openai 0.21 vs 0.24 estimado.",
     "check": "2×2 de #542 (36 items, scripts/check-v21-finops.js «calibración V542»): estimado expected ≈ USD 13.5 vs gasto REAL ≈ 11.73 (+15 %, objetivo ±20 %) y vs 14.55 registrado (−7 %). El objetivo es el REAL: los 2.82 restantes del registrado son reservas de Videogen de 3 fallas previas al render (resultado incierto, pendientes de conciliar), no consumo."
   },
+  "calibrationBankopt": {
+    "source": "BANKOPT (scratchpad/r18/BANKOPT-report.md): el ejecutor pide holgura por hoja (MC 2s+2, V/F y EM 2s+1), reubica la evidencia parafraseada, repara solo lo que falta, reintenta solo la hoja corta (borrador en el servidor) y cachea el prefijo de cada capítulo (5 min). Sin corrida real todavía: el gasto esperado se PROYECTA con el LLM falso de bankopt/sim.mjs.",
+    "method": "Mismo método que calibrationV542: expected = precio(p50) × (1 + retryRate) ⇒ precio(p50) = esperado / (1 + retryRate). Esperado por ítem = medido en #542 × (simulación rama / simulación staging), con la tasa de fallas que reproduce #542 en staging (RATE_X=4: staging simula exam 2.22 en 2 ítems y final 2.17 vs 2.23 / 2.12 medidos). Rama simulada: exam 1.116 (2 ítems), final 1.040 ⇒ ratios 0.502 / 0.480. Tokens p50 = forma de la simulación por ítem (entrada sin caché, salida, escritura y lectura de caché) escalada al esperado y dividida por 1.15. p10 = corrida limpia de la simulación (RATE_X=1); p90 ≈ 1.6 × p50.",
+    "exam": {
+      "projectedPerItemUSD": 0.56,
+      "retryRate": 0.15,
+      "retryRateWhy": "el reintento por EXAM_BANK_INCOMPLETE ya no regenera el examen entero: reanuda del borrador y solo repara la hoja corta (en la simulación los reintentos van dentro de los tokens del ítem)",
+      "p50USD": 0.487,
+      "reference": "examen de módulo de 2 capítulos (42 preguntas pedidas con holgura, 17 slots)"
+    },
+    "final_exam": {
+      "projectedPerItemUSD": 1.018,
+      "retryRate": 0.15,
+      "p50USD": 0.885,
+      "reference": "final de 2×2 (74 preguntas pedidas con holgura, 33 slots)"
+    },
+    "check": "scripts/check-v21-finops.js «calibración V542»: exam/final ≈ proyectados (±5 %), banco del 2×2 ≈ 2.14 (antes 4.35), total del 2×2 dentro de ±20 % del real proyectado (11.73 − 4.35 + 2.14 = 9.52) y del registrado proyectado (14.55 − 2.21 = 12.34). Reemplazar por percentiles aprendidos del ledger (cache_read/cache_write reales) cuando haya ≥ 20 muestras."
+  },
   "operations": {
     "llm.course_plan":        { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 3000, "p50": 5000, "p90": 8000 }, "output_tokens": { "p10": 1500, "p50": 3000, "p90": 5000 } } },
     "llm.course_intro":       { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 2000, "p50": 3000, "p90": 5000 }, "output_tokens": { "p10": 600, "p50": 1000, "p90": 1800 } } },
@@ -42,8 +60,8 @@
     "llm.video_interactions": { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 2500, "p50": 4000, "p90": 6000 }, "output_tokens": { "p10": 500, "p50": 900, "p90": 1500 } } },
     "llm.activity":           { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 3000, "p50": 5000, "p90": 8000 }, "output_tokens": { "p10": 2000, "p50": 4000, "p90": 7000 } } },
     "llm.scorm":              { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 4000, "p50": 6000, "p90": 9000 }, "output_tokens": { "p10": 6000, "p50": 10000, "p90": 14000 } } },
-    "llm.exam":               { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "retryRate": 0.35, "meters": { "input_tokens": { "p10": 36000, "p50": 90000, "p90": 150000 }, "output_tokens": { "p10": 16000, "p50": 37000, "p90": 60000 } } },
-    "llm.final_exam":         { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "retryRate": 0.35, "meters": { "input_tokens": { "p10": 80000, "p50": 170000, "p90": 280000 }, "output_tokens": { "p10": 31000, "p50": 70000, "p90": 110000 } } },
+    "llm.exam":               { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "retryRate": 0.15, "meters": { "input_tokens": { "p10": 1700, "p50": 5400, "p90": 8700 }, "output_tokens": { "p10": 20800, "p50": 27700, "p90": 44400 }, "cache_write_tokens": { "p10": 11400, "p50": 11400, "p90": 18200 }, "cache_read_tokens": { "p10": 21900, "p50": 47800, "p90": 76500 } } },
+    "llm.final_exam":         { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "retryRate": 0.15, "meters": { "input_tokens": { "p10": 9300, "p50": 17500, "p90": 28000 }, "output_tokens": { "p10": 38800, "p50": 50100, "p90": 80200 }, "cache_write_tokens": { "p10": 8700, "p50": 13800, "p90": 22100 }, "cache_read_tokens": { "p10": 66900, "p50": 99300, "p90": 158900 } } },
     "llm.audiobook_script":   { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 3000, "p50": 5000, "p90": 8000 }, "output_tokens": { "p10": 500, "p50": 700, "p90": 1000 } } },
     "tts.audio_welcome":      { "provider": "openai", "service": "audio.speech", "product": "gpt-4o-mini-tts", "meters": { "text_input_tokens": { "p10": 150, "p50": 250, "p90": 400 }, "audio_output_tokens": { "p10": 900, "p50": 1250, "p90": 2000 } } },
     "tts.audiobook_chapter":  { "provider": "openai", "service": "audio.speech", "product": "gpt-4o-mini-tts", "meters": { "text_input_tokens": { "p10": 550, "p50": 650, "p90": 800 }, "audio_output_tokens": { "p10": 3200, "p50": 4000, "p90": 5000 } } },

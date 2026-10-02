@@ -1215,6 +1215,57 @@ async function dbChecks() {
       eq([fdone.output_summary.v3Validation.artifactType, fdone.output_summary.v3Validation.questionCount, fdone.output_summary.v3Validation.bankSize], ['dynamic_exam_bank_json', 25, 50], 'summary final');
     });
 
+    await check('DB BANKOPT (1e): el claim anuncia el borrador; el fail retryable con examBankDraftArtifactId válido lo deja en output_summary.examBankDraft (generación vigente) y el próximo claim lo trae; artifact ajeno, de otro item o de otro tipo → ignorado; no retryable / no examen → nunca (el fail se registra igual)', async () => {
+      const examKey = `exam:${M1}`;
+      // El exam quedó completado arriba: se reabre como intento nuevo.
+      await ds.query(`update public.artifacts set item_run_id = null where item_run_id = (select id from public.generation_item_runs where job_id = $1 and item_key = $2)`, [job.id, examKey]);
+      await ds.query(`update public.generation_item_runs set status = 'pending', worker_id = null, lease_until = null, attempt_count = 0, max_attempts = 10, error = null, finished_at = null, output_summary = '{}'::jsonb, next_retry_at = null where job_id = $1 and item_key = $2`, [job.id, examKey]);
+      const ex = await claim(['exam']);
+      assert(ex, 'claim exam: ' + JSON.stringify(await item(examKey)));
+      eq(ex.claimPayload.examBank.draftArtifactType, 'dynamic_exam_bank_draft_json', 'el claim anuncia el soporte de borrador');
+      const draftArt = async (itemRunId, type = 'dynamic_exam_bank_draft_json', owner = OWNER) => (await ds.query(
+        `insert into public.artifacts (owner_id, course_id, type, storage_path, metadata) values ($1, $2, $3, $4, $5::jsonb) returning id`,
+        [owner, String(cid), type, `r11/draft/${Math.random()}`, JSON.stringify({ itemRunId, itemKey: examKey })]))[0].id;
+      // Negativos: el fail se registra (ok) pero sin borrador.
+      const other = await item(`content:${C1}`);
+      const OTHER_OWNER = '99999999-9999-4999-8999-999999999999';
+      for (const [label, idFn, retryable] of [
+        ['de otro item', () => draftArt(other.id), true],
+        ['de otro tipo', () => draftArt(ex.itemRunId, 'dynamic_exam_bank_json'), true],
+        ['de otro dueño', () => draftArt(ex.itemRunId, 'dynamic_exam_bank_draft_json', OTHER_OWNER), true],
+        ['inexistente', async () => '00000000-0000-4000-8000-00000000dead', true],
+      ]) {
+        const cur = await item(examKey);
+        const exN = cur.status === 'running' ? { itemRunId: cur.id } : (await readyAgain(examKey), await claim(['exam']));
+        assert(exN, 'claim ' + label);
+        const r = await sched.failItemDetailed(exN.itemRunId, 'b1', 'EXAM_BANK_INCOMPLETE: prueba ' + label, retryable, OWNER, { examBankDraftArtifactId: await idFn() });
+        eq(r, { ok: true }, 'fail registrado: ' + label);
+        const after = await item(examKey);
+        eq([after.status, after.output_summary.examBankDraft === undefined], ['retrying', true], 'sin borrador: ' + label);
+      }
+      // Positivo.
+      await readyAgain(examKey);
+      const ex2 = await claim(['exam']);
+      assert(ex2, 'claim exam 2');
+      const good = await draftArt(ex2.itemRunId);
+      eq(await sched.failItemDetailed(ex2.itemRunId, 'b1', 'EXAM_BANK_INCOMPLETE: hoja corta', true, OWNER, { examBankDraftArtifactId: good }), { ok: true }, 'fail con borrador');
+      const st = await item(examKey);
+      eq([st.status, st.output_summary.examBankDraft.artifactId, st.output_summary.examBankDraft.generation, st.output_summary.examBankDraft.attempt], ['retrying', good, st.generation, st.attempt_count], 'output_summary.examBankDraft');
+      await readyAgain(examKey);
+      const ex3 = await claim(['exam']);
+      assert(ex3, 'claim exam 3');
+      eq(ex3.outputSummary.examBankDraft.artifactId, good, 'el próximo claim trae el borrador');
+      eq(ex3.generation, st.generation, 'misma generación');
+      // Un fail posterior sin borrador conserva el último (el ejecutor decide si sigue sirviendo).
+      eq(await sched.failItemDetailed(ex3.itemRunId, 'b1', 'otra cosa', true, OWNER), { ok: true }, 'fail sin borrador');
+      eq((await item(examKey)).output_summary.examBankDraft.artifactId, good, 'borrador conservado');
+      // Un item que no es examen nunca guarda borrador.
+      const D = loadDist('modules/dynamic-generation/exam-bank-draft.js');
+      eq(await D.recordExamBankDraft({ async query() { throw new Error('no debe consultar'); } }, { id: other.id, type: 'content', generation: 1, attempt_count: 1 }, OWNER, good, true), { recorded: false, reason: 'not_exam_item' }, 'content');
+      eq(await D.recordExamBankDraft({ async query() { throw new Error('no debe consultar'); } }, { id: st.id, type: 'exam', generation: 1, attempt_count: 1 }, OWNER, 'no-uuid', true), { recorded: false, reason: 'invalid_id' }, 'id inválido');
+      eq(await D.recordExamBankDraft({ async query() { throw new Error('no debe consultar'); } }, { id: st.id, type: 'exam', generation: 1, attempt_count: 1 }, OWNER, good, false), { recorded: false, reason: 'not_retryable' }, 'fail no retryable (sin reintento no hay borrador)');
+    });
+
     await check('DB course_intro: QUANTITY_CLAIM rechazado; válido completo', async () => {
       const ci = await claim(['course_intro']);
       eq([ci.type, ci.claimPayload.validatedArtifactType], ['course_intro', 'dynamic_course_intro_json'], 'claim');

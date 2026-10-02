@@ -1,17 +1,19 @@
 // EV6 P2-B6 — LLM falso de los BANCOS de preguntas (dynamic_exam_bank_json) para el E2E v3.
 //
-// Reconoce los prompts del ejecutor por su marcador de primera línea (F1/F2, 44):
-//   EXAM_BANK_CHAPTER v1        examen del módulo, un capítulo (hojas completas o partes)
-//   EXAM_BANK_FINAL_CHAPTER v1  examen final, un capítulo de un módulo
+// Reconoce los prompts del ejecutor por su marcador de tarea (F1/F2, 44; BANKOPT: prompt en partes
+// «EXAM_BANK_SOURCE v2» + tarea + tail, mandado como bloques con cache_control):
+//   EXAM_BANK_CHAPTER v2        examen del módulo, un capítulo (hojas completas o partes)
+//   EXAM_BANK_FINAL_CHAPTER v2  examen final, un capítulo de un módulo
 //   EXAM_BANK_FINAL_MODULE v1   examen final, un módulo con todos sus capítulos (prompt de F1; F2 ya no lo usa)
-//   EXAM_BANK_REPAIR v1         reparación dirigida (lleva el pedido original tras «PEDIDO ORIGINAL:»)
+//   EXAM_BANK_REPAIR v2         reparación dirigida (mismo prefijo fuente + tarea; la lista va en el tail)
 // y responde EXACTAMENTE los ids pedidos, con el esquema que ve el LLM (5 distractores por
 // selección múltiple) y la evidencia copiada TEXTUAL del Markdown del capítulo que trae el prompt.
 //
-// Falla inyectada UNA vez por corrida (primer prompt de banco de un examen de módulo): una
-// pregunta con evidencia que NO está en el capítulo y una selección múltiple cuyos 5 distractores
-// son todos mucho más cortos que la correcta. El ejecutor debe pedir UNA reparación
-// (EXAM_BANK_REPAIR v1) y la respuesta de la reparación las corrige.
+// Falla inyectada UNA vez por corrida (primer prompt de banco de un examen de módulo): tres preguntas
+// con evidencia que NO está en el capítulo y una selección múltiple cuyos 5 distractores son todos
+// mucho más cortos que la correcta. BANKOPT: la hoja MC pide 2s+2 (holgura 2) → con 4 fallas faltan 2
+// para el objetivo; el ejecutor elige entre las válidas (la «solo más larga» queda fuera sin reparar) y
+// pide UNA reparación (EXAM_BANK_REPAIR v2) solo con 2 de las evidencias falsas, que la respuesta corrige.
 //
 // A1 (contrato): ANTES de devolver, cada pregunta se proyecta al esquema del contrato (3 distractores)
 // y se valida con `validateExamBank` de B2 (dist compilado, con el Markdown del capítulo). Las
@@ -21,11 +23,12 @@
 'use strict';
 
 const BANK_MARKERS = {
-  'EXAM_BANK_CHAPTER v1': 'module',
-  'EXAM_BANK_FINAL_CHAPTER v1': 'final',
+  'EXAM_BANK_CHAPTER v2': 'module',
+  'EXAM_BANK_FINAL_CHAPTER v2': 'final',
   'EXAM_BANK_FINAL_MODULE v1': 'final',
 };
-const REPAIR_MARKER = 'EXAM_BANK_REPAIR v1';
+const REPAIR_MARKER = 'EXAM_BANK_REPAIR v2';
+const SOURCE_MARKER = 'EXAM_BANK_SOURCE v2';
 const TYPE_IDX = { multichoice: 0, truefalse: 1, match: 2 };
 
 // ── Vocabulario (palabras disjuntas por ranura, ≥ 3 letras: el ejecutor descarta enunciados con
@@ -94,15 +97,18 @@ function chapterBlocks(base) {
 }
 
 function parseBankPrompt(prompt) {
-  const marker = prompt.split('\n')[0];
-  const isRepair = marker === REPAIR_MARKER;
-  if (!isRepair && !BANK_MARKERS[marker]) return null;
-  const at = prompt.indexOf('PEDIDO ORIGINAL:\n');
-  if (isRepair && at < 0) throw new Error('fake banco: reparación sin PEDIDO ORIGINAL');
-  const base = isRepair ? prompt.slice(at + 'PEDIDO ORIGINAL:\n'.length) : prompt;
-  const baseMarker = base.split('\n')[0];
-  const scope = BANK_MARKERS[baseMarker];
-  if (!scope) throw new Error(`fake banco: pedido original con marcador desconocido "${baseMarker}"`);
+  const lines = prompt.split('\n');
+  const taskMarker = lines.find((l) => BANK_MARKERS[l]);
+  const repairAt = lines.indexOf(REPAIR_MARKER);
+  const isRepair = repairAt >= 0;
+  if (!taskMarker) {
+    if (isRepair || lines[0] === SOURCE_MARKER) throw new Error('fake banco: prompt de banco sin marcador de tarea');
+    return null;
+  }
+  if (taskMarker !== 'EXAM_BANK_FINAL_MODULE v1' && lines[0] !== SOURCE_MARKER) throw new Error(`fake banco: la fuente del capítulo no va primero (línea 1 "${lines[0]}")`);
+  const marker = isRepair ? REPAIR_MARKER : taskMarker;
+  const base = prompt;
+  const scope = BANK_MARKERS[taskMarker];
   const chm = /Todas las preguntas llevan "chapterId": "([^"]+)"(?: y "moduleId": "([^"]+)")?/.exec(base);
   const mom = /Todas las preguntas llevan "moduleId": "([^"]+)"/.exec(base);
   const blocks = chapterBlocks(base);
@@ -119,7 +125,7 @@ function parseBankPrompt(prompt) {
   if (scope === 'final' && !moduleId) throw new Error('fake banco: prompt del examen final sin moduleId');
   const asks = [];
   if (isRepair) {
-    const head = prompt.slice(0, at);
+    const head = lines.slice(repairAt).join('\n');
     for (const m of head.matchAll(/^- id "([^"]+)" \(type "([a-z]+)"[^)]*\) → (.*)$/gm)) asks.push({ id: m[1], type: m[2], reasons: m[3] });
   } else {
     for (const line of base.split('\n')) {
@@ -203,18 +209,23 @@ function assertContract(contract, parsed, qs, faults) {
  * Devuelve respond(prompt) → { text } | null (no es un prompt de banco).
  */
 function createExamBankFake({ contract, rec, once, st }) {
-  st.examBank = st.examBank || { prompts: 0, repairs: [], faults: [] };
-  return function respondBank(prompt) {
+  st.examBank = st.examBank || { prompts: 0, repairs: [], faults: [], blockShapes: [] };
+  // blocks: contenido del mensaje tal como llegó (bloques de texto con cache_control) o null si era texto.
+  return function respondBank(prompt, blocks) {
     const parsed = parseBankPrompt(prompt);
     if (!parsed) return null;
+    st.examBank.blockShapes.push(Array.isArray(blocks) ? blocks.map((b) => (b && b.cache_control ? b.cache_control.type : null)) : null);
     if (!contract || typeof contract.validateExamBank !== 'function') throw new Error('fake banco: falta el contrato B2 (validateExamBank) para validar las respuestas');
     const retry = /TU RESPUESTA ANTERIOR NO SE PUDO USAR/.test(prompt);
     const faults = {};
-    // Falla UNA vez por corrida: primer pedido (no reparación ni reintento) de un examen de módulo con ≥ 2 MC.
+    // Falla UNA vez por corrida: primer pedido (no reparación ni reintento) de un examen de módulo con ≥ 4 MC
+    // (más fallas que la holgura de la hoja: si no, el ejecutor las absorbe sin reparar).
     const mcIds = parsed.asks.filter((a) => a.type === 'multichoice').map((a) => a.id);
-    if (!parsed.isRepair && !retry && parsed.scope === 'module' && mcIds.length >= 2 && once('exam_bank')) {
+    if (!parsed.isRepair && !retry && parsed.scope === 'module' && mcIds.length >= 4 && once('exam_bank')) {
       faults[mcIds[0]] = 'EXAM_BANK_LENGTH_BIAS';
       faults[mcIds[1]] = 'EXAM_BANK_EVIDENCE';
+      faults[mcIds[2]] = 'EXAM_BANK_EVIDENCE';
+      faults[mcIds[3]] = 'EXAM_BANK_EVIDENCE';
     }
     // Pedido de un capítulo: todas al mismo; prompt de módulo (F1): reparto en ronda entre sus capítulos.
     const qs = parsed.asks.map((a, i) => {
@@ -239,4 +250,4 @@ function createExamBankFake({ contract, rec, once, st }) {
   };
 }
 
-module.exports = { createExamBankFake, parseBankPrompt, BANK_MARKERS, REPAIR_MARKER };
+module.exports = { createExamBankFake, parseBankPrompt, BANK_MARKERS, REPAIR_MARKER, SOURCE_MARKER };

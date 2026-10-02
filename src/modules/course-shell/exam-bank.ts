@@ -172,6 +172,14 @@ export function bankRequested(slots: number): number {
 export function bankMax(slots: number): number {
   return 2 * slots + 2;
 }
+/**
+ * BANKOPT: lo que el ejecutor del navegador PIDE al LLM por hoja (espejo de dynExamBankAskCount, 44):
+ * holgura dentro de bankMax — selección múltiple 2s+2, V/F y emparejamiento 2s+1. El banco subido sigue
+ * conservando bankTarget (2s) por hoja; esto solo dimensiona el costo (estimador, run-budget.ts).
+ */
+export function bankAskCount(slots: number, type: ExamQuestionType): number {
+  return 2 * slots + (type === 'multichoice' ? 2 : 1);
+}
 export function planSlotCount(plan: readonly ExamPlanLeaf[]): number {
   return plan.reduce((a, l) => a + l.slots, 0);
 }

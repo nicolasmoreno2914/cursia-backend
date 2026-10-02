@@ -177,7 +177,7 @@ async function pureChecks() {
     eq(e.totals.byProvider.youtube.max, '0.0000000000', 'youtube $0');
     assert(e.totals.byChapter._none, 'items sin capítulo agrupados en _none');
     eq(e.estimatorVersion, 'finops-estimator-v2', 'versión');
-    eq(e.usageModelVersion, 'usage-priors-v1.2', 'usage model');
+    eq(e.usageModelVersion, 'usage-priors-v1.3', 'usage model');
     assert(leq(e.totals.retryAllowance.expected, e.totals.expected) && leq(e.totals.retryAllowance.max, e.totals.max), 'retryAllowance ⊂ total');
     for (const l of e.lines) assert(typeof l.retryRate === 'number' && l.retryRate >= 0, `retryRate en ${l.itemKey}`);
   });
@@ -198,48 +198,57 @@ async function pureChecks() {
     for (const c of [1, 2, 3, 4]) for (const t of ['content', 'experience', 'presentation', 'video', 'video_interactions', 'activity', 'audiobook_chapter']) add(t, `ch${c}`, `ch${c}`, c <= 2 ? 'm1' : 'm2');
     return man;
   };
-  await check('V542 calibración: el 2×2 de #542 (36 items) estima dentro de ±20 % del gasto REAL (11.73); exámenes, experiencia y contenido ≈ medidos; desglose con reintentos', () => {
+  // BANKOPT (priors v1.3): el banco de exámenes pasa a la PROYECCIÓN de la rama (holgura + evidencia reubicada +
+  // reintento por hoja + caché de prompts; usage-model.priors.v1.json calibrationBankopt): exam 0.56/ítem,
+  // final 1.018 ⇒ banco del 2×2 ≈ 2.14 (medido en staging 4.35). Real proyectado = 11.73 − 4.35 + 2.14 = 9.52;
+  // registrado proyectado = 14.55 − 2.21 = 12.34. Experiencia y contenido siguen con lo medido.
+  await check('V542 calibración (BANKOPT): el 2×2 de #542 (36 items) estima dentro de ±20 % del gasto REAL proyectado (9.52); exámenes ≈ proyección BANKOPT, experiencia y contenido ≈ medidos; desglose con reintentos y caché', () => {
     const items = RB.estimateItemsForRun(course542(), 'real');
     eq(items.length, 36, 'items');
     eq(items.filter((i) => i.usageScale).length, 0, 'el 2×2 es la referencia (escala 1)');
     const e = estimateCost({ items, catalog: CATALOG, usageModel: usageModelPriorsV1(), retryPolicy: { maxRetries: 1 } });
     const n = (x) => Number(x);
     const exp = n(e.totals.expected);
-    const REAL = 11.73;
-    const RECORDED = 14.55;
+    const REAL = 9.52;
+    const RECORDED = 12.34;
     assert(Math.abs(exp - REAL) / REAL <= 0.2, `expected ${exp} vs real ${REAL}: ${(((exp - REAL) / REAL) * 100).toFixed(1)} %`);
     assert(Math.abs(exp - RECORDED) / RECORDED <= 0.2, `expected ${exp} vs registrado ${RECORDED}`);
     const by = (t) => n(e.totals.byItemType[t].expected);
-    for (const [t, actual] of [['exam', 2.23], ['final_exam', 2.12], ['experience', 0.64], ['content', 0.4]]) {
+    for (const [t, actual] of [['exam', 1.12], ['final_exam', 1.018], ['experience', 0.64], ['content', 0.4]]) {
       assert(Math.abs(by(t) - actual) / actual <= 0.05, `${t}: estimado ${by(t)} vs medido ${actual}`);
     }
-    assert(Math.abs(n(e.totals.byProvider.anthropic.expected) - 6.08) / 6.08 <= 0.05, `anthropic ${e.totals.byProvider.anthropic.expected} vs 6.08`);
+    assert(Math.abs(n(e.totals.byProvider.anthropic.expected) - 3.87) / 3.87 <= 0.05, `anthropic ${e.totals.byProvider.anthropic.expected} vs 3.87 (6.08 − 4.35 + 2.14)`);
+    // El banco se estima con los 4 medidores de Sonnet 4.6 (entrada sin caché, salida, escritura y lectura de caché).
+    for (const op of ['llm.exam', 'llm.final_exam']) eq(Object.keys(usageModelPriorsV1().operations[op].meters).sort(), ['cache_read_tokens', 'cache_write_tokens', 'input_tokens', 'output_tokens'], op + ': medidores');
     // El estimado v1.1 (8.82) quedaba −25 % bajo el real y su anthropic (1.49) −75 %: la causa del tope cruzado.
-    assert(exp > 8.82 * 1.4, 'muy por encima del estimado v1.1');
+    assert(exp > 8.82 * 1.2, 'por encima del estimado v1.1 (que subestimaba el banco 14–19×)');
     // Desglose: la reserva por reintentos es visible y los exámenes llevan su tasa medida (0.35).
     const ra = n(e.totals.retryAllowance.expected);
     assert(ra > 0 && ra < exp, `retryAllowance ${ra}`);
-    eq([...new Set(e.lines.filter((l) => l.itemType === 'exam' || l.itemType === 'final_exam').map((l) => l.retryRate))], [0.35], 'retryRate del banco');
-    // Lo que ve la vista previa (StartPreview.estimate.breakdown): banco de exámenes ≈ 4.35 medido; reintentos.
+    eq([...new Set(e.lines.filter((l) => l.itemType === 'exam' || l.itemType === 'final_exam').map((l) => l.retryRate))], [0.15], 'retryRate del banco (reintento por hoja con borrador)');
+    // Lo que ve la vista previa (StartPreview.estimate.breakdown): banco de exámenes ≈ 2.14 proyectado; reintentos.
     const bd = loadDist('modules/finops/normal-approval.js').estimateBreakdown(e);
-    assert(Math.abs(n(bd.examBank.expected) - 4.35) / 4.35 <= 0.05, `breakdown.examBank ${bd.examBank.expected} vs 4.35`);
+    assert(Math.abs(n(bd.examBank.expected) - 2.14) / 2.14 <= 0.05, `breakdown.examBank ${bd.examBank.expected} vs 2.14`);
     eq(bd.retryAllowance, e.totals.retryAllowance, 'breakdown.retryAllowance');
-    console.log(`   2×2 #542: estimado ${exp.toFixed(2)} [${n(e.totals.min).toFixed(2)}–${n(e.totals.max).toFixed(2)}] vs real ${REAL} (${(((exp - REAL) / REAL) * 100).toFixed(1)} %) / registrado ${RECORDED} (${(((exp - RECORDED) / RECORDED) * 100).toFixed(1)} %); anthropic ${n(e.totals.byProvider.anthropic.expected).toFixed(2)} vs 6.08; reintentos ${ra.toFixed(2)}`);
+    console.log(`   2×2 #542 (BANKOPT): estimado ${exp.toFixed(2)} [${n(e.totals.min).toFixed(2)}–${n(e.totals.max).toFixed(2)}] vs real proyectado ${REAL} (${(((exp - REAL) / REAL) * 100).toFixed(1)} %) / registrado proyectado ${RECORDED} (${(((exp - RECORDED) / RECORDED) * 100).toFixed(1)} %); anthropic ${n(e.totals.byProvider.anthropic.expected).toFixed(2)} vs 3.87; banco ${n(bd.examBank.expected).toFixed(2)}; reintentos ${ra.toFixed(2)}`);
   });
-  await check('V542: el banco escala con los capítulos — entrada ∝ llamadas, salida ∝ preguntas pedidas; 1 capítulo cuesta menos, 3×3 más', () => {
+  await check('V542: el banco escala con los capítulos — entrada y lectura de caché ∝ llamadas, escritura ∝ capítulos, salida ∝ preguntas pedidas (con holgura); 1 capítulo cuesta menos, 3×3 más', () => {
     const ch = (k, m) => Array.from({ length: k }, (_, i) => ({ id: `${m}c${i}`, moduleId: m }));
-    eq(RB.examBankUsageScale('exam', ch(2, 'a')), { input_tokens: 1, output_tokens: 1 }, 'referencia módulo');
-    eq(RB.examBankUsageScale('final_exam', [...ch(2, 'a'), ...ch(2, 'b')]), { input_tokens: 1, output_tokens: 1 }, 'referencia final');
-    eq(RB.examBankUsageScale('exam', ch(3, 'a')), { input_tokens: 1.5, output_tokens: 1.4764 }, 'módulo de 3');
-    eq(RB.examBankUsageScale('exam', ch(1, 'a')), { input_tokens: 0.5, output_tokens: 0.4764 }, 'módulo de 1');
-    eq(RB.examBankUsageScale('final_exam', [...ch(3, 'a'), ...ch(3, 'b'), ...ch(3, 'c')]), { input_tokens: 1.125, output_tokens: 1.2309 }, 'final 3×3 (tope 40 slots)');
+    const one = { input_tokens: 1, output_tokens: 1, cache_write_tokens: 1, cache_read_tokens: 1 };
+    eq(RB.examBankUsageScale('exam', ch(2, 'a')), one, 'referencia módulo');
+    eq(RB.examBankUsageScale('final_exam', [...ch(2, 'a'), ...ch(2, 'b')]), one, 'referencia final');
+    // Holgura (BANKOPT): módulo de 2 = 42 preguntas pedidas (MC 12+12, V/F 5+3, EM 5+5), 4 llamadas, 2 capítulos.
+    eq(RB.examBankShape('module', ch(2, 'a')), { questions: 42, calls: 4, outputEst: 18040, units: 2 }, 'forma del módulo de referencia');
+    eq(RB.examBankUsageScale('exam', ch(3, 'a')), { input_tokens: 1.5, output_tokens: 1.4778, cache_write_tokens: 1.5, cache_read_tokens: 1.5 }, 'módulo de 3');
+    eq(RB.examBankUsageScale('exam', ch(1, 'a')), { input_tokens: 0.5, output_tokens: 0.4778, cache_write_tokens: 0.5, cache_read_tokens: 0.5 }, 'módulo de 1');
+    eq(RB.examBankUsageScale('final_exam', [...ch(3, 'a'), ...ch(3, 'b'), ...ch(3, 'c')]), { input_tokens: 1.125, output_tokens: 1.2403, cache_write_tokens: 2.25, cache_read_tokens: 1.125 }, 'final 3×3 (tope 40 slots; 9 capítulos escriben su prefijo)');
     eq(RB.examBankUsageScale('exam', []), null, 'sin capítulos');
     const man = [{ key: 'exam:m1', type: 'exam', moduleId: 'm1' }, ...[1, 2, 3].map((i) => ({ key: `content:c${i}`, type: 'content', moduleId: 'm1', chapterId: `c${i}` }))];
     const items = RB.estimateItemsForRun(man, 'real');
-    eq(items[0].usageScale, { input_tokens: 1.5, output_tokens: 1.4764 }, 'estimateItemsForRun fija la escala');
+    eq(items[0].usageScale, { input_tokens: 1.5, output_tokens: 1.4778, cache_write_tokens: 1.5, cache_read_tokens: 1.5 }, 'estimateItemsForRun fija la escala');
     const e = estimateCost({ items, catalog: CATALOG, usageModel: usageModelPriorsV1(), retryPolicy: { maxRetries: 1 } });
     const l = e.lines.find((x) => x.itemKey === 'exam:m1');
-    eq(l.usageScale, { input_tokens: 1.5, output_tokens: 1.4764 }, 'línea con la escala');
+    eq(l.usageScale, { input_tokens: 1.5, output_tokens: 1.4778, cache_write_tokens: 1.5, cache_read_tokens: 1.5 }, 'línea con la escala');
     const ref = estimateCost({ items: [{ itemKey: 'exam:m1', itemType: 'exam' }], catalog: CATALOG, usageModel: usageModelPriorsV1(), retryPolicy: { maxRetries: 1 } });
     assert(cmpDec(l.expected, ref.lines[0].expected) > 0, 'módulo de 3 > referencia');
     throwsCode(() => estimateCost({ items: [{ itemKey: 'x', itemType: 'exam', usageScale: 0 }], catalog: CATALOG, usageModel: usageModelPriorsV1(), retryPolicy: { maxRetries: 1 } }), 'INVALID_INPUT', 'escala 0');

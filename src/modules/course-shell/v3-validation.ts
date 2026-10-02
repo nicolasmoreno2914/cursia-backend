@@ -268,6 +268,8 @@ export interface ExamBankClaimFacts {
   moduleId: string | null;
   chapters: Array<{ chapterId: string; moduleId: string }>;
   plan: ExamPlanLeaf[];
+  /** BANKOPT (1e): presente si el fail acepta `examBankDraftArtifactId` (lo agrega el claim). */
+  draftArtifactType?: string;
 }
 
 export function examBankClaimFacts(

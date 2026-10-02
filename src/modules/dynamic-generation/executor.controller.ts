@@ -67,6 +67,9 @@ export class ExecutorController {
     @Body() dto: FailItemDto,
     @CurrentUser() user: AuthUser,
   ): Promise<ItemOpResult> {
-    return this.scheduler.failItemDetailed(id, dto.executorId, dto.error, dto.retryable, user.id);
+    return this.scheduler.failItemDetailed(
+      id, dto.executorId, dto.error, dto.retryable, user.id,
+      dto.examBankDraftArtifactId ? { examBankDraftArtifactId: dto.examBankDraftArtifactId } : undefined,
+    );
   }
 }

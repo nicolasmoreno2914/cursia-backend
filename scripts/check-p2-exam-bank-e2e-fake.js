@@ -8,9 +8,12 @@
 // Qué fija (lo mismo que el gate necesita para que E1/E3 pasen en modo banco):
 //   1. examen de módulo (2 capítulos) y examen final (2 módulos): el ejecutor arma bancos que
 //      validateExamBank acepta con la evidencia del Markdown;
-//   2. la falla inyectada (evidencia fuera del capítulo + MC con distractores mucho más cortos) sale
-//      UNA vez, el ejecutor manda EXACTAMENTE UNA reparación (EXAM_BANK_REPAIR v1) y el banco
-//      queda completo (rejectedByCode EXAM_BANK_EVIDENCE + EXAM_BANK_LENGTH_BIAS, repaired 2);
+//   2. la falla inyectada (3 evidencias fuera del capítulo + MC con distractores mucho más cortos, más que
+//      la holgura de la hoja) sale UNA vez, el ejecutor manda EXACTAMENTE UNA reparación
+//      (EXAM_BANK_REPAIR v2) solo con lo que falta (2 ids) y el banco queda completo
+//      (rejectedByCode EXAM_BANK_EVIDENCE + EXAM_BANK_LENGTH_BIAS, repaired 2);
+//   2b. BANKOPT: cada prompt de banco llega como 3 bloques [fuente, tarea, tail] con cache_control en los
+//      dos primeros, la fuente primero, y la reparación conserva el prefijo;
 //   3. A1: un desvío del contrato hace fallar AL FAKE (respuesta 400 + st.unknown);
 //   4. el modo banco solo se enciende con el override de la prueba: el frontend trae
 //      DYN_EXAM_BANK_MODE_ENABLED = true (encendido desde EV6 fase 2) y, con el interruptor en false, exam/final_exam siguen por GIFT.
@@ -118,7 +121,9 @@ function validateArtifact(res, item, md) {
   f.DYN_EXAM_BANK_MODE_ENABLED = true;
   const prompts = [];
   const origRespond = llm.respond;
-  llm.respond = (body) => { prompts.push(String(body.messages[0].content)); return origRespond(body); };
+  const flat = (c) => (Array.isArray(c) ? c.map((b) => b.text).join('') : String(c));
+  const prefixes = [];
+  llm.respond = (body) => { const c = body.messages[0].content; prompts.push(flat(c)); if (Array.isArray(c)) prefixes.push(c[0].text + '\u0000' + c[1].text); return origRespond(body); };
   const exam1 = examItem('module', OUTLINE[0].id);
   const r1 = await f._dynRunItemV3(exam1);
   ok(r1 && r1.ok === true, 'examen del módulo 1 (2 capítulos): ok', r1 && (r1.error || r1));
@@ -132,16 +137,24 @@ function validateArtifact(res, item, md) {
   }
   const repairs = llm.st.v3calls.filter((c) => c.kind === 'exam_bank_repair');
   ok(llm.st.invalidSent.exam_bank === 1 && repairs.length === 1 && llm.st.retriesSeen.exam_bank === 1, `falla inyectada 1 vez → EXACTAMENTE 1 reparación (${repairs.length})`, { inv: llm.st.invalidSent, rep: repairs });
-  ok(repairs.length === 1 && repairs[0].ids.length === 2, 'la reparación pide solo los 2 ids rechazados', repairs);
-  const rp = prompts.filter((p) => p.startsWith('EXAM_BANK_REPAIR v1'));
-  ok(rp.length === 1 && /EXAM_BANK_EVIDENCE/.test(rp[0]) && /EXAM_BANK_LENGTH_BIAS/.test(rp[0]), 'el prompt de reparación nombra los dos motivos (EVIDENCE y LENGTH_BIAS)');
-  ok(prompts.filter((p) => !p.startsWith('EXAM_BANK_REPAIR')).every((p) => p.startsWith('EXAM_BANK_CHAPTER v1')), 'módulo: todas las llamadas principales son EXAM_BANK_CHAPTER v1 (un capítulo por llamada)');
+  const injected = (llm.st.examBank.faults[0] || {}).faults || {};
+  const injIds = Object.keys(injected).sort();
+  ok(Object.keys(injected).length === 4 && repairs.length === 1 && JSON.stringify(repairs[0].ids) === JSON.stringify(injIds.slice(0, 2)), 'BANKOPT: 4 rechazadas en la hoja MC (holgura 2) → la reparación pide SOLO las 2 que faltan para el objetivo (las primeras en orden)', { repairs, injected });
+  const rp = prompts.filter((p) => p.split('\n').includes('EXAM_BANK_REPAIR v2'));
+  ok(rp.length === 1 && /EXAM_BANK_EVIDENCE/.test(rp[0]) && /EXAM_BANK_LENGTH_BIAS/.test(rp[0]) && !rp[0].includes('CANTIDADES ('), 'el prompt de reparación nombra los dos motivos (EVIDENCE y LENGTH_BIAS) y no repite las CANTIDADES');
+  ok(prompts.every((p) => p.startsWith('EXAM_BANK_SOURCE v2\n')) && prompts.filter((p) => !p.includes('EXAM_BANK_REPAIR v2')).every((p) => p.split('\n').includes('EXAM_BANK_CHAPTER v2')), 'módulo: fuente del capítulo primero; llamadas principales EXAM_BANK_CHAPTER v2 (un capítulo por llamada)');
+  const shapes = llm.st.examBank.blockShapes;
+  ok(shapes.length === prompts.length && shapes.every((x) => JSON.stringify(x) === JSON.stringify(['ephemeral', 'ephemeral', null])), `BANKOPT: ${shapes.length} prompts de banco como [fuente+cache_control, tarea+cache_control, tail]`, shapes);
+  const byCh = {};
+  prompts.forEach((p, i) => { const ch = (/Todas las preguntas llevan "chapterId": "([^"]+)"/.exec(p) || [])[1]; (byCh[ch] = byCh[ch] || new Set()).add(prefixes[i]); });
+  ok(Object.values(byCh).every((set) => set.size === 1), 'BANKOPT: mismo prefijo (fuente + tarea) en todas las llamadas de cada capítulo, reparación incluida');
 
   // ── 2. Segundo examen de módulo y examen final: SIN fallas nuevas (once por corrida) ──
   const exam2 = examItem('module', OUTLINE[1].id);
   const r2 = await f._dynRunItemV3(exam2);
   ok(r2 && r2.ok && validateArtifact(r2, exam2, md).ok && r2.summary.repaired === 0 && r2.summary.calls.continuation === 0, 'examen del módulo 2 (1 capítulo): válido sin reparaciones', r2 && (r2.error || r2.summary));
   prompts.length = 0;
+  prefixes.length = 0;
   const fin = examItem('final');
   const r3 = await f._dynRunItemV3(fin);
   ok(r3 && r3.ok === true, 'examen final (2 módulos, 3 capítulos): ok', r3 && (r3.error || r3));
@@ -150,7 +163,7 @@ function validateArtifact(res, item, md) {
     const doc = JSON.parse(r3.artifacts[0].content);
     ok(v.ok && doc.questions.every((q) => q.moduleId === ALL_CH.find((c) => c.id === q.chapterId).moduleId), `final: válido para B2 (${v.bankSize} preguntas, ${v.slotCount} slots), moduleId = módulo del capítulo`, v.errors.slice(0, 5));
     ok(r3.summary.repaired === 0 && r3.summary.chaptersCovered === 3, 'final: sin reparaciones, los 3 capítulos cubiertos', r3.summary);
-    ok(prompts.length > 0 && prompts.every((p) => p.startsWith('EXAM_BANK_FINAL_CHAPTER v1')), 'final: llamadas EXAM_BANK_FINAL_CHAPTER v1');
+    ok(prompts.length > 0 && prompts.every((p) => p.startsWith('EXAM_BANK_SOURCE v2\n') && p.split('\n').includes('EXAM_BANK_FINAL_CHAPTER v2')), 'final: llamadas EXAM_BANK_FINAL_CHAPTER v2 (fuente del capítulo primero)');
   }
   ok(llm.st.v3calls.filter((c) => c.kind === 'exam_bank_repair').length === 1, 'en toda la corrida: exam_bank_repair registrado UNA sola vez');
   ok(llm.st.unknown.length === 0 && netViolations.length === 0, 'LLM falso sin prompts no reconocidos; 0 fetch fuera de /api/proxy', { u: llm.st.unknown, n: netViolations });

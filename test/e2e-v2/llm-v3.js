@@ -186,7 +186,9 @@ function createLlmV3({ base, chapterIdFromText, examBankContract, h5p2 }) {
   }
 
   function respond(body) {
-    const prompt = String((body.messages && body.messages[0] && body.messages[0].content) || '');
+    // BANKOPT: el banco manda el mensaje como bloques de texto (cache_control); el resto, como texto.
+    const content = body.messages && body.messages[0] && body.messages[0].content;
+    const prompt = Array.isArray(content) ? content.map((b) => (b && typeof b.text === 'string' ? b.text : '')).join('') : String(content || '');
     const hasSchema = !!(body.output_config && body.output_config.format);
     if (hasSchema) return base.respond(body);
     const retry = prompt.indexOf(RETRY_MARK) >= 0;
@@ -194,7 +196,7 @@ function createLlmV3({ base, chapterIdFromText, examBankContract, h5p2 }) {
     try {
       // Bancos de preguntas (marcador en la 1.ª línea): antes que cualquier otra rama (el prompt trae
       // <<<CAPITULO, que el LLM v2 tomaría por un reintento del sidecar).
-      const bank = respondBank(prompt);
+      const bank = respondBank(prompt, Array.isArray(content) ? content : null);
       if (bank) return bank;
       if (prompt.indexOf('Genera la EXPERIENCIA del capítulo') >= 0) {
         const title = (/CAPÍTULO: "([^"]*)"/.exec(prompt) || [])[1] || '';
