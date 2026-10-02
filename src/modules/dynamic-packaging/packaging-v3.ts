@@ -47,6 +47,7 @@ import {
   PresentationProfile,
   defaultAssessmentProfile,
   defaultPresentationProfile,
+  isLightDefaultCourse,
   normalizeAssessmentProfile,
   normalizePresentationProfile,
   profileSha256,
@@ -294,6 +295,8 @@ export function resolvePackagingTheme(p: {
   presentationProfile: PresentationProfile | null;
   v2Migrated?: boolean;
   legacyPaletteId?: string | null;
+  /** V542 (G2): curso nuevo (isLightDefaultCourse) → aula-clara/light con el brandSeed de la paleta. */
+  lightDefault?: boolean;
 }): ResolvedPackagingTheme {
   if (p.presentationProfile) {
     const pp = p.presentationProfile;
@@ -308,7 +311,17 @@ export function resolvePackagingTheme(p: {
     };
   }
   if (typeof p.legacyPaletteId === 'string' && p.legacyPaletteId.trim()) {
-    return { source: 'palette', input: presentationProfileFromPaletteId(p.legacyPaletteId.trim()) as PresentationProfileInput };
+    const fromPalette = presentationProfileFromPaletteId(p.legacyPaletteId.trim());
+    if (p.lightDefault) {
+      const d = defaultPresentationProfile();
+      const seed = fromPalette.brandSeed;
+      const hasSeed = !!seed && (!!seed.accent || (Array.isArray(seed.moduleColors) && seed.moduleColors.length > 0));
+      return {
+        source: 'palette',
+        input: { themeFamily: d.themeFamily, mode: d.mode, ...(hasSeed ? { brandSeed: { ...seed } } : {}), themeVersion: d.themeVersion } as PresentationProfileInput,
+      };
+    }
+    return { source: 'palette', input: fromPalette as PresentationProfileInput };
   }
   const d = defaultPresentationProfile();
   return { source: 'default_v3', input: { themeFamily: d.themeFamily, mode: d.mode, themeVersion: d.themeVersion } as PresentationProfileInput };
@@ -345,10 +358,12 @@ export async function loadPackagingProfilesV3(q: QueryExecutor, courseId: number
   const assessment = a ? normalizeAssessmentProfile(parseJson(a.data)) : defaultAssessmentProfile({ finalExam });
   const presentation = p ? normalizePresentationProfile(parseJson(p.data)) : null;
   let legacyPaletteId: string | null = null;
+  let lightDefault = false;
   if (!presentation) {
     // F1 (I4): la paleta guardada con el curso aplica a TODO curso sin perfil (no solo a los migrados).
-    const [c] = await q.query(`select metadata from public.courses where id = $1`, [courseId]);
+    const [c] = await q.query(`select metadata, created_at from public.courses where id = $1`, [courseId]);
     legacyPaletteId = legacyPaletteIdOf(c?.metadata);
+    lightDefault = isLightDefaultCourse(c?.created_at);
     if (legacyPaletteId && !LEGACY_PALETTES.some((x) => x.id === legacyPaletteId)) {
       throw new Error(
         `THEME_INVALID: el curso #${courseId} tiene la paleta desconocida "${legacyPaletteId}"; ` +
@@ -356,7 +371,7 @@ export async function loadPackagingProfilesV3(q: QueryExecutor, courseId: number
       );
     }
   }
-  const theme = resolvePackagingTheme({ presentationProfile: presentation, legacyPaletteId });
+  const theme = resolvePackagingTheme({ presentationProfile: presentation, legacyPaletteId, lightDefault });
   return {
     assessment,
     assessmentVersion: a ? Number(a.version) : 0,

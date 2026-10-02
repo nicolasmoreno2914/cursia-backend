@@ -155,6 +155,29 @@ export function estimateCategories(byProvider: Record<string, MinExpMax> | undef
   return out;
 }
 
+/**
+ * V542 (G3) — desglose visible del estimado: el banco de preguntas de los exámenes (exam + final_exam,
+ * la parte de IA que el estimado v1.1 subestimaba ×14–19) y la reserva por reintentos incluida en el total.
+ */
+export interface EstimateBreakdown {
+  examBank: MinExpMax;
+  retryAllowance: { expected: string; max: string };
+}
+export function estimateBreakdown(estimate: Pick<EstimateResult, 'totals'>): EstimateBreakdown {
+  const zero = normalizeDecimal(0);
+  const by = estimate.totals.byItemType || {};
+  const examBank: MinExpMax = { min: zero, expected: zero, max: zero };
+  for (const t of ['exam', 'final_exam']) {
+    const v = by[t];
+    if (!v) continue;
+    examBank.min = addDec(examBank.min, v.min);
+    examBank.expected = addDec(examBank.expected, v.expected);
+    examBank.max = addDec(examBank.max, v.max);
+  }
+  const ra = (estimate.totals as { retryAllowance?: { expected: string; max: string } }).retryAllowance;
+  return { examBank, retryAllowance: ra ? { expected: ra.expected, max: ra.max } : { expected: zero, max: zero } };
+}
+
 function canonical(v: unknown): string {
   if (Array.isArray(v)) return '[' + v.map(canonical).join(',') + ']';
   if (v && typeof v === 'object') {

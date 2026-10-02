@@ -502,7 +502,8 @@ const MATRIX = [
       const mid = /forum_(\d+)/.exec(forum.dir)[1];
       return { [`${a.dir}/label.xml`]: (x) => x.replace(/\$@RESOURCEVIEWBYID\*\d+@\$/, `$@RESOURCEVIEWBYID*${mid}@$`) };
     }],
-    ['H5P_FILES', () => ({ 'files.xml': (x) => x.replace(/<filearea>intro<\/filearea>\n    <itemid>0<\/itemid>\n    <filepath>\/<\/filepath>\n    <filename>cursia-video/, '<filearea>content</filearea>\n    <itemid>0</itemid>\n    <filepath>/</filepath>\n    <filename>cursia-video') })],
+    // V542 I2: el .h5p vive SOLO en `package`; moverlo a otro filearea deja la actividad sin paquete.
+    ['H5P_FILES', () => ({ 'files.xml': (x) => x.replace(/<filearea>package<\/filearea>\n    <itemid>0<\/itemid>\n    <filepath>\/<\/filepath>\n    <filename>cursia-video/, '<filearea>content</filearea>\n    <itemid>0</itemid>\n    <filepath>/</filepath>\n    <filename>cursia-video') })],
     ['AUDIO_DURATION', () => {
       const a = find(/^cv3:shell:audio_welcome$/);
       return { [`${a.dir}/label.xml`]: (x) => x.replace(/Duración: \d+ min \d+ s/, 'Duración: 0 min 59 s') };
@@ -1033,6 +1034,126 @@ const MATRIX = [
     att.assessmentProfile.attempts.activity = 2;
     await rejects(B.buildDynamicMbzV3(att), /ASSESSMENT_UNENFORCEABLE/, 'intentos en h5p');
   });
+  // V542 fix round 1 (C1): la regla de cifras es la MISMA en lint de la intro, gate de render y validador —
+  // solo las cifras que cuentan la estructura/duración del curso salen de facts; normas y plazos del contenido se muestran.
+  await check('V542 C1 extremo a extremo: «Ley 1480 de 2011» y «15 días hábiles» en las intros validan, se renderizan y se empaquetan (validateMbzV3 limpio); «6 semanas» fuera de facts se rechaza en el lint, en el render y en el validador', async () => {
+    const LAW = 'Aplicar la Ley 1480 de 2011 y responder dentro de los 15 días hábiles que fija la norma.';
+    const i = PF.packagingInput(distRoot, MATRIX[0]);
+    const ci = { ...i.contents.courseIntro, competencies: [LAW, ...i.contents.courseIntro.competencies.slice(1)] };
+    eq(SHELL.validateCourseIntroV3(ci).errors || [], [], 'intro del curso válida');
+    i.contents.courseIntro = ci;
+    const [mid] = i.contents.moduleIntros.keys();
+    const mi = { ...i.contents.moduleIntros.get(mid) };
+    mi.presentation = `${mi.presentation} El Decreto 1074 de 2015 regula la garantía.`;
+    i.contents.moduleIntros.set(mid, mi);
+    const r = await B.buildDynamicMbzV3(i);
+    const v = await V.validateMbzV3(r.mbz, r.expectations);
+    assert(v.ok, JSON.stringify(v.issues.slice(0, 4)));
+    const z = await JSZip.loadAsync(r.mbz);
+    let txt = '';
+    for (const n of Object.keys(z.files).filter((x) => /label_\d+\/label\.xml$/.test(x))) txt += await z.file(n).async('string');
+    assert(txt.includes('Ley 1480 de 2011') && txt.includes('15 días hábiles') && txt.includes('Decreto 1074 de 2015'), 'las cifras de contenido se ven en los labels');
+    // «6 semanas»: lint de la intro, gate de render y validador.
+    const bad = { ...ci, competencies: ['Completar el curso en 6 semanas de estudio guiado.', ...ci.competencies.slice(1)] };
+    assert((SHELL.validateCourseIntroV3(bad).errors || []).some((e) => e.code === 'DIGIT_IN_TEXT'), 'lint: 6 semanas');
+    const i2 = PF.packagingInput(distRoot, MATRIX[0]);
+    i2.contents.courseIntro = bad;
+    await rejects(B.buildDynamicMbzV3(i2), /DIGIT_IN_TEXT|COURSE_INTRO/, 'builder: 6 semanas');
+    const facts = r.expectations.facts;
+    let threw = null;
+    try { SHELL.assertShellNumbers({ name: 'Qué aprenderás', html: '<div><p><span class="nolink">Completarás todo en 997 semanas. Ley 1480 de 2011.</span></p></div>' }, facts, r.expectations.shellProseByLabel['cv3:shell:competencies']); } catch (e) { threw = e; }
+    assert(threw && /SHELL_NUMBER_NOT_FROM_FACTS: .*997/.test(threw.message) && !/1480|2011/.test(threw.message.split(':').pop()), `gate: ${threw && threw.message}`);
+    SHELL.assertShellNumbers({ name: 'Qué aprenderás', html: '<div><p><span class="nolink">Ley 1480 de 2011, 15 días hábiles.</span></p></div>' }, facts, r.expectations.shellProseByLabel['cv3:shell:competencies']);
+    // Fix round 2 (N1): sin la prosa (plantilla pura), las mismas cifras NO salen de facts.
+    let strict = null;
+    try { SHELL.assertShellNumbers({ name: 'Plantilla', html: '<div><p><span class="nolink">Ley 1480 de 2011.</span></p></div>' }, facts); } catch (e) { strict = e; }
+    assert(strict && /1480/.test(strict.message), 'plantilla estricta');
+    const { z: zz, acts } = await actDirs(r.mbz);
+    const comp = acts.find((a) => a.idnumber === 'cv3:shell:competencies') || acts.find((a) => /^cv3:shell:/.test(a.idnumber));
+    const x = await zz.file(`${comp.dir}/label.xml`).async('string');
+    zz.file(`${comp.dir}/label.xml`, x.replace('Ley 1480 de 2011', 'Ley 1480 de 2011 en 997 semanas'));
+    const v2 = await V.validateMbzV3(await zz.generateAsync({ type: 'nodebuffer' }), r.expectations);
+    assert(v2.issues.some((e) => e.code === 'NUMBER_NOT_FROM_FACTS' && /997/.test(e.message) && !/1480/.test(e.message)), `validador: ${JSON.stringify(v2.issues.slice(0, 4))}`);
+  });
+
+  // V542 fix round 2 (N1): el texto de PLANTILLA de los labels del shell sigue estricto (toda cifra ∈ facts); solo
+  // la prosa LLM de las intros admite cifras de contenido.
+  await check('V542 N1: plantilla estricta — «Preguntas: 997», «Duración estimada: 997 h», «997 min», «Intentos: 997», «Nota mínima para aprobar: 997 de 100» → NUMBER_NOT_FROM_FACTS; «Ley 1480 de 2011» en la prosa pasa', async () => {
+    const LAW = 'Aplicar la Ley 1480 de 2011 y responder dentro de los 15 días hábiles que fija la norma.';
+    const i = PF.packagingInput(distRoot, MATRIX[0]);
+    i.contents.courseIntro = { ...i.contents.courseIntro, competencies: [LAW, ...i.contents.courseIntro.competencies.slice(1)] };
+    const r = await B.buildDynamicMbzV3(i);
+    eq(r.expectations.shellProseByLabel['cv3:shell:competencies'][0], LAW, 'shellProseByLabel: la competencia va en SU label');
+    assert(!r.expectations.shellProseByLabel['cv3:shell:welcome'].includes(LAW), 'y no en otro label');
+    eq((await V.validateMbzV3(r.mbz, r.expectations)).issues, [], 'base con la Ley en la prosa: limpio');
+    const { acts } = await actDirs(r.mbz);
+    const dirOf = (re) => acts.find((a) => re.test(a.idnumber)).dir;
+    const examInfo = dirOf(/^cv3:exam_info:/);
+    const cases = [
+      ['Preguntas: 997', examInfo, (x) => x.replace(/(Preguntas:&lt;\/span&gt;&lt;\/strong&gt;&lt;span class=&quot;nolink&quot;&gt; )\d+/, '$1997')],
+      ['Intentos: 997', examInfo, (x) => x.replace(/(Intentos:&lt;\/span&gt;&lt;\/strong&gt;&lt;span class=&quot;nolink&quot;&gt; )\d+/, '$1997')],
+      ['Nota mínima para aprobar: 997 de 100', examInfo, (x) => x.replace(/(Nota mínima para aprobar:&lt;\/span&gt;&lt;\/strong&gt;&lt;span class=&quot;nolink&quot;&gt; )\d+/, '$1997')],
+      ['997 min (audiolibro)', dirOf(/^cv3:shell:audiobook$/), (x) => x.replace(/Duración total: \d+ min/, 'Duración total: 997 min')],
+      // En un label CON prosa LLM (bienvenida): la cifra de plantilla sigue estricta.
+      ['Duración estimada: 997 h (bienvenida)', dirOf(/^cv3:shell:welcome$/), (x) => x.replace('&lt;/span&gt;', ' Duración estimada: 997 h&lt;/span&gt;')],
+      ['Ley 997 en la competencia: la prosa mutada ya no es la del builder', dirOf(/^cv3:shell:competencies$/), (x) => x.replace('Ley 1480 de 2011', 'Ley 1480 de 2011 en 997 min')],
+    ];
+    for (const [what, dir, fn] of cases) {
+      const v = await V.validateMbzV3(await mutate(r.mbz, { [`${dir}/label.xml`]: fn }), r.expectations);
+      assert(v.issues.some((e) => e.code === 'NUMBER_NOT_FROM_FACTS' && /997/.test(e.message) && !/1480|2011/.test(e.message)), `${what}: ${JSON.stringify(v.issues.slice(0, 3))}`);
+    }
+    // Render gate: la misma regla.
+    const facts = r.expectations.facts;
+    for (const t of ['Preguntas: 997', 'Duración estimada: 997 h', 'Duración: 997 min 58 s', 'Intentos: 997', 'Nota mínima para aprobar: 997 de 100', 'Lección 997']) {
+      let threw = null;
+      try { SHELL.assertShellNumbers({ name: 'x', html: `<div><p><span class="nolink">${t}</span></p></div>` }, facts, r.expectations.shellProseByLabel['cv3:shell:competencies']); } catch (e) { threw = e; }
+      assert(threw && /997/.test(threw.message), `gate: ${t}`);
+    }
+    // Intro lint: abreviaturas de duración.
+    for (const t of ['Completa el curso en 997 h de estudio.', 'Dedica 30 min por día.', 'Son 40 hs de práctica.', 'Unas 2 hrs bastan.']) {
+      assert(SHELL.lintShellProse(t).some((h) => h.code === 'DIGIT_IN_TEXT'), `lint: ${t}`);
+    }
+  });
+
+  // V542 fix round 3 (N1): la prosa se acota POR LABEL — la de un módulo nunca habilita cifras en otro label.
+  await check('V542 N1 cruzado: el módulo 2 dice «Ley 1480 de 2011» y la plantilla del módulo 1 muestra «Intentos: 2011» → rechazado por el validador y por el gate de render (prosa acotada por label)', async () => {
+    const i = PF.packagingInput(distRoot, MATRIX[0]);
+    const mids = [...i.contents.moduleIntros.keys()];
+    assert(mids.length >= 2, 'fixture con 2 módulos');
+    const m2 = { ...i.contents.moduleIntros.get(mids[1]) };
+    m2.presentation = `${m2.presentation} Aplica la Ley 1480 de 2011 en este módulo.`;
+    i.contents.moduleIntros.set(mids[1], m2);
+    const r = await B.buildDynamicMbzV3(i);
+    eq((await V.validateMbzV3(r.mbz, r.expectations)).issues, [], 'base limpia (la Ley en la prosa del módulo 2)');
+    const by = r.expectations.shellProseByLabel;
+    assert(by[`cv3:module_intro:${mids[1]}`].some((t) => t.includes('Ley 1480 de 2011')) && !by[`cv3:module_intro:${mids[0]}`].some((t) => t.includes('2011')), 'prosa por módulo');
+    const { acts } = await actDirs(r.mbz);
+    const dirOf = (idn) => acts.find((a) => a.idnumber === idn).dir;
+    const m1Intro = dirOf(`cv3:module_intro:${mids[0]}`);
+    const examInfo = acts.find((a) => a.idnumber.startsWith('cv3:exam_info:')).dir;
+    for (const [what, dir, fn] of [
+      ['module_intro del módulo 1 (label CON prosa propia)', m1Intro, (x) => x.replace('&lt;/span&gt;', ' Intentos: 2011&lt;/span&gt;')],
+      ['exam_info del módulo 1 (plantilla sin prosa)', examInfo, (x) => x.replace(/(Intentos:&lt;\/span&gt;&lt;\/strong&gt;&lt;span class=&quot;nolink&quot;&gt; )\d+/, '$12011')],
+      ['competencias del curso', dirOf('cv3:shell:competencies'), (x) => x.replace('&lt;/span&gt;', ' Intentos: 2011&lt;/span&gt;')],
+    ]) {
+      const v = await V.validateMbzV3(await mutate(r.mbz, { [`${dir}/label.xml`]: fn }), r.expectations);
+      assert(v.issues.some((e) => e.code === 'NUMBER_NOT_FROM_FACTS' && /2011/.test(e.message)), `${what}: ${JSON.stringify(v.issues.slice(0, 3))}`);
+    }
+    // Gate de render: con la prosa del módulo 1 (la suya) se rechaza; la del módulo 2 la habilitaría (por eso se acota).
+    const facts = r.expectations.facts;
+    const html = '<div><p><span class="nolink">Módulo 1: presentación. Intentos: 2011</span></p></div>';
+    let threw = null;
+    try { SHELL.assertShellNumbers({ name: 'Módulo 1: presentación', html }, facts, by[`cv3:module_intro:${mids[0]}`]); } catch (e) { threw = e; }
+    assert(threw && /SHELL_NUMBER_NOT_FROM_FACTS.*2011/.test(threw.message), `gate módulo 1: ${threw && threw.message}`);
+    SHELL.assertShellNumbers({ name: 'control', html }, facts, by[`cv3:module_intro:${mids[1]}`]); // control: la prosa del OTRO módulo sí lo dejaría pasar
+    // El render real del módulo 1 con «Intentos: 2011» metido en la plantilla falla (moduleIntroLabel pasa SU prosa).
+    const mf = facts.modules.find((m) => m.id === mids[0]) || facts.modules[0];
+    const lbl = SHELL.moduleIntroLabel(mf, i.contents.moduleIntros.get(mids[0]), facts, THEME.resolveTheme({ themeFamily: 'aula-clara', mode: 'light' }));
+    let threw2 = null;
+    try { SHELL.assertShellNumbers({ name: lbl.name, html: lbl.html.replace('</span>', ' Intentos: 2011</span>') }, facts, by[`cv3:module_intro:${mids[0]}`]); } catch (e) { threw2 = e; }
+    assert(threw2 && /2011/.test(threw2.message), 'gate sobre el render real del módulo 1');
+  });
+
   await check('builder falla fuerte: cifra en un intro del LLM, duración del video ≠ documento, token inválido', async () => {
     const i1 = PF.packagingInput(distRoot, MATRIX[0]);
     i1.contents.courseIntro = { ...i1.contents.courseIntro, closing: 'Completaste los 4 capítulos del curso.' };
@@ -1077,7 +1198,7 @@ const MATRIX = [
     for (const [f, v] of [['builderVersion', '3.0.1'], ['manifestSha256', 'm2'], ['sourceArtifactIds', ['a']], ['themeSha256', 't2'], ['assessmentProfileSha256', 'p2'], ['h5pProfileVersion', 2], ['vcRendererVersion', 'r2'], ['moodleVersion', '4.5']]) {
       assert(PK.packageReuseHashV3({ ...baseK, [f]: v }) !== k0, `cambia con ${f}`);
     }
-    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.6.0' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
+    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.9.0' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
   });
 
   // ── Medios ────────────────────────────────────────────────────────────────

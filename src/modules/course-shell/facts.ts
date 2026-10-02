@@ -33,6 +33,7 @@ import {
 import { formatDurationEs, formatDurationShortEs } from '../../package/audio';
 import { H5pActivityTypeV2, resolveActivityType } from './activity-type';
 import { displayStructureTitle } from '../course-structure/structure-titles';
+import { courseCountNumbers } from './intro-schemas';
 
 export const COURSE_FACTS_VERSION = 1;
 export const HOURS_SOURCE_LABEL = 'definida por la institución';
@@ -492,13 +493,60 @@ export function factsNumberSet(facts: CourseFacts): Set<number> {
 }
 
 /**
- * Números del texto que NO están en factsNumberSet (vacío = pasa). Los títulos
- * del Blueprint (curso, módulos, capítulos) se quitan antes: son nombres que
- * puso la institución ("ISO 9001"), no cifras que afirme el shell.
+ * Números del texto que NO están permitidos (vacío = pasa). Los títulos del Blueprint (curso, módulos,
+ * capítulos) se quitan antes: son nombres que puso la institución ("ISO 9001"), no cifras que afirme el shell.
+ *
+ * V542 fix round 2 (N1): el texto de PLANTILLA es estricto como siempre — toda cifra (duraciones, preguntas,
+ * intentos, nota mínima, numeración, marcas de tiempo) debe estar en factsNumberSet. La regla angosta de
+ * «cifras de contenido permitidas» aplica SOLO a la prosa que escribió el LLM (`prose`: textos de las intros
+ * que el label muestra): sus cifras de contenido («Ley 1480 de 2011», «15 días hábiles») se admiten; las que
+ * cuentan el curso (`courseCountNumbers`, la misma clase que rechaza el lint de la intro) deben estar en facts.
+ * Sin `prose`, todo el label es estricto.
  */
-export function lintShellNumbers(text: string, facts: CourseFacts): number[] {
+export function lintShellNumbers(text: string, facts: CourseFacts, prose: readonly string[] = []): number[] {
   const allowed = factsNumberSet(facts);
-  return numbersInText(stripStructureTitles(text, facts)).filter((n) => !allowed.has(n));
+  const contentNumbers = new Set<number>();
+  const bad: number[] = [];
+  for (const p of prose) {
+    const counted = new Set(courseCountNumbers(p));
+    for (const n of counted) if (!allowed.has(n)) bad.push(n);
+    for (const n of numbersInText(stripStructureTitles(p, facts))) if (!counted.has(n)) contentNumbers.add(n);
+  }
+  for (const n of numbersInText(stripStructureTitles(text, facts))) {
+    if (!allowed.has(n) && !contentNumbers.has(n)) bad.push(n);
+  }
+  return [...new Set(bad)];
+}
+
+/**
+ * V542 fix round 3 (N1): prosa LLM que muestra CADA label del shell, por idnumber — nunca un fondo común. Un label
+ * de curso recibe solo su campo de la intro del curso; `cv3:module_intro:<id>` solo la prosa de SU módulo; los
+ * demás labels no tienen prosa (plantilla estricta). Fuente única para el builder (expectations) y el render.
+ */
+export const COURSE_INTRO_PROSE_FIELD_BY_LABEL: Readonly<Record<string, 'welcome' | 'competencies' | 'methodology_note' | 'closing'>> = Object.freeze({
+  'cv3:shell:welcome': 'welcome',
+  'cv3:shell:competencies': 'competencies',
+  'cv3:shell:methodology': 'methodology_note',
+  'cv3:shell:closing': 'closing',
+});
+export function courseIntroProse(intro: unknown, field: 'welcome' | 'competencies' | 'methodology_note' | 'closing'): string[] {
+  const v = intro && typeof intro === 'object' ? (intro as Record<string, unknown>)[field] : undefined;
+  if (typeof v === 'string') return [v];
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+}
+export function moduleIntroProse(intro: unknown): string[] {
+  const i = (intro && typeof intro === 'object' ? intro : {}) as Record<string, unknown>;
+  const out: string[] = [];
+  if (typeof i.presentation === 'string') out.push(i.presentation);
+  if (Array.isArray(i.outcomes)) for (const x of i.outcomes) if (typeof x === 'string') out.push(x);
+  if (Array.isArray(i.journey)) for (const j of i.journey as any[]) if (j && typeof j.line === 'string') out.push(j.line);
+  return out;
+}
+export function shellProseByLabel(courseIntro: unknown, moduleIntros: ReadonlyMap<string, unknown>): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const [idn, field] of Object.entries(COURSE_INTRO_PROSE_FIELD_BY_LABEL)) out[idn] = courseIntroProse(courseIntro, field);
+  for (const [moduleId, intro] of moduleIntros) out[`cv3:module_intro:${moduleId}`] = moduleIntroProse(intro);
+  return out;
 }
 
 /**

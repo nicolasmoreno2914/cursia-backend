@@ -744,7 +744,7 @@ async function pureChecks() {
       ['Incluye un PDF descargable.', 'FORBIDDEN_CLAIM'],
       ['Con narración profesional de cada tema.', 'FORBIDDEN_CLAIM'],
       ['Dedica unos minutos por día.', 'FORBIDDEN_CLAIM'],
-      ['Aplica la norma ISO 9001 en tu área.', 'DIGIT_IN_TEXT'],
+      ['Practicarás con 12 ejercicios guiados en tu área.', 'DIGIT_IN_TEXT'],
     ];
     for (const [txt, code] of cases) {
       eq(S.lintShellProse(txt).map((h) => h.code).includes(code), true, `${txt} → ${code}`);
@@ -752,6 +752,13 @@ async function pureChecks() {
       assert(codes(S.validateCourseIntroV3(ci)).includes(code), `competencia: ${txt}`);
       const mi = F.moduleIntroFixture(c2.manifest, 0); mi.outcomes[0] = txt;
       assert(codes(S.validateModuleIntroV3(mi, { chapterIds: c2.manifest.modules[0].chapters.map((c) => c.chapterId) })).includes(code), `outcome: ${txt}`);
+    }
+    // V542 (M1): las cifras que NO cuentan la estructura/duración del curso se permiten — referencias legales y
+    // normativas, plazos del dominio — (antes el LLM escribía «Ley mil cuatrocientos ochenta de dos mil once»).
+    for (const ok of ['Aplica la Ley 1480 de 2011 (Estatuto del Consumidor) y el Decreto 1074 de 2015.', 'Aplica la norma ISO 9001 en tu área.', 'Responde el reclamo dentro de los 15 días hábiles que fija la ley.']) {
+      eq(S.lintShellProse(ok), [], `cifra permitida: ${ok}`);
+      const mi = F.moduleIntroFixture(c2.manifest, 0); mi.presentation = `${mi.presentation} ${ok}`;
+      eq(codes(S.validateModuleIntroV3(mi, { chapterIds: c2.manifest.modules[0].chapters.map((c) => c.chapterId) })).filter((c) => /DIGIT|QUANTITY/.test(c)), [], `intro de módulo con «${ok}»`);
     }
     // Prosa normal sin cifras: sin falsos positivos ("a la hora de", "una semana" no se cuenta como cantidad; "dos formas de").
     eq(S.lintShellProse('A la hora de atender, hay dos formas de escuchar y una semana cualquiera lo demuestra.'), [], 'falsos positivos');

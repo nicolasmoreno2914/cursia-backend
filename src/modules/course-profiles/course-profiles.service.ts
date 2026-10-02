@@ -15,6 +15,7 @@ import {
   defaultAssessmentProfile,
   PresentationDefaultSource,
   defaultPresentationProfileFor,
+  isLightDefaultCourse,
   isProfileKind,
   normalizeProfile,
   profileSha256,
@@ -121,11 +122,10 @@ export class CourseProfilesService {
     if (!row) {
       if (kind === 'presentation') {
         let pid = typeof paletteId === 'string' && paletteId.trim() ? paletteId.trim() : null;
-        if (!pid) {
-          const [c] = await this.dataSource.query(`select metadata from public.courses where id = $1`, [courseId]);
-          pid = paletteIdFromCourseMetadata(c?.metadata);
-        }
-        const d = defaultPresentationProfileFor(pid);
+        const [c] = await this.dataSource.query(`select metadata, created_at from public.courses where id = $1`, [courseId]);
+        if (!pid) pid = paletteIdFromCourseMetadata(c?.metadata);
+        // V542 (G2): curso nuevo → Aula Clara (claro) con los colores de la paleta; los anteriores, como siempre.
+        const d = defaultPresentationProfileFor(pid, { lightDefault: isLightDefaultCourse(c?.created_at) });
         return {
           courseId, kind, version: 0, profile: d.profile, sha256: profileSha256(d.profile), isDefault: true,
           createdAt: null, createdBy: null, warnings: d.warnings, defaultSource: d.source,

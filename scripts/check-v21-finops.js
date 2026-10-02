@@ -176,8 +176,74 @@ async function pureChecks() {
     eq(ops('audio_welcome'), ['tts.audio_welcome'], 'audio_welcome → tts');
     eq(e.totals.byProvider.youtube.max, '0.0000000000', 'youtube $0');
     assert(e.totals.byChapter._none, 'items sin capítulo agrupados en _none');
-    eq(e.estimatorVersion, 'finops-estimator-v1', 'versión');
-    eq(e.usageModelVersion, 'usage-priors-v1.1', 'usage model');
+    eq(e.estimatorVersion, 'finops-estimator-v2', 'versión');
+    eq(e.usageModelVersion, 'usage-priors-v1.2', 'usage model');
+    assert(leq(e.totals.retryAllowance.expected, e.totals.expected) && leq(e.totals.retryAllowance.max, e.totals.max), 'retryAllowance ⊂ total');
+    for (const l of e.lines) assert(typeof l.retryRate === 'number' && l.retryRate >= 0, `retryRate en ${l.itemKey}`);
+  });
+
+  // ── V542 (G3): calibración con el curso #542 (run 518bcc78, 2 módulos × 2 capítulos) ──
+  // Medido (FinOps del run, ~/cursia-test-env/ev5-ledger.md): anthropic 6.08 (exam 2.23 en 2 items, final 2.12,
+  // experience 0.64 en 4, content 0.40 en 4), videogen 3.74 real (+2.82 reservas pendientes de 3 fallas previas
+  // al render), gamma 1.70, openai 0.21 ⇒ REAL ≈ 11.73; registrado 14.55. Estimado v1.1 al aprobar: 8.82.
+  const RB = loadDist('modules/finops/run-budget.js');
+  const course542 = () => {
+    const man = [];
+    const add = (type, key, chapterId = null, moduleId = null) => man.push({ key: `${type}:${key}`, type, chapterId, moduleId });
+    add('course_plan', 'c');
+    add('course_intro', 'c');
+    for (const m of ['m1', 'm2']) { add('module_intro', m, null, m); add('exam', m, null, m); }
+    add('final_exam', 'f');
+    add('audio_welcome', 'c');
+    for (const c of [1, 2, 3, 4]) for (const t of ['content', 'experience', 'presentation', 'video', 'video_interactions', 'activity', 'audiobook_chapter']) add(t, `ch${c}`, `ch${c}`, c <= 2 ? 'm1' : 'm2');
+    return man;
+  };
+  await check('V542 calibración: el 2×2 de #542 (36 items) estima dentro de ±20 % del gasto REAL (11.73); exámenes, experiencia y contenido ≈ medidos; desglose con reintentos', () => {
+    const items = RB.estimateItemsForRun(course542(), 'real');
+    eq(items.length, 36, 'items');
+    eq(items.filter((i) => i.usageScale).length, 0, 'el 2×2 es la referencia (escala 1)');
+    const e = estimateCost({ items, catalog: CATALOG, usageModel: usageModelPriorsV1(), retryPolicy: { maxRetries: 1 } });
+    const n = (x) => Number(x);
+    const exp = n(e.totals.expected);
+    const REAL = 11.73;
+    const RECORDED = 14.55;
+    assert(Math.abs(exp - REAL) / REAL <= 0.2, `expected ${exp} vs real ${REAL}: ${(((exp - REAL) / REAL) * 100).toFixed(1)} %`);
+    assert(Math.abs(exp - RECORDED) / RECORDED <= 0.2, `expected ${exp} vs registrado ${RECORDED}`);
+    const by = (t) => n(e.totals.byItemType[t].expected);
+    for (const [t, actual] of [['exam', 2.23], ['final_exam', 2.12], ['experience', 0.64], ['content', 0.4]]) {
+      assert(Math.abs(by(t) - actual) / actual <= 0.05, `${t}: estimado ${by(t)} vs medido ${actual}`);
+    }
+    assert(Math.abs(n(e.totals.byProvider.anthropic.expected) - 6.08) / 6.08 <= 0.05, `anthropic ${e.totals.byProvider.anthropic.expected} vs 6.08`);
+    // El estimado v1.1 (8.82) quedaba −25 % bajo el real y su anthropic (1.49) −75 %: la causa del tope cruzado.
+    assert(exp > 8.82 * 1.4, 'muy por encima del estimado v1.1');
+    // Desglose: la reserva por reintentos es visible y los exámenes llevan su tasa medida (0.35).
+    const ra = n(e.totals.retryAllowance.expected);
+    assert(ra > 0 && ra < exp, `retryAllowance ${ra}`);
+    eq([...new Set(e.lines.filter((l) => l.itemType === 'exam' || l.itemType === 'final_exam').map((l) => l.retryRate))], [0.35], 'retryRate del banco');
+    // Lo que ve la vista previa (StartPreview.estimate.breakdown): banco de exámenes ≈ 4.35 medido; reintentos.
+    const bd = loadDist('modules/finops/normal-approval.js').estimateBreakdown(e);
+    assert(Math.abs(n(bd.examBank.expected) - 4.35) / 4.35 <= 0.05, `breakdown.examBank ${bd.examBank.expected} vs 4.35`);
+    eq(bd.retryAllowance, e.totals.retryAllowance, 'breakdown.retryAllowance');
+    console.log(`   2×2 #542: estimado ${exp.toFixed(2)} [${n(e.totals.min).toFixed(2)}–${n(e.totals.max).toFixed(2)}] vs real ${REAL} (${(((exp - REAL) / REAL) * 100).toFixed(1)} %) / registrado ${RECORDED} (${(((exp - RECORDED) / RECORDED) * 100).toFixed(1)} %); anthropic ${n(e.totals.byProvider.anthropic.expected).toFixed(2)} vs 6.08; reintentos ${ra.toFixed(2)}`);
+  });
+  await check('V542: el banco escala con los capítulos — entrada ∝ llamadas, salida ∝ preguntas pedidas; 1 capítulo cuesta menos, 3×3 más', () => {
+    const ch = (k, m) => Array.from({ length: k }, (_, i) => ({ id: `${m}c${i}`, moduleId: m }));
+    eq(RB.examBankUsageScale('exam', ch(2, 'a')), { input_tokens: 1, output_tokens: 1 }, 'referencia módulo');
+    eq(RB.examBankUsageScale('final_exam', [...ch(2, 'a'), ...ch(2, 'b')]), { input_tokens: 1, output_tokens: 1 }, 'referencia final');
+    eq(RB.examBankUsageScale('exam', ch(3, 'a')), { input_tokens: 1.5, output_tokens: 1.4764 }, 'módulo de 3');
+    eq(RB.examBankUsageScale('exam', ch(1, 'a')), { input_tokens: 0.5, output_tokens: 0.4764 }, 'módulo de 1');
+    eq(RB.examBankUsageScale('final_exam', [...ch(3, 'a'), ...ch(3, 'b'), ...ch(3, 'c')]), { input_tokens: 1.125, output_tokens: 1.2309 }, 'final 3×3 (tope 40 slots)');
+    eq(RB.examBankUsageScale('exam', []), null, 'sin capítulos');
+    const man = [{ key: 'exam:m1', type: 'exam', moduleId: 'm1' }, ...[1, 2, 3].map((i) => ({ key: `content:c${i}`, type: 'content', moduleId: 'm1', chapterId: `c${i}` }))];
+    const items = RB.estimateItemsForRun(man, 'real');
+    eq(items[0].usageScale, { input_tokens: 1.5, output_tokens: 1.4764 }, 'estimateItemsForRun fija la escala');
+    const e = estimateCost({ items, catalog: CATALOG, usageModel: usageModelPriorsV1(), retryPolicy: { maxRetries: 1 } });
+    const l = e.lines.find((x) => x.itemKey === 'exam:m1');
+    eq(l.usageScale, { input_tokens: 1.5, output_tokens: 1.4764 }, 'línea con la escala');
+    const ref = estimateCost({ items: [{ itemKey: 'exam:m1', itemType: 'exam' }], catalog: CATALOG, usageModel: usageModelPriorsV1(), retryPolicy: { maxRetries: 1 } });
+    assert(cmpDec(l.expected, ref.lines[0].expected) > 0, 'módulo de 3 > referencia');
+    throwsCode(() => estimateCost({ items: [{ itemKey: 'x', itemType: 'exam', usageScale: 0 }], catalog: CATALOG, usageModel: usageModelPriorsV1(), retryPolicy: { maxRetries: 1 } }), 'INVALID_INPUT', 'escala 0');
+    throwsCode(() => estimateCost({ items: [{ itemKey: 'x', itemType: 'exam', usageScale: { input_tokens: -1 } }], catalog: CATALOG, usageModel: usageModelPriorsV1(), retryPolicy: { maxRetries: 1 } }), 'INVALID_INPUT', 'escala negativa');
   });
 
   await check('estimador: determinístico (mismo input ⇒ mismo output)', () => {

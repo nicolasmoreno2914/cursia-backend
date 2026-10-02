@@ -236,8 +236,8 @@ async function runConfig(cfg) {
       eq(h.deploy.library, want, `librería ${id}`);
       const files = cm[id].files;
       const pkg = files.find((f) => f.area === 'package');
-      const intro = files.find((f) => f.area === 'intro');
-      assert(pkg && intro && pkg.hash === intro.hash && pkg.name === intro.name, `${id}: package + intro (mismo .h5p)`);
+      // V542 I2: UNA sola copia restaurada (package); el embed inline usa esa misma (sin copia en intro).
+      assert(pkg && files.filter((f) => /\.h5p$/.test(f.name)).length === 1, `${id}: un solo .h5p (package): ${JSON.stringify(files.map((f) => f.area + '/' + f.name))}`);
     }
   });
   const z = await JSZip.loadAsync(r.mbz);

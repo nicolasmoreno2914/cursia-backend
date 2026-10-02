@@ -128,6 +128,7 @@ import {
   validateH5pActivityPayload,
   welcomeLabel,
   welcomeStartLabel,
+  shellProseByLabel,
 } from '../modules/course-shell';
 import type { H5pActivityTypeV2 } from '../modules/course-shell';
 import { PackagingPlanV3, buildPackagingPlanV3, packagingPlanV3Sha256 } from '../modules/dynamic-packaging/packaging-plan-v3';
@@ -192,8 +193,18 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * solo al aprobar o agotar los intentos (availability e=1 | e=3, show:false, downloadcontent 0);
  * la info del examen la anuncia; nota para docentes (acceso condicional, intentos adicionales) en el
  * label oculto del certificado o en `cv3:shell:exams_teacher` al inicio de la primera evaluación.
+ * 3.7.0 (V542 I4): `reviewattempt` = D|I|O|C — al terminar un intento el estudiante revisa sus
+ * respuestas y su nota (sin corrección, feedback ni respuesta correcta antes del cierre) en vez de
+ * rebotar con «No tiene permiso para revisar este cuestionario».
+ * 3.8.0 (V542 I2): cada actividad H5P (video, práctica, caso, «Repaso») guarda su .h5p UNA vez
+ * (filearea `package`); el embed inline del intro carga ese mismo archivo → un solo contenido y un
+ * solo estado (sin «Data Reset» al pasar entre el capítulo y la página de la actividad). Un paquete
+ * sin actividades H5P queda byte a byte igual a 3.7.0.
+ * 3.9.0 (V542 fix round 1, I1): revisión del quiz D|I|C y notas O|C — la página de revisión al terminar
+ * muestra las respuestas propias SIN nota por pregunta (la nota por pregunta revelaba la correcta de una
+ * V/F); la nota total se ve en view.php (más tarde, abierto) y en el libro de calificaciones.
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.6.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.9.0';
 
 // EV6 P2-B5: `examExplanationsAvailability` vive en course-shell/exam-explanations (lo usa también el validador).
 export { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';
@@ -280,6 +291,11 @@ export interface MbzV3Expectations {
   h5pProfileVersion: number;
   /** EV6 P2-B5: hojas (categoría, tipo, slots) de cada quiz con banco, del plan congelado → QUIZ_RANDOM. */
   examBankPlans: ExamBankPlans;
+  /**
+   * V542 fix round 3 (N1): prosa LLM de CADA label del shell, por idnumber (shellProseByLabel): sus cifras de
+   * contenido se admiten SOLO en ese label; el resto es plantilla estricta.
+   */
+  shellProseByLabel: Record<string, string[]>;
 }
 
 export interface BuildDynamicMbzV3Result {
@@ -894,16 +910,17 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
 
   const addH5pActivity = (secnum: number, idnumber: string, name: string, kind: AssessableType, itemKey: string, filename: string, h5p: Buffer, mainLibrary: string, intro: (mid: number) => string): void => {
     const a = W.newActivity('h5pactivity', secnum, name, idnumber);
-    // El mismo .h5p (un blob) en `package` (view.php) y en `intro` (embed inline) — R8 videoActivityFileEntries.
+    // V542 I2 (3.8.0): el .h5p SOLO en `package`; el embed inline del intro carga ese mismo archivo
+    // (h5pInlineEmbedSrc 'package') → un contenido H5P y un estado xAPI por actividad (antes R8 ponía
+    // una segunda copia en `intro`: dos contenidos, «Data Reset» y progreso perdido al alternar).
     const fPkg = W.addFile(a.ctx, 'mod_h5pactivity', 'package', filename, h5p, H5P_PACKAGE_MIMETYPE);
-    const fIntro = W.addFile(a.ctx, 'mod_h5pactivity', 'intro', filename, h5p, H5P_PACKAGE_MIMETYPE);
     const introHtml = intro(a.mid);
     W.put(`${a.dir}/h5pactivity.xml`, h5pactivityXml({
       aid: a.aid, mid: a.mid, ctx: a.ctx, name, intro: introHtml, grade: 100,
       grademethod: resolved.kinds[kind].gradeMethod, enabletracking: 1, reviewmode: 1,
       displayoptions: { frame: false, download: false, embed: false, copyright: false }, ts,
     }));
-    gradedCommon(a, kind, name, [fPkg, fIntro]);
+    gradedCommon(a, kind, name, [fPkg]);
     labelsHtml.push({ where: `${idnumber}#intro`, html: introHtml });
     if (kind === 'activity') resolveCta('next-activity', secnum, `$@H5PACTIVITYVIEWBYID*${a.mid}@$`);
     h5pPackages.push({ itemKey, filename, mainLibrary, sha1: sha1Buf(h5p), bytes: h5p.length });
@@ -917,8 +934,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const addUngradedH5pActivity = (secnum: number, idnumber: string, name: string, itemKey: string, filename: string, h5p: Buffer, mainLibrary: string, intro: (mid: number) => string): void => {
     if (H5P_MOODLE_GRADING[mainLibrary]?.gradable !== false) throw new Error(`MBZ_V3_INVARIANT: ${mainLibrary} no es un add-on sin nota`);
     const a = W.newActivity('h5pactivity', secnum, name, idnumber);
-    const fPkg = W.addFile(a.ctx, 'mod_h5pactivity', 'package', filename, h5p, H5P_PACKAGE_MIMETYPE);
-    const fIntro = W.addFile(a.ctx, 'mod_h5pactivity', 'intro', filename, h5p, H5P_PACKAGE_MIMETYPE);
+    const fPkg = W.addFile(a.ctx, 'mod_h5pactivity', 'package', filename, h5p, H5P_PACKAGE_MIMETYPE); // V542 I2: sin copia en intro
     const introHtml = intro(a.mid);
     W.put(
       `${a.dir}/h5pactivity.xml`,
@@ -936,7 +952,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       applyXmlFields(withIdnumber(moduleXml(a.mid, 'h5pactivity', secnum, ts, MV.bv), idnumber), { completion: '2', completionview: '1', showdescription: '1' }),
     );
     W.put(`${a.dir}/grades.xml`, gradesXml(a.aid));
-    W.put(`${a.dir}/inforef.xml`, inforef([fPkg, fIntro]));
+    W.put(`${a.dir}/inforef.xml`, inforef([fPkg]));
     W.boilerplate(a.dir);
     labelsHtml.push({ where: `${idnumber}#intro`, html: introHtml });
     h5pPackages.push({ itemKey, filename, mainLibrary, sha1: sha1Buf(h5p), bytes: h5p.length });
@@ -1146,7 +1162,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
           const filename = videoPackageFilename(key);
           const name = safeActivityName(`Video interactivo · Capítulo ${ch.chapterNumber}: ${ch.title}`);
           addH5pActivity(sec, `${idp}:video`, name, 'video', key, filename, built.h5p, 'H5P.InteractiveVideo', (mid) =>
-            videoInlineIntroHtml({ packageFilename: filename, title: ch.title, activityMid: mid, youtubeId: video.youtubeId, theme: introTheme }),
+            videoInlineIntroHtml({ packageFilename: filename, title: ch.title, activityMid: mid, youtubeId: video.youtubeId, theme: introTheme, embed: 'package' }),
           );
           continue;
         }
@@ -1479,7 +1495,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const mbz = (await W.zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } })) as Buffer;
   return {
     mbz,
-    expectations: { facts, resolved, h5pProfileVersion, examBankPlans },
+    expectations: { facts, resolved, h5pProfileVersion, examBankPlans, shellProseByLabel: shellProseByLabel(courseIntro, moduleIntros) },
     summary: {
       builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3,
       moodleVersion: MV.br,

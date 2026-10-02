@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { GenerationManifestsService } from '../generation-manifests/generation-manifests.service';
 import { RunsService } from './runs.service';
-import { RunAdminAction, RunAdminActionCode, RunCompletion } from './run-completion';
+import { RunAdminAction, RunAdminActionCode, RunCompletion, loadPendingVideogenReservations } from './run-completion';
 
 /**
  * EV6 DoD BE-B — cola de recuperación de admin (SOLO LECTURA).
@@ -61,6 +61,16 @@ export interface NeedsAttentionListing {
    * none|stale. Acción: `retry_package` (POST …/package, idempotente).
    */
   manualPackage: NeedsAttentionEntry[];
+  /**
+   * V542 (G6): runs (cualquier estado terminal, también `complete`) con reservas de Videogen sin liquidar
+   * que solo un SUPER_ADMIN puede conciliar. Acción: `reconcile_videogen` con su `reservationKey`.
+   */
+  pendingReservations: NeedsAttentionEntry[];
+  /**
+   * V542 fix round 1 (I2): totales de las reservas pendientes de TODO el ledger (cualquier run, no solo el
+   * vigente de cada curso). `truncated` = hay más runs con reservas que `listedRuns` (subir `reservationRuns`).
+   */
+  pendingReservationsTotals: { reservations: number; runs: number; listedRuns: number; truncated: boolean };
   /** Ejecuciones que no se pudieron evaluar (integridad): solo ids y un código. */
   errors: Array<{ runId: string; courseId: number; code: string }>;
 }
@@ -91,6 +101,20 @@ export function endpointForAction(a: RunAdminAction, ids: { courseId: number; bl
         bodyAlternatives: [{ action: 'confirm_existing', youtubeVideoId: '<11 chars>' }, { action: 'authorize_reupload' }],
         note: 'resolución explícita de la subida a YouTube (sin Videogen)',
       };
+    case 'reconcile_videogen_reservation': {
+      // V542 (G6) + fix round 1 (I4): decisión explícita, append-only. «No cobrado» de un intento que pudo renderizarse
+      // exige acknowledgeMayHaveRendered: true.
+      const base = { reservationKey: a.reservationKey, reason: '<qué se verificó en la cuenta de Videogen>' };
+      const risky = a.mayHaveRendered !== false;
+      return {
+        method: 'POST', path: `/api/v1/admin/dynamic-runs/${ids.runId}/videogen-reservations/reconcile`,
+        bodyAlternatives: [
+          { ...base, outcome: 'not_charged', ...(risky ? { acknowledgeMayHaveRendered: true } : {}) },
+          { ...base, outcome: 'charged' },
+        ],
+        note: `reserva de Videogen PENDIENTE (USD ${a.amount ?? '?'}; intento: ${a.attemptState ?? 'unknown'}) que no se va a liquidar sola: Videogen no informa si cobró un job fallido; verificar en su cuenta y registrar «no cobrado» (la reserva va a 0) o «cobrado» (queda contada). SUPER_ADMIN, con motivo; nunca automático${risky ? '. OJO: ese intento pudo renderizarse o cobrarse (envío ambiguo o intento vigente sin liquidar): «no cobrado» exige acknowledgeMayHaveRendered: true' : ''}`,
+      };
+    }
     case 'reconcile_provider':
       return {
         method: 'POST', path: `${item}/retry`, body: { resubmitProvider: true },
@@ -134,7 +158,7 @@ export class AdminRecoveryService {
     private readonly runs: RunsService,
   ) {}
 
-  async listNeedsAttention(opts: { limit?: number } = {}): Promise<NeedsAttentionListing> {
+  async listNeedsAttention(opts: { limit?: number; reservationRuns?: number } = {}): Promise<NeedsAttentionListing> {
     const limit = Math.min(500, Math.max(1, Math.floor(Number(opts.limit) || 100)));
     // La ejecución vigente de cada curso (la más reciente); solo terminadas (las activas están en curso).
     const runs: any[] = await this.dataSource.query(
@@ -153,7 +177,7 @@ export class AdminRecoveryService {
         limit $1`,
       [limit],
     );
-    const out: NeedsAttentionListing = { generatedAt: new Date().toISOString(), scanned: runs.length, needsAttention: [], legacyPreview: [], manualPackage: [], errors: [] };
+    const out: NeedsAttentionListing = { generatedAt: new Date().toISOString(), scanned: runs.length, needsAttention: [], legacyPreview: [], manualPackage: [], pendingReservations: [], pendingReservationsTotals: { reservations: 0, runs: 0, listedRuns: 0, truncated: false }, errors: [] };
     for (const job of runs) {
       try {
         const bp = Number(job.blueprint_number);
@@ -163,6 +187,80 @@ export class AdminRecoveryService {
         const manual = completion.state === 'packaging' && !!completion.packageJob && !completion.packageJob.auto &&
           ['none', 'stale'].includes(completion.packageJob.status);
         if (completion.state !== 'needs_attention' && !legacy && !manual) continue;
+        const ids = { courseId: Number(job.course_id), blueprintNumber: bp, runId: String(job.id) };
+        const entry = this.entryOf(job, bp, manifest, completion, rows);
+        if (completion.state === 'needs_attention') out.needsAttention.push(entry);
+        if (manual) {
+          const a: RunAdminAction = { code: 'retry_package' };
+          out.manualPackage.push({ ...entry, adminActions: [{ ...a, endpoint: endpointForAction(a, ids) }] });
+        }
+        if (legacy) {
+          const [pkg] = await this.dataSource.query(
+            `select count(*)::int as built,
+                    count(*) filter (where (output_summary->>'artifactId') is not null)::int as downloadable
+               from public.production_jobs
+              where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1 and worker_status = 'completed'`,
+            [String(job.id)],
+          );
+          out.legacyPreview.push({ ...entry, legacyPreview: true, packageBuilt: (pkg?.built ?? 0) > 0, packageDownloadable: (pkg?.downloadable ?? 0) > 0 });
+        }
+      } catch (err) {
+        const status = (err as { getStatus?: () => number })?.getStatus?.();
+        out.errors.push({ runId: String(job.id), courseId: Number(job.course_id), code: status ? `http_${status}` : 'evaluation_failed' });
+        this.logger.warn(`needs-attention: no se pudo evaluar el run ${job.id}: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`);
+      }
+    }
+    await this.addPendingReservations(out, opts.reservationRuns);
+    return out;
+  }
+
+  /**
+   * V542 fix round 1 (I2): reservas de Videogen pendientes de TODO el ledger (cualquier run: el vigente, uno
+   * reemplazado por un run nuevo o un upgrade, uno fuera de los `limit` más recientes; cualquier estado, también
+   * `running`). Agrupadas por run (más antiguas primero); `reservationRuns` runs como máximo (default 200, tope
+   * 2000) con el total visible en `pendingReservationsTotals`.
+   */
+  private async addPendingReservations(out: NeedsAttentionListing, reservationRuns?: number): Promise<void> {
+    const cap = Math.min(2000, Math.max(1, Math.floor(Number(reservationRuns) || 200)));
+    const all = await loadPendingVideogenReservations(this.dataSource, null);
+    const byRun = new Map<string, typeof all>();
+    for (const r of all) byRun.set(r.runId, [...(byRun.get(r.runId) ?? []), r]);
+    const runIds = [...byRun.keys()];
+    out.pendingReservationsTotals = { reservations: all.length, runs: runIds.length, listedRuns: Math.min(cap, runIds.length), truncated: runIds.length > cap };
+    for (const runId of runIds.slice(0, cap)) {
+      const [job] = await this.dataSource.query(
+        `select r.*, b.blueprint_number, (r.input_payload->>'manifestId')::bigint as manifest_id_num
+           from public.production_jobs r
+           left join public.course_generation_manifests m on m.id = (r.input_payload->>'manifestId')::bigint
+           left join public.course_blueprints b on b.id = m.blueprint_id
+          where r.id = $1`,
+        [runId],
+      );
+      if (!job) {
+        // Fix round 2 (N5): el curso real (del ledger), nunca 0.
+        out.errors.push({ runId, courseId: Number(byRun.get(runId)![0].courseId ?? 0), code: 'reservation_run_missing' });
+        continue;
+      }
+      try {
+        const bp = Number(job.blueprint_number);
+        const manifest = await this.manifests.getById(Number(job.course_id), String(job.owner_id), bp, Number(job.manifest_id_num));
+        const { completion, rows } = await this.runs.completionForAdmin(job, manifest);
+        const entry = this.entryOf(job, bp, manifest, completion, rows);
+        const ids = { courseId: Number(job.course_id), blueprintNumber: bp, runId };
+        const actions: RunAdminAction[] = byRun.get(runId)!.map((r) => ({
+          code: 'reconcile_videogen_reservation', itemKey: r.itemKey, reservationKey: r.reservationKey, amount: r.amount,
+          attemptState: r.attemptState, mayHaveRendered: r.mayHaveRendered,
+        }));
+        out.pendingReservations.push({ ...entry, adminActions: actions.map((a) => ({ ...a, endpoint: endpointForAction(a, ids) })) });
+      } catch (err) {
+        const status = (err as { getStatus?: () => number })?.getStatus?.();
+        out.errors.push({ runId, courseId: Number(job.course_id), code: status ? `http_${status}` : 'evaluation_failed' });
+        this.logger.warn(`needs-attention: no se pudo evaluar el run ${runId} (reservas): ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`);
+      }
+    }
+  }
+
+  private entryOf(job: any, bp: number, manifest: any, completion: RunCompletion, rows: any[]): NeedsAttentionEntry {
         const ids = { courseId: Number(job.course_id), blueprintNumber: bp, runId: String(job.id) };
         const byKey = new Map<string, any>(rows.map((r: any) => [r.item_key, r]));
         const failed = completion.missingComponents
@@ -193,27 +291,7 @@ export class AdminRecoveryService {
             return { ...a, endpoint };
           }),
         };
-        if (completion.state === 'needs_attention') out.needsAttention.push(entry);
-        if (manual) {
-          const a: RunAdminAction = { code: 'retry_package' };
-          out.manualPackage.push({ ...entry, adminActions: [{ ...a, endpoint: endpointForAction(a, ids) }] });
-        }
-        if (legacy) {
-          const [pkg] = await this.dataSource.query(
-            `select count(*)::int as built,
-                    count(*) filter (where (output_summary->>'artifactId') is not null)::int as downloadable
-               from public.production_jobs
-              where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1 and worker_status = 'completed'`,
-            [String(job.id)],
-          );
-          out.legacyPreview.push({ ...entry, legacyPreview: true, packageBuilt: (pkg?.built ?? 0) > 0, packageDownloadable: (pkg?.downloadable ?? 0) > 0 });
-        }
-      } catch (err) {
-        const status = (err as { getStatus?: () => number })?.getStatus?.();
-        out.errors.push({ runId: String(job.id), courseId: Number(job.course_id), code: status ? `http_${status}` : 'evaluation_failed' });
-        this.logger.warn(`needs-attention: no se pudo evaluar el run ${job.id}: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`);
-      }
-    }
-    return out;
+        return entry;
   }
 }
+

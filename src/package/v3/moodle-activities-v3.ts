@@ -45,12 +45,27 @@ function sha1(s: string): string {
  * D(URING)=0x10000, I(MMEDIATELY_AFTER)=0x1000, O(PEN, "later while
  * open")=0x100, C(LOSE, "after close")=0x10. Probado en Moodle 4.5.14+
  * contra una restauración real — ver `scratchpad/r18/P2-design.md` §1.
+ *
+ * V542 (I4, builder 3.7.0): `reviewattempt` incluye I. Sin eso, Moodle redirige a review.php al
+ * terminar el intento y lo devuelve a view.php con «No tiene permiso para revisar este cuestionario».
+ *
+ * V542 fix round 1 (I1, builder 3.9.0) — regla del usuario: las respuestas correctas se revelan SOLO en
+ * «Respuestas explicadas» (al aprobar o agotar los intentos). La nota POR PREGUNTA junto a la respuesta
+ * propia revela la correcta (V/F: «0 sobre 5,88» con «Verdadero» marcado = la correcta es «Falso»), así que:
+ *  - D|I (durante e inmediatamente después, ~2 min): la página de revisión muestra las respuestas propias
+ *    SIN nota por pregunta (marks = MAX_ONLY: «Puntúa como 5,88») ni corrección → sin el aviso de permiso;
+ *  - O (más tarde, abierto): sin página de revisión; la nota TOTAL se ve en view.php y en el libro de
+ *    calificaciones (marks O ⇒ quiz_grade_item_update deja el ítem visible) y la completion sigue igual;
+ *  - C (cierre, solo si un profesor fija timeclose): todo.
+ * Compromiso (documentado): nunca hay notas por pregunta mientras el examen está abierto, y la revisión
+ * del intento solo está disponible justo al terminarlo; la nota total aparece en view.php ~2 min después
+ * (en el libro de calificaciones, de inmediato).
  */
 export const QUIZ_REVIEW_V3 = {
-  reviewattempt: 65552, // D|C — sin página de revisión del intento hasta el cierre
+  reviewattempt: 69648, // D|I|C — revisión de las respuestas propias al terminar (sin aviso de permiso)
   reviewcorrectness: 16, // C
-  reviewmaxmarks: 69904, // D|I|O|C
-  reviewmarks: 4368, // I|O|C — columna de nota en la vista de intentos
+  reviewmaxmarks: 69904, // D|I|O|C — «Puntúa como N» (sin la nota obtenida)
+  reviewmarks: 272, // O|C — nota (total y por pregunta) solo cuando NO hay página de revisión abierta (O) o al cierre
   reviewspecificfeedback: 16, // C
   reviewgeneralfeedback: 16, // C
   reviewrightanswer: 16, // C

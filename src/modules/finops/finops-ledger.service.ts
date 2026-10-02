@@ -711,7 +711,7 @@ export class FinopsLedgerService {
   async reconcileReservationAsCharged(
     reservationKey: string,
     reason: string,
-    opts: { decidedBy?: string; recordedBy?: string } = {},
+    opts: { decidedBy?: string; recordedBy?: string; metadata?: Record<string, unknown> } = {},
   ): Promise<{ reconciled: boolean; alreadySettled: boolean; amount: string; event: CostEventRow | null }> {
     nonEmpty(reservationKey, 'reservationKey');
     nonEmpty(reason, 'reason');
@@ -738,7 +738,51 @@ export class FinopsLedgerService {
         recordedBy: opts.recordedBy || 'reconciler',
         settlement: true,
         settlementLabel: 'reconciled_as_charged',
-        metadata: { reservationReconciledAsCharged: true, decidedBy },
+        metadata: { ...(opts.metadata || {}), reservationReconciledAsCharged: true, decidedBy },
+      });
+      return { reconciled: r.inserted, alreadySettled: false, amount: res.amount, event: r.event };
+    });
+  }
+
+  /**
+   * V542 (G6) — conciliación ADMINISTRATIVA de una reserva cuyo resultado es INCIERTO y que un
+   * SUPER_ADMIN decidió contar como NO COBRADA (p.ej. Videogen falló en `generate_script` antes del
+   * render y la cuenta del proveedor no muestra cobro). Inserta un ADJUSTMENT `final` que lleva la
+   * reserva a 0 (append-only: el CHARGE original queda, con su corrección al lado) con el motivo y el
+   * actor. Nunca es automático (regla del usuario: un resultado incierto no se libera solo). Exige
+   * `decidedBy` y `reason`. Repetir, o una reserva ya liquidada/conciliada = no-op (`alreadySettled`).
+   */
+  async reconcileReservationAsNotCharged(
+    reservationKey: string,
+    reason: string,
+    opts: { decidedBy?: string; recordedBy?: string; metadata?: Record<string, unknown> } = {},
+  ): Promise<{ reconciled: boolean; alreadySettled: boolean; amount: string; event: CostEventRow | null }> {
+    nonEmpty(reservationKey, 'reservationKey');
+    nonEmpty(reason, 'reason');
+    const decidedBy = nonEmpty(opts.decidedBy, 'decidedBy');
+    return this.dataSource.transaction(async (manager) => {
+      await manager.query(`select pg_advisory_xact_lock(hashtext($1))`, ['finops:adj:' + reservationKey]);
+      const [res] = await manager.query(
+        `select id, event_kind, metadata, measurement_status, amount::text as amount from public.generation_cost_events where idempotency_key = $1`,
+        [reservationKey],
+      );
+      if (!res) throw new FinopsError('ORIGINAL_NOT_FOUND', `no existe la reserva ${reservationKey}`);
+      if (res.event_kind !== 'CHARGE' || res.metadata?.reservation !== true) {
+        throw new FinopsError('INVALID_INPUT', `${reservationKey} no es una reserva de llamada pagada`);
+      }
+      const [adj] = await manager.query(
+        `select count(*)::int as n from public.generation_cost_events where corrects_event_id = $1 and event_kind = 'ADJUSTMENT'`,
+        [res.id],
+      );
+      if (Number(adj.n) > 0) return { reconciled: false, alreadySettled: true, amount: res.amount, event: null };
+      if (res.measurement_status !== 'pending') {
+        throw new FinopsError('INVALID_INPUT', `${reservationKey} no está pendiente (${String(res.measurement_status)}): no hay nada que conciliar`);
+      }
+      const r = await this.adjustWith(manager, reservationKey, normalizeDecimal(0), reason, {
+        recordedBy: opts.recordedBy || 'reconciler',
+        settlement: true,
+        settlementLabel: 'reconciled_as_not_charged',
+        metadata: { ...(opts.metadata || {}), reservationReconciledAsNotCharged: true, decidedBy },
       });
       return { reconciled: r.inserted, alreadySettled: false, amount: res.amount, event: r.event };
     });

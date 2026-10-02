@@ -284,16 +284,34 @@ const FLOWS = {
     if (k !== 'ok') throw new Error(`BL Comprobar: ${k}`);
   },
   // Video interactivo: en cada checkpoint planeado (468 s ⇒ 5) busca, responde lo correcto
-  // (multichoice / verdadero-falso alternados, como la fixture de llm-v3.js), "Comprobar";
+  // (multichoice / verdadero-falso alternados, como la fixture de llm-v3.js; el valor de cada V/F
+  // sale de la fixture y se exige que el contenido H5P coincida), "Comprobar";
   // al final "Enviar respuestas".
-  async interactivevideo(b) {
+  async interactivevideo(b, target) {
     const plan = H5PLIB.planInteractionCheckpoints(468);
+    // V542 fix round 1 (M3): la V/F correcta sale de la FIXTURE (llm-v3.js interactions(indices, firstTrue)),
+    // no del paquete que se prueba: el ejecutor siembra «la PRIMERA afirmación truefalse es …» con
+    // dynTfFirstTrue('video_interactions:<chapterId>') (FNV-1a de 'tf|' + itemKey, bit 0) y la fixture alterna
+    // desde ese valor. El contenido H5P debe coincidir (un builder que invirtiera la V/F falla acá).
+    const chapterId = String(target && target.idnumber || '').split(':')[2];
+    if (!chapterId) throw new Error('IV: sin chapterId en el idnumber');
+    const fnv = (str) => { let h = 2166136261 >>> 0; for (const byte of Buffer.from(str, 'utf8')) { h ^= byte; h = Math.imul(h, 16777619) >>> 0; } return h >>> 0; };
+    const firstTrue = (fnv(`tf|video_interactions:${chapterId}`) & 1) === 1;
+    let tfIndex = 0;
     await b.waitFor(inH5p(`const v=inst.video;return v&&v.getDuration&&v.getDuration()>0?1:0;`), { timeoutMs: 60000, what: 'YouTube en el IV' });
     for (let i = 0; i < plan.length; i++) {
       const cp = plan[i];
       const mc = i % 2 === 0;
       const q = mc ? '¿Qué señal indica una pérdida de presión en este tramo?' : 'Registrar la temperatura ayuda a anticipar fallas.';
-      const pick = mc ? 'Respuesta lenta del actuador' : 'Verdadero';
+      // V542: las V/F de la fixture alternan su valor (lint de sesgo del cliente): la correcta se lee del
+      // propio contenido H5P (H5P.TrueFalse en ese segundo: params.correct 'true' | 'false').
+      let pick = 'Respuesta lenta del actuador';
+      if (!mc) {
+        const expected = ((tfIndex++ % 2 === 0) === firstTrue) ? 'Verdadero' : 'Falso';
+        const inContent = await b.evaluate(inH5p(`const ia=(inst.options.assets.interactions||[]).filter(x=>/^H5P\.TrueFalse /.test(x.action.library)&&Math.abs(x.duration.from-${cp.atSec})<1)[0];return ia?(ia.action.params.correct==='true'?'Verdadero':'Falso'):null;`));
+        if (inContent !== expected) throw new Error(`IV checkpoint ${cp.index}: la V/F del contenido (${inContent}) no es la de la fixture (${expected})`);
+        pick = expected;
+      }
       await b.evaluate(inH5p(`inst.video.seek(${cp.atSec + 1});inst.video.play();return 1;`));
       await b.waitFor(inH5p(`return [...d.querySelectorAll('.h5p-interaction')].some(e=>e.offsetParent!==null&&e.innerText.includes(${JSON.stringify(q)}))?1:0;`), { timeoutMs: 30000, what: `IV checkpoint ${cp.index}` });
       const r = await b.evaluate(inH5p(`const box=[...d.querySelectorAll('.h5p-interaction')].find(e=>e.offsetParent!==null&&e.innerText.includes(${JSON.stringify(q)}));const o=[...box.querySelectorAll('.h5p-answer, .h5p-true-false-answer')].find(e=>e.innerText.trim()===${JSON.stringify(pick)});if(!o)return 'sin opción';o.click();const k=[...box.querySelectorAll('button')].find(x=>x.innerText.trim()==='Comprobar');if(!k)return 'sin Comprobar';k.click();return 'ok';`));
@@ -547,7 +565,7 @@ async function main() {
       const mc = R.moodle[key];
       for (const x of mc.cms.filter((y) => y.modname === 'h5pactivity')) {
         const t = /:activity$/.test(x.idnumber) ? SHELL.activityTypeForChapter(x.idnumber.split(':')[2]) : /:video$/.test(x.idnumber) ? 'interactivevideo' : null;
-        if (t && !targets[t]) targets[t] = { key, courseid: mc.courseid, cmid: x.cmid, type: t };
+        if (t && !targets[t]) targets[t] = { key, courseid: mc.courseid, cmid: x.cmid, type: t, idnumber: x.idnumber };
       }
     }
     eq(Object.keys(targets).sort(), ['blanks', 'dragtext', 'interactivevideo', 'questionset'], 'E1+E3 restaurados: hay una actividad de cada tipo (QuestionSet, DragText, Blanks) y un video interactivo');
@@ -560,7 +578,7 @@ async function main() {
       const lib = await b.waitFor(inH5p(`return inst.libraryInfo.versionedName;`), { timeoutMs: 30000, what: 'H5P' }).catch((e) => e.message);
       ok(lib === LIB[t], `${t}: el reproductor real despliega y carga ${LIB[t]} (${target.key}, cm ${target.cmid})`, lib);
       let answered = true;
-      try { await FLOWS[t](b); } catch (e) { answered = ok(false, `${t}: respondido a través del DOM`, e.message); }
+      try { await FLOWS[t](b, target); } catch (e) { answered = ok(false, `${t}: respondido a través del DOM`, e.message); }
       if (answered) ok(true, `${t}: respondido a través del DOM (todas correctas)${t === 'dragtext' && dtRedrags.length ? `; re-arrastres del harness: ${JSON.stringify(dtRedrags)}` : ''}`);
       await sleep(3000); // deja terminar el POST xAPI
       const file = path.join(SHOTS, `h5p-${t}-answered.png`);

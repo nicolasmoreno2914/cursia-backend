@@ -254,11 +254,19 @@ async function pureChecks() {
   // 645 2dc8dc4ec6bea13e3946abb496faca73f34774e84b4daf48bc83015cad1870ec.
   // Dorados post-P3 (builder 3.5.0): 644 800aea31b3c198341df277b8dfce4dadc9d62eec0573d3a77718b9626beeddac,
   // 645 bef9261dfed571ab61a64034614c87528ea03d640cf1b4a11c43ed31b08ed9f6.
+  // V542 I4 (builder 3.6.0 → 3.7.0) cambia SOLO `<reviewattempt>` 65552 → 69904 en cada quiz.xml (prueba:
+  // scratchpad/r18/v542fix/mbzdiff.js contra staging b959a89: 644 cambia quiz_1030 y quiz_1048, 645 quiz_1031,
+  // nada más). V542 I2 (3.7.0 → 3.8.0): cada h5pactivity guarda su .h5p UNA vez (sin la copia en `intro`):
+  // cambian h5pactivity.xml (iframe → package/0 + cargador v2), inforef.xml de h5pactivity y, por la
+  // renumeración de ids de archivo, inforef.xml de labels/SCORM y files.xml; ningún blob cambia. Dorados
+  // 3.7.0: 644 6afef1a78bd4f86eac5e355d6aa8e5f52dbc3fe4be9c08e066afd1f1c1822fec,
+  // 645 5cef2b728e7132590f1d5087381ecbca485fd2d00e76e528de11cd3fe87109b2. Dorados de staging (builder 3.6.0): 644 5de36d0645bcc04a2189f33849a53e1a2250991b4b3cd10ed0aaa3a11c3b0c1f,
+  // 645 58408d0e6a04774d5ca7df08deac6cd46a23a3326836047c7b1ad16cb13f458f.
   const GOLDEN_PRE_T5 = {
-    644: ['5de36d0645bcc04a2189f33849a53e1a2250991b4b3cd10ed0aaa3a11c3b0c1f', { engine: 'h5p', finalExam: true, courseId: 644 }],
-    645: ['58408d0e6a04774d5ca7df08deac6cd46a23a3326836047c7b1ad16cb13f458f', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
+    644: ['d3b7ad86f5863e64b49a7ef6419c365c626230c319b6cae1f1555963d7516dcf', { engine: 'h5p', finalExam: true, courseId: 644 }],
+    645: ['a72078adc2d79987d55b855c9e15923f398e009eaf1c39bf804fb323d829ba9c', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
   };
-  await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B4 (respuestas explicadas sobre sistema visual 2.0 + certificado + política de revisión del quiz, builder 3.6.0), con y sin el campo', async () => {
+  await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B4 (respuestas explicadas sobre sistema visual 2.0 + certificado + política de revisión del quiz con revisión de respuestas propias V542 + H5P de una sola copia, builder 3.9.0), con y sin el campo', async () => {
     for (const [id, [want, o]] of Object.entries(GOLDEN_PRE_T5)) {
       const i1 = PF.packagingInput(distRoot, o);
       const i2 = PF.packagingInput(distRoot, o);

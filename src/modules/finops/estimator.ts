@@ -5,6 +5,9 @@
  *   min      = precio(p10)                       (sin retries)
  *   expected = precio(p50) × (1 + retryRate)     (tasa observada/prior de retries)
  *   max      = precio(p90) × (1 + maxRetries)
+ * V542 (v2): `usageScale` por item escala el uso (p10/p50/p90) de sus operaciones — el banco de un
+ * examen crece con los capítulos que cubre (ver `examBankUsageScale` en run-budget.ts) — y el
+ * resultado separa la reserva por reintentos (`retryRate` por línea, `totals.retryAllowance`).
  * Acciones GENERATE/REGENERATE suman incremental. REUSE / REVIEW /
  * STALE_NO_AUTO / SOFT_DISABLE valen 0 incremental; REUSE / REVIEW /
  * STALE_NO_AUTO se reportan como evitado con basis='current_estimate' (el
@@ -16,7 +19,7 @@ import { priceUsage, PricingCatalogRow, UsageMeters } from './pricing';
 import { operationsForItemType, FinopsItemType } from './operations';
 import { UsageModel, assertValidUsageModel } from './usage-model';
 
-export const ESTIMATOR_VERSION = 'finops-estimator-v1';
+export const ESTIMATOR_VERSION = 'finops-estimator-v2';
 
 export const ESTIMATE_ACTIONS = ['GENERATE', 'REGENERATE', 'REUSE', 'REVIEW', 'STALE_NO_AUTO', 'SOFT_DISABLE'] as const;
 export type EstimateAction = (typeof ESTIMATE_ACTIONS)[number];
@@ -31,7 +34,15 @@ export interface EstimateItem {
   chapterId?: string | null;
   /** Default GENERATE (run nuevo sin plan de invalidación). */
   action?: EstimateAction | string | null;
+  /**
+   * V542: multiplicador del uso del usage model (> 0; default 1), único o por medidor
+   * (`{ input_tokens, output_tokens }`; un medidor ausente = 1). Lo fija quien arma los items cuando
+   * el trabajo real escala con el curso (banco de un examen, ver run-budget.ts examBankUsageScale).
+   */
+  usageScale?: UsageScale | null;
 }
+
+export type UsageScale = number | Readonly<Record<string, number>>;
 
 export interface RetryPolicy {
   /** Máximo de reintentos pagados por operación (config del worker). Entero >= 0. */
@@ -60,6 +71,10 @@ export interface EstimateLine extends MinExpMax {
   incremental: boolean;
   /** Costo que tendría generar el item (independiente de la acción). */
   wouldCost: MinExpMax;
+  /** V542: tasa de reintentos aplicada a expected (op.retryRate ?? retryPolicy/default). */
+  retryRate: number;
+  /** V542: multiplicador de uso del item (solo si se pidió uno ≠ 1). */
+  usageScale?: UsageScale;
   basis: 'usage_model';
   pricingVersions: string[];
 }
@@ -79,6 +94,11 @@ export interface EstimateResult {
   pricingVersions: string[];
   lines: EstimateLine[];
   totals: MinExpMax & {
+    /**
+     * V542: parte del total por reintentos — expected: Σ precio(p50)·retryRate; max: Σ precio(p90)·maxRetries
+     * (incrementales). El resto del total es el uso del usage model sin reintentos.
+     */
+    retryAllowance: { expected: string; max: string };
     byProvider: Record<string, MinExpMax>;
     byItemType: Record<string, MinExpMax>;
     byChapter: Record<string, MinExpMax>;
@@ -109,10 +129,22 @@ function addInto(map: Record<string, MinExpMax>, key: string, v: MinExpMax): voi
   map[key] = { min: addDec(cur.min, v.min), expected: addDec(cur.expected, v.expected), max: addDec(cur.max, v.max) };
 }
 
-function usageAt(meters: Record<string, { p10: DecimalLike; p50: DecimalLike; p90: DecimalLike }>, p: 'p10' | 'p50' | 'p90'): UsageMeters {
+function scaleOf(scale: UsageScale, meter: string): number {
+  return typeof scale === 'number' ? scale : scale[meter] ?? 1;
+}
+
+function usageAt(meters: Record<string, { p10: DecimalLike; p50: DecimalLike; p90: DecimalLike }>, p: 'p10' | 'p50' | 'p90', scale: UsageScale = 1): UsageMeters {
   const out: UsageMeters = {};
-  for (const m of Object.keys(meters).sort()) out[m] = meters[m][p];
+  // Escala ≠ 1: unidades enteras hacia arriba (tokens/créditos) — nunca subestima.
+  for (const m of Object.keys(meters).sort()) {
+    const k = scaleOf(scale, m);
+    out[m] = k === 1 ? meters[m][p] : String(Math.ceil(Number(meters[m][p]) * k));
+  }
   return out;
+}
+
+function isUnitScale(scale: UsageScale): boolean {
+  return typeof scale === 'number' ? scale === 1 : Object.values(scale).every((v) => v === 1);
 }
 
 function sortedRecord<T>(r: Record<string, T>): Record<string, T> {
@@ -137,6 +169,8 @@ export function estimateCost(input: EstimateCostInput): EstimateResult {
   const byChapter: Record<string, MinExpMax> = {};
   const versions = new Set<string>();
   let total = zero();
+  let retryExpected = ZERO;
+  let retryMax = ZERO;
   let avoidedTotal = ZERO;
   let currency: string | null = null;
   const seenKeys = new Set<string>();
@@ -150,6 +184,11 @@ export function estimateCost(input: EstimateCostInput): EstimateResult {
       throw new FinopsError('UNKNOWN_ACTION', `acción desconocida ${String(item.action)} en ${item.itemKey}`);
     }
     const incremental = INCREMENTAL_ACTIONS.includes(action);
+    const scale: UsageScale = item.usageScale ?? 1;
+    const factors = typeof scale === 'number' ? [scale] : scale && typeof scale === 'object' ? Object.values(scale) : [NaN];
+    if (!factors.every((v) => typeof v === 'number' && Number.isFinite(v) && v > 0 && v <= 100)) {
+      throw new FinopsError('INVALID_INPUT', `usageScale inválido en ${item.itemKey}: ${JSON.stringify(item.usageScale)}`);
+    }
     const ops = operationsForItemType(item.itemType);
     let itemWould = ZERO;
     for (const operation of ops) {
@@ -160,9 +199,9 @@ export function estimateCost(input: EstimateCostInput): EstimateResult {
         throw new FinopsError('INVALID_INPUT', `retryRate ${rate} de ${operation} fuera de [0, maxRetries=${rp.maxRetries}]`);
       }
       const at = { provider: def.provider, service: def.service, product: def.product, asOf: input.pricingAsOf ?? null };
-      const p10 = priceUsage(usageAt(def.meters, 'p10'), input.catalog, at);
-      const p50 = priceUsage(usageAt(def.meters, 'p50'), input.catalog, at);
-      const p90 = priceUsage(usageAt(def.meters, 'p90'), input.catalog, at);
+      const p10 = priceUsage(usageAt(def.meters, 'p10', scale), input.catalog, at);
+      const p50 = priceUsage(usageAt(def.meters, 'p50', scale), input.catalog, at);
+      const p90 = priceUsage(usageAt(def.meters, 'p90', scale), input.catalog, at);
       for (const r of [p10, p50, p90]) {
         if (r.lines.length === 0) continue;
         if (currency !== null && r.currency !== currency) throw new FinopsError('CURRENCY_MISMATCH', `${currency} vs ${r.currency}`);
@@ -188,12 +227,18 @@ export function estimateCost(input: EstimateCostInput): EstimateResult {
         incremental,
         ...inc,
         wouldCost: would,
+        retryRate: rate,
+        ...(!isUnitScale(scale) ? { usageScale: scale } : {}),
         basis: 'usage_model',
         pricingVersions: Array.from(new Set([...p10.pricingSnapshot.pricing_versions, ...p90.pricingSnapshot.pricing_versions])).sort(),
       };
       lines.push(line);
       itemWould = addDec(itemWould, would.expected);
       total = { min: addDec(total.min, inc.min), expected: addDec(total.expected, inc.expected), max: addDec(total.max, inc.max) };
+      if (incremental) {
+        retryExpected = addDec(retryExpected, mulDec(p50.amount, rate));
+        retryMax = addDec(retryMax, mulDec(p90.amount, rp.maxRetries));
+      }
       addInto(byProvider, def.provider, inc);
       addInto(byItemType, item.itemType, inc);
       addInto(byChapter, item.chapterId ?? NO_CHAPTER_KEY, inc);
@@ -210,7 +255,7 @@ export function estimateCost(input: EstimateCostInput): EstimateResult {
     currency: currency ?? 'USD',
     pricingVersions: Array.from(versions).sort(),
     lines,
-    totals: { ...total, byProvider: sortedRecord(byProvider), byItemType: sortedRecord(byItemType), byChapter: sortedRecord(byChapter) },
+    totals: { ...total, retryAllowance: { expected: retryExpected, max: retryMax }, byProvider: sortedRecord(byProvider), byItemType: sortedRecord(byItemType), byChapter: sortedRecord(byChapter) },
     avoided: { expected: avoidedTotal, byItem: avoided },
   };
 }

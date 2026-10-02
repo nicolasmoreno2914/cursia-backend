@@ -1,20 +1,49 @@
 {
-  "version": "usage-priors-v1.1",
+  "version": "usage-priors-v1.2",
   "learnedFromLedger": false,
   "minSamplesToLearn": 20,
   "defaultRetryRate": 0.15,
-  "notes": "PRIORS, not measurements. p10/p50/p90 of usage per operation (audit §W.6). LLM token priors are rough guesses from prompt sizes in the V2 executor and the audiobook target (~480 words/chapter ≈ 650 output tokens). TTS audio tokens assume ~1250 audio-output tokens per minute (US$0.015/min ÷ US$12/1M) and ~150 words/min. Gamma credits are a placeholder. Videogen = 1 render per video (observed). YouTube videos.insert quota = 1600 units (verify against current YouTube Data API docs). v1.1 (calibración #2): llm.content output p90 = 8000 = tope de salida del capítulo (antes 4608; la calibración #1 truncó 3/3 con Haiku 4.5), p50 3700 ≈ 12.6k caracteres medidos en 13 capítulos reales de staging. Replace each operation with p10/p50/p90 learned from generation_cost_events once it has >= minSamplesToLearn CHARGE samples.",
+  "notes": "PRIORS, not measurements. p10/p50/p90 of usage per operation (audit §W.6). LLM token priors are rough guesses from prompt sizes in the V2 executor and the audiobook target (~480 words/chapter ≈ 650 output tokens). TTS audio tokens assume ~1250 audio-output tokens per minute (US$0.015/min ÷ US$12/1M) and ~150 words/min. Gamma credits are a placeholder. Videogen = 1 render per video (observed). YouTube videos.insert quota = 1600 units (verify against current YouTube Data API docs). v1.1 (calibración #2): llm.content output p90 = 8000 = tope de salida del capítulo (antes 4608; la calibración #1 truncó 3/3 con Haiku 4.5), p50 3700 ≈ 12.6k caracteres medidos en 13 capítulos reales de staging. v1.2 (calibración V542, curso #542 run 518bcc78, 2 módulos × 2 capítulos, Sonnet 4.6 US$3/15 por M): ver el bloque calibrationV542. Replace each operation with p10/p50/p90 learned from generation_cost_events once it has >= minSamplesToLearn CHARGE samples.",
+  "calibrationV542": {
+    "source": "~/cursia-test-env/ev5-ledger.md (Validation course) — FinOps recorded USD per item type for run 518bcc78 (incluye reintentos pagados del item): exam 2.23 (2 items), final_exam 2.12 (1), experience 0.64 (4), content 0.40 (4); resto anthropic 0.69 (course_plan, intros, video_interactions, activity, audiobook_script) ≈ estimado v1.1 0.73, sin cambio.",
+    "method": "Solo hay montos por item type (no tokens por llamada). Por operación: actual_por_item = expected = precio(p50) × (1 + retryRate) ⇒ precio(p50) = actual / (1 + retryRate); el p50 de tokens se reparte con la forma de la operación: banco = N llamadas por capítulo (≈ 9-10k tokens de entrada c/u: sistema + texto del capítulo + contexto) y salida ≈ preguntas pedidas × tokens por tipo (MC 560, VF 200, EM 300; DYN_EXAM_BANK_TOKENS_EST del ejecutor), × ≈ 2.2 por reintentos internos (validation_retry, división por max_tokens, 2 rondas de reparación con la lista aceptada en el prompt). p10 = una sola pasada sin reparaciones; p90 ≈ 1.6–1.7 × p50.",
+    "exam": {
+      "actualPerItemUSD": 1.115,
+      "retryRate": 0.35,
+      "retryRateWhy": "1 de 3 ítems de banco del run necesitó un reintento completo de admin (EXAM_BANK_INCOMPLETE, G9) ⇒ 0.33 → 0.35",
+      "p50USD": 0.825,
+      "reference": "examen de módulo de 2 capítulos = 40 preguntas pedidas (17 slots); otros tamaños escalan por preguntas pedidas (run-budget.ts examBankUsageScale)"
+    },
+    "final_exam": {
+      "actualPerItemUSD": 2.12,
+      "retryRate": 0.35,
+      "p50USD": 1.56,
+      "reference": "final de 2×2 = 72 preguntas pedidas (33 slots)"
+    },
+    "experience": {
+      "actualPerItemUSD": 0.16,
+      "retryRate": "default 0.15",
+      "p50USD": 0.1395
+    },
+    "content": {
+      "actualPerItemUSD": 0.1,
+      "retryRate": "default 0.15",
+      "p50USD": 0.087
+    },
+    "notCalibrated": "gamma (estimado 0.69/presentación vs 0.425 medido, 4 muestras) se deja alto a propósito (lado seguro); videogen 0.94/render coincide; openai 0.21 vs 0.24 estimado.",
+    "check": "2×2 de #542 (36 items, scripts/check-v21-finops.js «calibración V542»): estimado expected ≈ USD 13.5 vs gasto REAL ≈ 11.73 (+15 %, objetivo ±20 %) y vs 14.55 registrado (−7 %). El objetivo es el REAL: los 2.82 restantes del registrado son reservas de Videogen de 3 fallas previas al render (resultado incierto, pendientes de conciliar), no consumo."
+  },
   "operations": {
     "llm.course_plan":        { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 3000, "p50": 5000, "p90": 8000 }, "output_tokens": { "p10": 1500, "p50": 3000, "p90": 5000 } } },
     "llm.course_intro":       { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 2000, "p50": 3000, "p90": 5000 }, "output_tokens": { "p10": 600, "p50": 1000, "p90": 1800 } } },
     "llm.module_intro":       { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 2000, "p50": 3000, "p90": 5000 }, "output_tokens": { "p10": 500, "p50": 900, "p90": 1500 } } },
-    "llm.content":            { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 3000, "p50": 5000, "p90": 9000 }, "output_tokens": { "p10": 3000, "p50": 3700, "p90": 8000 } } },
-    "llm.experience":         { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 3000, "p50": 5000, "p90": 8000 }, "output_tokens": { "p10": 800, "p50": 1500, "p90": 2500 } } },
+    "llm.content":            { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 3000, "p50": 5000, "p90": 9000 }, "output_tokens": { "p10": 3000, "p50": 4800, "p90": 8000 } } },
+    "llm.experience":         { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 5000, "p50": 12000, "p90": 20000 }, "output_tokens": { "p10": 3000, "p50": 6900, "p90": 12000 } } },
     "llm.video_interactions": { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 2500, "p50": 4000, "p90": 6000 }, "output_tokens": { "p10": 500, "p50": 900, "p90": 1500 } } },
     "llm.activity":           { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 3000, "p50": 5000, "p90": 8000 }, "output_tokens": { "p10": 2000, "p50": 4000, "p90": 7000 } } },
     "llm.scorm":              { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 4000, "p50": 6000, "p90": 9000 }, "output_tokens": { "p10": 6000, "p50": 10000, "p90": 14000 } } },
-    "llm.exam":               { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 4000, "p50": 8000, "p90": 14000 }, "output_tokens": { "p10": 1500, "p50": 3000, "p90": 5000 } } },
-    "llm.final_exam":         { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 6000, "p50": 12000, "p90": 20000 }, "output_tokens": { "p10": 2000, "p50": 4000, "p90": 6000 } } },
+    "llm.exam":               { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "retryRate": 0.35, "meters": { "input_tokens": { "p10": 36000, "p50": 90000, "p90": 150000 }, "output_tokens": { "p10": 16000, "p50": 37000, "p90": 60000 } } },
+    "llm.final_exam":         { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "retryRate": 0.35, "meters": { "input_tokens": { "p10": 80000, "p50": 170000, "p90": 280000 }, "output_tokens": { "p10": 31000, "p50": 70000, "p90": 110000 } } },
     "llm.audiobook_script":   { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 3000, "p50": 5000, "p90": 8000 }, "output_tokens": { "p10": 500, "p50": 700, "p90": 1000 } } },
     "tts.audio_welcome":      { "provider": "openai", "service": "audio.speech", "product": "gpt-4o-mini-tts", "meters": { "text_input_tokens": { "p10": 150, "p50": 250, "p90": 400 }, "audio_output_tokens": { "p10": 900, "p50": 1250, "p90": 2000 } } },
     "tts.audiobook_chapter":  { "provider": "openai", "service": "audio.speech", "product": "gpt-4o-mini-tts", "meters": { "text_input_tokens": { "p10": 550, "p50": 650, "p90": 800 }, "audio_output_tokens": { "p10": 3200, "p50": 4000, "p90": 5000 } } },

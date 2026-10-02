@@ -60,6 +60,36 @@ export function defaultPresentationProfile(): PresentationProfile {
   return { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 };
 }
 
+/**
+ * V542 (G2, decisión EV6 n.º 3) — un curso NUEVO sin perfil guardado arranca en Aula Clara (claro); la
+ * paleta solo aporta los colores de marca (`brandSeed`). Los cursos ANTERIORES conservan el tema que
+ * siempre derivaron de su paleta (claro → aula-clara/light, el resto → oscuro-premium/dark): su paquete
+ * y sus presentaciones de Gamma ya dependen de él.
+ *
+ * Marca: `courses.created_at` (timestamptz NOT NULL default now(), inmutable). Se eligió sobre una
+ * marca en `courses.metadata` porque PATCH /courses reemplaza `metadata` entero (CoursesService.update:
+ * Object.assign) y la marca se perdería; tampoco sirve «tiene runs/paquetes» porque el primer run de un
+ * curso nuevo ya existe cuando Gamma pide el tema.
+ * V542 fix round 1 (I3): falla CERRADO. Solo con `PRESENTATION_LIGHT_DEFAULT_SINCE` (ISO válido) puesto
+ * en el entorno; sin la variable (o inválida) el default claro está APAGADO y todo curso conserva el tema
+ * derivado de su paleta. El deploy de staging la fija en el instante de su deploy (2026-10-02T12:00:00Z).
+ */
+export const PRESENTATION_LIGHT_DEFAULT_SINCE_ENV = 'PRESENTATION_LIGHT_DEFAULT_SINCE';
+/** Corte del default claro, o null (apagado) si la variable falta o no es una fecha ISO válida. */
+export function presentationLightDefaultSince(env: NodeJS.ProcessEnv = process.env): Date | null {
+  const raw = String(env[PRESENTATION_LIGHT_DEFAULT_SINCE_ENV] ?? '').trim();
+  if (!raw || !/^\d{4}-\d{2}-\d{2}T/.test(raw)) return null;
+  const d = new Date(raw);
+  return Number.isFinite(d.getTime()) ? d : null;
+}
+/** ¿El curso (por su `created_at`) arranca en Aula Clara sin perfil guardado? Apagado o sin fecha legible → no (conserva). */
+export function isLightDefaultCourse(createdAt: Date | string | null | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+  const since = presentationLightDefaultSince(env);
+  if (!since || createdAt === null || createdAt === undefined || createdAt === '') return false;
+  const d = createdAt instanceof Date ? createdAt : new Date(createdAt);
+  return Number.isFinite(d.getTime()) && d.getTime() >= since.getTime();
+}
+
 /** F1 (I4): de dónde sale el perfil de presentación por defecto de un curso sin perfil guardado. */
 export type PresentationDefaultSource = 'palette' | 'fallback';
 
@@ -68,13 +98,15 @@ export type PresentationDefaultSource = 'palette' | 'fallback';
  * - Con una paleta legacy conocida → derivado de ella
  *   (`presentationProfileFromPalette`: claro → aula-clara/light, el resto →
  *   oscuro-premium/dark; brandSeed de la paleta), `source: 'palette'`.
+ *   V542 (G2): con `opts.lightDefault` (curso nuevo, `isLightDefaultCourse`) el tema es SIEMPRE
+ *   aula-clara/light y la paleta aporta solo el brandSeed (`source: 'palette'` igual).
  * - Sin paleta → aula-clara/light, `source: 'fallback'`.
  * - Paleta desconocida → aula-clara/light, `source: 'fallback'` + aviso
  *   `PALETTE_UNKNOWN` (esto es solo la LECTURA del default; el empaque falla
  *   fuerte con una paleta guardada desconocida).
  * Pura: nunca persiste nada.
  */
-export function defaultPresentationProfileFor(paletteId: string | null | undefined): {
+export function defaultPresentationProfileFor(paletteId: string | null | undefined, opts: { lightDefault?: boolean } = {}): {
   profile: PresentationProfile;
   source: PresentationDefaultSource;
   warnings: ProfileValidationError[];
@@ -93,12 +125,13 @@ export function defaultPresentationProfileFor(paletteId: string | null | undefin
   const seed: BrandSeedInput = {};
   if (d.brandSeed.accent) seed.accent = d.brandSeed.accent;
   if (d.brandSeed.moduleColors) seed.moduleColors = [...d.brandSeed.moduleColors];
+  const base = opts.lightDefault ? defaultPresentationProfile() : { themeFamily: d.themeFamily, mode: d.mode, themeVersion: d.themeVersion };
   return {
     profile: {
-      themeFamily: d.themeFamily,
-      mode: d.mode,
+      themeFamily: base.themeFamily,
+      mode: base.mode,
       brandSeed: Object.keys(seed).length ? seed : null,
-      themeVersion: d.themeVersion,
+      themeVersion: base.themeVersion,
     },
     source: 'palette',
     warnings: [],
