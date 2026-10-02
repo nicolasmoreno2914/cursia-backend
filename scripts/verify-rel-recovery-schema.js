@@ -131,10 +131,10 @@ const GIR_COLUMNS = {
 const GIA_COLUMNS = [
   'id', 'item_run_id', 'job_id', 'course_id', 'item_key', 'generation', 'attempt_no', 'executor_kind', 'executor_id', 'bundle_sha',
   'worker_version', 'started_at', 'heartbeat_at', 'finished_at', 'outcome', 'failure_class', 'failure_code', 'error_excerpt',
-  'http_status', 'provider', 'provider_request_id', 'reported_error_code', 'strategy_applied', 'next_retry_at', 'recovery_round', 'actor', 'created_at',
+  'http_status', 'provider', 'provider_request_id', 'reported_error_code', 'unclassified', 'strategy_applied', 'next_retry_at', 'recovery_round', 'actor', 'created_at',
 ];
-const GIA_INDEXES = ['idx_gia_job_item_attempt', 'idx_gia_failure_code', 'idx_gia_item_run', 'uq_gia_open_attempt'];
-const GIR_CONSTRAINTS = ['gir_failure_class_check', 'gir_failure_code_len', 'gir_attention_reason_check', 'gir_recovery_rounds_check'];
+const GIA_INDEXES = ['idx_gia_job_item_attempt', 'idx_gia_failure_code', 'idx_gia_item_run', 'uq_gia_open_attempt', 'idx_gia_unclassified'];
+const GIR_CONSTRAINTS = ['gir_failure_class_check', 'gir_failure_code_len', 'gir_attention_reason_check', 'gir_recovery_rounds_check', 'gia_reported_error_code_len'];
 
 async function readSchemaSnapshot(client) {
   const cols = (await client.query(
@@ -143,7 +143,8 @@ async function readSchemaSnapshot(client) {
   )).rows;
   const idx = (await client.query(`select indexname, indexdef from pg_indexes where schemaname = 'public' and tablename = 'generation_item_attempts'`)).rows;
   const cons = (await client.query(
-    `select conname, convalidated from pg_constraint where conrelid = 'public.generation_item_runs'::regclass`,
+    `select conname, convalidated from pg_constraint
+      where conrelid in ('public.generation_item_runs'::regclass, coalesce(to_regclass('public.generation_item_attempts'), 'public.generation_item_runs'::regclass))`,
   )).rows;
   const trg = (await client.query(`select tgname from pg_trigger where tgname = 'trg_gia_closed_row_immutable'`)).rows;
   const rls = (await client.query(`select relrowsecurity from pg_class where oid = to_regclass('public.generation_item_attempts')`)).rows;

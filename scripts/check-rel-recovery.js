@@ -239,6 +239,23 @@ async function dbChecks() {
       }
       x = runScript('scripts/verify-rel-recovery-schema.js', localEnv('reldb', { MIGRATION_ENV: 'staging' }));
       assert(x.code === 0 && /Esquema REL R2 completo/.test(x.out), 'verify: ' + x.out);
+      // N8: camino ALTER (tabla de una versión anterior sin la columna/CHECK) → la re-aplicación los agrega iguales.
+      await withClient('reldb', async (c) => {
+        await c.query(`drop view if exists public.generation_item_attempt_costs`);
+        await c.query(`alter table public.generation_item_attempts drop constraint gia_reported_error_code_len`);
+        await c.query(`drop index if exists public.idx_gia_unclassified`);
+        await c.query(`alter table public.generation_item_attempts drop column unclassified`);
+      });
+      x = runScript('scripts/verify-rel-recovery-schema.js', localEnv('reldb', { MIGRATION_ENV: 'staging' }));
+      assert(x.code !== 0 && /gia_reported_error_code_len/.test(x.out) && /unclassified/.test(x.out), 'verify detecta lo faltante: ' + x.out.slice(-600));
+      x = runScript('scripts/migrate-rel-recovery.js', localEnv('reldb', { MIGRATION_ENV: 'staging' }));
+      assert(x.code === 0, 'migrate (alter): ' + x.out);
+      x = runScript('scripts/verify-rel-recovery-schema.js', localEnv('reldb', { MIGRATION_ENV: 'staging' }));
+      assert(x.code === 0, 'verify tras el camino alter: ' + x.out);
+      await withClient('reldb', async (c) => {
+        const [k] = (await c.query(`select pg_get_constraintdef(oid) d from pg_constraint where conname = 'gia_reported_error_code_len'`)).rows;
+        assert(k && /char_length\(reported_error_code\)/.test(k.d) && /64/.test(k.d), 'CHECK de largo: ' + JSON.stringify(k));
+      });
       const stg = fs.readFileSync(path.join(REPO, '.github/workflows/deploy-staging.yml'), 'utf8');
       const prod = fs.readFileSync(path.join(REPO, '.github/workflows/deploy.yml'), 'utf8');
       assert(/MIGRATION_ENV=staging node scripts\/migrate-rel-recovery\.js/.test(stg) && /MIGRATION_ENV=staging node scripts\/verify-rel-recovery-schema\.js/.test(stg), 'staging');
@@ -495,6 +512,24 @@ async function dbChecks() {
         const last = rows[rows.length - 1];
         eq([last.outcome, last.failure_class, last.failure_code, last.reported_error_code], ['failed', cls, effective, code], `intento (${code})`);
       }
+    });
+
+    await check('DB N1 (garantía en runtime): un fallo sin regla queda unclassified=true en el log y verify-rel-no-unclassified falla; los fallos clasificados no', async () => {
+      const flagged = await R.ds.query(`select failure_code, failure_class from public.generation_item_attempts where unclassified`);
+      eq(flagged.map((r) => [r.failure_code, r.failure_class]), [['unclassified_error', 'D']], 'solo el «kaboom» del test C1');
+      const seq = await attempts(relSeq.itemRunId);
+      assert(seq.every((r) => r.unclassified === false), 'la secuencia clasificada no marca nada');
+      let x = runScript('scripts/verify-rel-no-unclassified.js', localEnv('reldb', { MIGRATION_ENV: 'staging' }));
+      assert(x.code !== 0 && /SIN clasificar/.test(x.out) && /unclassified_error/.test(x.out), 'verify debe fallar: ' + x.out.slice(-500));
+      x = runScript('scripts/verify-rel-no-unclassified.js', localEnv('reldb', { MIGRATION_ENV: 'staging' }));
+      const future = new Date(Date.now() + 60_000).toISOString();
+      const res = spawnSync(process.execPath, [path.join(REPO, 'scripts/verify-rel-no-unclassified.js'), '--since', future],
+        { cwd: tmpCwd, env: cleanEnv(localEnv('reldb', { MIGRATION_ENV: 'staging' })), encoding: 'utf8' });
+      assert(res.status === 0 && /Ningún fallo sin clasificar/.test(res.stdout), '--since posterior: ' + res.stdout + res.stderr);
+      x = runScript('scripts/verify-rel-no-unclassified.js', localEnv('reldb', {}));
+      assert(x.code !== 0 && /MIGRATION_ENV/.test(x.out), 'sin intención explícita se niega');
+      const NU = require('./verify-rel-no-unclassified');
+      eq(NU.unclassifiedProblems([{ failure_code: 'x_y', item_key: 'k', job_id: 'j', attempt_no: 2, excerpt: 'e' }]), ['x_y — k (run j, intento 2): e'], 'puro');
     });
 
     await check('DB auto-heal: la reapertura automática es `reopened` actor auto_heal y suma recovery_round (el healer decide igual que siempre)', async () => {

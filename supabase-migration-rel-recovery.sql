@@ -96,7 +96,9 @@ create table if not exists public.generation_item_attempts (
   provider         text,
   provider_request_id text,
   -- C1: errorCode que reportó el ejecutor (NO de confianza; la clase efectiva es failure_class).
-  reported_error_code text check (reported_error_code is null or char_length(reported_error_code) between 1 and 64),
+  reported_error_code text,
+  -- N1: el clasificador no tenía regla explícita para este fallo (D retenido + alerta). Un gate/E2E falla si hay alguno.
+  unclassified     boolean not null default false,
   strategy_applied text,
   next_retry_at    timestamptz,
   recovery_round   integer not null default 0,
@@ -106,8 +108,20 @@ create table if not exists public.generation_item_attempts (
   constraint gia_open_closed check ((finished_at is null) = (outcome is null))
 );
 
--- Fix round 1 (C1): idempotente también sobre una tabla creada por la versión anterior de esta migración.
+-- Fix rounds 1–2 (C1, N1, N8): idempotente también sobre una tabla creada por una versión anterior de esta
+-- migración: mismas columnas y el MISMO CHECK de largo por ambos caminos (create y alter).
 alter table public.generation_item_attempts add column if not exists reported_error_code text;
+alter table public.generation_item_attempts add column if not exists unclassified boolean not null default false;
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'gia_reported_error_code_len') then
+    alter table public.generation_item_attempts
+      add constraint gia_reported_error_code_len
+      check (reported_error_code is null or char_length(reported_error_code) between 1 and 64) not valid;
+    alter table public.generation_item_attempts validate constraint gia_reported_error_code_len;
+  end if;
+end $$;
+create index if not exists idx_gia_unclassified
+  on public.generation_item_attempts (created_at) where unclassified;
 
 create index if not exists idx_gia_job_item_attempt
   on public.generation_item_attempts (job_id, item_key, generation, attempt_no);
@@ -146,7 +160,7 @@ do $$ begin
       -- M3: un intento devuelto (refundAttempt, cuota de YouTube) reutiliza su attempt_no; solo la PRIMERA
       -- fila de cada (item_run_id, attempt_no) suma los eventos del ledger (nunca se cuenta dos veces).
       with firsts as (
-        select distinct on (a.item_run_id, a.attempt_no) a.*
+        select distinct on (a.item_run_id, a.attempt_no) a.id, a.item_run_id, a.job_id, a.item_key, a.generation, a.attempt_no
           from public.generation_item_attempts a
          where a.outcome is distinct from 'reopened'
          order by a.item_run_id, a.attempt_no, a.started_at, a.id

@@ -54,7 +54,10 @@ export async function relSchemaReady(q: Queryable, now: number = Date.now()): Pr
                             and column_name = 'recovery_round')
              and exists (select 1 from information_schema.columns
                           where table_schema = 'public' and table_name = 'generation_item_attempts'
-                            and column_name = 'reported_error_code')) as ready`,
+                            and column_name = 'reported_error_code')
+             and exists (select 1 from information_schema.columns
+                          where table_schema = 'public' and table_name = 'generation_item_attempts'
+                            and column_name = 'unclassified')) as ready`,
   );
   const ready = !!(Array.isArray(rows) ? rows[0]?.ready : false);
   schemaCache = { ready, at: now };
@@ -212,22 +215,22 @@ export async function recordItemFailure(qr: Queryable, t: FailureTransition): Pr
   const closed = returningRows(await qr.query(
     `update public.generation_item_attempts a
         set finished_at = now(), outcome = $2, failure_class = $3, failure_code = $4, error_excerpt = $5,
-            http_status = $6, provider = $7, strategy_applied = $8, reported_error_code = $9,
+            http_status = $6, provider = $7, strategy_applied = $8, reported_error_code = $9, unclassified = $10,
             next_retry_at = (select g.next_retry_at from public.generation_item_runs g where g.id = a.item_run_id)
       where a.item_run_id = $1 and a.finished_at is null
       returning a.id`,
-    [t.itemRunId, outcome, v.class, v.code, redactErrorExcerpt(t.error), v.httpStatus ?? null, v.provider ?? null, v.strategy, reported],
+    [t.itemRunId, outcome, v.class, v.code, redactErrorExcerpt(t.error), v.httpStatus ?? null, v.provider ?? null, v.strategy, reported, !!v.unclassified],
   ));
   if (closed.length > 0) return;
   await qr.query(
     `insert into public.generation_item_attempts
        (item_run_id, job_id, course_id, item_key, generation, attempt_no, executor_kind, executor_id, worker_version,
         started_at, finished_at, outcome, failure_class, failure_code, error_excerpt, http_status, provider,
-        strategy_applied, next_retry_at, recovery_round, actor, reported_error_code)
+        strategy_applied, next_retry_at, recovery_round, actor, reported_error_code, unclassified)
      select g.id, g.job_id, g.course_id, g.item_key, g.generation, g.attempt_count, null, null, $9,
-            coalesce(g.claimed_at, now()), now(), $2, $3, $4, $5, $6, $7, $8, g.next_retry_at, g.recovery_round, 'system', $10
+            coalesce(g.claimed_at, now()), now(), $2, $3, $4, $5, $6, $7, $8, g.next_retry_at, g.recovery_round, 'system', $10, $11
        from public.generation_item_runs g where g.id = $1`,
-    [t.itemRunId, outcome, v.class, v.code, redactErrorExcerpt(t.error), v.httpStatus ?? null, v.provider ?? null, v.strategy, workerVersion(), reported],
+    [t.itemRunId, outcome, v.class, v.code, redactErrorExcerpt(t.error), v.httpStatus ?? null, v.provider ?? null, v.strategy, workerVersion(), reported, !!v.unclassified],
   );
 }
 

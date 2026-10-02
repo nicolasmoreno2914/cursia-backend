@@ -97,7 +97,8 @@ if [ -n "${E2E_AFTER:-}" ]; then
 fi
 
 echo "== verify/audit (scripts reales del backend, con runs A y B) =="
-for s in verify-dynamic-generation-schema audit-generation-manifests audit-dynamic-generation audit-course-blueprints; do
+# REL N1: verify-rel-no-unclassified falla si la corrida produjo algún fallo SIN clasificar (garantía en runtime).
+for s in verify-dynamic-generation-schema audit-generation-manifests audit-dynamic-generation audit-course-blueprints verify-rel-no-unclassified; do
   (cd "$REPO" && env $STG node "scripts/$s.js") > "$OUT/$s.log" 2>&1; rc=$?
   [ $rc -ne 0 ] && RC=1
   echo "$s exit=$rc ($(tail -1 "$OUT/$s.log"))"
