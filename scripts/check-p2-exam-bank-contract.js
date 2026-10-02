@@ -522,10 +522,35 @@ async function main() {
     assert(!atComplete.ok && atComplete.errors.some((e) => e.code === 'EXAM_BANK_EVIDENCE' && /NIEGA/.test(e.message)), JSON.stringify(atComplete.errors.slice(0, 3)));
     eq(EB.validateExamBank(fin, { scope: 'final', chapters: chs, chapterMd: md, evidenceRules: 'asAccepted' }).ok, true, 'asAccepted sin versión = v1');
     // Versión inválida → esquema.
-    eq(EB.validateExamBank({ ...fin, bankValidationVersion: 3 }, { scope: 'final', chapters: chs, chapterMd: md, evidenceRules: 'asAccepted' }).errors.some((e) => e.path === '$.bankValidationVersion'), true, 'versión 3 inválida');
-    // El claim anuncia la versión vigente.
+    eq(EB.validateExamBank({ ...fin, bankValidationVersion: 4 }, { scope: 'final', chapters: chs, chapterMd: md, evidenceRules: 'asAccepted' }).errors.some((e) => e.path === '$.bankValidationVersion'), true, 'versión 4 inválida');
+    // El claim anuncia la versión vigente (fix bank-guard-minors: 3).
     const S = loadDist('modules/course-shell/index.js');
-    eq(S.EXAM_BANK_VALIDATION_VERSION, 2, 'versión vigente');
+    eq(S.EXAM_BANK_VALIDATION_VERSION, 3, 'versión vigente');
+  });
+
+  await check('Fix bank-guard-minors: un banco aceptado con las reglas v2 sigue empaquetando con ellas aunque las v3 lo rechacen («Es un mito: [frag]», «≠ → =», «> omitido»); declarado v3 → EXAM_BANK_EVIDENCE; al completar (reglas vigentes v3) → rechazo', async () => {
+    const chs = [{ id: 'c1', moduleId: 'm1' }, { id: 'c2', moduleId: 'm1' }];
+    const gi = new Map(chs.map((c, i) => [c.id, i]));
+    const plan = EB.expectedExamPlan('module', chs);
+    for (const [extra, frag, label] of [
+      ['Es un mito: el asesor entrega el reembolso en efectivo el mismo día de la compra.', 'el asesor entrega el reembolso en efectivo el mismo día de la compra', 'Es un mito: [frag]'],
+      ['El valor del pH del agua de la piscina debe ser ≠ 7,2 en el tratamiento de choque del vaso.', 'El valor del pH del agua de la piscina debe ser = 7,2', '≠ → ='],
+      ['El indicador sube con la temperatura del agua > 30 °C en la piscina pública del club.', 'El indicador sube con la temperatura del agua 30 °C en la piscina pública del club', '> omitido'],
+    ]) {
+      const md = new Map(chs.map((c, i) => [c.id, `${EBF.chapterMarkdown(i, 'Reglas')}\n\n${extra}`]));
+      const bank = (ver) => { const b = EBF.makeExamBank({ scope: 'module', moduleId: 'm1', chapters: chs, chapterIndex: gi, plan }); b.questions.find((q) => q.chapterId === 'c1').evidence = frag; if (ver !== undefined) b.bankValidationVersion = ver; return b; };
+      const pack = (ver) => EB.validateExamBank(bank(ver), { scope: 'module', chapters: chs, chapterMd: md, planSource: 'frozen', evidenceRules: 'asAccepted' });
+      eq(pack(2).ok, true, label + ': v2 empaqueta con reglas v2');
+      eq(pack(undefined).ok, true, label + ': sin versión (v1) empaqueta');
+      eq(pack(3).errors.map((e) => e.code), ['EXAM_BANK_EVIDENCE'], label + ': v3 rechaza');
+      const done = EB.validateExamBank(bank(2), { scope: 'module', chapters: chs, chapterMd: md });
+      eq(done.errors.map((e) => e.code), ['EXAM_BANK_EVIDENCE'], label + ': al completar (vigentes v3) se rechaza');
+    }
+    // Reglas v2 intactas: la normalización compartida y la guardia v2 dan lo mismo que antes del cambio.
+    eq(EB.examEvidenceSupport(EB.examEvidenceIndex('Es un mito: el asesor entrega el reembolso.', 2), 'el asesor entrega el reembolso'), { ok: true }, 'v2: el corte en «:» tapa «es un mito» (como en el round 4)');
+    eq(EB.examEvidenceSupport('Es un mito: el asesor entrega el reembolso.', 'el asesor entrega el reembolso'), { ok: false, reason: 'negated' }, 'v3 (default)');
+    eq(EB.normalizeExamText('a > b ≠ c'), 'a b = c', 'normalizeExamText sin cambios');
+    eq(EB.normalizeExamEvidenceText('> a > b ≠ c'), 'a > b ≠ c', 'normalización de evidencia v3');
   });
 
   await check('empaque (C2): bancos con plan congelado en OTRO orden que el Manifest actual (reorden posterior) → se cargan (no EXAM_BANK_INVALID) y llegan al builder', async () => {
