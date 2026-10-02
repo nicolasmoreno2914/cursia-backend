@@ -869,6 +869,57 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     });
   }
 
+  // ── #583 (decisión del usuario 2026-10-02): límite por generación de STAGING = 15 USD ──
+  await check('#583 deploy-staging.yml [4h10]: política de staging maxCostPerRun 15 — SOLO staging (nunca deploy.yml, otros workflows ni el migrador de producción), después de las migraciones FinOps, con guardarraíles e idempotente', () => {
+    const stg = fs.readFileSync(path.join(repoRoot, STAGING_WF), 'utf8');
+    const script = remoteScriptOf(pm2StepOf(stg, 'deploy-staging.yml').text);
+    const line = 'MIGRATION_ENV=staging node scripts/staging-budget-policy.js aa2fa9a1-afb1-4b01-8646-94a0cb272b57';
+    const lines = script.split('\n').map((l) => l.trim());
+    eq(lines.filter((l) => l.includes('staging-budget-policy')).length, 1, 'una sola invocación');
+    const at = lines.indexOf(line);
+    assert(at > 0, 'invocación exacta (MIGRATION_ENV=staging + owner de prueba de staging)');
+    assert(at > lines.findIndex((l) => l.includes('verify-v21-finops-rls.js')) && at < lines.findIndex((l) => l.startsWith('echo "━━━ [6/6]')), 'después del esquema FinOps y antes de recargar PM2');
+    for (const f of fs.readdirSync(path.join(repoRoot, '.github/workflows'))) {
+      if (f !== 'deploy-staging.yml') assert(!fs.readFileSync(path.join(repoRoot, '.github/workflows', f), 'utf8').includes('staging-budget-policy'), `no en ${f}`);
+    }
+    const walk = (d) => fs.readdirSync(d).flatMap((n) => { const p = path.join(d, n); return fs.statSync(p).isDirectory() ? walk(p) : [p]; });
+    for (const p of walk(path.join(repoRoot, 'scripts/prod'))) assert(!fs.readFileSync(p, 'utf8').includes('staging-budget-policy'), `no en ${path.relative(repoRoot, p)}`);
+    const S = require(path.join(repoRoot, 'scripts/staging-budget-policy.js'));
+    eq(S.STAGING_MAX_COST_PER_RUN, 15, 'límite aprobado');
+    // Guardarraíles (puros + proceso real): sin MIGRATION_ENV=staging, producción o ref indeterminable → exit 1 sin conectar.
+    assert(/MIGRATION_ENV/.test(S.refusal({ MIGRATION_ENV: 'production', DB_HOST: 'db.abcstaging.supabase.co' }) || ''), 'sin intención staging');
+    assert(/PRODUCCIÓN/.test(S.refusal({ MIGRATION_ENV: 'staging', DB_HOST: 'db.hriwbakbuypaiovvvkqh.supabase.co' }) || ''), 'producción por host');
+    assert(/PRODUCCIÓN/.test(S.refusal({ MIGRATION_ENV: 'staging', DB_USER: 'postgres.hriwbakbuypaiovvvkqh', DB_HOST: 'aws-0.pooler.supabase.com' }) || ''), 'producción por usuario del pooler');
+    assert(/ref/.test(S.refusal({ MIGRATION_ENV: 'staging', DB_HOST: '10.0.0.5' }) || ''), 'ref indeterminable');
+    assert(/ref/.test(S.refusal({ MIGRATION_ENV: 'staging', DB_HOST: '127.0.0.1' }) || ''), 'loopback sin NODE_ENV=test');
+    eq(S.refusal({ MIGRATION_ENV: 'staging', DB_HOST: 'db.ljdtmkwuhkvtmlhugjrv.supabase.co' }), null, 'staging corre');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'stg-policy-'));
+    try {
+      // Un .env que dice MIGRATION_ENV=staging no alcanza: la intención viene del entorno real.
+      fs.writeFileSync(path.join(tmp, '.env'), 'MIGRATION_ENV=staging\nDB_HOST=db.abcstaging.supabase.co\n');
+      const runIt = (env) => spawnSync(process.execPath, [path.join(repoRoot, 'scripts/staging-budget-policy.js')], { env: { PATH: process.env.PATH, ...env }, cwd: tmp, encoding: 'utf8', timeout: 20000 });
+      let r = runIt({});
+      assert(r.status === 1 && /MIGRATION_ENV/.test(r.stderr), `sin MIGRATION_ENV real: ${r.stderr}`);
+      r = runIt({ MIGRATION_ENV: 'staging', DB_HOST: 'db.hriwbakbuypaiovvvkqh.supabase.co' });
+      assert(r.status === 1 && /PRODUCCIÓN/.test(r.stderr) && !/ECONNREFUSED|ENOTFOUND/.test(r.stderr), `producción: ${r.stderr}`);
+      r = spawnSync(process.execPath, [path.join(repoRoot, 'scripts/staging-budget-policy.js'), 'no-uuid'], { env: { PATH: process.env.PATH, MIGRATION_ENV: 'staging', DB_HOST: 'db.abcstaging.supabase.co' }, cwd: tmp, encoding: 'utf8' });
+      assert(r.status === 1 && /ownerId inválido/.test(r.stderr), 'owner validado');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+    // Plan (puro): nueva versión de LA MISMA política con maxCostPerRun 15 y todo lo demás igual; idempotente.
+    const cur = { id: 'dfd95810-0000-4000-8000-000000000000', scope: 'global', scope_id: null, version: 3,
+      limits: { maxCostPerRun: '10', maxCostPerCourse: '15', monthlyCapStaging: '50', maxCostPerProvider: { gamma: '4' } }, on_exceed: 'ADMIN_APPROVAL', require_human_approval_for_real_spend: true };
+    const p = S.planPolicy(cur);
+    eq([p.action, p.row.scope, p.row.scope_id, p.row.version, p.row.on_exceed, p.row.require_human_approval_for_real_spend], ['insert', 'global', null, 4, 'ADMIN_APPROVAL', true], 'misma política, versión +1');
+    eq(p.row.limits, { maxCostPerRun: '15', maxCostPerCourse: '15', monthlyCapStaging: '50', maxCostPerProvider: { gamma: '4' } }, 'solo cambia maxCostPerRun');
+    eq(S.planPolicy({ ...cur, limits: { ...cur.limits, maxCostPerRun: 10 } }).row.limits.maxCostPerRun, 15, 'conserva el tipo numérico');
+    eq(S.planPolicy({ ...cur, version: 4, limits: p.row.limits }).action, 'noop', 'idempotente: ya en 15');
+    eq(S.planPolicy({ ...cur, limits: { ...cur.limits, maxCostPerRun: '15.00' } }).action, 'noop', 'numérico equivalente');
+    eq(S.planPolicy({ ...cur, scope: 'owner', scope_id: 'aa2fa9a1-afb1-4b01-8646-94a0cb272b57' }).row.scope_id, 'aa2fa9a1-afb1-4b01-8646-94a0cb272b57', 'política del owner: misma scope_id');
+    eq(S.planPolicy(null).action, 'none', 'sin política: no inventa una');
+  });
+
   // ── Límite de GitHub: un `run` con expresiones ${{ }} se rechaza (≈21000 caracteres) y el workflow
   // falla en 0 s sin correr ("workflow file issue"). Pasó en staging con #66/#67 (20976 y 21327 bytes).
   await check('workflows: ningún `run` con expresiones ${{ }} supera 20000 bytes (margen bajo el límite de GitHub)', async () => {
