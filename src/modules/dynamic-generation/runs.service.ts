@@ -2343,8 +2343,15 @@ export class RunsService {
         const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
         const code = String((resp && typeof resp === 'object' && ((resp as any).reason || (resp as any).code)) || (err instanceof Error ? err.name : 'error')).slice(0, 100);
         result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: code });
-        // Una carrera (otro tick/retry lo cambió: espera, ya no failed) se re-evalúa en el próximo tick.
-        if (code === 'backoff' || code === 'not_failed') continue;
+        // Una carrera (otro tick/retry lo cambió: espera, ya no failed) o una falla de infraestructura
+        // (DB/lock/timeout, FinOps no disponible, 5xx) se re-evalúa en el próximo tick (fix round 1, M5): solo
+        // un rechazo DEFINITIVO (presupuesto, tope, precondición, run reemplazado…) lo deja para un admin.
+        // La ventana de edad (maxAgeHours) sigue acotando los reintentos.
+        const status = (err as { getStatus?: () => number })?.getStatus?.();
+        const transient = code === 'backoff' || code === 'not_failed' || code === 'auto_heal_not_eligible' ||
+          /unavailable|timeout|ECONN|EMAXCONN|deadlock|lock|QueryFailed|Connection|InternalServerError|Error$/i.test(code) ||
+          (typeof status === 'number' && status >= 500) || typeof status !== 'number';
+        if (transient) continue;
         await decline(r, code, d.pendingUsd);
         this.logger.warn(`reenvío de audio incierto: ${r.item_key} (run ${r.job_id}) no se reenvía (${code}); queda para un admin`);
       }
@@ -4392,7 +4399,10 @@ export class RunsService {
     // items (ninguno activo → terminal; alguno running y el run no `running`), sigue el camino de siempre.
     // Si no, recomputeRunStatus no escribiría nada: se devuelve la fila tal cual, sin locks.
     const [pre] = await this.dataSource.query(
-      `select count(*) filter (where g.status = 'running' and g.lease_until < now())::int as expired,
+      // Fix round 1 (M4): `expired` sobre TODAS las filas del run (igual que sweepRunExpiredLeases), no solo
+      // la generación vigente; active/running sobre la vigente (igual que recomputeRunStatus).
+      `select (select count(*)::int from public.generation_item_runs x
+                where x.job_id = $1 and x.status = 'running' and x.lease_until < now()) as expired,
               count(*) filter (where g.status in ('pending', 'running', 'retrying'))::int as active,
               count(*) filter (where g.status = 'running')::int as running
          from public.generation_item_runs g

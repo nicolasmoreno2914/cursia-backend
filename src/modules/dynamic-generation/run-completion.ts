@@ -31,7 +31,7 @@
 import { frozenProviderModesOf, providerKindOfItemType } from './provider-modes';
 import { fallbackVideoModeOf, questionsBelongToVideo } from './video-upgrade';
 import { v3ValidatedArtifactTypes } from '../course-shell/v3-validation';
-import { ambiguousAudioResubmitDecision, autoHealDecision, autoHealEnabled, safeAutoRetryDecision } from './auto-heal';
+import { AMBIGUOUS_AUDIO_RESUBMIT_BACKOFF_SECONDS, ambiguousAudioResubmitDecision, autoHealDecision, autoHealEnabled, autoHealIntervalMs, safeAutoRetryDecision } from './auto-heal';
 import { BUDGET_EXCEEDED, PROVIDER_RECONCILIATION_REQUIRED } from '../finops/run-budget';
 
 export type RunCompletionState = 'in_progress' | 'packaging' | 'complete' | 'preview' | 'needs_attention' | 'cancelled';
@@ -524,7 +524,12 @@ export function adminActionFor(r: CompletionRow | undefined, cls: ItemCompletion
   // #583: audio con resultado incierto que el servidor todavía va a reenviar UNA vez (sin consultar el
   // ledger acá: si lo pendiente supera el tope, el barrido lo marca `declined` y la acción aparece).
   const ad = ambiguousAudioResubmitDecision(ahRow, now);
-  if (tickOn && (ad.heal === true || (ad.heal === false && ad.reason === 'backoff'))) return null;
+  // Fix round 1 (M6): techo duro — si el barrido no lo resolvió (ni lo reabrió ni lo declinó) dentro de la
+  // espera + 3 ticks, la acción de admin aparece igual (p.ej. el barrido falla en cada tick).
+  const adFailedAt = r.finished_at ? new Date(r.finished_at as any) : r.updated_at ? new Date(r.updated_at as any) : null;
+  const adCeilingOk = !adFailedAt || !Number.isFinite(adFailedAt.getTime()) ||
+    now.getTime() < adFailedAt.getTime() + AMBIGUOUS_AUDIO_RESUBMIT_BACKOFF_SECONDS * 1000 + 3 * autoHealIntervalMs(process.env);
+  if (tickOn && adCeilingOk && (ad.heal === true || (ad.heal === false && ad.reason === 'backoff'))) return null;
   if (err.includes(PROVIDER_RECONCILIATION_REQUIRED)) {
     return { code: r.type === 'video' ? 'reconcile_videogen' : 'reconcile_provider', itemKey: key };
   }

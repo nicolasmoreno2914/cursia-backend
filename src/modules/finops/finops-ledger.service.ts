@@ -539,6 +539,36 @@ export class FinopsLedgerService {
     });
   }
 
+  /**
+   * #583 fix round 1 (I1): corrige un cargo LLM CONSERVADOR (metadata.conservative, registrado por el
+   * proxy cuando el navegador cortó el stream) con el usage EXACTO medido al terminar de leer el stream.
+   * ADJUSTMENT por la diferencia, precio del catálogo AL MOMENTO DEL CARGO; repetir = no-op. Si el
+   * conservador no existe → null (el llamador registra el exacto como cargo). Un cargo que no es
+   * conservador nunca se toca (ya es una medición).
+   */
+  async correctConservativeLlmCharge(originalKey: string, measuredUsage: UsageMeters): Promise<{ corrected: boolean; delta: string | null } | null> {
+    nonEmpty(originalKey, 'originalKey');
+    const [orig] = await this.dataSource.query(
+      `select *, amount::text as amount from public.generation_cost_events where idempotency_key = $1`,
+      [originalKey],
+    );
+    if (!orig) return null;
+    if (orig.event_kind !== 'CHARGE' || orig.metadata?.conservative !== true) return { corrected: false, delta: null };
+    assertCompleteMeasurement(originalKey, measuredUsage);
+    const catalog = await this.loadCatalog(orig.provider, orig.service, orig.model_or_product);
+    const priced = priceUsage(measuredUsage || {}, catalog, {
+      provider: orig.provider,
+      service: orig.service,
+      product: orig.model_or_product,
+      asOf: orig.created_at,
+    });
+    const r = await this.recordAdjustment(originalKey, priced.amount, 'llm_stream_measured_after_client_gone', {
+      recordedBy: 'llm-proxy',
+      metadata: { measuredUsage, pricingSnapshot: priced.pricingSnapshot, correctsConservative: true },
+    });
+    return { corrected: r.inserted, delta: r.delta };
+  }
+
   /** Cargo de costo cero por diseño (YouTube: cuota; packaging/render local). */
   async recordZero(input: {
     kind: 'youtube' | 'package';

@@ -1170,6 +1170,63 @@ async function dbChecks() {
       eq(AH.ambiguousAudioResubmitDecision({ ...vrow, type: 'audiobook_chapter' }, now, { pendingUsd: 0.02, providers: ['openai'] }).heal, true, 'capítulo del audiolibro: sí');
     });
 
+    await check('#583 fix round 1 (M5): una falla de INFRAESTRUCTURA al reabrir (DB/lock, FinOps no disponible) NO gasta el único reenvío: se re-evalúa en el próximo tick', async () => {
+      const A = await ambiguousWelcome('583 audio infra');
+      const orig = runs.retryItem;
+      let calls = 0;
+      runs.retryItem = async function () { calls++; throw new Error('Connection terminated unexpectedly'); };
+      let res;
+      try { res = await runs.autoResubmitAmbiguousAudio({ now: later(3) }); } finally { runs.retryItem = orig; }
+      eq([calls, resubOf(res, A.rid).length], [1, 0], 'intentado, no reabierto');
+      let row = await itemRow(A.rid, A.key);
+      eq(row.output_summary.ambiguousAudioResubmit, undefined, 'sin `declined`: no queda para un admin por un hipo');
+      eq(resubOf(await runs.autoResubmitAmbiguousAudio({ now: later(4) }), A.rid).length, 1, 'el próximo tick lo reenvía');
+      row = await itemRow(A.rid, A.key);
+      eq(row.output_summary.ambiguousAudioResubmit.rounds, 1, 'una vez');
+    });
+
+    await check('#583 fix round 1 (M6): si el barrido no resuelve un audio incierto dentro de la espera + 3 ticks, la acción de admin aparece igual (techo duro)', async () => {
+      const now = new Date();
+      const row = (secAgo) => ({ id: 'a', item_key: 'audio_welcome:1', type: 'audio_welcome', status: 'failed', error: 'provider_reconciliation_required: openai — x', output_summary: {}, finished_at: new Date(now.getTime() - secAgo * 1000) });
+      eq(RC.adminActionFor(row(60), 'not_done', now), null, 'en la espera: sin acción (lo resuelve el servidor)');
+      eq(RC.adminActionFor(row(150), 'not_done', now), null, 'recién pasada la espera: el barrido todavía puede tomarlo');
+      eq(RC.adminActionFor(row(120 + 3 * 60 + 5), 'not_done', now), { code: 'reconcile_provider', itemKey: 'audio_welcome:1' }, 'pasado el techo: admin');
+    });
+
+    await check('#583 fix round 1 (I1): ingest del proxy — cargo CONSERVADOR (metadata.conservative) y CORRECCIÓN con el usage exacto (ADJUSTMENT, una vez); corrección sin conservador = el cargo; nunca toca un cargo medido', async () => {
+      const { FinopsIngestController } = loadDist('modules/finops/finops.controller.js');
+      const ctl = new FinopsIngestController(ledger);
+      const R = await freshRun('583 ingest corrección');
+      const ir = await itemRow(R.rid, `audio_welcome:${R.cid}`);
+      const base = { subject: OWNER, itemRunId: ir.id, callRole: 'main', attempt: 1, model: 'claude-sonnet-4-6', billingAccount: 'cursia' };
+      const total = async (mid) => {
+        const [c] = await events(`idempotency_key = $1`, [`anthropic:msg:${mid}`]);
+        const adj = c ? await events(`corrects_event_id = $1`, [c.id]) : [];
+        return { charge: c, adj, total: c ? adj.reduce((t, a) => t + Number(a.amount), Number(c.amount)) : null };
+      };
+      // 1) conservador y después corrección → baja al exacto, con su ADJUSTMENT; repetir = no-op.
+      await ctl.llmUsage({ ...base, messageId: 'msg_583_c1', usage: { input_tokens: 1200, output_tokens: 3500, cache_read_input_tokens: 5 }, measurement: 'conservative' });
+      let t = await total('msg_583_c1');
+      eq(t.charge.metadata.conservative, true, 'marcado conservador');
+      const conservative = t.total;
+      const r1 = await ctl.llmUsage({ ...base, messageId: 'msg_583_c1', usage: { input_tokens: 1200, output_tokens: 340, cache_read_input_tokens: 5 }, measurement: 'correction' });
+      t = await total('msg_583_c1');
+      assert(r1.corrected === true && t.adj.length === 1 && t.total < conservative && t.total > 0, `corregido ${JSON.stringify(r1)} ${t.total} < ${conservative}`);
+      await ctl.llmUsage({ ...base, messageId: 'msg_583_c1', usage: { input_tokens: 1200, output_tokens: 340, cache_read_input_tokens: 5 }, measurement: 'correction' });
+      eq((await total('msg_583_c1')).adj.length, 1, 'repetir = no-op');
+      // 2) corrección sin conservador previo → el exacto es el cargo.
+      await ctl.llmUsage({ ...base, messageId: 'msg_583_c2', usage: { input_tokens: 10, output_tokens: 20 }, measurement: 'correction' });
+      t = await total('msg_583_c2');
+      eq([!!t.charge, t.adj.length, t.charge.usage.output_tokens], [true, 0, 20], 'cargo exacto');
+      // 3) cargo medido normal: una «corrección» nunca lo toca.
+      await ctl.llmUsage({ ...base, messageId: 'msg_583_c3', usage: { input_tokens: 10, output_tokens: 900 } });
+      const before = (await total('msg_583_c3')).total;
+      const r3 = await ctl.llmUsage({ ...base, messageId: 'msg_583_c3', usage: { input_tokens: 10, output_tokens: 1 }, measurement: 'correction' });
+      eq([r3.corrected, (await total('msg_583_c3')).total], [false, before], 'medido intacto');
+      // 4) valor inválido → 400.
+      await rejectsRe(ctl.llmUsage({ ...base, messageId: 'msg_583_c4', usage: { input_tokens: 1, output_tokens: 1 }, measurement: 'maybe' }), /measurement/, 'inválido');
+    });
+
     await check('#583 scripts/staging-budget-policy.js contra PG16: nueva versión de la política vigente (owner de prueba > global) con maxCostPerRun 15 y TODO lo demás igual; idempotente (2.ª corrida no inserta)', async () => {
       const OWNER_STG = 'aa2fa9a1-afb1-4b01-8646-94a0cb272b57';
       const pols = () => ds.query(`select scope, scope_id, version, limits, on_exceed, require_human_approval_for_real_spend from public.cost_budget_policies
