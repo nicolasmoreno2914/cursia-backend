@@ -32,7 +32,7 @@
  * importa:» bajo el título y «Cómo lo aplicas:» al pie; sin ellos no se muestra nada (experiencias viejas).
  * Un acordeón cuyos encabezados son «Paso N: …» se dibuja como proceso (pasos siempre visibles).
  */
-import { contrastRatio, isValidHex, ModuleColor, ResolvedTheme, EduBlockRole } from '../theme-engine';
+import { brandTextInk, contrastRatio, isValidHex, ModuleColor, ResolvedTheme, EduBlockRole } from '../theme-engine';
 import { EduIcon, Tone, eduIcon, moduleTone, roleTone } from './edu';
 import {
   VcAccordion,
@@ -204,6 +204,21 @@ function surf(t: ResolvedTheme, bg: string, preferred: string[] = []): Surf {
 /** Primer color legible (≥ 4.5:1) sobre `bg` de la lista; si ninguno, el texto principal de `s`. */
 function readable(bg: string, cands: string[], fallback: string): string {
   return cands.find((c) => isValidHex(c) && contrastRatio(c, bg) >= MIN_CONTRAST) ?? fallback;
+}
+
+/**
+ * Fix #542 — tinta de TEXTO en el color de un tono (marca / rol / módulo) sobre `s` y, además, sobre
+ * los fondos `extraBgs` que el texto tenga de verdad (p. ej. la píldora ENHANCED del rótulo). Si el
+ * resultado de siempre (`readable(s.bg, [ink], s.fg)`) ya es legible sobre todos esos fondos se
+ * devuelve sin cambios (bytes idénticos); si no, se DERIVA una tinta del mismo tono que sí lo es
+ * (brandTextInk: oscurecer en claro / aclarar en oscuro). El color de marca como muestra, relleno o
+ * borde no se toca nunca: esto es solo para texto.
+ */
+function textInk(ink: string, s: Surf, extraBgs: string[] = []): string {
+  const legacy = readable(s.bg, [ink], s.fg);
+  const bgs = [s.bg, ...extraBgs];
+  if (bgs.every((bg) => contrastRatio(legacy, bg) >= MIN_CONTRAST)) return legacy;
+  return brandTextInk(ink, bgs, MIN_CONTRAST);
 }
 
 function attr(v: string): string {
@@ -889,8 +904,10 @@ function tinted(r: R, k: Tone): R {
 
 /** Rótulo del bloque: ícono + etiqueta en el color del rol. ENHANCED: píldora. */
 function chip(r: R, icon: EduIcon, label: string, k: Tone, s: Surf, opts: { margin?: string; onPanel?: boolean } = {}): string {
-  const ink = readable(s.bg, [k.ink], s.fg);
   const pill = opts.onPanel ? groundColor(r.t) : k.soft;
+  // ENHANCED pinta el rótulo como píldora (fondo `pill`): el texto debe ser legible sobre ella
+  // también, no solo sobre la superficie del bloque (fix #542: #BD0AD8 sobre #F4E3F7 = 4.09:1).
+  const ink = textInk(k.ink, s, r.enh ? [pill] : []);
   return (
     `<p class="cvc-meta cvc-chip"` +
     st(
@@ -913,7 +930,7 @@ function chip(r: R, icon: EduIcon, label: string, k: Tone, s: Surf, opts: { marg
 /** «¿Por qué importa?» bajo el título (opcional, generado). */
 function whyLine(r: R, why: string | undefined, k: Tone, s: Surf): string {
   if (!why || !why.trim()) return '';
-  const ink = readable(s.bg, [k.ink], s.fg);
+  const ink = textInk(k.ink, s);
   return (
     `<p class="cvc-why"${st(r, [['margin', `0 0 ${D(r, 18)}px 0`], ['padding', 0], ['color', s.fg2], ['font-size', r.t.typography.sizeBodyPx], ['line-height', '1.5'], ['max-width', `${r.t.typography.measureCh}ch`]])}>` +
     `<strong${st(r, [['color', ink]])}>${labelHtml('Por qué importa: ')}</strong>${inlineHtml(why)}</p>`
@@ -923,7 +940,7 @@ function whyLine(r: R, why: string | undefined, k: Tone, s: Surf): string {
 /** «¿Cómo lo aplicas?» al pie del bloque (opcional, generado). */
 function applyLine(r: R, apply: string | undefined, k: Tone, s: Surf): string {
   if (!apply || !apply.trim()) return '';
-  const ink = readable(s.bg, [k.ink], s.fg);
+  const ink = textInk(k.ink, s);
   return (
     `<div class="cvc-apply"${st(r, [['margin', `${D(r, 20)}px 0 0 0`], ['padding', `${D(r, 14)}px 0 0 0`], ['color', s.fg], ['border-top', `1px solid ${k.edge}`]])}>` +
     `<p${st(r, [['margin', 0], ['padding', 0], ['color', s.fg], ['line-height', '1.5'], ['max-width', `${r.t.typography.measureCh}ch`]])}>` +
@@ -985,7 +1002,7 @@ function renderHero(r: R, c: VcHero): string {
   }
   const k = modTn(r);
   const s = surf(r.t, k.soft);
-  const ink = readable(s.bg, [k.ink], s.fg);
+  const ink = textInk(k.ink, s);
   const meta =
     `<p class="cvc-meta cvc-progress"${st(r, [['margin', `0 0 ${D(r, 10)}px 0`], ['padding', 0], ['color', ink], ['font-family', r.t.personality.fontMeta], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700'], ['line-height', '1.5']])}>` +
     labelHtml(op.progress ?? op.kicker) +
@@ -1021,7 +1038,7 @@ function renderObjectives(r: R, c: VcLearningObjectives): string {
           // Labels del shell (countless): sin cifras que no salgan de facts → la insignia lleva un ícono.
           // fix M4: MISMO markup en ambos niveles — número (o ícono, en el shell) en la línea del texto. En
           // CLEAN_SAFE se lee «1 Identificar…»; en ENHANCED el <style> lo dibuja como insignia del módulo.
-          `<div class="cvc-li-t"${st(r, [['color', s.fg]])}><strong class="cvc-n"${st(r, [['color', readable(s.bg, [k.ink], s.fg)]])}>${r.countless ? eduIcon(r.enh, 'check', readable(s.bg, [k.ink], s.fg), 16) : labelHtml(String(i + 1))}</strong> <span class="cvc-t">${inlineHtml(it)}</span></div></li>`,
+          `<div class="cvc-li-t"${st(r, [['color', s.fg]])}><strong class="cvc-n"${st(r, [['color', textInk(k.ink, s)]])}>${r.countless ? eduIcon(r.enh, 'check', textInk(k.ink, s), 16) : labelHtml(String(i + 1))}</strong> <span class="cvc-t">${inlineHtml(it)}</span></div></li>`,
       )
       .join('');
     const title = c.title && !OBJ_KICKER_RE.test(c.title.trim()) ? c.title : r.countless ? 'Al terminar podrás:' : 'Al terminar este capítulo podrás:';
@@ -1034,7 +1051,7 @@ function renderConcept(r: R, c: VcConceptCards): string {
   const k = tn(r, 'concepto');
   const cards = list(c.cards, 'concept_cards.cards');
   return block(r, 'concept_cards', 'tinted', k, (s) => {
-    const ink = readable(s.bg, [k.ink], s.fg);
+    const ink = textInk(k.ink, s);
     const ht = itemTag(c.title, 'x');
     const rows = cards
       .map(
@@ -1139,7 +1156,7 @@ function renderMyth(r: R, c: VcMythReality): string {
     // y sin JS, rótulo + texto siempre visibles (mismo texto en ambos niveles).
     const cell = (kt: Tone, icon: EduIcon, label: string, body: string, extraCls: string, revealIdx?: number) => {
       const s = surf(r.t, kt.soft);
-      const ink = readable(s.bg, [kt.ink], s.fg);
+      const ink = textInk(kt.ink, s);
       const lead = `<p class="cvc-meta"${st(r, [['margin', '0 0 6px 0'], ['padding', 0], ['color', ink], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700']])}>${eduIcon(r.enh, icon, ink, 18)} ${labelHtml(label)}</p>`;
       const content =
         revealIdx === undefined
@@ -1172,7 +1189,7 @@ function renderCase(r: R, c: VcCaseScenario): string {
   const k = tn(r, 'caso');
   const g = ground(r);
   const hs = surf(r.t, k.soft);
-  const ink = readable(g.bg, [k.ink], g.fg);
+  const ink = textInk(k.ink, g);
   const head =
     `<div class="cvc-case-h"${st(r, [['background-color', hs.bg], ['color', hs.fg], ['margin', 0], ['padding', `${D(r, 18)}px ${D(r, 24)}px ${D(r, 14)}px ${D(r, 24)}px`], ['border-bottom', `1px solid ${k.edge}`]])}>` +
     chip(r, 'caso', 'Caso práctico', k, hs, { onPanel: true, margin: '0 0 10px 0' }) +
@@ -1202,7 +1219,7 @@ function renderChecklist(r: R, c: VcChecklist): string {
   const k = tn(r, 'ejemplo');
   const its = list(c.items, 'checklist.items');
   return block(r, 'checklist', 'open', k, (s) => {
-    const ink = readable(s.bg, [k.ink], s.fg);
+    const ink = textInk(k.ink, s);
     const items = its
       .map((it, i) => `<li class="cvc-check"${st(r, [['margin', 0], ['padding', `${D(r, 12)}px 0`], ['color', s.fg], ...(i === 0 ? [] : ([['border-top', `1px solid ${r.t.color.border}`]] as Decl[]))])}>${eduIcon(r.enh, 'check', ink, 20)} <span class="cvc-li-t">${inlineHtml(it)}</span></li>`)
       .join('');
@@ -1214,7 +1231,7 @@ function renderWorked(r: R, c: VcWorkedExample): string {
   const k = tn(r, 'ejemplo');
   return block(r, 'worked_example', 'open', k, (g) => {
     const ds = surf(r.t, k.soft);
-    const ink = readable(ds.bg, [k.ink], ds.fg);
+    const ink = textInk(k.ink, ds);
     const data = list(c.data, 'worked_example.data')
       .map((d) => `<li${st(r, [['margin', '0 0 6px 0'], ['padding', 0], ['color', ds.fg]])}>${eduIcon(r.enh, 'check', ink, 16)} ${inlineHtml(d)}</li>`)
       .join('');
@@ -1223,7 +1240,7 @@ function renderWorked(r: R, c: VcWorkedExample): string {
       `<p class="cvc-meta"${st(r, [['margin', '0 0 8px 0'], ['padding', 0], ['color', ink], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700']])}>${labelHtml('1 · Datos del caso (ilustrativos)')}</p>` +
       bareList(r, 'ul', data, 'cvc-cols2 cvc-we-data') +
       `</div>`;
-    const gk = readable(g.bg, [k.ink], g.fg);
+    const gk = textInk(k.ink, g);
     const stepsHead = `<p class="cvc-meta"${st(r, [['margin', '0 0 12px 0'], ['padding', 0], ['color', gk], ['font-size', r.t.typography.sizeSmallPx], ['font-weight', '700']])}>${labelHtml('2 · Resolución paso a paso')}</p>`;
     const steps = processRail(r, list(c.steps, 'worked_example.steps').map((x) => ({ heading: x.action, body: x.detail })), k, g, 'h5');
     const result =
@@ -1269,7 +1286,7 @@ function renderSummary(r: R, c: VcSummaryVisual): string {
   const k = modTn(r);
   const pts = list(c.points, 'summary_visual.points');
   return block(r, 'summary_visual', 'tinted', k, (s) => {
-    const ink = readable(s.bg, [k.ink], s.fg);
+    const ink = textInk(k.ink, s);
     const points = pts
       .map(
         (p, i) =>

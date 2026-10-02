@@ -196,6 +196,43 @@ export function correctForegroundForBackgrounds(
   throw new Error(`THEME_INVALID: no se pudo corregir "${fg}" contra [${backgrounds.join(', ')}]`);
 }
 
+// ─── Fix #542: tinta de TEXTO derivada de un color de marca ─────────────────
+
+/**
+ * Tinta de texto legible derivada de un color de marca/rol/módulo (fix #542).
+ *
+ * Regla P3: los colores de marca NUNCA se alteran como muestra/relleno/borde. Cuando un TEXTO va
+ * en el color de marca y no alcanza `min` contra TODOS los fondos reales sobre los que se pinta,
+ * se deriva una tinta del MISMO tono (h, s de la marca): se oscurece si los fondos son claros y se
+ * aclara si son oscuros, en pasos de 0.01 de luminosidad HSL, devolviendo el PRIMER paso que
+ * alcanza `min` contra todos (el mínimo cambio). Si el color ya cumple, se devuelve tal cual.
+ * Pura y determinista. Solo para texto (rótulos, íconos de línea): nunca para rellenos.
+ *
+ * Termina siempre para fondos del mismo lado (todos claros o todos oscuros): al extremo de la
+ * luminosidad (L 0.03 / 0.985) el contraste supera 4.5:1 contra cualquier fondo de ese lado que
+ * admita texto casi negro / casi blanco. Si no (fondos mezclados o un fondo que no admite texto),
+ * cae a ON_DARK / ON_LIGHT y, si tampoco cumplen, lanza THEME_INVALID (falla fuerte, nunca silencio).
+ */
+export function brandTextInk(brand: string, backgrounds: string[], min = 4.5): string {
+  const fg = normalizeHex(brand);
+  const bgs = backgrounds.map(normalizeHex);
+  if (bgs.length === 0) throw new Error('THEME_INVALID: brandTextInk sin fondos');
+  const worst = (c: string) => Math.min(...bgs.map((bg) => contrastRatio(c, bg)));
+  // Ya cumple → el valor recibido, sin normalizar (bytes idénticos a la salida de siempre).
+  if (worst(fg) >= min) return brand;
+  // Fondos claros (el casi-negro contrasta más que el casi-blanco) → oscurecer; si no → aclarar.
+  const lightBgs = bgs.reduce((n, bg) => n + (contrastRatio(ON_DARK, bg) >= contrastRatio(ON_LIGHT, bg) ? 1 : 0), 0) * 2 >= bgs.length;
+  const { h, s, l } = hexToHsl(fg);
+  for (let i = 1; i <= 100; i++) {
+    const ll = l + (lightBgs ? -1 : 1) * 0.01 * i;
+    const candidate = hslToHex(h, s, clamp01(ll));
+    if (worst(candidate) >= min) return candidate;
+    if (ll <= 0 || ll >= 1) break;
+  }
+  for (const c of lightBgs ? [ON_DARK, ON_LIGHT] : [ON_LIGHT, ON_DARK]) if (worst(c) >= min) return c;
+  throw new Error(`THEME_INVALID: sin tinta de texto legible para "${fg}" sobre [${bgs.join(', ')}]`);
+}
+
 // ─── P3 (fix I1-R2): diferencia perceptual CIEDE2000 ────────────────────────
 
 /** sRGB hex → CIELAB (D65). */

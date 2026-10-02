@@ -9,7 +9,7 @@
  */
 export * from './types';
 export { THEME_FAMILIES, SPACE_SCALE, EDU_BLOCKS } from './families';
-export { deltaE2000, hexToLab } from './color-math';
+export { deltaE2000, hexToLab, brandTextInk } from './color-math';
 export { contrastRatio, relativeLuminance, normalizeHex, isValidHex, isPureBlackOrWhite, ON_LIGHT, ON_DARK } from './color-math';
 export { resolveTheme, validateTheme, moduleColor, moduleColorAdjustments, themeSha256, defaultPresentationProfile, roleHueDistance, ROLE_HUE_MIN_DISTANCE, MODULE_NEUTRAL_SAT, DEFAULT_MODULE_MIN_DELTA_E } from './theme-resolver';
 export { brandSeedFromLegacyPalette, legacyPaletteThemeFallback, presentationProfileFromPalette, presentationProfileFromPaletteId } from './brand-seed';
