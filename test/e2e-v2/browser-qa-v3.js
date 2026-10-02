@@ -242,6 +242,10 @@ const FLOWS = {
   },
   async dragtext(b) {
     const words = [...H5P_ANSWERS.dragtext.text.matchAll(/\*([^*]+)\*/g)].map((m) => m[1]);
+    // #583 QUAL: el banco trae las respuestas + los distractores de la fixture (barajados por el reproductor).
+    const bank = await b.evaluate(inH5p(`return [...d.querySelectorAll('.h5p-drag-draggables-container .h5p-draggable')].map(e=>e.innerText.split('\\n')[0].trim());`));
+    const wantBank = words.concat(H5P_ANSWERS.dragtext.distractors || []).slice().sort();
+    if (JSON.stringify(bank.slice().sort()) !== JSON.stringify(wantBank)) throw new Error(`DT: banco ${JSON.stringify(bank)} ≠ respuestas + distractores ${JSON.stringify(wantBank)}`);
     for (let i = 0; i < words.length; i++) {
       const word = words[i];
       const fromSel = `[...d.querySelectorAll('.h5p-drag-draggables-container .h5p-draggable')].find(e=>e.innerText.split('\\n')[0].trim()===${JSON.stringify(word)})`;
@@ -253,6 +257,11 @@ const FLOWS = {
       let placed = false;
       for (let attempt = 0; attempt < 3 && !placed; attempt++) {
         let from = null; let to = null;
+        // Gate QUAL (#583): con 2 distractores el banco tiene 6 palabras y, según el barajado del reproductor, la que
+        // hay que arrastrar puede quedar DEBAJO del viewport (y 908 > 900): un evento de ratón fuera de la ventana
+        // no llega y la palabra no se mueve. Como un estudiante, primero se desplaza la página para ver el ejercicio.
+        await b.evaluate(inH5p(`const t=d.querySelector('.h5p-drag-text')||d.body;t.scrollIntoView({block:'start'});return 1;`));
+        await sleep(300);
         for (let k = 0; k < 20; k++) {
           const f1 = await b.evaluate(centerOf(fromSel)); const t1 = await b.evaluate(centerOf(toSel));
           await sleep(250);
@@ -260,6 +269,8 @@ const FLOWS = {
           if (!from) throw new Error(`DT: no está "${word}"`);
           if (JSON.stringify([f1, t1]) === JSON.stringify([from, to])) break;
         }
+        const vh = await b.evaluate('window.innerHeight');
+        if (!(from.y > 0 && from.y < vh && to.y > 0 && to.y < vh)) throw new Error(`DT: "${word}" o su hueco fuera de la pantalla (palabra y ${Math.round(from.y)}, hueco y ${Math.round(to.y)}, alto ${vh})`);
         await mouseDrag(b, from, to);
         placed = (await b.evaluate(inH5p(`const z=d.querySelectorAll('.h5p-dropzone')[${i}];return z?z.innerText.trim():'';`))) === word;
         if (!placed) dtRedrags.push({ word, attempt: attempt + 1 });
