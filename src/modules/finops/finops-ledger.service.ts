@@ -539,6 +539,65 @@ export class FinopsLedgerService {
     });
   }
 
+  /**
+   * #583 fix round 1 (I1) + fix round 2 (N2): corrige UNA VEZ un cargo LLM CONSERVADOR (metadata.conservative,
+   * registrado por el proxy cuando el navegador cortó el stream) con el usage EXACTO medido al terminar de
+   * leer el stream. Bajo el mismo lock de los ajustes de ese cargo:
+   *  - el cargo tiene que ser conservador y SIN una corrección previa (una sola; el ledger es append-only:
+   *    la marca «corrected» es el propio ADJUSTMENT con metadata.correctsConservative/conservativeStatus);
+   *  - dueño y modelo iguales a los del cargo;
+   *  - input y caché (escritura y lectura) IGUALES a los del cargo y output ≤ el del cargo: la corrección
+   *    solo puede quitar el relleno de max_tokens, nunca bajar otra cosa.
+   * ADJUSTMENT por la diferencia (precio del catálogo AL MOMENTO DEL CARGO). Si el conservador no existe →
+   * null (el llamador registra el exacto como cargo). Un cargo medido nunca se toca.
+   */
+  async correctConservativeLlmCharge(
+    originalKey: string,
+    measuredUsage: UsageMeters,
+    expect: { ownerId?: string | null; model?: string | null } = {},
+  ): Promise<{ corrected: boolean; delta: string | null; reason?: string } | null> {
+    nonEmpty(originalKey, 'originalKey');
+    assertCompleteMeasurement(originalKey, measuredUsage);
+    const [peek] = await this.dataSource.query(`select provider, service, model_or_product from public.generation_cost_events where idempotency_key = $1`, [originalKey]);
+    if (!peek) return null;
+    const catalog = await this.loadCatalog(peek.provider, peek.service, peek.model_or_product);
+    return this.dataSource.transaction(async (manager) => {
+      await manager.query(`select pg_advisory_xact_lock(hashtext($1))`, ['finops:adj:' + originalKey]);
+      const [orig] = await manager.query(`select *, amount::text as amount from public.generation_cost_events where idempotency_key = $1`, [originalKey]);
+      if (!orig) return null;
+      const refuse = (reason: string) => ({ corrected: false, delta: null, reason });
+      if (orig.event_kind !== 'CHARGE' || orig.metadata?.conservative !== true) return refuse('not_conservative');
+      const [prev] = await manager.query(
+        `select count(*)::int as n from public.generation_cost_events
+          where corrects_event_id = $1 and event_kind = 'ADJUSTMENT' and coalesce(metadata->>'correctsConservative', '') = 'true'`,
+        [orig.id],
+      );
+      if (Number(prev.n) > 0) return refuse('already_corrected');
+      if (expect.ownerId != null && String(orig.owner_id ?? '') !== String(expect.ownerId)) return refuse('owner_mismatch');
+      if (expect.model != null && String(orig.model_or_product ?? '') !== String(expect.model)) return refuse('model_mismatch');
+      const o = (orig.usage || {}) as Record<string, unknown>;
+      const m = (measuredUsage || {}) as Record<string, unknown>;
+      const n = (v: unknown) => (v === null || v === undefined || v === '' ? 0 : Number(v));
+      for (const k of ['input_tokens', 'cache_write_tokens', 'cache_read_tokens']) {
+        if (n(o[k]) !== n(m[k])) return refuse(`${k}_mismatch`);
+      }
+      if (!(n(m.output_tokens) <= n(o.output_tokens))) return refuse('output_above_conservative');
+      const priced = priceUsage(measuredUsage || {}, catalog, {
+        provider: orig.provider,
+        service: orig.service,
+        product: orig.model_or_product,
+        asOf: orig.created_at,
+      });
+      // forceInsert: aunque el exacto coincida con el conservador (delta 0) queda el ADJUSTMENT de marca: única vez.
+      const r = await this.adjustWith(manager, originalKey, normalizeDecimal(priced.amount), 'llm_stream_measured_after_client_gone', {
+        recordedBy: 'llm-proxy',
+        forceInsert: true,
+        metadata: { measuredUsage, pricingSnapshot: priced.pricingSnapshot, correctsConservative: true, conservativeStatus: 'corrected' },
+      });
+      return { corrected: r.inserted, delta: r.delta };
+    });
+  }
+
   /** Cargo de costo cero por diseño (YouTube: cuota; packaging/render local). */
   async recordZero(input: {
     kind: 'youtube' | 'package';
@@ -611,7 +670,7 @@ export class FinopsLedgerService {
     originalKey: string,
     newTotal: string,
     reason: string,
-    opts: { recordedBy?: string; metadata?: Record<string, unknown>; settlement?: boolean; settlementLabel?: string },
+    opts: { recordedBy?: string; metadata?: Record<string, unknown>; settlement?: boolean; settlementLabel?: string; forceInsert?: boolean },
   ): Promise<{ inserted: boolean; event: CostEventRow | null; delta: string; previousTotal: string; newTotal: string }> {
     {
       await manager.query(`select pg_advisory_xact_lock(hashtext($1))`, ['finops:adj:' + originalKey]);
@@ -629,7 +688,7 @@ export class FinopsLedgerService {
         throw new FinopsError('INVALID_INPUT', `${originalKey} (${orig.cost_source}) no es un costo medible: no se liquida`);
       }
       const settlesPending = !!opts.settlement && orig.measurement_status === 'pending' && Number(agg.n) === 0;
-      if (isZeroDec(delta) && !settlesPending) return { inserted: false, event: null, delta, previousTotal, newTotal };
+      if (isZeroDec(delta) && !settlesPending && !opts.forceInsert) return { inserted: false, event: null, delta, previousTotal, newTotal };
       const settlementMeta = opts.settlement
         ? { settlement: opts.settlementLabel ?? (isZeroDec(delta) ? 'measured_equals_provisional' : 'measured_differs') }
         : {};

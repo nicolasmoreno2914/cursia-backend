@@ -67,6 +67,8 @@ async function bootstrap() {
   const autoPackage = app.get(AutoPackageService);
   startAutoHealTimer(runsService, new Logger('DynamicAutoHeal'), process.env, [
     { name: 'reintento automático seguro', run: () => runsService.autoRetrySafeRejections() },
+    // #583 (decisión del usuario): UN reenvío automático de un audio con resultado incierto (≤ USD 0.10).
+    { name: 'reenvío de audio incierto', run: () => runsService.autoResubmitAmbiguousAudio() },
     { name: 'empaque automático', run: () => autoPackage.sweep() },
   ]);
 }

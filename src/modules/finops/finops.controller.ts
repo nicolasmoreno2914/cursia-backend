@@ -23,6 +23,7 @@ import { FinopsBudgetService } from './finops-budget.service';
 import { FinopsIngestTokenGuard } from './finops-ingest-token.guard';
 import { FinopsError } from './errors';
 import { llmIngestToChargeInput, parseLlmUsageIngest } from './llm-usage-ingest';
+import { costIdempotencyKey } from './idempotency';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -53,6 +54,15 @@ export class FinopsIngestController {
   async llmUsage(@Body() body: Record<string, unknown>, @Res({ passthrough: true }) res: Response) {
     try {
       const parsed = parseLlmUsageIngest(body);
+      // #583 fix round 1 (I1): corrección del cargo conservador de un stream cortado (mismo messageId).
+      if (parsed.measurement === 'correction') {
+        const input = llmIngestToChargeInput(parsed);
+        const key = costIdempotencyKey('anthropic', { messageId: parsed.messageId });
+        const usage = input.usage as Record<string, number>;
+        const c = await this.ledger.correctConservativeLlmCharge(key, usage, { ownerId: parsed.subject, model: parsed.model });
+        if (c) return { corrected: c.corrected, delta: c.delta, reason: c.reason ?? null, idempotencyKey: key };
+        // El conservador no llegó: el exacto ES el cargo.
+      }
       const r = await this.ledger.recordCharge(llmIngestToChargeInput(parsed));
       // RF-b fix C1/I2: precio faltante → registrado a 0 pendiente → 202 (nunca 4xx: el proxy no pierde el cargo).
       if (r.pricingMissing && res) res.status(HttpStatus.ACCEPTED);
