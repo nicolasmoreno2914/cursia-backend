@@ -704,6 +704,9 @@ export async function loadCompletionInputs(q: Q, jobId: string): Promise<{
  * SUPER_ADMIN con `reconcile_videogen`. Solo lectura; orden: creación.
  */
 export async function loadPendingVideogenReservations(q: Q, runId: string): Promise<PendingVideogenReservation[]> {
+  // Sin el esquema de FinOps (bases previas a V2.1 RF-a / harnesses) no hay reservas: nada que conciliar.
+  const [t] = await q.query(`select to_regclass('public.generation_cost_events') is not null as present`);
+  if (!t?.present) return [];
   const rows: any[] = await q.query(
     `select e.idempotency_key, e.item_key, e.item_run_id, e.amount::text as amount, e.created_at, g.status as item_status, g.error as item_error
        from public.generation_cost_events e

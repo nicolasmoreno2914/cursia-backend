@@ -79,6 +79,7 @@ const { DynamicYoutubePreflightService } = loadDist('modules/dynamic-generation/
 // EV6 DoD BE-B: cola de recuperación de admin (ruta V2, SUPER_ADMIN).
 const { AdminDynamicRunsController } = loadDist('modules/dynamic-generation/admin-runs.controller.js');
 const { AdminRecoveryService } = loadDist('modules/dynamic-generation/admin-recovery.service.js');
+const { VideogenReconciliationService } = loadDist('modules/dynamic-generation/videogen-reconciliation.service.js');
 const { SchedulerService } = loadDist('modules/dynamic-generation/scheduler.service.js');
 const { PackagingController } = loadDist('modules/dynamic-packaging/packaging.controller.js');
 const { PackagingService } = loadDist('modules/dynamic-packaging/packaging.service.js');
@@ -266,6 +267,7 @@ async function buildApp() {
     ],
     providers: [
       { provide: AdminRecoveryService, useValue: fakeService('AdminRecoveryService') },
+      { provide: VideogenReconciliationService, useValue: fakeService('VideogenReconciliationService') }, // V542 (G6)
       AppService,
       { provide: CoursesService, useValue: fakeService('CoursesService') },
       { provide: CourseStructureService, useValue: fakeService('CourseStructureService') },
