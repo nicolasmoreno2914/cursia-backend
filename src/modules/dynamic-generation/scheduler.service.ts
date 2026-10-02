@@ -71,7 +71,7 @@ import {
   videoClaimFacts,
 } from '../course-shell';
 import { V3_ARTIFACT_TEXT_READER, V3ArtifactTextReader } from './v3-artifact-reader';
-import { EXAM_BANK_DRAFT_ARTIFACT_TYPE, recordExamBankDraft } from './exam-bank-draft';
+import { EXAM_BANK_DRAFT_ARTIFACT_TYPE, clearExamBankDraft, recordExamBankDraft } from './exam-bank-draft';
 
 export type ItemType = ManifestItemType;
 
@@ -876,10 +876,11 @@ export class SchedulerService {
     const msg = String(error ?? '').trim().slice(0, MAX_ERROR_LENGTH) || 'unknown_error';
     return this.guardedItemOp(itemRunId, executorId, ownerId, 'update', async (qr, job, item) => {
       // BANKOPT (1e): borrador del banco de un examen incompleto (validado; si no corresponde, se ignora).
-      if (opts?.examBankDraftArtifactId) {
-        const d = await recordExamBankDraft(qr, item, job.owner_id, opts.examBankDraftArtifactId, !!retryable);
-        if (d.recorded === false) this.logger.warn(`failItem ${item.id}: borrador del banco ignorado (${d.reason})`);
-      }
+      // Fix round 2 (N2): un fail de exam/final_exam SIN borrador válido borra el anterior, para que el
+      // próximo intento nunca reanude un borrador que ya llevó a otra falla (bucle I1).
+      const d = await recordExamBankDraft(qr, item, job.owner_id, opts?.examBankDraftArtifactId ?? null, !!retryable);
+      if (d.recorded === false && opts?.examBankDraftArtifactId) this.logger.warn(`failItem ${item.id}: borrador del banco ignorado (${d.reason})`);
+      if (d.recorded === false) await clearExamBankDraft(qr, item);
       const t = await applyItemFailure(
         qr, item.id, msg, !!retryable, opts?.retryAfterSeconds ?? null, opts?.refundAttempt === true, opts?.grantAttempt === true,
       );

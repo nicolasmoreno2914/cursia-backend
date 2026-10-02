@@ -1256,13 +1256,30 @@ async function dbChecks() {
       assert(ex3, 'claim exam 3');
       eq(ex3.outputSummary.examBankDraft.artifactId, good, 'el próximo claim trae el borrador');
       eq(ex3.generation, st.generation, 'misma generación');
-      // Un fail posterior sin borrador conserva el último (el ejecutor decide si sigue sirviendo).
-      eq(await sched.failItemDetailed(ex3.itemRunId, 'b1', 'otra cosa', true, OWNER), { ok: true }, 'fail sin borrador');
-      eq((await item(examKey)).output_summary.examBankDraft.artifactId, good, 'borrador conservado');
-      // Fix round 1 (M4): al completar, el borrador sale de output_summary.
+      // Fix round 2 (N2): un fail posterior SIN borrador (falla de reglas del banco) lo borra: el bucle
+      // «fail con borrador → fail sin borrador → claim» ya no reanuda el borrador viejo.
+      eq(await sched.failItemDetailed(ex3.itemRunId, 'b1', 'EXAM_BANK_INCOMPLETE: el banco no cumple las reglas del contrato', true, OWNER), { ok: true }, 'fail sin borrador');
+      eq('examBankDraft' in (await item(examKey)).output_summary, false, 'borrador borrado por el fail sin borrador');
+      await readyAgain(examKey);
+      const ex3b = await claim(['exam']);
+      assert(ex3b, 'claim exam 3b');
+      eq('examBankDraft' in (ex3b.outputSummary || {}), false, 'el claim siguiente no trae borrador');
+      // Un borrador inválido (de otro item) también cuenta como «sin borrador válido»: borra el que hubiera.
+      const good2 = await draftArt(ex3b.itemRunId);
+      eq(await sched.failItemDetailed(ex3b.itemRunId, 'b1', 'EXAM_BANK_INCOMPLETE: hoja corta', true, OWNER, { examBankDraftArtifactId: good2 }), { ok: true }, 'fail con borrador 2');
+      eq((await item(examKey)).output_summary.examBankDraft.artifactId, good2, 'borrador 2 registrado');
+      await readyAgain(examKey);
+      const ex3c = await claim(['exam']);
+      eq(await sched.failItemDetailed(ex3c.itemRunId, 'b1', 'EXAM_BANK_INCOMPLETE: hoja corta', true, OWNER, { examBankDraftArtifactId: await draftArt(other.id) }), { ok: true }, 'fail con borrador ajeno');
+      eq('examBankDraft' in (await item(examKey)).output_summary, false, 'borrador ajeno ignorado y el anterior borrado');
+      // Fix round 1 (M4): al completar, el borrador sale de output_summary (se deja uno antes de completar).
+      await readyAgain(examKey);
+      const ex3d = await claim(['exam']);
+      eq(await sched.failItemDetailed(ex3d.itemRunId, 'b1', 'EXAM_BANK_INCOMPLETE: hoja corta', true, OWNER, { examBankDraftArtifactId: await draftArt(ex3d.itemRunId) }), { ok: true }, 'fail con borrador 3');
       await readyAgain(examKey);
       const ex4 = await claim(['exam']);
       assert(ex4, 'claim exam 4');
+      assert(ex4.outputSummary.examBankDraft, 'el claim trae el borrador 3');
       const modCh4 = [{ id: C1, moduleId: M1 }, { id: C2, moduleId: M1 }];
       const gIndex4 = new Map([[C1, 0], [C2, 1], [C3, 2]]);
       const good4 = EBF.makeExamBank({ scope: 'module', moduleId: M1, chapters: modCh4, chapterIndex: gIndex4, plan: ex4.claimPayload.examBank.plan });
@@ -1272,6 +1289,7 @@ async function dbChecks() {
       // Un item que no es examen nunca guarda borrador.
       const D = loadDist('modules/dynamic-generation/exam-bank-draft.js');
       eq(await D.recordExamBankDraft({ async query() { throw new Error('no debe consultar'); } }, { id: other.id, type: 'content', generation: 1, attempt_count: 1 }, OWNER, good, true), { recorded: false, reason: 'not_exam_item' }, 'content');
+      eq(await D.clearExamBankDraft({ async query() { throw new Error('no debe consultar'); } }, { id: other.id, type: 'content', output_summary: { examBankDraft: {} } }), false, 'clear: content no se toca');
       eq(await D.recordExamBankDraft({ async query() { throw new Error('no debe consultar'); } }, { id: st.id, type: 'exam', generation: 1, attempt_count: 1 }, OWNER, 'no-uuid', true), { recorded: false, reason: 'invalid_id' }, 'id inválido');
       eq(await D.recordExamBankDraft({ async query() { throw new Error('no debe consultar'); } }, { id: st.id, type: 'exam', generation: 1, attempt_count: 1 }, OWNER, good, false), { recorded: false, reason: 'not_retryable' }, 'fail no retryable (sin reintento no hay borrador)');
     });

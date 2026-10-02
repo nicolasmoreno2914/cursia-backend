@@ -544,6 +544,7 @@ async function main() {
     eq(await errs(base), [], 'sin borrador');
     eq(await errs({ ...base, examBankDraftArtifactId: '0b6b6b6b-0000-4000-8000-000000000001' }), [], 'con borrador');
     eq(await errs({ ...base, examBankDraftArtifactId: 'no-es-uuid' }), ['examBankDraftArtifactId'], 'no UUID');
+    eq(await errs({ ...base, examBankDraftArtifactId: null }), [], 'null explícito = sin borrador (fix round 2, N2: borra el anterior)');
     eq(await errs({ ...base, draft: 'x' }), ['draft'], 'otro campo sigue rechazado');
   });
 

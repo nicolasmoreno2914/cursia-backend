@@ -12,6 +12,8 @@ import { returningRows } from '../../common/db/returning-rows';
  *    dueño del run, de ese tipo y de ESE item run; entonces deja
  *    `output_summary.examBankDraft = { artifactId, generation, attempt, recordedAt }` (si no, lo ignora:
  *    el fail se registra igual, nunca se rechaza por el borrador);
+ *  - un fail de exam/final_exam SIN borrador válido (incluido un fail sin campo o con null) BORRA el
+ *    anterior (fix round 2, N2): un borrador solo vale para el intento siguiente al faltante que lo creó;
  *  - el claim ya devuelve `outputSummary`; además anuncia el soporte con
  *    `claimPayload.examBank.draftArtifactType` (el FailItemDto anterior rechazaría el campo por whitelist).
  * El ejecutor solo usa el borrador si coinciden generación, alcance, versión de prompt, plan y el sha256
@@ -59,4 +61,18 @@ export async function recordExamBankDraft(
   );
   if (rows.length !== 1) return { recorded: false, reason: 'artifact_mismatch' };
   return { recorded: true, artifactId: draft.artifactId };
+}
+
+/**
+ * Fix round 2 (N2): quita `output_summary.examBankDraft` de un exam/final_exam (fail sin borrador válido).
+ * No-op para otros tipos o si no hay borrador. Dentro de la transacción del fail.
+ */
+export async function clearExamBankDraft(qr: QueryRunner, item: { id: string; type: string; output_summary?: any }): Promise<boolean> {
+  if (!DRAFT_ITEM_TYPES.has(String(item.type))) return false;
+  if (!item.output_summary || typeof item.output_summary !== 'object' || !('examBankDraft' in item.output_summary)) return false;
+  await qr.query(
+    `update public.generation_item_runs set output_summary = output_summary - 'examBankDraft' where id = $1 and status = 'running'`,
+    [item.id],
+  );
+  return true;
 }
