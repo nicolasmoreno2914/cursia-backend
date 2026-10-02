@@ -1259,6 +1259,16 @@ async function dbChecks() {
       // Un fail posterior sin borrador conserva el último (el ejecutor decide si sigue sirviendo).
       eq(await sched.failItemDetailed(ex3.itemRunId, 'b1', 'otra cosa', true, OWNER), { ok: true }, 'fail sin borrador');
       eq((await item(examKey)).output_summary.examBankDraft.artifactId, good, 'borrador conservado');
+      // Fix round 1 (M4): al completar, el borrador sale de output_summary.
+      await readyAgain(examKey);
+      const ex4 = await claim(['exam']);
+      assert(ex4, 'claim exam 4');
+      const modCh4 = [{ id: C1, moduleId: M1 }, { id: C2, moduleId: M1 }];
+      const gIndex4 = new Map([[C1, 0], [C2, 1], [C3, 2]]);
+      const good4 = EBF.makeExamBank({ scope: 'module', moduleId: M1, chapters: modCh4, chapterIndex: gIndex4, plan: ex4.claimPayload.examBank.plan });
+      eq(await sched.completeItemDetailed(ex4.itemRunId, 'b1', { artifactIds: [await upload('dynamic_exam_bank_json', good4)], summary: {} }, OWNER), { ok: true }, 'completa');
+      const fin4 = await item(examKey);
+      eq([fin4.status, 'examBankDraft' in fin4.output_summary], ['completed', false], 'sin borrador tras completar');
       // Un item que no es examen nunca guarda borrador.
       const D = loadDist('modules/dynamic-generation/exam-bank-draft.js');
       eq(await D.recordExamBankDraft({ async query() { throw new Error('no debe consultar'); } }, { id: other.id, type: 'content', generation: 1, attempt_count: 1 }, OWNER, good, true), { recorded: false, reason: 'not_exam_item' }, 'content');

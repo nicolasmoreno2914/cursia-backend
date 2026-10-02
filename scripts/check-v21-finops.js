@@ -177,7 +177,7 @@ async function pureChecks() {
     eq(e.totals.byProvider.youtube.max, '0.0000000000', 'youtube $0');
     assert(e.totals.byChapter._none, 'items sin capítulo agrupados en _none');
     eq(e.estimatorVersion, 'finops-estimator-v2', 'versión');
-    eq(e.usageModelVersion, 'usage-priors-v1.3', 'usage model');
+    eq(e.usageModelVersion, 'usage-priors-v1.4', 'usage model');
     assert(leq(e.totals.retryAllowance.expected, e.totals.expected) && leq(e.totals.retryAllowance.max, e.totals.max), 'retryAllowance ⊂ total');
     for (const l of e.lines) assert(typeof l.retryRate === 'number' && l.retryRate >= 0, `retryRate en ${l.itemKey}`);
   });
@@ -198,26 +198,26 @@ async function pureChecks() {
     for (const c of [1, 2, 3, 4]) for (const t of ['content', 'experience', 'presentation', 'video', 'video_interactions', 'activity', 'audiobook_chapter']) add(t, `ch${c}`, `ch${c}`, c <= 2 ? 'm1' : 'm2');
     return man;
   };
-  // BANKOPT (priors v1.3): el banco de exámenes pasa a la PROYECCIÓN de la rama (holgura + evidencia reubicada +
-  // reintento por hoja + caché de prompts; usage-model.priors.v1.json calibrationBankopt): exam 0.56/ítem,
-  // final 1.018 ⇒ banco del 2×2 ≈ 2.14 (medido en staging 4.35). Real proyectado = 11.73 − 4.35 + 2.14 = 9.52;
-  // registrado proyectado = 14.55 − 2.21 = 12.34. Experiencia y contenido siguen con lo medido.
-  await check('V542 calibración (BANKOPT): el 2×2 de #542 (36 items) estima dentro de ±20 % del gasto REAL proyectado (9.52); exámenes ≈ proyección BANKOPT, experiencia y contenido ≈ medidos; desglose con reintentos y caché', () => {
+  // BANKOPT fix round 1 (priors v1.4): el banco pasa a la PROYECCIÓN CONSERVADORA de la rama (reubicación de
+  // evidencia solo casi textual, final con caché frío; usage-model.priors.v1.json calibrationBankopt): exam
+  // 0.826/ítem, final 1.755 ⇒ banco del 2×2 ≈ 3.41 (medido en staging 4.35). Real proyectado = 11.73 − 4.35 +
+  // 3.41 = 10.79; registrado proyectado = 14.55 − 0.94 = 13.61. Experiencia y contenido siguen con lo medido.
+  await check('V542 calibración (BANKOPT): el 2×2 de #542 (36 items) estima dentro de ±20 % del gasto REAL proyectado (10.79); exámenes ≈ proyección BANKOPT, experiencia y contenido ≈ medidos; desglose con reintentos y caché', () => {
     const items = RB.estimateItemsForRun(course542(), 'real');
     eq(items.length, 36, 'items');
     eq(items.filter((i) => i.usageScale).length, 0, 'el 2×2 es la referencia (escala 1)');
     const e = estimateCost({ items, catalog: CATALOG, usageModel: usageModelPriorsV1(), retryPolicy: { maxRetries: 1 } });
     const n = (x) => Number(x);
     const exp = n(e.totals.expected);
-    const REAL = 9.52;
-    const RECORDED = 12.34;
+    const REAL = 10.79;
+    const RECORDED = 13.61;
     assert(Math.abs(exp - REAL) / REAL <= 0.2, `expected ${exp} vs real ${REAL}: ${(((exp - REAL) / REAL) * 100).toFixed(1)} %`);
     assert(Math.abs(exp - RECORDED) / RECORDED <= 0.2, `expected ${exp} vs registrado ${RECORDED}`);
     const by = (t) => n(e.totals.byItemType[t].expected);
-    for (const [t, actual] of [['exam', 1.12], ['final_exam', 1.018], ['experience', 0.64], ['content', 0.4]]) {
+    for (const [t, actual] of [['exam', 1.652], ['final_exam', 1.755], ['experience', 0.64], ['content', 0.4]]) {
       assert(Math.abs(by(t) - actual) / actual <= 0.05, `${t}: estimado ${by(t)} vs medido ${actual}`);
     }
-    assert(Math.abs(n(e.totals.byProvider.anthropic.expected) - 3.87) / 3.87 <= 0.05, `anthropic ${e.totals.byProvider.anthropic.expected} vs 3.87 (6.08 − 4.35 + 2.14)`);
+    assert(Math.abs(n(e.totals.byProvider.anthropic.expected) - 5.14) / 5.14 <= 0.05, `anthropic ${e.totals.byProvider.anthropic.expected} vs 5.14 (6.08 − 4.35 + 3.41)`);
     // El banco se estima con los 4 medidores de Sonnet 4.6 (entrada sin caché, salida, escritura y lectura de caché).
     for (const op of ['llm.exam', 'llm.final_exam']) eq(Object.keys(usageModelPriorsV1().operations[op].meters).sort(), ['cache_read_tokens', 'cache_write_tokens', 'input_tokens', 'output_tokens'], op + ': medidores');
     // El estimado v1.1 (8.82) quedaba −25 % bajo el real y su anthropic (1.49) −75 %: la causa del tope cruzado.
@@ -226,11 +226,13 @@ async function pureChecks() {
     const ra = n(e.totals.retryAllowance.expected);
     assert(ra > 0 && ra < exp, `retryAllowance ${ra}`);
     eq([...new Set(e.lines.filter((l) => l.itemType === 'exam' || l.itemType === 'final_exam').map((l) => l.retryRate))], [0.15], 'retryRate del banco (reintento por hoja con borrador)');
-    // Lo que ve la vista previa (StartPreview.estimate.breakdown): banco de exámenes ≈ 2.14 proyectado; reintentos.
+    // Lo que ve la vista previa (StartPreview.estimate.breakdown): banco de exámenes ≈ 3.41 proyectado; reintentos.
     const bd = loadDist('modules/finops/normal-approval.js').estimateBreakdown(e);
-    assert(Math.abs(n(bd.examBank.expected) - 2.14) / 2.14 <= 0.05, `breakdown.examBank ${bd.examBank.expected} vs 2.14`);
+    assert(Math.abs(n(bd.examBank.expected) - 3.41) / 3.41 <= 0.05, `breakdown.examBank ${bd.examBank.expected} vs 3.41`);
+    // I3: el final no presupone caché tibio de los exámenes de módulo (escrituras completas: ≥ 5 k tokens por capítulo).
+    eq(usageModelPriorsV1().operations['llm.final_exam'].meters.cache_write_tokens.p50 >= 4 * 5000, true, 'final con caché frío');
     eq(bd.retryAllowance, e.totals.retryAllowance, 'breakdown.retryAllowance');
-    console.log(`   2×2 #542 (BANKOPT): estimado ${exp.toFixed(2)} [${n(e.totals.min).toFixed(2)}–${n(e.totals.max).toFixed(2)}] vs real proyectado ${REAL} (${(((exp - REAL) / REAL) * 100).toFixed(1)} %) / registrado proyectado ${RECORDED} (${(((exp - RECORDED) / RECORDED) * 100).toFixed(1)} %); anthropic ${n(e.totals.byProvider.anthropic.expected).toFixed(2)} vs 3.87; banco ${n(bd.examBank.expected).toFixed(2)}; reintentos ${ra.toFixed(2)}`);
+    console.log(`   2×2 #542 (BANKOPT): estimado ${exp.toFixed(2)} [${n(e.totals.min).toFixed(2)}–${n(e.totals.max).toFixed(2)}] vs real proyectado ${REAL} (${(((exp - REAL) / REAL) * 100).toFixed(1)} %) / registrado proyectado ${RECORDED} (${(((exp - RECORDED) / RECORDED) * 100).toFixed(1)} %); anthropic ${n(e.totals.byProvider.anthropic.expected).toFixed(2)} vs 5.14; banco ${n(bd.examBank.expected).toFixed(2)}; reintentos ${ra.toFixed(2)}`);
   });
   await check('V542: el banco escala con los capítulos — entrada y lectura de caché ∝ llamadas, escritura ∝ capítulos, salida ∝ preguntas pedidas (con holgura); 1 capítulo cuesta menos, 3×3 más', () => {
     const ch = (k, m) => Array.from({ length: k }, (_, i) => ({ id: `${m}c${i}`, moduleId: m }));

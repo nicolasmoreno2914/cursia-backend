@@ -832,6 +832,8 @@ export class SchedulerService {
         }
       }
 
+      // BANKOPT fix round 1 (M4): el borrador del banco solo sirve entre intentos; al completar se quita.
+      if (merged.merged && typeof merged.merged === 'object') delete (merged.merged as Record<string, unknown>).examBankDraft;
       const done = returningRows(
         await qr.query(
           `update public.generation_item_runs
