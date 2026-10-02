@@ -320,6 +320,95 @@ export function safeAutoRetryDecision(row: AutoHealRow, now: Date, policy: AutoH
   return { heal: true, rule, round: rounds + 1 };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// #583 (decisión del usuario 2026-10-02) — UN reenvío automático de un AUDIO con resultado incierto.
+//
+// La validación #583 necesitó un admin para un capítulo del audiolibro cuyo TTS se cortó tras enviarse
+// (`provider_reconciliation_required: openai …`, ≈ USD 0.02). Regla aprobada:
+//  - solo items de audio (audio_welcome / audiobook_chapter) cuya operación incierta es de OpenAI TTS
+//    (el guion LLM del audiolibro —anthropic— sigue siendo de admin); VIDEO nunca (regla de siempre);
+//  - solo si el costo estimado del reenvío es chico: lo pendiente sin liquidar de ese item (las reservas
+//    de la operación incierta = lo que cuesta repetirla) ≤ AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD;
+//  - UNA vez por item, marcado en output_summary.ambiguousAudioResubmit (bajo lock, misma escritura que
+//    la reapertura: sobrevive ticks y reinicios). Si vuelve a quedar incierto → nunca más automático:
+//    admin (adminActions + needs_attention);
+//  - FinOps: la reserva pendiente de la operación incierta QUEDA registrada (cuenta como gasto, igual que
+//    el «Resolver cobro» humano); el reenvío reserva lo suyo dentro del presupuesto YA autorizado del run
+//    (gate en simulación al reabrir + runtime guard del worker antes de llamar); nunca crea aprobaciones.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const AMBIGUOUS_AUDIO_RESUBMIT_TYPES: readonly string[] = Object.freeze(['audio_welcome', 'audiobook_chapter']);
+/** Tope de costo estimado por reenvío automático (USD). Más que esto → admin. */
+export const AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD = 0.1;
+/** A lo sumo UN reenvío automático por item. */
+export const AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS = 1;
+/** Espera desde el fallo incierto antes del reenvío automático. */
+export const AMBIGUOUS_AUDIO_RESUBMIT_BACKOFF_SECONDS = 120;
+export const AMBIGUOUS_AUDIO_RESUBMIT_CODE = 'ambiguous_audio_resubmit';
+/** Regex POSIX gruesa del barrido (la decisión fina es ambiguousAudioResubmitDecision). */
+export const AMBIGUOUS_AUDIO_RESUBMIT_SQL_REGEX = `^${PROVIDER_RECONCILIATION_REQUIRED}: openai([^a-z0-9_]|$)`;
+const AMBIGUOUS_AUDIO_RESUBMIT_RE = new RegExp(`^${PROVIDER_RECONCILIATION_REQUIRED}: openai(?![a-z0-9_])`);
+/** La deny-list del auto-healer SIN las dos entradas que describen justamente este caso (incierto/conciliación). */
+const AMBIGUOUS_AUDIO_DENY: readonly RegExp[] = Object.freeze(
+  AUTO_HEAL_DENY_PATTERNS.filter((re) => !re.test(PROVIDER_RECONCILIATION_REQUIRED) && !re.test('ambiguous')),
+);
+
+export function ambiguousAudioResubmitRoundsOf(outputSummary: Record<string, any> | null | undefined): number {
+  const n = Number(outputSummary?.ambiguousAudioResubmit?.rounds ?? 0);
+  return Number.isInteger(n) && n > 0 ? n : 0;
+}
+
+/** Lo pendiente (sin liquidar) del item en el ledger, por proveedor. null = no se consultó. */
+export interface AmbiguousAudioPending {
+  /** Suma de las reservas sin liquidar de intentos no reconocidos (USD). */
+  pendingUsd: number;
+  /** Proveedores de esas reservas. */
+  providers: string[];
+}
+
+export type AmbiguousAudioDecision =
+  | { heal: true; round: number; pendingUsd: number | null }
+  | { heal: false; reason: AutoHealSkipReason | 'declined' | 'over_threshold' | 'not_audio'; retryAt?: Date; pendingUsd?: number | null };
+
+/**
+ * Decisión pura. `pending` undefined = el llamador no consultó el ledger (completion: solo decide si
+ * el servidor todavía lo va a resolver solo); el barrido y retryItem SIEMPRE lo pasan.
+ */
+export function ambiguousAudioResubmitDecision(
+  row: AutoHealRow,
+  now: Date,
+  pending?: AmbiguousAudioPending | null,
+  policy: AutoHealPolicy = DEFAULT_AUTO_HEAL_POLICY,
+  maxUsd: number = AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD,
+): AmbiguousAudioDecision {
+  if (row.status !== 'failed') return { heal: false, reason: 'not_failed' };
+  if (!row.type || !AMBIGUOUS_AUDIO_RESUBMIT_TYPES.includes(row.type)) return { heal: false, reason: 'not_audio' };
+  const error = String(row.error ?? '').trim();
+  if (!error) return { heal: false, reason: 'no_error' };
+  if (!AMBIGUOUS_AUDIO_RESUBMIT_RE.test(error)) return { heal: false, reason: 'not_allow_listed' };
+  if (AMBIGUOUS_AUDIO_DENY.some((re) => re.test(error))) return { heal: false, reason: 'denied' };
+  const os = (row.output_summary ?? {}) as Record<string, any>;
+  if (os.ambiguousAudioResubmit?.declined) return { heal: false, reason: 'declined' };
+  const rounds = ambiguousAudioResubmitRoundsOf(os);
+  if (rounds >= AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS) return { heal: false, reason: 'cap_reached' };
+  const failedAt = toDate(row.finished_at) ?? toDate(row.updated_at);
+  if (failedAt && now.getTime() - failedAt.getTime() > policy.maxAgeHours * 3_600_000) return { heal: false, reason: 'too_old' };
+  let pendingUsd: number | null = null;
+  if (pending !== undefined) {
+    // Sin nada pendiente, o con algo pendiente de OTRO proveedor (p.ej. el guion LLM): no es este caso.
+    if (!pending || !(pending.pendingUsd > 0) || pending.providers.length === 0 || pending.providers.some((p) => p !== 'openai')) {
+      return { heal: false, reason: 'missing_precondition', pendingUsd: pending ? pending.pendingUsd : null };
+    }
+    pendingUsd = pending.pendingUsd;
+    if (pendingUsd > maxUsd) return { heal: false, reason: 'over_threshold', pendingUsd };
+  }
+  if (failedAt) {
+    const retryAt = new Date(failedAt.getTime() + AMBIGUOUS_AUDIO_RESUBMIT_BACKOFF_SECONDS * 1000);
+    if (now.getTime() < retryAt.getTime()) return { heal: false, reason: 'backoff', retryAt, pendingUsd };
+  }
+  return { heal: true, round: rounds + 1, pendingUsd };
+}
+
 export function autoHealEnabled(env: Record<string, string | undefined> = process.env): boolean {
   if (!isDynamicCourseStructureEnabled(env)) return false;
   return String(env[AUTO_HEAL_ENABLED_ENV] ?? '').trim().toLowerCase() !== 'false';

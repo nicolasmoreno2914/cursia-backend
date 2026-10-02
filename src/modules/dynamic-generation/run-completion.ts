@@ -31,7 +31,7 @@
 import { frozenProviderModesOf, providerKindOfItemType } from './provider-modes';
 import { fallbackVideoModeOf, questionsBelongToVideo } from './video-upgrade';
 import { v3ValidatedArtifactTypes } from '../course-shell/v3-validation';
-import { autoHealDecision, autoHealEnabled, safeAutoRetryDecision } from './auto-heal';
+import { ambiguousAudioResubmitDecision, autoHealDecision, autoHealEnabled, safeAutoRetryDecision } from './auto-heal';
 import { BUDGET_EXCEEDED, PROVIDER_RECONCILIATION_REQUIRED } from '../finops/run-budget';
 
 export type RunCompletionState = 'in_progress' | 'packaging' | 'complete' | 'preview' | 'needs_attention' | 'cancelled';
@@ -521,6 +521,10 @@ export function adminActionFor(r: CompletionRow | undefined, cls: ItemCompletion
   // reintento automático todavía disponible: lo toma el servidor, sin acción humana.
   const sd = safeAutoRetryDecision(ahRow, now);
   if (tickOn && (sd.heal === true || (sd.heal === false && sd.reason === 'backoff'))) return null;
+  // #583: audio con resultado incierto que el servidor todavía va a reenviar UNA vez (sin consultar el
+  // ledger acá: si lo pendiente supera el tope, el barrido lo marca `declined` y la acción aparece).
+  const ad = ambiguousAudioResubmitDecision(ahRow, now);
+  if (tickOn && (ad.heal === true || (ad.heal === false && ad.reason === 'backoff'))) return null;
   if (err.includes(PROVIDER_RECONCILIATION_REQUIRED)) {
     return { code: r.type === 'video' ? 'reconcile_videogen' : 'reconcile_provider', itemKey: key };
   }

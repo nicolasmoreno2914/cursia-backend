@@ -59,6 +59,9 @@ const AUD = loadDist('package/audio/index.js');
 const SM = loadDist('package/v3/synthetic-media.js');
 const F = loadDist('modules/finops/index.js');
 const H = loadDist('workers/finops-worker-hooks.js');
+const AH = loadDist('modules/dynamic-generation/auto-heal.js');
+const RC = loadDist('modules/dynamic-generation/run-completion.js');
+const T = loadDist('modules/dynamic-generation/item-transitions.js');
 const { startStorage, startProviderFakes, syntheticMp4WithMvhd } = require(path.join(REPO, 'test/e2e-v2/fakes.js'));
 
 // Claves FALSAS con marcas únicas: el check verifica que nunca aparezcan en logs/errores/DB.
@@ -1038,6 +1041,168 @@ async function dbChecks() {
       const r1 = await itemRow(R1.rid, `audio_welcome:${R1.cid}`);
       const r2 = await itemRow(R2.rid, `audio_welcome:${R2.cid}`);
       eq([(await reservationsOf(r1.id, 'openai')).map((x) => x.settled), (await reservationsOf(r2.id, 'openai')).map((x) => x.settled)], [[true], [true]], 'reservas liquidadas (sin doble conteo)');
+    });
+
+    // ═══ #583 (decisión del usuario 2026-10-02): UN reenvío automático de un AUDIO con resultado incierto ═══
+    const later = (mins) => new Date(Date.now() + mins * 60_000);
+    const finopsCounts = async (cid) => (await ds.query(
+      `select (select count(*)::int from public.cost_estimates where course_id = $1) as estimates,
+              (select count(*)::int from public.cost_budget_authorizations where course_id = $1) as auths`, [cid]))[0];
+    /** Audio de bienvenida cortado DESPUÉS de enviarse a OpenAI → reconciliación (como el capítulo de #583). */
+    async function ambiguousWelcome(title) {
+      const R = await freshRun(title);
+      const key = `audio_welcome:${R.cid}`;
+      fakes.plan.ttsFail = ['drop'];
+      await rejectsRe(PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome')), /^provider_reconciliation_required: openai/, 'TTS cortado');
+      const row = await itemRow(R.rid, key);
+      eq(row.status, 'failed', 'reconciliación');
+      return { ...R, key, row };
+    }
+    const resubOf = (res, rid) => res.resubmitted.filter((x) => x.runId === rid);
+
+    await check('#583 audio incierto → UN reenvío automático tras la espera (la reserva incierta QUEDA registrada y reconocida, sin estimados ni aprobaciones nuevas); el worker reenvía UNA vez y completa', async () => {
+      const A = await ambiguousWelcome('583 audio incierto');
+      const [pend] = await reservationsOf(A.row.id, 'openai');
+      assert(pend && !pend.settled && Number(pend.amount) > 0 && Number(pend.amount) <= AH.AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD, `reserva pendiente chica (${pend && pend.amount})`);
+      // Mientras el servidor lo va a reenviar solo, no hay acción de admin.
+      eq(RC.adminActionFor(A.row, 'not_done', new Date()), null, 'sin acción de admin (pendiente del servidor)');
+      const f0 = await finopsCounts(A.cid);
+      const t0 = fakes.st.tts.length;
+      eq(resubOf(await runs.autoResubmitAmbiguousAudio({ now: new Date() }), A.rid).length, 0, 'dentro de la espera: no');
+      const res = await runs.autoResubmitAmbiguousAudio({ now: later(3) });
+      eq(resubOf(res, A.rid).map((x) => x.itemKey), [A.key], 'reenviado');
+      let row = await itemRow(A.rid, A.key);
+      const os0 = row.output_summary;
+      const last = os0.previousErrors[os0.previousErrors.length - 1];
+      eq([row.status, os0.ambiguousAudioResubmit.rounds, os0.reconciliationAcknowledgedThroughAttempt, row.max_attempts - row.attempt_count, last.auto, last.ambiguousAudioResubmit],
+        ['pending', 1, row.attempt_count, 1, true, true], 'reapertura: una vez, intento reconocido, UN intento');
+      eq(Number(os0.ambiguousAudioResubmit.pendingUsd), Number(pend.amount), 'costo estimado registrado');
+      eq(await finopsCounts(A.cid), f0, 'sin estimados ni aprobaciones nuevas');
+      fakes.plan.ttsFail = [];
+      await PW.processProviderItem(workerDeps(), await claimProvider(A.rid, 'audio_welcome'));
+      row = await itemRow(A.rid, A.key);
+      eq([row.status, fakes.st.tts.length - t0], ['completed', 1], `reenvío único y completa (${row.error})`);
+      eq((await reservationsOf(row.id, 'openai')).map((x) => x.settled), [false, true], 'la reserva incierta queda contada + la del reenvío liquidada');
+      eq(resubOf(await runs.autoResubmitAmbiguousAudio({ now: later(10) }), A.rid).length, 0, 'nada más que reenviar');
+    });
+
+    await check('#583 incierto OTRA vez después de su reenvío automático → nunca un segundo reenvío (ni el auto-healer): admin (reconcile_provider) y el run termina needs_attention', async () => {
+      const A = await ambiguousWelcome('583 audio doble');
+      eq(resubOf(await runs.autoResubmitAmbiguousAudio({ now: later(3) }), A.rid).length, 1, 'primer reenvío');
+      const t0 = fakes.st.tts.length;
+      fakes.plan.ttsFail = ['drop'];
+      await rejectsRe(PW.processProviderItem(workerDeps(), await claimProvider(A.rid, 'audio_welcome')), /^provider_reconciliation_required: openai/, 'otra vez incierto');
+      fakes.plan.ttsFail = [];
+      const row = await itemRow(A.rid, A.key);
+      eq([row.status, fakes.st.tts.length - t0], ['failed', 1], 'una llamada');
+      for (const mins of [3, 60, 600]) {
+        eq(resubOf(await runs.autoResubmitAmbiguousAudio({ now: later(mins) }), A.rid).length, 0, `sin segundo reenvío (+${mins} min)`);
+        eq((await runs.autoHealFailedItems({ now: later(mins) })).reopened.filter((x) => x.runId === A.rid).length, 0, `auto-healer +${mins} min`);
+      }
+      eq(AH.ambiguousAudioResubmitDecision(row, later(30)).reason, 'cap_reached', 'tope');
+      eq(RC.adminActionFor(row, 'not_done', later(30)), { code: 'reconcile_provider', itemKey: A.key }, 'acción de admin');
+      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now(), output_summary = coalesce(output_summary, '{}'::jsonb) || '{"mode":"real"}'::jsonb
+                       where job_id = $1 and status in ('pending', 'retrying', 'blocked')`, [A.rid]);
+      eq(await runs.tx((qr) => T.recomputeRunStatus(qr, A.rid)), 'failed', 'run failed');
+      const dto = await runs.getRun(A.cid, OWNER, 1, A.rid);
+      eq(dto.completion.state, 'needs_attention', 'needs_attention');
+      assert(dto.completion.adminActions.some((a) => a.code === 'reconcile_provider' && a.itemKey === A.key), `acciones ${JSON.stringify(dto.completion.adminActions)}`);
+      eq(fakes.st.tts.length - t0, 1, 'cero llamadas automáticas más');
+    });
+
+    await check('#583 costo estimado sobre el tope → ningún reenvío automático: queda `declined` (sin re-evaluarlo en cada tick) y la acción es de admin', async () => {
+      const A = await ambiguousWelcome('583 audio caro');
+      const t0 = fakes.st.tts.length;
+      const res = await runs.autoResubmitAmbiguousAudio({ now: later(3), maxUsd: 0.000001 });
+      eq(resubOf(res, A.rid).length, 0, 'no se reenvía');
+      eq(res.skipped.filter((x) => x.runId === A.rid).map((x) => x.reason), ['over_threshold'], 'motivo');
+      const row = await itemRow(A.rid, A.key);
+      eq([row.status, row.output_summary.ambiguousAudioResubmit.declined], ['failed', 'over_threshold'], 'declinado → admin');
+      eq((await runs.autoResubmitAmbiguousAudio({ now: later(10) })).skipped.filter((x) => x.runId === A.rid).length, 0, 'no vuelve a evaluarse (ni con el tope normal)');
+      eq(RC.adminActionFor(row, 'not_done', later(10)), { code: 'reconcile_provider', itemKey: A.key }, 'acción de admin');
+      eq(fakes.st.tts.length - t0, 0, 'cero llamadas');
+    });
+
+    await check('#583 FinOps manda: sin presupuesto autorizado que cubra el reenvío → no se reabre (sin estimados ni aprobaciones) y queda para un admin; reabierto y revocado antes del envío → el runtime guard del worker lo bloquea (0 llamadas)', async () => {
+      const A = await ambiguousWelcome('583 audio sin presupuesto');
+      const [est] = await ds.query(`select id from public.cost_estimates where run_id = $1 and scope = 'run'`, [A.rid]);
+      await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, decision, reason) values ($1, $2, $3, 0, 'BLOCKED', 'check #583: revocado')`, [A.rid, A.cid, est.id]);
+      const f0 = await finopsCounts(A.cid);
+      const t0 = fakes.st.tts.length;
+      const res = await runs.autoResubmitAmbiguousAudio({ now: later(3) });
+      eq(resubOf(res, A.rid).length, 0, 'no se reabre');
+      eq(res.skipped.filter((x) => x.runId === A.rid).map((x) => x.reason), ['budget_approval_required'], 'motivo FinOps');
+      const row = await itemRow(A.rid, A.key);
+      eq([row.status, row.output_summary.ambiguousAudioResubmit.declined], ['failed', 'budget_approval_required'], 'declinado → admin');
+      eq(await finopsCounts(A.cid), f0, 'sin estimados ni aprobaciones nuevas');
+      eq(fakes.st.tts.length - t0, 0, 'cero llamadas');
+      // Runtime guard: reabierto con presupuesto y revocado ANTES de que el worker llame.
+      const G = await ambiguousWelcome('583 audio runtime guard');
+      eq(resubOf(await runs.autoResubmitAmbiguousAudio({ now: later(3) }), G.rid).length, 1, 'reabierto');
+      const [estG] = await ds.query(`select id from public.cost_estimates where run_id = $1 and scope = 'run'`, [G.rid]);
+      await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, decision, reason) values ($1, $2, $3, 0, 'BLOCKED', 'check #583: revocado')`, [G.rid, G.cid, estG.id]);
+      const t1 = fakes.st.tts.length;
+      await PW.processProviderItem(workerDeps(), await claimProvider(G.rid, 'audio_welcome')).catch(() => {});
+      const rg = await itemRow(G.rid, G.key);
+      eq([rg.status === 'completed', /budget_exceeded/.test(String(rg.error)), fakes.st.tts.length - t1], [false, true, 0], `runtime guard (${rg.status}: ${rg.error})`);
+    });
+
+    await check('#583 dos barridos a la vez (dos ticks / reinicio) → UN solo reenvío; el guion LLM incierto (anthropic) y el video nunca se reenvían solos', async () => {
+      const A = await ambiguousWelcome('583 audio concurrente');
+      const both = await Promise.all([runs.autoResubmitAmbiguousAudio({ now: later(3) }), runs.autoResubmitAmbiguousAudio({ now: later(3) })]);
+      eq(both.reduce((n, r) => n + resubOf(r, A.rid).length, 0), 1, 'un reenvío en total');
+      const row = await itemRow(A.rid, A.key);
+      eq([row.status, row.output_summary.ambiguousAudioResubmit.rounds, row.output_summary.previousErrors.length], ['pending', 1, 1], 'una sola reapertura');
+      // Guion del audiolibro (LLM) incierto → admin, nunca automático.
+      const B = await freshRun('583 guion incierto');
+      fakes.plan.llmFail = ['drop'];
+      const item = await claimProvider(B.rid, 'audiobook_chapter');
+      await rejectsRe(PW.processProviderItem(workerDeps(), item), /^provider_reconciliation_required: anthropic/, 'guion cortado');
+      fakes.plan.llmFail = [];
+      eq(resubOf(await runs.autoResubmitAmbiguousAudio({ now: later(3) }), B.rid).length, 0, 'anthropic: no');
+      const rb = await itemRow(B.rid, item.itemKey);
+      eq(AH.ambiguousAudioResubmitDecision(rb, later(3)).reason, 'not_allow_listed', 'solo TTS');
+      const now = new Date();
+      const vrow = { status: 'failed', type: 'video', error: 'provider_reconciliation_required: openai — x', output_summary: {}, finished_at: new Date(now.getTime() - 600e3) };
+      eq(AH.ambiguousAudioResubmitDecision(vrow, now).reason, 'not_audio', 'video: nunca');
+      eq(AH.ambiguousAudioResubmitDecision({ ...vrow, type: 'audio_welcome', error: 'provider_reconciliation_required: openai — x (budget_exceeded)' }, now).reason, 'denied', 'presupuesto en el motivo → nunca');
+      eq(AH.ambiguousAudioResubmitDecision({ ...vrow, type: 'audio_welcome' }, now, { pendingUsd: 0.02, providers: ['anthropic', 'openai'] }).reason, 'missing_precondition', 'otro proveedor pendiente');
+      eq(AH.ambiguousAudioResubmitDecision({ ...vrow, type: 'audiobook_chapter' }, now, { pendingUsd: 0.02, providers: ['openai'] }).heal, true, 'capítulo del audiolibro: sí');
+    });
+
+    await check('#583 scripts/staging-budget-policy.js contra PG16: nueva versión de la política vigente (owner de prueba > global) con maxCostPerRun 15 y TODO lo demás igual; idempotente (2.ª corrida no inserta)', async () => {
+      const OWNER_STG = 'aa2fa9a1-afb1-4b01-8646-94a0cb272b57';
+      const pols = () => ds.query(`select scope, scope_id, version, limits, on_exceed, require_human_approval_for_real_spend from public.cost_budget_policies
+                                     where scope = 'global' or (scope = 'owner' and scope_id = $1) order by scope, version`, [OWNER_STG]);
+      const g0 = (await ds.query(`select coalesce(max(version), 0)::int v from public.cost_budget_policies where scope = 'global'`))[0].v;
+      await ds.query(`insert into public.cost_budget_policies (scope, scope_id, version, limits, require_human_approval_for_real_spend, on_exceed, created_by)
+                      values ('global', null, $1, $2::jsonb, true, 'ADMIN_APPROVAL', 'check #583')`,
+        [g0 + 1, JSON.stringify({ maxCostPerRun: '10', maxCostPerCourse: '15', monthlyCapStaging: '50', maxCostPerProvider: { gamma: '4' } })]);
+      const runPolicy = (owner) => spawnSync(process.execPath, [path.join(REPO, 'scripts/staging-budget-policy.js'), ...(owner ? [owner] : [])],
+        { cwd: tmpCwd, env: cleanEnv({ MIGRATION_ENV: 'staging', NODE_ENV: 'test', ...localEnv({}) }), encoding: 'utf8', timeout: 60000 });
+      let r = runPolicy(OWNER_STG);
+      assert(r.status === 0 && /nueva versión con maxCostPerRun 15/.test(r.stdout), `1.ª corrida: ${r.stdout}${r.stderr}`);
+      let rows = (await pols()).filter((x) => x.scope === 'global');
+      const top = rows[rows.length - 1];
+      eq([top.version, top.limits, top.on_exceed, top.require_human_approval_for_real_spend], [g0 + 2, { maxCostPerRun: '15', maxCostPerCourse: '15', monthlyCapStaging: '50', maxCostPerProvider: { gamma: '4' } }, 'ADMIN_APPROVAL', true], 'versión nueva, resto igual');
+      eq(rows[rows.length - 2].limits.maxCostPerRun, '10', 'la versión anterior no se toca (inmutable)');
+      r = runPolicy(OWNER_STG);
+      assert(r.status === 0 && /ya tiene maxCostPerRun 15/.test(r.stdout), `2.ª corrida: ${r.stdout}${r.stderr}`);
+      eq((await pols()).filter((x) => x.scope === 'global').length, rows.length, 'idempotente: sin otra versión');
+      // Con política del owner de prueba, esa es la vigente para sus generaciones: se versiona ESA.
+      await ds.query(`insert into public.cost_budget_policies (scope, scope_id, version, limits, require_human_approval_for_real_spend, on_exceed, created_by)
+                      values ('owner', $1, 1, $2::jsonb, true, 'BLOCK', 'check #583')`, [OWNER_STG, JSON.stringify({ maxCostPerRun: 12, maxCostPerCourse: 30 })]);
+      r = runPolicy(OWNER_STG);
+      assert(r.status === 0, r.stderr);
+      const own = (await pols()).filter((x) => x.scope === 'owner');
+      eq(own.map((x) => [x.version, x.limits, x.on_exceed]), [[1, { maxCostPerRun: 12, maxCostPerCourse: 30 }, 'BLOCK'], [2, { maxCostPerRun: 15, maxCostPerCourse: 30 }, 'BLOCK']], 'owner versionado (tipo numérico conservado)');
+      eq((await pols()).filter((x) => x.scope === 'global').length, rows.length, 'global intacta');
+      // El presupuesto se sigue validando: la política nueva es la que ve el gate (sin aprobaciones automáticas).
+      const pf = await budget.policyFor(999999, OWNER_STG);
+      eq([pf.limits.maxCostPerRun, pf.onExceed], [15, 'BLOCK'], 'policyFor ve la versión nueva');
+      // Guardarraíl real: sin MIGRATION_ENV=staging no corre.
+      const bad = spawnSync(process.execPath, [path.join(REPO, 'scripts/staging-budget-policy.js')], { cwd: tmpCwd, env: cleanEnv({ NODE_ENV: 'test', ...localEnv({}) }), encoding: 'utf8' });
+      eq(bad.status, 1, 'sin MIGRATION_ENV=staging');
     });
 
     // ── Videogen (dynamic-item-worker) ──
