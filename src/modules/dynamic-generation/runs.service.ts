@@ -122,7 +122,7 @@ import {
   videoUpgradeOf,
   videoUpgradesOf,
 } from './video-upgrade';
-import { estimateCategories, estimateFingerprint, planNormalApproval, NormalApprovalPlan } from '../finops/normal-approval';
+import { estimateBreakdown, EstimateBreakdown, estimateCategories, estimateFingerprint, planNormalApproval, NormalApprovalPlan } from '../finops/normal-approval';
 import { isSuperAdminEmail } from '../../auth/super-admin';
 import { RunCompletion, attachCarryChains, evaluateRunCompletion, loadValidationCutoffs } from './run-completion';
 import { hasDeliverablePackage } from '../dynamic-packaging/package-freshness';
@@ -559,6 +559,8 @@ export interface StartPreview {
   estimate: {
     currency: string; min: string; expected: string; max: string;
     byProvider: Record<string, MinExpMax>; byItemType: Record<string, MinExpMax>; byCategory: Record<string, MinExpMax>;
+    /** V542: banco de preguntas de los exámenes y reserva por reintentos (incluidos en expected/max). */
+    breakdown: EstimateBreakdown;
   } | null;
   decision: string | null;
   reasons: string[];
@@ -629,6 +631,8 @@ export interface VideoUpgradePreview {
   estimate: {
     currency: string; min: string; expected: string; max: string;
     byProvider: Record<string, MinExpMax>; byItemType: Record<string, MinExpMax>; byCategory: Record<string, MinExpMax>;
+    /** V542: banco de preguntas de los exámenes y reserva por reintentos (incluidos en expected/max). */
+    breakdown: EstimateBreakdown;
   } | null;
   approval: {
     required: boolean; canApprove: boolean; withinPolicy: boolean; amount: string | null;
@@ -871,6 +875,7 @@ export class RunsService {
       estimate: {
         currency: sum.currency, min: sum.min, expected: sum.expected, max: sum.max,
         byProvider: sum.byProvider, byItemType: evaluation.estimate.totals.byItemType, byCategory: estimateCategories(sum.byProvider),
+        breakdown: estimateBreakdown(evaluation.estimate),
       },
       decision: evaluation.decision,
       reasons: evaluation.reasons,
@@ -3094,6 +3099,7 @@ export class RunsService {
       out.estimate = {
         currency: sum.currency, min: sum.min, expected: sum.expected, max: sum.max,
         byProvider: sum.byProvider, byItemType: econ.estimate.totals.byItemType, byCategory: estimateCategories(sum.byProvider),
+        breakdown: estimateBreakdown(econ.estimate),
       };
       out.approval = {
         // Video real = proveedor pagado real → siempre aprobación humana; nunca reutiliza un saldo autorizado antes.
