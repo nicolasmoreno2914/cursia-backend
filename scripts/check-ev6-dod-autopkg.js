@@ -1280,6 +1280,40 @@ const ENV_KEYS = [
       await ds.query(`update public.production_jobs set status = 'failed', worker_status = 'failed', finished_at = now() where id = $1`, [rr]);
     });
 
+    await check('[VG] fix round 2 (N5): reservationRuns=1 con 2 runs con reservas → truncated: true (totales visibles); un run que no se puede evaluar va a errors con su courseId REAL (nunca 0)', async () => {
+      const mk = async (title) => {
+        const C = await confirmedCourse(title);
+        const rid = await seededRealRun(C);
+        const v = await latest(rid, `video:${C.c1}`);
+        const key = await FWH.reservePaidCall(ledger, { kind: 'videogen', ownerId: OWNER, itemRunId: v.id, generation: 1, itemAttempt: 1, tag: 'submit', estimate: {} });
+        await ds.query(`update public.generation_item_runs set output_summary = output_summary || jsonb_build_object('previousExternals', jsonb_build_array(jsonb_build_object('externalReservationKey', $2::text, 'reason', 'videogen_failed: x'))) where id = $1`, [v.id, key]);
+        return { C, rid, key };
+      };
+      const A = await mk('V542 N5 truncado A');
+      const Bk = await mk('V542 N5 truncado B');
+      const pend = await RC.loadPendingVideogenReservations(ds, null);
+      eq(pend.find((p) => p.reservationKey === A.key).courseId, A.C.cid, 'courseId del ledger');
+      const L1 = await recovery.listNeedsAttention({ limit: 500, reservationRuns: 1 });
+      const t = L1.pendingReservationsTotals;
+      assert(t.runs >= 2 && t.listedRuns === 1 && t.truncated === true && L1.pendingReservations.length === 1, `truncado: ${JSON.stringify(t)} / ${L1.pendingReservations.length}`);
+      eq(t.reservations, pend.length, 'total de reservas = ledger');
+      const L2 = await recovery.listNeedsAttention({ limit: 500, reservationRuns: 2000 });
+      eq(L2.pendingReservationsTotals.truncated, false, 'sin truncar con tope alto');
+      // Run con reservas cuyo Manifest ya no se puede leer: error con el courseId real.
+      const [orig] = await ds.query(`select input_payload from public.production_jobs where id = $1`, [Bk.rid]);
+      await ds.query(`update public.production_jobs set input_payload = input_payload || '{"manifestId": 987654321}'::jsonb where id = $1`, [Bk.rid]);
+      try {
+        const L3 = await recovery.listNeedsAttention({ limit: 500, reservationRuns: 2000 });
+        const err = L3.errors.find((e) => e.runId === Bk.rid);
+        assert(err && err.courseId === Bk.C.cid && err.courseId !== 0, `error con courseId real: ${JSON.stringify(L3.errors)}`);
+        assert(!L3.pendingReservations.some((e) => e.runId === Bk.rid) && L3.pendingReservations.some((e) => e.runId === A.rid), 'el resto se lista igual');
+        eq(L3.pendingReservationsTotals.reservations, L2.pendingReservationsTotals.reservations, 'el total sigue contando la reserva del run con error');
+      } finally {
+        await ds.query(`update public.production_jobs set input_payload = $2::jsonb where id = $1`, [Bk.rid, JSON.stringify(orig.input_payload)]);
+      }
+      for (const x of [A, Bk]) await ds.query(`update public.production_jobs set status = 'failed', worker_status = 'failed', finished_at = now() where id = $1`, [x.rid]);
+    });
+
     // ════ [RP] reporte de cursos viejos: solo lectura ═════════════════════════
     const REPORT = 'scripts/report-ev6-legacy-preview-runs.js';
     await check('[RP] el reporte rechaza cualquier flag de escritura y exige REPORT_TARGET, SIN conectarse', async () => {

@@ -91,6 +91,8 @@ export interface PendingVideogenReservation {
   failureCode: string | null;
   /** V542 fix round 1 (I2): run de la reserva (la cola de admin la busca en TODOS los runs). */
   runId: string;
+  /** Fix round 2 (N5): curso de la reserva (del ledger), para informar un run que no se puede evaluar. */
+  courseId: number | null;
   /**
    * V542 fix round 1 (I4): de qué intento es la reserva —
    *  - `archived_failed`: intento ARCHIVADO por un reenvío cuyo motivo fue un fallo de render de Videogen
@@ -756,12 +758,12 @@ export async function loadCompletionInputs(q: Q, jobId: string): Promise<{
  * El resultado es incierto (Videogen no informa si cobró un job fallido): nunca se libera sola; lo decide un
  * SUPER_ADMIN con `reconcile_videogen`. Solo lectura; orden: creación.
  */
-export async function loadPendingVideogenReservations(q: Q, runId: string | null, opts: { limit?: number } = {}): Promise<PendingVideogenReservation[]> {
+export async function loadPendingVideogenReservations(q: Q, runId: string | null): Promise<PendingVideogenReservation[]> {
   // Sin el esquema de FinOps (bases previas a V2.1 RF-a / harnesses) no hay reservas: nada que conciliar.
   const [t] = await q.query(`select to_regclass('public.generation_cost_events') is not null as present`);
   if (!t?.present) return [];
   const rows: any[] = await q.query(
-    `select e.idempotency_key, e.item_key, e.item_run_id, e.run_id, e.amount::text as amount, e.created_at, g.status as item_status, g.error as item_error,
+    `select e.idempotency_key, e.item_key, e.item_run_id, e.run_id, e.course_id, e.amount::text as amount, e.created_at, g.status as item_status, g.error as item_error,
             g.output_summary as item_output_summary
        from public.generation_cost_events e
        join public.generation_item_runs g on g.id = e.item_run_id
@@ -770,8 +772,7 @@ export async function loadPendingVideogenReservations(q: Q, runId: string | null
         and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)
         and not (g.status in ('pending', 'running', 'retrying')
                  and coalesce(g.output_summary->>'externalReservationKey', '') = e.idempotency_key)
-      order by e.created_at, e.idempotency_key
-      ${opts.limit ? 'limit ' + Math.max(1, Math.floor(opts.limit)) : ''}`,
+      order by e.created_at, e.idempotency_key`,
     [runId],
   );
   return rows.map((r) => {
@@ -785,6 +786,7 @@ export async function loadPendingVideogenReservations(q: Q, runId: string | null
     createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
     failureCode: r.item_status === 'failed' ? (/^\s*([a-z][a-z0-9_]*)/.exec(String(r.item_error ?? ''))?.[1] ?? null) : null,
     runId: String(r.run_id),
+    courseId: r.course_id === null || r.course_id === undefined ? null : Number(r.course_id),
     attemptState: c.attemptState,
     videogenJobId: c.videogenJobId,
     mayHaveRendered: c.attemptState !== 'archived_failed',

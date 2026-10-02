@@ -237,7 +237,8 @@ export class AdminRecoveryService {
         [runId],
       );
       if (!job) {
-        out.errors.push({ runId, courseId: 0, code: 'reservation_run_missing' });
+        // Fix round 2 (N5): el curso real (del ledger), nunca 0.
+        out.errors.push({ runId, courseId: Number(byRun.get(runId)![0].courseId ?? 0), code: 'reservation_run_missing' });
         continue;
       }
       try {
