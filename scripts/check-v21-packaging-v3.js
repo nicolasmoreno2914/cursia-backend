@@ -1034,6 +1034,44 @@ const MATRIX = [
     att.assessmentProfile.attempts.activity = 2;
     await rejects(B.buildDynamicMbzV3(att), /ASSESSMENT_UNENFORCEABLE/, 'intentos en h5p');
   });
+  // V542 fix round 1 (C1): la regla de cifras es la MISMA en lint de la intro, gate de render y validador —
+  // solo las cifras que cuentan la estructura/duración del curso salen de facts; normas y plazos del contenido se muestran.
+  await check('V542 C1 extremo a extremo: «Ley 1480 de 2011» y «15 días hábiles» en las intros validan, se renderizan y se empaquetan (validateMbzV3 limpio); «6 semanas» fuera de facts se rechaza en el lint, en el render y en el validador', async () => {
+    const LAW = 'Aplicar la Ley 1480 de 2011 y responder dentro de los 15 días hábiles que fija la norma.';
+    const i = PF.packagingInput(distRoot, MATRIX[0]);
+    const ci = { ...i.contents.courseIntro, competencies: [LAW, ...i.contents.courseIntro.competencies.slice(1)] };
+    eq(SHELL.validateCourseIntroV3(ci).errors || [], [], 'intro del curso válida');
+    i.contents.courseIntro = ci;
+    const [mid] = i.contents.moduleIntros.keys();
+    const mi = { ...i.contents.moduleIntros.get(mid) };
+    mi.presentation = `${mi.presentation} El Decreto 1074 de 2015 regula la garantía.`;
+    i.contents.moduleIntros.set(mid, mi);
+    const r = await B.buildDynamicMbzV3(i);
+    const v = await V.validateMbzV3(r.mbz, r.expectations);
+    assert(v.ok, JSON.stringify(v.issues.slice(0, 4)));
+    const z = await JSZip.loadAsync(r.mbz);
+    let txt = '';
+    for (const n of Object.keys(z.files).filter((x) => /label_\d+\/label\.xml$/.test(x))) txt += await z.file(n).async('string');
+    assert(txt.includes('Ley 1480 de 2011') && txt.includes('15 días hábiles') && txt.includes('Decreto 1074 de 2015'), 'las cifras de contenido se ven en los labels');
+    // «6 semanas»: lint de la intro, gate de render y validador.
+    const bad = { ...ci, competencies: ['Completar el curso en 6 semanas de estudio guiado.', ...ci.competencies.slice(1)] };
+    assert((SHELL.validateCourseIntroV3(bad).errors || []).some((e) => e.code === 'DIGIT_IN_TEXT'), 'lint: 6 semanas');
+    const i2 = PF.packagingInput(distRoot, MATRIX[0]);
+    i2.contents.courseIntro = bad;
+    await rejects(B.buildDynamicMbzV3(i2), /DIGIT_IN_TEXT|COURSE_INTRO/, 'builder: 6 semanas');
+    const facts = r.expectations.facts;
+    let threw = null;
+    try { SHELL.assertShellNumbers({ name: 'Qué aprenderás', html: '<div><p><span class="nolink">Completarás todo en 997 semanas. Ley 1480 de 2011.</span></p></div>' }, facts); } catch (e) { threw = e; }
+    assert(threw && /SHELL_NUMBER_NOT_FROM_FACTS: .*997/.test(threw.message) && !/1480|2011/.test(threw.message.split(':').pop()), `gate: ${threw && threw.message}`);
+    SHELL.assertShellNumbers({ name: 'Qué aprenderás', html: '<div><p><span class="nolink">Ley 1480 de 2011, 15 días hábiles, ISO 9001.</span></p></div>' }, facts);
+    const { z: zz, acts } = await actDirs(r.mbz);
+    const comp = acts.find((a) => a.idnumber === 'cv3:shell:competencies') || acts.find((a) => /^cv3:shell:/.test(a.idnumber));
+    const x = await zz.file(`${comp.dir}/label.xml`).async('string');
+    zz.file(`${comp.dir}/label.xml`, x.replace('Ley 1480 de 2011', 'Ley 1480 de 2011 en 997 semanas'));
+    const v2 = await V.validateMbzV3(await zz.generateAsync({ type: 'nodebuffer' }), r.expectations);
+    assert(v2.issues.some((e) => e.code === 'NUMBER_NOT_FROM_FACTS' && /997/.test(e.message) && !/1480/.test(e.message)), `validador: ${JSON.stringify(v2.issues.slice(0, 4))}`);
+  });
+
   await check('builder falla fuerte: cifra en un intro del LLM, duración del video ≠ documento, token inválido', async () => {
     const i1 = PF.packagingInput(distRoot, MATRIX[0]);
     i1.contents.courseIntro = { ...i1.contents.courseIntro, closing: 'Completaste los 4 capítulos del curso.' };

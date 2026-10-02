@@ -33,6 +33,7 @@ import {
 import { formatDurationEs, formatDurationShortEs } from '../../package/audio';
 import { H5pActivityTypeV2, resolveActivityType } from './activity-type';
 import { displayStructureTitle } from '../course-structure/structure-titles';
+import { courseCountNumbers } from './intro-schemas';
 
 export const COURSE_FACTS_VERSION = 1;
 export const HOURS_SOURCE_LABEL = 'definida por la institución';
@@ -492,13 +493,16 @@ export function factsNumberSet(facts: CourseFacts): Set<number> {
 }
 
 /**
- * Números del texto que NO están en factsNumberSet (vacío = pasa). Los títulos
- * del Blueprint (curso, módulos, capítulos) se quitan antes: son nombres que
- * puso la institución ("ISO 9001"), no cifras que afirme el shell.
+ * Cifras del texto que CUENTAN la estructura o la duración del curso y NO están en factsNumberSet
+ * (vacío = pasa). Los títulos del Blueprint (curso, módulos, capítulos) se quitan antes: son nombres
+ * que puso la institución ("ISO 9001"), no cifras que afirme el shell.
+ * V542 fix round 1 (C1): solo la clase `courseCountNumbers` (la misma que rechaza el lint de la prosa
+ * de las intros); las cifras de contenido («Ley 1480 de 2011», «15 días hábiles») no son afirmaciones
+ * sobre el curso y se muestran.
  */
 export function lintShellNumbers(text: string, facts: CourseFacts): number[] {
   const allowed = factsNumberSet(facts);
-  return numbersInText(stripStructureTitles(text, facts)).filter((n) => !allowed.has(n));
+  return courseCountNumbers(stripStructureTitles(text, facts)).filter((n) => !allowed.has(n));
 }
 
 /**

@@ -143,6 +143,22 @@ export function lintShellProse(text: string): ShellProseHit[] {
   return hits;
 }
 
+/**
+ * V542 fix round 1 (C1) — cifras que CUENTAN la estructura o la duración del curso: la MISMA clase que rechazan
+ * los lints de la prosa (DIGIT_IN_TEXT de lintShellProse + lintQuantityClaims: «4 capítulos», «6 semanas»,
+ * «30 %», «capítulo 3»). Fuente única para el lint de las intros, el gate de render del shell
+ * (assertShellNumbers / SHELL_NUMBER_NOT_FROM_FACTS) y el validador (NUMBER_NOT_FROM_FACTS): una prosa que el
+ * lint acepta nunca la rechaza el render. Las demás cifras («Ley 1480 de 2011», «ISO 9001», «15 días hábiles»)
+ * son contenido y se muestran.
+ */
+export function courseCountNumbers(text: string): number[] {
+  const out: number[] = [];
+  const nums = (s: string) => Array.from(s.matchAll(/\d+(?:[.,]\d+)?/g), (m) => Number(m[0].replace(',', '.')));
+  for (const m of normalizeLint(text).matchAll(DIGIT_COUNT_RE)) out.push(...nums(m[0]));
+  for (const h of lintQuantityClaims(String(text ?? ''))) out.push(...nums(h.match));
+  return [...new Set(out)]; // ambas reglas pueden ver la misma cifra («4 capítulos»)
+}
+
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === 'object' && !Array.isArray(v);
 }
