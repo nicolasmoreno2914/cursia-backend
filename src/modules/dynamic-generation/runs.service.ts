@@ -124,7 +124,7 @@ import {
 } from './video-upgrade';
 import { estimateBreakdown, EstimateBreakdown, estimateCategories, estimateFingerprint, planNormalApproval, NormalApprovalPlan } from '../finops/normal-approval';
 import { isSuperAdminEmail } from '../../auth/super-admin';
-import { RunCompletion, attachCarryChains, evaluateRunCompletion, loadValidationCutoffs } from './run-completion';
+import { RunCompletion, attachCarryChains, evaluateRunCompletion, loadPendingVideogenReservations, loadValidationCutoffs } from './run-completion';
 import { hasDeliverablePackage } from '../dynamic-packaging/package-freshness';
 import { autoPackageEnabled, loadAutoPackageState } from '../dynamic-packaging/auto-package-state';
 import {
@@ -4387,7 +4387,9 @@ export class RunsService {
       : false;
     // Fix round 2: items completados antes de la validación de servidor de su tipo (cursos viejos) cuentan validados.
     const validationCutoffs = await loadValidationCutoffs(this.dataSource);
-    const first = evaluateRunCompletion(job, rows, m, null, { upgradeOnlyFailure, validationCutoffs });
+    // V542 (G6): reservas de Videogen sin liquidar que ningún worker va a liquidar → reconcile_videogen (SUPER_ADMIN).
+    const pendingVideogenReservations = await loadPendingVideogenReservations(this.dataSource, String(job.id));
+    const first = evaluateRunCompletion(job, rows, m, null, { upgradeOnlyFailure, validationCutoffs, pendingVideogenReservations });
     if (!first.generationComplete) return first;
     const q = { query: this.dataSource.query.bind(this.dataSource) };
     const ready = await hasDeliverablePackage(q, job, manifest, this.logger);
@@ -4403,7 +4405,7 @@ export class RunsService {
       autoRetryPending: stale ? pk.rebuildPending : pk.autoRetryPending,
       auto: pk.eligible && autoPackageEnabled(),
       blocked: pk.blocked ? { code: pk.blocked.code, message: pk.blocked.message, missing: pk.blocked.missing } : null,
-    }, { upgradeOnlyFailure, validationCutoffs });
+    }, { upgradeOnlyFailure, validationCutoffs, pendingVideogenReservations });
   }
 
   /**

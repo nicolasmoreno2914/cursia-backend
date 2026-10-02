@@ -17,6 +17,7 @@ import { ArtifactsServiceTextReader, V3_ARTIFACT_TEXT_READER } from './v3-artifa
 import { FinopsModule } from '../finops/finops.module';
 import { AdminDynamicRunsController } from './admin-runs.controller';
 import { AdminRecoveryService } from './admin-recovery.service';
+import { VideogenReconciliationService } from './videogen-reconciliation.service';
 
 /**
  * Generación dinámica (Fase 5A): runs sobre un Generation Manifest. No
@@ -38,6 +39,7 @@ import { AdminRecoveryService } from './admin-recovery.service';
   providers: [
     RunsService,
     AdminRecoveryService, // EV6 DoD BE-B: cola de recuperación de admin (solo lectura)
+    VideogenReconciliationService, // V542 (G6): conciliación explícita de reservas de Videogen (SUPER_ADMIN)
     SchedulerService,
     DynamicYoutubePreflightService,
     {

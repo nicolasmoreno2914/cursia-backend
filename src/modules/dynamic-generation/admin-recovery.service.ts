@@ -61,6 +61,11 @@ export interface NeedsAttentionListing {
    * none|stale. Acción: `retry_package` (POST …/package, idempotente).
    */
   manualPackage: NeedsAttentionEntry[];
+  /**
+   * V542 (G6): runs (cualquier estado terminal, también `complete`) con reservas de Videogen sin liquidar
+   * que solo un SUPER_ADMIN puede conciliar. Acción: `reconcile_videogen` con su `reservationKey`.
+   */
+  pendingReservations: NeedsAttentionEntry[];
   /** Ejecuciones que no se pudieron evaluar (integridad): solo ids y un código. */
   errors: Array<{ runId: string; courseId: number; code: string }>;
 }
@@ -81,6 +86,17 @@ export function endpointForAction(a: RunAdminAction, ids: { courseId: number; bl
     case 'retry_video_render':
       return { method: 'POST', path: `${item}/retry`, body: { resubmitVideo: true }, note: 'resubmitVideo (SUPER_ADMIN): nuevo render pagado, pasa por el gate de FinOps' };
     case 'reconcile_videogen':
+      // V542 (G6): reserva de Videogen sin liquidar (resultado incierto) → decisión explícita, append-only.
+      if (a.reservationKey) {
+        return {
+          method: 'POST', path: `/api/v1/admin/dynamic-runs/${ids.runId}/videogen-reservations/reconcile`,
+          bodyAlternatives: [
+            { reservationKey: a.reservationKey, outcome: 'not_charged', reason: '<qué se verificó en la cuenta de Videogen>' },
+            { reservationKey: a.reservationKey, outcome: 'charged', reason: '<qué se verificó en la cuenta de Videogen>' },
+          ],
+          note: `reserva de Videogen PENDIENTE (USD ${a.amount ?? '?'}) de un intento que no se va a liquidar solo: Videogen no informa si cobró un job fallido; verificar en su cuenta y registrar «no cobrado» (la reserva va a 0) o «cobrado» (queda contada). SUPER_ADMIN, con motivo; nunca automático`,
+        };
+      }
       return {
         method: 'POST', path: `${item}/retry`, body: { resubmitVideo: true },
         note: 'verificar primero en Videogen que el envío ambiguo no generó (ni cobró) un video; luego resubmitVideo (SUPER_ADMIN)',
@@ -153,7 +169,7 @@ export class AdminRecoveryService {
         limit $1`,
       [limit],
     );
-    const out: NeedsAttentionListing = { generatedAt: new Date().toISOString(), scanned: runs.length, needsAttention: [], legacyPreview: [], manualPackage: [], errors: [] };
+    const out: NeedsAttentionListing = { generatedAt: new Date().toISOString(), scanned: runs.length, needsAttention: [], legacyPreview: [], manualPackage: [], pendingReservations: [], errors: [] };
     for (const job of runs) {
       try {
         const bp = Number(job.blueprint_number);
@@ -162,7 +178,8 @@ export class AdminRecoveryService {
         const legacy = completion.state === 'preview' && job.worker_status === 'completed';
         const manual = completion.state === 'packaging' && !!completion.packageJob && !completion.packageJob.auto &&
           ['none', 'stale'].includes(completion.packageJob.status);
-        if (completion.state !== 'needs_attention' && !legacy && !manual) continue;
+        const reservationActions = completion.adminActions.filter((a) => a.code === 'reconcile_videogen' && !!a.reservationKey);
+        if (completion.state !== 'needs_attention' && !legacy && !manual && !reservationActions.length) continue;
         const ids = { courseId: Number(job.course_id), blueprintNumber: bp, runId: String(job.id) };
         const byKey = new Map<string, any>(rows.map((r: any) => [r.item_key, r]));
         const failed = completion.missingComponents
@@ -194,6 +211,9 @@ export class AdminRecoveryService {
           }),
         };
         if (completion.state === 'needs_attention') out.needsAttention.push(entry);
+        if (reservationActions.length) {
+          out.pendingReservations.push({ ...entry, adminActions: reservationActions.map((a) => ({ ...a, endpoint: endpointForAction(a, ids) })) });
+        }
         if (manual) {
           const a: RunAdminAction = { code: 'retry_package' };
           out.manualPackage.push({ ...entry, adminActions: [{ ...a, endpoint: endpointForAction(a, ids) }] });

@@ -62,6 +62,24 @@ export interface RunAdminAction {
   itemKey?: string;
   /** BE-B fix round 1 (I2): código del bloqueo del paquete que originó esta acción (nunca texto técnico). */
   reason?: string;
+  /**
+   * V542 (G6): `reconcile_videogen` de una RESERVA de Videogen sin liquidar cuyo resultado es incierto
+   * (el render falló o el envío quedó ambiguo y el item ya no la va a liquidar). Solo SUPER_ADMIN la ve
+   * con clave y monto (`redactCompletionForOwner` los quita al dueño).
+   */
+  reservationKey?: string;
+  amount?: string;
+}
+
+/** V542 (G6): reserva de Videogen pendiente que solo un SUPER_ADMIN puede conciliar (ver loadPendingVideogenReservations). */
+export interface PendingVideogenReservation {
+  reservationKey: string;
+  itemKey: string;
+  itemRunId: string;
+  amount: string;
+  createdAt: string | null;
+  /** Código del fallo que dejó la reserva sin liquidar (si el item todavía está fallido; nunca el texto). */
+  failureCode: string | null;
 }
 
 export interface RunCompletion {
@@ -172,6 +190,12 @@ export interface CompletionOptions {
    * cuenta como validado; uno posterior sin ella sigue «sin validar». Sin dato del tipo → sin excepción.
    */
   validationCutoffs?: Readonly<Record<string, Date>> | null;
+  /**
+   * V542 (G6): reservas de Videogen sin liquidar y que ningún worker va a liquidar (ver
+   * loadPendingVideogenReservations) → una acción `reconcile_videogen` por reserva, en CUALQUIER estado del
+   * run (también `in_progress` y `complete`: el curso no cambia de estado por una conciliación de dinero).
+   */
+  pendingVideogenReservations?: ReadonlyArray<PendingVideogenReservation> | null;
 }
 
 /** Clasificación de UN item requerido. */
@@ -495,7 +519,7 @@ export function evaluateRunCompletion(
   const seen = new Set<string>();
   const push = (a: RunAdminAction | null) => {
     if (!a) return;
-    const k = `${a.code}|${a.itemKey ?? ''}`;
+    const k = `${a.code}|${a.itemKey ?? ''}|${a.reservationKey ?? ''}`;
     if (seen.has(k)) return;
     seen.add(k);
     actions.push(a);
@@ -505,6 +529,10 @@ export function evaluateRunCompletion(
     if (c === 'not_done' || c === 'unvalidated') push(adminActionFor(rowsByKey.get(it.key), c, now));
   }
   if (previewComponents.some((k) => k.startsWith('video:')) && manifest.rulesVersion === 3) push({ code: 'generate_real_videos' });
+  // V542 (G6): nunca se liberan solas (resultado incierto): una acción de admin por reserva.
+  for (const r of opts.pendingVideogenReservations ?? []) {
+    push({ code: 'reconcile_videogen', itemKey: r.itemKey, reservationKey: r.reservationKey, amount: r.amount });
+  }
 
   let state: RunCompletionState;
   if (isCancelledLike(job) && !opts.upgradeOnlyFailure) state = 'cancelled';
@@ -561,9 +589,15 @@ export function evaluateRunCompletion(
  */
 export function redactCompletionForOwner<T extends Partial<RunCompletion> | null | undefined>(c: T): T {
   if (!c || typeof c !== 'object') return c;
+  let out = c;
+  // V542 (G6): la clave de la reserva y el monto son datos de conciliación del admin.
+  const acts = (c as RunCompletion).adminActions;
+  if (Array.isArray(acts) && acts.some((a) => a && (a.reservationKey !== undefined || a.amount !== undefined))) {
+    out = { ...out, adminActions: acts.map((a) => (a && (a.reservationKey !== undefined || a.amount !== undefined) ? (({ reservationKey: _k, amount: _a, ...rest }) => rest)(a) : a)) } as T;
+  }
   const pj = (c as RunCompletion).packageJob;
-  if (!pj || typeof pj !== 'object' || !pj.blocked || typeof pj.blocked !== 'object') return c;
-  return { ...c, packageJob: { ...pj, blocked: { code: pj.blocked.code, message: null } } } as T;
+  if (!pj || typeof pj !== 'object' || !pj.blocked || typeof pj.blocked !== 'object') return out;
+  return { ...out, packageJob: { ...pj, blocked: { code: pj.blocked.code, message: null } } } as T;
 }
 
 /** ¿El run terminado debe quedar `preview` (todo completado; algún componente de vista previa; nada más falta)? */
@@ -657,4 +691,37 @@ export async function loadCompletionInputs(q: Q, jobId: string): Promise<{
     rows,
     manifest: { rulesVersion: Number(m.rules_version), items: Array.isArray(mj?.items) ? mj.items : [] },
   };
+}
+
+/**
+ * V542 (G6) — reservas de Videogen del run que quedaron SIN liquidar y que ningún worker va a liquidar:
+ * CHARGE `pending` con `metadata.reservation`, proveedor videogen, cuenta real (no mock), sin ningún
+ * ADJUSTMENT, cuyo item ya no la está usando — el item está terminado (failed/cancelled/blocked/completed)
+ * o la reserva no es la del intento en curso (`output_summary.externalReservationKey`; un resubmitVideo la
+ * archiva en `previousExternals`). Es exactamente el caso del curso #542: `videogen_failed: generate_script
+ * … 429` ANTES del render y reenvío de admin → la reserva del intento fallido queda PENDIENTE para siempre.
+ * El resultado es incierto (Videogen no informa si cobró un job fallido): nunca se libera sola; lo decide un
+ * SUPER_ADMIN con `reconcile_videogen`. Solo lectura; orden: creación.
+ */
+export async function loadPendingVideogenReservations(q: Q, runId: string): Promise<PendingVideogenReservation[]> {
+  const rows: any[] = await q.query(
+    `select e.idempotency_key, e.item_key, e.item_run_id, e.amount::text as amount, e.created_at, g.status as item_status, g.error as item_error
+       from public.generation_cost_events e
+       join public.generation_item_runs g on g.id = e.item_run_id
+      where e.run_id = $1 and e.event_kind = 'CHARGE' and e.provider = 'videogen' and e.billing_account <> 'mock'
+        and coalesce((e.metadata->>'reservation') = 'true', false) and e.measurement_status = 'pending'
+        and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)
+        and not (g.status in ('pending', 'running', 'retrying')
+                 and coalesce(g.output_summary->>'externalReservationKey', '') = e.idempotency_key)
+      order by e.created_at, e.idempotency_key`,
+    [runId],
+  );
+  return rows.map((r) => ({
+    reservationKey: String(r.idempotency_key),
+    itemKey: String(r.item_key ?? ''),
+    itemRunId: String(r.item_run_id),
+    amount: String(r.amount),
+    createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+    failureCode: r.item_status === 'failed' ? (/^\s*([a-z][a-z0-9_]*)/.exec(String(r.item_error ?? ''))?.[1] ?? null) : null,
+  }));
 }
