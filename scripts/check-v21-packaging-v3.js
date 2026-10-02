@@ -602,6 +602,19 @@ const MATRIX = [
       const a = find(/^cv3:exam:/);
       return { [`${a.dir}/quiz.xml`]: (x) => x.replace('<reviewcorrectness>16</reviewcorrectness>', '<reviewcorrectness>4352</reviewcorrectness>') };
     }],
+    // QUIZFB: retroalimentación global con otra nota mínima, o sin ella → QUIZ_FEEDBACK; sin el bit I → QUIZ_REVIEW.
+    ['QUIZ_FEEDBACK', () => {
+      const a = find(/^cv3:exam:/);
+      return { [`${a.dir}/quiz.xml`]: (x) => x.replace('<mingrade>70.00000</mingrade>', '<mingrade>50.00000</mingrade>') };
+    }],
+    ['QUIZ_FEEDBACK', () => {
+      const a = find(/^cv3:final_exam$/);
+      return { [`${a.dir}/quiz.xml`]: (x) => x.replace(/<feedbacks>[\s\S]*?<\/feedbacks>/, '<feedbacks></feedbacks>') };
+    }],
+    ['QUIZ_REVIEW', () => {
+      const a = find(/^cv3:exam:/);
+      return { [`${a.dir}/quiz.xml`]: (x) => x.replace('<reviewoverallfeedback>4368</reviewoverallfeedback>', '<reviewoverallfeedback>16</reviewoverallfeedback>') };
+    }],
     // completionattemptsexhausted en 0 con intentos > 0 (el fixture base tiene attempts_number 3) → QUIZ_COMPLETION.
     ['QUIZ_COMPLETION', () => {
       const a = find(/^cv3:exam:/);
@@ -1198,7 +1211,7 @@ const MATRIX = [
     for (const [f, v] of [['builderVersion', '3.0.1'], ['manifestSha256', 'm2'], ['sourceArtifactIds', ['a']], ['themeSha256', 't2'], ['assessmentProfileSha256', 'p2'], ['h5pProfileVersion', 2], ['vcRendererVersion', 'r2'], ['moodleVersion', '4.5']]) {
       assert(PK.packageReuseHashV3({ ...baseK, [f]: v }) !== k0, `cambia con ${f}`);
     }
-    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.9.0' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
+    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.10.0' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
   });
 
   // ── Medios ────────────────────────────────────────────────────────────────

@@ -69,7 +69,41 @@ export function examExplanationsInfoText(attempts: number, explained: boolean): 
   if (!Number.isInteger(attempts) || attempts < 0) shellFail(`intentos inválidos (${attempts})`);
   const what = explained ? 'Las respuestas correctas y su explicación se habilitan' : 'Las respuestas correctas se habilitan';
   const when = attempts === 0 ? 'cuando apruebes' : attempts === 1 ? 'cuando apruebes o cuando uses tu único intento' : `cuando apruebes o cuando uses tus ${attempts} intentos`;
-  return `Al terminar cada intento verás tu calificación. ${what} en «${EXAM_EXPLANATIONS_SHORT}» ${when}.`;
+  // QUIZFB (re-verificación #542, R1): con la revisión sin notas por pregunta (builder 3.9.0) la nota del intento NO
+  // aparece en la página del cuestionario hasta unos minutos después; lo que se ve AL TERMINAR es el mensaje de
+  // «aprobaste / todavía no» (retroalimentación global, examOverallFeedbackBands) y la nota en Calificaciones.
+  return `${EXAM_ATTEMPT_RESULT_LINE} ${what} en «${EXAM_EXPLANATIONS_SHORT}» ${when}.`;
+}
+
+/** QUIZFB: lo que el estudiante ve al terminar cada intento (sin prometer la nota en la página del cuestionario). */
+export const EXAM_ATTEMPT_RESULT_LINE = 'Al terminar cada intento verás si aprobaste; tu calificación queda en Calificaciones.';
+
+/**
+ * QUIZFB — retroalimentación GLOBAL del quiz (quiz_feedback), visible inmediatamente después del intento y más tarde
+ * mientras está abierto (reviewoverallfeedback I|O|C): un mensaje de «aprobaste» desde la nota mínima del perfil y uno
+ * de «todavía no» por debajo. Moodle 4.5 no puede mostrar la nota del intento sin mostrar también la nota de cada
+ * pregunta (las dos salen de la opción «marks»), así que el resultado llega por este mensaje. Escala 0–100 (grade del
+ * quiz = 100); bandas de Moodle: mingrade ≤ nota < maxgrade (la de arriba hasta 101). Sin cifras fuera de facts:
+ * solo la nota mínima y 100.
+ */
+export interface ExamOverallFeedbackBand {
+  mingrade: number;
+  maxgrade: number;
+  html: string;
+}
+export function examOverallFeedbackBands(passingGrade: number, attempts: number): ExamOverallFeedbackBand[] {
+  if (!Number.isFinite(passingGrade) || passingGrade <= 0 || passingGrade > 100) shellFail(`nota mínima inválida (${passingGrade})`);
+  if (!Number.isInteger(attempts) || attempts < 0) shellFail(`intentos inválidos (${attempts})`);
+  const pass = `Aprobaste esta evaluación: alcanzaste la nota mínima de ${passingGrade} de 100. Ya puedes repasar las respuestas correctas en «${EXAM_EXPLANATIONS_SHORT}», justo debajo.`;
+  const retry = attempts === 1
+    ? `Todavía no alcanzas la nota mínima de ${passingGrade} de 100. Este era tu único intento: las respuestas correctas ya están en «${EXAM_EXPLANATIONS_SHORT}», justo debajo.`
+    : attempts === 0
+      ? `Todavía no alcanzas la nota mínima de ${passingGrade} de 100. Repasa los capítulos y vuelve a intentarlo.`
+      : `Todavía no alcanzas la nota mínima de ${passingGrade} de 100. Repasa los capítulos y vuelve a intentarlo si te quedan intentos; al usarlos todos se habilitan las «${EXAM_EXPLANATIONS_SHORT}».`;
+  return [
+    { mingrade: passingGrade, maxgrade: 101, html: `<p>${pass}</p>` },
+    { mingrade: 0, maxgrade: passingGrade, html: `<p>${retry}</p>` },
+  ];
 }
 
 // ─── Render ───────────────────────────────────────────────────────────────

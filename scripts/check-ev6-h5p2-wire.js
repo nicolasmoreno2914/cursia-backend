@@ -58,14 +58,14 @@ const GOLDEN = {
     'interactivevideo-468': 'e76d7faf1142cbb67e06f1531115d6dcfac35745d88584ddb331d486253de0ce',
     'interactivevideo-1200': '62c10cbbbda74c8b67e56bccb41d9be600a6866c40ca1c01e3482976f4f209b7',
   },
-  // V542 (builder 3.6.0 → 3.9.0: revisión del quiz D|I|C / notas O|C + H5P de una sola copia) — los mismos dorados nuevos que
+  // V542 + QUIZFB (builder 3.6.0 → 3.10.0: revisión del quiz D|I|C / notas O|C, retroalimentación global I|O|C con bandas «aprobaste / todavía no» + H5P de una sola copia) — los mismos dorados nuevos que
   // check-ev6-h5p2-contracts.js (diferencias contra staging verificadas archivo por archivo; ningún blob cambia).
   mbz: {
-    'h5p-final-light': '9dced72ddce5275652895d3988f106a459ecbf5cd6896e2138db29ff6a0f0697',
-    'scorm-nofinal-dark': '9e7762ad4dbc4f04ad8549a3c7d372d8c30baee6847d0ca5045a518804cca4ac',
-    'h5p-nofinal-dark-mock-cleansafe': '036c809e437882f7b6269a8801cb1f0db50d77c1b75d077d7b62b78eb4a6d678',
-    'scorm-final-light': 'bd2776ac86ec521b4e93a7bfebf882ac3d33a855e679699a7fe1060a79661266',
-    'h5p-ev5c-rules1': '4826b2789979ba69de667b0d8c7666651fefb75fb9ac126effcd87edf4de9cbd',
+    'h5p-final-light': '6ce9ebb34eb35f5dcb0149d3db7e3f70e561a2ded63525e863608d53d094af3c',
+    'scorm-nofinal-dark': 'b7aeda95e93f96c31183a116df404267783c3b6eefad15d880aadcd4f08003f0',
+    'h5p-nofinal-dark-mock-cleansafe': 'ab93ce5bbf98a44df60468a2a3a0f7f00fca7d3e676ba7628104a54e4504d83c',
+    'scorm-final-light': '6619628e4579b98d70d5a3b1432b3bc1c314c88b1e88a601ab3601ef329570a4',
+    'h5p-ev5c-rules1': 'c96fb4bbc9945126fb3cbc4f73fc638e1105c1af19d98efe824cd34a1dbda402',
   },
 };
 /** Listas propias de rules 2 (CONGELADO: cambiar cualquiera = reglas 3). */
