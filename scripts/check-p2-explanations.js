@@ -208,10 +208,10 @@ async function main() {
   const RA = await readPkg(builtA.mbz);
   const MA = A.input.manifest;
 
-  await check('(a) bancos: validateMbzV3 sin hallazgos y versión 3.9.0', async () => {
+  await check('(a) bancos: validateMbzV3 sin hallazgos y versión 3.10.0', async () => {
     const v = await V.validateMbzV3(builtA.mbz, builtA.expectations);
     assert(v.ok, JSON.stringify(v.issues.slice(0, 5)));
-    eq(builtA.summary.builderVersion, '3.9.0', 'versión');
+    eq(builtA.summary.builderVersion, '3.10.0', 'versión');
   });
   let pagesA = [];
   await check('(a) una página por quiz, después del quiz, availability exacta a SU quiz, completion 0, downloadcontent 0, fuera de completion.xml, registrada', () => {
@@ -284,7 +284,7 @@ async function main() {
     const k = builtA.expectations.facts.assessment.kinds;
     for (const m of MA.modules.filter((x) => x.examEnabled)) {
       const t = txt(RA.byId(`cv3:exam_info:${m.moduleId}`).intro);
-      const want = `Al terminar cada intento verás tu calificación. Las respuestas correctas y su explicación se habilitan en «Respuestas explicadas» cuando apruebes o cuando uses tus ${k.exam.attempts} intentos.`;
+      const want = `Al terminar cada intento verás si aprobaste; tu calificación queda en Calificaciones. Las respuestas correctas y su explicación se habilitan en «Respuestas explicadas» cuando apruebes o cuando uses tus ${k.exam.attempts} intentos.`;
       assert(t.includes(want), `exam_info ${m.moduleNumber}: ${t.slice(0, 400)}`);
       assert(t.includes(`Preguntas: ${EB.planSlotCount(A.banks.get(m.moduleId).plan)}`), 'preguntas = slots');
     }
@@ -394,7 +394,7 @@ async function main() {
       const t = txt(R.byId(`cv3:exam_info:${m.moduleId}`).intro);
       assert(t.includes('Las respuestas correctas y su explicación se habilitan en «Respuestas explicadas» cuando apruebes.'), t.slice(-300));
     }
-    eq(S.examExplanationsInfoText(1, true), 'Al terminar cada intento verás tu calificación. Las respuestas correctas y su explicación se habilitan en «Respuestas explicadas» cuando apruebes o cuando uses tu único intento.', '1 intento');
+    eq(S.examExplanationsInfoText(1, true), 'Al terminar cada intento verás si aprobaste; tu calificación queda en Calificaciones. Las respuestas correctas y su explicación se habilitan en «Respuestas explicadas» cuando apruebes o cuando uses tu único intento.', '1 intento');
   });
 
   await check('determinista: mismos insumos → mismos bytes', async () => {
