@@ -90,7 +90,13 @@ const URL_RE = /(https?:\/\/|www\.|\bdoi\s*:|\b10\.\d{4,9}\/\S+|\bisbn\b)/i;
 // ─── Lint de prosa del shell (fix round 1, review G5 C1) ───────────────────
 // Los textos LLM que el shell muestra como prosa NO pueden traer cifras: toda
 // cifra visible sale de facts. Se rechaza:
-//  - DIGIT_IN_TEXT: cualquier dígito (la bibliografía queda exenta: años);
+//  - DIGIT_IN_TEXT: una cifra que CUENTA la estructura o la duración del curso («4 capítulos»,
+//    «12 lecciones», «6 semanas»): esas cifras las pone Cursia desde facts. V542 (M1): las demás cifras
+//    se permiten — referencias legales y normativas («Ley 1480 de 2011», «ISO 9001»), plazos del
+//    dominio («15 días hábiles»), montos y porcentajes del contenido —; antes cualquier dígito se
+//    rechazaba y el LLM escribía «Ley mil cuatrocientos ochenta de dos mil once» (los números en
+//    palabras son solo para el guion del audio). Los porcentajes y «capítulo 3» los sigue cubriendo
+//    lintQuantityClaims. La bibliografía queda exenta (años, títulos);
 //  - QUANTITY_CLAIM: número escrito en palabras junto a un sustantivo de
 //    estructura o de tiempo ("tres módulos", "una docena de lecciones");
 //  - FORBIDDEN_CLAIM: afirmaciones que el shell nunca puede respaldar (§E):
@@ -106,6 +112,12 @@ const STRUCTURE_OR_TIME_NOUNS =
   'evaluacion(?:es)?|examen(?:es)?|cuestionarios?|pruebas?|juegos?|presentacion(?:es)?|partes?|secciones?|bloques?)';
 const LB = '(?<![\\p{L}\\p{N}_])';
 const RB = '(?![\\p{L}\\p{N}_])';
+/** Sustantivos que una cifra no puede contar en la prosa del shell: estructura del curso + duración. */
+const DIGIT_COUNTED_NOUNS =
+  '(?:modulos?|capitulos?|videos?|actividad(?:es)?|preguntas?|intentos?|minutos?|horas?|paginas?|semanas?|' +
+  'lecciones|leccion|unidad(?:es)?|sesion(?:es)?|clases?|ejercicios?|creditos?|temas?|diapositivas?|palabras?|niveles?|etapas?|' +
+  'evaluacion(?:es)?|examen(?:es)?|cuestionarios?|pruebas?|juegos?|presentacion(?:es)?|partes?|secciones?|bloques?)';
+const DIGIT_COUNT_RE = new RegExp(`${LB}\\p{Nd}+(?:[.,]\\p{Nd}+)*\\s*(?:[\\p{L}]+\\s+)?${DIGIT_COUNTED_NOUNS}${RB}`, 'gu');
 const NUMBER_WORD_RE = new RegExp(`${LB}${NUMBER_WORDS}\\s+(?:(?:de|del|los|las|sus|[\\p{L}]+)\\s+){0,2}${STRUCTURE_OR_TIME_NOUNS}${RB}`, 'gu');
 const FORBIDDEN_CLAIM_RE = new RegExp(
   `${LB}(?:certificad[oa]s?|certificacion(?:es)?|certificar|diplomas?|pdf|narracion(?:es)? profesional(?:es)?|narrad[oa]s? profesionalmente|locucion profesional|horas|minutos|semanas)${RB}`,
@@ -124,8 +136,8 @@ export interface ShellProseHit {
 /** Lint de los textos LLM que el shell renderiza como prosa (sin cifras, sin afirmaciones prohibidas). */
 export function lintShellProse(text: string): ShellProseHit[] {
   const hits: ShellProseHit[] = [];
-  for (const m of String(text ?? '').matchAll(/\p{Nd}+/gu)) hits.push({ code: 'DIGIT_IN_TEXT', match: m[0] });
   const norm = normalizeLint(text);
+  for (const m of norm.matchAll(DIGIT_COUNT_RE)) hits.push({ code: 'DIGIT_IN_TEXT', match: /\p{Nd}+(?:[.,]\p{Nd}+)*/u.exec(m[0])![0] });
   for (const m of norm.matchAll(NUMBER_WORD_RE)) hits.push({ code: 'QUANTITY_CLAIM', match: m[0] });
   for (const m of norm.matchAll(FORBIDDEN_CLAIM_RE)) hits.push({ code: 'FORBIDDEN_CLAIM', match: m[0] });
   return hits;
@@ -174,7 +186,7 @@ function checkText(v: unknown, path: string, rule: TextRule, errors: ShellValida
     for (const h of lintResourceMentions(v)) errors.push({ path, code: 'RESOURCE_MENTION', message: `menciona un recurso: "${h.match}"` });
     for (const h of lintQuantityClaims(v)) errors.push({ path, code: 'QUANTITY_CLAIM', message: `afirma una cantidad: "${h.match}"` });
     for (const h of lintShellProse(v)) {
-      const what = h.code === 'DIGIT_IN_TEXT' ? 'cifra (las cifras las pone Cursia desde facts)' : h.code === 'FORBIDDEN_CLAIM' ? 'afirmación no respaldada' : 'cantidad en palabras';
+      const what = h.code === 'DIGIT_IN_TEXT' ? 'cifra que cuenta la estructura o la duración del curso (esas cifras las pone Cursia desde facts)' : h.code === 'FORBIDDEN_CLAIM' ? 'afirmación no respaldada' : 'cantidad en palabras';
       errors.push({ path, code: h.code, message: `${what}: "${h.match}"` });
     }
   }
