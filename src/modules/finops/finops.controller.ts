@@ -59,8 +59,8 @@ export class FinopsIngestController {
         const input = llmIngestToChargeInput(parsed);
         const key = costIdempotencyKey('anthropic', { messageId: parsed.messageId });
         const usage = input.usage as Record<string, number>;
-        const c = await this.ledger.correctConservativeLlmCharge(key, usage);
-        if (c) return { corrected: c.corrected, delta: c.delta, idempotencyKey: key };
+        const c = await this.ledger.correctConservativeLlmCharge(key, usage, { ownerId: parsed.subject, model: parsed.model });
+        if (c) return { corrected: c.corrected, delta: c.delta, reason: c.reason ?? null, idempotencyKey: key };
         // El conservador no llegó: el exacto ES el cargo.
       }
       const r = await this.ledger.recordCharge(llmIngestToChargeInput(parsed));

@@ -1212,8 +1212,30 @@ async function dbChecks() {
       const r1 = await ctl.llmUsage({ ...base, messageId: 'msg_583_c1', usage: { input_tokens: 1200, output_tokens: 340, cache_read_input_tokens: 5 }, measurement: 'correction' });
       t = await total('msg_583_c1');
       assert(r1.corrected === true && t.adj.length === 1 && t.total < conservative && t.total > 0, `corregido ${JSON.stringify(r1)} ${t.total} < ${conservative}`);
-      await ctl.llmUsage({ ...base, messageId: 'msg_583_c1', usage: { input_tokens: 1200, output_tokens: 340, cache_read_input_tokens: 5 }, measurement: 'correction' });
-      eq((await total('msg_583_c1')).adj.length, 1, 'repetir = no-op');
+      const again = await ctl.llmUsage({ ...base, messageId: 'msg_583_c1', usage: { input_tokens: 1200, output_tokens: 100, cache_read_input_tokens: 5 }, measurement: 'correction' });
+      eq([again.corrected, again.reason, (await total('msg_583_c1')).adj.length], [false, 'already_corrected', 1], 'fix round 2 (N2): una segunda corrección (aun más baja) se rechaza');
+      eq(t.adj[0].metadata.conservativeStatus, 'corrected', 'marca «corrected» en el ADJUSTMENT (ledger append-only)');
+      // N2: la corrección solo puede quitar el relleno de output — nada más.
+      const mk = async (mid) => ctl.llmUsage({ ...base, messageId: mid, usage: { input_tokens: 1200, output_tokens: 3500, cache_read_input_tokens: 5 }, measurement: 'conservative' });
+      const corr = (mid, usage, extra) => ctl.llmUsage({ ...base, ...(extra || {}), messageId: mid, usage, measurement: 'correction' });
+      for (const [mid, usage, extra, reason] of [
+        ['msg_583_n2a', { input_tokens: 1100, output_tokens: 340, cache_read_input_tokens: 5 }, null, 'input_tokens_mismatch'],
+        ['msg_583_n2b', { input_tokens: 1200, output_tokens: 340, cache_read_input_tokens: 0 }, null, 'cache_read_tokens_mismatch'],
+        ['msg_583_n2c', { input_tokens: 1200, output_tokens: 3600, cache_read_input_tokens: 5 }, null, 'output_above_conservative'],
+        ['msg_583_n2d', { input_tokens: 1200, output_tokens: 340, cache_read_input_tokens: 5 }, { model: 'claude-haiku-4-5' }, 'model_mismatch'],
+        ['msg_583_n2e', { input_tokens: 1200, output_tokens: 340, cache_read_input_tokens: 5 }, { subject: '99999999-2222-4333-8444-555555555555', itemRunId: null }, 'owner_mismatch'],
+      ]) {
+        await mk(mid);
+        const before = (await total(mid)).total;
+        const rr = await corr(mid, usage, extra);
+        eq([rr.corrected, rr.reason, (await total(mid)).total, (await total(mid)).adj.length], [false, reason, before, 0], `rechazada: ${reason}`);
+      }
+      // Exacto == conservador (output 3500): igual queda la marca (delta 0) y es única.
+      await mk('msg_583_n2f');
+      const eqr = await corr('msg_583_n2f', { input_tokens: 1200, output_tokens: 3500, cache_read_input_tokens: 5 });
+      const tf = await total('msg_583_n2f');
+      eq([eqr.corrected, tf.adj.length, Number(tf.adj[0].amount)], [true, 1, 0], 'marca con delta 0');
+      eq((await corr('msg_583_n2f', { input_tokens: 1200, output_tokens: 10, cache_read_input_tokens: 5 })).reason, 'already_corrected', 'después ya no baja');
       // 2) corrección sin conservador previo → el exacto es el cargo.
       await ctl.llmUsage({ ...base, messageId: 'msg_583_c2', usage: { input_tokens: 10, output_tokens: 20 }, measurement: 'correction' });
       t = await total('msg_583_c2');
