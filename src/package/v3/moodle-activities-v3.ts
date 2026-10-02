@@ -45,12 +45,20 @@ function sha1(s: string): string {
  * D(URING)=0x10000, I(MMEDIATELY_AFTER)=0x1000, O(PEN, "later while
  * open")=0x100, C(LOSE, "after close")=0x10. Probado en Moodle 4.5.14+
  * contra una restauración real — ver `scratchpad/r18/P2-design.md` §1.
+ *
+ * V542 (I4, builder 3.7.0): `reviewattempt` incluye I y O. Sin ellos, Moodle
+ * redirige a review.php al terminar el intento y lo devuelve a view.php con
+ * «No tiene permiso para revisar este cuestionario». Con I|O el estudiante
+ * revisa SUS respuestas y su nota (por pregunta y total), pero corrección
+ * («Correcta/Incorrecta»), retroalimentación específica y general y la
+ * respuesta correcta siguen solo en C: las respuestas correctas se ven
+ * únicamente en «Respuestas explicadas» (P2-B4).
  */
 export const QUIZ_REVIEW_V3 = {
-  reviewattempt: 65552, // D|C — sin página de revisión del intento hasta el cierre
+  reviewattempt: 69904, // D|I|O|C — página de revisión con las respuestas propias (V542 I4)
   reviewcorrectness: 16, // C
   reviewmaxmarks: 69904, // D|I|O|C
-  reviewmarks: 4368, // I|O|C — columna de nota en la vista de intentos
+  reviewmarks: 4368, // I|O|C — nota por pregunta y columna de nota en la vista de intentos
   reviewspecificfeedback: 16, // C
   reviewgeneralfeedback: 16, // C
   reviewrightanswer: 16, // C

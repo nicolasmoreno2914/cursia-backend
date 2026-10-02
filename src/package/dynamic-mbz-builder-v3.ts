@@ -192,8 +192,11 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * solo al aprobar o agotar los intentos (availability e=1 | e=3, show:false, downloadcontent 0);
  * la info del examen la anuncia; nota para docentes (acceso condicional, intentos adicionales) en el
  * label oculto del certificado o en `cv3:shell:exams_teacher` al inicio de la primera evaluación.
+ * 3.7.0 (V542 I4): `reviewattempt` = D|I|O|C — al terminar un intento el estudiante revisa sus
+ * respuestas y su nota (sin corrección, feedback ni respuesta correcta antes del cierre) en vez de
+ * rebotar con «No tiene permiso para revisar este cuestionario».
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.6.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.7.0';
 
 // EV6 P2-B5: `examExplanationsAvailability` vive en course-shell/exam-explanations (lo usa también el validador).
 export { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';

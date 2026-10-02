@@ -24,7 +24,7 @@
  *                                          completion del curso del backup, setting badges = 1,
  *                                          imagen f1/f2/f3 PNG, examen final como criterio y el
  *                                          panel «Tu certificado» con $@BADGESVIEWBYID*curso@$
- *   QUIZ_REVIEW / QUIZ_COMPLETION          EV6 P2-B1: revisión solo con nota; attemptsexhausted = intentos > 0
+ *   QUIZ_REVIEW / QUIZ_COMPLETION          EV6 P2-B1: revisión = respuestas propias + nota (V542 I4), sin corrección/feedback/respuesta; attemptsexhausted = intentos > 0
  *   QUIZ_RANDOM / EXPLANATIONS_GATE /      EV6 P2-B5 (exam-validator-v3.ts): banco aleatorio por hoja,
  *   ANSWER_LEAK                            página «Respuestas explicadas» gated por SU quiz, ningún par
  *                                          enunciado + respuesta correcta fuera de su página

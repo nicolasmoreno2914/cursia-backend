@@ -7,7 +7,7 @@
 // el gate de notas: no son el objeto de esta prueba.
 //
 // Aserciones (P2-design §1.2/§1.3/§2.2, rulings 1–3):
-//  config restaurada  revisión = solo nota (8 campos §1.3), completionattemptsexhausted = intentos > 0,
+//  config restaurada  revisión = respuestas propias + nota (8 campos §1.3; V542 I4: reviewattempt D|I|O|C), completionattemptsexhausted = intentos > 0,
 //                     cm 2/0/1; slots todos aleatorios (banco: cada filtercondition → hoja del contexto
 //                     del quiz, includesubcategories false) o todos fijos (GIFT); Σ maxmark = 100;
 //                     página «Respuestas explicadas»: misma sección, justo después del quiz,
@@ -15,8 +15,10 @@
 //                     intentos ilimitados), completion 0, downloadcontent 0, fuera de los criterios.
 //  A (intentos > 0)   reprueba el primer examen de módulo hasta agotarlo: con intentos restantes
 //                     INCOMPLETE y página BLOQUEADA; agotado COMPLETE_FAIL y página DISPONIBLE; tras
-//                     cada intento: sin página de revisión, sin corrección, sin respuesta correcta, sin
-//                     feedback (solo la nota); luego aprueba todo lo demás → curso NO completo, sin insignia.
+//                     cada intento: página de revisión PERMITIDA (V542 I4: sin el aviso «No tiene permiso
+//                     para revisar este cuestionario») que, renderizada como el estudiante, muestra sus
+//                     respuestas y la nota por pregunta pero NO corrección, respuesta correcta, feedback
+//                     específico (por opción) ni general; luego aprueba todo lo demás → curso NO completo, sin insignia.
 //  U (intentos = 0)   reprueba 2 veces → página bloqueada (aunque Moodle ya marque COMPLETE_FAIL); aprueba
 //                     → página disponible; aprueba lo demás → curso completo.
 //  B                  aprueba al primer intento → COMPLETE_PASS, página disponible; aprueba lo demás →
@@ -45,7 +47,7 @@ use mod_quiz\quiz_attempt;
 use mod_quiz\quiz_settings;
 use mod_quiz\question\display_options;
 
-global $DB, $CFG;
+global $DB, $CFG, $PAGE;
 $CFG->noemailever = true;
 $courseid = (int)$argv[2];
 $outfile = $argv[3];
@@ -77,7 +79,7 @@ $moduleExams = array_values(array_filter(array_keys($quizzes), fn($k) => str_sta
 $final = isset($quizzes['cv3:final_exam']) ? 'cv3:final_exam' : null;
 $criteria = array_map('intval', $DB->get_fieldset_select('course_completion_criteria', 'moduleinstance', 'course = ? AND criteriatype = 4', [$courseid]));
 
-$REVIEW = ['reviewattempt' => 65552, 'reviewcorrectness' => 16, 'reviewmaxmarks' => 69904, 'reviewmarks' => 4368,
+$REVIEW = ['reviewattempt' => 69904, 'reviewcorrectness' => 16, 'reviewmaxmarks' => 69904, 'reviewmarks' => 4368,
     'reviewspecificfeedback' => 16, 'reviewgeneralfeedback' => 16, 'reviewrightanswer' => 16, 'reviewoverallfeedback' => 16];
 
 /** Slot → categoría del filtercondition restaurado (null si el slot es fijo). */
@@ -98,7 +100,7 @@ foreach ($quizzes as $idn => $Q) {
     $ctx = context_module::instance($cm->id);
     $attempts = (int)$q->attempts;
     $got = []; foreach ($REVIEW as $k => $v) $got[$k] = (int)$q->$k;
-    check("$idn: revisión solo con nota (8 campos §1.3)", $got === $REVIEW, $got);
+    check("$idn: revisión = respuestas propias + nota, sin corrección/feedback/respuesta (8 campos §1.3 + V542 I4)", $got === $REVIEW, $got);
     check("$idn: completionattemptsexhausted = intentos > 0 ($attempts)", (int)$q->completionattemptsexhausted === ($attempts > 0 ? 1 : 0), (int)$q->completionattemptsexhausted);
     check("$idn: cm completion 2/0/1", [(int)$cm->completion, (string)$cm->completiongradeitemnumber, (int)$cm->completionpassgrade] === [2, '0', 1],
         [$cm->completion, $cm->completiongradeitemnumber, $cm->completionpassgrade]);
@@ -208,7 +210,15 @@ function attempt($idn, $user, $correct) {
         'rightanswer' => (int)$o->rightanswer, 'feedback' => (int)$o->feedback, 'generalfeedback' => (int)$o->generalfeedback];
     $qs = quiz_settings::create($ao->get_quizid(), $user->id);
     [$some] = quiz_get_combined_reviewoptions($qs->get_quiz(), quiz_get_user_attempts($ao->get_quizid(), $user->id, 'finished', true));
-    $view = ['gradeColumn' => $some->marks >= display_options::MARK_AND_MAX, 'reviewLink' => (bool)$some->attempt];
+    // Enlace «Revisión» de la tabla de intentos de view.php (access_manager::make_review_link, la misma regla
+    // que usa review.php para dejar pasar o rebotar con «No tiene permiso para revisar este cuestionario»).
+    global $PAGE;
+    $PAGE = new moodle_page();
+    $PAGE->set_url('/mod/quiz/view.php', ['id' => $cm->id]);
+    $PAGE->set_context(context_module::instance($cm->id));
+    $link = $qs->get_access_manager(time())->make_review_link($ao->get_attempt(), null, $PAGE->get_renderer('mod_quiz'));
+    $view = ['gradeColumn' => $some->marks >= display_options::MARK_AND_MAX, 'reviewLink' => str_contains($link, '/mod/quiz/review.php')];
+    $review['page'] = render_review($ao, $cm);
     \core\session\manager::set_user(get_admin());
     if ($filters) {
         ksort($perleaf); $want = $config[$idn]['leafRefs']; ksort($want);
@@ -217,10 +227,55 @@ function attempt($idn, $user, $correct) {
     }
     return ['id' => (int)$a->id, 'grade' => $grade, 'review' => $review, 'view' => $view];
 }
+/**
+ * V542 I4: renderiza la página de revisión del intento COMO EL ESTUDIANTE (antes del cierre), igual que
+ * review.php, y busca lo que NO debe aparecer: corrección por opción, respuesta correcta, feedback
+ * específico (incluido el texto del feedback de la opción elegida) y general. Sí debe verse la nota.
+ */
+function render_review($ao, $cm) {
+    global $PAGE;
+    $PAGE = new moodle_page();
+    $PAGE->set_url('/mod/quiz/review.php', ['attempt' => $ao->get_attemptid()]);
+    $PAGE->set_context(context_module::instance($cm->id));
+    $PAGE->set_cm($cm);
+    $renderer = $PAGE->get_renderer('mod_quiz');
+    $leaks = []; $graded = 0; $n = 0;
+    foreach ($ao->get_slots() as $slot) {
+        $n++;
+        $qa = $ao->get_question_attempt($slot);
+        $q = $qa->get_question();
+        $html = $ao->render_question($slot, true, $renderer, $ao->review_url($slot));
+        $text = html_entity_decode(strip_tags($html), ENT_QUOTES | ENT_HTML5);
+        $why = [];
+        foreach (['rightanswer', 'generalfeedback', 'specificfeedback', 'outcome'] as $cls) {
+            if (preg_match('/class="[^"]*\b' . $cls . '\b/', $html)) $why[] = "div.$cls";
+        }
+        if (preg_match('/class="r\d+ (correct|incorrect|partiallycorrect)\b/', $html)) $why[] = 'opción marcada correcta/incorrecta';
+        if (preg_match('/class="[^"]*\b(correct|incorrect|partiallycorrect)\b[^"]*"[^>]*>\s*(?:<[^>]+>\s*)*(Correct|Incorrect|Partially correct|Correcta|Incorrecta)/i', $html)) $why[] = 'estado correcta/incorrecta';
+        $gf = trim(html_entity_decode(strip_tags((string)$q->generalfeedback), ENT_QUOTES | ENT_HTML5));
+        if ($gf !== '' && str_contains($text, $gf)) $why[] = 'texto del feedback general';
+        $type = $q->get_type_name();
+        if ($type === 'multichoice' || $type === 'truefalse') {
+            $resp = $qa->get_last_qt_data();
+            if (isset($resp['answer'])) {
+                if ($type === 'multichoice') { $order = $q->get_order($qa); $fbraw = $q->answers[$order[(int)$resp['answer']]]->feedback ?? ''; }
+                else { $fbraw = (int)$resp['answer'] ? $q->truefeedback : $q->falsefeedback; }
+                $fb = trim(html_entity_decode(strip_tags((string)$fbraw), ENT_QUOTES | ENT_HTML5));
+                if ($fb !== '' && str_contains($text, $fb)) $why[] = 'texto del feedback de la opción elegida';
+            }
+        }
+        if (preg_match('/class="grade"/', $html)) $graded++;
+        if ($why) $leaks[$slot] = $q->name . ': ' . implode(', ', $why);
+    }
+    return ['questions' => $n, 'withMark' => $graded, 'leaks' => $leaks];
+}
 function assert_marks_only($label, $r) {
-    check("$label: tras el intento solo la nota (sin página de revisión, corrección, respuesta correcta ni feedback); nota visible en la vista del quiz",
-        $r['review']['attempt'] === false && $r['review']['correctness'] === 0 && $r['review']['rightanswer'] === 0 && $r['review']['feedback'] === 0
-        && $r['review']['generalfeedback'] === 0 && $r['review']['marks'] >= display_options::MARK_AND_MAX && $r['view']['gradeColumn'] === true && $r['view']['reviewLink'] === false, $r);
+    check("$label: tras el intento se puede revisar (sin «No tiene permiso para revisar»): respuestas propias y nota, SIN corrección, respuesta correcta ni feedback; nota visible en la vista del quiz",
+        $r['review']['attempt'] === true && $r['review']['correctness'] === 0 && $r['review']['rightanswer'] === 0 && $r['review']['feedback'] === 0
+        && $r['review']['generalfeedback'] === 0 && $r['review']['marks'] >= display_options::MARK_AND_MAX && $r['view']['gradeColumn'] === true && $r['view']['reviewLink'] === true, $r);
+    $p = $r['review']['page'];
+    check("$label: página de revisión renderizada como el estudiante: {$p['questions']} preguntas, nota en cada una, 0 fugas de respuesta/feedback",
+        $p['questions'] > 0 && $p['withMark'] === $p['questions'] && !$p['leaks'], $p);
 }
 /** Aprueba (nota real) todo criterio de completion que no es un quiz. */
 function pass_non_quiz($user) {
@@ -315,6 +370,15 @@ if ($N > 0) {
 $B = student('B');
 $r = attempt($exam, $B, true);
 assert_marks_only("B $exam intento 1 aprobado", $r);
+// Control del detector de fugas (V542 I4): tras el cierre (timeclose en el pasado, AFTER_CLOSE) la MISMA
+// página sí revela respuesta correcta y feedback → el detector debe encontrarlos; luego se reabre el quiz.
+$DB->set_field('quiz', 'timeclose', time() - 60, ['id' => $quizzes[$exam]['cm']->instance]);
+\core\session\manager::set_user($B);
+$closed = render_review(quiz_attempt::create($r['id']), $quizzes[$exam]['cm']);
+\core\session\manager::set_user(get_admin());
+$DB->set_field('quiz', 'timeclose', 0, ['id' => $quizzes[$exam]['cm']->instance]);
+check("control: tras el cierre el detector SÍ ve respuesta/feedback ({$closed['questions']} preguntas, " . count($closed['leaks']) . ' con revelación)',
+    $closed['questions'] > 0 && count($closed['leaks']) === $closed['questions'], $closed);
 $s = state($B, $exam);
 $steps['B'][] = ['step' => 'intento 1 aprobado', 'grade' => $r['grade']] + $s;
 check("B $exam aprobado al primer intento: COMPLETE_PASS y página DISPONIBLE", $s['completion'] === 'COMPLETE_PASS' && $open($s) && $r['grade'] >= 99.99, $s);
