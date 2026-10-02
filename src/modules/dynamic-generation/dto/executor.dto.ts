@@ -84,6 +84,16 @@ export class FailItemDto extends ExecutorBaseDto {
 
   @IsBoolean()
   retryable: boolean;
+
+  /**
+   * BANKOPT (1e): artifact `dynamic_exam_bank_draft_json` con las preguntas válidas de un banco de examen
+   * incompleto (solo exam/final_exam retryable; el servidor verifica dueño, tipo e itemRunId y si no
+   * corresponde lo ignora). `null` explícito = borrar el borrador anterior (falla de reglas del banco sin
+   * faltante); ausente = conservarlo (fail transitorio). Ver exam-bank-draft.ts.
+   */
+  @IsOptional()
+  @IsUUID('all')
+  examBankDraftArtifactId?: string;
 }
 
 /**

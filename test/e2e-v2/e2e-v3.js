@@ -736,8 +736,12 @@ function reservationBookkeeping(ev) {
       const kinds = ['experience', 'course_intro', 'module_intro', 'video_interactions', 'h5p_questionset', 'h5p_dragtext', 'h5p_blanks', 'exam_bank'];
       eq(kinds.map((k) => llm.st.invalidSent[k] || 0), kinds.map(() => 1), `LLM falso: exactamente 1 respuesta inválida por cada uno de los ${kinds.length} tipos v3`);
       eq(kinds.map((k) => llm.st.retriesSeen[k] || 0), kinds.map(() => 1), 'cada respuesta inválida produjo EXACTAMENTE 1 reintento dirigido (validation_retry / continuation) y luego pasó');
-      // P2-B6 (A2): bancos — falla inyectada una vez, EXACTAMENTE una reparación, y el item que la recibió
-      // la registra (rechazos EVIDENCE + LENGTH_BIAS, 2 reparadas); ningún otro banco necesitó reparación.
+      // P2-B6 (A2): bancos — falla inyectada una vez (más rechazos que la holgura de la hoja, BANKOPT),
+      // EXACTAMENTE una reparación con lo que falta, y el item que la recibió la registra (rechazos
+      // EVIDENCE + LENGTH_BIAS, 2 reparadas); ningún otro banco necesitó reparación.
+      // BANKOPT (caché): todo prompt de banco llegó como [fuente+cache_control, tarea+cache_control, tail].
+      const shapes = (llm.st.examBank && llm.st.examBank.blockShapes) || [];
+      ok(shapes.length > 0 && shapes.every((x) => JSON.stringify(x) === JSON.stringify(['ephemeral', 'ephemeral', null])), `bancos: ${shapes.length} prompts con cache_control en fuente y tarea`, shapes.slice(0, 5));
       const bankCalls = llm.st.v3calls.filter((x) => /^(exam_bank|final_exam_bank|exam_bank_repair)$/.test(x.kind));
       const repairs = bankCalls.filter((x) => x.kind === 'exam_bank_repair');
       ok(repairs.length === 1 && (llm.st.examBank.faults || []).length === 1, `bancos: exam_bank_repair registrado UNA vez (${bankCalls.length} llamadas de banco al LLM falso, ${repairs.length} reparación)`, { repairs, faults: llm.st.examBank.faults });

@@ -67,6 +67,10 @@ export class ExecutorController {
     @Body() dto: FailItemDto,
     @CurrentUser() user: AuthUser,
   ): Promise<ItemOpResult> {
-    return this.scheduler.failItemDetailed(id, dto.executorId, dto.error, dto.retryable, user.id);
+    return this.scheduler.failItemDetailed(
+      id, dto.executorId, dto.error, dto.retryable, user.id,
+      // id = borrador nuevo; null explícito = borrar el anterior (R4); ausente = conservar.
+      dto.examBankDraftArtifactId !== undefined ? { examBankDraftArtifactId: dto.examBankDraftArtifactId } : undefined,
+    );
   }
 }

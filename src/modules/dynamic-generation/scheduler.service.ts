@@ -71,6 +71,7 @@ import {
   videoClaimFacts,
 } from '../course-shell';
 import { V3_ARTIFACT_TEXT_READER, V3ArtifactTextReader } from './v3-artifact-reader';
+import { EXAM_BANK_DRAFT_ARTIFACT_TYPE, clearExamBankDraft, recordExamBankDraft } from './exam-bank-draft';
 
 export type ItemType = ManifestItemType;
 
@@ -831,6 +832,8 @@ export class SchedulerService {
         }
       }
 
+      // BANKOPT fix round 1 (M4): el borrador del banco solo sirve entre intentos; al completar se quita.
+      if (merged.merged && typeof merged.merged === 'object') delete (merged.merged as Record<string, unknown>).examBankDraft;
       const done = returningRows(
         await qr.query(
           `update public.generation_item_runs
@@ -867,11 +870,20 @@ export class SchedulerService {
     error: string,
     retryable: boolean,
     ownerId?: string,
-    opts?: { retryAfterSeconds?: number; refundAttempt?: boolean; grantAttempt?: boolean },
+    /** examBankDraftArtifactId: id = borrador nuevo; null = borrar el anterior (falla sin faltante); ausente = conservar. */
+    opts?: { retryAfterSeconds?: number; refundAttempt?: boolean; grantAttempt?: boolean; examBankDraftArtifactId?: string | null },
   ): Promise<ItemOpResult> {
     executorId = this.checkExecutorId(executorId);
     const msg = String(error ?? '').trim().slice(0, MAX_ERROR_LENGTH) || 'unknown_error';
     return this.guardedItemOp(itemRunId, executorId, ownerId, 'update', async (qr, job, item) => {
+      // BANKOPT (1e): borrador del banco de un examen incompleto (validado; si no corresponde, se ignora).
+      // Fix round 4 (R4): el borrador anterior se borra SOLO con `examBankDraftArtifactId: null` explícito
+      // (el ejecutor lo manda ante una falla de reglas del banco SIN faltante, N2). Un fail transitorio (error
+      // de red/LLM, subida fallida, 409 al completar, borrador que no se pudo subir) llega sin el campo y lo
+      // conserva: un intento interrumpido no es una falla nueva.
+      const d = await recordExamBankDraft(qr, item, job.owner_id, opts?.examBankDraftArtifactId ?? null, !!retryable);
+      if (d.recorded === false && opts?.examBankDraftArtifactId) this.logger.warn(`failItem ${item.id}: borrador del banco ignorado (${d.reason})`);
+      if (d.recorded === false && opts?.examBankDraftArtifactId === null) await clearExamBankDraft(qr, item);
       const t = await applyItemFailure(
         qr, item.id, msg, !!retryable, opts?.retryAfterSeconds ?? null, opts?.refundAttempt === true, opts?.grantAttempt === true,
       );
@@ -1221,7 +1233,8 @@ export class SchedulerService {
     if (row.type === 'exam' || row.type === 'final_exam') {
       // EV6 P2: plan del banco (el mismo que valida completeItem). Sin capítulos → sin bloque (el GIFT sigue aceptado).
       const facts = examBankClaimFacts(manifest as any, row.type, row.module_id ?? mItem.moduleId ?? null);
-      if (facts) out.examBank = facts;
+      // BANKOPT (1e): anuncia que el fail acepta `examBankDraftArtifactId` (borrador entre intentos).
+      if (facts) out.examBank = { ...facts, draftArtifactType: EXAM_BANK_DRAFT_ARTIFACT_TYPE };
     }
     if (row.type === 'module_intro') {
       const mod = manifest.modules.find((m) => m.moduleId === row.module_id);

@@ -403,14 +403,14 @@ async function main() {
   // ── 4. Empaque ──
   const OWNER = '11111111-2222-4333-8444-555555555555';
   const RUN_ID = '22222222-1111-4111-8111-111111111111';
-  function runFixture(examMode, mutateBank) {
+  function runFixture(examMode, mutateBank, extraMd) {
     const input = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true, courseId: 734 });
     const manifest = input.manifest;
     const allChapters = manifest.modules.flatMap((m) => m.chapters.map((c) => ({ id: c.chapterId, moduleId: m.moduleId })));
     const gIndex = new Map(allChapters.map((c, i) => [c.id, i]));
     if (examMode === 'bank') {
       // el Markdown del capítulo trae las frases de evidencia del banco
-      for (const c of allChapters) input.contents.contentMd.set(c.id, `${input.contents.contentMd.get(c.id)}\n\n${EBF.chapterMarkdown(gIndex.get(c.id), 'Reglas')}`);
+      for (const c of allChapters) input.contents.contentMd.set(c.id, `${input.contents.contentMd.get(c.id)}\n\n${EBF.chapterMarkdown(gIndex.get(c.id), 'Reglas')}${extraMd ? '\n\n' + extraMd : ''}`);
     }
     const files = new Map();
     const rows = [];
@@ -499,6 +499,35 @@ async function main() {
     assert(err && err.name === 'PackagingNotReadyError' && err.missing.some((m) => /^exam:.*:EXAM_ARTIFACT_AMBIGUOUS=dynamic_exam_bank_json\+dynamic_exam_gift$/.test(m)), `ambiguo: ${err && (err.missing || err.message)}`);
   });
 
+  await check('BANKOPT fix round 4 (R2): un banco aceptado ANTES de la guardia de oración (sin bankValidationVersion) cuya evidencia es un fragmento de una oración negada SIGUE empaquetando; el mismo banco declarado v2 → EXAM_BANK_INVALID; al completar (reglas vigentes) se rechaza', async () => {
+    const NEG = 'No se permite abrir el tablero eléctrico de la sala de bombas con las manos húmedas o sin guantes.';
+    const FRAG = 'se permite abrir el tablero eléctrico de la sala de bombas con las manos húmedas';
+    const mut = (version) => (type, bank) => { if (type === 'final_exam') { bank.questions[0].evidence = FRAG; if (version) bank.bankValidationVersion = version; } };
+    // Pre-round-3 (sin versión): el empaque re-valida con reglas v1 (subcadena) → carga y construye.
+    const f1 = runFixture('bank', mut(null), NEG);
+    const { loaded } = await load(f1);
+    eq(loaded.exams.final.kind, 'bank', 'banco v1 cargado');
+    const built = await B.buildDynamicMbzV3({ ...f1.input, contents: loaded.contents });
+    assert(Buffer.isBuffer(built.mbz) && built.mbz.length > 0, 'el builder empaqueta el banco v1');
+    // bankValidationVersion 1 explícito: igual.
+    await load(runFixture('bank', mut(1), NEG));
+    // Declarado v2 (aceptado con la guardia): el empaque aplica la guardia → falla fuerte.
+    await rejects(load(runFixture('bank', mut(2), NEG)), /^EXAM_BANK_INVALID: final_exam:\d+ \[EXAM_BANK_EVIDENCE\]/, 'banco v2 con evidencia negada');
+    // Al completar (reglas vigentes, sin importar la versión declarada) el mismo banco se rechaza.
+    const fin = JSON.parse(f1.input.contents ? JSON.stringify(EBF.makeExamBank({ scope: 'final', moduleId: null, chapters: f1.manifest.modules.flatMap((m) => m.chapters.map((c) => ({ id: c.chapterId, moduleId: m.moduleId }))), chapterIndex: new Map(f1.manifest.modules.flatMap((m) => m.chapters.map((c) => c.chapterId)).map((id, i) => [id, i])), plan: EB.expectedExamPlan('final', f1.manifest.modules.flatMap((m) => m.chapters.map((c) => ({ id: c.chapterId, moduleId: m.moduleId })))) })) : '{}');
+    fin.questions[0].evidence = FRAG;
+    const chs = f1.manifest.modules.flatMap((m) => m.chapters.map((c) => ({ id: c.chapterId, moduleId: m.moduleId })));
+    const md = new Map(chs.map((c, i) => [c.id, `${EBF.chapterMarkdown(i, 'Reglas')}\n\n${NEG}`]));
+    const atComplete = EB.validateExamBank(fin, { scope: 'final', chapters: chs, chapterMd: md });
+    assert(!atComplete.ok && atComplete.errors.some((e) => e.code === 'EXAM_BANK_EVIDENCE' && /NIEGA/.test(e.message)), JSON.stringify(atComplete.errors.slice(0, 3)));
+    eq(EB.validateExamBank(fin, { scope: 'final', chapters: chs, chapterMd: md, evidenceRules: 'asAccepted' }).ok, true, 'asAccepted sin versión = v1');
+    // Versión inválida → esquema.
+    eq(EB.validateExamBank({ ...fin, bankValidationVersion: 3 }, { scope: 'final', chapters: chs, chapterMd: md, evidenceRules: 'asAccepted' }).errors.some((e) => e.path === '$.bankValidationVersion'), true, 'versión 3 inválida');
+    // El claim anuncia la versión vigente.
+    const S = loadDist('modules/course-shell/index.js');
+    eq(S.EXAM_BANK_VALIDATION_VERSION, 2, 'versión vigente');
+  });
+
   await check('empaque (C2): bancos con plan congelado en OTRO orden que el Manifest actual (reorden posterior) → se cargan (no EXAM_BANK_INVALID) y llegan al builder', async () => {
     const f = runFixture('bank', (type, bank, { chs, gIndex }) => {
       const rev = [...chs].reverse();
@@ -526,6 +555,50 @@ async function main() {
       eq(sha(direct.mbz), sha(base.mbz), 'sha = builder de la base');
       console.log(`   sha256 GIFT (h5p, 734): ${sha(direct.mbz)}`);
     }
+  });
+
+  await check('BANKOPT: bankAskCount = lo que pide el ejecutor (MC 2s+2, V/F y EM 2s+1), nunca más que bankMax; el banco subido sigue con bankTarget', () => {
+    for (const sl of [1, 2, 5, 12]) {
+      eq([EB.bankAskCount(sl, 'multichoice'), EB.bankAskCount(sl, 'truefalse'), EB.bankAskCount(sl, 'match')], [2 * sl + 2, 2 * sl + 1, 2 * sl + 1], 'slots ' + sl);
+      assert(EB.bankAskCount(sl, 'multichoice') <= EB.bankMax(sl), 'dentro del máximo del contrato');
+      eq(EB.bankTarget(sl), 2 * sl, 'objetivo sin cambio (2×)');
+    }
+  });
+  await check('BANKOPT fix round 3: validateExamBank exige que la oración AFIRME la evidencia — fragmento de oración afirmativa ✓; «No [fragmento]» y «[fragmento], excepto…» / «… solo si…» → EXAM_BANK_EVIDENCE; la negación o la excepción DENTRO de la evidencia vale', () => {
+    const md = [
+      '# Sala de bombas',
+      '- El operario revisa la válvula de control de la bomba principal antes de iniciar cada turno de trabajo.',
+      '- No se permite abrir el tablero eléctrico de la sala de bombas con las manos húmedas o sin guantes dieléctricos.',
+      '- Todos los equipos de la sala se lavan semanalmente con agua tratada, excepto el filtro de cartucho del spa interior.',
+      '- La bomba de recirculación se apaga durante la noche solo si el nivel del tanque de compensación supera el mínimo.',
+    ].join('\n');
+    const S = (ev) => EB.examEvidenceSupport(md, ev);
+    eq(S('El operario revisa la válvula de control de la bomba principal'), { ok: true }, 'afirmativa');
+    eq(S('se permite abrir el tablero eléctrico de la sala de bombas con las manos húmedas'), { ok: false, reason: 'negated' }, 'No [fragmento]');
+    eq(S('Todos los equipos de la sala se lavan semanalmente con agua tratada'), { ok: false, reason: 'conditioned' }, '[fragmento], excepto');
+    eq(S('La bomba de recirculación se apaga durante la noche'), { ok: false, reason: 'conditioned' }, '[fragmento] solo si');
+    eq(S('No se permite abrir el tablero eléctrico de la sala de bombas con las manos húmedas'), { ok: true }, 'negación dentro');
+    eq(S('Todos los equipos de la sala se lavan semanalmente con agua tratada, excepto el filtro de cartucho del spa interior.'), { ok: true }, 'excepción dentro');
+    eq(S('La bomba se lava con agua de lluvia'), { ok: false, reason: 'missing' }, 'no está');
+    // En validateExamBank (completeItem): misma regla.
+    const chs = [{ id: 'c1', moduleId: 'm1' }];
+    const q = { id: 'X-01', type: 'truefalse', chapterId: 'c1', level: 'aplicar', stem: 'Afirmación sobre el tablero eléctrico de la sala de bombas.', explanation: 'El capítulo prohíbe abrir el tablero con las manos húmedas: es un riesgo eléctrico directo.', evidence: 'se permite abrir el tablero eléctrico de la sala de bombas con las manos húmedas', answer: false, whyWrong: 'Quien marca verdadero ignora la prohibición del capítulo.' };
+    const errs = EB.validateExamBank({ questions: [q] }, { scope: 'module', chapters: chs, chapterMd: new Map([['c1', md]]) }).errors.filter((e) => e.code === 'EXAM_BANK_EVIDENCE');
+    assert(errs.length === 1 && /NIEGA/.test(errs[0].message), JSON.stringify(errs));
+    const ok = EB.validateExamBank({ questions: [{ ...q, evidence: 'No se permite abrir el tablero eléctrico de la sala de bombas con las manos húmedas' }] }, { scope: 'module', chapters: chs, chapterMd: new Map([['c1', md]]) }).errors.filter((e) => e.code === 'EXAM_BANK_EVIDENCE');
+    eq(ok, [], 'la evidencia completa con su negación vale');
+  });
+  await check('BANKOPT: FailItemDto acepta examBankDraftArtifactId (UUID, opcional) y rechaza otra cosa; whitelist estricta como en main.ts', async () => {
+    const { plainToInstance } = require('class-transformer');
+    const { validate } = require('class-validator');
+    const { FailItemDto } = loadDist('modules/dynamic-generation/dto/executor.dto.js');
+    const errs = async (body) => (await validate(plainToInstance(FailItemDto, body), { whitelist: true, forbidNonWhitelisted: true })).map((e) => e.property).sort();
+    const base = { executorId: 'ex-1', error: 'EXAM_BANK_INCOMPLETE: x', retryable: true };
+    eq(await errs(base), [], 'sin borrador');
+    eq(await errs({ ...base, examBankDraftArtifactId: '0b6b6b6b-0000-4000-8000-000000000001' }), [], 'con borrador');
+    eq(await errs({ ...base, examBankDraftArtifactId: 'no-es-uuid' }), ['examBankDraftArtifactId'], 'no UUID');
+    eq(await errs({ ...base, examBankDraftArtifactId: null }), [], 'null explícito = sin borrador (fix round 2, N2: borra el anterior)');
+    eq(await errs({ ...base, draft: 'x' }), ['draft'], 'otro campo sigue rechazado');
   });
 
   console.log(`\n${passes} OK, ${failures} FALLAS`);
