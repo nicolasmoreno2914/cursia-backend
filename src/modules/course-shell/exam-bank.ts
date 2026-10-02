@@ -260,19 +260,75 @@ export const EXAM_EVIDENCE_PREFIX_CONDITIONS: readonly string[] = ['si', 'except
 export const EXAM_EVIDENCE_PREFIX_CONDITION_PAIRS: readonly string[] = ['a menos', 'solo con', 'solamente con', 'unicamente con', 'solo si', 'solo cuando', 'siempre que', 'en caso', 'con tal'];
 export const EXAM_EVIDENCE_SUFFIX_CONDITIONS: readonly string[] = ['excepto', 'salvo', 'si', 'cuando', 'mientras', 'sino', 'pero', 'aunque'];
 export const EXAM_EVIDENCE_SUFFIX_CONDITION_PAIRS: readonly string[] = ['a menos', 'siempre que', 'siempre y', 'solo si', 'solo cuando', 'solamente si', 'solamente cuando', 'unicamente si', 'unicamente cuando', 'hasta que', 'con tal', 'en caso', 'a no'];
-/** Raíces de verbos tras los que «si» es interrogativo («verifica si…», «revisa si…»). */
+/** Raíces de verbos tras los que «si» es interrogativo (reglas v2; v3 usa palabras completas, abajo). */
 export const EXAM_EVIDENCE_WHETHER_VERBS: readonly string[] = ['verific', 'revis', 'comprob', 'comprueb', 'detect', 'observ', 'pregunt', 'sab', 'decid'];
+/**
+ * Fix bank-guard-minors (N-R3), reglas v3: verbos de averiguar como PALABRAS COMPLETAS (normalizadas). «si» es
+ * interrogativo si uno de estos está entre los 3 tokens anteriores y no hay «y/o/e/u» en medio
+ * («pregunta al cliente si…» sí; «observa y si el cliente se altera…» no; «los sábados si…» no).
+ */
+export const EXAM_EVIDENCE_WHETHER_WORDS: readonly string[] = [
+  'verifica', 'verificar', 'verifique', 'verifiquen', 'verifican', 'verificas', 'verificamos', 'verificando', 'verificate',
+  'revisa', 'revisar', 'revise', 'revisen', 'revisan', 'revisas', 'revisamos', 'revisando',
+  'comprueba', 'comprobar', 'compruebe', 'comprueben', 'comprueban', 'compruebas', 'comprobamos', 'comprobando',
+  'detecta', 'detectar', 'detecte', 'detecten', 'detectan', 'detectas', 'detectamos', 'detectando',
+  'observa', 'observar', 'observe', 'observen', 'observan', 'observas', 'observamos', 'observando',
+  'pregunta', 'preguntar', 'pregunte', 'pregunten', 'preguntan', 'preguntas', 'preguntamos', 'preguntando', 'preguntale', 'preguntate', 'preguntales',
+  'sabe', 'saber', 'sabes', 'saben', 'sabemos', 'sepa', 'sepan', 'sabiendo',
+  'decide', 'decidir', 'decida', 'decidan', 'deciden', 'decides', 'decidimos', 'decidiendo',
+  'averigua', 'averiguar', 'averigue', 'averiguan', 'averiguando', 'evalua', 'evaluar', 'evalue', 'evaluan', 'evaluando',
+  'determina', 'determinar', 'determine', 'determinan', 'define', 'definir', 'defina', 'definen', 'confirma', 'confirmar', 'confirme', 'confirman',
+];
+const EXAM_COORDINATORS: readonly string[] = ['y', 'o', 'e', 'u'];
+/** v3: cópulas tras «no» que forman «no es X: es Y» / «no se trata de X sino Y» (la negación no alcanza a Y). */
+const EXAM_COPULAS: readonly string[] = ['es', 'son', 'era', 'eran', 'fue', 'fueron', 'sera', 'seran', 'esta', 'estan'];
 const EXAM_SI_ACCENT_RE = /(^|[^\p{L}\p{N}])([sS])[íÍ](?![\p{L}\p{N}])/gu;
-export function examGuardNormalize(s: string): string {
+/**
+ * Fix bank-guard-minors (N-R1), reglas v3: normalización de la EVIDENCIA. Igual que `normalizeExamText` salvo:
+ *  - solo se quitan las tildes de las LETRAS (NFC y NFD por letra): «≠ ≮ ≯ ≤ ≥ ∉ ∄…» no se vuelven «= < >…»;
+ *  - «>» se quita solo como marca de cita al inicio de línea, nunca en medio («temperatura > 30 °C»).
+ * `normalizeExamText` (valores dorados, deduplicación, opciones) no cambia; los bancos v1/v2 se siguen
+ * re-validando en el empaque con ella.
+ */
+export function normalizeExamEvidenceText(s: string): string {
+  return String(s ?? '')
+    .normalize('NFC')
+    .replace(/\p{L}\p{M}*/gu, (m) => m.normalize('NFD').replace(/[̀-ͯ]/g, ''))
+    .toLowerCase()
+    .replace(/[­​-‍⁠﻿]/g, '')
+    .replace(/^[ \t]*>[ \t>]*/gm, '')
+    .replace(/^[ \t]*(?:[-+*•‣◦▪]|\d{1,3}[.)])[ \t]+/gm, '')
+    .replace(/[*_#`[\]()|]/g, '')
+    .replace(/[«»“”„‟″]/g, '"')
+    .replace(/[‘’‚‛′‹›]/g, "'")
+    .replace(/[‐‑‒–—―−]/g, '-')
+    .replace(/…/g, '...')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+export type ExamEvidenceRules = 2 | 3;
+export function examGuardNormalize(s: string, rules: ExamEvidenceRules = 3): string {
+  // v3: NFC antes de marcar «sí» (una «í» descompuesta, i + U+0301, también es «sí»).
+  if (rules >= 3) return normalizeExamEvidenceText(String(s ?? '').normalize('NFC').replace(EXAM_SI_ACCENT_RE, '$1$2itilde'));
   return normalizeExamText(String(s ?? '').replace(EXAM_SI_ACCENT_RE, '$1$2itilde'));
 }
+/** v3: desmentido («es falso», «es un mito»…) que no esté negado («no es un mito: [frag]» afirma). */
+function examHasFalsityV3(tokens: readonly string[]): boolean {
+  const s = ' ' + tokens.join(' ') + ' ';
+  return EXAM_EVIDENCE_FALSITY_PHRASES.some((p) => {
+    for (let at = s.indexOf(' ' + p + ' '); at >= 0; at = s.indexOf(' ' + p + ' ', at + 1)) {
+      if (!(p.startsWith('es ') && s.slice(0, at + 1).endsWith(' no '))) return true;
+    }
+    return false;
+  });
+}
 export type ExamEvidenceSupport = { ok: true } | { ok: false; reason: 'missing' | 'negated' | 'conditioned' | 'question' };
-export interface ExamEvidenceIndex { norm: string; bounds: number[] }
-export function examEvidenceIndex(chapterMd: string): ExamEvidenceIndex {
+export interface ExamEvidenceIndex { norm: string; bounds: number[]; rules?: ExamEvidenceRules }
+export function examEvidenceIndex(chapterMd: string, rules: ExamEvidenceRules = 3): ExamEvidenceIndex {
   let norm = '';
   const bounds: number[] = [0];
   for (const line of String(chapterMd ?? '').split('\n')) {
-    const n = examGuardNormalize(line);
+    const n = examGuardNormalize(line, rules);
     if (!n) continue;
     if (norm) norm += ' ';
     const start = norm.length;
@@ -284,23 +340,44 @@ export function examEvidenceIndex(chapterMd: string): ExamEvidenceIndex {
     bounds.push(norm.length);
   }
   bounds.sort((a, b) => a - b);
-  return { norm, bounds };
+  return { norm, bounds, rules };
 }
 function examIsWhetherVerb(t: string | undefined): boolean {
   return typeof t === 'string' && EXAM_EVIDENCE_WHETHER_VERBS.some((v) => t.startsWith(v));
 }
-/** «si» interrogativo: uno de los 3 tokens anteriores es un verbo de averiguar («pregunta al cliente si…»). */
+/** «si» interrogativo (v2): uno de los 3 tokens anteriores empieza por una raíz de verbo de averiguar. */
 function examWhetherBefore(tokens: readonly string[]): boolean {
   return tokens.slice(-3).some(examIsWhetherVerb);
+}
+/** «si» interrogativo (v3): verbo de averiguar (palabra completa) entre los 3 tokens anteriores, sin «y/o» en medio. */
+function examWhetherBeforeV3(tokens: readonly string[]): boolean {
+  const last = tokens.slice(-3);
+  for (let k = last.length - 1; k >= 0; k--) {
+    if (EXAM_EVIDENCE_WHETHER_WORDS.includes(last[k])) return true;
+    if (EXAM_COORDINATORS.includes(last[k])) return false;
+  }
+  return false;
 }
 function examHasPhrase(tokens: readonly string[], phrases: readonly string[]): boolean {
   const s = ' ' + tokens.join(' ') + ' ';
   return phrases.some((p) => s.includes(' ' + p + ' '));
 }
-export function examEvidenceSupport(chapter: string | ExamEvidenceIndex, evidence: string): ExamEvidenceSupport {
-  const ev = examGuardNormalize(evidence);
+/** v3: ¿el tramo [at, end) está DENTRO de una cita entre comillas que contiene una pregunta? */
+function examInsideQuotedQuestion(sentence: string, at: number, end: number): boolean {
+  const re = /"[^"]*"|'[^']*'/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(sentence))) {
+    if (m.index < at && m.index + m[0].length >= end && /[?¿]/.test(m[0])) return true;
+  }
+  return false;
+}
+export function examEvidenceSupport(chapter: string | ExamEvidenceIndex, evidence: string, rules: ExamEvidenceRules = 3): ExamEvidenceSupport {
+  const idx = typeof chapter === 'string' ? examEvidenceIndex(chapter, rules) : chapter;
+  const r: ExamEvidenceRules = typeof chapter === 'string' ? rules : (idx.rules ?? 2);
+  const v3 = r >= 3;
+  const ev = examGuardNormalize(evidence, r);
   if (!ev) return { ok: false, reason: 'missing' };
-  const { norm, bounds } = typeof chapter === 'string' ? examEvidenceIndex(chapter) : chapter;
+  const { norm, bounds } = idx;
   const evTok = examTokens(ev);
   let found = false;
   let reason: 'negated' | 'conditioned' | 'question' = 'negated';
@@ -310,21 +387,46 @@ export function examEvidenceSupport(chapter: string | ExamEvidenceIndex, evidenc
     let sStart = 0;
     let sEnd = norm.length;
     for (const b of bounds) { if (b <= at && b > sStart) sStart = b; if (b >= end && b < sEnd) sEnd = b; }
-    // Pregunta: ? o ¿ en la oración FUERA de citas entre comillas (una pregunta citada en una afirmación no cuenta).
-    if (/[?¿]/.test(norm.slice(sStart, sEnd).replace(/"[^"]*"|'[^']*'/g, ''))) { reason = 'question'; continue; }
+    // Pregunta: ? o ¿ en la oración FUERA de citas (una pregunta citada en una afirmación no cuenta); v3: un
+    // tramo tomado de DENTRO de una pregunta citada sí es pregunta.
+    const sentence = norm.slice(sStart, sEnd);
+    if (/[?¿]/.test(sentence.replace(/"[^"]*"|'[^']*'/g, '')) || (v3 && examInsideQuotedQuestion(sentence, at - sStart, end - sStart))) { reason = 'question'; continue; }
     const preText = norm.slice(sStart, at);
     const cut = Math.max(preText.lastIndexOf(':'), preText.lastIndexOf(';'));
-    const pre = examTokens(cut >= 0 ? preText.slice(cut + 1) : preText);
     const post = examTokens(norm.slice(end, sEnd));
-    const next = (i: number): string | undefined => (i + 1 < pre.length ? pre[i + 1] : evTok[0]);
-    const negated = pre.some((t, i) => EXAM_EVIDENCE_PREFIX_NEGATIONS.includes(t)
-      && !(t === 'sin' && next(i) === 'embargo')
-      && !(t === 'no' && ['obstante', 'solo', 'solamente', 'unicamente'].includes(next(i) as string)));
-    if (negated || examHasPhrase(pre, EXAM_EVIDENCE_FALSITY_PHRASES) || examHasPhrase(post, EXAM_EVIDENCE_FALSITY_PHRASES)) { reason = 'negated'; continue; }
-    const preCond = pre.some((t, i) => EXAM_EVIDENCE_PREFIX_CONDITIONS.includes(t) && !(t === 'si' && examWhetherBefore(pre.slice(0, i))))
-      || examHasPhrase(pre, EXAM_EVIDENCE_PREFIX_CONDITION_PAIRS);
+    let negated: boolean;
+    let pre: string[];
+    if (!v3) {
+      // v2: el corte en «:»/«;» acota TODO el prefijo.
+      pre = examTokens(cut >= 0 ? preText.slice(cut + 1) : preText);
+      const next = (i: number): string | undefined => (i + 1 < pre.length ? pre[i + 1] : evTok[0]);
+      negated = pre.some((t, i) => EXAM_EVIDENCE_PREFIX_NEGATIONS.includes(t)
+        && !(t === 'sin' && next(i) === 'embargo')
+        && !(t === 'no' && ['obstante', 'solo', 'solamente', 'unicamente'].includes(next(i) as string)));
+    } else {
+      // v3 (N-R3): el prefijo se examina ENTERO; el corte en «:»/«;» solo neutraliza una negación de cópula
+      // («No es X: es Y», «No se trata de X; …») y «no es / no se trata de … sino [frag]».
+      const before = cut >= 0 ? examTokens(preText.slice(0, cut)) : [];
+      const after = examTokens(cut >= 0 ? preText.slice(cut + 1) : preText);
+      pre = before.concat(after);
+      const next = (i: number): string | undefined => (i + 1 < pre.length ? pre[i + 1] : evTok[0]);
+      const copula = (i: number): boolean => pre[i] === 'no' && (EXAM_COPULAS.includes(next(i) as string) || (next(i) === 'se' && (i + 2 < pre.length ? pre[i + 2] : evTok[i + 2 - pre.length]) === 'trata'));
+      negated = pre.some((t, i) => {
+        if (!EXAM_EVIDENCE_PREFIX_NEGATIONS.includes(t)) return false;
+        if (t === 'sin' && next(i) === 'embargo') return false;
+        if (t === 'no' && ['obstante', 'solo', 'solamente', 'unicamente'].includes(next(i) as string)) return false;
+        if (copula(i) && (i < before.length || pre.slice(i + 1).includes('sino'))) return false;
+        return true;
+      });
+    }
+    const falsity = v3 ? examHasFalsityV3(pre) || examHasFalsityV3(post) : examHasPhrase(pre, EXAM_EVIDENCE_FALSITY_PHRASES) || examHasPhrase(post, EXAM_EVIDENCE_FALSITY_PHRASES);
+    if (negated || falsity) { reason = 'negated'; continue; }
+    const whether = v3 ? examWhetherBeforeV3 : examWhetherBefore;
+    const prePairs = v3 ? EXAM_EVIDENCE_PREFIX_CONDITION_PAIRS.concat(['siempre y', 'hasta que']) : EXAM_EVIDENCE_PREFIX_CONDITION_PAIRS;
+    const preCond = pre.some((t, i) => EXAM_EVIDENCE_PREFIX_CONDITIONS.includes(t) && !(t === 'si' && whether(pre.slice(0, i))))
+      || examHasPhrase(pre, prePairs);
     const postCond = post.some((t, i) => EXAM_EVIDENCE_SUFFIX_CONDITIONS.includes(t)
-      && !(t === 'si' && examWhetherBefore(evTok.concat(post.slice(0, i))))
+      && !(t === 'si' && whether(evTok.concat(post.slice(0, i))))
       && !(t === 'sino' && post[i + 1] === 'tambien'))
       || examHasPhrase(post, EXAM_EVIDENCE_SUFFIX_CONDITION_PAIRS);
     if (preCond || postCond) { reason = 'conditioned'; continue; }
@@ -397,14 +499,17 @@ export type ExamBankQuestion = ExamMultichoiceQuestion | ExamTrueFalseQuestion |
 /**
  * BANKOPT fix round 4 (R2): versión de las reglas de validación con que se ACEPTÓ el banco.
  *  1 (o ausente) = evidencia textual por subcadena (bancos anteriores);
- *  2 = además la oración debe AFIRMAR la evidencia (examEvidenceSupport).
+ *  2 = además la oración debe AFIRMAR la evidencia (examEvidenceSupport, guardia v2);
+ *  3 = guardia v3 (fix bank-guard-minors): corte «:»/«;» solo para negaciones de cópula, condiciones y
+ *      desmentidos en todo el prefijo, «si» interrogativo con verbos completos, tramos dentro de una pregunta
+ *      citada, y normalización de la evidencia que conserva «≠ ≮ ≯ ≤ ≥…» y «>» en medio del texto.
  * completeItem valida SIEMPRE con las reglas vigentes; el empaque re-valida con las de la versión del banco
  * (un banco ya aceptado nunca deja de empaquetarse porque las reglas se endurecieron).
  */
-export const EXAM_BANK_VALIDATION_VERSION = 2;
+export const EXAM_BANK_VALIDATION_VERSION = 3;
 export interface ExamBankV1 {
   bankVersion: 1;
-  bankValidationVersion?: 1 | 2;
+  bankValidationVersion?: 1 | 2 | 3;
   scope: ExamBankScope;
   moduleId: string | null;
   plan: ExamPlanLeaf[];
@@ -791,6 +896,7 @@ export function validateExamBank(doc: unknown, ctx: ExamBankValidationContext): 
     const idx = new Map<string, ExamEvidenceIndex>();
     const acceptedUnder = ctx.evidenceRules === 'asAccepted' ? (isObj(doc) && Number.isInteger(doc.bankValidationVersion) ? doc.bankValidationVersion : 1) : EXAM_BANK_VALIDATION_VERSION;
     const affirmed = acceptedUnder >= 2;
+    const rules: ExamEvidenceRules = acceptedUnder >= 3 ? 3 : 2;
     for (const { q, i } of valid) {
       if (typeof q.chapterId !== 'string' || typeof q.evidence !== 'string') continue;
       const md = ctx.chapterMd.get(q.chapterId);
@@ -801,7 +907,7 @@ export function validateExamBank(doc: unknown, ctx: ExamBankValidationContext): 
         if (!ev || !normalizeExamText(md).includes(ev)) E.push(`$.questions[${i}].evidence`, 'EXAM_BANK_EVIDENCE', `${idOf(q, i)}: la evidencia no aparece en el texto del capítulo ${q.chapterId}`);
         continue;
       }
-      if (!idx.has(q.chapterId)) idx.set(q.chapterId, examEvidenceIndex(md));
+      if (!idx.has(q.chapterId)) idx.set(q.chapterId, examEvidenceIndex(md, rules));
       const sup = examEvidenceSupport(idx.get(q.chapterId) as ExamEvidenceIndex, q.evidence);
       if (sup.ok === false) {
         const why = sup.reason === 'missing' ? 'la evidencia no aparece en el texto del capítulo'

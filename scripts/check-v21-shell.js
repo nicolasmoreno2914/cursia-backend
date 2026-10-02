@@ -1277,13 +1277,29 @@ async function dbChecks() {
       eq('examBankDraft' in (ex3e.outputSummary || {}), false, 'el claim siguiente no trae borrador');
       eq(await sched.failItemDetailed(ex3e.itemRunId, 'b1', 'EXAM_BANK_INCOMPLETE: hoja corta', true, OWNER, { examBankDraftArtifactId: await draftArt(ex3e.itemRunId) }), { ok: true }, 'fail con borrador 2');
       eq(!!(await item(examKey)).output_summary.examBankDraft, true, 'borrador 2 registrado');
+      const modCh4 = [{ id: C1, moduleId: M1 }, { id: C2, moduleId: M1 }];
+      const gIndex4 = new Map([[C1, 0], [C2, 1], [C3, 2]]);
+      // Fix bank-guard-minors (N-R4): un banco que el VALIDADOR DEL SERVIDOR rechaza al completar (prevalidateV3
+      // inválido) es una falla validada: borra el borrador (un ejecutor con reglas viejas no lo reanuda).
+      await readyAgain(examKey);
+      const exR = await claim(['exam']);
+      assert(exR && exR.outputSummary.examBankDraft, 'el claim trae el borrador 2');
+      const badR = EBF.makeExamBank({ scope: 'module', moduleId: M1, chapters: modCh4, chapterIndex: gIndex4, plan: exR.claimPayload.examBank.plan });
+      badR.questions[0].evidence = 'Una frase que el capítulo nunca dijo sobre la planta ni sobre el turno de trabajo.';
+      const rR = await sched.completeItemDetailed(exR.itemRunId, 'b1', { artifactIds: [await upload('dynamic_exam_bank_json', badR)], summary: {} }, OWNER);
+      eq([rR.ok, rR.reason], [false, 'v3_payload_invalid'], 'rechazo del validador del servidor');
+      const afterR = await item(examKey);
+      eq([afterR.status !== 'completed', 'examBankDraft' in afterR.output_summary], [true, false], 'borrador borrado por el rechazo del servidor');
+      await ds.query(`update public.generation_item_runs set status = 'retrying', finished_at = null, max_attempts = attempt_count + 5 where id = $1`, [afterR.id]);
+      eq(exR.claimPayload.examBank.bankValidationVersion, 3, 'el claim anuncia las reglas v3');
       // Fix round 1 (M4): al completar, el borrador sale de output_summary (se deja uno antes de completar).
+      await readyAgain(examKey);
+      const exS = await claim(['exam']);
+      eq(await sched.failItemDetailed(exS.itemRunId, 'b1', 'EXAM_BANK_INCOMPLETE: hoja corta', true, OWNER, { examBankDraftArtifactId: await draftArt(exS.itemRunId) }), { ok: true }, 'fail con borrador 3');
       await readyAgain(examKey);
       const ex4 = await claim(['exam']);
       assert(ex4, 'claim exam 4');
-      assert(ex4.outputSummary.examBankDraft, 'el claim trae el borrador 2');
-      const modCh4 = [{ id: C1, moduleId: M1 }, { id: C2, moduleId: M1 }];
-      const gIndex4 = new Map([[C1, 0], [C2, 1], [C3, 2]]);
+      assert(ex4.outputSummary.examBankDraft, 'el claim trae el borrador 3');
       const good4 = EBF.makeExamBank({ scope: 'module', moduleId: M1, chapters: modCh4, chapterIndex: gIndex4, plan: ex4.claimPayload.examBank.plan });
       eq(await sched.completeItemDetailed(ex4.itemRunId, 'b1', { artifactIds: [await upload('dynamic_exam_bank_json', good4)], summary: {} }, OWNER), { ok: true }, 'completa');
       const fin4 = await item(examKey);

@@ -704,7 +704,10 @@ export class SchedulerService {
     // del validador (nunca se acepta en silencio). v1/v2: no aplica.
     const pre = await this.prevalidateV3(itemRunId, executorId, ids, ownerId, typeof summary.promptVersion === 'string' ? summary.promptVersion : null);
     if (pre.kind === 'invalid') {
-      const failed = await this.failItemDetailed(itemRunId, executorId, pre.message, pre.retryable, ownerId);
+      // Fix bank-guard-minors (N-R4): un rechazo del validador del servidor es una falla VALIDADA, no
+      // transitoria: para exam/final_exam borra el borrador del banco (null explícito; no-op para otros tipos),
+      // así un ejecutor con reglas viejas no reanuda una y otra vez una pregunta que el servidor rechaza.
+      const failed = await this.failItemDetailed(itemRunId, executorId, pre.message, pre.retryable, ownerId, { examBankDraftArtifactId: null });
       return failed.ok ? { ok: false, reason: V3_PAYLOAD_INVALID, errors: pre.codes } : failed;
     }
     const validationPatch =
