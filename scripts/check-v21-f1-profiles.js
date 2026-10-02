@@ -357,7 +357,7 @@ const def = (finalExam) => PROF.defaultAssessmentProfile({ finalExam });
         sqls.push(sql);
         if (/final_exam_enabled/.test(sql)) return [{ final_exam_enabled: true }];
         if (/course_profiles/.test(sql)) return [];
-        if (/select metadata from public\.courses/.test(sql)) return [{ metadata: { pal: { id: 'blanco-corp' } } }];
+        if (/select metadata, created_at from public\.courses/.test(sql)) return [{ metadata: { pal: { id: 'blanco-corp' } }, created_at: new Date('2026-09-30T12:00:00Z') }];
         throw new Error(`SQL no esperado: ${sql}`);
       } },
       { async findOne() { return { structureVersion: 'dynamic' }; } },
@@ -372,6 +372,44 @@ const def = (finalExam) => PROF.defaultAssessmentProfile({ finalExam });
     const a = await svc.getCurrent(5, OWNER, 'assessment', 'navy-teal');
     eq([a.defaultSource, a.profile.passingGrade], [null, 70], 'assessment sin cambios');
     assert(!sqls.some((s) => /insert|update|delete/i.test(s)), 'nunca escribe');
+  });
+
+  // V542 (G2, decisión EV6 n.º 3): curso NUEVO (created_at ≥ PRESENTATION_LIGHT_DEFAULT_SINCE) sin perfil →
+  // Aula Clara (claro) con los colores de la paleta; los anteriores conservan el tema derivado de su paleta
+  // (su paquete y sus presentaciones ya dependen de él). GET del perfil y empaque coinciden.
+  await check('V542 G2: curso nuevo sin perfil → aula-clara/light + brandSeed de la paleta (también paletas oscuras); curso anterior → como siempre; GET y empaque coinciden', async () => {
+    const dark = (THEME.LEGACY_PALETTES.find((p) => /nocturno/i.test(p.name || p.id) && THEME.presentationProfileFromPalette(p).mode === 'dark') || THEME.LEGACY_PALETTES.find((p) => THEME.presentationProfileFromPalette(p).mode === 'dark')).id;
+    const before = new Date('2026-10-01T18:00:00Z');
+    const after = new Date('2026-10-02T00:00:01Z');
+    eq([PROF.isLightDefaultCourse(before), PROF.isLightDefaultCourse(after), PROF.isLightDefaultCourse(null)], [false, true, false], 'corte por defecto');
+    eq(PROF.isLightDefaultCourse(before, { PRESENTATION_LIGHT_DEFAULT_SINCE: '2026-10-01T00:00:00Z' }), true, 'corte por env');
+    eq(PROF.isLightDefaultCourse(after, { PRESENTATION_LIGHT_DEFAULT_SINCE: 'no-es-fecha' }), true, 'env inválido → corte por defecto');
+    const old = PROF.defaultPresentationProfileFor(dark);
+    eq([old.profile.themeFamily, old.profile.mode], ['oscuro-premium', 'dark'], `curso anterior: ${dark} → oscuro (sin cambio)`);
+    const neu = PROF.defaultPresentationProfileFor(dark, { lightDefault: true });
+    eq([neu.source, neu.profile.themeFamily, neu.profile.mode, neu.profile.brandSeed], ['palette', 'aula-clara', 'light', old.profile.brandSeed], 'curso nuevo: claro con la marca de la paleta');
+    const mk = (created_at) => new CourseProfilesService(
+      { async query(sql) {
+        if (/final_exam_enabled/.test(sql)) return [{ final_exam_enabled: true }];
+        if (/course_profiles/.test(sql)) return [];
+        if (/select metadata, created_at from public\.courses/.test(sql)) return [{ metadata: { paletteId: dark }, created_at }];
+        throw new Error(`SQL no esperado: ${sql}`);
+      } },
+      { async findOne() { return { structureVersion: 'dynamic' }; } },
+    );
+    eq((await mk(after).getCurrent(5, OWNER, 'presentation')).profile, neu.profile, 'GET curso nuevo');
+    eq((await mk(before).getCurrent(5, OWNER, 'presentation')).profile, old.profile, 'GET curso anterior');
+    const PKV3 = require(path.join(distRoot, 'modules/dynamic-packaging/packaging-v3.js'));
+    const pkgQ = (created_at) => ({ async query(sql) {
+      if (/course_profiles/.test(sql)) return [];
+      if (/select metadata, created_at from public\.courses/.test(sql)) return [{ metadata: { pal: { id: dark } }, created_at }];
+      throw new Error(`SQL no esperado: ${sql}`);
+    } });
+    const tNew = (await PKV3.loadPackagingProfilesV3(pkgQ(after), 5, true)).theme;
+    const tOld = (await PKV3.loadPackagingProfilesV3(pkgQ(before), 5, true)).theme;
+    eq([tNew.source, tNew.input.themeFamily, tNew.input.mode, tNew.input.brandSeed], ['palette', 'aula-clara', 'light', neu.profile.brandSeed], 'empaque curso nuevo');
+    eq([tOld.source, tOld.input.themeFamily, tOld.input.mode], ['palette', 'oscuro-premium', 'dark'], 'empaque curso anterior (sin cambio)');
+    eq(PKV3.resolvePackagingTheme({ presentationProfile: null, legacyPaletteId: dark }), tOld, 'sin lightDefault = comportamiento anterior');
   });
 
   console.log(`\n${passes} ok, ${failures} fallos`);

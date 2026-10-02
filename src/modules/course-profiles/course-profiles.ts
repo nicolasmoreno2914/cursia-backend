@@ -60,6 +60,32 @@ export function defaultPresentationProfile(): PresentationProfile {
   return { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 };
 }
 
+/**
+ * V542 (G2, decisión EV6 n.º 3) — un curso NUEVO sin perfil guardado arranca en Aula Clara (claro); la
+ * paleta solo aporta los colores de marca (`brandSeed`). Los cursos ANTERIORES conservan el tema que
+ * siempre derivaron de su paleta (claro → aula-clara/light, el resto → oscuro-premium/dark): su paquete
+ * y sus presentaciones de Gamma ya dependen de él.
+ *
+ * Marca: `courses.created_at` (timestamptz NOT NULL default now(), inmutable). Se eligió sobre una
+ * marca en `courses.metadata` porque PATCH /courses reemplaza `metadata` entero (CoursesService.update:
+ * Object.assign) y la marca se perdería; tampoco sirve «tiene runs/paquetes» porque el primer run de un
+ * curso nuevo ya existe cuando Gamma pide el tema. Corte: `PRESENTATION_LIGHT_DEFAULT_SINCE` (ISO; por
+ * defecto 2026-10-02T00:00:00Z, después del curso de validación #542; un valor inválido usa el defecto).
+ */
+export const PRESENTATION_LIGHT_DEFAULT_SINCE_ENV = 'PRESENTATION_LIGHT_DEFAULT_SINCE';
+export const PRESENTATION_LIGHT_DEFAULT_SINCE_DEFAULT = '2026-10-02T00:00:00.000Z';
+export function presentationLightDefaultSince(env: NodeJS.ProcessEnv = process.env): Date {
+  const raw = env[PRESENTATION_LIGHT_DEFAULT_SINCE_ENV];
+  const d = raw ? new Date(raw) : null;
+  return d && Number.isFinite(d.getTime()) ? d : new Date(PRESENTATION_LIGHT_DEFAULT_SINCE_DEFAULT);
+}
+/** ¿El curso (por su `created_at`) arranca en Aula Clara sin perfil guardado? Sin fecha legible → no (conserva). */
+export function isLightDefaultCourse(createdAt: Date | string | null | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (createdAt === null || createdAt === undefined || createdAt === '') return false;
+  const d = createdAt instanceof Date ? createdAt : new Date(createdAt);
+  return Number.isFinite(d.getTime()) && d.getTime() >= presentationLightDefaultSince(env).getTime();
+}
+
 /** F1 (I4): de dónde sale el perfil de presentación por defecto de un curso sin perfil guardado. */
 export type PresentationDefaultSource = 'palette' | 'fallback';
 
@@ -68,13 +94,15 @@ export type PresentationDefaultSource = 'palette' | 'fallback';
  * - Con una paleta legacy conocida → derivado de ella
  *   (`presentationProfileFromPalette`: claro → aula-clara/light, el resto →
  *   oscuro-premium/dark; brandSeed de la paleta), `source: 'palette'`.
+ *   V542 (G2): con `opts.lightDefault` (curso nuevo, `isLightDefaultCourse`) el tema es SIEMPRE
+ *   aula-clara/light y la paleta aporta solo el brandSeed (`source: 'palette'` igual).
  * - Sin paleta → aula-clara/light, `source: 'fallback'`.
  * - Paleta desconocida → aula-clara/light, `source: 'fallback'` + aviso
  *   `PALETTE_UNKNOWN` (esto es solo la LECTURA del default; el empaque falla
  *   fuerte con una paleta guardada desconocida).
  * Pura: nunca persiste nada.
  */
-export function defaultPresentationProfileFor(paletteId: string | null | undefined): {
+export function defaultPresentationProfileFor(paletteId: string | null | undefined, opts: { lightDefault?: boolean } = {}): {
   profile: PresentationProfile;
   source: PresentationDefaultSource;
   warnings: ProfileValidationError[];
@@ -93,12 +121,13 @@ export function defaultPresentationProfileFor(paletteId: string | null | undefin
   const seed: BrandSeedInput = {};
   if (d.brandSeed.accent) seed.accent = d.brandSeed.accent;
   if (d.brandSeed.moduleColors) seed.moduleColors = [...d.brandSeed.moduleColors];
+  const base = opts.lightDefault ? defaultPresentationProfile() : { themeFamily: d.themeFamily, mode: d.mode, themeVersion: d.themeVersion };
   return {
     profile: {
-      themeFamily: d.themeFamily,
-      mode: d.mode,
+      themeFamily: base.themeFamily,
+      mode: base.mode,
       brandSeed: Object.keys(seed).length ? seed : null,
-      themeVersion: d.themeVersion,
+      themeVersion: base.themeVersion,
     },
     source: 'palette',
     warnings: [],
