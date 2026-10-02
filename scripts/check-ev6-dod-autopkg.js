@@ -309,7 +309,9 @@ const ENV_KEYS = [
                                    and worker_status = 'completed' order by created_at desc, id desc limit 1`, [run.id]);
       return !!j && deliverableJobs.has(j.id);
     };
-    const completeJob = (id, builder = '3.6.0') => ds.query(`update public.production_jobs set status = 'completed', worker_status = 'completed', finished_at = now(),
+    // Builder VIGENTE del dist (V542 lo subió a 3.8.0): un paquete con esta versión es «el mismo build».
+    const CUR_BUILDER = L('package/dynamic-mbz-builder-v3.js').DYNAMIC_MBZ_BUILDER_VERSION_V3;
+    const completeJob = (id, builder = CUR_BUILDER) => ds.query(`update public.production_jobs set status = 'completed', worker_status = 'completed', finished_at = now(),
       output_summary = $2::jsonb where id = $1`, [id, JSON.stringify({ artifactId: crypto.randomUUID(), builderVersion: builder, sourceIdsHash: 'h'.repeat(64) })]);
     const autoPkg = new AutoPackageService(ds, packaging, runs);
     autoPkg.onModuleInit();
@@ -598,7 +600,7 @@ const ENV_KEYS = [
       await ds.query(`update public.production_jobs set status = 'completed', worker_status = 'completed', finished_at = now() where id = $1`, [runId]);
       const [j] = await ds.query(`insert into public.production_jobs (owner_id, course_id, execution_mode, status, worker_status, current_step, input_payload, output_summary, options, result, created_at)
         values ($1, $2, 'dynamic_package', 'completed', 'completed', 'dynamic_package', $3::jsonb, $4::jsonb, '{}'::jsonb, '{}'::jsonb, now() - interval '1 hour') returning id`,
-        [OWNER, C.cid, JSON.stringify({ runId, manifestId: C.manifest.id, blueprintNumber: 1 }), JSON.stringify({ artifactId: crypto.randomUUID(), builderVersion: '3.6.0', sourceIdsHash: 's'.repeat(64) })]);
+        [OWNER, C.cid, JSON.stringify({ runId, manifestId: C.manifest.id, blueprintNumber: 1 }), JSON.stringify({ artifactId: crypto.randomUUID(), builderVersion: CUR_BUILDER, sourceIdsHash: 's'.repeat(64) })]);
       // Marca de una re-completitud cuyo disparo se perdió.
       await ds.query(`update public.production_jobs set output_summary = output_summary || jsonb_build_object('autoPackage', jsonb_build_object('eligibleAt', now())) where id = $1`, [runId]);
       let sw = await autoPkg.sweep();

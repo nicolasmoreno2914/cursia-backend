@@ -522,13 +522,14 @@ const ENV_KEYS = [
       eq([dto.completion.state, dto.completion.packageReady], ['preview', false], 'el run sigue de vista previa');
     });
 
-    await check('dod', 'builder: run 100 % real → .mbz BYTE-IDÉNTICO al dorado (builder 3.6.0, mismo fixture que check-ev6-pending-videos) con qaPreviewNotice ausente o false; con true → nombre «[QA — vista previa, no entregable]» + aviso visible en la bienvenida, validador OK', async () => {
+    await check('dod', 'builder: run 100 % real → .mbz BYTE-IDÉNTICO al dorado (builder 3.8.0, mismo fixture que check-ev6-pending-videos) con qaPreviewNotice ausente o false; con true → nombre «[QA — vista previa, no entregable]» + aviso visible en la bienvenida, validador OK', async () => {
       const PF = require('./lib/v21-packaging-fixtures');
       const B = L('package/dynamic-mbz-builder-v3.js');
       const V = L('package/v3/mbz-validator-v3.js');
       const JSZip = require('jszip');
       const o = { engine: 'h5p', finalExam: true, courseId: 644 };
-      const GOLDEN_644 = '5de36d0645bcc04a2189f33849a53e1a2250991b4b3cd10ed0aaa3a11c3b0c1f';
+      // V542 (builder 3.8.0): mismo dorado que check-ev6-pending-videos (antes 5de36d06…, builder 3.6.0).
+      const GOLDEN_644 = '5b2bc73b0db0f6a37eebde4a015cb7f51e52eff2323443840f1a8b3c12710607';
       const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
       const r0 = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, o));
       const r1 = await B.buildDynamicMbzV3({ ...PF.packagingInput(distRoot, o), qaPreviewNotice: false });
