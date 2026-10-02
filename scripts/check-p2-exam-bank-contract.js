@@ -535,6 +535,30 @@ async function main() {
       eq(EB.bankTarget(sl), 2 * sl, 'objetivo sin cambio (2×)');
     }
   });
+  await check('BANKOPT fix round 3: validateExamBank exige que la oración AFIRME la evidencia — fragmento de oración afirmativa ✓; «No [fragmento]» y «[fragmento], excepto…» / «… solo si…» → EXAM_BANK_EVIDENCE; la negación o la excepción DENTRO de la evidencia vale', () => {
+    const md = [
+      '# Sala de bombas',
+      '- El operario revisa la válvula de control de la bomba principal antes de iniciar cada turno de trabajo.',
+      '- No se permite abrir el tablero eléctrico de la sala de bombas con las manos húmedas o sin guantes dieléctricos.',
+      '- Todos los equipos de la sala se lavan semanalmente con agua tratada, excepto el filtro de cartucho del spa interior.',
+      '- La bomba de recirculación se apaga durante la noche solo si el nivel del tanque de compensación supera el mínimo.',
+    ].join('\n');
+    const S = (ev) => EB.examEvidenceSupport(md, ev);
+    eq(S('El operario revisa la válvula de control de la bomba principal'), { ok: true }, 'afirmativa');
+    eq(S('se permite abrir el tablero eléctrico de la sala de bombas con las manos húmedas'), { ok: false, reason: 'negated' }, 'No [fragmento]');
+    eq(S('Todos los equipos de la sala se lavan semanalmente con agua tratada'), { ok: false, reason: 'conditioned' }, '[fragmento], excepto');
+    eq(S('La bomba de recirculación se apaga durante la noche'), { ok: false, reason: 'conditioned' }, '[fragmento] solo si');
+    eq(S('No se permite abrir el tablero eléctrico de la sala de bombas con las manos húmedas'), { ok: true }, 'negación dentro');
+    eq(S('Todos los equipos de la sala se lavan semanalmente con agua tratada, excepto el filtro de cartucho del spa interior.'), { ok: true }, 'excepción dentro');
+    eq(S('La bomba se lava con agua de lluvia'), { ok: false, reason: 'missing' }, 'no está');
+    // En validateExamBank (completeItem): misma regla.
+    const chs = [{ id: 'c1', moduleId: 'm1' }];
+    const q = { id: 'X-01', type: 'truefalse', chapterId: 'c1', level: 'aplicar', stem: 'Afirmación sobre el tablero eléctrico de la sala de bombas.', explanation: 'El capítulo prohíbe abrir el tablero con las manos húmedas: es un riesgo eléctrico directo.', evidence: 'se permite abrir el tablero eléctrico de la sala de bombas con las manos húmedas', answer: false, whyWrong: 'Quien marca verdadero ignora la prohibición del capítulo.' };
+    const errs = EB.validateExamBank({ questions: [q] }, { scope: 'module', chapters: chs, chapterMd: new Map([['c1', md]]) }).errors.filter((e) => e.code === 'EXAM_BANK_EVIDENCE');
+    assert(errs.length === 1 && /NIEGA/.test(errs[0].message), JSON.stringify(errs));
+    const ok = EB.validateExamBank({ questions: [{ ...q, evidence: 'No se permite abrir el tablero eléctrico de la sala de bombas con las manos húmedas' }] }, { scope: 'module', chapters: chs, chapterMd: new Map([['c1', md]]) }).errors.filter((e) => e.code === 'EXAM_BANK_EVIDENCE');
+    eq(ok, [], 'la evidencia completa con su negación vale');
+  });
   await check('BANKOPT: FailItemDto acepta examBankDraftArtifactId (UUID, opcional) y rechaza otra cosa; whitelist estricta como en main.ts', async () => {
     const { plainToInstance } = require('class-transformer');
     const { validate } = require('class-validator');

@@ -238,6 +238,61 @@ export function examTokens(normalized: string): string[] {
 }
 
 /**
+ * BANKOPT fix round 3 — la evidencia respalda lo que el capítulo AFIRMA. Un fragmento textual cuya oración
+ * lo niega antes («No [fragmento]…») o lo condiciona/exceptúa después («[fragmento], excepto…», «… solo si…»)
+ * no prueba la afirmación de la pregunta → EXAM_BANK_EVIDENCE.
+ *  - El Markdown se normaliza POR LÍNEA (`normalizeExamText`, mismo resultado que el texto completo) y se
+ *    unen con un espacio; los límites de oración son los de línea y `.`/`!`/`?` seguidos de espacio o fin.
+ *  - Por cada aparición de la evidencia normalizada: prefijo = desde el inicio de su oración; sufijo =
+ *    hasta el final de su oración. Basta UNA aparición sin negación en el prefijo ni condición en el sufijo.
+ * Espejo byte a byte en el ejecutor (45: dynExamEvidenceSupported).
+ */
+export const EXAM_EVIDENCE_PREFIX_NEGATIONS: readonly string[] = ['no', 'nunca', 'jamas', 'ni', 'sin', 'tampoco', 'nadie', 'nada', 'ninguno', 'ninguna', 'ningun', 'ningunos', 'ningunas'];
+export const EXAM_EVIDENCE_SUFFIX_CONDITIONS: readonly string[] = ['excepto', 'salvo', 'si', 'cuando', 'mientras', 'sino'];
+export const EXAM_EVIDENCE_SUFFIX_CONDITION_PAIRS: readonly string[] = ['a menos', 'siempre que', 'siempre y', 'solo si', 'solo cuando', 'solamente si', 'solamente cuando', 'unicamente si', 'unicamente cuando', 'hasta que', 'con tal', 'en caso', 'a no'];
+export type ExamEvidenceSupport = { ok: true } | { ok: false; reason: 'missing' | 'negated' | 'conditioned' };
+export interface ExamEvidenceIndex { norm: string; bounds: number[] }
+export function examEvidenceIndex(chapterMd: string): ExamEvidenceIndex {
+  let norm = '';
+  const bounds: number[] = [0];
+  for (const line of String(chapterMd ?? '').split('\n')) {
+    const n = normalizeExamText(line);
+    if (!n) continue;
+    if (norm) norm += ' ';
+    const start = norm.length;
+    bounds.push(start);
+    norm += n;
+    const re = /[.!?]+(?=\s|$)/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(n))) bounds.push(start + m.index + m[0].length);
+    bounds.push(norm.length);
+  }
+  bounds.sort((a, b) => a - b);
+  return { norm, bounds };
+}
+export function examEvidenceSupport(chapter: string | ExamEvidenceIndex, evidence: string): ExamEvidenceSupport {
+  const ev = normalizeExamText(evidence);
+  if (!ev) return { ok: false, reason: 'missing' };
+  const { norm, bounds } = typeof chapter === 'string' ? examEvidenceIndex(chapter) : chapter;
+  let found = false;
+  let reason: 'negated' | 'conditioned' = 'negated';
+  for (let at = norm.indexOf(ev); at >= 0; at = norm.indexOf(ev, at + 1)) {
+    found = true;
+    const end = at + ev.length;
+    let sStart = 0;
+    let sEnd = norm.length;
+    for (const b of bounds) { if (b <= at && b > sStart) sStart = b; if (b >= end && b < sEnd) sEnd = b; }
+    const pre = examTokens(norm.slice(sStart, at));
+    const post = examTokens(norm.slice(end, sEnd));
+    if (pre.some((t) => EXAM_EVIDENCE_PREFIX_NEGATIONS.includes(t))) { reason = 'negated'; continue; }
+    const pairs = post.slice(0, -1).map((t, k) => t + ' ' + post[k + 1]);
+    if (post.some((t) => EXAM_EVIDENCE_SUFFIX_CONDITIONS.includes(t)) || pairs.some((p) => EXAM_EVIDENCE_SUFFIX_CONDITION_PAIRS.includes(p))) { reason = 'conditioned'; continue; }
+    return { ok: true };
+  }
+  return found ? { ok: false, reason } : { ok: false, reason: 'missing' };
+}
+
+/**
  * ¿`inner` está contenido en `outer` por palabras completas? (secuencia contigua de tokens;
  * «5 mg/L» NO está en «15 mg/L», «2 horas» NO está en «12 horas», «agua» SÍ está en «agua tibia»).
  * Ambos se normalizan con `normalizeExamText`; un texto sin tokens nunca está contenido.
@@ -674,15 +729,18 @@ export function validateExamBank(doc: unknown, ctx: ExamBankValidationContext): 
 
   // ── Evidencia en el capítulo (si hay Markdown) ──
   if (ctx.chapterMd) {
-    const normMd = new Map<string, string>();
+    const idx = new Map<string, ExamEvidenceIndex>();
     for (const { q, i } of valid) {
       if (typeof q.chapterId !== 'string' || typeof q.evidence !== 'string') continue;
       const md = ctx.chapterMd.get(q.chapterId);
       if (typeof md !== 'string') continue;
-      if (!normMd.has(q.chapterId)) normMd.set(q.chapterId, normalizeExamText(md));
-      const ev = normalizeExamText(q.evidence);
-      if (!ev || !(normMd.get(q.chapterId) as string).includes(ev)) {
-        E.push(`$.questions[${i}].evidence`, 'EXAM_BANK_EVIDENCE', `${idOf(q, i)}: la evidencia no aparece en el texto del capítulo ${q.chapterId}`);
+      if (!idx.has(q.chapterId)) idx.set(q.chapterId, examEvidenceIndex(md));
+      const sup = examEvidenceSupport(idx.get(q.chapterId) as ExamEvidenceIndex, q.evidence);
+      if (sup.ok === false) {
+        const why = sup.reason === 'missing' ? 'la evidencia no aparece en el texto del capítulo'
+          : sup.reason === 'negated' ? 'la oración del capítulo NIEGA ese fragmento (negación antes) en el capítulo'
+            : 'la oración del capítulo CONDICIONA o exceptúa ese fragmento (excepto/salvo/si/cuando… después) en el capítulo';
+        E.push(`$.questions[${i}].evidence`, 'EXAM_BANK_EVIDENCE', `${idOf(q, i)}: ${why} ${q.chapterId}`);
       }
     }
   }
