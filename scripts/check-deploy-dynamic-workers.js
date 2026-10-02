@@ -656,10 +656,15 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     assert(!/_CAL_|CAL_ACTION|inputs\.calibration/.test(deployJob.replace(/^\s*if:.*$/m, '')), 'el job de deploy no lee inputs de calibración');
     assert(!fs.existsSync(path.join(repoRoot, '.github/workflows/staging-calibration.yml')), 'sin workflow solo-dispatch no registrado');
     const C = require(path.resolve('scripts/staging-v21-calibration.js'));
-    const pol = { limits: { maxCostPerRun: '10', maxCostPerCourse: '15', monthlyCapStaging: '50' }, on_exceed: 'ADMIN_APPROVAL', require_human_approval_for_real_spend: true };
+    // #583 (aprobado por el usuario 2026-10-02): maxCostPerRun de staging 15, misma constante que staging-budget-policy.js.
+    const pol = { limits: { maxCostPerRun: '15', maxCostPerCourse: '15', monthlyCapStaging: '50' }, on_exceed: 'ADMIN_APPROVAL', require_human_approval_for_real_spend: true };
+    eq(C.APPROVED.limits.maxCostPerRun, String(require(path.resolve('scripts/staging-budget-policy.js')).STAGING_MAX_COST_PER_RUN), 'una sola fuente con staging-budget-policy');
     assert(C.policyMatches(pol), 'política aprobada reconocida');
-    assert(C.policyMatches({ ...pol, limits: { maxCostPerRun: 10, maxCostPerCourse: '15.00', monthlyCapStaging: '50' } }), 'numérico equivalente');
-    assert(!C.policyMatches({ ...pol, on_exceed: 'BLOCK' }) && !C.policyMatches({ ...pol, limits: { ...pol.limits, maxCostPerRun: '11' } }) && !C.policyMatches(null), 'otra política ≠ aprobada');
+    assert(C.policyMatches({ ...pol, limits: { maxCostPerRun: 15, maxCostPerCourse: '15.00', monthlyCapStaging: '50' } }), 'numérico equivalente');
+    assert(!C.policyMatches({ ...pol, on_exceed: 'BLOCK' }) && !C.policyMatches({ ...pol, limits: { ...pol.limits, maxCostPerRun: '10' } }) && !C.policyMatches(null), 'otra política (p.ej. la vieja de 10) ≠ aprobada');
+    // La política que deja el deploy ([4h10]) y la de la acción `policy` de calibración son la misma: no se pisan.
+    const SBP = require(path.resolve('scripts/staging-budget-policy.js'));
+    eq(SBP.planPolicy({ scope: 'global', scope_id: null, version: 7, limits: { ...pol.limits }, on_exceed: 'ADMIN_APPROVAL', require_human_approval_for_real_spend: true }).action, 'noop', 'calibración → deploy: sin versión nueva');
     assert(!C.policyMatches({ ...pol, limits: { ...pol.limits, maxCostPerProvider: { gamma: '1' } } }), 'claves extra ≠ aprobada');
     const course = { title: '[CALIBRATION V2.1] Provider Cost Verification' };
     const est = { totals: { expected: '2.32', max: '5.41' } };
