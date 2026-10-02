@@ -57,10 +57,10 @@ function courseIntro() {
     schemaVersion: 1,
     welcome: words(120, 0),
     competencies: [
-      'Reconoce el comportamiento del aceite bajo presión en equipos de planta.',
-      'Selecciona el procedimiento de inspección adecuado para cada componente.',
-      'Registra observaciones técnicas con precisión y lenguaje claro.',
-      'Coordina con su equipo una intervención segura antes de actuar.',
+      'Reconocer el comportamiento del aceite bajo presión en equipos de planta.',
+      'Seleccionar el procedimiento de inspección adecuado para cada componente.',
+      'Registrar observaciones técnicas con precisión y lenguaje claro.',
+      'Coordinar con el equipo una intervención segura antes de actuar.',
     ],
     methodology_note: 'Estudia cada tema con ejemplos de tu propia faena y anota las decisiones que tomarías en terreno.',
     closing: 'Tu criterio técnico es la mejor herramienta de mantenimiento que puedes llevar a la planta.',
@@ -120,11 +120,15 @@ function experience(chapterId, title) {
     bridge_to_next: 'Con esta base, el siguiente paso es aplicar el mismo criterio a un caso nuevo.',
   };
 }
-function interactions(indices) {
+// #542 (I1, FE fix/v542-fe): V/F alternados empezando por el valor que pide el prompt («la PRIMERA afirmación
+// truefalse es VERDADERA|FALSA») y un distractor tan largo como la correcta: sin esto, el lint de sesgo del
+// cliente pide un reintento dirigido más por item (retriesSeen.video_interactions > 1).
+function interactions(indices, firstTrue) {
+  let tf = 0;
   return {
     checkpoints: indices.map((index, i) => (i % 2 === 0
-      ? { index, kind: 'multichoice', question: '¿Qué señal indica una pérdida de presión en este tramo?', answers: [{ text: 'Respuesta lenta del actuador', correct: true }, { text: 'Color de la pintura', correct: false }, { text: 'Marca del filtro', correct: false }], feedbackCorrect: 'Exacto: la respuesta lenta es la primera señal.', feedbackIncorrect: 'Revisa cómo responde el actuador bajo carga.' }
-      : { index, kind: 'truefalse', question: 'Registrar la temperatura ayuda a anticipar fallas.', correct: true, feedbackCorrect: 'Correcto: la tendencia anticipa la falla.', feedbackIncorrect: 'Sí ayuda: la tendencia anticipa la falla.' })),
+      ? { index, kind: 'multichoice', question: '¿Qué señal indica una pérdida de presión en este tramo?', answers: [{ text: 'Respuesta lenta del actuador', correct: true }, { text: 'Color de la pintura del equipo', correct: false }, { text: 'Marca del filtro', correct: false }], feedbackCorrect: 'Exacto: la respuesta lenta es la primera señal.', feedbackIncorrect: 'Revisa cómo responde el actuador bajo carga.' }
+      : { index, kind: 'truefalse', question: 'Registrar la temperatura ayuda a anticipar fallas.', correct: (tf++ % 2 === 0) === (firstTrue !== false), feedbackCorrect: 'Correcto: la tendencia anticipa la falla.', feedbackIncorrect: 'Sí ayuda: la tendencia anticipa la falla.' })),
   };
 }
 // Respuestas correctas conocidas (las usa el QA de navegador para responder en el reproductor real).
@@ -132,9 +136,9 @@ const H5P = {
   questionset: {
     title: 'Comprueba tu comprensión',
     questions: [
-      { kind: 'multichoice', question: '¿Qué mide un manómetro en el circuito?', answers: [{ text: 'La presión del fluido', correct: true, feedback: 'Bien.' }, { text: 'El caudal del fluido', correct: false }, { text: 'La viscosidad', correct: false }, { text: 'La temperatura', correct: false }] },
+      { kind: 'multichoice', question: '¿Qué mide un manómetro en el circuito?', answers: [{ text: 'La presión del fluido', correct: true, feedback: 'Bien.' }, { text: 'El caudal total del fluido', correct: false }, { text: 'La viscosidad', correct: false }, { text: 'La temperatura', correct: false }] },
       { kind: 'multichoice', question: '¿Qué componente genera el caudal?', answers: [{ text: 'La bomba', correct: true }, { text: 'El filtro', correct: false }, { text: 'El estanque', correct: false }, { text: 'La manguera', correct: false }] },
-      { kind: 'multichoice', question: '¿Qué indica un aceite oscuro y con olor a quemado?', answers: [{ text: 'Degradación térmica', correct: true }, { text: 'Aceite nuevo', correct: false }, { text: 'Nivel correcto', correct: false }, { text: 'Filtro limpio', correct: false }] },
+      { kind: 'multichoice', question: '¿Qué indica un aceite oscuro y con olor a quemado?', answers: [{ text: 'Degradación térmica', correct: true }, { text: 'Aceite nuevo', correct: false }, { text: 'Nivel correcto del aceite', correct: false }, { text: 'Filtro limpio', correct: false }] },
       { kind: 'truefalse', question: 'El bloqueo de energía se aplica antes de intervenir.', correct: true, feedbackCorrect: 'Sí.', feedbackWrong: 'Siempre se bloquea antes.' },
       { kind: 'truefalse', question: 'Una fuga pequeña nunca afecta la presión del sistema.', correct: false, feedbackCorrect: 'Correcto.', feedbackWrong: 'Toda fuga afecta la presión.' },
     ],
@@ -209,7 +213,7 @@ function createLlmV3({ base, chapterIdFromText, examBankContract, h5p2 }) {
         const v2 = !!(h5p2 && prompt.indexOf(h5p2.markers.videoInteractionsV2Prompt) >= 0);
         const reflIdx = v2 ? [...prompt.matchAll(new RegExp(h5p2.markers.reflectionLineRegex, 'gm'))].map((m) => Number(m[1])) : [];
         rec(v2 ? 'video_interactions_v2' : 'video_interactions', id, { invalid: bad, retry, checkpoints: indices.length, reflections: reflIdx.length });
-        const doc = bad ? INVALID.video_interactions(indices) : interactions(indices);
+        const doc = bad ? INVALID.video_interactions(indices) : interactions(indices, !/la PRIMERA afirmación truefalse es FALSA/.test(prompt));
         if (v2 && reflIdx.length) {
           const R = h5p2.videoInteractionsV2.reflections;
           doc.reflections = reflIdx.map((index, i) => ({ index, ...R[i % R.length] }));

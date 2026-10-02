@@ -284,7 +284,8 @@ const FLOWS = {
     if (k !== 'ok') throw new Error(`BL Comprobar: ${k}`);
   },
   // Video interactivo: en cada checkpoint planeado (468 s ⇒ 5) busca, responde lo correcto
-  // (multichoice / verdadero-falso alternados, como la fixture de llm-v3.js), "Comprobar";
+  // (multichoice / verdadero-falso alternados, como la fixture de llm-v3.js; el valor de cada V/F
+  // sale del contenido H5P), "Comprobar";
   // al final "Enviar respuestas".
   async interactivevideo(b) {
     const plan = H5PLIB.planInteractionCheckpoints(468);
@@ -293,7 +294,11 @@ const FLOWS = {
       const cp = plan[i];
       const mc = i % 2 === 0;
       const q = mc ? '¿Qué señal indica una pérdida de presión en este tramo?' : 'Registrar la temperatura ayuda a anticipar fallas.';
-      const pick = mc ? 'Respuesta lenta del actuador' : 'Verdadero';
+      // V542: las V/F de la fixture alternan su valor (lint de sesgo del cliente): la correcta se lee del
+      // propio contenido H5P (H5P.TrueFalse en ese segundo: params.correct 'true' | 'false').
+      const pick = mc ? 'Respuesta lenta del actuador'
+        : await b.evaluate(inH5p(`const ia=(inst.options.assets.interactions||[]).filter(x=>/^H5P\.TrueFalse /.test(x.action.library)&&Math.abs(x.duration.from-${cp.atSec})<1)[0];return ia?(ia.action.params.correct==='true'?'Verdadero':'Falso'):null;`));
+      if (!pick) throw new Error(`IV checkpoint ${cp.index}: sin la V/F del contenido en ${cp.atSec} s`);
       await b.evaluate(inH5p(`inst.video.seek(${cp.atSec + 1});inst.video.play();return 1;`));
       await b.waitFor(inH5p(`return [...d.querySelectorAll('.h5p-interaction')].some(e=>e.offsetParent!==null&&e.innerText.includes(${JSON.stringify(q)}))?1:0;`), { timeoutMs: 30000, what: `IV checkpoint ${cp.index}` });
       const r = await b.evaluate(inH5p(`const box=[...d.querySelectorAll('.h5p-interaction')].find(e=>e.offsetParent!==null&&e.innerText.includes(${JSON.stringify(q)}));const o=[...box.querySelectorAll('.h5p-answer, .h5p-true-false-answer')].find(e=>e.innerText.trim()===${JSON.stringify(pick)});if(!o)return 'sin opción';o.click();const k=[...box.querySelectorAll('button')].find(x=>x.innerText.trim()==='Comprobar');if(!k)return 'sin Comprobar';k.click();return 'ok';`));
