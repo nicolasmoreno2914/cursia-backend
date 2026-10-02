@@ -28,6 +28,23 @@
 //      texto; cualquier otra expresión sale como `__expr__` y el check la exige en su
 //      lista revisada (texto exacto) o falla.
 // Puro (solo lee archivos).
+//
+// GATE BEST-EFFORT (fix round 2, N1): un escáner estático nunca es completo. La GARANTÍA está en runtime:
+// todo fallo sin regla explícita queda D retenido + alerta, con `unclassified = true` en
+// generation_item_attempts, y scripts/verify-rel-no-unclassified.js hace fallar la compuerta E2E si una
+// corrida produjo alguno. Casos que el escáner SÍ detecta (auto-tests en scripts/fixtures/rel-gate):
+// literales/templates/concatenación/ternarios, constantes, helpers conocidos, variables (todas sus
+// asignaciones en la función envolvente), desestructuración, parámetros, template con el código pegado a
+// `${…}`, spread/argumentos faltantes, alias/bind, `?.(`, `['failItem']`, `fail(<cualquiera>, …)` del worker de
+// proveedores; en el frontend `error:`/`msg:`, helpers `*fail*(`, `backendDynFail(` (también `obj.`/`window.`),
+// shorthand `{ error }`, clave computada y `X.error = …`.
+// LÍMITES CONOCIDOS (no se detectan; los cubre la garantía de runtime):
+//   - sombreado (un parámetro de un callback interno con el mismo nombre que una variable externa);
+//   - reasignación DESPUÉS de la llamada dentro de un bucle;
+//   - mensajes construidos en otro módulo y pasados por referencia/propiedad (p.ej. `o.deps.msg`);
+//   - en el frontend, la lista de pasamanos va por NOMBRE de la expresión (`error`, `msg`, `e.msg`,
+//     `result.error`, `mapped.msg`): una variable NUEVA con uno de esos nombres pasa; también
+//     `throw new Error('…')` crudo (cae a D retenido en runtime).
 // ══════════════════════════════════════════════════════════════════════════
 
 const fs = require('fs');
@@ -72,6 +89,24 @@ function stripComments(src) {
     }
     out += c;
     i++;
+  }
+  return out;
+}
+
+/** Reemplaza el contenido de strings y templates por espacios (conserva largo y saltos de línea). */
+function blankStrings(src) {
+  let out = '';
+  let quote = null;
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    if (quote) {
+      if (c === '\\') { out += '  '; i++; continue; }
+      if (c === quote) { quote = null; out += c; continue; }
+      out += c === '\n' ? '\n' : ' ';
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') quote = c;
+    out += c;
   }
   return out;
 }
@@ -287,6 +322,8 @@ function resolveExpr(expr, ctx, depthGuard = 0) {
     }
     if (body.startsWith('${')) return { unresolved: true };
     const t = leadingToken(body);
+    // N1: `lease_expired${s}` — el código sigue dentro de la interpolación (no se puede leer).
+    if (t && body.slice(body.indexOf(t) + t.length).startsWith('${')) return { unresolved: true };
     return t ? { codes: [t] } : { unresolved: true };
   }
   const call = /^([A-Za-z_][A-Za-z0-9_]*)\(/.exec(e);
@@ -305,6 +342,14 @@ function resolveExpr(expr, ctx, depthGuard = 0) {
     // de la función que contiene la llamada y la llamada (ramas if/else/switch incluidas). Se unen los códigos de
     // todas; si ALGUNA no se puede resolver, la variable entera queda sin resolver (el gate falla).
     const region = ctx.src.slice(functionStartBefore(ctx.src, ctx.idx), ctx.idx);
+    // N1 (casos baratos): un nombre que es destino de una desestructuración o parámetro de alguna función de la
+    // región no se puede leer → sin resolver.
+    const nameRe = `\\b${e}\\b`;
+    if (new RegExp(`(?:\\{[^{}=;]*${nameRe}[^{}=;]*\\}|\\[[^\\[\\]=;]*${nameRe}[^\\[\\]=;]*\\])\\s*=(?![=>])`).test(region)) return { unresolved: true };
+    for (const pm of region.matchAll(/\bfunction\b[^(]*\(([^)]*)\)|\(([^()]*)\)\s*(?::\s*[^=;{]+)?=>|^\s*(?:async\s+)?[A-Za-z_]\w*\s*\(([^()]*)\)\s*(?::\s*[^{;]+)?\{/gm)) {
+      const params = pm[1] ?? pm[2] ?? pm[3] ?? '';
+      if (new RegExp(`(?:^|[,(\\s{])(?:\\.\\.\\.)?${e}\\s*[?:=,)]|(?:^|[,(\\s{])(?:\\.\\.\\.)?${e}\\s*$`).test(params)) return { unresolved: true };
+    }
     const re = new RegExp(`(?:^|[^.\\w])${e}\\s*(?::\\s*[A-Za-z<>\\[\\]| ]+?\\s*)?=(?![=>])\\s*`, 'g');
     let m;
     const codes = [];
@@ -336,7 +381,7 @@ const EMITTER_PATTERNS = [
   { re: /\.failItem\(/g, msgArg: 2 },
   { re: /(?<![\w.])failItemDetailed\(|\.failItemDetailed\(/g, msgArg: 2 },
   { re: /(?<![\w.])applyItemFailure\(/g, msgArg: 2 },
-  { re: /(?<![\w.])fail\(\s*deps\s*,/g, msgArg: 2 },
+  { re: /(?<![\w.])fail\(/g, msgArg: 2, onlyFiles: ['workers/provider-real/real-providers.ts'] },
   { re: /(?<![\w.])failJob\(/g, msgArg: 3 },
 ];
 
@@ -357,15 +402,20 @@ function scanBackendEmitters(repoRoot) {
     if (rel.startsWith('modules/reliability/')) continue;
     const src = stripComments(fs.readFileSync(f, 'utf8'));
     for (const p of EMITTER_PATTERNS) {
+      if (p.onlyFiles && !p.onlyFiles.includes(rel) && !rel.startsWith('workers/__fixture__')) continue;
       p.re.lastIndex = 0;
       let m;
       while ((m = p.re.exec(src))) {
         const open = m.index + m[0].lastIndexOf('(');
         if (isDefinition(src, m.index + (m[0].startsWith('.') ? 1 : 0))) continue;
         const args = readArgs(src, open);
-        if (args.length <= p.msgArg) continue;
         // Firma de un método (parámetros tipados), no una llamada.
         if (args.some((a) => /^[A-Za-z_]+\??\s*:\s*[A-Za-z{]/.test(a) && !/^['"`]/.test(a))) continue;
+        // N1: spread / argumentos faltantes → el mensaje no se puede leer (antes se saltaba en silencio).
+        if (args.length <= p.msgArg || args.slice(0, p.msgArg + 1).some((a) => a.startsWith('...'))) {
+          emitters.push({ file: rel, line: lineOf(src, m.index), expr: `__args__ ${norm(args.join(','))}`, key: `${rel}#__args__`, codes: null });
+          continue;
+        }
         const expr = args[p.msgArg];
         const key = `${rel}#${norm(stripSlice(expr))}`;
         let codes = null;
@@ -376,6 +426,16 @@ function scanBackendEmitters(repoRoot) {
         }
         emitters.push({ file: rel, line: lineOf(src, m.index), expr: norm(stripSlice(expr)), key, codes });
       }
+    }
+    // N1 (casos baratos): uso INDIRECTO de un emisor — alias (`const f = scheduler.failItem`, `.bind(`),
+    // llamada opcional (`failItem?.(`) o por corchetes (`['failItem'](`) — no se puede leer → sin resolver.
+    // Las listas de import/export no son usos.
+    const blank = blankStrings(src).replace(/^[ \t]*(?:import|export)\b[^;]*?\bfrom\b[^;\n]*;?/gm, (x) => x.replace(/[^\n]/g, ' '));
+    for (const im of blank.matchAll(/\b(failItem|failItemDetailed|applyItemFailure)\b(?!\s*\()(?!\s*:)(?!\s*\?\s*:)/g)) {
+      emitters.push({ file: rel, line: lineOf(src, im.index), expr: `__indirect__ ${src.slice(im.index, im.index + 40).replace(/\s+/g, ' ')}`, key: `${rel}#__indirect__`, codes: null });
+    }
+    for (const im of src.matchAll(/\[\s*['"`](failItem|failItemDetailed|applyItemFailure)['"`]\s*\]/g)) {
+      emitters.push({ file: rel, line: lineOf(src, im.index), expr: `__indirect__ ${im[0]}`, key: `${rel}#__indirect__`, codes: null });
     }
     // Runtime guard de presupuesto: blockItemForBudget → budget_exceeded (scheduler lo antepone siempre).
     if (/\bblockItemForBudget\(/.test(src) && rel === 'modules/dynamic-generation/scheduler.service.ts') {
@@ -501,6 +561,20 @@ function scanFrontendExecutor(file) {
     const args = readArgs(src, m.index + m[0].length - 1);
     const at = name === 'backendDynFail' ? 2 : 0;
     if (args.length > at) push(m.index, args[at]);
+  }
+  // N1 (casos baratos): `X.error = …` / `X.msg = …`, shorthand `{ error }`, clave computada `['error']: …` y
+  // `obj.backendDynFail(` / `window.backendDynFail(`.
+  const reMember = /[\w$\])]\.(?:error|msg)\s*=(?![=>])\s*/g;
+  while ((m = reMember.exec(src))) push(m.index, readValue(src, m.index + m[0].length));
+  const reShort = /[{,]\s*(error|msg)\s*(?=[,}])/g;
+  while ((m = reShort.exec(src))) out.push({ line: lineOf(src, m.index), text: `__expr__ shorthand:${m[1]}` });
+  const reComputed = /\[\s*(['"`])(error|msg)\1\s*\]\s*:\s*/g;
+  while ((m = reComputed.exec(src))) out.push({ line: lineOf(src, m.index), text: `__expr__ computed:${readValue(src, m.index + m[0].length).slice(0, 120)}` });
+  const reDot = /\.backendDynFail\(/g;
+  while ((m = reDot.exec(src))) {
+    const args = readArgs(src, m.index + m[0].length - 1);
+    if (args.length >= 3) push(m.index, args[2]);
+    else out.push({ line: lineOf(src, m.index), text: `__expr__ args:${args.join(',').slice(0, 120)}` });
   }
   const reCode = /\berrorCode\s*:\s*(['"`])([A-Za-z0-9_]+)\1/g;
   while ((m = reCode.exec(src))) out.push({ line: lineOf(src, m.index), text: `__errorCode__ ${m[2]}` });

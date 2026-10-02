@@ -110,6 +110,12 @@ export interface FailureVerdict {
   reportedCode?: string | null;
   /** C1: true si el errorCode reportado se ignoró (no lo puede producir esa fuente, o no subía la severidad). */
   reportedCodeIgnored?: boolean;
+  /** N2: el piso de dinero (deny-list) subió el veredicto a C. */
+  moneyFloor?: boolean;
+  /** N5: el proveedor reportó cuota/crédito/auth (contexto que se conserva aunque la clase sea C). */
+  providerConfigIssue?: boolean;
+  /** N5: unidades ya pagadas de este intento (p.ej. trozos de TTS antes del que falló); un reenvío las pagaría otra vez. */
+  paidUnits?: number;
 }
 
 /** Longitud máxima de un código estable (columna failure_code). */
@@ -199,7 +205,7 @@ const WORKER_ITEM_TYPES = new Set(['video', 'presentation', 'audio_welcome', 'au
  * palabras de cuota es un transitorio (A con backoff), no esto.
  */
 export const PROVIDER_CONFIG_RE =
-  /insufficient_quota|exceeded your current quota|\bquota\b|\bcredits?\b|cr[eé]ditos?\b|\bbalance\b|billing|facturaci[oó]n|payment required|\bHTTP 40[123]\b|\b40[123] (?:Unauthorized|Payment Required|Forbidden)\b|invalid[_ ]api[_ ]key|unauthori[sz]ed|forbidden/i;
+  /insufficient_quota|exceeded your current quota|\bquota\b|\bcuota\b|\bsaldo\b|\bcredits?\b|cr[eé]ditos?\b|\bbalance\b|billing|facturaci[oó]n|payment required|\bHTTP 40[123]\b|\b40[123] (?:Unauthorized|Payment Required|Forbidden)\b|invalid[_ ]api[_ ]key|unauthori[sz]ed|forbidden/i;
 
 /** Reglas de LLAMADAS a un proveedor pagado: a ellas se aplica el chequeo de configuración del proveedor (I1). */
 const PROVIDER_CALL_RULES: Readonly<Record<string, FailureProvider | null>> = Object.freeze({
@@ -216,6 +222,29 @@ const PROVIDER_CALL_RULES: Readonly<Record<string, FailureProvider | null>> = Ob
 
 /** Ids de reglas a las que se aplica el chequeo de configuración del proveedor (check). */
 export const PROVIDER_CALL_RULE_IDS: readonly string[] = Object.freeze(Object.keys(PROVIDER_CALL_RULES));
+
+/** N5: trozos de TTS ya pagados antes del que falló («chunk N/M» → N-1). */
+function ttsPaidChunks(error: string): number {
+  const m = /chunk (\d+)\/(\d+)/.exec(error);
+  return m ? Math.max(0, Number(m[1]) - 1) : 0;
+}
+
+/** N3: proveedor por el código mismo (prefijos videogen, gamma o GAMMA, openai_tts, youtube). */
+function providerFromCode(code: string): FailureProvider | null {
+  if (/^(videogen|video_|real_video|ambiguous_video)/i.test(code)) return 'videogen';
+  if (/^gamma|^GAMMA_|^theme_resolution/i.test(code)) return 'gamma';
+  if (/^openai|^tts|^insufficient_quota/i.test(code)) return 'openai';
+  if (/youtube|^blocked_(auth|quota)|^reauth|^channel_unresolved|^needs_youtube|^wait_quota|^oauth/i.test(code)) return 'youtube';
+  return null;
+}
+
+/** N3: proveedor por tipo de item cuando el mensaje no lo nombra. */
+function providerFromItemType(itemType: string | null): FailureProvider | null {
+  if (itemType === 'video') return 'videogen';
+  if (itemType === 'presentation') return 'gamma';
+  if (itemType === 'audio_welcome' || itemType === 'audiobook_chapter') return 'openai';
+  return null;
+}
 
 function providerFromMessage(error: string): FailureProvider | null {
   const m = /\b(openai|anthropic|gamma|videogen|youtube)\b/i.exec(error);
@@ -253,6 +282,9 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   { id: 'user_stopped', codes: ['user_stopped'], class: 'A', strategy: 'retry_backoff', rounds: 1 },
 
   // ── IA (Anthropic; proxy del navegador o gateway del servidor) ─────────────
+  // N6 (restricción de diseño para R3): un veredicto de auth/crédito/proveedor de Anthropic REPORTADO por el navegador
+  // (mensajes del proxy, `Sin disponibilidad…`, errorCode llm_auth_rejected/llm_credit_exhausted) nunca puede abrir un
+  // breaker GLOBAL de `anthropic`: solo uno por dueño, salvo corroboración del proxy/gateway del servidor.
   { id: 'llm_transient', codes: ['browser_llm_transient', 'llm_transient', 'llm_empty_response', 'llm_network'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'anthropic', rounds: 3 },
   {
     id: 'llm_config',
@@ -316,7 +348,8 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     // créditos medidos (el worker lo anota en el mensaje) es una falla conocida → B (una generación nueva).
     id: 'gamma_generation_failed', codes: ['gamma_generation_failed'],
     class: 'C', strategy: 'hold_for_human', paidRisk: 'uncertain', provider: 'gamma', rounds: 0, humanReason: 'duplicate_charge', adminAction: 'reconcile_provider',
-    refine: ({ error }) => (/cr[eé]ditos medidos/i.test(error)
+    // N4: anclado al SUFIJO que agrega el worker (real-providers.ts), nunca al texto de Gamma que va antes.
+    refine: ({ error }) => (/\[créditos medidos: \d+(?:\.\d+)?\]\. No se reenvía sola/.test(error)
       ? { class: 'B', strategy: 'regenerate_targeted', paidRisk: 'measured', rounds: 1, humanReason: undefined, adminAction: undefined }
       : null),
   },
@@ -415,8 +448,8 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     // Antes del primer trozo cobrado → A. Después de trozos ya cobrados (chunk N/M, N > 1) → C (user decision 1).
     id: 'tts_failed', codes: ['tts_failed'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'openai', rounds: 3,
     refine: ({ error }) => {
-      const m = /chunk (\d+)\/(\d+)/.exec(error);
-      return m && Number(m[1]) > 1 ? { class: 'C', strategy: 'auto_resubmit_once', rounds: 1, adminAction: 'reconcile_provider', humanReason: 'duplicate_charge' } : null;
+      const n = ttsPaidChunks(error);
+      return n > 0 ? { class: 'C', strategy: 'auto_resubmit_once', rounds: 1, adminAction: 'reconcile_provider', humanReason: 'duplicate_charge', paidRisk: 'uncertain' } : null;
     },
   },
   {
@@ -584,11 +617,35 @@ export function currentRecoveryOf(error: string, itemType: string | null | undef
 function verdictOf(rule: Rule, code: string, ctx: RefineCtx, extra: Partial<FailureVerdict>): FailureVerdict {
   // I1: cuota/crédito/auth de un proveedor ANTES de los refines del item (p.ej. el chunk N/M del TTS).
   const isProviderCall = Object.prototype.hasOwnProperty.call(PROVIDER_CALL_RULES, rule.id);
-  const providerCfg = isProviderCall ? (PROVIDER_CALL_RULES[rule.id] ?? providerFromMessage(ctx.error) ?? undefined) : undefined;
-  const patch = isProviderCall && PROVIDER_CONFIG_RE.test(ctx.error)
-    ? ({ class: 'D', strategy: 'wait_provider', scope: 'provider', rounds: 0, humanReason: 'config', provider: providerCfg, adminAction: 'retry_item' } as Partial<Rule>)
-    : rule.refine ? rule.refine(ctx) : null;
-  const r: Rule = patch ? { ...rule, ...patch } : rule;
+  const providerConfig = isProviderCall && PROVIDER_CONFIG_RE.test(ctx.error);
+  let patch: Partial<Rule> | null;
+  let extraCtx: Partial<FailureVerdict> = {};
+  if (providerConfig) {
+    const provider = PROVIDER_CALL_RULES[rule.id] ?? providerFromMessage(ctx.error) ?? providerFromItemType(ctx.itemType);
+    const paidUnits = rule.id === 'tts_failed' ? ttsPaidChunks(ctx.error) : 0;
+    extraCtx = { providerConfigIssue: true, ...(paidUnits > 0 ? { paidUnits } : {}) };
+    if (paidUnits > 0) {
+      // N5: trozos ya pagados y hoy un reintento re-sintetiza TODO (no hay cursor por trozo hasta R3/R8) → no se
+      // puede garantizar que la reanudación no los vuelva a pagar → C (reconciliación), nunca retry_item.
+      patch = { class: 'C', strategy: 'hold_for_human', scope: 'item', rounds: 0, humanReason: 'duplicate_charge', provider: provider ?? undefined,
+        adminAction: 'reconcile_provider', paidRisk: 'uncertain' };
+    } else if (provider) {
+      patch = { class: 'D', strategy: 'wait_provider', scope: 'provider', rounds: 0, humanReason: 'config', provider, adminAction: 'retry_item' };
+    } else {
+      // N3: nunca scope provider sin proveedor (p.ej. un 403 del Storage en un unexpected_error) → D retenido, scope item.
+      patch = { class: 'D', strategy: 'hold_for_human', scope: 'item', rounds: 0, humanReason: 'config', provider: undefined, adminAction: 'retry_item' };
+    }
+  } else {
+    patch = rule.refine ? rule.refine(ctx) : null;
+  }
+  let r: Rule = patch ? { ...rule, ...patch } : rule;
+  // N3: nunca scope provider sin proveedor — se deriva del código, del mensaje o del tipo de item; si no, scope item.
+  if ((r.scope ?? 'item') === 'provider' && !r.provider) {
+    const provider = providerFromCode(code) ?? providerFromMessage(ctx.error) ?? providerFromItemType(ctx.itemType);
+    r = provider ? { ...r, provider } : { ...r, scope: 'item' };
+  }
+  extra = { ...extraCtx, ...extra };
+  if (rule.id === 'tts_failed' && !providerConfig && ttsPaidChunks(ctx.error) > 0) extra = { paidUnits: ttsPaidChunks(ctx.error), ...extra };
   return {
     class: r.class,
     code: code.slice(0, FAILURE_CODE_MAX),
@@ -644,6 +701,37 @@ export function classifyFailure(input: FailureInput): FailureVerdict {
     return unclassifiedVerdict(extractFailureCode(error), httpStatus, 'package', 'none');
   }
 
+  return moneyFloor(classifyItem(input, error, ctxBase), error);
+}
+
+/**
+ * N2: piso de dinero en RUNTIME. Si el texto del fallo coincide con la deny-list de dinero del auto-healer
+ * (presupuesto, reconciliación, ambiguo, cuota/saldo, configuración…) el veredicto es AL MENOS C, sea cual sea
+ * el código de adelante (p.ej. `unexpected_error: budget_exceeded: …`). Excepción: las esperas de proveedor
+ * (`wait_provider`, p.ej. la cuota de YouTube, que ya es una espera sin gasto).
+ */
+const MONEY_FLOOR_EXTRA: readonly RegExp[] = Object.freeze([/\bsaldo\b/i]);
+function moneyFloor(v: FailureVerdict, error: string): FailureVerdict {
+  if (v.class === 'C' || v.class === 'D' || v.strategy === 'wait_provider') return v;
+  // Códigos de VALIDACIÓN que contienen la palabra (EXAM_ARTIFACT_AMBIGUOUS = dos artifacts de examen, no un pago)
+  // no cuentan: el piso mira el texto, no los códigos internos ya clasificados.
+  const text = error.replace(/\bEXAM_ARTIFACT_AMBIGUOUS\b/g, '');
+  if (!AUTO_HEAL_DENY_PATTERNS.some((re) => re.test(text)) && !MONEY_FLOOR_EXTRA.some((re) => re.test(text))) return v;
+  const budget = /budget|presupuesto/i.test(text);
+  const config = /not_allowed|not_configured|not_ready|provider_mode_unset|mock_not_allowed|blocked_auth|youtube_preflight/i.test(text);
+  return {
+    ...v,
+    class: 'C',
+    strategy: 'hold_for_human',
+    targetRounds: 0,
+    paidRisk: budget || config ? v.paidRisk : 'uncertain',
+    humanReason: budget ? 'budget' : config ? 'config' : 'duplicate_charge',
+    adminAction: budget ? 'approve_budget' : config ? 'retry_item' : 'reconcile_provider',
+    moneyFloor: true,
+  };
+}
+
+function classifyItem(input: FailureInput, error: string, ctxBase: Omit<RefineCtx, 'code'>): FailureVerdict {
   // Veredicto del MENSAJE (hecho del servidor / del emisor).
   const messageVerdict = classifyMessage(error, ctxBase, input?.source ?? null);
   if (!isValidFailureCode(input?.errorCode)) return messageVerdict;

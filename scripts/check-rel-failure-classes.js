@@ -10,6 +10,9 @@
 //      provider (I1); nunca lanza;
 //   3. paso que preserva el comportamiento: las reglas del auto-healer y del reintento seguro son
 //      las MISMAS (re-exportadas), y `currentRecoveryOf` coincide con autoHealDecision/safeAutoRetryDecision;
+//   (Fix round 2, N1) Los gates son BEST-EFFORT: la garantía está en runtime (D retenido + unclassified=true
+//   en el log + verify-rel-no-unclassified en la compuerta E2E). Límites conocidos: header de
+//   scripts/lib/rel-error-emitters.js.
 //   4. GATE: cada código que el backend EMITE hoy (failItem / fail(deps / applyItemFailure /
 //      failJob / blockItemForBudget, resueltos desde el código fuente) tiene una regla EXPLÍCITA;
 //      cada código interno de validación y de empaque también. Un emisor nuevo sin resolver o un
@@ -61,6 +64,7 @@ function check(name, fn) {
   }
 }
 function assert(c, m) { if (!c) throw new Error(m); }
+function eq2(a, b, m) { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`${m}: esperado ${JSON.stringify(b)}, encontrado ${JSON.stringify(a)}`); }
 
 const v = (error, extra = {}) => FC.classifyFailure({ error, ...extra });
 function expectVerdict(error, want, extra = {}) {
@@ -309,8 +313,7 @@ check('reglas (C1): un errorCode del ejecutor solo SUBE la severidad — nunca b
 // I1: cuerpos REALES de provider-clients.ts / real-providers.ts.
 const PROVIDER_BODY_SAMPLES = [
   ['tts_failed: chunk 1/4: openai POST /audio/speech HTTP 429: {"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}', 'openai'],
-  ['tts_failed: chunk 3/4: openai POST /audio/speech HTTP 429: {"error":{"code":"insufficient_quota"}}', 'openai'],
-  ['tts_failed: chunk 2/4: openai POST /audio/speech HTTP 401: Incorrect API key provided', 'openai'],
+  ['tts_failed: chunk 1/4: openai POST /audio/speech HTTP 401: Incorrect API key provided', 'openai'],
   ['audiobook_script_failed: anthropic POST /v1/messages HTTP 400: {"error":{"message":"Your credit balance is too low"}}', 'anthropic'],
   ['audiobook_script_failed: anthropic POST /v1/messages HTTP 401: invalid x-api-key', 'anthropic'],
   ['gamma_submit_failed: gamma POST /generations HTTP 401: Unauthorized', 'gamma'],
@@ -381,7 +384,14 @@ check('preservación (propiedad, M8a): para CADA código emitido × cuerpos real
         const r = FC.classifyFailure({ error: msg, outputSummary: os, source: src });
         n++;
         if (AH.isAutoHealDenied(msg)) assert(r.class === 'C' || r.class === 'D' || r.strategy === 'wait_provider', `denegado pero ${r.class}/${r.strategy}: ${msg}`);
-        if (isCall && /quota|credit|HTTP 40[123]/.test(b)) assert(r.class === 'D' && r.scope === 'provider' && r.strategy === 'wait_provider', `cuota/crédito/auth no es D-config de proveedor: ${msg} → ${r.class}/${r.strategy}`);
+        // Cuota/crédito/auth en una llamada a proveedor: D-config scope provider CON proveedor; sin proveedor
+        // conocido, D retenido scope item (N3); con trozos de TTS ya pagados, C (N5). Nunca un reintento.
+        if (isCall && /quota|credit|HTTP 40[123]/.test(b)) {
+          const ok = (r.class === 'D' && r.scope === 'provider' && r.strategy === 'wait_provider' && r.provider)
+            || (r.class === 'D' && r.scope === 'item' && r.strategy === 'hold_for_human' && !r.provider)
+            || (r.class === 'C' && r.adminAction === 'reconcile_provider' && r.paidUnits > 0);
+          assert(ok, `cuota/crédito/auth mal clasificada: ${msg} → ${r.class}/${r.scope}/${r.strategy}/${r.provider}`);
+        }
         assert(!r.unclassified || src === 'package_worker', `emitido y sin clasificar: ${msg}`);
       }
     }
@@ -419,6 +429,77 @@ check('preservación: todo lo que el auto-healer reabre es clase A en el clasifi
   assert(FC.currentRecoveryOf('videogen_submit_rejected: (HTTP 409)', 'video', {}) === 'manual', '409 no es definitivo');
   assert(FC.currentRecoveryOf('gamma_submit_failed: 400', 'presentation', {}) === 'safe_auto_retry', 'safe gamma');
   assert(FC.currentRecoveryOf('v3_payload_invalid: x', 'activity', {}) === 'manual', 'B hoy es manual');
+});
+
+check('fix round 2 (N2): piso de dinero en runtime — un texto de la deny-list es ≥ C aunque el código de adelante sea A/B', () => {
+  const cases = [
+    ['unexpected_error: budget_exceeded: el envío superaría el presupuesto', 'budget', 'approve_budget'],
+    ['unexpected_error: provider_reconciliation_required: openai — audio pagado sin persistir', 'duplicate_charge', 'reconcile_provider'],
+    ['unexpected_error: ambiguous submission (timeout del envío)', 'duplicate_charge', 'reconcile_provider'],
+    ['unexpected_error: el envío quedó ambiguo', 'duplicate_charge', 'reconcile_provider'],
+    ['unexpected_error: saldo insuficiente', 'duplicate_charge', 'reconcile_provider'],
+    ['unexpected_error: provider_mode_unset para gamma', 'config', 'retry_item'],
+  ];
+  for (const [msg, reason, action] of cases) {
+    for (const source of ['video_worker', 'provider_worker', 'browser_executor', undefined]) {
+      const r = v(msg, { source });
+      assert(['C', 'D'].includes(r.class) && r.strategy !== 'retry_backoff', `${msg} (${source}) → ${r.class}/${r.strategy}`);
+      if (r.class === 'C' && r.moneyFloor) eq2([r.humanReason, r.adminAction], [reason, action], msg);
+    }
+  }
+  const g = v('gamma_poll_failed: ambiguous response del poll', { outputSummary: GAMMA });
+  assert(g.class === 'C' && g.moneyFloor === true && g.paidRisk === 'uncertain', 'gamma_poll_failed ambiguo con id: ' + JSON.stringify(g));
+  // Excepciones: esperas de proveedor (cuota de YouTube) y códigos de validación con la palabra.
+  expectVerdict('youtube_blocked_quota: cuota diaria agotada', { class: 'A', strategy: 'wait_provider' });
+  const ex = v('v3_payload_invalid: exam exam:m1 rechazado por el validador del servidor [EXAM_ARTIFACT_AMBIGUOUS] $ EXAM_ARTIFACT_AMBIGUOUS: se subieron 2');
+  assert(ex.class === 'B' && !ex.moneyFloor, 'EXAM_ARTIFACT_AMBIGUOUS no es un pago: ' + JSON.stringify(ex));
+  // Un errorCode no puede esquivar el piso.
+  assert(v('unexpected_error: budget_exceeded: x', { errorCode: 'EXAM_BANK_INCOMPLETE', source: 'video_worker' }).class === 'C', 'piso con errorCode');
+});
+
+check('fix round 2 (N3): nunca scope provider sin proveedor — por tipo de item, si no D retenido scope item', () => {
+  expectVerdict('unexpected_error: descarga del artifact falló (HTTP 403)', { class: 'D', scope: 'item', strategy: 'hold_for_human', provider: null });
+  expectVerdict('unexpected_error: HTTP 403', { class: 'D', scope: 'provider', provider: 'videogen', strategy: 'wait_provider' }, { itemType: 'video' });
+  expectVerdict('unexpected_error: HTTP 401', { class: 'D', scope: 'provider', provider: 'gamma' }, { itemType: 'presentation' });
+  expectVerdict('unexpected_error: Videogen POST /jobs (HTTP 401)', { class: 'D', scope: 'provider', provider: 'videogen' });
+  for (const c of FC.classifiedCodes()) {
+    for (const b of ['', ': HTTP 401', ': insufficient_quota', ': forbidden']) {
+      for (const itemType of [null, 'content', 'video', 'presentation', 'audiobook_chapter']) {
+        const r = FC.classifyFailure({ error: `${c}${b}`, itemType });
+        assert(r.scope !== 'provider' || r.provider, `scope provider sin proveedor: ${c}${b} (${itemType})`);
+      }
+    }
+  }
+});
+
+check('fix round 2 (N4): el marcador de créditos medidos está anclado al sufijo del worker', () => {
+  const uncertainEcho = 'gamma_generation_failed: la generación g falló en Gamma (curso de contabilidad: créditos medidos al cierre) [Gamma no informó los créditos: cobro incierto]. No se reenvía sola: regenera la presentación';
+  expectVerdict(uncertainEcho, { class: 'C', paidRisk: 'uncertain' });
+  expectVerdict('gamma_generation_failed: x (texto [créditos medidos: 12] de Gamma) [Gamma no informó los créditos: cobro incierto]. No se reenvía sola', { class: 'C' });
+  expectVerdict('gamma_generation_failed: la generación g falló en Gamma (x) [créditos medidos: 12.5]. No se reenvía sola: regenera', { class: 'B', paidRisk: 'measured' });
+});
+
+check('fix round 2 (N5): TTS después del trozo 1 (trozos ya pagados) — nunca retry_item; cuota en un trozo > 1 → C con el contexto de config y los trozos pagados', () => {
+  const r = expectVerdict('tts_failed: chunk 3/4: openai POST /audio/speech HTTP 429: {"error":{"code":"insufficient_quota"}}',
+    { class: 'C', strategy: 'hold_for_human', adminAction: 'reconcile_provider', humanReason: 'duplicate_charge', paidRisk: 'uncertain', provider: 'openai', scope: 'item' });
+  assert(r.providerConfigIssue === true && r.paidUnits === 2, 'contexto: ' + JSON.stringify(r));
+  const r2 = expectVerdict('tts_failed: chunk 2/4: HTTP 401: Incorrect API key', { class: 'C', adminAction: 'reconcile_provider' });
+  assert(r2.paidUnits === 1 && r2.providerConfigIssue, JSON.stringify(r2));
+  const r3 = expectVerdict('tts_failed: chunk 3/4: HTTP 503', { class: 'C', strategy: 'auto_resubmit_once', adminAction: 'reconcile_provider', paidRisk: 'uncertain' });
+  assert(r3.paidUnits === 2 && !r3.providerConfigIssue, JSON.stringify(r3));
+  // Trozo 1: nada pagado → D-config a scope provider (pausa al proveedor) o A transitorio.
+  expectVerdict('tts_failed: chunk 1/4: HTTP 429: insufficient_quota', { class: 'D', scope: 'provider', strategy: 'wait_provider', adminAction: 'retry_item' });
+  for (let n = 2; n <= 6; n++) {
+    for (const body of ['HTTP 503', 'HTTP 429: insufficient_quota', 'HTTP 401', 'saldo agotado', 'cuota agotada', 'timeout']) {
+      const x = v(`tts_failed: chunk ${n}/6: ${body}`, { itemType: 'audiobook_chapter', source: 'provider_worker' });
+      assert(x.adminAction !== 'retry_item' && x.class === 'C', `trozo ${n} «${body}» → ${x.class}/${x.adminAction}`);
+    }
+  }
+});
+
+check('fix round 2 (N7): cuota/saldo en español es configuración del proveedor (paridad con la deny-list)', () => {
+  expectVerdict('tts_failed: chunk 1/4: openai HTTP 429: cuota agotada', { class: 'D', strategy: 'wait_provider', scope: 'provider' });
+  expectVerdict('gamma_submit_failed: gamma POST /generations HTTP 400: saldo insuficiente', { class: 'D', strategy: 'wait_provider', provider: 'gamma' });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -532,19 +613,24 @@ function frontendGate(dir, opts = {}) {
 }
 
 // Auto-test del escáner (M8c): las construcciones que la review mostró invisibles TIENEN que detectarse.
-check('gate auto-test (backend): asignación en rama, ternario con template, helper, parámetro y asignación parcialmente dinámica → detectados', () => {
+check('gate auto-test (backend): rama, ternario+template, helper, parámetro, parcial, desestructuración, parámetro con default, alias/bind, ?.(, corchetes, spread, template con sufijo y fail(<otro>, …) → detectados', () => {
   const fx = SCAN.scanBackendEmitters(path.join(__dirname, 'fixtures/rel-gate/be'));
   const byLine = fx.emitters.map((e) => ({ ...e, unclassifiedCodes: (e.codes || []).filter((c) => !FC.isFailureCodeClassified(c)) }));
   const flagged = byLine.filter((e) => !e.codes || e.unclassifiedCodes.length > 0);
-  assert(fx.emitters.length === 5, 'emisores del fixture: ' + fx.emitters.length);
-  assert(flagged.length === 5, 'NO detectados: ' + JSON.stringify(byLine.filter((e) => !flagged.includes(e)).map((e) => [e.line, e.expr, e.codes])));
+  assert(fx.emitters.length === 13, 'emisores del fixture: ' + fx.emitters.length);
+  assert(flagged.length === 13, 'NO detectados: ' + JSON.stringify(byLine.filter((e) => !flagged.includes(e)).map((e) => [e.line, e.expr, e.codes])));
+  for (const needle of ['__indirect__ failItem.bind', '__indirect__ failItem?.(', "__indirect__ ['failItem']", '__args__ ...args', '`lease_expired${s}`']) {
+    assert(byLine.some((e) => e.expr.startsWith(needle) && !e.codes), 'caso barato no detectado: ' + needle);
+  }
+  assert(byLine.some((e) => (e.codes || []).includes('zz_rp_code')), 'fail(d, …) del worker de proveedores');
   const codes = new Set(byLine.flatMap((e) => e.codes || []));
   assert(codes.has('videogen_paid_maybe_new') && codes.has('lease_expired') && codes.has('tpl_new_code_be'), 'unión de ramas: ' + [...codes].join(','));
 });
 
-check('gate auto-test (frontend): template, comillas dobles, variable, helper failWithDraft, backendDynFail con template y msg lanzado → detectados', () => {
+check('gate auto-test (frontend): template, comillas dobles, variable, failWithDraft, backendDynFail, msg lanzado, shorthand, clave computada, X.error = y window.backendDynFail → detectados', () => {
   const { missing } = frontendGate(path.join(__dirname, 'fixtures/rel-gate/fe'), { fixture: true });
-  for (const needle of ['brand_new_code', 'expresión sin código: m', 'tpl_new_code', 'dq_new_code', "e.reason + ' algo'", 'bk_new_code', 'thrown_new_code']) {
+  for (const needle of ['brand_new_code', 'expresión sin código: m', 'tpl_new_code', 'dq_new_code', "e.reason + ' algo'", 'bk_new_code', 'thrown_new_code',
+    'shorthand:error', 'computed:', 'zz_member_code', 'zz_window_code']) {
     assert(missing.some((x) => x.includes(needle)), `no detectado: ${needle}\n${missing.join('\n')}`);
   }
 });

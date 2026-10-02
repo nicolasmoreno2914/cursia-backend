@@ -7,3 +7,8 @@ async function _fixtureD(item) { return { ok: false, error: "dq_new_code: w", re
 async function _fixtureE(item, e) { return failWithDraft(e.reason + ' algo', 'x'); }
 async function _fixtureF(item) { await backendDynFail(item.itemRunId, 'ex', `bk_new_code: ${item.x}`, true); }
 async function _fixtureG(item) { throw { examBankFail: true, msg: 'thrown_new_code: x' }; }
+// Fix round 2 (N1, casos baratos): shorthand, clave computada, asignación a miembro y backendDynFail por objeto.
+async function _fixtureH(item) { var error = 'zz_short_code: x'; return { ok: false, error }; }
+async function _fixtureI(item) { return { ok: false, ['error']: 'zz_computed_code: x' }; }
+async function _fixtureJ(item) { var r = { ok: false }; r.error = 'zz_member_code: x'; return r; }
+async function _fixtureK(item) { await window.backendDynFail(item.itemRunId, 'ex', 'zz_window_code: x', true); }
