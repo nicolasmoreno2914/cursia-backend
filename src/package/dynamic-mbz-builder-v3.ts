@@ -650,7 +650,7 @@ export const EXAM_BANK_INVALID_BUILDER = 'EXAM_BANK_INVALID';
 function resolveExamSources(plan: PackagingPlanV3, c: DynamicPackageContentsV3): { modules: Map<string, ExamSource>; final: ExamSource | null } {
   const modules = new Map<string, ExamSource>();
   const check = (key: string, scope: 'module' | 'final', bank: ExamBankV1, chapters: Array<{ id: string; moduleId: string }>): void => {
-    const r = validateExamBank(bank, { scope, chapters, chapterMd: c.contentMd, planSource: 'frozen' });
+    const r = validateExamBank(bank, { scope, chapters, chapterMd: c.contentMd, planSource: 'frozen', evidenceRules: 'asAccepted' });
     if (!r.ok) {
       const codes = [...new Set(r.errors.map((e) => e.code))].sort();
       throw new Error(`${EXAM_BANK_INVALID_BUILDER}: ${key} [${codes.join(', ')}] ${r.errors.slice(0, 5).map((e) => `${e.path} ${e.code}: ${e.message}`).join(' | ')}`);

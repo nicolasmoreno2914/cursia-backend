@@ -25,7 +25,7 @@ import type { VideoCheckpoint } from '../../package/h5p';
 import { H5pActivityTypeV2, ShellValidationError, activityTypeForChapter, validateH5pActivityPayload } from './activity-type';
 import { validateCourseIntroV3, validateModuleIntroV3 } from './intro-schemas';
 import { FINAL_EXAM_QUESTION_RANGE, validateExamGift } from './final-exam';
-import { EXAM_BANK_ARTIFACT_TYPE, EXAM_BANK_VERSION, EXAM_GIFT_ARTIFACT_TYPE, ExamPlanLeaf, expectedExamPlan, validateExamBank } from './exam-bank';
+import { EXAM_BANK_ARTIFACT_TYPE, EXAM_BANK_VALIDATION_VERSION, EXAM_BANK_VERSION, EXAM_GIFT_ARTIFACT_TYPE, ExamPlanLeaf, expectedExamPlan, validateExamBank } from './exam-bank';
 
 export const V3_PAYLOAD_INVALID = 'v3_payload_invalid';
 
@@ -175,6 +175,8 @@ export function validateV3ItemArtifact(ctx: V3ItemValidationContext, text: strin
       ...(ctx.examChapterMd ? { chapterMd: ctx.examChapterMd } : {}),
     });
     // questionCount = slots (lo que ve el estudiante), no el tamaño del banco.
+    // BANKOPT fix round 4 (R2): completeItem valida SIEMPRE con las reglas vigentes (evidenceRules 'current');
+    // la versión que el banco declara solo la usa el empaque.
     return { ok: r.ok, errors: r.errors, summary: { questionCount: r.slotCount, bankSize: r.bankSize, bankVersion: EXAM_BANK_VERSION } };
   }
 
@@ -268,6 +270,8 @@ export interface ExamBankClaimFacts {
   moduleId: string | null;
   chapters: Array<{ chapterId: string; moduleId: string }>;
   plan: ExamPlanLeaf[];
+  /** BANKOPT fix round 4 (R2): versión de reglas de validación vigente (el ejecutor la escribe en el banco). */
+  bankValidationVersion?: number;
   /** BANKOPT (1e): presente si el fail acepta `examBankDraftArtifactId` (lo agrega el claim). */
   draftArtifactType?: string;
 }
@@ -287,6 +291,8 @@ export function examBankClaimFacts(
     moduleId: scope === 'module' ? (moduleId as string) : null,
     chapters: chapters.map((c) => ({ chapterId: c.id, moduleId: c.moduleId })),
     plan: expectedExamPlan(scope, chapters),
+    // BANKOPT fix round 4 (R2): el ejecutor declara en el banco las reglas con que lo validó.
+    bankValidationVersion: EXAM_BANK_VALIDATION_VERSION,
   };
 }
 

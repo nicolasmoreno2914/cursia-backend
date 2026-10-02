@@ -403,14 +403,14 @@ async function main() {
   // ── 4. Empaque ──
   const OWNER = '11111111-2222-4333-8444-555555555555';
   const RUN_ID = '22222222-1111-4111-8111-111111111111';
-  function runFixture(examMode, mutateBank) {
+  function runFixture(examMode, mutateBank, extraMd) {
     const input = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true, courseId: 734 });
     const manifest = input.manifest;
     const allChapters = manifest.modules.flatMap((m) => m.chapters.map((c) => ({ id: c.chapterId, moduleId: m.moduleId })));
     const gIndex = new Map(allChapters.map((c, i) => [c.id, i]));
     if (examMode === 'bank') {
       // el Markdown del capítulo trae las frases de evidencia del banco
-      for (const c of allChapters) input.contents.contentMd.set(c.id, `${input.contents.contentMd.get(c.id)}\n\n${EBF.chapterMarkdown(gIndex.get(c.id), 'Reglas')}`);
+      for (const c of allChapters) input.contents.contentMd.set(c.id, `${input.contents.contentMd.get(c.id)}\n\n${EBF.chapterMarkdown(gIndex.get(c.id), 'Reglas')}${extraMd ? '\n\n' + extraMd : ''}`);
     }
     const files = new Map();
     const rows = [];
@@ -497,6 +497,35 @@ async function main() {
     let err = null;
     try { await load(both); } catch (e) { err = e; }
     assert(err && err.name === 'PackagingNotReadyError' && err.missing.some((m) => /^exam:.*:EXAM_ARTIFACT_AMBIGUOUS=dynamic_exam_bank_json\+dynamic_exam_gift$/.test(m)), `ambiguo: ${err && (err.missing || err.message)}`);
+  });
+
+  await check('BANKOPT fix round 4 (R2): un banco aceptado ANTES de la guardia de oración (sin bankValidationVersion) cuya evidencia es un fragmento de una oración negada SIGUE empaquetando; el mismo banco declarado v2 → EXAM_BANK_INVALID; al completar (reglas vigentes) se rechaza', async () => {
+    const NEG = 'No se permite abrir el tablero eléctrico de la sala de bombas con las manos húmedas o sin guantes.';
+    const FRAG = 'se permite abrir el tablero eléctrico de la sala de bombas con las manos húmedas';
+    const mut = (version) => (type, bank) => { if (type === 'final_exam') { bank.questions[0].evidence = FRAG; if (version) bank.bankValidationVersion = version; } };
+    // Pre-round-3 (sin versión): el empaque re-valida con reglas v1 (subcadena) → carga y construye.
+    const f1 = runFixture('bank', mut(null), NEG);
+    const { loaded } = await load(f1);
+    eq(loaded.exams.final.kind, 'bank', 'banco v1 cargado');
+    const built = await B.buildDynamicMbzV3({ ...f1.input, contents: loaded.contents });
+    assert(Buffer.isBuffer(built.mbz) && built.mbz.length > 0, 'el builder empaqueta el banco v1');
+    // bankValidationVersion 1 explícito: igual.
+    await load(runFixture('bank', mut(1), NEG));
+    // Declarado v2 (aceptado con la guardia): el empaque aplica la guardia → falla fuerte.
+    await rejects(load(runFixture('bank', mut(2), NEG)), /^EXAM_BANK_INVALID: final_exam:\d+ \[EXAM_BANK_EVIDENCE\]/, 'banco v2 con evidencia negada');
+    // Al completar (reglas vigentes, sin importar la versión declarada) el mismo banco se rechaza.
+    const fin = JSON.parse(f1.input.contents ? JSON.stringify(EBF.makeExamBank({ scope: 'final', moduleId: null, chapters: f1.manifest.modules.flatMap((m) => m.chapters.map((c) => ({ id: c.chapterId, moduleId: m.moduleId }))), chapterIndex: new Map(f1.manifest.modules.flatMap((m) => m.chapters.map((c) => c.chapterId)).map((id, i) => [id, i])), plan: EB.expectedExamPlan('final', f1.manifest.modules.flatMap((m) => m.chapters.map((c) => ({ id: c.chapterId, moduleId: m.moduleId })))) })) : '{}');
+    fin.questions[0].evidence = FRAG;
+    const chs = f1.manifest.modules.flatMap((m) => m.chapters.map((c) => ({ id: c.chapterId, moduleId: m.moduleId })));
+    const md = new Map(chs.map((c, i) => [c.id, `${EBF.chapterMarkdown(i, 'Reglas')}\n\n${NEG}`]));
+    const atComplete = EB.validateExamBank(fin, { scope: 'final', chapters: chs, chapterMd: md });
+    assert(!atComplete.ok && atComplete.errors.some((e) => e.code === 'EXAM_BANK_EVIDENCE' && /NIEGA/.test(e.message)), JSON.stringify(atComplete.errors.slice(0, 3)));
+    eq(EB.validateExamBank(fin, { scope: 'final', chapters: chs, chapterMd: md, evidenceRules: 'asAccepted' }).ok, true, 'asAccepted sin versión = v1');
+    // Versión inválida → esquema.
+    eq(EB.validateExamBank({ ...fin, bankValidationVersion: 3 }, { scope: 'final', chapters: chs, chapterMd: md, evidenceRules: 'asAccepted' }).errors.some((e) => e.path === '$.bankValidationVersion'), true, 'versión 3 inválida');
+    // El claim anuncia la versión vigente.
+    const S = loadDist('modules/course-shell/index.js');
+    eq(S.EXAM_BANK_VALIDATION_VERSION, 2, 'versión vigente');
   });
 
   await check('empaque (C2): bancos con plan congelado en OTRO orden que el Manifest actual (reorden posterior) → se cargan (no EXAM_BANK_INVALID) y llegan al builder', async () => {

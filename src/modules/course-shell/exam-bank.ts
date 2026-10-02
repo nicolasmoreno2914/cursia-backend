@@ -238,31 +238,47 @@ export function examTokens(normalized: string): string[] {
 }
 
 /**
- * BANKOPT fix round 3 — la evidencia respalda lo que el capítulo AFIRMA. Un fragmento textual cuya oración
- * lo niega antes («No [fragmento]…») o lo condiciona/exceptúa después («[fragmento], excepto…», «… solo si…»)
- * no prueba la afirmación de la pregunta → EXAM_BANK_EVIDENCE.
- *  - El Markdown se normaliza POR LÍNEA (`normalizeExamText`, mismo resultado que el texto completo) y se
- *    unen con un espacio; los límites de oración son los de línea y `.`/`!`/`?` seguidos de espacio o fin.
- *  - Por cada aparición de la evidencia normalizada: prefijo = desde el inicio de su oración; sufijo =
- *    hasta el final de su oración. Basta UNA aparición sin negación en el prefijo ni condición en el sufijo.
- * Espejo byte a byte en el ejecutor (45: dynExamEvidenceSupported).
+ * BANKOPT fix rounds 3-4 — la evidencia respalda lo que el capítulo AFIRMA (guardia de oración).
+ * Un fragmento textual no prueba la afirmación de la pregunta si su oración:
+ *  - es una pregunta (lleva ? o ¿) -> 'question';
+ *  - lo niega antes («No [frag]», «Nunca…», «ni», «sin», «nadie»…) o lo declara falso alrededor
+ *    («es falso que», «no es cierto», «es un mito», «es mentira») -> 'negated';
+ *  - lo condiciona o exceptúa antes («Si…», «Excepto…», «Salvo…», «Solo con…», «A menos que…») o después
+ *    («…, excepto», «salvo», «si», «cuando», «mientras», «sino», «pero», «aunque», «solo si», «siempre que»…)
+ *    -> 'conditioned'.
+ * Mitigaciones de falsos rechazos (fix round 4, R3): el límite de oración admite comillas de cierre; «:» y
+ * «;» acotan el examen del prefijo; «si» con verificar/revisar/comprobar/detectar/observar/preguntar/saber/
+ * decidir en los 3 tokens anteriores es «si» interrogativo (no condición); «sí» con tilde nunca es condición (se conserva la tilde para
+ * este chequeo); «sin embargo», «no obstante» y «no solo… sino también» no niegan.
+ * Normalización: `normalizeExamText` por LÍNEA (unidas con un espacio) tras marcar «sí» con tilde; límites de
+ * oración = líneas y . ! ? seguidos de comillas opcionales y de espacio o fin. Basta UNA aparición válida.
+ * Espejo byte a byte en el ejecutor (45: dynExamEvidenceSupport).
  */
 export const EXAM_EVIDENCE_PREFIX_NEGATIONS: readonly string[] = ['no', 'nunca', 'jamas', 'ni', 'sin', 'tampoco', 'nadie', 'nada', 'ninguno', 'ninguna', 'ningun', 'ningunos', 'ningunas'];
-export const EXAM_EVIDENCE_SUFFIX_CONDITIONS: readonly string[] = ['excepto', 'salvo', 'si', 'cuando', 'mientras', 'sino'];
+export const EXAM_EVIDENCE_FALSITY_PHRASES: readonly string[] = ['es falso', 'no es cierto', 'no es verdad', 'es un mito', 'es mentira'];
+export const EXAM_EVIDENCE_PREFIX_CONDITIONS: readonly string[] = ['si', 'excepto', 'salvo'];
+export const EXAM_EVIDENCE_PREFIX_CONDITION_PAIRS: readonly string[] = ['a menos', 'solo con', 'solamente con', 'unicamente con', 'solo si', 'solo cuando', 'siempre que', 'en caso', 'con tal'];
+export const EXAM_EVIDENCE_SUFFIX_CONDITIONS: readonly string[] = ['excepto', 'salvo', 'si', 'cuando', 'mientras', 'sino', 'pero', 'aunque'];
 export const EXAM_EVIDENCE_SUFFIX_CONDITION_PAIRS: readonly string[] = ['a menos', 'siempre que', 'siempre y', 'solo si', 'solo cuando', 'solamente si', 'solamente cuando', 'unicamente si', 'unicamente cuando', 'hasta que', 'con tal', 'en caso', 'a no'];
-export type ExamEvidenceSupport = { ok: true } | { ok: false; reason: 'missing' | 'negated' | 'conditioned' };
+/** Raíces de verbos tras los que «si» es interrogativo («verifica si…», «revisa si…»). */
+export const EXAM_EVIDENCE_WHETHER_VERBS: readonly string[] = ['verific', 'revis', 'comprob', 'comprueb', 'detect', 'observ', 'pregunt', 'sab', 'decid'];
+const EXAM_SI_ACCENT_RE = /(^|[^\p{L}\p{N}])([sS])[íÍ](?![\p{L}\p{N}])/gu;
+export function examGuardNormalize(s: string): string {
+  return normalizeExamText(String(s ?? '').replace(EXAM_SI_ACCENT_RE, '$1$2itilde'));
+}
+export type ExamEvidenceSupport = { ok: true } | { ok: false; reason: 'missing' | 'negated' | 'conditioned' | 'question' };
 export interface ExamEvidenceIndex { norm: string; bounds: number[] }
 export function examEvidenceIndex(chapterMd: string): ExamEvidenceIndex {
   let norm = '';
   const bounds: number[] = [0];
   for (const line of String(chapterMd ?? '').split('\n')) {
-    const n = normalizeExamText(line);
+    const n = examGuardNormalize(line);
     if (!n) continue;
     if (norm) norm += ' ';
     const start = norm.length;
     bounds.push(start);
     norm += n;
-    const re = /[.!?]+(?=\s|$)/g;
+    const re = /[.!?]+["']*(?=\s|$)/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(n))) bounds.push(start + m.index + m[0].length);
     bounds.push(norm.length);
@@ -270,23 +286,48 @@ export function examEvidenceIndex(chapterMd: string): ExamEvidenceIndex {
   bounds.sort((a, b) => a - b);
   return { norm, bounds };
 }
+function examIsWhetherVerb(t: string | undefined): boolean {
+  return typeof t === 'string' && EXAM_EVIDENCE_WHETHER_VERBS.some((v) => t.startsWith(v));
+}
+/** «si» interrogativo: uno de los 3 tokens anteriores es un verbo de averiguar («pregunta al cliente si…»). */
+function examWhetherBefore(tokens: readonly string[]): boolean {
+  return tokens.slice(-3).some(examIsWhetherVerb);
+}
+function examHasPhrase(tokens: readonly string[], phrases: readonly string[]): boolean {
+  const s = ' ' + tokens.join(' ') + ' ';
+  return phrases.some((p) => s.includes(' ' + p + ' '));
+}
 export function examEvidenceSupport(chapter: string | ExamEvidenceIndex, evidence: string): ExamEvidenceSupport {
-  const ev = normalizeExamText(evidence);
+  const ev = examGuardNormalize(evidence);
   if (!ev) return { ok: false, reason: 'missing' };
   const { norm, bounds } = typeof chapter === 'string' ? examEvidenceIndex(chapter) : chapter;
+  const evTok = examTokens(ev);
   let found = false;
-  let reason: 'negated' | 'conditioned' = 'negated';
+  let reason: 'negated' | 'conditioned' | 'question' = 'negated';
   for (let at = norm.indexOf(ev); at >= 0; at = norm.indexOf(ev, at + 1)) {
     found = true;
     const end = at + ev.length;
     let sStart = 0;
     let sEnd = norm.length;
     for (const b of bounds) { if (b <= at && b > sStart) sStart = b; if (b >= end && b < sEnd) sEnd = b; }
-    const pre = examTokens(norm.slice(sStart, at));
+    // Pregunta: ? o ¿ en la oración FUERA de citas entre comillas (una pregunta citada en una afirmación no cuenta).
+    if (/[?¿]/.test(norm.slice(sStart, sEnd).replace(/"[^"]*"|'[^']*'/g, ''))) { reason = 'question'; continue; }
+    const preText = norm.slice(sStart, at);
+    const cut = Math.max(preText.lastIndexOf(':'), preText.lastIndexOf(';'));
+    const pre = examTokens(cut >= 0 ? preText.slice(cut + 1) : preText);
     const post = examTokens(norm.slice(end, sEnd));
-    if (pre.some((t) => EXAM_EVIDENCE_PREFIX_NEGATIONS.includes(t))) { reason = 'negated'; continue; }
-    const pairs = post.slice(0, -1).map((t, k) => t + ' ' + post[k + 1]);
-    if (post.some((t) => EXAM_EVIDENCE_SUFFIX_CONDITIONS.includes(t)) || pairs.some((p) => EXAM_EVIDENCE_SUFFIX_CONDITION_PAIRS.includes(p))) { reason = 'conditioned'; continue; }
+    const next = (i: number): string | undefined => (i + 1 < pre.length ? pre[i + 1] : evTok[0]);
+    const negated = pre.some((t, i) => EXAM_EVIDENCE_PREFIX_NEGATIONS.includes(t)
+      && !(t === 'sin' && next(i) === 'embargo')
+      && !(t === 'no' && ['obstante', 'solo', 'solamente', 'unicamente'].includes(next(i) as string)));
+    if (negated || examHasPhrase(pre, EXAM_EVIDENCE_FALSITY_PHRASES) || examHasPhrase(post, EXAM_EVIDENCE_FALSITY_PHRASES)) { reason = 'negated'; continue; }
+    const preCond = pre.some((t, i) => EXAM_EVIDENCE_PREFIX_CONDITIONS.includes(t) && !(t === 'si' && examWhetherBefore(pre.slice(0, i))))
+      || examHasPhrase(pre, EXAM_EVIDENCE_PREFIX_CONDITION_PAIRS);
+    const postCond = post.some((t, i) => EXAM_EVIDENCE_SUFFIX_CONDITIONS.includes(t)
+      && !(t === 'si' && examWhetherBefore(evTok.concat(post.slice(0, i))))
+      && !(t === 'sino' && post[i + 1] === 'tambien'))
+      || examHasPhrase(post, EXAM_EVIDENCE_SUFFIX_CONDITION_PAIRS);
+    if (preCond || postCond) { reason = 'conditioned'; continue; }
     return { ok: true };
   }
   return found ? { ok: false, reason } : { ok: false, reason: 'missing' };
@@ -353,8 +394,17 @@ export interface ExamMatchQuestion extends ExamQuestionBase {
 }
 export type ExamBankQuestion = ExamMultichoiceQuestion | ExamTrueFalseQuestion | ExamMatchQuestion;
 
+/**
+ * BANKOPT fix round 4 (R2): versión de las reglas de validación con que se ACEPTÓ el banco.
+ *  1 (o ausente) = evidencia textual por subcadena (bancos anteriores);
+ *  2 = además la oración debe AFIRMAR la evidencia (examEvidenceSupport).
+ * completeItem valida SIEMPRE con las reglas vigentes; el empaque re-valida con las de la versión del banco
+ * (un banco ya aceptado nunca deja de empaquetarse porque las reglas se endurecieron).
+ */
+export const EXAM_BANK_VALIDATION_VERSION = 2;
 export interface ExamBankV1 {
   bankVersion: 1;
+  bankValidationVersion?: 1 | 2;
   scope: ExamBankScope;
   moduleId: string | null;
   plan: ExamPlanLeaf[];
@@ -376,6 +426,11 @@ export interface ExamBankValidationContext {
    *    del plan existe. Un reorden (capítulos dentro del módulo, módulos) no invalida el banco.
    */
   planSource?: 'manifest' | 'frozen';
+  /**
+   * Reglas de evidencia (fix round 4, R2): 'current' (default, completeItem) = las vigentes
+   * (EXAM_BANK_VALIDATION_VERSION); 'asAccepted' (empaque) = las de `doc.bankValidationVersion` (ausente = 1).
+   */
+  evidenceRules?: 'current' | 'asAccepted';
 }
 
 export interface ExamBankValidationResult {
@@ -390,7 +445,7 @@ export interface ExamBankValidationResult {
 }
 // ─── 3. Validación ──────────────────────────────────────────────────────────
 
-const TOP_KEYS = ['bankVersion', 'scope', 'moduleId', 'plan', 'questions'];
+const TOP_KEYS = ['bankVersion', 'bankValidationVersion', 'scope', 'moduleId', 'plan', 'questions'];
 const COMMON_KEYS = ['id', 'type', 'chapterId', 'level', 'stem', 'explanation', 'evidence'];
 const TYPE_KEYS: Record<ExamQuestionType, string[]> = {
   multichoice: ['correct', 'distractors'],
@@ -518,8 +573,12 @@ export function validateExamBank(doc: unknown, ctx: ExamBankValidationContext): 
     E.push('$', 'EXAM_BANK_SCHEMA', 'el banco debe ser un objeto JSON');
     return done(0);
   }
-  E.keys(doc, TOP_KEYS, '$');
+  // bankValidationVersion es OPCIONAL (bancos anteriores no lo traen): solo se exige si está.
+  E.keys(doc, 'bankValidationVersion' in doc ? TOP_KEYS : TOP_KEYS.filter((k) => k !== 'bankValidationVersion'), '$');
   if (doc.bankVersion !== undefined && doc.bankVersion !== EXAM_BANK_VERSION) E.push('$.bankVersion', 'EXAM_BANK_SCHEMA', `bankVersion debe ser ${EXAM_BANK_VERSION}`);
+  if (doc.bankValidationVersion !== undefined && !(Number.isInteger(doc.bankValidationVersion) && doc.bankValidationVersion >= 1 && doc.bankValidationVersion <= EXAM_BANK_VALIDATION_VERSION)) {
+    E.push('$.bankValidationVersion', 'EXAM_BANK_SCHEMA', `bankValidationVersion debe ser un entero de 1 a ${EXAM_BANK_VALIDATION_VERSION}`);
+  }
   if (doc.scope !== undefined && doc.scope !== ctx.scope) E.push('$.scope', 'EXAM_BANK_SCHEMA', `scope debe ser "${ctx.scope}"`);
   if ('moduleId' in doc) {
     if (ctx.scope === 'module') {
@@ -730,16 +789,25 @@ export function validateExamBank(doc: unknown, ctx: ExamBankValidationContext): 
   // ── Evidencia en el capítulo (si hay Markdown) ──
   if (ctx.chapterMd) {
     const idx = new Map<string, ExamEvidenceIndex>();
+    const acceptedUnder = ctx.evidenceRules === 'asAccepted' ? (isObj(doc) && Number.isInteger(doc.bankValidationVersion) ? doc.bankValidationVersion : 1) : EXAM_BANK_VALIDATION_VERSION;
+    const affirmed = acceptedUnder >= 2;
     for (const { q, i } of valid) {
       if (typeof q.chapterId !== 'string' || typeof q.evidence !== 'string') continue;
       const md = ctx.chapterMd.get(q.chapterId);
       if (typeof md !== 'string') continue;
+      if (!affirmed) {
+        // Reglas v1 (bancos aceptados antes de la guardia de oración): subcadena del texto normalizado.
+        const ev = normalizeExamText(q.evidence);
+        if (!ev || !normalizeExamText(md).includes(ev)) E.push(`$.questions[${i}].evidence`, 'EXAM_BANK_EVIDENCE', `${idOf(q, i)}: la evidencia no aparece en el texto del capítulo ${q.chapterId}`);
+        continue;
+      }
       if (!idx.has(q.chapterId)) idx.set(q.chapterId, examEvidenceIndex(md));
       const sup = examEvidenceSupport(idx.get(q.chapterId) as ExamEvidenceIndex, q.evidence);
       if (sup.ok === false) {
         const why = sup.reason === 'missing' ? 'la evidencia no aparece en el texto del capítulo'
-          : sup.reason === 'negated' ? 'la oración del capítulo NIEGA ese fragmento (negación antes) en el capítulo'
-            : 'la oración del capítulo CONDICIONA o exceptúa ese fragmento (excepto/salvo/si/cuando… después) en el capítulo';
+          : sup.reason === 'negated' ? 'la oración del capítulo NIEGA o desmiente ese fragmento en el capítulo'
+            : sup.reason === 'question' ? 'la oración del capítulo es una PREGUNTA, no una afirmación, en el capítulo'
+              : 'la oración del capítulo CONDICIONA o exceptúa ese fragmento (si/excepto/salvo/cuando/pero/aunque…) en el capítulo';
         E.push(`$.questions[${i}].evidence`, 'EXAM_BANK_EVIDENCE', `${idOf(q, i)}: ${why} ${q.chapterId}`);
       }
     }

@@ -748,7 +748,7 @@ export async function loadContentsV3(
     banksToCheck.push({ key: plan.keys.finalExam as string, scope: 'final', bank: finalSrc.bank, chapters: plan.modules.flatMap((m) => m.chapters.map((c) => ({ id: c.chapterId, moduleId: m.moduleId }))) });
   }
   for (const b of banksToCheck) {
-    const r = validateExamBank(b.bank, { scope: b.scope, chapters: b.chapters, chapterMd: contentMd, planSource: 'frozen' });
+    const r = validateExamBank(b.bank, { scope: b.scope, chapters: b.chapters, chapterMd: contentMd, planSource: 'frozen', evidenceRules: 'asAccepted' });
     if (!r.ok) {
       const codes = [...new Set(r.errors.map((e) => e.code))].sort();
       throw new Error(`${EXAM_BANK_INVALID}: ${b.key} [${codes.join(', ')}] ${r.errors.slice(0, 5).map((e) => `${e.path} ${e.code}: ${e.message}`).join(' | ')}`);

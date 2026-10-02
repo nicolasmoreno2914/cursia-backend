@@ -870,17 +870,20 @@ export class SchedulerService {
     error: string,
     retryable: boolean,
     ownerId?: string,
+    /** examBankDraftArtifactId: id = borrador nuevo; null = borrar el anterior (falla sin faltante); ausente = conservar. */
     opts?: { retryAfterSeconds?: number; refundAttempt?: boolean; grantAttempt?: boolean; examBankDraftArtifactId?: string | null },
   ): Promise<ItemOpResult> {
     executorId = this.checkExecutorId(executorId);
     const msg = String(error ?? '').trim().slice(0, MAX_ERROR_LENGTH) || 'unknown_error';
     return this.guardedItemOp(itemRunId, executorId, ownerId, 'update', async (qr, job, item) => {
       // BANKOPT (1e): borrador del banco de un examen incompleto (validado; si no corresponde, se ignora).
-      // Fix round 2 (N2): un fail de exam/final_exam SIN borrador válido borra el anterior, para que el
-      // próximo intento nunca reanude un borrador que ya llevó a otra falla (bucle I1).
+      // Fix round 4 (R4): el borrador anterior se borra SOLO con `examBankDraftArtifactId: null` explícito
+      // (el ejecutor lo manda ante una falla de reglas del banco SIN faltante, N2). Un fail transitorio (error
+      // de red/LLM, subida fallida, 409 al completar, borrador que no se pudo subir) llega sin el campo y lo
+      // conserva: un intento interrumpido no es una falla nueva.
       const d = await recordExamBankDraft(qr, item, job.owner_id, opts?.examBankDraftArtifactId ?? null, !!retryable);
       if (d.recorded === false && opts?.examBankDraftArtifactId) this.logger.warn(`failItem ${item.id}: borrador del banco ignorado (${d.reason})`);
-      if (d.recorded === false) await clearExamBankDraft(qr, item);
+      if (d.recorded === false && opts?.examBankDraftArtifactId === null) await clearExamBankDraft(qr, item);
       const t = await applyItemFailure(
         qr, item.id, msg, !!retryable, opts?.retryAfterSeconds ?? null, opts?.refundAttempt === true, opts?.grantAttempt === true,
       );

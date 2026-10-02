@@ -12,8 +12,9 @@ import { returningRows } from '../../common/db/returning-rows';
  *    dueño del run, de ese tipo y de ESE item run; entonces deja
  *    `output_summary.examBankDraft = { artifactId, generation, attempt, recordedAt }` (si no, lo ignora:
  *    el fail se registra igual, nunca se rechaza por el borrador);
- *  - un fail de exam/final_exam SIN borrador válido (incluido un fail sin campo o con null) BORRA el
- *    anterior (fix round 2, N2): un borrador solo vale para el intento siguiente al faltante que lo creó;
+ *  - un fail con `examBankDraftArtifactId: null` explícito BORRA el anterior (fix round 2 N2 / round 4 R4):
+ *    el ejecutor lo manda ante una falla de reglas del banco sin faltante; un fail transitorio sin el campo
+ *    lo conserva;
  *  - el claim ya devuelve `outputSummary`; además anuncia el soporte con
  *    `claimPayload.examBank.draftArtifactType` (el FailItemDto anterior rechazaría el campo por whitelist).
  * El ejecutor solo usa el borrador si coinciden generación, alcance, versión de prompt, plan y el sha256

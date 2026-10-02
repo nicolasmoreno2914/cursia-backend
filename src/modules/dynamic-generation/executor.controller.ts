@@ -69,7 +69,8 @@ export class ExecutorController {
   ): Promise<ItemOpResult> {
     return this.scheduler.failItemDetailed(
       id, dto.executorId, dto.error, dto.retryable, user.id,
-      dto.examBankDraftArtifactId ? { examBankDraftArtifactId: dto.examBankDraftArtifactId } : undefined,
+      // id = borrador nuevo; null explícito = borrar el anterior (R4); ausente = conservar.
+      dto.examBankDraftArtifactId !== undefined ? { examBankDraftArtifactId: dto.examBankDraftArtifactId } : undefined,
     );
   }
 }
