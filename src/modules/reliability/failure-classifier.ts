@@ -32,6 +32,10 @@ import {
   AUTO_HEAL_DENY_PATTERNS,
   SAFE_AUTO_RETRY_RULES,
 } from './auto-heal-rules';
+// #583 (decisión del usuario A, 2026-10-02): UN reenvío automático de un audio TTS incierto si lo pendiente
+// del item en el ledger es ≤ USD 0.10. La decisión (con el ledger, bajo lock) vive en auto-heal.ts; acá se usa
+// la misma función pura SIN ledger para informar qué hace hoy el sistema.
+import { ambiguousAudioResubmitDecision } from '../dynamic-generation/auto-heal';
 
 export type FailureClass = 'A' | 'B' | 'C' | 'D';
 export const FAILURE_CLASSES: readonly FailureClass[] = Object.freeze(['A', 'B', 'C', 'D']);
@@ -81,6 +85,7 @@ export type CurrentRecovery =
   | 'executor_retry' // retryable en el item (attempt_count < max_attempts): el scheduler lo reintenta
   | 'auto_heal' // allow-list del auto-healer (R16)
   | 'safe_auto_retry' // reintento automático seguro (EV6 DoD BE-B)
+  | 'ambiguous_audio_resubmit' // #583: UN reenvío automático de audio TTS incierto (≤ USD 0.10 pendiente, lo decide auto-heal con el ledger)
   | 'denied' // deny-list: nunca se reabre solo
   | 'manual'; // nada automático: humano (retry/regenerate)
 
@@ -455,6 +460,12 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   {
     id: 'provider_reconciliation',
     codes: ['provider_reconciliation_required', 'confirm_paid_required', 'may_have_rendered_ack_required'],
+    // #583 (decisión A del usuario): TTS de OpenAI incierto en un item de audio → UN reenvío automático acotado
+    // (≤ USD 0.10 pendiente en el ledger, lo verifica auto-heal bajo lock); sigue siendo C (pago incierto).
+    refine: ({ error, itemType }) => (/^provider_reconciliation_required: openai(?![a-z0-9_])/.test(error)
+      && (itemType === 'audio_welcome' || itemType === 'audiobook_chapter')
+      ? { strategy: 'auto_resubmit_once', provider: 'openai' }
+      : null),
     class: 'C', strategy: 'provider_check', paidRisk: 'uncertain', rounds: 1, humanReason: 'duplicate_charge', adminAction: 'reconcile_provider',
   },
 ] as Rule[]);
@@ -603,6 +614,9 @@ export function extractFailureCode(error: string): string {
 export function currentRecoveryOf(error: string, itemType: string | null | undefined, outputSummary: Record<string, any> | null | undefined): CurrentRecovery {
   const e = String(error ?? '').trim();
   const os = outputSummary ?? {};
+  // #583: va ANTES de la deny-list (la deny-list describe justamente este caso incierto; la función de
+  // auto-heal aplica su propia deny-list reducida).
+  if (ambiguousAudioResubmitDecision({ status: 'failed', type: itemType ?? null, error: e, output_summary: os }, new Date()).heal) return 'ambiguous_audio_resubmit';
   const denied = AUTO_HEAL_DENY_PATTERNS.some((re) => re.test(e));
   const safe = SAFE_AUTO_RETRY_RULES.find((r) => r.match.test(e) && (!itemType || itemType === r.type));
   if (safe && !denied && safe.requires(os, e)) return 'safe_auto_retry';

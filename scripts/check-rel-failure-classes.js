@@ -502,6 +502,36 @@ check('fix round 2 (N7): cuota/saldo en español es configuración del proveedor
   expectVerdict('gamma_submit_failed: gamma POST /generations HTTP 400: saldo insuficiente', { class: 'D', strategy: 'wait_provider', provider: 'gamma' });
 });
 
+check('#583 (merge de staging): el reenvío automático ÚNICO de audio TTS incierto (≤ USD 0.10) es coherente con la clase C del clasificador', () => {
+  const msg = 'provider_reconciliation_required: openai — audio TTS pagado sin persistir. El proveedor pudo haber completado';
+  for (const itemType of ['audio_welcome', 'audiobook_chapter']) {
+    const r = expectVerdict(msg, { class: 'C', strategy: 'auto_resubmit_once', paidRisk: 'uncertain', adminAction: 'reconcile_provider', provider: 'openai' }, { itemType });
+    assert(FC.currentRecoveryOf(msg, itemType, {}) === 'ambiguous_audio_resubmit', 'currentRecovery ' + itemType);
+    assert(FC.currentRecoveryOf(msg, itemType, { ambiguousAudioResubmit: { rounds: 1 } }) === 'denied', 'una sola vez');
+    assert(FC.currentRecoveryOf(msg, itemType, { ambiguousAudioResubmit: { declined: 'over_threshold' } }) === 'denied', 'rechazado → admin');
+    void r;
+  }
+  // Fuera de la regla: guion LLM (anthropic), video, presentación → C provider_check, nunca reenvío automático.
+  expectVerdict('provider_reconciliation_required: anthropic — guion pagado sin persistir', { class: 'C', strategy: 'provider_check' }, { itemType: 'audiobook_chapter' });
+  assert(FC.currentRecoveryOf('provider_reconciliation_required: anthropic — x', 'audiobook_chapter', {}) === 'denied', 'anthropic');
+  for (const itemType of ['video', 'presentation']) {
+    expectVerdict(msg, { class: 'C', strategy: 'provider_check' }, { itemType });
+    assert(FC.currentRecoveryOf(msg, itemType, {}) === 'denied', itemType);
+  }
+  // Decisión A: el tope de USD 0.10 lo decide auto-heal con el ledger (misma función que usa el clasificador).
+  const NOW = new Date('2026-10-02T12:00:00Z');
+  const row = { status: 'failed', type: 'audiobook_chapter', error: msg, output_summary: {}, finished_at: new Date(NOW.getTime() - 600_000).toISOString() };
+  assert(AH.AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD === 0.1 && AH.AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS === 1, 'constantes de la decisión A');
+  assert(AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.04, providers: ['openai'] }).heal === true, '≤ 0.10 → un reenvío');
+  assert(AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.1, providers: ['openai'] }).heal === true, '= 0.10 → un reenvío');
+  const over = AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.11, providers: ['openai'] });
+  assert(over.heal === false && over.reason === 'over_threshold', '> 0.10 → admin');
+  assert(AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.04, providers: ['anthropic', 'openai'] }).heal === false, 'otro proveedor pendiente → admin');
+  // TTS incierto por trozos (N5) no es este caso (tts_failed, no provider_reconciliation_required): C reconcile.
+  const t = v('tts_failed: chunk 3/4: HTTP 503', { itemType: 'audiobook_chapter' });
+  assert(t.class === 'C' && t.adminAction === 'reconcile_provider' && FC.currentRecoveryOf('tts_failed: chunk 3/4: HTTP 503', 'audiobook_chapter', {}) !== 'ambiguous_audio_resubmit', 'tts_failed');
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 // 4. GATE: todo código emitido hoy tiene regla explícita
 // ════════════════════════════════════════════════════════════════════════════

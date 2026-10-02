@@ -158,7 +158,7 @@ const MIGRATION_STEPS = [
     // de costo por intento lee generation_cost_events) y de dynamic-generation (generation_item_runs).
     id: 'rel-recovery',
     file: 'supabase-migration-rel-recovery.sql',
-    stagingStep: '4h10 (migrate-rel-recovery.js)',
+    stagingStep: '4h11 (migrate-rel-recovery.js)',
     summary: 'REL R2: generation_item_attempts (append-only por fila cerrada, RLS) + failure_class/failure_code/recovery_*/cooldown_until/attention_reason en generation_item_runs + vista generation_item_attempt_costs',
   },
   {

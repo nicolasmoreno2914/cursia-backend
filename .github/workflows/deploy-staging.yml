@@ -598,10 +598,15 @@ jobs:
                echo "━━━ [4h9] V2.1 RF-b: verificación de RLS (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-v21-finops-rls.js
 
-               echo "━━━ [4h10] REL R2: log de intentos + columnas de recuperación por item (staging) ━━━"
+               echo "━━━ [4h10] #583: límite por generación de staging = 15 USD (nueva versión de la política vigente, solo staging, idempotente) ━━━"
+               # Decisión del usuario (2026-10-02). Solo staging: nunca en deploy.yml ni en el migrador de producción.
+               # El presupuesto aprobado de cada run se sigue validando antes del gasto (aprobación + runtime guard).
+               MIGRATION_ENV=staging node scripts/staging-budget-policy.js aa2fa9a1-afb1-4b01-8646-94a0cb272b57
+
+               echo "━━━ [4h11] REL R2: log de intentos + columnas de recuperación por item (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-rel-recovery.js
 
-               echo "━━━ [4h11] REL R2: verificación de esquema (staging) ━━━"
+               echo "━━━ [4h12] REL R2: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-rel-recovery-schema.js
 
                echo "━━━ [4i] Dynamic Generation: verificación de esquema (staging) ━━━"

@@ -36,8 +36,10 @@ const CALIBRATION_TITLE_RE = /^\[CALIBRATION V2\.1(?: #\d{1,3})?\] /;
 const CREATED_BY = 'staging-v21-calibration (aprobado en el chat por Nicolás, 2026-09-26)';
 
 /** Límites aprobados. monthlyCapStaging no lo aplica el gate del run: lo aplica `authorize`. */
+// #583 (aprobado por el usuario en el chat, 2026-10-02): maxCostPerRun de staging 10 → 15, la MISMA
+// constante que aplica scripts/staging-budget-policy.js en cada deploy de staging (una sola fuente).
 const APPROVED = Object.freeze({
-  limits: { maxCostPerRun: '10', maxCostPerCourse: '15', monthlyCapStaging: '50' },
+  limits: { maxCostPerRun: String(require('./staging-budget-policy').STAGING_MAX_COST_PER_RUN), maxCostPerCourse: '15', monthlyCapStaging: '50' },
   onExceed: 'ADMIN_APPROVAL',
   requireHumanApprovalForRealSpend: true,
   calibrationAuthorization: '8',
