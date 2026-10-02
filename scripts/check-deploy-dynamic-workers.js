@@ -517,6 +517,8 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       'ensure_env_exact DYNAMIC_MANIFEST_RULES_VERSION 3',
       // EV6 H5P v2 en staging: reglas de actividad 2, valor EXACTO.
       'ensure_env_exact DYNAMIC_ACTIVITY_TYPE_RULES 2',
+      // V542 fix round 1 (I3): default claro de cursos nuevos, desde un instante FIJO (solo si falta).
+      'ensure_env_default_if_absent PRESENTATION_LIGHT_DEFAULT_SINCE 2026-10-02T12:00:00Z',
       'ensure_env_flag_true DYNAMIC_COURSE_STRUCTURE',
     ]) assert(block.includes(needle), `falta: ${needle}`);
     assert(!/(ensure_\w+|printf[^\n]*>>\s*\.env)[^\n]*DYNAMIC_COHERENCE_LLM/.test(block), 'DYNAMIC_COHERENCE_LLM no debe escribirse');
@@ -557,10 +559,12 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
           eq(kv.DYNAMIC_VIDEO_DELIVERY, 'youtube', 'default DYNAMIC_VIDEO_DELIVERY');
           eq(kv.DYNAMIC_MANIFEST_RULES_VERSION, '3', 'DYNAMIC_MANIFEST_RULES_VERSION agregado en 3');
           eq(kv.DYNAMIC_ACTIVITY_TYPE_RULES, '2', 'DYNAMIC_ACTIVITY_TYPE_RULES agregado en 2');
+          eq(kv.PRESENTATION_LIGHT_DEFAULT_SINCE, '2026-10-02T12:00:00Z', 'PRESENTATION_LIGHT_DEFAULT_SINCE agregado (corte fijo)');
         } else {
           eq(kv.DYNAMIC_VIDEO_DELIVERY, 'videogen_direct', 'valor manual respetado');
           eq(kv.DYNAMIC_MANIFEST_RULES_VERSION, '3', 'rv3: el valor anterior (1) se reemplaza por 3');
           eq(kv.DYNAMIC_ACTIVITY_TYPE_RULES, '2', 'H5P v2: reglas de actividad 2');
+          eq(kv.PRESENTATION_LIGHT_DEFAULT_SINCE, '2026-10-02T12:00:00Z', 'PRESENTATION_LIGHT_DEFAULT_SINCE presente');
           assert(fs.existsSync(path.join(dir, '.env.bak')), 'backup del .env');
           eq(kv.DYNAMIC_V2_ALLOWED_OWNERS, `11111111-2222-4333-8444-555555555555,${OWNER}`, 'lista extendida (no reemplazada)');
         }

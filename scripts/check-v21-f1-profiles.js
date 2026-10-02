@@ -381,9 +381,15 @@ const def = (finalExam) => PROF.defaultAssessmentProfile({ finalExam });
     const dark = (THEME.LEGACY_PALETTES.find((p) => /nocturno/i.test(p.name || p.id) && THEME.presentationProfileFromPalette(p).mode === 'dark') || THEME.LEGACY_PALETTES.find((p) => THEME.presentationProfileFromPalette(p).mode === 'dark')).id;
     const before = new Date('2026-10-01T18:00:00Z');
     const after = new Date('2026-10-02T00:00:01Z');
-    eq([PROF.isLightDefaultCourse(before), PROF.isLightDefaultCourse(after), PROF.isLightDefaultCourse(null)], [false, true, false], 'corte por defecto');
+    // V542 fix round 1 (I3): falla CERRADO — sin la variable (o inválida) el default claro está apagado.
+    const ON = { PRESENTATION_LIGHT_DEFAULT_SINCE: '2026-10-02T00:00:00Z' };
+    eq([PROF.isLightDefaultCourse(after, {}), PROF.isLightDefaultCourse(new Date(), {}), PROF.isLightDefaultCourse(after, { PRESENTATION_LIGHT_DEFAULT_SINCE: 'no-es-fecha' }), PROF.isLightDefaultCourse(after, { PRESENTATION_LIGHT_DEFAULT_SINCE: '' })],
+      [false, false, false, false], 'sin env / env inválido → apagado (un curso creado «ahora» conserva el tema de su paleta)');
+    eq([PROF.isLightDefaultCourse(before, ON), PROF.isLightDefaultCourse(after, ON), PROF.isLightDefaultCourse(null, ON)], [false, true, false], 'con el corte');
     eq(PROF.isLightDefaultCourse(before, { PRESENTATION_LIGHT_DEFAULT_SINCE: '2026-10-01T00:00:00Z' }), true, 'corte por env');
-    eq(PROF.isLightDefaultCourse(after, { PRESENTATION_LIGHT_DEFAULT_SINCE: 'no-es-fecha' }), true, 'env inválido → corte por defecto');
+    const prevEnv = process.env.PRESENTATION_LIGHT_DEFAULT_SINCE;
+    process.env.PRESENTATION_LIGHT_DEFAULT_SINCE = ON.PRESENTATION_LIGHT_DEFAULT_SINCE;
+    try {
     const old = PROF.defaultPresentationProfileFor(dark);
     eq([old.profile.themeFamily, old.profile.mode], ['oscuro-premium', 'dark'], `curso anterior: ${dark} → oscuro (sin cambio)`);
     const neu = PROF.defaultPresentationProfileFor(dark, { lightDefault: true });
@@ -410,6 +416,12 @@ const def = (finalExam) => PROF.defaultAssessmentProfile({ finalExam });
     eq([tNew.source, tNew.input.themeFamily, tNew.input.mode, tNew.input.brandSeed], ['palette', 'aula-clara', 'light', neu.profile.brandSeed], 'empaque curso nuevo');
     eq([tOld.source, tOld.input.themeFamily, tOld.input.mode], ['palette', 'oscuro-premium', 'dark'], 'empaque curso anterior (sin cambio)');
     eq(PKV3.resolvePackagingTheme({ presentationProfile: null, legacyPaletteId: dark }), tOld, 'sin lightDefault = comportamiento anterior');
+    delete process.env.PRESENTATION_LIGHT_DEFAULT_SINCE;
+    eq((await mk(after).getCurrent(5, OWNER, 'presentation')).profile, old.profile, 'GET sin la variable: curso nuevo conserva el tema de la paleta');
+    eq((await PKV3.loadPackagingProfilesV3(pkgQ(after), 5, true)).theme, tOld, 'empaque sin la variable: igual que antes');
+    } finally {
+      if (prevEnv === undefined) delete process.env.PRESENTATION_LIGHT_DEFAULT_SINCE; else process.env.PRESENTATION_LIGHT_DEFAULT_SINCE = prevEnv;
+    }
   });
 
   console.log(`\n${passes} ok, ${failures} fallos`);

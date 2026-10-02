@@ -69,21 +69,25 @@ export function defaultPresentationProfile(): PresentationProfile {
  * Marca: `courses.created_at` (timestamptz NOT NULL default now(), inmutable). Se eligió sobre una
  * marca en `courses.metadata` porque PATCH /courses reemplaza `metadata` entero (CoursesService.update:
  * Object.assign) y la marca se perdería; tampoco sirve «tiene runs/paquetes» porque el primer run de un
- * curso nuevo ya existe cuando Gamma pide el tema. Corte: `PRESENTATION_LIGHT_DEFAULT_SINCE` (ISO; por
- * defecto 2026-10-02T00:00:00Z, después del curso de validación #542; un valor inválido usa el defecto).
+ * curso nuevo ya existe cuando Gamma pide el tema.
+ * V542 fix round 1 (I3): falla CERRADO. Solo con `PRESENTATION_LIGHT_DEFAULT_SINCE` (ISO válido) puesto
+ * en el entorno; sin la variable (o inválida) el default claro está APAGADO y todo curso conserva el tema
+ * derivado de su paleta. El deploy de staging la fija en el instante de su deploy (2026-10-02T12:00:00Z).
  */
 export const PRESENTATION_LIGHT_DEFAULT_SINCE_ENV = 'PRESENTATION_LIGHT_DEFAULT_SINCE';
-export const PRESENTATION_LIGHT_DEFAULT_SINCE_DEFAULT = '2026-10-02T00:00:00.000Z';
-export function presentationLightDefaultSince(env: NodeJS.ProcessEnv = process.env): Date {
-  const raw = env[PRESENTATION_LIGHT_DEFAULT_SINCE_ENV];
-  const d = raw ? new Date(raw) : null;
-  return d && Number.isFinite(d.getTime()) ? d : new Date(PRESENTATION_LIGHT_DEFAULT_SINCE_DEFAULT);
+/** Corte del default claro, o null (apagado) si la variable falta o no es una fecha ISO válida. */
+export function presentationLightDefaultSince(env: NodeJS.ProcessEnv = process.env): Date | null {
+  const raw = String(env[PRESENTATION_LIGHT_DEFAULT_SINCE_ENV] ?? '').trim();
+  if (!raw || !/^\d{4}-\d{2}-\d{2}T/.test(raw)) return null;
+  const d = new Date(raw);
+  return Number.isFinite(d.getTime()) ? d : null;
 }
-/** ¿El curso (por su `created_at`) arranca en Aula Clara sin perfil guardado? Sin fecha legible → no (conserva). */
+/** ¿El curso (por su `created_at`) arranca en Aula Clara sin perfil guardado? Apagado o sin fecha legible → no (conserva). */
 export function isLightDefaultCourse(createdAt: Date | string | null | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
-  if (createdAt === null || createdAt === undefined || createdAt === '') return false;
+  const since = presentationLightDefaultSince(env);
+  if (!since || createdAt === null || createdAt === undefined || createdAt === '') return false;
   const d = createdAt instanceof Date ? createdAt : new Date(createdAt);
-  return Number.isFinite(d.getTime()) && d.getTime() >= presentationLightDefaultSince(env).getTime();
+  return Number.isFinite(d.getTime()) && d.getTime() >= since.getTime();
 }
 
 /** F1 (I4): de dónde sale el perfil de presentación por defecto de un curso sin perfil guardado. */

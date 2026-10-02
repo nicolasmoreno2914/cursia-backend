@@ -456,6 +456,10 @@ jobs:
                # actividad 2 en staging (objetivo «decidir» → Branching Scenario, IV avanzado, «Repaso» en
                # cursos nuevos). Revertir = 0 (los runs existentes conservan su marcador congelado).
                ensure_env_exact DYNAMIC_ACTIVITY_TYPE_RULES 2
+               # V542 (G2, decisión EV6 n.º 3): cursos NUEVOS sin diseño guardado en Aula Clara (claro). Solo
+               # los creados desde este instante (fijo: el deploy de este cambio); los anteriores conservan el
+               # tema de su paleta. Sin la variable el default claro está APAGADO. Solo si falta.
+               ensure_env_default_if_absent PRESENTATION_LIGHT_DEFAULT_SINCE 2026-10-02T12:00:00Z
                if grep -q "^DYNAMIC_COHERENCE_LLM=" .env; then
                  echo "⚠️  DYNAMIC_COHERENCE_LLM está en el .env de staging — no se toca (la decisión de pre-aceptación es dejarlo OFF)"
                else
