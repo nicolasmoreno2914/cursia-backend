@@ -22,8 +22,10 @@ export class AdminDynamicRunsController {
 
   // GET /api/v1/admin/dynamic-runs/needs-attention?limit=100
   @Get('needs-attention')
-  needsAttention(@Query('limit') limit?: string): Promise<NeedsAttentionListing> {
-    return this.recovery.listNeedsAttention({ limit: limit === undefined ? undefined : Number(limit) });
+  // V542 fix round 1 (I2): &reservationRuns=N (default 200, tope 2000) — runs con reservas de Videogen pendientes
+  // de TODO el ledger; el total siempre viene en pendingReservationsTotals.
+  needsAttention(@Query('limit') limit?: string, @Query('reservationRuns') reservationRuns?: string): Promise<NeedsAttentionListing> {
+    return this.recovery.listNeedsAttention({ limit: limit === undefined ? undefined : Number(limit), reservationRuns: reservationRuns === undefined ? undefined : Number(reservationRuns) });
   }
 
   // V542 (G6) — GET /api/v1/admin/dynamic-runs/:runId/videogen-reservations

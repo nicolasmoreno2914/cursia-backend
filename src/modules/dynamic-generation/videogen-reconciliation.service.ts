@@ -60,9 +60,20 @@ export class VideogenReconciliationService {
     return { runId, courseId: Number(run.course_id), pending: await loadPendingVideogenReservations(this.dataSource, runId) };
   }
 
+  /** Decisión registrada en el ledger para la reserva (null = liquidada por otra vía o sin ajuste). */
+  private async recordedOutcome(reservationKey: string): Promise<VideogenReconcileOutcome | null> {
+    const [a] = await this.dataSource.query(
+      `select a.metadata->>'settlement' as label from public.generation_cost_events a
+        where a.corrects_event_id = (select id from public.generation_cost_events where idempotency_key = $1 and event_kind = 'CHARGE')
+          and a.event_kind = 'ADJUSTMENT' order by a.created_at desc, a.id desc limit 1`,
+      [reservationKey],
+    );
+    return a?.label === 'reconciled_as_not_charged' ? 'not_charged' : a?.label === 'reconciled_as_charged' ? 'charged' : null;
+  }
+
   async reconcile(
     runId: string,
-    body: { reservationKey?: unknown; outcome?: unknown; reason?: unknown },
+    body: { reservationKey?: unknown; outcome?: unknown; reason?: unknown; acknowledgeMayHaveRendered?: unknown },
     actor: { id: string; email?: string | null },
   ): Promise<VideogenReconcileResult> {
     // Defensa en profundidad (el controlador ya exige SuperAdminGuard).
@@ -72,6 +83,12 @@ export class VideogenReconciliationService {
     const reservationKey = typeof body?.reservationKey === 'string' ? body.reservationKey.trim() : '';
     const outcome = body?.outcome as VideogenReconcileOutcome;
     const reason = typeof body?.reason === 'string' ? body.reason.trim() : '';
+    const extra = Object.keys(body ?? {}).filter((k) => !['reservationKey', 'outcome', 'reason', 'acknowledgeMayHaveRendered'].includes(k));
+    if (extra.length) throw new BadRequestException(`campos no permitidos: ${extra.join(', ')}`);
+    if (body?.acknowledgeMayHaveRendered !== undefined && typeof body.acknowledgeMayHaveRendered !== 'boolean') {
+      throw new BadRequestException('acknowledgeMayHaveRendered debe ser booleano');
+    }
+    const ack = body?.acknowledgeMayHaveRendered === true;
     if (!reservationKey) throw new BadRequestException('reservationKey es obligatorio');
     if (!VIDEOGEN_RECONCILE_OUTCOMES.includes(outcome)) throw new BadRequestException(`outcome debe ser ${VIDEOGEN_RECONCILE_OUTCOMES.join(' | ')}`);
     if (reason.length < VIDEOGEN_RECONCILE_REASON_MIN || reason.length > 500) {
@@ -80,6 +97,15 @@ export class VideogenReconciliationService {
     await this.runOrThrow(runId);
     const pending = await loadPendingVideogenReservations(this.dataSource, runId);
     const target = pending.find((p) => p.reservationKey === reservationKey);
+    // V542 fix round 1 (I4): «no cobrado» de un intento que pudo renderizarse/cobrarse exige el reconocimiento explícito.
+    if (target && outcome === 'not_charged' && target.mayHaveRendered && !ack) {
+      throw new ConflictException({
+        code: 'may_have_rendered_ack_required',
+        message: `may_have_rendered_ack_required: la reserva es de un intento que pudo renderizarse o cobrarse (${target.attemptState}${target.videogenJobId ? ', con job de Videogen registrado' : ''}). ` +
+          'Para registrarla como NO cobrada, confirma en la cuenta de Videogen que ese job no se cobró y reenvía con acknowledgeMayHaveRendered: true (y el motivo). No se hizo nada.',
+        attemptState: target.attemptState,
+      });
+    }
     if (!target) {
       // ¿Ya conciliada (idempotente) o no conciliable (otro run, en curso, mock, otro proveedor)?
       const [ev] = await this.dataSource.query(
@@ -102,11 +128,27 @@ export class VideogenReconciliationService {
       }
       throw new ConflictException({ code: 'reservation_not_reconcilable', message: 'reservation_not_reconcilable: La reserva no es una reserva de Videogen pendiente de esta ejecución que ningún worker vaya a liquidar.' });
     }
-    const meta = { runId, itemKey: target.itemKey, outcome, decidedById: actor.id, decidedByRole: 'SUPER_ADMIN', failureCode: target.failureCode };
+    const meta = {
+      runId, itemKey: target.itemKey, outcome, decidedById: actor.id, decidedByRole: 'SUPER_ADMIN', failureCode: target.failureCode,
+      attemptState: target.attemptState, videogenJobId: target.videogenJobId,
+      ...(outcome === 'not_charged' && target.mayHaveRendered ? { acknowledgedMayHaveRendered: true } : {}),
+    };
     const recordedBy = 'admin_reconcile_videogen';
     const r = outcome === 'not_charged'
       ? await this.ledger.reconcileReservationAsNotCharged(reservationKey, reason, { decidedBy: actor.id, recordedBy, metadata: meta })
       : await this.ledger.reconcileReservationAsCharged(reservationKey, reason, { decidedBy: actor.id, recordedBy, metadata: meta });
+    if (r.alreadySettled) {
+      // Fix round 1 (M1): otra decisión ganó la carrera (lock del ledger): se informa la registrada, nunca la pedida.
+      const recorded = await this.recordedOutcome(reservationKey);
+      if (recorded !== outcome) {
+        throw new ConflictException({ code: 'reservation_already_settled', message: `reservation_already_settled: La reserva ya se concilió como ${recorded ?? 'liquidada'}; no se cambia una decisión registrada.` });
+      }
+      return {
+        runId, reservationKey, outcome, reconciled: false, alreadySettled: true, amount: r.amount,
+        countedAmount: outcome === 'charged' ? r.amount : normalizeDecimal(0), adjustmentEventId: null,
+        remaining: await loadPendingVideogenReservations(this.dataSource, runId),
+      };
+    }
     this.logger.warn(`reconcile_videogen: run ${runId} ${target.itemKey} reserva ${reservationKey} → ${outcome} (${target.amount}) por ${actor.id}`);
     return {
       runId, reservationKey, outcome, reconciled: r.reconciled, alreadySettled: r.alreadySettled, amount: r.amount,

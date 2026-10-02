@@ -215,18 +215,25 @@ const ENV_KEYS = [
         { id: 'c', item_key: 'content:a', type: 'content', status: 'running', output_summary: {} },
       ];
       const job = { status: 'running', worker_status: 'running', input_payload: { videoMode: 'real' } };
-      const res = [{ reservationKey: 'reservation:videogen:v:g1:a1:submit', itemKey: 'video:a', itemRunId: 'v', amount: '0.9400000000', createdAt: null, failureCode: 'videogen_failed' }];
+      const res = [{ reservationKey: 'reservation:videogen:v:g1:a1:submit', itemKey: 'video:a', itemRunId: 'v', amount: '0.9400000000', createdAt: null, failureCode: 'videogen_failed', runId: 'r', attemptState: 'current_attempt_unsettled', videogenJobId: true, mayHaveRendered: true }];
       const c = RC.evaluateRunCompletion(job, rows, manifest, null, { pendingVideogenReservations: res });
       eq(c.state, 'in_progress', 'sigue en curso');
-      eq(c.adminActions, [{ code: 'retry_video_render', itemKey: 'video:a' }, { code: 'reconcile_videogen', itemKey: 'video:a', reservationKey: res[0].reservationKey, amount: '0.9400000000' }], 'acciones con el run running');
+      eq(c.adminActions, [{ code: 'retry_video_render', itemKey: 'video:a' }, { code: 'reconcile_videogen_reservation', itemKey: 'video:a', reservationKey: res[0].reservationKey, amount: '0.9400000000', attemptState: 'current_attempt_unsettled', mayHaveRendered: true }], 'acciones con el run running');
       const own = RC.redactCompletionForOwner(c);
-      eq(own.adminActions, [{ code: 'retry_video_render', itemKey: 'video:a' }, { code: 'reconcile_videogen', itemKey: 'video:a' }], 'dueño sin clave ni monto');
+      eq(own.adminActions, [{ code: 'retry_video_render', itemKey: 'video:a' }], 'fix round 1 (M2): el dueño no recibe la conciliación de reservas');
       eq(c.adminActions[1].reservationKey, res[0].reservationKey, 'la original no se toca');
       // Run completo con una reserva sin conciliar: el curso sigue `complete` (la conciliación es de dinero) con la acción.
       const done = [{ id: 'v', item_key: 'video:a', type: 'video', status: 'completed', output_summary: { mode: 'real', delivery: 'completed', youtubeVideoId: 'abcdefghijk', external: { videogenJobId: 'j' } } },
         { id: 'c', item_key: 'content:a', type: 'content', status: 'completed', output_summary: {} }];
       const c2 = RC.evaluateRunCompletion({ status: 'completed', worker_status: 'completed', input_payload: { videoMode: 'real', videoDelivery: 'youtube' } }, done, manifest, { ready: true, status: 'completed' }, { pendingVideogenReservations: res });
-      eq([c2.state, c2.adminActions.map((a) => a.code)], ['complete', ['reconcile_videogen']], 'completo + acción de conciliación');
+      eq([c2.state, c2.adminActions.map((a) => a.code)], ['complete', ['reconcile_videogen_reservation']], 'completo + acción de conciliación');
+      // Fix round 1 (I4): clasificación del intento de una reserva.
+      const K = 'reservation:videogen:x:g1:a1:submit';
+      eq(RC.classifyVideogenReservation(K, { status: 'completed', output_summary: { previousExternals: [{ externalReservationKey: K, reason: 'videogen_failed: generate_script 429' }] } }), { attemptState: 'archived_failed', videogenJobId: false }, 'archivado por fallo de render');
+      eq(RC.classifyVideogenReservation(K, { status: 'completed', output_summary: { previousExternals: [{ externalReservationKey: K, reason: 'ambiguous_video_submission: timeout', external: { videogenJobId: 'j' } }] } }), { attemptState: 'ambiguous_submission', videogenJobId: true }, 'archivado ambiguo');
+      eq(RC.classifyVideogenReservation(K, { status: 'failed', error: 'ambiguous_video_submission: x', output_summary: { externalReservationKey: K } }), { attemptState: 'ambiguous_submission', videogenJobId: false }, 'vigente ambiguo');
+      eq(RC.classifyVideogenReservation(K, { status: 'failed', error: 'videogen_failed: x', output_summary: { externalReservationKey: K, external: { videogenJobId: 'j' } } }), { attemptState: 'current_attempt_unsettled', videogenJobId: true }, 'vigente sin liquidar');
+      eq(RC.classifyVideogenReservation(K, { status: 'failed', output_summary: {} }).attemptState, 'unknown', 'sin rastro');
     } finally {
       if (prevAH === undefined) delete process.env.DYNAMIC_AUTO_HEAL_ENABLED; else process.env.DYNAMIC_AUTO_HEAL_ENABLED = prevAH;
     }
@@ -1147,8 +1154,8 @@ const ENV_KEYS = [
       eq((await jobOf(rvg)).worker_status, 'running', 'run en curso');
       const mf = await manifests.getById(Cvg.cid, OWNER, 1, Cvg.manifest.id);
       const { completion } = await runs.completionForAdmin(await jobOf(rvg), mf);
-      const a = completion.adminActions.filter((x) => x.code === 'reconcile_videogen');
-      eq(a.map((x) => [x.itemKey, x.reservationKey, Number(x.amount)]), [[`video:${Cvg.c1}`, vgKeys.failed, 0.94]], 'acción con el run running');
+      const a = completion.adminActions.filter((x) => x.code === 'reconcile_videogen_reservation');
+      eq(a.map((x) => [x.itemKey, x.reservationKey, Number(x.amount), x.attemptState, x.mayHaveRendered]), [[`video:${Cvg.c1}`, vgKeys.failed, 0.94, 'archived_failed', false]], 'acción con el run running');
       eq(completion.state, 'in_progress', 'estado');
       assert(!JSON.stringify(RC.redactCompletionForOwner(completion)).includes(vgKeys.failed), 'dueño sin la clave');
     });
@@ -1164,7 +1171,11 @@ const ENV_KEYS = [
       const e = a.json.data.pendingReservations.find((x) => x.runId === rvg);
       assert(e, `run en pendingReservations: ${JSON.stringify(a.json.data.pendingReservations.map((x) => x.runId))}`);
       eq(e.adminActions.map((x) => [x.code, x.reservationKey, x.endpoint.path, x.endpoint.bodyAlternatives.map((b) => b.outcome)]),
-        [[ 'reconcile_videogen', vgKeys.failed, `${vgPath}/reconcile`, ['not_charged', 'charged']], ['reconcile_videogen', vgKeys.inflight, `${vgPath}/reconcile`, ['not_charged', 'charged']]], 'acciones');
+        [[ 'reconcile_videogen_reservation', vgKeys.failed, `${vgPath}/reconcile`, ['not_charged', 'charged']], ['reconcile_videogen_reservation', vgKeys.inflight, `${vgPath}/reconcile`, ['not_charged', 'charged']]], 'acciones');
+      // Fix round 1 (I4): el intento vigente sin liquidar pudo renderizarse → la variante «no cobrado» lleva el reconocimiento.
+      eq(e.adminActions.map((x) => [x.attemptState, x.mayHaveRendered, x.endpoint.bodyAlternatives[0].acknowledgeMayHaveRendered === true]), [['archived_failed', false, false], ['current_attempt_unsettled', true, true]], 'estado del intento');
+      const tot = a.json.data.pendingReservationsTotals;
+      assert(tot.reservations >= 2 && tot.runs >= 1 && tot.listedRuns === tot.runs && tot.truncated === false, `totales ${JSON.stringify(tot)}`);
       assert(/no informa si cobró/.test(e.adminActions[0].endpoint.note) && /nunca automático/.test(e.adminActions[0].endpoint.note), 'nota');
       const l = await get(vgPath, ADMIN_X);
       eq([l.status, l.json.data.pending.length], [200, 2], 'GET reservas (admin)');
@@ -1181,6 +1192,11 @@ const ENV_KEYS = [
       eq((await post(`${vgPath}/reconcile`, { ...ok, outcome: 'release' }, ADMIN_X)).status, 400, 'outcome inválido');
       const s1 = await post(`${vgPath}/reconcile`, { ...ok, reservationKey: vgKeys.settled }, ADMIN_X);
       eq([s1.status, JSON.stringify(s1.json).includes('reservation_already_settled')], [409, true], 'liquidada por el worker');
+      // Fix round 1 (I4): «no cobrado» de un intento que pudo renderizarse sin el reconocimiento → 409 explícito.
+      const s3 = await post(`${vgPath}/reconcile`, { reservationKey: vgKeys.inflight, outcome: 'not_charged', reason: 'Videogen: verificado sin cobro en la cuenta' }, ADMIN_X);
+      eq([s3.status, JSON.stringify(s3.json).includes('may_have_rendered_ack_required'), JSON.stringify(s3.json).includes('acknowledgeMayHaveRendered')], [409, true, true], 'sin acknowledgeMayHaveRendered');
+      eq((await post(`${vgPath}/reconcile`, { ...ok, acknowledgeMayHaveRendered: 'si' }, ADMIN_X)).status, 400, 'flag no booleano');
+      eq((await post(`${vgPath}/reconcile`, { ...ok, otra: 1 }, ADMIN_X)).status, 400, 'campo extra');
       const s2 = await post(`/api/v1/admin/dynamic-runs/${ramb}/videogen-reservations/reconcile`, ok, ADMIN_X);
       eq([s2.status, JSON.stringify(s2.json).includes('reservation_not_reconcilable')], [409, true], 'reserva de otro run');
       await rejectsRe(vgSvc.reconcile(rvg, ok, OWNER_ACTOR), /admin_recovery_only/, 'servicio: dueño', 403);
@@ -1216,6 +1232,52 @@ const ENV_KEYS = [
       eq(completion.adminActions.filter((x) => x.reservationKey), [], 'sin acción de conciliación');
       const a = await get('/api/v1/admin/dynamic-runs/needs-attention?limit=500', ADMIN_X);
       assert(!a.json.data.pendingReservations.some((x) => x.runId === rvg), 'fuera de la cola');
+    });
+
+    await check('[VG] fix round 1 (I2/I4): una reserva de un run REEMPLAZADO (el curso ya tiene un run más nuevo) aparece en la cola; envío ambiguo → «no cobrado» exige acknowledgeMayHaveRendered (409 sin él; con él, registrado con el reconocimiento)', async () => {
+      const Cs = await confirmedCourse('V542 reserva en run reemplazado');
+      const r1 = await seededRealRun(Cs);
+      const v = await latest(r1, `video:${Cs.c2}`);
+      const key = await FWH.reservePaidCall(ledger, { kind: 'videogen', ownerId: OWNER, itemRunId: v.id, generation: 1, itemAttempt: 1, tag: 'submit', estimate: {} });
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'ambiguous_video_submission: timeout', finished_at = now(),
+          output_summary = (output_summary - 'external') || jsonb_build_object('externalReservationKey', $2::text, 'externalSubmitStartedAt', '2026-10-01T00:00:00Z') where id = $1`, [v.id, key]);
+      await ds.query(`update public.production_jobs set status = 'failed', worker_status = 'failed', finished_at = now() where id = $1`, [r1]);
+      // Run más nuevo del mismo curso (en cola): r1 deja de ser el vigente; la cola principal ya no lo mira.
+      const [{ id: r2 }] = await ds.query(`insert into public.production_jobs (owner_id, course_id, execution_mode, status, worker_status, current_step, progress, input_payload, output_summary, options, result, created_at)
+        select owner_id, course_id, execution_mode, 'queued', 'queued', current_step, 0, input_payload, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now() + interval '1 second' from public.production_jobs where id = $1 returning id`, [r1]);
+      assert(r2 !== r1, 'run nuevo');
+      const a = await get('/api/v1/admin/dynamic-runs/needs-attention?limit=1', ADMIN_X);
+      const e = a.json.data.pendingReservations.find((x) => x.runId === r1);
+      assert(e, `run reemplazado listado (limit=1 de la cola principal no lo tapa): ${JSON.stringify(a.json.data.pendingReservationsTotals)}`);
+      eq(e.adminActions.map((x) => [x.reservationKey, x.attemptState, x.mayHaveRendered]), [[key, 'ambiguous_submission', true]], 'ambiguo');
+      const path1 = `/api/v1/admin/dynamic-runs/${r1}/videogen-reservations/reconcile`;
+      const reason = 'Videogen: no existe el job del envío ambiguo, sin cobro en la cuenta';
+      const no = await post(path1, { reservationKey: key, outcome: 'not_charged', reason }, ADMIN_X);
+      eq(no.status, 409, 'sin reconocimiento');
+      const yes = await post(path1, { reservationKey: key, outcome: 'not_charged', reason, acknowledgeMayHaveRendered: true }, ADMIN_X);
+      eq([yes.status, yes.json.data.reconciled, Number(yes.json.data.countedAmount)], [200, true, 0], `con reconocimiento ${JSON.stringify(yes.json).slice(0, 300)}`);
+      const ev = await evs(key);
+      eq([ev[1].metadata.attemptState, ev[1].metadata.acknowledgedMayHaveRendered, ev[1].metadata.settlement], ['ambiguous_submission', true, 'reconciled_as_not_charged'], 'metadata');
+      await ds.query(`update public.production_jobs set status = 'cancelled', worker_status = 'cancelled', finished_at = now() where id = $1`, [r2]);
+    });
+
+    await check('[VG] fix round 1 (M1): carrera entre decisiones opuestas → la segunda recibe 409 con la decisión registrada (nunca un 200 que contradiga el ledger)', async () => {
+      const Cr = await confirmedCourse('V542 carrera de conciliación');
+      const rr = await seededRealRun(Cr);
+      const v = await latest(rr, `video:${Cr.c1}`);
+      const key = await FWH.reservePaidCall(ledger, { kind: 'videogen', ownerId: OWNER, itemRunId: v.id, generation: 1, itemAttempt: 1, tag: 'submit', estimate: {} });
+      await ds.query(`update public.generation_item_runs set output_summary = output_summary || jsonb_build_object('previousExternals', jsonb_build_array(jsonb_build_object('externalReservationKey', $2::text, 'reason', 'videogen_failed: x'))) where id = $1`, [v.id, key]);
+      const p = `/api/v1/admin/dynamic-runs/${rr}/videogen-reservations/reconcile`;
+      const [x, y] = await Promise.all([
+        post(p, { reservationKey: key, outcome: 'not_charged', reason: 'carrera A: sin cobro en Videogen' }, ADMIN_X),
+        post(p, { reservationKey: key, outcome: 'charged', reason: 'carrera B: con cobro en Videogen' }, ADMIN_X),
+      ]);
+      const sts = [x.status, y.status].sort();
+      eq(sts, [200, 409], `una gana, la otra 409 (${x.status}/${y.status})`);
+      const won = x.status === 200 ? 'not_charged' : 'charged';
+      const label = (await evs(key))[1].metadata.settlement;
+      eq(label, won === 'not_charged' ? 'reconciled_as_not_charged' : 'reconciled_as_charged', 'el ledger coincide con la respuesta 200');
+      await ds.query(`update public.production_jobs set status = 'failed', worker_status = 'failed', finished_at = now() where id = $1`, [rr]);
     });
 
     // ════ [RP] reporte de cursos viejos: solo lectura ═════════════════════════

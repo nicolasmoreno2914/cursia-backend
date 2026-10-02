@@ -55,7 +55,13 @@ export type RunAdminActionCode =
    * BE-B fix round 1 (I2): el precheck del paquete lo bloquea por algo que no es de un componente concreto
    * (p.ej. el dueño quedó fuera de la allow-list): resolver la causa (`reason`) y después pedir el paquete.
    */
-  | 'resolve_package_block';
+  | 'resolve_package_block'
+  /**
+   * V542 (G6) + fix round 1 (M2): una RESERVA de Videogen sin liquidar (resultado incierto) que un SUPER_ADMIN
+   * concilia como cobrada o no cobrada. Código propio (no `reconcile_videogen`, que es el reenvío de un item
+   * ambiguo): un frontend viejo nunca la confunde con un reenvío pagado. Nunca llega al dueño.
+   */
+  | 'reconcile_videogen_reservation';
 
 export interface RunAdminAction {
   code: RunAdminActionCode;
@@ -69,6 +75,9 @@ export interface RunAdminAction {
    */
   reservationKey?: string;
   amount?: string;
+  /** V542 fix round 1 (I4): estado del intento de la reserva y si «no cobrado» exige `acknowledgeMayHaveRendered`. */
+  attemptState?: VideogenReservationAttemptState;
+  mayHaveRendered?: boolean;
 }
 
 /** V542 (G6): reserva de Videogen pendiente que solo un SUPER_ADMIN puede conciliar (ver loadPendingVideogenReservations). */
@@ -80,6 +89,50 @@ export interface PendingVideogenReservation {
   createdAt: string | null;
   /** Código del fallo que dejó la reserva sin liquidar (si el item todavía está fallido; nunca el texto). */
   failureCode: string | null;
+  /** V542 fix round 1 (I2): run de la reserva (la cola de admin la busca en TODOS los runs). */
+  runId: string;
+  /**
+   * V542 fix round 1 (I4): de qué intento es la reserva —
+   *  - `archived_failed`: intento ARCHIVADO por un reenvío cuyo motivo fue un fallo de render de Videogen
+   *    (`videogen_failed` / `videogen_submit_rejected`): el caso del curso #542;
+   *  - `ambiguous_submission`: intento (archivado o vigente) con envío ambiguo / reconciliación pendiente
+   *    (`ambiguous_video_submission`, `provider_reconciliation_required`): el job pudo existir y cobrarse;
+   *  - `current_attempt_unsettled`: el intento VIGENTE del item (ya no vivo) nunca se liquidó: el video pudo
+   *    renderizarse;
+   *  - `unknown`: no se encuentra el intento de la reserva.
+   * Solo `archived_failed` se puede conciliar «no cobrado» sin `acknowledgeMayHaveRendered: true`.
+   */
+  attemptState: VideogenReservationAttemptState;
+  /** Hay un id de job de Videogen registrado para ese intento. */
+  videogenJobId: boolean;
+  /** `attemptState !== 'archived_failed'`: «no cobrado» exige el reconocimiento explícito. */
+  mayHaveRendered: boolean;
+}
+
+export type VideogenReservationAttemptState = 'archived_failed' | 'ambiguous_submission' | 'current_attempt_unsettled' | 'unknown';
+
+const RENDER_FAILED_RE = /^\s*(videogen_failed|videogen_submit_rejected)\b/;
+const AMBIGUOUS_RE = /^\s*(ambiguous_video_submission|provider_reconciliation_required)\b/;
+
+/** V542 fix round 1 (I4): clasificación pura del intento de una reserva (ver PendingVideogenReservation). */
+export function classifyVideogenReservation(
+  reservationKey: string,
+  item: { status?: string | null; error?: string | null; output_summary?: any },
+): { attemptState: VideogenReservationAttemptState; videogenJobId: boolean } {
+  const os = item.output_summary && typeof item.output_summary === 'object' ? item.output_summary : {};
+  const archived = (Array.isArray(os.previousExternals) ? os.previousExternals : []).find((p: any) => p && p.externalReservationKey === reservationKey);
+  if (archived) {
+    const reason = String(archived.reason ?? '');
+    const jobId = !!archived.external?.videogenJobId;
+    if (RENDER_FAILED_RE.test(reason) && !AMBIGUOUS_RE.test(reason)) return { attemptState: 'archived_failed', videogenJobId: jobId };
+    return { attemptState: 'ambiguous_submission', videogenJobId: jobId };
+  }
+  if (os.externalReservationKey === reservationKey) {
+    const jobId = !!os.external?.videogenJobId;
+    if (AMBIGUOUS_RE.test(String(item.error ?? ''))) return { attemptState: 'ambiguous_submission', videogenJobId: jobId };
+    return { attemptState: 'current_attempt_unsettled', videogenJobId: jobId };
+  }
+  return { attemptState: 'unknown', videogenJobId: false };
 }
 
 export interface RunCompletion {
@@ -531,7 +584,7 @@ export function evaluateRunCompletion(
   if (previewComponents.some((k) => k.startsWith('video:')) && manifest.rulesVersion === 3) push({ code: 'generate_real_videos' });
   // V542 (G6): nunca se liberan solas (resultado incierto): una acción de admin por reserva.
   for (const r of opts.pendingVideogenReservations ?? []) {
-    push({ code: 'reconcile_videogen', itemKey: r.itemKey, reservationKey: r.reservationKey, amount: r.amount });
+    push({ code: 'reconcile_videogen_reservation', itemKey: r.itemKey, reservationKey: r.reservationKey, amount: r.amount, attemptState: r.attemptState, mayHaveRendered: r.mayHaveRendered });
   }
 
   let state: RunCompletionState;
@@ -590,10 +643,10 @@ export function evaluateRunCompletion(
 export function redactCompletionForOwner<T extends Partial<RunCompletion> | null | undefined>(c: T): T {
   if (!c || typeof c !== 'object') return c;
   let out = c;
-  // V542 (G6): la clave de la reserva y el monto son datos de conciliación del admin.
+  // V542 (G6) + fix round 1 (M2): la conciliación de reservas es solo de admin — el dueño no recibe la acción.
   const acts = (c as RunCompletion).adminActions;
-  if (Array.isArray(acts) && acts.some((a) => a && (a.reservationKey !== undefined || a.amount !== undefined))) {
-    out = { ...out, adminActions: acts.map((a) => (a && (a.reservationKey !== undefined || a.amount !== undefined) ? (({ reservationKey: _k, amount: _a, ...rest }) => rest)(a) : a)) } as T;
+  if (Array.isArray(acts) && acts.some((a) => a && (a.code === 'reconcile_videogen_reservation' || a.reservationKey !== undefined))) {
+    out = { ...out, adminActions: acts.filter((a) => !(a && (a.code === 'reconcile_videogen_reservation' || a.reservationKey !== undefined))) } as T;
   }
   const pj = (c as RunCompletion).packageJob;
   if (!pj || typeof pj !== 'object' || !pj.blocked || typeof pj.blocked !== 'object') return out;
@@ -703,28 +756,38 @@ export async function loadCompletionInputs(q: Q, jobId: string): Promise<{
  * El resultado es incierto (Videogen no informa si cobró un job fallido): nunca se libera sola; lo decide un
  * SUPER_ADMIN con `reconcile_videogen`. Solo lectura; orden: creación.
  */
-export async function loadPendingVideogenReservations(q: Q, runId: string): Promise<PendingVideogenReservation[]> {
+export async function loadPendingVideogenReservations(q: Q, runId: string | null, opts: { limit?: number } = {}): Promise<PendingVideogenReservation[]> {
   // Sin el esquema de FinOps (bases previas a V2.1 RF-a / harnesses) no hay reservas: nada que conciliar.
   const [t] = await q.query(`select to_regclass('public.generation_cost_events') is not null as present`);
   if (!t?.present) return [];
   const rows: any[] = await q.query(
-    `select e.idempotency_key, e.item_key, e.item_run_id, e.amount::text as amount, e.created_at, g.status as item_status, g.error as item_error
+    `select e.idempotency_key, e.item_key, e.item_run_id, e.run_id, e.amount::text as amount, e.created_at, g.status as item_status, g.error as item_error,
+            g.output_summary as item_output_summary
        from public.generation_cost_events e
        join public.generation_item_runs g on g.id = e.item_run_id
-      where e.run_id = $1 and e.event_kind = 'CHARGE' and e.provider = 'videogen' and e.billing_account <> 'mock'
+      where ($1::uuid is null or e.run_id = $1::uuid) and e.event_kind = 'CHARGE' and e.provider = 'videogen' and e.billing_account <> 'mock'
         and coalesce((e.metadata->>'reservation') = 'true', false) and e.measurement_status = 'pending'
         and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)
         and not (g.status in ('pending', 'running', 'retrying')
                  and coalesce(g.output_summary->>'externalReservationKey', '') = e.idempotency_key)
-      order by e.created_at, e.idempotency_key`,
+      order by e.created_at, e.idempotency_key
+      ${opts.limit ? 'limit ' + Math.max(1, Math.floor(opts.limit)) : ''}`,
     [runId],
   );
-  return rows.map((r) => ({
+  return rows.map((r) => {
+    const os = typeof r.item_output_summary === 'string' ? JSON.parse(r.item_output_summary) : r.item_output_summary;
+    const c = classifyVideogenReservation(String(r.idempotency_key), { status: r.item_status, error: r.item_error, output_summary: os });
+    return {
     reservationKey: String(r.idempotency_key),
     itemKey: String(r.item_key ?? ''),
     itemRunId: String(r.item_run_id),
     amount: String(r.amount),
     createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
     failureCode: r.item_status === 'failed' ? (/^\s*([a-z][a-z0-9_]*)/.exec(String(r.item_error ?? ''))?.[1] ?? null) : null,
-  }));
+    runId: String(r.run_id),
+    attemptState: c.attemptState,
+    videogenJobId: c.videogenJobId,
+    mayHaveRendered: c.attemptState !== 'archived_failed',
+    };
+  });
 }
