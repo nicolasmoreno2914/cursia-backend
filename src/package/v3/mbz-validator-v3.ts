@@ -10,7 +10,7 @@
  *   NUMBER_NOT_FROM_FACTS                  cifras de los labels determinísticos ∈ facts
  *   CLEAN_SAFE                             lint CLEAN_SAFE (cuerpo ≥ 16 px, contraste, hex…) en todo label
  *   TOKEN_INVALID                          todo `$@…$` apunta a un módulo del paquete del tipo correcto
- *   H5P_FILES / H5P_LIBRARIES              package + intro por h5pactivity; solo librerías del perfil
+ *   H5P_FILES / H5P_LIBRARIES              un solo .h5p (package) por h5pactivity y el intro lo embebe (V542 I2); solo librerías del perfil
  *                                          EV6 H5P v2: un .h5p de una principal "bundled" de
  *                                          CURSIA_H5P_PROFILE_V2 (Branching Scenario, Dialog Cards)
  *                                          lleva EXACTAMENTE sus carpetas delta, con library.json =
@@ -821,13 +821,14 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   for (const a of h5pActs) {
     const mine = files.filter((f) => f.ctx === a.ctx && f.component === 'mod_h5pactivity' && f.filename !== '.');
     const pkg = mine.find((f) => f.filearea === 'package');
-    const intro = mine.find((f) => f.filearea === 'intro');
-    if (!pkg || !intro) {
-      add('H5P_FILES', a.idnumber, `faltan entradas package/intro (package=${!!pkg}, intro=${!!intro})`);
+    if (!pkg) {
+      add('H5P_FILES', a.idnumber, 'falta la entrada package del .h5p');
       continue;
     }
-    if (pkg.hash !== intro.hash || pkg.filename !== intro.filename) add('H5P_FILES', a.idnumber, 'package e intro no son el mismo .h5p');
-    if (!a.intro.includes(`url=@@PLUGINFILE@@/${pkg.filename}`)) add('H5P_FILES', a.idnumber, 'el intro no embebe el .h5p del filearea intro');
+    // V542 I2: UNA sola copia (el embed inline usa la de `package`); una segunda copia = dos contenidos
+    // H5P sobre el mismo estado xAPI → «Data Reset» y progreso perdido.
+    if (mine.some((f) => f !== pkg)) add('H5P_FILES', a.idnumber, `más de una copia del .h5p (${mine.map((f) => f.filearea).join(', ')}): el estado se duplica`);
+    if (!a.intro.includes(`url=@@PLUGINFILE@@/../package/0/${pkg.filename}&`)) add('H5P_FILES', a.idnumber, 'el intro no embebe el .h5p del filearea package');
     const blob = await bin(`files/${pkg.hash.slice(0, 2)}/${pkg.hash}`);
     if (!blob) continue;
     try {

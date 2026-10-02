@@ -52,6 +52,39 @@ export const CURSIA_IV_INLINE_SCRIPT = String.raw`(function(w,d){var C=w.CursiaI
   String.raw`if('IntersectionObserver' in w){(function(f){var io=new w.IntersectionObserver(function(es){for(var j=0;j!==es.length;j++){if(es[j].isIntersecting){io.disconnect();C.load(f)}}},{rootMargin:'400px 0px'});io.observe(f)})(f)}else{C.load(f)}}}}` +
   String.raw`C.resizer();C.scan()})(window,document);`;
 
+/**
+ * V542 I2 — UNA sola copia del .h5p por actividad. El embed inline del intro carga el MISMO archivo
+ * que view.php (`mod_h5pactivity/package/0/<file>`), no una copia en el filearea `intro`: con dos
+ * copias Moodle crea dos contenidos H5P (pathnamehash distintos) sobre el mismo estado xAPI del
+ * contexto, y al desplegar el segundo `resetContentUserData` borra el progreso → modal «Data Reset».
+ * `@@PLUGINFILE@@` del intro es `pluginfile.php/<ctx>/mod_h5pactivity/intro`; Moodle no normaliza
+ * `..` dentro del parámetro `url` (core_h5p\api::get_pluginfile_hash), así que el cargador lo
+ * resuelve (`/intro/../package/0/` → `/package/0/`) solo en la query, antes de asignar `src`. Moodle 4.5
+ * entrega `url` URL-codificado (`%2Fintro%2F..%2Fpackage%2F0%2F`, visto en una restauración real): el
+ * cargador acepta ambas formas.
+ * Sin JS (o con forceclean) el bloque inline ni se muestra: queda el enlace a la actividad.
+ */
+export const H5P_PACKAGE_FROM_INTRO_PLUGINFILE = '@@PLUGINFILE@@/../package/0';
+
+/** Cargador de CURSIA_IV_INLINE_SCRIPT + resolución de `/intro/../package/0/` en la query (V542 I2). */
+export const CURSIA_IV_INLINE_SCRIPT_PKG = CURSIA_IV_INLINE_SCRIPT.replace(
+  String.raw`C.load=function(f){if(!f.getAttribute('src')){f.setAttribute('src',f.getAttribute('data-cursia-src'))}};`,
+  String.raw`C.load=function(f){if(!f.getAttribute('src')){var s=f.getAttribute('data-cursia-src'),q=s.indexOf('?');if(q!==-1){s=s.slice(0,q)+s.slice(q).replace(/(\/|%2F)intro(\/|%2F)(\.\.|%2E%2E)(\/|%2F)package(\/|%2F)0(\/|%2F)/gi,function(m,a,b,c,e,g,h){return a+'package'+g+'0'+h})}f.setAttribute('src',s)}};`,
+).replace('C=w.CursiaIV={v:1};', 'C=w.CursiaIV={v:2};');
+if (CURSIA_IV_INLINE_SCRIPT_PKG === CURSIA_IV_INLINE_SCRIPT || !CURSIA_IV_INLINE_SCRIPT_PKG.includes('{v:2}') || /[<>&]/.test(CURSIA_IV_INLINE_SCRIPT_PKG)) {
+  throw new Error('CURSIA_IV_INLINE_SCRIPT_PKG: no se pudo derivar el cargador');
+}
+
+/** Iframe embed.php: `intro` (receta R8, copia en el filearea intro) o `package` (V542 I2, una sola copia). */
+export type H5pInlineEmbedSource = 'intro' | 'package';
+export function h5pInlineEmbedSrc(packageFilename: string, source: H5pInlineEmbedSource = 'intro'): string {
+  const file = source === 'package' ? `${H5P_PACKAGE_FROM_INTRO_PLUGINFILE}/${packageFilename}` : `@@PLUGINFILE@@/${packageFilename}`;
+  return `${H5P_EMBED_FROM_PLUGINFILE}?url=${file}&amp;component=mod_h5pactivity`;
+}
+export function h5pInlineScript(source: H5pInlineEmbedSource = 'intro'): string {
+  return source === 'package' ? CURSIA_IV_INLINE_SCRIPT_PKG : CURSIA_IV_INLINE_SCRIPT;
+}
+
 export interface VideoIntroTheme {
   surface: string;
   border: string;
@@ -88,6 +121,8 @@ export interface VideoInlineIntroInput {
   activityMid: number;
   youtubeId: string;
   theme?: Partial<VideoIntroTheme>;
+  /** V542 I2: 'package' = el iframe carga el .h5p de view.php (sin copia en intro). Por defecto 'intro' (R8). */
+  embed?: H5pInlineEmbedSource;
 }
 
 /** Nombre de archivo determinístico del .h5p a partir del item_key (`video:ch3` → `cursia-video-ch3.h5p`). */
@@ -128,7 +163,7 @@ export function videoInlineIntroHtml(input: VideoInlineIntroInput): string {
   if (errs.length) throw new Error(`VIDEO_INTRO_INVALID: ${errs.join('; ')}`);
   const t = resolveTheme(input.theme);
   const C = VIDEO_INTRO_COPY;
-  const src = `${H5P_EMBED_FROM_PLUGINFILE}?url=@@PLUGINFILE@@/${packageFilename}&amp;component=mod_h5pactivity`;
+  const src = h5pInlineEmbedSrc(packageFilename, input.embed);
   const yt = `https://www.youtube.com/watch?v=${youtubeId}`;
   const viewToken = `$@H5PACTIVITYVIEWBYID*${activityMid}@$`;
   return [
@@ -143,7 +178,7 @@ export function videoInlineIntroHtml(input: VideoInlineIntroInput): string {
     `<p class="cursia-iv-open" style="margin:0 0 6px 0;"><a href="${viewToken}" style="color:${t.accent};font-weight:bold;">${esc(C.openLink)}</a></p>`,
     `<p style="margin:0;color:${t.textSecondary};"><a class="nomediaplugin" href="${yt}" style="color:${t.textSecondary};">${esc(C.youtubeLink)}</a> ${esc(C.youtubeNote)}</p>`,
     `</div>`,
-    `<script>${CURSIA_IV_INLINE_SCRIPT}</script>`,
+    `<script>${h5pInlineScript(input.embed)}</script>`,
     `</div>`,
   ].join('\n');
 }

@@ -502,7 +502,8 @@ const MATRIX = [
       const mid = /forum_(\d+)/.exec(forum.dir)[1];
       return { [`${a.dir}/label.xml`]: (x) => x.replace(/\$@RESOURCEVIEWBYID\*\d+@\$/, `$@RESOURCEVIEWBYID*${mid}@$`) };
     }],
-    ['H5P_FILES', () => ({ 'files.xml': (x) => x.replace(/<filearea>intro<\/filearea>\n    <itemid>0<\/itemid>\n    <filepath>\/<\/filepath>\n    <filename>cursia-video/, '<filearea>content</filearea>\n    <itemid>0</itemid>\n    <filepath>/</filepath>\n    <filename>cursia-video') })],
+    // V542 I2: el .h5p vive SOLO en `package`; moverlo a otro filearea deja la actividad sin paquete.
+    ['H5P_FILES', () => ({ 'files.xml': (x) => x.replace(/<filearea>package<\/filearea>\n    <itemid>0<\/itemid>\n    <filepath>\/<\/filepath>\n    <filename>cursia-video/, '<filearea>content</filearea>\n    <itemid>0</itemid>\n    <filepath>/</filepath>\n    <filename>cursia-video') })],
     ['AUDIO_DURATION', () => {
       const a = find(/^cv3:shell:audio_welcome$/);
       return { [`${a.dir}/label.xml`]: (x) => x.replace(/Duración: \d+ min \d+ s/, 'Duración: 0 min 59 s') };
@@ -1077,7 +1078,7 @@ const MATRIX = [
     for (const [f, v] of [['builderVersion', '3.0.1'], ['manifestSha256', 'm2'], ['sourceArtifactIds', ['a']], ['themeSha256', 't2'], ['assessmentProfileSha256', 'p2'], ['h5pProfileVersion', 2], ['vcRendererVersion', 'r2'], ['moodleVersion', '4.5']]) {
       assert(PK.packageReuseHashV3({ ...baseK, [f]: v }) !== k0, `cambia con ${f}`);
     }
-    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.7.0' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
+    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.8.0' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
   });
 
   // ── Medios ────────────────────────────────────────────────────────────────

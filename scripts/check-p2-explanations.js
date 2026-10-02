@@ -208,10 +208,10 @@ async function main() {
   const RA = await readPkg(builtA.mbz);
   const MA = A.input.manifest;
 
-  await check('(a) bancos: validateMbzV3 sin hallazgos y versión 3.7.0', async () => {
+  await check('(a) bancos: validateMbzV3 sin hallazgos y versión 3.8.0', async () => {
     const v = await V.validateMbzV3(builtA.mbz, builtA.expectations);
     assert(v.ok, JSON.stringify(v.issues.slice(0, 5)));
-    eq(builtA.summary.builderVersion, '3.7.0', 'versión');
+    eq(builtA.summary.builderVersion, '3.8.0', 'versión');
   });
   let pagesA = [];
   await check('(a) una página por quiz, después del quiz, availability exacta a SU quiz, completion 0, downloadcontent 0, fuera de completion.xml, registrada', () => {

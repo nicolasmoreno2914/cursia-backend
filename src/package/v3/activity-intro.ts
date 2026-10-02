@@ -1,9 +1,11 @@
 /**
  * Cursia V2.1 — R12: intros de las actividades calificables del capítulo.
  *
- * - Actividad H5P: misma receta probada que el video (R8, HD-V21-2): el
- *   `.h5p` también en el filearea `intro` y un iframe `embed.php` diferido,
- *   con la URL derivada de `@@PLUGINFILE@@` (sirve con wwwroot en subcarpeta)
+ * - Actividad H5P: misma receta probada que el video (R8, HD-V21-2): un
+ *   iframe `embed.php` diferido, con la URL derivada de `@@PLUGINFILE@@` (sirve
+ *   con wwwroot en subcarpeta). V542 I2: el iframe carga el `.h5p` del filearea
+ *   `package` (el mismo de view.php; ya NO hay copia en `intro`) → un contenido
+ *   y un estado por actividad
  *   y el resizer H5P inline (`CURSIA_IV_INLINE_SCRIPT`, sin h5plib/vNNN).
  *   Con forceclean=1 el iframe y el script se eliminan y queda el bloque de
  *   respaldo con el enlace a la actividad (`$@H5PACTIVITYVIEWBYID*mid@$`).
@@ -13,7 +15,7 @@
 import type { ResolvedTheme } from '../../modules/theme-engine';
 import { contrastRatio } from '../../modules/theme-engine';
 import { esc } from '../mbz-common';
-import { CURSIA_IV_INLINE_SCRIPT, H5P_EMBED_FROM_PLUGINFILE, VideoIntroTheme } from '../h5p';
+import { h5pInlineEmbedSrc, h5pInlineScript, VideoIntroTheme } from '../h5p';
 
 export const ACTIVITY_INTRO_COPY = Object.freeze({
   heading: 'Actividad práctica calificable',
@@ -46,7 +48,7 @@ export function reviewCardsIntroHtml(input: { packageFilename: string; title: st
   if (!Number.isInteger(activityMid) || activityMid < 1) throw new Error(`ACTIVITY_INTRO_INVALID: activityMid ${activityMid}`);
   checkFrame(t, f);
   const C = REVIEW_CARDS_INTRO_COPY;
-  const src = `${H5P_EMBED_FROM_PLUGINFILE}?url=@@PLUGINFILE@@/${packageFilename}&amp;component=mod_h5pactivity`;
+  const src = h5pInlineEmbedSrc(packageFilename, 'package');
   return [
     `<div class="cursia-iv cvc-act cvc-review" style="max-width:960px;margin:0 0 16px 0;padding:0;background-color:${t.surface};color:${t.textPrimary};border:1px solid ${f.edge};border-radius:14px;overflow:hidden;">`,
     frameHead(t, f, C.frameHeading),
@@ -56,7 +58,7 @@ export function reviewCardsIntroHtml(input: { packageFilename: string; title: st
     `<div class="cursia-iv-fallback" style="background-color:${t.surface};color:${t.textPrimary};margin:0;padding:12px 18px 14px 18px;font-size:16px;line-height:1.5;border-top:1px solid ${f.edge};">`,
     `<p class="cursia-iv-open" style="margin:0;color:${t.textSecondary};"><span class="nolink">${esc(C.frameFallbackLead)}</span><a href="$@H5PACTIVITYVIEWBYID*${activityMid}@$" style="color:${f.ink};font-weight:bold;"><span class="nolink">${esc(C.frameFallbackLink)}</span></a></p>`,
     `</div>`,
-    `<script>${CURSIA_IV_INLINE_SCRIPT}</script>`,
+    `<script>${h5pInlineScript('package')}</script>`,
     `</div>`,
   ].join('\n');
 }
@@ -121,7 +123,7 @@ export function h5pActivityInlineIntroHtml(input: { packageFilename: string; tit
   if (typeof title !== 'string' || !title.trim()) throw new Error('ACTIVITY_INTRO_INVALID: title vacío');
   if (!Number.isInteger(activityMid) || activityMid < 1) throw new Error(`ACTIVITY_INTRO_INVALID: activityMid ${activityMid}`);
   const C = ACTIVITY_INTRO_COPY;
-  const src = `${H5P_EMBED_FROM_PLUGINFILE}?url=@@PLUGINFILE@@/${packageFilename}&amp;component=mod_h5pactivity`;
+  const src = h5pInlineEmbedSrc(packageFilename, 'package');
   return [
     `<div class="cursia-iv" style="max-width:960px;margin:0 0 16px 0;padding:0;">`,
     `<div class="cursia-iv-inline" style="display:none;margin:0 0 12px 0;padding:0;">`,
@@ -132,7 +134,7 @@ export function h5pActivityInlineIntroHtml(input: { packageFilename: string; tit
     `<p style="margin:0 0 10px 0;color:${t.textSecondary};max-width:68ch;">${esc(C.body)}</p>`,
     `<p class="cursia-iv-open" style="margin:0;"><a href="$@H5PACTIVITYVIEWBYID*${activityMid}@$" style="color:${t.accent};font-weight:bold;">${esc(C.openLink)}</a></p>`,
     `</div>`,
-    `<script>${CURSIA_IV_INLINE_SCRIPT}</script>`,
+    `<script>${h5pInlineScript('package')}</script>`,
     `</div>`,
   ].join('\n');
 }
@@ -160,7 +162,7 @@ function framedH5pIntro(input: { packageFilename: string; title: string; activit
   const { packageFilename, title, activityMid, theme: t, frame: f } = input;
   checkFrame(t, f);
   const C = ACTIVITY_INTRO_COPY;
-  const src = `${H5P_EMBED_FROM_PLUGINFILE}?url=@@PLUGINFILE@@/${packageFilename}&amp;component=mod_h5pactivity`;
+  const src = h5pInlineEmbedSrc(packageFilename, 'package');
   return [
     `<div class="cursia-iv cvc-act" style="max-width:960px;margin:0 0 16px 0;padding:0;background-color:${t.surface};color:${t.textPrimary};border:1px solid ${f.edge};border-radius:14px;overflow:hidden;">`,
     frameHead(t, f, C.frameHeading),
@@ -170,7 +172,7 @@ function framedH5pIntro(input: { packageFilename: string; title: string; activit
     `<div class="cursia-iv-fallback" style="background-color:${t.surface};color:${t.textPrimary};margin:0;padding:12px 18px 14px 18px;font-size:16px;line-height:1.5;border-top:1px solid ${f.edge};">`,
     `<p class="cursia-iv-open" style="margin:0;color:${t.textSecondary};"><span class="nolink">${esc(C.frameFallbackLead)}</span><a href="$@H5PACTIVITYVIEWBYID*${activityMid}@$" style="color:${f.ink};font-weight:bold;"><span class="nolink">${esc(C.frameFallbackLink)}</span></a></p>`,
     `</div>`,
-    `<script>${CURSIA_IV_INLINE_SCRIPT}</script>`,
+    `<script>${h5pInlineScript('package')}</script>`,
     `</div>`,
   ].join('\n');
 }
