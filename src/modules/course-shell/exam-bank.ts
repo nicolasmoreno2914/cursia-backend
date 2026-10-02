@@ -516,8 +516,9 @@ export type ExamBankQuestion = ExamMultichoiceQuestion | ExamTrueFalseQuestion |
  *  3 = guardia v3 (fix bank-guard-minors): corte «:»/«;» solo para negaciones de cópula, condiciones y
  *      desmentidos en todo el prefijo, «si» interrogativo con verbos completos, tramos dentro de una pregunta
  *      citada, y normalización de la evidencia que conserva «≠ ≮ ≯ ≤ ≥…» y «>» en medio del texto;
- *  4 = #583 (I3): piso por hoja = 2·slots (bankFloorFor); la evidencia sigue con la guardia v3.
- * completeItem valida SIEMPRE con las reglas vigentes; el empaque re-valida con las de la versión del banco
+ *  4 = #583 (I3): piso por hoja = 2·slots (bankFloorFor); la evidencia sigue con la guardia v3. El piso sigue la
+ *      versión DECLARADA también al completar (un banco que declara < 4 conserva el piso histórico).
+ * completeItem valida la evidencia SIEMPRE con las reglas vigentes (el piso por hoja, con la versión declarada); el empaque re-valida con las de la versión del banco
  * (un banco ya aceptado nunca deja de empaquetarse porque las reglas se endurecieron).
  */
 export const EXAM_BANK_VALIDATION_VERSION = 4;
@@ -688,9 +689,13 @@ export function validateExamBank(doc: unknown, ctx: ExamBankValidationContext): 
   }
   const slotCount = plan ? planSlotCount(plan) : 0;
   const done = (bankSize: number): ExamBankValidationResult => ({ ok: E.list.length === 0, errors: E.list, slotCount, bankSize, plan });
-  // Reglas con que se valida (fix round 4, R2; #583: también el piso por hoja).
-  const acceptedUnder =
-    ctx.evidenceRules === 'asAccepted' ? (isObj(doc) && Number.isInteger(doc.bankValidationVersion) ? (doc.bankValidationVersion as number) : 1) : EXAM_BANK_VALIDATION_VERSION;
+  // Reglas de evidencia con que se valida (fix round 4, R2): las vigentes al completar, las declaradas al empaquetar.
+  const declaredVersion = isObj(doc) && Number.isInteger(doc.bankValidationVersion) ? (doc.bankValidationVersion as number) : 1;
+  const acceptedUnder = ctx.evidenceRules === 'asAccepted' ? declaredVersion : EXAM_BANK_VALIDATION_VERSION;
+  // #583 fix round 0 (orden de deploy indiferente): el piso por hoja sigue SIEMPRE la versión que el banco DECLARA,
+  // también al completar. Un banco v4 (ejecutor nuevo, claim que anuncia 4) exige 2·slots; uno sin versión o v1–v3
+  // (pestaña vieja, ejecutor anterior) conserva el piso histórico — completar y empaquetar nunca dependen del orden.
+  const floorVersion = declaredVersion;
 
   if (!isObj(doc)) {
     E.push('$', 'EXAM_BANK_SCHEMA', 'el banco debe ser un objeto JSON');
@@ -823,7 +828,7 @@ export function validateExamBank(doc: unknown, ctx: ExamBankValidationContext): 
       const k = leafKey(owner, leaf.type);
       planned.add(k);
       const n = byLeaf.get(k)?.length ?? 0;
-      const min = bankFloorFor(leaf.slots, acceptedUnder);
+      const min = bankFloorFor(leaf.slots, floorVersion);
       const max = bankMax(leaf.slots);
       if (n < min || n > max) {
         E.push('$.questions', 'EXAM_BANK_LEAF_COUNT', `${owner} × ${leaf.type}: ${n} preguntas, se esperaban ${min}–${max} (slots ${leaf.slots})`);

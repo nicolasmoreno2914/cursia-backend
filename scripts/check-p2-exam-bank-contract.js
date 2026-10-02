@@ -532,6 +532,43 @@ async function main() {
     eq(S.EXAM_BANK_VALIDATION_VERSION, 4, 'versión vigente');
   });
 
+  await check('#583 fix round 0 (orden de deploy indiferente): el piso por hoja sigue la versión DECLARADA — un banco sin versión / v3 con una hoja entre 1,5·s y 2·s se acepta al completar y se empaqueta; el mismo banco declarado v4 se rechaza al completar y al empaquetar', async () => {
+    // Recorta la primera hoja de cada examen de módulo con ≥ 2 slots a su piso HISTÓRICO (< 2·s).
+    const trimmed = [];
+    const mutTrim = (version) => (type, bank) => {
+      if (type !== 'exam') return;
+      const leaf = bank.plan.find((l) => l.slots >= 2 && EB.bankFloor(l.slots) < EB.bankTarget(l.slots));
+      assert(leaf, 'hay una hoja con piso histórico < 2·s');
+      const mine = bank.questions.filter((q) => q.chapterId === leaf.chapterId && q.type === leaf.type);
+      assert(mine.length >= EB.bankTarget(leaf.slots), 'el fixture trae 2·s');
+      const drop = new Set(mine.slice(EB.bankFloor(leaf.slots)).map((q) => q.id));
+      bank.questions = bank.questions.filter((q) => !drop.has(q.id));
+      trimmed.push({ leaf, kept: EB.bankFloor(leaf.slots) });
+      if (version !== null) bank.bankValidationVersion = version;
+    };
+    for (const version of [null, 3]) {
+      const f = runFixture('bank', mutTrim(version));
+      const { loaded } = await load(f);
+      const built = await B.buildDynamicMbzV3({ ...f.input, contents: loaded.contents });
+      assert(Buffer.isBuffer(built.mbz) && built.mbz.length > 0, `v${version}: se empaqueta`);
+    }
+    const t = trimmed[0];
+    assert(t.kept >= 1.5 * t.leaf.slots && t.kept < 2 * t.leaf.slots, `hoja recortada a ${t.kept} para ${t.leaf.slots} slots`);
+    await rejects(load(runFixture('bank', mutTrim(4))), /^EXAM_BANK_INVALID: exam:[^ ]+ \[EXAM_BANK_LEAF_COUNT\]/, 'banco v4 bajo 2·s al empaquetar');
+    // Al completar (reglas vigentes de evidencia), con el MISMO banco: sin versión / v3 → OK; v4 → EXAM_BANK_LEAF_COUNT.
+    const chs = [{ id: 'c1', moduleId: 'm1' }, { id: 'c2', moduleId: 'm1' }];
+    const gi = new Map(chs.map((c, i) => [c.id, i]));
+    const plan = EB.expectedExamPlan('module', chs);
+    const md = new Map(chs.map((c, i) => [c.id, EBF.chapterMarkdown(i, 'Reglas')]));
+    const base = EBF.makeExamBank({ scope: 'module', moduleId: 'm1', chapters: chs, chapterIndex: gi, plan });
+    eq(EB.validateExamBank(base, { scope: 'module', chapters: chs, chapterMd: md }).errors, [], 'fixture válido');
+    for (const version of [null, 1, 2, 3, 4]) {
+      const b = JSON.parse(JSON.stringify(base));
+      mutTrim(version)('exam', b);
+      const leafErrs = EB.validateExamBank(b, { scope: 'module', chapters: chs, chapterMd: md }).errors.filter((e) => e.code === 'EXAM_BANK_LEAF_COUNT');
+      eq(leafErrs.length, version === 4 ? 1 : 0, `al completar, declarado ${version}`);
+    }
+  });
   await check('Fix bank-guard-minors: un banco aceptado con las reglas v2 sigue empaquetando con ellas aunque las v3 lo rechacen («Es un mito: [frag]», «≠ → =», «> omitido»); declarado v3 → EXAM_BANK_EVIDENCE; al completar (reglas vigentes v3) → rechazo', async () => {
     const chs = [{ id: 'c1', moduleId: 'm1' }, { id: 'c2', moduleId: 'm1' }];
     const gi = new Map(chs.map((c, i) => [c.id, i]));
