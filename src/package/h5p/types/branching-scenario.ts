@@ -332,7 +332,13 @@ const NODE_COMMON = Object.freeze({
   forceContentFinished: 'useBehavioural',
 });
 
-export function buildBranchingScenario(input: BranchingScenarioInput): H5pBuiltContent {
+/**
+ * #583 fix round 1 (m3): `opts.passingGrade` = nota mínima de la actividad en Moodle (0–100, perfil vigente;
+ * default 70). La imagen de un final sigue a si ESE final aprueba: óptimo (100) verde; aceptable (70) ámbar solo si
+ * 70 ≥ nota mínima — si no, rojo y la explicación abre con «No aprobado»; malo (0) siempre rojo.
+ */
+export function buildBranchingScenario(input: BranchingScenarioInput, opts?: { passingGrade?: number }): H5pBuiltContent {
+  const passingGrade = opts && Number.isFinite(opts.passingGrade) ? (opts.passingGrade as number) : 70;
   validateBranchingScenarioInput(input);
   const scores = BRANCHING_SCENARIO_ENDING_SCORES;
   const nodeOf = new Map(input.decisions.map((d, i) => [d.id, i + 1]));
@@ -356,9 +362,14 @@ export function buildBranchingScenario(input: BranchingScenarioInput): H5pBuiltC
     const alternatives = d.options.map((o) => {
       if (o.next.startsWith('end:')) {
         const e = endingOf.get(o.next.slice(4))!;
-        const subtitle = (o.consequence ? P(o.consequence) : '') + P(e.text);
+        const pct = (scores[e.quality] * 100) / BRANCHING_SCENARIO_MAX_SCORE;
+        const failsAcceptable = e.quality === 'acceptable' && pct < passingGrade;
+        const subtitle =
+          (failsAcceptable ? P(`No aprobado: este final da ${scores[e.quality]} de ${BRANCHING_SCENARIO_MAX_SCORE} y la nota mínima es ${passingGrade} de 100.`) : '') +
+          (o.consequence ? P(o.consequence) : '') +
+          P(e.text);
         // #583 (I4): imagen propia por calidad (sin ella BS muestra su «pare» rojo en TODO final, también en el aceptable).
-        const img = bsEndImage(e.quality);
+        const img = bsEndImage(failsAcceptable ? 'poor' : e.quality);
         contentFiles[img.path] = img.bytes;
         return {
           text: escapeText(o.text),

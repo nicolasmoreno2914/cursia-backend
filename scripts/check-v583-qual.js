@@ -166,6 +166,23 @@ const DT = { itemKey: 'activity:qa', title: 'El registro de doña Carmen', taskD
     delete bad.branchingScenario.content[1].type.params.branchingQuestion.alternatives[1].feedback.image;
     throws(() => h.assertBranchingScenarioContent(bad), /final sin imagen propia/, 'sin imagen');
   });
+  await check('m3 (fix round 1): el color del final sigue la nota mínima REAL — con 80 el aceptable (70) no aprueba → rojo y «No aprobado»; con 70 (o 60) ámbar; el óptimo siempre verde, el malo rojo', () => {
+    const endsOf = (pg) => {
+      const b = h.buildBranchingScenario(BS_INPUT, pg === undefined ? undefined : { passingGrade: pg });
+      const out = {};
+      for (const n of b.content.branchingScenario.content) for (const a of n.type.params.branchingQuestion?.alternatives || []) if (a.nextContentId === -1) out[a.feedback.endScreenScore] = { img: a.feedback.image.path.replace(/^images\/cursia-final-|\.png$/g, ''), sub: a.feedback.subtitle };
+      return { out, files: Object.keys(b.contentFiles).sort() };
+    };
+    for (const pg of [undefined, 70, 60]) {
+      const { out } = endsOf(pg);
+      eq([out[10].img, out[7].img, out[0].img], ['optimal', 'acceptable', 'poor'], `nota mínima ${pg}`);
+      assert(!/No aprobado/.test(out[7].sub), `${pg}: el aceptable aprueba`);
+    }
+    const { out, files } = endsOf(80);
+    eq([out[10].img, out[7].img, out[0].img], ['optimal', 'poor', 'poor'], 'nota mínima 80');
+    assert(out[7].sub.startsWith('<p>No aprobado: este final da 7 de 10 y la nota mínima es 80 de 100.</p>'), out[7].sub);
+    eq(files, ['images/cursia-final-optimal.png', 'images/cursia-final-poor.png'], 'solo las imágenes usadas');
+  });
   await check('I4: buildBundledH5p — content/images/*.png dentro del .h5p, bytes determinísticos; una imagen referenciada que falta o una ruta fuera de images/ → H5P_PACKAGE_INVALID', async () => {
     const b = h.buildBranchingScenario(BS_INPUT);
     const store = h.openH5pLibraryStore(h.CURSIA_H5P_PROFILE_V2);
@@ -197,11 +214,12 @@ const DT = { itemKey: 'activity:qa', title: 'El registro de doña Carmen', taskD
   // ══ M1 / M4 — renderer ══
   await check('M1: los encabezados de paso empiezan en mayúscula («calcular el presupuesto…» → «Calcular…»; «Paso 2: priorizar» → «Priorizar»; «¿cuánto…?» → «¿Cuánto…?»); nunca toca siglas ni el resto', () => {
     const we = { type: 'worked_example', title: 'La tienda de doña Carmenza', situation: 'Es lunes y llega el distribuidor.', data: ['Dinero en caja: $180.000', 'Arriendo: $50.000'],
-      steps: [{ action: 'calcular el presupuesto de compras', detail: 'Resta los compromisos fijos.' }, { action: 'Paso 2: priorizar los productos', detail: 'Primero la rotación alta.' }, { action: '¿cuánto pedir?', detail: 'Solo lo esencial.' }, { action: 'IVA incluido', detail: 'Revisa la factura.' }],
+      steps: [{ action: 'calcular el presupuesto de compras', detail: 'Resta los compromisos fijos.' }, { action: 'Paso 2: priorizar los productos', detail: 'Primero la rotación alta.' }, { action: '¿cuánto pedir?', detail: 'Solo lo esencial.' }, { action: 'IVA incluido', detail: 'Revisa la factura.' }, { action: 'iPhone de la tienda', detail: 'Anota en el celular.' }, { action: 'eBay y otros canales', detail: 'Compara precios.' }],
       result: 'La tienda queda surtida.' };
     const html = vc.renderComponent(we, THEME, { uid: 'w' });
     const t = vc.extractText(html);
-    for (const want of ['Calcular el presupuesto de compras', 'Priorizar los productos', '¿Cuánto pedir?', 'IVA incluido']) assert(t.includes(want), `falta «${want}»: ${t.slice(0, 400)}`);
+    for (const want of ['Calcular el presupuesto de compras', 'Priorizar los productos', '¿Cuánto pedir?', 'IVA incluido', 'iPhone de la tienda', 'eBay y otros canales']) assert(t.includes(want), `falta «${want}»: ${t.slice(0, 400)}`);
+    assert(!/IPhone|EBay/.test(t), 'm10: marcas con mayúscula interna intactas');
     for (const bad of ['calcular el presupuesto de compras', 'priorizar los productos', '¿cuánto pedir?']) assert(!t.includes(bad), `queda «${bad}»`);
     const ps = vc.renderComponent({ type: 'process_steps', title: 'Recibir mercancía', steps: [{ heading: 'contar las unidades', body: 'Antes de firmar.' }, { heading: 'anotar en el cuaderno', body: 'Con fecha.' }] }, THEME, { uid: 'p' });
     const tp = vc.extractText(ps);

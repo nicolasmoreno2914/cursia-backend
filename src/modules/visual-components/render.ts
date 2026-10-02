@@ -500,9 +500,11 @@ function stripStepPrefix(h: string): string {
 /**
  * #583 (M1): el encabezado de un paso es un título — empieza en mayúscula aunque el LLM lo escriba como
  * continuación de «Paso 1:» («calcular el presupuesto de compras» → «Calcular el presupuesto de compras»).
- * Solo la primera letra, después de signos de apertura («¿¡"(…); nunca toca siglas ni el resto del texto.
+ * Solo la primera letra, después de signos de apertura («¿¡"(…); nunca toca siglas, marcas con mayúscula interna ni el resto.
  */
 export function capFirst(h: string): string {
+  // #583 fix round 1 (m10): una marca o término con mayúscula interna («iPhone», «eBay», «eCommerce») queda igual.
+  if (/^[\s«"“'‘(¿¡\[*_]*\p{Ll}+\p{Lu}/u.test(h)) return h;
   return h.replace(/^([\s«"“'‘(¿¡\[*_]*)(\p{Ll})/u, (_m, pre: string, ch: string) => pre + ch.toLocaleUpperCase('es'));
 }
 

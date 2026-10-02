@@ -613,7 +613,8 @@ async function buildActivityH5p(
     delete input.passPercentage;
     if (typeof input.title === 'string') input.title = h5pTitle(input.title, 120);
     validateBranchingScenarioInput(input);
-    const bs = buildBranchingScenario(input);
+    // #583 fix round 1 (m3): el color del final sigue la nota mínima REAL de la actividad (perfil vigente).
+    const bs = buildBranchingScenario(input, { passingGrade });
     assertH5pGradableInMoodle(bs.mainLibrary);
     const h5p = await buildBundledH5p({
       mainLibrary: bs.mainLibrary,
