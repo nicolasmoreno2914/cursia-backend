@@ -1,5 +1,5 @@
 {
-  "version": "usage-priors-v1.4",
+  "version": "usage-priors-v1.5",
   "learnedFromLedger": false,
   "minSamplesToLearn": 20,
   "defaultRetryRate": 0.15,
@@ -37,20 +37,21 @@
     "source": "BANKOPT + fix round 1 (scratchpad/r18/BANKOPT-report.md): holgura por hoja (MC 2s+2, V/F y EM 2s+1) con recorte equitativo por capítulo, reubicación de evidencia SOLO casi textual (tipeo/puntuación; Levenshtein ≥ 0,95, palabras de sentido y cifras idénticas, ambigüedad → rechazo), reparación solo de lo que falta, borrador solo ante faltante real y caché del prefijo de cada capítulo (5 min). Proyección con el LLM falso de bankopt/sim.mjs; sin corrida real todavía.",
     "method": "Mismo método que calibrationV542: expected = precio(p50) × (1 + retryRate). Esperado por ítem = medido en #542 × (simulación rama / simulación staging) con la tasa de fallas que reproduce #542 en staging (RATE_X=4: staging simula exam 2.30 en 2 ítems y final 2.14 vs 2.23 / 2.12 medidos). Escenario CONSERVADOR: FORM_SHARE=0 (ninguna evidencia no textual se salva por reubicación: todas las paráfrasis se rechazan y reparan) y COLD_FINAL=1 (el final NO reusa el caché de los exámenes de módulo: cada capítulo escribe fuente + tarea; una lectura cruzada es ganancia no presupuestada). Rama simulada: exam 1.702 (2 ítems), final 1.775 ⇒ ratios 0.741 / 0.828. Tokens p50 = forma de la simulación por ítem escalada a precio(p50), salvo la escritura de caché, que es un costo fijo por capítulo (no se escala; se compensa en la salida). p10 = corrida limpia (RATE_X=1); p90 = 1.6 × p50.",
     "exam": {
-      "projectedPerItemUSD": 0.826,
+      "projectedPerItemUSD": 0.886,
       "retryRate": 0.15,
       "retryRateWhy": "el reintento por un faltante real reanuda del borrador y solo repara la hoja corta; los reintentos simulados ya van dentro de los tokens del ítem",
-      "p50USD": 0.718,
+      "p50USD": 0.77,
       "reference": "examen de módulo de 2 capítulos (42 preguntas pedidas con holgura, 17 slots)"
     },
     "final_exam": {
-      "projectedPerItemUSD": 1.755,
+      "projectedPerItemUSD": 2.029,
       "retryRate": 0.15,
-      "p50USD": 1.526,
+      "p50USD": 1.764,
       "cacheAssumption": "caché frío: el ejecutor no garantiza que el final corra dentro de los 5 min del último examen de módulo, así que las escrituras de caché se presupuestan completas (≈ 6,7 k tokens por capítulo)",
       "reference": "final de 2×2 (74 preguntas pedidas con holgura, 33 slots)"
     },
-    "check": "scripts/check-v21-finops.js «calibración V542»: exam/final ≈ proyectados (±5 %), banco del 2×2 ≈ 3.41 (antes 4.35), total dentro de ±20 % del real proyectado (11.73 − 4.35 + 3.41 = 10.79) y del registrado proyectado (14.55 − 0.94 = 13.61). Reemplazar por percentiles aprendidos del ledger (cache_read/cache_write reales) cuando haya ≥ 20 muestras."
+    "check": "scripts/check-v21-finops.js «calibración V542»: exam/final ≈ proyectados (±5 %), banco del 2×2 ≈ 3.80 (antes 4.35), total dentro de ±20 % del real proyectado (11.73 − 4.35 + 3.80 = 11.18) y del registrado proyectado (14.55 − 0.55 = 14.00). Reemplazar por percentiles aprendidos del ledger (cache_read/cache_write reales) cuando haya ≥ 20 muestras.",
+    "callTimeoutHotfix": "Hotfix #583 (fix/bank-call-timeout, priors v1.5): el ejecutor parte el banco en llamadas de ≤ 3.500 tokens de salida estimados (antes 6.500; ~7.500-8.000 reales tardaban > 100 s y Cloudflare cortaba con 524) con tokens por pregunta medidos (MC 660, V/F 265, EM 335). Más llamadas por capítulo ⇒ más lecturas de caché y más tail sin caché (la escritura de caché por capítulo no cambia). Re-simulado (bankopt/sim.mjs, FE fix/bank-call-timeout, RATE_X=4, FORM_SHARE=0, COLD_FINAL=1): exam 1.825 (2 ítems) / final 2.052 vs staging 2.297 / 2.144 ⇒ ratios 0.795 / 0.957 ⇒ exam 0.886/ítem, final 2.029 ⇒ banco del 2×2 ≈ 3.80 (v1.4: 3.41). p50 USD = proyectado / 1.15 (exam 0.770, final 1.764); tokens = forma simulada escalada (escritura de caché sin escalar); p10 = corrida limpia (RATE_X=1); p90 ≈ 1.6 × p50."
   },
   "operations": {
     "llm.course_plan":        { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 3000, "p50": 5000, "p90": 8000 }, "output_tokens": { "p10": 1500, "p50": 3000, "p90": 5000 } } },
@@ -61,8 +62,8 @@
     "llm.video_interactions": { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 2500, "p50": 4000, "p90": 6000 }, "output_tokens": { "p10": 500, "p50": 900, "p90": 1500 } } },
     "llm.activity":           { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 3000, "p50": 5000, "p90": 8000 }, "output_tokens": { "p10": 2000, "p50": 4000, "p90": 7000 } } },
     "llm.scorm":              { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 4000, "p50": 6000, "p90": 9000 }, "output_tokens": { "p10": 6000, "p50": 10000, "p90": 14000 } } },
-    "llm.exam":               { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "retryRate": 0.15, "meters": { "input_tokens": { "p10": 1800, "p50": 8300, "p90": 13300 }, "output_tokens": { "p10": 21500, "p50": 41600, "p90": 66600 }, "cache_write_tokens": { "p10": 13000, "p50": 13000, "p90": 20800 }, "cache_read_tokens": { "p10": 22700, "p50": 68600, "p90": 109800 } } },
-    "llm.final_exam":         { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "retryRate": 0.15, "meters": { "input_tokens": { "p10": 10300, "p50": 23500, "p90": 37600 }, "output_tokens": { "p10": 41100, "p50": 87450, "p90": 139900 }, "cache_write_tokens": { "p10": 26700, "p50": 26700, "p90": 42700 }, "cache_read_tokens": { "p10": 53400, "p50": 145300, "p90": 232500 } } },
+    "llm.exam":               { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "retryRate": 0.15, "meters": { "input_tokens": { "p10": 2000, "p50": 14600, "p90": 23400 }, "output_tokens": { "p10": 21400, "p50": 41600, "p90": 66600 }, "cache_write_tokens": { "p10": 13100, "p50": 13100, "p90": 21000 }, "cache_read_tokens": { "p10": 48600, "p50": 178500, "p90": 285600 } } },
+    "llm.final_exam":         { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "retryRate": 0.15, "meters": { "input_tokens": { "p10": 14300, "p50": 45800, "p90": 73300 }, "output_tokens": { "p10": 42400, "p50": 94500, "p90": 151200 }, "cache_write_tokens": { "p10": 26900, "p50": 26900, "p90": 43000 }, "cache_read_tokens": { "p10": 90800, "p50": 361200, "p90": 577900 } } },
     "llm.audiobook_script":   { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 3000, "p50": 5000, "p90": 8000 }, "output_tokens": { "p10": 500, "p50": 700, "p90": 1000 } } },
     "tts.audio_welcome":      { "provider": "openai", "service": "audio.speech", "product": "gpt-4o-mini-tts", "meters": { "text_input_tokens": { "p10": 150, "p50": 250, "p90": 400 }, "audio_output_tokens": { "p10": 900, "p50": 1250, "p90": 2000 } } },
     "tts.audiobook_chapter":  { "provider": "openai", "service": "audio.speech", "product": "gpt-4o-mini-tts", "meters": { "text_input_tokens": { "p10": 550, "p50": 650, "p90": 800 }, "audio_output_tokens": { "p10": 3200, "p50": 4000, "p90": 5000 } } },
