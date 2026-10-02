@@ -12,8 +12,9 @@
 //      `fail(deps, item, MSG` (worker de proveedores), `failJob(…, …, …, MSG`
 //      (empaque) y `blockItemForBudget` (presupuesto). MSG se resuelve:
 //      literal / template / concatenación / ternario / constante del repo /
-//      variable local asignada antes en la misma función / helper conocido
-//      (FN_CODES). Lo que no se puede resolver tiene que figurar en
+//      variable local (TODAS sus asignaciones en la función envolvente, ramas
+//      incluidas; una sola no resoluble deja la variable sin resolver) / helper
+//      conocido (FN_CODES). Lo que no se puede resolver tiene que figurar en
 //      DYNAMIC_EMITTERS (con los códigos que puede producir) o el check falla:
 //      un emisor nuevo nunca queda sin clasificar en silencio.
 //   2. Códigos de validación (internos de `v3_payload_invalid`, de
@@ -21,8 +22,11 @@
 //      `code: 'X'` en los validadores que alimentan fallos de items.
 //   3. Códigos del empaque (scope package): `new XError('CODE…` en los
 //      builders/validadores del .mbz.
-//   4. (Opcional) el ejecutor del navegador (45-dynamic-generation-executor.js):
-//      `error: '…'`, `fail('…'`, `backendDynFail(…, '…'` y `errorCode: '…'`.
+//   4. (Con --fe; obligatorio en CI con --require-fe) el ejecutor del navegador
+//      (45-dynamic-generation-executor.js): cada `error:`/`msg:`, el 1er argumento de
+//      todo helper `*fail*(` y el 3º de `backendDynFail(`; un literal (', ", `) da su
+//      texto; cualquier otra expresión sale como `__expr__` y el check la exige en su
+//      lista revisada (texto exacto) o falla.
 // Puro (solo lee archivos).
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -217,6 +221,45 @@ function firstConcatOperand(expr) {
 }
 
 /**
+ * Inicio de la función que contiene `idx` (fix round 1, I2): la llave de apertura de la función
+ * ENVOLVENTE MÁS EXTERNA (método de clase, `function`, arrow) — sobre-inclusivo a propósito: incluir de más
+ * solo agrega asignaciones a revisar, nunca esconde una. Se calcula con la pila de llaves (saltando strings y
+ * templates); los bloques de control (if/for/while/switch/try/catch/else) y el cuerpo de la clase no cuentan.
+ */
+function functionStartBefore(src, idx) {
+  const stack = [];
+  let i = 0;
+  const tplStack = []; // profundidad de llaves al entrar a cada ${ … } de un template
+  let quote = null;
+  while (i < idx) {
+    const c = src[i];
+    if (quote) {
+      if (c === '\\') { i += 2; continue; }
+      if (quote === '`' && c === '$' && src[i + 1] === '{') { tplStack.push(stack.length); stack.push(-1); quote = null; i += 2; continue; }
+      if (c === quote) quote = null;
+      i++;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') { quote = c; i++; continue; }
+    if (c === '{') stack.push(i);
+    else if (c === '}') {
+      stack.pop();
+      if (tplStack.length && tplStack[tplStack.length - 1] === stack.length) { tplStack.pop(); quote = '`'; }
+    }
+    i++;
+  }
+  for (const pos of stack) {
+    if (pos < 0) continue;
+    const lineStart = src.lastIndexOf('\n', pos - 1) + 1;
+    const header = src.slice(lineStart, pos);
+    if (/\bclass\b/.test(header)) continue;
+    if (/^\s*(?:\}\s*)?(?:if|for|while|switch|catch|else|try|do|finally)\b/.test(header) || /\b(?:if|for|while|switch|catch)\s*\(/.test(header)) continue;
+    if (/=>\s*$|\bfunction\b|\)\s*(?::\s*[^{}()=;]+)?\s*$/.test(header)) return lineStart;
+  }
+  return 0;
+}
+
+/**
  * Resuelve una expresión de mensaje a códigos. Devuelve { codes: string[] } o { unresolved: true }.
  * ctx = { src, idx, consts, file }.
  */
@@ -258,27 +301,32 @@ function resolveExpr(expr, ctx, depthGuard = 0) {
     return t ? { codes: [t] } : { unresolved: true };
   }
   if (/^[a-z][A-Za-z0-9_]*$/.test(e)) {
-    // Variable local: asignaciones `const|let e = …` / `e = …` previas en las 40 líneas anteriores.
-    const before = ctx.src.slice(0, ctx.idx);
-    const window = before.split('\n').slice(-40).join('\n');
-    const re = new RegExp(`(?:^|[^.\\w])${e}\\s*(?::\\s*[A-Za-z]+\\s*)?=(?!=)\\s*`, 'g');
+    // Variable local (fix round 1, I2): TODAS las asignaciones `const|let|var e = …` / `e = …` entre el inicio
+    // de la función que contiene la llamada y la llamada (ramas if/else/switch incluidas). Se unen los códigos de
+    // todas; si ALGUNA no se puede resolver, la variable entera queda sin resolver (el gate falla).
+    const region = ctx.src.slice(functionStartBefore(ctx.src, ctx.idx), ctx.idx);
+    const re = new RegExp(`(?:^|[^.\\w])${e}\\s*(?::\\s*[A-Za-z<>\\[\\]| ]+?\\s*)?=(?![=>])\\s*`, 'g');
     let m;
-    let last = null;
-    while ((m = re.exec(window))) last = m.index + m[0].length;
-    if (last !== null) {
-      const rest = window.slice(last);
-      // Hasta el ';' de nivel superior.
+    const codes = [];
+    let found = 0;
+    while ((m = re.exec(region))) {
+      found++;
+      const rest = region.slice(m.index + m[0].length);
+      // Hasta el ';' (o fin de línea sin continuación) de nivel superior.
       let depth = 0; let quote = null; let end = rest.length;
       for (let i = 0; i < rest.length; i++) {
         const c = rest[i];
         if (quote) { if (c === '\\') { i++; continue; } if (c === quote) quote = null; continue; }
         if (c === '"' || c === "'" || c === '`') { quote = c; continue; }
         if ('([{'.includes(c)) depth++;
-        else if (')]}'.includes(c)) depth--;
+        else if (')]}'.includes(c)) { if (depth === 0) { end = i; break; } depth--; }
         else if (depth === 0 && c === ';') { end = i; break; }
       }
-      return resolveExpr(rest.slice(0, end), ctx, depthGuard + 1);
+      const r = resolveExpr(rest.slice(0, end), ctx, depthGuard + 1);
+      if (r.unresolved) return { unresolved: true };
+      codes.push(...r.codes);
     }
+    if (found > 0) return { codes: [...new Set(codes)] };
   }
   return { unresolved: true };
 }
@@ -391,28 +439,73 @@ function scanPackageCodes(repoRoot) {
 }
 
 /**
- * Ejecutor del navegador (solo lectura): mensajes de fallo y errorCode. Devuelve
- * [{line, text}] con el TEXTO inicial del mensaje (el clasificador decide por patrón/código).
+ * Valor de una propiedad/argumento a partir de `from` hasta el `,` / `}` / `)` de nivel superior.
+ */
+function readValue(src, from) {
+  let depth = 0; let quote = null; let tpl = 0;
+  for (let i = from; i < src.length; i++) {
+    const c = src[i];
+    if (quote) {
+      if (c === '\\') { i++; continue; }
+      if (quote === '`' && c === '$' && src[i + 1] === '{') { tpl++; i++; continue; }
+      if (quote === '`' && c === '}' && tpl > 0) { tpl--; continue; }
+      if (c === quote && tpl === 0) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') { quote = c; continue; }
+    if ('([{'.includes(c)) depth++;
+    else if (')]}'.includes(c)) { if (depth === 0) return src.slice(from, i).trim(); depth--; }
+    else if (depth === 0 && (c === ',' || c === ';')) return src.slice(from, i).trim();
+  }
+  return src.slice(from).trim();
+}
+
+/**
+ * Texto inicial LITERAL de una expresión de mensaje del navegador, o null si no empieza con un literal:
+ * '…' / "…" / `…` (hasta el primer ${…}), y `'a' + x` (primer operando literal).
+ */
+function literalLead(expr) {
+  const e = firstConcatOperand(stripSlice(expr));
+  let m = /^(['"])((?:\\.|(?!\1)[^\\])*)\1$/.exec(e);
+  if (m) return m[2];
+  m = /^`((?:\\.|[^`\\$]|\$(?!\{))*)/.exec(e);
+  if (m && e.endsWith('`')) return m[1];
+  return null;
+}
+
+/**
+ * Ejecutor del navegador (solo lectura): mensajes de fallo y errorCode (fix round 1, I3). Cada valor de
+ * `error:`, el 1er argumento de `fail(` y el 3º de `backendDynFail(` es o un LITERAL (comillas simples,
+ * dobles o backtick: se devuelve su texto inicial) o una EXPRESIÓN (`__expr__ …`), que el check exige
+ * cubrir con FE_EXPR_SAMPLES (si no, el gate falla). Definiciones (`function fail(`) se saltean.
  */
 function scanFrontendExecutor(file) {
   const src = stripComments(fs.readFileSync(file, 'utf8'));
   const out = [];
-  const push = (idx, text) => out.push({ line: lineOf(src, idx), text });
+  const push = (idx, value) => {
+    if (!value) return;
+    const lead = literalLead(value);
+    out.push({ line: lineOf(src, idx), text: lead !== null ? lead : `__expr__ ${value.replace(/\s+/g, ' ').slice(0, 200)}` });
+  };
   let m;
-  const reErr = /\berror\s*:\s*(['"])((?:\\.|(?!\1)[^\\])*)\1/g;
-  while ((m = reErr.exec(src))) push(m.index, m[2]);
-  // error: X + '…' / error: (cond ? 'a' : '') + …: se toma el primer literal.
-  const reErrExpr = /\berror\s*:\s*([^'"\s][^\n]*)/g;
-  while ((m = reErrExpr.exec(src))) {
-    const lits = [...m[1].matchAll(/'((?:\\.|[^'\\])*)'/g)].map((x) => x[1]);
-    if (lits.length) push(m.index, `__expr__ ${m[1].slice(0, 200)}`);
+  // `error:` (resultado {ok:false}) y `msg:` (excepciones que _dynMapApiError convierte en el error del item).
+  const reErr = /\b(?:error|msg)\s*:\s*/g;
+  while ((m = reErr.exec(src))) push(m.index, readValue(src, m.index + m[0].length));
+  // Cualquier helper de fallo (`fail(`, `failWithDraft(`, `_dynFail(`…): 1er argumento; `backendDynFail(`: 3º.
+  const reFail = /(?<![\w.$])([A-Za-z_$][\w$]*)\(/g;
+  while ((m = reFail.exec(src))) {
+    const name = m[1];
+    if (!/fail/i.test(name) || /^(?:failed|failures?)$/i.test(name)) continue;
+    const pre = src.slice(Math.max(0, m.index - 12), m.index);
+    if (/function\s*$/.test(pre)) continue;
+    const args = readArgs(src, m.index + m[0].length - 1);
+    const at = name === 'backendDynFail' ? 2 : 0;
+    if (args.length > at) push(m.index, args[at]);
   }
-  const reFail = /\bfail\(\s*(['"])((?:\\.|(?!\1)[^\\])*)\1/g;
-  while ((m = reFail.exec(src))) push(m.index, m[2]);
-  const reBack = /backendDynFail\([^,]+,[^,]+,\s*(['"])((?:\\.|(?!\1)[^\\])*)\1/g;
-  while ((m = reBack.exec(src))) push(m.index, m[2]);
-  const reCode = /\berrorCode\s*:\s*'([A-Za-z0-9_]+)'/g;
-  while ((m = reCode.exec(src))) push(m.index, `__errorCode__ ${m[1]}`);
+  const reCode = /\berrorCode\s*:\s*(['"`])([A-Za-z0-9_]+)\1/g;
+  while ((m = reCode.exec(src))) out.push({ line: lineOf(src, m.index), text: `__errorCode__ ${m[2]}` });
+  const reCodeExpr = /\berrorCode\s*:\s*(?!['"`])([^,}\n]+)/g;
+  while ((m = reCodeExpr.exec(src))) out.push({ line: lineOf(src, m.index), text: `__expr__ errorCode:${m[1].trim()}` });
   return out;
 }
 
@@ -432,6 +525,8 @@ function scanFrontendApi(file) {
 
 module.exports = {
   scanFrontendApi,
+  literalLead,
+  functionStartBefore,
   stripComments,
   readArgs,
   resolveExpr,

@@ -9,12 +9,18 @@
 // con sus propias reglas (reliability/auto-heal-rules.ts). `currentRecovery` informa qué hace HOY
 // el sistema con cada fallo; `targetRounds`/`strategy` describen la política objetivo de R3.
 //
-// Reglas (diseño §3.1):
-// - un `errorCode` EXPLÍCITO y conocido gana; si no, el código sale del mensaje (prefijo
-//   `codigo:` / `CODIGO:`, el envoltorio «❌ Falló después de N intentos», frases estables del
-//   ejecutor del navegador, o el status HTTP de la IA);
-// - código desconocido → clase A con 1 ronda (`unclassified: true`, alerta de ingeniería); nunca
-//   «desconocido = silencio para siempre» ni reintento ilimitado;
+// Reglas (diseño §3.1, fix round 1):
+// - el código sale del MENSAJE (hecho del servidor: prefijo `codigo:` / `CODIGO:`, el envoltorio
+//   «❌ Falló después de N intentos», frases estables del ejecutor del navegador, o — SOLO para
+//   llamadas HTTP de la IA — el status HTTP);
+// - un `errorCode` del ejecutor NO es de confianza (C1): solo puede SUBIR la severidad
+//   (A < B < C < D, y el riesgo de pago), nunca bajarla ni pisar un hecho del servidor (envío pagado,
+//   reconciliación, presupuesto, códigos propios de los workers). Del navegador solo se aceptan
+//   códigos que el navegador puede producir; el resto se registra como reportado y se ignora;
+// - código desconocido → clase D `hold_for_human` (`unclassified: true`, alerta de ingeniería):
+//   desconocido nunca es A (I4);
+// - fallos de cuota/crédito/autenticación/facturación de un proveedor → D-config a scope PROVIDER
+//   (`wait_provider`): pausan los items de ese proveedor sin quemar intentos (I1);
 // - la tabla cubre TODOS los códigos que el backend/workers/ejecutor emiten hoy:
 //   scripts/check-rel-failure-classes.js escanea los emisores y falla ante un código nuevo sin
 //   regla explícita.
@@ -100,6 +106,10 @@ export interface FailureVerdict {
   innerCodes?: string[];
   /** Status HTTP detectado en el mensaje (IA / proveedor), si lo hay. */
   httpStatus?: number | null;
+  /** C1: errorCode que reportó el ejecutor (no de confianza), si lo hubo. */
+  reportedCode?: string | null;
+  /** C1: true si el errorCode reportado se ignoró (no lo puede producir esa fuente, o no subía la severidad). */
+  reportedCodeIgnored?: boolean;
 }
 
 /** Longitud máxima de un código estable (columna failure_code). */
@@ -180,9 +190,46 @@ export function isKnownValidationCode(code: string): boolean {
   return VALIDATION_INNER_CODES.includes(code) || VALIDATION_INNER_FAMILIES.some((re) => re.test(code));
 }
 
+/** Items que ejecutan los workers contra proveedores pagados. */
+const WORKER_ITEM_TYPES = new Set(['video', 'presentation', 'audio_welcome', 'audiobook_chapter']);
+
+/**
+ * I1: cuota / crédito / facturación / autenticación de un PROVEEDOR (cuerpos reales de provider-clients.ts:
+ * `HTTP 429: …insufficient_quota…`, `HTTP 400: credit balance is too low`, `HTTP 401/402/403`). Un 429 SIN
+ * palabras de cuota es un transitorio (A con backoff), no esto.
+ */
+export const PROVIDER_CONFIG_RE =
+  /insufficient_quota|exceeded your current quota|\bquota\b|\bcredits?\b|cr[eé]ditos?\b|\bbalance\b|billing|facturaci[oó]n|payment required|\bHTTP 40[123]\b|\b40[123] (?:Unauthorized|Payment Required|Forbidden)\b|invalid[_ ]api[_ ]key|unauthori[sz]ed|forbidden/i;
+
+/** Reglas de LLAMADAS a un proveedor pagado: a ellas se aplica el chequeo de configuración del proveedor (I1). */
+const PROVIDER_CALL_RULES: Readonly<Record<string, FailureProvider | null>> = Object.freeze({
+  tts_failed: 'openai',
+  audiobook_script_failed: 'anthropic',
+  gamma_submit_failed: 'gamma',
+  gamma_repoll: 'gamma',
+  videogen_submit_rejected: 'videogen',
+  video_repoll: 'videogen',
+  llm_transient: 'anthropic',
+  // unexpected_error: el catch de los workers antes de una llamada pagada puede traer el cuerpo de un proveedor.
+  unexpected_error: null,
+} as Record<string, FailureProvider | null>);
+
+/** Ids de reglas a las que se aplica el chequeo de configuración del proveedor (check). */
+export const PROVIDER_CALL_RULE_IDS: readonly string[] = Object.freeze(Object.keys(PROVIDER_CALL_RULES));
+
+function providerFromMessage(error: string): FailureProvider | null {
+  const m = /\b(openai|anthropic|gamma|videogen|youtube)\b/i.exec(error);
+  return m ? (m[1].toLowerCase() as FailureProvider) : null;
+}
+
 const ITEM_RULES: readonly Rule[] = Object.freeze([
   // ── Infraestructura, lease y transporte ────────────────────────────────────
-  { id: 'lease_expired', codes: ['lease_expired'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', rounds: 3 },
+  {
+    // M1: un lease puede vencer A MITAD de una llamada pagada de un worker → riesgo incierto (el ledger
+    // re-verifica al re-reclamar); en items LLM del navegador el gasto queda medido por el proxy.
+    id: 'lease_expired', codes: ['lease_expired'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', rounds: 3,
+    refine: ({ itemType }) => (itemType && WORKER_ITEM_TYPES.has(itemType) ? { paidRisk: 'uncertain' } : null),
+  },
   { id: 'worker_draining', codes: ['worker_draining'], class: 'A', strategy: 'retry_backoff', rounds: 3 },
   { id: 'unexpected_error', codes: ['unexpected_error'], class: 'A', strategy: 'retry_backoff', rounds: 3 },
   { id: 'unknown_error', codes: ['unknown_error'], class: 'A', strategy: 'retry_backoff', rounds: 1 },
@@ -250,10 +297,28 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     class: 'B', strategy: 'regenerate_dependency', rounds: 1,
   },
   {
-    id: 'presentation_invalid',
-    codes: ['gamma_generation_failed', 'gamma_pdf_invalid', 'presentation_artifact_invalid', 'PRESENTATION_CARD_SLIDE_COUNT', 'SLIDE_COUNT'],
+    // I5: PDF/portada/PNG inválidos SOBRE una generación de Gamma ya existente (y pagada): re-descarga /
+    // re-render GRATIS de la MISMA generación (A). Sin generationId persistido no hay de dónde re-bajar → B.
+    id: 'presentation_output_invalid',
+    codes: ['gamma_pdf_invalid', 'presentation_artifact_invalid'],
     family: /^(PDF|COVER|PNG)_[A-Z0-9_]+$/,
     class: 'B', strategy: 'regenerate_targeted', paidRisk: 'measured', provider: 'gamma', rounds: 1,
+    refine: ({ outputSummary }) => (hasGammaId(outputSummary) ? { class: 'A', strategy: 'repoll_external', paidRisk: 'none' } : null),
+  },
+  {
+    // Cantidad de diapositivas: la generación misma es la equivocada → una generación nueva (pagada, dentro del presupuesto).
+    id: 'presentation_slide_count', codes: ['PRESENTATION_CARD_SLIDE_COUNT', 'SLIDE_COUNT'],
+    class: 'B', strategy: 'regenerate_targeted', paidRisk: 'measured', provider: 'gamma', rounds: 1,
+  },
+  {
+    // I5: la generación falló en Gamma. Si Gamma no informó los créditos, el cobro es INCIERTO → C (FinOps,
+    // decisión del usuario D3 2026-10-02: incierto → política FinOps, nunca duplicar gasto solo). Solo con
+    // créditos medidos (el worker lo anota en el mensaje) es una falla conocida → B (una generación nueva).
+    id: 'gamma_generation_failed', codes: ['gamma_generation_failed'],
+    class: 'C', strategy: 'hold_for_human', paidRisk: 'uncertain', provider: 'gamma', rounds: 0, humanReason: 'duplicate_charge', adminAction: 'reconcile_provider',
+    refine: ({ error }) => (/cr[eé]ditos medidos/i.test(error)
+      ? { class: 'B', strategy: 'regenerate_targeted', paidRisk: 'measured', rounds: 1, humanReason: undefined, adminAction: undefined }
+      : null),
   },
   {
     id: 'audio_invalid',
@@ -264,6 +329,10 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   { id: 'audiobook_script_failed', codes: ['audiobook_script_failed'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'anthropic', rounds: 3 },
 
   // ── Contrato y producto (D) ────────────────────────────────────────────────
+  // M7: ACTIVITY_TYPE_MISMATCH / EXAM_ARTIFACT_AMBIGUOUS existen en dos papeles. Como código INTERNO de
+  // `v3_payload_invalid [..]` (prevalidación del servidor) la clase la decide el código de arriba (B). Como
+  // código de PRIMER nivel del ejecutor («el claim pide X pero el Manifest dice Y») es un contrato roto (D).
+  // La coincidencia exacta de esta regla solo aplica al primer nivel.
   {
     id: 'contract',
     codes: ['missing_dependency_artifact', 'missing_content_artifact', 'missing_course_plan_artifact', 'ambiguous_course_plan_artifact',
@@ -288,7 +357,8 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     codes: ['ambiguous_video_submission', 'video_upgrade_ambiguous_submission', 'reserved_without_submit_marker'],
     class: 'C', strategy: 'provider_check', paidRisk: 'uncertain', provider: 'videogen', rounds: 1, humanReason: 'duplicate_charge', adminAction: 'reconcile_videogen',
   },
-  // Decisión D4 pendiente: hasta entonces, humano (retry_video_render).
+  // Decisión del usuario D4 (2026-10-02): render fallido con cobro incierto → política FinOps, nunca un reenvío
+  // automático que duplique gasto. «El proveedor confirma que no cobró → puede reintentar» llega con R8.
   { id: 'videogen_failed', codes: ['videogen_failed'], class: 'C', strategy: 'hold_for_human', paidRisk: 'uncertain', provider: 'videogen', rounds: 0, humanReason: 'duplicate_charge', adminAction: 'retry_video_render' },
   {
     id: 'provider_config',
@@ -332,7 +402,8 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     refine: ({ outputSummary }) => (hasGammaId(outputSummary) ? null : { strategy: 'retry_backoff' }),
   },
   { id: 'gamma_submit_failed', codes: ['gamma_submit_failed'], class: 'A', strategy: 'retry_backoff', provider: 'gamma', rounds: 1 },
-  // Decisión D3 pendiente: hasta entonces, humano (reconcile_provider).
+  // Decisión del usuario D3 (2026-10-02): envío incierto (sin generationId) → política FinOps, nunca duplicar
+  // gasto solo. «El proveedor confirma que no cobró → puede reintentar» llega con R8.
   {
     id: 'gamma_ambiguous', codes: ['gamma_submit_ambiguous', 'ambiguous_gamma_submission'],
     class: 'C', strategy: 'hold_for_human', paidRisk: 'uncertain', provider: 'gamma', rounds: 0, humanReason: 'duplicate_charge', adminAction: 'reconcile_provider',
@@ -449,6 +520,9 @@ const PHRASES: ReadonlyArray<[RegExp, string]> = [
   [/^(fetch failed|network error|socket hang up|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN)\b/i, 'llm_network'],
 ];
 
+/** Código de un mensaje en texto libre sin código reconocible (siempre sin regla → D retenido). */
+export const UNCLASSIFIED_CODE = 'unclassified_error';
+
 const UPPER_TOKEN_RE = /\b([A-Z][A-Z0-9]*_[A-Z0-9_]+)\b/g;
 
 /** Códigos internos entre corchetes de v3ValidationErrorMessage / tras `presentation_artifact_invalid:`. */
@@ -482,13 +556,12 @@ export function extractFailureCode(error: string): string {
       for (const m of e.matchAll(UPPER_TOKEN_RE)) if (isFailureCodeClassified(m[1])) return m[1];
       return 'claim_contract';
     }
-    if (/^[A-Z][A-Z0-9]*$/.test(tok) && !tok.includes('_')) {
-      // Palabra en mayúsculas sin '_' (p.ej. «HTTP 503 …»): no es un código.
-    } else if (tok.length <= FAILURE_CODE_MAX) {
-      return tok;
-    }
+    // Un código estable siempre lleva '_' (lease_expired, EXAM_BANK_…): una palabra suelta («la portada…»,
+    // «HTTP 503 …», «kaboom») es texto libre, no un código.
+    if (tok.includes('_') && tok.length <= FAILURE_CODE_MAX) return tok;
   }
-  return 'unknown_error';
+  // Texto libre sin código: desconocido (≠ `unknown_error`, que es el código del mensaje VACÍO del scheduler).
+  return UNCLASSIFIED_CODE;
 }
 
 // ─── Comportamiento ACTUAL (auto-heal.ts, sin cambios) ──────────────────────
@@ -509,7 +582,12 @@ export function currentRecoveryOf(error: string, itemType: string | null | undef
 // ─── Clasificación ──────────────────────────────────────────────────────────
 
 function verdictOf(rule: Rule, code: string, ctx: RefineCtx, extra: Partial<FailureVerdict>): FailureVerdict {
-  const patch = rule.refine ? rule.refine(ctx) : null;
+  // I1: cuota/crédito/auth de un proveedor ANTES de los refines del item (p.ej. el chunk N/M del TTS).
+  const isProviderCall = Object.prototype.hasOwnProperty.call(PROVIDER_CALL_RULES, rule.id);
+  const providerCfg = isProviderCall ? (PROVIDER_CALL_RULES[rule.id] ?? providerFromMessage(ctx.error) ?? undefined) : undefined;
+  const patch = isProviderCall && PROVIDER_CONFIG_RE.test(ctx.error)
+    ? ({ class: 'D', strategy: 'wait_provider', scope: 'provider', rounds: 0, humanReason: 'config', provider: providerCfg, adminAction: 'retry_item' } as Partial<Rule>)
+    : rule.refine ? rule.refine(ctx) : null;
   const r: Rule = patch ? { ...rule, ...patch } : rule;
   return {
     class: r.class,
@@ -551,8 +629,6 @@ export function classifyFailure(input: FailureInput): FailureVerdict {
   const scoped = input?.source === 'package_worker' ? PACKAGE_RULES : input?.source === 'restore_worker' ? RESTORE_RULES : null;
 
   if (scoped) {
-    const explicit = isValidFailureCode(input.errorCode) ? ruleFor(scoped, input.errorCode) : null;
-    if (explicit) return verdictOf(explicit, input.errorCode as string, { ...ctxBase, code: input.errorCode as string }, {});
     const lead = extractFailureCode(error);
     const lr = ruleFor(scoped, lead);
     if (lr) return verdictOf(lr, lead, { ...ctxBase, code: lead }, {});
@@ -565,26 +641,62 @@ export function classifyFailure(input: FailureInput): FailureVerdict {
       const r = ruleFor(scoped, tc);
       if (r) return verdictOf(r, tc, { ...ctxBase, code: tc }, {});
     }
-    return unclassifiedVerdict(isValidFailureCode(input.errorCode) ? input.errorCode : extractFailureCode(error), httpStatus, 'package');
+    return unclassifiedVerdict(extractFailureCode(error), httpStatus, 'package', 'none');
   }
 
-  // 1. errorCode explícito y conocido.
-  if (isValidFailureCode(input?.errorCode)) {
-    const r = ruleFor(ITEM_RULES, input.errorCode);
-    if (r) return verdictOf(r, input.errorCode, { ...ctxBase, code: input.errorCode }, withInner(input.errorCode, error));
-  }
-  // 2. Código del mensaje.
+  // Veredicto del MENSAJE (hecho del servidor / del emisor).
+  const messageVerdict = classifyMessage(error, ctxBase, input?.source ?? null);
+  if (!isValidFailureCode(input?.errorCode)) return messageVerdict;
+  // C1: errorCode reportado — no de confianza. Solo SUBE la severidad.
+  const reported = input.errorCode;
+  const codeRule = ruleFor(ITEM_RULES, reported);
+  const ignored = (v: FailureVerdict): FailureVerdict => ({ ...v, reportedCode: reported, reportedCodeIgnored: true });
+  if (!codeRule) return ignored(messageVerdict);
+  if (input?.source === 'browser_executor' && !BROWSER_REPORTABLE_RULES.has(codeRule.id)) return ignored(messageVerdict);
+  const codeVerdict = verdictOf(codeRule, reported, { ...ctxBase, code: reported }, withInner(reported, error));
+  const msgSev = SEVERITY[messageVerdict.class];
+  const codeSev = SEVERITY[codeVerdict.class];
+  // Mismo nivel: gana el mensaje (hecho), salvo que el mensaje no se haya podido clasificar.
+  const useCode = codeSev > msgSev || (codeSev === msgSev && messageVerdict.unclassified);
+  if (!useCode) return ignored(messageVerdict);
+  return {
+    ...codeVerdict,
+    paidRisk: PAID_RISK_ORDER[Math.max(PAID_RISK_ORDER.indexOf(codeVerdict.paidRisk), PAID_RISK_ORDER.indexOf(messageVerdict.paidRisk))],
+    reportedCode: reported,
+    reportedCodeIgnored: false,
+  };
+}
+
+const SEVERITY: Readonly<Record<FailureClass, number>> = Object.freeze({ A: 0, B: 1, C: 2, D: 3 });
+const PAID_RISK_ORDER: readonly PaidRisk[] = Object.freeze(['none', 'measured', 'uncertain'] as PaidRisk[]);
+
+/**
+ * C1: reglas cuyos códigos el ejecutor del NAVEGADOR puede producir de verdad (salida de la IA, su propio
+ * transporte/Storage, contrato del claim). Un código del navegador de cualquier otra regla (lease, drain,
+ * presupuesto, pagos ambiguos, reconciliación, proveedores, workers) se registra como reportado y se ignora.
+ */
+const BROWSER_REPORTABLE_RULES: ReadonlySet<string> = new Set([
+  'unknown_error', 'download_failed', 'exam_bank_chapter_md_missing', 'artifact_upload_failed', 'complete_rejected',
+  'browser_auth', 'user_stopped', 'llm_transient', 'llm_config', 'llm_request_rejected', 'llm_too_large', 'output_truncated',
+  'v3_payload_invalid', 'validation_invalid', 'exam_bank_invalid', 'corrupt_dependency', 'contract',
+]);
+
+/** Fuentes cuyos mensajes son llamadas HTTP a la IA (I4: solo ahí el status HTTP decide). */
+const LLM_HTTP_SOURCES: ReadonlySet<string> = new Set(['browser_executor', 'server_executor', 'llm_gateway']);
+
+function classifyMessage(error: string, ctxBase: Omit<RefineCtx, 'code'>, source: FailureSource | null): FailureVerdict {
   const code = extractFailureCode(error);
   const rule = ruleFor(ITEM_RULES, code);
   if (rule) return verdictOf(rule, code, { ...ctxBase, code }, withInner(code, error));
-  // 3. Status HTTP de la IA / proveedor.
-  if (httpStatus !== null) {
-    const hc = httpFallbackCode(httpStatus, error);
+  // I4: el status HTTP solo clasifica mensajes de llamadas HTTP de la IA (identificadas por la fuente).
+  if (ctxBase.httpStatus !== null && source && LLM_HTTP_SOURCES.has(source)) {
+    const hc = httpFallbackCode(ctxBase.httpStatus, error);
     const hr = hc ? ruleFor(ITEM_RULES, hc) : null;
     if (hr && hc) return verdictOf(hr, hc, { ...ctxBase, code: hc }, {});
   }
-  // 4. Desconocido: A ×1 → D `unclassified_error` (R3) + alerta de ingeniería.
-  return unclassifiedVerdict(isValidFailureCode(input?.errorCode) ? input.errorCode : code, httpStatus, 'item');
+  // Desconocido: D retenido (nunca A) + alerta de ingeniería.
+  const workerSource = source === 'video_worker' || source === 'provider_worker';
+  return unclassifiedVerdict(code, ctxBase.httpStatus, 'item', workerSource ? 'uncertain' : 'none');
 }
 
 function withInner(code: string, error: string): Partial<FailureVerdict> {
@@ -593,22 +705,23 @@ function withInner(code: string, error: string): Partial<FailureVerdict> {
   return inner.length ? { innerCodes: inner } : {};
 }
 
-function unclassifiedVerdict(code: string, httpStatus: number | null, scope: Scope): FailureVerdict {
+function unclassifiedVerdict(code: string, httpStatus: number | null, scope: Scope, paidRisk: PaidRisk): FailureVerdict {
+  // I4: desconocido = D retenido por seguridad (humano + alerta de ingeniería), nunca un reintento automático.
   return {
-    class: 'A',
+    class: 'D',
     code: (isValidFailureCode(code) ? code : 'unknown_error').slice(0, FAILURE_CODE_MAX),
-    strategy: 'retry_backoff',
+    strategy: 'hold_for_human',
     scope,
-    paidRisk: 'none',
-    targetRounds: 1,
+    paidRisk,
+    targetRounds: 0,
     provider: null,
-    adminAction: null,
-    humanReason: null,
+    adminAction: scope === 'package' ? 'retry_package' : 'retry_item',
+    humanReason: 'unrecoverable',
     rule: 'unclassified',
     unclassified: true,
     httpStatus,
   };
 }
 
-/** Código terminal de R3 para un desconocido que agotó su ronda (documentación / R3). */
+/** Código con el que R3 alerta a ingeniería por un fallo sin clasificar (documentación / R3). */
 export const UNCLASSIFIED_TERMINAL_CODE = 'unclassified_error';

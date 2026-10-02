@@ -502,7 +502,10 @@ export async function processRealPresentation(deps: RealProviderDeps, item: Clai
     await fail(
       deps,
       item,
-      `gamma_generation_failed: la generación ${gid} falló en Gamma (${st.error ?? 'sin detalle'}). No se reenvía sola: ` +
+      // REL I5: el clasificador distingue la falla con créditos medidos (B) de la de cobro incierto (C).
+      `gamma_generation_failed: la generación ${gid} falló en Gamma (${st.error ?? 'sin detalle'})` +
+        (measuredCredits ? ` [créditos medidos: ${st.creditsDeducted}]` : ' [Gamma no informó los créditos: cobro incierto]') +
+        '. No se reenvía sola: ' +
         'regenera la presentación para pedir una nueva.',
       false,
     );

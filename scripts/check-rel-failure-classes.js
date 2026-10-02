@@ -4,7 +4,10 @@
 //
 // Puro (sin DB, sin red):
 //   1. tabla del diseño §3.2: mensajes reales → clase / código / estrategia / scope / riesgo de pago;
-//   2. reglas: errorCode explícito gana; desconocido → A ×1 (`unclassified`); nunca lanza;
+//   2. reglas (fix round 1): el errorCode del ejecutor NO es de confianza — solo SUBE la severidad, nunca
+//      baja ni pisa un hecho del servidor (C1); desconocido → D retenido (`unclassified`, I4); el status
+//      HTTP solo clasifica llamadas HTTP de la IA (I4); cuota/crédito/auth de proveedor → D-config scope
+//      provider (I1); nunca lanza;
 //   3. paso que preserva el comportamiento: las reglas del auto-healer y del reintento seguro son
 //      las MISMAS (re-exportadas), y `currentRecoveryOf` coincide con autoHealDecision/safeAutoRetryDecision;
 //   4. GATE: cada código que el backend EMITE hoy (failItem / fail(deps / applyItemFailure /
@@ -12,9 +15,11 @@
 //      cada código interno de validación y de empaque también. Un emisor nuevo sin resolver o un
 //      código nuevo sin regla → el check falla;
 //   5. (con --fe <dir del frontend>) lo mismo para el ejecutor del navegador
-//      (45-dynamic-generation-executor.js + 04-api.js). Sin --fe se omite (el frontend es otro repo).
+//      (45-dynamic-generation-executor.js + 04-api.js); en CI (deploy-staging, regresión E2E) corre con
+//      --require-fe (sin --fe falla). Auto-tests del escáner sobre scripts/fixtures/rel-gate (backend y
+//      frontend): las construcciones que la review mostró invisibles tienen que detectarse.
 //
-// Uso: npm run build && node scripts/check-rel-failure-classes.js [--fe ../campuscloud-gen] [path/to/dist]
+// Uso: npm run build && node scripts/check-rel-failure-classes.js [--require-fe] [--fe ../campuscloud-gen] [path/to/dist]
 
 const fs = require('fs');
 const path = require('path');
@@ -116,8 +121,14 @@ check('tabla: IA (transitorios A, configuración D scope provider, tamaño/trunc
     expectVerdict(m, { class: 'D', strategy: 'hold_for_human', humanReason: 'budget', adminAction: 'approve_budget' });
   }
   // Sin código reconocible: el status HTTP decide.
-  expectVerdict('upstream said no (HTTP 503)', { class: 'A', code: 'llm_transient', httpStatus: 503 });
-  expectVerdict('algo raro', { class: 'A', code: 'llm_transient' }, { httpStatus: 524 });
+  // I4: el status HTTP solo decide en llamadas HTTP de la IA (por fuente); un worker con un mensaje desconocido sigue desconocido (D).
+  expectVerdict('upstream said no (HTTP 503)', { class: 'A', code: 'llm_transient', httpStatus: 503 }, { source: 'browser_executor' });
+  expectVerdict('algo raro', { class: 'A', code: 'llm_transient' }, { httpStatus: 524, source: 'llm_gateway' });
+  for (const src of ['video_worker', 'provider_worker', 'scheduler', undefined]) {
+    const w = v('kaboom (HTTP 503)', { source: src });
+    assert(w.unclassified && w.class === 'D' && w.provider === null && w.strategy === 'hold_for_human', `${src}: ${JSON.stringify(w)}`);
+  }
+  assert(v('kaboom (HTTP 503)', { source: 'video_worker' }).paidRisk === 'uncertain', 'desconocido de un worker pagado: riesgo incierto');
 });
 
 check('tabla: validación (B, regenerar solo el componente; códigos internos expuestos)', () => {
@@ -138,9 +149,17 @@ check('tabla: validación (B, regenerar solo el componente; códigos internos ex
     'course_plan_invalid: el plan del run no calza', 'AUDIO_SCRIPT_EMPTY: sin texto', 'AUDIOBOOK_CONTENT_EMPTY: x', 'AUDIO_WELCOME_TEXT_MISSING: x']) {
     expectVerdict(m, { class: 'B', strategy: 'regenerate_dependency' });
   }
-  for (const m of ['presentation_artifact_invalid: SLIDE_COUNT, PDF_MISSING', 'gamma_pdf_invalid: x', 'gamma_generation_failed: x']) {
+  // I5: sin generationId persistido no hay de dónde re-bajar → B; CON la generación (ya pagada) → A re-descarga gratis.
+  for (const m of ['presentation_artifact_invalid: SLIDE_COUNT, PDF_MISSING', 'gamma_pdf_invalid: x', 'PDF_MISSING: x', 'COVER_BYTES: x', 'PNG_SIGNATURE: x']) {
     expectVerdict(m, { class: 'B', strategy: 'regenerate_targeted', provider: 'gamma' });
+    expectVerdict(m, { class: 'A', strategy: 'repoll_external', paidRisk: 'none', targetRounds: 1 }, { outputSummary: GAMMA });
   }
+  expectVerdict('PRESENTATION_CARD_SLIDE_COUNT: 9 ≠ 10', { class: 'B', strategy: 'regenerate_targeted' }, { outputSummary: GAMMA });
+  expectVerdict('gamma_generation_failed: la generación g falló en Gamma (x) [Gamma no informó los créditos: cobro incierto]. No se reenvía sola',
+    { class: 'C', strategy: 'hold_for_human', paidRisk: 'uncertain', adminAction: 'reconcile_provider' });
+  expectVerdict('gamma_generation_failed: x', { class: 'C', paidRisk: 'uncertain' });
+  expectVerdict('gamma_generation_failed: la generación g falló en Gamma (x) [créditos medidos: 40]. No se reenvía sola',
+    { class: 'B', strategy: 'regenerate_targeted', paidRisk: 'measured' });
   expectVerdict('TTS_AUDIO_INVALID: el chunk 2/3 no es un MP3 medible', { class: 'B', provider: 'openai' });
   for (const c of ['BS_UNREACHABLE', 'TEXT_EMPTY', 'DIAGRAM_SHAPE', 'EXAM_BANK_DISTRACTORS', 'H5P_INPUT_INVALID', 'WORD_RANGE', 'GIFT_EMPTY']) {
     assert(FC.isKnownValidationCode(c), `${c} no es un código de validación conocido`);
@@ -194,6 +213,7 @@ check('tabla: YouTube, Gamma y TTS', () => {
   expectVerdict('gamma_submit_ambiguous: timeout', { class: 'C', paidRisk: 'uncertain', adminAction: 'reconcile_provider' });
   expectVerdict('tts_failed: chunk 1/4: HTTP 503', { class: 'A', strategy: 'retry_backoff', provider: 'openai' });
   expectVerdict('tts_failed: chunk 3/4: HTTP 503', { class: 'C', strategy: 'auto_resubmit_once', adminAction: 'reconcile_provider' });
+  expectVerdict('tts_failed: chunk 1/4: openai POST /audio/speech HTTP 429: rate limit, retry later', { class: 'A', strategy: 'retry_backoff' });
   expectVerdict('provider_reconciliation_required: openai — x', { class: 'C', strategy: 'provider_check', paidRisk: 'uncertain' });
   expectVerdict('audiobook_script_failed: HTTP 529', { class: 'A', provider: 'anthropic' });
 });
@@ -212,7 +232,7 @@ check('tabla: empaque (scope package) y restauración (R9/R10)', () => {
   want('MBZ_V3_TOKEN_INVALID: $@X@$', 'D', 'hold_for_human');
   want('pending_video_omitted: 2 videos', 'D', 'hold_for_human');
   const u = p('algo inesperado del builder');
-  assert(u.unclassified && u.class === 'A' && u.scope === 'package', 'desconocido de empaque: ' + JSON.stringify(u));
+  assert(u.unclassified && u.class === 'D' && u.scope === 'package' && u.strategy === 'hold_for_human', 'desconocido de empaque: ' + JSON.stringify(u));
   const r = (m) => FC.classifyFailure({ source: 'restore_worker', error: m });
   assert(r('RESTORE_INFRA_DOCKER_DOWN: x').strategy === 'reverify', 'restore infra');
   assert(r('RESTORE_PRECHECK_ERROR: quiz x').class === 'B', 'restore precheck');
@@ -222,9 +242,10 @@ check('tabla: empaque (scope package) y restauración (R9/R10)', () => {
 // ════════════════════════════════════════════════════════════════════════════
 // 2. Reglas generales
 // ════════════════════════════════════════════════════════════════════════════
-check('reglas: desconocido → A ×1 (unclassified, nunca silencio ni ilimitado); vacío → unknown_error; nunca lanza', () => {
+check('reglas (I4): desconocido → D retenido (unclassified, humano + alerta; nunca A ni reintento); vacío → unknown_error; nunca lanza', () => {
   const u = v('kaboom_xyz: algo nunca visto');
-  assert(u.class === 'A' && u.unclassified === true && u.targetRounds === 1 && u.code === 'kaboom_xyz' && u.strategy === 'retry_backoff', JSON.stringify(u));
+  assert(u.class === 'D' && u.unclassified === true && u.targetRounds === 0 && u.code === 'kaboom_xyz' && u.strategy === 'hold_for_human'
+    && u.humanReason === 'unrecoverable', JSON.stringify(u));
   const e = v('');
   assert(e.code === 'unknown_error' && !e.unclassified, JSON.stringify(e));
   for (const bad of [null, undefined, 42, {}, 'x'.repeat(10000), '❌', '    ']) {
@@ -234,16 +255,81 @@ check('reglas: desconocido → A ×1 (unclassified, nunca silencio ni ilimitado)
   assert(FC.UNCLASSIFIED_TERMINAL_CODE === 'unclassified_error', 'código terminal');
 });
 
-check('reglas: errorCode explícito y conocido gana sobre el mensaje; inválido/desconocido se ignora', () => {
-  const r = v('cualquier texto en español', { errorCode: 'EXAM_BANK_INCOMPLETE' });
-  assert(r.class === 'B' && r.code === 'EXAM_BANK_INCOMPLETE', JSON.stringify(r));
+check('reglas (C1): un errorCode del ejecutor solo SUBE la severidad — nunca baja C/D ni pisa un hecho del servidor', () => {
+  // Cada downgrade de la review (y variantes): el veredicto queda el del MENSAJE, con el código reportado registrado.
+  const downgrades = [
+    ['provider_reconciliation_required: openai — audio pagado sin persistir', 'llm_transient', 'C'],
+    ['ambiguous_video_submission: timeout', 'lease_expired', 'C'],
+    ['budget_exceeded: no_authorization', 'content_empty', 'D'],
+    ['budget_exceeded: x', 'unexpected_error', 'D'],
+    ['videogen_failed: render', 'worker_draining', 'C'],
+    ['gamma_submit_ambiguous: sin confirmar', 'validation_invalid', 'C'],
+    ['real_video_not_allowed: x', 'llm_transient', 'D'],
+    ['claim_payload_unavailable: x', 'EXAM_BANK_INCOMPLETE', 'D'],
+    ['tts_failed: chunk 3/4: HTTP 503', 'llm_transient', 'C'],
+    ['❌ Sin disponibilidad de generación. Contacta a soporte de Cursia.', 'llm_transient', 'D'],
+    ['v3_payload_invalid: activity x [BS_UNREACHABLE]', 'unknown_error', 'B'],
+    ['kaboom_desconocido: x', 'llm_transient', 'D'],
+  ];
+  for (const [msg, code, want] of downgrades) {
+    for (const source of ['browser_executor', 'video_worker', 'provider_worker', undefined]) {
+      const r = v(msg, { errorCode: code, source });
+      assert(r.class === want, `downgrade «${msg}» + errorCode ${code} (${source}) → ${r.class} (esperado ${want})`);
+      assert(r.reportedCode === code && r.reportedCodeIgnored === true, `código reportado registrado e ignorado: ${JSON.stringify(r)}`);
+    }
+  }
+  // Riesgo de pago: nunca baja.
+  const pr = v('lease_expired', { errorCode: 'EXAM_BANK_INCOMPLETE', itemType: 'video', source: 'video_worker' });
+  assert(pr.class === 'B' && pr.paidRisk === 'uncertain', 'B por el código pero con el riesgo incierto del lease de un worker: ' + JSON.stringify(pr));
+  // Subir sí: un mensaje A con un código de validación B (navegador) → B; un mensaje B con un código D de contrato → D.
+  const up = v('Servidor ocupado (529). Reintentando…', { errorCode: 'EXAM_BANK_INCOMPLETE', source: 'browser_executor' });
+  assert(up.class === 'B' && up.code === 'EXAM_BANK_INCOMPLETE' && up.reportedCodeIgnored === false, JSON.stringify(up));
+  const up2 = v('activity inválido tras reintento dirigido: x', { errorCode: 'claim_contract', source: 'browser_executor' });
+  assert(up2.class === 'D', JSON.stringify(up2));
+  // Del navegador solo códigos que el navegador produce: un código de servidor/worker se ignora aunque "suba".
+  for (const code of ['budget_exceeded', 'ambiguous_video_submission', 'provider_reconciliation_required', 'videogen_failed', 'lease_expired', 'worker_draining', 'youtube_blocked_auth']) {
+    const r = v('contenido vacío tras generación', { errorCode: code, source: 'browser_executor' });
+    assert(r.class === 'B' && r.code === 'content_empty' && r.reportedCodeIgnored === true, `${code} desde el navegador: ${JSON.stringify(r)}`);
+  }
+  // Mismo nivel: gana el mensaje (hecho); un mensaje desconocido (D) con un código conocido D → el código (más informativo).
+  const same = v('Servidor ocupado (529). Reintentando…', { errorCode: 'artifact_upload_failed', source: 'browser_executor' });
+  assert(same.code === 'llm_transient' && same.reportedCodeIgnored === true, JSON.stringify(same));
+  const unk = v('texto libre nunca visto', { errorCode: 'claim_contract', source: 'browser_executor' });
+  assert(unk.class === 'D' && unk.code === 'claim_contract' && !unk.unclassified, JSON.stringify(unk));
+  const unk2 = v('texto libre nunca visto', { errorCode: 'EXAM_BANK_INCOMPLETE', source: 'browser_executor' });
+  assert(unk2.class === 'D' && unk2.unclassified, 'un código B no baja un desconocido (D): ' + JSON.stringify(unk2));
+  // Inválido / desconocido: se ignora.
   const r2 = v('lease_expired', { errorCode: 'no es un código válido!' });
-  assert(r2.code === 'lease_expired', JSON.stringify(r2));
+  assert(r2.code === 'lease_expired' && !r2.reportedCode, JSON.stringify(r2));
   const r3 = v('lease_expired', { errorCode: 'codigo_que_no_existe' });
-  assert(r3.code === 'lease_expired' && !r3.unclassified, 'un errorCode desconocido no tapa un mensaje conocido: ' + JSON.stringify(r3));
-  const r4 = v('texto libre', { errorCode: 'codigo_que_no_existe' });
-  assert(r4.unclassified && r4.code === 'codigo_que_no_existe', JSON.stringify(r4));
+  assert(r3.code === 'lease_expired' && r3.reportedCode === 'codigo_que_no_existe' && r3.reportedCodeIgnored, JSON.stringify(r3));
   assert(FC.isValidFailureCode('abc_DEF_1') && !FC.isValidFailureCode('1abc') && !FC.isValidFailureCode('a'.repeat(65)) && !FC.isValidFailureCode('a b'), 'isValidFailureCode');
+});
+
+// I1: cuerpos REALES de provider-clients.ts / real-providers.ts.
+const PROVIDER_BODY_SAMPLES = [
+  ['tts_failed: chunk 1/4: openai POST /audio/speech HTTP 429: {"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}', 'openai'],
+  ['tts_failed: chunk 3/4: openai POST /audio/speech HTTP 429: {"error":{"code":"insufficient_quota"}}', 'openai'],
+  ['tts_failed: chunk 2/4: openai POST /audio/speech HTTP 401: Incorrect API key provided', 'openai'],
+  ['audiobook_script_failed: anthropic POST /v1/messages HTTP 400: {"error":{"message":"Your credit balance is too low"}}', 'anthropic'],
+  ['audiobook_script_failed: anthropic POST /v1/messages HTTP 401: invalid x-api-key', 'anthropic'],
+  ['gamma_submit_failed: gamma POST /generations HTTP 401: Unauthorized', 'gamma'],
+  ['gamma_submit_failed: gamma POST /generations HTTP 402: Payment Required — not enough credits', 'gamma'],
+  ['gamma_poll_failed: gamma GET /generations/g HTTP 403: Forbidden', 'gamma'],
+  ['videogen_submit_rejected: Videogen rechazó el envío (HTTP 402): insufficient credits', 'videogen'],
+  ['videogen_submit_rejected: Videogen rechazó el envío (HTTP 403)', 'videogen'],
+  ['unexpected_error: openai POST /audio/speech HTTP 429: insufficient_quota', 'openai'],
+];
+
+check('tabla (I1): cuota / crédito / auth / facturación de un proveedor → D-config scope PROVIDER (wait_provider, sin quemar intentos); 429 sin cuota → A', () => {
+  for (const [msg, provider] of PROVIDER_BODY_SAMPLES) {
+    for (const os of [{}, GAMMA, VG]) {
+      expectVerdict(msg, { class: 'D', strategy: 'wait_provider', scope: 'provider', humanReason: 'config', provider, targetRounds: 0 }, { outputSummary: os });
+    }
+  }
+  expectVerdict('tts_failed: chunk 1/4: openai POST /audio/speech HTTP 429: Rate limit reached, try again in 2s', { class: 'A', strategy: 'retry_backoff' });
+  expectVerdict('audiobook_script_failed: anthropic POST /v1/messages HTTP 529: overloaded', { class: 'A' });
+  expectVerdict('gamma_poll_failed: gamma GET /generations/g HTTP 503', { class: 'A', strategy: 'repoll_external' }, { outputSummary: GAMMA });
 });
 
 check('reglas: invariantes de la tabla (clases/estrategias/razones válidas; C/D con acción humana; guard reasons fuera)', () => {
@@ -277,6 +363,30 @@ check('preservación: las reglas del auto-healer y del reintento seguro son las 
     'browser_llm_transient', 'artifact_upload_failed']), 'allow-list');
   assert(JSON.stringify(AH.SAFE_AUTO_RETRY_RULES.map((r) => r.code)) === JSON.stringify(['videogen_submit_rejected', 'gamma_submit_failed']), 'safe');
   assert(AH.SAFE_AUTO_RETRY_MAX_ROUNDS === 1 && AH.SAFE_AUTO_RETRY_BACKOFF_SECONDS === 120, 'safe constants');
+});
+
+check('preservación (propiedad, M8a): para CADA código emitido × cuerpos reales de proveedor, deny-list ⇒ C/D o espera de proveedor', () => {
+  const bodies = ['', ': HTTP 503', ': HTTP 429: {"error":{"code":"insufficient_quota"}}', ': HTTP 401: Unauthorized', ': HTTP 402: Payment Required',
+    ': HTTP 400: Your credit balance is too low', ': HTTP 403: Forbidden', ': timeout', ': chunk 3/4: HTTP 429: insufficient_quota'];
+  const codes = new Set();
+  for (const e of SCAN.scanBackendEmitters(REPO).emitters) for (const c of e.codes || []) codes.add(c);
+  let n = 0;
+  for (const c of codes) {
+    // Cuerpos de proveedor SOLO en los códigos cuyos mensajes los traen de verdad (llamadas a un proveedor).
+    const isCall = FC.PROVIDER_CALL_RULE_IDS.includes(FC.classifyFailure({ error: `${c}: x`, source: 'provider_worker' }).rule);
+    for (const b of isCall ? bodies : ['', ': timeout', ': HTTP 503']) {
+      for (const os of [{}, GAMMA, VG]) {
+        const msg = `${c}${b}`;
+        const src = c === 'PACKAGE_BUILDER_ERROR' ? 'package_worker' : 'provider_worker';
+        const r = FC.classifyFailure({ error: msg, outputSummary: os, source: src });
+        n++;
+        if (AH.isAutoHealDenied(msg)) assert(r.class === 'C' || r.class === 'D' || r.strategy === 'wait_provider', `denegado pero ${r.class}/${r.strategy}: ${msg}`);
+        if (isCall && /quota|credit|HTTP 40[123]/.test(b)) assert(r.class === 'D' && r.scope === 'provider' && r.strategy === 'wait_provider', `cuota/crédito/auth no es D-config de proveedor: ${msg} → ${r.class}/${r.strategy}`);
+        assert(!r.unclassified || src === 'package_worker', `emitido y sin clasificar: ${msg}`);
+      }
+    }
+  }
+  console.log(`   (${n} combinaciones código × cuerpo × output_summary)`);
 });
 
 check('preservación: todo lo que el auto-healer reabre es clase A en el clasificador; lo que la deny-list frena nunca es A/B salvo esperas de proveedor', () => {
@@ -365,52 +475,90 @@ check('gate backend: cada código de error del empaque/validación del .mbz est�
 // ════════════════════════════════════════════════════════════════════════════
 // 5. Ejecutor del navegador (opcional)
 // ════════════════════════════════════════════════════════════════════════════
-// Expresiones (no literales) del ejecutor → mensajes de ejemplo que producen.
-const FE_EXPR_SAMPLES = [
-  [/inválido tras reintento dirigido/, ['activity inválido tras reintento dirigido: falta x', 'OUTPUT_TRUNCATED_MAX_TOKENS: activity inválido tras reintento dirigido: x']],
-  [/'text_fetch_failed'/, ['text_fetch_failed']],
-  [/'download_url_failed'/, ['download_url_failed']],
-  [/'ambiguous_'.*'missing_'.*_artifact/, ['ambiguous_dynamic_content_md_artifact: el item x', 'missing_dynamic_content_md_artifact: el item x']],
-  [/'_download_failed: '/, ['dynamic_content_md_download_failed: desconocido']],
-  [/'_empty: el artifact '/, ['dynamic_context_package_json_empty: el artifact a está vacío']],
-  [/^\(e && e\.message\) \|\| String\(e\)/, []], // excepción cruda: la clasifica el mensaje de api() (04-api.js, escaneado abajo)
-];
+/**
+ * Expresiones NO literales del ejecutor que existen HOY (revisadas una por una, texto EXACTO) → mensajes que
+ * producen. Es deuda explícita: cuando el frontend mande `errorCode` en cada {ok:false} (mitad FE de R1),
+ * cada entrada se reemplaza por su código. Cualquier expresión NUEVA (template, variable, helper) que no esté
+ * acá hace fallar el gate (I3).
+ */
+const FE_EXPR_SAMPLES = new Map([
+  ["item.type + ' inválido tras reintento dirigido: falta ' + problems.join('; ')", ['activity inválido tras reintento dirigido: falta x']],
+  ["(truncated ? 'OUTPUT_TRUNCATED_MAX_TOKENS: ' : '') + item.type + ' inválido tras reintento dirigido: ' + (errors || []).slice(0, 8).join('; ')",
+    ['activity inválido tras reintento dirigido: x', 'OUTPUT_TRUNCATED_MAX_TOKENS: activity inválido tras reintento dirigido: x']],
+  ["(e && e.message) || 'text_fetch_failed'", ['text_fetch_failed', 'fetch failed']],
+  ["(urlRes && urlRes.error) || 'download_url_failed'", ['download_url_failed']],
+  ["(deps.length ? 'ambiguous_' : 'missing_') + type + '_artifact: el item ' + item.itemKey + ' recibió ' + deps.length + ' artifacts ' + type + ' (se esperaba 1)'",
+    ['ambiguous_dynamic_content_md_artifact: el item x', 'missing_dynamic_content_md_artifact: el item x']],
+  ["type + '_download_failed: ' + ((dl && dl.error) || 'desconocido')", ['dynamic_content_md_download_failed: desconocido']],
+  ["type + '_empty: el artifact ' + deps[0].artifactId + ' está vacío'", ['dynamic_context_package_json_empty: el artifact a está vacío']],
+  // EXAM_BANK_CHAPTER_MD_MISSING (las dos asignaciones literales de mdErr).
+  ['mdErr', ['EXAM_BANK_CHAPTER_MD_MISSING: el capítulo c llegó con 2 artifacts dynamic_content_md (se esperaba 1)',
+    'EXAM_BANK_CHAPTER_MD_MISSING: no se pudo leer el texto del capítulo c (vacío)']],
+  // Pasamanos: el texto lo arman OTROS emisores que el gate ya escanea (fail('…'), msg: '…', api()).
+  ['error', []], ['msg', []], ['e.msg', []], ['result.error', []], ['mapped.msg', []],
+  // Excepción cruda: la arma api() (04-api.js, escaneado abajo); una excepción JS cualquiera queda desconocida → D retenido.
+  ['(e && e.message) || String(e)', []],
+]);
+
+/** Corre el gate frontend sobre un directorio; devuelve {missing, samples}. */
+function frontendGate(dir, opts = {}) {
+  const exec = path.join(dir, 'src/js/45-dynamic-generation-executor.js');
+  const api = path.join(dir, 'src/js/04-api.js');
+  assert(fs.existsSync(exec) && fs.existsSync(api), 'no existe el ejecutor/api en ' + dir);
+  const entries = SCAN.scanFrontendExecutor(exec);
+  if (!opts.fixture) assert(entries.length >= 60, 'muy pocos mensajes del ejecutor: ' + entries.length);
+  const missing = [];
+  const samples = [];
+  for (const e of entries) {
+    if (e.text.startsWith('__errorCode__ ')) { const c = e.text.slice(14); if (!FC.isFailureCodeClassified(c)) missing.push(`L${e.line} errorCode ${c}`); continue; }
+    if (e.text.startsWith('__expr__ ')) {
+      const expr = e.text.slice(9);
+      if (!FE_EXPR_SAMPLES.has(expr)) { missing.push(`L${e.line} expresión sin código: ${expr.slice(0, 140)}`); continue; }
+      for (const x of FE_EXPR_SAMPLES.get(expr)) samples.push([e.line, x]);
+      continue;
+    }
+    samples.push([e.line, e.text]);
+  }
+  for (const e of SCAN.scanFrontendApi(api)) samples.push([`api:${e.line}`, e.text]);
+  // Prefijos literales que el código completa con un número (mismo texto real que arma el navegador).
+  const complete = (t) => (/Fall[oó] despu[eé]s de $/.test(t) ? t + '3 intentos: x' : /\($/.test(t) ? t + '503). Reintentando…' : t);
+  for (const [line, raw] of samples) {
+    const x = complete(raw);
+    // Muestras de un pasamanos de excepción de red ('fetch failed'): desconocidas a propósito para el texto crudo, pero clasificadas como transporte.
+    const r = FC.classifyFailure({ error: x.endsWith(' ') ? x + 'x' : x, source: 'browser_executor' });
+    if (r.unclassified) missing.push(`L${line} «${x.slice(0, 100)}» → ${r.code}`);
+  }
+  return { missing, samples, entries };
+}
+
+// Auto-test del escáner (M8c): las construcciones que la review mostró invisibles TIENEN que detectarse.
+check('gate auto-test (backend): asignación en rama, ternario con template, helper, parámetro y asignación parcialmente dinámica → detectados', () => {
+  const fx = SCAN.scanBackendEmitters(path.join(__dirname, 'fixtures/rel-gate/be'));
+  const byLine = fx.emitters.map((e) => ({ ...e, unclassifiedCodes: (e.codes || []).filter((c) => !FC.isFailureCodeClassified(c)) }));
+  const flagged = byLine.filter((e) => !e.codes || e.unclassifiedCodes.length > 0);
+  assert(fx.emitters.length === 5, 'emisores del fixture: ' + fx.emitters.length);
+  assert(flagged.length === 5, 'NO detectados: ' + JSON.stringify(byLine.filter((e) => !flagged.includes(e)).map((e) => [e.line, e.expr, e.codes])));
+  const codes = new Set(byLine.flatMap((e) => e.codes || []));
+  assert(codes.has('videogen_paid_maybe_new') && codes.has('lease_expired') && codes.has('tpl_new_code_be'), 'unión de ramas: ' + [...codes].join(','));
+});
+
+check('gate auto-test (frontend): template, comillas dobles, variable, helper failWithDraft, backendDynFail con template y msg lanzado → detectados', () => {
+  const { missing } = frontendGate(path.join(__dirname, 'fixtures/rel-gate/fe'), { fixture: true });
+  for (const needle of ['brand_new_code', 'expresión sin código: m', 'tpl_new_code', 'dq_new_code', "e.reason + ' algo'", 'bk_new_code', 'thrown_new_code']) {
+    assert(missing.some((x) => x.includes(needle)), `no detectado: ${needle}\n${missing.join('\n')}`);
+  }
+});
 
 if (FE_DIR) {
-  const exec = path.join(FE_DIR, 'src/js/45-dynamic-generation-executor.js');
-  const api = path.join(FE_DIR, 'src/js/04-api.js');
   check(`gate frontend (${path.relative(process.cwd(), FE_DIR) || FE_DIR}): cada mensaje de fallo del ejecutor y de api() se clasifica explícitamente`, () => {
-    assert(fs.existsSync(exec) && fs.existsSync(api), 'no existe el ejecutor/api en ' + FE_DIR);
-    const entries = SCAN.scanFrontendExecutor(exec);
-    assert(entries.length >= 40, 'muy pocos mensajes del ejecutor: ' + entries.length);
-    const missing = [];
-    const samples = [];
-    for (const e of entries) {
-      if (e.text.startsWith('__errorCode__ ')) { const c = e.text.slice(14); if (!FC.isFailureCodeClassified(c)) missing.push(`L${e.line} errorCode ${c}`); continue; }
-      if (e.text.startsWith('__expr__ ')) {
-        const expr = e.text.slice(9);
-        const hit = FE_EXPR_SAMPLES.find(([re]) => re.test(expr));
-        if (!hit) { missing.push(`L${e.line} expresión sin muestra: ${expr.slice(0, 120)}`); continue; }
-        for (const s of hit[1]) samples.push([e.line, s]);
-        continue;
-      }
-      samples.push([e.line, e.text]);
-    }
-    for (const e of SCAN.scanFrontendApi(api)) {
-      let t = e.text;
-      if (/Fall[oó] despu[eé]s de $/.test(t)) t += '3 intentos: x';
-      else if (/\($/.test(t)) t += '503). Reintentando…';
-      samples.push([`api:${e.line}`, t]);
-    }
-    for (const [line, s] of samples) {
-      const r = FC.classifyFailure({ error: s.endsWith(' ') ? s + 'x' : s });
-      if (r.unclassified) missing.push(`L${line} «${s.slice(0, 100)}» → ${r.code}`);
-    }
-    assert(missing.length === 0, 'mensajes del navegador sin regla:\n' + missing.join('\n'));
+    const { missing, samples } = frontendGate(FE_DIR);
+    assert(missing.length === 0, 'mensajes del navegador sin regla / expresiones sin código:\n' + missing.join('\n'));
     console.log(`   (${samples.length} mensajes del navegador)`);
   });
+} else if (process.argv.includes('--require-fe')) {
+  check('gate frontend: --require-fe sin --fe <dir>', () => { throw new Error('el gate frontend es obligatorio aquí (CI): pasar --fe <checkout del frontend>'); });
 } else {
-  console.log('ℹ️  gate frontend omitido (sin --fe <dir del frontend>; el frontend es otro repo)');
+  console.log('ℹ️  gate frontend omitido (sin --fe <dir del frontend>; en CI corre con --require-fe --fe)');
 }
 
 console.log(`\n${failures === 0 ? '✅' : '❌'} check-rel-failure-classes: ${passes} ok, ${failures} fallidos`);

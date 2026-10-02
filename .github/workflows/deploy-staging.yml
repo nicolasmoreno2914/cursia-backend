@@ -137,8 +137,30 @@ jobs:
       - name: Check V2.1 F1 perfiles (pesos normalizados / curso sin nota, 409 al arrancar, paleta → presentación; puro)
         run: node scripts/check-v21-f1-profiles.js
 
-      - name: Check REL R1 clasificador central de fallos (tabla A/B/C/D + gate de códigos emitidos; puro)
-        run: node scripts/check-rel-failure-classes.js
+      # REL R1 fix round 1 (I3): el gate de códigos corre TAMBIÉN sobre el ejecutor del navegador (repo privado
+      # nicolasmoreno2914/cursia, rama staging). Requiere el secret FRONTEND_REPO_READ_TOKEN (PAT fine-grained,
+      # solo lectura de contenido de ese repo). Sin el secret el paso falla (fail-closed): nunca se despliega
+      # sin el gate del frontend.
+      - name: Require FRONTEND_REPO_READ_TOKEN (REL R1 gate frontend)
+        env:
+          FRONTEND_REPO_READ_TOKEN: ${{ secrets.FRONTEND_REPO_READ_TOKEN }}
+        run: |
+          if [ -z "$FRONTEND_REPO_READ_TOKEN" ]; then
+            echo "❌ Falta el secret FRONTEND_REPO_READ_TOKEN (lectura de nicolasmoreno2914/cursia): el gate REL R1 del frontend es obligatorio."
+            exit 1
+          fi
+
+      - name: Checkout frontend (staging) para el gate REL R1
+        uses: actions/checkout@v4
+        with:
+          repository: nicolasmoreno2914/cursia
+          ref: staging
+          path: frontend-for-gate
+          token: ${{ secrets.FRONTEND_REPO_READ_TOKEN }}
+          persist-credentials: false
+
+      - name: Check REL R1 clasificador central de fallos (tabla A/B/C/D + gate de códigos emitidos, backend + frontend; puro)
+        run: node scripts/check-rel-failure-classes.js --require-fe --fe frontend-for-gate
 
       - name: Check REL R2 log de intentos + columnas de recuperación (puro; la parte PG16 corre local)
         run: node scripts/check-rel-recovery.js --pure-only
