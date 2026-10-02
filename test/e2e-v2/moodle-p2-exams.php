@@ -7,7 +7,7 @@
 // el gate de notas: no son el objeto de esta prueba.
 //
 // Aserciones (P2-design §1.2/§1.3/§2.2, rulings 1–3):
-//  config restaurada  revisión = respuestas propias + nota (8 campos §1.3; V542 I4: reviewattempt D|I|O|C), completionattemptsexhausted = intentos > 0,
+//  config restaurada  revisión (8 campos §1.3; V542 fix round 1 I1: reviewattempt D|I|C, reviewmarks O|C), completionattemptsexhausted = intentos > 0,
 //                     cm 2/0/1; slots todos aleatorios (banco: cada filtercondition → hoja del contexto
 //                     del quiz, includesubcategories false) o todos fijos (GIFT); Σ maxmark = 100;
 //                     página «Respuestas explicadas»: misma sección, justo después del quiz,
@@ -15,10 +15,11 @@
 //                     intentos ilimitados), completion 0, downloadcontent 0, fuera de los criterios.
 //  A (intentos > 0)   reprueba el primer examen de módulo hasta agotarlo: con intentos restantes
 //                     INCOMPLETE y página BLOQUEADA; agotado COMPLETE_FAIL y página DISPONIBLE; tras
-//                     cada intento: página de revisión PERMITIDA (V542 I4: sin el aviso «No tiene permiso
-//                     para revisar este cuestionario») que, renderizada como el estudiante, muestra sus
-//                     respuestas y la nota por pregunta pero NO corrección, respuesta correcta, feedback
-//                     específico (por opción) ni general; luego aprueba todo lo demás → curso NO completo, sin insignia.
+//                     cada intento: página de revisión PERMITIDA al terminar (V542 I4: sin el aviso «No tiene
+//                     permiso para revisar este cuestionario») que, renderizada como el estudiante, muestra sus
+//                     respuestas SIN nota por pregunta (fix round 1 I1: la nota junto a la respuesta revela la
+//                     correcta de una V/F), corrección, respuesta correcta ni feedback; más tarde (abierto) sin
+//                     página de revisión y con la nota TOTAL visible (view.php + ítem del libro visible); luego aprueba todo lo demás → curso NO completo, sin insignia.
 //  U (intentos = 0)   reprueba 2 veces → página bloqueada (aunque Moodle ya marque COMPLETE_FAIL); aprueba
 //                     → página disponible; aprueba lo demás → curso completo.
 //  B                  aprueba al primer intento → COMPLETE_PASS, página disponible; aprueba lo demás →
@@ -79,7 +80,7 @@ $moduleExams = array_values(array_filter(array_keys($quizzes), fn($k) => str_sta
 $final = isset($quizzes['cv3:final_exam']) ? 'cv3:final_exam' : null;
 $criteria = array_map('intval', $DB->get_fieldset_select('course_completion_criteria', 'moduleinstance', 'course = ? AND criteriatype = 4', [$courseid]));
 
-$REVIEW = ['reviewattempt' => 69904, 'reviewcorrectness' => 16, 'reviewmaxmarks' => 69904, 'reviewmarks' => 4368,
+$REVIEW = ['reviewattempt' => 69648, 'reviewcorrectness' => 16, 'reviewmaxmarks' => 69904, 'reviewmarks' => 272,
     'reviewspecificfeedback' => 16, 'reviewgeneralfeedback' => 16, 'reviewrightanswer' => 16, 'reviewoverallfeedback' => 16];
 
 /** Slot → categoría del filtercondition restaurado (null si el slot es fijo). */
@@ -100,7 +101,7 @@ foreach ($quizzes as $idn => $Q) {
     $ctx = context_module::instance($cm->id);
     $attempts = (int)$q->attempts;
     $got = []; foreach ($REVIEW as $k => $v) $got[$k] = (int)$q->$k;
-    check("$idn: revisión = respuestas propias + nota, sin corrección/feedback/respuesta (8 campos §1.3 + V542 I4)", $got === $REVIEW, $got);
+    check("$idn: revisión = respuestas propias al terminar, sin nota por pregunta/corrección/feedback/respuesta; nota total más tarde (8 campos §1.3 + V542 I1)", $got === $REVIEW, $got);
     check("$idn: completionattemptsexhausted = intentos > 0 ($attempts)", (int)$q->completionattemptsexhausted === ($attempts > 0 ? 1 : 0), (int)$q->completionattemptsexhausted);
     check("$idn: cm completion 2/0/1", [(int)$cm->completion, (string)$cm->completiongradeitemnumber, (int)$cm->completionpassgrade] === [2, '0', 1],
         [$cm->completion, $cm->completiongradeitemnumber, $cm->completionpassgrade]);
@@ -218,6 +219,13 @@ function attempt($idn, $user, $correct) {
     $PAGE->set_context(context_module::instance($cm->id));
     $link = $qs->get_access_manager(time())->make_review_link($ao->get_attempt(), null, $PAGE->get_renderer('mod_quiz'));
     $view = ['gradeColumn' => $some->marks >= display_options::MARK_AND_MAX, 'reviewLink' => str_contains($link, '/mod/quiz/review.php')];
+    // V542 fix round 1 (I1): «más tarde, abierto» (LATER_WHILE_OPEN): sin página de revisión, nota total visible;
+    // el ítem del libro de calificaciones queda VISIBLE (quiz_grade_item_update: marks en O) con la nota del intento.
+    $later = display_options::make_from_quiz($qs->get_quiz(), display_options::LATER_WHILE_OPEN);
+    $gi = grade_item::fetch(['itemtype' => 'mod', 'itemmodule' => 'quiz', 'iteminstance' => $cm->instance, 'courseid' => $cm->course]);
+    $gg = $gi ? grade_grade::fetch(['itemid' => $gi->id, 'userid' => $user->id]) : null;
+    $view['later'] = ['attempt' => (bool)$later->attempt, 'marks' => (int)$later->marks, 'gradeItemHidden' => $gi ? (int)$gi->hidden : null,
+        'gradebookGrade' => $gg && $gg->finalgrade !== null ? (float)$gg->finalgrade : null];
     $review['page'] = render_review($ao, $cm);
     \core\session\manager::set_user(get_admin());
     if ($filters) {
@@ -265,16 +273,24 @@ function render_review($ao, $cm) {
             }
         }
         if (preg_match('/class="grade"/', $html)) $graded++;
+        // V542 fix round 1 (I1): la nota OBTENIDA por pregunta («Puntúa 0,00 sobre 5,88») junto a la respuesta propia
+        // revela la correcta (V/F). Solo se admite «Puntúa como 5,88» (MAX_ONLY).
+        $dp = $ao->get_display_options(true)->markdp;
+        $markStr = get_string('markoutofmax', 'question', (object)['mark' => $qa->format_mark($dp), 'max' => $qa->format_max_mark($dp)]);
+        if ($qa->get_mark() !== null && str_contains($text, html_entity_decode(strip_tags($markStr), ENT_QUOTES | ENT_HTML5))) $why[] = 'nota obtenida por pregunta';
         if ($why) $leaks[$slot] = $q->name . ': ' . implode(', ', $why);
     }
     return ['questions' => $n, 'withMark' => $graded, 'leaks' => $leaks];
 }
 function assert_marks_only($label, $r) {
-    check("$label: tras el intento se puede revisar (sin «No tiene permiso para revisar»): respuestas propias y nota, SIN corrección, respuesta correcta ni feedback; nota visible en la vista del quiz",
+    check("$label: al terminar se puede revisar (sin «No tiene permiso para revisar»): respuestas propias SIN nota por pregunta, corrección, respuesta correcta ni feedback",
         $r['review']['attempt'] === true && $r['review']['correctness'] === 0 && $r['review']['rightanswer'] === 0 && $r['review']['feedback'] === 0
-        && $r['review']['generalfeedback'] === 0 && $r['review']['marks'] >= display_options::MARK_AND_MAX && $r['view']['gradeColumn'] === true && $r['view']['reviewLink'] === true, $r);
+        && $r['review']['generalfeedback'] === 0 && $r['review']['marks'] === display_options::MAX_ONLY && $r['view']['reviewLink'] === true, $r);
+    check("$label: más tarde (abierto): sin página de revisión; nota total visible en view.php y en el libro de calificaciones (ítem visible, nota {$r['grade']})",
+        $r['view']['later']['attempt'] === false && $r['view']['later']['marks'] >= display_options::MARK_AND_MAX
+        && $r['view']['later']['gradeItemHidden'] === 0 && $r['view']['later']['gradebookGrade'] !== null, $r['view']);
     $p = $r['review']['page'];
-    check("$label: página de revisión renderizada como el estudiante: {$p['questions']} preguntas, nota en cada una, 0 fugas de respuesta/feedback",
+    check("$label: página de revisión renderizada como el estudiante: {$p['questions']} preguntas, «Puntúa como» en cada una, 0 fugas (nota obtenida, respuesta, corrección, feedback)",
         $p['questions'] > 0 && $p['withMark'] === $p['questions'] && !$p['leaks'], $p);
 }
 /** Aprueba (nota real) todo criterio de completion que no es un quiz. */
@@ -378,7 +394,9 @@ $closed = render_review(quiz_attempt::create($r['id']), $quizzes[$exam]['cm']);
 \core\session\manager::set_user(get_admin());
 $DB->set_field('quiz', 'timeclose', 0, ['id' => $quizzes[$exam]['cm']->instance]);
 check("control: tras el cierre el detector SÍ ve respuesta/feedback ({$closed['questions']} preguntas, " . count($closed['leaks']) . ' con revelación)',
-    $closed['questions'] > 0 && count($closed['leaks']) === $closed['questions'], $closed);
+    $closed['questions'] > 0 && count($closed['leaks']) === $closed['questions']
+    // V542 fix round 1 (I1): el detector de la nota obtenida por pregunta también la ve tras el cierre.
+    && count(array_filter($closed['leaks'], fn($l) => str_contains($l, 'nota obtenida por pregunta'))) === $closed['questions'], $closed);
 $s = state($B, $exam);
 $steps['B'][] = ['step' => 'intento 1 aprobado', 'grade' => $r['grade']] + $s;
 check("B $exam aprobado al primer intento: COMPLETE_PASS y página DISPONIBLE", $s['completion'] === 'COMPLETE_PASS' && $open($s) && $r['grade'] >= 99.99, $s);

@@ -263,10 +263,10 @@ async function pureChecks() {
   // 645 5cef2b728e7132590f1d5087381ecbca485fd2d00e76e528de11cd3fe87109b2. Dorados de staging (builder 3.6.0): 644 5de36d0645bcc04a2189f33849a53e1a2250991b4b3cd10ed0aaa3a11c3b0c1f,
   // 645 58408d0e6a04774d5ca7df08deac6cd46a23a3326836047c7b1ad16cb13f458f.
   const GOLDEN_PRE_T5 = {
-    644: ['5b2bc73b0db0f6a37eebde4a015cb7f51e52eff2323443840f1a8b3c12710607', { engine: 'h5p', finalExam: true, courseId: 644 }],
-    645: ['06158b4fbad0762cedc57fe6d68f5cd0b97d749d3766c5c9abefc455698b7c55', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
+    644: ['d3b7ad86f5863e64b49a7ef6419c365c626230c319b6cae1f1555963d7516dcf', { engine: 'h5p', finalExam: true, courseId: 644 }],
+    645: ['a72078adc2d79987d55b855c9e15923f398e009eaf1c39bf804fb323d829ba9c', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
   };
-  await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B4 (respuestas explicadas sobre sistema visual 2.0 + certificado + política de revisión del quiz con revisión de respuestas propias V542 + H5P de una sola copia, builder 3.8.0), con y sin el campo', async () => {
+  await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B4 (respuestas explicadas sobre sistema visual 2.0 + certificado + política de revisión del quiz con revisión de respuestas propias V542 + H5P de una sola copia, builder 3.9.0), con y sin el campo', async () => {
     for (const [id, [want, o]] of Object.entries(GOLDEN_PRE_T5)) {
       const i1 = PF.packagingInput(distRoot, o);
       const i2 = PF.packagingInput(distRoot, o);

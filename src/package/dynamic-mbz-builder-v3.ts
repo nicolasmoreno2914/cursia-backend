@@ -199,8 +199,11 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * (filearea `package`); el embed inline del intro carga ese mismo archivo → un solo contenido y un
  * solo estado (sin «Data Reset» al pasar entre el capítulo y la página de la actividad). Un paquete
  * sin actividades H5P queda byte a byte igual a 3.7.0.
+ * 3.9.0 (V542 fix round 1, I1): revisión del quiz D|I|C y notas O|C — la página de revisión al terminar
+ * muestra las respuestas propias SIN nota por pregunta (la nota por pregunta revelaba la correcta de una
+ * V/F); la nota total se ve en view.php (más tarde, abierto) y en el libro de calificaciones.
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.8.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.9.0';
 
 // EV6 P2-B5: `examExplanationsAvailability` vive en course-shell/exam-explanations (lo usa también el validador).
 export { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';
