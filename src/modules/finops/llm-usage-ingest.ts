@@ -26,9 +26,18 @@ export interface LlmUsageIngestBody {
   };
   billingAccount: 'cursia' | 'user_key';
   mode?: 'real' | 'mock';
+  /**
+   * #583 fix round 1 (I1): streaming a través del proxy.
+   * - 'conservative': el navegador se fue a mitad del stream; el proxy registra YA un cargo conservador
+   *   (output = max_tokens del pedido) marcado metadata.conservative — nunca se registra de menos.
+   * - 'correction': el proxy terminó de leer el stream y trae el usage EXACTO de ese mismo messageId:
+   *   ajusta el cargo conservador (ADJUSTMENT por la diferencia); si el conservador no llegó, es el cargo.
+   * Ausente = cargo normal (de siempre).
+   */
+  measurement?: 'conservative' | 'correction';
 }
 
-const ALLOWED_KEYS = new Set(['subject', 'itemRunId', 'callRole', 'attempt', 'model', 'messageId', 'requestId', 'usage', 'billingAccount', 'mode']);
+const ALLOWED_KEYS = new Set(['subject', 'itemRunId', 'callRole', 'attempt', 'model', 'messageId', 'requestId', 'usage', 'billingAccount', 'mode', 'measurement']);
 
 function bad(msg: string): never {
   throw new FinopsError('INVALID_INPUT', msg);
@@ -75,7 +84,9 @@ export function parseLlmUsageIngest(body: unknown): LlmUsageIngestBody {
     cache_creation_input_tokens: tokenCount(u.cache_creation_input_tokens, 'cache_creation_input_tokens', false),
     cache_read_input_tokens: tokenCount(u.cache_read_input_tokens, 'cache_read_input_tokens', false),
   };
-  return { subject, itemRunId, callRole, attempt: b.attempt, model, messageId, requestId, usage, billingAccount: b.billingAccount, mode };
+  const measurement = b.measurement ?? undefined;
+  if (measurement !== undefined && measurement !== 'conservative' && measurement !== 'correction') bad('measurement debe ser conservative | correction');
+  return { subject, itemRunId, callRole, attempt: b.attempt, model, messageId, requestId, usage, billingAccount: b.billingAccount, mode, ...(measurement ? { measurement } : {}) };
 }
 
 /** Body validado → input del ledger (medidores con los nombres del catálogo). */
@@ -103,6 +114,11 @@ export function llmIngestToChargeInput(body: LlmUsageIngestBody): RecordChargeIn
     recordedBy: 'llm-proxy',
     // RF-b fix C1/I2: un cargo LLM real nunca se pierde por un precio faltante.
     pricingFallback: 'pending_zero',
-    metadata: { requestId: body.requestId ?? null, billingAccountRequested: body.billingAccount },
+    metadata: {
+      requestId: body.requestId ?? null,
+      billingAccountRequested: body.billingAccount,
+      ...(body.measurement === 'conservative' ? { conservative: true, conservativeReason: 'stream_client_gone' } : {}),
+      ...(body.measurement === 'correction' ? { measuredFromStream: true } : {}),
+    },
   };
 }

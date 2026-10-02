@@ -76,6 +76,13 @@ import {
   SAFE_AUTO_RETRY_MAX_ROUNDS,
   SAFE_AUTO_RETRY_SQL_REGEX,
   safeAutoRetryDecision,
+  AMBIGUOUS_AUDIO_RESUBMIT_CODE,
+  AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS,
+  AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD,
+  AMBIGUOUS_AUDIO_RESUBMIT_SQL_REGEX,
+  AMBIGUOUS_AUDIO_RESUBMIT_TYPES,
+  AmbiguousAudioPending,
+  ambiguousAudioResubmitDecision,
 } from './auto-heal';
 import { FinopsBudgetService, StartBudgetEvaluation } from '../finops/finops-budget.service';
 import {
@@ -1633,13 +1640,18 @@ export class RunsService {
     itemKey: string,
     resubmitVideo = false,
     resubmitProvider = false,
-    auto?: { policy: AutoHealPolicy; now?: Date; safe?: boolean },
+    auto?: { policy: AutoHealPolicy; now?: Date; safe?: boolean; ambiguousAudio?: boolean; maxUsd?: number },
     /** EV6 DoD (R5): quién reintenta (la recuperación PAGA de un video es solo de SUPER_ADMIN). */
     actor?: { id?: string | null; email?: string | null },
   ): Promise<ItemRunDto> {
+    // #583 (decisión del usuario): el ÚNICO reenvío automático de un proveedor con resultado incierto es
+    // el de AUDIO (`auto.ambiguousAudio`, con resubmitProvider), re-evaluado bajo lock con el ledger.
+    if (auto?.ambiguousAudio && (!resubmitProvider || resubmitVideo || auto.safe)) {
+      throw new BadRequestException('auto-heal: el reenvío de audio incierto solo va con resubmitProvider');
+    }
     // EV6 DoD BE-B: el ÚNICO reenvío automático permitido es el reintento seguro (`auto.safe`) de un
     // rechazo DEFINITIVO de Videogen sin gasto (videogen_submit_rejected), re-evaluado bajo lock.
-    if (auto && (resubmitProvider || (resubmitVideo && !auto.safe))) {
+    if (auto && ((resubmitProvider && !auto.ambiguousAudio) || (resubmitVideo && !auto.safe))) {
       throw new BadRequestException('auto-heal: nunca reenvía a un proveedor (resubmitVideo/resubmitProvider)');
     }
     // Fix round 1 (I2): un SUPER_ADMIN reintenta sobre el run del dueño real del curso (FinOps, YouTube
@@ -1787,8 +1799,16 @@ export class RunsService {
       }
       // R16 (#2): la política del auto-healer se re-evalúa con la fila bloqueada (otro barrido, un retry
       // manual o un fallo nuevo pudieron cambiarla entre la lectura y este lock).
-      let autoMeta: { round: number; code: string } | null = null;
-      if (auto && auto.safe) {
+      let autoMeta: { round: number; code: string; pendingUsd?: number | null } | null = null;
+      if (auto && auto.ambiguousAudio) {
+        // #583: misma decisión que el barrido, con la fila bloqueada y lo pendiente del ledger releído acá.
+        const pending = await this.ambiguousAudioPending(qr, target.id, target.output_summary);
+        const d = ambiguousAudioResubmitDecision(target, auto.now ?? new Date(), pending, auto.policy, auto.maxUsd ?? AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD);
+        if (d.heal === false) {
+          throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (${d.reason})`, code: 'auto_heal_not_eligible', reason: d.reason });
+        }
+        autoMeta = { round: d.round, code: AMBIGUOUS_AUDIO_RESUBMIT_CODE, pendingUsd: d.pendingUsd };
+      } else if (auto && auto.safe) {
         // BE-B: reintento automático seguro (una vez; solo rechazos probados sin gasto).
         const d = safeAutoRetryDecision(target, auto.now ?? new Date(), auto.policy);
         if (d.heal === false || d.rule.resubmitVideo !== resubmitVideo) {
@@ -1902,23 +1922,31 @@ export class RunsService {
                     -- intentos hasta acá quedan reconocidas (el worker ya no las trata como ambiguas).
                     -- BE-B: el reintento automático seguro NO reconoce nada (no es una decisión humana):
                     -- conserva el valor previo; su reserva rechazada ya está liquidada (no bloquea).
-                    'reconciliationAcknowledgedThroughAttempt', ${auto ? `coalesce(output_summary->'reconciliationAcknowledgedThroughAttempt', '0'::jsonb)` : 'attempt_count'}
+                    -- #583: el reenvío automático de AUDIO incierto sí reconoce (como «Resolver cobro»): su reserva
+                    -- pendiente queda en el ledger contada como gasto y el próximo intento puede llamar.
+                    'reconciliationAcknowledgedThroughAttempt', ${auto && !auto.ambiguousAudio ? `coalesce(output_summary->'reconciliationAcknowledgedThroughAttempt', '0'::jsonb)` : 'attempt_count'}
                   ) || $4::jsonb)${resubmitSetSql}`
         : `(${previousErrorsExpr}) || $4::jsonb`;
       // R16 (#2): la reapertura automática queda registrada (auditoría) en la misma escritura.
       const nowIso = (auto?.now ?? new Date()).toISOString();
-      const entryExtra = autoMeta && auto?.safe
+      const entryExtra = autoMeta && auto?.ambiguousAudio
+        ? { auto: true, ambiguousAudioResubmit: true, ambiguousAudioResubmitRound: autoMeta.round, autoHealCode: autoMeta.code, pendingUsd: autoMeta.pendingUsd ?? null }
+        : autoMeta && auto?.safe
         ? { auto: true, safeAutoRetry: true, safeAutoRetryRound: autoMeta.round, autoHealCode: autoMeta.code }
         : autoMeta
           ? { auto: true, autoHealRound: autoMeta.round, autoHealCode: autoMeta.code }
           : actorId !== ownerId ? { retriedBy: actorId } : {};
-      const topExtra = autoMeta && auto?.safe
+      const topExtra = autoMeta && auto?.ambiguousAudio
+        ? { ambiguousAudioResubmit: { rounds: autoMeta.round, lastAt: nowIso, pendingUsd: autoMeta.pendingUsd ?? null,
+            maxUsd: auto.maxUsd ?? AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD, maxRounds: AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS } }
+        : autoMeta && auto?.safe
         ? { safeAutoRetry: { rounds: autoMeta.round, lastAt: nowIso, lastCode: autoMeta.code, maxRounds: SAFE_AUTO_RETRY_MAX_ROUNDS } }
         : autoMeta
           ? { autoHeal: { rounds: autoMeta.round, lastAt: nowIso, lastCode: autoMeta.code, maxRounds: autoHealMaxRoundsFor(target.type, auto!.policy) } }
           : {};
       // BE-B: el reintento seguro concede UN intento (un único reenvío; si vuelve a fallar, humano).
-      const attemptsGranted = auto?.safe ? 1 : auto ? Math.max(1, Math.floor(auto.policy.attemptsPerRound)) : 3;
+      // #583: el reenvío de audio incierto también concede UN intento (un único reenvío).
+      const attemptsGranted = auto?.safe || auto?.ambiguousAudio ? 1 : auto ? Math.max(1, Math.floor(auto.policy.attemptsPerRound)) : 3;
 
       const updated = returningRows(
         await qr.query(
@@ -2204,6 +2232,132 @@ export class RunsService {
     }
     if (rows.length) {
       this.logger.log(`reintento automático seguro: candidatos ${result.candidates}, reintentados ${result.retried.length}, omitidos ${result.skipped.length}`);
+    }
+    return result;
+  }
+
+  /**
+   * #583 — lo pendiente (reservas reales sin liquidar) de un item en el ledger, de los intentos que todavía
+   * no se reconocieron, por proveedor. Es lo que costaría repetir la operación incierta.
+   */
+  private async ambiguousAudioPending(
+    q: { query: (sql: string, params?: any[]) => Promise<any> },
+    itemRunId: string,
+    outputSummary: Record<string, any> | null,
+  ): Promise<AmbiguousAudioPending> {
+    const ack = Number(outputSummary?.reconciliationAcknowledgedThroughAttempt ?? 0);
+    const rows: Array<{ provider: string; amount: string }> = await q.query(
+      `select e.provider, coalesce(sum(e.amount), 0)::text as amount
+         from public.generation_cost_events e
+        where e.item_run_id = $1 and e.event_kind = 'CHARGE' and e.billing_account <> 'mock'
+          and coalesce((e.metadata->>'reservation') = 'true', false)
+          and coalesce(e.attempt, 0) > $2::int
+          and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)
+        group by e.provider`,
+      [itemRunId, Number.isFinite(ack) ? Math.floor(ack) : 0],
+    );
+    return {
+      pendingUsd: rows.reduce((t, r) => t + Number(r.amount || 0), 0),
+      providers: rows.map((r) => String(r.provider)).sort(),
+    };
+  }
+
+  /**
+   * #583 (decisión del usuario 2026-10-02) — barrido del reenvío automático ÚNICO de un audio con
+   * resultado incierto (mismo tick que el auto-healer). Solo audio_welcome / audiobook_chapter con
+   * `provider_reconciliation_required: openai …`, recientes, de la ejecución vigente, sin su reenvío
+   * usado ni rechazado, y con lo pendiente del item ≤ AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD. Pasa por
+   * retryItem(auto.ambiguousAudio, resubmitProvider): locks, decisión re-evaluada con el ledger bajo lock,
+   * gate de FinOps en simulación (presupuesto YA autorizado) y, en el worker, el runtime guard. Lo que no
+   * califica (sobre el tope, otro proveedor pendiente, FinOps lo rechaza…) queda `declined` → admin.
+   */
+  async autoResubmitAmbiguousAudio(
+    opts: { policy?: AutoHealPolicy; now?: Date; limit?: number; maxUsd?: number } = {},
+  ): Promise<{ candidates: number; resubmitted: Array<{ runId: string; itemKey: string; pendingUsd: number | null }>; skipped: Array<{ runId: string; itemKey: string; reason: string }> }> {
+    const policy = opts.policy ?? autoHealPolicyFromEnv();
+    const now = opts.now ?? new Date();
+    const limit = Math.max(1, Math.floor(opts.limit ?? 50));
+    const maxUsd = typeof opts.maxUsd === 'number' && opts.maxUsd >= 0 ? opts.maxUsd : AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD;
+    const result = { candidates: 0, resubmitted: [] as Array<{ runId: string; itemKey: string; pendingUsd: number | null }>, skipped: [] as Array<{ runId: string; itemKey: string; reason: string }> };
+    const rows: Array<{
+      id: string; job_id: string; item_key: string; type: string; status: string; error: string | null; output_summary: Record<string, any> | null;
+      finished_at: Date; updated_at: Date | null; course_id: number; owner_id: string; blueprint_number: number;
+    }> = await this.dataSource.query(
+      `select g.id, g.job_id, g.item_key, g.type, g.status, g.error, g.output_summary, g.finished_at, g.updated_at,
+              pj.course_id, pj.owner_id, b.blueprint_number
+         from public.generation_item_runs g
+         join public.production_jobs pj on pj.id = g.job_id
+         join public.course_generation_manifests m on m.id = g.manifest_id
+         join public.course_blueprints b on b.id = m.blueprint_id
+        where pj.execution_mode = 'dynamic_generation'
+          and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+          and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed', 'preview')
+          and g.status = 'failed'
+          and g.type = any($6::text[])
+          and ${latestGenerationPredicate('g')}
+          and g.finished_at > $1::timestamptz - make_interval(secs => $2::int)
+          and not exists (
+            select 1 from public.production_jobs pj2
+             where pj2.execution_mode = 'dynamic_generation' and pj2.course_id = pj.course_id and pj2.id <> pj.id
+               and (pj2.created_at > pj.created_at or (pj2.created_at = pj.created_at and pj2.id > pj.id)))
+          and not exists (select 1 from public.course_generation_manifests m2 where m2.course_id = m.course_id and m2.id > m.id)
+          and g.error ~ $3
+          and not (g.output_summary ? 'ambiguousAudioResubmit' and (g.output_summary->'ambiguousAudioResubmit' ? 'declined'
+                   or coalesce((g.output_summary->'ambiguousAudioResubmit'->>'rounds')::numeric, 0) >= $4::int))
+        order by g.finished_at desc, g.id desc
+        limit $5`,
+      [now.toISOString(), Math.round(Math.min(Math.max(policy.maxAgeHours, 0), AUTO_HEAL_MAX_AGE_HOURS_RANGE.max) * 3600), AMBIGUOUS_AUDIO_RESUBMIT_SQL_REGEX,
+        AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS, limit, [...AMBIGUOUS_AUDIO_RESUBMIT_TYPES]],
+    );
+    result.candidates = rows.length;
+    const decline = async (r: { id: string; item_key: string }, reason: string, pendingUsd: number | null) => {
+      try {
+        await this.dataSource.query(
+          `update public.generation_item_runs
+              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('ambiguousAudioResubmit',
+                    coalesce(output_summary->'ambiguousAudioResubmit', '{}'::jsonb) || jsonb_build_object('declined', $2::text, 'declinedAt', $3::text, 'pendingUsd', $4::numeric, 'maxUsd', $5::numeric))
+            where id = $1 and status = 'failed'`,
+          [r.id, reason.slice(0, 100), now.toISOString(), pendingUsd, maxUsd],
+        );
+      } catch (e) {
+        this.logger.warn(`reenvío de audio incierto: no se pudo registrar el rechazo de ${r.item_key}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    };
+    for (const r of rows) {
+      const pending = await this.ambiguousAudioPending(this.dataSource, r.id, r.output_summary);
+      const d = ambiguousAudioResubmitDecision(r, now, pending, policy, maxUsd);
+      if (d.heal === false) {
+        result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: d.reason });
+        // Lo que nunca va a calificar queda para un admin YA (sin re-evaluarlo en cada tick).
+        if (d.reason === 'over_threshold' || d.reason === 'missing_precondition' || d.reason === 'denied') {
+          await decline(r, d.reason, d.pendingUsd ?? null);
+          this.logger.warn(`reenvío de audio incierto: ${r.item_key} (run ${r.job_id}) no se reenvía solo (${d.reason}, pendiente USD ${d.pendingUsd ?? '?'}); queda para un admin`);
+        }
+        continue;
+      }
+      try {
+        await this.retryItem(r.course_id, r.owner_id, Number(r.blueprint_number), r.job_id, r.item_key, false, true, { policy, now, ambiguousAudio: true, maxUsd });
+        result.resubmitted.push({ runId: r.job_id, itemKey: r.item_key, pendingUsd: d.pendingUsd });
+        this.logger.warn(`reenvío de audio incierto: ${r.item_key} (run ${r.job_id}) — UN reenvío automático (pendiente USD ${d.pendingUsd} ≤ ${maxUsd}); la reserva incierta queda contada`);
+      } catch (err) {
+        const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
+        const code = String((resp && typeof resp === 'object' && ((resp as any).reason || (resp as any).code)) || (err instanceof Error ? err.name : 'error')).slice(0, 100);
+        result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: code });
+        // Una carrera (otro tick/retry lo cambió: espera, ya no failed) o una falla de infraestructura
+        // (DB/lock/timeout, FinOps no disponible, 5xx) se re-evalúa en el próximo tick (fix round 1, M5): solo
+        // un rechazo DEFINITIVO (presupuesto, tope, precondición, run reemplazado…) lo deja para un admin.
+        // La ventana de edad (maxAgeHours) sigue acotando los reintentos.
+        const status = (err as { getStatus?: () => number })?.getStatus?.();
+        const transient = code === 'backoff' || code === 'not_failed' || code === 'auto_heal_not_eligible' ||
+          /unavailable|timeout|ECONN|EMAXCONN|deadlock|lock|QueryFailed|Connection|InternalServerError|Error$/i.test(code) ||
+          (typeof status === 'number' && status >= 500) || typeof status !== 'number';
+        if (transient) continue;
+        await decline(r, code, d.pendingUsd);
+        this.logger.warn(`reenvío de audio incierto: ${r.item_key} (run ${r.job_id}) no se reenvía (${code}); queda para un admin`);
+      }
+    }
+    if (rows.length) {
+      this.logger.log(`reenvío de audio incierto: candidatos ${result.candidates}, reenviados ${result.resubmitted.length}, omitidos ${result.skipped.length}`);
     }
     return result;
   }
@@ -4237,6 +4391,27 @@ export class RunsService {
    */
   private async sweepAndRecompute(job: any): Promise<any> {
     if (!isActive(job)) return job;
+    // #583 (N8): cada GET del run (el panel lo sondea, y cada lane del ejecutor también) abría una
+    // transacción de escritura con SELECT … FOR UPDATE sobre la fila del run — la misma que bloquean los
+    // claims / heartbeats / completes — aunque no hubiera nada que barrer (15 round-trips + BEGIN/COMMIT
+    // por GET; staging tiene 2 conexiones para la API). Un chequeo de solo lectura decide si la
+    // transacción puede cambiar algo: con un lease vencido, o con el estado del run desalineado de sus
+    // items (ninguno activo → terminal; alguno running y el run no `running`), sigue el camino de siempre.
+    // Si no, recomputeRunStatus no escribiría nada: se devuelve la fila tal cual, sin locks.
+    const [pre] = await this.dataSource.query(
+      // Fix round 1 (M4): `expired` sobre TODAS las filas del run (igual que sweepRunExpiredLeases), no solo
+      // la generación vigente; active/running sobre la vigente (igual que recomputeRunStatus).
+      `select (select count(*)::int from public.generation_item_runs x
+                where x.job_id = $1 and x.status = 'running' and x.lease_until < now()) as expired,
+              count(*) filter (where g.status in ('pending', 'running', 'retrying'))::int as active,
+              count(*) filter (where g.status = 'running')::int as running
+         from public.generation_item_runs g
+        where g.job_id = $1 and ${latestGenerationPredicate('g')}`,
+      [job.id],
+    );
+    if (pre && Number(pre.expired) === 0 && Number(pre.active) > 0 && (Number(pre.running) === 0 || job.worker_status === 'running')) {
+      return job;
+    }
     let changed = false;
     await this.tx(async (qr) => {
       const [locked] = await qr.query(`select * from public.production_jobs where id = $1 for update`, [job.id]);
