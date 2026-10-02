@@ -140,7 +140,7 @@ import { groundColor } from '../modules/visual-components/render';
 import { IdAllocator, buildQuizV3, parseScormManifestIds, scormActivityXmlV3 } from './v3/moodle-activities-v3';
 import { expectedExamPlan, planSlotCount, validateExamBank } from '../modules/course-shell/exam-bank';
 import type { ExamBankV1 } from '../modules/course-shell/exam-bank';
-import { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';
+import { examExplanationsAvailability, examOverallFeedbackBands } from '../modules/course-shell/exam-explanations';
 import type { ExamBankPlans } from './v3/exam-validator-v3';
 import { COURSE_BADGE_BACKUP_ID, COURSE_BADGE_DEFAULT_ISSUER, courseBadgeImages, courseBadgeName, courseBadgeXml } from './v3/course-badge';
 
@@ -203,8 +203,11 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * 3.9.0 (V542 fix round 1, I1): revisión del quiz D|I|C y notas O|C — la página de revisión al terminar
  * muestra las respuestas propias SIN nota por pregunta (la nota por pregunta revelaba la correcta de una
  * V/F); la nota total se ve en view.php (más tarde, abierto) y en el libro de calificaciones.
+ * 3.10.0 (QUIZFB, re-verificación #542 R1): retroalimentación GLOBAL del quiz visible al terminar el intento
+ * (reviewoverallfeedback I|O|C, bandas «aprobaste» / «todavía no» con la nota mínima del perfil) y la línea de la
+ * info del examen promete exactamente eso («verás si aprobaste; tu calificación queda en Calificaciones»).
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.9.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.10.0';
 
 // EV6 P2-B5: `examExplanationsAvailability` vive en course-shell/exam-explanations (lo usa también el validador).
 export { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';
@@ -845,7 +848,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const W = new MbzWriter(ts, MV);
   const ids = new IdAllocator({
     qcat: 1000, qbe: 1000, qversion: 1000, question: 1000, qinstance: 1000, qref: 1000, qsetref: 1000, answer: 1000,
-    match: 1000, qoptions: 1000, qsection: 1000, sco: 50000, scodata: 60000,
+    match: 1000, qoptions: 1000, qsection: 1000, qfeedback: 1000, sco: 50000, scodata: 60000,
   });
   const graded: Array<CompletionCandidate & { name: string }> = [];
   const labelsHtml: Array<{ where: string; html: string }> = [];
@@ -978,6 +981,8 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       aid: a.aid, mid: a.mid, ctx: a.ctx, name, introHtml: `<p>${esc(name)}</p>`,
       ...(src.kind === 'bank' ? { bank: { doc: src.bank, groups: bankGroups } } : { gift: src.gift }),
       attempts: k.attempts, grademethod: k.gradeMethod, ts, stampSeed, ids,
+      // QUIZFB: «aprobaste / todavía no» al terminar el intento (la nota por pregunta sigue oculta mientras está abierto).
+      feedbackBands: examOverallFeedbackBands(k.passingGrade, k.attempts),
     });
     // Fix 1 (M5): los slots del quiz y las «preguntas» que anuncia el shell (facts) salen de la misma
     // fuente; si difieren, el texto del curso mentiría → falla fuerte.

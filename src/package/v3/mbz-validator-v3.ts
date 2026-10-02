@@ -24,6 +24,7 @@
  *                                          completion del curso del backup, setting badges = 1,
  *                                          imagen f1/f2/f3 PNG, examen final como criterio y el
  *                                          panel «Tu certificado» con $@BADGESVIEWBYID*curso@$
+ *   QUIZ_FEEDBACK                          QUIZFB: retroalimentación global «aprobaste / todavía no» con la nota mínima del perfil
  *   QUIZ_REVIEW / QUIZ_COMPLETION          EV6 P2-B1: revisión de las respuestas propias al terminar sin nota por pregunta (V542 I1), nota total más tarde; attemptsexhausted = intentos > 0
  *   QUIZ_RANDOM / EXPLANATIONS_GATE /      EV6 P2-B5 (exam-validator-v3.ts): banco aleatorio por hoja,
  *   ANSWER_LEAK                            página «Respuestas explicadas» gated por SU quiz, ningún par
@@ -44,7 +45,7 @@ import type { AssessmentCategoryKey } from '../assessment/resolve-assessment';
 import type { AssessableType } from '../../modules/course-profiles/course-profiles';
 import { extractText, lintCleanSafe, lintResourceMentions, parseHtml } from '../../modules/visual-components';
 import type { HtmlNode } from '../../modules/visual-components';
-import { CERTIFICATE_TEACHER_TROUBLESHOOTING, EXAMS_TEACHER_NOTE, EXAMS_TEACHER_NOTE_ATTEMPTS, EXAMS_TEACHER_NOTE_AVAILABILITY, CertificateRequirements, CourseFacts, chapterNextSteps, closingCertificateText, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles } from '../../modules/course-shell';
+import { CERTIFICATE_TEACHER_TROUBLESHOOTING, EXAMS_TEACHER_NOTE, EXAMS_TEACHER_NOTE_ATTEMPTS, EXAMS_TEACHER_NOTE_AVAILABILITY, CertificateRequirements, CourseFacts, chapterNextSteps, closingCertificateText, examOverallFeedbackBands, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles } from '../../modules/course-shell';
 import { safeActivityName } from '../mbz-common';
 import { courseBadgeDescription } from './course-badge';
 import { QUIZ_REVIEW_V3 } from './moodle-activities-v3';
@@ -119,7 +120,7 @@ interface ParsedActivity {
   moduleXmlId: number;
   actXmlModuleId: number;
   /** P2-B1: solo para modname 'quiz' — campos crudos de quiz.xml que no tienen otro lugar en ParsedActivity. */
-  quiz: { attempts_number: string; completionattemptsexhausted: string } & Record<keyof typeof QUIZ_REVIEW_V3, string> | null;
+  quiz: { attempts_number: string; completionattemptsexhausted: string; feedbacks: Array<{ text: string; min: number; max: number }> } & Record<keyof typeof QUIZ_REVIEW_V3, string> | null;
 }
 
 interface ParsedFile {
@@ -316,6 +317,9 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
         ? {
             attempts_number: tag(actXml, 'attempts_number') ?? '',
             completionattemptsexhausted: tag(actXml, 'completionattemptsexhausted') ?? '',
+            feedbacks: [...actXml.matchAll(/<feedback id="\d+">([\s\S]*?)<\/feedback>/g)].map((m) => ({
+              text: unxml(tag(m[1], 'feedbacktext') ?? ''), min: Number(tag(m[1], 'mingrade')), max: Number(tag(m[1], 'maxgrade')),
+            })),
             ...(Object.fromEntries(Object.keys(QUIZ_REVIEW_V3).map((k) => [k, tag(actXml, k) ?? ''])) as Record<keyof typeof QUIZ_REVIEW_V3, string>),
           }
         : null,
@@ -507,6 +511,14 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       for (const key of Object.keys(QUIZ_REVIEW_V3) as (keyof typeof QUIZ_REVIEW_V3)[]) {
         if (q[key] !== String(QUIZ_REVIEW_V3[key])) {
           add('QUIZ_REVIEW', a.dir, `${key} ${q[key]} ≠ ${QUIZ_REVIEW_V3[key]}`);
+        }
+      }
+      // QUIZFB: retroalimentación global = exactamente las bandas «aprobaste / todavía no» de la nota mínima del perfil.
+      if (kind) {
+        const want = examOverallFeedbackBands(resolved.kinds[kind].passingGrade, Number(q.attempts_number));
+        const got = q.feedbacks.map((f) => [f.min, f.max, f.text]);
+        if (JSON.stringify(got) !== JSON.stringify(want.map((b) => [b.mingrade, b.maxgrade, b.html]))) {
+          add('QUIZ_FEEDBACK', a.dir, `retroalimentación global ${JSON.stringify(q.feedbacks.map((f) => [f.min, f.max]))} ≠ bandas de la nota mínima ${resolved.kinds[kind].passingGrade}`);
         }
       }
       const wantExhausted = Number(q.attempts_number) > 0 ? '1' : '0';

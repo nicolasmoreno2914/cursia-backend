@@ -19,7 +19,9 @@
 //                     permiso para revisar este cuestionario») que, renderizada como el estudiante, muestra sus
 //                     respuestas SIN nota por pregunta (fix round 1 I1: la nota junto a la respuesta revela la
 //                     correcta de una V/F), corrección, respuesta correcta ni feedback; más tarde (abierto) sin
-//                     página de revisión y con la nota TOTAL visible (view.php + ítem del libro visible); luego aprueba todo lo demás → curso NO completo, sin insignia.
+//                     página de revisión y con la nota TOTAL visible (view.php + ítem del libro visible);
+//                     QUIZFB: al terminar, la retroalimentación global («aprobaste» / «todavía no», bandas de
+//                     la nota mínima del perfil) se ve con el texto de la banda de la nota real; luego aprueba todo lo demás → curso NO completo, sin insignia.
 //  U (intentos = 0)   reprueba 2 veces → página bloqueada (aunque Moodle ya marque COMPLETE_FAIL); aprueba
 //                     → página disponible; aprueba lo demás → curso completo.
 //  B                  aprueba al primer intento → COMPLETE_PASS, página disponible; aprueba lo demás →
@@ -81,7 +83,7 @@ $final = isset($quizzes['cv3:final_exam']) ? 'cv3:final_exam' : null;
 $criteria = array_map('intval', $DB->get_fieldset_select('course_completion_criteria', 'moduleinstance', 'course = ? AND criteriatype = 4', [$courseid]));
 
 $REVIEW = ['reviewattempt' => 69648, 'reviewcorrectness' => 16, 'reviewmaxmarks' => 69904, 'reviewmarks' => 272,
-    'reviewspecificfeedback' => 16, 'reviewgeneralfeedback' => 16, 'reviewrightanswer' => 16, 'reviewoverallfeedback' => 16];
+    'reviewspecificfeedback' => 16, 'reviewgeneralfeedback' => 16, 'reviewrightanswer' => 16, 'reviewoverallfeedback' => 4368];
 
 /** Slot → categoría del filtercondition restaurado (null si el slot es fijo). */
 function slot_leaf($cm) {
@@ -208,7 +210,12 @@ function attempt($idn, $user, $correct) {
     // Opciones de revisión de ESTE intento, vistas por el estudiante (antes del cierre).
     $o = $ao->get_display_options(true);
     $review = ['attempt' => (bool)$o->attempt, 'correctness' => (int)$o->correctness, 'marks' => (int)$o->marks,
-        'rightanswer' => (int)$o->rightanswer, 'feedback' => (int)$o->feedback, 'generalfeedback' => (int)$o->generalfeedback];
+        'rightanswer' => (int)$o->rightanswer, 'feedback' => (int)$o->feedback, 'generalfeedback' => (int)$o->generalfeedback,
+        // QUIZFB: la retroalimentación global («aprobaste / todavía no») se ve AL TERMINAR, con el texto de la banda de la nota real.
+        'overallfeedback' => (bool)$o->overallfeedback,
+        'overallText' => trim(html_entity_decode(strip_tags(quiz_feedback_for_grade($grade, $ao->get_quiz(), context_module::instance($cm->id))), ENT_QUOTES | ENT_HTML5))];
+    $gpass = (float)grade_item::fetch(['itemtype' => 'mod', 'itemmodule' => 'quiz', 'iteminstance' => $cm->instance, 'courseid' => $cm->course])->gradepass;
+    $review['passed'] = $grade >= $gpass - 1e-9;
     $qs = quiz_settings::create($ao->get_quizid(), $user->id);
     [$some] = quiz_get_combined_reviewoptions($qs->get_quiz(), quiz_get_user_attempts($ao->get_quizid(), $user->id, 'finished', true));
     // Enlace «Revisión» de la tabla de intentos de view.php (access_manager::make_review_link, la misma regla
@@ -289,6 +296,10 @@ function assert_marks_only($label, $r) {
     check("$label: más tarde (abierto): sin página de revisión; nota total visible en view.php y en el libro de calificaciones (ítem visible, nota {$r['grade']})",
         $r['view']['later']['attempt'] === false && $r['view']['later']['marks'] >= display_options::MARK_AND_MAX
         && $r['view']['later']['gradeItemHidden'] === 0 && $r['view']['later']['gradebookGrade'] !== null, $r['view']);
+    // QUIZFB: al terminar, la retroalimentación global dice si aprobó (la nota por pregunta sigue oculta).
+    $want = $r['review']['passed'] ? 'Aprobaste esta evaluación' : 'Todavía no alcanzas la nota mínima';
+    check("$label: al terminar se ve la retroalimentación global «" . ($r['review']['passed'] ? 'aprobaste' : 'todavía no') . "» (nota {$r['grade']})",
+        $r['review']['overallfeedback'] === true && str_starts_with($r['review']['overallText'], $want), $r['review']);
     $p = $r['review']['page'];
     check("$label: página de revisión renderizada como el estudiante: {$p['questions']} preguntas, «Puntúa como» en cada una, 0 fugas (nota obtenida, respuesta, corrección, feedback)",
         $p['questions'] > 0 && $p['withMark'] === $p['questions'] && !$p['leaks'], $p);

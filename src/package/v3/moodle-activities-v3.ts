@@ -57,6 +57,11 @@ function sha1(s: string): string {
  *  - O (más tarde, abierto): sin página de revisión; la nota TOTAL se ve en view.php y en el libro de
  *    calificaciones (marks O ⇒ quiz_grade_item_update deja el ítem visible) y la completion sigue igual;
  *  - C (cierre, solo si un profesor fija timeclose): todo.
+ * QUIZFB (builder 3.10.0, re-verificación #542 R1): `reviewoverallfeedback` I|O|C — al terminar, la página de
+ * revisión muestra la retroalimentación GLOBAL del quiz («aprobaste» desde la nota mínima del perfil / «todavía no»,
+ * `feedbackBands`). Moodle 4.5 no tiene forma de mostrar la nota del intento sin las notas por pregunta (las dos
+ * salen de «marks»), así que el resultado inmediato llega por ese mensaje; la nota queda en Calificaciones (ítem
+ * visible) y en view.php más tarde (O). Corrección, feedback por pregunta y respuesta correcta siguen solo en C.
  * Compromiso (documentado): nunca hay notas por pregunta mientras el examen está abierto, y la revisión
  * del intento solo está disponible justo al terminarlo; la nota total aparece en view.php ~2 min después
  * (en el libro de calificaciones, de inmediato).
@@ -69,7 +74,7 @@ export const QUIZ_REVIEW_V3 = {
   reviewspecificfeedback: 16, // C
   reviewgeneralfeedback: 16, // C
   reviewrightanswer: 16, // C
-  reviewoverallfeedback: 16, // C
+  reviewoverallfeedback: 4368, // I|O|C — QUIZFB: «aprobaste / todavía no» (retroalimentación global) al terminar
 } as const satisfies Record<string, number>;
 
 /** `maxmark` por pregunta con 7 decimales cuya suma es exactamente 100. */
@@ -103,6 +108,8 @@ export interface QuizV3Input {
   /** Semilla estable para los stamps (p.ej. el item_key). */
   stampSeed: string;
   ids: IdAllocator;
+  /** QUIZFB: bandas de la retroalimentación global (quiz_feedback, escala 0–100). Sin ellas, `<feedbacks>` vacío. */
+  feedbackBands?: ReadonlyArray<{ mingrade: number; maxgrade: number; html: string }>;
 }
 
 /**
@@ -210,6 +217,20 @@ export function buildQuizV3(p: QuizV3Input): QuizV3Output {
   return { quizXml, questionCategoriesXml, categoryIds: [catTop, catDefault, cat], questionCount: qs.length };
 }
 
+/** QUIZFB: `<feedback>` de cada banda (mingrade ≤ nota < maxgrade), en el orden dado. */
+function feedbacksXml(p: QuizV3Input): string {
+  const bands = p.feedbackBands ?? [];
+  const dec = (n: number) => n.toFixed(5);
+  for (const b of bands) {
+    if (!(b.mingrade >= 0 && b.maxgrade > b.mingrade && b.maxgrade <= 101) || typeof b.html !== 'string' || !b.html.trim()) {
+      throw new Error(`QUIZ_V3_INVALID: banda de retroalimentación ${JSON.stringify(b)}`);
+    }
+  }
+  return bands
+    .map((b) => `<feedback id="${p.ids.take('qfeedback')}"><feedbacktext>${xmlEsc(b.html)}</feedbacktext><feedbacktextformat>1</feedbacktextformat><mingrade>${dec(b.mingrade)}</mingrade><maxgrade>${dec(b.maxgrade)}</maxgrade></feedback>`)
+    .join('');
+}
+
 /** `quiz.xml` (mismo template para GIFT y banco; `instances` = los `question_instance`). */
 function quizActivityXmlV3(p: QuizV3Input, instances: string): string {
   const quizXmlBase = `<?xml version="1.0" encoding="UTF-8"?>
@@ -236,7 +257,7 @@ function quizActivityXmlV3(p: QuizV3Input, instances: string): string {
     <quiz_grade_items></quiz_grade_items>
     <question_instances>\n${instances}    </question_instances>
     <sections><section id="${p.ids.take('qsection')}"><firstslot>1</firstslot><heading></heading><shufflequestions>0</shufflequestions></section></sections>
-    <feedbacks></feedbacks>
+    <feedbacks>${feedbacksXml(p)}</feedbacks>
     <overrides></overrides><grades></grades><attempts></attempts>
   </quiz>
 </activity>`;
