@@ -66,7 +66,9 @@ export function recoveryViewOf(r: Record<string, any>): ItemRecoveryView {
   }
   const error = typeof r.error === 'string' ? r.error.trim() : '';
   if (error && FAILURE_STATUSES.has(String(r.status))) {
-    const v = classifyFailure({ error, itemType: r.type, outputSummary: r.output_summary ?? {} });
+    const src = r.type === 'video' ? 'video_worker'
+      : ['presentation', 'audio_welcome', 'audiobook_chapter'].includes(r.type) ? 'provider_worker' : 'browser_executor';
+    const v = classifyFailure({ error, itemType: r.type, outputSummary: r.output_summary ?? {}, source: src });
     const terminal = r.status === 'failed' || r.status === 'blocked';
     return {
       class: v.class,

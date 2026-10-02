@@ -348,7 +348,7 @@ async function dbChecks() {
       await snapRow('drained');
       await E.claimable(item.itemRunId);
       item = await E.claimWorker(C.runId, 'presentation');
-      const fr = await E.sched.failItemDetailed(item.itemRunId, 'rel-presentation-worker', 'la portada salió mal (texto libre)', false, undefined, { errorCode: 'presentation_artifact_invalid' });
+      const fr = await E.sched.failItemDetailed(item.itemRunId, 'rel-presentation-worker', 'presentation_artifact_invalid: PDF_MISSING (la portada salió mal)', false, undefined, { errorCode: 'PDF_MISSING' });
       eq(fr, { ok: true }, 'fail con errorCode');
       await snapRow('failed_errorCode');
       const dto = await E.runs.retryItem(C.cid, OWNER, 1, C.runId, key);
@@ -448,12 +448,13 @@ async function dbChecks() {
       const item = await R.sched.claimNextItem({ runId: relSeq.C.runId, executorId: 'browser-tab-1', ownerId: OWNER, leaseSeconds: 120,
         types: ['content', 'scorm', 'exam', 'course_plan', 'course_intro', 'module_intro', 'experience', 'video_interactions', 'activity', 'final_exam'] });
       assert(item, 'claim del navegador');
-      const res = await R.sched.failItemDetailed(item.itemRunId, 'browser-tab-1', 'el banco quedó incompleto: faltan 3 preguntas', true, OWNER, { errorCode: 'EXAM_BANK_INCOMPLETE' });
+      // C1: el código del ejecutor SUBE un transitorio (A) a B; nunca baja.
+      const res = await R.sched.failItemDetailed(item.itemRunId, 'browser-tab-1', 'Servidor ocupado (529). Reintentando…', true, OWNER, { errorCode: 'EXAM_BANK_INCOMPLETE' });
       eq(res, { ok: true }, 'fail');
       const row = await R.itemRow(relSeq.C.runId, item.itemKey);
-      eq([row.status, row.failure_class, row.failure_code, row.recovery_strategy, row.error], ['retrying', 'B', 'EXAM_BANK_INCOMPLETE', 'regenerate_targeted', 'el banco quedó incompleto: faltan 3 preguntas'], 'fila');
+      eq([row.status, row.failure_class, row.failure_code, row.recovery_strategy, row.error], ['retrying', 'B', 'EXAM_BANK_INCOMPLETE', 'regenerate_targeted', 'Servidor ocupado (529). Reintentando…'], 'fila');
       const [a] = await attempts(item.itemRunId);
-      eq([a.executor_kind, a.executor_id, a.outcome, a.failure_code], ['browser', 'browser-tab-1', 'failed', 'EXAM_BANK_INCOMPLETE'], 'intento');
+      eq([a.executor_kind, a.executor_id, a.outcome, a.failure_code, a.reported_error_code], ['browser', 'browser-tab-1', 'failed', 'EXAM_BANK_INCOMPLETE', 'EXAM_BANK_INCOMPLETE'], 'intento');
       const run = await R.runs.getRun(relSeq.C.cid, OWNER, 1, relSeq.C.runId);
       const dto = run.items.find((i) => i.itemKey === item.itemKey);
       eq([dto.recovery.source, dto.recovery.class, dto.recovery.code, dto.recovery.strategy, dto.attemptCount, dto.maxAttempts],
@@ -472,6 +473,28 @@ async function dbChecks() {
       eq(run2.items.find((i) => i.itemKey === item.itemKey).cost.actual, '0.42', 'actual del ledger');
       const [vc] = await R.ds.query(`select amount::text as amount, events from public.generation_item_attempt_costs where item_run_id = $1 and attempt_no = 1`, [item.itemRunId]);
       eq([Number(vc.amount), vc.events], [0.42, 1], 'vista de costo por intento');
+    });
+
+    await check('DB C1: un errorCode del navegador que intenta BAJAR la clase o falsear el desenlace se registra como reportado y se ignora', async () => {
+      const types = ['content', 'scorm', 'exam', 'course_plan', 'course_intro', 'module_intro', 'experience', 'video_interactions', 'activity', 'final_exam'];
+      const spoofs = [
+        ['❌ Sin disponibilidad de generación. Contacta a soporte de Cursia.', 'lease_expired', 'D', 'llm_credit_exhausted'],
+        ['contenido vacío tras generación', 'worker_draining', 'B', 'content_empty'],
+        ['kaboom nunca visto', 'llm_transient', 'D', 'unclassified_error'],
+      ];
+      let lastId = null;
+      for (const [msg, code, cls, effective] of spoofs) {
+        if (lastId) await R.ds.query(`update public.generation_item_runs set status = 'retrying', next_retry_at = now() - interval '1 second', max_attempts = attempt_count + 2 where id = $1`, [lastId]);
+        const item = await R.sched.claimNextItem({ runId: relSeq.C.runId, executorId: 'browser-tab-2', ownerId: OWNER, leaseSeconds: 120, types });
+        lastId = item && item.itemRunId;
+        assert(item, 'claim ' + code);
+        eq(await R.sched.failItemDetailed(item.itemRunId, 'browser-tab-2', msg, true, OWNER, { errorCode: code }), { ok: true }, 'fail');
+        const row = await R.itemRow(relSeq.C.runId, item.itemKey);
+        eq([row.failure_class, row.failure_code], [cls, effective], `item (${code})`);
+        const rows = await attempts(item.itemRunId);
+        const last = rows[rows.length - 1];
+        eq([last.outcome, last.failure_class, last.failure_code, last.reported_error_code], ['failed', cls, effective, code], `intento (${code})`);
+      }
     });
 
     await check('DB auto-heal: la reapertura automática es `reopened` actor auto_heal y suma recovery_round (el healer decide igual que siempre)', async () => {

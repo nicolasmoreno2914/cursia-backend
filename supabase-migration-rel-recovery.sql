@@ -20,7 +20,8 @@
 -- Nada del código lee estas columnas para DECIDIR (R1/R2 solo registran y exponen); el código
 -- tolera su ausencia (sonda de esquema en src/modules/reliability/attempt-log.ts).
 --
--- Rollback (solo si se quisiera deshacer; el código tolera la ausencia):
+-- Rollback (solo si se quisiera deshacer; el código tolera la ausencia — tras el rollback, `pm2 reload`
+-- de la API y los workers: la sonda de esquema positiva se cachea hasta 5 min):
 --   drop view if exists public.generation_item_attempt_costs;
 --   drop table if exists public.generation_item_attempts;
 --   alter table public.generation_item_runs
@@ -94,6 +95,8 @@ create table if not exists public.generation_item_attempts (
   http_status      integer,
   provider         text,
   provider_request_id text,
+  -- C1: errorCode que reportó el ejecutor (NO de confianza; la clase efectiva es failure_class).
+  reported_error_code text check (reported_error_code is null or char_length(reported_error_code) between 1 and 64),
   strategy_applied text,
   next_retry_at    timestamptz,
   recovery_round   integer not null default 0,
@@ -102,6 +105,9 @@ create table if not exists public.generation_item_attempts (
   -- abierto ⇔ sin desenlace; cerrado ⇔ con desenlace y fin.
   constraint gia_open_closed check ((finished_at is null) = (outcome is null))
 );
+
+-- Fix round 1 (C1): idempotente también sobre una tabla creada por la versión anterior de esta migración.
+alter table public.generation_item_attempts add column if not exists reported_error_code text;
 
 create index if not exists idx_gia_job_item_attempt
   on public.generation_item_attempts (job_id, item_key, generation, attempt_no);
@@ -137,14 +143,21 @@ do $$ begin
   if to_regclass('public.generation_cost_events') is not null then
     execute $v$
       create or replace view public.generation_item_attempt_costs with (security_invoker = true) as
+      -- M3: un intento devuelto (refundAttempt, cuota de YouTube) reutiliza su attempt_no; solo la PRIMERA
+      -- fila de cada (item_run_id, attempt_no) suma los eventos del ledger (nunca se cuenta dos veces).
+      with firsts as (
+        select distinct on (a.item_run_id, a.attempt_no) a.*
+          from public.generation_item_attempts a
+         where a.outcome is distinct from 'reopened'
+         order by a.item_run_id, a.attempt_no, a.started_at, a.id
+      )
       select a.id as attempt_id, a.item_run_id, a.job_id, a.item_key, a.generation, a.attempt_no,
              coalesce(sum(e.amount), 0) as amount,
              coalesce(sum(e.amount) filter (where e.measurement_status = 'pending' and e.event_kind = 'CHARGE'), 0) as pending_amount,
              count(e.id)::int as events
-        from public.generation_item_attempts a
+        from firsts a
         left join public.generation_cost_events e
           on e.item_run_id = a.item_run_id and e.attempt = a.attempt_no
-       where a.outcome is distinct from 'reopened'
        group by a.id, a.item_run_id, a.job_id, a.item_key, a.generation, a.attempt_no
     $v$;
   else

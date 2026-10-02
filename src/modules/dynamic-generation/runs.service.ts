@@ -135,7 +135,7 @@ import {
   sweepRunExpiredLeases,
   takeCompletedRunsInTx,
 } from './item-transitions';
-import { adminActor, recordItemReopened, recordItemsAbandoned } from '../reliability/attempt-log';
+import { AttemptActor, adminActor, recordItemReopened, recordItemsAbandoned } from '../reliability/attempt-log';
 import { ItemCostView, ItemRecoveryView, loadItemCosts, recoveryViewOf } from './item-recovery-view';
 
 export type ItemRunStatus = 'pending' | 'running' | 'retrying' | 'completed' | 'failed' | 'blocked' | 'cancelled';
@@ -2554,7 +2554,11 @@ export class RunsService {
           costKind: paidCascade.costKind,
         });
       }
-      return this.applyRegeneration(qr, plan, { job: locked, manifest, itemKey, mItem, ownerId, costKind });
+      return this.applyRegeneration(qr, plan, {
+        job: locked, manifest, itemKey, mItem, ownerId, costKind,
+        // REL R2 (M4): la generación nueva queda en el log de intentos como reapertura (dueño o admin).
+        attemptActor: isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : 'owner',
+      });
     });
 
     const [row] = await this.dataSource.query(`select * from public.generation_item_runs where id = $1`, [outcome.itemRunId]);
@@ -2727,7 +2731,7 @@ export class RunsService {
   private async applyRegeneration(
     qr: QueryRunner,
     plan: RegenerationPlan,
-    a: { job: any; manifest: ManifestDto; itemKey: string; mItem: { type: string }; ownerId: string; costKind: RegenerationCostKind },
+    a: { job: any; manifest: ManifestDto; itemKey: string; mItem: { type: string }; ownerId: string; costKind: RegenerationCostKind; attemptActor?: AttemptActor },
   ): Promise<{ kind: 'created'; itemRunId: string; previousItemRunId: string; previousGeneration: number; affected: RegenerationAffectedItem[] }> {
     const { job, manifest, itemKey, ownerId, costKind } = a;
     const latest = plan.latest;
@@ -2744,6 +2748,10 @@ export class RunsService {
           prev.module_id, prev.chapter_id, prev.depends_on ?? [], itemIdempotencyKey(manifest.id, key, generation),
           JSON.stringify({ regeneration })],
       );
+      await recordItemReopened(qr, row.id, {
+        actor: a.attemptActor ?? 'owner',
+        strategy: String(regeneration.reason).startsWith('cascade_from_') ? 'regenerate_cascade' : 'regenerate',
+      });
       // Fix wave M4 (tabla de Fase 8, fila REGENERATE): la salida de la
       // generación anterior pasa a stale con motivo — solo status + metadata
       // (el primer staleReason se conserva), nunca rutas ni filas.

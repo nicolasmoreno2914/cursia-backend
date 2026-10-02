@@ -32,6 +32,8 @@ interface Queryable {
 // ─── Sonda de esquema ────────────────────────────────────────────────────────
 
 const NEGATIVE_TTL_MS = 60_000;
+/** M2: la sonda positiva también vence (un rollback documentado de la migración deja de romper transacciones en ≤ 5 min; igual: pm2 reload tras un rollback). */
+const POSITIVE_TTL_MS = 5 * 60_000;
 let schemaCache: { ready: boolean; at: number } | null = null;
 
 /** Solo tests: olvida la sonda. */
@@ -44,12 +46,15 @@ export function resetRelSchemaCache(): void {
  * information_schema), segura dentro de cualquier transacción.
  */
 export async function relSchemaReady(q: Queryable, now: number = Date.now()): Promise<boolean> {
-  if (schemaCache && (schemaCache.ready || now - schemaCache.at < NEGATIVE_TTL_MS)) return schemaCache.ready;
+  if (schemaCache && now - schemaCache.at < (schemaCache.ready ? POSITIVE_TTL_MS : NEGATIVE_TTL_MS)) return schemaCache.ready;
   const rows = await q.query(
     `select (to_regclass('public.generation_item_attempts') is not null
              and exists (select 1 from information_schema.columns
                           where table_schema = 'public' and table_name = 'generation_item_runs'
-                            and column_name = 'recovery_round')) as ready`,
+                            and column_name = 'recovery_round')
+             and exists (select 1 from information_schema.columns
+                          where table_schema = 'public' and table_name = 'generation_item_attempts'
+                            and column_name = 'reported_error_code')) as ready`,
   );
   const ready = !!(Array.isArray(rows) ? rows[0]?.ready : false);
   schemaCache = { ready, at: now };
@@ -180,6 +185,7 @@ export interface FailureTransition {
   verdict: FailureVerdict;
   /** Rondas automáticas que el sistema hará HOY (auto-heal / reintento seguro); 0 = ninguna. */
   maxRoundsToday: number;
+  /** Desenlace según la TRANSICIÓN (barrido → lease_expired, drain del worker → drained); default failed. */
   outcome?: AttemptOutcome;
 }
 
@@ -193,7 +199,9 @@ export async function recordItemFailure(qr: Queryable, t: FailureTransition): Pr
   const terminal = t.status === 'failed' || t.status === 'blocked';
   // attention_reason solo cuando el item quedó en manos de un humano (clase C/D terminal).
   const attention = terminal && (v.class === 'C' || v.class === 'D') ? (v.humanReason ?? 'unrecoverable') : null;
-  const outcome = t.outcome ?? outcomeForFailure(v.code);
+  // C1: el desenlace sale de la transición, nunca del código (que un ejecutor podría reportar).
+  const outcome = t.outcome ?? 'failed';
+  const reported = v.reportedCode ? String(v.reportedCode).slice(0, 64) : null;
   await qr.query(
     `update public.generation_item_runs
         set failure_class = $2, failure_code = $3, recovery_strategy = $4, recovery_max_rounds = $5,
@@ -204,22 +212,22 @@ export async function recordItemFailure(qr: Queryable, t: FailureTransition): Pr
   const closed = returningRows(await qr.query(
     `update public.generation_item_attempts a
         set finished_at = now(), outcome = $2, failure_class = $3, failure_code = $4, error_excerpt = $5,
-            http_status = $6, provider = $7, strategy_applied = $8,
+            http_status = $6, provider = $7, strategy_applied = $8, reported_error_code = $9,
             next_retry_at = (select g.next_retry_at from public.generation_item_runs g where g.id = a.item_run_id)
       where a.item_run_id = $1 and a.finished_at is null
       returning a.id`,
-    [t.itemRunId, outcome, v.class, v.code, redactErrorExcerpt(t.error), v.httpStatus ?? null, v.provider ?? null, v.strategy],
+    [t.itemRunId, outcome, v.class, v.code, redactErrorExcerpt(t.error), v.httpStatus ?? null, v.provider ?? null, v.strategy, reported],
   ));
   if (closed.length > 0) return;
   await qr.query(
     `insert into public.generation_item_attempts
        (item_run_id, job_id, course_id, item_key, generation, attempt_no, executor_kind, executor_id, worker_version,
         started_at, finished_at, outcome, failure_class, failure_code, error_excerpt, http_status, provider,
-        strategy_applied, next_retry_at, recovery_round, actor)
+        strategy_applied, next_retry_at, recovery_round, actor, reported_error_code)
      select g.id, g.job_id, g.course_id, g.item_key, g.generation, g.attempt_count, null, null, $9,
-            coalesce(g.claimed_at, now()), now(), $2, $3, $4, $5, $6, $7, $8, g.next_retry_at, g.recovery_round, 'system'
+            coalesce(g.claimed_at, now()), now(), $2, $3, $4, $5, $6, $7, $8, g.next_retry_at, g.recovery_round, 'system', $10
        from public.generation_item_runs g where g.id = $1`,
-    [t.itemRunId, outcome, v.class, v.code, redactErrorExcerpt(t.error), v.httpStatus ?? null, v.provider ?? null, v.strategy, workerVersion()],
+    [t.itemRunId, outcome, v.class, v.code, redactErrorExcerpt(t.error), v.httpStatus ?? null, v.provider ?? null, v.strategy, workerVersion(), reported],
   );
 }
 

@@ -2,8 +2,8 @@ import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
 import { latestGenerationPredicate } from './item-generations';
 import { evaluateRunCompletion, loadCompletionInputs, terminalStatusFor } from './run-completion';
-import { FailureSource, classifyFailure, currentRecoveryOf } from '../reliability/failure-classifier';
-import { recordItemFailure } from '../reliability/attempt-log';
+import { FailureSource, classifyFailure, currentRecoveryOf, extractFailureCode } from '../reliability/failure-classifier';
+import { AttemptOutcome, outcomeForFailure, recordItemFailure } from '../reliability/attempt-log';
 import { autoHealMaxRoundsFor } from './auto-heal';
 import { SAFE_AUTO_RETRY_MAX_ROUNDS } from '../reliability/auto-heal-rules';
 
@@ -105,7 +105,7 @@ export async function applyItemFailure(
    * REL R1/R2: código explícito del emisor (FailItemDto.errorCode) y origen del fallo. Solo se
    * REGISTRAN (clase/código/estrategia en el item + log de intentos); no cambian la transición.
    */
-  meta?: { errorCode?: string | null; source?: FailureSource | null },
+  meta?: { errorCode?: string | null; source?: FailureSource | null; outcome?: AttemptOutcome },
 ): Promise<FailedTransition | null> {
   const retryAfter =
     typeof retryAfterSeconds === 'number' && Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
@@ -136,8 +136,12 @@ export async function applyItemFailure(
   const verdict = classifyFailure({
     error, errorCode: meta?.errorCode ?? null, source: meta?.source ?? null, itemType: row.type, outputSummary: row.output_summary ?? {},
   });
+  // C1: el desenlace sale de la transición (barrido → lease_expired explícito) o del MENSAJE de un emisor del
+  // servidor (drain del worker); un mensaje del navegador siempre es `failed`. Nunca del errorCode reportado.
+  const outcome: AttemptOutcome = meta?.outcome
+    ?? (meta?.source === 'browser_executor' ? 'failed' : outcomeForFailure(extractFailureCode(error)));
   await recordItemFailure(qr, {
-    itemRunId: row.id, status: row.status, error, verdict,
+    itemRunId: row.id, status: row.status, error, verdict, outcome,
     maxRoundsToday: maxAutomaticRoundsToday(error, row.type, row.output_summary ?? {}),
   });
   const blocked = row.status === 'failed' ? await blockDependents(qr, row.job_id, row.item_key) : [];
@@ -224,7 +228,7 @@ export async function sweepRunExpiredLeases(qr: QueryRunner, jobId: string): Pro
   for (const it of expired) {
     const used = grantsOf(it.output_summary);
     const free = used < LEASE_EXPIRY_FREE_GRANTS;
-    if (await applyItemFailure(qr, it.id, LEASE_EXPIRED_ERROR, true, null, false, free)) {
+    if (await applyItemFailure(qr, it.id, LEASE_EXPIRED_ERROR, true, null, false, free, { source: 'scheduler', outcome: 'lease_expired' })) {
       n++;
       if (free) {
         await qr.query(

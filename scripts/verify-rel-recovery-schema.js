@@ -131,7 +131,7 @@ const GIR_COLUMNS = {
 const GIA_COLUMNS = [
   'id', 'item_run_id', 'job_id', 'course_id', 'item_key', 'generation', 'attempt_no', 'executor_kind', 'executor_id', 'bundle_sha',
   'worker_version', 'started_at', 'heartbeat_at', 'finished_at', 'outcome', 'failure_class', 'failure_code', 'error_excerpt',
-  'http_status', 'provider', 'provider_request_id', 'strategy_applied', 'next_retry_at', 'recovery_round', 'actor', 'created_at',
+  'http_status', 'provider', 'provider_request_id', 'reported_error_code', 'strategy_applied', 'next_retry_at', 'recovery_round', 'actor', 'created_at',
 ];
 const GIA_INDEXES = ['idx_gia_job_item_attempt', 'idx_gia_failure_code', 'idx_gia_item_run', 'uq_gia_open_attempt'];
 const GIR_CONSTRAINTS = ['gir_failure_class_check', 'gir_failure_code_len', 'gir_attention_reason_check', 'gir_recovery_rounds_check'];
