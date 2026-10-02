@@ -517,8 +517,9 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       'ensure_env_exact DYNAMIC_MANIFEST_RULES_VERSION 3',
       // EV6 H5P v2 en staging: reglas de actividad 2, valor EXACTO.
       'ensure_env_exact DYNAMIC_ACTIVITY_TYPE_RULES 2',
-      // V542 fix round 1 (I3): default claro de cursos nuevos, desde un instante FIJO (solo si falta).
-      'ensure_env_default_if_absent PRESENTATION_LIGHT_DEFAULT_SINCE 2026-10-02T12:00:00Z',
+      // V542 fix round 2 (N2): default claro de cursos nuevos desde el instante del PRIMER deploy (calculado en el VPS,
+      // solo si falta → congelado después).
+      'ensure_env_default_if_absent PRESENTATION_LIGHT_DEFAULT_SINCE "$(date -u +%Y-%m-%dT%H:%M:%SZ)"',
       'ensure_env_flag_true DYNAMIC_COURSE_STRUCTURE',
     ]) assert(block.includes(needle), `falta: ${needle}`);
     assert(!/(ensure_\w+|printf[^\n]*>>\s*\.env)[^\n]*DYNAMIC_COHERENCE_LLM/.test(block), 'DYNAMIC_COHERENCE_LLM no debe escribirse');
@@ -530,7 +531,7 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       { label: '.env mínimo', env: `NODE_ENV=production\nSUPABASE_SERVICE_KEY=${SECRET}\n` },
       {
         label: '.env con valores manuales',
-        env: `NODE_ENV=production\nSUPABASE_SERVICE_KEY=${SECRET}\nDYNAMIC_V2_ALLOWED_OWNERS=11111111-2222-4333-8444-555555555555\nDYNAMIC_VIDEO_DELIVERY=videogen_direct\nDYNAMIC_MANIFEST_RULES_VERSION=1\n`,
+        env: `NODE_ENV=production\nSUPABASE_SERVICE_KEY=${SECRET}\nDYNAMIC_V2_ALLOWED_OWNERS=11111111-2222-4333-8444-555555555555\nDYNAMIC_VIDEO_DELIVERY=videogen_direct\nDYNAMIC_MANIFEST_RULES_VERSION=1\nPRESENTATION_LIGHT_DEFAULT_SINCE=2026-10-02T13:14:15Z\n`,
       },
     ];
     for (const sc of scenarios) {
@@ -559,12 +560,12 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
           eq(kv.DYNAMIC_VIDEO_DELIVERY, 'youtube', 'default DYNAMIC_VIDEO_DELIVERY');
           eq(kv.DYNAMIC_MANIFEST_RULES_VERSION, '3', 'DYNAMIC_MANIFEST_RULES_VERSION agregado en 3');
           eq(kv.DYNAMIC_ACTIVITY_TYPE_RULES, '2', 'DYNAMIC_ACTIVITY_TYPE_RULES agregado en 2');
-          eq(kv.PRESENTATION_LIGHT_DEFAULT_SINCE, '2026-10-02T12:00:00Z', 'PRESENTATION_LIGHT_DEFAULT_SINCE agregado (corte fijo)');
+          assert(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(kv.PRESENTATION_LIGHT_DEFAULT_SINCE) && Math.abs(Date.parse(kv.PRESENTATION_LIGHT_DEFAULT_SINCE) - Date.now()) < 600000, `PRESENTATION_LIGHT_DEFAULT_SINCE = instante del deploy (${kv.PRESENTATION_LIGHT_DEFAULT_SINCE})`);
         } else {
           eq(kv.DYNAMIC_VIDEO_DELIVERY, 'videogen_direct', 'valor manual respetado');
           eq(kv.DYNAMIC_MANIFEST_RULES_VERSION, '3', 'rv3: el valor anterior (1) se reemplaza por 3');
           eq(kv.DYNAMIC_ACTIVITY_TYPE_RULES, '2', 'H5P v2: reglas de actividad 2');
-          eq(kv.PRESENTATION_LIGHT_DEFAULT_SINCE, '2026-10-02T12:00:00Z', 'PRESENTATION_LIGHT_DEFAULT_SINCE presente');
+          eq(kv.PRESENTATION_LIGHT_DEFAULT_SINCE, '2026-10-02T13:14:15Z', 'PRESENTATION_LIGHT_DEFAULT_SINCE ya presente: no se mueve');
           assert(fs.existsSync(path.join(dir, '.env.bak')), 'backup del .env');
           eq(kv.DYNAMIC_V2_ALLOWED_OWNERS, `11111111-2222-4333-8444-555555555555,${OWNER}`, 'lista extendida (no reemplazada)');
         }
