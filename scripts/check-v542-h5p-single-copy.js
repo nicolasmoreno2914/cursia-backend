@@ -202,6 +202,15 @@ const BS_CFG = {
     z2.file(`${a.dir}/h5pactivity.xml`, xml.replace('url=@@PLUGINFILE@@/../package/0/', 'url=@@PLUGINFILE@@/'));
     const v2 = await V.validateMbzV3(await z2.generateAsync({ type: 'nodebuffer' }), b.r.expectations);
     assert(v2.issues.some((i) => i.code === 'H5P_FILES' && /no embebe el \.h5p del filearea package/.test(i.message)), JSON.stringify(v2.issues.slice(0, 4)));
+    // Fix round 1 (M7): un medio del intro (imagen, otro blob) NO es «otra copia del .h5p».
+    const other = /<file id="\d+">[\s\S]*?<\/file>/.exec(b.i.filesXml.replace(block, ''))[0];
+    const otherHash = /<contenthash>(\w+)<\/contenthash>/.exec(other)[1];
+    const img = block.replace(`<file id="${f.id}">`, '<file id="99998">').replace('<filearea>package</filearea>', '<filearea>intro</filearea>')
+      .replace(/<filename>[^<]+<\/filename>/, '<filename>imagen.png</filename>').replace(/<contenthash>\w+<\/contenthash>/, `<contenthash>${otherHash}</contenthash>`);
+    const z3 = await JSZip.loadAsync(b.r.mbz);
+    z3.file('files.xml', b.i.filesXml.replace(block, `${block}\n  ${img}`));
+    const v3 = await V.validateMbzV3(await z3.generateAsync({ type: 'nodebuffer' }), b.r.expectations);
+    assert(!v3.issues.some((i) => i.code === 'H5P_FILES'), `imagen del intro: ${JSON.stringify(v3.issues.slice(0, 4))}`);
   });
 
   // Curso sin H5P (SCORM, sin videos) y sin quizzes: dorado = staging b959a89 (builder 3.6.0).

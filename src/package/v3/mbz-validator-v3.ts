@@ -827,7 +827,9 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     }
     // V542 I2: UNA sola copia (el embed inline usa la de `package`); una segunda copia = dos contenidos
     // H5P sobre el mismo estado xAPI → «Data Reset» y progreso perdido.
-    if (mine.some((f) => f !== pkg)) add('H5P_FILES', a.idnumber, `más de una copia del .h5p (${mine.map((f) => f.filearea).join(', ')}): el estado se duplica`);
+    // Fix round 1 (M7): solo otra copia del PAQUETE (.h5p o el mismo blob) cuenta; un medio del intro (imagen) no.
+    const copies = mine.filter((f) => f !== pkg && (/\.h5p$/i.test(f.filename) || f.hash === pkg.hash));
+    if (copies.length) add('H5P_FILES', a.idnumber, `más de una copia del .h5p (${[pkg, ...copies].map((f) => f.filearea).join(', ')}): el estado se duplica`);
     if (!a.intro.includes(`url=@@PLUGINFILE@@/../package/0/${pkg.filename}&`)) add('H5P_FILES', a.idnumber, 'el intro no embebe el .h5p del filearea package');
     const blob = await bin(`files/${pkg.hash.slice(0, 2)}/${pkg.hash}`);
     if (!blob) continue;
