@@ -143,7 +143,9 @@ const H5P = {
       { kind: 'truefalse', question: 'Una fuga pequeña nunca afecta la presión del sistema.', correct: false, feedbackCorrect: 'Correcto.', feedbackWrong: 'Toda fuga afecta la presión.' },
     ],
   },
-  dragtext: { title: 'Completa el concepto', taskDescription: 'Arrastra cada término a su lugar.', text: 'La *bomba* genera el caudal, la *válvula* dirige el flujo, el *cilindro* entrega movimiento lineal y el *filtro* retiene partículas.' },
+  // #583 (I2): con el anuncio activityFeatures.dragTextDistractors el ejecutor pide el DragText para teléfono (texto
+  // corto, 4–5 huecos de ≤ 16 caracteres y EXACTAMENTE 2 distractores); sin el anuncio, distractors es opcional.
+  dragtext: { title: 'Completa el concepto', taskDescription: 'Arrastra cada término a su lugar.', text: 'La *bomba* genera el caudal, la *válvula* dirige el flujo, el *cilindro* entrega movimiento lineal y el *filtro* retiene partículas.', distractors: ['la manguera', 'el estanque'] },
   blanks: { title: 'Completa las frases', text: 'Escribe la palabra que falta.', questions: ['La bomba genera el *caudal*.', 'El manómetro mide la *presión*.', 'El filtro retiene *partículas*.', 'Antes de intervenir se aplica el *bloqueo*.'] },
 };
 const INVALID = {

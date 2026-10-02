@@ -153,7 +153,11 @@ async function main() {
   });
 
   await check('bankFloor / bankTarget / pedido / máximo por hoja', () => {
-    eq([1, 2, 3, 4, 5, 12].map(EB.bankFloor), [2, 3, 5, 6, 8, 18], 'floor = max(s+1, ceil(1.5 s))');
+    eq([1, 2, 3, 4, 5, 12].map(EB.bankFloor), [2, 3, 5, 6, 8, 18], 'floor histórico = max(s+1, ceil(1.5 s))');
+    // #583 (I3): reglas v4 → piso = 2·s (= bankTarget); v1–v3 conservan el histórico (bancos ya aceptados).
+    eq([1, 2, 3, 4, 5, 12].map((x) => EB.bankFloorFor(x, 4)), [2, 4, 6, 8, 10, 24], 'piso v4 = 2 s');
+    eq([1, 2, 3, 4, 5, 12].map((x) => EB.bankFloorFor(x, 3)), [2, 3, 5, 6, 8, 18], 'piso v3 = histórico');
+    eq(EB.EXAM_BANK_FULL_FLOOR_VERSION, 4, 'versión del piso 2·s');
     eq([1, 2, 5].map(EB.bankTarget), [2, 4, 10], 'target 2s');
     eq([1, 2, 5].map(EB.bankRequested), [3, 5, 11], 'pedido 2s+1');
     eq([1, 2, 5].map(EB.bankMax), [4, 6, 12], 'máximo 2s+2');
@@ -522,10 +526,10 @@ async function main() {
     assert(!atComplete.ok && atComplete.errors.some((e) => e.code === 'EXAM_BANK_EVIDENCE' && /NIEGA/.test(e.message)), JSON.stringify(atComplete.errors.slice(0, 3)));
     eq(EB.validateExamBank(fin, { scope: 'final', chapters: chs, chapterMd: md, evidenceRules: 'asAccepted' }).ok, true, 'asAccepted sin versión = v1');
     // Versión inválida → esquema.
-    eq(EB.validateExamBank({ ...fin, bankValidationVersion: 4 }, { scope: 'final', chapters: chs, chapterMd: md, evidenceRules: 'asAccepted' }).errors.some((e) => e.path === '$.bankValidationVersion'), true, 'versión 4 inválida');
-    // El claim anuncia la versión vigente (fix bank-guard-minors: 3).
+    eq(EB.validateExamBank({ ...fin, bankValidationVersion: 5 }, { scope: 'final', chapters: chs, chapterMd: md, evidenceRules: 'asAccepted' }).errors.some((e) => e.path === '$.bankValidationVersion'), true, 'versión 5 inválida');
+    // El claim anuncia la versión vigente (fix bank-guard-minors: 3; #583 I3: 4 = piso 2·slots).
     const S = loadDist('modules/course-shell/index.js');
-    eq(S.EXAM_BANK_VALIDATION_VERSION, 3, 'versión vigente');
+    eq(S.EXAM_BANK_VALIDATION_VERSION, 4, 'versión vigente');
   });
 
   await check('Fix bank-guard-minors: un banco aceptado con las reglas v2 sigue empaquetando con ellas aunque las v3 lo rechacen («Es un mito: [frag]», «≠ → =», «> omitido»); declarado v3 → EXAM_BANK_EVIDENCE; al completar (reglas vigentes v3) → rechazo', async () => {

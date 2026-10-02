@@ -285,6 +285,11 @@ export interface H5pBuiltContent {
    * Ausente en todos los builders de v1.
    */
   extraDependencies?: Array<{ machineName: string; majorVersion: number; minorVersion: number }>;
+  /**
+   * #583 (I4): archivos del contenido (ruta relativa a `content/` → bytes), p. ej. las imágenes de los finales del
+   * caso ramificado. Ausente en todos los demás builders (su .h5p no cambia).
+   */
+  contentFiles?: Record<string, Buffer>;
 }
 
 export const H5P_TITLE_MAX = 200;

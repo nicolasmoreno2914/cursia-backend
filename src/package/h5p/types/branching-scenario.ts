@@ -20,6 +20,7 @@ import { h5pSubContentId } from '../ids';
 import { applyH5pL10n } from '../l10n';
 import { h5pProfileVersionV2 } from '../profile';
 import { H5pBuiltContent, H5pInputError, Issues, checkItemKey, escapeText, isPlainObject } from './common';
+import { bsEndImage } from './bs-end-images';
 
 export const BRANCHING_SCENARIO_LIMITS = Object.freeze({
   titleMax: 120,
@@ -337,6 +338,7 @@ export function buildBranchingScenario(input: BranchingScenarioInput): H5pBuiltC
   const nodeOf = new Map(input.decisions.map((d, i) => [d.id, i + 1]));
   const endingOf = new Map(input.endings.map((e) => [e.id, e]));
   const sub = (i: number): string => h5pSubContentId(input.itemKey, i, h5pProfileVersionV2);
+  const contentFiles: Record<string, Buffer> = {};
   const content: Array<Record<string, unknown>> = [
     {
       type: {
@@ -355,7 +357,14 @@ export function buildBranchingScenario(input: BranchingScenarioInput): H5pBuiltC
       if (o.next.startsWith('end:')) {
         const e = endingOf.get(o.next.slice(4))!;
         const subtitle = (o.consequence ? P(o.consequence) : '') + P(e.text);
-        return { text: escapeText(o.text), nextContentId: -1, feedback: { title: P(e.title), subtitle, endScreenScore: scores[e.quality] } };
+        // #583 (I4): imagen propia por calidad (sin ella BS muestra su «pare» rojo en TODO final, también en el aceptable).
+        const img = bsEndImage(e.quality);
+        contentFiles[img.path] = img.bytes;
+        return {
+          text: escapeText(o.text),
+          nextContentId: -1,
+          feedback: { title: P(e.title), subtitle, image: { path: img.path, mime: img.mime, width: img.width, height: img.height }, endScreenScore: scores[e.quality] },
+        };
       }
       const target = nodeOf.get(o.next)!;
       return {
@@ -396,6 +405,7 @@ export function buildBranchingScenario(input: BranchingScenarioInput): H5pBuiltC
     content: params,
     subContentIds: content.map((c) => (c.type as { subContentId: string }).subContentId),
     maxScore: BRANCHING_SCENARIO_MAX_SCORE,
+    contentFiles,
   };
 }
 
@@ -425,6 +435,10 @@ export function assertBranchingScenarioContent(params: unknown): void {
           if (a.nextContentId === -1) {
             if (typeof a.feedback?.endScreenScore !== 'number') bad.push(`nodo ${i} alternativa ${j}: -1 sin endScreenScore`);
             else maxEnd = Math.max(maxEnd, a.feedback.endScreenScore);
+            // #583 (I4): todo final lleva SU imagen (sin ella, BS muestra el «pare» rojo por defecto).
+            if (typeof a.feedback?.image?.path !== 'string' || !/^images\/cursia-final-(?:optimal|acceptable|poor)\.png$/.test(a.feedback.image.path)) {
+              bad.push(`nodo ${i} alternativa ${j}: final sin imagen propia`);
+            }
           } else if (!Number.isInteger(a.nextContentId) || a.nextContentId <= i || a.nextContentId >= n) {
             bad.push(`nodo ${i} alternativa ${j}: nextContentId ${a.nextContentId} fuera de rango`);
           } else if (a.feedback && a.feedback.endScreenScore !== undefined) {

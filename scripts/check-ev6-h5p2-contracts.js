@@ -70,12 +70,18 @@ const GOLDEN = {
   // ningún blob cambia — scratchpad/r18/v542fix/mbzdiff.js contra staging b959a89). Dorados anteriores (staging):
   // h5p-final-light 46c6eb95…, scorm-nofinal-dark ab7c5f58…, h5p-nofinal-dark-mock-cleansafe 2c074a37…,
   // scorm-final-light 68738242…, h5p-ev5c-rules1 9c3ede4f….
+  // #583 QUAL (builder 3.10.0 → 3.11.0) cambia el .mbz a propósito, y SOLO en esto (diff semántico por idnumber
+  // contra origin/staging, scratchpad/r18/qual/golddiff/sem.js): reviewmaxmarks 69904 → 272 en cada quiz.xml; la frase
+  // del cierre; el label cv3:shell:libro_card se va y su tarjeta es el <intro> del recurso del Libro Guía
+  // (showdescription 1), con la renumeración de ids que eso trae; runtime VC 3 → 4 (esquina de la tabla sin «Aspecto»).
+  // Dorados anteriores (3.10.0): h5p-final-light 6ce9ebb3…, scorm-nofinal-dark b7aeda95…, h5p-nofinal-dark-mock-cleansafe
+  // ab93ce5b…, scorm-final-light 6619628e…, h5p-ev5c-rules1 c96fb4bb….
   mbz: {
-    'h5p-final-light': '6ce9ebb34eb35f5dcb0149d3db7e3f70e561a2ded63525e863608d53d094af3c',
-    'scorm-nofinal-dark': 'b7aeda95e93f96c31183a116df404267783c3b6eefad15d880aadcd4f08003f0',
-    'h5p-nofinal-dark-mock-cleansafe': 'ab93ce5bbf98a44df60468a2a3a0f7f00fca7d3e676ba7628104a54e4504d83c',
-    'scorm-final-light': '6619628e4579b98d70d5a3b1432b3bc1c314c88b1e88a601ab3601ef329570a4',
-    'h5p-ev5c-rules1': 'c96fb4bbc9945126fb3cbc4f73fc638e1105c1af19d98efe824cd34a1dbda402',
+    'h5p-final-light': '03bb4e8b8610cdc2b7b5a8523201dc99cea10edae98ce2e04729b3695771cddb',
+    'scorm-nofinal-dark': '9500797ec20439c80636c1d0565af8a09a475b584c5ddf359fc1a2b76b44b383',
+    'h5p-nofinal-dark-mock-cleansafe': '5329675d33baf25262432a653c3c6690321c85abcb4a50d12ab0cf57e33fa1db',
+    'scorm-final-light': '948e402dd5d5192b184801a419b78a798263cad37cbd834320daa2e25aae4562',
+    'h5p-ev5c-rules1': '4a1532f23d3f7b1047d73c28e10b0832dafbda04ace70b090dcb0efd84be54d1',
   },
 };
 
@@ -213,6 +219,13 @@ function checkValue(f, v, p, problems) {
     if (typeof v !== 'string') problems.push(`${p}: se esperaba texto`);
   } else if (f.type === 'video') {
     if (!Array.isArray(v) || !v.length) problems.push(`${p}: video vacío`);
+  } else if (f.type === 'image') {
+    // #583 (I4): campo image (H5PContentValidator::validateFile): {path relativo a content/, mime de imagen, width, height}.
+    const extra = Object.keys(v || {}).filter((k) => !['path', 'mime', 'width', 'height', 'copyright'].includes(k));
+    if (extra.length) problems.push(`${p}: claves extra ${extra}`);
+    if (typeof v?.path !== 'string' || /^[a-z]+:|\.\./i.test(v.path)) problems.push(`${p}: path inválido`);
+    if (!['image/png', 'image/jpeg', 'image/gif'].includes(v?.mime)) problems.push(`${p}: mime ${v?.mime} fuera de los de un campo image`);
+    if (!Number.isInteger(v?.width) || !Number.isInteger(v?.height)) problems.push(`${p}: width/height`);
   } else problems.push(`${p}: tipo ${f.type} no verificado`);
 }
 function lintAndConform(mainLib, content) {
@@ -406,16 +419,17 @@ function v2Doc(durationSec, videoItemKey = 'video:ch9') {
   // ══ 2. buildBundledH5p ═════════════════════════════════════════════════════
   const bsBuilt = h.buildBranchingScenario({ ...bsData(), itemKey: IK });
   const bundle = (built, libraryStore = store) =>
-    h.buildBundledH5p({ mainLibrary: built.mainLibrary, content: built.content, title: built.title, language: 'es', profile: P2, libraryStore });
+    h.buildBundledH5p({ mainLibrary: built.mainLibrary, content: built.content, title: built.title, language: 'es', profile: P2, libraryStore, ...(built.contentFiles ? { contentFiles: built.contentFiles } : {}) });
   const bsPkg = await bundle(bsBuilt);
   await check('buildBundledH5p BS: h5p.json + content.json + EXACTAMENTE las 19 carpetas delta con todos sus archivos; deps = runtime v2', async () => {
     const { z, names } = await zipNames(bsPkg);
     const tops = [...new Set(names.filter((n) => n !== 'h5p.json' && !n.startsWith('content/')).map((n) => n.split('/')[0]))].sort();
     eq(tops, BS_DELTA, 'carpetas');
-    eq(names.filter((n) => n === 'h5p.json' || n.startsWith('content/')), ['content/content.json', 'h5p.json'], 'contenido');
+    // #583 (I4): + la imagen de cada final (óptimo / aceptable / malo) en content/images/.
+    eq(names.filter((n) => n === 'h5p.json' || n.startsWith('content/')), ['content/content.json', 'content/images/cursia-final-acceptable.png', 'content/images/cursia-final-optimal.png', 'content/images/cursia-final-poor.png', 'h5p.json'], 'contenido');
     const nLib = store.manifest.libraries.reduce((a, l) => a + l.files.length, 0);
     // EV6 H5P v2 (H2, m-8): + un LICENSE.txt (aviso MIT) por carpeta delta.
-    eq(names.length, nLib + 2 + BS_DELTA.length, 'cantidad de entradas');
+    eq(names.length, nLib + 2 + 3 + BS_DELTA.length, 'cantidad de entradas');
     for (const d of BS_DELTA) {
       const notice = await z.file(`${d}/LICENSE.txt`).async('string');
       const e = store.manifest.libraries.find((l) => l.dir === d);
@@ -434,7 +448,7 @@ function v2Doc(durationSec, videoItemKey = 'video:ch9') {
     const code =
       `require('reflect-metadata');const h=require(${JSON.stringify(path.join(distRoot, 'package/h5p/index.js'))});` +
       `const d=${JSON.stringify({ ...bsData(), itemKey: IK })};const b=h.buildBranchingScenario(d);` +
-      `h.buildBundledH5p({mainLibrary:b.mainLibrary,content:b.content,title:b.title,language:'es',profile:h.CURSIA_H5P_PROFILE_V2,libraryStore:h.openH5pLibraryStore(h.CURSIA_H5P_PROFILE_V2)})` +
+      `h.buildBundledH5p({mainLibrary:b.mainLibrary,content:b.content,title:b.title,language:'es',profile:h.CURSIA_H5P_PROFILE_V2,libraryStore:h.openH5pLibraryStore(h.CURSIA_H5P_PROFILE_V2),contentFiles:b.contentFiles})` +
       `.then(x=>process.stdout.write(require('crypto').createHash('sha256').update(x).digest('hex'))).catch(e=>{console.error(e);process.exit(1)})`;
     const r = spawnSync(process.execPath, ['-e', code], { cwd: ROOT, encoding: 'utf8', env: { ...process.env, TZ: 'Pacific/Auckland' } });
     assert(r.status === 0, r.stderr);

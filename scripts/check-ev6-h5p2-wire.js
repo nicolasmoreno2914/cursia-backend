@@ -60,12 +60,18 @@ const GOLDEN = {
   },
   // V542 + QUIZFB (builder 3.6.0 → 3.10.0: revisión del quiz D|I|C / notas O|C, retroalimentación global I|O|C con bandas «aprobaste / todavía no» + H5P de una sola copia) — los mismos dorados nuevos que
   // check-ev6-h5p2-contracts.js (diferencias contra staging verificadas archivo por archivo; ningún blob cambia).
+  // #583 QUAL (builder 3.10.0 → 3.11.0) cambia el .mbz a propósito, y SOLO en esto (diff semántico por idnumber
+  // contra origin/staging, scratchpad/r18/qual/golddiff/sem.js): reviewmaxmarks 69904 → 272 en cada quiz.xml; la frase
+  // del cierre; el label cv3:shell:libro_card se va y su tarjeta es el <intro> del recurso del Libro Guía
+  // (showdescription 1), con la renumeración de ids que eso trae; runtime VC 3 → 4 (esquina de la tabla sin «Aspecto»).
+  // Dorados anteriores (3.10.0): h5p-final-light 6ce9ebb3…, scorm-nofinal-dark b7aeda95…, h5p-nofinal-dark-mock-cleansafe
+  // ab93ce5b…, scorm-final-light 6619628e…, h5p-ev5c-rules1 c96fb4bb….
   mbz: {
-    'h5p-final-light': '6ce9ebb34eb35f5dcb0149d3db7e3f70e561a2ded63525e863608d53d094af3c',
-    'scorm-nofinal-dark': 'b7aeda95e93f96c31183a116df404267783c3b6eefad15d880aadcd4f08003f0',
-    'h5p-nofinal-dark-mock-cleansafe': 'ab93ce5bbf98a44df60468a2a3a0f7f00fca7d3e676ba7628104a54e4504d83c',
-    'scorm-final-light': '6619628e4579b98d70d5a3b1432b3bc1c314c88b1e88a601ab3601ef329570a4',
-    'h5p-ev5c-rules1': 'c96fb4bbc9945126fb3cbc4f73fc638e1105c1af19d98efe824cd34a1dbda402',
+    'h5p-final-light': '03bb4e8b8610cdc2b7b5a8523201dc99cea10edae98ce2e04729b3695771cddb',
+    'scorm-nofinal-dark': '9500797ec20439c80636c1d0565af8a09a475b584c5ddf359fc1a2b76b44b383',
+    'h5p-nofinal-dark-mock-cleansafe': '5329675d33baf25262432a653c3c6690321c85abcb4a50d12ab0cf57e33fa1db',
+    'scorm-final-light': '948e402dd5d5192b184801a419b78a798263cad37cbd834320daa2e25aae4562',
+    'h5p-ev5c-rules1': '4a1532f23d3f7b1047d73c28e10b0832dafbda04ace70b090dcb0efd84be54d1',
   },
 };
 /** Listas propias de rules 2 (CONGELADO: cambiar cualquiera = reglas 3). */
@@ -427,7 +433,7 @@ const SRC = (bp) => ({ courseId: 777, blueprintId: 1, blueprintNumber: 1, bluepr
     // Claim
     const svc = Object.create(SchedulerService.prototype);
     const manifest2 = { rulesVersion: 3, features: { activityTypeRules: 2, ivAdvanced: 1 }, modules: [], items: [] };
-    eq(await svc.buildClaimV3({}, { type: 'activity', chapter_id: chId }, bsItem, manifest2), { validatedArtifactType: 'dynamic_h5p_params_json', activityType: 'branchingscenario', activityTypeSource: 'manifest' }, 'claim BS');
+    eq(await svc.buildClaimV3({}, { type: 'activity', chapter_id: chId }, bsItem, manifest2), { validatedArtifactType: 'dynamic_h5p_params_json', activityType: 'branchingscenario', activityTypeSource: 'manifest', activityFeatures: { dragTextDistractors: true } }, 'claim BS');
     const writes = [];
     const qr = { async query(sql, params) { if (/update public\.generation_item_runs/.test(sql)) { writes.push(params); return []; } return [videoRow]; } };
     const claim = await svc.buildClaimV3(qr, { type: 'video_interactions', chapter_id: chId, id: 'run1', job_id: 'j', manifest_id: 1 }, viItem, manifest2);

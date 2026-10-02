@@ -160,7 +160,7 @@ export function resolveActivityTypeWithSource(
 export const H5P_ACTIVITY_DATA_FIELDS: Readonly<Record<H5pActivityType, readonly string[]>> = Object.freeze({
   questionset: ['title', 'questions'],
   singlechoiceset: ['title', 'questions'],
-  dragtext: ['title', 'taskDescription', 'text'],
+  dragtext: ['title', 'taskDescription', 'text', 'distractors'], // #583 (I2): distractors opcional
   blanks: ['title', 'text', 'questions'],
 });
 

@@ -117,7 +117,7 @@ import {
   experienceMovementWords,
   finalExamInfoLabel,
   finalExamNextLabel,
-  libroCardLabel,
+  libroResourceIntro,
   methodologyLabel,
   moduleIntroLabel,
   moduleNextLabel,
@@ -206,8 +206,14 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * 3.10.0 (QUIZFB, re-verificación #542 R1): retroalimentación GLOBAL del quiz visible al terminar el intento
  * (reviewoverallfeedback I|O|C, bandas «aprobaste» / «todavía no» con la nota mínima del perfil) y la línea de la
  * info del examen promete exactamente eso («verás si aprobaste; tu calificación queda en Calificaciones»).
+ * 3.11.0 (#583 QUAL): el caso ramificado lleva una imagen de final por calidad (óptimo verde, aceptable ámbar,
+ * malo rojo; antes el «pare» rojo por defecto en todo final); el DragText empaqueta sus `distractors`; la nota
+ * máxima por pregunta del quiz ya no se muestra durante el intento ni al terminarlo (reviewmaxmarks O|C, sin
+ * «Puntúa como 5,88»); la tarjeta del Libro Guía es la descripción del recurso (una sola entrada en la sección 1);
+ * el cierre ya no afirma que el estudiante completó el curso; pasos con mayúscula inicial y la esquina de la tabla
+ * de comparación sin «Aspecto» (renderer style 3, runtime 4).
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.10.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.11.0';
 
 // EV6 P2-B5: `examExplanationsAvailability` vive en course-shell/exam-explanations (lo usa también el validador).
 export { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';
@@ -616,6 +622,8 @@ async function buildActivityH5p(
       language: 'es',
       profile: CURSIA_H5P_PROFILE_V2,
       libraryStore: libraryStore(),
+      // #583 (I4): imágenes de los finales (óptimo verde / aceptable ámbar / malo rojo).
+      ...(bs.contentFiles ? { contentFiles: bs.contentFiles } : {}),
     });
     return { h5p, mainLibrary: bs.mainLibrary };
   } else {
@@ -1077,12 +1085,16 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     const name = '📘 Libro Guía';
     const a = W.newActivity('resource', 1, name, 'cv3:shell:libro');
     libroMid = a.mid;
+    // #583 (M5/M6, builder 3.11.0): la tarjeta del Libro Guía es la DESCRIPCIÓN del recurso (showdescription),
+    // no un label aparte: la sección 1 muestra una sola entrada del Libro Guía.
+    const libroIntro = libroResourceIntro(facts, theme, opts).html;
+    labelsHtml.push({ where: 'cv3:shell:libro#intro', html: libroIntro });
     const fid = W.addFile(a.ctx, 'mod_resource', 'content', 'libro_guia_completo.html', libroHtml, 'text/html');
     W.put(`${a.dir}/resource.xml`, `<?xml version="1.0" encoding="UTF-8"?>
 <activity id="${a.aid}" moduleid="${a.mid}" modulename="resource" contextid="${a.ctx}">
   <resource id="${a.aid}">
     <name>${xmlEsc(name)}</name>
-    <intro></intro>
+    <intro>${xmlEsc(libroIntro)}</intro>
     <introformat>1</introformat>
     <tobemigrated>0</tobemigrated>
     <legacyfiles>0</legacyfiles>
@@ -1095,13 +1107,12 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   </resource>
 </activity>`);
     // F1 (I3): en un curso sin nota el Libro Guía es el criterio de completion (por vista).
-    const libroModule = withIdnumber(moduleXml(a.mid, 'resource', 1, ts, MV.bv), a.idnumber);
+    const libroModule = applyXmlFields(withIdnumber(moduleXml(a.mid, 'resource', 1, ts, MV.bv), a.idnumber), { showdescription: '1' });
     W.put(`${a.dir}/module.xml`, resolved.withoutGrades ? applyXmlFields(libroModule, { completion: '2', completionview: '1' }) : libroModule);
     W.put(`${a.dir}/inforef.xml`, inforef([fid]));
     W.put(`${a.dir}/grades.xml`, gradesXml(a.aid));
     W.boilerplate(a.dir);
   }
-  addLabel(1, 'cv3:shell:libro_card', libroCardLabel(libroMid, facts, theme, opts));
   addLabel(1, 'cv3:shell:audiobook', audiobookLabel(facts, theme, opts), [
     { name: SHELL_AUDIOBOOK_FILE, data: audiobook.buffer, mime: 'audio/mp3' },
   ]);

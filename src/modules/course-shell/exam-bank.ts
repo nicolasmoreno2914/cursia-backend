@@ -17,8 +17,9 @@
  *      del Manifest), restos mayores de n_T · c_m / C en aritmética ENTERA
  *      (base = floor(n_T·c_m / C), resto = (n_T·c_m) mod C; el sobrante va a los restos
  *      mayores, empate → módulo anterior). Hojas con 0 slots omitidas.
- *    - `bankFloor(s) = max(s+1, ceil(1.5·s))`, `bankTarget(s) = 2s`, se piden 2s+1, máximo
- *      aceptado 2s+2 por hoja.
+ *    - `bankFloor(s) = max(s+1, ceil(1.5·s))` (piso histórico, reglas v1–v3), `bankTarget(s) = 2s`,
+ *      se piden 2s+1, máximo aceptado 2s+2 por hoja. #583 (I3): desde las reglas v4 el piso es
+ *      `bankFloorFor(s, 4) = 2s` (= objetivo): dos intentos seguidos quedan disjuntos por diseño.
  *
  * 2. Esquema (claves exactas: falta → MISSING_FIELD, sobra → UNKNOWN_FIELD; tipo/longitud/
  *    enum/regex → EXAM_BANK_SCHEMA). Longitud de texto = `s.trim().length` (unidades UTF-16).
@@ -158,8 +159,20 @@ export function finalExamPlan(modules: ReadonlyArray<{ moduleId: string; chapter
   return out;
 }
 
+/** Piso HISTÓRICO por hoja (reglas de validación v1–v3): el mínimo con que algún banco se aceptó. */
 export function bankFloor(slots: number): number {
   return Math.max(slots + 1, Math.ceil(1.5 * slots));
+}
+/**
+ * #583 (I3): piso por hoja según las reglas con que se valida el banco. Con BANKOPT el piso de 1,5·s
+ * dejaba hojas de selección múltiple en 8 preguntas para 5 slots y dos intentos seguidos del módulo 1
+ * compartían 6 de 17 preguntas (#542: 1 de 17). Desde las reglas v4 el piso es 2·s (= bankTarget): la
+ * holgura del pedido (bankAskCount) sigue encima. v1–v3 (bancos ya aceptados) conservan el piso histórico
+ * para que nunca dejen de empaquetarse.
+ */
+export const EXAM_BANK_FULL_FLOOR_VERSION = 4;
+export function bankFloorFor(slots: number, validationVersion: number): number {
+  return validationVersion >= EXAM_BANK_FULL_FLOOR_VERSION ? bankTarget(slots) : bankFloor(slots);
 }
 export function bankTarget(slots: number): number {
   return 2 * slots;
@@ -502,14 +515,15 @@ export type ExamBankQuestion = ExamMultichoiceQuestion | ExamTrueFalseQuestion |
  *  2 = además la oración debe AFIRMAR la evidencia (examEvidenceSupport, guardia v2);
  *  3 = guardia v3 (fix bank-guard-minors): corte «:»/«;» solo para negaciones de cópula, condiciones y
  *      desmentidos en todo el prefijo, «si» interrogativo con verbos completos, tramos dentro de una pregunta
- *      citada, y normalización de la evidencia que conserva «≠ ≮ ≯ ≤ ≥…» y «>» en medio del texto.
+ *      citada, y normalización de la evidencia que conserva «≠ ≮ ≯ ≤ ≥…» y «>» en medio del texto;
+ *  4 = #583 (I3): piso por hoja = 2·slots (bankFloorFor); la evidencia sigue con la guardia v3.
  * completeItem valida SIEMPRE con las reglas vigentes; el empaque re-valida con las de la versión del banco
  * (un banco ya aceptado nunca deja de empaquetarse porque las reglas se endurecieron).
  */
-export const EXAM_BANK_VALIDATION_VERSION = 3;
+export const EXAM_BANK_VALIDATION_VERSION = 4;
 export interface ExamBankV1 {
   bankVersion: 1;
-  bankValidationVersion?: 1 | 2 | 3;
+  bankValidationVersion?: 1 | 2 | 3 | 4;
   scope: ExamBankScope;
   moduleId: string | null;
   plan: ExamPlanLeaf[];
@@ -534,6 +548,7 @@ export interface ExamBankValidationContext {
   /**
    * Reglas de evidencia (fix round 4, R2): 'current' (default, completeItem) = las vigentes
    * (EXAM_BANK_VALIDATION_VERSION); 'asAccepted' (empaque) = las de `doc.bankValidationVersion` (ausente = 1).
+   * #583: el piso por hoja también sigue esta versión (v4 = 2·slots; v1–v3 = piso histórico).
    */
   evidenceRules?: 'current' | 'asAccepted';
 }
@@ -673,6 +688,9 @@ export function validateExamBank(doc: unknown, ctx: ExamBankValidationContext): 
   }
   const slotCount = plan ? planSlotCount(plan) : 0;
   const done = (bankSize: number): ExamBankValidationResult => ({ ok: E.list.length === 0, errors: E.list, slotCount, bankSize, plan });
+  // Reglas con que se valida (fix round 4, R2; #583: también el piso por hoja).
+  const acceptedUnder =
+    ctx.evidenceRules === 'asAccepted' ? (isObj(doc) && Number.isInteger(doc.bankValidationVersion) ? (doc.bankValidationVersion as number) : 1) : EXAM_BANK_VALIDATION_VERSION;
 
   if (!isObj(doc)) {
     E.push('$', 'EXAM_BANK_SCHEMA', 'el banco debe ser un objeto JSON');
@@ -805,7 +823,7 @@ export function validateExamBank(doc: unknown, ctx: ExamBankValidationContext): 
       const k = leafKey(owner, leaf.type);
       planned.add(k);
       const n = byLeaf.get(k)?.length ?? 0;
-      const min = bankFloor(leaf.slots);
+      const min = bankFloorFor(leaf.slots, acceptedUnder);
       const max = bankMax(leaf.slots);
       if (n < min || n > max) {
         E.push('$.questions', 'EXAM_BANK_LEAF_COUNT', `${owner} × ${leaf.type}: ${n} preguntas, se esperaban ${min}–${max} (slots ${leaf.slots})`);
@@ -894,7 +912,6 @@ export function validateExamBank(doc: unknown, ctx: ExamBankValidationContext): 
   // ── Evidencia en el capítulo (si hay Markdown) ──
   if (ctx.chapterMd) {
     const idx = new Map<string, ExamEvidenceIndex>();
-    const acceptedUnder = ctx.evidenceRules === 'asAccepted' ? (isObj(doc) && Number.isInteger(doc.bankValidationVersion) ? doc.bankValidationVersion : 1) : EXAM_BANK_VALIDATION_VERSION;
     const affirmed = acceptedUnder >= 2;
     const rules: ExamEvidenceRules = acceptedUnder >= 3 ? 3 : 2;
     for (const { q, i } of valid) {

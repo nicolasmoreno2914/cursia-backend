@@ -181,7 +181,8 @@ function expectedSequence(distRoot, input) {
   const hasReview = (chapterId) => reviewOn && !!H5P.buildDialogCardsFromExperience({ chapterTitle: 'x', experience: input.contents.experiences.get(chapterId) });
   const seq = [];
   seq.push([0, ['cv3:shell:forum', 'cv3:shell:welcome', 'cv3:shell:audio_welcome', 'cv3:shell:competencies', 'cv3:shell:methodology', 'cv3:shell:start']]);
-  seq.push([1, ['cv3:shell:route', 'cv3:shell:libro', 'cv3:shell:libro_card', 'cv3:shell:audiobook', 'cv3:shell:route_start']]);
+  // #583 (builder 3.11.0): la tarjeta del Libro Guía es la descripción del recurso (sin label cv3:shell:libro_card).
+  seq.push([1, ['cv3:shell:route', 'cv3:shell:libro', 'cv3:shell:audiobook', 'cv3:shell:route_start']]);
   let n = 2;
   // EV6 P2-B4: sin certificado (= sin evaluación final) la nota oculta para docentes de «Respuestas
   // explicadas» abre la PRIMERA sección de evaluación; cada quiz lleva su página justo después.
