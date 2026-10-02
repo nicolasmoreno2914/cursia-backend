@@ -89,6 +89,11 @@ export interface MbzV3ValidationExpectations {
   resolved: ResolvedAssessment;
   /** EV6 P2-B5: plan por hoja de cada quiz con banco (del builder). Sin él, QUIZ_RANDOM exige solo coherencia interna. */
   examBankPlans?: ExamBankPlans;
+  /**
+   * V542 fix round 2 (N1): prosa LLM de las intros (del builder). Sus cifras de CONTENIDO se admiten en los labels
+   * del shell; todo lo demás (plantilla) es estricto. Sin ella, todo el label es estricto.
+   */
+  shellProse?: string[];
 }
 
 export interface MbzV3ValidationResult {
@@ -746,7 +751,8 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     }
     const deterministic = /^cv3:(shell:|module_intro:|exam_info:|module_next:|final_exam_info|final_exam_next)/.test(a.idnumber) || /^cv3:ch:[^:]+:presentation$/.test(a.idnumber);
     if (deterministic) {
-      const bad = lintShellNumbers(`${a.name} ${txt}`, facts);
+      const prose = /^cv3:(shell:(welcome|competencies|methodology|closing)$|module_intro:)/.test(a.idnumber) ? (exp.shellProse ?? []) : [];
+      const bad = lintShellNumbers(`${a.name} ${txt}`, facts, prose);
       if (bad.length) add('NUMBER_NOT_FROM_FACTS', a.idnumber, `cifras fuera de facts: ${bad.join(', ')}`);
     }
     const chm = /^cv3:ch:([^:]+):/.exec(a.idnumber);

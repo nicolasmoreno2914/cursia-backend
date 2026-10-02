@@ -493,16 +493,39 @@ export function factsNumberSet(facts: CourseFacts): Set<number> {
 }
 
 /**
- * Cifras del texto que CUENTAN la estructura o la duración del curso y NO están en factsNumberSet
- * (vacío = pasa). Los títulos del Blueprint (curso, módulos, capítulos) se quitan antes: son nombres
- * que puso la institución ("ISO 9001"), no cifras que afirme el shell.
- * V542 fix round 1 (C1): solo la clase `courseCountNumbers` (la misma que rechaza el lint de la prosa
- * de las intros); las cifras de contenido («Ley 1480 de 2011», «15 días hábiles») no son afirmaciones
- * sobre el curso y se muestran.
+ * Números del texto que NO están permitidos (vacío = pasa). Los títulos del Blueprint (curso, módulos,
+ * capítulos) se quitan antes: son nombres que puso la institución ("ISO 9001"), no cifras que afirme el shell.
+ *
+ * V542 fix round 2 (N1): el texto de PLANTILLA es estricto como siempre — toda cifra (duraciones, preguntas,
+ * intentos, nota mínima, numeración, marcas de tiempo) debe estar en factsNumberSet. La regla angosta de
+ * «cifras de contenido permitidas» aplica SOLO a la prosa que escribió el LLM (`prose`: textos de las intros
+ * que el label muestra): sus cifras de contenido («Ley 1480 de 2011», «15 días hábiles») se admiten; las que
+ * cuentan el curso (`courseCountNumbers`, la misma clase que rechaza el lint de la intro) deben estar en facts.
+ * Sin `prose`, todo el label es estricto.
  */
-export function lintShellNumbers(text: string, facts: CourseFacts): number[] {
+export function lintShellNumbers(text: string, facts: CourseFacts, prose: readonly string[] = []): number[] {
   const allowed = factsNumberSet(facts);
-  return courseCountNumbers(stripStructureTitles(text, facts)).filter((n) => !allowed.has(n));
+  const contentNumbers = new Set<number>();
+  const bad: number[] = [];
+  for (const p of prose) {
+    const counted = new Set(courseCountNumbers(p));
+    for (const n of counted) if (!allowed.has(n)) bad.push(n);
+    for (const n of numbersInText(stripStructureTitles(p, facts))) if (!counted.has(n)) contentNumbers.add(n);
+  }
+  for (const n of numbersInText(stripStructureTitles(text, facts))) {
+    if (!allowed.has(n) && !contentNumbers.has(n)) bad.push(n);
+  }
+  return [...new Set(bad)];
+}
+
+/** V542 fix round 2 (N1): textos de prosa LLM de una intro que el shell muestra (todo salvo la bibliografía). */
+export function introProseTexts(intro: unknown): string[] {
+  const i = (intro && typeof intro === 'object' ? intro : {}) as Record<string, unknown>;
+  const out: string[] = [];
+  for (const k of ['welcome', 'methodology_note', 'closing', 'presentation']) if (typeof i[k] === 'string') out.push(i[k] as string);
+  for (const k of ['competencies', 'outcomes']) if (Array.isArray(i[k])) for (const x of i[k] as unknown[]) if (typeof x === 'string') out.push(x);
+  if (Array.isArray(i.journey)) for (const j of i.journey as any[]) if (j && typeof j.line === 'string') out.push(j.line);
+  return out;
 }
 
 /**

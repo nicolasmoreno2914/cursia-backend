@@ -1061,15 +1061,57 @@ const MATRIX = [
     await rejects(B.buildDynamicMbzV3(i2), /DIGIT_IN_TEXT|COURSE_INTRO/, 'builder: 6 semanas');
     const facts = r.expectations.facts;
     let threw = null;
-    try { SHELL.assertShellNumbers({ name: 'Qué aprenderás', html: '<div><p><span class="nolink">Completarás todo en 997 semanas. Ley 1480 de 2011.</span></p></div>' }, facts); } catch (e) { threw = e; }
+    try { SHELL.assertShellNumbers({ name: 'Qué aprenderás', html: '<div><p><span class="nolink">Completarás todo en 997 semanas. Ley 1480 de 2011.</span></p></div>' }, facts, r.expectations.shellProse); } catch (e) { threw = e; }
     assert(threw && /SHELL_NUMBER_NOT_FROM_FACTS: .*997/.test(threw.message) && !/1480|2011/.test(threw.message.split(':').pop()), `gate: ${threw && threw.message}`);
-    SHELL.assertShellNumbers({ name: 'Qué aprenderás', html: '<div><p><span class="nolink">Ley 1480 de 2011, 15 días hábiles, ISO 9001.</span></p></div>' }, facts);
+    SHELL.assertShellNumbers({ name: 'Qué aprenderás', html: '<div><p><span class="nolink">Ley 1480 de 2011, 15 días hábiles.</span></p></div>' }, facts, r.expectations.shellProse);
+    // Fix round 2 (N1): sin la prosa (plantilla pura), las mismas cifras NO salen de facts.
+    let strict = null;
+    try { SHELL.assertShellNumbers({ name: 'Plantilla', html: '<div><p><span class="nolink">Ley 1480 de 2011.</span></p></div>' }, facts); } catch (e) { strict = e; }
+    assert(strict && /1480/.test(strict.message), 'plantilla estricta');
     const { z: zz, acts } = await actDirs(r.mbz);
     const comp = acts.find((a) => a.idnumber === 'cv3:shell:competencies') || acts.find((a) => /^cv3:shell:/.test(a.idnumber));
     const x = await zz.file(`${comp.dir}/label.xml`).async('string');
     zz.file(`${comp.dir}/label.xml`, x.replace('Ley 1480 de 2011', 'Ley 1480 de 2011 en 997 semanas'));
     const v2 = await V.validateMbzV3(await zz.generateAsync({ type: 'nodebuffer' }), r.expectations);
     assert(v2.issues.some((e) => e.code === 'NUMBER_NOT_FROM_FACTS' && /997/.test(e.message) && !/1480/.test(e.message)), `validador: ${JSON.stringify(v2.issues.slice(0, 4))}`);
+  });
+
+  // V542 fix round 2 (N1): el texto de PLANTILLA de los labels del shell sigue estricto (toda cifra ∈ facts); solo
+  // la prosa LLM de las intros admite cifras de contenido.
+  await check('V542 N1: plantilla estricta — «Preguntas: 997», «Duración estimada: 997 h», «997 min», «Intentos: 997», «Nota mínima para aprobar: 997 de 100» → NUMBER_NOT_FROM_FACTS; «Ley 1480 de 2011» en la prosa pasa', async () => {
+    const LAW = 'Aplicar la Ley 1480 de 2011 y responder dentro de los 15 días hábiles que fija la norma.';
+    const i = PF.packagingInput(distRoot, MATRIX[0]);
+    i.contents.courseIntro = { ...i.contents.courseIntro, competencies: [LAW, ...i.contents.courseIntro.competencies.slice(1)] };
+    const r = await B.buildDynamicMbzV3(i);
+    assert(r.expectations.shellProse.includes(LAW), 'expectations.shellProse lleva la prosa de la intro');
+    eq((await V.validateMbzV3(r.mbz, r.expectations)).issues, [], 'base con la Ley en la prosa: limpio');
+    const { acts } = await actDirs(r.mbz);
+    const dirOf = (re) => acts.find((a) => re.test(a.idnumber)).dir;
+    const examInfo = dirOf(/^cv3:exam_info:/);
+    const cases = [
+      ['Preguntas: 997', examInfo, (x) => x.replace(/(Preguntas:&lt;\/span&gt;&lt;\/strong&gt;&lt;span class=&quot;nolink&quot;&gt; )\d+/, '$1997')],
+      ['Intentos: 997', examInfo, (x) => x.replace(/(Intentos:&lt;\/span&gt;&lt;\/strong&gt;&lt;span class=&quot;nolink&quot;&gt; )\d+/, '$1997')],
+      ['Nota mínima para aprobar: 997 de 100', examInfo, (x) => x.replace(/(Nota mínima para aprobar:&lt;\/span&gt;&lt;\/strong&gt;&lt;span class=&quot;nolink&quot;&gt; )\d+/, '$1997')],
+      ['997 min (audiolibro)', dirOf(/^cv3:shell:audiobook$/), (x) => x.replace(/Duración total: \d+ min/, 'Duración total: 997 min')],
+      // En un label CON prosa LLM (bienvenida): la cifra de plantilla sigue estricta.
+      ['Duración estimada: 997 h (bienvenida)', dirOf(/^cv3:shell:welcome$/), (x) => x.replace('&lt;/span&gt;', ' Duración estimada: 997 h&lt;/span&gt;')],
+      ['Ley 997 en la competencia: la prosa mutada ya no es la del builder', dirOf(/^cv3:shell:competencies$/), (x) => x.replace('Ley 1480 de 2011', 'Ley 1480 de 2011 en 997 min')],
+    ];
+    for (const [what, dir, fn] of cases) {
+      const v = await V.validateMbzV3(await mutate(r.mbz, { [`${dir}/label.xml`]: fn }), r.expectations);
+      assert(v.issues.some((e) => e.code === 'NUMBER_NOT_FROM_FACTS' && /997/.test(e.message) && !/1480|2011/.test(e.message)), `${what}: ${JSON.stringify(v.issues.slice(0, 3))}`);
+    }
+    // Render gate: la misma regla.
+    const facts = r.expectations.facts;
+    for (const t of ['Preguntas: 997', 'Duración estimada: 997 h', 'Duración: 997 min 58 s', 'Intentos: 997', 'Nota mínima para aprobar: 997 de 100', 'Lección 997']) {
+      let threw = null;
+      try { SHELL.assertShellNumbers({ name: 'x', html: `<div><p><span class="nolink">${t}</span></p></div>` }, facts, r.expectations.shellProse); } catch (e) { threw = e; }
+      assert(threw && /997/.test(threw.message), `gate: ${t}`);
+    }
+    // Intro lint: abreviaturas de duración.
+    for (const t of ['Completa el curso en 997 h de estudio.', 'Dedica 30 min por día.', 'Son 40 hs de práctica.', 'Unas 2 hrs bastan.']) {
+      assert(SHELL.lintShellProse(t).some((h) => h.code === 'DIGIT_IN_TEXT'), `lint: ${t}`);
+    }
   });
 
   await check('builder falla fuerte: cifra en un intro del LLM, duración del video ≠ documento, token inválido', async () => {

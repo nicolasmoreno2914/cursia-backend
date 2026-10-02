@@ -21,7 +21,7 @@ import { extractText, lintCleanSafe, renderComponent } from '../visual-component
 import { labelHtml, inlineHtml } from '../visual-components/text';
 import { formatDurationEs } from '../../package/audio';
 import type { AssessableType } from '../course-profiles/course-profiles';
-import { CourseFacts, ModuleFacts, lintShellNumbers } from './facts';
+import { CourseFacts, ModuleFacts, introProseTexts, lintShellNumbers } from './facts';
 import { CTA_BADGES, CTA_EXAM, ctaButton, ctaSection } from './cta';
 import {
   CourseIntroV3,
@@ -72,14 +72,15 @@ export const SHELL_AUDIOBOOK_FILE = 'audiolibro.mp3';
  * texto) debe estar en factsNumberSet. Si no → SHELL_NUMBER_NOT_FROM_FACTS
  * (el empaquetado falla fuerte; nunca se publica una cifra inventada).
  */
-export function assertShellNumbers(label: ShellLabel, facts: CourseFacts): void {
-  const bad = lintShellNumbers(`${label.name} ${extractText(label.html)}`, facts);
+export function assertShellNumbers(label: ShellLabel, facts: CourseFacts, prose: readonly string[] = []): void {
+  // V542 fix round 2 (N1): plantilla estricta; solo la prosa LLM del label admite cifras de contenido.
+  const bad = lintShellNumbers(`${label.name} ${extractText(label.html)}`, facts, prose);
   if (bad.length > 0) {
     throw new Error(`SHELL_NUMBER_NOT_FROM_FACTS: "${label.name}" muestra cifras que no salen de facts: ${bad.join(', ')}`);
   }
 }
 
-function out(name: string, html: string, facts: CourseFacts): ShellLabel {
+function out(name: string, html: string, facts: CourseFacts, prose: readonly string[] = []): ShellLabel {
   const lint = lintCleanSafe(html);
   if (!lint.ok) {
     shellFail(`${name}: no pasa CLEAN_SAFE: ${lint.errors.slice(0, 3).map((e) => `${e.code} ${e.message}`).join('; ')}`);
@@ -87,7 +88,7 @@ function out(name: string, html: string, facts: CourseFacts): ShellLabel {
   const unprotected = unprotectedText(html);
   if (unprotected.length > 0) shellFail(`${name}: texto sin protección nolink: ${JSON.stringify(unprotected.slice(0, 3))}`);
   const label = { name, html };
-  assertShellNumbers(label, facts);
+  assertShellNumbers(label, facts, prose);
   return label;
 }
 
@@ -140,7 +141,7 @@ export function welcomeLabel(
     const cs = toneSurf(h, 'alt');
     qa = box(h, eyebrow(h, QA_PREVIEW_NOTICE_TITLE, cs.s) + pHtml(h, labelHtml(QA_PREVIEW_NOTICE_TEXT), cs.s, { last: true }), cs, { cls: 'cvc-qa-preview' });
   }
-  return out('Bienvenida', root(h, 'shell-welcome', qa + hero + statRow(h, stats) + hours), facts);
+  return out('Bienvenida', root(h, 'shell-welcome', qa + hero + statRow(h, stats) + hours), facts, introProseTexts(intro));
 }
 
 // ─── S0.3 Audio de bienvenida ───────────────────────────────────────────────
@@ -166,7 +167,7 @@ export function competenciesLabel(facts: CourseFacts, courseIntro: CourseIntroV3
     theme,
     { uid: 'shell-competencies-list', level: lvl(h), countless: true },
   );
-  return out('Qué aprenderás', root(h, 'shell-competencies', comp), facts);
+  return out('Qué aprenderás', root(h, 'shell-competencies', comp), facts, introProseTexts(intro));
 }
 
 // ─── S0.5 Metodología (plantilla determinística) ────────────────────────────
@@ -217,7 +218,7 @@ export function methodologyLabel(facts: CourseFacts, courseIntro: CourseIntroV3,
     heading(h, 'h3', 'Cómo vas a aprender', s) +
     rows(h, items, { cls: 'cvc-cols2', ordered: true }) +
     paras(h, intro.methodology_note, s, { last: true });
-  return out('Metodología', root(h, 'shell-methodology', inner), facts);
+  return out('Metodología', root(h, 'shell-methodology', inner), facts, introProseTexts(intro));
 }
 
 // ─── S1.1 Ruta de aprendizaje ───────────────────────────────────────────────
@@ -349,7 +350,7 @@ export function moduleIntroLabel(
     `</div>` +
     eyebrow(h, 'Recorrido del módulo', s) +
     rows(h, journey, { ordered: true });
-  return out(`Módulo ${module.number}: presentación`, root(h, `shell-module-${module.number}`, inner), facts);
+  return out(`Módulo ${module.number}: presentación`, root(h, `shell-module-${module.number}`, inner), facts, introProseTexts(intro));
 }
 
 // ─── Sm.E Evaluación del módulo / SZ Evaluación final ───────────────────────
@@ -575,7 +576,7 @@ export function closingLabel(
       { cls: 'cvc-certificate' },
     );
   }
-  return out('Cierre del curso', root(h, 'shell-closing', inner), facts);
+  return out('Cierre del curso', root(h, 'shell-closing', inner), facts, introProseTexts(intro));
 }
 
 /**

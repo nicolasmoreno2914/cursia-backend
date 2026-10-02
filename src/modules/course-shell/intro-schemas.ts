@@ -116,7 +116,9 @@ const RB = '(?![\\p{L}\\p{N}_])';
 const DIGIT_COUNTED_NOUNS =
   '(?:modulos?|capitulos?|videos?|actividad(?:es)?|preguntas?|intentos?|minutos?|horas?|paginas?|semanas?|' +
   'lecciones|leccion|unidad(?:es)?|sesion(?:es)?|clases?|ejercicios?|creditos?|temas?|diapositivas?|palabras?|niveles?|etapas?|' +
-  'evaluacion(?:es)?|examen(?:es)?|cuestionarios?|pruebas?|juegos?|presentacion(?:es)?|partes?|secciones?|bloques?)';
+  'evaluacion(?:es)?|examen(?:es)?|cuestionarios?|pruebas?|juegos?|presentacion(?:es)?|partes?|secciones?|bloques?|' +
+  // V542 fix round 2 (N1): abreviaturas de duración («997 h», «40 hs», «2 hrs», «30 min»).
+  'h|hs|hrs|min)';
 const DIGIT_COUNT_RE = new RegExp(`${LB}\\p{Nd}+(?:[.,]\\p{Nd}+)*\\s*(?:[\\p{L}]+\\s+)?${DIGIT_COUNTED_NOUNS}${RB}`, 'gu');
 const NUMBER_WORD_RE = new RegExp(`${LB}${NUMBER_WORDS}\\s+(?:(?:de|del|los|las|sus|[\\p{L}]+)\\s+){0,2}${STRUCTURE_OR_TIME_NOUNS}${RB}`, 'gu');
 const FORBIDDEN_CLAIM_RE = new RegExp(

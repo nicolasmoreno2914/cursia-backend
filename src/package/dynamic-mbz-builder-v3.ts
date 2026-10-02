@@ -128,6 +128,7 @@ import {
   validateH5pActivityPayload,
   welcomeLabel,
   welcomeStartLabel,
+  introProseTexts,
 } from '../modules/course-shell';
 import type { H5pActivityTypeV2 } from '../modules/course-shell';
 import { PackagingPlanV3, buildPackagingPlanV3, packagingPlanV3Sha256 } from '../modules/dynamic-packaging/packaging-plan-v3';
@@ -290,6 +291,8 @@ export interface MbzV3Expectations {
   h5pProfileVersion: number;
   /** EV6 P2-B5: hojas (categoría, tipo, slots) de cada quiz con banco, del plan congelado → QUIZ_RANDOM. */
   examBankPlans: ExamBankPlans;
+  /** V542 fix round 2 (N1): prosa LLM de las intros que muestran los labels del shell (cifras de contenido admitidas). */
+  shellProse: string[];
 }
 
 export interface BuildDynamicMbzV3Result {
@@ -1489,7 +1492,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const mbz = (await W.zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } })) as Buffer;
   return {
     mbz,
-    expectations: { facts, resolved, h5pProfileVersion, examBankPlans },
+    expectations: { facts, resolved, h5pProfileVersion, examBankPlans, shellProse: [...introProseTexts(courseIntro), ...[...moduleIntros.values()].flatMap((m) => introProseTexts(m))] },
     summary: {
       builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3,
       moodleVersion: MV.br,
