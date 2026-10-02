@@ -4384,6 +4384,24 @@ export class RunsService {
    */
   private async sweepAndRecompute(job: any): Promise<any> {
     if (!isActive(job)) return job;
+    // #583 (N8): cada GET del run (el panel lo sondea, y cada lane del ejecutor también) abría una
+    // transacción de escritura con SELECT … FOR UPDATE sobre la fila del run — la misma que bloquean los
+    // claims / heartbeats / completes — aunque no hubiera nada que barrer (15 round-trips + BEGIN/COMMIT
+    // por GET; staging tiene 2 conexiones para la API). Un chequeo de solo lectura decide si la
+    // transacción puede cambiar algo: con un lease vencido, o con el estado del run desalineado de sus
+    // items (ninguno activo → terminal; alguno running y el run no `running`), sigue el camino de siempre.
+    // Si no, recomputeRunStatus no escribiría nada: se devuelve la fila tal cual, sin locks.
+    const [pre] = await this.dataSource.query(
+      `select count(*) filter (where g.status = 'running' and g.lease_until < now())::int as expired,
+              count(*) filter (where g.status in ('pending', 'running', 'retrying'))::int as active,
+              count(*) filter (where g.status = 'running')::int as running
+         from public.generation_item_runs g
+        where g.job_id = $1 and ${latestGenerationPredicate('g')}`,
+      [job.id],
+    );
+    if (pre && Number(pre.expired) === 0 && Number(pre.active) > 0 && (Number(pre.running) === 0 || job.worker_status === 'running')) {
+      return job;
+    }
     let changed = false;
     await this.tx(async (qr) => {
       const [locked] = await qr.query(`select * from public.production_jobs where id = $1 for update`, [job.id]);
