@@ -1061,9 +1061,9 @@ const MATRIX = [
     await rejects(B.buildDynamicMbzV3(i2), /DIGIT_IN_TEXT|COURSE_INTRO/, 'builder: 6 semanas');
     const facts = r.expectations.facts;
     let threw = null;
-    try { SHELL.assertShellNumbers({ name: 'Qué aprenderás', html: '<div><p><span class="nolink">Completarás todo en 997 semanas. Ley 1480 de 2011.</span></p></div>' }, facts, r.expectations.shellProse); } catch (e) { threw = e; }
+    try { SHELL.assertShellNumbers({ name: 'Qué aprenderás', html: '<div><p><span class="nolink">Completarás todo en 997 semanas. Ley 1480 de 2011.</span></p></div>' }, facts, r.expectations.shellProseByLabel['cv3:shell:competencies']); } catch (e) { threw = e; }
     assert(threw && /SHELL_NUMBER_NOT_FROM_FACTS: .*997/.test(threw.message) && !/1480|2011/.test(threw.message.split(':').pop()), `gate: ${threw && threw.message}`);
-    SHELL.assertShellNumbers({ name: 'Qué aprenderás', html: '<div><p><span class="nolink">Ley 1480 de 2011, 15 días hábiles.</span></p></div>' }, facts, r.expectations.shellProse);
+    SHELL.assertShellNumbers({ name: 'Qué aprenderás', html: '<div><p><span class="nolink">Ley 1480 de 2011, 15 días hábiles.</span></p></div>' }, facts, r.expectations.shellProseByLabel['cv3:shell:competencies']);
     // Fix round 2 (N1): sin la prosa (plantilla pura), las mismas cifras NO salen de facts.
     let strict = null;
     try { SHELL.assertShellNumbers({ name: 'Plantilla', html: '<div><p><span class="nolink">Ley 1480 de 2011.</span></p></div>' }, facts); } catch (e) { strict = e; }
@@ -1083,7 +1083,8 @@ const MATRIX = [
     const i = PF.packagingInput(distRoot, MATRIX[0]);
     i.contents.courseIntro = { ...i.contents.courseIntro, competencies: [LAW, ...i.contents.courseIntro.competencies.slice(1)] };
     const r = await B.buildDynamicMbzV3(i);
-    assert(r.expectations.shellProse.includes(LAW), 'expectations.shellProse lleva la prosa de la intro');
+    eq(r.expectations.shellProseByLabel['cv3:shell:competencies'][0], LAW, 'shellProseByLabel: la competencia va en SU label');
+    assert(!r.expectations.shellProseByLabel['cv3:shell:welcome'].includes(LAW), 'y no en otro label');
     eq((await V.validateMbzV3(r.mbz, r.expectations)).issues, [], 'base con la Ley en la prosa: limpio');
     const { acts } = await actDirs(r.mbz);
     const dirOf = (re) => acts.find((a) => re.test(a.idnumber)).dir;
@@ -1105,13 +1106,52 @@ const MATRIX = [
     const facts = r.expectations.facts;
     for (const t of ['Preguntas: 997', 'Duración estimada: 997 h', 'Duración: 997 min 58 s', 'Intentos: 997', 'Nota mínima para aprobar: 997 de 100', 'Lección 997']) {
       let threw = null;
-      try { SHELL.assertShellNumbers({ name: 'x', html: `<div><p><span class="nolink">${t}</span></p></div>` }, facts, r.expectations.shellProse); } catch (e) { threw = e; }
+      try { SHELL.assertShellNumbers({ name: 'x', html: `<div><p><span class="nolink">${t}</span></p></div>` }, facts, r.expectations.shellProseByLabel['cv3:shell:competencies']); } catch (e) { threw = e; }
       assert(threw && /997/.test(threw.message), `gate: ${t}`);
     }
     // Intro lint: abreviaturas de duración.
     for (const t of ['Completa el curso en 997 h de estudio.', 'Dedica 30 min por día.', 'Son 40 hs de práctica.', 'Unas 2 hrs bastan.']) {
       assert(SHELL.lintShellProse(t).some((h) => h.code === 'DIGIT_IN_TEXT'), `lint: ${t}`);
     }
+  });
+
+  // V542 fix round 3 (N1): la prosa se acota POR LABEL — la de un módulo nunca habilita cifras en otro label.
+  await check('V542 N1 cruzado: el módulo 2 dice «Ley 1480 de 2011» y la plantilla del módulo 1 muestra «Intentos: 2011» → rechazado por el validador y por el gate de render (prosa acotada por label)', async () => {
+    const i = PF.packagingInput(distRoot, MATRIX[0]);
+    const mids = [...i.contents.moduleIntros.keys()];
+    assert(mids.length >= 2, 'fixture con 2 módulos');
+    const m2 = { ...i.contents.moduleIntros.get(mids[1]) };
+    m2.presentation = `${m2.presentation} Aplica la Ley 1480 de 2011 en este módulo.`;
+    i.contents.moduleIntros.set(mids[1], m2);
+    const r = await B.buildDynamicMbzV3(i);
+    eq((await V.validateMbzV3(r.mbz, r.expectations)).issues, [], 'base limpia (la Ley en la prosa del módulo 2)');
+    const by = r.expectations.shellProseByLabel;
+    assert(by[`cv3:module_intro:${mids[1]}`].some((t) => t.includes('Ley 1480 de 2011')) && !by[`cv3:module_intro:${mids[0]}`].some((t) => t.includes('2011')), 'prosa por módulo');
+    const { acts } = await actDirs(r.mbz);
+    const dirOf = (idn) => acts.find((a) => a.idnumber === idn).dir;
+    const m1Intro = dirOf(`cv3:module_intro:${mids[0]}`);
+    const examInfo = acts.find((a) => a.idnumber.startsWith('cv3:exam_info:')).dir;
+    for (const [what, dir, fn] of [
+      ['module_intro del módulo 1 (label CON prosa propia)', m1Intro, (x) => x.replace('&lt;/span&gt;', ' Intentos: 2011&lt;/span&gt;')],
+      ['exam_info del módulo 1 (plantilla sin prosa)', examInfo, (x) => x.replace(/(Intentos:&lt;\/span&gt;&lt;\/strong&gt;&lt;span class=&quot;nolink&quot;&gt; )\d+/, '$12011')],
+      ['competencias del curso', dirOf('cv3:shell:competencies'), (x) => x.replace('&lt;/span&gt;', ' Intentos: 2011&lt;/span&gt;')],
+    ]) {
+      const v = await V.validateMbzV3(await mutate(r.mbz, { [`${dir}/label.xml`]: fn }), r.expectations);
+      assert(v.issues.some((e) => e.code === 'NUMBER_NOT_FROM_FACTS' && /2011/.test(e.message)), `${what}: ${JSON.stringify(v.issues.slice(0, 3))}`);
+    }
+    // Gate de render: con la prosa del módulo 1 (la suya) se rechaza; la del módulo 2 la habilitaría (por eso se acota).
+    const facts = r.expectations.facts;
+    const html = '<div><p><span class="nolink">Módulo 1: presentación. Intentos: 2011</span></p></div>';
+    let threw = null;
+    try { SHELL.assertShellNumbers({ name: 'Módulo 1: presentación', html }, facts, by[`cv3:module_intro:${mids[0]}`]); } catch (e) { threw = e; }
+    assert(threw && /SHELL_NUMBER_NOT_FROM_FACTS.*2011/.test(threw.message), `gate módulo 1: ${threw && threw.message}`);
+    SHELL.assertShellNumbers({ name: 'control', html }, facts, by[`cv3:module_intro:${mids[1]}`]); // control: la prosa del OTRO módulo sí lo dejaría pasar
+    // El render real del módulo 1 con «Intentos: 2011» metido en la plantilla falla (moduleIntroLabel pasa SU prosa).
+    const mf = facts.modules.find((m) => m.id === mids[0]) || facts.modules[0];
+    const lbl = SHELL.moduleIntroLabel(mf, i.contents.moduleIntros.get(mids[0]), facts, THEME.resolveTheme({ themeFamily: 'aula-clara', mode: 'light' }));
+    let threw2 = null;
+    try { SHELL.assertShellNumbers({ name: lbl.name, html: lbl.html.replace('</span>', ' Intentos: 2011</span>') }, facts, by[`cv3:module_intro:${mids[0]}`]); } catch (e) { threw2 = e; }
+    assert(threw2 && /2011/.test(threw2.message), 'gate sobre el render real del módulo 1');
   });
 
   await check('builder falla fuerte: cifra en un intro del LLM, duración del video ≠ documento, token inválido', async () => {

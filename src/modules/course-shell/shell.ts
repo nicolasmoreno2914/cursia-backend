@@ -21,7 +21,7 @@ import { extractText, lintCleanSafe, renderComponent } from '../visual-component
 import { labelHtml, inlineHtml } from '../visual-components/text';
 import { formatDurationEs } from '../../package/audio';
 import type { AssessableType } from '../course-profiles/course-profiles';
-import { CourseFacts, ModuleFacts, introProseTexts, lintShellNumbers } from './facts';
+import { CourseFacts, ModuleFacts, courseIntroProse, lintShellNumbers, moduleIntroProse } from './facts';
 import { CTA_BADGES, CTA_EXAM, ctaButton, ctaSection } from './cta';
 import {
   CourseIntroV3,
@@ -141,7 +141,7 @@ export function welcomeLabel(
     const cs = toneSurf(h, 'alt');
     qa = box(h, eyebrow(h, QA_PREVIEW_NOTICE_TITLE, cs.s) + pHtml(h, labelHtml(QA_PREVIEW_NOTICE_TEXT), cs.s, { last: true }), cs, { cls: 'cvc-qa-preview' });
   }
-  return out('Bienvenida', root(h, 'shell-welcome', qa + hero + statRow(h, stats) + hours), facts, introProseTexts(intro));
+  return out('Bienvenida', root(h, 'shell-welcome', qa + hero + statRow(h, stats) + hours), facts, courseIntroProse(intro, 'welcome'));
 }
 
 // ─── S0.3 Audio de bienvenida ───────────────────────────────────────────────
@@ -167,7 +167,7 @@ export function competenciesLabel(facts: CourseFacts, courseIntro: CourseIntroV3
     theme,
     { uid: 'shell-competencies-list', level: lvl(h), countless: true },
   );
-  return out('Qué aprenderás', root(h, 'shell-competencies', comp), facts, introProseTexts(intro));
+  return out('Qué aprenderás', root(h, 'shell-competencies', comp), facts, courseIntroProse(intro, 'competencies'));
 }
 
 // ─── S0.5 Metodología (plantilla determinística) ────────────────────────────
@@ -218,7 +218,7 @@ export function methodologyLabel(facts: CourseFacts, courseIntro: CourseIntroV3,
     heading(h, 'h3', 'Cómo vas a aprender', s) +
     rows(h, items, { cls: 'cvc-cols2', ordered: true }) +
     paras(h, intro.methodology_note, s, { last: true });
-  return out('Metodología', root(h, 'shell-methodology', inner), facts, introProseTexts(intro));
+  return out('Metodología', root(h, 'shell-methodology', inner), facts, courseIntroProse(intro, 'methodology_note'));
 }
 
 // ─── S1.1 Ruta de aprendizaje ───────────────────────────────────────────────
@@ -350,7 +350,7 @@ export function moduleIntroLabel(
     `</div>` +
     eyebrow(h, 'Recorrido del módulo', s) +
     rows(h, journey, { ordered: true });
-  return out(`Módulo ${module.number}: presentación`, root(h, `shell-module-${module.number}`, inner), facts, introProseTexts(intro));
+  return out(`Módulo ${module.number}: presentación`, root(h, `shell-module-${module.number}`, inner), facts, moduleIntroProse(intro));
 }
 
 // ─── Sm.E Evaluación del módulo / SZ Evaluación final ───────────────────────
@@ -576,7 +576,7 @@ export function closingLabel(
       { cls: 'cvc-certificate' },
     );
   }
-  return out('Cierre del curso', root(h, 'shell-closing', inner), facts, introProseTexts(intro));
+  return out('Cierre del curso', root(h, 'shell-closing', inner), facts, courseIntroProse(intro, 'closing'));
 }
 
 /**

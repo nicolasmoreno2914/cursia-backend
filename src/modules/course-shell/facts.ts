@@ -518,13 +518,34 @@ export function lintShellNumbers(text: string, facts: CourseFacts, prose: readon
   return [...new Set(bad)];
 }
 
-/** V542 fix round 2 (N1): textos de prosa LLM de una intro que el shell muestra (todo salvo la bibliografía). */
-export function introProseTexts(intro: unknown): string[] {
+/**
+ * V542 fix round 3 (N1): prosa LLM que muestra CADA label del shell, por idnumber — nunca un fondo común. Un label
+ * de curso recibe solo su campo de la intro del curso; `cv3:module_intro:<id>` solo la prosa de SU módulo; los
+ * demás labels no tienen prosa (plantilla estricta). Fuente única para el builder (expectations) y el render.
+ */
+export const COURSE_INTRO_PROSE_FIELD_BY_LABEL: Readonly<Record<string, 'welcome' | 'competencies' | 'methodology_note' | 'closing'>> = Object.freeze({
+  'cv3:shell:welcome': 'welcome',
+  'cv3:shell:competencies': 'competencies',
+  'cv3:shell:methodology': 'methodology_note',
+  'cv3:shell:closing': 'closing',
+});
+export function courseIntroProse(intro: unknown, field: 'welcome' | 'competencies' | 'methodology_note' | 'closing'): string[] {
+  const v = intro && typeof intro === 'object' ? (intro as Record<string, unknown>)[field] : undefined;
+  if (typeof v === 'string') return [v];
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+}
+export function moduleIntroProse(intro: unknown): string[] {
   const i = (intro && typeof intro === 'object' ? intro : {}) as Record<string, unknown>;
   const out: string[] = [];
-  for (const k of ['welcome', 'methodology_note', 'closing', 'presentation']) if (typeof i[k] === 'string') out.push(i[k] as string);
-  for (const k of ['competencies', 'outcomes']) if (Array.isArray(i[k])) for (const x of i[k] as unknown[]) if (typeof x === 'string') out.push(x);
+  if (typeof i.presentation === 'string') out.push(i.presentation);
+  if (Array.isArray(i.outcomes)) for (const x of i.outcomes) if (typeof x === 'string') out.push(x);
   if (Array.isArray(i.journey)) for (const j of i.journey as any[]) if (j && typeof j.line === 'string') out.push(j.line);
+  return out;
+}
+export function shellProseByLabel(courseIntro: unknown, moduleIntros: ReadonlyMap<string, unknown>): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const [idn, field] of Object.entries(COURSE_INTRO_PROSE_FIELD_BY_LABEL)) out[idn] = courseIntroProse(courseIntro, field);
+  for (const [moduleId, intro] of moduleIntros) out[`cv3:module_intro:${moduleId}`] = moduleIntroProse(intro);
   return out;
 }
 
