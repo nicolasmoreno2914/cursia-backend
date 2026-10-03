@@ -454,6 +454,47 @@ async function dbChecks() {
       }
     });
 
+    await check('DB fix m3: columnas borradas con la sonda en caché positiva (rollback sin pm2 reload) → nunca 500: claim y fail siguen por el camino previo, la sonda se invalida', async () => {
+      const dropCols = () => ds.query(`drop trigger if exists trg_pj_release_exec_lease on public.production_jobs;
+                      drop function if exists public.pj_release_exec_lease();
+                      alter table public.production_jobs drop column if exists executor_lease_holder, drop column if exists executor_lease_expires_at`);
+      const remigrate = () => {
+        const res = runScript('scripts/migrate-rel-exec-lease.js', localEnv({ MIGRATION_ENV: 'staging' }));
+        assert(res.code === 0, 're-migrar: ' + res.out.slice(-500));
+        EL.resetExecLeaseSchemaCache();
+      };
+      const M = await makeCourse('REL lease rollback en caliente');
+      try {
+        // 1) acquire dentro del claim (transacción): sonda positiva, columnas ausentes.
+        assert((await claim(M.runId, A)).item, 'claim con columnas (sonda positiva)');
+        assert(await EL.execLeaseSchemaReady(ds), 'sonda positiva en caché');
+        await dropCols();
+        const rb = await claim(M.runId, B);
+        assert(rb.item && rb.reason === undefined, 'B reclama por el camino previo (sin 500): ' + JSON.stringify(rb).slice(0, 200));
+        eq(await EL.execLeaseSchemaReady(ds), false, 'sonda invalidada');
+        // 2) refresh dentro de complete/fail (transacción con SAVEPOINT): sonda positiva otra vez, columnas ausentes.
+        remigrate();
+        const ra = await claim(M.runId, A);
+        assert(ra.item, 'A reclama');
+        assert(await EL.execLeaseSchemaReady(ds), 'sonda positiva');
+        await dropCols();
+        const fr = await sched.failItemDetailed(ra.item.itemRunId, A, 'fetch failed', true, OWNER);
+        eq(fr.ok, true, 'fail ok (la transacción no se abortó)');
+        eq((await ds.query(`select status from public.generation_item_runs where id = $1`, [ra.item.itemRunId]))[0].status, 'retrying', 'transición aplicada');
+        eq(await EL.execLeaseSchemaReady(ds), false, 'sonda invalidada');
+        // 3) heartbeat (fuera de transacción) y release: sin 500.
+        remigrate();
+        const M2 = await makeCourse('REL lease rollback en caliente 2');
+        const rc = await claim(M2.runId, A);
+        assert(rc.item, 'A reclama (curso nuevo)');
+        await dropCols();
+        eq((await sched.heartbeatItemDetailed(rc.item.itemRunId, A, 120, OWNER)).ok, true, 'heartbeat ok');
+        eq(await sched.releaseRunExecutionLease(M2.runId, A, OWNER), { ok: true, released: false }, 'release sin 500');
+      } finally {
+        remigrate();
+      }
+    });
+
     await check('DB sin la migración (rollback documentado) → no-op: dos ejecutores reclaman como antes y executionLease = null', async () => {
       const R = await makeCourse('REL lease rollback');
       await ds.query(`drop trigger if exists trg_pj_release_exec_lease on public.production_jobs;

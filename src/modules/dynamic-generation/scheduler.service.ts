@@ -1495,7 +1495,7 @@ export class SchedulerService {
         // REL lease: complete / fail del titular renuevan el lease de ejecución del run (misma transacción,
         // fila del run bloqueada FOR UPDATE; si el run quedó terminal, el trigger de la migración lo suelta).
         if (runLock === 'update' && ownerId !== undefined && ownerId !== null && (await execLeaseSchemaReady(qr))) {
-          await refreshRunExecLease(qr, job.id, executorId, DEFAULT_LEASE_SECONDS);
+          await refreshRunExecLease(qr, job.id, executorId, DEFAULT_LEASE_SECONDS, true);
         }
         return { ok: true };
       });

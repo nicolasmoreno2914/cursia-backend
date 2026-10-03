@@ -18,7 +18,10 @@
  * Sin la migración (sonda negativa) todo esto es no-op y el claim se comporta como antes.
  */
 
+import { Logger } from '@nestjs/common';
 import { returningRows } from '../../common/db/returning-rows';
+
+const logger = new Logger('ExecutionLease');
 
 export const EXEC_LEASE_RUN_LEASED_ELSEWHERE = 'run_leased_elsewhere';
 
@@ -49,8 +52,46 @@ export async function execLeaseSchemaReady(q: Queryable, now: number = Date.now(
 }
 
 export type ExecLeaseAcquire =
-  | { ok: true; expiresAt: string | null }
+  | { ok: true; expiresAt: string | null; skipped?: true }
   | { ok: false; expiresAt: string | null };
+
+/** Postgres 42703 (undefined_column): las columnas del lease desaparecieron (rollback sin `pm2 reload`). */
+export function isUndefinedColumnError(err: unknown): boolean {
+  const e = err as { code?: unknown; driverError?: { code?: unknown } } | null;
+  return !!e && (e.code === '42703' || e.driverError?.code === '42703');
+}
+let warnedMissing = false;
+/**
+ * Fix round 1 (m3): sin columnas a la hora de la consulta → se abre (sin lease, camino previo), se invalida
+ * la sonda (el próximo claim ya no las usa) y se avisa UNA vez; nunca un 500.
+ */
+function failOpenOnMissingColumns(err: unknown): boolean {
+  if (!isUndefinedColumnError(err)) return false;
+  schemaCache = { ready: false, at: Date.now() };
+  if (!warnedMissing) {
+    warnedMissing = true;
+    logger.warn('lease de ejecución: faltan las columnas de production_jobs (¿rollback sin pm2 reload?); se sigue sin lease (camino previo)');
+  }
+  return true;
+}
+/** Solo tests. */
+export function resetExecLeaseWarnings(): void {
+  warnedMissing = false;
+}
+
+/** Corre `fn` dentro de un SAVEPOINT (transacción en curso): una columna ausente no aborta la transacción. */
+async function inSavepoint<T>(qr: Queryable, fn: () => Promise<T>, onMissing: () => T): Promise<T> {
+  await qr.query('savepoint rel_exec_lease');
+  try {
+    const out = await fn();
+    await qr.query('release savepoint rel_exec_lease');
+    return out;
+  } catch (err) {
+    if (!failOpenOnMissingColumns(err)) throw err;
+    await qr.query('rollback to savepoint rel_exec_lease');
+    return onMissing();
+  }
+}
 
 function iso(v: unknown): string | null {
   if (v === null || v === undefined) return null;
@@ -63,43 +104,68 @@ function iso(v: unknown): string | null {
  * (FOR UPDATE) en la misma transacción: la decisión es atómica con el claim del item.
  */
 export async function acquireRunExecLease(qr: Queryable, jobId: string, executorId: string, ttlSeconds: number): Promise<ExecLeaseAcquire> {
-  const rows = await qr.query(
-    `update public.production_jobs
-        set executor_lease_holder = $2,
-            executor_lease_expires_at = now() + make_interval(secs => $3::int)
-      where id = $1
-        and (executor_lease_holder is null or executor_lease_expires_at is null
-             or executor_lease_expires_at <= now() or executor_lease_holder = $2)
-      returning executor_lease_expires_at`,
-    [jobId, executorId, ttlSeconds],
-  );
-  const got = returningRows(rows);
-  if (got.length) return { ok: true, expiresAt: iso(got[0].executor_lease_expires_at) };
-  const [cur] = await qr.query(`select executor_lease_expires_at from public.production_jobs where id = $1`, [jobId]);
-  return { ok: false, expiresAt: iso(cur?.executor_lease_expires_at) };
+  return inSavepoint<ExecLeaseAcquire>(qr, async () => {
+    // Una sentencia: el UPDATE condicional y, si no aplicó, el vencimiento vigente (instantánea previa).
+    const [r] = await qr.query(
+      `with upd as (
+         update public.production_jobs
+            set executor_lease_holder = $2,
+                executor_lease_expires_at = now() + make_interval(secs => $3::int)
+          where id = $1
+            and (executor_lease_holder is null or executor_lease_expires_at is null
+                 or executor_lease_expires_at <= now() or executor_lease_holder = $2)
+          returning executor_lease_expires_at)
+       select (select count(*)::int from upd) as taken,
+              (select executor_lease_expires_at from upd) as new_exp,
+              (select executor_lease_expires_at from public.production_jobs where id = $1) as cur_exp`,
+      [jobId, executorId, ttlSeconds],
+    );
+    if (r && Number(r.taken) === 1) return { ok: true, expiresAt: iso(r.new_exp) };
+    return { ok: false, expiresAt: iso(r?.cur_exp) };
+  }, () => ({ ok: true, expiresAt: null, skipped: true }));
 }
 
-/** Renueva el lease SOLO si `executorId` sigue siendo el titular (por id del run). */
-export async function refreshRunExecLease(q: Queryable, jobId: string, executorId: string, ttlSeconds: number): Promise<boolean> {
-  const rows = await q.query(
-    `update public.production_jobs
-        set executor_lease_expires_at = now() + make_interval(secs => $3::int)
-      where id = $1 and executor_lease_holder = $2
-      returning id`,
-    [jobId, executorId, ttlSeconds],
-  );
-  return returningRows(rows).length === 1;
+/**
+ * Renueva el lease SOLO si `executorId` sigue siendo el titular (por id del run). Nota: un lease VENCIDO que
+ * nadie tomó todavía sigue a nombre del titular, así que su próximo latido lo revive (intencional: nadie más
+ * lo quería). Lo que no puede es recuperarlo después de que otro equipo lo tomó.
+ * `inTx`: dentro de una transacción en curso (usa SAVEPOINT para que una columna ausente no la aborte).
+ */
+export async function refreshRunExecLease(q: Queryable, jobId: string, executorId: string, ttlSeconds: number, inTx = false): Promise<boolean> {
+  const run = async () => {
+    const rows = await q.query(
+      `update public.production_jobs
+          set executor_lease_expires_at = now() + make_interval(secs => $3::int)
+        where id = $1 and executor_lease_holder = $2
+        returning id`,
+      [jobId, executorId, ttlSeconds],
+    );
+    return returningRows(rows).length === 1;
+  };
+  if (inTx) return inSavepoint(q, run, () => false);
+  try {
+    return await run();
+  } catch (err) {
+    if (failOpenOnMissingColumns(err)) return false;
+    throw err;
+  }
 }
 
 /** Liberación explícita del titular (dueño del run). Devuelve true si había lease de ese executorId. */
 export async function releaseRunExecLease(q: Queryable, jobId: string, executorId: string, ownerId: string): Promise<boolean> {
-  const rows = await q.query(
+  let rows: any;
+  try {
+    rows = await q.query(
     `update public.production_jobs
         set executor_lease_holder = null, executor_lease_expires_at = null
       where id = $1 and execution_mode = 'dynamic_generation' and owner_id = $3 and executor_lease_holder = $2
       returning id`,
-    [jobId, executorId, ownerId],
-  );
+      [jobId, executorId, ownerId],
+    );
+  } catch (err) {
+    if (failOpenOnMissingColumns(err)) return false;
+    throw err;
+  }
   return returningRows(rows).length === 1;
 }
 
