@@ -11,19 +11,23 @@
 // github.com/h5p/<repo> + licencia MIT, verificado por el controlador).
 //
 // Uso:
-//   node scripts/sync-h5p-library-store-v2.js <libsDir>          escribe el store
-//   node scripts/sync-h5p-library-store-v2.js <libsDir> --check  solo compara (exit 1 si difiere)
+//   node scripts/sync-h5p-library-store-v2.js <libsDir> [--profile v2|v3]          escribe el store
+//   node scripts/sync-h5p-library-store-v2.js <libsDir> [--profile v2|v3] --check  solo compara (exit 1 si difiere)
 //
-// El perfil sale de `src/package/h5p/cursia-h5p-profile.v2.json` (generado con
-// `scripts/generate-h5p-profile.js <libsDir> --profile v2`).
+// El perfil sale de `src/package/h5p/cursia-h5p-profile.<v2|v3>.json` (generado con
+// `scripts/generate-h5p-profile.js <libsDir> --profile v2|v3`).
+// UX #5 (r18): `--profile v3` escribe `assets/h5p-libs/v3` (delta de CURSIA_H5P_PROFILE_V3: las 19
+// carpetas de v2 + H5P.QuestionSet-1.21). Default v2 (salida idéntica a la de siempre).
 
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
 const ROOT = path.resolve(__dirname, '..');
-const STORE = path.join(ROOT, 'assets/h5p-libs/v2');
-const PROFILE_JSON = path.join(ROOT, 'src/package/h5p/cursia-h5p-profile.v2.json');
+const PROFILES = {
+  v2: { id: 'CURSIA_H5P_PROFILE_V2', store: path.join(ROOT, 'assets/h5p-libs/v2'), json: path.join(ROOT, 'src/package/h5p/cursia-h5p-profile.v2.json'), mains: 'Branching Scenario y Dialog Cards' },
+  v3: { id: 'CURSIA_H5P_PROFILE_V3', store: path.join(ROOT, 'assets/h5p-libs/v3'), json: path.join(ROOT, 'src/package/h5p/cursia-h5p-profile.v3.json'), mains: 'Branching Scenario, Dialog Cards y Question Set 1.21' },
+};
 
 // Fuente de la licencia de cada librería (fix round 1, I-2): la evidencia EXACTA que aplica.
 const LICENCE_SOURCE = Object.freeze({
@@ -62,6 +66,7 @@ const UPSTREAM_REPO = {
   'H5P.ExportableTextArea': 'h5p-exportable-text-area',
   'H5P.ImageHotspots': 'h5p-image-hotspots',
   'H5P.InteractiveVideo': 'h5p-interactive-video',
+  'H5P.QuestionSet': 'h5p-question-set',
   'H5P.Shape': 'h5p-shape',
   'H5P.TwitterUserFeed': 'h5p-twitter-user-feed',
   'H5PEditor.BranchingQuestion': 'h5p-editor-branching-question',
@@ -140,10 +145,12 @@ function licenceOf(src, lj, repo, dirLabel) {
   throw new Error(`H5P_STORE_LICENCE_MISSING: ${dirLabel} sin licencia en library.json, sin LICENCE/README y su repo ${repo} no está verificado`);
 }
 
-function buildStore(libsDir) {
-  const profileText = fs.readFileSync(PROFILE_JSON, 'utf8');
+function buildStore(libsDir, profileName = 'v2') {
+  const P = PROFILES[profileName];
+  if (!P) throw new Error(`perfil desconocido: ${profileName}`);
+  const profileText = fs.readFileSync(P.json, 'utf8');
   const profile = JSON.parse(profileText);
-  if (profile.profileId !== 'CURSIA_H5P_PROFILE_V2' || !profile.deltaByMain) throw new Error('perfil v2 inválido');
+  if (profile.profileId !== P.id || !profile.deltaByMain) throw new Error(`perfil ${profileName} inválido`);
   const delta = new Map();
   for (const refs of Object.values(profile.deltaByMain)) for (const r of refs) delta.set(dirName(r), r);
   const dirs = [...delta.keys()].sort();
@@ -203,11 +210,11 @@ function buildStore(libsDir) {
     libraries,
   };
   const licenses = [
-    '# Licencias de las librerías H5P del store v2',
+    `# Licencias de las librerías H5P del store ${profileName}`,
     '',
     'Las carpetas de este directorio son copias sin modificar de librerías H5P oficiales',
     '(organización `h5p` en GitHub). Cursia las incluye dentro de los paquetes `.h5p` de',
-    'Branching Scenario y Dialog Cards («delta» sobre CURSIA_H5P_PROFILE_V1). Versiones',
+    `${P.mains} («delta» sobre CURSIA_H5P_PROFILE_V1). Versiones`,
     'exactas y sha256 de cada archivo: `manifest.json`.',
     '',
     `Procedencia: ${manifest.provenance}.`,
@@ -237,12 +244,15 @@ function buildStore(libsDir) {
 
 function main() {
   const args = process.argv.slice(2);
-  const libsDir = args.find((a) => !a.startsWith('--'));
-  if (!libsDir) {
-    console.error('uso: node scripts/sync-h5p-library-store-v2.js <libsDir> [--check]');
+  const pi = args.indexOf('--profile');
+  const profileName = pi >= 0 ? args[pi + 1] : 'v2';
+  const libsDir = args.find((a, i) => !a.startsWith('--') && args[i - 1] !== '--profile');
+  if (!libsDir || !PROFILES[profileName]) {
+    console.error('uso: node scripts/sync-h5p-library-store-v2.js <libsDir> [--profile v2|v3] [--check]');
     process.exit(2);
   }
-  const { files, manifestText, licenses } = buildStore(path.resolve(libsDir));
+  const STORE = PROFILES[profileName].store;
+  const { files, manifestText, licenses } = buildStore(path.resolve(libsDir), profileName);
   if (args.includes('--check')) {
     const diffs = [];
     const want = new Map([...files.entries()].map(([p, b]) => [p, sha256(b)]));
@@ -259,7 +269,7 @@ function main() {
       console.error(`❌ el store difiere (${diffs.length}): ${diffs.slice(0, 10).join('; ')}`);
       process.exit(1);
     }
-    console.log(`✅ store v2 al día (${files.size} archivos de librería)`);
+    console.log(`✅ store ${profileName} al día (${files.size} archivos de librería)`);
     return;
   }
   fs.rmSync(STORE, { recursive: true, force: true });
@@ -269,9 +279,9 @@ function main() {
   }
   fs.writeFileSync(path.join(STORE, 'manifest.json'), manifestText);
   fs.writeFileSync(path.join(STORE, 'LICENSES.md'), licenses);
-  console.log(`store v2 → ${STORE}: ${files.size} archivos de librería + manifest.json + LICENSES.md`);
+  console.log(`store ${profileName} → ${STORE}: ${files.size} archivos de librería + manifest.json + LICENSES.md`);
 }
 
-module.exports = { licenceOf, localLicence, buildStore, LICENCE_SOURCE, UPSTREAM_VERIFIED_MIT, UPSTREAM_REPO };
+module.exports = { licenceOf, localLicence, buildStore, LICENCE_SOURCE, UPSTREAM_VERIFIED_MIT, UPSTREAM_REPO, PROFILES };
 
 if (require.main === module) main();

@@ -9,6 +9,8 @@ export {
   profileFullDependencies,
   CURSIA_H5P_PROFILE_V2,
   h5pProfileVersionV2,
+  CURSIA_H5P_PROFILE_V3,
+  h5pProfileVersionV3,
   profileBundledMainLibraries,
   profileDeltaDirs,
 } from './profile';

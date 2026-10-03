@@ -1,0 +1,22 @@
+{
+  "semantics": [
+    {
+      "label": "Etiket",
+      "description": "Etiket/opskrif vir antwoorde wanneer gebruiker alle antwoorde uitvoer"
+    },
+    {
+      "label": "Placeholder text",
+      "description": "Example value or other placeholder text. Should not be used to replace the description of the input field."
+    },
+    {
+      "label": "Index"
+    },
+    {
+      "label": "Uitvoer nie ondersteun nie etiket",
+      "default": "Uitvoer word nie ondersteun op jou toestel nie"
+    },
+    {
+      "label": "Voeg kommentaar by in die uitgevoerde dokument"
+    }
+  ]
+}
