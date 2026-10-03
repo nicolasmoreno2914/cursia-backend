@@ -72,12 +72,19 @@ const GOLDEN = {
   // audiolibro.mp3, portadas a 1600 px (antes 640) y sin botón «Iniciar actividad» hacia la H5P embebida.
   // Dorados anteriores (3.11.0): h5p-final-light 03bb4e8b…, scorm-nofinal-dark 9500797e…, h5p-nofinal-dark-mock-cleansafe
   // 5329675d…, scorm-final-light 948e402d…, h5p-ev5c-rules1 4a1532f2….
+  // r19 W (builder 3.12.0 → 3.13.0): SOLO cambia el label cv3:shell:welcome (hero con superficie según heroTreatment, «Curso · N módulos · M capítulos», entrada ≤ 40 palabras y cuerpo en párrafos ≤ 70) — diff por entrada del zip en scratchpad/r19/w-logs/golddiff (hook.js + diff.js).
+  // r19 L fix round 1: logo de la portada a opacidad plena, /Keywords del PDF (sha del plan) y transliteración — vuelve a mover solo el blob del Libro.
+  // r19 L (builder 3.12.0 → 3.13.0) cambia el .mbz a propósito, y SOLO en el Libro Guía (diff semántico de entradas del zip contra
+  // 77eeb18, scratchpad/r19/impl-l-probe/golddiff.js): el blob libro_guia_completo.html → PDF libro_guia_<slug>.pdf (files.xml:
+  // hash, nombre, tamaño, mimetype) y la descripción del recurso (resource.xml) con el botón «Abrir Libro Guía →» y «documento PDF».
+  // Dorados anteriores (3.12.0): h5p-final-light 5e9bf0f0…, scorm-nofinal-dark b967577f…, h5p-nofinal-dark-mock-cleansafe
+  // 14d45c9d…, scorm-final-light 6c18bcce…, h5p-ev5c-rules1 3c6d123e….
   mbz: {
-    'h5p-final-light': '5e9bf0f015e3c37aab9c91c5f0b4fe9ac29f4813303393f7210ed16e13f7524f',
-    'scorm-nofinal-dark': 'b967577f1cf7d78ab87a70442335d7cd636113e6774607a6d6e9480d8759e4c6',
-    'h5p-nofinal-dark-mock-cleansafe': '14d45c9d64b75b23d51c04452e15c6f6038c614f9a80d1d82d4d1d1cc202fda7',
-    'scorm-final-light': '6c18bcced0c41fa4a59fe91529c077e0d53aa759bffcc69725d8bbb9d5897fa9',
-    'h5p-ev5c-rules1': '3c6d123eb5eb1f8c4168bf4d4adcd592b60f0587f683bdbc85a4b3aaf76d99b1',
+    'h5p-final-light': '0eb987bf3053628826eae8f72cd88bff6825d0db65fea8046009570116f6b2ab',
+    'scorm-nofinal-dark': 'ef843c5414e59ffb50fb8d46f02d8800e6c23774ca73685252fa33b3cf16c725',
+    'h5p-nofinal-dark-mock-cleansafe': 'f309c5ac6db472587da1b7c3444597001d3dbaec923d0e51ca5939e483f356cb',
+    'scorm-final-light': '02a970f2cc4eddac2966fae28cfbb306920c715574e416e391fab703436bc0ec',
+    'h5p-ev5c-rules1': '3a8c0028b764cd91a21dbe8d58e92215479621793032b08788467225ef3836ef',
   },
 };
 /** Listas propias de rules 2 (CONGELADO: cambiar cualquiera = reglas 3). */

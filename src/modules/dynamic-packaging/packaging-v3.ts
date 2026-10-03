@@ -78,6 +78,7 @@ import { resolveAssessment } from '../../package/assessment';
 import { syntheticCoverPng, syntheticMp3, syntheticPdf } from '../../package/v3/synthetic-media';
 import { themeMismatch, validatePresentationArtifact } from '../../package/presentation';
 import { pdfPageCount } from '../../package/presentation';
+import { LibroLogoCandidate, resolveLibroLogo } from '../../package/v3/libro-logo';
 
 export const PACKAGING_V3 = 'PACKAGING_V3';
 export const V3_VIDEO_REQUIRES_YOUTUBE = 'v3_video_requires_youtube';
@@ -395,6 +396,8 @@ export interface PackageReuseKeyV3Input {
   moodleVersion: string;
   /** EV6 T5: keys de los videos pendientes omitidos (entra en la clave SOLO si no está vacía). */
   omittedVideoKeys?: string[];
+  /** r19 (L3): sha256 de la marca del Libro Guía (logo resuelto + nombre): un cambio de logo re-empaqueta. */
+  libroBrandSha256?: string;
 }
 
 export function packageReuseHashV3(k: PackageReuseKeyV3Input): string {
@@ -410,8 +413,100 @@ export function packageReuseHashV3(k: PackageReuseKeyV3Input): string {
     moodleVersion: k.moodleVersion,
     // EV6 T5: solo si hay omisiones → la clave de un run 100% real no cambia.
     ...(k.omittedVideoKeys && k.omittedVideoKeys.length ? { omittedVideoKeys: [...k.omittedVideoKeys].sort() } : {}),
+    ...(k.libroBrandSha256 ? { libroBrandSha256: k.libroBrandSha256 } : {}),
   });
   return createHash('sha256').update(canon, 'utf8').digest('hex');
+}
+
+// ─── Marca del Libro Guía (r19 L3) ─────────────────────────────────────────
+
+export interface LibroBrandV3 {
+  /** Primer logo candidato de la cuenta (compatibilidad; = candidates[0] ?? null). */
+  logo: LibroLogoCandidate | null;
+  /** Fix round 3: candidatos EN ORDEN [brand_profile, user_settings], sin validar; gana el primero que valida. */
+  candidates: LibroLogoCandidate[];
+  /** Nombre de la institución del curso (portada y pie del PDF), si hay. */
+  name: string | null;
+  /** Avisos de la búsqueda (p.ej. una tabla ausente o un logo solo como artifact). */
+  warnings: string[];
+}
+
+/**
+ * Logo y nombre para el Libro Guía, SIN llamadas pagas ni red (lecturas baratas a la base):
+ *   1. `brand_profiles` ACTIVO de la institución del curso → `palette.logoUrl` (data URI del frontend);
+ *   2. si no, `user_settings.logo_b64` del dueño del curso (lo que sube «Logo del centro»; PNG/JPEG/SVG tal cual);
+ *   3. si no, ninguno → logo de Cursia en el builder.
+ * `user_settings` (y `authorized_users`) es una tabla administrada por Supabase, SIN entidad ni migración en este
+ * backend (docs/memory/00_estado_actual.md, docs/ARQUITECTURA_V1.md): la base del backend ES la de Supabase y
+ * `courses.owner_id` es el uid de Supabase (sub del JWT). `brand_profiles` / `institutions` son entidades NestJS.
+ * Fix round 1 (I3): si una fuente que debería consultarse no existe (to_regclass nulo) o su consulta falla por
+ * estructura (tabla o columna ausente, permisos), el aviso `libro_logo_source_unavailable:<tabla>[:motivo]` queda
+ * visible en el resumen del paquete; nunca una caída silenciosa al logo de Cursia.
+ * `brand_profiles.logo_artifact_id` no lo llena hoy ningún flujo del producto: si aparece SIN `logoUrl` se avisa
+ * (`libro_logo_artifact_unsupported`) y se sigue con el paso 2.
+ */
+export async function loadLibroBrandV3(q: QueryExecutor, courseId: number, ownerId: string | null): Promise<LibroBrandV3> {
+  const warnings: string[] = [];
+  const why = (err: unknown) => (err instanceof Error ? err.message : String(err)).slice(0, 80).replace(/\s+/g, ' ').replace(/:/g, ';');
+  let course: any;
+  let reg: any;
+  try {
+    [course] = await q.query(`select owner_id, institution_id from public.courses where id = $1`, [courseId]);
+    [reg] = await q.query(
+      `select to_regclass('public.brand_profiles') is not null as bp, to_regclass('public.user_settings') is not null as us, to_regclass('public.institutions') is not null as inst`,
+      [],
+    );
+  } catch (err) {
+    return { logo: null, candidates: [], name: null, warnings: [`libro_logo_source_unavailable:courses:${why(err)}`] };
+  }
+  const owner = (course?.owner_id ?? ownerId ?? null) as string | null;
+  let name: string | null = null;
+  const candidates: LibroLogoCandidate[] = [];
+  if (course?.institution_id) {
+    if (!reg?.inst) warnings.push('libro_logo_source_unavailable:institutions');
+    else {
+      try {
+        const [inst] = await q.query(`select name from public.institutions where id::text = $1`, [String(course.institution_id)]);
+        if (typeof inst?.name === 'string' && inst.name.trim()) name = inst.name.trim().slice(0, 120);
+      } catch (err) {
+        warnings.push(`libro_logo_source_unavailable:institutions:${why(err)}`);
+      }
+    }
+    if (!reg?.bp) warnings.push('libro_logo_source_unavailable:brand_profiles');
+    else {
+      try {
+        const [bp] = await q.query(
+          `select palette->>'logoUrl' as logo_url, logo_artifact_id from public.brand_profiles where institution_id::text = $1 and status = 'active' order by version desc limit 1`,
+          [String(course.institution_id)],
+        );
+        if (typeof bp?.logo_url === 'string' && bp.logo_url.trim()) candidates.push({ source: 'brand_profile', dataUri: bp.logo_url });
+        else if (bp?.logo_artifact_id) warnings.push('libro_logo_artifact_unsupported:brand_profile');
+      } catch (err) {
+        warnings.push(`libro_logo_source_unavailable:brand_profiles:${why(err)}`);
+      }
+    }
+  }
+  // fix round 3: user_settings se lee SIEMPRE (no solo sin brand profile): es el respaldo si el logo de la marca no valida.
+  if (owner) {
+    if (!reg?.us) warnings.push('libro_logo_source_unavailable:user_settings');
+    else {
+      try {
+        const [us] = await q.query(`select logo_b64 from public.user_settings where user_id::text = $1`, [String(owner)]);
+        if (typeof us?.logo_b64 === 'string' && us.logo_b64.trim()) candidates.push({ source: 'user_settings', dataUri: us.logo_b64 });
+      } catch (err) {
+        warnings.push(`libro_logo_source_unavailable:user_settings:${why(err)}`);
+      }
+    }
+  }
+  return { logo: candidates[0] ?? null, candidates, name, warnings };
+}
+
+/** Hash de la marca del Libro Guía tal como la verá el builder (logo YA resuelto + nombre) y sus avisos. */
+export function libroBrandFingerprintV3(brand: Pick<LibroBrandV3, 'logo' | 'name'> & { candidates?: LibroLogoCandidate[] }): { sha256: string; warnings: string[]; logoSource: string } {
+  // fix round 3: hash de los bytes del logo RESUELTO (el primer candidato válido), igual que antes.
+  const logo = resolveLibroLogo(brand.candidates ?? brand.logo);
+  const sha256 = createHash('sha256').update(`${logo.sha256}|${brand.name ?? ''}`, 'utf8').digest('hex');
+  return { sha256, warnings: logo.warnings, logoSource: logo.source };
 }
 
 // ─── Contenidos ────────────────────────────────────────────────────────────
@@ -706,6 +801,10 @@ export async function loadContentsV3(
   const videoInteractions = new Map<string, unknown>();
   const activities = new Map<string, ActivityContentV3>();
   const audiobookChapters = new Map<string, Buffer>();
+  // r19: manifiesto validado por capítulo (output_summary del item) para el piso de 25 min del audiolibro.
+  // null = audio real SIN manifiesto (curso existente, anterior a r19): el piso se omite con aviso y el
+  // re-empaque NUNCA re-narra ni llama a un proveedor. Los capítulos simulados no entran al mapa.
+  const audiobookManifests = new Map<string, any>();
   for (const m of plan.modules) {
     moduleIntros.set(m.moduleId, moduleIntroSlots.get(m.moduleId));
     if (m.keys.exam) {
@@ -733,6 +832,10 @@ export async function loadContentsV3(
         }
       }
       audiobookChapters.set(ch.chapterId, slot.audio as Buffer);
+      if (!mockProviderItems.includes(ch.keys.audiobookChapter)) {
+        const man = byItem.get(ch.keys.audiobookChapter)?.outputSummary?.audiobookManifest;
+        audiobookManifests.set(ch.chapterId, man && typeof man === 'object' ? man : null);
+      }
     }
   }
   // EV6 P2: un banco se re-valida con el Markdown de sus capítulos (evidencia) antes de empaquetar; falla fuerte.
@@ -771,6 +874,7 @@ export async function loadContentsV3(
       ...(finalSrc && finalSrc.kind === 'bank' ? { finalExamBank: finalSrc.bank } : {}),
       audioWelcome: audioWelcome as Buffer,
       audiobookChapters,
+      audiobookManifests,
     },
     exams: { modules: examSources, final: finalSrc },
     warnings,
@@ -803,6 +907,8 @@ export interface PreparedV3Package {
    * `assessment_weights_normalized:…`.
    */
   profileWarnings: string[];
+  /** r19 (L3): marca del Libro Guía (logo candidato + nombre) que el worker pasa al builder. */
+  libroBrand: LibroBrandV3;
 }
 
 export interface PendingVideoV3 {
@@ -929,6 +1035,9 @@ export async function prepareV3Package(
   // Doble control (G6 M5): tras normalizar ninguna categoría ponderada puede quedar vacía.
   assertCategoriesPopulated(resolved, itemCounts);
   const sourceArtifactIds = sortedArtifactIdsV3(byItem);
+  // r19 (L3): el logo resuelto (y el nombre) entran en la clave: cambiar el logo de la cuenta re-empaqueta.
+  const libroBrand = await loadLibroBrandV3(q, courseId, run.owner_id ?? null);
+  const brandPrint = libroBrandFingerprintV3(libroBrand);
   const sourceIdsHash = packageReuseHashV3({
     builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3,
     manifestSha256: manifest.sha256,
@@ -939,6 +1048,7 @@ export async function prepareV3Package(
     vcRendererVersion: VC_RENDERER_VERSION,
     moodleVersion,
     omittedVideoKeys,
+    libroBrandSha256: brandPrint.sha256,
   });
   return {
     run,
@@ -949,7 +1059,8 @@ export async function prepareV3Package(
     staleWarnings: staleWarningsV3(byItem),
     resolved,
     assessment: assessmentPackageSummary(resolved),
-    profileWarnings: profileWarningsV3(profiles.theme, resolved),
+    profileWarnings: [...profileWarningsV3(profiles.theme, resolved), ...libroBrand.warnings, ...brandPrint.warnings],
     pendingVideos,
+    libroBrand,
   };
 }

@@ -17,6 +17,7 @@
  *                                          con library.json = versión del perfil; los demás siguen content-only (v1)
  *   AUDIO_DURATION                         las duraciones mostradas = las medidas de los MP3 del paquete
  *   FILES_INTEGRITY / STRUCTURE / LIBRO    blobs, inforef, secuencias, Libro Guía
+ *   LIBRO_CTA (≥ 3.13.0)                   botón «Abrir Libro Guía» a su propio recurso, pestaña nueva
  *   SECTIONS / NAVIGATION                  EV6: una sección por capítulo/evaluación, cierre al final
  *                                          (después del examen final), coursedisplay = 1 y cada
  *                                          botón «Continuar…» → la sección que corresponde
@@ -45,7 +46,7 @@ import type { AssessmentCategoryKey } from '../assessment/resolve-assessment';
 import type { AssessableType } from '../../modules/course-profiles/course-profiles';
 import { extractText, lintCleanSafe, lintResourceMentions, parseHtml } from '../../modules/visual-components';
 import type { HtmlNode } from '../../modules/visual-components';
-import { CERTIFICATE_TEACHER_TROUBLESHOOTING, EXAMS_TEACHER_NOTE, EXAMS_TEACHER_NOTE_ATTEMPTS, EXAMS_TEACHER_NOTE_AVAILABILITY, CertificateRequirements, CourseFacts, chapterNextSteps, closingCertificateText, examOverallFeedbackBands, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles } from '../../modules/course-shell';
+import { CERTIFICATE_TEACHER_TROUBLESHOOTING, EXAMS_TEACHER_NOTE, EXAMS_TEACHER_NOTE_ATTEMPTS, EXAMS_TEACHER_NOTE_AVAILABILITY, CertificateRequirements, CourseFacts, chapterNextSteps, closingCertificateText, examOverallFeedbackBands, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles, WELCOME_LEAD_MAX_WORDS, WELCOME_PARA_MAX_WORDS } from '../../modules/course-shell';
 import { safeActivityName } from '../mbz-common';
 import { courseBadgeDescription } from './course-badge';
 import { QUIZ_REVIEW_V3 } from './moodle-activities-v3';
@@ -62,6 +63,9 @@ import {
   profileBundledMainLibraries,
   profileDeltaDirs,
 } from '../h5p';
+
+/** r19 W: palabras visibles (sin guiones suaves). */
+const wordCountText = (t: string): number => t.replace(/[\u00AD\u200B]/g, '').trim().split(/\s+/).filter(Boolean).length;
 
 // EV6 H5P v2 (fix round 1, m-3): manifest del store (lista de archivos y sha256 por carpeta delta), leído una vez.
 let storeManifestMemo: H5pLibraryStoreManifest | null = null;
@@ -149,6 +153,7 @@ interface ParsedFile {
   filename: string;
   size: number;
   itemid: number;
+  mimetype: string;
 }
 
 function tag(xml: string, name: string): string | null {
@@ -265,6 +270,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     filename: unxml(tag(b, 'filename') ?? ''),
     size: num(tag(b, 'filesize')),
     itemid: num(tag(b, 'itemid')),
+    mimetype: unxml(tag(b, 'mimetype') ?? ''),
   }));
   const fileById = new Map(files.map((f) => [f.id, f]));
   for (const f of files) {
@@ -862,6 +868,23 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     }
   }
 
+  // r19 W: la bienvenida es una pantalla compuesta (hero con superficie, entrada corta, cuerpo en párrafos), nunca
+  // un muro de texto. Solo paquetes del builder ≥ 3.13.0 (los anteriores tenían la bienvenida en un solo párrafo).
+  if (builderVersionAtLeast(exp.builderVersion, '3.13.0')) {
+    const w = acts.find((a) => a.idnumber === 'cv3:shell:welcome');
+    if (w) {
+      const intro = w.intro;
+      if (!/class="cvc-welcome-band cvc-hero-(?:band|rule|plate)"/.test(intro)) add('STRUCTURE', 'cv3:shell:welcome', 'la bienvenida no tiene la superficie del hero (cvc-welcome-band)');
+      // Fix round 1 (M3): la entrada son TODOS los p.cvc-lead (el tope vale para el conjunto).
+      const leadWords = [...intro.matchAll(/<p class="cvc-lead"[^>]*>([\s\S]*?)<\/p>/g)].reduce((n, m) => n + wordCountText(extractText(m[1])), 0);
+      if (leadWords > WELCOME_LEAD_MAX_WORDS) add('STRUCTURE', 'cv3:shell:welcome', `la entrada de la bienvenida supera ${WELCOME_LEAD_MAX_WORDS} palabras`);
+      for (const m of intro.matchAll(/<p\b[^>]*>([\s\S]*?)<\/p>/g)) {
+        const n = wordCountText(extractText(m[1]));
+        if (n > WELCOME_PARA_MAX_WORDS) add('STRUCTURE', 'cv3:shell:welcome', `párrafo de ${n} palabras en la bienvenida (máximo ${WELCOME_PARA_MAX_WORDS})`);
+      }
+    }
+  }
+
   // ── EV6 T3: certificado (insignia de curso nativa) ──
   await checkCertificate();
 
@@ -1010,12 +1033,38 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
 
   // ── Libro Guía ──
   const libro = acts.find((a) => a.idnumber === 'cv3:shell:libro');
-  const lf = libro ? files.find((f) => f.ctx === libro.ctx && f.component === 'mod_resource' && f.filearea === 'content') : undefined;
-  const lhtml = lf ? await text(`files/${lf.hash.slice(0, 2)}/${lf.hash}`) : null;
-  if (!lhtml) add('LIBRO', 'cv3:shell:libro', 'falta el Libro Guía');
-  else {
-    if (!/<\/html>\s*$/i.test(lhtml)) add('LIBRO', 'cv3:shell:libro', 'no cierra en </html>');
-    if (!/<style>[\s\S]*@media print[\s\S]*<\/style>/i.test(lhtml)) add('LIBRO', 'cv3:shell:libro', 'sin <style> con CSS de impresión');
+  const libroFiles = libro ? files.filter((f) => f.ctx === libro.ctx && f.component === 'mod_resource' && f.filearea === 'content' && f.filename !== '.') : [];
+  const lf = libroFiles[0];
+  // r19: un paquete ≥ 3.13.0 (o cuyo Libro ya es PDF, con expectativas sin versión) sigue las reglas del PDF;
+  // el botón (LIBRO_CTA) solo se exige con la versión declarada ≥ 3.13.0.
+  const libroIsPdf = builderVersionAtLeast(exp.builderVersion, '3.13.0') || (!!lf && (lf.mimetype === 'application/pdf' || /\.pdf$/i.test(lf.filename)));
+  if (libroIsPdf) {
+    // r19 (L1/L5): un ÚNICO archivo, PDF real (application/pdf, .pdf), en el contexto del propio recurso.
+    if (!libro || !lf) add('LIBRO', 'cv3:shell:libro', 'falta el Libro Guía');
+    else {
+      if (libroFiles.length !== 1) add('LIBRO', 'cv3:shell:libro', `el recurso debe tener exactamente 1 archivo (tiene ${libroFiles.length})`);
+      const others = files.filter((f) => f !== lf && f.filename !== '.' && (f.hash === lf.hash || /^libro_guia/i.test(f.filename)));
+      if (others.length) add('LIBRO', 'cv3:shell:libro', `copia del Libro Guía fuera del recurso: ${others.map((f) => `${f.component}/${f.filearea}/${f.filename}`).join(', ')}`);
+      if (lf.mimetype !== 'application/pdf' || !/^libro_guia[a-z0-9_]*\.pdf$/.test(lf.filename)) add('LIBRO', 'cv3:shell:libro', `el Libro Guía debe ser un PDF libro_guia*.pdf (es ${lf.filename}, ${lf.mimetype || 'sin mimetype'})`);
+      if (!libro.inforefFiles.includes(lf.id)) add('LIBRO', 'cv3:shell:libro', 'inforef del recurso no referencia el PDF');
+      const pdf = await bin(`files/${lf.hash.slice(0, 2)}/${lf.hash}`);
+      if (!pdf) add('LIBRO', 'cv3:shell:libro', 'falta el blob del PDF');
+      else if (pdf.subarray(0, 5).toString('latin1') !== '%PDF-' || !/%%EOF\s*$/.test(pdf.subarray(-32).toString('latin1'))) add('LIBRO', 'cv3:shell:libro', 'el PDF no empieza en %PDF- o no cierra en %%EOF (truncado)');
+      // r19 (L4): botón «Abrir Libro Guía» hacia su PROPIO moduleid, en una pestaña nueva.
+      if (builderVersionAtLeast(exp.builderVersion, '3.13.0')) {
+        const anchors = [...libro.intro.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/g)];
+        const tok = `$@RESOURCEVIEWBYID*${libro.mid}@$`;
+        const ok = anchors.length === 1 && /Abrir Libro Guía/.test(extractText(anchors[0][2])) && anchors[0][1].includes(`href="${tok}"`) && /\btarget="_blank"/.test(anchors[0][1]) && /\brel="[^"]*\bnoopener\b[^"]*"/.test(anchors[0][1]);
+        if (!ok) add('LIBRO_CTA', 'cv3:shell:libro#intro', `se esperaba exactamente un botón «Abrir Libro Guía» con href="${tok}" target="_blank" rel="noopener…" (hay ${anchors.length} enlace(s))`);
+      }
+    }
+  } else {
+    const lhtml = lf ? await text(`files/${lf.hash.slice(0, 2)}/${lf.hash}`) : null;
+    if (!lhtml) add('LIBRO', 'cv3:shell:libro', 'falta el Libro Guía');
+    else {
+      if (!/<\/html>\s*$/i.test(lhtml)) add('LIBRO', 'cv3:shell:libro', 'no cierra en </html>');
+      if (!/<style>[\s\S]*@media print[\s\S]*<\/style>/i.test(lhtml)) add('LIBRO', 'cv3:shell:libro', 'sin <style> con CSS de impresión');
+    }
   }
 
   return {

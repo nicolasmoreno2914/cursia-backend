@@ -560,6 +560,9 @@ export async function processV3PackageJob(
     ts: (deps.nowSeconds ?? (() => Math.floor(Date.now() / 1000)))(),
     moodleVersion: moodleRequested,
     pendingVideoChapterIds,
+    // r19 (L3): logo de la cuenta (o ninguno → Cursia) y nombre de la institución para el Libro Guía en PDF.
+    // fix round 3: candidatos en orden (brand_profile → user_settings); el builder usa el primero que valida.
+    libroBrand: { logo: prepared.libroBrand?.candidates ?? prepared.libroBrand?.logo ?? null, name: prepared.libroBrand?.name ?? null },
     // EV6 DoD: paquete QA → aviso visible en la bienvenida + nombre del curso «[QA — vista previa, no entregable]».
     ...(qa ? { qaPreviewNotice: true } : {}),
   });
@@ -619,10 +622,12 @@ export async function processV3PackageJob(
       logger.error(`finops: no se pudo registrar el build del paquete ${job.id} en el ledger — ${errMessage(err)}`);
     }
   }
+  // r19 (L3): los avisos del logo los calcula prepare (también para un paquete reutilizado) y el builder; sin duplicados.
+  const profileDetails = new Set(profileWarnings.map((w) => w.detail));
   const warnings = [
     ...prepared.staleWarnings,
     ...profileWarnings,
-    ...[...loaded.warnings, ...built.summary.warnings].map((w) => ({ code: w.split(':')[0], detail: w })),
+    ...[...loaded.warnings, ...built.summary.warnings].filter((w) => !profileDetails.has(w)).map((w) => ({ code: w.split(':')[0], detail: w })),
   ];
   const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
     artifactId: artifact.id,
@@ -632,6 +637,8 @@ export async function processV3PackageJob(
     planSha256: built.summary.planSha256,
     counts: built.summary.counts,
     h5pPackages: built.summary.h5pPackages,
+    // r19 (L): Libro Guía en PDF (archivo, páginas, logo usado como marca de agua).
+    ...(built.summary.libro ? { libro: built.summary.libro } : {}),
     // EV6 H5P v2: «restaurar como administrador o gestor» (solo paquetes con librerías incluidas).
     ...(built.summary.restore ? { restore: built.summary.restore } : {}),
     mockProviderItems: loaded.mockProviderItems,

@@ -159,6 +159,21 @@ export function examBankUsageScale(itemType: 'exam' | 'final_exam', chapters: Re
   };
 }
 
+/**
+ * r19 (bloque A) — el audiolibro narra el capítulo COMPLETO: su costo (guion LLM por bloque + TTS) es
+ * proporcional a las palabras del capítulo. Los priors de `llm.audiobook_script` / `tts.audiobook_chapter`
+ * (usage-model.priors.v1.json v1.6, bloque audiobookR19) corresponden a un capítulo dinámico estándar de
+ * 2.800 palabras. Con las palabras conocidas (p. ej. una regeneración con el contenido ya generado), la
+ * escala es palabras / 2.800; antes de generar, la referencia (escala 1).
+ */
+export const AUDIOBOOK_REFERENCE_CHAPTER_WORDS = 2800;
+
+export function audiobookUsageScale(chapterWords: number | null | undefined): number | null {
+  const w = Number(chapterWords);
+  if (!Number.isFinite(w) || w <= 0) return null;
+  return Math.round((w / AUDIOBOOK_REFERENCE_CHAPTER_WORDS) * 10000) / 10000;
+}
+
 /** Capítulos (orden del Manifest) por módulo, desde los items de capítulo. */
 function manifestChapters(items: readonly RunManifestItem[]): Array<{ id: string; moduleId: string }> {
   const out: Array<{ id: string; moduleId: string }> = [];
@@ -179,6 +194,7 @@ export function estimateItemsForRun(
   items: readonly RunManifestItem[],
   mode: RunSpendMode | RunSpendModes,
   actions?: Readonly<Record<string, string>> | null,
+  opts?: { chapterWords?: Readonly<Record<string, number>> | null } | null,
 ): EstimateItem[] {
   if (!Array.isArray(items)) throw new FinopsError('INVALID_INPUT', 'estimateItemsForRun necesita items[]');
   const modes = asModes(mode);
@@ -190,14 +206,15 @@ export function estimateItemsForRun(
     const scale =
       it.type === 'exam' ? examBankUsageScale('exam', chapters.filter((c) => c.moduleId === it.moduleId))
         : it.type === 'final_exam' ? examBankUsageScale('final_exam', chapters)
-          : null;
+          : it.type === 'audiobook_chapter' && it.chapterId ? audiobookUsageScale(opts?.chapterWords?.[it.chapterId])
+            : null;
     out.push({
       itemKey: it.key,
       itemType: it.type,
       moduleId: it.moduleId ?? null,
       chapterId: it.chapterId ?? null,
       action: (actions && actions[it.key]) || 'GENERATE',
-      ...(scale !== null && Object.values(scale).some((v) => v !== 1) ? { usageScale: scale } : {}),
+      ...(scale !== null && (typeof scale === 'number' ? scale !== 1 : Object.values(scale).some((v) => v !== 1)) ? { usageScale: scale } : {}),
     });
   }
   return out;

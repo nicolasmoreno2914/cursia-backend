@@ -133,7 +133,8 @@ import {
 } from '../modules/course-shell';
 import type { H5pActivityTypeV2 } from '../modules/course-shell';
 import { PackagingPlanV3, buildPackagingPlanV3, packagingPlanV3Sha256 } from '../modules/dynamic-packaging/packaging-plan-v3';
-import { compileLibroHtmlV3, libroWordCount } from './v3/libro-v3';
+import { LIBRO_PDF_MIMETYPE, libroPdfFilename, renderLibroPdfV3 } from './v3/libro-v3';
+import { LibroLogoCandidate, cursiaDefaultLogo, resolveLibroLogo } from './v3/libro-logo';
 import { downscaleCoverPng } from './v3/png-downscale';
 import { ActivityFrameTone, activityPackageFilename, h5pActivityInlineIntroHtml, introThemeFrom, reviewCardsIntroHtml, scormIntroHtml } from './v3/activity-intro';
 import { moduleTone } from '../modules/visual-components/edu';
@@ -221,8 +222,19 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * incluida en el .h5p (delta H5P.QuestionSet-1.21) y los rótulos «Siguiente» / «Anterior» de su navegación: en 1.20
  * el botón «Pregunta siguiente/anterior» salía como un CTA azul vacío junto a «Comprobar». Un paquete con QuestionSet
  * pide restaurar como administrador o gestor (summary.restore), igual que BS / «Repaso».
+ * 3.13.0 (r19 L, Libro Guía): el Libro Guía es un PDF REAL (pdfkit, `libro_guia_<slug>.pdf`, application/pdf; único
+ * archivo del recurso, sin copia HTML) con portada, índice con páginas, encabezado y pie «Página X de Y», y UNA marca de
+ * agua por página (logo de la cuenta → logo de Cursia; un logo inválido cae a Cursia con aviso `libro_logo_invalid:…`);
+ * la descripción del recurso lleva el botón «Abrir Libro Guía →» hacia su propio `$@RESOURCEVIEWBYID*mid@$` en una
+ * pestaña nueva (`target="_blank"`, display 5 = view.php entrega el PDF). El logo y la marca entran en la clave de reuse.
+ * 3.13.0 (r19 W, bienvenida, mismo número de versión): el label de bienvenida se compone como pantalla de entrada — superficie del hero
+ * según `heroTreatment` de la familia (band / rule / plate), línea «Curso · N módulos · M capítulos» (facts),
+ * título, filete, entrada de ≤ 40 palabras / 240 caracteres y el resto de `course_intro.welcome` a tamaño de cuerpo
+ * en párrafos de ≤ 70 palabras, antes de la fila de cifras (antes: todo el texto en UN párrafo a tamaño de entrada).
+ * Mismo texto, sin esquema nuevo ni llamadas LLM. El divisor de oraciones (compartido con la presentación del
+ * módulo) ya no descarta el texto previo a un punto sin espacio («1.5») ni corta en abreviaturas.
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.12.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.13.0';
 
 // EV6 P2-B5: `examExplanationsAvailability` vive en course-shell/exam-explanations (lo usa también el validador).
 export { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';
@@ -261,6 +273,11 @@ export interface DynamicPackageContentsV3 {
   finalExamBank?: ExamBankV1 | null;
   audioWelcome: Buffer;
   audiobookChapters: Map<string, Buffer>;
+  /**
+   * r19: chapterId → manifiesto del audiolibro del capítulo (null = audio sin manifiesto, curso existente).
+   * Con el mapa, `assembleAudiobook` aplica el piso de 25 min (AUDIOBOOK_TOO_SHORT_FOR_SOURCE); sin él, no.
+   */
+  audiobookManifests?: Map<string, any> | null;
 }
 
 export interface BuildDynamicMbzV3Input {
@@ -290,6 +307,11 @@ export interface BuildDynamicMbzV3Input {
    * del curso. Ausente/false → bytes idénticos a los de antes.
    */
   qaPreviewNotice?: boolean;
+  /**
+   * r19 (L3): marca del Libro Guía en PDF — logo candidato de la cuenta (sin validar: el builder lo valida y cae al logo de
+   * Cursia con aviso) y nombre de la institución para la portada y el pie. Ausente → logo de Cursia, sin nombre.
+   */
+  libroBrand?: { logo?: LibroLogoCandidate | ReadonlyArray<LibroLogoCandidate> | null; name?: string | null } | null;
 }
 
 /** EV6 DoD: sufijo del nombre del curso de un paquete de QA. */
@@ -340,6 +362,8 @@ export interface BuildDynamicMbzV3Result {
     assessment: AssessmentPackageSummary;
     /** EV6 H5P v2: solo si el paquete lleva librerías H5P incluidas (restaurar como administrador o gestor). */
     restore?: { as: 'admin_or_manager'; note: string };
+    /** r19 (L): Libro Guía en PDF — archivo, páginas y el logo usado como marca de agua. */
+    libro: { filename: string; pageCount: number; wordCount: number; logoSource: string; logoSha256: string };
   };
 }
 
@@ -770,7 +794,9 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const audioWelcomeSeconds = mp3DurationSeconds(c.audioWelcome);
   const audiobook = assembleAudiobook(
     allChapters.map((ch) => ({ chapterId: ch.chapterId, chapterNumber: ch.chapterNumber, mp3: c.audiobookChapters.get(ch.chapterId) })),
+    { manifests: c.audiobookManifests ?? null },
   );
+  if (audiobook.floor) warnings.push(...audiobook.floor.warnings);
   // EV6 P2-B3: con banco, las «preguntas del examen» que ve el estudiante son los SLOTS (no el banco).
   const examQuestionCountByModule: Record<string, number> = {};
   const examBankSizeByModule: Record<string, number> = {};
@@ -798,7 +824,10 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       if (finalExamQuestionCount < 1) throw new Error(`QUIZ_V3_EMPTY: el GIFT de ${plan.keys.finalExam} no produjo preguntas`);
     }
   }
-  const libroHtml = compileLibroHtmlV3({
+  // r19 (L3): logo de la marca de agua (cuenta → Cursia); un logo de la cuenta inválido deja su aviso, nunca en silencio.
+  let libroLogo = resolveLibroLogo(input.libroBrand?.logo ?? null);
+  warnings.push(...libroLogo.warnings);
+  const libroInputBase = {
     courseTitle: plan.course.title,
     theme,
     courseIntro,
@@ -808,7 +837,23 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       intro: moduleIntros.get(m.moduleId) as ModuleIntroV3,
       chapters: m.chapters.map((ch) => ({ number: ch.chapterNumber, title: ch.title, md: c.contentMd.get(ch.chapterId) as string })),
     })),
-  });
+    brandName: input.libroBrand?.name ?? null,
+    // fix round 1 (M8): /ID del PDF único por curso (sha del plan), sigue determinístico.
+    documentKey: packagingPlanV3Sha256(plan),
+  };
+  let libro: Awaited<ReturnType<typeof renderLibroPdfV3>>;
+  try {
+    libro = await renderLibroPdfV3({ ...libroInputBase, logo: libroLogo });
+  } catch (err) {
+    // fix round 1 (I1): un logo de la cuenta que pdfkit no puede embeber nunca tumba el paquete → Cursia + aviso.
+    if (libroLogo.source === 'cursia_default') throw err;
+    warnings.push(`libro_logo_invalid:${libroLogo.source}:pdf_embed_failed`);
+    libroLogo = cursiaDefaultLogo();
+    libro = await renderLibroPdfV3({ ...libroInputBase, logo: libroLogo });
+  }
+  // fix round 1 (I2): caracteres sin equivalente en las fuentes del PDF → contados y visibles, nunca en silencio.
+  if (libro.unmappedChars > 0) warnings.push(`libro_chars_unmapped:${libro.unmappedChars}`);
+  const libroFilename = libroPdfFilename(plan.course.title);
 
   // EV6 T5 (ruling 3): capítulos pendientes cuyos textos publicados mencionan su video → aviso.
   const noticeChapterIds = pendingVideoNoticeChapterIds({
@@ -844,7 +889,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       ...(finalExamQuestionCount !== undefined ? { finalExamQuestionCount } : {}),
       ...(Object.keys(examBankSizeByModule).length ? { examBankSizeByModule } : {}),
       ...(finalExamBankSize !== undefined ? { finalExamBankSize } : {}),
-      libroWordCount: libroWordCount(libroHtml),
+      libroWordCount: libro.wordCount,
       // P3: palabras MEDIDAS del experience → minutos estimados del capítulo (facts).
       experienceWordsByChapter: Object.fromEntries(allChapters.map((ch) => [ch.chapterId, experienceMovementWords(c.experiences.get(ch.chapterId))])),
       // P3 (fix M2): duración medida de los videos reales (los pendientes no están en c.videos).
@@ -853,7 +898,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
           .map((ch) => [ch.chapterId, (c.videos.get(ch.chapterId) as { durationSec?: number } | undefined)?.durationSec] as const)
           .filter(([, s]) => typeof s === 'number' && Number.isFinite(s) && s > 0),
       ),
-      libroHasBibliography: libroHtml.includes('id="bibliografia"'),
+      libroHasBibliography: libro.hasBibliography,
     },
   });
   // R6: una categoría con peso > 0 y sin ítems calificables deja el curso sin poder llegar a 100 → falla fuerte.
@@ -1116,9 +1161,11 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     libroMid = a.mid;
     // #583 (M5/M6, builder 3.11.0): la tarjeta del Libro Guía es la DESCRIPCIÓN del recurso (showdescription),
     // no un label aparte: la sección 1 muestra una sola entrada del Libro Guía.
-    const libroIntro = libroResourceIntro(facts, theme, opts).html;
+    // r19 (L4, 3.13.0): con el botón «Abrir Libro Guía →» hacia su PROPIO moduleid, en una pestaña nueva.
+    const libroIntro = libroResourceIntro(facts, theme, opts, a.mid).html;
     labelsHtml.push({ where: 'cv3:shell:libro#intro', html: libroIntro });
-    const fid = W.addFile(a.ctx, 'mod_resource', 'content', 'libro_guia_completo.html', libroHtml, 'text/html');
+    // r19 (L1/L5): el PDF es el único archivo del recurso (display 5 → view.php lo entrega y el navegador lo muestra).
+    const fid = W.addFile(a.ctx, 'mod_resource', 'content', libroFilename, libro.pdf, LIBRO_PDF_MIMETYPE);
     W.put(`${a.dir}/resource.xml`, `<?xml version="1.0" encoding="UTF-8"?>
 <activity id="${a.aid}" moduleid="${a.mid}" modulename="resource" contextid="${a.ctx}">
   <resource id="${a.aid}">
@@ -1566,8 +1613,11 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
         itemKey: v.videoKey, chapterId: v.chapterId, chapterNumber: v.chapterNumber, title: v.title, notice: noticeChapterIds.includes(v.chapterId),
       })),
       warnings,
+      // r19: piso de 25 min del audiolibro (solo si el empaque pasó los manifiestos; no entra al .mbz).
+      ...(audiobook.floor ? { audiobookFloor: audiobook.floor } : {}),
       counts: facts.counts,
       assessment: assessmentPackageSummary(resolved),
+      libro: { filename: libroFilename, pageCount: libro.pageCount, wordCount: libro.wordCount, logoSource: libroLogo.source, logoSha256: libroLogo.sha256 },
       // EV6 H5P v2: con paquetes que traen sus librerías (Branching Scenario / «Repaso» / desde UX #5
       // QuestionSet 1.21) la entrega pide restaurar como administrador o gestor (rulings Q1).
       ...(h5pPackages.some((p) => p.mainLibrary in (CURSIA_H5P_PROFILE_V3.deltaByMain ?? {})) ? { restore: H5P_BUNDLED_RESTORE_NOTE } : {}),

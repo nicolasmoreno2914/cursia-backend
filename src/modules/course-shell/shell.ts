@@ -38,6 +38,7 @@ import {
   box,
   eyebrow,
   heading,
+  heroBand,
   hx,
   lead,
   link,
@@ -50,6 +51,8 @@ import {
   root,
   rows,
   shellFail,
+  splitBodyParagraphs,
+  splitLeadRest,
   st,
   statRow,
   surfOn,
@@ -109,6 +112,19 @@ export const QA_PREVIEW_NOTICE_TEXT =
   'Este paquete es una copia interna de control de calidad. Contiene componentes simulados o pendientes y no es ' +
   'el curso final: no lo entregues a estudiantes ni a clientes.';
 
+/** r19 W: topes de la composición de la bienvenida (los usa también el validador ≥ 3.13.0). */
+export const WELCOME_LEAD_MAX_WORDS = 40;
+export const WELCOME_LEAD_MAX_CHARS = 240;
+export const WELCOME_PARA_MAX_WORDS = 70;
+export const WELCOME_PARA_TARGET_WORDS = 60;
+
+/**
+ * Fix round 2: un token larguísimo (URL, cadena sin espacios) no desborda a 375 px. CLEAN_SAFE: los guiones suaves
+ * deterministas de richParagraphs (cada 10 caracteres en palabras de ≥ 22; Moodle elimina overflow-wrap/word-break bajo
+ * forceclean, text.ts §X.1). ENHANCED: además overflow-wrap:anywhere en la entrada y el cuerpo.
+ */
+const WRAP: Array<[string, string]> = [['overflow-wrap', 'anywhere'], ['word-break', 'break-word']];
+
 export function welcomeLabel(
   facts: CourseFacts,
   courseIntro: CourseIntroV3,
@@ -129,13 +145,29 @@ export function welcomeLabel(
   if (c.evaluations > 0) stats.push({ value: c.evaluations, label: plural(c.evaluations, 'evaluación', 'evaluaciones') });
   // UX r18 (problema 1): Moodle 4.5 siempre pinta el nombre de la sección 0 («Bienvenida») como
   // encabezado justo encima de este label (núcleo de format_topics, no se puede quitar desde el
-  // .mbz). El hero NO repite esa palabra como kicker: abre directo con el título del curso.
-  const hero = renderComponent(
-    { type: 'hero', title: facts.course.title, lead: intro.welcome },
-    theme,
-    { uid: 'shell-welcome-hero', level: lvl(h), countless: true },
-  );
+  // .mbz). El hero NO repite esa palabra: su línea meta son cifras de facts.
+  // r19 W: la bienvenida dejó de ser UN párrafo a tamaño de entrada (141–155 palabras = 11–13 líneas
+  // a 1280 y ~24 a 375). Composición determinística, sin LLM ni cambio de esquema:
+  //   superficie del hero (heroTreatment de la familia) → «Curso · N módulos · M capítulos» (caja de oración a 16 px:
+  //   pasa de 30 caracteres, no cabe como chip en mayúsculas — regla del QA del navegador) → título →
+  //   filete → entrada (≤ 40 palabras / 240 caracteres, oraciones enteras) → resto a tamaño de cuerpo
+  //   en párrafos de ≤ 70 palabras → fila de cifras. No se pierde ni se repite texto.
   const s = bgSurf(h);
+  // Fix round 1 (C1): `cut` — una primera oración fuera de tope se corta en la última cláusula (o palabra) que
+  // quepa y lo demás abre el cuerpo: TODA bienvenida válida por el esquema produce un label conforme (nunca falla el
+  // empaquetado por la forma del texto). `guard`: sin cortes en abreviaturas ni dentro de un énfasis.
+  const split = splitLeadRest(intro.welcome, { maxChars: WELCOME_LEAD_MAX_CHARS, maxWords: WELCOME_LEAD_MAX_WORDS, guard: true, cut: true });
+  const hero = heroBand(h, 'cvc-welcome-band', (bs) =>
+    eyebrow(h, `Curso · ${c.modules} ${plural(c.modules, 'módulo', 'módulos')} · ${c.chapters} ${plural(c.chapters, 'capítulo', 'capítulos')}`, bs, { sentence: true }) +
+    heading(h, 'h4', facts.course.title, bs, { display: true }) +
+    accentRule(h, bs) +
+    // Fix round 2: con `cut` la entrada siempre cabe o es vacía (primera palabra de > 240 caracteres): sin entrada, el
+    // hero queda en línea meta + título + filete y todo el texto va al cuerpo.
+    (split.lead ? lead(h, split.lead, bs, { last: true, cls: 'cvc-lead', enh: WRAP }) : ''),
+  );
+  if (!split.fits) shellFail(`Bienvenida: entrada fuera de tope (${split.lead.length} caracteres)`);
+  const bodyParas = split.rest ? splitBodyParagraphs(split.rest, { maxWords: WELCOME_PARA_MAX_WORDS, target: WELCOME_PARA_TARGET_WORDS }) : [];
+  const body = bodyParas.length ? `<div class="cvc-welcome-body"${st(h, [['margin', '0'], ['padding', 0], ['color', s.fg]])}>${paras(h, bodyParas.join('\n\n'), s, { enh: WRAP })}</div>` : '';
   const hours = facts.hours
     ? pHtml(h, labelHtml(`Duración estimada: ${facts.hours.value} h (${facts.hours.source}).`), s, { secondary: true, last: true })
     : '';
@@ -144,7 +176,7 @@ export function welcomeLabel(
     const cs = toneSurf(h, 'alt');
     qa = box(h, eyebrow(h, QA_PREVIEW_NOTICE_TITLE, cs.s) + pHtml(h, labelHtml(QA_PREVIEW_NOTICE_TEXT), cs.s, { last: true }), cs, { cls: 'cvc-qa-preview' });
   }
-  return out('Bienvenida', root(h, 'shell-welcome', qa + hero + statRow(h, stats) + hours), facts, courseIntroProse(intro, 'welcome'));
+  return out('Bienvenida', root(h, 'shell-welcome', qa + hero + body + statRow(h, stats) + hours), facts, courseIntroProse(intro, 'welcome'));
 }
 
 // ─── S0.3 Audio de bienvenida ───────────────────────────────────────────────
@@ -264,13 +296,21 @@ export function routeLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: Shel
 // ─── S1.2 Libro Guía ────────────────────────────────────────────────────────
 
 /**
- * #583 (M5/M6): descripción del recurso «📘 Libro Guía» (builder 3.11.0: `showdescription` = 1). Es la misma
- * tarjeta de libroCardLabel SIN el botón «Abrir el Libro Guía»: el nombre del recurso ya es el enlace, y la
- * sección 1 deja de mostrar dos entradas del Libro Guía (la fila del recurso y una tarjeta aparte).
+ * #583 (M5/M6): descripción del recurso «📘 Libro Guía» (builder 3.11.0: `showdescription` = 1): la sección 1 muestra una
+ * sola entrada del Libro Guía (la fila del recurso con esta tarjeta debajo). Sin `libroMid` (builder 3.11.0–3.12.0) la
+ * tarjeta no lleva botón.
+ * r19 (L4, builder 3.13.0): con `libroMid` (el moduleid del PROPIO recurso) lleva el botón visible «Abrir Libro Guía →»
+ * hacia `$@RESOURCEVIEWBYID*libroMid@$` en una pestaña nueva; con `display` = 5 (abrir) view.php entrega el PDF, que el
+ * navegador muestra en su visor.
  */
-export function libroResourceIntro(facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
-  return libroCard(null, facts, theme, opts);
+export function libroResourceIntro(facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions, libroMid?: number): ShellLabel {
+  if (libroMid === undefined) return libroCard(null, facts, theme, opts);
+  if (!Number.isInteger(libroMid) || libroMid < 1) shellFail(`libroMid inválido (${libroMid})`);
+  return libroCard(libroMid, facts, theme, opts, { text: LIBRO_CTA_TEXT, newTab: true, pdf: true });
 }
+
+/** r19 (L4): texto del botón del Libro Guía en la descripción del recurso (builder ≥ 3.13.0). */
+export const LIBRO_CTA_TEXT = 'Abrir Libro Guía →';
 
 /** Tarjeta del Libro Guía como label aparte (builder ≤ 3.10.0; se conserva para paquetes y pruebas anteriores). */
 export function libroCardLabel(libroMid: number, facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
@@ -278,20 +318,28 @@ export function libroCardLabel(libroMid: number, facts: CourseFacts, theme: Reso
   return libroCard(libroMid, facts, theme, opts);
 }
 
-function libroCard(libroMid: number | null, facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
+function libroCard(
+  libroMid: number | null,
+  facts: CourseFacts,
+  theme: ResolvedTheme,
+  opts?: ShellRenderOptions,
+  cta: { text: string; newTab: boolean; pdf: boolean } = { text: 'Abrir el Libro Guía', newTab: false, pdf: false },
+): ShellLabel {
   const h = hx(theme, opts);
   const cs = { s: panelSurf(h), border: h.t.color.border };
   const c = facts.counts;
   const text =
-    `El texto completo del curso en un solo documento: ${c.chapters} ${plural(c.chapters, 'capítulo', 'capítulos')} ` +
+    `El texto completo del curso en un solo documento${cta.pdf ? ' PDF' : ''}: ${c.chapters} ${plural(c.chapters, 'capítulo', 'capítulos')} ` +
     `en ${c.modules} ${plural(c.modules, 'módulo', 'módulos')}${facts.libro.hasBibliography === false ? '' : ', con bibliografía sugerida'}. ` +
     `Extensión aproximada: ${facts.libro.wordCount} palabras.`;
   const inner =
     eyebrow(h, 'Material de estudio', cs.s) +
     heading(h, 'h3', 'Libro Guía', cs.s) +
     pHtml(h, labelHtml(text), cs.s, { last: libroMid === null }) +
-    (libroMid === null ? '' : link(h, `$@RESOURCEVIEWBYID*${libroMid}@$`, 'Abrir el Libro Guía', cs.s, { button: true, margin: '16px 0 0 0' }));
-  return out(libroMid === null ? 'Libro Guía (descripción del recurso)' : 'Libro Guía', root(h, 'shell-libro', box(h, inner, cs)), facts);
+    (libroMid === null
+      ? ''
+      : link(h, `$@RESOURCEVIEWBYID*${libroMid}@$`, cta.text, cs.s, { button: true, margin: '16px 0 0 0', ...(cta.newTab ? { target: '_blank' as const } : {}) }));
+  return out(libroMid === null || cta.newTab ? 'Libro Guía (descripción del recurso)' : 'Libro Guía', root(h, 'shell-libro', box(h, inner, cs)), facts);
 }
 
 // ─── S1.3 Audiolibro ────────────────────────────────────────────────────────
@@ -346,17 +394,14 @@ export function moduleIntroLabel(
   const ps = panelSurf(h);
   void numeralHtml;
   // Review I: la banda lleva solo la entrada (2–3 líneas); el resto va abierto, como cuerpo.
-  const sentences = intro.presentation.match(/[^.!?]+[.!?]+(\s+|$)|[^.!?]+$/g) || [intro.presentation];
-  let bandText = '';
-  let k = 0;
-  while (k < sentences.length && (bandText.length === 0 || bandText.length + sentences[k].length <= 240)) bandText += sentences[k++];
-  const restText = sentences.slice(k).join('').trim();
+  // r19 W: el divisor vive en html.ts (splitLeadRest) y lo comparte la bienvenida del curso.
+  const { lead: bandText, rest: restText } = splitLeadRest(intro.presentation, { maxChars: 240 });
   const header =
     `<div class="cvc-modhead"${st(h, [['background-color', ps.bg], ['color', ps.fg], ['margin', '0 0 28px 0'], ['padding', '28px 28px 24px 28px']], [['border-radius', h.t.shape.radiusLg], ['padding', 'clamp(24px, 4vw, 44px)']])}>` +
     eyebrow(h, `Módulo ${module.number} · ${chapters.length} ${plural(chapters.length, 'capítulo', 'capítulos')}`, ps, { color: mc.main }) +
     heading(h, 'h2', module.title, ps) +
     accentRule(h, ps) +
-    lead(h, bandText.trim(), ps, { last: true }) +
+    lead(h, bandText, ps, { last: true }) +
     `</div>` +
     (restText ? paras(h, restText, s) : '');
   const journey = intro.journey

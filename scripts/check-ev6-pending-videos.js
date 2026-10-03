@@ -269,11 +269,17 @@ async function pureChecks() {
   // portadas a 1600 px (PNG con filtro adaptativo) y sin botón «Iniciar actividad» hacia H5P embebido. Diff
   // semántico por idnumber en scratchpad/r18/uximpl-golddiff2.js / uximpl-golddiff3.js: solo esos cambios.
   // Dorados 3.11.0: 644 63dac759…, 645 2c7fe50b….
+  // r19 W (builder 3.12.0 → 3.13.0): SOLO cambia el label cv3:shell:welcome (hero con superficie según heroTreatment, «Curso · N módulos · M capítulos», entrada ≤ 40 palabras y cuerpo en párrafos ≤ 70) — diff por entrada del zip en scratchpad/r19/w-logs/golddiff (hook.js + diff.js).
+  // r19 L fix round 1: logo de la portada a opacidad plena, /Keywords del PDF (sha del plan) y transliteración — vuelve a mover solo el blob del Libro.
+  // r19 L (builder 3.12.0 → 3.13.0) cambia el .mbz a propósito, y SOLO en el Libro Guía (diff semántico de entradas del zip contra
+  // 77eeb18, scratchpad/r19/impl-l-probe/golddiff.js): el blob libro_guia_completo.html → PDF libro_guia_<slug>.pdf (files.xml:
+  // hash, nombre, tamaño, mimetype) y la descripción del recurso (resource.xml) con el botón «Abrir Libro Guía →» y «documento PDF».
+  // Dorados 3.12.0: 644 7cb2a7c7…, 645 32191ec2….
   const GOLDEN_PRE_T5 = {
-    644: ['7cb2a7c7b0662209e1c3e02a090386f028cf15342174e766f1177d85c5877caf', { engine: 'h5p', finalExam: true, courseId: 644 }],
-    645: ['32191ec20a1e716492eae4247dc7faff83829a55d29ff577676dadb6570ce116', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
+    644: ['e64d1b6163be68cf28c20c55473f93d41745542e60f60b4ebc45a2d0ebbe5363', { engine: 'h5p', finalExam: true, courseId: 644 }],
+    645: ['b30a87050fc5fa85338230790b7f88447d23d971154a9f9689fba3e49e927b4a', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
   };
-  await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B4 (respuestas explicadas sobre sistema visual 2.0 + certificado + política de revisión del quiz con revisión de respuestas propias V542 + H5P de una sola copia + retroalimentación global del quiz + #583 QUAL + UX r18, builder 3.12.0), con y sin el campo', async () => {
+  await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B4 (respuestas explicadas sobre sistema visual 2.0 + certificado + política de revisión del quiz con revisión de respuestas propias V542 + H5P de una sola copia + retroalimentación global del quiz + #583 QUAL + UX r18 + r19 Libro Guía PDF, builder 3.13.0), con y sin el campo', async () => {
     for (const [id, [want, o]] of Object.entries(GOLDEN_PRE_T5)) {
       const i1 = PF.packagingInput(distRoot, o);
       const i2 = PF.packagingInput(distRoot, o);

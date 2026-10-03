@@ -582,7 +582,9 @@ function reservationBookkeeping(ev) {
         // EV6 T3: sin evaluación final no hay certificado y el worker lo avisa con EXACTAMENTE
         // certificate_omitted:no_final_exam (intencional); con evaluación final ese aviso no existe.
         const certOmitted = (w) => w && w.code === 'certificate_omitted' && w.detail === 'certificate_omitted:no_final_exam';
-        eq((os.warnings || []).filter((w) => !/mock/i.test(JSON.stringify(w)) && !(!C.finalExam && certOmitted(w))), [], `${C.key}: 0 warnings del worker (salvo los avisos de fixtures mock de Gamma/TTS${C.finalExam ? '' : ' y certificate_omitted:no_final_exam'})`);
+        // r19 L: la DB del E2E no tiene la tabla `user_settings` (la gestiona Supabase), así que el paquete avisa
+        // libro_logo_source_unavailable:user_settings y usa el logo de Cursia; es el único aviso tolerado.
+        eq((os.warnings || []).filter((w) => !/mock/i.test(JSON.stringify(w)) && !(!C.finalExam && certOmitted(w)) && !/^libro_logo_source_unavailable:user_settings$/.test(String(w.detail || w.code || ''))), [], `${C.key}: 0 warnings del worker (salvo los avisos de fixtures mock de Gamma/TTS${C.finalExam ? '' : ' y certificate_omitted:no_final_exam'})`);
         eq((os.warnings || []).filter(certOmitted).length, C.finalExam ? 0 : 1, `${C.key}: aviso certificate_omitted:no_final_exam ${C.finalExam ? 'ausente (hay evaluación final)' : 'presente (sin evaluación final)'}`);
         results.courses[C.key].packageSummary = os;
         await assertExamPackage(C.key, P.buf, C.examBank === true);
@@ -635,13 +637,16 @@ function reservationBookkeeping(ev) {
               // EV6 T3: la imagen de la insignia-certificado depende del TEMA (acento): se compara aparte.
               if (/<component>badges<\/component>/.test(f)) continue;
               const fnm = (/<filename>([^<]*)<\/filename>/.exec(f) || [])[1] || '';
+              // r19 L: el Libro Guía es un PDF que sigue el acento del TEMA → se compara aparte (cambia con el tema).
+              if (/^libro_guia_.*\.pdf$/.test(fnm)) { (m.libro = m.libro || new Set()).add(/<contenthash>(\w+)<\/contenthash>/.exec(f)[1]); continue; }
               const ext = (/\.(mp3|pdf|png|h5p|html)$/.exec(fnm) || [])[1];
               if (ext) (m[ext] = m[ext] || new Set()).add(/<contenthash>(\w+)<\/contenthash>/.exec(f)[1]);
             }
             return Object.fromEntries(Object.entries(m).map(([k, v]) => [k, [...v].sort()]));
           };
           const b1 = await blobs(z1); const b2 = await blobs(z2);
-          eq([b2.mp3, b2.pdf, b2.png], [b1.mp3, b1.pdf, b1.png], `E1-repack: MP3 (${(b1.mp3 || []).length}), PDF (${(b1.pdf || []).length}) y PNG (${(b1.png || []).length}) byte-idénticos entre E1 y E1-repack`);
+          eq([b2.mp3, b2.pdf, b2.png], [b1.mp3, b1.pdf, b1.png], `E1-repack: MP3 (${(b1.mp3 || []).length}), PDF de Gamma (${(b1.pdf || []).length}) y PNG (${(b1.png || []).length}) byte-idénticos entre E1 y E1-repack`);
+          ok((b1.libro || []).length === 1 && (b2.libro || []).length === 1 && b1.libro[0] !== b2.libro[0], 'E1-repack: un Libro Guía PDF en cada paquete, regenerado con el tema nuevo', [b1.libro, b2.libro]);
           // EV6 T3: la imagen de la insignia es función SOLO del tema: cambia con el tema nuevo y es
           // exactamente la que renderiza ese tema (mismos bytes que courseBadgeImages(resolveTheme(perfil nuevo))).
           const badgeBlobs = async (z) => {
@@ -1086,7 +1091,9 @@ function reservationBookkeeping(ev) {
         const blobByHash = async (h) => { const f = zip.file(`files/${h.slice(0, 2)}/${h}`); return f ? f.async('nodebuffer') : null; };
         const aw = (cm['cv3:shell:audio_welcome'] || { files: [] }).files.find((f) => /\.mp3$/.test(f.name));
         const ab = (cm['cv3:shell:audiobook'] || { files: [] }).files.find((f) => /\.mp3$/.test(f.name));
-        const lb = (cm['cv3:shell:libro'] || { files: [] }).files.find((f) => f.name === 'libro_guia_completo.html');
+        const lb = (cm['cv3:shell:libro'] || { files: [] }).files.find((f) => /^libro_guia_.*\.pdf$/.test(f.name));
+        // r19 L (3.13.0): el Libro Guía restaurado es un PDF real (application/pdf, firma %PDF-).
+        if (lb) { const lbb = await blobByHash(lb.hash); ok(lb.mime === 'application/pdf' && lbb && lbb.subarray(0, 5).toString() === '%PDF-', `${label}: el Libro Guía restaurado es un PDF`, { mime: lb.mime }); }
         ok(aw && ab && lb, `${label}: audio de bienvenida, audiolibro y Libro Guía restaurados`, { aw, ab, lb });
         const labels = spawnSync(PHP, ['-c', PHPINI, path.join(HERE, 'moodle-v3-labels.php'), process.env.MOODLE_ROOT, String(courseid)], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
         const L = JSON.parse((labels.stdout || '{}').split('\n').find((l) => l.startsWith('{')) || '{}');

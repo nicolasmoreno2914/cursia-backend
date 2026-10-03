@@ -100,33 +100,47 @@ const REAL = {
   const intro = (bib) => ({ schemaVersion: 1, welcome: 'Hola.', competencies: ['a'], methodology_note: 'm', closing: 'c', bibliography: bib });
   const mod = (bib) => ({ number: 1, title: 'Módulo', intro: { schemaVersion: 1, presentation: 'p', outcomes: ['o'], journey: [], bibliography: bib }, chapters: [{ number: 1, title: 'Cap', md: '# Cap\n\nTexto.' }] });
 
-  await check('Libro Guía: la sección de bibliografía muestra solo obras verificadas, en forma canónica', () => {
-    const html = LB.compileLibroHtmlV3({ courseTitle: 'Curso', theme, courseIntro: intro([REAL.hattie, REAL.suarezInvented]), modules: [mod([REAL.floridiTypo, REAL.selwynMisattributed])] });
-    assert.ok(html.includes('Visible Learning') && html.includes('Cowls, Josh'), 'canónicas presentes');
-    assert.ok(!/Suárez|Cowley|Critical Perspectives and Challenges/.test(html), 'inventadas/erratas ausentes');
-    assert.ok(html.includes('href="#bibliografia"'), 'índice enlaza la bibliografía');
+  // r19 (L1): el Libro Guía es un PDF (renderLibroPdfV3); el texto se extrae con pdfjs.
+  const LL = loadDist('package/v3/libro-logo.js');
+  const pdfText = async (input) => {
+    const r = await LB.renderLibroPdfV3({ ...input, logo: LL.resolveLibroLogo(null) });
+    const pdfjs = await import(require.resolve('pdfjs-dist/legacy/build/pdf.mjs', { paths: [path.resolve(__dirname, '..')] }));
+    const d = await pdfjs.getDocument({ data: new Uint8Array(r.pdf), verbosity: 0 }).promise;
+    let t = '';
+    for (let p = 1; p <= d.numPages; p++) t += (await (await d.getPage(p)).getTextContent()).items.map((i) => i.str).join(' ') + '\n';
+    return { r, t };
+  };
+  await check('Libro Guía: la sección de bibliografía muestra solo obras verificadas, en forma canónica', async () => {
+    const { r, t } = await pdfText({ courseTitle: 'Curso', theme, courseIntro: intro([REAL.hattie, REAL.suarezInvented]), modules: [mod([REAL.floridiTypo, REAL.selwynMisattributed])] });
+    assert.ok(t.includes('Visible Learning') && t.includes('Cowls, Josh'), 'canónicas presentes');
+    assert.ok(!/Suárez|Cowley|Critical Perspectives and Challenges/.test(t), 'inventadas/erratas ausentes');
+    assert.ok(r.hasBibliography && /Índice[\s\S]*Bibliografía/.test(t), 'el índice lista la bibliografía');
   });
 
-  await check('Libro Guía: sin ninguna obra verificable → no hay sección ni enlace de bibliografía vacíos', () => {
-    const html = LB.compileLibroHtmlV3({ courseTitle: 'Curso', theme, courseIntro: intro([REAL.suarezInvented]), modules: [mod([REAL.selwynMisattributed])] });
-    assert.ok(!html.includes('id="bibliografia"') && !html.includes('href="#bibliografia"'), 'sin sección vacía');
-    assert.ok(/<\/html>\s*$/.test(html));
+  await check('Libro Guía: sin ninguna obra verificable → no hay sección ni entrada de bibliografía vacías', async () => {
+    const { r, t } = await pdfText({ courseTitle: 'Curso', theme, courseIntro: intro([REAL.suarezInvented]), modules: [mod([REAL.selwynMisattributed])] });
+    assert.ok(!r.hasBibliography && !t.includes('Bibliografía'), 'sin sección vacía');
+    assert.ok(r.pdf.subarray(0, 5).toString() === '%PDF-');
   });
 
+  // r19: el guion del audiolibro es por bloque del capítulo (sectionNarrationPrompt / sectionContinuationPrompt).
+  const SEC = { idx: 0, title: 'S', text: 'x', words: 300, sha256: 'x' };
+  const narr = (i) => AS.sectionNarrationPrompt(i, SEC, 1, null);
+  const contP = (pais) => AS.sectionContinuationPrompt('texto', SEC, 'T', 100, pais);
   await check('audiolibro: el guion pide tuteo en Colombia (narración y continuación); en Argentina no impone tuteo', () => {
-    const co = AS.chapterNarrationPrompt({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Colombia', contentMarkdown: 'x' });
+    const co = narr({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Colombia', contentMarkdown: 'x' });
     assert.ok(/tuteo/.test(co.system) && /nunca voseo/.test(co.system), 'narración');
-    const cont = AS.chapterContinuationPrompt('texto', 'T', 100, 'Colombia');
+    const cont = contP('Colombia');
     assert.ok(/tuteo/.test(cont.system), 'continuación');
-    const ar = AS.chapterNarrationPrompt({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Argentina', contentMarkdown: 'x' });
+    const ar = narr({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Argentina', contentMarkdown: 'x' });
     assert.ok(!/nunca voseo/.test(ar.system), 'Argentina');
-    const none = AS.chapterNarrationPrompt({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', contentMarkdown: 'x' });
+    const none = narr({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', contentMarkdown: 'x' });
     assert.ok(/tuteo/.test(none.system), 'sin país → tuteo latinoamericano');
   });
 
   await check('audiolibro (R14-11): narración y continuación prohíben multiplicadores atribuidos a investigación y cifras que no estén en el extracto', () => {
-    const co = AS.chapterNarrationPrompt({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Colombia', contentMarkdown: 'x' });
-    const cont = AS.chapterContinuationPrompt('texto', 'T', 100, 'Colombia');
+    const co = narr({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Colombia', contentMarkdown: 'x' });
+    const cont = contP('Colombia');
     for (const [name, p] of [['narración', co], ['continuación', cont]]) {
       assert.ok(/multiplicadores/.test(p.system) && /triplica/.test(p.system), `${name}: multiplicadores`);
       assert.ok(/No inventes ni exageres/.test(p.system), `${name}: veracidad`);
@@ -142,8 +156,8 @@ const REAL = {
   });
 
   await check('audiolibro (R14-13): narración y continuación prohíben anunciar apartados que no se narran y mencionar "el extracto"', () => {
-    const co = AS.chapterNarrationPrompt({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Colombia', contentMarkdown: 'x' });
-    const cont = AS.chapterContinuationPrompt('texto', 'T', 100, 'Colombia');
+    const co = narr({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Colombia', contentMarkdown: 'x' });
+    const cont = contP('Colombia');
     for (const [n, p] of [['narración', co], ['continuación', cont]]) assert.ok(/siguiente apartado/.test(p.system) && /extracto/.test(p.system) && /idea completa/.test(p.system), n);
   });
 
