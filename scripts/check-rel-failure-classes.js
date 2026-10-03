@@ -532,6 +532,26 @@ check('#583 (merge de staging): el reenvío automático ÚNICO de audio TTS inci
   assert(t.class === 'C' && t.adminAction === 'reconcile_provider' && FC.currentRecoveryOf('tts_failed: chunk 3/4: HTTP 503', 'audiobook_chapter', {}) !== 'ambiguous_audio_resubmit', 'tts_failed');
 });
 
+check('cursia#68: cortes del stream SSE de la IA → A transitorio (sin riesgo de pago extra); el reintento de descarga conserva la clase del error interno', () => {
+  for (const m of ['La respuesta de la IA se cortó antes de terminar. Reintentando…', 'Se cortó la conexión con la IA. Reintentando…',
+    'La IA dejó de responder (90 s sin datos). Reintentando…', 'Respuesta de la IA incompleta', '❌ Falló después de 3 intentos: La respuesta de la IA se cortó antes de terminar. Reintentando…']) {
+    const r = v(m, { source: 'browser_executor' });
+    assert(r.class === 'A' && r.strategy === 'retry_backoff' && r.paidRisk === 'measured' && !r.unclassified, `${m} → ${JSON.stringify(r)}`);
+  }
+  expectVerdict('Respuesta ilegible de la API', { class: 'A' }, { source: 'browser_executor' });
+  expectVerdict('Servidor ocupado (stream: overloaded_error). Reintentando…', { class: 'A', code: 'llm_transient' }, { source: 'browser_executor' });
+  const inner = ['text_fetch_failed', 'download_url_failed', 'sign_failed', 'unsupported_download_method', 'artifact_download_unavailable', 'missing_artifact_id',
+    'dynamic_content_md_download_failed: HTTP 503', 'EXAM_BANK_CHAPTER_MD_MISSING: no se pudo leer el texto del capítulo c (HTTP 503)'];
+  for (const i of inner) {
+    const a = v(i, { source: 'browser_executor' });
+    const b = v(`${i} (tras 3 intentos)`, { source: 'browser_executor' });
+    assert(a.class === b.class && a.code === b.code && a.strategy === b.strategy, `«${i}» envuelto cambia de clase: ${a.class}/${a.code} → ${b.class}/${b.code}`);
+  }
+  // El piso de dinero sigue mirando el texto completo del envoltorio.
+  const f = v('dynamic_content_md_download_failed: presupuesto agotado del Storage (tras 3 intentos)', { source: 'browser_executor' });
+  assert(['C', 'D'].includes(f.class), 'piso de dinero con el envoltorio: ' + JSON.stringify(f));
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 // 4. GATE: todo código emitido hoy tiene regla explícita
 // ════════════════════════════════════════════════════════════════════════════
@@ -609,6 +629,23 @@ const FE_EXPR_SAMPLES = new Map([
   ['error', []], ['msg', []], ['e.msg', []], ['result.error', []], ['mapped.msg', []],
   // Excepción cruda: la arma api() (04-api.js, escaneado abajo); una excepción JS cualquiera queda desconocida → D retenido.
   ['(e && e.message) || String(e)', []],
+  // cursia#68 (#583 N4): reintento de la descarga DENTRO del item. Envuelve el error interno con «(tras N intentos)»:
+  // conserva su clase (el código va adelante) y el piso de dinero sigue mirando el texto completo.
+  ["err + ' (tras ' + attempt + ' intentos)'", ['text_fetch_failed (tras 3 intentos)', 'download_url_failed (tras 3 intentos)', 'sign_failed (tras 3 intentos)',
+    'fetch failed (tras 3 intentos)', 'unsupported_download_method (tras 2 intentos)', 'artifact_download_unavailable (tras 2 intentos)']],
+]);
+
+/** Expresiones NO literales de `msg:` en api() (04-api.js), revisadas (texto exacto) → mensajes que producen. */
+const FE_API_EXPR_SAMPLES = new Map([
+  // cursia#68: error dentro del stream SSE (overloaded/rate_limit → 529; otro → 500).
+  ["(overloaded?'Servidor ocupado':'Error del servidor')+' (stream: '+st.error+'). Reintentando…'",
+    ['Servidor ocupado (stream: overloaded_error). Reintentando…', 'Error del servidor (stream: api_error). Reintentando…']],
+  // cursia#68: el stream dejó de responder / se cortó la conexión.
+  ["(idled?'La IA dejó de responder ('+Math.round(API_STREAM_IDLE_MS/1000)+' s sin datos)':'Se cortó la conexión con la IA')+'. Reintentando…'",
+    ['La IA dejó de responder (90 s sin datos). Reintentando…', 'Se cortó la conexión con la IA. Reintentando…']],
+  // Pasamanos: los mensajes de _apiSseResult (escaneados como literales/expresiones arriba).
+  ['se.msg', []],
+  ["se2.msg||'Respuesta de la IA incompleta'", ['Respuesta de la IA incompleta']],
 ]);
 
 /** Corre el gate frontend sobre un directorio; devuelve {missing, samples}. */
@@ -630,7 +667,12 @@ function frontendGate(dir, opts = {}) {
     }
     samples.push([e.line, e.text]);
   }
-  for (const e of SCAN.scanFrontendApi(api)) samples.push([`api:${e.line}`, e.text]);
+  for (const e of SCAN.scanFrontendApi(api)) {
+    if (!e.text.startsWith('__expr__ ')) { samples.push([`api:${e.line}`, e.text]); continue; }
+    const expr = e.text.slice(9);
+    if (!FE_API_EXPR_SAMPLES.has(expr)) { missing.push(`api:${e.line} expresión sin código: ${expr.slice(0, 160)}`); continue; }
+    for (const x of FE_API_EXPR_SAMPLES.get(expr)) samples.push([`api:${e.line}`, x]);
+  }
   // Prefijos literales que el código completa con un número (mismo texto real que arma el navegador).
   const complete = (t) => (/Fall[oó] despu[eé]s de $/.test(t) ? t + '3 intentos: x' : /\($/.test(t) ? t + '503). Reintentando…' : t);
   for (const [line, raw] of samples) {
