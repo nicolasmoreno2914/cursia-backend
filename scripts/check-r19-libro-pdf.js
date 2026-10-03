@@ -464,6 +464,51 @@ const keepAlive = setInterval(() => {}, 1 << 30); // una promesa de pdfjs que no
       assert(l.source === 'cursia_default' && re.test(l.warnings[0] || ''), `${name}: ${JSON.stringify(l.warnings)}`);
     }
   });
+  // ── Fix round 3: candidatos en orden [brand_profile, user_settings]; gana el primero que valida ──
+  {
+    const svgUri = dataUri('image/svg+xml', Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="200" height="80"><rect width="200" height="80"/></svg>'));
+    const brandPng = accountPng();
+    const userPng = accountPng(true);
+    const brandC = (uri) => ({ source: 'brand_profile', dataUri: uri });
+    const userC = (uri) => ({ source: 'user_settings', dataUri: uri });
+    await check('fix 3: brand SVG + user_settings PNG → se usa user_settings, con UN aviso (el del brand)', async () => {
+      const l = LL.resolveLibroLogo([brandC(svgUri), userC(dataUri('image/png', userPng))]);
+      eq([l.source, l.warnings], ['user_settings', ['libro_logo_invalid:brand_profile:svg_unsupported']], 'resultado');
+      assert(samePixels({ ...PNG.decodePng(l.bytes), kind: 3, data: PNG.decodePng(l.bytes).pixels }, pngPixelHash(userPng)), 'bytes = logo de user_settings');
+      // de punta a punta: builder con los candidatos en orden → marca de agua de user_settings y el aviso en el resumen
+      const input = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true });
+      const r = await B.buildDynamicMbzV3({ ...input, libroBrand: { logo: [brandC(svgUri), userC(dataUri('image/png', userPng))], name: null } });
+      assert(r.summary.libro.logoSource === 'user_settings' && r.summary.libro.logoSha256 === l.sha256, JSON.stringify(r.summary.libro));
+      eq(r.summary.warnings.filter((w) => w.startsWith('libro_logo')), ['libro_logo_invalid:brand_profile:svg_unsupported'], 'avisos del logo en el paquete');
+      // la clave de reuse hashea el logo RESUELTO: = la de user_settings solo
+      const fp = PK.libroBrandFingerprintV3({ logo: null, candidates: [brandC(svgUri), userC(dataUri('image/png', userPng))], name: null });
+      eq(fp.sha256, PK.libroBrandFingerprintV3({ logo: userC(dataUri('image/png', userPng)), name: null }).sha256, 'misma clave que el logo resuelto');
+      eq(fp.warnings, ['libro_logo_invalid:brand_profile:svg_unsupported'], 'aviso en prepare');
+    });
+    await check('fix 3: brand PNG + user_settings PNG → gana el brand, sin avisos', () => {
+      const l = LL.resolveLibroLogo([brandC(dataUri('image/png', brandPng)), userC(dataUri('image/png', userPng))]);
+      eq([l.source, l.warnings], ['brand_profile', []], 'resultado');
+      eq(l.sha256, LL.resolveLibroLogo(brandC(dataUri('image/png', brandPng))).sha256, 'bytes del brand');
+    });
+    await check('fix 3: ambos inválidos → Cursia con DOS avisos, en orden', () => {
+      const l = LL.resolveLibroLogo([brandC(svgUri), userC(dataUri('image/png', brandPng.subarray(0, 100)))]);
+      assert(l.source === 'cursia_default' && l.sha256 === cursia.sha256, l.source);
+      assert(l.warnings.length === 2 && l.warnings[0] === 'libro_logo_invalid:brand_profile:svg_unsupported' && /^libro_logo_invalid:user_settings:png_/.test(l.warnings[1]), JSON.stringify(l.warnings));
+    });
+    await check('fix 3: loadLibroBrandV3 lee user_settings aunque haya brand profile y devuelve los candidatos en orden', async () => {
+      const q = { query: async (sql) => {
+        if (/from public\.courses/.test(sql)) return [{ owner_id: 'u1', institution_id: 'i1' }];
+        if (/to_regclass/.test(sql)) return [{ bp: true, us: true, inst: true }];
+        if (/from public\.institutions/.test(sql)) return [{ name: 'Instituto Demo' }];
+        if (/from public\.brand_profiles/.test(sql)) return [{ logo_url: svgUri }];
+        if (/from public\.user_settings/.test(sql)) return [{ logo_b64: dataUri('image/png', userPng) }];
+        throw new Error(sql);
+      } };
+      const b = await PK.loadLibroBrandV3(q, 1, 'u1');
+      eq(b.candidates.map((c) => c.source), ['brand_profile', 'user_settings'], 'orden');
+      eq(LL.resolveLibroLogo(b.candidates).source, 'user_settings', 'resuelto');
+    });
+  }
   await check('B: sin logo → logo de Cursia, sin avisos', async () => {
     for (const cand of [null, undefined, { source: 'user_settings', dataUri: '' }]) {
       const logo = LL.resolveLibroLogo(cand);
