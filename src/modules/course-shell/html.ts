@@ -112,11 +112,12 @@ function readable(bg: string, cands: string[], fallback: string): string {
   return cands.find((c) => contrastRatio(c, bg) >= MIN_CONTRAST) ?? fallback;
 }
 
-export function heading(h: Hx, tag: 'h2' | 'h3' | 'h4', text: string, s: Surf): string {
+export function heading(h: Hx, tag: 'h2' | 'h3' | 'h4', text: string, s: Surf, opts: { display?: boolean } = {}): string {
   const ty = h.t.typography;
   const p = h.t.personality;
+  // r19 W: `display` = tamaño de titular en un h4 (título del curso bajo el h3 «Bienvenida» de Moodle).
   const spec =
-    tag === 'h2'
+    tag === 'h2' || opts.display
       ? { px: ty.sizeDisplayPx, fl: ty.scale.display, font: p.fontDisplay, w: p.displayWeight, lh: '1.08', ls: '-0.015em', m: '0 0 20px 0' }
       : tag === 'h3'
         ? { px: ty.sizeTitlePx, fl: ty.scale.title, font: ty.fontHeading, w: ty.weightHeading, lh: '1.2', ls: '-0.01em', m: '0 0 16px 0' }
@@ -142,13 +143,13 @@ export function heading(h: Hx, tag: 'h2' | 'h3' | 'h4', text: string, s: Surf): 
 }
 
 /** Párrafo "lead" (entrada destacada). */
-export function lead(h: Hx, text: string, s: Surf, opts: { last?: boolean } = {}): string {
+export function lead(h: Hx, text: string, s: Surf, opts: { last?: boolean; cls?: string } = {}): string {
   const ty = h.t.typography;
   const ps = richParagraphs(text);
   return ps
     .map(
       (p, i) =>
-        `<p${st(
+        `<p${opts.cls ? ` class="${opts.cls}"` : ''}${st(
           h,
           [
             ['margin', i === ps.length - 1 && opts.last ? '0' : '0 0 16px 0'],
@@ -344,6 +345,30 @@ export function audio(h: Hx, src: string, label: string, s: Surf, name: string):
   );
 }
 
+/**
+ * r19 W — superficie del hero de bienvenida según `personality.heroTreatment` de la familia
+ * (antes declarado y nunca pintado). Todo en CLEAN_SAFE (fondo sólido + borde + padding); el
+ * radio y el padding fluido son ENHANCED. El texto interior usa la `Surf` que se le pasa a `inner`
+ * (contraste ≥ 4.5:1 garantizado por surfOn; falla fuerte si la familia no lo alcanza).
+ *  - band  → panel tintado (surfaceAlt / surface en láminas oscuras);
+ *  - rule  → fondo del label + filete superior de acento de 6 px + borde fino;
+ *  - plate → tinte suave de acento (accentSoft).
+ */
+export function heroBand(h: Hx, cls: string, inner: (s: Surf) => string): string {
+  const c = h.t.color;
+  const treatment = h.t.personality.heroTreatment;
+  const s = treatment === 'band' ? panelSurf(h) : treatment === 'plate' ? surfOn(h.t, c.accentSoft) : bgSurf(h);
+  const safe: Decl[] = [['background-color', s.bg], ['color', s.fg]];
+  if (treatment === 'rule') {
+    const col = readable(s.bg, [c.accent, c.accentStrong], c.borderStrong);
+    safe.push(['border', `1px solid ${c.border}`], ['border-top', `6px solid ${col}`]);
+  } else if (treatment === 'band') {
+    safe.push(['border', `1px solid ${c.border}`]);
+  }
+  safe.push(['margin', '0 0 24px 0'], ['padding', '24px']);
+  return `<div class="${cls} cvc-hero-${treatment}"${st(h, safe, [['border-radius', h.t.shape.radiusLg], ['padding', 'clamp(20px, 4vw, 44px)'], ['min-width', '0']])}>${inner(s)}</div>`;
+}
+
 /** Fila de cifras (cada cifra sale de facts). CLEAN_SAFE: una lista abierta; ENHANCED: una fila con divisores finos. Sin tarjetas. */
 export function statRow(h: Hx, stats: Array<{ value: number; label: string }>): string {
   const s = bgSurf(h);
@@ -374,6 +399,116 @@ export function transitionBox(h: Hx, inner: string, ink?: string): string {
 
 export function plural(n: number, one: string, many: string): string {
   return n === 1 ? one : many;
+}
+
+// ─── r19 W: entrada + cuerpo (un solo divisor de oraciones para módulo y bienvenida) ───
+
+/** Palabras visibles (separadas por espacios). */
+export function wordCount(text: string): number {
+  return String(text).trim().split(/\s+/).filter(Boolean).length;
+}
+
+/** Abreviaturas frecuentes: su punto no cierra la oración («Dr. Pérez», «EE. UU.»). */
+const ABBREV_BEFORE_DOT = /(?:^|[\s(«"“])(?:Dr|Dra|Sr|Sra|Srta|Ud|Uds|Lic|Ing|Prof|Profa|Arq|Mtro|Mtra|Av|Sto|Sta|núm|Núm|art|Art|pág|Pág|aprox|vs|EE|p\. ej|P\. ej)$/;
+
+/**
+ * Oraciones de `text` SIN perder nada: la concatenación de las piezas es exactamente `text`.
+ * Corte = puntuación final (.!?…) + cierre opcional (»”") + espacio, y la oración siguiente empieza
+ * con mayúscula, ¿, ¡, comillas o dígito. No corta en decimales («1.5»), «N.º», abreviaturas ni dentro
+ * de un `**énfasis**` abierto. (El regex anterior del módulo descartaba en silencio el texto antes de
+ * un punto sin espacio, p. ej. «El valor 1.5 es…».)
+ */
+export function splitSentences(text: string): string[] {
+  const t = String(text);
+  const out: string[] = [];
+  const re = /[.!?…]+[»”"')\]]*\s+/g;
+  let start = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(t))) {
+    const end = m.index + m[0].length;
+    if (end >= t.length) break;
+    if (!/^[\p{Lu}¿¡«“"(\d]/u.test(t.slice(end))) continue;
+    const head = t.slice(start, m.index);
+    if (m[0][0] === '.' && ABBREV_BEFORE_DOT.test(t.slice(0, m.index))) continue;
+    if ((head.match(/\*\*/g) || []).length % 2 === 1) continue;
+    out.push(t.slice(start, end));
+    start = end;
+  }
+  if (start < t.length) out.push(t.slice(start));
+  return out.length ? out : [t];
+}
+
+/**
+ * Entrada (banda) + resto: oraciones enteras desde el inicio mientras quepan en `maxChars`
+ * (y en `maxWords`, si se pide). La primera oración entra siempre; `fits` dice si la entrada
+ * respeta los topes (si no, el caller la muestra a tamaño de cuerpo). Lo usan la presentación
+ * del módulo (240 caracteres) y la bienvenida del curso (240 caracteres / 40 palabras).
+ */
+export function splitLeadRest(text: string, opts: { maxChars: number; maxWords?: number }): { lead: string; rest: string; fits: boolean } {
+  const sentences = splitSentences(text);
+  const ok = (s: string) => s.length <= opts.maxChars && (opts.maxWords === undefined || wordCount(s) <= opts.maxWords);
+  let lead = '';
+  let k = 0;
+  while (k < sentences.length && (lead.length === 0 || ok(lead + sentences[k]))) lead += sentences[k++];
+  return { lead: lead.trim(), rest: sentences.slice(k).join('').trim(), fits: ok(lead.trim()) };
+}
+
+/**
+ * Cuerpo en párrafos legibles: corta en límites de oración, cerca del reparto parejo
+ * (≈ `target` palabras) y nunca por encima de `maxWords`; una línea en blanco del texto
+ * fuerza un corte. Una oración sola más larga que `maxWords` se parte en la coma, punto y
+ * coma o dos puntos más cercano al medio (o, si no hay, en el espacio del medio).
+ * Determinista; la concatenación (normalizando espacios) es el texto original.
+ */
+export function splitBodyParagraphs(text: string, opts: { maxWords: number; target: number }): string[] {
+  const pieces: Array<{ s: string; brk: boolean }> = [];
+  const pushLong = (s: string, brk: boolean) => {
+    if (wordCount(s) <= opts.maxWords) {
+      pieces.push({ s, brk });
+      return;
+    }
+    const mid = s.length / 2;
+    let cut = -1;
+    for (const m of s.matchAll(/[,;:]\s+/g)) {
+      const at = (m.index as number) + m[0].length;
+      if (cut < 0 || Math.abs(at - mid) < Math.abs(cut - mid)) cut = at;
+    }
+    if (cut <= 0 || cut >= s.length) {
+      const sp = [...s.matchAll(/\s+/g)].map((m) => (m.index as number) + m[0].length);
+      cut = sp.reduce((best, at) => (Math.abs(at - mid) < Math.abs(best - mid) ? at : best), sp[0] ?? -1);
+    }
+    if (cut <= 0 || cut >= s.length) {
+      pieces.push({ s, brk });
+      return;
+    }
+    pushLong(s.slice(0, cut), brk);
+    pushLong(s.slice(cut), true);
+  };
+  for (const block of String(text).split(/\r?\n[ \t]*\r?\n/)) {
+    if (!block.trim()) continue;
+    splitSentences(block).forEach((s, i) => pushLong(s, i === 0 && pieces.length > 0));
+  }
+  const total = pieces.reduce((n, p) => n + wordCount(p.s), 0);
+  const n = Math.max(1, Math.ceil(total / opts.target));
+  const per = total / n;
+  const paras: string[] = [];
+  let cur = '';
+  let curW = 0;
+  let done = 0;
+  for (const p of pieces) {
+    const w = wordCount(p.s);
+    // corte si: línea en blanco, se pasa del tope, o el punto medio de la oración cae después del siguiente reparto parejo
+    if (curW > 0 && (p.brk || curW + w > opts.maxWords || done + w / 2 > per * (paras.length + 1))) {
+      paras.push(cur.trim());
+      cur = '';
+      curW = 0;
+    }
+    cur += (cur && !/\s$/.test(cur) ? ' ' : '') + p.s;
+    curW += w;
+    done += w;
+  }
+  if (cur.trim()) paras.push(cur.trim());
+  return paras;
 }
 
 /**

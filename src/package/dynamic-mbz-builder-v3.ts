@@ -221,8 +221,14 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * incluida en el .h5p (delta H5P.QuestionSet-1.21) y los rótulos «Siguiente» / «Anterior» de su navegación: en 1.20
  * el botón «Pregunta siguiente/anterior» salía como un CTA azul vacío junto a «Comprobar». Un paquete con QuestionSet
  * pide restaurar como administrador o gestor (summary.restore), igual que BS / «Repaso».
+ * 3.13.0 (r19 W, bienvenida): el label de bienvenida se compone como pantalla de entrada — superficie del hero
+ * según `heroTreatment` de la familia (band / rule / plate), línea «Curso · N módulos · M capítulos» (facts),
+ * título, filete, entrada de ≤ 40 palabras / 240 caracteres y el resto de `course_intro.welcome` a tamaño de cuerpo
+ * en párrafos de ≤ 70 palabras, antes de la fila de cifras (antes: todo el texto en UN párrafo a tamaño de entrada).
+ * Mismo texto, sin esquema nuevo ni llamadas LLM. El divisor de oraciones (compartido con la presentación del
+ * módulo) ya no descarta el texto previo a un punto sin espacio («1.5») ni corta en abreviaturas.
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.12.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.13.0';
 
 // EV6 P2-B5: `examExplanationsAvailability` vive en course-shell/exam-explanations (lo usa también el validador).
 export { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';

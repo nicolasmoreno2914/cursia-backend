@@ -45,7 +45,7 @@ import type { AssessmentCategoryKey } from '../assessment/resolve-assessment';
 import type { AssessableType } from '../../modules/course-profiles/course-profiles';
 import { extractText, lintCleanSafe, lintResourceMentions, parseHtml } from '../../modules/visual-components';
 import type { HtmlNode } from '../../modules/visual-components';
-import { CERTIFICATE_TEACHER_TROUBLESHOOTING, EXAMS_TEACHER_NOTE, EXAMS_TEACHER_NOTE_ATTEMPTS, EXAMS_TEACHER_NOTE_AVAILABILITY, CertificateRequirements, CourseFacts, chapterNextSteps, closingCertificateText, examOverallFeedbackBands, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles } from '../../modules/course-shell';
+import { CERTIFICATE_TEACHER_TROUBLESHOOTING, EXAMS_TEACHER_NOTE, EXAMS_TEACHER_NOTE_ATTEMPTS, EXAMS_TEACHER_NOTE_AVAILABILITY, CertificateRequirements, CourseFacts, chapterNextSteps, closingCertificateText, examOverallFeedbackBands, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles, WELCOME_LEAD_MAX_WORDS, WELCOME_PARA_MAX_WORDS } from '../../modules/course-shell';
 import { safeActivityName } from '../mbz-common';
 import { courseBadgeDescription } from './course-badge';
 import { QUIZ_REVIEW_V3 } from './moodle-activities-v3';
@@ -62,6 +62,9 @@ import {
   profileBundledMainLibraries,
   profileDeltaDirs,
 } from '../h5p';
+
+/** r19 W: palabras visibles (sin guiones suaves). */
+const wordCountText = (t: string): number => t.replace(/[\u00AD\u200B]/g, '').trim().split(/\s+/).filter(Boolean).length;
 
 // EV6 H5P v2 (fix round 1, m-3): manifest del store (lista de archivos y sha256 por carpeta delta), leído una vez.
 let storeManifestMemo: H5pLibraryStoreManifest | null = null;
@@ -859,6 +862,22 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       const tok = `VIEWBYID*${next.mid}@$`;
       if (next.modname === 'h5pactivity' && `${a.intro}`.includes(tok)) add('NAVIGATION', a.idnumber, `botón «Iniciar actividad» hacia ${next.idnumber}, que ya está embebida debajo`);
       if (next.modname === 'scorm' && !`${a.intro}`.includes(`$@SCORM${tok}`)) add('NAVIGATION', a.idnumber, `sin botón «Iniciar actividad» hacia el SCORM ${next.idnumber}`);
+    }
+  }
+
+  // r19 W: la bienvenida es una pantalla compuesta (hero con superficie, entrada corta, cuerpo en párrafos), nunca
+  // un muro de texto. Solo paquetes del builder ≥ 3.13.0 (los anteriores tenían la bienvenida en un solo párrafo).
+  if (builderVersionAtLeast(exp.builderVersion, '3.13.0')) {
+    const w = acts.find((a) => a.idnumber === 'cv3:shell:welcome');
+    if (w) {
+      const intro = w.intro;
+      if (!/class="cvc-welcome-band cvc-hero-(?:band|rule|plate)"/.test(intro)) add('STRUCTURE', 'cv3:shell:welcome', 'la bienvenida no tiene la superficie del hero (cvc-welcome-band)');
+      const leadP = /<p class="cvc-lead"[^>]*>([\s\S]*?)<\/p>/.exec(intro);
+      if (leadP && wordCountText(extractText(leadP[1])) > WELCOME_LEAD_MAX_WORDS) add('STRUCTURE', 'cv3:shell:welcome', `la entrada de la bienvenida supera ${WELCOME_LEAD_MAX_WORDS} palabras`);
+      for (const m of intro.matchAll(/<p\b[^>]*>([\s\S]*?)<\/p>/g)) {
+        const n = wordCountText(extractText(m[1]));
+        if (n > WELCOME_PARA_MAX_WORDS) add('STRUCTURE', 'cv3:shell:welcome', `párrafo de ${n} palabras en la bienvenida (máximo ${WELCOME_PARA_MAX_WORDS})`);
+      }
     }
   }
 
