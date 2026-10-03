@@ -181,6 +181,9 @@ jobs:
       - name: Check REL MVP recuperación por clase (A/B) + reparación del empaque (puro; la parte PG16 corre local)
         run: node scripts/check-rel-mvp-recovery.js --pure-only
 
+      - name: Check REL lease de ejecución del navegador por run (puro; la parte PG16 corre local)
+        run: node scripts/check-rel-exec-lease.js --pure-only
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
@@ -611,6 +614,12 @@ jobs:
 
                echo "━━━ [4h12] REL R2: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-rel-recovery-schema.js
+
+               echo "━━━ [4h13] REL lease de ejecución del navegador por run (production_jobs.executor_lease_*) (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-rel-exec-lease.js
+
+               echo "━━━ [4h14] REL lease de ejecución: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-rel-exec-lease-schema.js
 
                echo "━━━ [4i] Dynamic Generation: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-dynamic-generation-schema.js

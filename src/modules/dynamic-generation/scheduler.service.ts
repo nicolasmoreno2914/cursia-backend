@@ -74,6 +74,13 @@ import { V3_ARTIFACT_TEXT_READER, V3ArtifactTextReader } from './v3-artifact-rea
 import { EXAM_BANK_DRAFT_ARTIFACT_TYPE, clearExamBankDraft, recordExamBankDraft } from './exam-bank-draft';
 import { FailureSource, classifyFailure, isValidFailureCode } from '../reliability/failure-classifier';
 import { executorKindFor, openItemAttempt, recordItemCompleted, recordItemFailure } from '../reliability/attempt-log';
+import {
+  EXEC_LEASE_RUN_LEASED_ELSEWHERE,
+  acquireRunExecLease,
+  execLeaseSchemaReady,
+  refreshRunExecLease,
+  releaseRunExecLease,
+} from '../reliability/execution-lease';
 
 export type ItemType = ManifestItemType;
 
@@ -278,6 +285,16 @@ export interface ClaimOptions {
   ownerId?: string;
 }
 
+/**
+ * REL lease de ejecución: resultado del claim con el motivo cuando no se entrega nada por el lease
+ * del run (otro ejecutor del navegador lo tiene vigente). `item: null` sin `reason` = nada reclamable.
+ */
+export interface ClaimResult {
+  item: ClaimedItem | null;
+  reason?: typeof EXEC_LEASE_RUN_LEASED_ELSEWHERE;
+  leaseExpiresAt?: string | null;
+}
+
 /** Resultado de una operación sobre un item reclamado (el endpoint lo devuelve tal cual, 200). */
 export interface ItemOpResult {
   ok: boolean;
@@ -407,6 +424,15 @@ export class SchedulerService {
   // ── claim ────────────────────────────────────────────────────────────────
 
   async claimNextItem(opts: ClaimOptions): Promise<ClaimedItem | null> {
+    return (await this.claimNextItemDetailed(opts)).item;
+  }
+
+  /**
+   * Igual que claimNextItem, con el motivo de un claim del NAVEGADOR rechazado por el lease de
+   * ejecución del run (`run_leased_elsewhere` + vencimiento). Los workers internos (sin ownerId)
+   * nunca pasan por el lease.
+   */
+  async claimNextItemDetailed(opts: ClaimOptions): Promise<ClaimResult> {
     const executorId = this.checkExecutorId(opts.executorId);
     const types = this.checkTypes(opts.types);
     const leaseSeconds = this.clampLease(opts.leaseSeconds);
@@ -428,11 +454,12 @@ export class SchedulerService {
       // claim; se sigue con el próximo candidato en vez de devolver "nada".
       for (let attempt = 0; attempt < GLOBAL_CLAIM_RACE_RETRIES; attempt++) {
         const r = await this.claimInRun(opts.runId, executorId, types, leaseSeconds, opts.ownerId);
-        if (r.item) return r.item;
+        if (r.leasedElsewhere) return { item: null, reason: EXEC_LEASE_RUN_LEASED_ELSEWHERE, leaseExpiresAt: r.leasedElsewhere.expiresAt };
+        if (r.item) return { item: r.item };
         if (!r.unavailable) break;
       }
       await this.reportMissingDependencies(opts.runId, opts.ownerId);
-      return null;
+      return { item: null };
     }
 
     // Global (worker, R16). Orden de locks: el candidato se ELIGE sin tomar
@@ -446,6 +473,8 @@ export class SchedulerService {
     // null silencioso por "demasiados runs").
     await this.sweepExpiredLeases();
     const tried: string[] = [];
+    // REL lease: runs cuyo lease de ejecución tiene otro ejecutor del navegador (solo camino navegador).
+    const leasedRuns: string[] = [];
     for (let attempt = 0; attempt < GLOBAL_CLAIM_RACE_RETRIES; attempt++) {
       const [cand] = await this.dataSource.query(
         `select g.id, g.job_id
@@ -463,24 +492,26 @@ export class SchedulerService {
             and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
             and ($2::text is null or pj.owner_id = $2)
             and not (g.id = any($3::uuid[]))
+            and not (g.job_id = any($5::uuid[]))
             and ${claimablePredicate('g', '$4')}
           order by g.created_at, mo.ord nulls last, g.id
           limit 1`,
-        [ACTIVE_RUN_WORKER_STATUSES, opts.ownerId ?? null, tried, types],
+        [ACTIVE_RUN_WORKER_STATUSES, opts.ownerId ?? null, tried, types, leasedRuns],
       );
       if (!cand) {
         await this.reportMissingDependencies(null, opts.ownerId);
-        return null;
+        return { item: null };
       }
       tried.push(cand.id);
-      const { item } = await this.claimInRun(cand.job_id, executorId, types, leaseSeconds, opts.ownerId, cand.id);
-      if (item) return item;
+      const r = await this.claimInRun(cand.job_id, executorId, types, leaseSeconds, opts.ownerId, cand.id);
+      if (r.leasedElsewhere) leasedRuns.push(cand.job_id);
+      if (r.item) return { item: r.item };
     }
     this.logger.warn(
       `claim global: ${GLOBAL_CLAIM_RACE_RETRIES} candidatos seguidos se esfumaron por carreras ` +
         `(executor ${executorId}, tipos ${types.join(',')}); se devuelve null y el próximo poll reintenta`,
     );
-    return null;
+    return { item: null };
   }
 
   /**
@@ -495,9 +526,10 @@ export class SchedulerService {
     leaseSeconds: number,
     ownerId?: string,
     itemId?: string,
-  ): Promise<{ item: ClaimedItem | null; unavailable: boolean }> {
+  ): Promise<{ item: ClaimedItem | null; unavailable: boolean; leasedElsewhere?: { expiresAt: string | null } }> {
     let cancelledJob: any = null;
     let unavailable: string | null = null;
+    let leasedElsewhere: { expiresAt: string | null } | undefined;
     const claimed = await this.runs.tx(async (qr) => {
       const job = await this.lockRun(qr, runId, ownerId, 'update');
       if (!job) return null;
@@ -506,6 +538,18 @@ export class SchedulerService {
         return null;
       }
       if (!isActiveRun(job)) return null;
+
+      // REL lease de ejecución (solo camino navegador): con la fila del run ya bloqueada, se toma o
+      // renueva el lease del run (libre, vencido o ya de este executorId) — aunque después no haya
+      // nada reclamable (un ejecutor ocioso que sondea lo conserva). Si otro ejecutor lo tiene vigente,
+      // no se entrega nada. Los workers del servidor (ownerId ausente) nunca pasan por acá.
+      if (ownerId !== undefined && ownerId !== null && (await execLeaseSchemaReady(qr))) {
+        const lease = await acquireRunExecLease(qr, job.id, executorId, leaseSeconds);
+        if (!lease.ok) {
+          leasedElsewhere = { expiresAt: lease.expiresAt };
+          return null;
+        }
+      }
 
       if ((await sweepRunExpiredLeases(qr, job.id)) > 0) {
         await recomputeRunStatus(qr, job.id);
@@ -560,7 +604,18 @@ export class SchedulerService {
       this.logger.error(`Item ${unavailable} — marcado failed en el claim (dato de una dependencia ausente; no se inventa)`);
     }
     if (cancelledJob) await this.runs.reconcileCancellation(cancelledJob);
-    return { item: claimed, unavailable: unavailable !== null };
+    return { item: claimed, unavailable: unavailable !== null, ...(leasedElsewhere ? { leasedElsewhere } : {}) };
+  }
+
+  /**
+   * REL lease: liberación explícita del lease de ejecución del run por su titular (el navegador al
+   * cerrar la página; best-effort — el vencimiento es la garantía). Nunca toca items ni el acceso.
+   */
+  async releaseRunExecutionLease(runId: string, executorId: string, ownerId: string): Promise<{ ok: true; released: boolean }> {
+    executorId = this.checkExecutorId(executorId);
+    if (!UUID_RE.test(String(runId))) throw new BadRequestException('runId inválido');
+    if (!(await execLeaseSchemaReady(this.dataSource))) return { ok: true, released: false };
+    return { ok: true, released: await releaseRunExecLease(this.dataSource, runId, executorId, ownerId) };
   }
 
   /**
@@ -628,11 +683,17 @@ export class SchedulerService {
                  and pj.worker_status = any($4::text[])
                  and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
                  and ($5::text is null or pj.owner_id = $5))
-          returning g.id`,
+          returning g.id, g.job_id`,
         [itemRunId, executorId, this.clampLease(leaseSeconds), ACTIVE_RUN_WORKER_STATUSES, ownerId ?? null],
       ),
     );
-    if (rows.length === 1) return { ok: true };
+    if (rows.length === 1) {
+      // REL lease: el latido del titular renueva el lease de ejecución del run (solo si sigue siendo suyo).
+      if (ownerId !== undefined && ownerId !== null && (await execLeaseSchemaReady(this.dataSource))) {
+        await refreshRunExecLease(this.dataSource, rows[0].job_id, executorId, this.clampLease(leaseSeconds));
+      }
+      return { ok: true };
+    }
     return { ok: false, reason: await this.diagnose(itemRunId, executorId, ownerId) };
   }
 
@@ -1431,6 +1492,11 @@ export class SchedulerService {
         if (item.status !== 'running') throw new GuardRejection('not_running');
         if (item.worker_id !== executorId) throw new GuardRejection('lease_lost');
         await fn(qr, job, item);
+        // REL lease: complete / fail del titular renuevan el lease de ejecución del run (misma transacción,
+        // fila del run bloqueada FOR UPDATE; si el run quedó terminal, el trigger de la migración lo suelta).
+        if (runLock === 'update' && ownerId !== undefined && ownerId !== null && (await execLeaseSchemaReady(qr))) {
+          await refreshRunExecLease(qr, job.id, executorId, DEFAULT_LEASE_SECONDS);
+        }
         return { ok: true };
       });
     } catch (err) {

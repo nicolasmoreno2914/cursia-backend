@@ -57,6 +57,9 @@ export class ClaimItemDto extends ExecutorBaseDto {
   leaseSeconds?: number;
 }
 
+/** REL lease de ejecución: liberación explícita por el titular. */
+export class ReleaseRunLeaseDto extends ExecutorBaseDto {}
+
 export class HeartbeatItemDto extends ExecutorBaseDto {
   @IsOptional()
   @IsInt()

@@ -10,6 +10,7 @@ import {
   Optional,
   ServiceUnavailableException,
 } from '@nestjs/common';
+import { executionLeaseView, ExecutionLeaseView, normalizeRequestingExecutorId } from '../reliability/execution-lease';
 import { DataSource } from 'typeorm';
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
@@ -294,9 +295,21 @@ export interface RunDto {
   autoRecovery: boolean;
   /**
    * REL MVP fix round 1 (I3): último claim o finalización de una parte del NAVEGADOR (cualquier ejecutor,
-   * cualquier equipo). Si es reciente (< lease del navegador), otro ejecutor está vivo: no se arranca otro.
+   * cualquier equipo). Obsoleto para decidir: lo reemplaza `executionLease` (se conserva para frontends
+   * en caché anteriores al lease).
    */
   lastBrowserActivityAt: string | null;
+  /**
+   * REL lease de ejecución del navegador (servidor = autoridad): ¿algún ejecutor del navegador tiene el
+   * lease vigente de este run, y es el `executorId` que consultó (?executorId=, estable por equipo)?
+   * Solo informa: leer el run / el curso nunca depende del lease. null sin la migración.
+   */
+  executionLease: ExecutionLeaseView | null;
+}
+
+/** REL lease: quién consulta el run (solo para `executionLease.heldByYou`). */
+export interface RunReadOptions {
+  executorId?: string | null;
 }
 
 /** REL MVP fix round 1 (I3): último claim / finalización de una parte que ejecuta el navegador. */
@@ -1436,13 +1449,13 @@ export class RunsService {
    * ESE run. Sin runs, se conserva el comportamiento de siempre contra el
    * Manifest configurado (mismos 404/400; `null` si existe y no tiene runs).
    */
-  async getCurrentRun(courseId: number, ownerId: string, blueprintNumber: number): Promise<RunDto | null> {
+  async getCurrentRun(courseId: number, ownerId: string, blueprintNumber: number, read?: RunReadOptions): Promise<RunDto | null> {
     const current = await this.findCurrentRunOfBlueprint(courseId, ownerId, blueprintNumber);
     if (!current) {
       await this.manifests.get(courseId, ownerId, blueprintNumber);
       return null;
     }
-    return this.buildRunDto(current.job, current.manifest);
+    return this.buildRunDto(current.job, current.manifest, read);
   }
 
   /**
@@ -1613,10 +1626,10 @@ export class RunsService {
     };
   }
 
-  async getRun(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<RunDto> {
+  async getRun(courseId: number, ownerId: string, blueprintNumber: number, runId: string, read?: RunReadOptions): Promise<RunDto> {
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     const job = await this.loadRunRow(courseId, manifest, runId);
-    return this.buildRunDto(job, manifest);
+    return this.buildRunDto(job, manifest, read);
   }
 
   /**
@@ -4652,7 +4665,7 @@ export class RunsService {
     return out;
   }
 
-  private async buildRunDto(job: any, manifest: ManifestDto): Promise<RunDto> {
+  private async buildRunDto(job: any, manifest: ManifestDto, read?: RunReadOptions): Promise<RunDto> {
     job = await this.reconcileCancellation(job);
     job = await this.sweepAndRecompute(job);
     const ctx = await this.loadContextRow(job.id);
@@ -4698,6 +4711,7 @@ export class RunsService {
       completion,
       autoRecovery: autoRecoveryEnabled(),
       lastBrowserActivityAt: lastBrowserActivityOf(rows),
+      executionLease: executionLeaseView(job, normalizeRequestingExecutorId(read?.executorId), isActive(job)),
     };
   }
 
