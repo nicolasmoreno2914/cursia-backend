@@ -112,11 +112,12 @@ function readable(bg: string, cands: string[], fallback: string): string {
   return cands.find((c) => contrastRatio(c, bg) >= MIN_CONTRAST) ?? fallback;
 }
 
-export function heading(h: Hx, tag: 'h2' | 'h3' | 'h4', text: string, s: Surf): string {
+export function heading(h: Hx, tag: 'h2' | 'h3' | 'h4', text: string, s: Surf, opts: { display?: boolean } = {}): string {
   const ty = h.t.typography;
   const p = h.t.personality;
+  // r19 W: `display` = tamaño de titular en un h4 (título del curso bajo el h3 «Bienvenida» de Moodle).
   const spec =
-    tag === 'h2'
+    tag === 'h2' || opts.display
       ? { px: ty.sizeDisplayPx, fl: ty.scale.display, font: p.fontDisplay, w: p.displayWeight, lh: '1.08', ls: '-0.015em', m: '0 0 20px 0' }
       : tag === 'h3'
         ? { px: ty.sizeTitlePx, fl: ty.scale.title, font: ty.fontHeading, w: ty.weightHeading, lh: '1.2', ls: '-0.01em', m: '0 0 16px 0' }
@@ -142,13 +143,13 @@ export function heading(h: Hx, tag: 'h2' | 'h3' | 'h4', text: string, s: Surf): 
 }
 
 /** Párrafo "lead" (entrada destacada). */
-export function lead(h: Hx, text: string, s: Surf, opts: { last?: boolean } = {}): string {
+export function lead(h: Hx, text: string, s: Surf, opts: { last?: boolean; cls?: string; enh?: Decl[] } = {}): string {
   const ty = h.t.typography;
   const ps = richParagraphs(text);
   return ps
     .map(
       (p, i) =>
-        `<p${st(
+        `<p${opts.cls ? ` class="${opts.cls}"` : ''}${st(
           h,
           [
             ['margin', i === ps.length - 1 && opts.last ? '0' : '0 0 16px 0'],
@@ -158,7 +159,7 @@ export function lead(h: Hx, text: string, s: Surf, opts: { last?: boolean } = {}
             ['line-height', '1.5'],
             ['max-width', '60ch'],
           ],
-          [['font-size', ty.scale.lead]],
+          [['font-size', ty.scale.lead], ...(opts.enh ?? [])],
         )}>${p}</p>`,
     )
     .join('');
@@ -210,7 +211,7 @@ export function rows(h: Hx, itemsHtml: string, opts: { cls?: string; ordered?: b
 }
 
 /** Párrafos de texto plano (línea en blanco = párrafo). */
-export function paras(h: Hx, text: string, s: Surf, opts: { secondary?: boolean; weight?: number; last?: boolean } = {}): string {
+export function paras(h: Hx, text: string, s: Surf, opts: { secondary?: boolean; weight?: number; last?: boolean; enh?: Decl[] } = {}): string {
   const ty = h.t.typography;
   const ps = richParagraphs(text);
   return ps
@@ -224,7 +225,7 @@ export function paras(h: Hx, text: string, s: Surf, opts: { secondary?: boolean;
         ['max-width', `${ty.measureCh}ch`],
       ];
       if (opts.weight) safe.push(['font-weight', String(opts.weight)]);
-      return `<p${st(h, safe, [['font-size', ty.enhanced.sizeBodyFluid]])}>${p}</p>`;
+      return `<p${st(h, safe, [['font-size', ty.enhanced.sizeBodyFluid], ...(opts.enh ?? [])])}>${p}</p>`;
     })
     .join('');
 }
@@ -355,6 +356,33 @@ export function audio(h: Hx, src: string, label: string, s: Surf, name: string):
   );
 }
 
+/**
+ * r19 W — superficie del hero de bienvenida según `personality.heroTreatment` de la familia
+ * (antes declarado y nunca pintado). Todo en CLEAN_SAFE (fondo sólido + borde + padding); el
+ * radio y el padding fluido son ENHANCED. El texto interior usa la `Surf` que se le pasa a `inner`
+ * (contraste ≥ 4.5:1 garantizado por surfOn; falla fuerte si la familia no lo alcanza).
+ *  - band  → panel tintado (surfaceAlt / surface en láminas oscuras);
+ *  - rule  → fondo del label + filete superior de acento de 6 px + borde fino;
+ *  - plate → tinte suave de acento (accentSoft).
+ */
+export function heroBand(h: Hx, cls: string, inner: (s: Surf) => string): string {
+  const c = h.t.color;
+  const treatment = h.t.personality.heroTreatment;
+  const s = treatment === 'band' ? panelSurf(h) : treatment === 'plate' ? surfOn(h.t, c.accentSoft) : bgSurf(h);
+  const safe: Decl[] = [['background-color', s.bg], ['color', s.fg]];
+  if (treatment === 'rule') {
+    const col = readable(s.bg, [c.accent, c.accentStrong], c.borderStrong);
+    safe.push(['border', `1px solid ${c.border}`], ['border-top', `6px solid ${col}`]);
+  } else if (treatment === 'band') {
+    safe.push(['border', `1px solid ${c.border}`]);
+  }
+  safe.push(['margin', '0 0 24px 0'], ['padding', '24px']);
+  // Fix round 1: en las familias de lámina (oscuras) el label ya trae su propio padding fluido; el hero usa uno menor
+  // para que la entrada (≤ 240 caracteres) quepa en 4 líneas a 1280 igual que en las claras.
+  const pad = h.t.personality.plate ? 'clamp(20px, 3vw, 28px)' : 'clamp(20px, 4vw, 44px)';
+  return `<div class="${cls} cvc-hero-${treatment}"${st(h, safe, [['border-radius', h.t.shape.radiusLg], ['padding', pad], ['min-width', '0']])}>${inner(s)}</div>`;
+}
+
 /** Fila de cifras (cada cifra sale de facts). CLEAN_SAFE: una lista abierta; ENHANCED: una fila con divisores finos. Sin tarjetas. */
 export function statRow(h: Hx, stats: Array<{ value: number; label: string }>): string {
   const s = bgSurf(h);
@@ -385,6 +413,158 @@ export function transitionBox(h: Hx, inner: string, ink?: string): string {
 
 export function plural(n: number, one: string, many: string): string {
   return n === 1 ? one : many;
+}
+
+// ─── r19 W: entrada + cuerpo (un solo divisor de oraciones para módulo y bienvenida) ───
+
+/** Palabras visibles (separadas por espacios). */
+export function wordCount(text: string): number {
+  return String(text).trim().split(/\s+/).filter(Boolean).length;
+}
+
+/**
+ * Fix round 2: peso visual para repartir el cuerpo — una palabra normal pesa 1; un token de más de 22 caracteres
+ * (URL, cadena sin espacios) pesa ⌈largo / 5⌉, lo que ocupa en líneas. Siempre ≥ wordCount: un párrafo de peso ≤ 70
+ * tiene ≤ 70 palabras (lo que exige el validador) y no se vuelve un bloque altísimo por un token largo.
+ */
+export function wordWeight(text: string): number {
+  return String(text).trim().split(/\s+/).filter(Boolean).reduce((n, w) => n + ([...w].length > 22 ? Math.ceil([...w].length / 5) : 1), 0);
+}
+
+/** Abreviaturas frecuentes: su punto no cierra la oración («Dr. Pérez», «EE. UU.»). Solo en modo `guard`. */
+const ABBREV_BEFORE_DOT = /(?:^|[\s(«"“])(?:Dr|Dra|Sr|Sra|Srta|Ud|Uds|Lic|Ing|Prof|Profa|Arq|Mtro|Mtra|Av|Sto|Sta|núm|Núm|art|Art|pág|Pág|aprox|vs|EE|UU|p\. ej|P\. ej)$/;
+
+export interface SentenceOpts {
+  /**
+   * false (default, presentación del módulo): EXACTAMENTE los cortes del regex de 3.12.0
+   * (`[.!?]+` seguido de espacio, sea cual sea lo que siga: minúscula, `**`, raya, emoji…), así
+   * su salida no cambia; la única diferencia es que ya no descarta texto (ver splitSentences).
+   * true (bienvenida, r19 W): además no corta tras una abreviatura ni dentro de un énfasis `*…*`
+   * abierto, corta en «…» y en una línea en blanco.
+   */
+  guard?: boolean;
+}
+
+/**
+ * Oraciones de `text` SIN perder nada: la concatenación de las piezas es exactamente `text`.
+ * Corte = puntuación final + cierre opcional (»”"')]) + espacio. Un punto sin espacio detrás
+ * («1.5», «N.º», «web.com») no corta. El regex anterior del módulo
+ * (`/[^.!?]+[.!?]+(\s+|$)|[^.!?]+$/g`) DESCARTABA en silencio el texto previo a ese punto
+ * («El valor 1.5 es…» perdía «El valor 1.»); en todo texto que no perdía nada, los cortes son los
+ * mismos que los de aquel regex (modo por defecto).
+ */
+export function splitSentences(text: string, opts: SentenceOpts = {}): string[] {
+  const t = String(text);
+  const out: string[] = [];
+  const re = opts.guard ? /(?:[.!?…]+[»”"')\]]*\s+|\r?\n[ \t]*\r?\n\s*)/g : /[.!?]+[»”"')\]]*\s+/g;
+  let start = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(t))) {
+    const end = m.index + m[0].length;
+    if (end >= t.length) break;
+    if (opts.guard && /^[.!?…]/.test(m[0])) {
+      if (m[0][0] === '.' && ABBREV_BEFORE_DOT.test(t.slice(0, m.index))) continue;
+      const head = t.slice(0, m.index);
+      if ((head.match(/\*\*/g) || []).length % 2 === 1 || (head.replace(/\*\*/g, '').match(/\*/g) || []).length % 2 === 1) continue;
+    }
+    if (end === start) continue;
+    out.push(t.slice(start, end));
+    start = end;
+  }
+  if (start < t.length) out.push(t.slice(start));
+  return out.length ? out : [t];
+}
+
+/**
+ * Corta `s` en [cabeza, cola] con la cabeza lo más larga posible dentro de los topes: en el
+ * último límite de cláusula (`,` `;` `:` `—` `–`) que quepa; si no hay, en el último espacio.
+ * Sin elipsis ni texto agregado: cabeza + cola = s. `null` si ni una palabra cabe.
+ */
+export function cutToFit(s: string, maxChars: number, maxWords?: number, count: (x: string) => number = wordCount): [string, string] | null {
+  const ok = (x: string) => x.trim().length > 0 && x.trim().length <= maxChars && (maxWords === undefined || count(x) <= maxWords);
+  const ends = (re: RegExp) => [...s.matchAll(re)].map((m) => (m.index as number) + m[0].length).filter((at) => at < s.length);
+  for (const re of [/[,;:—–]\s+|\s+[—–]\s+/g, /\s+/g]) {
+    const cut = ends(re).filter((at) => ok(s.slice(0, at))).pop();
+    if (cut !== undefined) return [s.slice(0, cut), s.slice(cut)];
+  }
+  return null;
+}
+
+/**
+ * Entrada (banda) + resto: oraciones enteras desde el inicio mientras quepan en `maxChars`
+ * (y en `maxWords`, si se pide). La primera oración entra siempre, salvo con `cut`: si no cabe,
+ * se corta con cutToFit y lo que sobra abre el resto (bienvenida: ninguna forma de texto válida
+ * por el esquema produce una entrada fuera de tope). Con `guard` la entrada no cruza una línea en
+ * blanco. `fits` dice si la entrada respeta los topes (con `cut` siempre: entrada conforme o vacía). Lo usan la presentación del módulo
+ * (240 caracteres, modo 3.12.0) y la bienvenida (240 caracteres / 40 palabras, guard + cut).
+ */
+export function splitLeadRest(
+  text: string,
+  opts: { maxChars: number; maxWords?: number; guard?: boolean; cut?: boolean },
+): { lead: string; rest: string; fits: boolean } {
+  const sentences = splitSentences(text, { guard: opts.guard });
+  const ok = (s: string) => s.trim().length <= opts.maxChars && (opts.maxWords === undefined || wordCount(s) <= opts.maxWords);
+  const blankEnd = (s: string) => opts.guard === true && /\n[ \t]*\r?\n\s*$/.test(s);
+  let lead = '';
+  let k = 0;
+  while (k < sentences.length && (lead.length === 0 || (!blankEnd(lead) && ok(lead + sentences[k])))) lead += sentences[k++];
+  let rest = sentences.slice(k).join('');
+  if (opts.cut && !ok(lead)) {
+    // Fix round 2: garantía total. La entrada = el prefijo más largo de palabras enteras que cabe; si ni la primera
+    // palabra cabe (un token de > 240 caracteres), NO hay entrada y todo el texto va al cuerpo.
+    const c = cutToFit(lead, opts.maxChars, opts.maxWords);
+    rest = (c ? c[1] : lead) + rest;
+    lead = c ? c[0] : '';
+  }
+  return { lead: lead.trim(), rest: rest.trim(), fits: lead.trim() === '' ? opts.cut === true : ok(lead.trim()) };
+}
+
+/**
+ * Cuerpo en párrafos legibles: corta en límites de oración, cerca del reparto parejo
+ * (≈ `target` palabras) y nunca por encima de `maxWords`; una línea en blanco del texto
+ * fuerza un corte. Una oración sola más larga que `maxWords` se parte con cutToFit (cláusula,
+ * luego espacio) y sus trozos siguen el reparto normal. Se cuenta con wordWeight (≥ palabras): un token
+ * larguísimo cuenta por las líneas que ocupa. Determinista; la concatenación
+ * (normalizando espacios) es el texto original.
+ */
+export function splitBodyParagraphs(text: string, opts: { maxWords: number; target: number }): string[] {
+  const pieces: Array<{ s: string; brk: boolean }> = [];
+  for (const block of String(text).split(/\r?\n[ \t]*\r?\n/)) {
+    if (!block.trim()) continue;
+    splitSentences(block, { guard: true }).forEach((s0, i) => {
+      let s = s0;
+      let brk = i === 0 && pieces.length > 0;
+      while (wordWeight(s) > opts.maxWords && wordCount(s) > 1) {
+        const c = cutToFit(s, Infinity, opts.maxWords, wordWeight);
+        if (!c) break;
+        pieces.push({ s: c[0], brk });
+        s = c[1];
+        brk = false;
+      }
+      pieces.push({ s, brk });
+    });
+  }
+  const total = pieces.reduce((n, p) => n + wordWeight(p.s), 0);
+  const n = Math.max(1, Math.ceil(total / opts.target));
+  const per = total / n;
+  const paras: string[] = [];
+  let cur = '';
+  let curW = 0;
+  let done = 0;
+  for (const p of pieces) {
+    const w = wordWeight(p.s);
+    // corte si: línea en blanco, se pasa del tope, o el punto medio de la pieza cae después del siguiente reparto parejo
+    if (curW > 0 && (p.brk || curW + w > opts.maxWords || done + w / 2 > per * (paras.length + 1))) {
+      paras.push(cur.trim());
+      cur = '';
+      curW = 0;
+    }
+    cur += (cur && !/\s$/.test(cur) ? ' ' : '') + p.s;
+    curW += w;
+    done += w;
+  }
+  if (cur.trim()) paras.push(cur.trim());
+  return paras;
 }
 
 /**

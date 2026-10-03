@@ -230,7 +230,7 @@ const getPath = (o, p) => p.split('.').reduce((a, k) => (a == null ? a : a[k]), 
   const cfg = GOLD.MBZ_CONFIGS[0]; // h5p-final-light
   const built = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, cfg));
   await check('builder v3 ≥ 3.12.0: toda actividad QuestionSet es 1.21 con su delta; DragText/Blanks siguen content-only; summary.restore = administrador o gestor (pack v3); summary.h5pProfileVersion = 3', async () => {
-    eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.13.0', 'versión'); // r19 L: 3.12.0 → 3.13.0 (Libro Guía PDF)
+    eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.13.0', 'versión'); // r19 L: 3.12.0 → 3.13.0 (Libro Guía PDF + bienvenida)
     const z = await JSZip.loadAsync(built.mbz);
     const fx = await z.file('files.xml').async('string');
     const qsPkgs = built.summary.h5pPackages.filter((p) => p.mainLibrary === 'H5P.QuestionSet');

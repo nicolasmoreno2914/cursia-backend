@@ -531,9 +531,10 @@ const ENV_KEYS = [
       // QUIZFB (builder 3.10.0): mismo dorado que check-ev6-pending-videos (antes 5de36d06…, builder 3.6.0).
       // #583 QUAL (builder 3.11.0): reviewmaxmarks 69904 → 272, frase del cierre, tarjeta del Libro Guía como <intro> del recurso (sin label libro_card; ids renumerados) y runtime VC 4 — diff semántico en scratchpad/r18/qual/golddiff/sem.js (antes 812c6022…, 3.10.0).
       // UX r18 (builder 3.12.0): mismo dorado que check-ev6-pending-videos (antes 63dac759…, 3.11.0).
+      // r19 W (builder 3.12.0 → 3.13.0): SOLO cambia el label cv3:shell:welcome (hero con superficie según heroTreatment, «Curso · N módulos · M capítulos», entrada ≤ 40 palabras y cuerpo en párrafos ≤ 70) — diff por entrada del zip en scratchpad/r19/w-logs/golddiff (hook.js + diff.js) (antes 7cb2a7c7…, 3.12.0).
       // r19 L fix round 1: logo de la portada a opacidad plena, /Keywords del PDF (sha del plan) y transliteración — vuelve a mover solo el blob del Libro.
       // r19 L (builder 3.13.0): Libro Guía en PDF + botón en su descripción — mismo dorado que check-ev6-pending-videos (antes 7cb2a7c7…, 3.12.0).
-      const GOLDEN_644 = '02af361a7c149ef9a94976bdf64d475421b79c5d4fb94b5814b8c7d14427a3ed';
+      const GOLDEN_644 = 'e64d1b6163be68cf28c20c55473f93d41745542e60f60b4ebc45a2d0ebbe5363';
       const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
       const r0 = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, o));
       const r1 = await B.buildDynamicMbzV3({ ...PF.packagingInput(distRoot, o), qaPreviewNotice: false });

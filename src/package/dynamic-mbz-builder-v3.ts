@@ -227,6 +227,12 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * agua por página (logo de la cuenta → logo de Cursia; un logo inválido cae a Cursia con aviso `libro_logo_invalid:…`);
  * la descripción del recurso lleva el botón «Abrir Libro Guía →» hacia su propio `$@RESOURCEVIEWBYID*mid@$` en una
  * pestaña nueva (`target="_blank"`, display 5 = view.php entrega el PDF). El logo y la marca entran en la clave de reuse.
+ * 3.13.0 (r19 W, bienvenida, mismo número de versión): el label de bienvenida se compone como pantalla de entrada — superficie del hero
+ * según `heroTreatment` de la familia (band / rule / plate), línea «Curso · N módulos · M capítulos» (facts),
+ * título, filete, entrada de ≤ 40 palabras / 240 caracteres y el resto de `course_intro.welcome` a tamaño de cuerpo
+ * en párrafos de ≤ 70 palabras, antes de la fila de cifras (antes: todo el texto en UN párrafo a tamaño de entrada).
+ * Mismo texto, sin esquema nuevo ni llamadas LLM. El divisor de oraciones (compartido con la presentación del
+ * módulo) ya no descarta el texto previo a un punto sin espacio («1.5») ni corta en abreviaturas.
  */
 export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.13.0';
 

@@ -1,0 +1,116 @@
+/* eslint-disable */
+// r19 W — textos de bienvenida (`course_intro.welcome`) de largo real para los checks de composición.
+//  - w625 / w616: las bienvenidas reales de los cursos #625 (Técnico, 141 palabras) y #616 (Editorial, 155), tal
+//    cual salieron del paquete (r19/DIAG-W, diag-w/62x_s0_1000_label.html);
+//  - short80 / long220: los extremos del esquema (80–220 palabras, intro-schemas.ts);
+//  - abbrev: abreviaturas, decimales y «N.º» (no se corta dentro de ellos ni se pierde texto);
+//  - longFirst: primera oración de > 40 palabras (fix round 1: la entrada se corta en la última cláusula que cabe y el
+//    resto de la oración abre el cuerpo).
+'use strict';
+
+const WELCOMES = {
+  w625:
+    'Imagina que llegas a trabajar a una panadería y lo primero que tienes que hacer es amasar. ¿Sabes si la mesada está limpia? ' +
+    '¿La harina lleva el tiempo adecuado almacenada? ¿Tocaste algo crudo antes de manipular el pan terminado? Estas preguntas parecen ' +
+    'simples, pero marcan la diferencia entre un producto seguro y uno que puede enfermar a quien lo consume. En Chile, el Reglamento ' +
+    'Sanitario de los Alimentos establece las condiciones que deben cumplir quienes trabajan con alimentos, y las panaderías no son la ' +
+    'excepción. Este curso te prepara para cumplir esas exigencias desde el primer día de trabajo: vas a aprender a identificar y prevenir ' +
+    'la contaminación cruzada en tu puesto, y a conservar insumos y productos a las temperaturas correctas. Todo con ejemplos del día a día ' +
+    'de una panadería, sin tecnicismos innecesarios, para que puedas aplicarlo de inmediato.',
+  w616:
+    '¿Alguna vez fuiste a un restaurante y la atención fue tan buena que volviste aunque la comida no era perfecta? Eso no pasa por ' +
+    'casualidad. En la gastronomía peruana, los restaurantes familiares son el corazón de la industria: desde una cevichería en el Callao ' +
+    'hasta una picantería en Arequipa, la experiencia del comensal depende en gran medida de quién lo atiende y cómo. Este curso te da las ' +
+    'herramientas concretas para hacer ese trabajo bien desde el primer día. Vas a aprender a recibir a tus comensales con calidez, ' +
+    'ubicarlos con criterio, tomar pedidos sin errores que lleguen a la cocina torcidos y, cuando algo salga mal, convertir ese momento ' +
+    'incómodo en una razón para que el cliente quiera regresar. No necesitas experiencia previa. Solo necesitas ganas de entender que ' +
+    'atender bien es una habilidad que se aprende, se practica y marca la diferencia entre un restaurante que crece y uno que lucha por sobrevivir.',
+  short80:
+    'Atender bien a una persona empieza mucho antes de decir la primera palabra. En este curso vas a practicar cómo escuchar con atención, ' +
+    'cómo explicar una solución sin rodeos y cómo cerrar cada conversación con un acuerdo claro. Cada capítulo parte de una situación real ' +
+    'del mostrador o del teléfono. Al final de cada tramo tendrás una práctica breve para comprobar lo aprendido y volver sobre lo que ' +
+    'necesites, a tu ritmo y sin presión. Empieza cuando quieras y avanza paso a paso.',
+  long220:
+    'Cada día, miles de personas llegan a un mostrador, llaman a una línea de ayuda o escriben un mensaje esperando que alguien las ' +
+    'escuche de verdad. Lo que pasa en esos momentos define si vuelven o si se van para siempre. Sin embargo, casi nadie nos enseñó a ' +
+    'atender con método: aprendimos mirando a otros, repitiendo frases hechas y resolviendo como se pudo. Este curso cambia eso. Vas a ' +
+    'conocer un recorrido completo, desde el primer saludo hasta el seguimiento posterior, con herramientas que puedes usar el mismo día. ' +
+    'Empezaremos por la escucha activa, porque sin ella cualquier solución llega tarde o equivocada. Después trabajaremos la forma de ' +
+    'explicar procesos complejos con palabras simples, sin perder la precisión que el cliente necesita para decidir. Más adelante ' +
+    'abordaremos los reclamos difíciles, esos que ponen a prueba la paciencia, y verás cómo un método ordenado transforma una queja en ' +
+    'confianza. También vas a practicar la negociación de acuerdos justos, para que ambas partes sientan que ganaron algo valioso. Cada ' +
+    'capítulo combina una lectura breve, un ejemplo cercano y una práctica para que compruebes lo aprendido. No necesitas experiencia ' +
+    'previa ni conocimientos técnicos. Solo necesitas curiosidad, disposición para probar cosas nuevas y ganas de mejorar la experiencia ' +
+    'de cada persona que atiendes, empezando por la próxima que cruce tu puerta mañana.',
+  abbrev:
+    'El Dr. Ramírez lo resume así: la seguridad alimentaria se juega en los detalles. Una temperatura de 4.5 grados puede parecer ' +
+    'suficiente, pero no siempre lo es. La Resolución N.º 3 lo deja claro para todo el sector. En EE. UU. y en Chile se usan criterios ' +
+    'parecidos, aunque con matices. Este curso te muestra cómo aplicarlos en tu cocina, paso a paso, con ejemplos concretos y prácticas ' +
+    'breves. Vas a revisar la recepción de insumos, el almacenamiento en frío, la manipulación en la línea y la limpieza al cierre del ' +
+    'turno, siempre con la misma pregunta en mente: ¿esto protege a quien va a comer?',
+  longFirst:
+    'Cuando una persona entra a tu local con un problema que no sabe cómo explicar, con prisa, con dudas sobre lo que realmente necesita ' +
+    'y con la sensación de que nadie la va a escuchar, lo que hagas en los primeros segundos define toda la conversación que viene después. ' +
+    'Este curso te prepara para esos momentos. Vas a practicar la escucha activa, la explicación clara y el cierre con acuerdos que se ' +
+    'cumplen, siempre a partir de situaciones reales del mostrador y del teléfono.',
+};
+
+module.exports = { WELCOMES };
+
+// ─── Fix round 1 ───────────────────────────────────────────────────────────
+// C1 (review r19 W): formas válidas por el esquema que en la primera versión hacían fallar el empaquetado.
+const W = (n, word) => Array.from({ length: n }, (_, i) => `${word}${i % 10}`).join(' ');
+const C1_WELCOMES = {
+  // la bienvenida realista de 107 palabras con una primera oración de 78 (review-w/pkg.js)
+  firstSentence78:
+    'Cuando un cliente llega molesto a tu mostrador porque su pedido se atrasó, no encuentra lo que buscaba o simplemente tuvo un mal ' +
+    'día y necesita que alguien lo escuche, la forma en que respondas en los primeros segundos, con tu tono, tu postura y las palabras ' +
+    'que elijas, puede convertir una queja en una relación de confianza que dure años o en una pérdida que nadie en la empresa va a ' +
+    'notar hasta que sea demasiado tarde. Este curso te enseña a responder con método. Vas a practicar la escucha activa, la ' +
+    'explicación clara y el cierre con acuerdos concretos, siempre con situaciones reales del mostrador.',
+  // sin un solo signo de puntuación (ni cláusulas: corte en palabra)
+  noPunctuation: W(120, 'paso'),
+  // UNA oración de 220 palabras (el tope del esquema; ≤ 2000 caracteres)
+  single220: `${W(220, 'ok')}.`,
+  // una sola oración con cláusulas (≥ 80 palabras)
+  oneSentence:
+    'En este curso vas a recorrer, paso a paso y con ejemplos de tu propio trabajo, la forma de recibir a cada persona con calidez, ' +
+    'de escuchar lo que de verdad necesita aunque no sepa explicarlo, de ordenar una respuesta clara cuando el problema es difícil, ' +
+    'de cerrar cada conversación con un acuerdo que se pueda cumplir y de volver sobre lo aprendido cada vez que lo necesites, ' +
+    'a tu ritmo, sin presión y con prácticas breves que te muestran en el momento si vas por buen camino o si conviene repasar.',
+};
+
+// I2: presentaciones de módulo cuyos cortes el regex de 3.12.0 hacía bien (punto + `**`, raya, minúscula, emoji,
+// «…», abreviatura): la salida de moduleIntroLabel debe quedar BYTE A BYTE igual a 3.12.0. `decimal` es la única
+// excepción permitida (3.12.0 descartaba «El valor 1.»).
+const MODULE_PRESENTATIONS = {
+  emphasisStart: 'Este módulo abre la ruta. **La higiene** define cada paso del trabajo diario en la cocina, desde la recepción de insumos hasta la limpieza final del turno, y por eso la vas a practicar en todos los capítulos con casos reales.',
+  dashStart: 'Este módulo abre la ruta. — Y lo hace con casos reales de la cocina, desde la recepción hasta el cierre del turno, para que cada técnica tenga un uso concreto en tu jornada y la puedas aplicar de inmediato.',
+  enDashStart: 'Primero lo básico. – Después, la práctica guiada con ejemplos de tu propio puesto de trabajo y preguntas para revisar lo que haces cada día, sin tecnicismos y a tu ritmo, con pausas para pensar.',
+  lowercaseStart: 'Este curso es útil. iPhone, tablet o computador: cualquier equipo te sirve para seguir cada capítulo, ver los ejemplos, resolver las prácticas y volver sobre lo que necesites cuando quieras, sin depender de un horario fijo.',
+  emojiStart: 'Arrancamos con lo esencial. 🙂 Cada capítulo trae una lectura breve, un ejemplo cercano y una práctica corta que puedes resolver en pocos pasos desde cualquier lugar y repetir cuantas veces quieras para afianzar lo aprendido.',
+  ellipsis: 'Todo empieza así… Luego cambia, y el módulo te muestra por qué: cada decisión en el mostrador tiene un efecto en la experiencia del cliente, y aquí vas a aprender a anticiparlo con ejemplos concretos y preguntas para tu práctica.',
+  abbrev: 'El Dr. Ramírez lo resume así: la calidad se juega en los detalles. Este módulo te muestra cómo cuidarlos en cada etapa del servicio, con ejemplos reales del mostrador, del teléfono y de los canales digitales que usas todos los días.',
+  decimal: 'El valor 1.5 es el umbral de referencia. Este módulo explica de dónde sale y cómo usarlo en tu trabajo diario, con ejemplos concretos y preguntas para revisar tu propia práctica en cada capítulo del recorrido.',
+};
+
+// Fix round 2 (re-review r19 W): un token sin espacios de > 240 caracteres. Primera palabra = token → SIN entrada (todo al
+// cuerpo); token dentro de la primera oración → la entrada son las palabras previas. Ninguno desborda a 375 px.
+const relleno = Array.from({ length: 90 }, (_, i) => `relleno${'abcdefghi'[i % 9]}`).join(' ');
+C1_WELCOMES.tokenFirst250 = `${'a'.repeat(250)} ${Array.from({ length: 90 }, (_, i) => `relleno${i % 9}`).join(' ')}.`; // review-w/adv3.js, tal cual (91 palabras)
+C1_WELCOMES.tokenFirst300 = `${'bienvenida'.repeat(30)} ${relleno}.`; // primera palabra de 300 caracteres
+C1_WELCOMES.tokenInside = `Te damos la bienvenida al curso ${'x'.repeat(260)} ${relleno}.`;
+/**
+ * Formas sintéticas de relleno (palabras de 8–9 letras como «relleno2», tokens de 250–300): un párrafo legal de 70
+ * palabras así supera los topes de ALTO de bloque del render check (260 px a 1280 en editorial, 450 px a 375), pensados
+ * para prosa real. Para ellas el render exige todo lo demás (sin desborde a 375, orden, entrada ≤ 4 líneas, texto ≥ 16 px)
+ * salvo esos altos; check-r19-welcome sigue exigiendo ≤ 70 palabras por párrafo.
+ */
+const SYNTHETIC_FILLER = new Set(['tokenFirst250', 'tokenFirst300', 'tokenInside']);
+/** Bienvenidas sin entrada (la primera palabra no cabe en 240 caracteres). */
+const NO_LEAD = new Set(['tokenFirst250', 'tokenFirst300']);
+
+module.exports.C1_WELCOMES = C1_WELCOMES;
+module.exports.NO_LEAD = NO_LEAD;
+module.exports.SYNTHETIC_FILLER = SYNTHETIC_FILLER;
+module.exports.MODULE_PRESENTATIONS = MODULE_PRESENTATIONS;

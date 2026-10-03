@@ -288,7 +288,7 @@ const DT = { itemKey: 'activity:qa', title: 'El registro de doña Carmen', taskD
   });
   await check('M5: .mbz 3.13.0 — sección 1 con UNA entrada del Libro Guía (recurso con descripción, sin label libro_card), quiz.xml con reviewmaxmarks 272; validador limpio y la descripción pasa las reglas de los labels', async () => {
     const r = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true, courseId: 583 }));
-    eq(r.summary.builderVersion, '3.13.0', 'versión'); // UX r18: 3.11.0 → 3.12.0; r19 L: 3.13.0
+    eq(r.summary.builderVersion, '3.13.0', 'versión'); // UX r18: 3.11.0 → 3.12.0; r19 L+W: 3.13.0
     const z = await JSZip.loadAsync(r.mbz);
     const mb = await z.file('moodle_backup.xml').async('string');
     const acts = [...mb.matchAll(/<activity>\s*<moduleid>(\d+)<\/moduleid>\s*<sectionid>\d+<\/sectionid>\s*<modulename>(\w+)<\/modulename>\s*<title>([^<]*)<\/title>\s*<directory>([^<]+)<\/directory>/g)].map((m) => ({ mid: m[1], mod: m[2], title: m[3], dir: m[4] }));

@@ -82,6 +82,7 @@ const GOLDEN = {
   // audiolibro.mp3, portadas a 1600 px (antes 640) y sin botón «Iniciar actividad» hacia la H5P embebida.
   // Dorados anteriores (3.11.0): h5p-final-light 03bb4e8b…, scorm-nofinal-dark 9500797e…, h5p-nofinal-dark-mock-cleansafe
   // 5329675d…, scorm-final-light 948e402d…, h5p-ev5c-rules1 4a1532f2….
+  // r19 W (builder 3.12.0 → 3.13.0): SOLO cambia el label cv3:shell:welcome (hero con superficie según heroTreatment, «Curso · N módulos · M capítulos», entrada ≤ 40 palabras y cuerpo en párrafos ≤ 70) — diff por entrada del zip en scratchpad/r19/w-logs/golddiff (hook.js + diff.js).
   // r19 L fix round 1: logo de la portada a opacidad plena, /Keywords del PDF (sha del plan) y transliteración — vuelve a mover solo el blob del Libro.
   // r19 L (builder 3.12.0 → 3.13.0) cambia el .mbz a propósito, y SOLO en el Libro Guía (diff semántico de entradas del zip contra
   // 77eeb18, scratchpad/r19/impl-l-probe/golddiff.js): el blob libro_guia_completo.html → PDF libro_guia_<slug>.pdf (files.xml:
@@ -89,11 +90,11 @@ const GOLDEN = {
   // Dorados anteriores (3.12.0): h5p-final-light 5e9bf0f0…, scorm-nofinal-dark b967577f…, h5p-nofinal-dark-mock-cleansafe
   // 14d45c9d…, scorm-final-light 6c18bcce…, h5p-ev5c-rules1 3c6d123e….
   mbz: {
-    'h5p-final-light': '2b23ccfabd421bf91f6ed2b2d3aff41b4d8ed294a1a76ef9c33b095ba76b0812',
-    'scorm-nofinal-dark': 'b18c58680ef035b5ddbf60698904b6f8e666d46810904ad2f42a6bf4a3ec2dc8',
-    'h5p-nofinal-dark-mock-cleansafe': 'fe0aafc78f39d33921bf84d5302ca8053fe5eff7984a5a533602cdfbb4524f6f',
-    'scorm-final-light': 'd1cfc9f02a76c1013a76d5d9cdf04726661e49087022c680c0a0594491af5f51',
-    'h5p-ev5c-rules1': '257886893e21ddae142ff52559ea4eb4c2b753b6c89225a260dad53434a995de',
+    'h5p-final-light': '0eb987bf3053628826eae8f72cd88bff6825d0db65fea8046009570116f6b2ab',
+    'scorm-nofinal-dark': 'ef843c5414e59ffb50fb8d46f02d8800e6c23774ca73685252fa33b3cf16c725',
+    'h5p-nofinal-dark-mock-cleansafe': 'f309c5ac6db472587da1b7c3444597001d3dbaec923d0e51ca5939e483f356cb',
+    'scorm-final-light': '02a970f2cc4eddac2966fae28cfbb306920c715574e416e391fab703436bc0ec',
+    'h5p-ev5c-rules1': '3a8c0028b764cd91a21dbe8d58e92215479621793032b08788467225ef3836ef',
   },
 };
 
