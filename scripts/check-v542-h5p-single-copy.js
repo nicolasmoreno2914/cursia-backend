@@ -14,7 +14,7 @@
 //      Moodle reescribe a la del reproductor de view.php (/h5p/embed.php?url=…/package/0/<archivo>);
 //      el cargador R8 (modo intro) queda byte a byte igual;
 //   3. el validador rechaza una segunda copia (filearea intro) y un intro que no embebe el package;
-//   4. byte-identidad: un curso SIN actividades H5P ni quizzes da el mismo .mbz que staging 3.6.0.
+//   4. byte-identidad: un curso SIN actividades H5P ni quizzes da el .mbz dorado (3.6.0 = 3.10.0; 3.11.0 = #583 QUAL).
 // Puro (sin red, sin Moodle). Uso: node scripts/check-v542-h5p-single-copy.js [dist]
 'use strict';
 const path = require('path');
@@ -111,7 +111,7 @@ const BS_CFG = {
     }
   }
 
-  await check('builder 3.10.0 (3.8.0 = una sola copia; 3.9.0 = revisión del quiz; 3.10.0 = retroalimentación global)', () => eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.10.0', 'versión'));
+  await check('builder 3.11.0 (3.8.0 = una sola copia; 3.9.0 = revisión del quiz; 3.10.0 = retroalimentación global; 3.11.0 = #583 QUAL)', () => eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.11.0', 'versión'));
 
   await check('matriz + rules 2: toda h5pactivity tiene UNA sola copia del .h5p (filearea package) y su inforef apunta solo a ella', () => {
     let n = 0;
@@ -214,10 +214,11 @@ const BS_CFG = {
   });
 
   // Curso sin H5P (SCORM, sin videos) y sin quizzes: dorado = staging b959a89 (builder 3.6.0).
-  await check('byte-identidad: un curso SIN actividades H5P ni quizzes da el mismo .mbz que staging 3.6.0', async () => {
+  await check('byte-identidad: un curso SIN actividades H5P ni quizzes da el .mbz dorado (3.6.0 = 3.10.0; 3.11.0 = #583 QUAL)', async () => {
     const o = { engine: 'scorm', finalExam: false, courseId: 646, modules: [{ examEnabled: false, chapters: [{ video: false, activity: true }, { video: false, activity: false }] }] };
     const r = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, o));
-    eq(sha(r.mbz), 'd4e6bc68603b104b112c358770227298bf36cfd5aaef30689f3d769a8204fe98', 'sha256');
+    // #583 QUAL (builder 3.11.0): reviewmaxmarks 69904 → 272, frase del cierre, tarjeta del Libro Guía como <intro> del recurso (sin label libro_card; ids renumerados) y runtime VC 4 — diff semántico en scratchpad/r18/qual/golddiff/sem.js (antes d4e6bc68…: staging 3.6.0 = 3.10.0 para este curso).
+    eq(sha(r.mbz), '80e8b108ccbd547360f4851fb5054fdb2839aabdf6d513c6eef80060e8676545', 'sha256');
   });
 
   console.log(`\n${failures ? 'HAY FALLOS' : 'Todos los checks de V542 I2 (H5P de una sola copia) pasaron'} (${passed} ✅, ${failures} ❌).`);

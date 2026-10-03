@@ -67,9 +67,10 @@ export type VcRenderLevel = 'enhanced';
 /**
  * P3 — generación del lenguaje visual del renderer (entra en VC_RENDERER_VERSION → clave de reuse del
  * paquete): un cambio de estilo que no toca el schema ni el runtime JS igual debe re-empaquetar.
- * 1 = R14-A/EV4 (diseño editorial), 2 = sistema visual educativo 2.0.
+ * 1 = R14-A/EV4 (diseño editorial), 2 = sistema visual educativo 2.0, 3 = #583 (M1/M4): encabezados de
+ * paso con mayúscula inicial y esquina de la tabla de comparación sin rótulo.
  */
-export const VC_RENDER_STYLE_VERSION = 2;
+export const VC_RENDER_STYLE_VERSION = 3;
 
 /** R14-A — contexto de apertura de capítulo: el título del capítulo es el pico de la página. */
 export interface VcOpener {
@@ -493,7 +494,18 @@ function list<T>(v: T[] | undefined, what: string): T[] {
 const STEP_PREFIX_RE = /^\s*(?:paso|etapa|fase|step)\s*\d{1,2}\s*[:.\-–—)]\s*/i;
 function stripStepPrefix(h: string): string {
   const out = h.replace(STEP_PREFIX_RE, '');
-  return out.trim() ? out : h;
+  return capFirst(out.trim() ? out : h);
+}
+
+/**
+ * #583 (M1): el encabezado de un paso es un título — empieza en mayúscula aunque el LLM lo escriba como
+ * continuación de «Paso 1:» («calcular el presupuesto de compras» → «Calcular el presupuesto de compras»).
+ * Solo la primera letra, después de signos de apertura («¿¡"(…); nunca toca siglas, marcas con mayúscula interna ni el resto.
+ */
+export function capFirst(h: string): string {
+  // #583 fix round 1 (m10): una marca o término con mayúscula interna («iPhone», «eBay», «eCommerce») queda igual.
+  if (/^[\s«"“'‘(¿¡\[*_]*\p{Ll}+\p{Lu}/u.test(h)) return h;
+  return h.replace(/^([\s«"“'‘(¿¡\[*_]*)(\p{Ll})/u, (_m, pre: string, ch: string) => pre + ch.toLocaleUpperCase('es'));
 }
 
 // ─── Componentes (una función por tipo) ─────────────────────────────────────
@@ -572,7 +584,9 @@ function comparisonTable(r: R, columns: string[], rows: VcComparison['rows'], ti
   ];
   const headCell = (x: Surf): Decl[] => cellStyle(x, true, true);
   const thead =
-    `<thead><tr><th scope="col"${st(r, headCell(head))}>${labelHtml('Aspecto')}</th>` +
+    // #583 (M4): la esquina no lleva rótulo — «Aspecto» quedaba sobre filas que eran productos (el LLM a veces
+    // pone los sujetos en las filas). Celda vacía de encabezado (patrón estándar de tabla de doble entrada).
+    `<thead><tr><td${st(r, headCell(head))}></td>` +
     columns.map((cn) => `<th scope="col"${st(r, headCell(head))}>${inlineHtml(cn, h)}</th>`).join('') +
     '</tr></thead>';
   const tbody =

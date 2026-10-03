@@ -256,8 +256,22 @@ export function routeLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: Shel
 
 // ─── S1.2 Libro Guía ────────────────────────────────────────────────────────
 
+/**
+ * #583 (M5/M6): descripción del recurso «📘 Libro Guía» (builder 3.11.0: `showdescription` = 1). Es la misma
+ * tarjeta de libroCardLabel SIN el botón «Abrir el Libro Guía»: el nombre del recurso ya es el enlace, y la
+ * sección 1 deja de mostrar dos entradas del Libro Guía (la fila del recurso y una tarjeta aparte).
+ */
+export function libroResourceIntro(facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
+  return libroCard(null, facts, theme, opts);
+}
+
+/** Tarjeta del Libro Guía como label aparte (builder ≤ 3.10.0; se conserva para paquetes y pruebas anteriores). */
 export function libroCardLabel(libroMid: number, facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
   if (!Number.isInteger(libroMid) || libroMid < 1) shellFail(`libroMid inválido (${libroMid})`);
+  return libroCard(libroMid, facts, theme, opts);
+}
+
+function libroCard(libroMid: number | null, facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
   const h = hx(theme, opts);
   const cs = { s: panelSurf(h), border: h.t.color.border };
   const c = facts.counts;
@@ -268,9 +282,9 @@ export function libroCardLabel(libroMid: number, facts: CourseFacts, theme: Reso
   const inner =
     eyebrow(h, 'Material de estudio', cs.s) +
     heading(h, 'h3', 'Libro Guía', cs.s) +
-    pHtml(h, labelHtml(text), cs.s) +
-    link(h, `$@RESOURCEVIEWBYID*${libroMid}@$`, 'Abrir el Libro Guía', cs.s, { button: true, margin: '16px 0 0 0' });
-  return out('Libro Guía', root(h, 'shell-libro', box(h, inner, cs)), facts);
+    pHtml(h, labelHtml(text), cs.s, { last: libroMid === null }) +
+    (libroMid === null ? '' : link(h, `$@RESOURCEVIEWBYID*${libroMid}@$`, 'Abrir el Libro Guía', cs.s, { button: true, margin: '16px 0 0 0' }));
+  return out(libroMid === null ? 'Libro Guía (descripción del recurso)' : 'Libro Guía', root(h, 'shell-libro', box(h, inner, cs)), facts);
 }
 
 // ─── S1.3 Audiolibro ────────────────────────────────────────────────────────
@@ -549,10 +563,11 @@ export function closingLabel(
   const intro = assertValidCourseIntroV3(courseIntro);
   const h = hx(theme, opts);
   const s = bgSurf(h);
-  // EV6: el cierre va DESPUÉS de la evaluación final: constata que terminó (nunca la anuncia como pendiente).
+  // EV6: el cierre va DESPUÉS de la evaluación final. #583 (M5/M7): la frase es condicional — lo ve también
+  // quien todavía no aprobó (o ni intentó) la evaluación final, así que nunca afirma que ya la completó.
   const next = facts.finalExam.enabled
-    ? 'Has completado el recorrido del curso y su evaluación final.'
-    : 'Has completado el recorrido del curso.';
+    ? 'Al aprobar la evaluación final completas el recorrido del curso.'
+    : 'Llegaste al cierre del recorrido del curso.';
   let inner =
     eyebrow(h, 'Cierre', s) +
     heading(h, 'h3', 'Cierre del curso', s) +

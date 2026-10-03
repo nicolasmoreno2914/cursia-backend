@@ -122,6 +122,7 @@ for (const combo of F.THEME_COMBOS) {
         S.methodologyLabel(facts, ci, theme, o),
         S.routeLabel(facts, theme, o),
         S.libroCardLabel(77, facts, theme, o),
+        S.libroResourceIntro(facts, theme, o), // #583: descripción del recurso del Libro Guía
         S.audiobookLabel(facts, theme, o),
         S.closingLabel(facts, ci, theme, o, facts.finalExam.enabled ? { activities: facts.counts.activities > 0, videos: facts.counts.videos > 0, moduleExams: facts.counts.exams > 0, finalExam: true, courseGrade: true } : undefined), S.certificateTeacherLabel(`Certificado: ${facts.course.title}`, facts, theme, o),
       ];
@@ -308,7 +309,7 @@ if (probe) {
       const ci = F.courseIntroFixture();
       const ls = [
         S.welcomeLabel(facts, ci, theme, o), S.audioWelcomeLabel(facts, theme, o), S.competenciesLabel(facts, ci, theme, o),
-        S.methodologyLabel(facts, ci, theme, o), S.routeLabel(facts, theme, o), S.libroCardLabel(77, facts, theme, o),
+        S.methodologyLabel(facts, ci, theme, o), S.routeLabel(facts, theme, o), S.libroCardLabel(77, facts, theme, o), S.libroResourceIntro(facts, theme, o),
         S.audiobookLabel(facts, theme, o), S.closingLabel(facts, ci, theme, o, facts.finalExam.enabled ? { activities: facts.counts.activities > 0, videos: facts.counts.videos > 0, moduleExams: facts.counts.exams > 0, finalExam: true, courseGrade: true } : undefined), S.certificateTeacherLabel(`Certificado: ${facts.course.title}`, facts, theme, o), S.finalExamInfoLabel(facts, theme, o),
       ];
       facts.modules.forEach((m, i) => {

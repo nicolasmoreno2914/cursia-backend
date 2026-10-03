@@ -19,7 +19,8 @@
 import { ResolvedTheme } from '../theme-engine';
 import type { Tone } from './edu';
 
-export const VC_RUNTIME_VERSION = 3;
+/** 4 = #583 (M4): la tabla completa de una comparación apilada deja la esquina sin rótulo (antes «Aspecto»). */
+export const VC_RUNTIME_VERSION = 4;
 
 /**
  * R14-A — capa ENHANCED de «CURSIA V2 DESIGN LANGUAGE V1». El layout (columnas, eje de la
@@ -265,7 +266,7 @@ export function runtimeScript(uid: string): string {
     'N.cmp=function(stack){' +
     'var rows=[].slice.call(stack.querySelectorAll(".cvc-cmp-row"));if(!rows.length)return;' +
     'var t=d.createElement("table"),th=d.createElement("thead"),hr=d.createElement("tr"),tb=d.createElement("tbody");' +
-    'var h0=d.createElement("th");h0.scope="col";h0.textContent="Aspecto";hr.appendChild(h0);' +
+    'var h0=d.createElement("td");hr.appendChild(h0);' +
     '[].slice.call(rows[0].querySelectorAll(".cvc-cmp-col")).forEach(function(c){var h=d.createElement("th");h.scope="col";' +
     'h.textContent=c.textContent.replace(/:\\s*$/,"");hr.appendChild(h)});th.appendChild(hr);t.appendChild(th);' +
     'rows.forEach(function(row){var tr=d.createElement("tr"),rh=d.createElement("th"),lab=row.querySelector(".cvc-cmp-label");' +

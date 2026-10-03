@@ -25,7 +25,10 @@ import type { VideoCheckpoint } from '../../package/h5p';
 import { H5pActivityTypeV2, ShellValidationError, activityTypeForChapter, validateH5pActivityPayload } from './activity-type';
 import { validateCourseIntroV3, validateModuleIntroV3 } from './intro-schemas';
 import { FINAL_EXAM_QUESTION_RANGE, validateExamGift } from './final-exam';
-import { EXAM_BANK_ARTIFACT_TYPE, EXAM_BANK_VALIDATION_VERSION, EXAM_BANK_VERSION, EXAM_GIFT_ARTIFACT_TYPE, ExamPlanLeaf, expectedExamPlan, validateExamBank } from './exam-bank';
+import { EXAM_BANK_ARTIFACT_TYPE, EXAM_BANK_FULL_FLOOR_VERSION, EXAM_BANK_VALIDATION_VERSION, EXAM_BANK_VERSION, EXAM_GIFT_ARTIFACT_TYPE, ExamPlanLeaf, expectedExamPlan, validateExamBank } from './exam-bank';
+import { Logger } from '@nestjs/common';
+
+const v3Log = new Logger('V3Validation');
 
 export const V3_PAYLOAD_INVALID = 'v3_payload_invalid';
 
@@ -177,6 +180,13 @@ export function validateV3ItemArtifact(ctx: V3ItemValidationContext, text: strin
     // questionCount = slots (lo que ve el estudiante), no el tamaño del banco.
     // BANKOPT fix round 4 (R2): completeItem valida SIEMPRE con las reglas vigentes (evidenceRules 'current');
     // la versión que el banco declara solo la usa el empaque.
+    // #583 fix round 1 (m5): el piso por hoja sigue la versión que el banco DECLARA (orden de deploy indiferente).
+    // Un banco < v4 (ejecutor anterior / pestaña vieja) se acepta con el piso histórico 1,5·s: queda en el log para
+    // saber cuándo dejan de llegar y poder retirar ese camino (sunset detrás de un flag, decisión aparte).
+    const declared = parsedBank.value && typeof parsedBank.value === 'object' && Number.isInteger((parsedBank.value as any).bankValidationVersion) ? (parsedBank.value as any).bankValidationVersion : null;
+    if (r.ok && (declared === null || declared < EXAM_BANK_FULL_FLOOR_VERSION)) {
+      v3Log.warn(`EXAM_BANK_LEGACY_FLOOR ${ctx.itemKey}: el banco declara bankValidationVersion ${declared ?? 'ausente'} (< ${EXAM_BANK_FULL_FLOOR_VERSION}); piso por hoja histórico 1,5·slots`);
+    }
     return { ok: r.ok, errors: r.errors, summary: { questionCount: r.slotCount, bankSize: r.bankSize, bankVersion: EXAM_BANK_VERSION } };
   }
 

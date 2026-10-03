@@ -53,7 +53,8 @@ function sha1(s: string): string {
  * «Respuestas explicadas» (al aprobar o agotar los intentos). La nota POR PREGUNTA junto a la respuesta
  * propia revela la correcta (V/F: «0 sobre 5,88» con «Verdadero» marcado = la correcta es «Falso»), así que:
  *  - D|I (durante e inmediatamente después, ~2 min): la página de revisión muestra las respuestas propias
- *    SIN nota por pregunta (marks = MAX_ONLY: «Puntúa como 5,88») ni corrección → sin el aviso de permiso;
+ *    SIN nota por pregunta ni corrección → sin el aviso de permiso. #583 (builder 3.11.0): tampoco la nota
+ *    máxima por pregunta («Puntúa como 5,88», marks = MAX_ONLY hasta 3.10.0): marks = HIDDEN en D|I;
  *  - O (más tarde, abierto): sin página de revisión; la nota TOTAL se ve en view.php y en el libro de
  *    calificaciones (marks O ⇒ quiz_grade_item_update deja el ítem visible) y la completion sigue igual;
  *  - C (cierre, solo si un profesor fija timeclose): todo.
@@ -69,7 +70,9 @@ function sha1(s: string): string {
 export const QUIZ_REVIEW_V3 = {
   reviewattempt: 69648, // D|I|C — revisión de las respuestas propias al terminar (sin aviso de permiso)
   reviewcorrectness: 16, // C
-  reviewmaxmarks: 69904, // D|I|O|C — «Puntúa como N» (sin la nota obtenida)
+  // #583 (M5/M8): «Puntúa como 5,88» (100/17 por slot) durante el intento y en la revisión inmediata confundía:
+  // la nota máxima por pregunta ya no se muestra en D|I (marks = HIDDEN; tampoco revela la correcta). O|C igual.
+  reviewmaxmarks: 272, // O|C — nota máxima por pregunta solo junto con la nota (O|C), nunca en D|I
   reviewmarks: 272, // O|C — nota (total y por pregunta) solo cuando NO hay página de revisión abierta (O) o al cierre
   reviewspecificfeedback: 16, // C
   reviewgeneralfeedback: 16, // C

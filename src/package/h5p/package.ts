@@ -217,6 +217,33 @@ export interface BundledH5pInput extends ContentOnlyH5pInput {
   profile: H5pProfile;
   /** Store de librerías (openH5pLibraryStore). Nada se descarga. */
   libraryStore: H5pLibrarySource;
+  /** #583 (I4): archivos del contenido (`content/<ruta>`), p. ej. imágenes de los finales del caso ramificado. */
+  contentFiles?: Record<string, Buffer>;
+}
+
+/** Rutas de imagen (`{path, mime}`) que el contenido referencia (H5P las resuelve contra `content/`). */
+function contentImagePaths(node: unknown, out: Set<string> = new Set()): Set<string> {
+  if (Array.isArray(node)) node.forEach((x) => contentImagePaths(x, out));
+  else if (node && typeof node === 'object') {
+    const o = node as Record<string, unknown>;
+    if (typeof o.path === 'string' && typeof o.mime === 'string' && o.mime.startsWith('image/') && !/^[a-z]+:/i.test(o.path)) out.add(o.path);
+    Object.values(o).forEach((v) => contentImagePaths(v, out));
+  }
+  return out;
+}
+
+/** Entradas `content/<ruta>` (rutas relativas seguras, solo images/*.png|jpg) y cada imagen referenciada presente. */
+function contentFileEntries(content: Record<string, unknown>, files: Record<string, Buffer> | undefined): Array<[string, Buffer]> {
+  const out: Array<[string, Buffer]> = [];
+  for (const [p, data] of Object.entries(files ?? {}).sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    if (!/^images\/[a-z0-9][a-z0-9-]*\.(?:png|jpe?g)$/.test(p)) throw new Error(`H5P_PACKAGE_INVALID: archivo de contenido no permitido ${JSON.stringify(p)}`);
+    if (!Buffer.isBuffer(data) || data.length === 0) throw new Error(`H5P_PACKAGE_INVALID: archivo de contenido vacío ${p}`);
+    out.push([`content/${p}`, data]);
+  }
+  const have = new Set(Object.keys(files ?? {}));
+  const missing = [...contentImagePaths(content)].filter((p) => !have.has(p));
+  if (missing.length) throw new Error(`H5P_PACKAGE_INVALID: el contenido referencia imágenes que no van en el paquete: ${missing.join(', ')}`);
+  return out;
 }
 
 /**
@@ -243,6 +270,7 @@ export async function buildBundledH5p(input: BundledH5pInput): Promise<Buffer> {
   const entries: Array<[string, Buffer | string]> = [
     ['h5p.json', JSON.stringify(h5pJson)],
     ['content/content.json', JSON.stringify(input.content)],
+    ...contentFileEntries(input.content, input.contentFiles),
   ];
   const missing: string[] = [];
   for (const d of dirs) {

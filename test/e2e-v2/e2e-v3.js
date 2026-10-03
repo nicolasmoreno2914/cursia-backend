@@ -999,7 +999,7 @@ function reservationBookkeeping(ev) {
         // evaluación de módulo, la evaluación final y, ÚLTIMO, el cierre del curso.
         const want = [];
         want.push([0, ['cv3:shell:forum', 'cv3:shell:welcome', 'cv3:shell:audio_welcome', 'cv3:shell:competencies', 'cv3:shell:methodology', 'cv3:shell:start']]);
-        want.push([1, ['cv3:shell:route', 'cv3:shell:libro', 'cv3:shell:libro_card', 'cv3:shell:audiobook', 'cv3:shell:route_start']]);
+        want.push([1, ['cv3:shell:route', 'cv3:shell:libro', 'cv3:shell:audiobook', 'cv3:shell:route_start']]); // #583: sin libro_card
         const secOfCh = {}; const secOfExam = {}; const firstSecOfMod = {};
         let sn = 2;
         // EV6 P2-B4: sin evaluación final (= sin certificado) la nota oculta para docentes de «Respuestas

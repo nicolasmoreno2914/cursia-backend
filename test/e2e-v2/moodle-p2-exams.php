@@ -82,7 +82,7 @@ $moduleExams = array_values(array_filter(array_keys($quizzes), fn($k) => str_sta
 $final = isset($quizzes['cv3:final_exam']) ? 'cv3:final_exam' : null;
 $criteria = array_map('intval', $DB->get_fieldset_select('course_completion_criteria', 'moduleinstance', 'course = ? AND criteriatype = 4', [$courseid]));
 
-$REVIEW = ['reviewattempt' => 69648, 'reviewcorrectness' => 16, 'reviewmaxmarks' => 69904, 'reviewmarks' => 272,
+$REVIEW = ['reviewattempt' => 69648, 'reviewcorrectness' => 16, 'reviewmaxmarks' => 272, 'reviewmarks' => 272,
     'reviewspecificfeedback' => 16, 'reviewgeneralfeedback' => 16, 'reviewrightanswer' => 16, 'reviewoverallfeedback' => 4368];
 
 /** Slot → categoría del filtercondition restaurado (null si el slot es fijo). */
@@ -281,7 +281,7 @@ function render_review($ao, $cm) {
         }
         if (preg_match('/class="grade"/', $html)) $graded++;
         // V542 fix round 1 (I1): la nota OBTENIDA por pregunta («Puntúa 0,00 sobre 5,88») junto a la respuesta propia
-        // revela la correcta (V/F). Solo se admite «Puntúa como 5,88» (MAX_ONLY).
+        // revela la correcta (V/F). #583: desde el builder 3.11.0 tampoco «Puntúa como 5,88» (marks = HIDDEN en D|I).
         $dp = $ao->get_display_options(true)->markdp;
         $markStr = get_string('markoutofmax', 'question', (object)['mark' => $qa->format_mark($dp), 'max' => $qa->format_max_mark($dp)]);
         if ($qa->get_mark() !== null && str_contains($text, html_entity_decode(strip_tags($markStr), ENT_QUOTES | ENT_HTML5))) $why[] = 'nota obtenida por pregunta';
@@ -292,7 +292,7 @@ function render_review($ao, $cm) {
 function assert_marks_only($label, $r) {
     check("$label: al terminar se puede revisar (sin «No tiene permiso para revisar»): respuestas propias SIN nota por pregunta, corrección, respuesta correcta ni feedback",
         $r['review']['attempt'] === true && $r['review']['correctness'] === 0 && $r['review']['rightanswer'] === 0 && $r['review']['feedback'] === 0
-        && $r['review']['generalfeedback'] === 0 && $r['review']['marks'] === display_options::MAX_ONLY && $r['view']['reviewLink'] === true, $r);
+        && $r['review']['generalfeedback'] === 0 && $r['review']['marks'] === display_options::HIDDEN && $r['view']['reviewLink'] === true, $r);
     check("$label: más tarde (abierto): sin página de revisión; nota total visible en view.php y en el libro de calificaciones (ítem visible, nota {$r['grade']})",
         $r['view']['later']['attempt'] === false && $r['view']['later']['marks'] >= display_options::MARK_AND_MAX
         && $r['view']['later']['gradeItemHidden'] === 0 && $r['view']['later']['gradebookGrade'] !== null, $r['view']);
@@ -301,8 +301,9 @@ function assert_marks_only($label, $r) {
     check("$label: al terminar se ve la retroalimentación global «" . ($r['review']['passed'] ? 'aprobaste' : 'todavía no') . "» (nota {$r['grade']})",
         $r['review']['overallfeedback'] === true && str_starts_with($r['review']['overallText'], $want), $r['review']);
     $p = $r['review']['page'];
-    check("$label: página de revisión renderizada como el estudiante: {$p['questions']} preguntas, «Puntúa como» en cada una, 0 fugas (nota obtenida, respuesta, corrección, feedback)",
-        $p['questions'] > 0 && $p['withMark'] === $p['questions'] && !$p['leaks'], $p);
+    // #583 (M5/M8, builder 3.11.0): tampoco la nota MÁXIMA por pregunta («Puntúa como 5,88», marks = HIDDEN en D|I).
+    check("$label: página de revisión renderizada como el estudiante: {$p['questions']} preguntas, SIN «Puntúa como» en ninguna, 0 fugas (nota obtenida, respuesta, corrección, feedback)",
+        $p['questions'] > 0 && $p['withMark'] === 0 && !$p['leaks'], $p);
 }
 /** Aprueba (nota real) todo criterio de completion que no es un quiz. */
 function pass_non_quiz($user) {

@@ -191,6 +191,7 @@ function shellLabels(course, facts, theme, o) {
     ['metodologia', () => S.methodologyLabel(facts, CI, theme, o)],
     ['ruta', () => S.routeLabel(facts, theme, o)],
     ['libro', () => S.libroCardLabel(77, facts, theme, o)],
+    ['libro-recurso', () => S.libroResourceIntro(facts, theme, o)], // #583
     ['audiolibro', () => S.audiobookLabel(facts, theme, o)],
     ['cierre', () => S.closingLabel(facts, CI, theme, o)],
     ['inicio', () => S.welcomeStartLabel(first, facts, theme, o)],
