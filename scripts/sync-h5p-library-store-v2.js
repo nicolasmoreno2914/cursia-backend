@@ -78,6 +78,18 @@ const UPSTREAM_REPO = {
   'H5PEditor.Shape': 'h5p-editor-shape',
 };
 
+/**
+ * UX #5 fix round 1 (M-1): librerías publicadas por el H5P Hub SIN tag git upstream. Se registra el commit
+ * oficial exacto con el que la carpeta es byte a byte idéntica (verificado contra los blobs de GitHub por la
+ * review, 56/56 archivos), para que una comparación futura no use `master` (que sigue avanzando).
+ */
+const UPSTREAM_COMMIT = Object.freeze({
+  'H5P.QuestionSet-1.21': {
+    sha: '48aa08f798c016a0bb9096804a6cf45fb890d3f7',
+    note: 'release del H5P Hub sin tag git upstream; carpeta byte a byte idéntica al commit «bump patch 1.21.13» (2026-03-04) de master',
+  },
+});
+
 const MIT_TEXT = `Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
@@ -189,6 +201,7 @@ function buildStore(libsDir, profileName = 'v2') {
       repoUrl: `https://github.com/h5p/${repo}`,
       // true solo si el controlador verificó el repo en línea; los demás se derivan del nombre (h5p-<kebab>).
       repoUrlVerified: UPSTREAM_VERIFIED_MIT.includes(repo),
+      ...(UPSTREAM_COMMIT[d] ? { upstreamCommit: UPSTREAM_COMMIT[d].sha, upstreamCommitUrl: `https://github.com/h5p/${repo}/commit/${UPSTREAM_COMMIT[d].sha}`, upstreamNote: UPSTREAM_COMMIT[d].note } : {}),
       libraryJsonLicense: lj.license ?? null,
       localLicenceFile: lic ? lic.file : null,
       copyrightHolder: lic && lic.holder ? lic.holder : DEFAULT_HOLDER,
@@ -232,6 +245,14 @@ function buildStore(libsDir, profileName = 'v2') {
     '|---|---|---|---|---|---|---|',
     ...libraries.map((l) => `| ${l.machineName} | ${l.upstreamVersion} | ${l.copyrightHolder} | ${l.licence} | ${l.licenceSource}${l.localLicenceFile ? ` (${l.localLicenceFile})` : ''} | ${l.repoUrl} | ${l.repoUrlVerified ? 'sí' : 'no'} |`),
     '',
+    ...(libraries.some((l) => l.upstreamCommit)
+      ? [
+          '## Commit upstream de las librerías sin tag',
+          '',
+          ...libraries.filter((l) => l.upstreamCommit).map((l) => `- ${l.machineName} ${l.upstreamVersion}: ${l.upstreamCommitUrl} — ${l.upstreamNote}.`),
+          '',
+        ]
+      : []),
     '## MIT License',
     '',
     'Copyright (c) the copyright holders listed above for each library (Joubel AS / H5P Group AS).',
@@ -282,6 +303,6 @@ function main() {
   console.log(`store ${profileName} → ${STORE}: ${files.size} archivos de librería + manifest.json + LICENSES.md`);
 }
 
-module.exports = { licenceOf, localLicence, buildStore, LICENCE_SOURCE, UPSTREAM_VERIFIED_MIT, UPSTREAM_REPO, PROFILES };
+module.exports = { licenceOf, localLicence, buildStore, LICENCE_SOURCE, UPSTREAM_VERIFIED_MIT, UPSTREAM_REPO, UPSTREAM_COMMIT, PROFILES };
 
 if (require.main === module) main();

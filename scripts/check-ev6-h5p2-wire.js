@@ -458,7 +458,7 @@ const SRC = (bp) => ({ courseId: 777, blueprintId: 1, blueprintNumber: 1, bluepr
       svc.findLatestPackageJob = async () => ({ worker_status: 'running', output_summary: summary });
       return svc.getPackageStatus(1, 'o', 1, 'r');
     };
-    eq((await pkg({ restore: built2.summary.restore })).restore, { as: 'admin_or_manager', note: B.H5P_V2_RESTORE_NOTE.note }, 'con librerías incluidas');
+    eq((await pkg({ restore: built2.summary.restore })).restore, { as: 'admin_or_manager', note: B.H5P_BUNDLED_RESTORE_NOTE.note }, 'con librerías incluidas');
     assert(!('restore' in (await pkg({}))), 'paquete de siempre: sin restore');
     assert(!('restore' in (await pkg({ restore: { as: 'otro', note: 'x' } }))), 'forma inesperada: se ignora');
     const { CourseStructureService } = L('modules/course-structure/course-structure.service.js');

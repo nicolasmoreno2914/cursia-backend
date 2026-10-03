@@ -39,6 +39,10 @@ de la carpeta; este archivo y `manifest.json` son el aviso MIT de Cursia.
 | H5PEditor.RadioSelector | 1.2.2 | Joubel AS (H5P Group AS) | MIT | upstream repository verified 2026-10-01 | https://github.com/h5p/h5p-editor-radio-selector | sí |
 | H5PEditor.Shape | 1.0.0 | Joubel AS (H5P Group AS) | MIT | upstream repository verified 2026-10-01 | https://github.com/h5p/h5p-editor-shape | sí |
 
+## Commit upstream de las librerías sin tag
+
+- H5P.QuestionSet 1.21.13: https://github.com/h5p/h5p-question-set/commit/48aa08f798c016a0bb9096804a6cf45fb890d3f7 — release del H5P Hub sin tag git upstream; carpeta byte a byte idéntica al commit «bump patch 1.21.13» (2026-03-04) de master.
+
 ## MIT License
 
 Copyright (c) the copyright holders listed above for each library (Joubel AS / H5P Group AS).

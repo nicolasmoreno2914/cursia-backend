@@ -835,7 +835,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   const mainKeys = new Set(Object.values(CURSIA_H5P_PROFILE_V1.mainLibraries).map((l) => l.machineName));
   // EV6 H5P v2: principales con delta bundling y su perfil. UX #5 (r18): perfil v3 (BS, DC y QuestionSet 1.21).
   const bundledMains = new Set(profileBundledMainLibraries(CURSIA_H5P_PROFILE_V3));
-  const v2ByDir = new Map(CURSIA_H5P_PROFILE_V3.libraries.map((l) => [h5pLibraryDirName(l), l]));
+  const bundledProfileByDir = new Map(CURSIA_H5P_PROFILE_V3.libraries.map((l) => [h5pLibraryDirName(l), l]));
   const h5pActs = acts.filter((a) => a.modname === 'h5pactivity');
   for (const a of h5pActs) {
     const mine = files.filter((f) => f.ctx === a.ctx && f.component === 'mod_h5pactivity' && f.filename !== '.');
@@ -872,8 +872,8 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
         const tops = [...new Set(extra.map((n) => n.split('/')[0]))].sort();
         const missingDirs = want.filter((d) => !tops.includes(d));
         const extraDirs = tops.filter((d) => !want.includes(d));
-        if (missingDirs.length) add('H5P_LIBRARIES', a.idnumber, `faltan carpetas de librería del delta v2: ${missingDirs.slice(0, 5).join(', ')}`);
-        if (extraDirs.length) add('H5P_LIBRARIES', a.idnumber, `carpetas fuera del delta v2 de ${hj.mainLibrary}: ${extraDirs.slice(0, 5).join(', ')}`);
+        if (missingDirs.length) add('H5P_LIBRARIES', a.idnumber, `faltan carpetas de librería del delta del perfil: ${missingDirs.slice(0, 5).join(', ')}`);
+        if (extraDirs.length) add('H5P_LIBRARIES', a.idnumber, `carpetas fuera del delta del perfil de ${hj.mainLibrary}: ${extraDirs.slice(0, 5).join(', ')}`);
         const storeLibs = new Map(storeManifest().libraries.map((l) => [l.dir, l]));
         for (const d of tops.filter((x) => want.includes(x))) {
           // Archivos de la carpeta == los del store (nombres; sha256 de library.json). Los JS/CSS no se inflan.
@@ -898,9 +898,9 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
             add('H5P_LIBRARIES', a.idnumber, `${d}: library.json distinto del store (sha256)`);
           }
           const lj = JSON.parse(ljBuf.toString('utf8'));
-          const ref = v2ByDir.get(d)!;
+          const ref = bundledProfileByDir.get(d)!;
           if (lj.machineName !== ref.machineName || lj.majorVersion !== ref.majorVersion || lj.minorVersion !== ref.minorVersion || lj.patchVersion !== ref.patchVersion) {
-            add('H5P_LIBRARIES', a.idnumber, `${d}: library.json ${lj.machineName} ${lj.majorVersion}.${lj.minorVersion}.${lj.patchVersion} ≠ perfil v2 ${ref.patchVersion}`);
+            add('H5P_LIBRARIES', a.idnumber, `${d}: library.json ${lj.machineName} ${lj.majorVersion}.${lj.minorVersion}.${lj.patchVersion} ≠ perfil ${ref.patchVersion}`);
           }
         }
       }

@@ -1539,7 +1539,11 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       themeSha256: themeSha256(theme),
       themeFamily: theme.familyId,
       themeMode: theme.mode,
-      h5pProfileVersion,
+      // UX #5 fix round 1 (M-8): versión REAL del perfil de los .h5p del paquete — 3 si alguno trae librerías
+      // incluidas (QuestionSet 1.21, BS o «Repaso», todos armados con CURSIA_H5P_PROFILE_V3); 1 si todos son
+      // solo-contenido de v1 (o no hay H5P). No entra en el .mbz ni en la clave de reuse (esa sigue usando
+      // `h5pProfileVersion`, la versión de derivación de subContentId; builderVersion ya invalida el reuse).
+      h5pProfileVersion: summaryH5pProfileVersion(h5pPackages),
       vcRendererVersion: VC_RENDERER_VERSION,
       h5pPackages,
       mockPresentationChapters,
@@ -1551,7 +1555,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       assessment: assessmentPackageSummary(resolved),
       // EV6 H5P v2: con paquetes que traen sus librerías (Branching Scenario / «Repaso» / desde UX #5
       // QuestionSet 1.21) la entrega pide restaurar como administrador o gestor (rulings Q1).
-      ...(h5pPackages.some((p) => p.mainLibrary in (CURSIA_H5P_PROFILE_V3.deltaByMain ?? {})) ? { restore: H5P_V2_RESTORE_NOTE } : {}),
+      ...(h5pPackages.some((p) => p.mainLibrary in (CURSIA_H5P_PROFILE_V3.deltaByMain ?? {})) ? { restore: H5P_BUNDLED_RESTORE_NOTE } : {}),
     },
   };
 }
@@ -1565,15 +1569,27 @@ export function reviewCardsApply(blueprint: BlueprintSnapshotV2, manifest: Gener
 }
 
 /**
- * EV6 H5P v2 — instrucción de entrega (rulings Q1) para paquetes con librerías H5P incluidas. El
+ * EV6 H5P v2 — instrucción de entrega (rulings Q1) para paquetes con librerías H5P incluidas (perfil v3:
+ * BS, «Repaso» y, desde UX #5, QuestionSet 1.21). El
  * frontend la muestra en «Cómo restaurarlo en Moodle» (summary.restore del paquete).
  */
-export const H5P_V2_RESTORE_NOTE = Object.freeze({
+export const H5P_BUNDLED_RESTORE_NOTE = Object.freeze({
   as: 'admin_or_manager' as const,
   note:
     'Restaura este curso como administrador o gestor: así Moodle instala solo los tipos de contenido H5P que el sitio todavía no tiene. ' +
     'Si lo restaura un docente en un sitio que aún no los tiene, un administrador debe subir antes el Cursia H5P Library Pack v3.',
 });
+
+/** @deprecated UX #5 fix round 1 (M-2): nombre histórico (EV6 H5P v2); usar H5P_BUNDLED_RESTORE_NOTE. */
+export const H5P_V2_RESTORE_NOTE = H5P_BUNDLED_RESTORE_NOTE;
+
+/**
+ * UX #5 fix round 1 (M-8): perfil H5P real de un paquete v3 para `summary.h5pProfileVersion`: el del perfil v3
+ * si algún .h5p lleva librerías incluidas (todos salen de CURSIA_H5P_PROFILE_V3), si no el de v1.
+ */
+export function summaryH5pProfileVersion(pkgs: ReadonlyArray<{ mainLibrary: string }>): number {
+  return pkgs.some((p) => p.mainLibrary in (CURSIA_H5P_PROFILE_V3.deltaByMain ?? {})) ? CURSIA_H5P_PROFILE_V3.version : h5pProfileVersion;
+}
 
 /** Librerías del perfil (para el validador): "Machine major.minor". */
 export function h5pProfileLibraryKeys(): Set<string> {

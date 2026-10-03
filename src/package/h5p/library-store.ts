@@ -48,6 +48,10 @@ export interface H5pLibraryStoreEntry {
   libraryJsonLicense: string | null;
   localLicenceFile: string | null;
   copyrightHolder: string;
+  /** UX #5 fix round 1 (M-1): solo librerías del Hub sin tag upstream — commit oficial exacto y nota. */
+  upstreamCommit?: string;
+  upstreamCommitUrl?: string;
+  upstreamNote?: string;
   fileCount: number;
   totalBytes: number;
   files: H5pLibraryStoreFile[];

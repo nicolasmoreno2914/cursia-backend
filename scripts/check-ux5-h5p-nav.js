@@ -149,6 +149,10 @@ const getPath = (o, p) => p.split('.').reduce((a, k) => (a == null ? a : a[k]), 
     eq(Object.keys(m.deltaByMain).sort(), ['H5P.BranchingScenario', 'H5P.Dialogcards', 'H5P.QuestionSet'], 'deltaByMain');
     const qs = m.libraries.find((l) => l.dir === QS_DIR);
     eq([qs.upstreamVersion, qs.licence, qs.licenceSource, qs.libraryJsonLicense, qs.repoUrl], ['1.21.13', 'MIT', 'library.json', 'MIT', 'https://github.com/h5p/h5p-question-set'], 'procedencia QS');
+    // Fix round 1 (M-1): sin tag upstream → commit oficial exacto (48aa08f798, «bump patch 1.21.13») en manifest y LICENSES.md.
+    eq([qs.upstreamCommit, qs.upstreamCommitUrl], ['48aa08f798c016a0bb9096804a6cf45fb890d3f7', 'https://github.com/h5p/h5p-question-set/commit/48aa08f798c016a0bb9096804a6cf45fb890d3f7'], 'commit upstream QS');
+    assert(/sin tag/.test(qs.upstreamNote), 'nota «sin tag»');
+    assert(fs.readFileSync(path.join(STORE_V3, 'LICENSES.md'), 'utf8').includes('https://github.com/h5p/h5p-question-set/commit/48aa08f798c016a0bb9096804a6cf45fb890d3f7'), 'LICENSES.md con el commit');
     for (const f of qs.files) {
       const b = fs.readFileSync(path.join(STORE_V3, QS_DIR, f.path));
       assert(b.length === f.bytes && sha256(b) === f.sha256, `${f.path} sha256`);
@@ -225,7 +229,7 @@ const getPath = (o, p) => p.split('.').reduce((a, k) => (a == null ? a : a[k]), 
   // ══ 5. Builder v3 + validador ═════════════════════════════════════════════
   const cfg = GOLD.MBZ_CONFIGS[0]; // h5p-final-light
   const built = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, cfg));
-  await check('builder v3 3.12.0: toda actividad QuestionSet es 1.21 con su delta; DragText/Blanks siguen content-only; summary.restore = administrador o gestor (pack v3)', async () => {
+  await check('builder v3 3.12.0: toda actividad QuestionSet es 1.21 con su delta; DragText/Blanks siguen content-only; summary.restore = administrador o gestor (pack v3); summary.h5pProfileVersion = 3', async () => {
     eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.12.0', 'versión');
     const z = await JSZip.loadAsync(built.mbz);
     const fx = await z.file('files.xml').async('string');
@@ -244,6 +248,12 @@ const getPath = (o, p) => p.split('.').reduce((a, k) => (a == null ? a : a[k]), 
     }
     assert(fx.length > 0, 'files.xml');
     eq(built.summary.restore && built.summary.restore.as, 'admin_or_manager', 'restore');
+    // Fix round 1 (M-8): summary.h5pProfileVersion = perfil real (3 con QuestionSet 1.21); un curso SCORM sin H5P bundled = 1.
+    eq(built.summary.h5pProfileVersion, 3, 'summary.h5pProfileVersion con QS 1.21');
+    const scorm = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, GOLD.MBZ_CONFIGS.find((c) => c.engine === 'scorm')));
+    eq([scorm.summary.h5pProfileVersion, !!scorm.summary.restore], [scorm.summary.h5pPackages.some((p) => p.mainLibrary in P3.deltaByMain) ? 3 : 1, scorm.summary.h5pPackages.some((p) => p.mainLibrary in P3.deltaByMain)], 'summary sin bundled');
+    eq(B.summaryH5pProfileVersion([{ mainLibrary: 'H5P.DragText' }]), 1, 'solo-contenido = 1');
+    eq(B.H5P_V2_RESTORE_NOTE, B.H5P_BUNDLED_RESTORE_NOTE, 'alias histórico');
     assert(/Library Pack v3/.test(built.summary.restore.note), built.summary.restore.note);
   });
   await check('validateMbzV3: el .mbz con QuestionSet 1.21 bundled queda limpio; un QuestionSet 1.20 solo-contenido en su lugar → H5P_LIBRARIES (falta la carpeta delta)', async () => {
@@ -259,7 +269,7 @@ const getPath = (o, p) => p.split('.').reduce((a, k) => (a == null ? a : a[k]), 
     z.file(`files/${newHash.slice(0, 2)}/${newHash}`, legacy);
     const v2 = await V.validateMbzV3(await z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' }), built.expectations);
     const msgs = v2.issues.filter((i) => i.code === 'H5P_LIBRARIES').map((i) => i.message);
-    assert(msgs.some((m) => /faltan carpetas de librería del delta v2: H5P\.QuestionSet-1\.21/.test(m)), JSON.stringify(v2.issues.slice(0, 5)));
+    assert(msgs.some((m) => /faltan carpetas de librería del delta del perfil: H5P\.QuestionSet-1\.21/.test(m)), JSON.stringify(v2.issues.slice(0, 5)));
   });
 
   // ══ 6. Library Pack v3 + preflight v3 ═════════════════════════════════════
