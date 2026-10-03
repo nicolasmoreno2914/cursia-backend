@@ -261,6 +261,11 @@ export interface DynamicPackageContentsV3 {
   finalExamBank?: ExamBankV1 | null;
   audioWelcome: Buffer;
   audiobookChapters: Map<string, Buffer>;
+  /**
+   * r19: chapterId → manifiesto del audiolibro del capítulo (null = audio sin manifiesto, curso existente).
+   * Con el mapa, `assembleAudiobook` aplica el piso de 25 min (AUDIOBOOK_TOO_SHORT_FOR_SOURCE); sin él, no.
+   */
+  audiobookManifests?: Map<string, any> | null;
 }
 
 export interface BuildDynamicMbzV3Input {
@@ -770,7 +775,9 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const audioWelcomeSeconds = mp3DurationSeconds(c.audioWelcome);
   const audiobook = assembleAudiobook(
     allChapters.map((ch) => ({ chapterId: ch.chapterId, chapterNumber: ch.chapterNumber, mp3: c.audiobookChapters.get(ch.chapterId) })),
+    { manifests: c.audiobookManifests ?? null },
   );
+  if (audiobook.floor) warnings.push(...audiobook.floor.warnings);
   // EV6 P2-B3: con banco, las «preguntas del examen» que ve el estudiante son los SLOTS (no el banco).
   const examQuestionCountByModule: Record<string, number> = {};
   const examBankSizeByModule: Record<string, number> = {};
@@ -1566,6 +1573,8 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
         itemKey: v.videoKey, chapterId: v.chapterId, chapterNumber: v.chapterNumber, title: v.title, notice: noticeChapterIds.includes(v.chapterId),
       })),
       warnings,
+      // r19: piso de 25 min del audiolibro (solo si el empaque pasó los manifiestos; no entra al .mbz).
+      ...(audiobook.floor ? { audiobookFloor: audiobook.floor } : {}),
       counts: facts.counts,
       assessment: assessmentPackageSummary(resolved),
       // EV6 H5P v2: con paquetes que traen sus librerías (Branching Scenario / «Repaso» / desde UX #5

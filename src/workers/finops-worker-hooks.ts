@@ -16,6 +16,8 @@ import { usageModelPriorsV1 } from '../modules/finops/usage-model';
 export type WorkerLedger = Pick<FinopsLedgerService, 'recordCharge' | 'recordAdjustment' | 'recordZero'> &
   Partial<Pick<FinopsLedgerService, 'settleMeasuredUsage' | 'settleReservation' | 'itemPaidCharges'>>;
 export type WorkerBudget = Pick<FinopsBudgetService, 'guardPaidSubmission'>;
+/** r19 fix round 1 (I5): uso estimado de LA llamada que se va a hacer (el guard la precia con el catálogo). */
+export type GuardNextCall = { provider: string; service: string; product: string; usage: Record<string, number> };
 
 /**
  * YouTube Data API `videos.insert` = 1600 unidades de cuota por subida.
@@ -657,12 +659,20 @@ export async function settlePaidCall(
  * - una reserva liquidada no cuenta (su cargo final es otra fila, que sí cuenta);
  * - `releasableKey`: reserva sin marcador de envío (Gamma/Videogen) = la llamada
  *   nunca se hizo → se libera en vez de bloquear;
- * - `skipProviders`: proveedores cuyo resultado sí quedó persistido/reanudable.
+ * - `skipProviders`: proveedores cuyo resultado sí quedó persistido/reanudable;
+ * - `isPersistedOutput`: r19, una operación puntual cuyo resultado sí quedó guardado.
  */
 export async function priorPaidOperations(
   ledger: WorkerLedger | null | undefined,
   itemRunId: string,
-  opts: { currentAttempt: number; acknowledgedThroughAttempt: number; skipProviders?: string[]; isSubmitMarked?: (key: string) => boolean },
+  opts: {
+    currentAttempt: number;
+    acknowledgedThroughAttempt: number;
+    skipProviders?: string[];
+    isSubmitMarked?: (key: string) => boolean;
+    /** r19: cargo cuyo resultado YA quedó guardado en el item (bloque del guion / segmento del audiolibro) → no bloquea. */
+    isPersistedOutput?: (row: ItemPaidCharge) => boolean;
+  },
 ): Promise<{ blocking: ItemPaidCharge[]; releasable: ItemPaidCharge[] }> {
   const l = requireLedger(ledger, 'la consulta de cargos previos del item');
   if (!l.itemPaidCharges) throw new LedgerWriteFailed('la consulta de cargos previos del item', 'ledger sin itemPaidCharges');
@@ -678,6 +688,7 @@ export async function priorPaidOperations(
   const blocking: ItemPaidCharge[] = [];
   for (const r of prior) {
     if (r.reservation && r.settled) continue;
+    if (opts.isPersistedOutput && opts.isPersistedOutput(r)) continue;
     if (r.reservation && opts.isSubmitMarked && !opts.isSubmitMarked(r.idempotency_key)) releasable.push(r);
     else blocking.push(r);
   }

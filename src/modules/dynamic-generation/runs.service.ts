@@ -4115,6 +4115,37 @@ export class RunsService {
    * actual + incremental esperado; si no → 409 budget_approval_required con el
    * estimateId. AUTO_WITHIN_POLICY nunca cubre proveedores pagados.
    */
+  /**
+   * r19 (A5): palabras narrables de cada capítulo cuyo audiolibro se va a (re)generar, si ya se conocen: el plan
+   * de bloques (`audiobookPlan.narratableWords`) del item de audiolibro más reciente de ese capítulo en el run.
+   * Solo existe en un reintento/regeneración de un audiolibro ya planificado; antes de la primera generación el
+   * contenido no existe y el estimado usa el capítulo de referencia (2.800 palabras). Nunca falla el gate: ante
+   * cualquier error devuelve {} (el estimado de referencia).
+   */
+  private async audiobookChapterWords(runId: string, items: readonly RunManifestItem[]): Promise<Record<string, number>> {
+    const chapterIds = [...new Set(items.filter((it) => it.type === 'audiobook_chapter' && it.chapterId).map((it) => it.chapterId as string))];
+    if (!chapterIds.length) return {};
+    try {
+      const rows: Array<{ chapter_id: string; words: string | null }> = await this.dataSource.query(
+        `select distinct on (chapter_id) chapter_id::text as chapter_id, output_summary->'audiobookPlan'->>'narratableWords' as words
+           from public.generation_item_runs
+          where job_id = $1 and type = 'audiobook_chapter' and chapter_id::text = any($2::text[])
+            and output_summary ? 'audiobookPlan'
+          order by chapter_id, generation desc`,
+        [runId, chapterIds],
+      );
+      const out: Record<string, number> = {};
+      for (const r of rows) {
+        const w = Number(r.words);
+        if (Number.isFinite(w) && w > 0) out[r.chapter_id] = w;
+      }
+      return out;
+    } catch (err) {
+      this.logger.warn(`finops: palabras del audiolibro no disponibles para el estimado (${err instanceof Error ? err.message : String(err)}); se usa el capítulo de referencia`);
+      return {};
+    }
+  }
+
   private async finopsPaidWorkGate(a: { courseId: number; ownerId: string; manifest: ManifestDto; job: any; paidKeys: string[]; dryRun?: boolean }): Promise<void> {
     // Solo los items cuyo proveedor está congelado en `real` para este run (video: videoMode; Gamma/TTS: providerModes).
     const modes = this.spendModesOf(a.job);
@@ -4133,7 +4164,8 @@ export class RunsService {
     for (const it of items) actions[it.key] = 'REGENERATE';
     let estimate: EstimateResult;
     try {
-      estimate = await this.finopsBudget.estimate(estimateItemsForRun(items, 'real', actions));
+      const chapterWords = await this.audiobookChapterWords(a.job.id, items);
+      estimate = await this.finopsBudget.estimate(estimateItemsForRun(items, 'real', actions, { chapterWords }));
     } catch (err) {
       throw this.finopsUnavailable(err);
     }
@@ -4200,7 +4232,8 @@ export class RunsService {
     const items = regenerated.map((x) => byKey.get(x.itemKey)).filter(Boolean) as RunManifestItem[];
     let estimate: EstimateResult;
     try {
-      estimate = await this.finopsBudget.estimate(estimateItemsForRun(items, mode, actions));
+      const chapterWords = await this.audiobookChapterWords(job.id, items);
+      estimate = await this.finopsBudget.estimate(estimateItemsForRun(items, mode, actions, { chapterWords }));
     } catch (err) {
       throw this.finopsUnavailable(err);
     }

@@ -113,20 +113,24 @@ const REAL = {
     assert.ok(/<\/html>\s*$/.test(html));
   });
 
+  // r19: el guion del audiolibro es por bloque del capítulo (sectionNarrationPrompt / sectionContinuationPrompt).
+  const SEC = { idx: 0, title: 'S', text: 'x', words: 300, sha256: 'x' };
+  const narr = (i) => AS.sectionNarrationPrompt(i, SEC, 1, null);
+  const contP = (pais) => AS.sectionContinuationPrompt('texto', SEC, 'T', 100, pais);
   await check('audiolibro: el guion pide tuteo en Colombia (narración y continuación); en Argentina no impone tuteo', () => {
-    const co = AS.chapterNarrationPrompt({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Colombia', contentMarkdown: 'x' });
+    const co = narr({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Colombia', contentMarkdown: 'x' });
     assert.ok(/tuteo/.test(co.system) && /nunca voseo/.test(co.system), 'narración');
-    const cont = AS.chapterContinuationPrompt('texto', 'T', 100, 'Colombia');
+    const cont = contP('Colombia');
     assert.ok(/tuteo/.test(cont.system), 'continuación');
-    const ar = AS.chapterNarrationPrompt({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Argentina', contentMarkdown: 'x' });
+    const ar = narr({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Argentina', contentMarkdown: 'x' });
     assert.ok(!/nunca voseo/.test(ar.system), 'Argentina');
-    const none = AS.chapterNarrationPrompt({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', contentMarkdown: 'x' });
+    const none = narr({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', contentMarkdown: 'x' });
     assert.ok(/tuteo/.test(none.system), 'sin país → tuteo latinoamericano');
   });
 
   await check('audiolibro (R14-11): narración y continuación prohíben multiplicadores atribuidos a investigación y cifras que no estén en el extracto', () => {
-    const co = AS.chapterNarrationPrompt({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Colombia', contentMarkdown: 'x' });
-    const cont = AS.chapterContinuationPrompt('texto', 'T', 100, 'Colombia');
+    const co = narr({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Colombia', contentMarkdown: 'x' });
+    const cont = contP('Colombia');
     for (const [name, p] of [['narración', co], ['continuación', cont]]) {
       assert.ok(/multiplicadores/.test(p.system) && /triplica/.test(p.system), `${name}: multiplicadores`);
       assert.ok(/No inventes ni exageres/.test(p.system), `${name}: veracidad`);
@@ -142,8 +146,8 @@ const REAL = {
   });
 
   await check('audiolibro (R14-13): narración y continuación prohíben anunciar apartados que no se narran y mencionar "el extracto"', () => {
-    const co = AS.chapterNarrationPrompt({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Colombia', contentMarkdown: 'x' });
-    const cont = AS.chapterContinuationPrompt('texto', 'T', 100, 'Colombia');
+    const co = narr({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Colombia', contentMarkdown: 'x' });
+    const cont = contP('Colombia');
     for (const [n, p] of [['narración', co], ['continuación', cont]]) assert.ok(/siguiente apartado/.test(p.system) && /extracto/.test(p.system) && /idea completa/.test(p.system), n);
   });
 

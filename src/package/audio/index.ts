@@ -14,7 +14,9 @@ export { buildInfoFrame } from './mp3-info';
 export { formatDurationEs, formatDurationShortEs } from './format-duration';
 
 export { assembleAudiobook } from './assemble-audiobook';
-export type { AudiobookChapterInput, AudiobookPart, AssembledAudiobook } from './assemble-audiobook';
+export type { AudiobookChapterInput, AudiobookPart, AssembledAudiobook, AssembleAudiobookOptions } from './assemble-audiobook';
+
+export * from './audiobook-policy';
 
 export type { Mp3Frame } from './mp3-frame';
 

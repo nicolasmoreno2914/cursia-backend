@@ -177,7 +177,7 @@ async function pureChecks() {
     eq(e.totals.byProvider.youtube.max, '0.0000000000', 'youtube $0');
     assert(e.totals.byChapter._none, 'items sin capítulo agrupados en _none');
     eq(e.estimatorVersion, 'finops-estimator-v2', 'versión');
-    eq(e.usageModelVersion, 'usage-priors-v1.5', 'usage model');
+    eq(e.usageModelVersion, 'usage-priors-v1.6', 'usage model');
     assert(leq(e.totals.retryAllowance.expected, e.totals.expected) && leq(e.totals.retryAllowance.max, e.totals.max), 'retryAllowance ⊂ total');
     for (const l of e.lines) assert(typeof l.retryRate === 'number' && l.retryRate >= 0, `retryRate en ${l.itemKey}`);
   });
@@ -203,22 +203,25 @@ async function pureChecks() {
   // 0.886/ítem, final 2.029 (priors v1.5: llamadas de ≤ 3.500 tokens estimados, hotfix #583) ⇒ banco del 2×2 ≈ 3.80
   // (medido en staging 4.35). Real proyectado = 11.73 − 4.35 + 3.80 = 11.18; registrado proyectado = 14.55 − 0.55 =
   // 14.00. Experiencia y contenido siguen con lo medido.
-  await check('V542 calibración (BANKOPT): el 2×2 de #542 (36 items) estima dentro de ±20 % del gasto REAL proyectado (11.18); exámenes ≈ proyección BANKOPT, experiencia y contenido ≈ medidos; desglose con reintentos y caché', () => {
+  // r19 (bloque A, priors v1.6): el audiolibro narra el capítulo COMPLETO ⇒ ≈ US$0.35 por capítulo (antes ≈ 0.07 medido:
+  // resumen de ~480 palabras). Proyección del 2×2: + 4 × 0.28 = + 1.12 ⇒ real 11.18 → 12.30, registrado 14.00 → 15.12;
+  // anthropic (guion por bloque, ≈ 0.093 vs ≈ 0.015 por capítulo) 5.53 → 5.84.
+  await check('V542 calibración (BANKOPT + r19): el 2×2 de #542 (36 items) estima dentro de ±20 % del gasto REAL proyectado (12.30); exámenes ≈ proyección BANKOPT, experiencia y contenido ≈ medidos; desglose con reintentos y caché', () => {
     const items = RB.estimateItemsForRun(course542(), 'real');
     eq(items.length, 36, 'items');
     eq(items.filter((i) => i.usageScale).length, 0, 'el 2×2 es la referencia (escala 1)');
     const e = estimateCost({ items, catalog: CATALOG, usageModel: usageModelPriorsV1(), retryPolicy: { maxRetries: 1 } });
     const n = (x) => Number(x);
     const exp = n(e.totals.expected);
-    const REAL = 11.18;
-    const RECORDED = 14.0;
+    const REAL = 12.3;
+    const RECORDED = 15.12;
     assert(Math.abs(exp - REAL) / REAL <= 0.2, `expected ${exp} vs real ${REAL}: ${(((exp - REAL) / REAL) * 100).toFixed(1)} %`);
     assert(Math.abs(exp - RECORDED) / RECORDED <= 0.2, `expected ${exp} vs registrado ${RECORDED}`);
     const by = (t) => n(e.totals.byItemType[t].expected);
     for (const [t, actual] of [['exam', 1.772], ['final_exam', 2.029], ['experience', 0.64], ['content', 0.4]]) {
       assert(Math.abs(by(t) - actual) / actual <= 0.05, `${t}: estimado ${by(t)} vs medido ${actual}`);
     }
-    assert(Math.abs(n(e.totals.byProvider.anthropic.expected) - 5.53) / 5.53 <= 0.05, `anthropic ${e.totals.byProvider.anthropic.expected} vs 5.53 (6.08 − 4.35 + 3.80)`);
+    assert(Math.abs(n(e.totals.byProvider.anthropic.expected) - 5.84) / 5.84 <= 0.05, `anthropic ${e.totals.byProvider.anthropic.expected} vs 5.84 (6.08 − 4.35 + 3.80 + 4 × 0.078 del guion por bloque, r19)`);
     // El banco se estima con los 4 medidores de Sonnet 4.6 (entrada sin caché, salida, escritura y lectura de caché).
     for (const op of ['llm.exam', 'llm.final_exam']) eq(Object.keys(usageModelPriorsV1().operations[op].meters).sort(), ['cache_read_tokens', 'cache_write_tokens', 'input_tokens', 'output_tokens'], op + ': medidores');
     // El estimado v1.1 (8.82) quedaba −25 % bajo el real y su anthropic (1.49) −75 %: la causa del tope cruzado.
@@ -233,7 +236,7 @@ async function pureChecks() {
     // I3: el final no presupone caché tibio de los exámenes de módulo (escrituras completas: ≥ 5 k tokens por capítulo).
     eq(usageModelPriorsV1().operations['llm.final_exam'].meters.cache_write_tokens.p50 >= 4 * 5000, true, 'final con caché frío');
     eq(bd.retryAllowance, e.totals.retryAllowance, 'breakdown.retryAllowance');
-    console.log(`   2×2 #542 (BANKOPT): estimado ${exp.toFixed(2)} [${n(e.totals.min).toFixed(2)}–${n(e.totals.max).toFixed(2)}] vs real proyectado ${REAL} (${(((exp - REAL) / REAL) * 100).toFixed(1)} %) / registrado proyectado ${RECORDED} (${(((exp - RECORDED) / RECORDED) * 100).toFixed(1)} %); anthropic ${n(e.totals.byProvider.anthropic.expected).toFixed(2)} vs 5.53; banco ${n(bd.examBank.expected).toFixed(2)}; reintentos ${ra.toFixed(2)}`);
+    console.log(`   2×2 #542 (BANKOPT + r19): estimado ${exp.toFixed(2)} [${n(e.totals.min).toFixed(2)}–${n(e.totals.max).toFixed(2)}] vs real proyectado ${REAL} (${(((exp - REAL) / REAL) * 100).toFixed(1)} %) / registrado proyectado ${RECORDED} (${(((exp - RECORDED) / RECORDED) * 100).toFixed(1)} %); anthropic ${n(e.totals.byProvider.anthropic.expected).toFixed(2)} vs 5.84; banco ${n(bd.examBank.expected).toFixed(2)}; reintentos ${ra.toFixed(2)}`);
   });
   await check('V542: el banco escala con los capítulos — entrada y lectura de caché ∝ llamadas, escritura ∝ capítulos, salida ∝ preguntas pedidas (con holgura); 1 capítulo cuesta menos, 3×3 más', () => {
     const ch = (k, m) => Array.from({ length: k }, (_, i) => ({ id: `${m}c${i}`, moduleId: m }));
