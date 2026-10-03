@@ -10,10 +10,15 @@
  *  - se despoja el ID3 (v2 y v1) de cada parte;
  *  - se exige mismo sample rate + channel mode + versión MPEG en todas las
  *    partes, si no `MP3_INCOMPATIBLE_PARTS` con el detalle de cada una;
- *  - se descarta el frame Xing/Info de cada parte (mentiría sobre el total).
+ *  - se descarta el frame Xing/Info de cada parte (mentiría sobre el total);
+ *  - UX r18 (problema 2): el resultado abre con UN frame Info/Xing nuevo con el
+ *    conteo REAL de frames y bytes del buffer ensamblado (`mp3-info.ts`), para
+ *    que el reproductor conozca la duración exacta sin estimarla.
  */
 
 import { audioFramesOf, parseMp3 } from './mp3-parser';
+import { buildInfoFrame } from './mp3-info';
+import type { Mp3Frame } from './mp3-frame';
 import { Mp3IncompatiblePartsError, Mp3InvalidError } from './mp3-errors';
 
 interface PartProfile {
@@ -48,14 +53,20 @@ export function concatMp3(parts: Buffer[]): Buffer {
   }
 
   const chunks: Buffer[] = [];
+  const allFrames: Mp3Frame[] = [];
+  let firstHeader: Buffer | null = null;
   for (let i = 0; i < parsedParts.length; i++) {
     const { parsed } = parsedParts[i];
     const sourceBuf = parts[i];
     const audioFrames = audioFramesOf(parsed);
     for (const frame of audioFrames) {
+      if (!firstHeader) firstHeader = sourceBuf.subarray(frame.offset, frame.offset + 4);
       chunks.push(sourceBuf.subarray(frame.offset, frame.offset + frame.length));
+      allFrames.push(frame);
     }
   }
+  if (!firstHeader || !allFrames.length) throw new Mp3InvalidError('concatMp3: las partes no tienen frames de audio');
 
-  return Buffer.concat(chunks);
+  const audio = Buffer.concat(chunks);
+  return Buffer.concat([buildInfoFrame(firstHeader, allFrames, audio.length), audio]);
 }

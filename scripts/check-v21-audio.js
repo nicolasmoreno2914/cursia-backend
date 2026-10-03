@@ -127,10 +127,23 @@ check('parseMp3: detecta ID3v1 (128 bytes finales "TAG...")', () => {
 });
 
 // ─── concatMp3 ──────────────────────────────────────────────────────────────
+// UX r18 (problema 2): concatMp3 abre con UN frame Info nuevo (conteo real de frames/bytes); el audio
+// que sigue es el de siempre. `audioAfterInfo` valida ese frame y devuelve el resto para comparar.
+function audioAfterInfo(buf) {
+  const p = parseMp3(buf);
+  assert(p.hasXing === true, 'esperaba un frame Info/Xing al inicio del resultado');
+  const audioFrames = p.frames.length - 1;
+  assert(p.xingFrames === audioFrames, `el Info declara ${p.xingFrames} frames y hay ${audioFrames} de audio`);
+  const first = p.frames[0];
+  const o = first.offset + 4 + (first.channels === 1 ? (first.version === 'MPEG1' ? 17 : 9) : first.version === 'MPEG1' ? 32 : 17);
+  assert(buf.toString('ascii', o, o + 4) === 'Info', 'etiqueta Info (CBR)');
+  assert(buf.readUInt32BE(o + 12) === buf.length, `el Info declara ${buf.readUInt32BE(o + 12)} bytes y hay ${buf.length}`);
+  return buf.subarray(first.offset + first.length);
+}
 
-check('concatMp3: 3 slices contiguas reproducen el original byte a byte', () => {
+check('concatMp3: 3 slices contiguas reproducen el original byte a byte (tras el frame Info nuevo)', () => {
   const result = concatMp3([sliceA, sliceB, sliceC]);
-  assert(Buffer.compare(result, expectedConcat) === 0, 'el resultado no coincide byte a byte con el original');
+  assert(Buffer.compare(audioAfterInfo(result), expectedConcat) === 0, 'el resultado no coincide byte a byte con el original');
 });
 
 check('concatMp3: duración del resultado = suma de duraciones de las partes', () => {
@@ -149,7 +162,7 @@ check('concatMp3: despoja ID3 de cada parte antes de concatenar', () => {
   const result = concatMp3([sliceAWithTag, sliceB]);
   const parsed = parseMp3(result);
   assert(parsed.id3v1 === null, 'el resultado no debería tener ID3v1 (viene de una parte intermedia, no del final real)');
-  assert(parsed.frames.length === 80, `esperaba 80 frames (40+40), obtuve ${parsed.frames.length}`);
+  assert(parsed.frames.length === 81 && parsed.xingFrames === 80, `esperaba Info + 80 frames (40+40), obtuve ${parsed.frames.length} (Info: ${parsed.xingFrames})`);
 });
 
 check('concatMp3: partes incompatibles (44.1kHz vs 24kHz) → MP3_INCOMPATIBLE_PARTS', () => {
@@ -185,7 +198,7 @@ check('assembleAudiobook: ordena por chapterNumber y ensambla', () => {
     { chapterId: 'cap-1', chapterNumber: 1, mp3: sliceA },
     { chapterId: 'cap-3', chapterNumber: 3, mp3: sliceC },
   ]);
-  assert(Buffer.compare(result.buffer, expectedConcat) === 0, 'el buffer ensamblado no coincide con el esperado en orden 1,2,3');
+  assert(Buffer.compare(audioAfterInfo(result.buffer), expectedConcat) === 0, 'el buffer ensamblado no coincide con el esperado en orden 1,2,3');
   assert(result.parts.length === 3, 'esperaba 3 partes en el índice');
   assert(result.parts[0].chapterId === 'cap-1', 'la primera parte debe ser cap-1 (reordenado)');
   assert(result.parts[1].offsetSeconds > result.parts[0].offsetSeconds, 'offsets deben ser crecientes');
@@ -289,7 +302,8 @@ check('I3: assembleAudiobook — total y offsets coinciden EXACTAMENTE con el bu
     JSON.stringify([['a', 0, 2.4], ['b', 2.4, 1.2], ['c', 3.6, 0.6]]), JSON.stringify(r.parts));
   // Cada offset cae exactamente en un borde de frame del buffer ensamblado.
   const frames = parseMp3(r.buffer).frames;
-  assert(!parseMp3(r.buffer).hasXing && frames.length === 175, `frames ${frames.length}`);
+  // UX r18: un solo Info (el nuevo, con los 175 frames reales; el «mentiroso» de la parte se descartó).
+  assert(parseMp3(r.buffer).hasXing && parseMp3(r.buffer).xingFrames === 175 && frames.length === 176, `frames ${frames.length}`);
 });
 
 check('M2: un frame Info con CRC (protection_bit=0) se detecta y se descarta al concatenar', () => {
@@ -297,7 +311,8 @@ check('M2: un frame Info con CRC (protection_bit=0) se detecta y se descarta al 
   const p = parseMp3(crcX);
   assert(p.hasXing === true, 'Info con CRC no detectado');
   assert(near(mp3DurationSeconds(crcX), 2.4), `duración ${mp3DurationSeconds(crcX)}`);
-  assert(parseMp3(concatMp3([crcX])).frames.length === 100, 'el frame Info se coló en el stream');
+  const out = parseMp3(concatMp3([crcX]));
+  assert(out.frames.length === 101 && out.xingFrames === 100 && out.frames.slice(1).every((f) => !f.isXingOrInfo), 'el frame Info viejo se coló en el stream');
 });
 
 check('M2: una parte que cambia de sample rate a mitad del stream → MP3_INVALID', () => {

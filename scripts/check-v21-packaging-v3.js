@@ -285,7 +285,7 @@ const MATRIX = [
     void input;
   });
 
-  await check('[h5p-final-light] portada Gamma reducida (≤ 640 px) y PDF/PNG en el filearea intro del label de la tarjeta', async () => {
+  await check('[h5p-final-light] portada Gamma reducida (≤ 1600 px, UX r18) y PDF/PNG en el filearea intro del label de la tarjeta', async () => {
     const { r } = built['h5p-final-light'];
     const { z, acts } = await actDirs(r.mbz);
     const files = await z.file('files.xml').async('string');
@@ -299,7 +299,8 @@ const MATRIX = [
       assert(png && pdf && /<filearea>intro<\/filearea>/.test(png) && /<component>mod_label<\/component>/.test(pdf), `archivos de ${a.idnumber}`);
       const h = /<contenthash>(\w+)<\/contenthash>/.exec(png)[1];
       const dims = PRES.pngDimensions(await z.file(`files/${h.slice(0, 2)}/${h}`).async('nodebuffer'));
-      eq([dims.width, dims.height], [640, 360], 'portada reducida');
+      // UX r18 (problema 3): tope 1600 px (antes 640: borrosa a DPR 2); el fixture trae una portada más ancha.
+      eq([dims.width, dims.height], [1600, 900], 'portada reducida');
     }
     eq(r.summary.warnings, [], 'sin avisos');
   });
@@ -425,8 +426,9 @@ const MATRIX = [
       if (/:activity_instruction$/.test(a.idnumber)) {
         const next = bacts[i + 1];
         const mid = /_(\d+)$/.exec(next.dir)[1];
-        const tok = next.modname === 'scorm' ? 'SCORMVIEWBYID' : 'H5PACTIVITYVIEWBYID';
-        assert(x.includes(`$@${tok}*${mid}@$`), `${a.idnumber}: el botón no apunta a ${next.idnumber}`);
+        // UX r18 (problema 4): SCORM → botón a la actividad; H5P (embebida justo debajo) → sin botón.
+        if (next.modname === 'scorm') assert(x.includes(`$@SCORMVIEWBYID*${mid}@$`), `${a.idnumber}: el botón no apunta a ${next.idnumber}`);
+        else assert(next.modname === 'h5pactivity' && !/VIEWBYID\*\d+@\$/.test(x) && !x.includes('Iniciar actividad'), `${a.idnumber}: botón «Iniciar actividad» hacia ${next.idnumber}, que ya está embebida`);
       }
       if (/^cv3:(exam_info:|final_exam_info)/.test(a.idnumber)) {
         const mid = /_(\d+)$/.exec(bacts[i + 1].dir)[1];
@@ -555,8 +557,10 @@ const MATRIX = [
       return { [`${a.dir}/label.xml`]: (x) => x.replace(/\$@COURSESECTIONBYID\*(\d+)@\$/, 'cursia-cta://section/$1') };
     }],
     ['TOKEN_INVALID', () => {
-      const a = find(/^cv3:ch:[^:]+:activity_instruction$/);
-      return { [`${a.dir}/label.xml`]: (x) => x.replace(/\$@(SCORM|H5PACTIVITY)VIEWBYID\*\d+@\$/, 'cursia-cta://next-activity') };
+      // UX r18 (problema 4): el paquete base es H5P y su instrucción de práctica ya no lleva botón (la actividad va
+      // embebida); el marcador «siguiente» sin resolver se prueba en el botón de la evaluación del módulo.
+      const a = find(/^cv3:exam_info:/);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace(/\$@QUIZVIEWBYID\*\d+@\$/, 'cursia-cta://next-exam') };
     }],
     ['NUMBER_NOT_FROM_FACTS', () => {
       const a = find(/^cv3:module_next:/);
@@ -1212,7 +1216,7 @@ const MATRIX = [
     for (const [f, v] of [['builderVersion', '3.0.1'], ['manifestSha256', 'm2'], ['sourceArtifactIds', ['a']], ['themeSha256', 't2'], ['assessmentProfileSha256', 'p2'], ['h5pProfileVersion', 2], ['vcRendererVersion', 'r2'], ['moodleVersion', '4.5']]) {
       assert(PK.packageReuseHashV3({ ...baseK, [f]: v }) !== k0, `cambia con ${f}`);
     }
-    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.11.0' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
+    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.12.0' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
   });
 
   // ── Medios ────────────────────────────────────────────────────────────────
@@ -1224,7 +1228,7 @@ const MATRIX = [
     const small = MEDIA.syntheticCoverPng(300, 200, '#123456');
     eq(PNG.downscaleCoverPng(small).reason, 'already_small', 'chica');
     const big = PNG.downscaleCoverPng(MEDIA.syntheticCoverPng(2000, 1000, '#123456'));
-    eq([big.width, big.height, big.downscaled], [640, 320, true], 'grande');
+    eq([big.width, big.height, big.downscaled], [1600, 800, true], 'grande (UX r18: tope 1600 px)');
     const dec = PNG.decodePng(big.png);
     eq([dec.pixels[0], dec.pixels[1], dec.pixels[2]], [0x12, 0x34, 0x56], 'color preservado');
     const png16 = Buffer.from(small);

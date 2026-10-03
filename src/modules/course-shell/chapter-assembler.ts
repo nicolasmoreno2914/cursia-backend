@@ -48,7 +48,7 @@ import {
   unprotectedText,
 } from './html';
 import { COPY, activityTask, bridgeLead, moduleEndText, moduleExamTransition } from './microcopy';
-import { CTA_ACTIVITY, ctaButton, ctaSection } from './cta';
+import { CTA_ACTIVITY, activityEmbedsInline, ctaButton, ctaSection } from './cta';
 import { ChapterNextStep, chapterNextSteps } from './section-layout';
 
 export type ChapterSlot =
@@ -217,8 +217,10 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
         heading(h, 'h3', COPY.activityTitle, pss) +
         factsRow +
         pHtml(h, labelHtml(activityTask(ch.activityVariant === 'scorm' ? 'scorm' : ch.activityType)), pss, { last: true }) +
-        // Edu EV3: botón a la actividad (el builder resuelve el marcador al crearla).
-        ctaButton(h, CTA_ACTIVITY, `Iniciar actividad →`, pss, fill),
+        // Edu EV3: botón a la actividad (el builder resuelve el marcador al crearla). UX r18 (problema 4):
+        // solo si la actividad NO va embebida justo debajo (H5P se juega en la misma página; su intro ya
+        // trae el respaldo «Ábrela en su propia página →»). SCORM se abre aparte: conserva el botón.
+        (activityEmbedsInline(ch.activityVariant) ? '' : ctaButton(h, CTA_ACTIVITY, `Iniciar actividad →`, pss, fill)),
       { s: pss, border: mt.edge },
       { cls: 'cvc-practice' },
     );

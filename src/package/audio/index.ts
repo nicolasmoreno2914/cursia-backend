@@ -9,6 +9,7 @@ export { parseMp3, mp3DurationSeconds, audioFramesOf } from './mp3-parser';
 export type { ParsedMp3 } from './mp3-parser';
 
 export { concatMp3 } from './mp3-concat';
+export { buildInfoFrame } from './mp3-info';
 
 export { formatDurationEs, formatDurationShortEs } from './format-duration';
 

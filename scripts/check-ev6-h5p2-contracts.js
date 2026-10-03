@@ -76,12 +76,18 @@ const GOLDEN = {
   // (showdescription 1), con la renumeración de ids que eso trae; runtime VC 3 → 4 (esquina de la tabla sin «Aspecto»).
   // Dorados anteriores (3.10.0): h5p-final-light 6ce9ebb3…, scorm-nofinal-dark b7aeda95…, h5p-nofinal-dark-mock-cleansafe
   // ab93ce5b…, scorm-final-light 6619628e…, h5p-ev5c-rules1 c96fb4bb….
+  // UX r18 (builder 3.11.0 → 3.12.0) cambia el .mbz a propósito, y SOLO en esto (diff semántico por idnumber contra
+  // origin/staging, scratchpad/r18/uximpl-golddiff4.js): sección 0 con el hero primero y el foro al final (ids de la
+  // sección 0 renumerados), sin kicker «Bienvenida» en el hero, <audio preload="metadata">, frame Info en
+  // audiolibro.mp3, portadas a 1600 px (antes 640) y sin botón «Iniciar actividad» hacia la H5P embebida.
+  // Dorados anteriores (3.11.0): h5p-final-light 03bb4e8b…, scorm-nofinal-dark 9500797e…, h5p-nofinal-dark-mock-cleansafe
+  // 5329675d…, scorm-final-light 948e402d…, h5p-ev5c-rules1 4a1532f2….
   mbz: {
-    'h5p-final-light': '03bb4e8b8610cdc2b7b5a8523201dc99cea10edae98ce2e04729b3695771cddb',
-    'scorm-nofinal-dark': '9500797ec20439c80636c1d0565af8a09a475b584c5ddf359fc1a2b76b44b383',
-    'h5p-nofinal-dark-mock-cleansafe': '5329675d33baf25262432a653c3c6690321c85abcb4a50d12ab0cf57e33fa1db',
-    'scorm-final-light': '948e402dd5d5192b184801a419b78a798263cad37cbd834320daa2e25aae4562',
-    'h5p-ev5c-rules1': '4a1532f23d3f7b1047d73c28e10b0832dafbda04ace70b090dcb0efd84be54d1',
+    'h5p-final-light': 'd839d74342a7a99a8030ea554d85f359fb63e866ecae52bf04298f2faf831b68',
+    'scorm-nofinal-dark': '7a1a79b53c17784b1244a96fae8845a199a310c290b9d04ccb2e1facab9ff31d',
+    'h5p-nofinal-dark-mock-cleansafe': '6dc0cfc630a86373ffea4a4821c62c4bfb173e650fd91dd156bc397e5d86b9f0',
+    'scorm-final-light': '0f98d0ba5a539dec369c566d803139bfb23bfc4ff84023c8484bfba35991b6a6',
+    'h5p-ev5c-rules1': 'a94cdb0f4621e69bfc69156cb0197ae91ef4b0071361027aee26544fb9da1790',
   },
 };
 

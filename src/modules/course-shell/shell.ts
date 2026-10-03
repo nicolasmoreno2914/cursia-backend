@@ -127,8 +127,11 @@ export function welcomeLabel(
   if (c.videos > 0) stats.push({ value: c.videos, label: plural(c.videos, 'video interactivo', 'videos interactivos') });
   if (c.activities > 0) stats.push({ value: c.activities, label: plural(c.activities, 'actividad práctica', 'actividades prácticas') });
   if (c.evaluations > 0) stats.push({ value: c.evaluations, label: plural(c.evaluations, 'evaluación', 'evaluaciones') });
+  // UX r18 (problema 1): Moodle 4.5 siempre pinta el nombre de la sección 0 («Bienvenida») como
+  // encabezado justo encima de este label (núcleo de format_topics, no se puede quitar desde el
+  // .mbz). El hero NO repite esa palabra como kicker: abre directo con el título del curso.
   const hero = renderComponent(
-    { type: 'hero', eyebrow: 'Bienvenida', title: facts.course.title, lead: intro.welcome },
+    { type: 'hero', title: facts.course.title, lead: intro.welcome },
     theme,
     { uid: 'shell-welcome-hero', level: lvl(h), countless: true },
   );

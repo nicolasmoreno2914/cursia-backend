@@ -129,6 +129,7 @@ import {
   welcomeLabel,
   welcomeStartLabel,
   shellProseByLabel,
+  activityEmbedsInline,
 } from '../modules/course-shell';
 import type { H5pActivityTypeV2 } from '../modules/course-shell';
 import { PackagingPlanV3, buildPackagingPlanV3, packagingPlanV3Sha256 } from '../modules/dynamic-packaging/packaging-plan-v3';
@@ -212,8 +213,12 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * «Puntúa como 5,88»); la tarjeta del Libro Guía es la descripción del recurso (una sola entrada en la sección 1);
  * el cierre ya no afirma que el estudiante completó el curso; pasos con mayúscula inicial y la esquina de la tabla
  * de comparación sin «Aspecto» (renderer style 3, runtime 4).
+ * 3.12.0 (UX r18): la sección 0 abre con el hero de bienvenida (sin el kicker «Bienvenida» repetido) y el foro
+ * de avisos va al final (ids de la sección 0 renumerados); `<audio preload="metadata">`; el audiolibro
+ * concatenado lleva un frame Info con el conteo real de frames; portada a 1600 px (antes 640, PNG con filtro
+ * adaptativo); sin botón «Iniciar actividad» cuando la actividad H5P va embebida debajo (SCORM lo conserva).
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.11.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.12.0';
 
 // EV6 P2-B5: `examExplanationsAvailability` vive en course-shell/exam-explanations (lo usa también el validador).
 export { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';
@@ -1059,6 +1064,15 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   };
 
   // ── Sección 0 — shell ────────────────────────────────────────────────────
+  // UX r18 (problema 1): Moodle 4.5 pinta el nombre de la sección 0 como encabezado (núcleo); el hero
+  // con tema va JUSTO debajo (primer módulo de la sección) y el foro de avisos cierra la sección.
+  addLabel(0, 'cv3:shell:welcome', welcomeLabel(facts, courseIntro, theme, opts, input.qaPreviewNotice === true));
+  addLabel(0, 'cv3:shell:audio_welcome', audioWelcomeLabel(facts, theme, opts), [
+    { name: SHELL_AUDIO_WELCOME_FILE, data: c.audioWelcome, mime: 'audio/mp3' },
+  ]);
+  addLabel(0, 'cv3:shell:competencies', competenciesLabel(facts, courseIntro, theme, opts));
+  addLabel(0, 'cv3:shell:methodology', methodologyLabel(facts, courseIntro, theme, opts));
+  addLabel(0, 'cv3:shell:start', welcomeStartLabel(firstChapterSection as number, facts, theme, opts));
   {
     const name = '📢 Avisos del Curso';
     const a = W.newActivity('forum', 0, name, 'cv3:shell:forum');
@@ -1071,13 +1085,6 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     W.put(`${a.dir}/discussions.xml`, '<?xml version="1.0" encoding="UTF-8"?><discussions></discussions>');
     W.boilerplate(a.dir);
   }
-  addLabel(0, 'cv3:shell:welcome', welcomeLabel(facts, courseIntro, theme, opts, input.qaPreviewNotice === true));
-  addLabel(0, 'cv3:shell:audio_welcome', audioWelcomeLabel(facts, theme, opts), [
-    { name: SHELL_AUDIO_WELCOME_FILE, data: c.audioWelcome, mime: 'audio/mp3' },
-  ]);
-  addLabel(0, 'cv3:shell:competencies', competenciesLabel(facts, courseIntro, theme, opts));
-  addLabel(0, 'cv3:shell:methodology', methodologyLabel(facts, courseIntro, theme, opts));
-  addLabel(0, 'cv3:shell:start', welcomeStartLabel(firstChapterSection as number, facts, theme, opts));
 
   // ── Sección 1 — ruta, Libro Guía, audiolibro ─────────────────────────────
   addLabel(1, 'cv3:shell:route', routeLabel(facts, theme, opts));
@@ -1206,6 +1213,10 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
         const act = c.activities.get(ch.chapterId) as ActivityContentV3;
         const key = ch.keys.activity as string;
         const name = safeActivityName(`Actividad práctica · Capítulo ${ch.chapterNumber}: ${ch.title}`);
+        // H5P → intro con la actividad embebida (h5pActivityInlineIntroHtml); SCORM → se abre aparte. UX r18
+        // (problema 4): debe coincidir con `activityEmbedsInline` del ensamblador (sin botón «Iniciar actividad»
+        // cuando se embebe); el validador lo verifica sobre el paquete (NAVIGATION).
+        if (activityEmbedsInline(act.variant) !== (act.variant === 'h5p')) throw new Error(`MBZ_V3_INVARIANT: activityEmbedsInline(${act.variant}) no coincide con el intro del builder`);
         if (act.variant === 'h5p') {
           const built = await buildActivityH5p(
             act.payload,

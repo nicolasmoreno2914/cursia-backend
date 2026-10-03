@@ -998,7 +998,8 @@ function reservationBookkeeping(ev) {
         // EV6: una sección por capítulo (la presentación del módulo arriba del primero), una por
         // evaluación de módulo, la evaluación final y, ÚLTIMO, el cierre del curso.
         const want = [];
-        want.push([0, ['cv3:shell:forum', 'cv3:shell:welcome', 'cv3:shell:audio_welcome', 'cv3:shell:competencies', 'cv3:shell:methodology', 'cv3:shell:start']]);
+        // UX r18 (problema 1): hero de bienvenida primero (bajo el encabezado de Moodle), foro de avisos al final.
+        want.push([0, ['cv3:shell:welcome', 'cv3:shell:audio_welcome', 'cv3:shell:competencies', 'cv3:shell:methodology', 'cv3:shell:start', 'cv3:shell:forum']]);
         want.push([1, ['cv3:shell:route', 'cv3:shell:libro', 'cv3:shell:audiobook', 'cv3:shell:route_start']]); // #583: sin libro_card
         const secOfCh = {}; const secOfExam = {}; const firstSecOfMod = {};
         let sn = 2;
@@ -1136,7 +1137,14 @@ function reservationBookkeeping(ev) {
         for (const ch of chFlags) {
           if (!ch.activityEnabled) continue;
           const hs = hrefs(`cv3:ch:${ch.chapterId}:activity_instruction`);
-          if (!hs.some((h) => /\/mod\/(h5pactivity|scorm)\/view\.php\?id=\d+$/.test(h))) ctaBad.push(`${ch.chapterId.slice(0, 8)}: «Iniciar actividad» sin enlace a la actividad (${hs.join(' ')})`);
+          // UX r18 (problema 4): SCORM se abre aparte → «Iniciar actividad» con enlace a la actividad; H5P va embebida
+          // justo debajo → la instrucción NO lleva enlace a la actividad y el intro de la actividad conserva su
+          // respaldo «Ábrela en su propia página →» (enlace real a /mod/h5pactivity/view.php tras restaurar).
+          const actCm = cms.find((c) => c.idnumber === `cv3:ch:${ch.chapterId}:activity`);
+          if (actCm && actCm.modname === 'h5pactivity') {
+            if (hs.some((h) => /\/mod\/h5pactivity\/view\.php\?id=\d+$/.test(h))) ctaBad.push(`${ch.chapterId.slice(0, 8)}: «Iniciar actividad» hacia la actividad H5P que ya está embebida (${hs.join(' ')})`);
+            if (!hrefs(`cv3:ch:${ch.chapterId}:activity`).some((h) => /\/mod\/h5pactivity\/view\.php\?id=\d+$/.test(h))) ctaBad.push(`${ch.chapterId.slice(0, 8)}: el intro de la actividad H5P perdió el respaldo «Ábrela en su propia página»`);
+          } else if (!hs.some((h) => /\/mod\/scorm\/view\.php\?id=\d+$/.test(h))) ctaBad.push(`${ch.chapterId.slice(0, 8)}: «Iniciar actividad» sin enlace a la actividad (${hs.join(' ')})`);
         }
         // EV6: cada botón de sección → /course/section.php?id=<id REAL de la sección destino> (exactamente uno).
         const sidOf = (num) => (o.sections.find((x) => x.section === num) || {}).id;

@@ -425,7 +425,11 @@ async function pureChecks() {
             // P3: tarjeta «Práctica calificada · Capítulo N» con la fila de datos (de facts) y la tarea; el botón no repite el capítulo.
             assert(instr.startsWith(`Práctica calificada · Capítulo ${chapterNumber} Pon a prueba lo aprendido`) && instr.includes('Nota mínima: 70 de 100') && instr.includes('Intentos: sin límite'), `instrucción: ${instr}`);
             assert(/Intentos: sin límite (Responderás|Arrastrarás|Completarás|Resolverás) /.test(instr), `cap ${chapterNumber}: la instrucción no dice qué hará el estudiante: ${instr}`);
-            assert(instr.endsWith('Iniciar actividad →') && slots.find((s) => s.role === 'activity_instruction').html.includes('href="cursia-cta://next-activity"'), `cap ${chapterNumber}: botón «Iniciar actividad»`);
+            // UX r18 (problema 4): el botón solo cuando la actividad NO va embebida debajo (SCORM); con H5P
+            // la actividad se juega en la misma página y su intro trae el respaldo «Ábrela en su propia página».
+            const ih = slots.find((s) => s.role === 'activity_instruction').html;
+            if (S.activityEmbedsInline(ch.activityVariant)) assert(!instr.includes('Iniciar actividad') && !ih.includes('cursia-cta://next-activity'), `cap ${chapterNumber}: botón «Iniciar actividad» con H5P embebido`);
+            else assert(instr.endsWith('Iniciar actividad →') && ih.includes('href="cursia-cta://next-activity"'), `cap ${chapterNumber}: botón «Iniciar actividad»`);
           }
         }
       }
@@ -577,7 +581,7 @@ async function pureChecks() {
     const labels = shellLabels(f2, c2, THEME);
     const byName = Object.fromEntries(labels.map((l) => [l.name, l]));
     const aw = byName['Audio de bienvenida'].html;
-    assert(aw.includes('<audio controls preload="none" src="@@PLUGINFILE@@/audio_bienvenida.mp3"'), 'audio de bienvenida');
+    assert(aw.includes('<audio controls preload="metadata" src="@@PLUGINFILE@@/audio_bienvenida.mp3"'), 'audio de bienvenida (UX r18: preload="metadata")');
     assert(vc.extractText(aw).includes('Duración: 0 min 58 s.'), 'duración medida (formatDurationEs)');
     const ab = vc.extractText(byName['Audiolibro'].html);
     assert(ab.includes('Duración total: 15 min 48 s.') && ab.toLowerCase().includes('empieza en 3 min 01 s · dura 3 min 38 s'), `índice del audiolibro: ${ab}`);

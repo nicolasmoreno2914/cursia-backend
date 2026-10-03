@@ -324,11 +324,15 @@ export function link(h: Hx, href: string, text: string, s: Surf, opts: { button?
   return `<a href="${attr(href)}"${st(h, [['color', col], ['font-weight', '700']])}>${inlineHtml(text)}</a>`;
 }
 
-/** Reproductor nativo + enlace de descarga (el fallback sobrevive a forceclean). */
+/**
+ * Reproductor nativo + enlace de descarga (el fallback sobrevive a forceclean).
+ * UX r18 (problema 2): `preload="metadata"` (antes "none"): el navegador pide solo la cabecera del MP3 y
+ * muestra la duración REAL antes de Play (con "none" el control quedaba en 0:00 hasta reproducir).
+ */
 export function audio(h: Hx, src: string, label: string, s: Surf): string {
   return (
     `<p${st(h, [['margin', '0 0 12px 0'], ['padding', 0], ['color', s.fg]])}>` +
-    `<audio controls preload="none" src="${attr(src)}"${st(h, [['width', '100%'], ['max-width', '100%']])}>` +
+    `<audio controls preload="metadata" src="${attr(src)}"${st(h, [['width', '100%'], ['max-width', '100%']])}>` +
     `${labelHtml('Tu navegador no puede reproducir este audio: usa el enlace de descarga.')}</audio></p>` +
     `<p${st(h, [['margin', '0'], ['padding', 0], ['color', s.fg2], ['font-size', h.t.typography.sizeSmallPx]])}>${link(h, src, `Descargar ${label} (MP3)`, s)}</p>`
   );
