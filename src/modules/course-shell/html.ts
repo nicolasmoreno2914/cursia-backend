@@ -307,9 +307,20 @@ export function ul(h: Hx, itemsHtml: string[], s: Surf, opts: { ordered?: boolea
   return `<${tag}${st(h, [['margin', '0 0 16px 0'], ['padding', '0 0 0 24px'], ['list-style', opts.ordered ? 'decimal' : 'disc']])}>${items}</${tag}>`;
 }
 
-/** Enlace con color de acento legible sobre `s.bg`. `button`: píldora con fondo de acento (CTA). */
-export function link(h: Hx, href: string, text: string, s: Surf, opts: { button?: boolean; margin?: string; fill?: { bg: string; fg: string } } = {}): string {
+/**
+ * Enlace con color de acento legible sobre `s.bg`. `button`: píldora con fondo de acento (CTA).
+ * r19 (L4): `target: '_blank'` abre en una pestaña nueva con `rel="noopener noreferrer"` (HTMLPurifier de Moodle conserva
+ * `target="_blank"` — Attr.AllowedFrameTargets — y pone ese mismo `rel` por su cuenta con forceclean).
+ */
+export function link(
+  h: Hx,
+  href: string,
+  text: string,
+  s: Surf,
+  opts: { button?: boolean; margin?: string; fill?: { bg: string; fg: string }; target?: '_blank' } = {},
+): string {
   const c = h.t.color;
+  const tgt = opts.target === '_blank' ? ' target="_blank" rel="noopener noreferrer"' : '';
   if (opts.button) {
     // CLEAN_SAFE: un BLOQUE con fondo de acento (el <a> en línea partía el fondo al envolver a
     // 390 px). ENHANCED: el bloque se vuelve píldora (inline-block, radio 999).
@@ -317,11 +328,11 @@ export function link(h: Hx, href: string, text: string, s: Surf, opts: { button?
     const b = opts.fill ? surfOn(h.t, opts.fill.bg, [opts.fill.fg]) : surfOn(h.t, c.accent, [c.textOnAccent]);
     return (
       `<div class="cvc-btn-wrap"${st(h, [['background-color', b.bg], ['color', b.fg], ['padding', '12px 20px'], ['margin', opts.margin ?? '0'], ['text-align', 'center']], [['display', 'table'], ['border-radius', '999px'], ['max-width', '100%']])}>` +
-      `<a class="cvc-btn-link" href="${attr(href)}"${st(h, [['color', b.fg], ['font-weight', '700'], ['text-decoration', 'none']])}>${inlineHtml(text)}</a></div>`
+      `<a class="cvc-btn-link" href="${attr(href)}"${tgt}${st(h, [['color', b.fg], ['font-weight', '700'], ['text-decoration', 'none']])}>${inlineHtml(text)}</a></div>`
     );
   }
   const col = [c.accentStrong, c.accent, s.fg].find((x) => contrastRatio(x, s.bg) >= MIN_CONTRAST) ?? s.fg;
-  return `<a href="${attr(href)}"${st(h, [['color', col], ['font-weight', '700']])}>${inlineHtml(text)}</a>`;
+  return `<a href="${attr(href)}"${tgt}${st(h, [['color', col], ['font-weight', '700']])}>${inlineHtml(text)}</a>`;
 }
 
 /**

@@ -261,13 +261,10 @@ const MATRIX = [
       }
     }
     eq(hits.slice(0, 6), [], 'franjas laterales encontradas');
-    // Review I3: la tarjeta de módulo del Libro conserva el padding de su clase (el h2 no queda pegado al borde).
+    // r19 (L1, 3.13.0): el Libro Guía ya no es HTML (era la tarjeta de módulo con padding, review I3): es un PDF.
     const lib = await JSZip.loadAsync(built['h5p-final-light'].r.mbz);
-    let libro = '';
-    for (const n of Object.keys(lib.files)) { if (!n.startsWith('files/') || lib.files[n].dir) continue; const t = (await lib.files[n].async('nodebuffer')).toString('utf8'); if (t.includes('cc-libro-module')) { libro = t; break; } }
-    const secs = libro.match(/<section[^>]*class="cc-libro-module"[^>]*>/g) || [];
-    assert(secs.length > 0, 'Libro con tarjetas de módulo');
-    eq(secs.filter((x) => /padding/.test(x)), [], 'padding inline que pisa el de la clase');
+    const fxl = await lib.file('files.xml').async('string');
+    assert(!fxl.includes('libro_guia_completo.html') && /<filename>libro_guia_[a-z0-9_]+\.pdf<\/filename>/.test(fxl), 'Libro Guía en PDF (sin HTML)');
   });
 
   await check('[h5p-final-light] H5P: activity type por UUID del capítulo (R-012), paquetes content-only del perfil, sin SingleChoiceSet', async () => {
@@ -318,21 +315,31 @@ const MATRIX = [
     }
   });
 
-  await check('[h5p-final-light] Libro Guía v3: <style> con tokens del tema + print CSS, prefacios, capítulos, bibliografía y </html>', async () => {
+  await check('[h5p-final-light] Libro Guía v3 (r19: PDF real): prefacios, capítulos, bibliografía, una marca de agua por página', async () => {
     const { input, r } = built['h5p-final-light'];
     const { z, acts } = await actDirs(r.mbz);
     const libro = acts.find((a) => a.idnumber === 'cv3:shell:libro');
     const ctx = /contextid="(\d+)"/.exec(await z.file(`${libro.dir}/resource.xml`).async('string'))[1];
     const files = await z.file('files.xml').async('string');
-    const f = files.match(/<file id="\d+">[\s\S]*?<\/file>/g).find((x) => x.includes(`<contextid>${ctx}</contextid>`) && x.includes('libro_guia_completo.html'));
+    const f = files.match(/<file id="\d+">[\s\S]*?<\/file>/g).find((x) => x.includes(`<contextid>${ctx}</contextid>`) && /<filename>libro_guia_[a-z0-9_]+\.pdf<\/filename>/.test(x));
+    assert(f && f.includes('<mimetype>application/pdf</mimetype>'), 'PDF application/pdf en el contexto del recurso');
     const h = /<contenthash>(\w+)<\/contenthash>/.exec(f)[1];
-    const html = await z.file(`files/${h.slice(0, 2)}/${h}`).async('string');
-    const theme = THEME.resolveTheme(input.presentation);
-    assert(html.trim().endsWith('</html>'), '</html>');
-    assert(html.includes('@media print') && html.includes(theme.color.accentStrong), 'print CSS + tokens');
-    assert(html.includes('Al terminar este módulo podrás') && html.includes('Bibliografía general del curso'), 'prefacio + bibliografía');
-    assert(html.includes('Visible Learning') && html.includes('(2009)'), 'entradas de bibliografía (verificadas)');
-    for (const m of input.manifest.modules) for (const c of m.chapters) assert(html.includes(`id="cap-${c.chapterNumber}"`), `capítulo ${c.chapterNumber}`);
+    const pdf = await z.file(`files/${h.slice(0, 2)}/${h}`).async('nodebuffer');
+    assert(pdf.subarray(0, 5).toString('latin1') === '%PDF-' && /%%EOF\s*$/.test(pdf.subarray(-16).toString('latin1')), '%PDF-…%%EOF');
+    const pdfjs = await import(require.resolve('pdfjs-dist/legacy/build/pdf.mjs', { paths: [ROOT] }));
+    const d = await pdfjs.getDocument({ data: new Uint8Array(pdf), verbosity: 0, isOffscreenCanvasSupported: false }).promise;
+    let text = '';
+    for (let p = 1; p <= d.numPages; p++) {
+      const pg = await d.getPage(p);
+      const ol = await pg.getOperatorList();
+      // r19 fix 1 (i): marca de agua en toda página + logo a opacidad plena solo en la portada (detalle en check-r19-libro-pdf).
+      eq(ol.fnArray.filter((fn) => fn === pdfjs.OPS.paintImageXObject).length, p === 1 ? 2 : 1, `página ${p}: marca de agua (+ logo de portada en la 1)`);
+      text += (await pg.getTextContent()).items.map((i) => i.str).join(' ') + '\n';
+    }
+    eq(d.numPages, r.summary.libro.pageCount, 'páginas');
+    assert(text.includes('Al terminar este módulo podrás') && text.includes('Bibliografía general del curso'), 'prefacio + bibliografía');
+    assert(text.includes('Visible Learning') && text.includes('(2009)'), 'entradas de bibliografía (verificadas)');
+    for (const m of input.manifest.modules) for (const c of m.chapters) assert(text.includes(`Capítulo ${c.chapterNumber}`), `capítulo ${c.chapterNumber}`);
     const words = r.expectations.facts.libro.wordCount;
     assert(words > 100, 'palabras medidas');
   });
@@ -898,10 +905,10 @@ const MATRIX = [
     z.file('files.xml', fx);
     return z.generateAsync({ type: 'nodebuffer' });
   }
-  await check('validador detecta LIBRO (sin print CSS / sin </html>) y H5P_LIBRARIES por rol (G6 M7: actividad con otra librería, video que no es IV)', async () => {
-    const libroHash = (fx) => /<contenthash>(\w+)<\/contenthash>/.exec(fx.match(/<file id="\d+">[\s\S]*?<\/file>/g).find((b) => b.includes('<filename>libro_guia_completo.html</filename>')))[1];
-    for (const edit of [(t) => t.replace('@media print', '@media screen'), (t) => t.replace(/<\/html>\s*$/, '')]) {
-      const bad = await rewriteBlob(base.r.mbz, libroHash, async (b) => Buffer.from(edit(b.toString('utf8'))));
+  await check('validador detecta LIBRO (r19: PDF truncado / no PDF) y H5P_LIBRARIES por rol (G6 M7: actividad con otra librería, video que no es IV)', async () => {
+    const libroHash = (fx) => /<contenthash>(\w+)<\/contenthash>/.exec(fx.match(/<file id="\d+">[\s\S]*?<\/file>/g).find((b) => /<filename>libro_guia_[a-z0-9_]+\.pdf<\/filename>/.test(b)))[1];
+    for (const edit of [(b) => b.subarray(0, b.length - 64), () => Buffer.from('<!DOCTYPE html><html><body>libro</body></html>')]) {
+      const bad = await rewriteBlob(base.r.mbz, libroHash, async (b) => edit(b));
       const v = await V.validateMbzV3(bad, base.r.expectations);
       assert(v.issues.some((i) => i.code === 'LIBRO'), JSON.stringify(v.issues.slice(0, 3)));
     }
@@ -985,10 +992,21 @@ const MATRIX = [
     input.contents.contentMd.set(c1, input.contents.contentMd.get(c1) + '\n\nVer [esto](javascript:alert(1)) y [aquello](x"onmouseover="alert(2)).');
     const r = await B.buildDynamicMbzV3(input);
     const z = await JSZip.loadAsync(r.mbz);
-    const names = Object.keys(z.files).filter((n) => n.startsWith('files/'));
-    let libro = '';
-    for (const n of names) { const t = await z.file(n).async('string'); if (t.includes('Libro Guía del curso')) libro = t; }
-    assert(libro && !/javascript:/i.test(libro) && !/onmouseover/i.test(libro), 'sin javascript:/onmouseover en el Libro');
+    // r19 (L1): el Libro es un PDF — ninguna anotación de enlace con javascript:/data: ni texto con el payload.
+    const fx = await z.file('files.xml').async('string');
+    const h = /<contenthash>(\w+)<\/contenthash>/.exec(fx.match(/<file id="\d+">[\s\S]*?<\/file>/g).find((b) => /<filename>libro_guia_[a-z0-9_]+\.pdf<\/filename>/.test(b)))[1];
+    const pdf = await z.file(`files/${h.slice(0, 2)}/${h}`).async('nodebuffer');
+    const pdfjs = await import(require.resolve('pdfjs-dist/legacy/build/pdf.mjs', { paths: [ROOT] }));
+    const d = await pdfjs.getDocument({ data: new Uint8Array(pdf), verbosity: 0 }).promise;
+    let text = '';
+    const urls = [];
+    for (let p = 1; p <= d.numPages; p++) {
+      const pg = await d.getPage(p);
+      text += (await pg.getTextContent()).items.map((i) => i.str).join(' ');
+      for (const a of await pg.getAnnotations()) if (a.url || a.unsafeUrl) urls.push(a.url || a.unsafeUrl);
+    }
+    assert(/Ver\s*esto\)?\s*y\s*aquello/.test(text), `el texto de los links inseguros queda como texto: ${(/Ver.{0,40}/.exec(text) || [''])[0]}`);
+    assert(!/javascript:|onmouseover/i.test(text) && !urls.some((u) => /^(javascript|data):|onmouseover/i.test(u)), `sin javascript:/onmouseover en el Libro: ${JSON.stringify(urls)}`);
   });
   await check('F1 (I3): categoría ponderada vacía → prepareV3Package normaliza (sin fallar) y lo registra; tema sin perfil ni paleta → presentation_profile_defaulted', async () => {
     const { manifest } = SF.buildCourse(distRoot, { courseId: 641, finalExam: false, engine: 'h5p', modules: [{ examEnabled: true, chapters: [{ video: false, activity: false }] }] });
@@ -1002,6 +1020,8 @@ const MATRIX = [
       if (/course_profiles/.test(sql)) return [];
       if (/from public\.courses where id/.test(sql)) return [{ metadata: {} }];
       if (/production_jobs/.test(sql)) return [{ id: 'r', owner_id: 'o', execution_mode: 'dynamic_generation', worker_status: 'completed', status: 'completed', input_payload: {} }];
+      if (/to_regclass/.test(sql)) return [{ bp: true, us: true, inst: true }]; // r19 L3: fuentes presentes, sin logo → Cursia sin aviso
+      if (/from public\.user_settings/.test(sql)) return [];
       throw new Error(sql);
     } };
     const prep = await PK.prepareV3Package(q, 'r', { id: 1, sha256: 's', manifest }, 641, '4.1');
@@ -1230,10 +1250,10 @@ const MATRIX = [
     const baseK = { builderVersion: '3.0.0', manifestSha256: 'm', sourceArtifactIds: ['b', 'a'], themeSha256: 't', assessmentProfileSha256: 'p', h5pProfileVersion: 1, vcRendererVersion: 'r', moodleVersion: '4.1' };
     const k0 = PK.packageReuseHashV3(baseK);
     eq(PK.packageReuseHashV3({ ...baseK, sourceArtifactIds: ['a', 'b'] }), k0, 'orden');
-    for (const [f, v] of [['builderVersion', '3.0.1'], ['manifestSha256', 'm2'], ['sourceArtifactIds', ['a']], ['themeSha256', 't2'], ['assessmentProfileSha256', 'p2'], ['h5pProfileVersion', 2], ['vcRendererVersion', 'r2'], ['moodleVersion', '4.5']]) {
+    for (const [f, v] of [['builderVersion', '3.0.1'], ['manifestSha256', 'm2'], ['sourceArtifactIds', ['a']], ['themeSha256', 't2'], ['assessmentProfileSha256', 'p2'], ['h5pProfileVersion', 2], ['vcRendererVersion', 'r2'], ['moodleVersion', '4.5'], ['libroBrandSha256', 'logo2']]) {
       assert(PK.packageReuseHashV3({ ...baseK, [f]: v }) !== k0, `cambia con ${f}`);
     }
-    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.12.0' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
+    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.13.0' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
   });
 
   // ── Medios ────────────────────────────────────────────────────────────────
@@ -1325,6 +1345,9 @@ async function workerChecks() {
         if (/from public\.courses where id = \$1/.test(sql)) return [{ metadata: courseMetadata }];
         if (/generation_item_runs/.test(sql)) return rowsFor;
         if (/from public\.production_jobs where id = \$1/.test(sql)) return [runRow];
+        // r19 (L3): marca del Libro Guía — sin tablas de marca en el fake → logo de Cursia, sin avisos.
+        if (/to_regclass/.test(sql)) return [{ bp: true, us: true, inst: true }]; // r19 L3: fuentes presentes, sin logo → Cursia sin aviso
+      if (/from public\.user_settings/.test(sql)) return [];
         throw new Error(`SQL no esperado en el fake: ${sql.slice(0, 80)}`);
       },
     };

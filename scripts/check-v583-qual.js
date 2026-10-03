@@ -265,6 +265,20 @@ const DT = { itemKey: 'activity:qa', title: 'El registro de doña Carmen', taskD
     assert(vc.lintCleanSafe(intro.html).ok, 'CLEAN_SAFE');
     eq(S.lintShellNumbers(t, facts), [], 'cifras de facts');
   });
+  // r19 (L4, builder ≥ 3.13.0): la descripción vuelve a llevar UN botón visible, hacia el propio recurso y en pestaña nueva.
+  await check('r19 L4: con el moduleid del recurso (builder 3.13.0) la descripción trae el botón «Abrir Libro Guía →» (target _blank, rel noopener); sin él (3.11–3.12) sigue sin botón', () => {
+    const intro = S.libroResourceIntro(facts, THEME, undefined, 1007);
+    const a = [...intro.html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/g)];
+    eq(a.length, 1, 'un enlace');
+    assert(a[0][1].includes('href="$@RESOURCEVIEWBYID*1007@$"') && /target="_blank"/.test(a[0][1]) && /rel="noopener noreferrer"/.test(a[0][1]), a[0][1]);
+    assert(vc.extractText(a[0][2]).includes('Abrir Libro Guía'), 'texto');
+    assert(vc.extractText(intro.html).includes('en un solo documento PDF'), 'promete PDF (lo es)');
+    assert(vc.lintCleanSafe(intro.html).ok, 'CLEAN_SAFE');
+    eq(S.lintShellNumbers(vc.extractText(intro.html), facts), [], 'cifras de facts');
+    let threw = false;
+    try { S.libroResourceIntro(facts, THEME, undefined, 0); } catch { threw = true; }
+    assert(threw, 'mid inválido → falla');
+  });
   await check('M5: quiz — la nota máxima por pregunta solo con la nota (O|C): ni durante el intento ni al terminarlo (sin «Puntúa como 5,88»); el resto de la política igual', () => {
     const D = 0x10000, I = 0x1000, O = 0x100, C = 0x10;
     eq(MA.QUIZ_REVIEW_V3.reviewmaxmarks, O | C, 'reviewmaxmarks');
@@ -272,9 +286,9 @@ const DT = { itemKey: 'activity:qa', title: 'El registro de doña Carmen', taskD
     assert(!(MA.QUIZ_REVIEW_V3.reviewmaxmarks & D) && !(MA.QUIZ_REVIEW_V3.reviewmaxmarks & I), 'nada en D|I');
     eq([MA.QUIZ_REVIEW_V3.reviewattempt, MA.QUIZ_REVIEW_V3.reviewoverallfeedback, MA.QUIZ_REVIEW_V3.reviewcorrectness, MA.QUIZ_REVIEW_V3.reviewrightanswer], [D | I | C, I | O | C, C, C], 'resto de la política');
   });
-  await check('M5: .mbz 3.12.0 — sección 1 con UNA entrada del Libro Guía (recurso con descripción, sin label libro_card), quiz.xml con reviewmaxmarks 272; validador limpio y la descripción pasa las reglas de los labels', async () => {
+  await check('M5: .mbz 3.13.0 — sección 1 con UNA entrada del Libro Guía (recurso con descripción, sin label libro_card), quiz.xml con reviewmaxmarks 272; validador limpio y la descripción pasa las reglas de los labels', async () => {
     const r = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true, courseId: 583 }));
-    eq(r.summary.builderVersion, '3.12.0', 'versión'); // UX r18: 3.11.0 → 3.12.0
+    eq(r.summary.builderVersion, '3.13.0', 'versión'); // UX r18: 3.11.0 → 3.12.0; r19 L: 3.13.0
     const z = await JSZip.loadAsync(r.mbz);
     const mb = await z.file('moodle_backup.xml').async('string');
     const acts = [...mb.matchAll(/<activity>\s*<moduleid>(\d+)<\/moduleid>\s*<sectionid>\d+<\/sectionid>\s*<modulename>(\w+)<\/modulename>\s*<title>([^<]*)<\/title>\s*<directory>([^<]+)<\/directory>/g)].map((m) => ({ mid: m[1], mod: m[2], title: m[3], dir: m[4] }));
