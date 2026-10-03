@@ -273,7 +273,7 @@ async function pureChecks() {
   // Dorados 3.12.0: 644 7cb2a7c7…, 645 32191ec2….
   const GOLDEN_PRE_T5 = {
     644: ['ef3fe9910d95c49ea6711b7c7a3b892c85a27b28483bd75fc9509cdc01abebaf', { engine: 'h5p', finalExam: true, courseId: 644 }],
-    645: ['92ed23cdde264891f17784065b4998c3807c9a2ec660a2ecc0e1b26cd12b5ffd', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
+    645: ['ee0a9bd456d51e8e4ad68547471f54193287620ea5017c9dfd4499dbd9ae1f9c', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
   };
   await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B4 (respuestas explicadas sobre sistema visual 2.0 + certificado + política de revisión del quiz con revisión de respuestas propias V542 + H5P de una sola copia + retroalimentación global del quiz + #583 QUAL + UX r18 + r19 W, builder 3.13.0), con y sin el campo', async () => {
     for (const [id, [want, o]] of Object.entries(GOLDEN_PRE_T5)) {

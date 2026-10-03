@@ -10,7 +10,9 @@
 //     la fila de cifras (ul.cvc-facts) empieza dentro de los primeros 900 px del label (bienvenidas ≤ 160 palabras;
 //     con 220, el tope del esquema, solo se informa);
 //   - a 375: ningún bloque de texto supera 450 px y el título del curso queda ≤ 40 px de cuerpo.
-// Con `--shots DIR` guarda capturas (ENHANCED, bienvenida de #625) por familia a 1280 y 375: DIR/<tag>_<familia>-<modo>_<ancho>.png.
+// Para todo largo: la fila de cifras va inmediatamente después del cuerpo (orden intro → información del curso).
+// Con `--shots DIR` guarda capturas (bienvenida de #625) por familia a 1280 y 375: DIR/<tag>_<familia>-<modo>[_clean]_<ancho>.png
+// (ENHANCED y CLEAN_SAFE).
 // Si Chrome no está disponible el script NO pasa: imprime «SKIP» y sale con código 3.
 //
 // Usage: node scripts/qa-r19-welcome-render.js [path/to/dist] [--shots DIR] [--tag after] [--fixtures w625,w616]
@@ -34,7 +36,8 @@ const te = require(path.join(distRoot, 'modules/theme-engine/index.js'));
 const cp = require(path.join(distRoot, 'modules/course-profiles/course-profiles.js'));
 const F = require('./lib/v21-shell-fixtures');
 const VCF = require('./lib/v21-vc-fixtures');
-const { WELCOMES } = require('./lib/r19-welcome-fixtures');
+const { WELCOMES: W0, C1_WELCOMES } = require('./lib/r19-welcome-fixtures');
+const WELCOMES = { ...W0, ...C1_WELCOMES }; // fix round 1: + las formas límite de C1
 const { launchChrome, sleep } = require('./lib/v21-cdp');
 
 const CHROME = process.env.CHROME_BIN || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
@@ -65,6 +68,9 @@ const MEASURE = `(() => {
   }
   const lead = L.querySelector('p.cvc-lead');
   const stats = L.querySelector('ul.cvc-facts');
+  const body = L.querySelector('.cvc-welcome-body');
+  const bodyPs = body ? body.querySelectorAll('p') : [];
+  const lastBody = bodyPs.length ? bodyPs[bodyPs.length - 1].getBoundingClientRect() : null;
   const title = L.querySelector('h4');
   const lb = lead && lead.getBoundingClientRect();
   const llh = lead && (parseFloat(getComputedStyle(lead).lineHeight) || 30);
@@ -72,6 +78,8 @@ const MEASURE = `(() => {
     sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth,
     leadLines: lead ? Math.round(lb.height / llh) : null,
     statsTop: stats ? Math.round(stats.getBoundingClientRect().top + scrollY - top0) : null,
+    // I3 (fix round 1): las cifras van INMEDIATAMENTE después del cuerpo (siguiente hermano y debajo de su último párrafo).
+    statsAfterBody: !!(stats && body && body.nextElementSibling === stats && lastBody && stats.getBoundingClientRect().top >= lastBody.bottom - 1),
     titlePx: title ? parseFloat(getComputedStyle(title).fontSize) : null,
     labH: Math.round(L.getBoundingClientRect().height),
     docH: document.documentElement.scrollHeight,
@@ -133,23 +141,24 @@ function page(body) {
             const big = m.blocks.reduce((a, b) => (b.h > a.h ? b : a), { h: 0 });
             rows.push(`${where.padEnd(44)} lead ${String(m.leadLines ?? '-').padStart(2)} lín · bloque máx ${String(big.h).padStart(3)} px (${big.tag}) · cifras a ${String(m.statsTop).padStart(4)} px · título ${m.titlePx}px · label ${m.labH} px · sw ${m.sw}/${m.cw}`);
             if (m.sw > m.cw) fails.push(`${where}: desborde horizontal (scrollWidth ${m.sw} > ${m.cw})`);
+            if (!m.statsAfterBody) fails.push(`${where}: la fila de cifras no va inmediatamente después del cuerpo`);
             if (m.small.length) fails.push(`${where}: texto < 16 px fuera de un chip de metadato: ${m.small.slice(0, 3).join(', ')}`);
             if (w === 1280) {
               if (m.leadLines !== null && m.leadLines > 4) fails.push(`${where}: la entrada ocupa ${m.leadLines} líneas (> 4)`);
               if (big.h > 260) fails.push(`${where}: bloque de texto de ${big.h} px (> 260): ${big.tag} «${big.text}…»`);
               // Cifras sobre el pliegue: para bienvenidas de largo real (≤ 160 palabras; #625 = 141, #616 = 155). En el tope del
-              // esquema (220) el cuerpo solo ya ocupa ~14 líneas y el orden pedido (cuerpo ANTES de las cifras) las deja a
-              // ~920–1070 px: se informa en la tabla, no se exige.
+              // esquema (220) el cuerpo solo ya ocupa ~14 líneas y el orden pedido por el usuario (intro → información del curso)
+              // las deja a ~920–1070 px: aceptado por el controlador (r19 fix round 1, I3); para todo largo se exige el ORDEN.
               const wc = WELCOMES[fx].trim().split(/\s+/).length;
               if (m.statsTop === null || (wc <= 160 && m.statsTop > 900)) fails.push(`${where}: la fila de cifras empieza a ${m.statsTop} px (> 900)`);
             } else {
               if (big.h > 450) fails.push(`${where}: bloque de texto de ${big.h} px a 375 (> 450): ${big.tag} «${big.text}…»`);
               if (m.titlePx === null || m.titlePx > 40) fails.push(`${where}: título de ${m.titlePx}px a 375 (> 40)`);
             }
-            if (SHOTS && level === 'enhanced' && fx === FIXTURES[0]) {
+            if (SHOTS && fx === FIXTURES[0]) {
               await chrome.setViewport(w, Math.max(600, Math.min(m.docH, 4000)), mobile);
               await sleep(80);
-              await chrome.screenshot(path.join(SHOTS, `${TAG}_${key}_${w}.png`));
+              await chrome.screenshot(path.join(SHOTS, `${TAG}_${key}${level ? '' : '_clean'}_${w}.png`));
             }
           }
         }
@@ -163,7 +172,7 @@ function page(body) {
     console.error(`\n❌ ${fails.length} falla(s) en ${renders} renders:\n   ${fails.slice(0, 40).join('\n   ')}`);
     process.exit(1);
   }
-  console.log(`\n✅ render de la bienvenida OK: ${renders} renders (7 familia×modo × 2 niveles × ${FIXTURES.length} bienvenidas × 2 anchos)${SHOTS ? `; capturas en ${SHOTS}` : ''}.`);
+  console.log(`\n✅ render de la bienvenida OK: ${renders} renders (7 familia×modo × 2 niveles × ${FIXTURES.length} bienvenidas × 2 anchos; cifras justo después del cuerpo en todos)${SHOTS ? `; capturas en ${SHOTS}` : ''}.`);
 })().catch((e) => {
   console.error(e);
   process.exit(1);

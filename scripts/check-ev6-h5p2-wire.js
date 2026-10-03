@@ -77,8 +77,8 @@ const GOLDEN = {
   // 14d45c9d…, scorm-final-light 6c18bcce…, h5p-ev5c-rules1 3c6d123e….
   mbz: {
     'h5p-final-light': 'e08b30ead92b6daecc5a1c86683b8971300cf9327d84b2927575f5fb1fda4b6f',
-    'scorm-nofinal-dark': '27ddce40a5acbfbeac2b4776ba6e661d4f0955bfb676cffb4c1251ea38d61373',
-    'h5p-nofinal-dark-mock-cleansafe': 'd959978f2a2847b0e817d940f029791f3fe2145e8ee0e232fda7d98fb9257401',
+    'scorm-nofinal-dark': 'e1173289ba0439787b2fb8dc4953477e9e4a1b0e07a353767bb30c3486d20fa5',
+    'h5p-nofinal-dark-mock-cleansafe': '57396f8588d83fdf48aa70ef95b0af934b90c060e0d6bd47743e8e8522d78020',
     'scorm-final-light': 'e18851b4b4c6ed7c00ddd5f9e7246cd2396f6e4f8777f6909192e9e2a09413c2',
     'h5p-ev5c-rules1': '04da54bf506ca3bde3eb1b1ce2af89ce618ed192917ba706e73db6c423bcfac0',
   },

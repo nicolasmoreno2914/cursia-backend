@@ -4,7 +4,8 @@
 //    cual salieron del paquete (r19/DIAG-W, diag-w/62x_s0_1000_label.html);
 //  - short80 / long220: los extremos del esquema (80–220 palabras, intro-schemas.ts);
 //  - abbrev: abreviaturas, decimales y «N.º» (no se corta dentro de ellos ni se pierde texto);
-//  - longFirst: primera oración de > 40 palabras (no cabe en la entrada → va a tamaño de cuerpo, nunca como entrada).
+//  - longFirst: primera oración de > 40 palabras (fix round 1: la entrada se corta en la última cláusula que cabe y el
+//    resto de la oración abre el cuerpo).
 'use strict';
 
 const WELCOMES = {
@@ -54,7 +55,44 @@ const WELCOMES = {
     'cumplen, siempre a partir de situaciones reales del mostrador y del teléfono.',
 };
 
-/** Fixtures cuya primera oración NO cabe en la entrada (≤ 40 palabras / 240 caracteres). */
-const NO_LEAD = new Set(['longFirst']);
+module.exports = { WELCOMES };
 
-module.exports = { WELCOMES, NO_LEAD };
+// ─── Fix round 1 ───────────────────────────────────────────────────────────
+// C1 (review r19 W): formas válidas por el esquema que en la primera versión hacían fallar el empaquetado.
+const W = (n, word) => Array.from({ length: n }, (_, i) => `${word}${i % 10}`).join(' ');
+const C1_WELCOMES = {
+  // la bienvenida realista de 107 palabras con una primera oración de 78 (review-w/pkg.js)
+  firstSentence78:
+    'Cuando un cliente llega molesto a tu mostrador porque su pedido se atrasó, no encuentra lo que buscaba o simplemente tuvo un mal ' +
+    'día y necesita que alguien lo escuche, la forma en que respondas en los primeros segundos, con tu tono, tu postura y las palabras ' +
+    'que elijas, puede convertir una queja en una relación de confianza que dure años o en una pérdida que nadie en la empresa va a ' +
+    'notar hasta que sea demasiado tarde. Este curso te enseña a responder con método. Vas a practicar la escucha activa, la ' +
+    'explicación clara y el cierre con acuerdos concretos, siempre con situaciones reales del mostrador.',
+  // sin un solo signo de puntuación (ni cláusulas: corte en palabra)
+  noPunctuation: W(120, 'paso'),
+  // UNA oración de 220 palabras (el tope del esquema; ≤ 2000 caracteres)
+  single220: `${W(220, 'ok')}.`,
+  // una sola oración con cláusulas (≥ 80 palabras)
+  oneSentence:
+    'En este curso vas a recorrer, paso a paso y con ejemplos de tu propio trabajo, la forma de recibir a cada persona con calidez, ' +
+    'de escuchar lo que de verdad necesita aunque no sepa explicarlo, de ordenar una respuesta clara cuando el problema es difícil, ' +
+    'de cerrar cada conversación con un acuerdo que se pueda cumplir y de volver sobre lo aprendido cada vez que lo necesites, ' +
+    'a tu ritmo, sin presión y con prácticas breves que te muestran en el momento si vas por buen camino o si conviene repasar.',
+};
+
+// I2: presentaciones de módulo cuyos cortes el regex de 3.12.0 hacía bien (punto + `**`, raya, minúscula, emoji,
+// «…», abreviatura): la salida de moduleIntroLabel debe quedar BYTE A BYTE igual a 3.12.0. `decimal` es la única
+// excepción permitida (3.12.0 descartaba «El valor 1.»).
+const MODULE_PRESENTATIONS = {
+  emphasisStart: 'Este módulo abre la ruta. **La higiene** define cada paso del trabajo diario en la cocina, desde la recepción de insumos hasta la limpieza final del turno, y por eso la vas a practicar en todos los capítulos con casos reales.',
+  dashStart: 'Este módulo abre la ruta. — Y lo hace con casos reales de la cocina, desde la recepción hasta el cierre del turno, para que cada técnica tenga un uso concreto en tu jornada y la puedas aplicar de inmediato.',
+  enDashStart: 'Primero lo básico. – Después, la práctica guiada con ejemplos de tu propio puesto de trabajo y preguntas para revisar lo que haces cada día, sin tecnicismos y a tu ritmo, con pausas para pensar.',
+  lowercaseStart: 'Este curso es útil. iPhone, tablet o computador: cualquier equipo te sirve para seguir cada capítulo, ver los ejemplos, resolver las prácticas y volver sobre lo que necesites cuando quieras, sin depender de un horario fijo.',
+  emojiStart: 'Arrancamos con lo esencial. 🙂 Cada capítulo trae una lectura breve, un ejemplo cercano y una práctica corta que puedes resolver en pocos pasos desde cualquier lugar y repetir cuantas veces quieras para afianzar lo aprendido.',
+  ellipsis: 'Todo empieza así… Luego cambia, y el módulo te muestra por qué: cada decisión en el mostrador tiene un efecto en la experiencia del cliente, y aquí vas a aprender a anticiparlo con ejemplos concretos y preguntas para tu práctica.',
+  abbrev: 'El Dr. Ramírez lo resume así: la calidad se juega en los detalles. Este módulo te muestra cómo cuidarlos en cada etapa del servicio, con ejemplos reales del mostrador, del teléfono y de los canales digitales que usas todos los días.',
+  decimal: 'El valor 1.5 es el umbral de referencia. Este módulo explica de dónde sale y cómo usarlo en tu trabajo diario, con ejemplos concretos y preguntas para revisar tu propia práctica en cada capítulo del recorrido.',
+};
+
+module.exports.C1_WELCOMES = C1_WELCOMES;
+module.exports.MODULE_PRESENTATIONS = MODULE_PRESENTATIONS;
