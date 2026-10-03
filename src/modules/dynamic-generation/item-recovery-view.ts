@@ -10,6 +10,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import { CurrentRecovery, FailureClass, classifyFailure, currentRecoveryOf } from '../reliability/failure-classifier';
 import { maxAutomaticRoundsToday } from './item-transitions';
+import { autoRecoveryEnabled } from './auto-heal';
+import { providerProbeViewOf } from '../reliability/provider-probe';
 
 export interface ItemRecoveryView {
   /** Clase del último fallo (null = sin fallo). */
@@ -45,8 +47,27 @@ function iso(v: unknown): string | null {
   return Number.isFinite(d.getTime()) ? d.toISOString() : null;
 }
 
-/** Vista de recuperación de una fila de generation_item_runs (`select *`). Pura. */
-export function recoveryViewOf(r: Record<string, any>): ItemRecoveryView {
+/**
+ * REL CREDIT: un item que espera la sonda del proveedor (crédito/cuota agotados, dentro de las ~24 h, con la
+ * recuperación automática encendida) muestra que espera al proveedor: `provider_probe`, la próxima sonda en
+ * `nextRetryAt` y el motivo humano (config). La acción de admin sigue disponible (run-completion, sin cambios).
+ */
+function withProviderProbe(r: Record<string, any>, v: ItemRecoveryView, now: Date): ItemRecoveryView {
+  if (r.status !== 'failed') return v;
+  const p = providerProbeViewOf(
+    { id: r.id, type: r.type, status: r.status, error: r.error ?? null, output_summary: r.output_summary ?? {}, finished_at: r.finished_at, updated_at: r.updated_at, failure_class: r.failure_class ?? null },
+    now, autoRecoveryEnabled(process.env),
+  );
+  if (!p) return v;
+  return { ...v, strategy: 'wait_provider', currentRecovery: 'provider_probe', nextRetryAt: p.nextProbeAt.toISOString(), attentionReason: v.attentionReason ?? 'config' };
+}
+
+/** Vista de recuperación de una fila de generation_item_runs (`select *`). Pura salvo el reloj y el env (kill-switch). */
+export function recoveryViewOf(r: Record<string, any>, now: Date = new Date()): ItemRecoveryView {
+  return withProviderProbe(r, baseRecoveryViewOf(r), now);
+}
+
+function baseRecoveryViewOf(r: Record<string, any>): ItemRecoveryView {
   const round = Number.isInteger(Number(r.recovery_round)) && Number(r.recovery_round) > 0 ? Number(r.recovery_round) : 0;
   const nextRetryAt = iso(r.next_retry_at);
   const cooldownUntil = iso(r.cooldown_until);

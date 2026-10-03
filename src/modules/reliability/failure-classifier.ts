@@ -86,6 +86,7 @@ export type CurrentRecovery =
   | 'safe_auto_retry' // reintento automático seguro (EV6 DoD BE-B)
   | 'ambiguous_audio_resubmit' // #583: UN reenvío automático de audio TTS incierto (≤ USD 0.10 pendiente, lo decide auto-heal con el ledger)
   | 'auto_regenerate' // REL MVP: clase B de un componente de la IA → el auto-healer lo regenera solo (≤ 2 rondas)
+  | 'provider_probe' // REL CREDIT: crédito/cuota agotados → sonda del proveedor (canario) y reanudación sola (solo en la vista)
   | 'denied' // deny-list: nunca se reabre solo
   | 'manual'; // nada automático: humano (retry/regenerate)
 

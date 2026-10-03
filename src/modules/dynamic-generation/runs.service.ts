@@ -149,6 +149,21 @@ import {
   takeCompletedRunsInTx,
 } from './item-transitions';
 import { AttemptActor, adminActor, recordItemReopened, recordItemsAbandoned } from '../reliability/attempt-log';
+import { FailureProvider } from '../reliability/failure-classifier';
+import {
+  PROVIDER_PROBE_KEY,
+  PROVIDER_PROBE_MAX_HOURS,
+  PROVIDER_PROBE_RESUME_STRATEGY,
+  PROVIDER_PROBE_SKIP_SECONDS,
+  PROVIDER_PROBE_SQL_REGEX,
+  PROVIDER_PROBE_STRATEGY,
+  ProviderProbeRow,
+  USER_STOPPED_SQL_REGEX,
+  effectiveProbeStateOf,
+  planProviderProbes,
+  providerProbeEnabled,
+  providerProbeStateOf,
+} from '../reliability/provider-probe';
 import { ItemCostView, ItemRecoveryView, loadItemCosts, recoveryViewOf } from './item-recovery-view';
 
 export type ItemRunStatus = 'pending' | 'running' | 'retrying' | 'completed' | 'failed' | 'blocked' | 'cancelled';
@@ -1699,7 +1714,11 @@ export class RunsService {
     itemKey: string,
     resubmitVideo = false,
     resubmitProvider = false,
-    auto?: { policy: AutoHealPolicy; now?: Date; safe?: boolean; ambiguousAudio?: boolean; maxUsd?: number },
+    auto?: {
+      policy: AutoHealPolicy; now?: Date; safe?: boolean; ambiguousAudio?: boolean; maxUsd?: number;
+      /** REL CREDIT: sonda del proveedor tras crédito/cuota agotados (canario) o reanudación del resto. */
+      providerProbe?: { mode: 'canary' | 'resume'; provider: FailureProvider };
+    },
     /** EV6 DoD (R5): quién reintenta (la recuperación PAGA de un video es solo de SUPER_ADMIN). */
     actor?: { id?: string | null; email?: string | null },
   ): Promise<ItemRunDto> {
@@ -1710,6 +1729,9 @@ export class RunsService {
     }
     // EV6 DoD BE-B: el ÚNICO reenvío automático permitido es el reintento seguro (`auto.safe`) de un
     // rechazo DEFINITIVO de Videogen sin gasto (videogen_submit_rejected), re-evaluado bajo lock.
+    if (auto?.providerProbe && (resubmitProvider || resubmitVideo || auto.safe || auto.ambiguousAudio)) {
+      throw new BadRequestException('auto-heal: la sonda del proveedor nunca reenvía ni se combina con otro modo automático');
+    }
     if (auto && ((resubmitProvider && !auto.ambiguousAudio) || (resubmitVideo && !auto.safe))) {
       throw new BadRequestException('auto-heal: nunca reenvía a un proveedor (resubmitVideo/resubmitProvider)');
     }
@@ -1836,10 +1858,11 @@ export class RunsService {
         finished_at: Date | null;
         updated_at: Date | null;
         failure_class: string | null;
+        claimed_at: Date | null;
       }> = await qr.query(
         // F78-BE2: la generación VIGENTE de cada item (una regeneración
         // fallida se reintenta sobre su propia fila, nunca sobre la histórica).
-        `select id, item_key, status, depends_on, type, error, output_summary, finished_at, updated_at,
+        `select id, item_key, status, depends_on, type, error, output_summary, finished_at, updated_at, claimed_at,
                 -- REL MVP: clase registrada (R2) sin depender de que la columna exista (esquema tolerado).
                 to_jsonb(g)->>'failure_class' as failure_class
             from public.generation_item_runs g
@@ -1862,7 +1885,37 @@ export class RunsService {
       // R16 (#2): la política del auto-healer se re-evalúa con la fila bloqueada (otro barrido, un retry
       // manual o un fallo nuevo pudieron cambiarla entre la lectura y este lock).
       let autoMeta: { round: number; code: string; pendingUsd?: number | null; kind?: AutoHealKind; strategy?: string } | null = null;
-      if (auto && auto.ambiguousAudio) {
+      // REL CREDIT: estado de la sonda que deja esta reapertura (canario) — null = se borra (cualquier otra reapertura).
+      let probeState: Record<string, any> | null = null;
+      if (auto && auto.providerProbe) {
+        // Misma decisión que el barrido, con TODAS las filas del run bloqueadas: un único canario por (run, proveedor),
+        // su espera, el tope de ~24 h, el run no detenido por el usuario; la reanudación solo tras un canario OK.
+        const now = auto.now ?? new Date();
+        const pp = auto.providerProbe;
+        const plan = providerProbeEnabled(auto.policy)
+          ? planProviderProbes(items as ProviderProbeRow[], now, String(job.id)).find((x) => x.provider === pp.provider)
+          : undefined;
+        const ok = !!plan && (pp.mode === 'canary'
+          ? plan.action === 'probe' && plan.canaryId === String(target.id)
+          : plan.action === 'resume' && plan.waitingIds.includes(String(target.id)));
+        if (!ok) {
+          const reason = plan ? plan.action : providerProbeEnabled(auto.policy) ? 'not_waiting' : 'disabled';
+          throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (provider_probe ${pp.mode}: ${reason})`, code: 'auto_heal_not_eligible', reason });
+        }
+        // M1: solo el estado de la racha VIGENTE (uno de una racha vencida se ignora).
+        const same = effectiveProbeStateOf(target as ProviderProbeRow, pp.provider, now);
+        if (pp.mode === 'canary') {
+          probeState = {
+            provider: pp.provider,
+            firstFailedAt: same?.firstFailedAt ?? plan!.streakStartAt?.toISOString() ?? now.toISOString(),
+            runRound: plan!.round + 1,
+            rounds: Math.max(0, Math.floor(Number(same?.rounds ?? 0)) || 0) + 1,
+            canaryAt: now.toISOString(),
+            lastProbeAt: now.toISOString(),
+          };
+        }
+        autoMeta = { round: plan!.round + (pp.mode === 'canary' ? 1 : 0), code: pp.mode === 'canary' ? PROVIDER_PROBE_STRATEGY : PROVIDER_PROBE_RESUME_STRATEGY };
+      } else if (auto && auto.ambiguousAudio) {
         // #583: misma decisión que el barrido, con la fila bloqueada y lo pendiente del ledger releído acá.
         const pending = await this.ambiguousAudioPending(qr, target.id, target.output_summary);
         const d = ambiguousAudioResubmitDecision(target, auto.now ?? new Date(), pending, auto.policy, auto.maxUsd ?? AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD);
@@ -1961,7 +2014,8 @@ export class RunsService {
         resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey' - 'gammaPollSince' - 'videoPollSince'`;
       }
 
-      const previousErrorsExpr = `coalesce(output_summary, '{}'::jsonb) || jsonb_build_object(
+      // REL CREDIT: toda reapertura borra el estado de la sonda (racha nueva); el canario lo vuelve a escribir abajo.
+      const previousErrorsExpr = `(coalesce(output_summary, '{}'::jsonb) - '${PROVIDER_PROBE_KEY}') || jsonb_build_object(
                     'previousErrors',
                     coalesce(output_summary->'previousErrors', '[]'::jsonb) || jsonb_build_array(jsonb_build_object(
                       'error', error,
@@ -1991,7 +2045,9 @@ export class RunsService {
         : `(${previousErrorsExpr}) || $4::jsonb`;
       // R16 (#2): la reapertura automática queda registrada (auditoría) en la misma escritura.
       const nowIso = (auto?.now ?? new Date()).toISOString();
-      const entryExtra = autoMeta && auto?.ambiguousAudio
+      const entryExtra = autoMeta && auto?.providerProbe
+        ? { auto: true, providerProbe: auto.providerProbe.mode, provider: auto.providerProbe.provider, providerProbeRound: autoMeta.round }
+        : autoMeta && auto?.ambiguousAudio
         ? { auto: true, ambiguousAudioResubmit: true, ambiguousAudioResubmitRound: autoMeta.round, autoHealCode: autoMeta.code, pendingUsd: autoMeta.pendingUsd ?? null }
         : autoMeta && auto?.safe
         ? { auto: true, safeAutoRetry: true, safeAutoRetryRound: autoMeta.round, autoHealCode: autoMeta.code }
@@ -1999,7 +2055,9 @@ export class RunsService {
           ? { auto: true, autoHealRound: autoMeta.round, autoHealCode: autoMeta.code,
               ...(auto?.policy.classAware ? { autoHealClass: autoMeta.kind, autoHealStrategy: autoMeta.strategy } : {}) }
           : actorId !== ownerId ? { retriedBy: actorId } : {};
-      const topExtra = autoMeta && auto?.ambiguousAudio
+      const topExtra = autoMeta && auto?.providerProbe
+        ? (probeState ? { [PROVIDER_PROBE_KEY]: probeState } : {})
+        : autoMeta && auto?.ambiguousAudio
         ? { ambiguousAudioResubmit: { rounds: autoMeta.round, lastAt: nowIso, pendingUsd: autoMeta.pendingUsd ?? null,
             maxUsd: auto.maxUsd ?? AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD, maxRounds: AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS } }
         : autoMeta && auto?.safe
@@ -2016,7 +2074,9 @@ export class RunsService {
           : {};
       // BE-B: el reintento seguro concede UN intento (un único reenvío; si vuelve a fallar, humano).
       // #583: el reenvío de audio incierto también concede UN intento (un único reenvío).
-      const attemptsGranted = auto?.safe || auto?.ambiguousAudio ? 1 : auto ? Math.max(1, Math.floor(auto.policy.attemptsPerRound)) : 3;
+      // REL CREDIT: el canario concede UN intento (una sola llamada de prueba; fuera de las rondas del auto-healer).
+      const attemptsGranted = auto?.safe || auto?.ambiguousAudio || auto?.providerProbe?.mode === 'canary'
+        ? 1 : auto ? Math.max(1, Math.floor(auto.policy.attemptsPerRound)) : 3;
 
       const updated = returningRows(
         await qr.query(
@@ -2044,7 +2104,8 @@ export class RunsService {
       await recordItemReopened(qr, target.id, {
         actor: auto ? 'auto_heal' : isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : actorId !== ownerId ? adminActor(actorId) : 'owner',
         // REL MVP: con la política por clase la estrategia aplicada queda en el log (A reintento / B regenerar).
-        strategy: auto?.ambiguousAudio ? 'ambiguous_audio_resubmit' : auto?.safe ? 'safe_auto_retry'
+        strategy: auto?.providerProbe ? (auto.providerProbe.mode === 'canary' ? PROVIDER_PROBE_STRATEGY : PROVIDER_PROBE_RESUME_STRATEGY)
+          : auto?.ambiguousAudio ? 'ambiguous_audio_resubmit' : auto?.safe ? 'safe_auto_retry'
           : auto && auto.policy.classAware && autoMeta?.strategy ? `auto_heal_${autoMeta.kind === 'B' ? 'regenerate' : 'retry'}:${autoMeta.strategy}`
           : auto ? 'auto_heal'
           : resubmitVideo ? 'manual_resubmit_video' : resubmitProvider ? 'manual_resubmit_provider' : 'manual_retry',
@@ -2259,6 +2320,156 @@ export class RunsService {
         this.logger.warn(`auto-heal: ${r.item_key} (run ${r.job_id}) no se reabre automáticamente (${code}): ${msg.slice(0, 300)}`);
       }
     }
+  }
+
+  /**
+   * REL CREDIT — sonda del proveedor tras crédito/cuota agotados (mismo tick que el auto-healer; ver
+   * reliability/provider-probe.ts). Por cada run vigente con items `failed` por crédito/cuota de Anthropic u
+   * OpenAI: a su hora reabre UN canario por (run, proveedor) con retryItem(auto.providerProbe canary) — un
+   * intento, sin consumir las rondas del auto-healer —; si el canario (o una reapertura humana) termina bien,
+   * reabre el resto con retryItem(auto.providerProbe resume) (que desbloquea sus dependientes). Mientras
+   * espera, deja la próxima sonda en output_summary.providerProbe (vista de recuperación). Todo pasa por los
+   * locks y el gate de FinOps (simulación) de retryItem, y en el claim por el runtime guard y el ledger del
+   * worker. Apagado con DYNAMIC_AUTO_HEAL_POLICY=legacy.
+   */
+  async autoProbeProviderCredit(
+    opts: { policy?: AutoHealPolicy; now?: Date; limit?: number } = {},
+  ): Promise<{
+    enabled: boolean;
+    runs: number;
+    probed: Array<{ runId: string; itemKey: string; provider: string; round: number }>;
+    resumed: Array<{ runId: string; itemKey: string; provider: string }>;
+    waiting: Array<{ runId: string; provider: string; action: string; nextProbeAt: string | null }>;
+    skipped: Array<{ runId: string; itemKey: string; reason: string }>;
+  }> {
+    const policy = opts.policy ?? autoHealPolicyFromEnv();
+    const now = opts.now ?? new Date();
+    const limit = Math.max(1, Math.floor(opts.limit ?? 2000));
+    const result = {
+      enabled: providerProbeEnabled(policy), runs: 0,
+      probed: [] as Array<{ runId: string; itemKey: string; provider: string; round: number }>,
+      resumed: [] as Array<{ runId: string; itemKey: string; provider: string }>,
+      waiting: [] as Array<{ runId: string; provider: string; action: string; nextProbeAt: string | null }>,
+      skipped: [] as Array<{ runId: string; itemKey: string; reason: string }>,
+    };
+    if (!result.enabled) return result;
+    type Row = ProviderProbeRow & { job_id: string; item_key: string; type: string; course_id: number; owner_id: string; blueprint_number: number };
+    const rows: Row[] = await this.dataSource.query(
+      `select g.id, g.job_id, g.item_key, g.type, g.status, g.error, g.output_summary, g.finished_at, g.updated_at, g.claimed_at,
+              pj.course_id, pj.owner_id, b.blueprint_number, to_jsonb(g)->>'failure_class' as failure_class
+         from public.generation_item_runs g
+         join public.production_jobs pj on pj.id = g.job_id
+         join public.course_generation_manifests m on m.id = g.manifest_id
+         join public.course_blueprints b on b.id = m.blueprint_id
+        where pj.execution_mode = 'dynamic_generation'
+          and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+          and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed', 'preview')
+          and ${latestGenerationPredicate('g')}
+          and not exists (
+            select 1 from public.production_jobs pj2
+             where pj2.execution_mode = 'dynamic_generation' and pj2.course_id = pj.course_id and pj2.id <> pj.id
+               and (pj2.created_at > pj.created_at or (pj2.created_at = pj.created_at and pj2.id > pj.id)))
+          and not exists (select 1 from public.course_generation_manifests m2 where m2.course_id = m.course_id and m2.id > m.id)
+          and (
+            -- crédito/cuota (filtro grueso; la decisión fina es providerCreditWaitOf), dentro de la ventana de ~24 h
+            (g.status = 'failed' and g.error ~* $2 and g.finished_at > $1::timestamptz - make_interval(hours => $3::int))
+            -- estado de una sonda (canario en vuelo / terminado, esperas persistidas)
+            or (g.output_summary ? '${PROVIDER_PROBE_KEY}' and g.updated_at > $1::timestamptz - make_interval(hours => $3::int * 2))
+            -- detenido por el usuario: el run está pausado a mano (nunca se sondea)
+            or (g.status = 'failed' and g.error ~* $4)
+          )
+        order by g.job_id, g.id
+        limit $5`,
+      [now.toISOString(), PROVIDER_PROBE_SQL_REGEX, PROVIDER_PROBE_MAX_HOURS, USER_STOPPED_SQL_REGEX, limit],
+    );
+    const byRun = new Map<string, Row[]>();
+    for (const r of rows) {
+      if (!byRun.has(r.job_id)) byRun.set(r.job_id, []);
+      byRun.get(r.job_id)!.push(r);
+    }
+    const reopen = async (r: Row, mode: 'canary' | 'resume', provider: FailureProvider): Promise<boolean> => {
+      try {
+        await this.retryItem(r.course_id, r.owner_id, Number(r.blueprint_number), r.job_id, r.item_key, false, false,
+          { policy, now, providerProbe: { mode, provider } });
+        return true;
+      } catch (err) {
+        const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
+        const code = String((resp && typeof resp === 'object' && (resp as any).code) || (err instanceof Error ? err.name : 'error')).slice(0, 100);
+        const msg = err instanceof Error ? err.message : String(err);
+        result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: code });
+        // Enfriamiento durable en el item (no vuelve a tomar locks en cada tick); solo si sigue failed.
+        await this.dataSource.query(
+          `update public.generation_item_runs
+              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('${PROVIDER_PROBE_KEY}',
+                    coalesce(output_summary->'${PROVIDER_PROBE_KEY}', '{}'::jsonb) || $2::jsonb)
+            where id = $1 and status = 'failed'`,
+          [r.id, JSON.stringify({ provider, skipUntilMs: now.getTime() + PROVIDER_PROBE_SKIP_SECONDS * 1000, lastSkipReason: code })],
+        ).catch((e) => this.logger.warn(`sonda del proveedor: no se pudo registrar el enfriamiento de ${r.item_key}: ${e instanceof Error ? e.message : String(e)}`));
+        this.logger.warn(`sonda del proveedor: ${r.item_key} (run ${r.job_id}) no se reabre (${mode}, ${code}): ${msg.slice(0, 300)}`);
+        return false;
+      }
+    };
+    for (const [runId, runRows] of byRun) {
+      const plans = planProviderProbes(runRows, now, runId);
+      if (plans.some((p) => p.action !== 'none')) result.runs++;
+      const byId = new Map(runRows.map((r) => [String(r.id), r]));
+      for (const plan of plans) {
+        if (plan.action === 'resume') {
+          let pending = 0;
+          for (const id of plan.waitingIds) {
+            const r = byId.get(id)!;
+            const skip = Number(providerProbeStateOf(r.output_summary)?.skipUntilMs ?? 0);
+            if (Number.isFinite(skip) && skip > now.getTime()) { pending++; continue; }
+            if (await reopen(r, 'resume', plan.provider)) {
+              result.resumed.push({ runId, itemKey: r.item_key, provider: plan.provider });
+              this.logger.warn(`sonda del proveedor: ${plan.provider} volvió — reabierto ${r.item_key} (run ${runId})`);
+            } else pending++;
+          }
+          // Todo el resto reabierto → la prueba de éxito (canario completado) se consume; si quedó alguno
+          // (rechazado), se conserva y el próximo barrido lo reintenta (idempotente).
+          if (pending === 0 && plan.successIds.length) {
+            await this.dataSource.query(
+              `update public.generation_item_runs set output_summary = output_summary - '${PROVIDER_PROBE_KEY}'
+                where id = any($1::uuid[]) and status = 'completed'`,
+              [plan.successIds],
+            );
+          }
+          continue;
+        }
+        if (plan.action === 'probe' && plan.canaryId) {
+          const r = byId.get(plan.canaryId)!;
+          if (await reopen(r, 'canary', plan.provider)) {
+            result.probed.push({ runId, itemKey: r.item_key, provider: plan.provider, round: plan.round + 1 });
+            this.logger.warn(`sonda del proveedor: canario ${r.item_key} (run ${runId}) reabierto — ${plan.provider}, sonda ${plan.round + 1}`);
+          }
+          continue;
+        }
+        if (plan.action === 'none') continue;
+        result.waiting.push({ runId, provider: plan.provider, action: plan.action, nextProbeAt: plan.nextProbeAt ? plan.nextProbeAt.toISOString() : null });
+        if (plan.action !== 'wait' || !plan.nextProbeAt) continue;
+        // Vista de recuperación: la próxima sonda (y el inicio de la racha) en cada item que espera.
+        const nextIso = plan.nextProbeAt.toISOString();
+        for (const id of plan.waitingIds) {
+          const r = byId.get(id)!;
+          // M1: el estado de una racha vencida se REEMPLAZA (no se mezcla) por el de la racha nueva.
+          const same = effectiveProbeStateOf(r, plan.provider, now);
+          const firstFailedAt = same?.firstFailedAt
+            ?? (r.finished_at ? new Date(r.finished_at as any).toISOString() : plan.streakStartAt?.toISOString() ?? now.toISOString());
+          if (same && same.nextProbeAt === nextIso && same.firstFailedAt === firstFailedAt && Number(same.runRound ?? 0) === plan.round) continue;
+          await this.dataSource.query(
+            `update public.generation_item_runs
+                set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('${PROVIDER_PROBE_KEY}',
+                      (case when $5::boolean and output_summary->'${PROVIDER_PROBE_KEY}'->>'provider' = $3 then output_summary->'${PROVIDER_PROBE_KEY}' else '{}'::jsonb end) || $2::jsonb)
+              where id = $1 and status = 'failed' and error is not distinct from $4`,
+            [r.id, JSON.stringify({ provider: plan.provider, firstFailedAt, nextProbeAt: nextIso, runRound: plan.round }), plan.provider, r.error, !!same],
+          ).catch((e) => this.logger.warn(`sonda del proveedor: no se pudo registrar la espera de ${r.item_key}: ${e instanceof Error ? e.message : String(e)}`));
+        }
+      }
+    }
+    if (result.probed.length || result.resumed.length || result.skipped.length) {
+      this.logger.log(`sonda del proveedor: runs ${result.runs}, canarios ${result.probed.length}, reabiertos ${result.resumed.length}, omitidos ${result.skipped.length}`);
+    }
+    return result;
   }
 
   /**
