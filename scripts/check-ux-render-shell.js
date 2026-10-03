@@ -3,7 +3,8 @@
 // UX r18 — render del curso empaquetado (builder v3 3.12.0). Sin DB, sin red, sin proveedores.
 //
 //   (a) Bienvenida: la sección 0 abre con el hero con tema (cv3:shell:welcome) justo bajo el encabezado
-//       de Moodle y cierra con el foro «📢 Avisos del Curso»; el hero no repite «Bienvenida» (sin kicker);
+//       de Moodle y cierra con el foro «📢 Avisos del Curso»; el hero no repite «Bienvenida» (r19 W, 3.13.0: su única
+//       línea meta es «Curso · N módulos · M capítulos», de facts);
 //       sequence de section.xml = orden de moodle_backup.xml = moduleid de cada module.xml; en TODAS las
 //       familias de diseño; el validador marca SECTIONS si el orden se rompe.
 //   (b) Audio: audio() emite preload="metadata" (nunca "none"), también en los labels empaquetados.
@@ -288,7 +289,10 @@ function assertSharp(label, m) {
       const forum = sec0[sec0.length - 1];
       assert(forum.modname === 'forum' && new RegExp(`moduleid="${forum.mid}"`).test(await P.xmlOf(forum)), 'forum.xml con el moduleid del foro');
       const hero = await P.introOf(sec0[0]);
-      assert(!/cvc-kicker/.test(hero), 'el hero no lleva kicker');
+      // r19 W (builder 3.13.0): el hero lleva UNA línea meta, y es de cifras de facts («Curso · N módulos · M capítulos»),
+      // nunca el kicker «Bienvenida» de antes (antes de 3.13.0 el hero no tenía línea meta; el criterio es el mismo).
+      const kickers = [...hero.matchAll(/<p class="cvc-meta cvc-kicker"[^>]*>([\s\S]*?)<\/p>/g)].map((m) => visibleText(m[1]).replace(/\u00AD/g, ''));
+      assert(kickers.length === 1 && /^Curso · \d+ módulos? · \d+ capítulos?$/.test(kickers[0]), `línea meta del hero: ${JSON.stringify(kickers)}`);
       const txt = visibleText(hero);
       // Ningún elemento cuyo texto sea solo «Bienvenida» (el kicker viejo); la prosa («Te damos la bienvenida…») sí puede.
       assert(!/>\s*Bienvenida\s*</i.test(hero), `«Bienvenida» repetida como rótulo en el hero: ${txt.slice(0, 120)}`);
