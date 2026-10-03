@@ -203,6 +203,31 @@ export interface ProviderProbePlan {
 const IN_FLIGHT_STATUSES: readonly string[] = Object.freeze(['pending', 'retrying', 'running']);
 
 /**
+ * Fix round 1 (M2): la última sonda (recortada al tope de ~24 h) se ejecuta aunque el barrido llegue un poco
+ * después del tope; pasado este margen sin sondear, la racha vence igual.
+ */
+export const PROVIDER_PROBE_FINAL_GRACE_SECONDS = 3600;
+
+function failedAtOf(r: ProviderProbeRow, now: Date): Date {
+  return toDate(r.finished_at) ?? toDate(r.updated_at) ?? now;
+}
+
+/**
+ * Fix round 1 (M1): estado de sonda VIGENTE de una fila para `provider`. En un item `failed`, un estado cuya
+ * racha ya venció antes de ESTE fallo (fallo más nuevo que firstFailedAt + ~24 h) es de una racha anterior:
+ * se ignora (el fallo nuevo empieza otra racha, con sus propias rondas).
+ */
+export function effectiveProbeStateOf(r: ProviderProbeRow, provider: FailureProvider, now: Date = new Date()): ProviderProbeState | null {
+  const s = providerProbeStateOf(r.output_summary);
+  if (!s || s.provider !== provider) return null;
+  if (r.status === 'failed') {
+    const first = toDate(s.firstFailedAt);
+    if (first && failedAtOf(r, now).getTime() > first.getTime() + PROVIDER_PROBE_MAX_HOURS * 3_600_000 + PROVIDER_PROBE_FINAL_GRACE_SECONDS * 1000) return null;
+  }
+  return s;
+}
+
+/**
  * Plan de sondas de UN run (filas de la generación vigente con crédito agotado, con estado de sonda, o
  * detenidas por el usuario). `seed` = id del run (jitter determinista por run y proveedor). Puro: el
  * barrido lo usa para decidir y retryItem lo re-evalúa con las filas BLOQUEADAS.
@@ -222,15 +247,34 @@ export function planProviderProbes(rows: readonly ProviderProbeRow[], now: Date,
   }
   const paused = rows.some((r) => r.status === 'failed' && USER_STOPPED_RE.test(String(r.error ?? '').trim()));
   const out: ProviderProbePlan[] = [];
+  const MAX_MS = PROVIDER_PROBE_MAX_HOURS * 3_600_000;
   for (const provider of [...providers].sort()) {
     const waiting = waitingBy.get(provider) ?? [];
-    const withState = rows.filter((r) => providerProbeStateOf(r.output_summary)?.provider === provider);
-    const round = withState.reduce((m, r) => Math.max(m, Math.floor(Number(providerProbeStateOf(r.output_summary)?.runRound ?? 0)) || 0), 0);
+    const eff = (r: ProviderProbeRow) => effectiveProbeStateOf(r, provider, now);
+    const withState = rows.filter((r) => eff(r) !== null);
     const successIds = withState.filter((r) => r.status === 'completed').map((r) => String(r.id));
+    const firstOf = (r: ProviderProbeRow) => toDate(eff(r)?.firstFailedAt) ?? failedAtOf(r, now);
+    // M1: la racha sale SOLO de los items dentro de su propia ventana (un item vencido de una racha vieja no
+    // arrastra a un fallo nuevo al «exhausted»).
+    const active = waiting.filter((r) => now.getTime() - firstOf(r).getTime() <= MAX_MS + PROVIDER_PROBE_FINAL_GRACE_SECONDS * 1000);
+    const streakStartAt = active.length ? new Date(Math.min(...active.map((r) => firstOf(r).getTime()))) : null;
+    const sameStreak = (r: ProviderProbeRow) => {
+      if (!streakStartAt) return false;
+      const f = toDate(eff(r)?.firstFailedAt);
+      return !f || f.getTime() >= streakStartAt.getTime() - 1000;
+    };
+    const round = withState.filter(sameStreak)
+      .reduce((m, r) => Math.max(m, Math.floor(Number(eff(r)?.runRound ?? 0)) || 0), 0);
     const base: ProviderProbePlan = {
       provider, action: 'none', waitingIds: waiting.map((r) => String(r.id)), canaryId: null, inFlightId: null, successIds,
-      round, nextProbeAt: null, streakStartAt: null, deadlineAt: null,
+      round, nextProbeAt: null, streakStartAt, deadlineAt: null,
     };
+    // I2 (fix round 1): detenido por el usuario gana SIEMPRE — ni canario ni reanudación (la prueba de éxito se
+    // conserva y la reanudación ocurre cuando el usuario retome).
+    if (paused && (waiting.length || successIds.length)) {
+      out.push({ ...base, action: 'paused' });
+      continue;
+    }
     // El proveedor volvió (el canario —o una reapertura de un humano— terminó bien): se reabre el resto.
     if (successIds.length) {
       out.push({ ...base, action: 'resume' });
@@ -240,21 +284,18 @@ export function planProviderProbes(rows: readonly ProviderProbeRow[], now: Date,
       out.push(base);
       continue;
     }
-    const firstOf = (r: ProviderProbeRow) => toDate(providerProbeStateOf(r.output_summary)?.firstFailedAt) ?? toDate(r.finished_at) ?? toDate(r.updated_at) ?? now;
-    const streakStartAt = new Date(Math.min(...waiting.map((r) => firstOf(r).getTime())));
-    const deadlineAt = new Date(streakStartAt.getTime() + PROVIDER_PROBE_MAX_HOURS * 3_600_000);
-    const lastFailAt = new Date(Math.max(...waiting.map((r) => (toDate(r.finished_at) ?? toDate(r.updated_at) ?? now).getTime())));
-    let nextProbeAt = new Date(lastFailAt.getTime() + providerProbeWaitSeconds(round, `${seed}:${provider}`) * 1000);
-    if (nextProbeAt.getTime() > deadlineAt.getTime()) nextProbeAt = deadlineAt;
-    const plan: ProviderProbePlan = { ...base, streakStartAt, deadlineAt, nextProbeAt };
-    if (paused) {
-      out.push({ ...plan, action: 'paused', nextProbeAt: null });
+    if (!streakStartAt) {
+      out.push({ ...base, action: 'exhausted' });
       continue;
     }
+    const deadlineAt = new Date(streakStartAt.getTime() + MAX_MS);
+    const lastFailAt = new Date(Math.max(...active.map((r) => failedAtOf(r, now).getTime())));
+    let nextProbeAt = new Date(lastFailAt.getTime() + providerProbeWaitSeconds(round, `${seed}:${provider}`) * 1000);
+    if (nextProbeAt.getTime() > deadlineAt.getTime()) nextProbeAt = deadlineAt;
+    const plan: ProviderProbePlan = { ...base, deadlineAt, nextProbeAt };
     const inFlight = withState.find((r) => {
       if (!IN_FLIGHT_STATUSES.includes(r.status)) return false;
-      const s = providerProbeStateOf(r.output_summary)!;
-      const canaryAt = toDate(s.canaryAt);
+      const canaryAt = toDate(eff(r)!.canaryAt);
       if (!canaryAt) return false;
       // Pendiente sin reclamar desde la reapertura por más de PROVIDER_PROBE_STALL_SECONDS: no cuenta.
       const claimedAt = toDate(r.claimed_at);
@@ -265,7 +306,12 @@ export function planProviderProbes(rows: readonly ProviderProbeRow[], now: Date,
       out.push({ ...plan, action: 'in_flight', inFlightId: String(inFlight.id), nextProbeAt: null });
       continue;
     }
-    if (now.getTime() > deadlineAt.getTime()) {
+    // M2: la sonda que tocaba (incluida la última, recortada al tope) corre una vez aunque el barrido llegue
+    // después del tope (dentro del margen); vence cuando ya se hizo o pasó el margen.
+    const lastProbeAt = withState.filter(sameStreak)
+      .reduce<number | null>((m, r) => { const t = toDate(eff(r)?.lastProbeAt)?.getTime() ?? null; return t === null ? m : Math.max(m ?? t, t); }, null);
+    const dueDone = lastProbeAt !== null && lastProbeAt >= nextProbeAt.getTime();
+    if (now.getTime() > deadlineAt.getTime() && (dueDone || now.getTime() > deadlineAt.getTime() + PROVIDER_PROBE_FINAL_GRACE_SECONDS * 1000)) {
       out.push({ ...plan, action: 'exhausted', nextProbeAt: null });
       continue;
     }
@@ -273,20 +319,30 @@ export function planProviderProbes(rows: readonly ProviderProbeRow[], now: Date,
       out.push({ ...plan, action: 'wait' });
       continue;
     }
-    // Canario: primero un item del SERVIDOR (no depende de que haya un navegador abierto); si no, el item del
-    // navegador que falló último (el que pausó al ejecutor: reabrirlo lo reanuda). Sin los rechazados recientes.
-    const pickable = waiting.filter((r) => {
-      const skip = Number(providerProbeStateOf(r.output_summary)?.skipUntilMs ?? 0);
+    const pickable = active.filter((r) => {
+      const skip = Number(eff(r)?.skipUntilMs ?? 0);
       return !(Number.isFinite(skip) && skip > now.getTime());
     });
     if (!pickable.length) {
       out.push({ ...plan, action: 'wait' });
       continue;
     }
+    // Canario: primero un item del SERVIDOR (no depende de que haya un navegador abierto; el último que falló).
+    // Solo navegador (I1, fix round 1): el culpable de la pausa fatal del ejecutor (45: state.fatalItem = el PRIMER
+    // fallo no reintentable): el canario anterior que volvió a fallar (su re-falla es el primer fallo de esa
+    // reanudación), y si no hubo, el que falló PRIMERO. Reabrirlo es lo que reanuda al ejecutor pausado.
     const isWorker = (r: ProviderProbeRow) => !!r.type && AUTO_HEAL_WORKER_ITEM_TYPES.includes(r.type);
-    const failedMs = (r: ProviderProbeRow) => (toDate(r.finished_at) ?? toDate(r.updated_at) ?? now).getTime();
-    const canary = [...pickable].sort((a, b) =>
-      (Number(isWorker(b)) - Number(isWorker(a))) || (failedMs(b) - failedMs(a)) || String(a.id).localeCompare(String(b.id)))[0];
+    const workers = pickable.filter(isWorker);
+    let canary: ProviderProbeRow;
+    if (workers.length) {
+      canary = [...workers].sort((a, b) => (failedAtOf(b, now).getTime() - failedAtOf(a, now).getTime()) || String(a.id).localeCompare(String(b.id)))[0];
+    } else {
+      const canaryMs = (r: ProviderProbeRow) => toDate(eff(r)?.canaryAt)?.getTime() ?? -1;
+      const prevCanaries = pickable.filter((r) => canaryMs(r) >= 0);
+      canary = prevCanaries.length
+        ? [...prevCanaries].sort((a, b) => (canaryMs(b) - canaryMs(a)) || String(a.id).localeCompare(String(b.id)))[0]
+        : [...pickable].sort((a, b) => (failedAtOf(a, now).getTime() - failedAtOf(b, now).getTime()) || String(a.id).localeCompare(String(b.id)))[0];
+    }
     out.push({ ...plan, action: 'probe', canaryId: String(canary.id) });
   }
   return out;
@@ -301,12 +357,12 @@ export function providerProbeViewOf(row: ProviderProbeRow, now: Date, enabled: b
   if (!enabled) return null;
   const provider = providerCreditWaitOf(row);
   if (!provider) return null;
-  const s = providerProbeStateOf(row.output_summary);
+  const s = effectiveProbeStateOf(row, provider, now);
   const failedAt = toDate(row.finished_at) ?? toDate(row.updated_at) ?? now;
-  const first = toDate(s?.provider === provider ? s.firstFailedAt : null) ?? failedAt;
+  const first = toDate(s ? s.firstFailedAt : null) ?? failedAt;
   const deadlineAt = new Date(first.getTime() + PROVIDER_PROBE_MAX_HOURS * 3_600_000);
   if (now.getTime() > deadlineAt.getTime()) return null;
-  const persisted = s?.provider === provider ? toDate(s.nextProbeAt) : null;
+  const persisted = s ? toDate(s.nextProbeAt) : null;
   const nextProbeAt = persisted && persisted.getTime() >= failedAt.getTime()
     ? persisted
     : new Date(failedAt.getTime() + PROVIDER_PROBE_WAITS_SECONDS[0] * 1000);

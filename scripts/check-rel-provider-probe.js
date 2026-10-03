@@ -142,9 +142,14 @@ async function pureChecks() {
     eq([p.provider, p.action, p.waitingIds.length, p.round], ['anthropic', 'wait', 4, 0], 'en espera');
     [p] = PP.planProviderProbes(rows(Math.ceil(w0) + 1), NOW, 'run');
     eq([p.action, ['w1', 'w2'].includes(p.canaryId)], ['probe', true], 'canario del servidor');
-    // Solo items del navegador: el que falló último (el que pausó al ejecutor).
+    // Fix round 1 (I1): solo items del navegador → el culpable de la pausa fatal = el que falló PRIMERO.
     [p] = PP.planProviderProbes(rows(Math.ceil(w0) + 5).filter((r) => r.type !== 'audiobook_chapter'), NOW, 'run');
-    eq([p.action, p.canaryId], ['probe', 'b2'], 'navegador: el último');
+    eq([p.action, p.canaryId], ['probe', 'b1'], 'navegador: el primero en fallar');
+    // …y tras una re-falla del canario (primer fallo de esa reanudación = nuevo culpable), el mismo canario otra vez.
+    const refail = [prow(ANTH_BROWSER, { id: 'b1', type: 'experience', secAgo: 9000, os: { providerProbe: { provider: 'anthropic', firstFailedAt: ago(9000), runRound: 0 } } }),
+      prow(ANTH_BROWSER, { id: 'b2', type: 'activity', secAgo: 2000, os: { providerProbe: { provider: 'anthropic', firstFailedAt: ago(9000), canaryAt: ago(2100), runRound: 1, rounds: 1 } } })];
+    [p] = PP.planProviderProbes(refail, NOW, 'run');
+    eq([p.action, p.canaryId], ['probe', 'b2'], 'navegador: el canario anterior que volvió a fallar');
     // Canario en vuelo → ninguno más (ni pendiente, ni corriendo).
     const inflight = (status, claimed) => [...rows(4000).filter((r) => r.id !== 'w1'),
       prow(null, { id: 'w1', status, claimed_at: claimed, os: { providerProbe: { provider: 'anthropic', canaryAt: ago(60), runRound: 1 } } })];
@@ -176,10 +181,36 @@ async function pureChecks() {
     eq([p.action, p.round], ['wait', 1], 'espera de la sonda 2');
     eq(Math.round((p.nextProbeAt.getTime() - (NOW.getTime() - 400e3)) / 1000), Math.round(w1), 'nextProbeAt = re-falla + 10 min (+jitter)');
     eq(p.streakStartAt.toISOString(), ago(3600), 'la racha empieza en el primer fallo');
-    [p] = PP.planProviderProbes([prow(ANTH_SCRIPT, { id: 'w1', secAgo: 30, os: st({ firstFailedAt: ago(25 * 3600), runRound: 7 }) })], NOW, 'run');
+    [p] = PP.planProviderProbes([prow(ANTH_SCRIPT, { id: 'w1', secAgo: 30 * 3600, os: st({ firstFailedAt: ago(30 * 3600), runRound: 7, lastProbeAt: ago(30 * 3600) }) })], NOW, 'run');
     eq(p.action, 'exhausted', '> 24 h');
     [p] = PP.planProviderProbes([prow(ANTH_SCRIPT, { id: 'w1', secAgo: 4000 }), prow('Generación detenida por el usuario', { id: 'c1', type: 'content' })], NOW, 'run');
     eq(p.action, 'paused', 'detenido por el usuario');
+    // I2 (fix round 1): detenido por el usuario gana también sobre la reanudación (la prueba de éxito se conserva).
+    [p] = PP.planProviderProbes([prow(null, { id: 'w1', status: 'completed', os: st({ canaryAt: ago(100), runRound: 1 }) }), prow(ANTH_SCRIPT, { id: 'w2', secAgo: 3600 }),
+      prow('Generación detenida por el usuario', { id: 'c1', type: 'content' })], NOW, 'run');
+    eq([p.action, p.successIds], ['paused', ['w1']], 'pausado + éxito → paused (sin reanudar)');
+  });
+
+  await check('puro fix round 1 (M1): un fallo NUEVO tras una racha vencida empieza otra racha (rondas desde 0); (M2): la última sonda, recortada al tope, corre una vez', () => {
+    // M1: un item viejo vencido (racha de hace 30 h) + uno que falla ahora → racha nueva, ronda 0, no exhausted.
+    const stale = { providerProbe: { provider: 'anthropic', firstFailedAt: ago(30 * 3600), runRound: 9, lastProbeAt: ago(29 * 3600) } };
+    const w0 = PP.providerProbeWaitSeconds(0, 'run:anthropic');
+    let [p] = PP.planProviderProbes([prow(ANTH_SCRIPT, { id: 'old', secAgo: 29 * 3600, os: stale }), prow(ANTH_SCRIPT, { id: 'new', secAgo: Math.ceil(w0) + 2 })], NOW, 'run');
+    eq([p.action, p.round, p.canaryId, p.streakStartAt.toISOString()], ['probe', 0, 'new', ago(Math.ceil(w0) + 2)], 'racha nueva');
+    // M1 en el mismo item: su estado viejo (racha vencida) se ignora si vuelve a fallar después del tope.
+    [p] = PP.planProviderProbes([prow(ANTH_SCRIPT, { id: 'x', secAgo: 10, os: stale })], NOW, 'run');
+    eq([p.action, p.round, p.streakStartAt.toISOString()], ['wait', 0, ago(10)], 'estado viejo del mismo item ignorado');
+    // M2: racha empezada hace 24 h + 30 s, la próxima sonda recortada al tope, sin sondear desde entonces → corre.
+    const first = 24 * 3600 + 30;
+    const st2 = (o) => ({ providerProbe: { provider: 'anthropic', firstFailedAt: ago(first), runRound: 20, rounds: 20, canaryAt: ago(1800), lastProbeAt: ago(1800), ...o } });
+    [p] = PP.planProviderProbes([prow(ANTH_SCRIPT, { id: 'w1', secAgo: 600, os: st2({}) })], NOW, 'run');
+    eq([p.action, p.canaryId, p.nextProbeAt.toISOString()], ['probe', 'w1', ago(30)], 'la sonda final (en el tope) corre');
+    // …ya hecha (lastProbeAt ≥ el tope) y re-fallada → exhausted.
+    [p] = PP.planProviderProbes([prow(ANTH_SCRIPT, { id: 'w1', secAgo: 5, os: st2({ canaryAt: ago(20), lastProbeAt: ago(20) }) })], NOW, 'run');
+    eq(p.action, 'exhausted', 'tras la sonda final → exhausted');
+    // …y pasada la gracia (1 h) sin sondear → exhausted igual.
+    [p] = PP.planProviderProbes([prow(ANTH_SCRIPT, { id: 'w1', secAgo: 600, os: st2({ firstFailedAt: ago(25 * 3600 + 60) }) })], NOW, 'run');
+    eq(p.action, 'exhausted', 'pasada la gracia');
   });
 
   await check('puro: kill-switch DYNAMIC_AUTO_HEAL_POLICY=legacy apaga la sonda; vista: provider_probe con nextRetryAt solo si aplica', () => {
@@ -366,6 +397,19 @@ async function dbChecks() {
       probed: res.probed.filter((x) => x.runId === runId), resumed: res.resumed.filter((x) => x.runId === runId),
       waiting: res.waiting.filter((x) => x.runId === runId), skipped: res.skipped.filter((x) => x.runId === runId),
     });
+    // Claim REAL del worker (scheduler.claimNextItem sin ownerId) y completeItem con un artifact real del item.
+    const claimWorker = (runId, types = ['audiobook_chapter', 'audio_welcome']) =>
+      sched.claimNextItem({ runId, executorId: 'worker-probe', types, leaseSeconds: 120 });
+    async function completeCanary(runId, key) {
+      const item = await claimWorker(runId);
+      eq(item && item.itemKey, key, 'el worker reclama el canario');
+      const [art] = await ds.query(
+        `insert into public.artifacts (owner_id, course_id, job_id, type, storage_provider, storage_bucket, storage_path, filename, mime_type, metadata, module_id, chapter_id, manifest_id, manifest_item_key)
+         values ($1, $2, $3, 'dynamic_audio_mp3', 'supabase', 'cursia-artifacts', $4, 'a.mp3', 'audio/mpeg', '{}'::jsonb, $5, $6, $7, $8) returning id`,
+        [OWNER, String(item.artifactCourseId), runId, `${OWNER}/probe/${crypto.randomUUID()}.mp3`, item.moduleId ?? null, item.chapterId ?? null, item.manifestId, key]);
+      const res = await sched.completeItemDetailed(item.itemRunId, 'worker-probe', { artifactIds: [art.id], summary: { mode: 'mock', provider: 'openai' } });
+      eq(res, { ok: true }, 'completeItem');
+    }
     // Run con todo completado salvo los items a fallar (y sus dependientes, que quedan bloqueados).
     async function creditRun(title, fails) {
       const K = await makeCourse(title);
@@ -455,12 +499,10 @@ async function dbChecks() {
     await check('DB crédito: el canario vuelve a fallar por crédito → un intento consumido (no más), rondas del auto-healer intactas; la espera crece 10 → 20 min', async () => {
       const deltas = [];
       for (let round = 1; round <= 2; round++) {
-        // El worker reclama el canario (simulado: el payload real del worker no es parte de esta prueba).
-        const c0 = await itemRow(K.runId, canaryKey);
-        eq(c0.status, 'pending', 'canario reclamable');
-        await setRow(c0.id, `status = 'running', worker_id = 'worker-probe', attempt_count = attempt_count + 1, claimed_at = now(),
-                             lease_until = now() + interval '2 minutes'`);
-        const ok = await sched.failItem(c0.id, 'worker-probe', ANTH_SCRIPT, false);
+        // Fix round 1 (I3): el worker reclama el canario por el claim REAL del scheduler y falla por failItem.
+        const claimed = await claimWorker(K.runId);
+        eq(claimed && claimed.itemKey, canaryKey, 'el worker reclama el canario');
+        const ok = await sched.failItem(claimed.itemRunId, 'worker-probe', ANTH_SCRIPT, false);
         assert(ok, 'failItem');
         const row = await itemRow(K.runId, canaryKey);
         eq([row.status, row.attempt_count === row.max_attempts, row.output_summary.autoHeal ? row.output_summary.autoHeal.rounds || 0 : 0, row.output_summary.providerProbe.rounds],
@@ -482,8 +524,11 @@ async function dbChecks() {
 
     await check('DB crédito: el canario termina bien → se reabren TODOS los demás que esperaban (y sus dependientes), `provider_probe_resume`, la marca del canario se consume', async () => {
       const row = await itemRow(K.runId, canaryKey);
-      // El worker completa el canario (completeItem conserva output_summary: la prueba de éxito queda en providerProbe).
-      await setRow(row.id, `status = 'completed', error = null, finished_at = now()`);
+      // Fix round 1 (I3): claim REAL + completeItem del scheduler (camino del worker) — providerProbe sobrevive al completar.
+      await completeCanary(K.runId, canaryKey);
+      const done = await itemRow(K.runId, canaryKey);
+      eq([done.status, done.output_summary.providerProbe && done.output_summary.providerProbe.provider, !!(done.output_summary.providerProbe || {}).canaryAt],
+        ['completed', 'anthropic', true], 'providerProbe sobrevive a completeItem');
       const r = ofRun(await probe(1), K.runId);
       eq(r.resumed.map((x) => x.itemKey).sort(), kFailed.filter((k) => k !== canaryKey).sort(), 'todos los demás reabiertos');
       eq(r.probed.length, 0, 'sin otra sonda');
@@ -537,6 +582,61 @@ async function dbChecks() {
       const r = ofRun(await probe(0), M.runId);
       eq(r.probed.map((x) => x.provider).sort(), ['anthropic', 'openai'], 'uno por proveedor');
       eq(ofRun(await probe(60), M.runId).probed.length, 0, 'ninguno más');
+    });
+
+    await check('DB fix round 1 (I1): #616 SOLO navegador (experiencia falla primero, actividad 2 s después) → el canario es la PRIMERA (el culpable de la pausa fatal del ejecutor)', async () => {
+      const Bq = await creditRun('CREDIT browser-only', [
+        { type: 'experience', error: ANTH_BROWSER, secAgo: 12 },
+        { type: 'activity', error: ANTH_BROWSER, secAgo: 10 },
+      ]);
+      const r = ofRun(await probe(400), Bq.runId);
+      eq(r.probed.map((x) => x.itemKey), [Bq.fails[0].key], 'canario = la que falló primero');
+      eq((await itemRow(Bq.runId, Bq.fails[1].key)).status, 'failed', 'la otra sigue esperando');
+    });
+
+    await check('DB fix round 1 (I3): dos barridos A LA VEZ (Promise.all) → exactamente UN canario', async () => {
+      const Cc = await creditRun('CREDIT concurrent', [
+        { type: 'audiobook_chapter', idx: 0, error: ANTH_SCRIPT, secAgo: 3600 },
+        { type: 'audiobook_chapter', idx: 1, error: ANTH_SCRIPT, secAgo: 3600 },
+        { type: 'experience', error: ANTH_BROWSER, secAgo: 3600 },
+      ]);
+      const [a, b] = await Promise.all([probe(0), probe(0)]);
+      const probed = [...ofRun(a, Cc.runId).probed, ...ofRun(b, Cc.runId).probed];
+      eq(probed.length, 1, 'un canario entre los dos barridos');
+      const reopened = await ds.query(`select item_key from public.generation_item_runs where job_id = $1 and item_key = any($2::text[]) and status <> 'failed'`,
+        [Cc.runId, Cc.fails.map((f) => f.key)]);
+      eq(reopened.map((x) => x.item_key), [probed[0].itemKey], 'una sola fila reabierta');
+    });
+
+    await check('DB fix round 1 (I2): el canario termina bien DESPUÉS de que el usuario detuvo la generación → no se reabre nada más (ni en el barrido ni bajo lock); al retomar, sí', async () => {
+      const Pz = await creditRun('CREDIT paused resume', [
+        { type: 'audiobook_chapter', idx: 0, error: ANTH_SCRIPT, secAgo: 3600 },
+        { type: 'audiobook_chapter', idx: 1, error: ANTH_SCRIPT, secAgo: 3600 },
+        { type: 'experience', error: ANTH_BROWSER, secAgo: 3600 },
+      ]);
+      const r0 = ofRun(await probe(0), Pz.runId);
+      eq(r0.probed.length, 1, 'canario');
+      const canary = r0.probed[0].itemKey;
+      // El usuario detiene la generación mientras el canario vuela (una parte del navegador queda user_stopped).
+      const stop = (await itemsOfType(Pz.runId, 'module_intro'))[0];
+      assert(stop, 'module_intro existe');
+      await setRow(stop.id, `status = 'failed', error = 'Generación detenida por el usuario', finished_at = now()`);
+      await completeCanary(Pz.runId, canary);
+      const r1 = ofRun(await probe(5), Pz.runId);
+      eq([r1.resumed.length, r1.probed.length, r1.waiting.map((w) => w.action)], [0, 0, ['paused']], 'pausado: nada se reabre');
+      const others = Pz.fails.map((f) => f.key).filter((k) => k !== canary);
+      for (const k of others) eq((await itemRow(Pz.runId, k)).status, 'failed', `${k} sigue failed`);
+      // Bajo lock también: una reanudación directa se rechaza.
+      let err = null;
+      try {
+        await runs.retryItem(Pz.cid, OWNER, 1, Pz.runId, others[0], false, false, { policy: AH.DEFAULT_AUTO_HEAL_POLICY, now: at(5), providerProbe: { mode: 'resume', provider: 'anthropic' } });
+      } catch (e) { err = e; }
+      assert(err && /auto_heal_not_eligible.*paused/.test(err.message), 'retryItem bajo lock: ' + (err && err.message));
+      eq((await itemRow(Pz.runId, canary)).output_summary.providerProbe.provider, 'anthropic', 'la prueba de éxito se conserva');
+      // El usuario retoma (la parte detenida se reabre) → la reanudación ocurre.
+      await runs.retryItem(Pz.cid, OWNER, 1, Pz.runId, stop.item_key);
+      const r2 = ofRun(await probe(10), Pz.runId);
+      eq(r2.resumed.map((x) => x.itemKey).sort(), others.sort(), 'al retomar: el resto se reabre');
     });
 
     await check('DB kill-switch: DYNAMIC_AUTO_HEAL_POLICY=legacy → sin sondas (barrido y lock) y la vista como hoy', async () => {

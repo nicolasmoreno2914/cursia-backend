@@ -159,6 +159,7 @@ import {
   PROVIDER_PROBE_STRATEGY,
   ProviderProbeRow,
   USER_STOPPED_SQL_REGEX,
+  effectiveProbeStateOf,
   planProviderProbes,
   providerProbeEnabled,
   providerProbeStateOf,
@@ -1901,8 +1902,8 @@ export class RunsService {
           const reason = plan ? plan.action : providerProbeEnabled(auto.policy) ? 'not_waiting' : 'disabled';
           throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (provider_probe ${pp.mode}: ${reason})`, code: 'auto_heal_not_eligible', reason });
         }
-        const prev = providerProbeStateOf(target.output_summary);
-        const same = prev?.provider === pp.provider ? prev : null;
+        // M1: solo el estado de la racha VIGENTE (uno de una racha vencida se ignora).
+        const same = effectiveProbeStateOf(target as ProviderProbeRow, pp.provider, now);
         if (pp.mode === 'canary') {
           probeState = {
             provider: pp.provider,
@@ -2450,17 +2451,17 @@ export class RunsService {
         const nextIso = plan.nextProbeAt.toISOString();
         for (const id of plan.waitingIds) {
           const r = byId.get(id)!;
-          const s = providerProbeStateOf(r.output_summary);
-          const same = s?.provider === plan.provider ? s : null;
+          // M1: el estado de una racha vencida se REEMPLAZA (no se mezcla) por el de la racha nueva.
+          const same = effectiveProbeStateOf(r, plan.provider, now);
           const firstFailedAt = same?.firstFailedAt
             ?? (r.finished_at ? new Date(r.finished_at as any).toISOString() : plan.streakStartAt?.toISOString() ?? now.toISOString());
           if (same && same.nextProbeAt === nextIso && same.firstFailedAt === firstFailedAt && Number(same.runRound ?? 0) === plan.round) continue;
           await this.dataSource.query(
             `update public.generation_item_runs
                 set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('${PROVIDER_PROBE_KEY}',
-                      (case when output_summary->'${PROVIDER_PROBE_KEY}'->>'provider' = $3 then output_summary->'${PROVIDER_PROBE_KEY}' else '{}'::jsonb end) || $2::jsonb)
+                      (case when $5::boolean and output_summary->'${PROVIDER_PROBE_KEY}'->>'provider' = $3 then output_summary->'${PROVIDER_PROBE_KEY}' else '{}'::jsonb end) || $2::jsonb)
               where id = $1 and status = 'failed' and error is not distinct from $4`,
-            [r.id, JSON.stringify({ provider: plan.provider, firstFailedAt, nextProbeAt: nextIso, runRound: plan.round }), plan.provider, r.error],
+            [r.id, JSON.stringify({ provider: plan.provider, firstFailedAt, nextProbeAt: nextIso, runRound: plan.round }), plan.provider, r.error, !!same],
           ).catch((e) => this.logger.warn(`sonda del proveedor: no se pudo registrar la espera de ${r.item_key}: ${e instanceof Error ? e.message : String(e)}`));
         }
       }
