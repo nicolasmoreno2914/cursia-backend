@@ -247,6 +247,12 @@ export interface ClaimPayloadV3 {
   experienceFeatures?: { eduFields: boolean };
   /** EV6 IV avanzado: 2 si el Manifest declara `features.ivAdvanced = 1` (ausente = 1). */
   videoInteractionsSchemaVersion?: 2;
+  /**
+   * #583 (I2): capacidades del payload h5p que este backend acepta. El ejecutor pide el DragText móvil
+   * (texto corto + `distractors`) SOLO si ve `dragTextDistractors: true`; con un backend anterior (que
+   * rechazaría el campo) sigue con el prompt de siempre. El orden de deploy FE/BE no rompe la generación.
+   */
+  activityFeatures?: { dragTextDistractors: boolean };
 }
 
 /**
@@ -1249,6 +1255,7 @@ export class SchedulerService {
         out.activityType = r.type;
         out.activityTypeSource = r.source;
       }
+      out.activityFeatures = { dragTextDistractors: true };
     }
     if (row.type === 'video_interactions') {
       const ivAdvanced = manifest.features?.ivAdvanced === 1;

@@ -723,7 +723,8 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   // ── labels: CLEAN_SAFE, menciones, cifras, tokens ──
   const chapterById = new Map(facts.chapters.map((c) => [c.id, c]));
   const moduleById = new Map(facts.modules.map((m) => [m.id, m]));
-  const labels = acts.filter((a) => a.modname === 'label');
+  // #583 (builder 3.11.0): la descripción del recurso del Libro Guía (antes un label aparte) pasa las mismas reglas.
+  const labels = acts.filter((a) => a.modname === 'label' || (a.modname === 'resource' && a.idnumber === 'cv3:shell:libro' && a.intro.trim() !== ''));
   const allowedFor = (a: ParsedActivity): Record<ResourceKind, boolean> | null => {
     const chm = /^cv3:ch:([^:]+):/.exec(a.idnumber);
     if (chm) {
@@ -982,6 +983,6 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   return {
     ok: issues.length === 0,
     issues,
-    stats: { activities: acts.length, labels: labels.length, graded: gradedActs.length, h5p: h5pActs.length, files: files.length },
+    stats: { activities: acts.length, labels: labels.filter((a) => a.modname === 'label').length, graded: gradedActs.length, h5p: h5pActs.length, files: files.length },
   };
 }

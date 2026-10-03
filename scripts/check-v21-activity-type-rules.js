@@ -563,8 +563,8 @@ async function main() {
     const svc = Object.create(SchedulerService.prototype);
     const manifest = { rulesVersion: 3, modules: [], items: [] };
     const row = { type: 'activity', chapter_id: chId };
-    eq(await svc.buildClaimV3({}, row, itemRules, manifest), { validatedArtifactType: 'dynamic_h5p_params_json', activityType: other, activityTypeSource: 'manifest' }, 'manifest');
-    eq(await svc.buildClaimV3({}, row, itemLegacy, manifest), { validatedArtifactType: 'dynamic_h5p_params_json', activityType: hashType, activityTypeSource: 'rotation' }, 'rotation');
+    eq(await svc.buildClaimV3({}, row, itemRules, manifest), { validatedArtifactType: 'dynamic_h5p_params_json', activityType: other, activityTypeSource: 'manifest', activityFeatures: { dragTextDistractors: true } }, 'manifest');
+    eq(await svc.buildClaimV3({}, row, itemLegacy, manifest), { validatedArtifactType: 'dynamic_h5p_params_json', activityType: hashType, activityTypeSource: 'rotation', activityFeatures: { dragTextDistractors: true } }, 'rotation');
     eq(await svc.buildClaimV3({}, row, { ...itemLegacy, variant: 'scorm' }, manifest), { validatedArtifactType: null }, 'scorm');
   });
   await check('scheduler: la validación al completar exige el tipo del Manifest congelado del run (h5pType ≠ hash)', async () => {

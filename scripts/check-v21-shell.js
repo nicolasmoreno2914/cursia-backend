@@ -129,6 +129,8 @@ function shellLabels(facts, course, theme, level) {
     S.methodologyLabel(facts, ci, theme, o),
     S.routeLabel(facts, theme, o),
     S.libroCardLabel(77, facts, theme, o),
+    // #583 (builder 3.11.0): la tarjeta como descripción del recurso del Libro Guía.
+    S.libroResourceIntro(facts, theme, o),
     S.audiobookLabel(facts, theme, o),
     // EV6 T3: el cierre del paquete siempre trae el panel del certificado (insignia nativa).
     S.closingLabel(facts, ci, theme, o, certReqOf(facts)),
@@ -1291,7 +1293,7 @@ async function dbChecks() {
       const afterR = await item(examKey);
       eq([afterR.status !== 'completed', 'examBankDraft' in afterR.output_summary], [true, false], 'borrador borrado por el rechazo del servidor');
       await ds.query(`update public.generation_item_runs set status = 'retrying', finished_at = null, max_attempts = attempt_count + 5 where id = $1`, [afterR.id]);
-      eq(exR.claimPayload.examBank.bankValidationVersion, 3, 'el claim anuncia las reglas v3');
+      eq(exR.claimPayload.examBank.bankValidationVersion, 4, 'el claim anuncia las reglas v4 (#583: piso 2·slots)');
       // Fix round 1 (M4): al completar, el borrador sale de output_summary (se deja uno antes de completar).
       await readyAgain(examKey);
       const exS = await claim(['exam']);
