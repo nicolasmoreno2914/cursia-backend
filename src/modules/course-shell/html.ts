@@ -366,7 +366,10 @@ export function heroBand(h: Hx, cls: string, inner: (s: Surf) => string): string
     safe.push(['border', `1px solid ${c.border}`]);
   }
   safe.push(['margin', '0 0 24px 0'], ['padding', '24px']);
-  return `<div class="${cls} cvc-hero-${treatment}"${st(h, safe, [['border-radius', h.t.shape.radiusLg], ['padding', 'clamp(20px, 4vw, 44px)'], ['min-width', '0']])}>${inner(s)}</div>`;
+  // Fix round 1: en las familias de lámina (oscuras) el label ya trae su propio padding fluido; el hero usa uno menor
+  // para que la entrada (≤ 240 caracteres) quepa en 4 líneas a 1280 igual que en las claras.
+  const pad = h.t.personality.plate ? 'clamp(20px, 3vw, 28px)' : 'clamp(20px, 4vw, 44px)';
+  return `<div class="${cls} cvc-hero-${treatment}"${st(h, safe, [['border-radius', h.t.shape.radiusLg], ['padding', pad], ['min-width', '0']])}>${inner(s)}</div>`;
 }
 
 /** Fila de cifras (cada cifra sale de facts). CLEAN_SAFE: una lista abierta; ENHANCED: una fila con divisores finos. Sin tarjetas. */
@@ -408,29 +411,43 @@ export function wordCount(text: string): number {
   return String(text).trim().split(/\s+/).filter(Boolean).length;
 }
 
-/** Abreviaturas frecuentes: su punto no cierra la oración («Dr. Pérez», «EE. UU.»). */
-const ABBREV_BEFORE_DOT = /(?:^|[\s(«"“])(?:Dr|Dra|Sr|Sra|Srta|Ud|Uds|Lic|Ing|Prof|Profa|Arq|Mtro|Mtra|Av|Sto|Sta|núm|Núm|art|Art|pág|Pág|aprox|vs|EE|p\. ej|P\. ej)$/;
+/** Abreviaturas frecuentes: su punto no cierra la oración («Dr. Pérez», «EE. UU.»). Solo en modo `guard`. */
+const ABBREV_BEFORE_DOT = /(?:^|[\s(«"“])(?:Dr|Dra|Sr|Sra|Srta|Ud|Uds|Lic|Ing|Prof|Profa|Arq|Mtro|Mtra|Av|Sto|Sta|núm|Núm|art|Art|pág|Pág|aprox|vs|EE|UU|p\. ej|P\. ej)$/;
+
+export interface SentenceOpts {
+  /**
+   * false (default, presentación del módulo): EXACTAMENTE los cortes del regex de 3.12.0
+   * (`[.!?]+` seguido de espacio, sea cual sea lo que siga: minúscula, `**`, raya, emoji…), así
+   * su salida no cambia; la única diferencia es que ya no descarta texto (ver splitSentences).
+   * true (bienvenida, r19 W): además no corta tras una abreviatura ni dentro de un énfasis `*…*`
+   * abierto, corta en «…» y en una línea en blanco.
+   */
+  guard?: boolean;
+}
 
 /**
  * Oraciones de `text` SIN perder nada: la concatenación de las piezas es exactamente `text`.
- * Corte = puntuación final (.!?…) + cierre opcional (»”") + espacio, y la oración siguiente empieza
- * con mayúscula, ¿, ¡, comillas o dígito. No corta en decimales («1.5»), «N.º», abreviaturas ni dentro
- * de un `**énfasis**` abierto. (El regex anterior del módulo descartaba en silencio el texto antes de
- * un punto sin espacio, p. ej. «El valor 1.5 es…».)
+ * Corte = puntuación final + cierre opcional (»”"')]) + espacio. Un punto sin espacio detrás
+ * («1.5», «N.º», «web.com») no corta. El regex anterior del módulo
+ * (`/[^.!?]+[.!?]+(\s+|$)|[^.!?]+$/g`) DESCARTABA en silencio el texto previo a ese punto
+ * («El valor 1.5 es…» perdía «El valor 1.»); en todo texto que no perdía nada, los cortes son los
+ * mismos que los de aquel regex (modo por defecto).
  */
-export function splitSentences(text: string): string[] {
+export function splitSentences(text: string, opts: SentenceOpts = {}): string[] {
   const t = String(text);
   const out: string[] = [];
-  const re = /[.!?…]+[»”"')\]]*\s+/g;
+  const re = opts.guard ? /(?:[.!?…]+[»”"')\]]*\s+|\r?\n[ \t]*\r?\n\s*)/g : /[.!?]+[»”"')\]]*\s+/g;
   let start = 0;
   let m: RegExpExecArray | null;
   while ((m = re.exec(t))) {
     const end = m.index + m[0].length;
     if (end >= t.length) break;
-    if (!/^[\p{Lu}¿¡«“"(\d]/u.test(t.slice(end))) continue;
-    const head = t.slice(start, m.index);
-    if (m[0][0] === '.' && ABBREV_BEFORE_DOT.test(t.slice(0, m.index))) continue;
-    if ((head.match(/\*\*/g) || []).length % 2 === 1) continue;
+    if (opts.guard && /^[.!?…]/.test(m[0])) {
+      if (m[0][0] === '.' && ABBREV_BEFORE_DOT.test(t.slice(0, m.index))) continue;
+      const head = t.slice(0, m.index);
+      if ((head.match(/\*\*/g) || []).length % 2 === 1 || (head.replace(/\*\*/g, '').match(/\*/g) || []).length % 2 === 1) continue;
+    }
+    if (end === start) continue;
     out.push(t.slice(start, end));
     start = end;
   }
@@ -439,54 +456,72 @@ export function splitSentences(text: string): string[] {
 }
 
 /**
- * Entrada (banda) + resto: oraciones enteras desde el inicio mientras quepan en `maxChars`
- * (y en `maxWords`, si se pide). La primera oración entra siempre; `fits` dice si la entrada
- * respeta los topes (si no, el caller la muestra a tamaño de cuerpo). Lo usan la presentación
- * del módulo (240 caracteres) y la bienvenida del curso (240 caracteres / 40 palabras).
+ * Corta `s` en [cabeza, cola] con la cabeza lo más larga posible dentro de los topes: en el
+ * último límite de cláusula (`,` `;` `:` `—` `–`) que quepa; si no hay, en el último espacio.
+ * Sin elipsis ni texto agregado: cabeza + cola = s. `null` si ni una palabra cabe.
  */
-export function splitLeadRest(text: string, opts: { maxChars: number; maxWords?: number }): { lead: string; rest: string; fits: boolean } {
-  const sentences = splitSentences(text);
-  const ok = (s: string) => s.length <= opts.maxChars && (opts.maxWords === undefined || wordCount(s) <= opts.maxWords);
+export function cutToFit(s: string, maxChars: number, maxWords?: number): [string, string] | null {
+  const ok = (x: string) => x.trim().length > 0 && x.trim().length <= maxChars && (maxWords === undefined || wordCount(x) <= maxWords);
+  const ends = (re: RegExp) => [...s.matchAll(re)].map((m) => (m.index as number) + m[0].length).filter((at) => at < s.length);
+  for (const re of [/[,;:—–]\s+|\s+[—–]\s+/g, /\s+/g]) {
+    const cut = ends(re).filter((at) => ok(s.slice(0, at))).pop();
+    if (cut !== undefined) return [s.slice(0, cut), s.slice(cut)];
+  }
+  return null;
+}
+
+/**
+ * Entrada (banda) + resto: oraciones enteras desde el inicio mientras quepan en `maxChars`
+ * (y en `maxWords`, si se pide). La primera oración entra siempre, salvo con `cut`: si no cabe,
+ * se corta con cutToFit y lo que sobra abre el resto (bienvenida: ninguna forma de texto válida
+ * por el esquema produce una entrada fuera de tope). Con `guard` la entrada no cruza una línea en
+ * blanco. `fits` dice si la entrada respeta los topes. Lo usan la presentación del módulo
+ * (240 caracteres, modo 3.12.0) y la bienvenida (240 caracteres / 40 palabras, guard + cut).
+ */
+export function splitLeadRest(
+  text: string,
+  opts: { maxChars: number; maxWords?: number; guard?: boolean; cut?: boolean },
+): { lead: string; rest: string; fits: boolean } {
+  const sentences = splitSentences(text, { guard: opts.guard });
+  const ok = (s: string) => s.trim().length <= opts.maxChars && (opts.maxWords === undefined || wordCount(s) <= opts.maxWords);
+  const blankEnd = (s: string) => opts.guard === true && /\n[ \t]*\r?\n\s*$/.test(s);
   let lead = '';
   let k = 0;
-  while (k < sentences.length && (lead.length === 0 || ok(lead + sentences[k]))) lead += sentences[k++];
-  return { lead: lead.trim(), rest: sentences.slice(k).join('').trim(), fits: ok(lead.trim()) };
+  while (k < sentences.length && (lead.length === 0 || (!blankEnd(lead) && ok(lead + sentences[k])))) lead += sentences[k++];
+  let rest = sentences.slice(k).join('');
+  if (opts.cut && !ok(lead)) {
+    const c = cutToFit(lead, opts.maxChars, opts.maxWords);
+    if (c) {
+      lead = c[0];
+      rest = c[1] + rest;
+    }
+  }
+  return { lead: lead.trim(), rest: rest.trim(), fits: ok(lead.trim()) };
 }
 
 /**
  * Cuerpo en párrafos legibles: corta en límites de oración, cerca del reparto parejo
  * (≈ `target` palabras) y nunca por encima de `maxWords`; una línea en blanco del texto
- * fuerza un corte. Una oración sola más larga que `maxWords` se parte en la coma, punto y
- * coma o dos puntos más cercano al medio (o, si no hay, en el espacio del medio).
- * Determinista; la concatenación (normalizando espacios) es el texto original.
+ * fuerza un corte. Una oración sola más larga que `maxWords` se parte con cutToFit (cláusula,
+ * luego espacio) y sus trozos siguen el reparto normal. Determinista; la concatenación
+ * (normalizando espacios) es el texto original.
  */
 export function splitBodyParagraphs(text: string, opts: { maxWords: number; target: number }): string[] {
   const pieces: Array<{ s: string; brk: boolean }> = [];
-  const pushLong = (s: string, brk: boolean) => {
-    if (wordCount(s) <= opts.maxWords) {
-      pieces.push({ s, brk });
-      return;
-    }
-    const mid = s.length / 2;
-    let cut = -1;
-    for (const m of s.matchAll(/[,;:]\s+/g)) {
-      const at = (m.index as number) + m[0].length;
-      if (cut < 0 || Math.abs(at - mid) < Math.abs(cut - mid)) cut = at;
-    }
-    if (cut <= 0 || cut >= s.length) {
-      const sp = [...s.matchAll(/\s+/g)].map((m) => (m.index as number) + m[0].length);
-      cut = sp.reduce((best, at) => (Math.abs(at - mid) < Math.abs(best - mid) ? at : best), sp[0] ?? -1);
-    }
-    if (cut <= 0 || cut >= s.length) {
-      pieces.push({ s, brk });
-      return;
-    }
-    pushLong(s.slice(0, cut), brk);
-    pushLong(s.slice(cut), true);
-  };
   for (const block of String(text).split(/\r?\n[ \t]*\r?\n/)) {
     if (!block.trim()) continue;
-    splitSentences(block).forEach((s, i) => pushLong(s, i === 0 && pieces.length > 0));
+    splitSentences(block, { guard: true }).forEach((s0, i) => {
+      let s = s0;
+      let brk = i === 0 && pieces.length > 0;
+      while (wordCount(s) > opts.maxWords) {
+        const c = cutToFit(s, Infinity, opts.maxWords);
+        if (!c) break;
+        pieces.push({ s: c[0], brk });
+        s = c[1];
+        brk = false;
+      }
+      pieces.push({ s, brk });
+    });
   }
   const total = pieces.reduce((n, p) => n + wordCount(p.s), 0);
   const n = Math.max(1, Math.ceil(total / opts.target));
@@ -497,7 +532,7 @@ export function splitBodyParagraphs(text: string, opts: { maxWords: number; targ
   let done = 0;
   for (const p of pieces) {
     const w = wordCount(p.s);
-    // corte si: línea en blanco, se pasa del tope, o el punto medio de la oración cae después del siguiente reparto parejo
+    // corte si: línea en blanco, se pasa del tope, o el punto medio de la pieza cae después del siguiente reparto parejo
     if (curW > 0 && (p.brk || curW + w > opts.maxWords || done + w / 2 > per * (paras.length + 1))) {
       paras.push(cur.trim());
       cur = '';

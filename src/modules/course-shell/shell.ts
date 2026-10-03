@@ -146,12 +146,15 @@ export function welcomeLabel(
   //   filete → entrada (≤ 40 palabras / 240 caracteres, oraciones enteras) → resto a tamaño de cuerpo
   //   en párrafos de ≤ 70 palabras → fila de cifras. No se pierde ni se repite texto.
   const s = bgSurf(h);
-  const split = splitLeadRest(intro.welcome, { maxChars: WELCOME_LEAD_MAX_CHARS, maxWords: WELCOME_LEAD_MAX_WORDS });
+  // Fix round 1 (C1): `cut` — una primera oración fuera de tope se corta en la última cláusula (o palabra) que
+  // quepa y lo demás abre el cuerpo: TODA bienvenida válida por el esquema produce un label conforme (nunca falla el
+  // empaquetado por la forma del texto). `guard`: sin cortes en abreviaturas ni dentro de un énfasis.
+  const split = splitLeadRest(intro.welcome, { maxChars: WELCOME_LEAD_MAX_CHARS, maxWords: WELCOME_LEAD_MAX_WORDS, guard: true, cut: true });
   const hero = heroBand(h, 'cvc-welcome-band', (bs) =>
     eyebrow(h, `Curso · ${c.modules} ${plural(c.modules, 'módulo', 'módulos')} · ${c.chapters} ${plural(c.chapters, 'capítulo', 'capítulos')}`, bs, { sentence: true }) +
     heading(h, 'h4', facts.course.title, bs, { display: true }) +
     accentRule(h, bs) +
-    // Una primera oración que no cabe en la entrada va a tamaño de cuerpo (nunca un bloque largo a tamaño de entrada).
+    // Con `cut` la entrada siempre cabe; solo una palabra suelta de > 240 caracteres llega aquí sin caber → tamaño de cuerpo.
     (split.fits ? lead(h, split.lead, bs, { last: true, cls: 'cvc-lead' }) : paras(h, split.lead, bs, { last: true })),
   );
   const bodyParas = split.rest ? splitBodyParagraphs(split.rest, { maxWords: WELCOME_PARA_MAX_WORDS, target: WELCOME_PARA_TARGET_WORDS }) : [];

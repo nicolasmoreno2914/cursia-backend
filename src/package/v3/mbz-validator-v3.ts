@@ -872,8 +872,9 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     if (w) {
       const intro = w.intro;
       if (!/class="cvc-welcome-band cvc-hero-(?:band|rule|plate)"/.test(intro)) add('STRUCTURE', 'cv3:shell:welcome', 'la bienvenida no tiene la superficie del hero (cvc-welcome-band)');
-      const leadP = /<p class="cvc-lead"[^>]*>([\s\S]*?)<\/p>/.exec(intro);
-      if (leadP && wordCountText(extractText(leadP[1])) > WELCOME_LEAD_MAX_WORDS) add('STRUCTURE', 'cv3:shell:welcome', `la entrada de la bienvenida supera ${WELCOME_LEAD_MAX_WORDS} palabras`);
+      // Fix round 1 (M3): la entrada son TODOS los p.cvc-lead (el tope vale para el conjunto).
+      const leadWords = [...intro.matchAll(/<p class="cvc-lead"[^>]*>([\s\S]*?)<\/p>/g)].reduce((n, m) => n + wordCountText(extractText(m[1])), 0);
+      if (leadWords > WELCOME_LEAD_MAX_WORDS) add('STRUCTURE', 'cv3:shell:welcome', `la entrada de la bienvenida supera ${WELCOME_LEAD_MAX_WORDS} palabras`);
       for (const m of intro.matchAll(/<p\b[^>]*>([\s\S]*?)<\/p>/g)) {
         const n = wordCountText(extractText(m[1]));
         if (n > WELCOME_PARA_MAX_WORDS) add('STRUCTURE', 'cv3:shell:welcome', `párrafo de ${n} palabras en la bienvenida (máximo ${WELCOME_PARA_MAX_WORDS})`);
