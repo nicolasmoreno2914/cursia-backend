@@ -214,6 +214,17 @@ const SEVERITY: Readonly<Record<string, number>> = Object.freeze({ A: 0, B: 1, C
  * → provider_reconciliation_required). Cualquier otro A incierto queda para un humano.
  */
 export const AUTO_HEAL_LEDGER_GUARDED_CODES: readonly string[] = Object.freeze(['lease_expired', 'worker_draining']);
+/**
+ * r19 (#642): códigos B de un item de WORKER que la reapertura regenera solos (clase B, regenerate_targeted,
+ * regenMaxRounds). Solo las validaciones del GUION del audiolibro: el worker las marca con resultado CONOCIDO
+ * (cada llamada LLM medida y liquidada, nada en el aire) y el reintento reutiliza los guiones de bloque
+ * aceptados (audiobookSections) y los segmentos TTS pagados (audioSegments): solo se vuelve a pagar la llamada
+ * LLM del bloque que falló. Un TTS con resultado incierto sigue fuera (provider_reconciliation_required está en
+ * la deny-list; su único reenvío automático es el de #583), y el re-claim pasa por priorPaidBlock del worker.
+ */
+export const AUTO_REGEN_WORKER_CODES: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  audiobook_chapter: Object.freeze(['AUDIOBOOK_SECTION_PADDED', 'AUDIOBOOK_SECTION_TOO_SHORT', 'AUDIOBOOK_SCRIPT_REPETITION', 'AUDIOBOOK_SECTION_TRUNCATED']),
+});
 /** Estrategias B que la reapertura resuelve (regenerar el MISMO item); regenerate_dependency necesita otro item. */
 const AUTO_REGEN_STRATEGIES: readonly string[] = Object.freeze(['regenerate_targeted', 'regenerate_split']);
 
@@ -261,8 +272,12 @@ function classAwareDecision(row: AutoHealRow, now: Date, policy: AutoHealPolicy)
     return { heal: true, rule, round: rounds + 1, kind: 'A', strategy: v.strategy };
   }
   if (cls === 'B') {
-    // Solo componentes de la IA del navegador: regenerar un item de proveedor pagado (Gamma/TTS/video) sigue siendo humano.
-    if (row.type && AUTO_HEAL_WORKER_ITEM_TYPES.includes(row.type)) return { heal: false, reason: 'not_allow_listed' };
+    // Componentes de la IA del navegador; de los items de proveedor pagado (Gamma/TTS/video) solo las validaciones
+    // del GUION del audiolibro (AUTO_REGEN_WORKER_CODES): el resto sigue siendo humano.
+    if (row.type && AUTO_HEAL_WORKER_ITEM_TYPES.includes(row.type)
+      && !(v.class === 'B' && (AUTO_REGEN_WORKER_CODES[row.type] ?? []).includes(v.code))) {
+      return { heal: false, reason: 'not_allow_listed' };
+    }
     // Clase B registrada (errorCode del ejecutor que subió la severidad) sobre un mensaje A: regenerar el componente.
     const strategy = v.class === 'B' ? v.strategy : 'regenerate_targeted';
     if (!AUTO_REGEN_STRATEGIES.includes(strategy)) return { heal: false, reason: 'not_allow_listed' };

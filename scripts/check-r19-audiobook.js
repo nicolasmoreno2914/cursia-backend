@@ -19,6 +19,8 @@
 //   8. sin silencio artificial (el concat no inserta nada; voz ralentizada → rechazada);
 //   9. costo incierto → ningún reintento automático (y tras la decisión, solo lo que falta);
 //  10. re-empaque de un curso existente → 0 llamadas TTS / LLM.
+//  #642. bloque largo → UNA condensación; PADDED/TOO_SHORT/REPETITION/TRUNCATED → regeneración automática B
+//        (2 rondas) que reutiliza bloques aceptados y segmentos pagados.
 //
 // Usage: node scripts/check-r19-audiobook.js [path/to/dist]
 const fs = require('fs');
@@ -177,7 +179,7 @@ function memoryWorld() {
       let row = ledgerRows.find((r) => r.idempotency_key === key);
       if (row) return { inserted: false, event: row };
       row = { idempotency_key: key, attempt: input.attempt, provider: input.provider, external_operation_id: input.externalOperationId ?? null,
-        measurement_status: input.measurementStatus, reservation: !!(input.metadata && input.metadata.reservation), settled: false, itemRunId: input.itemRunId, usage: input.usage };
+        measurement_status: input.measurementStatus, callRole: input.callRole ?? null, reservation: !!(input.metadata && input.metadata.reservation), settled: false, itemRunId: input.itemRunId, usage: input.usage };
       ledgerRows.push(row);
       return { inserted: true, event: row };
     },
@@ -252,6 +254,7 @@ async function main() {
     await pureChecks();
     await workerChecks();
     await fixRound1Checks();
+    await condenseChecks();
     await packagingChecks();
     await finopsChecks();
   } finally {
@@ -840,6 +843,182 @@ async function fixRound1Checks() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
+// r19 (#642): bloque LARGO → UNA condensación acotada; PADDED/TOO_SHORT/REPETITION/TRUNCATED del guion del
+// audiolibro → regeneración automática (clase B, 2 rondas) sin repagar bloques aceptados ni segmentos pagados.
+/** Hace que la k-ésima llamada LLM (0 = la próxima) sea un guion principal al `ratio` de la fuente. */
+function paddedAt(ks, ratio) {
+  const st = FAKES.st;
+  const before = st.llm.length;
+  FAKES.plan.llmPaddedRatio = ratio;
+  Object.defineProperty(FAKES.plan, 'llmPadded', { configurable: true, get() { return ks.includes(st.llm.length - before) ? 1 : 0; }, set() {} });
+}
+function resetPadded() {
+  Object.defineProperty(FAKES.plan, 'llmPadded', { configurable: true, writable: true, value: 0 });
+  FAKES.plan.llmPaddedRatio = 0;
+  FAKES.plan.llmCondenseLong = 0;
+}
+async function condenseChecks() {
+  const AH = loadDist('modules/dynamic-generation/auto-heal.js');
+  const IT = loadDist('modules/dynamic-generation/item-transitions.js');
+  const RV = loadDist('modules/dynamic-generation/item-recovery-view.js');
+
+  await check('#642 guion: principal al 113 % → UNA condensación aceptada en la banda; principal+continuación > 110 % → condensación; condensación aún larga → AUDIOBOOK_SECTION_PADDED (reintentable); banda sin aflojar', async () => {
+    const p = AS.planAudiobookSections(chapterMd(21, 2800));
+    const s = p.sections[0];
+    const input = { courseTitle: 'C', chapterNumber: 21, chapterTitle: 'T', pais: 'Colombia', contentMarkdown: '' };
+    const src = s.text.split(/\s+/);
+    const w = (n) => Array.from({ length: n }, (_, i) => src[i % src.length]).join(' ');
+    const t = AS.sectionTargetWords(s.words);
+    eq([AUD.AUDIOBOOK_MIN_RATIO, AUD.AUDIOBOOK_MAX_RATIO], [0.85, 1.1], 'banda 85–110 % sin cambios');
+    eq([t.min, t.max], [Math.ceil(0.85 * s.words), Math.floor(1.1 * s.words)], 'banda del bloque');
+    let calls = [];
+    let condPrompt = null;
+    const r = await AS.generateSectionScript(input, s, p.sections.length, null, async (pr, role) => {
+      calls.push(role);
+      if (role === 'condense') { condPrompt = pr; return { text: w(t.target), messageId: 'mc' }; }
+      return { text: w(Math.round(s.words * 1.13)), messageId: 'mm' };
+    });
+    eq([calls, r.condensed, r.continued, r.messageIds, r.words], [['main', 'condense'], true, false, ['mm', 'mc'], t.target], 'condensación aceptada');
+    assert(r.ratio >= 0.85 && r.ratio <= 1.1, `ratio ${r.ratio}`);
+    assert(/CONDENSAR/.test(condPrompt.system) && !/CONTINUAR/.test(condPrompt.system), 'prompt de condensación (no de continuación)');
+    assert(condPrompt.user.includes(s.text) && condPrompt.user.includes(w(Math.round(s.words * 1.13))), 'fuente COMPLETA del bloque + narración a condensar');
+    assert(condPrompt.user.includes(`alrededor de ${t.target} palabras (entre ${t.min} y ${t.max})`), 'objetivo y banda');
+    assert(/No agregues información/.test(condPrompt.system) && /NO un resumen/.test(condPrompt.system) && /tuteo/.test(condPrompt.system), 'sin datos nuevos, conserva todo, reglas R14');
+    eq(condPrompt.maxTokens, Math.min(3000, Math.max(800, Math.ceil(t.target * 2) + 200)), 'max_tokens acotado al objetivo');
+
+    calls = [];
+    const r2 = await AS.generateSectionScript(input, s, 1, null, async (pr, role) => {
+      calls.push(role);
+      if (role === 'main') return { text: w(Math.round(t.target * 0.6)), messageId: 'm' };
+      if (role === 'continuation') return { text: w(Math.round(s.words * 0.7)), messageId: 'c' };
+      return { text: w(t.target), messageId: 'k' };
+    });
+    eq([calls, r2.continued, r2.condensed, r2.words], [['main', 'continuation', 'condense'], true, true, t.target], 'continuación que se pasa → condensación');
+
+    calls = [];
+    const e = await rejectsRe(AS.generateSectionScript(input, s, 1, null, async (pr, role) => {
+      calls.push(role);
+      return { text: w(role === 'condense' ? t.max + 1 : Math.round(s.words * 1.13)), messageId: role };
+    }), /^AUDIOBOOK_SECTION_PADDED: .*tras una condensación/, 'condensación aún larga');
+    eq([e.retryable, calls], [true, ['main', 'condense']], 'reintentable y UNA sola condensación');
+    await rejectsRe(AS.generateSectionScript(input, s, 1, null, async (pr, role) => ({ text: w(role === 'condense' ? t.target : t.max + 5), messageId: role, truncated: role === 'condense' })),
+      /^AUDIOBOOK_SECTION_TRUNCATED: la condensación/, 'condensación cortada por max_tokens → nunca se acepta');
+  });
+
+  await check('#642 worker: un bloque sale al 113 % → condensación medida (cargo validation_retry por msg_…) y el capítulo completa; 1 llamada LLM extra, 0 TTS extra', async () => {
+    const W = memoryWorld();
+    const md = chapterMd(22, 1500);
+    const n = AS.planAudiobookSections(md).sections.length;
+    const c0 = counts();
+    paddedAt([1], 1.13); // bloque 2
+    const it = await claim(W, newItem(W, { ch: 22, md }));
+    resetPadded();
+    eq([it.status, it.error ?? null], ['completed', null], 'completo');
+    const d = delta(c0);
+    eq(d.llm, n + 1, 'una condensación');
+    const sec = it.outputSummary.audiobookSections['1'];
+    eq([sec.condensed, sec.messageIds.length], [true, 2], 'bloque 2 condensado (principal + condensación)');
+    assert(sec.ratio >= 0.85 && sec.ratio <= 1.1, `ratio ${sec.ratio}`);
+    const condId = sec.messageIds[1];
+    const charge = W.ledgerRows.find((r) => !r.reservation && r.external_operation_id === condId);
+    assert(charge, `cargo medido de la condensación (${condId})`);
+    eq([charge.provider, charge.callRole, charge.measurement_status], ['anthropic', 'validation_retry', charge.measurement_status], 'condensación medida como validation_retry');
+    eq(W.ledgerRows.filter((r) => r.reservation && !r.settled).length, 0, 'ninguna reserva sin liquidar');
+    eq(d.tts, it.outputSummary.audiobookManifest.tts.segments.length, 'cada segmento se sintetiza una vez');
+  });
+
+  await check('#642 real: bloque 6 largo y la condensación también en 3/3 intentos → FAILED con PADDED; la recuperación es clase B automática (regenerate_targeted, 2 rondas), no manual; el reintento del FAILED reutiliza los 5 bloques aceptados y paga SOLO el bloque 6 en adelante; segmentos nunca recomprados', async () => {
+    const W = memoryWorld();
+    const md = chapterMd(23, 2800);
+    const n = AS.planAudiobookSections(md).sections.length;
+    assert(n >= 7, `capítulo con ≥ 7 bloques (${n})`);
+    const it = newItem(W, { ch: 23, md });
+    const c0 = counts();
+    paddedAt([5], 1.13); FAKES.plan.llmCondenseLong = 1;
+    await claim(W, it);
+    eq(it.status, 'retrying', `intento 1 (${it.error})`);
+    assert(/^AUDIOBOOK_SECTION_PADDED: el guion del bloque 6 /.test(it.error), it.error);
+    eq(Object.keys(it.outputSummary.audiobookSections).sort(), ['0', '1', '2', '3', '4'], 'bloques 1–5 guardados');
+    eq(delta(c0), { tts: 0, llm: 7 }, '5 bloques + principal y condensación del 6');
+    const kept = JSON.stringify(it.outputSummary.audiobookSections);
+    for (const a of [2, 3]) {
+      const c = counts();
+      paddedAt([0], 1.13); FAKES.plan.llmCondenseLong = 1;
+      await claim(W, nextAttempt(it));
+      eq(delta(c), { tts: 0, llm: 2 }, `intento ${a}: solo el bloque 6 (principal + condensación)`);
+      assert(/^AUDIOBOOK_SECTION_PADDED: el guion del bloque 6 /.test(it.error), it.error);
+    }
+    resetPadded();
+    eq(JSON.stringify(it.outputSummary.audiobookSections), kept, 'los bloques aceptados no cambian');
+    it.status = 'failed'; // el scheduler: 3/3 intentos agotados
+    const fin = it.error;
+
+    // Recuperación: clase B automática, no manual.
+    const v = FC.classifyFailure({ source: 'provider_worker', itemType: 'audiobook_chapter', error: fin, outputSummary: it.outputSummary });
+    eq([v.class, v.code, v.strategy, v.targetRounds], ['B', 'AUDIOBOOK_SECTION_PADDED', 'regenerate_targeted', 2], 'veredicto');
+    eq(FC.currentRecoveryOf(fin, 'audiobook_chapter', it.outputSummary, 'B'), 'auto_regenerate', 'currentRecovery');
+    eq(IT.maxAutomaticRoundsToday(fin, 'audiobook_chapter', it.outputSummary, 'B'), 2, 'maxRounds');
+    const failedAt = new Date(Date.now() - 10 * 60_000);
+    const row = { id: it.itemRunId, status: 'failed', type: 'audiobook_chapter', error: fin, output_summary: it.outputSummary, finished_at: failedAt };
+    const view = RV.recoveryViewOf(row);
+    eq([view.class, view.currentRecovery, view.maxRounds, view.attentionReason], ['B', 'auto_regenerate', 2, null], 'vista derivada');
+    const d1 = AH.autoHealDecision(row, new Date());
+    eq([d1.heal, d1.kind, d1.strategy, d1.round], [true, 'B', 'regenerate_targeted', 1], 'el barrido lo reabre (ronda 1/2)');
+    eq(AH.autoHealDecision({ ...row, output_summary: { ...it.outputSummary, autoHeal: { regenRounds: 2 } } }, new Date()).reason, 'cap_reached', 'tope de 2 rondas → humano');
+    for (const c of ['AUDIOBOOK_SECTION_TOO_SHORT', 'AUDIOBOOK_SCRIPT_REPETITION', 'AUDIOBOOK_SECTION_TRUNCATED']) {
+      eq(FC.currentRecoveryOf(`${c}: x`, 'audiobook_chapter', {}), 'auto_regenerate', c);
+    }
+
+    // Reintento del FAILED (lo que hace retryItem: mismo item_run, output_summary conservado).
+    const c4 = counts();
+    const failsBefore = it.fails.length;
+    await claim(W, nextAttempt(it, { previousErrors: [{ error: fin, attemptCount: it.attempt }] }));
+    eq([it.status, it.fails.length], ['completed', failsBefore], 'completa tras el reintento (sin fallas nuevas)');
+    const d4 = delta(c4);
+    eq(d4.llm, n - 5, 'solo el bloque 6 y los siguientes (los 5 aceptados se reutilizan)');
+    const segs = it.outputSummary.audiobookManifest.tts.segments.length;
+    eq(d4.tts, segs, 'segmentos: cada uno una vez');
+    eq(delta(c0).tts, segs, 'en todo el item, ningún segmento se recompró');
+    for (const k of ['0', '1', '2', '3', '4']) eq(it.outputSummary.audiobookSections[k], JSON.parse(kept)[k], `bloque ${Number(k) + 1} reutilizado`);
+  });
+
+  await check('#642: con segmentos ya pagados (TTS falla en el 3) el reintento B no recompra ninguno; el resto de la política no cambia (TTS incierto, validaciones del audio, Gamma)', async () => {
+    const W = memoryWorld();
+    const md = chapterMd(24, 1500);
+    const it = newItem(W, { ch: 24, md });
+    const c0 = counts();
+    paddedAt([2], 1.13); FAKES.plan.llmCondenseLong = 1;
+    await claim(W, it);
+    resetPadded();
+    assert(/^AUDIOBOOK_SECTION_PADDED/.test(it.error), it.error);
+    // Intento 2: guiones completos (solo el bloque 3), segmentos 1–2 pagados y el 3 rechazado (429).
+    FAKES.plan.ttsFail.push(undefined, undefined, 429);
+    const c1 = counts();
+    await claim(W, nextAttempt(it));
+    FAKES.plan.ttsFail.length = 0;
+    assert(/^tts_failed: chunk 3\/\d+ \(persisted 2\)/.test(it.error), it.error);
+    eq(Object.keys(it.outputSummary.audioSegments).length, 2, '2 segmentos pagados y guardados');
+    const llmScripts = delta(c1).llm;
+    // Intento 3 (otra validación B del guion sobre un item con segmentos pagados): 0 LLM, solo los segmentos que faltan.
+    const c2 = counts();
+    await claim(W, nextAttempt(it));
+    eq(it.status, 'completed', `completa (${it.error})`);
+    const segs = it.outputSummary.audiobookManifest.tts.segments.length;
+    eq(delta(c2), { tts: segs - 2, llm: 0 }, 'reutiliza los 2 segmentos pagados y todos los guiones');
+    eq(delta(c0).tts - 1, segs, 'cada segmento se pagó una vez (más el 429 sin cobro)');
+    assert(llmScripts >= 1, 'el intento 2 pagó solo los bloques que faltaban');
+
+    const v = (e, type = 'audiobook_chapter', os = {}) => FC.currentRecoveryOf(e, type, os);
+    assert(v('provider_reconciliation_required: openai audio.speech req_x sin resultado conocido') !== 'auto_regenerate', 'TTS incierto nunca se regenera solo');
+    eq(AH.autoHealDecision({ status: 'failed', type: 'audiobook_chapter', error: 'provider_reconciliation_required: openai x', output_summary: {} }, new Date()).heal, false, 'TTS incierto: el barrido no lo reabre');
+    for (const c of ['AUDIO_WPM_OUT_OF_RANGE', 'AUDIOBOOK_SEGMENT_DUPLICATE', 'AUDIOBOOK_MANIFEST_INVALID', 'AUDIOBOOK_CHAPTER_UNDER_TARGET']) eq(v(`${c}: x`), 'manual', `${c} sigue manual`);
+    eq(v('PRESENTATION_CARD_SLIDE_COUNT: x', 'presentation'), 'manual', 'Gamma sigue manual');
+    eq(v('AUDIOBOOK_SECTION_PADDED: x', 'audio_welcome'), 'manual', 'solo audiobook_chapter');
+    eq(v('AUDIOBOOK_PLAN_COVERAGE: x'), 'manual', 'bug del plan (D) sigue humano');
+  });
+}
+
 async function packagingChecks() {
   await check('10. re-empaque de un curso existente (audio sin manifiesto) → el paquete se arma, 0 llamadas TTS / LLM, el piso se omite con aviso', async () => {
     const c0 = counts();
