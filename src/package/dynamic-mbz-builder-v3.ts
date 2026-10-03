@@ -300,7 +300,7 @@ export interface BuildDynamicMbzV3Input {
    * r19 (L3): marca del Libro Guía en PDF — logo candidato de la cuenta (sin validar: el builder lo valida y cae al logo de
    * Cursia con aviso) y nombre de la institución para la portada y el pie. Ausente → logo de Cursia, sin nombre.
    */
-  libroBrand?: { logo?: LibroLogoCandidate | null; name?: string | null } | null;
+  libroBrand?: { logo?: LibroLogoCandidate | ReadonlyArray<LibroLogoCandidate> | null; name?: string | null } | null;
 }
 
 /** EV6 DoD: sufijo del nombre del curso de un paquete de QA. */

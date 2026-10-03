@@ -369,7 +369,24 @@ export function validateLogoBytes(bytes: Buffer, declaredMime: string): LogoVali
 const resolveCache = new Map<string, ResolvedLibroLogo>();
 const RESOLVE_CACHE_MAX = 32;
 
-export function resolveLibroLogo(candidate: LibroLogoCandidate | null | undefined): ResolvedLibroLogo {
+/**
+ * Fix round 3: candidatos EN ORDEN (brand_profile, luego user_settings). Gana el primero que valida (incluido el embebido
+ * de prueba en pdfkit); Cursia solo si todos fallan. Cada candidato rechazado deja `libro_logo_invalid:<origen>:<motivo>`
+ * (p.ej. un SVG viejo del brand profile ya no tapa un PNG válido de user_settings). Un candidato vacío se salta sin aviso.
+ */
+export function resolveLibroLogo(candidates: LibroLogoCandidate | ReadonlyArray<LibroLogoCandidate | null | undefined> | null | undefined): ResolvedLibroLogo {
+  const list = (Array.isArray(candidates) ? candidates : [candidates]) as Array<LibroLogoCandidate | null | undefined>;
+  const rejected: string[] = [];
+  for (const c of list) {
+    if (!c || c.dataUri == null || String(c.dataUri).trim() === '') continue;
+    const r = resolveOneLibroLogo(c);
+    if (r.source !== 'cursia_default') return { ...r, warnings: [...rejected, ...r.warnings] };
+    rejected.push(...r.warnings);
+  }
+  return { ...cursiaDefaultLogo(), warnings: rejected };
+}
+
+function resolveOneLibroLogo(candidate: LibroLogoCandidate | null | undefined): ResolvedLibroLogo {
   if (!candidate || candidate.dataUri == null || String(candidate.dataUri).trim() === '') return cursiaDefaultLogo();
   // fix round 1 (M4): prepare (cada chequeo de frescura) y el builder resuelven el mismo logo → caché por hash de la entrada.
   const key = `${candidate.source}|${createHash('sha256').update(String(candidate.dataUri)).digest('hex')}`;

@@ -421,8 +421,10 @@ export function packageReuseHashV3(k: PackageReuseKeyV3Input): string {
 // ─── Marca del Libro Guía (r19 L3) ─────────────────────────────────────────
 
 export interface LibroBrandV3 {
-  /** Logo candidato de la cuenta (sin validar; el builder lo valida y cae a Cursia con aviso). */
+  /** Primer logo candidato de la cuenta (compatibilidad; = candidates[0] ?? null). */
   logo: LibroLogoCandidate | null;
+  /** Fix round 3: candidatos EN ORDEN [brand_profile, user_settings], sin validar; gana el primero que valida. */
+  candidates: LibroLogoCandidate[];
   /** Nombre de la institución del curso (portada y pie del PDF), si hay. */
   name: string | null;
   /** Avisos de la búsqueda (p.ej. una tabla ausente o un logo solo como artifact). */
@@ -455,11 +457,11 @@ export async function loadLibroBrandV3(q: QueryExecutor, courseId: number, owner
       [],
     );
   } catch (err) {
-    return { logo: null, name: null, warnings: [`libro_logo_source_unavailable:courses:${why(err)}`] };
+    return { logo: null, candidates: [], name: null, warnings: [`libro_logo_source_unavailable:courses:${why(err)}`] };
   }
   const owner = (course?.owner_id ?? ownerId ?? null) as string | null;
   let name: string | null = null;
-  let logo: LibroLogoCandidate | null = null;
+  const candidates: LibroLogoCandidate[] = [];
   if (course?.institution_id) {
     if (!reg?.inst) warnings.push('libro_logo_source_unavailable:institutions');
     else {
@@ -477,30 +479,32 @@ export async function loadLibroBrandV3(q: QueryExecutor, courseId: number, owner
           `select palette->>'logoUrl' as logo_url, logo_artifact_id from public.brand_profiles where institution_id::text = $1 and status = 'active' order by version desc limit 1`,
           [String(course.institution_id)],
         );
-        if (typeof bp?.logo_url === 'string' && bp.logo_url.trim()) logo = { source: 'brand_profile', dataUri: bp.logo_url };
+        if (typeof bp?.logo_url === 'string' && bp.logo_url.trim()) candidates.push({ source: 'brand_profile', dataUri: bp.logo_url });
         else if (bp?.logo_artifact_id) warnings.push('libro_logo_artifact_unsupported:brand_profile');
       } catch (err) {
         warnings.push(`libro_logo_source_unavailable:brand_profiles:${why(err)}`);
       }
     }
   }
-  if (!logo && owner) {
+  // fix round 3: user_settings se lee SIEMPRE (no solo sin brand profile): es el respaldo si el logo de la marca no valida.
+  if (owner) {
     if (!reg?.us) warnings.push('libro_logo_source_unavailable:user_settings');
     else {
       try {
         const [us] = await q.query(`select logo_b64 from public.user_settings where user_id::text = $1`, [String(owner)]);
-        if (typeof us?.logo_b64 === 'string' && us.logo_b64.trim()) logo = { source: 'user_settings', dataUri: us.logo_b64 };
+        if (typeof us?.logo_b64 === 'string' && us.logo_b64.trim()) candidates.push({ source: 'user_settings', dataUri: us.logo_b64 });
       } catch (err) {
         warnings.push(`libro_logo_source_unavailable:user_settings:${why(err)}`);
       }
     }
   }
-  return { logo, name, warnings };
+  return { logo: candidates[0] ?? null, candidates, name, warnings };
 }
 
 /** Hash de la marca del Libro Guía tal como la verá el builder (logo YA resuelto + nombre) y sus avisos. */
-export function libroBrandFingerprintV3(brand: Pick<LibroBrandV3, 'logo' | 'name'>): { sha256: string; warnings: string[]; logoSource: string } {
-  const logo = resolveLibroLogo(brand.logo);
+export function libroBrandFingerprintV3(brand: Pick<LibroBrandV3, 'logo' | 'name'> & { candidates?: LibroLogoCandidate[] }): { sha256: string; warnings: string[]; logoSource: string } {
+  // fix round 3: hash de los bytes del logo RESUELTO (el primer candidato válido), igual que antes.
+  const logo = resolveLibroLogo(brand.candidates ?? brand.logo);
   const sha256 = createHash('sha256').update(`${logo.sha256}|${brand.name ?? ''}`, 'utf8').digest('hex');
   return { sha256, warnings: logo.warnings, logoSource: logo.source };
 }

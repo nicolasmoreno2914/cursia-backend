@@ -561,7 +561,8 @@ export async function processV3PackageJob(
     moodleVersion: moodleRequested,
     pendingVideoChapterIds,
     // r19 (L3): logo de la cuenta (o ninguno → Cursia) y nombre de la institución para el Libro Guía en PDF.
-    libroBrand: { logo: prepared.libroBrand?.logo ?? null, name: prepared.libroBrand?.name ?? null },
+    // fix round 3: candidatos en orden (brand_profile → user_settings); el builder usa el primero que valida.
+    libroBrand: { logo: prepared.libroBrand?.candidates ?? prepared.libroBrand?.logo ?? null, name: prepared.libroBrand?.name ?? null },
     // EV6 DoD: paquete QA → aviso visible en la bienvenida + nombre del curso «[QA — vista previa, no entregable]».
     ...(qa ? { qaPreviewNotice: true } : {}),
   });
