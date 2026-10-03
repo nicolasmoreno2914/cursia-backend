@@ -186,8 +186,10 @@ const DYNAMIC_EMITTERS = {
   // Portada de Gamma: CoverError.code (pdf-cover.ts) o el default.
   'workers/provider-real/real-providers.ts#`${code}:${errinstanceofError?err.message:String(err)}`': ['GAMMA_COVER_RENDER_FAILED', 'GAMMA_COVER_RASTERIZER_UNAVAILABLE'],
   // AudioScriptError.message = `${code}: …` (audio-scripts.ts) o el default.
-  'workers/provider-real/real-providers.ts#errinstanceofAudioScriptError?err.message:`AUDIO_WELCOME_TEXT_MISSING:course_intronoesJSON(${errinstanceofError?err.message:String(err)})`': ['AUDIO_WELCOME_TEXT_MISSING', 'AUDIOBOOK_CONTENT_EMPTY', 'AUDIOBOOK_SCRIPT_TOO_SHORT'],
-  'workers/provider-real/real-providers.ts#err.message': ['AUDIO_WELCOME_TEXT_MISSING', 'AUDIOBOOK_CONTENT_EMPTY', 'AUDIOBOOK_SCRIPT_TOO_SHORT'],
+  'workers/provider-real/real-providers.ts#errinstanceofAudioScriptError?err.message:`AUDIO_WELCOME_TEXT_MISSING:course_intronoesJSON(${errinstanceofError?err.message:String(err)})`': ['AUDIO_WELCOME_TEXT_MISSING'],
+  // r19: plan de bloques del audiolibro (planAudiobookSections) y guion por bloque (generateSectionScript).
+  'workers/provider-real/real-providers.ts#errinstanceofAudioScriptError?err.message:`AUDIOBOOK_PLAN_COVERAGE:${errinstanceofError?err.message:String(err)}`': ['AUDIOBOOK_PLAN_COVERAGE'],
+  'workers/provider-real/real-providers.ts#err.message': ['AUDIO_WELCOME_TEXT_MISSING', 'AUDIOBOOK_CONTENT_EMPTY', 'AUDIOBOOK_PLAN_COVERAGE', 'AUDIOBOOK_SECTION_TOO_SHORT', 'AUDIOBOOK_SECTION_PADDED'],
   // blockYoutubeDelivery(state: 'blocked_auth' | 'blocked_quota'): quota sale antes por blockYoutubeQuota.
   'workers/dynamic-item-worker.ts#`youtube_${state}:${detail}`': ['youtube_blocked_auth'],
   // fail() del worker de proveedores reenvía el mensaje de SUS callers (que se escanean uno por uno).

@@ -144,7 +144,7 @@ export interface ProviderWorkerDeps {
   dataSource: Pick<DataSource, 'query'>;
   /** Modo real (F2) usa además uploadBufferArtifact / putStorageObject / getDownloadUrl. */
   artifacts: Pick<ArtifactsService, 'uploadJsonArtifact'> &
-    Partial<Pick<ArtifactsService, 'uploadBufferArtifact' | 'putStorageObject' | 'getDownloadUrl'>>;
+    Partial<Pick<ArtifactsService, 'uploadBufferArtifact' | 'putStorageObject' | 'getDownloadUrl' | 'downloadStorageObject'>>;
   logger: Pick<Logger, 'log' | 'warn' | 'error'>;
   executorId: string;
   leaseSeconds: number;

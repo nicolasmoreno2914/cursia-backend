@@ -229,10 +229,14 @@ const PROVIDER_CALL_RULES: Readonly<Record<string, FailureProvider | null>> = Ob
 /** Ids de reglas a las que se aplica el chequeo de configuración del proveedor (check). */
 export const PROVIDER_CALL_RULE_IDS: readonly string[] = Object.freeze(Object.keys(PROVIDER_CALL_RULES));
 
-/** N5: trozos de TTS ya pagados antes del que falló («chunk N/M» → N-1). */
+/**
+ * N5: trozos de TTS ya pagados SIN guardar antes del que falló («chunk N/M» → N-1). r19: el audiolibro
+ * guarda cada segmento apenas se paga y lo anota («chunk N/M (persisted J)» → N-1-J): con todos los
+ * anteriores guardados el reintento solo sintetiza lo que falta (A, sin riesgo de pagar dos veces).
+ */
 function ttsPaidChunks(error: string): number {
-  const m = /chunk (\d+)\/(\d+)/.exec(error);
-  return m ? Math.max(0, Number(m[1]) - 1) : 0;
+  const m = /chunk (\d+)\/(\d+)(?: \(persisted (\d+)\))?/.exec(error);
+  return m ? Math.max(0, Number(m[1]) - 1 - (m[3] ? Number(m[3]) : 0)) : 0;
 }
 
 /** N3: proveedor por el código mismo (prefijos videogen, gamma o GAMMA, openai_tts, youtube). */
@@ -270,7 +274,7 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   { id: 'unknown_error', codes: ['unknown_error'], class: 'A', strategy: 'retry_backoff', rounds: 1 },
   {
     id: 'download_failed',
-    codes: ['download_failed', 'text_fetch_failed', 'download_url_failed', 'sign_failed', 'storage_unavailable'],
+    codes: ['download_failed', 'text_fetch_failed', 'download_url_failed', 'sign_failed', 'storage_unavailable', 'audio_segment_unavailable'],
     family: /^[a-z0-9_]+_download_failed$/,
     class: 'A', strategy: 'retry_backoff', provider: 'storage', rounds: 3,
   },
@@ -319,7 +323,9 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   {
     id: 'validation_invalid',
     codes: ['validation_invalid', 'content_empty', 'gift_invalid', 'llm_output_invalid', 'scorm_invalid', 'concept_plan_invalid',
-      'CONTENT_TRUTH', 'CONTENT_TRUTH_RETRY_INVALID', 'EXAM_NEUROMYTH', 'AUDIOBOOK_SCRIPT_TOO_SHORT'],
+      'CONTENT_TRUTH', 'CONTENT_TRUTH_RETRY_INVALID', 'EXAM_NEUROMYTH', 'AUDIOBOOK_SCRIPT_TOO_SHORT',
+      // r19: guion por bloque fuera de la banda 85–110 % o con repetición → se regeneran SOLO esos bloques.
+      'AUDIOBOOK_SECTION_TOO_SHORT', 'AUDIOBOOK_SECTION_PADDED', 'AUDIOBOOK_SCRIPT_REPETITION'],
     family: /^(GIFT|BS|TEXT|DIAGRAM)_[A-Z0-9_]+$/,
     class: 'B', strategy: 'regenerate_targeted', rounds: 2,
   },
@@ -363,7 +369,9 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   },
   {
     id: 'audio_invalid',
-    codes: ['TTS_AUDIO_INVALID', 'AUDIOBOOK_PART_MISSING', 'MP3_INVALID', 'MP3_INCOMPATIBLE_PARTS', 'AUDIO_DURATION'],
+    codes: ['TTS_AUDIO_INVALID', 'AUDIOBOOK_PART_MISSING', 'MP3_INVALID', 'MP3_INCOMPATIBLE_PARTS', 'AUDIO_DURATION',
+      // r19: segmento con ritmo fuera de banda (ralentizado/relleno/bucle), audio duplicado o manifiesto inconsistente.
+      'AUDIO_WPM_OUT_OF_RANGE', 'AUDIOBOOK_SEGMENT_DUPLICATE', 'AUDIOBOOK_MANIFEST_INVALID'],
     family: /^MP3_[A-Z0-9_]+$/,
     class: 'B', strategy: 'regenerate_targeted', paidRisk: 'measured', provider: 'openai', rounds: 2,
   },
@@ -381,7 +389,7 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
       'claim_contract', 'VIDEO_PLAN_MISMATCH', 'VIDEO_REFLECTION_PLAN_MISMATCH', 'ACTIVITY_TYPE_NOT_IN_MANIFEST', 'unsupported_item_type',
       'unsupported_rules_version', 'rules_version_mismatch', 'claim_payload_unavailable', 'video_duration_unmeasurable',
       'missing_artifact_id', 'artifact_download_unavailable', 'unsupported_download_method', 'provider_worker_wrong_type',
-      'missing_required_artifacts', 'ACTIVITY_TYPE_MISMATCH'],
+      'missing_required_artifacts', 'ACTIVITY_TYPE_MISMATCH', 'AUDIOBOOK_PLAN_COVERAGE'],
     family: /^(missing|ambiguous)_[a-z0-9_]+_artifact$/,
     class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'product_bug', adminAction: 'regenerate_item',
   },
@@ -492,7 +500,9 @@ const PACKAGE_RULES: readonly Rule[] = Object.freeze([
       'SECTION_LAYOUT_INVALID', 'COURSE_BADGE_INVALID', 'SYNTHETIC_MEDIA_INVALID', 'TOKEN_INVALID', 'VC_INVALID', 'VC_RENDER',
       'CURSIA_IV_INLINE_SCRIPT_PKG', 'H5P_NOT_GRADABLE_IN_MOODLE', 'ACTIVITY_INTRO_THEME', 'GAMMA_THEME_CONFIG', 'FACTS_INVALID',
       'VIDEO_PACKAGE_FILENAME_INVALID', 'ACTIVITY_PACKAGE_FILENAME_INVALID', 'V3_VALIDATION_CONTEXT', 'PNG_ENCODE', 'PNG_UNSUPPORTED',
-      'PACKAGE_BUILDER_ERROR'],
+      'PACKAGE_BUILDER_ERROR',
+      // r19: los capítulos pasaron su validación pero el total queda bajo el piso de 25 min → un humano mira el diagnóstico.
+      'AUDIOBOOK_TOO_SHORT_FOR_SOURCE'],
     family: /^(MBZ_V3_[A-Z0-9_]+|ASSESSMENT_[A-Z0-9_]+|WEIGHTS_[A-Z0-9_]+|THEME_[A-Z0-9_]+|H5P_PROFILE_[A-Z0-9_]+|H5P_PACK_[A-Z0-9_]+|H5P_L10N_[A-Z0-9_]+|H5P_PREFLIGHT_[A-Z0-9_]+|H5P_STORE_[A-Z0-9_]+|H5P_UUID_[A-Z0-9_]+|H5P_SUBCONTENT_[A-Z0-9_]+|MOCK_[A-Z0-9_]+|ACTIVITY_TYPE_INVALID_[A-Z0-9_]+)$/,
     class: 'D', strategy: 'hold_for_human', scope: 'package', rounds: 0, humanReason: 'product_bug', adminAction: 'retry_package',
   },
