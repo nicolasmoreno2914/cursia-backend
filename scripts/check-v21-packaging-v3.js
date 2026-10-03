@@ -332,7 +332,8 @@ const MATRIX = [
     for (let p = 1; p <= d.numPages; p++) {
       const pg = await d.getPage(p);
       const ol = await pg.getOperatorList();
-      eq(ol.fnArray.filter((fn) => fn === pdfjs.OPS.paintImageXObject).length, 1, `página ${p}: una marca de agua`);
+      // r19 fix 1 (i): marca de agua en toda página + logo a opacidad plena solo en la portada (detalle en check-r19-libro-pdf).
+      eq(ol.fnArray.filter((fn) => fn === pdfjs.OPS.paintImageXObject).length, p === 1 ? 2 : 1, `página ${p}: marca de agua (+ logo de portada en la 1)`);
       text += (await pg.getTextContent()).items.map((i) => i.str).join(' ') + '\n';
     }
     eq(d.numPages, r.summary.libro.pageCount, 'páginas');
@@ -1019,7 +1020,8 @@ const MATRIX = [
       if (/course_profiles/.test(sql)) return [];
       if (/from public\.courses where id/.test(sql)) return [{ metadata: {} }];
       if (/production_jobs/.test(sql)) return [{ id: 'r', owner_id: 'o', execution_mode: 'dynamic_generation', worker_status: 'completed', status: 'completed', input_payload: {} }];
-      if (/to_regclass/.test(sql)) return [{ bp: false, us: false, inst: false }]; // r19 L3: sin tablas de marca → Cursia
+      if (/to_regclass/.test(sql)) return [{ bp: true, us: true, inst: true }]; // r19 L3: fuentes presentes, sin logo → Cursia sin aviso
+      if (/from public\.user_settings/.test(sql)) return [];
       throw new Error(sql);
     } };
     const prep = await PK.prepareV3Package(q, 'r', { id: 1, sha256: 's', manifest }, 641, '4.1');
@@ -1344,7 +1346,8 @@ async function workerChecks() {
         if (/generation_item_runs/.test(sql)) return rowsFor;
         if (/from public\.production_jobs where id = \$1/.test(sql)) return [runRow];
         // r19 (L3): marca del Libro Guía — sin tablas de marca en el fake → logo de Cursia, sin avisos.
-        if (/to_regclass/.test(sql)) return [{ bp: false, us: false, inst: false }];
+        if (/to_regclass/.test(sql)) return [{ bp: true, us: true, inst: true }]; // r19 L3: fuentes presentes, sin logo → Cursia sin aviso
+      if (/from public\.user_settings/.test(sql)) return [];
         throw new Error(`SQL no esperado en el fake: ${sql.slice(0, 80)}`);
       },
     };

@@ -82,17 +82,18 @@ const GOLDEN = {
   // audiolibro.mp3, portadas a 1600 px (antes 640) y sin botón «Iniciar actividad» hacia la H5P embebida.
   // Dorados anteriores (3.11.0): h5p-final-light 03bb4e8b…, scorm-nofinal-dark 9500797e…, h5p-nofinal-dark-mock-cleansafe
   // 5329675d…, scorm-final-light 948e402d…, h5p-ev5c-rules1 4a1532f2….
+  // r19 L fix round 1: logo de la portada a opacidad plena, /Keywords del PDF (sha del plan) y transliteración — vuelve a mover solo el blob del Libro.
   // r19 L (builder 3.12.0 → 3.13.0) cambia el .mbz a propósito, y SOLO en el Libro Guía (diff semántico de entradas del zip contra
   // 77eeb18, scratchpad/r19/impl-l-probe/golddiff.js): el blob libro_guia_completo.html → PDF libro_guia_<slug>.pdf (files.xml:
   // hash, nombre, tamaño, mimetype) y la descripción del recurso (resource.xml) con el botón «Abrir Libro Guía →» y «documento PDF».
   // Dorados anteriores (3.12.0): h5p-final-light 5e9bf0f0…, scorm-nofinal-dark b967577f…, h5p-nofinal-dark-mock-cleansafe
   // 14d45c9d…, scorm-final-light 6c18bcce…, h5p-ev5c-rules1 3c6d123e….
   mbz: {
-    'h5p-final-light': 'd4cdc6efa42821e035fbd5e7a829508359bcce3bafedfbd4a4acb2ff9dbf1d74',
-    'scorm-nofinal-dark': 'aac75a863969a35c9a2f2f4c081bd08d20f04f031f52731792d07925d4e7b699',
-    'h5p-nofinal-dark-mock-cleansafe': 'fc312f3ddd83a9c2503eedb38ece5f02586c1a84a6a4e0a55935ed6b5aa661ff',
-    'scorm-final-light': '48cd77bd1d35ab43c5a20477be2cb2842775c7f764c9ce87fc318f986e56761b',
-    'h5p-ev5c-rules1': 'ce78fdc626d23e3ef477bd8f80feec569d1b13b22a64ce5362705b141b9d645f',
+    'h5p-final-light': '2b23ccfabd421bf91f6ed2b2d3aff41b4d8ed294a1a76ef9c33b095ba76b0812',
+    'scorm-nofinal-dark': 'b18c58680ef035b5ddbf60698904b6f8e666d46810904ad2f42a6bf4a3ec2dc8',
+    'h5p-nofinal-dark-mock-cleansafe': 'fe0aafc78f39d33921bf84d5302ca8053fe5eff7984a5a533602cdfbb4524f6f',
+    'scorm-final-light': 'd1cfc9f02a76c1013a76d5d9cdf04726661e49087022c680c0a0594491af5f51',
+    'h5p-ev5c-rules1': '257886893e21ddae142ff52559ea4eb4c2b753b6c89225a260dad53434a995de',
   },
 };
 

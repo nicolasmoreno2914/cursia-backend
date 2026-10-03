@@ -219,8 +219,9 @@ const BS_CFG = {
     const r = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, o));
     // #583 QUAL (builder 3.11.0): reviewmaxmarks 69904 → 272, frase del cierre, tarjeta del Libro Guía como <intro> del recurso (sin label libro_card; ids renumerados) y runtime VC 4 — diff semántico en scratchpad/r18/qual/golddiff/sem.js (antes d4e6bc68…: staging 3.6.0 = 3.10.0 para este curso).
     // UX r18 (builder 3.12.0): sección 0 hero primero / foro al final, sin kicker, preload="metadata" + title/aria-label (fix 1), Info en audiolibro.mp3 y portadas a 1600 px — diff semántico en scratchpad/r18/uximpl-golddiff4.js (antes 80e8b108…, 3.11.0).
+    // r19 L fix round 1: logo de la portada a opacidad plena, /Keywords del PDF (sha del plan) y transliteración — vuelve a mover solo el blob del Libro.
     // r19 L (builder 3.13.0): solo el Libro Guía (PDF en vez de HTML) y la descripción de su recurso (botón) — diff en scratchpad/r19/impl-l-probe/golddiff.js (antes a169af34…, 3.12.0).
-    eq(sha(r.mbz), '95d75ca3f8e33562046b15f65cdf6cfbddc41d603f415a288a90ce9f580d02ff', 'sha256');
+    eq(sha(r.mbz), 'aa10e7adc219a6a230579a31913a785649210f8c7c9633307c2278f4ebfaddc2', 'sha256');
   });
 
   console.log(`\n${failures ? 'HAY FALLOS' : 'Todos los checks de V542 I2 (H5P de una sola copia) pasaron'} (${passed} ✅, ${failures} ❌).`);

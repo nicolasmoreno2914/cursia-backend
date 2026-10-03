@@ -269,13 +269,14 @@ async function pureChecks() {
   // portadas a 1600 px (PNG con filtro adaptativo) y sin botón «Iniciar actividad» hacia H5P embebido. Diff
   // semántico por idnumber en scratchpad/r18/uximpl-golddiff2.js / uximpl-golddiff3.js: solo esos cambios.
   // Dorados 3.11.0: 644 63dac759…, 645 2c7fe50b….
+  // r19 L fix round 1: logo de la portada a opacidad plena, /Keywords del PDF (sha del plan) y transliteración — vuelve a mover solo el blob del Libro.
   // r19 L (builder 3.12.0 → 3.13.0) cambia el .mbz a propósito, y SOLO en el Libro Guía (diff semántico de entradas del zip contra
   // 77eeb18, scratchpad/r19/impl-l-probe/golddiff.js): el blob libro_guia_completo.html → PDF libro_guia_<slug>.pdf (files.xml:
   // hash, nombre, tamaño, mimetype) y la descripción del recurso (resource.xml) con el botón «Abrir Libro Guía →» y «documento PDF».
   // Dorados 3.12.0: 644 7cb2a7c7…, 645 32191ec2….
   const GOLDEN_PRE_T5 = {
-    644: ['5e6dd1fb044e22a3984c61629f9e68e42485c18e7204f028daba66fcf97b4868', { engine: 'h5p', finalExam: true, courseId: 644 }],
-    645: ['db739962692212c6e36be993c29931b6ca33fe45f9765ac6565a0c2e7ddb2472', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
+    644: ['02af361a7c149ef9a94976bdf64d475421b79c5d4fb94b5814b8c7d14427a3ed', { engine: 'h5p', finalExam: true, courseId: 644 }],
+    645: ['3963c169f3d16970d2364bf46c6c8934c7feea561c136ef6c992e6d7cdc10c6c', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
   };
   await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B4 (respuestas explicadas sobre sistema visual 2.0 + certificado + política de revisión del quiz con revisión de respuestas propias V542 + H5P de una sola copia + retroalimentación global del quiz + #583 QUAL + UX r18 + r19 Libro Guía PDF, builder 3.13.0), con y sin el campo', async () => {
     for (const [id, [want, o]] of Object.entries(GOLDEN_PRE_T5)) {

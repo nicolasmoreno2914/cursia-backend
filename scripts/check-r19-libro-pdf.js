@@ -45,6 +45,7 @@ const TE = loadDist('modules/theme-engine/index.js');
 const B = loadDist('package/dynamic-mbz-builder-v3.js');
 const V = loadDist('package/v3/mbz-validator-v3.js');
 const PK = loadDist('modules/dynamic-packaging/packaging-v3.js');
+const FC = loadDist('modules/reliability/failure-classifier.js');
 const PF = require('./lib/v21-packaging-fixtures');
 
 let passes = 0;
@@ -63,6 +64,9 @@ function assert(c, m) {
   if (!c) throw new Error(m || 'assert');
 }
 const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
+function eq(a, b, m) {
+  if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`${m}: esperado ${JSON.stringify(b)}, recibido ${JSON.stringify(a)}`);
+}
 
 // ─── fixtures ──────────────────────────────────────────────────────────────
 const SPANISH = ['á', 'é', 'í', 'ó', 'ú', 'ñ', 'ü', '¿', '¡', '«', '»', '“', '”', '–', '—', '•'];
@@ -105,7 +109,11 @@ async function loadPdf(buf) {
 const IMAGE_OPS = () => new Set(['paintImageXObject', 'paintInlineImageXObject', 'paintImageMaskXObject', 'paintImageXObjectRepeat', 'paintInlineImageXObjectGroup', 'paintImageMaskXObjectGroup', 'paintImageMaskXObjectRepeat', 'paintSolidColorImageMask'].map((k) => pdfjs.OPS[k]).filter((v) => v !== undefined));
 const TEXT_OPS = () => new Set(['showText', 'showSpacedText', 'nextLineShowText', 'nextLineSetSpacingShowText', 'beginText'].map((k) => pdfjs.OPS[k]));
 
-/** Análisis de todas las páginas: imágenes, orden respecto del texto, opacidad, texto. */
+/**
+ * Análisis de todas las páginas. Fix round 1 (M9 / decisión i): pila real de estado gráfico (save → push,
+ * restore → pop, setGState `ca` → tope) para clasificar cada pintura de imagen por su opacidad EFECTIVA, y la
+ * opacidad efectiva en el primer operador de texto.
+ */
 async function analyze(buf) {
   const d = await loadPdf(buf);
   const pages = [];
@@ -114,25 +122,26 @@ async function analyze(buf) {
   for (let p = 1; p <= d.numPages; p++) {
     const pg = await d.getPage(p);
     const ol = await pg.getOperatorList();
-    const imgIdx = [];
+    const stack = [1];
+    const paints = [];
     let firstText = -1;
-    let lastCa = null;
-    let caAtImage = null;
+    let caAtFirstText = null;
     ol.fnArray.forEach((fn, i) => {
-      if (fn === pdfjs.OPS.setGState) {
-        for (const [k, v] of ol.argsArray[i][0]) if (k === 'ca') lastCa = v;
+      if (fn === pdfjs.OPS.save) stack.push(stack[stack.length - 1]);
+      else if (fn === pdfjs.OPS.restore) { if (stack.length > 1) stack.pop(); }
+      else if (fn === pdfjs.OPS.setGState) {
+        for (const [k, v] of ol.argsArray[i][0]) if (k === 'ca') stack[stack.length - 1] = v;
       }
-      if (IMG.has(fn)) {
-        imgIdx.push(i);
-        if (caAtImage === null) caAtImage = lastCa;
-      }
-      if (TXT.has(fn) && firstText < 0) firstText = i;
+      if (IMG.has(fn)) paints.push({ i, ca: stack[stack.length - 1], id: ol.argsArray[i][0] });
+      if (TXT.has(fn) && firstText < 0) { firstText = i; caAtFirstText = stack[stack.length - 1]; }
     });
     const tc = await pg.getTextContent();
     const text = tc.items.map((it) => it.str).join(' ');
+    const wm = paints.filter((x) => x.ca <= 0.12);
+    const full = paints.filter((x) => x.ca >= 0.999);
     let image = null;
-    if (imgIdx.length) {
-      const id = ol.argsArray[imgIdx[0]][0];
+    if (wm.length) {
+      const id = wm[0].id;
       // sin OffscreenCanvas/ImageDecoder el worker manda los píxeles crudos; un objeto que no llega = falla (no cuelga)
       const obj = await new Promise((res) => {
         const t = setTimeout(() => res(null), 5000);
@@ -140,7 +149,18 @@ async function analyze(buf) {
       });
       image = obj ? { width: obj.width, height: obj.height, kind: obj.kind, data: obj.data || null } : null;
     }
-    pages.push({ imgCount: imgIdx.length, imgBeforeText: imgIdx.length > 0 && (firstText < 0 || imgIdx[0] < firstText), caAtImage, text, image });
+    pages.push({
+      imgCount: paints.length,
+      wmCount: wm.length,
+      fullCount: full.length,
+      otherCount: paints.length - wm.length - full.length,
+      wmFirstPaint: wm.length > 0 && paints[0] === wm[0],
+      imgBeforeText: wm.length > 0 && (firstText < 0 || wm[0].i < firstText),
+      caAtImage: wm.length ? wm[0].ca : null,
+      caAtFirstText,
+      text,
+      image,
+    });
   }
   const meta = await d.getMetadata();
   return { numPages: d.numPages, pages, text: pages.map((p) => p.text).join('\n'), info: meta.info };
@@ -218,15 +238,17 @@ const keepAlive = setInterval(() => {}, 1 << 30); // una promesa de pdfjs que no
       assert(r.pdf.subarray(0, 5).toString() === '%PDF-' && /%%EOF\s*$/.test(r.pdf.subarray(-16).toString('latin1')), 'cabecera/cierre');
       if (id === 'large') assert(a.numPages >= 45 && a.numPages <= 70, `el fixture grande debe rondar 50 páginas (${a.numPages})`);
     });
-    await check(`[${id}] exactamente UNA pintura de imagen por página, en TODAS (portada e índice incluidos)`, () => {
-      const bad = a.pages.map((p, i) => [i + 1, p.imgCount]).filter(([, n]) => n !== 1);
-      assert(bad.length === 0, `páginas con ≠ 1 imagen: ${JSON.stringify(bad)}`);
-      assert(r.watermarkDrawsPerPage.every((n) => n === 1), 'contador del renderer');
+    await check(`[${id}] toda página: exactamente UNA marca de agua (ca ≤ 0.12) y es la primera pintura; logo a opacidad plena SOLO en la portada (1)`, () => {
+      const bad = a.pages.map((p, i) => [i + 1, p.wmCount, p.fullCount, p.otherCount]).filter(([pg, w, f, o]) => w !== 1 || o !== 0 || f !== (pg === 1 ? 1 : 0));
+      assert(bad.length === 0, `páginas [n, marcas, plenas, otras] fuera de regla: ${JSON.stringify(bad)}`);
+      assert(a.pages.every((p) => p.wmFirstPaint), 'la marca de agua es la primera pintura de cada página');
+      assert(r.watermarkDrawsPerPage.every((n) => n === 1) && r.coverLogoDraws === 1, 'contadores del renderer');
     });
-    await check(`[${id}] la marca de agua se pinta ANTES de cualquier texto y con opacidad ca ≤ 0.12`, () => {
+    await check(`[${id}] la marca de agua se pinta ANTES de cualquier texto, ca ≤ 0.12, y el texto vuelve a opacidad plena`, () => {
       a.pages.forEach((p, i) => {
         assert(p.imgBeforeText, `página ${i + 1}: la imagen no va antes del texto`);
         assert(typeof p.caAtImage === 'number' && p.caAtImage > 0 && p.caAtImage <= 0.12, `página ${i + 1}: ca=${p.caAtImage}`);
+        assert(p.caAtFirstText === 1, `página ${i + 1}: el primer texto se pinta con ca=${p.caAtFirstText}`);
       });
     });
     await check(`[${id}] texto: título, cada capítulo, español correcto, sin U+FFFD ni caracteres fuera de WinAnsi`, () => {
@@ -256,6 +278,18 @@ const keepAlive = setInterval(() => {}, 1 << 30); // una promesa de pdfjs que no
     assert(LB.pdfText('¿Áéíóú ñÑ ü «» “” – — •?') === '¿Áéíóú ñÑ ü «» “” – — •?', 'español');
     assert(LB.pdfText('■ caso 🎯 ✏ −5 → x') === '• caso -5 -> x', LB.pdfText('■ caso 🎯 ✏ −5 → x'));
   });
+  await check('fix 1 (I2): transliteración — subíndices/superíndices, griego, operadores, flechas, ✓/✗, círculos; sin pérdida silenciosa', () => {
+    const cases = [
+      ['La fórmula π·r² y Δt; CO₂ y H₂O; α, β, σ; ① paso', 'La fórmula pi·r² y Delta t; CO2 y H2O; alpha, beta, sigma; 1. paso'],
+      ['x⁴ + y⁻¹ ≤ 3 ≥ 1 ≠ 2 ≈ 4 × 5 ÷ 6 ± 1', 'x4 + y-¹ <= 3 >= 1 != 2 ~= 4 × 5 ÷ 6 ± 1'],
+      ['μg, Ω, ∑x, ∞, √2, ½, ⅓', 'µg, Omega, Sigma x, infinito, raíz de 2, ½, 1/3'],
+      ['A → B ⇒ C ← D; ✓ hecho ✗ no; ◦ punto; 25 ℃', 'A -> B => C <- D; (sí) hecho (no) no; • punto; 25 °C'],
+    ];
+    for (const [i, o] of cases) assert(LB.pdfText(i) === o, `${i} → «${LB.pdfText(i)}» (esperado «${o}»)`);
+    for (const [i] of cases) assert(LB.unmappedCharCount(i) === 0, `${i}: nada sin mapa`);
+    eq(LB.unmappedCharCount('Café 🎯 ✏ 日本語\u200d\ufe0f'), 5, 'emoji, ✏ y CJK se cuentan; formato invisible no');
+    for (const ch of LB.pdfText('Ω∑∆π₂⁹①→✓')) assert(/^[\x20-\x7e\xa0-\xff€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ]$/.test(ch), `fuera de WinAnsi: ${ch}`);
+  });
 
   // ── 2. Logo ──
   const cursia = LL.cursiaDefaultLogo();
@@ -275,7 +309,7 @@ const keepAlive = setInterval(() => {}, 1 << 30); // una promesa de pdfjs que no
       const r = await LB.renderLibroPdfV3(libroInput({ modules: 1, chapters: 1, paras: 2, logo }));
       const a = await analyze(r.pdf);
       const exp = pngPixelHash(png);
-      a.pages.forEach((p, i) => assert(p.imgCount === 1 && samePixels(p.image, exp), `página ${i + 1}: la imagen no es el logo de la cuenta`));
+      a.pages.forEach((p, i) => assert(p.wmCount === 1 && samePixels(p.image, exp), `página ${i + 1}: la imagen no es el logo de la cuenta`));
       assert(!samePixels(a.pages[0].image, cursiaPx), 'no debe ser Cursia');
     }
   });
@@ -289,10 +323,83 @@ const keepAlive = setInterval(() => {}, 1 << 30); // una promesa de pdfjs que no
     assert(logo.kind === 'jpeg' && logo.width === 160 && logo.height === 90, JSON.stringify({ ...logo, bytes: 0 }));
     assert(logo.warnings.includes('libro_logo_no_alpha:user_settings'), JSON.stringify(logo.warnings));
     const a = await analyze((await LB.renderLibroPdfV3(libroInput({ modules: 1, chapters: 1, paras: 2, logo }))).pdf);
-    a.pages.forEach((p, i) => assert(p.imgCount === 1 && p.image.width === 160 && p.image.height === 90, `página ${i + 1}`));
+    a.pages.forEach((p, i) => assert(p.wmCount === 1 && p.image.width === 160 && p.image.height === 90, `página ${i + 1}`));
     // JPEG truncado → inválido
     const t = LL.resolveLibroLogo({ source: 'user_settings', dataUri: dataUri('image/jpeg', jpg.subarray(0, Math.floor(jpg.length / 2))) });
     assert(t.source === 'cursia_default' && /^libro_logo_invalid:user_settings:jpeg_/.test(t.warnings[0]), JSON.stringify(t.warnings));
+  });
+  await check('fix 1 (I1): JPEG con byte de relleno 0xFF antes del SOF (válido según la norma, pdfkit lo rechaza) → Cursia + pdf_embed_unsupported; el render directo sale LIBRO_V3_PDF_FAILED (clasificado)', async () => {
+    const sof = Buffer.from([0xff, 0xc0, 0, 11, 8, 0, 64, 0, 64, 1, 1, 0x11, 0]);
+    const app0 = Buffer.from([0xff, 0xe0, 0, 16, 0x4a, 0x46, 0x49, 0x46, 0, 1, 1, 0, 0, 1, 0, 1, 0, 0]);
+    const jpg = Buffer.concat([Buffer.from([0xff, 0xd8]), app0, Buffer.from([0xff]), sof, Buffer.from([0xff, 0xda, 0, 8, 1, 1, 0, 0, 0x3f, 0]), Buffer.alloc(50, 0x12), Buffer.from([0xff, 0xd9])]);
+    assert(LL.inspectJpeg(jpg).ok === true, 'estructura JPEG válida (relleno legal)');
+    const logo = LL.resolveLibroLogo({ source: 'user_settings', dataUri: dataUri('image/jpeg', jpg) });
+    assert(logo.source === 'cursia_default' && logo.warnings[0] === 'libro_logo_invalid:user_settings:pdf_embed_unsupported', JSON.stringify(logo.warnings));
+    // aun si llegara al renderer sin validar: error con código, nunca el string crudo de pdfkit
+    let msg = '';
+    try { await LB.renderLibroPdfV3(libroInput({ modules: 1, chapters: 1, paras: 1, logo: { ...cursia, source: 'user_settings', kind: 'jpeg', bytes: jpg, width: 64, height: 64, hasAlpha: false } })); } catch (e) { msg = e instanceof Error ? e.message : String(e); }
+    assert(/^LIBRO_V3_PDF_FAILED: /.test(msg), msg);
+    const v = FC.classifyFailure({ source: 'package_worker', error: msg });
+    assert(v.code === 'LIBRO_V3_PDF_FAILED' && v.class === 'D' && v.strategy === 'hold_for_human', JSON.stringify(v));
+  });
+  await check('fix 1 (I1): el builder nunca cae por el logo — un logo que pdfkit rechaza en el render → reintento con Cursia + aviso pdf_embed_failed', async () => {
+    const input = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true });
+    const real = LL.pdfkitAccepts;
+    const png = accountPng();
+    // simula un logo que pasa la validación pero pdfkit no puede pintar: PNG válido con IDAT corrompido DESPUÉS de validar
+    const LLmod = require(path.join(distRoot, 'package/v3/libro-logo.js'));
+    const origResolve = LLmod.resolveLibroLogo;
+    LLmod.resolveLibroLogo = (c) => (c ? { ...origResolve(null), source: 'user_settings', kind: 'jpeg', bytes: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 2, 0xff]), width: 64, height: 64, warnings: [] } : origResolve(c));
+    try {
+      const r = await B.buildDynamicMbzV3({ ...input, libroBrand: { logo: { source: 'user_settings', dataUri: dataUri('image/png', png) }, name: null } });
+      assert(r.summary.warnings.includes('libro_logo_invalid:user_settings:pdf_embed_failed'), JSON.stringify(r.summary.warnings));
+      assert(r.summary.libro.logoSource === 'cursia_default', JSON.stringify(r.summary.libro));
+    } finally {
+      LLmod.resolveLibroLogo = origResolve;
+    }
+    void real;
+  });
+  await check('fix 1 (M2/M3): PNG con «<svg» en su tEXt se acepta como PNG; data URI gigante → too_large sin parsear', () => {
+    const png = accountPng();
+    const t = Buffer.concat([Buffer.from('Comment\0made with <svg editor')]);
+    const crc = (b) => { let c, cr = ~0; for (const x of b) { cr ^= x; for (let k = 0; k < 8; k++) cr = (cr >>> 1) ^ (0xedb88320 & -(cr & 1)); } return (~cr) >>> 0; };
+    const chunk = Buffer.alloc(12 + t.length);
+    chunk.writeUInt32BE(t.length, 0); chunk.write('tEXt', 4, 'latin1'); t.copy(chunk, 8); chunk.writeUInt32BE(crc(chunk.subarray(4, 8 + t.length)), 8 + t.length);
+    const withText = Buffer.concat([png.subarray(0, 33), chunk, png.subarray(33)]);
+    const l = LL.resolveLibroLogo({ source: 'user_settings', dataUri: dataUri('image/png', withText) });
+    assert(l.source === 'user_settings' && l.warnings.length === 0, JSON.stringify(l.warnings));
+    const big = LL.resolveLibroLogo({ source: 'brand_profile', dataUri: 'data:image/png;base64,' + 'A'.repeat(7 * 1024 * 1024) });
+    assert(big.warnings[0] === 'libro_logo_invalid:brand_profile:too_large', JSON.stringify(big.warnings));
+  });
+  await check('fix 1 (ii): logo SVG de la cuenta → Cursia + aviso svg_unsupported (limitación conocida: sin rasterizador en producción)', () => {
+    const l = LL.resolveLibroLogo({ source: 'user_settings', dataUri: dataUri('image/svg+xml', Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="200" height="80"><image href="file:///etc/passwd"/></svg>')) });
+    assert(l.source === 'cursia_default' && l.warnings[0] === 'libro_logo_invalid:user_settings:svg_unsupported', JSON.stringify(l.warnings));
+  });
+  await check('fix 1 (M7/M9): insumos difíciles — capítulo vacío, sin bibliografía, palabra/URL larguísima, tabla de 14 columnas y fila más ancha, código cercado, griego, CJK → sin caídas, invariantes intactos, conteo de caracteres sin mapa', async () => {
+    const longWord = 'x'.repeat(3000);
+    const url = 'https://example.org/' + 'a'.repeat(2000);
+    const wide = '| ' + Array.from({ length: 14 }, (_, k) => `C${k + 1}`).join(' | ') + ' |\n|' + '---|'.repeat(14) + '\n| ' + Array.from({ length: 16 }, (_, k) => `v${k + 1}`).join(' | ') + ' |';
+    const md = `## Fórmulas\n\nLa energía Δt y π·r²; CO₂; ≤ 5. 日本語 🎯\n\n\`\`\`\nconst a = 1;\n  if (a ≥ 1) return;\n\`\`\`\n\n${longWord}\n\n[enlace](${url}) y ${url}\n\n${wide}`;
+    const inp = libroInput({ modules: 1, chapters: 2, paras: 1, brandName: null });
+    inp.courseIntro.bibliography = [];
+    inp.modules[0].intro.bibliography = [];
+    inp.modules[0].chapters[0].md = '';
+    inp.modules[0].chapters[1].md = md;
+    const r = await LB.renderLibroPdfV3(inp);
+    const a = await analyze(r.pdf);
+    assert(a.pages.every((p, i) => p.wmCount === 1 && p.otherCount === 0 && p.fullCount === (i === 0 ? 1 : 0)), 'invariantes de imagen');
+    assert(!r.hasBibliography && !a.text.includes('Bibliografía'), 'sin bibliografía');
+    assert(/Delta t/.test(a.text) && /pi·r²/.test(a.text) && /CO2/.test(a.text) && /<= 5/.test(a.text), 'griego / subíndices / comparadores transliterados');
+    assert(/const a = 1;/.test(a.text) && /if \(a >= 1\) return;/.test(a.text) && !a.text.includes('```'), 'código cercado línea por línea, sin ```');
+    assert(a.text.includes('C14') && a.text.includes('v16'), 'tabla ancha: ni encabezado ni celdas de más se pierden');
+    eq(r.unmappedChars, 4, 'caracteres sin mapa: 日本語 (3) + 🎯 (1)');
+  });
+  await check('fix 1 (I2): el builder deja libro_chars_unmapped:<n> en el resumen cuando el contenido trae caracteres sin mapa', async () => {
+    const input = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true });
+    const [c1] = input.contents.contentMd.keys();
+    input.contents.contentMd.set(c1, input.contents.contentMd.get(c1) + '\n\nGlosario: 日本語 y ✓ listo.');
+    const r = await B.buildDynamicMbzV3(input);
+    assert(r.summary.warnings.includes('libro_chars_unmapped:3'), JSON.stringify(r.summary.warnings));
   });
   await check('B: sin logo → logo de Cursia, sin avisos', async () => {
     for (const cand of [null, undefined, { source: 'user_settings', dataUri: '' }]) {
@@ -323,7 +430,7 @@ const keepAlive = setInterval(() => {}, 1 << 30); // una promesa de pdfjs que no
     }
     const bad = LL.resolveLibroLogo({ source: 'brand_profile', dataUri: dataUri('image/png', png.subarray(0, 100)) });
     const a = await analyze((await LB.renderLibroPdfV3(libroInput({ modules: 1, chapters: 1, paras: 2, logo: bad }))).pdf);
-    a.pages.forEach((p, i) => assert(p.imgCount === 1 && samePixels(p.image, cursiaPx), `página ${i + 1}: nunca una marca de agua vacía`));
+    a.pages.forEach((p, i) => assert(p.wmCount === 1 && samePixels(p.image, cursiaPx), `página ${i + 1}: nunca una marca de agua vacía`));
   });
 
   // ── 3. .mbz ──
@@ -371,7 +478,8 @@ const keepAlive = setInterval(() => {}, 1 << 30); // una promesa de pdfjs que no
     assert(inforef.includes(`<id>${(/<file id="(\d+)"/.exec(f) || [])[1]}</id>`), 'inforef');
     const a = await analyze(blob);
     const title = built.expectations.facts.course.title;
-    assert(a.pages.every((p) => p.imgCount === 1) && a.text.includes(title) && a.info.Title === title, 'PDF del paquete: marca de agua y /Title = título del curso (sin mezcla de cursos)');
+    assert(a.pages.every((p) => p.wmCount === 1) && a.text.includes(title) && a.info.Title === title, 'PDF del paquete: marca de agua y /Title = título del curso (sin mezcla de cursos)');
+    assert(!built.summary.warnings.some((w) => w.startsWith('libro_')), `el fixture limpio no deja avisos del Libro: ${JSON.stringify(built.summary.warnings)}`);
     assert(built.summary.libro && built.summary.libro.logoSource === 'cursia_default' && built.summary.libro.pageCount === a.numPages, JSON.stringify(built.summary.libro));
     assert(built.expectations.facts.libro.wordCount > 100, 'palabras medidas');
   });
@@ -439,10 +547,21 @@ const keepAlive = setInterval(() => {}, 1 << 30); // una promesa de pdfjs que no
     assert(b.logo.source === 'brand_profile' && b.name === 'Instituto Demo', JSON.stringify(b));
     b = await PK.loadLibroBrandV3(mk({ inst: true, bpRow: { logo_url: null, logo_artifact_id: 'x' }, usRow: { logo_b64: 'data:image/png;base64,BBB' } }), 1, 'u1');
     assert(b.logo.source === 'user_settings' && b.warnings.includes('libro_logo_artifact_unsupported:brand_profile'), JSON.stringify(b));
+    b = await PK.loadLibroBrandV3(mk({ inst: false }), 1, 'u1');
+    assert(b.logo === null && b.warnings.length === 0, `fuentes presentes y sin logo → Cursia sin aviso: ${JSON.stringify(b)}`);
+    // fix 1 (I3): una fuente ausente o rota se ve en el resumen, nunca cae en silencio a Cursia
     b = await PK.loadLibroBrandV3(mk({ inst: false, us: false }), 1, 'u1');
-    assert(b.logo === null && b.warnings.length === 0, JSON.stringify(b));
+    eq([b.logo, b.warnings], [null, ['libro_logo_source_unavailable:user_settings']], 'user_settings ausente');
+    b = await PK.loadLibroBrandV3(mk({ inst: true, bp: false, usRow: { logo_b64: 'data:image/png;base64,BBB' } }), 1, 'u1');
+    assert(b.logo.source === 'user_settings' && b.warnings.includes('libro_logo_source_unavailable:brand_profiles'), JSON.stringify(b));
+    const colMissing = { query: async (sql) => {
+      if (/from public\.user_settings/.test(sql)) throw new Error('column "logo_b64" does not exist');
+      return mk({ inst: false }).query(sql);
+    } };
+    b = await PK.loadLibroBrandV3(colMissing, 1, 'u1');
+    assert(b.logo === null && /^libro_logo_source_unavailable:user_settings:column "logo_b64" does not exist/.test(b.warnings[0]), JSON.stringify(b));
     b = await PK.loadLibroBrandV3({ query: async () => { throw new Error('boom'); } }, 1, 'u1');
-    assert(b.logo === null && /^libro_logo_lookup_failed/.test(b.warnings[0]), JSON.stringify(b));
+    assert(b.logo === null && /^libro_logo_source_unavailable:courses:boom/.test(b.warnings[0]), JSON.stringify(b));
   });
 
   if (OUT) {
