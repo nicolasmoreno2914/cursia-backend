@@ -264,13 +264,21 @@ export function routeLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: Shel
 // ─── S1.2 Libro Guía ────────────────────────────────────────────────────────
 
 /**
- * #583 (M5/M6): descripción del recurso «📘 Libro Guía» (builder 3.11.0: `showdescription` = 1). Es la misma
- * tarjeta de libroCardLabel SIN el botón «Abrir el Libro Guía»: el nombre del recurso ya es el enlace, y la
- * sección 1 deja de mostrar dos entradas del Libro Guía (la fila del recurso y una tarjeta aparte).
+ * #583 (M5/M6): descripción del recurso «📘 Libro Guía» (builder 3.11.0: `showdescription` = 1): la sección 1 muestra una
+ * sola entrada del Libro Guía (la fila del recurso con esta tarjeta debajo). Sin `libroMid` (builder 3.11.0–3.12.0) la
+ * tarjeta no lleva botón.
+ * r19 (L4, builder 3.13.0): con `libroMid` (el moduleid del PROPIO recurso) lleva el botón visible «Abrir Libro Guía →»
+ * hacia `$@RESOURCEVIEWBYID*libroMid@$` en una pestaña nueva; con `display` = 5 (abrir) view.php entrega el PDF, que el
+ * navegador muestra en su visor.
  */
-export function libroResourceIntro(facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
-  return libroCard(null, facts, theme, opts);
+export function libroResourceIntro(facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions, libroMid?: number): ShellLabel {
+  if (libroMid === undefined) return libroCard(null, facts, theme, opts);
+  if (!Number.isInteger(libroMid) || libroMid < 1) shellFail(`libroMid inválido (${libroMid})`);
+  return libroCard(libroMid, facts, theme, opts, { text: LIBRO_CTA_TEXT, newTab: true, pdf: true });
 }
+
+/** r19 (L4): texto del botón del Libro Guía en la descripción del recurso (builder ≥ 3.13.0). */
+export const LIBRO_CTA_TEXT = 'Abrir Libro Guía →';
 
 /** Tarjeta del Libro Guía como label aparte (builder ≤ 3.10.0; se conserva para paquetes y pruebas anteriores). */
 export function libroCardLabel(libroMid: number, facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
@@ -278,20 +286,28 @@ export function libroCardLabel(libroMid: number, facts: CourseFacts, theme: Reso
   return libroCard(libroMid, facts, theme, opts);
 }
 
-function libroCard(libroMid: number | null, facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
+function libroCard(
+  libroMid: number | null,
+  facts: CourseFacts,
+  theme: ResolvedTheme,
+  opts?: ShellRenderOptions,
+  cta: { text: string; newTab: boolean; pdf: boolean } = { text: 'Abrir el Libro Guía', newTab: false, pdf: false },
+): ShellLabel {
   const h = hx(theme, opts);
   const cs = { s: panelSurf(h), border: h.t.color.border };
   const c = facts.counts;
   const text =
-    `El texto completo del curso en un solo documento: ${c.chapters} ${plural(c.chapters, 'capítulo', 'capítulos')} ` +
+    `El texto completo del curso en un solo documento${cta.pdf ? ' PDF' : ''}: ${c.chapters} ${plural(c.chapters, 'capítulo', 'capítulos')} ` +
     `en ${c.modules} ${plural(c.modules, 'módulo', 'módulos')}${facts.libro.hasBibliography === false ? '' : ', con bibliografía sugerida'}. ` +
     `Extensión aproximada: ${facts.libro.wordCount} palabras.`;
   const inner =
     eyebrow(h, 'Material de estudio', cs.s) +
     heading(h, 'h3', 'Libro Guía', cs.s) +
     pHtml(h, labelHtml(text), cs.s, { last: libroMid === null }) +
-    (libroMid === null ? '' : link(h, `$@RESOURCEVIEWBYID*${libroMid}@$`, 'Abrir el Libro Guía', cs.s, { button: true, margin: '16px 0 0 0' }));
-  return out(libroMid === null ? 'Libro Guía (descripción del recurso)' : 'Libro Guía', root(h, 'shell-libro', box(h, inner, cs)), facts);
+    (libroMid === null
+      ? ''
+      : link(h, `$@RESOURCEVIEWBYID*${libroMid}@$`, cta.text, cs.s, { button: true, margin: '16px 0 0 0', ...(cta.newTab ? { target: '_blank' as const } : {}) }));
+  return out(libroMid === null || cta.newTab ? 'Libro Guía (descripción del recurso)' : 'Libro Guía', root(h, 'shell-libro', box(h, inner, cs)), facts);
 }
 
 // ─── S1.3 Audiolibro ────────────────────────────────────────────────────────
