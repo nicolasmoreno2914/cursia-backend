@@ -399,8 +399,40 @@ export class FinopsBudgetService {
 
   /** r19 fix round 1 (I5): costo de UNA llamada concreta (uso estimado × catálogo vigente). Lanza si no se puede preciar. */
   async callCost(c: { provider: string; service: string; product: string; usage: Record<string, number> }, runner: Runner = this.dataSource): Promise<string> {
-    const priced = priceUsage(c.usage, await this.catalog(runner), { provider: c.provider, service: c.service, product: c.product, asOf: new Date() });
-    return priced.amount;
+    const catalog = await this.catalog(runner);
+    try {
+      return priceUsage(c.usage, catalog, { provider: c.provider, service: c.service, product: c.product, asOf: new Date() }).amount;
+    } catch {
+      // r19 fix round 2: la llamada no tiene precio exacto en el catálogo (p. ej. un modelo/voz nuevo antes de
+      // cargar su fila). NUNCA se vuelve al p90 del item entero (reintroducía el falso bloqueo de I5): se precia
+      // de forma CONSERVADORA con la tarifa más cara del catálogo para cada medidor de ESTA llamada.
+      return this.conservativeCallCost(c.usage, catalog);
+    }
+  }
+
+  /**
+   * Costo conservador de una llamada sin precio exacto: por medidor, la tarifa MÁS CARA vigente del catálogo
+   * para ese medidor (cualquier proveedor/producto). Un medidor que no existe en el catálogo → CALL_UNPRICED
+   * (el guard falla cerrado: el item queda bloqueado con un motivo claro, nunca se llama sin poder acotar el gasto).
+   */
+  conservativeCallCost(usage: Record<string, number>, catalog: PricingCatalogRow[]): string {
+    const now = Date.now();
+    const open = catalog.filter((r) => !r.effective_to || new Date(r.effective_to as any).getTime() > now);
+    let total = normalizeDecimal(0);
+    for (const meter of Object.keys(usage)) {
+      let best: string | null = null;
+      for (const r of open.filter((x) => x.meter === meter)) {
+        try {
+          const amt = priceUsage({ [meter]: usage[meter] }, [r], { provider: r.provider, service: r.service, product: r.product_or_model }).amount;
+          if (best === null || cmpDec(amt, best) > 0) best = amt;
+        } catch {
+          /* fila no aplicable: se ignora */
+        }
+      }
+      if (best === null) throw new FinopsError('CALL_UNPRICED', `no hay ninguna tarifa para el medidor ${meter}`);
+      total = addDec(total, best);
+    }
+    return total;
   }
 
   /** Costo de UNA llamada pagada (p90, sin reintentos) de ese item type contra ese proveedor. */
@@ -461,8 +493,13 @@ export class FinopsBudgetService {
       this.runPaidAuthorizedBudget(a.runId),
       this.runActual(a.runId),
       this.reservedInFlight(a.runId, a.itemRunId),
-      a.nextCall ? this.callCost(a.nextCall).catch(() => this.singleCallCost(a.itemType, provider)) : this.singleCallCost(a.itemType, provider),
+      // Fix round 2: una llamada sin precio exacto se acota de forma conservadora (callCost); si ni eso se puede,
+      // null → el guard falla cerrado con 'call_unpriced' (nunca el p90 del item entero).
+      a.nextCall ? this.callCost(a.nextCall).catch(() => null) : this.singleCallCost(a.itemType, provider),
     ]);
+    if (next === null) {
+      return { allow: false, decision: 'BLOCK', committed: addDec(actualSoFar, reservedInFlight), remaining: null, reason: 'call_unpriced', authorizedBudget } as RuntimeGuardResult & { authorizedBudget: string | null };
+    }
     return { ...runtimeGuard({ authorizedBudget, actualSoFar, reservedInFlight, next }), authorizedBudget };
   }
 }

@@ -1009,19 +1009,41 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
   const narrated = (b: { text: string; extensions: string[] }) => [b.text, ...b.extensions].join(' ');
   const sources = p.sections.map((x) => ({ idx: x.idx, text: srcBySha.get(x.sha256)?.text ?? '' }));
 
-  /** Anti-duplicado / anti-bucle (bloques entre sí y DENTRO de un bloque); descarta y falla → el reintento los regenera. */
+  /**
+   * Anti-duplicado / anti-bucle (bloques entre sí y DENTRO de un bloque); descarta y falla → el reintento regenera
+   * SOLO lo descartado. Fix round 2: dos pasadas.
+   *  1. Guiones principales solos: una repetición ahí descarta esos bloques (como antes).
+   *  2. Principales + ampliaciones: como los principales ya pasaron (1), toda repetición nueva la introduce una
+   *     AMPLIACIÓN → se descartan solo las ampliaciones de los bloques implicados. El guion principal, validado
+   *     y pagado, se conserva y se reutiliza (nunca se vuelve a comprar).
+   */
   const repetitionGate = async (): Promise<boolean> => {
-    const rep = findScriptRepetition(blockTexts().map((b) => ({ idx: b.idx, text: narrated(b) })), sources);
-    if (!rep.idxs.length) return true;
+    const blocks = blockTexts();
+    const main = findScriptRepetition(blocks.map((b) => ({ idx: b.idx, text: b.text })), sources);
+    if (main.idxs.length) {
+      const dropped: string[] = [];
+      for (const i of blocksToDropForRepetition(main.idxs)) {
+        dropped.push(...(sections[String(i)]?.messageIds ?? []), ...(extensions[String(i)] ?? []).flatMap((e) => e.messageIds));
+        delete sections[String(i)];
+        delete extensions[String(i)];
+      }
+      discarded.push(...dropped);
+      await record(deps, item, { audiobookSections: sections, audiobookExtensions: extensions, audiobookDiscardedOps: [...discarded] });
+      await fail(deps, item, `AUDIOBOOK_SCRIPT_REPETITION: ${main.detail} (capítulo ${item.chapterNumber ?? '?'}; se regeneran solo esos bloques)`, true, { knownOutcome: true });
+      return false;
+    }
+    const all = findScriptRepetition(blocks.map((b) => ({ idx: b.idx, text: narrated(b) })), sources);
+    if (!all.idxs.length) return true;
+    const withExt = all.idxs.filter((i) => (extensions[String(i)] ?? []).length > 0);
+    if (!withExt.length) throw new Error(`repetición sin ampliaciones tras validar los guiones principales (${all.detail})`); // inalcanzable
     const dropped: string[] = [];
-    for (const i of blocksToDropForRepetition(rep.idxs)) {
-      dropped.push(...(sections[String(i)]?.messageIds ?? []), ...(extensions[String(i)] ?? []).flatMap((e) => e.messageIds));
-      delete sections[String(i)];
+    for (const i of withExt) {
+      dropped.push(...(extensions[String(i)] ?? []).flatMap((e) => e.messageIds));
       delete extensions[String(i)];
     }
     discarded.push(...dropped);
-    await record(deps, item, { audiobookSections: sections, audiobookExtensions: extensions, audiobookDiscardedOps: [...discarded] });
-    await fail(deps, item, `AUDIOBOOK_SCRIPT_REPETITION: ${rep.detail} (capítulo ${item.chapterNumber ?? '?'}; se regeneran solo esos bloques)`, true, { knownOutcome: true });
+    await record(deps, item, { audiobookExtensions: extensions, audiobookDiscardedOps: [...discarded] });
+    await fail(deps, item, `AUDIOBOOK_SCRIPT_REPETITION: ${all.detail} (capítulo ${item.chapterNumber ?? '?'}; la repite una ampliación: se descartan solo las ampliaciones de los bloques ${withExt.map((i) => i + 1).join(', ')}; el guion principal se conserva)`, true, { knownOutcome: true });
     return false;
   };
 
