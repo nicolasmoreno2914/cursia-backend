@@ -264,11 +264,12 @@ async function pureChecks() {
   // 645 58408d0e6a04774d5ca7df08deac6cd46a23a3326836047c7b1ad16cb13f458f.
   // #583 QUAL (builder 3.11.0): reviewmaxmarks 69904 → 272, frase del cierre, tarjeta del Libro Guía como <intro> del recurso (sin label libro_card; ids renumerados) y runtime VC 4 — diff semántico en scratchpad/r18/qual/golddiff/sem.js.
   // Dorados 3.10.0: 644 812c6022…, 645 db474403….
+  // UX #5 (builder 3.12.0): solo cambia el .h5p del QuestionSet de 644 (QS 1.21 + delta); 645 (SCORM) igual. 3.11.0: 644 63dac759….
   const GOLDEN_PRE_T5 = {
-    644: ['63dac759010c52e55998170608489649153b66342ca4b75dc179bac1a9528a9d', { engine: 'h5p', finalExam: true, courseId: 644 }],
+    644: ['6d58dc1e2b3d106285e9591d62e83fef251e1ef3b43eae0b59034d5793d06005', { engine: 'h5p', finalExam: true, courseId: 644 }],
     645: ['2c7fe50bc5ca0211074e376bed7ab6df824d8bcf1b8f109ae026466d68b09e8f', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
   };
-  await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B4 (respuestas explicadas sobre sistema visual 2.0 + certificado + política de revisión del quiz con revisión de respuestas propias V542 + H5P de una sola copia + retroalimentación global del quiz + #583 QUAL, builder 3.11.0), con y sin el campo', async () => {
+  await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B4 (respuestas explicadas sobre sistema visual 2.0 + certificado + política de revisión del quiz con revisión de respuestas propias V542 + H5P de una sola copia + retroalimentación global del quiz + #583 QUAL + UX #5 QuestionSet 1.21, builder 3.12.0), con y sin el campo', async () => {
     for (const [id, [want, o]] of Object.entries(GOLDEN_PRE_T5)) {
       const i1 = PF.packagingInput(distRoot, o);
       const i2 = PF.packagingInput(distRoot, o);

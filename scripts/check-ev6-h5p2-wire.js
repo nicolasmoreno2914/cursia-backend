@@ -66,12 +66,16 @@ const GOLDEN = {
   // (showdescription 1), con la renumeración de ids que eso trae; runtime VC 3 → 4 (esquina de la tabla sin «Aspecto»).
   // Dorados anteriores (3.10.0): h5p-final-light 6ce9ebb3…, scorm-nofinal-dark b7aeda95…, h5p-nofinal-dark-mock-cleansafe
   // ab93ce5b…, scorm-final-light 6619628e…, h5p-ev5c-rules1 c96fb4bb….
+  // UX #5 (builder 3.11.0 → 3.12.0) cambia SOLO el blob .h5p de la actividad QuestionSet (H5P.QuestionSet 1.21 con su
+  // carpeta delta y los rótulos «Siguiente» / «Anterior»): contenthash + filesize de esa entrada en files.xml; ningún
+  // otro archivo cambia (diff archivo por archivo en scratchpad/r18/ux5/mbzdiff.js). Los SCORM no cambian.
+  // Dorados anteriores (3.11.0): h5p-final-light 03bb4e8b…, h5p-nofinal-dark-mock-cleansafe 5329675d…, h5p-ev5c-rules1 4a1532f2….
   mbz: {
-    'h5p-final-light': '03bb4e8b8610cdc2b7b5a8523201dc99cea10edae98ce2e04729b3695771cddb',
+    'h5p-final-light': '9504afbf6e3fef76c8e4cff830019dcb833aeae36ffb4ab669416044aa70545e',
     'scorm-nofinal-dark': '9500797ec20439c80636c1d0565af8a09a475b584c5ddf359fc1a2b76b44b383',
-    'h5p-nofinal-dark-mock-cleansafe': '5329675d33baf25262432a653c3c6690321c85abcb4a50d12ab0cf57e33fa1db',
+    'h5p-nofinal-dark-mock-cleansafe': 'a2e624021b5d3d5da5d3f0da1c9c753a7d1ca47561242b3110d8a04ac7a6f1bb',
     'scorm-final-light': '948e402dd5d5192b184801a419b78a798263cad37cbd834320daa2e25aae4562',
-    'h5p-ev5c-rules1': '4a1532f23d3f7b1047d73c28e10b0832dafbda04ace70b090dcb0efd84be54d1',
+    'h5p-ev5c-rules1': 'f93d3f658bf66d9d832643fa3215dd040cc393324b91abd9f8a3dc797a6c45a2',
   },
 };
 /** Listas propias de rules 2 (CONGELADO: cambiar cualquiera = reglas 3). */
@@ -319,7 +323,9 @@ const SRC = (bp) => ({ courseId: 777, blueprintId: 1, blueprintNumber: 1, bluepr
       const hj = JSON.parse(await (await JSZip.loadAsync(blob)).file('h5p.json').async('string'));
       assert(!hj.preloadedDependencies.some((d) => d.machineName === 'H5P.Text'), 'rules 1: sin H5P.Text');
     }
-    assert(!r1.summary.restore, 'rules 1: sin nota de restauración');
+    // UX #5: la nota de restauración sale con cualquier paquete bundled del perfil v3 (desde 3.12.0 también QuestionSet 1.21).
+    const bundled1 = r1.summary.h5pPackages.some((p) => p.mainLibrary in h.CURSIA_H5P_PROFILE_V3.deltaByMain);
+    eq([!!r1.summary.restore, r1.summary.h5pPackages.some((p) => p.mainLibrary === 'H5P.Dialogcards' || p.mainLibrary === 'H5P.BranchingScenario')], [bundled1, false], 'rules 1: sin BS/DC; nota de restauración solo si hay QuestionSet 1.21');
   });
 
   await check('fix round 1 (I-2/M-4): «Repaso» SOLO con H5P v2 y motor h5p — reviewCards con rules 0/1 o motor SCORM ⇒ sin Dialog Cards, sin nota de restauración; facts lo rechaza', async () => {
@@ -330,7 +336,8 @@ const SRC = (bp) => ({ courseId: 777, blueprintId: 1, blueprintNumber: 1, bluepr
       const r = await B.buildDynamicMbzV3(inp);
       assert(!r.summary.h5pPackages.some((p) => p.mainLibrary === 'H5P.Dialogcards'), `sin Dialog Cards (${cfg.engine}, rules ${cfg.activityTypeRules})`);
       assert(!r.expectations.facts.counts.reviewCards, 'facts sin «Repaso»');
-      if (cfg.engine === 'h5p' && cfg.activityTypeRules !== 2) assert(!r.summary.restore, 'sin nota de restauración');
+      // UX #5: con QuestionSet 1.21 (bundled) la nota sí sale; sin BS/DC y sin QuestionSet, no.
+      if (cfg.engine === 'h5p' && cfg.activityTypeRules !== 2) eq(!!r.summary.restore, r.summary.h5pPackages.some((p) => p.mainLibrary in h.CURSIA_H5P_PROFILE_V3.deltaByMain), 'nota de restauración solo con paquetes bundled');
       const v = await V.validateMbzV3(r.mbz, r.expectations);
       assert(v.ok, JSON.stringify(v.issues.slice(0, 3)));
     }

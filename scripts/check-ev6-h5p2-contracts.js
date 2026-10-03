@@ -76,12 +76,16 @@ const GOLDEN = {
   // (showdescription 1), con la renumeración de ids que eso trae; runtime VC 3 → 4 (esquina de la tabla sin «Aspecto»).
   // Dorados anteriores (3.10.0): h5p-final-light 6ce9ebb3…, scorm-nofinal-dark b7aeda95…, h5p-nofinal-dark-mock-cleansafe
   // ab93ce5b…, scorm-final-light 6619628e…, h5p-ev5c-rules1 c96fb4bb….
+  // UX #5 (builder 3.11.0 → 3.12.0) cambia SOLO el blob .h5p de la actividad QuestionSet (H5P.QuestionSet 1.21 con su
+  // carpeta delta y los rótulos «Siguiente» / «Anterior»): contenthash + filesize de esa entrada en files.xml; ningún
+  // otro archivo cambia (diff archivo por archivo en scratchpad/r18/ux5/mbzdiff.js). Los SCORM no cambian.
+  // Dorados anteriores (3.11.0): h5p-final-light 03bb4e8b…, h5p-nofinal-dark-mock-cleansafe 5329675d…, h5p-ev5c-rules1 4a1532f2….
   mbz: {
-    'h5p-final-light': '03bb4e8b8610cdc2b7b5a8523201dc99cea10edae98ce2e04729b3695771cddb',
+    'h5p-final-light': '9504afbf6e3fef76c8e4cff830019dcb833aeae36ffb4ab669416044aa70545e',
     'scorm-nofinal-dark': '9500797ec20439c80636c1d0565af8a09a475b584c5ddf359fc1a2b76b44b383',
-    'h5p-nofinal-dark-mock-cleansafe': '5329675d33baf25262432a653c3c6690321c85abcb4a50d12ab0cf57e33fa1db',
+    'h5p-nofinal-dark-mock-cleansafe': 'a2e624021b5d3d5da5d3f0da1c9c753a7d1ca47561242b3110d8a04ac7a6f1bb',
     'scorm-final-light': '948e402dd5d5192b184801a419b78a798263cad37cbd834320daa2e25aae4562',
-    'h5p-ev5c-rules1': '4a1532f23d3f7b1047d73c28e10b0832dafbda04ace70b090dcb0efd84be54d1',
+    'h5p-ev5c-rules1': 'f93d3f658bf66d9d832643fa3215dd040cc393324b91abd9f8a3dc797a6c45a2',
   },
 };
 
@@ -805,7 +809,7 @@ function v2Doc(durationSec, videoItemKey = 'video:ch9') {
     assert(v.ok, JSON.stringify(v.issues.slice(0, 5)));
     eq(v.stats.h5p > 0, true, 'stats');
   });
-  await check('mbz-validator-v3 RECHAZA carpetas de más, de menos y library.json con otra versión; un QS con carpetas sigue "no content-only"', async () => {
+  await check('mbz-validator-v3 RECHAZA carpetas de más, de menos y library.json con otra versión; un QS 1.20 content-only con una carpeta ajena se rechaza por la delta v3', async () => {
     const mut = (fn) => async (buf) => {
       const z = await JSZip.loadAsync(buf);
       await fn(z);
@@ -853,12 +857,13 @@ function v2Doc(durationSec, videoItemKey = 'video:ch9') {
     v = await V.validateMbzV3(r.mbz, base.expectations);
     const msgs = h5pIssues(v, r.target.idnumber).map((i) => i.message);
     assert(msgs.some((m) => /H5P\.Dialogcards no es calificable/.test(m)) && !msgs.some((m) => /carpeta|delta|library\.json/.test(m)), JSON.stringify(msgs));
-    // Legacy: un QS (content-only) con una carpeta de librería sigue rechazado como antes.
+    // UX #5: QuestionSet es principal bundled en el perfil v3 (1.21 + su delta): un QS 1.20 content-only con una
+    // carpeta ajena se rechaza por la delta (falta H5P.QuestionSet-1.21, sobra H5P.Text-1.1).
     const qsB = h.buildQuestionSet({ itemKey: 'activity:q', title: 'QS', passPercentage: 70, questions: [{ kind: 'truefalse', question: 'A', correct: true }, { kind: 'truefalse', question: 'B', correct: false }] });
     const qsPkg = await h.buildContentOnlyH5p({ mainLibrary: qsB.mainLibrary, content: qsB.content, title: qsB.title, language: 'es' });
     r = await swapActivityPackage(base.mbz, qsPkg, mut((z) => z.file('H5P.Text-1.1/library.json', '{}')));
     v = await V.validateMbzV3(r.mbz, withType(base.expectations, r.target.chapterId, 'questionset'));
-    eq(h5pIssues(v, r.target.idnumber).map((i) => i.message), ['el paquete no es content-only: H5P.Text-1.1/library.json'], 'QS con carpeta');
+    eq(h5pIssues(v, r.target.idnumber).map((i) => i.message), ['faltan carpetas de librería del delta v2: H5P.QuestionSet-1.21', 'carpetas fuera del delta v2 de H5P.QuestionSet: H5P.Text-1.1'], 'QS con carpeta');
   });
 
   // ══ 7. Calificación + golden legacy ════════════════════════════════════════

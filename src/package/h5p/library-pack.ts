@@ -27,8 +27,11 @@ const PACK_ITEM_KEY = 'cursia-h5p-library-pack';
 /** Video público y neutro (Big Buck Bunny, Blender Foundation, CC-BY) solo para el contenido de instalación. */
 const PACK_SAMPLE_YOUTUBE_ID = 'aqz-KE-bpKQ';
 
-/** Contenido mínimo y neutro para el paquete de instalación de `mainLibrary`. Puro. */
-export function libraryPackSampleContent(mainLibrary: string): H5pBuiltContent {
+/**
+ * Contenido mínimo y neutro para el paquete de instalación de `mainLibrary`. Puro. `profile` (default v1)
+ * decide la versión de QuestionSet y sus textos (UX #5: v3 = QuestionSet 1.21 con «Siguiente» / «Anterior»).
+ */
+export function libraryPackSampleContent(mainLibrary: string, profile: H5pProfile = CURSIA_H5P_PROFILE_V1): H5pBuiltContent {
   const title = 'Cursia: instalación de tipos de contenido H5P';
   const mc = {
     kind: 'multichoice' as const,
@@ -42,7 +45,7 @@ export function libraryPackSampleContent(mainLibrary: string): H5pBuiltContent {
   const tf = { kind: 'truefalse' as const, question: 'Este contenido es solo de instalación.', correct: true };
   switch (mainLibrary) {
     case 'H5P.QuestionSet':
-      return buildQuestionSet({ itemKey: PACK_ITEM_KEY, title, questions: [mc, tf], passPercentage: 70 });
+      return buildQuestionSet({ itemKey: PACK_ITEM_KEY, title, questions: [mc, tf], passPercentage: 70 }, { profile });
     case 'H5P.SingleChoiceSet':
       return buildSingleChoiceSet({
         itemKey: PACK_ITEM_KEY,
@@ -209,7 +212,7 @@ export async function buildCursiaH5pLibraryPack(opts: {
   const packages: LibraryPackManifestEntry[] = [];
   for (const machineName of Object.keys(profile.mainLibraries).sort()) {
     const mainRef = profile.mainLibraries[machineName];
-    const sample = libraryPackSampleContent(machineName);
+    const sample = libraryPackSampleContent(machineName, profile);
     const libraryFiles: Record<string, Buffer> = {};
     const dirs = profile.closureByMain[machineName].full.map(h5pLibraryDirName);
     for (const dir of dirs) {

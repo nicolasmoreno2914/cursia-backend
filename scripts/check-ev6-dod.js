@@ -530,7 +530,8 @@ const ENV_KEYS = [
       const o = { engine: 'h5p', finalExam: true, courseId: 644 };
       // QUIZFB (builder 3.10.0): mismo dorado que check-ev6-pending-videos (antes 5de36d06…, builder 3.6.0).
       // #583 QUAL (builder 3.11.0): reviewmaxmarks 69904 → 272, frase del cierre, tarjeta del Libro Guía como <intro> del recurso (sin label libro_card; ids renumerados) y runtime VC 4 — diff semántico en scratchpad/r18/qual/golddiff/sem.js (antes 812c6022…, 3.10.0).
-      const GOLDEN_644 = '63dac759010c52e55998170608489649153b66342ca4b75dc179bac1a9528a9d';
+      // UX #5 (builder 3.12.0): solo cambia el .h5p del QuestionSet (QS 1.21 + delta) — antes 63dac759… (3.11.0).
+      const GOLDEN_644 = '6d58dc1e2b3d106285e9591d62e83fef251e1ef3b43eae0b59034d5793d06005';
       const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
       const r0 = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, o));
       const r1 = await B.buildDynamicMbzV3({ ...PF.packagingInput(distRoot, o), qaPreviewNotice: false });
