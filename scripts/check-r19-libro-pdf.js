@@ -153,6 +153,7 @@ async function analyze(buf) {
       imgCount: paints.length,
       wmCount: wm.length,
       fullCount: full.length,
+      sameXObject: wm.length === 1 && full.length === 1 ? wm[0].id === full[0].id : null,
       otherCount: paints.length - wm.length - full.length,
       wmFirstPaint: wm.length > 0 && paints[0] === wm[0],
       imgBeforeText: wm.length > 0 && (firstText < 0 || wm[0].i < firstText),
@@ -400,6 +401,68 @@ const keepAlive = setInterval(() => {}, 1 << 30); // una promesa de pdfjs que no
     input.contents.contentMd.set(c1, input.contents.contentMd.get(c1) + '\n\nGlosario: 日本語 y ✓ listo.');
     const r = await B.buildDynamicMbzV3(input);
     assert(r.summary.warnings.includes('libro_chars_unmapped:3'), JSON.stringify(r.summary.warnings));
+  });
+  // ── Fix round 2 (M1): PNG entrelazado, 16 bits RGBA y paleta de 1 bit → logo de la cuenta, nunca Cursia ──
+  const crc32 = (b) => { let cr = ~0; for (const x of b) { cr ^= x; for (let k = 0; k < 8; k++) cr = (cr >>> 1) ^ (0xedb88320 & -(cr & 1)); } return (~cr) >>> 0; };
+  const pngChunkJs = (type, data) => { const c = Buffer.alloc(12 + data.length); c.writeUInt32BE(data.length, 0); c.write(type, 4, 'latin1'); data.copy(c, 8); c.writeUInt32BE(crc32(c.subarray(4, 8 + data.length)), 8 + data.length); return c; };
+  /** PNG en JS puro (filtro 0): `rows(pass)` devuelve las filas crudas de cada pasada. */
+  const pngJs = (w, h, depth, colorType, interlace, rawRows, extra = []) => {
+    const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = depth; ihdr[9] = colorType; ihdr[12] = interlace;
+    return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), pngChunkJs('IHDR', ihdr), ...extra, pngChunkJs('IDAT', require('zlib').deflateSync(rawRows)), pngChunkJs('IEND', Buffer.alloc(0))]);
+  };
+  /** Píxeles de referencia RGBA 8 bits (elipse opaca sobre transparente, con degradé) — conocidos sin decodificar nada. */
+  const refRGBA = (w, h) => { const px = Buffer.alloc(w * h * 4); for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = (y * w + x) * 4; const inside = (x - w / 2) ** 2 / (w * 0.45) ** 2 + (y - h / 2) ** 2 / (h * 0.42) ** 2 <= 1; px[i] = 30; px[i + 1] = (x * 5) & 255; px[i + 2] = (y * 7) & 255; px[i + 3] = inside ? 255 : 0; } return px; };
+  const ADAM7 = [[0, 0, 8, 8], [4, 0, 8, 8], [0, 4, 4, 8], [2, 0, 4, 4], [0, 2, 2, 4], [1, 0, 2, 2], [0, 1, 1, 2]];
+  function interlacedRGBA8(w, h, px) {
+    const parts = [];
+    for (const [x0, y0, dx, dy] of ADAM7) {
+      const pw = Math.max(0, Math.ceil((w - x0) / dx)); const ph = Math.max(0, Math.ceil((h - y0) / dy));
+      if (!pw || !ph) continue;
+      for (let y = 0; y < ph; y++) { const row = Buffer.alloc(1 + pw * 4); for (let x = 0; x < pw; x++) px.copy(row, 1 + x * 4, ((y0 + y * dy) * w + x0 + x * dx) * 4, ((y0 + y * dy) * w + x0 + x * dx) * 4 + 4); parts.push(row); }
+    }
+    return pngJs(w, h, 8, 6, 1, Buffer.concat(parts));
+  }
+  function rgba16(w, h, px) {
+    const rows = []; for (let y = 0; y < h; y++) { const row = Buffer.alloc(1 + w * 8); for (let x = 0; x < w; x++) for (let k = 0; k < 4; k++) { const v = px[(y * w + x) * 4 + k]; row.writeUInt16BE(v * 257, 1 + x * 8 + k * 2); } rows.push(row); }
+    return pngJs(w, h, 16, 6, 0, Buffer.concat(rows));
+  }
+  /** Paleta de 1 bit: índice 0 = fondo transparente (tRNS), índice 1 = tinta; devuelve también sus RGBA de referencia. */
+  function palette1(w, h) {
+    const rows = []; const ref = Buffer.alloc(w * h * 4);
+    for (let y = 0; y < h; y++) { const row = Buffer.alloc(1 + Math.ceil(w / 8)); for (let x = 0; x < w; x++) { const on = ((x >> 3) + (y >> 3)) % 2 === 0 && (x - w / 2) ** 2 + (y - h / 2) ** 2 < (h / 2) ** 2; if (on) row[1 + (x >> 3)] |= 0x80 >> (x & 7); const i = (y * w + x) * 4; if (on) { ref[i] = 200; ref[i + 1] = 40; ref[i + 2] = 60; ref[i + 3] = 255; } } rows.push(row); }
+    const plte = pngChunkJs('PLTE', Buffer.from([255, 255, 255, 200, 40, 60])); const trns = pngChunkJs('tRNS', Buffer.from([0]));
+    return { png: pngJs(w, h, 1, 3, 0, Buffer.concat(rows), [plte, trns]), ref };
+  }
+  const refHash = (w, h, rgba) => { const n = w * h; const rgb = Buffer.alloc(n * 3); const a = Buffer.alloc(n); for (let i = 0; i < n; i++) { rgb[i * 3] = rgba[i * 4]; rgb[i * 3 + 1] = rgba[i * 4 + 1]; rgb[i * 3 + 2] = rgba[i * 4 + 2]; a[i] = rgba[i * 4 + 3]; } return { width: w, height: h, rgb: sha(rgb), a: sha(a), alphaRaw: a, rgbRaw: rgb }; };
+  for (const [name, mk] of [
+    ['entrelazado (Adam7) RGBA 8 bits', () => { const px = refRGBA(220, 90); return { png: interlacedRGBA8(220, 90, px), w: 220, h: 90, ref: px }; }],
+    ['RGBA 16 bits', () => { const px = refRGBA(180, 72); return { png: rgba16(180, 72, px), w: 180, h: 72, ref: px }; }],
+    ['paleta de 1 bit con tRNS', () => { const r = palette1(160, 64); return { png: r.png, w: 160, h: 64, ref: r.ref }; }],
+  ]) {
+    await check(`fix 2 (M1): PNG ${name} de la cuenta → marca de agua Y logo de portada (píxeles exactos), no Cursia, sin avisos`, async () => {
+      const f = mk();
+      if (process.env.R19_DUMP_PNG) fs.writeFileSync(path.join(process.env.R19_DUMP_PNG, `${name.replace(/[^a-z0-9]+/gi, '_')}.png`), f.png);
+      const logo = LL.resolveLibroLogo({ source: 'user_settings', dataUri: dataUri('image/png', f.png) });
+      assert(logo.source === 'user_settings' && logo.warnings.length === 0, `${logo.source} ${JSON.stringify(logo.warnings)}`);
+      assert(LL.pdfkitAccepts(f.png, f.w, f.h), 'pdfkit acepta los bytes originales');
+      const r = await LB.renderLibroPdfV3(libroInput({ modules: 1, chapters: 1, paras: 2, logo }));
+      const a = await analyze(r.pdf);
+      const exp = refHash(f.w, f.h, f.ref);
+      a.pages.forEach((p, i) => assert(p.wmCount === 1 && samePixels(p.image, exp), `página ${i + 1}: la marca de agua no es el logo`));
+      assert(a.pages[0].fullCount === 1 && a.pages[0].sameXObject === true, 'el logo de la portada es la MISMA imagen (XObject) que la marca de agua');
+      assert(!samePixels(a.pages[0].image, cursiaPx), 'no Cursia');
+    });
+  }
+  await check('fix 2 (M1): los guardas siguen — PNG con filtro inválido, IDAT truncado o bomba de descompresión → Cursia + aviso', () => {
+    const px = refRGBA(64, 64);
+    const good = rgba16(64, 64, px);
+    const rows = Buffer.alloc((1 + 64 * 4) * 64); for (let y = 0; y < 64; y++) rows[y * (1 + 64 * 4)] = 9;
+    const badFilter = pngJs(64, 64, 8, 6, 0, rows);
+    const bomb = pngJs(64, 64, 8, 6, 0, Buffer.alloc(400 * 1024 * 1024 / 64)); // datos de más que el tamaño declarado
+    for (const [name, png, re] of [['filtro', badFilter, /png_bad_filter_9/], ['truncado', good.subarray(0, good.length - 40), /png_/], ['bomba', bomb, /png_bomb/]]) {
+      const l = LL.resolveLibroLogo({ source: 'user_settings', dataUri: dataUri('image/png', png) });
+      assert(l.source === 'cursia_default' && re.test(l.warnings[0] || ''), `${name}: ${JSON.stringify(l.warnings)}`);
+    }
   });
   await check('B: sin logo → logo de Cursia, sin avisos', async () => {
     for (const cand of [null, undefined, { source: 'user_settings', dataUri: '' }]) {
