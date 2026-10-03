@@ -127,8 +127,11 @@ export function welcomeLabel(
   if (c.videos > 0) stats.push({ value: c.videos, label: plural(c.videos, 'video interactivo', 'videos interactivos') });
   if (c.activities > 0) stats.push({ value: c.activities, label: plural(c.activities, 'actividad práctica', 'actividades prácticas') });
   if (c.evaluations > 0) stats.push({ value: c.evaluations, label: plural(c.evaluations, 'evaluación', 'evaluaciones') });
+  // UX r18 (problema 1): Moodle 4.5 siempre pinta el nombre de la sección 0 («Bienvenida») como
+  // encabezado justo encima de este label (núcleo de format_topics, no se puede quitar desde el
+  // .mbz). El hero NO repite esa palabra como kicker: abre directo con el título del curso.
   const hero = renderComponent(
-    { type: 'hero', eyebrow: 'Bienvenida', title: facts.course.title, lead: intro.welcome },
+    { type: 'hero', title: facts.course.title, lead: intro.welcome },
     theme,
     { uid: 'shell-welcome-hero', level: lvl(h), countless: true },
   );
@@ -146,14 +149,18 @@ export function welcomeLabel(
 
 // ─── S0.3 Audio de bienvenida ───────────────────────────────────────────────
 
+/** Títulos visibles de los labels de audio; también son el nombre accesible (aria-label) de su reproductor. */
+const AUDIO_WELCOME_TITLE = 'Audio de bienvenida';
+const AUDIOBOOK_TITLE = 'Audiolibro';
+
 export function audioWelcomeLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
   const h = hx(theme, opts);
   const s = bgSurf(h);
   const inner =
     eyebrow(h, 'Escucha', s) +
-    heading(h, 'h3', 'Audio de bienvenida', s) +
+    heading(h, 'h3', AUDIO_WELCOME_TITLE, s) +
     pHtml(h, labelHtml(`Escucha la presentación del curso. Duración: ${formatDurationEs(facts.audio.welcomeSeconds)}.`), s, { secondary: true }) +
-    audio(h, `@@PLUGINFILE@@/${SHELL_AUDIO_WELCOME_FILE}`, 'el audio de bienvenida', s);
+    audio(h, `@@PLUGINFILE@@/${SHELL_AUDIO_WELCOME_FILE}`, 'el audio de bienvenida', s, AUDIO_WELCOME_TITLE);
   return out('Audio de bienvenida', root(h, 'shell-audio-welcome', inner), facts);
 }
 
@@ -305,9 +312,9 @@ export function audiobookLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: 
   });
   const inner =
     eyebrow(h, 'Escucha', s) +
-    heading(h, 'h3', 'Audiolibro', s) +
+    heading(h, 'h3', AUDIOBOOK_TITLE, s) +
     pHtml(h, labelHtml(`La versión narrada de los capítulos. Duración total: ${formatDurationEs(facts.audio.audiobookSeconds)}.`), s, { secondary: true }) +
-    audio(h, `@@PLUGINFILE@@/${SHELL_AUDIOBOOK_FILE}`, 'el audiolibro', s) +
+    audio(h, `@@PLUGINFILE@@/${SHELL_AUDIOBOOK_FILE}`, 'el audiolibro', s, AUDIOBOOK_TITLE) +
     `<div${' style="margin:24px 0 0 0"'}>` +
     eyebrow(h, 'Índice', s) +
     rows(h, items.join(''), { ordered: true }) +

@@ -1,6 +1,7 @@
 /**
  * Edu EV3 — navegación del estudiante: botones de llamada a la acción (V1 los tenía) que llevan
- * a la siguiente pieza del curso: «Iniciar actividad del capítulo N →», «Presentar evaluación del módulo N →»,
+ * a la siguiente pieza del curso: «Iniciar actividad →» (solo si la actividad NO se embebe en la página,
+ * ver `activityEmbedsInline`), «Presentar evaluación del módulo N →»,
  * «Continuar con el módulo N →».
  *
  * El shell no conoce los ids de Moodle: escribe un marcador `cursia-cta://…` en el href y el
@@ -19,6 +20,17 @@ export function ctaSection(sectionNum: number): string {
   if (!Number.isInteger(sectionNum) || sectionNum < 0) throw new Error(`CTA: sección inválida ${sectionNum}`);
   return `cursia-cta://section/${sectionNum}`;
 }
+/**
+ * UX r18 (problema 4): ¿la actividad del capítulo se muestra EMBEBIDA en la página del curso (su
+ * descripción visible trae el reproductor)? Hoy: sí con H5P (`h5pActivityInlineIntroHtml`), no con
+ * SCORM (`scormIntroHtml` se abre en su propia página). Fuente única de verdad para el ensamblador
+ * (sin botón «Iniciar actividad» hacia una actividad que ya está debajo) y el builder (qué intro usa),
+ * así las dos decisiones no pueden divergir.
+ */
+export function activityEmbedsInline(variant: 'h5p' | 'scorm' | string | null | undefined): boolean {
+  return variant === 'h5p';
+}
+
 /** Cualquier marcador (para el reemplazo y la verificación final). */
 export const CTA_RE = /cursia-cta:\/\/(next-activity|next-exam|badges|section\/(\d+))/g;
 

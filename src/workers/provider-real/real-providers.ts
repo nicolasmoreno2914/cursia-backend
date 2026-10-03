@@ -784,7 +784,11 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
   let mp3: Buffer;
   let durationSeconds: number;
   try {
-    mp3 = parts.length === 1 ? parts[0] : concatMp3(parts);
+    // UX r18 fix 1 (C1): SIEMPRE por concatMp3, también con una sola parte: el MP3 final de v3 (bienvenida y
+    // capítulos del audiolibro) lleva el frame Info con el conteo real de frames, escrito en JS. El transcode
+    // genérico (tts.service / audio-worker legacy / POST /tts/speech) NO escribe Info: esos caminos concatenan
+    // bytes crudos y un Info por segmento describiría solo el primero.
+    mp3 = concatMp3(parts);
     durationSeconds = mp3DurationSeconds(mp3);
   } catch (err) {
     return fail(deps, item, `TTS_AUDIO_INVALID: ${err instanceof Error ? err.message : String(err)}`, true, { knownOutcome: true });

@@ -256,6 +256,43 @@ export const H5P_L10N_ES419: Readonly<Record<string, Readonly<Record<string, str
 });
 
 /**
+ * UX #5 (r18) — textos de interfaz que solo existen desde una minor (semantics nueva). Se escriben
+ * SOLO si el paquete apunta a esa versión o posterior (applyH5pL10n con `version`): un paquete de
+ * QuestionSet 1.20 queda byte a byte igual (el filtro H5P de Moodle borraría claves fuera de su
+ * semantics). QuestionSet 1.21: rótulos de la navegación («Siguiente ›» / «Anterior»; en 1.20 el
+ * botón no tenía rótulo) y la pantalla de resultado.
+ */
+export const H5P_L10N_ES419_SINCE: Readonly<Record<string, ReadonlyArray<Readonly<{ majorVersion: number; minorVersion: number; texts: Readonly<Record<string, string>> }>>>> =
+  Object.freeze({
+    'H5P.QuestionSet': Object.freeze([
+      Object.freeze({
+        majorVersion: 1,
+        minorVersion: 21,
+        texts: Object.freeze({
+          'texts.previous': 'Anterior',
+          'texts.next': 'Siguiente',
+          'endGame.scoreHeader': 'Puntaje',
+          'endGame.amountCorrect': '@finals de @totals correctas',
+        }),
+      }),
+    ]),
+  });
+
+/** Tabla es-419 completa de `machineName` para la versión `version` (sin versión = la tabla base). */
+export function h5pL10nTable(machineName: string, version?: { majorVersion: number; minorVersion: number }): Record<string, string> {
+  const table = H5P_L10N_ES419[machineName];
+  if (!table) throw new Error(`H5P_L10N_MISSING_LIBRARY: ${machineName}`);
+  const out: Record<string, string> = { ...table };
+  if (version) {
+    for (const add of H5P_L10N_ES419_SINCE[machineName] || []) {
+      const reaches = version.majorVersion > add.majorVersion || (version.majorVersion === add.majorVersion && version.minorVersion >= add.minorVersion);
+      if (reaches) Object.assign(out, add.texts);
+    }
+  }
+  return out;
+}
+
+/**
  * Tokens que son idénticos en inglés y español (o no son texto de interfaz) y
  * por eso pueden quedar con su default. Solo tokens, nunca frases.
  */
@@ -277,11 +314,11 @@ function setPath(target: Record<string, any>, dotted: string, value: string): vo
 
 /**
  * Escribe todos los textos es-419 de `machineName` sobre `params` (muta y
- * devuelve `params`). Falla fuerte si la librería no tiene tabla.
+ * devuelve `params`). Falla fuerte si la librería no tiene tabla. Con `version`
+ * agrega además las claves de H5P_L10N_ES419_SINCE que esa versión ya tiene.
  */
-export function applyH5pL10n<T extends Record<string, any>>(machineName: string, params: T): T {
-  const table = H5P_L10N_ES419[machineName];
-  if (!table) throw new Error(`H5P_L10N_MISSING_LIBRARY: ${machineName}`);
+export function applyH5pL10n<T extends Record<string, any>>(machineName: string, params: T, version?: { majorVersion: number; minorVersion: number }): T {
+  const table = h5pL10nTable(machineName, version);
   for (const key of Object.keys(table).sort()) setPath(params, key, table[key]);
   return params;
 }

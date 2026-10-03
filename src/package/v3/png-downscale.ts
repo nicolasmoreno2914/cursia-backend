@@ -1,23 +1,31 @@
 /**
  * Cursia V2.1 — R12: reducción de la portada de Gamma (review G5, concern 2).
  *
- * Con `forceclean=1` HTMLPurifier descarta `width`/`max-width` del `<img>` de
- * la tarjeta de presentación: la portada se muestra a su tamaño natural. Una
- * portada de Gamma (~1920 px) desborda cualquier label. Reducir la imagen a
- * ≤ `COVER_MAX_WIDTH` px acota el daño (en Boost el label tiene
- * `.no-overflow`) y además achica el .mbz (§Q.7).
+ * Historia: en R12 el tope (640 px) era la defensa contra el desborde con
+ * `forceclean=1` (HTMLPurifier descarta el `width` CSS del `<img>`). Desde R13
+ * esa defensa es el atributo `width="240"` de la tarjeta (card-html.ts), que
+ * sobrevive al purificador; el tope ahora solo acota el peso del .mbz (§Q.7)
+ * sin bajar de la resolución que pide la pantalla (ver UX r18 abajo).
  *
  * Decodificador/encodificador PNG propio (sin dependencias): 8 bits, sin
  * entrelazado, tipos de color 0/2/3/4/6. Filtro de caja (promedio por área).
  * Determinístico: mismos bytes de entrada → mismos bytes de salida.
+ *
+ * UX r18 (problema 3): el tope de 640 px dejaba la portada borrosa (se muestra a ~772 px CSS = ~1544 px
+ * físicos en pantallas DPR 2). El desborde con forceclean que motivó el tope ya lo cubre el atributo
+ * `width="240"` de la tarjeta (R13, card-html.ts), así que el tope sube a 1600 px (raster de 150 dpi =
+ * 2000×1125 → 1600×900). Para acotar el peso, la PNG reducida se codifica con filtro adaptativo por fila
+ * (heurística estándar de libpng: mínima suma de diferencias absolutas) en vez de sin filtro. Costo medido
+ * (rasters reales del #616): 0,52–0,80 MB por portada (antes 0,18–0,22 MB a 640 px): ≈ +1,75 MB en un curso de
+ * 4 capítulos, ≈ +4 MB en uno de 9. El v3 no tiene tope de tamaño; el límite práctico es el de subida del Moodle.
  * Una PNG fuera de ese subconjunto NO se modifica (se devuelve tal cual con
  * `reason`): el paquete sigue siendo correcto, solo más pesado; el empaque lo
  * reporta como aviso visible.
  */
-import { inflateSync } from 'zlib';
-import { PNG_SIGNATURE, encodePng } from './synthetic-media';
+import { deflateSync, inflateSync } from 'zlib';
+import { PNG_SIGNATURE, pngChunk } from './synthetic-media';
 
-export const COVER_MAX_WIDTH = 640;
+export const COVER_MAX_WIDTH = 1600;
 
 export interface DecodedPng {
   width: number;
@@ -154,6 +162,54 @@ function boxResample(src: DecodedPng, tw: number, th: number): Buffer {
   return out;
 }
 
+/**
+ * PNG RGB/RGBA de 8 bits con filtro adaptativo por fila (None/Sub/Up/Average/Paeth; se elige el de
+ * menor suma de |byte con signo|, la heurística de libpng). Determinístico. Sin pérdida.
+ */
+export function encodePngFiltered(width: number, height: number, channels: 3 | 4, pixels: Buffer): Buffer {
+  if (pixels.length !== width * height * channels) throw new Error('PNG_ENCODE: tamaño de píxeles inconsistente');
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = channels === 4 ? 6 : 2;
+  const stride = width * channels;
+  const raw = Buffer.alloc((stride + 1) * height);
+  const cand = [0, 1, 2, 3, 4].map(() => Buffer.alloc(stride));
+  for (let y = 0; y < height; y++) {
+    const row = pixels.subarray(y * stride, (y + 1) * stride);
+    const up = y > 0 ? pixels.subarray((y - 1) * stride, y * stride) : null;
+    let best = 0;
+    let bestSum = Infinity;
+    for (let ft = 0; ft < 5; ft++) {
+      const out = cand[ft];
+      let sum = 0;
+      for (let x = 0; x < stride; x++) {
+        const a = x >= channels ? row[x - channels] : 0;
+        const b = up ? up[x] : 0;
+        const c = up && x >= channels ? up[x - channels] : 0;
+        const pred = ft === 0 ? 0 : ft === 1 ? a : ft === 2 ? b : ft === 3 ? (a + b) >> 1 : paeth(a, b, c);
+        const v = (row[x] - pred) & 0xff;
+        out[x] = v;
+        sum += v < 128 ? v : 256 - v;
+        if (sum >= bestSum) break;
+      }
+      if (sum < bestSum) {
+        bestSum = sum;
+        best = ft;
+      }
+    }
+    raw[y * (stride + 1)] = best;
+    cand[best].copy(raw, y * (stride + 1) + 1);
+  }
+  return Buffer.concat([
+    PNG_SIGNATURE,
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', deflateSync(raw, { level: 9 })),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
 export interface CoverDownscaleResult {
   png: Buffer;
   width: number;
@@ -185,5 +241,5 @@ export function downscaleCoverPng(buf: Buffer, maxWidth = COVER_MAX_WIDTH): Cove
   const tw = maxWidth;
   const th = Math.max(1, Math.round((dec.height * tw) / dec.width));
   const px = boxResample(dec, tw, th);
-  return { png: encodePng(tw, th, dec.channels, px), width: tw, height: th, downscaled: true };
+  return { png: encodePngFiltered(tw, th, dec.channels, px), width: tw, height: th, downscaled: true };
 }

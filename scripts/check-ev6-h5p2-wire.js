@@ -66,12 +66,18 @@ const GOLDEN = {
   // (showdescription 1), con la renumeración de ids que eso trae; runtime VC 3 → 4 (esquina de la tabla sin «Aspecto»).
   // Dorados anteriores (3.10.0): h5p-final-light 6ce9ebb3…, scorm-nofinal-dark b7aeda95…, h5p-nofinal-dark-mock-cleansafe
   // ab93ce5b…, scorm-final-light 6619628e…, h5p-ev5c-rules1 c96fb4bb….
+  // UX r18 (builder 3.11.0 → 3.12.0) cambia el .mbz a propósito, y SOLO en esto (diff semántico por idnumber contra
+  // origin/staging, scratchpad/r18/uximpl-golddiff4.js): sección 0 con el hero primero y el foro al final (ids de la
+  // sección 0 renumerados), sin kicker «Bienvenida» en el hero, <audio preload="metadata" title=…> (+ aria-label en ENHANCED; fix 1, M6), frame Info en
+  // audiolibro.mp3, portadas a 1600 px (antes 640) y sin botón «Iniciar actividad» hacia la H5P embebida.
+  // Dorados anteriores (3.11.0): h5p-final-light 03bb4e8b…, scorm-nofinal-dark 9500797e…, h5p-nofinal-dark-mock-cleansafe
+  // 5329675d…, scorm-final-light 948e402d…, h5p-ev5c-rules1 4a1532f2….
   mbz: {
-    'h5p-final-light': '03bb4e8b8610cdc2b7b5a8523201dc99cea10edae98ce2e04729b3695771cddb',
-    'scorm-nofinal-dark': '9500797ec20439c80636c1d0565af8a09a475b584c5ddf359fc1a2b76b44b383',
-    'h5p-nofinal-dark-mock-cleansafe': '5329675d33baf25262432a653c3c6690321c85abcb4a50d12ab0cf57e33fa1db',
-    'scorm-final-light': '948e402dd5d5192b184801a419b78a798263cad37cbd834320daa2e25aae4562',
-    'h5p-ev5c-rules1': '4a1532f23d3f7b1047d73c28e10b0832dafbda04ace70b090dcb0efd84be54d1',
+    'h5p-final-light': '5e9bf0f015e3c37aab9c91c5f0b4fe9ac29f4813303393f7210ed16e13f7524f',
+    'scorm-nofinal-dark': 'b967577f1cf7d78ab87a70442335d7cd636113e6774607a6d6e9480d8759e4c6',
+    'h5p-nofinal-dark-mock-cleansafe': '14d45c9d64b75b23d51c04452e15c6f6038c614f9a80d1d82d4d1d1cc202fda7',
+    'scorm-final-light': '6c18bcced0c41fa4a59fe91529c077e0d53aa759bffcc69725d8bbb9d5897fa9',
+    'h5p-ev5c-rules1': '3c6d123eb5eb1f8c4168bf4d4adcd592b60f0587f683bdbc85a4b3aaf76d99b1',
   },
 };
 /** Listas propias de rules 2 (CONGELADO: cambiar cualquiera = reglas 3). */
@@ -319,7 +325,9 @@ const SRC = (bp) => ({ courseId: 777, blueprintId: 1, blueprintNumber: 1, bluepr
       const hj = JSON.parse(await (await JSZip.loadAsync(blob)).file('h5p.json').async('string'));
       assert(!hj.preloadedDependencies.some((d) => d.machineName === 'H5P.Text'), 'rules 1: sin H5P.Text');
     }
-    assert(!r1.summary.restore, 'rules 1: sin nota de restauración');
+    // UX #5: la nota de restauración sale con cualquier paquete bundled del perfil v3 (desde 3.12.0 también QuestionSet 1.21).
+    const bundled1 = r1.summary.h5pPackages.some((p) => p.mainLibrary in h.CURSIA_H5P_PROFILE_V3.deltaByMain);
+    eq([!!r1.summary.restore, r1.summary.h5pPackages.some((p) => p.mainLibrary === 'H5P.Dialogcards' || p.mainLibrary === 'H5P.BranchingScenario')], [bundled1, false], 'rules 1: sin BS/DC; nota de restauración solo si hay QuestionSet 1.21');
   });
 
   await check('fix round 1 (I-2/M-4): «Repaso» SOLO con H5P v2 y motor h5p — reviewCards con rules 0/1 o motor SCORM ⇒ sin Dialog Cards, sin nota de restauración; facts lo rechaza', async () => {
@@ -330,7 +338,8 @@ const SRC = (bp) => ({ courseId: 777, blueprintId: 1, blueprintNumber: 1, bluepr
       const r = await B.buildDynamicMbzV3(inp);
       assert(!r.summary.h5pPackages.some((p) => p.mainLibrary === 'H5P.Dialogcards'), `sin Dialog Cards (${cfg.engine}, rules ${cfg.activityTypeRules})`);
       assert(!r.expectations.facts.counts.reviewCards, 'facts sin «Repaso»');
-      if (cfg.engine === 'h5p' && cfg.activityTypeRules !== 2) assert(!r.summary.restore, 'sin nota de restauración');
+      // UX #5: con QuestionSet 1.21 (bundled) la nota sí sale; sin BS/DC y sin QuestionSet, no.
+      if (cfg.engine === 'h5p' && cfg.activityTypeRules !== 2) eq(!!r.summary.restore, r.summary.h5pPackages.some((p) => p.mainLibrary in h.CURSIA_H5P_PROFILE_V3.deltaByMain), 'nota de restauración solo con paquetes bundled');
       const v = await V.validateMbzV3(r.mbz, r.expectations);
       assert(v.ok, JSON.stringify(v.issues.slice(0, 3)));
     }
@@ -451,7 +460,7 @@ const SRC = (bp) => ({ courseId: 777, blueprintId: 1, blueprintNumber: 1, bluepr
       svc.findLatestPackageJob = async () => ({ worker_status: 'running', output_summary: summary });
       return svc.getPackageStatus(1, 'o', 1, 'r');
     };
-    eq((await pkg({ restore: built2.summary.restore })).restore, { as: 'admin_or_manager', note: B.H5P_V2_RESTORE_NOTE.note }, 'con librerías incluidas');
+    eq((await pkg({ restore: built2.summary.restore })).restore, { as: 'admin_or_manager', note: B.H5P_BUNDLED_RESTORE_NOTE.note }, 'con librerías incluidas');
     assert(!('restore' in (await pkg({}))), 'paquete de siempre: sin restore');
     assert(!('restore' in (await pkg({ restore: { as: 'otro', note: 'x' } }))), 'forma inesperada: se ignora');
     const { CourseStructureService } = L('modules/course-structure/course-structure.service.js');

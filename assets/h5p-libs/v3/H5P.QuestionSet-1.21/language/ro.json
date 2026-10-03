@@ -1,0 +1,304 @@
+{
+  "semantics": [
+    {
+      "label": "Introducere chestionar",
+      "fields": [
+        {
+          "label": "Afișare introducere"
+        },
+        {
+          "label": "Titlu",
+          "description": "Acest titlu va fi afișat deasupra textului introductiv."
+        },
+        {
+          "label": "Text introductiv",
+          "description": "Acest text va fi afișat înainte de începerea chestionarului."
+        },
+        {
+          "label": "Text buton de pornire",
+          "default": "Pornește chestionarul"
+        },
+        {
+          "label": "Background image",
+          "description": "An optional background image for the introduction."
+        },
+        {
+          "label": "Alternative text",
+          "description": "If the browser can't load the image this text will be displayed instead. Also used by \"text-to-speech\" readers."
+        }
+      ]
+    },
+    {
+      "label": "Progress indicator",
+      "description": "Question set progress indicator style. Will be Textual if backwards navigation is disabled.",
+      "options": [
+        {
+          "label": "Textual"
+        },
+        {
+          "label": "Puncte"
+        }
+      ]
+    },
+    {
+      "label": "Procentaj de promovare",
+      "description": "Procentajul din scorul total necesar pentru promovarea chestionarului."
+    },
+    {
+      "label": "Întrebări",
+      "widgets": [
+        {
+          "label": "Implicit"
+        },
+        {
+          "label": "Textual"
+        }
+      ],
+      "entity": "question",
+      "field": {
+        "label": "Tipul întrebării",
+        "description": "Biblioteca pentru această întrebare."
+      }
+    },
+    {
+      "label": "Texte de interfață în chestionar",
+      "fields": [
+        {
+          "label": "Butonul Înapoi",
+          "default": "Întrebarea precedentă"
+        },
+        {
+          "label": "Back button label",
+          "default": "Previous"
+        },
+        {
+          "label": "Next button",
+          "default": "Next question"
+        },
+        {
+          "label": "Next button label",
+          "default": "Next"
+        },
+        {
+          "label": "Finish button",
+          "default": "Finish"
+        },
+        {
+          "label": "Butonul Trimitere",
+          "default": "Trimitere"
+        },
+        {
+          "label": "Text progres",
+          "description": "Text utilizat dacă este selectat progresul textual.",
+          "default": "Întrebarea: @current din @total întrebări"
+        },
+        {
+          "label": "Etichetă pentru a sări la o anumită întrebare",
+          "description": "Trebuie să utilizați substituentul „%d” în loc de numărul întrebării și %total în loc de numărul total de întrebări.",
+          "default": "Întrebarea %d din %total"
+        },
+        {
+          "label": "Question heading",
+          "default": "Question"
+        },
+        {
+          "label": "Progres Readspeaker",
+          "description": "Poate utiliza variabilele de întrebare @current și @total",
+          "default": "Întrebarea @current din @total"
+        },
+        {
+          "label": "Text întrebare fără răspuns",
+          "default": "Fără răspuns"
+        },
+        {
+          "label": "Text întrebare cu răspuns",
+          "default": "Cu răspuns"
+        },
+        {
+          "label": "Text întrebare curentă",
+          "default": "Întrebare curentă"
+        },
+        {
+          "label": "Etichetă de navigare pentru readspeakers",
+          "default": "Întrebări"
+        },
+        {
+          "label": "Instrucțiuni pentru navigarea în setul de întrebări cu cititor de ecran",
+          "default": "Alegeți întrebarea de afișat"
+        }
+      ]
+    },
+    {
+      "label": "Dezactivați navigarea înapoi",
+      "description": "Această opțiune vă va permite să vă deplasați doar înainte în setul de întrebări"
+    },
+    {
+      "label": "Amestecare întrebări",
+      "description": "Activați pentru a amesteca ordinea întrebărilor la afișare."
+    },
+    {
+      "label": "Numărul de întrebări de afișat:",
+      "description": "Creați un lot aleatoriu de întrebări din total."
+    },
+    {
+      "label": "Chestionar finalizat",
+      "fields": [
+        {
+          "label": "Afișare rezultate"
+        },
+        {
+          "label": "Afișare buton de soluție"
+        },
+        {
+          "label": "Afișare buton de reîncercare"
+        },
+        {
+          "label": "Mesaj fără rezultate",
+          "description": "Text afișat pe pagina de finalizare când „Afișare rezultate” este dezactivat",
+          "default": "Finalizat"
+        },
+        {
+          "label": "Results heading",
+          "default": "Results",
+          "description": "This heading will be displayed at the end of the quiz when the user has answered all questions."
+        },
+        {
+          "label": "Amount correct heading",
+          "description": "Header to show the final score to the user on the end screen",
+          "default": "@finals of @totals correct"
+        },
+        {
+          "label": "Score announcer",
+          "description": "This label will be used for announcing the final score to the user on the end screen",
+          "default": "You got @finals out of @totals points"
+        },
+        {
+          "label": "Score heading",
+          "description": "Header for the score part of the results table",
+          "default": "Score"
+        },
+        {
+          "label": "Overall Feedback",
+          "fields": [
+            {
+              "widgets": [
+                {
+                  "label": "Implicit"
+                }
+              ],
+              "label": "Definiți feedback personalizat pentru orice interval de scor",
+              "description": "Faceți clic pe butonul „Adăugare interval” pentru a adăuga oricâte intervale aveți nevoie. Exemplu: 0-20% Scor slab, 21-91% Scor mediu, 91-100% Scor excelent!",
+              "entity": "range",
+              "field": {
+                "fields": [
+                  {
+                    "label": "Interval de scor"
+                  },
+                  {},
+                  {
+                    "label": "Feedback pentru intervalul de scor definit",
+                    "placeholder": "Completați feedback-ul"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "label": "Feedback vechi",
+          "fields": [
+            {
+              "label": "Salutare de promovare a chestionarului",
+              "description": "Acest text va fi afișat deasupra scorului dacă utilizatorul a promovat cu succes chestionarul."
+            },
+            {
+              "label": "Comentariu de promovare",
+              "description": "Acest comentariu va fi afișat după scor dacă utilizatorul a promovat cu succes chestionarul."
+            },
+            {
+              "label": "Titlu de eșuare a chestionarului",
+              "description": "Acest text va fi afișat deasupra scorului dacă utilizatorul a eșuat la chestionar."
+            },
+            {
+              "label": "Comentariu de eșuare",
+              "description": "Acest comentariu va fi afișat după scor dacă utilizatorul a eșuat la chestionar."
+            }
+          ]
+        },
+        {
+          "label": "Etichetă buton soluție",
+          "default": "Arată soluția",
+          "description": "Text pentru butonul de soluție."
+        },
+        {
+          "label": "Etichetă buton de reîncercare",
+          "default": "Reîncearcă",
+          "description": "Text pentru butonul de reîncercare."
+        },
+        {
+          "label": "Text buton Finalizare",
+          "default": "Finalizare"
+        },
+        {
+          "label": "Text buton Trimitere",
+          "default": "Trimitere"
+        },
+        {
+          "label": "Afișare videoclip înainte de rezultatele chestionarului"
+        },
+        {
+          "label": "Activare buton de omitere a videoclipului"
+        },
+        {
+          "label": "Etichetă buton de omitere a videoclipului",
+          "default": "Omite videoclipul"
+        },
+        {
+          "label": "Videoclip de promovare",
+          "description": "Acest videoclip va fi redat dacă utilizatorul a promovat cu succes chestionarul."
+        },
+        {
+          "label": "Videoclip de eșuare",
+          "description": "Acest videoclip va fi redat dacă utilizatorul eșuează la chestionar."
+        }
+      ]
+    },
+    {
+      "label": "Behavioural settings",
+      "fields": [
+        {
+          "label": "Afișare butoane „Verificare”",
+          "description": "Această opțiune determină dacă butonul „Verificare” va fi afișat pentru toate întrebările."
+        },
+        {
+          "label": "Suprascriere buton „Afișare soluție”",
+          "description": "Această opțiune determină dacă butonul „Afișare soluție” va fi afișat pentru toate întrebările, dezactivat pentru toate sau configurat pentru fiecare întrebare în parte.",
+          "options": [
+            {
+              "label": "Activat"
+            },
+            {
+              "label": "Dezactivat"
+            }
+          ]
+        },
+        {
+          "label": "Suprascriere buton „Reîncercare”",
+          "description": "Această opțiune determină dacă butonul „Reîncercare” va fi afișat pentru toate întrebările, dezactivat pentru toate sau configurat pentru fiecare întrebare în parte.",
+          "options": [
+            {
+              "label": "Activat"
+            },
+            {
+              "label": "Dezactivat"
+            }
+          ]
+        },
+        {
+          "label": "Background image",
+          "description": "An optional background image for the Question set."
+        }
+      ]
+    }
+  ]
+}

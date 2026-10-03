@@ -1,0 +1,511 @@
+{
+  "semantics": [
+    {
+      "label": "Interaktívvideó-szerkesztő",
+      "fields": [
+        {
+          "label": "Videó feltöltése/beágyazása",
+          "fields": [
+            {
+              "label": "Videó hozzáadása",
+              "description": "Kattintson az alábbi elemre a használni kívánt videó hozzáadásához. Hozzáadhat videó hivatkozást, vagy videofájlokat tölthet fel. Lehetőség van a videó több verziójának hozzáadására, különböző minőségben. A böngészők maximális támogatásának biztosítása érdekében legalább webm és mp4 formátumban adjon hozzá egy-egy verziót."
+            },
+            {
+              "label": "Kezdőképernyő beállításai (YouTube videók esetében nem támogatott)",
+              "fields": [
+                {
+                  "label": "Az interaktív videó címe",
+                  "default": "Interaktív videó",
+                  "description": "Összefoglalókban, statisztikákban stb. használva"
+                },
+                {
+                  "label": "Cím elrejtése a videó kezdőképernyőjén"
+                },
+                {
+                  "label": "Rövid leírás (nem kötelező)",
+                  "description": "Opcionális. Egy rövid leírás megjelenítése a videó kezdőképernyőjén. YouTube videók esetében nem működik."
+                },
+                {
+                  "label": "Fedőkép",
+                  "description": "A kép azelőtt jelenik meg, hogy a felhasználó elindítaná a videót. YouTube videók esetében nem működik."
+                }
+              ]
+            },
+            {
+              "label": "Feliratsávok (YouTube videók esetében nem támogatott)",
+              "fields": [
+                {
+                  "label": "Elérhető feliratsávok",
+                  "entity": "Sáv",
+                  "field": {
+                    "label": "Sáv",
+                    "fields": [
+                      {
+                        "label": "Sáv neve",
+                        "description": "Több elérhető feliratsáv esetén használatos, a felhasználónak ki kell választania egy feliratsávot. Például a „spanyol feliratok” egy spanyol feliratsáv neve lehet.",
+                        "default": "Feliratok"
+                      },
+                      {
+                        "label": "Szövegsáv típusa",
+                        "options": [
+                          {
+                            "label": "Feliratok"
+                          },
+                          {
+                            "label": "Bővített feliratok"
+                          },
+                          {
+                            "label": "Leírások"
+                          }
+                        ]
+                      },
+                      {
+                        "label": "Source language, must be defined for subtitles",
+
+                        "description": "Must be a valid BCP 47 language tag. If 'Subtitles' is the type of text track selected, the source language of the track must be defined."
+                      },
+                      {
+                        "label": "Sáv forrása (WebVTT fájl)"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "label": "Alapértelmezett feliratsáv",
+                  "description": "Ha üresen marad, vagy nem egyezik a feliratsávok egyikével sem, az első feliratsáv lesz az alapértelmezett."
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "label": "Interakciók hozzáadása",
+          "fields": [
+            {
+              "field": {
+                "fields": [
+                  {
+                    "label": "Idő megjelenítése"
+                  },
+                  {
+                    "label": "Videó szüneteltetése"
+                  },
+                  {
+                    "label": "Megjelenítés mint",
+                    "description": "A <b>Gomb</b> egy összecsukott interakciós elem, amelyet a felhasználónak meg kell nyomnia a megnyitáshoz. A <b>Fedőkép</b> egy kinyitott interakciós elem, amely közvetlenül a videó fölött jelenik meg",
+                    "options": [
+                      {
+                        "label": "Gomb"
+                      },
+                      {
+                        "label": "Fedőkép"
+                      }
+                    ]
+                  },
+                  {
+                    "label": "Legyen gombot a kisméretű képernyőkön"
+                  },
+                  {
+                    "label": "Címke",
+                    "description": "Az interakció ikonja mellett megjelenő címke."
+                  },
+                  {},
+                  {},
+                  {},
+                  {},
+                  {},
+                  {},
+                  {
+                    "label": "Alkalmazkodás",
+                    "fields": [
+                      {
+                        "label": "Művelet, ha az összes válasz helyes",
+                        "fields": [
+                          {
+                            "label": "Lépés adott időre",
+                            "description": "Adjon meg egy időkódot p:mp formátumban"
+                          },
+                          {
+                            "label": "A felhasználó elutasíthatja, az adott ponttól folytatva"
+                          },
+                          {
+                            "label": "Üzenet"
+                          },
+                          {
+                            "label": "Felirat az ellépés gombhoz"
+                          }
+                        ]
+                      },
+                      {
+                        "label": "Művelet, ha a válasz helytelen",
+                        "fields": [
+                          {
+                            "label": "Lépés adott időre",
+                            "description": "Adjon meg egy időkódot p:mp formátumban"
+                          },
+                          {
+                            "label": "A felhasználó elutasíthatja, az adott ponttól folytatva"
+                          },
+                          {
+                            "label": "Üzenet"
+                          },
+                          {
+                            "label": "Felirat az ellépés gombhoz"
+                          }
+                        ]
+                      },
+                      {
+                        "label": "Maximális pontszám megkövetelése a feladatnál a továbblépéshez",
+                        "description": "A legjobb működéshez ezt a beállítást az Interaktív Videó „Előrelépés tiltása a videóban” beállítással együtt érdemes használni."
+                      }
+                    ]
+                  },
+                  {
+                    "label": "Képi megjelenítés",
+                    "fields": [
+                      {
+                        "label": "Háttérszín"
+                      },
+                      {
+                        "label": "Vetett árnyék",
+                        "description": "Finom árnyékot jelenít meg az interakciós elem körül. Érdemes lehet ezt kikapcsolni teljesen átlátható interakcióknál"
+                      }
+                    ]
+                  },
+                  {
+                    "label": "Ugrás kattintásra",
+                    "fields": [
+                      {
+                        "label": "Típus",
+                        "options": [
+                          {
+                            "label": "Időkód"
+                          },
+                          {
+                            "label": "Másik oldal (URL)"
+                          }
+                        ]
+                      },
+                      {
+                        "label": "Ugrás ide",
+                        "description": "A kívánt idő, ahova a felhasználó ugrani fog a videóban a gomb megnyomásakor. Adjon meg egy időkódot p:mp formátumban"
+                      },
+                      {
+                        "label": "URL",
+                        "fields": [
+                          {
+                            "label": "Protokoll",
+                            "options": [
+                              {
+                                "label": "http://"
+                              },
+                              {
+                                "label": "https://"
+                              },
+                              {
+                                "label": "(gyökérkönyvtárhoz viszonyítva)"
+                              },
+                              {
+                                "label": "egyéb"
+                              }
+                            ]
+                          },
+                          {
+                            "label": "URL"
+                          }
+                        ]
+                      },
+                      {
+                        "label": "Megjelenítés",
+                        "description": "Az interakciós elem kattinthatóságának jelzése egy szegély és egy ikon hozzáadásával"
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {},
+            {}
+          ]
+        },
+        {
+          "label": "Összefoglalás feladat",
+          "fields": [
+            {},
+            {
+              "label": "Megjelenítés ekkor",
+              "description": "A videó vége előtti másodpercek száma."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "label": "Viselkedési beállítások",
+      "fields": [
+        {
+          "label": "Videó indítása innen",
+          "description": "Adjon meg egy időkódot p:mp formátumban"
+        },
+        {
+          "label": "Videó automatikus indítása",
+          "description": "A videó lejátszása induljon el automatikusan"
+        },
+        {
+          "label": "Videó ismétlése",
+          "description": "Bekapcsolása esetén a videó újra és újra elindul"
+        },
+        {
+          "label": "Deactivate auto-pause",
+          "description": "Prevents video from pausing automatically if video gets hidden."
+        },
+        {
+          "label": "\"Megoldás mutatása\" gomb felülírása",
+          "description": "Ez a beállítás megadja, hogy a \"Megoldás mutatása\" gomb minden kérdésnél egyformán látható, rejtett, avagy ez kérdésenként állítható.",
+          "options": [
+            {
+              "label": "Bekapcsolva"
+            },
+            {
+              "label": "Kikapcsolva"
+            }
+          ]
+        },
+        {
+          "label": "\"Újra\" gomb felülírása",
+          "description": "Ez a beállítás megadja, hogy az \"Újra\" gomb minden kérdésnél egyformán látható, rejtett, avagy ez kérdésenként állítható.",
+          "options": [
+            {
+              "label": "Bekapcsolva"
+            },
+            {
+              "label": "Kikapcsolva"
+            }
+          ]
+        },
+        {
+          "label": "Kezdés nyitott könyvjelzők menüvel",
+          "description": "Ez a funkció nem érhető el iPad-en, ha a videó forrása a YouTube."
+        },
+        {
+          "label": "10 másodperces visszatekerés gomb mutatása"
+        },
+        {
+          "label": "Navigáció letiltása",
+          "description": "Az itt megadott navigáció a videónál tiltva lesz.",
+          "options": [
+            {
+              "label": "Nincs korlátozás"
+            },
+            {
+              "label": "Előrelépés"
+            },
+            {
+              "label": "Előre- és visszalépés"
+            }
+          ]
+        },
+        {
+          "label": "Hang kikapcsolása",
+          "description": "Bekapcsolása esetén letiltja a videó hangját, és megakadályozza annak bekapcsolását."
+        }
+      ]
+    },
+    {
+      "label": "Lokalizáció",
+      "fields": [
+        {
+          "label": "Interakciós elem felirata",
+          "default": "Interakció"
+        },
+        {
+          "label": "Lejátszás felirata",
+          "default": "Lejátszás"
+        },
+        {
+          "label": "Szünet felirata",
+          "default": "Szünet"
+        },
+        {
+          "label": "Elnémítás felirata",
+          "default": "Elnémítás, jelenleg hanggal"
+        },
+        {
+          "label": "Visszahangosítás felirata",
+          "default": "Visszahangosítás, jelenleg elnémítva"
+        },
+        {
+          "label": "Videó minőségének felirata",
+          "default": "Videó minősége"
+        },
+        {
+          "label": "Videó feliratok felirata",
+          "default": "Feliratok"
+        },
+        {
+          "label": "Bezárás gomb felirata",
+          "default": "Bezárás"
+        },
+        {
+          "label": "Teljes képernyő felirata",
+          "default": "Teljes képernyő"
+        },
+        {
+          "label": "Kilépés a teljes képernyőből felirata",
+          "default": "Kilépés a teljes képernyőből"
+        },
+        {
+          "label": "Összefoglalás felirata",
+          "default": "Összefoglaló ablak megnyitása"
+        },
+        {
+          "label": "Könyvjelzők felirata",
+          "default": "Könyvjelzők"
+        },
+        {
+          "label": "Leadás képernyő felirata",
+          "default": "Leadási képernyő"
+        },
+        {
+          "label": "Az alkalmazkodó funkció ellépés gombjának alapértelmezett felirata",
+          "default": "Tovább"
+        },
+        {
+          "label": "A videó folytatása gomb alapértelmezett felirata",
+          "default": "Videó folytatása"
+        },
+        {
+          "label": "A lejátszó további beállításai gomb alapértelmezett felirata",
+          "default": "A lejátszó további beállításai"
+        },
+        {
+          "label": "Lejátszási sebesség beállítása",
+          "default": "Lejátszás sebessége"
+        },
+        {
+          "label": "Visszalépés 10 másodperccel",
+          "default": "Visszalépés 10 másodperccel"
+        },
+        {
+          "label": "A navigáció nincs engedélyezve szöveg",
+          "default": "A navigáció nincs engedélyezve"
+        },
+        {
+          "label": "Az előrelépés nincs engedélyezve szöveg",
+          "default": "Az előrelépés nincs engedélyezve"
+        },
+        {
+          "label": "A hang nincs engedélyezve szöveg",
+          "default": "A hang nincs engedélyezve"
+        },
+        {
+          "label": "Figyelmeztetés, hogy a felhasználónak a folytatás előtt helyesen kell válaszolnia a kérdésre",
+          "default": "A folytatás előtt minden kérdésre helyesen kell válaszolnia."
+        },
+        {
+          "label": "Vissza gomb",
+          "default": "Vissza"
+        },
+        {
+          "label": "Eltelt idő, órák",
+          "default": "Órák"
+        },
+        {
+          "label": "Eltelt idő, perc",
+          "default": "Perc"
+        },
+        {
+          "label": "Eltelt idő, másodperc",
+          "default": "Másodperc"
+        },
+        {
+          "label": "Felirat a jelenlegi időponthoz",
+          "default": "Jelenlegi időpont:"
+        },
+        {
+          "label": "Felirat a teljes időhöz",
+          "default": "Teljes idő:"
+        },
+        {
+          "label": "Szöveg, amely elmagyarázza, hogy megjelent egy elnevezett interakció",
+          "default": "Interakció jelent meg:"
+        },
+        {
+          "label": "Szöveg, amely elmagyarázza, hogy több interakció jelent meg",
+          "default": "Több interakció jelent meg."
+        },
+        {
+          "label": "A videó szüneteltetve van közlése",
+          "default": "A videó szüneteltetve van"
+        },
+        {
+          "label": "Tartalom felirata",
+          "default": "Tartalom"
+        },
+        {
+          "label": "Megválaszolva üzenet (@answered helyébe a megválaszolt kérdések száma kerül)",
+          "default": "@answered megválaszolva"
+        },
+        {
+          "label": "Leadás képernyő felirata",
+          "default": "@answered kérdés megválaszolva",
+          "description": "Az @answered helyébe a megválaszolt kérdések száma kerül."
+        },
+        {
+          "label": "Leadás képernyő tájékoztatója",
+          "default": "Megválaszolt @answered kérdést, lent kattintson a válaszai leadásához.",
+          "description": "Az @answered helyébe a megválaszolt kérdések száma kerül."
+        },
+        {
+          "label": "Leadás képernyő tájékoztatója, ha a leadás gomb nem elérhető",
+          "default": "Megválaszolt @answered kérdést.",
+          "description": "Az @answered helyébe a megválaszolt kérdések száma kerül."
+        },
+        {
+          "label": "Leadás képernyő tájékoztatója hiányzó válaszoknál",
+          "default": "Nem válaszolt egyetlen kérdésre sem."
+        },
+        {
+          "label": "Leadás képernyő tájékoztatója hiányzó válaszról",
+          "default": "Válaszai beküldése előtt legalább egy kérdésre válaszolnia kell."
+        },
+        {
+          "label": "Leadás képernyő leadás gombja",
+          "default": "Válaszok leadása"
+        },
+        {
+          "label": "Leadás képernyő leadás üzenete",
+          "default": "A válaszai beérkeztek!"
+        },
+        {
+          "label": "Submit screen table row title: Score",
+          "default": "Score"
+        },
+        {
+          "label": "Submit screen question label",
+          "default": "Question"
+        },
+        {
+          "label": "Submit screen answered score",
+          "default": "answered"
+        },
+        {
+          "label": "Leadás képernyő sor összefoglaló pontszámmal együtt (szövegfelolvasók számára)",
+          "default": "Ön @score pontot kapott az elérhető @total pontból a @minutes perc @seconds másodpercnél feltett @question kérdésre."
+        },
+        {
+          "label": "Leadás képernyő sor összefoglaló pontszám nélkül (szövegfelolvasók számára)",
+          "default": "Ön válaszolt a(z) @minutes perc @seconds másodpercnél feltett @question kérdésre."
+        },
+        {
+          "label": "Videó előrehaladási sávja",
+          "default": "Videó előrehaladás"
+        },
+        {
+          "label": "Felirat az interakciók létrehozásához",
+          "default": "Az interakciók létrehozásához indítsa el a videó lejátszását"
+        }
+      ]
+    }
+  ]
+}

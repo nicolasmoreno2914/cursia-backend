@@ -272,9 +272,9 @@ const DT = { itemKey: 'activity:qa', title: 'El registro de doña Carmen', taskD
     assert(!(MA.QUIZ_REVIEW_V3.reviewmaxmarks & D) && !(MA.QUIZ_REVIEW_V3.reviewmaxmarks & I), 'nada en D|I');
     eq([MA.QUIZ_REVIEW_V3.reviewattempt, MA.QUIZ_REVIEW_V3.reviewoverallfeedback, MA.QUIZ_REVIEW_V3.reviewcorrectness, MA.QUIZ_REVIEW_V3.reviewrightanswer], [D | I | C, I | O | C, C, C], 'resto de la política');
   });
-  await check('M5: .mbz 3.11.0 — sección 1 con UNA entrada del Libro Guía (recurso con descripción, sin label libro_card), quiz.xml con reviewmaxmarks 272; validador limpio y la descripción pasa las reglas de los labels', async () => {
+  await check('M5: .mbz 3.12.0 — sección 1 con UNA entrada del Libro Guía (recurso con descripción, sin label libro_card), quiz.xml con reviewmaxmarks 272; validador limpio y la descripción pasa las reglas de los labels', async () => {
     const r = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true, courseId: 583 }));
-    eq(r.summary.builderVersion, '3.11.0', 'versión');
+    eq(r.summary.builderVersion, '3.12.0', 'versión'); // UX r18: 3.11.0 → 3.12.0
     const z = await JSZip.loadAsync(r.mbz);
     const mb = await z.file('moodle_backup.xml').async('string');
     const acts = [...mb.matchAll(/<activity>\s*<moduleid>(\d+)<\/moduleid>\s*<sectionid>\d+<\/sectionid>\s*<modulename>(\w+)<\/modulename>\s*<title>([^<]*)<\/title>\s*<directory>([^<]+)<\/directory>/g)].map((m) => ({ mid: m[1], mod: m[2], title: m[3], dir: m[4] }));

@@ -111,7 +111,7 @@ const BS_CFG = {
     }
   }
 
-  await check('builder 3.11.0 (3.8.0 = una sola copia; 3.9.0 = revisión del quiz; 3.10.0 = retroalimentación global; 3.11.0 = #583 QUAL)', () => eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.11.0', 'versión'));
+  await check('builder 3.12.0 (3.8.0 = una sola copia; 3.9.0 = revisión del quiz; 3.10.0 = retroalimentación global; 3.11.0 = #583 QUAL; 3.12.0 = UX r18)', () => eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.12.0', 'versión'));
 
   await check('matriz + rules 2: toda h5pactivity tiene UNA sola copia del .h5p (filearea package) y su inforef apunta solo a ella', () => {
     let n = 0;
@@ -214,11 +214,12 @@ const BS_CFG = {
   });
 
   // Curso sin H5P (SCORM, sin videos) y sin quizzes: dorado = staging b959a89 (builder 3.6.0).
-  await check('byte-identidad: un curso SIN actividades H5P ni quizzes da el .mbz dorado (3.6.0 = 3.10.0; 3.11.0 = #583 QUAL)', async () => {
+  await check('byte-identidad: un curso SIN actividades H5P ni quizzes da el .mbz dorado (3.6.0 = 3.10.0; 3.11.0 = #583 QUAL; 3.12.0 = UX r18)', async () => {
     const o = { engine: 'scorm', finalExam: false, courseId: 646, modules: [{ examEnabled: false, chapters: [{ video: false, activity: true }, { video: false, activity: false }] }] };
     const r = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, o));
     // #583 QUAL (builder 3.11.0): reviewmaxmarks 69904 → 272, frase del cierre, tarjeta del Libro Guía como <intro> del recurso (sin label libro_card; ids renumerados) y runtime VC 4 — diff semántico en scratchpad/r18/qual/golddiff/sem.js (antes d4e6bc68…: staging 3.6.0 = 3.10.0 para este curso).
-    eq(sha(r.mbz), '80e8b108ccbd547360f4851fb5054fdb2839aabdf6d513c6eef80060e8676545', 'sha256');
+    // UX r18 (builder 3.12.0): sección 0 hero primero / foro al final, sin kicker, preload="metadata" + title/aria-label (fix 1), Info en audiolibro.mp3 y portadas a 1600 px — diff semántico en scratchpad/r18/uximpl-golddiff4.js (antes 80e8b108…, 3.11.0).
+    eq(sha(r.mbz), 'a169af34d0b54eeaab569f80c0d6e2a8280f531b46814726e8976070d5e72c55', 'sha256');
   });
 
   console.log(`\n${failures ? 'HAY FALLOS' : 'Todos los checks de V542 I2 (H5P de una sola copia) pasaron'} (${passed} ✅, ${failures} ❌).`);

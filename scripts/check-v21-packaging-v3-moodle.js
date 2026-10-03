@@ -64,7 +64,8 @@ const CONFIGS = [
 const QUIZ_GM = { highest: 1, average: 2, first: 3, last: 4 };
 const H5P_GM = { highest: 1, average: 2, last: 3, first: 4 };
 const WHATGRADE = { highest: 0, average: 1, first: 2, last: 3 };
-const LIB = { questionset: 'H5P.QuestionSet 1.20', dragtext: 'H5P.DragText 1.10', blanks: 'H5P.Blanks 1.14' };
+// UX #5 (r18): el builder v3 arma QuestionSet 1.21 (CURSIA_H5P_PROFILE_V3, librería incluida en el .h5p).
+const LIB = { questionset: 'H5P.QuestionSet 1.21', dragtext: 'H5P.DragText 1.10', blanks: 'H5P.Blanks 1.14' };
 
 function kindOf(idnumber) {
   if (/:video$/.test(idnumber)) return 'video';

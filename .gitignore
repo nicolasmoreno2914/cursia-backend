@@ -21,3 +21,5 @@ h5p-library-pack/
 # EV6 H5P v2: el store versionado de librerías H5P SÍ se versiona, incluidas sus
 # carpetas `dist/` (código de las librerías upstream, no salida de build de Cursia).
 !assets/h5p-libs/v2/*/dist/
+# UX #5 (r18): store v3 (CURSIA_H5P_PROFILE_V3), mismo criterio.
+!assets/h5p-libs/v3/*/dist/

@@ -1,0 +1,304 @@
+{
+  "semantics": [
+    {
+      "label": "Quiz inleiding",
+      "fields": [
+        {
+          "label": "Toon inleiding"
+        },
+        {
+          "label": "Titel",
+          "description": "Deze titel zal boven de inleidende tekst worden getoond."
+        },
+        {
+          "label": "Inleidende tekst",
+          "description": "Deze tekst zal worden getoond voordat de quiz begint."
+        },
+        {
+          "label": "Tekst van \"Start\"-knop",
+          "default": "Start quiz"
+        },
+        {
+          "label": "Achtergrondafbeelding",
+          "description": "Een optionele achtergrondafbeelding voor de inleiding."
+        },
+        {
+          "label": "Alternative text",
+          "description": "If the browser can't load the image this text will be displayed instead. Also used by \"text-to-speech\" readers."
+        }
+      ]
+    },
+    {
+      "label": "Voortgangsindicator",
+      "description": "Question set progress indicator style. Will be Textual if backwards navigation is disabled.",
+      "options": [
+        {
+          "label": "Tekstueel"
+        },
+        {
+          "label": "Punten"
+        }
+      ]
+    },
+    {
+      "label": "Slagingspercentage",
+      "description": "Percentage van totale score dat vereist is om te slagen voor quiz."
+    },
+    {
+      "label": "Vragen",
+      "widgets": [
+        {
+          "label": "Standaard"
+        },
+        {
+          "label": "Tekstueel"
+        }
+      ],
+      "entity": "vraag",
+      "field": {
+        "label": "Type vraag",
+        "description": "Bibliotheek voor deze vraag."
+      }
+    },
+    {
+      "label": "Interface teksten in de quiz",
+      "fields": [
+        {
+          "label": "Tekst van \"Terug\"-knop",
+          "default": "Vorige vraag"
+        },
+        {
+          "label": "Back button label",
+          "default": "Previous"
+        },
+        {
+          "label": "Tekst van \"Volgende\"-knop",
+          "default": "Volgende vraag"
+        },
+        {
+          "label": "Next button label",
+          "default": "Next"
+        },
+        {
+          "label": "Tekst van \"Afsluiten\"-knop",
+          "default": "Stoppen"
+        },
+        {
+          "label": "Tekst voor \"Verzend\"-knop",
+          "default": "Verzend"
+        },
+        {
+          "label": "Tekst bij voortgang",
+          "description": "Deze tekst wordt gebruikt als 'Tekst' als voortgangsindicator is geselecteerd.",
+          "default": "Vraag: @current van @total vragen"
+        },
+        {
+          "label": "Label om naar een bepaalde vraag te springen",
+          "description": "Je moet de plaatsaanduiding '%d' gebruiken in plaats van het vraagnummer, en %total in plaats van het totaal aantal vragen.",
+          "default": "Vraag %d van %total"
+        },
+        {
+          "label": "Question heading",
+          "default": "Vraag"
+        },
+        {
+          "label": "Schermlezer voortgang",
+          "description": "Je mag @current gebruiken en @total als vraagvariabelen",
+          "default": "Vraag @current van @total"
+        },
+        {
+          "label": "Tekst van niet-beantwoorde vraag",
+          "default": "Niet-beantwoord"
+        },
+        {
+          "label": "Tekst van beantwoorde vraag",
+          "default": "Beantwoord"
+        },
+        {
+          "label": "Tekst van huidige vraag",
+          "default": "Huidige vraag"
+        },
+        {
+          "label": "Navigation label for readspeakers",
+          "default": "Questions"
+        },
+        {
+          "label": "Instruction for navigating question set with screenreader",
+          "default": "Choose question to display"
+        }
+      ]
+    },
+    {
+      "label": "Achterwaarts navigeren uitschakelen",
+      "description": "Deze optie staat je alleen toe voorwaarts te navigeren in de vragenreeks"
+    },
+    {
+      "label": "Vragen willekeurig ordenen",
+      "description": "Vragen bij weergave in willekeurige volgorde inschakelen."
+    },
+    {
+      "label": "Het aantal te tonen vragen:",
+      "description": "Creëer een willekeurig aantal vragen van het totaal."
+    },
+    {
+      "label": "Quiz voltooid",
+      "fields": [
+        {
+          "label": "Toon de resultaten"
+        },
+        {
+          "label": "Toon \"Oplossing\"-knop"
+        },
+        {
+          "label": "Toon \"Opnieuw\"-knop"
+        },
+        {
+          "label": "Geen resultaten bericht",
+          "description": "Getoonde tekst op de eindpagina wanneer \"Toon resultaten\" is uitgeschakeld",
+          "default": "Voltooid"
+        },
+        {
+          "label": "Results heading",
+          "default": "Results",
+          "description": "This heading will be displayed at the end of the quiz when the user has answered all questions."
+        },
+        {
+          "label": "Amount correct heading",
+          "description": "Header to show the final score to the user on the end screen",
+          "default": "@finals of @totals correct"
+        },
+        {
+          "label": "Score announcer",
+          "description": "This label will be used for announcing the final score to the user on the end screen",
+          "default": "You got @finals out of @totals points"
+        },
+        {
+          "label": "Score heading",
+          "description": "Header for the score part of the results table",
+          "default": "Score"
+        },
+        {
+          "label": "Algehele feedback",
+          "fields": [
+            {
+              "widgets": [
+                {
+                  "label": "Standaard"
+                }
+              ],
+              "label": "Definieer aangepaste feedback voor elke scorereeks",
+              "description": "Voorbeeld: 0-20% Onvoldoende score, 21-91% Gemiddelde score, 91-100% Uitstekende score!",
+              "entity": "reeks",
+              "field": {
+                "fields": [
+                  {
+                    "label": "Scorereeks"
+                  },
+                  {},
+                  {
+                    "label": "Feedback voor de gedefinieerde scorereeks",
+                    "placeholder": "Vul de feedback in"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "label": "Oude feedback",
+          "fields": [
+            {
+              "label": "Begroeting bij een geslaagde quiz",
+              "description": "Deze tekst wordt boven de score getoond als de deelnemer de test met goed gevolg heeft afgelegd."
+            },
+            {
+              "label": "Commentaar bij geslaagd",
+              "description": "Dit commentaar wordt getoond na de score als de deelnemer de test met goed gevolg heeft afgelegd."
+            },
+            {
+              "label": "Titel bij niet behaalde quiz",
+              "description": "Deze tekst wordt boven de score getoond als de deelnemer de test niet heeft gehaald."
+            },
+            {
+              "label": "Commentaar bij niet behaald",
+              "description": "Dit commentaar wordt getoond na de score als de deelnemer de test niet heeft gehaald."
+            }
+          ]
+        },
+        {
+          "label": "Label van \"Oplossing\"-knop",
+          "default": "Toon oplossing",
+          "description": "Tekst voor \"Oplossing\"-knop."
+        },
+        {
+          "label": "Label van \"Opnieuw\"-knop",
+          "default": "Opnieuw",
+          "description": "Tekst voor \"Opnieuw\"-knop."
+        },
+        {
+          "label": "Tekst voor \"Stoppen\"-knop",
+          "default": "Stoppen"
+        },
+        {
+          "label": "Tekst van \"Verzend\"-knop",
+          "default": "Verzend"
+        },
+        {
+          "label": "Toon video voor de quizresultaten"
+        },
+        {
+          "label": "Schakel \"Sla video over\"-knop in"
+        },
+        {
+          "label": "Label van \"Sla video over\"-knop",
+          "default": "Video overslaan"
+        },
+        {
+          "label": "Video bij een geslaagde quiz",
+          "description": "Deze video wordt afgespeeld als de deelnemer de test met succes heeft afgerond."
+        },
+        {
+          "label": "Video bij een niet behaalde quiz",
+          "description": "Deze video wordt afgespeeld als de deelnemer de test niet heeft gehaald."
+        }
+      ]
+    },
+    {
+      "label": "Behavioural settings",
+      "fields": [
+        {
+          "label": "Toon \"Controleer\"-knoppen",
+          "description": "Deze optie bepaalt of de knop \"Controleer\" wordt getoond voor alle vragen."
+        },
+        {
+          "label": "Overschrijf \"Toon oplossing\"-knop",
+          "description": "Deze optie bepaalt of de \"Toon oplossing\"-knop voor alle vragen wordt getoond, uitgeschakeld of voor iedere vraag afzonderlijk wordt geconfigureerd.",
+          "options": [
+            {
+              "label": "Ingeschakeld"
+            },
+            {
+              "label": "Uitgeschakeld"
+            }
+          ]
+        },
+        {
+          "label": "Overschrijf \"Opnieuw\"-knop",
+          "description": "Deze optie bepaalt of de \"Opnieuw\"-knop voor alle vragen wordt getoond, uitgeschakeld of voor iedere vraag afzonderlijk wordt geconfigureerd.",
+          "options": [
+            {
+              "label": "Ingeschakeld"
+            },
+            {
+              "label": "Uitgeschakeld"
+            }
+          ]
+        },
+        {
+          "label": "Achtergrondafbeelding",
+          "description": "Een optionele achtergrondafbeelding voor de vragenreeks."
+        }
+      ]
+    }
+  ]
+}

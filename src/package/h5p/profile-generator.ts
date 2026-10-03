@@ -124,6 +124,29 @@ export const CURSIA_H5P_PROFILE_SPEC_V2: H5pProfileSpec = Object.freeze({
   base: CURSIA_H5P_PROFILE_SPEC_V1,
 });
 
+// ── UX #5 (r18): H5P.QuestionSet 1.21 (navegación compatible con el tema de H5P.Question 1.5) ──
+//
+// QuestionSet 1.20 registra «Pregunta siguiente/anterior» con label VACÍO (esperaba un icono CSS
+// de JoubelUI); MultiChoice 1.16 y TrueFalse 1.8 construyen sus botones con H5P.Components (tema),
+// que descarta esa clase: el resultado era un CTA primario azul sin texto ni icono. QuestionSet
+// 1.21 usa H5P.Components.Navigation («Siguiente ›» / «Anterior»). Ningún patch 1.20.x lo corrige
+// (1.20.30/31 solo tocan preguntas vacías). v3 = v2 con QuestionSet 1.21; su base sigue siendo v1
+// (lo que el sitio tiene por el pack v1), así que QuestionSet pasa a llevar su delta en el `.h5p`.
+
+export const CURSIA_H5P_PROFILE_ID_V3 = 'CURSIA_H5P_PROFILE_V3';
+
+const QS_V3: H5pDependencyRef = { machineName: 'H5P.QuestionSet', majorVersion: 1, minorVersion: 21 };
+
+export const CURSIA_H5P_PROFILE_SPEC_V3: H5pProfileSpec = Object.freeze({
+  profileId: CURSIA_H5P_PROFILE_ID_V3,
+  version: 3,
+  mainLibraries: Object.freeze(
+    CURSIA_H5P_PROFILE_SPEC_V2.mainLibraries.map((m) => (m.machineName === QS_V3.machineName ? QS_V3 : m)),
+  ),
+  contentLibrariesByMain: CURSIA_H5P_PROFILE_SPEC_V2.contentLibrariesByMain,
+  base: CURSIA_H5P_PROFILE_SPEC_V1,
+});
+
 export function h5pLibraryDirName(ref: H5pDependencyRef): string {
   return `${ref.machineName}-${ref.majorVersion}.${ref.minorVersion}`;
 }
@@ -189,8 +212,9 @@ function closure(
 
 /**
  * Calcula el perfil completo. Pura y determinística. Sin `spec` = CURSIA_H5P_PROFILE_V1
- * (salida byte-idéntica a la de siempre). Con un spec derivado (v2) agrega
- * `baseProfileId` y `deltaByMain` (clausura full de cada principal nueva − librerías del base).
+ * (salida byte-idéntica a la de siempre). Con un spec derivado (v2, v3) agrega
+ * `baseProfileId` y `deltaByMain` (clausura full de cada principal nueva, o con otra minor que la
+ * del base, − librerías del base).
  */
 export function computeH5pProfile(libraryJsons: Record<string, H5pLibraryJson>, spec: H5pProfileSpec = CURSIA_H5P_PROFILE_SPEC_V1): H5pProfile {
   const mainLibraries: Record<string, H5pLibraryRef> = {};
@@ -234,7 +258,10 @@ export function computeH5pProfile(libraryJsons: Record<string, H5pLibraryJson>, 
   }
   const deltaByMain: Record<string, H5pLibraryRef[]> = {};
   for (const main of spec.mainLibraries) {
-    if (base.mainLibraries[main.machineName]) continue;
+    // Principal del base con el MISMO major.minor: el sitio ya la tiene (sin delta). Una principal
+    // nueva (v2: BS, DC) o con otra minor que la del base (v3: QuestionSet 1.21) lleva su delta.
+    const b = base.mainLibraries[main.machineName];
+    if (b && h5pLibraryDirName(b) === h5pLibraryDirName(main)) continue;
     deltaByMain[main.machineName] = closureByMain[main.machineName].full.filter((r) => !baseDirs.has(h5pLibraryDirName(r)));
   }
   return { ...profile, baseProfileId: base.profileId, deltaByMain };

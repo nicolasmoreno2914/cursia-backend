@@ -1,0 +1,22 @@
+{
+  "semantics": [
+    {
+      "label": "Lebo",
+      "description": "Weka lebo/kichwa cha jibu mtumiaji anaposafirisha majibu yote"
+    },
+    {
+      "label": "Placeholder text",
+      "description": "Example value or other placeholder text. Should not be used to replace the description of the input field."
+    },
+    {
+      "label": "Index"
+    },
+    {
+      "label": "Lebo ya uhamishaji hautumiki",
+      "default": "Uhamishaji hautumiki kwenye kifaa chako"
+    },
+    {
+      "label": "Jumuisha maoni katika hati iliyohamishwa"
+    }
+  ]
+}

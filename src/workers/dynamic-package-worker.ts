@@ -574,7 +574,7 @@ export async function processV3PackageJob(
   if (JSON.stringify(resolved) !== JSON.stringify(built.expectations.resolved)) {
     throw new Error('MBZ_V3_VALIDATION_FAILED: el builder resolvió una evaluación distinta de la del perfil vigente');
   }
-  const validation = await (deps.validateMbzV3 ?? validateMbzV3)(built.mbz, { facts: built.expectations.facts, resolved, examBankPlans: built.expectations.examBankPlans, shellProseByLabel: built.expectations.shellProseByLabel });
+  const validation = await (deps.validateMbzV3 ?? validateMbzV3)(built.mbz, { facts: built.expectations.facts, resolved, examBankPlans: built.expectations.examBankPlans, shellProseByLabel: built.expectations.shellProseByLabel, builderVersion: built.expectations.builderVersion });
   if (!validation.ok) {
     throw new Error(
       `MBZ_V3_VALIDATION_FAILED: ${validation.issues.length} hallazgo(s): ` +

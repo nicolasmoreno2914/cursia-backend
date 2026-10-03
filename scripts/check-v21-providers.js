@@ -632,6 +632,9 @@ async function dbChecks() {
       const mp3 = storage.blobs.get(`cursia-artifacts/${art.storage_path}`);
       eq(art.mime_type, 'audio/mpeg', 'mime');
       eq(art.metadata.durationSeconds, AUD.mp3DurationSeconds(mp3), 'duración medida');
+      // UX r18 fix 1 (C1): la bienvenida de UNA parte también pasa por concatMp3 → frame Info con el conteo real.
+      const pm = AUD.parseMp3(mp3);
+      assert(pm.hasXing && pm.xingFrames === pm.frames.length - 1, `frame Info de la bienvenida (${pm.hasXing}, ${pm.xingFrames} vs ${pm.frames.length - 1})`);
       const evs = await finalCharges(`item_run_id = $1`, [row.id]);
       eq(evs.map((e) => [e.provider, e.operation, e.cost_source, e.external_operation_id, e.idempotency_key]),
         [['openai', 'tts.audio_welcome', 'CALCULATED_FROM_USAGE', call.requestId, `openai:req:${call.requestId}`]], 'evento');
