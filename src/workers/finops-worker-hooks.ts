@@ -16,6 +16,8 @@ import { usageModelPriorsV1 } from '../modules/finops/usage-model';
 export type WorkerLedger = Pick<FinopsLedgerService, 'recordCharge' | 'recordAdjustment' | 'recordZero'> &
   Partial<Pick<FinopsLedgerService, 'settleMeasuredUsage' | 'settleReservation' | 'itemPaidCharges'>>;
 export type WorkerBudget = Pick<FinopsBudgetService, 'guardPaidSubmission'>;
+/** r19 fix round 1 (I5): uso estimado de LA llamada que se va a hacer (el guard la precia con el catálogo). */
+export type GuardNextCall = { provider: string; service: string; product: string; usage: Record<string, number> };
 
 /**
  * YouTube Data API `videos.insert` = 1600 unidades de cuota por subida.

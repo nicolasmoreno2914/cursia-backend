@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { FinopsError } from './errors';
 import { addDec, cmpDec, normalizeDecimal, DecimalLike } from './decimal';
-import type { PricingCatalogRow } from './pricing';
+import { PricingCatalogRow, priceUsage } from './pricing';
 import { EstimateItem, EstimateResult, RetryPolicy, estimateCost } from './estimator';
 import { usageModelPriorsV1 } from './usage-model';
 import { BudgetPolicy, RuntimeGuardResult, SpentSoFar, runtimeGuard } from './budget';
@@ -397,6 +397,12 @@ export class FinopsBudgetService {
     return row.total;
   }
 
+  /** r19 fix round 1 (I5): costo de UNA llamada concreta (uso estimado × catálogo vigente). Lanza si no se puede preciar. */
+  async callCost(c: { provider: string; service: string; product: string; usage: Record<string, number> }, runner: Runner = this.dataSource): Promise<string> {
+    const priced = priceUsage(c.usage, await this.catalog(runner), { provider: c.provider, service: c.service, product: c.product, asOf: new Date() });
+    return priced.amount;
+  }
+
   /** Costo de UNA llamada pagada (p90, sin reintentos) de ese item type contra ese proveedor. */
   async singleCallCost(itemType: string, provider: string, runner: Runner = this.dataSource): Promise<string> {
     const est = await this.estimate([{ itemKey: `guard:${itemType}`, itemType }], { retryPolicy: { maxRetries: 0, retryRate: 0 }, runner });
@@ -440,6 +446,13 @@ export class FinopsBudgetService {
      * proveedor pagado del item type.
      */
     provider?: string;
+    /**
+     * r19 fix round 1 (I5): uso estimado de LA llamada que se va a hacer (p. ej. un segmento de TTS o un
+     * bloque del guion). Con él, `next` es el costo de esa llamada con el catálogo vigente, no el p90 del
+     * item ENTERO (un audiolibro hace ~15 llamadas por capítulo: reservar el capítulo en cada una bloqueaba
+     * en falso un run que entra en su presupuesto). Sin él (o si no se puede preciar), el comportamiento previo.
+     */
+    nextCall?: { provider: string; service: string; product: string; usage: Record<string, number> } | null;
   }): Promise<RuntimeGuardResult & { authorizedBudget: string | null }> {
     const itemProvider = paidProviderOfItemType(a.itemType);
     if (!itemProvider) throw new FinopsError('INVALID_INPUT', `guardPaidSubmission: ${a.itemType} no es un item de proveedor pagado`);
@@ -448,7 +461,7 @@ export class FinopsBudgetService {
       this.runPaidAuthorizedBudget(a.runId),
       this.runActual(a.runId),
       this.reservedInFlight(a.runId, a.itemRunId),
-      this.singleCallCost(a.itemType, provider),
+      a.nextCall ? this.callCost(a.nextCall).catch(() => this.singleCallCost(a.itemType, provider)) : this.singleCallCost(a.itemType, provider),
     ]);
     return { ...runtimeGuard({ authorizedBudget, actualSoFar, reservedInFlight, next }), authorizedBudget };
   }
