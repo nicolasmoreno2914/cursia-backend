@@ -52,6 +52,8 @@ export interface LibroV3Input {
   logo: ResolvedLibroLogo;
   /** Nombre de la institución / marca (portada y pie), si la cuenta lo tiene. */
   brandName?: string | null;
+  /** Fix round 1 (M8): clave del documento (p.ej. sha del plan) → Info /Keywords, y así /ID único por curso y determinístico. */
+  documentKey?: string | null;
 }
 
 export interface LibroPdfResult {
@@ -64,6 +66,10 @@ export interface LibroPdfResult {
   watermarkDrawsPerPage: number[];
   /** Página (1-based) de inicio de cada capítulo, por número de capítulo. */
   chapterPages: Record<number, number>;
+  /** Fix round 1 (i): dibujos del logo a opacidad plena en la portada (siempre 1, solo en la página 1). */
+  coverLogoDraws: number;
+  /** Fix round 1 (I2): caracteres visibles del insumo sin equivalente en WinAnsi (quitados; aviso en el paquete). */
+  unmappedChars: number;
 }
 
 /** Opacidad de la marca de agua (≈ 0.06–0.10: discreta, el texto sigue completamente legible). */
@@ -90,36 +96,91 @@ export function libroPdfFilename(courseTitle: string): string {
 /** Los 27 caracteres de cp1252 en 0x80–0x9F (además de ASCII imprimible y Latin-1 0xA0–0xFF). */
 const CP1252_EXTRA = new Set('€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ');
 
-const CHAR_MAP: Record<string, string> = {
-  '■': '•', '□': '•', '▪': '•', '▫': '•', '◆': '•', '◇': '•', '●': '•', '○': '•', '◼': '•', '◻': '•', '⬛': '•', '⬜': '•',
-  '▶': '•', '►': '•', '▸': '•', '‣': '•', '⁃': '-', '∙': '·', '◦': '•',
-  '−': '-', '‐': '-', '‑': '-', '‒': '-', '―': '—', '⸺': '—',
-  '→': '->', '⇒': '=>', '➜': '->', '➔': '->', '⟶': '->', '←': '<-', '⇐': '<=', '↔': '<->', '↑': '^', '↓': 'v',
-  '≥': '>=', '≤': '<=', '≠': '!=', '≈': '~', '∞': 'infinito', '√': 'raíz de ',
-  '✓': '•', '✔': '•', '☑': '•', '✗': 'x', '✘': 'x', '☐': '•',
-  '′': "'", '″': '"', '‹': '‹', '‚': '‚', ' ': ' ', ' ': ' ', ' ': ' ', ' ': ' ', ' ': ' ', ' ': ' ',
-  '\t': ' ',
+const GREEK: Record<string, string> = {
+  'α': 'alpha', 'β': 'beta', 'γ': 'gamma', 'δ': 'delta', 'ε': 'epsilon', 'ϵ': 'epsilon', 'ζ': 'zeta', 'η': 'eta', 'θ': 'theta', 'ϑ': 'theta',
+  'ι': 'iota', 'κ': 'kappa', 'λ': 'lambda', 'μ': 'µ', 'ν': 'nu', 'ξ': 'xi', 'ο': 'omicron', 'π': 'pi', 'ρ': 'rho', 'σ': 'sigma', 'ς': 'sigma',
+  'τ': 'tau', 'υ': 'upsilon', 'φ': 'phi', 'ϕ': 'phi', 'χ': 'chi', 'ψ': 'psi', 'ω': 'omega',
+  'Α': 'Alpha', 'Β': 'Beta', 'Γ': 'Gamma', 'Δ': 'Delta', 'Ε': 'Epsilon', 'Ζ': 'Zeta', 'Η': 'Eta', 'Θ': 'Theta', 'Ι': 'Iota', 'Κ': 'Kappa',
+  'Λ': 'Lambda', 'Μ': 'Mu', 'Ν': 'Nu', 'Ξ': 'Xi', 'Ο': 'Omicron', 'Π': 'Pi', 'Ρ': 'Rho', 'Σ': 'Sigma', 'Τ': 'Tau', 'Υ': 'Upsilon',
+  'Φ': 'Phi', 'Χ': 'Chi', 'Ψ': 'Psi', 'Ω': 'Omega', '\u2126': 'Omega', '∆': 'Delta', '∑': 'Sigma', '∏': 'Pi',
 };
 
 /**
- * Texto apto para las fuentes estándar del PDF (codificación WinAnsi): NFC, mapeo determinístico de símbolos
- * comunes (viñetas, flechas, comparadores, guiones) y supresión de todo lo demás fuera de WinAnsi (emoji,
- * pictogramas, selectores de variación, ZWJ). Nunca deja un carácter que se pintaría como basura.
+ * Fix round 1 (I2): transliteración determinística de lo común que WinAnsi no tiene (nunca se pierde en silencio):
+ * subíndices/superíndices → dígitos, griego → nombre (π → pi, Δ → Delta; μ → µ, que sí es WinAnsi), comparadores y
+ * operadores → texto, flechas, ✓/✗, viñetas, números en círculo, fracciones, unidades. Lo que quede sin mapa se quita
+ * y se CUENTA (`unmappedCharCount` → aviso `libro_chars_unmapped:<n>` en el resumen del paquete).
+ */
+const CHAR_MAP: Record<string, string> = {
+  // viñetas y marcadores
+  '■': '•', '□': '•', '▪': '•', '▫': '•', '◆': '•', '◇': '•', '●': '•', '○': '•', '◼': '•', '◻': '•', '⬛': '•', '⬜': '•',
+  '▶': '•', '►': '•', '▸': '•', '‣': '•', '⁃': '-', '∙': '·', '◦': '•', '⦁': '•', '❖': '•', '★': '*', '☆': '*',
+  // guiones
+  '−': '-', '‐': '-', '‑': '-', '‒': '-', '―': '—', '⸺': '—', '⸻': '—',
+  // flechas
+  '→': '->', '⇒': '=>', '➜': '->', '➔': '->', '➡': '->', '⟶': '->', '⟹': '=>', '↦': '->', '←': '<-', '⇐': '<=', '⬅': '<-', '⟵': '<-',
+  '↔': '<->', '⇔': '<=>', '⟷': '<->', '↑': '(arriba)', '↓': '(abajo)', '⬆': '(arriba)', '⬇': '(abajo)', '↗': '(sube)', '↘': '(baja)',
+  // comparadores y operadores (× ÷ ± ¬ · son WinAnsi y se conservan)
+  '≥': '>=', '≤': '<=', '≠': '!=', '≈': '~=', '≅': '~=', '≃': '~=', '≡': '===', '∓': '-/+', '∝': ' proporcional a ', '∞': 'infinito',
+  '√': 'raíz de ', '∛': 'raíz cúbica de ', '∂': 'd', '∇': 'nabla', '∫': 'integral ', '∈': ' en ', '∉': ' no en ', '∩': ' intersección ', '∪': ' unión ',
+  '⊂': ' subconjunto de ', '∅': 'vacío', '∀': 'para todo ', '∃': 'existe ', '∴': 'por lo tanto', '⋅': '·', '∗': '*', '⁄': '/', '∕': '/',
+  // ✓ ✗
+  '✓': '(sí)', '✔': '(sí)', '☑': '(sí)', '✅': '(sí)', '✗': '(no)', '✘': '(no)', '❌': '(no)', '☒': '(no)', '☐': '[ ]',
+  // subíndices y superíndices (¹ ² ³ son Latin-1)
+  '₀': '0', '₁': '1', '₂': '2', '₃': '3', '₄': '4', '₅': '5', '₆': '6', '₇': '7', '₈': '8', '₉': '9', '₊': '+', '₋': '-', '₌': '=', '₍': '(', '₎': ')',
+  '⁰': '0', '⁴': '4', '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9', '⁺': '+', '⁻': '-', '⁼': '=', '⁽': '(', '⁾': ')', 'ⁿ': 'n',
+  // fracciones (½ ¼ ¾ son Latin-1)
+  '⅓': '1/3', '⅔': '2/3', '⅕': '1/5', '⅖': '2/5', '⅗': '3/5', '⅘': '4/5', '⅙': '1/6', '⅚': '5/6', '⅛': '1/8', '⅜': '3/8', '⅝': '5/8', '⅞': '7/8',
+  // unidades y abreviaturas
+  '℃': '°C', '℉': '°F', '№': 'N.º', '℮': 'e', 'ℓ': 'l', '㎡': 'm²', '㎥': 'm³',
+  // comillas / primas / espacios
+  '′': "'", '″': '"', '‴': "'''", '\u2009': ' ', '\u2002': ' ', '\u2003': ' ', '\u202f': ' ', '\u2007': ' ', '\u200a': ' ', '\u2008': ' ', '\u205f': ' ',
+  '\t': ' ',
+  ...GREEK,
+};
+for (let n = 1; n <= 20; n++) CHAR_MAP[String.fromCodePoint(0x2460 + n - 1)] = `${n}.`; // ① … ⑳
+for (let n = 1; n <= 10; n++) CHAR_MAP[String.fromCodePoint(0x2776 + n - 1)] = `${n}.`; // ❶ … ❿
+for (let n = 1; n <= 10; n++) CHAR_MAP[String.fromCodePoint(0x2780 + n - 1)] = `${n}.`; // ➀ … ➉
+
+/** Caracteres de formato invisibles: se quitan sin contar (no son contenido). */
+const INVISIBLE = /^(?:[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f­​-‏⁠-⁤︀-️﻿]|[\u{e0020}-\u{e007f}])$/u;
+
+const isWinAnsi = (ch: string): boolean => {
+  const cp = ch.codePointAt(0) as number;
+  return (cp >= 0x20 && cp <= 0x7e) || (cp >= 0xa0 && cp <= 0xff) || CP1252_EXTRA.has(ch);
+};
+
+/**
+ * Texto apto para las fuentes estándar del PDF (codificación WinAnsi): NFC, transliteración determinística
+ * (CHAR_MAP) y supresión de lo que no tiene mapa (emoji, CJK, pictogramas…). Nunca deja un carácter que se pintaría
+ * como basura. Una letra griega pegada a otra letra o dígito lleva un espacio («Δt» → «Delta t»).
  */
 export function pdfText(s: string): string {
   let out = '';
-  for (const ch of String(s ?? '').normalize('NFC')) {
+  const chars = [...String(s ?? '').normalize('NFC')];
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
     const mapped = CHAR_MAP[ch];
     if (mapped !== undefined) {
       out += mapped;
+      if (GREEK[ch] && GREEK[ch] !== 'µ' && i + 1 < chars.length && /[\p{L}\p{N}]/u.test(chars[i + 1]) && !GREEK[chars[i + 1]]) out += ' ';
       continue;
     }
-    const cp = ch.codePointAt(0) as number;
-    if ((cp >= 0x20 && cp <= 0x7e) || (cp >= 0xa0 && cp <= 0xff) || CP1252_EXTRA.has(ch)) out += ch;
-    else if (cp === 0x0a || cp === 0x0d) out += ' ';
-    // resto (emoji, ✏, pictogramas, U+FE0F, U+200D, controles): se quita
+    if (isWinAnsi(ch)) out += ch;
+    else if (ch === '\n' || ch === '\r') out += ' ';
+    // resto (emoji, CJK, pictogramas, formato invisible): se quita; `unmappedCharCount` cuenta los visibles
   }
   return out.replace(/ {2,}/g, ' ');
+}
+
+/** Fix round 1 (I2): caracteres VISIBLES que `pdfText` quitaría sin equivalente (para el aviso del paquete). */
+export function unmappedCharCount(s: string): number {
+  let n = 0;
+  for (const ch of String(s ?? '').normalize('NFC')) {
+    if (CHAR_MAP[ch] !== undefined || isWinAnsi(ch) || ch === '\n' || ch === '\r' || INVISIBLE.test(ch)) continue;
+    n++;
+  }
+  return n;
 }
 
 // ─── Markdown → bloques ────────────────────────────────────────────────────
@@ -139,6 +200,7 @@ type Block =
   | { t: 'list'; ordered: boolean; items: Run[][] }
   | { t: 'quote'; paras: Run[][] }
   | { t: 'table'; header: string[]; rows: string[][] }
+  | { t: 'code'; lines: string[] }
   | { t: 'hr' };
 
 const SAFE_URL = /^(https?:\/\/|mailto:|#)[^"'<>\s`]*$/i;
@@ -197,6 +259,8 @@ function splitRow(l: string): string[] {
 
 /** Párrafo que abre con un pictograma o marcador (■, ✏, 💡, ⚠️ …) → recuadro destacado, sin el marcador. */
 const CALLOUT_LEAD = /^\s*(?:[■□▪◆●▶►✏✎✍★☆✅❗❕❓⚠]|\p{Extended_Pictographic})[️‍\p{Extended_Pictographic}]*\s*/u;
+/** Igual que CALLOUT_LEAD en cada línea (el marcador de un destacado se quita a propósito: no es contenido perdido). */
+const CALLOUT_LEAD_G = /^\s*(?:[■□▪◆●▶►✏✎✍★☆✅❗❕❓⚠]|\p{Extended_Pictographic})[️‍\p{Extended_Pictographic}]*\s*/gmu;
 
 export function parseLibroMarkdown(md: string): Block[] {
   const lines = sanitizeMarkdownLinks(md).split(/\r?\n/);
@@ -246,17 +310,31 @@ export function parseLibroMarkdown(md: string): Block[] {
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
+    // fix round 1 (M7): bloque de código cercado (``` o ~~~) → monoespaciado, línea por línea (antes: un párrafo con ```).
+    const fenceM = /^\s*(```|~~~)/.exec(line);
+    if (fenceM) {
+      flushAll();
+      const code: string[] = [];
+      i++;
+      while (i < lines.length && !lines[i].trim().startsWith(fenceM[1])) code.push(pdfText(lines[i++].replace(/\s+$/, '')));
+      i++;
+      while (code.length && !code[code.length - 1].trim()) code.pop();
+      if (code.length) blocks.push({ t: 'code', lines: code });
+      continue;
+    }
     if (isTableRow(line) && i + 1 < lines.length && isTableSep(lines[i + 1])) {
       flushAll();
       const header = splitRow(line).map(plainInline);
       const rows: string[][] = [];
       i += 2;
       while (i < lines.length && isTableRow(lines[i]) && !isTableSep(lines[i])) {
-        const cells = splitRow(lines[i]).map(plainInline);
-        rows.push(header.map((_, k) => cells[k] ?? ''));
+        rows.push(splitRow(lines[i]).map(plainInline));
         i++;
       }
-      blocks.push({ t: 'table', header, rows });
+      // fix round 1 (M7): una fila con más celdas que el encabezado ya no pierde las de más (se ensancha el encabezado).
+      const width = Math.max(header.length, ...rows.map((r) => r.length));
+      while (header.length < width) header.push('');
+      blocks.push({ t: 'table', header, rows: rows.map((r) => header.map((_, k) => r[k] ?? '')) });
       continue;
     }
     const h = /^(#{1,6})\s+(.*)$/.exec(line);
@@ -378,7 +456,33 @@ const countWords = (s: string): number => (String(s ?? '').match(WORD_RE) || [])
 
 const PAGE = { size: 'LETTER' as const, w: 612, h: 792, top: 78, bottom: 74, left: 68, right: 68 };
 
+/**
+ * Fix round 1 (I1): todo error que no sea propio (`LIBRO_*`), p.ej. pdfkit que lanza el string «Invalid JPEG.»,
+ * sale como `LIBRO_V3_PDF_FAILED: …` (clasificado en failure-classifier), nunca como un error sin código.
+ */
 export async function renderLibroPdfV3(input: LibroV3Input): Promise<LibroPdfResult> {
+  try {
+    return await renderLibroPdfV3Inner(input);
+  } catch (err) {
+    if (err instanceof Error && /^LIBRO_/.test(err.message)) throw err;
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`LIBRO_V3_PDF_FAILED: pdfkit no pudo generar el Libro Guía: ${msg.slice(0, 200)}`);
+  }
+}
+
+/** Fix round 1 (I2): caracteres visibles sin equivalente WinAnsi en el texto que el libro imprime (cada fuente una vez). */
+export function libroUnmappedChars(input: Pick<LibroV3Input, 'courseTitle' | 'brandName' | 'courseIntro' | 'modules'>): number {
+  const parts: string[] = [input.courseTitle, input.brandName ?? ''];
+  const bib = libroBibliographyV3(input);
+  for (const b of [...bib.course, ...bib.modules.flatMap((m) => m.entries)]) parts.push(b.author, b.title, b.publisher);
+  for (const m of input.modules) {
+    parts.push(m.title, m.intro.presentation ?? '', ...(m.intro.outcomes ?? []));
+    for (const ch of m.chapters) parts.push(ch.title, stripLeadingDuplicateTitle(String(ch.md ?? ''), ch.title, ch.number).replace(CALLOUT_LEAD_G, ''));
+  }
+  return parts.reduce((n, p) => n + unmappedCharCount(String(p ?? '')), 0);
+}
+
+async function renderLibroPdfV3Inner(input: LibroV3Input): Promise<LibroPdfResult> {
   const { theme: t, modules } = input;
   if (!input.courseTitle || !Array.isArray(modules) || modules.length === 0) {
     throw new Error('LIBRO_V3_INVALID: faltan el título del curso o los módulos');
@@ -429,6 +533,7 @@ export async function renderLibroPdfV3(input: LibroV3Input): Promise<LibroPdfRes
       Producer: 'Cursia (pdfkit)',
       CreationDate: LIBRO_PDF_FIXED_DATE,
       ModDate: LIBRO_PDF_FIXED_DATE,
+      ...(input.documentKey ? { Keywords: `cursia:${String(input.documentKey).replace(/[^A-Za-z0-9:_-]/g, '').slice(0, 80)}` } : {}),
     },
   } as any);
   const chunks: Buffer[] = [];
@@ -452,9 +557,10 @@ export async function renderLibroPdfV3(input: LibroV3Input): Promise<LibroPdfRes
     watermarkDraws[pageIdx] = (watermarkDraws[pageIdx] ?? 0) + 1;
     doc.save();
     doc.opacity(LIBRO_WATERMARK_OPACITY);
-    doc.image(wmImage, wmX, wmY, { width: wmW, height: wmH });
+    doc.image(wmImage, wmX, wmY, { width: wmW, height: wmH, ignoreOrientation: true } as any);
     doc.restore();
   });
+  let coverLogoDraws = 0;
 
   let words = 0;
   const bottomY = () => doc.page.height - doc.page.margins.bottom;
@@ -609,6 +715,8 @@ export async function renderLibroPdfV3(input: LibroV3Input): Promise<LibroPdfRes
         list(b.items, b.ordered);
       } else if (b.t === 'table') {
         table(b.header, b.rows);
+      } else if (b.t === 'code') {
+        leftBarBlock(b.lines.map((l) => [{ text: l || ' ', code: true }]), { color: ink, bar: rule });
       } else if (b.t === 'hr') {
         if (doc.y > PAGE.top + 1 && remaining() > 24) {
           doc.save().lineWidth(0.6).strokeColor(rule).moveTo(PAGE.left, doc.y + 4).lineTo(PAGE.left + contentW, doc.y + 4).stroke().restore();
@@ -621,6 +729,12 @@ export async function renderLibroPdfV3(input: LibroV3Input): Promise<LibroPdfRes
   // ── 1. Portada ──
   newPage();
   doc.save().rect(0, 0, PAGE.w, 10).fill(accent).restore();
+  // Fix round 1 (i): el logo resuelto a opacidad plena, arriba a la izquierda (≤ 150 × 60 pt), lejos de la marca de agua.
+  {
+    const sc = Math.min(150 / logo.width, 60 / logo.height);
+    doc.image(wmImage, PAGE.left, 66, { width: logo.width * sc, height: logo.height * sc, ignoreOrientation: true } as any);
+    coverLogoDraws++;
+  }
   doc.y = 150;
   if (brandName) {
     doc.font(FONTS.sans.b).fontSize(10.5).fillColor(accent).text(brandName, PAGE.left, doc.y, { width: contentW, characterSpacing: 0.6 });
@@ -839,5 +953,6 @@ export async function renderLibroPdfV3(input: LibroV3Input): Promise<LibroPdfRes
   }
   const chapterPages: Record<number, number> = {};
   for (const m of modules) for (const ch of m.chapters) chapterPages[ch.number] = (startOf[`cap-${ch.number}`] as number) + 1;
-  return { pdf, pageCount: total, wordCount: words, hasBibliography, watermarkDrawsPerPage: draws, chapterPages };
+  if (coverLogoDraws !== 1) throw new Error(`LIBRO_V3_WATERMARK: se esperaba exactamente 1 logo en la portada (${coverLogoDraws})`);
+  return { pdf, pageCount: total, wordCount: words, hasBibliography, watermarkDrawsPerPage: draws, chapterPages, coverLogoDraws, unmappedChars: libroUnmappedChars(input) };
 }
