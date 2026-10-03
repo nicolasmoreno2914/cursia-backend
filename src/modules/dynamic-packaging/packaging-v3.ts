@@ -434,43 +434,68 @@ export interface LibroBrandV3 {
  *   1. `brand_profiles` ACTIVO de la institución del curso → `palette.logoUrl` (data URI del frontend);
  *   2. si no, `user_settings.logo_b64` del dueño del curso (lo que sube «Logo del centro»; PNG/JPEG/SVG tal cual);
  *   3. si no, ninguno → logo de Cursia en el builder.
+ * `user_settings` (y `authorized_users`) es una tabla administrada por Supabase, SIN entidad ni migración en este
+ * backend (docs/memory/00_estado_actual.md, docs/ARQUITECTURA_V1.md): la base del backend ES la de Supabase y
+ * `courses.owner_id` es el uid de Supabase (sub del JWT). `brand_profiles` / `institutions` son entidades NestJS.
+ * Fix round 1 (I3): si una fuente que debería consultarse no existe (to_regclass nulo) o su consulta falla por
+ * estructura (tabla o columna ausente, permisos), el aviso `libro_logo_source_unavailable:<tabla>[:motivo]` queda
+ * visible en el resumen del paquete; nunca una caída silenciosa al logo de Cursia.
  * `brand_profiles.logo_artifact_id` no lo llena hoy ningún flujo del producto: si aparece SIN `logoUrl` se avisa
- * (`libro_logo_artifact_unsupported`) y se sigue con el paso 2. Una tabla ausente (to_regclass) no es error.
- * Un fallo de la consulta deja `libro_logo_lookup_failed` (visible) y el Libro sale con el logo de Cursia.
+ * (`libro_logo_artifact_unsupported`) y se sigue con el paso 2.
  */
 export async function loadLibroBrandV3(q: QueryExecutor, courseId: number, ownerId: string | null): Promise<LibroBrandV3> {
   const warnings: string[] = [];
+  const why = (err: unknown) => (err instanceof Error ? err.message : String(err)).slice(0, 80).replace(/\s+/g, ' ').replace(/:/g, ';');
+  let course: any;
+  let reg: any;
   try {
-    const [course] = await q.query(`select owner_id, institution_id from public.courses where id = $1`, [courseId]);
-    const owner = (course?.owner_id ?? ownerId ?? null) as string | null;
-    const [reg] = await q.query(
+    [course] = await q.query(`select owner_id, institution_id from public.courses where id = $1`, [courseId]);
+    [reg] = await q.query(
       `select to_regclass('public.brand_profiles') is not null as bp, to_regclass('public.user_settings') is not null as us, to_regclass('public.institutions') is not null as inst`,
       [],
     );
-    let name: string | null = null;
-    let logo: LibroLogoCandidate | null = null;
-    if (course?.institution_id) {
-      if (reg?.inst) {
+  } catch (err) {
+    return { logo: null, name: null, warnings: [`libro_logo_source_unavailable:courses:${why(err)}`] };
+  }
+  const owner = (course?.owner_id ?? ownerId ?? null) as string | null;
+  let name: string | null = null;
+  let logo: LibroLogoCandidate | null = null;
+  if (course?.institution_id) {
+    if (!reg?.inst) warnings.push('libro_logo_source_unavailable:institutions');
+    else {
+      try {
         const [inst] = await q.query(`select name from public.institutions where id::text = $1`, [String(course.institution_id)]);
         if (typeof inst?.name === 'string' && inst.name.trim()) name = inst.name.trim().slice(0, 120);
+      } catch (err) {
+        warnings.push(`libro_logo_source_unavailable:institutions:${why(err)}`);
       }
-      if (reg?.bp) {
+    }
+    if (!reg?.bp) warnings.push('libro_logo_source_unavailable:brand_profiles');
+    else {
+      try {
         const [bp] = await q.query(
           `select palette->>'logoUrl' as logo_url, logo_artifact_id from public.brand_profiles where institution_id::text = $1 and status = 'active' order by version desc limit 1`,
           [String(course.institution_id)],
         );
         if (typeof bp?.logo_url === 'string' && bp.logo_url.trim()) logo = { source: 'brand_profile', dataUri: bp.logo_url };
         else if (bp?.logo_artifact_id) warnings.push('libro_logo_artifact_unsupported:brand_profile');
+      } catch (err) {
+        warnings.push(`libro_logo_source_unavailable:brand_profiles:${why(err)}`);
       }
     }
-    if (!logo && owner && reg?.us) {
-      const [us] = await q.query(`select logo_b64 from public.user_settings where user_id::text = $1`, [String(owner)]);
-      if (typeof us?.logo_b64 === 'string' && us.logo_b64.trim()) logo = { source: 'user_settings', dataUri: us.logo_b64 };
-    }
-    return { logo, name, warnings };
-  } catch (err) {
-    return { logo: null, name: null, warnings: [`libro_logo_lookup_failed:${err instanceof Error ? err.message.slice(0, 80).replace(/\s+/g, ' ') : 'error'}`] };
   }
+  if (!logo && owner) {
+    if (!reg?.us) warnings.push('libro_logo_source_unavailable:user_settings');
+    else {
+      try {
+        const [us] = await q.query(`select logo_b64 from public.user_settings where user_id::text = $1`, [String(owner)]);
+        if (typeof us?.logo_b64 === 'string' && us.logo_b64.trim()) logo = { source: 'user_settings', dataUri: us.logo_b64 };
+      } catch (err) {
+        warnings.push(`libro_logo_source_unavailable:user_settings:${why(err)}`);
+      }
+    }
+  }
+  return { logo, name, warnings };
 }
 
 /** Hash de la marca del Libro Guía tal como la verá el builder (logo YA resuelto + nombre) y sus avisos. */
