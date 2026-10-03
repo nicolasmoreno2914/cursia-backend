@@ -251,6 +251,7 @@ async function main() {
   try {
     await pureChecks();
     await workerChecks();
+    await fixRound1Checks();
     await packagingChecks();
     await finopsChecks();
   } finally {
@@ -269,7 +270,7 @@ async function pureChecks() {
     assert(p.narratableWords >= 2650 && p.narratableWords <= 2950, `≈2.800 palabras narrables (${p.narratableWords})`);
     eq(p.excluded.map((e) => e.reason), ['bibliography'], 'solo la bibliografía queda fuera');
     const all = p.sections.map((s) => s.text).join(' ');
-    assert(/Criterio: c1costo; Opción c1A: c1bajo; Opción c1B: c1alto\./.test(all), 'tabla verbalizada (encabezado: celda)');
+    assert(all.includes('Criterio; Opción c1A; Opción c1B.') && all.includes('c1costo; c1bajo; c1alto.'), 'tabla verbalizada (encabezado una vez + filas, sin perder celdas)');
     assert(/c1gl2: /.test(all) && !/\*\*/.test(all), 'glosario y lista narrados, sin markdown');
     assert(p.sections.every((s) => s.words >= AS.AUDIOBOOK_CHUNK_MIN_WORDS || p.sections.length === 1) && p.sections.every((s) => s.words <= AS.AUDIOBOOK_CHUNK_MAX_WORDS), `bloques ${p.sections.map((s) => s.words)}`);
     assert(new Set(p.sections.map((s) => s.sha256)).size === p.sections.length, 'sha por bloque');
@@ -568,7 +569,7 @@ async function workerChecks() {
     eq([it.status, delta(c0).llm], ['completed', 0], `completa sin repagar el guion (${it.error})`);
   });
 
-  await check('9. costo incierto (conexión cortada tras enviar el segmento 2) → reconciliación, 0 reintentos automáticos; el re-claim común no llama; tras la decisión explícita solo se sintetiza lo que falta', async () => {
+  await check('9. costo incierto (conexión cortada tras enviar el segmento 2) → reconciliación: el worker no reintenta solo y el re-claim común no llama (el único reenvío automático es el de #583, ≤ US$0.10, que reconoce el intento); tras ese reconocimiento solo se sintetiza lo que falta', async () => {
     const W = memoryWorld();
     const it = newItem(W, { ch: 12, md: chapterMd(12, 1500) });
     let n = 0;
@@ -590,6 +591,198 @@ async function workerChecks() {
     eq(it.status, 'completed', `completa (${it.error})`);
     const total = it.outputSummary.audiobookManifest.tts.segmentsExpected;
     eq(delta(c1), { tts: total - 1, llm: 0 }, 'el segmento 1 guardado NO se repaga');
+  });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Fix round 1 (review IMPL-A: I1–I5, A5, M5)
+async function fixRound1Checks() {
+  await check('FR1 I3: el limpiador ya no pierde texto — tabla GFM sin bordes, código en línea y «x < 5 y y > 3» se narran; «Referencias normativas…» se narra; «Referencias» se excluye CON sus palabras; cobertura contra el Markdown crudo = 0 perdidas', () => {
+    const md = [
+      '# Capítulo', '', 'Introducción del capítulo con varias palabras de contexto para el bloque inicial.',
+      '', '## Comparación', '', 'Criterio | Opción A | Opción B', '---|---|---', 'costo | bajo | alto', 'riesgo | medio | bajo', '',
+      'La fórmula `=SUMA(A1:A5)` suma el rango; si x < 5 y y > 3 el resultado cambia.',
+      '', '## Referencias normativas del sector', '', 'La norma técnica obliga a revisar la presión cada turno y a registrar el caudal medido en planta.',
+      '', '## Referencias', '', '- Autor, A. (2020). Obra citada. Editorial.', '- Autora, B. (2021). Otra obra. Editorial.',
+    ].join('\n');
+    const p = AS.planAudiobookSections(md);
+    const all = p.sections.map((x) => x.text).join(' ');
+    for (const w of ['Opción A', 'Opción B', 'riesgo; medio; bajo', '=SUMA(A1:A5)', 'x < 5 y y > 3', 'revisar la presión cada turno']) assert(all.includes(w), `falta «${w}» en: ${all}`);
+    assert(/^Criterio; Opción A; Opción B\.$/m.test(p.sections.map((x) => x.text).join('\n').replace(/ (?=costo)/, '\n')) || all.includes('Criterio; Opción A; Opción B.'), 'encabezado una sola vez (M5)');
+    eq(p.excluded.map((e) => e.title), ['Referencias'], 'solo la bibliografía exacta queda fuera');
+    assert(p.excluded[0].words > 0, 'con sus palabras');
+    eq(p.lostWords, 0, 'cobertura contra el crudo: nada perdido');
+    eq(p.rawWords, AS.rawSourceTokens(md).length, 'palabras crudas');
+    // El limpiador viejo (cleanAudioText) sí perdía «Opción A» / el código / «x < 5 …»: la regresión queda fijada.
+    const old = AS.cleanAudioText(md);
+    assert(!old.includes('=SUMA(A1:A5)') && !old.includes('x < 5'), 'el limpiador de la bienvenida/Gamma no cambia (fuera de alcance)');
+  });
+
+  await check('FR1 I3: control de cobertura INDEPENDIENTE del limpiador — si un bloque pierde palabras de la fuente, AUDIOBOOK_PLAN_COVERAGE (no reintentable), nunca un plan corto en silencio', () => {
+    const base = `# T\n\n## Uno\n\n${para(300, 'cv')}\n\n## Dos\n\n${para(300, 'cw')}`;
+    const p = AS.planAudiobookSections(base);
+    eq(AS.planCoverageLoss(base, p.sections.map((x) => x.text), []).length, 0, 'plan completo: 0 perdidas');
+    // Un plan al que le faltan 50 palabras del final (lo que haría un limpiador o un recorte defectuoso) se detecta.
+    const cut = p.sections.map((x, i) => (i === p.sections.length - 1 ? x.text.split(/\s+/).slice(0, -50).join(' ') : x.text));
+    eq(AS.planCoverageLoss(base, cut, []).length, 50, 'las 50 palabras perdidas aparecen');
+    assert(50 > Math.max(AS.AUDIOBOOK_COVERAGE_TOLERANCE.minWords, Math.ceil(p.rawWords * AS.AUDIOBOOK_COVERAGE_TOLERANCE.ratio)), 'y superan la tolerancia → AUDIOBOOK_PLAN_COVERAGE');
+    // Una sección excluida EXPLÍCITAMENTE cuenta como cubierta (queda en el manifiesto con sus palabras).
+    const withBib = `${base}\n\n## Bibliografía\n\n- Autor, A. (2020). Obra. Editorial.`;
+    const pb = AS.planAudiobookSections(withBib);
+    eq([pb.lostWords, pb.excluded.length], [0, 1], 'bibliografía excluida y registrada, sin pérdidas');
+  });
+
+  await check('FR1 I2: bucle DENTRO de un bloque (oración repetida) → AUDIOBOOK_SCRIPT_REPETITION, se descarta ESE bloque y el reintento lo regenera (antes: 0 llamadas y la misma falla en cada ronda)', async () => {
+    eq(AS.blocksToDropForRepetition([3]), [3], 'un solo bloque → ése');
+    eq(AS.blocksToDropForRepetition([4, 1]), [4], 'varios → todos salvo el primero por posición');
+    const W = memoryWorld();
+    const md = `# B\n\n## Uno\n\n${para(300, 'b1')}\n\n## Dos\n\n${para(300, 'b2')}`;
+    const it = newItem(W, { ch: 30, md });
+    FAKES.plan.llmLoop = 0;
+    let k = 0;
+    Object.defineProperty(FAKES.plan, 'llmLoop', { configurable: true, get() { return ++k === 2 ? 1 : 0; }, set() {} });
+    await claim(W, it);
+    Object.defineProperty(FAKES.plan, 'llmLoop', { configurable: true, writable: true, value: 0 });
+    eq(it.status, 'retrying', `no completo (${it.error})`);
+    assert(/^AUDIOBOOK_SCRIPT_REPETITION: el bloque 2 repite la oración/.test(it.error), it.error);
+    eq(Object.keys(it.outputSummary.audiobookSections), ['0'], 'el bloque con bucle se descartó');
+    const c0 = counts();
+    await claim(W, nextAttempt(it));
+    eq([it.status, delta(c0).llm], ['completed', 1], `el reintento regenera solo ese bloque (${it.error})`);
+    // Repetición que ya está en la FUENTE (M4): no cuenta.
+    const s = 'uno dos tres cuatro cinco seis siete ocho nueve diez once doce.';
+    eq(AS.findScriptRepetition([{ idx: 0, text: `${s} a. ${s} b. ${s}` }], [{ idx: 0, text: `${s} x. ${s} y. ${s}` }]).idxs, [], 'repetido en la fuente');
+  });
+
+  await check('FR1 I4: salida cortada por max_tokens → nunca se acepta tal cual: UNA continuación la termina; si la continuación también se corta → AUDIOBOOK_SECTION_TRUNCATED (no completo); max_tokens ≈ 2 × objetivo', async () => {
+    const W = memoryWorld();
+    const md = `# T\n\n## Uno\n\n${para(400, 't1')}`;
+    FAKES.plan.llmTruncate = 1;
+    const ok = await claim(W, newItem(W, { ch: 31, md }));
+    eq(ok.status, 'completed', `completa (${ok.error})`);
+    const sec = ok.outputSummary.audiobookManifest.script.sections[0];
+    eq([sec.continued, sec.messageIds.length], [true, 2], 'el bloque cortado se continuó');
+    assert(FAKES.st.llm.slice(-2)[0].truncated === true, 'la primera salida venía cortada');
+    FAKES.plan.llmTruncate = 2;
+    const bad = await claim(W, newItem(W, { ch: 32, md }));
+    FAKES.plan.llmTruncate = 0;
+    eq(bad.status, 'retrying', `no completo (${bad.error})`);
+    assert(/^AUDIOBOOK_SECTION_TRUNCATED/.test(bad.error), bad.error);
+    eq(bad.completion, undefined, 'nunca completeItem');
+    eq(FC.classifyFailure({ error: bad.error, itemType: 'audiobook_chapter', source: 'provider_worker' }).class, 'B', 'clase B');
+    const pl = AS.planAudiobookSections(`# X\n\n## Y\n\n${para(900, 'mt')}`);
+    const pr = AS.sectionNarrationPrompt({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', contentMarkdown: '' }, pl.sections[0], 1, null);
+    assert(pr.maxTokens >= 2 * AS.sectionTargetWords(pl.sections[0].words).target, `max_tokens ${pr.maxTokens}`);
+  });
+
+  await check('FR1 I1: voz a 170 ppm (todas las validaciones verdes) → cada capítulo se AMPLÍA desde su fuente hasta 0,85 × palabras × 60/141 y el curso llega a ≥ 1500 s SOLO (sin humano); ampliaciones con clave propia, segmentos pagados reutilizados', async () => {
+    const fast = startProviderFakes({ openaiKey: KEYS.OPENAI_API_KEY, anthropicKey: KEYS.ANTHROPIC_API_KEY, gammaKey: 'g', makePdf: () => Buffer.from('%PDF'), makeMp3, ttsWordsPerSecond: 170 / 60 });
+    const u = await fast.listen();
+    const env = { ...KEYS, OPENAI_API_BASE_URL: u.openaiUrl, ANTHROPIC_API_BASE_URL: u.anthropicUrl };
+    try {
+      const W = memoryWorld();
+      const mans = new Map();
+      const mp3s = [];
+      let src = 0;
+      for (const ch of [41, 42]) {
+        const md = chapterMd(ch, 2300); // 2 capítulos cortos: Σ fuente ≈ 4.600 (≥ umbral 4.148, < 5.148)
+        const plan = AS.planAudiobookSections(md);
+        src += plan.narratableWords;
+        const it = await claim(W, newItem(W, { ch, md }), { env });
+        eq([it.status, it.error ?? null], ['completed', null], `capítulo ${ch} completo sin humano`);
+        const m = it.outputSummary.audiobookManifest;
+        assert(m.audio.seconds >= AS.chapterTargetSeconds(plan.narratableWords) - 1e-6, `capítulo ${ch}: ${m.audio.seconds} s ≥ objetivo`);
+        assert(m.audio.wpm > 160 && m.audio.wpm < 175, `voz rápida ${m.audio.wpm}`);
+        assert(Object.keys(it.outputSummary.audiobookExtensions || {}).length >= 1, 'hubo ampliaciones');
+        assert(m.tts.segments.some((x) => /^seg-\d+-x0-0-[0-9a-f]{12}$/.test(x.key)), 'segmento de ampliación con su clave');
+        assert(m.script.sections.every((x) => x.ratio <= 1.1), 'ninguna ampliación pasa el 110 %');
+        eq(AUD.validateChapterAudioManifest(m), [], 'manifiesto válido (incluye el objetivo)');
+        mans.set(`ch${ch}`, m);
+        mp3s.push({ chapterId: `ch${ch}`, chapterNumber: ch, mp3: audioOf(W, it) });
+      }
+      assert(src >= AUD.AUDIOBOOK_FLOOR_SOURCE_WORDS, `fuente ${src}`);
+      const ab = AUD.assembleAudiobook(mp3s, { manifests: mans });
+      assert(ab.durationSeconds >= 1500, `curso ${ab.durationSeconds} s`);
+      eq([ab.floor.checked, ab.floor.belowFloor], [true, false], 'piso evaluado y cumplido');
+      console.log(`   170 ppm, 2 × 2.300: ${(ab.durationSeconds / 60).toFixed(1)} min (sin ampliar habría sido ≈ ${((src * 0.9 * 60) / 170 / 60).toFixed(1)} min)`);
+      // Idempotencia de la ampliación: un re-claim del mismo item ya completo no aplica; un capítulo cortado a mitad
+      // de la ampliación reutiliza los segmentos pagados (los de la base no cambian de clave).
+      const W2 = memoryWorld();
+      const it2 = newItem(W2, { ch: 43, md: chapterMd(43, 2300) });
+      let n = 0;
+      const base = AS.audiobookSegments(AS.planAudiobookSections(chapterMd(43, 2300)).sections.map((x) => ({ idx: x.idx, text: x.text }))).length;
+      fast.plan.ttsFail = { shift: () => (++n === base + 1 ? 429 : undefined) }; // falla el primer segmento de ampliación
+      await claim(W2, it2, { env });
+      fast.plan.ttsFail = [];
+      eq(it2.status, 'retrying', `cortado en la ampliación (${it2.error})`);
+      const t0 = fast.st.tts.length;
+      const l0 = fast.st.llm.length;
+      await claim(W2, nextAttempt(it2), { env });
+      eq(it2.status, 'completed', `completa (${it2.error})`);
+      eq(fast.st.llm.length - l0, 0, 'la ampliación guardada no se repaga');
+      assert(fast.st.tts.length - t0 < base, `solo los segmentos de ampliación faltantes (${fast.st.tts.length - t0})`);
+    } finally {
+      await fast.close();
+    }
+  });
+
+  await check('FR1 I1: sin margen bajo el 110 % → AUDIOBOOK_CHAPTER_UNDER_TARGET (clase B, recuperable), nunca completo; planChapterExtension elige primero los bloques de menor ratio', () => {
+    const picks = AS.planChapterExtension([{ idx: 0, sourceWords: 300, scriptWords: 280 }, { idx: 1, sourceWords: 300, scriptWords: 258 }, { idx: 2, sourceWords: 300, scriptWords: 330 }], 60);
+    eq(picks.map((x) => x.idx), [1], 'menor ratio primero; cubierto con uno');
+    assert(picks[0].words <= 330 - 258, 'tope 110 %');
+    eq(AS.planChapterExtension([{ idx: 0, sourceWords: 300, scriptWords: 330 }], 50), [], 'sin margen');
+    eq(FC.classifyFailure({ error: 'AUDIOBOOK_CHAPTER_UNDER_TARGET: x', itemType: 'audiobook_chapter', source: 'provider_worker' }).class, 'B', 'clase B');
+    const m = { v: 1, tts: { segmentsExpected: 0, segmentsGenerated: 0, segmentsConcatenated: 0, segments: [], wordsSent: 0 }, audio: { frames: 0, seconds: 100, infoFrames: 0, infoFrameSeconds: 100, wpm: 0, targetSeconds: 200 }, script: { sections: [] }, source: { sections: 0 } };
+    assert(AUD.validateChapterAudioManifest(m).some((e) => /UNDER_TARGET/.test(e)), 'el validador también lo exige');
+  });
+
+  await check('FR1 I5: el guard reserva el costo de LA llamada (segmento/bloque), no el p90 del capítulo: un 2×2 tipo #616 (≈ US$14.15) nunca se frena en falso contra US$15; el guard sigue frenando lo que de verdad no entra', async () => {
+    const seed = JSON.parse(fs.readFileSync(path.join(REPO, 'src/modules/finops/pricing-seed.v1.json'), 'utf8'));
+    const catalog = seed.rows.map((r, i) => ({ id: `seed-${i}`, ...r, unit_size: String(r.unit_size), unit_price: String(r.unit_price), effective_to: r.effective_to ?? null }));
+    const { FinopsBudgetService } = loadDist('modules/finops/finops-budget.service.js');
+    let actual = '0';
+    const ds = { async query(sql) {
+      if (/cost_budget_authorizations/.test(sql)) return [{ decision: 'ADMIN_APPROVED', authorized_budget: '15' }];
+      if (/sum\(amount\)/.test(sql)) return [{ total: actual }];
+      if (/generation_item_runs g/.test(sql)) return [];
+      if (/pricing_catalog/.test(sql)) return catalog;
+      throw new Error(`query inesperada: ${sql.slice(0, 80)}`);
+    } };
+    const svc = new FinopsBudgetService(ds, {});
+    const tts = (chars) => ({ provider: 'openai', service: 'audio.speech', product: 'gpt-4o-mini-tts', usage: { audio_seconds: Math.ceil(chars / 15) } });
+    const llm = (promptChars, maxTokens) => ({ provider: 'anthropic', service: 'messages', product: 'claude-sonnet-4-6', usage: { input_tokens: Math.ceil(promptChars / 3), output_tokens: maxTokens } });
+    const g = (nextCall) => svc.guardPaidSubmission({ runId: 'r', itemRunId: 'i', itemType: 'audiobook_chapter', provider: nextCall ? nextCall.provider : 'openai', ...(nextCall ? { nextCall } : {}) });
+    // Run tipo #616: todo lo demás ya gastado según el estimado (14.15 − 1.60 del audiolibro); luego los 4 capítulos,
+    // llamada por llamada (≈ 8 bloques + ≈ 9 segmentos por capítulo), con el gasto real acumulándose.
+    let spent = 14.15 - 1.6;
+    let blocked = 0;
+    const perChapter = [];
+    for (let i = 0; i < 8; i++) perChapter.push(['llm', 2800, 1100, 0.0103]);
+    for (let i = 0; i < 9; i++) perChapter.push(['tts', 1750, 0, 0.0292]);
+    for (let ch = 0; ch < 4; ch++) for (const [kind, a, b, cost] of perChapter) {
+      actual = spent.toFixed(6);
+      const r = await g(kind === 'tts' ? tts(a) : llm(a, b));
+      if (!r.allow) blocked++;
+      spent += cost;
+    }
+    eq(blocked, 0, `ninguna llamada frenada en falso (gasto final ${spent.toFixed(2)})`);
+    assert(spent <= 15, 'el run entra en el tope');
+    // Run que se fue un poco por encima del estimado por reintentos pagados (14.80): el segmento siguiente (≈ US$0.03)
+    // entra en US$15 — con el p90 del capítulo entero (≈ US$0.31) el guard viejo lo frenaba.
+    actual = '14.80';
+    eq((await g(tts(1750))).allow, true, 'por llamada: entra');
+    eq((await g(null)).allow, false, 'p90 del capítulo (comportamiento previo sin nextCall): frenaba en falso');
+    // Lo que de verdad no entra se sigue frenando.
+    actual = '14.99';
+    eq((await g(tts(3900))).allow, false, 'una llamada que supera el tope se frena');
+  });
+
+  await check('FR1 A5: el estimado de una regeneración usa las palabras reales del capítulo (audiobookPlan) si ya se conocen; antes de la primera generación, la referencia de 2.800', () => {
+    const src = fs.readFileSync(path.join(REPO, 'src/modules/dynamic-generation/runs.service.ts'), 'utf8');
+    assert((src.match(/estimateItemsForRun\(items, (?:'real'|mode), actions, \{ chapterWords \}\)/g) || []).length === 2, 'los dos gates de regeneración pasan chapterWords');
+    assert(/output_summary->'audiobookPlan'->>'narratableWords'/.test(src), 'leídas del plan del audiolibro');
+    const it = RB.estimateItemsForRun([{ key: 'audiobook_chapter:c', type: 'audiobook_chapter', chapterId: 'c', moduleId: 'm' }], 'real', { 'audiobook_chapter:c': 'REGENERATE' }, { chapterWords: { c: 4200 } });
+    eq(it[0].usageScale, 1.5, 'capítulo de 4.200 palabras = 1,5 × referencia');
   });
 }
 

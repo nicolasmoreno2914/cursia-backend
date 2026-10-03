@@ -139,14 +139,14 @@ function syntheticMp4WithMvhd(durationSec, tag = 'fake-mp4') {
 // (Gamma); POST /v1/audio/speech (OpenAI); POST /v1/messages (Anthropic). Cada
 // proveedor exige SU clave (401 si no). `plan` programa fallos/esperas para las
 // pruebas de reanudación. Registra cada llamada (sin guardar las claves).
-function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp3, pdfPages = 10, readyAfterPolls = 1, ttsWordsPerSecond = 2.5 }) {
+function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp3, pdfPages = 10, readyAfterPolls = 1, ttsWordsPerSecond = 141 / 60 }) {
   const st = { gammaPosts: [], gammaGets: [], exports: [], tts: [], llm: [], badAuth: [], seq: 0 };
   const gens = new Map(); // id → {polls}
   // Un valor numérico en gammaPostFail/ttsFail/llmFail = ese status HTTP; 'drop' = se corta la conexión DESPUÉS de recibir el pedido.
   // r19 (audiolibro por bloques): llmPadded = N respuestas a 1,4 × el objetivo; llmDuplicate = N respuestas que repiten el
   // texto del bloque anterior. ttsSlow = N segmentos con el doble de duración por palabra (voz ralentizada).
   // ttsSameAudio = N segmentos que reciben el MISMO audio (makeMp3 sin el texto: bytes idénticos para la misma duración).
-  const plan = { gammaPostFail: [], gammaHoldPending: false, gammaFailGeneration: false, gammaNoCredits: false, ttsFail: [], llmFail: [], llmShortFirst: 0, ttsFixedRequestId: null, llmTiny: 0, llmPadded: 0, llmDuplicate: 0, ttsSlow: 0, ttsSameAudio: 0 };
+  const plan = { gammaPostFail: [], gammaHoldPending: false, gammaFailGeneration: false, gammaNoCredits: false, ttsFail: [], llmFail: [], llmShortFirst: 0, ttsFixedRequestId: null, llmTiny: 0, llmPadded: 0, llmDuplicate: 0, ttsSlow: 0, ttsSameAudio: 0, llmTruncate: 0, llmLoop: 0 };
   let lastSectionText = null;
   // 'hang' = se recibe el pedido y nunca se responde (el cliente corta por timeout; la operación pudo ejecutarse).
   const hang = (rq) => setTimeout(() => rq.socket.destroy(), 10_000).unref();
@@ -204,7 +204,7 @@ function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp
         if (typeof f === 'number') { st.tts.push({ ...req, failed: f }); return json(f, { error: { message: `fake ${f}` } }); }
         const rid = plan.ttsFixedRequestId || `req_f2_${++st.seq}`;
         st.tts.push({ model: req.model, voice: req.voice, chars: String(req.input || '').length, requestId: rid, response_format: req.response_format });
-        // ~2.5 palabras/s → duración proporcional al texto (segundos enteros, ≥ 1); ttsSlow → el doble.
+        // Ritmo medido de la voz real (≈141 ppm, r19 DIAG-A) → duración proporcional al texto (segundos enteros, ≥ 1); ttsSlow → el doble.
         const slow = plan.ttsSlow > 0;
         if (slow) plan.ttsSlow--;
         const secs = Math.max(1, Math.round(String(req.input || '').split(/\s+/).length / ttsWordsPerSecond)) * (slow ? 2 : 1);
@@ -243,17 +243,37 @@ function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp
           if (dup) plan.llmDuplicate--;
           // tiny: ≤ 20 palabras y ≤ 30 % del objetivo (sigue corto aunque la continuación también lo sea).
           const n = tiny ? Math.max(1, Math.min(20, Math.round(target * 0.3))) : padded ? Math.round(target * 1.4) : short ? Math.round(target * 0.6) : target;
+          const loop = !isCont && plan.llmLoop > 0;
+          if (loop) plan.llmLoop--;
           if (dup) text = lastSectionText;
-          else if (isCont) text = src.slice(Math.max(0, src.length - n)).join(' ');
+          else if (loop) {
+            // Bucle DENTRO del bloque: la primera oración completa vuelve a aparecer al final; mismo largo.
+            const end = src.findIndex((w) => /[.!?]$/.test(w));
+            const first = src.slice(0, end + 1);
+            const mid = src.slice(first.length, Math.max(first.length, n - first.length));
+            while (mid.length && !/[.!?]$/.test(mid[mid.length - 1])) mid.pop(); // el medio termina en oración completa
+            text = [...first, ...mid, ...first].join(' ');
+          } else if (isCont) {
+            // Sigue desde la última palabra ya narrada (sin repetir); pasada la fuente, «amplía» con palabras nuevas.
+            const done = /Narración ya escrita[^\n]*\n"""\n([\s\S]*?)\n"""/.exec(user);
+            const last = done ? done[1].trim().split(/\s+/).pop() : null;
+            const at = last ? src.lastIndexOf(last) : -1;
+            const from = at >= 0 ? at + 1 : Math.max(0, src.length - n);
+            const more = src.slice(from, from + n);
+            text = [...more, ...Array.from({ length: n - more.length }, () => `amp${++st.seq}`)].join(' ');
+          }
           else if (n <= src.length) text = src.slice(0, n).join(' ');
           else text = [...src, ...Array.from({ length: n - src.length }, (_, i) => `relleno${i}`)].join(' ');
           if (!isCont) lastSectionText = text;
         } else {
           text = tiny ? words(20, st.seq) : isCont ? words(180, st.seq) : short ? words(200, st.seq) : words(430, st.seq);
         }
-        st.llm.push({ id, model: req.model, maxTokens: req.max_tokens, continuation: isCont });
+        // llmTruncate = N respuestas cortadas por max_tokens (stop_reason; el texto queda a mitad).
+        const trunc = plan.llmTruncate > 0;
+        if (trunc) { plan.llmTruncate--; text = String(text).replace(/[.!?]?$/, ''); }
+        st.llm.push({ id, model: req.model, maxTokens: req.max_tokens, continuation: isCont, truncated: trunc });
         return json(200, {
-          id, type: 'message', role: 'assistant', model: req.model, stop_reason: 'end_turn',
+          id, type: 'message', role: 'assistant', model: req.model, stop_reason: trunc ? 'max_tokens' : 'end_turn',
           content: [{ type: 'text', text }],
           usage: { input_tokens: 1200, output_tokens: isCont ? 260 : 640, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
         }, { 'request-id': `req_llm_${st.seq}` });
