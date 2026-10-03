@@ -77,6 +77,7 @@ import {
   autoHealPolicyFromEnv,
   autoHealRoundsOf,
   autoRegenRoundsOf,
+  autoRecoveryEnabled,
   SAFE_AUTO_RETRY_MAX_ROUNDS,
   SAFE_AUTO_RETRY_SQL_REGEX,
   safeAutoRetryDecision,
@@ -286,6 +287,29 @@ export interface RunDto {
    * `completed` con componentes de vista previa se lee `state:'preview'` sin escribir nada.
    */
   completion: RunCompletion;
+  /**
+   * REL MVP fix round 1 (M3): recuperación automática activa en el servidor (tick + política por clase).
+   * false (kill-switch `DYNAMIC_AUTO_HEAL_POLICY=legacy`) → el frontend no arranca el ejecutor solo al abrir.
+   */
+  autoRecovery: boolean;
+  /**
+   * REL MVP fix round 1 (I3): último claim o finalización de una parte del NAVEGADOR (cualquier ejecutor,
+   * cualquier equipo). Si es reciente (< lease del navegador), otro ejecutor está vivo: no se arranca otro.
+   */
+  lastBrowserActivityAt: string | null;
+}
+
+/** REL MVP fix round 1 (I3): último claim / finalización de una parte que ejecuta el navegador. */
+export function lastBrowserActivityOf(rows: ReadonlyArray<{ type: string; status: string; claimed_at?: Date | string | null; finished_at?: Date | string | null }>): string | null {
+  let best = 0;
+  for (const r of rows) {
+    if (AUTO_HEAL_WORKER_ITEM_TYPES.includes(r.type)) continue;
+    for (const v of [r.claimed_at, r.status === 'completed' ? r.finished_at : null]) {
+      const t = v ? new Date(v as any).getTime() : NaN;
+      if (Number.isFinite(t) && t > best) best = t;
+    }
+  }
+  return best ? new Date(best).toISOString() : null;
 }
 
 function toIso(v: Date | string | null | undefined): string | null {
@@ -2140,14 +2164,14 @@ export class RunsService {
             and not (case when jsonb_typeof(g.output_summary->'autoHeal'->'skipUntilMs') = 'number'
                           then (g.output_summary->'autoHeal'->>'skipUntilMs')::numeric > $12::numeric else false end)
             -- REL MVP: un error ya evaluado como no elegible (C/D, tope, precondición) no se re-evalúa hasta que cambie
-            and coalesce(g.output_summary->'autoHeal'->>'ineligibleMd5', '') <> md5(g.error)
+            and ($13::boolean is not true or coalesce(g.output_summary->'autoHeal'->>'ineligibleMd5', '') <> md5(g.error))
             and ($9::bigint is null or (${finishedUsSql}, g.id) < ($9::bigint, $10::uuid))
           order by ${finishedUsSql} desc, g.id desc
           limit $11`,
         [
           now.toISOString(), Math.round(Math.min(Math.max(policy.maxAgeHours, 0), AUTO_HEAL_MAX_AGE_HOURS_RANGE.max) * 3600), allowRegex, AUTO_HEAL_SQL_DENY_REGEX,
           [...AUTO_HEAL_WORKER_ITEM_TYPES], policy.maxRounds, policy.browserMaxRounds, backoffs,
-          cursor ? cursor.finishedUs : null, cursor ? cursor.id : null, pageSize, now.getTime(),
+          cursor ? cursor.finishedUs : null, cursor ? cursor.id : null, pageSize, now.getTime(), !!policy.classAware,
         ],
       );
       if (rows.length === 0) break;
@@ -4672,6 +4696,8 @@ export class RunsService {
       progress,
       items: itemDtos,
       completion,
+      autoRecovery: autoRecoveryEnabled(),
+      lastBrowserActivityAt: lastBrowserActivityOf(rows),
     };
   }
 

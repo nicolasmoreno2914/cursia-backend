@@ -12,6 +12,20 @@ import {
 } from './auto-package-state';
 import { isDynamicCourseStructureEnabled } from '../features/dynamic-features';
 import { classifyFailure } from '../reliability/failure-classifier';
+import { autoRecoveryEnabled } from '../dynamic-generation/auto-heal';
+
+/**
+ * Fix round 1 (I1): códigos de bloqueo del empaque CAUSADOS POR EL CONTENIDO de un item que se reparan
+ * regenerándolo, además de la regla `package_component` del clasificador (validadores del componente:
+ * EXAM_BANK_INVALID, QUIZ_V3_*, H5P_ACTIVITY_PAYLOAD_INVALID / H5P_*_INVALID, VIDEO_INTRO_INVALID,
+ * ACTIVITY_INTRO_INVALID, LIBRO_V3_INVALID, ANSWER_LEAK, …): el render del shell y el contraste del texto
+ * generado (course-shell/html.ts SHELL_RENDER, visual-components/lint-output.ts LOW_CONTRAST).
+ */
+export const PACKAGE_REPAIR_CODES: readonly string[] = Object.freeze(['SHELL_RENDER', 'LOW_CONTRAST']);
+/** M2: errores transitorios de la reparación antes de needs_attention. */
+export const PACKAGE_REPAIR_MAX_ERRORS = 3;
+/** I1: un rechazo que habla de dinero nunca dispara una regeneración (paga): needs_attention. */
+const PACKAGE_MONEY_RE = /budget|presupuesto|saldo|ambigu|quota|cuota|reconciliation|credit/i;
 
 export type AutoPackageOutcome =
   | { action: 'enqueued' | 'reused'; runId: string; jobId: string; status: string }
@@ -183,46 +197,80 @@ export class AutoPackageService implements OnModuleInit {
   }
 
   /**
-   * REL MVP — reparación por item de un rechazo del empaque. Devuelve:
-   *  - `repairing`: el rechazo nombra un item del run y el contenido de ESE item es la causa (no transitorio)
-   *    → se regenera solo ese componente (una vez); el run se reabre y el empaque automático vuelve a correr
-   *    cuando se complete;
-   *  - `blocked`: ese item ya se reparó una vez / no es elegible, o el rechazo es un D explícito sin item
-   *    (producto / configuración) → needs_attention con el código (sin reintentos que darían lo mismo);
-   *  - null: transitorio o sin clasificar → el reintento acotado de siempre.
-   * `onlyRepair`: un 4xx del precheck ya se registra como bloqueo con su código, mensaje y faltantes
-   * (camino de siempre): acá solo se agrega la reparación; cualquier otro desenlace devuelve null.
+   * REL MVP — reparación por item de un rechazo del empaque (fix round 1: I1, M2, M3).
+   *  - `repairing`: código de la allow-list de contenido (PACKAGE_REPAIR_CODES: validadores del componente
+   *    —banco/examen, H5P, intro de actividad/video, libro…— y SHELL_RENDER / LOW_CONTRAST) + un item del
+   *    run nombrado en el rechazo, sin texto de dinero → se regenera SOLO ese componente (una vez);
+   *  - `skipped` (repair_retry): la reparación falló por algo transitorio (DB, lock, FinOps caído): se
+   *    reintenta en el próximo barrido, hasta PACKAGE_REPAIR_MAX_ERRORS veces; después, needs_attention;
+   *  - `blocked`: no elegible (ya reparado, tipo pagado, cascada), D explícito (FILES_INTEGRITY y otros bugs
+   *    del builder, configuración, contenido sin item resoluble), presupuesto/saldo/ambiguo → needs_attention
+   *    con el código;
+   *  - null: transitorio de empaque (clase A) o error de build sin clasificar (infra, crash) → el reintento
+   *    acotado de siempre (3 intentos y después needs_attention + retry_package); o kill-switch legacy.
+   *  Nunca se regenera un item por un error que no sea de la allow-list de contenido.
+   * `onlyRepair` (camino del precheck en `ensure`): ese camino ya registra el 4xx como bloqueo y el resto como
+   * transitorio; acá solo se agrega la reparación (cualquier otro desenlace devuelve null).
    */
   private async repairOrBlock(runId: string, text: string, missing: string[], explicitCode: string | null, source: string,
     onlyRepair = false): Promise<AutoPackageOutcome | null> {
-    if (!this.runs) return null;
-    const verdict = classifyFailure({ source: 'package_worker', error: String(text ?? '') });
-    const code = packageBlockCode(text, explicitCode);
-    if (verdict.class === 'A') return null;
-    const rows: Array<{ item_key: string }> = await this.dataSource.query(
-      `select distinct item_key from public.generation_item_runs where job_id = $1`, [runId]);
-    const itemKey = packageBlockItemKey(text, missing, rows.map((r) => r.item_key));
-    if (itemKey) {
-      try {
-        await this.runs.autoRepairItemForPackage(runId, itemKey, code);
-        this.logger.warn(`empaque automático (${source}): run ${runId} — ${code} en ${itemKey}: se regenera solo ese componente y se vuelve a empaquetar al terminar`);
-        return { action: 'repairing', runId, itemKey, code };
-      } catch (err) {
-        const resp = (err as { getResponse?: () => unknown })?.getResponse?.() as any;
-        const why = String((resp && typeof resp === 'object' && (resp.reason || resp.code)) || (err instanceof Error ? err.message : String(err))).slice(0, 200);
-        if (onlyRepair) return null;
-        await this.recordBlock(runId, code, `${code} en ${itemKey}: no se repara solo (${why}). ${String(text ?? '').slice(0, 300)}`, [itemKey, ...missing]);
-        this.logger.warn(`empaque automático (${source}): run ${runId} — ${code} en ${itemKey} no se repara solo (${why}); queda para un admin`);
-        return { action: 'blocked', runId, code };
-      }
-    }
-    // Sin item: un D explícito (producto/configuración) no mejora reintentando → needs_attention con su código.
-    if (!onlyRepair && verdict.class === 'D' && !verdict.unclassified) {
-      await this.recordBlock(runId, code, String(text ?? '').slice(0, 400), missing);
+    if (!this.runs || !autoRecoveryEnabled()) return null;
+    const t = String(text ?? '');
+    const verdict = classifyFailure({ source: 'package_worker', error: t });
+    const code = packageBlockCode(t, explicitCode);
+    const money = PACKAGE_MONEY_RE.test(t) || missing.some((m) => PACKAGE_MONEY_RE.test(String(m)));
+    const block = async (message: string, extra: string[] = []): Promise<AutoPackageOutcome | null> => {
+      if (onlyRepair) return null;
+      await this.recordBlock(runId, code, message, [...extra, ...missing]);
       this.logger.warn(`empaque automático (${source}): run ${runId} bloqueado (${code}); queda para un admin`);
       return { action: 'blocked', runId, code };
+    };
+    if (money) return block(t.slice(0, 400));
+    const repairable = !verdict.unclassified && (verdict.rule === 'package_component' || PACKAGE_REPAIR_CODES.includes(verdict.code));
+    const rows: Array<{ item_key: string }> = repairable
+      ? await this.dataSource.query(`select distinct item_key from public.generation_item_runs where job_id = $1`, [runId])
+      : [];
+    const itemKey = repairable ? packageBlockItemKey(t, missing, rows.map((r) => r.item_key)) : null;
+    if (!itemKey) {
+      // Transitorio de empaque o error de build SIN clasificar (DB caída, crash del worker): el reintento acotado
+      // de siempre (3 intentos, después needs_attention + retry_package). Un D explícito (FILES_INTEGRITY y otros
+      // bugs del builder, configuración, o un código de contenido sin item resoluble): needs_attention ya.
+      if (verdict.class === 'A' || verdict.unclassified) return null;
+      return block(t.slice(0, 400));
     }
-    return null;
+    try {
+      await this.runs.autoRepairItemForPackage(runId, itemKey, code);
+      this.logger.warn(`empaque automático (${source}): run ${runId} — ${code} en ${itemKey}: se regenera solo ese componente y se vuelve a empaquetar al terminar`);
+      return { action: 'repairing', runId, itemKey, code };
+    } catch (err) {
+      const resp = (err as { getResponse?: () => unknown })?.getResponse?.() as any;
+      const why = String((resp && typeof resp === 'object' && (resp.reason || resp.code)) || (err instanceof Error ? err.message : String(err))).slice(0, 200);
+      const notEligible = !!(resp && typeof resp === 'object' && resp.code === 'auto_repair_not_eligible');
+      if (!notEligible) {
+        // M2: transitorio de la reparación → se reintenta en el próximo barrido (acotado), nunca un bloqueo directo.
+        const n = await this.recordRepairError(runId, why);
+        if (n < PACKAGE_REPAIR_MAX_ERRORS) {
+          this.logger.warn(`empaque automático (${source}): run ${runId} — la reparación de ${itemKey} falló (${why}); se reintenta (${n}/${PACKAGE_REPAIR_MAX_ERRORS})`);
+          return { action: 'skipped', runId, reason: 'repair_retry' };
+        }
+      }
+      this.logger.warn(`empaque automático (${source}): run ${runId} — ${code} en ${itemKey} no se repara solo (${why})`);
+      return block(`${code} en ${itemKey}: no se repara solo (${why}). ${t.slice(0, 300)}`, [itemKey]);
+    }
+  }
+
+  /** M2: un error más de la reparación automática (contador en la marca del run; se reinicia en cada completitud). */
+  private async recordRepairError(runId: string, why: string): Promise<number> {
+    const rows = await this.dataSource.query(
+      `update public.production_jobs
+          set output_summary = jsonb_set(output_summary, '{autoPackage,repairErrors}',
+                jsonb_build_object('count', coalesce((output_summary->'autoPackage'->'repairErrors'->>'count')::int, 0) + 1, 'at', now(), 'last', $2::text), true)
+        where id = $1 and jsonb_typeof(output_summary->'autoPackage') = 'object'
+        returning (output_summary->'autoPackage'->'repairErrors'->>'count')::int as n`,
+      [runId, why.slice(0, 200)],
+    );
+    const r = Array.isArray(rows) ? (Array.isArray(rows[0]) ? rows[0][0] : rows[0]) : null;
+    return Number(r?.n ?? PACKAGE_REPAIR_MAX_ERRORS);
   }
 
   /** Bloqueo del empaque automático (needs_attention con el código). Mismo registro que el 4xx del precheck. */

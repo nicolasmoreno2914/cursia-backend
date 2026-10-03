@@ -158,6 +158,22 @@ async function pureChecks() {
     eq(AH.autoHealDecision(row(B_ERR, { cls: 'A', type: 'activity' }), NOW, P).kind, 'B', 'registrada A nunca baja B');
   });
 
+  await check('puro fix M1: un A con riesgo de pago INCIERTO solo se reabre si su re-claim pasa por el ledger (lease_expired / worker_draining)', () => {
+    eq([...AH.AUTO_HEAL_LEDGER_GUARDED_CODES], ['lease_expired', 'worker_draining'], 'allow-list');
+    const FC = loadDist('modules/reliability/failure-classifier.js');
+    const samples = ['lease_expired', 'worker_draining: x', 'unexpected_error: x', 'gamma_timeout: x', 'video_timeout', 'tts_failed: chunk 1/3: HTTP 503',
+      'audiobook_script_failed: x', 'youtube_upload_failed: x', 'content_download_failed: x'];
+    for (const type of ['video', 'presentation', 'audiobook_chapter', 'audio_welcome', 'content']) {
+      for (const err of samples) {
+        const os = { external: { gammaGenerationId: 'g', videogenJobId: 'v' } };
+        const d = AH.autoHealDecision(row(err, { type, os }), NOW, P);
+        const v = FC.classifyFailure({ error: err, itemType: type, outputSummary: os, source: type === 'video' ? 'video_worker' : ['presentation', 'audiobook_chapter', 'audio_welcome'].includes(type) ? 'provider_worker' : 'browser_executor' });
+        if (d.heal && v.paidRisk === 'uncertain') assert(AH.AUTO_HEAL_LEDGER_GUARDED_CODES.includes(v.code), `${type}: ${err} (incierto) se reabriría`);
+      }
+    }
+    eq(AH.autoHealDecision(row('lease_expired', { type: 'video' }), NOW, P).heal, true, 'lease_expired en video: sí (ledger al re-reclamar)');
+  });
+
   await check('puro empaque: packageBlockItemKey encuentra el item nombrado (mensaje o missing), nunca un prefijo de otra clave', () => {
     const keys = ['exam:m1', 'exam:m10', 'activity:c1', 'content:c1', 'final_exam'];
     eq(APS.packageBlockItemKey('EXAM_BANK_INVALID: exam:m10 [EXAM_BANK_COVERAGE] x', [], keys), 'exam:m10', 'exam:m10');
@@ -426,6 +442,23 @@ async function dbChecks() {
       eq((await itemRow(C.runId, pres.item_key)).status, 'failed', 'failed');
     });
 
+    await check('DB fix I2 (sonda del revisor): fallo A del navegador subido a D por el errorCode del ejecutor (llm_credit_exhausted) → el barrido no lo toma Y la vista muestra la acción humana al instante (nunca «auto-heal»)', async () => {
+      const I = await makeCourse('REL MVP I2');
+      const it = await itemRow(I.runId, `content:${I.c1}`);
+      await setRow(it.id, `status = 'running', worker_id = 'exec-I2', attempt_count = 3, max_attempts = 3, lease_until = now() + interval '5 minutes'`);
+      await sched.failItem(it.id, 'exec-I2', '❌ Falló después de 3 intentos: 502 Bad Gateway', false, OWNER, { errorCode: 'llm_credit_exhausted' });
+      await setRow(it.id, `finished_at = now() - interval '10 minutes'`);
+      const row = await itemRow(I.runId, it.item_key);
+      eq([row.status, row.failure_class], ['failed', 'D'], 'D registrada por el errorCode');
+      const r = await heal(0);
+      eq(r.reopened.filter((x) => x.runId === I.runId).length, 0, 'no se reabre');
+      const run = await runs.getRun(I.cid, OWNER, 1, I.runId);
+      const acts = (run.completion.adminActions || []).filter((a) => a.itemKey === it.item_key).map((a) => a.code);
+      assert(acts.length === 1 && acts[0] !== null, 'acción humana visible: ' + JSON.stringify(run.completion.adminActions));
+      const view = run.items.find((x) => x.itemKey === it.item_key).recovery;
+      eq([view.class, view.currentRecovery], ['D', 'manual'], 'la vista nunca dice auto-heal');
+    });
+
     // ═══ los demás siguen ═════════════════════════════════════════════════════
     await check('DB: un item esperando su espera no frena a los demás — el run sigue activo y el ejecutor reclama otra parte', async () => {
       const D = await makeCourse('REL MVP independientes');
@@ -449,6 +482,9 @@ async function dbChecks() {
       const r2 = await heal(60);
       eq(r2.reopened.filter((x) => x.runId === D.runId).map((x) => x.itemKey), [failedKey], 'reabierto después');
       eq((await itemRow(D.runId, okKey)).status, 'running', 'la otra sigue en curso');
+      // Fix round 1 (I3): el run expone la actividad del navegador (otro equipo no arranca un segundo ejecutor).
+      const dto = await runs.getRun(D.cid, OWNER, 1, D.runId);
+      assert(dto.lastBrowserActivityAt && Date.now() - Date.parse(dto.lastBrowserActivityAt) < 60000, 'lastBrowserActivityAt reciente: ' + dto.lastBrowserActivityAt);
     });
 
     await check('DB: run cancelado → nunca se reabre nada', async () => {
@@ -522,9 +558,72 @@ async function dbChecks() {
       eq(out.action, 'enqueued', 'reintento');
       eq(pkgCalls.length, n0 + 1, 'requestPackage');
       eq(pkgCalls[pkgCalls.length - 1].opts, { auto: true }, 'automático');
-      const G2 = await completedRun('REL MVP build');
-      await failedPkgJob(G2, 'TypeError: Cannot read properties of undefined (reading x)');
-      eq((await autoPkg.ensure(G2.runId, 'sweep')).action, 'enqueued', 'error de build sin clasificar → reintento acotado');
+    });
+
+    // ═══ fix round 1 — I1: solo la allow-list de contenido + item; todo lo demás needs_attention ═══
+    await check('DB fix I1: rechazos que NOMBRAN un item pero no son de su contenido → NINGÚN item reabierto: FILES_INTEGRITY / presupuesto → needs_attention con el código; DB caída / crash sin clasificar → el reintento acotado de siempre', async () => {
+      const cases = [
+        ['connect ECONNREFUSED 127.0.0.1:5432 while loading artifacts of %EXAM%', null],
+        ['TypeError: Cannot read properties of undefined (reading x) at buildQuiz %EXAM%', null],
+        ['FILES_INTEGRITY: sha mismatch for %EXAM%', 'FILES_INTEGRITY'],
+        ['EXAM_BANK_INVALID: %EXAM% [X] presupuesto agotado durante la validación', 'EXAM_BANK_INVALID'],
+      ];
+      for (const [tpl, code] of cases) {
+        const G = await completedRun('REL MVP I1 ' + code);
+        const ek = examKeyOf(G);
+        await failedPkgJob(G, tpl.replace('%EXAM%', ek));
+        const n0 = pkgCalls.length;
+        const out = await autoPkg.ensure(G.runId, 'sweep');
+        if (code) {
+          eq([out.action, out.code], ['blocked', code], tpl);
+          eq(pkgCalls.length, n0, `${code}: sin re-empaquetar a ciegas`);
+        } else {
+          // Sin clasificar (DB caída / crash del builder): el reintento acotado de siempre (3 intentos → needs_attention).
+          eq(out.action, 'enqueued', tpl);
+          eq(pkgCalls.length, n0 + 1, 'reintento acotado');
+        }
+        eq((await ds.query(`select count(*)::int n from public.generation_item_runs where job_id = $1 and generation > 1`, [G.runId]))[0].n, 0, `${code}: ningún item regenerado`);
+        eq((await runRow(G.runId)).worker_status, 'completed', `${code}: run no reabierto`);
+        if (code) eq((await runs.getRun(G.cid, OWNER, 1, G.runId)).completion.state, 'needs_attention', `${code}: needs_attention`);
+      }
+    });
+
+    await check('DB fix M2: la reparación falla por algo transitorio → se reintenta en el próximo barrido (2 veces), a la 3.ª needs_attention; nunca un bloqueo directo', async () => {
+      const G = await completedRun('REL MVP M2');
+      const ek = examKeyOf(G);
+      await failedPkgJob(G, `EXAM_BANK_INVALID: ${ek} [EXAM_BANK_COVERAGE] x`);
+      const orig = runs.autoRepairItemForPackage.bind(runs);
+      let calls = 0;
+      runs.autoRepairItemForPackage = async (...a) => { if (a[0] === G.runId) { calls++; throw new Error('canceling statement due to lock timeout'); } return orig(...a); };
+      try {
+        eq((await autoPkg.ensure(G.runId, 'sweep')).reason, 'repair_retry', 'intento 1');
+        eq((await runRow(G.runId)).output_summary.autoPackage.blocked, undefined, 'sin bloqueo');
+        eq((await autoPkg.ensure(G.runId, 'sweep')).reason, 'repair_retry', 'intento 2');
+        const out = await autoPkg.ensure(G.runId, 'sweep');
+        eq([out.action, out.code, calls], ['blocked', 'EXAM_BANK_INVALID', 3], 'tope → needs_attention');
+      } finally {
+        runs.autoRepairItemForPackage = orig;
+      }
+    });
+
+    await check('DB fix M3: kill-switch legacy → sin reparación del empaque (reintento de siempre), RunDto.autoRecovery=false y el barrido R16 vuelve a ver filas marcadas «no elegible»', async () => {
+      process.env.DYNAMIC_AUTO_HEAL_POLICY = 'legacy';
+      try {
+        const G = await completedRun('REL MVP legacy');
+        await failedPkgJob(G, `EXAM_BANK_INVALID: ${examKeyOf(G)} [X] y`);
+        eq((await autoPkg.ensure(G.runId, 'sweep')).action, 'enqueued', 'legacy: reintento, sin reparación');
+        eq((await ds.query(`select count(*)::int n from public.generation_item_runs where job_id = $1 and generation > 1`, [G.runId]))[0].n, 0, 'sin regeneración');
+        eq((await runs.getRun(G.cid, OWNER, 1, G.runId)).autoRecovery, false, 'el frontend no arranca solo');
+        const H = await makeCourse('REL MVP legacy sweep');
+        const it = await itemRow(H.runId, `content:${H.c1}`);
+        await failAt(it.id, 'lease_expired', 600, `jsonb_build_object('autoHeal', jsonb_build_object('ineligibleMd5', md5('lease_expired')))`);
+        const r = await runs.autoHealFailedItems({ now: new Date(), policy: AH.LEGACY_AUTO_HEAL_POLICY });
+        eq(r.reopened.filter((x) => x.runId === H.runId).map((x) => x.itemKey), [it.item_key], 'la marca de la política por clase no tapa a R16');
+      } finally {
+        delete process.env.DYNAMIC_AUTO_HEAL_POLICY;
+      }
+      const G2 = await completedRun('REL MVP autoRecovery on');
+      eq((await runs.getRun(G2.cid, OWNER, 1, G2.runId)).autoRecovery, true, 'por defecto true');
     });
 
     await check('DB empaque: D sin item (SHELL_RENDER) → needs_attention con el código, sin reintentos', async () => {

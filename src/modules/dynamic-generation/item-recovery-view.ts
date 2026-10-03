@@ -60,7 +60,7 @@ export function recoveryViewOf(r: Record<string, any>): ItemRecoveryView {
       nextRetryAt,
       cooldownUntil,
       attentionReason: r.attention_reason ?? null,
-      currentRecovery: r.error ? currentRecoveryOf(String(r.error), r.type, r.output_summary ?? {}) : null,
+      currentRecovery: r.error ? currentRecoveryOf(String(r.error), r.type, r.output_summary ?? {}, r.failure_class) : null,
       source: 'recorded',
     };
   }

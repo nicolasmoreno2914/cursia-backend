@@ -226,6 +226,8 @@ export interface CompletionRow {
   carry_chain?: string[] | null;
   /** Fix round 3 (N1): `finished_at` de la fila ORIGINAL de la cadena de arrastre (la que produjo la salida). */
   carry_origin_finished_at?: Date | string | null;
+  /** Fix round 1 (I2): clase registrada al fallar (R2); C/D → acción humana, nunca «lo toma el auto-healer». */
+  failure_class?: string | null;
 }
 
 export interface CompletionManifest {
@@ -514,7 +516,7 @@ export function adminActionFor(r: CompletionRow | undefined, cls: ItemCompletion
   // El auto-healer todavía lo va a reabrir (allow-list, dentro de su ventana): sin acción humana.
   // REL MVP: id (semilla del jitter) y clase registrada → misma decisión que el barrido y el lock.
   const ahRow = { id: r.id, status: r.status, type: r.type, error: r.error ?? null, output_summary: s, finished_at: r.finished_at ?? null, updated_at: r.updated_at ?? null,
-    failure_class: (r as { failure_class?: string | null }).failure_class ?? null };
+    failure_class: r.failure_class ?? null };
   // Fix round 1 (M5): solo si el tick del auto-healer corre (si está apagado nadie lo va a reabrir).
   const tickOn = autoHealEnabled(process.env);
   const d = autoHealDecision(ahRow, now, autoHealPolicyFromEnv(process.env));
@@ -741,7 +743,9 @@ export async function loadCompletionInputs(q: Q, jobId: string): Promise<{
   const mj = typeof m.manifest_json === 'string' ? JSON.parse(m.manifest_json) : m.manifest_json;
   const rows: CompletionRow[] = await q.query(
     `select g.id, g.item_key, g.type, g.status, g.error, g.output_summary, g.finished_at, g.updated_at, g.chapter_id,
-            g.carried_from_item_run_id
+            g.carried_from_item_run_id,
+            -- Fix round 1 (I2): clase registrada (R2) sin depender de que la columna exista.
+            to_jsonb(g)->>'failure_class' as failure_class
        from public.generation_item_runs g
       where g.job_id = $1
         and not exists (select 1 from public.generation_item_runs n

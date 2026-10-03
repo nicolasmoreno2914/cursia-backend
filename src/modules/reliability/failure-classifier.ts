@@ -616,7 +616,13 @@ export function extractFailureCode(error: string): string {
 // ─── Comportamiento ACTUAL (auto-heal.ts, sin cambios) ──────────────────────
 
 /** Qué haría HOY el sistema con este fallo (auto-healer R16 / reintento seguro BE-B). Informativo. */
-export function currentRecoveryOf(error: string, itemType: string | null | undefined, outputSummary: Record<string, any> | null | undefined): CurrentRecovery {
+export function currentRecoveryOf(
+  error: string,
+  itemType: string | null | undefined,
+  outputSummary: Record<string, any> | null | undefined,
+  /** Fix round 1 (I2): clase REGISTRADA al fallar (incluye la subida por errorCode); C/D nunca es auto-heal. */
+  failureClass?: string | null,
+): CurrentRecovery {
   const e = String(error ?? '').trim();
   const os = outputSummary ?? {};
   // #583: va ANTES de la deny-list (la deny-list describe justamente este caso incierto; la función de
@@ -628,7 +634,7 @@ export function currentRecoveryOf(error: string, itemType: string | null | undef
   if (denied) return 'denied';
   // REL MVP: la MISMA decisión del auto-healer con la política vigente (por clase, o R16 con el kill-switch);
   // sin fecha de fallo (sin espera) y con las rondas ya usadas del item.
-  const d = autoHealDecision({ status: 'failed', type: itemType ?? null, error: e, output_summary: os }, new Date(), autoHealPolicyFromEnv(process.env));
+  const d = autoHealDecision({ status: 'failed', type: itemType ?? null, error: e, output_summary: os, failure_class: failureClass ?? null }, new Date(), autoHealPolicyFromEnv(process.env));
   if (d.heal) return d.kind === 'B' ? 'auto_regenerate' : 'auto_heal';
   return 'manual';
 }

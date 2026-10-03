@@ -142,7 +142,7 @@ export async function applyItemFailure(
     ?? (meta?.source === 'browser_executor' ? 'failed' : outcomeForFailure(extractFailureCode(error)));
   await recordItemFailure(qr, {
     itemRunId: row.id, status: row.status, error, verdict, outcome,
-    maxRoundsToday: maxAutomaticRoundsToday(error, row.type, row.output_summary ?? {}),
+    maxRoundsToday: maxAutomaticRoundsToday(error, row.type, row.output_summary ?? {}, verdict.class),
   });
   const blocked = row.status === 'failed' ? await blockDependents(qr, row.job_id, row.item_key) : [];
   return { id: row.id, status: row.status, blocked };
@@ -152,8 +152,8 @@ export async function applyItemFailure(
  * REL R2: rondas automáticas que el sistema hace HOY con este fallo una vez `failed` (auto-healer R16 o
  * reintento seguro BE-B, mismas reglas y topes que auto-heal.ts); 0 = solo humano. Informativo.
  */
-export function maxAutomaticRoundsToday(error: string, type: string | null | undefined, outputSummary: Record<string, any>): number {
-  const cur = currentRecoveryOf(error, type, outputSummary);
+export function maxAutomaticRoundsToday(error: string, type: string | null | undefined, outputSummary: Record<string, any>, failureClass?: string | null): number {
+  const cur = currentRecoveryOf(error, type, outputSummary, failureClass);
   if (cur === 'safe_auto_retry') return SAFE_AUTO_RETRY_MAX_ROUNDS;
   if (cur === 'ambiguous_audio_resubmit') return AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS;
   if (cur === 'auto_regenerate') return Math.max(0, Math.floor(autoHealPolicyFromEnv(process.env).regenMaxRounds ?? 0));

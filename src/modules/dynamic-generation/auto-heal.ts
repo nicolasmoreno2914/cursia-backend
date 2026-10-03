@@ -207,6 +207,13 @@ export function autoHealWaitSeconds(waits: readonly number[], rounds: number, ra
 }
 
 const SEVERITY: Readonly<Record<string, number>> = Object.freeze({ A: 0, B: 1, C: 2, D: 3 });
+/**
+ * Fix round 1 (M1): códigos A con `paidRisk: uncertain` que SÍ se reabren solos porque el re-claim de todo
+ * worker pagado verifica el ledger antes de llamar (dynamic-item-worker.ts: marcador externalSubmitStartedAt
+ * → ambiguous_video_submission + priorPaidOperations; real-providers.ts priorPaidBlock: priorPaidOperations
+ * → provider_reconciliation_required). Cualquier otro A incierto queda para un humano.
+ */
+export const AUTO_HEAL_LEDGER_GUARDED_CODES: readonly string[] = Object.freeze(['lease_expired', 'worker_draining']);
 /** Estrategias B que la reapertura resuelve (regenerar el MISMO item); regenerate_dependency necesita otro item. */
 const AUTO_REGEN_STRATEGIES: readonly string[] = Object.freeze(['regenerate_targeted', 'regenerate_split']);
 
@@ -240,6 +247,9 @@ function classAwareDecision(row: AutoHealRow, now: Date, policy: AutoHealPolicy)
     // Precondición R16 (re-poll gratis solo con el id del proveedor persistido; nunca un envío nuevo).
     const legacy = matchAutoHealRule(error);
     if (legacy?.requires && !legacy.requires(os)) return { heal: false, reason: 'missing_precondition', rule: legacy };
+    // Fix round 1 (M1): un A con riesgo de pago INCIERTO solo se reabre si su re-claim pasa por el chequeo del
+    // ledger del worker (priorPaidOperations / marcador de envío → reconciliación, nunca un pago ciego).
+    if (v.paidRisk === 'uncertain' && !AUTO_HEAL_LEDGER_GUARDED_CODES.includes(v.code)) return { heal: false, reason: 'not_allow_listed' };
     const rule: AutoHealRule = legacy ?? { code: v.code, match: /^/, why: `clase A (${v.rule})` };
     const rounds = autoHealRoundsOf(os);
     if (rounds >= autoHealMaxRoundsFor(row.type, policy)) return { heal: false, reason: 'cap_reached', rule };
@@ -443,6 +453,15 @@ export function autoHealPolicyFromEnv(env: Record<string, string | undefined> = 
   // REL MVP: kill-switch de la política por clase → R16 tal cual.
   const base = String(env[AUTO_HEAL_POLICY_ENV] ?? '').trim().toLowerCase() === 'legacy' ? LEGACY_AUTO_HEAL_POLICY : DEFAULT_AUTO_HEAL_POLICY;
   return { ...base, maxAgeHours };
+}
+
+/**
+ * Fix round 1 (M3): recuperación automática REL MVP activa (tick encendido + política por clase). El kill-switch
+ * `DYNAMIC_AUTO_HEAL_POLICY=legacy` (o el tick apagado) apaga también la reparación del empaque y el arranque
+ * automático del ejecutor al abrir el curso (RunDto.autoRecovery).
+ */
+export function autoRecoveryEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  return autoHealEnabled(env) && !!autoHealPolicyFromEnv(env).classAware;
 }
 
 export function autoHealIntervalMs(env: Record<string, string | undefined> = process.env): number {
