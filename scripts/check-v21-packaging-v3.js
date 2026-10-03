@@ -639,6 +639,23 @@ const MATRIX = [
     const v = await V.validateMbzV3(bad, base.r.expectations);
     assert(v.issues.some((i) => i.code === 'NAVIGATION' && /llevan a la misma sección/.test(i.message) && /cv3:shell:start/.test(i.where) && /cv3:shell:route_start/.test(i.where)), JSON.stringify(v.issues.slice(0, 5)));
   });
+  // UX r18 fix 1 (M3): con SCORM el botón «Iniciar actividad» se conserva y su marcador queda resuelto al SCORM
+  // siguiente; devolverlo a `cursia-cta://next-activity` → TOKEN_INVALID (el paquete H5P ya no tiene ese botón).
+  await check('[scorm-nofinal-dark] «Iniciar actividad» conservado y resuelto al SCORM; marcador next-activity sin resolver → TOKEN_INVALID', async () => {
+    const sb = built['scorm-nofinal-dark'];
+    const { z: sz, acts: sacts } = await actDirs(sb.r.mbz);
+    const instr = sacts.filter((a) => /:activity_instruction$/.test(a.idnumber));
+    assert(instr.length > 0, 'hay prácticas SCORM');
+    for (const a of instr) {
+      const next = sacts[sacts.indexOf(a) + 1];
+      const x = await sz.file(`${a.dir}/label.xml`).async('string');
+      const mid = /_(\d+)$/.exec(next.dir)[1];
+      assert(next.modname === 'scorm' && x.includes(`$@SCORMVIEWBYID*${mid}@$`) && x.includes('Iniciar actividad →') && !x.includes('cursia-cta://'), `${a.idnumber}: botón al SCORM ${next.idnumber}`);
+    }
+    const bad = await mutate(sb.r.mbz, { [`${instr[0].dir}/label.xml`]: (x) => x.replace(/\$@SCORMVIEWBYID\*\d+@\$/, () => 'cursia-cta://next-activity') });
+    const v = await V.validateMbzV3(bad, sb.r.expectations);
+    assert(!v.ok && v.issues.some((i) => i.code === 'TOKEN_INVALID' && i.where === instr[0].idnumber), JSON.stringify(v.issues.slice(0, 4)));
+  });
   const forumAct = find(/^cv3:shell:forum$/);
   const forumCtx = /contextid="(\d+)"/.exec(await bz.file(`${forumAct.dir}/forum.xml`).async('string'))[1];
   for (const [code, mk] of cases) {

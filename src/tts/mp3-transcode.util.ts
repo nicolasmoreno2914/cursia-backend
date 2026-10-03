@@ -1,8 +1,5 @@
 import { Logger } from '@nestjs/common';
 import { spawn } from 'child_process';
-import { mkdtemp, readFile, rm } from 'fs/promises';
-import { tmpdir } from 'os';
-import { join } from 'path';
 
 const logger = new Logger('Mp3Transcode');
 
@@ -21,11 +18,6 @@ const logger = new Logger('Mp3Transcode');
  * Si ffmpeg no está instalado en el servidor, o la recodificación falla por cualquier razón,
  * se devuelve el buffer ORIGINAL sin tocar — nunca bloquea la generación de audio por esto.
  * Requiere `ffmpeg` instalado en el sistema (apt install -y ffmpeg en la VPS).
- *
- * UX r18 (problema 2): la salida va a un ARCHIVO temporal (seekable) con `-write_xing 1`, no a
- * `pipe:1`: el muxer mp3 de ffmpeg solo escribe el frame Info/Xing (conteo real de frames → duración
- * exacta en el reproductor) cuando puede volver atrás a parchearlo. El directorio temporal se borra
- * siempre. `FFMPEG_BIN` permite apuntar a otro binario (pruebas). Sin ffmpeg: igual que antes.
  */
 export async function transcodeMp3Bitrate(
   inputBuffer: Buffer,
@@ -45,29 +37,21 @@ export async function transcodeMp3Bitrate(
   }
 }
 
-export const FFMPEG_BIN_ENV = 'FFMPEG_BIN';
-
-function ffmpegBin(): string {
-  return (process.env[FFMPEG_BIN_ENV] ?? '').trim() || 'ffmpeg';
-}
-
-async function runFfmpeg(inputBuffer: Buffer, bitrateKbps: number): Promise<Buffer> {
-  const dir = await mkdtemp(join(tmpdir(), 'cursia-mp3-transcode-'));
-  try {
-    const outPath = join(dir, 'out.mp3');
-    await spawnFfmpeg(inputBuffer, ['-i', 'pipe:0', '-ac', '1', '-b:a', `${bitrateKbps}k`, '-write_xing', '1', '-f', 'mp3', '-y', outPath]);
-    return await readFile(outPath);
-  } finally {
-    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
-  }
-}
-
-function spawnFfmpeg(inputBuffer: Buffer, args: string[]): Promise<void> {
+function runFfmpeg(inputBuffer: Buffer, bitrateKbps: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const proc = spawn(ffmpegBin(), args, { stdio: ['pipe', 'ignore', 'pipe'] });
+    const args = [
+      '-i', 'pipe:0',
+      '-ac', '1',
+      '-b:a', `${bitrateKbps}k`,
+      '-f', 'mp3',
+      'pipe:1',
+    ];
+    const proc = spawn('ffmpeg', args, { stdio: ['pipe', 'pipe', 'pipe'] });
 
+    const outChunks: Buffer[] = [];
     const errChunks: Buffer[] = [];
 
+    proc.stdout.on('data', (chunk: Buffer) => outChunks.push(chunk));
     proc.stderr.on('data', (chunk: Buffer) => errChunks.push(chunk));
 
     proc.on('error', (err) => {
@@ -77,7 +61,7 @@ function spawnFfmpeg(inputBuffer: Buffer, args: string[]): Promise<void> {
 
     proc.on('close', (code) => {
       if (code === 0) {
-        resolve();
+        resolve(Buffer.concat(outChunks));
       } else {
         const stderrText = Buffer.concat(errChunks).toString('utf-8').slice(-500);
         reject(new Error(`ffmpeg exit code ${code}: ${stderrText}`));

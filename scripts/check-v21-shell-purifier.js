@@ -253,7 +253,7 @@ check('CLEAN_SAFE: el purificador no descarta ninguna declaración inline', () =
     });
 });
 
-check('<audio> y enlaces (Libro Guía, descarga MP3) sobreviven con su URL', () => {
+check('<audio> (src, preload="metadata", title) y enlaces (Libro Guía, descarga MP3) sobreviven con su URL', () => {
   let audios = 0;
   let libro = 0;
   cases.forEach((c, i) => {
@@ -261,6 +261,12 @@ check('<audio> y enlaces (Libro Guía, descarga MP3) sobreviven con su URL', () 
     const srcAfter = attrValues(purified[i], 'audio', 'src');
     assert(JSON.stringify(srcBefore) === JSON.stringify(srcAfter), `${c.name}: audio src ${JSON.stringify(srcBefore)} → ${JSON.stringify(srcAfter)}`);
     audios += srcAfter.length;
+    // UX r18 (+ fix 1, M6): preload="metadata" y el nombre accesible (title = título visible) sobreviven a forceclean.
+    for (const at of ['preload', 'title']) {
+      const before = attrValues(c.html, 'audio', at);
+      const after = attrValues(purified[i], 'audio', at);
+      assert(before.length === srcBefore.length && JSON.stringify(before) === JSON.stringify(after), `${c.name}: audio ${at} ${JSON.stringify(before)} → ${JSON.stringify(after)}`);
+    }
     const hrefBefore = attrValues(c.html, 'a', 'href');
     const hrefAfter = attrValues(purified[i], 'a', 'href').map((h) => h.replace(/&amp;/g, '&'));
     assert(JSON.stringify(hrefBefore) === JSON.stringify(hrefAfter), `${c.name}: href ${JSON.stringify(hrefBefore)} → ${JSON.stringify(hrefAfter)}`);

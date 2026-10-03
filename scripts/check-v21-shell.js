@@ -581,7 +581,7 @@ async function pureChecks() {
     const labels = shellLabels(f2, c2, THEME);
     const byName = Object.fromEntries(labels.map((l) => [l.name, l]));
     const aw = byName['Audio de bienvenida'].html;
-    assert(aw.includes('<audio controls preload="metadata" src="@@PLUGINFILE@@/audio_bienvenida.mp3"'), 'audio de bienvenida (UX r18: preload="metadata")');
+    assert(aw.includes('<audio controls preload="metadata" title="Audio de bienvenida" src="@@PLUGINFILE@@/audio_bienvenida.mp3"'), 'audio de bienvenida (UX r18: preload="metadata" + title = título visible; CLEAN_SAFE sin aria)');
     assert(vc.extractText(aw).includes('Duración: 0 min 58 s.'), 'duración medida (formatDurationEs)');
     const ab = vc.extractText(byName['Audiolibro'].html);
     assert(ab.includes('Duración total: 15 min 48 s.') && ab.toLowerCase().includes('empieza en 3 min 01 s · dura 3 min 38 s'), `índice del audiolibro: ${ab}`);

@@ -95,6 +95,23 @@ export interface MbzV3ValidationExpectations {
    * se admiten SOLO en ese label; todo lo demás (plantilla) es estricto. Sin ella, todo el label es estricto.
    */
   shellProseByLabel?: Record<string, string[]>;
+  /**
+   * UX r18 fix 1 (M4): versión del builder que armó el paquete (`expectations.builderVersion`). Las reglas de UX r18
+   * (orden de la sección 0, botón «Iniciar actividad» solo hacia una actividad no embebida) aplican desde 3.12.0;
+   * sin versión (expectativas guardadas de paquetes anteriores) o con una menor, no se evalúan: un paquete 3.11.0
+   * válido no se reporta como fallido.
+   */
+  builderVersion?: string;
+}
+
+/** true si `v` (x.y.z) ≥ `min`. Una versión ausente o mal formada → false. */
+export function builderVersionAtLeast(v: string | undefined, min: string): boolean {
+  const parse = (x: string | undefined): number[] | null => (typeof x === 'string' && /^\d+\.\d+\.\d+$/.test(x) ? x.split('.').map(Number) : null);
+  const a = parse(v);
+  const b = parse(min) as number[];
+  if (!a) return false;
+  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] > b[i];
+  return true;
 }
 
 export interface MbzV3ValidationResult {
@@ -826,20 +843,23 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
 
   // UX r18 (problemas 1 y 4): orden de la sección 0 (hero con tema justo bajo el encabezado de Moodle,
   // foro de avisos al final) y botón «Iniciar actividad» solo hacia una actividad que NO se embebe.
-  const sec0 = acts.filter((a) => a.sectionid === 0).map((a) => a.idnumber);
-  if (sec0.length && sec0[0] !== 'cv3:shell:welcome') add('SECTIONS', 'sections/section_0', `la sección 0 abre con ${sec0[0]} (debe abrir con cv3:shell:welcome)`);
-  if (sec0.length && sec0[sec0.length - 1] !== 'cv3:shell:forum') add('SECTIONS', 'sections/section_0', `la sección 0 cierra con ${sec0[sec0.length - 1]} (debe cerrar con cv3:shell:forum)`);
-  for (let i = 0; i < acts.length; i++) {
-    const a = acts[i];
-    if (!/^cv3:ch:[^:]+:activity_instruction$/.test(a.idnumber)) continue;
-    const next = acts[i + 1];
-    if (!next || next.sectionid !== a.sectionid || next.idnumber !== a.idnumber.replace(/:activity_instruction$/, ':activity')) {
-      add('STRUCTURE', a.idnumber, 'la instrucción de la práctica no va seguida de su actividad');
-      continue;
+  // Fix 1 (M4): solo para paquetes del builder ≥ 3.12.0 (los anteriores tenían otro orden y el botón siempre).
+  if (builderVersionAtLeast(exp.builderVersion, '3.12.0')) {
+    const sec0 = acts.filter((a) => a.sectionid === 0).map((a) => a.idnumber);
+    if (sec0.length && sec0[0] !== 'cv3:shell:welcome') add('SECTIONS', 'sections/section_0', `la sección 0 abre con ${sec0[0]} (debe abrir con cv3:shell:welcome)`);
+    if (sec0.length && sec0[sec0.length - 1] !== 'cv3:shell:forum') add('SECTIONS', 'sections/section_0', `la sección 0 cierra con ${sec0[sec0.length - 1]} (debe cerrar con cv3:shell:forum)`);
+    for (let i = 0; i < acts.length; i++) {
+      const a = acts[i];
+      if (!/^cv3:ch:[^:]+:activity_instruction$/.test(a.idnumber)) continue;
+      const next = acts[i + 1];
+      if (!next || next.sectionid !== a.sectionid || next.idnumber !== a.idnumber.replace(/:activity_instruction$/, ':activity')) {
+        add('STRUCTURE', a.idnumber, 'la instrucción de la práctica no va seguida de su actividad');
+        continue;
+      }
+      const tok = `VIEWBYID*${next.mid}@$`;
+      if (next.modname === 'h5pactivity' && `${a.intro}`.includes(tok)) add('NAVIGATION', a.idnumber, `botón «Iniciar actividad» hacia ${next.idnumber}, que ya está embebida debajo`);
+      if (next.modname === 'scorm' && !`${a.intro}`.includes(`$@SCORM${tok}`)) add('NAVIGATION', a.idnumber, `sin botón «Iniciar actividad» hacia el SCORM ${next.idnumber}`);
     }
-    const tok = `VIEWBYID*${next.mid}@$`;
-    if (next.modname === 'h5pactivity' && `${a.intro}`.includes(tok)) add('NAVIGATION', a.idnumber, `botón «Iniciar actividad» hacia ${next.idnumber}, que ya está embebida debajo`);
-    if (next.modname === 'scorm' && !`${a.intro}`.includes(`$@SCORM${tok}`)) add('NAVIGATION', a.idnumber, `sin botón «Iniciar actividad» hacia el SCORM ${next.idnumber}`);
   }
 
   // ── EV6 T3: certificado (insignia de curso nativa) ──

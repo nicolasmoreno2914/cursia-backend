@@ -328,11 +328,17 @@ export function link(h: Hx, href: string, text: string, s: Surf, opts: { button?
  * Reproductor nativo + enlace de descarga (el fallback sobrevive a forceclean).
  * UX r18 (problema 2): `preload="metadata"` (antes "none"): el navegador pide solo la cabecera del MP3 y
  * muestra la duración REAL antes de Play (con "none" el control quedaba en 0:00 hasta reproducir).
+ * UX r18 fix 1 (M6): nombre accesible = el título visible del label (`name`, p.ej. «Audio de bienvenida»), para
+ * que el control nunca quede sin nombre (con html5audio o sin filtro de medios Moodle no le pone `title`):
+ *  - `title` SIEMPRE: está en el conjunto 'Common' de HTMLPurifier para <audio> (lib/weblib.php), así sobrevive a
+ *    forceclean y entra en CLEAN_SAFE; el cálculo de nombre accesible lo usa cuando no hay otro;
+ *  - `aria-label` solo en ENHANCED (regla de la casa: aria/id/role/data- son solo ENHANCED; el purificador los quita).
  */
-export function audio(h: Hx, src: string, label: string, s: Surf): string {
+export function audio(h: Hx, src: string, label: string, s: Surf, name: string): string {
+  if (!name || !name.trim()) shellFail('audio(): falta el nombre accesible del reproductor');
   return (
     `<p${st(h, [['margin', '0 0 12px 0'], ['padding', 0], ['color', s.fg]])}>` +
-    `<audio controls preload="metadata" src="${attr(src)}"${st(h, [['width', '100%'], ['max-width', '100%']])}>` +
+    `<audio controls preload="metadata" title="${attr(name.trim())}"${h.enh ? ` aria-label="${attr(name.trim())}"` : ''} src="${attr(src)}"${st(h, [['width', '100%'], ['max-width', '100%']])}>` +
     `${labelHtml('Tu navegador no puede reproducir este audio: usa el enlace de descarga.')}</audio></p>` +
     `<p${st(h, [['margin', '0'], ['padding', 0], ['color', s.fg2], ['font-size', h.t.typography.sizeSmallPx]])}>${link(h, src, `Descargar ${label} (MP3)`, s)}</p>`
   );

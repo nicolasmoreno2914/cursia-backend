@@ -7,13 +7,16 @@
 //       sequence de section.xml = orden de moodle_backup.xml = moduleid de cada module.xml; en TODAS las
 //       familias de diseño; el validador marca SECTIONS si el orden se rompe.
 //   (b) Audio: audio() emite preload="metadata" (nunca "none"), también en los labels empaquetados.
-//   (c) MP3 con frame Info: concatMp3/assembleAudiobook escriben un Info con el conteo REAL de frames y
-//       bytes (parser independiente, port de r18/diagC/mp3scan.py); transcodeMp3Bitrate escribe a un
-//       archivo temporal con -write_xing 1 (ffmpeg FALSO vía FFMPEG_BIN: no hay ffmpeg en esta máquina),
-//       borra el temporal, y sin ffmpeg / con error devuelve el buffer original (comportamiento previo).
-//   (d) Portada: ≥ 1600 px desde un raster de 2000×1125 (cubre los 1544 px físicos de la columna a DPR 2),
-//       nitidez (varianza del laplaciano) a su ancho no peor que la fuente llevada al mismo ancho; el <img>
-//       conserva width="240" (R13, forceclean).
+//   (c) MP3 con frame Info: SOLO los MP3 finales de v3 (concatMp3/assembleAudiobook, también con UNA parte)
+//       escriben un Info con el conteo REAL de frames y bytes (parser independiente, port de
+//       r18/diagC/mp3scan.py). El transcode genérico (tts.service, audio-worker legacy, POST /tts/speech) NO
+//       escribe Info: mismos argumentos de siempre (salida pipe:1) y devuelve tal cual lo que da ffmpeg (ffmpeg
+//       FALSO en el PATH: no hay ffmpeg en esta máquina); sin ffmpeg → el buffer original.
+//   (d) Portada: ≥ 1600 px desde un raster de 2000×1125 (cubre los 1544 px físicos de la columna a DPR 2).
+//       Nitidez contra una referencia INDEPENDIENTE: la fuente reducida con un filtro triangular (tent), otro
+//       método que el filtro de caja del builder. Umbrales: varianza del laplaciano ≥ 1.0 × referencia y
+//       PSNR ≥ 40 dB contra ella; el tope viejo (640, ampliado) queda ≤ 0.2 × y < 35 dB. Las cifras a 1544 px
+//       (ampliación/reducción bilineal, como el navegador) se imprimen. El <img> conserva width="240" (R13).
 //   (e) «Iniciar actividad»: sin botón cuando la actividad H5P va embebida (el intro conserva el respaldo
 //       «Ábrela en su propia página →»); SCORM lo conserva; finalización/nota de la actividad intactas;
 //       el validador marca NAVIGATION en ambos sentidos.
@@ -166,29 +169,6 @@ function resize(img, tw, th) {
   }
   return { w: tw, h: th, g: out };
 }
-/** Promedio por área (reducción sin aliasing, como el filtro de caja del builder). */
-function boxDown(img, tw, th) {
-  const out = new Float64Array(tw * th);
-  for (let ty = 0; ty < th; ty++) {
-    const y0 = (ty * img.h) / th, y1 = ((ty + 1) * img.h) / th;
-    for (let tx = 0; tx < tw; tx++) {
-      const x0 = (tx * img.w) / tw, x1 = ((tx + 1) * img.w) / tw;
-      let acc = 0, area = 0;
-      for (let sy = Math.floor(y0); sy < Math.ceil(y1); sy++) {
-        const wy = Math.min(y1, sy + 1) - Math.max(y0, sy);
-        if (wy <= 0) continue;
-        for (let sx = Math.floor(x0); sx < Math.ceil(x1); sx++) {
-          const wx = Math.min(x1, sx + 1) - Math.max(x0, sx);
-          if (wx <= 0) continue;
-          acc += img.g[sy * img.w + sx] * wx * wy;
-          area += wx * wy;
-        }
-      }
-      out[ty * tw + tx] = acc / area;
-    }
-  }
-  return { w: tw, h: th, g: out };
-}
 function lapVar(img) {
   let n = 0, s = 0, s2 = 0;
   for (let y = 1; y < img.h - 1; y++) {
@@ -201,30 +181,87 @@ function lapVar(img) {
   return s2 / n - (s / n) ** 2;
 }
 /** Raster «diapositiva» determinístico: fondo, bandas y trazos finos tipo texto (bordes duros). */
+/**
+ * Raster «diapositiva» determinístico: bloques de título, renglones de «texto», trazos diagonales y un gráfico
+ * en damero. Se dibuja a 4× y se promedia 4×4 (antialias, como el rasterizador de pdftoppm), así los bordes
+ * duros no producen el aliasing artificial de un patrón de 1 px.
+ */
 function slideRaster(w, h) {
+  const S = 4, W = w * S, H = h * S;
+  const at = (X, Y) => {
+    const x = X / S, y = Y / S;
+    if (y > h * 0.1 && y < h * 0.18 && x > w * 0.08 && x < w * 0.7 && Math.floor(x / 26) % 5 !== 4) return [30, 40, 60];
+    if (y > h * 0.24 && y < h * 0.5 && x > w * 0.08 && x < w * 0.55 && Math.floor(y / 14) % 2 === 0 && (Math.floor(x / 9) % 7 !== 6) && ((y % 14) > 3)) return [50, 55, 70];
+    if (y > h * 0.55 && x < w * 0.5 && ((x + 2 * y) % 60) < 5) return [120, 60, 20];
+    if (x > w * 0.6 && y > h * 0.3 && y < h * 0.85 && ((Math.floor(x / 18) + Math.floor(y / 18)) % 2 === 0)) return [10, 110, 160];
+    return [250, 248, 240];
+  };
   const px = Buffer.alloc(w * h * 3);
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
+      let r = 0, g = 0, b = 0;
+      for (let j = 0; j < S; j++) for (let i = 0; i < S; i++) { const c = at(x * S + i + 0.5, y * S + j + 0.5); r += c[0]; g += c[1]; b += c[2]; }
       const o = (y * w + x) * 3;
-      let r = 250, g = 248, b = 240;
-      if (y > h * 0.12 && y < h * 0.3 && (Math.floor(x / 7) % 3 !== 0) && (Math.floor(y / 5) % 4 !== 0) && x > w * 0.08 && x < w * 0.8) { r = 30; g = 40; b = 60; }
-      if (y > h * 0.4 && ((x * 13 + y * 7) % 23) < 3) { r = 120; g = 60; b = 20; }
-      if (x > w * 0.6 && y > h * 0.5 && ((Math.floor(x / 4) + Math.floor(y / 4)) % 2 === 0)) { r = 10; g = 110; b = 160; }
-      px[o] = r; px[o + 1] = g; px[o + 2] = b;
+      px[o] = Math.round(r / (S * S)); px[o + 1] = Math.round(g / (S * S)); px[o + 2] = Math.round(b / (S * S));
     }
   }
+  void W; void H;
   return MEDIA.encodePng(w, h, 3, px);
 }
 const DISPLAY_PX = 1544; // 772 px CSS de la columna de Moodle × DPR 2 (r18/UX-diag-C.md)
+/** Remuestreo separable con filtro triangular (tent), soporte = max(1, factor): referencia independiente del builder. */
+function tent(img, tw, th) {
+  const pass = (g, w, h, n, horiz) => {
+    const L = horiz ? w : h;
+    const sc = L / n;
+    const sup = Math.max(1, sc);
+    const W = [];
+    for (let o = 0; o < n; o++) {
+      const c = (o + 0.5) * sc - 0.5;
+      const ws = [];
+      let t = 0;
+      for (let i = Math.max(0, Math.ceil(c - sup)); i <= Math.min(L - 1, Math.floor(c + sup)); i++) {
+        const x = Math.max(0, 1 - Math.abs(i - c) / sup);
+        ws.push([i, x]);
+        t += x;
+      }
+      W.push(ws.map(([i, x]) => [i, x / t]));
+    }
+    const out = new Float64Array(horiz ? n * h : w * n);
+    if (horiz) { for (let y = 0; y < h; y++) for (let o = 0; o < n; o++) { let a = 0; for (const [i, x] of W[o]) a += g[y * w + i] * x; out[y * n + o] = a; } }
+    else { for (let o = 0; o < n; o++) for (let x0 = 0; x0 < w; x0++) { let a = 0; for (const [i, x] of W[o]) a += g[i * w + x0] * x; out[o * w + x0] = a; } }
+    return out;
+  };
+  return { w: tw, h: th, g: pass(pass(img.g, img.w, img.h, tw, true), tw, img.h, th, false) };
+}
+function psnr(a, b) {
+  let e = 0;
+  for (let i = 0; i < a.g.length; i++) e += (a.g[i] - b.g[i]) ** 2;
+  return 10 * Math.log10((255 * 255) / (e / a.g.length));
+}
 /**
- * Nitidez (varianza del laplaciano) de una imagen llevada a `W` px de ancho: reducción por área si es más
- * grande, ampliación bilineal (como el navegador) si es más chica. Se compara la portada contra la FUENTE
- * llevada al mismo ancho: cuánto detalle de la fuente conserva la portada a su tamaño.
+ * Portada vs. referencia independiente (fuente → tent al ancho de la portada), y lo que ve el estudiante a
+ * DPR 2 (bilineal a DISPLAY_PX, como el navegador; la referencia, tent a DISPLAY_PX).
  */
-function sharpnessAt(pngBuf, W) {
-  const img = gray(PNG.decodePng(pngBuf));
-  const th = Math.round((img.h * W) / img.w);
-  return lapVar(img.w >= W ? boxDown(img, W, th) : resize(img, W, th));
+function coverSharpness(srcPng, coverPng, oldPng) {
+  const S = gray(PNG.decodePng(srcPng));
+  const C = gray(PNG.decodePng(coverPng));
+  const O = gray(PNG.decodePng(oldPng));
+  const ref = tent(S, C.w, C.h);
+  const oldUp = resize(O, C.w, C.h);
+  const dh = Math.round((C.h * DISPLAY_PX) / C.w);
+  const refD = tent(S, DISPLAY_PX, dh), CD = resize(C, DISPLAY_PX, dh), OD = resize(O, DISPLAY_PX, dh);
+  return {
+    ref: lapVar(ref), cover: lapVar(C), old: lapVar(oldUp), psnrCover: psnr(C, ref), psnrOld: psnr(oldUp, ref),
+    refD: lapVar(refD), coverD: lapVar(CD), oldD: lapVar(OD),
+  };
+}
+function assertSharp(label, m) {
+  console.log(`   ${label}: var. laplaciano ref(tent) ${m.ref.toFixed(1)} · portada ${m.cover.toFixed(1)} (${(m.cover / m.ref).toFixed(2)}×, PSNR ${m.psnrCover.toFixed(1)} dB) · 640 ampliada ${m.old.toFixed(1)} (${(m.old / m.ref).toFixed(2)}×, ${m.psnrOld.toFixed(1)} dB) | a ${DISPLAY_PX} px: ref ${m.refD.toFixed(1)} · portada ${m.coverD.toFixed(1)} (${(m.coverD / m.refD).toFixed(2)}×) · 640 ${m.oldD.toFixed(1)} (${(m.oldD / m.refD).toFixed(2)}×)`);
+  assert(m.cover >= m.ref, `${label}: portada menos nítida que la referencia independiente (${m.cover} < ${m.ref})`);
+  assert(m.psnrCover >= 40, `${label}: la portada se aparta de la referencia (PSNR ${m.psnrCover} < 40 dB)`);
+  assert(m.old <= 0.2 * m.ref && m.psnrOld < 35, `${label}: control 640 px (${m.old}, ${m.psnrOld} dB) debía ser claramente peor`);
+  assert(m.coverD >= 4 * m.oldD, `${label}: a ${DISPLAY_PX} px la portada debía ser ≥ 4× más nítida que la de 640 (${m.coverD} vs ${m.oldD})`);
 }
 
 (async () => {
@@ -261,7 +298,7 @@ function sharpnessAt(pngBuf, W) {
       assert(v.ok, `validador: ${JSON.stringify(v.issues.slice(0, 5))}`);
     });
   }
-  await check('(a) validador: sección 0 con el foro primero o sin el foro al final → SECTIONS', async () => {
+  await check('(a) validador: sección 0 con el foro primero o sin el foro al final → SECTIONS (solo builder ≥ 3.12.0)', async () => {
     const r = built['aula-clara-light'];
     const P = await pkg(r.mbz);
     const [w, f] = ['cv3:shell:welcome', 'cv3:shell:forum'].map((id) => P.acts.find((a) => a.idnumber === id));
@@ -273,19 +310,36 @@ function sharpnessAt(pngBuf, W) {
     const v = await V.validateMbzV3(bad, r.expectations);
     assert(v.issues.some((i) => i.code === 'SECTIONS' && /abre con cv3:shell:forum/.test(i.message)), JSON.stringify(v.issues.slice(0, 5)));
     assert(v.issues.some((i) => i.code === 'SECTIONS' && /cierra con cv3:shell:welcome/.test(i.message)), JSON.stringify(v.issues.slice(0, 5)));
+    // Fix 1 (M4): con expectativas de un paquete anterior (sin builderVersion o 3.11.0) las reglas de UX r18 no aplican.
+    for (const old of [undefined, '3.11.0', '3.9.9']) {
+      const exp = { ...r.expectations };
+      if (old === undefined) delete exp.builderVersion; else exp.builderVersion = old;
+      const vo = await V.validateMbzV3(bad, exp);
+      assert(!vo.issues.some((i) => /sección 0 (abre|cierra)/.test(i.message)), `builder ${old}: ${JSON.stringify(vo.issues.slice(0, 3))}`);
+    }
+    eq([V.builderVersionAtLeast('3.12.0', '3.12.0'), V.builderVersionAtLeast('3.13.1', '3.12.0'), V.builderVersionAtLeast('4.0.0', '3.12.0'), V.builderVersionAtLeast('3.11.9', '3.12.0'), V.builderVersionAtLeast(undefined, '3.12.0'), V.builderVersionAtLeast('x', '3.12.0')], [true, true, true, false, false, false], 'comparación de versiones');
+    eq(r.expectations.builderVersion, B.DYNAMIC_MBZ_BUILDER_VERSION_V3, 'expectations.builderVersion = versión del builder');
   });
 
   // ════ (b) audio preload ════
-  await check('(b) audio() emite preload="metadata" (nunca "none") en todas las familias; los labels de audio empaquetados también', async () => {
+  await check('(b) audio() emite preload="metadata" (nunca "none") y nombre accesible = título visible (title siempre; aria-label en ENHANCED), en todas las familias y en los labels empaquetados', async () => {
     for (const theme of families) {
       const h = HTML.hx(te.resolveTheme(theme));
-      const html = HTML.audio(h, '@@PLUGINFILE@@/x.mp3', 'el audio', HTML.bgSurf(h));
-      assert(html.includes('<audio controls preload="metadata" src="@@PLUGINFILE@@/x.mp3"') && !/preload="none"/.test(html), `${theme.themeFamily}: ${html.slice(0, 160)}`);
+      const html = HTML.audio(h, '@@PLUGINFILE@@/x.mp3', 'el audio', HTML.bgSurf(h), 'Audio de prueba');
+      assert(html.includes('<audio controls preload="metadata" title="Audio de prueba" src="@@PLUGINFILE@@/x.mp3"') && !/preload="none"/.test(html) && !/aria-/.test(html), `${theme.themeFamily} CLEAN_SAFE: ${html.slice(0, 160)}`);
+      const he = HTML.hx(te.resolveTheme(theme), { level: 'enhanced' });
+      const enh = HTML.audio(he, '@@PLUGINFILE@@/x.mp3', 'el audio', HTML.bgSurf(he), 'Audio de prueba');
+      assert(enh.includes('<audio controls preload="metadata" title="Audio de prueba" aria-label="Audio de prueba" src="@@PLUGINFILE@@/x.mp3"'), `${theme.themeFamily} ENHANCED: ${enh.slice(0, 160)}`);
+      let threw = false;
+      try { HTML.audio(h, '@@PLUGINFILE@@/x.mp3', 'el audio', HTML.bgSurf(h), ' '); } catch (_) { threw = true; }
+      assert(threw, 'un reproductor sin nombre accesible falla fuerte');
     }
     const P = await pkg(built['editorial-light'].mbz);
-    for (const id of ['cv3:shell:audio_welcome', 'cv3:shell:audiobook']) {
+    // Fix 1 (M6): nombre accesible = título visible del label.
+    for (const [id, name] of [['cv3:shell:audio_welcome', 'Audio de bienvenida'], ['cv3:shell:audiobook', 'Audiolibro']]) {
       const intro = await P.introOf(P.acts.find((a) => a.idnumber === id));
-      assert(/<audio controls preload="metadata"/.test(intro) && !/preload="none"/.test(intro), `${id}: preload`);
+      assert(new RegExp(`<audio controls preload="metadata" title="${name}"`).test(intro) && !/preload="none"/.test(intro), `${id}: preload + title (nombre accesible que sobrevive a forceclean)`);
+      assert(new RegExp(`<h3[^>]*>(?:<[^>]+>)*${name}<`).test(intro), `${id}: el aria-label coincide con el título visible`);
     }
   });
 
@@ -329,56 +383,51 @@ function sharpnessAt(pngBuf, W) {
     eq(Math.abs(built['aula-clara-light'].expectations.facts.audio.audiobookSeconds - ps.dur) < 1e-6, true, 'la duración del label es la de los frames reales');
   });
 
-  // Transcode: ffmpeg falso (no hay ffmpeg en esta máquina; ver el reporte).
+  // Transcode genérico: ffmpeg FALSO en el PATH (no hay ffmpeg en esta máquina). Con salida a pipe:1 el muxer mp3 de
+  // ffmpeg no puede escribir Info/Xing (no es seekable) — el transcode no lo pide ni lo agrega.
   const fakeDir = fs.mkdtempSync(path.join(TMP, 'fake-ffmpeg-'));
   const argsLog = path.join(fakeDir, 'args.json');
-  const infoMp3 = path.join(fakeDir, 'with-info.mp3');
-  fs.writeFileSync(infoMp3, AUDIO.concatMp3([fs.readFileSync(path.join(FIX, 'welcome-100f.mp3'))]));
-  const fake = (name, body) => {
-    const p = path.join(fakeDir, name);
-    fs.writeFileSync(p, `#!${process.execPath}\nconst fs=require('fs');const a=process.argv.slice(2);fs.writeFileSync(${JSON.stringify(argsLog)},JSON.stringify(a));\nlet n=0;process.stdin.on('data',(c)=>{n+=c.length});process.stdin.on('end',()=>{${body}});\n`);
-    fs.chmodSync(p, 0o755);
-    return p;
-  };
-  const fakeOk = fake('ffmpeg-ok', `const out=a[a.length-1];if(!a.includes('-write_xing')||a[a.indexOf('-write_xing')+1]!=='1'||/^pipe:/.test(out)){process.stderr.write('bad args');process.exit(3)}fs.writeFileSync(out,fs.readFileSync(${JSON.stringify(infoMp3)}));process.exit(0);`);
-  const fakeFail = fake('ffmpeg-fail', `process.stderr.write('boom');process.exit(1);`);
-  const fakeNoOut = fake('ffmpeg-noout', `process.exit(0);`);
-  const leftovers = () => fs.readdirSync(TMP).filter((f) => f.startsWith('cursia-mp3-transcode-'));
+  fs.writeFileSync(path.join(fakeDir, 'ffmpeg'), `#!${process.execPath}\nconst fs=require('fs');fs.writeFileSync(${JSON.stringify(argsLog)},JSON.stringify(process.argv.slice(2)));\nconst c=[];process.stdin.on('data',(d)=>c.push(d));process.stdin.on('end',()=>{process.stdout.write(Buffer.concat(c));});\n`);
+  fs.chmodSync(path.join(fakeDir, 'ffmpeg'), 0o755);
   const original = fs.readFileSync(path.join(FIX, 'welcome-100f.mp3'));
-  await check('(c) transcodeMp3Bitrate: ffmpeg escribe a un archivo temporal con -write_xing 1 (no pipe:1), se lee ese archivo (con Info) y el temporal se borra', async () => {
-    process.env.FFMPEG_BIN = fakeOk;
-    const out = await TC.transcodeMp3Bitrate(original, 64);
-    const args = JSON.parse(fs.readFileSync(argsLog, 'utf8'));
-    eq(args.slice(0, 4), ['-i', 'pipe:0', '-ac', '1'], 'entrada por stdin, mono');
-    assert(args.includes('64k') && args[args.indexOf('-write_xing') + 1] === '1' && args.includes('-y'), `args ${JSON.stringify(args)}`);
-    assert(path.basename(args[args.length - 1]) === 'out.mp3' && args[args.length - 1].startsWith(TMP), `salida a archivo temporal: ${args[args.length - 1]}`);
-    assert(out.equals(fs.readFileSync(infoMp3)), 'devuelve el archivo escrito por ffmpeg');
-    const s = mp3scan(out);
-    assert(s.xing.length === 1 && s.xing[0].frames === s.frames, 'con Info y frames correctos');
-    eq(leftovers(), [], 'temporal borrado');
-  });
-  await check('(c) transcodeMp3Bitrate fallback: sin ffmpeg (ENOENT), ffmpeg con error o sin archivo de salida → buffer ORIGINAL intacto y sin temporales', async () => {
-    for (const [label, bin] of [['ENOENT', path.join(fakeDir, 'no-existe-ffmpeg')], ['exit 1', fakeFail], ['sin salida', fakeNoOut]]) {
-      process.env.FFMPEG_BIN = bin;
+  const PATH0 = process.env.PATH;
+  await check('(c) transcode genérico (tts.service / audio-worker legacy / POST /tts/speech): argumentos de siempre (salida pipe:1, sin -write_xing), NO agrega frame Info', async () => {
+    process.env.PATH = `${fakeDir}${path.delimiter}${PATH0}`;
+    try {
       const out = await TC.transcodeMp3Bitrate(original, 64);
-      assert(out === original, `${label}: debe devolver el mismo buffer`);
-      eq(leftovers(), [], `${label}: temporal borrado`);
+      eq(JSON.parse(fs.readFileSync(argsLog, 'utf8')), ['-i', 'pipe:0', '-ac', '1', '-b:a', '64k', '-f', 'mp3', 'pipe:1'], 'argumentos de ffmpeg');
+      assert(out.equals(original), 'devuelve exactamente lo que escribe ffmpeg');
+      eq(mp3scan(out).xing.length, 0, 'sin frame Info/Xing');
+      eq(mp3scan(original).xing.length, 0, 'fixture sin Info');
+    } finally {
+      process.env.PATH = PATH0;
     }
-    delete process.env.FFMPEG_BIN;
+  });
+  await check('(c) transcode genérico sin ffmpeg (ENOENT) → buffer ORIGINAL intacto', async () => {
+    process.env.PATH = fakeDir.replace(/fake-ffmpeg-.*/, 'no-existe');
+    try {
+      const out = await TC.transcodeMp3Bitrate(original, 64);
+      assert(out === original, 'debe devolver el mismo buffer');
+    } finally {
+      process.env.PATH = PATH0;
+    }
+  });
+  await check('(c) MP3 final v3 de UNA sola parte (bienvenida corta): concatMp3([parte]) también lleva el Info con sus frames reales', async () => {
+    const out = AUDIO.concatMp3([original]);
+    const s = mp3scan(out);
+    eq([s.xing.length, s.xing[0] && s.xing[0].frames, s.frames, s.xing[0] && s.xing[0].bytes], [1, mp3scan(original).frames, mp3scan(original).frames, out.length], 'Info de una parte');
+    assert(out.subarray(out.length - original.length).equals(original), 'el audio que sigue al Info es el original byte a byte');
   });
 
   // ════ (d) Portada ════
   const src = slideRaster(2000, 1125);
-  await check(`(d) portada: raster 2000×1125 → ${PNG.COVER_MAX_WIDTH} px (≥ 1600 ≥ ${DISPLAY_PX} px físicos a DPR 2), nitidez a su ancho no peor que la fuente; el tope viejo (640) sí era peor`, async () => {
+  await check(`(d) portada: raster 2000×1125 → ${PNG.COVER_MAX_WIDTH} px (≥ 1600 ≥ ${DISPLAY_PX} px físicos a DPR 2), nitidez ≥ referencia independiente (tent) y PSNR ≥ 40 dB; el tope viejo (640) no`, async () => {
     assert(PNG.COVER_MAX_WIDTH >= 1600, `COVER_MAX_WIDTH ${PNG.COVER_MAX_WIDTH}`);
     const r = PNG.downscaleCoverPng(src);
     eq([r.width, r.height, r.downscaled], [1600, 900, true], 'dimensiones');
     assert(r.width >= DISPLAY_PX, `la portada (${r.width} px) no cubre los ${DISPLAY_PX} px físicos de la columna a DPR 2: el navegador la ampliaría`);
     const W = r.width;
-    const sSrc = sharpnessAt(src, W), sNew = sharpnessAt(r.png, W), sOld = sharpnessAt(PNG.downscaleCoverPng(src, 640).png, W);
-    console.log(`   nitidez (var. laplaciano a ${W} px): fuente ${sSrc.toFixed(1)} · portada ${sNew.toFixed(1)} · tope viejo 640 ${sOld.toFixed(1)}; bytes fuente ${src.length} · portada ${r.png.length}`);
-    assert(sNew >= 0.99 * sSrc, `portada más borrosa que la fuente (${sNew} < ${sSrc})`);
-    assert(sOld < 0.5 * sSrc, `control: 640 px debía ser claramente más borrosa (${sOld} vs ${sSrc})`);
+    assertSharp(`sintético ${W}×${r.height} (${r.png.length} B)`, coverSharpness(src, r.png, PNG.downscaleCoverPng(src, 640).png));
     // Sin pérdida: el filtro adaptativo decodifica a los mismos píxeles que el filtro de caja.
     const dec = PNG.decodePng(r.png);
     const plain = PNG.decodePng(MEDIA.encodePng(dec.width, dec.height, dec.channels, dec.pixels));
@@ -387,15 +436,13 @@ function sharpnessAt(pngBuf, W) {
   });
   const realDir = process.env.UX_COVER_RASTER_DIR;
   if (realDir && fs.existsSync(realDir)) {
-    await check('(d) rasters reales (UX_COVER_RASTER_DIR): ≥ 1600 px y nitidez no peor que la fuente', async () => {
+    await check('(d) rasters reales (UX_COVER_RASTER_DIR): ≥ 1600 px y nitidez ≥ referencia independiente (tent), PSNR ≥ 40 dB', async () => {
       for (const f of fs.readdirSync(realDir).filter((x) => /^p150_.*\.png$/.test(x)).sort()) {
         const b = fs.readFileSync(path.join(realDir, f));
         const r = PNG.downscaleCoverPng(b);
         const o = PNG.downscaleCoverPng(b, 640);
-        const [s0, s1, s2] = [sharpnessAt(b, r.width), sharpnessAt(r.png, r.width), sharpnessAt(o.png, r.width)];
-        const d0 = sharpnessAt(b, DISPLAY_PX), d1 = sharpnessAt(r.png, DISPLAY_PX), d2 = sharpnessAt(o.png, DISPLAY_PX);
-        console.log(`   ${f}: fuente ${b.length} B · 640 ${o.png.length} B · ${r.width}×${r.height} ${r.png.length} B | nitidez a ${r.width}: fuente ${s0.toFixed(1)} · portada ${s1.toFixed(1)} · 640 ${s2.toFixed(1)} | a ${DISPLAY_PX}: fuente ${d0.toFixed(1)} · portada ${d1.toFixed(1)} · 640 ${d2.toFixed(1)}`);
-        assert(r.width >= 1600 && s1 >= 0.99 * s0, `${f}: ${r.width} px, nitidez ${s1} vs ${s0}`);
+        assert(r.width >= 1600, `${f}: ${r.width} px`);
+        assertSharp(`${f} (fuente ${b.length} B · 640 ${o.png.length} B · ${r.width}×${r.height} ${r.png.length} B)`, coverSharpness(b, r.png, o.png));
       }
     });
   }
@@ -452,6 +499,7 @@ function sharpnessAt(pngBuf, W) {
         } else {
           eq(next.modname, 'scorm', 'SCORM');
           assert(intro.includes('Iniciar actividad →') && intro.includes(`href="$@SCORMVIEWBYID*${next.mid}@$"`), `${a.idnumber}: botón al SCORM`);
+          assert(!intro.includes('cursia-cta://'), `${a.idnumber}: marcador next-activity resuelto`);
         }
         assert(/<completion>2<\/completion>/.test(next.module) && /<completionpassgrade>1<\/completionpassgrade>/.test(next.module) && /<completionview>0<\/completionview>/.test(next.module), `${next.idnumber}: finalización por aprobado`);
         const grades = await P.z.file(`${next.dir}/grades.xml`).async('string');
@@ -480,6 +528,13 @@ function sharpnessAt(pngBuf, W) {
       const bad = await mutate(r.mbz, { [`${a.dir}/label.xml`]: (x) => x.replace(/\$@SCORMVIEWBYID\*\d+@\$/, '#') });
       const v = await V.validateMbzV3(bad, r.expectations);
       assert(v.issues.some((i) => i.code === 'NAVIGATION' && /sin botón «Iniciar actividad»/.test(i.message)), JSON.stringify(v.issues.slice(0, 5)));
+      // Fix 1 (M3): el marcador «next-activity» del SCORM sin resolver → TOKEN_INVALID.
+      const raw = await mutate(r.mbz, { [`${a.dir}/label.xml`]: (x) => x.replace(/\$@SCORMVIEWBYID\*\d+@\$/, () => 'cursia-cta://next-activity') });
+      const vr = await V.validateMbzV3(raw, r.expectations);
+      assert(vr.issues.some((i) => i.code === 'TOKEN_INVALID' && i.where === a.idnumber), JSON.stringify(vr.issues.slice(0, 5)));
+      // Fix 1 (M4): con expectativas de un paquete 3.11.0 la regla nueva no aplica.
+      const vo = await V.validateMbzV3(bad, { ...r.expectations, builderVersion: '3.11.0' });
+      assert(!vo.issues.some((i) => i.code === 'NAVIGATION' && /Iniciar actividad/.test(i.message)), JSON.stringify(vo.issues.slice(0, 5)));
     }
   });
 

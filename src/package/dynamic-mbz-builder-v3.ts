@@ -310,6 +310,8 @@ export interface MbzV3Expectations {
    * contenido se admiten SOLO en ese label; el resto es plantilla estricta.
    */
   shellProseByLabel: Record<string, string[]>;
+  /** UX r18 fix 1 (M4): versión del builder que armó el paquete (las reglas nuevas del validador dependen de ella). */
+  builderVersion: string;
 }
 
 export interface BuildDynamicMbzV3Result {
@@ -1213,11 +1215,12 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
         const act = c.activities.get(ch.chapterId) as ActivityContentV3;
         const key = ch.keys.activity as string;
         const name = safeActivityName(`Actividad práctica · Capítulo ${ch.chapterNumber}: ${ch.title}`);
-        // H5P → intro con la actividad embebida (h5pActivityInlineIntroHtml); SCORM → se abre aparte. UX r18
-        // (problema 4): debe coincidir con `activityEmbedsInline` del ensamblador (sin botón «Iniciar actividad»
-        // cuando se embebe); el validador lo verifica sobre el paquete (NAVIGATION).
-        if (activityEmbedsInline(act.variant) !== (act.variant === 'h5p')) throw new Error(`MBZ_V3_INVARIANT: activityEmbedsInline(${act.variant}) no coincide con el intro del builder`);
-        if (act.variant === 'h5p') {
+        // UX r18 (problema 4) + fix 1 (M1): el builder decide con el MISMO predicado que el ensamblador
+        // (`activityEmbedsInline`: sin botón «Iniciar actividad» cuando la actividad va embebida). Embebida → intro
+        // con el reproductor (hoy solo sabe embeber H5P); no embebida → se abre aparte (hoy solo SCORM). Si el
+        // predicado y lo que el builder sabe construir divergen, falla fuerte en vez de dejar una práctica sin acceso.
+        if (activityEmbedsInline(act.variant)) {
+          if (act.variant !== 'h5p') throw new Error(`MBZ_V3_INVARIANT: la actividad ${act.variant} se declara embebida pero el builder solo embebe H5P`);
           const built = await buildActivityH5p(
             act.payload,
             ch.chapterId,
@@ -1232,6 +1235,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
             h5pActivityInlineIntroHtml({ packageFilename: filename, title: ch.title, activityMid: mid, theme: introTheme, frame: frameFor(ch.chapterNumber) }),
           );
         } else {
+          if (act.variant !== 'scorm') throw new Error(`MBZ_V3_INVARIANT: la actividad ${(act as { variant: string }).variant} no se embebe y el builder solo abre aparte un SCORM`);
           const a = W.newActivity('scorm', sec, name, `${idp}:activity`);
           const mids = parseScormManifestIds(act.manifestXml);
           const zipName = `actividad-capitulo-${ch.chapterNumber}.zip`;
@@ -1523,7 +1527,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const mbz = (await W.zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } })) as Buffer;
   return {
     mbz,
-    expectations: { facts, resolved, h5pProfileVersion, examBankPlans, shellProseByLabel: shellProseByLabel(courseIntro, moduleIntros) },
+    expectations: { facts, resolved, h5pProfileVersion, examBankPlans, shellProseByLabel: shellProseByLabel(courseIntro, moduleIntros), builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3 },
     summary: {
       builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3,
       moodleVersion: MV.br,

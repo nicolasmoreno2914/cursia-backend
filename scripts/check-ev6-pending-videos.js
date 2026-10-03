@@ -265,13 +265,13 @@ async function pureChecks() {
   // #583 QUAL (builder 3.11.0): reviewmaxmarks 69904 → 272, frase del cierre, tarjeta del Libro Guía como <intro> del recurso (sin label libro_card; ids renumerados) y runtime VC 4 — diff semántico en scratchpad/r18/qual/golddiff/sem.js.
   // Dorados 3.10.0: 644 812c6022…, 645 db474403….
   // UX r18 (builder 3.12.0): sección 0 con el hero primero y el foro al final (mids 1000–1005 de la sección 0
-  // corridos), sin kicker «Bienvenida» en el hero, <audio preload="metadata">, frame Info en audiolibro.mp3,
+  // corridos), sin kicker «Bienvenida» en el hero, <audio preload="metadata" title=…> (+ aria-label en ENHANCED; fix 1, M6), frame Info en audiolibro.mp3,
   // portadas a 1600 px (PNG con filtro adaptativo) y sin botón «Iniciar actividad» hacia H5P embebido. Diff
   // semántico por idnumber en scratchpad/r18/uximpl-golddiff2.js / uximpl-golddiff3.js: solo esos cambios.
   // Dorados 3.11.0: 644 63dac759…, 645 2c7fe50b….
   const GOLDEN_PRE_T5 = {
-    644: ['756d30395c945fb1c7c9892c372b2c6d5112e0ddda4c975ecfffd5908cd46cb6', { engine: 'h5p', finalExam: true, courseId: 644 }],
-    645: ['204e1074212c6e74f8eba4eef4e464394e2d1987dacd32b08d9bd81f36a0fb97', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
+    644: ['4f4aa1b9bf4ccd45f3f2e8031cae838473e67b3cc218dfd6a8e827b58e9037b5', { engine: 'h5p', finalExam: true, courseId: 644 }],
+    645: ['32191ec20a1e716492eae4247dc7faff83829a55d29ff577676dadb6570ce116', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
   };
   await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B4 (respuestas explicadas sobre sistema visual 2.0 + certificado + política de revisión del quiz con revisión de respuestas propias V542 + H5P de una sola copia + retroalimentación global del quiz + #583 QUAL + UX r18, builder 3.12.0), con y sin el campo', async () => {
     for (const [id, [want, o]] of Object.entries(GOLDEN_PRE_T5)) {

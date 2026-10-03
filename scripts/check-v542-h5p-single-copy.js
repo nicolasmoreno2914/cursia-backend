@@ -218,8 +218,8 @@ const BS_CFG = {
     const o = { engine: 'scorm', finalExam: false, courseId: 646, modules: [{ examEnabled: false, chapters: [{ video: false, activity: true }, { video: false, activity: false }] }] };
     const r = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, o));
     // #583 QUAL (builder 3.11.0): reviewmaxmarks 69904 → 272, frase del cierre, tarjeta del Libro Guía como <intro> del recurso (sin label libro_card; ids renumerados) y runtime VC 4 — diff semántico en scratchpad/r18/qual/golddiff/sem.js (antes d4e6bc68…: staging 3.6.0 = 3.10.0 para este curso).
-    // UX r18 (builder 3.12.0): sección 0 hero primero / foro al final, sin kicker, preload="metadata", Info en audiolibro.mp3 y portadas a 1600 px — diff semántico en scratchpad/r18/uximpl-golddiff4.js (antes 80e8b108…, 3.11.0).
-    eq(sha(r.mbz), 'e718ef45eefc2d4707526a00f60acbca03bcd41710415889cb061edde7bba090', 'sha256');
+    // UX r18 (builder 3.12.0): sección 0 hero primero / foro al final, sin kicker, preload="metadata" + title/aria-label (fix 1), Info en audiolibro.mp3 y portadas a 1600 px — diff semántico en scratchpad/r18/uximpl-golddiff4.js (antes 80e8b108…, 3.11.0).
+    eq(sha(r.mbz), 'a169af34d0b54eeaab569f80c0d6e2a8280f531b46814726e8976070d5e72c55', 'sha256');
   });
 
   console.log(`\n${failures ? 'HAY FALLOS' : 'Todos los checks de V542 I2 (H5P de una sola copia) pasaron'} (${passed} ✅, ${failures} ❌).`);

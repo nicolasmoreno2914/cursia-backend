@@ -68,16 +68,16 @@ const GOLDEN = {
   // ab93ce5b…, scorm-final-light 6619628e…, h5p-ev5c-rules1 c96fb4bb….
   // UX r18 (builder 3.11.0 → 3.12.0) cambia el .mbz a propósito, y SOLO en esto (diff semántico por idnumber contra
   // origin/staging, scratchpad/r18/uximpl-golddiff4.js): sección 0 con el hero primero y el foro al final (ids de la
-  // sección 0 renumerados), sin kicker «Bienvenida» en el hero, <audio preload="metadata">, frame Info en
+  // sección 0 renumerados), sin kicker «Bienvenida» en el hero, <audio preload="metadata" title=…> (+ aria-label en ENHANCED; fix 1, M6), frame Info en
   // audiolibro.mp3, portadas a 1600 px (antes 640) y sin botón «Iniciar actividad» hacia la H5P embebida.
   // Dorados anteriores (3.11.0): h5p-final-light 03bb4e8b…, scorm-nofinal-dark 9500797e…, h5p-nofinal-dark-mock-cleansafe
   // 5329675d…, scorm-final-light 948e402d…, h5p-ev5c-rules1 4a1532f2….
   mbz: {
-    'h5p-final-light': 'd839d74342a7a99a8030ea554d85f359fb63e866ecae52bf04298f2faf831b68',
-    'scorm-nofinal-dark': '7a1a79b53c17784b1244a96fae8845a199a310c290b9d04ccb2e1facab9ff31d',
-    'h5p-nofinal-dark-mock-cleansafe': '6dc0cfc630a86373ffea4a4821c62c4bfb173e650fd91dd156bc397e5d86b9f0',
-    'scorm-final-light': '0f98d0ba5a539dec369c566d803139bfb23bfc4ff84023c8484bfba35991b6a6',
-    'h5p-ev5c-rules1': 'a94cdb0f4621e69bfc69156cb0197ae91ef4b0071361027aee26544fb9da1790',
+    'h5p-final-light': 'ef14a6aff868d846d04839d88ee444050eef4b793dee035d855439d58e8964d4',
+    'scorm-nofinal-dark': 'b967577f1cf7d78ab87a70442335d7cd636113e6774607a6d6e9480d8759e4c6',
+    'h5p-nofinal-dark-mock-cleansafe': '715aa10f91b945f21f06904c46988c0f7baf91e44c9e646bdec30682676e7371',
+    'scorm-final-light': '6c18bcced0c41fa4a59fe91529c077e0d53aa759bffcc69725d8bbb9d5897fa9',
+    'h5p-ev5c-rules1': '4e5d160266833e479b86a891a3dab1e50c91baa0f9dc2a7eb5118ad650b6d51d',
   },
 };
 /** Listas propias de rules 2 (CONGELADO: cambiar cualquiera = reglas 3). */
