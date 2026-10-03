@@ -85,7 +85,17 @@ export interface AudiobookManifestSection {
 export interface AudiobookChapterManifest {
   v: number;
   chapterId: string;
-  source: { words: number; narratableWords: number; sections: number; sha256: string; excluded: Array<{ title: string; words: number; reason: string }> };
+  source: {
+    words: number;
+    narratableWords: number;
+    sections: number;
+    sha256: string;
+    /** Secciones excluidas EXPLÍCITAMENTE de la narración (bibliografía), con sus palabras. */
+    excluded: Array<{ title: string; words: number; reason: string }>;
+    /** Fix round 1 (I3): palabras del Markdown crudo y las que no quedaron en ningún bloque ni excluido. */
+    rawWords?: number | null;
+    lostWords?: number | null;
+  };
   script: { words: number; ratio: number; sections: AudiobookManifestSection[] };
   tts: {
     wordsSent: number;
@@ -95,7 +105,16 @@ export interface AudiobookChapterManifest {
     segmentsConcatenated: number;
     segments: AudiobookManifestSegment[];
   };
-  audio: { frames: number; seconds: number; infoFrames: number | null; infoFrameSeconds: number | null; bitrateKbps: number | null; wpm: number };
+  audio: {
+    frames: number;
+    seconds: number;
+    infoFrames: number | null;
+    infoFrameSeconds: number | null;
+    bitrateKbps: number | null;
+    wpm: number;
+    /** Fix round 1 (I1): duración mínima del capítulo = 0,85 × palabras narrables × 60 / 141. */
+    targetSeconds?: number;
+  };
 }
 
 const FRAME_EPS = 1e-6;
@@ -134,6 +153,7 @@ export function validateChapterAudioManifest(m: AudiobookChapterManifest): strin
   const sentWords = t.segments.reduce((a, s) => a + s.words, 0);
   if (sentWords !== t.wordsSent) errs.push(`WORDS_SENT ${t.wordsSent} != ${sentWords}`);
   if (t.wordsSent >= AUDIOBOOK_WPM_MIN_WORDS && (m.audio.wpm < AUDIOBOOK_WPM_MIN || m.audio.wpm > AUDIOBOOK_WPM_MAX)) errs.push(`WPM ${m.audio.wpm}`);
+  if (typeof m.audio.targetSeconds === 'number' && m.audio.seconds + FRAME_EPS < m.audio.targetSeconds) errs.push(`UNDER_TARGET ${m.audio.seconds} < ${m.audio.targetSeconds}`);
   return errs;
 }
 
@@ -164,6 +184,9 @@ export interface CourseFloorResult {
  * (segmentos faltantes, bloques por debajo del objetivo, ritmo). Un capítulo
  * sin manifiesto (audio existente de antes de r19, o simulado) → el piso se
  * omite con un aviso: un re-empaque NUNCA re-narra ni gasta.
+ * Fix round 1 (I1): es una defensa en profundidad. El worker del capítulo ya exige
+ * `chapterTargetSeconds` (0,85 × palabras × 60/141) antes de completar, así que
+ * con Σ fuente ≥ umbral el total es ≥ 1500 s por construcción; llegar aquí es un bug.
  */
 export function checkAudiobookCourseFloor(chapters: CourseFloorChapter[]): CourseFloorResult {
   const totalSeconds = chapters.reduce((a, c) => a + c.durationSeconds, 0);

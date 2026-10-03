@@ -18,6 +18,7 @@ import {
   AUDIOBOOK_MAX_RATIO,
   AUDIOBOOK_MIN_RATIO,
   AUDIOBOOK_TARGET_RATIO,
+  AUDIOBOOK_WPM_REF,
 } from '../../package/audio/audiobook-policy';
 
 /** Modelo del guion: el mismo que fuerza el frontend (`_generateAudiobookNarrativeScript`) y el prior del estimador. */
@@ -156,31 +157,99 @@ export interface ScriptPrompt {
 // r19 — plan de bloques del capítulo (cubre TODO el Markdown, nunca recorta)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Tabla Markdown → oraciones habladas («Encabezado: celda; …»): el contenido se narra, no se borra. */
+/**
+ * Limpiador del texto NARRADO del audiolibro (r19 fix round 1, I3). A diferencia de
+ * `cleanAudioText` (bienvenida y Gamma, sin cambios), solo quita SINTAXIS Markdown y
+ * nunca texto: conserva el código en línea (sin las comillas invertidas), los `<`/`>`
+ * que no son etiquetas HTML reales y el texto entre `|` de una tabla mal formada.
+ */
+export function cleanNarrationText(raw: string): string {
+  return (raw || '')
+    .replace(/^\s*(```|~~~)[^\n]*$/gm, ' ')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/<\/?[a-zA-Z][a-zA-Z0-9-]*(\s[^<>]*)?\/?>/g, ' ')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*\n]+)\*/g, '$1')
+    .replace(/^\s*[*\-+]\s+/gm, '')
+    .replace(/^\s*\d+\.\s+/gm, '')
+    .replace(/`([^`]*)`/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/^\s*([-*_]\s*){3,}$/gm, ' ')
+    .replace(/\|/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Tabla Markdown → oraciones habladas: el encabezado UNA vez («Criterio; Opción A; Opción B.») y
+ * cada fila («costo; bajo; alto.»). Sirve con o sin `|` en los bordes (GFM). Ninguna celda se
+ * pierde y no se agregan palabras (fix round 1, M5: antes el encabezado se repetía por fila).
+ */
 export function verbalizeMarkdownTables(md: string): string {
   const lines = (md || '').replace(/\r\n?/g, '\n').split('\n');
   const out: string[] = [];
-  const isRow = (l: string) => /^\s*\|.*\|\s*$/.test(l);
-  const isSep = (l: string) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(l);
+  const isSep = (l: string) => l.includes('|') && /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(l);
+  const isOuterRow = (l: string) => /^\s*\|.*\|\s*$/.test(l);
+  const hasPipe = (l: string) => l.includes('|') && l.trim().length > 0;
   const cells = (l: string) => l.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
   for (let i = 0; i < lines.length; i++) {
-    if (!isRow(lines[i])) { out.push(lines[i]); continue; }
+    const gfm = hasPipe(lines[i]) && i + 1 < lines.length && isSep(lines[i + 1]);
+    if (!gfm && !isOuterRow(lines[i])) { out.push(lines[i]); continue; }
     const block: string[] = [];
-    while (i < lines.length && isRow(lines[i])) block.push(lines[i++]);
+    if (gfm) {
+      block.push(lines[i], lines[i + 1]);
+      i += 2;
+      while (i < lines.length && hasPipe(lines[i]) && !isSep(lines[i])) block.push(lines[i++]);
+    } else {
+      while (i < lines.length && isOuterRow(lines[i])) block.push(lines[i++]);
+    }
     i--;
-    const hasHeader = block.length >= 2 && isSep(block[1]);
-    const header = hasHeader ? cells(block[0]) : null;
-    const rows = (hasHeader ? block.slice(2) : block).filter((l) => !isSep(l)).map(cells);
-    const sentences = rows.map((r) => {
-      const parts = r.map((c, j) => (header && header[j] && c ? `${header[j]}: ${c}` : c)).filter(Boolean);
-      return parts.length ? `${parts.join('; ')}.` : '';
-    }).filter(Boolean);
+    const rows = block.filter((l) => !isSep(l)).map(cells);
     out.push('');
-    if (header && !rows.length) out.push(`${header.filter(Boolean).join(', ')}.`);
-    out.push(...sentences);
+    for (const r of rows) {
+      const parts = r.filter(Boolean);
+      if (parts.length) out.push(`${parts.join('; ')}.`);
+    }
     out.push('');
   }
   return out.join('\n');
+}
+
+/**
+ * Palabras de la fuente para el control de cobertura INDEPENDIENTE del limpiador (fix round 1, I3):
+ * solo se quita sintaxis (marcas de título/lista/énfasis, bordes de tabla, URLs de enlaces,
+ * etiquetas HTML reales). Normalizadas a minúsculas sin puntuación en los bordes.
+ */
+export function rawSourceTokens(md: string): string[] {
+  return (md || '')
+    .replace(/^\s*(```|~~~)[^\n]*$/gm, ' ')
+    .replace(/\]\([^)]*\)/g, ']')
+    .replace(/<\/?[a-zA-Z][a-zA-Z0-9-]*(\s[^<>]*)?\/?>/g, ' ')
+    .replace(/^\s*\d+\.\s+/gm, ' ')
+    .split(/[\s|]+/)
+    .map(normToken)
+    .filter(Boolean);
+}
+
+function normToken(t: string): string {
+  return t.toLowerCase().normalize('NFC').replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+}
+
+/**
+ * Palabras del Markdown CRUDO que no aparecen en ningún texto narrado ni en una sección excluida
+ * explícitamente (multiconjunto de tokens normalizados). Independiente del limpiador (fix round 1, I3).
+ */
+export function planCoverageLoss(md: string, narratedTexts: string[], excludedMarkdown: string[]): string[] {
+  const have = new Map<string, number>();
+  const add = (t: string) => { const k = normToken(t); if (k) have.set(k, (have.get(k) ?? 0) + 1); };
+  for (const x of narratedTexts) for (const t of x.split(/\s+/)) add(t);
+  for (const b of excludedMarkdown) for (const t of rawSourceTokens(b)) add(t);
+  const lost: string[] = [];
+  for (const t of rawSourceTokens(md)) {
+    const n = have.get(t) ?? 0;
+    if (n > 0) have.set(t, n - 1); else lost.push(t);
+  }
+  return lost;
 }
 
 export interface AudiobookSourceSection {
@@ -201,17 +270,26 @@ export interface AudiobookSectionPlan {
   narratableWords: number;
   sections: AudiobookSourceSection[];
   excluded: Array<{ title: string; words: number; reason: string }>;
+  /** Palabras del Markdown crudo (solo sin sintaxis) y cuántas no aparecen en ningún bloque ni excluido. */
+  rawWords: number;
+  lostWords: number;
 }
 
-/** Bibliografía / referencias / enlaces: no se narran (quedan en el plan como excluidos, contados). */
-const EXCLUDED_TITLE_RE = /^(bibliograf[ií]a|referencias|fuentes|webgraf[ií]a|lecturas recomendadas|enlaces)\b/i;
+/**
+ * Bibliografía / referencias / enlaces: no se narran (quedan en el plan y en el manifiesto como
+ * excluidos, con sus palabras). Fix round 1 (I3): solo el título EXACTO (sin número), nunca un
+ * prefijo: «Referencias normativas del sector» es contenido y se narra.
+ */
+const EXCLUDED_TITLE_RE = /^(bibliograf[ií]a|referencias|referencias bibliogr[aá]ficas|fuentes|fuentes consultadas|webgraf[ií]a|lecturas recomendadas|enlaces|enlaces de inter[eé]s)\.?$/i;
+/** Tolerancia del control de cobertura (diferencias de tokenización): más que esto = contenido perdido. */
+export const AUDIOBOOK_COVERAGE_TOLERANCE = Object.freeze({ minWords: 5, ratio: 0.01 });
 
 interface RawBlock { title: string; paragraphs: string[]; words: number }
 
 function paragraphsOf(raw: string): string[] {
   return verbalizeMarkdownTables(raw)
     .split(/\n\s*\n/)
-    .map((p) => cleanAudioText(p))
+    .map((p) => cleanNarrationText(p))
     .filter((p) => p.length > 0);
 }
 
@@ -241,7 +319,7 @@ export function planAudiobookSections(markdown: string): AudiobookSectionPlan {
     const h = /^##(?!#)\s+(.+?)\s*#*\s*$/.exec(line);
     if (h) {
       rawBlocks.push(cur);
-      cur = { title: cleanAudioText(h[1]), body: `${line}\n` };
+      cur = { title: cleanNarrationText(h[1]), body: `${line}\n` };
     } else cur.body += `${line}\n`;
   }
   rawBlocks.push(cur);
@@ -301,7 +379,19 @@ export function planAudiobookSections(markdown: string): AudiobookSectionPlan {
   if (covered !== sourceWords) {
     throw new AudioScriptError('AUDIOBOOK_PLAN_COVERAGE', `el plan cubre ${covered} de ${sourceWords} palabras del capítulo`, false);
   }
-  return { sha256: sha256(md), sourceWords, narratableWords, sections, excluded };
+  // Fix round 1 (I3): cobertura contra el Markdown CRUDO (independiente del limpiador): toda palabra
+  // de la fuente tiene que estar en un bloque narrado o en una sección excluida explícitamente.
+  const raw = rawSourceTokens(md);
+  const lost = planCoverageLoss(md, sections.map((x) => x.text), rawBlocks.filter((b) => b.title && EXCLUDED_TITLE_RE.test(b.title)).map((b) => b.body));
+  const tol = Math.max(AUDIOBOOK_COVERAGE_TOLERANCE.minWords, Math.ceil(raw.length * AUDIOBOOK_COVERAGE_TOLERANCE.ratio));
+  if (lost.length > tol) {
+    throw new AudioScriptError(
+      'AUDIOBOOK_PLAN_COVERAGE',
+      `${lost.length} de ${raw.length} palabras del capítulo no quedaron en ningún bloque (p. ej. «${lost.slice(0, 8).join(' ')}»)`,
+      false,
+    );
+  }
+  return { sha256: sha256(md), sourceWords, narratableWords, sections, excluded, rawWords: raw.length, lostWords: lost.length };
 }
 
 export function sectionTargetWords(sourceWords: number): { target: number; min: number; max: number } {
@@ -313,7 +403,8 @@ export function sectionTargetWords(sourceWords: number): { target: number; min: 
 }
 
 function sectionMaxTokens(target: number): number {
-  return Math.min(3000, Math.max(800, Math.ceil(target * 1.6) + 200));
+  // Fix round 1 (I4): ~1,8 tokens por palabra en español + margen (antes 1,6: un bloque de 900 palabras podía cortarse).
+  return Math.min(3000, Math.max(800, Math.ceil(target * 2) + 200));
 }
 
 const SECTION_COMMON_RULES = (pais?: string | null) =>
@@ -380,7 +471,7 @@ export function sectionContinuationPrompt(
 export type ScriptCallRole = 'main' | 'continuation';
 
 /** Llamada LLM inyectada: devuelve el texto (la medición al ledger la hace el caller). */
-export type ScriptLlm = (prompt: ScriptPrompt, role: ScriptCallRole) => Promise<{ text: string; messageId: string }>;
+export type ScriptLlm = (prompt: ScriptPrompt, role: ScriptCallRole) => Promise<{ text: string; messageId: string; truncated?: boolean }>;
 
 export interface SectionScriptResult {
   idx: number;
@@ -413,7 +504,7 @@ export async function generateSectionScript(
   const { target, min, max } = sectionTargetWords(section.words);
   const main = await llm(sectionNarrationPrompt(input, section, totalSections, prevTail), 'main');
   const messageIds = [main.messageId];
-  let text = cleanAudioText(main.text);
+  let text = cleanNarrationText(main.text);
   let continued = false;
   if (wordCount(text) > max) {
     throw new AudioScriptError(
@@ -422,13 +513,21 @@ export async function generateSectionScript(
       true,
     );
   }
-  if (wordCount(text) < min) {
-    // Lo que falta hasta el objetivo (nunca un mínimo fijo: en un bloque chico empujaría por encima del 110 %).
-    const needed = Math.max(1, target - wordCount(text));
+  // Fix round 1 (I4): una salida cortada por max_tokens nunca se acepta tal cual, aunque caiga en la
+  // banda: se trata como corta (UNA continuación que la termina).
+  if (wordCount(text) < min || main.truncated) {
+    const w = wordCount(text);
+    const needed = w < target ? Math.max(1, target - w) : Math.max(1, Math.min(max - w, Math.ceil(section.words * 0.05)));
+    if (w >= max) {
+      throw new AudioScriptError('AUDIOBOOK_SECTION_TRUNCATED', `el guion del bloque ${section.idx + 1} del capítulo ${input.chapterNumber} se cortó por max_tokens sin margen para terminarlo`, true);
+    }
     const cont = await llm(sectionContinuationPrompt(text, section, input.chapterTitle, needed, input.pais), 'continuation');
     messageIds.push(cont.messageId);
     continued = true;
-    text = `${text} ${cleanAudioText(cont.text)}`.replace(/\s+/g, ' ').trim();
+    if (cont.truncated) {
+      throw new AudioScriptError('AUDIOBOOK_SECTION_TRUNCATED', `la continuación del bloque ${section.idx + 1} del capítulo ${input.chapterNumber} se cortó por max_tokens: no se narra un bloque cortado`, true);
+    }
+    text = `${text} ${cleanNarrationText(cont.text)}`.replace(/\s+/g, ' ').trim();
   }
   const words = wordCount(text);
   if (words < min) {
@@ -448,32 +547,139 @@ export async function generateSectionScript(
   return { idx: section.idx, sourceSha: section.sha256, sourceWords: section.words, text, words, ratio: ratioOf(words, section.words), continued, messageIds };
 }
 
+/** Normalización para comparar narración (minúsculas, sin tildes ni puntuación). */
+function normForRepetition(t: string): string {
+  return t.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9ñ\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function countShingles(text: string, out: Map<string, number>): void {
+  const w = normForRepetition(text).split(' ').filter(Boolean);
+  for (let i = 0; i + AUDIOBOOK_SHINGLE_WORDS <= w.length; i++) {
+    const k = w.slice(i, i + AUDIOBOOK_SHINGLE_WORDS).join(' ');
+    out.set(k, (out.get(k) ?? 0) + 1);
+  }
+}
+
+/** Oraciones de ≥ 8 palabras (normalizadas) de un texto, con su cuenta. */
+function countSentences(text: string, out: Map<string, number>): void {
+  for (const s of text.split(/(?<=[.!?])\s+/)) {
+    const n = normForRepetition(s);
+    if (n.split(' ').length >= 8) out.set(n, (out.get(n) ?? 0) + 1);
+  }
+}
+
 /**
- * Anti-duplicado / anti-bucle sobre el guion del capítulo: bloques idénticos, o
- * una frase de 12 palabras repetida más de 2 veces. Devuelve los índices de
- * bloque implicados (vacío = sin repetición).
+ * Anti-duplicado / anti-bucle sobre el guion del capítulo: bloques idénticos, una oración
+ * repetida DENTRO de un bloque, o una frase de 12 palabras repetida más de 2 veces. Fix round 1
+ * (M4): lo que ya se repite en la fuente no cuenta. Devuelve los índices de bloque implicados en
+ * orden de posición (vacío = sin repetición): el caller descarta el primero si es uno solo
+ * (bucle dentro de un bloque, I2) o todos salvo el primero si son varios.
  */
-export function findScriptRepetition(sections: Array<{ idx: number; text: string }>): { idxs: number[]; detail: string } {
-  const norm = (t: string) => t.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9ñ\s]/g, ' ').replace(/\s+/g, ' ').trim();
+export function findScriptRepetition(
+  sections: Array<{ idx: number; text: string }>,
+  sources?: Array<{ idx: number; text: string }> | null,
+): { idxs: number[]; detail: string } {
+  const srcShingles = new Map<string, number>();
+  const srcSentences = new Map<string, number>();
+  for (const s of sources ?? []) { countShingles(s.text, srcShingles); countSentences(s.text, srcSentences); }
+  const ordered = [...sections].sort((a, b) => a.idx - b.idx);
   const seen = new Map<string, number>();
-  for (const s of sections) {
-    const n = norm(s.text);
+  for (const s of ordered) {
+    const n = normForRepetition(s.text);
     if (seen.has(n)) return { idxs: [seen.get(n) as number, s.idx], detail: `los bloques ${(seen.get(n) as number) + 1} y ${s.idx + 1} son idénticos` };
     seen.set(n, s.idx);
   }
+  for (const s of ordered) {
+    const sent = new Map<string, number>();
+    countSentences(s.text, sent);
+    for (const [k, c] of sent) {
+      if (c > 1 && c > (srcSentences.get(k) ?? 0)) return { idxs: [s.idx], detail: `el bloque ${s.idx + 1} repite la oración «${k.slice(0, 80)}» ${c} veces` };
+    }
+  }
   const counts = new Map<string, { n: number; idxs: Set<number> }>();
-  for (const s of sections) {
-    const w = norm(s.text).split(' ').filter(Boolean);
-    for (let i = 0; i + AUDIOBOOK_SHINGLE_WORDS <= w.length; i++) {
-      const k = w.slice(i, i + AUDIOBOOK_SHINGLE_WORDS).join(' ');
+  for (const s of ordered) {
+    const local = new Map<string, number>();
+    countShingles(s.text, local);
+    for (const [k, c0] of local) {
       const c = counts.get(k) ?? { n: 0, idxs: new Set<number>() };
-      c.n++;
+      c.n += c0;
       c.idxs.add(s.idx);
       counts.set(k, c);
-      if (c.n > AUDIOBOOK_SHINGLE_MAX_REPEATS) return { idxs: [...c.idxs].sort((a, b) => a - b), detail: `la frase «${k}» se repite ${c.n} veces` };
+      if (c.n > Math.max(AUDIOBOOK_SHINGLE_MAX_REPEATS, srcShingles.get(k) ?? 0)) {
+        return { idxs: [...c.idxs].sort((a, b) => a - b), detail: `la frase «${k}» se repite ${c.n} veces` };
+      }
     }
   }
   return { idxs: [], detail: '' };
+}
+
+/** Bloques a descartar ante una repetición: el único (bucle interno) o todos salvo el primero por posición. */
+export function blocksToDropForRepetition(idxs: number[]): number[] {
+  const sorted = [...idxs].sort((a, b) => a - b);
+  return sorted.length <= 1 ? sorted : sorted.slice(1);
+}
+
+// ─── r19 fix round 1 (I1): completar desde la fuente un capítulo por debajo de su duración objetivo ───
+
+/** Duración mínima del capítulo: 0,85 × palabras de fuente narrables al ritmo de referencia (141 ppm). */
+export function chapterTargetSeconds(narratableWords: number): number {
+  return (AUDIOBOOK_MIN_RATIO * narratableWords * 60) / AUDIOBOOK_WPM_REF;
+}
+
+/** Tope por pasada de una ampliación: +25 % de las palabras de la fuente del bloque. */
+export const AUDIOBOOK_EXTENSION_MAX_FRACTION = 0.25;
+/** Se pide al menos esto por ampliación (si el bloque tiene margen); un bloque con menos de 3 palabras de margen no se amplía. */
+export const AUDIOBOOK_EXTENSION_MIN_WORDS = 10;
+export const AUDIOBOOK_EXTENSION_MIN_ROOM = 3;
+
+/**
+ * Qué bloques ampliar para cubrir `deficitWords`: primero los de MENOR ratio (los que el LLM más
+ * condensó), cada uno hasta el 110 % de su fuente y +25 % por pasada; se corta al cubrir el déficit.
+ */
+export function planChapterExtension(
+  blocks: Array<{ idx: number; sourceWords: number; scriptWords: number }>,
+  deficitWords: number,
+): Array<{ idx: number; words: number }> {
+  const out: Array<{ idx: number; words: number }> = [];
+  let left = Math.ceil(deficitWords);
+  const sorted = [...blocks].sort((a, b) => a.scriptWords / Math.max(1, a.sourceWords) - b.scriptWords / Math.max(1, b.sourceWords) || a.idx - b.idx);
+  for (const b of sorted) {
+    if (left <= 0) break;
+    const room = Math.min(Math.floor(AUDIOBOOK_MAX_RATIO * b.sourceWords) - b.scriptWords, Math.ceil(AUDIOBOOK_EXTENSION_MAX_FRACTION * b.sourceWords));
+    if (room < AUDIOBOOK_EXTENSION_MIN_ROOM) continue;
+    const words = Math.min(room, Math.max(left, AUDIOBOOK_EXTENSION_MIN_WORDS));
+    out.push({ idx: b.idx, words });
+    left -= words;
+  }
+  return out;
+}
+
+/**
+ * UNA continuación acotada y fundada en la fuente del bloque (sectionContinuationPrompt: narra lo
+ * que falte del bloque). Nunca supera `maxWords`: si el LLM se excede o se corta por max_tokens, se
+ * conserva hasta la última oración completa dentro del tope (nunca media oración).
+ */
+export async function generateSectionExtension(
+  input: ChapterScriptInput,
+  section: AudiobookSourceSection,
+  existingText: string,
+  words: number,
+  maxWords: number,
+  llm: ScriptLlm,
+): Promise<{ text: string; words: number; messageIds: string[] }> {
+  const r = await llm(sectionContinuationPrompt(existingText, section, input.chapterTitle, words, input.pais), 'continuation');
+  let text = cleanNarrationText(r.text);
+  if (r.truncated || wordCount(text) > maxWords) {
+    const sentences = text.split(/(?<=[.!?])\s+/);
+    let kept = '';
+    for (const s of sentences) {
+      if (!/[.!?]$/.test(s) && r.truncated) break; // la oración cortada nunca entra
+      if (wordCount(`${kept} ${s}`) > maxWords) break;
+      kept = kept ? `${kept} ${s}` : s;
+    }
+    text = kept;
+  }
+  return { text, words: wordCount(text), messageIds: [r.messageId] };
 }
 
 export interface AudiobookSegmentPlan {
@@ -487,13 +693,21 @@ export interface AudiobookSegmentPlan {
   chars: number;
 }
 
-/** Segmentos del TTS (splitForTts por bloque), en orden de narración. */
-export function audiobookSegments(sections: Array<{ idx: number; text: string }>): AudiobookSegmentPlan[] {
+/**
+ * Segmentos del TTS (splitForTts por bloque), en orden de narración. Las ampliaciones de un bloque
+ * (fix round 1, I1) van detrás de él con su propia clave `seg-<bloque>-x<n>-<parte>-<sha12>`: los
+ * segmentos ya pagados del bloque no cambian de clave y se reutilizan.
+ */
+export function audiobookSegments(sections: Array<{ idx: number; text: string; extensions?: string[] }>): AudiobookSegmentPlan[] {
   const out: AudiobookSegmentPlan[] = [];
+  const push = (keyBase: string, sectionIdx: number, partIdx: number, text: string) => {
+    const textSha = sha256(text);
+    out.push({ key: `${keyBase}-${textSha.slice(0, 12)}`, sectionIdx, partIdx, text, textSha, words: wordCount(text), chars: text.length });
+  };
   for (const s of [...sections].sort((a, b) => a.idx - b.idx)) {
-    splitForTts(s.text).forEach((text, partIdx) => {
-      const textSha = sha256(text);
-      out.push({ key: `seg-${s.idx}-${partIdx}-${textSha.slice(0, 12)}`, sectionIdx: s.idx, partIdx, text, textSha, words: wordCount(text), chars: text.length });
+    splitForTts(s.text).forEach((text, partIdx) => push(`seg-${s.idx}-${partIdx}`, s.idx, partIdx, text));
+    (s.extensions ?? []).forEach((ext, n) => {
+      splitForTts(ext).forEach((text, p) => push(`seg-${s.idx}-x${n}-${p}`, s.idx, 1000 * (n + 1) + p, text));
     });
   }
   return out;

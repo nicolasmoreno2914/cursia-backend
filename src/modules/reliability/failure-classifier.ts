@@ -325,7 +325,7 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     codes: ['validation_invalid', 'content_empty', 'gift_invalid', 'llm_output_invalid', 'scorm_invalid', 'concept_plan_invalid',
       'CONTENT_TRUTH', 'CONTENT_TRUTH_RETRY_INVALID', 'EXAM_NEUROMYTH', 'AUDIOBOOK_SCRIPT_TOO_SHORT',
       // r19: guion por bloque fuera de la banda 85–110 % o con repetición → se regeneran SOLO esos bloques.
-      'AUDIOBOOK_SECTION_TOO_SHORT', 'AUDIOBOOK_SECTION_PADDED', 'AUDIOBOOK_SCRIPT_REPETITION'],
+      'AUDIOBOOK_SECTION_TOO_SHORT', 'AUDIOBOOK_SECTION_PADDED', 'AUDIOBOOK_SCRIPT_REPETITION', 'AUDIOBOOK_SECTION_TRUNCATED'],
     family: /^(GIFT|BS|TEXT|DIAGRAM)_[A-Z0-9_]+$/,
     class: 'B', strategy: 'regenerate_targeted', rounds: 2,
   },
@@ -371,7 +371,9 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     id: 'audio_invalid',
     codes: ['TTS_AUDIO_INVALID', 'AUDIOBOOK_PART_MISSING', 'MP3_INVALID', 'MP3_INCOMPATIBLE_PARTS', 'AUDIO_DURATION',
       // r19: segmento con ritmo fuera de banda (ralentizado/relleno/bucle), audio duplicado o manifiesto inconsistente.
-      'AUDIO_WPM_OUT_OF_RANGE', 'AUDIOBOOK_SEGMENT_DUPLICATE', 'AUDIOBOOK_MANIFEST_INVALID'],
+      'AUDIO_WPM_OUT_OF_RANGE', 'AUDIOBOOK_SEGMENT_DUPLICATE', 'AUDIOBOOK_MANIFEST_INVALID',
+      // r19 fix round 1 (I1): capítulo bajo su duración objetivo tras ampliar desde la fuente → el reintento amplía lo que quede.
+      'AUDIOBOOK_CHAPTER_UNDER_TARGET'],
     family: /^MP3_[A-Z0-9_]+$/,
     class: 'B', strategy: 'regenerate_targeted', paidRisk: 'measured', provider: 'openai', rounds: 2,
   },

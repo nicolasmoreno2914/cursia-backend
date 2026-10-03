@@ -46,7 +46,9 @@ import {
 } from '../../package/presentation';
 import {
   AUDIOBOOK_MANIFEST_VERSION,
+  AUDIOBOOK_MAX_RATIO,
   AUDIOBOOK_TARGET_BITRATE_KBPS,
+  AUDIOBOOK_WPM_REF,
   AUDIOBOOK_WPM_MAX,
   AUDIOBOOK_WPM_MIN,
   AUDIOBOOK_WPM_MIN_WORDS,
@@ -61,7 +63,9 @@ import {
 import { transcodeMp3Bitrate } from '../../tts/mp3-transcode.util';
 import type { ThemeFamilyId, ThemeMode } from '../../modules/theme-engine/types';
 import {
+  GuardNextCall,
   LedgerWriteFailed,
+  TTS_CHARS_PER_SECOND_ESTIMATE,
   WorkerBudget,
   WorkerLedger,
   budgetExceededMessage,
@@ -86,10 +90,16 @@ import {
   AudioScriptError,
   AudiobookSectionPlan,
   ChapterScriptInput,
+  ScriptLlm,
+  TTS_MAX_CHARS,
   audiobookSegments,
+  blocksToDropForRepetition,
+  chapterTargetSeconds,
   cleanAudioText,
   findScriptRepetition,
+  generateSectionExtension,
   generateSectionScript,
+  planChapterExtension,
   planAudiobookSections,
   splitForTts,
   welcomeScriptFromCourseIntro,
@@ -258,8 +268,10 @@ async function handBackIfDraining(deps: RealProviderDeps, item: ClaimedItem, whe
 }
 
 /** Runtime guard antes de una llamada pagada NUEVA. false = item bloqueado (sin llamada). */
-async function guard(deps: RealProviderDeps, item: ClaimedItem, provider?: string): Promise<boolean> {
-  const g = await deps.budget.guardPaidSubmission({ runId: item.runId, itemRunId: item.itemRunId, itemType: item.type, ...(provider ? { provider } : {}) });
+async function guard(deps: RealProviderDeps, item: ClaimedItem, provider?: string, nextCall?: GuardNextCall): Promise<boolean> {
+  const g = await deps.budget.guardPaidSubmission({
+    runId: item.runId, itemRunId: item.itemRunId, itemType: item.type, ...(provider ? { provider } : {}), ...(nextCall ? { nextCall } : {}),
+  });
   if (g.allow) return true;
   if (!deps.scheduler.blockItemForBudget) throw new Error('dynamic-provider-worker: scheduler sin blockItemForBudget');
   deps.logger.warn(`Item ${item.itemKey}: presupuesto excedido (${g.reason}) — no se llama al proveedor${provider ? ` (${provider})` : ''}`);
@@ -770,6 +782,9 @@ export interface PersistedAudiobookPlan {
   narratableWords: number;
   excluded: AudiobookSectionPlan['excluded'];
   sections: Array<{ idx: number; title: string; words: number; sha256: string }>;
+  /** Fix round 1 (I3): palabras del Markdown crudo y las que no quedaron en ningún bloque ni excluido. */
+  rawWords?: number;
+  lostWords?: number;
 }
 
 /** Guion aceptado de un bloque (output_summary.audiobookSections[idx]). */
@@ -830,10 +845,30 @@ export function persistedAudiobookOps(os: Record<string, any> | null | undefined
   const ids = new Set<string>();
   for (const s of Object.values((os?.audiobookSections ?? {}) as Record<string, PersistedSectionScript>)) for (const m of s?.messageIds ?? []) if (m) ids.add(m);
   for (const g of Object.values((os?.audioSegments ?? {}) as Record<string, PersistedSegment>)) if (g?.requestId) ids.add(g.requestId);
+  for (const list of Object.values((os?.audiobookExtensions ?? {}) as Record<string, PersistedExtension[]>)) for (const e of list ?? []) for (const m of e?.messageIds ?? []) if (m) ids.add(m);
   // Descartados a sabiendas (segmento guardado corrupto, bloque repetido): resultado conocido, ya regenerado.
   for (const d of Array.isArray(os?.audiobookDiscardedOps) ? os.audiobookDiscardedOps : []) if (typeof d === 'string' && d) ids.add(d);
   return ids;
 }
+
+/** Ampliación aceptada de un bloque (fix round 1, I1): output_summary.audiobookExtensions[idx][n]. */
+export interface PersistedExtension {
+  sourceSha: string;
+  text: string;
+  words: number;
+  messageIds: string[];
+}
+
+/** Costo estimado de UNA llamada (fix round 1, I5): el guard reserva esto, no el p90 del item entero. */
+function ttsCallEstimate(model: string, characters: number): GuardNextCall {
+  return { provider: 'openai', service: 'audio.speech', product: model, usage: { audio_seconds: Math.max(1, Math.ceil(characters / TTS_CHARS_PER_SECOND_ESTIMATE)) } };
+}
+function llmCallEstimate(model: string, promptChars: number, maxTokens: number): GuardNextCall {
+  return { provider: 'anthropic', service: 'messages', product: model, usage: { input_tokens: Math.max(1, Math.ceil(promptChars / 3)), output_tokens: Math.max(1, maxTokens) } };
+}
+/** Cota de una llamada del guion antes de conocer el prompt (sistema + bloque de ~900 palabras + cola; salida máxima). */
+const LLM_CALL_PROMPT_CHARS_BOUND = 9000;
+const LLM_CALL_MAX_TOKENS_BOUND = 3000;
 
 export async function processRealAudiobook(deps: RealProviderDeps, item: ClaimedItem, ownerId: string): Promise<void> {
   const env = envOf(deps);
@@ -842,104 +877,119 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
   const os = (item.outputSummary ?? {}) as Record<string, any>;
   let plan: PersistedAudiobookPlan | null = validPlan(os.audiobookPlan) ? os.audiobookPlan : null;
   const sections: Record<string, PersistedSectionScript> = { ...((os.audiobookSections ?? {}) as Record<string, PersistedSectionScript>) };
+  const extensions: Record<string, PersistedExtension[]> = { ...((os.audiobookExtensions ?? {}) as Record<string, PersistedExtension[]>) };
   const segState: Record<string, PersistedSegment> = { ...((os.audioSegments ?? {}) as Record<string, PersistedSegment>) };
+  const discarded: string[] = Array.isArray(os.audiobookDiscardedOps) ? [...os.audiobookDiscardedOps] : [];
   const sectionDone = (p: PersistedAudiobookPlan, i: number) => sections[String(p.sections[i].idx)]?.sourceSha === p.sections[i].sha256;
   const scriptsDone = () => !!plan && plan.sections.every((_, i) => sectionDone(plan as PersistedAudiobookPlan, i));
   const needsLlm = !scriptsDone();
   const tracker = deps.tracker;
+  const model = trimmed(env, 'OPENAI_TTS_MODEL') || TTS_MODEL_DEFAULT;
+  const voice = trimmed(env, 'OPENAI_TTS_VOICE') || TTS_VOICE_DEFAULT;
+  const scriptModel = trimmed(env, AUDIOBOOK_SCRIPT_MODEL_ENV) || AUDIOBOOK_SCRIPT_MODEL_DEFAULT;
 
-  // Guard (TTS) → configuración COMPLETA antes de la primera llamada pagada.
-  if (!(await guard(deps, item))) return;
+  // Guard (TTS, una llamada) → configuración COMPLETA antes de la primera llamada pagada.
+  if (!(await guard(deps, item, undefined, ttsCallEstimate(model, TTS_MAX_CHARS)))) return;
   const missing: string[] = [];
   if (!openaiKey) missing.push('OPENAI_API_KEY');
   if (needsLlm && !anthropicKey) missing.push('ANTHROPIC_API_KEY');
   if (missing.length) await fail(deps, item, notReady(item, missing), false);
-  const scriptModel = trimmed(env, AUDIOBOOK_SCRIPT_MODEL_ENV) || AUDIOBOOK_SCRIPT_MODEL_DEFAULT;
+
+  // El Markdown del capítulo (descarga gratis): plan de bloques, fuente de la repetición y de las ampliaciones.
+  if (needsLlm && (await handBackIfDraining(deps, item, 'antes de pedir el guion del audiolibro (sin gasto)'))) return;
+  const markdown = markdownOf(await dependencyText(deps, item, ownerId, 'dynamic_content_md'));
+  let full: AudiobookSectionPlan;
+  try {
+    full = planAudiobookSections(markdown);
+  } catch (err) {
+    return fail(deps, item, err instanceof AudioScriptError ? err.message : `AUDIOBOOK_PLAN_COVERAGE: ${err instanceof Error ? err.message : String(err)}`, false);
+  }
+  if (!full.sections.length) {
+    await fail(deps, item, `AUDIOBOOK_CONTENT_EMPTY: el capítulo ${item.chapterNumber ?? '?'} no tiene contenido para narrar`, false);
+  }
+  const srcBySha = new Map(full.sections.map((x) => [x.sha256, x]));
+  const input: ChapterScriptInput = {
+    courseTitle: item.blueprint?.course?.title ?? 'este curso',
+    chapterNumber: item.chapterNumber ?? 0,
+    chapterTitle: item.blueprint?.chapter?.title ?? `Capítulo ${item.chapterNumber ?? '?'}`,
+    chapterDescription: item.blueprint?.chapter?.description ?? null,
+    sector: (item.context?.courseContext as any)?.sector ?? null,
+    nivel: (item.context?.courseContext as any)?.nivel ?? null,
+    pais: (item.context?.courseContext as any)?.pais ?? null,
+    contentMarkdown: markdown,
+  };
+  const itemRole = providerCallRoleOf(item.attempt);
+  let llmClient: AnthropicClient | null = null;
+  /** Llamada pagada del guion (bloque o ampliación): guard por llamada → reserva → llamada → liquidación. */
+  const llmFor = (tag: string, what: string, paidIds: string[]): ScriptLlm => async (prompt, role) => {
+    await heartbeat(deps, item);
+    if (!(await guard(deps, item, 'anthropic', llmCallEstimate(scriptModel, prompt.system.length + prompt.user.length, prompt.maxTokens)))) throw new BudgetBlocked();
+    // Calibración #2: reserva DURABLE antes de la llamada (si falla, no se llama).
+    const resKey = await reservePaidCall(deps.finops, {
+      kind: 'llm', ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1, itemAttempt: item.attempt,
+      tag: `${tag}-${role}`,
+      estimate: { promptChars: prompt.system.length + prompt.user.length, maxTokens: prompt.maxTokens, model: scriptModel },
+    });
+    if (tracker) tracker.inFlight = { provider: 'anthropic', key: resKey };
+    if (!llmClient) llmClient = new AnthropicClient(anthropicKey, env);
+    let r;
+    try {
+      r = await llmClient.messages({ model: scriptModel, system: prompt.system, user: prompt.user, maxTokens: prompt.maxTokens });
+    } catch (err) {
+      // Rechazo definitivo (4xx con respuesta) → sin gasto: se libera la reserva. Cualquier otro
+      // resultado (timeout/red/5xx/sin id-usage) queda reservado y el item va a reconciliación.
+      if (isDefinitiveRejection(err)) {
+        await settlePaidCall(deps.finops, resKey, null, 'anthropic_rejected_definitively');
+        if (tracker) tracker.inFlight = null;
+      }
+      throw err;
+    }
+    if (tracker && tracker.inFlight) tracker.inFlight.opId = r.messageId;
+    // Medición server-side (HD-V21-17): cargo por msg_… + reserva a 0, atómico. Error → reconciliación.
+    await settlePaidCall(deps.finops, resKey, serverLlmChargeInput({
+      ownerId, itemRunId: item.itemRunId, model: scriptModel, messageId: r.messageId, requestId: r.requestId, usage: r.usage,
+      callRole: role === 'continuation' ? 'continuation' : 'main',
+      attempt: itemRole.attempt,
+    }), 'anthropic_measured');
+    paidIds.push(r.messageId);
+    if (tracker) {
+      tracker.inFlight = null;
+      tracker.unpersistedPaidOutput = { provider: 'anthropic', what, opIds: [...paidIds] };
+    }
+    // Fix round 1 (I4): la salida cortada por max_tokens se informa (nunca se acepta como un bloque completo).
+    return { text: r.text, messageId: r.messageId, truncated: r.stopReason === 'max_tokens' };
+  };
+  /** Error de una llamada del guion → fallo con su clase (resultado conocido, presupuesto, lease o proveedor). */
+  const scriptFailure = async (err: unknown, where: string): Promise<'stop'> => {
+    if (err instanceof LeaseLost) throw err;
+    if (err instanceof BudgetBlocked) return 'stop';
+    if (err instanceof AudioScriptError) return fail(deps, item, err.message, err.retryable, { knownOutcome: true });
+    const e = err instanceof ProviderCallError ? err : null;
+    return fail(deps, item, `audiobook_script_failed: ${where}: ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
+  };
 
   // ── 1. Plan + guion por bloque (solo los bloques que falten) ───────────────
   if (needsLlm) {
-    // R16 (#1): drenando → no se empieza la llamada pagada al LLM del guion.
-    if (await handBackIfDraining(deps, item, 'antes de pedir el guion del audiolibro (sin gasto)')) return;
-    const markdown = markdownOf(await dependencyText(deps, item, ownerId, 'dynamic_content_md'));
-    let full: AudiobookSectionPlan;
-    try {
-      full = planAudiobookSections(markdown);
-    } catch (err) {
-      return fail(deps, item, err instanceof AudioScriptError ? err.message : `AUDIOBOOK_PLAN_COVERAGE: ${err instanceof Error ? err.message : String(err)}`, false);
-    }
-    if (!full.sections.length) {
-      await fail(deps, item, `AUDIOBOOK_CONTENT_EMPTY: el capítulo ${item.chapterNumber ?? '?'} no tiene contenido para narrar`, false);
-    }
     plan = {
       v: 1, sha256: full.sha256, sourceWords: full.sourceWords, narratableWords: full.narratableWords, excluded: full.excluded,
+      rawWords: full.rawWords, lostWords: full.lostWords,
       sections: full.sections.map((x) => ({ idx: x.idx, title: x.title, words: x.words, sha256: x.sha256 })),
     };
     await record(deps, item, { audiobookPlan: plan });
-    if (!(await guard(deps, item, 'anthropic'))) return;
-    const llmClient = new AnthropicClient(anthropicKey, env);
-    const itemRole = providerCallRoleOf(item.attempt);
-    const input: ChapterScriptInput = {
-      courseTitle: item.blueprint?.course?.title ?? 'este curso',
-      chapterNumber: item.chapterNumber ?? 0,
-      chapterTitle: item.blueprint?.chapter?.title ?? `Capítulo ${item.chapterNumber ?? '?'}`,
-      chapterDescription: item.blueprint?.chapter?.description ?? null,
-      sector: (item.context?.courseContext as any)?.sector ?? null,
-      nivel: (item.context?.courseContext as any)?.nivel ?? null,
-      pais: (item.context?.courseContext as any)?.pais ?? null,
-      contentMarkdown: markdown,
-    };
+    if (!(await guard(deps, item, 'anthropic', llmCallEstimate(scriptModel, LLM_CALL_PROMPT_CHARS_BOUND, LLM_CALL_MAX_TOKENS_BOUND)))) return;
     for (const section of full.sections) {
       const k = String(section.idx);
       if (sections[k]?.sourceSha === section.sha256) continue; // ya pagado y aceptado
       // R16 (#1): entre bloques no hay gasto en el aire (el anterior ya quedó guardado).
       if (await handBackIfDraining(deps, item, `antes del guion del bloque ${section.idx + 1} (los anteriores ya están guardados)`)) return;
       const prevTail = sections[String(section.idx - 1)]?.text ?? null;
-      const paidIds: string[] = [];
       let res;
       try {
-        res = await generateSectionScript(input, section, full.sections.length, prevTail, async (prompt, role) => {
-          await heartbeat(deps, item);
-          // Cada llamada pagada (principal o continuación) pasa por el guard con el gasto actualizado.
-          if (!(await guard(deps, item, 'anthropic'))) throw new BudgetBlocked();
-          // Calibración #2: reserva DURABLE antes de la llamada (si falla, no se llama).
-          const resKey = await reservePaidCall(deps.finops, {
-            kind: 'llm', ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1, itemAttempt: item.attempt,
-            tag: `sec${section.idx}-${role}`,
-            estimate: { promptChars: prompt.system.length + prompt.user.length, maxTokens: prompt.maxTokens, model: scriptModel },
-          });
-          if (tracker) tracker.inFlight = { provider: 'anthropic', key: resKey };
-          let r;
-          try {
-            r = await llmClient.messages({ model: scriptModel, system: prompt.system, user: prompt.user, maxTokens: prompt.maxTokens });
-          } catch (err) {
-            // Rechazo definitivo (4xx con respuesta) → sin gasto: se libera la reserva. Cualquier otro
-            // resultado (timeout/red/5xx/sin id-usage) queda reservado y el item va a reconciliación.
-            if (isDefinitiveRejection(err)) {
-              await settlePaidCall(deps.finops, resKey, null, 'anthropic_rejected_definitively');
-              if (tracker) tracker.inFlight = null;
-            }
-            throw err;
-          }
-          if (tracker && tracker.inFlight) tracker.inFlight.opId = r.messageId;
-          // Medición server-side (HD-V21-17): cargo por msg_… + reserva a 0, atómico. Error → reconciliación.
-          await settlePaidCall(deps.finops, resKey, serverLlmChargeInput({
-            ownerId, itemRunId: item.itemRunId, model: scriptModel, messageId: r.messageId, requestId: r.requestId, usage: r.usage,
-            callRole: role === 'continuation' ? 'continuation' : 'main',
-            attempt: itemRole.attempt,
-          }), 'anthropic_measured');
-          paidIds.push(r.messageId);
-          if (tracker) {
-            tracker.inFlight = null;
-            tracker.unpersistedPaidOutput = { provider: 'anthropic', what: `guion del bloque ${section.idx + 1} del audiolibro pagado sin persistir`, opIds: [...paidIds] };
-          }
-          return { text: r.text, messageId: r.messageId };
-        });
+        res = await generateSectionScript(input, section, full.sections.length, prevTail,
+          llmFor(`sec${section.idx}`, `guion del bloque ${section.idx + 1} del audiolibro pagado sin persistir`, []));
       } catch (err) {
-        if (err instanceof LeaseLost) throw err;
-        if (err instanceof BudgetBlocked) return;
-        if (err instanceof AudioScriptError) return fail(deps, item, err.message, err.retryable, { knownOutcome: true });
-        const e = err instanceof ProviderCallError ? err : null;
-        return fail(deps, item, `audiobook_script_failed: bloque ${section.idx + 1}/${full.sections.length}: ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
+        await scriptFailure(err, `bloque ${section.idx + 1}/${full.sections.length}`);
+        return;
       }
       sections[k] = {
         sourceSha: res.sourceSha, sourceWords: res.sourceWords, text: res.text, words: res.words, ratio: res.ratio,
@@ -951,145 +1001,237 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
     }
   }
   const p = plan as PersistedAudiobookPlan;
-  const ordered = p.sections.map((x) => ({ idx: x.idx, text: sections[String(x.idx)].text }));
+  const blockTexts = () => p.sections.map((x) => ({
+    idx: x.idx,
+    text: sections[String(x.idx)].text,
+    extensions: (extensions[String(x.idx)] ?? []).filter((e) => e.sourceSha === x.sha256).map((e) => e.text),
+  }));
+  const narrated = (b: { text: string; extensions: string[] }) => [b.text, ...b.extensions].join(' ');
+  const sources = p.sections.map((x) => ({ idx: x.idx, text: srcBySha.get(x.sha256)?.text ?? '' }));
+
+  /** Anti-duplicado / anti-bucle (bloques entre sí y DENTRO de un bloque); descarta y falla → el reintento los regenera. */
+  const repetitionGate = async (): Promise<boolean> => {
+    const rep = findScriptRepetition(blockTexts().map((b) => ({ idx: b.idx, text: narrated(b) })), sources);
+    if (!rep.idxs.length) return true;
+    const dropped: string[] = [];
+    for (const i of blocksToDropForRepetition(rep.idxs)) {
+      dropped.push(...(sections[String(i)]?.messageIds ?? []), ...(extensions[String(i)] ?? []).flatMap((e) => e.messageIds));
+      delete sections[String(i)];
+      delete extensions[String(i)];
+    }
+    discarded.push(...dropped);
+    await record(deps, item, { audiobookSections: sections, audiobookExtensions: extensions, audiobookDiscardedOps: [...discarded] });
+    await fail(deps, item, `AUDIOBOOK_SCRIPT_REPETITION: ${rep.detail} (capítulo ${item.chapterNumber ?? '?'}; se regeneran solo esos bloques)`, true, { knownOutcome: true });
+    return false;
+  };
 
   // ── 2. Anti-duplicado / anti-bucle sobre el guion completo ─────────────────
-  const rep = findScriptRepetition(ordered);
-  if (rep.idxs.length) {
-    // Se descartan los bloques repetidos (salvo el primero): el reintento solo vuelve a pedir ésos.
-    const dropped: string[] = [];
-    for (const i of rep.idxs.slice(1)) { dropped.push(...(sections[String(i)]?.messageIds ?? [])); delete sections[String(i)]; }
-    const prevDiscarded: string[] = Array.isArray(os.audiobookDiscardedOps) ? os.audiobookDiscardedOps : [];
-    await record(deps, item, { audiobookSections: sections, audiobookDiscardedOps: [...prevDiscarded, ...dropped] });
-    return fail(deps, item, `AUDIOBOOK_SCRIPT_REPETITION: ${rep.detail} (capítulo ${item.chapterNumber ?? '?'}; se regeneran solo esos bloques)`, true, { knownOutcome: true });
-  }
-  if (needsLlm && !(await guard(deps, item, 'openai'))) return; // el LLM gastó: el TTS vuelve a pasar por el guard
+  if (!(await repetitionGate())) return;
+  if (needsLlm && !(await guard(deps, item, 'openai', ttsCallEstimate(model, TTS_MAX_CHARS)))) return; // el LLM gastó
 
   // ── 3. Segmentos de TTS (solo los que falten o estén inválidos) ────────────
-  const segs = audiobookSegments(ordered);
-  if (!segs.length) await fail(deps, item, `AUDIO_SCRIPT_EMPTY: ${item.itemKey} no tiene texto para narrar`, false);
-  const model = trimmed(env, 'OPENAI_TTS_MODEL') || TTS_MODEL_DEFAULT;
-  const voice = trimmed(env, 'OPENAI_TTS_VOICE') || TTS_VOICE_DEFAULT;
   const tts = new OpenAiTtsClient(openaiKey, env);
-  const parts: Buffer[] = [];
-  const manifestSegs: AudiobookManifestSegment[] = [];
   const segBase = storageBase(item, ownerId, 'dynamic_audio_segment');
-  const discarded: string[] = Array.isArray(os.audiobookDiscardedOps) ? [...os.audiobookDiscardedOps] : [];
   let reused = 0;
-  for (let k = 0; k < segs.length; k++) {
-    const seg = segs[k];
-    const prev = segState[seg.key];
-    if (prev && prev.textSha === seg.textSha && typeof prev.storagePath === 'string') {
-      if (!deps.artifacts.downloadStorageObject) throw new Error('dynamic-provider-worker: artifacts sin downloadStorageObject (modo real)');
-      let buf: Buffer;
+  type Synth = { segs: ReturnType<typeof audiobookSegments>; parts: Buffer[]; manifestSegs: AudiobookManifestSegment[] };
+  /** Sintetiza (o reutiliza) todos los segmentos del guion actual. null = el item ya quedó devuelto/fallado. */
+  const synthesize = async (): Promise<Synth | null> => {
+    const segs = audiobookSegments(blockTexts());
+    if (!segs.length) await fail(deps, item, `AUDIO_SCRIPT_EMPTY: ${item.itemKey} no tiene texto para narrar`, false);
+    const parts: Buffer[] = [];
+    const manifestSegs: AudiobookManifestSegment[] = [];
+    for (let k = 0; k < segs.length; k++) {
+      const seg = segs[k];
+      const prev = segState[seg.key];
+      if (prev && prev.textSha === seg.textSha && typeof prev.storagePath === 'string') {
+        if (!deps.artifacts.downloadStorageObject) throw new Error('dynamic-provider-worker: artifacts sin downloadStorageObject (modo real)');
+        let buf: Buffer;
+        try {
+          buf = await deps.artifacts.downloadStorageObject(ARTIFACTS_BUCKET, prev.storagePath);
+        } catch (err) {
+          // Sin gasto: el segmento pagado sigue en el Storage; se reintenta la descarga (nunca se repaga).
+          await fail(deps, item, `audio_segment_unavailable: ${seg.key} (${err instanceof Error ? err.message : String(err)}); se reintenta sin volver a sintetizar`, true);
+          return null;
+        }
+        let info: ReturnType<typeof mp3FrameInfo> | null = null;
+        try { info = mp3FrameInfo(buf); } catch { info = null; }
+        if (info && sha256(buf) === prev.audioSha && info.frames === prev.frames) {
+          parts.push(buf);
+          manifestSegs.push({ key: seg.key, sectionIdx: seg.sectionIdx, partIdx: seg.partIdx, words: seg.words, chars: seg.chars, textSha: seg.textSha,
+            audioSha: prev.audioSha, frames: prev.frames, seconds: prev.seconds, bitrateKbps: prev.bitrateKbps, requestId: prev.requestId, storagePath: prev.storagePath });
+          reused++;
+          continue;
+        }
+        // Guardado pero corrupto (sha o frames distintos): es INVÁLIDO → se regenera solo este segmento. Su operación
+        // pagada queda anotada como descartada a sabiendas (resultado conocido): nunca bloquea un intento posterior.
+        deps.logger.warn(`Item ${item.itemKey}: el segmento ${seg.key} guardado no coincide con su manifiesto — se vuelve a sintetizar`);
+        delete segState[seg.key];
+        if (prev.requestId) discarded.push(prev.requestId);
+        await record(deps, item, { audioSegments: segState, audiobookDiscardedOps: [...discarded] });
+      }
+      // R16 (#1): entre segmentos no hay gasto en el aire (los anteriores ya están guardados).
+      if (await handBackIfDraining(deps, item, `antes del segmento ${k + 1}/${segs.length} del audio (los anteriores ya están guardados)`)) return null;
+      await heartbeat(deps, item);
+      // Fix round 1 (I5): el guard reserva el costo de ESTE segmento (no el p90 del capítulo entero).
+      if (!(await guard(deps, item, 'openai', ttsCallEstimate(model, seg.chars)))) return null;
+      // Calibración #2: reserva DURABLE del segmento antes de llamar (si falla, no se llama a OpenAI).
+      const resKey = await reservePaidCall(deps.finops, {
+        kind: 'tts', ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1, itemAttempt: item.attempt,
+        tag: `seg:${seg.key}`, estimate: { characters: seg.chars, model },
+      });
+      if (tracker) tracker.inFlight = { provider: 'openai', key: resKey };
+      let res;
       try {
-        buf = await deps.artifacts.downloadStorageObject(ARTIFACTS_BUCKET, prev.storagePath);
+        res = await tts.speech({ model, voice, input: seg.text });
       } catch (err) {
-        // Sin gasto: el segmento pagado sigue en el Storage; se reintenta la descarga (nunca se repaga).
-        return fail(deps, item, `audio_segment_unavailable: ${seg.key} (${err instanceof Error ? err.message : String(err)}); se reintenta sin volver a sintetizar`, true);
+        const e = err instanceof ProviderCallError ? err : null;
+        if (isDefinitiveRejection(err)) {
+          await settlePaidCall(deps.finops, resKey, null, 'openai_tts_rejected_definitively');
+          if (tracker) tracker.inFlight = null;
+        }
+        // «persisted k»: los k segmentos anteriores ya están guardados → ningún trozo pagado sin guardar (clase A).
+        await fail(deps, item, `tts_failed: chunk ${k + 1}/${segs.length} (persisted ${k}): ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
+        return null;
       }
-      let info: ReturnType<typeof mp3FrameInfo> | null = null;
-      try { info = mp3FrameInfo(buf); } catch { info = null; }
-      if (info && sha256(buf) === prev.audioSha && info.frames === prev.frames) {
-        parts.push(buf);
-        manifestSegs.push({ key: seg.key, sectionIdx: seg.sectionIdx, partIdx: seg.partIdx, words: seg.words, chars: seg.chars, textSha: seg.textSha,
-          audioSha: prev.audioSha, frames: prev.frames, seconds: prev.seconds, bitrateKbps: prev.bitrateKbps, requestId: prev.requestId, storagePath: prev.storagePath });
-        reused++;
-        continue;
+      if (tracker && tracker.inFlight) tracker.inFlight.opId = res.requestId;
+      let rawSeconds: number | null = null;
+      try { rawSeconds = mp3DurationSeconds(res.audio); } catch { rawSeconds = null; }
+      await settlePaidCall(deps.finops, resKey, ttsChargeInput({
+        ownerId, itemRunId: item.itemRunId, requestId: res.requestId, audioSeconds: rawSeconds, characters: seg.chars,
+        model, generation: item.generation ?? 1, chunk: k, itemAttempt: item.attempt,
+      }), 'openai_tts_measured');
+      if (tracker) {
+        tracker.inFlight = null;
+        tracker.unpersistedPaidOutput = { provider: 'openai', what: `segmento ${seg.key} del audiolibro pagado sin persistir`, opIds: res.requestId ? [res.requestId] : [] };
       }
-      // Guardado pero corrupto (sha o frames distintos): es INVÁLIDO → se regenera solo este segmento. Su operación
-      // pagada queda anotada como descartada a sabiendas (resultado conocido): nunca bloquea un intento posterior.
-      deps.logger.warn(`Item ${item.itemKey}: el segmento ${seg.key} guardado no coincide con su manifiesto — se vuelve a sintetizar`);
-      delete segState[seg.key];
-      if (prev.requestId) await record(deps, item, { audioSegments: segState, audiobookDiscardedOps: [...discarded, prev.requestId] });
-      if (prev.requestId) discarded.push(prev.requestId);
+      if (rawSeconds === null) await fail(deps, item, `TTS_AUDIO_INVALID: el segmento ${k + 1}/${segs.length} (${seg.key}) de ${item.itemKey} no es un MP3 medible`, true, { knownOutcome: true });
+      // r19 A4: el audiolibro va a 48 kbps mono (transcode existente; sin ffmpeg → el original, como hoy).
+      const buf = await transcodeMp3Bitrate(res.audio, AUDIOBOOK_TARGET_BITRATE_KBPS);
+      let info: ReturnType<typeof mp3FrameInfo>;
+      try {
+        info = mp3FrameInfo(buf);
+      } catch (err) {
+        await fail(deps, item, `TTS_AUDIO_INVALID: el segmento ${seg.key} no es un MP3 válido tras el transcode (${err instanceof Error ? err.message : String(err)})`, true, { knownOutcome: true });
+        return null;
+      }
+      const wpm = wpmOf(seg.words, info.seconds);
+      if (seg.words >= AUDIOBOOK_WPM_MIN_WORDS && (wpm < AUDIOBOOK_WPM_MIN || wpm > AUDIOBOOK_WPM_MAX)) {
+        // Voz ralentizada, relleno o bucle: el segmento NO se guarda como válido → el reintento lo regenera.
+        await fail(deps, item, `AUDIO_WPM_OUT_OF_RANGE: el segmento ${seg.key} narra ${seg.words} palabras en ${info.seconds.toFixed(2)} s (${wpm} ppm; aceptado ${AUDIOBOOK_WPM_MIN}–${AUDIOBOOK_WPM_MAX})`, true, { knownOutcome: true });
+        return null;
+      }
+      const audioSha = sha256(buf);
+      const dup = Object.entries(segState).find(([key, g]) => key !== seg.key && g.audioSha === audioSha);
+      if (dup) {
+        await fail(deps, item, `AUDIOBOOK_SEGMENT_DUPLICATE: el audio del segmento ${seg.key} es idéntico al de ${dup[0]}`, true, { knownOutcome: true });
+        return null;
+      }
+      if (!deps.artifacts.putStorageObject) throw new Error('dynamic-provider-worker: artifacts sin putStorageObject (modo real)');
+      // Ruta por intento: nunca choca con un objeto de un intento anterior del mismo segmento.
+      const storagePath = `${segBase}/${seg.key}.a${item.attempt}.mp3`;
+      await deps.artifacts.putStorageObject({ storagePath, buffer: buf, mimeType: 'audio/mpeg', upsert: false });
+      segState[seg.key] = {
+        sectionIdx: seg.sectionIdx, partIdx: seg.partIdx, textSha: seg.textSha, audioSha, frames: info.frames, seconds: info.seconds,
+        bitrateKbps: info.bitrateKbps, requestId: res.requestId, storagePath, bytes: buf.length, words: seg.words, chars: seg.chars,
+      };
+      await record(deps, item, { audioSegments: segState });
+      if (tracker) tracker.unpersistedPaidOutput = null;
+      parts.push(buf);
+      manifestSegs.push({ key: seg.key, sectionIdx: seg.sectionIdx, partIdx: seg.partIdx, words: seg.words, chars: seg.chars, textSha: seg.textSha,
+        audioSha, frames: info.frames, seconds: info.seconds, bitrateKbps: info.bitrateKbps, requestId: res.requestId, storagePath });
     }
-    // R16 (#1): entre segmentos no hay gasto en el aire (los anteriores ya están guardados).
-    if (await handBackIfDraining(deps, item, `antes del segmento ${k + 1}/${segs.length} del audio (los anteriores ya están guardados)`)) return;
-    await heartbeat(deps, item);
-    // Calibración #2: reserva DURABLE del segmento antes de llamar (si falla, no se llama a OpenAI).
-    const resKey = await reservePaidCall(deps.finops, {
-      kind: 'tts', ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1, itemAttempt: item.attempt,
-      tag: `seg:${seg.key}`, estimate: { characters: seg.chars, model },
-    });
-    if (tracker) tracker.inFlight = { provider: 'openai', key: resKey };
-    let res;
+    return { segs, parts, manifestSegs };
+  };
+  const concat = async (parts: Buffer[]): Promise<{ mp3: Buffer; audio: ReturnType<typeof mp3FrameInfo> } | null> => {
     try {
-      res = await tts.speech({ model, voice, input: seg.text });
+      // UX r18: concatMp3 escribe el frame Info con el conteo REAL de frames (solo aquí; el transcode genérico no).
+      const mp3 = concatMp3(parts);
+      return { mp3, audio: mp3FrameInfo(mp3) };
     } catch (err) {
-      const e = err instanceof ProviderCallError ? err : null;
-      if (isDefinitiveRejection(err)) {
-        await settlePaidCall(deps.finops, resKey, null, 'openai_tts_rejected_definitively');
-        if (tracker) tracker.inFlight = null;
-      }
-      // «persisted k»: los k segmentos anteriores ya están guardados → ningún trozo pagado sin guardar (clase A).
-      return fail(deps, item, `tts_failed: chunk ${k + 1}/${segs.length} (persisted ${k}): ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
+      await fail(deps, item, `TTS_AUDIO_INVALID: ${err instanceof Error ? err.message : String(err)}`, true, { knownOutcome: true });
+      return null;
     }
-    if (tracker && tracker.inFlight) tracker.inFlight.opId = res.requestId;
-    let rawSeconds: number | null = null;
-    try { rawSeconds = mp3DurationSeconds(res.audio); } catch { rawSeconds = null; }
-    await settlePaidCall(deps.finops, resKey, ttsChargeInput({
-      ownerId, itemRunId: item.itemRunId, requestId: res.requestId, audioSeconds: rawSeconds, characters: seg.chars,
-      model, generation: item.generation ?? 1, chunk: k, itemAttempt: item.attempt,
-    }), 'openai_tts_measured');
-    if (tracker) {
-      tracker.inFlight = null;
-      tracker.unpersistedPaidOutput = { provider: 'openai', what: `segmento ${seg.key} del audiolibro pagado sin persistir`, opIds: res.requestId ? [res.requestId] : [] };
-    }
-    if (rawSeconds === null) await fail(deps, item, `TTS_AUDIO_INVALID: el segmento ${k + 1}/${segs.length} (${seg.key}) de ${item.itemKey} no es un MP3 medible`, true, { knownOutcome: true });
-    // r19 A4: el audiolibro va a 48 kbps mono (transcode existente; sin ffmpeg → el original, como hoy).
-    const buf = await transcodeMp3Bitrate(res.audio, AUDIOBOOK_TARGET_BITRATE_KBPS);
-    let info: ReturnType<typeof mp3FrameInfo>;
-    try {
-      info = mp3FrameInfo(buf);
-    } catch (err) {
-      return fail(deps, item, `TTS_AUDIO_INVALID: el segmento ${seg.key} no es un MP3 válido tras el transcode (${err instanceof Error ? err.message : String(err)})`, true, { knownOutcome: true });
-    }
-    const wpm = wpmOf(seg.words, info.seconds);
-    if (seg.words >= AUDIOBOOK_WPM_MIN_WORDS && (wpm < AUDIOBOOK_WPM_MIN || wpm > AUDIOBOOK_WPM_MAX)) {
-      // Voz ralentizada, relleno o bucle: el segmento NO se guarda como válido → el reintento lo regenera.
-      return fail(deps, item, `AUDIO_WPM_OUT_OF_RANGE: el segmento ${seg.key} narra ${seg.words} palabras en ${info.seconds.toFixed(2)} s (${wpm} ppm; aceptado ${AUDIOBOOK_WPM_MIN}–${AUDIOBOOK_WPM_MAX})`, true, { knownOutcome: true });
-    }
-    const audioSha = sha256(buf);
-    const dup = Object.entries(segState).find(([key, g]) => key !== seg.key && g.audioSha === audioSha);
-    if (dup) {
-      return fail(deps, item, `AUDIOBOOK_SEGMENT_DUPLICATE: el audio del segmento ${seg.key} es idéntico al de ${dup[0]}`, true, { knownOutcome: true });
-    }
-    if (!deps.artifacts.putStorageObject) throw new Error('dynamic-provider-worker: artifacts sin putStorageObject (modo real)');
-    // Ruta por intento: nunca choca con un objeto de un intento anterior del mismo segmento.
-    const storagePath = `${segBase}/${seg.key}.a${item.attempt}.mp3`;
-    await deps.artifacts.putStorageObject({ storagePath, buffer: buf, mimeType: 'audio/mpeg', upsert: false });
-    segState[seg.key] = {
-      sectionIdx: seg.sectionIdx, partIdx: seg.partIdx, textSha: seg.textSha, audioSha, frames: info.frames, seconds: info.seconds,
-      bitrateKbps: info.bitrateKbps, requestId: res.requestId, storagePath, bytes: buf.length, words: seg.words, chars: seg.chars,
-    };
-    await record(deps, item, { audioSegments: segState });
-    if (tracker) tracker.unpersistedPaidOutput = null;
-    parts.push(buf);
-    manifestSegs.push({ key: seg.key, sectionIdx: seg.sectionIdx, partIdx: seg.partIdx, words: seg.words, chars: seg.chars, textSha: seg.textSha,
-      audioSha, frames: info.frames, seconds: info.seconds, bitrateKbps: info.bitrateKbps, requestId: res.requestId, storagePath });
-  }
+  };
+  const blockWords = (idx: number) => {
+    const sc = sections[String(idx)];
+    const ext = (extensions[String(idx)] ?? []).filter((e) => e.sourceSha === sc.sourceSha);
+    return sc.words + ext.reduce((a, e) => a + e.words, 0);
+  };
 
-  // ── 4. Concatenación + manifiesto validado ANTES de completar ──────────────
-  let mp3: Buffer;
-  let audio: ReturnType<typeof mp3FrameInfo>;
-  try {
-    // UX r18: concatMp3 escribe el frame Info con el conteo REAL de frames (solo aquí; el transcode genérico no).
-    mp3 = concatMp3(parts);
-    audio = mp3FrameInfo(mp3);
-  } catch (err) {
-    return fail(deps, item, `TTS_AUDIO_INVALID: ${err instanceof Error ? err.message : String(err)}`, true, { knownOutcome: true });
+  let synth = await synthesize();
+  if (!synth) return;
+  let built = await concat(synth.parts);
+  if (!built) return;
+
+  // ── 4. Duración objetivo del capítulo (fix round 1, I1) ────────────────────
+  // T_ch = 0,85 × palabras de fuente × 60 / 141 s. Con Σ fuente ≥ umbral, Σ T_ch ≥ 1500 s: el piso del curso
+  // queda garantizado por construcción. Si el capítulo quedó corto (voz rápida o guion condensado), UNA pasada
+  // por intento amplía desde su propia fuente los bloques de menor ratio (tope 110 %, +25 % por pasada).
+  const target = chapterTargetSeconds(p.narratableWords);
+  if (built.audio.seconds + 1e-6 < target) {
+    const sentWords = synth.manifestSegs.reduce((a, x) => a + x.words, 0);
+    const wpm = Math.max(1, sentWords / (built.audio.seconds / 60));
+    const deficitWords = Math.ceil(((target - built.audio.seconds) * wpm) / 60 * 1.02);
+    const picks = planChapterExtension(p.sections.map((x) => ({ idx: x.idx, sourceWords: x.words, scriptWords: blockWords(x.idx) })), deficitWords);
+    if (!picks.length) {
+      return fail(deps, item, `AUDIOBOOK_CHAPTER_UNDER_TARGET: el capítulo ${item.chapterNumber ?? '?'} dura ${built.audio.seconds.toFixed(0)} s (< ${target.toFixed(0)} s = 0,85 × ${p.narratableWords} palabras a ${AUDIOBOOK_WPM_REF} ppm) y ningún bloque tiene margen bajo el 110 % de su fuente; no se completa`, true, { knownOutcome: true });
+    }
+    if (!anthropicKey) await fail(deps, item, notReady(item, ['ANTHROPIC_API_KEY']), false);
+    for (const pick of picks) {
+      const x = p.sections.find((s) => s.idx === pick.idx) as PersistedAudiobookPlan['sections'][number];
+      const src = srcBySha.get(x.sha256);
+      if (!src) continue; // el Markdown cambió: el bloque no se amplía (sin gasto)
+      const k = String(x.idx);
+      const maxWords = Math.floor(AUDIOBOOK_MAX_RATIO * x.words) - blockWords(x.idx);
+      const existing = [sections[k].text, ...(extensions[k] ?? []).map((e) => e.text)].join(' ');
+      let ext;
+      try {
+        ext = await generateSectionExtension(input, src, existing, pick.words, maxWords,
+          llmFor(`ext${x.idx}-${(extensions[k] ?? []).length}`, `ampliación del bloque ${x.idx + 1} del audiolibro pagada sin persistir`, []));
+      } catch (err) {
+        await scriptFailure(err, `ampliación del bloque ${x.idx + 1}`);
+        return;
+      }
+      if (ext.words > 0) {
+        extensions[k] = [...(extensions[k] ?? []), { sourceSha: x.sha256, text: ext.text, words: ext.words, messageIds: ext.messageIds }];
+      } else {
+        discarded.push(...ext.messageIds); // ampliación vacía (cortada sin oración completa): pagada y descartada a sabiendas
+      }
+      await record(deps, item, { audiobookExtensions: extensions, audiobookDiscardedOps: [...discarded] });
+      if (tracker) tracker.unpersistedPaidOutput = null;
+    }
+    if (!(await repetitionGate())) return;
+    synth = await synthesize();
+    if (!synth) return;
+    built = await concat(synth.parts);
+    if (!built) return;
+    if (built.audio.seconds + 1e-6 < target) {
+      return fail(deps, item, `AUDIOBOOK_CHAPTER_UNDER_TARGET: el capítulo ${item.chapterNumber ?? '?'} dura ${built.audio.seconds.toFixed(0)} s tras ampliar ${picks.length} bloque(s) desde su fuente (objetivo ${target.toFixed(0)} s); el reintento amplía lo que quede bajo el 110 %. No se completa`, true, { knownOutcome: true });
+    }
   }
+  const { segs, parts, manifestSegs } = synth;
+  const { mp3, audio } = built;
+
+  // ── 5. Manifiesto validado ANTES de completar ──────────────────────────────
   const scriptSections = p.sections.map((x) => {
     const sc = sections[String(x.idx)];
-    return { idx: x.idx, title: x.title, sourceWords: x.words, sourceSha: x.sha256, scriptWords: sc.words, ratio: sc.ratio, continued: sc.continued, messageIds: sc.messageIds };
+    const ext = (extensions[String(x.idx)] ?? []).filter((e) => e.sourceSha === x.sha256);
+    const words = blockWords(x.idx);
+    return {
+      idx: x.idx, title: x.title, sourceWords: x.words, sourceSha: x.sha256, scriptWords: words,
+      ratio: Math.round((words / Math.max(1, x.words)) * 1000) / 1000, continued: sc.continued || ext.length > 0,
+      messageIds: [...sc.messageIds, ...ext.flatMap((e) => e.messageIds)],
+    };
   });
   const scriptWords = scriptSections.reduce((a, x) => a + x.scriptWords, 0);
   const wordsSent = manifestSegs.reduce((a, x) => a + x.words, 0);
   const manifest: AudiobookChapterManifest = {
     v: AUDIOBOOK_MANIFEST_VERSION,
     chapterId: item.chapterId as string,
-    source: { words: p.sourceWords, narratableWords: p.narratableWords, sections: p.sections.length, sha256: p.sha256, excluded: p.excluded },
+    source: {
+      words: p.sourceWords, narratableWords: p.narratableWords, sections: p.sections.length, sha256: p.sha256, excluded: p.excluded,
+      rawWords: p.rawWords ?? null, lostWords: p.lostWords ?? null,
+    },
     script: { words: scriptWords, ratio: Math.round((scriptWords / Math.max(1, p.narratableWords)) * 1000) / 1000, sections: scriptSections },
     tts: {
       wordsSent,
@@ -1106,6 +1248,7 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
       infoFrameSeconds: audio.infoFrames === null ? null : (audio.infoFrames * audio.samples) / audio.sampleRate,
       bitrateKbps: audio.bitrateKbps,
       wpm: wpmOf(wordsSent, audio.seconds),
+      targetSeconds: target,
     },
   };
   const problems = validateChapterAudioManifest(manifest);
@@ -1115,7 +1258,7 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
   if (audio.bitrateKbps !== AUDIOBOOK_TARGET_BITRATE_KBPS) {
     deps.logger.warn(`Item ${item.itemKey}: el audiolibro quedó a ${audio.bitrateKbps ?? 'VBR'} kbps (esperado ${AUDIOBOOK_TARGET_BITRATE_KBPS}; ¿ffmpeg ausente en el worker?)`);
   }
-  const fullScript = ordered.map((x) => x.text).join('\n\n');
+  const fullScript = blockTexts().map(narrated).join('\n\n');
   const messageIds = scriptSections.flatMap((x) => x.messageIds);
   if (!deps.artifacts.uploadBufferArtifact) throw new Error('dynamic-provider-worker: artifacts sin uploadBufferArtifact (modo real)');
   const entity = item.chapterId ?? 'course';
@@ -1140,6 +1283,7 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
     summary: {
       mode: 'real', provider: 'openai', model, voice, durationSeconds: audio.seconds, chunks: segs.length, scriptSha256: sha256(fullScript),
       words: scriptWords, messageIds, scriptModel, reusedSegments: reused, audiobookManifest: manifest,
+      ...(audio.bitrateKbps !== AUDIOBOOK_TARGET_BITRATE_KBPS ? { bitrateWarning: `audiolibro a ${audio.bitrateKbps ?? 'VBR'} kbps (esperado ${AUDIOBOOK_TARGET_BITRATE_KBPS})` } : {}),
     },
   });
   if (!ok) deps.logger.warn(`Item ${item.itemKey}: audiolibro subido (artifact ${row.id}) pero completeItem devolvió false (lease perdida)`);
