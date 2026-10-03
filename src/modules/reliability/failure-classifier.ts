@@ -290,7 +290,9 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   // N6 (restricción de diseño para R3): un veredicto de auth/crédito/proveedor de Anthropic REPORTADO por el navegador
   // (mensajes del proxy, `Sin disponibilidad…`, errorCode llm_auth_rejected/llm_credit_exhausted) nunca puede abrir un
   // breaker GLOBAL de `anthropic`: solo uno por dueño, salvo corroboración del proxy/gateway del servidor.
-  { id: 'llm_transient', codes: ['browser_llm_transient', 'llm_transient', 'llm_empty_response', 'llm_network'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'anthropic', rounds: 3 },
+  // cursia#68 (SSE): `llm_stream_cut` = el stream de la IA se cortó / dejó de responder / quedó incompleto. Transitorio
+  // (A, reintento); el gasto ya queda en el ledger con el cargo conservador del proxy (paidRisk measured, sin más riesgo).
+  { id: 'llm_transient', codes: ['browser_llm_transient', 'llm_transient', 'llm_empty_response', 'llm_network', 'llm_stream_cut'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'anthropic', rounds: 3 },
   {
     id: 'llm_config',
     codes: ['llm_credit_exhausted', 'llm_auth_rejected', 'proxy_misconfigured', 'llm_model_config', 'llm_model_not_allowed', 'llm_api_key_missing', 'llm_model_missing'],
@@ -560,6 +562,9 @@ const PHRASES: ReadonlyArray<[RegExp, string]> = [
   [/^Petici[oó]n demasiado grande\b/i, 'llm_request_too_large'],
   [/^Servidor ocupado\b|^Error del servidor\b|^Error de red\b/i, 'llm_transient'],
   [/^Respuesta vac[ií]a\b/i, 'llm_empty_response'],
+  // cursia#68 (streaming SSE de api()): cortes del stream → transitorio de la IA.
+  [/^La respuesta de la IA se cort[oó](?![a-z])|^Se cort[oó] la conexi[oó]n con la IA\b|^La IA dej[oó] de responder\b|^Respuesta de la IA incompleta\b/i, 'llm_stream_cut'],
+  [/^Respuesta ilegible de la API\b/i, 'llm_empty_response'],
   [/^Generaci[oó]n detenida por el usuario\b/i, 'user_stopped'],
   [/^(fetch failed|network error|socket hang up|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN)\b/i, 'llm_network'],
 ];

@@ -583,15 +583,22 @@ function scanFrontendExecutor(file) {
   return out;
 }
 
-/** api() del navegador (04-api.js): mensajes `msg: '…'` que el ejecutor reenvía como error del item. */
+/**
+ * api() del navegador (04-api.js): mensajes `msg: …` que el ejecutor reenvía como error del item. Un literal da su
+ * texto (escapes \\uXXXX → texto real); cualquier otra expresión (cursia#68: ternarios del stream SSE) sale como
+ * `__expr__ …` y el check la exige en su lista revisada (FE_API_EXPR_SAMPLES) o falla.
+ */
 function scanFrontendApi(file) {
   const src = stripComments(fs.readFileSync(file, 'utf8'));
   const out = [];
-  const re = /\bmsg\s*:\s*(['"])((?:\\.|(?!\1)[^\\])*)\1/g;
+  const re = /\bmsg\s*:\s*/g;
   let m;
   while ((m = re.exec(src))) {
-    // Escapes \uXXXX del archivo → texto real (el mensaje que ve el clasificador).
-    const text = m[2].replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+    const value = readValue(src, m.index + m[0].length);
+    const lead = literalLead(value);
+    const text = lead !== null
+      ? lead.replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+      : `__expr__ ${value.replace(/\s+/g, ' ').slice(0, 240)}`;
     out.push({ line: lineOf(src, m.index), text });
   }
   return out;
