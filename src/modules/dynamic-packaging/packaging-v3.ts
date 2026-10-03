@@ -706,6 +706,10 @@ export async function loadContentsV3(
   const videoInteractions = new Map<string, unknown>();
   const activities = new Map<string, ActivityContentV3>();
   const audiobookChapters = new Map<string, Buffer>();
+  // r19: manifiesto validado por capítulo (output_summary del item) para el piso de 25 min del audiolibro.
+  // null = audio real SIN manifiesto (curso existente, anterior a r19): el piso se omite con aviso y el
+  // re-empaque NUNCA re-narra ni llama a un proveedor. Los capítulos simulados no entran al mapa.
+  const audiobookManifests = new Map<string, any>();
   for (const m of plan.modules) {
     moduleIntros.set(m.moduleId, moduleIntroSlots.get(m.moduleId));
     if (m.keys.exam) {
@@ -733,6 +737,10 @@ export async function loadContentsV3(
         }
       }
       audiobookChapters.set(ch.chapterId, slot.audio as Buffer);
+      if (!mockProviderItems.includes(ch.keys.audiobookChapter)) {
+        const man = byItem.get(ch.keys.audiobookChapter)?.outputSummary?.audiobookManifest;
+        audiobookManifests.set(ch.chapterId, man && typeof man === 'object' ? man : null);
+      }
     }
   }
   // EV6 P2: un banco se re-valida con el Markdown de sus capítulos (evidencia) antes de empaquetar; falla fuerte.
@@ -771,6 +779,7 @@ export async function loadContentsV3(
       ...(finalSrc && finalSrc.kind === 'bank' ? { finalExamBank: finalSrc.bank } : {}),
       audioWelcome: audioWelcome as Buffer,
       audiobookChapters,
+      audiobookManifests,
     },
     exams: { modules: examSources, final: finalSrc },
     warnings,

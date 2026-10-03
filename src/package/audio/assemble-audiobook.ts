@@ -15,6 +15,7 @@
 import { concatMp3 } from './mp3-concat';
 import { mp3DurationSeconds } from './mp3-parser';
 import { AudiobookPartMissingError, Mp3InvalidError } from './mp3-errors';
+import { CourseFloorChapter, CourseFloorResult, checkAudiobookCourseFloor } from './audiobook-policy';
 
 export interface AudiobookChapterInput {
   chapterId: string;
@@ -32,9 +33,20 @@ export interface AssembledAudiobook {
   buffer: Buffer;
   durationSeconds: number;
   parts: AudiobookPart[];
+  /** r19: resultado del piso de 25 min (solo si el caller pasó `manifests`). */
+  floor?: CourseFloorResult;
 }
 
-export function assembleAudiobook(chapters: AudiobookChapterInput[]): AssembledAudiobook {
+export interface AssembleAudiobookOptions {
+  /**
+   * r19: chapterId → manifiesto del capítulo (`audiobookManifest` del item) o null si el audio no
+   * lo tiene (curso existente). Con el mapa, se aplica el piso de 25 min (checkAudiobookCourseFloor);
+   * null → el piso se omite con aviso; ausente del mapa (simulado) → se omite sin aviso. Nunca se re-narra.
+   */
+  manifests?: Map<string, CourseFloorChapter['manifest']> | null;
+}
+
+export function assembleAudiobook(chapters: AudiobookChapterInput[], opts: AssembleAudiobookOptions = {}): AssembledAudiobook {
   if (!Array.isArray(chapters) || chapters.length === 0) {
     throw new AudiobookPartMissingError([]);
   }
@@ -65,5 +77,11 @@ export function assembleAudiobook(chapters: AudiobookChapterInput[]): AssembledA
 
   const durationSeconds = durations.reduce((sum, d) => sum + d, 0);
 
+  if (opts.manifests) {
+    const m = opts.manifests;
+    // Ausente del mapa = simulado (undefined, sin aviso); presente en null = audio existente sin manifiesto (aviso).
+    const floor = checkAudiobookCourseFloor(ordered.map((c, i) => ({ chapterId: c.chapterId, durationSeconds: durations[i], manifest: m.has(c.chapterId) ? m.get(c.chapterId) ?? null : undefined })));
+    return { buffer, durationSeconds, parts, floor };
+  }
   return { buffer, durationSeconds, parts };
 }
