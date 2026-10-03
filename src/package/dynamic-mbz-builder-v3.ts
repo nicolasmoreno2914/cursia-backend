@@ -54,7 +54,7 @@ import {
 import type { AssessmentCategoryKey, CompletionCandidate } from './assessment/resolve-assessment';
 import {
   CURSIA_H5P_PROFILE_V1,
-  CURSIA_H5P_PROFILE_V2,
+  CURSIA_H5P_PROFILE_V3,
   H5P_MOODLE_GRADING,
   H5P_PACKAGE_MIMETYPE,
   H5pBuiltContent,
@@ -217,6 +217,10 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * de avisos va al final (ids de la sección 0 renumerados); `<audio preload="metadata">`; el audiolibro
  * concatenado lleva un frame Info con el conteo real de frames; portada a 1600 px (antes 640, PNG con filtro
  * adaptativo); sin botón «Iniciar actividad» cuando la actividad H5P va embebida debajo (SCORM lo conserva).
+ * 3.12.0 (UX #5, r18): la actividad QuestionSet usa H5P.QuestionSet 1.21 (CURSIA_H5P_PROFILE_V3) con su librería
+ * incluida en el .h5p (delta H5P.QuestionSet-1.21) y los rótulos «Siguiente» / «Anterior» de su navegación: en 1.20
+ * el botón «Pregunta siguiente/anterior» salía como un CTA azul vacío junto a «Comprobar». Un paquete con QuestionSet
+ * pide restaurar como administrador o gestor (summary.restore), igual que BS / «Repaso».
  */
 export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.12.0';
 
@@ -605,7 +609,21 @@ async function buildActivityH5p(
     // R11a ruling 3: la nota interna del QuestionSet es la del perfil VIGENTE, nunca la del LLM/executor.
     input.passPercentage = passingGrade;
     validateQuestionSetInput(input);
-    built = buildQuestionSet(input);
+    // UX #5 (r18): QuestionSet 1.21 (CURSIA_H5P_PROFILE_V3) — su navegación «Siguiente ›» / «Anterior»
+    // es compatible con el tema de H5P.Question 1.5 (en 1.20 era un botón azul vacío). Lleva su delta
+    // (H5P.QuestionSet-1.21) dentro del .h5p, como BS y DC: un sitio con el pack v1 la instala al
+    // restaurar como administrador o gestor (o con el pack v3 instalado, cualquier docente).
+    const qs = buildQuestionSet(input, { profile: CURSIA_H5P_PROFILE_V3 });
+    assertH5pGradableInMoodle(qs.mainLibrary);
+    const h5p = await buildBundledH5p({
+      mainLibrary: qs.mainLibrary,
+      content: qs.content,
+      title: qs.title,
+      language: 'es',
+      profile: CURSIA_H5P_PROFILE_V3,
+      libraryStore: libraryStore(),
+    });
+    return { h5p, mainLibrary: qs.mainLibrary };
   } else if (p.type === 'dragtext') {
     delete input.passPercentage;
     validateDragTextInput(input);
@@ -628,7 +646,7 @@ async function buildActivityH5p(
       content: bs.content,
       title: bs.title,
       language: 'es',
-      profile: CURSIA_H5P_PROFILE_V2,
+      profile: CURSIA_H5P_PROFILE_V3,
       libraryStore: libraryStore(),
       // #583 (I4): imágenes de los finales (óptimo verde / aceptable ámbar / malo rojo).
       ...(bs.contentFiles ? { contentFiles: bs.contentFiles } : {}),
@@ -976,9 +994,10 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     labelsHtml.push({ where: `${idnumber}#intro`, html: introHtml });
     h5pPackages.push({ itemKey, filename, mainLibrary, sha1: sha1Buf(h5p), bytes: h5p.length });
   };
-  // EV6 H5P v2: store de librerías (perfil v2) abierto solo si el paquete lleva BS o «Repaso».
+  // EV6 H5P v2: store de librerías abierto solo si el paquete lleva librerías incluidas (BS, «Repaso»,
+  // y desde UX #5 QuestionSet 1.21). Perfil v3 (sus carpetas de BS/DC son las mismas de v2, mismos bytes).
   let storeMemo: H5pLibrarySource | null = null;
-  const libraryStore = (): H5pLibrarySource => (storeMemo ??= openH5pLibraryStore(CURSIA_H5P_PROFILE_V2));
+  const libraryStore = (): H5pLibrarySource => (storeMemo ??= openH5pLibraryStore(CURSIA_H5P_PROFILE_V3));
 
   const questionCategories: string[] = [];
   const examBankPlans: ExamBankPlans = {};
@@ -1202,7 +1221,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
             content: deck.content,
             title: deck.title,
             language: 'es',
-            profile: CURSIA_H5P_PROFILE_V2,
+            profile: CURSIA_H5P_PROFILE_V3,
             libraryStore: libraryStore(),
           });
           const name = safeActivityName(`Repaso · Capítulo ${ch.chapterNumber}: ${ch.title}`);
@@ -1535,7 +1554,11 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       themeSha256: themeSha256(theme),
       themeFamily: theme.familyId,
       themeMode: theme.mode,
-      h5pProfileVersion,
+      // UX #5 fix round 1 (M-8): versión REAL del perfil de los .h5p del paquete — 3 si alguno trae librerías
+      // incluidas (QuestionSet 1.21, BS o «Repaso», todos armados con CURSIA_H5P_PROFILE_V3); 1 si todos son
+      // solo-contenido de v1 (o no hay H5P). No entra en el .mbz ni en la clave de reuse (esa sigue usando
+      // `h5pProfileVersion`, la versión de derivación de subContentId; builderVersion ya invalida el reuse).
+      h5pProfileVersion: summaryH5pProfileVersion(h5pPackages),
       vcRendererVersion: VC_RENDERER_VERSION,
       h5pPackages,
       mockPresentationChapters,
@@ -1545,9 +1568,9 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       warnings,
       counts: facts.counts,
       assessment: assessmentPackageSummary(resolved),
-      // EV6 H5P v2: con paquetes que traen sus librerías (Branching Scenario / «Repaso») la entrega
-      // pide restaurar como administrador o gestor (rulings Q1). Ausente en los paquetes de siempre.
-      ...(h5pPackages.some((p) => p.mainLibrary in (CURSIA_H5P_PROFILE_V2.deltaByMain ?? {})) ? { restore: H5P_V2_RESTORE_NOTE } : {}),
+      // EV6 H5P v2: con paquetes que traen sus librerías (Branching Scenario / «Repaso» / desde UX #5
+      // QuestionSet 1.21) la entrega pide restaurar como administrador o gestor (rulings Q1).
+      ...(h5pPackages.some((p) => p.mainLibrary in (CURSIA_H5P_PROFILE_V3.deltaByMain ?? {})) ? { restore: H5P_BUNDLED_RESTORE_NOTE } : {}),
     },
   };
 }
@@ -1561,15 +1584,27 @@ export function reviewCardsApply(blueprint: BlueprintSnapshotV2, manifest: Gener
 }
 
 /**
- * EV6 H5P v2 — instrucción de entrega (rulings Q1) para paquetes con librerías H5P incluidas. El
+ * EV6 H5P v2 — instrucción de entrega (rulings Q1) para paquetes con librerías H5P incluidas (perfil v3:
+ * BS, «Repaso» y, desde UX #5, QuestionSet 1.21). El
  * frontend la muestra en «Cómo restaurarlo en Moodle» (summary.restore del paquete).
  */
-export const H5P_V2_RESTORE_NOTE = Object.freeze({
+export const H5P_BUNDLED_RESTORE_NOTE = Object.freeze({
   as: 'admin_or_manager' as const,
   note:
-    'Restaura este curso como administrador o gestor: así Moodle instala solo los tipos de contenido nuevos (caso ramificado y tarjetas de repaso). ' +
-    'Si lo restaura un docente en un sitio que aún no los tiene, un administrador debe subir antes el Cursia H5P Library Pack v2.',
+    'Restaura este curso como administrador o gestor: así Moodle instala solo los tipos de contenido H5P que el sitio todavía no tiene. ' +
+    'Si lo restaura un docente en un sitio que aún no los tiene, un administrador debe subir antes el Cursia H5P Library Pack v3.',
 });
+
+/** @deprecated UX #5 fix round 1 (M-2): nombre histórico (EV6 H5P v2); usar H5P_BUNDLED_RESTORE_NOTE. */
+export const H5P_V2_RESTORE_NOTE = H5P_BUNDLED_RESTORE_NOTE;
+
+/**
+ * UX #5 fix round 1 (M-8): perfil H5P real de un paquete v3 para `summary.h5pProfileVersion`: el del perfil v3
+ * si algún .h5p lleva librerías incluidas (todos salen de CURSIA_H5P_PROFILE_V3), si no el de v1.
+ */
+export function summaryH5pProfileVersion(pkgs: ReadonlyArray<{ mainLibrary: string }>): number {
+  return pkgs.some((p) => p.mainLibrary in (CURSIA_H5P_PROFILE_V3.deltaByMain ?? {})) ? CURSIA_H5P_PROFILE_V3.version : h5pProfileVersion;
+}
 
 /** Librerías del perfil (para el validador): "Machine major.minor". */
 export function h5pProfileLibraryKeys(): Set<string> {

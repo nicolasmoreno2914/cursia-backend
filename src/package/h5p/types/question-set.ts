@@ -1,6 +1,8 @@
 // Cursia V2.1 / R7-core — H5P.QuestionSet (MultiChoice + TrueFalse).
 // Actividad por defecto del capítulo ("Comprueba tu comprensión", §J.2).
 import { applyH5pL10n } from '../l10n';
+import { CURSIA_H5P_PROFILE_V1, profileMainLibrary } from '../profile';
+import type { H5pProfile } from '../profile-generator';
 import {
   ChoiceQuestionInput,
   H5pBuiltContent,
@@ -51,8 +53,18 @@ export function validateQuestionSetInput(input: unknown): asserts input is Quest
   issues.throwIfAny('QuestionSet');
 }
 
-export function buildQuestionSet(input: QuestionSetInput): H5pBuiltContent {
+export interface QuestionSetBuildOptions {
+  /**
+   * UX #5 (r18): perfil H5P del paquete (default CURSIA_H5P_PROFILE_V1 → QuestionSet 1.20, salida
+   * byte a byte igual a la de siempre). Con CURSIA_H5P_PROFILE_V3 (QuestionSet 1.21) agrega los
+   * rótulos de la navegación y de la pantalla de resultado que solo existen en 1.21.
+   */
+  profile?: H5pProfile;
+}
+
+export function buildQuestionSet(input: QuestionSetInput, options: QuestionSetBuildOptions = {}): H5pBuiltContent {
   validateQuestionSetInput(input);
+  const qsRef = profileMainLibrary(options.profile || CURSIA_H5P_PROFILE_V1, 'H5P.QuestionSet');
   const n = input.questions.length;
   const questions = input.questions.map((q, i) =>
     buildChoiceSubContent(q, input.itemKey, i, `Pregunta ${i + 1} de ${n}: ${shortTitle(q.question)}`),
@@ -73,7 +85,7 @@ export function buildQuestionSet(input: QuestionSetInput): H5pBuiltContent {
       skippable: false,
     },
     override: { checkButton: true },
-  });
+  }, qsRef);
   return {
     mainLibrary: 'H5P.QuestionSet',
     title: input.title.trim(),

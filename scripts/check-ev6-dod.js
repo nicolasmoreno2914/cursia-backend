@@ -531,7 +531,7 @@ const ENV_KEYS = [
       // QUIZFB (builder 3.10.0): mismo dorado que check-ev6-pending-videos (antes 5de36d06…, builder 3.6.0).
       // #583 QUAL (builder 3.11.0): reviewmaxmarks 69904 → 272, frase del cierre, tarjeta del Libro Guía como <intro> del recurso (sin label libro_card; ids renumerados) y runtime VC 4 — diff semántico en scratchpad/r18/qual/golddiff/sem.js (antes 812c6022…, 3.10.0).
       // UX r18 (builder 3.12.0): mismo dorado que check-ev6-pending-videos (antes 63dac759…, 3.11.0).
-      const GOLDEN_644 = '4f4aa1b9bf4ccd45f3f2e8031cae838473e67b3cc218dfd6a8e827b58e9037b5';
+      const GOLDEN_644 = '7cb2a7c7b0662209e1c3e02a090386f028cf15342174e766f1177d85c5877caf';
       const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
       const r0 = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, o));
       const r1 = await B.buildDynamicMbzV3({ ...PF.packagingInput(distRoot, o), qaPreviewNotice: false });

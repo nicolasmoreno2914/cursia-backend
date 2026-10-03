@@ -6,7 +6,7 @@
 // del `.h5p`. Nada se descarga en build ni en runtime: si falta un archivo o su
 // sha256 no coincide, falla fuerte (H5P_PACKAGE_MISSING_LIBRARY_FILES).
 //
-// Se sincroniza con `scripts/sync-h5p-library-store-v2.js <libsDir>`.
+// Se sincroniza con `scripts/sync-h5p-library-store-v2.js <libsDir> [--profile v3]`.
 import * as fs from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
@@ -14,6 +14,19 @@ import { H5pProfile, serializeH5pProfile } from './profile-generator';
 
 /** `<repo>/assets/h5p-libs/v2` (igual desde src/ con ts-node que desde dist/). */
 export const H5P_LIBRARY_STORE_V2_DIR = path.resolve(__dirname, '../../../assets/h5p-libs/v2');
+
+/**
+ * UX #5 (r18): `<repo>/assets/h5p-libs/v3` — store de CURSIA_H5P_PROFILE_V3 (las 20 carpetas delta:
+ * las 19 de v2, byte a byte iguales — git guarda un solo blob por contenido —, + H5P.QuestionSet-1.21).
+ */
+export const H5P_LIBRARY_STORE_V3_DIR = path.resolve(__dirname, '../../../assets/h5p-libs/v3');
+
+/** Carpeta del store versionado de un perfil derivado (v2 → assets/h5p-libs/v2, v3 → …/v3). */
+export function h5pLibraryStoreDir(profile: H5pProfile): string {
+  if (profile.profileId === 'CURSIA_H5P_PROFILE_V2') return H5P_LIBRARY_STORE_V2_DIR;
+  if (profile.profileId === 'CURSIA_H5P_PROFILE_V3') return H5P_LIBRARY_STORE_V3_DIR;
+  throw new Error(`H5P_STORE_PROFILE_MISMATCH: ${profile.profileId} no tiene store de librerías`);
+}
 
 export interface H5pLibraryStoreFile {
   path: string;
@@ -35,6 +48,10 @@ export interface H5pLibraryStoreEntry {
   libraryJsonLicense: string | null;
   localLicenceFile: string | null;
   copyrightHolder: string;
+  /** UX #5 fix round 1 (M-1): solo librerías del Hub sin tag upstream — commit oficial exacto y nota. */
+  upstreamCommit?: string;
+  upstreamCommitUrl?: string;
+  upstreamNote?: string;
   fileCount: number;
   totalBytes: number;
   files: H5pLibraryStoreFile[];
@@ -107,7 +124,7 @@ const sha256 = (b: Buffer): string => createHash('sha256').update(b).digest('hex
  * canónico). Los archivos se leen y verifican (sha256) al pedir cada librería;
  * el resultado se memoiza por carpeta.
  */
-export function openH5pLibraryStore(profile: H5pProfile, dir: string = H5P_LIBRARY_STORE_V2_DIR): H5pLibrarySource & { manifest: H5pLibraryStoreManifest } {
+export function openH5pLibraryStore(profile: H5pProfile, dir: string = h5pLibraryStoreDir(profile)): H5pLibrarySource & { manifest: H5pLibraryStoreManifest } {
   const mp = path.join(dir, 'manifest.json');
   if (!fs.existsSync(mp)) throw new Error(`H5P_PACKAGE_MISSING_LIBRARY_FILES: no existe ${mp}`);
   const manifest = JSON.parse(fs.readFileSync(mp, 'utf8')) as H5pLibraryStoreManifest;

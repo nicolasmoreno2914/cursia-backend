@@ -1,0 +1,98 @@
+{
+  "semantics": [
+    {
+      "label": "Bakgrunnsbilete",
+      "description": "Bilete brukt som bakgunn"
+    },
+    {
+      "label": "Alternativ tekst for bakgrunnsbilete",
+      "description": "Dersom nettlesaren ikkje kan laste inn biletet, blir denne teksten vist i staden. Teksten blir òg brukt av assisterande teknologi."
+    },
+    {
+      "label": "Hotspot-ikon",
+      "options": [
+        {
+          "label": "Førehandsdefinert ikon"
+        },
+        {
+          "label": "Opplasta bilete"
+        }
+      ]
+    },
+    {
+      "label": "Førehandsdefinert ikon",
+      "description": "Vel eit førehandsdefinert hotspot-ikon frå lista.",
+      "options": [
+        {
+          "label": "Plussteikn"
+        },
+        {
+          "label": "Minusteikn"
+        },
+        {
+          "label": "Gongeteikn"
+        },
+        {
+          "label": "Hake"
+        },
+        {
+          "label": "Spørjeteikn"
+        },
+        {
+          "label": "Infoteikn (i)"
+        },
+        {
+          "label": "Utropsteikn"
+        }
+      ]
+    },
+    {
+      "label": "Opplasta bilete",
+      "description": "Bruk eit sjølvvalt bilete som hotspot-ikon.<br />75 x 75 pikslar er tilrådd som biletstorleik."
+    },
+    {
+      "label": "Hotspot-farge",
+      "description": "Vel hotspot-farge."
+    },
+    {
+      "entity": "Hotspot",
+      "label": "Hotspotar",
+      "field": {
+        "label": "Hotspot",
+        "fields": [
+          {
+            "label": "Hotspot-plassering",
+            "description": "Klikk på miniatyrbiletet (thumbnail) for å plassere hotspoten."
+          },
+          {
+            "label": "Dekk heile bakgrunnsbiletet",
+            "description": "Viss brukar klikkar på hotspoten, vil popup-vindauget dekke heile bakgrunnsbiletet."
+          },
+          {
+            "label": "Tittel",
+            "description": "Valfri tittel for popup-vindauget. Tittelen blir òg brukt av assisterende teknologi."
+          },
+          {
+            "label": "Innhald i popup-vindauget",
+            "field": {
+              "label": "Innhaldselement"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "label": "Hotspot-merkelapp for assisterande teknologi",
+      "default": "Hotspot nummer #num",
+      "description": "Dersom hotspoten manglar tittel, fortel denne teksten kva for ein hotspot brukar har navigert til. #num kan brukast i staden for hotspot-nummeret. Blir brukt av assisterande teknologi."
+    },
+    {
+      "label": "Namn på \"Lukk\"-knapp (for assisterande teknologi)",
+      "default": "Lukk"
+    },
+    {
+      "label": "Label for assistive technologies denoting that hotspot contains Audio/Video",
+      "default": "Contains Audio/Video"
+    }
+  ]
+}

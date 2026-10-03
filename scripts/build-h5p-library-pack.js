@@ -13,6 +13,7 @@
 // EV6 H5P v2: `--profile v2` arma el pack de CURSIA_H5P_PROFILE_V2 (las 7 principales de v1 +
 // Branching Scenario 1.10 + Dialog Cards 1.9; las carpetas nuevas salen del store versionado
 // assets/h5p-libs/v2, las de v1 de <libsDir>). Mismo README (sección v2 incluida).
+// UX #5 (r18): `--profile v3` = v2 con QuestionSet 1.21 (carpetas delta del store assets/h5p-libs/v3).
 
 const fs = require('fs');
 const path = require('path');
@@ -21,14 +22,14 @@ const args = process.argv.slice(2);
 const pi = args.indexOf('--profile');
 const profileName = pi >= 0 ? args[pi + 1] : 'v1';
 const [libsDir, outDir] = args.filter((a, i) => !a.startsWith('--') && args[i - 1] !== '--profile');
-if (!libsDir || !outDir || !['v1', 'v2'].includes(profileName)) {
-  console.error('uso: node scripts/build-h5p-library-pack.js <libsDir> <outDir> [--profile v1|v2]');
+if (!libsDir || !outDir || !['v1', 'v2', 'v3'].includes(profileName)) {
+  console.error('uso: node scripts/build-h5p-library-pack.js <libsDir> <outDir> [--profile v1|v2|v3]');
   process.exit(2);
 }
 
 const { buildCursiaH5pLibraryPack } = require(path.resolve('dist/package/h5p/library-pack.js'));
 const h5p = require(path.resolve('dist/package/h5p/index.js'));
-const profile = profileName === 'v2' ? h5p.CURSIA_H5P_PROFILE_V2 : h5p.CURSIA_H5P_PROFILE_V1;
+const profile = { v1: h5p.CURSIA_H5P_PROFILE_V1, v2: h5p.CURSIA_H5P_PROFILE_V2, v3: h5p.CURSIA_H5P_PROFILE_V3 }[profileName];
 
 buildCursiaH5pLibraryPack({ libsDir: path.resolve(libsDir), outDir: path.resolve(outDir), profile })
   .then((manifest) => {

@@ -53,6 +53,7 @@ const ALLOWED_HOSTS = ['127.0.0.1', 'localhost', 'youtube.com', '*.youtube.com',
 process.env.CURSIA_CHROME_HOST_RESOLVER_RULES = `MAP * ~NOTFOUND, ${ALLOWED_HOSTS.map((h) => `EXCLUDE ${h}`).join(', ')}`;
 const hostAllowed = (h) => ALLOWED_HOSTS.some((a) => (a.startsWith('*.') ? h.endsWith(a.slice(1)) : h === a));
 const { launchChrome, sleep } = require(path.join(REPO, 'scripts/lib/v21-cdp.js'));
+const { UNLABELED_CONTROLS_EXPR } = require(path.join(REPO, 'scripts/lib/h5p-unlabeled-controls.js'));
 const VC = require(path.join(REPO, 'dist/modules/visual-components/index.js'));
 const SHELL = require(path.join(REPO, 'dist/modules/course-shell/index.js'));
 const H5PLIB = require(path.join(REPO, 'dist/package/h5p/index.js'));
@@ -211,6 +212,10 @@ const IV = (cmid, body) => `(()=>{const f=document.querySelector('#module-${cmid
 const FIND = `(()=>{function find(w){try{if(w.H5P&&w.H5P.instances&&w.H5P.instances.length)return w}catch(e){}for(let i=0;i<w.frames.length;i++){const r=find(w.frames[i]);if(r)return r}return null}return find(window)})()`;
 const inH5p = (body) => `(()=>{const w=${FIND};if(!w)throw new Error('sin ventana H5P');const d=w.document;const inst=w.H5P.instances[0];const vis=(e)=>!!e&&e.getClientRects().length>0&&w.getComputedStyle(e).visibility!=='hidden';${body}})()`;
 const centerOf = (sel) => inH5p(`const el=(${sel});if(!el)return null;const r=el.getBoundingClientRect();let x=r.left+r.width/2,y=r.top+r.height/2;let cw=w;while(cw!==cw.parent){const fe=cw.frameElement;const fr=fe.getBoundingClientRect();x+=fr.left+fe.clientLeft;y+=fr.top+fe.clientTop;cw=cw.parent}return {x,y};`);
+// UX #5 (r18): controles visibles del H5P sin texto visible y sin icono (aria-label solo no alcanza). [] = OK.
+const UNLABELED = inH5p(`return ${UNLABELED_CONTROLS_EXPR};`);
+let unlabeledLog = [];
+async function recordUnlabeled(b, state) { unlabeledLog.push({ state, unlabeled: await b.evaluate(UNLABELED).catch((e) => [{ error: e.message }]) }); }
 async function clickBtn(b, labels) {
   return b.evaluate(inH5p(`const L=${JSON.stringify(labels)};const lab=(e)=>[(e.innerText||'').trim(),e.getAttribute('aria-label')||'',e.getAttribute('title')||''];const x=[...d.querySelectorAll('button,[role=button]')].find(e=>vis(e)&&lab(e).some(t=>L.includes(t.trim())));if(!x)return 'no: '+[...d.querySelectorAll('button,[role=button]')].filter(vis).map(e=>lab(e).join('/')).join('|');x.click();return 'ok';`));
 }
@@ -234,10 +239,13 @@ const FLOWS = {
       const r = await b.evaluate(inH5p(`const c=[...d.querySelectorAll('.question-container')].find(c=>vis(c)&&c.innerText.includes(${JSON.stringify(q.question)}));const o=[...c.querySelectorAll('.h5p-answer,.h5p-true-false-answer')].find(e=>e.innerText.trim()===${JSON.stringify(pick)});if(!o)return 'sin opción '+[...c.querySelectorAll('.h5p-answer,.h5p-true-false-answer')].map(e=>e.innerText.trim()).join('|');o.click();const k=[...c.querySelectorAll('button')].find(e=>vis(e)&&e.innerText.trim()==='Comprobar');if(!k)return 'sin Comprobar';k.click();return 'ok';`));
       if (r !== 'ok') throw new Error(`QS pregunta ${i + 1}: ${r}`);
       await sleep(700);
+      await recordUnlabeled(b, `pregunta ${i + 1} tras Comprobar`);
       const last = i === qs.length - 1;
-      const n = await clickBtn(b, last ? ['Finalizar', 'Enviar'] : ['Pregunta siguiente']);
+      // UX #5: QuestionSet 1.21 rotula su navegación «Siguiente» (1.20: botón vacío con aria «Pregunta siguiente»).
+      const n = await clickBtn(b, last ? ['Finalizar', 'Enviar'] : ['Siguiente']);
       if (n !== 'ok') throw new Error(`QS pregunta ${i + 1}: ${n}`);
       await sleep(900);
+      if (!last) await recordUnlabeled(b, `pregunta ${i + 2} tras Siguiente`);
     }
   },
   async dragtext(b) {
@@ -587,7 +595,7 @@ async function main() {
       }
     }
     eq(Object.keys(targets).sort(), ['blanks', 'dragtext', 'interactivevideo', 'questionset'], 'E1+E3 restaurados: hay una actividad de cada tipo (QuestionSet, DragText, Blanks) y un video interactivo');
-    const LIB = { questionset: 'H5P.QuestionSet 1.20', dragtext: 'H5P.DragText 1.10', blanks: 'H5P.Blanks 1.14', interactivevideo: 'H5P.InteractiveVideo 1.27' };
+    const LIB = { questionset: 'H5P.QuestionSet 1.21', dragtext: 'H5P.DragText 1.10', blanks: 'H5P.Blanks 1.14', interactivevideo: 'H5P.InteractiveVideo 1.27' };
     out.metrics.h5pGrades = {};
     for (const t of ['questionset', 'dragtext', 'blanks', 'interactivevideo']) {
       const target = targets[t];
@@ -595,6 +603,8 @@ async function main() {
       await b.navigate(`${WWW}/mod/h5pactivity/view.php?id=${target.cmid}`);
       const lib = await b.waitFor(inH5p(`return inst.libraryInfo.versionedName;`), { timeoutMs: 30000, what: 'H5P' }).catch((e) => e.message);
       ok(lib === LIB[t], `${t}: el reproductor real despliega y carga ${LIB[t]} (${target.key}, cm ${target.cmid})`, lib);
+      unlabeledLog = [];
+      await recordUnlabeled(b, 'al cargar');
       let answered = true;
       try { await FLOWS[t](b, target); } catch (e) { answered = ok(false, `${t}: respondido a través del DOM`, e.message); }
       if (answered) ok(true, `${t}: respondido a través del DOM (todas correctas)${t === 'dragtext' && dtRedrags.length ? `; re-arrastres del harness: ${JSON.stringify(dtRedrags)}` : ''}`);
@@ -604,6 +614,8 @@ async function main() {
       out.shots.push(file);
       const vis = await b.evaluate(inH5p(`return d.body.innerText;`)).catch(() => '');
       eq0(englishIn(vis), `${t}: reproductor sin textos por defecto en inglés`);
+      await recordUnlabeled(b, 'al final');
+      eq0(unlabeledLog.filter((x) => x.unlabeled.length), `${t}: ningún control visible sin texto ni icono (${unlabeledLog.map((x) => x.state).join(', ')})`);
       const st = vm('state', String(target.courseid), String(target.cmid), creds.username);
       ok(st.attempts.length === 1 && st.grade === 100 && st.completion === 'COMPLETE_PASS', `${t}: DB 1 intento, nota 100, COMPLETE_PASS`, { attempts: st.attempts, grade: st.grade, completion: st.completion });
       out.metrics.h5pGrades[t] = { ...target, grade: st.grade, completion: st.completion };

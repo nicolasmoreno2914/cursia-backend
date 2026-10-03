@@ -12,9 +12,9 @@
  *   TOKEN_INVALID                          todo `$@…$` apunta a un módulo del paquete del tipo correcto
  *   H5P_FILES / H5P_LIBRARIES              un solo .h5p (package) por h5pactivity y el intro lo embebe (V542 I2); solo librerías del perfil
  *                                          EV6 H5P v2: un .h5p de una principal "bundled" de
- *                                          CURSIA_H5P_PROFILE_V2 (Branching Scenario, Dialog Cards)
- *                                          lleva EXACTAMENTE sus carpetas delta, con library.json =
- *                                          versión del perfil v2; los demás siguen content-only (v1)
+ *                                          CURSIA_H5P_PROFILE_V3 (Branching Scenario, Dialog Cards y,
+ *                                          UX #5, QuestionSet 1.21) lleva EXACTAMENTE sus carpetas delta,
+ *                                          con library.json = versión del perfil; los demás siguen content-only (v1)
  *   AUDIO_DURATION                         las duraciones mostradas = las medidas de los MP3 del paquete
  *   FILES_INTEGRITY / STRUCTURE / LIBRO    blobs, inforef, secuencias, Libro Guía
  *   SECTIONS / NAVIGATION                  EV6: una sección por capítulo/evaluación, cierre al final
@@ -53,7 +53,7 @@ import { formatDurationEs, mp3DurationSeconds } from '../audio';
 import { ExamBankPlans, examChecksV3, readExamPackageV3 } from './exam-validator-v3';
 import {
   CURSIA_H5P_PROFILE_V1,
-  CURSIA_H5P_PROFILE_V2,
+  CURSIA_H5P_PROFILE_V3,
   H5P_MOODLE_GRADING,
   H5P_BUNDLE_LICENSE_NOTICE_FILE,
   H5pLibraryStoreManifest,
@@ -66,7 +66,7 @@ import {
 // EV6 H5P v2 (fix round 1, m-3): manifest del store (lista de archivos y sha256 por carpeta delta), leído una vez.
 let storeManifestMemo: H5pLibraryStoreManifest | null = null;
 function storeManifest(): H5pLibraryStoreManifest {
-  if (!storeManifestMemo) storeManifestMemo = openH5pLibraryStore(CURSIA_H5P_PROFILE_V2).manifest;
+  if (!storeManifestMemo) storeManifestMemo = openH5pLibraryStore(CURSIA_H5P_PROFILE_V3).manifest;
   return storeManifestMemo;
 }
 
@@ -871,9 +871,9 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   // ── H5P ──
   const profileKeys = new Set(CURSIA_H5P_PROFILE_V1.libraries.map((l) => `${l.machineName} ${l.majorVersion}.${l.minorVersion}`));
   const mainKeys = new Set(Object.values(CURSIA_H5P_PROFILE_V1.mainLibraries).map((l) => l.machineName));
-  // EV6 H5P v2: principales con delta bundling y su perfil.
-  const bundledMains = new Set(profileBundledMainLibraries(CURSIA_H5P_PROFILE_V2));
-  const v2ByDir = new Map(CURSIA_H5P_PROFILE_V2.libraries.map((l) => [h5pLibraryDirName(l), l]));
+  // EV6 H5P v2: principales con delta bundling y su perfil. UX #5 (r18): perfil v3 (BS, DC y QuestionSet 1.21).
+  const bundledMains = new Set(profileBundledMainLibraries(CURSIA_H5P_PROFILE_V3));
+  const bundledProfileByDir = new Map(CURSIA_H5P_PROFILE_V3.libraries.map((l) => [h5pLibraryDirName(l), l]));
   const h5pActs = acts.filter((a) => a.modname === 'h5pactivity');
   for (const a of h5pActs) {
     const mine = files.filter((f) => f.ctx === a.ctx && f.component === 'mod_h5pactivity' && f.filename !== '.');
@@ -906,12 +906,12 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
         if (!mainKeys.has(hj.mainLibrary)) add('H5P_LIBRARIES', a.idnumber, `librería principal fuera del perfil: ${hj.mainLibrary}`);
       } else {
         // Carpetas de librería del paquete == delta calculada (ni una de más ni de menos).
-        const want = profileDeltaDirs(CURSIA_H5P_PROFILE_V2, hj.mainLibrary);
+        const want = profileDeltaDirs(CURSIA_H5P_PROFILE_V3, hj.mainLibrary);
         const tops = [...new Set(extra.map((n) => n.split('/')[0]))].sort();
         const missingDirs = want.filter((d) => !tops.includes(d));
         const extraDirs = tops.filter((d) => !want.includes(d));
-        if (missingDirs.length) add('H5P_LIBRARIES', a.idnumber, `faltan carpetas de librería del delta v2: ${missingDirs.slice(0, 5).join(', ')}`);
-        if (extraDirs.length) add('H5P_LIBRARIES', a.idnumber, `carpetas fuera del delta v2 de ${hj.mainLibrary}: ${extraDirs.slice(0, 5).join(', ')}`);
+        if (missingDirs.length) add('H5P_LIBRARIES', a.idnumber, `faltan carpetas de librería del delta del perfil: ${missingDirs.slice(0, 5).join(', ')}`);
+        if (extraDirs.length) add('H5P_LIBRARIES', a.idnumber, `carpetas fuera del delta del perfil de ${hj.mainLibrary}: ${extraDirs.slice(0, 5).join(', ')}`);
         const storeLibs = new Map(storeManifest().libraries.map((l) => [l.dir, l]));
         for (const d of tops.filter((x) => want.includes(x))) {
           // Archivos de la carpeta == los del store (nombres; sha256 de library.json). Los JS/CSS no se inflan.
@@ -936,9 +936,9 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
             add('H5P_LIBRARIES', a.idnumber, `${d}: library.json distinto del store (sha256)`);
           }
           const lj = JSON.parse(ljBuf.toString('utf8'));
-          const ref = v2ByDir.get(d)!;
+          const ref = bundledProfileByDir.get(d)!;
           if (lj.machineName !== ref.machineName || lj.majorVersion !== ref.majorVersion || lj.minorVersion !== ref.minorVersion || lj.patchVersion !== ref.patchVersion) {
-            add('H5P_LIBRARIES', a.idnumber, `${d}: library.json ${lj.machineName} ${lj.majorVersion}.${lj.minorVersion}.${lj.patchVersion} ≠ perfil v2 ${ref.patchVersion}`);
+            add('H5P_LIBRARIES', a.idnumber, `${d}: library.json ${lj.machineName} ${lj.majorVersion}.${lj.minorVersion}.${lj.patchVersion} ≠ perfil ${ref.patchVersion}`);
           }
         }
       }
@@ -961,7 +961,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       // Fix round 1 (I-1): un paquete bundled solo puede declarar lo que el sitio ya tiene (perfil v1)
       // o lo que trae adentro (SU delta) — nunca otra librería de v2 que no viaja en el paquete.
       const allowedDeps = bundled
-        ? new Set([...profileKeys, ...(CURSIA_H5P_PROFILE_V2.deltaByMain![hj.mainLibrary] || []).map((l) => `${l.machineName} ${l.majorVersion}.${l.minorVersion}`)])
+        ? new Set([...profileKeys, ...(CURSIA_H5P_PROFILE_V3.deltaByMain![hj.mainLibrary] || []).map((l) => `${l.machineName} ${l.majorVersion}.${l.minorVersion}`)])
         : profileKeys;
       for (const d of hj.preloadedDependencies ?? []) {
         const k = `${d.machineName} ${d.majorVersion}.${d.minorVersion}`;

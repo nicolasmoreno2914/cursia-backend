@@ -16,6 +16,10 @@
 //  5. DB: exactamente 1 intento por envío, nota 0–100 esperada, completion
 //     esperado y resultados hijos con subcontent UUID = los del paquete.
 //  6. Idioma: sin textos por defecto en inglés visibles en el iframe H5P.
+//  7. UX #5 (r18): ningún control VISIBLE (button / [role=button]) del iframe H5P sin texto visible y
+//     sin icono (aria-label solo no alcanza) — al cargar, tras cada «Comprobar», tras «Siguiente» y al
+//     final. QuestionSet va como lo arma el builder v3: H5P.QuestionSet 1.21 (CURSIA_H5P_PROFILE_V3)
+//     con su librería incluida en el .h5p (con 1.20 «Pregunta siguiente» era un botón azul vacío).
 //
 // Nunca borra datos: deja el curso y los intentos. La contraseña nunca se imprime.
 //
@@ -54,6 +58,7 @@ try {
 const F = require('./lib/v21-player-fixture');
 const { buildMiniH5pMbz } = require('./lib/v21-mini-mbz');
 const { launchChrome, sleep } = require('./lib/v21-cdp');
+const { UNLABELED_CONTROLS_EXPR } = require('./lib/h5p-unlabeled-controls');
 
 let failures = 0;
 let passes = 0;
@@ -96,6 +101,14 @@ const englishIn = (text) => ENGLISH.filter((w) => new RegExp(`(^|[^A-Za-zÁ-ú])
 // Localiza la ventana con H5P.instances (atraviesa iframes del mismo origen).
 const FIND = `(()=>{function find(w){try{if(w.H5P&&w.H5P.instances&&w.H5P.instances.length)return w}catch(e){}for(let i=0;i<w.frames.length;i++){const r=find(w.frames[i]);if(r)return r}return null}return find(window)})()`;
 const inH5p = (body) => `(()=>{const w=${FIND};if(!w)throw new Error('sin ventana H5P');const d=w.document;const inst=w.H5P.instances[0];const vis=(e)=>!!e&&e.getClientRects().length>0&&w.getComputedStyle(e).visibility!=='hidden';${body}})()`;
+// UX #5: controles visibles sin texto ni icono (lista vacía = OK). Se acumulan por estado en `unlabeledLog`.
+const UNLABELED = inH5p(`return ${UNLABELED_CONTROLS_EXPR};`);
+let unlabeledLog = [];
+// Fix round 1 (M-5): un error al evaluar se registra como hallazgo de ESE tipo (lista no vacía), nunca aborta el check.
+async function recordUnlabeled(b, state) {
+  const u = await b.evaluate(UNLABELED).catch((e) => [{ error: e && e.message ? e.message : String(e) }]);
+  unlabeledLog.push({ state, unlabeled: Array.isArray(u) ? u : [{ error: `resultado inesperado: ${JSON.stringify(u)}` }] });
+}
 const COLLECT = inH5p(`const a=[];d.querySelectorAll('[aria-label],[title],[placeholder]').forEach(e=>{['aria-label','title','placeholder'].forEach(k=>{const v=e.getAttribute(k);if(v)a.push(v)})});return {visible:d.body.innerText,attrs:a.join('\\n')};`);
 // Centro de un elemento del frame H5P en coordenadas de la página principal.
 const centerOf = (selectorExpr) =>
@@ -137,10 +150,13 @@ const FLOWS = {
       if (r !== 'ok') throw new Error(`QS pregunta ${i + 1}: ${r}`);
       await sleep(700);
       texts.push(await b.evaluate(COLLECT));
+      await recordUnlabeled(b, `pregunta ${i + 1} tras Comprobar`);
       const last = i === F.QS.questions.length - 1;
-      const n = await clickVisibleButton(b, last ? ['Finalizar', 'Enviar'] : ['Pregunta siguiente']);
-      if (n !== 'ok') throw new Error(`QS pregunta ${i + 1}: botón ${last ? 'Finalizar' : 'siguiente'}: ${n}`);
+      // QuestionSet 1.21: navegación rotulada «Siguiente» (en 1.20 era un botón vacío con aria «Pregunta siguiente»).
+      const n = await clickVisibleButton(b, last ? ['Finalizar', 'Enviar'] : ['Siguiente']);
+      if (n !== 'ok') throw new Error(`QS pregunta ${i + 1}: botón ${last ? 'Finalizar' : 'Siguiente'}: ${n}`);
       await sleep(900);
+      if (!last) await recordUnlabeled(b, `pregunta ${i + 2} tras Siguiente`);
     }
     await b.waitFor(inH5p(`return d.body.innerText.includes('Tu resultado')?1:0;`), { timeoutMs: 10000, what: 'pantalla de resultado QS' });
   },
@@ -217,7 +233,7 @@ const FLOWS = {
 async function main() {
   // ── 1. Build ──
   const specs = [
-    { key: 'QS', lib: 'H5P.QuestionSet 1.20', built: h.buildQuestionSet(F.QS), expect: { raw: 3, grade: 75, completion: 'COMPLETE_PASS', perChild: [true, true, false, true] } },
+    { key: 'QS', lib: 'H5P.QuestionSet 1.21', bundled: true, built: h.buildQuestionSet(F.QS, { profile: h.CURSIA_H5P_PROFILE_V3 }), expect: { raw: 3, grade: 75, completion: 'COMPLETE_PASS', perChild: [true, true, false, true] } },
     // SCS: C1 corregido (1 intento, hijos con UUID), pero Moodle NO califica SCS 1.11 (ver
     // src/package/h5p/moodle-grading.ts). Se verifica esa limitación tal cual: si algún día
     // Moodle/SCS la corrigen, este check falla y obliga a actualizar H5P_MOODLE_GRADING.
@@ -228,7 +244,9 @@ async function main() {
   let mid = 4301;
   for (const s of specs) {
     s.mid = mid++;
-    s.h5p = await h.buildContentOnlyH5p({ mainLibrary: s.built.mainLibrary, content: s.built.content, title: s.built.title, language: 'es' });
+    s.h5p = s.bundled
+      ? await h.buildBundledH5p({ mainLibrary: s.built.mainLibrary, content: s.built.content, title: s.built.title, language: 'es', profile: h.CURSIA_H5P_PROFILE_V3, libraryStore: h.openH5pLibraryStore(h.CURSIA_H5P_PROFILE_V3) })
+      : await h.buildContentOnlyH5p({ mainLibrary: s.built.mainLibrary, content: s.built.content, title: s.built.title, language: 'es' });
     s.name = `${s.key} — ${s.built.title}`;
   }
   report(`build: 4 paquetes (QS ${specs[0].built.subContentIds.length} UUID, SCS ${specs[1].built.subContentIds.length} UUID, DT, Blanks)`, specs[0].built.subContentIds.length === 4 && specs[1].built.subContentIds.length === 4);
@@ -283,8 +301,10 @@ async function main() {
     const bar = await b.evaluate(inH5p(`return [...d.querySelectorAll('.h5p-actions li, .h5p-actions button')].filter(vis).map(e=>e.innerText.trim());`));
     report(`${s.key}: sin barra de acciones (displayoptions 15: sin "Reuse"/"Embed")`, Array.isArray(bar) && bar.length === 0, bar);
     const texts = [await b.evaluate(COLLECT)];
+    unlabeledLog = [];
     await b.screenshot(path.join(shotsDir, `player-${s.key.toLowerCase()}-01-start.png`));
     try {
+      await recordUnlabeled(b, 'al cargar');
       await FLOWS[s.key](b, texts);
       report(`${s.key}: respondido y enviado a través del DOM`, true);
     } catch (e) {
@@ -292,7 +312,10 @@ async function main() {
     }
     await sleep(2500); // deja terminar el POST xAPI
     texts.push(await b.evaluate(COLLECT));
+    await recordUnlabeled(b, 'al final');
     await b.screenshot(path.join(shotsDir, `player-${s.key.toLowerCase()}-02-result.png`));
+    const unl = unlabeledLog.filter((x) => x.unlabeled.length);
+    report(`${s.key}: ningún control visible sin texto ni icono (${unlabeledLog.map((x) => x.state).join(', ')})`, unl.length === 0, unl);
     const visible = texts.map((t) => t.visible).join('\n');
     const attrs = texts.map((t) => t.attrs).join('\n');
     const enVis = englishIn(visible);

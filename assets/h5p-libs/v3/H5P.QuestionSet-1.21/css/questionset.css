@@ -1,0 +1,180 @@
+.questionset {
+  background-color: var(--h5p-theme-background);
+  padding: 0;
+}
+.questionset .h5p-question-main-content {
+  padding-top: 1px;
+}
+
+.questionset .question-container {
+  margin: var(--h5p-theme-spacing-m);
+}
+
+.questionset-results h2 {
+  font-size: calc(var(--h5p-theme-spacing-s)*1.2);
+  font-weight: bold;
+  padding-bottom: var(--h5p-theme-spacing-xxs);
+}
+
+.questionset, .questionset-results {
+  overflow: hidden;
+}
+.questionset.hidden {
+  display: none;
+}
+.questionset, .questionset-results {
+  position: relative;
+}
+.h5p-multichoice > .h5p-question {
+  text-align: left;
+  margin: var(--h5p-theme-spacing-xxs) var(--h5p-theme-spacing-xxs) calc(var(--h5p-theme-spacing-s)*0.7);
+  background: var(--h5p-theme-ui-base);
+  zoom: 1;
+}
+
+.qs-footer > .qs-solutionbutton {
+  float: none;
+}
+
+.qs-footer > .qs-retrybutton {
+  float: none;
+}
+
+/* Need to disable max-height animation stuff, since this will
+   make resizing of iframe in Safari not work! */
+.questionset .h5p-question-buttons.h5p-question-visible {
+  transition: none;
+}
+
+.qs-progress-announcer {
+  height: 0;
+  width: 0;
+  position: absolute;
+  overflow: hidden;
+}
+
+.h5p-question .h5p-question-prev {
+  left: var(--h5p-theme-spacing-l);
+
+}
+.h5p-question .h5p-question-next {
+  right: var(--h5p-theme-spacing-l);
+}
+
+.h5p-question .h5p-question-prev.truncated,
+.h5p-question .h5p-question-next.truncated {
+  padding: 0;
+  line-height: 2.2335em;
+}
+
+.video-container {
+  position: relative;
+}
+.video-container > video {
+  background-color: #000;
+  width: 100%;
+}
+.video-container > .h5p-button {
+  position: absolute;
+  top: calc(--h5p-theme-spacing-xxs);
+  right: calc(--h5p-theme-spacing-xxs);
+}
+
+.qs-progress {
+  text-align: center;
+  line-height: var(--h5p-theme-spacing-m);
+}
+
+.questionset .h5p-theme-progress {
+  display:  inline-flex;
+}
+
+.questionset-results {
+  text-align: center;
+  background: var(--h5p-theme-ui-base);
+}
+
+.questionset-results .h5p-theme-results-list {
+  max-height: 13rem;
+}
+
+.questionset-results .h5p-joubelui-button.h5p-button.qs-solutionbutton.h5p-theme-secondary-cta.h5p-theme-show-results.h5p-question-show-solution {
+  margin-right: var(--h5p-theme-spacing-xs);
+}
+
+.questionset-results .feedback-section {
+  margin: calc(var(--h5p-theme-spacing-s)*0.75);
+}
+
+.questionset-results .greeting {
+  margin-top: var(--h5p-theme-spacing-s);
+  color: var(--h5p-theme-text-third);
+  font-size: var(--h5p-theme-font-size-xl);
+}
+
+.questionset-results .buttons {
+  margin: var(--h5p-theme-spacing-m) 0 var(--h5p-theme-spacing-m) 0;
+  display: flex;
+  justify-content: center;
+  gap: var(--h5p-theme-spacing-s);
+}
+
+.questionset-results .result-header,
+.questionset-results .result-text,
+.questionset-results .feedback-section {
+  color: var(--h5p-theme-main-cta-base);
+  font-weight: bold;
+}
+
+.questionset-results .result-header {
+  font-size: calc (2 * var(--h5p-theme-font-size-m));
+  margin: var(--h5p-theme-spacing-s) var(--h5p-theme-spacing-xxs) var(--h5p-theme-spacing-xxs) var(--h5p-theme-spacing-xxs) ;
+}
+
+.questionset-results .result-text,
+.questionset-results .feedback-section .feedback-text {
+  font-size: var(--h5p-theme-font-size-xl);
+  line-height: var(--h5p-theme-font-size-l);
+  margin: var(--h5p-theme-spacing-s);
+}
+
+/* No margin for questions when no frame */
+.h5p-no-frame .questionset .h5p-question > * {
+  margin-left: 0;
+  margin-right: 0;
+}
+
+.h5p-no-frame .questionset-results .feedback-section,
+.h5p-no-frame .questionset .h5p-question > *:first-child {
+  margin-top: 0;
+}
+
+.h5p-no-frame .questionset-results .buttons,
+.h5p-no-frame .questionset .h5p-question > *:last-child {
+  margin-bottom: 0;
+}
+
+/* Hide the fullscreen button rendered by H5P.DragQuestion */
+.questionset .h5p-question.h5p-dragquestion .h5p-my-fullscreen-button-enter,
+.questionset .h5p-question.h5p-dragquestion .h5p-my-fullscreen-button-exit {
+  display: none;
+}
+
+.qs-footer .h5p-theme-primary-cta.h5p-theme-show-results.h5p-hidden {
+  display: none;
+}
+.question-container {
+  margin: var(--h5p-theme-spacing-xs) var(--h5p-theme-spacing-xs);
+  box-shadow: 0px 8px 19.9px 0px rgba(0, 0, 0, 0.05);
+  border: solid 1px var(--h5p-theme-stroke-1);
+  border-radius: var(--h5p-theme-border-radius-medium);
+  padding: var(--h5p-theme-spacing-s);
+  background-color: var(--h5p-theme-ui-base);
+}
+.h5p-no-frame .questionset .h5p-navigation {
+  border-top: 0;
+}
+
+.h5p-theme-nav-button.h5p-theme-previous.visibility-hidden {
+  visibility: hidden; /* Components.Navigation uses grid layout, so we can't use display: none */
+}

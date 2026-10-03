@@ -4,6 +4,7 @@
 // (nunca a mano) y se versiona junto al código.
 import * as profileJson from './cursia-h5p-profile.v1.json';
 import * as profileV2Json from './cursia-h5p-profile.v2.json';
+import * as profileV3Json from './cursia-h5p-profile.v3.json';
 import {
   H5pDependencyRef,
   H5pLibraryRef,
@@ -55,6 +56,25 @@ if (
   !CURSIA_H5P_PROFILE_V2.deltaByMain
 ) {
   throw new Error('H5P_PROFILE_CORRUPT: cursia-h5p-profile.v2.json no corresponde a CURSIA_H5P_PROFILE_V2');
+}
+
+/**
+ * UX #5 (r18) — CURSIA_H5P_PROFILE_V3 = v2 con H5P.QuestionSet 1.21 (navegación «Siguiente ›» /
+ * «Anterior» compatible con el tema de H5P.Question 1.5; en 1.20 era un botón vacío). Base v1: el
+ * `.h5p` de QuestionSet lleva su delta (la carpeta H5P.QuestionSet-1.21), igual que BS y DC.
+ * Es el perfil de los paquetes NUEVOS del builder v3. Los subContentId no cambian (v1 / `#p2`).
+ */
+export const h5pProfileVersionV3 = 3;
+
+export const CURSIA_H5P_PROFILE_V3: H5pProfile = deepFreeze(stripModuleDefault(profileV3Json));
+
+if (
+  CURSIA_H5P_PROFILE_V3.version !== h5pProfileVersionV3 ||
+  CURSIA_H5P_PROFILE_V3.profileId !== 'CURSIA_H5P_PROFILE_V3' ||
+  CURSIA_H5P_PROFILE_V3.baseProfileId !== CURSIA_H5P_PROFILE_V1.profileId ||
+  !CURSIA_H5P_PROFILE_V3.deltaByMain
+) {
+  throw new Error('H5P_PROFILE_CORRUPT: cursia-h5p-profile.v3.json no corresponde a CURSIA_H5P_PROFILE_V3');
 }
 
 /** Principales cuyo `.h5p` lleva sus librerías delta adentro (buildBundledH5p). */

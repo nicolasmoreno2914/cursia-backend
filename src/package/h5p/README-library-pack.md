@@ -64,7 +64,7 @@ Compatible = mismo major.minor y patch instalado mayor o igual al del perfil.
 
 ## Actualizaciones
 
-Un pack nuevo implica un perfil nuevo (`CURSIA_H5P_PROFILE_V2`,
+Un pack nuevo implica un perfil nuevo (`CURSIA_H5P_PROFILE_V2`, `_V3`,
 `h5pProfileVersion = 2`). Las versiones de un perfil publicado no cambian.
 
 ## Pack v2 (CURSIA_H5P_PROFILE_V2): caso ramificado y tarjetas de repaso
@@ -99,3 +99,42 @@ node scripts/h5p-preflight-moodle.js <moodleDir> <php.ini> --profile v2
 Las librerías nuevas salen del store versionado `assets/h5p-libs/v2` (versiones
 exactas, sha256 por archivo y licencia MIT de cada una en su `manifest.json` y
 `LICENSES.md`); nada se descarga.
+
+## Pack v3 (CURSIA_H5P_PROFILE_V3): conjunto de preguntas con navegación rotulada
+
+Los cursos nuevos usan **H5P.QuestionSet 1.21** en la actividad práctica por defecto
+del capítulo. En QuestionSet 1.20, junto a «Comprobar» aparecía un botón azul **vacío**:
+era «Pregunta siguiente» / «Pregunta anterior», que en 1.20 no tiene rótulo (esperaba un
+icono que el tema actual de H5P ya no dibuja). QuestionSet 1.21 lo muestra como
+navegación «Siguiente ›» / «Anterior». Ningún patch 1.20.x lo corrige.
+
+| Archivo | Tipo de contenido | Nota |
+|---|---|---|
+| `cursia-h5p-pack-v3-H5P.QuestionSet-1.21.13.h5p` | Conjunto de preguntas | Calificable |
+
+El pack v3 incluye además los otros 8 paquetes de v2 (mismas versiones), así que un
+sitio nuevo puede usar solo el pack v3.
+
+**Restaurar como administrador o gestor.** Igual que el caso ramificado y el «Repaso»,
+el `.h5p` del conjunto de preguntas lleva su librería (`H5P.QuestionSet-1.21`) adentro:
+con restauración de administrador o gestor Moodle la instala sola. Si restaura un
+**docente** en un sitio que todavía no tiene QuestionSet 1.21, la actividad muestra
+«Missing main library»: un administrador sube una vez el pack v3 (opción A) y desde ahí
+cualquier docente puede restaurar.
+
+**Cursos ya entregados.** Siguen funcionando con QuestionSet 1.20 (las dos versiones
+conviven en el sitio; Moodle no migra contenido de una minor a otra), pero conservan el
+botón vacío. Para corregir uno hay que volver a empaquetarlo (botón «Preparar paquete»
+de Cursia: el builder 3.12.0 ya arma QuestionSet 1.21) y restaurarlo, o reemplazar el
+archivo `.h5p` de cada actividad de práctica por el nuevo.
+
+```bash
+node scripts/generate-h5p-profile.js <libsDir> --profile v3
+node scripts/sync-h5p-library-store-v2.js <libsDir> --profile v3
+node scripts/build-h5p-library-pack.js <libsDir> <outDir> --profile v3
+node scripts/h5p-preflight-moodle.js <moodleDir> <php.ini> --profile v3
+```
+
+Las carpetas delta salen del store versionado `assets/h5p-libs/v3` (las 19 de v2, byte a
+byte iguales, + `H5P.QuestionSet-1.21`, MIT, github.com/h5p/h5p-question-set); nada se
+descarga.
