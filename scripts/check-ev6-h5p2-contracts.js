@@ -82,12 +82,17 @@ const GOLDEN = {
   // audiolibro.mp3, portadas a 1600 px (antes 640) y sin botón «Iniciar actividad» hacia la H5P embebida.
   // Dorados anteriores (3.11.0): h5p-final-light 03bb4e8b…, scorm-nofinal-dark 9500797e…, h5p-nofinal-dark-mock-cleansafe
   // 5329675d…, scorm-final-light 948e402d…, h5p-ev5c-rules1 4a1532f2….
+  // r19 L (builder 3.12.0 → 3.13.0) cambia el .mbz a propósito, y SOLO en el Libro Guía (diff semántico de entradas del zip contra
+  // 77eeb18, scratchpad/r19/impl-l-probe/golddiff.js): el blob libro_guia_completo.html → PDF libro_guia_<slug>.pdf (files.xml:
+  // hash, nombre, tamaño, mimetype) y la descripción del recurso (resource.xml) con el botón «Abrir Libro Guía →» y «documento PDF».
+  // Dorados anteriores (3.12.0): h5p-final-light 5e9bf0f0…, scorm-nofinal-dark b967577f…, h5p-nofinal-dark-mock-cleansafe
+  // 14d45c9d…, scorm-final-light 6c18bcce…, h5p-ev5c-rules1 3c6d123e….
   mbz: {
-    'h5p-final-light': '5e9bf0f015e3c37aab9c91c5f0b4fe9ac29f4813303393f7210ed16e13f7524f',
-    'scorm-nofinal-dark': 'b967577f1cf7d78ab87a70442335d7cd636113e6774607a6d6e9480d8759e4c6',
-    'h5p-nofinal-dark-mock-cleansafe': '14d45c9d64b75b23d51c04452e15c6f6038c614f9a80d1d82d4d1d1cc202fda7',
-    'scorm-final-light': '6c18bcced0c41fa4a59fe91529c077e0d53aa759bffcc69725d8bbb9d5897fa9',
-    'h5p-ev5c-rules1': '3c6d123eb5eb1f8c4168bf4d4adcd592b60f0587f683bdbc85a4b3aaf76d99b1',
+    'h5p-final-light': 'd4cdc6efa42821e035fbd5e7a829508359bcce3bafedfbd4a4acb2ff9dbf1d74',
+    'scorm-nofinal-dark': 'aac75a863969a35c9a2f2f4c081bd08d20f04f031f52731792d07925d4e7b699',
+    'h5p-nofinal-dark-mock-cleansafe': 'fc312f3ddd83a9c2503eedb38ece5f02586c1a84a6a4e0a55935ed6b5aa661ff',
+    'scorm-final-light': '48cd77bd1d35ab43c5a20477be2cb2842775c7f764c9ce87fc318f986e56761b',
+    'h5p-ev5c-rules1': 'ce78fdc626d23e3ef477bd8f80feec569d1b13b22a64ce5362705b141b9d645f',
   },
 };
 

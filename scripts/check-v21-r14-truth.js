@@ -100,17 +100,27 @@ const REAL = {
   const intro = (bib) => ({ schemaVersion: 1, welcome: 'Hola.', competencies: ['a'], methodology_note: 'm', closing: 'c', bibliography: bib });
   const mod = (bib) => ({ number: 1, title: 'Módulo', intro: { schemaVersion: 1, presentation: 'p', outcomes: ['o'], journey: [], bibliography: bib }, chapters: [{ number: 1, title: 'Cap', md: '# Cap\n\nTexto.' }] });
 
-  await check('Libro Guía: la sección de bibliografía muestra solo obras verificadas, en forma canónica', () => {
-    const html = LB.compileLibroHtmlV3({ courseTitle: 'Curso', theme, courseIntro: intro([REAL.hattie, REAL.suarezInvented]), modules: [mod([REAL.floridiTypo, REAL.selwynMisattributed])] });
-    assert.ok(html.includes('Visible Learning') && html.includes('Cowls, Josh'), 'canónicas presentes');
-    assert.ok(!/Suárez|Cowley|Critical Perspectives and Challenges/.test(html), 'inventadas/erratas ausentes');
-    assert.ok(html.includes('href="#bibliografia"'), 'índice enlaza la bibliografía');
+  // r19 (L1): el Libro Guía es un PDF (renderLibroPdfV3); el texto se extrae con pdfjs.
+  const LL = loadDist('package/v3/libro-logo.js');
+  const pdfText = async (input) => {
+    const r = await LB.renderLibroPdfV3({ ...input, logo: LL.resolveLibroLogo(null) });
+    const pdfjs = await import(require.resolve('pdfjs-dist/legacy/build/pdf.mjs', { paths: [path.resolve(__dirname, '..')] }));
+    const d = await pdfjs.getDocument({ data: new Uint8Array(r.pdf), verbosity: 0 }).promise;
+    let t = '';
+    for (let p = 1; p <= d.numPages; p++) t += (await (await d.getPage(p)).getTextContent()).items.map((i) => i.str).join(' ') + '\n';
+    return { r, t };
+  };
+  await check('Libro Guía: la sección de bibliografía muestra solo obras verificadas, en forma canónica', async () => {
+    const { r, t } = await pdfText({ courseTitle: 'Curso', theme, courseIntro: intro([REAL.hattie, REAL.suarezInvented]), modules: [mod([REAL.floridiTypo, REAL.selwynMisattributed])] });
+    assert.ok(t.includes('Visible Learning') && t.includes('Cowls, Josh'), 'canónicas presentes');
+    assert.ok(!/Suárez|Cowley|Critical Perspectives and Challenges/.test(t), 'inventadas/erratas ausentes');
+    assert.ok(r.hasBibliography && /Índice[\s\S]*Bibliografía/.test(t), 'el índice lista la bibliografía');
   });
 
-  await check('Libro Guía: sin ninguna obra verificable → no hay sección ni enlace de bibliografía vacíos', () => {
-    const html = LB.compileLibroHtmlV3({ courseTitle: 'Curso', theme, courseIntro: intro([REAL.suarezInvented]), modules: [mod([REAL.selwynMisattributed])] });
-    assert.ok(!html.includes('id="bibliografia"') && !html.includes('href="#bibliografia"'), 'sin sección vacía');
-    assert.ok(/<\/html>\s*$/.test(html));
+  await check('Libro Guía: sin ninguna obra verificable → no hay sección ni entrada de bibliografía vacías', async () => {
+    const { r, t } = await pdfText({ courseTitle: 'Curso', theme, courseIntro: intro([REAL.suarezInvented]), modules: [mod([REAL.selwynMisattributed])] });
+    assert.ok(!r.hasBibliography && !t.includes('Bibliografía'), 'sin sección vacía');
+    assert.ok(r.pdf.subarray(0, 5).toString() === '%PDF-');
   });
 
   await check('audiolibro: el guion pide tuteo en Colombia (narración y continuación); en Argentina no impone tuteo', () => {

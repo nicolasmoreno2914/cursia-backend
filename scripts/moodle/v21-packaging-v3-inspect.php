@@ -135,6 +135,21 @@ foreach ($sections as $s) {
         $out['closingBadgeLinks'] = array_map(fn($u) => html_entity_decode($u), $m[1]);
     }
 }
+// r19 (L4): botón del Libro Guía en la descripción de su recurso, ya decodificado por la restauración.
+$out['libro'] = null;
+foreach ($sections as $s) {
+    foreach ($s['cms'] as $c) {
+        if ($c['idnumber'] !== 'cv3:shell:libro') continue;
+        $res = $DB->get_record('resource', ['id' => $modinfo->get_cm($c['cmid'])->instance]);
+        preg_match_all('#<a\b([^>]*)>(.*?)</a>#s', $res->intro, $m, PREG_SET_ORDER);
+        $links = [];
+        foreach ($m as $a) {
+            $attr = function ($n) use ($a) { return preg_match('#\b' . $n . '="([^"]*)"#', $a[1], $x) ? html_entity_decode($x[1]) : null; };
+            $links[] = ['href' => $attr('href'), 'target' => $attr('target'), 'rel' => $attr('rel'), 'text' => trim(strip_tags($a[2]))];
+        }
+        $out['libro'] = ['cmid' => $c['cmid'], 'display' => (int)$res->display, 'links' => $links];
+    }
+}
 $out['wwwroot'] = $CFG->wwwroot;
 
 // ── 6. Módulos calificables ──

@@ -248,18 +248,32 @@ async function runConfig(cfg) {
     return f && /<contenthash>(\w+)<\/contenthash>/.exec(f)[1];
   };
   const mbzFiles = {};
-  for (const n of ['audio_bienvenida.mp3', 'audiolibro.mp3', 'libro_guia_completo.html']) mbzFiles[n] = await blobHash(n);
-  check(`${tag} archivos restaurados: MP3 de bienvenida y audiolibro, PNG+PDF por tarjeta, Libro Guía (mismo contenthash)`, () => {
+  // r19 (L1/L5, builder 3.13.0): el Libro Guía es un PDF `libro_guia_<slug>.pdf` (application/pdf).
+  const fxAll = await z.file('files.xml').async('string');
+  const libroName = (/<filename>(libro_guia_[a-z0-9_]+\.pdf)<\/filename>/.exec(fxAll) || [])[1];
+  for (const n of ['audio_bienvenida.mp3', 'audiolibro.mp3', libroName]) mbzFiles[n] = await blobHash(n);
+  check(`${tag} archivos restaurados: MP3 de bienvenida y audiolibro, PNG+PDF por tarjeta, Libro Guía PDF (mismo contenthash)`, () => {
     const aw = cm['cv3:shell:audio_welcome'].files.find((f) => f.name === 'audio_bienvenida.mp3');
     const ab = cm['cv3:shell:audiobook'].files.find((f) => f.name === 'audiolibro.mp3');
-    const lb = cm['cv3:shell:libro'].files.find((f) => f.name === 'libro_guia_completo.html');
-    assert(aw && ab && lb, 'faltan archivos');
-    eq([aw.hash, ab.hash, lb.hash], [mbzFiles['audio_bienvenida.mp3'], mbzFiles['audiolibro.mp3'], mbzFiles['libro_guia_completo.html']], 'contenthash');
+    const lbs = cm['cv3:shell:libro'].files;
+    const lb = lbs.find((f) => f.name === libroName);
+    assert(aw && ab && lb && libroName, 'faltan archivos');
+    eq([lbs.length, lb.mime], [1, 'application/pdf'], 'un solo archivo del Libro Guía, PDF');
+    eq([aw.hash, ab.hash, lb.hash], [mbzFiles['audio_bienvenida.mp3'], mbzFiles['audiolibro.mp3'], mbzFiles[libroName]], 'contenthash');
     eq([aw.area, ab.area, lb.area], ['intro', 'intro', 'content'], 'fileareas');
     for (const c of cms.filter((x) => /:presentation$/.test(x.idnumber))) {
       const names = c.files.map((f) => `${f.area}:${f.mime}`).sort();
       eq(names, ['intro:application/pdf', 'intro:image/png'], c.idnumber);
     }
+  });
+  check(`${tag} r19 L4: la descripción del Libro Guía restaurada lleva UN botón «Abrir Libro Guía» → mod/resource/view.php?id=<su cmid>, target _blank`, () => {
+    const L = o.libro;
+    assert(L, 'sin datos del recurso del Libro Guía');
+    eq(L.display, 5, 'display 5 (view.php entrega el PDF)');
+    eq(L.links.length, 1, `enlaces en la descripción: ${JSON.stringify(L.links)}`);
+    const a = L.links[0];
+    eq(a.href, `${o.wwwroot}/mod/resource/view.php?id=${L.cmid}`, 'href decodificado = el propio recurso');
+    assert(a.target === '_blank' && /noopener/.test(a.rel || '') && /Abrir Libro Guía/.test(a.text), JSON.stringify(a));
   });
   return courseid;
 }
