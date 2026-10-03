@@ -143,7 +143,7 @@ export function heading(h: Hx, tag: 'h2' | 'h3' | 'h4', text: string, s: Surf, o
 }
 
 /** Párrafo "lead" (entrada destacada). */
-export function lead(h: Hx, text: string, s: Surf, opts: { last?: boolean; cls?: string } = {}): string {
+export function lead(h: Hx, text: string, s: Surf, opts: { last?: boolean; cls?: string; enh?: Decl[] } = {}): string {
   const ty = h.t.typography;
   const ps = richParagraphs(text);
   return ps
@@ -159,7 +159,7 @@ export function lead(h: Hx, text: string, s: Surf, opts: { last?: boolean; cls?:
             ['line-height', '1.5'],
             ['max-width', '60ch'],
           ],
-          [['font-size', ty.scale.lead]],
+          [['font-size', ty.scale.lead], ...(opts.enh ?? [])],
         )}>${p}</p>`,
     )
     .join('');
@@ -211,7 +211,7 @@ export function rows(h: Hx, itemsHtml: string, opts: { cls?: string; ordered?: b
 }
 
 /** Párrafos de texto plano (línea en blanco = párrafo). */
-export function paras(h: Hx, text: string, s: Surf, opts: { secondary?: boolean; weight?: number; last?: boolean } = {}): string {
+export function paras(h: Hx, text: string, s: Surf, opts: { secondary?: boolean; weight?: number; last?: boolean; enh?: Decl[] } = {}): string {
   const ty = h.t.typography;
   const ps = richParagraphs(text);
   return ps
@@ -225,7 +225,7 @@ export function paras(h: Hx, text: string, s: Surf, opts: { secondary?: boolean;
         ['max-width', `${ty.measureCh}ch`],
       ];
       if (opts.weight) safe.push(['font-weight', String(opts.weight)]);
-      return `<p${st(h, safe, [['font-size', ty.enhanced.sizeBodyFluid]])}>${p}</p>`;
+      return `<p${st(h, safe, [['font-size', ty.enhanced.sizeBodyFluid], ...(opts.enh ?? [])])}>${p}</p>`;
     })
     .join('');
 }
@@ -411,6 +411,15 @@ export function wordCount(text: string): number {
   return String(text).trim().split(/\s+/).filter(Boolean).length;
 }
 
+/**
+ * Fix round 2: peso visual para repartir el cuerpo — una palabra normal pesa 1; un token de más de 22 caracteres
+ * (URL, cadena sin espacios) pesa ⌈largo / 5⌉, lo que ocupa en líneas. Siempre ≥ wordCount: un párrafo de peso ≤ 70
+ * tiene ≤ 70 palabras (lo que exige el validador) y no se vuelve un bloque altísimo por un token largo.
+ */
+export function wordWeight(text: string): number {
+  return String(text).trim().split(/\s+/).filter(Boolean).reduce((n, w) => n + ([...w].length > 22 ? Math.ceil([...w].length / 5) : 1), 0);
+}
+
 /** Abreviaturas frecuentes: su punto no cierra la oración («Dr. Pérez», «EE. UU.»). Solo en modo `guard`. */
 const ABBREV_BEFORE_DOT = /(?:^|[\s(«"“])(?:Dr|Dra|Sr|Sra|Srta|Ud|Uds|Lic|Ing|Prof|Profa|Arq|Mtro|Mtra|Av|Sto|Sta|núm|Núm|art|Art|pág|Pág|aprox|vs|EE|UU|p\. ej|P\. ej)$/;
 
@@ -460,8 +469,8 @@ export function splitSentences(text: string, opts: SentenceOpts = {}): string[] 
  * último límite de cláusula (`,` `;` `:` `—` `–`) que quepa; si no hay, en el último espacio.
  * Sin elipsis ni texto agregado: cabeza + cola = s. `null` si ni una palabra cabe.
  */
-export function cutToFit(s: string, maxChars: number, maxWords?: number): [string, string] | null {
-  const ok = (x: string) => x.trim().length > 0 && x.trim().length <= maxChars && (maxWords === undefined || wordCount(x) <= maxWords);
+export function cutToFit(s: string, maxChars: number, maxWords?: number, count: (x: string) => number = wordCount): [string, string] | null {
+  const ok = (x: string) => x.trim().length > 0 && x.trim().length <= maxChars && (maxWords === undefined || count(x) <= maxWords);
   const ends = (re: RegExp) => [...s.matchAll(re)].map((m) => (m.index as number) + m[0].length).filter((at) => at < s.length);
   for (const re of [/[,;:—–]\s+|\s+[—–]\s+/g, /\s+/g]) {
     const cut = ends(re).filter((at) => ok(s.slice(0, at))).pop();
@@ -475,7 +484,7 @@ export function cutToFit(s: string, maxChars: number, maxWords?: number): [strin
  * (y en `maxWords`, si se pide). La primera oración entra siempre, salvo con `cut`: si no cabe,
  * se corta con cutToFit y lo que sobra abre el resto (bienvenida: ninguna forma de texto válida
  * por el esquema produce una entrada fuera de tope). Con `guard` la entrada no cruza una línea en
- * blanco. `fits` dice si la entrada respeta los topes. Lo usan la presentación del módulo
+ * blanco. `fits` dice si la entrada respeta los topes (con `cut` siempre: entrada conforme o vacía). Lo usan la presentación del módulo
  * (240 caracteres, modo 3.12.0) y la bienvenida (240 caracteres / 40 palabras, guard + cut).
  */
 export function splitLeadRest(
@@ -490,20 +499,21 @@ export function splitLeadRest(
   while (k < sentences.length && (lead.length === 0 || (!blankEnd(lead) && ok(lead + sentences[k])))) lead += sentences[k++];
   let rest = sentences.slice(k).join('');
   if (opts.cut && !ok(lead)) {
+    // Fix round 2: garantía total. La entrada = el prefijo más largo de palabras enteras que cabe; si ni la primera
+    // palabra cabe (un token de > 240 caracteres), NO hay entrada y todo el texto va al cuerpo.
     const c = cutToFit(lead, opts.maxChars, opts.maxWords);
-    if (c) {
-      lead = c[0];
-      rest = c[1] + rest;
-    }
+    rest = (c ? c[1] : lead) + rest;
+    lead = c ? c[0] : '';
   }
-  return { lead: lead.trim(), rest: rest.trim(), fits: ok(lead.trim()) };
+  return { lead: lead.trim(), rest: rest.trim(), fits: lead.trim() === '' ? opts.cut === true : ok(lead.trim()) };
 }
 
 /**
  * Cuerpo en párrafos legibles: corta en límites de oración, cerca del reparto parejo
  * (≈ `target` palabras) y nunca por encima de `maxWords`; una línea en blanco del texto
  * fuerza un corte. Una oración sola más larga que `maxWords` se parte con cutToFit (cláusula,
- * luego espacio) y sus trozos siguen el reparto normal. Determinista; la concatenación
+ * luego espacio) y sus trozos siguen el reparto normal. Se cuenta con wordWeight (≥ palabras): un token
+ * larguísimo cuenta por las líneas que ocupa. Determinista; la concatenación
  * (normalizando espacios) es el texto original.
  */
 export function splitBodyParagraphs(text: string, opts: { maxWords: number; target: number }): string[] {
@@ -513,8 +523,8 @@ export function splitBodyParagraphs(text: string, opts: { maxWords: number; targ
     splitSentences(block, { guard: true }).forEach((s0, i) => {
       let s = s0;
       let brk = i === 0 && pieces.length > 0;
-      while (wordCount(s) > opts.maxWords) {
-        const c = cutToFit(s, Infinity, opts.maxWords);
+      while (wordWeight(s) > opts.maxWords && wordCount(s) > 1) {
+        const c = cutToFit(s, Infinity, opts.maxWords, wordWeight);
         if (!c) break;
         pieces.push({ s: c[0], brk });
         s = c[1];
@@ -523,7 +533,7 @@ export function splitBodyParagraphs(text: string, opts: { maxWords: number; targ
       pieces.push({ s, brk });
     });
   }
-  const total = pieces.reduce((n, p) => n + wordCount(p.s), 0);
+  const total = pieces.reduce((n, p) => n + wordWeight(p.s), 0);
   const n = Math.max(1, Math.ceil(total / opts.target));
   const per = total / n;
   const paras: string[] = [];
@@ -531,7 +541,7 @@ export function splitBodyParagraphs(text: string, opts: { maxWords: number; targ
   let curW = 0;
   let done = 0;
   for (const p of pieces) {
-    const w = wordCount(p.s);
+    const w = wordWeight(p.s);
     // corte si: línea en blanco, se pasa del tope, o el punto medio de la pieza cae después del siguiente reparto parejo
     if (curW > 0 && (p.brk || curW + w > opts.maxWords || done + w / 2 > per * (paras.length + 1))) {
       paras.push(cur.trim());

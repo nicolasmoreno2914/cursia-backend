@@ -118,6 +118,13 @@ export const WELCOME_LEAD_MAX_CHARS = 240;
 export const WELCOME_PARA_MAX_WORDS = 70;
 export const WELCOME_PARA_TARGET_WORDS = 60;
 
+/**
+ * Fix round 2: un token larguísimo (URL, cadena sin espacios) no desborda a 375 px. CLEAN_SAFE: los guiones suaves
+ * deterministas de richParagraphs (cada 10 caracteres en palabras de ≥ 22; Moodle elimina overflow-wrap/word-break bajo
+ * forceclean, text.ts §X.1). ENHANCED: además overflow-wrap:anywhere en la entrada y el cuerpo.
+ */
+const WRAP: Array<[string, string]> = [['overflow-wrap', 'anywhere'], ['word-break', 'break-word']];
+
 export function welcomeLabel(
   facts: CourseFacts,
   courseIntro: CourseIntroV3,
@@ -154,11 +161,13 @@ export function welcomeLabel(
     eyebrow(h, `Curso · ${c.modules} ${plural(c.modules, 'módulo', 'módulos')} · ${c.chapters} ${plural(c.chapters, 'capítulo', 'capítulos')}`, bs, { sentence: true }) +
     heading(h, 'h4', facts.course.title, bs, { display: true }) +
     accentRule(h, bs) +
-    // Con `cut` la entrada siempre cabe; solo una palabra suelta de > 240 caracteres llega aquí sin caber → tamaño de cuerpo.
-    (split.fits ? lead(h, split.lead, bs, { last: true, cls: 'cvc-lead' }) : paras(h, split.lead, bs, { last: true })),
+    // Fix round 2: con `cut` la entrada siempre cabe o es vacía (primera palabra de > 240 caracteres): sin entrada, el
+    // hero queda en línea meta + título + filete y todo el texto va al cuerpo.
+    (split.lead ? lead(h, split.lead, bs, { last: true, cls: 'cvc-lead', enh: WRAP }) : ''),
   );
+  if (!split.fits) shellFail(`Bienvenida: entrada fuera de tope (${split.lead.length} caracteres)`);
   const bodyParas = split.rest ? splitBodyParagraphs(split.rest, { maxWords: WELCOME_PARA_MAX_WORDS, target: WELCOME_PARA_TARGET_WORDS }) : [];
-  const body = bodyParas.length ? `<div class="cvc-welcome-body"${st(h, [['margin', '0'], ['padding', 0], ['color', s.fg]])}>${paras(h, bodyParas.join('\n\n'), s)}</div>` : '';
+  const body = bodyParas.length ? `<div class="cvc-welcome-body"${st(h, [['margin', '0'], ['padding', 0], ['color', s.fg]])}>${paras(h, bodyParas.join('\n\n'), s, { enh: WRAP })}</div>` : '';
   const hours = facts.hours
     ? pHtml(h, labelHtml(`Duración estimada: ${facts.hours.value} h (${facts.hours.source}).`), s, { secondary: true, last: true })
     : '';
