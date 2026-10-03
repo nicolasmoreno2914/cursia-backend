@@ -163,19 +163,24 @@ async function pureChecks() {
     assert(/AUDIO_WELCOME_TEXT_MISSING/.test((() => { try { AS.welcomeScriptFromCourseIntro({}); } catch (e) { return e.message; } })()), 'falta');
   });
 
-  await check('puro: guion de capítulo — 1 llamada si alcanza; corto → UNA continuación; sigue corto → AUDIOBOOK_SCRIPT_TOO_SHORT (fail loud); prompts del legacy', async () => {
-    const input = { courseTitle: 'Curso', chapterNumber: 2, chapterTitle: 'Bombas', sector: 'Minería', nivel: 'Intermedio', contentMarkdown: '# Bombas\n\nTexto **real** del capítulo.' };
-    const w = (n) => Array.from({ length: n }, () => 'palabra').join(' ');
+  await check('puro (r19): guion por BLOQUE del capítulo — 1 llamada en la banda 85–110 %; corto → UNA continuación; sigue corto → AUDIOBOOK_SECTION_TOO_SHORT (fail loud); el plan cubre todo el capítulo', async () => {
+    const md = '# Bombas\n\nTexto **real** del capítulo con una introducción breve.\n\n## Mantenimiento\n\n' + Array.from({ length: 30 }, (_, i) => `Paso ${i} del mantenimiento preventivo de la bomba.`).join(' ');
+    const input = { courseTitle: 'Curso', chapterNumber: 2, chapterTitle: 'Bombas', sector: 'Minería', nivel: 'Intermedio', contentMarkdown: md };
+    const plan = AS.planAudiobookSections(md);
+    eq(plan.narratableWords, AS.wordCount(AS.cleanAudioText(md)), 'el plan cubre todas las palabras');
+    const sec = plan.sections[0];
+    const t = AS.sectionTargetWords(sec.words);
+    const w = (n) => sec.text.split(/\s+/).slice(0, n).join(' ');
     let calls = [];
-    const r1 = await AS.generateChapterScript(input, async (p, role) => { calls.push(role); return { text: w(430), messageId: 'msg_a' }; });
-    eq([calls, r1.words, r1.continued, r1.messageIds], [['main'], 430, false, ['msg_a']], 'una llamada');
+    const r1 = await AS.generateSectionScript(input, sec, plan.sections.length, null, async (p, role) => { calls.push(role); return { text: w(t.target), messageId: 'msg_a' }; });
+    eq([calls, r1.words, r1.continued, r1.messageIds], [['main'], t.target, false, ['msg_a']], 'una llamada');
     calls = [];
-    const r2 = await AS.generateChapterScript(input, async (p, role) => { calls.push(role); return { text: w(role === 'main' ? 200 : 200), messageId: `msg_${role}` }; });
-    eq([calls, r2.words, r2.continued, r2.messageIds], [['main', 'continuation'], 400, true, ['msg_main', 'msg_continuation']], 'continuación');
-    const err = await rejectsRe(AS.generateChapterScript(input, async () => ({ text: w(100), messageId: 'm' })), /AUDIOBOOK_SCRIPT_TOO_SHORT/, 'corto');
+    const r2 = await AS.generateSectionScript(input, sec, plan.sections.length, null, async (p, role) => { calls.push(role); return { text: role === 'main' ? w(Math.round(t.target / 2)) : w(t.target - Math.round(t.target / 2)), messageId: `msg_${role}` }; });
+    eq([calls, r2.continued, r2.messageIds], [['main', 'continuation'], true, ['msg_main', 'msg_continuation']], 'continuación');
+    const err = await rejectsRe(AS.generateSectionScript(input, sec, 1, null, async () => ({ text: w(10), messageId: 'm' })), /AUDIOBOOK_SECTION_TOO_SHORT/, 'corto');
     eq(err.retryable, true, 'reintentable');
-    const p = AS.chapterNarrationPrompt(input);
-    assert(/Entre 350 y 600 palabras/.test(p.system) && /Capítulo 2 — Bombas del curso "Curso" orientado a Minería, nivel Intermedio/.test(p.user) && !/\*\*/.test(p.user), 'prompt');
+    const p = AS.sectionNarrationPrompt(input, sec, plan.sections.length, null);
+    assert(/NO un resumen/.test(p.system) && /Capítulo 2 — Bombas/.test(p.user) && /orientado a Minería, nivel Intermedio/.test(p.user) && p.user.includes(sec.text) && !/\*\*/.test(p.user), 'prompt');
     const chunks = AS.splitForTts(`${'Oración de prueba. '.repeat(400)}`);
     assert(chunks.length >= 2 && chunks.every((c) => c.length <= AS.TTS_MAX_CHARS && c.length > 0), `chunks ${chunks.map((c) => c.length)}`);
   });
@@ -653,8 +658,9 @@ async function dbChecks() {
       eq(row.status, 'completed', `estado (${row.error})`);
       const calls = fakes.st.llm.slice(llm0);
       eq([calls.length, calls[0].continuation, calls[1].continuation, calls[0].model], [2, false, true, 'claude-sonnet-4-6'], 'main + continuación');
-      const s = row.output_summary.audiobookScript;
-      assert(s && s.words >= 350 && s.messageIds.join() === calls.map((c) => c.id).join(), `guion persistido ${JSON.stringify(s && s.words)}`);
+      // r19: guion por bloque, persistido apenas se acepta (aquí el capítulo es un solo bloque).
+      const s = row.output_summary.audiobookSections && row.output_summary.audiobookSections['0'];
+      assert(s && s.ratio >= 0.85 && s.ratio <= 1.1 && s.continued && s.messageIds.join() === calls.map((c) => c.id).join(), `guion persistido ${JSON.stringify(s && [s.words, s.ratio])}`);
       const llmEv = await finalCharges(`item_run_id = $1 and provider = 'anthropic'`, [row.id]);
       eq((await reservationsOf(row.id, 'anthropic')).map((x) => x.settled), [true, true], 'reservas LLM liquidadas');
       eq(llmEv.map((e) => [e.operation, e.call_role, e.cost_source, e.external_operation_id, e.idempotency_key]),
@@ -665,7 +671,11 @@ async function dbChecks() {
       const [art] = await ds.query(`select * from public.artifacts where item_run_id = $1 and type = 'dynamic_audio_mp3'`, [row.id]);
       const mp3 = storage.blobs.get(`cursia-artifacts/${art.storage_path}`);
       eq(art.metadata.durationSeconds, AUD.mp3DurationSeconds(mp3), 'duración medida');
-      assert(art.metadata.script === s.text && art.metadata.words === s.words, 'guion en el artifact');
+      assert(art.metadata.scriptSha256 === sha256(s.text) && art.metadata.words === s.words, 'guion en el artifact');
+      const man = art.metadata.audiobookManifest;
+      eq(AUD.validateChapterAudioManifest(man), [], 'manifiesto válido en el artifact');
+      eq(row.output_summary.audiobookManifest, man, 'y en el summary del item');
+      eq([man.audio.seconds, man.audio.infoFrameSeconds], [art.metadata.durationSeconds, art.metadata.durationSeconds], 'Info = frames');
     });
 
     await check('DB audiolibro (calibración #2): TTS 500 tras el guion = gasto posible → RECONCILIACIÓN (no reintentable), reserva pendiente; un retry común NO vuelve a llamar; resubmitProvider explícito reutiliza el guion (0 LLM) y completa', async () => {
@@ -677,9 +687,10 @@ async function dbChecks() {
       await rejectsRe(PW.processProviderItem(workerDeps(), item), /^provider_reconciliation_required/, 'reconciliación');
       let row = await itemRow(runId, item.itemKey);
       eq(row.status, 'failed', `estado ${row.status} ${row.error}`);
-      assert(/tts_failed/.test(row.error) && row.output_summary.audiobookScript, 'guion guardado + motivo');
+      assert(/tts_failed/.test(row.error) && row.output_summary.audiobookSections && row.output_summary.audiobookSections['0'], 'guion guardado + motivo');
       const resv = await reservationsOf(row.id, 'openai');
-      eq(resv.map((x) => [x.measurement_status, x.settled, x.idempotency_key]), [['pending', false, `reservation:tts:${row.id}:g1:a1:chunk0`]], 'reserva TTS pendiente (el presupuesto la cuenta)');
+      eq(resv.map((x) => [x.measurement_status, x.settled]), [['pending', false]], 'reserva TTS pendiente (el presupuesto la cuenta)');
+      assert(new RegExp(`^reservation:tts:${row.id}:g1:a1:seg_seg-0-0-[0-9a-f]{12}$`).test(resv[0].idempotency_key), `clave por segmento ${resv[0].idempotency_key}`);
       assert(Number(resv[0].amount) > 0, 'reserva con monto estimado');
       const llmAfterFirst = fakes.st.llm.length;
       eq([llmAfterFirst - llm0, fakes.st.tts.length - tts0], [1, 1], 'una llamada LLM, un TTS');
@@ -846,7 +857,7 @@ async function dbChecks() {
       eq(row.status, 'failed', `reconciliación (${row.error})`);
       const resv = await reservationsOf(row.id, 'anthropic');
       eq(resv.map((x) => [x.settled, x.operation, x.idempotency_key, Number(x.usage.output_tokens) > 0]),
-        [[false, 'llm.audiobook_script', `reservation:llm:${row.id}:g1:a1:script-main-0`, true]], 'reserva LLM');
+        [[false, 'llm.audiobook_script', `reservation:llm:${row.id}:g1:a1:sec0-main`, true]], 'reserva LLM');
       eq((await events(`item_run_id = $1 and provider = 'openai'`, [row.id])).length, 0, 'sin TTS');
       await runs.retryItem(A2.cid, OWNER, 1, runA2, item.itemKey, false, true);
       const again = await claimProvider(runA2, 'audiobook_chapter');
@@ -943,7 +954,7 @@ async function dbChecks() {
       eq((await reservationsOf(row.id, 'gamma')).map((x) => x.settled), [true], 'Gamma: reserva liquidada');
     });
 
-    await check('FAULT DB caída TOTAL después del proveedor (ni liquidación ni failItem): la lease vence y el re-claim lo detecta en el LEDGER → reconciliación, 0 llamadas; también si el audio pagado no se pudo subir', async () => {
+    await check('FAULT DB caída TOTAL después del proveedor (ni liquidación ni failItem): la lease vence y el re-claim lo detecta en el LEDGER → reconciliación, 0 llamadas; si el audiolibro pagado YA quedó guardado por segmento y falló la subida final, el re-claim lo reutiliza (0 llamadas)', async () => {
       const R = await freshRun('Fault total');
       const c0 = counts();
       let item = await claimProvider(R.rid, 'audio_welcome');
@@ -968,7 +979,11 @@ async function dbChecks() {
       await ds.query(`update public.generation_item_runs set lease_until = now() - interval '1 second' where id = $1`, [row.id]);
       await sched.sweepExpiredLeases(R.rid);
       await retryNow(row.id);
-      await rejectsRe(PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audiobook_chapter')), /^provider_reconciliation_required: openai/, 're-claim tras pagar sin persistir');
+      // r19: el guion y el segmento pagados SÍ quedaron guardados (Storage + output_summary) antes de la subida
+      // final: el re-claim los reutiliza y completa sin volver a pagar (antes: reconciliación).
+      await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audiobook_chapter'));
+      row = await itemRow(R.rid, item.itemKey);
+      eq([row.status, row.output_summary.reusedSegments], ['completed', d1.tts], `re-claim reutiliza lo pagado (${row.error})`);
       eq(delta(c1), d1, '0 llamadas nuevas (ni LLM ni TTS)');
     });
 
@@ -989,7 +1004,7 @@ async function dbChecks() {
       eq((await finalCharges(`item_run_id = $1 and provider = 'openai'`, [row.id])).length, 1, 'UN cargo de TTS');
     });
 
-    await check('REVIEW I4b: resultado CONOCIDO (guion rechazado por validación, AUDIOBOOK_SCRIPT_TOO_SHORT) → reintento acotado normal (NO reconciliación); el intento queda reconocido y el re-claim completa', async () => {
+    await check('REVIEW I4b: resultado CONOCIDO (guion rechazado por validación, AUDIOBOOK_SECTION_TOO_SHORT) → reintento acotado normal (NO reconciliación); el intento queda reconocido y el re-claim completa', async () => {
       const R = await freshRun('Review I4b');
       const c0 = counts();
       fakes.plan.llmTiny = 2; // main + continuación, ambas cortas
@@ -997,7 +1012,7 @@ async function dbChecks() {
       await PW.processProviderItem(workerDeps(), item);
       let row = await itemRow(R.rid, item.itemKey);
       eq(row.status, 'retrying', `reintentable (${row.error})`);
-      assert(/^AUDIOBOOK_SCRIPT_TOO_SHORT/.test(row.error) && !/reconciliation/.test(row.error), row.error);
+      assert(/^AUDIOBOOK_SECTION_TOO_SHORT/.test(row.error) && !/reconciliation/.test(row.error), row.error);
       eq([row.output_summary.reconciliationAcknowledgedThroughAttempt, delta(c0).llm, delta(c0).tts], [1, 2, 0], 'intento reconocido; 2 LLM, 0 TTS');
       await retryNow(row.id);
       await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audiobook_chapter'));

@@ -139,11 +139,15 @@ function syntheticMp4WithMvhd(durationSec, tag = 'fake-mp4') {
 // (Gamma); POST /v1/audio/speech (OpenAI); POST /v1/messages (Anthropic). Cada
 // proveedor exige SU clave (401 si no). `plan` programa fallos/esperas para las
 // pruebas de reanudación. Registra cada llamada (sin guardar las claves).
-function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp3, pdfPages = 10, readyAfterPolls = 1 }) {
+function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp3, pdfPages = 10, readyAfterPolls = 1, ttsWordsPerSecond = 2.5 }) {
   const st = { gammaPosts: [], gammaGets: [], exports: [], tts: [], llm: [], badAuth: [], seq: 0 };
   const gens = new Map(); // id → {polls}
   // Un valor numérico en gammaPostFail/ttsFail/llmFail = ese status HTTP; 'drop' = se corta la conexión DESPUÉS de recibir el pedido.
-  const plan = { gammaPostFail: [], gammaHoldPending: false, gammaFailGeneration: false, gammaNoCredits: false, ttsFail: [], llmFail: [], llmShortFirst: 0, ttsFixedRequestId: null, llmTiny: 0 };
+  // r19 (audiolibro por bloques): llmPadded = N respuestas a 1,4 × el objetivo; llmDuplicate = N respuestas que repiten el
+  // texto del bloque anterior. ttsSlow = N segmentos con el doble de duración por palabra (voz ralentizada).
+  // ttsSameAudio = N segmentos que reciben el MISMO audio (makeMp3 sin el texto: bytes idénticos para la misma duración).
+  const plan = { gammaPostFail: [], gammaHoldPending: false, gammaFailGeneration: false, gammaNoCredits: false, ttsFail: [], llmFail: [], llmShortFirst: 0, ttsFixedRequestId: null, llmTiny: 0, llmPadded: 0, llmDuplicate: 0, ttsSlow: 0, ttsSameAudio: 0 };
+  let lastSectionText = null;
   // 'hang' = se recibe el pedido y nunca se responde (el cliente corta por timeout; la operación pudo ejecutarse).
   const hang = (rq) => setTimeout(() => rq.socket.destroy(), 10_000).unref();
   let base = null;
@@ -200,10 +204,15 @@ function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp
         if (typeof f === 'number') { st.tts.push({ ...req, failed: f }); return json(f, { error: { message: `fake ${f}` } }); }
         const rid = plan.ttsFixedRequestId || `req_f2_${++st.seq}`;
         st.tts.push({ model: req.model, voice: req.voice, chars: String(req.input || '').length, requestId: rid, response_format: req.response_format });
-        // ~2.5 palabras/s → duración proporcional al texto (segundos enteros, ≥ 1).
-        const secs = Math.max(1, Math.round(String(req.input || '').split(/\s+/).length / 2.5));
+        // ~2.5 palabras/s → duración proporcional al texto (segundos enteros, ≥ 1); ttsSlow → el doble.
+        const slow = plan.ttsSlow > 0;
+        if (slow) plan.ttsSlow--;
+        const secs = Math.max(1, Math.round(String(req.input || '').split(/\s+/).length / ttsWordsPerSecond)) * (slow ? 2 : 1);
+        const same = plan.ttsSameAudio > 0;
+        if (same) plan.ttsSameAudio--;
         rs.writeHead(200, { 'content-type': 'audio/mpeg', 'x-request-id': rid });
-        return rs.end(makeMp3(secs));
+        // El 2.º argumento (texto) deja que un generador NO silencioso varíe el audio por segmento (r19).
+        return rs.end(makeMp3(secs, same ? '' : String(req.input || '')));
       }
       // ── Anthropic ──
       if (rq.method === 'POST' && p === '/v1/messages') {
@@ -219,7 +228,29 @@ function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp
         const isCont = /CONTINUAR/.test(String(req.system || ''));
         const tiny = plan.llmTiny > 0;
         if (tiny) plan.llmTiny--;
-        const text = tiny ? words(20, st.seq) : isCont ? words(180, st.seq) : short ? words(200, st.seq) : words(430, st.seq);
+        // r19: el guion del audiolibro es por bloque: el pedido trae el texto COMPLETO del bloque y el objetivo
+        // («alrededor de N palabras» / «aproximadamente N palabras más»). La «adaptación» falsa usa las
+        // palabras del propio bloque (sin repetir frases), así que pasa el anti-bucle y la banda 85–110 %.
+        const user = String(req.messages && req.messages[0] && req.messages[0].content || '');
+        const block = /Texto del bloque[^\n]*:\n"""\n([\s\S]*?)\n"""/.exec(user);
+        let text;
+        if (block) {
+          const src = block[1].split(/\s+/).filter(Boolean);
+          const target = Number((isCont ? /aproximadamente (\d+) palabras más/ : /alrededor de (\d+) palabras/).exec(user)?.[1] || 0);
+          const padded = !isCont && plan.llmPadded > 0;
+          if (padded) plan.llmPadded--;
+          const dup = !isCont && plan.llmDuplicate > 0 && lastSectionText;
+          if (dup) plan.llmDuplicate--;
+          // tiny: ≤ 20 palabras y ≤ 30 % del objetivo (sigue corto aunque la continuación también lo sea).
+          const n = tiny ? Math.max(1, Math.min(20, Math.round(target * 0.3))) : padded ? Math.round(target * 1.4) : short ? Math.round(target * 0.6) : target;
+          if (dup) text = lastSectionText;
+          else if (isCont) text = src.slice(Math.max(0, src.length - n)).join(' ');
+          else if (n <= src.length) text = src.slice(0, n).join(' ');
+          else text = [...src, ...Array.from({ length: n - src.length }, (_, i) => `relleno${i}`)].join(' ');
+          if (!isCont) lastSectionText = text;
+        } else {
+          text = tiny ? words(20, st.seq) : isCont ? words(180, st.seq) : short ? words(200, st.seq) : words(430, st.seq);
+        }
         st.llm.push({ id, model: req.model, maxTokens: req.max_tokens, continuation: isCont });
         return json(200, {
           id, type: 'message', role: 'assistant', model: req.model, stop_reason: 'end_turn',
