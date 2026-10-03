@@ -1015,7 +1015,10 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   const libro = acts.find((a) => a.idnumber === 'cv3:shell:libro');
   const libroFiles = libro ? files.filter((f) => f.ctx === libro.ctx && f.component === 'mod_resource' && f.filearea === 'content' && f.filename !== '.') : [];
   const lf = libroFiles[0];
-  if (builderVersionAtLeast(exp.builderVersion, '3.13.0')) {
+  // r19: un paquete ≥ 3.13.0 (o cuyo Libro ya es PDF, con expectativas sin versión) sigue las reglas del PDF;
+  // el botón (LIBRO_CTA) solo se exige con la versión declarada ≥ 3.13.0.
+  const libroIsPdf = builderVersionAtLeast(exp.builderVersion, '3.13.0') || (!!lf && (lf.mimetype === 'application/pdf' || /\.pdf$/i.test(lf.filename)));
+  if (libroIsPdf) {
     // r19 (L1/L5): un ÚNICO archivo, PDF real (application/pdf, .pdf), en el contexto del propio recurso.
     if (!libro || !lf) add('LIBRO', 'cv3:shell:libro', 'falta el Libro Guía');
     else {
@@ -1028,10 +1031,12 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       if (!pdf) add('LIBRO', 'cv3:shell:libro', 'falta el blob del PDF');
       else if (pdf.subarray(0, 5).toString('latin1') !== '%PDF-' || !/%%EOF\s*$/.test(pdf.subarray(-32).toString('latin1'))) add('LIBRO', 'cv3:shell:libro', 'el PDF no empieza en %PDF- o no cierra en %%EOF (truncado)');
       // r19 (L4): botón «Abrir Libro Guía» hacia su PROPIO moduleid, en una pestaña nueva.
-      const anchors = [...libro.intro.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/g)];
-      const tok = `$@RESOURCEVIEWBYID*${libro.mid}@$`;
-      const ok = anchors.length === 1 && /Abrir Libro Guía/.test(extractText(anchors[0][2])) && anchors[0][1].includes(`href="${tok}"`) && /\btarget="_blank"/.test(anchors[0][1]) && /\brel="[^"]*\bnoopener\b[^"]*"/.test(anchors[0][1]);
-      if (!ok) add('LIBRO_CTA', 'cv3:shell:libro#intro', `se esperaba exactamente un botón «Abrir Libro Guía» con href="${tok}" target="_blank" rel="noopener…" (hay ${anchors.length} enlace(s))`);
+      if (builderVersionAtLeast(exp.builderVersion, '3.13.0')) {
+        const anchors = [...libro.intro.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/g)];
+        const tok = `$@RESOURCEVIEWBYID*${libro.mid}@$`;
+        const ok = anchors.length === 1 && /Abrir Libro Guía/.test(extractText(anchors[0][2])) && anchors[0][1].includes(`href="${tok}"`) && /\btarget="_blank"/.test(anchors[0][1]) && /\brel="[^"]*\bnoopener\b[^"]*"/.test(anchors[0][1]);
+        if (!ok) add('LIBRO_CTA', 'cv3:shell:libro#intro', `se esperaba exactamente un botón «Abrir Libro Guía» con href="${tok}" target="_blank" rel="noopener…" (hay ${anchors.length} enlace(s))`);
+      }
     }
   } else {
     const lhtml = lf ? await text(`files/${lf.hash.slice(0, 2)}/${lf.hash}`) : null;
