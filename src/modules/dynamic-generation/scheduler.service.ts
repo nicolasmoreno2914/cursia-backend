@@ -337,6 +337,8 @@ export const SERVER_OWNED_SUMMARY_KEYS: readonly string[] = Object.freeze([
   'mode', 'videoMode', 'videoModeOriginal', 'external', 'externalReservationKey', 'externalSubmitStartedAt',
   'delivery', 'youtubeVideoId', 'youtubeUrl', 'youtubeUploadStartedAt', 'videogenStatus', 'videogenDownloadUrl',
   'videoIdentity', 'v3Validation', 'artifactIds',
+  // REL CREDIT: estado de la sonda del proveedor (lo escribe solo el barrido / retryItem).
+  'providerProbe',
 ]);
 
 /** `summary` del ejecutor del navegador sin las claves del servidor (y la lista de las descartadas). */

@@ -184,6 +184,9 @@ jobs:
       - name: Check REL lease de ejecución del navegador por run (puro; la parte PG16 corre local)
         run: node scripts/check-rel-exec-lease.js --pure-only
 
+      - name: Check REL sonda del proveedor tras crédito/cuota agotados (puro; la parte PG16 corre local)
+        run: node scripts/check-rel-provider-probe.js --pure-only
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh

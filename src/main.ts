@@ -69,6 +69,8 @@ async function bootstrap() {
     { name: 'reintento automático seguro', run: () => runsService.autoRetrySafeRejections() },
     // #583 (decisión del usuario): UN reenvío automático de un audio con resultado incierto (≤ USD 0.10).
     { name: 'reenvío de audio incierto', run: () => runsService.autoResubmitAmbiguousAudio() },
+    // REL CREDIT: sonda del proveedor tras crédito/cuota agotados (un canario por run y proveedor; legacy la apaga).
+    { name: 'sonda de crédito del proveedor', run: () => runsService.autoProbeProviderCredit() },
     { name: 'empaque automático', run: () => autoPackage.sweep() },
   ]);
 }
