@@ -11,11 +11,46 @@ import {
   loadAutoPackageState,
 } from './auto-package-state';
 import { isDynamicCourseStructureEnabled } from '../features/dynamic-features';
+import { classifyFailure } from '../reliability/failure-classifier';
 
 export type AutoPackageOutcome =
   | { action: 'enqueued' | 'reused'; runId: string; jobId: string; status: string }
   | { action: 'skipped'; runId: string; reason: string }
-  | { action: 'blocked'; runId: string; code: string };
+  | { action: 'blocked'; runId: string; code: string }
+  | { action: 'repairing'; runId: string; itemKey: string; code: string };
+
+/**
+ * REL MVP — item del run nombrado en un rechazo del empaque (mensaje del validador / precheck o su lista
+ * `missing`). La clave más larga gana (p.ej. `exam:m1` antes que un prefijo). null = ninguno.
+ */
+export function packageBlockItemKey(text: string, missing: readonly string[], itemKeys: readonly string[]): string | null {
+  const hay = [String(text ?? ''), ...missing.map(String)].join('\n');
+  const keys = [...new Set(itemKeys)].filter(Boolean).sort((a, b) => b.length - a.length);
+  let best: { key: string; at: number } | null = null;
+  for (const k of keys) {
+    let from = 0;
+    while (from <= hay.length) {
+      const at = hay.indexOf(k, from);
+      if (at < 0) break;
+      const before = at === 0 ? '' : hay[at - 1];
+      const after = hay[at + k.length] ?? '';
+      // Límite de clave: nunca un prefijo de otra clave (content:c1 dentro de content:c10).
+      if (!/[A-Za-z0-9_-]/.test(before) && !/[A-Za-z0-9_-]/.test(after)) {
+        if (!best || at < best.at) best = { key: k, at };
+        break;
+      }
+      from = at + 1;
+    }
+  }
+  return best ? best.key : null;
+}
+
+/** Código del rechazo del empaque (primer token en mayúsculas conocido o el código explícito). */
+function packageBlockCode(text: string, explicit?: string | null): string {
+  const v = classifyFailure({ source: 'package_worker', error: String(text ?? '') });
+  if (!v.unclassified) return v.code;
+  return String(explicit || v.code || 'package_error').slice(0, 80);
+}
 
 /**
  * EV6 DoD BE-B — empaque final AUTOMÁTICO (ver auto-package-state.ts para las reglas).
@@ -69,6 +104,20 @@ export class AutoPackageService implements OnModuleInit {
       if (mark.transient.count >= AUTO_PACKAGE_MAX_TRANSIENT) return { action: 'skipped', runId, reason: 'transient_exhausted' };
       // El barrido solo actúa sobre lo que el estado declara pendiente (misma regla que RunDto.completion).
       if (source === 'sweep' && !state.autoRetryPending && !state.rebuildPending) return { action: 'skipped', runId, reason: 'nothing_pending' };
+      // REL MVP: el último paquete final falló por el contenido de un item → reparar ese item (o needs_attention).
+      if (state.status === 'failed' && state.failedSinceMark > 0) {
+        const [lastFailed] = await this.dataSource.query(
+          `select id, error_message from public.production_jobs
+            where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1 and worker_status in ('failed', 'failed_retryable')
+              and created_at >= $2::timestamptz
+            order by created_at desc, id desc limit 1`,
+          [runId, mark.eligibleAt.toISOString()],
+        );
+        if (lastFailed?.error_message) {
+          const out = await this.repairOrBlock(runId, String(lastFailed.error_message), [], null, source);
+          if (out) return out;
+        }
+      }
       // `Number(null)` es 0: un Blueprint que no resuelve (join vacío) nunca pasa como el número 0.
       const bp = run.blueprint_number == null ? NaN : Number(run.blueprint_number);
       if (!Number.isInteger(bp) || bp < 1) {
@@ -101,6 +150,15 @@ export class AutoPackageService implements OnModuleInit {
       const status = (err as { getStatus?: () => number })?.getStatus?.();
       const missing: string[] = Array.isArray(resp?.missing) ? resp.missing.filter((x: unknown) => typeof x === 'string').slice(0, 50).map((x: string) => x.slice(0, 200)) : [];
       const code = String((resp && typeof resp === 'object' && resp.code) || (missing.length ? 'package_not_ready' : status ? `http_${status}` : 'error')).slice(0, 80);
+      // REL MVP: el precheck / validador rechazó el contenido de un item → repararlo (una vez) o needs_attention.
+      try {
+        const text = String((resp && typeof resp === 'object' && typeof resp.message === 'string' ? resp.message : (err as Error)?.message) ?? '');
+        const out = await this.repairOrBlock(runId, text, missing, resp && typeof resp === 'object' && resp.code ? String(resp.code) : null, source,
+          !!(status && status >= 400 && status < 500));
+        if (out) return out;
+      } catch (e) {
+        this.logger.warn(`empaque automático (${source}): run ${runId}: la reparación por item falló (${e instanceof Error ? e.message : String(e)}); sigue el camino de siempre`);
+      }
       if (status && status >= 400 && status < 500) {
         // Fix round 1 (I2): el run no se puede empaquetar tal como está. Queda registrado el código, el mensaje
         // (para el admin) y lo que falta; la acción de admin es la del componente que lo bloquea (nunca un
@@ -122,6 +180,61 @@ export class AutoPackageService implements OnModuleInit {
       this.logger.warn(`empaque automático (${source}): run ${runId} falló (${err instanceof Error ? err.message : String(err)}); lo retoma el barrido`);
       return { action: 'skipped', runId, reason: 'transient_error' };
     }
+  }
+
+  /**
+   * REL MVP — reparación por item de un rechazo del empaque. Devuelve:
+   *  - `repairing`: el rechazo nombra un item del run y el contenido de ESE item es la causa (no transitorio)
+   *    → se regenera solo ese componente (una vez); el run se reabre y el empaque automático vuelve a correr
+   *    cuando se complete;
+   *  - `blocked`: ese item ya se reparó una vez / no es elegible, o el rechazo es un D explícito sin item
+   *    (producto / configuración) → needs_attention con el código (sin reintentos que darían lo mismo);
+   *  - null: transitorio o sin clasificar → el reintento acotado de siempre.
+   * `onlyRepair`: un 4xx del precheck ya se registra como bloqueo con su código, mensaje y faltantes
+   * (camino de siempre): acá solo se agrega la reparación; cualquier otro desenlace devuelve null.
+   */
+  private async repairOrBlock(runId: string, text: string, missing: string[], explicitCode: string | null, source: string,
+    onlyRepair = false): Promise<AutoPackageOutcome | null> {
+    if (!this.runs) return null;
+    const verdict = classifyFailure({ source: 'package_worker', error: String(text ?? '') });
+    const code = packageBlockCode(text, explicitCode);
+    if (verdict.class === 'A') return null;
+    const rows: Array<{ item_key: string }> = await this.dataSource.query(
+      `select distinct item_key from public.generation_item_runs where job_id = $1`, [runId]);
+    const itemKey = packageBlockItemKey(text, missing, rows.map((r) => r.item_key));
+    if (itemKey) {
+      try {
+        await this.runs.autoRepairItemForPackage(runId, itemKey, code);
+        this.logger.warn(`empaque automático (${source}): run ${runId} — ${code} en ${itemKey}: se regenera solo ese componente y se vuelve a empaquetar al terminar`);
+        return { action: 'repairing', runId, itemKey, code };
+      } catch (err) {
+        const resp = (err as { getResponse?: () => unknown })?.getResponse?.() as any;
+        const why = String((resp && typeof resp === 'object' && (resp.reason || resp.code)) || (err instanceof Error ? err.message : String(err))).slice(0, 200);
+        if (onlyRepair) return null;
+        await this.recordBlock(runId, code, `${code} en ${itemKey}: no se repara solo (${why}). ${String(text ?? '').slice(0, 300)}`, [itemKey, ...missing]);
+        this.logger.warn(`empaque automático (${source}): run ${runId} — ${code} en ${itemKey} no se repara solo (${why}); queda para un admin`);
+        return { action: 'blocked', runId, code };
+      }
+    }
+    // Sin item: un D explícito (producto/configuración) no mejora reintentando → needs_attention con su código.
+    if (!onlyRepair && verdict.class === 'D' && !verdict.unclassified) {
+      await this.recordBlock(runId, code, String(text ?? '').slice(0, 400), missing);
+      this.logger.warn(`empaque automático (${source}): run ${runId} bloqueado (${code}); queda para un admin`);
+      return { action: 'blocked', runId, code };
+    }
+    return null;
+  }
+
+  /** Bloqueo del empaque automático (needs_attention con el código). Mismo registro que el 4xx del precheck. */
+  private async recordBlock(runId: string, code: string, message: string, missing: string[]): Promise<void> {
+    await this.dataSource.query(
+      `update public.production_jobs
+          set output_summary = jsonb_set(output_summary, '{autoPackage,blocked}',
+                jsonb_build_object('code', $2::text, 'message', $3::text, 'missing', $4::jsonb, 'at', now()), true),
+              updated_at = now()
+        where id = $1 and jsonb_typeof(output_summary->'autoPackage') = 'object'`,
+      [runId, code.slice(0, 80), message.slice(0, 400), JSON.stringify(missing.slice(0, 50).map((x) => String(x).slice(0, 200)))],
+    );
   }
 
   /** Fix round 1 (M1): un transitorio más (tope + espera propios). Nunca lanza. */
