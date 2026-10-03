@@ -9,7 +9,9 @@
 //   - a 1280: la entrada ocupa ≤ 4 líneas; ningún bloque de texto (p, h4, li) supera 260 px de alto;
 //     la fila de cifras (ul.cvc-facts) empieza dentro de los primeros 900 px del label (bienvenidas ≤ 160 palabras;
 //     con 220, el tope del esquema, solo se informa);
-//   - a 375: ningún bloque de texto supera 450 px y el título del curso queda ≤ 40 px de cuerpo.
+//   - a 375: ningún bloque de texto supera 450 px y el título ≤ 40 px. Los topes de ALTO de bloque (260 / 450) no se
+//     aplican a las formas sintéticas SYNTHETIC_FILLER de los fixtures (tokens de 250–300 caracteres + relleno de palabras
+//     largas); para ellas vale todo lo demás, en particular «sin desborde horizontal».
 // Para todo largo: la fila de cifras va inmediatamente después del cuerpo (orden intro → información del curso).
 // Con `--shots DIR` guarda capturas (bienvenida de #625) por familia a 1280 y 375: DIR/<tag>_<familia>-<modo>[_clean]_<ancho>.png
 // (ENHANCED y CLEAN_SAFE).
@@ -36,7 +38,7 @@ const te = require(path.join(distRoot, 'modules/theme-engine/index.js'));
 const cp = require(path.join(distRoot, 'modules/course-profiles/course-profiles.js'));
 const F = require('./lib/v21-shell-fixtures');
 const VCF = require('./lib/v21-vc-fixtures');
-const { WELCOMES: W0, C1_WELCOMES } = require('./lib/r19-welcome-fixtures');
+const { WELCOMES: W0, C1_WELCOMES, SYNTHETIC_FILLER } = require('./lib/r19-welcome-fixtures');
 const WELCOMES = { ...W0, ...C1_WELCOMES }; // fix round 1: + las formas límite de C1
 const { launchChrome, sleep } = require('./lib/v21-cdp');
 
@@ -145,14 +147,14 @@ function page(body) {
             if (m.small.length) fails.push(`${where}: texto < 16 px fuera de un chip de metadato: ${m.small.slice(0, 3).join(', ')}`);
             if (w === 1280) {
               if (m.leadLines !== null && m.leadLines > 4) fails.push(`${where}: la entrada ocupa ${m.leadLines} líneas (> 4)`);
-              if (big.h > 260) fails.push(`${where}: bloque de texto de ${big.h} px (> 260): ${big.tag} «${big.text}…»`);
+              if (big.h > 260 && !SYNTHETIC_FILLER.has(fx)) fails.push(`${where}: bloque de texto de ${big.h} px (> 260): ${big.tag} «${big.text}…»`);
               // Cifras sobre el pliegue: para bienvenidas de largo real (≤ 160 palabras; #625 = 141, #616 = 155). En el tope del
               // esquema (220) el cuerpo solo ya ocupa ~14 líneas y el orden pedido por el usuario (intro → información del curso)
               // las deja a ~920–1070 px: aceptado por el controlador (r19 fix round 1, I3); para todo largo se exige el ORDEN.
               const wc = WELCOMES[fx].trim().split(/\s+/).length;
               if (m.statsTop === null || (wc <= 160 && m.statsTop > 900)) fails.push(`${where}: la fila de cifras empieza a ${m.statsTop} px (> 900)`);
             } else {
-              if (big.h > 450) fails.push(`${where}: bloque de texto de ${big.h} px a 375 (> 450): ${big.tag} «${big.text}…»`);
+              if (big.h > 450 && !SYNTHETIC_FILLER.has(fx)) fails.push(`${where}: bloque de texto de ${big.h} px a 375 (> 450): ${big.tag} «${big.text}…»`);
               if (m.titlePx === null || m.titlePx > 40) fails.push(`${where}: título de ${m.titlePx}px a 375 (> 40)`);
             }
             if (SHOTS && fx === FIXTURES[0]) {

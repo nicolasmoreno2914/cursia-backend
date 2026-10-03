@@ -86,11 +86,11 @@ const GOLDEN = {
   // Dorados anteriores (3.12.0): h5p-final-light 5e9bf0f0…, scorm-nofinal-dark b967577f…, h5p-nofinal-dark-mock-cleansafe
   // 14d45c9d…, scorm-final-light 6c18bcce…, h5p-ev5c-rules1 3c6d123e….
   mbz: {
-    'h5p-final-light': 'e08b30ead92b6daecc5a1c86683b8971300cf9327d84b2927575f5fb1fda4b6f',
-    'scorm-nofinal-dark': 'e1173289ba0439787b2fb8dc4953477e9e4a1b0e07a353767bb30c3486d20fa5',
-    'h5p-nofinal-dark-mock-cleansafe': '57396f8588d83fdf48aa70ef95b0af934b90c060e0d6bd47743e8e8522d78020',
-    'scorm-final-light': 'e18851b4b4c6ed7c00ddd5f9e7246cd2396f6e4f8777f6909192e9e2a09413c2',
-    'h5p-ev5c-rules1': '04da54bf506ca3bde3eb1b1ce2af89ce618ed192917ba706e73db6c423bcfac0',
+    'h5p-final-light': 'c7f404a8a5a7eb224247d68c4f527e58ff560125bcd102e194ea3f3de76af85f',
+    'scorm-nofinal-dark': 'dd388ebeb8e9b2b1dc923f5276b755bbd7e8d77f56f840fbc3842b77277580fe',
+    'h5p-nofinal-dark-mock-cleansafe': '050f59afa996d7bf100031ff76e148c1205184dd477cfa864d0b13f738ab8c8e',
+    'scorm-final-light': 'bbc155e2e2b502ea3e69c6d63dfa85007e68bfab67d71b8e37c5150a1656284f',
+    'h5p-ev5c-rules1': '68ebeb3033f08f9803b6ffc5b7e3327c9c201fc98348123e19eb4822e584546a',
   },
 };
 

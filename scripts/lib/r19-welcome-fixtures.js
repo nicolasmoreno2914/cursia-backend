@@ -94,5 +94,23 @@ const MODULE_PRESENTATIONS = {
   decimal: 'El valor 1.5 es el umbral de referencia. Este módulo explica de dónde sale y cómo usarlo en tu trabajo diario, con ejemplos concretos y preguntas para revisar tu propia práctica en cada capítulo del recorrido.',
 };
 
+// Fix round 2 (re-review r19 W): un token sin espacios de > 240 caracteres. Primera palabra = token → SIN entrada (todo al
+// cuerpo); token dentro de la primera oración → la entrada son las palabras previas. Ninguno desborda a 375 px.
+const relleno = Array.from({ length: 90 }, (_, i) => `relleno${'abcdefghi'[i % 9]}`).join(' ');
+C1_WELCOMES.tokenFirst250 = `${'a'.repeat(250)} ${Array.from({ length: 90 }, (_, i) => `relleno${i % 9}`).join(' ')}.`; // review-w/adv3.js, tal cual (91 palabras)
+C1_WELCOMES.tokenFirst300 = `${'bienvenida'.repeat(30)} ${relleno}.`; // primera palabra de 300 caracteres
+C1_WELCOMES.tokenInside = `Te damos la bienvenida al curso ${'x'.repeat(260)} ${relleno}.`;
+/**
+ * Formas sintéticas de relleno (palabras de 8–9 letras como «relleno2», tokens de 250–300): un párrafo legal de 70
+ * palabras así supera los topes de ALTO de bloque del render check (260 px a 1280 en editorial, 450 px a 375), pensados
+ * para prosa real. Para ellas el render exige todo lo demás (sin desborde a 375, orden, entrada ≤ 4 líneas, texto ≥ 16 px)
+ * salvo esos altos; check-r19-welcome sigue exigiendo ≤ 70 palabras por párrafo.
+ */
+const SYNTHETIC_FILLER = new Set(['tokenFirst250', 'tokenFirst300', 'tokenInside']);
+/** Bienvenidas sin entrada (la primera palabra no cabe en 240 caracteres). */
+const NO_LEAD = new Set(['tokenFirst250', 'tokenFirst300']);
+
 module.exports.C1_WELCOMES = C1_WELCOMES;
+module.exports.NO_LEAD = NO_LEAD;
+module.exports.SYNTHETIC_FILLER = SYNTHETIC_FILLER;
 module.exports.MODULE_PRESENTATIONS = MODULE_PRESENTATIONS;

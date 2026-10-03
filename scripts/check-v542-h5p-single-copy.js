@@ -220,7 +220,7 @@ const BS_CFG = {
     // #583 QUAL (builder 3.11.0): reviewmaxmarks 69904 → 272, frase del cierre, tarjeta del Libro Guía como <intro> del recurso (sin label libro_card; ids renumerados) y runtime VC 4 — diff semántico en scratchpad/r18/qual/golddiff/sem.js (antes d4e6bc68…: staging 3.6.0 = 3.10.0 para este curso).
     // UX r18 (builder 3.12.0): sección 0 hero primero / foro al final, sin kicker, preload="metadata" + title/aria-label (fix 1), Info en audiolibro.mp3 y portadas a 1600 px — diff semántico en scratchpad/r18/uximpl-golddiff4.js (antes 80e8b108…, 3.11.0).
     // r19 W (builder 3.12.0 → 3.13.0): SOLO cambia el label cv3:shell:welcome (hero con superficie según heroTreatment, «Curso · N módulos · M capítulos», entrada ≤ 40 palabras y cuerpo en párrafos ≤ 70) — diff por entrada del zip en scratchpad/r19/w-logs/golddiff (hook.js + diff.js) (antes a169af34…, 3.12.0).
-    eq(sha(r.mbz), 'd1110959eac9421203c98edd900af2ab60cc520c98830c16d27b079a289931c2', 'sha256');
+    eq(sha(r.mbz), 'add76c64408254e6635f89048e4d2036d731ef7626c548760579cc8710e10258', 'sha256');
   });
 
   console.log(`\n${failures ? 'HAY FALLOS' : 'Todos los checks de V542 I2 (H5P de una sola copia) pasaron'} (${passed} ✅, ${failures} ❌).`);

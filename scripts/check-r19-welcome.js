@@ -48,7 +48,7 @@ const cp = loadDist('modules/course-profiles/course-profiles.js');
 const F = require('./lib/v21-shell-fixtures');
 const VCF = require('./lib/v21-vc-fixtures');
 const PF = require('./lib/v21-packaging-fixtures');
-const { WELCOMES, C1_WELCOMES, MODULE_PRESENTATIONS } = require('./lib/r19-welcome-fixtures');
+const { WELCOMES, C1_WELCOMES, MODULE_PRESENTATIONS, NO_LEAD } = require('./lib/r19-welcome-fixtures');
 // Fix round 1: la matriz incluye las formas de C1 (primera oración de 78 palabras, sin puntuación, una oración de 220, una sola oración).
 const ALL_WELCOMES = { ...WELCOMES, ...C1_WELCOMES };
 
@@ -110,7 +110,7 @@ function all(n, out = []) {
  * Las aserciones de composición sobre el HTML de UN label de bienvenida. Devuelve la lista de fallas (vacía = OK),
  * para poder usarla también como control negativo sobre el hero de 3.12.0.
  */
-function welcomeIssues(html, { welcome, title, theme, clean }) {
+function welcomeIssues(html, { welcome, title, theme, clean, noLead = false }) {
   const bad = [];
   const root = vc.parseHtml(html);
   const els = all(root).filter((n) => n.tag !== '#root');
@@ -127,7 +127,10 @@ function welcomeIssues(html, { welcome, title, theme, clean }) {
   if (!stats) bad.push('sin fila de cifras');
   if (!band) bad.push('sin superficie del hero (cvc-welcome-band)');
   // (1) orden
-  if (!leadEl) bad.push('sin entrada (p.cvc-lead)');
+  // Fix round 2: sin entrada SOLO cuando la primera palabra no cabe (token de > 240 caracteres).
+  if (noLead) {
+    if (leadEl) bad.push('primera palabra de > 240 caracteres renderizada como entrada');
+  } else if (!leadEl) bad.push('sin entrada (p.cvc-lead)');
   if (!bodyPs.length) bad.push('sin cuerpo (cvc-welcome-body p)');
   if (titleEl && stats && bodyPs.length) {
     const seq = [titleEl, ...(leadEl ? [leadEl] : []), bodyPs[0], stats].map((n) => pos.get(n));
@@ -261,12 +264,17 @@ function welcomeIssues(html, { welcome, title, theme, clean }) {
     eq([np.fits, words(np.lead)], [true, 40], 'sin puntuación → corte en palabra (40)');
     eq(HTML.cutToFit('uno dos, tres cuatro cinco', 240, 3), ['uno dos, ', 'tres cuatro cinco'], 'cutToFit: cláusula');
     eq(HTML.cutToFit('uno dos tres cuatro', 240, 3), ['uno dos tres ', 'cuatro'], 'cutToFit: palabra');
+    // Fix round 2: token de > 240 caracteres como primera palabra → entrada vacía; dentro de la oración → palabras previas.
+    const t1 = HTML.splitLeadRest(C1_WELCOMES.tokenFirst250, WO);
+    eq([t1.lead, t1.fits, norm(t1.rest) === norm(C1_WELCOMES.tokenFirst250)], ['', true, true], 'tokenFirst250 → sin entrada, todo al cuerpo');
+    const t2 = HTML.splitLeadRest(C1_WELCOMES.tokenInside, WO);
+    eq([t2.lead, t2.fits], ['Te damos la bienvenida al curso', true], 'tokenInside → entrada = palabras previas al token');
     for (const [id, w] of Object.entries(ALL_WELCOMES)) {
       const sp = HTML.splitLeadRest(w, WO);
       assert(sp.fits, `${id}: entrada fuera de tope`);
       const ps = HTML.splitBodyParagraphs(sp.rest, { maxWords: 70, target: 60 });
       assert(ps.every((p) => words(p) <= 70), `${id}: párrafo > 70 (${ps.map(words)})`);
-      eq(norm([sp.lead, ...ps].join(' ')), norm(w), `${id}: sin pérdida`);
+      eq(norm([sp.lead, ...ps].filter(Boolean).join(' ')), norm(w), `${id}: sin pérdida`);
     }
     eq(HTML.splitBodyParagraphs(HTML.splitLeadRest(WELCOMES.w625, WO).rest, { maxWords: 70, target: 60 }).map(words), [46, 56], '#625 cuerpo');
     eq(HTML.splitBodyParagraphs('Uno dos tres.\n\nCuatro cinco.', { maxWords: 70, target: 60 }), ['Uno dos tres.', 'Cuatro cinco.'], 'línea en blanco = corte');
@@ -290,7 +298,7 @@ function welcomeIssues(html, { welcome, title, theme, clean }) {
           const lbl = S.welcomeLabel(facts, ci, theme, o);
           const again = S.welcomeLabel(facts, ci, theme, o);
           if (lbl.html !== again.html) errs.push(`${id}: no determinista`);
-          const issues = welcomeIssues(lbl.html, { welcome, title: facts.course.title, theme, clean: !level });
+          const issues = welcomeIssues(lbl.html, { welcome, title: facts.course.title, theme, clean: !level, noLead: NO_LEAD.has(id) });
           issues.forEach((i) => errs.push(`${id}: ${i}`));
         }
         assert(errs.length === 0, errs.slice(0, 8).join('\n'));
@@ -391,7 +399,7 @@ function welcomeIssues(html, { welcome, title, theme, clean }) {
           if (!(await z.file(f).async('string')).includes('<idnumber>cv3:shell:welcome</idnumber>')) continue;
           const x = await z.file(f.replace('module.xml', 'label.xml')).async('string');
           const intro = /<intro>([\s\S]*?)<\/intro>/.exec(x)[1].replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&');
-          const issues = welcomeIssues(intro, { welcome: w, title: r.expectations.facts.course.title, theme: te.resolveTheme({ themeFamily, mode: 'light' }), clean: false });
+          const issues = welcomeIssues(intro, { welcome: w, title: r.expectations.facts.course.title, theme: te.resolveTheme({ themeFamily, mode: 'light' }), clean: false, noLead: NO_LEAD.has(id) });
           issues.forEach((i) => errs.push(`${id}/${themeFamily}: ${i}`));
         }
       }

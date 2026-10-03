@@ -272,8 +272,8 @@ async function pureChecks() {
   // r19 W (builder 3.12.0 → 3.13.0): SOLO cambia el label cv3:shell:welcome (hero con superficie según heroTreatment, «Curso · N módulos · M capítulos», entrada ≤ 40 palabras y cuerpo en párrafos ≤ 70) — diff por entrada del zip en scratchpad/r19/w-logs/golddiff (hook.js + diff.js).
   // Dorados 3.12.0: 644 7cb2a7c7…, 645 32191ec2….
   const GOLDEN_PRE_T5 = {
-    644: ['ef3fe9910d95c49ea6711b7c7a3b892c85a27b28483bd75fc9509cdc01abebaf', { engine: 'h5p', finalExam: true, courseId: 644 }],
-    645: ['ee0a9bd456d51e8e4ad68547471f54193287620ea5017c9dfd4499dbd9ae1f9c', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
+    644: ['4469ff50f32c0fc38cf2b68a2b99a2fa97893ef784d414582cb58c956a3204ce', { engine: 'h5p', finalExam: true, courseId: 644 }],
+    645: ['e63ce5ae42c4717a9ca3eca5659cbad77fb361fc43a72c33f41469bbaee9e0ea', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
   };
   await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B4 (respuestas explicadas sobre sistema visual 2.0 + certificado + política de revisión del quiz con revisión de respuestas propias V542 + H5P de una sola copia + retroalimentación global del quiz + #583 QUAL + UX r18 + r19 W, builder 3.13.0), con y sin el campo', async () => {
     for (const [id, [want, o]] of Object.entries(GOLDEN_PRE_T5)) {
