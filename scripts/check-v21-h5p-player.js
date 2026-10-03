@@ -104,9 +104,10 @@ const inH5p = (body) => `(()=>{const w=${FIND};if(!w)throw new Error('sin ventan
 // UX #5: controles visibles sin texto ni icono (lista vacía = OK). Se acumulan por estado en `unlabeledLog`.
 const UNLABELED = inH5p(`return ${UNLABELED_CONTROLS_EXPR};`);
 let unlabeledLog = [];
+// Fix round 1 (M-5): un error al evaluar se registra como hallazgo de ESE tipo (lista no vacía), nunca aborta el check.
 async function recordUnlabeled(b, state) {
-  const u = await b.evaluate(UNLABELED);
-  unlabeledLog.push({ state, unlabeled: u });
+  const u = await b.evaluate(UNLABELED).catch((e) => [{ error: e && e.message ? e.message : String(e) }]);
+  unlabeledLog.push({ state, unlabeled: Array.isArray(u) ? u : [{ error: `resultado inesperado: ${JSON.stringify(u)}` }] });
 }
 const COLLECT = inH5p(`const a=[];d.querySelectorAll('[aria-label],[title],[placeholder]').forEach(e=>{['aria-label','title','placeholder'].forEach(k=>{const v=e.getAttribute(k);if(v)a.push(v)})});return {visible:d.body.innerText,attrs:a.join('\\n')};`);
 // Centro de un elemento del frame H5P en coordenadas de la página principal.
@@ -301,9 +302,9 @@ async function main() {
     report(`${s.key}: sin barra de acciones (displayoptions 15: sin "Reuse"/"Embed")`, Array.isArray(bar) && bar.length === 0, bar);
     const texts = [await b.evaluate(COLLECT)];
     unlabeledLog = [];
-    await recordUnlabeled(b, 'al cargar');
     await b.screenshot(path.join(shotsDir, `player-${s.key.toLowerCase()}-01-start.png`));
     try {
+      await recordUnlabeled(b, 'al cargar');
       await FLOWS[s.key](b, texts);
       report(`${s.key}: respondido y enviado a través del DOM`, true);
     } catch (e) {

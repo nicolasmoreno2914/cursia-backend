@@ -11,6 +11,7 @@
 //     pasa en los estados inicial / tras Comprobar / tras Siguiente / resultado; la navegación dice
 //     «Siguiente» / «Anterior»; la pantalla final queda en español (sin «Next», «Previous», «Score»,
 //     «correct»); el xAPI de cierre (completed) trae la nota y cada pregunta su subContentId.
+//  0. Fix round 1 (M-3): controles sintéticos (ancestro opacity:0 / visibility:hidden ignorados, etc.).
 //  3. Sin falsos positivos: DragText, Blanks, SingleChoiceSet, Dialog Cards y Branching Scenario (este
 //     tiene un botón solo-icono, «Pantalla completa», que cuenta como icono) pasan el assert.
 //
@@ -165,6 +166,29 @@ async function walk(b, file, name, isQs) {
   const b = await launchChrome({ extraArgs: ['--allow-file-access-from-files'] });
   try {
     await b.setViewport(900, 900);
+    // Fix round 1 (M-3): controles sintéticos — qué cuenta como visible y qué como icono.
+    const synth = path.join(OUT, 'synthetic.html');
+    fs.writeFileSync(synth, `<!doctype html><html><head><meta charset="utf-8"><style>
+      button{width:60px;height:24px;margin:4px}.glyph::before{content:"\\f054"}.bgonly::before{content:"";background:#00f;display:inline-block;width:8px;height:8px}
+    </style></head><body>
+      <div style="opacity:0"><div><button id="in-opacity0" aria-label="oculto por opacidad del abuelo"></button></div></div>
+      <div style="visibility:hidden"><button id="in-hidden" aria-label="oculto por visibility del padre"></button></div>
+      <div style="display:none"><button id="in-none" aria-label="oculto por display del padre"></button></div>
+      <button id="own-opacity0" style="opacity:0" aria-label="transparente"></button>
+      <button id="text">Siguiente</button>
+      <button id="glyph" class="glyph" aria-label="icono glifo"></button>
+      <button id="svg" aria-label="icono svg"><svg width="10" height="10"><rect width="10" height="10"/></svg></button>
+      <button id="empty-aria" aria-label="Pregunta siguiente"></button>
+      <span id="empty-role" role="button" style="display:inline-block;width:40px;height:20px"></span>
+      <button id="bg-only" class="bgonly" aria-label="solo color de fondo"></button>
+      <div style="opacity:0.5"><button id="half-opacity-empty" aria-label="medio transparente"></button></div>
+    </body></html>`);
+    await b.navigate('file://' + synth);
+    await sleep(300);
+    const flagged = (await b.evaluate(W(`return ${UNLABELED_CONTROLS_EXPR}.map(function(x){return x.aria||x.tag;});`))).sort();
+    const ids = await b.evaluate(W(`const L=${UNLABELED_CONTROLS_EXPR};return [...d.querySelectorAll('button,[role=button]')].filter(e=>L.some(x=>x.aria===(e.getAttribute('aria-label')||'')&&x.tag===e.tagName)).map(e=>e.id).sort();`));
+    report('assert sintético: ignora controles dentro de un ancestro opacity:0 / visibility:hidden / display:none y con opacity:0 propia; acepta texto, glifo y svg; marca vacío con aria, [role=button] vacío, ::before solo color y vacío con opacidad parcial',
+      JSON.stringify(ids) === JSON.stringify(['bg-only', 'empty-aria', 'empty-role', 'half-opacity-empty']), { ids, flagged });
     for (const c of cases) {
       const dir = await extract(c.buf, c.name);
       const { file, mainLibrary } = page(dir, c.name);
