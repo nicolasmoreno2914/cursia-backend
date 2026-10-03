@@ -178,6 +178,9 @@ jobs:
       - name: Check REL R2 log de intentos + columnas de recuperación (puro; la parte PG16 corre local)
         run: node scripts/check-rel-recovery.js --pure-only
 
+      - name: Check REL MVP recuperación por clase (A/B) + reparación del empaque (puro; la parte PG16 corre local)
+        run: node scripts/check-rel-mvp-recovery.js --pure-only
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh

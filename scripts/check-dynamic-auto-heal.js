@@ -94,7 +94,7 @@ const failedRow = (error, os = {}, failedSecAgo = 3600) => ({ status: 'failed', 
 // Parte pura
 // ════════════════════════════════════════════════════════════════════════════
 async function pureChecks() {
-  const P = AH.DEFAULT_AUTO_HEAL_POLICY;
+  const P = AH.LEGACY_AUTO_HEAL_POLICY; // REL MVP: este check cubre la política R16 (kill-switch DYNAMIC_AUTO_HEAL_POLICY=legacy)
 
   await check('puro: allow-list explícita — cada código (salvo los del navegador) lo emite de verdad el backend compilado', () => {
     const codes = AH.AUTO_HEAL_ALLOW_LIST.map((r) => r.code);
@@ -375,7 +375,7 @@ async function dbChecks() {
     const itemRow = async (runId, key) => (await ds.query(`select * from public.generation_item_runs where job_id = $1 and item_key = $2 order by generation desc limit 1`, [runId, key]))[0];
     const setRow = (id, sets, params = []) => ds.query(`update public.generation_item_runs set ${sets} where id = $1`, [id, ...params]);
     const estimatesOf = async (cid) => (await ds.query(`select count(*)::int n from public.cost_estimates where course_id = $1`, [cid]))[0].n;
-    const heal = (secLater) => runs.autoHealFailedItems({ now: new Date(Date.now() + secLater * 1000) });
+    const heal = (secLater) => runs.autoHealFailedItems({ now: new Date(Date.now() + secLater * 1000), policy: AH.LEGACY_AUTO_HEAL_POLICY });
 
     const C = await makeCourse('Curso auto-heal');
     const contentKey = `content:${C.c1}`;
@@ -401,7 +401,7 @@ async function dbChecks() {
     });
 
     // ═══ #2 healer ═══════════════════════════════════════════════════════════
-    const P = AH.DEFAULT_AUTO_HEAL_POLICY;
+    const P = AH.LEGACY_AUTO_HEAL_POLICY; // REL MVP: este check cubre la política R16 (kill-switch DYNAMIC_AUTO_HEAL_POLICY=legacy)
     const revoke = async (why) => {
       const [est] = await ds.query(`select id from public.cost_estimates where run_id = $1 and scope = 'run'`, [C.runId]);
       await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, decision, reason) values ($1, $2, $3, 0, 'BLOCKED', $4)`, [C.runId, C.cid, est.id, why]);
@@ -565,7 +565,7 @@ async function dbChecks() {
       assert(intro[0], 'course_intro');
       await failAt(intro[0].id, 'lease_expired', 30, `'{}'::jsonb`);
       await failAt((await itemRow(C.runId, `content:${C.c2}`)).id, 'lease_expired', 60, `'{}'::jsonb`);
-      const r = await runs.autoHealFailedItems({ now: new Date(), limit: 1 });
+      const r = await runs.autoHealFailedItems({ now: new Date(), limit: 1, policy: AH.LEGACY_AUTO_HEAL_POLICY });
       eq(r.reopened.map((x) => x.itemKey), [intro[0].item_key, `content:${C.c2}`], 'elegibles reabiertos, el más nuevo primero');
       eq(r.skipped.map((x) => [x.itemKey, x.reason]), [[audio.item_key, 'budget_approval_required'], [presKey, 'budget_approval_required']], 'rechazados en orden (más nuevo primero)');
       eq(r.candidates, 4, 'los errores de contenido no cuentan (filtro SQL)');
@@ -574,9 +574,9 @@ async function dbChecks() {
         const ah = (await itemRow(C.runId, k)).output_summary.autoHeal;
         assert(ah && Math.abs(ah.skipUntilMs - (Date.now() + AH.AUTO_HEAL_SKIP_COOLDOWN_SECONDS * 1000)) < 60_000 && ah.lastSkipReason === 'budget_approval_required', `${k}: ${JSON.stringify(ah)}`);
       }
-      const r2 = await runs.autoHealFailedItems({ now: new Date(), limit: 1 });
+      const r2 = await runs.autoHealFailedItems({ now: new Date(), limit: 1, policy: AH.LEGACY_AUTO_HEAL_POLICY });
       eq([r2.candidates, r2.skipped.length], [0, 0], 'en enfriamiento: ni candidatos ni locks');
-      const r3 = await runs.autoHealFailedItems({ now: new Date(Date.now() + (AH.AUTO_HEAL_SKIP_COOLDOWN_SECONDS + 60) * 1000), limit: 1 });
+      const r3 = await runs.autoHealFailedItems({ now: new Date(Date.now() + (AH.AUTO_HEAL_SKIP_COOLDOWN_SECONDS + 60) * 1000), limit: 1, policy: AH.LEGACY_AUTO_HEAL_POLICY });
       eq(r3.candidates, 2, 'pasado el enfriamiento vuelven a evaluarse');
       await reauthorize(estId);
     });
@@ -588,7 +588,7 @@ async function dbChecks() {
                         finished_at = date_trunc('milliseconds', now() - interval '40 minutes') + interval '100 microseconds' where id = $1`, [a.id]);
       await ds.query(`update public.generation_item_runs set status = 'failed', error = 'lease_expired', output_summary = '{}'::jsonb,
                         finished_at = date_trunc('milliseconds', now() - interval '40 minutes') + interval '700 microseconds' where id = $1`, [b.id]);
-      const r = await runs.autoHealFailedItems({ now: new Date(), limit: 1 });
+      const r = await runs.autoHealFailedItems({ now: new Date(), limit: 1, policy: AH.LEGACY_AUTO_HEAL_POLICY });
       eq(r.reopened.map((x) => x.itemKey), [b.item_key, a.item_key], 'ambos, el más nuevo (µs) primero');
     });
 

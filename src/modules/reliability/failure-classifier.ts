@@ -28,14 +28,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import type { RunAdminActionCode } from '../dynamic-generation/run-completion';
 import {
-  AUTO_HEAL_ALLOW_LIST,
   AUTO_HEAL_DENY_PATTERNS,
   SAFE_AUTO_RETRY_RULES,
 } from './auto-heal-rules';
 // #583 (decisión del usuario A, 2026-10-02): UN reenvío automático de un audio TTS incierto si lo pendiente
 // del item en el ledger es ≤ USD 0.10. La decisión (con el ledger, bajo lock) vive en auto-heal.ts; acá se usa
 // la misma función pura SIN ledger para informar qué hace hoy el sistema.
-import { ambiguousAudioResubmitDecision } from '../dynamic-generation/auto-heal';
+import { ambiguousAudioResubmitDecision, autoHealDecision, autoHealPolicyFromEnv } from '../dynamic-generation/auto-heal';
 
 export type FailureClass = 'A' | 'B' | 'C' | 'D';
 export const FAILURE_CLASSES: readonly FailureClass[] = Object.freeze(['A', 'B', 'C', 'D']);
@@ -86,6 +85,7 @@ export type CurrentRecovery =
   | 'auto_heal' // allow-list del auto-healer (R16)
   | 'safe_auto_retry' // reintento automático seguro (EV6 DoD BE-B)
   | 'ambiguous_audio_resubmit' // #583: UN reenvío automático de audio TTS incierto (≤ USD 0.10 pendiente, lo decide auto-heal con el ledger)
+  | 'auto_regenerate' // REL MVP: clase B de un componente de la IA → el auto-healer lo regenera solo (≤ 2 rondas)
   | 'denied' // deny-list: nunca se reabre solo
   | 'manual'; // nada automático: humano (retry/regenerate)
 
@@ -621,8 +621,10 @@ export function currentRecoveryOf(error: string, itemType: string | null | undef
   const safe = SAFE_AUTO_RETRY_RULES.find((r) => r.match.test(e) && (!itemType || itemType === r.type));
   if (safe && !denied && safe.requires(os, e)) return 'safe_auto_retry';
   if (denied) return 'denied';
-  const rule = AUTO_HEAL_ALLOW_LIST.find((r) => r.match.test(e));
-  if (rule && (!rule.requires || rule.requires(os))) return 'auto_heal';
+  // REL MVP: la MISMA decisión del auto-healer con la política vigente (por clase, o R16 con el kill-switch);
+  // sin fecha de fallo (sin espera) y con las rondas ya usadas del item.
+  const d = autoHealDecision({ status: 'failed', type: itemType ?? null, error: e, output_summary: os }, new Date(), autoHealPolicyFromEnv(process.env));
+  if (d.heal) return d.kind === 'B' ? 'auto_regenerate' : 'auto_heal';
   return 'manual';
 }
 

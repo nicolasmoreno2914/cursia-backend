@@ -4,7 +4,7 @@ import { latestGenerationPredicate } from './item-generations';
 import { evaluateRunCompletion, loadCompletionInputs, terminalStatusFor } from './run-completion';
 import { FailureSource, classifyFailure, currentRecoveryOf, extractFailureCode } from '../reliability/failure-classifier';
 import { AttemptOutcome, outcomeForFailure, recordItemFailure } from '../reliability/attempt-log';
-import { AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS, autoHealMaxRoundsFor } from './auto-heal';
+import { AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS, autoHealMaxRoundsFor, autoHealPolicyFromEnv } from './auto-heal';
 import { SAFE_AUTO_RETRY_MAX_ROUNDS } from '../reliability/auto-heal-rules';
 
 /**
@@ -156,7 +156,8 @@ export function maxAutomaticRoundsToday(error: string, type: string | null | und
   const cur = currentRecoveryOf(error, type, outputSummary);
   if (cur === 'safe_auto_retry') return SAFE_AUTO_RETRY_MAX_ROUNDS;
   if (cur === 'ambiguous_audio_resubmit') return AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS;
-  return cur === 'auto_heal' ? autoHealMaxRoundsFor(type) : 0;
+  if (cur === 'auto_regenerate') return Math.max(0, Math.floor(autoHealPolicyFromEnv(process.env).regenMaxRounds ?? 0));
+  return cur === 'auto_heal' ? autoHealMaxRoundsFor(type, autoHealPolicyFromEnv(process.env)) : 0;
 }
 
 /**

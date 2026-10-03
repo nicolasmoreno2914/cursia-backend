@@ -70,9 +70,13 @@ import {
   AUTO_HEAL_WORKER_ITEM_TYPES,
   AutoHealPolicy,
   AutoHealSweepResult,
+  AUTO_HEAL_PERMANENT_SKIPS,
+  AutoHealKind,
   autoHealDecision,
   autoHealMaxRoundsFor,
   autoHealPolicyFromEnv,
+  autoHealRoundsOf,
+  autoRegenRoundsOf,
   SAFE_AUTO_RETRY_MAX_ROUNDS,
   SAFE_AUTO_RETRY_SQL_REGEX,
   safeAutoRetryDecision,
@@ -404,7 +408,16 @@ export interface RegenerateItemOptions {
   dryRun?: boolean;
   /** Fix wave I2: generación vigente que vio el usuario; si cambió → 409 generation_changed. */
   expectedGeneration?: number;
+  /**
+   * REL MVP (reparación de empaque, sin humano): el validador del paquete rechazó el contenido de ESTE
+   * item. Solo componentes de la IA (costo `llm`), sin cascada (regenera solo ese componente), una vez por
+   * item (la generación nueva queda con `regeneration.reason = 'package_repair'`; otra → 409).
+   */
+  autoRepair?: { code: string };
 }
+
+/** REL MVP: motivo de la generación nueva creada por la reparación automática del empaque. */
+export const PACKAGE_REPAIR_REASON = 'package_repair';
 
 /** Fix wave I1: respuesta de `{dryRun:true}` (misma forma de `affected` que la llamada real). */
 export interface RegenerateDryRunResult {
@@ -1785,10 +1798,13 @@ export class RunsService {
         output_summary: Record<string, any> | null;
         finished_at: Date | null;
         updated_at: Date | null;
+        failure_class: string | null;
       }> = await qr.query(
         // F78-BE2: la generación VIGENTE de cada item (una regeneración
         // fallida se reintenta sobre su propia fila, nunca sobre la histórica).
-        `select id, item_key, status, depends_on, type, error, output_summary, finished_at, updated_at
+        `select id, item_key, status, depends_on, type, error, output_summary, finished_at, updated_at,
+                -- REL MVP: clase registrada (R2) sin depender de que la columna exista (esquema tolerado).
+                to_jsonb(g)->>'failure_class' as failure_class
             from public.generation_item_runs g
             where g.job_id = $1 and ${latestGenerationPredicate('g')}
             order by id
@@ -1808,7 +1824,7 @@ export class RunsService {
       }
       // R16 (#2): la política del auto-healer se re-evalúa con la fila bloqueada (otro barrido, un retry
       // manual o un fallo nuevo pudieron cambiarla entre la lectura y este lock).
-      let autoMeta: { round: number; code: string; pendingUsd?: number | null } | null = null;
+      let autoMeta: { round: number; code: string; pendingUsd?: number | null; kind?: AutoHealKind; strategy?: string } | null = null;
       if (auto && auto.ambiguousAudio) {
         // #583: misma decisión que el barrido, con la fila bloqueada y lo pendiente del ledger releído acá.
         const pending = await this.ambiguousAudioPending(qr, target.id, target.output_summary);
@@ -1829,7 +1845,7 @@ export class RunsService {
         if (d.heal === false) {
           throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (${d.reason})`, code: 'auto_heal_not_eligible' });
         }
-        autoMeta = { round: d.round, code: d.rule.code };
+        autoMeta = { round: d.round, code: d.rule.code, kind: d.kind, strategy: d.strategy };
       }
 
       // I1 (fix wave / review controller ruling: "un retry NO es un resume").
@@ -1943,7 +1959,8 @@ export class RunsService {
         : autoMeta && auto?.safe
         ? { auto: true, safeAutoRetry: true, safeAutoRetryRound: autoMeta.round, autoHealCode: autoMeta.code }
         : autoMeta
-          ? { auto: true, autoHealRound: autoMeta.round, autoHealCode: autoMeta.code }
+          ? { auto: true, autoHealRound: autoMeta.round, autoHealCode: autoMeta.code,
+              ...(auto?.policy.classAware ? { autoHealClass: autoMeta.kind, autoHealStrategy: autoMeta.strategy } : {}) }
           : actorId !== ownerId ? { retriedBy: actorId } : {};
       const topExtra = autoMeta && auto?.ambiguousAudio
         ? { ambiguousAudioResubmit: { rounds: autoMeta.round, lastAt: nowIso, pendingUsd: autoMeta.pendingUsd ?? null,
@@ -1951,7 +1968,14 @@ export class RunsService {
         : autoMeta && auto?.safe
         ? { safeAutoRetry: { rounds: autoMeta.round, lastAt: nowIso, lastCode: autoMeta.code, maxRounds: SAFE_AUTO_RETRY_MAX_ROUNDS } }
         : autoMeta
-          ? { autoHeal: { rounds: autoMeta.round, lastAt: nowIso, lastCode: autoMeta.code, maxRounds: autoHealMaxRoundsFor(target.type, auto!.policy) } }
+          ? (auto!.policy.classAware
+            // REL MVP: rondas A (reintento) y B (regeneración) por separado; cada una conserva la otra.
+            ? { autoHeal: {
+                rounds: autoMeta.kind === 'B' ? autoHealRoundsOf(target.output_summary) : autoMeta.round,
+                regenRounds: autoMeta.kind === 'B' ? autoMeta.round : autoRegenRoundsOf(target.output_summary),
+                lastAt: nowIso, lastCode: autoMeta.code, lastClass: autoMeta.kind, lastStrategy: autoMeta.strategy,
+                maxRounds: autoHealMaxRoundsFor(target.type, auto!.policy), regenMaxRounds: auto!.policy.regenMaxRounds ?? 0 } }
+            : { autoHeal: { rounds: autoMeta.round, lastAt: nowIso, lastCode: autoMeta.code, maxRounds: autoHealMaxRoundsFor(target.type, auto!.policy) } })
           : {};
       // BE-B: el reintento seguro concede UN intento (un único reenvío; si vuelve a fallar, humano).
       // #583: el reenvío de audio incierto también concede UN intento (un único reenvío).
@@ -1962,7 +1986,8 @@ export class RunsService {
           `update public.generation_item_runs
               set status = 'pending',
                   max_attempts = attempt_count + $2::int,
-                  output_summary = ${outputSummaryExpr},
+                  -- REL MVP: cualquier reapertura olvida la marca «no elegible» del error anterior.
+                  output_summary = (${outputSummaryExpr}) #- '{autoHeal,ineligibleMd5}',
                   error = null,
                   next_retry_at = null,
                   worker_id = null,
@@ -1981,7 +2006,10 @@ export class RunsService {
       // REL R2: la reapertura queda en el log de intentos (misma transacción; no-op sin esquema).
       await recordItemReopened(qr, target.id, {
         actor: auto ? 'auto_heal' : isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : actorId !== ownerId ? adminActor(actorId) : 'owner',
-        strategy: auto?.ambiguousAudio ? 'ambiguous_audio_resubmit' : auto?.safe ? 'safe_auto_retry' : auto ? 'auto_heal'
+        // REL MVP: con la política por clase la estrategia aplicada queda en el log (A reintento / B regenerar).
+        strategy: auto?.ambiguousAudio ? 'ambiguous_audio_resubmit' : auto?.safe ? 'safe_auto_retry'
+          : auto && auto.policy.classAware && autoMeta?.strategy ? `auto_heal_${autoMeta.kind === 'B' ? 'regenerate' : 'retry'}:${autoMeta.strategy}`
+          : auto ? 'auto_heal'
           : resubmitVideo ? 'manual_resubmit_video' : resubmitProvider ? 'manual_resubmit_provider' : 'manual_retry',
         automatic: !!auto,
       });
@@ -2062,15 +2090,26 @@ export class RunsService {
                                   then (g.output_summary->'autoHeal'->>'rounds')::numeric else 0 end), 1000000)::int`;
     // Fix m1: cursor exacto al microsegundo (un Date de JS trunca a ms y podía saltear filas).
     const finishedUsSql = `(extract(epoch from g.finished_at) * 1000000)::bigint`;
-    const backoffs = (policy.backoffSeconds.length ? policy.backoffSeconds : [0]).map((x) => Math.max(0, Math.floor(x)));
+    // REL MVP (política por clase): el SQL solo descarta lo seguro (deny-list, precondiciones, tope de rondas A,
+    // la espera MÍNIMA posible con jitter, y los errores ya evaluados como no elegibles); la clase A/B, la espera
+    // exacta y el tope de B los decide autoHealDecision (JS), re-evaluado además bajo lock en retryItem.
+    const jitter = Math.max(0, Math.min(0.5, Number(policy.jitterRatio ?? 0)));
+    const allWaits = [...policy.backoffSeconds, ...(policy.regenBackoffSeconds ?? [])].map((x) => Math.max(0, Number(x) || 0));
+    const minWait = allWaits.length ? Math.floor(Math.min(...allWaits) * (1 - jitter)) : 0;
+    const backoffs = policy.classAware
+      ? [minWait]
+      : (policy.backoffSeconds.length ? policy.backoffSeconds : [0]).map((x) => Math.max(0, Math.floor(x)));
+    const allowRegex = policy.classAware ? '.' : AUTO_HEAL_SQL_ALLOW_REGEX;
     let cursor: { finishedUs: string; id: string } | null = null;
     while (result.candidates! < maxCandidates) {
       const rows: Array<{
         id: string; job_id: string; item_key: string; type: string; status: string; error: string | null; output_summary: Record<string, any> | null;
         finished_at: Date; finished_us: string; updated_at: Date | null; course_id: number; owner_id: string; blueprint_number: number;
+        failure_class: string | null;
       }> = await this.dataSource.query(
         `select g.id, g.job_id, g.item_key, g.type, g.status, g.error, g.output_summary, g.finished_at, g.updated_at,
-                ${finishedUsSql}::text as finished_us, pj.course_id, pj.owner_id, b.blueprint_number
+                ${finishedUsSql}::text as finished_us, pj.course_id, pj.owner_id, b.blueprint_number,
+                to_jsonb(g)->>'failure_class' as failure_class
            from public.generation_item_runs g
            join public.production_jobs pj on pj.id = g.job_id
            join public.course_generation_manifests m on m.id = g.manifest_id
@@ -2100,11 +2139,13 @@ export class RunsService {
             -- m2: enfriamiento tras un rechazo de retryItem (presupuesto, run reemplazado, otro run activo…)
             and not (case when jsonb_typeof(g.output_summary->'autoHeal'->'skipUntilMs') = 'number'
                           then (g.output_summary->'autoHeal'->>'skipUntilMs')::numeric > $12::numeric else false end)
+            -- REL MVP: un error ya evaluado como no elegible (C/D, tope, precondición) no se re-evalúa hasta que cambie
+            and coalesce(g.output_summary->'autoHeal'->>'ineligibleMd5', '') <> md5(g.error)
             and ($9::bigint is null or (${finishedUsSql}, g.id) < ($9::bigint, $10::uuid))
           order by ${finishedUsSql} desc, g.id desc
           limit $11`,
         [
-          now.toISOString(), Math.round(Math.min(Math.max(policy.maxAgeHours, 0), AUTO_HEAL_MAX_AGE_HOURS_RANGE.max) * 3600), AUTO_HEAL_SQL_ALLOW_REGEX, AUTO_HEAL_SQL_DENY_REGEX,
+          now.toISOString(), Math.round(Math.min(Math.max(policy.maxAgeHours, 0), AUTO_HEAL_MAX_AGE_HOURS_RANGE.max) * 3600), allowRegex, AUTO_HEAL_SQL_DENY_REGEX,
           [...AUTO_HEAL_WORKER_ITEM_TYPES], policy.maxRounds, policy.browserMaxRounds, backoffs,
           cursor ? cursor.finishedUs : null, cursor ? cursor.id : null, pageSize, now.getTime(),
         ],
@@ -2127,7 +2168,7 @@ export class RunsService {
 
   private async autoHealOne(
     r: { id: string; job_id: string; item_key: string; type: string; status: string; error: string | null; output_summary: Record<string, any> | null;
-      finished_at: Date; updated_at: Date | null; course_id: number; owner_id: string; blueprint_number: number },
+      finished_at: Date; updated_at: Date | null; course_id: number; owner_id: string; blueprint_number: number; failure_class?: string | null },
     now: Date,
     policy: AutoHealPolicy,
     result: AutoHealSweepResult,
@@ -2135,14 +2176,26 @@ export class RunsService {
     const d = autoHealDecision(r, now, policy);
     if (d.heal === false) {
       result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: d.reason });
+      // REL MVP: motivo permanente para ESTE error → marca (md5 del error) y el SQL deja de seleccionarlo
+      // hasta que el item vuelva a fallar con otro error. Solo si sigue igual (nunca pisa un item que cambió).
+      if (policy.classAware && AUTO_HEAL_PERMANENT_SKIPS.includes(d.reason)) {
+        await this.dataSource.query(
+          `update public.generation_item_runs
+              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('autoHeal',
+                    coalesce(output_summary->'autoHeal', '{}'::jsonb) || jsonb_build_object('ineligibleMd5', md5(error), 'ineligibleReason', $2::text))
+            where id = $1 and status = 'failed' and error = $3`,
+          [r.id, d.reason, r.error],
+        ).catch((e) => this.logger.warn(`auto-heal: no se pudo marcar ${r.item_key} como no elegible: ${e instanceof Error ? e.message : String(e)}`));
+      }
       return;
     }
     try {
       await this.retryItem(r.course_id, r.owner_id, Number(r.blueprint_number), r.job_id, r.item_key, false, false, { policy, now });
       this.autoHealLastSkip.delete(r.id);
-      result.reopened.push({ runId: r.job_id, itemKey: r.item_key, code: d.rule.code, round: d.round });
+      result.reopened.push({ runId: r.job_id, itemKey: r.item_key, code: d.rule.code, round: d.round, kind: d.kind, strategy: d.strategy });
       this.logger.warn(
-        `auto-heal: reabierto ${r.item_key} (run ${r.job_id}) — ronda ${d.round}/${autoHealMaxRoundsFor(r.type, policy)}, ` +
+        `auto-heal: reabierto ${r.item_key} (run ${r.job_id}) — ${policy.classAware ? `clase ${d.kind} (${d.strategy}), ` : ''}` +
+          `ronda ${d.round}/${d.kind === 'B' ? policy.regenMaxRounds ?? 0 : autoHealMaxRoundsFor(r.type, policy)}, ` +
           `código ${d.rule.code}; error previo: ${String(r.error ?? '').slice(0, 200)}`,
       );
     } catch (err) {
@@ -2657,7 +2710,18 @@ export class RunsService {
       };
     }
 
-    if (costKind !== 'none' && o.confirmPaid !== true) {
+    if (o.autoRepair) {
+      // REL MVP: solo componentes de la IA, sin cascada y una sola vez por item (nunca un proveedor pagado ni un bucle).
+      const notEligible = (reason: string) => new ConflictException({ message: `auto_repair_not_eligible: "${itemKey}" (${reason})`, code: 'auto_repair_not_eligible', reason });
+      if (costKind !== 'llm') throw notEligible(`tipo ${mItem.type}`);
+      const cascade = regenerationCascade(manifest.rulesVersion, manifest.manifest.items,
+        { key: itemKey, type: mItem.type, moduleId: mItem.moduleId ?? null, chapterId: mItem.chapterId ?? null });
+      if (cascade.regenerate.length > 0 || cascade.stale.length > 0) throw notEligible('regenerarlo arrastra otros componentes');
+      const [latest] = await this.dataSource.query(
+        `select output_summary from public.generation_item_runs where job_id = $1 and item_key = $2 order by generation desc limit 1`, [job.id, itemKey]);
+      if (latest?.output_summary?.regeneration?.reason === PACKAGE_REPAIR_REASON) throw notEligible('ya se reparó una vez');
+    }
+    if (costKind !== 'none' && o.confirmPaid !== true && !o.autoRepair) {
       throw new BadRequestException({
         message:
           `confirm_paid_required: regenerar "${itemKey}" tiene costo (${costKind === 'videogen' ? 'video real en Videogen' : costKind === 'gamma' ? 'presentación en Gamma' : costKind === 'tts' ? 'audio TTS' : 'créditos de IA'}); ` +
@@ -2699,6 +2763,9 @@ export class RunsService {
       // V2.1 fix round 1 (I2): la cascada también puede costar (p.ej. v3: regenerar un video
       // mock regenera sus interacciones con LLM) → confirmPaid aunque el pedido en sí sea gratis.
       const paidCascade = plan.cascade.find((c) => c.costKind !== 'none');
+      if (o.autoRepair && (plan.cascade.length > 0 || plan.staleDeps.length > 0)) {
+        throw new ConflictException({ message: `auto_repair_not_eligible: "${itemKey}" (cascada)`, code: 'auto_repair_not_eligible', reason: 'cascade' });
+      }
       if (paidCascade && o.confirmPaid !== true) {
         throw new BadRequestException({
           message:
@@ -2711,7 +2778,8 @@ export class RunsService {
       return this.applyRegeneration(qr, plan, {
         job: locked, manifest, itemKey, mItem, ownerId, costKind,
         // REL R2 (M4): la generación nueva queda en el log de intentos como reapertura (dueño o admin).
-        attemptActor: isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : 'owner',
+        attemptActor: o.autoRepair ? 'recovery' : isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : 'owner',
+        autoRepair: o.autoRepair,
       });
     });
 
@@ -2729,6 +2797,28 @@ export class RunsService {
       affected,
       run: await this.buildRunDto(await this.loadJobById(job.id), manifest),
     };
+  }
+
+  /**
+   * REL MVP — reparación automática del empaque: el validador del paquete final rechazó el contenido de
+   * `itemKey` (EXAM_BANK_INVALID, H5P inválido, …). Regenera SOLO ese componente (generación nueva, una
+   * vez por item, sin cascada, solo IA) con las mismas reglas, locks y gate de FinOps que regenerateItem;
+   * el run se reabre y, al completarse, el empaque automático vuelve a correr. Lanza si no es elegible.
+   */
+  async autoRepairItemForPackage(runId: string, itemKey: string, code: string): Promise<RegenerateItemResult> {
+    const [r] = await this.dataSource.query(
+      `select pj.course_id, pj.owner_id, b.blueprint_number
+         from public.production_jobs pj
+         join public.course_generation_manifests m on m.id = (pj.input_payload->>'manifestId')::bigint
+         join public.course_blueprints b on b.id = m.blueprint_id
+        where pj.id = $1 and pj.execution_mode = 'dynamic_generation'`,
+      [runId],
+    );
+    if (!r) throw new NotFoundException(`auto_repair: el run ${runId} no existe`);
+    const out = await this.regenerateItem(Number(r.course_id), String(r.owner_id), Number(r.blueprint_number), runId, itemKey,
+      { confirmPaid: true, autoRepair: { code: String(code).slice(0, 64) } });
+    this.logger.warn(`auto-repair (empaque): ${itemKey} (run ${runId}) regenerado por ${code}`);
+    return out as RegenerateItemResult;
   }
 
   /** Filas afectadas guardadas en una regeneración en vuelo (o solo el item si no hubo cascada), con created:false. */
@@ -2885,7 +2975,8 @@ export class RunsService {
   private async applyRegeneration(
     qr: QueryRunner,
     plan: RegenerationPlan,
-    a: { job: any; manifest: ManifestDto; itemKey: string; mItem: { type: string }; ownerId: string; costKind: RegenerationCostKind; attemptActor?: AttemptActor },
+    a: { job: any; manifest: ManifestDto; itemKey: string; mItem: { type: string }; ownerId: string; costKind: RegenerationCostKind; attemptActor?: AttemptActor;
+      autoRepair?: { code: string } },
   ): Promise<{ kind: 'created'; itemRunId: string; previousItemRunId: string; previousGeneration: number; affected: RegenerationAffectedItem[] }> {
     const { job, manifest, itemKey, ownerId, costKind } = a;
     const latest = plan.latest;
@@ -2904,7 +2995,9 @@ export class RunsService {
       );
       await recordItemReopened(qr, row.id, {
         actor: a.attemptActor ?? 'owner',
-        strategy: String(regeneration.reason).startsWith('cascade_from_') ? 'regenerate_cascade' : 'regenerate',
+        strategy: regeneration.reason === PACKAGE_REPAIR_REASON ? 'package_repair:regenerate_targeted'
+          : String(regeneration.reason).startsWith('cascade_from_') ? 'regenerate_cascade' : 'regenerate',
+        automatic: regeneration.reason === PACKAGE_REPAIR_REASON,
       });
       // Fix wave M4 (tabla de Fase 8, fila REGENERATE): la salida de la
       // generación anterior pasa a stale con motivo — solo status + metadata
@@ -2925,7 +3018,8 @@ export class RunsService {
     const primary = await insertGeneration(latest, itemKey, {
       fromItemRunId: latest.id,
       fromGeneration: Number(latest.generation),
-      reason: plan.stale ? 'stale_no_auto' : 'user_requested',
+      reason: a.autoRepair ? PACKAGE_REPAIR_REASON : plan.stale ? 'stale_no_auto' : 'user_requested',
+      ...(a.autoRepair ? { packageRepairCode: a.autoRepair.code } : {}),
       staleArtifactIds: plan.staleArtifactIds,
       costKind,
       requestedBy: ownerId,

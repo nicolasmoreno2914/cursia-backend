@@ -428,7 +428,8 @@ check('preservación: todo lo que el auto-healer reabre es clase A en el clasifi
   assert(FC.currentRecoveryOf(safeVg, 'video', {}) === 'safe_auto_retry', 'currentRecovery safe vg');
   assert(FC.currentRecoveryOf('videogen_submit_rejected: (HTTP 409)', 'video', {}) === 'manual', '409 no es definitivo');
   assert(FC.currentRecoveryOf('gamma_submit_failed: 400', 'presentation', {}) === 'safe_auto_retry', 'safe gamma');
-  assert(FC.currentRecoveryOf('v3_payload_invalid: x', 'activity', {}) === 'manual', 'B hoy es manual');
+  assert(FC.currentRecoveryOf('v3_payload_invalid: x', 'activity', {}) === 'auto_regenerate', 'REL MVP: B de la IA se regenera sola');
+  assert(FC.currentRecoveryOf('v3_payload_invalid: x', 'activity', { autoHeal: { regenRounds: 2 } }) === 'manual', 'REL MVP: B con el tope usado → humano');
 });
 
 check('fix round 2 (N2): piso de dinero en runtime — un texto de la deny-list es ≥ C aunque el código de adelante sea A/B', () => {

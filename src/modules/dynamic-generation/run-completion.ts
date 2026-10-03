@@ -31,7 +31,7 @@
 import { frozenProviderModesOf, providerKindOfItemType } from './provider-modes';
 import { fallbackVideoModeOf, questionsBelongToVideo } from './video-upgrade';
 import { v3ValidatedArtifactTypes } from '../course-shell/v3-validation';
-import { AMBIGUOUS_AUDIO_RESUBMIT_BACKOFF_SECONDS, ambiguousAudioResubmitDecision, autoHealDecision, autoHealEnabled, autoHealIntervalMs, safeAutoRetryDecision } from './auto-heal';
+import { AMBIGUOUS_AUDIO_RESUBMIT_BACKOFF_SECONDS, ambiguousAudioResubmitDecision, autoHealDecision, autoHealEnabled, autoHealIntervalMs, autoHealPolicyFromEnv, safeAutoRetryDecision } from './auto-heal';
 import { BUDGET_EXCEEDED, PROVIDER_RECONCILIATION_REQUIRED } from '../finops/run-budget';
 
 export type RunCompletionState = 'in_progress' | 'packaging' | 'complete' | 'preview' | 'needs_attention' | 'cancelled';
@@ -512,10 +512,12 @@ export function adminActionFor(r: CompletionRow | undefined, cls: ItemCompletion
   }
   if (r.status === 'cancelled') return null;
   // El auto-healer todavía lo va a reabrir (allow-list, dentro de su ventana): sin acción humana.
-  const ahRow = { status: r.status, type: r.type, error: r.error ?? null, output_summary: s, finished_at: r.finished_at ?? null, updated_at: r.updated_at ?? null };
+  // REL MVP: id (semilla del jitter) y clase registrada → misma decisión que el barrido y el lock.
+  const ahRow = { id: r.id, status: r.status, type: r.type, error: r.error ?? null, output_summary: s, finished_at: r.finished_at ?? null, updated_at: r.updated_at ?? null,
+    failure_class: (r as { failure_class?: string | null }).failure_class ?? null };
   // Fix round 1 (M5): solo si el tick del auto-healer corre (si está apagado nadie lo va a reabrir).
   const tickOn = autoHealEnabled(process.env);
-  const d = autoHealDecision(ahRow, now);
+  const d = autoHealDecision(ahRow, now, autoHealPolicyFromEnv(process.env));
   if (tickOn && (d.heal === true || (d.heal === false && d.reason === 'backoff'))) return null;
   // BE-B: rechazo definitivo SIN gasto (videogen_submit_rejected / gamma_submit_failed) con su ÚNICO
   // reintento automático todavía disponible: lo toma el servidor, sin acción humana.

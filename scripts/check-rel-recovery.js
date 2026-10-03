@@ -105,7 +105,7 @@ async function pureChecks() {
     const der = RV.recoveryViewOf({ status: 'failed', error: 'ambiguous_video_submission', type: 'video', output_summary: {} });
     eq([der.source, der.class, der.code, der.attentionReason, der.maxRounds, der.currentRecovery], ['derived', 'C', 'ambiguous_video_submission', 'duplicate_charge', 0, 'denied'], 'derivada');
     const der2 = RV.recoveryViewOf({ status: 'failed', error: 'lease_expired', type: 'content', output_summary: {} });
-    eq([der2.class, der2.maxRounds, der2.attentionReason], ['A', 1, null], 'derivada A (navegador: 1 ronda hoy)');
+    eq([der2.class, der2.maxRounds, der2.attentionReason], ['A', 5, null], 'derivada A (REL MVP: 5 rondas por clase)');
     const none = RV.recoveryViewOf({ status: 'completed', error: null, type: 'content', recovery_round: 1 });
     eq([none.source, none.class, none.round], ['none', null, 1], 'sin fallo');
     eq(RV.recoveryViewOf({ status: 'pending', error: 'lease_expired', type: 'content' }).source, 'none', 'pending sin registro = sin fallo vigente');
@@ -542,7 +542,8 @@ async function dbChecks() {
       eq([row.status, row.recovery_round], ['pending', 1], 'fila');
       const rows = await attempts(it.id);
       const last = rows[rows.length - 1];
-      eq([last.outcome, last.actor, last.strategy_applied, last.recovery_round], ['reopened', 'auto_heal', 'auto_heal', 1], 'intento');
+      // REL MVP: con la política por clase la estrategia aplicada queda en el log (A → reintento con espera).
+      eq([last.outcome, last.actor, last.strategy_applied, last.recovery_round], ['reopened', 'auto_heal', 'auto_heal_retry:retry_backoff', 1], 'intento');
     });
 
     await check('DB admin: retry de SUPER_ADMIN → actor admin:<hash> (nunca el email)', async () => {
