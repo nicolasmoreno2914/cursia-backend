@@ -9,6 +9,7 @@ import {
   ParseIntPipe,
   ParseUUIDPipe,
   Post,
+  Query,
   Res,
   UseGuards,
   UseInterceptors,
@@ -78,12 +79,15 @@ export class RunsController {
   // shape que GET …/runs/:runId (con progreso). La UI reanuda con esto tras
   // recargar, sin reenviar contexto.
   @Get()
+  // REL lease: ?executorId= (opcional, el del equipo) solo calcula executionLease.heldByYou; nunca
+  // condiciona la lectura (acceso al curso ≠ lease de ejecución).
   current(
     @Param('courseId', ParseIntPipe) courseId: number,
     @Param('number', ParseIntPipe) number: number,
     @CurrentUser() user: AuthUser,
+    @Query('executorId') executorId?: string,
   ) {
-    return this.runs.getCurrentRun(courseId, user.id, number);
+    return this.runs.getCurrentRun(courseId, user.id, number, { executorId: typeof executorId === 'string' ? executorId : null });
   }
 
   // GET /api/v1/courses/:courseId/blueprints/:number/manifest/runs/estimate
@@ -144,8 +148,9 @@ export class RunsController {
     @Param('number', ParseIntPipe) number: number,
     @Param('runId', ParseUUIDPipe) runId: string,
     @CurrentUser() user: AuthUser,
+    @Query('executorId') executorId?: string,
   ) {
-    return this.runs.getRun(courseId, user.id, number, runId);
+    return this.runs.getRun(courseId, user.id, number, runId, { executorId: typeof executorId === 'string' ? executorId : null });
   }
 
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/cancel

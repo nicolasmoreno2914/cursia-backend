@@ -137,6 +137,53 @@ jobs:
       - name: Check V2.1 F1 perfiles (pesos normalizados / curso sin nota, 409 al arrancar, paleta → presentación; puro)
         run: node scripts/check-v21-f1-profiles.js
 
+      # REL R1 (I3, ruling conservador): el gate de códigos del BACKEND corre siempre y falla cerrado. La parte
+      # del FRONTEND (repo privado nicolasmoreno2914/cursia, rama staging) corre solo si existe el secret
+      # FRONTEND_REPO_READ_TOKEN (PAT fine-grained de solo lectura; agregarlo es decisión del owner): sin él se
+      # omite con un aviso visible y el deploy de staging NO se rompe. La obligatoriedad (--require-fe) vive en
+      # la regresión E2E (test/e2e-v2/run-e2e-v21.sh), que corre con el frontend presente y bloquea el merge.
+      - name: Detect FRONTEND_REPO_READ_TOKEN (REL R1 gate frontend)
+        id: fe_gate
+        env:
+          FRONTEND_REPO_READ_TOKEN: ${{ secrets.FRONTEND_REPO_READ_TOKEN }}
+        run: |
+          if [ -n "$FRONTEND_REPO_READ_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=REL R1 gate frontend OMITIDO::Falta el secret FRONTEND_REPO_READ_TOKEN: el gate de códigos del ejecutor del navegador NO corre en este deploy (sí en la regresión E2E). El gate del backend corre igual."
+          fi
+
+      - name: Checkout frontend (staging) para el gate REL R1
+        if: steps.fe_gate.outputs.present == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: nicolasmoreno2914/cursia
+          ref: staging
+          path: frontend-for-gate
+          token: ${{ secrets.FRONTEND_REPO_READ_TOKEN }}
+          persist-credentials: false
+
+      - name: Check REL R1 clasificador central de fallos (tabla A/B/C/D + gate de códigos emitidos; backend siempre, frontend si hay token)
+        env:
+          FE_GATE_PRESENT: ${{ steps.fe_gate.outputs.present }}
+        run: |
+          if [ "$FE_GATE_PRESENT" = "true" ]; then
+            node scripts/check-rel-failure-classes.js --require-fe --fe frontend-for-gate
+          else
+            echo "::warning title=REL R1 gate frontend OMITIDO::solo se verifica el backend (sin FRONTEND_REPO_READ_TOKEN)"
+            node scripts/check-rel-failure-classes.js
+          fi
+
+      - name: Check REL R2 log de intentos + columnas de recuperación (puro; la parte PG16 corre local)
+        run: node scripts/check-rel-recovery.js --pure-only
+
+      - name: Check REL MVP recuperación por clase (A/B) + reparación del empaque (puro; la parte PG16 corre local)
+        run: node scripts/check-rel-mvp-recovery.js --pure-only
+
+      - name: Check REL lease de ejecución del navegador por run (puro; la parte PG16 corre local)
+        run: node scripts/check-rel-exec-lease.js --pure-only
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
@@ -561,6 +608,18 @@ jobs:
                # Decisión del usuario (2026-10-02). Solo staging: nunca en deploy.yml ni en el migrador de producción.
                # El presupuesto aprobado de cada run se sigue validando antes del gasto (aprobación + runtime guard).
                MIGRATION_ENV=staging node scripts/staging-budget-policy.js aa2fa9a1-afb1-4b01-8646-94a0cb272b57
+
+               echo "━━━ [4h11] REL R2: log de intentos + columnas de recuperación por item (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-rel-recovery.js
+
+               echo "━━━ [4h12] REL R2: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-rel-recovery-schema.js
+
+               echo "━━━ [4h13] REL lease de ejecución del navegador por run (production_jobs.executor_lease_*) (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-rel-exec-lease.js
+
+               echo "━━━ [4h14] REL lease de ejecución: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-rel-exec-lease-schema.js
 
                echo "━━━ [4i] Dynamic Generation: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-dynamic-generation-schema.js

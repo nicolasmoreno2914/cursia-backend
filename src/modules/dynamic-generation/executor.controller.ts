@@ -2,8 +2,8 @@ import { Body, Controller, HttpCode, HttpStatus, Param, ParseUUIDPipe, Post, Use
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
-import { ClaimedItem, DEFAULT_LEASE_SECONDS, ItemOpResult, SchedulerService } from './scheduler.service';
-import { ClaimItemDto, CompleteItemDto, FailItemDto, HeartbeatItemDto } from './dto/executor.dto';
+import { ClaimResult, DEFAULT_LEASE_SECONDS, ItemOpResult, SchedulerService } from './scheduler.service';
+import { ClaimItemDto, CompleteItemDto, FailItemDto, HeartbeatItemDto, ReleaseRunLeaseDto } from './dto/executor.dto';
 
 /**
  * Endpoints del ejecutor del navegador (Fase 5A, Task 3). Siempre con JWT:
@@ -19,17 +19,31 @@ export class ExecutorController {
   constructor(private readonly scheduler: SchedulerService) {}
 
   // POST /api/v1/dynamic-generation/claim → { item: ClaimedItem | null }
+  // REL lease de ejecución: si otro ejecutor del navegador tiene el lease vigente del run →
+  // { item: null, reason: 'run_leased_elsewhere', leaseExpiresAt } (200, nunca un error: el acceso al
+  // curso y al run no depende de esto; el ejecutor solo espera a que venza).
   @Post('claim')
   @HttpCode(HttpStatus.OK)
-  async claim(@Body() dto: ClaimItemDto, @CurrentUser() user: AuthUser): Promise<{ item: ClaimedItem | null }> {
-    const item = await this.scheduler.claimNextItem({
+  async claim(@Body() dto: ClaimItemDto, @CurrentUser() user: AuthUser): Promise<ClaimResult> {
+    return this.scheduler.claimNextItemDetailed({
       runId: dto.runId,
       executorId: dto.executorId,
       types: dto.types,
       leaseSeconds: dto.leaseSeconds ?? DEFAULT_LEASE_SECONDS,
       ownerId: user.id,
     });
-    return { item };
+  }
+
+  // POST /api/v1/dynamic-generation/runs/:runId/release-lease → { ok: true, released }
+  // REL lease: el titular suelta el lease de ejecución del run (al cerrar la página, best-effort).
+  @Post('runs/:runId/release-lease')
+  @HttpCode(HttpStatus.OK)
+  releaseLease(
+    @Param('runId', ParseUUIDPipe) runId: string,
+    @Body() dto: ReleaseRunLeaseDto,
+    @CurrentUser() user: AuthUser,
+  ): Promise<{ ok: true; released: boolean }> {
+    return this.scheduler.releaseRunExecutionLease(runId, dto.executorId, user.id);
   }
 
   // POST /api/v1/dynamic-generation/items/:id/heartbeat
@@ -67,10 +81,13 @@ export class ExecutorController {
     @Body() dto: FailItemDto,
     @CurrentUser() user: AuthUser,
   ): Promise<ItemOpResult> {
+    // id = borrador nuevo; null explícito = borrar el anterior (R4); ausente = conservar.
+    const opts: { examBankDraftArtifactId?: string | null; errorCode?: string } = {};
+    if (dto.examBankDraftArtifactId !== undefined) opts.examBankDraftArtifactId = dto.examBankDraftArtifactId;
+    // REL R1: código explícito opcional (solo clasificación).
+    if (dto.errorCode !== undefined) opts.errorCode = dto.errorCode;
     return this.scheduler.failItemDetailed(
-      id, dto.executorId, dto.error, dto.retryable, user.id,
-      // id = borrador nuevo; null explícito = borrar el anterior (R4); ausente = conservar.
-      dto.examBankDraftArtifactId !== undefined ? { examBankDraftArtifactId: dto.examBankDraftArtifactId } : undefined,
+      id, dto.executorId, dto.error, dto.retryable, user.id, Object.keys(opts).length ? opts : undefined,
     );
   }
 }

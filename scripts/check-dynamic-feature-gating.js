@@ -971,6 +971,8 @@ async function runWorkerProcess(script, env, { waitMs }) {
           if (/pg_advisory_xact_lock/.test(sql)) return [];
           // Fase 8 fix wave: "¿otro run se creó desde este (fromRun)?" (no).
           if (/fromRunId/.test(sql)) return [];
+          // REL R2: sonda de esquema del log de intentos (sin esquema → el registro es no-op).
+          if (/to_regclass\('public\.generation_item_attempts'\)/.test(sql)) return [{ ready: false }];
           if (/from public\.production_jobs pj/.test(sql)) return [];
           if (/from public\.production_jobs where id = \$1\s*$/m.test(sql.trim()) || /select id, status, worker_status from public\.production_jobs/.test(sql)) {
             return [locked];

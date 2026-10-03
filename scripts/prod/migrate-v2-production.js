@@ -152,6 +152,26 @@ const MIGRATION_STEPS = [
     summary: 'EV6 H5P v2: courses.review_cards_enabled (nullable, default false; NULL en cursos existentes)',
   },
   {
+    // REL R2 (preparación; nada lo corre desde staging): log de intentos + columnas de recuperación por
+    // item. Aditiva; el código tolera su ausencia (sonda de esquema en reliability/attempt-log.ts: sin
+    // la migración no registra nada y se comporta como antes). Va DESPUÉS del ledger FinOps (la vista
+    // de costo por intento lee generation_cost_events) y de dynamic-generation (generation_item_runs).
+    id: 'rel-recovery',
+    file: 'supabase-migration-rel-recovery.sql',
+    stagingStep: '4h11 (migrate-rel-recovery.js)',
+    summary: 'REL R2: generation_item_attempts (append-only por fila cerrada, RLS) + failure_class/failure_code/recovery_*/cooldown_until/attention_reason en generation_item_runs + vista generation_item_attempt_costs',
+  },
+  {
+    // REL lease de ejecución del navegador por run (preparación; nada lo corre desde staging). Aditiva;
+    // el código tolera su ausencia (sonda en reliability/execution-lease.ts: sin la migración el claim
+    // se comporta como antes). Trigger BEFORE UPDATE en production_jobs que suelta el lease al terminar /
+    // cancelar el run (WHEN: solo filas con lease, ninguna fila legacy lo tiene).
+    id: 'rel-exec-lease',
+    file: 'supabase-migration-rel-exec-lease.sql',
+    stagingStep: '4h13 (migrate-rel-exec-lease.js)',
+    summary: 'REL: production_jobs.executor_lease_holder / executor_lease_expires_at (nullable) + constraints + trigger trg_pj_release_exec_lease',
+  },
+  {
     // Decisión: SÍ se necesita en producción. El ejecutor dynamic de V2 (y el
     // artifactUpload legacy de 39-brandkit/41-course-setup) sube a
     // cursia-artifacts DESDE EL NAVEGADOR con el JWT del usuario; el

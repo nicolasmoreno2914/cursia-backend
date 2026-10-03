@@ -196,6 +196,10 @@ async function main() {
           'supabase-migration-v21-finops.sql', 'supabase-migration-v21-finops-rls.sql',
           // EV6 H5P v2 (H2): courses.review_cards_enabled (preparación; default false).
           'supabase-migration-ev6-h5p2.sql',
+          // REL R2: log de intentos + columnas de recuperación (preparación).
+          'supabase-migration-rel-recovery.sql',
+          // REL: lease de ejecución del navegador por run (preparación).
+          'supabase-migration-rel-exec-lease.sql',
           'supabase-migration-storage-artifacts-policies.sql']), 'orden: ' + files.join(','));
         for (const s of plan.steps.filter((x) => x.status === 'included')) {
           const h = crypto.createHash('sha256').update(fs.readFileSync(path.join(REPO, s.file))).digest('hex');

@@ -270,6 +270,13 @@ const FLOWS = {
           if (JSON.stringify([f1, t1]) === JSON.stringify([from, to])) break;
         }
         const vh = await b.evaluate('window.innerHeight');
+        // scrollIntoView dentro del iframe no siempre desplaza la página de Moodle que lo contiene (iframe con alto de
+        // su contenido): si la palabra o su hueco siguen fuera, se desplaza la ventana superior para centrar ambos.
+        if (!(from.y > 0 && from.y < vh && to.y > 0 && to.y < vh)) {
+          await b.evaluate(`window.scrollBy(0, ${Math.round((from.y + to.y) / 2 - vh / 2)}); 1`);
+          await sleep(300);
+          from = await b.evaluate(centerOf(fromSel)); to = await b.evaluate(centerOf(toSel));
+        }
         if (!(from.y > 0 && from.y < vh && to.y > 0 && to.y < vh)) throw new Error(`DT: "${word}" o su hueco fuera de la pantalla (palabra y ${Math.round(from.y)}, hueco y ${Math.round(to.y)}, alto ${vh})`);
         await mouseDrag(b, from, to);
         placed = (await b.evaluate(inH5p(`const z=d.querySelectorAll('.h5p-dropzone')[${i}];return z?z.innerText.trim():'';`))) === word;

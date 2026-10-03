@@ -118,6 +118,8 @@ if [ "${E2E_SKIP_REGRESSION:-0}" != "1" ]; then
       check-v21-h5p-moodle) a=("$MOODLE/source" "$MOODLE/php.ini") ;;
       check-v21-h5p-player) a=("$MOODLE/source" "$MOODLE/php.ini" --creds "$CREDS" --shots "$SHOTS/regression-player") ;;
       check-v21-video-moodle) a=("$MOODLE/source" "$MOODLE/php.ini" --creds "$CREDS" --shots "$SHOTS/regression-video") ;;
+      # REL R1 (I3): el gate de códigos también sobre el ejecutor del navegador bajo prueba.
+      check-rel-failure-classes) a=(--require-fe --fe "$FE") ;;
       *) a=() ;;
     esac
     (cd "$REPO" && "${CLEAN_ENV[@]}" node "$f" "${a[@]+"${a[@]}"}") > "$REG/$n.log" 2>&1
