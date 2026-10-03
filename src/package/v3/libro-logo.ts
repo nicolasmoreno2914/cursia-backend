@@ -13,8 +13,15 @@
  * `libro_logo_invalid:<origen>:<motivo>` en el resumen del paquete. Un logo sin transparencia se usa igual
  * (a baja opacidad se ve como un rectángulo tenue) y deja el aviso `libro_logo_no_alpha:<origen>`.
  *
+ * Fix round 1 (I1): además de la validación propia, el logo se EMBEBE de prueba en un documento pdfkit descartable
+ * (el mismo parser que usará el Libro): si pdfkit no lo acepta (p.ej. un JPEG válido con bytes de relleno 0xFF entre
+ * segmentos, que el parser de pdfkit no soporta) → Cursia + `libro_logo_invalid:<origen>:pdf_embed_unsupported`.
+ * SVG: limitación conocida (sin rasterizador en producción: @napi-rs/canvas solo llega transitivo vía pdf-parse y
+ * ningún código de src lo importa) → Cursia + aviso.
+ *
  * Puro salvo la lectura (cacheada) del asset de Cursia. Determinístico: mismos bytes → mismo PNG canónico.
  */
+import PDFDocument = require('pdfkit');
 import { createHash } from 'crypto';
 import { readFileSync } from 'fs';
 import * as path from 'path';
@@ -76,6 +83,8 @@ export type LogoValidation =
 
 /** Parsea un data URI de imagen. Devuelve el mime declarado y los bytes, o un motivo de rechazo. */
 export function parseLogoDataUri(value: string): { ok: true; mime: string; bytes: Buffer } | { ok: false; reason: string } {
+  // fix round 1 (M3): tope ANTES de cualquier regex / Buffer (4,5 MB en base64 ≈ 6,2 M caracteres + cabecera).
+  if (typeof value === 'string' && value.length > Math.ceil((LIBRO_LOGO_LIMITS.maxBytes * 4) / 3) + 256) return { ok: false, reason: 'too_large' };
   const v = String(value ?? '').trim();
   if (!v) return { ok: false, reason: 'empty' };
   if (/^https?:\/\//i.test(v)) return { ok: false, reason: 'remote_url_unsupported' };
@@ -138,6 +147,27 @@ export function inspectJpeg(b: Buffer): { ok: true; width: number; height: numbe
   return { ok: false, reason: 'jpeg_truncated' };
 }
 
+/**
+ * Fix round 1 (I1): embebido de prueba con el parser real de pdfkit (documento descartable, página 10×10 pt). El JPEG
+ * se copia tal cual al PDF (embed síncrono); el PNG es el canónico propio (8 bits). Ancho/alto de pdfkit deben coincidir
+ * con los propios (sin rotación EXIF: el Libro dibuja con ignoreOrientation).
+ */
+export function pdfkitAccepts(bytes: Buffer, width: number, height: number): boolean {
+  try {
+    const d = new PDFDocument({ autoFirstPage: false, compress: false });
+    d.on('data', () => undefined);
+    d.on('error', () => undefined);
+    const img: any = (d as any).openImage(bytes);
+    if (!img || img.width !== width || img.height !== height) return false;
+    d.addPage({ size: [10, 10], margin: 0 });
+    d.image(img, 0, 0, { width: 10, height: 10, ignoreOrientation: true } as any);
+    d.end();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Valida bytes de logo contra el mime declarado. PNG → PNG canónico (RGB/RGBA 8 bits, ≤ 1200 px de ancho). */
 export function validateLogoBytes(bytes: Buffer, declaredMime: string): LogoValidation {
   const L = LIBRO_LOGO_LIMITS;
@@ -145,7 +175,8 @@ export function validateLogoBytes(bytes: Buffer, declaredMime: string): LogoVali
   if (bytes.length > L.maxBytes) return { ok: false, reason: 'too_large' };
   const isPng = bytes.length >= 8 && bytes.subarray(0, 8).equals(PNG_MAGIC);
   const isJpeg = bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
-  if (/<svg[\s>]/i.test(bytes.subarray(0, 4096).toString('latin1'))) return { ok: false, reason: 'svg_unsupported' };
+  // fix round 1 (M2): el olfateo de SVG solo si no hay firma PNG/JPEG (un PNG con «<svg» en su tEXt es un PNG).
+  if (!isPng && !isJpeg && /<svg[\s>]/i.test(bytes.subarray(0, 4096).toString('latin1'))) return { ok: false, reason: 'svg_unsupported' };
   if (declaredMime === 'image/png' && !isPng) return { ok: false, reason: isJpeg ? 'mime_mismatch' : 'png_bad_magic' };
   if (declaredMime === 'image/jpeg' && !isJpeg) return { ok: false, reason: isPng ? 'mime_mismatch' : 'jpeg_bad_magic' };
   if (isPng) {
@@ -163,6 +194,7 @@ export function validateLogoBytes(bytes: Buffer, declaredMime: string): LogoVali
     }
     const canonical = encodePngFiltered(dec.width, dec.height, dec.channels, dec.pixels);
     const out = dec.width > L.maxEmbedWidth ? downscaleCoverPng(canonical, L.maxEmbedWidth) : { png: canonical, width: dec.width, height: dec.height };
+    if (!pdfkitAccepts(out.png, out.width, out.height)) return { ok: false, reason: 'pdf_embed_unsupported' };
     return { ok: true, kind: 'png', bytes: out.png, width: out.width, height: out.height, hasAlpha: dec.channels === 4 };
   }
   if (isJpeg) {
@@ -170,6 +202,7 @@ export function validateLogoBytes(bytes: Buffer, declaredMime: string): LogoVali
     if (j.ok === false) return { ok: false, reason: j.reason };
     if (Math.min(j.width, j.height) < L.minSide) return { ok: false, reason: 'too_small' };
     if (Math.max(j.width, j.height) > L.maxSide || j.width * j.height > L.maxPixels) return { ok: false, reason: 'too_many_pixels' };
+    if (!pdfkitAccepts(bytes, j.width, j.height)) return { ok: false, reason: 'pdf_embed_unsupported' };
     return { ok: true, kind: 'jpeg', bytes, width: j.width, height: j.height, hasAlpha: false };
   }
   return { ok: false, reason: 'unknown_format' };
@@ -179,8 +212,22 @@ export function validateLogoBytes(bytes: Buffer, declaredMime: string): LogoVali
  * Logo del Libro Guía: el de la cuenta si valida; si no (o si no hay), el de Cursia. Un rechazo deja el
  * aviso `libro_logo_invalid:<origen>:<motivo>` (nunca una marca de agua vacía, nunca en silencio).
  */
+const resolveCache = new Map<string, ResolvedLibroLogo>();
+const RESOLVE_CACHE_MAX = 32;
+
 export function resolveLibroLogo(candidate: LibroLogoCandidate | null | undefined): ResolvedLibroLogo {
   if (!candidate || candidate.dataUri == null || String(candidate.dataUri).trim() === '') return cursiaDefaultLogo();
+  // fix round 1 (M4): prepare (cada chequeo de frescura) y el builder resuelven el mismo logo → caché por hash de la entrada.
+  const key = `${candidate.source}|${createHash('sha256').update(String(candidate.dataUri)).digest('hex')}`;
+  const hit = resolveCache.get(key);
+  if (hit) return { ...hit, warnings: [...hit.warnings] };
+  const r = resolveLibroLogoUncached(candidate);
+  if (resolveCache.size >= RESOLVE_CACHE_MAX) resolveCache.delete(resolveCache.keys().next().value as string);
+  resolveCache.set(key, r);
+  return { ...r, warnings: [...r.warnings] };
+}
+
+function resolveLibroLogoUncached(candidate: LibroLogoCandidate): ResolvedLibroLogo {
   const fail = (reason: string): ResolvedLibroLogo => ({ ...cursiaDefaultLogo(), warnings: [`libro_logo_invalid:${candidate.source}:${reason}`] });
   const p = parseLogoDataUri(candidate.dataUri);
   if (p.ok === false) return fail(p.reason);

@@ -134,7 +134,7 @@ import {
 import type { H5pActivityTypeV2 } from '../modules/course-shell';
 import { PackagingPlanV3, buildPackagingPlanV3, packagingPlanV3Sha256 } from '../modules/dynamic-packaging/packaging-plan-v3';
 import { LIBRO_PDF_MIMETYPE, libroPdfFilename, renderLibroPdfV3 } from './v3/libro-v3';
-import { LibroLogoCandidate, resolveLibroLogo } from './v3/libro-logo';
+import { LibroLogoCandidate, cursiaDefaultLogo, resolveLibroLogo } from './v3/libro-logo';
 import { downscaleCoverPng } from './v3/png-downscale';
 import { ActivityFrameTone, activityPackageFilename, h5pActivityInlineIntroHtml, introThemeFrom, reviewCardsIntroHtml, scormIntroHtml } from './v3/activity-intro';
 import { moduleTone } from '../modules/visual-components/edu';
@@ -812,9 +812,9 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     }
   }
   // r19 (L3): logo de la marca de agua (cuenta → Cursia); un logo de la cuenta inválido deja su aviso, nunca en silencio.
-  const libroLogo = resolveLibroLogo(input.libroBrand?.logo ?? null);
+  let libroLogo = resolveLibroLogo(input.libroBrand?.logo ?? null);
   warnings.push(...libroLogo.warnings);
-  const libro = await renderLibroPdfV3({
+  const libroInputBase = {
     courseTitle: plan.course.title,
     theme,
     courseIntro,
@@ -824,9 +824,22 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       intro: moduleIntros.get(m.moduleId) as ModuleIntroV3,
       chapters: m.chapters.map((ch) => ({ number: ch.chapterNumber, title: ch.title, md: c.contentMd.get(ch.chapterId) as string })),
     })),
-    logo: libroLogo,
     brandName: input.libroBrand?.name ?? null,
-  });
+    // fix round 1 (M8): /ID del PDF único por curso (sha del plan), sigue determinístico.
+    documentKey: packagingPlanV3Sha256(plan),
+  };
+  let libro: Awaited<ReturnType<typeof renderLibroPdfV3>>;
+  try {
+    libro = await renderLibroPdfV3({ ...libroInputBase, logo: libroLogo });
+  } catch (err) {
+    // fix round 1 (I1): un logo de la cuenta que pdfkit no puede embeber nunca tumba el paquete → Cursia + aviso.
+    if (libroLogo.source === 'cursia_default') throw err;
+    warnings.push(`libro_logo_invalid:${libroLogo.source}:pdf_embed_failed`);
+    libroLogo = cursiaDefaultLogo();
+    libro = await renderLibroPdfV3({ ...libroInputBase, logo: libroLogo });
+  }
+  // fix round 1 (I2): caracteres sin equivalente en las fuentes del PDF → contados y visibles, nunca en silencio.
+  if (libro.unmappedChars > 0) warnings.push(`libro_chars_unmapped:${libro.unmappedChars}`);
   const libroFilename = libroPdfFilename(plan.course.title);
 
   // EV6 T5 (ruling 3): capítulos pendientes cuyos textos publicados mencionan su video → aviso.
