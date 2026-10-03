@@ -584,7 +584,7 @@ function reservationBookkeeping(ev) {
         const certOmitted = (w) => w && w.code === 'certificate_omitted' && w.detail === 'certificate_omitted:no_final_exam';
         // r19 L: la DB del E2E no tiene la tabla `user_settings` (la gestiona Supabase), así que el paquete avisa
         // libro_logo_source_unavailable:user_settings y usa el logo de Cursia; es el único aviso tolerado.
-        eq((os.warnings || []).filter((w) => !/mock/i.test(JSON.stringify(w)) && !(!C.finalExam && certOmitted(w)) && !/^libro_logo_source_unavailable:user_settings/.test(String(w.detail || w.code || ''))), [], `${C.key}: 0 warnings del worker (salvo los avisos de fixtures mock de Gamma/TTS${C.finalExam ? '' : ' y certificate_omitted:no_final_exam'})`);
+        eq((os.warnings || []).filter((w) => !/mock/i.test(JSON.stringify(w)) && !(!C.finalExam && certOmitted(w)) && !/^libro_logo_source_unavailable:user_settings$/.test(String(w.detail || w.code || ''))), [], `${C.key}: 0 warnings del worker (salvo los avisos de fixtures mock de Gamma/TTS${C.finalExam ? '' : ' y certificate_omitted:no_final_exam'})`);
         eq((os.warnings || []).filter(certOmitted).length, C.finalExam ? 0 : 1, `${C.key}: aviso certificate_omitted:no_final_exam ${C.finalExam ? 'ausente (hay evaluación final)' : 'presente (sin evaluación final)'}`);
         results.courses[C.key].packageSummary = os;
         await assertExamPackage(C.key, P.buf, C.examBank === true);
