@@ -726,6 +726,59 @@ async function fixRound1Checks() {
     }
   });
 
+  await check('FR2: la ampliación repite una oración del guion principal → se descarta SOLO la ampliación (el principal, ya pagado, se conserva: 0 llamadas para él); el reintento regenera solo la ampliación y completa', async () => {
+    const fast = startProviderFakes({ openaiKey: KEYS.OPENAI_API_KEY, anthropicKey: KEYS.ANTHROPIC_API_KEY, gammaKey: 'g', makePdf: () => Buffer.from('%PDF'), makeMp3, ttsWordsPerSecond: 170 / 60 });
+    const u = await fast.listen();
+    const env = { ...KEYS, OPENAI_API_BASE_URL: u.openaiUrl, ANTHROPIC_API_BASE_URL: u.anthropicUrl };
+    try {
+      const W = memoryWorld();
+      const md = chapterMd(44, 2300);
+      const it = newItem(W, { ch: 44, md });
+      fast.plan.llmContRepeat = 1; // la PRIMERA ampliación arranca repitiendo la primera oración de su bloque
+      await claim(W, it, { env });
+      fast.plan.llmContRepeat = 0;
+      eq(it.status, 'retrying', `no completo (${it.error})`);
+      assert(/^AUDIOBOOK_SCRIPT_REPETITION: .*la repite una ampliación: se descartan solo las ampliaciones/.test(it.error), it.error);
+      const plan = AS.planAudiobookSections(md);
+      eq(Object.keys(it.outputSummary.audiobookSections).length, plan.sections.length, 'TODOS los guiones principales se conservan');
+      const mainIds = Object.values(it.outputSummary.audiobookSections).flatMap((x) => x.messageIds);
+      const disc = it.outputSummary.audiobookDiscardedOps || [];
+      assert(disc.length >= 1 && disc.every((d) => !mainIds.includes(d)), 'solo se descartaron ids de ampliaciones');
+      const l0 = fast.st.llm.length;
+      await claim(W, nextAttempt(it), { env });
+      eq(it.status, 'completed', `completa (${it.error})`);
+      const calls = fast.st.llm.slice(l0);
+      assert(calls.length >= 1 && calls.every((c) => c.continuation), `el reintento solo pide ampliaciones (${calls.map((c) => (c.continuation ? 'cont' : 'MAIN')).join(',')})`);
+      eq(Object.values(it.outputSummary.audiobookSections).flatMap((x) => x.messageIds), mainIds, 'principales reutilizados byte a byte (mismos msg ids)');
+      assert(it.outputSummary.audiobookManifest.audio.seconds >= AS.chapterTargetSeconds(plan.narratableWords) - 1e-6, 'llega a su duración objetivo');
+    } finally {
+      await fast.close();
+    }
+  });
+
+  await check('FR2 (menor): una llamada sin precio exacto en el catálogo NUNCA vuelve al p90 del item: se acota con la tarifa más cara del medidor; si el medidor no existe, el guard falla cerrado (call_unpriced)', async () => {
+    const seed = JSON.parse(fs.readFileSync(path.join(REPO, 'src/modules/finops/pricing-seed.v1.json'), 'utf8'));
+    const catalog = seed.rows.map((r, i) => ({ id: `seed-${i}`, ...r, unit_size: String(r.unit_size), unit_price: String(r.unit_price), effective_to: r.effective_to ?? null }));
+    const { FinopsBudgetService } = loadDist('modules/finops/finops-budget.service.js');
+    let actual = '14.80';
+    const ds = { async query(sql) {
+      if (/cost_budget_authorizations/.test(sql)) return [{ decision: 'ADMIN_APPROVED', authorized_budget: '15' }];
+      if (/sum\(amount\)/.test(sql)) return [{ total: actual }];
+      if (/generation_item_runs g/.test(sql)) return [];
+      if (/pricing_catalog/.test(sql)) return catalog;
+      throw new Error(`query inesperada: ${sql.slice(0, 80)}`);
+    } };
+    const svc = new FinopsBudgetService(ds, {});
+    const unknownModel = { provider: 'openai', service: 'audio.speech', product: 'tts-modelo-nuevo', usage: { audio_seconds: 117 } };
+    const cons = Number(await svc.callCost(unknownModel));
+    const exact = Number(await svc.callCost({ ...unknownModel, product: 'gpt-4o-mini-tts' }));
+    assert(cons >= exact && cons < 0.31, `conservador por llamada ${cons} (≥ exacto ${exact}, < p90 del capítulo)`);
+    const g = await svc.guardPaidSubmission({ runId: 'r', itemRunId: 'i', itemType: 'audiobook_chapter', provider: 'openai', nextCall: unknownModel });
+    eq(g.allow, true, `sin precio exacto: entra con el costo conservador de la llamada (${g.reason})`);
+    const none = await svc.guardPaidSubmission({ runId: 'r', itemRunId: 'i', itemType: 'audiobook_chapter', provider: 'openai', nextCall: { ...unknownModel, usage: { medidor_inexistente: 5 } } });
+    eq([none.allow, none.reason], [false, 'call_unpriced'], 'medidor sin ninguna tarifa: falla cerrado con motivo claro');
+  });
+
   await check('FR1 I1: sin margen bajo el 110 % → AUDIOBOOK_CHAPTER_UNDER_TARGET (clase B, recuperable), nunca completo; planChapterExtension elige primero los bloques de menor ratio', () => {
     const picks = AS.planChapterExtension([{ idx: 0, sourceWords: 300, scriptWords: 280 }, { idx: 1, sourceWords: 300, scriptWords: 258 }, { idx: 2, sourceWords: 300, scriptWords: 330 }], 60);
     eq(picks.map((x) => x.idx), [1], 'menor ratio primero; cubierto con uno');

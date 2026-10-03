@@ -146,7 +146,7 @@ function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp
   // r19 (audiolibro por bloques): llmPadded = N respuestas a 1,4 × el objetivo; llmDuplicate = N respuestas que repiten el
   // texto del bloque anterior. ttsSlow = N segmentos con el doble de duración por palabra (voz ralentizada).
   // ttsSameAudio = N segmentos que reciben el MISMO audio (makeMp3 sin el texto: bytes idénticos para la misma duración).
-  const plan = { gammaPostFail: [], gammaHoldPending: false, gammaFailGeneration: false, gammaNoCredits: false, ttsFail: [], llmFail: [], llmShortFirst: 0, ttsFixedRequestId: null, llmTiny: 0, llmPadded: 0, llmDuplicate: 0, ttsSlow: 0, ttsSameAudio: 0, llmTruncate: 0, llmLoop: 0 };
+  const plan = { gammaPostFail: [], gammaHoldPending: false, gammaFailGeneration: false, gammaNoCredits: false, ttsFail: [], llmFail: [], llmShortFirst: 0, ttsFixedRequestId: null, llmTiny: 0, llmPadded: 0, llmDuplicate: 0, ttsSlow: 0, ttsSameAudio: 0, llmTruncate: 0, llmLoop: 0, llmContRepeat: 0 };
   let lastSectionText = null;
   // 'hang' = se recibe el pedido y nunca se responde (el cliente corta por timeout; la operación pudo ejecutarse).
   const hang = (rq) => setTimeout(() => rq.socket.destroy(), 10_000).unref();
@@ -261,6 +261,15 @@ function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp
             const from = at >= 0 ? at + 1 : Math.max(0, src.length - n);
             const more = src.slice(from, from + n);
             text = [...more, ...Array.from({ length: n - more.length }, () => `amp${++st.seq}`)].join(' ');
+            // llmContRepeat = N continuaciones que arrancan repitiendo la primera oración del bloque (ya narrada).
+            if (plan.llmContRepeat > 0) {
+              plan.llmContRepeat--;
+              const end = src.findIndex((w) => /[.!?]$/.test(w));
+              const first = src.slice(0, end + 1);
+              const rest = text.split(' ').slice(first.length);
+              while (rest.length && !/[.!?]$/.test(rest[rest.length - 1])) rest.push('fin.'); // termina en oración
+              text = ['Recordemos.', ...first, ...rest].join(' '); // «Recordemos.» cierra la oración previa
+            }
           }
           else if (n <= src.length) text = src.slice(0, n).join(' ');
           else text = [...src, ...Array.from({ length: n - src.length }, (_, i) => `relleno${i}`)].join(' ');
