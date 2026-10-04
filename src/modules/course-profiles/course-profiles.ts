@@ -1,21 +1,35 @@
 import { sha256Canonical, sortedCanonicalJson } from '../coherence/canonical-json';
 import { LEGACY_PALETTES, THEME_FAMILIES, presentationProfileFromPalette } from '../theme-engine';
+import {
+  PedagogicalProfile,
+  normalizePedagogicalProfile,
+  pedagogicalProfileSha256,
+  validatePedagogicalProfile,
+} from '../pedagogy/pedagogy-profile';
 
 /**
  * Cursia V2.1 — R3: perfiles de curso (audit §M.2, §K.2). Lógica PURA: sin
  * DB, sin reloj, sin aleatoriedad.
  *
- * Los perfiles NO entran en el Blueprint, en el Manifest ni en ninguna huella
- * de invalidación: no cambian QUÉ se genera, solo cómo se empaqueta (y el
- * tema Gamma). Se guardan versionados (append-only) en `course_profiles`.
+ * Los perfiles de presentación y evaluación NO entran en el Blueprint, en el
+ * Manifest ni en ninguna huella de invalidación: no cambian QUÉ se genera, solo
+ * cómo se empaqueta (y el tema Gamma). Se guardan versionados (append-only) en
+ * `course_profiles`.
+ *
+ * Motor pedagógico V1: `pedagogy` es la excepción deliberada — el perfil
+ * pedagógico SÍ cambia el diseño: el lock del Blueprint v2 lo convierte en
+ * reglas y congela el diseño resultante (src/modules/pedagogy). Su forma y su
+ * validación viven en pedagogy-profile.ts.
  */
 
-export type ProfileKind = 'presentation' | 'assessment';
-export const PROFILE_KINDS: readonly ProfileKind[] = ['presentation', 'assessment'];
+export type ProfileKind = 'presentation' | 'assessment' | 'pedagogy';
+export const PROFILE_KINDS: readonly ProfileKind[] = ['presentation', 'assessment', 'pedagogy'];
 
 export function isProfileKind(v: unknown): v is ProfileKind {
-  return v === 'presentation' || v === 'assessment';
+  return v === 'presentation' || v === 'assessment' || v === 'pedagogy';
 }
+
+export type AnyCourseProfile = PresentationProfile | AssessmentProfile | PedagogicalProfile;
 
 export interface ProfileValidationError {
   path: string;
@@ -396,6 +410,7 @@ export function validateAssessmentProfile(p: unknown, ctx: { finalExam: boolean 
 }
 
 export function validateProfile(kind: ProfileKind, p: unknown, ctx: { finalExam: boolean }): ProfileValidationError[] {
+  if (kind === 'pedagogy') return validatePedagogicalProfile(p);
   return kind === 'presentation' ? validatePresentationProfile(p) : validateAssessmentProfile(p, ctx);
 }
 
@@ -451,16 +466,29 @@ export function normalizeAssessmentProfile(p: unknown): AssessmentProfile {
   };
 }
 
-export function normalizeProfile(kind: ProfileKind, p: unknown): PresentationProfile | AssessmentProfile {
+export function normalizeProfile(kind: 'presentation', p: unknown): PresentationProfile;
+export function normalizeProfile(kind: 'assessment', p: unknown): AssessmentProfile;
+export function normalizeProfile(kind: 'pedagogy', p: unknown): PedagogicalProfile;
+export function normalizeProfile(kind: ProfileKind, p: unknown): AnyCourseProfile;
+export function normalizeProfile(kind: ProfileKind, p: unknown): AnyCourseProfile {
+  if (kind === 'pedagogy') return normalizePedagogicalProfile(p);
   return kind === 'presentation' ? normalizePresentationProfile(p) : normalizeAssessmentProfile(p);
 }
 
 /** JSON canónico (claves ordenadas recursivamente): independiente del orden de claves de jsonb. */
-export function canonicalProfileJson(p: PresentationProfile | AssessmentProfile): string {
+export function canonicalProfileJson(p: AnyCourseProfile): string {
   return sortedCanonicalJson(p);
 }
 
-/** sha256 hex del JSON canónico del perfil. */
-export function profileSha256(p: PresentationProfile | AssessmentProfile): string {
+/**
+ * sha256 hex del JSON canónico del perfil. El perfil pedagógico se hashea sin
+ * `designRules` (registro derivado que guarda el servidor): mismo perfil ⇒ mismo sha.
+ */
+export function profileSha256(p: AnyCourseProfile): string {
+  if (isPedagogicalProfileShape(p)) return pedagogicalProfileSha256(p);
   return sha256Canonical(p);
+}
+
+function isPedagogicalProfileShape(p: unknown): p is PedagogicalProfile {
+  return !!p && typeof p === 'object' && 'pedagogyProfileVersion' in (p as Record<string, unknown>);
 }

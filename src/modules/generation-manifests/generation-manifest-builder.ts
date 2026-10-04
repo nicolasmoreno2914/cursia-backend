@@ -11,6 +11,9 @@ import {
   chooseActivityTypesV1,
 } from './activity-type-rules';
 import { chooseActivityTypesV2 } from './activity-type-rules-v2';
+import { sortedCanonicalJson } from '../coherence/canonical-json';
+import { ManifestFeaturesPedagogy, manifestFeaturesPedagogy, manifestItemDesign } from '../pedagogy/manifest-design';
+import { allowedPedagogicalTypes, choosePedagogicalActivityTypes } from '../pedagogy/pedagogical-blueprint';
 
 /**
  * rulesVersion por defecto (y el único que existía hasta 5B.2.B/Fase 6). La
@@ -134,6 +137,11 @@ export interface ManifestItem {
    * activity-type-rules.ts). Ausente = rotación por hash (`activityTypeForChapter`).
    */
   h5pType?: GradedH5pActivityType | 'branchingscenario';
+  /**
+   * Motor pedagógico V1: diseño pedagógico del item (lo lee su generador). SOLO en Manifests v3
+   * de Blueprints con `course.pedagogy`; ausente = Manifest de siempre (sha intacto).
+   */
+  design?: Record<string, unknown>;
 }
 
 /** Solo rulesVersion 3: flags de curso del Blueprint v2 que cambian el conjunto de items. */
@@ -153,6 +161,12 @@ export interface ManifestFeatures {
    * interruptor de H5P v2 (ruling Q2). Ausente = schemaVersion 1, bytes de siempre.
    */
   ivAdvanced?: 1;
+  /**
+   * Motor pedagógico V1: el Blueprint trae diseño pedagógico. Con esta clave cada item lleva
+   * `design` y cada activity h5p lleva `h5pType` elegido por el diseño (choosePedagogicalActivityTypes,
+   * dentro de los tipos que admite activityTypeRules). Ausente = Manifest de siempre.
+   */
+  pedagogy?: ManifestFeaturesPedagogy;
 }
 
 /**
@@ -1103,8 +1117,11 @@ export function buildGenerationManifestV3(
   const variant: ActivityVariant = course.activityEngine;
   // EV5-C: con el marcador, el tipo h5p de cada actividad se decide y congela acá.
   // EV6 H5P v2: con el marcador 2, reglas v2 (decide → branchingscenario, tope y balance propios).
-  const chosenTypes: Map<string, { type: GradedH5pActivityType | 'branchingscenario' }> | null =
-    activityTypeRules === 1 ? chooseActivityTypesV1(snapshot) : activityTypeRules === 2 ? chooseActivityTypesV2(snapshot) : null;
+  // Motor pedagógico V1: con diseño pedagógico el tipo lo elige el diseño (dentro de los tipos admitidos).
+  const pedagogyFeature = manifestFeaturesPedagogy(snapshot);
+  const chosenTypes: Map<string, { type: GradedH5pActivityType | 'branchingscenario' }> | null = pedagogyFeature
+    ? choosePedagogicalActivityTypes(snapshot, activityTypeRules)
+    : activityTypeRules === 1 ? chooseActivityTypesV1(snapshot) : activityTypeRules === 2 ? chooseActivityTypesV2(snapshot) : null;
   const planKey = coursePlanKey(source.courseId);
   const introKey = courseIntroKey(source.courseId);
   const courseBase = { scope: 'course' as const, moduleId: null, chapterId: null, moduleNumber: null, chapterNumber: null };
@@ -1171,6 +1188,13 @@ export function buildGenerationManifestV3(
   if (course.finalExam) {
     items.push({ key: finalExamKey(source.courseId), type: 'final_exam', ...courseBase, dependsOn: [...allContentKeys] });
   }
+  if (pedagogyFeature) {
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const design = manifestItemDesign(snapshot, it.type, it.moduleId, it.chapterId);
+      if (design) items[i] = { ...it, design };
+    }
+  }
 
   const count = (t: ManifestItemType) => items.filter((i) => i.type === t).length;
   return {
@@ -1187,6 +1211,7 @@ export function buildGenerationManifestV3(
       activityEngine: course.activityEngine,
       ...(activityTypeRules === 1 ? { activityTypeRules: 1 as const } : {}),
       ...(activityTypeRules === 2 ? { activityTypeRules: 2 as const, ivAdvanced: 1 as const } : {}),
+      ...(pedagogyFeature ? { pedagogy: pedagogyFeature } : {}),
     },
     modules,
     items,
@@ -1258,6 +1283,7 @@ export function canonicalManifestJsonV3(m: GenerationManifestV1): string {
       activityEngine: m.features?.activityEngine,
       ...(m.features?.activityTypeRules !== undefined ? { activityTypeRules: m.features.activityTypeRules } : {}),
       ...(m.features?.ivAdvanced !== undefined ? { ivAdvanced: m.features.ivAdvanced } : {}),
+      ...(m.features?.pedagogy !== undefined ? { pedagogy: JSON.parse(sortedCanonicalJson(m.features.pedagogy)) } : {}),
     },
     modules: m.modules.map((mod) => ({
       moduleId: mod.moduleId,
@@ -1283,6 +1309,8 @@ export function canonicalManifestJsonV3(m: GenerationManifestV1): string {
       dependsOn: [...i.dependsOn],
       ...(i.variant !== undefined ? { variant: i.variant } : {}),
       ...(i.h5pType !== undefined ? { h5pType: i.h5pType } : {}),
+      // Motor pedagógico V1: claves del diseño ordenadas (independiente del orden de jsonb).
+      ...(i.design !== undefined ? { design: JSON.parse(sortedCanonicalJson(i.design)) } : {}),
     })),
     // Se copian TODAS las claves que traiga (en orden v3 primero, luego
     // cualquier extra como scormCount) para que el validador vea un totals
@@ -1379,9 +1407,26 @@ export function validateGenerationManifestV3(
       message: `features.ivAdvanced debe ser 1 con activityTypeRules=2 y estar ausente si no (encontrado ${JSON.stringify(ivAdvanced ?? null)}, reglas ${JSON.stringify(rulesMarker ?? null)})`,
     });
   }
-  // Recalculado desde el snapshot (módulo puro de reglas, no el builder).
-  const expectedH5pTypes: Map<string, { type: string }> | null =
-    rulesMarker === 1 ? chooseActivityTypesV1(snapshot) : rulesMarker === 2 ? chooseActivityTypesV2(snapshot) : null;
+  // Motor pedagógico V1: features.pedagogy refleja course.pedagogy del Blueprint (o falta en ambos).
+  const wantPedagogy = manifestFeaturesPedagogy(snapshot);
+  const gotPedagogy = (m.features as any)?.pedagogy;
+  if (sortedCanonicalJson(wantPedagogy ?? null) !== sortedCanonicalJson(gotPedagogy ?? null)) {
+    errors.push({
+      code: 'FEATURES_MISMATCH',
+      message: `features.pedagogy esperado ${JSON.stringify(wantPedagogy ?? null)}, encontrado ${JSON.stringify(gotPedagogy ?? null)}`,
+    });
+  }
+  // Recalculado desde el snapshot (módulo puro de reglas, no el builder). Con diseño pedagógico,
+  // el tipo lo decide el diseño (dentro de los tipos que admite activityTypeRules).
+  let expectedH5pTypes: Map<string, { type: string }> | null = null;
+  if (wantPedagogy) {
+    if (rulesMarker === undefined || rulesMarker === 1 || rulesMarker === 2) {
+      expectedH5pTypes = choosePedagogicalActivityTypes(snapshot, rulesMarker);
+    }
+  } else {
+    expectedH5pTypes = rulesMarker === 1 ? chooseActivityTypesV1(snapshot) : rulesMarker === 2 ? chooseActivityTypesV2(snapshot) : null;
+  }
+  const allowedH5p = wantPedagogy ? (allowedPedagogicalTypes(rulesMarker) as readonly string[]) : null;
 
   // --- Recalcular lo esperado desde el snapshot ---
   const planKey = `course_plan:${source.courseId}`;
@@ -1495,6 +1540,16 @@ export function validateGenerationManifestV3(
           key: it.key,
         });
       }
+      // Motor pedagógico V1: `design` recalculado desde el Blueprint (o ausente sin pedagogía).
+      const wantDesign = wantPedagogy ? manifestItemDesign(snapshot, exp.type, exp.moduleId, exp.chapterId) : undefined;
+      const gotDesign = (it as any).design;
+      if (wantDesign === undefined && gotDesign !== undefined) {
+        errors.push({ code: 'UNEXPECTED_DESIGN', message: `item ${it.key}: trae design pero ${wantPedagogy ? 'su tipo no lleva diseño' : 'el Blueprint no tiene diseño pedagógico'}`, key: it.key });
+      } else if (wantDesign !== undefined && gotDesign === undefined) {
+        errors.push({ code: 'MISSING_DESIGN', message: `item ${it.key}: falta design (el Blueprint tiene diseño pedagógico)`, key: it.key });
+      } else if (wantDesign !== undefined && sortedCanonicalJson(wantDesign) !== sortedCanonicalJson(gotDesign)) {
+        errors.push({ code: 'WRONG_DESIGN', message: `item ${it.key}: design no coincide con el diseño pedagógico del Blueprint`, key: it.key });
+      }
     }
     if (it.type === 'activity') {
       if (it.variant !== engine) {
@@ -1509,6 +1564,9 @@ export function validateGenerationManifestV3(
     }
     const h5pType = (it as any).h5pType;
     const isH5pActivity = it.type === 'activity' && it.variant === 'h5p';
+    if (allowedH5p && isH5pActivity && h5pType !== undefined && !allowedH5p.includes(h5pType)) {
+      errors.push({ code: 'WRONG_H5P_TYPE', message: `item ${it.key}: h5pType ${JSON.stringify(h5pType)} no admitido con activityTypeRules=${JSON.stringify(rulesMarker ?? null)}`, key: it.key });
+    }
     if (expectedH5pTypes && isH5pActivity) {
       const want = it.chapterId ? expectedH5pTypes.get(it.chapterId)?.type : undefined;
       if (h5pType === undefined) {

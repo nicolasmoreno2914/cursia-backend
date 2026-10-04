@@ -1,4 +1,6 @@
 import { Injectable, BadRequestException, NotFoundException, ConflictException, Logger, OnModuleInit, ServiceUnavailableException } from '@nestjs/common';
+import { lockPedagogyInput } from '../pedagogy/pedagogical-blueprint';
+import { parseStoredPedagogicalProfile } from '../pedagogy/pedagogy-db';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
 import { CourseModule as CourseModuleEntity } from './entities/course-module.entity';
@@ -212,6 +214,11 @@ export class CourseStructureService implements OnModuleInit {
               (to_jsonb(c) ? 'review_cards_enabled') as review_cards_migrated,
               b.id as bp_id, b.blueprint_number as bp_number, b.locked_at as bp_locked_at,
               b.snapshot_sha256 as bp_sha256, b.schema_version as bp_schema_version,
+              -- Motor pedagógico V1 (review I1): perfil pedagógico vigente en la MISMA sentencia (sin ida y vuelta extra).
+              (select json_build_object('id', p.id, 'version', p.version, 'data', p.data, 'sha256', p.sha256)
+                 from public.course_profiles p
+                where p.course_id = c.id and p.kind = 'pedagogy' and b.schema_version = 2
+                order by p.version desc limit 1) as ped_row,
               coalesce((
                 select json_agg(json_build_object(
                          'id', m.id, 'position', m.position, 'title', m.title, 'objective', m.objective,
@@ -279,12 +286,27 @@ export class CourseStructureService implements OnModuleInit {
           sha256: row.bp_sha256,
           schemaVersion: Number(row.bp_schema_version),
         };
-    const liveMatchesCurrentBlueprint = this.computeLiveMatchesCurrentBlueprint(
+    // Motor pedagógico V1 (review I1): el lock v2 congela el diseño del perfil pedagógico vigente; la
+    // comparación usa el MISMO perfil (leído en la sentencia de arriba, solo con Blueprint v2 vigente).
+    // Un perfil ilegible → la comparación da false (nunca rompe la lectura de la estructura).
+    let pedagogyProfile: unknown = null;
+    let pedagogyUnreadable = false;
+    if (currentBlueprint && currentBlueprint.schemaVersion === 2 && row.ped_row) {
+      try {
+        const ped = typeof row.ped_row === 'string' ? JSON.parse(row.ped_row) : row.ped_row;
+        pedagogyProfile = parseStoredPedagogicalProfile(ped, courseId).profile;
+      } catch (err) {
+        pedagogyUnreadable = true;
+        this.logger.warn(`readStructure: perfil pedagógico ilegible del curso #${courseId} — ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    const liveMatchesCurrentBlueprint = !pedagogyUnreadable && this.computeLiveMatchesCurrentBlueprint(
       course,
       modules,
       currentBlueprint,
       settings,
       activityByChapter,
+      pedagogyProfile,
     );
 
     return {
@@ -375,6 +397,7 @@ export class CourseStructureService implements OnModuleInit {
     currentBlueprint: { sha256: string; schemaVersion?: number } | null,
     settings?: { finalExam: boolean; activityEngine: 'h5p' | 'scorm'; reviewCardsEnabled?: boolean },
     activityByChapter?: Map<string, boolean>,
+    pedagogyProfile: unknown = null,
   ): boolean {
     if (!currentBlueprint) return false;
     try {
@@ -397,11 +420,10 @@ export class CourseStructureService implements OnModuleInit {
             video_enabled: c.videoEnabled, activity_enabled: activityByChapter.get(c.id) as boolean,
           })),
         );
-        const snapshotV2 = buildBlueprintSnapshotV2(
-          { id: course.id, title: course.title, finalExam: settings.finalExam, activityEngine: settings.activityEngine, reviewCards: settings.reviewCardsEnabled === true },
-          rawModulesV2,
-          rawChaptersV2,
-        );
+        const courseV2 = { id: course.id, title: course.title, finalExam: settings.finalExam, activityEngine: settings.activityEngine, reviewCards: settings.reviewCardsEnabled === true };
+        const plainV2 = buildBlueprintSnapshotV2(courseV2, rawModulesV2, rawChaptersV2);
+        const pedagogy = lockPedagogyInput(plainV2, pedagogyProfile);
+        const snapshotV2 = pedagogy ? buildBlueprintSnapshotV2(courseV2, rawModulesV2, rawChaptersV2, pedagogy) : plainV2;
         return snapshotSha256V2(snapshotV2) === currentBlueprint.sha256;
       }
       const rawModules: RawModuleRow[] = modules.map((m) => ({

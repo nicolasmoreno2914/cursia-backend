@@ -2,14 +2,14 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import type { QueryRunner } from 'typeorm';
 import { CoursesService } from '../courses/courses.service';
 import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import {
-  AssessmentProfile,
-  PresentationProfile,
+  AnyCourseProfile,
   ProfileKind,
   ProfileValidationError,
   defaultAssessmentProfile,
@@ -22,13 +22,15 @@ import {
   validateAssessmentProfile,
   validateProfile,
 } from './course-profiles';
+import { DesignRules, deriveDesignRulesOrNull, designRulesRecord } from '../pedagogy/design-rules';
+import { emptyPedagogicalProfile } from '../pedagogy/pedagogy-profile';
 
 export interface CourseProfileDto {
   courseId: number;
   kind: ProfileKind;
   /** 0 = no hay versión guardada (default). */
   version: number;
-  profile: PresentationProfile | AssessmentProfile;
+  profile: AnyCourseProfile;
   sha256: string;
   isDefault: boolean;
   createdAt: string | null;
@@ -45,6 +47,18 @@ export interface CourseProfileDto {
    * es aula-clara/light. `null` en un perfil guardado o de evaluación.
    */
   defaultSource: PresentationDefaultSource | null;
+  /**
+   * Motor pedagógico V1 — solo `pedagogy`: reglas de diseño derivadas del perfil (recalculadas en
+   * cada lectura con el motor vigente; null si el perfil está vacío). `rulesStale` = la versión
+   * guardada se calculó con otro motor (informativo: el lock siempre usa el motor vigente).
+   */
+  designRules?: ReturnType<typeof designRulesRecord> | null;
+  rulesStale?: boolean;
+}
+
+function pedagogyRulesRecord(profile: AnyCourseProfile): ReturnType<typeof designRulesRecord> | null {
+  const rules: DesignRules | null = deriveDesignRulesOrNull(profile);
+  return rules ? designRulesRecord(rules) : null;
 }
 
 /** F1 (I4): id de paleta guardado en `courses.metadata` (`paletteId` o `pal.id`), si lo hay. */
@@ -61,6 +75,12 @@ const PROFILE_VERSION_UNIQUE = 'course_profiles_course_kind_version_key';
 
 function toIso(v: Date | string): string {
   return (v instanceof Date ? v : new Date(v)).toISOString();
+}
+
+function isKindCheckViolation(err: any): boolean {
+  const e = err?.driverError ?? err;
+  return (err?.code === '23514' || e?.code === '23514') &&
+    (err?.constraint === 'course_profiles_kind_check' || e?.constraint === 'course_profiles_kind_check');
 }
 
 function isVersionConflict(err: any): boolean {
@@ -84,7 +104,7 @@ export class CourseProfilesService {
 
   private assertKind(kind: string): asserts kind is ProfileKind {
     if (!isProfileKind(kind)) {
-      throw new BadRequestException(`Tipo de perfil inválido: "${kind}" (permitidos: presentation, assessment)`);
+      throw new BadRequestException(`Tipo de perfil inválido: "${kind}" (permitidos: presentation, assessment, pedagogy)`);
     }
   }
 
@@ -131,6 +151,14 @@ export class CourseProfilesService {
           createdAt: null, createdBy: null, warnings: d.warnings, defaultSource: d.source,
         };
       }
+      if (kind === 'pedagogy') {
+        // Motor pedagógico V1: sin perfil guardado = sin enfoque (el comportamiento de siempre).
+        const empty = emptyPedagogicalProfile();
+        return {
+          courseId, kind, version: 0, profile: empty, sha256: profileSha256(empty), isDefault: true,
+          createdAt: null, createdBy: null, warnings: [], defaultSource: null, designRules: null, rulesStale: false,
+        };
+      }
       const profile = defaultAssessmentProfile({ finalExam });
       return {
         courseId, kind, version: 0, profile, sha256: profileSha256(profile), isDefault: true,
@@ -171,6 +199,8 @@ export class CourseProfilesService {
       }
       const profile = normalizeProfile(kind, data);
       const sha = profileSha256(profile);
+      // Motor pedagógico V1: se guardan junto al perfil las reglas que derivó el servidor (nunca las del cliente).
+      const stored = kind === 'pedagogy' ? { ...profile, designRules: pedagogyRulesRecord(profile) } : profile;
 
       const [latest] = await qr.query(
         `select * from public.course_profiles where course_id = $1 and kind = $2 order by version desc limit 1`,
@@ -193,7 +223,7 @@ export class CourseProfilesService {
         `insert into public.course_profiles (course_id, kind, version, data, sha256, created_by)
          values ($1, $2, $3, $4::jsonb, $5, $6)
          returning *`,
-        [courseId, kind, currentVersion + 1, JSON.stringify(profile), sha, ownerId],
+        [courseId, kind, currentVersion + 1, JSON.stringify(stored), sha, ownerId],
       );
       await qr.commitTransaction();
       return { created: true, profile: this.toDto(row, finalExam) };
@@ -201,6 +231,12 @@ export class CourseProfilesService {
       if (qr.isTransactionActive) await qr.rollbackTransaction();
       if (isVersionConflict(err)) {
         throw new ConflictException('Otro guardado del perfil en curso, vuelve a leerlo y reintenta');
+      }
+      // Motor pedagógico V1 (review M6): base sin la migración pedagogy → mensaje claro, no un 500.
+      if (isKindCheckViolation(err)) {
+        throw new ServiceUnavailableException(
+          `Este entorno todavía no admite perfiles "${kind}" (falta la migración supabase-migration-pedagogy-profiles.sql).`,
+        );
       }
       throw err;
     } finally {
@@ -220,7 +256,7 @@ export class CourseProfilesService {
     if (profileSha256(profile) !== row.sha256) {
       throw new Error(`Perfil #${row.id} (${kind} v${row.version}): el contenido no coincide con su sha256 (integridad rota)`);
     }
-    return {
+    const base: CourseProfileDto = {
       courseId: row.course_id,
       kind,
       version: Number(row.version),
@@ -229,8 +265,12 @@ export class CourseProfilesService {
       isDefault: false,
       createdAt: toIso(row.created_at),
       createdBy: row.created_by ?? null,
-      warnings: kind === 'assessment' ? validateAssessmentProfile(profile, { finalExam }) : [],
+      warnings: kind === 'assessment' ? validateAssessmentProfile(profile as any, { finalExam }) : [],
       defaultSource: null,
     };
+    if (kind !== 'pedagogy') return base;
+    const designRules = pedagogyRulesRecord(profile);
+    const storedEngine = stored?.designRules?.engineVersion ?? null;
+    return { ...base, designRules, rulesStale: designRules !== null && storedEngine !== designRules.engineVersion };
   }
 }

@@ -1,4 +1,13 @@
 import { createHash } from 'crypto';
+import {
+  BlueprintPedagogyInput,
+  ChapterDesign,
+  CoursePedagogyDesign,
+  ModuleDesign,
+  canonicalChapterDesign,
+  canonicalCoursePedagogy,
+  canonicalModuleDesign,
+} from '../pedagogy/blueprint-design';
 
 /**
  * Raw shape returned by `select ... from course_modules`. snake_case on
@@ -344,6 +353,8 @@ export interface BlueprintChapterV2 extends BlueprintChapter {
   /** Solo presente con texto: los snapshots sin descripción conservan su sha. */
   description?: string;
   activityEnabled: boolean;
+  /** Motor pedagógico V1: solo si el curso tiene perfil pedagógico (sin él, sha de siempre). */
+  design?: ChapterDesign;
 }
 
 export interface BlueprintModuleV2 {
@@ -354,6 +365,8 @@ export interface BlueprintModuleV2 {
   /** Solo presente con texto: los snapshots sin descripción conservan su sha. */
   description?: string;
   examEnabled: boolean;
+  /** Motor pedagógico V1: solo si el curso tiene perfil pedagógico. */
+  design?: ModuleDesign;
   chapters: BlueprintChapterV2[];
 }
 
@@ -370,6 +383,11 @@ export interface BlueprintSnapshotV2 {
      * La clave existe SOLO cuando está encendido: los snapshots sin ella conservan su sha.
      */
     reviewCards?: true;
+    /**
+     * Motor pedagógico V1: resumen del diseño pedagógico (enfoques, estrategia de evaluación…).
+     * La clave existe SOLO con perfil pedagógico: los snapshots sin ella conservan su sha.
+     */
+    pedagogy?: CoursePedagogyDesign;
   };
   modules: BlueprintModuleV2[];
 }
@@ -403,6 +421,7 @@ export function buildBlueprintSnapshotV2(
   course: BlueprintCourseInputV2,
   modules: RawModuleRow[],
   chapters: RawChapterRowV2[],
+  pedagogy?: BlueprintPedagogyInput | null,
 ): BlueprintSnapshotV2 {
   if (typeof course.finalExam !== 'boolean') {
     throw new Error(`BLUEPRINT_V2_INVALID_INPUT: course.finalExam debe ser boolean (fue ${JSON.stringify(course.finalExam)})`);
@@ -438,6 +457,12 @@ export function buildBlueprintSnapshotV2(
     chaptersByModule.set(c.module_id, list);
   }
   const sortedModules = [...modules].sort((a, b) => Number(a.position) - Number(b.position));
+  // Motor pedagógico V1: con perfil, TODO módulo y capítulo lleva su diseño (incompleto → throw).
+  if (pedagogy) {
+    for (const m of modules) if (!pedagogy.modules?.[m.id]) throw new Error(`BLUEPRINT_PEDAGOGY_INVALID: falta el diseño del módulo ${m.id}`);
+    for (const c of chapters) if (!pedagogy.chapters?.[c.id]) throw new Error(`BLUEPRINT_PEDAGOGY_INVALID: falta el diseño del capítulo ${c.id}`);
+  }
+  const coursePedagogy = pedagogy ? canonicalCoursePedagogy(pedagogy.course) : null;
 
   return {
     schemaVersion: 2,
@@ -448,6 +473,7 @@ export function buildBlueprintSnapshotV2(
       finalExam: course.finalExam,
       activityEngine: course.activityEngine,
       ...(course.reviewCards === true ? { reviewCards: true as const } : {}),
+      ...(coursePedagogy ? { pedagogy: coursePedagogy } : {}),
     },
     modules: sortedModules.map((m) => {
       const moduleChapters = [...(chaptersByModule.get(m.id) ?? [])].sort(
@@ -460,6 +486,7 @@ export function buildBlueprintSnapshotV2(
         objective: m.objective ?? null,
         ...descriptionKey(m.description),
         examEnabled: !!m.exam_enabled,
+        ...(pedagogy ? { design: canonicalModuleDesign(pedagogy.modules[m.id], `modules[${m.id}].design`) } : {}),
         chapters: moduleChapters.map((c) => ({
           id: c.id,
           position: Number(c.position),
@@ -468,6 +495,7 @@ export function buildBlueprintSnapshotV2(
           ...descriptionKey(c.description),
           videoEnabled: !!c.video_enabled,
           activityEnabled: c.activity_enabled,
+          ...(pedagogy ? { design: canonicalChapterDesign(pedagogy.chapters[c.id], `chapters[${c.id}].design`) } : {}),
         })),
       };
     }),
@@ -493,20 +521,41 @@ export function recanonicalizeBlueprintSnapshotV2(stored: any): BlueprintSnapsho
   if (!s || s.schemaVersion !== 2) {
     throw new Error(`recanonicalizeBlueprintSnapshotV2: schemaVersion ${s?.schemaVersion} (se esperaba 2)`);
   }
+  const { course, modules, chapters, pedagogy } = snapshotV2ToRows(s);
+  return buildBlueprintSnapshotV2(course, modules, chapters, pedagogy);
+}
+
+/**
+ * Snapshot v2 (en cualquier orden de claves) → la entrada del builder: filas crudas + el diseño
+ * pedagógico tal cual estaba congelado (null si el snapshot no lo tiene). Lo usan
+ * `recanonicalizeBlueprintSnapshotV2` y el motor pedagógico (aplicar/proponer sobre un snapshot).
+ */
+export function snapshotV2ToRows(s: any): {
+  course: BlueprintCourseInputV2;
+  modules: RawModuleRow[];
+  chapters: RawChapterRowV2[];
+  pedagogy: BlueprintPedagogyInput | null;
+} {
   const modules: RawModuleRow[] = [];
   const chapters: RawChapterRowV2[] = [];
+  const hasPedagogy = s.course?.pedagogy !== undefined;
+  const pedagogy: BlueprintPedagogyInput | null = hasPedagogy ? { course: s.course.pedagogy, modules: {}, chapters: {} } : null;
   for (const m of s.modules) {
     modules.push({ id: m.id, position: m.position, title: m.title, objective: m.objective, exam_enabled: m.examEnabled, description: m.description ?? null });
+    if (pedagogy) pedagogy.modules[m.id] = m.design;
+    else if (m.design !== undefined) throw new Error(`BLUEPRINT_PEDAGOGY_INVALID: el módulo ${m.id} trae design sin course.pedagogy`);
     for (const c of m.chapters) {
       chapters.push({
         id: c.id, module_id: m.id, position: c.position, title: c.title, objective: c.objective,
         description: c.description ?? null,
         video_enabled: c.videoEnabled, activity_enabled: c.activityEnabled,
       });
+      if (pedagogy) pedagogy.chapters[c.id] = c.design;
+      else if (c.design !== undefined) throw new Error(`BLUEPRINT_PEDAGOGY_INVALID: el capítulo ${c.id} trae design sin course.pedagogy`);
     }
   }
-  return buildBlueprintSnapshotV2(
-    {
+  return {
+    course: {
       id: s.course.id,
       title: s.course.title,
       finalExam: s.course.finalExam,
@@ -515,7 +564,8 @@ export function recanonicalizeBlueprintSnapshotV2(stored: any): BlueprintSnapsho
     },
     modules,
     chapters,
-  );
+    pedagogy,
+  };
 }
 
 /**
@@ -554,6 +604,26 @@ export function validateBlueprintSnapshotV2(s: BlueprintSnapshotV2): BlueprintVa
       message: `course.activityEngine inválido: ${JSON.stringify(s.course.activityEngine)} (permitidos: h5p, scorm)`,
     });
   }
+  // Motor pedagógico V1: con course.pedagogy, todo módulo y capítulo lleva design; sin él, ninguno.
+  const hasPedagogy = s.course.pedagogy !== undefined;
+  s.modules.forEach((m, mIdx) => {
+    if ((m.design !== undefined) !== hasPedagogy) {
+      errors.push({
+        path: `modules[${mIdx}].design`,
+        code: 'PEDAGOGY_INCOMPLETE',
+        message: hasPedagogy ? `El módulo ${m.id} no tiene diseño pedagógico` : `El módulo ${m.id} trae diseño pedagógico sin course.pedagogy`,
+      });
+    }
+    m.chapters.forEach((c, cIdx) => {
+      if ((c.design !== undefined) !== hasPedagogy) {
+        errors.push({
+          path: `modules[${mIdx}].chapters[${cIdx}].design`,
+          code: 'PEDAGOGY_INCOMPLETE',
+          message: hasPedagogy ? `El capítulo ${c.id} no tiene diseño pedagógico` : `El capítulo ${c.id} trae diseño pedagógico sin course.pedagogy`,
+        });
+      }
+    });
+  });
   s.modules.forEach((m, mIdx) =>
     m.chapters.forEach((c, cIdx) => {
       if (typeof c.activityEnabled !== 'boolean') {

@@ -7,7 +7,7 @@ import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
 
 /**
- * V2.1 (R3): perfiles de curso (presentation / assessment). Controller V2
+ * V2.1 (R3): perfiles de curso (presentation / assessment; motor pedagógico V1: pedagogy). Controller V2
  * (listado en features/dynamic-routes.ts: 404 con DYNAMIC_COURSE_STRUCTURE
  * apagado).
  */

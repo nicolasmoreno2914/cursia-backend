@@ -571,6 +571,12 @@ jobs:
                echo "━━━ [4d5] EV6 H5P v2: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-ev6-h5p2-schema.js
 
+               echo "━━━ [4d6] Motor pedagógico V1: course_profiles.kind admite pedagogy — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-pedagogy-profiles.js
+
+               echo "━━━ [4d7] Motor pedagógico V1: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-pedagogy-profiles-schema.js
+
                echo "━━━ [4e] Generation Manifests: migración (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-generation-manifests.js
 

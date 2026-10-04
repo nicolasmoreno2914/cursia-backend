@@ -9,6 +9,8 @@ import {
 import { DataSource } from 'typeorm';
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
+import { lockPedagogyInput } from '../pedagogy/pedagogical-blueprint';
+import { loadCurrentPedagogicalProfile } from '../pedagogy/pedagogy-db';
 import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import {
   BlueprintSnapshotV1,
@@ -276,7 +278,13 @@ export class CourseBlueprintsService {
    * idempotencia que `lock`, pero lee los toggles nuevos
    * (courses.final_exam_enabled / activity_engine,
    * course_chapters.activity_enabled) y persiste `schema_version = 2`. Los
-   * perfiles (tema, evaluación) NO entran: no se leen acá.
+   * perfiles de tema y evaluación NO entran: no se leen acá.
+   *
+   * Motor pedagógico V1: el perfil pedagógico VIGENTE (si existe y no está
+   * vacío) se convierte en reglas y su diseño se congela en el snapshot
+   * (`course.pedagogy` + `design` por módulo y capítulo). Los toggles del
+   * docente NO se tocan (las sugerencias de estructura solo las muestra el
+   * dry-run). Sin perfil: snapshot y sha de siempre.
    */
   private async lockV2(
     courseId: number,
@@ -356,7 +364,10 @@ export class CourseBlueprintsService {
         });
       }
 
-      const snapshot = buildBlueprintSnapshotV2(courseRef, modules, chapters);
+      const pedagogyProfile = await loadCurrentPedagogicalProfile(qr, courseId);
+      const plain = buildBlueprintSnapshotV2(courseRef, modules, chapters);
+      const pedagogy = lockPedagogyInput(plain, pedagogyProfile ? pedagogyProfile.profile : null);
+      const snapshot = pedagogy ? buildBlueprintSnapshotV2(courseRef, modules, chapters, pedagogy) : plain;
       const canonical = canonicalJsonV2(snapshot);
       const sha = snapshotSha256V2(snapshot);
 

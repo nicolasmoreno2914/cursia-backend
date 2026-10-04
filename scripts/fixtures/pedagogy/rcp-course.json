@@ -1,0 +1,39 @@
+{
+  "description": "Curso de ejemplo de la Fase 8 (motor pedagógico V1): «RCP Básico para Auxiliares de Enfermería», 3 módulos × 3 capítulos. Estructura escrita a mano (sin IA, sin costo) con los toggles de un curso nuevo: video y actividad en todos los capítulos, examen por módulo y examen final.",
+  "course": { "id": 9001, "title": "RCP Básico para Auxiliares de Enfermería", "finalExam": true, "activityEngine": "h5p", "reviewCards": false },
+  "modules": [
+    {
+      "id": "8a0d1f00-0000-4000-8000-000000000001",
+      "title": "Reconocimiento del paro cardiorrespiratorio",
+      "objective": "Comprender la cadena de supervivencia y reconocer un paro cardiorrespiratorio en el entorno hospitalario.",
+      "examEnabled": true,
+      "chapters": [
+        { "id": "8a0d1f00-0000-4000-8000-000000000011", "title": "La cadena de supervivencia", "objective": "Conocer los eslabones de la cadena de supervivencia intrahospitalaria y el papel del auxiliar en cada uno.", "videoEnabled": true, "activityEnabled": true },
+        { "id": "8a0d1f00-0000-4000-8000-000000000012", "title": "Seguridad de la escena y respuesta del paciente", "objective": "Verificar la seguridad del entorno y evaluar la respuesta del paciente en menos de 10 segundos.", "videoEnabled": true, "activityEnabled": true },
+        { "id": "8a0d1f00-0000-4000-8000-000000000013", "title": "Activación del código azul", "objective": "Decidir cuándo activar el código azul y comunicar la emergencia con un mensaje estructurado.", "videoEnabled": true, "activityEnabled": true }
+      ]
+    },
+    {
+      "id": "8a0d1f00-0000-4000-8000-000000000002",
+      "title": "Compresiones torácicas de alta calidad",
+      "objective": "Aplicar compresiones torácicas de alta calidad según las guías vigentes.",
+      "examEnabled": true,
+      "chapters": [
+        { "id": "8a0d1f00-0000-4000-8000-000000000021", "title": "Posición del paciente y del reanimador", "objective": "Ubicar al paciente en superficie firme y adoptar la postura correcta del reanimador.", "videoEnabled": true, "activityEnabled": true },
+        { "id": "8a0d1f00-0000-4000-8000-000000000022", "title": "Profundidad, frecuencia y reexpansión", "objective": "Ejecutar compresiones de 5 a 6 cm a 100–120 por minuto permitiendo la reexpansión completa del tórax.", "videoEnabled": true, "activityEnabled": true },
+        { "id": "8a0d1f00-0000-4000-8000-000000000023", "title": "Relevo del compresor y minimización de pausas", "objective": "Organizar el relevo cada dos minutos y minimizar las interrupciones de las compresiones.", "videoEnabled": true, "activityEnabled": true }
+      ]
+    },
+    {
+      "id": "8a0d1f00-0000-4000-8000-000000000003",
+      "title": "Vía aérea, ventilación y desfibrilación",
+      "objective": "Integrar la ventilación y el uso del DEA en la secuencia de RCP básica.",
+      "examEnabled": true,
+      "chapters": [
+        { "id": "8a0d1f00-0000-4000-8000-000000000031", "title": "Apertura de la vía aérea y ventilación con bolsa-mascarilla", "objective": "Entender las maniobras de apertura de la vía aérea y la ventilación con bolsa-válvula-mascarilla.", "videoEnabled": true, "activityEnabled": true },
+        { "id": "8a0d1f00-0000-4000-8000-000000000032", "title": "Uso del desfibrilador externo automático", "objective": "Aplicar el DEA siguiendo sus indicaciones sin retrasar las compresiones.", "videoEnabled": true, "activityEnabled": true },
+        { "id": "8a0d1f00-0000-4000-8000-000000000033", "title": "Trabajo en equipo y registro del evento", "objective": "Coordinar roles en el equipo de reanimación y registrar el evento en la hoja de paro.", "videoEnabled": true, "activityEnabled": true }
+      ]
+    }
+  ]
+}
