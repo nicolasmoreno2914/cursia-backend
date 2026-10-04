@@ -130,6 +130,7 @@ const DYNAMIC_CONTROLLER_CLASS_NAMES = new Set([
   'DynamicYoutubeController', // DN-1: GET /dynamic/youtube/preflight
   'CourseStructureSettingsController', // V2.1 R3
   'CourseProfilesController', // V2.1 R3
+  'PedagogyController', // Motor pedagógico V1
   'AdminDynamicRunsController', // EV6 DoD BE-B: GET /admin/dynamic-runs/needs-attention (SUPER_ADMIN)
 ]);
 /**

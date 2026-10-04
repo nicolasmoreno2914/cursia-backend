@@ -27,6 +27,7 @@ import { FeaturesModule } from './modules/features/features.module';
 import { CoherenceModule } from './modules/coherence/coherence.module';
 import { InvalidationModule } from './modules/invalidation/invalidation.module';
 import { CourseProfilesModule } from './modules/course-profiles/course-profiles.module';
+import { PedagogyModule } from './modules/pedagogy/pedagogy.module';
 import { FinopsModule } from './modules/finops/finops.module';
 
 @Module({
@@ -59,7 +60,8 @@ import { FinopsModule } from './modules/finops/finops.module';
     FeaturesModule,
     CoherenceModule,
     InvalidationModule,
-    CourseProfilesModule, // V2.1 (R3): perfiles de curso (presentation / assessment)
+    CourseProfilesModule, // V2.1 (R3): perfiles de curso (presentation / assessment / pedagogy)
+    PedagogyModule, // Motor pedagógico V1: catálogo, «No estoy seguro», dry-run (sin escrituras ni proveedores)
     FinopsModule,
   ],
   controllers: [AppController],

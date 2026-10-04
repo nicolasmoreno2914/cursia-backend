@@ -306,6 +306,11 @@ async function createCourse(C, llm) {
   ok(pa.status === 201, `${C.key}: POST profiles/assessment (passingGrade ${C.passing}) → 201`, { s: pa.status, e: pa.error });
   const pp = await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { ...C.theme, brandSeed: null, themeVersion: 1 } });
   ok(pp.status === 201, `${C.key}: POST profiles/presentation (${C.theme.themeFamily}/${C.theme.mode}) → 201`, { s: pp.status, e: pp.error });
+  // Motor pedagógico V1 (E6): perfil pedagógico ANTES del lock (el lock lo congela en el Blueprint).
+  if (C.pedagogy) {
+    const pg = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: C.pedagogy, expectedVersion: 0 });
+    ok(pg.status === 201 && pg.data.profile.designRules && pg.data.profile.designRules.engineVersion === 1, `${C.key}: POST profiles/pedagogy (${C.pedagogy.primaryApproach}) → 201 con reglas del servidor`, { s: pg.status, e: pg.error });
+  }
   const lock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st.structureVersionCounter });
   ok(lock.status === 201 && lock.data.blueprint.snapshot && lock.data.blueprint.snapshot.schemaVersion === 2, `${C.key}: lock → Blueprint schemaVersion 2`, { s: lock.status, e: lock.error, sv: lock.data && lock.data.blueprint && lock.data.blueprint.snapshot && lock.data.blueprint.snapshot.schemaVersion });
   const n = lock.data.blueprint.blueprintNumber;
@@ -959,6 +964,76 @@ function reservationBookkeeping(ev) {
           return { from: x.duration.from, to: x.duration.to, seekTo: x.adaptivity.wrong.seekTo, library: x.action.library, wrongText };
         }),
       };
+    }, { fatal: false });
+
+    // ═══ Motor pedagógico V1 — E6: perfil pedagógico → Blueprint → Manifest con diseño → run 100 % mock → empaque ═══
+    // Prueba que los consumidores REALES (runs, scheduler, ejecutor del navegador, workers, empaque) toleran el
+    // diseño pedagógico (`course.pedagogy`, `design`, h5pType elegido por el diseño). Sin gasto: todo mock/falso.
+    if (RUN_E5) await step('v3-E6-pedagogia-generacion', async () => {
+      const PED = D('modules/pedagogy/index.js');
+      const MB = D('modules/generation-manifests/generation-manifest-builder.js');
+      const pedagogy = {
+        pedagogyProfileVersion: 1, primaryApproach: 'significativo', secondaryApproaches: ['experiencial'],
+        learner: { description: 'Técnicos de mantenimiento nuevos', ageGroup: 'adults', educationLevel: 'technical', priorKnowledge: 'none', experience: 'none' },
+        learningOutcomes: { know: ['Componentes del circuito hidráulico'], do: ['Verificar la presión'], competencies: [] },
+        learningModes: ['concepts'], experienceTypes: ['teacher_guided'], assessmentMethods: ['quizzes'], principles: [], origin: 'manual',
+      };
+      const C = { key: 'E6', title: '[E2E Pedagogía E6] Circuitos hidráulicos (significativo)', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'h5p', examBank: false, pedagogy, modules: [
+        { title: 'Fundamentos del circuito', objective: 'Relacionar los componentes del circuito hidráulico', exam: true, chapters: [
+          { title: 'Componentes y funciones', v: true, a: true, objective: 'Relacionar cada componente del circuito con su función' },
+          { title: 'Presión y caudal', v: false, a: true, objective: 'Explicar la relación entre presión y caudal' },
+        ] }] };
+      const c = await createCourse(C, llm);
+      S.E6 = c;
+      const st6 = await readStructure(c.courseId);
+      eq(st6.liveMatchesCurrentBlueprint, true, 'E6: con perfil pedagógico, la estructura queda «confirmada» (liveMatchesCurrentBlueprint true, review I1)');
+      const bp = (await api('GET', `/courses/${c.courseId}/blueprints/${c.n}`)).data;
+      const snap = bp && (bp.snapshot || (bp.blueprint && bp.blueprint.snapshot));
+      ok(snap && snap.course.pedagogy && snap.course.pedagogy.approaches.map((a) => a.id).join('+') === 'significativo+experiencial', 'E6: Blueprint congela course.pedagogy (significativo + experiencial)', snap && snap.course.pedagogy);
+      ok(snap && snap.modules.every((m) => m.design && m.chapters.every((x) => x.design && x.design.sequence.length > 5)), 'E6: design en cada módulo y capítulo del Blueprint');
+      const M = c.manifest.manifest;
+      ok(M.features.pedagogy && M.features.pedagogy.engineVersion === 1, 'E6: Manifest con features.pedagogy', M.features);
+      eq(MB.validateGenerationManifestV3(M, PED.applyPedagogyToSnapshot(snap, PED.deriveDesignRules(pedagogy)), M.source), [], 'E6: el Manifest guardado valida contra el diseño recalculado del perfil');
+      eq(bp && bp.sha256, M.source.blueprintSha256, 'E6: el Manifest apunta al Blueprint con diseño');
+      const acts = M.items.filter((i) => i.type === 'activity');
+      // significativo (0,6) + experiencial (0,4): tipos preferidos [arrastrar, preguntas, …]; «Explicar…» (objetivo) elige preguntas dentro del top-2.
+      const prefs = snap.modules[0].chapters[0].design.activity.preferredTypes;
+      eq(prefs.slice(0, 2), ['dragtext', 'questionset'], 'E6: tipos preferidos combinados (significativo + experiencial)');
+      ok(acts.length === 2 && acts.every((i) => prefs.slice(0, 2).includes(i.h5pType) && i.design && i.design.intent === 'relate') && acts[0].h5pType === 'dragtext', 'E6: actividades con tipo y diseño del enfoque (intención relacionar; tipos del top-2 del diseño)', acts.map((i) => [i.h5pType, i.design]));
+      ok(M.items.find((i) => i.type === 'video').design.style === 'concept_explainer', 'E6: video con estilo del enfoque (explicación de concepto)');
+      ok(M.items.filter((i) => i.type === 'exam').every((i) => i.design.examStyle === 'conceptual_relations'), 'E6: examen de módulo con estilo del enfoque');
+      // Igual que E5: video contra el Videogen FALSO local (v3 exige entrega por YouTube, también falso) con la
+      // aprobación de presupuesto del sandbox; Gamma/TTS mock. Ningún proveedor real: gasto 0.
+      const ctx = { nombre: C.title, ...CTX, scormTemplateIds: S.templates };
+      const body = { ...ctx, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
+      let start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, body);
+      const estM = /estimateId=([0-9a-f-]{36})/.exec(String(start.error || ''));
+      ok(start.status === 409 && !!estM, 'E6: run con video (Videogen falso) sin aprobación → 409 con estimateId', { s: start.status, e: start.error });
+      await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+               values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e pedagogía E6: aprobación (Videogen FALSO local)')`, [c.courseId, estM && estM[1]]);
+      start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, body);
+      ok(start.status === 201, 'E6: run creado (201)', { s: start.status, e: start.error });
+      if (start.status !== 201) throw new Error(`E6: run no creado: ${start.status} ${start.error}`);
+      c.runId = start.data.run.id;
+      llm.st.tag = 'E6';
+      S.front.DYN_EXAM_BANK_MODE_ENABLED = false;
+      const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
+      const stt = await waitRunTerminal(ctl, 'E6 run');
+      const items = await waitItemsDone(c.runId);
+      ok(['preview', 'completed'].includes(stt.status) && stt.failed === 0 && !stt.fatalError, 'E6: ejecutor del navegador terminó sin fallidos', stt);
+      ok(items.every((i) => i.status === 'completed'), `E6: los ${items.length} items completed (con diseño pedagógico en el Manifest)`, items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, i.error_message && i.error_message.slice(0, 400)]));
+      ok(llm.st.unknown.length === 0, 'E6: LLM falso sin prompts no reconocidos', llm.st.unknown);
+      const ev = await q(`select count(*)::int n, coalesce(sum(amount), 0)::float usd from public.generation_cost_events where course_id = $1 and event_kind = 'CHARGE' and cost_source <> 'ZERO_BY_DESIGN'`, [c.courseId]);
+      results.courses.E6 = { courseId: c.courseId, blueprintNumber: c.n, runId: c.runId, items: items.length, features: M.features,
+        activities: acts.map((i) => ({ key: i.key, h5pType: i.h5pType, design: i.design })), chargedEvents: ev[0] };
+    }, { fatal: false });
+    if (RUN_E5 && S.E6 && S.E6.runId) await step('v3-E6-pedagogia-empaquetado', async () => {
+      const c = S.E6;
+      const P = await packageRun('E6', c.courseId, c.n, c.runId);
+      const os = P.job.output_summary || {};
+      const libs = (os.h5pPackages || []).map((p) => p.mainLibrary);
+      ok(libs.includes('H5P.DragText') || libs.includes('H5P.Blanks'), 'E6: el paquete trae las actividades del tipo elegido por el diseño pedagógico', libs);
+      results.courses.E6.packageSummary = { h5pPackages: (os.h5pPackages || []).map((p) => ({ itemKey: p.itemKey, mainLibrary: p.mainLibrary })) };
     }, { fatal: false });
 
     // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══

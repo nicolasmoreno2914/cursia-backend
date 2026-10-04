@@ -13,6 +13,41 @@ function descField(x: { description?: string }, key: string): Record<string, str
 }
 
 /**
+ * Motor pedagógico V1: el diseño pedagógico (Blueprint v2 con `course.pedagogy`) entra en la
+ * huella SOLO si existe, como sha de su JSON canónico. Sin diseño la huella es idéntica a la
+ * de antes; cambiar el enfoque (o el diseño de un capítulo) regenera lo que dependía de él.
+ */
+function designField(design: unknown, key: string): Record<string, string> {
+  return design !== undefined && design !== null ? { [key]: sha256Canonical(design) } : {};
+}
+
+interface PedagogyLookup {
+  course: unknown;
+  modules: Map<string, unknown>;
+  chapters: Map<string, unknown>;
+}
+
+/**
+ * Review I3: de `course.pedagogy` solo entra lo que define el DISEÑO. `profileSha256` (cambia con la
+ * descripción del estudiante, un resultado o el origen del perfil) y `engineVersion` quedan afuera: un
+ * cambio que no altera ningún valor de diseño no regenera nada.
+ */
+function coursePedagogyDesignProjection(p: any): unknown {
+  if (p === undefined || p === null) return undefined;
+  const { profileSha256: _sha, engineVersion: _engine, ...design } = p;
+  return design;
+}
+
+function pedagogyLookup(bp: any): PedagogyLookup {
+  const out: PedagogyLookup = { course: coursePedagogyDesignProjection(bp?.course?.pedagogy), modules: new Map(), chapters: new Map() };
+  for (const m of Array.isArray(bp?.modules) ? bp.modules : []) {
+    if (m?.design !== undefined) out.modules.set(m.id, m.design);
+    for (const c of Array.isArray(m?.chapters) ? m.chapters : []) if (c?.design !== undefined) out.chapters.set(c.id, c.design);
+  }
+  return out;
+}
+
+/**
  * Fase 8 — huellas de inputs relevantes por item (spec §2), siempre por UUID.
  *
  * - `content:<ch>`: `own` = (chapter.id, title, objective) y `context` =
@@ -69,6 +104,7 @@ function computeFingerprintsAt(
 ): BlueprintFingerprints {
   const ctx = opts.courseContextSha256 ?? null;
   const outline = buildOutline(bp as BlueprintSnapshotV1);
+  const ped = pedagogyLookup(bp);
   const content = new Map<string, ChapterFingerprint>();
   const exam = new Map<string, string>();
   const moduleIntro = new Map<string, string>();
@@ -82,9 +118,13 @@ function computeFingerprintsAt(
       moduleObjective: m.objective,
       ...descField(m, 'moduleDescription'),
       courseContextSha256: ctx,
+      ...designField(ped.course, 'coursePedagogy'),
     });
     for (const c of m.chapters) {
-      const own = sha256Canonical({ v, kind: 'content-own', chapterId: c.id, title: c.title, objective: c.objective, ...descField(c, 'description') });
+      const own = sha256Canonical({
+        v, kind: 'content-own', chapterId: c.id, title: c.title, objective: c.objective, ...descField(c, 'description'),
+        ...designField(ped.chapters.get(c.id), 'design'),
+      });
       content.set(c.id, { own, context, full: sha256Canonical({ v, kind: 'content', own, context }) });
     }
     const chapterIds = m.chapters.map((c) => c.id).sort(cmpStr);
@@ -99,11 +139,16 @@ function computeFingerprintsAt(
         ...descField(m, 'moduleDescription'),
         chapterIds,
         contentOwn: chapterIds.map((id) => content.get(id)!.own),
+        ...designField(ped.modules.get(m.id), 'moduleDesign'),
+        ...designField(ped.course, 'coursePedagogy'),
       }),
     );
     moduleIntro.set(
       m.id,
-      sha256Canonical({ v, kind: 'module_intro', moduleId: m.id, title: m.title, objective: m.objective, ...descField(m, 'description'), chapterIds }),
+      sha256Canonical({
+        v, kind: 'module_intro', moduleId: m.id, title: m.title, objective: m.objective, ...descField(m, 'description'), chapterIds,
+        ...designField(ped.modules.get(m.id), 'moduleDesign'),
+      }),
     );
   }
 
@@ -116,6 +161,7 @@ function computeFingerprintsAt(
     kind: 'outline',
     courseTitle: bp.course?.title ?? null,
     courseContextSha256: ctx,
+    ...designField(ped.course, 'coursePedagogy'),
     modules: [...outline.modules]
       .sort((a, b) => cmpStr(a.id, b.id))
       .map((m) => ({
@@ -231,6 +277,7 @@ export function computeFingerprintsV3(
 ): BlueprintFingerprintsV3 {
   const v = INVALIDATION_FINGERPRINT_VERSION_V3;
   const base = computeFingerprintsAt(v, bp, opts);
+  const ped = pedagogyLookup(bp);
   const moduleIntro = new Map<string, string>();
   for (const m of base.outline.modules) {
     const ids = m.chapters.map((c) => c.id).sort(cmpStr);
@@ -245,6 +292,7 @@ export function computeFingerprintsV3(
         ...descField(m, 'description'),
         chapterIds: ids,
         contentOwn: ids.map((id) => base.content.get(id)!.own),
+        ...designField(ped.modules.get(m.id), 'moduleDesign'),
       }),
     );
   }
@@ -254,6 +302,7 @@ export function computeFingerprintsV3(
     kind: 'final_exam',
     chapterIds,
     contentOwn: chapterIds.map((id) => base.content.get(id)!.own),
+    ...designField(ped.course, 'coursePedagogy'),
   });
   return { ...base, moduleIntro, finalExam };
 }

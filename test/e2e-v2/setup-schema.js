@@ -61,6 +61,7 @@ const req = (p) => require(path.join(BUILD, p));
     'supabase-migration-v21-finops-rls.sql',
     // EV6 H5P v2 (H2): courses.review_cards_enabled (ajuste «Repaso» del Blueprint).
     'supabase-migration-ev6-h5p2.sql',
+    'supabase-migration-pedagogy-profiles.sql', // Motor pedagógico V1: course_profiles.kind admite 'pedagogy'
   ]) {
     await ds.query(fs.readFileSync(path.join(REPO, f), 'utf8'));
     console.log('applied', f);
