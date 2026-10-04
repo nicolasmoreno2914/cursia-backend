@@ -146,7 +146,7 @@ function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp
   // r19 (audiolibro por bloques): llmPadded = N respuestas a 1,4 × el objetivo; llmDuplicate = N respuestas que repiten el
   // texto del bloque anterior. ttsSlow = N segmentos con el doble de duración por palabra (voz ralentizada).
   // ttsSameAudio = N segmentos que reciben el MISMO audio (makeMp3 sin el texto: bytes idénticos para la misma duración).
-  const plan = { gammaPostFail: [], gammaHoldPending: false, gammaFailGeneration: false, gammaNoCredits: false, ttsFail: [], llmFail: [], llmShortFirst: 0, ttsFixedRequestId: null, llmTiny: 0, llmPadded: 0, llmDuplicate: 0, ttsSlow: 0, ttsSameAudio: 0, llmTruncate: 0, llmLoop: 0, llmContRepeat: 0 };
+  const plan = { gammaPostFail: [], gammaHoldPending: false, gammaFailGeneration: false, gammaNoCredits: false, ttsFail: [], llmFail: [], llmShortFirst: 0, ttsFixedRequestId: null, llmTiny: 0, llmPadded: 0, llmDuplicate: 0, ttsSlow: 0, ttsSameAudio: 0, llmTruncate: 0, llmLoop: 0, llmContRepeat: 0, llmPaddedRatio: 0, llmCondenseLong: 0 };
   let lastSectionText = null;
   // 'hang' = se recibe el pedido y nunca se responde (el cliente corta por timeout; la operación pudo ejecutarse).
   const hang = (rq) => setTimeout(() => rq.socket.destroy(), 10_000).unref();
@@ -237,12 +237,26 @@ function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp
         if (block) {
           const src = block[1].split(/\s+/).filter(Boolean);
           const target = Number((isCont ? /aproximadamente (\d+) palabras más/ : /alrededor de (\d+) palabras/).exec(user)?.[1] || 0);
+          // r19 (#642): condensación de un bloque largo («CONDENSAR»): reescribe con las palabras del bloque al
+          // objetivo (o, con llmCondenseLong, al 120 % de la fuente: sigue largo). No consume los demás planes.
+          const isCondense = /CONDENSAR/.test(String(req.system || ''));
+          if (isCondense) {
+            const long = plan.llmCondenseLong > 0;
+            if (long) plan.llmCondenseLong--;
+            const m = long ? Math.round(src.length * 1.2) : target;
+            text = m <= src.length ? src.slice(0, m).join(' ') : [...src, ...Array.from({ length: m - src.length }, (_, i) => `cond${i}`)].join(' ');
+            st.llm.push({ id, model: req.model, maxTokens: req.max_tokens, continuation: false, condense: true, truncated: false });
+            return json(200, {
+              id, type: 'message', role: 'assistant', model: req.model, stop_reason: 'end_turn', content: [{ type: 'text', text }],
+              usage: { input_tokens: 1400, output_tokens: 600, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+            }, { 'request-id': `req_llm_${st.seq}` });
+          }
           const padded = !isCont && plan.llmPadded > 0;
           if (padded) plan.llmPadded--;
           const dup = !isCont && plan.llmDuplicate > 0 && lastSectionText;
           if (dup) plan.llmDuplicate--;
           // tiny: ≤ 20 palabras y ≤ 30 % del objetivo (sigue corto aunque la continuación también lo sea).
-          const n = tiny ? Math.max(1, Math.min(20, Math.round(target * 0.3))) : padded ? Math.round(target * 1.4) : short ? Math.round(target * 0.6) : target;
+          const n = tiny ? Math.max(1, Math.min(20, Math.round(target * 0.3))) : padded ? Math.round(plan.llmPaddedRatio > 0 ? src.length * plan.llmPaddedRatio : target * 1.4) : short ? Math.round(target * 0.6) : target;
           const loop = !isCont && plan.llmLoop > 0;
           if (loop) plan.llmLoop--;
           if (dup) text = lastSectionText;

@@ -795,6 +795,8 @@ export interface PersistedSectionScript {
   words: number;
   ratio: number;
   continued: boolean;
+  /** r19 (#642): condensado con una llamada acotada (ausente en guiones anteriores). */
+  condensed?: boolean;
   messageIds: string[];
   model: string;
 }
@@ -948,7 +950,8 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
     // Medición server-side (HD-V21-17): cargo por msg_… + reserva a 0, atómico. Error → reconciliación.
     await settlePaidCall(deps.finops, resKey, serverLlmChargeInput({
       ownerId, itemRunId: item.itemRunId, model: scriptModel, messageId: r.messageId, requestId: r.requestId, usage: r.usage,
-      callRole: role === 'continuation' ? 'continuation' : 'main',
+      // r19 (#642): la condensación de un bloque largo es una corrección por validación (banda 85–110 %).
+      callRole: role === 'continuation' ? 'continuation' : role === 'condense' ? 'validation_retry' : 'main',
       attempt: itemRole.attempt,
     }), 'anthropic_measured');
     paidIds.push(r.messageId);
@@ -993,7 +996,7 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
       }
       sections[k] = {
         sourceSha: res.sourceSha, sourceWords: res.sourceWords, text: res.text, words: res.words, ratio: res.ratio,
-        continued: res.continued, messageIds: res.messageIds, model: scriptModel,
+        continued: res.continued, condensed: res.condensed, messageIds: res.messageIds, model: scriptModel,
       };
       // Idempotencia: el guion aceptado del bloque queda guardado — un re-claim no vuelve a pagarlo.
       await record(deps, item, { audiobookSections: sections });

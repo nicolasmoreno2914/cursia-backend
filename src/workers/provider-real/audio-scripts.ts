@@ -468,7 +468,37 @@ export function sectionContinuationPrompt(
   return { system, user, maxTokens: sectionMaxTokens(wordsNeeded) };
 }
 
-export type ScriptCallRole = 'main' | 'continuation';
+/**
+ * r19 (#642): condensación del guion de un bloque que quedó LARGO (> 110 % de su fuente): reescribe la
+ * MISMA narración dentro de la banda, conservando todo el contenido del bloque y quitando relleno o
+ * repeticiones (nunca datos nuevos). Simétrica a sectionContinuationPrompt (que completa un bloque corto).
+ */
+export function sectionCondensePrompt(
+  existingText: string,
+  section: AudiobookSourceSection,
+  chapterTitle: string,
+  pais?: string | null,
+): ScriptPrompt {
+  const { target, min, max } = sectionTargetWords(section.words);
+  const system =
+    'Eres un narrador experto en educación. La narración de audiolibro de un bloque quedó DEMASIADO LARGA: ' +
+    'reescríbela más breve (CONDENSAR), conservando todo el contenido del bloque y quitando relleno, ' +
+    'repeticiones, rodeos y frases de transición sobrantes.\n\n' +
+    'REGLAS:\n' +
+    `- Extensión: alrededor de ${target} palabras (entre ${min} y ${max}); nunca más de ${max}.\n` +
+    '- Conserva la apertura y la continuidad de la narración original (no saludes ni presentes de nuevo si no lo hacía).\n' +
+    '- Quita solo relleno y repeticiones: ninguna idea, ejemplo, cifra, paso o definición del bloque se pierde.\n' +
+    SECTION_COMMON_RULES(pais) +
+    '- Responde SOLO con la narración condensada, sin preámbulos ni explicaciones.';
+  const user =
+    `Capítulo: ${chapterTitle}. Bloque ${section.idx + 1}${section.title ? `: «${section.title}»` : ''}.\n\n` +
+    `Texto del bloque (${section.words} palabras):\n"""\n${section.text}\n"""\n\n` +
+    `Narración demasiado larga (${wordCount(existingText)} palabras; reescríbela, NO la continúes):\n"""\n${existingText}\n"""\n\n` +
+    `Reescribe la narración del bloque en alrededor de ${target} palabras (entre ${min} y ${max}).`;
+  return { system, user, maxTokens: sectionMaxTokens(target) };
+}
+
+export type ScriptCallRole = 'main' | 'continuation' | 'condense';
 
 /** Llamada LLM inyectada: devuelve el texto (la medición al ledger la hace el caller). */
 export type ScriptLlm = (prompt: ScriptPrompt, role: ScriptCallRole) => Promise<{ text: string; messageId: string; truncated?: boolean }>;
@@ -481,6 +511,8 @@ export interface SectionScriptResult {
   words: number;
   ratio: number;
   continued: boolean;
+  /** r19 (#642): el guion quedó largo y se condensó con UNA llamada acotada. */
+  condensed: boolean;
   messageIds: string[];
 }
 
@@ -491,8 +523,9 @@ function ratioOf(words: number, source: number): number {
 /**
  * Guion de UN bloque: 1 llamada; por debajo del 85 % de la fuente → UNA
  * continuación acotada; sigue corto → AUDIOBOOK_SECTION_TOO_SHORT; por encima
- * del 110 % → AUDIOBOOK_SECTION_PADDED. Ambos reintentables con resultado
- * CONOCIDO (cada llamada queda medida; los bloques ya aceptados no se repagan).
+ * del 110 % → UNA condensación acotada (r19 #642); sigue largo →
+ * AUDIOBOOK_SECTION_PADDED. Todos reintentables con resultado CONOCIDO (cada
+ * llamada queda medida; los bloques ya aceptados no se repagan).
  */
 export async function generateSectionScript(
   input: ChapterScriptInput,
@@ -506,16 +539,22 @@ export async function generateSectionScript(
   const messageIds = [main.messageId];
   let text = cleanNarrationText(main.text);
   let continued = false;
+  let condensed = false;
+  /** UNA condensación acotada del guion largo (la banda 85–110 % no se afloja). */
+  const condense = async (): Promise<void> => {
+    const r = await llm(sectionCondensePrompt(text, section, input.chapterTitle, input.pais), 'condense');
+    messageIds.push(r.messageId);
+    condensed = true;
+    if (r.truncated) {
+      throw new AudioScriptError('AUDIOBOOK_SECTION_TRUNCATED', `la condensación del bloque ${section.idx + 1} del capítulo ${input.chapterNumber} se cortó por max_tokens: no se narra un bloque cortado`, true);
+    }
+    text = cleanNarrationText(r.text);
+  };
   if (wordCount(text) > max) {
-    throw new AudioScriptError(
-      'AUDIOBOOK_SECTION_PADDED',
-      `el guion del bloque ${section.idx + 1} del capítulo ${input.chapterNumber} tiene ${wordCount(text)} palabras para ${section.words} de fuente (máximo ${max}): no se narra relleno`,
-      true,
-    );
-  }
-  // Fix round 1 (I4): una salida cortada por max_tokens nunca se acepta tal cual, aunque caiga en la
-  // banda: se trata como corta (UNA continuación que la termina).
-  if (wordCount(text) < min || main.truncated) {
+    await condense();
+  } else if (wordCount(text) < min || main.truncated) {
+    // Fix round 1 (I4): una salida cortada por max_tokens nunca se acepta tal cual, aunque caiga en la
+    // banda: se trata como corta (UNA continuación que la termina).
     const w = wordCount(text);
     const needed = w < target ? Math.max(1, target - w) : Math.max(1, Math.min(max - w, Math.ceil(section.words * 0.05)));
     if (w >= max) {
@@ -528,23 +567,26 @@ export async function generateSectionScript(
       throw new AudioScriptError('AUDIOBOOK_SECTION_TRUNCATED', `la continuación del bloque ${section.idx + 1} del capítulo ${input.chapterNumber} se cortó por max_tokens: no se narra un bloque cortado`, true);
     }
     text = `${text} ${cleanNarrationText(cont.text)}`.replace(/\s+/g, ' ').trim();
+    // Principal + continuación por encima del 110 %: UNA condensación (simétrica a la continuación).
+    if (wordCount(text) > max) await condense();
   }
   const words = wordCount(text);
+  const after = [continued ? 'una continuación' : '', condensed ? 'una condensación' : ''].filter(Boolean).join(' y ') || 'la llamada principal';
   if (words < min) {
     throw new AudioScriptError(
       'AUDIOBOOK_SECTION_TOO_SHORT',
-      `el guion del bloque ${section.idx + 1} del capítulo ${input.chapterNumber} quedó con ${words} palabras para ${section.words} de fuente (mínimo ${min}) tras una continuación`,
+      `el guion del bloque ${section.idx + 1} del capítulo ${input.chapterNumber} quedó con ${words} palabras para ${section.words} de fuente (mínimo ${min}) tras ${after}`,
       true,
     );
   }
   if (words > max) {
     throw new AudioScriptError(
       'AUDIOBOOK_SECTION_PADDED',
-      `el guion del bloque ${section.idx + 1} del capítulo ${input.chapterNumber} quedó con ${words} palabras para ${section.words} de fuente (máximo ${max}) tras una continuación`,
+      `el guion del bloque ${section.idx + 1} del capítulo ${input.chapterNumber} quedó con ${words} palabras para ${section.words} de fuente (máximo ${max}) tras ${after}: no se narra relleno`,
       true,
     );
   }
-  return { idx: section.idx, sourceSha: section.sha256, sourceWords: section.words, text, words, ratio: ratioOf(words, section.words), continued, messageIds };
+  return { idx: section.idx, sourceSha: section.sha256, sourceWords: section.words, text, words, ratio: ratioOf(words, section.words), continued, condensed, messageIds };
 }
 
 /** Normalización para comparar narración (minúsculas, sin tildes ni puntuación). */
