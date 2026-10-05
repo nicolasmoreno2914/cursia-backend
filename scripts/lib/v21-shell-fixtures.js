@@ -51,6 +51,8 @@ function buildCourse(distRoot, { courseId = 501, title = 'Atención al cliente d
         objective: chapterObjectives ? chapterObjectives[(ci - 1) % chapterObjectives.length] ?? null : null,
         video_enabled: !!c.video,
         activity_enabled: !!c.activity,
+        // Motor de carga horaria: `practice: true` → capítulo de práctica (los fixtures de siempre no llevan la clave).
+        ...(c.practice ? { chapter_kind: 'practice' } : {}),
       });
     });
   });

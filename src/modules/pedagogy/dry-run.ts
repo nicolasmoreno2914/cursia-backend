@@ -61,6 +61,8 @@ export interface DryRunChapterInput {
   description?: string | null;
   videoEnabled?: boolean;
   activityEnabled?: boolean;
+  /** Motor de carga horaria: 'practice' = capítulo de práctica (sin video). Ausente = contenido. */
+  kind?: 'content' | 'practice';
 }
 export interface DryRunModuleInput {
   id?: string;
@@ -274,7 +276,8 @@ export function snapshotFromStructure(input: DryRunStructureInput): BlueprintSna
     (Array.isArray(m.chapters) ? m.chapters : []).forEach((c, ci) => {
       chapters.push({
         id: c.id || `${mid}c${ci + 1}`, module_id: mid, position: ci, title: String(c.title ?? ''), objective: c.objective ?? null,
-        description: c.description ?? null, video_enabled: c.videoEnabled !== false, activity_enabled: c.activityEnabled !== false,
+        description: c.description ?? null, video_enabled: c.kind === 'practice' ? false : c.videoEnabled !== false, activity_enabled: c.activityEnabled !== false,
+        ...(c.kind !== undefined ? { chapter_kind: c.kind } : {}),
       });
     });
   });

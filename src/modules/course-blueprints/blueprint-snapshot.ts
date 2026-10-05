@@ -336,6 +336,43 @@ export const DEFAULT_ACTIVITY_ENGINE: ActivityEngine = 'h5p';
 
 export interface RawChapterRowV2 extends RawChapterRow {
   activity_enabled: boolean;
+  /**
+   * Motor de carga horaria: tipo de capítulo (course_chapters.chapter_kind). Ausente/null/'content' = capítulo
+   * de contenido de siempre; 'practice' = capítulo de práctica (sin video, presentación, audiolibro ni Libro).
+   */
+  chapter_kind?: string | null;
+}
+
+export type ChapterKind = 'content' | 'practice';
+export const CHAPTER_KINDS: readonly ChapterKind[] = ['content', 'practice'];
+
+/** Tipo efectivo de un capítulo del snapshot (la clave `kind` existe SOLO en los de práctica). */
+export function chapterKindOf(c: { kind?: string }): ChapterKind {
+  return c.kind === 'practice' ? 'practice' : 'content';
+}
+
+function rawChapterKind(v: unknown): ChapterKind | null {
+  if (v === undefined || v === null || v === 'content') return 'content';
+  if (v === 'practice') return 'practice';
+  return null;
+}
+
+/**
+ * Reglas del capítulo de práctica (las mismas en la entrada, el snapshot y la API): sin video; y cada módulo
+ * necesita al menos un capítulo de CONTENIDO (la práctica se apoya en sus resúmenes y los exámenes en su texto).
+ */
+function practiceErrors(modules: { id: string; chapters: { id: string; kind: ChapterKind | null; videoEnabled: boolean }[] }[], pathOf: (mi: number, ci: number) => string): BlueprintValidationError[] {
+  const errors: BlueprintValidationError[] = [];
+  modules.forEach((m, mi) => {
+    m.chapters.forEach((c, ci) => {
+      if (c.kind === null) errors.push({ path: `${pathOf(mi, ci)}.kind`, code: 'INVALID_CHAPTER_KIND', message: `El capítulo ${c.id} tiene un tipo inválido (permitidos: content, practice)` });
+      else if (c.kind === 'practice' && c.videoEnabled) errors.push({ path: `${pathOf(mi, ci)}.videoEnabled`, code: 'PRACTICE_CHAPTER_VIDEO', message: `El capítulo de práctica ${c.id} no puede tener video` });
+    });
+    if (m.chapters.length > 0 && m.chapters.every((c) => c.kind === 'practice')) {
+      errors.push({ path: `modules[${mi}]`, code: 'PRACTICE_MODULE_WITHOUT_CONTENT', message: `El módulo ${m.id} necesita al menos un capítulo de contenido (la práctica se apoya en ellos)` });
+    }
+  });
+  return errors;
 }
 
 export interface BlueprintCourseInputV2 {
@@ -359,6 +396,11 @@ export interface BlueprintChapterV2 extends BlueprintChapter {
   /** Solo presente con texto: los snapshots sin descripción conservan su sha. */
   description?: string;
   activityEnabled: boolean;
+  /**
+   * Motor de carga horaria: SOLO en capítulos de práctica (los de contenido no llevan la clave y conservan su
+   * sha). Un capítulo de práctica no tiene video, presentación, audiolibro ni capítulo del Libro.
+   */
+  kind?: 'practice';
   /** Motor pedagógico V1: solo si el curso tiene perfil pedagógico (sin él, sha de siempre). */
   design?: ChapterDesign;
 }
@@ -448,6 +490,11 @@ export function buildBlueprintSnapshotV2(
   if (course.targetHours !== undefined && course.targetHours !== null && !isValidTargetHours(course.targetHours)) {
     throw new Error(`BLUEPRINT_V2_INVALID_INPUT: course.targetHours debe ser un número de 1 a 500 en pasos de 0,5 o null (fue ${JSON.stringify(course.targetHours)})`);
   }
+  const kindErrors = practiceErrors(
+    modules.map((m) => ({ id: m.id, chapters: chapters.filter((c) => c.module_id === m.id).map((c) => ({ id: c.id, kind: rawChapterKind(c.chapter_kind), videoEnabled: !!c.video_enabled })) })),
+    (mi, ci) => `modules[${mi}].chapters[${ci}]`,
+  );
+  if (kindErrors.length) throw new Error(`BLUEPRINT_V2_INVALID_INPUT: ${kindErrors.map((e) => e.message).join('; ')}`);
   const badChapter = chapters.find((c) => typeof c.activity_enabled !== 'boolean');
   if (badChapter) {
     throw new Error(
@@ -510,6 +557,7 @@ export function buildBlueprintSnapshotV2(
           ...descriptionKey(c.description),
           videoEnabled: !!c.video_enabled,
           activityEnabled: c.activity_enabled,
+          ...(rawChapterKind(c.chapter_kind) === 'practice' ? { kind: 'practice' as const } : {}),
           ...(pedagogy ? { design: canonicalChapterDesign(pedagogy.chapters[c.id], `chapters[${c.id}].design`) } : {}),
         })),
       };
@@ -564,6 +612,7 @@ export function snapshotV2ToRows(s: any): {
         id: c.id, module_id: m.id, position: c.position, title: c.title, objective: c.objective,
         description: c.description ?? null,
         video_enabled: c.videoEnabled, activity_enabled: c.activityEnabled,
+        ...(c.kind !== undefined ? { chapter_kind: c.kind } : {}),
       });
       if (pedagogy) pedagogy.chapters[c.id] = c.design;
       else if (c.design !== undefined) throw new Error(`BLUEPRINT_PEDAGOGY_INVALID: el capítulo ${c.id} trae design sin course.pedagogy`);
@@ -651,6 +700,10 @@ export function validateBlueprintSnapshotV2(s: BlueprintSnapshotV2): BlueprintVa
       }
     }),
   );
+  errors.push(...practiceErrors(
+    s.modules.map((m) => ({ id: m.id, chapters: m.chapters.map((c) => ({ id: c.id, kind: rawChapterKind((c as { kind?: unknown }).kind), videoEnabled: !!c.videoEnabled })) })),
+    (mi, ci) => `modules[${mi}].chapters[${ci}]`,
+  ));
   return [...errors, ...validateBlueprintSnapshot(structuralViewV1(s))];
 }
 
@@ -687,6 +740,10 @@ export function validateBlueprintInputV2(
       });
     }
   });
+  errors.push(...practiceErrors(
+    modules.map((m) => ({ id: m.id, chapters: chapters.filter((c) => c.module_id === m.id).map((c) => ({ id: c.id, kind: rawChapterKind(c.chapter_kind), videoEnabled: !!c.video_enabled })) })),
+    (mi, ci) => `modules[${mi}].chapters[${ci}]`,
+  ));
   return errors;
 }
 

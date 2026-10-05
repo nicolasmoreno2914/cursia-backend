@@ -98,6 +98,13 @@ export function computeFingerprints(
  * estructurales comunes a Blueprint schemaVersion 1 y 2 (ids, títulos,
  * objetivos, position, membresía): los toggles y el motor NUNCA entran.
  */
+/** Motor de carga horaria: ids de los capítulos de práctica del snapshot (v1 y v2 sin práctica → vacío). */
+function practiceChapterIdsOf(bp: { modules: ReadonlyArray<{ chapters: ReadonlyArray<{ id: string }> }> }): Set<string> {
+  const out = new Set<string>();
+  for (const m of bp.modules ?? []) for (const c of m.chapters ?? []) if ((c as { kind?: string }).kind === 'practice') out.add(c.id);
+  return out;
+}
+
 function computeFingerprintsAt(
   v: number,
   bp: Pick<BlueprintSnapshotV1, 'course' | 'modules'>,
@@ -109,6 +116,8 @@ function computeFingerprintsAt(
   const content = new Map<string, ChapterFingerprint>();
   const exam = new Map<string, string>();
   const moduleIntro = new Map<string, string>();
+  // Motor de carga horaria: los capítulos de práctica no aportan texto a los exámenes (sin práctica: huellas de siempre).
+  const practiceIds = practiceChapterIdsOf(bp);
 
   for (const m of outline.modules) {
     const context = sha256Canonical({
@@ -128,7 +137,7 @@ function computeFingerprintsAt(
       });
       content.set(c.id, { own, context, full: sha256Canonical({ v, kind: 'content', own, context }) });
     }
-    const chapterIds = m.chapters.map((c) => c.id).sort(cmpStr);
+    const chapterIds = m.chapters.map((c) => c.id).filter((id) => !practiceIds.has(id)).sort(cmpStr);
     exam.set(
       m.id,
       sha256Canonical({
@@ -147,7 +156,7 @@ function computeFingerprintsAt(
     moduleIntro.set(
       m.id,
       sha256Canonical({
-        v, kind: 'module_intro', moduleId: m.id, title: m.title, objective: m.objective, ...descField(m, 'description'), chapterIds,
+        v, kind: 'module_intro', moduleId: m.id, title: m.title, objective: m.objective, ...descField(m, 'description'), chapterIds: m.chapters.map((c) => c.id).sort(cmpStr),
         ...designField(ped.modules.get(m.id), 'moduleDesign'),
       }),
     );
@@ -266,6 +275,14 @@ export interface BlueprintFingerprintsV3 extends BlueprintFingerprints {
    * Entra únicamente en la huella de ESE trabajo: un reorden regenera solo lo que recibe otra indicación.
    */
   roleDesign: Map<string, Record<string, string>>;
+  /** Motor de carga horaria: capítulo de práctica → sha de sus fuentes (capítulos de contenido del módulo). */
+  practiceSources?: Map<string, string>;
+}
+
+/** Envuelve la huella de experience/activity de un capítulo de práctica con la de sus fuentes (contenido: igual). */
+function withPracticeSources(fps: BlueprintFingerprintsV3, type: string, chapterId: string, fp: string | null): string | null {
+  const src = (type === 'experience' || type === 'activity') ? fps.practiceSources?.get(chapterId) : undefined;
+  return fp && src ? sha256Canonical({ v: INVALIDATION_FINGERPRINT_VERSION_V3, kind: 'practice', type, base: fp, sources: src }) : fp;
 }
 
 /** Contexto que no vive en el Blueprint y que algunas huellas v3 necesitan. */
@@ -303,7 +320,18 @@ export function computeFingerprintsV3(
       }),
     );
   }
-  const chapterIds = base.outline.chapters.map((c) => c.id).sort(cmpStr);
+  const practiceIds = practiceChapterIdsOf(bp);
+  const chapterIds = base.outline.chapters.map((c) => c.id).filter((id) => !practiceIds.has(id)).sort(cmpStr);
+  // Motor de carga horaria: experience/activity de un capítulo de práctica se apoyan en los capítulos de CONTENIDO de
+  // su módulo: su huella suma el `own` de esas fuentes (en orden), así un cambio en ellas o en el conjunto la regenera.
+  const practiceSources = new Map<string, string>();
+  for (const m of base.outline.modules) {
+    const sources = m.chapters.map((c) => c.id).filter((id) => !practiceIds.has(id));
+    for (const c of m.chapters) {
+      if (!practiceIds.has(c.id)) continue;
+      practiceSources.set(c.id, sha256Canonical({ v, kind: 'practice-sources', sources, sourcesOwn: sources.map((id) => base.content.get(id)!.own) }));
+    }
+  }
   const finalExam = sha256Canonical({
     v,
     kind: 'final_exam',
@@ -320,7 +348,7 @@ export function computeFingerprintsV3(
       if (Object.keys(shas).length) roleDesign.set(ch.id, shas);
     }
   }
-  return { ...base, moduleIntro, finalExam, roleDesign };
+  return { ...base, moduleIntro, finalExam, roleDesign, practiceSources };
 }
 
 /** Sha de la variación por rol que recibe el trabajo `type` del capítulo (null = el rol no le cambia nada). */
@@ -376,7 +404,7 @@ export function itemFingerprintV3(fps: BlueprintFingerprintsV3, key: string, ext
   const { type, entityId } = parseItemKey(key);
   assertKnownV3Type(type, key);
   const fp = itemFingerprintV3Base(fps, key, extras);
-  return CHAPTER_ITEM_TYPES_V3.includes(type) ? withRoleDesign(fps, type, entityId, fp) : fp;
+  return CHAPTER_ITEM_TYPES_V3.includes(type) ? withRoleDesign(fps, type, entityId, withPracticeSources(fps, type, entityId, fp)) : fp;
 }
 
 function itemFingerprintV3Base(fps: BlueprintFingerprintsV3, key: string, extras: FingerprintExtrasV3): string | null {
@@ -403,7 +431,7 @@ export function matchFingerprintV3(fps: BlueprintFingerprintsV3, key: string, ex
   const { type, entityId } = parseItemKey(key);
   assertKnownV3Type(type, key);
   if (!CHAPTER_ITEM_TYPES_V3.includes(type)) return itemFingerprintV3(fps, key, extras);
-  return withRoleDesign(fps, type, entityId, matchFingerprintV3Base(fps, key, extras));
+  return withRoleDesign(fps, type, entityId, withPracticeSources(fps, type, entityId, matchFingerprintV3Base(fps, key, extras)));
 }
 
 function matchFingerprintV3Base(fps: BlueprintFingerprintsV3, key: string, extras: FingerprintExtrasV3): string | null {

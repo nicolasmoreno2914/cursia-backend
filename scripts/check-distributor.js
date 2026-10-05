@@ -226,6 +226,7 @@ check('D10b otras formas de curso: cada nivel respeta el tope de su rol FINAL (l
         assert(c.targetMinutes <= ST.DISTRIBUTOR_RULES.maxChapterMinutes, `${shape}/${k}/${h}: ${c.id} ${c.targetMinutes} min`);
       }
       near(r.applicationShare, r.studyTime.byComponent.application / r.studyTime.courseEstimatedMinutes, 0.006, 'proporción informada');
+      eq(r.recommendations.some((x) => /% de este diseño son Actividades de aplicación/.test(x)), r.applicationShare > r.policy.maxApplicationShare + 0.005 || (r.applicationShare > r.policy.maxApplicationShare && r.recommendations.some((x) => /% de este diseño/.test(x))), `${shape}/${k}/${h}: aviso cuando la aplicación supera el tope del enfoque`);
       const rc = r.changes.filter((x) => x.type === 'role_changed');
       roleChanges += rc.length;
       for (const x of rc) assert(/deja de ser .+ y pasa a .+ del módulo/.test(x.detail), x.detail);

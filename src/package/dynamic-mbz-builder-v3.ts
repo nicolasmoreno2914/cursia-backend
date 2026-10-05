@@ -585,11 +585,13 @@ function collectMissing(plan: PackagingPlanV3, c: DynamicPackageContentsV3): str
     if (m.keys.exam && !c.examBanks?.has(m.moduleId) && !(c.examGift.get(m.moduleId) ?? '').trim()) missing.push(m.keys.exam);
     for (const ch of m.chapters) {
       const id = ch.chapterId;
-      if (!(c.contentMd.get(id) ?? '').trim()) missing.push(ch.keys.content);
+      // Motor de carga horaria: el capítulo de práctica no tiene content (Libro), presentación ni audiolibro (keys null).
+      if (ch.keys.content && !(c.contentMd.get(id) ?? '').trim()) missing.push(ch.keys.content);
       if (!c.experiences.has(id)) missing.push(ch.keys.experience);
       const p = c.presentations.get(id);
-      if (!p || !Buffer.isBuffer(p.pdf) || !Buffer.isBuffer(p.cover)) missing.push(ch.keys.presentation);
-      if (!Buffer.isBuffer(c.audiobookChapters.get(id))) missing.push(ch.keys.audiobookChapter);
+      if (ch.keys.presentation && (!p || !Buffer.isBuffer(p.pdf) || !Buffer.isBuffer(p.cover))) missing.push(ch.keys.presentation);
+      if (ch.keys.audiobookChapter && !Buffer.isBuffer(c.audiobookChapters.get(id))) missing.push(ch.keys.audiobookChapter);
+      if (ch.kind === 'practice' && (c.contentMd.has(id) || c.presentations.has(id) || c.audiobookChapters.has(id))) missing.push(`${ch.keys.experience}:practice_with_content`);
       if (ch.keys.video && !c.videos.has(id)) missing.push(ch.keys.video);
       if (ch.keys.videoInteractions && !c.videoInteractions.has(id)) missing.push(ch.keys.videoInteractions);
       if (ch.keys.activity) {
@@ -791,10 +793,12 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   // ── Datos MEDIDOS ────────────────────────────────────────────────────────
   const allChapters = plan.modules.flatMap((m) => m.chapters);
   const slideCountByChapter: Record<string, number> = {};
-  for (const ch of allChapters) slideCountByChapter[ch.chapterId] = pdfPageCount((c.presentations.get(ch.chapterId) as { pdf: Buffer }).pdf);
+  // Motor de carga horaria: diapositivas, audiolibro y Libro solo de los capítulos de CONTENIDO.
+  const contentChapters = allChapters.filter((ch) => ch.kind !== 'practice');
+  for (const ch of contentChapters) slideCountByChapter[ch.chapterId] = pdfPageCount((c.presentations.get(ch.chapterId) as { pdf: Buffer }).pdf);
   const audioWelcomeSeconds = mp3DurationSeconds(c.audioWelcome);
   const audiobook = assembleAudiobook(
-    allChapters.map((ch) => ({ chapterId: ch.chapterId, chapterNumber: ch.chapterNumber, mp3: c.audiobookChapters.get(ch.chapterId) })),
+    contentChapters.map((ch) => ({ chapterId: ch.chapterId, chapterNumber: ch.chapterNumber, mp3: c.audiobookChapters.get(ch.chapterId) })),
     { manifests: c.audiobookManifests ?? null },
   );
   if (audiobook.floor) warnings.push(...audiobook.floor.warnings);
@@ -836,7 +840,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       number: m.moduleNumber,
       title: m.title,
       intro: moduleIntros.get(m.moduleId) as ModuleIntroV3,
-      chapters: m.chapters.map((ch) => ({ number: ch.chapterNumber, title: ch.title, md: c.contentMd.get(ch.chapterId) as string })),
+      chapters: m.chapters.filter((ch) => ch.kind !== 'practice').map((ch) => ({ number: ch.chapterNumber, title: ch.title, md: c.contentMd.get(ch.chapterId) as string })),
     })),
     brandName: input.libroBrand?.name ?? null,
     // fix round 1 (M8): /ID del PDF único por curso (sha del plan), sigue determinístico.

@@ -118,6 +118,9 @@ export interface ChapterFacts {
    * El validador del .mbz lee este dato (nunca recalcula el hash).
    */
   activityType: H5pActivityTypeV2 | null;
+  /** Motor de carga horaria: SOLO en capítulos de práctica (sin presentación, Libro propio, video ni audiolibro). */
+  kind?: 'practice';
+  /** Diapositivas medidas de la presentación (0 en un capítulo de práctica: no tiene presentación). */
   slideCount: number;
   /**
    * P3: minutos estimados del capítulo (modelo study-time, redondeados a 5) desde las palabras MEDIDAS del
@@ -252,6 +255,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
       if (itemKeys.has(`activity:${mc.chapterId}`) !== activityEnabled) fail(`activity del capítulo ${mc.chapterNumber} incoherente con el Manifest`);
       if (itemKeys.has(`video:${mc.chapterId}`) !== mc.videoEnabled) fail(`video del capítulo ${mc.chapterNumber} incoherente con el Manifest`);
       const variant = activityEnabled ? features.activityEngine : null;
+      const practice = mc.kind === 'practice';
       const videoPending = pendingIds.has(mc.chapterId);
       if (videoPending && !mc.videoEnabled) fail(`video pendiente en el capítulo ${mc.chapterNumber}, que no tiene video en el Manifest`);
       chapters.push({
@@ -266,8 +270,10 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
         activityEnabled,
         activityVariant: variant,
         activityType: variant === 'h5p' ? resolveActivityType(itemByKey.get(`activity:${mc.chapterId}`), { activityTypeRules: manifest.features?.activityTypeRules }) : null,
-        slideCount: posInt(artifacts.slideCountByChapter?.[mc.chapterId], `slideCount del capítulo ${mc.chapterNumber}`),
+        ...(practice ? { kind: 'practice' as const } : {}),
+        slideCount: practice ? 0 : posInt(artifacts.slideCountByChapter?.[mc.chapterId], `slideCount del capítulo ${mc.chapterNumber}`),
       });
+      if (practice && artifacts.slideCountByChapter?.[mc.chapterId] !== undefined) fail(`el capítulo de práctica ${mc.chapterNumber} no tiene presentación pero se informaron diapositivas`);
       if (artifacts.experienceWordsByChapter) {
         const ch = chapters[chapters.length - 1];
         const per = artifacts.experienceWordsByChapter[mc.chapterId];
@@ -356,7 +362,9 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
     byId.set(p.chapterId, posSeconds(p.seconds, `duración del audiolibro del capítulo ${p.chapterId}`));
   }
   let offset = 0;
-  const audiobookParts = chapters.map((c) => {
+  // Motor de carga horaria: el audiolibro narra los capítulos de CONTENIDO (la práctica no tiene parte).
+  for (const c of chapters) if (c.kind === 'practice' && byId.has(c.id)) fail(`audiobookParts: el capítulo de práctica ${c.number} no tiene audiolibro`);
+  const audiobookParts = chapters.filter((c) => c.kind !== 'practice').map((c) => {
     const seconds = byId.get(c.id);
     if (seconds === undefined) fail(`audiolibro sin la parte del capítulo ${c.number}`);
     const part = { chapterId: c.id, chapterNumber: c.number, seconds, offsetSeconds: offset };
@@ -376,7 +384,8 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
   if (artifacts.experienceWordsByChapter) {
     // Aproximación documentada: el Libro compilado (palabras medidas) se reparte por igual entre los capítulos;
     // incluye además apertura, aperturas de módulo y bibliografía (unos cientos de palabras por capítulo).
-    const libroPerChapter = Math.max(1, Math.round(libroWordCount / chapters.length));
+    const contentChapterCount = chapters.filter((c) => c.kind !== 'practice').length;
+    const libroPerChapter = Math.max(1, Math.round(libroWordCount / Math.max(1, contentChapterCount)));
     const byModule = new Map<string, ChapterFacts[]>();
     for (const ch of chapters) byModule.set(ch.moduleId, [...(byModule.get(ch.moduleId) ?? []), ch]);
     let est: StudyTimeEstimate;
@@ -395,13 +404,15 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
           ...(m.examQuestionCount !== null ? { examQuestions: m.examQuestionCount } : {}),
           chapters: (byModule.get(m.id) ?? []).map((ch) => {
             const sw = shownWords.get(ch.id) as { words: number; videoSeconds?: number };
+            const practiceCh = ch.kind === 'practice';
             return {
               chapterId: ch.id,
+              ...(practiceCh ? { kind: 'practice' as const } : {}),
               pageWords: sw.words,
-              libro: true,
-              libroWords: libroPerChapter,
-              presentation: true,
-              slides: ch.slideCount,
+              libro: !practiceCh,
+              ...(practiceCh ? {} : { libroWords: libroPerChapter }),
+              presentation: !practiceCh,
+              ...(practiceCh ? {} : { slides: ch.slideCount }),
               video: ch.videoEnabled,
               ...(sw.videoSeconds !== undefined ? { videoSeconds: sw.videoSeconds } : {}),
               ivAdvanced: features.ivAdvanced === 1,

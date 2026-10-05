@@ -354,13 +354,28 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
   };
   const remaining = [...toItems.keys()].filter((k) => !decided.has(k)).sort(byRankKey(rankTo));
   const anyContentNew = contentProducesNew.size > 0;
+  // Motor de carga horaria: experience/activity de un capítulo de PRÁCTICA (sin content propio) se regeneran si
+  // cambió el capítulo (título/objetivo/diseño), el conjunto o el `own` de sus fuentes, o si alguna fuente regenera.
+  const practiceChanged = (chId: string): boolean => {
+    const toSrc = toFp.practiceSources?.get(chId);
+    if (toSrc === undefined) return false;
+    if (fromFp.practiceSources?.get(chId) !== toSrc) return true;
+    const f0 = fromFp.content.get(chId);
+    if (!f0 || f0.own !== toFp.content.get(chId)!.own) return true;
+    // Fuentes = capítulos de contenido del mismo módulo (los que no son de práctica).
+    const moduleId = toFp.outline.chapterById.get(chId)?.moduleId;
+    const mod = toFp.outline.modules.find((m) => m.id === moduleId);
+    return (mod?.chapters ?? []).some((c) => !toFp.practiceSources?.has(c.id) && contentProducesNew.has(c.id));
+  };
 
   for (const key of remaining) {
     const { type, entityId } = parseItemKey(key);
     const toItem = toItems.get(key)!;
     const inFrom = fromItems.has(key);
     const chapterIsNew = CHAPTER_ITEM_TYPES_V3.includes(type) && !fromFp.outline.chapterById.has(entityId);
-    const contentNew = CHAPTER_ITEM_TYPES_V3.includes(type) && contentProducesNew.has(entityId);
+    const practiceNew = (type === 'experience' || type === 'activity') && practiceChanged(entityId);
+    const contentNew = CHAPTER_ITEM_TYPES_V3.includes(type) && (contentProducesNew.has(entityId) || practiceNew);
+    const contentReason = practiceNew && !contentProducesNew.has(entityId) ? 'practice_sources_changed' : 'content_regenerated';
     let a: InvalidationAction;
 
     if (type === 'experience') {
@@ -368,7 +383,7 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
       if (!inFrom) {
         decideNewItem(a, chapterIsNew ? 'chapter_added' : 'new_item', contentNew);
       } else if (contentNew) {
-        regenerate(a, 'content_regenerated');
+        regenerate(a, contentReason);
       } else if (roleChanged('experience', entityId)) {
         regenerate(a, ROLE_REASON);
       } else {
@@ -382,7 +397,7 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
       if (!inFrom) {
         decideNewItem(a, chapterIsNew ? 'chapter_added' : 'activity_toggled_on', contentNew);
       } else if (contentNew) {
-        regenerate(a, 'content_regenerated');
+        regenerate(a, contentReason);
       } else if ((fromItems.get(key)!.variant ?? null) !== (toItem.variant ?? null)) {
         regenerate(a, 'activity_engine_changed');
       } else if (
@@ -453,8 +468,9 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
         decideNewItem(a, oldMod ? 'exam_toggled_on' : 'module_added', memberContentNew);
       } else {
         const reasons: string[] = [];
-        const oldIds = oldMod!.chapters.map((c) => c.id).sort(cmpStr).join(',');
-        const newIds = newMod.chapters.map((c) => c.id).sort(cmpStr).join(',');
+        // Motor de carga horaria: los capítulos de práctica no son miembros del examen (no aportan texto).
+        const oldIds = oldMod!.chapters.filter((c) => !fromFp.practiceSources?.has(c.id)).map((c) => c.id).sort(cmpStr).join(',');
+        const newIds = newMod.chapters.filter((c) => !toFp.practiceSources?.has(c.id)).map((c) => c.id).sort(cmpStr).join(',');
         if (oldIds !== newIds) reasons.push('module_membership_changed');
         if (oldMod!.title !== newMod.title || oldMod!.objective !== newMod.objective || (oldMod!.description ?? null) !== (newMod.description ?? null)) reasons.push('module_title_or_objective_changed');
         const existingMemberContentNew = newMod.chapters.some(
@@ -475,8 +491,8 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
         decideNewItem(a, 'final_exam_toggled_on', anyContentNew);
       } else {
         const reasons: string[] = [];
-        const oldIds = fromFp.outline.chapters.map((c) => c.id).sort(cmpStr).join(',');
-        const newIds = toFp.outline.chapters.map((c) => c.id).sort(cmpStr).join(',');
+        const oldIds = fromFp.outline.chapters.filter((c) => !fromFp.practiceSources?.has(c.id)).map((c) => c.id).sort(cmpStr).join(',');
+        const newIds = toFp.outline.chapters.filter((c) => !toFp.practiceSources?.has(c.id)).map((c) => c.id).sort(cmpStr).join(',');
         if (oldIds !== newIds) reasons.push('course_membership_changed');
         // EV6 P2 fix 1 (C2): el banco del final congela hojas módulo × tipo. Si cambia el CONJUNTO de
         // módulos con capítulos (módulo borrado/vaciado o creado con capítulos movidos), el plan
@@ -484,7 +500,7 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
         // existiendo, o reordenar, sigue siendo REUSE (el banco empaqueta con su plan congelado).
         // Fix 2 (R1): solo si el origen es un BANCO; un final GIFT (o de tipo desconocido) se comporta como siempre.
         const finalIsBank = (records.get(key)?.artifactTypes ?? []).includes(EXAM_BANK_ARTIFACT_TYPE);
-        const moduleSet = (fp: typeof fromFp) => fp.outline.modules.filter((m) => m.chapters.length > 0).map((m) => m.id).sort(cmpStr).join(',');
+        const moduleSet = (fp: typeof fromFp) => fp.outline.modules.filter((m) => m.chapters.some((c) => !fp.practiceSources?.has(c.id))).map((m) => m.id).sort(cmpStr).join(',');
         if (finalIsBank && moduleSet(fromFp) !== moduleSet(toFp)) reasons.push('course_modules_changed');
         const existingContentNew = toFp.outline.chapters.some((c) => contentProducesNew.has(c.id) && fromFp.outline.chapterById.has(c.id));
         if (existingContentNew || (reasons.length === 0 && fromFp.finalExam !== toFp.finalExam)) reasons.push('member_content_changed');

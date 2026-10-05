@@ -90,8 +90,9 @@ export interface AssembleChapterInput {
 }
 
 /** Secuencia de slots (solo `kind`/`role`) — útil para tests y para R12. */
-export function chapterSlotSequence(flags: { videoEnabled: boolean; activityEnabled: boolean; videoPendingNotice?: boolean; reviewCards?: boolean }): string[] {
-  const seq = ['label:opening', 'presentation', 'label:deepening'];
+export function chapterSlotSequence(flags: { videoEnabled: boolean; activityEnabled: boolean; videoPendingNotice?: boolean; reviewCards?: boolean; practice?: boolean }): string[] {
+  // Motor de carga horaria: el capítulo de práctica no tiene presentación (ni video: lo valida el Blueprint).
+  const seq = flags.practice ? ['label:opening', 'label:deepening'] : ['label:opening', 'presentation', 'label:deepening'];
   if (flags.videoEnabled) seq.push('label:video_primer', 'video_h5p');
   else if (flags.videoPendingNotice) seq.push('label:video_pending');
   seq.push('label:synthesis');
@@ -182,10 +183,12 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   const head = headsWithHero ? '' : eyebrow(h, opener.kicker, s) + heading(h, 'h2', ch.title, s);
   const examNext = lastOfModule && mod.examEnabled;
   slots.push(label('opening', 'Apertura', injectIntoMovement(mv('opening'), head, chapterRoute(h, ch, examNext, mt))));
-  // [2] Presentación (obligatoria en V2.1).
-  slots.push({ kind: 'presentation' });
-  // [3] Profundización.
-  slots.push(label('deepening', 'Profundización', mv('deepening')));
+  const practice = ch.kind === 'practice';
+  if (practice && (ch.videoEnabled || ch.videoPending)) shellFail(`capítulo de práctica ${ch.number} con video`);
+  // [2] Presentación (obligatoria en V2.1 en los capítulos de contenido; el de práctica no tiene).
+  if (!practice) slots.push({ kind: 'presentation' });
+  // [3] Profundización (en la práctica: la práctica guiada).
+  slots.push(label('deepening', practice ? 'Práctica guiada' : 'Profundización', mv('deepening')));
   // [4] Video: guía previa (plantilla + conceptos del LLM) + transición → video.
   if (ch.videoEnabled) {
     const before = chipH(h, 'video', 'Video interactivo', mt, s) + heading(h, 'h3', COPY.videoPrimerTitle, s) + pHtml(h, labelHtml(COPY.videoPrimerLead), s);
@@ -283,7 +286,8 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
  * orden, como en un curso, no como en un artículo.
  */
 function chapterRoute(h: Hx, ch: ChapterFacts, examNext: boolean, mt: Tone): string {
-  const steps: Array<[EduIcon, string]> = [['presentacion', 'Presentación'], ['libro', 'Profundización']];
+  // Motor de carga horaria: el capítulo de práctica no tiene presentación; su profundización es la práctica guiada.
+  const steps: Array<[EduIcon, string]> = ch.kind === 'practice' ? [['practica', 'Práctica guiada']] : [['presentacion', 'Presentación'], ['libro', 'Profundización']];
   if (ch.videoEnabled) steps.push(['video', 'Video interactivo']);
   steps.push(['logro', 'Síntesis']);
   steps.push(ch.activityEnabled ? ['practica', 'Práctica calificada'] : ['repaso', 'Repaso']);

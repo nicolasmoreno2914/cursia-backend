@@ -92,6 +92,20 @@ function packagingInput(distRoot, o = {}) {
   const activities = new Map();
   const slices = ['slice-a.mp3', 'slice-b.mp3', 'slice-c.mp3'];
   chapters.forEach((c, i) => {
+    if (c.kind === 'practice') {
+      // Motor de carga horaria: el capítulo de práctica no tiene presentación, Libro (content) ni audiolibro.
+      if (c.activityEnabled) {
+        if (engine === 'h5p') {
+          const payload = SF.h5pPayload(shell.resolveActivityType(itemByKey.get(`activity:${c.chapterId}`), { activityTypeRules: manifest.features && manifest.features.activityTypeRules }));
+          payload.data.itemKey = `activity:${c.chapterId}`;
+          if (payload.type === 'questionset') payload.data.passPercentage = 70;
+          activities.set(c.chapterId, { variant: 'h5p', payload });
+        } else {
+          activities.set(c.chapterId, { variant: 'scorm', html: SCORM_HTML, manifestXml: SCORM_MANIFEST(c.chapterNumber) });
+        }
+      }
+      return;
+    }
     presentations.set(c.chapterId, {
       pdf: media.syntheticPdf(8 + (i % 3)),
       cover: media.syntheticCoverPng(cw, chh, ['#2F5D8A', '#3A7D44', '#8A3A5D', '#6B5B2A'][i % 4]),
@@ -191,7 +205,7 @@ function expectedSequence(distRoot, input) {
   for (const mod of m.modules) {
     mod.chapters.forEach((ch, i) => {
       const ids = i === 0 ? [`cv3:module_intro:${mod.moduleId}`] : [];
-      for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled, reviewCards: hasReview(ch.chapterId) })) {
+      for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled, reviewCards: hasReview(ch.chapterId), practice: ch.kind === 'practice' })) {
         const role = s.startsWith('label:') ? s.slice(6) : s === 'video_h5p' ? 'video' : s;
         ids.push(`cv3:ch:${ch.chapterId}:${role}`);
       }

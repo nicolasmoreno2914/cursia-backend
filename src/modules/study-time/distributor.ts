@@ -251,8 +251,14 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   const priorityTrace: string[] = [];
   const baseHours = r1(estimateCourseStudyTime(toInput(false)).courseEstimatedMinutes / 60);
 
-  const result = (status: DistributionStatus, recommendations: string[]): DistributionResult => {
+  const result = (status: DistributionStatus, recs: string[]): DistributionResult => {
     const generable = estimateCourseStudyTime(toInput(false));
+    // Re-revisión L3: los capítulos de práctica no tienen tope de aplicación; si el diseño queda por encima de la
+    // proporción del enfoque, se dice explícitamente (las Actividades de aplicación todavía no se generan).
+    const share = est.byComponent.application / est.courseEstimatedMinutes;
+    const recommendations = share > policy.maxApplicationShare + 1e-9
+      ? [...recs, `El ${Math.round(share * 100)} % de este diseño son Actividades de aplicación (más que el ${Math.round(policy.maxApplicationShare * 100)} % habitual del enfoque) y todavía no se generan: hoy el curso tendría ${String(r1(generable.courseEstimatedMinutes / 60)).replace('.', ',')} h. Si el curso es chico, conviene sumar capítulos de contenido o un módulo en lugar de más práctica.`]
+      : recs;
     const estChapter = new Map(est.modules.flatMap((m) => m.chapters).map((c) => [c.chapterId, c.chapterEstimatedMinutes]));
     const genChapter = new Map(generable.modules.flatMap((m) => m.chapters).map((c) => [c.chapterId, c.chapterEstimatedMinutes]));
     const modules: ProposedModule[] = design.map((m) => ({

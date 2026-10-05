@@ -5,6 +5,7 @@ import type {
   BlueprintSnapshotV1,
   BlueprintSnapshotV2,
 } from '../course-blueprints/blueprint-snapshot';
+import { chapterKindOf } from '../course-blueprints/blueprint-snapshot';
 import {
   ActivityTypeRulesVersion,
   GradedH5pActivityType,
@@ -106,6 +107,11 @@ export interface ManifestChapter {
   videoEnabled: boolean;
   /** Solo rulesVersion 3 (ausente en v1/v2: su forma canónica no cambia). */
   activityEnabled?: boolean;
+  /**
+   * Motor de carga horaria: SOLO en capítulos de práctica (v3). Sin la clave = capítulo de contenido (sha de
+   * siempre). Un capítulo de práctica solo produce experience (+ activity), apoyados en los content del módulo.
+   */
+  kind?: 'practice';
 }
 
 export interface ManifestModule {
@@ -1061,6 +1067,9 @@ export function manifestSha256(m: GenerationManifestV1): string {
 //   video_interactions:<ch>       chapter videoEnabled       [video:<ch>, content:<ch>]
 //   activity:<ch>  (+variant)     chapter activityEnabled    [content:<ch>]
 //   audiobook_chapter:<ch>        chapter siempre            [content:<ch>]
+//   Capítulo de PRÁCTICA (kind 'practice', motor de carga horaria): SOLO experience:<ch> y, si activityEnabled,
+//   activity:<ch>; ambos con dependsOn = los content de los capítulos de CONTENIDO del módulo, en orden (se apoyan
+//   en sus resúmenes). Sin content, presentation, video ni audiobook_chapter, y fuera de exam/final_exam.
 //   exam:<m>                      module  examEnabled        content del módulo, en orden
 //   final_exam:<courseId>         course  course.finalExam   todos los content, en orden
 // Orden canónico: course_plan, course_intro, audio_welcome; por módulo:
@@ -1144,14 +1153,32 @@ export function buildGenerationManifestV3(
     });
     const chapters: ManifestChapter[] = [];
     const contentKeys: string[] = [];
-    for (const c of [...m.chapters].sort((a, b) => a.position - b.position)) {
+    const sortedChapters = [...m.chapters].sort((a, b) => a.position - b.position);
+    // Motor de carga horaria: la práctica se apoya en los content de los capítulos de CONTENIDO del módulo.
+    const moduleContentKeys = sortedChapters.filter((c) => chapterKindOf(c) === 'content').map((c) => `content:${c.id}`);
+    for (const c of sortedChapters) {
       if (typeof c.activityEnabled !== 'boolean') {
         throw new Error(`BLUEPRINT_V2_INVALID_INPUT: chapter ${c.id} sin activityEnabled boolean`);
       }
       chapterNumber += 1;
       const videoEnabled = !!c.videoEnabled;
-      chapters.push({ chapterId: c.id, position: c.position, chapterNumber, videoEnabled, activityEnabled: c.activityEnabled });
+      const practice = chapterKindOf(c) === 'practice';
+      if (practice && (videoEnabled || moduleContentKeys.length === 0)) {
+        throw new Error(`BLUEPRINT_V2_INVALID_INPUT: el capítulo de práctica ${c.id} no puede tener video y su módulo necesita un capítulo de contenido`);
+      }
+      chapters.push({ chapterId: c.id, position: c.position, chapterNumber, videoEnabled, activityEnabled: c.activityEnabled, ...(practice ? { kind: 'practice' as const } : {}) });
       const base = { scope: 'chapter' as const, moduleId: m.id, chapterId: c.id, moduleNumber, chapterNumber };
+      if (practice) {
+        items.push({ key: `experience:${c.id}`, type: 'experience', ...base, dependsOn: [...moduleContentKeys] });
+        if (c.activityEnabled) {
+          const h5pType = variant === 'h5p' && chosenTypes ? chosenTypes.get(c.id)?.type : undefined;
+          if (chosenTypes && variant === 'h5p' && !h5pType) {
+            throw new Error(`buildGenerationManifestV3: sin tipo h5p para la actividad del capítulo ${c.id}`);
+          }
+          items.push({ key: `activity:${c.id}`, type: 'activity', ...base, dependsOn: [...moduleContentKeys], variant, ...(h5pType ? { h5pType } : {}) });
+        }
+        continue;
+      }
       const contentKey = `content:${c.id}`;
       contentKeys.push(contentKey);
       allContentKeys.push(contentKey);
@@ -1296,6 +1323,7 @@ export function canonicalManifestJsonV3(m: GenerationManifestV1): string {
         chapterNumber: c.chapterNumber,
         videoEnabled: c.videoEnabled,
         activityEnabled: c.activityEnabled,
+        ...(c.kind === 'practice' ? { kind: 'practice' as const } : {}),
       })),
     })),
     items: m.items.map((i) => ({
@@ -1455,19 +1483,28 @@ export function validateGenerationManifestV3(
     });
     const modContent: string[] = [];
     const mirrorChapters: ManifestChapter[] = [];
-    for (const c of [...mod.chapters].sort((a, b) => a.position - b.position)) {
+    const sortedCh = [...mod.chapters].sort((a, b) => a.position - b.position);
+    const modContentAll = sortedCh.filter((c) => chapterKindOf(c) === 'content').map((c) => `content:${c.id}`);
+    for (const c of sortedCh) {
       chNum += 1;
       const videoOn = !!c.videoEnabled;
       const activityOn = c.activityEnabled === true;
+      const practice = chapterKindOf(c) === 'practice';
       chapterInfo.set(c.id, { moduleId: mod.id, videoEnabled: videoOn, activityEnabled: activityOn });
-      mirrorChapters.push({ chapterId: c.id, position: c.position, chapterNumber: chNum, videoEnabled: videoOn, activityEnabled: activityOn });
-      const content = `content:${c.id}`;
-      modContent.push(content);
-      allContent.push(content);
+      mirrorChapters.push({ chapterId: c.id, position: c.position, chapterNumber: chNum, videoEnabled: videoOn, activityEnabled: activityOn, ...(practice ? { kind: 'practice' as const } : {}) });
       const ch = (type: ManifestItemType, dependsOn: string[], variant?: ActivityVariant): ExpectedItemV3 => ({
         key: `${type}:${c.id}`, type, scope: 'chapter', moduleId: mod.id, chapterId: c.id,
         moduleNumber, chapterNumber: chNum, dependsOn, ...(variant ? { variant } : {}),
       });
+      if (practice) {
+        // Motor de carga horaria: capítulo de práctica = experience (+ activity) sobre los content del módulo.
+        expected.push(ch('experience', [...modContentAll]));
+        if (activityOn) expected.push(ch('activity', [...modContentAll], engine));
+        continue;
+      }
+      const content = `content:${c.id}`;
+      modContent.push(content);
+      allContent.push(content);
       for (const type of V3_CHAPTER_TYPES_IN_ORDER) {
         if (type === 'content') expected.push(ch(type, [planKey]));
         else if (type === 'video' || type === 'video_interactions') {
@@ -1660,6 +1697,7 @@ function canonicalModules(mods: ManifestModule[]): unknown {
       chapterNumber: c.chapterNumber,
       videoEnabled: c.videoEnabled,
       activityEnabled: c.activityEnabled,
+      ...(c.kind === 'practice' ? { kind: 'practice' as const } : {}),
     })),
   }));
 }
