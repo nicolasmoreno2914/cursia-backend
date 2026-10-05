@@ -89,12 +89,17 @@ const GOLDEN = {
   // hash, nombre, tamaño, mimetype) y la descripción del recurso (resource.xml) con el botón «Abrir Libro Guía →» y «documento PDF».
   // Dorados anteriores (3.12.0): h5p-final-light 5e9bf0f0…, scorm-nofinal-dark b967577f…, h5p-nofinal-dark-mock-cleansafe
   // 14d45c9d…, scorm-final-light 6c18bcce…, h5p-ev5c-rules1 3c6d123e….
+  // Motor de carga horaria Loop 1 (study-time) cambia el .mbz a propósito, y SOLO en el badge «~X min» de la apertura de
+  // cada capítulo (modelo único: 150 ppm + Libro + preguntas del video + repaso): en las 5 configuraciones cambian exactamente
+  // 4 entradas del zip (los label.xml de apertura) y normalizando «~N min» son idénticas (scratchpad/r23/mbzdiff.js).
+  // Dorados anteriores (3.13.0): h5p-final-light 0eb987bf…, scorm-nofinal-dark ef843c54…, h5p-nofinal-dark-mock-cleansafe
+  // f309c5ac…, scorm-final-light 02a970f2…, h5p-ev5c-rules1 3a8c0028….
   mbz: {
-    'h5p-final-light': '0eb987bf3053628826eae8f72cd88bff6825d0db65fea8046009570116f6b2ab',
-    'scorm-nofinal-dark': 'ef843c5414e59ffb50fb8d46f02d8800e6c23774ca73685252fa33b3cf16c725',
-    'h5p-nofinal-dark-mock-cleansafe': 'f309c5ac6db472587da1b7c3444597001d3dbaec923d0e51ca5939e483f356cb',
-    'scorm-final-light': '02a970f2cc4eddac2966fae28cfbb306920c715574e416e391fab703436bc0ec',
-    'h5p-ev5c-rules1': '3a8c0028b764cd91a21dbe8d58e92215479621793032b08788467225ef3836ef',
+    'h5p-final-light': 'f81e186a6da1aacf3f56d18008c95c7f6211f10e267befefeb55974a97970cb5',
+    'scorm-nofinal-dark': '8e99edd2d00f974b8c36015fcadd77c942dc2470ed9f5f621347f675aa301fb8',
+    'h5p-nofinal-dark-mock-cleansafe': 'b933f95914ba27af4e2e55f57af72873a3b592a3c0818c019d1cb9aeedda0bba',
+    'scorm-final-light': '93f39f3ecad0961062b95052a4e14498c7c75c64228688fbf5fb01c48b66a8a6',
+    'h5p-ev5c-rules1': '18ec532260583fb1dcaa8bf7dce28546395400825b6a4352ca05f90a462a2b6a',
   },
 };
 
