@@ -17,6 +17,7 @@ import {
   validateGenerationManifestV3,
 } from '../generation-manifests/generation-manifest-builder';
 import type { ActivityTypeRulesVersion } from '../generation-manifests/activity-type-rules';
+import { createHash } from 'crypto';
 import { estimateCost } from '../finops/estimator';
 import { DistributionResult, distributeCourseHours, estimateCourseStudyTime, StudyTimeEstimate, studyTimeInputFromManifest } from '../study-time';
 import { ITEM_TYPE_OPERATIONS, isFinopsItemType, providerOfOperation } from '../finops/operations';
@@ -167,7 +168,7 @@ export interface DryRunResult {
    * Motor de carga horaria (Loop 3): diseño propuesto por el distribuidor para alcanzar targetHours (null sin
    * objetivo). Solo propuesta: no cambia el Blueprint ni el Manifest de este dry-run.
    */
-  distribution: DistributionResult | null;
+  distribution: (DistributionResult & { materialized: DistributionMaterialized }) | null;
   baseline: DryRunSide;
   pedagogical: DryRunSide | null;
   structureChanges: StructureChange[];
@@ -304,6 +305,49 @@ function snapshotFromSnapshot(s: BlueprintSnapshotV2): BlueprintSnapshotV2 {
   const errors = validateBlueprintInputV2(rows.course, rows.modules, rows.chapters);
   if (errors.length > 0) throw new Error(`DRY_RUN_INVALID_STRUCTURE: ${errors.map((e) => e.message).join('; ')}`);
   return buildBlueprintSnapshotV2(rows.course, rows.modules, rows.chapters);
+}
+
+/**
+ * Motor de carga horaria: la propuesta del distribuidor llevada a un Blueprint EN MEMORIA (capítulos propuestos
+ * con ids deterministas; los de práctica con kind) y por el Manifest real, su validador, el modelo de tiempo y el
+ * estimador de costo. Prueba que el diseño propuesto es representable y dice cuánto costaría generarlo HOY (sin
+ * las Actividades de aplicación, que son Fase 2). No se guarda nada.
+ */
+export interface DistributionMaterialized {
+  blueprintSha256: string;
+  manifestSha256: string;
+  manifestErrors: { code: string; message: string; key?: string }[];
+  items: number;
+  totals: Record<string, number>;
+  providers: ProviderPlan;
+  /** Horas del Manifest materializado (deben ser las `generableHours` del distribuidor). */
+  generableHours: number;
+}
+
+/** UUID v4 determinista para un capítulo propuesto (solo en el dry-run). */
+function proposedChapterUuid(id: string): string {
+  const h = createHash('sha256').update(id, 'utf8').digest('hex');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
+
+export function materializeDistribution(base: BlueprintSnapshotV2, dist: DistributionResult): BlueprintSnapshotV2 {
+  const rows = snapshotV2ToRows(base);
+  const byId = new Map(rows.chapters.map((c) => [c.id, c]));
+  const chapters: RawChapterRowV2[] = [];
+  for (const m of dist.modules) {
+    m.chapters.forEach((c, ci) => {
+      const existing = byId.get(c.id);
+      if (existing) {
+        chapters.push({ ...existing, position: ci });
+        return;
+      }
+      chapters.push({
+        id: proposedChapterUuid(c.id), module_id: m.id, position: ci, title: c.title, objective: c.objective, description: null,
+        video_enabled: c.videoEnabled, activity_enabled: c.activityEnabled, ...(c.kind === 'practice' ? { chapter_kind: 'practice' } : {}),
+      });
+    });
+  }
+  return buildBlueprintSnapshotV2(rows.course, rows.modules, chapters);
 }
 
 /** El mismo snapshot con `course.targetHours` (pasa por el builder: orden canónico y validación). */
@@ -465,9 +509,21 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
     profileEmpty,
     rules,
     targetHours,
-    distribution: targetHours === null
-      ? null
-      : distributeCourseHours({ snapshot: view.blueprint, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1 }),
+    distribution: targetHours === null ? null : (() => {
+      const dist = distributeCourseHours({ snapshot: view.blueprint, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1 });
+      const plain = materializeDistribution(view.blueprint, dist);
+      const ms = side(rules ? applyPedagogyToSnapshot(plain, rules) : plain, activityTypeRules);
+      const materialized: DistributionMaterialized = {
+        blueprintSha256: ms.blueprintSha256,
+        manifestSha256: ms.manifestSha256,
+        manifestErrors: ms.manifestErrors,
+        items: ms.manifest.items.length,
+        totals: { ...(ms.manifest.totals as any) },
+        providers: ms.providers,
+        generableHours: ms.studyTime.courseEstimatedHours,
+      };
+      return { ...dist, materialized };
+    })(),
     workload: targetHours === null
       ? null
       : {
