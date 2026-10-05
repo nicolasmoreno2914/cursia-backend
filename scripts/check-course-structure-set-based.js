@@ -439,6 +439,10 @@ async function main() {
       await rejectsWith(S.updateModule(cid, m0.id, OWNER, { title: noCut, expectedCounter: c }), 400, /MODULE_TITLE_TOO_LONG/, 'updateModule 400');
       await rejectsWith(S.updateChapter(cid, m0.id, ghost, OWNER, { title: noCut, expectedCounter: c }), 404, /Chapter .* not found/, 'updateChapter: 404 antes que el título inválido');
       await rejectsWith(S.updateChapter(cid, ghost, ch0.id, OWNER, { objective: 'x', expectedCounter: c }), 404, /Chapter .* not found/, 'updateChapter: módulo equivocado');
+      // Revisión final Fase 1 (M1): encender el video lleva la guarda «práctica» en el UPDATE; un capítulo o módulo
+      // inexistente sigue siendo 404 (nunca 400 PRACTICE_CHAPTER_VIDEO).
+      await rejectsWith(S.updateChapter(cid, m0.id, ghost, OWNER, { videoEnabled: true, expectedCounter: c }), 404, /Chapter .* not found/, 'updateChapter video: capítulo inexistente');
+      await rejectsWith(S.updateChapter(cid, ghost, ch0.id, OWNER, { videoEnabled: true, expectedCounter: c }), 404, /Chapter .* not found/, 'updateChapter video: módulo equivocado');
       await rejectsWith(S.updateChapter(cid, m0.id, ch0.id, OWNER, { title: noCut, expectedCounter: c }), 400, /CHAPTER_TITLE_TOO_LONG/, 'updateChapter 400');
       await rejectsWith(S.createChapter(cid, ghost, OWNER, { title: noCut, expectedCounter: c }), 404, /Module .* not found/, 'createChapter: 404 antes que el título inválido');
       await rejectsWith(S.createChapter(cid, m0.id, OWNER, { title: noCut, expectedCounter: c }), 400, /CHAPTER_TITLE_TOO_LONG/, 'createChapter 400');

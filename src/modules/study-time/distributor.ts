@@ -24,6 +24,7 @@ import type { BlueprintSnapshotV2 } from '../course-blueprints/blueprint-snapsho
 import type { DesignRules } from '../pedagogy/design-rules';
 import { chapterRole } from '../pedagogy/pedagogical-blueprint';
 import type { ChapterRole } from '../pedagogy/vocabulary';
+import { STRUCTURE_TITLE_MAX } from '../course-structure/structure-titles';
 import { isValidTargetHours } from './target-hours';
 import { STUDY_TIME_RULES, StudyTimeCourseInput, StudyTimeEstimate, estimateCourseStudyTime } from './time-model';
 
@@ -180,6 +181,15 @@ interface WorkModule {
   title: string;
   examEnabled: boolean;
   chapters: WorkChapter[];
+}
+
+/**
+ * Título de un capítulo propuesto: «Prefijo: título del módulo» si cabe en el máximo de la estructura; si no, solo
+ * el prefijo (el módulo ya va en el objetivo). Así la propuesta materializada es la misma que crearía el editor.
+ */
+export function proposedTitle(prefix: string, moduleTitle: string): string {
+  const full = `${prefix}: ${String(moduleTitle ?? '').trim()}`;
+  return full.length <= STRUCTURE_TITLE_MAX ? full : prefix;
 }
 
 export function distributeCourseHours(input: DistributorInput): DistributionResult {
@@ -389,7 +399,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
           id: `proposed:practice:${m.id}:${round}`,
           proposed: true,
           kind: 'practice',
-          title: round === 1 ? `Práctica integradora: ${m.title}` : `Práctica de casos: ${m.title}`,
+          title: proposedTitle(round === 1 ? 'Práctica integradora' : 'Práctica de casos', m.title),
           objective: `Aplicar lo aprendido en «${m.title}» en una situación completa`,
           videoEnabled: false,
           activityEnabled: true,
@@ -420,7 +430,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
           id: `proposed:content:${m.id}:${n}`,
           proposed: true,
           kind: 'content',
-          title: `Profundización ${n}: ${m.title}`,
+          title: proposedTitle(`Profundización ${n}`, m.title),
           objective: `Analizar casos complejos de «${m.title}»`,
           videoEnabled: usesVideo,
           activityEnabled: true,

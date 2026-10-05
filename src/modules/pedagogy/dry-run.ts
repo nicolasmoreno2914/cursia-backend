@@ -314,14 +314,15 @@ function snapshotFromSnapshot(s: BlueprintSnapshotV2): BlueprintSnapshotV2 {
  * las Actividades de aplicación, que son Fase 2). No se guarda nada.
  */
 export interface DistributionMaterialized {
-  blueprintSha256: string;
-  manifestSha256: string;
+  /** null si la materialización falló (el error va en manifestErrors). */
+  blueprintSha256: string | null;
+  manifestSha256: string | null;
   manifestErrors: { code: string; message: string; key?: string }[];
   items: number;
   totals: Record<string, number>;
   providers: ProviderPlan;
-  /** Horas del Manifest materializado (deben ser las `generableHours` del distribuidor). */
-  generableHours: number;
+  /** Horas del Manifest materializado (deben ser las `generableHours` del distribuidor); null si falló. */
+  generableHours: number | null;
 }
 
 /** UUID v4 determinista para un capítulo propuesto (solo en el dry-run). */
@@ -347,7 +348,37 @@ export function materializeDistribution(base: BlueprintSnapshotV2, dist: Distrib
       });
     });
   }
+  // Misma validación de entrada que el camino real (snapshotFromSnapshot / lock): títulos, video en práctica, etc.
+  const errors = validateBlueprintInputV2(rows.course, rows.modules, chapters);
+  if (errors.length > 0) {
+    throw new Error(`DISTRIBUTION_MATERIALIZE_INVALID: ${errors.map((e) => `${e.code}: ${e.message}`).join('; ')}`);
+  }
   return buildBlueprintSnapshotV2(rows.course, rows.modules, chapters);
+}
+
+/**
+ * La propuesta materializada; si falla (bug del materializador o diseño no representable) el error queda VISIBLE en
+ * `manifestErrors` sin tumbar la línea base ni la vista pedagógica del dry-run.
+ */
+export function materializeOrError(
+  base: BlueprintSnapshotV2,
+  dist: DistributionResult,
+  build: (plain: BlueprintSnapshotV2) => DistributionMaterialized,
+): DistributionMaterialized {
+  try {
+    return build(materializeDistribution(base, dist));
+  } catch (err) {
+    const message = (err as Error)?.message || String(err);
+    return {
+      blueprintSha256: null,
+      manifestSha256: null,
+      manifestErrors: [{ code: 'DISTRIBUTION_MATERIALIZE_FAILED', message }],
+      items: 0,
+      totals: {},
+      providers: { byProvider: {}, estimateUsd: null, estimateNote: `Sin estimación de costo: la propuesta no se pudo materializar (${message})` },
+      generableHours: null,
+    };
+  }
 }
 
 /** El mismo snapshot con `course.targetHours` (pasa por el builder: orden canónico y validación). */
@@ -511,17 +542,18 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
     targetHours,
     distribution: targetHours === null ? null : (() => {
       const dist = distributeCourseHours({ snapshot: view.blueprint, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1 });
-      const plain = materializeDistribution(view.blueprint, dist);
-      const ms = side(rules ? applyPedagogyToSnapshot(plain, rules) : plain, activityTypeRules);
-      const materialized: DistributionMaterialized = {
-        blueprintSha256: ms.blueprintSha256,
-        manifestSha256: ms.manifestSha256,
-        manifestErrors: ms.manifestErrors,
-        items: ms.manifest.items.length,
-        totals: { ...(ms.manifest.totals as any) },
-        providers: ms.providers,
-        generableHours: ms.studyTime.courseEstimatedHours,
-      };
+      const materialized = materializeOrError(view.blueprint, dist, (plain) => {
+        const ms = side(rules ? applyPedagogyToSnapshot(plain, rules) : plain, activityTypeRules);
+        return {
+          blueprintSha256: ms.blueprintSha256,
+          manifestSha256: ms.manifestSha256,
+          manifestErrors: ms.manifestErrors,
+          items: ms.manifest.items.length,
+          totals: { ...(ms.manifest.totals as any) },
+          providers: ms.providers,
+          generableHours: ms.studyTime.courseEstimatedHours,
+        };
+      });
       return { ...dist, materialized };
     })(),
     workload: targetHours === null
