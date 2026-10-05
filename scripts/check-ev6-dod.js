@@ -534,7 +534,8 @@ const ENV_KEYS = [
       // r19 W (builder 3.12.0 → 3.13.0): SOLO cambia el label cv3:shell:welcome (hero con superficie según heroTreatment, «Curso · N módulos · M capítulos», entrada ≤ 40 palabras y cuerpo en párrafos ≤ 70) — diff por entrada del zip en scratchpad/r19/w-logs/golddiff (hook.js + diff.js) (antes 7cb2a7c7…, 3.12.0).
       // r19 L fix round 1: logo de la portada a opacidad plena, /Keywords del PDF (sha del plan) y transliteración — vuelve a mover solo el blob del Libro.
       // r19 L (builder 3.13.0): Libro Guía en PDF + botón en su descripción — mismo dorado que check-ev6-pending-videos (antes 7cb2a7c7…, 3.12.0).
-      const GOLDEN_644 = 'e64d1b6163be68cf28c20c55473f93d41745542e60f60b4ebc45a2d0ebbe5363';
+      // Motor de carga horaria L1 (badge de minutos del modelo de tiempo): mismo dorado que check-ev6-pending-videos, verificado por entrada del zip — solo cambian los «~N min» (scratchpad/r23/mbzdiff2.js) (antes e64d1b61…).
+      const GOLDEN_644 = 'c359c0a59d19e949a13c7762208eee7d62667da5ba0ae68108bdbf34a8a49d2c';
       const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
       const r0 = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, o));
       const r1 = await B.buildDynamicMbzV3({ ...PF.packagingInput(distRoot, o), qaPreviewNotice: false });
