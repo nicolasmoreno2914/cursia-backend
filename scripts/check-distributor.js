@@ -287,5 +287,30 @@ check('D13 adversos', () => {
   assert(r.counts.chapters <= 1 + 5 + 2, 'topes respetados');
 });
 
+check('D16 revisión final Fase 1 (M4): títulos propuestos ≤ 80 y la materialización valida como el camino real', () => {
+  eq(ST.proposedTitle('Práctica integradora', 'Soporte vital'), 'Práctica integradora: Soporte vital', 'cabe');
+  const long = 'Gestión integral de riesgos biológicos, químicos y ergonómicos en servicios hospitalarios de alta complejidad';
+  eq(ST.proposedTitle('Práctica integradora', long), 'Práctica integradora', 'no cabe: solo el prefijo');
+  const s = clone(RCP);
+  s.modules[0].title = long.slice(0, 80);
+  const r = P.runPedagogyDryRun({ structure: s, profile: profileOf('competencias', { targetHours: 50 }), activityTypeRules: 2 });
+  const d = r.distribution;
+  eq(d.materialized.manifestErrors, [], 'propuesta válida con un módulo de 80 caracteres');
+  for (const m of d.modules) for (const c of m.chapters) assert(c.title.length <= 80, `título largo: ${c.title}`);
+});
+
+check('D17 revisión final Fase 1 (M3): si la materialización falla, el error es VISIBLE y el resto del dry-run sigue', () => {
+  const s = clone(RCP);
+  const base = P.runPedagogyDryRun({ structure: s, profile: profileOf('competencias', { targetHours: 33 }), activityTypeRules: 2 });
+  // Un capítulo propuesto con video en práctica no es representable: la validación de entrada lo rechaza.
+  const bad = { ...base.distribution, modules: base.distribution.modules.map((m) => ({ ...m, chapters: m.chapters.map((c) => (c.kind === 'practice' ? { ...c, videoEnabled: true } : c)) })) };
+  let threw = null;
+  try { P.materializeDistribution(base.baseline.blueprint, bad); } catch (e) { threw = e.message; }
+  assert(threw && /DISTRIBUTION_MATERIALIZE_INVALID: .*PRACTICE_CHAPTER_VIDEO/.test(threw), `materializeDistribution falla fuerte: ${threw}`);
+  const m = P.materializeOrError(base.baseline.blueprint, base.distribution, () => { throw new Error('bug simulado'); });
+  eq([m.manifestErrors[0].code, m.generableHours, m.providers.estimateUsd], ['DISTRIBUTION_MATERIALIZE_FAILED', null, null], 'error visible');
+  assert(/bug simulado/.test(m.manifestErrors[0].message) && /Sin estimación de costo/.test(m.providers.estimateNote), 'mensaje y nota de costo');
+});
+
 console.log(`\n${passes} OK, ${failures} fallidas`);
 process.exit(failures ? 1 : 0);

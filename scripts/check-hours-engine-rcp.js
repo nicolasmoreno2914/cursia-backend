@@ -10,14 +10,25 @@
 //        Fase 0 (~19 / ~32 / ~49 h; ~9 / ~11 / ~19 capítulos; ~9 / ~9 / ~13 videos; ~0 / ~2 / ~6 de práctica)
 //   HE2  la propuesta materializada es un Blueprint + Manifest VÁLIDOS y sus horas son las del distribuidor
 //   HE3  8 h → la estructura mínima supera el objetivo (sin recortar); 80 h → no alcanza (propone módulos)
-//   HE4  sin targetHours y con perfil vacío: la salida de siempre (distribution null; mismos sha)
+//   HE4  sin targetHours y con perfil vacío: la salida de siempre (distribution null; sha de Blueprint y Manifest = dorado)
 //   HE5  cada enfoque existente produce una propuesta válida; competencias y significativo crecen distinto
 //   HE6  costo: el video no crece con las horas (solo con capítulos de profundización); la práctica cuesta
-//        mucho menos que un capítulo de contenido; 0 proveedores llamados
+//        mucho menos que un capítulo de contenido
+//   HE7  0 llamadas de red MEDIDAS (fetch, http/https, net/tls interceptados antes de cargar el código)
 //
 // Imprime la tabla comparativa del reporte. Uso: node scripts/check-hours-engine-rcp.js [path/to/dist]
 'use strict';
 const path = require('path');
+
+// Guarda de red REAL (revisión final Fase 1, M5): cualquier intento de salir a la red se cuenta y falla.
+const netAttempts = [];
+{
+  const deny = (what) => function () { netAttempts.push(what); throw new Error(`red prohibida en el dry-run: ${what}`); };
+  for (const mod of ['http', 'https']) { const m = require(mod); m.request = deny(`${mod}.request`); m.get = deny(`${mod}.get`); }
+  const net = require('net'); net.connect = deny('net.connect'); net.createConnection = deny('net.createConnection');
+  const tls = require('tls'); tls.connect = deny('tls.connect');
+  globalThis.fetch = deny('fetch');
+}
 
 const distRoot = path.resolve(process.cwd(), process.argv.slice(2).find((a) => !a.startsWith('--')) || 'dist');
 function loadDist(rel) {
@@ -113,6 +124,10 @@ check('HE4 sin targetHours y con perfil vacío: la salida de siempre', () => {
   const b = P.runPedagogyDryRun({ structure: rcp(), profile: null, activityTypeRules: 2 });
   eq([b.distribution, b.pedagogical], [null, null], 'perfil vacío');
   eq(S[33].baseline.blueprintSha256 !== b.baseline.blueprintSha256, true, 'con objetivo, el Blueprint lleva targetHours');
+  // Dorado (rama staging 00d2399, idéntico al de antes del motor de horas: check-target-hours fija los 80 casos legacy).
+  const GOLD = ['21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4', 'e4a859788fd35c2496fe7384e3e9c4e47be9b4e707f6a9b3380ca82ba0f31066'];
+  eq([a.baseline.blueprintSha256, a.baseline.manifestSha256], GOLD, 'sin objetivo: sha de siempre');
+  eq([b.baseline.blueprintSha256, b.baseline.manifestSha256], GOLD, 'perfil vacío: sha de siempre');
 });
 
 check('HE5 cada enfoque existente produce una propuesta válida; competencias y significativo crecen distinto', () => {
@@ -137,6 +152,14 @@ check('HE6 costo: el video no crece con las horas; la práctica cuesta mucho men
   const perContent = (usd(m(50)) - usd(m(33)) - 4 * perPractice) / 4;
   assert(perPractice > 0 && perPractice < 0.4, `práctica ≈ USD ${perPractice.toFixed(2)}`);
   assert(perContent > 5 * perPractice, `contenido ≈ USD ${perContent.toFixed(2)} (≫ práctica)`);
+});
+
+check('HE7 0 llamadas de red medidas durante todos los dry-runs (no un literal del objeto de retorno)', () => {
+  eq(netAttempts, [], 'intentos de red');
+  let threw = false;
+  try { require('https').request('https://example.invalid'); } catch { threw = true; }
+  assert(threw && netAttempts.length === 1, 'la guarda está activa (una llamada de control se intercepta)');
+  netAttempts.length = 0;
 });
 
 // ── Tabla del reporte ──
