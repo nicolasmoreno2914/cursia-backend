@@ -1,0 +1,140 @@
+{
+  "_note": "Medidas de solo lectura de 3 cursos reales de staging (.mbz descargados): palabras, preguntas, tarjetas y audio. Sin contenido. Los videos son de YouTube (no están en el .mbz): su duración se infiere del plan de preguntas (n = clamp(round(d/100),3,8) + 2 pausas IV v2).",
+  "courses": [
+    {
+      "courseId": 616,
+      "frameWords": 931,
+      "libroWords": 11845,
+      "welcomeAudioSeconds": 64.2,
+      "examQuestionsByModule": [
+        17,
+        17
+      ],
+      "finalExamQuestions": 33,
+      "chapters": [
+        {
+          "module": 1,
+          "pageWords": 2246,
+          "videoInteractions": 9,
+          "activityType": "H5P.QuestionSet",
+          "activityItems": 8,
+          "reviewCards": 9
+        },
+        {
+          "module": 1,
+          "pageWords": 2305,
+          "videoInteractions": 8,
+          "activityType": "H5P.QuestionSet",
+          "activityItems": 8,
+          "reviewCards": 9
+        },
+        {
+          "module": 2,
+          "pageWords": 2709,
+          "videoInteractions": 8,
+          "activityType": "H5P.QuestionSet",
+          "activityItems": 8,
+          "reviewCards": 9
+        },
+        {
+          "module": 2,
+          "pageWords": 1932,
+          "videoInteractions": 7,
+          "activityType": "H5P.QuestionSet",
+          "activityItems": 8,
+          "reviewCards": 10
+        }
+      ]
+    },
+    {
+      "courseId": 583,
+      "frameWords": 939,
+      "libroWords": 11321,
+      "welcomeAudioSeconds": 52.0,
+      "examQuestionsByModule": [
+        17,
+        17
+      ],
+      "finalExamQuestions": 33,
+      "chapters": [
+        {
+          "module": 1,
+          "pageWords": 2405,
+          "videoInteractions": 9,
+          "activityType": "H5P.DragText",
+          "activityItems": 6,
+          "reviewCards": 10
+        },
+        {
+          "module": 1,
+          "pageWords": 1847,
+          "videoInteractions": 7,
+          "activityType": "H5P.QuestionSet",
+          "activityItems": 8,
+          "reviewCards": 10
+        },
+        {
+          "module": 2,
+          "pageWords": 2372,
+          "videoInteractions": 8,
+          "activityType": "H5P.QuestionSet",
+          "activityItems": 8,
+          "reviewCards": 10
+        },
+        {
+          "module": 2,
+          "pageWords": 1861,
+          "videoInteractions": 9,
+          "activityType": "H5P.BranchingScenario",
+          "activityItems": 5,
+          "reviewCards": 10
+        }
+      ]
+    },
+    {
+      "courseId": 542,
+      "frameWords": 944,
+      "libroWords": 12018,
+      "welcomeAudioSeconds": 60.4,
+      "examQuestionsByModule": [
+        17,
+        17
+      ],
+      "finalExamQuestions": 33,
+      "chapters": [
+        {
+          "module": 1,
+          "pageWords": 2441,
+          "videoInteractions": 8,
+          "activityType": "H5P.QuestionSet",
+          "activityItems": 8,
+          "reviewCards": 8
+        },
+        {
+          "module": 1,
+          "pageWords": 2557,
+          "videoInteractions": 7,
+          "activityType": "H5P.QuestionSet",
+          "activityItems": 7,
+          "reviewCards": 10
+        },
+        {
+          "module": 2,
+          "pageWords": 2365,
+          "videoInteractions": 7,
+          "activityType": "H5P.BranchingScenario",
+          "activityItems": 4,
+          "reviewCards": 8
+        },
+        {
+          "module": 2,
+          "pageWords": 1976,
+          "videoInteractions": 8,
+          "activityType": "H5P.QuestionSet",
+          "activityItems": 7,
+          "reviewCards": 10
+        }
+      ]
+    }
+  ]
+}

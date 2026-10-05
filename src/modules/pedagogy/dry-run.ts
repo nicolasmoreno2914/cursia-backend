@@ -18,6 +18,7 @@ import {
 } from '../generation-manifests/generation-manifest-builder';
 import type { ActivityTypeRulesVersion } from '../generation-manifests/activity-type-rules';
 import { estimateCost } from '../finops/estimator';
+import { estimateCourseStudyTime, StudyTimeEstimate, studyTimeInputFromManifest } from '../study-time';
 import { ITEM_TYPE_OPERATIONS, isFinopsItemType, providerOfOperation } from '../finops/operations';
 import { estimateItemsForRun } from '../finops/run-budget';
 import { usageModelPriorsV1 } from '../finops/usage-model';
@@ -100,6 +101,8 @@ export interface DryRunSide {
   manifestSha256: string;
   manifestErrors: { code: string; message: string; key?: string }[];
   providers: ProviderPlan;
+  /** Motor de carga horaria: tiempo de estudio PLANIFICADO (modelo study-time; nada se genera). */
+  studyTime: StudyTimeEstimate;
 }
 
 export interface DryRunChapterRow {
@@ -168,6 +171,8 @@ export interface DryRunResult {
     itemsWithDesign: number;
     totals: { baseline: Record<string, number>; pedagogical: Record<string, number> | null };
     estimateExpectedUsd: { baseline: string | null; pedagogical: string | null };
+    /** Horas de estudio estimadas (modelo study-time). */
+    estimatedHours: { baseline: number; pedagogical: number | null };
     summary: string[];
   };
   appliedRules: AppliedRule[];
@@ -341,6 +346,7 @@ function side(snapshot: BlueprintSnapshotV2, activityTypeRules: ActivityTypeRule
     manifestSha256: manifestSha256(manifest),
     manifestErrors: validateGenerationManifestV3(manifest, snapshot, source),
     providers: providerPlanFor(manifest),
+    studyTime: estimateCourseStudyTime(studyTimeInputFromManifest(manifest, snapshot)),
   };
 }
 
@@ -455,6 +461,7 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
       itemsWithDesign,
       totals: { baseline: { ...(baseline.manifest.totals as any) }, pedagogical: pedagogical ? { ...(pedagogical.manifest.totals as any) } : null },
       estimateExpectedUsd: { baseline: baseline.providers.estimateUsd?.expected ?? null, pedagogical: pedagogical?.providers.estimateUsd?.expected ?? null },
+      estimatedHours: { baseline: baseline.studyTime.courseEstimatedHours, pedagogical: pedagogical ? pedagogical.studyTime.courseEstimatedHours : null },
       summary,
     },
     appliedRules: rules ? rules.applied : [],

@@ -34,6 +34,7 @@ import { formatDurationEs, formatDurationShortEs } from '../../package/audio';
 import { H5pActivityTypeV2, resolveActivityType } from './activity-type';
 import { displayStructureTitle } from '../course-structure/structure-titles';
 import { courseCountNumbers } from './intro-schemas';
+import { estimateCourseStudyTime, StudyTimeEstimate } from '../study-time/time-model';
 
 export const COURSE_FACTS_VERSION = 1;
 export const HOURS_SOURCE_LABEL = 'definida por la institución';
@@ -117,7 +118,7 @@ export interface ChapterFacts {
   activityType: H5pActivityTypeV2 | null;
   slideCount: number;
   /**
-   * P3: minutos estimados del capítulo (estimateChapterMinutes) desde las palabras MEDIDAS del
+   * P3: minutos estimados del capítulo (modelo study-time, redondeados a 5) desde las palabras MEDIDAS del
    * experience + diapositivas + video real + actividad. Ausente si el empaque no informó las palabras.
    */
   estimatedMinutes?: number;
@@ -175,6 +176,11 @@ export interface CourseFacts {
   };
   libro: { wordCount: number; hasBibliography: boolean };
   hours: { value: number; source: string } | null;
+  /**
+   * Motor de carga horaria: tiempo de estudio estimado del curso (modelo study-time con las medidas del
+   * paquete). Solo si el empaque informó las palabras del experience. No se imprime en el shell.
+   */
+  studyTime?: { rulesVersion: number; courseEstimatedMinutes: number; courseEstimatedHours: number } | null;
 }
 
 function fail(msg: string): never {
@@ -231,6 +237,8 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
   const chapters: ChapterFacts[] = [];
   const modules: ModuleFacts[] = [];
   const knownChapterIds = new Set<string>();
+  // Palabras que muestra cada capítulo (P3) → minutos con el modelo de tiempo, después de saber qué capítulos llevan «Repaso».
+  const shownWords = new Map<string, { words: number; videoSeconds?: number }>();
   for (const mm of manifest.modules) {
     const sm = bp.modules.find((m) => m.id === mm.moduleId);
     if (!sm) fail(`módulo ${mm.moduleId} del Manifest ausente en el Blueprint`);
@@ -276,7 +284,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
         if (words < 1) fail(`el experience del capítulo ${mc.chapterNumber} no tiene palabras medidas`);
         const vs = artifacts.videoSecondsByChapter?.[mc.chapterId];
         if (vs !== undefined && (!Number.isFinite(vs) || vs <= 0)) fail(`duración del video del capítulo ${mc.chapterNumber} inválida (${JSON.stringify(vs)})`);
-        ch.estimatedMinutes = estimateChapterMinutes({ words, slideCount: ch.slideCount, videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled, videoSeconds: ch.videoEnabled ? vs : undefined });
+        shownWords.set(mc.chapterId, { words, videoSeconds: ch.videoEnabled ? vs : undefined });
       }
     });
     const q = artifacts.examQuestionCountByModule?.[mm.moduleId];
@@ -355,6 +363,52 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
   });
 
   const libroWordCount = posInt(artifacts.libroWordCount, 'libroWordCount');
+  // Motor de carga horaria: el tiempo de cada capítulo y del curso sale del modelo único (study-time) con las
+  // MEDIDAS del paquete; lo no medido (preguntas de la actividad, tarjetas, textos del marco) usa el planificado.
+  let studyTime: CourseFacts['studyTime'] = null;
+  if (artifacts.experienceWordsByChapter) {
+    const libroPerChapter = Math.max(1, Math.round(libroWordCount / chapters.length));
+    const byModule = new Map<string, ChapterFacts[]>();
+    for (const ch of chapters) byModule.set(ch.moduleId, [...(byModule.get(ch.moduleId) ?? []), ch]);
+    let est: StudyTimeEstimate;
+    try {
+      est = estimateCourseStudyTime({
+        frame: true,
+        welcomeAudio: true,
+        welcomeAudioSeconds: welcomeSeconds,
+        forum: true,
+        finalExam: features.finalExam,
+        ...(finalQ !== null ? { finalExamQuestions: finalQ } : {}),
+        modules: modules.map((m) => ({
+          moduleId: m.id,
+          intro: true,
+          exam: m.examEnabled,
+          ...(m.examQuestionCount !== null ? { examQuestions: m.examQuestionCount } : {}),
+          chapters: (byModule.get(m.id) ?? []).map((ch) => {
+            const sw = shownWords.get(ch.id) as { words: number; videoSeconds?: number };
+            return {
+              chapterId: ch.id,
+              pageWords: sw.words,
+              libro: true,
+              libroWords: libroPerChapter,
+              presentation: true,
+              slides: ch.slideCount,
+              video: ch.videoEnabled,
+              ...(sw.videoSeconds !== undefined ? { videoSeconds: sw.videoSeconds } : {}),
+              ivAdvanced: features.ivAdvanced === 1,
+              activity: ch.activityEnabled,
+              review: ch.reviewCards === true,
+            };
+          }),
+        })),
+      });
+    } catch (e) {
+      fail(`tiempo de estudio: ${(e as Error).message}`);
+    }
+    const byId = new Map(est.modules.flatMap((m) => m.chapters.map((c) => [c.chapterId, c.displayMinutes] as const)));
+    for (const ch of chapters) ch.estimatedMinutes = byId.get(ch.id);
+    studyTime = { rulesVersion: est.rulesVersion, courseEstimatedMinutes: est.courseEstimatedMinutes, courseEstimatedHours: est.courseEstimatedHours };
+  }
   let hours: CourseFacts['hours'] = null;
   if (input.hours !== undefined && input.hours !== null) {
     if (typeof input.hours !== 'number' || !Number.isFinite(input.hours) || input.hours <= 0) fail('hours debe ser un número > 0');
@@ -388,6 +442,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
     audio: { welcomeSeconds, audiobookSeconds: offset, audiobookParts },
     libro: { wordCount: libroWordCount, hasBibliography: artifacts.libroHasBibliography !== false },
     hours,
+    ...(studyTime ? { studyTime } : {}),
   };
   // Sanidad contra los totales del Manifest (dos fuentes, un número).
   const t = manifest.totals;
@@ -399,21 +454,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
   return deepFreeze(facts);
 }
 
-// ─── P3: tiempo estimado del capítulo ───────────────────────────────────────
-
-/** Ritmo de lectura (palabras/min) y tiempos fijos del estimado (constantes del producto, no del LLM). */
-export const CHAPTER_MINUTES_RULES = Object.freeze({ wordsPerMinute: 180, minutesPerSlide: 0.5, videoMinutes: 6, activityMinutes: 8, roundTo: 5, min: 5 });
-
-/**
- * Minutos estimados de un capítulo, redondeados a 5 (mínimo 5). Determinista. El video usa su duración
- * MEDIDA (`videoSeconds`) cuando el empaque la informa; si no, el estimado fijo.
- */
-export function estimateChapterMinutes(x: { words: number; slideCount: number; videoEnabled: boolean; activityEnabled: boolean; videoSeconds?: number }): number {
-  const R = CHAPTER_MINUTES_RULES;
-  const video = !x.videoEnabled ? 0 : x.videoSeconds !== undefined ? x.videoSeconds / 60 : R.videoMinutes;
-  const raw = x.words / R.wordsPerMinute + x.slideCount * R.minutesPerSlide + video + (x.activityEnabled ? R.activityMinutes : 0);
-  return Math.max(R.min, Math.round(raw / R.roundTo) * R.roundTo);
-}
+// ─── P3: palabras del experience (el tiempo lo calcula el modelo único de study-time) ───
 
 const NON_TEXT_KEYS = new Set(['type', 'variant', 'kind', 'vcSchemaVersion', 'chapterId']);
 
