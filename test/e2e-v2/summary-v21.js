@@ -26,8 +26,9 @@ if (v3) {
   add('E2E v3: FinOps (ledger, estimates, contadores)', by(/^v3-finops$|^v3-red-final$/));
   if (v3.h5p2 && v3.h5p2.skipped) rows.push(['E2E v3: H5P v2 (E5, rules 2)', 0, 0, `omitido: ${v3.h5p2.reason}`]);
   else add('E2E v3: H5P v2 (E5, rules 2: BS + «Repaso» + IV v2)', by(/^v3-E5-h5p2-/));
-  // Motor pedagógico V1: E6 (perfil → Blueprint → Manifest con diseño → run mock → empaque). Corre junto con E5.
-  if (!(v3.h5p2 && v3.h5p2.skipped)) add('E2E v3: motor pedagógico (E6: perfil → Manifest con diseño → run mock → empaque)', by(/^v3-E6-pedagogia-/));
+  // Motor pedagógico: E6 (perfil → Blueprint → Manifest con diseño → prompts/configuración de cada generador con LLM y
+  // proveedores FALSOS → empaque). Corre junto con E5.
+  if (!(v3.h5p2 && v3.h5p2.skipped)) add('E2E v3: motor pedagógico (E6: perfil → Manifest con diseño → prompts y proveedores falsos → empaque)', by(/^v3-E6-pedagogia-/));
   add('Moodle 4.5: restore + inspección + notas simuladas', by(/^moodle-/));
   if (v3.aborted) rows.push(['E2E v3', 0, 1, `ABORT: ${v3.aborted}`]);
 } else rows.push(['E2E v3', 0, 1, 'sin results-v3.json']);

@@ -71,6 +71,7 @@ import {
   videoClaimFacts,
 } from '../course-shell';
 import { V3_ARTIFACT_TEXT_READER, V3ArtifactTextReader } from './v3-artifact-reader';
+import { ItemPedagogyBrief, buildItemPedagogyBrief } from '../pedagogy/generator-directives';
 import { EXAM_BANK_DRAFT_ARTIFACT_TYPE, clearExamBankDraft, recordExamBankDraft } from './exam-bank-draft';
 import { FailureSource, classifyFailure, isValidFailureCode } from '../reliability/failure-classifier';
 import { executorKindFor, openItemAttempt, recordItemCompleted, recordItemFailure } from '../reliability/attempt-log';
@@ -230,6 +231,11 @@ export interface ClaimedItem {
    * siguen llegando en `dependencyArtifacts`, como en v2.
    */
   claimPayload?: ClaimPayloadV3;
+  /**
+   * Motor pedagógico Fase 2: indicaciones del diseño pedagógico para el generador de ESTE item
+   * (generator-directives.ts). Solo en items cuyo Manifest trae `design`; ausente = prompt de siempre.
+   */
+  pedagogy?: ItemPedagogyBrief;
 }
 
 export interface ClaimPayloadV3 {
@@ -283,7 +289,12 @@ export interface ClaimOptions {
   leaseSeconds: number;
   /** Presente → camino navegador: solo runs de ese dueño. Ausente → worker interno. */
   ownerId?: string;
+  /** Camino navegador: capacidades que declara el ejecutor (query `features`), p. ej. PEDAGOGY_BRIEF_FEATURE. */
+  executorFeatures?: string[];
 }
+
+/** Motor pedagógico Fase 2: el ejecutor del navegador aplica `ClaimedItem.pedagogy` a sus prompts. */
+export const PEDAGOGY_BRIEF_FEATURE = 'pedagogy-brief-1';
 
 /**
  * REL lease de ejecución: resultado del claim con el motivo cuando no se entrega nada por el lease
@@ -451,6 +462,7 @@ export class SchedulerService {
       if (!UUID_RE.test(opts.runId)) throw new BadRequestException('runId inválido');
       if (opts.ownerId !== undefined && opts.ownerId !== null) {
         await this.assertBrowserTypesMatchRun(opts.runId, opts.ownerId, types);
+        await this.assertExecutorAppliesPedagogy(opts.runId, opts.ownerId, opts.executorFeatures ?? []);
       }
       // M6: un item cuyo payload no se puede armar se marca failed dentro del
       // claim; se sigue con el próximo candidato en vez de devolver "nada".
@@ -618,6 +630,30 @@ export class SchedulerService {
     if (!UUID_RE.test(String(runId))) throw new BadRequestException('runId inválido');
     if (!(await execLeaseSchemaReady(this.dataSource))) return { ok: true, released: false };
     return { ok: true, released: await releaseRunExecLease(this.dataSource, runId, executorId, ownerId) };
+  }
+
+  /**
+   * Motor pedagógico Fase 2 (review I2): un run con diseño pedagógico (Manifest con features.pedagogy) solo lo
+   * ejecuta un navegador que aplica el brief del claim. Una pestaña con una versión anterior de Cursia lo
+   * ignoraría y generaría (y pagaría) cada recurso sin el enfoque, en silencio. Se rechaza ANTES de reclamar
+   * nada, con el mismo 409 rules_version_mismatch que esa versión ya muestra como pausa visible («recarga la
+   * página»). Runs sin pedagogía: sin cambios.
+   */
+  private async assertExecutorAppliesPedagogy(runId: string, ownerId: string, features: string[]): Promise<void> {
+    if (features.includes(PEDAGOGY_BRIEF_FEATURE)) return;
+    const [row] = await this.dataSource.query(
+      `select (m.manifest_json->'features'->'pedagogy') is not null as pedagogy
+         from public.production_jobs pj
+         join public.course_generation_manifests m on m.id::text = pj.input_payload->>'manifestId'
+        where pj.id = $1 and pj.execution_mode = 'dynamic_generation' and pj.owner_id = $2`,
+      [runId, ownerId],
+    );
+    if (!row || row.pedagogy !== true) return;
+    const message =
+      `rules_version_mismatch: la ejecución ${runId} tiene diseño pedagógico y este navegador ejecuta una versión ` +
+      'anterior de Cursia que no lo aplica a los recursos. Recarga la página para continuar; con esta versión el ' +
+      'curso se generaría sin el enfoque pedagógico elegido.';
+    throw new ConflictException({ message, code: 'executor_outdated_pedagogy', runId });
   }
 
   /**
@@ -1729,6 +1765,18 @@ export class SchedulerService {
 
     const v3 = await this.buildClaimV3(qr, row, mItem, manifest);
 
+    // Motor pedagógico Fase 2: el diseño del item (Manifest validado arriba contra el Blueprint) → brief del generador.
+    let pedagogy: ItemPedagogyBrief | null = null;
+    if (snapshot.schemaVersion === 2 && (mItem as any).design !== undefined) {
+      try {
+        pedagogy = buildItemPedagogyBrief({ item: mItem as any, snapshot, activityTypeRules: (manifest as any).features?.activityTypeRules ?? null });
+      } catch (err) {
+        // Determinista (p. ej. un valor del diseño congelado sin texto de generador): el item falla visible y no
+        // reintentable en el claim, en vez de trabar el run con un 500 en cada claim (review M8).
+        throw new ClaimPayloadUnavailable('PEDAGOGY_DIRECTIVE_UNKNOWN', `no se pudo armar el brief pedagógico de ${row.item_key} (${err instanceof Error ? err.message : String(err)})`);
+      }
+    }
+
     return {
       itemRunId: row.id,
       runId: job.id,
@@ -1778,6 +1826,7 @@ export class SchedulerService {
         storagePath: a.storage_path,
       })),
       ...(v3 ? { claimPayload: v3 } : {}),
+      ...(pedagogy ? { pedagogy } : {}),
     };
   }
 

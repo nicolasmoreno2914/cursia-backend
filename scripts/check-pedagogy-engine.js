@@ -226,24 +226,35 @@ async function pureChecks() {
       eq(s.course.pedagogy.roleTargets, JSON.parse(JSON.stringify(rules.roleTargets)), `${a}: variaciones por rol a nivel curso`);
     }
   });
-  await check('Review I2: reordenar o agregar capítulos NO cambia el diseño congelado ni las huellas de los capítulos que no cambiaron', () => {
-    const rules = P.deriveDesignRules(profileOf('competencias')); // tiene variación por rol (cierre → simular)
+  await check('Review I2 + Fase 2 (N2/I1): reordenar o agregar capítulos no cambia el diseño congelado ni la huella del contenido; solo cambia la huella del trabajo cuyo diseño efectivo cambió por el rol', () => {
+    const rules = P.deriveDesignRules(profileOf('competencias')); // variación por rol: cierre del módulo → simular
     const build = (st) => P.applyPedagogyToSnapshot(P.snapshotFromStructure(st), rules);
     const s0 = build(RCP);
     const f0 = fp.computeFingerprintsV3(s0);
     const re = JSON.parse(JSON.stringify(RCP));
     re.modules[0].chapters.reverse();
-    const f1 = fp.computeFingerprintsV3(build(re));
+    const s1 = build(re);
+    const f1 = fp.computeFingerprintsV3(s1);
     const ids = s0.modules.flatMap((m) => m.chapters.map((c) => c.id));
     for (const id of ids) eq(f1.content.get(id).own, f0.content.get(id).own, `reorden: own de ${id}`);
     eq([f1.courseOutline, f1.finalExam], [f0.courseOutline, f0.finalExam], 'reorden: outline y final');
+    const types = ['content', 'experience', 'presentation', 'video', 'video_interactions', 'activity', 'audiobook_chapter'];
+    const changed = [];
+    for (const id of ids) for (const t of types) {
+      const key = `${t}:${id}`;
+      const ex = t === 'activity' ? { variant: 'h5p' } : t === 'video_interactions' ? { videoIdentity: 'v' } : {};
+      if (fp.itemFingerprintV3(f0, key, ex) !== fp.itemFingerprintV3(f1, key, ex)) changed.push(key);
+    }
+    const first = '8a0d1f00-0000-4000-8000-000000000011', last = '8a0d1f00-0000-4000-8000-000000000013';
+    eq(changed.sort(), [`activity:${first}`, `activity:${last}`].sort(), 'reorden: solo las actividades del viejo y del nuevo cierre (simular ↔ aplicar)');
     const app = JSON.parse(JSON.stringify(RCP));
     app.modules[0].chapters.push({ id: '8a0d1f00-0000-4000-8000-000000000014', title: 'Capítulo agregado', objective: 'Aplicar lo anterior en un simulacro', videoEnabled: true, activityEnabled: true });
-    const f2 = fp.computeFingerprintsV3(build(app));
+    const s2 = build(app);
+    const f2 = fp.computeFingerprintsV3(s2);
     for (const id of ids) eq(f2.content.get(id).own, f0.content.get(id).own, `agregado: own de ${id}`);
-    // El rol sí cambia en el Manifest (como la numeración): el viejo cierre pasa a desarrollo.
-    const old = '8a0d1f00-0000-4000-8000-000000000013';
-    eq([P.effectiveChapterDesign(s0, old).role, P.effectiveChapterDesign(build(app), old).role], ['module_closing', 'core'], 'rol efectivo recalculado');
+    assert(fp.itemFingerprintV3(f2, `activity:${last}`, { variant: 'h5p' }) !== fp.itemFingerprintV3(f0, `activity:${last}`, { variant: 'h5p' }), 'el viejo cierre (ahora desarrollo) cambia de actividad');
+    eq(fp.itemFingerprintV3(f2, `content:${last}`), fp.itemFingerprintV3(f0, `content:${last}`), 'pero su contenido no');
+    eq([P.effectiveChapterDesign(s0, last).role, P.effectiveChapterDesign(s2, last).role], ['module_closing', 'core'], 'rol efectivo recalculado');
   });
   await check('Review I3: cambios del perfil que no tocan el diseño (descripción del estudiante, resultados, origen) no cambian ninguna huella', () => {
     const a = profileOf('significativo');
