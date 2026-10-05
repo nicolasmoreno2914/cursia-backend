@@ -35,7 +35,7 @@ import {
   proposeStructureAdjustments,
 } from './pedagogical-blueprint';
 import { ItemPedagogyBrief, OverrideLevel, PEDAGOGY_GENERATOR_COVERAGE, buildItemPedagogyBrief } from './generator-directives';
-import { PedagogicalProfile, isEmptyPedagogicalProfile, normalizePedagogicalProfile } from './pedagogy-profile';
+import { PedagogicalProfile, isEmptyPedagogicalProfile, normalizePedagogicalProfile, profileTargetHours } from './pedagogy-profile';
 import { PEDAGOGY_ENGINE_VERSION } from './vocabulary';
 
 /**
@@ -157,6 +157,10 @@ export interface DryRunResult {
   profile: PedagogicalProfile | null;
   profileEmpty: boolean;
   rules: DesignRules | null;
+  /** Motor de carga horaria: horas objetivo del curso (null = sin objetivo, comportamiento anterior). */
+  targetHours: number | null;
+  /** Objetivo vs. estimado de la vista final (pedagógica o línea base). null sin objetivo. */
+  workload: { targetHours: number; estimatedHours: number; deltaHours: number } | null;
   baseline: DryRunSide;
   pedagogical: DryRunSide | null;
   structureChanges: StructureChange[];
@@ -294,6 +298,12 @@ function snapshotFromSnapshot(s: BlueprintSnapshotV2): BlueprintSnapshotV2 {
   return buildBlueprintSnapshotV2(rows.course, rows.modules, rows.chapters);
 }
 
+/** El mismo snapshot con `course.targetHours` (pasa por el builder: orden canónico y validación). */
+export function withTargetHours(s: BlueprintSnapshotV2, targetHours: number | null): BlueprintSnapshotV2 {
+  const rows = snapshotV2ToRows(s);
+  return buildBlueprintSnapshotV2({ ...rows.course, targetHours }, rows.modules, rows.chapters, rows.pedagogy);
+}
+
 let catalogCache: any[] | null = null;
 function seedCatalog(): any[] {
   if (!catalogCache) {
@@ -356,7 +366,11 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
   if (activityTypeRules !== 0 && activityTypeRules !== 1 && activityTypeRules !== 2) {
     throw new Error(`DRY_RUN_INVALID: activityTypeRules ${JSON.stringify(activityTypeRules)} (0 | 1 | 2)`);
   }
-  const base = isSnapshot(input.structure) ? snapshotFromSnapshot(input.structure) : snapshotFromStructure(input.structure as DryRunStructureInput);
+  const base0 = isSnapshot(input.structure) ? snapshotFromSnapshot(input.structure) : snapshotFromStructure(input.structure as DryRunStructureInput);
+  // Motor de carga horaria: el objetivo de horas viene del perfil (con o sin enfoque); sin él, el del snapshot recibido.
+  const profileHours = profileTargetHours(input.profile);
+  const base = profileHours !== null ? withTargetHours(base0, profileHours) : base0;
+  const targetHours = base.course.targetHours ?? null;
   const profileEmpty = isEmptyPedagogicalProfile(input.profile);
   const profile = profileEmpty ? null : normalizePedagogicalProfile(input.profile, registry);
   const rules = profile ? deriveDesignRulesOrNull(profile, registry) : null;
@@ -442,6 +456,14 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
     profile,
     profileEmpty,
     rules,
+    targetHours,
+    workload: targetHours === null
+      ? null
+      : {
+        targetHours,
+        estimatedHours: view.studyTime.courseEstimatedHours,
+        deltaHours: Math.round((view.studyTime.courseEstimatedHours - targetHours) * 10) / 10,
+      },
     baseline,
     pedagogical,
     structureChanges,

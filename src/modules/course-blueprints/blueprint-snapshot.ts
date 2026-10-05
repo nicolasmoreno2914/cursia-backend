@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { isValidTargetHours } from '../study-time/target-hours';
 import {
   BlueprintPedagogyInput,
   ChapterDesign,
@@ -347,6 +348,11 @@ export interface BlueprintCourseInputV2 {
    * NULL en cursos anteriores (= apagado), default true en cursos nuevos. Solo `true` entra al snapshot.
    */
   reviewCards?: boolean | null;
+  /**
+   * Motor de carga horaria: horas de estudio objetivo (del perfil del curso). null/ausente = sin objetivo:
+   * el snapshot no lleva la clave y conserva su sha.
+   */
+  targetHours?: number | null;
 }
 
 export interface BlueprintChapterV2 extends BlueprintChapter {
@@ -383,6 +389,11 @@ export interface BlueprintSnapshotV2 {
      * La clave existe SOLO cuando está encendido: los snapshots sin ella conservan su sha.
      */
     reviewCards?: true;
+    /**
+     * Motor de carga horaria: horas de estudio objetivo del curso (restricción del curso). La clave existe
+     * SOLO con objetivo: los snapshots sin ella conservan su sha. No cambia los items del Manifest.
+     */
+    targetHours?: number;
     /**
      * Motor pedagógico V1: resumen del diseño pedagógico (enfoques, estrategia de evaluación…).
      * La clave existe SOLO con perfil pedagógico: los snapshots sin ella conservan su sha.
@@ -434,6 +445,9 @@ export function buildBlueprintSnapshotV2(
   if (course.reviewCards !== undefined && course.reviewCards !== null && typeof course.reviewCards !== 'boolean') {
     throw new Error(`BLUEPRINT_V2_INVALID_INPUT: course.reviewCards debe ser boolean o null (fue ${JSON.stringify(course.reviewCards)})`);
   }
+  if (course.targetHours !== undefined && course.targetHours !== null && !isValidTargetHours(course.targetHours)) {
+    throw new Error(`BLUEPRINT_V2_INVALID_INPUT: course.targetHours debe ser un número de 1 a 500 en pasos de 0,5 o null (fue ${JSON.stringify(course.targetHours)})`);
+  }
   const badChapter = chapters.find((c) => typeof c.activity_enabled !== 'boolean');
   if (badChapter) {
     throw new Error(
@@ -473,6 +487,7 @@ export function buildBlueprintSnapshotV2(
       finalExam: course.finalExam,
       activityEngine: course.activityEngine,
       ...(course.reviewCards === true ? { reviewCards: true as const } : {}),
+      ...(course.targetHours !== undefined && course.targetHours !== null ? { targetHours: course.targetHours } : {}),
       ...(coursePedagogy ? { pedagogy: coursePedagogy } : {}),
     },
     modules: sortedModules.map((m) => {
@@ -561,6 +576,7 @@ export function snapshotV2ToRows(s: any): {
       finalExam: s.course.finalExam,
       activityEngine: s.course.activityEngine,
       ...(s.course.reviewCards !== undefined ? { reviewCards: s.course.reviewCards } : {}),
+      ...(s.course.targetHours !== undefined ? { targetHours: s.course.targetHours } : {}),
     },
     modules,
     chapters,

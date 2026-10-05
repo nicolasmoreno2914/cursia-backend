@@ -11,6 +11,7 @@ import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
 import { lockPedagogyInput } from '../pedagogy/pedagogical-blueprint';
 import { loadCurrentPedagogicalProfile } from '../pedagogy/pedagogy-db';
+import { profileTargetHours } from '../pedagogy/pedagogy-profile';
 import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import {
   BlueprintSnapshotV1,
@@ -335,6 +336,8 @@ export class CourseBlueprintsService {
         );
       }
 
+      // Motor pedagógico V1 / motor de carga horaria: perfil vigente (diseño + horas objetivo).
+      const pedagogyProfile = await loadCurrentPedagogicalProfile(qr, courseId);
       const courseRef = {
         id: course.id,
         title: course.title,
@@ -342,6 +345,8 @@ export class CourseBlueprintsService {
         activityEngine: course.activity_engine,
         // EV6 H5P v2: NULL (curso anterior / columna sin migrar) = apagado; solo true entra al snapshot.
         reviewCards: course.review_cards_enabled === true,
+        // Sin objetivo de horas: la clave no entra al snapshot (sha de siempre).
+        targetHours: profileTargetHours(pedagogyProfile ? pedagogyProfile.profile : null),
       };
       const errors = validateBlueprintInputV2(courseRef, modules, chapters);
       if (errors.length > 0) {
@@ -364,7 +369,6 @@ export class CourseBlueprintsService {
         });
       }
 
-      const pedagogyProfile = await loadCurrentPedagogicalProfile(qr, courseId);
       const plain = buildBlueprintSnapshotV2(courseRef, modules, chapters);
       const pedagogy = lockPedagogyInput(plain, pedagogyProfile ? pedagogyProfile.profile : null);
       const snapshot = pedagogy ? buildBlueprintSnapshotV2(courseRef, modules, chapters, pedagogy) : plain;

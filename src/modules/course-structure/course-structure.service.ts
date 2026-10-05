@@ -1,6 +1,7 @@
 import { Injectable, BadRequestException, NotFoundException, ConflictException, Logger, OnModuleInit, ServiceUnavailableException } from '@nestjs/common';
 import { lockPedagogyInput } from '../pedagogy/pedagogical-blueprint';
 import { parseStoredPedagogicalProfile } from '../pedagogy/pedagogy-db';
+import { profileTargetHours } from '../pedagogy/pedagogy-profile';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
 import { CourseModule as CourseModuleEntity } from './entities/course-module.entity';
@@ -420,7 +421,11 @@ export class CourseStructureService implements OnModuleInit {
             video_enabled: c.videoEnabled, activity_enabled: activityByChapter.get(c.id) as boolean,
           })),
         );
-        const courseV2 = { id: course.id, title: course.title, finalExam: settings.finalExam, activityEngine: settings.activityEngine, reviewCards: settings.reviewCardsEnabled === true };
+        const courseV2 = {
+          id: course.id, title: course.title, finalExam: settings.finalExam, activityEngine: settings.activityEngine, reviewCards: settings.reviewCardsEnabled === true,
+          // Motor de carga horaria: las horas objetivo del perfil también entran al snapshot del lock.
+          targetHours: profileTargetHours(pedagogyProfile),
+        };
         const plainV2 = buildBlueprintSnapshotV2(courseV2, rawModulesV2, rawChaptersV2);
         const pedagogy = lockPedagogyInput(plainV2, pedagogyProfile);
         const snapshotV2 = pedagogy ? buildBlueprintSnapshotV2(courseV2, rawModulesV2, rawChaptersV2, pedagogy) : plainV2;
