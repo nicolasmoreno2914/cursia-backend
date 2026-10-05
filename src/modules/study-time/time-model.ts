@@ -141,8 +141,8 @@ export interface StudyTimeCourseInput {
 
 export interface StudyTimeChapterEstimate {
   chapterId: string;
-  /** Minutos exactos (2 decimales). */
-  minutes: number;
+  /** Minutos exactos del capítulo (2 decimales). */
+  chapterEstimatedMinutes: number;
   /** Lo que se muestra: redondeado a 5 (mínimo 5). */
   displayMinutes: number;
   resources: StudyTimeResource[];
@@ -150,7 +150,8 @@ export interface StudyTimeChapterEstimate {
 
 export interface StudyTimeModuleEstimate {
   moduleId: string;
-  minutes: number;
+  /** Minutos exactos del módulo: apertura + capítulos + examen (2 decimales). */
+  moduleEstimatedMinutes: number;
   resources: StudyTimeResource[];
   chapters: StudyTimeChapterEstimate[];
 }
@@ -182,7 +183,8 @@ const r2 = (n: number) => Math.round(n * 100) / 100;
 const fmt = (n: number) => String(r2(n)).replace('.', ',');
 
 function measure(v: number | undefined, planned: number, what: string, opts: { integer?: boolean; allowZero?: boolean } = {}): { value: number; measured: boolean } {
-  if (v === undefined || v === null) return { value: planned, measured: false };
+  // Solo `undefined` es «no medido»: un null (u otro valor) es una medida rota y falla fuerte.
+  if (v === undefined) return { value: planned, measured: false };
   const okNum = typeof v === 'number' && Number.isFinite(v) && (opts.allowZero ? v >= 0 : v > 0) && (!opts.integer || Number.isInteger(v));
   if (!okNum) throw new StudyTimeError(`${what} inválido (${JSON.stringify(v)})`);
   return { value: v, measured: true };
@@ -238,8 +240,8 @@ export function estimateChapterStudyTime(ch: StudyTimeChapterInput): StudyTimeCh
     }
     out.push(res('application_activity', ch.applicationMinutes, `nivel de ${ch.applicationMinutes} min fijado por Cursia`, false));
   }
-  const minutes = r2(out.reduce((a, x) => a + x.minutes, 0));
-  return { chapterId: ch.chapterId, minutes, displayMinutes: displayChapterMinutes(minutes), resources: out };
+  const chapterEstimatedMinutes = r2(out.reduce((a, x) => a + x.minutes, 0));
+  return { chapterId: ch.chapterId, chapterEstimatedMinutes, displayMinutes: displayChapterMinutes(chapterEstimatedMinutes), resources: out };
 }
 
 /** Redondeo para mostrar el tiempo de un capítulo (a 5 min, mínimo 5). */
@@ -276,8 +278,8 @@ export function estimateCourseStudyTime(input: StudyTimeCourseInput): StudyTimeE
       const q = measure(m.examQuestions, examSlotSplit(m.chapters.length).total, `examQuestions del módulo ${m.moduleId}`, { integer: true });
       mr.push(res('module_exam', q.value * R.minutesPerExamQuestion, `${q.value} preguntas × ${fmt(R.minutesPerExamQuestion)} min`, q.measured));
     }
-    const minutes = r2(mr.reduce((a, x) => a + x.minutes, 0) + chapters.reduce((a, c) => a + c.minutes, 0));
-    return { moduleId: m.moduleId, minutes, resources: mr, chapters };
+    const moduleEstimatedMinutes = r2(mr.reduce((a, x) => a + x.minutes, 0) + chapters.reduce((a, c) => a + c.chapterEstimatedMinutes, 0));
+    return { moduleId: m.moduleId, moduleEstimatedMinutes, resources: mr, chapters };
   });
   if (input.finalExam) {
     const q = measure(input.finalExamQuestions, finalExamSlotSplit(seenChapters.size).total, 'finalExamQuestions', { integer: true });

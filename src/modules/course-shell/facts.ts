@@ -89,6 +89,8 @@ export interface BuildCourseFactsInput {
    * `course.reviewCards` encendido; el builder los elige (experiencia con ≥ 4 tarjetas).
    */
   reviewCardsChapterIds?: readonly string[] | null;
+  /** Motor de carga horaria: tarjetas MEDIDAS de cada «Repaso» (⊆ reviewCardsChapterIds). Ausente = planificado. */
+  reviewCardCountByChapter?: Readonly<Record<string, number>> | null;
 }
 
 export interface ChapterFacts {
@@ -180,7 +182,7 @@ export interface CourseFacts {
    * Motor de carga horaria: tiempo de estudio estimado del curso (modelo study-time con las medidas del
    * paquete). Solo si el empaque informó las palabras del experience. No se imprime en el shell.
    */
-  studyTime?: { rulesVersion: number; courseEstimatedMinutes: number; courseEstimatedHours: number } | null;
+  studyTime?: { rulesVersion: number; courseEstimatedMinutes: number; courseEstimatedHours: number; usesPlannedValues: boolean };
 }
 
 function fail(msg: string): never {
@@ -365,8 +367,12 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
   const libroWordCount = posInt(artifacts.libroWordCount, 'libroWordCount');
   // Motor de carga horaria: el tiempo de cada capítulo y del curso sale del modelo único (study-time) con las
   // MEDIDAS del paquete; lo no medido (preguntas de la actividad, tarjetas, textos del marco) usa el planificado.
-  let studyTime: CourseFacts['studyTime'] = null;
+  let studyTime: CourseFacts['studyTime'];
+  const reviewCounts = input.reviewCardCountByChapter ?? {};
+  for (const id of Object.keys(reviewCounts)) if (!reviewIds.has(id)) fail(`tarjetas de «Repaso» de un capítulo sin «Repaso» (${id})`);
   if (artifacts.experienceWordsByChapter) {
+    // Aproximación documentada: el Libro compilado (palabras medidas) se reparte por igual entre los capítulos;
+    // incluye además apertura, aperturas de módulo y bibliografía (unos cientos de palabras por capítulo).
     const libroPerChapter = Math.max(1, Math.round(libroWordCount / chapters.length));
     const byModule = new Map<string, ChapterFacts[]>();
     for (const ch of chapters) byModule.set(ch.moduleId, [...(byModule.get(ch.moduleId) ?? []), ch]);
@@ -398,6 +404,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
               ivAdvanced: features.ivAdvanced === 1,
               activity: ch.activityEnabled,
               review: ch.reviewCards === true,
+              ...(reviewCounts[ch.id] !== undefined ? { reviewCards: reviewCounts[ch.id] } : {}),
             };
           }),
         })),
@@ -407,7 +414,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
     }
     const byId = new Map(est.modules.flatMap((m) => m.chapters.map((c) => [c.chapterId, c.displayMinutes] as const)));
     for (const ch of chapters) ch.estimatedMinutes = byId.get(ch.id);
-    studyTime = { rulesVersion: est.rulesVersion, courseEstimatedMinutes: est.courseEstimatedMinutes, courseEstimatedHours: est.courseEstimatedHours };
+    studyTime = { rulesVersion: est.rulesVersion, courseEstimatedMinutes: est.courseEstimatedMinutes, courseEstimatedHours: est.courseEstimatedHours, usesPlannedValues: est.usesPlannedValues };
   }
   let hours: CourseFacts['hours'] = null;
   if (input.hours !== undefined && input.hours !== null) {

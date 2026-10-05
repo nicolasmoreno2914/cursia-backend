@@ -29,6 +29,13 @@ Cursia calcula el tiempo de estudio de un estudiante típico con **una sola fuen
 
 - El audiolibro no suma: es otra forma de recorrer el Libro Guía.
 - El capítulo se muestra redondeado a 5 minutos (mínimo 5).
+- Solo `undefined` significa «no medido». Un `null` o cualquier otro valor inválido es una medida rota y falla fuerte.
+- **Salida:**
+  - por capítulo, `chapterEstimatedMinutes` (exacto) y `displayMinutes`;
+  - por módulo, `moduleEstimatedMinutes`;
+  - por curso, `courseEstimatedMinutes` y `courseEstimatedHours`;
+  - por recurso, `minutes`, la fórmula aplicada (`basis`) y si el dato es medido o planificado.
+- «Repaso» usa un solo predicado, `reviewCardsEnabledFor`. Lo comparten el modelo y el empaque (`reviewCardsApply` lo llama).
 - El curso se informa en minutos exactos y en horas con un decimal.
 - `byComponent` separa el tiempo en curso, contenido, práctica, repaso, aplicación y evaluación, para explicar de dónde salen las horas.
 
@@ -36,7 +43,24 @@ Cursia calcula el tiempo de estudio de un estudiante típico con **una sola fuen
 
 Antes, el badge «Capítulo N de T · ~X min» del paquete usaba `estimateChapterMinutes`: 180 palabras/min, video fijo de 6 min, actividad de 8 min, y no contaba el Libro, las preguntas del video ni el repaso. Por eso mostraba ~30–35 min, cuando el capítulo real lleva ~70.
 
-Esa función y `CHAPTER_MINUTES_RULES` se eliminaron. `facts` calcula el badge con el modelo único y suma `facts.studyTime`: horas del curso, que no se imprimen en el shell.
+Esa función y `CHAPTER_MINUTES_RULES` se eliminaron. `facts` calcula el badge con el modelo único y suma `facts.studyTime`, que tampoco se imprime en el shell:
+
+- horas del curso;
+- `usesPlannedValues`.
+
+**Valores medidos al empaquetar:**
+- palabras de la página;
+- diapositivas;
+- duración del video;
+- tarjetas de cada «Repaso»;
+- preguntas de cada examen;
+- duración del audio de bienvenida.
+
+**Siguen planificados:**
+- preguntas de la actividad (8): hoy el empaque no las informa por tipo;
+- palabras de las aperturas de módulo y del marco del curso.
+
+**Aproximación del Libro:** sus palabras medidas se reparten por igual entre los capítulos. Ese total incluye además la apertura, las aperturas de módulo y la bibliografía, unos cientos de palabras por capítulo.
 
 ## Dónde se ve
 
@@ -54,7 +78,7 @@ Esa función y `CHAPTER_MINUTES_RULES` se eliminaron. `facts` calcula el badge c
   - errores;
   - el plan del video igual al empaque;
   - el plan de exámenes;
-  - **3 cursos reales de staging** (medidas de solo lectura en `scripts/fixtures/study-time/staging-courses.json`: 6,4–6,6 h por curso de 2×2, 65–75 min por capítulo);
+  - **3 cursos reales de staging** (medidas de solo lectura en `scripts/fixtures/study-time/staging-courses.json`: 6,5–6,6 h por curso de 2×2, 65–75 min por capítulo). Los videos son de YouTube y su duración no está en el `.mbz`, así que se deriva de las marcas de tiempo reales de las preguntas del paquete. La prueba verifica contra el paquete que la regla de cantidad de preguntas y pausas da lo mismo;
   - dry-run;
   - la corrección del badge.
 - `scripts/check-v21-shell.js` (P3): los minutos de facts son los del modelo, con las mismas medidas.

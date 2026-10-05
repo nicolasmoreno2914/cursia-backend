@@ -12,8 +12,8 @@
 //   ST6  entradas inválidas fallan fuerte (nunca un default inventado)
 //   ST7  preguntas y pausas del video = el MISMO plan del empaque (plan.ts)
 //   ST8  preguntas de exámenes planificadas = plan de slots del banco (17 / 33 en un 2×2)
-//   ST9  3 cursos REALES de staging (medidas de solo lectura): horas por capítulo y curso; el plan de
-//        preguntas del video coincide con el paquete real
+//   ST9  3 cursos REALES de staging (medidas de solo lectura): horas por capítulo y curso; la duración del
+//        video sale de las marcas de tiempo reales y la regla de preguntas + pausas coincide con el paquete
 //   ST10 dry-run pedagógico: horas planificadas en línea base y vista pedagógica, sin proveedores
 //   ST11 la discrepancia anterior (badge ~30–35 min) queda corregida: un capítulo completo da ~70 min
 //
@@ -111,12 +111,12 @@ check('ST2 capítulo planificado completo: cada recurso con su regla y el total'
   const c = ST.estimateChapterStudyTime(fullChapter('c1'));
   const by = Object.fromEntries(c.resources.map((r) => [r.resource, r.minutes]));
   eq(by, { chapter_page: 14.67, libro: 19.33, presentation: 6, video: 10, video_interactions: 8, activity: 9.6, review: 4.5 }, 'minutos por recurso');
-  eq(c.minutes, 72.1, 'total exacto');
+  eq(c.chapterEstimatedMinutes, 72.1, 'total exacto (a mano: 14,67 + 19,33 + 6 + 10 + 8 + 9,6 + 4,5)');
   eq(c.displayMinutes, 70, 'redondeado a 5');
   assert(c.resources.every((r) => r.measured === false && r.basis.length > 0), 'planificados con su fórmula');
   eq(c.resources.find((r) => r.resource === 'video_interactions').basis, '6 preguntas + 2 pausas × 1 min', 'pausas IV v2');
   eq(ST.estimateChapterStudyTime(fullChapter('c1', { ivAdvanced: false })).resources.find((r) => r.resource === 'video_interactions').minutes, 6, 'sin IV v2 no hay pausas');
-  eq(ST.estimateChapterStudyTime(fullChapter('c1', { applicationMinutes: 90 })).minutes, 162.1, 'Actividad de aplicación (Fase 2) suma su nivel');
+  eq(ST.estimateChapterStudyTime(fullChapter('c1', { applicationMinutes: 90 })).chapterEstimatedMinutes, 162.1, 'Actividad de aplicación (Fase 2) suma su nivel');
   eq(ST.displayChapterMinutes(1), 5, 'mínimo 5');
 });
 
@@ -129,9 +129,10 @@ check('ST3 curso RCP 3×3 planificado: ~13,6 h, componentes = total, determinist
   eq(a.modules.length, 3, 'módulos');
   eq(a.modules.flatMap((m) => m.chapters).length, 9, 'capítulos');
   near(a.courseEstimatedHours, 13.6, 0.05, 'horas (baseline Fase 0: 13,6 h sin guías)');
+  eq(a.courseEstimatedMinutes, 813.23, 'a mano: 9 × 72,1 + 3 × 30 + 48 + 3 × 3 + 6,33 + 1 + 10');
   eq(a.courseEstimatedHours, Math.round((a.courseEstimatedMinutes / 60) * 10) / 10, 'horas = minutos / 60');
   near(sum(Object.values(a.byComponent)), a.courseEstimatedMinutes, 0.05, 'componentes suman el total');
-  const modSum = sum(a.modules.map((m) => m.minutes)) + sum(a.resources.map((r) => r.minutes));
+  const modSum = sum(a.modules.map((m) => m.moduleEstimatedMinutes)) + sum(a.resources.map((r) => r.minutes));
   near(modSum, a.courseEstimatedMinutes, 0.05, 'módulos + curso = total');
   eq(mins(a, 'final_exam'), [48], 'examen final: 40 preguntas (tope) × 1,2');
   eq(a.modules.map((m) => m.resources.find((r) => r.resource === 'module_exam').minutes), [30, 30, 30], 'exámenes de módulo: 25 × 1,2');
@@ -198,6 +199,8 @@ check('ST6 entradas inválidas fallan fuerte', () => {
   const bad = [
     [fullChapter('c', { pageWords: -1 }), /pageWords/],
     [fullChapter('c', { pageWords: 0 }), /pageWords/],
+    [fullChapter('c', { pageWords: null }), /pageWords/],
+    [fullChapter('c', { videoSeconds: null }), /videoSeconds/],
     [fullChapter('c', { slides: 2.5 }), /slides/],
     [fullChapter('c', { videoSeconds: NaN }), /videoSeconds/],
     [fullChapter('c', { videoSeconds: 999999 }), /videoSeconds/],
@@ -234,14 +237,20 @@ check('ST8 preguntas de exámenes planificadas = plan de slots del banco', () =>
   eq([EB.examSlotSplit(2).total, EB.finalExamSlotSplit(4).total, EB.finalExamSlotSplit(9).total], [17, 33, 40], 'slots');
 });
 
-check('ST9 cursos reales de staging (solo lectura): horas por capítulo y curso', () => {
+check('ST9 cursos reales de staging (solo lectura): horas por capítulo y curso; el plan del video coincide con el paquete', () => {
   eq(REAL.courses.map((c) => c.courseId), [616, 583, 542], 'cursos');
   const rows = [];
   for (const c of REAL.courses) {
     const byMod = new Map();
     c.chapters.forEach((ch, i) => {
-      // Video de YouTube (fuera del .mbz): duración inferida del plan del paquete real (n − 2 pausas) × 100 s.
-      const videoSeconds = (ch.videoInteractions - 2) * 100;
+      // Video de YouTube (fuera del .mbz): su duración sale de las marcas de tiempo REALES de las preguntas del
+      // paquete (plan: n preguntas en los puntos medios de n tramos iguales de [30, d − 15]) → d = 45 + n × tramo.
+      // NO usa la regla de cantidad (clamp(round(d/100), 3, 8)): la prueba la verifica contra el paquete.
+      const q = ch.videoQuestionAtSec;
+      const n = q.length;
+      const seg = (q[n - 1] - q[0]) / (n - 1);
+      assert(Math.abs(q[0] - (30 + seg / 2)) <= 1, `curso ${c.courseId} cap ${i + 1}: la primera pregunta está donde la pone el plan`);
+      const videoSeconds = 45 + n * seg;
       const input = {
         chapterId: `c${c.courseId}-${i + 1}`,
         pageWords: ch.pageWords,
@@ -256,7 +265,7 @@ check('ST9 cursos reales de staging (solo lectura): horas por capítulo y curso'
         review: true,
         reviewCards: ch.reviewCards,
       };
-      byMod.set(ch.module, [...(byMod.get(ch.module) || []), input]);
+      byMod.set(ch.module, [...(byMod.get(ch.module) || []), { input, real: n + ch.videoPauseAtSec.length }]);
     });
     const mods = [...byMod.keys()].sort((a, b) => a - b);
     const est = ST.estimateCourseStudyTime({
@@ -267,11 +276,11 @@ check('ST9 cursos reales de staging (solo lectura): horas por capítulo y curso'
       forum: true,
       finalExam: true,
       finalExamQuestions: c.finalExamQuestions,
-      modules: mods.map((n, i) => ({ moduleId: `m${n}`, intro: true, exam: true, examQuestions: c.examQuestionsByModule[i], chapters: byMod.get(n) })),
+      modules: mods.map((n, i) => ({ moduleId: `m${n}`, intro: true, exam: true, examQuestions: c.examQuestionsByModule[i], chapters: byMod.get(n).map((x) => x.input) })),
     });
-    // El plan del estimador reproduce las interacciones del paquete REAL.
+    const reals = mods.flatMap((n) => byMod.get(n).map((x) => x.real));
     est.modules.flatMap((m) => m.chapters).forEach((ch, i) => {
-      eq(ch.resources.find((r) => r.resource === 'video_interactions').minutes, c.chapters[i].videoInteractions, `curso ${c.courseId} cap ${i + 1}: interacciones del paquete`);
+      eq(ch.resources.find((r) => r.resource === 'video_interactions').minutes, reals[i], `curso ${c.courseId} cap ${i + 1}: preguntas + pausas = las del paquete real`);
       assert(ch.displayMinutes >= 60 && ch.displayMinutes <= 90, `curso ${c.courseId} cap ${i + 1}: ${ch.displayMinutes} min fuera de [60, 90]`);
     });
     assert(est.courseEstimatedHours >= 6 && est.courseEstimatedHours <= 7.5, `curso ${c.courseId}: ${est.courseEstimatedHours} h fuera de [6, 7,5] (2×2)`);
@@ -296,11 +305,11 @@ check('ST10 dry-run pedagógico: horas planificadas en línea base y vista pedag
 });
 
 check('ST11 la discrepancia anterior (~30–35 min) queda corregida', () => {
-  // Modelo anterior (facts P3): 180 palabras/min, video fijo 6 min, actividad 8, sin Libro, preguntas del video ni repaso.
-  const old = Math.round((2200 / 180 + 10 * 0.5 + 6 + 8) / 5) * 5;
-  eq(old, 30, 'el badge anterior');
-  const now = ST.estimateChapterStudyTime(fullChapter('c')).displayMinutes;
-  assert(now >= 65 && now <= 75, `capítulo completo ${now} min`);
+  // Badge anterior (facts P3: 180 palabras/min, video fijo 6 min, actividad 8, sin Libro, preguntas del video
+  // ni repaso) para el mismo capítulo: 2200/180 + 10 × 0,5 + 6 + 8 = 31,2 → «~30 min».
+  // Ahora, el mismo capítulo planificado completo (a mano en ST2): 72,1 → «~70 min».
+  eq(ST.estimateChapterStudyTime(fullChapter('c')).displayMinutes, 70, 'capítulo completo');
+  eq(ST.estimateChapterStudyTime(fullChapter('c', { libro: false, review: false, ivAdvanced: false })).displayMinutes, 45, 'aun sin Libro ni repaso (46,27) supera el badge anterior');
 });
 
 console.log(`\n${passes} OK, ${failures} fallidas`);

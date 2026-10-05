@@ -26,8 +26,11 @@ export interface StudyTimeMeasurements {
   welcomeAudioSeconds?: number;
 }
 
-/** Mismas condiciones que `reviewCardsApply` del empaque v3. */
-function reviewCardsPlanned(blueprint: BlueprintSnapshotV2, manifest: GenerationManifestV1): boolean {
+/**
+ * ¿El curso lleva «Repaso» (Dialog Cards)? Ajuste del Blueprint + H5P v2 + motor h5p. Predicado ÚNICO:
+ * el empaque v3 (`reviewCardsApply`) lo usa también.
+ */
+export function reviewCardsEnabledFor(blueprint: BlueprintSnapshotV2, manifest: GenerationManifestV1): boolean {
   return blueprint.course.reviewCards === true && manifest.features?.activityTypeRules === 2 && blueprint.course.activityEngine === 'h5p';
 }
 
@@ -41,7 +44,7 @@ export function studyTimeInputFromManifest(
   const keys = new Set(manifest.items.map((i) => i.key));
   const has = (type: string, id: string) => keys.has(`${type}:${id}`);
   const hasType = (type: string) => manifest.items.some((i) => i.type === type);
-  const review = reviewCardsPlanned(blueprint, manifest);
+  const review = reviewCardsEnabledFor(blueprint, manifest);
   const reviewIds = measured.reviewChapterIds ? new Set(measured.reviewChapterIds) : null;
   const ivAdvanced = manifest.features?.ivAdvanced === 1;
   const pick = (rec: Record<string, number> | undefined, id: string) => (rec && Object.prototype.hasOwnProperty.call(rec, id) ? rec[id] : undefined);
