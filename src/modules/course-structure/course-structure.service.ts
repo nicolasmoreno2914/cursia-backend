@@ -803,7 +803,11 @@ export class CourseStructureService implements OnModuleInit {
       }
       const newCounter = this.counterOrThrow(r.counter, courseId);
       await queryRunner.commitTransaction();
-      return { chapter: this.jsonObject(r.chapter), structureVersionCounter: newCounter, titleNormalized: nt.changed };
+      const chapter = this.jsonObject(r.chapter);
+      // Un capítulo de contenido no informa `kind`: en una base sin la migración de práctica la columna no existe
+      // y el editor solo ofrece la práctica cuando la lectura de la estructura la informa (re-revisión L4, m1).
+      if (!practice && chapter) delete chapter.kind;
+      return { chapter, structureVersionCounter: newCounter, titleNormalized: nt.changed };
     } catch (err) {
       if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
       throw err;

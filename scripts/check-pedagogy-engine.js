@@ -913,6 +913,10 @@ async function dbChecks() {
       const st0 = await structureSvc.getStructure(course.id, OWNER);
       assert(st0.modules.every((m) => m.chapters.every((c) => c.kind === 'content')), 'capítulos existentes: content');
       const mod = st0.modules[0];
+      // Re-revisión L4 (m1): un capítulo de contenido nuevo no informa `kind` (en una base sin migrar no existe la columna).
+      const plain = await structureSvc.createChapter(course.id, mod.id, OWNER, { title: 'Contenido temporal', expectedCounter: await counter() });
+      eq('kind' in plain.chapter, false, 'contenido nuevo: sin kind en la respuesta');
+      await structureSvc.deleteChapter(course.id, mod.id, plain.chapter.id, OWNER, await counter());
       await rejectsRe(structureSvc.createChapter(course.id, mod.id, OWNER, { title: 'Práctica', kind: 'practice', videoEnabled: true, expectedCounter: await counter() }), /PRACTICE_CHAPTER_VIDEO/, 'práctica con video', 400);
       const r = await structureSvc.createChapter(course.id, mod.id, OWNER, { title: 'Práctica integradora', kind: 'practice', expectedCounter: await counter() });
       eq([r.chapter.kind, r.chapter.videoEnabled, r.chapter.activityEnabled], ['practice', false, true], 'creado');
