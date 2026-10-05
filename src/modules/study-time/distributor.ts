@@ -111,6 +111,8 @@ export interface DistributionResult {
   /** Proporción del diseño en Actividades de aplicación (0–1), incluidos los capítulos de práctica. */
   applicationShare: number;
   policy: { kind: 'application_first' | 'depth_first'; weights: { application: number; depth: number } | null } & DistributorPolicy;
+  /** Fase 2 · «Ajustar»: preferencias efectivas con las que se armó el diseño. */
+  preferences: Required<DesignPreferences>;
   modules: ProposedModule[];
   changes: DistributionChange[];
   recommendations: string[];
@@ -133,8 +135,26 @@ export interface DistributionResult {
   studyTime: StudyTimeEstimate;
 }
 
+/**
+ * Fase 2 · «Ajustar» (preferencias del docente, guardadas en el perfil pedagógico como `designPreferences`):
+ *   - emphasis: 'application' fuerza la política de aplicación primero; 'depth', la de profundidad; 'balanced'
+ *     (por defecto) usa la que deriva el enfoque.
+ *   - applicationActivities: 'auto' (por defecto: donde el diseño las necesite), 'practice_only' (solo en capítulos
+ *     de práctica) o 'none' (ninguna: el curso crece solo con capítulos).
+ */
+export type DesignEmphasis = 'application' | 'balanced' | 'depth';
+export type ApplicationActivitiesMode = 'auto' | 'practice_only' | 'none';
+export const DESIGN_EMPHASES: readonly DesignEmphasis[] = ['application', 'balanced', 'depth'];
+export const APPLICATION_ACTIVITIES_MODES: readonly ApplicationActivitiesMode[] = ['auto', 'practice_only', 'none'];
+export interface DesignPreferences {
+  emphasis?: DesignEmphasis;
+  applicationActivities?: ApplicationActivitiesMode;
+}
+
 export interface DistributorInput {
   snapshot: BlueprintSnapshotV2;
+  /** Fase 2 · «Ajustar»: preferencias del docente (ausentes = las de siempre). */
+  preferences?: DesignPreferences | null;
   /** Reglas del motor pedagógico (null = sin enfoque: política neutra). */
   rules: DesignRules | null;
   targetHours: number;
@@ -205,7 +225,18 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   const tolMinH = input.tolerance?.minHours ?? DISTRIBUTOR_RULES.tolerance.minHours;
   if (!(tolPct >= 0 && tolPct <= 0.5) || !(tolMinH >= 0 && tolMinH <= 10)) throw new DistributorError('tolerancia fuera de rango (pct 0–0,5; minHours 0–10)');
 
-  const policy = distributorPolicyFor(rules);
+  const prefs = input.preferences ?? {};
+  if (prefs.emphasis !== undefined && !DESIGN_EMPHASES.includes(prefs.emphasis)) throw new DistributorError(`emphasis inválido (${JSON.stringify(prefs.emphasis)})`);
+  if (prefs.applicationActivities !== undefined && !APPLICATION_ACTIVITIES_MODES.includes(prefs.applicationActivities)) {
+    throw new DistributorError(`applicationActivities inválido (${JSON.stringify(prefs.applicationActivities)})`);
+  }
+  const appMode: ApplicationActivitiesMode = prefs.applicationActivities ?? 'auto';
+  const basePolicy = distributorPolicyFor(rules);
+  const policy: DistributionResult['policy'] = prefs.emphasis === 'application'
+    ? { ...basePolicy, kind: 'application_first', ...DISTRIBUTOR_RULES.applicationFirst }
+    : prefs.emphasis === 'depth'
+      ? { ...basePolicy, kind: 'depth_first', ...DISTRIBUTOR_RULES.depthFirst }
+      : basePolicy;
   const target = input.targetHours * 60;
   const tol = Math.max(target * tolPct, tolMinH * 60);
   const review = snapshot.course.reviewCards === true && atr === 2 && snapshot.course.activityEngine === 'h5p';
@@ -225,7 +256,8 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
         objective: c.objective ?? null,
         videoEnabled: !!c.videoEnabled,
         activityEnabled: c.activityEnabled === true,
-        applicationMinutes: null,
+        // Fase 2: se arranca con las Actividades de Aplicación que la estructura YA tiene (ver «ya cumple», abajo).
+        applicationMinutes: typeof (c as { applicationMinutes?: unknown }).applicationMinutes === 'number' ? ((c as { applicationMinutes?: number }).applicationMinutes as number) : null,
       })),
     }));
   if (design.some((m) => m.chapters.length === 0)) throw new DistributorError('cada módulo necesita al menos un capítulo');
@@ -306,6 +338,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
       deltaHours: r1(est.courseEstimatedHours - input.targetHours),
       applicationShare: Math.round((est.byComponent.application / est.courseEstimatedMinutes) * 100) / 100,
       policy,
+      preferences: { emphasis: prefs.emphasis ?? 'balanced', applicationActivities: appMode },
       modules,
       changes,
       recommendations,
@@ -329,6 +362,20 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
 
   const fmtH = (n: number) => String(r1(n)).replace('.', ',');
   const initialRoles = new Map(design.flatMap((m) => m.chapters.map((c) => [c.id, roleOf(m, c)] as const)));
+
+  // Fase 2 — «ya cumple»: si la estructura ACTUAL, con sus Actividades de Aplicación (p. ej. un diseño ya aplicado o
+  // fijado a mano), queda dentro de la tolerancia y respeta las preferencias, no se propone nada (el distribuidor es
+  // estable sobre su propio resultado). Si no, se rediseña desde cero (las actividades existentes no condicionan).
+  const hasExisting = design.some((m) => m.chapters.some((c) => c.applicationMinutes !== null));
+  const respectsMode = design.every((m) => m.chapters.every((c) => c.applicationMinutes === null || (appMode !== 'none' && (appMode !== 'practice_only' || c.kind === 'practice'))));
+  if (hasExisting && respectsMode && Math.abs(minutes() - target) <= tol) {
+    priorityTrace.push('La estructura actual, con sus Actividades de Aplicación, ya cumple la carga horaria objetivo: no se propone ningún cambio.');
+    return result('within_tolerance', []);
+  }
+  if (hasExisting) {
+    for (const m of design) for (const c of m.chapters) c.applicationMinutes = null;
+    reEval();
+  }
 
   // 1) No rellenar: la estructura mínima ya supera el objetivo → informar y proponer, nunca recortar sola.
   if (minutes() > target + tol) {
@@ -358,6 +405,8 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
    */
   const trySetTier = (m: WorkModule, c: WorkChapter, tier: number | null): boolean => {
     if (tier !== null && tier > capOf(m, c)) return false;
+    // «Ajustar»: sin Actividades de Aplicación, o solo en los capítulos de práctica.
+    if (tier !== null && (appMode === 'none' || (appMode === 'practice_only' && c.kind !== 'practice'))) return false;
     const prev = c.applicationMinutes;
     c.applicationMinutes = tier;
     reEval();

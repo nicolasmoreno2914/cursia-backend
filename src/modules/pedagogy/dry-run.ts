@@ -36,7 +36,7 @@ import {
   proposeStructureAdjustments,
 } from './pedagogical-blueprint';
 import { ItemPedagogyBrief, OverrideLevel, PEDAGOGY_GENERATOR_COVERAGE, buildItemPedagogyBrief } from './generator-directives';
-import { PedagogicalProfile, isEmptyPedagogicalProfile, normalizePedagogicalProfile, profileApplicationContext, profileTargetHours } from './pedagogy-profile';
+import { PedagogicalProfile, isEmptyPedagogicalProfile, normalizePedagogicalProfile, profileApplicationContext, profileDesignPreferences, profileTargetHours } from './pedagogy-profile';
 import { PEDAGOGY_ENGINE_VERSION } from './vocabulary';
 
 /**
@@ -170,7 +170,7 @@ export interface DryRunResult {
    * Motor de carga horaria (Loop 3): diseño propuesto por el distribuidor para alcanzar targetHours (null sin
    * objetivo). Solo propuesta: no cambia el Blueprint ni el Manifest de este dry-run.
    */
-  distribution: (DistributionResult & { materialized: DistributionMaterialized }) | null;
+  distribution: (DistributionResult & { materialized: DistributionMaterialized; proposalSha256: string }) | null;
   baseline: DryRunSide;
   pedagogical: DryRunSide | null;
   structureChanges: StructureChange[];
@@ -326,6 +326,22 @@ export interface DistributionMaterialized {
   providers: ProviderPlan;
   /** Horas del Manifest materializado (deben ser las `generableHours` del distribuidor); null si falló. */
   generableHours: number | null;
+}
+
+/**
+ * Fase 2 · «Aplicar diseño»: huella de la propuesta (estructura + actividades + preferencias). El servidor recalcula
+ * la propuesta al aplicar y exige la MISMA huella que vio el docente (si la estructura o el perfil cambiaron, 409).
+ */
+export function distributionProposalSha256(dist: DistributionResult): string {
+  const canon = {
+    targetHours: dist.targetHours,
+    preferences: dist.preferences,
+    modules: dist.modules.map((m) => ({
+      id: m.id,
+      chapters: m.chapters.map((c) => ({ id: c.id, proposed: c.proposed, kind: c.kind, title: c.title, objective: c.objective, videoEnabled: c.videoEnabled, activityEnabled: c.activityEnabled, applicationMinutes: c.applicationMinutes })),
+    })),
+  };
+  return createHash('sha256').update(JSON.stringify(canon), 'utf8').digest('hex');
 }
 
 /** UUID v4 determinista para un capítulo propuesto (solo en el dry-run). */
@@ -561,7 +577,7 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
     rules,
     targetHours,
     distribution: targetHours === null ? null : (() => {
-      const dist = distributeCourseHours({ snapshot: view.blueprint, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1 });
+      const dist = distributeCourseHours({ snapshot: view.blueprint, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile) });
       const materialized = materializeOrError(view.blueprint, dist, (plain) => {
         const ms = side(rules ? applyPedagogyToSnapshot(plain, rules) : plain, activityTypeRules);
         return {
@@ -574,7 +590,8 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
           generableHours: ms.studyTime.courseEstimatedHours,
         };
       }, appContext);
-      return { ...dist, materialized };
+      // Fase 2 · «Aplicar diseño»: huella de la propuesta que ve el docente (el servidor la recalcula al aplicar).
+      return { ...dist, materialized, proposalSha256: distributionProposalSha256(dist) };
     })(),
     workload: targetHours === null
       ? null

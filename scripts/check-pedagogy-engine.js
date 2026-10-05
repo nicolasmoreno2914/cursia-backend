@@ -971,6 +971,35 @@ async function dbChecks() {
       const big = { course: { title: 'x' }, modules: Array.from({ length: 21 }, (_, i) => ({ title: `M${i}`, chapters: [{ title: 'c' }] })) };
       await rejectsRe(Promise.resolve().then(() => pedagogy.dryRunInline({ structure: big })), /como máximo 20 módulos/, 'límite', 400);
     });
+    await check('DB Fase 2 «Aplicar diseño»: propuesta (horas + preferencias) → estructura real con actividades; huella vieja 409; lock + Manifest con actividades; estable', async () => {
+      await profiles.append(course.id, OWNER, 'pedagogy', { ...profileOf('competencias'), targetHours: 33, designPreferences: { emphasis: 'application', applicationActivities: 'auto' } });
+      const dr = await pedagogy.dryRunCourse(course.id, OWNER, {});
+      const d = dr.distribution;
+      assert(d && /^[0-9a-f]{64}$/.test(d.proposalSha256) && d.counts.applicationActivities > 0, 'propuesta con actividades');
+      eq(d.preferences, { emphasis: 'application', applicationActivities: 'auto' }, 'preferencias efectivas');
+      const proposed = d.modules.flatMap((m) => m.chapters).filter((c) => c.proposed).length;
+      const c0 = await counter();
+      await rejectsRe(structureSvc.applyDistribution(course.id, OWNER, { expectedCounter: c0, proposalSha256: '0'.repeat(64) }), /PROPOSAL_CHANGED/, 'huella distinta', 409);
+      eq(await counter(), c0, 'la huella vieja no escribe nada');
+      const r = await structureSvc.applyDistribution(course.id, OWNER, { expectedCounter: c0, proposalSha256: d.proposalSha256 });
+      eq([r.addedChapters, r.applicationActivities, r.structureVersionCounter], [proposed, d.counts.applicationActivities, c0 + 1], 'aplicado (un solo counter)');
+      const st = await structureSvc.getStructure(course.id, OWNER);
+      const live = st.modules.flatMap((m) => m.chapters);
+      eq(live.filter((c) => typeof c.applicationMinutes === 'number').length, d.counts.applicationActivities, 'actividades en la estructura');
+      eq(st.modules.map((m) => m.chapters.map((c) => c.kind === 'practice' ? 'P' : 'C').join('')), d.modules.map((m) => m.chapters.map((c) => c.kind === 'practice' ? 'P' : 'C').join('')), 'misma forma y orden que la propuesta');
+      const lock = await blueprints.lock(course.id, OWNER, await counter());
+      eq(snap.validateBlueprintSnapshotV2(lock.blueprint.snapshot), [], 'Blueprint válido');
+      assert(lock.blueprint.snapshot.course.applicationContext, 'contexto del estudiante congelado');
+      const read = await blueprints.getByNumberAnySchema(course.id, OWNER, lock.blueprint.blueprintNumber);
+      const m = mb.buildGenerationManifestV3(read.snapshot, { courseId: course.id, blueprintId: read.id, blueprintNumber: read.blueprintNumber, blueprintSha256: read.sha256 }, { activityTypeRules: 2 });
+      eq(mb.validateGenerationManifestV3(m, read.snapshot, m.source), [], 'Manifest válido');
+      eq(m.totals.applicationActivityCount, d.counts.applicationActivities, 'Manifest = diseño aprobado');
+      const dr2 = await pedagogy.dryRunCourse(course.id, OWNER, {});
+      eq(dr2.distribution.modules.flatMap((x) => x.chapters).filter((c) => c.proposed).length, 0, 'estable: nada más que agregar');
+      assert(Math.abs(dr2.distribution.estimatedHours - d.estimatedHours) <= 0.15, `mismas horas (${dr2.distribution.estimatedHours} vs ${d.estimatedHours})`);
+      eq(Math.abs(dr2.baseline.studyTime.courseEstimatedHours - d.estimatedHours) <= 0.15, true, 'la estructura real ya tiene las horas del diseño');
+      await rejectsRe(profiles.append(course.id, OWNER, 'pedagogy', { ...profileOf('competencias'), targetHours: 33, designPreferences: { emphasis: 'x' } }), /INVALID_OPTION/, 'preferencia inválida', 400);
+    });
   } finally {
     if (ds && ds.isInitialized) await ds.destroy();
     for (const [k, env] of [['flag', 'DYNAMIC_COURSE_STRUCTURE'], ['allow', 'DYNAMIC_V2_ALLOWED_OWNERS'], ['rules', 'DYNAMIC_MANIFEST_RULES_VERSION'], ['atr', 'DYNAMIC_ACTIVITY_TYPE_RULES'], ['unowned', 'ALLOW_UNOWNED_COURSES']]) {

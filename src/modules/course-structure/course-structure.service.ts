@@ -1,6 +1,8 @@
 import { Injectable, BadRequestException, NotFoundException, ConflictException, Logger, OnModuleInit, ServiceUnavailableException } from '@nestjs/common';
 import { lockPedagogyInput } from '../pedagogy/pedagogical-blueprint';
-import { parseStoredPedagogicalProfile } from '../pedagogy/pedagogy-db';
+import { loadCurrentPedagogicalProfile, parseStoredPedagogicalProfile } from '../pedagogy/pedagogy-db';
+import { runPedagogyDryRun } from '../pedagogy/dry-run';
+import { ApplyDistributionDto } from './dto/apply-distribution.dto';
 import { profileApplicationContext, profileTargetHours } from '../pedagogy/pedagogy-profile';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
@@ -27,6 +29,7 @@ import {
   isActivityEngine,
   snapshotSha256,
   snapshotSha256V2,
+  validateBlueprintInputV2,
 } from '../course-blueprints/blueprint-snapshot';
 import { assertApplicationActivitySchema, assertPracticeChapterSchema, assertV21StructureSchema, probeV21StructureSchema } from './v21-schema-guard';
 import { isApplicationMinutes } from '../study-time/application-tiers';
@@ -198,6 +201,111 @@ export class CourseStructureService implements OnModuleInit {
   ): Promise<boolean> {
     if (!hasBlueprint) return false;
     return (await this.readStructure(queryRunner, courseId, ownerId)).liveMatchesCurrentBlueprint;
+  }
+
+  /**
+   * Fase 2 · «Aplicar diseño»: recalcula la propuesta del distribuidor con la estructura ACTUAL y el perfil GUARDADO
+   * (horas objetivo + preferencias) y, si su huella es la que vio el docente, la aplica en UNA transacción:
+   *   - crea los capítulos propuestos (práctica / profundización) en su lugar;
+   *   - fija (o quita) la Actividad de Aplicación de cada capítulo;
+   *   - reordena las posiciones según la propuesta (los únicos se verifican al COMMIT).
+   * No toca títulos, objetivos, videos ni actividades de los capítulos existentes. Huella distinta → 409
+   * PROPOSAL_CHANGED (la estructura o el perfil cambiaron: volver a ver el diseño). No genera nada ni gasta.
+   */
+  async applyDistribution(courseId: number, ownerId: string, dto: ApplyDistributionDto) {
+    assertDynamicOwnerAllowed(ownerId);
+    await assertV21StructureSchema(this.dataSource);
+    await assertApplicationActivitySchema(this.dataSource);
+    const queryRunner = this.dataSource.createQueryRunner();
+    try {
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
+      const lock = await this.lockAndVerifyEx(queryRunner, courseId, ownerId, dto.expectedCounter);
+      const [course] = await queryRunner.query(
+        `select id, title, final_exam_enabled, activity_engine, (to_jsonb(courses) ->> 'review_cards_enabled')::boolean as review_cards_enabled
+           from public.courses where id = $1`,
+        [courseId],
+      );
+      const modules = await queryRunner.query(
+        `select id, position, title, objective, description, exam_enabled from public.course_modules where course_id = $1`,
+        [courseId],
+      );
+      const chapters = await queryRunner.query(
+        `select id, module_id, position, title, objective, description, video_enabled, activity_enabled,
+                to_jsonb(course_chapters) ->> 'chapter_kind' as chapter_kind,
+                to_jsonb(course_chapters) ->> 'application_minutes' as application_minutes
+           from public.course_chapters where course_id = $1`,
+        [courseId],
+      );
+      const saved = await loadCurrentPedagogicalProfile(queryRunner, courseId);
+      if (!saved || profileTargetHours(saved.profile) === null) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException({ code: 'NO_TARGET_HOURS', message: 'NO_TARGET_HOURS: el curso no tiene horas objetivo guardadas; guarda el perfil antes de aplicar el diseño.' });
+      }
+      const courseRef = {
+        id: course.id, title: course.title, finalExam: course.final_exam_enabled, activityEngine: course.activity_engine,
+        reviewCards: course.review_cards_enabled === true,
+      };
+      const errors = validateBlueprintInputV2(courseRef, modules, chapters);
+      if (errors.length) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException(`La estructura actual no se puede evaluar: ${errors.map((e) => e.message).join('; ')}`);
+      }
+      const dr = runPedagogyDryRun({ structure: buildBlueprintSnapshotV2(courseRef, modules, chapters), profile: saved.profile, activityTypeRules: readActivityTypeRulesConfig() });
+      const dist = dr.distribution;
+      if (!dist) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException({ code: 'NO_TARGET_HOURS', message: 'NO_TARGET_HOURS: sin horas objetivo no hay propuesta que aplicar.' });
+      }
+      if (dist.proposalSha256 !== dto.proposalSha256) {
+        await queryRunner.rollbackTransaction();
+        throw new ConflictException({ code: 'PROPOSAL_CHANGED', message: 'PROPOSAL_CHANGED: la estructura o el perfil cambiaron desde que viste el diseño; vuelve a verlo antes de aplicarlo.' });
+      }
+      if (dist.materialized.manifestErrors.length) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException({ code: 'PROPOSAL_INVALID', message: `PROPOSAL_INVALID: ${dist.materialized.manifestErrors.map((e) => e.code).join(', ')}` });
+      }
+      const proposedPractice = dist.modules.some((m) => m.chapters.some((c) => c.proposed && c.kind === 'practice'));
+      if (proposedPractice) await assertPracticeChapterSchema(queryRunner);
+      let added = 0;
+      for (const m of dist.modules) {
+        for (const [ci, c] of m.chapters.entries()) {
+          if (c.proposed) {
+            const practice = c.kind === 'practice';
+            await queryRunner.query(
+              `insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled, activity_enabled, application_minutes${practice ? ', chapter_kind' : ''})
+               values ($1, $2, $3, $4, $5, $6, $7, $8${practice ? ", 'practice'" : ''})`,
+              [courseId, m.id, ci, c.title, c.objective, practice ? false : c.videoEnabled, c.activityEnabled, c.applicationMinutes],
+            );
+            added++;
+          } else {
+            await queryRunner.query(
+              `update public.course_chapters set position = $1, application_minutes = $2, updated_at = now() where id = $3 and module_id = $4 and course_id = $5`,
+              [ci, c.applicationMinutes, c.id, m.id, courseId],
+            );
+          }
+        }
+      }
+      const [cr] = returningRows(await queryRunner.query(
+        `update public.courses set structure_version_counter = structure_version_counter + 1 where id = $1 returning structure_version_counter`,
+        [courseId],
+      ));
+      const newCounter = this.counterOrThrow(cr?.structure_version_counter, courseId);
+      const liveMatchesCurrentBlueprint = await this.liveMatchesAfterMutation(queryRunner, courseId, ownerId, lock.hasBlueprint);
+      await queryRunner.commitTransaction();
+      return {
+        structureVersionCounter: newCounter,
+        liveMatchesCurrentBlueprint,
+        addedChapters: added,
+        applicationActivities: dist.counts.applicationActivities,
+        estimatedHours: dist.estimatedHours,
+      };
+    } catch (err) {
+      if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
   }
 
   async getStructure(courseId: number, ownerId: string) {

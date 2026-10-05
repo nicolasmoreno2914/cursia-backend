@@ -23,6 +23,8 @@
 //   AA12 el validador del .mbz detecta: solucionario visible, respuestas en la página del estudiante, actividad
 //        faltante, PDF faltante
 //   AA13 la secuencia de la sección = Manifest + chapterSlotSequence (instrucción → actividad → solucionario)
+//   AA15 «Ajustar»: énfasis (aplicación / profundidad), Actividades solo en práctica o ninguna; inválido → error
+//   AA16 estabilidad: el diseño aplicado (materializado) vuelve a dar «ya cumple» sin cambios; huella determinista
 //   AA14 PDF imprimible: páginas reales = páginas con contenido (sin hojas en blanco), bytes deterministas, renglones
 //        para responder; el del estudiante sin respuestas
 //
@@ -425,6 +427,46 @@ function rcpWithApplications() {
         eq(pages, a.pages, `${min}/${mode}: páginas reales = informadas`);
         assert(a.pages >= 1 && a.pages <= 8, `${min}/${mode}: ${a.pages} páginas`);
       }
+    }
+  });
+
+  await check('AA15 «Ajustar»: énfasis, solo práctica, ninguna; preferencias inválidas fallan', () => {
+    const s = clone(RCP); s.course.reviewCards = true;
+    const run = (prefs, h = 50, k = 'competencias') => P.runPedagogyDryRun({ structure: clone(s), profile: profileOf(k, { targetHours: h, ...(prefs ? { designPreferences: prefs } : {}) }), activityTypeRules: 2 }).distribution;
+    const base = run(null);
+    const depth = run({ emphasis: 'depth' });
+    eq([base.policy.kind, depth.policy.kind], ['application_first', 'depth_first'], 'énfasis profundidad');
+    assert(depth.counts.contentChapters > base.counts.contentChapters, 'más profundidad = más capítulos de contenido');
+    const sig = run({ emphasis: 'application' }, 50, 'significativo');
+    eq(sig.policy.kind, 'application_first', 'énfasis aplicación sobre un enfoque de profundidad');
+    const po = run({ applicationActivities: 'practice_only' });
+    assert(po.modules.every((m) => m.chapters.every((c) => c.applicationMinutes === null || c.kind === 'practice')), 'solo capítulos de práctica');
+    assert(po.counts.applicationActivities > 0, 'con alguna');
+    const none = run({ applicationActivities: 'none' });
+    eq(none.counts.applicationActivities, 0, 'ninguna');
+    assert(none.counts.chapters > base.counts.chapters, 'sin actividades crece con capítulos');
+    eq(none.preferences, { emphasis: 'balanced', applicationActivities: 'none' }, 'preferencias efectivas');
+    eq(none.materialized.manifestErrors, [], 'propuesta válida');
+    throwsRe(() => run({ applicationActivities: 'todas' }), /PROFILE_INVALID|INVALID_OPTION/, 'inválida');
+    // Sin preferencias: el perfil normalizado no lleva la clave (sha de siempre).
+    eq('designPreferences' in P.normalizePedagogicalProfile(profileOf('competencias', { designPreferences: { emphasis: 'balanced', applicationActivities: 'auto' } })), false, 'valores por defecto no se guardan');
+  });
+
+  await check('AA16 estabilidad: el diseño aplicado vuelve a dar «ya cumple» (sin cambios, mismas horas); huella determinista', () => {
+    const s = clone(RCP); s.course.reviewCards = true;
+    for (const h of [20, 33, 50]) {
+      const prof = profileOf('competencias', { targetHours: h });
+      const dr = P.runPedagogyDryRun({ structure: clone(s), profile: prof, activityTypeRules: 2 });
+      const d = dr.distribution;
+      const again = P.runPedagogyDryRun({ structure: clone(s), profile: prof, activityTypeRules: 2 }).distribution;
+      eq(again.proposalSha256, d.proposalSha256, `${h} h: huella determinista`);
+      if (d.status !== 'within_tolerance') continue;
+      // «Aplicar»: la propuesta materializada como estructura nueva (sin diseño pedagógico, como la estructura viva).
+      const applied = P.materializeDistribution(dr.baseline.blueprint, d, null);
+      const after = P.runPedagogyDryRun({ structure: applied, profile: prof, activityTypeRules: 2 }).distribution;
+      eq([after.status, after.changes.filter((c) => c.type !== 'set_application_activity').length], ['within_tolerance', 0], `${h} h: sin cambios`);
+      eq(after.modules.flatMap((m) => m.chapters).filter((c) => c.proposed).length, 0, `${h} h: nada que agregar`);
+      assert(Math.abs(after.estimatedHours - d.estimatedHours) <= 0.15, `${h} h: ${after.estimatedHours} vs ${d.estimatedHours}`);
     }
   });
 
