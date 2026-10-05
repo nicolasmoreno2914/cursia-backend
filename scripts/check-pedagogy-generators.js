@@ -409,7 +409,10 @@ const has = (text, needle, msg) => assert(String(text).includes(needle), `${msg}
     // Manifest con TODO encendido: examen final, video y actividad en todos, motor h5p (y scorm aparte).
     const kinds = new Set();
     for (const engine of ['h5p', 'scorm']) {
-      const dr = P.runPedagogyDryRun({ structure: { ...RCP, course: { ...RCP.course, activityEngine: engine, finalExam: true, reviewCards: true } }, profile: profileOf('competencias'), applyStructureAdjustments: false });
+      // Fase 2: una Actividad de Aplicación en el primer capítulo (el Manifest emite application_activity).
+      const withApp = JSON.parse(JSON.stringify(RCP));
+      withApp.modules[0].chapters[0].applicationMinutes = 60;
+      const dr = P.runPedagogyDryRun({ structure: { ...withApp, course: { ...withApp.course, activityEngine: engine, finalExam: true, reviewCards: true } }, profile: profileOf('competencias'), applyStructureAdjustments: false });
       for (const it of dr.pedagogical.manifest.items) kinds.add(it.type);
       for (const g of dr.generators) {
         const cov = P.PEDAGOGY_GENERATOR_COVERAGE[g.type];

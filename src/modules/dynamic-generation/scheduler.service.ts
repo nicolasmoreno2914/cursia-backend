@@ -1,3 +1,4 @@
+import { APPLICATION_ACTIVITY_SCHEMA_VERSION } from '../course-shell/application-activity';
 import {
   BadRequestException,
   ConflictException,
@@ -277,6 +278,11 @@ export interface ClaimPayloadV3 {
    * dependencyArtifacts), sin teoría nueva. Ausente = capítulo de contenido de siempre.
    */
   practice?: { sourceChapterIds: string[] };
+  /**
+   * Fase 2: Actividad de Aplicación. `minutes` = nivel del Manifest (la actividad se dimensiona con él);
+   * `context` = estudiante + resultados de aprendizaje CONGELADOS en el Blueprint (null si el perfil no los define).
+   */
+  application?: { minutes: number; chapterKind: 'content' | 'practice'; schemaVersion: number; context: unknown };
 }
 
 /**
@@ -1208,6 +1214,13 @@ export class SchedulerService {
       // EV6 H5P v2: el validador acepta branchingscenario solo con el marcador 2 del Manifest congelado.
       if (rules !== undefined && rules !== null) ctx.activityTypeRules = rules;
     }
+    if (g.type === 'application_activity') {
+      // Fase 2: los minutos salen del item del Manifest congelado (nunca del ejecutor).
+      ctx.applicationMinutes = typeof mItem.applicationMinutes === 'number' ? mItem.applicationMinutes : null;
+      if (ctx.applicationMinutes === null) {
+        throw new InternalServerErrorException(`v3_validation_context: ${g.item_key} sin applicationMinutes en el Manifest; no se completa sin validar`);
+      }
+    }
     if (g.type === 'module_intro') {
       const mod = (manifest.modules ?? []).find((m: any) => m.moduleId === g.module_id);
       ctx.moduleChapterIds = mod ? mod.chapters.map((c: any) => c.chapterId) : [];
@@ -1339,7 +1352,7 @@ export class SchedulerService {
   }
 
   /** Bloque `claimPayload` del ClaimedItem (solo rulesVersion 3 y tipos validados por el servidor). */
-  private async buildClaimV3(qr: QueryRunner, row: any, mItem: any, manifest: GenerationManifestV1): Promise<ClaimPayloadV3 | undefined> {
+  private async buildClaimV3(qr: QueryRunner, row: any, mItem: any, manifest: GenerationManifestV1, snapshot?: AnyBlueprintSnapshot): Promise<ClaimPayloadV3 | undefined> {
     if (manifest.rulesVersion !== 3) return undefined;
     const validatedArtifactType = v3ValidatedArtifactType(row.type, mItem.variant ?? null);
     const out: ClaimPayloadV3 = { validatedArtifactType };
@@ -1351,6 +1364,7 @@ export class SchedulerService {
       case 'module_intro':
       case 'video_interactions':
       case 'activity':
+      case 'application_activity':
         break;
       default:
         return undefined;
@@ -1359,7 +1373,21 @@ export class SchedulerService {
       out.chapterId = row.chapter_id;
       out.experienceFeatures = { eduFields: true };
     }
-    if (row.type === 'experience' || row.type === 'activity') {
+    if (row.type === 'application_activity') {
+      // Fase 2: minutos (nivel del diseño), tipo de capítulo y contexto congelado (estudiante + resultados).
+      const mm = manifest.modules.find((m) => m.chapters.some((c) => c.chapterId === row.chapter_id));
+      const mc = mm?.chapters.find((c) => c.chapterId === row.chapter_id);
+      if (typeof mItem.applicationMinutes !== 'number') throw new ClaimPayloadUnavailable('MISSING_APPLICATION_MINUTES', `${row.item_key} sin applicationMinutes en el Manifest`);
+      out.chapterId = row.chapter_id;
+      out.application = {
+        minutes: mItem.applicationMinutes,
+        chapterKind: mc?.kind === 'practice' ? 'practice' : 'content',
+        schemaVersion: APPLICATION_ACTIVITY_SCHEMA_VERSION,
+        // El Blueprint congelado del run (el claim ya verificó su sha); nunca el perfil vivo.
+        context: (snapshot as any)?.course?.applicationContext ?? null,
+      };
+    }
+    if (row.type === 'experience' || row.type === 'activity' || row.type === 'application_activity') {
       const mm = manifest.modules.find((m) => m.chapters.some((c) => c.chapterId === row.chapter_id));
       const mc = mm?.chapters.find((c) => c.chapterId === row.chapter_id);
       if (mm && mc?.kind === 'practice') {
@@ -1779,7 +1807,7 @@ export class SchedulerService {
             [row.job_id, row.manifest_id, deps],
           );
 
-    const v3 = await this.buildClaimV3(qr, row, mItem, manifest);
+    const v3 = await this.buildClaimV3(qr, row, mItem, manifest, snapshot);
 
     // Motor pedagógico Fase 2: el diseño del item (Manifest validado arriba contra el Blueprint) → brief del generador.
     let pedagogy: ItemPedagogyBrief | null = null;

@@ -44,7 +44,9 @@ export type PedagogyGeneratorId =
   | 'branching_scenario'
   | 'scorm_activity'
   | 'exam'
-  | 'final_exam';
+  | 'final_exam'
+  // Fase 2: Actividad de Aplicación (actividad + solucionario).
+  | 'application_activity';
 
 /** Generadores que reciben un prompt LLM (bloque con marcador) vs. proveedores (línea compacta). */
 const PROVIDER_GENERATORS: ReadonlySet<PedagogyGeneratorId> = new Set(['presentation', 'video']);
@@ -102,6 +104,7 @@ export const PEDAGOGY_GENERATOR_COVERAGE: Readonly<Record<string, { consumes: bo
   activity: { consumes: true, generator: 'LLM (navegador) — H5P (cuestionario, arrastrar, completar, escenario ramificado) o salas SCORM', reason: 'intención, escenario y retroalimentación (+ tipo H5P elegido por el diseño en V1)' },
   exam: { consumes: true, generator: 'LLM (navegador) — banco de preguntas o GIFT del módulo', reason: 'estrategia, estilo de evaluación y retroalimentación' },
   final_exam: { consumes: true, generator: 'LLM (navegador) — banco de preguntas o GIFT final', reason: 'estrategia, estilo integrador y retroalimentación' },
+  application_activity: { consumes: true, generator: 'LLM (navegador) — Actividad de Aplicación + solucionario docente', reason: 'intención, escenario, profundidad, verbos del objetivo y retroalimentación (Fase 2)' },
   audio_welcome: {
     consumes: false,
     generator: 'TTS (worker) — narra la bienvenida ya generada',
@@ -377,6 +380,7 @@ export function generatorForItem(item: BriefInput['item']): PedagogyGeneratorId 
     case 'video_interactions':
     case 'exam':
     case 'final_exam':
+    case 'application_activity':
       return item.type;
     case 'activity':
       if (item.variant === 'scorm') return 'scorm_activity';
@@ -514,6 +518,24 @@ function directivesFor(gen: PedagogyGeneratorId, input: BriefInput): { directive
       } else if (input.item.chapterId) {
         overridden.push(...activityTypeOverrides(input));
       }
+      break;
+    }
+    case 'application_activity': {
+      // Fase 2: el diseño del capítulo decide hacia dónde empuja la actividad (intención, tipo de situación,
+      // profundidad, verbos y retroalimentación); la ESTRUCTURA de ocho partes la fija Cursia.
+      const intent = des.activity?.intent ?? des.intent;
+      const sc = des.scenario ?? {};
+      const fb = des.feedback ?? {};
+      directives.push(d('activity.intent', intent, `Orienta los ejercicios y el taller así: ${need(INTENT_TEXT, intent, 'activity.intent')}`));
+      directives.push(d('scenarios.type', sc.type, `El contexto y el taller son ${need(SCENARIO_TEXT, sc.type, 'scenario.type')} (ilustrativos, sin datos reales de personas ni instituciones).`));
+      directives.push(d('content.depth', des.depth, need(DEPTH_TEXT, des.depth, 'depth')));
+      const verbs: string[] = Array.isArray(des.objectiveVerbs) ? des.objectiveVerbs.slice(0, 6) : [];
+      if (verbs.length) directives.push({ target: 'objectives.verbs', value: verbs.join(','), label: verbs.join(', '), instruction: `Redacta el objetivo y el producto con verbos como: ${verbs.join(', ')}.` });
+      directives.push(d('feedback.mode', fb.mode, `${need(FEEDBACK_TEXT, fb.mode, 'feedback.mode')} Aplícalo en la autoevaluación del estudiante y en las explicaciones del solucionario.`));
+      overridden.push({
+        target: 'activity.intent', value: intent, by: 'product', scope: 'partial', rule: 'Estructura fija de la Actividad de Aplicación de Cursia (objetivo, contexto, ejemplos, 6–10 ejercicios, taller, producto, autoevaluación y 3–4 criterios)',
+        effect: 'El diseño orienta el género, los casos y la exigencia; las partes y cantidades las fija Cursia según los minutos.',
+      });
       break;
     }
     case 'exam':
