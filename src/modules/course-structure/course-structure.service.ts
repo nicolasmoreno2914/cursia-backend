@@ -28,7 +28,7 @@ import {
   snapshotSha256,
   snapshotSha256V2,
 } from '../course-blueprints/blueprint-snapshot';
-import { assertV21StructureSchema, probeV21StructureSchema } from './v21-schema-guard';
+import { assertPracticeChapterSchema, assertV21StructureSchema, probeV21StructureSchema } from './v21-schema-guard';
 import {
   CHAPTER_TITLE_TOO_LONG,
   MODULE_TITLE_TOO_LONG,
@@ -237,8 +237,8 @@ export class CourseStructureService implements OnModuleInit {
                                     'id', ch.id, 'position', ch.position, 'title', ch.title, 'objective', ch.objective,
                                     'description', ch.description, 'videoEnabled', ch.video_enabled,
                                     'activityEnabled', ch.activity_enabled,
-                                    -- Motor de carga horaria: tolerante a una base sin la migración (null → 'content').
-                                    'kind', coalesce(to_jsonb(ch) ->> 'chapter_kind', 'content')) order by ch.position, ch.id)
+                                    -- Motor de carga horaria: sin la migración la clave viene null (y el editor no ofrece la práctica).
+                                    'kind', to_jsonb(ch) ->> 'chapter_kind') order by ch.position, ch.id)
                              from public.course_chapters ch where ch.module_id = m.id and ch.course_id = c.id), '[]'::json)
                        ) order by m.position, m.id)
                   from public.course_modules m where m.course_id = c.id), '[]'::json) as modules
@@ -278,8 +278,9 @@ export class CourseStructureService implements OnModuleInit {
           throw new Error(`Capítulo ${c.id}: activity_enabled ilegible (${JSON.stringify(c.activityEnabled)})`);
         }
         activityByChapter.set(c.id, c.activityEnabled);
-        if (c.kind !== 'content' && c.kind !== 'practice') throw new Error(`Capítulo ${c.id}: chapter_kind ilegible (${JSON.stringify(c.kind)})`);
-        kindByChapter.set(c.id, c.kind);
+        // Motor de carga horaria: null = base sin la migración (capítulo de contenido, sin informar el tipo).
+        if (c.kind !== null && c.kind !== undefined && c.kind !== 'content' && c.kind !== 'practice') throw new Error(`Capítulo ${c.id}: chapter_kind ilegible (${JSON.stringify(c.kind)})`);
+        if (c.kind === 'content' || c.kind === 'practice') kindByChapter.set(c.id, c.kind);
         return {
           id: c.id as string,
           position: Number(c.position),
@@ -350,7 +351,7 @@ export class CourseStructureService implements OnModuleInit {
           description: c.description ?? null,
           videoEnabled: c.videoEnabled,
           activityEnabled: activityByChapter.get(c.id) as boolean,
-          kind: kindByChapter.get(c.id) as 'content' | 'practice',
+          ...(kindByChapter.has(c.id) ? { kind: kindByChapter.get(c.id) as 'content' | 'practice' } : {}),
         })),
       })),
       currentBlueprint,
@@ -742,6 +743,7 @@ export class CourseStructureService implements OnModuleInit {
     const practice = dto.kind === 'practice';
     if (practice && dto.videoEnabled === true) throw practiceVideoError();
     await assertV21StructureSchema(this.dataSource); // V2.1 fix round 1 (I5): 503 si falta la migración R3
+    if (dto.kind !== undefined) await assertPracticeChapterSchema(this.dataSource); // 503 sin la migración de práctica
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();
@@ -813,6 +815,7 @@ export class CourseStructureService implements OnModuleInit {
   async updateChapter(courseId: number, moduleId: string, chapterId: string, ownerId: string, dto: UpdateChapterDto) {
     assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     await assertV21StructureSchema(this.dataSource); // V2.1 fix round 1 (I5): 503 si falta la migración R3
+    if (dto.kind !== undefined) await assertPracticeChapterSchema(this.dataSource); // 503 sin la migración de práctica
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();

@@ -194,7 +194,9 @@ export function proposeStructureAdjustments(
       const path = `modules[${mi}].chapters[${ci}]`;
       // Motor de carga horaria: un capítulo de práctica nunca lleva video (regla de producto > pedagogía).
       if (videoPolicy !== 'keep' && chapterKindOf(c) !== 'practice') {
-        const want = videoPolicy === 'every_chapter' ? true : ci === 0;
+        // «Solo el primero» = el primer capítulo de CONTENIDO del módulo (una práctica al inicio no cuenta).
+        const contentIdx = m.chapters.filter((x) => chapterKindOf(x) !== 'practice').indexOf(c);
+        const want = videoPolicy === 'every_chapter' ? true : contentIdx === 0;
         if (row.video_enabled !== want) {
           changes.push({
             path: `${path}.videoEnabled`, entityId: c.id, title: c.title, field: 'videoEnabled', from: row.video_enabled, to: want,

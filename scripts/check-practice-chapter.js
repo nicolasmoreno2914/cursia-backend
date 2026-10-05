@@ -45,6 +45,8 @@ const B = loadDist('package/dynamic-mbz-builder-v3.js');
 const VAL = loadDist('package/v3/mbz-validator-v3.js');
 const SHELL = loadDist('modules/course-shell/index.js');
 const PF = require('./lib/v21-packaging-fixtures');
+const CASCADE = loadDist('modules/dynamic-generation/regeneration-cascade.js');
+const GUARD = loadDist('modules/course-structure/v21-schema-guard.js');
 const RCP = require('./fixtures/pedagogy/rcp-course.json');
 const PROF = require('./fixtures/pedagogy/profiles.json');
 
@@ -179,8 +181,6 @@ const contentIdsOf = (s, mi) => s.modules[mi].chapters.filter((c) => c.kind !== 
     const delta = usd(dr) - usd(plain);
     // Solo experience + activity (LLM) por capítulo de práctica; los exámenes NO cambian (no la cubren).
     assert(delta > 0 && delta < 0.6, `dos capítulos de práctica cuestan < USD 0,60 (${delta.toFixed(4)})`);
-    const byType = (x) => { const o = {}; for (const [k, v] of Object.entries(x.baseline.providers.estimateUsd.byProvider)) o[k] = v; return o; };
-    void byType;
     for (const prov of ['gamma', 'videogen', 'openai']) {
       const ops = (x) => JSON.stringify((x.baseline.providers.byProvider[prov] || {}).operations || {});
       eq(ops(dr), ops(plain), `${prov}: mismas operaciones`);
@@ -287,6 +287,41 @@ const contentIdsOf = (s, mi) => s.modules[mi].chapters.filter((c) => c.kind !== 
     eq(fps.practiceSources.size, 0, 'sin fuentes de práctica');
     const plan = PLAN.buildPackagingPlanV3(pm, plain);
     assert(plan.modules.every((x) => x.chapters.every((c) => !('kind' in c) && c.keys.content && c.keys.presentation && c.keys.audiobookChapter)), 'plan de empaque de siempre');
+  });
+
+  await check('PC10 regenerar el Libro de una fuente DENTRO de un run regenera también la práctica del módulo (revisión L4 I1)', () => {
+    const src = contentIdsOf(bp, 0)[1];
+    const c = CASCADE.regenerationCascade(3, m.items, { key: `content:${src}`, type: 'content', moduleId: bp.modules[0].id, chapterId: src });
+    assert(c.regenerate.includes(`experience:${PR1}`) && c.regenerate.includes(`activity:${PR1}`), `práctica del módulo 1: ${c.regenerate.join(', ')}`);
+    assert(!c.regenerate.some((k) => k.endsWith(PR2)), 'la del módulo 2 no');
+    eq(c.stale.filter((k) => k.endsWith(PR1)), [], 'nada pagado de la práctica');
+    const plain = manifestOf(P.snapshotFromStructure(clone(RCP)));
+    const c0 = CASCADE.regenerationCascade(3, plain.items, { key: `content:${src}`, type: 'content', moduleId: bp.modules[0].id, chapterId: src });
+    eq(c0.regenerate.filter((k) => !k.endsWith(src) && !/^(exam|final_exam):/.test(k)), [], 'sin práctica: la cascada de siempre');
+  });
+
+  await check('PC11 práctica al INICIO del módulo + enfoque «problemas»: el video del primer capítulo de contenido no se toca (revisión L4 I4)', () => {
+    for (const k of ['problemas', 'problemas+significativo+autodirigido']) {
+      const s2 = clone(RCP);
+      s2.course.reviewCards = true;
+      s2.modules[0].chapters.unshift({ id: PR1, title: 'Práctica de entrada', kind: 'practice', activityEnabled: true });
+      const dr = P.runPedagogyDryRun({ structure: s2, profile: profileOf(k), activityTypeRules: 2 });
+      const first = s2.modules[0].chapters[1].id;
+      assert(!dr.structureChanges.some((c) => c.entityId === first && c.field === 'videoEnabled' && c.to === false), `${k}: no apaga el video del primer capítulo de contenido`);
+      eq(dr.pedagogical.manifestErrors, [], `${k}: Manifest válido`);
+    }
+  });
+
+  await check('PC12 guarda de esquema: sin la columna chapter_kind una escritura con kind responde 503 (no un 500); con ella pasa', async () => {
+    GUARD._resetPracticeSchemaGuardForTests();
+    let err = null;
+    try { await GUARD.assertPracticeChapterSchema({ query: async () => [] }); } catch (e) { err = e; }
+    assert(err && err.getStatus && err.getStatus() === 503 && /schema_not_migrated_practice/.test(JSON.stringify(err.getResponse())), `503: ${err && err.message}`);
+    await GUARD.assertPracticeChapterSchema({ query: async () => [{ '?column?': 1 }] });
+    let calls = 0;
+    await GUARD.assertPracticeChapterSchema({ query: async () => { calls++; return []; } });
+    eq(calls, 0, 'el positivo queda cacheado');
+    GUARD._resetPracticeSchemaGuardForTests();
   });
 
   console.log(`\n${passes} OK, ${failures} fallidas`);

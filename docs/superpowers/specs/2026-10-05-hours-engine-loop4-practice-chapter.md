@@ -76,6 +76,24 @@ Un capítulo `kind: 'practice'` amplía horas con práctica y no con más texto.
   - Badge de minutos con el modelo de tiempo.
   - El validador del `.mbz` prohíbe que la práctica nombre una presentación.
 
+## Correcciones de la revisión independiente (0C/5I/6M)
+
+- **I1. Cascada de regeneración.** Regenerar el `content` de una fuente dentro de un run también regenera `experience` y `activity` de las prácticas del módulo. La cascada sigue las aristas del Manifest y coincide con el plan de invalidación.
+- **I2. Base sin migrar.** Sin la columna, la lectura de la estructura no informa `kind` y el editor no ofrece la práctica. Una escritura con `kind` responde 503 `schema_not_migrated_practice`, nunca un 500.
+- **I3. Plan de conceptos.**
+  - El temario marca los capítulos de práctica.
+  - La práctica tiene `concepts_introduced: []` (el validador la admite).
+  - El Context Package de los capítulos de contenido no la toma como capítulo anterior ni siguiente, y no suma sus conceptos.
+- **I4. Video en el primer capítulo.** La política «video solo en el primer capítulo» del motor pedagógico cuenta solo capítulos de contenido: una práctica al inicio no le quita el video al primer capítulo de contenido.
+- **I5. Práctica SCORM.** Las salas reciben el bloque de práctica con títulos y objetivos de las fuentes. No reciben su texto: las plantillas SCORM trabajan con el temario.
+- **Menores:**
+  - **Pantalla de generación:** los conteos previos excluyen la práctica.
+  - **GIFT de respaldo:** excluye la práctica.
+  - **Editor:** no deja sacar del módulo el único capítulo de contenido de un módulo con práctica.
+  - **Vista de versiones:** muestra «Práctica».
+  - **Metodología:** «presentación en los capítulos de contenido» y «Capítulos de práctica».
+- **Numeración.** El Libro y el audiolibro conservan la numeración del curso. Si el capítulo 3 es de práctica, el Libro pasa del capítulo 2 al 4: es a propósito, para que los números coincidan con los del curso.
+
 ## Pruebas
 
 - `scripts/check-practice-chapter.js` (PC1–PC9):
