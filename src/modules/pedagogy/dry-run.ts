@@ -18,7 +18,7 @@ import {
 } from '../generation-manifests/generation-manifest-builder';
 import type { ActivityTypeRulesVersion } from '../generation-manifests/activity-type-rules';
 import { estimateCost } from '../finops/estimator';
-import { estimateCourseStudyTime, StudyTimeEstimate, studyTimeInputFromManifest } from '../study-time';
+import { DistributionResult, distributeCourseHours, estimateCourseStudyTime, StudyTimeEstimate, studyTimeInputFromManifest } from '../study-time';
 import { ITEM_TYPE_OPERATIONS, isFinopsItemType, providerOfOperation } from '../finops/operations';
 import { estimateItemsForRun } from '../finops/run-budget';
 import { usageModelPriorsV1 } from '../finops/usage-model';
@@ -161,6 +161,11 @@ export interface DryRunResult {
   targetHours: number | null;
   /** Objetivo vs. estimado de la vista final (pedagógica o línea base). null sin objetivo. */
   workload: { targetHours: number; estimatedHours: number; deltaHours: number } | null;
+  /**
+   * Motor de carga horaria (Loop 3): diseño propuesto por el distribuidor para alcanzar targetHours (null sin
+   * objetivo). Solo propuesta: no cambia el Blueprint ni el Manifest de este dry-run.
+   */
+  distribution: DistributionResult | null;
   baseline: DryRunSide;
   pedagogical: DryRunSide | null;
   structureChanges: StructureChange[];
@@ -457,6 +462,9 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
     profileEmpty,
     rules,
     targetHours,
+    distribution: targetHours === null
+      ? null
+      : distributeCourseHours({ snapshot: view.blueprint, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1 }),
     workload: targetHours === null
       ? null
       : {

@@ -34,6 +34,8 @@ export const STUDY_TIME_RULES = Object.freeze({
   /** Valores planificados (antes de generar), calibrados con cursos reales. */
   planned: Object.freeze({
     chapterPageWords: 2200,
+    /** Capítulo de práctica: página de práctica guiada (resumen mínimo + consignas), sin Libro propio. */
+    practicePageWords: 900,
     libroChapterWords: 2900,
     slides: 10,
     videoSeconds: 600,
@@ -54,6 +56,7 @@ export type StudyTimeResourceKind =
   | 'forum'
   | 'module_intro'
   | 'chapter_page'
+  | 'practice_page'
   | 'libro'
   | 'presentation'
   | 'video'
@@ -73,6 +76,7 @@ const COMPONENT_OF: Readonly<Record<StudyTimeResourceKind, StudyTimeComponent>> 
   forum: 'course',
   module_intro: 'course',
   chapter_page: 'content',
+  practice_page: 'practice',
   libro: 'content',
   presentation: 'content',
   video: 'content',
@@ -98,6 +102,8 @@ export interface StudyTimeResource {
 /** Un capítulo: qué recursos tiene y, si ya existen, sus medidas. */
 export interface StudyTimeChapterInput {
   chapterId: string;
+  /** 'practice' = capítulo de práctica (página de práctica guiada); ausente = 'content'. */
+  kind?: 'content' | 'practice';
   /** Palabras que el estudiante lee en la página del capítulo (medidas). Ausente = planificado. */
   pageWords?: number;
   libro: boolean;
@@ -206,7 +212,9 @@ export function estimateChapterStudyTime(ch: StudyTimeChapterInput): StudyTimeCh
   if (!ch || typeof ch.chapterId !== 'string' || !ch.chapterId) throw new StudyTimeError('capítulo sin chapterId');
   const where = `capítulo ${ch.chapterId}`;
   const out: StudyTimeResource[] = [];
-  out.push(readingResource('chapter_page', measure(ch.pageWords, P.chapterPageWords, `pageWords del ${where}`, { integer: true })));
+  if (ch.kind !== undefined && ch.kind !== 'content' && ch.kind !== 'practice') throw new StudyTimeError(`kind del ${where} inválido (${JSON.stringify(ch.kind)})`);
+  const practice = ch.kind === 'practice';
+  out.push(readingResource(practice ? 'practice_page' : 'chapter_page', measure(ch.pageWords, practice ? P.practicePageWords : P.chapterPageWords, `pageWords del ${where}`, { integer: true })));
   if (ch.libro) out.push(readingResource('libro', measure(ch.libroWords, P.libroChapterWords, `libroWords del ${where}`, { integer: true })));
   if (ch.presentation) {
     const s = measure(ch.slides, P.slides, `slides del ${where}`, { integer: true });
@@ -275,14 +283,18 @@ export function estimateCourseStudyTime(input: StudyTimeCourseInput): StudyTimeE
       return estimateChapterStudyTime(c);
     });
     if (m.exam) {
-      const q = measure(m.examQuestions, examSlotSplit(m.chapters.length).total, `examQuestions del módulo ${m.moduleId}`, { integer: true });
+      // Las preguntas salen del texto de los capítulos de CONTENIDO (el de práctica no tiene texto propio).
+      const contentCount = m.chapters.filter((c) => c.kind !== 'practice').length;
+      if (contentCount === 0) throw new StudyTimeError(`el módulo ${m.moduleId} tiene examen pero ningún capítulo de contenido`);
+      const q = measure(m.examQuestions, examSlotSplit(contentCount).total, `examQuestions del módulo ${m.moduleId}`, { integer: true });
       mr.push(res('module_exam', q.value * R.minutesPerExamQuestion, `${q.value} preguntas × ${fmt(R.minutesPerExamQuestion)} min`, q.measured));
     }
     const moduleEstimatedMinutes = r2(mr.reduce((a, x) => a + x.minutes, 0) + chapters.reduce((a, c) => a + c.chapterEstimatedMinutes, 0));
     return { moduleId: m.moduleId, moduleEstimatedMinutes, resources: mr, chapters };
   });
   if (input.finalExam) {
-    const q = measure(input.finalExamQuestions, finalExamSlotSplit(seenChapters.size).total, 'finalExamQuestions', { integer: true });
+    const contentTotal = input.modules.reduce((n, m) => n + m.chapters.filter((c) => c.kind !== 'practice').length, 0);
+    const q = measure(input.finalExamQuestions, finalExamSlotSplit(contentTotal).total, 'finalExamQuestions', { integer: true });
     course.push(res('final_exam', q.value * R.minutesPerExamQuestion, `${q.value} preguntas × ${fmt(R.minutesPerExamQuestion)} min`, q.measured));
   }
 

@@ -35,6 +35,8 @@ const slim = (r) => {
   const out = JSON.parse(JSON.stringify(r));
   for (const k of ['baseline', 'pedagogical']) if (out[k]) out[k] = { blueprintSha256: out[k].blueprintSha256, manifestErrors: out[k].manifestErrors, totals: out[k].manifest.totals, estimateUsd: out[k].providers.estimateUsd };
   delete out.appliedRules; delete out.rules;
+  // Motor de carga horaria: la propuesta del distribuidor sin el desglose del modelo de tiempo (el panel no lo lee).
+  if (out.distribution) delete out.distribution.studyTime;
   return out;
 };
 const reg = P.defaultApproachRegistry();
@@ -46,6 +48,9 @@ const panel = {
   recommendRcp: P.recommendApproaches(PF.wizardAnswers['rcp-practico']),
   dryRunProblemas: slim(Object.assign(P.runPedagogyDryRun({ structure: RCP, profile: prof('problemas') }), { profileSource: 'request', savedProfileVersion: 0 })),
   dryRunEmpty: slim(Object.assign(P.runPedagogyDryRun({ structure: RCP, profile: null }), { profileSource: 'none', savedProfileVersion: 0 })),
+  // Motor de carga horaria (Loop 3): RCP con «Repaso» + competencias + 33 h, y sin enfoque + 8 h (mínimo supera el objetivo).
+  dryRunCompetencias33: slim(Object.assign(P.runPedagogyDryRun({ structure: { ...RCP, course: { ...RCP.course, reviewCards: true } }, profile: { ...prof('competencias'), targetHours: 33 } }), { profileSource: 'request', savedProfileVersion: 0 })),
+  dryRunHours8: slim(Object.assign(P.runPedagogyDryRun({ structure: { ...RCP, course: { ...RCP.course, reviewCards: true } }, profile: { ...P.emptyPedagogicalProfile(), targetHours: 8 } }), { profileSource: 'request', savedProfileVersion: 0 })),
 };
 
 // ── pedagogy-prompts-rcp.json (test-50) ──
