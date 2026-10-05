@@ -79,12 +79,17 @@ const GOLDEN = {
   // hash, nombre, tamaño, mimetype) y la descripción del recurso (resource.xml) con el botón «Abrir Libro Guía →» y «documento PDF».
   // Dorados anteriores (3.12.0): h5p-final-light 5e9bf0f0…, scorm-nofinal-dark b967577f…, h5p-nofinal-dark-mock-cleansafe
   // 14d45c9d…, scorm-final-light 6c18bcce…, h5p-ev5c-rules1 3c6d123e….
+  // Motor de carga horaria Loop 1 (study-time) cambia el .mbz a propósito, y SOLO en el badge «~X min» de la apertura de
+  // cada capítulo (modelo único: 150 ppm + Libro + preguntas del video + repaso): en las 5 configuraciones cambian exactamente
+  // 4 entradas del zip (los label.xml de apertura) y normalizando «~N min» son idénticas (scratchpad/r23/mbzdiff.js).
+  // Dorados anteriores (3.13.0): h5p-final-light 0eb987bf…, scorm-nofinal-dark ef843c54…, h5p-nofinal-dark-mock-cleansafe
+  // f309c5ac…, scorm-final-light 02a970f2…, h5p-ev5c-rules1 3a8c0028….
   mbz: {
-    'h5p-final-light': '0eb987bf3053628826eae8f72cd88bff6825d0db65fea8046009570116f6b2ab',
-    'scorm-nofinal-dark': 'ef843c5414e59ffb50fb8d46f02d8800e6c23774ca73685252fa33b3cf16c725',
-    'h5p-nofinal-dark-mock-cleansafe': 'f309c5ac6db472587da1b7c3444597001d3dbaec923d0e51ca5939e483f356cb',
-    'scorm-final-light': '02a970f2cc4eddac2966fae28cfbb306920c715574e416e391fab703436bc0ec',
-    'h5p-ev5c-rules1': '3a8c0028b764cd91a21dbe8d58e92215479621793032b08788467225ef3836ef',
+    'h5p-final-light': 'f81e186a6da1aacf3f56d18008c95c7f6211f10e267befefeb55974a97970cb5',
+    'scorm-nofinal-dark': '8e99edd2d00f974b8c36015fcadd77c942dc2470ed9f5f621347f675aa301fb8',
+    'h5p-nofinal-dark-mock-cleansafe': 'b933f95914ba27af4e2e55f57af72873a3b592a3c0818c019d1cb9aeedda0bba',
+    'scorm-final-light': '93f39f3ecad0961062b95052a4e14498c7c75c64228688fbf5fb01c48b66a8a6',
+    'h5p-ev5c-rules1': '18ec532260583fb1dcaa8bf7dce28546395400825b6a4352ca05f90a462a2b6a',
   },
 };
 /** Listas propias de rules 2 (CONGELADO: cambiar cualquiera = reglas 3). */
@@ -362,6 +367,31 @@ const SRC = (bp) => ({ courseId: 777, blueprintId: 1, blueprintNumber: 1, bluepr
         finalExamQuestionCount: 12, libroWordCount: 1000,
       },
     }), /solo con H5P v2 \(activityTypeRules=2\) y motor h5p/, 'facts con rules 1');
+  });
+  await check('motor de carga horaria (re-revisión L1 N1/N2): tarjetas MEDIDAS de «Repaso» en los minutos; conteos inválidos o de capítulos sin «Repaso» fallan; studyTime del paquete', async () => {
+    const f = built2.expectations.facts;
+    assert(f.studyTime && f.studyTime.courseEstimatedHours > 0 && f.studyTime.usesPlannedValues === true, 'facts.studyTime del paquete (marco y aperturas siguen planificados)');
+    const withReview = f.chapters.filter((c) => c.reviewCards).map((c) => c.id);
+    assert(withReview.length > 0, 'el fixture tiene capítulos con «Repaso»');
+    const VCF = require('./lib/v21-vc-fixtures');
+    const words = Object.fromEntries(f.chapters.map((c) => [c.id, SHELL.experienceMovementWords(VCF.buildExperience())]));
+    const factsWith = (counts) => SHELL.buildCourseFacts({
+      manifest: input2.manifest, blueprint: input2.blueprint, assessment: input2.assessmentProfile,
+      reviewCardsChapterIds: withReview, ...(counts ? { reviewCardCountByChapter: counts } : {}),
+      artifacts: {
+        audioWelcomeSeconds: 10, audiobookParts: f.chapters.map((c) => ({ chapterId: c.id, seconds: 10 })),
+        slideCountByChapter: Object.fromEntries(f.chapters.map((c) => [c.id, 8])), examQuestionCountByModule: Object.fromEntries(f.modules.filter((m) => m.examEnabled).map((m) => [m.id, 8])),
+        ...(f.finalExam.enabled ? { finalExamQuestionCount: 12 } : {}), libroWordCount: 1000, experienceWordsByChapter: words,
+      },
+    });
+    const planned = factsWith(null);
+    const four = factsWith({ [withReview[0]]: 4 });
+    const ten = factsWith({ [withReview[0]]: 10 });
+    eq(Math.round((ten.studyTime.courseEstimatedMinutes - four.studyTime.courseEstimatedMinutes) * 100) / 100, 3, '6 tarjetas medidas más = 3 min');
+    eq(Math.round((planned.studyTime.courseEstimatedMinutes - four.studyTime.courseEstimatedMinutes) * 100) / 100, 2.5, 'planificado (9) vs medido (4)');
+    const sinRepaso = f.chapters.find((c) => !withReview.includes(c.id));
+    if (sinRepaso) throws(() => factsWith({ [sinRepaso.id]: 6 }), /capítulo sin «Repaso»/, 'conteo de un capítulo sin «Repaso»');
+    for (const bad of [0, -1, 2.5, '9', null]) throws(() => factsWith({ [withReview[0]]: bad }), /tarjetas de «Repaso» del capítulo/, `conteo ${JSON.stringify(bad)}`);
   });
   await check('fix round 1 (M-5/M-6): un capítulo con < 4 tarjetas no lleva «Repaso»; facts, secuencia y validador coherentes; el label de autoevaluación no repite «Repaso»', async () => {
     const VCF = require('./lib/v21-vc-fixtures');

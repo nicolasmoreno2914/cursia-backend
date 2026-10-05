@@ -48,6 +48,7 @@ function loadDist(rel) {
 }
 
 const S = loadDist('modules/course-shell/index.js');
+const ST = loadDist('modules/study-time/index.js');
 const vc = loadDist('modules/visual-components/index.js');
 const te = loadDist('modules/theme-engine/index.js');
 const cp = loadDist('modules/course-profiles/course-profiles.js');
@@ -473,9 +474,12 @@ async function pureChecks() {
   await check('P3: apertura «Módulo M · Capítulo N de T · ~X min» (X de facts, palabras medidas), riel «Dónde estás» del módulo y CTA en el color del módulo', () => {
     // experienceWordCount: solo texto que lee el estudiante (sin type/kind/variant/chapterId).
     eq(S.experienceWordCount({ type: 'hero', title: 'Uno dos', lead: 'tres', chapterId: 'cap-x', items: ['cuatro cinco', 7] }), 5, 'experienceWordCount');
-    eq([S.estimateChapterMinutes({ words: 1800, slideCount: 10, videoEnabled: true, activityEnabled: true }), S.estimateChapterMinutes({ words: 10, slideCount: 0, videoEnabled: false, activityEnabled: false })], [30, 5], 'estimateChapterMinutes');
-    // fix M2: la duración MEDIDA del video reemplaza el estimado fijo (6 min) — 20 min de video → 45, no 30.
-    eq(S.estimateChapterMinutes({ words: 1800, slideCount: 10, videoEnabled: true, activityEnabled: true, videoSeconds: 1200 }), 45, 'video medido');
+    // Motor de carga horaria: el tiempo del capítulo sale del modelo único (study-time); 150 palabras/min,
+    // Libro, diapositivas, video MEDIDO + sus preguntas, actividad y repaso. Redondeo a 5 (mínimo 5).
+    const base = { chapterId: 'c', pageWords: 1800, libro: false, presentation: true, slides: 10, video: true, activity: true, review: false };
+    eq([ST.estimateChapterStudyTime(base).displayMinutes, ST.estimateChapterStudyTime({ chapterId: 'c', pageWords: 10, libro: false, presentation: false, video: false, activity: false, review: false }).displayMinutes], [45, 5], 'estimateChapterStudyTime');
+    // fix M2: la duración MEDIDA del video reemplaza el planificado (600 s) — 20 min de video → 55, no 45.
+    eq(ST.estimateChapterStudyTime({ ...base, videoSeconds: 1200 }).displayMinutes, 55, 'video medido');
     const words = {};
     const exps = F.experiencesFor(c2.manifest);
     for (const id of Object.keys(exps)) words[id] = S.experienceMovementWords(exps[id]);
@@ -491,6 +495,19 @@ async function pureChecks() {
     const fw = factsOf(c2, { artifacts: { ...F.measuredArtifacts(c2.manifest), experienceWordsByChapter: words } });
     assert(fw.chapters.every((c) => Number.isInteger(c.estimatedMinutes) && c.estimatedMinutes >= 5 && c.estimatedMinutes % 5 === 0), 'minutos en facts');
     assert(S.factsNumberSet(fw).has(fw.chapters[0].estimatedMinutes), 'los minutos son números de facts');
+    // Fuente única: los minutos de facts son los del modelo study-time con las mismas medidas.
+    assert(fw.studyTime && fw.studyTime.rulesVersion === ST.STUDY_TIME_RULES_VERSION && fw.studyTime.courseEstimatedHours > 0, 'facts.studyTime del curso');
+    eq(f2.studyTime, undefined, 'sin palabras medidas no hay studyTime');
+    const art = F.measuredArtifacts(c2.manifest);
+    fw.chapters.forEach((c) => {
+      const shown = ['opening', 'deepening', 'synthesis', 'closing', ...(c.videoEnabled ? ['video_primer'] : []), ...(!c.activityEnabled ? ['self_check'] : [])];
+      const direct = ST.estimateChapterStudyTime({
+        chapterId: c.id, pageWords: shown.reduce((a, m) => a + (words[c.id][m] || 0), 0), libro: true, libroWords: Math.max(1, Math.round(art.libroWordCount / fw.chapters.length)),
+        presentation: true, slides: c.slideCount, video: c.videoEnabled, ...(c.videoEnabled && art.videoSecondsByChapter && art.videoSecondsByChapter[c.id] ? { videoSeconds: art.videoSecondsByChapter[c.id] } : {}),
+        ivAdvanced: c2.manifest.features.ivAdvanced === 1, activity: c.activityEnabled, review: c.reviewCards === true,
+      });
+      eq(c.estimatedMinutes, direct.displayMinutes, `cap ${c.number}: facts = study-time`);
+    });
     eq(f2.chapters.some((c) => c.estimatedMinutes !== undefined), false, 'sin palabras medidas no hay minutos');
     let threw = false;
     try { factsOf(c2, { artifacts: { ...F.measuredArtifacts(c2.manifest), experienceWordsByChapter: { ...words, intruso: 3 } } }); } catch (e) { threw = /no está en el Manifest/.test(e.message); }

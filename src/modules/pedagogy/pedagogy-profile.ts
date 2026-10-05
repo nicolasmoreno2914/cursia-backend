@@ -1,4 +1,5 @@
 import { sha256Canonical } from '../coherence/canonical-json';
+import { TARGET_HOURS_MAX, TARGET_HOURS_MIN, isValidTargetHours } from '../study-time/target-hours';
 import { PedagogicalApproachRegistry } from './approach-registry';
 import { defaultApproachRegistry } from './builtin-approaches';
 import {
@@ -64,6 +65,12 @@ export interface PedagogicalProfile {
   assessmentMethods: AssessmentMethod[];
   principles: string[];
   origin: 'manual' | 'wizard';
+  /**
+   * Motor de carga horaria: horas de estudio objetivo del curso (restricción del curso, no pedagogía).
+   * Opcional: la clave existe SOLO si se definió (perfiles anteriores conservan su sha). Puede ir en un
+   * perfil sin enfoque.
+   */
+  targetHours?: number;
 }
 
 export interface PedagogyValidationError {
@@ -107,6 +114,20 @@ const TOP_KEYS = [
 ];
 /** `designRules` lo escribe el servidor: se tolera en la entrada (se ignora y se recalcula). */
 const TOLERATED_KEYS = ['designRules'];
+/** Claves opcionales (ausentes = comportamiento anterior). */
+const OPTIONAL_KEYS = ['targetHours'];
+
+/**
+ * Horas objetivo de un perfil guardado o enviado (con o sin enfoque). null = sin objetivo (comportamiento
+ * anterior). Un valor inválido lanza PROFILE_INVALID (nunca se ignora en silencio).
+ */
+export function profileTargetHours(p: unknown): number | null {
+  if (!isPlainObject(p) || p.targetHours === undefined || p.targetHours === null) return null;
+  if (!isValidTargetHours(p.targetHours)) {
+    throw new Error(`PROFILE_INVALID: INVALID_TARGET_HOURS targetHours: debe ser un número de ${TARGET_HOURS_MIN} a ${TARGET_HOURS_MAX} horas, en pasos de 0,5 (fue ${JSON.stringify(p.targetHours)})`);
+  }
+  return p.targetHours;
+}
 const LEARNER_KEYS = ['description', 'ageGroup', 'educationLevel', 'priorKnowledge', 'experience'];
 const OUTCOME_KEYS = ['know', 'do', 'competencies'];
 
@@ -124,7 +145,7 @@ export function validatePedagogicalProfile(
 
   for (const k of TOP_KEYS) if (!(k in p)) err(k, 'MISSING_FIELD', `Falta el campo "${k}"`);
   for (const k of Object.keys(p)) {
-    if (!TOP_KEYS.includes(k) && !TOLERATED_KEYS.includes(k)) err(k, 'UNKNOWN_FIELD', `Campo desconocido "${k}"`);
+    if (!TOP_KEYS.includes(k) && !TOLERATED_KEYS.includes(k) && !OPTIONAL_KEYS.includes(k)) err(k, 'UNKNOWN_FIELD', `Campo desconocido "${k}"`);
   }
   if ('pedagogyProfileVersion' in p && p.pedagogyProfileVersion !== PEDAGOGY_PROFILE_VERSION) {
     err('pedagogyProfileVersion', 'INVALID_PROFILE_VERSION', `pedagogyProfileVersion debe ser ${PEDAGOGY_PROFILE_VERSION}`);
@@ -180,6 +201,9 @@ export function validatePedagogicalProfile(
   if ('principles' in p) checkTextList(p.principles, 'principles', errors);
   if ('origin' in p && p.origin !== 'manual' && p.origin !== 'wizard') {
     err('origin', 'INVALID_ORIGIN', "origin debe ser 'manual' o 'wizard'");
+  }
+  if ('targetHours' in p && p.targetHours !== null && !isValidTargetHours(p.targetHours)) {
+    err('targetHours', 'INVALID_TARGET_HOURS', `targetHours debe ser un número de ${TARGET_HOURS_MIN} a ${TARGET_HOURS_MAX} horas, en pasos de 0,5`);
   }
   return errors;
 }
@@ -260,6 +284,8 @@ export function normalizePedagogicalProfile(
     assessmentMethods: inOrder(ASSESSMENT_METHODS, q.assessmentMethods),
     principles: texts(q.principles),
     origin: q.origin,
+    // Solo si se definió: los perfiles sin objetivo conservan bytes y sha.
+    ...(q.targetHours !== undefined && q.targetHours !== null ? { targetHours: q.targetHours } : {}),
   };
 }
 

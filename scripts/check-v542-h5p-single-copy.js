@@ -222,7 +222,10 @@ const BS_CFG = {
     // r19 W (builder 3.12.0 → 3.13.0): SOLO cambia el label cv3:shell:welcome (hero con superficie según heroTreatment, «Curso · N módulos · M capítulos», entrada ≤ 40 palabras y cuerpo en párrafos ≤ 70) — diff por entrada del zip en scratchpad/r19/w-logs/golddiff (hook.js + diff.js) (antes a169af34…, 3.12.0).
     // r19 L fix round 1: logo de la portada a opacidad plena, /Keywords del PDF (sha del plan) y transliteración — vuelve a mover solo el blob del Libro.
     // r19 L (builder 3.13.0): solo el Libro Guía (PDF en vez de HTML) y la descripción de su recurso (botón) — diff en scratchpad/r19/impl-l-probe/golddiff.js (antes a169af34…, 3.12.0).
-    eq(sha(r.mbz), '6c5212484dc65adcbac6c621acda47914091f11b05400cbe22fcc5c42e1d8ed2', 'sha256');
+    // Motor de carga horaria Loop 1 (study-time): cambia SOLO el badge «~X min» de la apertura de cada capítulo; verificado
+    // archivo por archivo (scratchpad/r23/mbzdiff2.js): solo cambian esos label.xml y, normalizando «~N min», son idénticos.
+    // Dorado 3.13.0: 6c521248….
+    eq(sha(r.mbz), '742d47a3091866dda1fe16768a7e6f92a47e3ef86b45e2fc4ea63e209bb8a7b2', 'sha256');
   });
 
   console.log(`\n${failures ? 'HAY FALLOS' : 'Todos los checks de V542 I2 (H5P de una sola copia) pasaron'} (${passed} ✅, ${failures} ❌).`);

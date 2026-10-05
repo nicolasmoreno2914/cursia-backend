@@ -144,6 +144,7 @@ import { expectedExamPlan, planSlotCount, validateExamBank } from '../modules/co
 import type { ExamBankV1 } from '../modules/course-shell/exam-bank';
 import { examExplanationsAvailability, examOverallFeedbackBands } from '../modules/course-shell/exam-explanations';
 import type { ExamBankPlans } from './v3/exam-validator-v3';
+import { reviewCardsEnabledFor } from '../modules/study-time/manifest-input';
 import { COURSE_BADGE_BACKUP_ID, COURSE_BADGE_DEFAULT_ISSUER, courseBadgeImages, courseBadgeName, courseBadgeXml } from './v3/course-badge';
 
 /**
@@ -865,7 +866,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   });
   // EV6 H5P v2 — «Repaso» (Dialog Cards) desde la experiencia validada, solo con el ajuste del
   // Blueprint. Capítulos con < 4 tarjetas no llevan repaso (nunca un mazo de 1–3).
-  const reviewDecks = new Map<string, H5pBuiltContent>();
+  const reviewDecks = new Map<string, H5pBuiltContent & { cards: unknown[] }>();
   // H2 fix round 1 (I-2, M-4): solo con H5P v2 (marcador activityTypeRules=2 del Manifest) y motor h5p
   // (un curso SCORM puede ir a un sitio sin las librerías v1 de las que depende Dialog Cards).
   if (reviewCardsApply(blueprint, manifest)) {
@@ -878,6 +879,8 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     manifest,
     blueprint,
     ...(reviewDecks.size ? { reviewCardsChapterIds: [...reviewDecks.keys()] } : {}),
+    // Motor de carga horaria: tarjetas MEDIDAS de cada «Repaso» (minutos del capítulo).
+    ...(reviewDecks.size ? { reviewCardCountByChapter: Object.fromEntries([...reviewDecks].map(([id, d]) => [id, d.cards.length])) } : {}),
     assessment: input.assessmentProfile,
     hours: input.hours ?? null,
     pendingVideos: plan.omittedVideos.length ? { chapterIds: plan.omittedVideos.map((v) => v.chapterId), noticeChapterIds } : null,
@@ -1630,7 +1633,8 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
  * de H5P v2 (activityTypeRules = 2) y el motor de actividades es h5p. Cualquier otro caso: apagado.
  */
 export function reviewCardsApply(blueprint: BlueprintSnapshotV2, manifest: GenerationManifestV1): boolean {
-  return blueprint.course.reviewCards === true && manifest.features?.activityTypeRules === 2 && blueprint.course.activityEngine === 'h5p';
+  // Predicado único compartido con el modelo de tiempo (study-time): mismas condiciones en ambos.
+  return reviewCardsEnabledFor(blueprint, manifest);
 }
 
 /**

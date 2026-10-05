@@ -18,6 +18,7 @@ import {
 } from '../generation-manifests/generation-manifest-builder';
 import type { ActivityTypeRulesVersion } from '../generation-manifests/activity-type-rules';
 import { estimateCost } from '../finops/estimator';
+import { estimateCourseStudyTime, StudyTimeEstimate, studyTimeInputFromManifest } from '../study-time';
 import { ITEM_TYPE_OPERATIONS, isFinopsItemType, providerOfOperation } from '../finops/operations';
 import { estimateItemsForRun } from '../finops/run-budget';
 import { usageModelPriorsV1 } from '../finops/usage-model';
@@ -34,7 +35,7 @@ import {
   proposeStructureAdjustments,
 } from './pedagogical-blueprint';
 import { ItemPedagogyBrief, OverrideLevel, PEDAGOGY_GENERATOR_COVERAGE, buildItemPedagogyBrief } from './generator-directives';
-import { PedagogicalProfile, isEmptyPedagogicalProfile, normalizePedagogicalProfile } from './pedagogy-profile';
+import { PedagogicalProfile, isEmptyPedagogicalProfile, normalizePedagogicalProfile, profileTargetHours } from './pedagogy-profile';
 import { PEDAGOGY_ENGINE_VERSION } from './vocabulary';
 
 /**
@@ -100,6 +101,8 @@ export interface DryRunSide {
   manifestSha256: string;
   manifestErrors: { code: string; message: string; key?: string }[];
   providers: ProviderPlan;
+  /** Motor de carga horaria: tiempo de estudio PLANIFICADO (modelo study-time; nada se genera). */
+  studyTime: StudyTimeEstimate;
 }
 
 export interface DryRunChapterRow {
@@ -154,6 +157,10 @@ export interface DryRunResult {
   profile: PedagogicalProfile | null;
   profileEmpty: boolean;
   rules: DesignRules | null;
+  /** Motor de carga horaria: horas objetivo del curso (null = sin objetivo, comportamiento anterior). */
+  targetHours: number | null;
+  /** Objetivo vs. estimado de la vista final (pedagógica o línea base). null sin objetivo. */
+  workload: { targetHours: number; estimatedHours: number; deltaHours: number } | null;
   baseline: DryRunSide;
   pedagogical: DryRunSide | null;
   structureChanges: StructureChange[];
@@ -168,6 +175,8 @@ export interface DryRunResult {
     itemsWithDesign: number;
     totals: { baseline: Record<string, number>; pedagogical: Record<string, number> | null };
     estimateExpectedUsd: { baseline: string | null; pedagogical: string | null };
+    /** Horas de estudio estimadas (modelo study-time). */
+    estimatedHours: { baseline: number; pedagogical: number | null };
     summary: string[];
   };
   appliedRules: AppliedRule[];
@@ -289,6 +298,12 @@ function snapshotFromSnapshot(s: BlueprintSnapshotV2): BlueprintSnapshotV2 {
   return buildBlueprintSnapshotV2(rows.course, rows.modules, rows.chapters);
 }
 
+/** El mismo snapshot con `course.targetHours` (pasa por el builder: orden canónico y validación). */
+export function withTargetHours(s: BlueprintSnapshotV2, targetHours: number | null): BlueprintSnapshotV2 {
+  const rows = snapshotV2ToRows(s);
+  return buildBlueprintSnapshotV2({ ...rows.course, targetHours }, rows.modules, rows.chapters, rows.pedagogy);
+}
+
 let catalogCache: any[] | null = null;
 function seedCatalog(): any[] {
   if (!catalogCache) {
@@ -341,6 +356,7 @@ function side(snapshot: BlueprintSnapshotV2, activityTypeRules: ActivityTypeRule
     manifestSha256: manifestSha256(manifest),
     manifestErrors: validateGenerationManifestV3(manifest, snapshot, source),
     providers: providerPlanFor(manifest),
+    studyTime: estimateCourseStudyTime(studyTimeInputFromManifest(manifest, snapshot)),
   };
 }
 
@@ -350,7 +366,11 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
   if (activityTypeRules !== 0 && activityTypeRules !== 1 && activityTypeRules !== 2) {
     throw new Error(`DRY_RUN_INVALID: activityTypeRules ${JSON.stringify(activityTypeRules)} (0 | 1 | 2)`);
   }
-  const base = isSnapshot(input.structure) ? snapshotFromSnapshot(input.structure) : snapshotFromStructure(input.structure as DryRunStructureInput);
+  const base0 = isSnapshot(input.structure) ? snapshotFromSnapshot(input.structure) : snapshotFromStructure(input.structure as DryRunStructureInput);
+  // Motor de carga horaria: el objetivo de horas viene del perfil (con o sin enfoque); sin él, el del snapshot recibido.
+  const profileHours = profileTargetHours(input.profile);
+  const base = profileHours !== null ? withTargetHours(base0, profileHours) : base0;
+  const targetHours = base.course.targetHours ?? null;
   const profileEmpty = isEmptyPedagogicalProfile(input.profile);
   const profile = profileEmpty ? null : normalizePedagogicalProfile(input.profile, registry);
   const rules = profile ? deriveDesignRulesOrNull(profile, registry) : null;
@@ -436,6 +456,14 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
     profile,
     profileEmpty,
     rules,
+    targetHours,
+    workload: targetHours === null
+      ? null
+      : {
+        targetHours,
+        estimatedHours: view.studyTime.courseEstimatedHours,
+        deltaHours: Math.round((view.studyTime.courseEstimatedHours - targetHours) * 10) / 10,
+      },
     baseline,
     pedagogical,
     structureChanges,
@@ -455,6 +483,7 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
       itemsWithDesign,
       totals: { baseline: { ...(baseline.manifest.totals as any) }, pedagogical: pedagogical ? { ...(pedagogical.manifest.totals as any) } : null },
       estimateExpectedUsd: { baseline: baseline.providers.estimateUsd?.expected ?? null, pedagogical: pedagogical?.providers.estimateUsd?.expected ?? null },
+      estimatedHours: { baseline: baseline.studyTime.courseEstimatedHours, pedagogical: pedagogical ? pedagogical.studyTime.courseEstimatedHours : null },
       summary,
     },
     appliedRules: rules ? rules.applied : [],

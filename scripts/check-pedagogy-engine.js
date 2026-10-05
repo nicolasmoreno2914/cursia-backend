@@ -821,6 +821,7 @@ async function dbChecks() {
       const res = await blueprints.lock(course.id, OWNER, await counter());
       eq([res.created, res.blueprint.schemaVersion], [true, 2], 'v2');
       assert(!('pedagogy' in res.blueprint.snapshot.course), 'sin course.pedagogy');
+      assert(!('targetHours' in res.blueprint.snapshot.course), 'sin course.targetHours (motor de carga horaria)');
       assert(res.blueprint.snapshot.modules.every((m) => !('design' in m) && m.chapters.every((c) => !('design' in c))), 'sin design');
       plainSha = res.blueprint.sha256;
     });
@@ -881,6 +882,32 @@ async function dbChecks() {
       const res = await blueprints.lock(course.id, OWNER, await counter());
       eq(res.blueprint.sha256, plainSha, 'mismo sha que sin perfil');
       assert(!('pedagogy' in res.blueprint.snapshot.course), 'sin diseño');
+    });
+    await check('DB motor de carga horaria: targetHours en el perfil (sin enfoque) → hay que reconfirmar; el lock lo congela; Manifest con los mismos trabajos; quitarlo vuelve al sha de siempre', async () => {
+      eq(await liveMatches(), true, 'confirmado sin objetivo');
+      const a = await profiles.append(course.id, OWNER, 'pedagogy', { ...P.emptyPedagogicalProfile(), targetHours: 33 });
+      eq([a.created, a.profile.profile ? a.profile.profile.targetHours : a.profile.targetHours], [true, 33], 'perfil con 33 h guardado');
+      eq(await liveMatches(), false, 'el objetivo nuevo pide reconfirmar');
+      const res = await blueprints.lock(course.id, OWNER, await counter());
+      eq([res.created, res.blueprint.snapshot.course.targetHours], [true, 33], 'Blueprint con targetHours');
+      assert(!('pedagogy' in res.blueprint.snapshot.course), 'sin enfoque no hay diseño');
+      eq(snap.validateBlueprintSnapshotV2(res.blueprint.snapshot), [], 'valida');
+      eq(await liveMatches(), true, 'reconfirmado');
+      const read = await blueprints.getByNumberAnySchema(course.id, OWNER, res.blueprint.blueprintNumber);
+      eq(snap.snapshotSha256V2(read.snapshot), res.blueprint.sha256, 'round trip jsonb');
+      const m = mb.buildGenerationManifestV3(read.snapshot, { courseId: course.id, blueprintId: read.id, blueprintNumber: read.blueprintNumber, blueprintSha256: read.sha256 }, { activityTypeRules: 2 });
+      eq(mb.validateGenerationManifestV3(m, read.snapshot, m.source), [], 'Manifest v3 válido');
+      const plainSnap = snap.recanonicalizeBlueprintSnapshotV2({ ...read.snapshot, course: { ...read.snapshot.course, targetHours: undefined } });
+      const mPlain = mb.buildGenerationManifestV3(plainSnap, { ...m.source, blueprintSha256: snap.snapshotSha256V2(plainSnap) }, { activityTypeRules: 2 });
+      eq(snap.snapshotSha256V2(plainSnap), plainSha, 'sin el objetivo es el Blueprint de siempre');
+      eq([m.items, m.totals, m.features], [mPlain.items, mPlain.totals, mPlain.features], 'mismos trabajos');
+      const dr = await pedagogy.dryRunCourse(course.id, OWNER, {});
+      eq([dr.profileSource, dr.targetHours, dr.workload && dr.workload.targetHours, dr.pedagogical], ['saved', 33, 33, null], 'dry-run con el objetivo guardado');
+      await rejectsRe(profiles.append(course.id, OWNER, 'pedagogy', { ...P.emptyPedagogicalProfile(), targetHours: 0.25 }), /INVALID_TARGET_HOURS/, 'objetivo inválido', 400);
+      await profiles.append(course.id, OWNER, 'pedagogy', P.emptyPedagogicalProfile());
+      eq(await liveMatches(), false, 'quitar el objetivo también pide reconfirmar');
+      const back = await blueprints.lock(course.id, OWNER, await counter());
+      eq(back.blueprint.sha256, plainSha, 'sin objetivo: el sha de siempre');
     });
     await check('DB dry-run del curso: estructura viva + perfil del cuerpo (sin guardar) o el guardado; solo lectura; ajeno 404; legacy 400', async () => {
       const before = await ds.query(`select (select count(*)::int from public.course_blueprints) b, (select count(*)::int from public.course_profiles) p, (select structure_version_counter from public.courses where id=$1) c`, [course.id]);
