@@ -33,6 +33,7 @@ import {
   lintObjectives,
   proposeStructureAdjustments,
 } from './pedagogical-blueprint';
+import { ItemPedagogyBrief, OverrideLevel, PEDAGOGY_GENERATOR_COVERAGE, buildItemPedagogyBrief } from './generator-directives';
 import { PedagogicalProfile, isEmptyPedagogicalProfile, normalizePedagogicalProfile } from './pedagogy-profile';
 import { PEDAGOGY_ENGINE_VERSION } from './vocabulary';
 
@@ -117,6 +118,33 @@ export interface DryRunChapterRow {
   resources: string[] | null;
 }
 
+/** Fase 2: lo que recibe el generador de cada trabajo del Manifest pedagógico. */
+export interface DryRunGeneratorRow {
+  itemKey: string;
+  type: string;
+  moduleNumber: number | null;
+  chapterNumber: number | null;
+  /** Generador que produce el trabajo (texto) y si consume el diseño. */
+  generator: string;
+  consumes: boolean;
+  /** Por qué no consume (solo consumes=false). */
+  reason: string | null;
+  /** Dónde entra el texto: bloque del prompt LLM, content_txt de Videogen o additionalInstructions de Gamma. */
+  deliveredAs: string | null;
+  brief: ItemPedagogyBrief | null;
+}
+
+/** Fase 2: reglas pedagógicas que pierden frente a una restricción del CURSO (toggles del docente). */
+export interface DryRunCourseOverride {
+  chapterId: string;
+  title: string;
+  target: string;
+  value: string;
+  by: OverrideLevel;
+  rule: string;
+  effect: string;
+}
+
 export interface DryRunResult {
   dryRun: true;
   providersCalled: 0;
@@ -143,6 +171,54 @@ export interface DryRunResult {
     summary: string[];
   };
   appliedRules: AppliedRule[];
+  /** Fase 2: brief de cada trabajo (vacío sin perfil: los prompts son los de siempre). */
+  generators: DryRunGeneratorRow[];
+  courseOverrides: DryRunCourseOverride[];
+}
+
+const DELIVERED_AS: Readonly<Record<string, string>> = Object.freeze({
+  presentation: 'Gamma: al final de additionalInstructions (después de las reglas de siempre)',
+  video: 'Videogen: cabecera de content_txt (antes del capítulo)',
+});
+
+/** Brief de cada trabajo del Manifest (las mismas funciones que usa el claim del backend). */
+export function generatorPlanFor(side: DryRunSide, registry: PedagogicalApproachRegistry): DryRunGeneratorRow[] {
+  const rules = (side.manifest as any).features?.activityTypeRules ?? null;
+  return side.manifest.items.map((it) => {
+    const cov = PEDAGOGY_GENERATOR_COVERAGE[it.type];
+    if (!cov) throw new Error(`DRY_RUN_COVERAGE: el tipo ${it.type} no está en PEDAGOGY_GENERATOR_COVERAGE`);
+    const brief = buildItemPedagogyBrief({ item: it as any, snapshot: side.blueprint, activityTypeRules: rules, registry });
+    return {
+      itemKey: it.key,
+      type: it.type,
+      moduleNumber: it.moduleNumber ?? null,
+      chapterNumber: it.chapterNumber ?? null,
+      generator: cov.generator,
+      consumes: cov.consumes,
+      reason: cov.consumes ? null : cov.reason,
+      deliveredAs: brief ? DELIVERED_AS[brief.generator] ?? 'Prompt LLM del navegador: bloque «DISEÑO PEDAGÓGICO DE ESTE RECURSO»' : null,
+      brief,
+    };
+  });
+}
+
+/** Toggles del docente (restricción del curso, prioridad 3) que dejan sin efecto una regla pedagógica. */
+function courseOverridesFor(snapshot: BlueprintSnapshotV2): DryRunCourseOverride[] {
+  if (!snapshot.course.pedagogy) return [];
+  const out: DryRunCourseOverride[] = [];
+  for (const m of [...snapshot.modules].sort((a, b) => a.position - b.position)) {
+    for (const c of [...m.chapters].sort((a, b) => a.position - b.position)) {
+      if (!c.design) continue;
+      const d = effectiveChapterDesign(snapshot, c.id);
+      if (!c.videoEnabled) {
+        out.push({ chapterId: c.id, title: c.title, target: 'video.style', value: d.video.style, by: 'course', rule: 'El docente apagó el video de este capítulo', effect: 'No hay video ni preguntas de video: el estilo de video no se aplica.' });
+      }
+      if (c.activityEnabled !== true) {
+        out.push({ chapterId: c.id, title: c.title, target: 'activity.intent', value: d.activity.intent, by: 'course', rule: 'El docente apagó la actividad de este capítulo', effect: 'No hay actividad: la intención de la actividad no se aplica.' });
+      }
+    }
+  }
+  return out;
 }
 
 const DRY_RUN_SOURCE_BASE = { blueprintId: 0, blueprintNumber: 0 };
@@ -382,5 +458,7 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
       summary,
     },
     appliedRules: rules ? rules.applied : [],
+    generators: pedagogical ? generatorPlanFor(pedagogical, registry) : [],
+    courseOverrides: pedagogical ? courseOverridesFor(pedagogical.blueprint) : [],
   };
 }

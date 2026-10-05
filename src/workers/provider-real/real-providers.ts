@@ -335,10 +335,33 @@ function storageBase(item: ClaimedItem, ownerId: string, artifactType: string): 
 // presentation:<ch> — Gamma
 // ═══════════════════════════════════════════════════════════════════════════
 
+/** Tope de additionalInstructions de la API de Gamma (caracteres). */
+export const GAMMA_ADDITIONAL_INSTRUCTIONS_MAX = 2000;
+
+/**
+ * Motor pedagógico Fase 2: línea «Enfoque didáctico…» del brief del item (solo si el claim la trae y
+ * es del generador `presentation`). Va DESPUÉS de las reglas de siempre (veracidad, idioma, portada),
+ * que mandan; si no cabe en el tope de Gamma se omite (la regla técnica gana) y no se trunca a medias.
+ */
+export function gammaPedagogyInstructions(item: Pick<ClaimedItem, 'pedagogy'>): string | null {
+  const p = item.pedagogy;
+  return p && p.generator === 'presentation' && typeof p.text === 'string' && p.text.trim() ? p.text.trim() : null;
+}
+
 /** Cuerpo de la generación: el del legacy probado (gamma-worker.ts), sin las marcas PARTE A/B del layout V1. */
-export function gammaGenerationBody(input: { chapterTitle: string; chapterDescription?: string | null; contentMarkdown: string; themeId: string }): Record<string, unknown> {
+export function gammaGenerationBody(input: { chapterTitle: string; chapterDescription?: string | null; contentMarkdown: string; themeId: string; pedagogyInstructions?: string | null }): Record<string, unknown> {
   // Title Normalization: el título (breve) encabeza la portada; la descripción es contexto, nunca título.
   const desc = input.chapterDescription && input.chapterDescription.trim() ? `${input.chapterDescription.trim()}\n\n` : '';
+  const body = gammaGenerationBodyBase(input, desc);
+  const ped = input.pedagogyInstructions && input.pedagogyInstructions.trim() ? input.pedagogyInstructions.trim() : '';
+  if (ped) {
+    const withPed = `${body.additionalInstructions} ${ped}`;
+    if (withPed.length <= GAMMA_ADDITIONAL_INSTRUCTIONS_MAX) body.additionalInstructions = withPed;
+  }
+  return body;
+}
+
+function gammaGenerationBodyBase(input: { chapterTitle: string; contentMarkdown: string; themeId: string }, desc: string): Record<string, unknown> & { additionalInstructions: string } {
   return {
     inputText: `${input.chapterTitle}\n\n${desc}${cleanAudioText(input.contentMarkdown)}`,
     textMode: 'generate',
@@ -450,17 +473,29 @@ export async function processRealPresentation(deps: RealProviderDeps, item: Clai
     const resKey = await reservePaidCall(deps.finops, {
       kind: 'gamma', ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1, itemAttempt: item.attempt, tag: 'submit', estimate: {},
     });
+    // Motor pedagógico Fase 2: el enfoque de las diapositivas (si el claim lo trae) al final de additionalInstructions.
+    const pedLine = gammaPedagogyInstructions(item);
+    const gammaBody = gammaGenerationBody({
+      chapterTitle, chapterDescription: item.blueprint?.chapter?.description ?? null, contentMarkdown: markdown, themeId: themeId!,
+      pedagogyInstructions: pedLine,
+    });
+    const pedApplied = !!pedLine && String(gammaBody.additionalInstructions).endsWith(pedLine);
+    if (pedLine && !pedApplied) {
+      deps.logger.warn(`Item ${item.itemKey}: el enfoque didáctico no cabe en additionalInstructions de Gamma (tope ${GAMMA_ADDITIONAL_INSTRUCTIONS_MAX}); se envía sin él (manda el límite técnico)`);
+    }
     const marker = new Date().toISOString();
-    await record(deps, item, { externalSubmitStartedAt: marker, externalReservationKey: resKey });
+    await record(deps, item, {
+      externalSubmitStartedAt: marker, externalReservationKey: resKey,
+      // Qué diseño recibió Gamma (auditoría simétrica con el navegador).
+      ...(item.pedagogy ? { pedagogySha256: item.pedagogy.textSha256, pedagogyApplied: pedApplied } : {}),
+    });
     const tracker = deps.tracker;
     if (tracker) {
       tracker.inFlight = { provider: 'gamma', key: resKey };
       (tracker as any).gammaReservationKey = resKey;
     }
     try {
-      generationId = await client.createGeneration(gammaGenerationBody({
-        chapterTitle, chapterDescription: item.blueprint?.chapter?.description ?? null, contentMarkdown: markdown, themeId: themeId!,
-      }));
+      generationId = await client.createGeneration(gammaBody);
     } catch (err) {
       // SOLO un 4xx con respuesta es un rechazo definitivo previo a la aceptación → se libera la
       // reserva, se limpia el marcador y el reintento automático (acotado) puede reenviar.

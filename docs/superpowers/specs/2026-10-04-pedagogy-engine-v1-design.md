@@ -12,7 +12,7 @@ Usuario
   → Reglas de diseño (motor data-driven)
   → Blueprint v2 existente (course.pedagogy + design por módulo/capítulo)
   → Manifest v3 existente (features.pedagogy + design por item + h5pType del diseño)
-  → Generadores existentes (Fase 2: leer item.design en los prompts)
+  → Generadores existentes (Fase 2: brief del diseño en cada prompt / configuración)
 ```
 
 ## Dónde entra (diagnóstico)
@@ -66,9 +66,9 @@ Perfil → reglas → Blueprint (línea base y pedagógico) → Manifest (los do
 - `src/js/__harness__/test-49-pedagogy-panel.mjs` (frontend): panel, asistente, vista previa y errores.
 - `scripts/pedagogy-compare.js`: comparación de la Fase 8, el curso RCP con los 5 enfoques (solo dry-run).
 
-## Fase 2 (fuera de alcance)
+## Fase 2
 
-Conectar `item.design` a los prompt builders (frontend 44 y guion de video del backend) y validarlo con un curso real autorizado. Además:
+Hecha: el diseño de cada trabajo llega a su generador (ver `2026-10-04-pedagogy-phase2-generators-design.md`). Queda validarlo con un curso real autorizado. Además:
 
 - botón «Aplicar cambios sugeridos» (usa la API de estructura existente);
 - aplicar los pesos sugeridos al perfil de evaluación;

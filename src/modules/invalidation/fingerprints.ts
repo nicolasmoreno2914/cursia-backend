@@ -1,6 +1,7 @@
 import type { BlueprintSnapshotV1, BlueprintSnapshotV2 } from '../course-blueprints/blueprint-snapshot';
 import { cmpStr, sha256Canonical } from '../coherence/canonical-json';
 import { Outline, buildOutline } from '../coherence/coherence-types';
+import { roleDesignDelta } from '../pedagogy/generator-directives';
 
 /**
  * Title Normalization: la descripción entra en la huella SOLO si existe (con la
@@ -259,6 +260,12 @@ export const INVALIDATION_FINGERPRINT_VERSION_V3 = 2;
 export interface BlueprintFingerprintsV3 extends BlueprintFingerprints {
   /** Huella de `final_exam` (conjunto de capítulos + `own`). */
   finalExam: string;
+  /**
+   * Motor pedagógico Fase 2 (review N2 de V1 + I1 de Fase 2): por capítulo, tipo de trabajo → sha de la parte del
+   * diseño EFECTIVO que lee su brief, SOLO cuando el rol del capítulo en el módulo la cambia (roleDesignDelta).
+   * Entra únicamente en la huella de ESE trabajo: un reorden regenera solo lo que recibe otra indicación.
+   */
+  roleDesign: Map<string, Record<string, string>>;
 }
 
 /** Contexto que no vive en el Blueprint y que algunas huellas v3 necesitan. */
@@ -304,7 +311,27 @@ export function computeFingerprintsV3(
     contentOwn: chapterIds.map((id) => base.content.get(id)!.own),
     ...designField(ped.course, 'coursePedagogy'),
   });
-  return { ...base, moduleIntro, finalExam };
+  const roleDesign = new Map<string, Record<string, string>>();
+  if ((bp as any).course?.pedagogy) {
+    for (const ch of base.outline.chapters) {
+      const delta = roleDesignDelta(bp, ch.id);
+      const shas: Record<string, string> = {};
+      for (const [type, proj] of Object.entries(delta)) shas[type] = sha256Canonical(proj);
+      if (Object.keys(shas).length) roleDesign.set(ch.id, shas);
+    }
+  }
+  return { ...base, moduleIntro, finalExam, roleDesign };
+}
+
+/** Sha de la variación por rol que recibe el trabajo `type` del capítulo (null = el rol no le cambia nada). */
+export function roleDesignShaV3(fps: BlueprintFingerprintsV3, type: string, chapterId: string): string | null {
+  return fps.roleDesign?.get(chapterId)?.[type] ?? null;
+}
+
+/** Envuelve una huella con la variación por rol del trabajo (sin variación = la huella de siempre). */
+function withRoleDesign(fps: BlueprintFingerprintsV3, type: string, chapterId: string, fp: string | null): string | null {
+  const r = roleDesignShaV3(fps, type, chapterId);
+  return fp && r ? sha256Canonical({ v: INVALIDATION_FINGERPRINT_VERSION_V3, kind: 'role-design', type, base: fp, roleDesign: r }) : fp;
 }
 
 /** Tipos v3 cuya entidad es un capítulo (key `<type>:<chapterId>`). */
@@ -346,9 +373,15 @@ function h5pTypeField(extras: FingerprintExtrasV3): { h5pType?: string } {
 
 /** Huella "completa" v3 de un item (null si la entidad no existe o si falta la identidad del video). */
 export function itemFingerprintV3(fps: BlueprintFingerprintsV3, key: string, extras: FingerprintExtrasV3 = {}): string | null {
-  const v = INVALIDATION_FINGERPRINT_VERSION_V3;
   const { type, entityId } = parseItemKey(key);
   assertKnownV3Type(type, key);
+  const fp = itemFingerprintV3Base(fps, key, extras);
+  return CHAPTER_ITEM_TYPES_V3.includes(type) ? withRoleDesign(fps, type, entityId, fp) : fp;
+}
+
+function itemFingerprintV3Base(fps: BlueprintFingerprintsV3, key: string, extras: FingerprintExtrasV3): string | null {
+  const v = INVALIDATION_FINGERPRINT_VERSION_V3;
+  const { type, entityId } = parseItemKey(key);
   if (OWN_MATCH_TYPES_V3.has(type)) return fps.content.get(entityId)?.full ?? null;
   if (type === 'activity') {
     const c = fps.content.get(entityId);
@@ -367,9 +400,15 @@ export function itemFingerprintV3(fps: BlueprintFingerprintsV3, key: string, ext
 
 /** Huella de match v3 (la que se guarda en el artifact y decide REUSE de un deshabilitado). */
 export function matchFingerprintV3(fps: BlueprintFingerprintsV3, key: string, extras: FingerprintExtrasV3 = {}): string | null {
-  const v = INVALIDATION_FINGERPRINT_VERSION_V3;
   const { type, entityId } = parseItemKey(key);
   assertKnownV3Type(type, key);
+  if (!CHAPTER_ITEM_TYPES_V3.includes(type)) return itemFingerprintV3(fps, key, extras);
+  return withRoleDesign(fps, type, entityId, matchFingerprintV3Base(fps, key, extras));
+}
+
+function matchFingerprintV3Base(fps: BlueprintFingerprintsV3, key: string, extras: FingerprintExtrasV3): string | null {
+  const v = INVALIDATION_FINGERPRINT_VERSION_V3;
+  const { type, entityId } = parseItemKey(key);
   if (OWN_MATCH_TYPES_V3.has(type)) return fps.content.get(entityId)?.own ?? null;
   if (type === 'activity') {
     const c = fps.content.get(entityId);
@@ -380,5 +419,5 @@ export function matchFingerprintV3(fps: BlueprintFingerprintsV3, key: string, ex
     const video = extras.videoIdentity ?? null;
     return c && video ? sha256Canonical({ v, kind: 'video_interactions', own: c.own, video }) : null;
   }
-  return itemFingerprintV3(fps, key, extras);
+  return itemFingerprintV3Base(fps, key, extras);
 }

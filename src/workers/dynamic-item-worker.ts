@@ -455,9 +455,15 @@ export async function downloadContentMarkdown(
   return markdown;
 }
 
-function buildContentTxt(item: ClaimedItem, markdown: string): string {
+/**
+ * Texto que recibe Videogen. Motor pedagógico Fase 2: si el claim trae el brief del generador `video`,
+ * su línea «Enfoque didáctico: Estilo del video…» va en la cabecera (antes del capítulo, así el tope
+ * de caracteres nunca la corta). Sin brief, el texto es byte a byte el de siempre.
+ */
+export function buildContentTxt(item: Pick<ClaimedItem, 'blueprint' | 'chapterNumber' | 'pedagogy'>, markdown: string): string {
   const chapterTitle = item.blueprint.chapter?.title ?? `Capítulo ${item.chapterNumber ?? '?'}`;
-  const header = `Capítulo ${item.chapterNumber ?? '?'}: ${chapterTitle}\nCurso: ${item.blueprint.course.title}\n\n`;
+  const ped = item.pedagogy && item.pedagogy.generator === 'video' && typeof item.pedagogy.text === 'string' && item.pedagogy.text.trim() ? `${item.pedagogy.text.trim()}\n` : '';
+  const header = `Capítulo ${item.chapterNumber ?? '?'}: ${chapterTitle}\nCurso: ${item.blueprint.course.title}\n${ped}\n`;
   const plain = bookMarkdownToNarrationText(markdown);
   return (header + plain).slice(0, CONTENT_TXT_MAX_CHARS);
 }
@@ -714,6 +720,8 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
       const marked = await scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
         externalSubmitStartedAt: new Date().toISOString(),
         ...(resKey ? { externalReservationKey: resKey } : {}),
+        // Motor pedagógico Fase 2: qué diseño recibió Videogen (cabecera de content_txt).
+        ...(item.pedagogy && item.pedagogy.generator === 'video' ? { pedagogySha256: item.pedagogy.textSha256 } : {}),
       });
       if (!marked) {
         logger.error(`Item ${item.itemKey}: lease perdida antes de someter el video a Videogen — se detiene sin someter`);

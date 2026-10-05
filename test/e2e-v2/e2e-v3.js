@@ -978,7 +978,7 @@ function reservationBookkeeping(ev) {
         learningOutcomes: { know: ['Componentes del circuito hidráulico'], do: ['Verificar la presión'], competencies: [] },
         learningModes: ['concepts'], experienceTypes: ['teacher_guided'], assessmentMethods: ['quizzes'], principles: [], origin: 'manual',
       };
-      const C = { key: 'E6', title: '[E2E Pedagogía E6] Circuitos hidráulicos (significativo)', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'h5p', examBank: false, pedagogy, modules: [
+      const C = { key: 'E6', title: '[E2E Pedagogía E6] Circuitos hidráulicos (significativo)', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'h5p', examBank: true, pedagogy, modules: [
         { title: 'Fundamentos del circuito', objective: 'Relacionar los componentes del circuito hidráulico', exam: true, chapters: [
           { title: 'Componentes y funciones', v: true, a: true, objective: 'Relacionar cada componente del circuito con su función' },
           { title: 'Presión y caudal', v: false, a: true, objective: 'Explicar la relación entre presión y caudal' },
@@ -1002,10 +1002,12 @@ function reservationBookkeeping(ev) {
       ok(acts.length === 2 && acts.every((i) => prefs.slice(0, 2).includes(i.h5pType) && i.design && i.design.intent === 'relate') && acts[0].h5pType === 'dragtext', 'E6: actividades con tipo y diseño del enfoque (intención relacionar; tipos del top-2 del diseño)', acts.map((i) => [i.h5pType, i.design]));
       ok(M.items.find((i) => i.type === 'video').design.style === 'concept_explainer', 'E6: video con estilo del enfoque (explicación de concepto)');
       ok(M.items.filter((i) => i.type === 'exam').every((i) => i.design.examStyle === 'conceptual_relations'), 'E6: examen de módulo con estilo del enfoque');
-      // Igual que E5: video contra el Videogen FALSO local (v3 exige entrega por YouTube, también falso) con la
-      // aprobación de presupuesto del sandbox; Gamma/TTS mock. Ningún proveedor real: gasto 0.
+      // Fase 2: como E4, Videogen / Gamma / TTS / guion LLM por los workers REALES contra los fakes locales (el
+      // diseño tiene que llegar a la configuración final de cada proveedor), con la aprobación de presupuesto del
+      // sandbox. Ningún proveedor real: gasto 0.
       const ctx = { nombre: C.title, ...CTX, scormTemplateIds: S.templates };
-      const body = { ...ctx, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
+      const body = { ...ctx, videoMode: 'real' }; // providerModes: default REAL (contra los fakes)
+      const calls0 = { g: PFAKES.st.gammaPosts.length, v: FAKES.videogen.submissions.length };
       let start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, body);
       const estM = /estimateId=([0-9a-f-]{36})/.exec(String(start.error || ''));
       ok(start.status === 409 && !!estM, 'E6: run con video (Videogen falso) sin aprobación → 409 con estimateId', { s: start.status, e: start.error });
@@ -1016,16 +1018,78 @@ function reservationBookkeeping(ev) {
       if (start.status !== 201) throw new Error(`E6: run no creado: ${start.status} ${start.error}`);
       c.runId = start.data.run.id;
       llm.st.tag = 'E6';
-      S.front.DYN_EXAM_BANK_MODE_ENABLED = false;
-      const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
-      const stt = await waitRunTerminal(ctl, 'E6 run');
+      // Fase 2 (review M6): E6 corre el banco de preguntas (el camino por defecto en producción): el diseño tiene que
+      // llegar a cada parte del banco (task con caché, reparaciones). La rama GIFT la cubren E4 y test-50.
+      S.front.DYN_EXAM_BANK_MODE_ENABLED = true;
+      // Fase 2 (review I2): un navegador con una versión anterior (no declara que aplica el brief) no puede reclamar
+      // un run con diseño: 409 rules_version_mismatch (pausa visible «recarga la página»), nada reclamado.
+      const old = await api('POST', '/dynamic-generation/claim', { runId: c.runId, executorId: 'e2e-old-tab', types: ['content', 'course_plan', 'course_intro', 'module_intro', 'experience', 'video_interactions', 'activity', 'exam', 'final_exam'], leaseSeconds: 60 });
+      const claimedOld = await q(`select count(*)::int n from public.generation_item_runs where job_id = $1 and worker_id = 'e2e-old-tab'`, [c.runId]);
+      ok(old.status === 409 && /rules_version_mismatch/.test(String(old.error)) && /diseño pedagógico/.test(String(old.error)) && claimedOld[0].n === 0,
+        'E6: ejecutor sin la capacidad pedagogy-brief-1 → 409 visible y ningún item reclamado', { s: old.status, e: old.error, n: claimedOld[0].n });
+      // Fase 2: se graba cada prompt que el ejecutor REAL manda al LLM falso, con el item que lo pidió.
+      const prompts = [];
+      const respond0 = llm.respond;
+      llm.respond = (b, h) => { prompts.push({ body: b, headers: h || {} }); return respond0(b, h); };
+      let stt;
+      try {
+        const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
+        stt = await waitRunTerminal(ctl, 'E6 run', undefined, c.runId);
+      } finally {
+        llm.respond = respond0;
+      }
       const items = await waitItemsDone(c.runId);
       ok(['preview', 'completed'].includes(stt.status) && stt.failed === 0 && !stt.fatalError, 'E6: ejecutor del navegador terminó sin fallidos', stt);
       ok(items.every((i) => i.status === 'completed'), `E6: los ${items.length} items completed (con diseño pedagógico en el Manifest)`, items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, i.error_message && i.error_message.slice(0, 400)]));
       ok(llm.st.unknown.length === 0, 'E6: LLM falso sin prompts no reconocidos', llm.st.unknown);
+
+      // ── Fase 2: el diseño de cada trabajo llegó al prompt / configuración FINAL de su generador ──
+      const rules6 = M.features.activityTypeRules ?? null;
+      const briefs = new Map(M.items.map((it) => [it.key, PED.buildItemPedagogyBrief({ item: it, snapshot: snap, activityTypeRules: rules6 })]));
+      const runRows = await q(`select id, item_key, type, output_summary from public.generation_item_runs where job_id = $1`, [c.runId]);
+      const keyOfRun = new Map(runRows.map((r) => [r.id, r.item_key]));
+      const textOf = (b) => (b.messages || []).map((m) => (typeof m.content === 'string' ? m.content : (m.content || []).map((x) => x.text || '').join(''))).join('\n');
+      const hdr = (h, k) => (typeof h.get === 'function' ? h.get(k) : h[k]);
+      const byItem = new Map();
+      for (const p of prompts) {
+        const key = keyOfRun.get(hdr(p.headers, 'x-cursia-item-run-id'));
+        if (!key) continue;
+        if (!byItem.has(key)) byItem.set(key, []);
+        byItem.get(key).push({ role: hdr(p.headers, 'x-cursia-call-role') || 'main', text: textOf(p.body) });
+      }
+      const missing = [];
+      const reached = new Set();
+      for (const [key, calls] of byItem) {
+        const br = briefs.get(key);
+        const type = key.slice(0, key.indexOf(':'));
+        if (!br) { missing.push(`${key}: prompt LLM sin diseño (${type})`); continue; }
+        const want = br.text.replace(/^\n+/, '');
+        // Sin bloque a propósito: el reintento SOLO del sidecar del contenido y la pasada que iguala la longitud de las
+        // opciones GIFT (reparaciones de formato sobre un texto ya generado con el diseño; no escriben contenido nuevo).
+        const formatRepair = (x) => x.role === 'context_summary_retry' || /^Estas preguntas GIFT de selección múltiple/.test(x.text);
+        for (const call of calls.filter((x) => !formatRepair(x))) {
+          if (!call.text.includes(want)) missing.push(`${key} (${call.role}): el prompt no trae su diseño`);
+        }
+        reached.add(type);
+      }
+      eq(missing, [], 'E6: TODO prompt LLM del ejecutor real trae el diseño de SU item (reintentos y correcciones incluidos)');
+      eq([...reached].sort(), ['activity', 'content', 'course_intro', 'course_plan', 'exam', 'experience', 'final_exam', 'module_intro', 'video_interactions'], 'E6: generadores del navegador que recibieron diseño');
+      const sumMismatch = runRows.filter((r) => byItem.has(r.item_key) && r.output_summary && briefs.get(r.item_key) && r.output_summary.pedagogySha256 !== briefs.get(r.item_key).textSha256).map((r) => r.item_key);
+      eq(sumMismatch, [], 'E6: el summary de cada item registra la huella del diseño que recibió (pedagogySha256)');
+      const vg = FAKES.videogen.submissions.slice(calls0.v);
+      const vBrief = briefs.get(M.items.find((i) => i.type === 'video').key);
+      ok(vg.length === 1 && vg[0].content_txt.includes(vBrief.text) && vg[0].content_txt.indexOf(vBrief.text) < 200, 'E6: Videogen FALSO recibió el estilo del video en la cabecera del content_txt', vg.map((x) => x.content_txt.slice(0, 300)));
+      const gp = PFAKES.st.gammaPosts.slice(calls0.g);
+      const pBriefs = M.items.filter((i) => i.type === 'presentation').map((i) => briefs.get(i.key).text);
+      ok(gp.length === pBriefs.length && gp.every((b) => pBriefs.some((t) => String(b.additionalInstructions).endsWith(t)) && /^La diapositiva 1 es la portada/.test(b.additionalInstructions)),
+        'E6: Gamma FALSO recibió el enfoque de las diapositivas al final de additionalInstructions (las reglas de siempre primero)', gp.map((b) => String(b.additionalInstructions).slice(-200)));
+      const notConsumed = [...new Set(M.items.filter((i) => !briefs.get(i.key)).map((i) => i.type))].sort();
+      eq(notConsumed, ['audio_welcome', 'audiobook_chapter'], 'E6: los únicos trabajos sin diseño son los de audio (narran contenido ya diseñado)');
+      S.E6pedagogy = { llmCalls: prompts.length, itemsWithDesign: byItem.size, reached: [...reached].sort(), notConsumed };
+
       const ev = await q(`select count(*)::int n, coalesce(sum(amount), 0)::float usd from public.generation_cost_events where course_id = $1 and event_kind = 'CHARGE' and cost_source <> 'ZERO_BY_DESIGN'`, [c.courseId]);
       results.courses.E6 = { courseId: c.courseId, blueprintNumber: c.n, runId: c.runId, items: items.length, features: M.features,
-        activities: acts.map((i) => ({ key: i.key, h5pType: i.h5pType, design: i.design })), chargedEvents: ev[0] };
+        activities: acts.map((i) => ({ key: i.key, h5pType: i.h5pType, design: i.design })), chargedEvents: ev[0], pedagogyPrompts: S.E6pedagogy };
     }, { fatal: false });
     if (RUN_E5 && S.E6 && S.E6.runId) await step('v3-E6-pedagogia-empaquetado', async () => {
       const c = S.E6;

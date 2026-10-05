@@ -101,7 +101,8 @@ function makeFront({ feRoot, backendUrl, storageUrl, token, ownerId, llm, logFil
     const url = String(input && input.url ? input.url : input);
     if (url === '/api/proxy') {
       const body = JSON.parse((init && init.body) || '{}');
-      const out = llm.respond(body);
+      // Fase 2 (motor pedagógico): los headers (x-cursia-item-run-id…) dejan atribuir cada prompt a su item.
+      const out = llm.respond(body, (init && init.headers) || {});
       if (out.httpStatus && out.httpStatus !== 200) {
         return new Response(JSON.stringify({ error: { message: out.error || 'fake llm error' } }), { status: out.httpStatus, headers: { 'content-type': 'application/json' } });
       }

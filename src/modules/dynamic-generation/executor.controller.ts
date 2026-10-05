@@ -1,4 +1,4 @@
-import { Body, Controller, HttpCode, HttpStatus, Param, ParseUUIDPipe, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, HttpCode, HttpStatus, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
@@ -24,13 +24,17 @@ export class ExecutorController {
   // curso y al run no depende de esto; el ejecutor solo espera a que venza).
   @Post('claim')
   @HttpCode(HttpStatus.OK)
-  async claim(@Body() dto: ClaimItemDto, @CurrentUser() user: AuthUser): Promise<ClaimResult> {
+  // Motor pedagógico Fase 2: `?features=pedagogy-brief-1` = el ejecutor aplica el brief pedagógico del claim.
+  // Va por query (no en el body ni en un header): el body es whitelist estricta y CORS solo admite
+  // Content-Type/Authorization, así un frontend nuevo contra un backend anterior sigue funcionando.
+  async claim(@Body() dto: ClaimItemDto, @CurrentUser() user: AuthUser, @Query('features') features?: string): Promise<ClaimResult> {
     return this.scheduler.claimNextItemDetailed({
       runId: dto.runId,
       executorId: dto.executorId,
       types: dto.types,
       leaseSeconds: dto.leaseSeconds ?? DEFAULT_LEASE_SECONDS,
       ownerId: user.id,
+      executorFeatures: typeof features === 'string' ? features.split(',').map((f) => f.trim()).filter(Boolean).slice(0, 10) : [],
     });
   }
 

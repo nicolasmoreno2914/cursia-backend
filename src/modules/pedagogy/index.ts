@@ -11,3 +11,4 @@ export * from './recommendation';
 export * from './dry-run';
 export * from './labels';
 export * from './pedagogy-db';
+export * from './generator-directives';

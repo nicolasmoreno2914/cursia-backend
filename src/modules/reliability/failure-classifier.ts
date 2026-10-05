@@ -391,7 +391,9 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
       'claim_contract', 'VIDEO_PLAN_MISMATCH', 'VIDEO_REFLECTION_PLAN_MISMATCH', 'ACTIVITY_TYPE_NOT_IN_MANIFEST', 'unsupported_item_type',
       'unsupported_rules_version', 'rules_version_mismatch', 'claim_payload_unavailable', 'video_duration_unmeasurable',
       'missing_artifact_id', 'artifact_download_unavailable', 'unsupported_download_method', 'provider_worker_wrong_type',
-      'missing_required_artifacts', 'ACTIVITY_TYPE_MISMATCH', 'AUDIOBOOK_PLAN_COVERAGE'],
+      'missing_required_artifacts', 'ACTIVITY_TYPE_MISMATCH', 'AUDIOBOOK_PLAN_COVERAGE',
+      // Motor pedagógico Fase 2: brief pedagógico del claim con forma inválida en el navegador (versiones desalineadas).
+      'PEDAGOGY_BRIEF_INVALID'],
     family: /^(missing|ambiguous)_[a-z0-9_]+_artifact$/,
     class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'product_bug', adminAction: 'regenerate_item',
   },

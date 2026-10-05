@@ -13,6 +13,7 @@ import {
   computeFingerprintsV3,
   itemFingerprintV3,
   matchFingerprintV3,
+  roleDesignShaV3,
   parseItemKey,
 } from './fingerprints';
 import {
@@ -307,6 +308,10 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
 
   const decided = new Map<string, InvalidationAction>();
   const contentProducesNew = new Set<string>();
+  // Motor pedagógico Fase 2: lo que recibe el generador de ESE trabajo cambió por el rol del capítulo en su módulo
+  // (p. ej. un reorden convierte un capítulo en el cierre del módulo y su actividad pasa a «simular»).
+  const roleChanged = (type: string, chId: string): boolean => roleDesignShaV3(fromFp, type, chId) !== roleDesignShaV3(toFp, type, chId);
+  const ROLE_REASON = 'pedagogy_role_design_changed';
 
   // ---- 1) content (todo lo demás del capítulo depende de él) ----
   for (const key of toItems.keys()) {
@@ -323,6 +328,9 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
       if (f0.own !== f1.own) {
         a.action = 'REGENERATE';
         a.reasons.push('chapter_title_or_objective_changed');
+      } else if (roleChanged('content', chId)) {
+        a.action = 'REGENERATE';
+        a.reasons.push(ROLE_REASON);
       } else {
         const review: string[] = [];
         if (oldCh!.moduleId !== newCh.moduleId) review.push('moved_across_modules');
@@ -361,6 +369,8 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
         decideNewItem(a, chapterIsNew ? 'chapter_added' : 'new_item', contentNew);
       } else if (contentNew) {
         regenerate(a, 'content_regenerated');
+      } else if (roleChanged('experience', entityId)) {
+        regenerate(a, ROLE_REASON);
       } else {
         const content = decided.get(`content:${entityId}`);
         const review = (content?.reasons ?? []).filter((r) => r === 'moved_across_modules' || r === 'module_context_changed');
@@ -380,6 +390,8 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
         resolveActivityType({ ...toItem, key }, { activityTypeRules: toRules })
       ) {
         regenerate(a, 'activity_type_changed');
+      } else if (roleChanged('activity', entityId)) {
+        regenerate(a, ROLE_REASON);
       } else {
         a.reasons.push('content_reused');
         settleReuse(a, 'REUSE');
@@ -390,6 +402,8 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
         decideNewItem(a, chapterIsNew ? 'chapter_added' : type === 'video' ? 'video_toggled_on' : 'new_item', contentNew);
       } else if (contentNew) {
         staleProvider(a, 'content_regenerated_provider_costly');
+      } else if (roleChanged(type, entityId)) {
+        staleProvider(a, ROLE_REASON);
       } else {
         a.reasons.push('content_reused');
         settleReuse(a, 'REUSE');
@@ -421,6 +435,8 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
         decideNewItem(a, chapterIsNew ? 'chapter_added' : 'video_toggled_on', contentNew);
       } else if (contentNew) {
         regenerate(a, 'content_regenerated');
+      } else if (roleChanged('video_interactions', entityId)) {
+        regenerate(a, ROLE_REASON);
       } else if (a.matchFingerprint !== a.fromMatchFingerprint) {
         // El video que B hereda no es el que describían (o no se conoce su identidad).
         regenerate(a, a.fromMatchFingerprint && a.matchFingerprint ? 'video_changed' : 'video_identity_unknown');
