@@ -821,6 +821,7 @@ async function dbChecks() {
       const res = await blueprints.lock(course.id, OWNER, await counter());
       eq([res.created, res.blueprint.schemaVersion], [true, 2], 'v2');
       assert(!('pedagogy' in res.blueprint.snapshot.course), 'sin course.pedagogy');
+      assert(!('targetHours' in res.blueprint.snapshot.course), 'sin course.targetHours (motor de carga horaria)');
       assert(res.blueprint.snapshot.modules.every((m) => !('design' in m) && m.chapters.every((c) => !('design' in c))), 'sin design');
       plainSha = res.blueprint.sha256;
     });

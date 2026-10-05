@@ -250,6 +250,8 @@ check('ST9 cursos reales de staging (solo lectura): horas por capítulo y curso;
       const n = q.length;
       const seg = (q[n - 1] - q[0]) / (n - 1);
       assert(Math.abs(q[0] - (30 + seg / 2)) <= 1, `curso ${c.courseId} cap ${i + 1}: la primera pregunta está donde la pone el plan`);
+      // Las marcas son segundos enteros: d tiene ±2 s de error. #616 cap. 1 da 748,5 s, 1,5 s antes del salto 7 → 8
+      // preguntas (750 s): si algún día falla SOLO ese caso, es redondeo de la marca, no un cambio de la regla.
       const videoSeconds = 45 + n * seg;
       const input = {
         chapterId: `c${c.courseId}-${i + 1}`,

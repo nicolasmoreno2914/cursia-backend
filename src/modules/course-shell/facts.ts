@@ -369,7 +369,10 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
   // MEDIDAS del paquete; lo no medido (preguntas de la actividad, tarjetas, textos del marco) usa el planificado.
   let studyTime: CourseFacts['studyTime'];
   const reviewCounts = input.reviewCardCountByChapter ?? {};
-  for (const id of Object.keys(reviewCounts)) if (!reviewIds.has(id)) fail(`tarjetas de «Repaso» de un capítulo sin «Repaso» (${id})`);
+  for (const [id, n] of Object.entries(reviewCounts)) {
+    if (!reviewIds.has(id)) fail(`tarjetas de «Repaso» de un capítulo sin «Repaso» (${id})`);
+    posInt(n, `tarjetas de «Repaso» del capítulo ${id}`);
+  }
   if (artifacts.experienceWordsByChapter) {
     // Aproximación documentada: el Libro compilado (palabras medidas) se reparte por igual entre los capítulos;
     // incluye además apertura, aperturas de módulo y bibliografía (unos cientos de palabras por capítulo).

@@ -188,6 +188,23 @@ check('TH7 cambiar targetHours después del Blueprint: nuevo sha, invalidación 
   }
 });
 
+check('TH7b con enfoque: cambiar las horas cambia el sha del perfil en el diseño, pero los trabajos y la invalidación no', () => {
+  const mk = (h) => P.runPedagogyDryRun({ structure: clone(RCP), profile: profileOf('competencias', h === null ? {} : { targetHours: h }) }).pedagogical;
+  const [a, b] = [mk(20), mk(33)];
+  assert(a.blueprint.course.pedagogy.profileSha256 !== b.blueprint.course.pedagogy.profileSha256, 'el sha del perfil cambia con las horas');
+  assert(a.manifest.features.pedagogy.profileSha256 !== b.manifest.features.pedagogy.profileSha256, 'y el del Manifest también');
+  eq(b.manifest.items, a.manifest.items, 'mismos trabajos con el mismo diseño');
+  const mA = manifestOf(a.blueprint, 1);
+  const mB = manifestOf(b.blueprint, 2);
+  const items = mA.items.map((it) => ({
+    itemKey: it.key, itemRunId: `A#${it.key}`, status: 'completed', artifactIds: RES.requiredArtifactTypesV3(it.type, it.variant).map((r) => `A|${it.key}|${r}`),
+    artifactStatus: 'ready', inputFingerprint: null, outputIdentity: `out/A/${it.key}`,
+    ...(it.type === 'video_interactions' ? { consumedVideoIdentity: `out/A/video:${it.chapterId}` } : {}),
+  }));
+  const plan = PV3.computeInvalidationPlanV3({ from: { blueprint: a.blueprint, manifest: mA, items }, to: { blueprint: b.blueprint, manifest: mB } });
+  eq(plan.actions.filter((x) => x.action !== 'REUSE').map((x) => `${x.itemKey}=${x.action}`), [], '20 → 33 h con enfoque: nada que regenerar');
+});
+
 check('TH8 reordenar capítulos con targetHours: el objetivo se conserva y las horas no cambian', () => {
   const re = clone(RCP);
   re.modules[0].chapters.reverse();

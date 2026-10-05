@@ -368,6 +368,31 @@ const SRC = (bp) => ({ courseId: 777, blueprintId: 1, blueprintNumber: 1, bluepr
       },
     }), /solo con H5P v2 \(activityTypeRules=2\) y motor h5p/, 'facts con rules 1');
   });
+  await check('motor de carga horaria (re-revisión L1 N1/N2): tarjetas MEDIDAS de «Repaso» en los minutos; conteos inválidos o de capítulos sin «Repaso» fallan; studyTime del paquete', async () => {
+    const f = built2.expectations.facts;
+    assert(f.studyTime && f.studyTime.courseEstimatedHours > 0 && f.studyTime.usesPlannedValues === true, 'facts.studyTime del paquete (marco y aperturas siguen planificados)');
+    const withReview = f.chapters.filter((c) => c.reviewCards).map((c) => c.id);
+    assert(withReview.length > 0, 'el fixture tiene capítulos con «Repaso»');
+    const VCF = require('./lib/v21-vc-fixtures');
+    const words = Object.fromEntries(f.chapters.map((c) => [c.id, SHELL.experienceMovementWords(VCF.buildExperience())]));
+    const factsWith = (counts) => SHELL.buildCourseFacts({
+      manifest: input2.manifest, blueprint: input2.blueprint, assessment: input2.assessmentProfile,
+      reviewCardsChapterIds: withReview, ...(counts ? { reviewCardCountByChapter: counts } : {}),
+      artifacts: {
+        audioWelcomeSeconds: 10, audiobookParts: f.chapters.map((c) => ({ chapterId: c.id, seconds: 10 })),
+        slideCountByChapter: Object.fromEntries(f.chapters.map((c) => [c.id, 8])), examQuestionCountByModule: Object.fromEntries(f.modules.filter((m) => m.examEnabled).map((m) => [m.id, 8])),
+        ...(f.finalExam.enabled ? { finalExamQuestionCount: 12 } : {}), libroWordCount: 1000, experienceWordsByChapter: words,
+      },
+    });
+    const planned = factsWith(null);
+    const four = factsWith({ [withReview[0]]: 4 });
+    const ten = factsWith({ [withReview[0]]: 10 });
+    eq(Math.round((ten.studyTime.courseEstimatedMinutes - four.studyTime.courseEstimatedMinutes) * 100) / 100, 3, '6 tarjetas medidas más = 3 min');
+    eq(Math.round((planned.studyTime.courseEstimatedMinutes - four.studyTime.courseEstimatedMinutes) * 100) / 100, 2.5, 'planificado (9) vs medido (4)');
+    const sinRepaso = f.chapters.find((c) => !withReview.includes(c.id));
+    if (sinRepaso) throws(() => factsWith({ [sinRepaso.id]: 6 }), /capítulo sin «Repaso»/, 'conteo de un capítulo sin «Repaso»');
+    for (const bad of [0, -1, 2.5, '9', null]) throws(() => factsWith({ [withReview[0]]: bad }), /tarjetas de «Repaso» del capítulo/, `conteo ${JSON.stringify(bad)}`);
+  });
   await check('fix round 1 (M-5/M-6): un capítulo con < 4 tarjetas no lleva «Repaso»; facts, secuencia y validador coherentes; el label de autoevaluación no repite «Repaso»', async () => {
     const VCF = require('./lib/v21-vc-fixtures');
     const inp = PF.packagingInput(distRoot, V2CFG);
