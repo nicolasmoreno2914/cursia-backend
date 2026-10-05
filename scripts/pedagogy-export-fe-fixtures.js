@@ -35,8 +35,10 @@ const slim = (r) => {
   const out = JSON.parse(JSON.stringify(r));
   for (const k of ['baseline', 'pedagogical']) if (out[k]) out[k] = { blueprintSha256: out[k].blueprintSha256, manifestErrors: out[k].manifestErrors, totals: out[k].manifest.totals, estimateUsd: out[k].providers.estimateUsd };
   delete out.appliedRules; delete out.rules;
-  // Motor de carga horaria: la propuesta del distribuidor sin el desglose del modelo de tiempo (el panel no lo lee).
-  if (out.distribution) delete out.distribution.studyTime;
+  // Fase 2 · «Ver diseño»: del modelo de tiempo solo lo que lee el panel (piezas y minutos por capítulo).
+  if (out.distribution && out.distribution.studyTime) {
+    out.distribution.studyTime = { modules: out.distribution.studyTime.modules.map((m) => ({ chapters: m.chapters.map((c) => ({ chapterId: c.chapterId, chapterEstimatedMinutes: c.chapterEstimatedMinutes, resources: c.resources.map((r) => ({ resource: r.resource, minutes: r.minutes })) })) })) };
+  }
   return out;
 };
 const reg = P.defaultApproachRegistry();
