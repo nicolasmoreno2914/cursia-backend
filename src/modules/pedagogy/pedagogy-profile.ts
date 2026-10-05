@@ -128,6 +128,14 @@ export function profileTargetHours(p: unknown): number | null {
   }
   return p.targetHours;
 }
+/**
+ * Fase 2 · Actividades de Aplicación: estudiante + resultados de aprendizaje del perfil (lo que el Blueprint congela
+ * en course.applicationContext). null sin perfil.
+ */
+export function profileApplicationContext(p: unknown): { learner: unknown; learningOutcomes: unknown } | null {
+  if (!isPlainObject(p)) return null;
+  return { learner: p.learner ?? null, learningOutcomes: p.learningOutcomes ?? null };
+}
 const LEARNER_KEYS = ['description', 'ageGroup', 'educationLevel', 'priorKnowledge', 'experience'];
 const OUTCOME_KEYS = ['know', 'do', 'competencies'];
 

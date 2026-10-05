@@ -36,7 +36,7 @@ import {
   proposeStructureAdjustments,
 } from './pedagogical-blueprint';
 import { ItemPedagogyBrief, OverrideLevel, PEDAGOGY_GENERATOR_COVERAGE, buildItemPedagogyBrief } from './generator-directives';
-import { PedagogicalProfile, isEmptyPedagogicalProfile, normalizePedagogicalProfile, profileTargetHours } from './pedagogy-profile';
+import { PedagogicalProfile, isEmptyPedagogicalProfile, normalizePedagogicalProfile, profileApplicationContext, profileTargetHours } from './pedagogy-profile';
 import { PEDAGOGY_ENGINE_VERSION } from './vocabulary';
 
 /**
@@ -64,6 +64,8 @@ export interface DryRunChapterInput {
   activityEnabled?: boolean;
   /** Motor de carga horaria: 'practice' = capítulo de práctica (sin video). Ausente = contenido. */
   kind?: 'content' | 'practice';
+  /** Fase 2: minutos de la Actividad de Aplicación (30/60/90/120; ausente/null = sin actividad). */
+  applicationMinutes?: number | null;
 }
 export interface DryRunModuleInput {
   id?: string;
@@ -279,6 +281,7 @@ export function snapshotFromStructure(input: DryRunStructureInput): BlueprintSna
         id: c.id || `${mid}c${ci + 1}`, module_id: mid, position: ci, title: String(c.title ?? ''), objective: c.objective ?? null,
         description: c.description ?? null, video_enabled: c.kind === 'practice' ? false : c.videoEnabled !== false, activity_enabled: c.activityEnabled !== false,
         ...(c.kind !== undefined ? { chapter_kind: c.kind } : {}),
+        ...(c.applicationMinutes !== undefined ? { application_minutes: c.applicationMinutes } : {}),
       });
     });
   });
@@ -331,20 +334,24 @@ function proposedChapterUuid(id: string): string {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
 }
 
-export function materializeDistribution(base: BlueprintSnapshotV2, dist: DistributionResult): BlueprintSnapshotV2 {
+export function materializeDistribution(base: BlueprintSnapshotV2, dist: DistributionResult, applicationContext: unknown = null): BlueprintSnapshotV2 {
   const rows = snapshotV2ToRows(base);
+  // Fase 2: el contexto del perfil que congelaría el lock (entra solo si la propuesta tiene Actividades de Aplicación).
+  if (applicationContext !== null && applicationContext !== undefined) rows.course = { ...rows.course, applicationContext };
   const byId = new Map(rows.chapters.map((c) => [c.id, c]));
   const chapters: RawChapterRowV2[] = [];
   for (const m of dist.modules) {
     m.chapters.forEach((c, ci) => {
       const existing = byId.get(c.id);
       if (existing) {
-        chapters.push({ ...existing, position: ci });
+        // Fase 2: la propuesta fija (o quita) la Actividad de Aplicación de cada capítulo existente.
+        chapters.push({ ...existing, position: ci, application_minutes: c.applicationMinutes ?? null });
         return;
       }
       chapters.push({
         id: proposedChapterUuid(c.id), module_id: m.id, position: ci, title: c.title, objective: c.objective, description: null,
         video_enabled: c.videoEnabled, activity_enabled: c.activityEnabled, ...(c.kind === 'practice' ? { chapter_kind: 'practice' } : {}),
+        application_minutes: c.applicationMinutes ?? null,
       });
     });
   }
@@ -364,9 +371,10 @@ export function materializeOrError(
   base: BlueprintSnapshotV2,
   dist: DistributionResult,
   build: (plain: BlueprintSnapshotV2) => DistributionMaterialized,
+  applicationContext: unknown = null,
 ): DistributionMaterialized {
   try {
-    return build(materializeDistribution(base, dist));
+    return build(materializeDistribution(base, dist, applicationContext));
   } catch (err) {
     const message = (err as Error)?.message || String(err);
     return {
@@ -379,6 +387,15 @@ export function materializeOrError(
       generableHours: null,
     };
   }
+}
+
+/**
+ * Fase 2: el mismo snapshot con el contexto de las Actividades de Aplicación del perfil (el builder lo congela solo
+ * si algún capítulo tiene una; si no, el snapshot no cambia).
+ */
+export function withApplicationContext(s: BlueprintSnapshotV2, applicationContext: unknown): BlueprintSnapshotV2 {
+  const rows = snapshotV2ToRows(s);
+  return buildBlueprintSnapshotV2({ ...rows.course, applicationContext }, rows.modules, rows.chapters, rows.pedagogy);
 }
 
 /** El mismo snapshot con `course.targetHours` (pasa por el builder: orden canónico y validación). */
@@ -452,7 +469,10 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
   const base0 = isSnapshot(input.structure) ? snapshotFromSnapshot(input.structure) : snapshotFromStructure(input.structure as DryRunStructureInput);
   // Motor de carga horaria: el objetivo de horas viene del perfil (con o sin enfoque); sin él, el del snapshot recibido.
   const profileHours = profileTargetHours(input.profile);
-  const base = profileHours !== null ? withTargetHours(base0, profileHours) : base0;
+  const base1 = profileHours !== null ? withTargetHours(base0, profileHours) : base0;
+  // Fase 2: estudiante + resultados de aprendizaje del perfil (lo mismo que congela el lock).
+  const appContext = profileApplicationContext(input.profile);
+  const base = appContext ? withApplicationContext(base1, appContext) : base1;
   const targetHours = base.course.targetHours ?? null;
   const profileEmpty = isEmptyPedagogicalProfile(input.profile);
   const profile = profileEmpty ? null : normalizePedagogicalProfile(input.profile, registry);
@@ -553,7 +573,7 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
           providers: ms.providers,
           generableHours: ms.studyTime.courseEstimatedHours,
         };
-      });
+      }, appContext);
       return { ...dist, materialized };
     })(),
     workload: targetHours === null

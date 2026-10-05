@@ -1,7 +1,7 @@
 import { Injectable, BadRequestException, NotFoundException, ConflictException, Logger, OnModuleInit, ServiceUnavailableException } from '@nestjs/common';
 import { lockPedagogyInput } from '../pedagogy/pedagogical-blueprint';
 import { parseStoredPedagogicalProfile } from '../pedagogy/pedagogy-db';
-import { profileTargetHours } from '../pedagogy/pedagogy-profile';
+import { profileApplicationContext, profileTargetHours } from '../pedagogy/pedagogy-profile';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
 import { CourseModule as CourseModuleEntity } from './entities/course-module.entity';
@@ -28,7 +28,8 @@ import {
   snapshotSha256,
   snapshotSha256V2,
 } from '../course-blueprints/blueprint-snapshot';
-import { assertPracticeChapterSchema, assertV21StructureSchema, probeV21StructureSchema } from './v21-schema-guard';
+import { assertApplicationActivitySchema, assertPracticeChapterSchema, assertV21StructureSchema, probeV21StructureSchema } from './v21-schema-guard';
+import { isApplicationMinutes } from '../study-time/application-tiers';
 import {
   CHAPTER_TITLE_TOO_LONG,
   MODULE_TITLE_TOO_LONG,
@@ -79,6 +80,15 @@ function cleanDescription(v: string | undefined | null): string | null {
 import { blueprintSchemaVersionForRules, readActivityTypeRulesConfig, readConfiguredRulesVersion } from '../generation-manifests/manifest-rules-config';
 
 /** Motor de carga horaria: 400 visible si se pide video en un capítulo de práctica. */
+/** Fase 2: minutos de la Actividad de Aplicación del pedido (el DTO ya los validó; defensa en profundidad). */
+function applicationMinutesOrThrow(v: unknown): number | null {
+  if (v === null) return null;
+  if (!isApplicationMinutes(v)) {
+    throw new BadRequestException({ code: 'INVALID_APPLICATION_MINUTES', message: `INVALID_APPLICATION_MINUTES: los minutos de la Actividad de Aplicación deben ser 30, 60, 90 o 120 (fue ${JSON.stringify(v)})` });
+  }
+  return v;
+}
+
 function practiceVideoError(): BadRequestException {
   return new BadRequestException({
     code: 'PRACTICE_CHAPTER_VIDEO',
@@ -221,6 +231,9 @@ export class CourseStructureService implements OnModuleInit {
               c.final_exam_enabled, c.activity_engine,
               (to_jsonb(c) ->> 'review_cards_enabled')::boolean as review_cards_enabled,
               (to_jsonb(c) ? 'review_cards_enabled') as review_cards_migrated,
+              -- Fase 2 · Actividades de Aplicación: ¿la base tiene course_chapters.application_minutes? (misma sentencia)
+              exists (select 1 from information_schema.columns
+                       where table_schema = 'public' and table_name = 'course_chapters' and column_name = 'application_minutes') as app_col,
               b.id as bp_id, b.blueprint_number as bp_number, b.locked_at as bp_locked_at,
               b.snapshot_sha256 as bp_sha256, b.schema_version as bp_schema_version,
               -- Motor pedagógico V1 (review I1): perfil pedagógico vigente en la MISMA sentencia (sin ida y vuelta extra).
@@ -238,7 +251,9 @@ export class CourseStructureService implements OnModuleInit {
                                     'description', ch.description, 'videoEnabled', ch.video_enabled,
                                     'activityEnabled', ch.activity_enabled,
                                     -- Motor de carga horaria: sin la migración la clave viene null (y el editor no ofrece la práctica).
-                                    'kind', to_jsonb(ch) ->> 'chapter_kind') order by ch.position, ch.id)
+                                    'kind', to_jsonb(ch) ->> 'chapter_kind',
+                                    -- Fase 2: sin la migración la clave no existe en la fila (app_col = false).
+                                    'applicationMinutes', to_jsonb(ch) ->> 'application_minutes') order by ch.position, ch.id)
                              from public.course_chapters ch where ch.module_id = m.id and ch.course_id = c.id), '[]'::json)
                        ) order by m.position, m.id)
                   from public.course_modules m where m.course_id = c.id), '[]'::json) as modules
@@ -266,6 +281,9 @@ export class CourseStructureService implements OnModuleInit {
     const rawModules: any[] = typeof row.modules === 'string' ? JSON.parse(row.modules) : row.modules || [];
     const activityByChapter = new Map<string, boolean>();
     const kindByChapter = new Map<string, 'content' | 'practice'>();
+    // Fase 2: minutos de aplicación por capítulo (null = sin actividad); vacío si la base no tiene la columna.
+    const appCol = row.app_col === true;
+    const applicationByChapter = new Map<string, number | null>();
     const modules = rawModules.map((m) => ({
       id: m.id as string,
       position: Number(m.position),
@@ -281,6 +299,11 @@ export class CourseStructureService implements OnModuleInit {
         // Motor de carga horaria: null = base sin la migración (capítulo de contenido, sin informar el tipo).
         if (c.kind !== null && c.kind !== undefined && c.kind !== 'content' && c.kind !== 'practice') throw new Error(`Capítulo ${c.id}: chapter_kind ilegible (${JSON.stringify(c.kind)})`);
         if (c.kind === 'content' || c.kind === 'practice') kindByChapter.set(c.id, c.kind);
+        if (appCol) {
+          const am = c.applicationMinutes === null || c.applicationMinutes === undefined ? null : Number(c.applicationMinutes);
+          if (am !== null && !isApplicationMinutes(am)) throw new Error(`Capítulo ${c.id}: application_minutes ilegible (${JSON.stringify(c.applicationMinutes)})`);
+          applicationByChapter.set(c.id, am);
+        }
         return {
           id: c.id as string,
           position: Number(c.position),
@@ -323,6 +346,7 @@ export class CourseStructureService implements OnModuleInit {
       activityByChapter,
       pedagogyProfile,
       kindByChapter,
+      applicationByChapter,
     );
 
     return {
@@ -352,6 +376,8 @@ export class CourseStructureService implements OnModuleInit {
           videoEnabled: c.videoEnabled,
           activityEnabled: activityByChapter.get(c.id) as boolean,
           ...(kindByChapter.has(c.id) ? { kind: kindByChapter.get(c.id) as 'content' | 'practice' } : {}),
+          // Fase 2: la clave existe SOLO si la base tiene la columna (el editor ofrece la actividad solo entonces).
+          ...(applicationByChapter.has(c.id) ? { applicationMinutes: applicationByChapter.get(c.id) as number | null } : {}),
         })),
       })),
       currentBlueprint,
@@ -416,6 +442,7 @@ export class CourseStructureService implements OnModuleInit {
     activityByChapter?: Map<string, boolean>,
     pedagogyProfile: unknown = null,
     kindByChapter?: Map<string, 'content' | 'practice'>,
+    applicationByChapter?: Map<string, number | null>,
   ): boolean {
     if (!currentBlueprint) return false;
     try {
@@ -437,12 +464,14 @@ export class CourseStructureService implements OnModuleInit {
             description: c.description ?? null,
             video_enabled: c.videoEnabled, activity_enabled: activityByChapter.get(c.id) as boolean,
             chapter_kind: kindByChapter?.get(c.id) ?? 'content',
+            application_minutes: applicationByChapter?.get(c.id) ?? null,
           })),
         );
         const courseV2 = {
           id: course.id, title: course.title, finalExam: settings.finalExam, activityEngine: settings.activityEngine, reviewCards: settings.reviewCardsEnabled === true,
           // Motor de carga horaria: las horas objetivo del perfil también entran al snapshot del lock.
           targetHours: profileTargetHours(pedagogyProfile),
+          applicationContext: profileApplicationContext(pedagogyProfile),
         };
         const plainV2 = buildBlueprintSnapshotV2(courseV2, rawModulesV2, rawChaptersV2);
         const pedagogy = lockPedagogyInput(plainV2, pedagogyProfile);
@@ -744,6 +773,10 @@ export class CourseStructureService implements OnModuleInit {
     if (practice && dto.videoEnabled === true) throw practiceVideoError();
     await assertV21StructureSchema(this.dataSource); // V2.1 fix round 1 (I5): 503 si falta la migración R3
     if (dto.kind !== undefined) await assertPracticeChapterSchema(this.dataSource); // 503 sin la migración de práctica
+    // Fase 2: minutos de la Actividad de Aplicación (null = sin actividad, igual que omitirla al crear).
+    const appMinutes = dto.applicationMinutes === undefined ? undefined : applicationMinutesOrThrow(dto.applicationMinutes);
+    if (dto.applicationMinutes !== undefined) await assertApplicationActivitySchema(this.dataSource); // 503 sin la migración
+    const withApp = typeof appMinutes === 'number';
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();
@@ -776,10 +809,10 @@ export class CourseStructureService implements OnModuleInit {
            select id from public.course_modules where id = $2 and course_id = $1
          ),
          ins as (
-           insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled, activity_enabled, description${practice ? ', chapter_kind' : ''})
+           insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled, activity_enabled, description${practice ? ', chapter_kind' : ''}${withApp ? ', application_minutes' : ''})
            select $1::int, m.id,
                   coalesce((select max(position) from public.course_chapters where module_id = m.id), -1) + 1,
-                  $3::text, $4::text, $5::boolean, $6::boolean, $7::text${practice ? ", 'practice'" : ''}
+                  $3::text, $4::text, $5::boolean, $6::boolean, $7::text${practice ? ", 'practice'" : ''}${withApp ? `, ${appMinutes}::smallint` : ''}
              from m
            returning id, position, title, objective, description, video_enabled, activity_enabled
          ),
@@ -807,6 +840,8 @@ export class CourseStructureService implements OnModuleInit {
       // Un capítulo de contenido no informa `kind`: en una base sin la migración de práctica la columna no existe
       // y el editor solo ofrece la práctica cuando la lectura de la estructura la informa (re-revisión L4, m1).
       if (!practice && chapter) delete chapter.kind;
+      // Fase 2: la clave solo cuando el pedido la trajo (la base tiene la columna: lo verificó la guarda).
+      if (chapter && dto.applicationMinutes !== undefined) chapter.applicationMinutes = appMinutes ?? null;
       return { chapter, structureVersionCounter: newCounter, titleNormalized: nt.changed };
     } catch (err) {
       if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
@@ -820,6 +855,8 @@ export class CourseStructureService implements OnModuleInit {
     assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     await assertV21StructureSchema(this.dataSource); // V2.1 fix round 1 (I5): 503 si falta la migración R3
     if (dto.kind !== undefined) await assertPracticeChapterSchema(this.dataSource); // 503 sin la migración de práctica
+    const appMinutes = dto.applicationMinutes === undefined ? undefined : applicationMinutesOrThrow(dto.applicationMinutes);
+    if (dto.applicationMinutes !== undefined) await assertApplicationActivitySchema(this.dataSource); // 503 sin la migración
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();
@@ -873,6 +910,7 @@ export class CourseStructureService implements OnModuleInit {
       if (dto.kind === 'practice') sets.push('video_enabled = false');
       else if (dto.videoEnabled !== undefined) { sets.push(`video_enabled = $${i++}`); params.push(dto.videoEnabled); }
       if (dto.activityEnabled !== undefined) { sets.push(`activity_enabled = $${i++}`); params.push(dto.activityEnabled); }
+      if (appMinutes !== undefined) { sets.push(`application_minutes = $${i++}`); params.push(appMinutes); }
 
       const found = await this.updateRowAndBump(
         queryRunner, 'course_chapters', sets, params, i, { id: chapterId, module_id: moduleId, course_id: courseId }, courseId,

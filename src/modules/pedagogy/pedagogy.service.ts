@@ -113,7 +113,8 @@ export class PedagogyService {
     );
     const chapters: RawChapterRowV2[] = await this.dataSource.query(
       `select id, module_id, position, title, objective, description, video_enabled, activity_enabled,
-              to_jsonb(course_chapters) ->> 'chapter_kind' as chapter_kind
+              to_jsonb(course_chapters) ->> 'chapter_kind' as chapter_kind,
+                to_jsonb(course_chapters) ->> 'application_minutes' as application_minutes
          from public.course_chapters where course_id = $1`,
       [courseId],
     );

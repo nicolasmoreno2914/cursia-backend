@@ -129,6 +129,8 @@ export const BRIEF_ROLE_SENSITIVE_FIELDS: Readonly<Record<string, readonly strin
   video: ['video.style'],
   video_interactions: ['video.interactions', 'feedback.mode', 'feedback.timing'],
   activity: ['activity.intent', 'scenario.type', 'scenario.branching', 'feedback.mode', 'feedback.timing'],
+  // Fase 2: la Actividad de Aplicación lee el tipo de contenido, el escenario, la intención y la retroalimentación.
+  application_activity: ['contentType', 'scenario.type', 'activity.intent', 'feedback.mode'],
 });
 
 function pick(o: any, path: string): unknown {

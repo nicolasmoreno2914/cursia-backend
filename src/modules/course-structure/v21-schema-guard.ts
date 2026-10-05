@@ -95,3 +95,28 @@ export async function assertPracticeChapterSchema(q: { query(sql: string, params
   }
   practiceVerified = true;
 }
+
+// ── Fase 2: Actividades de Aplicación (course_chapters.application_minutes) ──
+// Misma regla que la práctica: la migración (supabase-migration-application-activities.sql) corre SOLO en
+// staging; sin ella la lectura no informa `applicationMinutes` y una escritura con la clave responde 503.
+export const SCHEMA_NOT_MIGRATED_APPLICATION = 'schema_not_migrated_application';
+let applicationVerified = false;
+
+export function _resetApplicationSchemaGuardForTests(): void {
+  applicationVerified = false;
+}
+
+export async function assertApplicationActivitySchema(q: { query(sql: string, params?: any[]): Promise<any> }): Promise<void> {
+  if (applicationVerified) return;
+  const res: any = await q.query(
+    `select 1 from information_schema.columns where table_schema = 'public' and table_name = 'course_chapters' and column_name = 'application_minutes'`,
+  );
+  const rows: unknown[] = Array.isArray(res) ? res : res.rows;
+  if (!rows.length) {
+    throw new ServiceUnavailableException({
+      code: SCHEMA_NOT_MIGRATED_APPLICATION,
+      message: `${SCHEMA_NOT_MIGRATED_APPLICATION}: esta base no tiene las Actividades de Aplicación (course_chapters.application_minutes); correr supabase-migration-application-activities.sql antes de usarlas.`,
+    });
+  }
+  applicationVerified = true;
+}

@@ -150,7 +150,8 @@ check('HE6 costo: el video no crece con las horas; la práctica cuesta mucho men
   assert(prov(m(50), 'videogen') > prov(m(33), 'videogen'), '50 h: más video solo por capítulos de profundización');
   const perPractice = (usd(m(33)) - usd(m(20))) / 2;
   const perContent = (usd(m(50)) - usd(m(33)) - 4 * perPractice) / 4;
-  assert(perPractice > 0 && perPractice < 0.4, `práctica ≈ USD ${perPractice.toFixed(2)}`);
+  // Fase 2: la práctica incluye su Actividad de Aplicación (texto LLM): sigue muy por debajo de un capítulo de contenido.
+  assert(perPractice > 0 && perPractice < 0.8, `práctica ≈ USD ${perPractice.toFixed(2)}`);
   assert(perContent > 5 * perPractice, `contenido ≈ USD ${perContent.toFixed(2)} (≫ práctica)`);
 });
 

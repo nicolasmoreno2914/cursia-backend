@@ -583,6 +583,12 @@ jobs:
                echo "━━━ [4d9] Motor de carga horaria: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-practice-chapters-schema.js
 
+               echo "━━━ [4d10] Actividades de Aplicación: course_chapters.application_minutes — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-application-activities.js
+
+               echo "━━━ [4d11] Actividades de Aplicación: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-application-activities-schema.js
+
                echo "━━━ [4e] Generation Manifests: migración (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-generation-manifests.js
 

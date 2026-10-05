@@ -373,7 +373,7 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
     const toItem = toItems.get(key)!;
     const inFrom = fromItems.has(key);
     const chapterIsNew = CHAPTER_ITEM_TYPES_V3.includes(type) && !fromFp.outline.chapterById.has(entityId);
-    const practiceNew = (type === 'experience' || type === 'activity') && practiceChanged(entityId);
+    const practiceNew = (type === 'experience' || type === 'activity' || type === 'application_activity') && practiceChanged(entityId);
     const contentNew = CHAPTER_ITEM_TYPES_V3.includes(type) && (contentProducesNew.has(entityId) || practiceNew);
     const contentReason = practiceNew && !contentProducesNew.has(entityId) ? 'practice_sources_changed' : 'content_regenerated';
     let a: InvalidationAction;
@@ -406,6 +406,22 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
       ) {
         regenerate(a, 'activity_type_changed');
       } else if (roleChanged('activity', entityId)) {
+        regenerate(a, ROLE_REASON);
+      } else {
+        a.reasons.push('content_reused');
+        settleReuse(a, 'REUSE');
+      }
+    } else if (type === 'application_activity') {
+      // Fase 2: la actividad (y su solucionario) se rehace si cambió su capítulo o sus fuentes, sus minutos o el
+      // contexto congelado (estudiante / resultados de aprendizaje). Es texto del navegador: nunca un proveedor pago.
+      a = base(key, true);
+      if (!inFrom) {
+        decideNewItem(a, chapterIsNew ? 'chapter_added' : 'application_toggled_on', contentNew);
+      } else if (contentNew) {
+        regenerate(a, contentReason);
+      } else if (fromFp.application?.get(entityId) !== toFp.application?.get(entityId)) {
+        regenerate(a, 'application_frame_changed');
+      } else if (roleChanged('application_activity', entityId)) {
         regenerate(a, ROLE_REASON);
       } else {
         a.reasons.push('content_reused');
@@ -555,7 +571,9 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
             ? 'video_toggled_off'
             : type === 'activity'
               ? 'activity_toggled_off'
-              : 'not_in_target_manifest',
+              : type === 'application_activity'
+                ? 'application_toggled_off'
+                : 'not_in_target_manifest',
       );
     } else if (MODULE_ITEM_TYPES_V3.includes(type)) {
       a.reasons.push(!toFp.outline.moduleById.has(entityId) ? 'module_deleted' : type === 'exam' ? 'exam_toggled_off' : 'not_in_target_manifest');

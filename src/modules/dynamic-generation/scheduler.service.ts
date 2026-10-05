@@ -107,6 +107,8 @@ export const BROWSER_CLAIMABLE_TYPES: ItemType[] = [
   'content', 'scorm', 'exam', 'course_plan', 'course_intro', 'module_intro',
   // V2.1 rulesVersion 3 (R4): items LLM del ejecutor del navegador (activity en sus dos variantes).
   'experience', 'video_interactions', 'activity', 'final_exam',
+  // Fase 2: Actividad de Aplicación (actividad + solucionario, texto LLM del navegador).
+  'application_activity',
 ];
 /**
  * V2.1 rulesVersion 3 (R4): items de PROVEEDOR que solo reclama el worker del

@@ -18,8 +18,9 @@
 //   - Prioridad: técnica > producto > curso (targetHours, toggles del docente) > pedagogía > preferencias.
 //     targetHours obliga a cambiar la estructura, pero esos cambios son PROPUESTAS: el lock nunca las aplica.
 //
-// Fase 1: la Actividad de aplicación todavía no se genera (Fase 2). El distribuidor reserva su nivel en el
-// diseño y reporta por separado las horas del diseño completo y las que se pueden generar HOY.
+// Fase 2: la Actividad de Aplicación SE GENERA (item `application_activity` del Manifest). El distribuidor fija
+// su nivel por capítulo y las horas generables son las del diseño completo (`generableHours` se conserva por
+// compatibilidad: es igual a `estimatedHours`).
 import type { BlueprintSnapshotV2 } from '../course-blueprints/blueprint-snapshot';
 import type { DesignRules } from '../pedagogy/design-rules';
 import { chapterRole } from '../pedagogy/pedagogical-blueprint';
@@ -28,7 +29,7 @@ import { STRUCTURE_TITLE_MAX } from '../course-structure/structure-titles';
 import { isValidTargetHours } from './target-hours';
 import { STUDY_TIME_RULES, StudyTimeCourseInput, StudyTimeEstimate, estimateCourseStudyTime } from './time-model';
 
-export const DISTRIBUTOR_VERSION = 1 as const;
+export const DISTRIBUTOR_VERSION = 2 as const;
 
 export interface DistributorPolicy {
   /** Nivel máximo de la Actividad de aplicación en capítulos de contenido y en los cierres de módulo / práctica. */
@@ -71,7 +72,7 @@ export interface ProposedChapter {
   videoEnabled: boolean;
   activityEnabled: boolean;
   review: boolean;
-  /** Nivel de la Actividad de aplicación (Fase 2: reservado en el diseño, todavía no se genera). */
+  /** Nivel de la Actividad de Aplicación (minutos; null = sin actividad). Se genera con el curso (Fase 2). */
   applicationMinutes: number | null;
   /** Tiempo objetivo del capítulo (modelo de tiempo, exacto) y lo que se puede generar hoy (sin la Actividad). */
   targetMinutes: number;
@@ -104,7 +105,7 @@ export interface DistributionResult {
   baseHours: number;
   /** Horas del diseño propuesto completo. */
   estimatedHours: number;
-  /** Horas que se pueden generar HOY (sin las Actividades de aplicación de la Fase 2). */
+  /** Horas que se pueden generar HOY: desde la Fase 2, todo el diseño (= estimatedHours). */
   generableHours: number;
   deltaHours: number;
   /** Proporción del diseño en Actividades de aplicación (0–1), incluidos los capítulos de práctica. */
@@ -262,12 +263,12 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   const baseHours = r1(estimateCourseStudyTime(toInput(false)).courseEstimatedMinutes / 60);
 
   const result = (status: DistributionStatus, recs: string[]): DistributionResult => {
-    const generable = estimateCourseStudyTime(toInput(false));
+    const generable = est; // Fase 2: las Actividades de Aplicación se generan
     // Re-revisión L3: los capítulos de práctica no tienen tope de aplicación; si el diseño queda por encima de la
-    // proporción del enfoque, se dice explícitamente (las Actividades de aplicación todavía no se generan).
+    // proporción del enfoque, se dice explícitamente.
     const share = est.byComponent.application / est.courseEstimatedMinutes;
     const recommendations = share > policy.maxApplicationShare + 1e-9
-      ? [...recs, `El ${Math.round(share * 100)} % de este diseño son Actividades de aplicación (más que el ${Math.round(policy.maxApplicationShare * 100)} % habitual del enfoque) y todavía no se generan: hoy el curso tendría ${String(r1(generable.courseEstimatedMinutes / 60)).replace('.', ',')} h. Si el curso es chico, conviene sumar capítulos de contenido o un módulo en lugar de más práctica.`]
+      ? [...recs, `El ${Math.round(share * 100)} % de este diseño son Actividades de Aplicación (más que el ${Math.round(policy.maxApplicationShare * 100)} % habitual del enfoque). Si el curso es chico, conviene sumar capítulos de contenido o un módulo en lugar de más práctica.`]
       : recs;
     const estChapter = new Map(est.modules.flatMap((m) => m.chapters).map((c) => [c.chapterId, c.chapterEstimatedMinutes]));
     const genChapter = new Map(generable.modules.flatMap((m) => m.chapters).map((c) => [c.chapterId, c.chapterEstimatedMinutes]));
@@ -411,7 +412,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
         for (const t of [...tiers].reverse()) if (trySetTier(m, pc, t)) break;
         changes.push({
           type: 'add_practice_chapter', moduleId: m.id, chapterId: pc.id,
-          detail: `Capítulo de práctica «${pc.title}»: sin video, presentación ni audiolibro; actividad H5P${review ? ', repaso' : ''}${pc.applicationMinutes ? ` y Actividad de aplicación de ${pc.applicationMinutes} min (se genera más adelante)` : ''}.`,
+          detail: `Capítulo de práctica «${pc.title}»: sin video, presentación ni audiolibro; actividad H5P${review ? ', repaso' : ''}${pc.applicationMinutes ? ` y Actividad de Aplicación de ${pc.applicationMinutes} min` : ''}.`,
         });
       }
     }
@@ -444,7 +445,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
         trySetTier(m, cc, tiers[0]);
         changes.push({
           type: 'add_content_chapter', moduleId: m.id, chapterId: cc.id,
-          detail: `Capítulo de profundización «${cc.title}»${usesVideo ? ' con video' : ''}, actividad${review ? ', repaso' : ''}${cc.applicationMinutes ? ` y Actividad de aplicación de ${cc.applicationMinutes} min (se genera más adelante)` : ''}.`,
+          detail: `Capítulo de profundización «${cc.title}»${usesVideo ? ' con video' : ''}, actividad${review ? ', repaso' : ''}${cc.applicationMinutes ? ` y Actividad de Aplicación de ${cc.applicationMinutes} min` : ''}.`,
         });
         growApplication();
       }
@@ -476,7 +477,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   }
   for (const m of design) for (const c of m.chapters) {
     if (c.applicationMinutes && !c.proposed) {
-      changes.push({ type: 'set_application_activity', moduleId: m.id, chapterId: c.id, detail: `Actividad de aplicación de ${c.applicationMinutes} min en «${c.title}» (se genera más adelante).` });
+      changes.push({ type: 'set_application_activity', moduleId: m.id, chapterId: c.id, detail: `Actividad de Aplicación de ${c.applicationMinutes} min en «${c.title}».` });
     }
     const before = initialRoles.get(c.id);
     if (!c.proposed && before && before !== roleOf(m, c)) {

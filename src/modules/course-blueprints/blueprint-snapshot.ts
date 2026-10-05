@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { isApplicationMinutes } from '../study-time/application-tiers';
 import { isValidTargetHours } from '../study-time/target-hours';
 import {
   BlueprintPedagogyInput,
@@ -341,6 +342,11 @@ export interface RawChapterRowV2 extends RawChapterRow {
    * de contenido de siempre; 'practice' = capítulo de práctica (sin video, presentación, audiolibro ni Libro).
    */
   chapter_kind?: string | null;
+  /**
+   * Fase 2 · Actividades de Aplicación: minutos de la actividad del capítulo (course_chapters.application_minutes).
+   * Ausente/null = sin actividad; 30/60/90/120 = niveles del modelo de tiempo.
+   */
+  application_minutes?: number | null;
 }
 
 export type ChapterKind = 'content' | 'practice';
@@ -349,6 +355,23 @@ export const CHAPTER_KINDS: readonly ChapterKind[] = ['content', 'practice'];
 /** Tipo efectivo de un capítulo del snapshot (la clave `kind` existe SOLO en los de práctica). */
 export function chapterKindOf(c: { kind?: string }): ChapterKind {
   return c.kind === 'practice' ? 'practice' : 'content';
+}
+
+/** Minutos de aplicación crudos: undefined = sin actividad; 'invalid' = valor fuera de los niveles. */
+function rawApplicationMinutes(v: unknown): number | undefined | 'invalid' {
+  if (v === undefined || v === null) return undefined;
+  const n = typeof v === 'string' && /^\d+$/.test(v) ? Number(v) : v;
+  return isApplicationMinutes(n) ? n : 'invalid';
+}
+
+function applicationErrors(chapters: { id: string; minutes: unknown }[], pathOf: (i: number) => string): BlueprintValidationError[] {
+  const errors: BlueprintValidationError[] = [];
+  chapters.forEach((c, i) => {
+    if (rawApplicationMinutes(c.minutes) === 'invalid') {
+      errors.push({ path: pathOf(i), code: 'INVALID_APPLICATION_MINUTES', message: `El capítulo ${c.id} tiene minutos de Actividad de Aplicación inválidos (${JSON.stringify(c.minutes)}; permitidos: 30, 60, 90, 120)` });
+    }
+  });
+  return errors;
 }
 
 function rawChapterKind(v: unknown): ChapterKind | null {
@@ -375,6 +398,59 @@ function practiceErrors(modules: { id: string; chapters: { id: string; kind: Cha
   return errors;
 }
 
+/**
+ * Fase 2 · Actividades de Aplicación: perfil del estudiante y resultados de aprendizaje del perfil pedagógico,
+ * CONGELADOS en el Blueprint para que la actividad generada use exactamente lo aprobado. La clave existe SOLO si
+ * algún capítulo tiene Actividad de Aplicación y el contexto no está vacío (los demás snapshots conservan su sha).
+ */
+export interface ApplicationContextV2 {
+  learner: {
+    description: string | null;
+    ageGroup: string | null;
+    educationLevel: string | null;
+    priorKnowledge: string | null;
+    experience: string | null;
+  };
+  learningOutcomes: { know: string[]; do: string[]; competencies: string[] };
+}
+
+function ctxText(v: unknown, path: string): string | null {
+  if (v === null || v === undefined) return null;
+  if (typeof v !== 'string') throw new Error(`BLUEPRINT_V2_INVALID_INPUT: ${path} debe ser texto o null (fue ${JSON.stringify(v)})`);
+  const t = v.replace(/\s+/g, ' ').trim();
+  return t ? t : null;
+}
+function ctxList(v: unknown, path: string): string[] {
+  if (v === undefined || v === null) return [];
+  if (!Array.isArray(v)) throw new Error(`BLUEPRINT_V2_INVALID_INPUT: ${path} debe ser una lista de textos`);
+  return v.map((x, i) => ctxText(x, `${path}[${i}]`)).filter((x): x is string => x !== null);
+}
+
+/** Forma canónica (claves en orden fijo, textos colapsados); null si no hay nada que congelar. */
+export function canonicalApplicationContext(v: unknown): ApplicationContextV2 | null {
+  if (v === undefined || v === null) return null;
+  if (typeof v !== 'object' || Array.isArray(v)) throw new Error('BLUEPRINT_V2_INVALID_INPUT: applicationContext debe ser un objeto');
+  const o = v as any;
+  const l = o.learner ?? {};
+  const out: ApplicationContextV2 = {
+    learner: {
+      description: ctxText(l.description, 'applicationContext.learner.description'),
+      ageGroup: ctxText(l.ageGroup, 'applicationContext.learner.ageGroup'),
+      educationLevel: ctxText(l.educationLevel, 'applicationContext.learner.educationLevel'),
+      priorKnowledge: ctxText(l.priorKnowledge, 'applicationContext.learner.priorKnowledge'),
+      experience: ctxText(l.experience, 'applicationContext.learner.experience'),
+    },
+    learningOutcomes: {
+      know: ctxList(o.learningOutcomes?.know, 'applicationContext.learningOutcomes.know'),
+      do: ctxList(o.learningOutcomes?.do, 'applicationContext.learningOutcomes.do'),
+      competencies: ctxList(o.learningOutcomes?.competencies, 'applicationContext.learningOutcomes.competencies'),
+    },
+  };
+  const empty = Object.values(out.learner).every((x) => x === null)
+    && out.learningOutcomes.know.length + out.learningOutcomes.do.length + out.learningOutcomes.competencies.length === 0;
+  return empty ? null : out;
+}
+
 export interface BlueprintCourseInputV2 {
   id: number;
   title: string;
@@ -390,6 +466,8 @@ export interface BlueprintCourseInputV2 {
    * el snapshot no lleva la clave y conserva su sha.
    */
   targetHours?: number | null;
+  /** Fase 2: contexto del perfil para las Actividades de Aplicación (entra solo si algún capítulo tiene una). */
+  applicationContext?: unknown;
 }
 
 export interface BlueprintChapterV2 extends BlueprintChapter {
@@ -401,6 +479,11 @@ export interface BlueprintChapterV2 extends BlueprintChapter {
    * sha). Un capítulo de práctica no tiene video, presentación, audiolibro ni capítulo del Libro.
    */
   kind?: 'practice';
+  /**
+   * Fase 2 · Actividades de Aplicación: SOLO en capítulos con actividad (los demás no llevan la clave y conservan
+   * su sha). Minutos de trabajo del estudiante (30/60/90/120): entran al tiempo del capítulo y del curso.
+   */
+  applicationMinutes?: number;
   /** Motor pedagógico V1: solo si el curso tiene perfil pedagógico (sin él, sha de siempre). */
   design?: ChapterDesign;
 }
@@ -436,6 +519,11 @@ export interface BlueprintSnapshotV2 {
      * SOLO con objetivo: los snapshots sin ella conservan su sha. No cambia los items del Manifest.
      */
     targetHours?: number;
+    /**
+     * Fase 2 · Actividades de Aplicación: estudiante + resultados de aprendizaje congelados. SOLO si algún capítulo
+     * tiene Actividad de Aplicación y el perfil los define.
+     */
+    applicationContext?: ApplicationContextV2;
     /**
      * Motor pedagógico V1: resumen del diseño pedagógico (enfoques, estrategia de evaluación…).
      * La clave existe SOLO con perfil pedagógico: los snapshots sin ella conservan su sha.
@@ -495,6 +583,8 @@ export function buildBlueprintSnapshotV2(
     (mi, ci) => `modules[${mi}].chapters[${ci}]`,
   );
   if (kindErrors.length) throw new Error(`BLUEPRINT_V2_INVALID_INPUT: ${kindErrors.map((e) => e.message).join('; ')}`);
+  const appErrors = applicationErrors(chapters.map((c) => ({ id: c.id, minutes: c.application_minutes })), (i) => `chapters[${i}].application_minutes`);
+  if (appErrors.length) throw new Error(`BLUEPRINT_V2_INVALID_INPUT: ${appErrors.map((e) => e.message).join('; ')}`);
   const badChapter = chapters.find((c) => typeof c.activity_enabled !== 'boolean');
   if (badChapter) {
     throw new Error(
@@ -524,6 +614,9 @@ export function buildBlueprintSnapshotV2(
     for (const c of chapters) if (!pedagogy.chapters?.[c.id]) throw new Error(`BLUEPRINT_PEDAGOGY_INVALID: falta el diseño del capítulo ${c.id}`);
   }
   const coursePedagogy = pedagogy ? canonicalCoursePedagogy(pedagogy.course) : null;
+  // Fase 2: el contexto de las actividades se congela solo si alguna lo va a usar.
+  const anyApplication = chapters.some((c) => typeof rawApplicationMinutes(c.application_minutes) === 'number');
+  const applicationContext = anyApplication ? canonicalApplicationContext(course.applicationContext) : null;
 
   return {
     schemaVersion: 2,
@@ -535,6 +628,7 @@ export function buildBlueprintSnapshotV2(
       activityEngine: course.activityEngine,
       ...(course.reviewCards === true ? { reviewCards: true as const } : {}),
       ...(course.targetHours !== undefined && course.targetHours !== null ? { targetHours: course.targetHours } : {}),
+      ...(applicationContext ? { applicationContext } : {}),
       ...(coursePedagogy ? { pedagogy: coursePedagogy } : {}),
     },
     modules: sortedModules.map((m) => {
@@ -558,6 +652,7 @@ export function buildBlueprintSnapshotV2(
           videoEnabled: !!c.video_enabled,
           activityEnabled: c.activity_enabled,
           ...(rawChapterKind(c.chapter_kind) === 'practice' ? { kind: 'practice' as const } : {}),
+          ...(typeof rawApplicationMinutes(c.application_minutes) === 'number' ? { applicationMinutes: rawApplicationMinutes(c.application_minutes) as number } : {}),
           ...(pedagogy ? { design: canonicalChapterDesign(pedagogy.chapters[c.id], `chapters[${c.id}].design`) } : {}),
         })),
       };
@@ -613,6 +708,7 @@ export function snapshotV2ToRows(s: any): {
         description: c.description ?? null,
         video_enabled: c.videoEnabled, activity_enabled: c.activityEnabled,
         ...(c.kind !== undefined ? { chapter_kind: c.kind } : {}),
+        ...(c.applicationMinutes !== undefined ? { application_minutes: c.applicationMinutes } : {}),
       });
       if (pedagogy) pedagogy.chapters[c.id] = c.design;
       else if (c.design !== undefined) throw new Error(`BLUEPRINT_PEDAGOGY_INVALID: el capítulo ${c.id} trae design sin course.pedagogy`);
@@ -626,6 +722,7 @@ export function snapshotV2ToRows(s: any): {
       activityEngine: s.course.activityEngine,
       ...(s.course.reviewCards !== undefined ? { reviewCards: s.course.reviewCards } : {}),
       ...(s.course.targetHours !== undefined ? { targetHours: s.course.targetHours } : {}),
+      ...(s.course.applicationContext !== undefined ? { applicationContext: s.course.applicationContext } : {}),
     },
     modules,
     chapters,
@@ -704,6 +801,19 @@ export function validateBlueprintSnapshotV2(s: BlueprintSnapshotV2): BlueprintVa
     s.modules.map((m) => ({ id: m.id, chapters: m.chapters.map((c) => ({ id: c.id, kind: rawChapterKind((c as { kind?: unknown }).kind), videoEnabled: !!c.videoEnabled })) })),
     (mi, ci) => `modules[${mi}].chapters[${ci}]`,
   ));
+  // Fase 2: el contexto de las actividades existe solo con alguna actividad, y en forma canónica.
+  const ctx = (s.course as { applicationContext?: unknown }).applicationContext;
+  if (ctx !== undefined) {
+    const anyApp = s.modules.some((m) => m.chapters.some((c) => (c as { applicationMinutes?: unknown }).applicationMinutes !== undefined));
+    let canon: ApplicationContextV2 | null = null;
+    try { canon = canonicalApplicationContext(ctx); } catch { canon = null; }
+    if (!anyApp) errors.push({ path: 'course.applicationContext', code: 'APPLICATION_CONTEXT_WITHOUT_ACTIVITY', message: 'course.applicationContext existe pero ningún capítulo tiene Actividad de Aplicación' });
+    else if (!canon || JSON.stringify(canon) !== JSON.stringify(ctx)) errors.push({ path: 'course.applicationContext', code: 'INVALID_APPLICATION_CONTEXT', message: 'course.applicationContext no está en forma canónica' });
+  }
+  s.modules.forEach((m, mi) => errors.push(...applicationErrors(
+    m.chapters.map((c) => ({ id: c.id, minutes: (c as { applicationMinutes?: unknown }).applicationMinutes })),
+    (ci) => `modules[${mi}].chapters[${ci}].applicationMinutes`,
+  )));
   return [...errors, ...validateBlueprintSnapshot(structuralViewV1(s))];
 }
 
@@ -744,6 +854,7 @@ export function validateBlueprintInputV2(
     modules.map((m) => ({ id: m.id, chapters: chapters.filter((c) => c.module_id === m.id).map((c) => ({ id: c.id, kind: rawChapterKind(c.chapter_kind), videoEnabled: !!c.video_enabled })) })),
     (mi, ci) => `modules[${mi}].chapters[${ci}]`,
   ));
+  errors.push(...applicationErrors(chapters.map((c) => ({ id: c.id, minutes: c.application_minutes })), (i) => `chapters[${i}].application_minutes`));
   return errors;
 }
 

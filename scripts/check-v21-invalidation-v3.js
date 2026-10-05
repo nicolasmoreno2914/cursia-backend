@@ -150,6 +150,8 @@ function buildBp(spec) {
   spec.modules.forEach((m) => m.chapters.forEach((c, j) => chapters.push({
     id: c.id, module_id: m.id, position: c.position ?? j, title: c.title, objective: c.objective ?? null,
     video_enabled: !!c.video, activity_enabled: !!c.act,
+    // Fase 2: Actividad de Aplicación (minutos) en los capítulos que la piden.
+    ...(c.app ? { application_minutes: c.app } : {}),
   })));
   return snap.buildBlueprintSnapshotV2(
     { id: COURSE_ID, title: spec.title, finalExam: spec.finalExam, activityEngine: spec.engine }, modules, chapters,
@@ -244,9 +246,13 @@ async function pureChecks() {
   const m0 = manifestOf(bp0, 1);
   const chapterItems = (ch) => m0.items.filter((i) => i.chapterId === ch).map((i) => i.key);
 
-  await check('fixture: el Manifest v3 tiene todos los tipos (13) y el plan sin cambios es todo REUSE', () => {
-    const types = new Set(m0.items.map((i) => i.type));
+  await check('fixture: el Manifest v3 tiene todos los tipos (14, con una Actividad de Aplicación) y el plan sin cambios es todo REUSE', () => {
+    // Fase 2: el fixture base no cambia (sha fijados); los 14 tipos se ven con una actividad en el capítulo 2.
+    const withApp = baseSpec(); chapterOf(withApp, C2).app = 60;
+    const types = new Set([...m0.items, ...manifestOf(buildBp(withApp), 9).items].map((i) => i.type));
     for (const t of B.MANIFEST_ITEM_TYPES_V3) assert(types.has(t), `falta ${t}`);
+    const pa = planOf(buildBp(withApp), buildBp(withApp)).plan;
+    assert(allReuse(pa), 'con actividad: no todo REUSE');
     const { plan } = planOf(bp0, buildBp(baseSpec()));
     assert(allReuse(plan), 'no todo REUSE');
     eq([plan.fromRulesVersion, plan.toRulesVersion, plan.fingerprintVersion, plan.invalidationPlanVersion], [3, 3, 2, 2], 'versiones');

@@ -10,7 +10,7 @@
 //       competencias → práctica antes que profundidad; significativo → profundidad antes que práctica
 //   D6  tolerancia configurable (±5 % o ±1 h por defecto) y respetada en el estado
 //   D7  determinista; los minutos los pone el modelo de tiempo (suma por capítulo = total)
-//   D8  las horas generables HOY no cuentan las Actividades de aplicación (Fase 2)
+//   D8  Fase 2: las Actividades de Aplicación se generan (horas generables = horas del diseño)
 //   D9  prioridad: targetHours manda sobre la estructura del enfoque, pero solo PROPONE (no toca el Blueprint)
 //   D10 límites: ningún capítulo > 240 min; ≤ 5 capítulos de contenido por módulo; aplicación ≤ tope del enfoque
 //   D11 reordenar capítulos y cambiar targetHours: el resultado se recalcula sin estado oculto
@@ -180,10 +180,11 @@ check('D7 determinista; los minutos son los del modelo de tiempo', () => {
   near(a.studyTime.courseEstimatedMinutes / 60, a.estimatedHours, 0.05, 'total');
 });
 
-check('D8 horas generables HOY = diseño sin Actividades de aplicación (Fase 2)', () => {
+check('D8 Fase 2: las Actividades de Aplicación se generan — horas generables = horas del diseño (también por capítulo)', () => {
   const r = dist(33);
-  near(r.estimatedHours - r.generableHours, r.counts.applicationMinutes / 60, 0.1, 'la diferencia es exactamente la aplicación');
-  for (const c of chapters(r)) near(c.targetMinutes - c.generableMinutes, c.applicationMinutes || 0, 0.01, `capítulo ${c.id}`);
+  assert(r.counts.applicationMinutes > 0, 'el diseño tiene actividades');
+  eq(r.generableHours, r.estimatedHours, 'generable = diseño');
+  for (const c of chapters(r)) eq(c.generableMinutes, c.targetMinutes, `capítulo ${c.id}`);
   eq(r.baseHours, dist(20).baseHours, 'base igual para cualquier objetivo');
 });
 
@@ -228,7 +229,7 @@ check('D10b otras formas de curso: cada nivel respeta el tope de su rol FINAL (l
       near(r.applicationShare, r.studyTime.byComponent.application / r.studyTime.courseEstimatedMinutes, 0.006, 'proporción informada');
       // Aviso exacto: con la proporción REAL (studyTime) por encima del tope del enfoque, y nunca por debajo.
       const realShare = r.studyTime.byComponent.application / r.studyTime.courseEstimatedMinutes;
-      const warned = r.recommendations.some((x) => /% de este diseño son Actividades de aplicación/.test(x));
+      const warned = r.recommendations.some((x) => /% de este diseño son Actividades de Aplicación/i.test(x));
       if (realShare > r.policy.maxApplicationShare + 1e-6) assert(warned, `${shape}/${k}/${h}: falta el aviso (${realShare.toFixed(3)})`);
       if (realShare <= r.policy.maxApplicationShare) assert(!warned, `${shape}/${k}/${h}: aviso de más (${realShare.toFixed(3)})`);
       const rc = r.changes.filter((x) => x.type === 'role_changed');

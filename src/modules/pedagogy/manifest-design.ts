@@ -73,6 +73,12 @@ export function manifestItemDesign(
           return { interactions: d.video.interactions, feedback: { mode: d.feedback.mode, timing: d.feedback.timing } };
         case 'activity':
           return { intent: d.activity.intent, scenario: { type: d.scenario.type, branching: d.scenario.branching }, feedback: { mode: d.feedback.mode, timing: d.feedback.timing } };
+        case 'application_activity':
+          // Fase 2: la Actividad de Aplicación adapta tipo de tarea, profundidad y retroalimentación al diseño del capítulo.
+          return {
+            role: d.role, objectiveVerbs: [...d.objectiveVerbs], contentType: d.contentType, depth: d.depth, intent: d.activity.intent,
+            scenario: { type: d.scenario.type, branching: d.scenario.branching }, feedback: { mode: d.feedback.mode, timing: d.feedback.timing },
+          };
         default:
           throw new Error(`manifestItemDesign: tipo de item sin diseño definido: ${type}`);
       }

@@ -14,6 +14,7 @@ export const FINOPS_ITEM_TYPES = [
   'video',
   'video_interactions',
   'activity',
+  'application_activity',
   'exam',
   'final_exam',
   'audio_welcome',
@@ -33,6 +34,8 @@ export const ITEM_TYPE_OPERATIONS: Readonly<Record<FinopsItemType, readonly stri
   video: ['videogen.render', 'youtube.upload'],
   video_interactions: ['llm.video_interactions'],
   activity: ['llm.activity'],
+  // Fase 2: actividad del estudiante + solucionario docente (dos llamadas de texto; prior en usage-model.priors.v1.json).
+  application_activity: ['llm.application_activity'],
   exam: ['llm.exam'],
   final_exam: ['llm.final_exam'],
   audio_welcome: ['tts.audio_welcome'],

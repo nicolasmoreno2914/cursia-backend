@@ -12,6 +12,7 @@ import {
   chooseActivityTypesV1,
 } from './activity-type-rules';
 import { chooseActivityTypesV2 } from './activity-type-rules-v2';
+import { isApplicationMinutes } from '../study-time/application-tiers';
 import { sortedCanonicalJson } from '../coherence/canonical-json';
 import { ManifestFeaturesPedagogy, manifestFeaturesPedagogy, manifestItemDesign } from '../pedagogy/manifest-design';
 import { allowedPedagogicalTypes, choosePedagogicalActivityTypes } from '../pedagogy/pedagogical-blueprint';
@@ -49,6 +50,8 @@ export type ManifestItemType =
   | 'presentation'
   | 'video_interactions'
   | 'activity'
+  // Fase 2 · Actividades de Aplicación (solo en capítulos con applicationMinutes):
+  | 'application_activity'
   | 'audiobook_chapter'
   | 'audio_welcome'
   | 'final_exam';
@@ -68,12 +71,12 @@ export const MANIFEST_ITEM_TYPES_V2: readonly ManifestItemType[] = [
  */
 export const MANIFEST_ITEM_TYPES_V3: readonly ManifestItemType[] = [
   'course_plan', 'course_intro', 'audio_welcome', 'module_intro',
-  'content', 'experience', 'presentation', 'video', 'video_interactions', 'activity', 'audiobook_chapter',
+  'content', 'experience', 'presentation', 'video', 'video_interactions', 'activity', 'application_activity', 'audiobook_chapter',
   'exam', 'final_exam',
 ];
 /** Tipos que solo existen en rulesVersion 3. */
 export const V3_ONLY_ITEM_TYPES: readonly ManifestItemType[] = [
-  'experience', 'presentation', 'video_interactions', 'activity', 'audiobook_chapter', 'audio_welcome', 'final_exam',
+  'experience', 'presentation', 'video_interactions', 'activity', 'application_activity', 'audiobook_chapter', 'audio_welcome', 'final_exam',
 ];
 /** Todos los tipos que existen en algún rulesVersion soportado. */
 export const ALL_MANIFEST_ITEM_TYPES: readonly ManifestItemType[] = [...MANIFEST_ITEM_TYPES_V2, ...V3_ONLY_ITEM_TYPES];
@@ -112,6 +115,8 @@ export interface ManifestChapter {
    * siempre). Un capítulo de práctica solo produce experience (+ activity), apoyados en los content del módulo.
    */
   kind?: 'practice';
+  /** Fase 2: minutos de la Actividad de Aplicación, SOLO en capítulos que la tienen (sin la clave: sha de siempre). */
+  applicationMinutes?: number;
 }
 
 export interface ManifestModule {
@@ -148,6 +153,8 @@ export interface ManifestItem {
    * de Blueprints con `course.pedagogy`; ausente = Manifest de siempre (sha intacto).
    */
   design?: Record<string, unknown>;
+  /** Fase 2: SOLO en items `application_activity` — minutos de trabajo del estudiante (30/60/90/120). */
+  applicationMinutes?: number;
 }
 
 /** Solo rulesVersion 3: flags de curso del Blueprint v2 que cambian el conjunto de items. */
@@ -199,6 +206,8 @@ export interface ManifestTotals {
   audioWelcomeCount?: number;
   finalExamCount?: number;
   totalJobs: number;
+  /** Fase 2: SOLO si el Manifest tiene Actividades de Aplicación (va después de totalJobs; sin ella, sha de siempre). */
+  applicationActivityCount?: number;
 }
 
 /**
@@ -1089,7 +1098,7 @@ export function finalExamKey(courseId: number): string {
 
 /** Tipos por capítulo de v3, en orden canónico. */
 const V3_CHAPTER_TYPES_IN_ORDER = [
-  'content', 'experience', 'presentation', 'video', 'video_interactions', 'activity', 'audiobook_chapter',
+  'content', 'experience', 'presentation', 'video', 'video_interactions', 'activity', 'application_activity', 'audiobook_chapter',
 ] as const;
 
 function assertV2Snapshot(snapshot: any, where: string): asserts snapshot is BlueprintSnapshotV2 {
@@ -1166,7 +1175,17 @@ export function buildGenerationManifestV3(
       if (practice && (videoEnabled || moduleContentKeys.length === 0)) {
         throw new Error(`BLUEPRINT_V2_INVALID_INPUT: el capítulo de práctica ${c.id} no puede tener video y su módulo necesita un capítulo de contenido`);
       }
-      chapters.push({ chapterId: c.id, position: c.position, chapterNumber, videoEnabled, activityEnabled: c.activityEnabled, ...(practice ? { kind: 'practice' as const } : {}) });
+      // Fase 2: Actividad de Aplicación (minutos del Blueprint; ausente = sin actividad).
+      const appMin = (c as { applicationMinutes?: unknown }).applicationMinutes;
+      if (appMin !== undefined && !isApplicationMinutes(appMin)) {
+        throw new Error(`BLUEPRINT_V2_INVALID_INPUT: el capítulo ${c.id} tiene applicationMinutes inválido (${JSON.stringify(appMin)})`);
+      }
+      const application = isApplicationMinutes(appMin) ? appMin : null;
+      chapters.push({
+        chapterId: c.id, position: c.position, chapterNumber, videoEnabled, activityEnabled: c.activityEnabled,
+        ...(practice ? { kind: 'practice' as const } : {}),
+        ...(application !== null ? { applicationMinutes: application } : {}),
+      });
       const base = { scope: 'chapter' as const, moduleId: m.id, chapterId: c.id, moduleNumber, chapterNumber };
       if (practice) {
         items.push({ key: `experience:${c.id}`, type: 'experience', ...base, dependsOn: [...moduleContentKeys] });
@@ -1176,6 +1195,9 @@ export function buildGenerationManifestV3(
             throw new Error(`buildGenerationManifestV3: sin tipo h5p para la actividad del capítulo ${c.id}`);
           }
           items.push({ key: `activity:${c.id}`, type: 'activity', ...base, dependsOn: [...moduleContentKeys], variant, ...(h5pType ? { h5pType } : {}) });
+        }
+        if (application !== null) {
+          items.push({ key: `application_activity:${c.id}`, type: 'application_activity', ...base, dependsOn: [...moduleContentKeys], applicationMinutes: application });
         }
         continue;
       }
@@ -1201,6 +1223,9 @@ export function buildGenerationManifestV3(
           key: `activity:${c.id}`, type: 'activity', ...base, dependsOn: [contentKey], variant,
           ...(h5pType ? { h5pType } : {}),
         });
+      }
+      if (application !== null) {
+        items.push({ key: `application_activity:${c.id}`, type: 'application_activity', ...base, dependsOn: [contentKey], applicationMinutes: application });
       }
       items.push({ key: `audiobook_chapter:${c.id}`, type: 'audiobook_chapter', ...base, dependsOn: [contentKey] });
     }
@@ -1259,6 +1284,7 @@ export function buildGenerationManifestV3(
       audioWelcomeCount: count('audio_welcome'),
       finalExamCount: count('final_exam'),
       totalJobs: items.length,
+      applicationActivityCount: count('application_activity'),
     }),
   };
 }
@@ -1282,8 +1308,13 @@ function totalsV3From(t: ManifestTotals): ManifestTotals {
     audioWelcomeCount: t.audioWelcomeCount,
     finalExamCount: t.finalExamCount,
     totalJobs: t.totalJobs,
+    // Fase 2: la clave existe SOLO con actividades (los Manifests sin ellas conservan su forma y su sha).
+    ...(t.applicationActivityCount ? { applicationActivityCount: t.applicationActivityCount } : {}),
   };
 }
+
+/** Fase 2: claves opcionales de totals v3 (después de totalJobs; solo si son > 0). */
+export const MANIFEST_TOTALS_OPTIONAL_KEYS_V3: readonly (keyof ManifestTotals)[] = ['applicationActivityCount'];
 
 /** Claves exactas de totals en v3 (orden canónico). */
 export const MANIFEST_TOTALS_KEYS_V3: readonly (keyof ManifestTotals)[] = [
@@ -1324,6 +1355,7 @@ export function canonicalManifestJsonV3(m: GenerationManifestV1): string {
         videoEnabled: c.videoEnabled,
         activityEnabled: c.activityEnabled,
         ...(c.kind === 'practice' ? { kind: 'practice' as const } : {}),
+        ...(c.applicationMinutes !== undefined ? { applicationMinutes: c.applicationMinutes } : {}),
       })),
     })),
     items: m.items.map((i) => ({
@@ -1339,6 +1371,7 @@ export function canonicalManifestJsonV3(m: GenerationManifestV1): string {
       ...(i.h5pType !== undefined ? { h5pType: i.h5pType } : {}),
       // Motor pedagógico V1: claves del diseño ordenadas (independiente del orden de jsonb).
       ...(i.design !== undefined ? { design: JSON.parse(sortedCanonicalJson(i.design)) } : {}),
+      ...(i.applicationMinutes !== undefined ? { applicationMinutes: i.applicationMinutes } : {}),
     })),
     // Se copian TODAS las claves que traiga (en orden v3 primero, luego
     // cualquier extra como scormCount) para que el validador vea un totals
@@ -1363,6 +1396,8 @@ interface ExpectedItemV3 {
   chapterNumber: number | null;
   dependsOn: string[];
   variant?: ActivityVariant;
+  /** Fase 2: solo en application_activity. */
+  applicationMinutes?: number;
 }
 
 /**
@@ -1468,7 +1503,7 @@ export function validateGenerationManifestV3(
   expected.push(course('course_intro', [planKey]));
   expected.push(course('audio_welcome', [introKey]));
 
-  const chapterInfo = new Map<string, { moduleId: string; videoEnabled: boolean; activityEnabled: boolean }>();
+  const chapterInfo = new Map<string, { moduleId: string; videoEnabled: boolean; activityEnabled: boolean; applicationMinutes?: number }>();
   const moduleInfo = new Map<string, { examEnabled: boolean }>();
   const expectedModules: ManifestModule[] = [];
   const allContent: string[] = [];
@@ -1490,8 +1525,15 @@ export function validateGenerationManifestV3(
       const videoOn = !!c.videoEnabled;
       const activityOn = c.activityEnabled === true;
       const practice = chapterKindOf(c) === 'practice';
-      chapterInfo.set(c.id, { moduleId: mod.id, videoEnabled: videoOn, activityEnabled: activityOn });
-      mirrorChapters.push({ chapterId: c.id, position: c.position, chapterNumber: chNum, videoEnabled: videoOn, activityEnabled: activityOn, ...(practice ? { kind: 'practice' as const } : {}) });
+      // Fase 2: minutos de la Actividad de Aplicación (un valor fuera de los niveles no produce item: lo marca el validador del Blueprint).
+      const appRaw = (c as { applicationMinutes?: unknown }).applicationMinutes;
+      const appMin = isApplicationMinutes(appRaw) ? appRaw : undefined;
+      chapterInfo.set(c.id, { moduleId: mod.id, videoEnabled: videoOn, activityEnabled: activityOn, ...(appMin !== undefined ? { applicationMinutes: appMin } : {}) });
+      mirrorChapters.push({
+        chapterId: c.id, position: c.position, chapterNumber: chNum, videoEnabled: videoOn, activityEnabled: activityOn,
+        ...(practice ? { kind: 'practice' as const } : {}),
+        ...(appMin !== undefined ? { applicationMinutes: appMin } : {}),
+      });
       const ch = (type: ManifestItemType, dependsOn: string[], variant?: ActivityVariant): ExpectedItemV3 => ({
         key: `${type}:${c.id}`, type, scope: 'chapter', moduleId: mod.id, chapterId: c.id,
         moduleNumber, chapterNumber: chNum, dependsOn, ...(variant ? { variant } : {}),
@@ -1500,6 +1542,7 @@ export function validateGenerationManifestV3(
         // Motor de carga horaria: capítulo de práctica = experience (+ activity) sobre los content del módulo.
         expected.push(ch('experience', [...modContentAll]));
         if (activityOn) expected.push(ch('activity', [...modContentAll], engine));
+        if (appMin !== undefined) expected.push({ ...ch('application_activity', [...modContentAll]), applicationMinutes: appMin });
         continue;
       }
       const content = `content:${c.id}`;
@@ -1512,6 +1555,8 @@ export function validateGenerationManifestV3(
           expected.push(ch(type, type === 'video' ? [content] : [`video:${c.id}`, content]));
         } else if (type === 'activity') {
           if (activityOn) expected.push(ch(type, [content], engine));
+        } else if (type === 'application_activity') {
+          if (appMin !== undefined) expected.push({ ...ch(type, [content]), applicationMinutes: appMin });
         } else expected.push(ch(type, [content]));
       }
     }
@@ -1599,6 +1644,16 @@ export function validateGenerationManifestV3(
     } else if (it.variant !== undefined) {
       errors.push({ code: 'UNEXPECTED_VARIANT', message: `item ${it.key}: solo los items activity llevan variant`, key: it.key });
     }
+    // Fase 2: applicationMinutes SOLO en application_activity y igual al del capítulo del Blueprint.
+    const gotApp = (it as any).applicationMinutes;
+    if (it.type === 'application_activity') {
+      const wantApp = exp?.applicationMinutes;
+      if (exp && gotApp !== wantApp) {
+        errors.push({ code: 'WRONG_APPLICATION_MINUTES', message: `item ${it.key}: applicationMinutes esperado ${JSON.stringify(wantApp ?? null)}, encontrado ${JSON.stringify(gotApp ?? null)}`, key: it.key });
+      }
+    } else if (gotApp !== undefined) {
+      errors.push({ code: 'UNEXPECTED_APPLICATION_MINUTES', message: `item ${it.key}: solo los items application_activity llevan applicationMinutes`, key: it.key });
+    }
     const h5pType = (it as any).h5pType;
     const isH5pActivity = it.type === 'activity' && it.variant === 'h5p';
     if (allowedH5p && isH5pActivity && h5pType !== undefined && !allowedH5p.includes(h5pType)) {
@@ -1667,15 +1722,16 @@ export function validateGenerationManifestV3(
     audioWelcomeCount: cnt('audio_welcome'),
     finalExamCount: cnt('final_exam'),
     totalJobs: expected.length,
+    applicationActivityCount: cnt('application_activity'),
   });
   const totals: Record<string, unknown> = (m.totals as any) ?? {};
-  for (const k of MANIFEST_TOTALS_KEYS_V3) {
+  for (const k of [...MANIFEST_TOTALS_KEYS_V3, ...MANIFEST_TOTALS_OPTIONAL_KEYS_V3]) {
     if (totals[k] !== (expectedTotals as any)[k]) {
       errors.push({ code: 'TOTALS_MISMATCH', message: `totals.${k} esperado ${(expectedTotals as any)[k]}, encontrado ${totals[k]}` });
     }
   }
   for (const k of Object.keys(totals)) {
-    if (!MANIFEST_TOTALS_KEYS_V3.includes(k as keyof ManifestTotals) && totals[k] !== undefined) {
+    if (!MANIFEST_TOTALS_KEYS_V3.includes(k as keyof ManifestTotals) && !MANIFEST_TOTALS_OPTIONAL_KEYS_V3.includes(k as keyof ManifestTotals) && totals[k] !== undefined) {
       errors.push({ code: 'TOTALS_MISMATCH', message: `totals.${k} no existe en rulesVersion 3` });
     }
   }
@@ -1698,6 +1754,7 @@ function canonicalModules(mods: ManifestModule[]): unknown {
       videoEnabled: c.videoEnabled,
       activityEnabled: c.activityEnabled,
       ...(c.kind === 'practice' ? { kind: 'practice' as const } : {}),
+      ...(c.applicationMinutes !== undefined ? { applicationMinutes: c.applicationMinutes } : {}),
     })),
   }));
 }
@@ -1706,7 +1763,7 @@ function canonicalModules(mods: ManifestModule[]): unknown {
 function unexpectedItemError(
   it: ManifestItem,
   source: ManifestSource,
-  chapterInfo: Map<string, { moduleId: string; videoEnabled: boolean; activityEnabled: boolean }>,
+  chapterInfo: Map<string, { moduleId: string; videoEnabled: boolean; activityEnabled: boolean; applicationMinutes?: number }>,
   moduleInfo: Map<string, { examEnabled: boolean }>,
   finalExam: boolean,
 ): ManifestValidationError {
@@ -1737,6 +1794,9 @@ function unexpectedItemError(
   }
   if (it.type === 'activity' && !ch.activityEnabled) {
     return { code: 'ACTIVITY_NOT_ENABLED', message: `${it.key} existe pero el capítulo tiene activityEnabled=false`, key: it.key };
+  }
+  if (it.type === 'application_activity' && ch.applicationMinutes === undefined) {
+    return { code: 'APPLICATION_NOT_ENABLED', message: `${it.key} existe pero el capítulo no tiene Actividad de Aplicación`, key: it.key };
   }
   return { code: 'UNEXPECTED_ITEM', message: `${it.key} no corresponde al snapshot`, key: it.key };
 }

@@ -1,5 +1,6 @@
 {
-  "version": "usage-priors-v1.6",
+  "version": "usage-priors-v1.7",
+  "applicationActivityV17": "Fase 2 (Actividades de Aplicación): llm.application_activity = 2 llamadas (actividad del estudiante + solucionario docente). Entrada ≈ texto fuente del capítulo recortado (≤ 24.000 caracteres ≈ 7k tokens) + sistema/pedagogía ≈ 2k, ×2, más la actividad (≈ 4k) en la 2.ª ⇒ p50 16k. Salida ≈ actividad 5k + solucionario 4,5k ⇒ p50 9,5k; p90 15k (nivel de 120 min). Prior, no medida: reemplazar con el ledger.",
   "learnedFromLedger": false,
   "minSamplesToLearn": 20,
   "defaultRetryRate": 0.15,
@@ -69,6 +70,7 @@
     "llm.experience":         { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 5000, "p50": 12000, "p90": 20000 }, "output_tokens": { "p10": 3000, "p50": 6900, "p90": 12000 } } },
     "llm.video_interactions": { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 2500, "p50": 4000, "p90": 6000 }, "output_tokens": { "p10": 500, "p50": 900, "p90": 1500 } } },
     "llm.activity":           { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 3000, "p50": 5000, "p90": 8000 }, "output_tokens": { "p10": 2000, "p50": 4000, "p90": 7000 } } },
+    "llm.application_activity": { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 9000, "p50": 16000, "p90": 24000 }, "output_tokens": { "p10": 6000, "p50": 9500, "p90": 15000 } } },
     "llm.scorm":              { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "meters": { "input_tokens": { "p10": 4000, "p50": 6000, "p90": 9000 }, "output_tokens": { "p10": 6000, "p50": 10000, "p90": 14000 } } },
     "llm.exam":               { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "retryRate": 0.15, "meters": { "input_tokens": { "p10": 2000, "p50": 14600, "p90": 23400 }, "output_tokens": { "p10": 21400, "p50": 41600, "p90": 66600 }, "cache_write_tokens": { "p10": 13100, "p50": 13100, "p90": 21000 }, "cache_read_tokens": { "p10": 48600, "p50": 178500, "p90": 285600 } } },
     "llm.final_exam":         { "provider": "anthropic", "service": "messages", "product": "claude-sonnet-4-6", "retryRate": 0.15, "meters": { "input_tokens": { "p10": 14300, "p50": 45800, "p90": 73300 }, "output_tokens": { "p10": 42400, "p50": 94500, "p90": 151200 }, "cache_write_tokens": { "p10": 26900, "p50": 26900, "p90": 43000 }, "cache_read_tokens": { "p10": 90800, "p50": 361200, "p90": 577900 } } },
