@@ -33,7 +33,11 @@ export interface DistributorPolicy {
   /** Nivel máximo de la Actividad de aplicación en capítulos de contenido y en los cierres de módulo / práctica. */
   contentTierMax: number;
   closingTierMax: number;
-  /** Proporción máxima del curso en aplicación: más allá se crece con ESTRUCTURA, no con actividades más largas. */
+  /**
+   * Proporción máxima de aplicación para SUBIR niveles en capítulos de contenido: más allá se crece con
+   * ESTRUCTURA (capítulos de práctica o de profundización), no alargando actividades. No limita a los
+   * capítulos de práctica, cuya razón de ser es la aplicación: la proporción real se informa en el resultado.
+   */
   maxApplicationShare: number;
   /** Capítulos de práctica por módulo antes (o después) de profundizar. */
   practicePerModule: number;
@@ -81,7 +85,7 @@ export interface ProposedModule {
 }
 
 export interface DistributionChange {
-  type: 'add_practice_chapter' | 'add_content_chapter' | 'set_application_activity';
+  type: 'add_practice_chapter' | 'add_content_chapter' | 'set_application_activity' | 'role_changed';
   moduleId: string;
   chapterId: string;
   /** Texto para el docente. */
@@ -102,6 +106,8 @@ export interface DistributionResult {
   /** Horas que se pueden generar HOY (sin las Actividades de aplicación de la Fase 2). */
   generableHours: number;
   deltaHours: number;
+  /** Proporción del diseño en Actividades de aplicación (0–1), incluidos los capítulos de práctica. */
+  applicationShare: number;
   policy: { kind: 'application_first' | 'depth_first'; weights: { application: number; depth: number } | null } & DistributorPolicy;
   modules: ProposedModule[];
   changes: DistributionChange[];
@@ -144,6 +150,7 @@ export class DistributorError extends Error {
 }
 
 const r1 = (n: number) => Math.round(n * 10) / 10;
+const ROLE_TEXT: Readonly<Record<ChapterRole, string>> = Object.freeze({ module_opening: 'apertura', core: 'núcleo', module_closing: 'cierre', single: 'capítulo único' });
 const avg = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
 
 /** Política de crecimiento según las dimensiones del motor pedagógico (sin enfoque: aplicación primero). */
@@ -280,6 +287,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
       estimatedHours: est.courseEstimatedHours,
       generableHours: generable.courseEstimatedHours,
       deltaHours: r1(est.courseEstimatedHours - input.targetHours),
+      applicationShare: Math.round((est.byComponent.application / est.courseEstimatedMinutes) * 100) / 100,
       policy,
       modules,
       changes,
@@ -302,17 +310,24 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
     };
   };
 
+  const fmtH = (n: number) => String(r1(n)).replace('.', ',');
+  const initialRoles = new Map(design.flatMap((m) => m.chapters.map((c) => [c.id, roleOf(m, c)] as const)));
+
   // 1) No rellenar: la estructura mínima ya supera el objetivo → informar y proponer, nunca recortar sola.
   if (minutes() > target + tol) {
-    const contentChapterAvg = avg(est.modules.flatMap((m) => m.chapters).map((c) => c.chapterEstimatedMinutes));
-    const extra = minutes() - target;
-    const remove = Math.ceil(extra / contentChapterAvg);
+    const chs = est.modules.flatMap((m) => m.chapters);
+    const contentChapterAvg = avg(chs.map((c) => c.chapterEstimatedMinutes));
+    const remove = Math.ceil((minutes() - target) / contentChapterAvg);
+    const reduce = remove < chs.length
+      ? `Para acercarse habría que quitar unos ${remove} capítulo(s) de contenido (≈ ${fmtH(contentChapterAvg)} min cada uno) o un módulo completo, o apagar videos o actividades.`
+      : `Ni quitando capítulos se llega: el marco del curso (bienvenida, foro y evaluaciones) ya ocupa buena parte del tiempo. Conviene revisar si el objetivo de ${fmtH(input.targetHours)} h es el correcto.`;
     return result('minimum_exceeds_target', [
-      `La estructura mínima actual supera la carga horaria objetivo: ${r1(minutes() / 60)} h frente a ${input.targetHours} h (tolerancia ±${r1(tol / 60)} h).`,
-      `Para acercarse habría que quitar unos ${remove} capítulo(s) de contenido (≈ ${r1(contentChapterAvg)} min cada uno) o un módulo completo, o apagar videos o actividades. Cursia no recorta contenido por su cuenta: es una decisión del docente.`,
+      `La estructura mínima actual supera la carga horaria objetivo: ${fmtH(minutes() / 60)} h frente a ${fmtH(input.targetHours)} h (tolerancia ±${fmtH(tol / 60)} h).`,
+      `${reduce} Cursia no recorta contenido por su cuenta: es una decisión del docente.`,
     ]);
   }
 
+  const tiers = STUDY_TIME_RULES.applicationActivityTiers as readonly number[];
   const contentChapters = () => design.flatMap((m) => m.chapters.filter((c) => c.kind === 'content').map((c) => ({ m, c })));
   // Orden de la aplicación: primero los cierres de módulo (integran el módulo), después el núcleo, al final las aperturas.
   const rank = (role: ChapterRole) => (role === 'module_closing' || role === 'single' ? 0 : role === 'module_opening' ? 2 : 1);
@@ -320,26 +335,45 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   const capOf = (m: WorkModule, c: WorkChapter) => (c.kind === 'practice' || roleOf(m, c) === 'module_closing' ? policy.closingTierMax : policy.contentTierMax);
   const applicationShare = () => est.byComponent.application / minutes();
 
-  // 2) Aplicación: subir el nivel de la Actividad por rondas (30 → tope), sin pasar el tope por capítulo ni
-  //    (desde el segundo nivel) la proporción máxima de aplicación del enfoque.
+  /**
+   * Fija el nivel de la Actividad de un capítulo SOLO si respeta el tope de su rol y los 240 min por capítulo; al
+   * SUBIR un nivel ya asignado (alargar actividades) también la proporción máxima de aplicación del enfoque.
+   */
+  const trySetTier = (m: WorkModule, c: WorkChapter, tier: number | null): boolean => {
+    if (tier !== null && tier > capOf(m, c)) return false;
+    const prev = c.applicationMinutes;
+    c.applicationMinutes = tier;
+    reEval();
+    const raises = prev !== null && (tier ?? 0) > prev;
+    if (chapterMinutes(c.id) > DISTRIBUTOR_RULES.maxChapterMinutes || (raises && applicationShare() > policy.maxApplicationShare + 1e-9)) {
+      c.applicationMinutes = prev;
+      reEval();
+      return false;
+    }
+    return true;
+  };
+  /** Tras insertar un capítulo los roles se recalculan por posición: ningún nivel queda por encima del tope de su rol nuevo. */
+  const clampToRoleCaps = () => {
+    for (const m of design) for (const c of m.chapters) {
+      if (c.applicationMinutes === null || c.applicationMinutes <= capOf(m, c)) continue;
+      c.applicationMinutes = [...tiers].reverse().find((t) => t <= capOf(m, c)) ?? null;
+    }
+    reEval();
+  };
+
+  // 2) Aplicación: subir el nivel de la Actividad por rondas (30 → tope) en los capítulos de contenido.
   const growApplication = (): boolean => {
-    for (const tier of STUDY_TIME_RULES.applicationActivityTiers) {
+    for (const tier of tiers) {
       for (const { m, c } of applicationOrder()) {
         if (reached()) return true;
-        if (tier > capOf(m, c)) continue;
         if (c.applicationMinutes !== null && c.applicationMinutes >= tier) continue;
-        const prev = c.applicationMinutes;
-        c.applicationMinutes = tier;
-        reEval();
-        if (chapterMinutes(c.id) > DISTRIBUTOR_RULES.maxChapterMinutes || (prev !== null && applicationShare() > policy.maxApplicationShare)) {
-          c.applicationMinutes = prev;
-          reEval();
-        }
+        trySetTier(m, c, tier);
       }
     }
     return reached();
   };
   // 3) Práctica: capítulos de práctica (sin video, Gamma ni audiolibro). El primero cierra el módulo; el segundo va al medio.
+  //    Su Actividad toma el nivel de cierre del enfoque (es estructura de aplicación, no una actividad alargada).
   const addPractice = (): boolean => {
     for (let round = 1; round <= policy.practicePerModule; round++) {
       for (const m of design) {
@@ -353,12 +387,16 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
           objective: `Aplicar lo aprendido en «${m.title}» en una situación completa`,
           videoEnabled: false,
           activityEnabled: true,
-          applicationMinutes: policy.closingTierMax,
+          applicationMinutes: null,
         };
         if (round === 1) m.chapters.push(pc);
         else m.chapters.splice(Math.ceil(m.chapters.length / 2), 0, pc);
-        reEval();
-        changes.push({ type: 'add_practice_chapter', moduleId: m.id, chapterId: pc.id, detail: `Capítulo de práctica «${pc.title}»: sin video, presentación ni audiolibro; actividad H5P${review ? ', repaso' : ''} y Actividad de aplicación de ${pc.applicationMinutes} min (Fase 2).` });
+        clampToRoleCaps();
+        for (const t of [...tiers].reverse()) if (trySetTier(m, pc, t)) break;
+        changes.push({
+          type: 'add_practice_chapter', moduleId: m.id, chapterId: pc.id,
+          detail: `Capítulo de práctica «${pc.title}»: sin video, presentación ni audiolibro; actividad H5P${review ? ', repaso' : ''}${pc.applicationMinutes ? ` y Actividad de aplicación de ${pc.applicationMinutes} min (se genera más adelante)` : ''}.`,
+        });
       }
     }
     return reached();
@@ -380,14 +418,18 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
           objective: `Analizar casos complejos de «${m.title}»`,
           videoEnabled: usesVideo,
           activityEnabled: true,
-          applicationMinutes: STUDY_TIME_RULES.applicationActivityTiers[0],
+          applicationMinutes: null,
         };
         // Después del último capítulo de contenido (las prácticas siguen cerrando el módulo).
         let last = -1;
         m.chapters.forEach((c, i) => { if (c.kind === 'content') last = i; });
         m.chapters.splice(last + 1, 0, cc);
-        reEval();
-        changes.push({ type: 'add_content_chapter', moduleId: m.id, chapterId: cc.id, detail: `Capítulo de profundización «${cc.title}»${usesVideo ? ' con video' : ''}, actividad${review ? ', repaso' : ''} y Actividad de aplicación de ${cc.applicationMinutes} min (Fase 2).` });
+        clampToRoleCaps();
+        trySetTier(m, cc, tiers[0]);
+        changes.push({
+          type: 'add_content_chapter', moduleId: m.id, chapterId: cc.id,
+          detail: `Capítulo de profundización «${cc.title}»${usesVideo ? ' con video' : ''}, actividad${review ? ', repaso' : ''}${cc.applicationMinutes ? ` y Actividad de aplicación de ${cc.applicationMinutes} min (se genera más adelante)` : ''}.`,
+        });
         growApplication();
       }
     }
@@ -399,39 +441,54 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
     if (steps[s]()) break;
     growApplication();
   }
-  // Ajuste fino: bajar niveles (de a 30 min) si se pasó, empezando por las aperturas.
-  for (const { m, c } of [...applicationOrder()].reverse()) {
-    while (c.applicationMinutes !== null && minutes() > target + tol / 2 && c.applicationMinutes > STUDY_TIME_RULES.applicationActivityTiers[0]) {
-      c.applicationMinutes -= 30;
+  // Ajuste fino: si se pasó, bajar niveles de a uno (empezando por las aperturas) SOLO mientras el total siga
+  // dentro de la tolerancia por abajo (nunca descarta un diseño válido).
+  for (const { c } of [...applicationOrder()].reverse()) {
+    while (c.applicationMinutes !== null && minutes() > target + tol / 2) {
+      const i = tiers.indexOf(c.applicationMinutes);
+      const lower = i > 0 ? tiers[i - 1] : null;
+      if (lower === null) break;
+      const prev = c.applicationMinutes;
+      c.applicationMinutes = lower;
       reEval();
+      if (minutes() < target - tol) {
+        c.applicationMinutes = prev;
+        reEval();
+        break;
+      }
     }
-    void m;
   }
   for (const m of design) for (const c of m.chapters) {
     if (c.applicationMinutes && !c.proposed) {
-      changes.push({ type: 'set_application_activity', moduleId: m.id, chapterId: c.id, detail: `Actividad de aplicación de ${c.applicationMinutes} min en «${c.title}» (Fase 2).` });
+      changes.push({ type: 'set_application_activity', moduleId: m.id, chapterId: c.id, detail: `Actividad de aplicación de ${c.applicationMinutes} min en «${c.title}» (se genera más adelante).` });
+    }
+    const before = initialRoles.get(c.id);
+    if (!c.proposed && before && before !== roleOf(m, c)) {
+      changes.push({ type: 'role_changed', moduleId: m.id, chapterId: c.id, detail: `«${c.title}» deja de ser ${ROLE_TEXT[before]} y pasa a ${ROLE_TEXT[roleOf(m, c)]} del módulo: lo nuevo cambia su lugar en el módulo.` });
     }
   }
 
   const addedPractice = changes.filter((c) => c.type === 'add_practice_chapter').length;
   const addedContent = changes.filter((c) => c.type === 'add_content_chapter').length;
-  priorityTrace.push(`La carga horaria objetivo (${input.targetHours} h) es una restricción del curso: manda sobre la estructura sugerida por el enfoque, pero los capítulos nuevos son propuestas que el docente aprueba (el lock nunca las aplica).`);
+  priorityTrace.push(`La carga horaria objetivo (${fmtH(input.targetHours)} h) es una restricción del curso: manda sobre la estructura sugerida por el enfoque, pero los capítulos nuevos son propuestas que el docente aprueba (confirmar la estructura nunca las aplica sola).`);
   priorityTrace.push(policy.kind === 'application_first'
     ? 'El enfoque prioriza aplicación y desempeño: primero Actividades de aplicación, después capítulos de práctica y solo al final profundización.'
     : 'El enfoque prioriza profundidad y conexiones: primero Actividades de aplicación cortas, después capítulos de profundización y al final práctica.');
-  if (addedPractice || addedContent) priorityTrace.push(`Se proponen ${addedPractice} capítulo(s) de práctica y ${addedContent} de profundización: la estructura actual no alcanza ${input.targetHours} h sin ellos.`);
+  if (addedPractice || addedContent) priorityTrace.push(`Se proponen ${addedPractice} capítulo(s) de práctica y ${addedContent} de profundización: la estructura actual no alcanza ${fmtH(input.targetHours)} h sin ellos.`);
 
   const gap = target - minutes();
   if (Math.abs(gap) <= tol) return result('within_tolerance', []);
   if (gap < 0) {
-    return result('above_tolerance', [`El diseño quedó ${r1(-gap / 60)} h por encima del objetivo: el último capítulo agregado no se puede partir. El docente puede quitarlo o bajar actividades.`]);
+    return result('above_tolerance', [addedPractice || addedContent
+      ? `El diseño quedó ${fmtH(-gap / 60)} h por encima del objetivo: el último capítulo agregado no se puede partir. El docente puede quitarlo o bajar actividades.`
+      : `El diseño quedó ${fmtH(-gap / 60)} h por encima del objetivo por el tamaño mínimo de las Actividades de aplicación (30 min). El docente puede quitar alguna.`]);
   }
   // 5) No alcanza con los topes razonables: proponer estructura, nunca inflar.
   const perModule = minutes() / design.length;
   const modulesNeeded = Math.ceil(gap / perModule);
   const chapterAvg = avg(est.modules.flatMap((m) => m.chapters).map((c) => c.chapterEstimatedMinutes));
   return result('cannot_reach_target', [
-    `No alcanza ${input.targetHours} h sin rellenar: el diseño llega a ${r1(minutes() / 60)} h y faltan ${r1(gap / 60)} h.`,
-    `Recomendación: agregar ${modulesNeeded} módulo(s) nuevo(s) (≈ ${r1(perModule / 60)} h cada uno con la misma estructura) o unos ${Math.ceil(gap / chapterAvg)} capítulos más en módulos nuevos. Los temas los decide el docente.`,
+    `No alcanza ${fmtH(input.targetHours)} h sin rellenar: el diseño llega a ${fmtH(minutes() / 60)} h y faltan ${fmtH(gap / 60)} h.`,
+    `Recomendación: agregar ${modulesNeeded} módulo(s) nuevo(s) (≈ ${fmtH(perModule / 60)} h cada uno con la misma estructura) o unos ${Math.ceil(gap / chapterAvg)} capítulos más en módulos nuevos. Los temas los decide el docente.`,
   ]);
 }

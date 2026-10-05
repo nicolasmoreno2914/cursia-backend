@@ -154,7 +154,16 @@ check('D6 tolerancia configurable', () => {
   eq(dist(20).toleranceHours, 1, 'mínimo 1 h');
   const tight = dist(33, 'competencias', { opts: { tolerance: { pct: 0, minHours: 0.1 } } });
   eq(tight.toleranceHours, 0.1, 'tolerancia ajustada');
-  assert(tight.status !== 'within_tolerance' || Math.abs(tight.estimatedHours - 33) <= 0.1, `con ±0,1 h: ${tight.status} ${tight.estimatedHours}`);
+  // Con minutos exactos (las horas redondeadas a 1 decimal no sirven para ±0,1 h).
+  assert(tight.status !== 'within_tolerance' || Math.abs(tight.studyTime.courseEstimatedMinutes - 33 * 60) <= 6 + 1e-9, `con ±0,1 h: ${tight.status} ${tight.studyTime.courseEstimatedMinutes} min`);
+  // Revisión L3 (I3): el ajuste fino nunca descarta un diseño válido (20 h ±0,1 h tiene uno a 1203 min).
+  const t20 = dist(20, 'competencias', { opts: { tolerance: { pct: 0, minHours: 0.1 } } });
+  eq(t20.status, 'within_tolerance', `20 h ±0,1 h (${t20.estimatedHours} h)`);
+  for (const h of [12.5, 17, 21.5, 26, 29.5, 37, 44.5]) {
+    const r = dist(h, 'competencias', { opts: { tolerance: { pct: 0, minHours: 0.25 } } });
+    assert(r.status !== 'cannot_reach_target' || r.estimatedHours < h - 0.25, `${h} h: no reporta «no alcanza» con un diseño dentro de la tolerancia (${r.estimatedHours})`);
+    if (r.status === 'cannot_reach_target') assert(dist(h, 'competencias').status !== 'within_tolerance' || r.estimatedHours < h - 0.25, `${h} h`);
+  }
   const wide = dist(33, 'competencias', { opts: { tolerance: { pct: 0.3 } } });
   eq(wide.status, 'within_tolerance', 'tolerancia amplia');
   assert(wide.counts.chapters <= dist(33).counts.chapters, 'con más tolerancia no crece más');
@@ -202,6 +211,40 @@ check('D10 límites: ≤ 240 min por capítulo, ≤ 5 de contenido por módulo, 
     }
     for (const c of chapters(r).filter((x) => x.kind === 'practice')) eq([c.videoEnabled, c.activityEnabled], [false, true], 'práctica sin video, con actividad');
   }
+});
+
+check('D10b otras formas de curso: cada nivel respeta el tope de su rol FINAL (los roles cambian al agregar capítulos y se informan)', () => {
+  const shapes = [[2, 3], [1], [4, 1, 2], [5, 5], [1, 1, 1, 1], [3, 3, 3]];
+  let roleChanges = 0;
+  for (const shape of shapes) {
+    const st = { course: { title: 'Forma', reviewCards: true, finalExam: true }, modules: shape.map((n, mi) => ({ title: `M${mi + 1}`, chapters: Array.from({ length: n }, (_, ci) => ({ title: `C${mi + 1}.${ci + 1}`, objective: 'Aplicar el procedimiento' })) })) };
+    for (const k of ['competencias', 'significativo', null]) for (const h of [10, 20, 33, 50, 120]) {
+      const r = ST.distributeCourseHours({ snapshot: P.snapshotFromStructure(clone(st)), rules: rulesOf(k), targetHours: h });
+      for (const c of chapters(r)) {
+        const cap = c.kind === 'practice' || c.role === 'module_closing' ? r.policy.closingTierMax : r.policy.contentTierMax;
+        assert(c.applicationMinutes === null || c.applicationMinutes <= cap, `${shape}/${k}/${h}: ${c.id} (${c.role}) ${c.applicationMinutes} > ${cap}`);
+        assert(c.targetMinutes <= ST.DISTRIBUTOR_RULES.maxChapterMinutes, `${shape}/${k}/${h}: ${c.id} ${c.targetMinutes} min`);
+      }
+      near(r.applicationShare, r.studyTime.byComponent.application / r.studyTime.courseEstimatedMinutes, 0.006, 'proporción informada');
+      const rc = r.changes.filter((x) => x.type === 'role_changed');
+      roleChanges += rc.length;
+      for (const x of rc) assert(/deja de ser .+ y pasa a .+ del módulo/.test(x.detail), x.detail);
+      for (const t of [...r.recommendations, ...r.priorityTrace, ...r.changes.map((x) => x.detail)]) {
+        assert(!/Fase 2|lock|\d\.\d+ h/.test(t), `texto para el docente sin jerga ni decimales con punto: «${t}»`);
+      }
+    }
+  }
+  assert(roleChanges > 0, 'al cerrar un módulo con práctica, el cierre anterior cambia de rol y se informa');
+});
+
+check('D10c objetivos muy bajos: nunca propone quitar más capítulos de los que hay', () => {
+  for (const h of [1, 2, 3.5]) {
+    const r = dist(h);
+    eq(r.status, 'minimum_exceeds_target', `${h} h`);
+    const m = /quitar unos (\d+) capítulo/.exec(r.recommendations[1]);
+    assert(!m || Number(m[1]) < r.counts.chapters, `${h} h: ${r.recommendations[1]}`);
+  }
+  assert(/Ni quitando capítulos se llega/.test(dist(1).recommendations[1]), dist(1).recommendations[1]);
 });
 
 check('D11 reordenar capítulos y cambiar targetHours: se recalcula sin estado oculto', () => {

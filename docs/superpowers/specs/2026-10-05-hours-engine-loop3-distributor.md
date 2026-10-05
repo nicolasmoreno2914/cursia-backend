@@ -26,7 +26,7 @@ Los minutos los pone **siempre** el modelo de tiempo (Loop 1).
 |---|---|---|
 | Peso decisivo | promedio(práctica, evidencia, autenticidad) ≥ promedio(profundidad conceptual, conocimientos previos) | lo contrario |
 | Tope de la Actividad de aplicación: contenido / cierre o práctica | 90 / 120 min | 60 / 90 min |
-| Proporción máxima de aplicación | 50 % | 40 % |
+| Proporción máxima de aplicación para **subir niveles** en capítulos de contenido | 50 % | 40 % |
 | Capítulos de práctica por módulo | 2 | 1 |
 | Orden de crecimiento | aplicación → práctica → profundización | aplicación → profundización → práctica |
 
@@ -35,7 +35,15 @@ Los minutos los pone **siempre** el modelo de tiempo (Loop 1).
 - 240 min por capítulo;
 - 5 capítulos de contenido por módulo;
 - tolerancia de ±5 % o ±1 h, lo que sea mayor, configurable (`tolerance.pct`, `tolerance.minHours`);
-- ajuste fino bajando niveles de 30 minutos.
+- ajuste fino bajando niveles de uno en uno, solo mientras el total siga dentro de la tolerancia por abajo, así nunca descarta un diseño válido.
+
+**Detalles:**
+
+- **Alcance del tope de aplicación.** Frena el crecimiento por actividades más largas, para que el curso no termine en «todo guías». No limita a los capítulos de práctica, cuya razón de ser es la aplicación: entran con el nivel de cierre. La proporción real se informa en `applicationShare`, y el panel la muestra («55 % del diseño son Actividades de aplicación»).
+- **Roles.** Se recalculan por posición, con el mismo `chapterRole` del motor pedagógico. Cuando un capítulo de práctica pasa a cerrar el módulo:
+  - el cierre anterior pasa a núcleo;
+  - su nivel se ajusta al tope de su nuevo rol;
+  - el cambio se informa (`role_changed`).
 
 ## Reglas que respeta
 

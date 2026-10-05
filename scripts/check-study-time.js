@@ -306,6 +306,19 @@ check('ST10 dry-run pedagógico: horas planificadas en línea base y vista pedag
   eq(ped.diff.estimatedHours.pedagogical, ped.pedagogical.studyTime.courseEstimatedHours, 'diff con perfil');
 });
 
+check('ST12 capítulo de práctica: página de práctica (900 palabras), sin Libro, presentación ni video; exámenes solo de capítulos de contenido', () => {
+  const pc = ST.estimateChapterStudyTime({ chapterId: 'p', kind: 'practice', libro: false, presentation: false, video: false, activity: true, review: true });
+  eq(pc.resources.map((r) => [r.resource, r.minutes]), [['practice_page', 6], ['activity', 9.6], ['review', 4.5]], 'recursos');
+  eq(pc.chapterEstimatedMinutes, 20.1, 'a mano: 900/150 + 8 × 1,2 + 9 × 0,5');
+  eq(pc.resources[0].component, 'practice', 'la página de práctica es práctica, no contenido');
+  const course = (mods) => ST.estimateCourseStudyTime({ frame: false, welcomeAudio: false, forum: false, finalExam: true, modules: mods });
+  const e = course([{ moduleId: 'm', intro: false, exam: true, chapters: [fullChapter('a'), fullChapter('b'), { chapterId: 'p', kind: 'practice', libro: false, presentation: false, video: false, activity: true, review: true }] }]);
+  eq(e.modules[0].resources.find((r) => r.resource === 'module_exam').basis, '17 preguntas × 1,2 min', 'slots de 2 capítulos de contenido (no 3)');
+  eq(e.resources.find((r) => r.resource === 'final_exam').basis, '17 preguntas × 1,2 min', 'final: 2 de contenido');
+  throwsRe(() => course([{ moduleId: 'm', intro: false, exam: true, chapters: [{ chapterId: 'p', kind: 'practice', libro: false, presentation: false, video: false, activity: true, review: false }] }]), /ningún capítulo de contenido/, 'examen sin capítulos de contenido');
+  throwsRe(() => ST.estimateChapterStudyTime({ chapterId: 'x', kind: 'taller', libro: false, presentation: false, video: false, activity: false, review: false }), /kind/, 'kind inválido');
+});
+
 check('ST11 la discrepancia anterior (~30–35 min) queda corregida', () => {
   // Badge anterior (facts P3: 180 palabras/min, video fijo 6 min, actividad 8, sin Libro, preguntas del video
   // ni repaso) para el mismo capítulo: 2200/180 + 10 × 0,5 + 6 + 8 = 31,2 → «~30 min».
