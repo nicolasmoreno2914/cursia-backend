@@ -66,6 +66,12 @@ const CONFIGS = [
       { examEnabled: true, chapters: [{ video: true, activity: true }, { video: false, activity: true }, { practice: true, activity: true }] },
       { examEnabled: false, chapters: [{ video: true, activity: true }, { practice: true, activity: true }, { video: false, activity: false }] },
     ] },
+  // Fase 2: Actividades de Aplicación (contenido, práctica y capítulo sin actividad H5P); solucionario oculto.
+  { id: 'application-activities', engine: 'h5p', finalExam: true, theme: { themeFamily: 'aula-clara', mode: 'light' }, courseId: 641,
+    modules: [
+      { examEnabled: true, chapters: [{ video: true, activity: true, application: 60 }, { video: false, activity: true, application: 30 }, { practice: true, activity: true, application: 120 }] },
+      { examEnabled: false, chapters: [{ video: true, activity: true }, { video: false, activity: false, application: 90 }] },
+    ] },
 ];
 const QUIZ_GM = { highest: 1, average: 2, first: 3, last: 4 };
 const H5P_GM = { highest: 1, average: 2, last: 3, first: 4 };
@@ -119,6 +125,22 @@ async function runConfig(cfg) {
     eq(o.restoreDbLogWarnings, [], 'backup_logs');
     eq(rs.stderr.split('\n').filter((l) => /warning|notice|debug|error|exception/i.test(l)), [], 'CLI');
   });
+  if (input.contents.applications) {
+    check(`${tag} Fase 2: el estudiante ve la Actividad de Aplicación y NO el solucionario; el docente ve ambos; cada página con su PDF`, () => {
+      const vPath = path.join(OUT_DIR, `r12-${cfg.id}.app.json`);
+      execFileSync(PHP, ['-c', PHPINI, path.join(__dirname, 'moodle/v21-application-visibility.php'), inPath, vPath], { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024 });
+      const v = JSON.parse(fs.readFileSync(vPath, 'utf8'));
+      const n = input.contents.applications.size;
+      eq(v.pages.length, 2 * n, 'páginas de actividad + solucionario');
+      for (const p of v.pages) {
+        const sol = /:application_solution$/.test(p.idnumber);
+        eq([p.visible, p.studentVisible, p.studentCanView, p.teacherVisible], sol ? [0, false, false, true] : [1, true, true, true], `${p.idnumber} visibilidad`);
+        eq(p.files.length, 1, `${p.idnumber}: un PDF`);
+        eq(p.contentLinksFiles, p.files, `${p.idnumber}: el contenido enlaza su PDF`);
+        eq([p.completion, p.completionview], sol ? [0, 0] : [2, 1], `${p.idnumber}: completion`);
+      }
+    });
+  }
   check(`${tag} estructura por UUID: secciones × idnumber cv3:… = Manifest + chapterSlotSequence`, () => {
     eq(o.sections.map((s) => [s.section, s.cms.map((c) => c.idnumber)]), PF.expectedSequence(dist, input), 'secuencia');
     // EV6: una sección por capítulo («Módulo m · Capítulo n: título»), una por evaluación de módulo,
@@ -147,6 +169,8 @@ async function runConfig(cfg) {
     for (const c of cms.filter((x) => !kindOf(x.idnumber))) {
       // F1 (I3): en un curso sin nota el Libro Guía se completa por vista.
       if (resolved.withoutGrades && c.idnumber === 'cv3:shell:libro') eq([c.completion, c.completionview], [2, 1], 'Libro por vista');
+      // Fase 2: la página de la Actividad de Aplicación se completa por vista (2); el resto sin completion.
+      else if (/:application$/.test(c.idnumber)) eq(c.completion, 2, `Actividad de Aplicación por vista ${c.idnumber}`);
       else eq(c.completion, 0, `sin completion ${c.idnumber}`);
     }
   });
@@ -203,7 +227,9 @@ async function runConfig(cfg) {
     awards.push({ id: cfg.id, courseid, ...aw });
     eq([aw.statusAfterRestore, aw.statusAfterEnable], [0, 1], 'habilitar acceso (acción única del gestor)');
     // Fix 0b: el label para docentes existe oculto: el docente con edición lo ve, el estudiante no.
-    eq(aw.hiddenModules, ['cv3:shell:certificate_teacher'], 'único módulo oculto');
+    // Fase 2: además, el solucionario docente de cada Actividad de Aplicación (oculto a propósito).
+    eq(aw.hiddenModules.filter((x) => !/:application_solution$/.test(x)), ['cv3:shell:certificate_teacher'], 'único módulo oculto (fuera de los solucionarios)');
+    eq(aw.hiddenModules.filter((x) => /:application_solution$/.test(x)).length, input.contents.applications ? input.contents.applications.size : 0, 'un solucionario oculto por actividad');
     eq(aw.visibility.student['cv3:shell:certificate_teacher'], { visible: 0, uservisible: false, onCoursePage: false }, 'estudiante NO ve el label docente');
     eq(aw.visibility.editingteacher['cv3:shell:certificate_teacher'], { visible: 0, uservisible: true, onCoursePage: true }, 'docente lo ve (atenuado)');
     eq(aw.visibility.student['cv3:shell:closing'].uservisible, true, 'el estudiante sí ve el cierre');

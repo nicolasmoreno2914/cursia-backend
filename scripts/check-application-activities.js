@@ -18,6 +18,13 @@
 //   AA9  distribuidor: las actividades se generan (horas generables = horas del diseño) y la propuesta
 //        materializada trae sus items y sus horas
 //   AA10 guarda de esquema: sin la columna application_minutes, escribir los minutos responde 503
+//   AA11 empaque (h5p y scorm, con práctica): página del estudiante visible (sin respuestas, con PDF imprimible),
+//        solucionario docente OCULTO (con su PDF), badge con los minutos de la actividad; .mbz válido
+//   AA12 el validador del .mbz detecta: solucionario visible, respuestas en la página del estudiante, actividad
+//        faltante, PDF faltante
+//   AA13 la secuencia de la sección = Manifest + chapterSlotSequence (instrucción → actividad → solucionario)
+//   AA14 PDF imprimible: páginas reales = páginas con contenido (sin hojas en blanco), bytes deterministas, renglones
+//        para responder; el del estudiante sin respuestas
 //
 // Uso: node scripts/check-application-activities.js [path/to/dist]   (después de npm run build)
 'use strict';
@@ -288,6 +295,137 @@ function rcpWithApplications() {
     eq(calls, 0, 'el positivo queda cacheado');
     GUARD._resetApplicationSchemaGuardForTests();
     void SHELL;
+  });
+
+  const B = loadDist('package/dynamic-mbz-builder-v3.js');
+  const VAL = loadDist('package/v3/mbz-validator-v3.js');
+  const PF = require('./lib/v21-packaging-fixtures');
+  const JSZip = require('jszip');
+  const APP_MODULES = [
+    { examEnabled: true, chapters: [{ video: true, activity: true, application: 60 }, { video: false, activity: true, application: 30 }, { practice: true, activity: true, application: 120 }] },
+    { examEnabled: false, chapters: [{ video: true, activity: true }, { video: false, activity: false, application: 90 }] },
+  ];
+  const built = {};
+  async function pkg(engine) {
+    if (built[engine]) return built[engine];
+    const input = PF.packagingInput(distRoot, { engine, finalExam: true, courseId: 640, modules: APP_MODULES });
+    const r = await B.buildDynamicMbzV3(input);
+    const zip = await JSZip.loadAsync(r.mbz);
+    built[engine] = { input, r, zip };
+    return built[engine];
+  }
+  const actsOf = async (zip) => {
+    const mb = await zip.file('moodle_backup.xml').async('string');
+    return [...mb.matchAll(/<activity>\s*<moduleid>(\d+)<\/moduleid>\s*<sectionid>(\d+)<\/sectionid>\s*<modulename>([a-z0-9_]+)<\/modulename>\s*<title>([^<]*)<\/title>\s*<directory>([^<]+)<\/directory>/g)].map((m) => ({ mid: Number(m[1]), sec: Number(m[2]), mod: m[3], title: m[4], dir: m[5] }));
+  };
+  const idnOf = async (zip, dir) => ((await zip.file(`${dir}/module.xml`).async('string')).match(/<idnumber>([^<]*)<\/idnumber>/) || [])[1];
+
+  await check('AA11 empaque h5p y scorm: página visible sin respuestas + PDF, solucionario OCULTO + PDF, badge con minutos; .mbz válido', async () => {
+    for (const engine of ['h5p', 'scorm']) {
+      const { input, r, zip } = await pkg(engine);
+      const v = await VAL.validateMbzV3(r.mbz, r.expectations);
+      assert(v.ok, `${engine}: validador ${JSON.stringify(v.issues.slice(0, 5))}`);
+      const appChapters = input.manifest.modules.flatMap((m) => m.chapters).filter((c) => c.applicationMinutes !== undefined);
+      eq(appChapters.length, 4, 'capítulos con actividad');
+      const acts = await actsOf(zip);
+      const files = await zip.file('files.xml').async('string');
+      for (const c of appChapters) {
+        const st = [];
+        const so = [];
+        for (const a of acts.filter((x) => x.mod === 'page')) {
+          const idn = await idnOf(zip, a.dir);
+          if (idn === `cv3:ch:${c.chapterId}:application`) st.push(a);
+          if (idn === `cv3:ch:${c.chapterId}:application_solution`) so.push(a);
+        }
+        eq([st.length, so.length], [1, 1], `capítulo ${c.chapterNumber}: página + solucionario`);
+        const vis = async (a) => ((await zip.file(`${a.dir}/module.xml`).async('string')).match(/<visible>(\d)<\/visible>/) || [])[1];
+        eq([await vis(st[0]), await vis(so[0])], ['1', '0'], `capítulo ${c.chapterNumber}: estudiante visible, solucionario oculto`);
+        const stHtml = await zip.file(`${st[0].dir}/page.xml`).async('string');
+        const soHtml = await zip.file(`${so[0].dir}/page.xml`).async('string');
+        const doc = input.contents.applications.get(c.chapterId);
+        assert(stHtml.includes('Ejercicio 1') && stHtml.includes('Taller de aplicación') && stHtml.includes('Autoevaluación') && stHtml.includes('Criterios de evaluación'), 'estructura de la actividad');
+        assert(!stHtml.includes(doc.solution.answers[0].answer.replace(/\./g, '')) && !/Solucionario|Respuesta:/.test(stHtml), 'sin respuestas en la página del estudiante');
+        assert(soHtml.includes(doc.solution.answers[0].answer.slice(0, 20)) && soHtml.includes('Logrado') && soHtml.includes('Observaciones para el docente'), 'solucionario completo');
+        assert(stHtml.includes(`capitulo-${c.chapterNumber}-actividad-de-aplicacion.pdf`) && soHtml.includes(`capitulo-${c.chapterNumber}-solucionario-docente.pdf`), 'enlaces a los PDF');
+        assert(files.includes(`<filename>capitulo-${c.chapterNumber}-actividad-de-aplicacion.pdf</filename>`) && files.includes(`<filename>capitulo-${c.chapterNumber}-solucionario-docente.pdf</filename>`), 'PDF en files.xml');
+      }
+      // Minutos: facts del capítulo = base + actividad; la práctica nunca gana video/presentación/audiolibro.
+      const facts = r.expectations.facts;
+      for (const c of appChapters) {
+        const fc = facts.chapters.find((x) => x.id === c.chapterId);
+        eq(fc.applicationMinutes, c.applicationMinutes, 'facts con minutos');
+        assert(fc.estimatedMinutes >= c.applicationMinutes + 10, `capítulo ${c.chapterNumber}: ${fc.estimatedMinutes} min incluye ${c.applicationMinutes}`);
+      }
+      const pr = facts.chapters.find((x) => x.kind === 'practice');
+      eq([pr.videoEnabled, pr.slideCount], [false, 0], 'práctica sin video ni presentación');
+      eq(facts.counts.applicationActivities, 4, 'facts.counts');
+      assert(!acts.some((a) => a.mod === 'resource' && /actividad/i.test(a.title)), 'sin recursos sueltos');
+    }
+  });
+
+  await check('AA12 el validador del .mbz detecta solucionario visible, respuestas filtradas, actividad faltante y PDF faltante', async () => {
+    const { r, zip } = await pkg('h5p');
+    const acts = await actsOf(zip);
+    let solDir = null;
+    let stDir = null;
+    for (const a of acts.filter((x) => x.mod === 'page')) {
+      const idn = await idnOf(zip, a.dir);
+      if (/:application_solution$/.test(idn) && !solDir) solDir = a.dir;
+      else if (/:application$/.test(idn) && !stDir) stDir = a.dir;
+    }
+    const tamper = async (fn) => {
+      const z = await JSZip.loadAsync(r.mbz);
+      await fn(z);
+      const buf = await z.generateAsync({ type: 'nodebuffer' });
+      return (await VAL.validateMbzV3(buf, r.expectations)).issues.map((i) => i.code);
+    };
+    const visible = await tamper(async (z) => { z.file(`${solDir}/module.xml`, (await z.file(`${solDir}/module.xml`).async('string')).replace('<visible>0</visible>', '<visible>1</visible>')); });
+    assert(visible.includes('APPLICATION'), `solucionario visible: ${visible}`);
+    const leak = await tamper(async (z) => { z.file(`${stDir}/page.xml`, (await z.file(`${stDir}/page.xml`).async('string')).replace('Ejercicio 1', 'Respuesta: 42 · Ejercicio 1')); });
+    assert(leak.includes('APPLICATION'), `respuestas filtradas: ${leak}`);
+    const pdf = await tamper(async (z) => { z.file(`${stDir}/page.xml`, (await z.file(`${stDir}/page.xml`).async('string')).replace(/@@PLUGINFILE@@\/capitulo-\d+-actividad-de-aplicacion\.pdf/, '#')); });
+    assert(pdf.includes('APPLICATION'), `sin enlace al PDF: ${pdf}`);
+    // Actividad faltante: facts con una actividad más que el paquete.
+    const exp2 = JSON.parse(JSON.stringify(r.expectations));
+    const noApp = exp2.facts.chapters.find((c) => c.applicationMinutes === undefined);
+    noApp.applicationMinutes = 60;
+    const miss = (await VAL.validateMbzV3(r.mbz, exp2)).issues.map((i) => i.code);
+    assert(miss.includes('APPLICATION'), `actividad faltante: ${miss}`);
+  });
+
+  await check('AA13 secuencia de cada sección = Manifest + chapterSlotSequence (instrucción → actividad → solucionario)', async () => {
+    const { input, zip } = await pkg('h5p');
+    const want = PF.expectedSequence(distRoot, input);
+    const acts = await actsOf(zip);
+    const got = new Map();
+    for (const a of acts) {
+      const idn = await idnOf(zip, a.dir);
+      if (!got.has(a.sec)) got.set(a.sec, []);
+      got.get(a.sec).push(idn);
+    }
+    for (const [sec, ids] of want) eq(got.get(sec), ids, `sección ${sec}`);
+    const appSec = want.find(([, ids]) => ids.some((x) => /:application$/.test(x)))[1];
+    const i = appSec.findIndex((x) => /:application_instruction$/.test(x));
+    eq([appSec[i + 1].split(':').pop(), appSec[i + 2].split(':').pop(), appSec[i + 3].split(':').pop()], ['application', 'application_solution', 'closing'], 'orden');
+    eq(SHELL.chapterSlotSequence({ videoEnabled: false, activityEnabled: true, practice: true, application: true }), ['label:opening', 'label:deepening', 'label:synthesis', 'label:activity_instruction', 'activity', 'label:application_instruction', 'application', 'application_solution', 'label:closing'], 'práctica con actividad');
+  });
+
+  await check('AA14 PDF: sin hojas en blanco (pie dentro del margen), bytes deterministas, estudiante sin respuestas', async () => {
+    const APDF = loadDist('package/v3/application-pdf.js');
+    const TE = loadDist('modules/theme-engine/index.js');
+    const theme = TE.resolveTheme({ themeFamily: 'aula-clara', mode: 'light' });
+    for (const min of [30, 60, 90, 120]) {
+      const doc = PF.applicationDoc('c-aa14', min, 2);
+      const inp = { courseTitle: 'Curso', chapterNumber: 2, chapterTitle: 'Capítulo dos', doc, theme };
+      for (const mode of ['student', 'teacher']) {
+        const a = await APDF.renderApplicationPdf(inp, mode);
+        const b = await APDF.renderApplicationPdf(inp, mode);
+        assert(Buffer.compare(a.pdf, b.pdf) === 0, `${min}/${mode}: bytes deterministas`);
+        const pages = (a.pdf.toString('latin1').match(/\/Type \/Page\b/g) || []).length;
+        eq(pages, a.pages, `${min}/${mode}: páginas reales = informadas`);
+        assert(a.pages >= 1 && a.pages <= 8, `${min}/${mode}: ${a.pages} páginas`);
+      }
+    }
   });
 
   console.log(`\n${passes} OK, ${failures} fallidas`);

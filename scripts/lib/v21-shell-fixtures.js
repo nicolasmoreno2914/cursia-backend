@@ -53,6 +53,8 @@ function buildCourse(distRoot, { courseId = 501, title = 'Atención al cliente d
         activity_enabled: !!c.activity,
         // Motor de carga horaria: `practice: true` → capítulo de práctica (los fixtures de siempre no llevan la clave).
         ...(c.practice ? { chapter_kind: 'practice' } : {}),
+        // Fase 2: `application: 30|60|90|120` → Actividad de Aplicación (los fixtures de siempre no llevan la clave).
+        ...(c.application ? { application_minutes: c.application } : {}),
       });
     });
   });

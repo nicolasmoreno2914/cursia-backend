@@ -224,6 +224,11 @@ const GRADED = new Set(['quiz', 'scorm', 'h5pactivity']);
 
 /** EV6 H5P v2: add-on «Repaso» (Dialog Cards) — h5pactivity SIN nota, completion por vista. */
 const REVIEW_CARDS_RE = /^cv3:ch:([^:]+):review_cards$/;
+/** Fase 2: Actividad de Aplicación — página del estudiante y solucionario docente (oculto). */
+const APPLICATION_RE = /^cv3:ch:([^:]+):application$/;
+const APPLICATION_SOLUTION_RE = /^cv3:ch:([^:]+):application_solution$/;
+/** Marcas que solo puede tener el solucionario (la página del estudiante nunca lleva respuestas). */
+const SOLUTION_MARKERS_RE = /Solucionario|Gu[ií]a de correcci[oó]n|Respuesta:|Soluci[oó]n esperada/;
 
 export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectations): Promise<MbzV3ValidationResult> {
   const issues: MbzV3Issue[] = [];
@@ -552,8 +557,12 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   }
   // F1 (I3): en un curso sin nota el Libro Guía se completa por vista (criterio del curso); el resto, 0.
   const viewCompletion = (a: ParsedActivity) => resolved.withoutGrades === true && a.modname === 'resource' && a.idnumber === 'cv3:shell:libro';
+  // Fase 2: la página de la Actividad de Aplicación se completa por vista (seguimiento; nunca criterio del curso).
+  const applicationView = (a: ParsedActivity) => a.modname === 'page' && APPLICATION_RE.test(a.idnumber);
   for (const a of acts.filter((x) => !GRADED.has(x.modname))) {
-    if (viewCompletion(a)) {
+    if (applicationView(a)) {
+      if (a.module.completion !== '2' || a.module.completionview !== '1') add('APPLICATION', a.dir, `Actividad de Aplicación con completion ${a.module.completion}/${a.module.completionview} ≠ 2/1`);
+    } else if (viewCompletion(a)) {
       if (a.module.completion !== '2' || a.module.completionview !== '1') {
         add('COMPLETION', a.dir, `Libro Guía de un curso sin nota con completion ${a.module.completion}/${a.module.completionview} ≠ 2/1`);
       }
@@ -575,6 +584,35 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     if (/calificab|nota de esta actividad/i.test(a.intro) || /calificab/i.test(a.name)) add('ADDON', a.dir, '«Repaso» presentado como calificable');
   }
   if (reviewActs.length !== (facts.counts.reviewCards ?? 0)) add('ADDON', 'review_cards', `${reviewActs.length} «Repaso» en el paquete ≠ facts ${facts.counts.reviewCards ?? 0}`);
+  // Fase 2: Actividades de Aplicación — por capítulo con applicationMinutes, EXACTAMENTE una página visible del
+  // estudiante (sin respuestas, con su PDF) y un solucionario oculto (visible=0, con su PDF); en ningún otro capítulo.
+  for (const ch of facts.chapters) {
+    const want = ch.applicationMinutes !== undefined;
+    const st = acts.filter((a) => a.idnumber === `cv3:ch:${ch.id}:application`);
+    const so = acts.filter((a) => a.idnumber === `cv3:ch:${ch.id}:application_solution`);
+    if (st.length !== (want ? 1 : 0) || so.length !== (want ? 1 : 0)) {
+      add('APPLICATION', `cv3:ch:${ch.id}:application`, `capítulo ${ch.number}: ${st.length} página(s) del estudiante y ${so.length} solucionario(s) (facts ${want ? 'con' : 'sin'} actividad)`);
+      continue;
+    }
+    if (!want) continue;
+    for (const [a, hidden] of [[st[0], false], [so[0], true]] as const) {
+      if (a.modname !== 'page') add('APPLICATION', a.idnumber, `debe ser una página (mod_page), es ${a.modname}`);
+      if (a.grade || a.inforefGradeItems.length) add('APPLICATION', a.idnumber, 'con ítem de calificación');
+      if ((a.module.visible === '0') !== hidden) add('APPLICATION', a.idnumber, hidden ? 'el solucionario docente debe estar oculto (visible=0)' : 'la página del estudiante debe estar visible');
+      const pdfs = files.filter((f) => f.ctx === a.ctx && f.component === 'mod_page' && f.filearea === 'content' && /\.pdf$/i.test(f.filename));
+      if (pdfs.length !== 1) add('APPLICATION', a.idnumber, `${pdfs.length} PDF adjunto(s) (se espera 1)`);
+      const content = unxml(tag((await text(`${a.dir}/page.xml`)) ?? '', 'content') ?? '');
+      if (pdfs.length === 1 && !content.includes(`@@PLUGINFILE@@/${pdfs[0].filename}`)) add('APPLICATION', a.idnumber, 'la página no enlaza su PDF');
+      const lint = lintCleanSafe(content);
+      if (!lint.ok) add('CLEAN_SAFE', a.idnumber, lint.errors.slice(0, 3).map((e) => `${e.code} ${e.message}`).join('; '));
+      if (!hidden && SOLUTION_MARKERS_RE.test(extractText(content))) add('APPLICATION', a.idnumber, 'la página del estudiante muestra contenido del solucionario');
+      if (hidden && !/Solucionario/.test(a.name)) add('APPLICATION', a.idnumber, 'el solucionario no se nombra como tal');
+    }
+  }
+  for (const a of acts.filter((x) => (APPLICATION_RE.test(x.idnumber) || APPLICATION_SOLUTION_RE.test(x.idnumber)))) {
+    const id = (APPLICATION_RE.exec(a.idnumber) ?? APPLICATION_SOLUTION_RE.exec(a.idnumber)) as RegExpExecArray;
+    if (!facts.chapters.some((c) => c.id === id[1])) add('APPLICATION', a.idnumber, 'Actividad de Aplicación de un capítulo que no está en facts');
+  }
   if (resolved.withoutGrades === true && gradedActs.length > 0) add('STRUCTURE', 'graded', `curso sin nota con ${gradedActs.length} ítem(s) calificable(s)`);
   const practice = gradedActs.filter((g) => g.kind === 'activity' || g.kind === 'video').length;
   const expectedPractice = facts.counts.activities + facts.counts.videos;
@@ -603,6 +641,8 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   const checkHidden = (allowed: string | null): void => {
     for (const a of acts) {
       if (a.module.visible === '1') continue;
+      // Fase 2: el solucionario docente de cada Actividad de Aplicación va oculto (lo verifica la regla APPLICATION).
+      if (APPLICATION_SOLUTION_RE.test(a.idnumber)) continue;
       if (a.idnumber !== allowed) add('CERTIFICATE', a.idnumber, `módulo oculto inesperado (visible=${a.module.visible}): solo el label para docentes del certificado (o, sin él, el de las evaluaciones) puede estarlo`);
     }
   };
@@ -760,7 +800,8 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       const toFinal = steps[ch.id]?.kind === 'final_exam' && /:closing$/.test(a.idnumber);
       // EV6 T5 (ruling 3): un capítulo con video pendiente solo puede nombrar el video si lleva el aviso.
       // Motor de carga horaria: un capítulo de práctica no tiene presentación (no puede nombrarla).
-      return { video: ch.videoEnabled || ch.videoPendingNotice === true, activity: ch.activityEnabled, exam: !!mod?.examEnabled && last, final_exam: toFinal, presentation: ch.kind !== 'practice', other: false };
+      // Fase 2: la Actividad de Aplicación también es una actividad del capítulo (puede nombrarse).
+      return { video: ch.videoEnabled || ch.videoPendingNotice === true, activity: ch.activityEnabled || ch.applicationMinutes !== undefined, exam: !!mod?.examEnabled && last, final_exam: toFinal, presentation: ch.kind !== 'practice', other: false };
     }
     const mm = /^cv3:(?:module_intro|exam_info):(.+)$/.exec(a.idnumber);
     if (mm) {
