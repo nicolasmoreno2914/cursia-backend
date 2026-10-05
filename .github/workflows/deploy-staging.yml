@@ -577,6 +577,12 @@ jobs:
                echo "━━━ [4d7] Motor pedagógico V1: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-pedagogy-profiles-schema.js
 
+               echo "━━━ [4d8] Motor de carga horaria: capítulo de práctica (course_chapters.chapter_kind) — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-practice-chapters.js
+
+               echo "━━━ [4d9] Motor de carga horaria: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-practice-chapters-schema.js
+
                echo "━━━ [4e] Generation Manifests: migración (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-generation-manifests.js
 

@@ -17,6 +17,8 @@
  *        sus interacciones también (misma regla que el plan v3).
  *  - video:<ch> → REGENERATE video_interactions:<ch> (describen un video nuevo).
  *  - course_intro → STALE_NO_AUTO audio_welcome (TTS).
+ *    Motor de carga horaria: también REGENERATE experience/activity de los capítulos de PRÁCTICA del módulo
+ *    (su `dependsOn` incluye este content: se arman con el texto de los capítulos de contenido).
  *  - course_plan: no encadena (misma regla que v2: el plan no regenera los content).
  *  - resto: sin cascada.
  * Solo se incluyen keys que existen en el Manifest.
@@ -26,6 +28,8 @@ export interface CascadeItem {
   type: string;
   moduleId?: string | null;
   chapterId?: string | null;
+  /** Aristas del Manifest (para encadenar a los capítulos de práctica que se apoyan en este content). */
+  dependsOn?: readonly string[];
 }
 
 export interface RegenerationCascade {
@@ -46,8 +50,12 @@ export function regenerationCascade(rulesVersion: number, items: readonly Cascad
   }
   if (mItem.type === 'content' && ch) {
     const finalExam = items.find((it) => it.type === 'final_exam')?.key ?? null;
+    // Motor de carga horaria: experience/activity de las prácticas que se apoyan en este content.
+    const practice = items
+      .filter((it) => (it.type === 'experience' || it.type === 'activity') && it.chapterId !== ch && (it.dependsOn ?? []).includes(mItem.key))
+      .map((it) => it.key);
     return {
-      regenerate: pick([`experience:${ch}`, `activity:${ch}`, mItem.moduleId ? `exam:${mItem.moduleId}` : null, finalExam]),
+      regenerate: pick([`experience:${ch}`, `activity:${ch}`, ...practice, mItem.moduleId ? `exam:${mItem.moduleId}` : null, finalExam]),
       stale: pick([`presentation:${ch}`, `video:${ch}`, `video_interactions:${ch}`, `audiobook_chapter:${ch}`]),
     };
   }

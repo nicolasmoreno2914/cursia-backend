@@ -264,12 +264,13 @@ export function validateV3ItemArtifact(ctx: V3ItemValidationContext, text: strin
  * el módulo no existe (el caller falla fuerte).
  */
 export function examChaptersFromManifest(
-  manifest: { modules?: Array<{ moduleId: string; chapters?: Array<{ chapterId: string }> }> } | null | undefined,
+  manifest: { modules?: Array<{ moduleId: string; chapters?: Array<{ chapterId: string; kind?: string }> }> } | null | undefined,
   type: 'exam' | 'final_exam',
   moduleId?: string | null,
 ): Array<{ id: string; moduleId: string }> {
   const mods = (manifest?.modules ?? []).filter((m) => type === 'final_exam' || m.moduleId === moduleId);
-  return mods.flatMap((m) => (m.chapters ?? []).map((c) => ({ id: c.chapterId, moduleId: m.moduleId })));
+  // Motor de carga horaria: las preguntas salen del texto de los capítulos de CONTENIDO (la práctica no tiene texto propio).
+  return mods.flatMap((m) => (m.chapters ?? []).filter((c) => c.kind !== 'practice').map((c) => ({ id: c.chapterId, moduleId: m.moduleId })));
 }
 
 /** EV6 P2: lo que el claim de un examen v3 entrega al ejecutor para armar el banco (el plan es el que valida el servidor). */

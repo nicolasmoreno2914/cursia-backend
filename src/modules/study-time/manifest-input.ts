@@ -68,6 +68,8 @@ export function studyTimeInputFromManifest(
         const id = c.chapterId;
         return {
           chapterId: id,
+          // Motor de carga horaria: capítulo de práctica (página de práctica guiada; sin Libro, presentación ni video).
+          ...(c.kind === 'practice' ? { kind: 'practice' as const } : {}),
           // v3 siempre publica la página (experience) del capítulo.
           pageWords: pick(measured.pageWordsByChapter, id),
           libro: has('content', id),

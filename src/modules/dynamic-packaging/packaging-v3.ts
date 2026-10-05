@@ -757,9 +757,11 @@ export async function loadContentsV3(
     for (const ch of m.chapters) {
       const slot: ChapterSlots = {};
       chapterSlots.set(ch.chapterId, slot);
-      tasks.push(async () => { slot.content = await validatedText(L, byItem, ch.keys.content, 'dynamic_content_md'); });
+      // Motor de carga horaria: un capítulo de práctica no tiene content (Libro), presentación ni audiolibro.
+      const contentKey = ch.keys.content;
+      if (contentKey) tasks.push(async () => { slot.content = await validatedText(L, byItem, contentKey, 'dynamic_content_md'); });
       tasks.push(async () => { slot.experience = json(await validatedText(L, byItem, ch.keys.experience, 'dynamic_experience_json'), ch.keys.experience); });
-      tasks.push(async () => { slot.presentation = await loadPresentation(ch); });
+      if (ch.keys.presentation) tasks.push(async () => { slot.presentation = await loadPresentation(ch); });
       if (ch.keys.video) {
         tasks.push(async () => { slot.video = await loadVideo(ch); });
         tasks.push(async () => {
@@ -778,7 +780,8 @@ export async function loadContentsV3(
           tasks.push(async () => { slot.scormManifest = await validatedText(L, byItem, activityKey, 'dynamic_scorm_manifest'); });
         }
       }
-      tasks.push(async () => { slot.audio = await audio(ch.keys.audiobookChapter); });
+      const audioKey = ch.keys.audiobookChapter;
+      if (audioKey) tasks.push(async () => { slot.audio = await audio(audioKey); });
     }
   }
   if (plan.keys.finalExam) {
@@ -815,11 +818,13 @@ export async function loadContentsV3(
     }
     for (const ch of m.chapters) {
       const slot = chapterSlots.get(ch.chapterId) as ChapterSlots;
-      contentMd.set(ch.chapterId, slot.content as string);
+      if (ch.keys.content) contentMd.set(ch.chapterId, slot.content as string);
       experiences.set(ch.chapterId, slot.experience);
-      const pres = slot.presentation as PresentationSlot;
-      warnings.push(...pres.warnings);
-      presentations.set(ch.chapterId, pres.value);
+      if (ch.keys.presentation) {
+        const pres = slot.presentation as PresentationSlot;
+        warnings.push(...pres.warnings);
+        presentations.set(ch.chapterId, pres.value);
+      }
       if (ch.keys.video) {
         videos.set(ch.chapterId, slot.video as { youtubeId: string; durationSec: number });
         videoInteractions.set(ch.chapterId, slot.videoInteractions);
@@ -831,10 +836,12 @@ export async function loadContentsV3(
           activities.set(ch.chapterId, { variant: 'scorm', html: slot.scormHtml as string, manifestXml: slot.scormManifest as string });
         }
       }
-      audiobookChapters.set(ch.chapterId, slot.audio as Buffer);
-      if (!mockProviderItems.includes(ch.keys.audiobookChapter)) {
-        const man = byItem.get(ch.keys.audiobookChapter)?.outputSummary?.audiobookManifest;
-        audiobookManifests.set(ch.chapterId, man && typeof man === 'object' ? man : null);
+      if (ch.keys.audiobookChapter) {
+        audiobookChapters.set(ch.chapterId, slot.audio as Buffer);
+        if (!mockProviderItems.includes(ch.keys.audiobookChapter)) {
+          const man = byItem.get(ch.keys.audiobookChapter)?.outputSummary?.audiobookManifest;
+          audiobookManifests.set(ch.chapterId, man && typeof man === 'object' ? man : null);
+        }
       }
     }
   }
@@ -845,10 +852,11 @@ export async function loadContentsV3(
   const banksToCheck: Array<{ key: string; scope: 'module' | 'final'; bank: ExamBankV1; chapters: Array<{ id: string; moduleId: string }> }> = [];
   for (const m of plan.modules) {
     const src = examSources.get(m.moduleId);
-    if (src?.kind === 'bank') banksToCheck.push({ key: m.keys.exam as string, scope: 'module', bank: src.bank, chapters: m.chapters.map((c) => ({ id: c.chapterId, moduleId: m.moduleId })) });
+    // Motor de carga horaria: los capítulos de práctica no entran a los exámenes (mismo plan que el claim).
+    if (src?.kind === 'bank') banksToCheck.push({ key: m.keys.exam as string, scope: 'module', bank: src.bank, chapters: m.chapters.filter((c) => c.kind !== 'practice').map((c) => ({ id: c.chapterId, moduleId: m.moduleId })) });
   }
   if (finalSrc?.kind === 'bank') {
-    banksToCheck.push({ key: plan.keys.finalExam as string, scope: 'final', bank: finalSrc.bank, chapters: plan.modules.flatMap((m) => m.chapters.map((c) => ({ id: c.chapterId, moduleId: m.moduleId }))) });
+    banksToCheck.push({ key: plan.keys.finalExam as string, scope: 'final', bank: finalSrc.bank, chapters: plan.modules.flatMap((m) => m.chapters.filter((c) => c.kind !== 'practice').map((c) => ({ id: c.chapterId, moduleId: m.moduleId }))) });
   }
   for (const b of banksToCheck) {
     const r = validateExamBank(b.bank, { scope: b.scope, chapters: b.chapters, chapterMd: contentMd, planSource: 'frozen', evidenceRules: 'asAccepted' });

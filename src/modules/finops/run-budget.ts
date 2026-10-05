@@ -174,12 +174,15 @@ export function audiobookUsageScale(chapterWords: number | null | undefined): nu
   return Math.round((w / AUDIOBOOK_REFERENCE_CHAPTER_WORDS) * 10000) / 10000;
 }
 
-/** Capítulos (orden del Manifest) por módulo, desde los items de capítulo. */
+/**
+ * Capítulos (orden del Manifest) por módulo que cubren los exámenes: los que tienen `content` (todo capítulo de
+ * contenido lo tiene en v1/v2/v3). Motor de carga horaria: un capítulo de práctica no tiene content ni entra al banco.
+ */
 function manifestChapters(items: readonly RunManifestItem[]): Array<{ id: string; moduleId: string }> {
   const out: Array<{ id: string; moduleId: string }> = [];
   const seen = new Set<string>();
   for (const it of items) {
-    if (!it.chapterId || !it.moduleId || seen.has(it.chapterId)) continue;
+    if (it.type !== 'content' || !it.chapterId || !it.moduleId || seen.has(it.chapterId)) continue;
     seen.add(it.chapterId);
     out.push({ id: it.chapterId, moduleId: it.moduleId });
   }

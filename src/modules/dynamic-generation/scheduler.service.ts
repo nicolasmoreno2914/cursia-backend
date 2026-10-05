@@ -196,7 +196,7 @@ export interface ClaimedItem {
      * Capítulos del módulo del item, en orden del Manifest (para exam:
      * exactamente los que evalúa). Vacío en items de scope course.
      */
-    moduleChapters: Array<{ id: string; title: string; objective: string | null; description: string | null; chapterNumber: number }>;
+    moduleChapters: Array<{ id: string; title: string; objective: string | null; description: string | null; chapterNumber: number; kind?: 'practice' }>;
     /**
      * R18: outline del curso COMPLETO (todos los módulos, en orden del
      * Manifest), con numeración global — para que los builders dynamic
@@ -216,7 +216,8 @@ export interface ClaimedItem {
        */
       objective: string | null;
       description: string | null;
-      chapters: Array<{ chapterNumber: number; id: string; title: string; objective: string | null; description: string | null }>;
+      /** Motor de carga horaria: `kind: 'practice'` SOLO en capítulos de práctica (los de contenido no la llevan). */
+      chapters: Array<{ chapterNumber: number; id: string; title: string; objective: string | null; description: string | null; kind?: 'practice' }>;
     }>;
   };
   dependencyArtifacts: Array<{ itemKey: string; artifactId: string; type: string; storagePath: string }>;
@@ -268,6 +269,12 @@ export interface ClaimPayloadV3 {
    * rechazaría el campo) sigue con el prompt de siempre. El orden de deploy FE/BE no rompe la generación.
    */
   activityFeatures?: { dragTextDistractors: boolean };
+  /**
+   * Motor de carga horaria: experience/activity de un CAPÍTULO DE PRÁCTICA. El ejecutor arma la página y la
+   * actividad desde los capítulos de contenido del módulo (`sourceChapterIds`, en orden; sus content llegan en
+   * dependencyArtifacts), sin teoría nueva. Ausente = capítulo de contenido de siempre.
+   */
+  practice?: { sourceChapterIds: string[] };
 }
 
 /**
@@ -1350,6 +1357,13 @@ export class SchedulerService {
       out.chapterId = row.chapter_id;
       out.experienceFeatures = { eduFields: true };
     }
+    if (row.type === 'experience' || row.type === 'activity') {
+      const mm = manifest.modules.find((m) => m.chapters.some((c) => c.chapterId === row.chapter_id));
+      const mc = mm?.chapters.find((c) => c.chapterId === row.chapter_id);
+      if (mm && mc?.kind === 'practice') {
+        out.practice = { sourceChapterIds: mm.chapters.filter((c) => c.kind !== 'practice').map((c) => c.chapterId) };
+      }
+    }
     if (row.type === 'final_exam') {
       out.finalExam = { minQuestions: FINAL_EXAM_QUESTION_RANGE.min, maxQuestions: FINAL_EXAM_QUESTION_RANGE.max };
     }
@@ -1723,7 +1737,7 @@ export class SchedulerService {
       : mModule.chapters.map((mc) => {
           const sc = sModule!.chapters.find((c) => c.id === mc.chapterId);
           if (!sc) throw fail(`capítulo ${mc.chapterId} del Manifest ausente en el Blueprint`);
-          return { id: sc.id, title: sc.title, objective: sc.objective ?? null, description: descOf(sc), chapterNumber: mc.chapterNumber };
+          return { id: sc.id, title: sc.title, objective: sc.objective ?? null, description: descOf(sc), chapterNumber: mc.chapterNumber, ...(mc.kind === 'practice' ? { kind: 'practice' as const } : {}) };
         });
 
     // Outline del curso completo (R18), en el mismo orden en que el Manifest
@@ -1742,7 +1756,7 @@ export class SchedulerService {
         chapters: mm.chapters.map((mc) => {
           const sc = sm.chapters.find((c) => c.id === mc.chapterId);
           if (!sc) throw fail(`capítulo ${mc.chapterId} del Manifest ausente en el Blueprint`);
-          return { chapterNumber: mc.chapterNumber, id: sc.id, title: sc.title, objective: sc.objective ?? null, description: descOf(sc) };
+          return { chapterNumber: mc.chapterNumber, id: sc.id, title: sc.title, objective: sc.objective ?? null, description: descOf(sc), ...(mc.kind === 'practice' ? { kind: 'practice' as const } : {}) };
         }),
       };
     });

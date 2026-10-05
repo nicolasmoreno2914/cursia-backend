@@ -217,9 +217,15 @@ export function methodologySteps(facts: CourseFacts): Array<{ title: string; bod
   const allVideo = c.videos === c.chapters;
   const allActivity = c.activities === c.chapters;
   const allExam = c.exams === c.modules;
+  // Motor de carga horaria: con capítulos de práctica la presentación es solo de los de contenido (sin práctica:
+  // el texto de siempre).
+  const practice = facts.chapters.some((ch) => ch.kind === 'practice');
   const steps: Array<{ title: string; body: string }> = [
     { title: 'Recorrido del capítulo', body: 'Cada capítulo te guía con explicaciones, ejemplos y momentos de reflexión.' },
-    { title: 'Presentación del capítulo', body: 'Una visión general de las ideas principales, para ver o repasar cuando quieras.' },
+    practice
+      ? { title: 'Presentación del capítulo', body: 'En los capítulos de contenido, una visión general de las ideas principales, para ver o repasar cuando quieras.' }
+      : { title: 'Presentación del capítulo', body: 'Una visión general de las ideas principales, para ver o repasar cuando quieras.' },
+    ...(practice ? [{ title: 'Capítulos de práctica', body: 'Integran lo que aprendiste en el módulo en un caso completo, sin teoría nueva.' }] : []),
   ];
   if (c.videos > 0) {
     steps.push({

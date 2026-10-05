@@ -759,7 +759,8 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       // Fix 1 (I2): SOLO su label de cierre (el botón determinístico); el resto del capítulo, nunca.
       const toFinal = steps[ch.id]?.kind === 'final_exam' && /:closing$/.test(a.idnumber);
       // EV6 T5 (ruling 3): un capítulo con video pendiente solo puede nombrar el video si lleva el aviso.
-      return { video: ch.videoEnabled || ch.videoPendingNotice === true, activity: ch.activityEnabled, exam: !!mod?.examEnabled && last, final_exam: toFinal, presentation: true, other: false };
+      // Motor de carga horaria: un capítulo de práctica no tiene presentación (no puede nombrarla).
+      return { video: ch.videoEnabled || ch.videoPendingNotice === true, activity: ch.activityEnabled, exam: !!mod?.examEnabled && last, final_exam: toFinal, presentation: ch.kind !== 'practice', other: false };
     }
     const mm = /^cv3:(?:module_intro|exam_info):(.+)$/.exec(a.idnumber);
     if (mm) {

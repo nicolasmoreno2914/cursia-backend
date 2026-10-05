@@ -60,6 +60,12 @@ const CONFIGS = [
   // F1 (I3): curso sin nota → sin categorías, completion del curso por vista del Libro Guía.
   { id: 'f1-without-grades', engine: 'h5p', finalExam: false, theme: { themeFamily: 'aula-clara', mode: 'light' }, courseId: 634,
     modules: [{ examEnabled: false, chapters: [{ video: false, activity: false }] }] },
+  // Motor de carga horaria: capítulos de práctica (sin presentación, Libro ni audiolibro; fuera de los exámenes).
+  { id: 'practice-chapters', engine: 'h5p', finalExam: true, theme: { themeFamily: 'aula-clara', mode: 'light' }, courseId: 635,
+    modules: [
+      { examEnabled: true, chapters: [{ video: true, activity: true }, { video: false, activity: true }, { practice: true, activity: true }] },
+      { examEnabled: false, chapters: [{ video: true, activity: true }, { practice: true, activity: true }, { video: false, activity: false }] },
+    ] },
 ];
 const QUIZ_GM = { highest: 1, average: 2, first: 3, last: 4 };
 const H5P_GM = { highest: 1, average: 2, last: 3, first: 4 };

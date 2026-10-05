@@ -47,11 +47,16 @@ export interface PackagingChapterPlanV3 {
   videoPending: boolean;
   activityEnabled: boolean;
   activityVariant: 'h5p' | 'scorm' | null;
+  /**
+   * Motor de carga horaria: SOLO en capítulos de práctica (los de contenido no llevan la clave: el sha del plan
+   * de siempre). Sin content (Libro), presentación, video ni audiolibro: esas keys son null.
+   */
+  kind?: 'practice';
   keys: {
-    content: string;
+    content: string | null;
     experience: string;
-    presentation: string;
-    audiobookChapter: string;
+    presentation: string | null;
+    audiobookChapter: string | null;
     video: string | null;
     videoInteractions: string | null;
     activity: string | null;
@@ -142,7 +147,9 @@ export function buildPackagingPlanV3(
       const bc = bm.chapters.find((c) => c.id === mc.chapterId);
       if (!bc) throw new PackagingPlanV3Error(`el capítulo ${mc.chapterId} no está en el módulo ${mm.moduleId} del Blueprint`);
       const id = mc.chapterId;
+      const practice = mc.kind === 'practice';
       const videoInManifest = mc.videoEnabled === true;
+      if (practice && videoInManifest) throw new PackagingPlanV3Error(`el capítulo de práctica ${id} tiene video en el Manifest`);
       const videoPending = videoInManifest && omit.has(id);
       // Un video pendiente se consume igual (el Manifest queda cubierto) pero no ocupa lugar en el paquete.
       let videoKey: string | null = null;
@@ -171,11 +178,12 @@ export function buildPackagingPlanV3(
         videoPending,
         activityEnabled,
         activityVariant: variant,
+        ...(practice ? { kind: 'practice' as const } : {}),
         keys: {
-          content: take(`content:${id}`, 'content'),
+          content: practice ? null : take(`content:${id}`, 'content'),
           experience: take(`experience:${id}`, 'experience'),
-          presentation: take(`presentation:${id}`, 'presentation'),
-          audiobookChapter: take(`audiobook_chapter:${id}`, 'audiobook_chapter'),
+          presentation: practice ? null : take(`presentation:${id}`, 'presentation'),
+          audiobookChapter: practice ? null : take(`audiobook_chapter:${id}`, 'audiobook_chapter'),
           video: videoPending ? null : videoKey,
           videoInteractions: videoPending ? null : videoInteractionsKey,
           activity: activityKey,

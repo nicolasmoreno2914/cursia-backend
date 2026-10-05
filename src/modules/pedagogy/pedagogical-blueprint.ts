@@ -2,6 +2,7 @@ import {
   BlueprintSnapshotV2,
   buildBlueprintSnapshotV2,
   snapshotV2ToRows,
+  chapterKindOf,
 } from '../course-blueprints/blueprint-snapshot';
 import {
   INTENT_TO_TYPE_V1,
@@ -191,8 +192,11 @@ export function proposeStructureAdjustments(
     m.chapters.forEach((c, ci) => {
       const row = byId.get(c.id)!;
       const path = `modules[${mi}].chapters[${ci}]`;
-      if (videoPolicy !== 'keep') {
-        const want = videoPolicy === 'every_chapter' ? true : ci === 0;
+      // Motor de carga horaria: un capítulo de práctica nunca lleva video (regla de producto > pedagogía).
+      if (videoPolicy !== 'keep' && chapterKindOf(c) !== 'practice') {
+        // «Solo el primero» = el primer capítulo de CONTENIDO del módulo (una práctica al inicio no cuenta).
+        const contentIdx = m.chapters.filter((x) => chapterKindOf(x) !== 'practice').indexOf(c);
+        const want = videoPolicy === 'every_chapter' ? true : contentIdx === 0;
         if (row.video_enabled !== want) {
           changes.push({
             path: `${path}.videoEnabled`, entityId: c.id, title: c.title, field: 'videoEnabled', from: row.video_enabled, to: want,

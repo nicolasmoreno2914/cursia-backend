@@ -392,6 +392,8 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
       'unsupported_rules_version', 'rules_version_mismatch', 'claim_payload_unavailable', 'video_duration_unmeasurable',
       'missing_artifact_id', 'artifact_download_unavailable', 'unsupported_download_method', 'provider_worker_wrong_type',
       'missing_required_artifacts', 'ACTIVITY_TYPE_MISMATCH', 'AUDIOBOOK_PLAN_COVERAGE',
+      // Motor de carga horaria: el claim de una práctica sin fuentes es un contrato roto.
+      'practice_sources_missing',
       // Motor pedagógico Fase 2: brief pedagógico del claim con forma inválida en el navegador (versiones desalineadas).
       'PEDAGOGY_BRIEF_INVALID'],
     family: /^(missing|ambiguous)_[a-z0-9_]+_artifact$/,

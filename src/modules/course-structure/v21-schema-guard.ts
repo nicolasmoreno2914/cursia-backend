@@ -69,3 +69,29 @@ export async function probeV21StructureSchema(q: { query(sql: string, params?: a
     logger.error(`${SCHEMA_NOT_MIGRATED_V21}: no se pudo sondear el esquema al iniciar (${err instanceof Error ? err.message : String(err)})`);
   }
 }
+
+// ── Motor de carga horaria: capítulo de práctica (course_chapters.chapter_kind) ──
+// La migración (supabase-migration-practice-chapters.sql) corre SOLO en staging. Sin ella, la lectura de la
+// estructura NO informa `kind` (el editor no ofrece la práctica) y una escritura con `kind` responde 503
+// `schema_not_migrated_practice` — nunca un 500 crudo. Positivo cacheado por proceso, como la guarda V2.1.
+export const SCHEMA_NOT_MIGRATED_PRACTICE = 'schema_not_migrated_practice';
+let practiceVerified = false;
+
+export function _resetPracticeSchemaGuardForTests(): void {
+  practiceVerified = false;
+}
+
+export async function assertPracticeChapterSchema(q: { query(sql: string, params?: any[]): Promise<any> }): Promise<void> {
+  if (practiceVerified) return;
+  const res: any = await q.query(
+    `select 1 from information_schema.columns where table_schema = 'public' and table_name = 'course_chapters' and column_name = 'chapter_kind'`,
+  );
+  const rows: unknown[] = Array.isArray(res) ? res : res.rows;
+  if (!rows.length) {
+    throw new ServiceUnavailableException({
+      code: SCHEMA_NOT_MIGRATED_PRACTICE,
+      message: `${SCHEMA_NOT_MIGRATED_PRACTICE}: esta base no tiene el capítulo de práctica (course_chapters.chapter_kind); correr supabase-migration-practice-chapters.sql antes de usarlo.`,
+    });
+  }
+  practiceVerified = true;
+}

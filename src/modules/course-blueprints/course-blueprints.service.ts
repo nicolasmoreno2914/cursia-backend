@@ -322,7 +322,8 @@ export class CourseBlueprintsService {
         [courseId],
       );
       const chapters: RawChapterRowV2[] = await qr.query(
-        `select id, module_id, position, title, objective, description, video_enabled, activity_enabled
+        `select id, module_id, position, title, objective, description, video_enabled, activity_enabled,
+                to_jsonb(course_chapters) ->> 'chapter_kind' as chapter_kind
            from public.course_chapters where course_id = $1`,
         [courseId],
       );

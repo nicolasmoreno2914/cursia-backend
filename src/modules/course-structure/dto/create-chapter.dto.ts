@@ -1,4 +1,4 @@
-import { IsString, IsNotEmpty, IsOptional, MaxLength, IsBoolean, IsInt, Min } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, MaxLength, IsBoolean, IsInt, Min, IsIn } from 'class-validator';
 
 export class CreateChapterDto {
   // Title Normalization: se aceptan hasta 1000 caracteres para poder SEPARAR un título pegado con su
@@ -26,6 +26,12 @@ export class CreateChapterDto {
   @IsBoolean()
   @IsOptional()
   activityEnabled?: boolean;
+
+  // Motor de carga horaria: 'practice' = capítulo de práctica (sin video, presentación, audiolibro ni Libro);
+  // ausente → 'content' (el de siempre).
+  @IsIn(['content', 'practice'])
+  @IsOptional()
+  kind?: 'content' | 'practice';
 
   @IsInt()
   @Min(0)

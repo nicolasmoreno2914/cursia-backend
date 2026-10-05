@@ -176,7 +176,8 @@ check('tabla: contrato y producto (D) — incluido el «ambiguous_*_artifact» d
     'claim_payload_unavailable: falta x', 'tipo no soportado por el ejecutor del navegador (v3): foo', 'rulesVersion no soportado por el ejecutor del navegador: 9',
     'video_interactions: VIDEO_PLAN_MISMATCH — los checkpoints', 'video_interactions: el claim no trae la duración', 'activity: variant desconocido o ausente (x)',
     'activity h5p: el claim no trae el tipo h5p requerido (contrato R11a)', 'ACTIVITY_TYPE_NOT_IN_MANIFEST: el tipo "x"', 'course_plan: el outline del claim no tiene capítulos',
-    'video_duration_unmeasurable: el MP4 del video x', 'provider_worker_wrong_type: content', 'missing_artifact_id', 'artifact_download_unavailable']) {
+    'video_duration_unmeasurable: el MP4 del video x', 'provider_worker_wrong_type: content', 'missing_artifact_id', 'artifact_download_unavailable',
+    'practice_sources_missing: el claim del capítulo de práctica experience:x no trae sourceChapterIds']) {
     expectVerdict(m, { class: 'D', strategy: 'hold_for_human', humanReason: 'product_bug' });
   }
   expectVerdict('video_interactions: VIDEO_REFLECTION_PLAN_MISMATCH: las pausas', { class: 'D', code: 'VIDEO_REFLECTION_PLAN_MISMATCH' });

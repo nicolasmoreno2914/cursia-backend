@@ -733,7 +733,7 @@ async function dbChecks() {
       await c.query(`create role "${ROLE}" superuser login`);
     });
     await withClient(DB, async (c) => {
-      for (const f of ['scripts/prod/test/fixtures/legacy-baseline.sql', 'supabase-migration-dynamic-course-structure.sql', 'supabase-migration-course-blueprints.sql', 'supabase-migration-v21-blueprint-profiles.sql']) {
+      for (const f of ['scripts/prod/test/fixtures/legacy-baseline.sql', 'supabase-migration-dynamic-course-structure.sql', 'supabase-migration-course-blueprints.sql', 'supabase-migration-v21-blueprint-profiles.sql', 'supabase-migration-practice-chapters.sql']) {
         await c.query(fs.readFileSync(path.join(REPO, f), 'utf8'));
       }
     });
@@ -908,6 +908,43 @@ async function dbChecks() {
       eq(await liveMatches(), false, 'quitar el objetivo también pide reconfirmar');
       const back = await blueprints.lock(course.id, OWNER, await counter());
       eq(back.blueprint.sha256, plainSha, 'sin objetivo: el sha de siempre');
+    });
+    await check('DB motor de carga horaria: capítulo de práctica por la API — kind, sin video (400), lock con kind, Manifest válido, estructura viva = Blueprint', async () => {
+      const st0 = await structureSvc.getStructure(course.id, OWNER);
+      assert(st0.modules.every((m) => m.chapters.every((c) => c.kind === 'content')), 'capítulos existentes: content');
+      const mod = st0.modules[0];
+      // Re-revisión L4 (m1): un capítulo de contenido nuevo no informa `kind` (en una base sin migrar no existe la columna).
+      const plain = await structureSvc.createChapter(course.id, mod.id, OWNER, { title: 'Contenido temporal', expectedCounter: await counter() });
+      eq('kind' in plain.chapter, false, 'contenido nuevo: sin kind en la respuesta');
+      await structureSvc.deleteChapter(course.id, mod.id, plain.chapter.id, OWNER, await counter());
+      await rejectsRe(structureSvc.createChapter(course.id, mod.id, OWNER, { title: 'Práctica', kind: 'practice', videoEnabled: true, expectedCounter: await counter() }), /PRACTICE_CHAPTER_VIDEO/, 'práctica con video', 400);
+      const r = await structureSvc.createChapter(course.id, mod.id, OWNER, { title: 'Práctica integradora', kind: 'practice', expectedCounter: await counter() });
+      eq([r.chapter.kind, r.chapter.videoEnabled, r.chapter.activityEnabled], ['practice', false, true], 'creado');
+      const pid = r.chapter.id;
+      const dbKind = (await ds.query(`select chapter_kind, video_enabled from public.course_chapters where id = $1`, [pid]))[0];
+      eq([dbKind.chapter_kind, dbKind.video_enabled], ['practice', false], 'fila');
+      await rejectsRe(structureSvc.updateChapter(course.id, mod.id, pid, OWNER, { videoEnabled: true, expectedCounter: await counter() }), /PRACTICE_CHAPTER_VIDEO/, 'encender video en práctica', 400);
+      // Pasar un capítulo de contenido CON video a práctica apaga su video; volver a contenido lo deja sin video.
+      const c2 = mod.chapters[1];
+      await structureSvc.updateChapter(course.id, mod.id, c2.id, OWNER, { kind: 'practice', expectedCounter: await counter() });
+      eq((await ds.query(`select chapter_kind, video_enabled from public.course_chapters where id = $1`, [c2.id]))[0], { chapter_kind: 'practice', video_enabled: false }, 'a práctica: sin video');
+      await structureSvc.updateChapter(course.id, mod.id, c2.id, OWNER, { kind: 'content', videoEnabled: true, expectedCounter: await counter() });
+      eq((await ds.query(`select chapter_kind, video_enabled from public.course_chapters where id = $1`, [c2.id]))[0], { chapter_kind: 'content', video_enabled: true }, 'de vuelta a contenido');
+      eq(await liveMatches(), false, 'la práctica nueva pide reconfirmar');
+      const lock = await blueprints.lock(course.id, OWNER, await counter());
+      const pc = lock.blueprint.snapshot.modules[0].chapters.find((c) => c.id === pid);
+      eq([pc.kind, pc.videoEnabled], ['practice', false], 'Blueprint con kind');
+      eq(snap.validateBlueprintSnapshotV2(lock.blueprint.snapshot), [], 'Blueprint válido');
+      const read = await blueprints.getByNumberAnySchema(course.id, OWNER, lock.blueprint.blueprintNumber);
+      const m = mb.buildGenerationManifestV3(read.snapshot, { courseId: course.id, blueprintId: read.id, blueprintNumber: read.blueprintNumber, blueprintSha256: read.sha256 }, { activityTypeRules: 2 });
+      eq(mb.validateGenerationManifestV3(m, read.snapshot, m.source), [], 'Manifest v3 válido');
+      eq(m.items.filter((i) => i.chapterId === pid).map((i) => i.type), ['experience', 'activity'], 'trabajos de la práctica');
+      eq(await liveMatches(), true, 'reconfirmado');
+      const dr = await pedagogy.dryRunCourse(course.id, OWNER, {});
+      assert(dr.baseline.manifest.modules[0].chapters.some((c) => c.chapterId === pid && c.kind === 'practice'), 'dry-run del curso ve la práctica');
+      await structureSvc.deleteChapter(course.id, mod.id, pid, OWNER, await counter());
+      await blueprints.lock(course.id, OWNER, await counter());
+      eq(await liveMatches(), true, 'sin la práctica');
     });
     await check('DB dry-run del curso: estructura viva + perfil del cuerpo (sin guardar) o el guardado; solo lectura; ajeno 404; legacy 400', async () => {
       const before = await ds.query(`select (select count(*)::int from public.course_blueprints) b, (select count(*)::int from public.course_profiles) p, (select structure_version_counter from public.courses where id=$1) c`, [course.id]);

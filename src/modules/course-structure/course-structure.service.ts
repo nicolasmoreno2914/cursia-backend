@@ -28,7 +28,7 @@ import {
   snapshotSha256,
   snapshotSha256V2,
 } from '../course-blueprints/blueprint-snapshot';
-import { assertV21StructureSchema, probeV21StructureSchema } from './v21-schema-guard';
+import { assertPracticeChapterSchema, assertV21StructureSchema, probeV21StructureSchema } from './v21-schema-guard';
 import {
   CHAPTER_TITLE_TOO_LONG,
   MODULE_TITLE_TOO_LONG,
@@ -77,6 +77,14 @@ function cleanDescription(v: string | undefined | null): string | null {
   return t ? t : null;
 }
 import { blueprintSchemaVersionForRules, readActivityTypeRulesConfig, readConfiguredRulesVersion } from '../generation-manifests/manifest-rules-config';
+
+/** Motor de carga horaria: 400 visible si se pide video en un capítulo de práctica. */
+function practiceVideoError(): BadRequestException {
+  return new BadRequestException({
+    code: 'PRACTICE_CHAPTER_VIDEO',
+    message: 'PRACTICE_CHAPTER_VIDEO: un capítulo de práctica no tiene video (se apoya en los capítulos de contenido del módulo).',
+  });
+}
 
 @Injectable()
 export class CourseStructureService implements OnModuleInit {
@@ -228,7 +236,9 @@ export class CourseStructureService implements OnModuleInit {
                            select json_agg(json_build_object(
                                     'id', ch.id, 'position', ch.position, 'title', ch.title, 'objective', ch.objective,
                                     'description', ch.description, 'videoEnabled', ch.video_enabled,
-                                    'activityEnabled', ch.activity_enabled) order by ch.position, ch.id)
+                                    'activityEnabled', ch.activity_enabled,
+                                    -- Motor de carga horaria: sin la migración la clave viene null (y el editor no ofrece la práctica).
+                                    'kind', to_jsonb(ch) ->> 'chapter_kind') order by ch.position, ch.id)
                              from public.course_chapters ch where ch.module_id = m.id and ch.course_id = c.id), '[]'::json)
                        ) order by m.position, m.id)
                   from public.course_modules m where m.course_id = c.id), '[]'::json) as modules
@@ -255,6 +265,7 @@ export class CourseStructureService implements OnModuleInit {
     };
     const rawModules: any[] = typeof row.modules === 'string' ? JSON.parse(row.modules) : row.modules || [];
     const activityByChapter = new Map<string, boolean>();
+    const kindByChapter = new Map<string, 'content' | 'practice'>();
     const modules = rawModules.map((m) => ({
       id: m.id as string,
       position: Number(m.position),
@@ -267,6 +278,9 @@ export class CourseStructureService implements OnModuleInit {
           throw new Error(`Capítulo ${c.id}: activity_enabled ilegible (${JSON.stringify(c.activityEnabled)})`);
         }
         activityByChapter.set(c.id, c.activityEnabled);
+        // Motor de carga horaria: null = base sin la migración (capítulo de contenido, sin informar el tipo).
+        if (c.kind !== null && c.kind !== undefined && c.kind !== 'content' && c.kind !== 'practice') throw new Error(`Capítulo ${c.id}: chapter_kind ilegible (${JSON.stringify(c.kind)})`);
+        if (c.kind === 'content' || c.kind === 'practice') kindByChapter.set(c.id, c.kind);
         return {
           id: c.id as string,
           position: Number(c.position),
@@ -308,6 +322,7 @@ export class CourseStructureService implements OnModuleInit {
       settings,
       activityByChapter,
       pedagogyProfile,
+      kindByChapter,
     );
 
     return {
@@ -336,6 +351,7 @@ export class CourseStructureService implements OnModuleInit {
           description: c.description ?? null,
           videoEnabled: c.videoEnabled,
           activityEnabled: activityByChapter.get(c.id) as boolean,
+          ...(kindByChapter.has(c.id) ? { kind: kindByChapter.get(c.id) as 'content' | 'practice' } : {}),
         })),
       })),
       currentBlueprint,
@@ -399,6 +415,7 @@ export class CourseStructureService implements OnModuleInit {
     settings?: { finalExam: boolean; activityEngine: 'h5p' | 'scorm'; reviewCardsEnabled?: boolean },
     activityByChapter?: Map<string, boolean>,
     pedagogyProfile: unknown = null,
+    kindByChapter?: Map<string, 'content' | 'practice'>,
   ): boolean {
     if (!currentBlueprint) return false;
     try {
@@ -419,6 +436,7 @@ export class CourseStructureService implements OnModuleInit {
             id: c.id, module_id: m.id, position: c.position, title: c.title, objective: c.objective,
             description: c.description ?? null,
             video_enabled: c.videoEnabled, activity_enabled: activityByChapter.get(c.id) as boolean,
+            chapter_kind: kindByChapter?.get(c.id) ?? 'content',
           })),
         );
         const courseV2 = {
@@ -721,7 +739,11 @@ export class CourseStructureService implements OnModuleInit {
 
   async createChapter(courseId: number, moduleId: string, ownerId: string, dto: CreateChapterDto) {
     assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
+    // Motor de carga horaria: el capítulo de práctica no tiene video (por definición).
+    const practice = dto.kind === 'practice';
+    if (practice && dto.videoEnabled === true) throw practiceVideoError();
     await assertV21StructureSchema(this.dataSource); // V2.1 fix round 1 (I5): 503 si falta la migración R3
+    if (dto.kind !== undefined) await assertPracticeChapterSchema(this.dataSource); // 503 sin la migración de práctica
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();
@@ -754,10 +776,10 @@ export class CourseStructureService implements OnModuleInit {
            select id from public.course_modules where id = $2 and course_id = $1
          ),
          ins as (
-           insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled, activity_enabled, description)
+           insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled, activity_enabled, description${practice ? ', chapter_kind' : ''})
            select $1::int, m.id,
                   coalesce((select max(position) from public.course_chapters where module_id = m.id), -1) + 1,
-                  $3::text, $4::text, $5::boolean, $6::boolean, $7::text
+                  $3::text, $4::text, $5::boolean, $6::boolean, $7::text${practice ? ", 'practice'" : ''}
              from m
            returning id, position, title, objective, description, video_enabled, activity_enabled
          ),
@@ -770,9 +792,9 @@ export class CourseStructureService implements OnModuleInit {
          select (select count(*)::int from m) as found,
                 (select json_build_object('id', ins.id, 'position', ins.position, 'title', ins.title, 'objective', ins.objective,
                                           'description', ins.description, 'videoEnabled', ins.video_enabled,
-                                          'activityEnabled', ins.activity_enabled) from ins) as chapter,
+                                          'activityEnabled', ins.activity_enabled, 'kind', $8::text) from ins) as chapter,
                 (select structure_version_counter from c) as counter`,
-        [courseId, moduleId, nt.title, dto.objective || null, dto.videoEnabled ?? false, dto.activityEnabled ?? true, description],
+        [courseId, moduleId, nt.title, dto.objective || null, practice ? false : dto.videoEnabled ?? false, dto.activityEnabled ?? true, description, practice ? 'practice' : 'content'],
       );
       const r = rows[0];
       if (!r || Number(r.found) === 0) {
@@ -781,7 +803,11 @@ export class CourseStructureService implements OnModuleInit {
       }
       const newCounter = this.counterOrThrow(r.counter, courseId);
       await queryRunner.commitTransaction();
-      return { chapter: this.jsonObject(r.chapter), structureVersionCounter: newCounter, titleNormalized: nt.changed };
+      const chapter = this.jsonObject(r.chapter);
+      // Un capítulo de contenido no informa `kind`: en una base sin la migración de práctica la columna no existe
+      // y el editor solo ofrece la práctica cuando la lectura de la estructura la informa (re-revisión L4, m1).
+      if (!practice && chapter) delete chapter.kind;
+      return { chapter, structureVersionCounter: newCounter, titleNormalized: nt.changed };
     } catch (err) {
       if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
       throw err;
@@ -793,6 +819,7 @@ export class CourseStructureService implements OnModuleInit {
   async updateChapter(courseId: number, moduleId: string, chapterId: string, ownerId: string, dto: UpdateChapterDto) {
     assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     await assertV21StructureSchema(this.dataSource); // V2.1 fix round 1 (I5): 503 si falta la migración R3
+    if (dto.kind !== undefined) await assertPracticeChapterSchema(this.dataSource); // 503 sin la migración de práctica
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();
@@ -837,13 +864,30 @@ export class CourseStructureService implements OnModuleInit {
         }
       } else if (dto.description !== undefined) description = cleanDescription(dto.description);
       if (description !== undefined) { sets.push(`description = $${i++}`); params.push(description); }
-      if (dto.videoEnabled !== undefined) { sets.push(`video_enabled = $${i++}`); params.push(dto.videoEnabled); }
+      // Motor de carga horaria: pasar a práctica apaga el video; un capítulo de práctica nunca lo enciende.
+      if (dto.kind === 'practice' && dto.videoEnabled === true) throw practiceVideoError();
+      // Encender el video sin cambiar el tipo: la guarda va en el mismo UPDATE (sin una ida y vuelta extra); solo si
+      // no actualiza nada se distingue 404 de «es una práctica».
+      const guardPracticeVideo = dto.videoEnabled === true && dto.kind === undefined;
+      if (dto.kind !== undefined) { sets.push(`chapter_kind = $${i++}`); params.push(dto.kind); }
+      if (dto.kind === 'practice') sets.push('video_enabled = false');
+      else if (dto.videoEnabled !== undefined) { sets.push(`video_enabled = $${i++}`); params.push(dto.videoEnabled); }
       if (dto.activityEnabled !== undefined) { sets.push(`activity_enabled = $${i++}`); params.push(dto.activityEnabled); }
 
       const found = await this.updateRowAndBump(
         queryRunner, 'course_chapters', sets, params, i, { id: chapterId, module_id: moduleId, course_id: courseId }, courseId,
+        guardPracticeVideo ? `coalesce(to_jsonb(t) ->> 'chapter_kind', 'content') <> 'practice'` : undefined,
       );
       if (!found.found) {
+        if (guardPracticeVideo) {
+          const exists = await queryRunner.query(
+            `select 1 from public.course_chapters where id = $1 and module_id = $2 and course_id = $3`,
+            [chapterId, moduleId, courseId],
+          );
+          await queryRunner.rollbackTransaction();
+          if (exists.length > 0) throw practiceVideoError();
+          throw notFound();
+        }
         await queryRunner.rollbackTransaction();
         throw notFound();
       }
@@ -1195,10 +1239,11 @@ export class CourseStructureService implements OnModuleInit {
     nextIdx: number,
     where: Record<'id' | 'course_id', string | number> & { module_id?: string },
     courseId: number,
+    extraCond?: string,
   ): Promise<{ found: boolean; counter: number }> {
     const p = params.slice();
     let i = nextIdx;
-    const conds: string[] = [];
+    const conds: string[] = extraCond ? [extraCond] : [];
     for (const [col, v] of Object.entries(where)) {
       if (v === undefined) continue;
       conds.push(`t.${col} = $${i++}`);
