@@ -15,7 +15,7 @@ Curso → perfil del curso (course_profiles kind 'pedagogy') → targetHours →
 - **Lock.** El lock v2 y la comparación «estructura viva = Blueprint» (`computeLiveMatchesCurrentBlueprint`) leen el perfil vigente.
   - Congelan `course.targetHours` en el snapshot **solo si existe**.
   - Cambiar las horas pide reconfirmar la estructura, igual que cambiar el enfoque.
-- **Manifest.** No cambia: los mismos trabajos, `features` y totales. Solo cambia el sha del Blueprint, y con enfoque también el sha del perfil dentro de `pedagogy`.
+- **Manifest.** Los mismos trabajos y totales. Las `features` también son iguales, salvo `features.pedagogy.profileSha256` cuando hay enfoque, porque las horas forman parte del perfil. El sha del Blueprint cambia.
   - La invalidación no regenera nada: cero trabajos y cero proveedores.
 - **Dry-run.** Devuelve `targetHours` y `workload`, que compara las horas objetivo con las estimadas por el modelo de tiempo. Si la entrada trae horas, las toma; si no, usa las del snapshot recibido.
 - **Panel.** Conserva las horas al guardar o quitar el enfoque y al usar la recomendación de «No estoy seguro». La edición llega en el Loop 3.
@@ -35,10 +35,15 @@ Un curso sin `targetHours`, o con un perfil vacío, produce exactamente el Bluep
 - **Rollback.** Una vez que algún curso guardó `targetHours`, volver a un backend anterior a este loop **rompe** esos cursos:
   - el perfil se rechaza por `UNKNOWN_FIELD`;
   - el recanonicalize viejo descarta la clave y el sha del Blueprint no coincide.
-- **Antes de revertir:** guardar en esos cursos un perfil sin `targetHours` y reconfirmar la estructura. En staging se identifican con:
+- **Antes de revertir:**
+  1. Guardar en esos cursos un perfil sin `targetHours` y reconfirmar la estructura.
+  2. Verificar que no haya runs activos sobre Blueprints que contengan `course.targetHours`.
+  3. No reintentar ni reempaquetar con el backend viejo los runs ya terminados sobre esos Blueprints: el backend viejo los recanonicaliza en el scheduler, en `course-blueprints.service` y en `coherence/report`, descarta la clave y falla por sha.
+- **Cómo encontrarlos:**
 
   ```sql
   select course_id from course_profiles where kind = 'pedagogy' and data ? 'targetHours';
+  select course_id, id from course_blueprints where snapshot_json->'course' ? 'targetHours';
   ```
 
 ## Pruebas
