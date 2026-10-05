@@ -866,14 +866,9 @@ export class CourseStructureService implements OnModuleInit {
       if (description !== undefined) { sets.push(`description = $${i++}`); params.push(description); }
       // Motor de carga horaria: pasar a práctica apaga el video; un capítulo de práctica nunca lo enciende.
       if (dto.kind === 'practice' && dto.videoEnabled === true) throw practiceVideoError();
-      if (dto.videoEnabled === true && dto.kind === undefined) {
-        const [cur] = await queryRunner.query(
-          `select coalesce(to_jsonb(ch) ->> 'chapter_kind', 'content') as kind from public.course_chapters ch where id = $1 and module_id = $2 and course_id = $3`,
-          [chapterId, moduleId, courseId],
-        );
-        if (!cur) { await queryRunner.rollbackTransaction(); throw notFound(); }
-        if (cur.kind === 'practice') throw practiceVideoError();
-      }
+      // Encender el video sin cambiar el tipo: la guarda va en el mismo UPDATE (sin una ida y vuelta extra); solo si
+      // no actualiza nada se distingue 404 de «es una práctica».
+      const guardPracticeVideo = dto.videoEnabled === true && dto.kind === undefined;
       if (dto.kind !== undefined) { sets.push(`chapter_kind = $${i++}`); params.push(dto.kind); }
       if (dto.kind === 'practice') sets.push('video_enabled = false');
       else if (dto.videoEnabled !== undefined) { sets.push(`video_enabled = $${i++}`); params.push(dto.videoEnabled); }
@@ -881,8 +876,18 @@ export class CourseStructureService implements OnModuleInit {
 
       const found = await this.updateRowAndBump(
         queryRunner, 'course_chapters', sets, params, i, { id: chapterId, module_id: moduleId, course_id: courseId }, courseId,
+        guardPracticeVideo ? `coalesce(to_jsonb(t) ->> 'chapter_kind', 'content') <> 'practice'` : undefined,
       );
       if (!found.found) {
+        if (guardPracticeVideo) {
+          const exists = await queryRunner.query(
+            `select 1 from public.course_chapters where id = $1 and module_id = $2 and course_id = $3`,
+            [chapterId, moduleId, courseId],
+          );
+          await queryRunner.rollbackTransaction();
+          if (exists.length > 0) throw practiceVideoError();
+          throw notFound();
+        }
         await queryRunner.rollbackTransaction();
         throw notFound();
       }
@@ -1234,10 +1239,11 @@ export class CourseStructureService implements OnModuleInit {
     nextIdx: number,
     where: Record<'id' | 'course_id', string | number> & { module_id?: string },
     courseId: number,
+    extraCond?: string,
   ): Promise<{ found: boolean; counter: number }> {
     const p = params.slice();
     let i = nextIdx;
-    const conds: string[] = [];
+    const conds: string[] = extraCond ? [extraCond] : [];
     for (const [col, v] of Object.entries(where)) {
       if (v === undefined) continue;
       conds.push(`t.${col} = $${i++}`);
