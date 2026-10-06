@@ -1,4 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { academicBlueprintContext, loadCurrentAcademicContext } from '../academic-context/academic-db';
 import { DataSource } from 'typeorm';
 import { CoursesService } from '../courses/courses.service';
 import {
@@ -114,16 +115,20 @@ export class PedagogyService {
     const chapters: RawChapterRowV2[] = await this.dataSource.query(
       `select id, module_id, position, title, objective, description, video_enabled, activity_enabled,
               to_jsonb(course_chapters) ->> 'chapter_kind' as chapter_kind,
-                to_jsonb(course_chapters) ->> 'application_minutes' as application_minutes
+                to_jsonb(course_chapters) ->> 'application_minutes' as application_minutes,
+                to_jsonb(course_chapters) -> 'outcome_ids' as outcome_ids
          from public.course_chapters where course_id = $1`,
       [courseId],
     );
+    // Fase 3: el contexto académico guardado entra al Blueprint en memoria igual que en el lock.
+    const academic = await loadCurrentAcademicContext(this.dataSource, courseId);
     const courseRef = {
       id: row.id,
       title: row.title,
       finalExam: row.final_exam_enabled,
       activityEngine: row.activity_engine,
       reviewCards: row.review_cards_enabled === true,
+      academicContext: academic ? academicBlueprintContext(academic.context, academic.sha256) : null,
     };
     const errors = validateBlueprintInputV2(courseRef, modules, chapters);
     if (errors.length > 0) {

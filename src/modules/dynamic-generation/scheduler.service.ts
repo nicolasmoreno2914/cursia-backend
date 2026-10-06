@@ -1835,8 +1835,9 @@ export class SchedulerService {
     const v3 = await this.buildClaimV3(qr, row, mItem, manifest, snapshot);
 
     // Motor pedagógico Fase 2: el diseño del item (Manifest validado arriba contra el Blueprint) → brief del generador.
+    // Fase 3: también con contexto académico congelado (los resultados que el item debe evidenciar van en el brief).
     let pedagogy: ItemPedagogyBrief | null = null;
-    if (snapshot.schemaVersion === 2 && (mItem as any).design !== undefined) {
+    if (snapshot.schemaVersion === 2 && ((mItem as any).design !== undefined || (snapshot as any).course?.academicContext !== undefined)) {
       try {
         pedagogy = buildItemPedagogyBrief({ item: mItem as any, snapshot, activityTypeRules: (manifest as any).features?.activityTypeRules ?? null });
       } catch (err) {

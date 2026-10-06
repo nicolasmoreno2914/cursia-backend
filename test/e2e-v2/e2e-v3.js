@@ -256,6 +256,11 @@ async function createCourse(C, llm) {
   const c = await api('POST', '/courses/dynamic', { frontendCourseId: fc, title: C.title });
   ok(c.status === 201, `${C.key}: POST /courses/dynamic → 201`, { s: c.status, e: c.error });
   const courseId = Number(c.data.id);
+  // Fase 3: contexto académico guardado ANTES de crear los capítulos (los vínculos solo apuntan a un contexto guardado).
+  if (C.academic) {
+    const pa = await api('POST', `/courses/${courseId}/profiles/academic`, { data: C.academic, expectedVersion: 0 });
+    ok(pa.status === 201, `${C.key}: POST profiles/academic → 201`, { s: pa.status, e: pa.error });
+  }
   let st = await readStructure(courseId);
   let counter = st.structureVersionCounter;
   for (const m of st.modules) counter = (await api('DELETE', `/courses/${courseId}/modules/${m.id}`, { expectedCounter: counter })).data.structureVersionCounter;
@@ -275,6 +280,9 @@ async function createCourse(C, llm) {
       // Fase 2: capítulo de práctica y Actividad de Aplicación (minutos) cuando el escenario los pide.
       if (cs.kind) body.kind = cs.kind;
       if (cs.app) body.applicationMinutes = cs.app;
+      // Fase 3: descripción y vínculos a resultados del contexto académico.
+      if (cs.description) body.description = cs.description;
+      if (cs.outcomeIds) body.outcomeIds = cs.outcomeIds;
       const isAuto = i === 0 && auto.length === 1;
       const r = isAuto
         ? await api('PATCH', `/courses/${courseId}/modules/${mid}/chapters/${auto[0].id}`, body)
@@ -1232,6 +1240,165 @@ function reservationBookkeeping(ev) {
       const pg2 = await pagesOf(P2.buf);
       ok(pg2.get(`cv3:ch:${chPractice}:application_solution`).visible === 0 && pg2.get(`cv3:ch:${chContent}:application`).visible === 1, 'E7: reempaque tras regenerar: páginas y solucionario oculto intactos');
       results.courses.E7.regeneration = { key, dryRunAffected: dry.data.affected.map((x) => x.itemKey), llmCalls: kinds };
+    }, { fatal: false });
+
+
+    // ═══ Fase 3 · Contexto académico — E8: microcurrículo (DOCX real) → contexto → perfil → 64 h → diseño → Blueprint → Manifest ═══
+    // Sin proveedores: la extracción es determinista y el run no se ejecuta (un claim real comprueba el brief y se cancela).
+    if (RUN_E5) await step('v3-E8-contexto-academico-diseno', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const fc = crypto.randomUUID();
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: fc, title: '[E2E Contexto E8] Contabilidad de Costos' });
+      ok(cr.status === 201, 'E8: POST /courses/dynamic → 201', { s: cr.status, e: cr.error });
+      const courseId = Number(cr.data.id);
+      // 1. Documento → extracción (sin guardar, sin proveedores)
+      const docx = await AF.fixture('consistent', 'docx');
+      const net0 = fs.existsSync(NET_LOG) ? fs.readFileSync(NET_LOG, 'utf8').length : 0;
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo-costos.docx', dataBase64: docx.toString('base64') }] });
+      ok(ex.status === 200 && ex.data.saved === false && ex.data.stats.providersCalled === 0, 'E8: extract → 200, determinista, sin guardar y sin proveedores', { s: ex.status, e: ex.error });
+      const draft = ex.data.draft;
+      eq([draft.identity.subjectName.value, draft.outcomes.length, draft.competencies.length, draft.units.length, draft.hours.total.value, draft.evaluation.length], ['Contabilidad de Costos', 6, 2, 5, 64, 5], 'E8: el contexto trae asignatura, 6 RA, 2 competencias, 5 unidades, 64 h y 5 evaluaciones');
+      eq([ex.data.validation.canProceed, ex.data.validation.counts], [true, { error: 0, warning: 0, missing: 0 }], 'E8: validación limpia');
+      eq((await q(`select count(*)::int n from public.course_profiles where course_id = $1`, [courseId]))[0].n, 0, 'E8: la extracción no guardó nada');
+      ok(!fs.existsSync(NET_LOG) || fs.readFileSync(NET_LOG, 'utf8').length === net0, 'E8: 0 conexiones fuera de 127.0.0.1 durante la extracción');
+      const bad = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'foto.bin', dataBase64: Buffer.from([0, 1, 2, 3, 255]).toString('base64') }] });
+      ok(bad.status === 400 && /UNSUPPORTED_DOCUMENT/.test(String(bad.error)), 'E8: archivo no soportado → 400 UNSUPPORTED_DOCUMENT', { s: bad.status, e: bad.error });
+      const inc = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'inconsistente.pdf', dataBase64: (await AF.fixture('inconsistent', 'pdf')).toString('base64') }] });
+      ok(inc.status === 200 && inc.data.validation.issues.some((i) => i.message === 'El documento indica 64 horas, pero la suma de componentes reportada es 48 horas.'), 'E8: PDF inconsistente → advertencia de horas exacta (sin bloquear)', inc.data && inc.data.validation && inc.data.validation.counts);
+      // 2. Guardar (versionado) — sin contexto, vincular resultados responde 400
+      let st = await readStructure(courseId);
+      const [m0] = st.modules;
+      const pre = await api('PATCH', `/courses/${courseId}/modules/${m0.id}/chapters/${m0.chapters[0].id}`, { outcomeIds: ['RA1'], expectedCounter: st.structureVersionCounter });
+      ok(pre.status === 400 && /NO_ACADEMIC_CONTEXT/.test(String(pre.error)), 'E8: vincular sin contexto guardado → 400 NO_ACADEMIC_CONTEXT', { s: pre.status, e: pre.error });
+      const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: draft, expectedVersion: 0 });
+      ok(sv.status === 201 && sv.data.profile.version === 1 && sv.data.profile.academicValidation.canProceed === true, 'E8: POST profiles/academic → 201 (versión 1, con validación)', { s: sv.status, e: sv.error });
+      const again = await api('POST', `/courses/${courseId}/profiles/academic`, { data: draft });
+      ok(again.status === 200 && again.data.created === false, 'E8: guardar el mismo contexto es idempotente (200, sin versión nueva)', { s: again.status });
+      // 3. Diseño desde el contexto
+      const dz = await api('GET', `/courses/${courseId}/academic-context/design`);
+      ok(dz.status === 200 && dz.data.available === true && dz.data.providersCalled === 0, 'E8: GET design → 200', { s: dz.status, e: dz.error });
+      const sug = dz.data.profileSuggestion;
+      const prop = dz.data.structureProposal;
+      eq([sug.profile.targetHours, sug.profile.learningOutcomes.do.length, sug.approachHints], [64, 5, ['problemas']], 'E8: el contexto sugiere 64 h, 5 resultados de saber hacer y nombra ABP');
+      eq([prop.counts.modules, prop.counts.chapters, prop.counts.outcomesCovered], [5, 18, 6], 'E8: estructura propuesta 5 × 18 con los 6 RA vinculados');
+      // 4. Perfil pedagógico desde el contexto (+ el enfoque que elige el docente)
+      const profile = { ...sug.profile, primaryApproach: 'problemas', secondaryApproaches: [] };
+      const pg = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: profile, expectedVersion: 0 });
+      ok(pg.status === 201 && pg.data.profile.profile.targetHours === 64, 'E8: perfil pedagógico guardado con las 64 h y los resultados del documento', { s: pg.status, e: pg.error });
+      // 5. Estructura desde el microcurrículo (lo que hace el panel con la vía de 48), con descripción y vínculos
+      st = await readStructure(courseId);
+      let counter = st.structureVersionCounter;
+      for (let mi = 0; mi < prop.modules.length; mi++) {
+        const pm = prop.modules[mi];
+        let mod;
+        if (mi === 0) {
+          mod = st.modules[0];
+          const u = await api('PATCH', `/courses/${courseId}/modules/${mod.id}`, { title: pm.title, objective: pm.objective, description: pm.description || undefined, examEnabled: true, expectedCounter: counter });
+          counter = u.data.structureVersionCounter;
+          mod = { ...mod, chapters: mod.chapters };
+        } else {
+          const cm = await api('POST', `/courses/${courseId}/modules`, { title: pm.title, objective: pm.objective, examEnabled: true, expectedCounter: counter });
+          counter = cm.data.structureVersionCounter;
+          mod = cm.data.module;
+        }
+        for (let ci = 0; ci < pm.chapters.length; ci++) {
+          const pc = pm.chapters[ci];
+          const body = { title: pc.title, videoEnabled: pc.videoEnabled, activityEnabled: pc.activityEnabled, ...(pc.description ? { description: pc.description } : {}), ...(pc.outcomeIds.length ? { outcomeIds: pc.outcomeIds } : {}), expectedCounter: counter };
+          const auto = (mod.chapters || [])[0];
+          const r = ci === 0 && auto ? await api('PATCH', `/courses/${courseId}/modules/${mod.id}/chapters/${auto.id}`, body) : await api('POST', `/courses/${courseId}/modules/${mod.id}/chapters`, body);
+          if (![200, 201].includes(r.status)) throw new Error(`E8 capítulo ${pc.title}: ${r.status} ${r.error}`);
+          counter = r.data.structureVersionCounter;
+        }
+      }
+      st = await readStructure(courseId);
+      eq(st.modules.map((m) => m.chapters.length), [4, 4, 4, 3, 3], 'E8: estructura viva = la del microcurrículo');
+      eq(st.modules[4].chapters.map((c) => c.outcomeIds), [['RA5', 'RA6'], ['RA5'], ['RA5', 'RA6']], 'E8: vínculos persistidos y devueltos por el GET (orden canónico)');
+      const badLink = await api('PATCH', `/courses/${courseId}/modules/${st.modules[0].id}/chapters/${st.modules[0].chapters[0].id}`, { outcomeIds: ['RA9'], expectedCounter: st.structureVersionCounter });
+      ok(badLink.status === 400 && /UNKNOWN_OUTCOME_REF/.test(String(badLink.error)), 'E8: vincular un resultado inexistente → 400 UNKNOWN_OUTCOME_REF', { s: badLink.status, e: badLink.error });
+      // 6. 64 h: dry-run del distribuidor con la estructura del documento → aplicar el diseño
+      const dr = await api('POST', `/courses/${courseId}/pedagogy/dry-run`, {});
+      const dist = dr.data && dr.data.distribution;
+      ok(dr.status === 201 || dr.status === 200, 'E8: dry-run del curso → OK', { s: dr.status, e: dr.error });
+      ok(dist && dist.status === 'within_tolerance' && dist.targetHours === 64 && dist.materialized.manifestErrors.length === 0, 'E8: con el microcurrículo, 64 h quedan DENTRO de la tolerancia (la estructura 3 × 3 del baseline no alcanzaba)', dist && { status: dist.status, h: dist.estimatedHours, c: dist.counts });
+      ok(dr.data.pedagogical && dr.data.pedagogical.blueprint.course.academicContext && dr.data.pedagogical.blueprint.course.academicContext.outcomes.length === 6, 'E8: el Blueprint del dry-run lleva el contexto académico congelado');
+      const ap = await api('POST', `/courses/${courseId}/modules/apply-distribution`, { expectedCounter: st.structureVersionCounter, proposalSha256: dist.proposalSha256 });
+      ok([200, 201].includes(ap.status) && ap.data.addedChapters >= 1, 'E8: «Aplicar diseño» → estructura con la práctica y las Actividades de Aplicación del diseño', { s: ap.status, e: ap.error, d: ap.data });
+      st = await readStructure(courseId);
+      const linkedBefore = st.modules.flatMap((m) => m.chapters).filter((c) => Array.isArray(c.outcomeIds)).length;
+      eq(linkedBefore, 18, 'E8: «Aplicar diseño» no tocó los vínculos de los capítulos');
+      // 7. Lock → Blueprint con contexto y vínculos; Manifest válido
+      const lock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st.structureVersionCounter });
+      ok(lock.status === 201, 'E8: lock → 201', { s: lock.status, e: lock.error });
+      const snap = lock.data.blueprint.snapshot;
+      const ac = snap.course.academicContext;
+      ok(ac && ac.outcomes.map((o) => o.id).join() === 'RA1,RA2,RA3,RA4,RA5,RA6' && ac.competencies.length === 2 && ac.contextSha256 === sv.data.profile.sha256, 'E8: Blueprint congela los resultados y competencias del contexto (con su huella)', ac && { o: ac.outcomes.length, sha: ac.contextSha256 });
+      eq(snap.modules.flatMap((m) => m.chapters).filter((c) => c.outcomeIds).length, 18, 'E8: Blueprint con los vínculos de los 18 capítulos del documento');
+      ok(snap.course.pedagogy && snap.course.targetHours === 64, 'E8: Blueprint con el diseño pedagógico y las 64 h');
+      const st2 = await readStructure(courseId);
+      ok(st2.liveMatchesCurrentBlueprint === true, 'E8: la estructura viva coincide con el Blueprint (el contexto entra igual en la comparación)');
+      const n = lock.data.blueprint.blueprintNumber;
+      const man = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest`);
+      ok(man.status === 201 && man.data.manifest.rulesVersion === 3, 'E8: Manifest v3 → 201', { s: man.status, e: man.error });
+      const M = man.data.manifest.manifest;
+      ok(M.totals.applicationActivityCount >= 18 && M.modules.length === 5, 'E8: Manifest con 5 módulos y las Actividades de Aplicación del diseño', M.totals);
+      // 8. El brief REAL del claim lleva los resultados (sin generar nada: el run se cancela)
+      const run = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest/runs`, { nombre: 'E8', ...CTX, scormTemplateIds: S.templates, videoMode: 'mock', providerModes: { presentation: 'mock', audio: 'mock' } });
+      ok(run.status === 201, 'E8: run creado (no se ejecuta)', { s: run.status, e: run.error });
+      const runId = run.data.run.id;
+      const cl = await api('POST', '/dynamic-generation/claim?features=pedagogy-brief-1,application-activity-1', { runId, executorId: 'e2e-e8-probe', types: ['course_plan'], leaseSeconds: 30 });
+      const item = cl.data && (cl.data.item || (cl.data.items && cl.data.items[0]));
+      const brief = item && item.pedagogy;
+      ok(cl.status === 200 || cl.status === 201, 'E8: claim del plan del curso', { s: cl.status, e: cl.error });
+      ok(brief && /RESULTADOS DE APRENDIZAJE QUE ESTE RECURSO DEBE EVIDENCIAR/.test(brief.text) && brief.outcomes && brief.outcomes.join() === 'RA1,RA2,RA3,RA4,RA5,RA6,CO1,CO2' && brief.text.length <= 4000,
+        'E8: el claim entrega el brief con los 6 RA y 2 competencias que el plan debe cubrir', brief && { outcomes: brief.outcomes, len: brief.text.length });
+      const cancel = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest/runs/${runId}/cancel`, {});
+      ok([200, 201].includes(cancel.status), 'E8: run de prueba cancelado (nada se generó)', { s: cancel.status, e: cancel.error });
+      results.courses.E8 = { courseId, blueprintNumber: n, hours: dist.estimatedHours, counts: dist.counts, outcomes: ac.outcomes.length, manifestTotals: M.totals, usd: dist.materialized.providers.estimateUsd.expected };
+    }, { fatal: false });
+
+    // E8-mini: curso chico desde su microcurrículo, generado de punta a punta con el ejecutor REAL del navegador (LLM falso):
+    // los resultados vinculados llegan a los prompts del contenido, la actividad y el examen; empaque OK.
+    if (RUN_E5) await step('v3-E8-contexto-academico-generacion', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const AC = D('modules/academic-context/index.js');
+      const ext = await AC.extractAcademicContext([{ name: 'mini.docx', data: await AF.fixture('mini', 'docx') }]);
+      const prop = AC.proposeStructureFromContext(ext.context);
+      const C = { key: 'E8m', title: '[E2E Contexto E8-mini] Inspección de circuitos hidráulicos', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'h5p', academic: ext.context,
+        modules: prop.modules.map((m) => ({ title: m.title, objective: m.objective, exam: true, chapters: m.chapters.map((c) => ({ title: c.title, v: false, a: true, objective: `Aplicar ${c.title.toLowerCase()}`, description: c.description || undefined, outcomeIds: c.outcomeIds })) })) };
+      const c = await createCourse(C, llm);
+      S.E8m = c;
+      const bp = (await api('GET', `/courses/${c.courseId}/blueprints/${c.n}`)).data;
+      const snap = bp && (bp.snapshot || (bp.blueprint && bp.blueprint.snapshot));
+      ok(snap && snap.course.academicContext && snap.modules[0].chapters[0].outcomeIds.join() === 'RA1,RA2', 'E8-mini: Blueprint con el contexto y los vínculos', snap && snap.modules[0].chapters[0].outcomeIds);
+      const start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, { nombre: C.title, ...CTX, scormTemplateIds: S.templates, videoMode: 'mock', providerModes: { presentation: 'mock', audio: 'mock' } });
+      ok(start.status === 201, 'E8-mini: run 100 % mock creado', { s: start.status, e: start.error });
+      if (start.status !== 201) throw new Error(`E8-mini: run no creado: ${start.status} ${start.error}`);
+      c.runId = start.data.run.id;
+      llm.st.tag = 'E8m';
+      const prompts = [];
+      const respond0 = llm.respond;
+      llm.respond = (b, h) => { prompts.push(b); return respond0(b, h); };
+      let stt;
+      try {
+        const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
+        stt = await waitRunTerminal(ctl, 'E8-mini run', undefined, c.runId);
+      } finally {
+        llm.respond = respond0;
+      }
+      const items = await waitItemsDone(c.runId);
+      ok(['preview', 'completed'].includes(stt.status) && stt.failed === 0 && !stt.fatalError, 'E8-mini: el ejecutor del navegador terminó sin fallidos', stt);
+      ok(items.every((i) => i.status === 'completed'), `E8-mini: los ${items.length} items completed`, items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, i.error_message && i.error_message.slice(0, 300)]));
+      ok(llm.st.unknown.length === 0, 'E8-mini: LLM falso sin prompts no reconocidos', llm.st.unknown);
+      const textOf = (b) => (b.messages || []).map((m) => (typeof m.content === 'string' ? m.content : (m.content || []).map((x) => x.text || '').join(''))).join('\n');
+      const all = prompts.map(textOf);
+      const withBlock = all.filter((t) => t.includes('RESULTADOS DE APRENDIZAJE QUE ESTE RECURSO DEBE EVIDENCIAR'));
+      ok(withBlock.length >= 6, `E8-mini: ${withBlock.length} prompts con el bloque de resultados (plan, contenido, actividades, exámenes)`, withBlock.length);
+      ok(withBlock.some((t) => /RA3 \(saber hacer · aplicar\): Ajustar la válvula de alivio/.test(t) && /evidencia observable/.test(t)), 'E8-mini: la actividad del capítulo de ajuste pide evidencia de RA3');
+      ok(withBlock.some((t) => /al menos una pregunta/.test(t) && t.includes('RA1') && t.includes('RA2')), 'E8-mini: el examen del módulo 1 cubre RA1 y RA2');
+      ok(all.filter((t) => t.includes('RESULTADOS DE APRENDIZAJE QUE ESTE RECURSO DEBE EVIDENCIAR')).every((t) => !/RA9/.test(t)), 'E8-mini: ningún resultado inventado');
+      const P = await packageRun('E8m', c.courseId, c.n, c.runId);
+      ok(P && P.buf && P.buf.length > 0, 'E8-mini: paquete .mbz construido (el contexto no cambia el empaque)');
+      results.courses.E8m = { courseId: c.courseId, runId: c.runId, items: items.length, promptsWithOutcomes: withBlock.length };
     }, { fatal: false });
 
     // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══

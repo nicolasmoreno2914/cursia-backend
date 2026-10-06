@@ -4,6 +4,9 @@ import { loadCurrentPedagogicalProfile, parseStoredPedagogicalProfile } from '..
 import { runPedagogyDryRun } from '../pedagogy/dry-run';
 import { ApplyDistributionDto } from './dto/apply-distribution.dto';
 import { profileApplicationContext, profileTargetHours } from '../pedagogy/pedagogy-profile';
+import { academicBlueprintContext, loadCurrentAcademicContext, parseStoredAcademicContext } from '../academic-context/academic-db';
+import { AcademicBlueprintContext, rawOutcomeIds, sortOutcomeIds } from '../academic-context/blueprint-academic';
+import { academicOutcomeIds } from '../academic-context/academic-context';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
 import { CourseModule as CourseModuleEntity } from './entities/course-module.entity';
@@ -31,7 +34,7 @@ import {
   snapshotSha256V2,
   validateBlueprintInputV2,
 } from '../course-blueprints/blueprint-snapshot';
-import { assertApplicationActivitySchema, assertPracticeChapterSchema, assertV21StructureSchema, probeV21StructureSchema } from './v21-schema-guard';
+import { assertAcademicContextSchema, assertApplicationActivitySchema, assertPracticeChapterSchema, assertV21StructureSchema, probeV21StructureSchema } from './v21-schema-guard';
 import { isApplicationMinutes } from '../study-time/application-tiers';
 import {
   CHAPTER_TITLE_TOO_LONG,
@@ -90,6 +93,28 @@ function applicationMinutesOrThrow(v: unknown): number | null {
     throw new BadRequestException({ code: 'INVALID_APPLICATION_MINUTES', message: `INVALID_APPLICATION_MINUTES: los minutos de la Actividad de Aplicación deben ser 30, 60, 90 o 120 (fue ${JSON.stringify(v)})` });
   }
   return v;
+}
+
+/**
+ * Fase 3: vínculos del capítulo → ids ordenados (o null = sin vínculos). Cada id debe existir en el contexto
+ * académico VIGENTE del curso (leído en la misma transacción); sin contexto no se puede vincular.
+ */
+async function outcomeIdsOrThrow(q: QueryRunner, courseId: number, v: string[] | null): Promise<string[] | null> {
+  if (v === null || v.length === 0) return null;
+  const ids = rawOutcomeIds(v);
+  if (ids === 'invalid' || ids === undefined) {
+    throw new BadRequestException({ code: 'INVALID_OUTCOME_IDS', message: `INVALID_OUTCOME_IDS: los vínculos deben ser de 1 a 8 ids RA… / CO… sin repetir (fue ${JSON.stringify(v)})` });
+  }
+  const academic = await loadCurrentAcademicContext(q, courseId);
+  if (!academic) {
+    throw new BadRequestException({ code: 'NO_ACADEMIC_CONTEXT', message: 'NO_ACADEMIC_CONTEXT: el curso no tiene contexto académico guardado; guarda el contexto antes de vincular resultados a los capítulos.' });
+  }
+  const known = academicOutcomeIds(academic.context);
+  const unknown = ids.filter((x) => !known.has(x));
+  if (unknown.length) {
+    throw new BadRequestException({ code: 'UNKNOWN_OUTCOME_REF', message: `UNKNOWN_OUTCOME_REF: ${unknown.join(', ')} no existe(n) en el contexto académico del curso (versión ${academic.version}).` });
+  }
+  return sortOutcomeIds(ids);
 }
 
 function practiceVideoError(): BadRequestException {
@@ -233,11 +258,14 @@ export class CourseStructureService implements OnModuleInit {
       const chapters = await queryRunner.query(
         `select id, module_id, position, title, objective, description, video_enabled, activity_enabled,
                 to_jsonb(course_chapters) ->> 'chapter_kind' as chapter_kind,
-                to_jsonb(course_chapters) ->> 'application_minutes' as application_minutes
+                to_jsonb(course_chapters) ->> 'application_minutes' as application_minutes,
+                to_jsonb(course_chapters) -> 'outcome_ids' as outcome_ids
            from public.course_chapters where course_id = $1`,
         [courseId],
       );
       const saved = await loadCurrentPedagogicalProfile(queryRunner, courseId);
+      // Fase 3: el contexto académico entra al Blueprint en memoria igual que en el lock (misma propuesta, misma huella).
+      const academic = await loadCurrentAcademicContext(queryRunner, courseId);
       // Review M2: un perfil o una estructura que el motor no puede evaluar es un 400 (como en pedagogy.service), no un 500.
       const asBad = async <T>(fn: () => T): Promise<T> => {
         try {
@@ -254,6 +282,7 @@ export class CourseStructureService implements OnModuleInit {
       const courseRef = {
         id: course.id, title: course.title, finalExam: course.final_exam_enabled, activityEngine: course.activity_engine,
         reviewCards: course.review_cards_enabled === true,
+        academicContext: academic ? academicBlueprintContext(academic.context, academic.sha256) : null,
       };
       const errors = validateBlueprintInputV2(courseRef, modules, chapters);
       if (errors.length) {
@@ -357,6 +386,9 @@ export class CourseStructureService implements OnModuleInit {
               -- Fase 2 · Actividades de Aplicación: ¿la base tiene course_chapters.application_minutes? (misma sentencia)
               exists (select 1 from information_schema.columns
                        where table_schema = 'public' and table_name = 'course_chapters' and column_name = 'application_minutes') as app_col,
+              -- Fase 3 · Contexto académico: ¿la base tiene course_chapters.outcome_ids? (misma sentencia)
+              exists (select 1 from information_schema.columns
+                       where table_schema = 'public' and table_name = 'course_chapters' and column_name = 'outcome_ids') as oid_col,
               b.id as bp_id, b.blueprint_number as bp_number, b.locked_at as bp_locked_at,
               b.snapshot_sha256 as bp_sha256, b.schema_version as bp_schema_version,
               -- Motor pedagógico V1 (review I1): perfil pedagógico vigente en la MISMA sentencia (sin ida y vuelta extra).
@@ -364,6 +396,11 @@ export class CourseStructureService implements OnModuleInit {
                  from public.course_profiles p
                 where p.course_id = c.id and p.kind = 'pedagogy' and b.schema_version = 2
                 order by p.version desc limit 1) as ped_row,
+              -- Fase 3: contexto académico vigente (solo con Blueprint v2 vigente: entra a la comparación del lock).
+              (select json_build_object('id', p.id, 'version', p.version, 'data', p.data, 'sha256', p.sha256)
+                 from public.course_profiles p
+                where p.course_id = c.id and p.kind = 'academic' and b.schema_version = 2
+                order by p.version desc limit 1) as acad_row,
               coalesce((
                 select json_agg(json_build_object(
                          'id', m.id, 'position', m.position, 'title', m.title, 'objective', m.objective,
@@ -376,7 +413,9 @@ export class CourseStructureService implements OnModuleInit {
                                     -- Motor de carga horaria: sin la migración la clave viene null (y el editor no ofrece la práctica).
                                     'kind', to_jsonb(ch) ->> 'chapter_kind',
                                     -- Fase 2: sin la migración la clave no existe en la fila (app_col = false).
-                                    'applicationMinutes', to_jsonb(ch) ->> 'application_minutes') order by ch.position, ch.id)
+                                    'applicationMinutes', to_jsonb(ch) ->> 'application_minutes',
+                                    -- Fase 3: sin la migración la clave no existe en la fila (oid_col = false).
+                                    'outcomeIds', to_jsonb(ch) -> 'outcome_ids') order by ch.position, ch.id)
                              from public.course_chapters ch where ch.module_id = m.id and ch.course_id = c.id), '[]'::json)
                        ) order by m.position, m.id)
                   from public.course_modules m where m.course_id = c.id), '[]'::json) as modules
@@ -407,6 +446,9 @@ export class CourseStructureService implements OnModuleInit {
     // Fase 2: minutos de aplicación por capítulo (null = sin actividad); vacío si la base no tiene la columna.
     const appCol = row.app_col === true;
     const applicationByChapter = new Map<string, number | null>();
+    // Fase 3: vínculos a resultados por capítulo (null = sin vínculos); vacío si la base no tiene la columna.
+    const oidCol = row.oid_col === true;
+    const outcomesByChapter = new Map<string, string[] | null>();
     const modules = rawModules.map((m) => ({
       id: m.id as string,
       position: Number(m.position),
@@ -426,6 +468,11 @@ export class CourseStructureService implements OnModuleInit {
           const am = c.applicationMinutes === null || c.applicationMinutes === undefined ? null : Number(c.applicationMinutes);
           if (am !== null && !isApplicationMinutes(am)) throw new Error(`Capítulo ${c.id}: application_minutes ilegible (${JSON.stringify(c.applicationMinutes)})`);
           applicationByChapter.set(c.id, am);
+        }
+        if (oidCol) {
+          const ids = rawOutcomeIds(c.outcomeIds);
+          if (ids === 'invalid') throw new Error(`Capítulo ${c.id}: outcome_ids ilegible (${JSON.stringify(c.outcomeIds)})`);
+          outcomesByChapter.set(c.id, ids ?? null);
         }
         return {
           id: c.id as string,
@@ -461,7 +508,19 @@ export class CourseStructureService implements OnModuleInit {
         this.logger.warn(`readStructure: perfil pedagógico ilegible del curso #${courseId} — ${err instanceof Error ? err.message : String(err)}`);
       }
     }
-    const liveMatchesCurrentBlueprint = !pedagogyUnreadable && this.computeLiveMatchesCurrentBlueprint(
+    // Fase 3: el contexto académico vigente entra a la comparación igual que en el lock (ilegible → false).
+    let academicBp: AcademicBlueprintContext | null = null;
+    let academicUnreadable = false;
+    if (currentBlueprint && currentBlueprint.schemaVersion === 2 && row.acad_row) {
+      try {
+        const a = parseStoredAcademicContext(typeof row.acad_row === 'string' ? JSON.parse(row.acad_row) : row.acad_row, courseId);
+        academicBp = academicBlueprintContext(a.context, a.sha256);
+      } catch (err) {
+        academicUnreadable = true;
+        this.logger.warn(`readStructure: contexto académico ilegible del curso #${courseId} — ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    const liveMatchesCurrentBlueprint = !pedagogyUnreadable && !academicUnreadable && this.computeLiveMatchesCurrentBlueprint(
       course,
       modules,
       currentBlueprint,
@@ -470,6 +529,8 @@ export class CourseStructureService implements OnModuleInit {
       pedagogyProfile,
       kindByChapter,
       applicationByChapter,
+      outcomesByChapter,
+      academicBp,
     );
 
     return {
@@ -501,6 +562,8 @@ export class CourseStructureService implements OnModuleInit {
           ...(kindByChapter.has(c.id) ? { kind: kindByChapter.get(c.id) as 'content' | 'practice' } : {}),
           // Fase 2: la clave existe SOLO si la base tiene la columna (el editor ofrece la actividad solo entonces).
           ...(applicationByChapter.has(c.id) ? { applicationMinutes: applicationByChapter.get(c.id) as number | null } : {}),
+          // Fase 3: la clave existe SOLO si la base tiene la columna (el editor ofrece los vínculos solo entonces).
+          ...(outcomesByChapter.has(c.id) ? { outcomeIds: outcomesByChapter.get(c.id) as string[] | null } : {}),
         })),
       })),
       currentBlueprint,
@@ -566,6 +629,8 @@ export class CourseStructureService implements OnModuleInit {
     pedagogyProfile: unknown = null,
     kindByChapter?: Map<string, 'content' | 'practice'>,
     applicationByChapter?: Map<string, number | null>,
+    outcomesByChapter?: Map<string, string[] | null>,
+    academicBp: AcademicBlueprintContext | null = null,
   ): boolean {
     if (!currentBlueprint) return false;
     try {
@@ -588,6 +653,7 @@ export class CourseStructureService implements OnModuleInit {
             video_enabled: c.videoEnabled, activity_enabled: activityByChapter.get(c.id) as boolean,
             chapter_kind: kindByChapter?.get(c.id) ?? 'content',
             application_minutes: applicationByChapter?.get(c.id) ?? null,
+            outcome_ids: outcomesByChapter?.get(c.id) ?? null,
           })),
         );
         const courseV2 = {
@@ -595,6 +661,7 @@ export class CourseStructureService implements OnModuleInit {
           // Motor de carga horaria: las horas objetivo del perfil también entran al snapshot del lock.
           targetHours: profileTargetHours(pedagogyProfile),
           applicationContext: profileApplicationContext(pedagogyProfile),
+          academicContext: academicBp,
         };
         const plainV2 = buildBlueprintSnapshotV2(courseV2, rawModulesV2, rawChaptersV2);
         const pedagogy = lockPedagogyInput(plainV2, pedagogyProfile);
@@ -899,6 +966,7 @@ export class CourseStructureService implements OnModuleInit {
     // Fase 2: minutos de la Actividad de Aplicación (null = sin actividad, igual que omitirla al crear).
     const appMinutes = dto.applicationMinutes === undefined ? undefined : applicationMinutesOrThrow(dto.applicationMinutes);
     if (dto.applicationMinutes !== undefined) await assertApplicationActivitySchema(this.dataSource); // 503 sin la migración
+    if (dto.outcomeIds !== undefined) await assertAcademicContextSchema(this.dataSource); // Fase 3: 503 sin la migración
     const withApp = typeof appMinutes === 'number';
     const queryRunner = this.dataSource.createQueryRunner();
     try {
@@ -958,8 +1026,15 @@ export class CourseStructureService implements OnModuleInit {
         throw notFound();
       }
       const newCounter = this.counterOrThrow(r.counter, courseId);
+      // Fase 3: vínculos a resultados (validados contra el contexto vigente, en la misma transacción).
+      const outcomeIds = dto.outcomeIds === undefined ? undefined : await outcomeIdsOrThrow(queryRunner, courseId, dto.outcomeIds);
+      const created = this.jsonObject(r.chapter);
+      if (outcomeIds && created?.id) {
+        await queryRunner.query(`update public.course_chapters set outcome_ids = $1::jsonb where id = $2 and course_id = $3`, [JSON.stringify(outcomeIds), created.id, courseId]);
+      }
       await queryRunner.commitTransaction();
-      const chapter = this.jsonObject(r.chapter);
+      const chapter = created;
+      if (chapter && dto.outcomeIds !== undefined) chapter.outcomeIds = outcomeIds ?? null;
       // Un capítulo de contenido no informa `kind`: en una base sin la migración de práctica la columna no existe
       // y el editor solo ofrece la práctica cuando la lectura de la estructura la informa (re-revisión L4, m1).
       if (!practice && chapter) delete chapter.kind;
@@ -980,6 +1055,7 @@ export class CourseStructureService implements OnModuleInit {
     if (dto.kind !== undefined) await assertPracticeChapterSchema(this.dataSource); // 503 sin la migración de práctica
     const appMinutes = dto.applicationMinutes === undefined ? undefined : applicationMinutesOrThrow(dto.applicationMinutes);
     if (dto.applicationMinutes !== undefined) await assertApplicationActivitySchema(this.dataSource); // 503 sin la migración
+    if (dto.outcomeIds !== undefined) await assertAcademicContextSchema(this.dataSource); // Fase 3: 503 sin la migración
     const queryRunner = this.dataSource.createQueryRunner();
     try {
       await queryRunner.connect();
@@ -1034,6 +1110,17 @@ export class CourseStructureService implements OnModuleInit {
       else if (dto.videoEnabled !== undefined) { sets.push(`video_enabled = $${i++}`); params.push(dto.videoEnabled); }
       if (dto.activityEnabled !== undefined) { sets.push(`activity_enabled = $${i++}`); params.push(dto.activityEnabled); }
       if (appMinutes !== undefined) { sets.push(`application_minutes = $${i++}`); params.push(appMinutes); }
+      let outcomeIds: string[] | null | undefined;
+      if (dto.outcomeIds !== undefined) {
+        try {
+          outcomeIds = await outcomeIdsOrThrow(queryRunner, courseId, dto.outcomeIds);
+        } catch (err) {
+          await queryRunner.rollbackTransaction();
+          throw err;
+        }
+        sets.push(`outcome_ids = $${i++}::jsonb`);
+        params.push(outcomeIds === null ? null : JSON.stringify(outcomeIds));
+      }
 
       const found = await this.updateRowAndBump(
         queryRunner, 'course_chapters', sets, params, i, { id: chapterId, module_id: moduleId, course_id: courseId }, courseId,
@@ -1058,6 +1145,7 @@ export class CourseStructureService implements OnModuleInit {
         structureVersionCounter: newCounter,
         ...(nt ? { title: nt.title, titleNormalized: nt.changed } : {}),
         ...(description !== undefined ? { description } : {}),
+        ...(outcomeIds !== undefined ? { outcomeIds } : {}),
       };
     } catch (err) {
       if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();

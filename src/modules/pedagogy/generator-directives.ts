@@ -5,6 +5,7 @@ import { defaultApproachRegistry } from './builtin-approaches';
 import { PEDAGOGY_SECTION_LABELS, PEDAGOGY_VALUE_LABELS } from './labels';
 import { allowedPedagogicalTypes, choosePedagogicalActivityTypes, effectiveChapterDesign } from './pedagogical-blueprint';
 import { ENUM_TARGETS } from './vocabulary';
+import { itemOutcomes, renderAlignmentBlock } from '../academic-context/alignment-brief';
 
 /**
  * Motor pedagógico Fase 2 — diseño del item → indicaciones para SU generador.
@@ -83,6 +84,8 @@ export interface ItemPedagogyBrief {
   /** Texto listo para el generador (bloque con marcador en prompts LLM; línea compacta en proveedores). */
   text: string;
   textSha256: string;
+  /** Fase 3: ids de los resultados de aprendizaje que el item debe evidenciar (solo si el bloque entró al texto). */
+  outcomes?: string[];
 }
 
 // ── Cobertura: qué hace cada tipo de item con el diseño ─────────────────────
@@ -359,7 +362,7 @@ function feedbackTimingOverride(timing: string, rule: string): PedagogyOverride[
 
 export interface BriefInput {
   /** Item del Manifest v3 (con `design`). */
-  item: { type: string; chapterId: string | null; variant?: string; h5pType?: string; design?: Record<string, unknown> };
+  item: { type: string; moduleId?: string | null; chapterId: string | null; variant?: string; h5pType?: string; design?: Record<string, unknown> };
   /** Snapshot del Blueprint (con course.pedagogy) del que salió el Manifest. */
   snapshot: BlueprintSnapshotV2;
   /** features.activityTypeRules del Manifest (para la traza del tipo H5P). */
@@ -604,20 +607,34 @@ function renderText(gen: PedagogyGeneratorId, directives: PedagogyDirective[]): 
  * Brief pedagógico de un item del Manifest (null si el item no trae diseño o su tipo no lo consume).
  * Falla fuerte si el diseño trae un valor sin texto (vocabulario y textos desalineados).
  */
+/** Tope del brief completo (el ejecutor del navegador rechaza más de 4000: DYN_PEDAGOGY_TEXT_MAX). */
+export const PEDAGOGY_BRIEF_TEXT_MAX = 4000;
+
 export function buildItemPedagogyBrief(input: BriefInput): ItemPedagogyBrief | null {
-  if (!input.item.design || !input.snapshot.course.pedagogy) return null;
   const gen = generatorForItem(input.item);
   if (!gen) return null;
-  const { directives, overridden } = directivesFor(gen, input);
-  const text = renderText(gen, directives);
+  const withDesign = !!input.item.design && !!input.snapshot.course.pedagogy;
+  // Fase 3: resultados de aprendizaje del contexto académico congelado que el item debe evidenciar.
+  const outcomes = itemOutcomes(input.snapshot, input.item);
+  if (!withDesign && !outcomes.length) return null;
+  const { directives, overridden } = withDesign ? directivesFor(gen, input) : { directives: [] as PedagogyDirective[], overridden: [] as PedagogyOverride[] };
+  let text = withDesign ? renderText(gen, directives) : '';
+  let alignment = '';
+  if (outcomes.length && !PROVIDER_GENERATORS.has(gen)) {
+    const base = text || renderText(gen, []);
+    alignment = renderAlignmentBlock(gen, outcomes, PEDAGOGY_BRIEF_TEXT_MAX - base.length - 1);
+    if (alignment) text = `${base}\n${alignment}`;
+  }
+  if (!text) return null; // proveedor sin diseño o bloque que no entró: el prompt de siempre
   return {
     version: GENERATOR_DIRECTIVES_VERSION,
-    engineVersion: input.snapshot.course.pedagogy.engineVersion,
+    engineVersion: withDesign ? input.snapshot.course.pedagogy!.engineVersion : 0,
     generator: gen,
     directives,
     overridden,
     text,
     textSha256: sha256(text),
+    ...(alignment ? { outcomes: outcomes.map((o) => o.id) } : {}),
   };
 }
 

@@ -132,6 +132,7 @@ const DYNAMIC_CONTROLLER_CLASS_NAMES = new Set([
   'CourseProfilesController', // V2.1 R3
   'PedagogyController', // Motor pedagógico V1
   'AdminDynamicRunsController', // EV6 DoD BE-B: GET /admin/dynamic-runs/needs-attention (SUPER_ADMIN)
+  'AcademicContextController', // Fase 3: /courses/:id/academic-context/{extract,design}
 ]);
 /**
  * Todo lo demás: legacy sin ninguna ruta dynamic, EXCEPTO CoursesController

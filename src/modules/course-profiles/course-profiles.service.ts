@@ -24,6 +24,8 @@ import {
 } from './course-profiles';
 import { DesignRules, deriveDesignRulesOrNull, designRulesRecord } from '../pedagogy/design-rules';
 import { emptyPedagogicalProfile } from '../pedagogy/pedagogy-profile';
+import { AcademicContextV1, emptyAcademicContext } from '../academic-context/academic-context';
+import { AcademicValidation, validateAcademicContext } from '../academic-context/validate';
 
 export interface CourseProfileDto {
   courseId: number;
@@ -54,7 +56,18 @@ export interface CourseProfileDto {
    */
   designRules?: ReturnType<typeof designRulesRecord> | null;
   rulesStale?: boolean;
+  /**
+   * Fase 3 — solo `academic`: validación semántica del contexto (errores / advertencias / faltantes), recalculada
+   * en cada lectura. `canProceed: false` impide usarlo en el diseño, nunca guardarlo.
+   */
+  academicValidation?: AcademicValidation;
 }
+
+/** Migración que habilita cada kind nuevo (mensaje 503 claro si el entorno no la tiene). */
+const KIND_MIGRATION: Record<string, string> = {
+  pedagogy: 'supabase-migration-pedagogy-profiles.sql',
+  academic: 'supabase-migration-academic-context.sql',
+};
 
 function pedagogyRulesRecord(profile: AnyCourseProfile): ReturnType<typeof designRulesRecord> | null {
   const rules: DesignRules | null = deriveDesignRulesOrNull(profile);
@@ -104,7 +117,7 @@ export class CourseProfilesService {
 
   private assertKind(kind: string): asserts kind is ProfileKind {
     if (!isProfileKind(kind)) {
-      throw new BadRequestException(`Tipo de perfil inválido: "${kind}" (permitidos: presentation, assessment, pedagogy)`);
+      throw new BadRequestException(`Tipo de perfil inválido: "${kind}" (permitidos: presentation, assessment, pedagogy, academic)`);
     }
   }
 
@@ -157,6 +170,14 @@ export class CourseProfilesService {
         return {
           courseId, kind, version: 0, profile: empty, sha256: profileSha256(empty), isDefault: true,
           createdAt: null, createdBy: null, warnings: [], defaultSource: null, designRules: null, rulesStale: false,
+        };
+      }
+      if (kind === 'academic') {
+        // Fase 3: sin contexto guardado = el comportamiento de siempre (el diseño no usa ningún contexto).
+        const empty = emptyAcademicContext();
+        return {
+          courseId, kind, version: 0, profile: empty, sha256: profileSha256(empty), isDefault: true,
+          createdAt: null, createdBy: null, warnings: [], defaultSource: null, academicValidation: validateAcademicContext(empty),
         };
       }
       const profile = defaultAssessmentProfile({ finalExam });
@@ -235,7 +256,7 @@ export class CourseProfilesService {
       // Motor pedagógico V1 (review M6): base sin la migración pedagogy → mensaje claro, no un 500.
       if (isKindCheckViolation(err)) {
         throw new ServiceUnavailableException(
-          `Este entorno todavía no admite perfiles "${kind}" (falta la migración supabase-migration-pedagogy-profiles.sql).`,
+          `Este entorno todavía no admite perfiles "${kind}" (falta la migración ${KIND_MIGRATION[kind] ?? 'de perfiles'}).`,
         );
       }
       throw err;
@@ -268,6 +289,7 @@ export class CourseProfilesService {
       warnings: kind === 'assessment' ? validateAssessmentProfile(profile as any, { finalExam }) : [],
       defaultSource: null,
     };
+    if (kind === 'academic') return { ...base, academicValidation: validateAcademicContext(profile as AcademicContextV1) };
     if (kind !== 'pedagogy') return base;
     const designRules = pedagogyRulesRecord(profile);
     const storedEngine = stored?.designRules?.engineVersion ?? null;

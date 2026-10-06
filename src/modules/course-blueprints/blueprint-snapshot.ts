@@ -10,6 +10,12 @@ import {
   canonicalCoursePedagogy,
   canonicalModuleDesign,
 } from '../pedagogy/blueprint-design';
+import {
+  AcademicBlueprintContext,
+  canonicalAcademicBlueprintContext,
+  rawOutcomeIds,
+  sortOutcomeIds,
+} from '../academic-context/blueprint-academic';
 
 /**
  * Raw shape returned by `select ... from course_modules`. snake_case on
@@ -347,6 +353,11 @@ export interface RawChapterRowV2 extends RawChapterRow {
    * Ausente/null = sin actividad; 30/60/90/120 = niveles del modelo de tiempo.
    */
   application_minutes?: number | null;
+  /**
+   * Fase 3 · Contexto académico: vínculos del capítulo a resultados / competencias (course_chapters.outcome_ids,
+   * jsonb). Ausente/null = sin vínculos (la clave no entra al snapshot).
+   */
+  outcome_ids?: unknown;
 }
 
 export type ChapterKind = 'content' | 'practice';
@@ -369,6 +380,34 @@ function applicationErrors(chapters: { id: string; minutes: unknown }[], pathOf:
   chapters.forEach((c, i) => {
     if (rawApplicationMinutes(c.minutes) === 'invalid') {
       errors.push({ path: pathOf(i), code: 'INVALID_APPLICATION_MINUTES', message: `El capítulo ${c.id} tiene minutos de Actividad de Aplicación inválidos (${JSON.stringify(c.minutes)}; permitidos: 30, 60, 90, 120)` });
+    }
+  });
+  return errors;
+}
+
+/**
+ * Fase 3: vínculos capítulo → resultados. Forma (1–8 ids RA/CO sin repetir) y existencia: un vínculo solo puede
+ * apuntar a un resultado o competencia del contexto académico congelado (sin contexto, ningún capítulo vincula).
+ */
+function outcomeErrors(chapters: { id: string; ids: unknown }[], ctx: AcademicBlueprintContext | null, pathOf: (i: number) => string): BlueprintValidationError[] {
+  const errors: BlueprintValidationError[] = [];
+  const known = new Set(ctx ? [...ctx.outcomes.map((o) => o.id), ...ctx.competencies.map((c) => c.id)] : []);
+  chapters.forEach((c, i) => {
+    const ids = rawOutcomeIds(c.ids);
+    if (ids === undefined) return;
+    if (ids === 'invalid') {
+      errors.push({ path: pathOf(i), code: 'INVALID_OUTCOME_IDS', message: `El capítulo ${c.id} tiene vínculos a resultados inválidos (${JSON.stringify(c.ids)}; 1 a 8 ids RA… / CO… sin repetir)` });
+      return;
+    }
+    const unknown = ids.filter((x) => !known.has(x));
+    if (unknown.length) {
+      errors.push({
+        path: pathOf(i),
+        code: 'UNKNOWN_OUTCOME_REF',
+        message: ctx
+          ? `El capítulo ${c.id} vincula ${unknown.join(', ')}, que no existe(n) en el contexto académico del curso`
+          : `El capítulo ${c.id} vincula resultados (${ids.join(', ')}) pero el curso no tiene contexto académico`,
+      });
     }
   });
   return errors;
@@ -468,6 +507,8 @@ export interface BlueprintCourseInputV2 {
   targetHours?: number | null;
   /** Fase 2: contexto del perfil para las Actividades de Aplicación (entra solo si algún capítulo tiene una). */
   applicationContext?: unknown;
+  /** Fase 3: contexto académico en su forma congelada (academicBlueprintContext); null/ausente = sin contexto. */
+  academicContext?: unknown;
 }
 
 export interface BlueprintChapterV2 extends BlueprintChapter {
@@ -484,6 +525,8 @@ export interface BlueprintChapterV2 extends BlueprintChapter {
    * su sha). Minutos de trabajo del estudiante (30/60/90/120): entran al tiempo del capítulo y del curso.
    */
   applicationMinutes?: number;
+  /** Fase 3: SOLO en capítulos con vínculos a resultados del contexto académico (orden RA → CO, por número). */
+  outcomeIds?: string[];
   /** Motor pedagógico V1: solo si el curso tiene perfil pedagógico (sin él, sha de siempre). */
   design?: ChapterDesign;
 }
@@ -524,6 +567,11 @@ export interface BlueprintSnapshotV2 {
      * tiene Actividad de Aplicación y el perfil los define.
      */
     applicationContext?: ApplicationContextV2;
+    /**
+     * Fase 3 · Contexto académico: resultados de aprendizaje y competencias (con id) congelados, y la huella del
+     * contexto guardado. SOLO con un contexto que traiga resultados o competencias.
+     */
+    academicContext?: AcademicBlueprintContext;
     /**
      * Motor pedagógico V1: resumen del diseño pedagógico (enfoques, estrategia de evaluación…).
      * La clave existe SOLO con perfil pedagógico: los snapshots sin ella conservan su sha.
@@ -585,6 +633,10 @@ export function buildBlueprintSnapshotV2(
   if (kindErrors.length) throw new Error(`BLUEPRINT_V2_INVALID_INPUT: ${kindErrors.map((e) => e.message).join('; ')}`);
   const appErrors = applicationErrors(chapters.map((c) => ({ id: c.id, minutes: c.application_minutes })), (i) => `chapters[${i}].application_minutes`);
   if (appErrors.length) throw new Error(`BLUEPRINT_V2_INVALID_INPUT: ${appErrors.map((e) => e.message).join('; ')}`);
+  // Fase 3: el contexto académico congelado y los vínculos de cada capítulo (que solo pueden apuntar a él).
+  const academicContext = canonicalAcademicBlueprintContext(course.academicContext);
+  const outErrors = outcomeErrors(chapters.map((c) => ({ id: c.id, ids: c.outcome_ids })), academicContext, (i) => `chapters[${i}].outcome_ids`);
+  if (outErrors.length) throw new Error(`BLUEPRINT_V2_INVALID_INPUT: ${outErrors.map((e) => e.message).join('; ')}`);
   const badChapter = chapters.find((c) => typeof c.activity_enabled !== 'boolean');
   if (badChapter) {
     throw new Error(
@@ -629,6 +681,7 @@ export function buildBlueprintSnapshotV2(
       ...(course.reviewCards === true ? { reviewCards: true as const } : {}),
       ...(course.targetHours !== undefined && course.targetHours !== null ? { targetHours: course.targetHours } : {}),
       ...(applicationContext ? { applicationContext } : {}),
+      ...(academicContext ? { academicContext } : {}),
       ...(coursePedagogy ? { pedagogy: coursePedagogy } : {}),
     },
     modules: sortedModules.map((m) => {
@@ -653,6 +706,7 @@ export function buildBlueprintSnapshotV2(
           activityEnabled: c.activity_enabled,
           ...(rawChapterKind(c.chapter_kind) === 'practice' ? { kind: 'practice' as const } : {}),
           ...(typeof rawApplicationMinutes(c.application_minutes) === 'number' ? { applicationMinutes: rawApplicationMinutes(c.application_minutes) as number } : {}),
+          ...(Array.isArray(rawOutcomeIds(c.outcome_ids)) ? { outcomeIds: sortOutcomeIds(rawOutcomeIds(c.outcome_ids) as string[]) } : {}),
           ...(pedagogy ? { design: canonicalChapterDesign(pedagogy.chapters[c.id], `chapters[${c.id}].design`) } : {}),
         })),
       };
@@ -709,6 +763,7 @@ export function snapshotV2ToRows(s: any): {
         video_enabled: c.videoEnabled, activity_enabled: c.activityEnabled,
         ...(c.kind !== undefined ? { chapter_kind: c.kind } : {}),
         ...(c.applicationMinutes !== undefined ? { application_minutes: c.applicationMinutes } : {}),
+        ...(c.outcomeIds !== undefined ? { outcome_ids: c.outcomeIds } : {}),
       });
       if (pedagogy) pedagogy.chapters[c.id] = c.design;
       else if (c.design !== undefined) throw new Error(`BLUEPRINT_PEDAGOGY_INVALID: el capítulo ${c.id} trae design sin course.pedagogy`);
@@ -723,6 +778,7 @@ export function snapshotV2ToRows(s: any): {
       ...(s.course.reviewCards !== undefined ? { reviewCards: s.course.reviewCards } : {}),
       ...(s.course.targetHours !== undefined ? { targetHours: s.course.targetHours } : {}),
       ...(s.course.applicationContext !== undefined ? { applicationContext: s.course.applicationContext } : {}),
+      ...(s.course.academicContext !== undefined ? { academicContext: s.course.academicContext } : {}),
     },
     modules,
     chapters,
@@ -814,6 +870,22 @@ export function validateBlueprintSnapshotV2(s: BlueprintSnapshotV2): BlueprintVa
     m.chapters.map((c) => ({ id: c.id, minutes: (c as { applicationMinutes?: unknown }).applicationMinutes })),
     (ci) => `modules[${mi}].chapters[${ci}].applicationMinutes`,
   )));
+  // Fase 3: contexto académico canónico y vínculos que apuntan a él (en orden canónico).
+  const actx = (s.course as { academicContext?: unknown }).academicContext;
+  let acanon: AcademicBlueprintContext | null = null;
+  if (actx !== undefined) {
+    try { acanon = canonicalAcademicBlueprintContext(actx); } catch { acanon = null; }
+    if (!acanon || JSON.stringify(acanon) !== JSON.stringify(actx)) errors.push({ path: 'course.academicContext', code: 'INVALID_ACADEMIC_CONTEXT', message: 'course.academicContext no está en forma canónica' });
+  }
+  s.modules.forEach((m, mi) => {
+    errors.push(...outcomeErrors(m.chapters.map((c) => ({ id: c.id, ids: (c as { outcomeIds?: unknown }).outcomeIds })), acanon, (ci) => `modules[${mi}].chapters[${ci}].outcomeIds`));
+    m.chapters.forEach((c, ci) => {
+      const ids = (c as { outcomeIds?: string[] }).outcomeIds;
+      if (Array.isArray(ids) && JSON.stringify(sortOutcomeIds(ids)) !== JSON.stringify(ids)) {
+        errors.push({ path: `modules[${mi}].chapters[${ci}].outcomeIds`, code: 'INVALID_OUTCOME_IDS', message: `El capítulo ${c.id} tiene los vínculos fuera del orden canónico` });
+      }
+    });
+  });
   return [...errors, ...validateBlueprintSnapshot(structuralViewV1(s))];
 }
 
@@ -855,6 +927,13 @@ export function validateBlueprintInputV2(
     (mi, ci) => `modules[${mi}].chapters[${ci}]`,
   ));
   errors.push(...applicationErrors(chapters.map((c) => ({ id: c.id, minutes: c.application_minutes })), (i) => `chapters[${i}].application_minutes`));
+  let actx: AcademicBlueprintContext | null = null;
+  try {
+    actx = canonicalAcademicBlueprintContext(course.academicContext);
+  } catch (err) {
+    errors.push({ path: 'course.academicContext', code: 'INVALID_ACADEMIC_CONTEXT', message: err instanceof Error ? err.message : String(err) });
+  }
+  errors.push(...outcomeErrors(chapters.map((c) => ({ id: c.id, ids: c.outcome_ids })), actx, (i) => `chapters[${i}].outcome_ids`));
   return errors;
 }
 

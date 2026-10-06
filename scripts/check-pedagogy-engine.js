@@ -172,7 +172,8 @@ async function pureChecks() {
     eq(P.pedagogicalProfileSha256(P.normalizePedagogicalProfile(a)), P.pedagogicalProfileSha256(P.normalizePedagogicalProfile(b)), 'sha');
     eq(profilesPure.profileSha256(profilesPure.normalizeProfile('pedagogy', b)), P.pedagogicalProfileSha256(P.normalizePedagogicalProfile(a)), 'course-profiles despacha pedagogy');
     eq(profilesPure.validateProfile('pedagogy', a, { finalExam: true }), [], 'validateProfile(pedagogy)');
-    eq(profilesPure.PROFILE_KINDS, ['presentation', 'assessment', 'pedagogy'], 'kinds');
+    // Fase 3: + 'academic' (contexto académico).
+    eq(profilesPure.PROFILE_KINDS, ['presentation', 'assessment', 'pedagogy', 'academic'], 'kinds');
   });
   await check('Perfil: reglas derivadas son determinísticas y representables (designRulesRecord)', () => {
     const r1 = P.deriveDesignRules(profileOf('problemas+significativo+autodirigido'));

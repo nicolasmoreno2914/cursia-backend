@@ -120,3 +120,27 @@ export async function assertApplicationActivitySchema(q: { query(sql: string, pa
   }
   applicationVerified = true;
 }
+
+// Fase 3 · Contexto académico: la migración (supabase-migration-academic-context.sql) corre SOLO en staging; sin ella
+// la lectura no informa `outcomeIds` y una escritura con la clave responde 503.
+export const SCHEMA_NOT_MIGRATED_ACADEMIC = 'schema_not_migrated_academic';
+let academicVerified = false;
+
+export function _resetAcademicSchemaGuardForTests(): void {
+  academicVerified = false;
+}
+
+export async function assertAcademicContextSchema(q: { query(sql: string, params?: any[]): Promise<any> }): Promise<void> {
+  if (academicVerified) return;
+  const res: any = await q.query(
+    `select 1 from information_schema.columns where table_schema = 'public' and table_name = 'course_chapters' and column_name = 'outcome_ids'`,
+  );
+  const rows: unknown[] = Array.isArray(res) ? res : res.rows;
+  if (!rows.length) {
+    throw new ServiceUnavailableException({
+      code: SCHEMA_NOT_MIGRATED_ACADEMIC,
+      message: `${SCHEMA_NOT_MIGRATED_ACADEMIC}: esta base no tiene el contexto académico (course_chapters.outcome_ids); correr supabase-migration-academic-context.sql antes de vincular resultados.`,
+    });
+  }
+  academicVerified = true;
+}
