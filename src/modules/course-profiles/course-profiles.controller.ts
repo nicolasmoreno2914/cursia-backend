@@ -39,7 +39,7 @@ export class CourseProfilesController {
     @Body() dto: UseDocumentDto,
     @CurrentUser() user: AuthUser,
   ) {
-    return this.profilesService.useDocumentInPedagogy(courseId, user.id, dto.fields);
+    return this.profilesService.useDocumentInPedagogy(courseId, user.id, dto.fields, dto.expectedVersion);
   }
 
   // POST /api/v1/courses/:courseId/profiles/:kind  body { data, expectedVersion? }

@@ -374,7 +374,7 @@ export class CourseProfilesService {
    * LOOP 8.1 (review L81 I1e) · «Usar los datos del documento»: decisión explícita del docente de reemplazar en el perfil
    * los datos que había cambiado (`fields`, o todos los que difieren) por los del contexto académico vigente.
    */
-  async useDocumentInPedagogy(courseId: number, ownerId: string, fields?: string[]): Promise<PedagogyDerivationResult> {
+  async useDocumentInPedagogy(courseId: number, ownerId: string, fields?: string[], expectedVersion?: number): Promise<PedagogyDerivationResult> {
     assertDynamicOwnerAllowed(ownerId);
     await this.loadCourse(courseId, ownerId);
     const force = (fields && fields.length ? fields : DERIVED_FIELDS).filter((f): f is DerivedField => (DERIVED_FIELDS as readonly string[]).includes(f));
@@ -388,6 +388,14 @@ export class CourseProfilesService {
       if (!academic) {
         await qr.rollbackTransaction();
         throw new BadRequestException({ code: 'NO_ACADEMIC_CONTEXT', message: 'NO_ACADEMIC_CONTEXT: el curso no tiene contexto académico guardado.' });
+      }
+      if (expectedVersion !== undefined) {
+        const [p] = await qr.query(`select version from public.course_profiles where course_id = $1 and kind = 'pedagogy' order by version desc limit 1`, [courseId]);
+        const current = p ? Number(p.version) : 0;
+        if (current !== expectedVersion) {
+          await qr.rollbackTransaction();
+          throw new ConflictException(`El perfil "pedagogy" del curso #${courseId} cambió: expectedVersion=${expectedVersion}, actual=${current}. Vuelve a leerlo (GET) antes de usar los datos del documento.`);
+        }
       }
       const finalExam = await this.readFinalExam(qr, courseId);
       const r = await this.derivePedagogyFromAcademic(qr, courseId, ownerId, academic.context, academic.version, finalExam, force);

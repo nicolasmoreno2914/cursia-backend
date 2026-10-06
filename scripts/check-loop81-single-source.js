@@ -132,6 +132,14 @@ const BRIEF = { nombre: 'Contabilidad de Costos', obj: 'Calcular y controlar los
     eq([facts.educationLevel.value, facts.educationLevel.source], ['professional', 'profile'], 'review L81 I2: la decisión del docente manda sobre el documento');
     assert(facts.conflicts.some((c) => c.field === 'pedagogy.educationLevel'), 'conflicto visible');
     eq(CF.pedagogyFieldOwners(sugg, null, sugg).do, 'document', 'igual al documento sin registro (perfil anterior a 8.1): del documento');
+    // Review L81 R2-M4: con registro, un valor que el docente escribió y coincide con el documento sigue siendo suyo.
+    const typedSame = JSON.parse(JSON.stringify(hoursFirst)); typedSame.targetHours = 64;
+    eq(CF.pedagogyFieldOwners(typedSame, { academicVersion: 1, fields: {} }, sugg).targetHours, 'user', 'escrito por el docente aunque coincida');
+    // Review L81 R2-M2: forzar métodos de evaluación del docente SUMA los del documento (lo que el panel muestra).
+    const mine = { ...emptyPed(), assessmentMethods: ['portfolio'] };
+    const oM = CF.pedagogyFieldOwners(mine, null, sugg);
+    const mf = CF.mergeDerivedProfile(mine, sugg, oM, 1, ['assessmentMethods']);
+    eq([mf.profile.assessmentMethods.includes('portfolio'), sugg.assessmentMethods.every((x) => mf.profile.assessmentMethods.includes(x))], [true, true], 'unión');
     const forced = CF.mergeDerivedProfile(hoursFirst, sugg, o1, 1, ['targetHours']);
     eq([forced.profile.targetHours, forced.changed.includes('targetHours')], [64, true], '«Usar los datos del documento» (force)');
   });
@@ -358,6 +366,24 @@ async function dbChecks(ctx) {
       const al = CF.alignCourseContextWithSnapshot(run, learner);
       eq(CF.contextLevelOf(al.context.contexto), learner.educationLevel, 'contenido y Actividades de Aplicación: el mismo nivel');
       eq(await FDB.loadFrozenLearner(ds, cid, 999999), null, 'otro Blueprint: nada');
+    });
+
+    await check('SS14 (review L81 R2-I1) sin Actividades de Aplicación: el estudiante es el del perfil vigente al confirmar, y no cambia después', async () => {
+      const cid = await newCourse('Sin AA');
+      await profiles.append(cid, OWNER, 'academic', ctx);
+      const [m] = await ds.query(`insert into public.course_modules (course_id, position, title, objective, exam_enabled) values ($1, 0, 'Costos', 'Calcular costos de producción', true) returning id`, [cid]);
+      await ds.query(`insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled, activity_enabled) values ($1, $2, 0, 'Elementos del costo', 'Identificar los elementos del costo', true, true)`, [cid, m.id]);
+      await blueprints.lock(cid, OWNER, Number((await ds.query(`select structure_version_counter c from public.courses where id = $1`, [cid]))[0].c));
+      const [bp] = await ds.query(`select id, snapshot_json -> 'course' -> 'applicationContext' as ac from public.course_blueprints where course_id = $1 order by id desc limit 1`, [cid]);
+      eq(bp.ac, null, 'sin Actividades de Aplicación el snapshot no congela al estudiante');
+      const before = await FDB.loadFrozenLearner(ds, cid, bp.id);
+      eq(before && before.educationLevel, (await ped(cid)).profile.learner.educationLevel, 'el del perfil al confirmar');
+      const cur = (await ped(cid)).profile;
+      await profiles.append(cid, OWNER, 'pedagogy', { ...cur, learner: { ...cur.learner, educationLevel: 'professional' } });
+      eq(JSON.stringify(await FDB.loadFrozenLearner(ds, cid, bp.id)), JSON.stringify(before), 'un cambio posterior del perfil no cambia el estudiante de ese Blueprint (reanudar = mismo contexto)');
+      await rejectsRe(profiles.useDocumentInPedagogy(cid, OWNER, ['educationLevel'], 1), /cambió: expectedVersion=1/, 'use-document con versión vieja', 409);
+      const u = await profiles.useDocumentInPedagogy(cid, OWNER, ['educationLevel'], (await ped(cid)).version);
+      eq(u.changes, ['educationLevel'], 'con la versión vigente, sí');
     });
 
     await check('SS10 lectura avanzada: estimar sin proveedor, consentimiento obligatorio, mismo extractor, gasto registrado', async () => {

@@ -24,12 +24,22 @@ export async function loadCourseFacts(q: Q, courseId: number, courseRow?: any): 
 }
 
 /**
- * LOOP 8.1 (review L81 I3) · Estudiante que congeló el Blueprint (course.applicationContext.learner: entra al snapshot
- * cuando el curso tiene Actividades de Aplicación). null si no hay. Es lo que reciben esas actividades al generar.
+ * LOOP 8.1 (review L81 I3 / R2-I1) · Estudiante del Blueprint, FIJO para ese Blueprint:
+ *   1. el que congeló el snapshot (course.applicationContext.learner: cursos con Actividades de Aplicación — es
+ *      exactamente lo que reciben esas actividades);
+ *   2. si no hay, el del perfil pedagógico vigente al confirmar (la última versión creada hasta locked_at: las
+ *      versiones son inmutables, así que el resultado no cambia después) — cursos sin Actividades de Aplicación.
+ * null sin perfil. Leer del Blueprint (no del perfil vivo) hace que reanudar dé siempre el mismo contexto.
  */
 export async function loadFrozenLearner(q: Q, courseId: number, blueprintId: number): Promise<Record<string, unknown> | null> {
   const [bp] = await q.query(
-    `select snapshot_json -> 'course' -> 'applicationContext' -> 'learner' as learner from public.course_blueprints where id = $1 and course_id = $2`,
+    `select coalesce(
+              b.snapshot_json -> 'course' -> 'applicationContext' -> 'learner',
+              (select p.data -> 'learner' from public.course_profiles p
+                where p.course_id = b.course_id and p.kind = 'pedagogy' and p.created_at <= b.locked_at
+                order by p.version desc limit 1)
+            ) as learner
+       from public.course_blueprints b where b.id = $1 and b.course_id = $2`,
     [blueprintId, courseId],
   );
   const v = bp ? (typeof bp.learner === 'string' ? JSON.parse(bp.learner) : bp.learner) : null;

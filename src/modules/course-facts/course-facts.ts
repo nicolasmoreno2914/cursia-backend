@@ -145,7 +145,9 @@ export function pedagogyFieldOwners(
     const sha = fieldSha(v);
     if (isEmptyValue(v)) out[f] = 'empty';
     else if (record && record.fields[f] === sha) out[f] = 'document';
-    else if (sugs.some((sg) => fieldSha(derivedFieldValue(sg, f)) === sha)) out[f] = 'document';
+    // Igual al documento SOLO sin registro (perfiles anteriores a 8.1, «Usar en el perfil»). Con registro, un valor que
+    // el docente escribió y coincide con el documento sigue siendo suyo (review L81 R2-M4).
+    else if (!record && sugs.some((sg) => fieldSha(derivedFieldValue(sg, f)) === sha)) out[f] = 'document';
     else out[f] = 'user';
   }
   return out;
@@ -171,6 +173,15 @@ export function mergeDerivedProfile(
     const docValue = derivedFieldValue(suggested, f);
     const takeDoc = owners[f] !== 'user' || force.includes(f);
     if (takeDoc && !isEmptyValue(docValue)) {
+      if (f === 'assessmentMethods' && owners[f] === 'user') {
+        // Forzado sobre métodos del docente: se SUMAN los del documento (es lo que el panel muestra), no se reemplazan.
+        const union = [...new Set([...(current.assessmentMethods || []), ...(suggested.assessmentMethods || [])])];
+        const ordered = union;
+        if (fieldSha(ordered) !== fieldSha(current.assessmentMethods || [])) changed.push(f);
+        next.assessmentMethods = ordered as PedagogicalProfile['assessmentMethods'];
+        record.fields[f] = fieldSha(ordered);
+        continue;
+      }
       if (fieldSha(derivedFieldValue(current, f)) !== fieldSha(docValue)) changed.push(f);
       setDerivedField(next, suggested, f);
       record.fields[f] = fieldSha(docValue);
@@ -243,6 +254,17 @@ const FIELD_LABEL: Readonly<Record<DerivedField, string>> = Object.freeze({
   competencies: 'las competencias', targetHours: 'las horas objetivo', assessmentMethods: 'los métodos de evaluación',
 });
 
+/** Qué usa Cursia en cada caso (review L81 R2-M1: el mensaje dice exactamente qué recibe cada parte del curso). */
+const FIELD_CONFLICT_MESSAGE: Readonly<Record<DerivedField, (docV: unknown, pedHours: number | null) => string>> = Object.freeze({
+  targetHours: (docV: unknown, h: number | null) => `El documento indica ${docV} h y elegiste ${h} h: el diseño usa lo que elegiste.`,
+  educationLevel: () => 'Elegiste un nivel educativo distinto del documento: todo el curso usa el que elegiste.',
+  description: () => 'Cambiaste el perfil del estudiante: las Actividades de Aplicación usan el tuyo.',
+  know: () => 'Cambiaste los resultados de saber: el diseño y las Actividades de Aplicación usan los tuyos; los capítulos se alinean con los resultados del documento.',
+  do: () => 'Cambiaste los resultados de saber hacer: el diseño y las Actividades de Aplicación usan los tuyos; los capítulos se alinean con los resultados del documento.',
+  competencies: () => 'Cambiaste las competencias: el diseño y las Actividades de Aplicación usan las tuyas; los capítulos se alinean con las del documento.',
+  assessmentMethods: () => 'Cambiaste los métodos de evaluación: el diseño usa los tuyos.',
+});
+
 export function resolveCourseFacts(input: FactsInput): CourseFacts {
   const b = input.brief ? input.brief.fields : {};
   const ctx = input.academic ? input.academic.context : null;
@@ -276,9 +298,7 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
       if (owners[f] === 'user' && !isEmptyValue(docV) && fieldSha(docV) !== fieldSha(derivedFieldValue(ped, f))) {
         differing.push(f);
         conflicts.push({ field: `pedagogy.${f}`, values: [{ source: 'document', value: docV }, { source: 'profile', value: derivedFieldValue(ped, f) }],
-          message: f === 'targetHours'
-            ? `El documento indica ${docV} h y elegiste ${pedHours} h: se usa lo que elegiste.`
-            : `Cambiaste ${FIELD_LABEL[f]}: se usa lo tuyo y no lo del documento.` });
+          message: FIELD_CONFLICT_MESSAGE[f](docV, pedHours) });
       }
     }
   }
