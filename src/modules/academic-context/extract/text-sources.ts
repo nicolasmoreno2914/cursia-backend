@@ -49,11 +49,32 @@ export function sniffMediaType(buf: Buffer, name: string): AcademicDocument['med
   if (buf.length >= 5 && buf.subarray(0, 5).toString('latin1') === '%PDF-') return 'application/pdf';
   if (buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04) return DOCX;
   // Texto: UTF-8 o Windows-1252 (habitual en sílabos guardados en Windows). Binario → no soportado (review N3): bytes
-  // de control C0 (salvo tab/saltos) o bytes que Windows-1252 no define, en más del 0,5 % del archivo.
+  // de control C0 (salvo tab/saltos) o bytes que Windows-1252 no define, en más del 0,5 % del archivo. Los bytes
+  // «no definidos» solo cuentan en líneas que NO son UTF-8 válido (review I8): en UTF-8 son bytes de continuación
+  // legítimos (Á = C3 81, Í = C3 8D, ” = E2 80 9D).
   let bad = 0;
-  for (const b of buf) if ((b < 0x20 && b !== 0x09 && b !== 0x0a && b !== 0x0d && b !== 0x0c) || b === 0x7f || CP1252_UNDEFINED.has(b)) bad++;
+  for (const b of buf) if ((b < 0x20 && b !== 0x09 && b !== 0x0a && b !== 0x0d && b !== 0x0c) || b === 0x7f) bad++;
+  if (!isUtf8(buf)) {
+    let start = 0;
+    for (let i = 0; i <= buf.length; i++) {
+      if (i < buf.length && buf[i] !== 0x0a) continue;
+      const line = buf.subarray(start, i);
+      if (!isUtf8(line)) for (const b of line) if (CP1252_UNDEFINED.has(b)) bad++;
+      start = i + 1;
+    }
+  }
   if (bad > Math.max(0, buf.length * 0.005)) return null;
   return /\.md$/i.test(name) ? 'text/markdown' : 'text/plain';
+}
+
+const UTF8_STRICT = new TextDecoder('utf-8', { fatal: true });
+function isUtf8(bytes: Buffer): boolean {
+  try {
+    UTF8_STRICT.decode(bytes);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Bytes 0x80–0x9F que Windows-1252 no define. */

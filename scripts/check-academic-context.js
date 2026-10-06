@@ -496,6 +496,12 @@ const profileOf = (k, extra = {}) => ({
     let binCode = null;
     try { await A.extractAcademicContext([{ name: 'raro.txt', data: bin }]); } catch (e) { binCode = e.code; }
     eq(binCode, 'UNSUPPORTED_DOCUMENT', 'binario rechazado');
+    // I8 (REVIEW-3): UTF-8 legítimo con Á, Í, ” y emoji (bytes 0x81/0x8D/0x9D de continuación) NO es binario.
+    const accents = txt(['ÁREA: Salud', 'Asignatura: Gestión de riesgos', '# ÍNDICE', 'METODOLOGÍA', '“Seguridad” 😁', 'BIBLIOGRAFÍA', 'Contenidos', '- Introducción']);
+    eq(A.sniffMediaType(Buffer.from('ÁREA: Salud', 'utf8'), 'a.txt'), 'text/plain', '«ÁREA» corto aceptado');
+    eq(A.sniffMediaType(accents, 'a.md'), 'text/markdown', 'sílabo con tildes mayúsculas aceptado');
+    const ra = await A.extractAcademicContext([{ name: 'tildes.txt', data: accents }]);
+    eq(ra.context.identity.subjectName.value, 'Gestión de riesgos', 'se extrae normalmente');
     // N4: sílabo partido: resultados en un archivo, contenidos (con vínculos) en otro.
     const rs = await A.extractAcademicContext([
       { name: 'resultados.txt', data: txt(['Resultados de aprendizaje', 'RA1. Identificar peligros.', 'RA2. Evaluar riesgos.']) },

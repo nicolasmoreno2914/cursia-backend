@@ -613,7 +613,7 @@ jobs:
                echo "━━━ [4h5b] Actividades de Aplicación: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-application-activities-schema.js
 
-               echo "━━━ [4h5c] Contexto académico: course_profiles kind 'academic' + course_chapters.outcome_ids — migración (staging, DESPUÉS de pedagogy-profiles) ━━━"
+               echo "━━━ [4h5c] Contexto académico: course_profiles kind academic + course_chapters.outcome_ids — migración (staging, DESPUÉS de pedagogy-profiles) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-academic-context.js
 
                echo "━━━ [4h5d] Contexto académico: verificación de esquema (staging) ━━━"
