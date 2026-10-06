@@ -448,8 +448,8 @@ export class CourseStructureService implements OnModuleInit {
       const hasKind = cols.some((c) => c.column_name === 'chapter_kind');
       const hasApp = cols.some((c) => c.column_name === 'application_minutes');
       const liveMods: { id: string }[] = await queryRunner.query(`select id from public.course_modules where course_id = $1 order by position, id`, [courseId]);
-      const liveChs: { id: string; module_id: string; chapter_kind: string | null; application_minutes: string | null }[] = await queryRunner.query(
-        `select id, module_id, to_jsonb(ch) ->> 'chapter_kind' as chapter_kind, to_jsonb(ch) ->> 'application_minutes' as application_minutes
+      const liveChs: { id: string; module_id: string; title: string; chapter_kind: string | null; application_minutes: string | null }[] = await queryRunner.query(
+        `select id, module_id, title, to_jsonb(ch) ->> 'chapter_kind' as chapter_kind, to_jsonb(ch) ->> 'application_minutes' as application_minutes
            from public.course_chapters ch where course_id = $1 order by position, id`,
         [courseId],
       );
@@ -477,7 +477,24 @@ export class CourseStructureService implements OnModuleInit {
           );
           moduleId = mod.id;
         }
-        const keepChs = keepMod ? chsOf(keepMod.id) : [];
+        // Review L80 R2-I1: emparejar primero por título (el mismo capítulo del documento conserva su id aunque «Aplicar
+        // diseño» haya intercalado práctica o profundización) y después, en orden, solo con capítulos de CONTENIDO que
+        // quedaron libres. Los capítulos de práctica y los sobrantes se borran.
+        const pool = keepMod ? chsOf(keepMod.id) : [];
+        const used = new Set<string>();
+        const norm = (t: string) => String(t || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const keepChs: ({ id: string } | undefined)[] = m.chapters.map((c) => {
+          const t = norm(normalizeTitleOrThrow('chapter', c.title).title);
+          const hit = pool.find((x) => !used.has(x.id) && norm(x.title) === t);
+          if (hit) used.add(hit.id);
+          return hit;
+        });
+        const freeContent = pool.filter((x) => !used.has(x.id) && x.chapter_kind !== 'practice');
+        for (let ci = 0; ci < keepChs.length; ci++) {
+          if (keepChs[ci]) continue;
+          const next = freeContent.shift();
+          if (next) { used.add(next.id); keepChs[ci] = next; }
+        }
         for (const [ci, c] of m.chapters.entries()) {
           const ct = normalizeTitleOrThrow('chapter', c.title);
           const cDesc = checkedDescription(mergeDescription(cleanDescription(c.description), ct.description));
@@ -487,7 +504,7 @@ export class CourseStructureService implements OnModuleInit {
               `update public.course_chapters set position = $2, title = $3, objective = $4, description = $5, video_enabled = $6,
                       activity_enabled = $7, outcome_ids = $8::jsonb${contentReset}, updated_at = now()
                 where id = $1 and course_id = $9`,
-              [keepChs[ci].id, ci, ct.title, c.objective, cDesc, c.videoEnabled, c.activityEnabled, links, courseId],
+              [keepChs[ci]!.id, ci, ct.title, c.objective, cDesc, c.videoEnabled, c.activityEnabled, links, courseId],
             );
           } else {
             await queryRunner.query(
@@ -497,7 +514,7 @@ export class CourseStructureService implements OnModuleInit {
             );
           }
         }
-        const extraChs = keepChs.slice(m.chapters.length).map((c) => c.id);
+        const extraChs = pool.filter((x) => !used.has(x.id)).map((x) => x.id);
         if (extraChs.length) await queryRunner.query(`delete from public.course_chapters where course_id = $1 and id = any($2::uuid[])`, [courseId, extraChs]);
       }
       const extraMods = liveMods.slice(proposal.modules.length).map((x) => x.id);

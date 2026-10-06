@@ -364,6 +364,27 @@ async function dbChecks() {
       eq(res.replaced.confirmed, false, 'la versión nueva se usa sin preguntar');
     });
 
+    await check('DA13 (review L80 R2-I1) documento → diseño de horas → Blueprint → mismo documento: TODOS sus capítulos conservan el id', async () => {
+      const cid = await newCourse('Diseño y reemplazo');
+      await saveContext(cid);
+      await svc.applyAcademicStructure(cid, OWNER, { expectedCounter: await counter(cid), contextVersion: 1 });
+      const docIds = new Map((await get(cid)).modules.flatMap((m) => m.chapters.map((c) => [`${m.position}|${c.title}`, c.id])));
+      const design = A.suggestProfileFromContext(ctx, null).profile;
+      await profiles.append(cid, OWNER, 'pedagogy', { ...design, primaryApproach: 'competencias', targetHours: 96, designPreferences: { emphasis: 'application', applicationActivities: 'auto' } });
+      const dr = await pedagogy.dryRunCourse(cid, OWNER, {});
+      const ap = await svc.applyDistribution(cid, OWNER, { expectedCounter: await counter(cid), proposalSha256: dr.distribution.proposalSha256 });
+      let st = await get(cid);
+      const practice = st.modules.flatMap((m) => m.chapters).filter((c) => c.kind === 'practice').length;
+      assert(ap.addedChapters > 0 && practice > 0, 'el diseño intercaló capítulos de práctica');
+      await blueprints.lock(cid, OWNER, await counter(cid));
+      await svc.applyAcademicStructure(cid, OWNER, { expectedCounter: await counter(cid), contextVersion: 1, confirmReplace: true });
+      st = await get(cid);
+      const after = st.modules.flatMap((m) => m.chapters.map((c) => [`${m.position}|${c.title}`, c.id]));
+      eq(after.length, docIds.size, 'solo los capítulos del documento');
+      eq(after.filter(([k, id]) => docIds.get(k) === id).length, docIds.size, 'cada capítulo del documento conserva su id');
+      eq(st.modules.flatMap((m) => m.chapters).filter((c) => c.kind === 'practice' || typeof c.applicationMinutes === 'number').length, 0, 'práctica y actividades del diseño, fuera');
+    });
+
     await check('DA12 con una generación en curso → 409 ACTIVE_RUN y nada cambia', async () => {
       const cid = await newCourse('Run activo');
       await saveContext(cid);
