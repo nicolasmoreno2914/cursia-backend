@@ -277,11 +277,16 @@ export interface BlueprintFingerprintsV3 extends BlueprintFingerprints {
   roleDesign: Map<string, Record<string, string>>;
   /** Motor de carga horaria: capítulo de práctica → sha de sus fuentes (capítulos de contenido del módulo). */
   practiceSources?: Map<string, string>;
+  /**
+   * Fase 2 · Actividades de Aplicación: capítulo → sha de lo que la actividad lee además del capítulo (minutos y
+   * contexto congelado del estudiante/resultados). Solo capítulos con actividad.
+   */
+  application?: Map<string, string>;
 }
 
 /** Envuelve la huella de experience/activity de un capítulo de práctica con la de sus fuentes (contenido: igual). */
 function withPracticeSources(fps: BlueprintFingerprintsV3, type: string, chapterId: string, fp: string | null): string | null {
-  const src = (type === 'experience' || type === 'activity') ? fps.practiceSources?.get(chapterId) : undefined;
+  const src = (type === 'experience' || type === 'activity' || type === 'application_activity') ? fps.practiceSources?.get(chapterId) : undefined;
   return fp && src ? sha256Canonical({ v: INVALIDATION_FINGERPRINT_VERSION_V3, kind: 'practice', type, base: fp, sources: src }) : fp;
 }
 
@@ -348,7 +353,17 @@ export function computeFingerprintsV3(
       if (Object.keys(shas).length) roleDesign.set(ch.id, shas);
     }
   }
-  return { ...base, moduleIntro, finalExam, roleDesign, practiceSources };
+  // Fase 2: minutos + contexto congelado (course.applicationContext) de cada capítulo con Actividad de Aplicación.
+  const application = new Map<string, string>();
+  const appContext = (bp as any).course?.applicationContext ?? null;
+  for (const m of (bp as any).modules ?? []) {
+    for (const c of m.chapters ?? []) {
+      if (typeof c.applicationMinutes === 'number') {
+        application.set(c.id, sha256Canonical({ v, kind: 'application-frame', minutes: c.applicationMinutes, applicationContext: appContext }));
+      }
+    }
+  }
+  return { ...base, moduleIntro, finalExam, roleDesign, practiceSources, application };
 }
 
 /** Sha de la variación por rol que recibe el trabajo `type` del capítulo (null = el rol no le cambia nada). */
@@ -370,6 +385,7 @@ export const CHAPTER_ITEM_TYPES_V3: readonly string[] = [
   'video',
   'video_interactions',
   'activity',
+  'application_activity',
   'audiobook_chapter',
 ];
 /** Tipos v3 cuya entidad es un módulo (key `<type>:<moduleId>`). */
@@ -420,6 +436,11 @@ function itemFingerprintV3Base(fps: BlueprintFingerprintsV3, key: string, extras
     const video = extras.videoIdentity ?? null;
     return c && video ? sha256Canonical({ v, kind: 'video_interactions', content: c.full, video }) : null;
   }
+  if (type === 'application_activity') {
+    const c = fps.content.get(entityId);
+    const frame = fps.application?.get(entityId);
+    return c && frame ? sha256Canonical({ v, kind: 'application_activity', content: c.full, frame }) : null;
+  }
   if (type === 'exam') return fps.exam.get(entityId) ?? null;
   if (type === 'module_intro') return fps.moduleIntro.get(entityId) ?? null;
   if (type === 'final_exam') return fps.finalExam;
@@ -446,6 +467,11 @@ function matchFingerprintV3Base(fps: BlueprintFingerprintsV3, key: string, extra
     const c = fps.content.get(entityId);
     const video = extras.videoIdentity ?? null;
     return c && video ? sha256Canonical({ v, kind: 'video_interactions', own: c.own, video }) : null;
+  }
+  if (type === 'application_activity') {
+    const c = fps.content.get(entityId);
+    const frame = fps.application?.get(entityId);
+    return c && frame ? sha256Canonical({ v, kind: 'application_activity', own: c.own, frame }) : null;
   }
   return itemFingerprintV3Base(fps, key, extras);
 }

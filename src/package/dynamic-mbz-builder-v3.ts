@@ -145,6 +145,8 @@ import type { ExamBankV1 } from '../modules/course-shell/exam-bank';
 import { examExplanationsAvailability, examOverallFeedbackBands } from '../modules/course-shell/exam-explanations';
 import type { ExamBankPlans } from './v3/exam-validator-v3';
 import { reviewCardsEnabledFor } from '../modules/study-time/manifest-input';
+import { applicationSolutionPage, applicationStudentPage } from '../modules/course-shell/application-pages';
+import { renderApplicationPdf } from './v3/application-pdf';
 import { COURSE_BADGE_BACKUP_ID, COURSE_BADGE_DEFAULT_ISSUER, courseBadgeImages, courseBadgeName, courseBadgeXml } from './v3/course-badge';
 
 /**
@@ -279,6 +281,11 @@ export interface DynamicPackageContentsV3 {
    * Con el mapa, `assembleAudiobook` aplica el piso de 25 min (AUDIOBOOK_TOO_SHORT_FOR_SOURCE); sin él, no.
    */
   audiobookManifests?: Map<string, any> | null;
+  /**
+   * Fase 2: chapterId → documento `dynamic_application_json` validado (actividad + solucionario). Solo con
+   * Actividades de Aplicación: cada una se empaqueta como página del estudiante + solucionario docente oculto.
+   */
+  applications?: Map<string, unknown>;
 }
 
 export interface BuildDynamicMbzV3Input {
@@ -735,7 +742,9 @@ function resolveExamSources(plan: PackagingPlanV3, c: DynamicPackageContentsV3):
     const gift = c.examGift.get(m.moduleId);
     if (bank && (gift ?? '').trim()) throw new Error(`MBZ_V3_INVARIANT: ${m.keys.exam} trae GIFT y banco a la vez`);
     if (bank) {
-      check(m.keys.exam, 'module', bank, m.chapters.map((ch) => ({ id: ch.chapterId, moduleId: m.moduleId })));
+      // Motor de carga horaria: los capítulos de práctica no entran a los exámenes (mismo plan que el claim y que
+      // packaging-v3); sin el filtro, un módulo con práctica y examen en banco nunca se empaquetaba (E2E E7).
+      check(m.keys.exam, 'module', bank, m.chapters.filter((ch) => ch.kind !== 'practice').map((ch) => ({ id: ch.chapterId, moduleId: m.moduleId })));
       modules.set(m.moduleId, { kind: 'bank', bank });
     } else {
       modules.set(m.moduleId, { kind: 'gift', gift: gift as string });
@@ -745,7 +754,7 @@ function resolveExamSources(plan: PackagingPlanV3, c: DynamicPackageContentsV3):
   if (plan.keys.finalExam) {
     if (c.finalExamBank && (c.finalExamGift ?? '').trim()) throw new Error(`MBZ_V3_INVARIANT: ${plan.keys.finalExam} trae GIFT y banco a la vez`);
     if (c.finalExamBank) {
-      check(plan.keys.finalExam, 'final', c.finalExamBank, plan.modules.flatMap((m) => m.chapters.map((ch) => ({ id: ch.chapterId, moduleId: m.moduleId }))));
+      check(plan.keys.finalExam, 'final', c.finalExamBank, plan.modules.flatMap((m) => m.chapters.filter((ch) => ch.kind !== 'practice').map((ch) => ({ id: ch.chapterId, moduleId: m.moduleId }))));
       final = { kind: 'bank', bank: c.finalExamBank };
     } else {
       final = { kind: 'gift', gift: c.finalExamGift as string };
@@ -981,6 +990,45 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     W.put(`${a.dir}/grades.xml`, gradesXml(a.aid));
     W.boilerplate(a.dir);
     labelsHtml.push({ where: idnumber, html: label.html });
+    return a;
+  };
+
+  // Fase 2: página (mod_page) con archivos en su filearea `content` (enlaces @@PLUGINFILE@@/<archivo>).
+  // `hidden`: visible=0 (solo docentes: moodle/course:viewhiddenactivities). `completionView`: se marca al verla.
+  const addPage = (
+    secnum: number,
+    idnumber: string,
+    page: { name: string; html: string },
+    files: Array<{ name: string; data: Buffer; mime: string }>,
+    opts: { hidden?: boolean; completionView?: boolean } = {},
+  ): ActivityRef => {
+    const a = W.newActivity('page', secnum, page.name, idnumber);
+    const fileIds = files.map((f) => W.addFile(a.ctx, 'mod_page', 'content', f.name, f.data, f.mime));
+    W.put(`${a.dir}/page.xml`, `<?xml version="1.0" encoding="UTF-8"?>
+<activity id="${a.aid}" moduleid="${a.mid}" modulename="page" contextid="${a.ctx}">
+  <page id="${a.aid}">
+    <name>${xmlEsc(page.name)}</name>
+    <intro></intro>
+    <introformat>1</introformat>
+    <content>${xmlEsc(page.html)}</content>
+    <contentformat>1</contentformat>
+    <legacyfiles>0</legacyfiles>
+    <legacyfileslast>${NULL}</legacyfileslast>
+    <display>0</display>
+    <displayoptions>a:2:{s:10:"printintro";i:0;s:17:"printlastmodified";i:0;}</displayoptions>
+    <revision>1</revision>
+    <timemodified>${ts}</timemodified>
+  </page>
+</activity>`);
+    W.put(`${a.dir}/module.xml`, applyXmlFields(withIdnumber(moduleXml(a.mid, 'page', secnum, ts, MV.bv), idnumber), {
+      ...(opts.hidden ? { visible: '0', visibleold: '0' } : {}),
+      ...(opts.completionView ? { completion: '2', completionview: '1' } : { completion: '0' }),
+      downloadcontent: '0',
+    }));
+    W.put(`${a.dir}/inforef.xml`, inforef(fileIds));
+    W.put(`${a.dir}/grades.xml`, gradesXml(a.aid));
+    W.boilerplate(a.dir);
+    labelsHtml.push({ where: idnumber, html: page.html });
     return a;
   };
 
@@ -1282,6 +1330,24 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
           addUngradedH5pActivity(sec, `${idp}:review_cards`, name, key, filename, h5p, deck.mainLibrary, (mid) =>
             reviewCardsIntroHtml({ packageFilename: filename, title: deck.title, activityMid: mid, theme: introTheme, frame: frameFor(ch.chapterNumber) }),
           );
+          continue;
+        }
+        if (slot.kind === 'application') {
+          // Fase 2: página del estudiante (visible, con su PDF imprimible) + solucionario docente (OCULTO, con su PDF).
+          const doc = c.applications?.get(ch.chapterId);
+          if (!doc || cf.applicationMinutes === undefined) throw new Error(`MBZ_V3_INVARIANT: Actividad de Aplicación del capítulo ${ch.chapterNumber} sin documento`);
+          const tone = moduleTone(theme, moduleColor(theme, m.moduleNumber - 1), groundColor(theme));
+          const studentPdfName = `capitulo-${ch.chapterNumber}-actividad-de-aplicacion.pdf`;
+          const teacherPdfName = `capitulo-${ch.chapterNumber}-solucionario-docente.pdf`;
+          const pdfIn = { courseTitle: plan.course.title, chapterNumber: ch.chapterNumber, chapterTitle: ch.title, doc, theme, documentKey: ch.keys.application };
+          const studentPdf = await renderApplicationPdf(pdfIn, 'student');
+          const teacherPdf = await renderApplicationPdf(pdfIn, 'teacher');
+          for (const r of [studentPdf, teacherPdf]) if (r.unmappedChars > 0) warnings.push(`application_chars_unmapped:${ch.keys.application}:${r.unmappedChars}`);
+          const pageIn = { chapterId: ch.chapterId, chapterNumber: ch.chapterNumber, chapterTitle: ch.title, doc, tone };
+          const student = applicationStudentPage({ ...pageIn, pdfFilename: studentPdfName }, theme);
+          addPage(sec, `${idp}:application`, { name: safeActivityName(student.name), html: student.html }, [{ name: studentPdfName, data: studentPdf.pdf, mime: 'application/pdf' }], { completionView: true });
+          const teacher = applicationSolutionPage({ ...pageIn, pdfFilename: teacherPdfName }, theme);
+          addPage(sec, `${idp}:application_solution`, { name: safeActivityName(teacher.name), html: teacher.html }, [{ name: teacherPdfName, data: teacherPdf.pdf, mime: 'application/pdf' }], { hidden: true });
           continue;
         }
         // slot.kind === 'activity'

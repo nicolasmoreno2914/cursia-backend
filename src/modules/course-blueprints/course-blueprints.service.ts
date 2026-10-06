@@ -11,7 +11,7 @@ import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
 import { lockPedagogyInput } from '../pedagogy/pedagogical-blueprint';
 import { loadCurrentPedagogicalProfile } from '../pedagogy/pedagogy-db';
-import { profileTargetHours } from '../pedagogy/pedagogy-profile';
+import { profileApplicationContext, profileTargetHours } from '../pedagogy/pedagogy-profile';
 import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import {
   BlueprintSnapshotV1,
@@ -323,7 +323,8 @@ export class CourseBlueprintsService {
       );
       const chapters: RawChapterRowV2[] = await qr.query(
         `select id, module_id, position, title, objective, description, video_enabled, activity_enabled,
-                to_jsonb(course_chapters) ->> 'chapter_kind' as chapter_kind
+                to_jsonb(course_chapters) ->> 'chapter_kind' as chapter_kind,
+                to_jsonb(course_chapters) ->> 'application_minutes' as application_minutes
            from public.course_chapters where course_id = $1`,
         [courseId],
       );
@@ -348,6 +349,8 @@ export class CourseBlueprintsService {
         reviewCards: course.review_cards_enabled === true,
         // Sin objetivo de horas: la clave no entra al snapshot (sha de siempre).
         targetHours: profileTargetHours(pedagogyProfile ? pedagogyProfile.profile : null),
+        // Fase 2: estudiante + resultados de aprendizaje congelados (solo entran si hay Actividades de Aplicación).
+        applicationContext: profileApplicationContext(pedagogyProfile ? pedagogyProfile.profile : null),
       };
       const errors = validateBlueprintInputV2(courseRef, modules, chapters);
       if (errors.length > 0) {

@@ -160,6 +160,36 @@ const INVALID = {
   blanks: () => ({ ...H5P.blanks, questions: ['La velocidad se mide en *km/h*.'] }),
 };
 
+// Fase 2: actividad VÁLIDA para el nivel de minutos (EXERCISES_BY_MINUTES); el género cambia con el tipo de capítulo
+// (procedimiento en la práctica, análisis de casos en el de contenido) para que no todas tengan la misma forma.
+function applicationActivity(minutes, practice) {
+  const count = { 30: 6, 60: 7, 90: 9, 120: 10 }[minutes];
+  if (!count) throw new Error(`fake LLM v3: minutos de actividad inválidos ${minutes}`);
+  const split = { 30: [5, 15, 8, 2], 60: [10, 30, 15, 5], 90: [15, 45, 25, 5], 120: [20, 60, 35, 5] }[minutes];
+  const diff = (i) => (i < 2 ? 'basico' : i < count - 2 ? 'intermedio' : 'avanzado');
+  return {
+    genre: practice ? 'procedure' : 'case_analysis',
+    title: practice ? 'Inspección integradora del circuito' : 'Analiza un caso de mantenimiento en faena',
+    objective: practice ? 'Ejecutar una inspección completa del circuito hidráulico registrando cada verificación.' : 'Analizar una situación de mantenimiento y proponer una intervención fundamentada.',
+    context: 'Trabajas en el turno de mantenimiento de una faena del norte de Chile. El equipo te pide revisar un circuito hidráulico antes de liberarlo a operación. Los datos de esta actividad son hipotéticos e ilustrativos.',
+    examples: [{ title: 'Caso resuelto', problem: 'Un cilindro pierde fuerza al final de la carrera.', steps: ['Bloquea y etiqueta el equipo.', 'Mide la presión en el puerto de prueba.', 'Compara con el valor de placa.'], result: 'La presión está bajo el valor de placa: se revisa la válvula de alivio.' }],
+    exercises: Array.from({ length: count }, (_, i) => ({ id: `E${i + 1}`, prompt: `Revisa la situación hipotética ${i + 1} del circuito y explica qué verificarías primero.`, difficulty: diff(i), answerLines: 3 })),
+    workshop: { title: 'Taller de inspección', situation: 'Un equipo vuelve de una mantención y debes decidir si se libera a operación con los registros del turno.', instructions: ['Revisa los registros.', 'Identifica la verificación pendiente.', 'Redacta la decisión para el supervisor.'] },
+    deliverable: { description: 'Una hoja de inspección completa con la decisión justificada.', format: 'Hoja de inspección', extent: 'Una página' },
+    selfCheck: ['¿Bloqueé el equipo antes de medir?', '¿Registré cada valor?', '¿Comparé con el valor de placa?', '¿Justifiqué la decisión?'],
+    criteria: [{ name: 'Seguridad', description: 'Aplica el bloqueo antes de intervenir.', weight: 40 }, { name: 'Diagnóstico', description: 'Identifica la causa con evidencia.', weight: 40 }, { name: 'Registro', description: 'Deja la inspección documentada.', weight: 20 }],
+    minutesBySection: { examples: split[0], exercises: split[1], workshop: split[2], selfCheck: split[3] },
+  };
+}
+function applicationSolution(a) {
+  return {
+    answers: a.exercises.map((e) => ({ exerciseId: e.id, answer: `Verificar primero la presión del circuito en la situación del ${e.id}.`, explanation: 'La presión fuera de rango es la causa más frecuente y se mide sin desarmar.' })),
+    workshopSolution: 'Un buen trabajo revisa los registros, detecta la verificación pendiente, la ejecuta con el equipo bloqueado y deja la decisión escrita.',
+    correctionGuide: a.criteria.map((c) => ({ criterion: c.name, achieved: 'Cumple el criterio por completo.', developing: 'Cumple el criterio en parte.', insufficient: 'No cumple el criterio.' })),
+    teacherNotes: ['Acepta otra secuencia si mantiene el bloqueo antes de intervenir.'],
+  };
+}
+
 function giftBlocks(prefix, from, split, typesOnly) {
   const pad = (n) => (n < 10 ? '0' + n : String(n));
   const out = [];
@@ -292,6 +322,29 @@ function createLlmV3({ base, chapterIdFromText, examBankContract, h5p2 }) {
         st.retriesSeen.final_exam = (st.retriesSeen.final_exam || 0) + 1;
         rec('final_exam_correction', String(st.courseId), { miss });
         return { text: giftBlocks('EF', from, miss, miss) };
+      }
+      // Fase 2 · Actividades de Aplicación: 1.ª pasada (actividad del estudiante; inválida UNA vez: pesos que no
+      // suman 100 → reintento dirigido) y 2.ª pasada (solucionario de ESA actividad: ids y criterios del prompt).
+      if (prompt.indexOf('Diseña la ACTIVIDAD DE APLICACIÓN de este capítulo para ') >= 0) {
+        const title = (/CAPÍTULO: "([^"]*)"/.exec(prompt) || [])[1] || '';
+        const id = st.chapterByTitle.get(title);
+        if (!id) throw new Error(`fake LLM v3: capítulo desconocido "${title}" (actividad de aplicación)`);
+        const minutes = Number((/para (\d+) minutos de trabajo del estudiante/.exec(prompt) || [])[1]);
+        const practice = prompt.indexOf('Es un CAPÍTULO DE PRÁCTICA') >= 0;
+        if (retry) st.retriesSeen.application_activity = (st.retriesSeen.application_activity || 0) + 1;
+        const bad = !retry && once('application_activity');
+        rec('application_activity', id, { invalid: bad, retry, minutes, practice });
+        const a = applicationActivity(minutes, practice);
+        if (bad) a.criteria[0].weight += 10;
+        return J(a);
+      }
+      if (prompt.indexOf('Escribe el SOLUCIONARIO DOCENTE de esa actividad') >= 0) {
+        const m = /ACTIVIDAD DEL ESTUDIANTE \(ya aprobada; NO la cambies\):\n(.*)\n\nEscribe el SOLUCIONARIO/s.exec(prompt);
+        if (!m) throw new Error('fake LLM v3: prompt de solucionario sin la actividad');
+        const a = JSON.parse(m[1]);
+        const title = (/CAPÍTULO: "([^"]*)"/.exec(prompt) || [])[1] || '';
+        rec('application_solution', st.chapterByTitle.get(title) || title, { retry, exercises: a.exercises.length });
+        return J(applicationSolution(a));
       }
     } catch (e) {
       st.unknown.push(String(e && e.message));

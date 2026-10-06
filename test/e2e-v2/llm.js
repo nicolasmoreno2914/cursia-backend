@@ -70,7 +70,8 @@ function createLlm({ getFixtures, getSplit }) {
         let mm;
         while ((mm = re.exec(prompt))) {
           if (mm[2]) plan.modules[mm[2]] = { summary: `Propósito del módulo ${mm[1]}: ${mm[3]} (${tag}).` };
-          else plan.chapters[mm[5]] = {
+          // El renglón del capítulo puede traer su descripción/rol (p. ej. práctica): el concepto usa solo el título.
+          else if ((mm[6] = mm[6].split(/ [—(]/)[0].slice(0, 80))) plan.chapters[mm[5]] = {
             summary: `El capítulo ${mm[4]} cubre ${mm[6]} y avanza sobre lo anterior (${tag}).`,
             concepts_introduced: [`Concepto clave de ${mm[6]}`, `Práctica de ${mm[6]}`],
             concepts_assumed: [],

@@ -1,3 +1,4 @@
+import { APPLICATION_ARTIFACT_TYPE, validateApplicationActivityDoc } from '../course-shell/application-activity';
 /**
  * Cursia V2.1 — R12: empaque de runs rulesVersion 3 — resolución de
  * artifacts, perfiles vigentes, tema, clave de reuse y carga de contenidos.
@@ -672,6 +673,8 @@ export async function loadContentsV3(
     scormHtml?: string;
     scormManifest?: string;
     audio?: Buffer;
+    /** Fase 2: Actividad de Aplicación (actividad + solucionario), re-validada contra los minutos del plan. */
+    application?: unknown;
   };
   const tasks: Array<() => Promise<void>> = [];
   let courseIntro: any;
@@ -782,6 +785,16 @@ export async function loadContentsV3(
       }
       const audioKey = ch.keys.audiobookChapter;
       if (audioKey) tasks.push(async () => { slot.audio = await audio(audioKey); });
+      const appKey = ch.keys.application;
+      if (appKey) {
+        tasks.push(async () => {
+          const doc = json(await validatedText(L, byItem, appKey, APPLICATION_ARTIFACT_TYPE), appKey);
+          // Falla fuerte: nunca se empaqueta una actividad (o su solucionario) incompleta.
+          const errs = validateApplicationActivityDoc(doc, { chapterId: ch.chapterId, minutes: ch.applicationMinutes as number });
+          if (errs.length) throw new Error(`${PACKAGING_V3}: ${appKey} inválido [${[...new Set(errs.map((e) => e.code))].sort().join(', ')}] ${errs.slice(0, 3).map((e) => `${e.path} ${e.message}`).join(' | ')}`);
+          slot.application = doc;
+        });
+      }
     }
   }
   if (plan.keys.finalExam) {
@@ -804,6 +817,7 @@ export async function loadContentsV3(
   const videoInteractions = new Map<string, unknown>();
   const activities = new Map<string, ActivityContentV3>();
   const audiobookChapters = new Map<string, Buffer>();
+  const applications = new Map<string, unknown>();
   // r19: manifiesto validado por capítulo (output_summary del item) para el piso de 25 min del audiolibro.
   // null = audio real SIN manifiesto (curso existente, anterior a r19): el piso se omite con aviso y el
   // re-empaque NUNCA re-narra ni llama a un proveedor. Los capítulos simulados no entran al mapa.
@@ -836,6 +850,7 @@ export async function loadContentsV3(
           activities.set(ch.chapterId, { variant: 'scorm', html: slot.scormHtml as string, manifestXml: slot.scormManifest as string });
         }
       }
+      if (ch.keys.application) applications.set(ch.chapterId, slot.application);
       if (ch.keys.audiobookChapter) {
         audiobookChapters.set(ch.chapterId, slot.audio as Buffer);
         if (!mockProviderItems.includes(ch.keys.audiobookChapter)) {
@@ -883,6 +898,8 @@ export async function loadContentsV3(
       audioWelcome: audioWelcome as Buffer,
       audiobookChapters,
       audiobookManifests,
+      // Fase 2: solo con actividades (sin ellas, la entrada del builder de siempre).
+      ...(applications.size ? { applications } : {}),
     },
     exams: { modules: examSources, final: finalSrc },
     warnings,

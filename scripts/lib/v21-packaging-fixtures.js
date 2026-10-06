@@ -91,6 +91,9 @@ function packagingInput(distRoot, o = {}) {
   const videoInteractions = new Map();
   const activities = new Map();
   const slices = ['slice-a.mp3', 'slice-b.mp3', 'slice-c.mp3'];
+  // Fase 2: documento de prueba de cada Actividad de Aplicación (salida simulada del ejecutor; valida contra el contrato).
+  const applications = new Map();
+  for (const c of chapters) if (c.applicationMinutes !== undefined) applications.set(c.chapterId, applicationDoc(c.chapterId, c.applicationMinutes, c.chapterNumber));
   chapters.forEach((c, i) => {
     if (c.kind === 'practice') {
       // Motor de carga horaria: el capítulo de práctica no tiene presentación, Libro (content) ni audiolibro.
@@ -174,8 +177,36 @@ function packagingInput(distRoot, o = {}) {
       finalExamGift: finalExam ? SF.FINAL_GIFT : null,
       audioWelcome: welcome,
       audiobookChapters,
+      ...(applications.size ? { applications } : {}),
     },
   };
+}
+
+/** Fase 2: documento `dynamic_application_json` de prueba (cantidades según el nivel de minutos). */
+function applicationDoc(chapterId, minutes, n) {
+  const count = { 30: 6, 60: 7, 90: 9, 120: 10 }[minutes];
+  const diff = (i) => (i < 2 ? 'basico' : i < count - 2 ? 'intermedio' : 'avanzado');
+  const split = { 30: [5, 15, 8, 2], 60: [10, 30, 15, 5], 90: [15, 45, 25, 5], 120: [20, 60, 35, 5] }[minutes];
+  const activity = {
+    genre: 'case_analysis',
+    title: `Aplica el capítulo ${n} en un caso real`,
+    objective: 'Analizar una situación de atención al cliente y proponer una respuesta fundamentada.',
+    context: 'Trabajas en el área de servicio de una empresa de la región y recibes casos que exigen aplicar lo aprendido en el capítulo.',
+    examples: [{ title: 'Caso resuelto', problem: 'Un cliente reclama por una entrega tardía y pide la devolución del dinero.', steps: ['Escucha y resume el reclamo.', 'Propón una solución dentro de la política.'], result: 'El cliente acepta un reenvío sin costo.' }],
+    exercises: Array.from({ length: count }, (_, i) => ({ id: `E${i + 1}`, prompt: `Analiza el caso hipotético ${i + 1} y explica qué harías.`, difficulty: diff(i), answerLines: 3 })),
+    workshop: { title: 'Taller del capítulo', situation: 'Atiendes una jornada con varios casos hipotéticos de clientes y debes priorizar y responder cada uno.', instructions: ['Prioriza los casos.', 'Redacta la respuesta de los dos más urgentes.'] },
+    deliverable: { description: 'Un documento con la priorización y las respuestas.', format: 'Documento', extent: 'Una página' },
+    selfCheck: ['¿Escuché el reclamo completo?', '¿Mi solución está dentro de la política?', '¿Expliqué el porqué?', '¿Usé un tono cordial?'],
+    criteria: [{ name: 'Análisis del caso', description: 'Identifica el problema real.', weight: 40 }, { name: 'Solución', description: 'Propone una solución viable.', weight: 40 }, { name: 'Comunicación', description: 'Responde con claridad y cordialidad.', weight: 20 }],
+    minutesBySection: { examples: split[0], exercises: split[1], workshop: split[2], selfCheck: split[3] },
+  };
+  const solution = {
+    answers: activity.exercises.map((e) => ({ exerciseId: e.id, answer: `Respuesta esperada del ${e.id}.`, explanation: 'Se identifica el problema y se propone una solución dentro de la política.' })),
+    workshopSolution: 'Un buen trabajo prioriza por urgencia e impacto, responde con empatía y deja registro de cada caso atendido en la jornada.',
+    correctionGuide: activity.criteria.map((c) => ({ criterion: c.name, achieved: 'Cumple el criterio por completo.', developing: 'Cumple el criterio en parte.', insufficient: 'No cumple el criterio.' })),
+    teacherNotes: ['Acepta soluciones alternativas si respetan la política.'],
+  };
+  return { schemaVersion: 1, chapterId, minutes, activity, solution };
 }
 
 /**
@@ -205,7 +236,7 @@ function expectedSequence(distRoot, input) {
   for (const mod of m.modules) {
     mod.chapters.forEach((ch, i) => {
       const ids = i === 0 ? [`cv3:module_intro:${mod.moduleId}`] : [];
-      for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled, reviewCards: hasReview(ch.chapterId), practice: ch.kind === 'practice' })) {
+      for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled, reviewCards: hasReview(ch.chapterId), practice: ch.kind === 'practice', application: ch.applicationMinutes !== undefined })) {
         const role = s.startsWith('label:') ? s.slice(6) : s === 'video_h5p' ? 'video' : s;
         ids.push(`cv3:ch:${ch.chapterId}:${role}`);
       }
@@ -226,4 +257,4 @@ function expectedSequence(distRoot, input) {
   return seq;
 }
 
-module.exports = { packagingInput, expectedSequence, contentMd, moduleGift, SCORM_HTML, SCORM_MANIFEST, YOUTUBE_ID, VIDEO_SECONDS };
+module.exports = { packagingInput, expectedSequence, applicationDoc, contentMd, moduleGift, SCORM_HTML, SCORM_MANIFEST, YOUTUBE_ID, VIDEO_SECONDS };

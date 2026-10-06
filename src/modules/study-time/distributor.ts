@@ -18,8 +18,9 @@
 //   - Prioridad: técnica > producto > curso (targetHours, toggles del docente) > pedagogía > preferencias.
 //     targetHours obliga a cambiar la estructura, pero esos cambios son PROPUESTAS: el lock nunca las aplica.
 //
-// Fase 1: la Actividad de aplicación todavía no se genera (Fase 2). El distribuidor reserva su nivel en el
-// diseño y reporta por separado las horas del diseño completo y las que se pueden generar HOY.
+// Fase 2: la Actividad de Aplicación SE GENERA (item `application_activity` del Manifest). El distribuidor fija
+// su nivel por capítulo y las horas generables son las del diseño completo (`generableHours` se conserva por
+// compatibilidad: es igual a `estimatedHours`).
 import type { BlueprintSnapshotV2 } from '../course-blueprints/blueprint-snapshot';
 import type { DesignRules } from '../pedagogy/design-rules';
 import { chapterRole } from '../pedagogy/pedagogical-blueprint';
@@ -28,7 +29,7 @@ import { STRUCTURE_TITLE_MAX } from '../course-structure/structure-titles';
 import { isValidTargetHours } from './target-hours';
 import { STUDY_TIME_RULES, StudyTimeCourseInput, StudyTimeEstimate, estimateCourseStudyTime } from './time-model';
 
-export const DISTRIBUTOR_VERSION = 1 as const;
+export const DISTRIBUTOR_VERSION = 2 as const;
 
 export interface DistributorPolicy {
   /** Nivel máximo de la Actividad de aplicación en capítulos de contenido y en los cierres de módulo / práctica. */
@@ -71,7 +72,7 @@ export interface ProposedChapter {
   videoEnabled: boolean;
   activityEnabled: boolean;
   review: boolean;
-  /** Nivel de la Actividad de aplicación (Fase 2: reservado en el diseño, todavía no se genera). */
+  /** Nivel de la Actividad de Aplicación (minutos; null = sin actividad). Se genera con el curso (Fase 2). */
   applicationMinutes: number | null;
   /** Tiempo objetivo del capítulo (modelo de tiempo, exacto) y lo que se puede generar hoy (sin la Actividad). */
   targetMinutes: number;
@@ -86,7 +87,7 @@ export interface ProposedModule {
 }
 
 export interface DistributionChange {
-  type: 'add_practice_chapter' | 'add_content_chapter' | 'set_application_activity' | 'role_changed';
+  type: 'add_practice_chapter' | 'add_content_chapter' | 'set_application_activity' | 'remove_application_activity' | 'role_changed';
   moduleId: string;
   chapterId: string;
   /** Texto para el docente. */
@@ -104,12 +105,14 @@ export interface DistributionResult {
   baseHours: number;
   /** Horas del diseño propuesto completo. */
   estimatedHours: number;
-  /** Horas que se pueden generar HOY (sin las Actividades de aplicación de la Fase 2). */
+  /** Horas que se pueden generar HOY: desde la Fase 2, todo el diseño (= estimatedHours). */
   generableHours: number;
   deltaHours: number;
   /** Proporción del diseño en Actividades de aplicación (0–1), incluidos los capítulos de práctica. */
   applicationShare: number;
   policy: { kind: 'application_first' | 'depth_first'; weights: { application: number; depth: number } | null } & DistributorPolicy;
+  /** Fase 2 · «Ajustar»: preferencias efectivas con las que se armó el diseño. */
+  preferences: Required<DesignPreferences>;
   modules: ProposedModule[];
   changes: DistributionChange[];
   recommendations: string[];
@@ -132,8 +135,26 @@ export interface DistributionResult {
   studyTime: StudyTimeEstimate;
 }
 
+/**
+ * Fase 2 · «Ajustar» (preferencias del docente, guardadas en el perfil pedagógico como `designPreferences`):
+ *   - emphasis: 'application' fuerza la política de aplicación primero; 'depth', la de profundidad; 'balanced'
+ *     (por defecto) usa la que deriva el enfoque.
+ *   - applicationActivities: 'auto' (por defecto: donde el diseño las necesite), 'practice_only' (solo en capítulos
+ *     de práctica) o 'none' (ninguna: el curso crece solo con capítulos).
+ */
+export type DesignEmphasis = 'application' | 'balanced' | 'depth';
+export type ApplicationActivitiesMode = 'auto' | 'practice_only' | 'none';
+export const DESIGN_EMPHASES: readonly DesignEmphasis[] = ['application', 'balanced', 'depth'];
+export const APPLICATION_ACTIVITIES_MODES: readonly ApplicationActivitiesMode[] = ['auto', 'practice_only', 'none'];
+export interface DesignPreferences {
+  emphasis?: DesignEmphasis;
+  applicationActivities?: ApplicationActivitiesMode;
+}
+
 export interface DistributorInput {
   snapshot: BlueprintSnapshotV2;
+  /** Fase 2 · «Ajustar»: preferencias del docente (ausentes = las de siempre). */
+  preferences?: DesignPreferences | null;
   /** Reglas del motor pedagógico (null = sin enfoque: política neutra). */
   rules: DesignRules | null;
   targetHours: number;
@@ -204,7 +225,18 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   const tolMinH = input.tolerance?.minHours ?? DISTRIBUTOR_RULES.tolerance.minHours;
   if (!(tolPct >= 0 && tolPct <= 0.5) || !(tolMinH >= 0 && tolMinH <= 10)) throw new DistributorError('tolerancia fuera de rango (pct 0–0,5; minHours 0–10)');
 
-  const policy = distributorPolicyFor(rules);
+  const prefs = input.preferences ?? {};
+  if (prefs.emphasis !== undefined && !DESIGN_EMPHASES.includes(prefs.emphasis)) throw new DistributorError(`emphasis inválido (${JSON.stringify(prefs.emphasis)})`);
+  if (prefs.applicationActivities !== undefined && !APPLICATION_ACTIVITIES_MODES.includes(prefs.applicationActivities)) {
+    throw new DistributorError(`applicationActivities inválido (${JSON.stringify(prefs.applicationActivities)})`);
+  }
+  const appMode: ApplicationActivitiesMode = prefs.applicationActivities ?? 'auto';
+  const basePolicy = distributorPolicyFor(rules);
+  const policy: DistributionResult['policy'] = prefs.emphasis === 'application'
+    ? { ...basePolicy, kind: 'application_first', ...DISTRIBUTOR_RULES.applicationFirst }
+    : prefs.emphasis === 'depth'
+      ? { ...basePolicy, kind: 'depth_first', ...DISTRIBUTOR_RULES.depthFirst }
+      : basePolicy;
   const target = input.targetHours * 60;
   const tol = Math.max(target * tolPct, tolMinH * 60);
   const review = snapshot.course.reviewCards === true && atr === 2 && snapshot.course.activityEngine === 'h5p';
@@ -224,7 +256,8 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
         objective: c.objective ?? null,
         videoEnabled: !!c.videoEnabled,
         activityEnabled: c.activityEnabled === true,
-        applicationMinutes: null,
+        // Fase 2: se arranca con las Actividades de Aplicación que la estructura YA tiene (ver «ya cumple», abajo).
+        applicationMinutes: typeof (c as { applicationMinutes?: unknown }).applicationMinutes === 'number' ? ((c as { applicationMinutes?: number }).applicationMinutes as number) : null,
       })),
     }));
   if (design.some((m) => m.chapters.length === 0)) throw new DistributorError('cada módulo necesita al menos un capítulo');
@@ -259,15 +292,26 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   const roleOf = (m: WorkModule, c: WorkChapter) => chapterRole(m.chapters.indexOf(c), m.chapters.length);
   const changes: DistributionChange[] = [];
   const priorityTrace: string[] = [];
+  // Fase 2 (review I2): minutos de Actividad de Aplicación con los que llegó cada capítulo existente; quitar o cambiar
+  // una actividad ES un cambio (si no, «Ninguna» dejaría las actividades en la base y se generarían igual).
+  const initialMinutes = new Map(design.flatMap((m) => m.chapters.map((c) => [c.id, c.applicationMinutes] as const)));
+  const pushRemovals = () => {
+    for (const m of design) for (const c of m.chapters) {
+      if (c.proposed || initialMinutes.get(c.id) == null || c.applicationMinutes !== null) continue;
+      if (changes.some((x) => x.type === 'remove_application_activity' && x.chapterId === c.id)) continue;
+      changes.push({ type: 'remove_application_activity', moduleId: m.id, chapterId: c.id, detail: `Se quita la Actividad de Aplicación de ${initialMinutes.get(c.id)} min de «${c.title}».` });
+    }
+  };
   const baseHours = r1(estimateCourseStudyTime(toInput(false)).courseEstimatedMinutes / 60);
 
   const result = (status: DistributionStatus, recs: string[]): DistributionResult => {
-    const generable = estimateCourseStudyTime(toInput(false));
+    pushRemovals();
+    const generable = est; // Fase 2: las Actividades de Aplicación se generan
     // Re-revisión L3: los capítulos de práctica no tienen tope de aplicación; si el diseño queda por encima de la
-    // proporción del enfoque, se dice explícitamente (las Actividades de aplicación todavía no se generan).
+    // proporción del enfoque, se dice explícitamente.
     const share = est.byComponent.application / est.courseEstimatedMinutes;
     const recommendations = share > policy.maxApplicationShare + 1e-9
-      ? [...recs, `El ${Math.round(share * 100)} % de este diseño son Actividades de aplicación (más que el ${Math.round(policy.maxApplicationShare * 100)} % habitual del enfoque) y todavía no se generan: hoy el curso tendría ${String(r1(generable.courseEstimatedMinutes / 60)).replace('.', ',')} h. Si el curso es chico, conviene sumar capítulos de contenido o un módulo en lugar de más práctica.`]
+      ? [...recs, `El ${Math.round(share * 100)} % de este diseño son Actividades de Aplicación (más que el ${Math.round(policy.maxApplicationShare * 100)} % habitual del enfoque). Si el curso es chico, conviene sumar capítulos de contenido o un módulo en lugar de más práctica.`]
       : recs;
     const estChapter = new Map(est.modules.flatMap((m) => m.chapters).map((c) => [c.chapterId, c.chapterEstimatedMinutes]));
     const genChapter = new Map(generable.modules.flatMap((m) => m.chapters).map((c) => [c.chapterId, c.chapterEstimatedMinutes]));
@@ -305,6 +349,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
       deltaHours: r1(est.courseEstimatedHours - input.targetHours),
       applicationShare: Math.round((est.byComponent.application / est.courseEstimatedMinutes) * 100) / 100,
       policy,
+      preferences: { emphasis: prefs.emphasis ?? 'balanced', applicationActivities: appMode },
       modules,
       changes,
       recommendations,
@@ -328,6 +373,20 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
 
   const fmtH = (n: number) => String(r1(n)).replace('.', ',');
   const initialRoles = new Map(design.flatMap((m) => m.chapters.map((c) => [c.id, roleOf(m, c)] as const)));
+
+  // Fase 2 — «ya cumple»: si la estructura ACTUAL, con sus Actividades de Aplicación (p. ej. un diseño ya aplicado o
+  // fijado a mano), queda dentro de la tolerancia y respeta las preferencias, no se propone nada (el distribuidor es
+  // estable sobre su propio resultado). Si no, se rediseña desde cero (las actividades existentes no condicionan).
+  const hasExisting = design.some((m) => m.chapters.some((c) => c.applicationMinutes !== null));
+  const respectsMode = design.every((m) => m.chapters.every((c) => c.applicationMinutes === null || (appMode !== 'none' && (appMode !== 'practice_only' || c.kind === 'practice'))));
+  if (hasExisting && respectsMode && Math.abs(minutes() - target) <= tol) {
+    priorityTrace.push('La estructura actual, con sus Actividades de Aplicación, ya cumple la carga horaria objetivo: no se propone ningún cambio.');
+    return result('within_tolerance', []);
+  }
+  if (hasExisting) {
+    for (const m of design) for (const c of m.chapters) c.applicationMinutes = null;
+    reEval();
+  }
 
   // 1) No rellenar: la estructura mínima ya supera el objetivo → informar y proponer, nunca recortar sola.
   if (minutes() > target + tol) {
@@ -357,6 +416,8 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
    */
   const trySetTier = (m: WorkModule, c: WorkChapter, tier: number | null): boolean => {
     if (tier !== null && tier > capOf(m, c)) return false;
+    // «Ajustar»: sin Actividades de Aplicación, o solo en los capítulos de práctica.
+    if (tier !== null && (appMode === 'none' || (appMode === 'practice_only' && c.kind !== 'practice'))) return false;
     const prev = c.applicationMinutes;
     c.applicationMinutes = tier;
     reEval();
@@ -411,7 +472,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
         for (const t of [...tiers].reverse()) if (trySetTier(m, pc, t)) break;
         changes.push({
           type: 'add_practice_chapter', moduleId: m.id, chapterId: pc.id,
-          detail: `Capítulo de práctica «${pc.title}»: sin video, presentación ni audiolibro; actividad H5P${review ? ', repaso' : ''}${pc.applicationMinutes ? ` y Actividad de aplicación de ${pc.applicationMinutes} min (se genera más adelante)` : ''}.`,
+          detail: `Capítulo de práctica «${pc.title}»: sin video, presentación ni audiolibro; actividad H5P${review ? ', repaso' : ''}${pc.applicationMinutes ? ` y Actividad de Aplicación de ${pc.applicationMinutes} min` : ''}.`,
         });
       }
     }
@@ -444,7 +505,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
         trySetTier(m, cc, tiers[0]);
         changes.push({
           type: 'add_content_chapter', moduleId: m.id, chapterId: cc.id,
-          detail: `Capítulo de profundización «${cc.title}»${usesVideo ? ' con video' : ''}, actividad${review ? ', repaso' : ''}${cc.applicationMinutes ? ` y Actividad de aplicación de ${cc.applicationMinutes} min (se genera más adelante)` : ''}.`,
+          detail: `Capítulo de profundización «${cc.title}»${usesVideo ? ' con video' : ''}, actividad${review ? ', repaso' : ''}${cc.applicationMinutes ? ` y Actividad de Aplicación de ${cc.applicationMinutes} min` : ''}.`,
         });
         growApplication();
       }
@@ -475,8 +536,11 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
     }
   }
   for (const m of design) for (const c of m.chapters) {
-    if (c.applicationMinutes && !c.proposed) {
-      changes.push({ type: 'set_application_activity', moduleId: m.id, chapterId: c.id, detail: `Actividad de aplicación de ${c.applicationMinutes} min en «${c.title}» (se genera más adelante).` });
+    const had = initialMinutes.get(c.id) ?? null;
+    if (c.applicationMinutes && !c.proposed && c.applicationMinutes !== had) {
+      changes.push({ type: 'set_application_activity', moduleId: m.id, chapterId: c.id, detail: had
+        ? `Actividad de Aplicación de «${c.title}»: de ${had} a ${c.applicationMinutes} min.`
+        : `Actividad de Aplicación de ${c.applicationMinutes} min en «${c.title}».` });
     }
     const before = initialRoles.get(c.id);
     if (!c.proposed && before && before !== roleOf(m, c)) {

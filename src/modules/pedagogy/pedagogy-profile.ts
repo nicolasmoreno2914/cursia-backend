@@ -71,6 +71,11 @@ export interface PedagogicalProfile {
    * perfil sin enfoque.
    */
   targetHours?: number;
+  /**
+   * Fase 2 · «Ajustar»: preferencias del diseño (énfasis y Actividades de Aplicación). Opcional: la clave existe SOLO
+   * si alguna difiere del valor por defecto (perfiles anteriores conservan su sha).
+   */
+  designPreferences?: { emphasis?: 'application' | 'depth'; applicationActivities?: 'practice_only' | 'none' };
 }
 
 export interface PedagogyValidationError {
@@ -115,7 +120,34 @@ const TOP_KEYS = [
 /** `designRules` lo escribe el servidor: se tolera en la entrada (se ignora y se recalcula). */
 const TOLERATED_KEYS = ['designRules'];
 /** Claves opcionales (ausentes = comportamiento anterior). */
-const OPTIONAL_KEYS = ['targetHours'];
+const OPTIONAL_KEYS = ['targetHours', 'designPreferences'];
+const DESIGN_EMPHASES_ALLOWED = ['application', 'balanced', 'depth'];
+const APPLICATION_MODES_ALLOWED = ['auto', 'practice_only', 'none'];
+
+/** Fase 2 · «Ajustar»: preferencias del diseño del perfil (vacío = las de siempre). Lanza si son inválidas. */
+export function profileDesignPreferences(p: unknown): { emphasis?: 'application' | 'balanced' | 'depth'; applicationActivities?: 'auto' | 'practice_only' | 'none' } {
+  if (!isPlainObject(p) || p.designPreferences === undefined || p.designPreferences === null) return {};
+  const errs: PedagogyValidationError[] = [];
+  checkDesignPreferences(p.designPreferences, errs);
+  if (errs.length) throw new Error(`PROFILE_INVALID: ${errs.map((e) => `${e.code} ${e.path}: ${e.message}`).join('; ')}`);
+  return { ...(p.designPreferences as object) } as any;
+}
+
+function checkDesignPreferences(v: unknown, errors: PedagogyValidationError[]): void {
+  if (!isPlainObject(v)) {
+    errors.push({ path: 'designPreferences', code: 'INVALID_TYPE', message: 'designPreferences debe ser un objeto' });
+    return;
+  }
+  for (const k of Object.keys(v)) {
+    if (k !== 'emphasis' && k !== 'applicationActivities') errors.push({ path: `designPreferences.${k}`, code: 'UNKNOWN_FIELD', message: `Campo desconocido "designPreferences.${k}"` });
+  }
+  if (v.emphasis !== undefined && !DESIGN_EMPHASES_ALLOWED.includes(v.emphasis as string)) {
+    errors.push({ path: 'designPreferences.emphasis', code: 'INVALID_OPTION', message: `emphasis inválido (permitidos: ${DESIGN_EMPHASES_ALLOWED.join(', ')})` });
+  }
+  if (v.applicationActivities !== undefined && !APPLICATION_MODES_ALLOWED.includes(v.applicationActivities as string)) {
+    errors.push({ path: 'designPreferences.applicationActivities', code: 'INVALID_OPTION', message: `applicationActivities inválido (permitidos: ${APPLICATION_MODES_ALLOWED.join(', ')})` });
+  }
+}
 
 /**
  * Horas objetivo de un perfil guardado o enviado (con o sin enfoque). null = sin objetivo (comportamiento
@@ -127,6 +159,14 @@ export function profileTargetHours(p: unknown): number | null {
     throw new Error(`PROFILE_INVALID: INVALID_TARGET_HOURS targetHours: debe ser un número de ${TARGET_HOURS_MIN} a ${TARGET_HOURS_MAX} horas, en pasos de 0,5 (fue ${JSON.stringify(p.targetHours)})`);
   }
   return p.targetHours;
+}
+/**
+ * Fase 2 · Actividades de Aplicación: estudiante + resultados de aprendizaje del perfil (lo que el Blueprint congela
+ * en course.applicationContext). null sin perfil.
+ */
+export function profileApplicationContext(p: unknown): { learner: unknown; learningOutcomes: unknown } | null {
+  if (!isPlainObject(p)) return null;
+  return { learner: p.learner ?? null, learningOutcomes: p.learningOutcomes ?? null };
 }
 const LEARNER_KEYS = ['description', 'ageGroup', 'educationLevel', 'priorKnowledge', 'experience'];
 const OUTCOME_KEYS = ['know', 'do', 'competencies'];
@@ -205,6 +245,7 @@ export function validatePedagogicalProfile(
   if ('targetHours' in p && p.targetHours !== null && !isValidTargetHours(p.targetHours)) {
     err('targetHours', 'INVALID_TARGET_HOURS', `targetHours debe ser un número de ${TARGET_HOURS_MIN} a ${TARGET_HOURS_MAX} horas, en pasos de 0,5`);
   }
+  if ('designPreferences' in p && p.designPreferences !== null) checkDesignPreferences(p.designPreferences, errors);
   return errors;
 }
 
@@ -286,6 +327,15 @@ export function normalizePedagogicalProfile(
     origin: q.origin,
     // Solo si se definió: los perfiles sin objetivo conservan bytes y sha.
     ...(q.targetHours !== undefined && q.targetHours !== null ? { targetHours: q.targetHours } : {}),
+    // Fase 2: solo lo que difiere del valor por defecto (sin preferencias: bytes y sha de siempre).
+    ...(() => {
+      const dp = (q as any).designPreferences;
+      if (!dp) return {};
+      const out: Record<string, string> = {};
+      if (dp.emphasis && dp.emphasis !== 'balanced') out.emphasis = dp.emphasis;
+      if (dp.applicationActivities && dp.applicationActivities !== 'auto') out.applicationActivities = dp.applicationActivities;
+      return Object.keys(out).length ? { designPreferences: out as PedagogicalProfile['designPreferences'] } : {};
+    })(),
   };
 }
 

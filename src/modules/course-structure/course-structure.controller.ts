@@ -1,3 +1,4 @@
+import { ApplyDistributionDto } from './dto/apply-distribution.dto';
 import {
   Controller,
   Get,
@@ -47,6 +48,17 @@ export class CourseStructureController {
     @CurrentUser() user: AuthUser,
   ) {
     return this.structureService.createModule(courseId, user.id, dto);
+  }
+
+  // POST /api/v1/courses/:courseId/modules/apply-distribution — Fase 2 · «Aplicar diseño» (propuesta del distribuidor
+  // con sus capítulos y Actividades de Aplicación → estructura real; luego se confirma el Blueprint como siempre).
+  @Post('apply-distribution')
+  applyDistribution(
+    @Param('courseId', ParseIntPipe) courseId: number,
+    @Body() dto: ApplyDistributionDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.structureService.applyDistribution(courseId, user.id, dto);
   }
 
   // PATCH /api/v1/courses/:courseId/modules/reorder

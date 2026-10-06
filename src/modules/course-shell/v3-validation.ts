@@ -1,3 +1,4 @@
+import { APPLICATION_ARTIFACT_TYPE, applicationActivitySummary, validateApplicationActivityDoc } from './application-activity';
 /**
  * R11a — validación SERVER-SIDE (pura) de los artifacts LLM de rulesVersion 3
  * antes de aceptar la completitud de un item (scheduler.completeItem).
@@ -56,6 +57,8 @@ export function v3ValidatedArtifactType(type: string, variant?: string | null): 
       return 'dynamic_video_interactions_json';
     case 'activity':
       return variant === 'h5p' ? 'dynamic_h5p_params_json' : null;
+    case 'application_activity':
+      return APPLICATION_ARTIFACT_TYPE;
     case 'exam':
     case 'final_exam':
       return EXAM_BANK_ARTIFACT_TYPE;
@@ -95,6 +98,8 @@ export interface V3ItemValidationContext {
   examChapters?: Array<{ id: string; moduleId: string }>;
   /** EV6 P2 fix 1 (I1): Markdown vigente (dynamic_content_md) de los capítulos del examen → EXAM_BANK_EVIDENCE al completar. */
   examChapterMd?: ReadonlyMap<string, string>;
+  /** Fase 2: minutos de la Actividad de Aplicación (item del Manifest congelado). */
+  applicationMinutes?: number | null;
 }
 
 /**
@@ -252,6 +257,13 @@ export function validateV3ItemArtifact(ctx: V3ItemValidationContext, text: strin
         ...(ctx.activityTypeRules !== undefined && ctx.activityTypeRules !== null ? { activityTypeRules: ctx.activityTypeRules } : {}),
       });
       return { ...r, summary: { activityType: expectedType } };
+    }
+    case 'application_activity': {
+      if (!ctx.chapterId || typeof ctx.applicationMinutes !== 'number') {
+        throw new Error(`V3_VALIDATION_CONTEXT: application_activity ${ctx.itemKey} sin chapterId o minutos`);
+      }
+      const errors = validateApplicationActivityDoc(doc, { chapterId: ctx.chapterId, minutes: ctx.applicationMinutes });
+      return { ok: errors.length === 0, errors, ...(errors.length === 0 ? { summary: applicationActivitySummary(doc) } : {}) };
     }
     default:
       throw new Error(`V3_VALIDATION_CONTEXT: tipo ${ctx.type} sin validador`);

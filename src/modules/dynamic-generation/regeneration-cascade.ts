@@ -52,10 +52,10 @@ export function regenerationCascade(rulesVersion: number, items: readonly Cascad
     const finalExam = items.find((it) => it.type === 'final_exam')?.key ?? null;
     // Motor de carga horaria: experience/activity de las prácticas que se apoyan en este content.
     const practice = items
-      .filter((it) => (it.type === 'experience' || it.type === 'activity') && it.chapterId !== ch && (it.dependsOn ?? []).includes(mItem.key))
+      .filter((it) => (it.type === 'experience' || it.type === 'activity' || it.type === 'application_activity') && it.chapterId !== ch && (it.dependsOn ?? []).includes(mItem.key))
       .map((it) => it.key);
     return {
-      regenerate: pick([`experience:${ch}`, `activity:${ch}`, ...practice, mItem.moduleId ? `exam:${mItem.moduleId}` : null, finalExam]),
+      regenerate: pick([`experience:${ch}`, `activity:${ch}`, `application_activity:${ch}`, ...practice, mItem.moduleId ? `exam:${mItem.moduleId}` : null, finalExam]),
       stale: pick([`presentation:${ch}`, `video:${ch}`, `video_interactions:${ch}`, `audiobook_chapter:${ch}`]),
     };
   }

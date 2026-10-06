@@ -196,6 +196,8 @@ export const VALIDATION_INNER_CODES: readonly string[] = Object.freeze([
 export const VALIDATION_INNER_FAMILIES: readonly RegExp[] = Object.freeze([
   /^TEXT_[A-Z0-9_]+$/, /^BS_[A-Z0-9_]+$/, /^DIAGRAM_[A-Z0-9_]+$/, /^CONTENT_TRUTH[A-Z0-9_]*$/, /^EXAM_BANK_[A-Z0-9_]+$/,
   /^GIFT_[A-Z0-9_]+$/, /^PDF_[A-Z0-9_]+$/, /^COVER_[A-Z0-9_]+$/, /^PNG_[A-Z0-9_]+$/, /^H5P_[A-Z0-9_]+_INVALID$/,
+  // Fase 2: validación de la Actividad de Aplicación (course-shell/application-activity.ts) → B, regenerar la actividad.
+  /^APPLICATION_[A-Z0-9_]+$/,
 ]);
 
 export function isKnownValidationCode(code: string): boolean {
@@ -394,6 +396,8 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
       'missing_required_artifacts', 'ACTIVITY_TYPE_MISMATCH', 'AUDIOBOOK_PLAN_COVERAGE',
       // Motor de carga horaria: el claim de una práctica sin fuentes es un contrato roto.
       'practice_sources_missing',
+      // Fase 2: el claim de una Actividad de Aplicación sin minutos en el Manifest es un contrato roto.
+      'MISSING_APPLICATION_MINUTES',
       // Motor pedagógico Fase 2: brief pedagógico del claim con forma inválida en el navegador (versiones desalineadas).
       'PEDAGOGY_BRIEF_INVALID'],
     family: /^(missing|ambiguous)_[a-z0-9_]+_artifact$/,
@@ -512,7 +516,10 @@ const PACKAGE_RULES: readonly Rule[] = Object.freeze([
       // r19 L: asset del logo de Cursia ausente/roto (deploy) o invariante de una marca de agua por página.
       'LIBRO_LOGO_ASSET_MISSING', 'LIBRO_LOGO_ASSET_INVALID', 'LIBRO_V3_WATERMARK',
       // r19 L fix round 1 (I1): pdfkit no pudo generar el Libro Guía (ni con el logo de Cursia) → bug de producto.
-      'LIBRO_V3_PDF_FAILED'],
+      'LIBRO_V3_PDF_FAILED',
+      // Fase 2: pdfkit no pudo generar el PDF imprimible de una Actividad de Aplicación / documento ya validado sin
+      // actividad o sin solucionario al llegar al render → bug de producto (el item ya pasó su validación).
+      'APPLICATION_PDF_FAILED', 'APPLICATION_PDF_INVALID'],
     family: /^(MBZ_V3_[A-Z0-9_]+|ASSESSMENT_[A-Z0-9_]+|WEIGHTS_[A-Z0-9_]+|THEME_[A-Z0-9_]+|H5P_PROFILE_[A-Z0-9_]+|H5P_PACK_[A-Z0-9_]+|H5P_L10N_[A-Z0-9_]+|H5P_PREFLIGHT_[A-Z0-9_]+|H5P_STORE_[A-Z0-9_]+|H5P_UUID_[A-Z0-9_]+|H5P_SUBCONTENT_[A-Z0-9_]+|MOCK_[A-Z0-9_]+|ACTIVITY_TYPE_INVALID_[A-Z0-9_]+)$/,
     class: 'D', strategy: 'hold_for_human', scope: 'package', rounds: 0, humanReason: 'product_bug', adminAction: 'retry_package',
   },
@@ -553,7 +560,7 @@ export function classifiedCodes(): string[] {
 /** Tipos de item que el ejecutor usa como prefijo de un mensaje de contrato del claim («video_interactions: …»). */
 const ITEM_TYPE_PREFIXES = new Set([
   'content', 'scorm', 'exam', 'video', 'course_plan', 'course_intro', 'module_intro', 'experience', 'video_interactions', 'activity',
-  'final_exam', 'presentation', 'audio_welcome', 'audiobook_chapter',
+  'final_exam', 'presentation', 'audio_welcome', 'audiobook_chapter', 'application_activity',
 ]);
 
 /** Frases estables del ejecutor del navegador / de api() (04-api.js) → código. Orden = prioridad. */

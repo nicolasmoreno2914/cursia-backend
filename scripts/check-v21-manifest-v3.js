@@ -427,7 +427,7 @@ async function pureChecks() {
 
   await check('tipos: V3 = orden canónico, ALL = v2 ∪ v3, scope de audio_welcome/final_exam = course, itemTypesForRulesVersion(3)', () => {
     eq(B.MANIFEST_ITEM_TYPES_V3, ['course_plan', 'course_intro', 'audio_welcome', 'module_intro', 'content', 'experience',
-      'presentation', 'video', 'video_interactions', 'activity', 'audiobook_chapter', 'exam', 'final_exam'], 'V3');
+      'presentation', 'video', 'video_interactions', 'activity', 'application_activity', 'audiobook_chapter', 'exam', 'final_exam'], 'V3');
     eq(B.itemTypesForRulesVersion(3), B.MANIFEST_ITEM_TYPES_V3, 'rv 3');
     eq(B.itemTypesForRulesVersion(2), B.MANIFEST_ITEM_TYPES_V2, 'rv 2 sin cambios');
     eq(B.itemTypesForRulesVersion(1), B.MANIFEST_ITEM_TYPES_V1, 'rv 1 sin cambios');
@@ -708,6 +708,13 @@ async function dbChecks() {
       }
       const v = runScript('scripts/verify-v21-manifest-v3-schema.js', localEnv({ MIGRATION_ENV: 'staging' }));
       assert(v.code === 0 && /Esquema V2.1 R4/.test(v.out), `verify: exit ${v.code}\n${v.out}`);
+      // Fase 2: Actividades de Aplicación (columna, item y conteos con práctica) — dos veces (idempotente) + verificador.
+      for (let i = 0; i < 2; i++) {
+        const res = runScript('scripts/migrate-application-activities.js', localEnv({ MIGRATION_ENV: 'staging' }));
+        assert(res.code === 0, `actividades, corrida ${i + 1}: exit ${res.code}\n${res.out}`);
+      }
+      const va = runScript('scripts/verify-application-activities-schema.js', localEnv({ MIGRATION_ENV: 'staging' }));
+      assert(va.code === 0 && /application_minutes/.test(va.out), `verify actividades: exit ${va.code}\n${va.out}`);
     });
     await check('DB: verificadores previos siguen verdes (dynamic-generation, generation-manifests)', async () => {
       for (const s of ['scripts/verify-dynamic-generation-schema.js', 'scripts/verify-generation-manifests-schema.js']) {
@@ -743,15 +750,15 @@ async function dbChecks() {
       [{ id: '00000000-0000-4000-8000-0000000000a1', position: 0, title: 'M1', objective: null, exam_enabled: true },
         { id: '00000000-0000-4000-8000-0000000000a2', position: 1, title: 'M2', objective: null, exam_enabled: false }],
       [{ id: '00000000-0000-4000-8000-0000000000c1', module_id: '00000000-0000-4000-8000-0000000000a1', position: 0, title: 'C1', objective: null, video_enabled: true, activity_enabled: true },
-        { id: '00000000-0000-4000-8000-0000000000c2', module_id: '00000000-0000-4000-8000-0000000000a1', position: 1, title: 'C2', objective: null, video_enabled: false, activity_enabled: false },
+        { id: '00000000-0000-4000-8000-0000000000c2', module_id: '00000000-0000-4000-8000-0000000000a1', position: 1, title: 'C2', objective: null, video_enabled: false, activity_enabled: false, application_minutes: 60 },
         { id: '00000000-0000-4000-8000-0000000000c3', module_id: '00000000-0000-4000-8000-0000000000a2', position: 0, title: 'C3', objective: null, video_enabled: true, activity_enabled: false }],
     );
     // Estructura viva con los mismos ids (FKs de artifacts.module_id/chapter_id).
     for (const m of s2.modules) {
       await ds.query(`insert into public.course_modules (id, course_id, position, title) values ($1, $2, $3, $4)`, [m.id, cid, m.position, m.title]);
       for (const c of m.chapters) {
-        await ds.query(`insert into public.course_chapters (id, course_id, module_id, position, title, video_enabled, activity_enabled)
-                        values ($1, $2, $3, $4, $5, $6, $7)`, [c.id, cid, m.id, c.position, c.title, c.videoEnabled, c.activityEnabled]);
+        await ds.query(`insert into public.course_chapters (id, course_id, module_id, position, title, video_enabled, activity_enabled, application_minutes)
+                        values ($1, $2, $3, $4, $5, $6, $7, $8)`, [c.id, cid, m.id, c.position, c.title, c.videoEnabled, c.activityEnabled, c.applicationMinutes ?? null]);
       }
     }
     await ds.query(
@@ -772,8 +779,8 @@ async function dbChecks() {
       dto = res.manifest;
       const [row] = await ds.query(`select * from public.course_generation_manifests where id = $1`, [dto.id]);
       eq([row.scorm_count, row.experience_count, row.presentation_count, row.video_interactions_count, row.activity_count,
-        row.audiobook_chapter_count, row.audio_welcome_count, row.final_exam_count, row.total_jobs],
-      [0, 3, 3, 2, 1, 3, 1, 1, dto.manifest.items.length], 'columnas');
+        row.audiobook_chapter_count, row.audio_welcome_count, row.final_exam_count, row.application_activity_count, row.total_jobs],
+      [0, 3, 3, 2, 1, 3, 1, 1, 1, dto.manifest.items.length], 'columnas');
       eq(row.manifest_sha256, B.manifestSha256(B.buildGenerationManifest(s2, { courseId: cid, blueprintId: row.blueprint_id, blueprintNumber: 1, blueprintSha256: snap.snapshotSha256V2(s2) }, { rulesVersion: 3 })), 'sha = builder puro');
       const again = await manifests.getOrCreate(cid, OWNER, 1);
       eq([again.created, again.manifest.id, again.manifest.sha256], [false, dto.id, dto.sha256], 'idempotente');
@@ -782,6 +789,31 @@ async function dbChecks() {
       const byId = await manifests.getById(cid, OWNER, 1, dto.id);
       eq(B.canonicalManifestJson(byId.manifest), B.canonicalManifestJson(dto.manifest), 'getById (jsonb round trip)');
       await manifests.assertBlueprintAccessible(cid, OWNER, 1);
+    });
+    await check('DB servicio (Fase 2): Manifest v3 con capítulo de PRÁCTICA + Actividades de Aplicación pasa cgm_counts_consistent (antes lo rechazaba)', async () => {
+      process.env.DYNAMIC_MANIFEST_RULES_VERSION = '3';
+      const [c3] = await ds.query(`insert into public.courses (owner_id, title, structure_version) values ($1, 'Curso práctica', 'dynamic') returning id`, [OWNER]);
+      const MA = '00000000-0000-4000-8000-0000000000b1';
+      const sp = snap.buildBlueprintSnapshotV2(
+        { id: c3.id, title: 'Curso práctica', finalExam: true, activityEngine: 'h5p' },
+        [{ id: MA, position: 0, title: 'M1', objective: null, exam_enabled: true }],
+        [{ id: '00000000-0000-4000-8000-0000000000d1', module_id: MA, position: 0, title: 'Contenido', objective: null, video_enabled: true, activity_enabled: true, application_minutes: 90 },
+          { id: '00000000-0000-4000-8000-0000000000d2', module_id: MA, position: 1, title: 'Práctica', objective: null, video_enabled: false, activity_enabled: true, chapter_kind: 'practice', application_minutes: 60 }],
+      );
+      await ds.query(`insert into public.course_modules (id, course_id, position, title) values ($1, $2, 0, 'M1')`, [MA, c3.id]);
+      for (const ch of sp.modules[0].chapters) {
+        await ds.query(`insert into public.course_chapters (id, course_id, module_id, position, title, video_enabled, activity_enabled, application_minutes) values ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [ch.id, c3.id, MA, ch.position, ch.title, ch.videoEnabled, ch.activityEnabled, ch.applicationMinutes]);
+      }
+      await ds.query(
+        `insert into public.course_blueprints (course_id, blueprint_number, schema_version, snapshot_json, snapshot_sha256, structure_counter_at_lock, module_count, chapter_count)
+         values ($1, 1, 2, $2::jsonb, $3, 0, 1, 2)`, [c3.id, snap.canonicalJsonV2(sp), snap.snapshotSha256V2(sp)]);
+      const res = await manifests.getOrCreate(c3.id, OWNER, 1);
+      const [row] = await ds.query(`select chapter_count, content_count, presentation_count, audiobook_chapter_count, experience_count, application_activity_count, total_jobs from public.course_generation_manifests where id = $1`, [res.manifest.id]);
+      eq([row.chapter_count, row.content_count, row.presentation_count, row.audiobook_chapter_count, row.experience_count, row.application_activity_count, row.total_jobs],
+        [2, 1, 1, 1, 2, 2, res.manifest.manifest.items.length], 'conteos con práctica y actividades');
+      const again = await manifests.get(c3.id, OWNER, 1);
+      eq(again.sha256, res.manifest.sha256, 'lectura verificada (columnas = totals)');
     });
     await check('DB servicio: config 3 + Blueprint v1 → 409 BLUEPRINT_SCHEMA_MISMATCH; config 1 + Blueprint v2 → 501 (como en R3)', async () => {
       process.env.DYNAMIC_MANIFEST_RULES_VERSION = '3';
@@ -842,13 +874,20 @@ async function dbChecks() {
       await rejectsRe(sched.claimNextItem({ executorId: 'b0', types: ['presentation'], runId: job.id, ownerId: OWNER }), /browser_type_not_allowed/, 'navegador pide presentation', 400);
       // Completar plan / intro / content "a mano" (sus ejecutores reales son del navegador).
       await ds.query(`update public.generation_item_runs set status = 'completed' where job_id = $1 and type in ('course_plan', 'course_intro', 'content')`, [job.id]);
-      const act = await sched.claimNextItem({ executorId: 'b1', types: ['experience', 'video_interactions', 'activity', 'final_exam', 'exam', 'module_intro'], runId: job.id, ownerId: OWNER });
+      // Fase 2 (review I3): con Actividades de Aplicación en el Manifest, un navegador sin la capacidad → 409 visible.
+      const appInManifest = (await ds.query(`select coalesce(manifest_json->'items', '[]'::jsonb) @> '[{"type":"application_activity"}]'::jsonb a from public.course_generation_manifests where id = $1`, [dto.id]))[0].a;
+      if (appInManifest) {
+        await rejectsRe(sched.claimNextItem({ executorId: 'b1', types: ['experience', 'video_interactions', 'activity', 'final_exam', 'exam', 'module_intro'], runId: job.id, ownerId: OWNER }),
+          /Actividades de Aplicación/, 'navegador sin application-activity-1', 409);
+      }
+      const FEAT = ['pedagogy-brief-1', 'application-activity-1'];
+      const act = await sched.claimNextItem({ executorId: 'b1', types: ['experience', 'video_interactions', 'activity', 'final_exam', 'exam', 'module_intro'], runId: job.id, ownerId: OWNER, executorFeatures: FEAT });
       assert(act, 'el navegador v3 no reclamó nada');
       const claimedAct = act.type === 'activity' ? act : null;
       // Reclamar hasta dar con el activity (el orden es el del Manifest).
       let activity = claimedAct;
       for (let i = 0; i < 20 && !activity; i++) {
-        const next = await sched.claimNextItem({ executorId: 'b1', types: ['activity'], runId: job.id, ownerId: OWNER });
+        const next = await sched.claimNextItem({ executorId: 'b1', types: ['activity'], runId: job.id, ownerId: OWNER, executorFeatures: FEAT });
         if (next && next.type === 'activity') activity = next;
         else break;
       }

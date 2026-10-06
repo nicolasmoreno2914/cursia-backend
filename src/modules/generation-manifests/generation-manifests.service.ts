@@ -1,3 +1,4 @@
+import { assertApplicationActivitySchema } from '../course-structure/v21-schema-guard';
 import { ConflictException, Injectable, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
@@ -322,6 +323,10 @@ export class GenerationManifestsService {
     t: ManifestTotals,
     ownerId: string,
   ): Promise<any> {
+    // Fase 2: la columna application_activity_count solo se escribe con actividades (una base sin la migración
+    // sigue aceptando los Manifests de siempre; con actividades y sin migración → 503, nunca un 500 crudo).
+    const apps = t.applicationActivityCount ?? 0;
+    if (apps > 0) await assertApplicationActivitySchema(this.dataSource);
     return this.dataSource.query(
       `insert into public.course_generation_manifests
          (course_id, blueprint_id, rules_version, manifest_schema_version, manifest_json,
@@ -329,16 +334,16 @@ export class GenerationManifestsService {
           scorm_count, video_count, exam_count, total_jobs, created_by,
           course_plan_count, course_intro_count, module_intro_count,
           experience_count, presentation_count, video_interactions_count, activity_count,
-          audiobook_chapter_count, audio_welcome_count, final_exam_count)
+          audiobook_chapter_count, audio_welcome_count, final_exam_count${apps > 0 ? ', application_activity_count' : ''})
        values ($1, $2, 3, $3, $4::jsonb, $5, $6, $7, $8, $9, 0, $10, $11, $12, $13, $14, $15, $16,
-               $17, $18, $19, $20, $21, $22, $23)
+               $17, $18, $19, $20, $21, $22, $23${apps > 0 ? ', $24' : ''})
        on conflict (blueprint_id, rules_version) do nothing
        returning *`,
       [courseId, blueprintId, MANIFEST_SCHEMA_VERSION, canonical, sha, blueprintSha,
         t.moduleCount, t.chapterCount, t.contentCount, t.videoCount, t.examCount, t.totalJobs, ownerId,
         t.coursePlanCount, t.courseIntroCount, t.moduleIntroCount,
         t.experienceCount, t.presentationCount, t.videoInteractionsCount, t.activityCount,
-        t.audiobookChapterCount, t.audioWelcomeCount, t.finalExamCount],
+        t.audiobookChapterCount, t.audioWelcomeCount, t.finalExamCount, ...(apps > 0 ? [apps] : [])],
     );
   }
 
@@ -470,9 +475,12 @@ export class GenerationManifestsService {
     // v3 (R4): scorm_count = 0 (no hay items scorm) + columnas v3 (0 en v1/v2).
     if (manifest.rulesVersion === 3) fromJson[3] = t.scormCount ?? 0;
     cols.push(row.experience_count ?? 0, row.presentation_count ?? 0, row.video_interactions_count ?? 0,
-      row.activity_count ?? 0, row.audiobook_chapter_count ?? 0, row.audio_welcome_count ?? 0, row.final_exam_count ?? 0);
+      row.activity_count ?? 0, row.audiobook_chapter_count ?? 0, row.audio_welcome_count ?? 0, row.final_exam_count ?? 0,
+      // Fase 2: ausente antes de la migración de actividades → 0 (lo que declara un Manifest sin actividades).
+      row.application_activity_count ?? 0);
     fromJson.push(t.experienceCount ?? 0, t.presentationCount ?? 0, t.videoInteractionsCount ?? 0,
-      t.activityCount ?? 0, t.audiobookChapterCount ?? 0, t.audioWelcomeCount ?? 0, t.finalExamCount ?? 0);
+      t.activityCount ?? 0, t.audiobookChapterCount ?? 0, t.audioWelcomeCount ?? 0, t.finalExamCount ?? 0,
+      t.applicationActivityCount ?? 0);
     if (cols.some((v, i) => v !== fromJson[i])) {
       throw new InternalServerErrorException(
         `${where}: columnas de conteo [${cols.join(',')}] no coinciden con totals del manifest [${fromJson.join(',')}]`,

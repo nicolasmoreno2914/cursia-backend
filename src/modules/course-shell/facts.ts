@@ -120,6 +120,11 @@ export interface ChapterFacts {
   activityType: H5pActivityTypeV2 | null;
   /** Motor de carga horaria: SOLO en capítulos de práctica (sin presentación, Libro propio, video ni audiolibro). */
   kind?: 'practice';
+  /**
+   * Fase 2: minutos de la Actividad de Aplicación del capítulo (item application_activity del Manifest). SOLO en
+   * capítulos con actividad: página del estudiante + solucionario oculto; entran al tiempo del capítulo.
+   */
+  applicationMinutes?: number;
   /** Diapositivas medidas de la presentación (0 en un capítulo de práctica: no tiene presentación). */
   slideCount: number;
   /**
@@ -165,6 +170,8 @@ export interface CourseFacts {
     evaluations: number;
     /** EV6 H5P v2: capítulos con «Repaso» (add-on sin nota). Solo si > 0. */
     reviewCards?: number;
+    /** Fase 2: capítulos con Actividad de Aplicación (solo si hay alguna). */
+    applicationActivities?: number;
   };
   chapters: ChapterFacts[];
   modules: ModuleFacts[];
@@ -271,8 +278,10 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
         activityVariant: variant,
         activityType: variant === 'h5p' ? resolveActivityType(itemByKey.get(`activity:${mc.chapterId}`), { activityTypeRules: manifest.features?.activityTypeRules }) : null,
         ...(practice ? { kind: 'practice' as const } : {}),
+        ...(mc.applicationMinutes !== undefined ? { applicationMinutes: mc.applicationMinutes } : {}),
         slideCount: practice ? 0 : posInt(artifacts.slideCountByChapter?.[mc.chapterId], `slideCount del capítulo ${mc.chapterNumber}`),
       });
+      if (itemKeys.has(`application_activity:${mc.chapterId}`) !== (mc.applicationMinutes !== undefined)) fail(`Actividad de Aplicación del capítulo ${mc.chapterNumber} incoherente con el Manifest`);
       if (practice && artifacts.slideCountByChapter?.[mc.chapterId] !== undefined) fail(`el capítulo de práctica ${mc.chapterNumber} no tiene presentación pero se informaron diapositivas`);
       if (artifacts.experienceWordsByChapter) {
         const ch = chapters[chapters.length - 1];
@@ -419,6 +428,8 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
               activity: ch.activityEnabled,
               review: ch.reviewCards === true,
               ...(reviewCounts[ch.id] !== undefined ? { reviewCards: reviewCounts[ch.id] } : {}),
+              // Fase 2: la Actividad de Aplicación suma sus minutos al capítulo (y al curso).
+              ...(ch.applicationMinutes !== undefined ? { applicationMinutes: ch.applicationMinutes } : {}),
             };
           }),
         })),
@@ -455,6 +466,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
       finalExam: features.finalExam,
       evaluations: exams + (features.finalExam ? 1 : 0),
       ...(reviewIds.size ? { reviewCards: reviewIds.size } : {}),
+      ...(chapters.some((c) => c.applicationMinutes !== undefined) ? { applicationActivities: chapters.filter((c) => c.applicationMinutes !== undefined).length } : {}),
     },
     chapters,
     modules,

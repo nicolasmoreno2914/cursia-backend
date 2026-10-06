@@ -150,8 +150,12 @@ check('HE6 costo: el video no crece con las horas; la práctica cuesta mucho men
   assert(prov(m(50), 'videogen') > prov(m(33), 'videogen'), '50 h: más video solo por capítulos de profundización');
   const perPractice = (usd(m(33)) - usd(m(20))) / 2;
   const perContent = (usd(m(50)) - usd(m(33)) - 4 * perPractice) / 4;
-  assert(perPractice > 0 && perPractice < 0.4, `práctica ≈ USD ${perPractice.toFixed(2)}`);
-  assert(perContent > 5 * perPractice, `contenido ≈ USD ${perContent.toFixed(2)} (≫ práctica)`);
+  // Fase 2: la práctica incluye su Actividad de Aplicación (texto LLM): sigue muy por debajo de un capítulo de contenido.
+  // Review Fase 2 (I1/M6): la diferencia 20 → 33 h también sube de nivel actividades existentes (costo por nivel): < USD 1.
+  assert(perPractice > 0 && perPractice < 1, `práctica ≈ USD ${perPractice.toFixed(2)}`);
+  // Las dos diferencias incluyen la subida de nivel de las actividades existentes (330 → 1.050 → 1.650 min de
+  // aplicación, costo por nivel desde la review M6): el capítulo de contenido sigue costando > 3× la práctica.
+  assert(perContent > 3 * perPractice, `contenido ≈ USD ${perContent.toFixed(2)} (≫ práctica USD ${perPractice.toFixed(2)})`);
 });
 
 check('HE7 0 llamadas de red medidas durante todos los dry-runs (no un literal del objeto de retorno)', () => {

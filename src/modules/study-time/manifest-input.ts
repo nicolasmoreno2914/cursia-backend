@@ -1,8 +1,8 @@
 // Motor de carga horaria — entrada del modelo de tiempo desde un Manifest v3 (lo que se va a generar).
 //
 // Cada recurso existe si el Manifest tiene su trabajo: página (experience), Libro Guía (content),
-// presentación, video (+ preguntas), actividad, apertura de módulo, exámenes, bienvenida y audio de
-// bienvenida. El «Repaso» depende del ajuste del Blueprint (mismas condiciones que el empaque) y el foro
+// presentación, video (+ preguntas), actividad, Actividad de Aplicación (Fase 2, con sus minutos),
+// apertura de módulo, exámenes, bienvenida y audio de bienvenida. El «Repaso» depende del ajuste del Blueprint (mismas condiciones que el empaque) y el foro
 // lo agrega siempre el shell del curso. Las medidas (si ya se generó) llegan aparte y reemplazan a los
 // valores planificados.
 import type { BlueprintSnapshotV2 } from '../course-blueprints/blueprint-snapshot';
@@ -32,6 +32,14 @@ export interface StudyTimeMeasurements {
  */
 export function reviewCardsEnabledFor(blueprint: BlueprintSnapshotV2, manifest: GenerationManifestV1): boolean {
   return blueprint.course.reviewCards === true && manifest.features?.activityTypeRules === 2 && blueprint.course.activityEngine === 'h5p';
+}
+
+/** Minutos de la Actividad de Aplicación de un capítulo (del item del Manifest; falta o inválido → throw). */
+function applicationMinutesOf(manifest: GenerationManifestV1, chapterId: string): number {
+  const it = manifest.items.find((i) => i.type === 'application_activity' && i.chapterId === chapterId);
+  const m = it?.applicationMinutes;
+  if (typeof m !== 'number') throw new StudyTimeError(`application_activity:${chapterId} sin applicationMinutes`);
+  return m;
 }
 
 export function studyTimeInputFromManifest(
@@ -83,6 +91,8 @@ export function studyTimeInputFromManifest(
           activityItems: pick(measured.activityItemsByChapter, id),
           review: reviewIds ? reviewIds.has(id) : review,
           reviewCards: pick(measured.reviewCardsByChapter, id),
+          // Fase 2: la Actividad de Aplicación entra con sus minutos (nivel fijado por el diseño, nunca medido).
+          ...(has('application_activity', id) ? { applicationMinutes: applicationMinutesOf(manifest, id) } : {}),
         };
       }),
     })),

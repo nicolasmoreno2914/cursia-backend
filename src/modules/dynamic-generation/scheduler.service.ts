@@ -1,3 +1,4 @@
+import { APPLICATION_ACTIVITY_SCHEMA_VERSION } from '../course-shell/application-activity';
 import {
   BadRequestException,
   ConflictException,
@@ -107,6 +108,8 @@ export const BROWSER_CLAIMABLE_TYPES: ItemType[] = [
   'content', 'scorm', 'exam', 'course_plan', 'course_intro', 'module_intro',
   // V2.1 rulesVersion 3 (R4): items LLM del ejecutor del navegador (activity en sus dos variantes).
   'experience', 'video_interactions', 'activity', 'final_exam',
+  // Fase 2: Actividad de Aplicación (actividad + solucionario, texto LLM del navegador).
+  'application_activity',
 ];
 /**
  * V2.1 rulesVersion 3 (R4): items de PROVEEDOR que solo reclama el worker del
@@ -275,6 +278,11 @@ export interface ClaimPayloadV3 {
    * dependencyArtifacts), sin teoría nueva. Ausente = capítulo de contenido de siempre.
    */
   practice?: { sourceChapterIds: string[] };
+  /**
+   * Fase 2: Actividad de Aplicación. `minutes` = nivel del Manifest (la actividad se dimensiona con él);
+   * `context` = estudiante + resultados de aprendizaje CONGELADOS en el Blueprint (null si el perfil no los define).
+   */
+  application?: { minutes: number; chapterKind: 'content' | 'practice'; schemaVersion: number; context: unknown };
 }
 
 /**
@@ -302,6 +310,8 @@ export interface ClaimOptions {
 
 /** Motor pedagógico Fase 2: el ejecutor del navegador aplica `ClaimedItem.pedagogy` a sus prompts. */
 export const PEDAGOGY_BRIEF_FEATURE = 'pedagogy-brief-1';
+/** Fase 2: el ejecutor del navegador sabe generar items `application_activity` (actividad + solucionario). */
+export const APPLICATION_ACTIVITY_FEATURE = 'application-activity-1';
 
 /**
  * REL lease de ejecución: resultado del claim con el motivo cuando no se entrega nada por el lease
@@ -470,6 +480,7 @@ export class SchedulerService {
       if (opts.ownerId !== undefined && opts.ownerId !== null) {
         await this.assertBrowserTypesMatchRun(opts.runId, opts.ownerId, types);
         await this.assertExecutorAppliesPedagogy(opts.runId, opts.ownerId, opts.executorFeatures ?? []);
+        await this.assertExecutorGeneratesApplication(opts.runId, opts.ownerId, opts.executorFeatures ?? []);
       }
       // M6: un item cuyo payload no se puede armar se marca failed dentro del
       // claim; se sigue con el próximo candidato en vez de devolver "nada".
@@ -661,6 +672,28 @@ export class SchedulerService {
       'anterior de Cursia que no lo aplica a los recursos. Recarga la página para continuar; con esta versión el ' +
       'curso se generaría sin el enfoque pedagógico elegido.';
     throw new ConflictException({ message, code: 'executor_outdated_pedagogy', runId });
+  }
+
+  /**
+   * Fase 2 (review I3): un run con Actividades de Aplicación solo lo ejecuta un navegador que sabe generarlas. Una
+   * pestaña con una versión anterior reclamaría todo lo demás, renovaría el lease exclusivo del run y dejaría los
+   * items application_activity en pending para siempre (el curso nunca termina, sin error, y otro dispositivo no
+   * puede tomar la ejecución). Se rechaza ANTES de reclamar nada con el 409 visible «recarga la página».
+   */
+  private async assertExecutorGeneratesApplication(runId: string, ownerId: string, features: string[]): Promise<void> {
+    if (features.includes(APPLICATION_ACTIVITY_FEATURE)) return;
+    const [row] = await this.dataSource.query(
+      `select coalesce(m.manifest_json->'items', '[]'::jsonb) @> '[{"type":"application_activity"}]'::jsonb as application
+         from public.production_jobs pj
+         join public.course_generation_manifests m on m.id::text = pj.input_payload->>'manifestId'
+        where pj.id = $1 and pj.execution_mode = 'dynamic_generation' and pj.owner_id = $2`,
+      [runId, ownerId],
+    );
+    if (!row || row.application !== true) return;
+    const message =
+      `rules_version_mismatch: la ejecución ${runId} tiene Actividades de Aplicación y este navegador ejecuta una versión ` +
+      'anterior de Cursia que no sabe generarlas. Recarga la página para continuar; con esta versión el curso no podría terminar.';
+    throw new ConflictException({ message, code: 'executor_outdated_application', runId });
   }
 
   /**
@@ -1206,6 +1239,13 @@ export class SchedulerService {
       // EV6 H5P v2: el validador acepta branchingscenario solo con el marcador 2 del Manifest congelado.
       if (rules !== undefined && rules !== null) ctx.activityTypeRules = rules;
     }
+    if (g.type === 'application_activity') {
+      // Fase 2: los minutos salen del item del Manifest congelado (nunca del ejecutor).
+      ctx.applicationMinutes = typeof mItem.applicationMinutes === 'number' ? mItem.applicationMinutes : null;
+      if (ctx.applicationMinutes === null) {
+        throw new InternalServerErrorException(`v3_validation_context: ${g.item_key} sin applicationMinutes en el Manifest; no se completa sin validar`);
+      }
+    }
     if (g.type === 'module_intro') {
       const mod = (manifest.modules ?? []).find((m: any) => m.moduleId === g.module_id);
       ctx.moduleChapterIds = mod ? mod.chapters.map((c: any) => c.chapterId) : [];
@@ -1337,7 +1377,7 @@ export class SchedulerService {
   }
 
   /** Bloque `claimPayload` del ClaimedItem (solo rulesVersion 3 y tipos validados por el servidor). */
-  private async buildClaimV3(qr: QueryRunner, row: any, mItem: any, manifest: GenerationManifestV1): Promise<ClaimPayloadV3 | undefined> {
+  private async buildClaimV3(qr: QueryRunner, row: any, mItem: any, manifest: GenerationManifestV1, snapshot?: AnyBlueprintSnapshot): Promise<ClaimPayloadV3 | undefined> {
     if (manifest.rulesVersion !== 3) return undefined;
     const validatedArtifactType = v3ValidatedArtifactType(row.type, mItem.variant ?? null);
     const out: ClaimPayloadV3 = { validatedArtifactType };
@@ -1349,6 +1389,7 @@ export class SchedulerService {
       case 'module_intro':
       case 'video_interactions':
       case 'activity':
+      case 'application_activity':
         break;
       default:
         return undefined;
@@ -1357,7 +1398,21 @@ export class SchedulerService {
       out.chapterId = row.chapter_id;
       out.experienceFeatures = { eduFields: true };
     }
-    if (row.type === 'experience' || row.type === 'activity') {
+    if (row.type === 'application_activity') {
+      // Fase 2: minutos (nivel del diseño), tipo de capítulo y contexto congelado (estudiante + resultados).
+      const mm = manifest.modules.find((m) => m.chapters.some((c) => c.chapterId === row.chapter_id));
+      const mc = mm?.chapters.find((c) => c.chapterId === row.chapter_id);
+      if (typeof mItem.applicationMinutes !== 'number') throw new ClaimPayloadUnavailable('MISSING_APPLICATION_MINUTES', `${row.item_key} sin applicationMinutes en el Manifest`);
+      out.chapterId = row.chapter_id;
+      out.application = {
+        minutes: mItem.applicationMinutes,
+        chapterKind: mc?.kind === 'practice' ? 'practice' : 'content',
+        schemaVersion: APPLICATION_ACTIVITY_SCHEMA_VERSION,
+        // El Blueprint congelado del run (el claim ya verificó su sha); nunca el perfil vivo.
+        context: (snapshot as any)?.course?.applicationContext ?? null,
+      };
+    }
+    if (row.type === 'experience' || row.type === 'activity' || row.type === 'application_activity') {
       const mm = manifest.modules.find((m) => m.chapters.some((c) => c.chapterId === row.chapter_id));
       const mc = mm?.chapters.find((c) => c.chapterId === row.chapter_id);
       if (mm && mc?.kind === 'practice') {
@@ -1777,7 +1832,7 @@ export class SchedulerService {
             [row.job_id, row.manifest_id, deps],
           );
 
-    const v3 = await this.buildClaimV3(qr, row, mItem, manifest);
+    const v3 = await this.buildClaimV3(qr, row, mItem, manifest, snapshot);
 
     // Motor pedagógico Fase 2: el diseño del item (Manifest validado arriba contra el Blueprint) → brief del generador.
     let pedagogy: ItemPedagogyBrief | null = null;

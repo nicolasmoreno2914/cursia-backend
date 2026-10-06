@@ -26,6 +26,8 @@ export const BROWSER_ITEM_TYPES = [
   'content', 'scorm', 'exam', 'course_plan', 'course_intro', 'module_intro',
   // V2.1 rulesVersion 3 (R4): items LLM del navegador. presentation/audio_* son del worker.
   'experience', 'video_interactions', 'activity', 'final_exam',
+  // Fase 2: Actividad de Aplicación (actividad + solucionario, texto LLM del navegador).
+  'application_activity',
 ] as const;
 export type BrowserItemType = (typeof BROWSER_ITEM_TYPES)[number];
 

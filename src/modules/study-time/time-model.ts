@@ -12,6 +12,7 @@
 //
 // El audiolibro NO suma: es otra forma de recorrer el Libro Guía (escucharlo o leerlo, no ambos).
 import { examSlotSplit, finalExamSlotSplit } from '../course-shell/exam-bank';
+import { APPLICATION_ACTIVITY_TIERS } from './application-tiers';
 import { reflectionPauseCount, videoInteractionCount } from '../../package/h5p/interactive-video/plan';
 
 export const STUDY_TIME_RULES_VERSION = 1 as const;
@@ -30,7 +31,7 @@ export const STUDY_TIME_RULES = Object.freeze({
   /** Presentarse y participar en el foro del curso. */
   forumMinutes: 10,
   /** Niveles de la Actividad de aplicación (Fase 2): los fija Cursia, nunca la IA. */
-  applicationActivityTiers: Object.freeze([30, 60, 90, 120] as const),
+  applicationActivityTiers: APPLICATION_ACTIVITY_TIERS,
   /** Valores planificados (antes de generar), calibrados con cursos reales. */
   planned: Object.freeze({
     chapterPageWords: 2200,

@@ -36,7 +36,7 @@ import {
   proposeStructureAdjustments,
 } from './pedagogical-blueprint';
 import { ItemPedagogyBrief, OverrideLevel, PEDAGOGY_GENERATOR_COVERAGE, buildItemPedagogyBrief } from './generator-directives';
-import { PedagogicalProfile, isEmptyPedagogicalProfile, normalizePedagogicalProfile, profileTargetHours } from './pedagogy-profile';
+import { PedagogicalProfile, isEmptyPedagogicalProfile, normalizePedagogicalProfile, profileApplicationContext, profileDesignPreferences, profileTargetHours } from './pedagogy-profile';
 import { PEDAGOGY_ENGINE_VERSION } from './vocabulary';
 
 /**
@@ -64,6 +64,8 @@ export interface DryRunChapterInput {
   activityEnabled?: boolean;
   /** Motor de carga horaria: 'practice' = capítulo de práctica (sin video). Ausente = contenido. */
   kind?: 'content' | 'practice';
+  /** Fase 2: minutos de la Actividad de Aplicación (30/60/90/120; ausente/null = sin actividad). */
+  applicationMinutes?: number | null;
 }
 export interface DryRunModuleInput {
   id?: string;
@@ -168,7 +170,7 @@ export interface DryRunResult {
    * Motor de carga horaria (Loop 3): diseño propuesto por el distribuidor para alcanzar targetHours (null sin
    * objetivo). Solo propuesta: no cambia el Blueprint ni el Manifest de este dry-run.
    */
-  distribution: (DistributionResult & { materialized: DistributionMaterialized }) | null;
+  distribution: (DistributionResult & { materialized: DistributionMaterialized; proposalSha256: string }) | null;
   baseline: DryRunSide;
   pedagogical: DryRunSide | null;
   structureChanges: StructureChange[];
@@ -279,6 +281,7 @@ export function snapshotFromStructure(input: DryRunStructureInput): BlueprintSna
         id: c.id || `${mid}c${ci + 1}`, module_id: mid, position: ci, title: String(c.title ?? ''), objective: c.objective ?? null,
         description: c.description ?? null, video_enabled: c.kind === 'practice' ? false : c.videoEnabled !== false, activity_enabled: c.activityEnabled !== false,
         ...(c.kind !== undefined ? { chapter_kind: c.kind } : {}),
+        ...(c.applicationMinutes !== undefined ? { application_minutes: c.applicationMinutes } : {}),
       });
     });
   });
@@ -325,26 +328,46 @@ export interface DistributionMaterialized {
   generableHours: number | null;
 }
 
+/**
+ * Fase 2 · «Aplicar diseño»: huella de la propuesta (estructura + actividades + preferencias). El servidor recalcula
+ * la propuesta al aplicar y exige la MISMA huella que vio el docente (si la estructura o el perfil cambiaron, 409).
+ */
+export function distributionProposalSha256(dist: DistributionResult): string {
+  const canon = {
+    targetHours: dist.targetHours,
+    preferences: dist.preferences,
+    modules: dist.modules.map((m) => ({
+      id: m.id,
+      chapters: m.chapters.map((c) => ({ id: c.id, proposed: c.proposed, kind: c.kind, title: c.title, objective: c.objective, videoEnabled: c.videoEnabled, activityEnabled: c.activityEnabled, applicationMinutes: c.applicationMinutes })),
+    })),
+  };
+  return createHash('sha256').update(JSON.stringify(canon), 'utf8').digest('hex');
+}
+
 /** UUID v4 determinista para un capítulo propuesto (solo en el dry-run). */
 function proposedChapterUuid(id: string): string {
   const h = createHash('sha256').update(id, 'utf8').digest('hex');
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
 }
 
-export function materializeDistribution(base: BlueprintSnapshotV2, dist: DistributionResult): BlueprintSnapshotV2 {
+export function materializeDistribution(base: BlueprintSnapshotV2, dist: DistributionResult, applicationContext: unknown = null): BlueprintSnapshotV2 {
   const rows = snapshotV2ToRows(base);
+  // Fase 2: el contexto del perfil que congelaría el lock (entra solo si la propuesta tiene Actividades de Aplicación).
+  if (applicationContext !== null && applicationContext !== undefined) rows.course = { ...rows.course, applicationContext };
   const byId = new Map(rows.chapters.map((c) => [c.id, c]));
   const chapters: RawChapterRowV2[] = [];
   for (const m of dist.modules) {
     m.chapters.forEach((c, ci) => {
       const existing = byId.get(c.id);
       if (existing) {
-        chapters.push({ ...existing, position: ci });
+        // Fase 2: la propuesta fija (o quita) la Actividad de Aplicación de cada capítulo existente.
+        chapters.push({ ...existing, position: ci, application_minutes: c.applicationMinutes ?? null });
         return;
       }
       chapters.push({
         id: proposedChapterUuid(c.id), module_id: m.id, position: ci, title: c.title, objective: c.objective, description: null,
         video_enabled: c.videoEnabled, activity_enabled: c.activityEnabled, ...(c.kind === 'practice' ? { chapter_kind: 'practice' } : {}),
+        application_minutes: c.applicationMinutes ?? null,
       });
     });
   }
@@ -364,9 +387,10 @@ export function materializeOrError(
   base: BlueprintSnapshotV2,
   dist: DistributionResult,
   build: (plain: BlueprintSnapshotV2) => DistributionMaterialized,
+  applicationContext: unknown = null,
 ): DistributionMaterialized {
   try {
-    return build(materializeDistribution(base, dist));
+    return build(materializeDistribution(base, dist, applicationContext));
   } catch (err) {
     const message = (err as Error)?.message || String(err);
     return {
@@ -379,6 +403,15 @@ export function materializeOrError(
       generableHours: null,
     };
   }
+}
+
+/**
+ * Fase 2: el mismo snapshot con el contexto de las Actividades de Aplicación del perfil (el builder lo congela solo
+ * si algún capítulo tiene una; si no, el snapshot no cambia).
+ */
+export function withApplicationContext(s: BlueprintSnapshotV2, applicationContext: unknown): BlueprintSnapshotV2 {
+  const rows = snapshotV2ToRows(s);
+  return buildBlueprintSnapshotV2({ ...rows.course, applicationContext }, rows.modules, rows.chapters, rows.pedagogy);
 }
 
 /** El mismo snapshot con `course.targetHours` (pasa por el builder: orden canónico y validación). */
@@ -452,7 +485,10 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
   const base0 = isSnapshot(input.structure) ? snapshotFromSnapshot(input.structure) : snapshotFromStructure(input.structure as DryRunStructureInput);
   // Motor de carga horaria: el objetivo de horas viene del perfil (con o sin enfoque); sin él, el del snapshot recibido.
   const profileHours = profileTargetHours(input.profile);
-  const base = profileHours !== null ? withTargetHours(base0, profileHours) : base0;
+  const base1 = profileHours !== null ? withTargetHours(base0, profileHours) : base0;
+  // Fase 2: estudiante + resultados de aprendizaje del perfil (lo mismo que congela el lock).
+  const appContext = profileApplicationContext(input.profile);
+  const base = appContext ? withApplicationContext(base1, appContext) : base1;
   const targetHours = base.course.targetHours ?? null;
   const profileEmpty = isEmptyPedagogicalProfile(input.profile);
   const profile = profileEmpty ? null : normalizePedagogicalProfile(input.profile, registry);
@@ -541,8 +577,12 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
     rules,
     targetHours,
     distribution: targetHours === null ? null : (() => {
-      const dist = distributeCourseHours({ snapshot: view.blueprint, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1 });
-      const materialized = materializeOrError(view.blueprint, dist, (plain) => {
+      // Fase 2 (review I1): el distribuidor dimensiona sobre lo que el lock congelaría HOY (estructura viva + diseño),
+      // NUNCA sobre la vista con los cambios de estructura sugeridos (videos/actividades/repaso): esos no los escribe
+      // «Aplicar diseño» (los decide el docente en el editor), y contarlos haría que lo mostrado ≠ lo aplicado.
+      const lockShaped = rules ? applyPedagogyToSnapshot(base, rules) : base;
+      const dist = distributeCourseHours({ snapshot: lockShaped, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile) });
+      const materialized = materializeOrError(lockShaped, dist, (plain) => {
         const ms = side(rules ? applyPedagogyToSnapshot(plain, rules) : plain, activityTypeRules);
         return {
           blueprintSha256: ms.blueprintSha256,
@@ -553,8 +593,9 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
           providers: ms.providers,
           generableHours: ms.studyTime.courseEstimatedHours,
         };
-      });
-      return { ...dist, materialized };
+      }, appContext);
+      // Fase 2 · «Aplicar diseño»: huella de la propuesta que ve el docente (el servidor la recalcula al aplicar).
+      return { ...dist, materialized, proposalSha256: distributionProposalSha256(dist) };
     })(),
     workload: targetHours === null
       ? null

@@ -52,6 +52,8 @@ export interface PackagingChapterPlanV3 {
    * de siempre). Sin content (Libro), presentación, video ni audiolibro: esas keys son null.
    */
   kind?: 'practice';
+  /** Fase 2: minutos de la Actividad de Aplicación, SOLO en capítulos que la tienen (sin la clave: sha de siempre). */
+  applicationMinutes?: number;
   keys: {
     content: string | null;
     experience: string;
@@ -60,6 +62,8 @@ export interface PackagingChapterPlanV3 {
     video: string | null;
     videoInteractions: string | null;
     activity: string | null;
+    /** Fase 2: SOLO en capítulos con Actividad de Aplicación (actividad + solucionario oculto). */
+    application?: string;
   };
 }
 
@@ -167,6 +171,11 @@ export function buildPackagingPlanV3(
         if (v !== features.activityEngine) throw new PackagingPlanV3Error(`activity:${id} con variant ${String(v)} ≠ ${features.activityEngine}`);
         variant = v;
       }
+      // Fase 2: la Actividad de Aplicación del capítulo (Manifest = fuente: chapters[].applicationMinutes).
+      const applicationKey = mc.applicationMinutes !== undefined ? take(`application_activity:${id}`, 'application_activity') : null;
+      if (applicationKey && byKey.get(applicationKey)?.applicationMinutes !== mc.applicationMinutes) {
+        throw new PackagingPlanV3Error(`${applicationKey} con applicationMinutes distinto del capítulo del Manifest`);
+      }
       return {
         chapterId: id,
         moduleId: mm.moduleId,
@@ -179,6 +188,7 @@ export function buildPackagingPlanV3(
         activityEnabled,
         activityVariant: variant,
         ...(practice ? { kind: 'practice' as const } : {}),
+        ...(applicationKey ? { applicationMinutes: mc.applicationMinutes as number } : {}),
         keys: {
           content: practice ? null : take(`content:${id}`, 'content'),
           experience: take(`experience:${id}`, 'experience'),
@@ -187,6 +197,7 @@ export function buildPackagingPlanV3(
           video: videoPending ? null : videoKey,
           videoInteractions: videoPending ? null : videoInteractionsKey,
           activity: activityKey,
+          ...(applicationKey ? { application: applicationKey } : {}),
         },
       };
     });

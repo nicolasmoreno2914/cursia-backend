@@ -57,7 +57,9 @@ export type ChapterSlot =
   | { kind: 'video_h5p' }
   | { kind: 'activity'; variant: 'h5p' | 'scorm' }
   /** EV6 H5P v2: «Repaso» opcional con Dialog Cards (sin nota); solo si chapterFacts.reviewCards. */
-  | { kind: 'review_cards' };
+  | { kind: 'review_cards' }
+  /** Fase 2: Actividad de Aplicación (página del estudiante + solucionario docente oculto); solo con applicationMinutes. */
+  | { kind: 'application' };
 
 export type ChapterLabelRole =
   | 'opening'
@@ -67,6 +69,7 @@ export type ChapterLabelRole =
   | 'synthesis'
   | 'activity_instruction'
   | 'self_check'
+  | 'application_instruction'
   | 'closing';
 
 export interface AssembleChapterInput {
@@ -90,7 +93,7 @@ export interface AssembleChapterInput {
 }
 
 /** Secuencia de slots (solo `kind`/`role`) — útil para tests y para R12. */
-export function chapterSlotSequence(flags: { videoEnabled: boolean; activityEnabled: boolean; videoPendingNotice?: boolean; reviewCards?: boolean; practice?: boolean }): string[] {
+export function chapterSlotSequence(flags: { videoEnabled: boolean; activityEnabled: boolean; videoPendingNotice?: boolean; reviewCards?: boolean; practice?: boolean; application?: boolean }): string[] {
   // Motor de carga horaria: el capítulo de práctica no tiene presentación (ni video: lo valida el Blueprint).
   const seq = flags.practice ? ['label:opening', 'label:deepening'] : ['label:opening', 'presentation', 'label:deepening'];
   if (flags.videoEnabled) seq.push('label:video_primer', 'video_h5p');
@@ -99,6 +102,8 @@ export function chapterSlotSequence(flags: { videoEnabled: boolean; activityEnab
   if (flags.activityEnabled) seq.push('label:activity_instruction', 'activity');
   else seq.push('label:self_check');
   if (flags.reviewCards) seq.push('review_cards');
+  // Fase 2: Actividad de Aplicación = instrucción + página del estudiante + solucionario docente (oculto).
+  if (flags.application) seq.push('label:application_instruction', 'application', 'application_solution');
   seq.push('label:closing');
   return seq;
 }
@@ -236,6 +241,20 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   }
   // EV6 H5P v2: «Repaso» opcional (Dialog Cards desde la experiencia) antes del cierre. Sin nota.
   if (ch.reviewCards === true) slots.push({ kind: 'review_cards' });
+  // Fase 2: Actividad de Aplicación (trabajo práctico con producto; sin nota en Moodle) antes del cierre.
+  if (ch.applicationMinutes !== undefined) {
+    const ps = surfOn(h.t, mt.soft);
+    const inner = box(
+      h,
+      chipH(h, 'practica', `Actividad de Aplicación · Capítulo ${ch.number} · ~${ch.applicationMinutes} min`, mt, ps, true) +
+        heading(h, 'h3', 'Aplica lo aprendido', ps) +
+        pHtml(h, labelHtml('Ejercicios graduados, un taller y un producto para entregar. Puedes resolverla en la plataforma o descargarla en PDF para trabajar en papel; al final revisa tu trabajo con la autoevaluación y los criterios.'), ps, { last: true }),
+      { s: ps, border: mt.edge },
+      { cls: 'cvc-application' },
+    );
+    slots.push(label('application_instruction', 'Actividad de Aplicación', root(h, uid('application_instruction'), inner)));
+    slots.push({ kind: 'application' });
+  }
   // [7] Cierre + puente (LLM, sin recursos) + transiciones determinísticas.
   // M12: el puente del LLM ("a continuación…") solo cuando realmente sigue otro
   // capítulo; antes de un examen de módulo o al final del curso manda la
@@ -291,6 +310,7 @@ function chapterRoute(h: Hx, ch: ChapterFacts, examNext: boolean, mt: Tone): str
   if (ch.videoEnabled) steps.push(['video', 'Video interactivo']);
   steps.push(['logro', 'Síntesis']);
   steps.push(ch.activityEnabled ? ['practica', 'Práctica calificada'] : ['repaso', 'Repaso']);
+  if (ch.applicationMinutes !== undefined) steps.push(['logro', 'Actividad de Aplicación']);
   if (examNext) steps.push(['examen', 'Evaluación del módulo']);
   const s = bgSurf(h);
   const items = steps

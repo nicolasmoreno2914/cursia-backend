@@ -33,6 +33,12 @@ export class CreateChapterDto {
   @IsOptional()
   kind?: 'content' | 'practice';
 
+  // Fase 2 · Actividades de Aplicación: minutos de la actividad del capítulo (30/60/90/120); null = sin actividad;
+  // ausente → sin cambio (al crear: sin actividad).
+  @IsIn([30, 60, 90, 120])
+  @IsOptional()
+  applicationMinutes?: 30 | 60 | 90 | 120 | null;
+
   @IsInt()
   @Min(0)
   expectedCounter: number;
