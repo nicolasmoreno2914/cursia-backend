@@ -236,8 +236,13 @@ export class CourseProfilesService {
         );
       }
       if (latest && latest.sha256 === sha) {
-        await qr.rollbackTransaction();
-        return { created: false, profile: this.toDto(latest, finalExam) };
+        // Review N6: re-guardar el mismo contexto también limpia vínculos rotos (p. ej. anteriores a la poda).
+        const prunedSame = kind === 'academic' ? await this.pruneStaleOutcomeLinks(qr, courseId, profile as AcademicContextV1) : [];
+        // El DTO se arma ANTES de confirmar (review N-M1): un fallo de integridad no deja la poda confirmada con un 500.
+        const dto = this.toDto(latest, finalExam);
+        if (prunedSame.length) await qr.commitTransaction();
+        else await qr.rollbackTransaction();
+        return { created: false, profile: dto, ...(prunedSame.length ? { prunedOutcomeLinks: prunedSame } : {}) };
       }
 
       const [row] = await qr.query(
