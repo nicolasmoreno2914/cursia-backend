@@ -1424,6 +1424,53 @@ function reservationBookkeeping(ev) {
       results.courses.E8m = { courseId: c.courseId, runId: c.runId, items: items.length, promptsWithOutcomes: withBlock.length };
     }, { fatal: false });
 
+
+    // ═══ Fase 4 · Coherence Engine — E9: alineación resultado → evidencia sobre el curso del E8 (DB real, sin proveedores) ═══
+    if (RUN_E5 && results.courses.E8) await step('v3-E9-coherencia-alineacion', async () => {
+      const courseId = results.courses.E8.courseId;
+      const net0 = fs.existsSync(NET_LOG) ? fs.readFileSync(NET_LOG, 'utf8').length : 0;
+      const dr = async () => {
+        const r = await api('POST', `/courses/${courseId}/pedagogy/dry-run`, {});
+        if (![200, 201].includes(r.status)) throw new Error(`E9: dry-run ${r.status} ${r.error}`);
+        return r.data;
+      };
+      const d0 = await dr();
+      const a0 = d0.alignment;
+      ok(a0 && a0.available === true && a0.ruleset === 'alignment-rules@1' && a0.outcomes.length === 7, 'E9: el dry-run del curso trae el mapa de alineación (5 RA de la versión 2 + 2 competencias)', a0 && a0.coverage);
+      // Review F4 I2: el flujo de Cursia no vincula competencias → advertencia transversal (A1c), nunca crítico.
+      ok(a0.findings.filter((f) => f.rule === 'A1c' && f.severity === 'warning').map((f) => f.outcomeIds[0]).join() === 'CO1,CO2' && !a0.findings.some((f) => f.rule === 'A1'),
+        'E9: las competencias sin capítulos → advertencia transversal A1c (el documento no las vincula), sin críticos A1', a0.findings.map((f) => f.rule + ':' + f.outcomeIds.join('+')));
+      const ra2 = a0.outcomes.find((o) => o.id === 'RA2');
+      ok(['instruction', 'practice', 'application', 'assessment'].every((k) => ra2.evidence.some((e) => e.kind === k)) && ra2.evidence.every((e) => /:/.test(e.itemKey)), 'E9: RA2 con evidencias tipadas (instrucción, práctica, aplicación, evaluación) del Manifest');
+      const pa = d0.distribution && d0.distribution.materialized.alignment;
+      ok(pa && pa.available === true && pa.outcomes.length === 7 && pa.counts.critical <= a0.counts.critical, 'E9: también la alineación del diseño propuesto (mismos resultados, sin más críticos)', pa && pa.counts);
+      ok(a0.thresholds.missingPracticeIsCritical === false && a0.thresholds.practiceMinutesForComplex === 95, 'E9: umbrales del enfoque guardado (problemas: práctica 0,7 → 95 min)', a0.thresholds);
+      // Caso incompleto: quitar los vínculos de un capítulo → A4; de todos los capítulos de RA4 → A1.
+      let st = await readStructure(courseId);
+      const m4 = st.modules[3];
+      let counter = st.structureVersionCounter;
+      for (const c of m4.chapters.filter((x) => Array.isArray(x.outcomeIds))) {
+        const u = await api('PATCH', `/courses/${courseId}/modules/${m4.id}/chapters/${c.id}`, { outcomeIds: null, expectedCounter: counter });
+        if (u.status !== 200) throw new Error(`E9: quitar vínculos ${u.status} ${u.error}`);
+        counter = u.data.structureVersionCounter;
+      }
+      const a1 = (await dr()).alignment;
+      ok(a1.findings.some((f) => f.rule === 'A1' && f.severity === 'critical' && f.outcomeIds[0] === 'RA4') && a1.findings.filter((f) => f.rule === 'A4').length >= 3,
+        'E9: sin vínculos en el módulo 4 → RA4 sin cobertura (crítico) y sus capítulos «no asociados a ningún resultado»', a1.findings.map((f) => f.rule + ':' + (f.outcomeIds[0] || f.chapterIds[0])));
+      // Caso pedagógico: el mismo curso con aprendizaje significativo cambia umbrales, severidades y sugerencias.
+      const ped = (await api('GET', `/courses/${courseId}/profiles/pedagogy`)).data;
+      const sig = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: { ...ped.profile, primaryApproach: 'significativo', secondaryApproaches: [] }, expectedVersion: ped.version });
+      ok(sig.status === 201, 'E9: perfil cambiado a aprendizaje significativo', { s: sig.status, e: sig.error });
+      const a2 = (await dr()).alignment;
+      ok(a2.thresholds.practiceMinutesForComplex === 70 && a2.thresholds.priorKnowledgeChecks === true && a2.approach.approaches[0].id === 'significativo', 'E9: significativo → 70 min para resultados complejos y control de conocimientos previos', a2.thresholds);
+      // Review F4 M8: aserción concreta. Las A6 se miden contra el umbral del enfoque vigente, y bajar el umbral nunca agrega A6.
+      const a6 = (r) => r.findings.filter((f) => f.rule === 'A6');
+      ok(a6(a1).every((f) => f.evidence.requiredMinutes === 95) && a6(a2).every((f) => f.evidence.requiredMinutes === 70) && a6(a2).length <= a6(a1).length && a2.reportSha256 !== a1.reportSha256,
+        'E9: cambiar el enfoque recalcula las advertencias de tiempo con el umbral nuevo (95 → 70 min)', { a1: a6(a1).length, a2: a6(a2).length });
+      ok(fs.existsSync(NET_LOG) && fs.readFileSync(NET_LOG, 'utf8').length === net0, 'E9: 0 conexiones fuera de 127.0.0.1 (netguard activo)');
+      results.courses.E9 = { courseId, initial: a0.counts, incomplete: a1.counts, significativo: a2.counts };
+    }, { fatal: false });
+
     // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══
     const MOODLE_JOBS = ONLY_REAL_PROVIDERS ? [] : [['E1', 'E1'], ['E1-repack', 'E1repack'], ['E2', 'E2'], ['E3', 'E3']];
     // EV6 H5P v2: E5 entra al mismo restore + inspección (con los «Repaso» del paquete).

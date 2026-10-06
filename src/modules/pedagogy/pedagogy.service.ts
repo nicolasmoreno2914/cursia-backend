@@ -144,6 +144,8 @@ export class PedagogyService {
         profile,
         activityTypeRules: this.activityTypeRules(body.activityTypeRules),
         applyStructureAdjustments: body.applyStructureAdjustments,
+        // Fase 4: dato del contexto que no vive en el Blueprint (sugerencia P2 del Coherence Engine).
+        alignment: { priorKnowledgeDeclared: academic ? academic.context.learner.priorKnowledge.status !== 'missing' : null },
       }),
     );
     return {

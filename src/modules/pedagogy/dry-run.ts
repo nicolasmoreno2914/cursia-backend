@@ -1,3 +1,4 @@
+import { ALIGNMENT_RULESET, ALIGNMENT_VERSION, AlignmentReport, AlignmentUnavailable, buildAlignmentReport } from '../coherence/alignment';
 import {
   ActivityEngine,
   BlueprintSnapshotV2,
@@ -90,6 +91,8 @@ export interface DryRunInput {
   /** Aplicar los cambios de estructura sugeridos en la vista pedagógica (default true). */
   applyStructureAdjustments?: boolean;
   registry?: PedagogicalApproachRegistry;
+  /** Fase 4: datos del contexto académico que no viven en el Blueprint (P2: ¿declara conocimientos previos?). */
+  alignment?: { priorKnowledgeDeclared?: boolean | null };
 }
 
 export interface ProviderPlan {
@@ -171,6 +174,11 @@ export interface DryRunResult {
    * objetivo). Solo propuesta: no cambia el Blueprint ni el Manifest de este dry-run.
    */
   distribution: (DistributionResult & { materialized: DistributionMaterialized; proposalSha256: string }) | null;
+  /**
+   * Fase 4 · Coherence Engine (capa A): alineación resultado → evidencia del diseño que se ve (con diseño pedagógico si
+   * hay perfil). La clave existe SOLO si el Blueprint trae contexto académico (los dry-runs de siempre no cambian).
+   */
+  alignment?: AlignmentReport | AlignmentUnavailable;
   baseline: DryRunSide;
   pedagogical: DryRunSide | null;
   structureChanges: StructureChange[];
@@ -326,6 +334,23 @@ export interface DistributionMaterialized {
   providers: ProviderPlan;
   /** Horas del Manifest materializado (deben ser las `generableHours` del distribuidor); null si falló. */
   generableHours: number | null;
+  /** Fase 4: alineación del diseño PROPUESTO (solo con contexto académico). */
+  alignment?: AlignmentReport | AlignmentUnavailable;
+}
+
+/** Fase 4: reporte de alineación de un lado del dry-run (undefined sin contexto académico). */
+function alignmentOf(s: DryRunSide, extras: DryRunInput['alignment'], registry: PedagogicalApproachRegistry): AlignmentReport | AlignmentUnavailable | undefined {
+  if (!s.blueprint.course.academicContext) return undefined;
+  // Review F4 M4: un fallo de la alineación nunca rompe el dry-run ni se disfraza de «propuesta no materializable».
+  try {
+    const r: AlignmentReport | AlignmentUnavailable = buildAlignmentReport({
+      snapshot: s.blueprint, manifest: s.manifest, studyTime: s.studyTime, blueprintSha256: s.blueprintSha256,
+      priorKnowledgeDeclared: extras?.priorKnowledgeDeclared ?? null, registry,
+    });
+    return r.available ? r : undefined;
+  } catch {
+    return { alignmentVersion: ALIGNMENT_VERSION, ruleset: ALIGNMENT_RULESET, available: false, reason: 'ALIGNMENT_FAILED' };
+  }
 }
 
 /**
@@ -566,7 +591,13 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
     if (lint) summary.push(`${lint} objetivo(s) no cumplen el estilo del enfoque (con sugerencia).`);
   }
 
+  // Fase 4: la alineación del diseño ACTUAL se mide sobre lo que el lock congelaría hoy (estructura viva + diseño), no
+  // sobre la vista con los cambios de estructura sugeridos (esos no se aplican solos y ocultarían vacíos reales).
+  const alignment = base.course.academicContext
+    ? alignmentOf(rules ? side(applyPedagogyToSnapshot(base, rules), activityTypeRules) : baseline, input.alignment, registry)
+    : undefined;
   return {
+    ...(alignment ? { alignment } : {}),
     dryRun: true,
     providersCalled: 0,
     spendUsd: '0.00',
@@ -592,6 +623,7 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
           totals: { ...(ms.manifest.totals as any) },
           providers: ms.providers,
           generableHours: ms.studyTime.courseEstimatedHours,
+          ...(() => { const a = alignmentOf(ms, input.alignment, registry); return a ? { alignment: a } : {}; })(),
         };
       }, appContext);
       // Fase 2 · «Aplicar diseño»: huella de la propuesta que ve el docente (el servidor la recalcula al aplicar).
