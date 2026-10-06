@@ -13,6 +13,7 @@ import { CourseStructureSettingsController } from '../course-structure/course-st
 import { CourseProfilesController } from '../course-profiles/course-profiles.controller';
 import { PedagogyController } from '../pedagogy/pedagogy.controller';
 import { AcademicContextController } from '../academic-context/academic-context.controller';
+import { ChangeImpactController } from '../invalidation/change-impact.controller';
 
 /**
  * Rutas de la estructura dinámica de cursos (V2) que DynamicFeatureGuard
@@ -40,6 +41,7 @@ export const DYNAMIC_CONTROLLERS: ReadonlySet<Function> = new Set<Function>([
   AdminDynamicRunsController,        // EV6 DoD BE-B: GET /admin/dynamic-runs/needs-attention (SUPER_ADMIN)
   PedagogyController,                // Motor pedagógico V1: /pedagogy/* y /courses/:id/pedagogy/dry-run
   AcademicContextController,         // Fase 3: /courses/:id/academic-context/{extract,design}
+  ChangeImpactController,            // Fase 5: POST /courses/:id/change-impact (vista previa, sin escrituras)
 ]);
 
 export const DYNAMIC_HANDLERS: ReadonlySet<Function> = new Set<Function>([

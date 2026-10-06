@@ -1471,6 +1471,63 @@ function reservationBookkeeping(ev) {
       results.courses.E9 = { courseId, initial: a0.counts, incomplete: a1.counts, significativo: a2.counts };
     }, { fatal: false });
 
+
+    // ═══ Fase 5 · Regeneración parcial — E10: vista previa del impacto de los cambios (DB real, sin proveedores, USD 0) ═══
+    if (RUN_E5 && results.courses.E8m) await step('v3-E10-impacto-de-cambios', async () => {
+      const net0 = fs.existsSync(NET_LOG) ? fs.readFileSync(NET_LOG, 'utf8').length : 0;
+      const courseId = results.courses.E8m.courseId;
+      const jobs0 = (await q(`select count(*)::int n from public.production_jobs where course_id = $1`, [courseId]))[0].n;
+      const persisted = async () => (await q(`select (select count(*) from public.course_blueprints where course_id = $1)::int b,
+          (select count(*) from public.course_generation_manifests where course_id = $1)::int m,
+          (select count(*) from public.course_profiles where course_id = $1)::int p`, [courseId]))[0];
+      const persisted0 = await persisted();
+      const imp = async (body) => {
+        const r = await api('POST', `/courses/${courseId}/change-impact`, body || {});
+        if (r.status !== 200) throw new Error(`E10: change-impact ${r.status} ${r.error}`);
+        return r.data;
+      };
+      // Sin cambios: nada que regenerar, USD 0.
+      const d0 = await imp();
+      ok(d0.available === true && d0.fromRunId === results.courses.E8m.runId && d0.blueprintChanged === false && d0.impact.toRun.length === 0 && d0.impact.untouchedChapters === d0.impact.chapters.length,
+        'E10: curso generado sin cambios → todo intacto, nada que regenerar', d0.impact && d0.impact.totals);
+      // Cambiar UN capítulo: solo él (y lo que lo incluye).
+      let st = await readStructure(courseId);
+      const m0 = st.modules[0];
+      const ch = m0.chapters[1];
+      const u = await api('PATCH', `/courses/${courseId}/modules/${m0.id}/chapters/${ch.id}`, { title: `${ch.title} (revisado)`, expectedCounter: st.structureVersionCounter });
+      ok(u.status === 200, 'E10: editar el título de un capítulo', { s: u.status, e: u.error });
+      const d1 = await imp();
+      const c1 = d1.impact.chapters.find((x) => x.chapterId === ch.id);
+      ok(c1 && !c1.untouched && c1.regenerate.some((k) => k.startsWith('content:')) && d1.impact.untouchedChapters === d1.impact.chapters.length - 1,
+        'E10: solo el capítulo editado cambia; los demás quedan intactos', d1.impact.chapters.map((x) => [x.title, x.untouched]));
+      ok(d1.impact.toRun.every((k) => k.includes(ch.id) || /^(course_plan|course_intro|module_intro|exam|final_exam):/.test(k)), 'E10: fuera del capítulo solo lo que lo incluye (plan, intros, exámenes)', d1.impact.toRun);
+      ok(Number(d1.impact.cost.toRun.estimateUsd.expected) > 0 && d1.impact.dryRun === true && d1.impact.spendUsd === '0.00', 'E10: costo estimado de los cambios (simulado, USD 0 gastado)', d1.impact.cost.toRun.estimateUsd);
+      ok(d1.impact.estimatedChangeCostUsd === Number(d1.impact.cost.toRun.estimateUsd.expected).toFixed(2), 'E10: «Costo estimado de los cambios: USD X» = todo lo que se ejecutaría', d1.impact.estimatedChangeCostUsd);
+      // Cambio pedagógico de vista previa (sin guardar): qué depende de esa decisión.
+      const ped = (await api('GET', `/courses/${courseId}/profiles/pedagogy`)).data;
+      const preview = { ...ped.profile, primaryApproach: 'significativo', secondaryApproaches: [] };
+      const d2 = await imp({ profile: preview });
+      ok(d2.impact.toRun.length > d1.impact.toRun.length && d2.impact.toRun.every((k) => (d2.impact.reasons[k] || []).length > 0), 'E10: cambiar el enfoque (vista previa) → más items, cada uno con su motivo', d2.impact.totals);
+      const pedAfter = (await api('GET', `/courses/${courseId}/profiles/pedagogy`)).data;
+      ok(pedAfter.version === ped.version, 'E10: la vista previa no guardó el perfil');
+      // Review F5 I1: perfil inválido → 400 (no 500); run inexistente → 404.
+      const bad = await api('POST', `/courses/${courseId}/change-impact`, { profile: { ...ped.profile, targetHours: -3 }, applyDistribution: true });
+      ok(bad.status === 400, 'E10: perfil de vista previa inválido → 400', { s: bad.status, e: bad.error });
+      const bad2 = await api('POST', `/courses/${courseId}/change-impact`, { profile: { ...ped.profile, primaryApproach: 'no-existe' } });
+      ok(bad2.status === 400, 'E10: enfoque desconocido → 400', { s: bad2.status, e: bad2.error });
+      const nf = await api('POST', `/courses/${courseId}/change-impact`, { fromRunId: '99999999-9999-4999-8999-999999999999' });
+      ok(nf.status === 404, 'E10: run de origen inexistente → 404', { s: nf.status, e: nf.error });
+      ok((await q(`select count(*)::int n from public.production_jobs where course_id = $1`, [courseId]))[0].n === jobs0, 'E10: no se creó ningún run ni trabajo');
+      ok(JSON.stringify(await persisted()) === JSON.stringify(persisted0), 'E10: la vista previa no escribió Blueprints, Manifests ni perfiles', persisted0);
+      // Curso sin generar (E8): nada que conservar, costo del curso completo.
+      if (results.courses.E8) {
+        const r = await api('POST', `/courses/${results.courses.E8.courseId}/change-impact`, {});
+        ok(r.status === 200 && r.data.available === false && r.data.reason === 'NO_PREVIOUS_RUN' && Number(r.data.fullGeneration.estimateUsd.expected) > 0, 'E10: curso no generado → costo de generarlo completo', { s: r.status, d: r.data && r.data.reason });
+      }
+      ok(fs.existsSync(NET_LOG) && fs.readFileSync(NET_LOG, 'utf8').length === net0, 'E10: 0 conexiones fuera de 127.0.0.1 (netguard activo)');
+      results.courses.E10 = { courseId, unchanged: d0.impact.totals, oneChapter: { toRun: d1.impact.toRun.length, usd: d1.impact.cost.toRun.estimateUsd.expected }, approachPreview: { toRun: d2.impact.toRun.length } };
+    }, { fatal: false });
+
     // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══
     const MOODLE_JOBS = ONLY_REAL_PROVIDERS ? [] : [['E1', 'E1'], ['E1-repack', 'E1repack'], ['E2', 'E2'], ['E3', 'E3']];
     // EV6 H5P v2: E5 entra al mismo restore + inspección (con los «Repaso» del paquete).

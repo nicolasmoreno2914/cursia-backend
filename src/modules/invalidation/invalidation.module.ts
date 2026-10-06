@@ -1,6 +1,8 @@
 import { Module } from '@nestjs/common';
 import { InvalidationController } from './invalidation.controller';
 import { InvalidationService } from './invalidation.service';
+import { ChangeImpactController } from './change-impact.controller';
+import { ChangeImpactService } from './change-impact.service';
 import { GenerationManifestsModule } from '../generation-manifests/generation-manifests.module';
 import { AuthModule } from '../../auth/auth.module';
 
@@ -11,8 +13,8 @@ import { AuthModule } from '../../auth/auth.module';
  */
 @Module({
   imports: [GenerationManifestsModule, AuthModule],
-  controllers: [InvalidationController],
-  providers: [InvalidationService],
+  controllers: [InvalidationController, ChangeImpactController],
+  providers: [InvalidationService, ChangeImpactService],
   exports: [InvalidationService],
 })
 export class InvalidationModule {}
