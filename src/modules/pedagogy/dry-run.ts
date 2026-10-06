@@ -527,7 +527,9 @@ export function providerPlanFor(manifest: GenerationManifestV1, opts?: { coverag
     for (const [type, v] of Object.entries(est.totals.byItemType)) cat[COST_CATEGORY_OF_ITEM_TYPE[type] ?? 'text'] += Number(v.expected);
     const unverified = new Set<string>();
     for (const l of est.lines) {
-      const rows = seedCatalog().filter((r) => r.provider === l.provider && r.product_or_model === l.product);
+      // Los multiplicadores de caché son derivados (×1,25 / ×0,1 de la tarifa verificada) y de peso marginal: no
+      // vuelven «provisional» a un proveedor cuyas tarifas principales están verificadas.
+      const rows = seedCatalog().filter((r) => r.provider === l.provider && r.product_or_model === l.product && !/^cache_/.test(String(r.meter)));
       if (rows.some((r) => r.verified !== true)) unverified.add(l.provider);
     }
     const unverifiedProviders = [...unverified].sort();
