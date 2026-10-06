@@ -1892,7 +1892,8 @@ function reservationBookkeeping(ev) {
         const labels = spawnSync(PHP, ['-c', PHPINI, path.join(HERE, 'moodle-v3-labels.php'), process.env.MOODLE_ROOT, String(courseid)], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
         const L = JSON.parse((labels.stdout || '{}').split('\n').find((l) => l.startsWith('{')) || '{}');
         ok(labels.status === 0 && L.labels, `${label}: textos de labels leídos de la DB`, (labels.stderr || '').slice(0, 300));
-        const text = (idn) => ((L.labels || {})[idn] || '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ');
+        // Guiones suaves (&shy;) que el shell inserta en palabras largas: no son parte del texto que se busca.
+        const text = (idn) => ((L.labels || {})[idn] || '').replace(/<[^>]+>/g, ' ').replace(/&shy;|\u00ad/g, '').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ');
         if (aw && ab) {
           const awS = mp3DurationSeconds(await blobByHash(aw.hash));
           const abS = mp3DurationSeconds(await blobByHash(ab.hash));
