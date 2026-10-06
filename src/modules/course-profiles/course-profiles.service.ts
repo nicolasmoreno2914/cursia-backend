@@ -1,3 +1,5 @@
+import { returningRows } from '../../common/db/returning-rows';
+import { advanceStructureOriginIfUntouched } from '../course-structure/structure-authority';
 import {
   BadRequestException,
   ConflictException,
@@ -290,7 +292,14 @@ export class CourseProfilesService {
       await qr.query(`update public.course_chapters set outcome_ids = $1::jsonb, updated_at = now() where id = $2 and course_id = $3`, [keep.length ? JSON.stringify(keep) : null, r.id, courseId]);
       out.push({ chapterId: r.id, removed: ids.filter((x) => !known.has(x)) });
     }
-    if (out.length) await qr.query(`update public.courses set structure_version_counter = structure_version_counter + 1 where id = $1`, [courseId]);
+    if (out.length) {
+      // Review L80 R2-M1: el contador nuevo sale del mismo UPDATE (append ya tiene la fila del curso FOR UPDATE).
+      const res = await qr.query(`update public.courses set structure_version_counter = structure_version_counter + 1 where id = $1 returning structure_version_counter c`, [courseId]);
+      const before = Number(returningRows(res)[0].c) - 1;
+      // LOOP 8.0 (review L80 I2): quitar vínculos que el contexto nuevo ya no define es trabajo de Cursia, no del
+      // docente: una estructura de Cursia intacta lo sigue siendo (el documento nuevo la puede reemplazar sin preguntar).
+      await advanceStructureOriginIfUntouched(qr, courseId, before, before + 1);
+    }
     return out;
   }
 

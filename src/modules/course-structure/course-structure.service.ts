@@ -83,6 +83,17 @@ function cleanDescription(v: string | undefined | null): string | null {
   const t = String(v ?? '').replace(/\s+/g, ' ').trim();
   return t ? t : null;
 }
+import {
+  StructureOrigin,
+  advanceStructureOriginIfUntouched,
+  isPristineSkeleton,
+  parseStructureOrigin,
+  structureAuthority,
+  writeStructureOrigin,
+} from './structure-authority';
+import { proposeStructureFromContext } from '../academic-context/context-design';
+import { validateAcademicContext } from '../academic-context/validate';
+import { ApplyAcademicStructureDto, RecordStructureOriginDto } from './dto/apply-academic-structure.dto';
 import { activityTypeRulesForNextManifest, blueprintSchemaVersionForRules, readActivityTypeRulesConfig, readConfiguredRulesVersion } from '../generation-manifests/manifest-rules-config';
 import { composeLockSnapshotV2, plainCourseRefV2 } from '../course-blueprints/lock-snapshot';
 
@@ -341,6 +352,8 @@ export class CourseStructureService implements OnModuleInit {
         [courseId],
       ));
       const newCounter = this.counterOrThrow(cr?.structure_version_counter, courseId);
+      // LOOP 8.0: el diseño de Cursia sobre una estructura que Cursia armó y nadie tocó sigue siendo «de Cursia».
+      await advanceStructureOriginIfUntouched(queryRunner, courseId, lock.counter, newCounter);
       const liveMatchesCurrentBlueprint = await this.liveMatchesAfterMutation(queryRunner, courseId, ownerId, lock.hasBlueprint);
       await queryRunner.commitTransaction();
       return {
@@ -350,6 +363,203 @@ export class CourseStructureService implements OnModuleInit {
         applicationActivities: dist.counts.applicationActivities,
         estimatedHours: dist.estimatedHours,
       };
+    } catch (err) {
+      if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  /**
+   * LOOP 8.0 · La estructura del microcurrículo (contexto académico GUARDADO, versión `dto.contextVersion`) reemplaza la
+   * estructura del curso en UNA transacción: unidades → módulos, contenidos → capítulos (≤ 5 por módulo), con sus
+   * descripciones, objetivos y vínculos a resultados. Es la misma propuesta que muestra GET academic-context/design.
+   *   - Sin preguntar: esqueleto vacío, o estructura que armó Cursia (IA o una versión anterior del documento) y que
+   *     nadie tocó desde entonces (structureAuthority).
+   *   - Con trabajo del docente o con una versión confirmada (Blueprint vigente): 409 STRUCTURE_REPLACE_NEEDS_CONFIRMATION
+   *     con lo que se perdería, salvo `confirmReplace: true`. Nunca se pisa nada en silencio.
+   * No genera nada ni gasta. El curso ya generado (Blueprint, Manifest, runs) no cambia: la estructura viva deja de
+   * coincidir con la versión confirmada y se vuelve a confirmar como siempre.
+   */
+  async applyAcademicStructure(courseId: number, ownerId: string, dto: ApplyAcademicStructureDto) {
+    assertDynamicOwnerAllowed(ownerId);
+    await assertV21StructureSchema(this.dataSource);
+    const queryRunner = this.dataSource.createQueryRunner();
+    try {
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
+      const lock = await this.lockAndVerifyEx(queryRunner, courseId, ownerId, dto.expectedCounter);
+      await assertAcademicContextSchema(queryRunner);
+      const academic = await loadCurrentAcademicContext(queryRunner, courseId);
+      if (!academic) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException({ code: 'NO_ACADEMIC_CONTEXT', message: 'NO_ACADEMIC_CONTEXT: el curso no tiene contexto académico guardado; guarda el microcurrículo antes de usar su estructura.' });
+      }
+      if (academic.version !== dto.contextVersion) {
+        await queryRunner.rollbackTransaction();
+        throw new ConflictException({ code: 'CONTEXT_CHANGED', currentContextVersion: academic.version, message: `CONTEXT_CHANGED: el contexto académico cambió (versión ${academic.version}); vuelve a revisarlo antes de usar su estructura.` });
+      }
+      if (!validateAcademicContext(academic.context).canProceed) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException({ code: 'CONTEXT_HAS_ERRORS', message: 'CONTEXT_HAS_ERRORS: el contexto académico tiene errores; corrígelos antes de usar su estructura.' });
+      }
+      const proposal = proposeStructureFromContext(academic.context);
+      if (!proposal.available) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException({ code: 'NO_STRUCTURE_IN_CONTEXT', message: `NO_STRUCTURE_IN_CONTEXT: ${proposal.reason}` });
+      }
+      const current = await this.readStructure(queryRunner, courseId, ownerId);
+      const authority = current.structureAuthority;
+      const currentCounts = { modules: current.modules.length, chapters: current.modules.reduce((a, m) => a + m.chapters.length, 0) };
+      if (authority.replaceReasons.length && dto.confirmReplace !== true) {
+        await queryRunner.rollbackTransaction();
+        throw new ConflictException({
+          code: 'STRUCTURE_REPLACE_NEEDS_CONFIRMATION',
+          reasons: authority.replaceReasons,
+          current: currentCounts,
+          proposal: { modules: proposal.counts.modules, chapters: proposal.counts.chapters },
+          message: 'STRUCTURE_REPLACE_NEEDS_CONFIRMATION: la estructura actual tiene cambios del docente o una versión confirmada; confirma antes de reemplazarla.',
+        });
+      }
+      // Review L80 M2: con una generación en curso, cambiar la estructura deja a sus items apuntando a capítulos que ya no
+      // existen. Se rechaza a la vista (como cualquier cambio grande durante un run).
+      if (lock.hasBlueprint) {
+        const [run] = await queryRunner.query(
+          `select id from public.production_jobs
+            where course_id = $1 and execution_mode = 'dynamic_generation' and worker_status in ('queued', 'running', 'retrying')
+              and coalesce(status, '') not in ('cancelled', 'cancelling')
+            limit 1`,
+          [courseId],
+        );
+        if (run) {
+          await queryRunner.rollbackTransaction();
+          throw new ConflictException({ code: 'ACTIVE_RUN', message: 'ACTIVE_RUN: hay una generación en curso; espera a que termine (o cancélala) antes de cambiar la estructura con el microcurrículo.' });
+        }
+      }
+      // Review L80 I3: reconciliación POR POSICIÓN (no borrar y recrear). El módulo i y el capítulo j que ya existen
+      // conservan su id y toman los datos del documento; sobran → se borran; faltan → se crean. Así lo que no cambió
+      // (p. ej. volver a guardar el mismo microcurrículo) sigue siendo el mismo item para el impacto de cambios y la
+      // regeneración parcial; lo que cambió lo detectan sus huellas, como cualquier edición.
+      const cols: { column_name: string }[] = await queryRunner.query(
+        `select column_name from information_schema.columns
+          where table_schema = 'public' and table_name = 'course_chapters' and column_name in ('chapter_kind', 'application_minutes')`,
+      );
+      const hasKind = cols.some((c) => c.column_name === 'chapter_kind');
+      const hasApp = cols.some((c) => c.column_name === 'application_minutes');
+      const liveMods: { id: string }[] = await queryRunner.query(`select id from public.course_modules where course_id = $1 order by position, id`, [courseId]);
+      const liveChs: { id: string; module_id: string; title: string; chapter_kind: string | null; application_minutes: string | null }[] = await queryRunner.query(
+        `select id, module_id, title, to_jsonb(ch) ->> 'chapter_kind' as chapter_kind, to_jsonb(ch) ->> 'application_minutes' as application_minutes
+           from public.course_chapters ch where course_id = $1 order by position, id`,
+        [courseId],
+      );
+      // El diseño de horas aplicado (práctica / Actividades de Aplicación) no viene del documento: se avisa al docente.
+      const previousHadDesign = liveChs.some((c) => c.chapter_kind === 'practice' || c.application_minutes !== null);
+      const chsOf = (moduleId: string) => liveChs.filter((c) => c.module_id === moduleId);
+      const contentReset = `${hasKind ? ", chapter_kind = 'content'" : ''}${hasApp ? ', application_minutes = null' : ''}`;
+      for (const [mi, m] of proposal.modules.entries()) {
+        const mt = normalizeTitleOrThrow('module', m.title);
+        const mDesc = checkedDescription(mergeDescription(cleanDescription(m.description), mt.description));
+        let moduleId: string;
+        const keepMod = liveMods[mi];
+        if (keepMod) {
+          moduleId = keepMod.id;
+          await queryRunner.query(
+            `update public.course_modules set position = $2, title = $3, objective = $4, description = $5, exam_enabled = $6, updated_at = now()
+              where id = $1 and course_id = $7`,
+            [moduleId, mi, mt.title, m.objective, mDesc, m.examEnabled, courseId],
+          );
+        } else {
+          const [mod] = await queryRunner.query(
+            `insert into public.course_modules (course_id, position, title, objective, description, exam_enabled)
+             values ($1, $2, $3, $4, $5, $6) returning id`,
+            [courseId, mi, mt.title, m.objective, mDesc, m.examEnabled],
+          );
+          moduleId = mod.id;
+        }
+        // Review L80 R2-I1: emparejar primero por título (el mismo capítulo del documento conserva su id aunque «Aplicar
+        // diseño» haya intercalado práctica o profundización) y después, en orden, solo con capítulos de CONTENIDO que
+        // quedaron libres. Los capítulos de práctica y los sobrantes se borran.
+        const pool = keepMod ? chsOf(keepMod.id) : [];
+        const used = new Set<string>();
+        const norm = (t: string) => String(t || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const keepChs: ({ id: string } | undefined)[] = m.chapters.map((c) => {
+          const t = norm(normalizeTitleOrThrow('chapter', c.title).title);
+          const hit = pool.find((x) => !used.has(x.id) && norm(x.title) === t);
+          if (hit) used.add(hit.id);
+          return hit;
+        });
+        const freeContent = pool.filter((x) => !used.has(x.id) && x.chapter_kind !== 'practice');
+        for (let ci = 0; ci < keepChs.length; ci++) {
+          if (keepChs[ci]) continue;
+          const next = freeContent.shift();
+          if (next) { used.add(next.id); keepChs[ci] = next; }
+        }
+        for (const [ci, c] of m.chapters.entries()) {
+          const ct = normalizeTitleOrThrow('chapter', c.title);
+          const cDesc = checkedDescription(mergeDescription(cleanDescription(c.description), ct.description));
+          const links = c.outcomeIds.length ? JSON.stringify(c.outcomeIds) : null;
+          if (keepChs[ci]) {
+            await queryRunner.query(
+              `update public.course_chapters set position = $2, title = $3, objective = $4, description = $5, video_enabled = $6,
+                      activity_enabled = $7, outcome_ids = $8::jsonb${contentReset}, updated_at = now()
+                where id = $1 and course_id = $9`,
+              [keepChs[ci]!.id, ci, ct.title, c.objective, cDesc, c.videoEnabled, c.activityEnabled, links, courseId],
+            );
+          } else {
+            await queryRunner.query(
+              `insert into public.course_chapters (course_id, module_id, position, title, objective, description, video_enabled, activity_enabled, outcome_ids)
+               values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)`,
+              [courseId, moduleId, ci, ct.title, c.objective, cDesc, c.videoEnabled, c.activityEnabled, links],
+            );
+          }
+        }
+        const extraChs = pool.filter((x) => !used.has(x.id)).map((x) => x.id);
+        if (extraChs.length) await queryRunner.query(`delete from public.course_chapters where course_id = $1 and id = any($2::uuid[])`, [courseId, extraChs]);
+      }
+      const extraMods = liveMods.slice(proposal.modules.length).map((x) => x.id);
+      // Módulos sobrantes: sus capítulos se borran por cascada (artifacts.module_id/chapter_id → null por su FK).
+      if (extraMods.length) await queryRunner.query(`delete from public.course_modules where course_id = $1 and id = any($2::uuid[])`, [courseId, extraMods]);
+      const [cr] = returningRows(await queryRunner.query(
+        `update public.courses set final_exam_enabled = $2, structure_version_counter = structure_version_counter + 1
+          where id = $1 returning structure_version_counter`,
+        [courseId, proposal.finalExam],
+      ));
+      const newCounter = this.counterOrThrow(cr?.structure_version_counter, courseId);
+      await writeStructureOrigin(queryRunner, courseId, { source: 'academic_context', counter: newCounter, contextVersion: academic.version, at: new Date().toISOString() });
+      const structure = await this.readStructure(queryRunner, courseId, ownerId);
+      await queryRunner.commitTransaction();
+      return {
+        ...structure,
+        replaced: { previous: currentCounts, modules: proposal.counts.modules, chapters: proposal.counts.chapters, contextVersion: academic.version, confirmed: authority.replaceReasons.length > 0 },
+        hadBlueprint: lock.hasBlueprint,
+        previousHadDesign,
+        notes: proposal.notes,
+      };
+    } catch (err) {
+      if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  /**
+   * LOOP 8.0 · El editor terminó de aplicar la propuesta de la IA: la estructura vigente (con este contador) es de
+   * Cursia. No cambia la estructura ni el contador. Contador distinto → 409 (alguien la cambió mientras tanto).
+   */
+  async recordStructureOrigin(courseId: number, ownerId: string, dto: RecordStructureOriginDto) {
+    assertDynamicOwnerAllowed(ownerId);
+    await assertV21StructureSchema(this.dataSource);
+    const queryRunner = this.dataSource.createQueryRunner();
+    try {
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
+      const lock = await this.lockAndVerifyEx(queryRunner, courseId, ownerId, dto.expectedCounter);
+      const origin: StructureOrigin = { source: dto.source, counter: lock.counter, contextVersion: null, at: new Date().toISOString() };
+      await writeStructureOrigin(queryRunner, courseId, origin);
+      await queryRunner.commitTransaction();
+      return { structureVersionCounter: lock.counter, structureOrigin: origin };
     } catch (err) {
       if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
       throw err;
@@ -395,6 +605,8 @@ export class CourseStructureService implements OnModuleInit {
               -- Fase 3 · Contexto académico: ¿la base tiene course_chapters.outcome_ids? (misma sentencia)
               exists (select 1 from information_schema.columns
                        where table_schema = 'public' and table_name = 'course_chapters' and column_name = 'outcome_ids') as oid_col,
+              -- LOOP 8.0: quién armó la estructura vigente (sin migración: courses.metadata).
+              c.metadata -> 'structureOrigin' as structure_origin,
               b.id as bp_id, b.blueprint_number as bp_number, b.locked_at as bp_locked_at,
               b.snapshot_sha256 as bp_sha256, b.schema_version as bp_schema_version,
               -- Motor pedagógico V1 (review I1): perfil pedagógico vigente en la MISMA sentencia (sin ida y vuelta extra).
@@ -574,6 +786,13 @@ export class CourseStructureService implements OnModuleInit {
       })),
       currentBlueprint,
       liveMatchesCurrentBlueprint,
+      // LOOP 8.0: ¿la estructura del microcurrículo puede reemplazar la vigente sin preguntar?
+      structureAuthority: structureAuthority(
+        parseStructureOrigin(typeof row.structure_origin === 'string' ? JSON.parse(row.structure_origin) : row.structure_origin),
+        counter,
+        isPristineSkeleton(modules),
+        currentBlueprint !== null,
+      ),
     };
   }
 

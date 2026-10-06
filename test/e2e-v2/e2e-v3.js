@@ -1736,6 +1736,56 @@ function reservationBookkeeping(ev) {
       results.courses.E11regen = { ...info(man2.data.manifest.manifest, P2, modsB), blueprintNumber: n2, runId: runBId, regenerated: regen.length, usd: I.estimatedChangeCostUsd };
     }, { fatal: false });
 
+    // ═══ LOOP 8.0 · E12 — el microcurrículo manda sobre la estructura (hallazgo O1), por HTTP real: la IA armó la
+    // estructura → el documento la reemplaza sin preguntar; con cambios del docente → 409 hasta confirmar.
+    if (RUN_E5) await step('v3-E12-microcurriculo-manda', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: '[E2E E12] Contabilidad de Costos' });
+      ok(cr.status === 201, 'E12: curso dinámico creado', { s: cr.status, e: cr.error });
+      const courseId = Number(cr.data.id);
+      // Esqueleto del editor (R8) y la propuesta de la IA tal como la aplica 48: 4 módulos con mutaciones sueltas.
+      let counter = (await readStructure(courseId)).structureVersionCounter;
+      const sk = await api('POST', `/courses/${courseId}/modules`, { title: 'Módulo 1', expectedCounter: counter });
+      counter = sk.data.structureVersionCounter;
+      let st = await readStructure(courseId);
+      ok(st.structureAuthority && st.structureAuthority.pristine === true && st.structureAuthority.replaceReasons.length === 0, 'E12: esqueleto vacío → reemplazable sin preguntar', st.structureAuthority);
+      counter = (await api('PATCH', `/courses/${courseId}/modules/${st.modules[0].id}`, { title: 'IA módulo 1', objective: 'Objetivo propuesto por la IA', expectedCounter: counter })).data.structureVersionCounter;
+      for (let i = 2; i <= 4; i++) counter = (await api('POST', `/courses/${courseId}/modules`, { title: `IA módulo ${i}`, objective: 'Objetivo propuesto por la IA', expectedCounter: counter })).data.structureVersionCounter;
+      const badSrc = await api('POST', `/courses/${courseId}/modules/structure-origin`, { source: 'academic_context', expectedCounter: counter });
+      ok(badSrc.status === 400, 'E12: el cliente no puede declarar el origen «academic_context» (DTO)', { s: badSrc.status, e: badSrc.error });
+      const ro = await api('POST', `/courses/${courseId}/modules/structure-origin`, { source: 'ai_proposal', expectedCounter: counter });
+      ok(ro.status === 200 && ro.data.structureVersionCounter === counter, 'E12: origen IA registrado sin cambiar el contador', { s: ro.status, e: ro.error });
+      st = await readStructure(courseId);
+      eq([st.modules.length, st.structureAuthority.source, st.structureAuthority.untouched, st.structureAuthority.replaceReasons], [4, 'ai_proposal', true, []], 'E12: estructura de la IA intacta');
+      // Microcurrículo → contexto guardado → su estructura reemplaza a la de la IA, en una transacción.
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo.docx', dataBase64: (await AF.fixture('consistent', 'docx')).toString('base64') }] });
+      const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 });
+      ok(sv.status === 201, 'E12: contexto académico guardado (versión 1)', { s: sv.status, e: sv.error });
+      const prop = (await api('GET', `/courses/${courseId}/academic-context/design`)).data.structureProposal;
+      const noVer = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: counter });
+      ok(noVer.status === 400, 'E12: sin contextVersion → 400 (DTO)', { s: noVer.status });
+      const ap = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: counter, contextVersion: 1 });
+      ok(ap.status === 201 && ap.data.replaced.confirmed === false && ap.data.structureVersionCounter === counter + 1, 'E12: el microcurrículo reemplaza la estructura de la IA sin preguntar (un contador)', { s: ap.status, e: ap.error });
+      st = await readStructure(courseId);
+      eq([st.modules.length, st.modules.reduce((a, m) => a + m.chapters.length, 0), st.structureAuthority.source, st.structureAuthority.contextVersion], [prop.counts.modules, prop.counts.chapters, 'academic_context', 1], 'E12: forma y origen del documento');
+      eq(st.modules.flatMap((m) => m.chapters.map((c) => c.outcomeIds || [])), prop.modules.flatMap((m) => m.chapters.map((c) => c.outcomeIds)), 'E12: vínculos a resultados del documento');
+      ok(!st.modules.some((m) => /^IA /.test(m.title)), 'E12: no queda nada de la estructura de la IA');
+      // El docente edita → el documento ya no la pisa sin confirmación (409, nada cambia); con confirmación, sí.
+      const c0 = st.modules[0].chapters[0];
+      counter = (await api('PATCH', `/courses/${courseId}/modules/${st.modules[0].id}/chapters/${c0.id}`, { title: 'Título del docente', expectedCounter: st.structureVersionCounter })).data.structureVersionCounter;
+      const nc = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: counter, contextVersion: 1 });
+      ok(nc.status === 409 && /^STRUCTURE_REPLACE_NEEDS_CONFIRMATION/.test(String(nc.error)), 'E12: con cambios del docente → 409 STRUCTURE_REPLACE_NEEDS_CONFIRMATION', { s: nc.status, e: nc.error });
+      st = await readStructure(courseId);
+      eq([st.structureVersionCounter, st.modules[0].chapters[0].title], [counter, 'Título del docente'], 'E12: el 409 no cambió nada');
+      const yc = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: counter, contextVersion: 1, confirmReplace: true });
+      ok(yc.status === 201 && yc.data.replaced.confirmed === true, 'E12: confirmado → reemplazada', { s: yc.status, e: yc.error });
+      // Review L80 M1: el origen solo lo escribe el backend de la estructura; un PATCH del curso no lo cambia.
+      const pm = await api('PATCH', `/courses/${courseId}`, { metadata: { structureOrigin: { source: 'ai_proposal', counter: 0 } } });
+      st = await readStructure(courseId);
+      ok(pm.status === 200 && st.structureAuthority.source === 'academic_context' && st.structureAuthority.untouched === true, 'E12: un PATCH del curso no cambia el origen de la estructura', { s: pm.status, a: st.structureAuthority });
+      results.courses.E12 = { courseId, modules: prop.counts.modules, chapters: prop.counts.chapters };
+    }, { fatal: false });
+
     // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══
     const MOODLE_JOBS = ONLY_REAL_PROVIDERS ? [] : [['E1', 'E1'], ['E1-repack', 'E1repack'], ['E2', 'E2'], ['E3', 'E3']];
     // EV6 H5P v2: E5 entra al mismo restore + inspección (con los «Repaso» del paquete).

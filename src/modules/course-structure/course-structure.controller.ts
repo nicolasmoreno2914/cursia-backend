@@ -1,4 +1,5 @@
 import { ApplyDistributionDto } from './dto/apply-distribution.dto';
+import { ApplyAcademicStructureDto, RecordStructureOriginDto } from './dto/apply-academic-structure.dto';
 import {
   Controller,
   Get,
@@ -59,6 +60,29 @@ export class CourseStructureController {
     @CurrentUser() user: AuthUser,
   ) {
     return this.structureService.applyDistribution(courseId, user.id, dto);
+  }
+
+  // POST /api/v1/courses/:courseId/modules/apply-academic-structure — LOOP 8.0: la estructura del microcurrículo
+  // (contexto académico guardado) reemplaza la del curso. Sin pisar trabajo del docente sin confirmación explícita.
+  @Post('apply-academic-structure')
+  applyAcademicStructure(
+    @Param('courseId', ParseIntPipe) courseId: number,
+    @Body() dto: ApplyAcademicStructureDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.structureService.applyAcademicStructure(courseId, user.id, dto);
+  }
+
+  // POST /api/v1/courses/:courseId/modules/structure-origin — LOOP 8.0: el editor registra que la estructura vigente
+  // es la propuesta de la IA (así el microcurrículo puede reemplazarla sin pedir confirmación mientras nadie la toque).
+  @Post('structure-origin')
+  @HttpCode(HttpStatus.OK)
+  recordStructureOrigin(
+    @Param('courseId', ParseIntPipe) courseId: number,
+    @Body() dto: RecordStructureOriginDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.structureService.recordStructureOrigin(courseId, user.id, dto);
   }
 
   // PATCH /api/v1/courses/:courseId/modules/reorder
