@@ -16,6 +16,8 @@
 //   D11 reordenar capítulos y cambiar targetHours: el resultado se recalcula sin estado oculto
 //   D12 dry-run pedagógico: `distribution` con objetivo; null sin objetivo (salida de siempre)
 //   D13 adversos: Blueprint vacío, módulo sin capítulos, targetHours inválido, tolerancia absurda
+//   D18 LOOP 7 (A1): re-proponer sobre un diseño aplicado nunca quita la Actividad de las prácticas y converge
+//       (punto fijo); «Ninguna» → «auto» sobre un diseño aplicado devuelve la actividad a las prácticas
 //
 // Uso: node scripts/check-distributor.js [path/to/dist]   (después de npm run build)
 'use strict';
@@ -311,6 +313,46 @@ check('D17 revisión final Fase 1 (M3): si la materialización falla, el error e
   const m = P.materializeOrError(base.baseline.blueprint, base.distribution, () => { throw new Error('bug simulado'); });
   eq([m.manifestErrors[0].code, m.generableHours, m.providers.estimateUsd], ['DISTRIBUTION_MATERIALIZE_FAILED', null, null], 'error visible');
   assert(/bug simulado/.test(m.manifestErrors[0].message) && /Sin estimación de costo/.test(m.providers.estimateNote), 'mensaje y nota de costo');
+});
+
+check('D18 LOOP 7 (A1): re-proponer sobre un diseño aplicado conserva las prácticas con su actividad y converge', () => {
+  const rules = rulesOf('competencias');
+  const run = (snap, h, prefs) => ST.distributeCourseHours({ snapshot: snap, rules, targetHours: h, activityTypeRules: 2, ...(prefs ? { preferences: prefs } : {}) });
+  // Aplicar = materializar con ids NUEVOS para los capítulos agregados (en la base son gen_random_uuid).
+  let nid = 0;
+  const known = new Set(snapOf().modules.flatMap((m) => m.chapters.map((c) => c.id)));
+  const apply = (snap, d) => {
+    const out = clone(P.materializeDistribution(snap, d));
+    for (const m of out.modules) for (const c of m.chapters) {
+      if (known.has(c.id)) continue;
+      c.id = `00000000-0000-4000-9000-${String(++nid).padStart(12, '0')}`;
+      known.add(c.id);
+    }
+    return out;
+  };
+  for (const h of [50, 80]) {
+    let snap = snapOf();
+    let d = run(snap, h);
+    const seen = [];
+    for (let i = 0; i < 4 && d.changes.length; i++) {
+      snap = apply(snap, d);
+      d = run(snap, h);
+      seen.push(d.changes.length);
+      const practice = d.modules.flatMap((m) => m.chapters).filter((c) => c.kind === 'practice');
+      assert(practice.length > 0 && practice.every((c) => c.applicationMinutes), `${h} h, vuelta ${i + 1}: cada práctica conserva su Actividad (${practice.map((c) => c.applicationMinutes).join(',')})`);
+      const kindOf = new Map(d.modules.flatMap((m) => m.chapters.map((c) => [c.id, c.kind])));
+      assert(!d.changes.some((c) => c.type === 'remove_application_activity' && kindOf.get(c.chapterId) === 'practice'), `${h} h: nunca propone quitar la Actividad de una práctica`);
+    }
+    eq(d.changes.length, 0, `${h} h: converge a un punto fijo (cambios por vuelta: ${seen.join(' → ')})`);
+  }
+  // «Ninguna» aplicada y después «auto»: las prácticas existentes recuperan su Actividad.
+  let snap = snapOf();
+  snap = apply(snap, run(snap, 50));
+  snap = apply(snap, run(snap, 50, { applicationActivities: 'none' }));
+  assert(snap.modules.flatMap((m) => m.chapters).every((c) => !c.applicationMinutes), 'con «Ninguna» no quedan actividades');
+  const back = run(snap, 50, { applicationActivities: 'auto' });
+  const pr = back.modules.flatMap((m) => m.chapters).filter((c) => c.kind === 'practice');
+  assert(pr.length > 0 && pr.every((c) => c.applicationMinutes), `«auto» devuelve la actividad a las ${pr.length} prácticas`);
 });
 
 console.log(`\n${passes} OK, ${failures} fallidas`);
