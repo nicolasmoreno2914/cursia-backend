@@ -31,7 +31,14 @@ MBZ="$(cd "$(dirname "$MBZ")" && pwd)/$(basename "$MBZ")"
 cd "$MOODLE"
 
 echo "== Restoring $MBZ into a new course (category 1) ==" >&2
-RESTORE_OUT="$("$PHP" -c "$PHPINI" admin/cli/restore_backup.php --file="$MBZ" --categoryid=1 2>&1)"
+# LOOP 7: con CURSIA_RESTORE_PHP (scripts/moodle/restore-as-admin.php del repo) el restore corre con la sesión del
+# admin, como un restore web: los overrides de permisos del paquete (solucionario prohibido al estudiante) se
+# aplican. El CLI de Moodle no tiene sesión y los descarta. Sin la variable: el CLI de siempre.
+if [ -n "${CURSIA_RESTORE_PHP:-}" ]; then
+    RESTORE_OUT="$("$PHP" -c "$PHPINI" "$CURSIA_RESTORE_PHP" --moodle="$MOODLE" --file="$MBZ" --categoryid=1 2>&1)"
+else
+    RESTORE_OUT="$("$PHP" -c "$PHPINI" admin/cli/restore_backup.php --file="$MBZ" --categoryid=1 2>&1)"
+fi
 echo "$RESTORE_OUT" >&2
 
 # The CLI script prints "Course ID: N" (or similar) on success; try a couple

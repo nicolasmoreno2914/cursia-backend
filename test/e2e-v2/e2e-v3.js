@@ -1689,8 +1689,11 @@ function reservationBookkeeping(ev) {
       llm.st.chapterByTitle.set(newTitle, ch.id);
       const imp = await api('POST', `/courses/${courseId}/change-impact`, {});
       const I = imp.data && imp.data.impact;
-      ok(imp.status === 200 && imp.data.fromRunId === runA && I.untouchedChapters === I.chapters.length - 1 && I.toRun.some((k) => k === `content:${ch.id}`) && Number(I.estimatedChangeCostUsd) > 0,
-        'E11: impacto: solo ese capítulo cambia; costo estimado de los cambios > 0', I && { toRun: I.toRun.length, usd: I.estimatedChangeCostUsd });
+      // Cambia ESE capítulo y, por dependencia, las prácticas de SU módulo (integran los contenidos del módulo); nada más.
+      const practiceOfM0 = new Set(m0.chapters.filter((c) => c.kind === 'practice').map((c) => c.id));
+      const changedCh = I ? I.chapters.filter((c) => !c.untouched).map((c) => c.chapterId) : [];
+      ok(imp.status === 200 && imp.data.fromRunId === runA && changedCh.includes(ch.id) && changedCh.every((id) => id === ch.id || practiceOfM0.has(id)) && I.toRun.some((k) => k === `content:${ch.id}`) && Number(I.estimatedChangeCostUsd) > 0,
+        'E11: impacto: cambian ese capítulo y las prácticas de su módulo (dependen de él); nada más; costo estimado > 0', I && { changed: changedCh.length, practiceInModule: practiceOfM0.size, toRun: I.toRun.length, usd: I.estimatedChangeCostUsd });
       st2 = await readStructure(courseId);
       const lock2 = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st2.structureVersionCounter });
       const n2 = lock2.data.blueprint.blueprintNumber;
@@ -1724,9 +1727,13 @@ function reservationBookkeeping(ev) {
       const titles = await Promise.all(Object.keys(z2.files).filter((x) => /^sections\/section_\d+\/section\.xml$/.test(x)).map((f) => z2.file(f).async('string')));
       ok(titles.some((x) => x.includes(newTitle.replace(/&/g, '&amp;'))), 'E11: el re-empaque lleva el capítulo editado');
       ok(fs.existsSync(NET_LOG) && fs.readFileSync(NET_LOG, 'utf8').length === net0, 'E11: 0 conexiones fuera de 127.0.0.1 en todo el flujo (netguard)');
-      const info = (manifest) => ({ courseId, spec: { passing: 70, engine: 'h5p' }, assessment, manifestModules: manifest.modules, features: manifest.features, applications: apps.length, reviewCardsChapterIds: [] });
-      results.courses.E11 = { ...info(M), blueprintNumber: n, runId: runA, items: itemsA.length, hours: hoursFrozen, usd: usd(DRY.providerPlanFor(M)), adjust: { from: d1.proposalSha256, to: d2.proposalSha256 } };
-      results.courses.E11regen = { ...info(man2.data.manifest.manifest), blueprintNumber: n2, runId: runBId, regenerated: regen.length, usd: I.estimatedChangeCostUsd };
+      const reviewIds = (P) => ((P.job.output_summary || {}).h5pPackages || []).filter((p) => /^review_cards:/.test(p.itemKey)).map((p) => p.itemKey.slice('review_cards:'.length));
+      const modsOf = async () => (await readStructure(courseId)).modules.map((m) => ({ id: m.id, title: m.title, chapters: m.chapters.map((x) => ({ id: x.id, title: x.title })) }));
+      const modsB = await modsOf();
+      const modsA = modsB.map((m) => ({ ...m, chapters: m.chapters.map((x) => (x.id === ch.id ? { ...x, title: ch.title } : x)) }));
+      const info = (manifest, P, modules) => ({ courseId, spec: { passing: 70, engine: 'h5p' }, assessment, manifestModules: manifest.modules, features: manifest.features, applications: apps.length, reviewCardsChapterIds: reviewIds(P), modules });
+      results.courses.E11 = { ...info(M, P1, modsA), blueprintNumber: n, runId: runA, items: itemsA.length, hours: hoursFrozen, usd: usd(DRY.providerPlanFor(M)), adjust: { from: d1.proposalSha256, to: d2.proposalSha256 } };
+      results.courses.E11regen = { ...info(man2.data.manifest.manifest, P2, modsB), blueprintNumber: n2, runId: runBId, regenerated: regen.length, usd: I.estimatedChangeCostUsd };
     }, { fatal: false });
 
     // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══
@@ -1894,7 +1901,9 @@ function reservationBookkeeping(ev) {
           results.moodle[label].audio = { welcomeSec: awS, audiobookSec: abS };
         }
         const pres = cms.filter((c) => /:presentation$/.test(c.idnumber));
-        ok(pres.length === chFlags.length && pres.every((c) => JSON.stringify(c.files.map((f) => f.mime).sort()) === JSON.stringify(['application/pdf', 'image/png'])), `${label}: ${chFlags.length} tarjetas Gamma con portada PNG + PDF`, pres.map((c) => c.files.map((f) => f.mime)));
+        // Motor de carga horaria: los capítulos de práctica no tienen presentación.
+        const contentFlags = chFlags.filter((c) => c.kind !== 'practice');
+        ok(pres.length === contentFlags.length && pres.every((c) => JSON.stringify(c.files.map((f) => f.mime).sort()) === JSON.stringify(['application/pdf', 'image/png'])), `${label}: ${contentFlags.length} tarjetas Gamma con portada PNG + PDF`, pres.map((c) => c.files.map((f) => f.mime)));
         // Cifras del shell = Manifest (facts).
         const nCh = chFlags.length; const nV = chFlags.filter((x) => x.videoEnabled).length; const nA = chFlags.filter((x) => x.activityEnabled).length;
         const nEval = M.modules.filter((m) => m.examEnabled).length + (M.features.finalExam ? 1 : 0);

@@ -65,6 +65,7 @@ const code = async (fn) => { try { await fn(); return 'OK'; } catch (e) { return
     eq(await code(() => svc.create(dto(`${ME}/x.json`, 'otro-bucket'), ME)), 'storage_path_not_owned', 'otro bucket');
     eq(await code(() => svc.create(dto(`${ME}/../${OTHER}/x.json`), ME)), 'storage_path_not_owned', 'dot-segments');
     eq(await code(() => svc.create(dto(`qa-internal/${OTHER}/x.mbz`), ME)), 'storage_path_not_owned', 'QA de otro');
+    eq(await code(() => svc.create(dto(`qa-internal/${ME}/dynamic/1/2/dynamic_mbz/r/c.mbz`), ME)), 'storage_path_not_owned', 'QA propio tampoco (solo lo registra el backend)');
     eq(await code(() => svc.create(dto('mock/presentation/x.pdf'), ME)), 'storage_path_not_owned', 'fixture mock no se registra por la API');
     eq(await code(() => svc.create(dto(`${ME}/123/content/libro.md`), ME)), 'OK', 'ruta propia (convención legacy y dynamic)');
   });

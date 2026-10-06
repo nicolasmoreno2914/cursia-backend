@@ -524,13 +524,18 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
     return reached();
   };
 
-  // LOOP 7 (A1): una práctica que YA existe y a la que la etapa de práctica no llegó (el objetivo se alcanzó antes con
-  // actividades de contenido) recupera igual su Actividad: es su razón de ser. El ajuste fino de abajo baja después las
-  // actividades de CONTENIDO si el total se pasó.
+  // LOOP 7 (A1 + REVIEW-L7 I1): una práctica que YA existe y a la que la etapa de práctica no llegó (el objetivo se
+  // alcanzó antes) recupera su Actividad SOLO con un nivel que mantenga el total dentro de la tolerancia y la
+  // proporción de aplicación del enfoque (si ninguno cabe, queda sin actividad: nunca empeora el estado del diseño).
   const seedLeftoverPractice = () => {
     for (const m of design) for (const c of m.chapters) {
       if (c.kind !== 'practice' || c.proposed || c.applicationMinutes !== null) continue;
-      for (const t of [...tiers].reverse()) if (trySetTier(m, c, t)) break;
+      for (const t of [...tiers].reverse()) {
+        if (!trySetTier(m, c, t)) continue;
+        if (minutes() <= target + tol && applicationShare() <= policy.maxApplicationShare + 1e-9) break;
+        c.applicationMinutes = null;
+        reEval();
+      }
     }
   };
 

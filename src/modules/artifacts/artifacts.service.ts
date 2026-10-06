@@ -165,7 +165,9 @@ export class ArtifactsService {
     // LOOP 7 (A4 C1): la API solo registra objetos DEL PROPIO usuario en el bucket de artifacts. Antes cualquier ruta
     // ajena quedaba registrada y después se firmaba / borraba con la service role (lectura y borrado entre cuentas).
     const bucket = dto.storage_bucket ?? 'cursia-artifacts';
-    if (!storagePathOwnedBy(ownerId, bucket, dto.storage_path)) {
+    // REVIEW-L7 I4: por la API, SOLO la carpeta propia (`<uid>/…`): nunca `qa-internal/…` (copias de QA, solo
+    // SUPER_ADMIN, las registra el backend) ni fixtures compartidos.
+    if (!storagePathOwnedBy(ownerId, bucket, dto.storage_path) || String(dto.storage_path).split('/')[0] !== ownerId) {
       throw new ForbiddenException({ code: 'storage_path_not_owned', message: 'storage_path_not_owned: el archivo debe estar en tu carpeta del bucket de artifacts.' });
     }
     const artifact = this.artifactRepo.create({

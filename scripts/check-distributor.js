@@ -351,8 +351,19 @@ check('D18 LOOP 7 (A1): re-proponer sobre un diseño aplicado conserva las prác
   snap = apply(snap, run(snap, 50, { applicationActivities: 'none' }));
   assert(snap.modules.flatMap((m) => m.chapters).every((c) => !c.applicationMinutes), 'con «Ninguna» no quedan actividades');
   const back = run(snap, 50, { applicationActivities: 'auto' });
-  const pr = back.modules.flatMap((m) => m.chapters).filter((c) => c.kind === 'practice');
-  assert(pr.length > 0 && pr.every((c) => c.applicationMinutes), `«auto» devuelve la actividad a las ${pr.length} prácticas`);
+  eq(back.status, 'within_tolerance', '«Ninguna» → «auto»: el diseño vuelve a cumplir');
+  // REVIEW-L7 I1: una práctica existente recupera su actividad solo si cabe en la tolerancia y en la proporción.
+  assert(back.estimatedHours <= back.targetHours + back.toleranceHours + 1e-9, `sin pasarse del objetivo (${back.estimatedHours} h)`);
+  // Bajar el objetivo sobre un diseño aplicado nunca deja el diseño en peor estado que proponerlo desde cero.
+  const rank = { within_tolerance: 0, cannot_reach_target: 1, above_tolerance: 2, minimum_exceeds_target: 3 };
+  for (const [hi, lo] of [[50, 33], [80, 40], [40, 25]]) {
+    let s2 = snapOf();
+    s2 = apply(s2, run(s2, hi));
+    const down = run(s2, lo);
+    const scratch = run(snapOf(), lo);
+    assert(rank[down.status] <= rank[scratch.status] || down.status === 'minimum_exceeds_target', `${hi}→${lo} h: ${down.status} (${down.estimatedHours} h) no peor que desde cero ${scratch.status} (${scratch.estimatedHours} h)`);
+    assert(down.status === 'minimum_exceeds_target' || down.estimatedHours <= down.targetHours + down.toleranceHours + 1e-9 || scratch.status === 'above_tolerance', `${hi}→${lo} h: la siembra de prácticas no se pasa del objetivo (${down.estimatedHours} h)`);
+  }
 });
 
 console.log(`\n${passes} OK, ${failures} fallidas`);
