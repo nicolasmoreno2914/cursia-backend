@@ -52,29 +52,34 @@ export function sniffMediaType(buf: Buffer, name: string): AcademicDocument['med
   // de control C0 (salvo tab/saltos) o bytes que Windows-1252 no define, en más del 0,5 % del archivo. Los bytes
   // «no definidos» solo cuentan en líneas que NO son UTF-8 válido (review I8): en UTF-8 son bytes de continuación
   // legítimos (Á = C3 81, Í = C3 8D, ” = E2 80 9D).
+  // Una sola pasada lineal (review I9: decodificar línea por línea bloqueaba segundos con miles de líneas cortas).
+  const limit = Math.max(0, buf.length * 0.005);
   let bad = 0;
-  for (const b of buf) if ((b < 0x20 && b !== 0x09 && b !== 0x0a && b !== 0x0d && b !== 0x0c) || b === 0x7f) bad++;
-  if (!isUtf8(buf)) {
-    let start = 0;
-    for (let i = 0; i <= buf.length; i++) {
-      if (i < buf.length && buf[i] !== 0x0a) continue;
-      const line = buf.subarray(start, i);
-      if (!isUtf8(line)) for (const b of line) if (CP1252_UNDEFINED.has(b)) bad++;
-      start = i + 1;
-    }
+  let lineUndefined = 0; // bytes «no definidos» de la línea en curso
+  let lineValid = true; // ¿la línea en curso es UTF-8 válido hasta aquí?
+  let need = 0; // bytes de continuación UTF-8 pendientes
+  const endLine = () => {
+    if (need) lineValid = false;
+    if (!lineValid) bad += lineUndefined;
+    lineUndefined = 0; lineValid = true; need = 0;
+  };
+  for (let i = 0; i < buf.length; i++) {
+    const b = buf[i];
+    if (b === 0x0a) { endLine(); if (bad > limit) return null; continue; }
+    if ((b < 0x20 && b !== 0x09 && b !== 0x0d && b !== 0x0c) || b === 0x7f) bad++;
+    if (CP1252_UNDEFINED.has(b)) lineUndefined++;
+    if (!lineValid) continue;
+    if (need) {
+      if ((b & 0xc0) === 0x80) need--;
+      else lineValid = false;
+    } else if (b >= 0xc2 && b <= 0xdf) need = 1;
+    else if (b >= 0xe0 && b <= 0xef) need = 2;
+    else if (b >= 0xf0 && b <= 0xf4) need = 3;
+    else if (b >= 0x80) lineValid = false;
   }
-  if (bad > Math.max(0, buf.length * 0.005)) return null;
+  endLine();
+  if (bad > limit) return null;
   return /\.md$/i.test(name) ? 'text/markdown' : 'text/plain';
-}
-
-const UTF8_STRICT = new TextDecoder('utf-8', { fatal: true });
-function isUtf8(bytes: Buffer): boolean {
-  try {
-    UTF8_STRICT.decode(bytes);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /** Bytes 0x80–0x9F que Windows-1252 no define. */
