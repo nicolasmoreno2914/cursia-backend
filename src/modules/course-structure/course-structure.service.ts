@@ -83,6 +83,17 @@ function cleanDescription(v: string | undefined | null): string | null {
   const t = String(v ?? '').replace(/\s+/g, ' ').trim();
   return t ? t : null;
 }
+import {
+  STRUCTURE_ORIGIN_KEY,
+  StructureOrigin,
+  isPristineSkeleton,
+  originAfterCursiaDesign,
+  parseStructureOrigin,
+  structureAuthority,
+} from './structure-authority';
+import { proposeStructureFromContext } from '../academic-context/context-design';
+import { validateAcademicContext } from '../academic-context/validate';
+import { ApplyAcademicStructureDto, RecordStructureOriginDto } from './dto/apply-academic-structure.dto';
 import { activityTypeRulesForNextManifest, blueprintSchemaVersionForRules, readActivityTypeRulesConfig, readConfiguredRulesVersion } from '../generation-manifests/manifest-rules-config';
 import { composeLockSnapshotV2, plainCourseRefV2 } from '../course-blueprints/lock-snapshot';
 
@@ -341,6 +352,8 @@ export class CourseStructureService implements OnModuleInit {
         [courseId],
       ));
       const newCounter = this.counterOrThrow(cr?.structure_version_counter, courseId);
+      // LOOP 8.0: el diseño de Cursia sobre una estructura que Cursia armó y nadie tocó sigue siendo «de Cursia».
+      await this.advanceOriginAfterCursiaDesign(queryRunner, courseId, lock.counter, newCounter);
       const liveMatchesCurrentBlueprint = await this.liveMatchesAfterMutation(queryRunner, courseId, ownerId, lock.hasBlueprint);
       await queryRunner.commitTransaction();
       return {
@@ -356,6 +369,137 @@ export class CourseStructureService implements OnModuleInit {
     } finally {
       await queryRunner.release();
     }
+  }
+
+  /**
+   * LOOP 8.0 · La estructura del microcurrículo (contexto académico GUARDADO, versión `dto.contextVersion`) reemplaza la
+   * estructura del curso en UNA transacción: unidades → módulos, contenidos → capítulos (≤ 5 por módulo), con sus
+   * descripciones, objetivos y vínculos a resultados. Es la misma propuesta que muestra GET academic-context/design.
+   *   - Sin preguntar: esqueleto vacío, o estructura que armó Cursia (IA o una versión anterior del documento) y que
+   *     nadie tocó desde entonces (structureAuthority).
+   *   - Con trabajo del docente o con una versión confirmada (Blueprint vigente): 409 STRUCTURE_REPLACE_NEEDS_CONFIRMATION
+   *     con lo que se perdería, salvo `confirmReplace: true`. Nunca se pisa nada en silencio.
+   * No genera nada ni gasta. El curso ya generado (Blueprint, Manifest, runs) no cambia: la estructura viva deja de
+   * coincidir con la versión confirmada y se vuelve a confirmar como siempre.
+   */
+  async applyAcademicStructure(courseId: number, ownerId: string, dto: ApplyAcademicStructureDto) {
+    assertDynamicOwnerAllowed(ownerId);
+    await assertV21StructureSchema(this.dataSource);
+    const queryRunner = this.dataSource.createQueryRunner();
+    try {
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
+      const lock = await this.lockAndVerifyEx(queryRunner, courseId, ownerId, dto.expectedCounter);
+      await assertAcademicContextSchema(queryRunner);
+      const academic = await loadCurrentAcademicContext(queryRunner, courseId);
+      if (!academic) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException({ code: 'NO_ACADEMIC_CONTEXT', message: 'NO_ACADEMIC_CONTEXT: el curso no tiene contexto académico guardado; guarda el microcurrículo antes de usar su estructura.' });
+      }
+      if (academic.version !== dto.contextVersion) {
+        await queryRunner.rollbackTransaction();
+        throw new ConflictException({ code: 'CONTEXT_CHANGED', currentContextVersion: academic.version, message: `CONTEXT_CHANGED: el contexto académico cambió (versión ${academic.version}); vuelve a revisarlo antes de usar su estructura.` });
+      }
+      if (!validateAcademicContext(academic.context).canProceed) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException({ code: 'CONTEXT_HAS_ERRORS', message: 'CONTEXT_HAS_ERRORS: el contexto académico tiene errores; corrígelos antes de usar su estructura.' });
+      }
+      const proposal = proposeStructureFromContext(academic.context);
+      if (!proposal.available) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException({ code: 'NO_STRUCTURE_IN_CONTEXT', message: `NO_STRUCTURE_IN_CONTEXT: ${proposal.reason}` });
+      }
+      const current = await this.readStructure(queryRunner, courseId, ownerId);
+      const authority = current.structureAuthority;
+      const currentCounts = { modules: current.modules.length, chapters: current.modules.reduce((a, m) => a + m.chapters.length, 0) };
+      if (authority.replaceReasons.length && dto.confirmReplace !== true) {
+        await queryRunner.rollbackTransaction();
+        throw new ConflictException({
+          code: 'STRUCTURE_REPLACE_NEEDS_CONFIRMATION',
+          reasons: authority.replaceReasons,
+          current: currentCounts,
+          proposal: { modules: proposal.counts.modules, chapters: proposal.counts.chapters },
+          message: 'STRUCTURE_REPLACE_NEEDS_CONFIRMATION: la estructura actual tiene cambios del docente o una versión confirmada; confirma antes de reemplazarla.',
+        });
+      }
+      // Reemplazo completo (los capítulos se borran por cascada; artifacts.module_id/chapter_id → null por su FK).
+      await queryRunner.query(`delete from public.course_modules where course_id = $1`, [courseId]);
+      for (const [mi, m] of proposal.modules.entries()) {
+        const mt = normalizeTitleOrThrow('module', m.title);
+        const [mod] = await queryRunner.query(
+          `insert into public.course_modules (course_id, position, title, objective, description, exam_enabled)
+           values ($1, $2, $3, $4, $5, $6) returning id`,
+          [courseId, mi, mt.title, m.objective, checkedDescription(mergeDescription(cleanDescription(m.description), mt.description)), m.examEnabled],
+        );
+        for (const [ci, c] of m.chapters.entries()) {
+          const ct = normalizeTitleOrThrow('chapter', c.title);
+          await queryRunner.query(
+            `insert into public.course_chapters (course_id, module_id, position, title, objective, description, video_enabled, activity_enabled, outcome_ids)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)`,
+            [courseId, mod.id, ci, ct.title, c.objective, checkedDescription(mergeDescription(cleanDescription(c.description), ct.description)),
+              c.videoEnabled, c.activityEnabled, c.outcomeIds.length ? JSON.stringify(c.outcomeIds) : null],
+          );
+        }
+      }
+      const [cr] = returningRows(await queryRunner.query(
+        `update public.courses set final_exam_enabled = $2, structure_version_counter = structure_version_counter + 1
+          where id = $1 returning structure_version_counter`,
+        [courseId, proposal.finalExam],
+      ));
+      const newCounter = this.counterOrThrow(cr?.structure_version_counter, courseId);
+      await this.writeStructureOrigin(queryRunner, courseId, { source: 'academic_context', counter: newCounter, contextVersion: academic.version, at: new Date().toISOString() });
+      const structure = await this.readStructure(queryRunner, courseId, ownerId);
+      await queryRunner.commitTransaction();
+      return {
+        ...structure,
+        replaced: { previous: currentCounts, modules: proposal.counts.modules, chapters: proposal.counts.chapters, contextVersion: academic.version, confirmed: authority.replaceReasons.length > 0 },
+        hadBlueprint: lock.hasBlueprint,
+        notes: proposal.notes,
+      };
+    } catch (err) {
+      if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  /**
+   * LOOP 8.0 · El editor terminó de aplicar la propuesta de la IA: la estructura vigente (con este contador) es de
+   * Cursia. No cambia la estructura ni el contador. Contador distinto → 409 (alguien la cambió mientras tanto).
+   */
+  async recordStructureOrigin(courseId: number, ownerId: string, dto: RecordStructureOriginDto) {
+    assertDynamicOwnerAllowed(ownerId);
+    await assertV21StructureSchema(this.dataSource);
+    const queryRunner = this.dataSource.createQueryRunner();
+    try {
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
+      const lock = await this.lockAndVerifyEx(queryRunner, courseId, ownerId, dto.expectedCounter);
+      const origin: StructureOrigin = { source: dto.source, counter: lock.counter, contextVersion: null, at: new Date().toISOString() };
+      await this.writeStructureOrigin(queryRunner, courseId, origin);
+      await queryRunner.commitTransaction();
+      return { structureVersionCounter: lock.counter, structureOrigin: origin };
+    } catch (err) {
+      if (queryRunner.isTransactionActive) await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  private async writeStructureOrigin(q: QueryRunner, courseId: number, origin: StructureOrigin): Promise<void> {
+    await q.query(
+      `update public.courses set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), $2::text[], $3::jsonb, true) where id = $1`,
+      [courseId, [STRUCTURE_ORIGIN_KEY], JSON.stringify(origin)],
+    );
+  }
+
+  private async advanceOriginAfterCursiaDesign(q: QueryRunner, courseId: number, counterBefore: number, counterAfter: number): Promise<void> {
+    const [row] = await q.query(`select metadata -> 'structureOrigin' as o from public.courses where id = $1`, [courseId]);
+    const raw = row ? (typeof row.o === 'string' ? JSON.parse(row.o) : row.o) : null;
+    const next = originAfterCursiaDesign(parseStructureOrigin(raw), counterBefore, counterAfter);
+    if (next) await this.writeStructureOrigin(q, courseId, next);
   }
 
   async getStructure(courseId: number, ownerId: string) {
@@ -395,6 +539,8 @@ export class CourseStructureService implements OnModuleInit {
               -- Fase 3 · Contexto académico: ¿la base tiene course_chapters.outcome_ids? (misma sentencia)
               exists (select 1 from information_schema.columns
                        where table_schema = 'public' and table_name = 'course_chapters' and column_name = 'outcome_ids') as oid_col,
+              -- LOOP 8.0: quién armó la estructura vigente (sin migración: courses.metadata).
+              c.metadata -> 'structureOrigin' as structure_origin,
               b.id as bp_id, b.blueprint_number as bp_number, b.locked_at as bp_locked_at,
               b.snapshot_sha256 as bp_sha256, b.schema_version as bp_schema_version,
               -- Motor pedagógico V1 (review I1): perfil pedagógico vigente en la MISMA sentencia (sin ida y vuelta extra).
@@ -574,6 +720,13 @@ export class CourseStructureService implements OnModuleInit {
       })),
       currentBlueprint,
       liveMatchesCurrentBlueprint,
+      // LOOP 8.0: ¿la estructura del microcurrículo puede reemplazar la vigente sin preguntar?
+      structureAuthority: structureAuthority(
+        parseStructureOrigin(typeof row.structure_origin === 'string' ? JSON.parse(row.structure_origin) : row.structure_origin),
+        counter,
+        isPristineSkeleton(modules),
+        currentBlueprint !== null,
+      ),
     };
   }
 
