@@ -1,6 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
-import { assembleLockSnapshotV2, loadLockRows } from '../course-blueprints/lock-snapshot';
+import { assembleLockSnapshotV2, loadLockRows, plainCourseRefV2 } from '../course-blueprints/lock-snapshot';
 import { BlueprintSnapshotV2, RawChapterRowV2, RawModuleRow, buildBlueprintSnapshotV2, snapshotSha256V2 } from '../course-blueprints/blueprint-snapshot';
 import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import { GenerationManifestsService } from '../generation-manifests/generation-manifests.service';
@@ -81,11 +81,8 @@ export class ChangeImpactService {
       // viva con las reglas de actividad configuradas; luego la propuesta se aplica a las filas EN MEMORIA como lo haría
       // el apply (insertar capítulos propuestos, reordenar, minutos de aplicación) y el Blueprint sale del mismo
       // ensamblado que el lock. Así lo previsualizado es lo que se confirmaría.
-      const courseRef = {
-        id: course.id, title: course.title, finalExam: course.final_exam_enabled, activityEngine: course.activity_engine,
-        reviewCards: course.review_cards_enabled === true,
-        academicContext: assembled.snapshot.course.academicContext ?? null,
-      };
+      // LOOP 7 (A1 I2): datos del curso de la fuente única (los mismos que el lock y que «Aplicar diseño»).
+      const courseRef = plainCourseRefV2(course, assembled.snapshot.course.academicContext ?? null);
       let dist: NonNullable<ReturnType<typeof runPedagogyDryRun>['distribution']>;
       try {
         const dr = runPedagogyDryRun({ structure: buildBlueprintSnapshotV2(courseRef as any, rows.modules, rows.chapters), profile, activityTypeRules: atrNext });

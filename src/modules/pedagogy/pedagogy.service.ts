@@ -16,6 +16,7 @@ import { PEDAGOGY_ROLE_LABELS, PEDAGOGY_SECTION_LABELS, PEDAGOGY_TARGET_LABELS, 
 import { loadCurrentPedagogicalProfile } from './pedagogy-db';
 import { PedagogyRecommendation, WIZARD_QUESTIONS, recommendApproaches } from './recommendation';
 import { PEDAGOGY_ENGINE_VERSION } from './vocabulary';
+import { plainCourseRefV2 } from '../course-blueprints/lock-snapshot';
 
 /** Límites del dry-run en línea (lógica pura, pero sin estructuras gigantes). */
 const MAX_DRY_RUN_MODULES = 20;
@@ -122,14 +123,8 @@ export class PedagogyService {
     );
     // Fase 3: el contexto académico guardado entra al Blueprint en memoria igual que en el lock.
     const academic = await loadCurrentAcademicContext(this.dataSource, courseId);
-    const courseRef = {
-      id: row.id,
-      title: row.title,
-      finalExam: row.final_exam_enabled,
-      activityEngine: row.activity_engine,
-      reviewCards: row.review_cards_enabled === true,
-      academicContext: academic ? academicBlueprintContext(academic.context, academic.sha256) : null,
-    };
+    // LOOP 7 (A1 I2): datos del curso de la fuente única (los mismos que el lock).
+    const courseRef = plainCourseRefV2(row, academic ? academicBlueprintContext(academic.context, academic.sha256) : null);
     const errors = validateBlueprintInputV2(courseRef, modules, chapters);
     if (errors.length > 0) {
       throw new BadRequestException(`La estructura actual no se puede evaluar todavía: ${errors.map((e) => e.message).join('; ')}`);
