@@ -1260,14 +1260,21 @@ function reservationBookkeeping(ev) {
       eq([draft.identity.subjectName.value, draft.outcomes.length, draft.competencies.length, draft.units.length, draft.hours.total.value, draft.evaluation.length], ['Contabilidad de Costos', 6, 2, 5, 64, 5], 'E8: el contexto trae asignatura, 6 RA, 2 competencias, 5 unidades, 64 h y 5 evaluaciones');
       eq([ex.data.validation.canProceed, ex.data.validation.counts], [true, { error: 0, warning: 0, missing: 0 }], 'E8: validación limpia');
       eq((await q(`select count(*)::int n from public.course_profiles where course_id = $1`, [courseId]))[0].n, 0, 'E8: la extracción no guardó nada');
-      ok(!fs.existsSync(NET_LOG) || fs.readFileSync(NET_LOG, 'utf8').length === net0, 'E8: 0 conexiones fuera de 127.0.0.1 durante la extracción');
+      ok(fs.existsSync(NET_LOG) && fs.readFileSync(NET_LOG, 'utf8').length === net0, 'E8: 0 conexiones fuera de 127.0.0.1 durante la extracción (netguard activo)');
       const bad = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'foto.bin', dataBase64: Buffer.from([0, 1, 2, 3, 255]).toString('base64') }] });
       ok(bad.status === 400 && /UNSUPPORTED_DOCUMENT/.test(String(bad.error)), 'E8: archivo no soportado → 400 UNSUPPORTED_DOCUMENT', { s: bad.status, e: bad.error });
       const inc = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'inconsistente.pdf', dataBase64: (await AF.fixture('inconsistent', 'pdf')).toString('base64') }] });
       ok(inc.status === 200 && inc.data.validation.issues.some((i) => i.message === 'El documento indica 64 horas, pero la suma de componentes reportada es 48 horas.'), 'E8: PDF inconsistente → advertencia de horas exacta (sin bloquear)', inc.data && inc.data.validation && inc.data.validation.counts);
-      // 2. Guardar (versionado) — sin contexto, vincular resultados responde 400
+      // 2. Guardar (versionado) — sin contexto, vincular resultados responde 400. Un curso nuevo no trae módulos (el
+      //    esqueleto 1×1 lo arma el editor): se crea el primero, con su capítulo automático.
       let st = await readStructure(courseId);
+      if (!st.modules.length) {
+        const c0 = await api('POST', `/courses/${courseId}/modules`, { title: 'Módulo 1', examEnabled: true, expectedCounter: st.structureVersionCounter });
+        if (c0.status !== 201) throw new Error(`E8: primer módulo ${c0.status} ${c0.error}`);
+        st = await readStructure(courseId);
+      }
       const [m0] = st.modules;
+      ok(m0 && m0.chapters.length === 1 && 'outcomeIds' in m0.chapters[0] && m0.chapters[0].outcomeIds === null, 'E8: el GET de la estructura informa outcomeIds (null) con la migración aplicada', m0 && m0.chapters[0]);
       const pre = await api('PATCH', `/courses/${courseId}/modules/${m0.id}/chapters/${m0.chapters[0].id}`, { outcomeIds: ['RA1'], expectedCounter: st.structureVersionCounter });
       ok(pre.status === 400 && /NO_ACADEMIC_CONTEXT/.test(String(pre.error)), 'E8: vincular sin contexto guardado → 400 NO_ACADEMIC_CONTEXT', { s: pre.status, e: pre.error });
       const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: draft, expectedVersion: 0 });
@@ -1341,18 +1348,32 @@ function reservationBookkeeping(ev) {
       ok(man.status === 201 && man.data.manifest.rulesVersion === 3, 'E8: Manifest v3 → 201', { s: man.status, e: man.error });
       const M = man.data.manifest.manifest;
       ok(M.totals.applicationActivityCount >= 18 && M.modules.length === 5, 'E8: Manifest con 5 módulos y las Actividades de Aplicación del diseño', M.totals);
-      // 8. El brief REAL del claim lleva los resultados (sin generar nada: el run se cancela)
-      const run = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest/runs`, { nombre: 'E8', ...CTX, scormTemplateIds: S.templates, videoMode: 'mock', providerModes: { presentation: 'mock', audio: 'mock' } });
-      ok(run.status === 201, 'E8: run creado (no se ejecuta)', { s: run.status, e: run.error });
-      const runId = run.data.run.id;
-      const cl = await api('POST', '/dynamic-generation/claim?features=pedagogy-brief-1,application-activity-1', { runId, executorId: 'e2e-e8-probe', types: ['course_plan'], leaseSeconds: 30 });
-      const item = cl.data && (cl.data.item || (cl.data.items && cl.data.items[0]));
-      const brief = item && item.pedagogy;
-      ok(cl.status === 200 || cl.status === 201, 'E8: claim del plan del curso', { s: cl.status, e: cl.error });
-      ok(brief && /RESULTADOS DE APRENDIZAJE QUE ESTE RECURSO DEBE EVIDENCIAR/.test(brief.text) && brief.outcomes && brief.outcomes.join() === 'RA1,RA2,RA3,RA4,RA5,RA6,CO1,CO2' && brief.text.length <= 4000,
-        'E8: el claim entrega el brief con los 6 RA y 2 competencias que el plan debe cubrir', brief && { outcomes: brief.outcomes, len: brief.text.length });
-      const cancel = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest/runs/${runId}/cancel`, {});
-      ok([200, 201].includes(cancel.status), 'E8: run de prueba cancelado (nada se generó)', { s: cancel.status, e: cancel.error });
+      // 8. El brief que el claim entregaría a cada generador (misma función que el scheduler, sobre el Blueprint y el
+      //    Manifest GUARDADOS). El claim real con el ejecutor del navegador lo prueba E8-mini (sin videos: este app de
+      //    prueba no publica en YouTube, requisito para crear runs con video).
+      const GD = D('modules/pedagogy/generator-directives.js');
+      const fe = M.items.find((i) => i.type === 'final_exam');
+      const fb = GD.buildItemPedagogyBrief({ item: fe, snapshot: snap, activityTypeRules: M.features && M.features.activityTypeRules });
+      ok(fb && /RESULTADOS DE APRENDIZAJE QUE ESTE RECURSO DEBE EVIDENCIAR/.test(fb.text) && fb.outcomes.join() === 'RA1,RA2,RA3,RA4,RA5,RA6' && fb.text.length <= 4000 && fb.directives.length > 0,
+        'E8: el examen final recibe el diseño pedagógico + los 6 resultados (≤ 4000 caracteres)', fb && { outcomes: fb.outcomes, len: fb.text.length });
+      const appItem = M.items.find((i) => i.type === 'application_activity' && snap.modules[1].chapters.some((c) => c.id === i.chapterId && c.outcomeIds));
+      const ab = GD.buildItemPedagogyBrief({ item: appItem, snapshot: snap, activityTypeRules: M.features && M.features.activityTypeRules });
+      ok(ab && ab.outcomes.join() === 'RA2' && /criterios de evaluación deben referirse a ellos/.test(ab.text), 'E8: la Actividad de Aplicación del módulo 2 recibe RA2 y la indicación de evidenciarlo', ab && ab.outcomes);
+      const pres = M.items.find((i) => i.type === 'presentation');
+      ok(!GD.buildItemPedagogyBrief({ item: pres, snapshot: snap }) || !/RESULTADOS DE APRENDIZAJE/.test(GD.buildItemPedagogyBrief({ item: pres, snapshot: snap }).text), 'E8: los proveedores (Gamma) no reciben el bloque de resultados');
+      // Review I1: una versión nueva del contexto que ya no define RA6 limpia los vínculos (misma transacción) y el
+      // curso se puede volver a confirmar (sin quedar trabado con un vínculo roto).
+      const v2 = JSON.parse(JSON.stringify(draft));
+      v2.outcomes = v2.outcomes.filter((o) => o.id !== 'RA6');
+      v2.units = v2.units.map((u) => ({ ...u, outcomeIds: u.outcomeIds.filter((x) => x !== 'RA6'), contents: u.contents.map((c) => ({ ...c, outcomeIds: c.outcomeIds.filter((x) => x !== 'RA6') })) }));
+      v2.evaluation = v2.evaluation.map((e) => ({ ...e, outcomeIds: e.outcomeIds.filter((x) => x !== 'RA6') }));
+      const sv2 = await api('POST', `/courses/${courseId}/profiles/academic`, { data: v2 });
+      ok(sv2.status === 201 && (sv2.data.prunedOutcomeLinks || []).length === 2 && sv2.data.prunedOutcomeLinks.every((p) => p.removed.join() === 'RA6'),
+        'E8: guardar una versión sin RA6 quita RA6 de los 2 capítulos que lo vinculaban', sv2.data && sv2.data.prunedOutcomeLinks);
+      const st3 = await readStructure(courseId);
+      ok(!st3.modules.flatMap((m) => m.chapters).some((c) => (c.outcomeIds || []).includes('RA6')) && st3.liveMatchesCurrentBlueprint === false, 'E8: sin vínculos rotos; el Blueprint confirmado ya no coincide (hay que reconfirmar)');
+      const relock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st3.structureVersionCounter });
+      ok(relock.status === 201 && relock.data.blueprint.snapshot.course.academicContext.outcomes.length === 5, 'E8: el curso se vuelve a confirmar con la versión nueva del contexto', { s: relock.status, e: relock.error });
       results.courses.E8 = { courseId, blueprintNumber: n, hours: dist.estimatedHours, counts: dist.counts, outcomes: ac.outcomes.length, manifestTotals: M.totals, usd: dist.materialized.providers.estimateUsd.expected };
     }, { fatal: false });
 
@@ -1395,7 +1416,9 @@ function reservationBookkeeping(ev) {
       ok(withBlock.length >= 6, `E8-mini: ${withBlock.length} prompts con el bloque de resultados (plan, contenido, actividades, exámenes)`, withBlock.length);
       ok(withBlock.some((t) => /RA3 \(saber hacer · aplicar\): Ajustar la válvula de alivio/.test(t) && /evidencia observable/.test(t)), 'E8-mini: la actividad del capítulo de ajuste pide evidencia de RA3');
       ok(withBlock.some((t) => /al menos una pregunta/.test(t) && t.includes('RA1') && t.includes('RA2')), 'E8-mini: el examen del módulo 1 cubre RA1 y RA2');
-      ok(all.filter((t) => t.includes('RESULTADOS DE APRENDIZAJE QUE ESTE RECURSO DEBE EVIDENCIAR')).every((t) => !/RA9/.test(t)), 'E8-mini: ningún resultado inventado');
+      const allowed = new Set([...ext.context.outcomes.map((o) => o.id), ...ext.context.competencies.map((o) => o.id)]);
+      const mentioned = new Set(withBlock.flatMap((t) => [...t.matchAll(/^- ((?:RA|CO)\d+) \(/gm)].map((m) => m[1])));
+      ok(mentioned.size > 0 && [...mentioned].every((id) => allowed.has(id)), 'E8-mini: los prompts solo nombran resultados del contexto (ninguno inventado)', [...mentioned]);
       const P = await packageRun('E8m', c.courseId, c.n, c.runId);
       ok(P && P.buf && P.buf.length > 0, 'E8-mini: paquete .mbz construido (el contexto no cambia el empaque)');
       results.courses.E8m = { courseId: c.courseId, runId: c.runId, items: items.length, promptsWithOutcomes: withBlock.length };

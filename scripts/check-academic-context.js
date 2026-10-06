@@ -264,7 +264,9 @@ const profileOf = (k, extra = {}) => ({
 
   await check('AC7 contexto → estructura: unidades → módulos, contenidos → capítulos, objetivos = resultados', async () => {
     const p = A.proposeStructureFromContext(ctx);
-    eq([p.available, p.counts], [true, { modules: 5, chapters: 18, linkedChapters: 18, inferredLinks: 0, outcomesCovered: 6, outcomesTotal: 6 }], 'propuesta');
+    eq([p.available, p.counts], [true, { modules: 5, chapters: 18, linkedChapters: 18, inferredLinks: 1, outcomesCovered: 6, outcomesTotal: 6 }], 'propuesta');
+    // Review M1: «Punto de equilibrio» toma solo RA5 de los dos de su unidad (elección por términos → inferred).
+    eq([p.modules[4].chapters[1].outcomeIds, p.modules[4].chapters[1].linkStatus, p.modules[4].chapters[0].linkStatus], [['RA5'], 'inferred', 'found'], 'subconjunto por términos = inferido');
     eq(p.modules.map((m) => m.title), ctx.units.map((u) => u.title), 'módulos = unidades');
     eq(p.modules[1].objective, 'Calcular el costo de los materiales y de la mano de obra aplicando métodos de valoración de inventarios y la liquidación de la nómina.', 'objetivo del módulo = su resultado');
     eq(p.modules[4].outcomeIds, ['RA5', 'RA6'], 'vínculos del módulo');
@@ -389,8 +391,11 @@ const profileOf = (k, extra = {}) => ({
     // Baseline (Loop 0): la estructura de ejemplo 3 × 3 NO alcanzaba 64 h.
     const gold = require('./fixtures/baseline/design-baseline-v1.json');
     eq(gold.scenarios['competencias:64h'].status, 'cannot_reach_target', 'baseline 3 × 3');
-    // El Blueprint materializado conserva el contexto congelado y los vínculos.
-    eq(d.materialized.manifestErrors.length, 0, 'materializado');
+    // Review M11: el Blueprint materializado conserva el contexto congelado y los vínculos de los capítulos existentes.
+    const mat = P.materializeDistribution(snap, d);
+    eq(mat.course.academicContext, snap.course.academicContext, 'contexto congelado en el diseño materializado');
+    eq(mat.modules.flatMap((m) => m.chapters).filter((c) => c.outcomeIds).length, 18, 'los 18 capítulos del documento conservan sus vínculos');
+    assert(mat.modules.flatMap((m) => m.chapters).some((c) => c.kind === 'practice' && !c.outcomeIds), 'la práctica agregada no inventa vínculos');
   });
 
   await check('AC12 vínculos sugeridos para una estructura existente (sin pisar los del docente)', () => {
@@ -402,6 +407,69 @@ const profileOf = (k, extra = {}) => ({
     ];
     const s = A.suggestOutcomeLinks(ctx, existing);
     eq(s.map((x) => [x.chapterId, x.status, x.suggested]), [['c1', 'inferred', ['RA5']], ['c2', 'inferred', ['RA3']], ['c3', 'none', []], ['c4', 'keep', ['RA6']]], 'sugerencias');
+  });
+
+  await check('AC14 robustez (review I3, I4, I5, I7, M2, M3, M7, M13): nunca rechaza un documento legible ni inventa vínculos', async () => {
+    const txt = (lines) => Buffer.from(lines.join('\n'), 'utf8');
+    // I3: valores fuera de rango → missing + nota (no 400); conflictos largos entre documentos se acotan.
+    const r1 = await A.extractAcademicContext([{ name: 'raro.txt', data: txt(['Asignatura: X', 'Resultados de aprendizaje', 'RA1. Aplicar algo.', 'Horas totales: 6000 horas', 'Créditos: 90', 'Evaluación', '- Parcial (RA1) 120 %']) }]);
+    eq([r1.context.hours.total.status, r1.context.hours.credits.status, r1.context.evaluation[0].weightPct], ['missing', 'missing', null], 'fuera de rango queda faltante');
+    eq(r1.notes.filter((n) => n.code === 'VALUE_OUT_OF_RANGE').length, 3, 'una nota por valor');
+    const long = 'x'.repeat(300);
+    const r2 = await A.extractAcademicContext([
+      { name: 'a.txt', data: txt(['Asignatura: X', 'Descripción', `Primera versión ${long}`, 'Contenidos', '- Tema']) },
+      { name: 'b.txt', data: txt(['Asignatura: X', 'Descripción', `Segunda versión ${long}`]) },
+    ]);
+    assert(r2.context.conflicts.some((k) => k.path === 'identity.description' && k.values.every((v) => v.value.length <= 200)), 'conflicto largo acotado');
+    // I4: el mapa de ids por documento reescribe los vínculos de sus unidades y evaluación.
+    const r3 = await A.extractAcademicContext([
+      { name: 'a.txt', data: txt(['Resultados de aprendizaje', 'RA1. Identificar peligros.', 'RA2. Evaluar riesgos.']) },
+      { name: 'b.txt', data: txt(['Resultados de aprendizaje', 'RA1. Redactar informes técnicos.', 'RA2. Identificar peligros.', 'Contenidos', 'Unidad 1: Informes (RA1)', '- Estructura del informe', 'Unidad 2: Peligros (RA2)', '- Inspección', 'Evaluación', '- Informe técnico (RA1) — 100 %']) },
+    ]);
+    const redactar = r3.context.outcomes.find((o) => /Redactar/.test(o.text)).id;
+    const identificar = r3.context.outcomes.find((o) => /Identificar/.test(o.text)).id;
+    eq([redactar, identificar], ['RA3', 'RA1'], 'ids fusionados');
+    eq(r3.context.units.map((u) => u.outcomeIds), [[redactar], [identificar]], 'las unidades del 2.º documento apuntan al resultado correcto');
+    eq(r3.context.evaluation[0].outcomeIds, [redactar], 'la evaluación también');
+    // I5: en un PDF, una línea del cuerpo repetida en 2 páginas y el «64» bajo «Total de horas» se conservan.
+    const PDFDocument = require('pdfkit');
+    const pdf = await new Promise((res) => {
+      const d = new PDFDocument({ info: { CreationDate: new Date(0) } });
+      const ch = []; d.on('data', (x) => ch.push(x)); d.on('end', () => res(Buffer.concat(ch)));
+      d.text('Encabezado institucional'); d.text('Contenidos'); d.text('Unidad 1: Bases'); d.text('- Taller práctico'); d.text('- Lectura guiada'); d.text('Pie común');
+      d.addPage(); d.text('Encabezado institucional'); d.text('Unidad 2: Avance'); d.text('- Taller práctico'); d.text('- Caso'); d.text('Total de horas'); d.text('64'); d.text('Pie común');
+      d.addPage(); d.text('Encabezado institucional'); d.text('Bibliografía'); d.text('- Autor, A. (2020). Libro.'); d.text('Pie común');
+      d.end();
+    });
+    const r4 = await A.extractAcademicContext([{ name: 'p.pdf', data: pdf }]);
+    eq(r4.context.units.map((u) => u.contents.map((c) => c.text)), [['Taller práctico', 'Lectura guiada'], ['Taller práctico', 'Caso']], 'contenidos repetidos entre páginas se conservan');
+    eq([r4.context.hours.total.status, r4.context.hours.total.value], ['found', 64], 'el «64» del cuerpo se conserva');
+    assert(r4.notes.some((n) => n.code === 'PAGE_FURNITURE_DROPPED'), 'nota de encabezados/pies descartados');
+    assert(!r4.context.units.some((u) => u.contents.some((c) => /Encabezado|Pie común/.test(c.text))), 'encabezado y pie fuera');
+    // M2: «CO2» en el texto no es una competencia; «(CE2)» sí.
+    const r5 = await A.extractAcademicContext([{ name: 'c.txt', data: txt(['Competencias', 'CE1. Gestiona.', 'CE2. Controla.', 'Contenidos', 'Unidad 1: Ambiente', '- Emisiones de CO2 y efecto invernadero', '- Normas de control (CE2)']) }]);
+    eq(r5.context.units[0].contents.map((c) => c.outcomeIds), [[], ['CO2']], 'CO2 de química ≠ competencia');
+    // M3: «16 semanas de 4 horas» son semanas.
+    const r6 = await A.extractAcademicContext([{ name: 's.txt', data: txt(['Asignatura: X', 'Semanas: 16 semanas de 4 horas', 'Contenidos', '- Tema']) }]);
+    eq([r6.context.hours.weeks.value, r6.context.hours.total.status], [16, 'missing'], 'semanas, no total');
+    // M13: TXT en Windows-1252 se lee (con nota).
+    const r7 = await A.extractAcademicContext([{ name: 'w.txt', data: Buffer.from('Asignatura: Gestión de riesgos\nContenidos\n- Introducción\n', 'latin1') }]);
+    eq(r7.context.identity.subjectName.value, 'Gestión de riesgos', 'tildes de Latin-1');
+    assert(r7.notes.some((n) => n.code === 'ENCODING_ASSUMED_LATIN1'), 'nota de codificación');
+    // M7: avisos acotados por código.
+    const many = clone(ctx);
+    many.outcomes = Array.from({ length: 30 }, (_v, i) => ({ id: `RA${i + 1}`, text: 'Aplicar el mismo procedimiento del curso', level: 'apply', domain: 'do', status: 'provided', sources: [] }));
+    const v = A.validateAcademicContext(A.normalizeAcademicContext(many));
+    const dup = v.issues.filter((i) => i.code === 'DUPLICATE_OUTCOME');
+    assert(dup.length === 21 && /y \d+ aviso\(s\) más/.test(dup[20].message), `tope de avisos (${dup.length})`);
+    // I7: DOCX cuyo XML descomprimido supera el tope → 400 claro, sin inflarlo.
+    const JSZip = require('jszip');
+    const z = new JSZip();
+    z.file('word/document.xml', '<w:document><w:body>' + ' '.repeat(21 * 1024 * 1024) + '</w:body></w:document>');
+    const bomb = await z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+    let code = null;
+    try { await A.extractAcademicContext([{ name: 'bomba.docx', data: bomb }]); } catch (e) { code = e.code; }
+    eq([bomb.length < 1024 * 1024, code], [true, 'DOCUMENT_TOO_LARGE'], 'zip bomb rechazado');
   });
 
   await check('AC13 0 llamadas de red medidas', () => eq(netAttempts, [], 'intentos de red'));

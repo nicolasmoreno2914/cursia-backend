@@ -48,6 +48,7 @@ interface AcademicContextV1 {
   methodology: Field<string>;
   constraints: Field<string[]>;
   additionalInfo: Field<string[]>;
+  conflicts: { path; values: { value; source: SourceRef }[] }[];   // un dato con valores distintos (se usa el primero)
 }
 ```
 
@@ -62,8 +63,9 @@ interface AcademicContextV1 {
 
 ## 3. Ingesta (Loop 3.3)
 
-`POST /api/v1/courses/:courseId/academic-context/extract` (multipart, campo `files`, 1–5 archivos, ≤ 10 MB c/u;
-PDF con texto, DOCX, TXT/MD). Responde `{ draft, issues, stats }` **sin guardar nada**. 0 proveedores.
+`POST /api/v1/courses/:courseId/academic-context/extract` (JSON `{ files: [{ name, dataBase64 }] }`, 1–5 archivos,
+≤ 7 MB c/u decodificado — el body admite 10 MB —; PDF con texto, DOCX, TXT/MD; el tipo se detecta por la firma del
+contenido, no por la extensión). Responde `{ draft, validation, notes, stats }` **sin guardar nada**. 0 proveedores.
 
 1. Texto con localizadores: PDF por página (`pdf-parse`), DOCX por párrafo y fila de tabla (celdas unidas con
    « | »), TXT/MD por línea. PDF sin texto (escaneado) → issue `error DOCUMENT_WITHOUT_TEXT` (no hay OCR).
@@ -100,7 +102,7 @@ Contexto académico ─┬─► sugerencias al perfil pedagógico (estudiante, 
                     │   distribuidor, Actividades de Aplicación (sin cambios en esos motores)
                     ├─► propuesta de estructura determinista: unidades → módulos, contenidos → capítulos
                     │   (≤ 5 por módulo, agrupados en orden), descripción = contenidos cubiertos,
-                    │   objetivo = resultado vinculado (si es un infinitivo), outcomeIds por capítulo
+                    │   objetivo del MÓDULO = sus resultados; el del capítulo queda vacío (no se inventa), outcomeIds por capítulo
                     │   → se aplica con la vía existente (solo sobre el esqueleto intacto: nunca pisa trabajo)
                     └─► vínculos capítulo → resultados (course_chapters.outcome_ids) editables;
                         sugerencia léxica para estructuras existentes (inferred)

@@ -389,10 +389,10 @@ export function computeFingerprintsV3(
     for (const m of bp.modules) {
       add('exam', m.id, { type: 'exam', moduleId: m.id, chapterId: null });
       for (const c of m.chapters) {
-        for (const t of ['experience', 'activity', 'video_interactions', 'application_activity']) add(t, c.id, { type: t, moduleId: m.id, chapterId: c.id });
+        for (const t of ALIGNMENT_FINGERPRINT_TYPES) if (CHAPTER_ITEM_TYPES_V3.includes(t)) add(t, c.id, { type: t, moduleId: m.id, chapterId: c.id });
       }
     }
-    add('final_exam', courseId, { type: 'final_exam', chapterId: null });
+    if (ALIGNMENT_FINGERPRINT_TYPES.includes('final_exam')) add('final_exam', courseId, { type: 'final_exam', chapterId: null });
   }
   return { ...base, moduleIntro, finalExam, roleDesign, practiceSources, application, ...(alignment.size ? { alignment } : {}) };
 }

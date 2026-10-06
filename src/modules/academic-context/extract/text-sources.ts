@@ -27,7 +27,12 @@ export interface ReadDocument {
   lines: SourceLine[];
   pages: number | null;
   characters: number;
+  /** Avisos de lectura (líneas descartadas como encabezado/pie, codificación supuesta…) para el docente. */
+  notes?: { code: string; message: string }[];
 }
+
+/** Tope del XML descomprimido de un DOCX (defensa contra zip bombs: el archivo comprimido ya está acotado). */
+export const MAX_DOCX_XML_BYTES = 20 * 1024 * 1024;
 
 export const MAX_DOCUMENT_BYTES = 7 * 1024 * 1024;
 
@@ -43,9 +48,9 @@ const DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.doc
 export function sniffMediaType(buf: Buffer, name: string): AcademicDocument['mediaType'] | null {
   if (buf.length >= 5 && buf.subarray(0, 5).toString('latin1') === '%PDF-') return 'application/pdf';
   if (buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04) return DOCX;
-  // Texto: UTF-8 válido y sin bytes de control binarios.
-  const s = buf.toString('utf8');
-  if (s.includes('\uFFFD') || /[\x00-\x08\x0E-\x1F]/.test(s)) return null;
+  // Texto: UTF-8 o Windows-1252/Latin-1 (habitual en sílabos guardados en Windows), sin bytes de control binarios.
+  const s = buf.toString('latin1');
+  if (/[\x00-\x08\x0E-\x1F]/.test(s)) return null;
   return /\.md$/i.test(name) ? 'text/markdown' : 'text/plain';
 }
 
@@ -71,7 +76,12 @@ export async function readPdf(buf: Buffer): Promise<ReadDocument> {
         lines.push({ text, page: typeof p.num === 'number' ? p.num : i + 1, line: n, ...(cells ? { cells } : {}) });
       }
     });
-    return { mediaType: 'application/pdf', lines: dropRepeatedPageFurniture(lines, res.pages.length), pages: res.pages.length, characters };
+    const kept = dropRepeatedPageFurniture(lines, res.pages.length);
+    const dropped = lines.length - kept.length;
+    return {
+      mediaType: 'application/pdf', lines: kept, pages: res.pages.length, characters,
+      ...(dropped ? { notes: [{ code: 'PAGE_FURNITURE_DROPPED', message: `Se descartaron ${dropped} línea(s) que parecen encabezados, pies o números de página del PDF.` }] } : {}),
+    };
   } catch (err) {
     throw new DocumentReadError('DOCUMENT_UNREADABLE', `No se pudo leer el PDF (${err instanceof Error ? err.message : String(err)})`);
   } finally {
@@ -79,17 +89,46 @@ export async function readPdf(buf: Buffer): Promise<ReadDocument> {
   }
 }
 
-/** Encabezados / pies repetidos en ≥ 50 % de las páginas (mínimo 2 páginas) y números de página sueltos. */
+/**
+ * Encabezados / pies de página: SOLO entre las 2 primeras y las 2 últimas líneas de cada página, que no sean viñetas,
+ * y que se repitan (mismo texto) en ≥ 50 % de las páginas (mínimo 2). Un número suelto es número de página solo si es
+ * la primera o la última línea de su página y coincide con su número («3», «Página 3», «3 de 10»). Nada del cuerpo de
+ * la página se descarta (un tema repetido en dos unidades o el «64» debajo de «Total de horas» se conservan).
+ */
 export function dropRepeatedPageFurniture(lines: SourceLine[], pages: number): SourceLine[] {
-  const pageNumRe = /^(?:p[aá]g(?:ina)?\.?\s*)?\d{1,4}(?:\s*(?:de|\/)\s*\d{1,4})?$/i;
-  if (pages < 2) return lines.filter((l) => !pageNumRe.test(l.text));
+  const byPage = new Map<number, SourceLine[]>();
+  for (const l of lines) {
+    const p = l.page ?? 0;
+    if (!byPage.has(p)) byPage.set(p, []);
+    byPage.get(p)!.push(l);
+  }
+  const edge = new Set<SourceLine>();
+  const firstLast = new Set<SourceLine>();
+  for (const ls of byPage.values()) {
+    ls.slice(0, 2).forEach((l) => edge.add(l));
+    ls.slice(-2).forEach((l) => edge.add(l));
+    firstLast.add(ls[0]);
+    firstLast.add(ls[ls.length - 1]);
+  }
+  const bullet = /^\s*(?:[-•*▪◦○●·–—]|\(?[0-9]{1,2}[.)])\s+/;
+  const pageNum = (l: SourceLine) => {
+    const m = /^(?:p[aá]g(?:ina)?\.?\s*)?(\d{1,4})(?:\s*(?:de|\/)\s*\d{1,4})?$/i.exec(l.text);
+    return !!m && firstLast.has(l) && Number(m[1]) === l.page;
+  };
   const pagesBy = new Map<string, Set<number>>();
   for (const l of lines) {
+    if (!edge.has(l) || bullet.test(l.text) || l.text.length > 120) continue;
     const k = l.text.toLowerCase();
     if (!pagesBy.has(k)) pagesBy.set(k, new Set());
     pagesBy.get(k)!.add(l.page ?? 0);
   }
-  return lines.filter((l) => !pageNumRe.test(l.text) && (pagesBy.get(l.text.toLowerCase())!.size < Math.max(2, Math.ceil(pages / 2)) || l.text.length > 120));
+  const need = Math.max(2, Math.ceil(pages / 2));
+  return lines.filter((l) => {
+    if (pageNum(l)) return false;
+    if (pages < 2 || !edge.has(l) || bullet.test(l.text)) return true;
+    const set = pagesBy.get(l.text.toLowerCase());
+    return !set || set.size < need;
+  });
 }
 
 function decodeXml(s: string): string {
@@ -118,8 +157,13 @@ export async function readDocx(buf: Buffer): Promise<ReadDocument> {
     const zip = await JSZip.loadAsync(buf);
     const f = zip.file('word/document.xml');
     if (!f) throw new Error('falta word/document.xml');
+    // JSZip conoce el tamaño descomprimido declarado: se rechaza antes de inflar (zip bomb).
+    const declared = Number((f as unknown as { _data?: { uncompressedSize?: number } })._data?.uncompressedSize ?? 0);
+    if (declared > MAX_DOCX_XML_BYTES) throw new DocumentReadError('DOCUMENT_TOO_LARGE', `el contenido del DOCX descomprimido supera ${MAX_DOCX_XML_BYTES / 1024 / 1024} MB`);
     xml = await f.async('string');
+    if (xml.length > MAX_DOCX_XML_BYTES) throw new DocumentReadError('DOCUMENT_TOO_LARGE', `el contenido del DOCX descomprimido supera ${MAX_DOCX_XML_BYTES / 1024 / 1024} MB`);
   } catch (err) {
+    if (err instanceof DocumentReadError) throw err;
     throw new DocumentReadError('DOCUMENT_UNREADABLE', `No se pudo leer el DOCX (${err instanceof Error ? err.message : String(err)})`);
   }
   const body = xml.replace(/^[\s\S]*?<w:body>/, '').replace(/<\/w:body>[\s\S]*$/, '');
@@ -132,7 +176,8 @@ export async function readDocx(buf: Buffer): Promise<ReadDocument> {
     characters += l.text.length;
     lines.push({ ...l, line: n });
   };
-  // Tablas y párrafos en orden de aparición (las tablas anidadas se aplanan en su fila).
+  // Tablas y párrafos en orden de aparición. Limitación conocida: una tabla ANIDADA corta la tabla exterior en su
+  // primer </w:tbl> (el resto de la fila exterior se lee como párrafos sueltos).
   const blockRe = /<w:tbl>([\s\S]*?)<\/w:tbl>|<w:p\b(?:[^>]*[^/>])?>([\s\S]*?)<\/w:p>|<w:p\b[^>]*\/>/g;
   let m: RegExpExecArray | null;
   while ((m = blockRe.exec(body))) {
@@ -166,7 +211,10 @@ export function readText(buf: Buffer, mediaType: 'text/plain' | 'text/markdown')
   const lines: SourceLine[] = [];
   let n = 0;
   let characters = 0;
-  for (const raw of buf.toString('utf8').replace(/^\uFEFF/, '').split(/\r?\n/)) {
+  const utf8 = buf.toString('utf8');
+  const latin1 = utf8.includes('\uFFFD');
+  const textAll = latin1 ? buf.toString('latin1') : utf8;
+  for (const raw of textAll.replace(/^\uFEFF/, '').split(/\r?\n/)) {
     n++;
     let text = raw;
     let heading = false;
@@ -188,7 +236,10 @@ export function readText(buf: Buffer, mediaType: 'text/plain' | 'text/markdown')
     characters += text.length;
     lines.push({ text, page: null, line: n, ...(heading ? { heading: true } : {}), ...(cells ? { cells } : {}) });
   }
-  return { mediaType, lines, pages: null, characters };
+  return {
+    mediaType, lines, pages: null, characters,
+    ...(latin1 ? { notes: [{ code: 'ENCODING_ASSUMED_LATIN1', message: 'El texto no estaba en UTF-8: se leyó como Windows-1252 / Latin-1. Revisa las tildes; si se ven mal, guárdalo como UTF-8.' }] } : {}),
+  };
 }
 
 export async function readDocument(buf: Buffer, name: string): Promise<ReadDocument> {
