@@ -8,7 +8,7 @@ import {
   buildBlueprintSnapshotV2,
   validateBlueprintInputV2,
 } from '../course-blueprints/blueprint-snapshot';
-import { readActivityTypeRulesConfig } from '../generation-manifests/manifest-rules-config';
+import { activityTypeRulesForNextManifest, readActivityTypeRulesConfig } from '../generation-manifests/manifest-rules-config';
 import type { ActivityTypeRulesVersion } from '../generation-manifests/activity-type-rules';
 import { defaultApproachRegistry } from './builtin-approaches';
 import { DryRunInput, DryRunResult, runPedagogyDryRun } from './dry-run';
@@ -138,11 +138,18 @@ export class PedagogyService {
     const saved = await loadCurrentPedagogicalProfile(this.dataSource, courseId);
     const fromRequest = body.profile !== undefined;
     const profile = fromRequest ? body.profile : saved?.profile ?? null;
+    // LOOP 7 (A2 A3): las reglas de actividad con las que se congelará el PRÓXIMO Manifest del curso (fuente única).
+    let atr: ActivityTypeRulesVersion;
+    try {
+      atr = body.activityTypeRules !== undefined ? body.activityTypeRules : await activityTypeRulesForNextManifest(this.dataSource, courseId);
+    } catch (err) {
+      throw new BadRequestException(`Configuración inválida de reglas de actividad: ${(err as Error).message}`);
+    }
     const result = asBadRequest(() =>
       runPedagogyDryRun({
         structure: snapshot,
         profile,
-        activityTypeRules: this.activityTypeRules(body.activityTypeRules),
+        activityTypeRules: atr,
         applyStructureAdjustments: body.applyStructureAdjustments,
         // Fase 4: dato del contexto que no vive en el Blueprint (sugerencia P2 del Coherence Engine).
         alignment: { priorKnowledgeDeclared: academic ? academic.context.learner.priorKnowledge.status !== 'missing' : null },

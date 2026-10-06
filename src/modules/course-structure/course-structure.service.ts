@@ -83,7 +83,7 @@ function cleanDescription(v: string | undefined | null): string | null {
   const t = String(v ?? '').replace(/\s+/g, ' ').trim();
   return t ? t : null;
 }
-import { blueprintSchemaVersionForRules, readActivityTypeRulesConfig, readConfiguredRulesVersion } from '../generation-manifests/manifest-rules-config';
+import { activityTypeRulesForNextManifest, blueprintSchemaVersionForRules, readActivityTypeRulesConfig, readConfiguredRulesVersion } from '../generation-manifests/manifest-rules-config';
 
 /** Motor de carga horaria: 400 visible si se pide video en un capítulo de práctica. */
 /** Fase 2: minutos de la Actividad de Aplicación del pedido (el DTO ya los validó; defensa en profundidad). */
@@ -289,7 +289,15 @@ export class CourseStructureService implements OnModuleInit {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException(`La estructura actual no se puede evaluar: ${errors.map((e) => e.message).join('; ')}`);
       }
-      const dr = await asBad(() => runPedagogyDryRun({ structure: buildBlueprintSnapshotV2(courseRef, modules, chapters), profile: saved.profile, activityTypeRules: readActivityTypeRulesConfig() }));
+      // LOOP 7 (A2 A3): mismas reglas de actividad que el dry-run y que el próximo Manifest (fuente única).
+      let atr: Awaited<ReturnType<typeof activityTypeRulesForNextManifest>>;
+      try {
+        atr = await activityTypeRulesForNextManifest(queryRunner, courseId);
+      } catch (err) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException(`Configuración inválida de reglas de actividad: ${(err as Error).message}`);
+      }
+      const dr = await asBad(() => runPedagogyDryRun({ structure: buildBlueprintSnapshotV2(courseRef, modules, chapters), profile: saved.profile, activityTypeRules: atr }));
       const dist = dr.distribution;
       if (!dist) {
         await queryRunner.rollbackTransaction();

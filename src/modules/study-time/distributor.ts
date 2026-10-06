@@ -381,7 +381,11 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   const respectsMode = design.every((m) => m.chapters.every((c) => c.applicationMinutes === null || (appMode !== 'none' && (appMode !== 'practice_only' || c.kind === 'practice'))));
   if (hasExisting && respectsMode && Math.abs(minutes() - target) <= tol) {
     priorityTrace.push('La estructura actual, con sus Actividades de Aplicación, ya cumple la carga horaria objetivo: no se propone ningún cambio.');
-    return result('within_tolerance', []);
+    // LOOP 7 (A2 A2): «Ajustar» el énfasis o el enfoque sobre un diseño que ya cumple no cambia nada; se dice (y por
+    // qué) en lugar de mostrar un «diseño ya aplicado» mudo con preferencias nuevas.
+    return result('within_tolerance', [
+      `El diseño vigente ya cumple ${fmtH(input.targetHours)} h con sus capítulos y Actividades de Aplicación: no hay cambios que proponer. Cursia no quita capítulos ni actividades por su cuenta; si cambiaste el énfasis o el enfoque y quieres otra estructura, ajústala en el editor (quitar o agregar capítulos) y vuelve a ver el diseño.`,
+    ]);
   }
   if (hasExisting) {
     for (const m of design) for (const c of m.chapters) c.applicationMinutes = null;

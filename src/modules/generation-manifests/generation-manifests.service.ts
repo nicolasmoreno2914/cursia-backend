@@ -17,7 +17,7 @@ import {
   manifestSha256,
   validateGenerationManifest,
 } from './generation-manifest-builder';
-import { readActivityTypeRulesConfig, readManifestRulesVersionConfig } from './manifest-rules-config';
+import { activityTypeRulesForNextManifest, readActivityTypeRulesConfig, readManifestRulesVersionConfig } from './manifest-rules-config';
 import type { ActivityTypeRulesVersion } from './activity-type-rules';
 
 export interface ManifestDto {
@@ -300,17 +300,12 @@ export class GenerationManifestsService {
    * config (lanza si es inválida). Un curso con Manifests nunca lee la config.
    */
   private async activityTypeRulesForNewRow(courseId: number): Promise<ActivityTypeRulesVersion> {
-    // Review EV5-C (4): solo el marcador (jsonb), no el documento entero.
-    const [prev] = await this.dataSource.query(
-      `select id, manifest_json->'features'->'activityTypeRules' as activity_type_rules
-         from public.course_generation_manifests
-        where course_id = $1 and rules_version = 3
-        order by created_at desc, id desc
-        limit 1`,
-      [courseId],
-    );
-    if (!prev) return this.configuredActivityTypeRules();
-    return activityTypeRulesValue(prev.activity_type_rules, prev.id);
+    // LOOP 7: fuente única (también la usan el dry-run, «Aplicar diseño» y el impacto de cambios).
+    try {
+      return await activityTypeRulesForNextManifest(this.dataSource, courseId);
+    } catch (err) {
+      throw new InternalServerErrorException((err as Error).message);
+    }
   }
 
   /** INSERT v3: columnas de conteo v2 + v3 (supabase-migration-v21-manifest-v3.sql); scorm_count = 0. */

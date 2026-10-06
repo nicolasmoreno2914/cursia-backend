@@ -405,6 +405,30 @@ export function materializeDistribution(base: BlueprintSnapshotV2, dist: Distrib
 }
 
 /**
+ * LOOP 7 (A2 A4): la tarjeta y lo que se congela salen de dos cálculos (distribuidor vs Manifest materializado).
+ * Cualquier diferencia de horas o de conteos es un error visible (nunca una tarjeta que miente en silencio).
+ */
+export function distributionModelMismatch(
+  dist: DistributionResult,
+  ms: { manifest: GenerationManifestV1; studyTime: StudyTimeEstimate },
+): { code: string; message: string }[] {
+  const t = ms.manifest.totals as unknown as Record<string, number | undefined>;
+  const n = (k: string) => Number(t[k] ?? 0);
+  const pairs: [string, number, number][] = [
+    ['horas', dist.estimatedHours, ms.studyTime.courseEstimatedHours],
+    ['capítulos', dist.counts.chapters, n('experienceCount')],
+    ['capítulos con video', dist.counts.videoChapters, n('videoCount')],
+    ['actividades', dist.counts.activities, n('activityCount')],
+    ['Actividades de Aplicación', dist.counts.applicationActivities, n('applicationActivityCount')],
+    ['evaluaciones', dist.counts.evaluations, n('examCount') + n('finalExamCount')],
+  ];
+  const off = pairs.filter(([, a, b]) => Math.abs(a - b) > 1e-6);
+  return off.length
+    ? [{ code: 'DISTRIBUTION_MODEL_MISMATCH', message: `DISTRIBUTION_MODEL_MISMATCH: la propuesta no coincide con su Manifest (${off.map(([k, a, b]) => `${k} ${a} ≠ ${b}`).join('; ')}); no se puede aplicar.` }]
+    : [];
+}
+
+/**
  * La propuesta materializada; si falla (bug del materializador o diseño no representable) el error queda VISIBLE en
  * `manifestErrors` sin tumbar la línea base ni la vista pedagógica del dry-run.
  */
@@ -618,7 +642,9 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
         return {
           blueprintSha256: ms.blueprintSha256,
           manifestSha256: ms.manifestSha256,
-          manifestErrors: ms.manifestErrors,
+          // LOOP 7 (A2 A4): la tarjeta «Cursia recomienda» muestra horas y conteos del modelo del distribuidor; si no
+          // coinciden con el Manifest materializado (lo que se congelaría), el error es visible y «Aplicar» se bloquea.
+          manifestErrors: [...ms.manifestErrors, ...distributionModelMismatch(dist, ms)],
           items: ms.manifest.items.length,
           totals: { ...(ms.manifest.totals as any) },
           providers: ms.providers,
