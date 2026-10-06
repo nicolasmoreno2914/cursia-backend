@@ -742,7 +742,9 @@ function resolveExamSources(plan: PackagingPlanV3, c: DynamicPackageContentsV3):
     const gift = c.examGift.get(m.moduleId);
     if (bank && (gift ?? '').trim()) throw new Error(`MBZ_V3_INVARIANT: ${m.keys.exam} trae GIFT y banco a la vez`);
     if (bank) {
-      check(m.keys.exam, 'module', bank, m.chapters.map((ch) => ({ id: ch.chapterId, moduleId: m.moduleId })));
+      // Motor de carga horaria: los capítulos de práctica no entran a los exámenes (mismo plan que el claim y que
+      // packaging-v3); sin el filtro, un módulo con práctica y examen en banco nunca se empaquetaba (E2E E7).
+      check(m.keys.exam, 'module', bank, m.chapters.filter((ch) => ch.kind !== 'practice').map((ch) => ({ id: ch.chapterId, moduleId: m.moduleId })));
       modules.set(m.moduleId, { kind: 'bank', bank });
     } else {
       modules.set(m.moduleId, { kind: 'gift', gift: gift as string });
@@ -752,7 +754,7 @@ function resolveExamSources(plan: PackagingPlanV3, c: DynamicPackageContentsV3):
   if (plan.keys.finalExam) {
     if (c.finalExamBank && (c.finalExamGift ?? '').trim()) throw new Error(`MBZ_V3_INVARIANT: ${plan.keys.finalExam} trae GIFT y banco a la vez`);
     if (c.finalExamBank) {
-      check(plan.keys.finalExam, 'final', c.finalExamBank, plan.modules.flatMap((m) => m.chapters.map((ch) => ({ id: ch.chapterId, moduleId: m.moduleId }))));
+      check(plan.keys.finalExam, 'final', c.finalExamBank, plan.modules.flatMap((m) => m.chapters.filter((ch) => ch.kind !== 'practice').map((ch) => ({ id: ch.chapterId, moduleId: m.moduleId }))));
       final = { kind: 'bank', bank: c.finalExamBank };
     } else {
       final = { kind: 'gift', gift: c.finalExamGift as string };
