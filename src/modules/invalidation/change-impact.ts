@@ -48,6 +48,8 @@ export interface ChangeImpactChapter {
   review: string[];
   paidStale: string[];
   generate: string[];
+  /** Pagados que se volverían a ejecutar (fallidos o reactivados); no son «nuevos». */
+  paidRetry: string[];
   disable: string[];
   /** true = ningún item del capítulo cambia (todo REUSE). */
   untouched: boolean;
@@ -105,7 +107,7 @@ export function summarizeChangeImpact(input: {
   const byChapter = new Map<string, ChangeImpactChapter>();
   for (const m of [...to.blueprint.modules].sort((a, b) => a.position - b.position)) {
     for (const c of [...m.chapters].sort((a, b) => a.position - b.position)) {
-      byChapter.set(c.id, { chapterId: c.id, moduleId: m.id, title: c.title, regenerate: [], review: [], paidStale: [], generate: [], disable: [], untouched: true });
+      byChapter.set(c.id, { chapterId: c.id, moduleId: m.id, title: c.title, regenerate: [], review: [], paidStale: [], generate: [], paidRetry: [], disable: [], untouched: true });
     }
   }
   const reasons: Record<string, string[]> = {};
@@ -115,7 +117,7 @@ export function summarizeChangeImpact(input: {
     if (!ch || !a.inTargetManifest && a.action !== 'SOFT_DISABLE') continue;
     if (a.action === 'REUSE') continue;
     ch.untouched = false;
-    if (a.action === 'REGENERATE') (PAID_TYPES.has(a.type) ? ch.generate : ch.regenerate).push(a.itemKey);
+    if (a.action === 'REGENERATE') (PAID_TYPES.has(a.type) ? ch.paidRetry : ch.regenerate).push(a.itemKey);
     else if (a.action === 'GENERATE') ch.generate.push(a.itemKey);
     else if (a.action === 'REVIEW') ch.review.push(a.itemKey);
     else if (a.action === 'STALE_NO_AUTO') ch.paidStale.push(a.itemKey);
