@@ -266,6 +266,12 @@ export class CourseStructureService implements OnModuleInit {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException({ code: 'NO_TARGET_HOURS', message: 'NO_TARGET_HOURS: sin horas objetivo no hay propuesta que aplicar.' });
       }
+      // Review N1: con la estructura mínima por encima del objetivo, Cursia informa y NO recorta (ni capítulos ni
+      // Actividades de Aplicación): esa propuesta no se aplica (el panel tampoco ofrece el botón).
+      if (dist.status === 'minimum_exceeds_target') {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException({ code: 'PROPOSAL_NOT_APPLICABLE', message: 'PROPOSAL_NOT_APPLICABLE: la estructura actual ya supera la carga horaria objetivo; Cursia no recorta contenido por su cuenta (ajusta la estructura en el editor o el objetivo de horas).' });
+      }
       if (dist.proposalSha256 !== dto.proposalSha256) {
         await queryRunner.rollbackTransaction();
         throw new ConflictException({ code: 'PROPOSAL_CHANGED', message: 'PROPOSAL_CHANGED: la estructura o el perfil cambiaron desde que viste el diseño; vuelve a verlo antes de aplicarlo.' });

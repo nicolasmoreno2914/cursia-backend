@@ -999,6 +999,13 @@ async function dbChecks() {
       assert(Math.abs(dr2.distribution.estimatedHours - d.estimatedHours) <= 0.15, `mismas horas (${dr2.distribution.estimatedHours} vs ${d.estimatedHours})`);
       eq(Math.abs(dr2.baseline.studyTime.courseEstimatedHours - d.estimatedHours) <= 0.15, true, 'la estructura real ya tiene las horas del diseño');
       await rejectsRe(profiles.append(course.id, OWNER, 'pedagogy', { ...profileOf('competencias'), targetHours: 33, designPreferences: { emphasis: 'x' } }), /INVALID_OPTION/, 'preferencia inválida', 400);
+      // Review N1: objetivo por debajo de la estructura mínima → la propuesta (que quitaría las actividades) NO se aplica.
+      await profiles.append(course.id, OWNER, 'pedagogy', { ...profileOf('competencias'), targetHours: 1 });
+      const low = (await pedagogy.dryRunCourse(course.id, OWNER, {})).distribution;
+      eq(low.status, 'minimum_exceeds_target', 'objetivo de 1 h: la estructura mínima lo supera');
+      const c1 = await counter();
+      await rejectsRe(structureSvc.applyDistribution(course.id, OWNER, { expectedCounter: c1, proposalSha256: low.proposalSha256 }), /PROPOSAL_NOT_APPLICABLE/, 'no recorta', 400);
+      eq(await counter(), c1, 'no escribió nada');
     });
   } finally {
     if (ds && ds.isInitialized) await ds.destroy();
