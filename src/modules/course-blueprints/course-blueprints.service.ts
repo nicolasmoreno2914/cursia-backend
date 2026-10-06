@@ -10,6 +10,7 @@ import {
 import { DataSource } from 'typeorm';
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
+import { assembleLockSnapshotV2, loadLockRows } from './lock-snapshot';
 import { lockPedagogyInput } from '../pedagogy/pedagogical-blueprint';
 import { loadCurrentPedagogicalProfile } from '../pedagogy/pedagogy-db';
 import { profileApplicationContext, profileTargetHours } from '../pedagogy/pedagogy-profile';
@@ -318,18 +319,7 @@ export class CourseBlueprintsService {
         );
       }
 
-      const modules: RawModuleRow[] = await qr.query(
-        `select id, position, title, objective, description, exam_enabled from public.course_modules where course_id = $1`,
-        [courseId],
-      );
-      const chapters: RawChapterRowV2[] = await qr.query(
-        `select id, module_id, position, title, objective, description, video_enabled, activity_enabled,
-                to_jsonb(course_chapters) ->> 'chapter_kind' as chapter_kind,
-                to_jsonb(course_chapters) ->> 'application_minutes' as application_minutes,
-                to_jsonb(course_chapters) -> 'outcome_ids' as outcome_ids
-           from public.course_chapters where course_id = $1`,
-        [courseId],
-      );
+      const { modules, chapters } = await loadLockRows(qr, courseId);
 
       if (course.structure_version_counter !== expectedCounter) {
         await qr.rollbackTransaction();
@@ -340,30 +330,15 @@ export class CourseBlueprintsService {
         );
       }
 
-      // Motor pedagógico V1 / motor de carga horaria: perfil vigente (diseño + horas objetivo).
-      const pedagogyProfile = await loadCurrentPedagogicalProfile(qr, courseId);
-      // Fase 3: contexto académico vigente → sus resultados y competencias se congelan en el Blueprint.
-      const academic = await loadCurrentAcademicContext(qr, courseId);
-      const courseRef = {
-        id: course.id,
-        title: course.title,
-        finalExam: course.final_exam_enabled,
-        activityEngine: course.activity_engine,
-        // EV6 H5P v2: NULL (curso anterior / columna sin migrar) = apagado; solo true entra al snapshot.
-        reviewCards: course.review_cards_enabled === true,
-        // Sin objetivo de horas: la clave no entra al snapshot (sha de siempre).
-        targetHours: profileTargetHours(pedagogyProfile ? pedagogyProfile.profile : null),
-        // Fase 2: estudiante + resultados de aprendizaje congelados (solo entran si hay Actividades de Aplicación).
-        applicationContext: profileApplicationContext(pedagogyProfile ? pedagogyProfile.profile : null),
-        academicContext: academic ? academicBlueprintContext(academic.context, academic.sha256) : null,
-      };
-      const errors = validateBlueprintInputV2(courseRef, modules, chapters);
-      if (errors.length > 0) {
+      // Perfil pedagógico (diseño + horas objetivo) y contexto académico vigentes → el Blueprint (lock-snapshot.ts,
+      // misma composición que la vista previa del impacto de los cambios).
+      const assembled = await assembleLockSnapshotV2(qr, course, { modules, chapters });
+      if (assembled.errors.length > 0) {
         await qr.rollbackTransaction();
-        const detail = errors.map((e) => e.message).join('; ');
+        const detail = assembled.errors.map((e) => e.message).join('; ');
         throw new BadRequestException({
           message: `La estructura no cumple las validaciones para crear un Blueprint: ${detail}`,
-          errors,
+          errors: assembled.errors,
         });
       }
       // Title Normalization: un Blueprint nunca congela un título de módulo/capítulo > 80
@@ -378,9 +353,7 @@ export class CourseBlueprintsService {
         });
       }
 
-      const plain = buildBlueprintSnapshotV2(courseRef, modules, chapters);
-      const pedagogy = lockPedagogyInput(plain, pedagogyProfile ? pedagogyProfile.profile : null);
-      const snapshot = pedagogy ? buildBlueprintSnapshotV2(courseRef, modules, chapters, pedagogy) : plain;
+      const snapshot = assembled.snapshot as BlueprintSnapshotV2;
       const canonical = canonicalJsonV2(snapshot);
       const sha = snapshotSha256V2(snapshot);
 
