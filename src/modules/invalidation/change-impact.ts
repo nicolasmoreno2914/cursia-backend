@@ -4,6 +4,7 @@ import { ProviderPlan, providerPlanFor } from '../pedagogy/dry-run';
 import type { StudyTimeEstimate } from '../study-time/time-model';
 import type { InvalidationAction, InvalidationActionType, InvalidationPlan } from './plan';
 import { ALIGNMENT_FINGERPRINT_TYPES } from './fingerprints';
+import { PROVIDER_PAID_ITEM_TYPES_V3 } from './plan-v3';
 
 /**
  * Fase 5 — Regeneración parcial inteligente: ¿qué cambió, qué depende de eso, qué hay que regenerar, qué queda intacto
@@ -64,16 +65,24 @@ export interface ChangeImpact {
   paidStale: string[];
   /** Items pagados NUEVOS (p. ej. un video de un capítulo agregado): se generarían al confirmar. */
   paidNew: string[];
+  /** Items pagados que se volverían a ejecutar al confirmar (fallidos o reactivados), distintos de los nuevos. */
+  paidRetry: string[];
   chapters: ChangeImpactChapter[];
   untouchedChapters: number;
   /** Costo simulado de lo que se ejecutaría (texto + pagos nuevos) y, aparte, de regenerar los pagados marcados. */
   cost: { toRun: ProviderPlan; paidStaleIfRegenerated: ProviderPlan };
+  /**
+   * 5.5 · «Costo estimado de los cambios: USD X» — lo que se ejecutaría al confirmar (texto + pagados nuevos o a
+   * reintentar). Simulado: nada se cobra. null = sin tarifas configuradas.
+   */
+  estimatedChangeCostUsd: string | null;
   hours: { from: number; to: number; delta: number } | null;
   /** Por qué cambia cada item (motivos del plan), solo de los que no se reutilizan. */
   reasons: Record<string, string[]>;
 }
 
-const PAID_TYPES = new Set(Object.entries(DEPENDENCY_DOC).filter(([, d]) => d.paid).map(([t]) => t));
+// Fuente única de los tipos pagados: el plan v3 (review F5: sin listas duplicadas).
+const PAID_TYPES = new Set(PROVIDER_PAID_ITEM_TYPES_V3);
 
 function itemsOf(manifest: GenerationManifestV1, keys: string[]): ManifestItem[] {
   const set = new Set(keys);
@@ -89,7 +98,8 @@ export function summarizeChangeImpact(input: {
   const inTarget = (a: InvalidationAction) => a.inTargetManifest;
   const run = (a: InvalidationAction) => inTarget(a) && (a.action === 'REGENERATE' || a.action === 'GENERATE');
   const toRun = plan.actions.filter((a) => run(a) && !PAID_TYPES.has(a.type)).map((a) => a.itemKey);
-  const paidNew = plan.actions.filter((a) => run(a) && PAID_TYPES.has(a.type)).map((a) => a.itemKey);
+  const paidNew = plan.actions.filter((a) => run(a) && PAID_TYPES.has(a.type) && a.action === 'GENERATE').map((a) => a.itemKey);
+  const paidRetry = plan.actions.filter((a) => run(a) && PAID_TYPES.has(a.type) && a.action === 'REGENERATE').map((a) => a.itemKey);
   const paidStale = plan.actions.filter((a) => inTarget(a) && a.action === 'STALE_NO_AUTO').map((a) => a.itemKey);
 
   const byChapter = new Map<string, ChangeImpactChapter>();
@@ -112,6 +122,7 @@ export function summarizeChangeImpact(input: {
     else if (a.action === 'SOFT_DISABLE') ch.disable.push(a.itemKey);
   }
   const chapters = [...byChapter.values()];
+  const toRunPlan = providerPlanFor({ ...to.manifest, items: itemsOf(to.manifest, [...toRun, ...paidNew, ...paidRetry]) });
   const hFrom = input.from?.studyTime?.courseEstimatedHours ?? null;
   const hTo = to.studyTime?.courseEstimatedHours ?? null;
   return {
@@ -123,12 +134,14 @@ export function summarizeChangeImpact(input: {
     toRun,
     paidStale,
     paidNew,
+    paidRetry,
     chapters,
     untouchedChapters: chapters.filter((c) => c.untouched).length,
     cost: {
-      toRun: providerPlanFor({ ...to.manifest, items: itemsOf(to.manifest, [...toRun, ...paidNew]) }),
+      toRun: toRunPlan,
       paidStaleIfRegenerated: providerPlanFor({ ...to.manifest, items: itemsOf(to.manifest, paidStale) }),
     },
+    estimatedChangeCostUsd: toRunPlan.estimateUsd ? Number(toRunPlan.estimateUsd.expected).toFixed(2) : null,
     hours: hFrom !== null && hTo !== null ? { from: hFrom, to: hTo, delta: Math.round((hTo - hFrom) * 10) / 10 } : null,
     reasons,
   };

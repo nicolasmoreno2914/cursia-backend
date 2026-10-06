@@ -36,6 +36,7 @@ const CI = load('modules/invalidation/change-impact.js');
 const ST = load('modules/study-time/index.js');
 const MI = load('modules/study-time/manifest-input.js');
 const DIST = load('modules/study-time/distributor.js');
+const SVC = load('modules/invalidation/change-impact.service.js');
 const F = require('./lib/academic-fixtures.js');
 
 let passes = 0;
@@ -106,7 +107,8 @@ const impactOf = (from, to) => {
     eq(imp.reasons[`video_interactions:${target.id}`], ['video_stale'], 'motivo: el video quedó marcado');
     eq(imp.untouchedChapters, imp.chapters.length - 1, 'los demás capítulos intactos');
     const others = imp.toRun.filter((k) => !k.includes(target.id));
-    eq(others.map((k) => k.split(':')[0]).sort(), ['course_intro', 'course_plan', 'exam', 'final_exam', 'module_intro'].filter((t) => others.some((k) => k.startsWith(t + ':'))).sort(), 'fuera del capítulo solo lo que lo incluye');
+    // Review F5 (CI2 casi tautológico): lo que lo incluye SÍ se regenera — examen e intro de SU módulo.
+    assert(others.includes(`exam:${modules[0].id}`) && others.includes(`module_intro:${modules[0].id}`), `examen e intro del módulo: ${others.join(', ')}`);
     assert(others.every((k) => /^(course_plan|course_intro|module_intro|exam|final_exam):/.test(k)), `fuera del capítulo: ${others.join(', ')}`);
     assert(!others.some((k) => k.startsWith('exam:') && !k.includes(modules[0].id)), 'solo el examen de SU módulo');
     assert(Object.keys(imp.reasons).some((k) => k.includes(target.id)), 'motivos por item');
@@ -168,6 +170,43 @@ const impactOf = (from, to) => {
     eq([imp.toRun.length, imp.paidStale.length, imp.untouchedChapters === imp.chapters.length], [0, 0, true], 'nada que regenerar');
     eq(Number(imp.cost.toRun.estimateUsd.expected), 0, 'USD 0');
     eq(netAttempts, [], 'red');
+  });
+
+  await check('CI7 la vista previa aplica la propuesta EXACTA de «Aplicar diseño» (review F5 I3)', () => {
+    // «Aplicar diseño»: dry-run sobre la estructura viva con las reglas configuradas; la vista previa aplica esa misma
+    // propuesta a las filas en memoria (applyProposalToRows) y ensambla como el lock.
+    const rows = { modules, chapters: chapters.map(({ application_minutes, ...c }) => c) };
+    const ref = { ...courseRef(64) }; delete ref.targetHours;
+    for (const atr of [0, 1, 2]) {
+      const dr = DR.runPedagogyDryRun({ structure: SNAP.buildBlueprintSnapshotV2(ref, rows.modules, rows.chapters), profile: profileOf('competencias', 48), activityTypeRules: atr });
+      const dist = dr.distribution;
+      const after = SVC.applyProposalToRows(rows, dist.modules);
+      const snap = designed(after.modules, after.chapters, 'competencias', 48);
+      // Mismo orden de capítulos por módulo, mismos minutos de aplicación, la práctica sin video.
+      for (const m of dist.modules) {
+        const sm = snap.modules.find((x) => x.id === m.id);
+        eq(sm.chapters.map((c) => c.id), m.chapters.map((c) => c.id), `orden del módulo (reglas ${atr})`);
+        eq(sm.chapters.map((c) => c.applicationMinutes ?? null), m.chapters.map((c) => c.applicationMinutes), `minutos de aplicación (reglas ${atr})`);
+        assert(sm.chapters.filter((c) => c.kind === 'practice').every((c) => c.videoEnabled === false), 'práctica sin video');
+      }
+      eq(after.chapters.length, dist.modules.reduce((n2, m) => n2 + m.chapters.length, 0), 'ningún capítulo se pierde ni se duplica');
+      assert(chapters.every((c) => after.chapters.some((x) => x.id === c.id)), 'ningún capítulo existente se borra');
+    }
+  });
+
+  await check('CI8 pagados nuevos vs a reintentar, y «Costo estimado de los cambios» = todo lo que se ejecutaría (review F5 I5)', () => {
+    // Un capítulo nuevo en el módulo 1: su video, Gamma y audiolibro son pagados NUEVOS.
+    const extra = { id: uuid(), module_id: modules[0].id, position: 99, title: 'Costos ocultos', objective: 'Reconocer costos ocultos', description: null, video_enabled: true, activity_enabled: true, outcome_ids: ['RA1'] };
+    const to = sideOf(designed(modules, [...chapters, extra], 'competencias', 64));
+    const imp = impactOf(from, to);
+    assert(imp.paidNew.some((k) => k === `video:${extra.id}`), `video nuevo: ${imp.paidNew.join(', ')}`);
+    eq(imp.paidRetry, [], 'nada que reintentar');
+    const sets = [imp.toRun, imp.paidNew, imp.paidRetry, imp.paidStale];
+    const all = sets.flat();
+    eq(new Set(all).size, all.length, 'conjuntos disjuntos (sin doble conteo)');
+    eq(imp.estimatedChangeCostUsd, Number(imp.cost.toRun.estimateUsd.expected).toFixed(2), 'el total es el costo de lo que se ejecutaría');
+    const textOnly = Number(DR.providerPlanFor({ ...to.manifest, items: to.manifest.items.filter((i) => imp.toRun.includes(i.key)) }).estimateUsd.expected);
+    assert(Number(imp.estimatedChangeCostUsd) > textOnly, 'incluye los pagados nuevos');
   });
 
   // --export <dir>: respuestas REALES de la vista previa para el harness del frontend (test-53).
