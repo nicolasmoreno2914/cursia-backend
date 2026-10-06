@@ -1779,6 +1779,10 @@ function reservationBookkeeping(ev) {
       eq([st.structureVersionCounter, st.modules[0].chapters[0].title], [counter, 'Título del docente'], 'E12: el 409 no cambió nada');
       const yc = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: counter, contextVersion: 1, confirmReplace: true });
       ok(yc.status === 201 && yc.data.replaced.confirmed === true, 'E12: confirmado → reemplazada', { s: yc.status, e: yc.error });
+      // Review L80 M1: el origen solo lo escribe el backend de la estructura; un PATCH del curso no lo cambia.
+      const pm = await api('PATCH', `/courses/${courseId}`, { metadata: { structureOrigin: { source: 'ai_proposal', counter: 0 } } });
+      st = await readStructure(courseId);
+      ok(pm.status === 200 && st.structureAuthority.source === 'academic_context' && st.structureAuthority.untouched === true, 'E12: un PATCH del curso no cambia el origen de la estructura', { s: pm.status, a: st.structureAuthority });
       results.courses.E12 = { courseId, modules: prop.counts.modules, chapters: prop.counts.chapters };
     }, { fatal: false });
 

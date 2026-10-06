@@ -1,3 +1,4 @@
+import { STRUCTURE_ORIGIN_KEY } from '../course-structure/structure-authority';
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -198,6 +199,15 @@ export class CoursesService {
   ): Promise<Course> {
     // findOne ya valida ownership → 404 si no es del usuario
     const course = await this.findOne(id, ownerId);
+    // LOOP 8.0 (review L80 M1): el origen de la estructura (metadata.structureOrigin) lo escribe solo el backend de la
+    // estructura; un PATCH del curso nunca lo cambia ni lo borra.
+    if (dto.metadata !== undefined) {
+      const keep = course.metadata ? course.metadata[STRUCTURE_ORIGIN_KEY] : undefined;
+      const next: Record<string, any> = { ...(dto.metadata || {}) };
+      delete next[STRUCTURE_ORIGIN_KEY];
+      if (keep !== undefined) next[STRUCTURE_ORIGIN_KEY] = keep;
+      dto = { ...dto, metadata: next };
+    }
     Object.assign(course, dto);
     return this.courseRepo.save(course);
   }

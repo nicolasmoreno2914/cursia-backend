@@ -16,6 +16,9 @@
 //   DA8 «Aplicar diseño» de Cursia sobre la estructura del documento la mantiene «de Cursia»; editada, no
 //   DA9 una versión NUEVA del contexto reemplaza la estructura del documento anterior sin preguntar (nadie la tocó)
 //   DA10 cursos legacy: la API los rechaza; el GET de un curso sin origen informa «sin origen» (compatibilidad)
+//   DA11 (review L80 I2) un contexto nuevo que quita un resultado poda vínculos SIN volver «editada» la estructura
+//   DA12 (review L80 M2) con una generación en curso → 409 ACTIVE_RUN, nada cambia
+//   (review L80 I3) el reemplazo reconcilia por posición: ids conservados (DA4, DA7, DA9)
 //
 // Uso: node scripts/check-loop8-document-structure-authority.js [--pure-only] [path/to/dist]
 'use strict';
@@ -240,6 +243,7 @@ async function dbChecks() {
       eq([st.structureAuthority.source, st.structureAuthority.untouched, st.structureAuthority.replaceReasons], ['ai_proposal', true, []], 'IA intacta');
       await saveContext(cid);
       const before = await counter(cid);
+      const aiIds = st.modules.map((m) => m.id);
       const res = await svc.applyAcademicStructure(cid, OWNER, { expectedCounter: before, contextVersion: 1 });
       eq([res.structureVersionCounter, res.replaced.previous, res.replaced.confirmed], [before + 1, { modules: 6, chapters: 12 }, false], 'un solo contador, sin confirmación');
       st = await get(cid);
@@ -250,6 +254,7 @@ async function dbChecks() {
       eq([st.structureAuthority.source, st.structureAuthority.untouched, st.structureAuthority.replaceReasons], ['academic_context', true, []], 'GET informa el documento');
       const leftovers = (await ds.query(`select count(*)::int n from public.course_chapters where course_id = $1`, [cid]))[0].n;
       eq(leftovers, proposal.counts.chapters, 'sin capítulos huérfanos');
+      eq(st.modules.map((m) => m.id), aiIds.slice(0, proposal.counts.modules), 'reconciliación por posición: los módulos que siguen conservan su id; el sobrante se borró');
     });
 
     await check('DA5 origen de la IA: solo con el contador vigente y sin tocar la estructura', async () => {
@@ -283,11 +288,14 @@ async function dbChecks() {
       let st = await get(cid);
       eq([st.liveMatchesCurrentBlueprint, st.structureAuthority.replaceReasons], [true, ['confirmed_blueprint']], 'confirmada e intacta');
       await rejectsRe(svc.applyAcademicStructure(cid, OWNER, { expectedCounter: await counter(cid), contextVersion: 1 }), /STRUCTURE_REPLACE_NEEDS_CONFIRMATION/, 'pide confirmación', 409);
+      const ids = st.modules.flatMap((m) => [m.id, ...m.chapters.map((c) => c.id)]);
       const res = await svc.applyAcademicStructure(cid, OWNER, { expectedCounter: await counter(cid), contextVersion: 1, confirmReplace: true });
       eq(res.hadBlueprint, true, 'informa el Blueprint');
       st = await get(cid);
       assert(typeof lock.blueprint.blueprintNumber === 'number' && st.currentBlueprint, 'hay Blueprint');
-      eq([st.currentBlueprint.number, st.currentBlueprint.sha256, st.liveMatchesCurrentBlueprint], [lock.blueprint.blueprintNumber, lock.blueprint.sha256, false], 'Blueprint intacto; la estructura viva ya no coincide (ids nuevos)');
+      eq([st.currentBlueprint.number, st.currentBlueprint.sha256], [lock.blueprint.blueprintNumber, lock.blueprint.sha256], 'Blueprint intacto');
+      eq(st.modules.flatMap((m) => [m.id, ...m.chapters.map((c) => c.id)]), ids, 'el mismo documento conserva TODOS los ids (lo generado se puede reutilizar)');
+      eq(st.liveMatchesCurrentBlueprint, true, 'mismo documento → la estructura sigue coincidiendo con la versión confirmada');
       expectProposal(st, 'tras Blueprint');
     });
 
@@ -304,12 +312,21 @@ async function dbChecks() {
       assert(applied.addedChapters + applied.applicationActivities > 0, 'el diseño cambió la estructura');
       let st = await get(cid);
       eq([st.structureAuthority.source, st.structureAuthority.untouched, st.structureAuthority.originCounter], ['academic_context', true, c0 + 1], 'sigue siendo de Cursia');
-      const m0 = st.modules[0];
-      await svc.updateModule(cid, m0.id, OWNER, { title: 'Mi módulo', expectedCounter: await counter(cid) });
+      // Un contexto nuevo reemplaza la estructura (nadie la tocó) y avisa que el diseño de horas se perdió (review L80 M3).
+      const ctx2 = JSON.parse(JSON.stringify(ctx));
+      ctx2.units = ctx2.units.slice(0, 3);
+      await saveContext(cid, ctx2);
+      const rep2 = await svc.applyAcademicStructure(cid, OWNER, { expectedCounter: await counter(cid), contextVersion: 2 });
+      eq([rep2.replaced.confirmed, rep2.previousHadDesign], [false, true], 'sin confirmación; avisa que había diseño de horas');
+      st = await get(cid);
+      eq(st.modules.flatMap((m) => m.chapters).filter((c) => c.kind === 'practice' || typeof c.applicationMinutes === 'number').length, 0, 'práctica y Actividades de Aplicación del diseño anterior quitadas');
+      // Editada por el docente: un diseño de Cursia encima NO la vuelve «de Cursia».
+      await svc.updateModule(cid, st.modules[0].id, OWNER, { title: 'Mi módulo', expectedCounter: await counter(cid) });
+      await profiles.append(cid, OWNER, 'pedagogy', { ...design, primaryApproach: 'competencias', targetHours: 96, designPreferences: { emphasis: 'application', applicationActivities: 'auto' } });
       const dr2 = await pedagogy.dryRunCourse(cid, OWNER, {});
-      if (dr2.distribution && dr2.distribution.status !== 'minimum_exceeds_target' && dr2.distribution.changes && dr2.distribution.changes.length) {
-        await svc.applyDistribution(cid, OWNER, { expectedCounter: await counter(cid), proposalSha256: dr2.distribution.proposalSha256 });
-      }
+      assert(dr2.distribution && dr2.distribution.status !== 'minimum_exceeds_target', 'hay diseño para la estructura editada');
+      const ap2 = await svc.applyDistribution(cid, OWNER, { expectedCounter: await counter(cid), proposalSha256: dr2.distribution.proposalSha256 });
+      assert(ap2.addedChapters + ap2.applicationActivities > 0, 'el diseño sí cambió la estructura editada');
       st = await get(cid);
       eq([st.structureAuthority.untouched, st.structureAuthority.replaceReasons], [false, ['user_edits']], 'editada sigue editada');
     });
@@ -321,11 +338,46 @@ async function dbChecks() {
       const ctx2 = JSON.parse(JSON.stringify(ctx));
       ctx2.units = ctx2.units.slice(0, 2);
       const p2 = A.proposeStructureFromContext(ctx2);
+      const ids1 = (await get(cid)).modules.map((m) => m.id);
       const v2 = await saveContext(cid, ctx2);
       eq(v2.profile.version, 2, 'versión 2');
       const res = await svc.applyAcademicStructure(cid, OWNER, { expectedCounter: await counter(cid), contextVersion: 2 });
       eq([res.replaced.confirmed, shape(await get(cid))], [false, p2.modules.map((m) => m.chapters.length)], 'sin confirmación, forma nueva');
       eq((await get(cid)).structureAuthority.contextVersion, 2, 'origen con la versión 2');
+      eq((await get(cid)).modules.map((m) => m.id), ids1.slice(0, p2.counts.modules), 'módulos que siguen: mismo id; sobrantes borrados');
+    });
+
+    await check('DA11 un contexto nuevo con un resultado menos poda vínculos y la estructura del documento sigue «de Cursia»', async () => {
+      const cid = await newCourse('Poda');
+      await saveContext(cid);
+      await svc.applyAcademicStructure(cid, OWNER, { expectedCounter: await counter(cid), contextVersion: 1 });
+      const last = ctx.outcomes[ctx.outcomes.length - 1].id;
+      const linked = (await get(cid)).modules.flatMap((m) => m.chapters).filter((c) => (c.outcomeIds || []).includes(last)).length;
+      assert(linked > 0, `hay capítulos vinculados a ${last}`);
+      const ctx3 = JSON.parse(JSON.stringify(ctx, (k, v) => (Array.isArray(v) ? v.filter((x) => x !== last) : v)));
+      ctx3.outcomes = ctx3.outcomes.filter((o) => o.id !== last);
+      const saved3 = await saveContext(cid, ctx3);
+      assert((saved3.prunedOutcomeLinks || []).length > 0, 'podó vínculos');
+      const a = (await get(cid)).structureAuthority;
+      eq([a.source, a.untouched, a.replaceReasons], ['academic_context', true, []], 'la poda no cuenta como edición del docente');
+      const res = await svc.applyAcademicStructure(cid, OWNER, { expectedCounter: await counter(cid), contextVersion: 2 });
+      eq(res.replaced.confirmed, false, 'la versión nueva se usa sin preguntar');
+    });
+
+    await check('DA12 con una generación en curso → 409 ACTIVE_RUN y nada cambia', async () => {
+      const cid = await newCourse('Run activo');
+      await saveContext(cid);
+      await svc.applyAcademicStructure(cid, OWNER, { expectedCounter: await counter(cid), contextVersion: 1 });
+      await blueprints.lock(cid, OWNER, await counter(cid));
+      // Base desechable sin la migración de la generación dinámica: se admite el execution_mode del run de prueba.
+      await ds.query(`alter table public.production_jobs drop constraint if exists production_jobs_execution_mode_check`);
+      const [job] = await ds.query(`insert into public.production_jobs (owner_id, course_id, execution_mode, status, worker_status) values ($1, $2, 'dynamic_generation', 'running', 'running') returning id`, [OWNER, cid]);
+      const c0 = await counter(cid);
+      await rejectsRe(svc.applyAcademicStructure(cid, OWNER, { expectedCounter: c0, contextVersion: 1, confirmReplace: true }), /ACTIVE_RUN/, 'run en curso', 409);
+      eq(await counter(cid), c0, 'nada cambió');
+      await ds.query(`update public.production_jobs set worker_status = 'completed', status = 'completed' where id = $1`, [job.id]);
+      const ok = await svc.applyAcademicStructure(cid, OWNER, { expectedCounter: c0, contextVersion: 1, confirmReplace: true });
+      eq(ok.replaced.confirmed, true, 'terminado el run, se puede');
     });
 
     await check('DA10 compatibilidad: legacy rechazado; curso dinámico sin origen = «sin origen»', async () => {

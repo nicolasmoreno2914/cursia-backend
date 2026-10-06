@@ -84,12 +84,12 @@ function cleanDescription(v: string | undefined | null): string | null {
   return t ? t : null;
 }
 import {
-  STRUCTURE_ORIGIN_KEY,
   StructureOrigin,
+  advanceStructureOriginIfUntouched,
   isPristineSkeleton,
-  originAfterCursiaDesign,
   parseStructureOrigin,
   structureAuthority,
+  writeStructureOrigin,
 } from './structure-authority';
 import { proposeStructureFromContext } from '../academic-context/context-design';
 import { validateAcademicContext } from '../academic-context/validate';
@@ -353,7 +353,7 @@ export class CourseStructureService implements OnModuleInit {
       ));
       const newCounter = this.counterOrThrow(cr?.structure_version_counter, courseId);
       // LOOP 8.0: el diseño de Cursia sobre una estructura que Cursia armó y nadie tocó sigue siendo «de Cursia».
-      await this.advanceOriginAfterCursiaDesign(queryRunner, courseId, lock.counter, newCounter);
+      await advanceStructureOriginIfUntouched(queryRunner, courseId, lock.counter, newCounter);
       const liveMatchesCurrentBlueprint = await this.liveMatchesAfterMutation(queryRunner, courseId, ownerId, lock.hasBlueprint);
       await queryRunner.commitTransaction();
       return {
@@ -422,38 +422,101 @@ export class CourseStructureService implements OnModuleInit {
           message: 'STRUCTURE_REPLACE_NEEDS_CONFIRMATION: la estructura actual tiene cambios del docente o una versión confirmada; confirma antes de reemplazarla.',
         });
       }
-      // Reemplazo completo (los capítulos se borran por cascada; artifacts.module_id/chapter_id → null por su FK).
-      await queryRunner.query(`delete from public.course_modules where course_id = $1`, [courseId]);
-      for (const [mi, m] of proposal.modules.entries()) {
-        const mt = normalizeTitleOrThrow('module', m.title);
-        const [mod] = await queryRunner.query(
-          `insert into public.course_modules (course_id, position, title, objective, description, exam_enabled)
-           values ($1, $2, $3, $4, $5, $6) returning id`,
-          [courseId, mi, mt.title, m.objective, checkedDescription(mergeDescription(cleanDescription(m.description), mt.description)), m.examEnabled],
+      // Review L80 M2: con una generación en curso, cambiar la estructura deja a sus items apuntando a capítulos que ya no
+      // existen. Se rechaza a la vista (como cualquier cambio grande durante un run).
+      if (lock.hasBlueprint) {
+        const [run] = await queryRunner.query(
+          `select id from public.production_jobs
+            where course_id = $1 and execution_mode = 'dynamic_generation' and worker_status in ('queued', 'running', 'retrying')
+              and coalesce(status, '') not in ('cancelled', 'cancelling')
+            limit 1`,
+          [courseId],
         );
-        for (const [ci, c] of m.chapters.entries()) {
-          const ct = normalizeTitleOrThrow('chapter', c.title);
-          await queryRunner.query(
-            `insert into public.course_chapters (course_id, module_id, position, title, objective, description, video_enabled, activity_enabled, outcome_ids)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)`,
-            [courseId, mod.id, ci, ct.title, c.objective, checkedDescription(mergeDescription(cleanDescription(c.description), ct.description)),
-              c.videoEnabled, c.activityEnabled, c.outcomeIds.length ? JSON.stringify(c.outcomeIds) : null],
-          );
+        if (run) {
+          await queryRunner.rollbackTransaction();
+          throw new ConflictException({ code: 'ACTIVE_RUN', message: 'ACTIVE_RUN: hay una generación en curso; espera a que termine (o cancélala) antes de cambiar la estructura con el microcurrículo.' });
         }
       }
+      // Review L80 I3: reconciliación POR POSICIÓN (no borrar y recrear). El módulo i y el capítulo j que ya existen
+      // conservan su id y toman los datos del documento; sobran → se borran; faltan → se crean. Así lo que no cambió
+      // (p. ej. volver a guardar el mismo microcurrículo) sigue siendo el mismo item para el impacto de cambios y la
+      // regeneración parcial; lo que cambió lo detectan sus huellas, como cualquier edición.
+      const cols: { column_name: string }[] = await queryRunner.query(
+        `select column_name from information_schema.columns
+          where table_schema = 'public' and table_name = 'course_chapters' and column_name in ('chapter_kind', 'application_minutes')`,
+      );
+      const hasKind = cols.some((c) => c.column_name === 'chapter_kind');
+      const hasApp = cols.some((c) => c.column_name === 'application_minutes');
+      const liveMods: { id: string }[] = await queryRunner.query(`select id from public.course_modules where course_id = $1 order by position, id`, [courseId]);
+      const liveChs: { id: string; module_id: string; chapter_kind: string | null; application_minutes: string | null }[] = await queryRunner.query(
+        `select id, module_id, to_jsonb(ch) ->> 'chapter_kind' as chapter_kind, to_jsonb(ch) ->> 'application_minutes' as application_minutes
+           from public.course_chapters ch where course_id = $1 order by position, id`,
+        [courseId],
+      );
+      // El diseño de horas aplicado (práctica / Actividades de Aplicación) no viene del documento: se avisa al docente.
+      const previousHadDesign = liveChs.some((c) => c.chapter_kind === 'practice' || c.application_minutes !== null);
+      const chsOf = (moduleId: string) => liveChs.filter((c) => c.module_id === moduleId);
+      const contentReset = `${hasKind ? ", chapter_kind = 'content'" : ''}${hasApp ? ', application_minutes = null' : ''}`;
+      for (const [mi, m] of proposal.modules.entries()) {
+        const mt = normalizeTitleOrThrow('module', m.title);
+        const mDesc = checkedDescription(mergeDescription(cleanDescription(m.description), mt.description));
+        let moduleId: string;
+        const keepMod = liveMods[mi];
+        if (keepMod) {
+          moduleId = keepMod.id;
+          await queryRunner.query(
+            `update public.course_modules set position = $2, title = $3, objective = $4, description = $5, exam_enabled = $6, updated_at = now()
+              where id = $1 and course_id = $7`,
+            [moduleId, mi, mt.title, m.objective, mDesc, m.examEnabled, courseId],
+          );
+        } else {
+          const [mod] = await queryRunner.query(
+            `insert into public.course_modules (course_id, position, title, objective, description, exam_enabled)
+             values ($1, $2, $3, $4, $5, $6) returning id`,
+            [courseId, mi, mt.title, m.objective, mDesc, m.examEnabled],
+          );
+          moduleId = mod.id;
+        }
+        const keepChs = keepMod ? chsOf(keepMod.id) : [];
+        for (const [ci, c] of m.chapters.entries()) {
+          const ct = normalizeTitleOrThrow('chapter', c.title);
+          const cDesc = checkedDescription(mergeDescription(cleanDescription(c.description), ct.description));
+          const links = c.outcomeIds.length ? JSON.stringify(c.outcomeIds) : null;
+          if (keepChs[ci]) {
+            await queryRunner.query(
+              `update public.course_chapters set position = $2, title = $3, objective = $4, description = $5, video_enabled = $6,
+                      activity_enabled = $7, outcome_ids = $8::jsonb${contentReset}, updated_at = now()
+                where id = $1 and course_id = $9`,
+              [keepChs[ci].id, ci, ct.title, c.objective, cDesc, c.videoEnabled, c.activityEnabled, links, courseId],
+            );
+          } else {
+            await queryRunner.query(
+              `insert into public.course_chapters (course_id, module_id, position, title, objective, description, video_enabled, activity_enabled, outcome_ids)
+               values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)`,
+              [courseId, moduleId, ci, ct.title, c.objective, cDesc, c.videoEnabled, c.activityEnabled, links],
+            );
+          }
+        }
+        const extraChs = keepChs.slice(m.chapters.length).map((c) => c.id);
+        if (extraChs.length) await queryRunner.query(`delete from public.course_chapters where course_id = $1 and id = any($2::uuid[])`, [courseId, extraChs]);
+      }
+      const extraMods = liveMods.slice(proposal.modules.length).map((x) => x.id);
+      // Módulos sobrantes: sus capítulos se borran por cascada (artifacts.module_id/chapter_id → null por su FK).
+      if (extraMods.length) await queryRunner.query(`delete from public.course_modules where course_id = $1 and id = any($2::uuid[])`, [courseId, extraMods]);
       const [cr] = returningRows(await queryRunner.query(
         `update public.courses set final_exam_enabled = $2, structure_version_counter = structure_version_counter + 1
           where id = $1 returning structure_version_counter`,
         [courseId, proposal.finalExam],
       ));
       const newCounter = this.counterOrThrow(cr?.structure_version_counter, courseId);
-      await this.writeStructureOrigin(queryRunner, courseId, { source: 'academic_context', counter: newCounter, contextVersion: academic.version, at: new Date().toISOString() });
+      await writeStructureOrigin(queryRunner, courseId, { source: 'academic_context', counter: newCounter, contextVersion: academic.version, at: new Date().toISOString() });
       const structure = await this.readStructure(queryRunner, courseId, ownerId);
       await queryRunner.commitTransaction();
       return {
         ...structure,
         replaced: { previous: currentCounts, modules: proposal.counts.modules, chapters: proposal.counts.chapters, contextVersion: academic.version, confirmed: authority.replaceReasons.length > 0 },
         hadBlueprint: lock.hasBlueprint,
+        previousHadDesign,
         notes: proposal.notes,
       };
     } catch (err) {
@@ -477,7 +540,7 @@ export class CourseStructureService implements OnModuleInit {
       await queryRunner.startTransaction();
       const lock = await this.lockAndVerifyEx(queryRunner, courseId, ownerId, dto.expectedCounter);
       const origin: StructureOrigin = { source: dto.source, counter: lock.counter, contextVersion: null, at: new Date().toISOString() };
-      await this.writeStructureOrigin(queryRunner, courseId, origin);
+      await writeStructureOrigin(queryRunner, courseId, origin);
       await queryRunner.commitTransaction();
       return { structureVersionCounter: lock.counter, structureOrigin: origin };
     } catch (err) {
@@ -486,20 +549,6 @@ export class CourseStructureService implements OnModuleInit {
     } finally {
       await queryRunner.release();
     }
-  }
-
-  private async writeStructureOrigin(q: QueryRunner, courseId: number, origin: StructureOrigin): Promise<void> {
-    await q.query(
-      `update public.courses set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), $2::text[], $3::jsonb, true) where id = $1`,
-      [courseId, [STRUCTURE_ORIGIN_KEY], JSON.stringify(origin)],
-    );
-  }
-
-  private async advanceOriginAfterCursiaDesign(q: QueryRunner, courseId: number, counterBefore: number, counterAfter: number): Promise<void> {
-    const [row] = await q.query(`select metadata -> 'structureOrigin' as o from public.courses where id = $1`, [courseId]);
-    const raw = row ? (typeof row.o === 'string' ? JSON.parse(row.o) : row.o) : null;
-    const next = originAfterCursiaDesign(parseStructureOrigin(raw), counterBefore, counterAfter);
-    if (next) await this.writeStructureOrigin(q, courseId, next);
   }
 
   async getStructure(courseId: number, ownerId: string) {

@@ -109,3 +109,26 @@ export function originAfterCursiaDesign(origin: StructureOrigin | null, counterB
   if (!origin || origin.counter !== counterBefore) return null;
   return { ...origin, counter: counterAfter };
 }
+
+// ── Lectura / escritura del origen dentro de una transacción (structure, profiles) ──
+type Q = { query(sql: string, params?: any[]): Promise<any> };
+
+export async function readStructureOrigin(q: Q, courseId: number): Promise<StructureOrigin | null> {
+  const res = await q.query(`select metadata -> 'structureOrigin' as o from public.courses where id = $1`, [courseId]);
+  const rows: any[] = Array.isArray(res) ? res : res.rows;
+  const raw = rows[0] ? rows[0].o : null;
+  return parseStructureOrigin(typeof raw === 'string' ? JSON.parse(raw) : raw);
+}
+
+export async function writeStructureOrigin(q: Q, courseId: number, origin: StructureOrigin): Promise<void> {
+  await q.query(
+    `update public.courses set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), $2::text[], $3::jsonb, true) where id = $1`,
+    [courseId, [STRUCTURE_ORIGIN_KEY], JSON.stringify(origin)],
+  );
+}
+
+/** Un cambio que hace Cursia (diseño de horas, poda de vínculos de un contexto nuevo) no convierte la estructura en «editada». */
+export async function advanceStructureOriginIfUntouched(q: Q, courseId: number, counterBefore: number, counterAfter: number): Promise<void> {
+  const next = originAfterCursiaDesign(await readStructureOrigin(q, courseId), counterBefore, counterAfter);
+  if (next) await writeStructureOrigin(q, courseId, next);
+}
