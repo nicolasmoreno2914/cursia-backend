@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, ConflictException, Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { CoursesService } from '../courses/courses.service';
 import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
@@ -9,7 +9,22 @@ import { proposeStructureFromContext, suggestOutcomeLinks, suggestProfileFromCon
 import { DocumentReadError } from './extract/text-sources';
 import { extractAcademicContext } from './extract/extractor';
 import { validateAcademicContext } from './validate';
-import { ExtractAcademicContextDto } from './dto/extract.dto';
+import { ExtractAcademicContextDto, ExtractAdvancedDto } from './dto/extract.dto';
+import { extractionQuality } from './extraction-quality';
+import { readPdf } from './extract/text-sources';
+import {
+  ADVANCED_EXTRACTION_OPERATION,
+  ADVANCED_MAX_PAGES,
+  AnthropicTranscriber,
+  DocumentTranscriber,
+  advancedExtractionEnabled,
+  advancedExtractionModel,
+  estimateAdvancedExtraction,
+} from './advanced-extraction';
+import { FinopsLedgerService } from '../finops/finops-ledger.service';
+
+/** Token de inyección del transcriptor (las pruebas inyectan uno falso). */
+export const DOCUMENT_TRANSCRIBER = 'DOCUMENT_TRANSCRIBER';
 
 /**
  * Fase 3 — Contexto académico: extracción (sin guardar) y diseño desde el contexto guardado. Sin proveedores
@@ -18,10 +33,17 @@ import { ExtractAcademicContextDto } from './dto/extract.dto';
  */
 @Injectable()
 export class AcademicContextService {
+  private readonly logger = new Logger(AcademicContextService.name);
+  private readonly transcriber: DocumentTranscriber;
+
   constructor(
     private readonly dataSource: DataSource,
     private readonly coursesService: CoursesService,
-  ) {}
+    @Optional() private readonly ledger?: FinopsLedgerService,
+    @Optional() @Inject(DOCUMENT_TRANSCRIBER) transcriber?: DocumentTranscriber,
+  ) {
+    this.transcriber = transcriber || new AnthropicTranscriber();
+  }
 
   private async loadCourse(courseId: number, ownerId: string): Promise<void> {
     const course = await this.coursesService.findOne(courseId, ownerId); // 404 si no es suyo
@@ -36,11 +58,94 @@ export class AcademicContextService {
     const inputs = dto.files.map((f) => ({ name: f.name, data: Buffer.from(f.dataBase64, 'base64') }));
     try {
       const r = await extractAcademicContext(inputs);
-      return { draft: r.context, validation: validateAcademicContext(r.context), notes: r.notes, stats: r.stats, saved: false };
+      // LOOP 8.1: cargador único — se informa si la lectura gratuita alcanzó y si la avanzada puede ayudar.
+      const quality = extractionQuality(r.context);
+      return {
+        draft: r.context, validation: validateAcademicContext(r.context), notes: r.notes, stats: r.stats, saved: false,
+        quality: { ...quality, advancedAvailable: quality.advancedMayHelp && advancedExtractionEnabled() },
+      };
     } catch (err) {
       if (err instanceof DocumentReadError) throw new BadRequestException({ code: err.code, message: `${err.code}: ${err.message}` });
       if (err instanceof Error && /^ACADEMIC_/.test(err.message)) throw new BadRequestException(err.message.slice(0, 500));
       throw err;
+    }
+  }
+
+  /**
+   * LOOP 8.1 · Lectura avanzada (respaldo del cargador único). 'estimate' no llama a ningún proveedor; 'run' exige
+   * haber aceptado el costo máximo estimado, transcribe el PDF con IA y lo pasa por el MISMO extractor determinista.
+   * El gasto se registra en FinOps aunque la lectura falle después. Nada se guarda: igual que /extract.
+   */
+  async extractAdvanced(courseId: number, ownerId: string, dto: ExtractAdvancedDto) {
+    assertDynamicOwnerAllowed(ownerId);
+    await this.loadCourse(courseId, ownerId);
+    const f = dto.files[0];
+    const pdf = Buffer.from(f.dataBase64, 'base64');
+    if (!/\.pdf$/i.test(f.name) && pdf.subarray(0, 5).toString('latin1') !== '%PDF-') {
+      throw new BadRequestException({ code: 'ADVANCED_ONLY_PDF', message: 'ADVANCED_ONLY_PDF: la lectura avanzada es para PDF (escaneados o difíciles de leer); los Word se leen sin costo.' });
+    }
+    let pages: number;
+    try {
+      pages = (await readPdf(pdf)).pages || 1;
+    } catch (err) {
+      if (err instanceof DocumentReadError) throw new BadRequestException({ code: err.code, message: `${err.code}: ${err.message}` });
+      throw err;
+    }
+    if (pages > ADVANCED_MAX_PAGES) {
+      throw new BadRequestException({ code: 'ADVANCED_TOO_MANY_PAGES', message: `ADVANCED_TOO_MANY_PAGES: el documento tiene ${pages} páginas; la lectura avanzada admite hasta ${ADVANCED_MAX_PAGES}.` });
+    }
+    const estimate = estimateAdvancedExtraction(pages);
+    if (dto.mode === 'estimate') return { available: advancedExtractionEnabled(), ...estimate, providersCalled: 0 };
+    if (!advancedExtractionEnabled()) {
+      throw new ConflictException({ code: 'ADVANCED_DISABLED', message: 'ADVANCED_DISABLED: la lectura avanzada no está activada en este entorno.' });
+    }
+    if (typeof dto.acceptedMaxUsd !== 'number' || dto.acceptedMaxUsd < estimate.estimateUsd.max) {
+      throw new ConflictException({ code: 'ESTIMATE_NOT_ACCEPTED', estimate, message: 'ESTIMATE_NOT_ACCEPTED: acepta el costo estimado antes de leer el documento.' });
+    }
+    const t = await this.transcriber.transcribe({ name: f.name, pdf, model: advancedExtractionModel() });
+    await this.recordAdvancedCharge(courseId, ownerId, pages, t);
+    if (t.truncated) {
+      throw new BadRequestException({ code: 'ADVANCED_TRUNCATED', message: 'ADVANCED_TRUNCATED: el documento es demasiado largo para leerlo completo; divide el PDF y vuelve a intentarlo.' });
+    }
+    if (!t.text || t.text.replace(/\[ilegible\]/g, '').trim().length < 40) {
+      throw new BadRequestException({ code: 'ADVANCED_UNREADABLE', message: 'ADVANCED_UNREADABLE: tampoco la lectura avanzada pudo leer el documento.' });
+    }
+    const base = f.name.replace(/\.pdf$/i, '');
+    const r = await extractAcademicContext([{ name: `${base} (lectura avanzada).md`, data: Buffer.from(t.text, 'utf8') }]);
+    const quality = extractionQuality(r.context);
+    return {
+      draft: r.context, validation: validateAcademicContext(r.context), notes: r.notes, stats: r.stats, saved: false,
+      quality: { ...quality, advancedAvailable: false },
+      advanced: { pages, model: t.model, usage: t.usage, estimateUsd: estimate.estimateUsd },
+    };
+  }
+
+  private async recordAdvancedCharge(courseId: number, ownerId: string, pages: number, t: { model: string; messageId: string; usage: { input_tokens: number; output_tokens: number } }) {
+    if (!this.ledger) {
+      this.logger.error(`Lectura avanzada del curso #${courseId}: sin FinOps, el gasto NO quedó registrado (${t.messageId}).`);
+      return;
+    }
+    try {
+      await this.ledger.recordCharge({
+        ownerIdFromAuth: ownerId,
+        provider: 'anthropic',
+        service: 'messages',
+        modelOrProduct: t.model,
+        operation: ADVANCED_EXTRACTION_OPERATION,
+        usage: { input_tokens: t.usage.input_tokens, output_tokens: t.usage.output_tokens, cache_write_tokens: 0, cache_read_tokens: 0 },
+        usageUnit: 'output_tokens',
+        externalOperationId: t.messageId,
+        idempotency: { kind: 'anthropic', parts: { messageId: t.messageId } },
+        callRole: 'main',
+        attempt: 1,
+        billingAccount: 'cursia',
+        mode: 'real',
+        recordedBy: 'academic-advanced-extraction',
+        pricingFallback: 'pending_zero',
+        metadata: { courseId, pages },
+      } as any);
+    } catch (err) {
+      this.logger.error(`Lectura avanzada del curso #${courseId}: no se pudo registrar el gasto (${t.messageId}): ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 

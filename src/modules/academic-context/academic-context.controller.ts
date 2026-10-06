@@ -3,7 +3,7 @@ import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
 import { AcademicContextService } from './academic-context.service';
-import { ExtractAcademicContextDto } from './dto/extract.dto';
+import { ExtractAcademicContextDto, ExtractAdvancedDto } from './dto/extract.dto';
 
 /**
  * Fase 3 — Contexto académico (controller V2: listado en features/dynamic-routes.ts, 404 con la estructura dinámica
@@ -20,6 +20,14 @@ export class AcademicContextController {
   @HttpCode(200)
   extract(@Param('courseId', ParseIntPipe) courseId: number, @Body() dto: ExtractAcademicContextDto, @CurrentUser() user: AuthUser) {
     return this.service.extract(courseId, user.id, dto);
+  }
+
+  // POST /api/v1/courses/:courseId/academic-context/extract-advanced  body { files: [PDF], mode, acceptedMaxUsd? }
+  // LOOP 8.1: lectura avanzada (estimar sin costo → leer con IA tras aceptar el costo). NO guarda nada.
+  @Post('extract-advanced')
+  @HttpCode(200)
+  extractAdvanced(@Param('courseId', ParseIntPipe) courseId: number, @Body() dto: ExtractAdvancedDto, @CurrentUser() user: AuthUser) {
+    return this.service.extractAdvanced(courseId, user.id, dto);
   }
 
   // GET /api/v1/courses/:courseId/academic-context/design → sugerencias al perfil, estructura propuesta y vínculos.

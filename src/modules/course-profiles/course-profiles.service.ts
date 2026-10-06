@@ -1,4 +1,7 @@
 import { returningRows } from '../../common/db/returning-rows';
+import { PEDAGOGY_DERIVATION_KEY, derivedSubsetSha, parsePedagogyDerivation, pedagogyDerivedUntouched } from '../course-facts/course-facts';
+import { suggestProfileFromContext } from '../academic-context/context-design';
+import type { PedagogicalProfile } from '../pedagogy/pedagogy-profile';
 import { advanceStructureOriginIfUntouched } from '../course-structure/structure-authority';
 import {
   BadRequestException,
@@ -29,6 +32,13 @@ import { emptyPedagogicalProfile } from '../pedagogy/pedagogy-profile';
 import { AcademicContextV1, emptyAcademicContext } from '../academic-context/academic-context';
 import { AcademicValidation, validateAcademicContext } from '../academic-context/validate';
 
+export interface PedagogyDerivationResult {
+  applied: boolean;
+  reason: 'derived' | 'no_changes' | 'pedagogy_edited' | 'invalid';
+  version?: number;
+  changes?: string[];
+}
+
 export interface CourseProfileDto {
   courseId: number;
   kind: ProfileKind;
@@ -51,6 +61,8 @@ export interface CourseProfileDto {
    * es aula-clara/light. `null` en un perfil guardado o de evaluación.
    */
   defaultSource: PresentationDefaultSource | null;
+  /** LOOP 8.1 — solo `pedagogy`: de qué versión del contexto salieron estudiante/resultados/horas y si siguen intactos. */
+  derivedFromAcademic?: { academicVersion: number; untouched: boolean };
   /**
    * Motor pedagógico V1 — solo `pedagogy`: reglas de diseño derivadas del perfil (recalculadas en
    * cada lectura con el motor vigente; null si el perfil está vacío). `rulesStale` = la versión
@@ -188,7 +200,16 @@ export class CourseProfilesService {
         createdAt: null, createdBy: null, warnings: [], defaultSource: null,
       };
     }
-    return this.toDto(row, finalExam);
+    const dto = this.toDto(row, finalExam);
+    if (kind === 'pedagogy') {
+      // LOOP 8.1: ¿los campos del documento (estudiante, resultados, horas) siguen como Cursia los derivó?
+      const [c] = await this.dataSource.query(`select metadata -> 'pedagogyDerivation' as d from public.courses where id = $1`, [courseId]);
+      const record = parsePedagogyDerivation(c ? (typeof c.d === 'string' ? JSON.parse(c.d) : c.d) : null);
+      if (record) {
+        return { ...dto, derivedFromAcademic: { academicVersion: record.academicVersion, untouched: pedagogyDerivedUntouched(dto.profile as PedagogicalProfile, record) } };
+      }
+    }
+    return dto;
   }
 
   async append(
@@ -197,7 +218,7 @@ export class CourseProfilesService {
     kind: string,
     data: unknown,
     expectedVersion?: number,
-  ): Promise<{ created: boolean; profile: CourseProfileDto; prunedOutcomeLinks?: { chapterId: string; removed: string[] }[] }> {
+  ): Promise<{ created: boolean; profile: CourseProfileDto; prunedOutcomeLinks?: { chapterId: string; removed: string[] }[]; derivedPedagogy?: PedagogyDerivationResult }> {
     assertDynamicOwnerAllowed(ownerId); // allow-list V2 en toda escritura
     this.assertKind(kind);
     await this.loadCourse(courseId, ownerId);
@@ -257,8 +278,18 @@ export class CourseProfilesService {
       // roto (y el lock fallaría). En la MISMA transacción se quitan de los capítulos los ids que la versión nueva no
       // define; si cambió alguno, sube el counter de la estructura (las pestañas abiertas releen).
       const pruned = kind === 'academic' ? await this.pruneStaleOutcomeLinks(qr, courseId, profile as AcademicContextV1) : [];
+      // LOOP 8.1: el documento es dueño del estudiante, los resultados y las horas del perfil pedagógico. Se derivan
+      // EN LA MISMA transacción (sin botón «Usar en el perfil»), salvo que el docente los haya cambiado a mano.
+      const derivedPedagogy = kind === 'academic'
+        ? await this.derivePedagogyFromAcademic(qr, courseId, ownerId, profile as AcademicContextV1, currentVersion + 1, finalExam)
+        : undefined;
       await qr.commitTransaction();
-      return { created: true, profile: this.toDto(row, finalExam), ...(pruned.length ? { prunedOutcomeLinks: pruned } : {}) };
+      return {
+        created: true,
+        profile: this.toDto(row, finalExam),
+        ...(pruned.length ? { prunedOutcomeLinks: pruned } : {}),
+        ...(derivedPedagogy ? { derivedPedagogy } : {}),
+      };
     } catch (err) {
       if (qr.isTransactionActive) await qr.rollbackTransaction();
       if (isVersionConflict(err)) {
@@ -274,6 +305,49 @@ export class CourseProfilesService {
     } finally {
       await qr.release();
     }
+  }
+
+  /**
+   * LOOP 8.1 · Perfil pedagógico derivado del contexto académico (antes: botón «Usar en el perfil»). Conserva enfoque,
+   * preferencias y todo lo que no viene del documento. Solo reescribe los campos del documento si siguen como Cursia
+   * los dejó (o vacíos); si el docente los cambió a mano, no se tocan y «Lo que sabemos del curso» informa el conflicto.
+   */
+  private async derivePedagogyFromAcademic(
+    qr: QueryRunner,
+    courseId: number,
+    ownerId: string,
+    ctx: AcademicContextV1,
+    academicVersion: number,
+    finalExam: boolean,
+  ): Promise<PedagogyDerivationResult> {
+    const [latest] = await qr.query(
+      `select * from public.course_profiles where course_id = $1 and kind = 'pedagogy' order by version desc limit 1`,
+      [courseId],
+    );
+    const current = latest ? (normalizeProfile('pedagogy', typeof latest.data === 'string' ? JSON.parse(latest.data) : latest.data) as PedagogicalProfile) : null;
+    const [c] = await qr.query(`select metadata -> 'pedagogyDerivation' as d from public.courses where id = $1`, [courseId]);
+    const record = parsePedagogyDerivation(c ? (typeof c.d === 'string' ? JSON.parse(c.d) : c.d) : null);
+    if (!pedagogyDerivedUntouched(current, record)) return { applied: false, reason: 'pedagogy_edited' };
+    const suggestion = suggestProfileFromContext(ctx, current);
+    const writeRecord = (p: PedagogicalProfile | null) =>
+      qr.query(
+        `update public.courses set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), $2::text[], $3::jsonb, true) where id = $1`,
+        [courseId, [PEDAGOGY_DERIVATION_KEY], JSON.stringify({ academicVersion, subsetSha: derivedSubsetSha(p) })],
+      );
+    if (!suggestion.changes.length) {
+      await writeRecord(current);
+      return { applied: false, reason: 'no_changes' };
+    }
+    if (validateProfile('pedagogy', suggestion.profile, { finalExam }).length) return { applied: false, reason: 'invalid' };
+    const next = normalizeProfile('pedagogy', suggestion.profile) as PedagogicalProfile;
+    const version = latest ? Number(latest.version) + 1 : 1;
+    await qr.query(
+      `insert into public.course_profiles (course_id, kind, version, data, sha256, created_by)
+       values ($1, 'pedagogy', $2, $3::jsonb, $4, $5)`,
+      [courseId, version, JSON.stringify({ ...next, designRules: pedagogyRulesRecord(next) }), profileSha256(next), ownerId],
+    );
+    await writeRecord(next);
+    return { applied: true, reason: 'derived', version, changes: suggestion.changes.map((x) => x.path) };
   }
 
   /** Fase 3 (I1): quita de course_chapters.outcome_ids los ids que el contexto `ctx` no define. */

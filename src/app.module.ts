@@ -29,6 +29,7 @@ import { InvalidationModule } from './modules/invalidation/invalidation.module';
 import { CourseProfilesModule } from './modules/course-profiles/course-profiles.module';
 import { PedagogyModule } from './modules/pedagogy/pedagogy.module';
 import { AcademicContextModule } from './modules/academic-context/academic-context.module';
+import { CourseFactsModule } from './modules/course-facts/course-facts.module';
 import { FinopsModule } from './modules/finops/finops.module';
 
 @Module({
@@ -63,6 +64,7 @@ import { FinopsModule } from './modules/finops/finops.module';
     InvalidationModule,
     CourseProfilesModule, // V2.1 (R3): perfiles de curso (presentation / assessment / pedagogy / academic)
     PedagogyModule, // Motor pedagógico V1: catálogo, «No estoy seguro», dry-run (sin escrituras ni proveedores)
+    CourseFactsModule, // LOOP 8.1: pedido del curso + «Lo que sabemos del curso» (fuente única)
     AcademicContextModule, // Fase 3: contexto académico (extracción determinista + diseño desde el contexto; sin proveedores)
     FinopsModule,
   ],

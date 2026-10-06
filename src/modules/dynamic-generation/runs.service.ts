@@ -1,3 +1,5 @@
+import { loadCourseFacts } from '../course-facts/course-facts-db';
+import { alignCourseContextWithFacts } from '../course-facts/course-facts';
 import {
   BadRequestException,
   ConflictException,
@@ -844,7 +846,7 @@ export class RunsService {
     if (isFromRunRequest(courseContext)) {
       return this.startRunFromPrevious(courseId, ownerId, blueprintNumber, manifest, courseContext.fromRun);
     }
-    const context = normalizeCourseContext(courseContext);
+    const context = await this.contextAlignedWithFacts(courseId, manifest.id, courseContext);
     this.assertRequiredContext(context);
     const contextHash = canonicalContextHash(context);
     const videoMode = this.normalizeVideoMode((courseContext as any)?.videoMode);
@@ -867,6 +869,27 @@ export class RunsService {
     const other = await this.findActiveRunOnOtherManifest(this.dataSource, courseId, manifest.id);
     if (other) throw this.otherActiveRunConflict(other, manifest);
     return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, true, videoDelivery, providerModes, opts);
+  }
+
+  /**
+   * LOOP 8.1 · El contexto que se congela en un run NUEVO se alinea con «Lo que sabemos del curso»: el nivel del
+   * documento y los conocimientos previos que el docente fijó en el perfil prevalecen sobre la pantalla Datos (los
+   * prompts nunca reciben dos estudiantes distintos). Sin documento ni perfil → el contexto de siempre (mismo hash).
+   * La regeneración parcial (`fromRun`) no pasa por acá: reutiliza el contexto congelado del run anterior.
+   */
+  private async contextAlignedWithFacts(courseId: number, manifestId: number, courseContext: unknown): Promise<Record<string, any>> {
+    const context = normalizeCourseContext(courseContext);
+    const facts = await loadCourseFacts(this.dataSource, courseId);
+    const aligned = alignCourseContextWithFacts(context, facts);
+    if (!aligned.changed.length) return context;
+    // Compatibilidad: un run de este Manifest congelado ANTES de alinear (p. ej. anterior a LOOP 8.1) se retoma con su
+    // mismo contexto; alinearlo ahora daría otro hash y bloquearía reanudarlo (409 «otro contexto»).
+    const latest = await this.findLatestRunRow(manifestId);
+    if (latest) {
+      const prev = await this.loadContextRow(latest.id).catch(() => null);
+      if (prev && prev.context_hash === canonicalContextHash(context)) return context;
+    }
+    return normalizeCourseContext(aligned.context);
   }
 
   // ── Flujo NORMAL de aprobación desde la UI (separado de la calibración) ──
@@ -892,7 +915,7 @@ export class RunsService {
     assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
     await assertAssessmentProfileResolvableForRun(this.dataSource, courseId, manifest);
-    const context = normalizeCourseContext(courseContext);
+    const context = await this.contextAlignedWithFacts(courseId, manifest.id, courseContext);
     this.assertRequiredContext(context);
     const contextHash = canonicalContextHash(context);
     const videoMode = this.normalizeVideoMode((courseContext as any)?.videoMode);

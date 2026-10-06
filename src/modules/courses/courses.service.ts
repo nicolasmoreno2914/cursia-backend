@@ -1,4 +1,5 @@
 import { STRUCTURE_ORIGIN_KEY } from '../course-structure/structure-authority';
+import { BRIEF_KEY, PEDAGOGY_DERIVATION_KEY } from '../course-facts/course-facts';
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -8,6 +9,9 @@ import { UpdateCourseDto } from './dto/update-course.dto';
 import { AdminDashboardService } from '../../admin/services/admin-dashboard.service';
 import { assertDynamicCreationAllowed, assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import { readActivityTypeRulesConfig } from '../generation-manifests/manifest-rules-config';
+
+/** LOOP 8.0/8.1: claves de courses.metadata que solo escriben sus servicios. */
+const PROTECTED_METADATA_KEYS = [STRUCTURE_ORIGIN_KEY, BRIEF_KEY, PEDAGOGY_DERIVATION_KEY];
 
 /**
  * EV6 H5P v2 (H2 fix round 1, I-2): «Repaso» (Dialog Cards) arranca ENCENDIDO solo en cursos
@@ -199,13 +203,15 @@ export class CoursesService {
   ): Promise<Course> {
     // findOne ya valida ownership → 404 si no es del usuario
     const course = await this.findOne(id, ownerId);
-    // LOOP 8.0 (review L80 M1): el origen de la estructura (metadata.structureOrigin) lo escribe solo el backend de la
-    // estructura; un PATCH del curso nunca lo cambia ni lo borra.
+    // LOOP 8.0 (review L80 M1) + LOOP 8.1: las claves de la fuente única (origen de la estructura, pedido del curso,
+    // derivación del perfil) las escriben solo sus servicios; un PATCH del curso nunca las cambia ni las borra.
     if (dto.metadata !== undefined) {
-      const keep = course.metadata ? course.metadata[STRUCTURE_ORIGIN_KEY] : undefined;
       const next: Record<string, any> = { ...(dto.metadata || {}) };
-      delete next[STRUCTURE_ORIGIN_KEY];
-      if (keep !== undefined) next[STRUCTURE_ORIGIN_KEY] = keep;
+      for (const key of PROTECTED_METADATA_KEYS) {
+        const keep = course.metadata ? course.metadata[key] : undefined;
+        delete next[key];
+        if (keep !== undefined) next[key] = keep;
+      }
       dto = { ...dto, metadata: next };
     }
     Object.assign(course, dto);
