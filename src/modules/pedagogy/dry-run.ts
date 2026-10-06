@@ -1,4 +1,4 @@
-import { AlignmentReport, AlignmentUnavailable, buildAlignmentReport } from '../coherence/alignment';
+import { ALIGNMENT_RULESET, ALIGNMENT_VERSION, AlignmentReport, AlignmentUnavailable, buildAlignmentReport } from '../coherence/alignment';
 import {
   ActivityEngine,
   BlueprintSnapshotV2,
@@ -178,7 +178,7 @@ export interface DryRunResult {
    * Fase 4 · Coherence Engine (capa A): alineación resultado → evidencia del diseño que se ve (con diseño pedagógico si
    * hay perfil). La clave existe SOLO si el Blueprint trae contexto académico (los dry-runs de siempre no cambian).
    */
-  alignment?: AlignmentReport;
+  alignment?: AlignmentReport | AlignmentUnavailable;
   baseline: DryRunSide;
   pedagogical: DryRunSide | null;
   structureChanges: StructureChange[];
@@ -335,17 +335,22 @@ export interface DistributionMaterialized {
   /** Horas del Manifest materializado (deben ser las `generableHours` del distribuidor); null si falló. */
   generableHours: number | null;
   /** Fase 4: alineación del diseño PROPUESTO (solo con contexto académico). */
-  alignment?: AlignmentReport;
+  alignment?: AlignmentReport | AlignmentUnavailable;
 }
 
 /** Fase 4: reporte de alineación de un lado del dry-run (undefined sin contexto académico). */
-function alignmentOf(s: DryRunSide, extras: DryRunInput['alignment'], registry: PedagogicalApproachRegistry): AlignmentReport | undefined {
+function alignmentOf(s: DryRunSide, extras: DryRunInput['alignment'], registry: PedagogicalApproachRegistry): AlignmentReport | AlignmentUnavailable | undefined {
   if (!s.blueprint.course.academicContext) return undefined;
-  const r: AlignmentReport | AlignmentUnavailable = buildAlignmentReport({
-    snapshot: s.blueprint, manifest: s.manifest, studyTime: s.studyTime, blueprintSha256: s.blueprintSha256,
-    priorKnowledgeDeclared: extras?.priorKnowledgeDeclared ?? null, registry,
-  });
-  return r.available ? r : undefined;
+  // Review F4 M4: un fallo de la alineación nunca rompe el dry-run ni se disfraza de «propuesta no materializable».
+  try {
+    const r: AlignmentReport | AlignmentUnavailable = buildAlignmentReport({
+      snapshot: s.blueprint, manifest: s.manifest, studyTime: s.studyTime, blueprintSha256: s.blueprintSha256,
+      priorKnowledgeDeclared: extras?.priorKnowledgeDeclared ?? null, registry,
+    });
+    return r.available ? r : undefined;
+  } catch {
+    return { alignmentVersion: ALIGNMENT_VERSION, ruleset: ALIGNMENT_RULESET, available: false, reason: 'ALIGNMENT_FAILED' };
+  }
 }
 
 /**

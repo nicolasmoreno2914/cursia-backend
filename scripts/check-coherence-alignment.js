@@ -5,7 +5,8 @@
 //   AL1  mapa: cada resultado lista evidencias TIPADAS (instrucción / práctica / aplicación / evaluación) con su item del
 //        Manifest y sus minutos; la práctica sin vínculos integra los resultados de su módulo
 //   AL2  caso correcto: todo cubierto → 0 críticos, 0 advertencias; estados «covered»
-//   AL3  caso incompleto: resultado sin capítulos → A1 crítico; capítulo sin resultado → A4; sin práctica → A3
+//   AL3  caso incompleto: resultado sin capítulos → A1 crítico (competencia: A1c advertencia); capítulo sin resultado → A4;
+//        sin práctica → A3 (también si solo hay preguntas del video)
 //   AL4  caso desalineado: resultado de saber hacer con evaluación solo conceptual → A5 (y desaparece con una Actividad de
 //        Aplicación); tiempo de práctica insuficiente para un resultado complejo → A6
 //   AL5  caso pedagógico: el MISMO curso con competencias vs significativo cambia severidades y umbrales (dimensiones del
@@ -83,7 +84,7 @@ const align = (snap, ctx, approach, extras) => P.runPedagogyDryRun({ structure: 
     const snap = course(ctx, { links: linksAll, app: appAll });
     const r = align(snap, ctx, 'competencias');
     const ra2 = r.outcomes.find((o) => o.id === 'RA2');
-    eq([...new Set(ra2.evidence.map((e) => e.kind))].sort(), ['application', 'assessment', 'instruction', 'practice'], 'tipos de evidencia');
+    eq([...new Set(ra2.evidence.map((e) => e.kind))].sort(), ['application', 'assessment', 'check', 'instruction', 'practice'], 'tipos de evidencia (las preguntas del video son «check»)');
     assert(ra2.evidence.every((e) => /^(content|experience|activity|video_interactions|application_activity|exam|final_exam):/.test(e.itemKey)), 'cada evidencia apunta a un item del Manifest');
     const exam = ra2.evidence.find((e) => e.type === 'exam');
     eq([exam.style, exam.moduleId], ['situational_cases', snap.modules[1].id], 'evaluación del módulo con el estilo del diseño');
@@ -120,6 +121,18 @@ const align = (snap, ctx, approach, extras) => P.runPedagogyDryRun({ structure: 
     assert(r.findings.some((f) => f.rule === 'A4' && f.severity === 'warning' && /no está claramente asociado a ningún resultado/.test(f.message)), 'A4');
     assert(r.findings.some((f) => f.rule === 'A3' && f.message === 'El resultado RA3 no tiene suficiente evidencia práctica.'), 'mensaje A3');
     eq(r.outcomes.find((o) => o.id === 'RA4').status, 'uncovered', 'RA4 sin cobertura');
+    // Review F4 I1: actividades apagadas con videos ENCENDIDOS — las preguntas de comprensión del video no son práctica.
+    const soloVideo = align(course(ctx, { links: linksAll, activity: () => false }), ctx, 'competencias');
+    const a3 = soloVideo.findings.filter((f) => f.rule === 'A3').map((f) => f.outcomeIds[0]);
+    for (const id of ['RA2', 'RA3', 'RA4']) assert(a3.includes(id), `A3 con solo video para ${id}: ${rules(soloVideo).join(', ')}`);
+    assert(soloVideo.findings.some((f) => f.rule === 'A3' && /solo preguntas de comprensión en el video/.test(f.message)), 'el mensaje dice que solo hay preguntas del video');
+    assert(!a3.includes('RA1'), 'RA1 (saber) se cubre con instrucción y comprensión');
+    eq(soloVideo.outcomes.find((o) => o.id === 'RA2').status, 'partial', 'RA2 ya no figura «Cubierto»');
+    // Review F4 I2: competencias sin capítulos (el flujo de Cursia no las vincula) → advertencia transversal, no crítico.
+    const sinCo = align(course(ctx, { app: appAll }), ctx, 'competencias');
+    const co = sinCo.findings.filter((f) => /^CO/.test(f.outcomeIds[0] || ''));
+    eq(co.filter((f) => f.rule.startsWith('A1')).map((f) => `${f.severity}:${f.rule}:${f.outcomeIds[0]}`), ['warning:A1c:CO1', 'warning:A1c:CO2'], 'competencias sin vínculos');
+    assert(!sinCo.findings.some((f) => f.rule === 'A1' && /^CO/.test(f.outcomeIds[0])), 'nunca A1 crítico para una competencia');
   });
 
   await check('AL4 caso desalineado: saber hacer con evaluación solo conceptual → A5; tiempo insuficiente → A6', () => {
