@@ -4079,7 +4079,7 @@ export class RunsService {
     const actions: Record<string, string> = {};
     for (const x of planned) actions[x.itemKey] = x.action;
     const items = planned.map((x) => byKey.get(x.itemKey)).filter(Boolean) as RunManifestItem[];
-    const est = await this.finopsBudget.estimate(estimateItemsForRun(items, mode, actions));
+    const est = await this.finopsBudget.estimate(estimateItemsForRun(items, mode, actions, { coverageItems: manifest.manifest.items }));
     const sourceIds = planned.filter((x) => x.action === 'STALE_NO_AUTO' && x.itemRunId).map((x) => x.itemRunId as string);
     const hist = await this.finopsBudget.historicalByItemRun(sourceIds);
     const computable = planned.filter(
@@ -4165,7 +4165,7 @@ export class RunsService {
     let estimate: EstimateResult;
     try {
       const chapterWords = await this.audiobookChapterWords(a.job.id, items);
-      estimate = await this.finopsBudget.estimate(estimateItemsForRun(items, 'real', actions, { chapterWords }));
+      estimate = await this.finopsBudget.estimate(estimateItemsForRun(items, 'real', actions, { chapterWords, coverageItems: a.manifest.manifest.items }));
     } catch (err) {
       throw this.finopsUnavailable(err);
     }
@@ -4233,7 +4233,7 @@ export class RunsService {
     let estimate: EstimateResult;
     try {
       const chapterWords = await this.audiobookChapterWords(job.id, items);
-      estimate = await this.finopsBudget.estimate(estimateItemsForRun(items, mode, actions, { chapterWords }));
+      estimate = await this.finopsBudget.estimate(estimateItemsForRun(items, mode, actions, { chapterWords, coverageItems: manifest.manifest.items }));
     } catch (err) {
       throw this.finopsUnavailable(err);
     }

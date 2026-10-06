@@ -47,6 +47,7 @@ async function check(name, fn) {
 const assert = (c, m) => { if (!c) throw new Error(m); };
 const eq = (a, b, m) => { const A1 = JSON.stringify(a); const B1 = JSON.stringify(b); if (A1 !== B1) throw new Error(`${m}: esperado ${B1}, encontrado ${A1}`); };
 const clone = (o) => JSON.parse(JSON.stringify(o));
+const near = (a, b, t, m) => { if (!(Math.abs(a - b) <= t)) throw new Error(`${m}: esperado ${b} ± ${t}, encontrado ${a}`); };
 
 let n = 0;
 const uuid = () => `00000000-0000-4000-8000-${String(++n).padStart(12, '0')}`;
@@ -207,6 +208,24 @@ const impactOf = (from, to) => {
     eq(imp.estimatedChangeCostUsd, Number(imp.cost.toRun.estimateUsd.expected).toFixed(2), 'el total es el costo de lo que se ejecutaría');
     const textOnly = Number(DR.providerPlanFor({ ...to.manifest, items: to.manifest.items.filter((i) => imp.toRun.includes(i.key)) }).estimateUsd.expected);
     assert(Number(imp.estimatedChangeCostUsd) > textOnly, 'incluye los pagados nuevos');
+  });
+
+  await check('CI9 LOOP 7 (A3 I1): un examen estimado solo cuesta lo mismo que dentro del curso (cubre todos sus capítulos)', () => {
+    const M = from.manifest;
+    const usd = (plan) => Number(plan.estimateUsd.expected);
+    const fe = M.items.filter((i) => i.type === 'final_exam');
+    const ex = M.items.filter((i) => i.type === 'exam' && i.moduleId === modules[0].id);
+    const only = (xs, cov) => DR.providerPlanFor({ ...M, items: xs }, cov ? { coverageItems: M.items } : undefined);
+    // Sin cobertura (el bug): el banco se escalaba con 0 capítulos del subconjunto.
+    assert(usd(only(fe, true)) > usd(only(fe, false)) && usd(only(ex, true)) > usd(only(ex, false)), 'con cobertura cuesta más que sin ella');
+    // Aditividad: examen + resto = curso completo.
+    const rest = M.items.filter((i) => i.type !== 'final_exam');
+    near(usd(only(fe, true)) + usd(only(rest, true)), usd(DR.providerPlanFor(M)), 0.02, 'final + resto = curso completo');
+    // El impacto de editar UN capítulo incluye su examen y el final con su costo real.
+    const chs = chapters.map((c, i) => (i === 2 ? { ...c, title: 'Clasificación de los costos por comportamiento' } : c));
+    const imp = impactOf(from, sideOf(designed(modules, chs, 'competencias', 64)));
+    const withExams = DR.providerPlanFor({ ...M, items: M.items.filter((i) => imp.toRun.includes(i.key)) }, { coverageItems: M.items });
+    near(Number(imp.estimatedChangeCostUsd), usd(withExams), 0.01, 'costo de los cambios con exámenes a escala real');
   });
 
   // --export <dir>: respuestas REALES de la vista previa para el harness del frontend (test-53).

@@ -124,7 +124,8 @@ export function summarizeChangeImpact(input: {
     else if (a.action === 'SOFT_DISABLE') ch.disable.push(a.itemKey);
   }
   const chapters = [...byChapter.values()];
-  const toRunPlan = providerPlanFor({ ...to.manifest, items: itemsOf(to.manifest, [...toRun, ...paidNew, ...paidRetry]) });
+  const coverage = { coverageItems: to.manifest.items };
+  const toRunPlan = providerPlanFor({ ...to.manifest, items: itemsOf(to.manifest, [...toRun, ...paidNew, ...paidRetry]) }, coverage);
   const hFrom = input.from?.studyTime?.courseEstimatedHours ?? null;
   const hTo = to.studyTime?.courseEstimatedHours ?? null;
   return {
@@ -141,7 +142,7 @@ export function summarizeChangeImpact(input: {
     untouchedChapters: chapters.filter((c) => c.untouched).length,
     cost: {
       toRun: toRunPlan,
-      paidStaleIfRegenerated: providerPlanFor({ ...to.manifest, items: itemsOf(to.manifest, paidStale) }),
+      paidStaleIfRegenerated: providerPlanFor({ ...to.manifest, items: itemsOf(to.manifest, paidStale) }, coverage),
     },
     estimatedChangeCostUsd: toRunPlan.estimateUsd ? Number(toRunPlan.estimateUsd.expected).toFixed(2) : null,
     hours: hFrom !== null && hTo !== null ? { from: hFrom, to: hTo, delta: Math.round((hTo - hFrom) * 10) / 10 } : null,

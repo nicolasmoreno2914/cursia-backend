@@ -455,7 +455,7 @@ function seedCatalog(): any[] {
 }
 
 /** Proveedores y operaciones que dispararía el Manifest + estimación con el seed de precios (sin DB, sin red). */
-export function providerPlanFor(manifest: GenerationManifestV1): ProviderPlan {
+export function providerPlanFor(manifest: GenerationManifestV1, opts?: { coverageItems?: GenerationManifestV1['items'] }): ProviderPlan {
   const byProvider: ProviderPlan['byProvider'] = {};
   for (const it of manifest.items) {
     if (!isFinopsItemType(it.type)) continue;
@@ -475,7 +475,7 @@ export function providerPlanFor(manifest: GenerationManifestV1): ProviderPlan {
   let estimateUsd: ProviderPlan['estimateUsd'] = null;
   let estimateNote = 'Estimación con los precios del seed versionado (pricing-seed.v1) y el modelo de uso v1. Nada se ejecuta ni se cobra en el dry-run.';
   try {
-    const items = estimateItemsForRun(manifest.items, 'real');
+    const items = estimateItemsForRun(manifest.items, 'real', null, opts?.coverageItems ? { coverageItems: opts.coverageItems } : null);
     const est = estimateCost({ items, catalog: seedCatalog(), usageModel: usageModelPriorsV1(), retryPolicy: { maxRetries: 1 } });
     const byP: Record<string, string> = {};
     for (const k of Object.keys(est.totals.byProvider).sort()) byP[k] = est.totals.byProvider[k].expected;
