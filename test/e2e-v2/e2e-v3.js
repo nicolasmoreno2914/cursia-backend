@@ -253,6 +253,12 @@ async function waitItemsDone(runId, timeoutMs = 10 * 60 * 1000) {
 }
 
 /** Crea el curso por HTTP (estructura, toggles v3, perfiles), bloquea el Blueprint y crea el Manifest v3. */
+/** LOOP 8.1: versión vigente del perfil pedagógico (guardar el contexto académico lo deriva y sube la versión). */
+async function pedagogyVersion(courseId) {
+  const r = await api('GET', `/courses/${courseId}/profiles/pedagogy`);
+  return r.status === 200 && r.data ? Number(r.data.version) : 0;
+}
+
 async function createCourse(C, llm) {
   const fc = crypto.randomUUID();
   const c = await api('POST', '/courses/dynamic', { frontendCourseId: fc, title: C.title });
@@ -322,7 +328,8 @@ async function createCourse(C, llm) {
   ok(pp.status === 201, `${C.key}: POST profiles/presentation (${C.theme.themeFamily}/${C.theme.mode}) → 201`, { s: pp.status, e: pp.error });
   // Motor pedagógico V1 (E6): perfil pedagógico ANTES del lock (el lock lo congela en el Blueprint).
   if (C.pedagogy) {
-    const pg = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: C.pedagogy, expectedVersion: 0 });
+    // LOOP 8.1: con contexto académico guardado, el perfil ya se derivó (versión 1): se guarda sobre la vigente, como el panel.
+    const pg = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: C.pedagogy, expectedVersion: await pedagogyVersion(courseId) });
     ok(pg.status === 201 && pg.data.profile.designRules && pg.data.profile.designRules.engineVersion === 1, `${C.key}: POST profiles/pedagogy (${C.pedagogy.primaryApproach}) → 201 con reglas del servidor`, { s: pg.status, e: pg.error });
   }
   const lock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st.structureVersionCounter });
@@ -1292,7 +1299,10 @@ function reservationBookkeeping(ev) {
       eq([prop.counts.modules, prop.counts.chapters, prop.counts.outcomesCovered], [5, 18, 6], 'E8: estructura propuesta 5 × 18 con los 6 RA vinculados');
       // 4. Perfil pedagógico desde el contexto (+ el enfoque que elige el docente)
       const profile = { ...sug.profile, primaryApproach: 'problemas', secondaryApproaches: [] };
-      const pg = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: profile, expectedVersion: 0 });
+      // LOOP 8.1: guardar el contexto ya derivó el perfil (64 h y resultados); el docente elige el enfoque sobre la versión vigente.
+      const pv = await api('GET', `/courses/${courseId}/profiles/pedagogy`);
+      ok(pv.status === 200 && pv.data.version === 1 && pv.data.profile.targetHours === 64 && pv.data.derivedFromAcademic && pv.data.derivedFromAcademic.untouched === true, 'E8: guardar el contexto derivó el perfil (64 h y resultados del documento)', { s: pv.status, v: pv.data && pv.data.version });
+      const pg = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: profile, expectedVersion: pv.data.version });
       ok(pg.status === 201 && pg.data.profile.profile.targetHours === 64, 'E8: perfil pedagógico guardado con las 64 h y los resultados del documento', { s: pg.status, e: pg.error });
       // 5. Estructura desde el microcurrículo (lo que hace el panel con la vía de 48), con descripción y vínculos
       st = await readStructure(courseId);
@@ -1580,7 +1590,7 @@ function reservationBookkeeping(ev) {
 
       // 3. Enfoque (el docente lo elige sobre la sugerencia del contexto) + 64 h.
       const profile1 = { ...dz.profileSuggestion.profile, primaryApproach: 'competencias', secondaryApproaches: [], targetHours: 64 };
-      const pg1 = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: profile1, expectedVersion: 0 });
+      const pg1 = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: profile1, expectedVersion: await pedagogyVersion(courseId) });
       ok(pg1.status === 201, 'E11: enfoque competencias + 64 h guardados', { s: pg1.status, e: pg1.error });
 
       // 4. «Cursia recomienda»: cada número sale del diseño materializado (Manifest), nunca de otra cuenta.
@@ -1601,7 +1611,7 @@ function reservationBookkeeping(ev) {
 
       // 5. Ajustar (énfasis en profundidad) → nuevo diseño, distinto, con la misma garantía.
       const profile2 = { ...profile1, designPreferences: { emphasis: 'depth' } };
-      const pg2 = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: profile2, expectedVersion: 1 });
+      const pg2 = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: profile2, expectedVersion: pg1.data.profile.version });
       ok(pg2.status === 201, 'E11: «Ajustar» guardado (énfasis profundidad)', { s: pg2.status, e: pg2.error });
       const dr2 = await api('POST', `/courses/${courseId}/pedagogy/dry-run`, {});
       const d2 = card(dr2.data);

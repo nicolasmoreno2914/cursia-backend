@@ -68,52 +68,117 @@ export function priorKnowledgeFromBrief(nivel: string | undefined): 'none' | 'in
   return null;
 }
 
-// ── Derivación del perfil pedagógico desde el documento (sin botón) ───────────────────────────────────────
+// ── Derivación del perfil pedagógico desde el documento (sin botón), POR CAMPO ───────────────────────────
+//
+// Review L81 I1: cada campo tiene su dueño. Un campo es «del documento» si está vacío o sigue con el valor que Cursia
+// escribió la última vez (huella por campo en courses.metadata.pedagogyDerivation); si el docente lo cambió (o lo
+// escribió antes de subir el documento, p. ej. las horas), es «del usuario» y se respeta. Un valor igual al que
+// propone el documento cuenta como del documento (cursos anteriores a 8.1 que usaron «Usar en el perfil»).
 
 export const PEDAGOGY_DERIVATION_KEY = 'pedagogyDerivation';
-/** Campos del perfil pedagógico cuyo dueño es el documento (los que escribe suggestProfileFromContext). */
-export function derivedSubset(p: PedagogicalProfile | null): Record<string, unknown> {
+export const DERIVED_FIELDS = ['description', 'educationLevel', 'know', 'do', 'competencies', 'targetHours', 'assessmentMethods'] as const;
+export type DerivedField = (typeof DERIVED_FIELDS)[number];
+export type FieldOwner = 'document' | 'user' | 'empty';
+
+export function derivedFieldValue(p: PedagogicalProfile | null, f: DerivedField): unknown {
   const x = p || ({} as PedagogicalProfile);
-  return {
-    description: x.learner ? x.learner.description ?? null : null,
-    educationLevel: x.learner ? x.learner.educationLevel ?? null : null,
-    know: x.learningOutcomes ? x.learningOutcomes.know || [] : [],
-    do: x.learningOutcomes ? x.learningOutcomes.do || [] : [],
-    competencies: x.learningOutcomes ? x.learningOutcomes.competencies || [] : [],
-    targetHours: typeof x.targetHours === 'number' ? x.targetHours : null,
-    assessmentMethods: x.assessmentMethods || [],
-  };
+  switch (f) {
+    case 'description': return x.learner ? x.learner.description ?? null : null;
+    case 'educationLevel': return x.learner ? x.learner.educationLevel ?? null : null;
+    case 'know': return x.learningOutcomes ? x.learningOutcomes.know || [] : [];
+    case 'do': return x.learningOutcomes ? x.learningOutcomes.do || [] : [];
+    case 'competencies': return x.learningOutcomes ? x.learningOutcomes.competencies || [] : [];
+    case 'targetHours': return typeof x.targetHours === 'number' ? x.targetHours : null;
+    case 'assessmentMethods': return x.assessmentMethods || [];
+  }
 }
-export function derivedSubsetSha(p: PedagogicalProfile | null): string {
-  return createHash('sha256').update(JSON.stringify(derivedSubset(p))).digest('hex');
+/** Copia el valor del campo de `from` a `into` (perfiles completos, normalizados). */
+export function setDerivedField(into: PedagogicalProfile, from: PedagogicalProfile, f: DerivedField): void {
+  switch (f) {
+    case 'description': into.learner = { ...into.learner, description: from.learner.description }; break;
+    case 'educationLevel': into.learner = { ...into.learner, educationLevel: from.learner.educationLevel }; break;
+    case 'know': into.learningOutcomes = { ...into.learningOutcomes, know: from.learningOutcomes.know.slice() }; break;
+    case 'do': into.learningOutcomes = { ...into.learningOutcomes, do: from.learningOutcomes.do.slice() }; break;
+    case 'competencies': into.learningOutcomes = { ...into.learningOutcomes, competencies: from.learningOutcomes.competencies.slice() }; break;
+    case 'targetHours':
+      if (typeof from.targetHours === 'number') into.targetHours = from.targetHours;
+      else delete (into as { targetHours?: number }).targetHours;
+      break;
+    case 'assessmentMethods': into.assessmentMethods = from.assessmentMethods.slice(); break;
+  }
 }
-export function derivedSubsetIsEmpty(p: PedagogicalProfile | null): boolean {
-  const s = derivedSubset(p);
-  return s.description === null && s.educationLevel === null && s.targetHours === null &&
-    (s.know as unknown[]).length === 0 && (s.do as unknown[]).length === 0 && (s.competencies as unknown[]).length === 0 &&
-    (s.assessmentMethods as unknown[]).length === 0;
+const isEmptyValue = (v: unknown) => v === null || v === undefined || (Array.isArray(v) && v.length === 0) || (typeof v === 'string' && !v.trim());
+export function fieldSha(v: unknown): string {
+  return createHash('sha256').update(JSON.stringify(v === undefined ? null : v)).digest('hex');
 }
 
 export interface PedagogyDerivation {
   /** Versión del contexto académico de la que salió la última derivación. */
   academicVersion: number;
-  /** Huella de los campos derivados tal como Cursia los dejó. */
-  subsetSha: string;
+  /** Huella del valor que Cursia escribió en cada campo que es del documento. */
+  fields: Partial<Record<DerivedField, string>>;
 }
 export function parsePedagogyDerivation(v: unknown): PedagogyDerivation | null {
   if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
   const o = v as Record<string, unknown>;
   if (typeof o.academicVersion !== 'number' || !Number.isInteger(o.academicVersion) || o.academicVersion < 1) return null;
-  if (typeof o.subsetSha !== 'string' || !/^[0-9a-f]{64}$/.test(o.subsetSha)) return null;
-  return { academicVersion: o.academicVersion, subsetSha: o.subsetSha };
+  if (!o.fields || typeof o.fields !== 'object' || Array.isArray(o.fields)) return null;
+  const fields: Partial<Record<DerivedField, string>> = {};
+  for (const f of DERIVED_FIELDS) {
+    const sha = (o.fields as Record<string, unknown>)[f];
+    if (typeof sha === 'string' && /^[0-9a-f]{64}$/.test(sha)) fields[f] = sha;
+  }
+  return { academicVersion: o.academicVersion, fields };
 }
+
+/** Dueño de cada campo del perfil frente al documento (`suggested` = lo que propone el documento vigente, o null). */
+export function pedagogyFieldOwners(
+  current: PedagogicalProfile | null,
+  record: PedagogyDerivation | null,
+  /** Lo que propone el documento vigente y, al guardar una versión nueva, también la anterior. */
+  suggested: PedagogicalProfile | null | (PedagogicalProfile | null)[],
+): Record<DerivedField, FieldOwner> {
+  const out = {} as Record<DerivedField, FieldOwner>;
+  const sugs = (Array.isArray(suggested) ? suggested : [suggested]).filter((x): x is PedagogicalProfile => !!x);
+  for (const f of DERIVED_FIELDS) {
+    const v = derivedFieldValue(current, f);
+    const sha = fieldSha(v);
+    if (isEmptyValue(v)) out[f] = 'empty';
+    else if (record && record.fields[f] === sha) out[f] = 'document';
+    else if (sugs.some((sg) => fieldSha(derivedFieldValue(sg, f)) === sha)) out[f] = 'document';
+    else out[f] = 'user';
+  }
+  return out;
+}
+
 /**
- * ¿Cursia puede reescribir los campos del documento en el perfil? Sí si no hay perfil, si esos campos están vacíos o
- * si siguen exactamente como Cursia los dejó en la última derivación. Si el docente los cambió, se respetan.
+ * Perfil derivado: los campos que son del documento (o vacíos) toman el valor que propone el documento; los del
+ * usuario se conservan, salvo los que el docente pide explícitamente reemplazar (`force`). Devuelve el perfil, el
+ * registro nuevo y qué campos cambiaron.
  */
-export function pedagogyDerivedUntouched(current: PedagogicalProfile | null, record: PedagogyDerivation | null): boolean {
-  if (!current || derivedSubsetIsEmpty(current)) return true;
-  return !!record && record.subsetSha === derivedSubsetSha(current);
+export function mergeDerivedProfile(
+  current: PedagogicalProfile,
+  suggested: PedagogicalProfile,
+  owners: Record<DerivedField, FieldOwner>,
+  academicVersion: number,
+  force: readonly DerivedField[] = [],
+): { profile: PedagogicalProfile; record: PedagogyDerivation; changed: DerivedField[]; kept: DerivedField[] } {
+  const next: PedagogicalProfile = JSON.parse(JSON.stringify(current));
+  const record: PedagogyDerivation = { academicVersion, fields: {} };
+  const changed: DerivedField[] = [];
+  const kept: DerivedField[] = [];
+  for (const f of DERIVED_FIELDS) {
+    const docValue = derivedFieldValue(suggested, f);
+    const takeDoc = owners[f] !== 'user' || force.includes(f);
+    if (takeDoc && !isEmptyValue(docValue)) {
+      if (fieldSha(derivedFieldValue(current, f)) !== fieldSha(docValue)) changed.push(f);
+      setDerivedField(next, suggested, f);
+      record.fields[f] = fieldSha(docValue);
+    } else if (owners[f] === 'user' && !isEmptyValue(docValue) && fieldSha(docValue) !== fieldSha(derivedFieldValue(current, f))) {
+      kept.push(f);
+    }
+  }
+  return { profile: next, record, changed, kept };
 }
 
 // ── «Lo que sabemos del curso» ────────────────────────────────────────────────────────────────────────────
@@ -136,7 +201,16 @@ export interface CourseFacts {
   sector: Fact<string>;
   country: Fact<string>;
   document: { present: boolean; contextVersion: number | null; names: string[] };
-  pedagogy: { version: number; primaryApproach: string | null; derivedFromDocument: boolean; derivedUntouched: boolean };
+  pedagogy: {
+    version: number;
+    primaryApproach: string | null;
+    /** Dueño de cada dato del perfil que puede venir del documento. */
+    owners: Record<DerivedField, FieldOwner>;
+    /** Algún dato del perfil viene del documento. */
+    derivedFromDocument: boolean;
+    /** Datos del perfil que el docente decidió y difieren del documento (se respetan; «Usar los del documento» los reemplaza). */
+    userFieldsDifferingFromDocument: DerivedField[];
+  };
   institutionId: string | null;
   conflicts: FactConflict[];
 }
@@ -148,6 +222,8 @@ export interface FactsInput {
   academic: { version: number; context: AcademicContextV1 } | null;
   pedagogy: { version: number; profile: PedagogicalProfile } | null;
   derivation: PedagogyDerivation | null;
+  /** Lo que el documento vigente propone para el perfil (suggestProfileFromContext), o null sin documento. */
+  suggested: PedagogicalProfile | null;
 }
 
 const PLACEHOLDER_TITLES = ['Curso Virtual', 'Curso sin título', 'Tu curso'];
@@ -162,18 +238,28 @@ function first<T>(...cands: Fact<T>[]): Fact<T> {
   return { value: null, source: null };
 }
 
+const FIELD_LABEL: Readonly<Record<DerivedField, string>> = Object.freeze({
+  description: 'el perfil del estudiante', educationLevel: 'el nivel educativo', know: 'los resultados de saber', do: 'los resultados de saber hacer',
+  competencies: 'las competencias', targetHours: 'las horas objetivo', assessmentMethods: 'los métodos de evaluación',
+});
+
 export function resolveCourseFacts(input: FactsInput): CourseFacts {
   const b = input.brief ? input.brief.fields : {};
   const ctx = input.academic ? input.academic.context : null;
   const ped = input.pedagogy ? input.pedagogy.profile : null;
   const found = <T>(f: { status: string; value: T | null } | undefined): T | null => (f && f.status !== 'missing' ? f.value : null);
+  const owners = pedagogyFieldOwners(ped, input.derivation, input.suggested);
   const conflicts: FactConflict[] = [];
 
+  // Nivel educativo — Review L81 I2: la decisión explícita del docente en el perfil manda; si no, el documento; si no,
+  // el pedido (Datos).
   const docLevel = ctx ? found(ctx.identity.educationLevel) : null;
   const briefLevel = educationLevelFromBrief(b.contexto);
   const pedLevel = ped && ped.learner ? ped.learner.educationLevel : null;
-  const educationLevel = first<string>(fact(docLevel && docLevel.level, 'document'), fact(pedLevel, 'profile'), fact(briefLevel, 'user'));
-  if (docLevel && docLevel.level && briefLevel && docLevel.level !== briefLevel) {
+  const educationLevel = owners.educationLevel === 'user'
+    ? fact<string>(pedLevel, 'profile')
+    : first<string>(fact(docLevel && docLevel.level, 'document'), fact(pedLevel, 'profile'), fact(briefLevel, 'user'));
+  if (owners.educationLevel !== 'user' && docLevel && docLevel.level && briefLevel && docLevel.level !== briefLevel) {
     conflicts.push({ field: 'educationLevel', values: [{ source: 'document', value: docLevel.level }, { source: 'user', value: briefLevel }],
       message: 'El documento indica un nivel educativo distinto del que elegiste en Datos: se usa el del documento.' });
   }
@@ -181,21 +267,26 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
   const docHours = ctx ? found(ctx.hours.total) : null;
   const pedHours = ped && typeof ped.targetHours === 'number' ? ped.targetHours : null;
   const targetHours = first<number>(fact(pedHours, 'profile'), fact(docHours, 'document'));
-  if (docHours !== null && pedHours !== null && docHours !== pedHours) {
-    conflicts.push({ field: 'targetHours', values: [{ source: 'document', value: docHours }, { source: 'profile', value: pedHours }],
-      message: `El documento indica ${docHours} h y el curso tiene ${pedHours} h objetivo.` });
+
+  // Datos del perfil que decidió el docente y difieren de lo que propone el documento: se respetan y se informan.
+  const differing: DerivedField[] = [];
+  if (ctx && input.suggested) {
+    for (const f of DERIVED_FIELDS) {
+      const docV = derivedFieldValue(input.suggested, f);
+      if (owners[f] === 'user' && !isEmptyValue(docV) && fieldSha(docV) !== fieldSha(derivedFieldValue(ped, f))) {
+        differing.push(f);
+        conflicts.push({ field: `pedagogy.${f}`, values: [{ source: 'document', value: docV }, { source: 'profile', value: derivedFieldValue(ped, f) }],
+          message: f === 'targetHours'
+            ? `El documento indica ${docV} h y elegiste ${pedHours} h: se usa lo que elegiste.`
+            : `Cambiaste ${FIELD_LABEL[f]}: se usa lo tuyo y no lo del documento.` });
+      }
+    }
   }
 
   const docOutcomes = ctx ? ctx.outcomes.map((o) => ({ id: o.id, text: o.text, domain: o.domain })) : [];
   const pedOutcomes = ped && ped.learningOutcomes
     ? [...ped.learningOutcomes.know.map((t) => ({ id: null, text: t, domain: 'know' })), ...ped.learningOutcomes.do.map((t) => ({ id: null, text: t, domain: 'do' }))]
     : [];
-  const derivedUntouched = pedagogyDerivedUntouched(ped, input.derivation);
-  if (ctx && docOutcomes.length && ped && !derivedUntouched) {
-    conflicts.push({ field: 'pedagogy', values: [{ source: 'document', value: input.academic!.version }, { source: 'profile', value: input.pedagogy!.version }],
-      message: 'Cambiaste a mano el estudiante, los resultados o las horas del perfil: Cursia no los reemplaza con el documento.' });
-  }
-
   const title = first<string>(
     fact(b.nombre, 'user'),
     fact(ctx ? found(ctx.identity.subjectName) : null, 'document'),
@@ -208,7 +299,9 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
     topic: first<string>(fact(b.obj, 'user'), fact(ctx ? found(ctx.identity.generalObjective) : null, 'document')),
     educationLevel,
     priorKnowledge: first<string>(fact(ped && ped.learner ? ped.learner.priorKnowledge : null, 'profile'), fact(priorKnowledgeFromBrief(b.nivel), 'user')),
-    learnerDescription: first<string>(fact(ctx ? found(ctx.learner.profile) : null, 'document'), fact(ped && ped.learner ? ped.learner.description : null, 'profile')),
+    learnerDescription: owners.description === 'user'
+      ? fact<string>(ped!.learner.description, 'profile')
+      : first<string>(fact(ctx ? found(ctx.learner.profile) : null, 'document'), fact(ped && ped.learner ? ped.learner.description : null, 'profile')),
     outcomes: first(fact(docOutcomes, 'document'), fact(pedOutcomes, 'profile')),
     competencies: first<string[]>(fact(ctx ? ctx.competencies.map((c) => c.text) : null, 'document'), fact(ped && ped.learningOutcomes ? ped.learningOutcomes.competencies : null, 'profile')),
     targetHours,
@@ -219,18 +312,19 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
     pedagogy: {
       version: input.pedagogy ? input.pedagogy.version : 0,
       primaryApproach: ped ? ped.primaryApproach : null,
-      derivedFromDocument: !!input.derivation && !!ctx && derivedUntouched && !derivedSubsetIsEmpty(ped),
-      derivedUntouched,
+      owners,
+      derivedFromDocument: !!ctx && DERIVED_FIELDS.some((f) => owners[f] === 'document'),
+      userFieldsDifferingFromDocument: differing,
     },
     institutionId: input.institutionId,
     conflicts,
   };
 }
 
-// ── Contexto que se congela al generar: alineado con la fuente única ───────────────────────────────────────
+// ── Contexto que se congela al generar: alineado con el perfil CONGELADO en el Blueprint ───────────────────
 
 const LEVEL_TEXT: Readonly<Record<string, string>> = Object.freeze({
-  basic: 'Educación básica',
+  basic: 'Educación básica — primeros niveles de escolaridad',
   secondary: 'Bachillerato — estudiantes de secundaria y media',
   technical: 'Técnico / Tecnólogo — formación vocacional y técnica, orientada a competencias prácticas',
   university: 'Universitario — estudiantes de pregrado universitario, con rigor académico y pensamiento crítico',
@@ -238,35 +332,44 @@ const LEVEL_TEXT: Readonly<Record<string, string>> = Object.freeze({
 });
 const PRIOR_TEXT: Readonly<Record<string, string>> = Object.freeze({
   none: 'Básico — sin conocimientos previos',
-  basic: 'Básico — conoce lo esencial',
+  basic: 'Básico — conoce lo esencial del tema',
   intermediate: 'Intermedio — conoce los conceptos fundamentales',
   advanced: 'Avanzado — ya trabaja en el área',
 });
+/** Texto del contexto educativo → nivel (mismo vocabulario que LEVEL_TEXT, ida y vuelta sin pérdida). */
+export function contextLevelOf(contexto: string | undefined): string | null {
+  const s = strip(String(contexto || '')).trim();
+  if (/^educacion basica/.test(s)) return 'basic';
+  return educationLevelFromBrief(contexto);
+}
+/** Texto del nivel de conocimiento → previos (ida y vuelta sin pérdida con PRIOR_TEXT). */
+export function contextPriorOf(nivel: string | undefined): string | null {
+  const s = strip(String(nivel || '')).trim();
+  if (/^basico — conoce/.test(s)) return 'basic';
+  return priorKnowledgeFromBrief(nivel);
+}
 
 /**
- * Un run NUEVO congela el contexto del curso. Para que los prompts nunca reciban dos estudiantes distintos, los campos
- * con un dueño de mayor autoridad que la pantalla Datos se alinean con él:
- *   - contexto educativo ← nivel del DOCUMENTO (si difiere del elegido en Datos);
- *   - nivel de conocimiento ← conocimientos previos del PERFIL (decisión explícita del docente) si difieren;
- *   - objetivo vacío ← objetivo general del documento.
- * Sin documento ni perfil (o sin diferencias) devuelve el contexto TAL CUAL (mismo hash que siempre).
+ * Review L81 I2/I3: un run NUEVO congela el contexto del curso alineado con el estudiante que el Blueprint de ESE
+ * Manifest congeló para las Actividades de Aplicación (course.applicationContext.learner: nivel y previos, que ya
+ * resuelven la autoridad documento / decisión del docente). Así contenido y Actividades de Aplicación reciben el mismo
+ * estudiante, y el mismo Manifest produce siempre el mismo contexto (reanudar nunca cambia el hash).
+ * Sin estudiante congelado (o sin diferencias) devuelve el contexto TAL CUAL (mismo hash que siempre).
  */
-export function alignCourseContextWithFacts<T extends Record<string, any>>(ctx: T, facts: CourseFacts): { context: T; changed: string[] } {
+export function alignCourseContextWithSnapshot<T extends Record<string, any>>(ctx: T, frozenLearner: unknown): { context: T; changed: string[] } {
+  const l = frozenLearner && typeof frozenLearner === 'object' ? (frozenLearner as Record<string, unknown>) : null;
+  if (!l) return { context: ctx, changed: [] };
   const out: Record<string, any> = { ...ctx };
   const changed: string[] = [];
-  const lvl = facts.educationLevel;
-  if (lvl.source === 'document' && lvl.value && educationLevelFromBrief(ctx.contexto) !== lvl.value && LEVEL_TEXT[lvl.value]) {
-    out.contexto = LEVEL_TEXT[lvl.value];
+  const lvl = typeof l.educationLevel === 'string' ? l.educationLevel : null;
+  if (lvl && LEVEL_TEXT[lvl] && contextLevelOf(ctx.contexto) !== lvl) {
+    out.contexto = LEVEL_TEXT[lvl];
     changed.push('contexto');
   }
-  const pk = facts.priorKnowledge;
-  if (pk.source === 'profile' && pk.value && priorKnowledgeFromBrief(ctx.nivel) !== pk.value && PRIOR_TEXT[pk.value]) {
-    out.nivel = PRIOR_TEXT[pk.value];
+  const pk = typeof l.priorKnowledge === 'string' ? l.priorKnowledge : null;
+  if (pk && PRIOR_TEXT[pk] && contextPriorOf(ctx.nivel) !== pk) {
+    out.nivel = PRIOR_TEXT[pk];
     changed.push('nivel');
-  }
-  if ((!ctx.obj || !String(ctx.obj).trim()) && facts.topic.source === 'document' && facts.topic.value) {
-    out.obj = facts.topic.value.slice(0, BRIEF_MAX.obj);
-    changed.push('obj');
   }
   return { context: (changed.length ? out : ctx) as T, changed };
 }

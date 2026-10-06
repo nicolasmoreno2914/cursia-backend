@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import { loadCourseFacts } from './course-facts-db';
@@ -48,6 +48,10 @@ export class CourseFactsService {
       await qr.startTransaction();
       const row = await this.courseRow(qr, courseId, ownerId, true);
       const prev = parseBrief(row.metadata ? row.metadata[BRIEF_KEY] : null);
+      if (dto.expectedUpdatedAt !== undefined && prev && prev.updatedAt !== dto.expectedUpdatedAt) {
+        await qr.rollbackTransaction();
+        throw new ConflictException({ code: 'BRIEF_CHANGED', brief: prev, message: 'BRIEF_CHANGED: el pedido del curso cambió en otra pestaña o equipo; vuelve a leerlo antes de guardar.' });
+      }
       const fields = normalizeBriefFields(dto as Record<string, unknown>);
       if (prev && JSON.stringify(prev.fields) === JSON.stringify(fields)) {
         await qr.rollbackTransaction();

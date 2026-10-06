@@ -34,6 +34,8 @@ export const DOCUMENT_TRANSCRIBER = 'DOCUMENT_TRANSCRIBER';
 @Injectable()
 export class AcademicContextService {
   private readonly logger = new Logger(AcademicContextService.name);
+  /** Cursos con una lectura avanzada en curso (por proceso; la API de staging corre en una sola instancia). */
+  private static readonly advancedInFlight = new Set<number>();
   private readonly transcriber: DocumentTranscriber;
 
   constructor(
@@ -102,8 +104,18 @@ export class AcademicContextService {
     if (typeof dto.acceptedMaxUsd !== 'number' || dto.acceptedMaxUsd < estimate.estimateUsd.max) {
       throw new ConflictException({ code: 'ESTIMATE_NOT_ACCEPTED', estimate, message: 'ESTIMATE_NOT_ACCEPTED: acepta el costo estimado antes de leer el documento.' });
     }
-    const t = await this.transcriber.transcribe({ name: f.name, pdf, model: advancedExtractionModel() });
-    await this.recordAdvancedCharge(courseId, ownerId, pages, t);
+    // Review L81 M3: una lectura avanzada a la vez por curso (dos pestañas no pagan dos veces).
+    if (AcademicContextService.advancedInFlight.has(courseId)) {
+      throw new ConflictException({ code: 'ADVANCED_IN_PROGRESS', message: 'ADVANCED_IN_PROGRESS: ya hay una lectura avanzada en curso para este curso.' });
+    }
+    AcademicContextService.advancedInFlight.add(courseId);
+    let t;
+    try {
+      t = await this.transcriber.transcribe({ name: f.name, pdf, model: advancedExtractionModel() });
+      await this.recordAdvancedCharge(courseId, ownerId, pages, t);
+    } finally {
+      AcademicContextService.advancedInFlight.delete(courseId);
+    }
     if (t.truncated) {
       throw new BadRequestException({ code: 'ADVANCED_TRUNCATED', message: 'ADVANCED_TRUNCATED: el documento es demasiado largo para leerlo completo; divide el PDF y vuelve a intentarlo.' });
     }

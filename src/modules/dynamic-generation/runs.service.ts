@@ -1,5 +1,5 @@
-import { loadCourseFacts } from '../course-facts/course-facts-db';
-import { alignCourseContextWithFacts } from '../course-facts/course-facts';
+import { alignCourseContextWithSnapshot } from '../course-facts/course-facts';
+import { loadFrozenLearner } from '../course-facts/course-facts-db';
 import {
   BadRequestException,
   ConflictException,
@@ -846,7 +846,7 @@ export class RunsService {
     if (isFromRunRequest(courseContext)) {
       return this.startRunFromPrevious(courseId, ownerId, blueprintNumber, manifest, courseContext.fromRun);
     }
-    const context = await this.contextAlignedWithFacts(courseId, manifest.id, courseContext);
+    const context = await this.contextAlignedWithFacts(courseId, manifest, courseContext);
     this.assertRequiredContext(context);
     const contextHash = canonicalContextHash(context);
     const videoMode = this.normalizeVideoMode((courseContext as any)?.videoMode);
@@ -877,14 +877,16 @@ export class RunsService {
    * prompts nunca reciben dos estudiantes distintos). Sin documento ni perfil → el contexto de siempre (mismo hash).
    * La regeneración parcial (`fromRun`) no pasa por acá: reutiliza el contexto congelado del run anterior.
    */
-  private async contextAlignedWithFacts(courseId: number, manifestId: number, courseContext: unknown): Promise<Record<string, any>> {
+  private async contextAlignedWithFacts(courseId: number, manifest: { id: number; blueprintId: number }, courseContext: unknown): Promise<Record<string, any>> {
     const context = normalizeCourseContext(courseContext);
-    const facts = await loadCourseFacts(this.dataSource, courseId);
-    const aligned = alignCourseContextWithFacts(context, facts);
+    // Review L81 I3: se alinea con el estudiante que congeló el Blueprint de ESTE Manifest (no con datos vivos): el
+    // mismo Manifest da siempre el mismo contexto, así reanudar o reintentar nunca cambia el hash.
+    const learner = await loadFrozenLearner(this.dataSource, courseId, manifest.blueprintId);
+    const aligned = alignCourseContextWithSnapshot(context, learner);
     if (!aligned.changed.length) return context;
-    // Compatibilidad: un run de este Manifest congelado ANTES de alinear (p. ej. anterior a LOOP 8.1) se retoma con su
+    // Compatibilidad: un run de este Manifest congelado ANTES de alinear (anterior a LOOP 8.1) se retoma con su
     // mismo contexto; alinearlo ahora daría otro hash y bloquearía reanudarlo (409 «otro contexto»).
-    const latest = await this.findLatestRunRow(manifestId);
+    const latest = await this.findLatestRunRow(manifest.id);
     if (latest) {
       const prev = await this.loadContextRow(latest.id).catch(() => null);
       if (prev && prev.context_hash === canonicalContextHash(context)) return context;
@@ -915,7 +917,7 @@ export class RunsService {
     assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
     await assertAssessmentProfileResolvableForRun(this.dataSource, courseId, manifest);
-    const context = await this.contextAlignedWithFacts(courseId, manifest.id, courseContext);
+    const context = await this.contextAlignedWithFacts(courseId, manifest, courseContext);
     this.assertRequiredContext(context);
     const contextHash = canonicalContextHash(context);
     const videoMode = this.normalizeVideoMode((courseContext as any)?.videoMode);

@@ -1,7 +1,8 @@
-import { Body, Controller, Get, Param, ParseIntPipe, Post, Query, Res, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Param, ParseIntPipe, Post, Query, Res, UseGuards } from '@nestjs/common';
 import type { Response } from 'express';
 import { CourseProfilesService } from './course-profiles.service';
 import { CreateProfileDto } from './dto/create-profile.dto';
+import { UseDocumentDto } from './dto/use-document.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
@@ -26,6 +27,19 @@ export class CourseProfilesController {
     @Query('paletteId') paletteId?: string,
   ) {
     return this.profilesService.getCurrent(courseId, user.id, kind, typeof paletteId === 'string' ? paletteId.slice(0, 64) : null);
+  }
+
+  // POST /api/v1/courses/:courseId/profiles/pedagogy/use-document  body { fields?: string[] }
+  // LOOP 8.1: «Usar los datos del documento» — el docente decide reemplazar en el perfil lo que había cambiado.
+  // Declarado ANTES de :kind (dos segmentos: no choca, pero queda explícito).
+  @Post('pedagogy/use-document')
+  @HttpCode(200)
+  useDocument(
+    @Param('courseId', ParseIntPipe) courseId: number,
+    @Body() dto: UseDocumentDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.profilesService.useDocumentInPedagogy(courseId, user.id, dto.fields);
   }
 
   // POST /api/v1/courses/:courseId/profiles/:kind  body { data, expectedVersion? }

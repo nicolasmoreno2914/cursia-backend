@@ -6,15 +6,20 @@
 // Parte pura:
 //   SS1 pedido del curso: normalización, parseo estricto, chips de Datos → vocabulario del motor
 //   SS2 «Lo que sabemos del curso»: autoridad documento > perfil > usuario, orígenes y conflictos
-//   SS3 contexto congelado: sin documento ni perfil queda IDÉNTICO; el nivel del documento y los previos del perfil
-//       prevalecen sobre Datos; objetivo vacío ← documento
-//   SS4 derivación del perfil: intacto / vacío / editado a mano
+//   SS3 contexto congelado: alineado con el estudiante que congeló el Blueprint; sin él queda IDÉNTICO; ida y vuelta
+//       de los textos sin pérdida (idempotente)
+//   SS4 dueño POR CAMPO (review L81 I1/I2): vacío / del documento / del usuario; horas antes del documento; el nivel que
+//       decidió el docente manda sobre el documento; «Usar los datos del documento» (force)
 //   SS5 calidad de la extracción (escaneo, sin lo esencial) y costo estimado de la lectura avanzada (rango, sin red)
 // Parte DB (Postgres 16 local desechable; se salta SOLO con --pure-only, y lo dice):
 //   SS6 pedido del curso: PUT/GET, idempotente, otro dueño 404, legacy 400
 //   SS7 guardar el contexto deriva el perfil pedagógico SOLO (sin «Usar en el perfil»): 64 h, resultados, nivel
 //   SS8 el docente cambia a mano el estudiante → un contexto nuevo NO lo pisa y «Lo que sabemos» informa el conflicto
 //   SS9 guardar el enfoque sin tocar lo del documento lo deja «intacto»: el contexto nuevo sí se deriva
+//   SS11 horas antes del documento: el documento llena estudiante y resultados y RESPETA las horas (conflicto visible);
+//        «Usar los datos del documento» las reemplaza por decisión explícita
+//   SS12 perfil anterior a 8.1 igual al documento («Usar en el perfil»): cuenta como del documento y sigue actualizándose
+//   SS13 estudiante congelado en el Blueprint (con Actividades de Aplicación) → alinea el contexto del run
 //   SS10 lectura avanzada: estimar sin proveedor; apagada → 409; sin aceptar el costo → 409; aceptada → transcripción
 //        falsa + MISMO extractor → contexto con resultados; gasto registrado (también si la lectura sale truncada)
 //
@@ -79,46 +84,56 @@ const BRIEF = { nombre: 'Contabilidad de Costos', obj: 'Calcular y controlar los
 
   const brief = { briefVersion: 1, fields: CF.normalizeBriefFields(BRIEF), updatedAt: 't' };
   await check('SS2 «Lo que sabemos»: autoridad, orígenes y conflictos', () => {
-    const solo = CF.resolveCourseFacts({ courseTitle: 'Curso sin título', institutionId: null, brief, academic: null, pedagogy: null, derivation: null });
+    const solo = CF.resolveCourseFacts({ courseTitle: 'Curso sin título', institutionId: null, brief, academic: null, pedagogy: null, derivation: null, suggested: null });
     eq([solo.title.value, solo.title.source, solo.topic.source, solo.educationLevel.value, solo.educationLevel.source, solo.priorKnowledge.value, solo.targetHours.value, solo.conflicts], ['Contabilidad de Costos', 'user', 'user', 'technical', 'user', 'none', null, []], 'solo el pedido');
     const ped = { ...emptyPed(), targetHours: 48 };
-    const withDoc = CF.resolveCourseFacts({ courseTitle: 'x', institutionId: 'inst-1', brief: { ...brief, fields: { ...brief.fields, contexto: 'Universitario — x' } }, academic: { version: 1, context: ctx }, pedagogy: { version: 1, profile: ped }, derivation: null });
+    const suggested = A.suggestProfileFromContext(ctx, null).profile;
+    const withDoc = CF.resolveCourseFacts({ courseTitle: 'x', institutionId: 'inst-1', brief: { ...brief, fields: { ...brief.fields, contexto: 'Universitario — x' } }, academic: { version: 1, context: ctx }, pedagogy: { version: 1, profile: ped }, derivation: null, suggested });
     eq(withDoc.educationLevel.source, 'document', 'el nivel del documento manda');
     eq(withDoc.outcomes.source, 'document', 'resultados del documento');
     eq([withDoc.targetHours.value, withDoc.targetHours.source], [48, 'profile'], 'horas: dueño = perfil');
     // El perfil trae horas puestas a mano y no hay registro de derivación (perfil anterior a 8.1): se respeta y se informa.
-    eq(withDoc.conflicts.map((c) => c.field).sort(), ['educationLevel', 'pedagogy', 'targetHours'], 'conflictos de nivel, perfil y horas a la vista');
+    eq(withDoc.conflicts.map((c) => c.field).sort(), ['educationLevel', 'pedagogy.targetHours'], 'conflictos: nivel (Datos vs documento) y horas (elegidas vs documento)');
+    eq(withDoc.pedagogy.owners.targetHours, 'user', 'las horas que eligió el docente son suyas');
     eq([withDoc.document.present, withDoc.document.contextVersion, withDoc.institutionId], [true, 1, 'inst-1'], 'documento e institución');
   });
 
-  await check('SS3 contexto congelado: idéntico sin fuentes; documento y perfil prevalecen sobre Datos', () => {
-    const run = { nombre: 'C', sector: 'S', pais: 'Colombia', contexto: BRIEF.contexto, nivel: BRIEF.nivel, tono: 'x', obj: '' };
-    const none = CF.alignCourseContextWithFacts(run, CF.resolveCourseFacts({ courseTitle: 'C', institutionId: null, brief, academic: null, pedagogy: null, derivation: null }));
-    assert(none.context === run && none.changed.length === 0, 'sin documento ni perfil: el mismo objeto (mismo hash)');
-    const ped = { ...emptyPed(), learner: { ...emptyPed().learner, priorKnowledge: 'advanced' } };
-    const facts = CF.resolveCourseFacts({ courseTitle: 'C', institutionId: null, brief, academic: { version: 1, context: ctx }, pedagogy: { version: 1, profile: ped }, derivation: null });
-    const al = CF.alignCourseContextWithFacts(run, facts);
-    const docLevel = ctx.identity.educationLevel.value && ctx.identity.educationLevel.value.level;
-    eq(al.changed.includes('nivel'), true, 'previos del perfil');
-    assert(/^Avanzado/.test(al.context.nivel), 'nivel = perfil');
-    if (docLevel && docLevel !== 'technical') assert(al.changed.includes('contexto'), 'contexto = documento');
-    const noObj = CF.resolveCourseFacts({ courseTitle: 'C', institutionId: null, brief: { ...brief, fields: { ...brief.fields, obj: undefined } }, academic: { version: 1, context: ctx }, pedagogy: null, derivation: null });
-    if (ctx.identity.generalObjective.status !== 'missing') {
-      const a2 = CF.alignCourseContextWithFacts(run, noObj);
-      eq([a2.changed.includes('obj'), a2.context.obj.length > 0], [true, true], 'objetivo vacío (sin objetivo en Datos) ← documento');
-    }
-    eq(CF.alignCourseContextWithFacts({ ...run, obj: 'El mío' }, noObj).context.obj, 'El mío', 'un objetivo escrito nunca se reemplaza');
+  await check('SS3 contexto congelado: alineado con el estudiante del Blueprint; sin él, idéntico; ida y vuelta sin pérdida', () => {
+    const run = { nombre: 'C', sector: 'S', pais: 'Colombia', contexto: BRIEF.contexto, nivel: BRIEF.nivel, tono: 'x', obj: 'o' };
+    const none = CF.alignCourseContextWithSnapshot(run, null);
+    assert(none.context === run && none.changed.length === 0, 'sin estudiante congelado: el mismo objeto (mismo hash)');
+    const same = CF.alignCourseContextWithSnapshot(run, { educationLevel: 'technical', priorKnowledge: 'none' });
+    assert(same.context === run && same.changed.length === 0, 'mismo estudiante que Datos: sin cambios');
+    const al = CF.alignCourseContextWithSnapshot(run, { educationLevel: 'university', priorKnowledge: 'basic' });
+    eq(al.changed, ['contexto', 'nivel'], 'nivel y previos del Blueprint');
+    assert(/^Universitario/.test(al.context.contexto) && /^Básico — conoce/.test(al.context.nivel), 'textos del vocabulario');
+    const again = CF.alignCourseContextWithSnapshot(al.context, { educationLevel: 'university', priorKnowledge: 'basic' });
+    assert(again.context === al.context && again.changed.length === 0, 'idempotente: ida y vuelta sin pérdida (review L81 M5)');
+    for (const lvl of ['basic', 'secondary', 'technical', 'university', 'professional']) eq(CF.contextLevelOf(CF.alignCourseContextWithSnapshot({ contexto: '' }, { educationLevel: lvl }).context.contexto), lvl, `ida y vuelta ${lvl}`);
+    for (const pk of ['none', 'basic', 'intermediate', 'advanced']) eq(CF.contextPriorOf(CF.alignCourseContextWithSnapshot({ nivel: '' }, { priorKnowledge: pk }).context.nivel), pk, `ida y vuelta ${pk}`);
     eq(run.nivel, BRIEF.nivel, 'no muta el original');
   });
 
-  await check('SS4 derivación del perfil: vacío / intacto / editado a mano', () => {
+  await check('SS4 dueño por campo: vacío / documento / usuario; horas antes del documento; nivel del docente manda; force', () => {
     const sugg = A.suggestProfileFromContext(ctx, null).profile;
-    const rec = { academicVersion: 1, subsetSha: CF.derivedSubsetSha(sugg) };
-    eq([CF.pedagogyDerivedUntouched(null, null), CF.pedagogyDerivedUntouched(emptyPed(), null)], [true, true], 'sin perfil o vacío');
-    eq(CF.pedagogyDerivedUntouched(sugg, rec), true, 'intacto');
-    eq(CF.pedagogyDerivedUntouched({ ...sugg, primaryApproach: 'competencias', designPreferences: { emphasis: 'depth' } }, rec), true, 'cambiar el enfoque no es editar lo del documento');
-    eq(CF.pedagogyDerivedUntouched({ ...sugg, learner: { ...sugg.learner, description: 'Otros estudiantes' } }, rec), false, 'editado a mano');
-    eq(CF.pedagogyDerivedUntouched(sugg, null), false, 'con datos y sin registro (perfil anterior a 8.1): se respeta');
+    const all = (o) => CF.DERIVED_FIELDS.map((f) => o[f]);
+    eq(all(CF.pedagogyFieldOwners(null, null, sugg)), CF.DERIVED_FIELDS.map(() => 'empty'), 'sin perfil: todo vacío');
+    const hoursFirst = { ...emptyPed(), targetHours: 40 };
+    const o1 = CF.pedagogyFieldOwners(hoursFirst, null, sugg);
+    eq([o1.targetHours, o1.know, o1.description], ['user', 'empty', 'empty'], 'horas del docente; el resto vacío');
+    const m1 = CF.mergeDerivedProfile(hoursFirst, sugg, o1, 1);
+    eq([m1.profile.targetHours, m1.profile.learningOutcomes.do.length > 0, m1.kept, m1.changed.includes('targetHours')], [40, true, ['targetHours'], false], 'llena lo vacío y respeta las horas');
+    const o2 = CF.pedagogyFieldOwners(m1.profile, m1.record, sugg);
+    eq([o2.targetHours, o2.do, o2.description], ['user', 'document', 'document'], 'después: lo derivado es del documento');
+    const edited = JSON.parse(JSON.stringify(m1.profile)); edited.learner.educationLevel = 'professional';
+    const o3 = CF.pedagogyFieldOwners(edited, m1.record, sugg);
+    eq(o3.educationLevel, 'user', 'nivel cambiado a mano');
+    const facts = CF.resolveCourseFacts({ courseTitle: 'x', institutionId: null, brief, academic: { version: 1, context: ctx }, pedagogy: { version: 2, profile: edited }, derivation: m1.record, suggested: sugg });
+    eq([facts.educationLevel.value, facts.educationLevel.source], ['professional', 'profile'], 'review L81 I2: la decisión del docente manda sobre el documento');
+    assert(facts.conflicts.some((c) => c.field === 'pedagogy.educationLevel'), 'conflicto visible');
+    eq(CF.pedagogyFieldOwners(sugg, null, sugg).do, 'document', 'igual al documento sin registro (perfil anterior a 8.1): del documento');
+    const forced = CF.mergeDerivedProfile(hoursFirst, sugg, o1, 1, ['targetHours']);
+    eq([forced.profile.targetHours, forced.changed.includes('targetHours')], [64, true], '«Usar los datos del documento» (force)');
   });
 
   await check('SS5 calidad de la extracción y costo estimado de la lectura avanzada', () => {
@@ -135,6 +150,12 @@ const BRIEF = { nombre: 'Contabilidad de Costos', obj: 'Calcular y controlar los
     eq([e10.pages, e10.model, e10.assumptions.length], [10, 'm', 2], 'forma');
     assert(e10.estimateUsd.expected > 0.1 && e10.estimateUsd.expected < 1, `10 páginas: centavos (${e10.estimateUsd.expected})`);
     eq(ADV.estimateAdvancedExtraction(0).pages, 1, 'mínimo 1 página');
+    // Review L81 I4: solo las páginas cuya transcripción cabe en una respuesta; el estimado nunca cuenta salida imposible.
+    eq(ADV.ADVANCED_MAX_PAGES, 20, 'tope de páginas');
+    assert(ADV.ADVANCED_MAX_PAGES * ADV.ADVANCED_TOKENS.outputPerPage <= ADV.ADVANCED_MAX_OUTPUT_TOKENS - 1000, 'cabe con margen');
+    const e40 = ADV.estimateAdvancedExtraction(40);
+    const outCap = ADV.ADVANCED_MAX_OUTPUT_TOKENS * ADV.ADVANCED_REFERENCE_PRICE.outputPerMTok / 1e6;
+    assert(e40.estimateUsd.max <= (ADV.ADVANCED_TOKENS.inputBase + 40 * ADV.ADVANCED_TOKENS.inputPerPage) * 2 * 3 / 1e6 + outCap + 0.01, 'el máximo no supera lo que la respuesta puede producir');
   });
 
   if (PURE_ONLY) console.log('\n⚠️  --pure-only: se SALTÓ la parte DB (no cuenta como probada).');
@@ -178,7 +199,7 @@ async function dbChecks(ctx) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursia-loop81-pg16-'));
   const DB = 'loop81db';
   const pg = (bin, a) => spawnSync(path.join(pgBin, bin), a, { env: cleanEnv(), encoding: 'utf8' });
-  const saved = { flag: process.env.DYNAMIC_COURSE_STRUCTURE, allow: process.env.DYNAMIC_V2_ALLOWED_OWNERS, unowned: process.env.ALLOW_UNOWNED_COURSES, adv: process.env.ACADEMIC_ADVANCED_EXTRACTION_ENABLED };
+  const saved = { flag: process.env.DYNAMIC_COURSE_STRUCTURE, allow: process.env.DYNAMIC_V2_ALLOWED_OWNERS, unowned: process.env.ALLOW_UNOWNED_COURSES, adv: process.env.ACADEMIC_ADVANCED_EXTRACTION_ENABLED, rules: process.env.DYNAMIC_MANIFEST_RULES_VERSION, atr: process.env.DYNAMIC_ACTIVITY_TYPE_RULES };
   let started = false;
   let ds = null;
   try {
@@ -200,6 +221,8 @@ async function dbChecks(ctx) {
     process.env.DYNAMIC_COURSE_STRUCTURE = 'true';
     delete process.env.DYNAMIC_V2_ALLOWED_OWNERS;
     delete process.env.ALLOW_UNOWNED_COURSES;
+    process.env.DYNAMIC_MANIFEST_RULES_VERSION = '3'; // Blueprint v2 (con estudiante congelado) como en staging
+    process.env.DYNAMIC_ACTIVITY_TYPE_RULES = '2';
     ds = new DataSource({ type: 'postgres', host: '127.0.0.1', port, username: 'postgres', database: DB, entities: [], synchronize: false });
     await ds.initialize();
     const coursesStub = {
@@ -210,6 +233,10 @@ async function dbChecks(ctx) {
       },
     };
     const profiles = new CourseProfilesService(ds, coursesStub);
+    const { CourseBlueprintsService } = loadDist('modules/course-blueprints/course-blueprints.service.js');
+    const blueprints = new CourseBlueprintsService(ds);
+    const FDB = loadDist('modules/course-facts/course-facts-db.js');
+    const emptyPedFor = () => ({ pedagogyProfileVersion: 1, primaryApproach: null, secondaryApproaches: [], learner: { description: null, ageGroup: null, educationLevel: null, priorKnowledge: null, experience: null }, learningOutcomes: { know: [], do: [], competencies: [] }, learningModes: [], experienceTypes: [], assessmentMethods: [], principles: [], origin: 'manual' });
     const facts = new CourseFactsService(ds);
     const charges = [];
     const ledger = { recordCharge: async (x) => { charges.push(x); return { inserted: true, event: {} }; } };
@@ -230,6 +257,10 @@ async function dbChecks(ctx) {
       eq([p1.changed, p1.brief.fields.obj], [true, BRIEF.obj], 'guardado');
       eq((await facts.putBrief(cid, OWNER, { ...BRIEF, obj: `  ${BRIEF.obj}  ` })).changed, false, 'mismo pedido: sin escritura');
       eq((await facts.getBrief(cid, OWNER)).brief.fields.sector, 'Contabilidad', 'GET');
+      await rejectsRe(facts.putBrief(cid, OWNER, { ...BRIEF, sector: 'X', expectedUpdatedAt: '1999-01-01T00:00:00.000Z' }), /BRIEF_CHANGED/, 'pestaña vieja (review L81 M1)', 409);
+      const up = await facts.putBrief(cid, OWNER, { ...BRIEF, sector: 'Finanzas', expectedUpdatedAt: p1.brief.updatedAt });
+      eq([up.changed, up.brief.fields.sector], [true, 'Finanzas'], 'con el updatedAt vigente se guarda');
+      await facts.putBrief(cid, OWNER, BRIEF);
       const [m] = await ds.query(`select metadata from public.courses where id = $1`, [cid]);
       eq(Object.keys(m.metadata), ['brief'], 'solo la clave brief');
       await rejectsRe(facts.putBrief(cid, OTHER, BRIEF), /not found/, 'otro dueño', 404);
@@ -245,14 +276,14 @@ async function dbChecks(ctx) {
       eq([r.created, r.derivedPedagogy && r.derivedPedagogy.applied, r.derivedPedagogy && r.derivedPedagogy.version], [true, true, 1], 'perfil v1 derivado en la misma transacción');
       const p = await ped(cid);
       eq([p.version, p.profile.targetHours, p.profile.learningOutcomes.do.length > 0], [1, 64, true], '64 h y resultados del documento');
-      eq(p.derivedFromAcademic, { academicVersion: 1, untouched: true }, 'GET pedagogy informa la derivación');
+      eq([p.derivedFromAcademic.academicVersion, p.derivedFromAcademic.untouched, p.derivedFromAcademic.owners.do], [1, true, 'document'], 'GET pedagogy informa la derivación por campo');
       const f = await facts.getFacts(cid, OWNER);
       eq([f.outcomes.source, f.targetHours.value, f.pedagogy.derivedFromDocument, f.conflicts], ['document', 64, true, []], 'Lo que sabemos: documento, sin conflictos');
       const again = await profiles.append(cid, OWNER, 'academic', ctx);
       eq([again.created, (await ped(cid)).version], [false, 1], 're-guardar el mismo contexto no crea versiones');
     });
 
-    await check('SS8 el docente cambia a mano el estudiante → un contexto nuevo NO lo pisa y se informa el conflicto', async () => {
+    await check('SS8 el docente cambia a mano el estudiante → el contexto nuevo NO lo pisa pero SÍ actualiza lo demás; conflicto visible', async () => {
       const cid = await newCourse('Editado');
       await profiles.append(cid, OWNER, 'academic', ctx);
       const p1 = (await ped(cid)).profile;
@@ -260,11 +291,11 @@ async function dbChecks(ctx) {
       const ctx2 = JSON.parse(JSON.stringify(ctx));
       ctx2.hours.total = { ...ctx2.hours.total, value: 48 };
       const r = await profiles.append(cid, OWNER, 'academic', ctx2);
-      eq([r.created, r.derivedPedagogy], [true, { applied: false, reason: 'pedagogy_edited' }], 'no se derivó');
+      eq([r.created, r.derivedPedagogy.applied, r.derivedPedagogy.changes, r.derivedPedagogy.kept], [true, true, ['targetHours'], ['description']], 'horas del documento actualizadas; el estudiante del docente, respetado');
       const p = await ped(cid);
-      eq([p.version, p.profile.learner.description, p.profile.targetHours, p.derivedFromAcademic.untouched], [2, 'Trabajadores del área contable de una pyme', 64, false], 'lo del docente sigue');
+      eq([p.version, p.profile.learner.description, p.profile.targetHours, p.derivedFromAcademic.untouched, p.derivedFromAcademic.owners.description], [3, 'Trabajadores del área contable de una pyme', 48, false, 'user'], 'perfil');
       const f = await facts.getFacts(cid, OWNER);
-      assert(f.conflicts.some((c) => c.field === 'pedagogy') && f.conflicts.some((c) => c.field === 'targetHours'), 'conflictos a la vista: ' + JSON.stringify(f.conflicts.map((c) => c.field)));
+      eq(f.conflicts.map((c) => c.field), ['pedagogy.description'], 'conflicto del campo, nada más');
     });
 
     await check('SS9 cambiar solo el enfoque deja lo del documento «intacto»: el contexto nuevo se deriva', async () => {
@@ -279,6 +310,54 @@ async function dbChecks(ctx) {
       eq(r.derivedPedagogy.applied, true, 'derivado');
       const p = (await ped(cid)).profile;
       eq([p.targetHours, p.primaryApproach, p.designPreferences], [48, 'competencias', { emphasis: 'application' }], 'horas nuevas; enfoque y preferencias se conservan');
+    });
+
+    await check('SS11 horas antes del documento: se respetan y lo demás se llena; «Usar los datos del documento» las reemplaza', async () => {
+      const cid = await newCourse('Horas primero');
+      await profiles.append(cid, OWNER, 'pedagogy', { ...emptyPedFor(), targetHours: 40 });
+      const r = await profiles.append(cid, OWNER, 'academic', ctx);
+      eq([r.derivedPedagogy.applied, r.derivedPedagogy.kept], [true, ['targetHours']], 'deriva y respeta las horas');
+      let p = (await ped(cid)).profile;
+      eq([p.targetHours, p.learningOutcomes.do.length > 0, p.learner.educationLevel !== null], [40, true, true], 'estudiante y resultados del documento, 40 h del docente');
+      let f = await facts.getFacts(cid, OWNER);
+      eq([f.targetHours.value, f.conflicts.map((c) => c.field)], [40, ['pedagogy.targetHours']], 'conflicto de horas visible');
+      const u = await profiles.useDocumentInPedagogy(cid, OWNER, ['targetHours']);
+      eq([u.applied, u.changes], [true, ['targetHours']], 'decisión explícita');
+      p = (await ped(cid)).profile;
+      f = await facts.getFacts(cid, OWNER);
+      eq([p.targetHours, f.conflicts, (await ped(cid)).derivedFromAcademic.owners.targetHours], [64, [], 'document'], 'ahora las horas son del documento');
+      await rejectsRe(profiles.useDocumentInPedagogy(cid, OWNER, ['nada']), /INVALID_FIELDS/, 'campos inválidos', 400);
+    });
+
+    await check('SS12 perfil anterior a 8.1 igual al documento: cuenta como del documento y se sigue actualizando', async () => {
+      const cid = await newCourse('Pre 8.1');
+      await ds.query(`insert into public.course_profiles (course_id, kind, version, data, sha256) select $1, kind, version, data, sha256 from public.course_profiles where false`, [cid]);
+      const sugg = A.suggestProfileFromContext(ctx, null).profile;
+      await profiles.append(cid, OWNER, 'academic', ctx);
+      await ds.query(`update public.courses set metadata = metadata - 'pedagogyDerivation' where id = $1`, [cid]); // como si fuera anterior a 8.1
+      eq((await ped(cid)).derivedFromAcademic, undefined, 'sin registro');
+      const ctx2 = JSON.parse(JSON.stringify(ctx));
+      ctx2.hours.total = { ...ctx2.hours.total, value: 48 };
+      const r = await profiles.append(cid, OWNER, 'academic', ctx2);
+      eq([r.derivedPedagogy.applied, r.derivedPedagogy.changes, r.derivedPedagogy.kept], [true, ['targetHours'], []], 'igual al documento → del documento');
+      eq((await ped(cid)).profile.targetHours, 48, 'actualizado');
+      assert(sugg.targetHours === 64, 'fixture');
+    });
+
+    await check('SS13 estudiante congelado en el Blueprint (con Actividades de Aplicación) → alinea el contexto del run', async () => {
+      const cid = await newCourse('Blueprint');
+      await profiles.append(cid, OWNER, 'academic', ctx);
+      const [m] = await ds.query(`insert into public.course_modules (course_id, position, title, objective, exam_enabled) values ($1, 0, 'Costos', 'Calcular costos de producción', true) returning id`, [cid]);
+      await ds.query(`insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled, activity_enabled, application_minutes) values ($1, $2, 0, 'Elementos del costo', 'Identificar los elementos del costo', true, true, 60)`, [cid, m.id]);
+      const lock = await blueprints.lock(cid, OWNER, Number((await ds.query(`select structure_version_counter c from public.courses where id = $1`, [cid]))[0].c));
+      const [bp] = await ds.query(`select id from public.course_blueprints where course_id = $1 order by id desc limit 1`, [cid]);
+      const learner = await FDB.loadFrozenLearner(ds, cid, bp.id);
+      assert(lock.blueprint && learner && learner.educationLevel, 'el Blueprint congeló al estudiante: ' + JSON.stringify(learner));
+      eq(learner.educationLevel, (await ped(cid)).profile.learner.educationLevel, 'el del perfil derivado');
+      const run = { nombre: 'C', sector: 'S', pais: 'Colombia', contexto: 'Universitario — x', nivel: 'Avanzado — y', tono: 't', obj: 'o' };
+      const al = CF.alignCourseContextWithSnapshot(run, learner);
+      eq(CF.contextLevelOf(al.context.contexto), learner.educationLevel, 'contenido y Actividades de Aplicación: el mismo nivel');
+      eq(await FDB.loadFrozenLearner(ds, cid, 999999), null, 'otro Blueprint: nada');
     });
 
     await check('SS10 lectura avanzada: estimar sin proveedor, consentimiento obligatorio, mismo extractor, gasto registrado', async () => {
@@ -311,7 +390,7 @@ async function dbChecks(ctx) {
     });
   } finally {
     if (ds) await ds.destroy().catch(() => {});
-    for (const [k, v] of [['DYNAMIC_COURSE_STRUCTURE', saved.flag], ['DYNAMIC_V2_ALLOWED_OWNERS', saved.allow], ['ALLOW_UNOWNED_COURSES', saved.unowned], ['ACADEMIC_ADVANCED_EXTRACTION_ENABLED', saved.adv]]) {
+    for (const [k, v] of [['DYNAMIC_COURSE_STRUCTURE', saved.flag], ['DYNAMIC_V2_ALLOWED_OWNERS', saved.allow], ['ALLOW_UNOWNED_COURSES', saved.unowned], ['ACADEMIC_ADVANCED_EXTRACTION_ENABLED', saved.adv], ['DYNAMIC_MANIFEST_RULES_VERSION', saved.rules], ['DYNAMIC_ACTIVITY_TYPE_RULES', saved.atr]]) {
       if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }
     if (started) pg('pg_ctl', ['-D', dataDir, '-m', 'immediate', '-w', 'stop']);

@@ -205,17 +205,22 @@ export class CoursesService {
     const course = await this.findOne(id, ownerId);
     // LOOP 8.0 (review L80 M1) + LOOP 8.1: las claves de la fuente única (origen de la estructura, pedido del curso,
     // derivación del perfil) las escriben solo sus servicios; un PATCH del curso nunca las cambia ni las borra.
-    if (dto.metadata !== undefined) {
-      const next: Record<string, any> = { ...(dto.metadata || {}) };
-      for (const key of PROTECTED_METADATA_KEYS) {
-        const keep = course.metadata ? course.metadata[key] : undefined;
-        delete next[key];
-        if (keep !== undefined) next[key] = keep;
-      }
-      dto = { ...dto, metadata: next };
+    // Review L81 M2: la mezcla se hace en SQL, en una sola sentencia, con las claves protegidas leídas AL ESCRIBIR (un
+    // PUT /brief o una derivación que se confirma entre la lectura y la escritura nunca se revierte).
+    const { metadata, ...rest } = dto as UpdateCourseDto & { metadata?: Record<string, any> };
+    // update() parcial: solo las columnas enviadas (save() reescribiría el metadata leído antes, ya viejo).
+    if (Object.keys(rest).length) await this.courseRepo.update({ id: course.id }, rest as any);
+    if (metadata !== undefined) {
+      const next: Record<string, any> = { ...(metadata || {}) };
+      for (const key of PROTECTED_METADATA_KEYS) delete next[key];
+      await this.courseRepo.query(
+        `update public.courses
+            set metadata = $2::jsonb || coalesce((select jsonb_object_agg(k, v) from jsonb_each(coalesce(metadata, '{}'::jsonb)) as e(k, v) where k = any($3::text[])), '{}'::jsonb)
+          where id = $1`,
+        [id, JSON.stringify(next), PROTECTED_METADATA_KEYS],
+      );
     }
-    Object.assign(course, dto);
-    return this.courseRepo.save(course);
+    return this.findOne(id, ownerId);
   }
 
   // ── REMOVE ────────────────────────────────────────────────────────────────
