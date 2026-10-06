@@ -583,12 +583,6 @@ jobs:
                echo "━━━ [4d9] Motor de carga horaria: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-practice-chapters-schema.js
 
-               echo "━━━ [4d10] Actividades de Aplicación: course_chapters.application_minutes — migración (staging) ━━━"
-               MIGRATION_ENV=staging node scripts/migrate-application-activities.js
-
-               echo "━━━ [4d11] Actividades de Aplicación: verificación de esquema (staging) ━━━"
-               MIGRATION_ENV=staging node scripts/verify-application-activities-schema.js
-
                echo "━━━ [4e] Generation Manifests: migración (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-generation-manifests.js
 
@@ -612,6 +606,12 @@ jobs:
 
                echo "━━━ [4h5] V2.1 R4: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-v21-manifest-v3-schema.js
+
+               echo "━━━ [4h5a] Actividades de Aplicación: course_chapters.application_minutes + conteos del Manifest — migración (staging, DESPUÉS de manifest-v3: reescribe cgm_counts_consistent) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-application-activities.js
+
+               echo "━━━ [4h5b] Actividades de Aplicación: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-application-activities-schema.js
 
                echo "━━━ [4h6] V2.1 RF: ledger FinOps (tablas append-only + seed de precios) (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-v21-finops.js

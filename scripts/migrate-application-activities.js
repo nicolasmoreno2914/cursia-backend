@@ -23,7 +23,8 @@ function loadEnvFile(envPath) {
 
 // Cursia — Fase 2 (Actividades de Aplicación): course_chapters.application_minutes (30/60/90/120 o
 // null). Las filas existentes quedan null (ningún Blueprint cambia). Aditiva, idempotente y SOLO
-// staging: la cablea deploy-staging.yml (nunca deploy.yml), después de migrate-practice-chapters.js.
+// staging: la cablea deploy-staging.yml (nunca deploy.yml), DESPUÉS de migrate-v21-manifest-v3.js (paso 4h5a):
+// reescribe cgm_counts_consistent y gir_type_check, que esa migración crea; antes, en una base nueva, quedarían los v3.
 // Producción: fuera de alcance de esta fase (no está en scripts/prod/migrate-v2-production.js).
 //
 // Guardarraíl de intención explícita: esta migración es solo para staging.

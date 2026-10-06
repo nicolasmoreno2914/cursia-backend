@@ -68,6 +68,10 @@ env $STG node "$REPO/scripts/migrate-invalidation.js" > "$OUT/migrate-invalidati
 # V2.1 R4: Manifest rulesVersion 3 (extiende los CHECKs de la migración v2 → corre DESPUÉS de ella).
 env $STG node "$REPO/scripts/migrate-v21-manifest-v3.js" > "$OUT/migrate-v21-manifest-v3.log" 2>&1 || { cat "$OUT/migrate-v21-manifest-v3.log"; exit 9; }
 env $STG node "$REPO/scripts/verify-v21-manifest-v3-schema.js" > "$OUT/verify-v21-manifest-v3.log" 2>&1 || { cat "$OUT/verify-v21-manifest-v3.log"; exit 9; }
+# Fase 2 (Actividades de Aplicación): DESPUÉS de manifest-v3 — reescribe cgm_counts_consistent (práctica + actividades)
+# y agrega application_activity a gir_type_check (setup-schema.js ya la corrió antes de que existieran esos CHECKs v3).
+env $STG node "$REPO/scripts/migrate-application-activities.js" > "$OUT/migrate-application-activities.log" 2>&1 || { cat "$OUT/migrate-application-activities.log"; exit 9; }
+env $STG node "$REPO/scripts/verify-application-activities-schema.js" > "$OUT/verify-application-activities.log" 2>&1 || { cat "$OUT/verify-application-activities.log"; exit 9; }
 # V2.1 RF-b: seed de pricing_catalog (las tablas ya las creó setup-schema.js sql; el script es idempotente).
 env $STG node "$REPO/scripts/migrate-v21-finops.js" > "$OUT/migrate-v21-finops.log" 2>&1 || { cat "$OUT/migrate-v21-finops.log"; exit 9; }
 env $STG node "$REPO/scripts/verify-v21-finops-schema.js" > "$OUT/verify-v21-finops.log" 2>&1 || { cat "$OUT/verify-v21-finops.log"; exit 9; }
