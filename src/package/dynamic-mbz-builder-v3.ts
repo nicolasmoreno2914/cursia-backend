@@ -539,13 +539,49 @@ class MbzWriter {
   }
 }
 
-function inforef(fileIds: number[], gradeItemIds: number[] = [], qcats: number[] = []): string {
+function inforef(fileIds: number[], gradeItemIds: number[] = [], qcats: number[] = [], roleIds: number[] = []): string {
   let x = '<?xml version="1.0" encoding="UTF-8"?>\n<inforef>\n';
+  // LOOP 7 (A4 I1): los roles que usa un override de la actividad (Moodle solo carga y mapea los roles referenciados).
+  if (roleIds.length) x += `  <roleref>\n${roleIds.map((id) => `    <role><id>${id}</id></role>`).join('\n')}\n  </roleref>\n`;
   if (fileIds.length) x += `  <fileref>\n${fileIds.map((id) => `    <file><id>${id}</id></file>`).join('\n')}\n  </fileref>\n`;
   if (gradeItemIds.length) x += `  <grade_itemref>\n${gradeItemIds.map((id) => `    <grade_item><id>${id}</id></grade_item>`).join('\n')}\n  </grade_itemref>\n`;
   if (qcats.length) x += `  <question_categoryref>\n${qcats.map((id) => `    <question_category><id>${id}</id></question_category>`).join('\n')}\n  </question_categoryref>\n`;
   return x + '</inforef>';
 }
+
+/**
+ * LOOP 7 (A4 I1) — solucionario docente: además de oculto, el rol ESTUDIANTE tiene PROHIBIDO ver la página
+ * (override `mod/page:view` = CAP_PROHIBIT en el contexto de la actividad). Si un docente la muestra por error (un
+ * clic en «Mostrar», edición masiva, modo sigiloso), un estudiante sigue sin poder abrirla ni descargar su PDF
+ * (pluginfile de mod_page exige `mod/page:view`). Rol de respaldo 5 = student (arquetipo student): el restore lo
+ * mapea por nombre corto / arquetipo al rol estudiante del sitio.
+ */
+export const STUDENT_ROLE_BACKUP_ID = 5;
+export const TEACHER_ONLY_ROLES_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<roles>
+  <role_overrides>
+    <override id="1">
+      <roleid>${STUDENT_ROLE_BACKUP_ID}</roleid>
+      <capability>mod/page:view</capability>
+      <permission>-1000</permission>
+      <timemodified>0</timemodified>
+      <modifierid>0</modifierid>
+    </override>
+  </role_overrides>
+  <role_assignments>
+  </role_assignments>
+</roles>`;
+export const STUDENT_ROLE_DEFINITION_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<roles_definition>
+  <role id="${STUDENT_ROLE_BACKUP_ID}">
+    <name></name>
+    <shortname>student</shortname>
+    <nameincourse>$@NULL@$</nameincourse>
+    <description></description>
+    <sortorder>5</sortorder>
+    <archetype>student</archetype>
+  </role>
+</roles_definition>`;
 
 function withIdnumber(xml: string, idnumber: string): string {
   return applyXmlFields(xml, { idnumber: xmlEsc(idnumber) });
@@ -995,14 +1031,16 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
 
   // Fase 2: página (mod_page) con archivos en su filearea `content` (enlaces @@PLUGINFILE@@/<archivo>).
   // `hidden`: visible=0 (solo docentes: moodle/course:viewhiddenactivities). `completionView`: se marca al verla.
+  let teacherOnlyPages = 0;
   const addPage = (
     secnum: number,
     idnumber: string,
     page: { name: string; html: string },
     files: Array<{ name: string; data: Buffer; mime: string }>,
-    opts: { hidden?: boolean; completionView?: boolean } = {},
+    opts: { hidden?: boolean; completionView?: boolean; teacherOnly?: boolean } = {},
   ): ActivityRef => {
     const a = W.newActivity('page', secnum, page.name, idnumber);
+    if (opts.teacherOnly) teacherOnlyPages++;
     const fileIds = files.map((f) => W.addFile(a.ctx, 'mod_page', 'content', f.name, f.data, f.mime));
     W.put(`${a.dir}/page.xml`, `<?xml version="1.0" encoding="UTF-8"?>
 <activity id="${a.aid}" moduleid="${a.mid}" modulename="page" contextid="${a.ctx}">
@@ -1021,13 +1059,14 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   </page>
 </activity>`);
     W.put(`${a.dir}/module.xml`, applyXmlFields(withIdnumber(moduleXml(a.mid, 'page', secnum, ts, MV.bv), idnumber), {
-      ...(opts.hidden ? { visible: '0', visibleold: '0' } : {}),
+      ...(opts.hidden || opts.teacherOnly ? { visible: '0', visibleold: '0' } : {}),
       ...(opts.completionView ? { completion: '2', completionview: '1' } : { completion: '0' }),
       downloadcontent: '0',
     }));
-    W.put(`${a.dir}/inforef.xml`, inforef(fileIds));
+    W.put(`${a.dir}/inforef.xml`, inforef(fileIds, [], [], opts.teacherOnly ? [STUDENT_ROLE_BACKUP_ID] : []));
     W.put(`${a.dir}/grades.xml`, gradesXml(a.aid));
     W.boilerplate(a.dir);
+    if (opts.teacherOnly) W.put(`${a.dir}/roles.xml`, TEACHER_ONLY_ROLES_XML);
     labelsHtml.push({ where: idnumber, html: page.html });
     return a;
   };
@@ -1347,7 +1386,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
           const student = applicationStudentPage({ ...pageIn, pdfFilename: studentPdfName }, theme);
           addPage(sec, `${idp}:application`, { name: safeActivityName(student.name), html: student.html }, [{ name: studentPdfName, data: studentPdf.pdf, mime: 'application/pdf' }], { completionView: true });
           const teacher = applicationSolutionPage({ ...pageIn, pdfFilename: teacherPdfName }, theme);
-          addPage(sec, `${idp}:application_solution`, { name: safeActivityName(teacher.name), html: teacher.html }, [{ name: teacherPdfName, data: teacherPdf.pdf, mime: 'application/pdf' }], { hidden: true });
+          addPage(sec, `${idp}:application_solution`, { name: safeActivityName(teacher.name), html: teacher.html }, [{ name: teacherPdfName, data: teacherPdf.pdf, mime: 'application/pdf' }], { teacherOnly: true });
           continue;
         }
         // slot.kind === 'activity'
@@ -1559,7 +1598,9 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   }));
 
   // ── Archivos raíz ────────────────────────────────────────────────────────
-  W.put('roles.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<roles_definition>\n</roles_definition>');
+  // LOOP 7 (A4 I1): el rol estudiante se define solo si algún solucionario lo usa (paquetes sin Actividades de
+  // Aplicación: byte-idénticos a antes).
+  W.put('roles.xml', teacherOnlyPages > 0 ? STUDENT_ROLE_DEFINITION_XML : '<?xml version="1.0" encoding="UTF-8"?>\n<roles_definition>\n</roles_definition>');
   W.put('scales.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<scales_definition>\n</scales_definition>');
   W.put('outcomes.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<outcomes_definition>\n</outcomes_definition>');
   // EV6 (T3): certificado = insignia de curso (criterio: completion del curso) + su imagen.

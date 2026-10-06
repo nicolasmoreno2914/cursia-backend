@@ -78,3 +78,35 @@ export function readActivityTypeRulesConfig(env: NodeJS.ProcessEnv = process.env
     `${ACTIVITY_TYPE_RULES_ENV} inválido: ${JSON.stringify(raw)} (valores permitidos: "0", "1" o "2"; ausente = 0)`,
   );
 }
+
+/**
+ * LOOP 7 (A2 A3) — FUENTE ÚNICA del marcador de reglas de actividad que tendrá el PRÓXIMO Manifest v3 del curso:
+ * el del Manifest v3 más reciente del curso (`features.activityTypeRules ?? 0`); sin Manifest v3 previo, la config.
+ * La usan el Manifest nuevo (GenerationManifestsService), el dry-run del curso («Cursia recomienda»), «Aplicar
+ * diseño» y la vista previa del impacto: lo que se muestra se dimensiona con las mismas reglas que se congelan.
+ */
+export async function activityTypeRulesForNextManifest(
+  q: { query(sql: string, params?: unknown[]): Promise<any> },
+  courseId: number,
+  env: NodeJS.ProcessEnv = process.env,
+  opts: { tableKnownToExist?: boolean } = {},
+): Promise<ActivityTypeRulesVersion> {
+  // Sin la tabla de Manifests (esquema sin esa migración) no hay Manifest previo → config, como antes. to_regclass no
+  // falla (una consulta fallida abortaría la transacción del llamador, p. ej. «Aplicar diseño»).
+  const [reg] = opts.tableKnownToExist ? [{ ok: true }] : await q.query(`select to_regclass('public.course_generation_manifests') is not null as ok`);
+  const [prev] = reg && reg.ok
+    ? await q.query(
+      `select id, manifest_json->'features'->'activityTypeRules' as activity_type_rules
+         from public.course_generation_manifests
+        where course_id = $1 and rules_version = 3
+        order by created_at desc, id desc
+        limit 1`,
+      [courseId],
+    )
+    : [];
+  if (!prev) return readActivityTypeRulesConfig(env);
+  const raw = prev.activity_type_rules;
+  if (raw === undefined || raw === null) return 0;
+  if (raw === 0 || raw === 1 || raw === 2) return raw;
+  throw new Error(`Generation Manifest #${String(prev.id)}: features.activityTypeRules guardado inválido (${JSON.stringify(raw)})`);
+}

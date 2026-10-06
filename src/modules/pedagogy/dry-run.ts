@@ -100,7 +100,26 @@ export interface ProviderPlan {
   byProvider: Record<string, { items: number; operations: Record<string, number> }>;
   estimateUsd: { min: string; expected: string; max: string; byProvider: Record<string, string> } | null;
   estimateNote: string;
+  /**
+   * LOOP 7 (A3 I3/I4/I7): desglose por categoría (esperado, USD) — audiovisual (video, presentaciones, audio y guion
+   * del audiolibro), Actividades de Aplicación, texto con IA —, proveedores con tarifa PROVISIONAL (no verificada) y
+   * los supuestos del estimado. Ausentes si no hay estimación.
+   */
+  byCategory?: { audiovisual: string; application: string; text: string };
+  unverifiedProviders?: string[];
+  assumptions?: string[];
 }
+
+/** LOOP 7: categoría de costo visible de un tipo de item (fuente única para panel, impacto y modal). */
+export const COST_CATEGORY_OF_ITEM_TYPE: Readonly<Record<string, 'audiovisual' | 'application' | 'text'>> = Object.freeze({
+  video: 'audiovisual', presentation: 'audiovisual', audio_welcome: 'audiovisual', audiobook_chapter: 'audiovisual',
+  application_activity: 'application',
+});
+export const ESTIMATE_ASSUMPTIONS: readonly string[] = Object.freeze([
+  'Es una estimación: el uso de cada recurso sale de un modelo típico por tipo (aún no medido con cursos reales), no del contenido de tu curso.',
+  'El texto con IA se valúa con el modelo recomendado (Sonnet 4.6); con un modelo más económico costaría menos.',
+  'Cada recurso puede necesitar un reintento: por eso hay un rango.',
+]);
 
 export interface DryRunSide {
   blueprint: BlueprintSnapshotV2;
@@ -405,6 +424,30 @@ export function materializeDistribution(base: BlueprintSnapshotV2, dist: Distrib
 }
 
 /**
+ * LOOP 7 (A2 A4): la tarjeta y lo que se congela salen de dos cálculos (distribuidor vs Manifest materializado).
+ * Cualquier diferencia de horas o de conteos es un error visible (nunca una tarjeta que miente en silencio).
+ */
+export function distributionModelMismatch(
+  dist: DistributionResult,
+  ms: { manifest: GenerationManifestV1; studyTime: StudyTimeEstimate },
+): { code: string; message: string }[] {
+  const t = ms.manifest.totals as unknown as Record<string, number | undefined>;
+  const n = (k: string) => Number(t[k] ?? 0);
+  const pairs: [string, number, number][] = [
+    ['horas', dist.estimatedHours, ms.studyTime.courseEstimatedHours],
+    ['capítulos', dist.counts.chapters, n('experienceCount')],
+    ['capítulos con video', dist.counts.videoChapters, n('videoCount')],
+    ['actividades', dist.counts.activities, n('activityCount')],
+    ['Actividades de Aplicación', dist.counts.applicationActivities, n('applicationActivityCount')],
+    ['evaluaciones', dist.counts.evaluations, n('examCount') + n('finalExamCount')],
+  ];
+  const off = pairs.filter(([, a, b]) => Math.abs(a - b) > 1e-6);
+  return off.length
+    ? [{ code: 'DISTRIBUTION_MODEL_MISMATCH', message: `DISTRIBUTION_MODEL_MISMATCH: la propuesta no coincide con su Manifest (${off.map(([k, a, b]) => `${k} ${a} ≠ ${b}`).join('; ')}); no se puede aplicar.` }]
+    : [];
+}
+
+/**
  * La propuesta materializada; si falla (bug del materializador o diseño no representable) el error queda VISIBLE en
  * `manifestErrors` sin tumbar la línea base ni la vista pedagógica del dry-run.
  */
@@ -455,7 +498,7 @@ function seedCatalog(): any[] {
 }
 
 /** Proveedores y operaciones que dispararía el Manifest + estimación con el seed de precios (sin DB, sin red). */
-export function providerPlanFor(manifest: GenerationManifestV1): ProviderPlan {
+export function providerPlanFor(manifest: GenerationManifestV1, opts?: { coverageItems?: GenerationManifestV1['items'] }): ProviderPlan {
   const byProvider: ProviderPlan['byProvider'] = {};
   for (const it of manifest.items) {
     if (!isFinopsItemType(it.type)) continue;
@@ -475,11 +518,27 @@ export function providerPlanFor(manifest: GenerationManifestV1): ProviderPlan {
   let estimateUsd: ProviderPlan['estimateUsd'] = null;
   let estimateNote = 'Estimación con los precios del seed versionado (pricing-seed.v1) y el modelo de uso v1. Nada se ejecuta ni se cobra en el dry-run.';
   try {
-    const items = estimateItemsForRun(manifest.items, 'real');
+    const items = estimateItemsForRun(manifest.items, 'real', null, opts?.coverageItems ? { coverageItems: opts.coverageItems } : null);
     const est = estimateCost({ items, catalog: seedCatalog(), usageModel: usageModelPriorsV1(), retryPolicy: { maxRetries: 1 } });
     const byP: Record<string, string> = {};
     for (const k of Object.keys(est.totals.byProvider).sort()) byP[k] = est.totals.byProvider[k].expected;
     estimateUsd = { min: est.totals.min, expected: est.totals.expected, max: est.totals.max, byProvider: byP };
+    const cat = { audiovisual: 0, application: 0, text: 0 };
+    for (const [type, v] of Object.entries(est.totals.byItemType)) cat[COST_CATEGORY_OF_ITEM_TYPE[type] ?? 'text'] += Number(v.expected);
+    const unverified = new Set<string>();
+    for (const l of est.lines) {
+      // Los multiplicadores de caché son derivados (×1,25 / ×0,1 de la tarifa verificada) y de peso marginal: no
+      // vuelven «provisional» a un proveedor cuyas tarifas principales están verificadas.
+      const rows = seedCatalog().filter((r) => r.provider === l.provider && r.product_or_model === l.product && !/^cache_/.test(String(r.meter)));
+      if (rows.some((r) => r.verified !== true)) unverified.add(l.provider);
+    }
+    const unverifiedProviders = [...unverified].sort();
+    return {
+      byProvider: sorted, estimateUsd, estimateNote,
+      byCategory: { audiovisual: cat.audiovisual.toFixed(2), application: cat.application.toFixed(2), text: cat.text.toFixed(2) },
+      unverifiedProviders,
+      assumptions: [...ESTIMATE_ASSUMPTIONS, ...(unverifiedProviders.length ? [`Tarifa provisional (no verificada con la factura) para: ${unverifiedProviders.join(', ')}.`] : [])],
+    };
   } catch (e) {
     estimateNote = `Sin estimación de costo: ${(e as Error).message}`;
   }
@@ -618,7 +677,9 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
         return {
           blueprintSha256: ms.blueprintSha256,
           manifestSha256: ms.manifestSha256,
-          manifestErrors: ms.manifestErrors,
+          // LOOP 7 (A2 A4): la tarjeta «Cursia recomienda» muestra horas y conteos del modelo del distribuidor; si no
+          // coinciden con el Manifest materializado (lo que se congelaría), el error es visible y «Aplicar» se bloquea.
+          manifestErrors: [...ms.manifestErrors, ...distributionModelMismatch(dist, ms)],
           items: ms.manifest.items.length,
           totals: { ...(ms.manifest.totals as any) },
           providers: ms.providers,

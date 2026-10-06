@@ -212,12 +212,20 @@ export function estimateItemsForRun(
   items: readonly RunManifestItem[],
   mode: RunSpendMode | RunSpendModes,
   actions?: Readonly<Record<string, string>> | null,
-  opts?: { chapterWords?: Readonly<Record<string, number>> | null } | null,
+  opts?: {
+    chapterWords?: Readonly<Record<string, number>> | null;
+    /**
+     * LOOP 7 (A3 I1): items del Manifest COMPLETO. Al estimar un subconjunto (regeneración, impacto de cambios) los
+     * exámenes cubren igual todos los capítulos de su módulo / del curso; sin esto el banco se escalaba con los
+     * capítulos del subconjunto y el costo de los cambios salía subestimado.
+     */
+    coverageItems?: readonly RunManifestItem[] | null;
+  } | null,
 ): EstimateItem[] {
   if (!Array.isArray(items)) throw new FinopsError('INVALID_INPUT', 'estimateItemsForRun necesita items[]');
   const modes = asModes(mode);
   const out: EstimateItem[] = [];
-  const chapters = manifestChapters(items);
+  const chapters = manifestChapters(opts?.coverageItems ?? items);
   for (const it of items) {
     if (WORKER_PAID_ITEM_TYPES.includes(it.type) && spendModeOfItemType(modes, it.type) === 'mock') continue;
     // V542: el banco del examen escala con los capítulos que cubre (módulo: los suyos; final: todos).

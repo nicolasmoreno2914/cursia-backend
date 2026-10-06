@@ -65,6 +65,8 @@ const V3OUT = path.join(OUT, 'v3');
 fs.mkdirSync(V3OUT, { recursive: true });
 const NET_LOG = path.join(V3OUT, 'net-violations.log');
 const MOODLE_SCRATCH = process.env.MOODLE_SCRATCH;
+// LOOP 7: restores de Moodle con la sesión del admin (como un restore web): los overrides del paquete se aplican.
+process.env.CURSIA_RESTORE_PHP = process.env.CURSIA_RESTORE_PHP || path.join(REPO, 'scripts/moodle/restore-as-admin.php');
 // V2.1 F2: `E2E_V3_ONLY=real-providers` corre SOLO arranque + workers + E4 (Gamma/TTS/LLM reales contra
 // fakes locales), sin E1–E3 ni restores de Moodle (para correrlo aparte cuando el Moodle local está ocupado).
 const ONLY_REAL_PROVIDERS = process.env.E2E_V3_ONLY === 'real-providers';
@@ -1528,10 +1530,219 @@ function reservationBookkeeping(ev) {
       results.courses.E10 = { courseId, unchanged: d0.impact.totals, oneChapter: { toRun: d1.impact.toRun.length, usd: d1.impact.cost.toRun.estimateUsd.expected }, approachPreview: { toRun: d2.impact.toRun.length } };
     }, { fatal: false });
 
+    // ═══ LOOP 7 · E11 — FLUJO COMPLETO en un solo curso (solo mocks, USD 0): microcurrículo → contexto académico →
+    // enfoque → 64 h → «Cursia recomienda» → Ver diseño → Ajustar → nuevo diseño → Aplicar → Blueprint → Manifest →
+    // Actividades de Aplicación → coherencia → costo simulado → generación → empaque → impacto de un cambio →
+    // regeneración parcial (= el impacto previsto) → re-empaque → restauración en Moodle (abajo, con estudiante real).
+    if (RUN_E5) await step('v3-E11-flujo-completo', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const DRY = D('modules/pedagogy/dry-run.js');
+      const STI = D('modules/study-time/index.js');
+      const MIN = D('modules/study-time/manifest-input.js');
+      const usd = (plan) => (plan && plan.estimateUsd ? Number(plan.estimateUsd.expected) : null);
+      const net0 = fs.existsSync(NET_LOG) ? fs.readFileSync(NET_LOG, 'utf8').length : 0;
+      const title = '[E2E Flujo completo E11] Contabilidad de Costos';
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title });
+      ok(cr.status === 201, 'E11: curso dinámico creado', { s: cr.status, e: cr.error });
+      const courseId = Number(cr.data.id);
+
+      // 1. Microcurrículo → contexto académico (determinista, sin proveedores) → guardado.
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo.docx', dataBase64: (await AF.fixture('consistent', 'docx')).toString('base64') }] });
+      ok(ex.status === 200 && ex.data.stats.providersCalled === 0 && ex.data.validation.canProceed, 'E11: microcurrículo → contexto académico (0 proveedores)', { s: ex.status, e: ex.error });
+      const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 });
+      ok(sv.status === 201, 'E11: contexto académico guardado (versión 1)', { s: sv.status, e: sv.error });
+      const dz = (await api('GET', `/courses/${courseId}/academic-context/design`)).data;
+      const prop = dz.structureProposal;
+
+      // 2. Estructura del microcurrículo (lo que hace «Proponer estructura»).
+      let st = await readStructure(courseId);
+      let counter = st.structureVersionCounter;
+      for (const m of st.modules) counter = (await api('DELETE', `/courses/${courseId}/modules/${m.id}`, { expectedCounter: counter })).data.structureVersionCounter;
+      const setg = await api('PATCH', `/courses/${courseId}/structure-settings`, { finalExam: true, activityEngine: 'h5p', expectedCounter: counter });
+      counter = setg.data.structureVersionCounter;
+      for (const pm of prop.modules) {
+        const cm = await api('POST', `/courses/${courseId}/modules`, { title: pm.title, objective: pm.objective, examEnabled: true, expectedCounter: counter });
+        if (cm.status !== 201) throw new Error(`E11 módulo: ${cm.status} ${cm.error}`);
+        counter = cm.data.structureVersionCounter;
+        const auto = cm.data.module.chapters || [];
+        for (let ci = 0; ci < pm.chapters.length; ci++) {
+          const pc = pm.chapters[ci];
+          const body = { title: pc.title, objective: pc.objective || `Aplicar ${pc.title.toLowerCase()}`, videoEnabled: pc.videoEnabled, activityEnabled: pc.activityEnabled, ...(pc.description ? { description: pc.description } : {}), ...(pc.outcomeIds.length ? { outcomeIds: pc.outcomeIds } : {}), expectedCounter: counter };
+          const r = ci === 0 && auto.length === 1 ? await api('PATCH', `/courses/${courseId}/modules/${cm.data.module.id}/chapters/${auto[0].id}`, body) : await api('POST', `/courses/${courseId}/modules/${cm.data.module.id}/chapters`, body);
+          if (![200, 201].includes(r.status)) throw new Error(`E11 capítulo ${pc.title}: ${r.status} ${r.error}`);
+          counter = r.data.structureVersionCounter;
+        }
+      }
+      const A = D('modules/course-profiles/course-profiles.js');
+      const assessment = { ...A.defaultAssessmentProfile({ finalExam: true }), passingGrade: 70 };
+      ok((await api('POST', `/courses/${courseId}/profiles/assessment`, { data: assessment })).status === 201, 'E11: perfil de evaluación');
+      ok((await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 } })).status === 201, 'E11: perfil de presentación');
+
+      // 3. Enfoque (el docente lo elige sobre la sugerencia del contexto) + 64 h.
+      const profile1 = { ...dz.profileSuggestion.profile, primaryApproach: 'competencias', secondaryApproaches: [], targetHours: 64 };
+      const pg1 = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: profile1, expectedVersion: 0 });
+      ok(pg1.status === 201, 'E11: enfoque competencias + 64 h guardados', { s: pg1.status, e: pg1.error });
+
+      // 4. «Cursia recomienda»: cada número sale del diseño materializado (Manifest), nunca de otra cuenta.
+      const card = (dr) => {
+        const d = dr.distribution;
+        const t = d.materialized.totals;
+        ok(d.materialized.manifestErrors.length === 0, 'E11: diseño materializado sin errores (DISTRIBUTION_MODEL_MISMATCH incluido)', d.materialized.manifestErrors);
+        eq([d.counts.chapters, d.counts.videoChapters, d.counts.applicationActivities, d.counts.evaluations, d.estimatedHours],
+          [t.experienceCount, t.videoCount, t.applicationActivityCount, t.examCount + t.finalExamCount, d.materialized.generableHours], 'E11: tarjeta = Manifest materializado (capítulos, videos, Actividades de Aplicación, evaluaciones, horas)');
+        ok(d.materialized.providers.byCategory && d.materialized.providers.assumptions.length >= 3 && Number(d.materialized.providers.estimateUsd.min) < Number(d.materialized.providers.estimateUsd.expected),
+          'E11: costo con rango, desglose y supuestos (estimación, no precio)', d.materialized.providers.byCategory);
+        return d;
+      };
+      const dr1 = await api('POST', `/courses/${courseId}/pedagogy/dry-run`, {});
+      ok([200, 201].includes(dr1.status), 'E11: «Cursia recomienda» (dry-run) → OK', { s: dr1.status, e: dr1.error });
+      const d1 = card(dr1.data);
+      ok(d1.status === 'within_tolerance' && d1.targetHours === 64, `E11: 64 h dentro de la tolerancia (${d1.estimatedHours} h)`, { st: d1.status, h: d1.estimatedHours });
+
+      // 5. Ajustar (énfasis en profundidad) → nuevo diseño, distinto, con la misma garantía.
+      const profile2 = { ...profile1, designPreferences: { emphasis: 'depth' } };
+      const pg2 = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: profile2, expectedVersion: 1 });
+      ok(pg2.status === 201, 'E11: «Ajustar» guardado (énfasis profundidad)', { s: pg2.status, e: pg2.error });
+      const dr2 = await api('POST', `/courses/${courseId}/pedagogy/dry-run`, {});
+      const d2 = card(dr2.data);
+      ok(d2.proposalSha256 !== d1.proposalSha256 && d2.policy.kind === 'depth_first', 'E11: «Ajustar» produce un diseño nuevo (política de profundidad)', { p: d2.policy.kind });
+
+      // 6. Aplicar diseño: la huella vieja da 409; la nueva aplica.
+      st = await readStructure(courseId);
+      const stale = await api('POST', `/courses/${courseId}/modules/apply-distribution`, { expectedCounter: st.structureVersionCounter, proposalSha256: d1.proposalSha256 });
+      ok(stale.status === 409 && /PROPOSAL_CHANGED/.test(String(stale.error)), 'E11: aplicar el diseño anterior al «Ajustar» → 409 PROPOSAL_CHANGED', { s: stale.status, e: stale.error });
+      const ap = await api('POST', `/courses/${courseId}/modules/apply-distribution`, { expectedCounter: st.structureVersionCounter, proposalSha256: d2.proposalSha256 });
+      ok([200, 201].includes(ap.status), 'E11: «Aplicar diseño» → estructura con práctica y Actividades de Aplicación', { s: ap.status, e: ap.error });
+
+      // 7. Blueprint + Manifest congelados = lo que mostró la vista previa (preview = generación).
+      st = await readStructure(courseId);
+      const lock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st.structureVersionCounter });
+      ok(lock.status === 201, 'E11: lock → Blueprint', { s: lock.status, e: lock.error });
+      const snap = lock.data.blueprint.snapshot;
+      const n = lock.data.blueprint.blueprintNumber;
+      const man = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest`);
+      ok(man.status === 201 && man.data.manifest.rulesVersion === 3, 'E11: Manifest v3', { s: man.status, e: man.error });
+      const M = man.data.manifest.manifest;
+      const hoursFrozen = STI.estimateCourseStudyTime(MIN.studyTimeInputFromManifest(M, snap)).courseEstimatedHours;
+      eq([M.totals.experienceCount, M.totals.videoCount, M.totals.applicationActivityCount, M.totals.examCount + M.totals.finalExamCount, hoursFrozen],
+        [d2.counts.chapters, d2.counts.videoChapters, d2.counts.applicationActivities, d2.counts.evaluations, d2.estimatedHours], 'E11: lo congelado = «Cursia recomienda» después de Ajustar (capítulos, videos, actividades, evaluaciones, horas)');
+      ok(Math.abs(usd(DRY.providerPlanFor(M)) - usd(d2.materialized.providers)) < 0.005, 'E11: costo del Manifest congelado = costo mostrado', { frozen: usd(DRY.providerPlanFor(M)), shown: usd(d2.materialized.providers) });
+      ok(snap.course.academicContext && snap.course.pedagogy && snap.course.targetHours === 64, 'E11: Blueprint con contexto académico, diseño pedagógico y 64 h');
+
+      // 8. Actividades de Aplicación: una por capítulo marcado, con sus minutos; ninguna en un capítulo sin marca.
+      const apps = M.items.filter((i) => i.type === 'application_activity');
+      const marked = M.modules.flatMap((m) => m.chapters).filter((c) => c.applicationMinutes !== undefined);
+      eq(apps.map((i) => i.chapterId).sort(), marked.map((c) => c.chapterId).sort(), `E11: ${apps.length} Actividades de Aplicación, una por capítulo marcado`);
+      ok(marked.some((c) => c.kind === 'practice'), 'E11: también en capítulos de práctica');
+
+      // 9. Coherencia del diseño congelado.
+      const co = (await api('POST', `/courses/${courseId}/pedagogy/dry-run`, {})).data.alignment;
+      ok(co && co.available === true && co.outcomes.length === 8 && co.counts.critical === 0, 'E11: coherencia: 6 RA + 2 competencias, 0 críticos', co && co.counts);
+
+      // 10. Costo simulado antes de generar = el del Manifest (USD 0 gastado).
+      const pre = await api('POST', `/courses/${courseId}/change-impact`, {});
+      ok(pre.status === 200 && pre.data.available === false && pre.data.reason === 'NO_PREVIOUS_RUN' && Math.abs(usd(pre.data.fullGeneration) - usd(DRY.providerPlanFor(M))) < 0.005,
+        'E11: sin generar aún → el impacto ofrece el costo de generarlo completo (= Manifest)', { s: pre.status, d: pre.data && pre.data.reason });
+
+      // 11. Generación completa con proveedores FALSOS (Videogen local, Gamma/TTS mock, LLM falso).
+      const mods = st.modules;
+      llm.st.courseId = courseId;
+      llm.st.chapterByTitle.clear(); llm.st.moduleByTitle.clear(); llm.st.moduleOfChapter.clear();
+      for (const m of mods) { llm.st.moduleByTitle.set(m.title, m.id); for (const x of m.chapters) { llm.st.chapterByTitle.set(x.title, x.id); llm.st.moduleOfChapter.set(x.id, m.id); } }
+      const ctx = { nombre: title, ...CTX, scormTemplateIds: S.templates };
+      const body = { ...ctx, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
+      let start = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest/runs`, body);
+      const estM = /estimateId=([0-9a-f-]{36})/.exec(String(start.error || ''));
+      if (start.status === 409 && estM) {
+        await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+                 values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e E11: aprobación del run (proveedores FALSOS locales)')`, [courseId, estM[1]]);
+        start = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest/runs`, body);
+      }
+      ok(start.status === 201, 'E11: run creado (Videogen falso, Gamma/TTS mock)', { s: start.status, e: start.error });
+      if (start.status !== 201) throw new Error(`E11: run no creado: ${start.status} ${start.error}`);
+      const runA = start.data.run.id;
+      llm.st.tag = 'E11';
+      S.front.DYN_EXAM_BANK_MODE_ENABLED = false;
+      let stt = await waitRunTerminal(S.front.dynExecutorStart({ courseId, blueprintNumber: n, runId: runA }), 'E11 run', undefined, runA);
+      const itemsA = await waitItemsDone(runA);
+      ok(stt.failed === 0 && !stt.fatalError && itemsA.every((i) => i.status === 'completed'), `E11: los ${itemsA.length} items generados sin fallos`, itemsA.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error_message || '').slice(0, 200)]));
+      ok(llm.st.unknown.length === 0, 'E11: LLM falso sin prompts no reconocidos', llm.st.unknown);
+      eq(itemsA.map((i) => i.item_key).sort(), M.items.map((i) => i.key).sort(), 'E11: items generados = items del Manifest');
+
+      // 12. Empaque (.mbz) con solucionarios ocultos y prohibidos al estudiante.
+      const P1 = await packageRun('E11', courseId, n, runA);
+      const z1 = await JSZip.loadAsync(P1.buf);
+      const solDirs = [];
+      for (const f of Object.keys(z1.files).filter((x) => /^activities\/page_\d+\/module\.xml$/.test(x))) {
+        if (/:application_solution<\/idnumber>/.test(await z1.file(f).async('string'))) solDirs.push(f.replace('/module.xml', ''));
+      }
+      const solOk = await Promise.all(solDirs.map(async (d) => /<roleid>5<\/roleid>\s*<capability>mod\/page:view<\/capability>\s*<permission>-1000<\/permission>/.test(await z1.file(`${d}/roles.xml`).async('string'))));
+      ok(solDirs.length === apps.length && solOk.every(Boolean), `E11: ${solDirs.length} solucionarios con mod/page:view PROHIBIDO al estudiante`);
+
+      // 13. Impacto de un cambio (un capítulo) = lo que después se regenera de verdad.
+      const m0 = st.modules[0];
+      const ch = m0.chapters.find((c) => c.kind !== 'practice');
+      const newTitle = `${ch.title} (revisado)`;
+      let st2 = await readStructure(courseId);
+      const up = await api('PATCH', `/courses/${courseId}/modules/${m0.id}/chapters/${ch.id}`, { title: newTitle, expectedCounter: st2.structureVersionCounter });
+      ok(up.status === 200, 'E11: el docente edita el título de un capítulo', { s: up.status, e: up.error });
+      llm.st.chapterByTitle.set(newTitle, ch.id);
+      const imp = await api('POST', `/courses/${courseId}/change-impact`, {});
+      const I = imp.data && imp.data.impact;
+      // Cambia ESE capítulo y, por dependencia, las prácticas de SU módulo (integran los contenidos del módulo); nada más.
+      const practiceOfM0 = new Set(m0.chapters.filter((c) => c.kind === 'practice').map((c) => c.id));
+      const changedCh = I ? I.chapters.filter((c) => !c.untouched).map((c) => c.chapterId) : [];
+      ok(imp.status === 200 && imp.data.fromRunId === runA && changedCh.includes(ch.id) && changedCh.every((id) => id === ch.id || practiceOfM0.has(id)) && I.toRun.some((k) => k === `content:${ch.id}`) && Number(I.estimatedChangeCostUsd) > 0,
+        'E11: impacto: cambian ese capítulo y las prácticas de su módulo (dependen de él); nada más; costo estimado > 0', I && { changed: changedCh.length, practiceInModule: practiceOfM0.size, toRun: I.toRun.length, usd: I.estimatedChangeCostUsd });
+      st2 = await readStructure(courseId);
+      const lock2 = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st2.structureVersionCounter });
+      const n2 = lock2.data.blueprint.blueprintNumber;
+      const man2 = await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest`);
+      ok(lock2.status === 201 && man2.status === 201, 'E11: nueva versión congelada (Blueprint + Manifest)', { l: lock2.status, m: man2.status });
+      const plan = await api('GET', `/courses/${courseId}/blueprints/${n2}/manifest/invalidation-plan?fromRun=${runA}`);
+      const regen = plan.data.plan.actions.filter((a) => a.inTargetManifest && (a.action === 'REGENERATE' || a.action === 'GENERATE')).map((a) => a.itemKey).sort();
+      eq(regen, [...I.toRun, ...I.paidNew, ...I.paidRetry].sort(), 'E11: el plan real de regeneración = el impacto previsto (mismos items)');
+      eq(plan.data.costEstimate.estimatedChangeCostUsd, I.estimatedChangeCostUsd, 'E11: «Generar solo lo que cambió» muestra el mismo costo que el impacto');
+
+      // 14. Regeneración parcial real: solo los items del plan tienen una generación nueva.
+      let runB = await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest/runs`, { fromRun: runA });
+      const estB = /estimateId=([0-9a-f-]{36})/.exec(String(runB.error || ''));
+      if (runB.status === 409 && estB) {
+        await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+                 values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e E11: regeneración parcial (LLM falso)')`, [courseId, estB[1]]);
+        runB = await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest/runs`, { fromRun: runA });
+      }
+      ok(runB.status === 201 && runB.data.invalidation && runB.data.invalidation.planSha256 === plan.data.plan.planSha256, 'E11: regeneración parcial creada con el plan previsto (planSha256)', { s: runB.status, e: runB.error });
+      const runBId = runB.data.run.id;
+      const calls0 = llm.st.v3calls.length;
+      stt = await waitRunTerminal(S.front.dynExecutorStart({ courseId, blueprintNumber: n2, runId: runBId }), 'E11 regeneración', undefined, runBId);
+      const itemsB = await waitItemsDone(runBId);
+      ok(stt.failed === 0 && !stt.fatalError, 'E11: la regeneración parcial terminó sin fallos', stt);
+      const generatedB = itemsB.filter((i) => i.status === 'completed' && !(i.output_summary && i.output_summary.carriedFrom)).map((i) => i.item_key);
+      ok(regen.every((k) => itemsB.some((i) => i.item_key === k && i.status === 'completed')), 'E11: cada item del plan quedó regenerado', regen.filter((k) => !itemsB.some((i) => i.item_key === k && i.status === 'completed')));
+      ok(llm.st.v3calls.length - calls0 > 0 && llm.st.v3calls.length - calls0 <= regen.length * 3, `E11: solo se llamó al LLM para lo que cambió (${llm.st.v3calls.length - calls0} llamadas para ${regen.length} items)`);
+      void generatedB;
+      const P2 = await packageRun('E11-regen', courseId, n2, runBId);
+      const z2 = await JSZip.loadAsync(P2.buf);
+      const titles = await Promise.all(Object.keys(z2.files).filter((x) => /^sections\/section_\d+\/section\.xml$/.test(x)).map((f) => z2.file(f).async('string')));
+      ok(titles.some((x) => x.includes(newTitle.replace(/&/g, '&amp;'))), 'E11: el re-empaque lleva el capítulo editado');
+      ok(fs.existsSync(NET_LOG) && fs.readFileSync(NET_LOG, 'utf8').length === net0, 'E11: 0 conexiones fuera de 127.0.0.1 en todo el flujo (netguard)');
+      const reviewIds = (P) => ((P.job.output_summary || {}).h5pPackages || []).filter((p) => /^review_cards:/.test(p.itemKey)).map((p) => p.itemKey.slice('review_cards:'.length));
+      const modsOf = async () => (await readStructure(courseId)).modules.map((m) => ({ id: m.id, title: m.title, chapters: m.chapters.map((x) => ({ id: x.id, title: x.title })) }));
+      const modsB = await modsOf();
+      const modsA = modsB.map((m) => ({ ...m, chapters: m.chapters.map((x) => (x.id === ch.id ? { ...x, title: ch.title } : x)) }));
+      const info = (manifest, P, modules) => ({ courseId, spec: { passing: 70, engine: 'h5p' }, assessment, manifestModules: manifest.modules, features: manifest.features, applications: apps.length, reviewCardsChapterIds: reviewIds(P), modules });
+      results.courses.E11 = { ...info(M, P1, modsA), blueprintNumber: n, runId: runA, items: itemsA.length, hours: hoursFrozen, usd: usd(DRY.providerPlanFor(M)), adjust: { from: d1.proposalSha256, to: d2.proposalSha256 } };
+      results.courses.E11regen = { ...info(man2.data.manifest.manifest, P2, modsB), blueprintNumber: n2, runId: runBId, regenerated: regen.length, usd: I.estimatedChangeCostUsd };
+    }, { fatal: false });
+
     // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══
     const MOODLE_JOBS = ONLY_REAL_PROVIDERS ? [] : [['E1', 'E1'], ['E1-repack', 'E1repack'], ['E2', 'E2'], ['E3', 'E3']];
     // EV6 H5P v2: E5 entra al mismo restore + inspección (con los «Repaso» del paquete).
     if (results.mbz.E5) MOODLE_JOBS.push(['E5', 'E5']);
+    // LOOP 7 · E11: el curso del flujo completo y su re-empaque tras la regeneración parcial.
+    if (results.mbz.E11 && results.courses.E11) MOODLE_JOBS.push(['E11', 'E11']);
+    if (results.mbz['E11-regen'] && results.courses.E11regen) MOODLE_JOBS.push(['E11-regen', 'E11regen']);
     const SHELL = D('modules/course-shell/index.js');
     const AS = D('package/assessment/index.js');
     const { mp3DurationSeconds } = D('package/audio/mp3-parser.js');
@@ -1583,7 +1794,8 @@ function reservationBookkeeping(ev) {
             const ids = ci === 0 ? [`cv3:module_intro:${mod.moduleId}`] : [];
             // EV6 H5P v2: los «Repaso» salen de los paquetes H5P del empaque (vacío en E1–E4: secuencia de siempre).
             const reviewSet = new Set(info.reviewCardsChapterIds || []);
-            for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled, reviewCards: reviewSet.has(ch.chapterId) })) {
+            // LOOP 7: capítulos de práctica y Actividades de Aplicación (página + solucionario) en su lugar.
+            for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled, reviewCards: reviewSet.has(ch.chapterId), practice: ch.kind === 'practice', application: ch.applicationMinutes !== undefined })) {
               const role = s.startsWith('label:') ? s.slice(6) : s === 'video_h5p' ? 'video' : s;
               ids.push(`cv3:ch:${ch.chapterId}:${role}`);
             }
@@ -1662,10 +1874,26 @@ function reservationBookkeeping(ev) {
         // r19 L (3.13.0): el Libro Guía restaurado es un PDF real (application/pdf, firma %PDF-).
         if (lb) { const lbb = await blobByHash(lb.hash); ok(lb.mime === 'application/pdf' && lbb && lbb.subarray(0, 5).toString() === '%PDF-', `${label}: el Libro Guía restaurado es un PDF`, { mime: lb.mime }); }
         ok(aw && ab && lb, `${label}: audio de bienvenida, audiolibro y Libro Guía restaurados`, { aw, ab, lb });
+        // LOOP 7 (A4 I1/I2): con un ESTUDIANTE y un DOCENTE reales en el curso restaurado: el estudiante ve su Actividad
+        // de Aplicación y NO el solucionario — tampoco si un docente lo muestra por error (override PROHIBIT); el docente sí.
+        if (info.applications) {
+          const vPath = path.join(V3OUT, `moodle-${label}.app.json`);
+          const vr = spawnSync(PHP, ['-c', PHPINI, path.join(REPO, 'scripts/moodle/v21-application-visibility.php'), inPath, vPath], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+          ok(vr.status === 0, `${label}: chequeo de visibilidad con usuarios reales sin error`, (vr.stderr || '').slice(-400));
+          const v = JSON.parse(fs.readFileSync(vPath, 'utf8'));
+          const bad = v.pages.filter((p) => {
+            const sol = /:application_solution$/.test(p.idnumber);
+            return JSON.stringify([p.visible, p.studentVisible, p.studentCanView, p.teacherVisible]) !== JSON.stringify(sol ? [0, false, false, true] : [1, true, true, true]) || p.files.length !== 1;
+          }).map((p) => p.idnumber);
+          eq([v.pages.length, bad], [2 * info.applications, []], `${label}: ${info.applications} Actividades de Aplicación visibles al estudiante con su PDF; solucionarios ocultos`);
+          const leak = v.shownByMistake.filter((x) => !(x.visible === 1 && x.studentOverride === -1000 && !x.studentHasView && !x.studentCanOpen && x.teacherCanOpen)).map((x) => x.idnumber);
+          eq([v.shownByMistake.length, leak], [info.applications, []], `${label}: solucionario mostrado por error → el estudiante NO puede abrirlo ni su PDF; el docente sí`);
+        }
         const labels = spawnSync(PHP, ['-c', PHPINI, path.join(HERE, 'moodle-v3-labels.php'), process.env.MOODLE_ROOT, String(courseid)], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
         const L = JSON.parse((labels.stdout || '{}').split('\n').find((l) => l.startsWith('{')) || '{}');
         ok(labels.status === 0 && L.labels, `${label}: textos de labels leídos de la DB`, (labels.stderr || '').slice(0, 300));
-        const text = (idn) => ((L.labels || {})[idn] || '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ');
+        // Guiones suaves (&shy;) que el shell inserta en palabras largas: no son parte del texto que se busca.
+        const text = (idn) => ((L.labels || {})[idn] || '').replace(/<[^>]+>/g, ' ').replace(/&shy;|\u00ad/g, '').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ');
         if (aw && ab) {
           const awS = mp3DurationSeconds(await blobByHash(aw.hash));
           const abS = mp3DurationSeconds(await blobByHash(ab.hash));
@@ -1674,7 +1902,9 @@ function reservationBookkeeping(ev) {
           results.moodle[label].audio = { welcomeSec: awS, audiobookSec: abS };
         }
         const pres = cms.filter((c) => /:presentation$/.test(c.idnumber));
-        ok(pres.length === chFlags.length && pres.every((c) => JSON.stringify(c.files.map((f) => f.mime).sort()) === JSON.stringify(['application/pdf', 'image/png'])), `${label}: ${chFlags.length} tarjetas Gamma con portada PNG + PDF`, pres.map((c) => c.files.map((f) => f.mime)));
+        // Motor de carga horaria: los capítulos de práctica no tienen presentación.
+        const contentFlags = chFlags.filter((c) => c.kind !== 'practice');
+        ok(pres.length === contentFlags.length && pres.every((c) => JSON.stringify(c.files.map((f) => f.mime).sort()) === JSON.stringify(['application/pdf', 'image/png'])), `${label}: ${contentFlags.length} tarjetas Gamma con portada PNG + PDF`, pres.map((c) => c.files.map((f) => f.mime)));
         // Cifras del shell = Manifest (facts).
         const nCh = chFlags.length; const nV = chFlags.filter((x) => x.videoEnabled).length; const nA = chFlags.filter((x) => x.activityEnabled).length;
         const nEval = M.modules.filter((m) => m.examEnabled).length + (M.features.finalExam ? 1 : 0);

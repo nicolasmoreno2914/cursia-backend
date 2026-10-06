@@ -36,7 +36,7 @@ export class ArtifactsController {
     @Body() dto: CreateArtifactDto,
     @CurrentUser() user: AuthUser,
   ) {
-    const artifact = await this.artifactsService.create(dto, user.id);
+    const artifact = await this.artifactsService.createFromApi(dto, user.id);
     return { ok: true, data: artifact };
   }
 

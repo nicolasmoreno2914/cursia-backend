@@ -835,7 +835,8 @@ async function fixRound1Checks() {
 
   await check('FR1 A5: el estimado de una regeneración usa las palabras reales del capítulo (audiobookPlan) si ya se conocen; antes de la primera generación, la referencia de 2.800', () => {
     const src = fs.readFileSync(path.join(REPO, 'src/modules/dynamic-generation/runs.service.ts'), 'utf8');
-    assert((src.match(/estimateItemsForRun\(items, (?:'real'|mode), actions, \{ chapterWords \}\)/g) || []).length === 2, 'los dos gates de regeneración pasan chapterWords');
+    // LOOP 7 (A3 I1): además pasan coverageItems (exámenes escalados con todos sus capítulos).
+    assert((src.match(/estimateItemsForRun\(items, (?:'real'|mode), actions, \{ chapterWords(?:, coverageItems: [\w.]+)? \}\)/g) || []).length === 2, 'los dos gates de regeneración pasan chapterWords');
     assert(/output_summary->'audiobookPlan'->>'narratableWords'/.test(src), 'leídas del plan del audiolibro');
     const it = RB.estimateItemsForRun([{ key: 'audiobook_chapter:c', type: 'audiobook_chapter', chapterId: 'c', moduleId: 'm' }], 'real', { 'audiobook_chapter:c': 'REGENERATE' }, { chapterWords: { c: 4200 } });
     eq(it[0].usageScale, 1.5, 'capítulo de 4.200 palabras = 1,5 × referencia');

@@ -8,7 +8,7 @@ import {
   buildBlueprintSnapshotV2,
   validateBlueprintInputV2,
 } from '../course-blueprints/blueprint-snapshot';
-import { readActivityTypeRulesConfig } from '../generation-manifests/manifest-rules-config';
+import { activityTypeRulesForNextManifest, readActivityTypeRulesConfig } from '../generation-manifests/manifest-rules-config';
 import type { ActivityTypeRulesVersion } from '../generation-manifests/activity-type-rules';
 import { defaultApproachRegistry } from './builtin-approaches';
 import { DryRunInput, DryRunResult, runPedagogyDryRun } from './dry-run';
@@ -16,6 +16,7 @@ import { PEDAGOGY_ROLE_LABELS, PEDAGOGY_SECTION_LABELS, PEDAGOGY_TARGET_LABELS, 
 import { loadCurrentPedagogicalProfile } from './pedagogy-db';
 import { PedagogyRecommendation, WIZARD_QUESTIONS, recommendApproaches } from './recommendation';
 import { PEDAGOGY_ENGINE_VERSION } from './vocabulary';
+import { plainCourseRefV2 } from '../course-blueprints/lock-snapshot';
 
 /** Límites del dry-run en línea (lógica pura, pero sin estructuras gigantes). */
 const MAX_DRY_RUN_MODULES = 20;
@@ -122,14 +123,8 @@ export class PedagogyService {
     );
     // Fase 3: el contexto académico guardado entra al Blueprint en memoria igual que en el lock.
     const academic = await loadCurrentAcademicContext(this.dataSource, courseId);
-    const courseRef = {
-      id: row.id,
-      title: row.title,
-      finalExam: row.final_exam_enabled,
-      activityEngine: row.activity_engine,
-      reviewCards: row.review_cards_enabled === true,
-      academicContext: academic ? academicBlueprintContext(academic.context, academic.sha256) : null,
-    };
+    // LOOP 7 (A1 I2): datos del curso de la fuente única (los mismos que el lock).
+    const courseRef = plainCourseRefV2(row, academic ? academicBlueprintContext(academic.context, academic.sha256) : null);
     const errors = validateBlueprintInputV2(courseRef, modules, chapters);
     if (errors.length > 0) {
       throw new BadRequestException(`La estructura actual no se puede evaluar todavía: ${errors.map((e) => e.message).join('; ')}`);
@@ -138,11 +133,18 @@ export class PedagogyService {
     const saved = await loadCurrentPedagogicalProfile(this.dataSource, courseId);
     const fromRequest = body.profile !== undefined;
     const profile = fromRequest ? body.profile : saved?.profile ?? null;
+    // LOOP 7 (A2 A3): las reglas de actividad con las que se congelará el PRÓXIMO Manifest del curso (fuente única).
+    let atr: ActivityTypeRulesVersion;
+    try {
+      atr = body.activityTypeRules !== undefined ? body.activityTypeRules : await activityTypeRulesForNextManifest(this.dataSource, courseId);
+    } catch (err) {
+      throw new BadRequestException(`Configuración inválida de reglas de actividad: ${(err as Error).message}`);
+    }
     const result = asBadRequest(() =>
       runPedagogyDryRun({
         structure: snapshot,
         profile,
-        activityTypeRules: this.activityTypeRules(body.activityTypeRules),
+        activityTypeRules: atr,
         applyStructureAdjustments: body.applyStructureAdjustments,
         // Fase 4: dato del contexto que no vive en el Blueprint (sugerencia P2 del Coherence Engine).
         alignment: { priorKnowledgeDeclared: academic ? academic.context.learner.priorKnowledge.status !== 'missing' : null },

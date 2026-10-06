@@ -381,7 +381,11 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   const respectsMode = design.every((m) => m.chapters.every((c) => c.applicationMinutes === null || (appMode !== 'none' && (appMode !== 'practice_only' || c.kind === 'practice'))));
   if (hasExisting && respectsMode && Math.abs(minutes() - target) <= tol) {
     priorityTrace.push('La estructura actual, con sus Actividades de Aplicación, ya cumple la carga horaria objetivo: no se propone ningún cambio.');
-    return result('within_tolerance', []);
+    // LOOP 7 (A2 A2): «Ajustar» el énfasis o el enfoque sobre un diseño que ya cumple no cambia nada; se dice (y por
+    // qué) en lugar de mostrar un «diseño ya aplicado» mudo con preferencias nuevas.
+    return result('within_tolerance', [
+      `El diseño vigente ya cumple ${fmtH(input.targetHours)} h con sus capítulos y Actividades de Aplicación: no hay cambios que proponer. Cursia no quita capítulos ni actividades por su cuenta; si cambiaste el énfasis o el enfoque y quieres otra estructura, ajústala en el editor (quitar o agregar capítulos) y vuelve a ver el diseño.`,
+    ]);
   }
   if (hasExisting) {
     for (const m of design) for (const c of m.chapters) c.applicationMinutes = null;
@@ -455,7 +459,14 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
     for (let round = 1; round <= policy.practicePerModule; round++) {
       for (const m of design) {
         if (reached()) return true;
-        if (m.chapters.filter((c) => c.kind === 'practice').length >= round) continue;
+        const existing = m.chapters.filter((c) => c.kind === 'practice');
+        if (existing.length >= round) {
+          // LOOP 7 (A1): la práctica que YA existe en esta ronda recibe su Actividad igual que al crearla (mismo momento y
+          // nivel de cierre). Antes, el rediseño la dejaba sin actividad y el diseño aplicado no era un punto fijo.
+          const pc0 = existing[round - 1];
+          if (!pc0.proposed && pc0.applicationMinutes === null) for (const t of [...tiers].reverse()) if (trySetTier(m, pc0, t)) break;
+          continue;
+        }
         const pc: WorkChapter = {
           id: `proposed:practice:${m.id}:${round}`,
           proposed: true,
@@ -513,11 +524,27 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
     return reached();
   };
 
+  // LOOP 7 (A1 + REVIEW-L7 I1): una práctica que YA existe y a la que la etapa de práctica no llegó (el objetivo se
+  // alcanzó antes) recupera su Actividad SOLO con un nivel que mantenga el total dentro de la tolerancia y la
+  // proporción de aplicación del enfoque (si ninguno cabe, queda sin actividad: nunca empeora el estado del diseño).
+  const seedLeftoverPractice = () => {
+    for (const m of design) for (const c of m.chapters) {
+      if (c.kind !== 'practice' || c.proposed || c.applicationMinutes !== null) continue;
+      for (const t of [...tiers].reverse()) {
+        if (!trySetTier(m, c, t)) continue;
+        if (minutes() <= target + tol && applicationShare() <= policy.maxApplicationShare + 1e-9) break;
+        c.applicationMinutes = null;
+        reEval();
+      }
+    }
+  };
+
   const steps = { application: growApplication, practice: addPractice, content: addContent };
   for (const s of policy.order) {
     if (steps[s]()) break;
     growApplication();
   }
+  seedLeftoverPractice();
   // Ajuste fino: si se pasó, bajar niveles de a uno (empezando por las aperturas) SOLO mientras el total siga
   // dentro de la tolerancia por abajo (nunca descarta un diseño válido).
   for (const { c } of [...applicationOrder()].reverse()) {

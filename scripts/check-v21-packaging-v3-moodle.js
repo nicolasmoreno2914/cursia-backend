@@ -27,6 +27,8 @@ const MOODLE_LOCAL_DIR = process.env.MOODLE_LOCAL_DIR || process.env.E2E_MOODLE_
 const OUT_DIR = process.env.R12_OUT_DIR || path.join(MOODLE_LOCAL_DIR, 'r12-packaging-out');
 const PHP = process.env.PHP_BIN || '/opt/homebrew/opt/php@8.3/bin/php';
 const PHPINI = path.join(MOODLE_LOCAL_DIR, 'php.ini');
+// LOOP 7: restore con la sesión del admin (como un restore web): los overrides de permisos del paquete se aplican.
+process.env.CURSIA_RESTORE_PHP = process.env.CURSIA_RESTORE_PHP || path.join(__dirname, 'moodle/restore-as-admin.php');
 const dist = path.join(ROOT, 'dist');
 
 const B = require(path.join(dist, 'package/dynamic-mbz-builder-v3.js'));
@@ -138,6 +140,11 @@ async function runConfig(cfg) {
         eq(p.files.length, 1, `${p.idnumber}: un PDF`);
         eq(p.contentLinksFiles, p.files, `${p.idnumber}: el contenido enlaza su PDF`);
         eq([p.completion, p.completionview], sol ? [0, 0] : [2, 1], `${p.idnumber}: completion`);
+      }
+      // LOOP 7 (A4 I1): aunque un docente lo muestre por error, el estudiante NO puede abrir el solucionario ni su PDF.
+      eq(v.shownByMistake.length, n, 'cada solucionario probado mostrado por error');
+      for (const x of v.shownByMistake) {
+        eq([x.visible, x.studentOverride, x.studentHasView, x.studentCanOpen, x.teacherCanOpen], [1, -1000, false, false, true], `${x.idnumber}: mostrado por error`);
       }
     });
   }

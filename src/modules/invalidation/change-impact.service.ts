@@ -1,11 +1,11 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
-import { assembleLockSnapshotV2, loadLockRows } from '../course-blueprints/lock-snapshot';
+import { assembleLockSnapshotV2, loadLockRows, plainCourseRefV2 } from '../course-blueprints/lock-snapshot';
 import { BlueprintSnapshotV2, RawChapterRowV2, RawModuleRow, buildBlueprintSnapshotV2, snapshotSha256V2 } from '../course-blueprints/blueprint-snapshot';
 import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import { GenerationManifestsService } from '../generation-manifests/generation-manifests.service';
 import { GenerationManifestV1, buildGenerationManifestV3 } from '../generation-manifests/generation-manifest-builder';
-import { readActivityTypeRulesConfig } from '../generation-manifests/manifest-rules-config';
+import { activityTypeRulesForNextManifest } from '../generation-manifests/manifest-rules-config';
 import { canonicalContextHash } from '../dynamic-generation/run-hash';
 import { providerPlanFor, runPedagogyDryRun } from '../pedagogy/dry-run';
 import { profileTargetHours } from '../pedagogy/pedagogy-profile';
@@ -55,6 +55,13 @@ export class ChangeImpactService {
     // «Hasta»: lo que el lock congelaría hoy (con el perfil de vista previa si viene). Un perfil o una propuesta que el
     // motor no puede evaluar es un 400, nunca un 500 (review F5 I1).
     const rows = await loadLockRows(this.dataSource, courseId);
+    // LOOP 7 (A2 A3): las reglas de actividad del PRÓXIMO Manifest (las que se congelarán): fuente única.
+    let atrNext: 0 | 1 | 2;
+    try {
+      atrNext = await activityTypeRulesForNextManifest(this.dataSource, courseId);
+    } catch (err) {
+      throw new BadRequestException(`Configuración inválida de reglas de actividad: ${(err as Error).message}`);
+    }
     const bad = (err: unknown) => new BadRequestException((err instanceof Error ? err.message : String(err)).slice(0, 500));
     const assemble = async (r: typeof rows, override: { profileOverride?: unknown }) => {
       let a: Awaited<ReturnType<typeof assembleLockSnapshotV2>>;
@@ -74,14 +81,11 @@ export class ChangeImpactService {
       // viva con las reglas de actividad configuradas; luego la propuesta se aplica a las filas EN MEMORIA como lo haría
       // el apply (insertar capítulos propuestos, reordenar, minutos de aplicación) y el Blueprint sale del mismo
       // ensamblado que el lock. Así lo previsualizado es lo que se confirmaría.
-      const courseRef = {
-        id: course.id, title: course.title, finalExam: course.final_exam_enabled, activityEngine: course.activity_engine,
-        reviewCards: course.review_cards_enabled === true,
-        academicContext: assembled.snapshot.course.academicContext ?? null,
-      };
+      // LOOP 7 (A1 I2): datos del curso de la fuente única (los mismos que el lock y que «Aplicar diseño»).
+      const courseRef = plainCourseRefV2(course, assembled.snapshot.course.academicContext ?? null);
       let dist: NonNullable<ReturnType<typeof runPedagogyDryRun>['distribution']>;
       try {
-        const dr = runPedagogyDryRun({ structure: buildBlueprintSnapshotV2(courseRef as any, rows.modules, rows.chapters), profile, activityTypeRules: readActivityTypeRulesConfig() });
+        const dr = runPedagogyDryRun({ structure: buildBlueprintSnapshotV2(courseRef as any, rows.modules, rows.chapters), profile, activityTypeRules: atrNext });
         if (!dr.distribution) throw new Error('NO_TARGET_HOURS: sin horas objetivo no hay propuesta que aplicar.');
         dist = dr.distribution;
       } catch (err) { throw bad(err); }
@@ -107,7 +111,7 @@ export class ChangeImpactService {
     }
     const source = { courseId, blueprintId: 0, blueprintNumber: 0, blueprintSha256: snapshotSha256V2(to) };
     if (!runA) {
-      const manifestB = buildGenerationManifestV3(to, source, { activityTypeRules: readActivityTypeRulesConfig() });
+      const manifestB = buildGenerationManifestV3(to, source, { activityTypeRules: atrNext });
       return {
         available: false as const, reason: 'NO_PREVIOUS_RUN', dryRun: true, providersCalled: 0, spendUsd: '0.00',
         message: 'El curso todavía no se generó: no hay nada que conservar. Generarlo completo costaría lo estimado.',
@@ -123,8 +127,7 @@ export class ChangeImpactService {
     const blueprintA = (await this.manifests.blueprintOfForRules(courseId, ownerId, bpNumberA, manifestA.rulesVersion)).snapshot as BlueprintSnapshotV2;
     const [ctx] = await this.dataSource.query(`select context, context_hash from public.generation_run_contexts where job_id = $1`, [runA.id]);
     if (!ctx || canonicalContextHash(ctx.context) !== ctx.context_hash) throw new BadRequestException(`La ejecución ${runA.id} no tiene un contexto congelado íntegro`);
-    const atr = (manifestA.manifest as GenerationManifestV1).features?.activityTypeRules ?? 0;
-    const manifestB = buildGenerationManifestV3(to, source, { activityTypeRules: atr as 0 | 1 | 2 });
+    const manifestB = buildGenerationManifestV3(to, source, { activityTypeRules: atrNext });
     const { plan } = await computePlanFromDb(this.dataSource, {
       runA, manifestA, blueprintA, manifestB: { manifest: manifestB } as any, blueprintB: to, contextHash: ctx.context_hash,
     });

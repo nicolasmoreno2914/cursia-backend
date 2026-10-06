@@ -124,7 +124,8 @@ export function summarizeChangeImpact(input: {
     else if (a.action === 'SOFT_DISABLE') ch.disable.push(a.itemKey);
   }
   const chapters = [...byChapter.values()];
-  const toRunPlan = providerPlanFor({ ...to.manifest, items: itemsOf(to.manifest, [...toRun, ...paidNew, ...paidRetry]) });
+  const coverage = { coverageItems: to.manifest.items };
+  const toRunPlan = providerPlanFor({ ...to.manifest, items: itemsOf(to.manifest, [...toRun, ...paidNew, ...paidRetry]) }, coverage);
   const hFrom = input.from?.studyTime?.courseEstimatedHours ?? null;
   const hTo = to.studyTime?.courseEstimatedHours ?? null;
   return {
@@ -141,7 +142,7 @@ export function summarizeChangeImpact(input: {
     untouchedChapters: chapters.filter((c) => c.untouched).length,
     cost: {
       toRun: toRunPlan,
-      paidStaleIfRegenerated: providerPlanFor({ ...to.manifest, items: itemsOf(to.manifest, paidStale) }),
+      paidStaleIfRegenerated: providerPlanFor({ ...to.manifest, items: itemsOf(to.manifest, paidStale) }, coverage),
     },
     estimatedChangeCostUsd: toRunPlan.estimateUsd ? Number(toRunPlan.estimateUsd.expected).toFixed(2) : null,
     hours: hFrom !== null && hTo !== null ? { from: hFrom, to: hTo, delta: Math.round((hTo - hFrom) * 10) / 10 } : null,
@@ -152,4 +153,33 @@ export function summarizeChangeImpact(input: {
 /** 5.1: tabla de dependencias (documentación viva para la UI y el reporte). */
 export function dependencyTable(): { type: string; dependsOn: string; inputs: string; paid: boolean; outcomesInFingerprint: boolean }[] {
   return Object.entries(DEPENDENCY_DOC).map(([type, d]) => ({ type, ...d, outcomesInFingerprint: ALIGNMENT_FINGERPRINT_TYPES.includes(type) }));
+}
+
+/**
+ * LOOP 7 (A1 I1): costo estimado de APLICAR un plan de invalidación («Generar solo lo que cambió»): lo que se
+ * ejecutaría (texto/LLM + pagados nuevos o a reintentar), con el mismo estimador que la vista previa del impacto.
+ * Puro (precios de referencia del seed, nada se cobra). Antes el modal no mostraba ninguna cifra: cambiar el enfoque
+ * podía regenerar decenas de items LLM sin que el docente viera un monto.
+ */
+export interface PlanCostEstimate {
+  estimatedChangeCostUsd: string | null;
+  range: { min: string; max: string } | null;
+  llmItems: number;
+  paidItems: number;
+  cost: ProviderPlan;
+  note: string;
+}
+export function planCostEstimate(plan: InvalidationPlan, manifest: GenerationManifestV1): PlanCostEstimate {
+  const keys = plan.actions.filter((a) => a.inTargetManifest && (a.action === 'REGENERATE' || a.action === 'GENERATE')).map((a) => a.itemKey);
+  const items = itemsOf(manifest, keys);
+  const cost = providerPlanFor({ ...manifest, items }, { coverageItems: manifest.items });
+  const paid = items.filter((i) => PAID_TYPES.has(i.type)).length;
+  return {
+    estimatedChangeCostUsd: cost.estimateUsd ? Number(cost.estimateUsd.expected).toFixed(2) : null,
+    range: cost.estimateUsd ? { min: Number(cost.estimateUsd.min).toFixed(2), max: Number(cost.estimateUsd.max).toFixed(2) } : null,
+    llmItems: items.length - paid,
+    paidItems: paid,
+    cost,
+    note: 'Estimación con precios de referencia y uso típico por tipo de recurso (no medido); el texto se valúa con el modelo recomendado. Nada se cobra al calcularla.',
+  };
 }

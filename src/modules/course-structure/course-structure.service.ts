@@ -83,7 +83,8 @@ function cleanDescription(v: string | undefined | null): string | null {
   const t = String(v ?? '').replace(/\s+/g, ' ').trim();
   return t ? t : null;
 }
-import { blueprintSchemaVersionForRules, readActivityTypeRulesConfig, readConfiguredRulesVersion } from '../generation-manifests/manifest-rules-config';
+import { activityTypeRulesForNextManifest, blueprintSchemaVersionForRules, readActivityTypeRulesConfig, readConfiguredRulesVersion } from '../generation-manifests/manifest-rules-config';
+import { composeLockSnapshotV2, plainCourseRefV2 } from '../course-blueprints/lock-snapshot';
 
 /** Motor de carga horaria: 400 visible si se pide video en un capítulo de práctica. */
 /** Fase 2: minutos de la Actividad de Aplicación del pedido (el DTO ya los validó; defensa en profundidad). */
@@ -279,17 +280,22 @@ export class CourseStructureService implements OnModuleInit {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException({ code: 'NO_TARGET_HOURS', message: 'NO_TARGET_HOURS: el curso no tiene horas objetivo guardadas; guarda el perfil antes de aplicar el diseño.' });
       }
-      const courseRef = {
-        id: course.id, title: course.title, finalExam: course.final_exam_enabled, activityEngine: course.activity_engine,
-        reviewCards: course.review_cards_enabled === true,
-        academicContext: academic ? academicBlueprintContext(academic.context, academic.sha256) : null,
-      };
+      // LOOP 7 (A1 I2): datos del curso de la fuente única (los mismos que el lock).
+      const courseRef = plainCourseRefV2(course, academic ? academicBlueprintContext(academic.context, academic.sha256) : null);
       const errors = validateBlueprintInputV2(courseRef, modules, chapters);
       if (errors.length) {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException(`La estructura actual no se puede evaluar: ${errors.map((e) => e.message).join('; ')}`);
       }
-      const dr = await asBad(() => runPedagogyDryRun({ structure: buildBlueprintSnapshotV2(courseRef, modules, chapters), profile: saved.profile, activityTypeRules: readActivityTypeRulesConfig() }));
+      // LOOP 7 (A2 A3): mismas reglas de actividad que el dry-run y que el próximo Manifest (fuente única).
+      let atr: Awaited<ReturnType<typeof activityTypeRulesForNextManifest>>;
+      try {
+        atr = await activityTypeRulesForNextManifest(queryRunner, courseId);
+      } catch (err) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException(`Configuración inválida de reglas de actividad: ${(err as Error).message}`);
+      }
+      const dr = await asBad(() => runPedagogyDryRun({ structure: buildBlueprintSnapshotV2(courseRef, modules, chapters), profile: saved.profile, activityTypeRules: atr }));
       const dist = dr.distribution;
       if (!dist) {
         await queryRunner.rollbackTransaction();
@@ -656,17 +662,13 @@ export class CourseStructureService implements OnModuleInit {
             outcome_ids: outcomesByChapter?.get(c.id) ?? null,
           })),
         );
-        const courseV2 = {
-          id: course.id, title: course.title, finalExam: settings.finalExam, activityEngine: settings.activityEngine, reviewCards: settings.reviewCardsEnabled === true,
-          // Motor de carga horaria: las horas objetivo del perfil también entran al snapshot del lock.
-          targetHours: profileTargetHours(pedagogyProfile),
-          applicationContext: profileApplicationContext(pedagogyProfile),
-          academicContext: academicBp,
-        };
-        const plainV2 = buildBlueprintSnapshotV2(courseV2, rawModulesV2, rawChaptersV2);
-        const pedagogy = lockPedagogyInput(plainV2, pedagogyProfile);
-        const snapshotV2 = pedagogy ? buildBlueprintSnapshotV2(courseV2, rawModulesV2, rawChaptersV2, pedagogy) : plainV2;
-        return snapshotSha256V2(snapshotV2) === currentBlueprint.sha256;
+        // LOOP 7 (A1 I2): la MISMA composición que el lock (fuente única), con las filas ya leídas.
+        const composed = composeLockSnapshotV2(
+          { id: course.id, title: course.title, final_exam_enabled: settings.finalExam, activity_engine: settings.activityEngine, review_cards_enabled: settings.reviewCardsEnabled === true },
+          { modules: rawModulesV2, chapters: rawChaptersV2 }, pedagogyProfile, academicBp,
+        );
+        if (!composed.snapshot) throw new Error(composed.errors.map((e) => e.message).join('; '));
+        return snapshotSha256V2(composed.snapshot) === currentBlueprint.sha256;
       }
       const rawModules: RawModuleRow[] = modules.map((m) => ({
         id: m.id,

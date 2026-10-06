@@ -267,6 +267,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
 
   // ── files.xml ──
   const filesXml = (await text('files.xml')) ?? '';
+  const rootRoles = (await text('roles.xml')) ?? '';
   const files: ParsedFile[] = blocks(filesXml, 'file').map((b) => ({
     id: num(/<file id="(\d+)"/.exec(b)?.[1]),
     hash: tag(b, 'contenthash') ?? '',
@@ -318,7 +319,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     const inf = (await text(`${dir}/inforef.xml`)) ?? '';
     const fileref = tag(inf, 'fileref') ?? '';
     const module: Record<string, string> = {};
-    for (const k of ['idnumber', 'completion', 'completiongradeitemnumber', 'completionpassgrade', 'completionview', 'sectionnumber', 'visible']) {
+    for (const k of ['idnumber', 'completion', 'completiongradeitemnumber', 'completionpassgrade', 'completionview', 'sectionnumber', 'visible', 'visibleold']) {
       module[k] = tag(moduleXml, k) ?? '';
     }
     let grade: Record<string, string> | null = null;
@@ -608,6 +609,25 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       if (!lint.ok) add('CLEAN_SAFE', a.idnumber, lint.errors.slice(0, 3).map((e) => `${e.code} ${e.message}`).join('; '));
       if (!hidden && SOLUTION_MARKERS_RE.test(extractText(content))) add('APPLICATION', a.idnumber, 'la página del estudiante muestra contenido del solucionario');
       if (hidden && !/Solucionario/.test(a.name)) add('APPLICATION', a.idnumber, 'el solucionario no se nombra como tal');
+      if (hidden) {
+        // LOOP 7 (A4 I1/I3): barreras del solucionario — oculto también tras restaurar (visibleold=0), estudiante con
+        // mod/page:view PROHIBIDO (override en la actividad + el rol referenciado y definido) y ningún enlace a él
+        // desde otro contenido del curso.
+        if (a.module.visibleold !== '0') add('APPLICATION', a.idnumber, 'el solucionario debe quedar oculto tras restaurar (visibleold=0)');
+        const rx = (await text(`${a.dir}/roles.xml`)) ?? '';
+        const ov = /<override\b[\s\S]*?<\/override>/g;
+        const prohibits = (rx.match(ov) ?? []).some((o) => tag(o, 'roleid') === '5' && tag(o, 'capability') === 'mod/page:view' && tag(o, 'permission') === '-1000');
+        if (!prohibits) add('APPLICATION', a.idnumber, 'el solucionario no prohíbe mod/page:view al rol estudiante');
+        const inf = (await text(`${a.dir}/inforef.xml`)) ?? '';
+        if (!/<roleref>[\s\S]*<role><id>5<\/id><\/role>[\s\S]*<\/roleref>/.test(inf)) add('APPLICATION', a.idnumber, 'inforef sin el rol estudiante (el override no se restauraría)');
+        if (!/<role id="5">[\s\S]*<archetype>student<\/archetype>/.test(rootRoles)) add('APPLICATION', 'roles.xml', 'roles.xml raíz no define el rol estudiante del override');
+        const solPdf = files.find((f) => f.ctx === a.ctx && /\.pdf$/i.test(f.filename));
+        for (const other of acts) {
+          if (other === a) continue;
+          const body = `${other.intro}\n${unxml(tag((await text(`${other.dir}/${other.modname}.xml`)) ?? '', 'content') ?? '')}`;
+          if (body.includes(`VIEWBYID*${a.mid}@$`) || (solPdf && body.includes(solPdf.filename))) add('APPLICATION', other.idnumber, `enlaza al solucionario docente ${a.idnumber}`);
+        }
+      }
     }
   }
   for (const a of acts.filter((x) => (APPLICATION_RE.test(x.idnumber) || APPLICATION_SOLUTION_RE.test(x.idnumber)))) {
