@@ -310,6 +310,8 @@ export interface ClaimOptions {
 
 /** Motor pedagógico Fase 2: el ejecutor del navegador aplica `ClaimedItem.pedagogy` a sus prompts. */
 export const PEDAGOGY_BRIEF_FEATURE = 'pedagogy-brief-1';
+/** Fase 2: el ejecutor del navegador sabe generar items `application_activity` (actividad + solucionario). */
+export const APPLICATION_ACTIVITY_FEATURE = 'application-activity-1';
 
 /**
  * REL lease de ejecución: resultado del claim con el motivo cuando no se entrega nada por el lease
@@ -478,6 +480,7 @@ export class SchedulerService {
       if (opts.ownerId !== undefined && opts.ownerId !== null) {
         await this.assertBrowserTypesMatchRun(opts.runId, opts.ownerId, types);
         await this.assertExecutorAppliesPedagogy(opts.runId, opts.ownerId, opts.executorFeatures ?? []);
+        await this.assertExecutorGeneratesApplication(opts.runId, opts.ownerId, opts.executorFeatures ?? []);
       }
       // M6: un item cuyo payload no se puede armar se marca failed dentro del
       // claim; se sigue con el próximo candidato en vez de devolver "nada".
@@ -669,6 +672,28 @@ export class SchedulerService {
       'anterior de Cursia que no lo aplica a los recursos. Recarga la página para continuar; con esta versión el ' +
       'curso se generaría sin el enfoque pedagógico elegido.';
     throw new ConflictException({ message, code: 'executor_outdated_pedagogy', runId });
+  }
+
+  /**
+   * Fase 2 (review I3): un run con Actividades de Aplicación solo lo ejecuta un navegador que sabe generarlas. Una
+   * pestaña con una versión anterior reclamaría todo lo demás, renovaría el lease exclusivo del run y dejaría los
+   * items application_activity en pending para siempre (el curso nunca termina, sin error, y otro dispositivo no
+   * puede tomar la ejecución). Se rechaza ANTES de reclamar nada con el 409 visible «recarga la página».
+   */
+  private async assertExecutorGeneratesApplication(runId: string, ownerId: string, features: string[]): Promise<void> {
+    if (features.includes(APPLICATION_ACTIVITY_FEATURE)) return;
+    const [row] = await this.dataSource.query(
+      `select coalesce(m.manifest_json->'items', '[]'::jsonb) @> '[{"type":"application_activity"}]'::jsonb as application
+         from public.production_jobs pj
+         join public.course_generation_manifests m on m.id::text = pj.input_payload->>'manifestId'
+        where pj.id = $1 and pj.execution_mode = 'dynamic_generation' and pj.owner_id = $2`,
+      [runId, ownerId],
+    );
+    if (!row || row.application !== true) return;
+    const message =
+      `rules_version_mismatch: la ejecución ${runId} tiene Actividades de Aplicación y este navegador ejecuta una versión ` +
+      'anterior de Cursia que no sabe generarlas. Recarga la página para continuar; con esta versión el curso no podría terminar.';
+    throw new ConflictException({ message, code: 'executor_outdated_application', runId });
   }
 
   /**

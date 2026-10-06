@@ -87,7 +87,7 @@ export interface ProposedModule {
 }
 
 export interface DistributionChange {
-  type: 'add_practice_chapter' | 'add_content_chapter' | 'set_application_activity' | 'role_changed';
+  type: 'add_practice_chapter' | 'add_content_chapter' | 'set_application_activity' | 'remove_application_activity' | 'role_changed';
   moduleId: string;
   chapterId: string;
   /** Texto para el docente. */
@@ -292,9 +292,20 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   const roleOf = (m: WorkModule, c: WorkChapter) => chapterRole(m.chapters.indexOf(c), m.chapters.length);
   const changes: DistributionChange[] = [];
   const priorityTrace: string[] = [];
+  // Fase 2 (review I2): minutos de Actividad de Aplicación con los que llegó cada capítulo existente; quitar o cambiar
+  // una actividad ES un cambio (si no, «Ninguna» dejaría las actividades en la base y se generarían igual).
+  const initialMinutes = new Map(design.flatMap((m) => m.chapters.map((c) => [c.id, c.applicationMinutes] as const)));
+  const pushRemovals = () => {
+    for (const m of design) for (const c of m.chapters) {
+      if (c.proposed || initialMinutes.get(c.id) == null || c.applicationMinutes !== null) continue;
+      if (changes.some((x) => x.type === 'remove_application_activity' && x.chapterId === c.id)) continue;
+      changes.push({ type: 'remove_application_activity', moduleId: m.id, chapterId: c.id, detail: `Se quita la Actividad de Aplicación de ${initialMinutes.get(c.id)} min de «${c.title}».` });
+    }
+  };
   const baseHours = r1(estimateCourseStudyTime(toInput(false)).courseEstimatedMinutes / 60);
 
   const result = (status: DistributionStatus, recs: string[]): DistributionResult => {
+    pushRemovals();
     const generable = est; // Fase 2: las Actividades de Aplicación se generan
     // Re-revisión L3: los capítulos de práctica no tienen tope de aplicación; si el diseño queda por encima de la
     // proporción del enfoque, se dice explícitamente.
@@ -525,8 +536,11 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
     }
   }
   for (const m of design) for (const c of m.chapters) {
-    if (c.applicationMinutes && !c.proposed) {
-      changes.push({ type: 'set_application_activity', moduleId: m.id, chapterId: c.id, detail: `Actividad de Aplicación de ${c.applicationMinutes} min en «${c.title}».` });
+    const had = initialMinutes.get(c.id) ?? null;
+    if (c.applicationMinutes && !c.proposed && c.applicationMinutes !== had) {
+      changes.push({ type: 'set_application_activity', moduleId: m.id, chapterId: c.id, detail: had
+        ? `Actividad de Aplicación de «${c.title}»: de ${had} a ${c.applicationMinutes} min.`
+        : `Actividad de Aplicación de ${c.applicationMinutes} min en «${c.title}».` });
     }
     const before = initialRoles.get(c.id);
     if (!c.proposed && before && before !== roleOf(m, c)) {

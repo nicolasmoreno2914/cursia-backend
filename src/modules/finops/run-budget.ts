@@ -86,6 +86,8 @@ export interface RunManifestItem {
   type: string;
   moduleId?: string | null;
   chapterId?: string | null;
+  /** Fase 2: minutos de la Actividad de Aplicación (items application_activity). */
+  applicationMinutes?: number;
 }
 
 const GENERATING = new Set(['GENERATE', 'REGENERATE']);
@@ -175,6 +177,19 @@ export function audiobookUsageScale(chapterWords: number | null | undefined): nu
 }
 
 /**
+ * Fase 2 (review M6): la salida de `llm.application_activity` (actividad + solucionario) crece con los ejercicios del
+ * nivel; los priors corresponden al nivel de 60 min (7 ejercicios). La entrada (fuente del capítulo) no cambia.
+ */
+const APPLICATION_REFERENCE_EXERCISES = 7;
+const APPLICATION_EXERCISES_EST: Readonly<Record<number, number>> = { 30: 6, 60: 7, 90: 9, 120: 10 };
+
+export function applicationUsageScale(minutes: number | null | undefined): Readonly<Record<string, number>> | null {
+  const n = APPLICATION_EXERCISES_EST[Number(minutes)];
+  if (!n) return null;
+  return { output_tokens: Math.round((n / APPLICATION_REFERENCE_EXERCISES) * 10000) / 10000 };
+}
+
+/**
  * Capítulos (orden del Manifest) por módulo que cubren los exámenes: los que tienen `content` (todo capítulo de
  * contenido lo tiene en v1/v2/v3). Motor de carga horaria: un capítulo de práctica no tiene content ni entra al banco.
  */
@@ -210,7 +225,8 @@ export function estimateItemsForRun(
       it.type === 'exam' ? examBankUsageScale('exam', chapters.filter((c) => c.moduleId === it.moduleId))
         : it.type === 'final_exam' ? examBankUsageScale('final_exam', chapters)
           : it.type === 'audiobook_chapter' && it.chapterId ? audiobookUsageScale(opts?.chapterWords?.[it.chapterId])
-            : null;
+            : it.type === 'application_activity' ? applicationUsageScale(it.applicationMinutes)
+              : null;
     out.push({
       itemKey: it.key,
       itemType: it.type,

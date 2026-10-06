@@ -3,7 +3,7 @@
 //
 // Lo valida el servidor al completar el item (scheduler.completeItem → validateV3ItemArtifact) y, con las MISMAS
 // reglas, el ejecutor del navegador antes de subirlo (espejo en 45-dynamic-generation-executor.js; la paridad la
-// prueba scripts/check-application-activities-generation.js). Falla fuerte: un documento incompleto nunca se
+// prueba scripts/check-application-activities.js y el harness del frontend test-51). Falla fuerte: un documento incompleto nunca se
 // empaqueta como «listo».
 //
 // Estructura pedida (directiva Fase 2): objetivo, contexto, 1–2 ejemplos resueltos cuando corresponda, 6–10
@@ -88,6 +88,22 @@ function assertMinutes(minutes: number): void {
  * Parte del ESTUDIANTE (`activity`). La valida el ejecutor tras la 1.ª pasada y el servidor dentro del documento.
  * Devuelve los errores y, para el solucionario, los ids de los ejercicios y los nombres de los criterios.
  */
+/**
+ * Marcas de solucionario: NUNCA en la parte del estudiante. El validador del .mbz (APPLICATION) las busca en la página
+ * renderizada; se rechazan acá también para que el navegador reintente la 1.ª pasada en vez de fallar el empaque
+ * después de pagar (review I4).
+ */
+export const APPLICATION_SOLUTION_MARKERS_RE = /Solucionario|Gu[ií]a de correcci[oó]n|Respuesta:|Soluci[oó]n esperada/i;
+const STUDENT_KEYS = ['genre', 'title', 'objective', 'context', 'examples', 'exercises', 'workshop', 'deliverable', 'selfCheck', 'criteria', 'minutesBySection'];
+const EXERCISE_KEYS = ['id', 'prompt', 'difficulty', 'answerLines'];
+
+function stringsOf(v: unknown, out: string[] = []): string[] {
+  if (typeof v === 'string') out.push(v);
+  else if (Array.isArray(v)) v.forEach((x) => stringsOf(x, out));
+  else if (v && typeof v === 'object') Object.values(v as Record<string, unknown>).forEach((x) => stringsOf(x, out));
+  return out;
+}
+
 export function validateApplicationStudentPart(a: unknown, minutes: number): { errors: ApplicationValidationError[]; exerciseIds: string[]; criteriaNames: string[] } {
   assertMinutes(minutes);
   const errors: ApplicationValidationError[] = [];
@@ -99,6 +115,10 @@ export function validateApplicationStudentPart(a: unknown, minutes: number): { e
     err('$.activity', 'APPLICATION_SHAPE', 'falta la actividad del estudiante');
     return { errors, exerciseIds: ids, criteriaNames: names };
   }
+  // Review M5: la parte del estudiante no admite campos extra (p. ej. respuestas que un render futuro podría mostrar).
+  for (const k of Object.keys(a)) if (!STUDENT_KEYS.includes(k)) err(`$.activity.${k}`, 'APPLICATION_SHAPE', `campo desconocido en la actividad del estudiante: ${k}`);
+  const marker = stringsOf(a).find((x) => APPLICATION_SOLUTION_MARKERS_RE.test(x));
+  if (marker !== undefined) err('$.activity', 'APPLICATION_SOLUTION_MARKER', `la actividad del estudiante no puede contener marcas de solucionario («Respuesta:», «Solución esperada», «Guía de corrección», «Solucionario»): «${marker.slice(0, 80)}»`);
   const genre = a.genre;
   const knownGenre = (APPLICATION_GENRES as readonly string[]).includes(genre);
   if (!knownGenre) err('$.activity.genre', 'APPLICATION_GENRE', `genre debe ser uno de ${APPLICATION_GENRES.join(', ')}`);
@@ -123,6 +143,7 @@ export function validateApplicationStudentPart(a: unknown, minutes: number): { e
       ids.push('');
       return err(p, 'APPLICATION_SHAPE', `${p} debe ser un objeto`);
     }
+    for (const k of Object.keys(e)) if (!EXERCISE_KEYS.includes(k)) err(`${p}.${k}`, 'APPLICATION_SHAPE', `campo desconocido en el ejercicio: ${k}`);
     const want = `E${i + 1}`;
     if (e.id !== want) err(`${p}.id`, 'APPLICATION_EXERCISE_ID', `${p}.id debe ser "${want}" (en orden)`);
     ids.push(String(e.id));

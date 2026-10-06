@@ -46,7 +46,7 @@ import type { AssessmentCategoryKey } from '../assessment/resolve-assessment';
 import type { AssessableType } from '../../modules/course-profiles/course-profiles';
 import { extractText, lintCleanSafe, lintResourceMentions, parseHtml } from '../../modules/visual-components';
 import type { HtmlNode } from '../../modules/visual-components';
-import { CERTIFICATE_TEACHER_TROUBLESHOOTING, EXAMS_TEACHER_NOTE, EXAMS_TEACHER_NOTE_ATTEMPTS, EXAMS_TEACHER_NOTE_AVAILABILITY, CertificateRequirements, CourseFacts, chapterNextSteps, closingCertificateText, examOverallFeedbackBands, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles, WELCOME_LEAD_MAX_WORDS, WELCOME_PARA_MAX_WORDS } from '../../modules/course-shell';
+import { APPLICATION_SOLUTION_MARKERS_RE, CERTIFICATE_TEACHER_TROUBLESHOOTING, EXAMS_TEACHER_NOTE, EXAMS_TEACHER_NOTE_ATTEMPTS, EXAMS_TEACHER_NOTE_AVAILABILITY, CertificateRequirements, CourseFacts, chapterNextSteps, closingCertificateText, examOverallFeedbackBands, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles, WELCOME_LEAD_MAX_WORDS, WELCOME_PARA_MAX_WORDS } from '../../modules/course-shell';
 import { safeActivityName } from '../mbz-common';
 import { courseBadgeDescription } from './course-badge';
 import { QUIZ_REVIEW_V3 } from './moodle-activities-v3';
@@ -228,7 +228,8 @@ const REVIEW_CARDS_RE = /^cv3:ch:([^:]+):review_cards$/;
 const APPLICATION_RE = /^cv3:ch:([^:]+):application$/;
 const APPLICATION_SOLUTION_RE = /^cv3:ch:([^:]+):application_solution$/;
 /** Marcas que solo puede tener el solucionario (la página del estudiante nunca lleva respuestas). */
-const SOLUTION_MARKERS_RE = /Solucionario|Gu[ií]a de correcci[oó]n|Respuesta:|Soluci[oó]n esperada/;
+// Fase 2: la misma regex que rechaza la generación (validateApplicationStudentPart), para que nunca diverjan.
+const SOLUTION_MARKERS_RE = APPLICATION_SOLUTION_MARKERS_RE;
 
 export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectations): Promise<MbzV3ValidationResult> {
   const issues: MbzV3Issue[] = [];

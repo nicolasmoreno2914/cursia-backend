@@ -464,10 +464,58 @@ function rcpWithApplications() {
       // «Aplicar»: la propuesta materializada como estructura nueva (sin diseño pedagógico, como la estructura viva).
       const applied = P.materializeDistribution(dr.baseline.blueprint, d, null);
       const after = P.runPedagogyDryRun({ structure: applied, profile: prof, activityTypeRules: 2 }).distribution;
-      eq([after.status, after.changes.filter((c) => c.type !== 'set_application_activity').length], ['within_tolerance', 0], `${h} h: sin cambios`);
+      // Review I2: un minuto que ya tiene el capítulo NO es un cambio (antes se listaba igual): cero cambios de verdad.
+      eq([after.status, after.changes.length], ['within_tolerance', 0], `${h} h: sin cambios`);
       eq(after.modules.flatMap((m) => m.chapters).filter((c) => c.proposed).length, 0, `${h} h: nada que agregar`);
       assert(Math.abs(after.estimatedHours - d.estimatedHours) <= 0.15, `${h} h: ${after.estimatedHours} vs ${d.estimatedHours}`);
     }
+  });
+
+  await check('AA17 review: lo mostrado = lo aplicado (sin sugerencias de estructura), quitar actividades ES un cambio, marcas/campos extra rechazados, costo por nivel', () => {
+    const s = clone(RCP); s.course.reviewCards = true;
+    // I1: con un enfoque que sugiere cambios de estructura (videos/actividades/repaso), el diseño se dimensiona sobre lo
+    // que el lock congelaría: aplicarlo (sin esos cambios) vuelve a dar «ya cumple» con las mismas horas.
+    let withSuggestions = 0;
+    for (const k of ['competencias', 'problemas', 'experiencial', 'significativo', 'autodirigido']) {
+      for (const h of [20, 33]) {
+        const prof = profileOf(k, { targetHours: h });
+        const dr = P.runPedagogyDryRun({ structure: clone(s), profile: prof, activityTypeRules: 2 });
+        if (dr.structureChanges.length) withSuggestions++;
+        const d = dr.distribution;
+        if (d.status !== 'within_tolerance') continue;
+        const applied = P.materializeDistribution(dr.baseline.blueprint, d, null);
+        const after = P.runPedagogyDryRun({ structure: applied, profile: prof, activityTypeRules: 2 }).distribution;
+        eq([after.status, after.changes.length], ['within_tolerance', 0], `${k} ${h} h: aplicado = ya cumple`);
+        assert(Math.abs(after.estimatedHours - d.estimatedHours) <= 0.15, `${k} ${h} h: horas mostradas ${d.estimatedHours} vs aplicadas ${after.estimatedHours}`);
+      }
+    }
+    assert(withSuggestions > 0, 'algún enfoque sugiere cambios de estructura (el caso de I1 queda cubierto)');
+    // I2: estructura con actividades aplicadas + «Ninguna» → un remove_application_activity por cada una; materializado sin actividades.
+    const prof = profileOf('competencias', { targetHours: 33 });
+    const dr = P.runPedagogyDryRun({ structure: clone(s), profile: prof, activityTypeRules: 2 });
+    const applied = P.materializeDistribution(dr.baseline.blueprint, dr.distribution, null);
+    const had = applied.modules.flatMap((m) => m.chapters).filter((c) => c.applicationMinutes);
+    assert(had.length > 0, 'el diseño aplicado tiene actividades');
+    const none = P.runPedagogyDryRun({ structure: applied, profile: profileOf('competencias', { targetHours: 33, designPreferences: { applicationActivities: 'none' } }), activityTypeRules: 2 }).distribution;
+    eq(none.changes.filter((c) => c.type === 'remove_application_activity').map((c) => c.chapterId).sort(), had.map((c) => c.id).sort(), '«Ninguna»: un cambio por actividad quitada');
+    eq(none.counts.applicationActivities, 0, '«Ninguna»: sin actividades');
+    // I4 + M5: marcas de solucionario y campos extra en la parte del estudiante → error en la generación (reintento).
+    const doc = require('./lib/v21-packaging-fixtures').applicationDoc('00000000-0000-4000-8000-000000000001', 60, 1);
+    const codes = (a) => SHELL.validateApplicationStudentPart(a, 60).errors.map((e) => e.code);
+    eq(codes(doc.activity), [], 'actividad de fixture válida');
+    const m1 = clone(doc.activity); m1.exercises[2].prompt = 'Completa la hoja. Respuesta: ____________';
+    assert(codes(m1).includes('APPLICATION_SOLUTION_MARKER'), '«Respuesta:» rechazada');
+    const m2 = clone(doc.activity); m2.workshop.situation += ' Compara con la solución esperada al terminar la jornada de trabajo.';
+    assert(codes(m2).includes('APPLICATION_SOLUTION_MARKER'), '«solución esperada» rechazada');
+    const m3 = clone(doc.activity); m3.exercises[0].answer = 'la respuesta';
+    assert(codes(m3).includes('APPLICATION_SHAPE'), 'campo extra en un ejercicio rechazado');
+    const m4 = clone(doc.activity); m4.solution = {};
+    assert(codes(m4).includes('APPLICATION_SHAPE'), 'campo extra en la actividad rechazado');
+    // M6: costo por nivel de minutos (la salida escala con los ejercicios; 60 min = referencia).
+    const RB = loadDist('modules/finops/run-budget.js');
+    eq([30, 60, 90, 120].map((x) => RB.applicationUsageScale(x)), [{ output_tokens: 0.8571 }, { output_tokens: 1 }, { output_tokens: 1.2857 }, { output_tokens: 1.4286 }], 'escala por nivel');
+    const est = RB.estimateItemsForRun([{ key: 'application_activity:x', type: 'application_activity', chapterId: 'x', applicationMinutes: 120 }, { key: 'application_activity:y', type: 'application_activity', chapterId: 'y', applicationMinutes: 60 }], 'mock');
+    eq(est.map((e) => e.usageScale ?? null), [{ output_tokens: 1.4286 }, null], 'el estimador lleva la escala (60 min sin escala)');
   });
 
   console.log(`\n${passes} OK, ${failures} fallidas`);

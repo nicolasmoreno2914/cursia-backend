@@ -577,8 +577,12 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
     rules,
     targetHours,
     distribution: targetHours === null ? null : (() => {
-      const dist = distributeCourseHours({ snapshot: view.blueprint, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile) });
-      const materialized = materializeOrError(view.blueprint, dist, (plain) => {
+      // Fase 2 (review I1): el distribuidor dimensiona sobre lo que el lock congelaría HOY (estructura viva + diseño),
+      // NUNCA sobre la vista con los cambios de estructura sugeridos (videos/actividades/repaso): esos no los escribe
+      // «Aplicar diseño» (los decide el docente en el editor), y contarlos haría que lo mostrado ≠ lo aplicado.
+      const lockShaped = rules ? applyPedagogyToSnapshot(base, rules) : base;
+      const dist = distributeCourseHours({ snapshot: lockShaped, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile) });
+      const materialized = materializeOrError(lockShaped, dist, (plain) => {
         const ms = side(rules ? applyPedagogyToSnapshot(plain, rules) : plain, activityTypeRules);
         return {
           blueprintSha256: ms.blueprintSha256,

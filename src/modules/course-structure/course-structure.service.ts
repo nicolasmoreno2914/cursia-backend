@@ -238,7 +238,16 @@ export class CourseStructureService implements OnModuleInit {
         [courseId],
       );
       const saved = await loadCurrentPedagogicalProfile(queryRunner, courseId);
-      if (!saved || profileTargetHours(saved.profile) === null) {
+      // Review M2: un perfil o una estructura que el motor no puede evaluar es un 400 (como en pedagogy.service), no un 500.
+      const asBad = async <T>(fn: () => T): Promise<T> => {
+        try {
+          return fn();
+        } catch (err) {
+          await queryRunner.rollbackTransaction();
+          throw new BadRequestException((err instanceof Error ? err.message : String(err)).slice(0, 500));
+        }
+      };
+      if (!saved || (await asBad(() => profileTargetHours(saved.profile))) === null) {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException({ code: 'NO_TARGET_HOURS', message: 'NO_TARGET_HOURS: el curso no tiene horas objetivo guardadas; guarda el perfil antes de aplicar el diseño.' });
       }
@@ -251,7 +260,7 @@ export class CourseStructureService implements OnModuleInit {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException(`La estructura actual no se puede evaluar: ${errors.map((e) => e.message).join('; ')}`);
       }
-      const dr = runPedagogyDryRun({ structure: buildBlueprintSnapshotV2(courseRef, modules, chapters), profile: saved.profile, activityTypeRules: readActivityTypeRulesConfig() });
+      const dr = await asBad(() => runPedagogyDryRun({ structure: buildBlueprintSnapshotV2(courseRef, modules, chapters), profile: saved.profile, activityTypeRules: readActivityTypeRulesConfig() }));
       const dist = dr.distribution;
       if (!dist) {
         await queryRunner.rollbackTransaction();

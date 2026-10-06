@@ -10,7 +10,7 @@
 | **Distribuidor** (`study-time/distributor.ts`) | Ya reserva niveles de aplicación por rol del capítulo y política pedagógica (topes 90/120, share cap). | Las actividades pasan de «reservadas» a **generables**: `generableHours = estimatedHours` cuando el curso las tiene. |
 | **Capítulo de práctica** (Loop 4) | Capítulo sin video/Gamma/audiolibro/Libro; fuentes = capítulos de contenido del módulo. | Una práctica puede llevar Actividad de Aplicación; sus fuentes son las mismas (`moduleContentKeys`). Ninguna regla de video/Gamma/audiolibro cambia. |
 | **Blueprint v2** | Claves opcionales solo cuando aplican (`kind`, `targetHours`) → sha idéntico en cursos que no las usan. | Nueva clave opcional por capítulo `applicationMinutes` (solo si está fijada). |
-| **Manifest v3** + validador independiente | Items por capítulo con `dependsOn`, totales, exclusión de exámenes. | Nuevo item `application:<capítulo>` tipo `application_activity`, `dependsOn` = `content` del capítulo (o del módulo en práctica). Sin la clave, el Manifest es byte-idéntico. |
+| **Manifest v3** + validador independiente | Items por capítulo con `dependsOn`, totales, exclusión de exámenes. | Nuevo item `application_activity:<capítulo>` (ruling R16) tipo `application_activity`, `dependsOn` = `content` del capítulo (o del módulo en práctica). Sin la clave, el Manifest es byte-idéntico. |
 | **Motor pedagógico** (perfil, reglas, `generator-directives`) | Enfoque, `learningOutcomes` (hoy guardados pero no usados), learner, diseño por capítulo. | Bloque pedagógico del prompt + directivas por enfoque para la actividad. `learningOutcomes` entra por primera vez en un generador. |
 | **Ejecutor del navegador** (`45-dynamic-generation-executor.js`) | `_dynV3JsonWithRetry`, artifacts JSON, validación espejo, fuentes del capítulo/práctica. | Nuevo `_dynRunApplicationActivity`, mismo patrón que `experience` (JSON + reintento dirigido + artifact). |
 | **Validación servidor** (`course-shell/v3-validation.ts`) | El backend re-valida cada artifact al completar el item. | Validador `validateApplicationActivityV1` espejo del cliente (fallar fuerte). |
@@ -47,7 +47,7 @@ Faltaba (confirmado por grep): la columna/clave por capítulo, el item del Manif
 - **DB (solo staging):** `course_chapters.application_minutes smallint null`, con `CHECK (application_minutes in (30,60,90,120))`. La migración es aditiva e idempotente, va en `deploy-staging.yml` y queda en EXCLUDED del plan de producción. Las lecturas son tolerantes (`to_jsonb(ch)->>'application_minutes'`). Si se escribe sin la columna, responde 503 `schema_not_migrated_application`.
 - **API:** `applicationMinutes: 30|60|90|120|null` en crear y actualizar capítulo. La lectura de la estructura lo informa solo si la columna existe.
 - **Blueprint v2:** `chapters[].applicationMinutes` existe solo cuando está fijada. Se valida con `INVALID_APPLICATION_MINUTES`.
-- **Manifest v3:** `application:<id>` con `type: 'application_activity'` y `applicationMinutes`. `dependsOn` = `content:<id>` en contenido, o los `content` de los capítulos de contenido del módulo en práctica. Agrega `modules[].chapters[].applicationMinutes` y `totals.applicationActivityCount`, este último solo si hay alguna. Queda fuera de exámenes y nunca agrega video, presentación ni audiolibro.
+- **Manifest v3:** `application_activity:<id>` con `type: 'application_activity'` y `applicationMinutes`. `dependsOn` = `content:<id>` en contenido, o los `content` de los capítulos de contenido del módulo en práctica. Agrega `modules[].chapters[].applicationMinutes` y `totals.applicationActivityCount`, este último solo si hay alguna. Queda fuera de exámenes y nunca agrega video, presentación ni audiolibro.
 - **Tiempo:**
   - `studyTimeInputFromManifest` y `facts` pasan `applicationMinutes`;
   - el badge de minutos del capítulo la incluye;
@@ -63,7 +63,7 @@ El item hace dos pasadas, y las dos validan fuerte:
    - `objective`;
    - `context`;
    - `examples`: 0–2. Al menos uno en `calculation`, `procedure` y `design_build`;
-   - `exercises`: 6–10, con `id`, `prompt`, `difficulty` (básico/intermedio/avanzado, en orden no decreciente cuando hay gradación), `kind` y `answerSpace` (líneas para el PDF);
+   - `exercises`: 6–10, con `id`, `prompt`, `difficulty` (básico/intermedio/avanzado, en orden no decreciente cuando hay gradación), y `answerLines` (renglones para el PDF, 1–15; implementado sin `kind`: el género de la actividad ya fija la forma);
    - `workshop`: situación, consignas y tiempo;
    - `deliverable`: producto o evidencia, formato y extensión;
    - `selfCheck`: checklist de 4–8 ítems;
@@ -81,10 +81,12 @@ El item hace dos pasadas, y las dos validan fuerte:
 
 | Nivel | Ejercicios | Ejemplos | Taller |
 |---|---|---|---|
-| 30 min | 6 | 0–1 | breve |
-| 60 min | 7–8 | 1 | estándar |
-| 90 min | 8–9 | 1–2 | extendido |
-| 120 min | 9–10 | 2 | extendido |
+| 30 min | 6–7 | 0–1 | breve |
+| 60 min | 6–8 | 0–2 | estándar |
+| 90 min | 8–10 | 0–2 | extendido |
+| 120 min | 9–10 | 0–2 | extendido |
+
+(Tabla implementada = `EXERCISES_BY_MINUTES` de `course-shell/application-activity.ts`; los géneros calculation, procedure y design_build exigen al menos 1 ejemplo.)
 
 **Artifact:** `dynamic_application_json` con `{ activity, solution }`. Un item genera las dos partes, así que la regeneración nunca las desincroniza.
 
@@ -99,7 +101,7 @@ El item hace dos pasadas, y las dos validan fuerte:
   - Actividades de Aplicación: «Donde el diseño las necesite» (por defecto) / «Solo en capítulos de práctica» / «Ninguna».
 
   Cada cambio recalcula diseño, horas y costo con un dry-run. No genera nada.
-- **«Aplicar diseño»:** `POST /courses/:id/pedagogy/apply-distribution` con `expectedCounter` y el `proposalSha256` que vio el usuario.
+- **«Aplicar diseño»:** `POST /courses/:id/modules/apply-distribution` con `expectedCounter` y el `proposalSha256` que vio el usuario.
   - El servidor recalcula la propuesta y, si el sha no coincide, responde 409.
   - En una transacción crea los capítulos propuestos y fija `applicationMinutes`. No toca títulos ni capítulos existentes, salvo los minutos de aplicación.
   - Después corre el flujo de siempre: confirmar Blueprint (lock) → presupuesto → generar. El Blueprint confirmado es exactamente el diseño, y el Manifest se construye desde él.
