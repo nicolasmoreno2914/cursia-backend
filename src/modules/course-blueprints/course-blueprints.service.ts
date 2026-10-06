@@ -1,4 +1,5 @@
 import { CHAPTER_TITLE_TOO_LONG, MODULE_TITLE_TOO_LONG, STRUCTURE_TITLE_MAX } from '../course-structure/structure-titles';
+import { academicBlueprintContext, loadCurrentAcademicContext } from '../academic-context/academic-db';
 import {
   Injectable,
   BadRequestException,
@@ -324,7 +325,8 @@ export class CourseBlueprintsService {
       const chapters: RawChapterRowV2[] = await qr.query(
         `select id, module_id, position, title, objective, description, video_enabled, activity_enabled,
                 to_jsonb(course_chapters) ->> 'chapter_kind' as chapter_kind,
-                to_jsonb(course_chapters) ->> 'application_minutes' as application_minutes
+                to_jsonb(course_chapters) ->> 'application_minutes' as application_minutes,
+                to_jsonb(course_chapters) -> 'outcome_ids' as outcome_ids
            from public.course_chapters where course_id = $1`,
         [courseId],
       );
@@ -340,6 +342,8 @@ export class CourseBlueprintsService {
 
       // Motor pedagógico V1 / motor de carga horaria: perfil vigente (diseño + horas objetivo).
       const pedagogyProfile = await loadCurrentPedagogicalProfile(qr, courseId);
+      // Fase 3: contexto académico vigente → sus resultados y competencias se congelan en el Blueprint.
+      const academic = await loadCurrentAcademicContext(qr, courseId);
       const courseRef = {
         id: course.id,
         title: course.title,
@@ -351,6 +355,7 @@ export class CourseBlueprintsService {
         targetHours: profileTargetHours(pedagogyProfile ? pedagogyProfile.profile : null),
         // Fase 2: estudiante + resultados de aprendizaje congelados (solo entran si hay Actividades de Aplicación).
         applicationContext: profileApplicationContext(pedagogyProfile ? pedagogyProfile.profile : null),
+        academicContext: academic ? academicBlueprintContext(academic.context, academic.sha256) : null,
       };
       const errors = validateBlueprintInputV2(courseRef, modules, chapters);
       if (errors.length > 0) {

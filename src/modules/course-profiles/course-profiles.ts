@@ -6,6 +6,7 @@ import {
   pedagogicalProfileSha256,
   validatePedagogicalProfile,
 } from '../pedagogy/pedagogy-profile';
+import { AcademicContextV1, normalizeAcademicContext, validateAcademicContextShape } from '../academic-context/academic-context';
 
 /**
  * Cursia V2.1 — R3: perfiles de curso (audit §M.2, §K.2). Lógica PURA: sin
@@ -20,16 +21,20 @@ import {
  * pedagógico SÍ cambia el diseño: el lock del Blueprint v2 lo convierte en
  * reglas y congela el diseño resultante (src/modules/pedagogy). Su forma y su
  * validación viven en pedagogy-profile.ts.
+ *
+ * Fase 3: `academic` (contexto académico del curso: microcurrículo estructurado) también cambia el diseño — sus
+ * resultados de aprendizaje se congelan en el Blueprint v2 (course.academicContext). Forma y validación en
+ * src/modules/academic-context.
  */
 
-export type ProfileKind = 'presentation' | 'assessment' | 'pedagogy';
-export const PROFILE_KINDS: readonly ProfileKind[] = ['presentation', 'assessment', 'pedagogy'];
+export type ProfileKind = 'presentation' | 'assessment' | 'pedagogy' | 'academic';
+export const PROFILE_KINDS: readonly ProfileKind[] = ['presentation', 'assessment', 'pedagogy', 'academic'];
 
 export function isProfileKind(v: unknown): v is ProfileKind {
-  return v === 'presentation' || v === 'assessment' || v === 'pedagogy';
+  return v === 'presentation' || v === 'assessment' || v === 'pedagogy' || v === 'academic';
 }
 
-export type AnyCourseProfile = PresentationProfile | AssessmentProfile | PedagogicalProfile;
+export type AnyCourseProfile = PresentationProfile | AssessmentProfile | PedagogicalProfile | AcademicContextV1;
 
 export interface ProfileValidationError {
   path: string;
@@ -411,6 +416,7 @@ export function validateAssessmentProfile(p: unknown, ctx: { finalExam: boolean 
 
 export function validateProfile(kind: ProfileKind, p: unknown, ctx: { finalExam: boolean }): ProfileValidationError[] {
   if (kind === 'pedagogy') return validatePedagogicalProfile(p);
+  if (kind === 'academic') return validateAcademicContextShape(p);
   return kind === 'presentation' ? validatePresentationProfile(p) : validateAssessmentProfile(p, ctx);
 }
 
@@ -469,9 +475,11 @@ export function normalizeAssessmentProfile(p: unknown): AssessmentProfile {
 export function normalizeProfile(kind: 'presentation', p: unknown): PresentationProfile;
 export function normalizeProfile(kind: 'assessment', p: unknown): AssessmentProfile;
 export function normalizeProfile(kind: 'pedagogy', p: unknown): PedagogicalProfile;
+export function normalizeProfile(kind: 'academic', p: unknown): AcademicContextV1;
 export function normalizeProfile(kind: ProfileKind, p: unknown): AnyCourseProfile;
 export function normalizeProfile(kind: ProfileKind, p: unknown): AnyCourseProfile {
   if (kind === 'pedagogy') return normalizePedagogicalProfile(p);
+  if (kind === 'academic') return normalizeAcademicContext(p);
   return kind === 'presentation' ? normalizePresentationProfile(p) : normalizeAssessmentProfile(p);
 }
 

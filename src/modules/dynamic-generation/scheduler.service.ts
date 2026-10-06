@@ -660,17 +660,21 @@ export class SchedulerService {
   private async assertExecutorAppliesPedagogy(runId: string, ownerId: string, features: string[]): Promise<void> {
     if (features.includes(PEDAGOGY_BRIEF_FEATURE)) return;
     const [row] = await this.dataSource.query(
-      `select (m.manifest_json->'features'->'pedagogy') is not null as pedagogy
+      `select (m.manifest_json->'features'->'pedagogy') is not null as pedagogy,
+              -- Fase 3 (review M6): un Blueprint con contexto académico también entrega brief (resultados por item).
+              (b.snapshot_json->'course'->'academicContext') is not null as academic
          from public.production_jobs pj
          join public.course_generation_manifests m on m.id::text = pj.input_payload->>'manifestId'
+         left join public.course_blueprints b on b.id = m.blueprint_id and b.course_id = m.course_id
         where pj.id = $1 and pj.execution_mode = 'dynamic_generation' and pj.owner_id = $2`,
       [runId, ownerId],
     );
-    if (!row || row.pedagogy !== true) return;
+    if (!row || (row.pedagogy !== true && row.academic !== true)) return;
+    const what = row.pedagogy === true ? 'diseño pedagógico' : 'resultados de aprendizaje vinculados';
     const message =
-      `rules_version_mismatch: la ejecución ${runId} tiene diseño pedagógico y este navegador ejecuta una versión ` +
+      `rules_version_mismatch: la ejecución ${runId} tiene ${what} y este navegador ejecuta una versión ` +
       'anterior de Cursia que no lo aplica a los recursos. Recarga la página para continuar; con esta versión el ' +
-      'curso se generaría sin el enfoque pedagógico elegido.';
+      `curso se generaría sin ${row.pedagogy === true ? 'el enfoque pedagógico elegido' : 'los resultados de aprendizaje'}.`;
     throw new ConflictException({ message, code: 'executor_outdated_pedagogy', runId });
   }
 
@@ -1835,8 +1839,9 @@ export class SchedulerService {
     const v3 = await this.buildClaimV3(qr, row, mItem, manifest, snapshot);
 
     // Motor pedagógico Fase 2: el diseño del item (Manifest validado arriba contra el Blueprint) → brief del generador.
+    // Fase 3: también con contexto académico congelado (los resultados que el item debe evidenciar van en el brief).
     let pedagogy: ItemPedagogyBrief | null = null;
-    if (snapshot.schemaVersion === 2 && (mItem as any).design !== undefined) {
+    if (snapshot.schemaVersion === 2 && ((mItem as any).design !== undefined || (snapshot as any).course?.academicContext !== undefined)) {
       try {
         pedagogy = buildItemPedagogyBrief({ item: mItem as any, snapshot, activityTypeRules: (manifest as any).features?.activityTypeRules ?? null });
       } catch (err) {

@@ -24,6 +24,8 @@ import {
 } from './course-profiles';
 import { DesignRules, deriveDesignRulesOrNull, designRulesRecord } from '../pedagogy/design-rules';
 import { emptyPedagogicalProfile } from '../pedagogy/pedagogy-profile';
+import { AcademicContextV1, emptyAcademicContext } from '../academic-context/academic-context';
+import { AcademicValidation, validateAcademicContext } from '../academic-context/validate';
 
 export interface CourseProfileDto {
   courseId: number;
@@ -54,7 +56,18 @@ export interface CourseProfileDto {
    */
   designRules?: ReturnType<typeof designRulesRecord> | null;
   rulesStale?: boolean;
+  /**
+   * Fase 3 — solo `academic`: validación semántica del contexto (errores / advertencias / faltantes), recalculada
+   * en cada lectura. `canProceed: false` impide usarlo en el diseño, nunca guardarlo.
+   */
+  academicValidation?: AcademicValidation;
 }
+
+/** Migración que habilita cada kind nuevo (mensaje 503 claro si el entorno no la tiene). */
+const KIND_MIGRATION: Record<string, string> = {
+  pedagogy: 'supabase-migration-pedagogy-profiles.sql',
+  academic: 'supabase-migration-academic-context.sql',
+};
 
 function pedagogyRulesRecord(profile: AnyCourseProfile): ReturnType<typeof designRulesRecord> | null {
   const rules: DesignRules | null = deriveDesignRulesOrNull(profile);
@@ -104,7 +117,7 @@ export class CourseProfilesService {
 
   private assertKind(kind: string): asserts kind is ProfileKind {
     if (!isProfileKind(kind)) {
-      throw new BadRequestException(`Tipo de perfil inválido: "${kind}" (permitidos: presentation, assessment, pedagogy)`);
+      throw new BadRequestException(`Tipo de perfil inválido: "${kind}" (permitidos: presentation, assessment, pedagogy, academic)`);
     }
   }
 
@@ -159,6 +172,14 @@ export class CourseProfilesService {
           createdAt: null, createdBy: null, warnings: [], defaultSource: null, designRules: null, rulesStale: false,
         };
       }
+      if (kind === 'academic') {
+        // Fase 3: sin contexto guardado = el comportamiento de siempre (el diseño no usa ningún contexto).
+        const empty = emptyAcademicContext();
+        return {
+          courseId, kind, version: 0, profile: empty, sha256: profileSha256(empty), isDefault: true,
+          createdAt: null, createdBy: null, warnings: [], defaultSource: null, academicValidation: validateAcademicContext(empty),
+        };
+      }
       const profile = defaultAssessmentProfile({ finalExam });
       return {
         courseId, kind, version: 0, profile, sha256: profileSha256(profile), isDefault: true,
@@ -174,7 +195,7 @@ export class CourseProfilesService {
     kind: string,
     data: unknown,
     expectedVersion?: number,
-  ): Promise<{ created: boolean; profile: CourseProfileDto }> {
+  ): Promise<{ created: boolean; profile: CourseProfileDto; prunedOutcomeLinks?: { chapterId: string; removed: string[] }[] }> {
     assertDynamicOwnerAllowed(ownerId); // allow-list V2 en toda escritura
     this.assertKind(kind);
     await this.loadCourse(courseId, ownerId);
@@ -215,8 +236,13 @@ export class CourseProfilesService {
         );
       }
       if (latest && latest.sha256 === sha) {
-        await qr.rollbackTransaction();
-        return { created: false, profile: this.toDto(latest, finalExam) };
+        // Review N6: re-guardar el mismo contexto también limpia vínculos rotos (p. ej. anteriores a la poda).
+        const prunedSame = kind === 'academic' ? await this.pruneStaleOutcomeLinks(qr, courseId, profile as AcademicContextV1) : [];
+        // El DTO se arma ANTES de confirmar (review N-M1): un fallo de integridad no deja la poda confirmada con un 500.
+        const dto = this.toDto(latest, finalExam);
+        if (prunedSame.length) await qr.commitTransaction();
+        else await qr.rollbackTransaction();
+        return { created: false, profile: dto, ...(prunedSame.length ? { prunedOutcomeLinks: prunedSame } : {}) };
       }
 
       const [row] = await qr.query(
@@ -225,8 +251,12 @@ export class CourseProfilesService {
          returning *`,
         [courseId, kind, currentVersion + 1, JSON.stringify(stored), sha, ownerId],
       );
+      // Fase 3 (review I1): una versión nueva del contexto que ya no define un resultado vinculado deja ese vínculo
+      // roto (y el lock fallaría). En la MISMA transacción se quitan de los capítulos los ids que la versión nueva no
+      // define; si cambió alguno, sube el counter de la estructura (las pestañas abiertas releen).
+      const pruned = kind === 'academic' ? await this.pruneStaleOutcomeLinks(qr, courseId, profile as AcademicContextV1) : [];
       await qr.commitTransaction();
-      return { created: true, profile: this.toDto(row, finalExam) };
+      return { created: true, profile: this.toDto(row, finalExam), ...(pruned.length ? { prunedOutcomeLinks: pruned } : {}) };
     } catch (err) {
       if (qr.isTransactionActive) await qr.rollbackTransaction();
       if (isVersionConflict(err)) {
@@ -235,13 +265,33 @@ export class CourseProfilesService {
       // Motor pedagógico V1 (review M6): base sin la migración pedagogy → mensaje claro, no un 500.
       if (isKindCheckViolation(err)) {
         throw new ServiceUnavailableException(
-          `Este entorno todavía no admite perfiles "${kind}" (falta la migración supabase-migration-pedagogy-profiles.sql).`,
+          `Este entorno todavía no admite perfiles "${kind}" (falta la migración ${KIND_MIGRATION[kind] ?? 'de perfiles'}).`,
         );
       }
       throw err;
     } finally {
       await qr.release();
     }
+  }
+
+  /** Fase 3 (I1): quita de course_chapters.outcome_ids los ids que el contexto `ctx` no define. */
+  private async pruneStaleOutcomeLinks(qr: QueryRunner, courseId: number, ctx: AcademicContextV1): Promise<{ chapterId: string; removed: string[] }[]> {
+    const rows: { id: string; ids: unknown }[] = await qr.query(
+      `select id, to_jsonb(ch) -> 'outcome_ids' as ids from public.course_chapters ch
+        where ch.course_id = $1 and jsonb_typeof(to_jsonb(ch) -> 'outcome_ids') = 'array'`,
+      [courseId],
+    );
+    const known = new Set([...ctx.outcomes.map((o) => o.id), ...ctx.competencies.map((c) => c.id)]);
+    const out: { chapterId: string; removed: string[] }[] = [];
+    for (const r of rows) {
+      const ids = Array.isArray(r.ids) ? (r.ids as string[]) : [];
+      const keep = ids.filter((x) => known.has(x));
+      if (keep.length === ids.length) continue;
+      await qr.query(`update public.course_chapters set outcome_ids = $1::jsonb, updated_at = now() where id = $2 and course_id = $3`, [keep.length ? JSON.stringify(keep) : null, r.id, courseId]);
+      out.push({ chapterId: r.id, removed: ids.filter((x) => !known.has(x)) });
+    }
+    if (out.length) await qr.query(`update public.courses set structure_version_counter = structure_version_counter + 1 where id = $1`, [courseId]);
+    return out;
   }
 
   /**
@@ -268,6 +318,7 @@ export class CourseProfilesService {
       warnings: kind === 'assessment' ? validateAssessmentProfile(profile as any, { finalExam }) : [],
       defaultSource: null,
     };
+    if (kind === 'academic') return { ...base, academicValidation: validateAcademicContext(profile as AcademicContextV1) };
     if (kind !== 'pedagogy') return base;
     const designRules = pedagogyRulesRecord(profile);
     const storedEngine = stored?.designRules?.engineVersion ?? null;

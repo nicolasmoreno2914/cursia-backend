@@ -223,6 +223,7 @@ const EXCLUDED = [
   { file: 'supabase-migration-pedagogy-profiles.sql', reason: 'Motor pedagógico V1: SOLO staging en esta fase (deploy-staging.yml 4d6); se agrega al plan de producción cuando se decida el rollout' },
   { file: 'supabase-migration-practice-chapters.sql', reason: 'Motor de carga horaria (capítulo de práctica): SOLO staging en esta fase (deploy-staging.yml); se agrega al plan de producción cuando se decida el rollout' },
   { file: 'supabase-migration-application-activities.sql', reason: 'Fase 2 (Actividades de Aplicación): SOLO staging en esta fase (deploy-staging.yml); se agrega al plan de producción cuando se decida el rollout' },
+  { file: 'supabase-migration-academic-context.sql', reason: 'Fase 3 (Contexto académico): SOLO staging en esta fase (deploy-staging.yml); se agrega al plan de producción cuando se decida el rollout' },
   { file: 'supabase-migration-ev6-dod-preview-status.sql', reason: "EV6 DoD: el CHECK de worker_status con 'preview' lo aplica el PASO 0 (scripts/lib/production-jobs-constraints.js, misma lista); este .sql es su equivalente manual" },
 ];
 

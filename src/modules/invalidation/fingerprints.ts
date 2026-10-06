@@ -1,4 +1,5 @@
 import type { BlueprintSnapshotV1, BlueprintSnapshotV2 } from '../course-blueprints/blueprint-snapshot';
+import { itemOutcomes } from '../academic-context/alignment-brief';
 import { cmpStr, sha256Canonical } from '../coherence/canonical-json';
 import { Outline, buildOutline } from '../coherence/coherence-types';
 import { roleDesignDelta } from '../pedagogy/generator-directives';
@@ -282,6 +283,20 @@ export interface BlueprintFingerprintsV3 extends BlueprintFingerprints {
    * contexto congelado del estudiante/resultados). Solo capítulos con actividad.
    */
   application?: Map<string, string>;
+  /**
+   * Fase 3 · Contexto académico (R26): `<type>:<entidad>` → sha de los resultados de aprendizaje (ids + textos) que
+   * recibe ese item, SOLO para los items que producen evidencia y con resultados. Entra únicamente en su huella: un
+   * cambio de vínculos regenera actividades, Actividades de Aplicación y exámenes, nunca el content (ni su video).
+   */
+  alignment?: Map<string, string>;
+}
+
+/** Fase 3 (R26): tipos cuya huella incluye los resultados que deben evidenciar. */
+export const ALIGNMENT_FINGERPRINT_TYPES: readonly string[] = ['experience', 'activity', 'video_interactions', 'application_activity', 'exam', 'final_exam'];
+
+function withAlignment(fps: BlueprintFingerprintsV3, type: string, entityId: string, fp: string | null): string | null {
+  const a = fps.alignment?.get(`${type}:${entityId}`);
+  return fp && a ? sha256Canonical({ v: INVALIDATION_FINGERPRINT_VERSION_V3, kind: 'alignment', type, base: fp, alignment: a }) : fp;
 }
 
 /** Envuelve la huella de experience/activity de un capítulo de práctica con la de sus fuentes (contenido: igual). */
@@ -363,7 +378,23 @@ export function computeFingerprintsV3(
       }
     }
   }
-  return { ...base, moduleIntro, finalExam, roleDesign, practiceSources, application };
+  // Fase 3 (R26): resultados que recibe cada item de evidencia (mismo cálculo que el brief del claim).
+  const alignment = new Map<string, string>();
+  if ((bp as any).course?.academicContext) {
+    const courseId = String((bp as any).course.id);
+    const add = (type: string, entityId: string, ref: { type: string; moduleId?: string | null; chapterId: string | null }) => {
+      const outs = itemOutcomes(bp, ref);
+      if (outs.length) alignment.set(`${type}:${entityId}`, sha256Canonical({ v, kind: 'alignment', outcomes: outs }));
+    };
+    for (const m of bp.modules) {
+      add('exam', m.id, { type: 'exam', moduleId: m.id, chapterId: null });
+      for (const c of m.chapters) {
+        for (const t of ALIGNMENT_FINGERPRINT_TYPES) if (CHAPTER_ITEM_TYPES_V3.includes(t)) add(t, c.id, { type: t, moduleId: m.id, chapterId: c.id });
+      }
+    }
+    if (ALIGNMENT_FINGERPRINT_TYPES.includes('final_exam')) add('final_exam', courseId, { type: 'final_exam', chapterId: null });
+  }
+  return { ...base, moduleIntro, finalExam, roleDesign, practiceSources, application, ...(alignment.size ? { alignment } : {}) };
 }
 
 /** Sha de la variación por rol que recibe el trabajo `type` del capítulo (null = el rol no le cambia nada). */
@@ -420,7 +451,8 @@ export function itemFingerprintV3(fps: BlueprintFingerprintsV3, key: string, ext
   const { type, entityId } = parseItemKey(key);
   assertKnownV3Type(type, key);
   const fp = itemFingerprintV3Base(fps, key, extras);
-  return CHAPTER_ITEM_TYPES_V3.includes(type) ? withRoleDesign(fps, type, entityId, withPracticeSources(fps, type, entityId, fp)) : fp;
+  const wrapped = CHAPTER_ITEM_TYPES_V3.includes(type) ? withRoleDesign(fps, type, entityId, withPracticeSources(fps, type, entityId, fp)) : fp;
+  return withAlignment(fps, type, entityId, wrapped);
 }
 
 function itemFingerprintV3Base(fps: BlueprintFingerprintsV3, key: string, extras: FingerprintExtrasV3): string | null {
@@ -452,7 +484,7 @@ export function matchFingerprintV3(fps: BlueprintFingerprintsV3, key: string, ex
   const { type, entityId } = parseItemKey(key);
   assertKnownV3Type(type, key);
   if (!CHAPTER_ITEM_TYPES_V3.includes(type)) return itemFingerprintV3(fps, key, extras);
-  return withRoleDesign(fps, type, entityId, withPracticeSources(fps, type, entityId, matchFingerprintV3Base(fps, key, extras)));
+  return withAlignment(fps, type, entityId, withRoleDesign(fps, type, entityId, withPracticeSources(fps, type, entityId, matchFingerprintV3Base(fps, key, extras))));
 }
 
 function matchFingerprintV3Base(fps: BlueprintFingerprintsV3, key: string, extras: FingerprintExtrasV3): string | null {

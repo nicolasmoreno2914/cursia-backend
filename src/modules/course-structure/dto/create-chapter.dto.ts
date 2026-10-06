@@ -1,4 +1,4 @@
-import { IsString, IsNotEmpty, IsOptional, MaxLength, IsBoolean, IsInt, Min, IsIn } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, MaxLength, IsBoolean, IsInt, Min, IsIn, IsArray, ArrayMaxSize, ArrayUnique, Matches } from 'class-validator';
 
 export class CreateChapterDto {
   // Title Normalization: se aceptan hasta 1000 caracteres para poder SEPARAR un título pegado con su
@@ -38,6 +38,15 @@ export class CreateChapterDto {
   @IsIn([30, 60, 90, 120])
   @IsOptional()
   applicationMinutes?: 30 | 60 | 90 | 120 | null;
+
+  // Fase 3 · Contexto académico: resultados de aprendizaje / competencias que el capítulo debe evidenciar (1–8 ids del
+  // contexto académico vigente, «RA1», «CO2»…); null o [] = sin vínculos; ausente → sin cambio.
+  @IsArray()
+  @ArrayMaxSize(8)
+  @ArrayUnique()
+  @Matches(/^(RA|CO)[0-9]{1,3}$/, { each: true })
+  @IsOptional()
+  outcomeIds?: string[] | null;
 
   @IsInt()
   @Min(0)
