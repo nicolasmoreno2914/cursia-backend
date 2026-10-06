@@ -8,6 +8,7 @@
 //       (sin error); una diferencia → DISTRIBUTION_MODEL_MISMATCH visible
 //   LF3 «Ajustar» después de aplicar: si el diseño vigente ya cumple, la propuesta lo DICE (no queda un «ya aplicado»
 //       mudo con preferencias nuevas)
+//   LF5 costo: desglose por categoría = total; tarifas provisionales y supuestos explícitos (nunca falsa precisión)
 //   LF4 0 llamadas de red
 //
 // Uso: node scripts/check-loop7-flow-consistency.js [path/to/dist]
@@ -86,6 +87,17 @@ const eq = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new
     const d2 = DR.runPedagogyDryRun({ structure: applied, profile: profileOf(64, { designPreferences: { emphasis: 'depth' } }), activityTypeRules: 2 }).distribution;
     eq(d2.changes.length, 0, 'el diseño vigente ya cumple: 0 cambios');
     assert(d2.recommendations.some((r) => /ya cumple/.test(r) && /no quita capítulos/.test(r)), `la propuesta explica por qué no cambia: ${JSON.stringify(d2.recommendations)}`);
+  });
+
+  await check('LF5 costo: desglose audiovisual / Actividades de Aplicación / texto = total; tarifas provisionales y supuestos visibles', () => {
+    const d = DR.runPedagogyDryRun({ structure, profile: profileOf(64), activityTypeRules: 2 }).distribution;
+    const pv = d.materialized.providers;
+    const sum = Number(pv.byCategory.audiovisual) + Number(pv.byCategory.application) + Number(pv.byCategory.text);
+    assert(Math.abs(sum - Number(pv.estimateUsd.expected)) < 0.03, `categorías ${JSON.stringify(pv.byCategory)} = total ${pv.estimateUsd.expected}`);
+    assert(Number(pv.byCategory.application) > 0 && Number(pv.byCategory.audiovisual) > Number(pv.byCategory.application), 'las Actividades de Aplicación aparte del audiovisual');
+    assert(pv.unverifiedProviders.includes('gamma') && pv.assumptions.some((x) => /Tarifa provisional/.test(x) && /gamma/.test(x)), `Gamma provisional: ${pv.unverifiedProviders}`);
+    assert(pv.assumptions.some((x) => /Sonnet 4\.6/.test(x)) && pv.assumptions.some((x) => /estimación/i.test(x)), 'supuestos del modelo y del uso');
+    assert(Number(pv.estimateUsd.min) < Number(pv.estimateUsd.expected) && Number(pv.estimateUsd.expected) < Number(pv.estimateUsd.max), 'rango min < esperado < max');
   });
 
   await check('LF4 0 llamadas de red', () => eq(netAttempts, [], 'red'));

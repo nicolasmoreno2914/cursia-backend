@@ -100,7 +100,26 @@ export interface ProviderPlan {
   byProvider: Record<string, { items: number; operations: Record<string, number> }>;
   estimateUsd: { min: string; expected: string; max: string; byProvider: Record<string, string> } | null;
   estimateNote: string;
+  /**
+   * LOOP 7 (A3 I3/I4/I7): desglose por categoría (esperado, USD) — audiovisual (video, presentaciones, audio y guion
+   * del audiolibro), Actividades de Aplicación, texto con IA —, proveedores con tarifa PROVISIONAL (no verificada) y
+   * los supuestos del estimado. Ausentes si no hay estimación.
+   */
+  byCategory?: { audiovisual: string; application: string; text: string };
+  unverifiedProviders?: string[];
+  assumptions?: string[];
 }
+
+/** LOOP 7: categoría de costo visible de un tipo de item (fuente única para panel, impacto y modal). */
+export const COST_CATEGORY_OF_ITEM_TYPE: Readonly<Record<string, 'audiovisual' | 'application' | 'text'>> = Object.freeze({
+  video: 'audiovisual', presentation: 'audiovisual', audio_welcome: 'audiovisual', audiobook_chapter: 'audiovisual',
+  application_activity: 'application',
+});
+export const ESTIMATE_ASSUMPTIONS: readonly string[] = Object.freeze([
+  'Es una estimación: el uso de cada recurso sale de un modelo típico por tipo (aún no medido con cursos reales), no del contenido de tu curso.',
+  'El texto con IA se valúa con el modelo recomendado (Sonnet 4.6); con un modelo más económico costaría menos.',
+  'Cada recurso puede necesitar un reintento: por eso hay un rango.',
+]);
 
 export interface DryRunSide {
   blueprint: BlueprintSnapshotV2;
@@ -504,6 +523,20 @@ export function providerPlanFor(manifest: GenerationManifestV1, opts?: { coverag
     const byP: Record<string, string> = {};
     for (const k of Object.keys(est.totals.byProvider).sort()) byP[k] = est.totals.byProvider[k].expected;
     estimateUsd = { min: est.totals.min, expected: est.totals.expected, max: est.totals.max, byProvider: byP };
+    const cat = { audiovisual: 0, application: 0, text: 0 };
+    for (const [type, v] of Object.entries(est.totals.byItemType)) cat[COST_CATEGORY_OF_ITEM_TYPE[type] ?? 'text'] += Number(v.expected);
+    const unverified = new Set<string>();
+    for (const l of est.lines) {
+      const rows = seedCatalog().filter((r) => r.provider === l.provider && r.product_or_model === l.product);
+      if (rows.some((r) => r.verified !== true)) unverified.add(l.provider);
+    }
+    const unverifiedProviders = [...unverified].sort();
+    return {
+      byProvider: sorted, estimateUsd, estimateNote,
+      byCategory: { audiovisual: cat.audiovisual.toFixed(2), application: cat.application.toFixed(2), text: cat.text.toFixed(2) },
+      unverifiedProviders,
+      assumptions: [...ESTIMATE_ASSUMPTIONS, ...(unverifiedProviders.length ? [`Tarifa provisional (no verificada con la factura) para: ${unverifiedProviders.join(', ')}.`] : [])],
+    };
   } catch (e) {
     estimateNote = `Sin estimación de costo: ${(e as Error).message}`;
   }
