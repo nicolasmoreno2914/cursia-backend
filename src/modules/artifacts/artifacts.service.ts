@@ -161,13 +161,23 @@ export class ArtifactsService {
 
   // ── CREATE ──────────────────────────────────────────────────────────────────
 
+  /**
+   * `POST /artifacts` (cliente). REVIEW-L7 I4: por la API, SOLO la carpeta propia (`<uid>/…`): nunca `qa-internal/…`
+   * (copias de QA, solo SUPER_ADMIN, las registra el backend) ni fixtures compartidos.
+   */
+  async createFromApi(dto: CreateArtifactDto, ownerId: string): Promise<Artifact> {
+    if (String(dto.storage_path ?? '').split('/')[0] !== ownerId) {
+      throw new ForbiddenException({ code: 'storage_path_not_owned', message: 'storage_path_not_owned: el archivo debe estar en tu carpeta del bucket de artifacts.' });
+    }
+    return this.create(dto, ownerId);
+  }
+
   async create(dto: CreateArtifactDto, ownerId: string): Promise<Artifact> {
-    // LOOP 7 (A4 C1): la API solo registra objetos DEL PROPIO usuario en el bucket de artifacts. Antes cualquier ruta
-    // ajena quedaba registrada y después se firmaba / borraba con la service role (lectura y borrado entre cuentas).
+    // LOOP 7 (A4 C1): solo se registran objetos DEL dueño en el bucket de artifacts (su carpeta, o la de QA interna
+    // `qa-internal/<dueño>/…` que escribe el backend). Antes cualquier ruta ajena quedaba registrada y después se
+    // firmaba / borraba con la service role (lectura y borrado entre cuentas).
     const bucket = dto.storage_bucket ?? 'cursia-artifacts';
-    // REVIEW-L7 I4: por la API, SOLO la carpeta propia (`<uid>/…`): nunca `qa-internal/…` (copias de QA, solo
-    // SUPER_ADMIN, las registra el backend) ni fixtures compartidos.
-    if (!storagePathOwnedBy(ownerId, bucket, dto.storage_path) || String(dto.storage_path).split('/')[0] !== ownerId) {
+    if (!storagePathOwnedBy(ownerId, bucket, dto.storage_path)) {
       throw new ForbiddenException({ code: 'storage_path_not_owned', message: 'storage_path_not_owned: el archivo debe estar en tu carpeta del bucket de artifacts.' });
     }
     const artifact = this.artifactRepo.create({

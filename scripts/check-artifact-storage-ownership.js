@@ -61,13 +61,17 @@ const code = async (fn) => { try { await fn(); return 'OK'; } catch (e) { return
 (async () => {
   await check('AS1 create(): ruta ajena / otro bucket / ruta insegura → 403; la propia → OK', async () => {
     const { svc } = env();
-    eq(await code(() => svc.create(dto(`${OTHER}/dynamic/1/2/dynamic_application_json/x/a1.json`), ME)), 'storage_path_not_owned', 'ruta de otro usuario');
-    eq(await code(() => svc.create(dto(`${ME}/x.json`, 'otro-bucket'), ME)), 'storage_path_not_owned', 'otro bucket');
-    eq(await code(() => svc.create(dto(`${ME}/../${OTHER}/x.json`), ME)), 'storage_path_not_owned', 'dot-segments');
-    eq(await code(() => svc.create(dto(`qa-internal/${OTHER}/x.mbz`), ME)), 'storage_path_not_owned', 'QA de otro');
-    eq(await code(() => svc.create(dto(`qa-internal/${ME}/dynamic/1/2/dynamic_mbz/r/c.mbz`), ME)), 'storage_path_not_owned', 'QA propio tampoco (solo lo registra el backend)');
-    eq(await code(() => svc.create(dto('mock/presentation/x.pdf'), ME)), 'storage_path_not_owned', 'fixture mock no se registra por la API');
-    eq(await code(() => svc.create(dto(`${ME}/123/content/libro.md`), ME)), 'OK', 'ruta propia (convención legacy y dynamic)');
+    eq(await code(() => svc.createFromApi(dto(`${OTHER}/dynamic/1/2/dynamic_application_json/x/a1.json`), ME)), 'storage_path_not_owned', 'ruta de otro usuario');
+    eq(await code(() => svc.createFromApi(dto(`${ME}/x.json`, 'otro-bucket'), ME)), 'storage_path_not_owned', 'otro bucket');
+    eq(await code(() => svc.createFromApi(dto(`${ME}/../${OTHER}/x.json`), ME)), 'storage_path_not_owned', 'dot-segments');
+    eq(await code(() => svc.createFromApi(dto(`qa-internal/${OTHER}/x.mbz`), ME)), 'storage_path_not_owned', 'QA de otro');
+    eq(await code(() => svc.createFromApi(dto(`qa-internal/${ME}/dynamic/1/2/dynamic_mbz/r/c.mbz`), ME)), 'storage_path_not_owned', 'QA propio tampoco (solo lo registra el backend)');
+    eq(await code(() => svc.createFromApi(dto('mock/presentation/x.pdf'), ME)), 'storage_path_not_owned', 'fixture mock no se registra por la API');
+    eq(await code(() => svc.createFromApi(dto(`${ME}/123/content/libro.md`), ME)), 'OK', 'ruta propia (convención legacy y dynamic)');
+    // El backend (uploadBufferArtifact → create) sí registra la copia QA interna del dueño; nunca la de otro.
+    eq(await code(() => svc.create(dto(`qa-internal/${ME}/dynamic/1/2/dynamic_mbz/r/c.mbz`), ME)), 'OK', 'backend: QA propia');
+    eq(await code(() => svc.create(dto(`qa-internal/${OTHER}/dynamic/1/2/dynamic_mbz/r/c.mbz`), ME)), 'storage_path_not_owned', 'backend: QA ajena');
+    eq(await code(() => svc.create(dto(`${OTHER}/x.json`), ME)), 'storage_path_not_owned', 'backend: ruta ajena');
   });
 
   await check('AS2 getDownloadUrl(): una fila ajena registrada antes del control no se firma', async () => {
@@ -75,7 +79,7 @@ const code = async (fn) => { try { await fn(); return 'OK'; } catch (e) { return
     rows.set('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', { id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', ownerId: ME, storageProvider: 'supabase', storageBucket: 'cursia-artifacts', storagePath: `${OTHER}/dynamic/x/solucionario.json`, metadata: {} });
     eq(await code(() => svc.getDownloadUrl('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', ME, 3600)), 'storage_path_not_owned', 'no se firma');
     eq(calls.length, 0, 'ninguna llamada a Storage');
-    const own = await svc.create(dto(`${ME}/1/content/x.md`), ME);
+    const own = await svc.createFromApi(dto(`${ME}/1/content/x.md`), ME);
     const r = await svc.getDownloadUrl(own.id, ME, 10 * 365 * 24 * 3600);
     assert(r.url && calls.length === 1, 'la propia se firma');
   });
@@ -86,7 +90,7 @@ const code = async (fn) => { try { await fn(); return 'OK'; } catch (e) { return
     await svc.remove('cccccccc-cccc-4ccc-8ccc-cccccccccccc', ME);
     assert(!rows.has('cccccccc-cccc-4ccc-8ccc-cccccccccccc'), 'fila borrada');
     eq(calls.filter((c) => c.method === 'DELETE').length, 0, 'objeto ajeno intacto');
-    const own = await svc.create(dto(`${ME}/1/package/curso.mbz`), ME);
+    const own = await svc.createFromApi(dto(`${ME}/1/package/curso.mbz`), ME);
     await svc.remove(own.id, ME);
     eq(calls.filter((c) => c.method === 'DELETE').map((c) => c.url.endsWith(`${ME}/1/package/curso.mbz`)), [true], 'objeto propio borrado');
   });
