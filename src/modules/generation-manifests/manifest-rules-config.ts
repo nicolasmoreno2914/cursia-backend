@@ -89,10 +89,11 @@ export async function activityTypeRulesForNextManifest(
   q: { query(sql: string, params?: unknown[]): Promise<any> },
   courseId: number,
   env: NodeJS.ProcessEnv = process.env,
+  opts: { tableKnownToExist?: boolean } = {},
 ): Promise<ActivityTypeRulesVersion> {
   // Sin la tabla de Manifests (esquema sin esa migración) no hay Manifest previo → config, como antes. to_regclass no
   // falla (una consulta fallida abortaría la transacción del llamador, p. ej. «Aplicar diseño»).
-  const [reg] = await q.query(`select to_regclass('public.course_generation_manifests') is not null as ok`);
+  const [reg] = opts.tableKnownToExist ? [{ ok: true }] : await q.query(`select to_regclass('public.course_generation_manifests') is not null as ok`);
   const [prev] = reg && reg.ok
     ? await q.query(
       `select id, manifest_json->'features'->'activityTypeRules' as activity_type_rules

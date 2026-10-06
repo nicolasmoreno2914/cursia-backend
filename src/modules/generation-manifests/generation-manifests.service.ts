@@ -302,7 +302,8 @@ export class GenerationManifestsService {
   private async activityTypeRulesForNewRow(courseId: number): Promise<ActivityTypeRulesVersion> {
     // LOOP 7: fuente única (también la usan el dry-run, «Aplicar diseño» y el impacto de cambios).
     try {
-      return await activityTypeRulesForNextManifest(this.dataSource, courseId);
+      // El servicio de Manifests trabaja sobre su propia tabla: no hace falta comprobar que exista.
+      return await activityTypeRulesForNextManifest(this.dataSource, courseId, process.env, { tableKnownToExist: true });
     } catch (err) {
       throw new InternalServerErrorException((err as Error).message);
     }

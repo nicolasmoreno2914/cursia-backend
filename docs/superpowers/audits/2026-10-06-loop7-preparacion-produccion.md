@@ -12,12 +12,19 @@ el plan exacto, y lo que exige decisión del dueño está marcado.
    de staging (commit `4a2a866` de `chore/loop7-hardening`: `storagePathOwnedBy` en `create()`, firma y borrado + tope
    de `expires`) es pequeño y aislado: candidato a un PR propio contra `main` (hotfix) sin esperar el release.
 2. **Presupuesto (§6.2 corregido).** La política bloquea cuando el costo **esperado** del run supera el límite
-   (`normal-approval.ts`), y el monto autorizado es `min(máximo estimado, límite restante)`. El diseño real de 64 h
-   del microcurrículo estima **≈ USD 64 esperado (USD 41–157)** —no 54,70, que era el curso RCP de 3×3—. Con
-   `maxCostPerRun = 60` ese curso quedaría bloqueado. Propuesta corregida:
-   - Validación real (1 curso, owner interno): `maxCostPerRun = 80`, `maxCostPerCourse = 100` (run + una
-     regeneración parcial), `monthlyCap = 150`, `on_exceed = ADMIN_APPROVAL`, `require_human_approval_for_real_spend = true`.
-   - Lanzamiento acotado: `maxCostPerRun = 90`, `maxCostPerCourse = 120`, `monthlyCap` = cursos esperados × 70 USD,
+   (`normal-approval.ts`), y el monto autorizado es `min(máximo estimado, límite restante)`. Estimados reales del
+   microcurrículo de 64 h (los dos diseños posibles según el enfoque):
+
+   | Diseño a 64 h | Capítulos (video) | Esperado | Rango | Videogen · Gamma · TTS · Anthropic |
+   |---|---|---|---|---|
+   | Aplicación primero (competencias, ABP) | 23 (18) | ≈ USD 64 | 41–157 | 19,46 · 12,42 · 5,28 · 27,28 |
+   | Profundidad primero (significativo, o «Ajustar» → profundidad) | 26 (25) | ≈ USD 84 | 55–204 | 27,03 · 17,25 · 7,32 · 32,77 |
+
+   (Los 54,70 de la Fase 6 eran el curso RCP de 3×3.) Con `maxCostPerRun = 60` cualquiera de los dos quedaría
+   bloqueado. Propuesta corregida:
+   - Validación real (1 curso, owner interno): `maxCostPerRun = 100`, `maxCostPerCourse = 130` (run + una
+     regeneración parcial), `monthlyCap = 200`, `on_exceed = ADMIN_APPROVAL`, `require_human_approval_for_real_spend = true`.
+   - Lanzamiento acotado: `maxCostPerRun = 110`, `maxCostPerCourse = 150`, `monthlyCap` = cursos esperados × 90 USD,
      recalibrado con 2–4 semanas de ledger real.
 3. **Restauración en Moodle con override del solucionario.** Cada solucionario lleva `mod/page:view` = PROHIBIT para
    el rol estudiante. Un restore web (admin o docente con edición) lo aplica; el CLI `admin/cli/restore_backup.php`
