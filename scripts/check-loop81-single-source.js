@@ -136,10 +136,17 @@ const BRIEF = { nombre: 'Contabilidad de Costos', obj: 'Calcular y controlar los
     const typedSame = JSON.parse(JSON.stringify(hoursFirst)); typedSame.targetHours = 64;
     eq(CF.pedagogyFieldOwners(typedSame, { academicVersion: 1, fields: {} }, sugg).targetHours, 'user', 'escrito por el docente aunque coincida');
     // Review L81 R2-M2: forzar métodos de evaluación del docente SUMA los del documento (lo que el panel muestra).
-    const mine = { ...emptyPed(), assessmentMethods: ['portfolio'] };
+    const mine = { ...emptyPed(), assessmentMethods: ['peer'] };
     const oM = CF.pedagogyFieldOwners(mine, null, sugg);
     const mf = CF.mergeDerivedProfile(mine, sugg, oM, 1, ['assessmentMethods']);
-    eq([mf.profile.assessmentMethods.includes('portfolio'), sugg.assessmentMethods.every((x) => mf.profile.assessmentMethods.includes(x))], [true, true], 'unión');
+    eq([mf.profile.assessmentMethods.includes('peer'), sugg.assessmentMethods.every((x) => mf.profile.assessmentMethods.includes(x))], [true, true], 'unión');
+    eq(mf.record.fields.assessmentMethods, undefined, 'sigue siendo del docente (review L81 R3-M1)');
+    const V = loadDist('modules/pedagogy/vocabulary.js').ASSESSMENT_METHODS;
+    eq(mf.profile.assessmentMethods, V.filter((x) => mf.profile.assessmentMethods.includes(x)), 'en el orden del vocabulario');
+    const fUnion = CF.resolveCourseFacts({ courseTitle: 'x', institutionId: null, brief, academic: { version: 1, context: ctx }, pedagogy: { version: 2, profile: mf.profile }, derivation: mf.record, suggested: sugg });
+    eq(fUnion.conflicts.some((c) => c.field === 'pedagogy.assessmentMethods'), false, 'con los del documento sumados ya no hay conflicto');
+    const again = CF.mergeDerivedProfile(mf.profile, sugg, CF.pedagogyFieldOwners(mf.profile, mf.record, sugg), 2);
+    eq(again.profile.assessmentMethods, mf.profile.assessmentMethods, 'una versión nueva del documento no borra los métodos del docente');
     const forced = CF.mergeDerivedProfile(hoursFirst, sugg, o1, 1, ['targetHours']);
     eq([forced.profile.targetHours, forced.changed.includes('targetHours')], [64, true], '«Usar los datos del documento» (force)');
   });

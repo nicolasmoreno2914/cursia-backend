@@ -11,6 +11,7 @@
 import { createHash } from 'crypto';
 import type { AcademicContextV1 } from '../academic-context/academic-context';
 import type { PedagogicalProfile } from '../pedagogy/pedagogy-profile';
+import { ASSESSMENT_METHODS } from '../pedagogy/vocabulary';
 
 // ── Pedido del curso (brief) ──────────────────────────────────────────────────────────────────────────────
 
@@ -174,12 +175,13 @@ export function mergeDerivedProfile(
     const takeDoc = owners[f] !== 'user' || force.includes(f);
     if (takeDoc && !isEmptyValue(docValue)) {
       if (f === 'assessmentMethods' && owners[f] === 'user') {
-        // Forzado sobre métodos del docente: se SUMAN los del documento (es lo que el panel muestra), no se reemplazan.
-        const union = [...new Set([...(current.assessmentMethods || []), ...(suggested.assessmentMethods || [])])];
-        const ordered = union;
+        // Forzado sobre métodos del docente: se SUMAN los del documento (es lo que el panel muestra), en el orden del
+        // vocabulario (el del perfil guardado). El campo sigue siendo del docente: no se registra como del documento,
+        // así una versión nueva del documento nunca borra sus métodos (review L81 R3-M1).
+        const have = new Set<string>([...(current.assessmentMethods || []), ...(suggested.assessmentMethods || [])]);
+        const ordered = ASSESSMENT_METHODS.filter((x) => have.has(x));
         if (fieldSha(ordered) !== fieldSha(current.assessmentMethods || [])) changed.push(f);
         next.assessmentMethods = ordered as PedagogicalProfile['assessmentMethods'];
-        record.fields[f] = fieldSha(ordered);
         continue;
       }
       if (fieldSha(derivedFieldValue(current, f)) !== fieldSha(docValue)) changed.push(f);
@@ -295,7 +297,10 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
   if (ctx && input.suggested) {
     for (const f of DERIVED_FIELDS) {
       const docV = derivedFieldValue(input.suggested, f);
-      if (owners[f] === 'user' && !isEmptyValue(docV) && fieldSha(docV) !== fieldSha(derivedFieldValue(ped, f))) {
+      // Métodos de evaluación: los del documento se SUMAN; solo hay conflicto si falta alguno del documento.
+      const missingDocMethods = f === 'assessmentMethods' && (docV as string[]).some((x) => !((ped && ped.assessmentMethods) || []).includes(x as any));
+      const differs = f === 'assessmentMethods' ? missingDocMethods : fieldSha(docV) !== fieldSha(derivedFieldValue(ped, f));
+      if (owners[f] === 'user' && !isEmptyValue(docV) && differs) {
         differing.push(f);
         conflicts.push({ field: `pedagogy.${f}`, values: [{ source: 'document', value: docV }, { source: 'profile', value: derivedFieldValue(ped, f) }],
           message: FIELD_CONFLICT_MESSAGE[f](docV, pedHours) });
