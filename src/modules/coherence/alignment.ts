@@ -29,7 +29,11 @@ export const ALIGNMENT_VERSION = 1 as const;
 export const ALIGNMENT_RULESET = 'alignment-rules@1' as const;
 
 export type AlignmentSeverity = 'critical' | 'warning' | 'suggestion';
-export type EvidenceKind = 'instruction' | 'practice' | 'application' | 'assessment';
+/**
+ * `check` = preguntas de comprensión dentro del video (review F4 I1): cuentan como evidencia de que se enseñó y
+ * para resultados de saber, pero NO satisfacen la práctica de un resultado de desempeño.
+ */
+export type EvidenceKind = 'instruction' | 'check' | 'practice' | 'application' | 'assessment';
 
 export interface AlignmentEvidence {
   kind: EvidenceKind;
@@ -57,7 +61,7 @@ export interface OutcomeAlignment {
   complex: boolean;
   chapterIds: string[];
   evidence: AlignmentEvidence[];
-  minutes: { instruction: number; practice: number; application: number; assessmentItems: number };
+  minutes: { instruction: number; check: number; practice: number; application: number; assessmentItems: number };
   status: 'covered' | 'partial' | 'uncovered';
 }
 
@@ -103,7 +107,8 @@ export interface AlignmentUnavailable {
   alignmentVersion: typeof ALIGNMENT_VERSION;
   ruleset: typeof ALIGNMENT_RULESET;
   available: false;
-  reason: 'NO_ACADEMIC_CONTEXT';
+  /** ALIGNMENT_FAILED: el cálculo falló dentro del dry-run (nunca rompe la propuesta). */
+  reason: 'NO_ACADEMIC_CONTEXT' | 'ALIGNMENT_FAILED';
 }
 
 export interface AlignmentInput {
@@ -154,10 +159,13 @@ function evidenceKindOf(it: ManifestItem, practiceChapters: Set<string>): Eviden
     case 'content':
       return 'instruction';
     case 'experience':
-      return it.chapterId && practiceChapters.has(it.chapterId) ? 'practice' : 'instruction';
+      // En un capítulo de contenido la página de experiencia ES parte del contenido (sus minutos ya cuentan en
+      // `content:`): no se duplica como evidencia de 0 minutos (review F4 M6).
+      return it.chapterId && practiceChapters.has(it.chapterId) ? 'practice' : null;
     case 'activity':
-    case 'video_interactions':
       return 'practice';
+    case 'video_interactions':
+      return 'check';
     case 'application_activity':
       return 'application';
     case 'exam':
@@ -232,10 +240,10 @@ export function buildAlignmentReport(input: AlignmentInput): AlignmentReport | A
   const outcomes = new Map<string, OutcomeAlignment>();
   for (const o of ctx.outcomes) {
     const performance = isPerformanceLevel(o.level as any);
-    outcomes.set(o.id, { id: o.id, text: o.text, level: o.level, domain: o.domain, performance, complex: o.level === 'analyze' || o.level === 'evaluate' || o.level === 'create', chapterIds: [], evidence: [], minutes: { instruction: 0, practice: 0, application: 0, assessmentItems: 0 }, status: 'uncovered' });
+    outcomes.set(o.id, { id: o.id, text: o.text, level: o.level, domain: o.domain, performance, complex: o.level === 'analyze' || o.level === 'evaluate' || o.level === 'create', chapterIds: [], evidence: [], minutes: { instruction: 0, check: 0, practice: 0, application: 0, assessmentItems: 0 }, status: 'uncovered' });
   }
   for (const c of ctx.competencies) {
-    outcomes.set(c.id, { id: c.id, text: c.text, level: null, domain: 'competency', performance: true, complex: true, chapterIds: [], evidence: [], minutes: { instruction: 0, practice: 0, application: 0, assessmentItems: 0 }, status: 'uncovered' });
+    outcomes.set(c.id, { id: c.id, text: c.text, level: null, domain: 'competency', performance: true, complex: true, chapterIds: [], evidence: [], minutes: { instruction: 0, check: 0, practice: 0, application: 0, assessmentItems: 0 }, status: 'uncovered' });
   }
 
   for (const it of manifest.items) {
@@ -250,10 +258,11 @@ export function buildAlignmentReport(input: AlignmentInput): AlignmentReport | A
       if (kind === 'assessment') ev.style = it.type === 'final_exam' ? finalExamStyle : examStyle;
       o.evidence.push(ev);
       if (kind === 'instruction') o.minutes.instruction = round2(o.minutes.instruction + share);
+      else if (kind === 'check') o.minutes.check = round2(o.minutes.check + share);
       else if (kind === 'practice') o.minutes.practice = round2(o.minutes.practice + share);
       else if (kind === 'application') o.minutes.application = round2(o.minutes.application + share);
       else o.minutes.assessmentItems += 1;
-      if (it.chapterId && (kind === 'instruction' || kind === 'practice' || kind === 'application') && !o.chapterIds.includes(it.chapterId)) o.chapterIds.push(it.chapterId);
+      if (it.chapterId && kind !== 'assessment' && !o.chapterIds.includes(it.chapterId)) o.chapterIds.push(it.chapterId);
     }
   }
 
@@ -266,7 +275,12 @@ export function buildAlignmentReport(input: AlignmentInput): AlignmentReport | A
     const f = o.domain === 'competency'; // concordancia: «cubierta» / «cubierto»
     const practiceMin = round2(o.minutes.practice + o.minutes.application);
     const moduleIds = [...new Set(o.evidence.map((e) => e.moduleId).filter((x): x is string => !!x))].sort();
-    if (!has('instruction') && !has('practice') && !has('application')) {
+    const taught = has('instruction') || has('check') || has('practice') || has('application');
+    if (!taught && o.domain === 'competency') {
+      // Review F4 I2: los documentos suelen declarar las competencias para todo el curso, sin atarlas a unidades, y
+      // Cursia no propone vínculos de competencias. No es un vacío crítico: se evidencian de forma transversal.
+      add({ rule: 'A1c', severity: 'warning', outcomeIds: [o.id], moduleIds: [], chapterIds: [], message: `La competencia ${o.id} («${short(o.text)}») no está vinculada a ningún capítulo: solo se evidenciaría de forma transversal.`, suggestion: 'Vincúlala a los capítulos o Actividades de Aplicación donde se pone en juego, para que el curso la trabaje y la evalúe de forma explícita.', evidence: { outcomeId: o.id } });
+    } else if (!taught) {
       add({ rule: 'A1', severity: 'critical', outcomeIds: [o.id], moduleIds: [], chapterIds: [], message: `${label} ${o.id} («${short(o.text)}») no está ${f ? 'cubierta' : 'cubierto'} por ningún capítulo.`, suggestion: 'Vincúlalo a los capítulos que lo trabajan o agrega un capítulo que lo desarrolle.', evidence: { outcomeId: o.id } });
     } else {
       if (!has('assessment') && !has('application')) {
@@ -275,7 +289,9 @@ export function buildAlignmentReport(input: AlignmentInput): AlignmentReport | A
       if (o.performance && !has('practice') && !has('application')) {
         add({
           rule: 'A3', severity: thresholds.missingPracticeIsCritical ? 'critical' : 'warning', outcomeIds: [o.id], moduleIds, chapterIds: o.chapterIds,
-          message: `${label} ${o.id} no tiene suficiente evidencia práctica.`,
+          message: has('check')
+            ? `${label} ${o.id} no tiene suficiente evidencia práctica: solo preguntas de comprensión en el video.`
+            : `${label} ${o.id} no tiene suficiente evidencia práctica.`,
           suggestion: 'Activa la actividad de sus capítulos o agrega una Actividad de Aplicación o un capítulo de práctica en su módulo.',
           evidence: { outcomeId: o.id, level: o.level, evidenceDimension: D.evidence },
         });
@@ -312,8 +328,9 @@ export function buildAlignmentReport(input: AlignmentInput): AlignmentReport | A
     const items = manifest.items.filter((i) => i.moduleId === m.id);
     const hasApplication = items.some((i) => i.type === 'application_activity');
     if (thresholds.problemChecks) {
-      const decision = items.some((i) => i.type === 'activity' && (i.h5pType === 'branchingscenario' || i.variant === 'scorm')) || hasApplication ||
-        // La intención de decidir del diseño solo cuenta donde la actividad del capítulo existe.
+      const decision = items.some((i) => i.type === 'activity' && i.h5pType === 'branchingscenario') || hasApplication ||
+        // La intención de decidir del diseño solo cuenta donde la actividad del capítulo existe. Un SCORM cuenta solo
+        // por esa intención, no por ser SCORM (review F4 M7).
         m.chapters.some((c) => c.activityEnabled && !!c.design && (c.design.activity.intent === 'decide' || c.design.scenario.branching));
       if (!decision) add({ rule: 'P1', severity: 'suggestion', outcomeIds: [], moduleIds: [m.id], chapterIds: [], message: `El módulo «${short(m.title)}» no tiene un problema para analizar y decidir.`, suggestion: 'Con este enfoque, cada módulo debería cerrar con un caso o escenario de decisión (Actividad de Aplicación o escenario ramificado).', evidence: { moduleId: m.id, problemFirst: D.problemFirst } });
     }
@@ -328,7 +345,7 @@ export function buildAlignmentReport(input: AlignmentInput): AlignmentReport | A
   // Estado por resultado.
   for (const o of outcomes.values()) {
     const has = (k: EvidenceKind) => o.evidence.some((e) => e.kind === k);
-    const taught = has('instruction') || has('practice') || has('application');
+    const taught = has('instruction') || has('check') || has('practice') || has('application');
     const practiced = !o.performance || has('practice') || has('application');
     const assessed = has('assessment') || has('application');
     o.status = !taught ? 'uncovered' : practiced && assessed && !findings.some((f) => f.outcomeIds.includes(o.id) && f.severity !== 'suggestion') ? 'covered' : 'partial';
@@ -336,7 +353,7 @@ export function buildAlignmentReport(input: AlignmentInput): AlignmentReport | A
   }
 
   const order: Record<AlignmentSeverity, number> = { critical: 0, warning: 1, suggestion: 2 };
-  const ruleOrder = ['A1', 'A3', 'A5', 'A2', 'A6', 'A4', 'A7', 'P1', 'P2', 'P3'];
+  const ruleOrder = ['A1', 'A1c', 'A3', 'A5', 'A2', 'A6', 'A4', 'A7', 'P1', 'P2', 'P3'];
   const sorted = findings
     .map((f, i) => ({ f, i }))
     .sort((a, b) => order[a.f.severity] - order[b.f.severity] || ruleOrder.indexOf(a.f.rule) - ruleOrder.indexOf(b.f.rule) || a.i - b.i)

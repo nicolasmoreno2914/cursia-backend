@@ -48,10 +48,48 @@ const DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.doc
 export function sniffMediaType(buf: Buffer, name: string): AcademicDocument['mediaType'] | null {
   if (buf.length >= 5 && buf.subarray(0, 5).toString('latin1') === '%PDF-') return 'application/pdf';
   if (buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04) return DOCX;
-  // Texto: UTF-8 o Windows-1252/Latin-1 (habitual en sílabos guardados en Windows), sin bytes de control binarios.
-  const s = buf.toString('latin1');
-  if (/[\x00-\x08\x0E-\x1F]/.test(s)) return null;
+  // Texto: UTF-8 o Windows-1252 (habitual en sílabos guardados en Windows). Binario → no soportado (review N3): bytes
+  // de control C0 (salvo tab/saltos) o bytes que Windows-1252 no define, en más del 0,5 % del archivo. Los bytes
+  // «no definidos» solo cuentan en líneas que NO son UTF-8 válido (review I8): en UTF-8 son bytes de continuación
+  // legítimos (Á = C3 81, Í = C3 8D, ” = E2 80 9D).
+  let bad = 0;
+  for (const b of buf) if ((b < 0x20 && b !== 0x09 && b !== 0x0a && b !== 0x0d && b !== 0x0c) || b === 0x7f) bad++;
+  if (!isUtf8(buf)) {
+    let start = 0;
+    for (let i = 0; i <= buf.length; i++) {
+      if (i < buf.length && buf[i] !== 0x0a) continue;
+      const line = buf.subarray(start, i);
+      if (!isUtf8(line)) for (const b of line) if (CP1252_UNDEFINED.has(b)) bad++;
+      start = i + 1;
+    }
+  }
+  if (bad > Math.max(0, buf.length * 0.005)) return null;
   return /\.md$/i.test(name) ? 'text/markdown' : 'text/plain';
+}
+
+const UTF8_STRICT = new TextDecoder('utf-8', { fatal: true });
+function isUtf8(bytes: Buffer): boolean {
+  try {
+    UTF8_STRICT.decode(bytes);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Bytes 0x80–0x9F que Windows-1252 no define. */
+const CP1252_UNDEFINED = new Set([0x81, 0x8d, 0x8f, 0x90, 0x9d]);
+/** Windows-1252 0x80–0x9F (comillas tipográficas, rayas, €…); el resto coincide con Latin-1. */
+const CP1252_HIGH: Record<number, string> = {
+  0x80: '\u20AC', 0x82: '\u201A', 0x83: '\u0192', 0x84: '\u201E', 0x85: '\u2026', 0x86: '\u2020', 0x87: '\u2021', 0x88: '\u02C6',
+  0x89: '\u2030', 0x8a: '\u0160', 0x8b: '\u2039', 0x8c: '\u0152', 0x8e: '\u017D', 0x91: '\u2018', 0x92: '\u2019', 0x93: '\u201C',
+  0x94: '\u201D', 0x95: '\u2022', 0x96: '\u2013', 0x97: '\u2014', 0x98: '\u02DC', 0x99: '\u2122', 0x9a: '\u0161', 0x9b: '\u203A',
+  0x9c: '\u0153', 0x9e: '\u017E', 0x9f: '\u0178',
+};
+export function decodeCp1252(bytes: Buffer): string {
+  let out = '';
+  for (const b of bytes) out += b >= 0x80 && b <= 0x9f ? (CP1252_HIGH[b] ?? '') : String.fromCharCode(b);
+  return out;
 }
 
 const collapse = (s: string) => s.replace(/[\u00A0\t ]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -151,17 +189,41 @@ function runText(xml: string): string {
   return out;
 }
 
+/** Descomprime una entrada del ZIP en streaming, con tope de bytes REALES (no el declarado). */
+function inflateLimited(file: JSZip.JSZipObject, max: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    let done = false;
+    const h = (file as any).internalStream('uint8array');
+    h.on('data', (chunk: Uint8Array) => {
+      if (done) return;
+      total += chunk.length;
+      if (total > max) {
+        done = true;
+        try { h.pause(); } catch { /* ya detenido */ }
+        reject(new DocumentReadError('DOCUMENT_TOO_LARGE', `el contenido del DOCX descomprimido supera ${max / 1024 / 1024} MB`));
+        return;
+      }
+      chunks.push(chunk);
+    })
+      .on('error', (e: unknown) => { if (!done) { done = true; reject(e); } })
+      .on('end', () => { if (!done) { done = true; resolve(Buffer.concat(chunks.map((c) => Buffer.from(c))).toString('utf8')); } })
+      .resume();
+  });
+}
+
 export async function readDocx(buf: Buffer): Promise<ReadDocument> {
   let xml: string;
   try {
     const zip = await JSZip.loadAsync(buf);
     const f = zip.file('word/document.xml');
     if (!f) throw new Error('falta word/document.xml');
-    // JSZip conoce el tamaño descomprimido declarado: se rechaza antes de inflar (zip bomb).
+    // Zip bomb (review I7): el tamaño declarado en el ZIP puede mentir; se descomprime por partes CONTANDO los bytes
+    // reales y se corta al pasar el tope (nunca se infla entero en memoria).
     const declared = Number((f as unknown as { _data?: { uncompressedSize?: number } })._data?.uncompressedSize ?? 0);
     if (declared > MAX_DOCX_XML_BYTES) throw new DocumentReadError('DOCUMENT_TOO_LARGE', `el contenido del DOCX descomprimido supera ${MAX_DOCX_XML_BYTES / 1024 / 1024} MB`);
-    xml = await f.async('string');
-    if (xml.length > MAX_DOCX_XML_BYTES) throw new DocumentReadError('DOCUMENT_TOO_LARGE', `el contenido del DOCX descomprimido supera ${MAX_DOCX_XML_BYTES / 1024 / 1024} MB`);
+    xml = await inflateLimited(f, MAX_DOCX_XML_BYTES);
   } catch (err) {
     if (err instanceof DocumentReadError) throw err;
     throw new DocumentReadError('DOCUMENT_UNREADABLE', `No se pudo leer el DOCX (${err instanceof Error ? err.message : String(err)})`);
@@ -211,10 +273,21 @@ export function readText(buf: Buffer, mediaType: 'text/plain' | 'text/markdown')
   const lines: SourceLine[] = [];
   let n = 0;
   let characters = 0;
-  const utf8 = buf.toString('utf8');
-  const latin1 = utf8.includes('\uFFFD');
-  const textAll = latin1 ? buf.toString('latin1') : utf8;
-  for (const raw of textAll.replace(/^\uFEFF/, '').split(/\r?\n/)) {
+  // Línea por línea (review N2): cada línea en UTF-8; solo las que no lo son se leen como Windows-1252 (un byte
+  // suelto no arruina las tildes del resto del archivo).
+  let latin1 = false;
+  const rawLines: string[] = [];
+  let startAt = 0;
+  for (let i = 0; i <= buf.length; i++) {
+    if (i < buf.length && buf[i] !== 0x0a) continue;
+    const bytes = buf.subarray(startAt, i);
+    const u = bytes.toString('utf8');
+    if (u.includes('\uFFFD')) { latin1 = true; rawLines.push(decodeCp1252(bytes)); } else rawLines.push(u);
+    startAt = i + 1;
+  }
+  if (rawLines.length) rawLines[0] = rawLines[0].replace(/^\uFEFF/, '');
+  for (const rawLine of rawLines) {
+    const raw = rawLine.replace(/\r$/, '');
     n++;
     let text = raw;
     let heading = false;
@@ -238,7 +311,7 @@ export function readText(buf: Buffer, mediaType: 'text/plain' | 'text/markdown')
   }
   return {
     mediaType, lines, pages: null, characters,
-    ...(latin1 ? { notes: [{ code: 'ENCODING_ASSUMED_LATIN1', message: 'El texto no estaba en UTF-8: se leyó como Windows-1252 / Latin-1. Revisa las tildes; si se ven mal, guárdalo como UTF-8.' }] } : {}),
+    ...(latin1 ? { notes: [{ code: 'ENCODING_ASSUMED_LATIN1', message: 'Parte del texto no estaba en UTF-8: esas líneas se leyeron como Windows-1252. Revisa las tildes; si se ven mal, guárdalo como UTF-8.' }] } : {}),
   };
 }
 

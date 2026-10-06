@@ -167,11 +167,13 @@ const COMPETENCY_CODE_RE = /^\s*\(?(CE|CG|CO|C)\s*[-.]?\s*([0-9]{1,3})\s*\)?\s*[
 // —entre paréntesis, al final tras un guion o en una celda que solo trae códigos—, para no confundir «CO2» de
 // «emisiones de CO2» con una competencia.
 const OUTCOME_REF_G = /\b(RAA|RAP|RA)\s*-?\s*([0-9]{1,3})\b/g;
-const CODE_G = /\b(RAA|RAP|RA|CE|CG|CO)\s*-?\s*([0-9]{1,3})\b/g;
+// Dentro de un grupo de códigos se aceptan minúsculas («(ra1, ra2)»); fuera, solo «RA» en mayúsculas.
+const CODE_G = /\b(RAA|RAP|RA|CE|CG|CO)\s*-?\s*([0-9]{1,3})\b/gi;
 const CODE_LIST = '(?:(?:RAA|RAP|RA|CE|CG|CO)\\s*-?\\s*[0-9]{1,3}[\\s,;y]*)+';
-const GROUP_PAREN_G = new RegExp(`\\((\\s*${CODE_LIST})\\)`, 'g');
-const GROUP_TAIL_RE = new RegExp(`[-–—:|]\\s*(${CODE_LIST})$`);
-const GROUP_ALL_RE = new RegExp(`^\\s*${CODE_LIST}$`);
+const GROUP_PAREN_G = new RegExp(`\\((\\s*${CODE_LIST})\\)`, 'gi');
+// Al final tras guion o barra (no «:» — «Gas principal: CO2» no es un vínculo).
+const GROUP_TAIL_RE = new RegExp(`[-–—|]\\s*(${CODE_LIST})$`, 'i');
+const GROUP_ALL_RE = new RegExp(`^\\s*${CODE_LIST}$`, 'i');
 
 // ── Estado por documento ──────────────────────────────────────────────────────────────────────────────────
 
@@ -670,11 +672,12 @@ export function refsOf(text: string): { ids: string[]; rest: string } {
   if (tail) groups.push(tail[1]);
   if (GROUP_ALL_RE.test(text)) groups.push(text);
   for (const g of groups) {
-    for (const m of g.matchAll(CODE_G)) ids.push(/^R/.test(m[1]) ? `RA${Number(m[2])}` : `CO${Number(m[2])}`);
+    for (const m of g.matchAll(CODE_G)) ids.push(/^R/i.test(m[1]) ? `RA${Number(m[2])}` : `CO${Number(m[2])}`);
   }
   for (const m of text.matchAll(OUTCOME_REF_G)) ids.push(`RA${Number(m[2])}`);
   const rest = collapse(text.replace(GROUP_PAREN_G, '').replace(GROUP_TAIL_RE, '').replace(GROUP_ALL_RE, ''));
-  return { ids: [...new Set(ids)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)), rest };
+  // Orden canónico (review N5): RA antes que CO, por número (RA2 antes que RA10).
+  return { ids: [...new Set(ids)].sort((a, b) => (a.startsWith('RA') ? 0 : 1) - (b.startsWith('RA') ? 0 : 1) || Number(a.slice(2)) - Number(b.slice(2))), rest };
 }
 
 function takeHours(text: string): { text: string; hours: number | null } {
@@ -766,12 +769,22 @@ export async function extractAcademicContext(inputs: ExtractionInput[]): Promise
       if (!ex.found.size) ex.note('NO_SECTIONS_RECOGNIZED', `En «${doc.name}» no se reconoció ninguna sección de un microcurrículo (resultados, contenidos, horas, evaluación…).`);
     }
     for (const k of ex.found) sections.add(k);
-    const dangling = danglingRefs(ex.ctx);
+    const dangling = ex.ctx.outcomes.length || ex.ctx.competencies.length ? danglingRefs(ex.ctx) : [];
     if (dangling.length) ex.note('UNKNOWN_OUTCOME_REF_IN_DOCUMENT', `«${doc.name}» vincula ${dangling.join(', ')}, que no aparecen entre sus resultados de aprendizaje o competencias: esos vínculos no se guardaron.`);
     notes.push(...ex.notes);
     parts.push({ doc, ex });
   }
   const merged = mergeExtractions(parts.map((p) => p.ex.ctx), parts.map((p) => p.doc));
+  // Vínculos que, ya fusionados, no apuntan a ningún resultado ni competencia: se quitan con una nota (nunca se guarda
+  // un vínculo roto).
+  const finalDangling = danglingRefs(merged);
+  if (finalDangling.length) {
+    notes.push({ code: 'UNKNOWN_OUTCOME_REF_IN_DOCUMENT', documentId: null, message: `Los documentos vinculan ${finalDangling.join(', ')}, que no aparecen entre los resultados de aprendizaje o competencias: esos vínculos no se guardaron.` });
+    const known = new Set([...merged.outcomes.map((o) => o.id), ...merged.competencies.map((o) => o.id)]);
+    const keep = (ids: string[]) => ids.filter((x) => known.has(x));
+    merged.units = merged.units.map((u) => ({ ...u, outcomeIds: keep(u.outcomeIds), contents: u.contents.map((c) => ({ ...c, outcomeIds: keep(c.outcomeIds) })) }));
+    merged.evaluation = merged.evaluation.map((e) => ({ ...e, outcomeIds: keep(e.outcomeIds) }));
+  }
   return {
     context: normalizeAcademicContext(merged),
     notes,
@@ -844,7 +857,10 @@ export function mergeExtractions(ctxs: AcademicContextV1[], documents: AcademicD
       idMap.set(o.id, id);
       out.competencies.push({ ...o, id });
     }
-    const remap = (ids: string[]) => [...new Set(ids.map((x) => idMap.get(x)).filter((x): x is string => !!x))];
+    // Un documento que no define resultados ni competencias (p. ej. el anexo de contenidos de un sílabo partido en dos)
+    // se refiere a los ids ya fusionados (review N4): sus vínculos se conservan tal cual.
+    const definesOwn = c.outcomes.length > 0 || c.competencies.length > 0;
+    const remap = (ids: string[]) => [...new Set(ids.map((x) => (definesOwn ? idMap.get(x) : x)).filter((x): x is string => !!x))];
     if (!out.units.length && c.units.length) {
       out.units = c.units.slice(0, ACADEMIC_LIMITS.units).map((u) => ({ ...u, outcomeIds: remap(u.outcomeIds), contents: u.contents.map((x) => ({ ...x, outcomeIds: remap(x.outcomeIds) })) }));
     }

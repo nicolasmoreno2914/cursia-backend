@@ -472,6 +472,48 @@ const profileOf = (k, extra = {}) => ({
     eq([bomb.length < 1024 * 1024, code], [true, 'DOCUMENT_TOO_LARGE'], 'zip bomb rechazado');
   });
 
+  await check('AC15 re-revisión (I7, N1–N5): zip con tamaño falso, Windows-1252 por línea, binario, sílabo partido, códigos', async () => {
+    const txt = (lines) => Buffer.from(lines.join('\n'), 'utf8');
+    // I7: el ZIP DECLARA 1000 bytes pero se infla a 30 MB → se corta por bytes reales.
+    const JSZip = require('jszip');
+    const z = new JSZip();
+    z.file('word/document.xml', '<w:document><w:body>' + ' '.repeat(30 * 1024 * 1024) + '</w:body></w:document>');
+    const liar = await z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+    const patchSize = (buf, sigOffsetFn) => { let i = -1; while ((i = buf.indexOf(sigOffsetFn.sig, i + 1)) >= 0) buf.writeUInt32LE(1000, i + sigOffsetFn.off); };
+    patchSize(liar, { sig: Buffer.from([0x50, 0x4b, 0x03, 0x04]), off: 22 });
+    patchSize(liar, { sig: Buffer.from([0x50, 0x4b, 0x01, 0x02]), off: 24 });
+    const heap0 = process.memoryUsage().rss;
+    let code = null;
+    try { await A.extractAcademicContext([{ name: 'mentira.docx', data: liar }]); } catch (e) { code = e.code || e.message; }
+    eq(code, 'DOCUMENT_TOO_LARGE', 'zip con tamaño falso rechazado');
+    assert(process.memoryUsage().rss - heap0 < 200 * 1024 * 1024, 'sin inflar todo en memoria');
+    // N1/N2: una línea en Windows-1252 (comillas tipográficas, raya) no arruina las tildes UTF-8 del resto.
+    const mixed = Buffer.concat([Buffer.from('Asignatura: Gestión de riesgos\nDescripción\n', 'utf8'), Buffer.from([0x93, 0x45, 0x6c, 0x20, 0x72, 0x69, 0x65, 0x73, 0x67, 0x6f, 0x94, 0x20, 0x96, 0x20, 0x63, 0x61, 0x73, 0x6f, 0x0a]), Buffer.from('Contenidos\n- Introducción\n', 'utf8')]);
+    const rm = await A.extractAcademicContext([{ name: 'mixto.txt', data: mixed }]);
+    eq([rm.context.identity.subjectName.value, rm.context.identity.description.value, rm.context.units[0].contents[0].text], ['Gestión de riesgos', '\u201CEl riesgo\u201D \u2013 caso', 'Introducción'], 'cp1252 solo en su línea');
+    // N3: binario sin bytes C0 → no soportado (400), no un borrador vacío.
+    const bin = Buffer.from(Array.from({ length: 4000 }, (_v, i) => [0x81, 0x8d, 0x8f, 0x90, 0x9d, 0x41][i % 6]));
+    let binCode = null;
+    try { await A.extractAcademicContext([{ name: 'raro.txt', data: bin }]); } catch (e) { binCode = e.code; }
+    eq(binCode, 'UNSUPPORTED_DOCUMENT', 'binario rechazado');
+    // I8 (REVIEW-3): UTF-8 legítimo con Á, Í, ” y emoji (bytes 0x81/0x8D/0x9D de continuación) NO es binario.
+    const accents = txt(['ÁREA: Salud', 'Asignatura: Gestión de riesgos', '# ÍNDICE', 'METODOLOGÍA', '“Seguridad” 😁', 'BIBLIOGRAFÍA', 'Contenidos', '- Introducción']);
+    eq(A.sniffMediaType(Buffer.from('ÁREA: Salud', 'utf8'), 'a.txt'), 'text/plain', '«ÁREA» corto aceptado');
+    eq(A.sniffMediaType(accents, 'a.md'), 'text/markdown', 'sílabo con tildes mayúsculas aceptado');
+    const ra = await A.extractAcademicContext([{ name: 'tildes.txt', data: accents }]);
+    eq(ra.context.identity.subjectName.value, 'Gestión de riesgos', 'se extrae normalmente');
+    // N4: sílabo partido: resultados en un archivo, contenidos (con vínculos) en otro.
+    const rs = await A.extractAcademicContext([
+      { name: 'resultados.txt', data: txt(['Resultados de aprendizaje', 'RA1. Identificar peligros.', 'RA2. Evaluar riesgos.']) },
+      { name: 'contenidos.txt', data: txt(['Contenidos', 'Unidad 1: Peligros (RA1)', '- Inspección', 'Unidad 2: Riesgos (RA2, RA7)', '- Matriz']) },
+    ]);
+    eq(rs.context.units.map((u) => u.outcomeIds), [['RA1'], ['RA2']], 'los vínculos del segundo archivo se conservan (RA7 inexistente, fuera)');
+    assert(rs.notes.some((n) => n.code === 'UNKNOWN_OUTCOME_REF_IN_DOCUMENT' && /RA7/.test(n.message)), 'nota del vínculo inexistente');
+    // N5: «: CO2» no es vínculo; minúsculas en paréntesis sí; orden canónico.
+    eq(A.refsOf('Gas principal: CO2').ids, [], '«: CO2»');
+    eq(A.refsOf('Matriz de riesgos (ra10, ra2, ce1)').ids, ['RA2', 'RA10', 'CO1'], 'minúsculas en grupo y orden canónico');
+  });
+
   await check('AC13 0 llamadas de red medidas', () => eq(netAttempts, [], 'intentos de red'));
 
   console.log(`\n${passes} OK, ${failures} fallidas`);
