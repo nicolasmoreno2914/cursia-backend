@@ -874,13 +874,20 @@ async function dbChecks() {
       await rejectsRe(sched.claimNextItem({ executorId: 'b0', types: ['presentation'], runId: job.id, ownerId: OWNER }), /browser_type_not_allowed/, 'navegador pide presentation', 400);
       // Completar plan / intro / content "a mano" (sus ejecutores reales son del navegador).
       await ds.query(`update public.generation_item_runs set status = 'completed' where job_id = $1 and type in ('course_plan', 'course_intro', 'content')`, [job.id]);
-      const act = await sched.claimNextItem({ executorId: 'b1', types: ['experience', 'video_interactions', 'activity', 'final_exam', 'exam', 'module_intro'], runId: job.id, ownerId: OWNER });
+      // Fase 2 (review I3): con Actividades de Aplicación en el Manifest, un navegador sin la capacidad → 409 visible.
+      const appInManifest = (await ds.query(`select coalesce(manifest_json->'items', '[]'::jsonb) @> '[{"type":"application_activity"}]'::jsonb a from public.course_generation_manifests where id = $1`, [dto.id]))[0].a;
+      if (appInManifest) {
+        await rejectsRe(sched.claimNextItem({ executorId: 'b1', types: ['experience', 'video_interactions', 'activity', 'final_exam', 'exam', 'module_intro'], runId: job.id, ownerId: OWNER }),
+          /Actividades de Aplicación/, 'navegador sin application-activity-1', 409);
+      }
+      const FEAT = ['pedagogy-brief-1', 'application-activity-1'];
+      const act = await sched.claimNextItem({ executorId: 'b1', types: ['experience', 'video_interactions', 'activity', 'final_exam', 'exam', 'module_intro'], runId: job.id, ownerId: OWNER, executorFeatures: FEAT });
       assert(act, 'el navegador v3 no reclamó nada');
       const claimedAct = act.type === 'activity' ? act : null;
       // Reclamar hasta dar con el activity (el orden es el del Manifest).
       let activity = claimedAct;
       for (let i = 0; i < 20 && !activity; i++) {
-        const next = await sched.claimNextItem({ executorId: 'b1', types: ['activity'], runId: job.id, ownerId: OWNER });
+        const next = await sched.claimNextItem({ executorId: 'b1', types: ['activity'], runId: job.id, ownerId: OWNER, executorFeatures: FEAT });
         if (next && next.type === 'activity') activity = next;
         else break;
       }
