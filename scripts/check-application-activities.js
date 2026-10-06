@@ -393,6 +393,20 @@ function rcpWithApplications() {
     noApp.applicationMinutes = 60;
     const miss = (await VAL.validateMbzV3(r.mbz, exp2)).issues.map((i) => i.code);
     assert(miss.includes('APPLICATION'), `actividad faltante: ${miss}`);
+    // LOOP 7 (A4 I1/I3): barreras del solucionario — override del estudiante, rol referenciado, visibleold y enlaces.
+    const ok0 = (await VAL.validateMbzV3(r.mbz, r.expectations)).issues;
+    eq(ok0, [], 'el paquete de siempre es válido (con override del estudiante)');
+    const rx = await (await JSZip.loadAsync(r.mbz)).file(`${solDir}/roles.xml`).async('string');
+    assert(/<roleid>5<\/roleid>\s*<capability>mod\/page:view<\/capability>\s*<permission>-1000<\/permission>/.test(rx), `override en el solucionario: ${rx}`);
+    const noOverride = await tamper(async (z) => { z.file(`${solDir}/roles.xml`, rx.replace('<permission>-1000</permission>', '<permission>1</permission>')); });
+    assert(noOverride.includes('APPLICATION'), `sin prohibición al estudiante: ${noOverride}`);
+    const noRoleref = await tamper(async (z) => { z.file(`${solDir}/inforef.xml`, (await z.file(`${solDir}/inforef.xml`).async('string')).replace(/<roleref>[\s\S]*<\/roleref>\n/, '')); });
+    assert(noRoleref.includes('APPLICATION'), `sin roleref: ${noRoleref}`);
+    const visOld = await tamper(async (z) => { z.file(`${solDir}/module.xml`, (await z.file(`${solDir}/module.xml`).async('string')).replace('<visibleold>0</visibleold>', '<visibleold>1</visibleold>')); });
+    assert(visOld.includes('APPLICATION'), `visibleold: ${visOld}`);
+    const solMid = Number(/_(\d+)$/.exec(solDir)[1]);
+    const link = await tamper(async (z) => { z.file(`${stDir}/page.xml`, (await z.file(`${stDir}/page.xml`).async('string')).replace('Ejercicio 1', () => `&lt;a href=&quot;$@PAGEVIEWBYID*${solMid}@$&quot;&gt;ver&lt;/a&gt; Ejercicio 1`)); });
+    assert(link.includes('APPLICATION'), `enlace al solucionario desde la página del estudiante: ${link}`);
   });
 
   await check('AA13 secuencia de cada sección = Manifest + chapterSlotSequence (instrucción → actividad → solucionario)', async () => {

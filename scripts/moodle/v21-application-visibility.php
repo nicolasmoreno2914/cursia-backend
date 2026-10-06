@@ -59,4 +59,26 @@ foreach ($asStudent->get_cms() as $cm) {
         'completionview' => (int)$cm->completionview,
     ];
 }
+// LOOP 7 (A4 I1/I2): un docente MUESTRA el solucionario por error (clic en «Mostrar»): el estudiante sigue sin poder
+// verlo ni abrir su PDF (override mod/page:view = PROHIBIT del rol estudiante en la actividad); el docente sí.
+require_once($CFG->dirroot . '/course/lib.php');
+$out['shownByMistake'] = [];
+foreach (get_fast_modinfo($course)->get_cms() as $cm) {
+    if ($cm->modname !== 'page' || !preg_match('/^cv3:ch:[^:]+:application_solution$/', (string)$cm->idnumber)) continue;
+    set_coursemodule_visible($cm->id, 1);
+    $ctx = context_module::instance($cm->id);
+    $s = get_fast_modinfo($course, $student)->get_cm($cm->id);
+    $t = get_fast_modinfo($course, $teacher)->get_cm($cm->id);
+    $studentRole = $DB->get_field('role', 'id', ['shortname' => 'student'], MUST_EXIST);
+    $out['shownByMistake'][] = [
+        'idnumber' => (string)$cm->idnumber,
+        'visible' => (int)$DB->get_field('course_modules', 'visible', ['id' => $cm->id]),
+        'studentOverride' => (int)$DB->get_field('role_capabilities', 'permission', ['contextid' => $ctx->id, 'roleid' => $studentRole, 'capability' => 'mod/page:view']),
+        'studentHasView' => has_capability('mod/page:view', $ctx, $student),
+        // pluginfile de mod_page: require_course_login + require_capability('mod/page:view') → lo mismo que esto.
+        'studentCanOpen' => (bool)$s->uservisible && has_capability('mod/page:view', $ctx, $student),
+        'teacherCanOpen' => (bool)$t->uservisible && has_capability('mod/page:view', $ctx, $teacher),
+    ];
+    set_coursemodule_visible($cm->id, 0);
+}
 file_put_contents($argv[2], json_encode($out, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));

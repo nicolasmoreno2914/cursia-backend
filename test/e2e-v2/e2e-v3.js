@@ -65,6 +65,8 @@ const V3OUT = path.join(OUT, 'v3');
 fs.mkdirSync(V3OUT, { recursive: true });
 const NET_LOG = path.join(V3OUT, 'net-violations.log');
 const MOODLE_SCRATCH = process.env.MOODLE_SCRATCH;
+// LOOP 7: restores de Moodle con la sesión del admin (como un restore web): los overrides del paquete se aplican.
+process.env.CURSIA_RESTORE_PHP = process.env.CURSIA_RESTORE_PHP || path.join(REPO, 'scripts/moodle/restore-as-admin.php');
 // V2.1 F2: `E2E_V3_ONLY=real-providers` corre SOLO arranque + workers + E4 (Gamma/TTS/LLM reales contra
 // fakes locales), sin E1–E3 ni restores de Moodle (para correrlo aparte cuando el Moodle local está ocupado).
 const ONLY_REAL_PROVIDERS = process.env.E2E_V3_ONLY === 'real-providers';
