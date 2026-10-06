@@ -1,7 +1,7 @@
 import { ConflictException, Injectable, NotFoundException, NotImplementedException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { GenerationManifestsService } from '../generation-manifests/generation-manifests.service';
-import type { ManifestItemType } from '../generation-manifests/generation-manifest-builder';
+import type { GenerationManifestV1, ManifestItemType } from '../generation-manifests/generation-manifest-builder';
 import { requiredArtifactTypesForPresent } from '../dynamic-packaging/artifact-resolver';
 import { assertDynamicOwnerAllowed, isRealVideoAllowedForOwner, isVideoPreviewAllowed, toHttpConfigError } from '../features/dynamic-features';
 import { ACTIVE_RUN_WORKER_STATUSES } from '../dynamic-generation/item-transitions';
@@ -9,6 +9,7 @@ import { canonicalContextHash } from '../dynamic-generation/run-hash';
 import { computePlanFromDb, planApplyWrites } from './invalidation-apply';
 import { isProviderWorkerDeployed } from '../dynamic-generation/provider-modes';
 import type { InvalidationPlan } from './plan';
+import { PlanCostEstimate, planCostEstimate } from './change-impact';
 import { INVALIDATION_V3_NOT_IMPLEMENTED, assertInvalidationRulesSupported } from './plan';
 
 export interface InvalidationPlanResponse {
@@ -38,6 +39,8 @@ export interface InvalidationPlanResponse {
    */
   blockers: string[];
   plan: InvalidationPlan;
+  /** LOOP 7 (A1 I1): costo estimado de aplicar el plan (simulado, USD 0 al calcularlo). */
+  costEstimate: PlanCostEstimate;
 }
 
 /**
@@ -108,6 +111,7 @@ export class InvalidationService {
           .map((a) => a.itemKey),
         blockers: [],
         plan,
+        costEstimate: planCostEstimate(plan, manifestB.manifest as GenerationManifestV1),
       };
     }
 
@@ -191,6 +195,7 @@ export class InvalidationService {
       providerItemsToGenerate: writes.providerItemsToGenerate,
       blockers,
       plan,
+      costEstimate: planCostEstimate(plan, manifestB.manifest as GenerationManifestV1),
     };
   }
 }

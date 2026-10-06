@@ -228,6 +228,21 @@ const impactOf = (from, to) => {
     near(Number(imp.estimatedChangeCostUsd), usd(withExams), 0.01, 'costo de los cambios con exámenes a escala real');
   });
 
+  await check('CI10 LOOP 7 (A1 I1): «Generar solo lo que cambió» muestra el mismo costo que la vista previa del impacto', () => {
+    for (const approach of ['competencias', 'significativo']) {
+      const to = sideOf(designed(modules, chapters.map((c, i) => (i === 2 ? { ...c, title: 'Otro título' } : c)), approach, 64));
+      const plan = PLAN.computeInvalidationPlan({
+        from: { blueprint: from.blueprint, manifest: from.manifest, items: fromItemsOf(from.manifest), courseContextSha256: 'ctx' },
+        to: { blueprint: to.blueprint, manifest: to.manifest, courseContextSha256: 'ctx' },
+      });
+      const imp = CI.summarizeChangeImpact({ plan, to, from });
+      const pc = CI.planCostEstimate(plan, to.manifest);
+      eq(pc.estimatedChangeCostUsd, imp.estimatedChangeCostUsd, `${approach}: mismo costo en el modal y en el impacto`);
+      eq(pc.llmItems + pc.paidItems, imp.toRun.length + imp.paidNew.length + imp.paidRetry.length, `${approach}: mismos items`);
+      assert(Number(pc.range.min) <= Number(pc.estimatedChangeCostUsd) && Number(pc.estimatedChangeCostUsd) <= Number(pc.range.max) && /Estimación/.test(pc.note), `${approach}: rango y supuestos`);
+    }
+  });
+
   // --export <dir>: respuestas REALES de la vista previa para el harness del frontend (test-53).
   const exp = process.argv.indexOf('--export');
   if (exp > 0) {
