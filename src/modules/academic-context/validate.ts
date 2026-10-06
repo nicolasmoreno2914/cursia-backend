@@ -36,6 +36,7 @@ export interface AcademicValidation {
 /** Umbral de casi-duplicado (token-Jaccard sobre el texto normalizado del Coherence Engine). */
 export const DUPLICATE_JACCARD_MIN = 0.8;
 const HOURS_TOLERANCE = 0.5;
+export const ISSUES_PER_CODE_MAX = 20;
 
 const fmt = (n: number) => String(Math.round(n * 100) / 100).replace('.', ',');
 const known = <T>(f: Field<T>) => f.status !== 'missing' && f.value !== null;
@@ -116,7 +117,9 @@ export function validateAcademicContext(ctx: AcademicContextV1): AcademicValidat
   // ── Advertencias: duplicados y contradicciones ──
   dupes(ctx.outcomes.map((o) => ({ id: o.id, text: o.text })), 'outcomes', 'DUPLICATE_OUTCOME', 'resultados', add);
   dupes(ctx.competencies.map((o) => ({ id: o.id, text: o.text })), 'competencies', 'DUPLICATE_COMPETENCY', 'competencias', add);
-  dupes(contents.map((c) => ({ id: c.id, text: c.text })), 'units', 'DUPLICATE_CONTENT', 'contenidos', add);
+  // Contenidos: solo dentro de cada unidad (un tema repetido entre unidades suele ser intencional y el par completo es
+  // cuadrático: hasta 800 contenidos).
+  ctx.units.forEach((u, i) => dupes(u.contents.map((c) => ({ id: c.id, text: c.text })), `units[${i}]`, 'DUPLICATE_CONTENT', 'contenidos', add));
   for (const k of ctx.conflicts) {
     add('warning', 'CONTRADICTION', k.path, `El documento da valores distintos para ${PATH_LABEL[k.path] ?? k.path}: ${k.values.map((v) => `«${short(v.value)}»${v.source.page ? ` (p. ${v.source.page})` : ''}`).join(' y ')}. Se usó el primero; revísalo.`);
   }
@@ -139,9 +142,23 @@ export function validateAcademicContext(ctx: AcademicContextV1): AcademicValidat
   miss(!known(ctx.identity.educationLevel), 'MISSING_LEVEL', 'identity.educationLevel', 'el nivel educativo');
   miss(!known(ctx.methodology), 'MISSING_METHODOLOGY', 'methodology', 'la metodología');
 
+  // Tope por código: 20 issues + una línea «y N más» (un contexto enorme no produce miles de avisos).
+  const byCode = new Map<string, number>();
+  const capped: AcademicIssue[] = [];
+  for (const it of issues) {
+    const k = `${it.severity}:${it.code}`;
+    const seen = (byCode.get(k) ?? 0) + 1;
+    byCode.set(k, seen);
+    if (seen <= ISSUES_PER_CODE_MAX) capped.push(it);
+  }
+  for (const [k, total] of byCode) {
+    if (total <= ISSUES_PER_CODE_MAX) continue;
+    const [severity, code] = k.split(':') as [AcademicIssueSeverity, string];
+    capped.push({ severity, code, path: '', message: `… y ${total - ISSUES_PER_CODE_MAX} aviso(s) más del mismo tipo.` });
+  }
   const counts = { error: 0, warning: 0, missing: 0 };
   for (const i of issues) counts[i.severity]++;
-  return { validationVersion: ACADEMIC_VALIDATION_VERSION, canProceed: counts.error === 0, counts, issues };
+  return { validationVersion: ACADEMIC_VALIDATION_VERSION, canProceed: counts.error === 0, counts, issues: capped };
 }
 
 const PATH_LABEL: Record<string, string> = {

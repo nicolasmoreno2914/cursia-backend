@@ -195,7 +195,7 @@ export class CourseProfilesService {
     kind: string,
     data: unknown,
     expectedVersion?: number,
-  ): Promise<{ created: boolean; profile: CourseProfileDto }> {
+  ): Promise<{ created: boolean; profile: CourseProfileDto; prunedOutcomeLinks?: { chapterId: string; removed: string[] }[] }> {
     assertDynamicOwnerAllowed(ownerId); // allow-list V2 en toda escritura
     this.assertKind(kind);
     await this.loadCourse(courseId, ownerId);
@@ -246,8 +246,12 @@ export class CourseProfilesService {
          returning *`,
         [courseId, kind, currentVersion + 1, JSON.stringify(stored), sha, ownerId],
       );
+      // Fase 3 (review I1): una versión nueva del contexto que ya no define un resultado vinculado deja ese vínculo
+      // roto (y el lock fallaría). En la MISMA transacción se quitan de los capítulos los ids que la versión nueva no
+      // define; si cambió alguno, sube el counter de la estructura (las pestañas abiertas releen).
+      const pruned = kind === 'academic' ? await this.pruneStaleOutcomeLinks(qr, courseId, profile as AcademicContextV1) : [];
       await qr.commitTransaction();
-      return { created: true, profile: this.toDto(row, finalExam) };
+      return { created: true, profile: this.toDto(row, finalExam), ...(pruned.length ? { prunedOutcomeLinks: pruned } : {}) };
     } catch (err) {
       if (qr.isTransactionActive) await qr.rollbackTransaction();
       if (isVersionConflict(err)) {
@@ -263,6 +267,26 @@ export class CourseProfilesService {
     } finally {
       await qr.release();
     }
+  }
+
+  /** Fase 3 (I1): quita de course_chapters.outcome_ids los ids que el contexto `ctx` no define. */
+  private async pruneStaleOutcomeLinks(qr: QueryRunner, courseId: number, ctx: AcademicContextV1): Promise<{ chapterId: string; removed: string[] }[]> {
+    const rows: { id: string; ids: unknown }[] = await qr.query(
+      `select id, to_jsonb(ch) -> 'outcome_ids' as ids from public.course_chapters ch
+        where ch.course_id = $1 and jsonb_typeof(to_jsonb(ch) -> 'outcome_ids') = 'array'`,
+      [courseId],
+    );
+    const known = new Set([...ctx.outcomes.map((o) => o.id), ...ctx.competencies.map((c) => c.id)]);
+    const out: { chapterId: string; removed: string[] }[] = [];
+    for (const r of rows) {
+      const ids = Array.isArray(r.ids) ? (r.ids as string[]) : [];
+      const keep = ids.filter((x) => known.has(x));
+      if (keep.length === ids.length) continue;
+      await qr.query(`update public.course_chapters set outcome_ids = $1::jsonb, updated_at = now() where id = $2 and course_id = $3`, [keep.length ? JSON.stringify(keep) : null, r.id, courseId]);
+      out.push({ chapterId: r.id, removed: ids.filter((x) => !known.has(x)) });
+    }
+    if (out.length) await qr.query(`update public.courses set structure_version_counter = structure_version_counter + 1 where id = $1`, [courseId]);
+    return out;
   }
 
   /**

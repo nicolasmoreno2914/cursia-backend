@@ -238,8 +238,9 @@ export function proposeStructureFromContext(ctx: AcademicContextV1): ContextStru
         // La unidad vincula resultados: cada capítulo toma los que mejor le encajan (o todos, si ninguno destaca).
         const candidates = outcomes.filter((o) => unitLinks.includes(o.id));
         const lex = lexicalOutcomeMatches(g.map((c) => c.text).join(' '), candidates);
-        outcomeIds = lex.length ? lex : [...unitLinks];
-        linkStatus = 'found';
+        // Todos los de la unidad = lo que dice el documento (found); un subconjunto elegido por términos = inferred.
+        outcomeIds = lex.length && lex.length < unitLinks.length ? lex : [...unitLinks];
+        linkStatus = outcomeIds.length < unitLinks.length ? 'inferred' : 'found';
       }
       if (!outcomeIds.length && raOnly.length) {
         outcomeIds = lexicalOutcomeMatches(g.map((c) => c.text).join(' '), raOnly);

@@ -71,6 +71,9 @@ export class AcademicContextService {
       reason: null,
       contextVersion: academic.version,
       contextSha256: academic.sha256,
+      // Review I2: versión del perfil pedagógico sobre la que se calculó la sugerencia (expectedVersion al aplicarla:
+      // si el docente guardó otra versión mientras tanto, 409 y se recalcula — nunca se pisan sus cambios).
+      pedagogyVersion: ped ? ped.version : 0,
       validation,
       profileSuggestion: suggestProfileFromContext(academic.context, ped ? ped.profile : null),
       structureProposal: proposeStructureFromContext(academic.context),

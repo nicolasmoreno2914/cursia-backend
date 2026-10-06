@@ -163,8 +163,15 @@ const PCT_RE = /(\d{1,3}(?:[.,]\d{1,2})?)\s*%/;
 const num = (s: string) => Number(s.replace(',', '.'));
 const OUTCOME_CODE_RE = /^\s*\(?(RAA|RAP|RA|R)\s*[-.]?\s*([0-9]{1,3})\s*\)?\s*[.:)\-–]?\s+/i;
 const COMPETENCY_CODE_RE = /^\s*\(?(CE|CG|CO|C)\s*[-.]?\s*([0-9]{1,3})\s*\)?\s*[.:)\-–]?\s+/i;
-const OUTCOME_REF_G = /\b(RAA|RAP|RA)\s*-?\s*([0-9]{1,3})\b/gi;
-const COMPETENCY_REF_G = /\b(CE|CG|CO)\s*-?\s*([0-9]{1,3})\b/gi;
+// Vínculos: «RA1» (mayúsculas) en cualquier parte; las competencias («CE2», «CO1») SOLO dentro de un grupo de códigos
+// —entre paréntesis, al final tras un guion o en una celda que solo trae códigos—, para no confundir «CO2» de
+// «emisiones de CO2» con una competencia.
+const OUTCOME_REF_G = /\b(RAA|RAP|RA)\s*-?\s*([0-9]{1,3})\b/g;
+const CODE_G = /\b(RAA|RAP|RA|CE|CG|CO)\s*-?\s*([0-9]{1,3})\b/g;
+const CODE_LIST = '(?:(?:RAA|RAP|RA|CE|CG|CO)\\s*-?\\s*[0-9]{1,3}[\\s,;y]*)+';
+const GROUP_PAREN_G = new RegExp(`\\((\\s*${CODE_LIST})\\)`, 'g');
+const GROUP_TAIL_RE = new RegExp(`[-–—:|]\\s*(${CODE_LIST})$`);
+const GROUP_ALL_RE = new RegExp(`^\\s*${CODE_LIST}$`);
 
 // ── Estado por documento ──────────────────────────────────────────────────────────────────────────────────
 
@@ -499,6 +506,10 @@ class DocExtraction {
         const r = refsOf(c.text);
         return { id: `${id}.${j + 1}`, text: clip(r.rest || c.text, ACADEMIC_LIMITS.text).text, outcomeIds: r.ids.slice(0, ACADEMIC_LIMITS.outcomeIdsPerItem), status: 'found', sources: [this.src(c.lines[0], section)] };
       });
+      if (u.hours !== null && !(u.hours > 0 && u.hours <= 5000)) {
+        this.note('VALUE_OUT_OF_RANGE', `La unidad «${clip(u.title, 60).text}» declara ${fmtH(u.hours)} h, fuera del rango admitido; no se usó.`);
+        u.hours = null;
+      }
       const unit: ThematicUnit = (u as any).inferred
         ? { id, title: clip(u.title, ACADEMIC_LIMITS.title).text, hours: null, outcomeIds: [], contents, status: 'inferred', sources: [this.src(u.line, section)], basis: 'el documento lista los contenidos sin agruparlos en unidades: se usan como una sola unidad con el título de la sección' }
         : { id, title: clip(u.title, ACADEMIC_LIMITS.title).text, hours: u.hours, outcomeIds: [...new Set(u.refs)].slice(0, ACADEMIC_LIMITS.outcomeIdsPerItem), contents, status: 'found', sources: [this.src(u.line, section)] };
@@ -534,6 +545,12 @@ class DocExtraction {
       if (!m) continue;
       const value = num(m[1]);
       if (!Number.isFinite(value)) continue;
+      // Fuera del rango del modelo: el dato queda «missing» con una nota (nunca rechaza el documento entero).
+      const max = kind === 'credits' ? 60 : kind === 'weeks' ? 104 : 5000;
+      if (value <= 0 || value > max) {
+        this.note('VALUE_OUT_OF_RANGE', `«${clip(e.line.text, 80).text}»: ${fmtH(value)} está fuera del rango admitido (hasta ${max}); no se usó.`);
+        continue;
+      }
       const src = this.src(e.line, section);
       const show = (x: number) => String(x);
       if (kind === 'total') this.ctx.hours.total = this.setFound('hours.total', this.ctx.hours.total, value, src, show);
@@ -559,7 +576,11 @@ class DocExtraction {
   private parseEvaluation(s: Section): void {
     for (const it of this.items(s)) {
       if (this.ctx.evaluation.length >= ACADEMIC_LIMITS.evaluation) break;
-      const pm = PCT_RE.exec(it.text);
+      let pm = PCT_RE.exec(it.text);
+      if (pm && !(num(pm[1]) >= 0 && num(pm[1]) <= 100)) {
+        this.note('VALUE_OUT_OF_RANGE', `«${clip(it.text, 80).text}»: un peso de ${pm[1]} % no es válido; la actividad quedó sin peso.`);
+        pm = null;
+      }
       const r = refsOf(it.text.replace(PCT_RE, ''));
       const instrument = collapse(r.rest.replace(/[—–\-|:;,()]+\s*$/g, '').replace(/^\s*[—–\-|:;,]+/, '').replace(/\(\s*\)/g, ''));
       if (!instrument) continue;
@@ -643,15 +664,17 @@ function assignIds(codes: (number | null)[], prefix: 'RA' | 'CO', max: number): 
 /** Vínculos «RA1», «RA 2», «CE3» dentro de un texto → ids normalizados + el texto sin la lista de vínculos. */
 export function refsOf(text: string): { ids: string[]; rest: string } {
   const ids: string[] = [];
+  const groups: string[] = [];
+  for (const m of text.matchAll(GROUP_PAREN_G)) groups.push(m[1]);
+  const tail = GROUP_TAIL_RE.exec(text);
+  if (tail) groups.push(tail[1]);
+  if (GROUP_ALL_RE.test(text)) groups.push(text);
+  for (const g of groups) {
+    for (const m of g.matchAll(CODE_G)) ids.push(/^R/.test(m[1]) ? `RA${Number(m[2])}` : `CO${Number(m[2])}`);
+  }
   for (const m of text.matchAll(OUTCOME_REF_G)) ids.push(`RA${Number(m[2])}`);
-  for (const m of text.matchAll(COMPETENCY_REF_G)) ids.push(`CO${Number(m[2])}`);
-  const rest = collapse(
-    text
-      .replace(/\(\s*(?:(?:RAA|RAP|RA|CE|CG|CO)\s*-?\s*[0-9]{1,3}[\s,;y]*)+\)/gi, '')
-      .replace(/[-–—:|]\s*(?:(?:RAA|RAP|RA|CE|CG|CO)\s*-?\s*[0-9]{1,3}[\s,;y]*)+$/gi, '')
-      .replace(/^\s*(?:(?:RAA|RAP|RA|CE|CG|CO)\s*-?\s*[0-9]{1,3}[\s,;y]*)+$/gi, ''),
-  );
-  return { ids: [...new Set(ids)], rest };
+  const rest = collapse(text.replace(GROUP_PAREN_G, '').replace(GROUP_TAIL_RE, '').replace(GROUP_ALL_RE, ''));
+  return { ids: [...new Set(ids)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)), rest };
 }
 
 function takeHours(text: string): { text: string; hours: number | null } {
@@ -669,7 +692,8 @@ function splitContentCell(t: string): string[] {
 function hoursKindOf(key: SectionKey, label: string, text: string): 'total' | 'weekly' | 'weeks' | 'credits' | HoursComponentKind | null {
   if (key === 'hoursTotal') return 'total';
   if (key === 'hoursWeekly') return 'weekly';
-  if (key === 'weeks') return /hora/i.test(text) ? 'total' : 'weeks';
+  // «16 semanas de 4 horas» son semanas (no un total de 4 h); «Duración: 64 horas» sí es el total.
+  if (key === 'weeks') return /hora/i.test(text) && !/\d\s*semanas?/i.test(text) ? 'total' : 'weeks';
   if (key === 'credits') return 'credits';
   if (key === 'hoursContact') return 'contact';
   if (key === 'hoursPractice') return 'practice';
@@ -734,6 +758,7 @@ export async function extractAcademicContext(inputs: ExtractionInput[]): Promise
       extractor: { id: EXTRACTOR_ID, version: EXTRACTOR_VERSION },
     };
     const ex = new DocExtraction(docId);
+    for (const n of read.notes ?? []) ex.note(n.code, `«${doc.name}»: ${n.message}`);
     if (!read.lines.length) {
       ex.note('DOCUMENT_WITHOUT_TEXT', `«${doc.name}» no tiene texto extraíble (¿PDF escaneado?). Cursia no hace OCR: sube un PDF con texto o un DOCX.`);
     } else {
@@ -769,7 +794,7 @@ export function mergeExtractions(ctxs: AcademicContextV1[], documents: AcademicD
       }
       if (normKey(show(cur.value as T)) !== normKey(show(f.value as T)) && cur.sources[0] && f.sources[0]) {
         const k = out.conflicts.find((x) => x.path === path);
-        const vals = [{ value: show(cur.value as T), source: cur.sources[0] }, { value: show(f.value as T), source: f.sources[0] }];
+        const vals = [{ value: show(cur.value as T).slice(0, ACADEMIC_LIMITS.title), source: cur.sources[0] }, { value: show(f.value as T).slice(0, ACADEMIC_LIMITS.title), source: f.sources[0] }];
         if (k) {
           if (!k.values.some((v) => normKey(v.value) === normKey(vals[1].value)) && k.values.length < ACADEMIC_LIMITS.sourcesPerItem) k.values.push(vals[1]);
         } else if (out.conflicts.length < ACADEMIC_LIMITS.conflicts) out.conflicts.push({ path, values: vals });
@@ -797,31 +822,39 @@ export function mergeExtractions(ctxs: AcademicContextV1[], documents: AcademicD
   for (const c of ctxs) {
     for (const k of c.conflicts) if (out.conflicts.length < ACADEMIC_LIMITS.conflicts && !out.conflicts.some((x) => x.path === k.path)) out.conflicts.push(k);
   }
-  // Listas: el primer documento que trae una lista la define (ids del documento); los siguientes solo agregan
-  // elementos nuevos, renumerados después de los existentes.
-  const seenText = (list: { text: string }[], t: string) => list.some((x) => normKey(x.text) === normKey(t));
+  // Listas: el primer documento que trae una lista la define (ids del documento); los siguientes solo agregan elementos
+  // nuevos, renumerados después de los existentes. Cada documento lleva su MAPA de ids (su RA1 → el id fusionado, o el
+  // id del resultado con el mismo texto) y sus vínculos de unidades / contenidos / evaluación se reescriben con él.
+  const seenText = <T extends { text: string }>(list: T[], t: string): T | undefined => list.find((x) => normKey(x.text) === normKey(t));
   for (const c of ctxs) {
+    const idMap = new Map<string, string>();
     for (const o of c.outcomes) {
-      if (out.outcomes.length >= ACADEMIC_LIMITS.outcomes || seenText(out.outcomes, o.text)) continue;
-      out.outcomes.push(out.outcomes.some((x) => x.id === o.id) ? { ...o, id: nextId(out.outcomes.map((x) => x.id), 'RA') } : o);
+      const same = seenText(out.outcomes, o.text);
+      if (same) { idMap.set(o.id, same.id); continue; }
+      if (out.outcomes.length >= ACADEMIC_LIMITS.outcomes) continue;
+      const id = out.outcomes.some((x) => x.id === o.id) ? nextId(out.outcomes.map((x) => x.id), 'RA') : o.id;
+      idMap.set(o.id, id);
+      out.outcomes.push({ ...o, id });
     }
     for (const o of c.competencies) {
-      if (out.competencies.length >= ACADEMIC_LIMITS.competencies || seenText(out.competencies, o.text)) continue;
-      out.competencies.push(out.competencies.some((x) => x.id === o.id) ? { ...o, id: nextId(out.competencies.map((x) => x.id), 'CO') } : o);
+      const same = seenText(out.competencies, o.text);
+      if (same) { idMap.set(o.id, same.id); continue; }
+      if (out.competencies.length >= ACADEMIC_LIMITS.competencies) continue;
+      const id = out.competencies.some((x) => x.id === o.id) ? nextId(out.competencies.map((x) => x.id), 'CO') : o.id;
+      idMap.set(o.id, id);
+      out.competencies.push({ ...o, id });
     }
-    if (!out.units.length && c.units.length) out.units = c.units.slice(0, ACADEMIC_LIMITS.units);
+    const remap = (ids: string[]) => [...new Set(ids.map((x) => idMap.get(x)).filter((x): x is string => !!x))];
+    if (!out.units.length && c.units.length) {
+      out.units = c.units.slice(0, ACADEMIC_LIMITS.units).map((u) => ({ ...u, outcomeIds: remap(u.outcomeIds), contents: u.contents.map((x) => ({ ...x, outcomeIds: remap(x.outcomeIds) })) }));
+    }
     if (!out.hours.components.length && c.hours.components.length) out.hours.components = c.hours.components;
-    if (!out.evaluation.length && c.evaluation.length) out.evaluation = c.evaluation;
+    if (!out.evaluation.length && c.evaluation.length) out.evaluation = c.evaluation.map((e) => ({ ...e, outcomeIds: remap(e.outcomeIds) }));
     for (const b of c.bibliography) {
       if (out.bibliography.length >= ACADEMIC_LIMITS.bibliography || seenText(out.bibliography, b.text)) continue;
       out.bibliography.push({ ...b, id: `B${out.bibliography.length + 1}` });
     }
   }
-  // Vínculos a resultados que el documento no define: se quitan (y la validación lo reporta desde las notas).
-  const known = new Set([...out.outcomes.map((o) => o.id), ...out.competencies.map((o) => o.id)]);
-  const keep = (ids: string[]) => ids.filter((x) => known.has(x));
-  out.units = out.units.map((u) => ({ ...u, outcomeIds: keep(u.outcomeIds), contents: u.contents.map((c) => ({ ...c, outcomeIds: keep(c.outcomeIds) })) }));
-  out.evaluation = out.evaluation.map((e) => ({ ...e, outcomeIds: keep(e.outcomeIds) }));
   return out;
 }
 
