@@ -272,6 +272,9 @@ async function createCourse(C, llm) {
       const cs = ms.chapters[i];
       // EV6 H5P v2: `cs.objective` explícito (p. ej. «Decidir…» → Branching Scenario con rules 2).
       const body = { title: cs.title, objective: cs.objective || `Aplicar ${cs.title.toLowerCase()}`, videoEnabled: cs.v, activityEnabled: cs.a, expectedCounter: counter };
+      // Fase 2: capítulo de práctica y Actividad de Aplicación (minutos) cuando el escenario los pide.
+      if (cs.kind) body.kind = cs.kind;
+      if (cs.app) body.applicationMinutes = cs.app;
       const isAuto = i === 0 && auto.length === 1;
       const r = isAuto
         ? await api('PATCH', `/courses/${courseId}/modules/${mid}/chapters/${auto[0].id}`, body)
@@ -297,7 +300,8 @@ async function createCourse(C, llm) {
     }
   }
   st = await readStructure(courseId);
-  const mods = st.modules.map((m) => ({ id: m.id, title: m.title, exam: m.examEnabled, chapters: m.chapters.map((x) => ({ id: x.id, title: x.title, v: !!x.videoEnabled, a: x.activityEnabled !== false })) }));
+  const mods = st.modules.map((m) => ({ id: m.id, title: m.title, exam: m.examEnabled, chapters: m.chapters.map((x) => ({ id: x.id, title: x.title, v: !!x.videoEnabled, a: x.activityEnabled !== false, kind: x.kind || 'content', app: x.applicationMinutes ?? null })) }));
+  eq(mods.map((m) => m.chapters.map((x) => `${x.kind}/${x.app}`)), C.modules.map((m) => m.chapters.map((x) => `${x.kind || 'content'}/${x.app || null}`)), `${C.key}: tipo de capítulo y minutos de Actividad de Aplicación persistidos`);
   eq(mods.map((m) => m.chapters.map((x) => `${x.v ? 'V+' : 'V-'}${x.a ? 'A+' : 'A-'}`)), C.modules.map((m) => m.chapters.map((x) => `${x.v ? 'V+' : 'V-'}${x.a ? 'A+' : 'A-'}`)), `${C.key}: estructura viva con las combinaciones V/A pedidas`);
   // Perfiles (append-only, fuera del Blueprint): evaluación y presentación.
   const A = D('modules/course-profiles/course-profiles.js');
@@ -322,8 +326,10 @@ async function createCourse(C, llm) {
   const want = {
     videos: chapters.filter((x) => x.v).length, activities: chapters.filter((x) => x.a).length, exams: mods.filter((m) => m.exam).length,
   };
+  const contentChapters = chapters.filter((x) => x.kind !== 'practice').length;
   eq([M.totals.videoCount, M.totals.activityCount, M.totals.examCount, M.totals.finalExamCount, M.totals.presentationCount, M.totals.audiobookChapterCount, M.totals.experienceCount],
-    [want.videos, want.activities, want.exams, C.finalExam ? 1 : 0, chapters.length, chapters.length, chapters.length], `${C.key}: totales del Manifest v3 (video/actividad/examen/final/Gamma/audiolibro/experiencia)`);
+    [want.videos, want.activities, want.exams, C.finalExam ? 1 : 0, contentChapters, contentChapters, chapters.length], `${C.key}: totales del Manifest v3 (video/actividad/examen/final/Gamma/audiolibro/experiencia)`);
+  eq(M.totals.applicationActivityCount ?? 0, chapters.filter((x) => x.app).length, `${C.key}: totales del Manifest v3 (Actividades de Aplicación)`);
   ok(M.items.filter((i) => i.type === 'activity').every((i) => i.variant === C.engine), `${C.key}: actividades con variant ${C.engine}`);
   // mapas del LLM falso (títulos → UUID)
   llm.st.courseId = courseId;
@@ -1098,6 +1104,134 @@ function reservationBookkeeping(ev) {
       const libs = (os.h5pPackages || []).map((p) => p.mainLibrary);
       ok(libs.includes('H5P.DragText') || libs.includes('H5P.Blanks'), 'E6: el paquete trae las actividades del tipo elegido por el diseño pedagógico', libs);
       results.courses.E6.packageSummary = { h5pPackages: (os.h5pPackages || []).map((p) => ({ itemKey: p.itemKey, mainLibrary: p.mainLibrary })) };
+    }, { fatal: false });
+
+    // ═══ Fase 2 · Actividades de Aplicación — E7: capítulo de contenido + capítulo de PRÁCTICA con actividad ═══
+    // Estructura → perfil (estudiante + resultados) → lock → Manifest con application_activity → run 100 % mock con el
+    // ejecutor REAL del navegador (dos pasadas: actividad + solucionario; una respuesta inválida → reintento dirigido)
+    // → empaque (página visible + PDF, solucionario OCULTO + PDF) → regenerar UNA actividad (solo ella) → reempaque.
+    if (RUN_E5) await step('v3-E7-aplicacion-generacion', async () => {
+      const AA = D('modules/course-shell/application-activity.js');
+      const pedagogy = {
+        pedagogyProfileVersion: 1, primaryApproach: 'competencias', secondaryApproaches: [],
+        learner: { description: 'Técnicos de mantenimiento con experiencia en planta', ageGroup: 'adults', educationLevel: 'technical', priorKnowledge: 'basic', experience: 'some' },
+        learningOutcomes: { know: ['Rangos de presión del circuito'], do: ['Inspeccionar un circuito hidráulico antes de liberarlo'], competencies: [] },
+        learningModes: ['practice'], experienceTypes: ['teacher_guided'], assessmentMethods: ['quizzes'], principles: [], origin: 'manual',
+      };
+      const C = { key: 'E7', title: '[E2E Aplicación E7] Inspección de circuitos hidráulicos', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: false, engine: 'h5p', pedagogy, modules: [
+        { title: 'Inspección del circuito', objective: 'Inspeccionar el circuito hidráulico antes de liberarlo', exam: true, chapters: [
+          { title: 'Lectura de presión', v: false, a: true, app: 60, objective: 'Medir la presión del circuito en el puerto de prueba' },
+          { title: 'Ajuste de válvulas', v: false, a: true, objective: 'Ajustar la válvula de alivio al valor de placa' },
+          { title: 'Práctica integradora', v: false, a: false, kind: 'practice', app: 30, objective: 'Ejecutar la inspección completa del circuito' },
+        ] }] };
+      const c = await createCourse(C, llm);
+      S.E7 = c;
+      const M = c.manifest.manifest;
+      const [chContent, chPlain, chPractice] = c.mods[0].chapters.map((x) => x.id);
+      const apps = M.items.filter((i) => i.type === 'application_activity');
+      eq(apps.map((i) => [i.key, i.applicationMinutes]), [[`application_activity:${chContent}`, 60], [`application_activity:${chPractice}`, 30]], 'E7: Manifest con una Actividad de Aplicación por capítulo marcado (60 y 30 min)');
+      const ofPractice = M.items.filter((i) => i.chapterId === chPractice).map((i) => i.type).sort();
+      eq(ofPractice, ['application_activity', 'experience'], 'E7: el capítulo de práctica con actividad NO activa video, Gamma, audiolibro ni Libro');
+      eq(apps.find((i) => i.chapterId === chPractice).dependsOn.slice().sort(), [`content:${chContent}`, `content:${chPlain}`].sort(), 'E7: la actividad de la práctica depende de los contenidos del módulo');
+      const bp = (await api('GET', `/courses/${c.courseId}/blueprints/${c.n}`)).data;
+      const snap = bp && (bp.snapshot || (bp.blueprint && bp.blueprint.snapshot));
+      ok(snap && snap.course.applicationContext && snap.course.applicationContext.learningOutcomes.do[0] === pedagogy.learningOutcomes.do[0], 'E7: Blueprint congela applicationContext (estudiante + resultados)', snap && snap.course.applicationContext);
+      const mc = M.chapters ? M.chapters : M.modules.flatMap((m) => m.chapters);
+      ok(mc.find((x) => x.chapterId === chContent).applicationMinutes === 60 && mc.find((x) => x.chapterId === chPlain).applicationMinutes === undefined, 'E7: ManifestChapter.applicationMinutes solo donde hay actividad');
+
+      const ctx = { nombre: C.title, ...CTX, scormTemplateIds: S.templates };
+      const start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, { ...ctx, videoMode: 'mock', providerModes: { presentation: 'mock', audio: 'mock' } });
+      ok(start.status === 201, 'E7: run 100 % mock creado (201) sin aprobación', { s: start.status, e: start.error });
+      if (start.status !== 201) throw new Error(`E7: run no creado: ${start.status} ${start.error}`);
+      c.runId = start.data.run.id;
+      llm.st.tag = 'E7';
+      // Review I3: una pestaña con la versión anterior (aplica el diseño pero no sabe generar Actividades de Aplicación)
+      // recibe el 409 visible «recarga la página» y no reclama nada (nunca deja el run a medias renovando el lease).
+      const old = await api('POST', '/dynamic-generation/claim?features=pedagogy-brief-1', { runId: c.runId, executorId: 'e2e-old-tab-app', types: ['content', 'course_plan', 'course_intro', 'module_intro', 'experience', 'video_interactions', 'activity', 'exam', 'final_exam'], leaseSeconds: 60 });
+      const claimedOld = await q(`select count(*)::int n from public.generation_item_runs where job_id = $1 and worker_id = 'e2e-old-tab-app'`, [c.runId]);
+      ok(old.status === 409 && /rules_version_mismatch/.test(String(old.error)) && /Actividades de Aplicación/.test(String(old.error)) && claimedOld[0].n === 0,
+        'E7: ejecutor sin la capacidad application-activity-1 → 409 visible y ningún item reclamado', { s: old.status, e: old.error, n: claimedOld[0].n });
+      const prompts = [];
+      const respond0 = llm.respond;
+      llm.respond = (b, h) => { prompts.push(b); return respond0(b, h); };
+      let stt;
+      try {
+        const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
+        stt = await waitRunTerminal(ctl, 'E7 run', undefined, c.runId);
+      } finally {
+        llm.respond = respond0;
+      }
+      const items = await waitItemsDone(c.runId);
+      ok(['preview', 'completed'].includes(stt.status) && stt.failed === 0 && !stt.fatalError, 'E7: ejecutor del navegador terminó sin fallidos', stt);
+      ok(items.every((i) => i.status === 'completed'), `E7: los ${items.length} items completed (con Actividades de Aplicación)`, items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, i.error_message && i.error_message.slice(0, 400)]));
+      ok(llm.st.unknown.length === 0, 'E7: LLM falso sin prompts no reconocidos', llm.st.unknown);
+      ok((llm.st.retriesSeen.application_activity || 0) >= 1, 'E7: la actividad inválida (pesos ≠ 100) pidió un reintento dirigido', llm.st.retriesSeen);
+      const textOf = (b) => (b.messages || []).map((m) => (typeof m.content === 'string' ? m.content : (m.content || []).map((x) => x.text || '').join(''))).join('\n');
+      const appPrompts = prompts.map(textOf).filter((t) => t.includes('Diseña la ACTIVIDAD DE APLICACIÓN'));
+      ok(appPrompts.length >= 2 && appPrompts.every((t) => t.includes(pedagogy.learningOutcomes.do[0]) && t.includes(pedagogy.learner.description)), 'E7: el prompt de la actividad trae el estudiante y los resultados de aprendizaje congelados', appPrompts.length);
+      ok(appPrompts.some((t) => t.includes('para 30 minutos') && t.includes('CAPÍTULO DE PRÁCTICA')) && appPrompts.some((t) => t.includes('para 60 minutos') && !t.includes('CAPÍTULO DE PRÁCTICA')), 'E7: minutos y tipo de capítulo de cada actividad llegan a su prompt');
+      const arts = await q(`select g.item_key k, a.type t, a.metadata from public.artifacts a join public.generation_item_runs g on g.id = a.item_run_id
+                            where g.job_id = $1 and a.type = 'dynamic_application_json' order by g.item_key`, [c.runId]);
+      eq(arts.map((a) => a.k).sort(), apps.map((i) => i.key).sort(), 'E7: un artifact dynamic_application_json por actividad');
+      const sums = await q(`select item_key, output_summary from public.generation_item_runs where job_id = $1 and type = 'application_activity'`, [c.runId]);
+      const byKey = new Map(sums.map((r) => [r.item_key, r.output_summary]));
+      eq([byKey.get(`application_activity:${chContent}`).genre, byKey.get(`application_activity:${chPractice}`).genre, byKey.get(`application_activity:${chPractice}`).chapterKind], ['case_analysis', 'procedure', 'practice'], 'E7: las dos actividades no tienen la misma forma (género por capítulo) y la práctica se registra como tal');
+      eq([byKey.get(`application_activity:${chContent}`).minutes, byKey.get(`application_activity:${chPractice}`).minutes], [60, 30], 'E7: summary con los minutos del Manifest');
+      results.courses.E7 = { courseId: c.courseId, blueprintNumber: c.n, runId: c.runId, items: items.length, applications: apps.map((i) => ({ key: i.key, minutes: i.applicationMinutes })), summaries: Object.fromEntries(byKey) };
+      void AA;
+    }, { fatal: false });
+    if (RUN_E5 && S.E7 && S.E7.runId) await step('v3-E7-aplicacion-empaquetado-y-regeneracion', async () => {
+      const c = S.E7;
+      const [chContent, , chPractice] = c.mods[0].chapters.map((x) => x.id);
+      const pagesOf = async (buf) => {
+        const zip = await JSZip.loadAsync(buf);
+        const out = new Map();
+        for (const f of Object.keys(zip.files).filter((n) => /^activities\/page_\d+\/module\.xml$/.test(n))) {
+          const mx = await zip.file(f).async('string');
+          const idn = (/<idnumber>([^<]*)<\/idnumber>/.exec(mx) || [])[1] || '';
+          if (!/:application(_solution)?$/.test(idn)) continue;
+          const px = await zip.file(f.replace('module.xml', 'page.xml')).async('string');
+          out.set(idn, { visible: Number((/<visible>(\d)<\/visible>/.exec(mx) || [])[1]), content: px });
+        }
+        return out;
+      };
+      const P1 = await packageRun('E7', c.courseId, c.n, c.runId);
+      const pg = await pagesOf(P1.buf);
+      for (const ch of [chContent, chPractice]) {
+        const s = pg.get(`cv3:ch:${ch}:application`);
+        const t = pg.get(`cv3:ch:${ch}:application_solution`);
+        ok(s && s.visible === 1 && /\.pdf/.test(s.content) && !s.content.includes('Verificar primero la presión'), `E7: ${ch === chPractice ? 'práctica' : 'contenido'}: página del estudiante visible, con PDF y sin respuestas`, s && { visible: s.visible });
+        ok(t && t.visible === 0 && /\.pdf/.test(t.content) && t.content.includes('Verificar primero la presión'), `E7: ${ch === chPractice ? 'práctica' : 'contenido'}: solucionario docente OCULTO (visible 0) con respuestas y PDF`, t && { visible: t.visible });
+      }
+      ok(![...pg.keys()].some((k) => k.includes(c.mods[0].chapters[1].id)), 'E7: el capítulo sin actividad no tiene páginas de aplicación');
+
+      // Regenerar SOLO la actividad de la práctica: el plan no arrastra nada más.
+      const key = `application_activity:${chPractice}`;
+      const base = `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs/${c.runId}/items/${encodeURIComponent(key)}/regenerate`;
+      const dry = await api('POST', base, { dryRun: true });
+      ok(dry.status === 200 && dry.data.costKind === 'llm' && JSON.stringify(dry.data.affected.map((x) => [x.itemKey, x.action])) === JSON.stringify([[key, 'REGENERATE']]) && dry.data.blockers.length === 0,
+        'E7: dryRun de regenerar una actividad → solo esa actividad (LLM), sin trabas', { s: dry.status, e: dry.error, d: dry.data });
+      const noConfirm = await api('POST', base, {});
+      ok(noConfirm.status === 400 && /confirm_paid_required/.test(String(noConfirm.error)), 'E7: regenerar sin confirmPaid → 400 confirm_paid_required', { s: noConfirm.status, e: noConfirm.error });
+      const before = await q(`select item_key, max(generation)::int g from public.generation_item_runs where job_id = $1 group by item_key`, [c.runId]);
+      const regen = await api('POST', base, { confirmPaid: true });
+      ok(regen.status === 201 && regen.data.created === true, 'E7: regeneración creada (201)', { s: regen.status, e: regen.error });
+      const calls0 = llm.st.v3calls.length;
+      const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
+      const stt = await waitRunTerminal(ctl, 'E7 regeneración', undefined, c.runId);
+      await waitItemsDone(c.runId);
+      ok(stt.failed === 0 && !stt.fatalError, 'E7: el ejecutor completó la regeneración', stt);
+      const after = await q(`select item_key, max(generation)::int g from public.generation_item_runs where job_id = $1 group by item_key`, [c.runId]);
+      const bumped = after.filter((r) => r.g !== (before.find((b) => b.item_key === r.item_key) || {}).g).map((r) => r.item_key);
+      eq(bumped, [key], 'E7: solo la actividad regenerada tiene una generación nueva');
+      const [latest] = await q(`select status from public.generation_item_runs where job_id = $1 and item_key = $2 order by generation desc limit 1`, [c.runId, key]);
+      eq(latest && latest.status, 'completed', 'E7: la generación nueva de la actividad quedó completed');
+      const kinds = llm.st.v3calls.slice(calls0).map((x) => x.kind);
+      ok(kinds.length >= 2 && kinds.every((k) => k === 'application_activity' || k === 'application_solution'), 'E7: la regeneración solo llamó al LLM para la actividad y su solucionario', kinds);
+      const P2 = await packageRun('E7-regen', c.courseId, c.n, c.runId);
+      const pg2 = await pagesOf(P2.buf);
+      ok(pg2.get(`cv3:ch:${chPractice}:application_solution`).visible === 0 && pg2.get(`cv3:ch:${chContent}:application`).visible === 1, 'E7: reempaque tras regenerar: páginas y solucionario oculto intactos');
+      results.courses.E7.regeneration = { key, dryRunAffected: dry.data.affected.map((x) => x.itemKey), llmCalls: kinds };
     }, { fatal: false });
 
     // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══
