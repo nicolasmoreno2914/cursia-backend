@@ -13,12 +13,13 @@
 //   Z4 una fila de A que apunte a la ruta de B (registrada antes del fix) no se firma (403) y su DELETE no borra el
 //      objeto de B
 //   Z5 simétrico: B tampoco accede a lo de A
-//   Z6 administrador (SUPER_ADMIN): mismo comportamiento autorizado que antes — lo suyo sí, lo ajeno no (la API de
-//      artifacts nunca dio acceso entre cuentas a un admin)
+//   Z6 administrador (SUPER_ADMIN): la API de artifacts no tiene (ni tenía) privilegios de admin: un admin es un dueño
+//      más — lo suyo sí, lo ajeno no. El hotfix no cambia eso (comportamiento autorizado conservado).
 //   Z7 rutas inválidas / no autorizadas → 403 storage_path_not_owned; bucket ajeno → 403
 //   Z8 ninguna variante de ruta salta el control (.., %2e, \, //, ./, ?, #, mayúsculas, espacios, control, absoluta…)
 //   Z9 las rutas legítimas de producción siguen funcionando (frontend y workers, con espacios y tildes en el nombre)
 //   Z10 vida de la URL firmada acotada (1 min – 7 días)
+//   Z11 los uploads del backend (workers) validan la ruta ANTES de escribir en Storage
 //
 // Uso: npm run build && node scripts/check-artifacts-authz.js [path/to/dist]
 'use strict';
@@ -175,9 +176,22 @@ const own = (u, file = 'content/content_snapshot_1.json') => `${u.id}/c0ffee00-0
     for (const p of legit) eq((await http(() => ctl.create(dto(p), A))).status, 200, `legítima ${p.slice(37)}`);
     const r = await svc.uploadJsonArtifact({ ownerId: A.id, type: 'gamma_snapshot', filename: 'gamma_snapshot_1234.json', storagePath: `${A.id}/1234/gamma/gamma_snapshot_1234.json`, payload: { ok: true } });
     assert(r && r.ownerId === A.id, 'el worker registra su upload');
-    let err = null;
-    try { await svc.uploadBufferArtifact({ ownerId: A.id, type: 'x', filename: 'x.mbz', storagePath: `${B.id}/1/package/x.mbz`, buffer: Buffer.from('x'), mimeType: 'application/zip' }); } catch (e) { err = e; }
-    assert(err && err.getStatus && err.getStatus() === 403, 'un worker con una ruta ajena también se frena');
+  });
+
+  await check('Z11 los uploads del backend validan la ruta ANTES de escribir en Storage (courseId con .. no planta archivos)', async () => {
+    const { svc, storage } = env();
+    const evil = [`${B.id}/1/package/x.mbz`, `${A.id}/../../otro-bucket/x.json`, `${A.id}/../${B.id}/media/x.mp3`, `${A.id}/%2e%2e/${B.id}/x`];
+    for (const p of evil) {
+      let err = null;
+      try { await svc.uploadBufferArtifact({ ownerId: A.id, type: 'x', filename: 'x', storagePath: p, buffer: Buffer.from('x'), mimeType: 'application/zip' }); } catch (e) { err = e; }
+      assert(err && err.getStatus && err.getStatus() === 403, `buffer ${p}: 403`);
+      err = null;
+      try { await svc.uploadJsonArtifact({ ownerId: A.id, type: 'x', filename: 'x', storagePath: p, payload: {} }); } catch (e) { err = e; }
+      assert(err && err.getStatus && err.getStatus() === 403, `json ${p}: 403`);
+    }
+    eq(storage.length, 0, 'ninguna escritura en Storage');
+    await svc.uploadBufferArtifact({ ownerId: A.id, type: 'x', filename: 'x.mbz', storagePath: `${A.id}/1/package/x.mbz`, buffer: Buffer.from('x'), mimeType: 'application/zip' });
+    eq(storage.map((x) => x.method), ['POST'], 'la ruta propia sí se sube');
   });
 
   await check('Z10 vida de la URL firmada acotada (1 min – 7 días)', async () => {

@@ -112,6 +112,9 @@ export class ArtifactsService {
     if (!supabaseUrl || !serviceKey) {
       throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for server-side artifact upload');
     }
+    // Seguridad: la ruta se valida ANTES de escribir en Storage con la service role (un courseId con `..` no puede
+    // plantar un archivo fuera de la carpeta del dueño ni en otro bucket).
+    if (!storagePathOwnedBy(input.ownerId, bucket, input.storagePath)) throw notOwned();
 
     const body = JSON.stringify(input.payload, null, 2);
     const sizeBytes = Buffer.byteLength(body);
@@ -163,6 +166,9 @@ export class ArtifactsService {
     if (!supabaseUrl || !serviceKey) {
       throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for server-side artifact upload');
     }
+    // Seguridad: la ruta se valida ANTES de escribir en Storage con la service role (un courseId con `..` no puede
+    // plantar un archivo fuera de la carpeta del dueño ni en otro bucket).
+    if (!storagePathOwnedBy(input.ownerId, bucket, input.storagePath)) throw notOwned();
 
     const encodedPath = input.storagePath
       .split('/')
