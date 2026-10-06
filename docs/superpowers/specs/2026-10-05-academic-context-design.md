@@ -64,7 +64,7 @@ interface AcademicContextV1 {
 ## 3. Ingesta (Loop 3.3)
 
 `POST /api/v1/courses/:courseId/academic-context/extract` (JSON `{ files: [{ name, dataBase64 }] }`, 1–5 archivos,
-≤ 7 MB c/u decodificado — el body admite 10 MB —; PDF con texto, DOCX, TXT/MD; el tipo se detecta por la firma del
+≤ 7 MB EN TOTAL decodificado — el body admite 10 MB y el base64 agrega un tercio —; PDF con texto, DOCX, TXT/MD; el tipo se detecta por la firma del
 contenido, no por la extensión). Responde `{ draft, validation, notes, stats }` **sin guardar nada**. 0 proveedores.
 
 1. Texto con localizadores: PDF por página (`pdf-parse`), DOCX por párrafo y fila de tabla (celdas unidas con

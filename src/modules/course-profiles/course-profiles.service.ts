@@ -236,8 +236,11 @@ export class CourseProfilesService {
         );
       }
       if (latest && latest.sha256 === sha) {
-        await qr.rollbackTransaction();
-        return { created: false, profile: this.toDto(latest, finalExam) };
+        // Review N6: re-guardar el mismo contexto también limpia vínculos rotos (p. ej. anteriores a la poda).
+        const prunedSame = kind === 'academic' ? await this.pruneStaleOutcomeLinks(qr, courseId, profile as AcademicContextV1) : [];
+        if (prunedSame.length) await qr.commitTransaction();
+        else await qr.rollbackTransaction();
+        return { created: false, profile: this.toDto(latest, finalExam), ...(prunedSame.length ? { prunedOutcomeLinks: prunedSame } : {}) };
       }
 
       const [row] = await qr.query(
