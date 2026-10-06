@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, Logger } from '@nestjs/common';
+import { ForbiddenException, Injectable, NotFoundException, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
@@ -82,6 +82,34 @@ export function assertSafeStoragePath(storagePath: unknown): string[] {
   return segments;
 }
 
+/** Único bucket de artifacts (LOOP 7 C1: nunca otro bucket desde la API). */
+export const ARTIFACT_BUCKETS: readonly string[] = ['cursia-artifacts'];
+/** Prefijo de los .mbz de QA internos (`qa-internal/<ownerId>/…`, ver dynamic-packaging/qa-package.ts). */
+const QA_PREFIX = 'qa-internal';
+
+/**
+ * LOOP 7 (A4 C1): ¿el objeto `bucket/storagePath` pertenece a `ownerId`? Convención de TODOS los writers
+ * (frontend con RLS `auth.uid()` y workers): primer segmento = dueño; los .mbz de QA, `qa-internal/<dueño>/…`.
+ * `allowMockFixtures`: rutas `mock/…` de fixtures compartidos (solo lectura, nunca borrado).
+ */
+export function storagePathOwnedBy(ownerId: string, bucket: string, storagePath: unknown, opts: { allowMockFixtures?: boolean } = {}): boolean {
+  if (!ownerId || !ARTIFACT_BUCKETS.includes(bucket)) return false;
+  let seg: string[];
+  try {
+    seg = assertSafeStoragePath(storagePath);
+  } catch {
+    return false;
+  }
+  if (seg[0] === ownerId && seg.length > 1) return true;
+  if (seg[0] === QA_PREFIX && seg[1] === ownerId && seg.length > 2) return true;
+  return opts.allowMockFixtures === true && seg[0] === 'mock' && seg.length > 1;
+}
+
+/** Tope de vida de una URL firmada (LOOP 7 A4 M1): 1 min – 7 días. */
+export function clampSignedUrlSeconds(n: number): number {
+  return Number.isFinite(n) ? Math.min(Math.max(Math.floor(n), 60), 7 * 24 * 3600) : 3600;
+}
+
 export function isStorageDuplicateResponse(status: number, body: string): boolean {
   if (status === 409) return true;
   if (status !== 400) return false;
@@ -134,6 +162,12 @@ export class ArtifactsService {
   // ── CREATE ──────────────────────────────────────────────────────────────────
 
   async create(dto: CreateArtifactDto, ownerId: string): Promise<Artifact> {
+    // LOOP 7 (A4 C1): la API solo registra objetos DEL PROPIO usuario en el bucket de artifacts. Antes cualquier ruta
+    // ajena quedaba registrada y después se firmaba / borraba con la service role (lectura y borrado entre cuentas).
+    const bucket = dto.storage_bucket ?? 'cursia-artifacts';
+    if (!storagePathOwnedBy(ownerId, bucket, dto.storage_path)) {
+      throw new ForbiddenException({ code: 'storage_path_not_owned', message: 'storage_path_not_owned: el archivo debe estar en tu carpeta del bucket de artifacts.' });
+    }
     const artifact = this.artifactRepo.create({
       ownerId,
       courseId:        dto.course_id ?? null,
@@ -141,7 +175,7 @@ export class ArtifactsService {
       type:           dto.type,
       storagePath:    dto.storage_path,
       storageProvider: dto.storage_provider ?? 'supabase',
-      storageBucket:  dto.storage_bucket ?? 'cursia-artifacts',
+      storageBucket:  bucket,
       filename:       dto.filename ?? null,
       mimeType:       dto.mime_type ?? 'application/octet-stream',
       sizeBytes:      dto.size_bytes ?? null,
@@ -366,6 +400,13 @@ export class ArtifactsService {
     expiresInSeconds = 3600,
   ): Promise<{ url?: string; storagePath: string; bucket: string; method: string }> {
     const artifact = await this.findOne(id, ownerId);
+    // LOOP 7 (A4 C1): se firma SOLO un objeto de la carpeta del dueño de la fila (también para filas registradas antes
+    // del control en create()). La service role ignora RLS: este es el único control.
+    if (!storagePathOwnedBy(artifact.ownerId, artifact.storageBucket, artifact.storagePath, { allowMockFixtures: true })) {
+      this.logger.warn(`getDownloadUrl(${artifact.id}): ruta fuera de la carpeta del dueño (${artifact.storageBucket}/${artifact.storagePath}); no se firma`);
+      throw new ForbiddenException({ code: 'storage_path_not_owned', message: 'storage_path_not_owned: este archivo no está en la carpeta del dueño; no se puede descargar.' });
+    }
+    expiresInSeconds = clampSignedUrlSeconds(expiresInSeconds);
 
     const supabaseUrl = this.config.get<string>('SUPABASE_URL');
     const serviceKey  = this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY');
@@ -498,6 +539,12 @@ export class ArtifactsService {
       throw err;
     } finally {
       await qr.release();
+    }
+    // LOOP 7 (A4 C1): el objeto se borra SOLO si está en la carpeta del dueño de la fila (nunca una ruta ajena ni un
+    // fixture compartido); la fila sí se borra.
+    if (deleteObject && !storagePathOwnedBy(row.owner_id, row.storage_bucket, row.storage_path)) {
+      this.logger.warn(`remove(${row.id}): ruta fuera de la carpeta del dueño (${row.storage_bucket}/${row.storage_path}); se borra la fila, no el objeto`);
+      deleteObject = false;
     }
     if (deleteObject) await this.deleteStorageObject(row);
   }
