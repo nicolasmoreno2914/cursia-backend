@@ -684,6 +684,10 @@ jobs:
                echo "━━━ [6b2] V2.1: preflight de proveedores + FinOps (solo lectura, informativo) ━━━"
                MIGRATION_ENV=staging PREFLIGHT_GAMMA_THEMES=1 node scripts/preflight-v21-providers.js || true
 
+               echo "━━━ [6b3] LOOP 8.6C: nginx de staging — 40 MB solo en la lectura de documentos ━━━"
+               # Solo el bloque server de api-staging (produccion queda intacta); copia, nginx -t y recarga sin cortes.
+               sudo python3 scripts/staging-nginx-extract-limit.py api-staging.cursia.nomaddi.com 40m
+
                echo "━━━ [6c] Estabilidad PM2 staging (ventana de 45 s) ━━━"
                PM2_BEFORE=$(sudo pm2 jlist | node scripts/pm2-staging-stability.js snapshot)
                sleep 45
