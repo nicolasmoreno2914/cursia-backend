@@ -180,12 +180,26 @@ const BRIEF = { briefVersion: 1, fields: { obj: 'Quiero un curso de Excel básic
       ['Licenciatura en Educación Infantil', 'found', src, 'Educación Infantil'],
       ['Tecnología en Gestión Contable y Financiera', 'inferred', src, null],
       ['Programa de formación complementaria orientado a fortalecer las competencias laborales de los trabajadores del sector', 'found', src, null],
+      // Review L821 M1: placeholders, códigos y títulos sin área no son un sector; títulos SENA y «Programa técnico…» se limpian.
+      ['N/A', 'found', src, null], ['No aplica', 'found', src, null], ['Todos los programas', 'found', src, null],
+      ['Código SNIES 12345', 'found', src, null], ['Facultad de Ciencias Económicas', 'found', src, null], ['Tecnología en', 'found', src, null],
+      ['Técnico Laboral por Competencias en Auxiliar de Enfermería', 'found', src, 'Auxiliar de Enfermería'],
+      ['Programa Técnico Profesional en Logística', 'found', src, 'Logística'],
+      ['Curso de Excel básico', 'found', src, 'Curso de Excel básico'],
+      ['Administración de Empresas', 'found', src, 'Administración de Empresas'],
     ];
     for (const [v, st, s, want] of cases) eq(CF.sectorFromAcademicContext(withProgram(v, st, s)), want, `«${v}» (${st})`);
     eq(CF.sectorFromAcademicContext({ ...doc, identity: { ...doc.identity, program: { status: 'missing', value: null, sources: [] } } }), null, 'sin programa: sin dato');
     const noBrief = { briefVersion: 1, fields: { obj: 'x' }, updatedAt: 't' };
     const f = CF.resolveCourseFacts({ courseTitle: null, institutionId: null, brief: noBrief, academic: { version: 1, context: doc }, pedagogy: null, derivation: null, suggested: null });
-    eq([f.sector.value, f.sector.source], ['Gestión Contable y Financiera', 'inferred'], 'microcurrículo de prueba: inferido del programa');
+    eq([f.sector.value, f.sector.source, f.documentSector], ['Gestión Contable y Financiera', 'inferred', 'Gestión Contable y Financiera'], 'microcurrículo de prueba: inferido del programa');
+    // Review L821 M3: «del documento» solo con un documento (un contexto escrito a mano no es un documento).
+    const handCtx = A.rewriteOutcomes(null, [{ text: 'Aplica fórmulas' }]);
+    handCtx.hours.total = { status: 'provided', value: 30, sources: [] };
+    const sh = A.suggestProfileFromContext(handCtx, null).profile;
+    const mh = CF.mergeDerivedProfile(sh, sh, CF.pedagogyFieldOwners(null, null, sh), 1);
+    const fh = CF.resolveCourseFacts({ courseTitle: null, institutionId: null, brief: noBrief, academic: { version: 1, context: handCtx }, pedagogy: { version: 1, profile: { ...mh.profile, targetHours: 30 } }, derivation: mh.record, suggested: sh });
+    assert(fh.targetHours.source !== 'document', 'sin documento las horas no dicen «del documento»: ' + fh.targetHours.source);
     const fb = CF.resolveCourseFacts({ courseTitle: null, institutionId: null, brief: { ...noBrief, fields: { obj: 'x', sector: 'Contabilidad' } }, academic: { version: 1, context: doc }, pedagogy: null, derivation: null, suggested: null });
     eq([fb.sector.value, fb.sector.source], ['Contabilidad', 'user'], 'lo que dijo el usuario manda');
     const fp = CF.resolveCourseFacts({ courseTitle: null, institutionId: null, brief: noBrief, academic: { version: 1, context: A.buildProposedContext(null, PROPOSAL) }, pedagogy: null, derivation: null, suggested: null });
