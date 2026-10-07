@@ -2023,6 +2023,9 @@ function reservationBookkeeping(ev) {
       const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title });
       ok(cr.status === 201, 'E17: curso dinámico creado', { s: cr.status, e: cr.error });
       const courseId = Number(cr.data.id);
+      // El cliente asegura el esqueleto mínimo (1 módulo, 1 capítulo) al abrir el curso, igual que en E15.
+      const sk = await api('POST', `/courses/${courseId}/modules`, { title: 'Módulo 1', expectedCounter: 0 });
+      ok(sk.status === 201, 'E17: esqueleto del curso', { s: sk.status, e: sk.error });
 
       // Paso 1 · el pedido (lo que escribe el docente) + el microcurrículo.
       const brief = { nombre: 'Contabilidad de Costos', obj: 'Calcular y controlar los costos de producción', sector: 'Contabilidad', pais: 'Colombia', contexto: 'Técnico / Tecnólogo — formación técnica', nivel: 'Básico — sin conocimientos previos' };
