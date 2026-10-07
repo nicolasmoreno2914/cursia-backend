@@ -49,7 +49,7 @@ export class GenerationDesignGate {
     throw new ConflictException({ code: GENERATION_NOT_VERIFIED, reason, message: `${GENERATION_NOT_VERIFIED}: ${MESSAGES[reason]} No se generó nada.`, ...extra });
   }
 
-  private async assertBlueprintMatchesLiveDesign(courseId: number, frozenSha: string): Promise<void> {
+  private async assertBlueprintMatchesLiveDesign(courseId: number, frozenSha: string, reason: GenerationGateReason = 'design_changed'): Promise<void> {
     const [course] = await this.dataSource.query(
       `select id, title, structure_version, structure_version_counter, current_blueprint_id, final_exam_enabled, activity_engine,
               (to_jsonb(courses) ->> 'review_cards_enabled')::boolean as review_cards_enabled
@@ -58,14 +58,20 @@ export class GenerationDesignGate {
     );
     const rows = await loadLockRows(this.dataSource as any, courseId);
     const assembled = await assembleLockSnapshotV2(this.dataSource as any, course, rows);
-    if (assembled.errors.length > 0 || !assembled.snapshot) this.reject('design_changed');
-    if (snapshotSha256V2(assembled.snapshot as any) !== frozenSha) this.reject('design_changed');
+    if (assembled.errors.length > 0 || !assembled.snapshot) this.reject(reason);
+    if (snapshotSha256V2(assembled.snapshot as any) !== frozenSha) this.reject(reason);
   }
 
   /** Re-review piloto M-c: un error de integridad al recomponer no es un 500 crudo (503: reintentar). */
-  private async blueprintMatchesOr503(courseId: number, frozenSha: string): Promise<void> {
+  private async blueprintMatchesOr503(courseId: number, frozenSha: string, counterAtLock?: number): Promise<void> {
     try {
-      await this.assertBlueprintMatchesLiveDesign(courseId, frozenSha);
+      // Mensaje preciso: si además avanzó el contador, cambió la ESTRUCTURA; si no, el perfil/contexto/configuración.
+      let reason: GenerationGateReason = 'design_changed';
+      if (counterAtLock !== undefined) {
+        const [c] = await this.dataSource.query(`select structure_version_counter from public.courses where id = $1`, [courseId]);
+        if (c && Number(c.structure_version_counter) !== Number(counterAtLock)) reason = 'structure_changed';
+      }
+      await this.assertBlueprintMatchesLiveDesign(courseId, frozenSha, reason);
     } catch (err) {
       if (err instanceof HttpException) throw err;
       throw new ServiceUnavailableException({ code: 'GENERATION_VERIFICATION_UNAVAILABLE', message: 'GENERATION_VERIFICATION_UNAVAILABLE: no se pudo comparar el diseño aprobado con el vigente; vuelve a intentarlo. No se generó nada.' });
@@ -84,11 +90,15 @@ export class GenerationDesignGate {
     );
     if (!bp) this.reject('blueprint_missing');
     if (course.current_blueprint_id === null || Number(course.current_blueprint_id) !== Number(bp.id)) this.reject('blueprint_not_current');
-    if (Number(bp.structure_counter_at_lock) !== Number(course.structure_version_counter)) this.reject('structure_changed');
+    // v2: la huella del snapshot (estructura + perfil + contexto + configuración) decide; el contador puede avanzar con
+    // operaciones que no cambian lo que se genera (p. ej. «Usar este diseño» sin cambios, que devuelve el MISMO Blueprint
+    // idempotente). v1 (sin perfil en el snapshot): el contador, como siempre.
+    const v2 = Number(bp.schema_version) === 2;
+    if (!v2 && Number(bp.structure_counter_at_lock) !== Number(course.structure_version_counter)) this.reject('structure_changed');
     // Review piloto C1: el Blueprint v2 congela también el perfil pedagógico (horas, enfoque), el contexto académico y la
     // configuración del curso, que NO avanzan el contador. Lo que se verifica abajo es lo vigente: debe ser exactamente lo
     // que se congeló (misma huella del snapshot recompuesto), o se verificaría una cosa y se generaría otra.
-    if (Number(bp.schema_version) === 2) await this.blueprintMatchesOr503(courseId, String(bp.snapshot_sha256));
+    if (v2) await this.blueprintMatchesOr503(courseId, String(bp.snapshot_sha256), Number(bp.structure_counter_at_lock));
 
     let card: any;
     try {
@@ -102,9 +112,9 @@ export class GenerationDesignGate {
     if (!card || !card.design || !card.verification) this.reject('unverified');
     // Nada cambió mientras se verificaba (misma estructura que el Blueprint).
     const [after] = await this.dataSource.query(`select structure_version_counter from public.courses where id = $1`, [courseId]);
-    if (!after || Number(after.structure_version_counter) !== Number(course.structure_version_counter)) this.reject('structure_changed');
+    if (!after || (!v2 && Number(after.structure_version_counter) !== Number(course.structure_version_counter))) this.reject('structure_changed');
     // Re-review piloto M-d: tampoco cambió el perfil/contexto mientras se verificaba.
-    if (Number(bp.schema_version) === 2) await this.blueprintMatchesOr503(courseId, String(bp.snapshot_sha256));
+    if (v2) await this.blueprintMatchesOr503(courseId, String(bp.snapshot_sha256), Number(bp.structure_counter_at_lock));
     if (card.design.applicable !== true) this.reject('not_applicable');
     const proposed = (card.design.modules || []).reduce((n: number, m: any) => n + (m.chapters || []).filter((c: any) => c.proposed).length, 0);
     const pending = Math.max((card.design.changes || []).length, proposed);

@@ -601,14 +601,19 @@ async function dbChecks() {
       eq(await gateReason(cid, n2), 'ok', 're-aprobado');
     });
 
-    await check('RG5 R68 (re-review P1): el diseño verificado debe ser el GUARDADO — sin perfil guardado (horas/enfoque propuestos por Cursia) → design_not_saved', async () => {
+    await check('RG5 R68 (re-review P1): sin cambios por aplicar pero con el perfil de la tarjeta SIN guardar → exactamente design_not_saved', async () => {
       const cid = await courseWith('Gate 5', [3, 3], 'El curso tendrá 3 capítulos por módulo.');
-      // El docente congela sin «Usar este diseño» y sin cambios de estructura por aplicar (pins + nada que agregar).
-      const rec0 = await design.recommend(cid, OWNER, {});
-      assert(rec0.profileChanged === true, 'Cursia propone un perfil que no está guardado');
-      const n = await lockNow(cid);
-      const r = await gateReason(cid, n);
-      assert(r === 'design_not_saved' || r === 'pending_changes', r);
+      // El docente conserva su estructura (fija videos y Actividades) y elige horas, pero nunca usa «Usar este diseño»:
+      // el enfoque y el audiovisual que propone Cursia no se guardan.
+      for (const ch of await ds.query(`select id, module_id, video_enabled from public.course_chapters where course_id = $1`, [cid])) {
+        await structure.updateChapter(cid, ch.module_id, ch.id, OWNER, { videoEnabled: ch.video_enabled, pinVideo: true, applicationMinutes: null, pinApplication: true, expectedCounter: await counter(cid) });
+      }
+      const pre = await design.recommend(cid, OWNER, {});
+      const cur = await profiles.getCurrent(cid, OWNER, 'pedagogy');
+      await profiles.append(cid, OWNER, 'pedagogy', { ...cur.profile, targetHours: Math.ceil(pre.design.baseHours * 2) / 2 }, cur.isDefault ? undefined : cur.version);
+      const card = await design.recommend(cid, OWNER, {});
+      eq([card.design.changes.length, card.verification.blocking, card.profileChanged], [0, false, true], 'sin cambios ni críticos, pero el perfil de la tarjeta no es el guardado');
+      eq(await gateReason(cid, await lockNow(cid)), 'design_not_saved', 'motivo exacto');
       await useDesign(cid);
       eq(await gateReason(cid, await lockNow(cid)), 'ok', 'con «Usar este diseño» el perfil queda guardado');
     });
@@ -619,7 +624,10 @@ async function dbChecks() {
       await structure.updateChapter(cid, ch.module_id, ch.id, OWNER, { title: 'Título corregido', expectedCounter: await counter(cid) });
       await useDesign(cid);
       const [{ o }] = await ds.query(`select metadata -> 'structureOrigin' o from public.courses where id = $1`, [cid]);
-      eq([o.counter, o.shape], [await counter(cid), [4, 4]], 'el origen avanzó con la forma nueva');
+      eq(o.shape, [4, 4], 'el origen tiene la forma nueva');
+      assert(o.counter < await counter(cid), 're-review R1: el contador del origen NO avanza (el título corregido sigue protegido contra un reemplazo sin confirmar)');
+      const SAuth = loadDist('modules/course-structure/structure-authority.js');
+      eq(SAuth.originAfterCursiaDesign({ source: 'ai_proposal', counter: 1, contextVersion: null, at: '', shape: [3, 3] }, 5, 6, [3, 3]) !== null, true, 'misma forma → la estructura sigue siendo de Cursia');
       const card = await design.recommend(cid, OWNER, {});
       eq(reqCheck(card, 'chapters').severity, 'ok', 'el requisito se cumple con el diseño de Cursia (no es una excepción del docente)');
       eq(await gateReason(cid, await lockNow(cid)), 'ok', 'aprobable');

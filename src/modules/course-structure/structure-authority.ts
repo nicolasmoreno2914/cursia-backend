@@ -157,6 +157,17 @@ export async function writeStructureOrigin(q: Q, courseId: number, origin: Struc
  * mutar). Sin ella se usa la forma viva (los cambios que no tocan la forma: vínculos, videos).
  */
 export async function advanceStructureOriginIfUntouched(q: Q, courseId: number, counterBefore: number, counterAfter: number, shapeBefore?: number[]): Promise<void> {
-  const next = originAfterCursiaDesign(await readStructureOrigin(q, courseId), counterBefore, counterAfter, shapeBefore ?? (await liveStructureShape(q, courseId)));
-  if (next) await writeStructureOrigin(q, courseId, { ...next, shape: undefined });
+  const origin = await readStructureOrigin(q, courseId);
+  if (!origin) return;
+  if (origin.counter === counterBefore) {
+    // Nadie la tocó: el cambio de Cursia la deja intacta (contador y forma nuevos).
+    await writeStructureOrigin(q, courseId, { ...origin, counter: counterAfter, shape: undefined });
+    return;
+  }
+  // Re-review piloto R1: hubo ediciones del docente que NO cambiaron la forma (títulos, videos). La estructura sigue siendo
+  // de Cursia para los requisitos (se actualiza solo la FORMA), pero el contador del origen NO avanza: es la protección
+  // contra reemplazar la estructura sin confirmar («Se pierden los cambios hechos después…», confirmReplace).
+  if (originAfterCursiaDesign(origin, counterBefore, counterAfter, shapeBefore ?? (await liveStructureShape(q, courseId)))) {
+    await writeStructureOrigin(q, courseId, { ...origin, shape: await liveStructureShape(q, courseId) });
+  }
 }
