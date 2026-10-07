@@ -12,5 +12,6 @@ import { PedagogyService } from './pedagogy.service';
   ],
   controllers: [PedagogyController],
   providers: [PedagogyService],
+  exports: [PedagogyService], // LOOP 8.3: «Cursia recomienda» usa el mismo dry-run
 })
 export class PedagogyModule {}

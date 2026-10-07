@@ -1,3 +1,4 @@
+import { loadDesignPins, setVideoPin } from '../course-design/design-pins';
 import { Injectable, BadRequestException, NotFoundException, ConflictException, Logger, OnModuleInit, ServiceUnavailableException } from '@nestjs/common';
 import { lockPedagogyInput } from '../pedagogy/pedagogical-blueprint';
 import { loadCurrentPedagogicalProfile, parseStoredPedagogicalProfile } from '../pedagogy/pedagogy-db';
@@ -306,7 +307,8 @@ export class CourseStructureService implements OnModuleInit {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException(`Configuración inválida de reglas de actividad: ${(err as Error).message}`);
       }
-      const dr = await asBad(() => runPedagogyDryRun({ structure: buildBlueprintSnapshotV2(courseRef, modules, chapters), profile: saved.profile, activityTypeRules: atr }));
+      const designPins = await loadDesignPins(queryRunner, courseId);
+      const dr = await asBad(() => runPedagogyDryRun({ structure: buildBlueprintSnapshotV2(courseRef, modules, chapters), profile: saved.profile, activityTypeRules: atr, designPins }));
       const dist = dr.distribution;
       if (!dist) {
         await queryRunner.rollbackTransaction();
@@ -341,8 +343,10 @@ export class CourseStructureService implements OnModuleInit {
             added++;
           } else {
             await queryRunner.query(
-              `update public.course_chapters set position = $1, application_minutes = $2, updated_at = now() where id = $3 and module_id = $4 and course_id = $5`,
-              [ci, c.applicationMinutes, c.id, m.id, courseId],
+              // LOOP 8.3: también el video que decidió el diseño (prioridad audiovisual; lo fijado por el docente ya viene respetado).
+              `update public.course_chapters set position = $1, application_minutes = $2, video_enabled = case when $6::boolean is null then video_enabled else $6::boolean end, updated_at = now()
+                where id = $3 and module_id = $4 and course_id = $5`,
+              [ci, c.applicationMinutes, c.id, m.id, courseId, c.kind === 'content' ? c.videoEnabled : null],
             );
           }
         }
@@ -1361,9 +1365,13 @@ export class CourseStructureService implements OnModuleInit {
         throw notFound();
       }
       const newCounter = found.counter;
+      // LOOP 8.3: video cambiado a mano → fijado por el docente; pasar a práctica lo libera (la práctica nunca lleva video).
+      if (dto.kind === 'practice') await setVideoPin(queryRunner, courseId, chapterId, null);
+      else if (dto.pinVideo === true && dto.videoEnabled !== undefined) await setVideoPin(queryRunner, courseId, chapterId, dto.videoEnabled);
       await queryRunner.commitTransaction();
       return {
         structureVersionCounter: newCounter,
+        ...(dto.pinVideo === true && dto.videoEnabled !== undefined && dto.kind !== 'practice' ? { videoPinned: true } : {}),
         ...(nt ? { title: nt.title, titleNormalized: nt.changed } : {}),
         ...(description !== undefined ? { description } : {}),
         ...(outcomeIds !== undefined ? { outcomeIds } : {}),

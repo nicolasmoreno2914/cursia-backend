@@ -1,3 +1,4 @@
+import { DESIGN_PINS_KEY } from '../course-design/design-pins';
 import { STRUCTURE_ORIGIN_KEY } from '../course-structure/structure-authority';
 import { BRIEF_KEY, PEDAGOGY_DERIVATION_KEY } from '../course-facts/course-facts';
 import { Injectable, NotFoundException } from '@nestjs/common';
@@ -11,7 +12,7 @@ import { assertDynamicCreationAllowed, assertDynamicOwnerAllowed } from '../feat
 import { readActivityTypeRulesConfig } from '../generation-manifests/manifest-rules-config';
 
 /** LOOP 8.0/8.1: claves de courses.metadata que solo escriben sus servicios. */
-const PROTECTED_METADATA_KEYS = [STRUCTURE_ORIGIN_KEY, BRIEF_KEY, PEDAGOGY_DERIVATION_KEY];
+const PROTECTED_METADATA_KEYS = [STRUCTURE_ORIGIN_KEY, BRIEF_KEY, PEDAGOGY_DERIVATION_KEY, DESIGN_PINS_KEY];
 
 /**
  * EV6 H5P v2 (H2 fix round 1, I-2): «Repaso» (Dialog Cards) arranca ENCENDIDO solo en cursos

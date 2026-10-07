@@ -93,6 +93,8 @@ export interface DryRunInput {
   registry?: PedagogicalApproachRegistry;
   /** Fase 4: datos del contexto académico que no viven en el Blueprint (P2: ¿declara conocimientos previos?). */
   alignment?: { priorKnowledgeDeclared?: boolean | null };
+  /** LOOP 8.3: valores fijados por el docente (courses.metadata.designPins) que el distribuidor respeta. */
+  designPins?: Record<string, { video?: boolean }> | null;
 }
 
 export interface ProviderPlan {
@@ -405,7 +407,8 @@ export function materializeDistribution(base: BlueprintSnapshotV2, dist: Distrib
       const existing = byId.get(c.id);
       if (existing) {
         // Fase 2: la propuesta fija (o quita) la Actividad de Aplicación de cada capítulo existente.
-        chapters.push({ ...existing, position: ci, application_minutes: c.applicationMinutes ?? null });
+        // LOOP 8.3: y el video de los capítulos de contenido (prioridad audiovisual / valores fijados por el docente).
+        chapters.push({ ...existing, position: ci, application_minutes: c.applicationMinutes ?? null, ...(c.kind === 'content' ? { video_enabled: c.videoEnabled } : {}) });
         return;
       }
       chapters.push({
@@ -671,7 +674,7 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
       // NUNCA sobre la vista con los cambios de estructura sugeridos (videos/actividades/repaso): esos no los escribe
       // «Aplicar diseño» (los decide el docente en el editor), y contarlos haría que lo mostrado ≠ lo aplicado.
       const lockShaped = rules ? applyPedagogyToSnapshot(base, rules) : base;
-      const dist = distributeCourseHours({ snapshot: lockShaped, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile) });
+      const dist = distributeCourseHours({ snapshot: lockShaped, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile), pins: input.designPins ?? null });
       const materialized = materializeOrError(lockShaped, dist, (plain) => {
         const ms = side(rules ? applyPedagogyToSnapshot(plain, rules) : plain, activityTypeRules);
         return {

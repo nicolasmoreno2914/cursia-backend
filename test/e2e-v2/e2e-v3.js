@@ -1906,6 +1906,60 @@ function reservationBookkeeping(ev) {
         'E14b: lo guardado desde el navegador está en «Lo que sabemos»', { d: f.data && { s: f.data.sector, c: f.data.country, p: f.data.document } });
     }, { fatal: false });
 
+    // ═══ LOOP 8.3 · E15 — «Cursia recomienda» por HTTP real: recomendación → Ajustar → guardar → aplicar (huella) → lock →
+    // Manifest = tarjeta; video fijado respetado; «Liberar». USD 0 (nada se genera).
+    if (RUN_E5) await step('v3-E15-cursia-recomienda', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: '[E2E E15] Contabilidad de Costos' });
+      const courseId = Number(cr.data.id);
+      const m0 = await api('POST', `/courses/${courseId}/modules`, { title: 'Módulo 1', expectedCounter: 0 });
+      ok(m0.status === 201, 'E15: esqueleto', { s: m0.status, e: m0.error });
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo.docx', dataBase64: (await AF.fixture('consistent', 'docx')).toString('base64') }] });
+      const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 });
+      ok(sv.status === 201, 'E15: microcurrículo guardado', { s: sv.status });
+      let st = await readStructure(courseId);
+      const aa = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: st.structureVersionCounter, contextVersion: sv.data.profile.version });
+      ok([200, 201].includes(aa.status), 'E15: estructura del documento', { s: aa.status, e: aa.error });
+      const r1 = await api('POST', `/courses/${courseId}/design/recommendation`, {});
+      ok(r1.status === 200 && r1.data.hours.target === 64 && r1.data.hours.source === 'document' && r1.data.approach && r1.data.approach.source === 'recommended' && r1.data.preferences.audiovisual === 'recommended',
+        'E15: Cursia recomienda (64 h del documento, enfoque recomendado, audiovisual recomendado)', { s: r1.status, h: r1.data && r1.data.hours, a: r1.data && r1.data.approach });
+      ok(r1.data.design && r1.data.design.applicable && r1.data.design.manifestErrors.length === 0 && r1.data.cost && Number(r1.data.cost.expected) > 0 && r1.data.providersCalled === 0,
+        'E15: tarjeta aplicable, = Manifest materializado, con costo; 0 proveedores', { d: r1.data.design && r1.data.design.status });
+      const less = await api('POST', `/courses/${courseId}/design/recommendation`, { adjust: { audiovisual: 'less' } });
+      const more = await api('POST', `/courses/${courseId}/design/recommendation`, { adjust: { audiovisual: 'more' } });
+      ok(less.data.design.counts.videoChapters < r1.data.design.counts.videoChapters && r1.data.design.counts.videoChapters <= more.data.design.counts.videoChapters
+        && Math.abs(less.data.design.estimatedHours - 64) <= 3.5 && Math.abs(more.data.design.estimatedHours - 64) <= 3.5,
+        'E15: Menos < Recomendado ≤ Más video, las tres con 64 h', { l: less.data.design.counts.videoChapters, r: r1.data.design.counts.videoChapters, m: more.data.design.counts.videoChapters });
+      const bad = await api('POST', `/courses/${courseId}/design/recommendation`, { adjust: { audiovisual: 'mucho' } });
+      ok(bad.status === 400, 'E15: Ajustar inválido → 400 (DTO)', { s: bad.status });
+      // «Usar este diseño» (Menos video): guardar el perfil efectivo → misma huella → aplicar → lock → Manifest = tarjeta.
+      const card = less.data;
+      const pv = await api('GET', `/courses/${courseId}/profiles/pedagogy`);
+      const sp = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: card.profile, expectedVersion: pv.data.version });
+      ok(sp.status === 201, 'E15: perfil del diseño guardado', { s: sp.status, e: sp.error });
+      const r2 = await api('POST', `/courses/${courseId}/design/recommendation`, {});
+      ok(r2.data.profileChanged === false && r2.data.design.proposalSha256 === card.design.proposalSha256, 'E15: guardado = la misma huella que la tarjeta', { a: r2.data.design.proposalSha256, b: card.design.proposalSha256 });
+      st = await readStructure(courseId);
+      const ap = await api('POST', `/courses/${courseId}/modules/apply-distribution`, { expectedCounter: st.structureVersionCounter, proposalSha256: card.design.proposalSha256 });
+      ok([200, 201].includes(ap.status), 'E15: aplicar el diseño', { s: ap.status, e: ap.error });
+      st = await readStructure(courseId);
+      const lock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st.structureVersionCounter });
+      const man = await api('POST', `/courses/${courseId}/blueprints/${lock.data.blueprint.blueprintNumber}/manifest`);
+      const T = man.data.manifest.manifest.totals;
+      const c = card.design.counts;
+      eq([T.experienceCount, T.videoCount, T.applicationActivityCount, T.examCount + T.finalExamCount], [c.chapters, c.videoChapters, c.applicationActivities, c.evaluations], 'E15: Manifest congelado = tarjeta «Cursia recomienda» (capítulos, videos, Actividades de Aplicación, evaluaciones)');
+      // Video fijado a mano en el editor → la recomendación lo respeta; «Liberar».
+      const ch = st.modules[0].chapters.find((x) => x.kind !== 'practice' && x.videoEnabled);
+      const pin = await api('PATCH', `/courses/${courseId}/modules/${st.modules[0].id}/chapters/${ch.id}`, { videoEnabled: false, pinVideo: true, expectedCounter: st.structureVersionCounter });
+      ok(pin.status === 200 && pin.data.videoPinned === true, 'E15: video fijado por el docente', { s: pin.status, e: pin.error });
+      const r3 = await api('POST', `/courses/${courseId}/design/recommendation`, { adjust: { audiovisual: 'more' } });
+      const ch3 = r3.data.design.modules[0].chapters.find((x) => x.id === ch.id);
+      ok(ch3 && ch3.videoEnabled === false && ch3.videoPinned === true && r3.data.pinnedChapters === 1, 'E15: «Más video» respeta lo fijado', { ch3 });
+      const cl = await api('POST', `/courses/${courseId}/design/pins/clear`, {});
+      ok(cl.status === 200 && cl.data.released === 1, 'E15: «Liberar»', { s: cl.status, d: cl.data });
+      results.courses.E15 = { courseId };
+    }, { fatal: false });
+
     // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══
     const MOODLE_JOBS = ONLY_REAL_PROVIDERS ? [] : [['E1', 'E1'], ['E1-repack', 'E1repack'], ['E2', 'E2'], ['E3', 'E3']];
     // EV6 H5P v2: E5 entra al mismo restore + inspección (con los «Repaso» del paquete).
