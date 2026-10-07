@@ -4,13 +4,18 @@
 //
 // Parte pura:
 //   VF1 diseño sano: todo ok, sin bloqueo; costo, audiovisual, práctica y evaluaciones en la lista
-//   VF2 horas: por encima → advertencia con «Usar N h»; no alcanza → editor; contenidos > horas → CRÍTICO con «Diseñar para N h»
+//   VF2 horas: por encima → advertencia con «Usar N h»; no alcanza → editor; contenidos > horas → CRÍTICO (el botón
+//       «Diseñar para N h» está en la tarjeta, no repetido aquí)
 //   VF3 alineación: A1/A4 → «Corregir» automático SOLO si la vinculación lo resuelve (si no, editor con destino); A3/A5/A6
 //       → «Ajustar» solo si cambia algo (si no, editor); A4 de un capítulo PROPUESTO se omite; el resumen no suma;
 //       A7 / P2 → «Lo que entendimos»; sin resultados → advertencia; errores del Manifest → crítico sin códigos internos
 //   VF6 contenidos del microcurrículo sin capítulo; evaluaciones que pide el documento; costo con coma decimal; > 500 h
+//   VF8 contenidos cubiertos por UN capítulo (no por palabras sueltas del módulo); evaluaciones del documento por tipo y resultado
 // Parte DB (Postgres 16 desechable; --pure-only la salta y lo dice):
 //   VF4 la recomendación trae la verificación del MISMO diseño (alineación real del Coherence Engine)
+//   VF9 aplicar: los capítulos de contenido que propone el diseño heredan los resultados de su módulo (sin A4 después)
+//   VF10 «sin vínculos» solo al QUITARLOS; las sugerencias del panel académico no tocan prácticas ni desvinculados;
+//        «Liberar» limpia las marcas de capítulos borrados
 //   VF5 «Corregir» automático: vincula solo los capítulos de CONTENIDO SIN vínculos (los del docente y las prácticas
 //       intactos), con vista previa en la verificación; un capítulo desvinculado a propósito no se re-vincula; sube el
 //       contador; ya vinculado → la verificación no ofrece «automático»; contador viejo → 409; acción desconocida → 400; ajeno 404
@@ -70,7 +75,7 @@ const vids = (d) => d.modules.map((m) => m.chapters.filter((c) => c.kind === 'co
   console.log('Parte pura');
   const base = { status: 'within_tolerance', targetHours: 64, estimatedHours: 63.5, toleranceHours: 3.2, baseHours: 30, counts: { modules: 4, chapters: 16, contentChapters: 12, practiceChapters: 4, videoChapters: 8, activities: 16, applicationActivities: 10, evaluations: 5 },
     manifestErrors: [], alignment: { available: true, coverage: { outcomes: 6, covered: 6, partial: 0, uncovered: 0 }, findings: [] }, approach: { id: 'competencias', label: 'Competencias' }, policyKind: 'application_first', audiovisual: 'recommended', pinnedChapters: 0, cost: { min: '18', expected: '24', max: '33' },
-    preferences: { emphasis: 'balanced', applicationActivities: 'auto' }, autoLink: { chapterIds: [], outcomeIds: [], preview: [] }, proposedChapterIds: [], uncoveredContents: [], requiredEvaluations: [] };
+    preferences: { emphasis: 'balanced', applicationActivities: 'auto' }, autoLink: { chapterIds: [], outcomeIds: [], preview: [] }, proposedChapterIds: [], uncoveredContents: [], requiredEvaluations: [], uncoveredEvaluations: [] };
   const byId = (v) => Object.fromEntries(v.checks.map((c) => [c.id, c]));
   await check('VF1 diseño sano: todo ok y sin bloqueo; la lista cubre las 10 áreas', () => {
     const v = V.verifyDesign(base);
@@ -87,7 +92,7 @@ const vids = (d) => d.modules.map((m) => m.chapters.filter((c) => c.kind === 'co
     const cant = byId(V.verifyDesign({ ...base, status: 'cannot_reach_target', estimatedHours: 40 })).hours;
     eq([cant.severity, cant.fix.kind, cant.fix.action], ['warning', 'editor', 'add_modules'], 'no alcanza');
     const v = V.verifyDesign({ ...base, status: 'minimum_exceeds_target', targetHours: 16, baseHours: 30.2 });
-    eq([byId(v).hours.severity, byId(v).hours.fix.value, v.blocking], ['critical', 31, true], 'contenidos > horas: bloquea');
+    eq([byId(v).hours.severity, byId(v).hours.fix, /«Diseñar para 31 h» en la tarjeta/.test(byId(v).hours.detail), v.blocking], ['critical', undefined, true, true], 'contenidos > horas: bloquea; el botón está en la tarjeta (sin duplicar)');
   });
   await check('VF3 alineación → «Corregir» que de verdad resuelve: automático, Ajustar, editor o «Lo que entendimos»', () => {
     const f = (rule, severity, extra = {}) => ({ id: rule + ':x', rule, severity, outcomeIds: ['RA1'], chapterIds: [], moduleIds: [], message: 'm ' + rule, suggestion: 's', ...extra });
@@ -130,6 +135,30 @@ const vids = (d) => d.modules.map((m) => m.chapters.filter((c) => c.kind === 'co
     eq([big.severity, big.fix.kind, /500 h/.test(big.detail)], ['critical', 'editor', true], 'contenidos > 500 h: dividir');
     const above = byId(V.verifyDesign({ ...base, status: 'above_tolerance', targetHours: 480, estimatedHours: 500.4 })).hours;
     eq(above.fix.kind, 'editor', 'pasarse de 500 h no se ofrece como meta');
+  });
+
+  await check('VF8 contenidos: cubiertos por UN capítulo con ≥ 2 palabras en común; evaluaciones del documento por tipo y resultado', () => {
+    const SVC = loadDist('modules/course-design/course-design.service.js');
+    const ctx = { units: [{ contents: ['Hoja de costos por orden de producción', 'Costos indirectos de fabricación', 'Toma de decisiones con información de costos', 'Producción equivalente', 'Inventarios'].map((text) => ({ text })) }], evaluation: [] };
+    // Sonda de la revisión L84-2 (N2): capítulos genéricos de un módulo «Contabilidad de costos» NO cubren esos contenidos.
+    const generic = [{ title: 'Introducción a los costos' }, { title: 'Materiales y producción' }, { title: 'Informe de decisiones' }];
+    eq(SVC.uncoveredUnitContents(ctx, generic), ctx.units[0].contents.map((c) => c.text), 'capítulos genéricos: nada cubierto');
+    const specific = [{ title: 'La hoja de costos', description: 'Hoja de costos por órdenes de producción' }, { title: 'Costos indirectos', objective: 'Distribuir los costos indirectos de fabricación' }, { title: 'Inventarios' }];
+    eq(SVC.uncoveredUnitContents(ctx, specific), ['Toma de decisiones con información de costos', 'Producción equivalente'], 'capítulos específicos: cubre lo que trabajan (descripción incluida)');
+    const ch = (id, extra = {}) => ({ id, proposed: false, kind: 'content', applicationMinutes: null, ...extra });
+    const dist = { counts: { evaluations: 2 }, modules: [
+      { id: 'm1', examEnabled: true, chapters: [ch('c1'), ch('c2', { applicationMinutes: 60 }), ch('p1', { proposed: true, kind: 'practice', applicationMinutes: 90 })] },
+      { id: 'm2', examEnabled: true, chapters: [ch('c3')] }] };
+    const links = new Map([['c1', ['RA1']], ['c2', ['RA2']], ['c3', ['RA3']]]);
+    const ev = (instrument, outcomeIds) => ({ ...ctx, evaluation: [{ id: 'EV', instrument, weightPct: 25, outcomeIds }] });
+    eq(SVC.uncoveredEvaluations(ev('Proyecto de costeo por órdenes', ['RA3']), dist, links), [{ instrument: 'Proyecto de costeo por órdenes', outcomes: ['RA3'], kind: 'performance' }], 'proyecto de RA3 sin Actividad de Aplicación donde se trabaja RA3');
+    eq(SVC.uncoveredEvaluations(ev('Taller práctico', ['RA1']), dist, links), [], 'la práctica del módulo (hereda RA1) lo evidencia');
+    eq(SVC.uncoveredEvaluations(ev('Examen parcial', ['RA3']), dist, links), [], 'la evaluación del módulo 2 trabaja RA3');
+    const noExam = { counts: { evaluations: 1 }, modules: [{ ...dist.modules[0] }, { ...dist.modules[1], examEnabled: false }] };
+    eq(SVC.uncoveredEvaluations(ev('Examen parcial', ['RA3']), noExam, links).map((x) => x.kind), ['exam'], 'sin evaluación que trabaje RA3 ni final');
+    const v = byId(V.verifyDesign({ ...base, uncoveredEvaluations: [{ instrument: 'Proyecto de costeo', outcomes: ['RA3'], kind: 'performance' }, { instrument: 'Parcial', outcomes: ['RA3'], kind: 'exam' }] }));
+    eq([v.evaluation_performance.severity, v.evaluation_performance.fix.action, v.evaluation_exams.fix.action], ['warning', 'outcome_links', 'module_exams'], 'advertencias con su corrección');
+    eq(byId(V.verifyDesign({ ...base, preferences: { emphasis: 'balanced', applicationActivities: 'none' }, uncoveredEvaluations: [{ instrument: 'Proyecto', outcomes: [], kind: 'performance' }] })).evaluation_performance.fix.kind, 'adjust', 'sin actividades: Ajustar las enciende');
   });
 
   if (PURE_ONLY) console.log('\n⚠️  --pure-only: se SALTÓ la parte DB (no cuenta como probada).');
@@ -291,6 +320,53 @@ async function dbChecks() {
       const [ch] = await ds.query(`insert into public.course_chapters (course_id, module_id, position, title, chapter_kind, video_enabled) values ($1, $2, 0, 'Práctica', 'practice', false) returning id`, [c.id, m.id]);
       const up = await structure.updateChapter(c.id, m.id, ch.id, OWNER, { videoEnabled: false, pinVideo: true, expectedCounter: await counter(c.id) });
       eq(up.videoPinned, undefined, 'sin videoPinned');
+    });
+
+    await check('VF9 aplicar: la profundización que propone el diseño hereda los resultados de su módulo; después no hay A4', async () => {
+      const cid = await docCourse('Profundización');
+      const card = await design.recommend(cid, OWNER, { adjust: { emphasis: 'depth', targetHours: 96 } });
+      const proposed = card.design.modules.flatMap((m) => m.chapters.filter((c) => c.proposed && c.kind === 'content').map((c) => ({ m: m.id, title: c.title })));
+      assert(proposed.length > 0, 'el diseño propone capítulos de contenido: ' + JSON.stringify(card.design.counts));
+      assert(!card.verification.checks.some((c) => /no está claramente asociado/.test(c.title)), 'ni en la tarjeta (heredan en la materialización)');
+      const v = (await profiles.getCurrent(cid, OWNER, 'pedagogy')).version;
+      await profiles.append(cid, OWNER, 'pedagogy', card.profile, v);
+      await structure.applyDistribution(cid, OWNER, { expectedCounter: await counter(cid), proposalSha256: card.design.proposalSha256 });
+      const rows = await ds.query(`select module_id, title, outcome_ids, to_jsonb(ch) ->> 'chapter_kind' k from public.course_chapters ch where course_id = $1`, [cid]);
+      const titles = new Set(proposed.map((p) => p.title));
+      for (const p of proposed) {
+        const row = rows.find((r) => r.title === p.title && r.module_id === p.m);
+        const union = [...new Set(rows.filter((r) => r.module_id === p.m && r.k !== 'practice' && !titles.has(r.title)).flatMap((r) => r.outcome_ids || []))].sort();
+        assert(union.length > 0, `el módulo de «${p.title}» tiene resultados`);
+        eq(row && row.outcome_ids, union, `«${p.title}» hereda los resultados de su módulo`);
+      }
+      const after = await design.recommend(cid, OWNER, {});
+      assert(!after.verification.checks.some((c) => /no está claramente asociado/.test(c.title)), 'después de aplicar no aparece «sin resultado»: ' + JSON.stringify(after.verification.checks.filter((c) => c.severity !== 'ok').map((c) => c.title)));
+    });
+
+    await check('VF10 «sin vínculos» solo al quitarlos; el panel académico no sugiere prácticas ni desvinculados; «Liberar» limpia marcas de borrados', async () => {
+      const { AcademicContextService } = loadDist('modules/academic-context/academic-context.service.js');
+      const acx = new AcademicContextService(ds, coursesStub, null, null);
+      const [c] = await ds.query(`insert into public.courses (owner_id, title, structure_version, final_exam_enabled, activity_engine) values ($1, 'Marcas', 'dynamic', true, 'h5p') returning id`, [OWNER]);
+      const [m] = await ds.query(`insert into public.course_modules (course_id, position, title) values ($1, 0, 'Costos') returning id`, [c.id]);
+      const ids = [];
+      for (const [i, title] of ['Elementos del costo y su clasificación', 'Costo de materiales y mano de obra', 'Práctica: costo de materiales y mano de obra', 'Sistema de costeo por órdenes de producción'].entries()) {
+        ids.push((await ds.query(`insert into public.course_chapters (course_id, module_id, position, title, objective) values ($1, $2, $3, $4, $4) returning id`, [c.id, m.id, i, title]))[0].id);
+      }
+      await ds.query(`update public.course_chapters set chapter_kind = 'practice', video_enabled = false where id = $1`, [ids[2]]);
+      await profiles.append(c.id, OWNER, 'academic', doc);
+      const pins = async () => (await ds.query(`select metadata -> 'designPins' p from public.courses where id = $1`, [c.id]))[0].p || {};
+      await structure.updateChapter(c.id, m.id, ids[0], OWNER, { outcomeIds: null, expectedCounter: await counter(c.id) });
+      eq((await pins())[ids[0]], undefined, 'null a un capítulo sin vínculos: no deja marca');
+      await structure.updateChapter(c.id, m.id, ids[1], OWNER, { outcomeIds: ['RA1'], expectedCounter: await counter(c.id) });
+      await structure.updateChapter(c.id, m.id, ids[1], OWNER, { outcomeIds: null, expectedCounter: await counter(c.id) });
+      eq((await pins())[ids[1]], { noLinks: true }, 'quitar los vínculos deja la marca');
+      const dz = await acx.design(c.id, OWNER);
+      const byCh = Object.fromEntries(dz.outcomeLinks.map((s) => [s.chapterId, s]));
+      eq([byCh[ids[1]].status, byCh[ids[2]].status], ['none', 'none'], 'el panel académico no sugiere vincular el desvinculado ni la práctica');
+      assert(byCh[ids[0]].status === 'inferred' && byCh[ids[0]].suggested.length, 'los demás sí: ' + JSON.stringify(byCh[ids[0]]));
+      await structure.deleteChapter(c.id, m.id, ids[1], OWNER, await counter(c.id));
+      await design.clearPins(c.id, OWNER);
+      eq((await pins())[ids[1]], undefined, '«Liberar» limpia la marca de un capítulo borrado');
     });
 
   } finally {

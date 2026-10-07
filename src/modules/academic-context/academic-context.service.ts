@@ -1,3 +1,4 @@
+import { loadDesignPins } from '../course-design/design-pins';
 import { BadRequestException, ConflictException, Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { CoursesService } from '../courses/courses.service';
@@ -215,13 +216,17 @@ export class AcademicContextService {
       return { available: false, reason: 'CONTEXT_HAS_ERRORS', contextVersion: academic.version, validation, profileSuggestion: null, structureProposal: null, outcomeLinks: [] };
     }
     const ped = await loadCurrentPedagogicalProfile(this.dataSource, courseId);
-    const chapters: { id: string; module_id: string; title: string; objective: string | null; description: string | null; outcome_ids: unknown }[] = await this.dataSource.query(
-      `select ch.id, ch.module_id, ch.title, ch.objective, ch.description, to_jsonb(ch) -> 'outcome_ids' as outcome_ids
+    const chapters: { id: string; module_id: string; title: string; objective: string | null; description: string | null; outcome_ids: unknown; kind: string | null }[] = await this.dataSource.query(
+      `select ch.id, ch.module_id, ch.title, ch.objective, ch.description, to_jsonb(ch) -> 'outcome_ids' as outcome_ids, to_jsonb(ch) ->> 'chapter_kind' as kind
          from public.course_chapters ch join public.course_modules m on m.id = ch.module_id
         where ch.course_id = $1 order by m.position, ch.position, ch.id`,
       [courseId],
     );
     const known = academicOutcomeIds(academic.context);
+    // Review L84-2 N5: lo mismo que la vinculación automática de la verificación — nunca se sugiere vincular un capítulo de
+    // práctica ni uno que el docente desvinculó a propósito.
+    const pins = await loadDesignPins(this.dataSource, courseId);
+    const noSuggest = new Set(chapters.filter((c) => c.kind === 'practice' || (pins[c.id] && pins[c.id].noLinks)).map((c) => c.id));
     return {
       available: true,
       reason: null,
@@ -240,7 +245,7 @@ export class AcademicContextService {
           // Un vínculo a un resultado que ya no existe en el contexto no cuenta como «decisión del docente».
           outcomeIds: Array.isArray(c.outcome_ids) ? (c.outcome_ids as string[]).filter((x) => known.has(x)) : null,
         })),
-      ),
+      ).map((s) => (s.status === 'inferred' && noSuggest.has(s.chapterId) ? { ...s, suggested: s.current, status: 'none' as const } : s)),
       providersCalled: 0,
     };
   }

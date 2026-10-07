@@ -15,7 +15,7 @@ import { verifyDesign } from './design-verification';
 import { returningRows } from '../../common/db/returning-rows';
 import { LINK_CONTAINMENT_MIN, suggestOutcomeLinks } from '../academic-context/context-design';
 import type { AcademicContextV1 } from '../academic-context/academic-context';
-import { tokenContainment } from '../coherence/normalize';
+import { tokenSet } from '../coherence/normalize';
 import { proposedChapterUuid } from '../pedagogy/dry-run';
 import { advanceStructureOriginIfUntouched } from '../course-structure/structure-authority';
 import { ConflictException } from '@nestjs/common';
@@ -116,7 +116,8 @@ export class CourseDesignService {
     const profile = normalizePedagogicalProfile(base);
     const dr = await this.pedagogy.dryRunCourse(courseId, ownerId, { profile });
     const dist = dr.distribution;
-    const chapterOutcomes = await this.chapterOutcomes(courseId);
+    const live = await this.liveChapters(courseId);
+    const chapterOutcomes = new Map(live.map((r) => [r.id, r.outcomeIds]));
     const linkPlan = academic && dist ? await autoLinkPlan(this.dataSource, courseId, academic.context) : [];
     const savedComparable = saved ? JSON.stringify(normalizePedagogicalProfile(Object.fromEntries(Object.entries(saved.profile as any).filter(([k]) => k !== 'designRules')))) : null;
     const approachDef = profile.primaryApproach ? registry.get(profile.primaryApproach) : null;
@@ -138,8 +139,9 @@ export class CourseDesignService {
           preview: linkPlan.map((p) => ({ chapter: p.title, outcomes: p.suggested })),
         },
         proposedChapterIds: dist.modules.flatMap((m) => m.chapters.filter((c) => c.proposed).map((c) => proposedChapterUuid(c.id))),
-        uncoveredContents: academic ? uncoveredUnitContents(academic.context, dist.modules) : [],
+        uncoveredContents: academic ? uncoveredUnitContents(academic.context, live) : [],
         requiredEvaluations: academic ? academic.context.evaluation.map((e) => e.instrument).filter(Boolean) : [],
+        uncoveredEvaluations: academic ? uncoveredEvaluations(academic.context, dist, chapterOutcomes) : [],
       })
       : null;
     return {
@@ -260,12 +262,13 @@ export class CourseDesignService {
     return { released };
   }
 
-  private async chapterOutcomes(courseId: number): Promise<Map<string, string[]>> {
-    const rows: { id: string; outcome_ids: unknown }[] = await this.dataSource.query(
-      `select id, to_jsonb(ch) -> 'outcome_ids' as outcome_ids from public.course_chapters ch where course_id = $1`,
+  private async liveChapters(courseId: number): Promise<LiveChapter[]> {
+    const rows: { id: string; module_id: string; title: string; objective: string | null; description: string | null; outcome_ids: unknown; kind: string | null }[] = await this.dataSource.query(
+      `select id, module_id, title, objective, description, to_jsonb(ch) -> 'outcome_ids' as outcome_ids, to_jsonb(ch) ->> 'chapter_kind' as kind
+         from public.course_chapters ch where course_id = $1`,
       [courseId],
     );
-    return new Map(rows.map((r) => [r.id, Array.isArray(r.outcome_ids) ? (r.outcome_ids as string[]) : []]));
+    return rows.map((r) => ({ id: r.id, moduleId: r.module_id, title: r.title, objective: r.objective, description: r.description, kind: r.kind === 'practice' ? 'practice' : 'content', outcomeIds: Array.isArray(r.outcome_ids) ? (r.outcome_ids as string[]) : [] }));
   }
 }
 
@@ -290,15 +293,61 @@ export async function autoLinkPlan(q: Q, courseId: number, ctx: AcademicContextV
     .map((s) => ({ chapterId: s.chapterId, title: byId.get(s.chapterId)!.title, suggested: s.suggested }));
 }
 
-/** Contenidos de las unidades del microcurrículo que ningún capítulo (ni su módulo) trabaja. Review L84 I5. */
-export function uncoveredUnitContents(ctx: AcademicContextV1, modules: { title: string; chapters: { title: string; objective?: string | null }[] }[]): string[] {
-  const chapterTexts = modules.flatMap((m) => m.chapters.map((c) => `${c.title} ${c.objective || ''}`));
-  const moduleTexts = modules.map((m) => [m.title, ...m.chapters.map((c) => `${c.title} ${c.objective || ''}`)].join(' '));
+interface LiveChapter { id: string; moduleId: string; title: string; objective: string | null; description: string | null; kind: 'content' | 'practice'; outcomeIds: string[] }
+
+/**
+ * Contenidos de las unidades del microcurrículo que ningún capítulo EXISTENTE trabaja (review L84 I5 / L84-2 N2).
+ * Un contenido está cubierto si UN capítulo (título + objetivo + descripción, donde la estructura del documento guarda
+ * los contenidos) comparte al menos la mitad de sus palabras y, si tiene dos o más, al menos dos. Nunca contra el texto
+ * concatenado de un módulo (una palabra suelta como «costo» lo «cubría» todo) ni contra capítulos propuestos.
+ */
+export function uncoveredUnitContents(ctx: AcademicContextV1, chapters: { title: string; objective?: string | null; description?: string | null }[]): string[] {
+  const sets = chapters.map((c) => tokenSet([c.title, c.objective || '', c.description || ''].join(' ')));
   const out: string[] = [];
   for (const u of ctx.units) {
     for (const c of u.contents) {
-      const hit = chapterTexts.some((t) => tokenContainment(c.text, t) >= LINK_CONTAINMENT_MIN) || moduleTexts.some((t) => tokenContainment(c.text, t) >= LINK_CONTAINMENT_MIN);
+      const ct = tokenSet(c.text);
+      if (!ct.size) continue;
+      const need = ct.size >= 2 ? 2 : 1;
+      const hit = sets.some((s) => {
+        let inter = 0;
+        for (const x of ct) if (s.has(x)) inter++;
+        return inter >= need && inter / ct.size >= LINK_CONTAINMENT_MIN;
+      });
       if (!hit) out.push(c.text);
+    }
+  }
+  return out;
+}
+
+/** Instrumentos de desempeño (se evidencian con una Actividad de Aplicación, no con un examen). */
+const PERFORMANCE_INSTRUMENT_RE = /proyect|taller|caso|pr[aá]ctic|informe|trabajo|ejercicio|laborator|portafolio|exposici|simulaci|estudio de/i;
+
+/**
+ * Review L84-2 N6 · Lo que el microcurrículo evalúa y el diseño no: por cada instrumento del documento, sus resultados
+ * deben tener evidencia del mismo tipo — desempeño (proyecto, taller, caso…) → una Actividad de Aplicación en un capítulo
+ * que trabaje ese resultado; prueba (parcial, examen…) → la evaluación de un módulo que lo trabaje o la evaluación final.
+ * Un capítulo propuesto o de práctica trabaja los resultados de su módulo.
+ */
+export function uncoveredEvaluations(
+  ctx: AcademicContextV1,
+  dist: { counts: { evaluations: number }; modules: { id: string; examEnabled: boolean; chapters: { id: string; proposed: boolean; kind: string; applicationMinutes?: number | null }[] }[] },
+  chapterOutcomes: Map<string, string[]>,
+): { instrument: string; outcomes: string[]; kind: 'performance' | 'exam' }[] {
+  const moduleOuts = new Map(dist.modules.map((m) => [m.id, new Set(m.chapters.filter((c) => !c.proposed && c.kind !== 'practice').flatMap((c) => chapterOutcomes.get(c.id) || []))]));
+  const outsOf = (m: { id: string }, c: { id: string; proposed: boolean; kind: string }) => (c.proposed || c.kind === 'practice' ? moduleOuts.get(m.id)! : new Set(chapterOutcomes.get(c.id) || []));
+  const finalExam = dist.counts.evaluations > dist.modules.filter((m) => m.examEnabled).length;
+  const hits = (set: Set<string>, outs: string[]) => !outs.length || outs.some((o) => set.has(o));
+  const out: { instrument: string; outcomes: string[]; kind: 'performance' | 'exam' }[] = [];
+  for (const ev of ctx.evaluation) {
+    if (!ev.instrument) continue;
+    const outs = ev.outcomeIds || [];
+    if (PERFORMANCE_INSTRUMENT_RE.test(ev.instrument)) {
+      const ok = dist.modules.some((m) => m.chapters.some((c) => (c.applicationMinutes || 0) > 0 && hits(outsOf(m, c), outs)));
+      if (!ok) out.push({ instrument: ev.instrument, outcomes: outs, kind: 'performance' });
+    } else {
+      const ok = finalExam || dist.modules.some((m) => m.examEnabled && hits(moduleOuts.get(m.id)!, outs));
+      if (!ok) out.push({ instrument: ev.instrument, outcomes: outs, kind: 'exam' });
     }
   }
   return out;
