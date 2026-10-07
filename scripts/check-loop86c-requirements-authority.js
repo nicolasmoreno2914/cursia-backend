@@ -546,6 +546,22 @@ async function dbChecks() {
       eq((await design.recommend(cid3, OWNER, {})).hours.target, 12.5, '«12,50 horas» → 12,5 h');
     });
 
+    await check('RC21 piloto: si el docente cambió la estructura, Cursia no vuelve a proponer capítulos: queda como su excepción y se puede aprobar', async () => {
+      const cid = await courseWith('Estructura del docente', [3, 3], 'El curso tendrá 4 capítulos por módulo.');
+      const first = await design.recommend(cid, OWNER, {});
+      eq(first.design.modules.map((m) => m.chapters.length), [4, 4], 'Cursia completa el mínimo en su estructura');
+      // El docente edita la estructura en «Avanzado» (cambia un título): el contador avanza desde el origen de Cursia.
+      const [ch] = await ds.query(`select id, module_id from public.course_chapters where course_id = $1 order by position limit 1`, [cid]);
+      await structure.updateChapter(cid, ch.module_id, ch.id, OWNER, { title: 'Tema renombrado por el docente', expectedCounter: await counter(cid) });
+      const card = await design.recommend(cid, OWNER, {});
+      eq(card.design.modules.map((m) => m.chapters.length), [3, 3], 'su estructura se respeta (sin capítulos propuestos)');
+      eq(card.design.modules.flatMap((m) => m.chapters).filter((c) => c.proposed).length, 0, 'sin cambios pendientes');
+      const cc = reqCheck(card, 'chapters');
+      eq(cc.severity, 'warning', 'excepción del docente');
+      assert(/Excepción al requisito del documento/.test(cc.title), cc.title);
+      eq(card.verification.blocking, false, 'no bloquea');
+    });
+
     await check('RC7 conflictos que Cursia no resuelve sola: críticos con su causa; la generación no se bloquea en el servidor', async () => {
       const cid = await courseWith('Conflictos', [4, 4, 4, 4], 'El curso tendrá 3 módulos. Se realizarán 3 evaluaciones parciales y 1 evaluación final. Cada capítulo tendrá 2 videos.');
       const card = await design.recommend(cid, OWNER, {});

@@ -1,5 +1,6 @@
 import { buildRequirementsView, currentEntry, loadRequirementsState, RequirementCheck, RequirementsView } from './document-requirements';
 import type { DocumentRequirement } from './requirements';
+import { readStructureOrigin } from '../../course-structure/structure-authority';
 
 /**
  * LOOP 8.6C · Autoridad de los requisitos del documento sobre «Cursia recomienda».
@@ -164,7 +165,12 @@ const merge = (a: { min?: number; max?: number } | undefined, b: { min?: number;
  * Requisitos OBLIGATORIOS → restricciones del distribuidor. Una excepción del docente (prioridad audiovisual o modo de
  * Actividades de Aplicación) quita la restricción de ese campo: manda su decisión y queda registrada como excepción.
  */
-export function constraintsFor(required: DocumentRequirement[], exceptions: StoredExceptions['fields']): DistributorRequirementConstraints | null {
+/**
+ * Piloto (2026-10-07): `structureByTeacher` = el docente armó o cambió la estructura después de que Cursia la armó. Su
+ * estructura manda: Cursia ya no vuelve a proponer capítulos para llegar al mínimo del documento (eso queda como
+ * «Excepción al requisito del documento»), pero sigue sin pasar del máximo.
+ */
+export function constraintsFor(required: DocumentRequirement[], exceptions: StoredExceptions['fields'], opts: { structureByTeacher?: boolean } = {}): DistributorRequirementConstraints | null {
   const c: DistributorRequirementConstraints = { sources: {} };
   for (const r of required) {
     const s = r.scope;
@@ -199,6 +205,10 @@ export function constraintsFor(required: DocumentRequirement[], exceptions: Stor
   // ni pasa del máximo; no restringe ese campo y Verificación muestra el choque en los dos.
   const crossed = (x?: { min?: number; max?: number }) => !!x && x.min !== undefined && x.max !== undefined && x.min > x.max;
   if (crossed(c.chaptersPerModule)) { delete c.chaptersPerModule; delete c.sources.chapters; }
+  if (opts.structureByTeacher && c.chaptersPerModule) {
+    if (c.chaptersPerModule.max === undefined) { delete c.chaptersPerModule; delete c.sources.chapters; }
+    else c.chaptersPerModule = { max: c.chaptersPerModule.max };
+  }
   if (crossed(c.applicationPerModule)) { delete c.applicationPerModule; delete c.sources.applicationPerModule; }
   if (crossed(c.applicationTotal)) { delete c.applicationTotal; delete c.sources.applicationTotal; }
   const any = c.chaptersPerModule || c.videosAllContent || c.videosNone || c.applicationPerModule || c.applicationTotal;
@@ -210,7 +220,16 @@ export async function requirementConstraintsForCourse(
   q: Q, courseId: number, contextDocs: { sha256: string }[], savedPrefs: Record<string, unknown> | null | undefined, decisions?: DecisionOverrides,
 ): Promise<DistributorRequirementConstraints | null> {
   const a = await loadRequirementAuthority(q, courseId, contextDocs);
-  return constraintsFor(a.required, teacherDecisions(a, savedPrefs, decisions));
+  return constraintsFor(a.required, teacherDecisions(a, savedPrefs, decisions), { structureByTeacher: await structureEditedByTeacher(q, courseId) });
+}
+
+/** El docente armó la estructura (sin origen de Cursia) o la cambió después (el contador avanzó desde el origen). */
+export async function structureEditedByTeacher(q: Q, courseId: number): Promise<boolean> {
+  const origin = await readStructureOrigin(q as any, courseId);
+  if (!origin) return true;
+  const res = await q.query(`select structure_version_counter c from public.courses where id = $1`, [courseId]);
+  const rows: any[] = Array.isArray(res) ? res : (res as any).rows;
+  return !rows[0] || Number(rows[0].c) !== origin.counter;
 }
 
 /** Decisiones del docente: implícitas (perfil guardado) + registradas + las de la vista previa, menos las que se devuelven. */
