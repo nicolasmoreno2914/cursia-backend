@@ -1,9 +1,9 @@
-import { Body, Controller, Get, HttpCode, Param, ParseIntPipe, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Param, ParseIntPipe, Post, Put, UseGuards } from '@nestjs/common';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
 import { AcademicContextService } from './academic-context.service';
-import { ExtractAcademicContextDto, ExtractAdvancedDto } from './dto/extract.dto';
+import { ExtractAcademicContextDto, ExtractAdvancedDto, OutcomesDto, ProposalDto } from './dto/extract.dto';
 
 /**
  * Fase 3 — Contexto académico (controller V2: listado en features/dynamic-routes.ts, 404 con la estructura dinámica
@@ -28,6 +28,21 @@ export class AcademicContextController {
   @HttpCode(200)
   extractAdvanced(@Param('courseId', ParseIntPipe) courseId: number, @Body() dto: ExtractAdvancedDto, @CurrentUser() user: AuthUser) {
     return this.service.extractAdvanced(courseId, user.id, dto);
+  }
+
+  // POST /api/v1/courses/:courseId/academic-context/proposal  body { expectedVersion, outcomes[], subjectName?, … }
+  // LOOP 8.2: sin documento, lo que Cursia entendió del pedido (inferred). 409 si el contexto viene de un documento.
+  @Post('proposal')
+  @HttpCode(200)
+  proposal(@Param('courseId', ParseIntPipe) courseId: number, @Body() dto: ProposalDto, @CurrentUser() user: AuthUser) {
+    return this.service.saveProposal(courseId, user.id, dto);
+  }
+
+  // PUT /api/v1/courses/:courseId/academic-context/outcomes  body { expectedVersion, outcomes: [{ id?, text }], accept? }
+  // LOOP 8.2: corregir o confirmar los resultados de aprendizaje («Lo que entendimos»).
+  @Put('outcomes')
+  outcomes(@Param('courseId', ParseIntPipe) courseId: number, @Body() dto: OutcomesDto, @CurrentUser() user: AuthUser) {
+    return this.service.saveOutcomes(courseId, user.id, dto);
   }
 
   // GET /api/v1/courses/:courseId/academic-context/design → sugerencias al perfil, estructura propuesta y vínculos.
