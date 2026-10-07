@@ -17,6 +17,11 @@ async function bootstrap() {
   warnIfNearMissDynamicFlag(logger);
   const app = await NestFactory.create(AppModule, { bodyParser: false });
 
+  // CORS (src/common/cors-options.ts: única definición, con la prueba de navegador check-cors-methods.js).
+  // Piloto: ANTES de los parsers del cuerpo — un cuerpo demasiado grande (413) o mal formado (400) corta la cadena en el
+  // parser y, sin la cabecera CORS, el navegador solo ve «Failed to fetch» en vez del mensaje del servidor.
+  app.enableCors(corsOptions(process.env));
+
   // Body size limit — 9 chapters of libro guía can exceed the 100KB default
   // LOOP 8.6B · la lectura de documentos (base64 en JSON) admite hasta 25 MB de archivos: límite propio SOLO en esas dos
   // rutas (25 MB × 4/3 del base64 + margen); el resto de la API sigue en 10 MB. Va antes del parser general: un cuerpo
@@ -27,9 +32,6 @@ async function bootstrap() {
 
   // Security
   app.use(helmet());
-
-  // CORS (src/common/cors-options.ts: única definición, con la prueba de navegador check-cors-methods.js)
-  app.enableCors(corsOptions(process.env));
 
   // Global validation pipe
   app.useGlobalPipes(
