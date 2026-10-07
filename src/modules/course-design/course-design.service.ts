@@ -9,8 +9,16 @@ import { loadCurrentAcademicContext } from '../academic-context/academic-db';
 import { loadCourseFacts } from '../course-facts/course-facts-db';
 import { isValidTargetHours } from '../study-time/target-hours';
 import { defaultApproachRegistry } from '../pedagogy/builtin-approaches';
-import { clearDesignPins, loadProposedHours, setProposedHours } from './design-pins';
+import { clearDesignPins, loadDesignPins, loadProposedHours, setProposedHours } from './design-pins';
 import { ApproachSuggestion, proposeTargetHours, recommendApproachFromFacts } from './design-recommendation';
+import { verifyDesign } from './design-verification';
+import { returningRows } from '../../common/db/returning-rows';
+import { LINK_CONTAINMENT_MIN, suggestOutcomeLinks } from '../academic-context/context-design';
+import type { AcademicContextV1 } from '../academic-context/academic-context';
+import { tokenSet } from '../coherence/normalize';
+import { proposedChapterUuid } from '../pedagogy/dry-run';
+import { advanceStructureOriginIfUntouched } from '../course-structure/structure-authority';
+import { ConflictException } from '@nestjs/common';
 import { DesignAdjustDto, RecommendDesignDto } from './dto/recommend.dto';
 
 /** Prioridad audiovisual por defecto de V2 (sin preferencia guardada). */
@@ -94,7 +102,8 @@ export class CourseDesignService {
         : facts.targetHours.source === 'document' ? 'document' : 'user';
     let proposal: ReturnType<typeof proposeTargetHours> | null = null;
     if (typeof adjust.targetHours === 'number') {
-      if (adjust.targetHours !== base.targetHours) hoursSource = 'adjusted';
+      // Review L83-2 m1: horas escritas en «Ajustar» son del docente aunque coincidan con las que propuso Cursia.
+      hoursSource = 'adjusted';
       base.targetHours = adjust.targetHours;
     } else if (adjust.targetHours === 'auto' || typeof base.targetHours !== 'number') {
       const probe = await this.pedagogy.dryRunCourse(courseId, ownerId, { profile: normalizePedagogicalProfile({ ...base, targetHours: PROBE_TARGET_HOURS }) });
@@ -107,10 +116,36 @@ export class CourseDesignService {
     const profile = normalizePedagogicalProfile(base);
     const dr = await this.pedagogy.dryRunCourse(courseId, ownerId, { profile });
     const dist = dr.distribution;
-    const chapterOutcomes = await this.chapterOutcomes(courseId);
+    const live = await this.liveChapters(courseId);
+    const chapterOutcomes = new Map(live.map((r) => [r.id, r.outcomeIds]));
+    const linkPlan = academic && dist ? await autoLinkPlan(this.dataSource, courseId, academic.context) : [];
     const savedComparable = saved ? JSON.stringify(normalizePedagogicalProfile(Object.fromEntries(Object.entries(saved.profile as any).filter(([k]) => k !== 'designRules')))) : null;
     const approachDef = profile.primaryApproach ? registry.get(profile.primaryApproach) : null;
     const providers = dist && dist.materialized ? dist.materialized.providers : null;
+    const pinnedChapters = dist ? dist.modules.reduce((n, m) => n + m.chapters.filter((c) => !c.proposed && ((c.videoPinned && c.kind === 'content') || c.applicationPinned)).length, 0) : 0;
+    // LOOP 8.4: la verificación del MISMO diseño (alineación del Coherence Engine incluida).
+    const verification = dist
+      ? verifyDesign({
+        status: dist.status, targetHours: dist.targetHours, estimatedHours: dist.estimatedHours, toleranceHours: dist.toleranceHours, baseHours: dist.baseHours,
+        counts: dist.counts, manifestErrors: dist.materialized ? dist.materialized.manifestErrors : [{ code: 'NOT_MATERIALIZED' }],
+        alignment: dist.materialized ? (dist.materialized as any).alignment : null,
+        approach: profile.primaryApproach ? { id: profile.primaryApproach, label: approachDef ? approachDef.label : profile.primaryApproach } : null,
+        policyKind: dist.policy ? dist.policy.kind : null, audiovisual: prefs.audiovisual || null, pinnedChapters,
+        cost: providers && providers.estimateUsd ? providers.estimateUsd : null,
+        preferences: { emphasis: prefs.emphasis || 'balanced', applicationActivities: prefs.applicationActivities || 'auto' },
+        autoLink: {
+          chapterIds: linkPlan.map((p) => p.chapterId),
+          outcomeIds: [...new Set(linkPlan.flatMap((p) => p.suggested))],
+          preview: linkPlan.map((p) => ({ chapter: p.title, outcomes: p.suggested })),
+        },
+        proposedChapterIds: dist.modules.flatMap((m) => m.chapters.filter((c) => c.proposed).map((c) => proposedChapterUuid(c.id))),
+        uncoveredContents: academic ? uncoveredUnitContents(academic.context, live) : [],
+        requiredEvaluations: academic ? academic.context.evaluation.map((e) => e.instrument).filter(Boolean) : [],
+        pinnedApplicationsOutsideMode: dist.modules.flatMap((m) => m.chapters.filter((c) => c.applicationPinned && c.applicationMinutes
+          && ((prefs.applicationActivities || 'auto') === 'none' || ((prefs.applicationActivities || 'auto') === 'practice_only' && c.kind !== 'practice'))).map((c) => c.id)),
+        uncoveredEvaluations: academic ? uncoveredEvaluations(academic.context, dist, chapterOutcomes) : [],
+      })
+      : null;
     return {
       designVersion: 1,
       providersCalled: 0,
@@ -125,7 +160,8 @@ export class CourseDesignService {
       hours: { target: profile.targetHours ?? null, source: hoursSource, ...(proposal ? { proposedFrom: proposal.base, reason: proposal.reason } : hoursSource === 'proposed' ? { reason: `Cursia propuso ${profile.targetHours} h para este curso.` } : {}) },
       preferences: { emphasis: prefs.emphasis || 'balanced', applicationActivities: prefs.applicationActivities || 'auto', audiovisual: prefs.audiovisual },
       // Review L83 M-1: solo los fijados que el diseño usa (capítulos de contenido que existen).
-      pinnedChapters: dist ? dist.modules.reduce((n, m) => n + m.chapters.filter((c) => c.videoPinned && c.kind === 'content' && !c.proposed).length, 0) : 0,
+      pinnedChapters,
+      verification,
       design: dist
         ? {
           status: dist.status,
@@ -142,7 +178,7 @@ export class CourseDesignService {
           modules: dist.modules.map((m) => ({
             id: m.id, title: m.title, examEnabled: m.examEnabled,
             chapters: m.chapters.map((c) => ({
-              id: c.id, proposed: c.proposed, kind: c.kind, title: c.title, role: c.role, videoEnabled: c.videoEnabled, videoPinned: c.videoPinned,
+              id: c.id, proposed: c.proposed, kind: c.kind, title: c.title, role: c.role, videoEnabled: c.videoEnabled, videoPinned: c.videoPinned, applicationPinned: c.applicationPinned,
               activityEnabled: c.activityEnabled, review: c.review, applicationMinutes: c.applicationMinutes, hours: Math.round((c.targetMinutes / 60) * 10) / 10,
               outcomeIds: chapterOutcomes.get(c.id) || [],
             })),
@@ -173,6 +209,53 @@ export class CourseDesignService {
     return { proposed };
   }
 
+  /**
+   * LOOP 8.4 · «Corregir» automático. Solo lo que no toca ninguna decisión del docente:
+   *   link_outcomes — vincula a sus resultados los capítulos que NO tienen vínculos propios (la misma sugerencia del
+   *   contexto académico; un capítulo con vínculos se conserva siempre). Una transacción, con el contador de la estructura.
+   */
+  async fix(courseId: number, ownerId: string, action: string, expectedCounter: number) {
+    assertDynamicOwnerAllowed(ownerId);
+    await this.loadCourse(courseId, ownerId);
+    if (action !== 'link_outcomes') throw new BadRequestException(`Acción desconocida: ${JSON.stringify(action)}`);
+    const academic = await loadCurrentAcademicContext(this.dataSource, courseId);
+    if (!academic) throw new BadRequestException('NO_ACADEMIC_CONTEXT: el curso no tiene resultados de aprendizaje para vincular.');
+    const qr = this.dataSource.createQueryRunner();
+    try {
+      await qr.connect();
+      await qr.startTransaction();
+      const [course] = await qr.query(`select structure_version_counter c from public.courses where id = $1 for update`, [courseId]);
+      if (Number(course.c) !== expectedCounter) {
+        await qr.rollbackTransaction();
+        throw new ConflictException({ code: 'STRUCTURE_CHANGED', message: 'STRUCTURE_CHANGED: la estructura cambió; vuelve a verla antes de corregir.' });
+      }
+      // La misma lista que mostró la verificación (dentro de la transacción: nada cambió desde el contador).
+      const plan = await autoLinkPlan(qr, courseId, academic.context);
+      let linked = 0;
+      const applied: { chapter: string; outcomes: string[] }[] = [];
+      for (const s of plan) {
+        const res = await qr.query(
+          `update public.course_chapters set outcome_ids = $1::jsonb, updated_at = now() where id = $2 and course_id = $3 and (outcome_ids is null or jsonb_array_length(outcome_ids) = 0) returning id`,
+          [JSON.stringify(s.suggested), s.chapterId, courseId],
+        );
+        if (returningRows(res).length) { linked++; applied.push({ chapter: s.title, outcomes: s.suggested }); }
+      }
+      let counter = expectedCounter;
+      if (linked) {
+        const n = await qr.query(`update public.courses set structure_version_counter = structure_version_counter + 1 where id = $1 returning structure_version_counter c`, [courseId]);
+        counter = Number(returningRows(n)[0].c);
+        await advanceStructureOriginIfUntouched(qr, courseId, expectedCounter, counter);
+      }
+      await qr.commitTransaction();
+      return { action, linkedChapters: linked, applied, structureVersionCounter: counter };
+    } catch (err) {
+      if (qr.isTransactionActive) await qr.rollbackTransaction();
+      throw err;
+    } finally {
+      await qr.release();
+    }
+  }
+
   /** «Liberar»: los valores fijados vuelven a decidirlos Cursia. */
   async clearPins(courseId: number, ownerId: string) {
     assertDynamicOwnerAllowed(ownerId);
@@ -181,11 +264,110 @@ export class CourseDesignService {
     return { released };
   }
 
-  private async chapterOutcomes(courseId: number): Promise<Map<string, string[]>> {
-    const rows: { id: string; outcome_ids: unknown }[] = await this.dataSource.query(
-      `select id, to_jsonb(ch) -> 'outcome_ids' as outcome_ids from public.course_chapters ch where course_id = $1`,
+  private async liveChapters(courseId: number): Promise<LiveChapter[]> {
+    const rows: { id: string; module_id: string; title: string; objective: string | null; description: string | null; outcome_ids: unknown; kind: string | null }[] = await this.dataSource.query(
+      `select id, module_id, title, objective, description, to_jsonb(ch) -> 'outcome_ids' as outcome_ids, to_jsonb(ch) ->> 'chapter_kind' as kind
+         from public.course_chapters ch where course_id = $1`,
       [courseId],
     );
-    return new Map(rows.map((r) => [r.id, Array.isArray(r.outcome_ids) ? (r.outcome_ids as string[]) : []]));
+    return rows.map((r) => ({ id: r.id, moduleId: r.module_id, title: r.title, objective: r.objective, description: r.description, kind: r.kind === 'practice' ? 'practice' : 'content', outcomeIds: Array.isArray(r.outcome_ids) ? (r.outcome_ids as string[]) : [] }));
   }
+}
+
+type Q = { query: (sql: string, params?: unknown[]) => Promise<any> };
+
+/**
+ * LOOP 8.4 (review L84 C1/I1/I2) · Lo que la vinculación automática haría: capítulos de CONTENIDO existentes, sin
+ * vínculos propios, que el docente no desvinculó a propósito, y para los que hay una sugerencia. Lo usan la verificación
+ * (para ofrecer «Corregir» solo si resuelve algo, con vista previa) y la corrección (dentro de su transacción).
+ */
+export async function autoLinkPlan(q: Q, courseId: number, ctx: AcademicContextV1): Promise<{ chapterId: string; title: string; suggested: string[] }[]> {
+  const rows: { id: string; module_id: string; title: string; objective: string | null; description: string | null; outcome_ids: unknown; kind: string | null }[] = await q.query(
+    `select id, module_id, title, objective, description, to_jsonb(ch) -> 'outcome_ids' as outcome_ids, to_jsonb(ch) ->> 'chapter_kind' as kind
+       from public.course_chapters ch where course_id = $1`,
+    [courseId],
+  );
+  const pins = await loadDesignPins(q, courseId);
+  const candidates = rows.filter((r) => r.kind !== 'practice' && !(Array.isArray(r.outcome_ids) && r.outcome_ids.length) && !(pins[r.id] && pins[r.id].noLinks));
+  const byId = new Map(candidates.map((r) => [r.id, r]));
+  return suggestOutcomeLinks(ctx, candidates.map((r) => ({ id: r.id, moduleId: r.module_id, title: r.title, objective: r.objective, description: r.description, outcomeIds: null })))
+    .filter((s) => s.status === 'inferred' && s.suggested.length)
+    .map((s) => ({ chapterId: s.chapterId, title: byId.get(s.chapterId)!.title, suggested: s.suggested }));
+}
+
+interface LiveChapter { id: string; moduleId: string; title: string; objective: string | null; description: string | null; kind: 'content' | 'practice'; outcomeIds: string[] }
+
+/**
+ * Contenidos de las unidades del microcurrículo que ningún capítulo EXISTENTE trabaja (review L84 I5 / L84-2 N2).
+ * Un contenido está cubierto si UN capítulo (título + objetivo + descripción, donde la estructura del documento guarda
+ * los contenidos) comparte al menos la mitad de sus palabras y, si tiene dos o más, al menos dos. Nunca contra el texto
+ * concatenado de un módulo (una palabra suelta como «costo» lo «cubría» todo) ni contra capítulos propuestos.
+ */
+export function uncoveredUnitContents(ctx: AcademicContextV1, chapters: { title: string; objective?: string | null; description?: string | null }[]): string[] {
+  const sets = chapters.map((c) => [...tokenSet([c.title, c.objective || '', c.description || ''].join(' '))]);
+  // Review L84-3 Mn4: «clasificación» ≈ «clasificar», «control» ≈ «controlar»: misma raíz de 7 letras (con 6,
+  // «información» ≈ «informe» daba por cubierto lo que no lo está).
+  const same = (a: string, b: string) => a === b || (a.length >= 7 && b.length >= 7 && a.slice(0, 7) === b.slice(0, 7));
+  const out: string[] = [];
+  for (const u of ctx.units) {
+    for (const c of u.contents) {
+      const ct = tokenSet(c.text);
+      if (!ct.size) continue;
+      const need = ct.size >= 2 ? 2 : 1;
+      const hit = sets.some((s) => {
+        let inter = 0;
+        for (const x of ct) if (s.some((y) => same(x, y))) inter++;
+        return inter >= need && inter / ct.size >= LINK_CONTAINMENT_MIN;
+      });
+      if (!hit) out.push(c.text);
+    }
+  }
+  return out;
+}
+
+/**
+ * Clasificación de un instrumento del microcurrículo (review L84-3 Mn6 / L84-4): lo que es desempeño sin duda (práctico,
+ * proyecto, taller…) pide una Actividad de Aplicación aunque diga «examen» («Examen práctico»); si no, lo que es prueba
+ * (parcial, examen, quiz…) pide una evaluación («Examen de casos clínicos»); el resto de desempeño (caso, informe…), una
+ * Actividad.
+ */
+const STRONG_PERFORMANCE_RE = /pr[aá]ctic|proyect|taller|laborator|portafolio|exposici|simulaci|desempe[nñ]o|demostraci/i;
+const EXAM_INSTRUMENT_RE = /parcial|examen|prueba|quiz|test\b|cuestionario|evaluaci[oó]n escrita/i;
+const PERFORMANCE_INSTRUMENT_RE = /caso|informe|trabajo|ejercicio|estudio de/i;
+export function instrumentKind(instrument: string): 'performance' | 'exam' {
+  if (STRONG_PERFORMANCE_RE.test(instrument)) return 'performance';
+  if (EXAM_INSTRUMENT_RE.test(instrument)) return 'exam';
+  return PERFORMANCE_INSTRUMENT_RE.test(instrument) ? 'performance' : 'exam';
+}
+
+/**
+ * Review L84-2 N6 · Lo que el microcurrículo evalúa y el diseño no: por cada instrumento del documento, sus resultados
+ * deben tener evidencia del mismo tipo — desempeño (proyecto, taller, caso…) → una Actividad de Aplicación en un capítulo
+ * que trabaje ese resultado; prueba (parcial, examen…) → la evaluación de un módulo que lo trabaje o la evaluación final.
+ * Un capítulo propuesto o de práctica trabaja los resultados de su módulo.
+ */
+export function uncoveredEvaluations(
+  ctx: AcademicContextV1,
+  dist: { counts: { evaluations: number }; modules: { id: string; examEnabled: boolean; chapters: { id: string; proposed: boolean; kind: string; applicationMinutes?: number | null }[] }[] },
+  chapterOutcomes: Map<string, string[]>,
+): { instrument: string; outcomes: string[]; kind: 'performance' | 'exam'; chapterIds: string[] }[] {
+  const moduleOuts = new Map(dist.modules.map((m) => [m.id, new Set(m.chapters.filter((c) => !c.proposed && c.kind !== 'practice').flatMap((c) => chapterOutcomes.get(c.id) || []))]));
+  const outsOf = (m: { id: string }, c: { id: string; proposed: boolean; kind: string }) => (c.proposed || c.kind === 'practice' ? moduleOuts.get(m.id)! : new Set(chapterOutcomes.get(c.id) || []));
+  const finalExam = dist.counts.evaluations > dist.modules.filter((m) => m.examEnabled).length;
+  const hits = (set: Set<string>, outs: string[]) => !outs.length || outs.some((o) => set.has(o));
+  const out: { instrument: string; outcomes: string[]; kind: 'performance' | 'exam'; chapterIds: string[] }[] = [];
+  // Capítulos EXISTENTES de contenido que trabajan alguno de esos resultados (donde se activa la Actividad).
+  const workingOn = (outs: string[]) => dist.modules.flatMap((m) => m.chapters.filter((c) => !c.proposed && c.kind !== 'practice' && outs.some((o) => (chapterOutcomes.get(c.id) || []).includes(o))).map((c) => c.id));
+  for (const ev of ctx.evaluation) {
+    if (!ev.instrument) continue;
+    const outs = ev.outcomeIds || [];
+    if (instrumentKind(ev.instrument) === 'performance') {
+      const ok = dist.modules.some((m) => m.chapters.some((c) => (c.applicationMinutes || 0) > 0 && hits(outsOf(m, c), outs)));
+      if (!ok) out.push({ instrument: ev.instrument, outcomes: outs, kind: 'performance', chapterIds: workingOn(outs) });
+    } else {
+      const ok = finalExam || dist.modules.some((m) => m.examEnabled && hits(moduleOuts.get(m.id)!, outs));
+      if (!ok) out.push({ instrument: ev.instrument, outcomes: outs, kind: 'exam', chapterIds: [] });
+    }
+  }
+  return out;
 }

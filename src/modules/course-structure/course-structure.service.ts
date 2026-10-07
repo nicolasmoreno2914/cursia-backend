@@ -2,7 +2,7 @@ import { PinOp, loadDesignPins, pinsMetadataExpr } from '../course-design/design
 import { Injectable, BadRequestException, NotFoundException, ConflictException, Logger, OnModuleInit, ServiceUnavailableException } from '@nestjs/common';
 import { lockPedagogyInput } from '../pedagogy/pedagogical-blueprint';
 import { loadCurrentPedagogicalProfile, parseStoredPedagogicalProfile } from '../pedagogy/pedagogy-db';
-import { runPedagogyDryRun } from '../pedagogy/dry-run';
+import { moduleOutcomeIds, runPedagogyDryRun } from '../pedagogy/dry-run';
 import { ApplyDistributionDto } from './dto/apply-distribution.dto';
 import { profileApplicationContext, profileTargetHours } from '../pedagogy/pedagogy-profile';
 import { academicBlueprintContext, loadCurrentAcademicContext, parseStoredAcademicContext } from '../academic-context/academic-db';
@@ -335,10 +335,12 @@ export class CourseStructureService implements OnModuleInit {
         for (const [ci, c] of m.chapters.entries()) {
           if (c.proposed) {
             const practice = c.kind === 'practice';
+            // Review L84-2 N4: la profundización hereda los resultados de su módulo (lo mismo que mostró la tarjeta).
+            const inherited = practice ? [] : moduleOutcomeIds(chapters, m.id, academic ? academicOutcomeIds(academic.context) : null);
             await queryRunner.query(
-              `insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled, activity_enabled, application_minutes${practice ? ', chapter_kind' : ''})
-               values ($1, $2, $3, $4, $5, $6, $7, $8${practice ? ", 'practice'" : ''})`,
-              [courseId, m.id, ci, c.title, c.objective, practice ? false : c.videoEnabled, c.activityEnabled, c.applicationMinutes],
+              `insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled, activity_enabled, application_minutes${practice ? ', chapter_kind' : ''}${inherited.length ? ', outcome_ids' : ''})
+               values ($1, $2, $3, $4, $5, $6, $7, $8${practice ? ", 'practice'" : ''}${inherited.length ? ', $9::jsonb' : ''})`,
+              [courseId, m.id, ci, c.title, c.objective, practice ? false : c.videoEnabled, c.activityEnabled, c.applicationMinutes, ...(inherited.length ? [JSON.stringify(inherited)] : [])],
             );
             added++;
           } else {
@@ -1356,6 +1358,13 @@ export class CourseStructureService implements OnModuleInit {
       // Review L83-2 m5: un capítulo de práctica nunca lleva video: no se fija nada (y se libera lo que hubiera).
       else if (pinRequested) pinOps.push({ field: 'video', value: dto.videoEnabled as boolean, unlessPractice: dto.kind !== 'content' });
       else if (dto.videoEnabled !== undefined) pinOps.push({ field: 'video', value: null });
+      // LOOP 8.4 (review L84 I2 / L84-2 N5): QUITAR todos los vínculos a mano es una decisión del docente (la vinculación
+      // automática no lo vuelve a vincular); vincular algo la borra.
+      if (outcomeIds !== undefined) pinOps.push(outcomeIds === null ? { field: 'noLinks', value: true, onlyIfLinked: true } : { field: 'noLinks', value: null });
+      // Review L84-4: Actividad de Aplicación cambiada a mano (V2) → fijada (0 = sin actividad); sin fijar, el último valor
+      // elegido por alguien ya no está fijado (igual que el video).
+      const appPinned = dto.pinApplication === true && appMinutes !== undefined;
+      if (appMinutes !== undefined) pinOps.push(appPinned ? { field: 'application', value: appMinutes ?? 0 } : { field: 'application', value: null });
       const found = await this.updateRowAndBump(
         queryRunner, 'course_chapters', sets, params, i, { id: chapterId, module_id: moduleId, course_id: courseId }, courseId,
         guardPracticeVideo ? `coalesce(to_jsonb(t) ->> 'chapter_kind', 'content') <> 'practice'` : undefined,
@@ -1379,6 +1388,7 @@ export class CourseStructureService implements OnModuleInit {
       return {
         structureVersionCounter: newCounter,
         ...(pinRequested && (dto.kind === 'content' || found.kind !== 'practice') ? { videoPinned: true } : {}),
+        ...(appPinned ? { applicationPinned: true } : {}),
         ...(nt ? { title: nt.title, titleNormalized: nt.changed } : {}),
         ...(description !== undefined ? { description } : {}),
         ...(outcomeIds !== undefined ? { outcomeIds } : {}),
@@ -1740,17 +1750,24 @@ export class CourseStructureService implements OnModuleInit {
     p.push(courseId);
     let pinSet = '';
     let kindSel = '';
+    let pinCte = '';
     if (pins && pins.ops.length) {
       const chIdx = i++;
       p.push(pins.chapterId);
-      pinSet = `, metadata = ${pinsMetadataExpr('co.metadata', `$${chIdx}`, pins.ops)}`;
-      kindSel = `, (select coalesce(to_jsonb(kx) ->> 'chapter_kind', 'content') from public.course_chapters kx where kx.id::text = $${chIdx}::text) as kind`;
+      // Review L84-3 Mn3: el estado ANTERIOR del capítulo (tipo y si tenía vínculos) se lee una vez, por clave primaria.
+      pinCte = `pk as (
+         select coalesce(to_jsonb(kx) ->> 'chapter_kind', 'content') as kind,
+                (case when jsonb_typeof(to_jsonb(kx) -> 'outcome_ids') = 'array' then jsonb_array_length(to_jsonb(kx) -> 'outcome_ids') else 0 end) > 0 as linked
+           from public.course_chapters kx where kx.id = $${chIdx}::uuid
+       ),`;
+      pinSet = `, metadata = ${pinsMetadataExpr('co.metadata', `$${chIdx}`, pins.ops, { isPractice: `coalesce((select kind from pk), 'content') = 'practice'`, wasLinked: `coalesce((select linked from pk), false)` })}`;
+      kindSel = `, (select kind from pk) as kind`;
     }
     const target = sets.length > 0
       ? `update public.${table} t set ${sets.join(', ')}, updated_at = now() where ${conds.join(' and ')} returning t.id`
       : `select t.id from public.${table} t where ${conds.join(' and ')}`;
     const rows = await queryRunner.query(
-      `with u as (${target}),
+      `with ${pinCte}u as (${target}),
        c as (
          update public.courses co
             set structure_version_counter = co.structure_version_counter + 1${pinSet}

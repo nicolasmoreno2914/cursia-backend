@@ -1,3 +1,5 @@
+import { academicOutcomeIds } from '../academic-context/academic-context';
+import type { AcademicContextV1 } from '../academic-context/academic-context';
 import { ALIGNMENT_RULESET, ALIGNMENT_VERSION, AlignmentReport, AlignmentUnavailable, buildAlignmentReport } from '../coherence/alignment';
 import {
   ActivityEngine,
@@ -391,9 +393,25 @@ export function distributionProposalSha256(dist: DistributionResult): string {
 }
 
 /** UUID v4 determinista para un capítulo propuesto (solo en el dry-run). */
-function proposedChapterUuid(id: string): string {
+export function proposedChapterUuid(id: string): string {
   const h = createHash('sha256').update(id, 'utf8').digest('hex');
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
+
+/**
+ * LOOP 8.4 (review L84-2 N4) · Un capítulo de CONTENIDO que propone el diseño (profundización) trabaja los resultados de su
+ * módulo: hereda la unión de los vínculos de sus capítulos de contenido. Así no aparece «sin resultado» después de aplicar
+ * ni se le pide al docente algo que el sistema puede decidir. Las prácticas no heredan (como en la vinculación automática).
+ */
+export function moduleOutcomeIds(chapters: { module_id: string; outcome_ids?: unknown; chapter_kind?: unknown }[], moduleId: string, known?: ReadonlySet<string> | null): string[] {
+  const set = new Set<string>();
+  for (const c of chapters) {
+    if (c.module_id !== moduleId || c.chapter_kind === 'practice') continue;
+    const ids = typeof c.outcome_ids === 'string' ? JSON.parse(c.outcome_ids) : c.outcome_ids;
+    // Review L84-3 Mn2: un vínculo a un resultado que el contexto vigente ya no define no se hereda.
+    if (Array.isArray(ids)) for (const x of ids) if (typeof x === 'string' && (!known || known.has(x))) set.add(x);
+  }
+  return [...set].sort();
 }
 
 export function materializeDistribution(base: BlueprintSnapshotV2, dist: DistributionResult, applicationContext: unknown = null): BlueprintSnapshotV2 {
@@ -401,6 +419,8 @@ export function materializeDistribution(base: BlueprintSnapshotV2, dist: Distrib
   // Fase 2: el contexto del perfil que congelaría el lock (entra solo si la propuesta tiene Actividades de Aplicación).
   if (applicationContext !== null && applicationContext !== undefined) rows.course = { ...rows.course, applicationContext };
   const byId = new Map(rows.chapters.map((c) => [c.id, c]));
+  const ctx = rows.course && (rows.course as { academicContext?: unknown }).academicContext;
+  const knownOutcomes = ctx && typeof ctx === 'object' ? academicOutcomeIds(ctx as AcademicContextV1) : null;
   const chapters: RawChapterRowV2[] = [];
   for (const m of dist.modules) {
     m.chapters.forEach((c, ci) => {
@@ -411,10 +431,12 @@ export function materializeDistribution(base: BlueprintSnapshotV2, dist: Distrib
         chapters.push({ ...existing, position: ci, application_minutes: c.applicationMinutes ?? null, ...(c.kind === 'content' ? { video_enabled: c.videoEnabled } : {}) });
         return;
       }
+      const inherited = c.kind === 'practice' ? [] : moduleOutcomeIds(rows.chapters, m.id, knownOutcomes);
       chapters.push({
         id: proposedChapterUuid(c.id), module_id: m.id, position: ci, title: c.title, objective: c.objective, description: null,
         video_enabled: c.videoEnabled, activity_enabled: c.activityEnabled, ...(c.kind === 'practice' ? { chapter_kind: 'practice' } : {}),
         application_minutes: c.applicationMinutes ?? null,
+        ...(inherited.length ? { outcome_ids: inherited } : {}),
       });
     });
   }

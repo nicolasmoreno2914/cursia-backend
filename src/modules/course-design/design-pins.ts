@@ -7,7 +7,7 @@
 type Q = { query(sql: string, params?: any[]): Promise<any> };
 
 export const DESIGN_PINS_KEY = 'designPins';
-export type DesignPinsMap = Record<string, { video?: boolean }>;
+export type DesignPinsMap = Record<string, { video?: boolean; application?: number; noLinks?: boolean }>;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function parseDesignPins(v: unknown): DesignPinsMap {
@@ -16,7 +16,12 @@ export function parseDesignPins(v: unknown): DesignPinsMap {
   for (const [id, pin] of Object.entries(v as Record<string, unknown>)) {
     if (!UUID_RE.test(id) || !pin || typeof pin !== 'object') continue;
     const video = (pin as { video?: unknown }).video;
-    if (typeof video === 'boolean') out[id] = { video };
+    const noLinks = (pin as { noLinks?: unknown }).noLinks === true;
+    const app = (pin as { application?: unknown }).application;
+    const application = typeof app === 'number' && Number.isInteger(app) && app >= 0 && app <= 240 ? app : undefined;
+    if (typeof video === 'boolean' || noLinks || application !== undefined) {
+      out[id] = { ...(typeof video === 'boolean' ? { video } : {}), ...(application !== undefined ? { application } : {}), ...(noLinks ? { noLinks: true } : {}) };
+    }
   }
   return out;
 }
@@ -28,27 +33,44 @@ export async function loadDesignPins(q: Q, courseId: number): Promise<DesignPins
 }
 
 /**
- * Un cambio sobre el valor fijado de UN capítulo: `value` null lo libera. `unlessPractice`: si el capítulo es de práctica
- * (que nunca lleva video) se libera en vez de fijarse.
+ * Un cambio sobre lo fijado de UN capítulo: `value` null lo libera.
+ *  - `unlessPractice`: si el capítulo es de práctica (que nunca lleva video) se libera en vez de fijarse.
+ *  - `onlyIfLinked`: solo si el capítulo TENÍA vínculos antes de este cambio (review L84-2 N5: «sin vínculos» es una
+ *    decisión del docente solo cuando los quita; mandar null a un capítulo que ya no tenía no decide nada).
+ * Las condiciones leen la fila tal como estaba ANTES de la sentencia (las CTE de Postgres ven la misma instantánea).
  */
-export interface PinOp { field: 'video'; value: boolean | null; unlessPractice?: boolean }
+export interface PinOp { field: 'video' | 'noLinks' | 'application'; value: boolean | number | null; unlessPractice?: boolean; onlyIfLinked?: boolean }
 
 /**
  * Expresión SQL (jsonb) que aplica `ops` sobre la columna `col` de courses.metadata, con el id del capítulo en el
  * parámetro `chapterParam` (p. ej. '$7'). Permite plegar el cambio en el MISMO UPDATE que sube el contador de la
  * estructura (sin idas y vueltas extra). Los nombres de campo y los booleanos son constantes, nunca datos del cliente.
  */
-export function pinsMetadataExpr(col: string, chapterParam: string, ops: PinOp[]): string {
+/** Literal SQL de un valor fijado: booleano o minutos enteros (validados antes; nunca texto del cliente). */
+function pinLiteral(v: boolean | number): string {
+  if (typeof v === 'number') {
+    if (!Number.isInteger(v) || v < 0 || v > 240) throw new Error(`valor fijado inválido: ${v}`);
+    return `${v}`;
+  }
+  return v ? 'true' : 'false';
+}
+
+export function pinsMetadataExpr(col: string, chapterParam: string, ops: PinOp[], cond?: { isPractice: string; wasLinked: string }): string {
   const ch = `${chapterParam}::text`;
+  // Review L84-3 Mn3: por la clave primaria (uuid), y una sola vez si el llamador ya calculó las condiciones (CTE).
+  const isPractice = cond ? cond.isPractice : `exists (select 1 from public.course_chapters px where px.id = ${chapterParam}::uuid and coalesce(to_jsonb(px) ->> 'chapter_kind', 'content') = 'practice')`;
+  const wasLinked = cond ? cond.wasLinked : `exists (select 1 from public.course_chapters px where px.id = ${chapterParam}::uuid and (case when jsonb_typeof(to_jsonb(px) -> 'outcome_ids') = 'array' then jsonb_array_length(to_jsonb(px) -> 'outcome_ids') else 0 end) > 0)`;
   let e = `coalesce(${col}, '{}'::jsonb)`;
   for (const op of ops) {
     const clear = `(${e} #- array['${DESIGN_PINS_KEY}', ${ch}, '${op.field}'])`;
     if (op.value === null) { e = clear; continue; }
     const set = `jsonb_set(${e}, array['${DESIGN_PINS_KEY}'], coalesce(${e} -> '${DESIGN_PINS_KEY}', '{}'::jsonb) || ` +
-      `jsonb_build_object(${ch}, coalesce(${e} -> '${DESIGN_PINS_KEY}' -> ${ch}, '{}'::jsonb) || jsonb_build_object('${op.field}', ${op.value ? 'true' : 'false'})), true)`;
-    e = op.unlessPractice
-      ? `(case when exists (select 1 from public.course_chapters px where px.id::text = ${ch} and coalesce(to_jsonb(px) ->> 'chapter_kind', 'content') = 'practice') then ${clear} else ${set} end)`
-      : set;
+      `jsonb_build_object(${ch}, coalesce(${e} -> '${DESIGN_PINS_KEY}' -> ${ch}, '{}'::jsonb) || jsonb_build_object('${op.field}', ${pinLiteral(op.value)})), true)`;
+    if (op.unlessPractice) {
+      e = `(case when ${isPractice} then ${clear} else ${set} end)`;
+    } else if (op.onlyIfLinked) {
+      e = `(case when ${wasLinked} then ${set} else ${e} end)`;
+    } else e = set;
   }
   return e;
 }
@@ -61,8 +83,22 @@ export async function setVideoPin(q: Q, courseId: number, chapterId: string, vid
 /** «Liberar»: todos los valores fijados vuelven a decidirlos Cursia. Devuelve cuántos había. */
 export async function clearDesignPins(q: Q, courseId: number): Promise<number> {
   const before = await loadDesignPins(q, courseId);
-  await q.query(`update public.courses set metadata = coalesce(metadata, '{}'::jsonb) - '${DESIGN_PINS_KEY}' where id = $1`, [courseId]);
-  return Object.keys(before).length;
+  const videoIds = Object.keys(before).filter((id) => typeof before[id].video === 'boolean');
+  const appIds = Object.keys(before).filter((id) => typeof before[id].application === 'number');
+  // Review L83-2 m5: se informan solo los que el diseño usaba (capítulos de contenido que existen); los huérfanos se
+  // limpian igual.
+  // Capítulos que existen con algo fijado que el diseño usa (video en contenido; Actividad de Aplicación en cualquiera).
+  const live: { n: number }[] = videoIds.length || appIds.length
+    ? await q.query(`select count(*)::int n from public.course_chapters ch where course_id = $1 and ((id = any($2::uuid[]) and coalesce(to_jsonb(ch) ->> 'chapter_kind', 'content') <> 'practice') or id = any($3::uuid[]))`, [courseId, videoIds, appIds])
+    : [{ n: 0 }];
+  // «Liberar» devuelve el VIDEO a Cursia; las decisiones de vínculos del docente se conservan (solo de capítulos que
+  // existen: review L84-2 N5).
+  const noLinkIds = Object.keys(before).filter((id) => before[id].noLinks);
+  const alive: { id: string }[] = noLinkIds.length ? await q.query(`select id::text id from public.course_chapters where course_id = $1 and id = any($2::uuid[])`, [courseId, noLinkIds]) : [];
+  const keep: DesignPinsMap = {};
+  for (const r of alive) keep[r.id] = { noLinks: true };
+  await q.query(`update public.courses set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), $2::text[], $3::jsonb, true) where id = $1`, [courseId, [DESIGN_PINS_KEY], JSON.stringify(keep)]);
+  return live[0] ? Number(live[0].n) : 0;
 }
 
 /**

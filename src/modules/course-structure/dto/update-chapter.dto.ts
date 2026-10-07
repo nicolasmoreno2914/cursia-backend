@@ -16,4 +16,12 @@ export class UpdateChapterDto extends PartialType(
   @IsOptional()
   @IsBoolean()
   pinVideo?: boolean;
+
+  /**
+   * Review L84-4: el docente cambió la Actividad de Aplicación A MANO (editor V2): queda fijada y el diseño de Cursia la
+   * respeta. Solo con applicationMinutes.
+   */
+  @IsOptional()
+  @IsBoolean()
+  pinApplication?: boolean;
 }

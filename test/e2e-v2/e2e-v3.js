@@ -1960,6 +1960,44 @@ function reservationBookkeeping(ev) {
       results.courses.E15 = { courseId };
     }, { fatal: false });
 
+    // ═══ LOOP 8.4 · E16 — verificación del diseño por HTTP real: hallazgos con «Corregir»; el automático vincula solo los
+    // capítulos sin vínculos y la verificación queda limpia. USD 0.
+    if (RUN_E5) await step('v3-E16-verificacion', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: '[E2E E16] Contabilidad de Costos' });
+      const courseId = Number(cr.data.id);
+      const m = await api('POST', `/courses/${courseId}/modules`, { title: 'Costos', expectedCounter: 0 });
+      ok(m.status === 201, 'E16: módulo', { s: m.status, e: m.error });
+      let st = await readStructure(courseId);
+      const mod = st.modules[0];
+      const first = mod.chapters[0];
+      let r = await api('PATCH', `/courses/${courseId}/modules/${mod.id}/chapters/${first.id}`, { title: 'Elementos del costo y su clasificación', expectedCounter: st.structureVersionCounter });
+      for (const title of ['Costo de materiales y mano de obra', 'Sistema de costeo por órdenes de producción']) {
+        st = await readStructure(courseId);
+        r = await api('POST', `/courses/${courseId}/modules/${mod.id}/chapters`, { title, objective: title, expectedCounter: st.structureVersionCounter });
+        ok(r.status === 201, `E16: capítulo «${title}»`, { s: r.status, e: r.error });
+      }
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo.docx', dataBase64: (await AF.fixture('consistent', 'docx')).toString('base64') }] });
+      await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 });
+      const v1 = await api('POST', `/courses/${courseId}/design/recommendation`, {});
+      const ver = v1.data && v1.data.verification;
+      ok(v1.status === 200 && ver && ver.verificationVersion === 1 && Array.isArray(ver.checks), 'E16: la recomendación trae la verificación', { s: v1.status });
+      const areas = new Set(ver.checks.map((c) => c.area));
+      ok(['hours', 'outcomes', 'structure', 'activities', 'practice', 'audiovisual', 'evaluations', 'pedagogy', 'cost'].every((a) => areas.has(a)), 'E16: verifica horas, resultados, estructura, actividades, práctica, audiovisual, evaluaciones, pedagogía y costo', [...areas]);
+      const auto = ver.checks.find((c) => c.fix && c.fix.kind === 'auto');
+      ok(auto && auto.fix.action === 'link_outcomes', 'E16: capítulos sin vínculos → «Corregir» automático', ver.checks.filter((c) => c.severity !== 'ok').map((c) => c.title));
+      st = await readStructure(courseId);
+      const stale = await api('POST', `/courses/${courseId}/design/fix`, { action: 'link_outcomes', expectedCounter: st.structureVersionCounter + 3 });
+      ok(stale.status === 409, 'E16: contador viejo → 409', { s: stale.status });
+      const badA = await api('POST', `/courses/${courseId}/design/fix`, { action: 'borrar', expectedCounter: st.structureVersionCounter });
+      ok(badA.status === 400, 'E16: acción desconocida → 400 (DTO)', { s: badA.status });
+      const fx = await api('POST', `/courses/${courseId}/design/fix`, { action: 'link_outcomes', expectedCounter: st.structureVersionCounter });
+      ok(fx.status === 200 && fx.data.linkedChapters >= 1 && fx.data.structureVersionCounter === st.structureVersionCounter + 1, 'E16: corregido (capítulos vinculados, contador +1)', { s: fx.status, d: fx.data });
+      const v2 = await api('POST', `/courses/${courseId}/design/recommendation`, {});
+      ok(!v2.data.verification.checks.some((c) => c.fix && c.fix.kind === 'auto'), 'E16: después de corregir no queda nada automático pendiente', v2.data.verification.checks.filter((c) => c.severity !== 'ok').map((c) => c.title));
+      results.courses.E16 = { courseId };
+    }, { fatal: false });
+
     // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══
     const MOODLE_JOBS = ONLY_REAL_PROVIDERS ? [] : [['E1', 'E1'], ['E1-repack', 'E1repack'], ['E2', 'E2'], ['E3', 'E3']];
     // EV6 H5P v2: E5 entra al mismo restore + inspección (con los «Repaso» del paquete).

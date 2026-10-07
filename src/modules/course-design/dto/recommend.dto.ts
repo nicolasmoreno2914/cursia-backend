@@ -1,5 +1,5 @@
 import { Type } from 'class-transformer';
-import { IsIn, IsNumber, IsOptional, IsString, MaxLength, ValidateNested } from 'class-validator';
+import { IsIn, IsInt, IsNumber, IsOptional, IsString, MaxLength, Min, ValidateNested } from 'class-validator';
 
 /** LOOP 8.3 · «Ajustar»: cambios sobre el diseño que se recalcula (nada se guarda). Ausente = lo que ya decidió el curso. */
 export class DesignAdjustDto {
@@ -34,4 +34,14 @@ export class HoursOriginDto {
   @IsOptional()
   @IsNumber()
   proposed?: number | null;
+}
+
+/** LOOP 8.4 · «Corregir» automático de la verificación. */
+export class DesignFixDto {
+  @IsIn(['link_outcomes'])
+  action: 'link_outcomes';
+
+  @IsInt()
+  @Min(0)
+  expectedCounter: number;
 }
