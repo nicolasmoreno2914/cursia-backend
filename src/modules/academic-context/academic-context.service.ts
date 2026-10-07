@@ -192,7 +192,7 @@ export class AcademicContextService {
       ctx = build(current ? current.context : null);
     } catch (err) {
       if (err instanceof ProposedContextError) {
-        if (err.code === 'DOCUMENT_CONTEXT') throw new ConflictException(err.message);
+        if (err.code === 'DOCUMENT_CONTEXT' || err.code === 'USER_CONTEXT') throw new ConflictException(err.message);
         throw new BadRequestException(err.message);
       }
       throw err;

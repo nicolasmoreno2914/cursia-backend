@@ -92,7 +92,12 @@ const BRIEF = { briefVersion: 1, fields: { obj: 'Quiero un curso de Excel básic
   await check('PC2 la propuesta nunca reemplaza un contexto de documento', () => {
     throwsRe(() => A.buildProposedContext(doc, PROPOSAL), /DOCUMENT_CONTEXT/, 'documento manda');
     const prev = A.buildProposedContext(null, PROPOSAL);
-    eq(A.buildProposedContext(prev, { outcomes: ['Diseña un tablero de control'] }).outcomes.length, 1, 'una propuesta nueva reemplaza la anterior');
+    eq(A.buildProposedContext(prev, { outcomes: ['Diseña un tablero de control'] }).outcomes.length, 1, 'una propuesta nueva reemplaza la anterior (sin confirmar)');
+    // Review L82 I1: lo que el docente escribió o confirmó nunca lo reemplaza una propuesta.
+    throwsRe(() => A.buildProposedContext(A.rewriteOutcomes(null, [{ text: 'Aplica fórmulas básicas' }]), PROPOSAL), /USER_CONTEXT/, 'resultados escritos por el docente');
+    const confirmed = A.rewriteOutcomes(prev, prev.outcomes.map((o) => ({ id: o.id, text: o.text })), true);
+    throwsRe(() => A.buildProposedContext(confirmed, PROPOSAL), /USER_CONTEXT/, 'propuesta confirmada');
+    eq([A.isReplaceableByProposal(null), A.isReplaceableByProposal(prev), A.isReplaceableByProposal(confirmed), A.isReplaceableByProposal(doc)], [true, true, false, false], 'reemplazable solo vacío o propuesta sin confirmar');
   });
 
   await check('PC3 editar resultados: ids y orígenes conservados, editados «tuyos», vínculos limpios, errores claros', () => {
@@ -124,6 +129,10 @@ const BRIEF = { briefVersion: 1, fields: { obj: 'Quiero un curso de Excel básic
     assert(A.validateAcademicContext(ok).canProceed, 'válido');
     const same = A.rewriteOutcomes(doc, doc.outcomes.map((o) => ({ id: o.id, text: o.text })), true);
     eq(same.outcomes, doc.outcomes, 'los del documento no cambian');
+    // Review L82 I2: resultados INFERIDOS por el extractor (objetivos del documento) conservan su cita al confirmar.
+    const docInf = JSON.parse(JSON.stringify(doc));
+    docInf.outcomes = docInf.outcomes.map((o) => ({ ...o, status: 'inferred', basis: 'objetivo del documento usado como resultado' }));
+    eq(A.rewriteOutcomes(docInf, docInf.outcomes.map((o) => ({ id: o.id, text: o.text })), true).outcomes, docInf.outcomes, 'inferidos del documento: intactos');
   });
 
   await check('PC5 «Lo que sabemos»: origen por resultado; sin documento no hay «documento» ni conflictos contra él', () => {
@@ -143,6 +152,10 @@ const BRIEF = { briefVersion: 1, fields: { obj: 'Quiero un curso de Excel básic
     eq([f2.document.proposed, f2.outcomes.source, f2.outcomes.value.map((o) => o.origin)], [false, 'user', ['user', 'user']], 'confirmados = tuyos');
     const f3 = CF.resolveCourseFacts({ courseTitle: null, institutionId: null, brief: BRIEF, academic: { version: 1, context: doc }, pedagogy: null, derivation: null, suggested: null });
     eq([f3.document.present, f3.document.proposed, f3.outcomes.source, f3.outcomes.value.every((o) => o.origin === 'document')], [true, false, 'document', true], 'con documento, como en 8.1');
+    const docInf = JSON.parse(JSON.stringify(doc));
+    docInf.outcomes = docInf.outcomes.map((o) => ({ ...o, status: 'inferred', basis: 'objetivo del documento usado como resultado' }));
+    const f4 = CF.resolveCourseFacts({ courseTitle: null, institutionId: null, brief: BRIEF, academic: { version: 1, context: docInf }, pedagogy: null, derivation: null, suggested: null });
+    eq([f4.document.proposed, f4.outcomes.source, f4.outcomes.value.every((o) => o.origin === 'document')], [false, 'document', true], 'review L82 I2: inferidos del documento siguen siendo del documento');
   });
 
   if (PURE_ONLY) console.log('\n⚠️  --pure-only: se SALTÓ la parte DB (no cuenta como probada).');
@@ -280,6 +293,7 @@ async function dbChecks(doc) {
       const again = await acxP.saveOutcomes(cid, OWNER, { expectedVersion: 3, outcomes: f2.outcomes.value.map((o) => ({ id: o.id, text: o.text })), accept: true });
       eq(again.created, false, 'confirmar dos veces no crea versiones');
       await rejectsRe(acxP.saveOutcomes(cid, OWNER, { expectedVersion: 1, outcomes: [{ text: 'x y' }] }), /ACADEMIC_CHANGED/, 'pestaña vieja', 409);
+      await rejectsRe(acxP.saveProposal(cid, OWNER, { expectedVersion: 3, ...PROPOSAL }), /USER_CONTEXT/, 'review L82 I1: una propuesta no pisa lo confirmado', 409);
     });
 
     await check('PC9 subir después un documento reemplaza la propuesta (el documento manda)', async () => {

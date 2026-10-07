@@ -19,7 +19,7 @@ export const PROPOSAL_BASIS = 'Propuesto por Cursia a partir de tu pedido';
 export const PROPOSAL_LIMITS = Object.freeze({ outcomes: 12, competencies: 10, priorKnowledge: 8 });
 
 export class ProposedContextError extends Error {
-  constructor(readonly code: 'DOCUMENT_CONTEXT' | 'NO_OUTCOMES' | 'DUPLICATE_OUTCOME_ID' | 'TOO_MANY_OUTCOMES' | 'EMPTY_OUTCOME', message: string) {
+  constructor(readonly code: 'DOCUMENT_CONTEXT' | 'USER_CONTEXT' | 'NO_OUTCOMES' | 'DUPLICATE_OUTCOME_ID' | 'TOO_MANY_OUTCOMES' | 'EMPTY_OUTCOME', message: string) {
     super(`${code}: ${message}`);
   }
 }
@@ -57,9 +57,30 @@ export function hasDocuments(ctx: AcademicContextV1 | null | undefined): boolean
   return !!ctx && Array.isArray(ctx.documents) && ctx.documents.length > 0;
 }
 
-/** Contexto académico propuesto por Cursia (sin documentos). Lanza DOCUMENT_CONTEXT si el vigente viene de un documento. */
+/** ¿Un dato lo propuso Cursia desde el pedido (y nadie lo confirmó)? */
+export function isProposed(x: { status: string; basis?: string } | null | undefined): boolean {
+  return !!x && x.status === 'inferred' && x.basis === PROPOSAL_BASIS;
+}
+
+/**
+ * ¿El contexto vigente se puede reemplazar por una propuesta nueva? Solo si está vacío o es una propuesta de Cursia
+ * sin confirmar (review L82 I1): nunca un documento ni algo que el docente escribió o confirmó.
+ */
+export function isReplaceableByProposal(ctx: AcademicContextV1 | null | undefined): boolean {
+  if (!ctx) return true;
+  if (hasDocuments(ctx)) return false;
+  const fields = [ctx.identity.subjectName, ctx.identity.program, ctx.identity.educationLevel, ctx.identity.generalObjective, ctx.identity.description, ctx.learner.profile, ctx.learner.priorKnowledge];
+  if (fields.some((f) => f.status !== 'missing' && !isProposed(f))) return false;
+  return [...ctx.outcomes, ...ctx.competencies].every((x) => isProposed(x)) && ctx.units.length === 0 && ctx.evaluation.length === 0;
+}
+
+/**
+ * Contexto académico propuesto por Cursia (sin documentos). Lanza DOCUMENT_CONTEXT si el vigente viene de un documento
+ * y USER_CONTEXT si tiene datos que escribió o confirmó el docente.
+ */
 export function buildProposedContext(current: AcademicContextV1 | null, p: CourseProposal): AcademicContextV1 {
   if (hasDocuments(current)) throw new ProposedContextError('DOCUMENT_CONTEXT', 'el curso ya tiene un contexto académico leído de un documento; el documento manda.');
+  if (!isReplaceableByProposal(current)) throw new ProposedContextError('USER_CONTEXT', 'el contexto académico tiene datos que escribiste o confirmaste; Cursia no los reemplaza.');
   const outcomes = cleanList(p.outcomes, PROPOSAL_LIMITS.outcomes, ACADEMIC_LIMITS.outcomeText);
   if (!outcomes.length) throw new ProposedContextError('NO_OUTCOMES', 'la propuesta no trae resultados de aprendizaje.');
   const ctx = emptyAcademicContext();
@@ -103,7 +124,8 @@ export function rewriteOutcomes(current: AcademicContextV1 | null, edits: Outcom
   const outcomes: LearningOutcome[] = list.map((e) => {
     const prev = e.id ? byId.get(e.id) : undefined;
     if (prev && sameText(prev.text, e.text)) {
-      if (accept && prev.status === 'inferred') return outcomeOf(prev.id, prev.text, 'provided');
+      // Solo lo que propuso Cursia; un resultado inferido DEL DOCUMENTO conserva su cita (review L82 I2).
+      if (accept && isProposed(prev)) return outcomeOf(prev.id, prev.text, 'provided');
       return prev;
     }
     return outcomeOf(prev ? prev.id : `RA${++next}`, e.text, 'provided');
