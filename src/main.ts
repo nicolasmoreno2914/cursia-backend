@@ -4,6 +4,7 @@ import { ValidationPipe, Logger } from '@nestjs/common';
 import helmet from 'helmet';
 import * as express from 'express';
 import { AppModule } from './app.module';
+import { corsOptions } from './common/cors-options';
 import { AllExceptionsFilter } from './common/filters/http-exception.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
 import { warnIfNearMissDynamicFlag } from './modules/features/dynamic-features';
@@ -23,16 +24,8 @@ async function bootstrap() {
   // Security
   app.use(helmet());
 
-  // CORS
-  app.enableCors({
-    origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : '*',
-    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: false,
-    // Task 4 (rendimiento): cada request con Authorization lleva un preflight OPTIONS (~200 ms de
-    // ida y vuelta desde LatAm). Cachearlo 10 min en el navegador (Chrome topa en 2 h).
-    maxAge: 600,
-  });
+  // CORS (src/common/cors-options.ts: única definición, con la prueba de navegador check-cors-methods.js)
+  app.enableCors(corsOptions(process.env));
 
   // Global validation pipe
   app.useGlobalPipes(

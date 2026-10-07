@@ -283,6 +283,24 @@ const FIELD_CONFLICT_MESSAGE: Readonly<Record<DerivedField, (docV: unknown, pedH
   assessmentMethods: () => 'Cambiaste los métodos de evaluación: el diseño usa los tuyos.',
 });
 
+/** Prefijos de título que no son el área («Tecnología en…», «Técnico profesional en…»…). */
+const DEGREE_PREFIX_RE = /^(?:programa\s+(?:de|en)\s+|carrera\s+(?:de|en)\s+)?(?:(?:tecnolog[ií]a|t[eé]cnic[oa](?:\s+(?:profesional|laboral))?|tecn[oó]log[oa]|licenciatura|especializaci[oó]n(?:\s+tecnol[oó]gica)?|maestr[ií]a|doctorado|pregrado|diplomado|profesional|curso)\s+(?:en|de|del)\s+)/i;
+
+/**
+ * LOOP 8.2.1 · Sector a partir del documento, SOLO con evidencia: el programa académico ENCONTRADO en el documento
+ * (con su cita), sin el prefijo del título. «Tecnología en Gestión Contable y Financiera» → «Gestión Contable y
+ * Financiera». Sin programa encontrado (o si queda vacío o es demasiado largo para ser un sector) → null: nunca se inventa.
+ */
+export function sectorFromAcademicContext(ctx: AcademicContextV1 | null | undefined): string | null {
+  const p = ctx && ctx.identity ? ctx.identity.program : null;
+  if (!p || p.status !== 'found' || typeof p.value !== 'string' || !p.sources.length) return null;
+  const raw = p.value.replace(/\s+/g, ' ').trim();
+  const rest = raw.replace(DEGREE_PREFIX_RE, '').replace(/^[\s:–—-]+/, '').trim();
+  // Un «programa» que es una frase larga no es un área: mejor sin dato que un sector inventado.
+  if (rest.length < 3 || rest.length > 80 || rest.split(' ').length > 10) return null;
+  return rest.charAt(0).toUpperCase() + rest.slice(1);
+}
+
 export function resolveCourseFacts(input: FactsInput): CourseFacts {
   const b = input.brief ? input.brief.fields : {};
   const inferredKeys = new Set(String(b.inferidos || '').split(',').map((s) => s.trim()).filter(Boolean));
@@ -311,7 +329,9 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
 
   const docHours = ctx ? found(ctx.hours.total) : null;
   const pedHours = ped && typeof ped.targetHours === 'number' ? ped.targetHours : null;
-  const targetHours = first<number>(fact(pedHours, 'profile'), fact(docHours, 'document'));
+  // LOOP 8.2.1: horas que el perfil tiene porque las derivó del documento (dueño = documento) se muestran «del
+  // documento»; solo las que decidió el docente son «elegidas por ti» (y si difieren del documento, hay conflicto).
+  const targetHours = first<number>(fact(pedHours, owners.targetHours === 'document' ? 'document' : 'profile'), fact(docHours, 'document'));
 
   // Datos del perfil que decidió el docente y difieren de lo que propone el documento: se respetan y se informan.
   const differing: DerivedField[] = [];
@@ -355,7 +375,8 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
     competencies: first<string[]>(fact(ctx ? ctx.competencies.map((c) => c.text) : null, ctx && ctx.competencies.length ? ctxSource(ctx.competencies[0]) : 'document'), fact(ped && ped.learningOutcomes ? ped.learningOutcomes.competencies : null, 'profile')),
     targetHours,
     units: fact(withDocs && ctx ? ctx.units.length : null, 'document'),
-    sector: fact(b.sector, briefSource('sector')),
+    // LOOP 8.2.1: sin sector en el pedido, solo con evidencia del documento (el programa encontrado en él); si no, sin dato.
+    sector: first<string>(fact(b.sector, briefSource('sector')), fact(ctx && withDocs ? sectorFromAcademicContext(ctx) : null, 'inferred')),
     country: fact(b.pais, briefSource('pais')),
     document: { present: withDocs, proposed: !withDocs && !!ctx && ctx.outcomes.some((o) => isProposed(o)), contextVersion: input.academic ? input.academic.version : null, names: ctx ? ctx.documents.map((d) => d.name) : [] },
     pedagogy: {
