@@ -577,6 +577,7 @@ async function main() {
             return [{ id: runId, job_id: 'j', manifest_id: 1, item_key: mItem.key, type: 'activity', status: 'running', worker_id: 'ex', chapter_id: chId,
               module_id: 'm', owner_id: OWNER, job_course_id: 1, frontend_course_id: 'fc', rules_version: 3, manifest_json: { rulesVersion: 3, items: [mItem] } }];
           }
+          if (/from public\.generation_run_contexts/.test(sql)) return []; // Language QA: contexto del run (curso de idiomas)
           if (/from public\.artifacts/.test(sql)) return [{ id: 'a1', type: 'dynamic_h5p_params_json', storage_bucket: 'b', storage_path: 'p' }];
           throw new Error(`query inesperada ${sql.slice(0, 60)}`);
         },

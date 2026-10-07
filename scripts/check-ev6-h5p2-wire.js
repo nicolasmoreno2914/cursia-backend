@@ -449,6 +449,7 @@ const SRC = (bp) => ({ courseId: 777, blueprintId: 1, blueprintNumber: 1, bluepr
               module_id: 'm', owner_id: OWNER, job_course_id: 1, frontend_course_id: 'fc', rules_version: 3,
               manifest_json: { rulesVersion: 3, features: { finalExam: false, activityEngine: 'h5p', ...features }, items: [mItem] } }];
           }
+          if (/from public\.generation_run_contexts/.test(sql)) return []; // Language QA: contexto del run (curso de idiomas)
           if (/from public\.artifacts/.test(sql)) return [{ id: 'a1', type: type === 'activity' ? 'dynamic_h5p_params_json' : 'dynamic_video_interactions_json', storage_bucket: 'b', storage_path: 'p' }];
           throw new Error(`query inesperada ${sql.slice(0, 60)}`);
         },

@@ -3,7 +3,7 @@
  * R14 (QA factual del showcase) — checks puros sobre dist/:
  *  1. Bibliografía verificada del Libro Guía: solo obras del catálogo, en forma canónica; lo
  *     inventado o mal atribuido se omite (casos REALES del curso #241).
- *  2. Guion del audiolibro: tuteo para Colombia/LatAm (voseo solo en Argentina/Uruguay/Paraguay).
+ *  2. Guion del audiolibro: español neutro con tuteo para cualquier país (Language QA, piloto 2026-10-07).
  * Uso: npm run build && node scripts/check-v21-r14-truth.js
  */
 const path = require('path');
@@ -127,13 +127,14 @@ const REAL = {
   const SEC = { idx: 0, title: 'S', text: 'x', words: 300, sha256: 'x' };
   const narr = (i) => AS.sectionNarrationPrompt(i, SEC, 1, null);
   const contP = (pais) => AS.sectionContinuationPrompt('texto', SEC, 'T', 100, pais);
-  await check('audiolibro: el guion pide tuteo en Colombia (narración y continuación); en Argentina no impone tuteo', () => {
+  // Language QA (piloto, 2026-10-07): español neutro con tuteo para CUALQUIER país (antes Argentina usaba voseo).
+  await check('audiolibro: el guion pide español neutro con tuteo en Colombia y también en Argentina (narración y continuación)', () => {
     const co = narr({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Colombia', contentMarkdown: 'x' });
-    assert.ok(/tuteo/.test(co.system) && /nunca voseo/.test(co.system), 'narración');
+    assert.ok(/tuteo/.test(co.system) && /nunca voseo/i.test(co.system), 'narración');
     const cont = contP('Colombia');
     assert.ok(/tuteo/.test(cont.system), 'continuación');
     const ar = narr({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', pais: 'Argentina', contentMarkdown: 'x' });
-    assert.ok(!/nunca voseo/.test(ar.system), 'Argentina');
+    assert.ok(/tuteo/.test(ar.system) && /nunca voseo/i.test(ar.system), 'Argentina: también neutro');
     const none = narr({ courseTitle: 'C', chapterNumber: 1, chapterTitle: 'T', contentMarkdown: 'x' });
     assert.ok(/tuteo/.test(none.system), 'sin país → tuteo latinoamericano');
   });
