@@ -42,8 +42,11 @@ export interface PinOp { field: 'video' | 'noLinks'; value: boolean | null; unle
  * parámetro `chapterParam` (p. ej. '$7'). Permite plegar el cambio en el MISMO UPDATE que sube el contador de la
  * estructura (sin idas y vueltas extra). Los nombres de campo y los booleanos son constantes, nunca datos del cliente.
  */
-export function pinsMetadataExpr(col: string, chapterParam: string, ops: PinOp[]): string {
+export function pinsMetadataExpr(col: string, chapterParam: string, ops: PinOp[], cond?: { isPractice: string; wasLinked: string }): string {
   const ch = `${chapterParam}::text`;
+  // Review L84-3 Mn3: por la clave primaria (uuid), y una sola vez si el llamador ya calculó las condiciones (CTE).
+  const isPractice = cond ? cond.isPractice : `exists (select 1 from public.course_chapters px where px.id = ${chapterParam}::uuid and coalesce(to_jsonb(px) ->> 'chapter_kind', 'content') = 'practice')`;
+  const wasLinked = cond ? cond.wasLinked : `exists (select 1 from public.course_chapters px where px.id = ${chapterParam}::uuid and (case when jsonb_typeof(to_jsonb(px) -> 'outcome_ids') = 'array' then jsonb_array_length(to_jsonb(px) -> 'outcome_ids') else 0 end) > 0)`;
   let e = `coalesce(${col}, '{}'::jsonb)`;
   for (const op of ops) {
     const clear = `(${e} #- array['${DESIGN_PINS_KEY}', ${ch}, '${op.field}'])`;
@@ -51,9 +54,9 @@ export function pinsMetadataExpr(col: string, chapterParam: string, ops: PinOp[]
     const set = `jsonb_set(${e}, array['${DESIGN_PINS_KEY}'], coalesce(${e} -> '${DESIGN_PINS_KEY}', '{}'::jsonb) || ` +
       `jsonb_build_object(${ch}, coalesce(${e} -> '${DESIGN_PINS_KEY}' -> ${ch}, '{}'::jsonb) || jsonb_build_object('${op.field}', ${op.value ? 'true' : 'false'})), true)`;
     if (op.unlessPractice) {
-      e = `(case when exists (select 1 from public.course_chapters px where px.id::text = ${ch} and coalesce(to_jsonb(px) ->> 'chapter_kind', 'content') = 'practice') then ${clear} else ${set} end)`;
+      e = `(case when ${isPractice} then ${clear} else ${set} end)`;
     } else if (op.onlyIfLinked) {
-      e = `(case when exists (select 1 from public.course_chapters px where px.id::text = ${ch} and (case when jsonb_typeof(to_jsonb(px) -> 'outcome_ids') = 'array' then jsonb_array_length(to_jsonb(px) -> 'outcome_ids') else 0 end) > 0) then ${set} else ${e} end)`;
+      e = `(case when ${wasLinked} then ${set} else ${e} end)`;
     } else e = set;
   }
   return e;

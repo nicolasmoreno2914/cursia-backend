@@ -151,11 +151,15 @@ const vids = (d) => d.modules.map((m) => m.chapters.filter((c) => c.kind === 'co
       { id: 'm2', examEnabled: true, chapters: [ch('c3')] }] };
     const links = new Map([['c1', ['RA1']], ['c2', ['RA2']], ['c3', ['RA3']]]);
     const ev = (instrument, outcomeIds) => ({ ...ctx, evaluation: [{ id: 'EV', instrument, weightPct: 25, outcomeIds }] });
-    eq(SVC.uncoveredEvaluations(ev('Proyecto de costeo por órdenes', ['RA3']), dist, links), [{ instrument: 'Proyecto de costeo por órdenes', outcomes: ['RA3'], kind: 'performance' }], 'proyecto de RA3 sin Actividad de Aplicación donde se trabaja RA3');
+    eq(SVC.uncoveredEvaluations(ev('Proyecto de costeo por órdenes', ['RA3']), dist, links), [{ instrument: 'Proyecto de costeo por órdenes', outcomes: ['RA3'], kind: 'performance', chapterIds: ['c3'] }], 'proyecto de RA3 sin Actividad de Aplicación donde se trabaja RA3 (destino: el capítulo de RA3)');
+    eq(SVC.uncoveredEvaluations(ev('Examen de casos clínicos', ['RA3']), dist, links), [], 'L84-3 Mn6: «Examen de casos» es una prueba (la evaluación del módulo 2 la cubre)');
+    eq(SVC.uncoveredUnitContents({ units: [{ contents: [{ text: 'Clasificación de los costos' }, { text: 'Control de materiales' }] }] }, [{ title: 'Cómo clasificar los costos' }, { title: 'Controlar los materiales' }]), [], 'L84-3 Mn4: paráfrasis verbales cubren');
     eq(SVC.uncoveredEvaluations(ev('Taller práctico', ['RA1']), dist, links), [], 'la práctica del módulo (hereda RA1) lo evidencia');
     eq(SVC.uncoveredEvaluations(ev('Examen parcial', ['RA3']), dist, links), [], 'la evaluación del módulo 2 trabaja RA3');
     const noExam = { counts: { evaluations: 1 }, modules: [{ ...dist.modules[0] }, { ...dist.modules[1], examEnabled: false }] };
     eq(SVC.uncoveredEvaluations(ev('Examen parcial', ['RA3']), noExam, links).map((x) => x.kind), ['exam'], 'sin evaluación que trabaje RA3 ni final');
+    const target = byId(V.verifyDesign({ ...base, uncoveredEvaluations: [{ instrument: 'Proyecto', outcomes: ['RA3'], kind: 'performance', chapterIds: ['c3'] }] })).evaluation_performance.fix;
+    eq([target.kind, target.action, target.targets.chapterIds], ['editor', 'application', ['c3']], 'L84-3 Mn5: lleva a la Actividad de Aplicación del capítulo que trabaja el resultado');
     const v = byId(V.verifyDesign({ ...base, uncoveredEvaluations: [{ instrument: 'Proyecto de costeo', outcomes: ['RA3'], kind: 'performance' }, { instrument: 'Parcial', outcomes: ['RA3'], kind: 'exam' }] }));
     eq([v.evaluation_performance.severity, v.evaluation_performance.fix.action, v.evaluation_exams.fix.action], ['warning', 'outcome_links', 'module_exams'], 'advertencias con su corrección');
     eq(byId(V.verifyDesign({ ...base, preferences: { emphasis: 'balanced', applicationActivities: 'none' }, uncoveredEvaluations: [{ instrument: 'Proyecto', outcomes: [], kind: 'performance' }] })).evaluation_performance.fix.kind, 'adjust', 'sin actividades: Ajustar las enciende');

@@ -302,7 +302,10 @@ interface LiveChapter { id: string; moduleId: string; title: string; objective: 
  * concatenado de un módulo (una palabra suelta como «costo» lo «cubría» todo) ni contra capítulos propuestos.
  */
 export function uncoveredUnitContents(ctx: AcademicContextV1, chapters: { title: string; objective?: string | null; description?: string | null }[]): string[] {
-  const sets = chapters.map((c) => tokenSet([c.title, c.objective || '', c.description || ''].join(' ')));
+  const sets = chapters.map((c) => [...tokenSet([c.title, c.objective || '', c.description || ''].join(' '))]);
+  // Review L84-3 Mn4: «clasificación» ≈ «clasificar», «control» ≈ «controlar»: misma raíz de 7 letras (con 6,
+  // «información» ≈ «informe» daba por cubierto lo que no lo está).
+  const same = (a: string, b: string) => a === b || (a.length >= 7 && b.length >= 7 && a.slice(0, 7) === b.slice(0, 7));
   const out: string[] = [];
   for (const u of ctx.units) {
     for (const c of u.contents) {
@@ -311,7 +314,7 @@ export function uncoveredUnitContents(ctx: AcademicContextV1, chapters: { title:
       const need = ct.size >= 2 ? 2 : 1;
       const hit = sets.some((s) => {
         let inter = 0;
-        for (const x of ct) if (s.has(x)) inter++;
+        for (const x of ct) if (s.some((y) => same(x, y))) inter++;
         return inter >= need && inter / ct.size >= LINK_CONTAINMENT_MIN;
       });
       if (!hit) out.push(c.text);
@@ -320,6 +323,8 @@ export function uncoveredUnitContents(ctx: AcademicContextV1, chapters: { title:
   return out;
 }
 
+/** Instrumentos de prueba (se evidencian con una evaluación): se miran primero (review L84-3 Mn6: «Examen de casos»). */
+const EXAM_INSTRUMENT_RE = /parcial|examen|prueba|quiz|test\b|cuestionario|evaluaci[oó]n escrita/i;
 /** Instrumentos de desempeño (se evidencian con una Actividad de Aplicación, no con un examen). */
 const PERFORMANCE_INSTRUMENT_RE = /proyect|taller|caso|pr[aá]ctic|informe|trabajo|ejercicio|laborator|portafolio|exposici|simulaci|estudio de/i;
 
@@ -333,21 +338,23 @@ export function uncoveredEvaluations(
   ctx: AcademicContextV1,
   dist: { counts: { evaluations: number }; modules: { id: string; examEnabled: boolean; chapters: { id: string; proposed: boolean; kind: string; applicationMinutes?: number | null }[] }[] },
   chapterOutcomes: Map<string, string[]>,
-): { instrument: string; outcomes: string[]; kind: 'performance' | 'exam' }[] {
+): { instrument: string; outcomes: string[]; kind: 'performance' | 'exam'; chapterIds: string[] }[] {
   const moduleOuts = new Map(dist.modules.map((m) => [m.id, new Set(m.chapters.filter((c) => !c.proposed && c.kind !== 'practice').flatMap((c) => chapterOutcomes.get(c.id) || []))]));
   const outsOf = (m: { id: string }, c: { id: string; proposed: boolean; kind: string }) => (c.proposed || c.kind === 'practice' ? moduleOuts.get(m.id)! : new Set(chapterOutcomes.get(c.id) || []));
   const finalExam = dist.counts.evaluations > dist.modules.filter((m) => m.examEnabled).length;
   const hits = (set: Set<string>, outs: string[]) => !outs.length || outs.some((o) => set.has(o));
-  const out: { instrument: string; outcomes: string[]; kind: 'performance' | 'exam' }[] = [];
+  const out: { instrument: string; outcomes: string[]; kind: 'performance' | 'exam'; chapterIds: string[] }[] = [];
+  // Capítulos EXISTENTES de contenido que trabajan alguno de esos resultados (donde se activa la Actividad).
+  const workingOn = (outs: string[]) => dist.modules.flatMap((m) => m.chapters.filter((c) => !c.proposed && c.kind !== 'practice' && outs.some((o) => (chapterOutcomes.get(c.id) || []).includes(o))).map((c) => c.id));
   for (const ev of ctx.evaluation) {
     if (!ev.instrument) continue;
     const outs = ev.outcomeIds || [];
-    if (PERFORMANCE_INSTRUMENT_RE.test(ev.instrument)) {
+    if (!EXAM_INSTRUMENT_RE.test(ev.instrument) && PERFORMANCE_INSTRUMENT_RE.test(ev.instrument)) {
       const ok = dist.modules.some((m) => m.chapters.some((c) => (c.applicationMinutes || 0) > 0 && hits(outsOf(m, c), outs)));
-      if (!ok) out.push({ instrument: ev.instrument, outcomes: outs, kind: 'performance' });
+      if (!ok) out.push({ instrument: ev.instrument, outcomes: outs, kind: 'performance', chapterIds: workingOn(outs) });
     } else {
       const ok = finalExam || dist.modules.some((m) => m.examEnabled && hits(moduleOuts.get(m.id)!, outs));
-      if (!ok) out.push({ instrument: ev.instrument, outcomes: outs, kind: 'exam' });
+      if (!ok) out.push({ instrument: ev.instrument, outcomes: outs, kind: 'exam', chapterIds: [] });
     }
   }
   return out;

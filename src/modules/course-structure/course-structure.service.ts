@@ -336,7 +336,7 @@ export class CourseStructureService implements OnModuleInit {
           if (c.proposed) {
             const practice = c.kind === 'practice';
             // Review L84-2 N4: la profundización hereda los resultados de su módulo (lo mismo que mostró la tarjeta).
-            const inherited = practice ? [] : moduleOutcomeIds(chapters, m.id);
+            const inherited = practice ? [] : moduleOutcomeIds(chapters, m.id, academic ? academicOutcomeIds(academic.context) : null);
             await queryRunner.query(
               `insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled, activity_enabled, application_minutes${practice ? ', chapter_kind' : ''}${inherited.length ? ', outcome_ids' : ''})
                values ($1, $2, $3, $4, $5, $6, $7, $8${practice ? ", 'practice'" : ''}${inherited.length ? ', $9::jsonb' : ''})`,
@@ -1745,17 +1745,24 @@ export class CourseStructureService implements OnModuleInit {
     p.push(courseId);
     let pinSet = '';
     let kindSel = '';
+    let pinCte = '';
     if (pins && pins.ops.length) {
       const chIdx = i++;
       p.push(pins.chapterId);
-      pinSet = `, metadata = ${pinsMetadataExpr('co.metadata', `$${chIdx}`, pins.ops)}`;
-      kindSel = `, (select coalesce(to_jsonb(kx) ->> 'chapter_kind', 'content') from public.course_chapters kx where kx.id::text = $${chIdx}::text) as kind`;
+      // Review L84-3 Mn3: el estado ANTERIOR del capítulo (tipo y si tenía vínculos) se lee una vez, por clave primaria.
+      pinCte = `pk as (
+         select coalesce(to_jsonb(kx) ->> 'chapter_kind', 'content') as kind,
+                (case when jsonb_typeof(to_jsonb(kx) -> 'outcome_ids') = 'array' then jsonb_array_length(to_jsonb(kx) -> 'outcome_ids') else 0 end) > 0 as linked
+           from public.course_chapters kx where kx.id = $${chIdx}::uuid
+       ),`;
+      pinSet = `, metadata = ${pinsMetadataExpr('co.metadata', `$${chIdx}`, pins.ops, { isPractice: `coalesce((select kind from pk), 'content') = 'practice'`, wasLinked: `coalesce((select linked from pk), false)` })}`;
+      kindSel = `, (select kind from pk) as kind`;
     }
     const target = sets.length > 0
       ? `update public.${table} t set ${sets.join(', ')}, updated_at = now() where ${conds.join(' and ')} returning t.id`
       : `select t.id from public.${table} t where ${conds.join(' and ')}`;
     const rows = await queryRunner.query(
-      `with u as (${target}),
+      `with ${pinCte}u as (${target}),
        c as (
          update public.courses co
             set structure_version_counter = co.structure_version_counter + 1${pinSet}
