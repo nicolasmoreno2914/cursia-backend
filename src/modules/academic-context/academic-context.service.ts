@@ -9,7 +9,9 @@ import { proposeStructureFromContext, suggestOutcomeLinks, suggestProfileFromCon
 import { DocumentReadError } from './extract/text-sources';
 import { extractAcademicContext } from './extract/extractor';
 import { validateAcademicContext } from './validate';
-import { ExtractAcademicContextDto, ExtractAdvancedDto } from './dto/extract.dto';
+import { ExtractAcademicContextDto, ExtractAdvancedDto, OutcomesDto, ProposalDto } from './dto/extract.dto';
+import { ProposedContextError, buildProposedContext, rewriteOutcomes } from './proposed-context';
+import { CourseProfilesService } from '../course-profiles/course-profiles.service';
 import { extractionQuality } from './extraction-quality';
 import { readPdf } from './extract/text-sources';
 import {
@@ -43,6 +45,7 @@ export class AcademicContextService {
     private readonly coursesService: CoursesService,
     @Optional() private readonly ledger?: FinopsLedgerService,
     @Optional() @Inject(DOCUMENT_TRANSCRIBER) transcriber?: DocumentTranscriber,
+    @Optional() private readonly profiles?: CourseProfilesService,
   ) {
     this.transcriber = transcriber || new AnthropicTranscriber();
   }
@@ -159,6 +162,42 @@ export class AcademicContextService {
     } catch (err) {
       this.logger.error(`Lectura avanzada del curso #${courseId}: no se pudo registrar el gasto (${t.messageId}): ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  /**
+   * LOOP 8.2 · Sin documento: lo que Cursia entendió del pedido queda como contexto académico propuesto (`inferred`).
+   * Se guarda por el camino de siempre (perfil versionado: deriva el perfil pedagógico, poda vínculos). 409
+   * DOCUMENT_CONTEXT si el contexto vigente viene de un documento (el documento manda).
+   */
+  async saveProposal(courseId: number, ownerId: string, dto: ProposalDto) {
+    return this.saveBuilt(courseId, ownerId, dto.expectedVersion, (current) => buildProposedContext(current, dto));
+  }
+
+  /** LOOP 8.2 · «Editar» / «Sí, usar estos» de los resultados en «Lo que entendimos» (ids y orígenes conservados). */
+  async saveOutcomes(courseId: number, ownerId: string, dto: OutcomesDto) {
+    return this.saveBuilt(courseId, ownerId, dto.expectedVersion, (current) => rewriteOutcomes(current, dto.outcomes, dto.accept === true));
+  }
+
+  private async saveBuilt(courseId: number, ownerId: string, expectedVersion: number, build: (current: any) => any) {
+    assertDynamicOwnerAllowed(ownerId);
+    if (!this.profiles) throw new Error('CourseProfilesService no disponible');
+    await this.loadCourse(courseId, ownerId);
+    const current = await loadCurrentAcademicContext(this.dataSource, courseId);
+    // La versión leída debe ser la que el cliente vio (el guardado vuelve a comprobarla dentro de su transacción).
+    if ((current ? current.version : 0) !== expectedVersion) {
+      throw new ConflictException(`ACADEMIC_CHANGED: el contexto académico cambió (versión ${current ? current.version : 0}); vuelve a leerlo antes de guardar.`);
+    }
+    let ctx;
+    try {
+      ctx = build(current ? current.context : null);
+    } catch (err) {
+      if (err instanceof ProposedContextError) {
+        if (err.code === 'DOCUMENT_CONTEXT' || err.code === 'USER_CONTEXT') throw new ConflictException(err.message);
+        throw new BadRequestException(err.message);
+      }
+      throw err;
+    }
+    return this.profiles.append(courseId, ownerId, 'academic', ctx, expectedVersion);
   }
 
   /**

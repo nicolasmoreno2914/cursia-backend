@@ -1833,6 +1833,45 @@ function reservationBookkeeping(ev) {
       results.courses.E13 = { courseId };
     }, { fatal: false });
 
+    // ═══ LOOP 8.2 · E14 — «Lo que entendimos» sin documento: propuesta, edición y confirmación por HTTP real (USD 0:
+    // la interpretación del pedido corre en el cliente; aquí solo se guarda lo interpretado).
+    if (RUN_E5) await step('v3-E14-lo-que-entendimos', async () => {
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: '[E2E E14] Excel básico' });
+      ok(cr.status === 201, 'E14: curso dinámico creado', { s: cr.status, e: cr.error });
+      const courseId = Number(cr.data.id);
+      const pb = await api('PUT', `/courses/${courseId}/brief`, { obj: 'Quiero un curso de Excel básico para estudiantes de Administración', contexto: 'Universitario — estudiantes de pregrado universitario, con rigor académico y pensamiento crítico', sector: 'Administración', pais: 'Colombia', inferidos: 'sector,pais' });
+      ok(pb.status === 200 && pb.data.brief.fields.inferidos === 'sector,pais', 'E14: el pedido guarda qué llenó Cursia', { s: pb.status, e: pb.error });
+      const proposal = { expectedVersion: 0, subjectName: 'Excel básico para la gestión', learnerProfile: 'Estudiantes de primeros semestres de Administración',
+        outcomes: ['Organiza datos de gestión en tablas con formato', 'Calcula indicadores con fórmulas y funciones', 'Explica cuándo usar cada tipo de gráfico'] };
+      const bad = await api('POST', `/courses/${courseId}/academic-context/proposal`, { ...proposal, outcomes: [] });
+      ok(bad.status === 400, 'E14: propuesta sin resultados → 400 (DTO)', { s: bad.status });
+      const sp = await api('POST', `/courses/${courseId}/academic-context/proposal`, proposal);
+      ok(sp.status === 200 && sp.data.created === true && sp.data.profile.version === 1 && sp.data.derivedPedagogy && sp.data.derivedPedagogy.applied === true, 'E14: propuesta guardada y perfil pedagógico derivado', { s: sp.status, e: sp.error });
+      let f = await api('GET', `/courses/${courseId}/facts`);
+      ok(f.status === 200 && f.data.document.present === false && f.data.document.proposed === true && f.data.outcomes.value.every((o) => o.origin === 'proposed') &&
+        f.data.title.source === 'inferred' && f.data.sector.source === 'inferred' && f.data.topic.source === 'user' && f.data.conflicts.length === 0, 'E14: «Lo que sabemos» = propuesto e inferido, sin documento', { d: f.data && { doc: f.data.document, t: f.data.title, s: f.data.sector } });
+      const stale = await api('POST', `/courses/${courseId}/academic-context/proposal`, proposal);
+      ok(stale.status === 409 && /^ACADEMIC_CHANGED/.test(String(stale.error)), 'E14: propuesta con versión vieja → 409', { s: stale.status, e: stale.error });
+      const ed = await api('PUT', `/courses/${courseId}/academic-context/outcomes`, { expectedVersion: 1, outcomes: [{ id: 'RA1', text: proposal.outcomes[0] }, { id: 'RA2', text: 'Calcula indicadores de gestión con funciones' }, { text: 'Diseña un tablero de control' }] });
+      ok(ed.status === 200 && ed.data.profile.version === 2, 'E14: editar resultados crea la versión 2', { s: ed.status, e: ed.error });
+      f = await api('GET', `/courses/${courseId}/facts`);
+      ok(JSON.stringify(f.data.outcomes.value.map((o) => [o.id, o.origin])) === JSON.stringify([['RA1', 'proposed'], ['RA2', 'user'], ['RA4', 'user']]), 'E14: ids conservados, orígenes por resultado', { o: f.data.outcomes.value });
+      const acc = await api('PUT', `/courses/${courseId}/academic-context/outcomes`, { expectedVersion: 2, accept: true, outcomes: f.data.outcomes.value.map((o) => ({ id: o.id, text: o.text })) });
+      ok(acc.status === 200 && acc.data.profile.version === 3, 'E14: «Sí, usar estos» confirma (versión 3)', { s: acc.status, e: acc.error });
+      f = await api('GET', `/courses/${courseId}/facts`);
+      ok(f.data.document.proposed === false && f.data.outcomes.value.every((o) => o.origin === 'user'), 'E14: confirmados = escritos por el docente', { d: f.data.document });
+      // El documento manda: sobre un contexto leído de un documento, la propuesta se rechaza.
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo.docx', dataBase64: (await AF.fixture('consistent', 'docx')).toString('base64') }] });
+      const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 3 });
+      ok(sv.status === 201, 'E14: el documento reemplaza la propuesta confirmada', { s: sv.status, e: sv.error });
+      const over = await api('POST', `/courses/${courseId}/academic-context/proposal`, { ...proposal, expectedVersion: 4 });
+      ok(over.status === 409 && /^DOCUMENT_CONTEXT/.test(String(over.error)), 'E14: propuesta sobre un documento → 409 DOCUMENT_CONTEXT', { s: over.status, e: over.error });
+      f = await api('GET', `/courses/${courseId}/facts`);
+      ok(f.data.document.present === true && f.data.outcomes.source === 'document' && f.data.targetHours.value === 64, 'E14: ahora todo viene del documento', { d: f.data && f.data.document });
+      results.courses.E14 = { courseId };
+    }, { fatal: false });
+
     // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══
     const MOODLE_JOBS = ONLY_REAL_PROVIDERS ? [] : [['E1', 'E1'], ['E1-repack', 'E1repack'], ['E2', 'E2'], ['E3', 'E3']];
     // EV6 H5P v2: E5 entra al mismo restore + inspección (con los «Repaso» del paquete).

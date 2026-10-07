@@ -1,3 +1,4 @@
+import { isProposed } from '../academic-context/proposed-context';
 // LOOP 8.1 · Una sola fuente de verdad del curso («Lo que sabemos del curso»).
 //
 // Cada dato tiene UN dueño; el resto lo lee (nunca lo copia):
@@ -18,10 +19,11 @@ import { ASSESSMENT_METHODS } from '../pedagogy/vocabulary';
 export const BRIEF_KEY = 'brief';
 export const BRIEF_VERSION = 1 as const;
 /** Mismos nombres que el contexto que se congela al generar (CourseContextDto), para no traducir campos. */
-export const BRIEF_FIELDS = ['nombre', 'obj', 'sector', 'pais', 'ciudad', 'contexto', 'nivel', 'tono', 'comp'] as const;
+/** inferidos (LOOP 8.2): claves del pedido que llenó Cursia (V2 no pregunta sector, país ni tono), separadas por comas. */
+export const BRIEF_FIELDS = ['nombre', 'obj', 'sector', 'pais', 'ciudad', 'contexto', 'nivel', 'tono', 'comp', 'inferidos'] as const;
 export type BriefField = (typeof BRIEF_FIELDS)[number];
 export const BRIEF_MAX: Readonly<Record<BriefField, number>> = Object.freeze({
-  nombre: 255, obj: 600, sector: 255, pais: 100, ciudad: 100, contexto: 400, nivel: 255, tono: 255, comp: 255,
+  nombre: 255, obj: 600, sector: 255, pais: 100, ciudad: 100, contexto: 400, nivel: 255, tono: 255, comp: 255, inferidos: 100,
 });
 
 export interface CourseBrief {
@@ -197,6 +199,18 @@ export function mergeDerivedProfile(
 // ── «Lo que sabemos del curso» ────────────────────────────────────────────────────────────────────────────
 
 export type FactSource = 'document' | 'user' | 'profile' | 'inferred' | 'default';
+export type OutcomeOrigin = 'document' | 'proposed' | 'user' | 'profile';
+/** Estado de un dato del contexto académico → origen visible (LOOP 8.2: un contexto sin documento no es «del documento»). */
+// Review L82 I2: «inferido» del EXTRACTOR (p. ej. objetivos del documento usados como resultados) sigue siendo del
+// documento; solo lo que propuso Cursia desde el pedido (PROPOSAL_BASIS) es «propuesto».
+function ctxSource(x: { status?: string; basis?: string } | undefined): FactSource {
+  const s = x && x.status;
+  return s === 'found' ? 'document' : s === 'inferred' ? (isProposed(x as any) ? 'inferred' : 'document') : 'user';
+}
+function ctxOrigin(x: { status?: string; basis?: string } | undefined): OutcomeOrigin {
+  const s = x && x.status;
+  return s === 'found' ? 'document' : s === 'inferred' ? (isProposed(x as any) ? 'proposed' : 'document') : 'user';
+}
 export interface Fact<T> { value: T | null; source: FactSource | null }
 export interface FactConflict { field: string; values: { source: FactSource; value: unknown }[]; message: string }
 
@@ -207,13 +221,15 @@ export interface CourseFacts {
   educationLevel: Fact<string>;
   priorKnowledge: Fact<string>;
   learnerDescription: Fact<string>;
-  outcomes: Fact<{ id: string | null; text: string; domain: string | null }[]>;
+  /** origin (LOOP 8.2): de dónde salió CADA resultado — documento, propuesto por Cursia sin documento o escrito por el docente. */
+  outcomes: Fact<{ id: string | null; text: string; domain: string | null; origin: OutcomeOrigin }[]>;
   competencies: Fact<string[]>;
   targetHours: Fact<number>;
   units: Fact<number>;
   sector: Fact<string>;
   country: Fact<string>;
-  document: { present: boolean; contextVersion: number | null; names: string[] };
+  /** present: hay un documento leído. proposed (LOOP 8.2): sin documento, con resultados que propuso Cursia sin confirmar. */
+  document: { present: boolean; proposed: boolean; contextVersion: number | null; names: string[] };
   pedagogy: {
     version: number;
     primaryApproach: string | null;
@@ -269,10 +285,15 @@ const FIELD_CONFLICT_MESSAGE: Readonly<Record<DerivedField, (docV: unknown, pedH
 
 export function resolveCourseFacts(input: FactsInput): CourseFacts {
   const b = input.brief ? input.brief.fields : {};
+  const inferredKeys = new Set(String(b.inferidos || '').split(',').map((s) => s.trim()).filter(Boolean));
+  const briefSource = (k: BriefField): FactSource => (inferredKeys.has(k) ? 'inferred' : 'user');
   const ctx = input.academic ? input.academic.context : null;
   const ped = input.pedagogy ? input.pedagogy.profile : null;
   const found = <T>(f: { status: string; value: T | null } | undefined): T | null => (f && f.status !== 'missing' ? f.value : null);
   const owners = pedagogyFieldOwners(ped, input.derivation, input.suggested);
+  const withDocs = !!ctx && Array.isArray(ctx.documents) && ctx.documents.length > 0;
+  const ctxFact = <T>(f: { status: string; value: T | null } | undefined): Fact<T> =>
+    f && f.status !== 'missing' ? fact<T>(f.value, ctxSource(f as any)) : { value: null, source: null };
   const conflicts: FactConflict[] = [];
 
   // Nivel educativo — Review L81 I2: la decisión explícita del docente en el perfil manda; si no, el documento; si no,
@@ -294,7 +315,8 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
 
   // Datos del perfil que decidió el docente y difieren de lo que propone el documento: se respetan y se informan.
   const differing: DerivedField[] = [];
-  if (ctx && input.suggested) {
+  // Solo frente a un DOCUMENTO: sin documento (propuesta de Cursia) lo que decidió el docente manda y no hay con qué chocar.
+  if (ctx && withDocs && input.suggested) {
     for (const f of DERIVED_FIELDS) {
       const docV = derivedFieldValue(input.suggested, f);
       // Métodos de evaluación: los del documento se SUMAN; solo hay conflicto si falta alguno del documento.
@@ -308,37 +330,39 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
     }
   }
 
-  const docOutcomes = ctx ? ctx.outcomes.map((o) => ({ id: o.id, text: o.text, domain: o.domain })) : [];
+  const docOutcomes = ctx ? ctx.outcomes.map((o) => ({ id: o.id, text: o.text, domain: o.domain as string | null, origin: ctxOrigin(o) })) : [];
+  const srcs = ctx ? ctx.outcomes.map((o) => ctxSource(o)) : [];
+  const docOutcomesSource: FactSource = !srcs.length ? 'document' : srcs.every((s) => s === srcs[0]) ? srcs[0] : srcs.includes('document') ? 'document' : 'user';
   const pedOutcomes = ped && ped.learningOutcomes
-    ? [...ped.learningOutcomes.know.map((t) => ({ id: null, text: t, domain: 'know' })), ...ped.learningOutcomes.do.map((t) => ({ id: null, text: t, domain: 'do' }))]
+    ? [...ped.learningOutcomes.know.map((t) => ({ id: null, text: t, domain: 'know' as string | null, origin: 'profile' as OutcomeOrigin })), ...ped.learningOutcomes.do.map((t) => ({ id: null, text: t, domain: 'do' as string | null, origin: 'profile' as OutcomeOrigin }))]
     : [];
   const title = first<string>(
-    fact(b.nombre, 'user'),
-    fact(ctx ? found(ctx.identity.subjectName) : null, 'document'),
+    fact(b.nombre, briefSource('nombre')),
+    ctx ? ctxFact(ctx.identity.subjectName) : fact<string>(null, null),
     fact(input.courseTitle && !PLACEHOLDER_TITLES.includes(input.courseTitle.trim()) ? input.courseTitle : null, 'user'),
   );
 
   return {
     factsVersion: 1,
     title,
-    topic: first<string>(fact(b.obj, 'user'), fact(ctx ? found(ctx.identity.generalObjective) : null, 'document')),
+    topic: first<string>(fact(b.obj, 'user'), ctx ? ctxFact(ctx.identity.generalObjective) : fact<string>(null, null)),
     educationLevel,
     priorKnowledge: first<string>(fact(ped && ped.learner ? ped.learner.priorKnowledge : null, 'profile'), fact(priorKnowledgeFromBrief(b.nivel), 'user')),
     learnerDescription: owners.description === 'user'
       ? fact<string>(ped!.learner.description, 'profile')
-      : first<string>(fact(ctx ? found(ctx.learner.profile) : null, 'document'), fact(ped && ped.learner ? ped.learner.description : null, 'profile')),
-    outcomes: first(fact(docOutcomes, 'document'), fact(pedOutcomes, 'profile')),
-    competencies: first<string[]>(fact(ctx ? ctx.competencies.map((c) => c.text) : null, 'document'), fact(ped && ped.learningOutcomes ? ped.learningOutcomes.competencies : null, 'profile')),
+      : first<string>(ctx ? ctxFact(ctx.learner.profile) : fact<string>(null, null), fact(ped && ped.learner ? ped.learner.description : null, 'profile')),
+    outcomes: first(fact(docOutcomes, docOutcomesSource), fact(pedOutcomes, 'profile')),
+    competencies: first<string[]>(fact(ctx ? ctx.competencies.map((c) => c.text) : null, ctx && ctx.competencies.length ? ctxSource(ctx.competencies[0]) : 'document'), fact(ped && ped.learningOutcomes ? ped.learningOutcomes.competencies : null, 'profile')),
     targetHours,
-    units: fact(ctx ? ctx.units.length : null, 'document'),
-    sector: fact(b.sector, 'user'),
-    country: fact(b.pais, 'user'),
-    document: { present: !!ctx, contextVersion: input.academic ? input.academic.version : null, names: ctx ? ctx.documents.map((d) => d.name) : [] },
+    units: fact(withDocs && ctx ? ctx.units.length : null, 'document'),
+    sector: fact(b.sector, briefSource('sector')),
+    country: fact(b.pais, briefSource('pais')),
+    document: { present: withDocs, proposed: !withDocs && !!ctx && ctx.outcomes.some((o) => isProposed(o)), contextVersion: input.academic ? input.academic.version : null, names: ctx ? ctx.documents.map((d) => d.name) : [] },
     pedagogy: {
       version: input.pedagogy ? input.pedagogy.version : 0,
       primaryApproach: ped ? ped.primaryApproach : null,
       owners,
-      derivedFromDocument: !!ctx && DERIVED_FIELDS.some((f) => owners[f] === 'document'),
+      derivedFromDocument: withDocs && DERIVED_FIELDS.some((f) => owners[f] === 'document'),
       userFieldsDifferingFromDocument: differing,
     },
     institutionId: input.institutionId,
