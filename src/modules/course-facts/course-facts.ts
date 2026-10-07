@@ -140,6 +140,8 @@ export function pedagogyFieldOwners(
   record: PedagogyDerivation | null,
   /** Lo que propone el documento vigente y, al guardar una versión nueva, también la anterior. */
   suggested: PedagogicalProfile | null | (PedagogicalProfile | null)[],
+  /** LOOP 8.3 (review L83 I-3): horas que propuso Cursia (metadata.designHours); con ese valor no son del docente. */
+  proposedHours: number | null = null,
 ): Record<DerivedField, FieldOwner> {
   const out = {} as Record<DerivedField, FieldOwner>;
   const sugs = (Array.isArray(suggested) ? suggested : [suggested]).filter((x): x is PedagogicalProfile => !!x);
@@ -147,6 +149,7 @@ export function pedagogyFieldOwners(
     const v = derivedFieldValue(current, f);
     const sha = fieldSha(v);
     if (isEmptyValue(v)) out[f] = 'empty';
+    else if (f === 'targetHours' && typeof proposedHours === 'number' && v === proposedHours) out[f] = 'empty';
     else if (record && record.fields[f] === sha) out[f] = 'document';
     // Igual al documento SOLO sin registro (perfiles anteriores a 8.1, «Usar en el perfil»). Con registro, un valor que
     // el docente escribió y coincide con el documento sigue siendo suyo (review L81 R2-M4).
@@ -255,6 +258,8 @@ export interface FactsInput {
   derivation: PedagogyDerivation | null;
   /** Lo que el documento vigente propone para el perfil (suggestProfileFromContext), o null sin documento. */
   suggested: PedagogicalProfile | null;
+  /** LOOP 8.3: horas que propuso Cursia y el docente aceptó (courses.metadata.designHours). */
+  proposedHours?: number | null;
 }
 
 const PLACEHOLDER_TITLES = ['Curso Virtual', 'Curso sin título', 'Tu curso'];
@@ -318,7 +323,7 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
   const ctx = input.academic ? input.academic.context : null;
   const ped = input.pedagogy ? input.pedagogy.profile : null;
   const found = <T>(f: { status: string; value: T | null } | undefined): T | null => (f && f.status !== 'missing' ? f.value : null);
-  const owners = pedagogyFieldOwners(ped, input.derivation, input.suggested);
+  const owners = pedagogyFieldOwners(ped, input.derivation, input.suggested, input.proposedHours ?? null);
   const withDocs = !!ctx && Array.isArray(ctx.documents) && ctx.documents.length > 0;
   const docSector = ctx && withDocs ? sectorFromAcademicContext(ctx) : null;
   const ctxFact = <T>(f: { status: string; value: T | null } | undefined): Fact<T> =>
@@ -342,7 +347,8 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
   const pedHours = ped && typeof ped.targetHours === 'number' ? ped.targetHours : null;
   // LOOP 8.2.1: horas que el perfil tiene porque las derivó del documento (dueño = documento) se muestran «del
   // documento»; solo las que decidió el docente son «elegidas por ti» (y si difieren del documento, hay conflicto).
-  const targetHours = first<number>(fact(pedHours, withDocs && owners.targetHours === 'document' ? 'document' : 'profile'), fact(docHours, 'document'));
+  const hoursProposed = typeof input.proposedHours === 'number' && pedHours === input.proposedHours;
+  const targetHours = first<number>(fact(pedHours, hoursProposed ? 'inferred' : withDocs && owners.targetHours === 'document' ? 'document' : 'profile'), fact(docHours, 'document'));
 
   // Datos del perfil que decidió el docente y difieren de lo que propone el documento: se respetan y se informan.
   const differing: DerivedField[] = [];

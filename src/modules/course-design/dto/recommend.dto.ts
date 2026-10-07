@@ -1,5 +1,5 @@
 import { Type } from 'class-transformer';
-import { IsIn, IsOptional, IsString, MaxLength, ValidateNested } from 'class-validator';
+import { IsIn, IsNumber, IsOptional, IsString, MaxLength, ValidateNested } from 'class-validator';
 
 /** LOOP 8.3 · «Ajustar»: cambios sobre el diseño que se recalcula (nada se guarda). Ausente = lo que ya decidió el curso. */
 export class DesignAdjustDto {
@@ -28,3 +28,10 @@ export class RecommendDesignDto {
   adjust?: DesignAdjustDto;
 }
 
+
+/** Review L83 I-3: horas propuestas por Cursia que «Usar este diseño» guardó (null = las horas no son de Cursia). */
+export class HoursOriginDto {
+  @IsOptional()
+  @IsNumber()
+  proposed?: number | null;
+}

@@ -222,6 +222,8 @@ async function dbChecks() {
     const blueprints = new CourseBlueprintsService(ds);
     const pedagogy = new PedagogyService(ds, coursesStub);
     const design = new CourseDesignService(ds, coursesStub, pedagogy);
+    const { CourseFactsService } = loadDist('modules/course-facts/course-facts.service.js');
+    const facts = new CourseFactsService(ds);
     const structure = new CourseStructureService(ds.getRepository(CourseModule), ds.getRepository(CourseChapter), coursesStub, ds, blueprints);
     const OWNER = '11111111-2222-4333-8444-555555555555';
     const OTHER = '99999999-8888-4777-8666-555555555555';
@@ -316,6 +318,56 @@ async function dbChecks() {
       const [legacy] = await ds.query(`insert into public.courses (owner_id, title) values ($1, 'Legacy') returning id`, [OWNER]);
       await rejectsRe(design.recommend(legacy.id, OWNER, {}), /solo admite cursos "dynamic"/, 'legacy', 400);
     });
+    await check('DS10 (review L83 I-4) perfil sin horas + documento con 64 h → la recomendación usa 64 h del documento (no propone otra)', async () => {
+      const cid = await docCourse('Sin horas en el perfil');
+      const p = (await profiles.getCurrent(cid, OWNER, 'pedagogy')).profile;
+      const noHours = JSON.parse(JSON.stringify(p)); delete noHours.targetHours; delete noHours.designRules;
+      await profiles.append(cid, OWNER, 'pedagogy', noHours, (await profiles.getCurrent(cid, OWNER, 'pedagogy')).version);
+      const r = await design.recommend(cid, OWNER, {});
+      eq([r.hours.target, r.hours.source], [64, 'document'], 'las del documento');
+    });
+
+    await check('DS11 (review L83 I-3) horas propuestas → «Usar» las registra como propuestas: «Lo que sabemos» = inferidas y un microcurrículo posterior las reemplaza', async () => {
+      const [c] = await ds.query(`insert into public.courses (owner_id, title, structure_version, final_exam_enabled, activity_engine) values ($1, 'Propuestas', 'dynamic', true, 'h5p') returning id`, [OWNER]);
+      for (let mi = 0; mi < 2; mi++) {
+        const [m] = await ds.query(`insert into public.course_modules (course_id, position, title) values ($1, $2, $3) returning id`, [c.id, mi, `Módulo ${mi + 1}`]);
+        for (let ci = 0; ci < 2; ci++) await ds.query(`insert into public.course_chapters (course_id, module_id, position, title, objective) values ($1, $2, $3, $4, 'Aplicar en un caso')`, [c.id, m.id, ci, `Tema ${mi + 1}.${ci + 1}`]);
+      }
+      await profiles.append(c.id, OWNER, 'academic', A.buildProposedContext(null, { outcomes: ['Calcula indicadores', 'Elabora un tablero'] }));
+      const card = await design.recommend(c.id, OWNER, {});
+      eq(card.hours.source, 'proposed', 'propuestas');
+      await rejectsRe(design.recordHoursOrigin(c.id, OWNER, card.hours.target), /HOURS_NOT_SAVED/, 'sin guardar el perfil no se registra', 400);
+      await profiles.append(c.id, OWNER, 'pedagogy', card.profile, (await profiles.getCurrent(c.id, OWNER, 'pedagogy')).version);
+      await design.recordHoursOrigin(c.id, OWNER, card.hours.target);
+      const again = await design.recommend(c.id, OWNER, {});
+      eq([again.hours.source, again.hours.target, /Cursia propuso/.test(again.hours.reason || '')], ['proposed', card.hours.target, true], 'siguen siendo propuestas');
+      const f = await facts.getFacts(c.id, OWNER);
+      eq([f.targetHours.value, f.targetHours.source, f.conflicts.length], [card.hours.target, 'inferred', 0], 'Lo que sabemos: inferidas');
+      const r = await profiles.append(c.id, OWNER, 'academic', doc, (await profiles.getCurrent(c.id, OWNER, 'academic')).version);
+      eq(r.derivedPedagogy.applied, true, 'derivado');
+      const f2 = await facts.getFacts(c.id, OWNER);
+      eq([f2.targetHours.value, f2.targetHours.source, f2.conflicts.filter((x) => x.field === 'pedagogy.targetHours').length], [64, 'document', 0], 'el documento reemplaza las propuestas sin conflicto');
+      const legit = await design.recommend(c.id, OWNER, { adjust: { targetHours: 40 } });
+      await profiles.append(c.id, OWNER, 'pedagogy', legit.profile, (await profiles.getCurrent(c.id, OWNER, 'pedagogy')).version);
+      eq((await facts.getFacts(c.id, OWNER)).targetHours.source, 'profile', 'las que elige el docente son suyas');
+    });
+
+    await check('DS12 video fijado entre la tarjeta y «Aplicar» → 409 visible; un cambio manual SIN fijar libera el valor fijado; fijados de capítulos borrados no cuentan', async () => {
+      const cid = await docCourse('Carrera de fijados');
+      const card = await design.recommend(cid, OWNER, {});
+      const v = (await profiles.getCurrent(cid, OWNER, 'pedagogy')).version;
+      await profiles.append(cid, OWNER, 'pedagogy', card.profile, v);
+      const ch = card.design.modules[0].chapters.find((x) => x.kind === 'content' && x.videoEnabled && !x.proposed);
+      const [mod] = await ds.query(`select module_id from public.course_chapters where id = $1`, [ch.id]);
+      await structure.updateChapter(cid, mod.module_id, ch.id, OWNER, { videoEnabled: false, pinVideo: true, expectedCounter: await counter(cid) });
+      await rejectsRe(structure.applyDistribution(cid, OWNER, { expectedCounter: await counter(cid), proposalSha256: card.design.proposalSha256 }), /PROPOSAL_CHANGED/, 'la tarjeta vieja no se aplica', 409);
+      await structure.updateChapter(cid, mod.module_id, ch.id, OWNER, { videoEnabled: true, expectedCounter: await counter(cid) });
+      eq((await design.recommend(cid, OWNER, {})).pinnedChapters, 0, 'el cambio sin fijar libera');
+      await structure.updateChapter(cid, mod.module_id, ch.id, OWNER, { videoEnabled: false, pinVideo: true, expectedCounter: await counter(cid) });
+      await ds.query(`update public.courses set metadata = jsonb_set(metadata, '{designPins}', (metadata -> 'designPins') || '{"00000000-0000-4000-8000-000000000999":{"video":true}}'::jsonb) where id = $1`, [cid]);
+      eq((await design.recommend(cid, OWNER, {})).pinnedChapters, 1, 'solo los fijados de capítulos que existen');
+    });
+
   } finally {
     if (ds) await ds.destroy().catch(() => {});
     for (const [k, v] of [['DYNAMIC_COURSE_STRUCTURE', saved.flag], ['DYNAMIC_V2_ALLOWED_OWNERS', saved.allow], ['ALLOW_UNOWNED_COURSES', saved.unowned], ['DYNAMIC_MANIFEST_RULES_VERSION', saved.rules], ['DYNAMIC_ACTIVITY_TYPE_RULES', saved.atr]]) {

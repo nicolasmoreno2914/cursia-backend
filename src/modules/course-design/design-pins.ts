@@ -50,3 +50,25 @@ export async function clearDesignPins(q: Q, courseId: number): Promise<number> {
   await q.query(`update public.courses set metadata = coalesce(metadata, '{}'::jsonb) - '${DESIGN_PINS_KEY}' where id = $1`, [courseId]);
   return Object.keys(before).length;
 }
+
+/**
+ * LOOP 8.3 (review L83 I-3) · Horas que PROPUSO Cursia y el docente aceptó con «Usar este diseño»: no son una decisión
+ * del docente. courses.metadata.designHours = { proposed: número }. Mientras el perfil tenga ese mismo valor, «Lo que
+ * sabemos» las muestra como propuestas y un microcurrículo posterior las reemplaza por las suyas.
+ */
+export const DESIGN_HOURS_KEY = 'designHours';
+export function parseProposedHours(v: unknown): number | null {
+  const p = v && typeof v === 'object' && !Array.isArray(v) ? (v as { proposed?: unknown }).proposed : null;
+  return typeof p === 'number' && Number.isFinite(p) && p > 0 ? p : null;
+}
+export async function loadProposedHours(q: Q, courseId: number): Promise<number | null> {
+  const [row] = await q.query(`select metadata -> '${DESIGN_HOURS_KEY}' as h from public.courses where id = $1`, [courseId]);
+  return parseProposedHours(row ? (typeof row.h === 'string' ? JSON.parse(row.h) : row.h) : null);
+}
+export async function setProposedHours(q: Q, courseId: number, proposed: number | null): Promise<void> {
+  if (proposed === null) {
+    await q.query(`update public.courses set metadata = coalesce(metadata, '{}'::jsonb) - '${DESIGN_HOURS_KEY}' where id = $1`, [courseId]);
+    return;
+  }
+  await q.query(`update public.courses set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), $2::text[], jsonb_build_object('proposed', $3::numeric), true) where id = $1`, [courseId, [DESIGN_HOURS_KEY], proposed]);
+}

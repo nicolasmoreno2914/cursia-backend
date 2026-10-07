@@ -9,7 +9,7 @@ import { loadCurrentAcademicContext } from '../academic-context/academic-db';
 import { loadCourseFacts } from '../course-facts/course-facts-db';
 import { isValidTargetHours } from '../study-time/target-hours';
 import { defaultApproachRegistry } from '../pedagogy/builtin-approaches';
-import { clearDesignPins, loadDesignPins } from './design-pins';
+import { clearDesignPins, loadProposedHours, setProposedHours } from './design-pins';
 import { ApproachSuggestion, proposeTargetHours, recommendApproachFromFacts } from './design-recommendation';
 import { DesignAdjustDto, RecommendDesignDto } from './dto/recommend.dto';
 
@@ -50,7 +50,12 @@ export class CourseDesignService {
       throw new BadRequestException(`Enfoque desconocido: ${JSON.stringify(adjust.approach)}`);
     }
     const saved = await loadCurrentPedagogicalProfile(this.dataSource, courseId);
-    const academic = await loadCurrentAcademicContext(this.dataSource, courseId).catch(() => null);
+    // Review L83 M-7: solo una base sin la tabla de perfiles se trata como «sin contexto»; cualquier otro error se ve.
+    const academic = await loadCurrentAcademicContext(this.dataSource, courseId).catch((err) => {
+      if (err && (err as { code?: string }).code === '42P01') return null;
+      throw err;
+    });
+    const proposedHours = await loadProposedHours(this.dataSource, courseId);
     const facts = await loadCourseFacts(this.dataSource, courseId);
     const base: any = saved ? JSON.parse(JSON.stringify(saved.profile)) : emptyPedagogicalProfile();
     delete base.designRules;
@@ -80,8 +85,13 @@ export class CourseDesignService {
     base.designPreferences = prefs;
 
     // Horas: la meta explícita (docente o documento) NUNCA se redondea; sin meta, la propone Cursia.
+    // Review L83 I-4: sin horas en el perfil, las del documento (las mismas que muestra «Lo que entendimos»).
+    if (typeof base.targetHours !== 'number' && adjust.targetHours === undefined && facts.targetHours.source === 'document' && typeof facts.targetHours.value === 'number') {
+      base.targetHours = facts.targetHours.value;
+    }
     let hoursSource: 'user' | 'document' | 'proposed' | 'adjusted' =
-      facts.targetHours.source === 'document' ? 'document' : 'user';
+      typeof proposedHours === 'number' && base.targetHours === proposedHours ? 'proposed'
+        : facts.targetHours.source === 'document' ? 'document' : 'user';
     let proposal: ReturnType<typeof proposeTargetHours> | null = null;
     if (typeof adjust.targetHours === 'number') {
       if (adjust.targetHours !== base.targetHours) hoursSource = 'adjusted';
@@ -97,7 +107,6 @@ export class CourseDesignService {
     const profile = normalizePedagogicalProfile(base);
     const dr = await this.pedagogy.dryRunCourse(courseId, ownerId, { profile });
     const dist = dr.distribution;
-    const pins = await loadDesignPins(this.dataSource, courseId);
     const chapterOutcomes = await this.chapterOutcomes(courseId);
     const savedComparable = saved ? JSON.stringify(normalizePedagogicalProfile(Object.fromEntries(Object.entries(saved.profile as any).filter(([k]) => k !== 'designRules')))) : null;
     const approachDef = profile.primaryApproach ? registry.get(profile.primaryApproach) : null;
@@ -113,9 +122,10 @@ export class CourseDesignService {
         ? { id: profile.primaryApproach, label: approachDef ? approachDef.label : profile.primaryApproach, source: approachSource,
           reasons: approachSource === 'recommended' && suggestion ? suggestion.reasons : [] }
         : null,
-      hours: { target: profile.targetHours ?? null, source: hoursSource, ...(proposal ? { proposedFrom: proposal.base, reason: proposal.reason } : {}) },
+      hours: { target: profile.targetHours ?? null, source: hoursSource, ...(proposal ? { proposedFrom: proposal.base, reason: proposal.reason } : hoursSource === 'proposed' ? { reason: `Cursia propuso ${profile.targetHours} h para este curso.` } : {}) },
       preferences: { emphasis: prefs.emphasis || 'balanced', applicationActivities: prefs.applicationActivities || 'auto', audiovisual: prefs.audiovisual },
-      pinnedChapters: Object.keys(pins).length,
+      // Review L83 M-1: solo los fijados que el diseño usa (capítulos de contenido que existen).
+      pinnedChapters: dist ? dist.modules.reduce((n, m) => n + m.chapters.filter((c) => c.videoPinned && c.kind === 'content' && !c.proposed).length, 0) : 0,
       design: dist
         ? {
           status: dist.status,
@@ -142,6 +152,25 @@ export class CourseDesignService {
       cost: providers && providers.estimateUsd ? { min: providers.estimateUsd.min, expected: providers.estimateUsd.expected, max: providers.estimateUsd.max, note: providers.estimateNote } : null,
       outcomes: academic ? academic.context.outcomes.map((o) => ({ id: o.id, text: o.text })) : [],
     };
+  }
+
+  /**
+   * Review L83 I-3: «Usar este diseño» con horas que propuso Cursia → quedan registradas como propuestas (no del docente);
+   * con horas del docente o del documento, el registro se borra. Valida contra el perfil guardado: nunca se marca como
+   * propuesto un valor distinto del vigente.
+   */
+  async recordHoursOrigin(courseId: number, ownerId: string, proposed: number | null) {
+    assertDynamicOwnerAllowed(ownerId);
+    await this.loadCourse(courseId, ownerId);
+    if (proposed !== null) {
+      if (!isValidTargetHours(proposed)) throw new BadRequestException('proposed debe ser un número de 1 a 500, en pasos de media hora, o null.');
+      const saved = await loadCurrentPedagogicalProfile(this.dataSource, courseId);
+      if (!saved || (saved.profile as any).targetHours !== proposed) {
+        throw new BadRequestException('HOURS_NOT_SAVED: guarda primero el perfil con esas horas.');
+      }
+    }
+    await setProposedHours(this.dataSource, courseId, proposed);
+    return { proposed };
   }
 
   /** «Liberar»: los valores fijados vuelven a decidirlos Cursia. */
