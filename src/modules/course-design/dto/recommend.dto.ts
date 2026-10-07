@@ -1,5 +1,5 @@
 import { Type } from 'class-transformer';
-import { IsIn, IsInt, IsNumber, IsOptional, IsString, MaxLength, Min, ValidateNested } from 'class-validator';
+import { ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, MaxLength, Min, ValidateNested } from 'class-validator';
 
 /** LOOP 8.3 · «Ajustar»: cambios sobre el diseño que se recalcula (nada se guarda). Ausente = lo que ya decidió el curso. */
 export class DesignAdjustDto {
@@ -26,6 +26,26 @@ export class RecommendDesignDto {
   @ValidateNested()
   @Type(() => DesignAdjustDto)
   adjust?: DesignAdjustDto;
+
+  /** LOOP 8.6C · «Volver al requisito del documento»: la vista previa ignora la decisión registrada de esos campos. */
+  @IsOptional() @IsArray() @ArrayMaxSize(2) @IsIn(['audiovisual', 'applicationActivities'], { each: true })
+  clearDecisions?: ('audiovisual' | 'applicationActivities')[];
+}
+
+/**
+ * LOOP 8.6C · Decisiones del docente que pueden apartarse del documento (las registra «Usar este diseño»). null = ya no
+ * hay decisión del docente en ese campo (vuelve a mandar el documento).
+ */
+export class RequirementDecisionsDto {
+  @IsOptional() @IsIn(['less', 'recommended', 'more'])
+  audiovisual?: 'less' | 'recommended' | 'more' | null;
+
+  @IsOptional() @IsIn(['auto', 'practice_only', 'none'])
+  applicationActivities?: 'auto' | 'practice_only' | 'none' | null;
+
+  /** Review L86C I1: prioridad audiovisual que eligió Cursia para cumplir el documento (null = ninguna). */
+  @IsOptional() @IsIn(['less', 'recommended', 'more'])
+  cursiaAudiovisual?: 'less' | 'recommended' | 'more' | null;
 }
 
 

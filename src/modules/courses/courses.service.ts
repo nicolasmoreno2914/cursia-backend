@@ -2,6 +2,7 @@ import { DESIGN_HOURS_KEY, DESIGN_PINS_KEY } from '../course-design/design-pins'
 import { STRUCTURE_ORIGIN_KEY } from '../course-structure/structure-authority';
 import { BRIEF_KEY, PEDAGOGY_DERIVATION_KEY } from '../course-facts/course-facts';
 import { DOCUMENT_REQUIREMENTS_KEY, REQUIREMENTS_SELECTION_KEY } from '../academic-context/requirements/document-requirements';
+import { REQUIREMENT_EXCEPTIONS_KEY } from '../academic-context/requirements/requirement-authority';
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -15,7 +16,7 @@ import { readActivityTypeRulesConfig } from '../generation-manifests/manifest-ru
 /** LOOP 8.0/8.1: claves de courses.metadata que solo escriben sus servicios. */
 const PROTECTED_METADATA_KEYS = [STRUCTURE_ORIGIN_KEY, BRIEF_KEY, PEDAGOGY_DERIVATION_KEY, DESIGN_PINS_KEY, DESIGN_HOURS_KEY,
   // LOOP 8.6B (review I1): requisitos leídos del documento y la alternativa elegida (solo los escribe academic-context).
-  DOCUMENT_REQUIREMENTS_KEY, REQUIREMENTS_SELECTION_KEY];
+  DOCUMENT_REQUIREMENTS_KEY, REQUIREMENTS_SELECTION_KEY, REQUIREMENT_EXCEPTIONS_KEY];
 
 /**
  * EV6 H5P v2 (H2 fix round 1, I-2): «Repaso» (Dialog Cards) arranca ENCENDIDO solo en cursos

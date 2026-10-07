@@ -22,6 +22,7 @@ import {
 import type { ActivityTypeRulesVersion } from '../generation-manifests/activity-type-rules';
 import { createHash } from 'crypto';
 import { estimateCost } from '../finops/estimator';
+import type { DistributorRequirementConstraints } from '../academic-context/requirements/requirement-authority';
 import { DistributionResult, distributeCourseHours, estimateCourseStudyTime, StudyTimeEstimate, studyTimeInputFromManifest } from '../study-time';
 import { ITEM_TYPE_OPERATIONS, isFinopsItemType, providerOfOperation } from '../finops/operations';
 import { estimateItemsForRun } from '../finops/run-budget';
@@ -97,6 +98,8 @@ export interface DryRunInput {
   alignment?: { priorKnowledgeDeclared?: boolean | null };
   /** LOOP 8.3: valores fijados por el docente (courses.metadata.designPins) que el distribuidor respeta. */
   designPins?: Record<string, { video?: boolean }> | null;
+  /** LOOP 8.6C: requisitos obligatorios del documento que el distribuidor cumple (null = sin requisitos). */
+  requirementConstraints?: DistributorRequirementConstraints | null;
 }
 
 export interface ProviderPlan {
@@ -696,7 +699,7 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
       // NUNCA sobre la vista con los cambios de estructura sugeridos (videos/actividades/repaso): esos no los escribe
       // «Aplicar diseño» (los decide el docente en el editor), y contarlos haría que lo mostrado ≠ lo aplicado.
       const lockShaped = rules ? applyPedagogyToSnapshot(base, rules) : base;
-      const dist = distributeCourseHours({ snapshot: lockShaped, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile), pins: input.designPins ?? null });
+      const dist = distributeCourseHours({ snapshot: lockShaped, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile), pins: input.designPins ?? null, requirements: input.requirementConstraints ?? null });
       const materialized = materializeOrError(lockShaped, dist, (plain) => {
         const ms = side(rules ? applyPedagogyToSnapshot(plain, rules) : plain, activityTypeRules);
         return {

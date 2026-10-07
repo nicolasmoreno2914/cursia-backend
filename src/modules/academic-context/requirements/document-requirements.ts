@@ -244,6 +244,12 @@ export interface RequirementCheck {
   chosenBy: RequirementChooser;
   /** Por qué no se puede verificar (o una aclaración). */
   note?: string;
+  /** El requisito no se puede cumplir con lo que Cursia sabe producir (p. ej. dos videos por capítulo): conflicto. */
+  impossible?: true;
+  /** LOOP 8.6C: severidad que le da Verificación (la interfaz la usa para no contradecirla). */
+  severity?: 'ok' | 'info' | 'warning' | 'critical';
+  /** Re-review L86C m2: la explicación de Verificación (p. ej. un choque de horas con la estructura). */
+  detail?: string;
 }
 
 /** D6: horas exactas con tolerancia ±5 %, mínimo ±1 h. */
@@ -275,13 +281,20 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
   const chapters = mods.flatMap((m) => m.chapters);
   const proposedStructure = chapters.some((c) => c.proposed);
   const structureBy: RequirementChooser = d.structureByTeacher && !proposedStructure ? 'teacher' : 'cursia';
+  // Review L86C M8: los capítulos que propone Cursia no cambian cuántos módulos hay: la cantidad de módulos es del docente
+  // si él armó la estructura, aunque el diseño agregue capítulos.
+  const modulesBy: RequirementChooser = d.structureByTeacher ? 'teacher' : 'cursia';
   const videosBy: RequirementChooser = d.audiovisualByTeacher || chapters.some((c) => c.videoPinned) ? 'teacher' : 'cursia';
   const appBy: RequirementChooser = d.applicationByTeacher || chapters.some((c) => c.applicationPinned) ? 'teacher' : 'cursia';
   const hoursBy: RequirementChooser = d.hoursSource === 'user' || d.hoursSource === 'adjusted' ? 'teacher' : d.hoursSource === 'document' ? 'document' : 'cursia';
   const modExams = mods.filter((m) => m.examEnabled).length;
   const finalExam = Math.max(0, d.evaluations - modExams);
   const out: RequirementCheck[] = [];
-  const nv = (r: DocumentRequirement, note: string, chosenBy: RequirementChooser = 'cursia') => out.push({ requirementId: r.id, status: 'not_verifiable', actual: {}, chosenBy, note });
+  const nv = (r: DocumentRequirement, note: string, chosenBy: RequirementChooser = 'cursia', impossible = false) =>
+    out.push({ requirementId: r.id, status: 'not_verifiable', actual: {}, chosenBy, note, ...(impossible ? { impossible: true as const } : {}) });
+  // Review L86C M5: un requisito de un módulo que el diseño no tiene NO se cumple (no es «no verificable»).
+  const missingModule = (r: DocumentRequirement, n: number, chosenBy: RequirementChooser) =>
+    out.push({ requirementId: r.id, status: 'unmet', actual: { value: 0 }, chosenBy, note: `El diseño no tiene módulo ${n}.` });
   const one = (r: DocumentRequirement, a: number, chosenBy: RequirementChooser, hours = false) =>
     out.push({ requirementId: r.id, status: satisfies(r, a, hours) ? 'met' : 'unmet', actual: { value: hours ? round1(a) : a }, chosenBy });
   const each = (r: DocumentRequirement, values: number[], chosenBy: RequirementChooser) =>
@@ -302,14 +315,14 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
     switch (r.kind) {
       case 'modules':
         if (s.level !== 'course') { nv(r, 'Cursia todavía no mide este alcance en el diseño.'); break; }
-        one(r, mods.length, structureBy);
+        one(r, mods.length, modulesBy);
         break;
       case 'chapters':
         if (s.level === 'course') one(r, chapters.length, structureBy);
         else if (s.level === 'module' && isEach) each(r, mods.map((m) => m.chapters.length), structureBy);
         else if (s.level === 'module' && 'index' in s) {
           const m = mods[s.index - 1];
-          if (!m) nv(r, `El diseño no tiene módulo ${s.index}.`, structureBy); else one(r, m.chapters.length, structureBy);
+          if (!m) missingModule(r, s.index, modulesBy); else one(r, m.chapters.length, structureBy);
         } else nv(r, 'Cursia todavía no mide este alcance en el diseño.');
         break;
       case 'target_hours':
@@ -317,7 +330,7 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
           if (typeof d.targetHours !== 'number') nv(r, 'El diseño todavía no tiene horas.', hoursBy); else one(r, d.targetHours, hoursBy, true);
         } else if (s.level === 'module' && 'index' in s) {
           const m = mods[s.index - 1];
-          if (!m) nv(r, `El diseño no tiene módulo ${s.index}.`, structureBy);
+          if (!m) missingModule(r, s.index, modulesBy);
           else one(r, m.chapters.reduce((a, c) => a + c.hours, 0), 'cursia', true);
         } else if (s.level === 'module' && isEach) {
           out.push({ requirementId: r.id, status: mods.length && mods.every((m) => satisfies(r, m.chapters.reduce((a, c) => a + c.hours, 0), true)) ? 'met' : 'unmet', actual: { each: mods.map((m) => round1(m.chapters.reduce((a, c) => a + c.hours, 0))) }, chosenBy: 'cursia' });
@@ -332,7 +345,7 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
           if (r.mode === 'max' || r.value <= 1) {
             const target = chapters.filter((c) => (s.chapterKind ? c.kind === s.chapterKind : c.kind !== 'practice'));
             each(r, target.map((c) => (c.videoEnabled ? 1 : 0)), videosBy);
-          } else nv(r, 'Cursia produce un video por capítulo: no puede cumplir más de uno por capítulo todavía.');
+          } else nv(r, 'Cursia produce un video por capítulo: no puede cumplir más de uno por capítulo todavía.', 'cursia', true);
         } else nv(r, 'Cursia todavía no mide este alcance en el diseño.');
         break;
       }
@@ -345,7 +358,7 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
             // Las prácticas también llevan Actividad de Aplicación (a diferencia del video, que es de los capítulos de contenido).
             const target = chapters.filter((c) => (s.chapterKind ? c.kind === s.chapterKind : true));
             each(r, target.map((c) => (c.applicationMinutes ? 1 : 0)), appBy);
-          } else nv(r, 'Cursia diseña como mucho una Actividad de Aplicación por capítulo.');
+          } else nv(r, 'Cursia diseña como mucho una Actividad de Aplicación por capítulo.', 'cursia', true);
         } else nv(r, 'Cursia todavía no mide este alcance en el diseño.');
         break;
       }
