@@ -1544,6 +1544,104 @@ function reservationBookkeeping(ev) {
     // enfoque → 64 h → «Cursia recomienda» → Ver diseño → Ajustar → nuevo diseño → Aplicar → Blueprint → Manifest →
     // Actividades de Aplicación → coherencia → costo simulado → generación → empaque → impacto de un cambio →
     // regeneración parcial (= el impacto previsto) → re-empaque → restauración en Moodle (abajo, con estudiante real).
+    // LOOP 8.5 · Generación con proveedores FALSOS → empaque → impacto de un cambio → regeneración parcial → re-empaque.
+    // Compartido por E11 (endpoints de diseño de siempre) y E17 (flujo V2); deja results.courses[tag] y [tag + 'regen'].
+    const fullGenerationFlow = async (tag, { courseId, title, n, st, M, apps, assessment, hoursFrozen, net0, extra = {} }) => {
+      const DRY = D('modules/pedagogy/dry-run.js');
+      const usd = (plan) => (plan && plan.estimateUsd ? Number(plan.estimateUsd.expected) : null);
+      // 11. Generación completa con proveedores FALSOS (Videogen local, Gamma/TTS mock, LLM falso).
+      const mods = st.modules;
+      llm.st.courseId = courseId;
+      llm.st.chapterByTitle.clear(); llm.st.moduleByTitle.clear(); llm.st.moduleOfChapter.clear();
+      for (const m of mods) { llm.st.moduleByTitle.set(m.title, m.id); for (const x of m.chapters) { llm.st.chapterByTitle.set(x.title, x.id); llm.st.moduleOfChapter.set(x.id, m.id); } }
+      const ctx = { nombre: title, ...CTX, scormTemplateIds: S.templates };
+      const body = { ...ctx, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
+      let start = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest/runs`, body);
+      const estM = /estimateId=([0-9a-f-]{36})/.exec(String(start.error || ''));
+      if (start.status === 409 && estM) {
+        await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+                 values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e ${tag}: aprobación del run (proveedores FALSOS locales)')`, [courseId, estM[1]]);
+        start = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest/runs`, body);
+      }
+      ok(start.status === 201, `${tag}: run creado (Videogen falso, Gamma/TTS mock)`, { s: start.status, e: start.error });
+      if (start.status !== 201) throw new Error(`${tag}: run no creado: ${start.status} ${start.error}`);
+      const runA = start.data.run.id;
+      llm.st.tag = tag;
+      S.front.DYN_EXAM_BANK_MODE_ENABLED = false;
+      let stt = await waitRunTerminal(S.front.dynExecutorStart({ courseId, blueprintNumber: n, runId: runA }), `${tag} run`, undefined, runA);
+      const itemsA = await waitItemsDone(runA);
+      ok(stt.failed === 0 && !stt.fatalError && itemsA.every((i) => i.status === 'completed'), `${tag}: los ${itemsA.length} items generados sin fallos`, itemsA.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error_message || '').slice(0, 200)]));
+      ok(llm.st.unknown.length === 0, `${tag}: LLM falso sin prompts no reconocidos`, llm.st.unknown);
+      eq(itemsA.map((i) => i.item_key).sort(), M.items.map((i) => i.key).sort(), `${tag}: items generados = items del Manifest`);
+
+      // 12. Empaque (.mbz) con solucionarios ocultos y prohibidos al estudiante.
+      const P1 = await packageRun(tag, courseId, n, runA);
+      const z1 = await JSZip.loadAsync(P1.buf);
+      const solDirs = [];
+      for (const f of Object.keys(z1.files).filter((x) => /^activities\/page_\d+\/module\.xml$/.test(x))) {
+        if (/:application_solution<\/idnumber>/.test(await z1.file(f).async('string'))) solDirs.push(f.replace('/module.xml', ''));
+      }
+      const solOk = await Promise.all(solDirs.map(async (d) => /<roleid>5<\/roleid>\s*<capability>mod\/page:view<\/capability>\s*<permission>-1000<\/permission>/.test(await z1.file(`${d}/roles.xml`).async('string'))));
+      ok(solDirs.length === apps.length && solOk.every(Boolean), `${tag}: ${solDirs.length} solucionarios con mod/page:view PROHIBIDO al estudiante`);
+
+      // 13. Impacto de un cambio (un capítulo) = lo que después se regenera de verdad.
+      const m0 = st.modules[0];
+      const ch = m0.chapters.find((c) => c.kind !== 'practice');
+      const newTitle = `${ch.title} (revisado)`;
+      let st2 = await readStructure(courseId);
+      const up = await api('PATCH', `/courses/${courseId}/modules/${m0.id}/chapters/${ch.id}`, { title: newTitle, expectedCounter: st2.structureVersionCounter });
+      ok(up.status === 200, `${tag}: el docente edita el título de un capítulo`, { s: up.status, e: up.error });
+      llm.st.chapterByTitle.set(newTitle, ch.id);
+      const imp = await api('POST', `/courses/${courseId}/change-impact`, {});
+      const I = imp.data && imp.data.impact;
+      // Cambia ESE capítulo y, por dependencia, las prácticas de SU módulo (integran los contenidos del módulo); nada más.
+      const practiceOfM0 = new Set(m0.chapters.filter((c) => c.kind === 'practice').map((c) => c.id));
+      const changedCh = I ? I.chapters.filter((c) => !c.untouched).map((c) => c.chapterId) : [];
+      ok(imp.status === 200 && imp.data.fromRunId === runA && changedCh.includes(ch.id) && changedCh.every((id) => id === ch.id || practiceOfM0.has(id)) && I.toRun.some((k) => k === `content:${ch.id}`) && Number(I.estimatedChangeCostUsd) > 0,
+        `${tag}: impacto: cambian ese capítulo y las prácticas de su módulo (dependen de él); nada más; costo estimado > 0`, I && { changed: changedCh.length, practiceInModule: practiceOfM0.size, toRun: I.toRun.length, usd: I.estimatedChangeCostUsd });
+      st2 = await readStructure(courseId);
+      const lock2 = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st2.structureVersionCounter });
+      const n2 = lock2.data.blueprint.blueprintNumber;
+      const man2 = await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest`);
+      ok(lock2.status === 201 && man2.status === 201, `${tag}: nueva versión congelada (Blueprint + Manifest)`, { l: lock2.status, m: man2.status });
+      const plan = await api('GET', `/courses/${courseId}/blueprints/${n2}/manifest/invalidation-plan?fromRun=${runA}`);
+      const regen = plan.data.plan.actions.filter((a) => a.inTargetManifest && (a.action === 'REGENERATE' || a.action === 'GENERATE')).map((a) => a.itemKey).sort();
+      eq(regen, [...I.toRun, ...I.paidNew, ...I.paidRetry].sort(), `${tag}: el plan real de regeneración = el impacto previsto (mismos items)`);
+      eq(plan.data.costEstimate.estimatedChangeCostUsd, I.estimatedChangeCostUsd, `${tag}: «Generar solo lo que cambió» muestra el mismo costo que el impacto`);
+
+      // 14. Regeneración parcial real: solo los items del plan tienen una generación nueva.
+      let runB = await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest/runs`, { fromRun: runA });
+      const estB = /estimateId=([0-9a-f-]{36})/.exec(String(runB.error || ''));
+      if (runB.status === 409 && estB) {
+        await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+                 values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e ${tag}: regeneración parcial (LLM falso)')`, [courseId, estB[1]]);
+        runB = await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest/runs`, { fromRun: runA });
+      }
+      ok(runB.status === 201 && runB.data.invalidation && runB.data.invalidation.planSha256 === plan.data.plan.planSha256, `${tag}: regeneración parcial creada con el plan previsto (planSha256)`, { s: runB.status, e: runB.error });
+      const runBId = runB.data.run.id;
+      const calls0 = llm.st.v3calls.length;
+      stt = await waitRunTerminal(S.front.dynExecutorStart({ courseId, blueprintNumber: n2, runId: runBId }), `${tag} regeneración`, undefined, runBId);
+      const itemsB = await waitItemsDone(runBId);
+      ok(stt.failed === 0 && !stt.fatalError, `${tag}: la regeneración parcial terminó sin fallos`, stt);
+      const generatedB = itemsB.filter((i) => i.status === 'completed' && !(i.output_summary && i.output_summary.carriedFrom)).map((i) => i.item_key);
+      ok(regen.every((k) => itemsB.some((i) => i.item_key === k && i.status === 'completed')), `${tag}: cada item del plan quedó regenerado`, regen.filter((k) => !itemsB.some((i) => i.item_key === k && i.status === 'completed')));
+      ok(llm.st.v3calls.length - calls0 > 0 && llm.st.v3calls.length - calls0 <= regen.length * 3, `${tag}: solo se llamó al LLM para lo que cambió (${llm.st.v3calls.length - calls0} llamadas para ${regen.length} items)`);
+      void generatedB;
+      const P2 = await packageRun(`${tag}-regen`, courseId, n2, runBId);
+      const z2 = await JSZip.loadAsync(P2.buf);
+      const titles = await Promise.all(Object.keys(z2.files).filter((x) => /^sections\/section_\d+\/section\.xml$/.test(x)).map((f) => z2.file(f).async('string')));
+      ok(titles.some((x) => x.includes(newTitle.replace(/&/g, '&amp;'))), `${tag}: el re-empaque lleva el capítulo editado`);
+      ok(fs.existsSync(NET_LOG) && fs.readFileSync(NET_LOG, 'utf8').length === net0, `${tag}: 0 conexiones fuera de 127.0.0.1 en todo el flujo (netguard)`);
+      const reviewIds = (P) => ((P.job.output_summary || {}).h5pPackages || []).filter((p) => /^review_cards:/.test(p.itemKey)).map((p) => p.itemKey.slice('review_cards:'.length));
+      const modsOf = async () => (await readStructure(courseId)).modules.map((m) => ({ id: m.id, title: m.title, chapters: m.chapters.map((x) => ({ id: x.id, title: x.title })) }));
+      const modsB = await modsOf();
+      const modsA = modsB.map((m) => ({ ...m, chapters: m.chapters.map((x) => (x.id === ch.id ? { ...x, title: ch.title } : x)) }));
+      const info = (manifest, P, modules) => ({ courseId, spec: { passing: 70, engine: 'h5p' }, assessment, manifestModules: manifest.modules, features: manifest.features, applications: apps.length, reviewCardsChapterIds: reviewIds(P), modules });
+      results.courses[tag] = { ...info(M, P1, modsA), blueprintNumber: n, runId: runA, items: itemsA.length, hours: hoursFrozen, usd: usd(DRY.providerPlanFor(M)), ...extra };
+      results.courses[tag + 'regen'] = { ...info(man2.data.manifest.manifest, P2, modsB), blueprintNumber: n2, runId: runBId, regenerated: regen.length, usd: I.estimatedChangeCostUsd };
+      return { runA, itemsA, M2: man2.data.manifest.manifest, regen, I };
+    };
+
     if (RUN_E5) await step('v3-E11-flujo-completo', async () => {
       const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
       const DRY = D('modules/pedagogy/dry-run.js');
@@ -1654,96 +1752,8 @@ function reservationBookkeeping(ev) {
       ok(pre.status === 200 && pre.data.available === false && pre.data.reason === 'NO_PREVIOUS_RUN' && Math.abs(usd(pre.data.fullGeneration) - usd(DRY.providerPlanFor(M))) < 0.005,
         'E11: sin generar aún → el impacto ofrece el costo de generarlo completo (= Manifest)', { s: pre.status, d: pre.data && pre.data.reason });
 
-      // 11. Generación completa con proveedores FALSOS (Videogen local, Gamma/TTS mock, LLM falso).
-      const mods = st.modules;
-      llm.st.courseId = courseId;
-      llm.st.chapterByTitle.clear(); llm.st.moduleByTitle.clear(); llm.st.moduleOfChapter.clear();
-      for (const m of mods) { llm.st.moduleByTitle.set(m.title, m.id); for (const x of m.chapters) { llm.st.chapterByTitle.set(x.title, x.id); llm.st.moduleOfChapter.set(x.id, m.id); } }
-      const ctx = { nombre: title, ...CTX, scormTemplateIds: S.templates };
-      const body = { ...ctx, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
-      let start = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest/runs`, body);
-      const estM = /estimateId=([0-9a-f-]{36})/.exec(String(start.error || ''));
-      if (start.status === 409 && estM) {
-        await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
-                 values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e E11: aprobación del run (proveedores FALSOS locales)')`, [courseId, estM[1]]);
-        start = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest/runs`, body);
-      }
-      ok(start.status === 201, 'E11: run creado (Videogen falso, Gamma/TTS mock)', { s: start.status, e: start.error });
-      if (start.status !== 201) throw new Error(`E11: run no creado: ${start.status} ${start.error}`);
-      const runA = start.data.run.id;
-      llm.st.tag = 'E11';
-      S.front.DYN_EXAM_BANK_MODE_ENABLED = false;
-      let stt = await waitRunTerminal(S.front.dynExecutorStart({ courseId, blueprintNumber: n, runId: runA }), 'E11 run', undefined, runA);
-      const itemsA = await waitItemsDone(runA);
-      ok(stt.failed === 0 && !stt.fatalError && itemsA.every((i) => i.status === 'completed'), `E11: los ${itemsA.length} items generados sin fallos`, itemsA.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error_message || '').slice(0, 200)]));
-      ok(llm.st.unknown.length === 0, 'E11: LLM falso sin prompts no reconocidos', llm.st.unknown);
-      eq(itemsA.map((i) => i.item_key).sort(), M.items.map((i) => i.key).sort(), 'E11: items generados = items del Manifest');
-
-      // 12. Empaque (.mbz) con solucionarios ocultos y prohibidos al estudiante.
-      const P1 = await packageRun('E11', courseId, n, runA);
-      const z1 = await JSZip.loadAsync(P1.buf);
-      const solDirs = [];
-      for (const f of Object.keys(z1.files).filter((x) => /^activities\/page_\d+\/module\.xml$/.test(x))) {
-        if (/:application_solution<\/idnumber>/.test(await z1.file(f).async('string'))) solDirs.push(f.replace('/module.xml', ''));
-      }
-      const solOk = await Promise.all(solDirs.map(async (d) => /<roleid>5<\/roleid>\s*<capability>mod\/page:view<\/capability>\s*<permission>-1000<\/permission>/.test(await z1.file(`${d}/roles.xml`).async('string'))));
-      ok(solDirs.length === apps.length && solOk.every(Boolean), `E11: ${solDirs.length} solucionarios con mod/page:view PROHIBIDO al estudiante`);
-
-      // 13. Impacto de un cambio (un capítulo) = lo que después se regenera de verdad.
-      const m0 = st.modules[0];
-      const ch = m0.chapters.find((c) => c.kind !== 'practice');
-      const newTitle = `${ch.title} (revisado)`;
-      let st2 = await readStructure(courseId);
-      const up = await api('PATCH', `/courses/${courseId}/modules/${m0.id}/chapters/${ch.id}`, { title: newTitle, expectedCounter: st2.structureVersionCounter });
-      ok(up.status === 200, 'E11: el docente edita el título de un capítulo', { s: up.status, e: up.error });
-      llm.st.chapterByTitle.set(newTitle, ch.id);
-      const imp = await api('POST', `/courses/${courseId}/change-impact`, {});
-      const I = imp.data && imp.data.impact;
-      // Cambia ESE capítulo y, por dependencia, las prácticas de SU módulo (integran los contenidos del módulo); nada más.
-      const practiceOfM0 = new Set(m0.chapters.filter((c) => c.kind === 'practice').map((c) => c.id));
-      const changedCh = I ? I.chapters.filter((c) => !c.untouched).map((c) => c.chapterId) : [];
-      ok(imp.status === 200 && imp.data.fromRunId === runA && changedCh.includes(ch.id) && changedCh.every((id) => id === ch.id || practiceOfM0.has(id)) && I.toRun.some((k) => k === `content:${ch.id}`) && Number(I.estimatedChangeCostUsd) > 0,
-        'E11: impacto: cambian ese capítulo y las prácticas de su módulo (dependen de él); nada más; costo estimado > 0', I && { changed: changedCh.length, practiceInModule: practiceOfM0.size, toRun: I.toRun.length, usd: I.estimatedChangeCostUsd });
-      st2 = await readStructure(courseId);
-      const lock2 = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st2.structureVersionCounter });
-      const n2 = lock2.data.blueprint.blueprintNumber;
-      const man2 = await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest`);
-      ok(lock2.status === 201 && man2.status === 201, 'E11: nueva versión congelada (Blueprint + Manifest)', { l: lock2.status, m: man2.status });
-      const plan = await api('GET', `/courses/${courseId}/blueprints/${n2}/manifest/invalidation-plan?fromRun=${runA}`);
-      const regen = plan.data.plan.actions.filter((a) => a.inTargetManifest && (a.action === 'REGENERATE' || a.action === 'GENERATE')).map((a) => a.itemKey).sort();
-      eq(regen, [...I.toRun, ...I.paidNew, ...I.paidRetry].sort(), 'E11: el plan real de regeneración = el impacto previsto (mismos items)');
-      eq(plan.data.costEstimate.estimatedChangeCostUsd, I.estimatedChangeCostUsd, 'E11: «Generar solo lo que cambió» muestra el mismo costo que el impacto');
-
-      // 14. Regeneración parcial real: solo los items del plan tienen una generación nueva.
-      let runB = await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest/runs`, { fromRun: runA });
-      const estB = /estimateId=([0-9a-f-]{36})/.exec(String(runB.error || ''));
-      if (runB.status === 409 && estB) {
-        await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
-                 values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e E11: regeneración parcial (LLM falso)')`, [courseId, estB[1]]);
-        runB = await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest/runs`, { fromRun: runA });
-      }
-      ok(runB.status === 201 && runB.data.invalidation && runB.data.invalidation.planSha256 === plan.data.plan.planSha256, 'E11: regeneración parcial creada con el plan previsto (planSha256)', { s: runB.status, e: runB.error });
-      const runBId = runB.data.run.id;
-      const calls0 = llm.st.v3calls.length;
-      stt = await waitRunTerminal(S.front.dynExecutorStart({ courseId, blueprintNumber: n2, runId: runBId }), 'E11 regeneración', undefined, runBId);
-      const itemsB = await waitItemsDone(runBId);
-      ok(stt.failed === 0 && !stt.fatalError, 'E11: la regeneración parcial terminó sin fallos', stt);
-      const generatedB = itemsB.filter((i) => i.status === 'completed' && !(i.output_summary && i.output_summary.carriedFrom)).map((i) => i.item_key);
-      ok(regen.every((k) => itemsB.some((i) => i.item_key === k && i.status === 'completed')), 'E11: cada item del plan quedó regenerado', regen.filter((k) => !itemsB.some((i) => i.item_key === k && i.status === 'completed')));
-      ok(llm.st.v3calls.length - calls0 > 0 && llm.st.v3calls.length - calls0 <= regen.length * 3, `E11: solo se llamó al LLM para lo que cambió (${llm.st.v3calls.length - calls0} llamadas para ${regen.length} items)`);
-      void generatedB;
-      const P2 = await packageRun('E11-regen', courseId, n2, runBId);
-      const z2 = await JSZip.loadAsync(P2.buf);
-      const titles = await Promise.all(Object.keys(z2.files).filter((x) => /^sections\/section_\d+\/section\.xml$/.test(x)).map((f) => z2.file(f).async('string')));
-      ok(titles.some((x) => x.includes(newTitle.replace(/&/g, '&amp;'))), 'E11: el re-empaque lleva el capítulo editado');
-      ok(fs.existsSync(NET_LOG) && fs.readFileSync(NET_LOG, 'utf8').length === net0, 'E11: 0 conexiones fuera de 127.0.0.1 en todo el flujo (netguard)');
-      const reviewIds = (P) => ((P.job.output_summary || {}).h5pPackages || []).filter((p) => /^review_cards:/.test(p.itemKey)).map((p) => p.itemKey.slice('review_cards:'.length));
-      const modsOf = async () => (await readStructure(courseId)).modules.map((m) => ({ id: m.id, title: m.title, chapters: m.chapters.map((x) => ({ id: x.id, title: x.title })) }));
-      const modsB = await modsOf();
-      const modsA = modsB.map((m) => ({ ...m, chapters: m.chapters.map((x) => (x.id === ch.id ? { ...x, title: ch.title } : x)) }));
-      const info = (manifest, P, modules) => ({ courseId, spec: { passing: 70, engine: 'h5p' }, assessment, manifestModules: manifest.modules, features: manifest.features, applications: apps.length, reviewCardsChapterIds: reviewIds(P), modules });
-      results.courses.E11 = { ...info(M, P1, modsA), blueprintNumber: n, runId: runA, items: itemsA.length, hours: hoursFrozen, usd: usd(DRY.providerPlanFor(M)), adjust: { from: d1.proposalSha256, to: d2.proposalSha256 } };
-      results.courses.E11regen = { ...info(man2.data.manifest.manifest, P2, modsB), blueprintNumber: n2, runId: runBId, regenerated: regen.length, usd: I.estimatedChangeCostUsd };
+      // 11–14. Generación, empaque, impacto, regeneración parcial y re-empaque (compartido con E17).
+      await fullGenerationFlow('E11', { courseId, title, n, st, M, apps, assessment, hoursFrozen, net0, extra: { adjust: { from: d1.proposalSha256, to: d2.proposalSha256 } } });
     }, { fatal: false });
 
     // ═══ LOOP 8.0 · E12 — el microcurrículo manda sobre la estructura (hallazgo O1), por HTTP real: la IA armó la
@@ -1998,6 +2008,104 @@ function reservationBookkeeping(ev) {
       results.courses.E16 = { courseId };
     }, { fatal: false });
 
+    // ═══ LOOP 8.5 · E17 — flujo DEFINITIVO de Cursia V2 por HTTP real, en el orden de la pantalla: pedido → microcurrículo →
+    // «Lo que entendimos» (facts) → «Cursia recomienda» → Ajustar → «Usar este diseño» (perfil, horas, vínculos, aplicar) →
+    // verificación → «Aprobar» (Blueprint) → Manifest = tarjeta → generación con proveedores FALSOS → Actividades de
+    // Aplicación → empaque → regeneración parcial → re-empaque → Moodle (restore, permisos, notas). USD 0.
+    if (RUN_E5) await step('v3-E17-flujo-v2-definitivo', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const DRY = D('modules/pedagogy/dry-run.js');
+      const STI = D('modules/study-time/index.js');
+      const MIN = D('modules/study-time/manifest-input.js');
+      const usd = (plan) => (plan && plan.estimateUsd ? Number(plan.estimateUsd.expected) : null);
+      const net0 = fs.existsSync(NET_LOG) ? fs.readFileSync(NET_LOG, 'utf8').length : 0;
+      const title = '[E2E Flujo V2 E17] Contabilidad de Costos';
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title });
+      ok(cr.status === 201, 'E17: curso dinámico creado', { s: cr.status, e: cr.error });
+      const courseId = Number(cr.data.id);
+
+      // Paso 1 · el pedido (lo que escribe el docente) + el microcurrículo.
+      const brief = { nombre: 'Contabilidad de Costos', obj: 'Calcular y controlar los costos de producción', sector: 'Contabilidad', pais: 'Colombia', contexto: 'Técnico / Tecnólogo — formación técnica', nivel: 'Básico — sin conocimientos previos' };
+      const pb = await api('PUT', `/courses/${courseId}/brief`, brief);
+      ok(pb.status === 200, 'E17: pedido guardado', { s: pb.status, e: pb.error });
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo.docx', dataBase64: (await AF.fixture('consistent', 'docx')).toString('base64') }] });
+      ok(ex.status === 200 && ex.data.stats.providersCalled === 0, 'E17: microcurrículo leído (0 proveedores)', { s: ex.status, e: ex.error });
+      const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 });
+      ok(sv.status === 201 && sv.data.derivedPedagogy && sv.data.derivedPedagogy.applied === true, 'E17: contexto guardado; el perfil pedagógico se deriva solo', { s: sv.status });
+
+      // Paso 2 · «Lo que entendimos»: lo que sabe Cursia, con su origen.
+      const f = await api('GET', `/courses/${courseId}/facts`);
+      ok(f.status === 200 && f.data.outcomes.source === 'document' && f.data.targetHours.value === 64 && f.data.targetHours.source === 'document' && f.data.document.present === true,
+        'E17: «Lo que entendimos»: resultados y 64 h del documento', { o: f.data && f.data.outcomes.source, h: f.data && f.data.targetHours });
+      let st = await readStructure(courseId);
+      const aa = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: st.structureVersionCounter, contextVersion: sv.data.profile.version });
+      ok([200, 201].includes(aa.status), 'E17: «Diseñar el curso» → estructura del microcurrículo', { s: aa.status, e: aa.error });
+
+      // Paso 3 · «Cursia recomienda»: el docente no decide módulos, capítulos, práctica, audiovisual ni cómo llegar a las horas.
+      const r1 = await api('POST', `/courses/${courseId}/design/recommendation`, {});
+      ok(r1.status === 200 && r1.data.providersCalled === 0 && r1.data.hours.target === 64 && r1.data.hours.source === 'document' && r1.data.approach && r1.data.approach.source === 'recommended'
+        && r1.data.preferences.audiovisual === 'recommended' && r1.data.design.applicable, 'E17: Cursia recomienda (64 h del documento, enfoque y audiovisual recomendados, aplicable)', { s: r1.status, e: r1.error });
+      // Ajustar: «Más aplicación» (la meta explícita de 64 h no se toca; nada de video para inflar horas).
+      const r2 = await api('POST', `/courses/${courseId}/design/recommendation`, { adjust: { emphasis: 'application' } });
+      const card = r2.data;
+      ok(r2.status === 200 && card.hours.target === 64 && card.design.status === 'within_tolerance' && card.design.counts.videoChapters <= r1.data.design.counts.videoChapters,
+        'E17: Ajustar «Más aplicación»: mismas 64 h, sin más video', { st: card.design && card.design.status, v: [r1.data.design.counts.videoChapters, card.design && card.design.counts.videoChapters] });
+      const ver0 = card.verification;
+      ok(ver0 && ver0.blocking === false, 'E17: verificación sin bloqueos antes de usar el diseño', ver0 && ver0.checks.filter((c) => c.severity === 'critical').map((c) => c.title));
+
+      // «Usar este diseño» — lo mismo que hace el cliente (52-v2-design.js v2dUse).
+      const pv = await api('GET', `/courses/${courseId}/profiles/pedagogy`);
+      const sp = card.profileChanged ? await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: card.profile, expectedVersion: pv.data.version }) : { status: 201 };
+      ok(sp.status === 201, 'E17: perfil del diseño guardado', { s: sp.status, e: sp.error });
+      const ho = await api('POST', `/courses/${courseId}/design/hours-origin`, { proposed: card.hours.source === 'proposed' ? card.hours.target : null });
+      ok(ho.status === 200, 'E17: origen de las horas registrado', { s: ho.status, e: ho.error });
+      if (ver0.checks.some((c) => c.id === 'outcome_links')) {
+        st = await readStructure(courseId);
+        const fx = await api('POST', `/courses/${courseId}/design/fix`, { action: 'link_outcomes', expectedCounter: st.structureVersionCounter });
+        ok(fx.status === 200 && fx.data.linkedChapters >= 1, 'E17: vinculación automática mostrada en la verificación, aplicada', { s: fx.status, d: fx.data });
+      }
+      const r3 = await api('POST', `/courses/${courseId}/design/recommendation`, {});
+      ok(r3.data.profileChanged === false && r3.data.design.proposalSha256 === card.design.proposalSha256, 'E17: lo guardado = la misma huella que la tarjeta', { a: r3.data.design.proposalSha256, b: card.design.proposalSha256 });
+      st = await readStructure(courseId);
+      const ap = await api('POST', `/courses/${courseId}/modules/apply-distribution`, { expectedCounter: st.structureVersionCounter, proposalSha256: card.design.proposalSha256 });
+      ok([200, 201].includes(ap.status), 'E17: diseño aplicado', { s: ap.status, e: ap.error });
+
+      // Paso 4 · «Revisar y generar»: la estructura aplicada = la tarjeta; la verificación sigue limpia.
+      st = await readStructure(courseId);
+      const chs = st.modules.flatMap((m) => m.chapters);
+      eq([chs.length, chs.filter((c) => c.kind === 'practice').length, chs.filter((c) => c.videoEnabled).length, chs.filter((c) => c.applicationMinutes).length],
+        [card.design.counts.chapters, card.design.counts.practiceChapters, card.design.counts.videoChapters, card.design.counts.applicationActivities], 'E17: estructura aplicada = tarjeta (capítulos, práctica, video, Actividades de Aplicación)');
+      const r4 = await api('POST', `/courses/${courseId}/design/recommendation`, {});
+      ok(r4.data.verification && r4.data.verification.blocking === false && !r4.data.verification.checks.some((c) => c.fix && c.fix.kind === 'auto') && r4.data.design.changes.length === 0,
+        'E17: revisión: verificación sin bloqueos, sin correcciones automáticas pendientes y sin cambios por aplicar', r4.data.verification && r4.data.verification.checks.filter((c) => c.severity !== 'ok' && c.severity !== 'info').map((c) => c.title));
+      eq([r4.data.design.counts.chapters, r4.data.design.counts.videoChapters, r4.data.design.counts.applicationActivities, r4.data.design.counts.evaluations, r4.data.design.estimatedHours],
+        [card.design.counts.chapters, card.design.counts.videoChapters, card.design.counts.applicationActivities, card.design.counts.evaluations, card.design.estimatedHours], 'E17: lo que muestra «Revisar y generar» = la tarjeta usada');
+      const A = D('modules/course-profiles/course-profiles.js');
+      const assessment = { ...A.defaultAssessmentProfile({ finalExam: true }), passingGrade: 70 };
+      ok((await api('POST', `/courses/${courseId}/profiles/assessment`, { data: assessment })).status === 201, 'E17: perfil de evaluación');
+      ok((await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 } })).status === 201, 'E17: perfil de presentación');
+
+      // «Aprobar y generar»: Blueprint + Manifest = la tarjeta (capítulos, videos, actividades, evaluaciones, horas, costo).
+      st = await readStructure(courseId);
+      const lock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st.structureVersionCounter });
+      ok(lock.status === 201, 'E17: aprobado → Blueprint', { s: lock.status, e: lock.error });
+      const snap = lock.data.blueprint.snapshot;
+      const n = lock.data.blueprint.blueprintNumber;
+      const man = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest`);
+      ok(man.status === 201 && man.data.manifest.rulesVersion === 3, 'E17: Manifest v3', { s: man.status, e: man.error });
+      const M = man.data.manifest.manifest;
+      const hoursFrozen = STI.estimateCourseStudyTime(MIN.studyTimeInputFromManifest(M, snap)).courseEstimatedHours;
+      const c = card.design.counts;
+      eq([M.totals.experienceCount, M.totals.videoCount, M.totals.applicationActivityCount, M.totals.examCount + M.totals.finalExamCount, hoursFrozen],
+        [c.chapters, c.videoChapters, c.applicationActivities, c.evaluations, card.design.estimatedHours], 'E17: Manifest congelado = tarjeta «Cursia recomienda» (capítulos, videos, actividades, evaluaciones, horas)');
+      ok(Math.abs(usd(DRY.providerPlanFor(M)) - Number(card.cost.expected)) < 0.005, 'E17: costo del Manifest = costo de la tarjeta', { frozen: usd(DRY.providerPlanFor(M)), shown: card.cost.expected });
+      const apps = M.items.filter((i) => i.type === 'application_activity');
+      ok(apps.length === c.applicationActivities && apps.length > 0, `E17: ${apps.length} Actividades de Aplicación en el Manifest`);
+
+      // Generación (mock) → empaque → impacto → regeneración parcial → re-empaque; Moodle después (restore, permisos, notas).
+      await fullGenerationFlow('E17', { courseId, title, n, st, M, apps, assessment, hoursFrozen, net0, extra: { v2: true } });
+    }, { fatal: false });
+
     // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══
     const MOODLE_JOBS = ONLY_REAL_PROVIDERS ? [] : [['E1', 'E1'], ['E1-repack', 'E1repack'], ['E2', 'E2'], ['E3', 'E3']];
     // EV6 H5P v2: E5 entra al mismo restore + inspección (con los «Repaso» del paquete).
@@ -2005,6 +2113,9 @@ function reservationBookkeeping(ev) {
     // LOOP 7 · E11: el curso del flujo completo y su re-empaque tras la regeneración parcial.
     if (results.mbz.E11 && results.courses.E11) MOODLE_JOBS.push(['E11', 'E11']);
     if (results.mbz['E11-regen'] && results.courses.E11regen) MOODLE_JOBS.push(['E11-regen', 'E11regen']);
+    // LOOP 8.5 · E17: el flujo V2 definitivo y su re-empaque.
+    if (results.mbz.E17 && results.courses.E17) MOODLE_JOBS.push(['E17', 'E17']);
+    if (results.mbz['E17-regen'] && results.courses.E17regen) MOODLE_JOBS.push(['E17-regen', 'E17regen']);
     const SHELL = D('modules/course-shell/index.js');
     const AS = D('package/assessment/index.js');
     const { mp3DurationSeconds } = D('package/audio/mp3-parser.js');
