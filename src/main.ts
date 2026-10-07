@@ -18,6 +18,10 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bodyParser: false });
 
   // Body size limit — 9 chapters of libro guía can exceed the 100KB default
+  // LOOP 8.6B · la lectura de documentos (base64 en JSON) admite hasta 25 MB de archivos: límite propio SOLO en esas dos
+  // rutas (25 MB × 4/3 del base64 + margen); el resto de la API sigue en 10 MB. Va antes del parser general: un cuerpo
+  // ya leído no se vuelve a leer.
+  app.use(/^\/api\/v1\/courses\/\d+\/academic-context\/(extract|extract-advanced)\/?$/, express.json({ limit: '36mb' }));
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 

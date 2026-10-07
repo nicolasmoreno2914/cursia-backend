@@ -7,7 +7,7 @@ export class ExtractFileDto {
   @MaxLength(200)
   name: string;
 
-  /** Contenido del archivo en base64 (≤ 7 MB decodificado; el límite total lo pone el body de 10 MB). */
+  /** Contenido del archivo en base64 (≤ 25 MB decodificado; el cuerpo de /extract admite 36 MB, ver main.ts). */
   @IsBase64()
   dataBase64: string;
 }
@@ -122,4 +122,16 @@ export class OutcomesDto {
   @IsOptional()
   @IsBoolean()
   accept?: boolean;
+}
+
+/** LOOP 8.6B · PUT /courses/:courseId/academic-context/requirements/selection — alternativa elegida (o null para quitarla). */
+export class RequirementSelectionDto {
+  @IsString()
+  @Matches(/^[A-Za-z0-9-]{1,40}$/)
+  groupId: string;
+
+  @IsOptional()
+  @IsString()
+  @Matches(/^[A-Za-z0-9]{1,8}$/)
+  optionId?: string | null;
 }

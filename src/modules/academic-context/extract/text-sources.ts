@@ -34,7 +34,14 @@ export interface ReadDocument {
 /** Tope del XML descomprimido de un DOCX (defensa contra zip bombs: el archivo comprimido ya está acotado). */
 export const MAX_DOCX_XML_BYTES = 20 * 1024 * 1024;
 
-export const MAX_DOCUMENT_BYTES = 7 * 1024 * 1024;
+/**
+ * LOOP 8.6B · 25 MB por documento (antes 7 MB). Lo pesado de los documentos reales son imágenes y fuentes (el texto
+ * útil pesa KB): los DOCX llegan ya sin ellas (el navegador las quita antes de subir) y los PDF se leen sin decodificar
+ * imágenes. Lo que consume memoria al leer un PDF son las PÁGINAS, por eso además hay un tope de páginas.
+ */
+export const MAX_DOCUMENT_BYTES = 25 * 1024 * 1024;
+/** Páginas máximas de un PDF (se cuentan antes de leer el texto: unos ms y poca memoria). */
+export const MAX_PDF_PAGES = 600;
 
 export class DocumentReadError extends Error {
   constructor(readonly code: string, message: string) {
@@ -104,6 +111,17 @@ export async function readPdf(buf: Buffer): Promise<ReadDocument> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { PDFParse } = require('pdf-parse');
   const parser = new PDFParse({ data: new Uint8Array(buf) });
+  let total = 0;
+  try {
+    total = (await parser.getInfo()).total;
+  } catch (err) {
+    await parser.destroy().catch(() => undefined);
+    throw new DocumentReadError('DOCUMENT_UNREADABLE', `No se pudo leer el PDF (${err instanceof Error ? err.message : String(err)})`);
+  }
+  if (total > MAX_PDF_PAGES) {
+    await parser.destroy().catch(() => undefined);
+    throw new DocumentReadError('DOCUMENT_TOO_MANY_PAGES', `el PDF tiene ${total} páginas; Cursia lee hasta ${MAX_PDF_PAGES}. Sube solo las páginas del microcurrículo.`);
+  }
   try {
     const res = await parser.getText();
     const lines: SourceLine[] = [];
