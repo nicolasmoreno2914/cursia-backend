@@ -1022,7 +1022,8 @@ function reservationBookkeeping(ev) {
       ok(M.features.pedagogy && M.features.pedagogy.engineVersion === 1, 'E6: Manifest con features.pedagogy', M.features);
       // R68: el perfil congelado es el del escenario + las horas que eligió el docente para conservar su estructura.
       const savedPed = (await api('GET', `/courses/${c.courseId}/profiles/pedagogy`)).data.profile;
-      const frozenPed = typeof savedPed.targetHours === 'number' ? { ...pedagogy, targetHours: savedPed.targetHours } : pedagogy;
+      // (el perfil guardado sin las reglas que el servidor deriva de él)
+      const frozenPed = Object.fromEntries(Object.entries(savedPed).filter(([k]) => k !== 'designRules'));
       eq(MB.validateGenerationManifestV3(M, PED.applyPedagogyToSnapshot(snap, PED.deriveDesignRules(frozenPed)), M.source), [], 'E6: el Manifest guardado valida contra el diseño recalculado del perfil');
       eq(bp && bp.sha256, M.source.blueprintSha256, 'E6: el Manifest apunta al Blueprint con diseño');
       const acts = M.items.filter((i) => i.type === 'activity');

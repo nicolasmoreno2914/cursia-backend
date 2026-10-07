@@ -305,7 +305,8 @@ export function lqaFindings(text, max) { return lqaMarkdownFindings(text, max); 
 /** Cursos de idiomas o de lengua/literatura: citan inglés, «vosotros» o voseo a propósito (sin Language QA). */
 // Review piloto I3: solo el NOMBRE y el SECTOR del curso, con palabras completas («lenguaje» SQL, «manuales en inglés» del
 // contexto no eximen).
-export const LQA_LANGUAGE_COURSE_RE = /(?:^|[^\p{L}])(?:ingl[eé]s|english|idiomas?|lenguas?|literatura|castellano|biling[üu]es?|traducci[oó]n|interpretaci[oó]n|franc[eé]s|portugu[eé]s|alem[aá]n|italiano|japon[eé]s|chino|mandar[ií]n|coreano|ruso|ling[üu][íi]stica|gram[aá]tica|redacci[oó]n|ortograf[íi]a)(?=$|[^\p{L}])/iu;
+// Re-review piloto P3: nada de «interpretación» (de planos), «redacción» (de informes) ni «gramática» sueltas.
+export const LQA_LANGUAGE_COURSE_RE = /(?:^|[^\p{L}])(?:ingl[eé]s|english|idiomas?|lenguas?|literatura|castellano|biling[üu]es?|traducci[oó]n|franc[eé]s|portugu[eé]s|alem[aá]n|italiano|japon[eé]s|chino|mandar[ií]n|coreano|ruso|ling[üu][íi]stica)(?=$|[^\p{L}])/iu;
 export function lqaIsLanguageCourse(courseContext) {
   var c = courseContext || {};
   return LQA_LANGUAGE_COURSE_RE.test([c.nombre, c.sector].filter(function (x) { return typeof x === 'string'; }).join(' '));

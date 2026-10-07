@@ -13,7 +13,9 @@ function pendingOf(card) {
   const proposed = (d.modules || []).reduce((n, m) => n + (m.chapters || []).filter((c) => c.proposed).length, 0);
   return Math.max((d.changes || []).length, proposed);
 }
-const approvable = (card, allowCritical) => !!(card && card.design && card.verification && card.design.applicable === true && (allowCritical || !card.verification.blocking) && pendingOf(card) === 0);
+// Re-review piloto P1: el servidor exige además que el diseño verificado sea el GUARDADO (profileChanged false), como deja
+// «Usar este diseño» (que guarda el perfil de la tarjeta).
+const approvable = (card, allowCritical) => !!(card && card.design && card.verification && card.design.applicable === true && (allowCritical || !card.verification.blocking) && pendingOf(card) === 0 && card.profileChanged === false);
 // Hacia ARRIBA: unas horas por debajo de lo que ya suman los contenidos serían un crítico («ya suman más de lo pedido»).
 const halfStepUp = (n) => Math.min(500, Math.max(1, Math.ceil(Number(n) * 2) / 2));
 
@@ -56,7 +58,15 @@ async function keepTeacherDesign(api, courseId, label, opts = {}) {
     const sv = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: { ...base, targetHours }, expectedVersion: version });
     if (sv.status !== 201 && sv.status !== 200) throw new Error(`${label}: guardar las horas del docente → ${sv.status} ${sv.error}`);
   }
-  const last = await rec();
+  let last = await rec();
+  // 3. Como «Usar este diseño»: guardar el perfil de la tarjeta (enfoque/audiovisual que propone Cursia) si no estaba guardado.
+  if (last.profileChanged === true) {
+    const cur = await api('GET', `/courses/${courseId}/profiles/pedagogy`);
+    const version = cur.status === 200 && cur.data && !cur.data.isDefault ? Number(cur.data.version) : 0;
+    const sv = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: last.profile, expectedVersion: version });
+    if (sv.status !== 201 && sv.status !== 200) throw new Error(`${label}: guardar el perfil de la tarjeta → ${sv.status} ${sv.error}`);
+    last = await rec();
+  }
   if (!approvable(last, opts.allowCritical)) {
     const crit = (last.verification && last.verification.checks || []).filter((c) => c.severity === 'critical').map((c) => c.title);
     throw new Error(`${label}: el diseño del docente no queda aprobable (cambios ${pendingOf(last)}, aplicable ${last.design && last.design.applicable}, críticos ${JSON.stringify(crit)}, cambios ${JSON.stringify((last.design && last.design.changes || []).slice(0, 5))})`);

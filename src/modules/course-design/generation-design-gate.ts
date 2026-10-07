@@ -18,13 +18,14 @@ import { snapshotSha256V2 } from '../course-blueprints/blueprint-snapshot';
  */
 export const GENERATION_NOT_VERIFIED = 'GENERATION_NOT_VERIFIED';
 
-export type GenerationGateReason = 'blueprint_missing' | 'blueprint_not_current' | 'structure_changed' | 'design_changed' | 'unverified' | 'not_applicable' | 'pending_changes' | 'critical';
+export type GenerationGateReason = 'blueprint_missing' | 'blueprint_not_current' | 'structure_changed' | 'design_changed' | 'design_not_saved' | 'unverified' | 'not_applicable' | 'pending_changes' | 'critical';
 
 const MESSAGES: Record<GenerationGateReason, string> = {
   blueprint_missing: 'el curso no tiene una estructura aprobada para generar.',
   blueprint_not_current: 'la estructura aprobada que se quiere generar no es la vigente del curso.',
   structure_changed: 'la estructura cambió después de aprobarla; vuelve a revisarla y aprobarla en «Revisar y generar».',
   design_changed: 'el diseño cambió después de aprobarlo (horas, enfoque, contexto o configuración del curso); vuelve a revisarlo y aprobarlo en «Revisar y generar».',
+  design_not_saved: 'el diseño verificado no es el guardado (horas, enfoque o audiovisual que propone Cursia sin guardar): usa «Usar este diseño» y vuelve a aprobarlo.',
   unverified: 'no se pudo verificar el diseño del curso.',
   not_applicable: 'el diseño del curso no se puede preparar para generar (revísalo en «Diseño»).',
   pending_changes: 'la estructura no tiene el diseño verificado: hay cambios recomendados sin aplicar (revísalo en «Diseño»).',
@@ -61,6 +62,16 @@ export class GenerationDesignGate {
     if (snapshotSha256V2(assembled.snapshot as any) !== frozenSha) this.reject('design_changed');
   }
 
+  /** Re-review piloto M-c: un error de integridad al recomponer no es un 500 crudo (503: reintentar). */
+  private async blueprintMatchesOr503(courseId: number, frozenSha: string): Promise<void> {
+    try {
+      await this.assertBlueprintMatchesLiveDesign(courseId, frozenSha);
+    } catch (err) {
+      if (err instanceof HttpException) throw err;
+      throw new ServiceUnavailableException({ code: 'GENERATION_VERIFICATION_UNAVAILABLE', message: 'GENERATION_VERIFICATION_UNAVAILABLE: no se pudo comparar el diseño aprobado con el vigente; vuelve a intentarlo. No se generó nada.' });
+    }
+  }
+
   async assertVerified(courseId: number, ownerId: string, blueprintNumber: number): Promise<GenerationGateResult> {
     const [course] = await this.dataSource.query(
       `select id, structure_version_counter, current_blueprint_id from public.courses where id = $1 and owner_id = $2`,
@@ -77,7 +88,7 @@ export class GenerationDesignGate {
     // Review piloto C1: el Blueprint v2 congela también el perfil pedagógico (horas, enfoque), el contexto académico y la
     // configuración del curso, que NO avanzan el contador. Lo que se verifica abajo es lo vigente: debe ser exactamente lo
     // que se congeló (misma huella del snapshot recompuesto), o se verificaría una cosa y se generaría otra.
-    if (Number(bp.schema_version) === 2) await this.assertBlueprintMatchesLiveDesign(courseId, String(bp.snapshot_sha256));
+    if (Number(bp.schema_version) === 2) await this.blueprintMatchesOr503(courseId, String(bp.snapshot_sha256));
 
     let card: any;
     try {
@@ -92,6 +103,8 @@ export class GenerationDesignGate {
     // Nada cambió mientras se verificaba (misma estructura que el Blueprint).
     const [after] = await this.dataSource.query(`select structure_version_counter from public.courses where id = $1`, [courseId]);
     if (!after || Number(after.structure_version_counter) !== Number(course.structure_version_counter)) this.reject('structure_changed');
+    // Re-review piloto M-d: tampoco cambió el perfil/contexto mientras se verificaba.
+    if (Number(bp.schema_version) === 2) await this.blueprintMatchesOr503(courseId, String(bp.snapshot_sha256));
     if (card.design.applicable !== true) this.reject('not_applicable');
     const proposed = (card.design.modules || []).reduce((n: number, m: any) => n + (m.chapters || []).filter((c: any) => c.proposed).length, 0);
     const pending = Math.max((card.design.changes || []).length, proposed);
@@ -100,6 +113,10 @@ export class GenerationDesignGate {
       const criticals = (card.verification.checks || []).filter((c: any) => c.severity === 'critical' && !c.summary).map((c: any) => ({ id: c.id, area: c.area, title: c.title }));
       this.reject('critical', { criticals });
     }
+    // (Al final: los cambios por aplicar y los críticos son lo primero que el docente debe ver.)
+    // Re-review piloto P1: Verificación evaluó el perfil que muestra la tarjeta; debe ser el GUARDADO (el que congeló el
+    // Blueprint). Si Cursia propone horas/enfoque/audiovisual sin guardar, se verificó otra cosa que la que se generaría.
+    if (card.profileChanged === true) this.reject('design_not_saved');
     return { ok: true, structureCounter: Number(course.structure_version_counter), blueprintId: Number(bp.id) };
   }
 }

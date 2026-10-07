@@ -601,6 +601,30 @@ async function dbChecks() {
       eq(await gateReason(cid, n2), 'ok', 're-aprobado');
     });
 
+    await check('RG5 R68 (re-review P1): el diseño verificado debe ser el GUARDADO — sin perfil guardado (horas/enfoque propuestos por Cursia) → design_not_saved', async () => {
+      const cid = await courseWith('Gate 5', [3, 3], 'El curso tendrá 3 capítulos por módulo.');
+      // El docente congela sin «Usar este diseño» y sin cambios de estructura por aplicar (pins + nada que agregar).
+      const rec0 = await design.recommend(cid, OWNER, {});
+      assert(rec0.profileChanged === true, 'Cursia propone un perfil que no está guardado');
+      const n = await lockNow(cid);
+      const r = await gateReason(cid, n);
+      assert(r === 'design_not_saved' || r === 'pending_changes', r);
+      await useDesign(cid);
+      eq(await gateReason(cid, await lockNow(cid)), 'ok', 'con «Usar este diseño» el perfil queda guardado');
+    });
+
+    await check('RG6 re-review P2: corregir un título y DESPUÉS «Usar este diseño» → la estructura sigue siendo de Cursia (el origen avanza con la nueva forma)', async () => {
+      const cid = await courseWith('Gate 6', [3, 3], 'El curso tendrá 4 capítulos por módulo.');
+      const [ch] = await ds.query(`select id, module_id from public.course_chapters where course_id = $1 order by position limit 1`, [cid]);
+      await structure.updateChapter(cid, ch.module_id, ch.id, OWNER, { title: 'Título corregido', expectedCounter: await counter(cid) });
+      await useDesign(cid);
+      const [{ o }] = await ds.query(`select metadata -> 'structureOrigin' o from public.courses where id = $1`, [cid]);
+      eq([o.counter, o.shape], [await counter(cid), [4, 4]], 'el origen avanzó con la forma nueva');
+      const card = await design.recommend(cid, OWNER, {});
+      eq(reqCheck(card, 'chapters').severity, 'ok', 'el requisito se cumple con el diseño de Cursia (no es una excepción del docente)');
+      eq(await gateReason(cid, await lockNow(cid)), 'ok', 'aprobable');
+    });
+
     await check('RG4 R68: un crítico de Verificación → critical con la lista de críticos', async () => {
       const cid = await courseWith('Gate 4', [3, 3], 'El curso tendrá 3 capítulos por módulo. Cada capítulo tendrá 2 videos.');
       await useDesign(cid);

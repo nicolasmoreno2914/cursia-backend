@@ -112,8 +112,12 @@ export function structureAuthority(
  * seguía como la dejó Cursia, el diseño también es de Cursia y el origen avanza al nuevo contador. Si el docente ya la
  * había editado, el origen queda como estaba (sigue contando como editada).
  */
-export function originAfterCursiaDesign(origin: StructureOrigin | null, counterBefore: number, counterAfter: number): StructureOrigin | null {
-  if (!origin || origin.counter !== counterBefore) return null;
+export function originAfterCursiaDesign(origin: StructureOrigin | null, counterBefore: number, counterAfter: number, shapeBefore?: number[] | null): StructureOrigin | null {
+  if (!origin) return null;
+  // Re-review piloto P2: con forma registrada, la estructura sigue siendo de Cursia si su FORMA antes de este cambio era la
+  // del origen (un título corregido entremedio no la vuelve del docente).
+  const sameShape = !!origin.shape && !!shapeBefore && origin.shape.length === shapeBefore.length && origin.shape.every((n, i) => n === shapeBefore[i]);
+  if (origin.counter !== counterBefore && !sameShape) return null;
   return { ...origin, counter: counterAfter };
 }
 
@@ -148,7 +152,11 @@ export async function writeStructureOrigin(q: Q, courseId: number, origin: Struc
 }
 
 /** Un cambio que hace Cursia (diseño de horas, poda de vínculos de un contexto nuevo) no convierte la estructura en «editada». */
-export async function advanceStructureOriginIfUntouched(q: Q, courseId: number, counterBefore: number, counterAfter: number): Promise<void> {
-  const next = originAfterCursiaDesign(await readStructureOrigin(q, courseId), counterBefore, counterAfter);
+/**
+ * `shapeBefore`: la forma ANTES del cambio de Cursia (quien cambia la forma, como «Usar este diseño», la lee antes de
+ * mutar). Sin ella se usa la forma viva (los cambios que no tocan la forma: vínculos, videos).
+ */
+export async function advanceStructureOriginIfUntouched(q: Q, courseId: number, counterBefore: number, counterAfter: number, shapeBefore?: number[]): Promise<void> {
+  const next = originAfterCursiaDesign(await readStructureOrigin(q, courseId), counterBefore, counterAfter, shapeBefore ?? (await liveStructureShape(q, courseId)));
   if (next) await writeStructureOrigin(q, courseId, { ...next, shape: undefined });
 }

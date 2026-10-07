@@ -92,6 +92,7 @@ import {
   parseStructureOrigin,
   structureAuthority,
   writeStructureOrigin,
+  liveStructureShape,
 } from './structure-authority';
 import { proposeStructureFromContext } from '../academic-context/context-design';
 import { validateAcademicContext } from '../academic-context/validate';
@@ -333,6 +334,8 @@ export class CourseStructureService implements OnModuleInit {
       }
       const proposedPractice = dist.modules.some((m) => m.chapters.some((c) => c.proposed && c.kind === 'practice'));
       if (proposedPractice) await assertPracticeChapterSchema(queryRunner);
+      // Re-review piloto P2: la forma ANTES de agregar los capítulos de Cursia (para saber si la estructura seguía siendo suya).
+      const shapeBefore = await liveStructureShape(queryRunner, courseId);
       let added = 0;
       for (const m of dist.modules) {
         for (const [ci, c] of m.chapters.entries()) {
@@ -362,7 +365,7 @@ export class CourseStructureService implements OnModuleInit {
       ));
       const newCounter = this.counterOrThrow(cr?.structure_version_counter, courseId);
       // LOOP 8.0: el diseño de Cursia sobre una estructura que Cursia armó y nadie tocó sigue siendo «de Cursia».
-      await advanceStructureOriginIfUntouched(queryRunner, courseId, lock.counter, newCounter);
+      await advanceStructureOriginIfUntouched(queryRunner, courseId, lock.counter, newCounter, shapeBefore);
       const liveMatchesCurrentBlueprint = await this.liveMatchesAfterMutation(queryRunner, courseId, ownerId, lock.hasBlueprint);
       await queryRunner.commitTransaction();
       return {
