@@ -1,3 +1,4 @@
+import { GenerationDesignGate } from '../course-design/generation-design-gate';
 import { alignCourseContextWithSnapshot } from '../course-facts/course-facts';
 import { loadFrozenLearner } from '../course-facts/course-facts-db';
 import {
@@ -797,6 +798,11 @@ export class RunsService {
      * (503 finops_unavailable); los runs mock/LLM siguen sin estimado.
      */
     @Optional() private readonly finopsBudget?: FinopsBudgetService,
+    /**
+     * R68: gate de verificación del diseño (toda generación nueva). @Optional solo por los harnesses que construyen el
+     * servicio a mano; en la app lo inyecta Nest siempre (lo comprueba check-r68-generation-gate.js).
+     */
+    @Optional() private readonly designGate?: GenerationDesignGate,
   ) {
     // M6 (review-it2): NO se valida DYNAMIC_VIDEO_DELIVERY acá. RunsService
     // vive en AppModule, que arranca la API y todos los workers legacy — un
@@ -843,6 +849,9 @@ export class RunsService {
     await assertAssessmentProfileResolvableForRun(this.dataSource, courseId, manifest);
     // Fase 8 (F8-BE): `{fromRun}` crea el run B aplicando el plan de
     // invalidación (mismo entry point → mismos gates G3 de arriba).
+    // R68: una generación nueva (también la regeneración `fromRun` o reabrir un run cancelado/fallido) exige el diseño
+    // verificado; retomar la que ya está activa en este Manifest no.
+    await this.assertDesignVerifiedForNewRun(courseId, ownerId, blueprintNumber, manifest.id);
     if (isFromRunRequest(courseContext)) {
       return this.startRunFromPrevious(courseId, ownerId, blueprintNumber, manifest, courseContext.fromRun);
     }
@@ -924,6 +933,8 @@ export class RunsService {
     assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
     await assertAssessmentProfileResolvableForRun(this.dataSource, courseId, manifest);
+    // R68: el estimado de una generación nueva también exige el diseño verificado (mismo gate que startRun).
+    await this.assertDesignVerifiedForNewRun(courseId, ownerId, blueprintNumber, manifest.id);
     const rawContext = normalizeCourseContext(courseContext);
     this.assertRequiredContext(rawContext);
     const videoMode = this.normalizeVideoMode((courseContext as any)?.videoMode);
@@ -4746,6 +4757,16 @@ export class RunsService {
   }
 
   /** Run activo del Manifest (después de reconciliar un cancel legacy). */
+  /**
+   * R68: toda generación NUEVA exige el diseño verificado (GenerationDesignGate). Retomar el run que ya está activo en
+   * este Manifest no es una generación nueva (lo devuelve get-or-create tal cual).
+   */
+  private async assertDesignVerifiedForNewRun(courseId: number, ownerId: string, blueprintNumber: number, manifestId: number): Promise<void> {
+    if (!this.designGate) return;
+    if (await this.findActiveRunRow(manifestId)) return;
+    await this.designGate.assertVerified(courseId, ownerId, blueprintNumber);
+  }
+
   private async findActiveRunRow(manifestId: number): Promise<any | null> {
     const rows = await this.dataSource.query(
       `select * from public.production_jobs

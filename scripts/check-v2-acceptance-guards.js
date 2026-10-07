@@ -290,7 +290,10 @@ async function call(base, method, p, { user = OWNER_A, body } = {}) {
       const r = await call(base, 'POST', '/api/v1/jobs/full', { body: { courseId: DYN_UUID } });
       eq(r.status, 409, 'status');
       assert(String(r.json && r.json.error).startsWith(PREFIX_AUDIO), JSON.stringify(r.json));
-      eq((await call(base, 'POST', '/api/v1/jobs/full', { body: { courseId: DYN_UUID, options: { generateAudio: false } } })).status, 201, 'generateAudio=false');
+      // R68 (piloto): sin audio tampoco: un curso V2 solo se genera por el flujo V2 verificado.
+      const na = await call(base, 'POST', '/api/v1/jobs/full', { body: { courseId: DYN_UUID, options: { generateAudio: false } } });
+      eq(na.status, 409, 'generateAudio=false → 409 (R68)');
+      assert(String(na.json && na.json.error).startsWith('v2_course_legacy_generation_disabled:'), JSON.stringify(na.json));
       eq((await call(base, 'POST', '/api/v1/jobs/full', { body: { courseId: '8' } })).status, 201, 'legacy');
     });
 
@@ -307,12 +310,12 @@ async function call(base, method, p, { user = OWNER_A, body } = {}) {
       eq(jobs.repos.state.jobSaves, saves, 'no debe reencolar');
       jobs.repos.state.jobForFindOne = mk(DYN_UUID, { generateAudio: false });
       const noAudio = await call(base, 'POST', '/api/v1/jobs/full-1/retry');
-      eq(noAudio.status, 200, 'generateAudio=false: status');
-      eq(jobs.repos.state.jobSaves, saves + 1, 'generateAudio=false: reencola');
+      eq(noAudio.status, 409, 'generateAudio=false: 409 (R68)');
+      eq(jobs.repos.state.jobSaves, saves, 'generateAudio=false: no reencola (R68)');
       jobs.repos.state.jobForFindOne = mk(LEG_UUID);
       const ok = await call(base, 'POST', '/api/v1/jobs/full-1/retry');
       eq(ok.status, 200, 'legacy status');
-      eq(jobs.repos.state.jobSaves, saves + 2, 'legacy: reencola');
+      eq(jobs.repos.state.jobSaves, saves + 1, 'legacy: reencola');
       jobs.repos.state.jobForFindOne = null;
     });
 

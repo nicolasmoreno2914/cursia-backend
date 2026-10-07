@@ -1,3 +1,4 @@
+import { CourseDesignModule } from '../course-design/course-design.module';
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { GenerationItemRun } from './entities/generation-item-run.entity';
@@ -34,6 +35,7 @@ import { VideogenReconciliationService } from './videogen-reconciliation.service
     YoutubeModule,             // DN-1: YoutubeService/YoutubeTokenService (preflight, sin modificarlos)
     ArtifactsModule,           // V2.1 R11a: lector de artifacts para validar items LLM v3 al completar
     FinopsModule,              // V2.1 RF-b: estimado + gates de presupuesto (FinopsBudgetService)
+    CourseDesignModule,        // R68: GenerationDesignGate (sin diseño verificado no hay generación)
   ],
   controllers: [RunsController, ExecutorController, DynamicYoutubeController, AdminDynamicRunsController],
   providers: [

@@ -89,3 +89,20 @@ export async function isLegacyAudioBlockedForJob(
   }
   return null;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R68 (piloto, 2026-10-07): un curso V2 (dynamic) se genera SOLO por el flujo V2 (runs sobre un Blueprint con el
+// diseño verificado, ver GenerationDesignGate). Los jobs legacy de generación (contenido, videos, H5P, Gamma, paquete
+// y el job maestro) lo rechazan con 409 `v2_course_legacy_generation_disabled:` antes de crear nada: el frontend
+// antiguo o una llamada directa no pueden saltarse Verificación. Misma regla de identidad que el audio (I1).
+// ─────────────────────────────────────────────────────────────────────────────
+export const V2_COURSE_LEGACY_GENERATION_DISABLED = 'v2_course_legacy_generation_disabled';
+
+export async function assertLegacyGenerationAllowed(query: QueryFn, ownerId: string, rawCourseId: unknown): Promise<void> {
+  if (await isDynamicCourseFor(query, ownerId, rawCourseId)) {
+    throw new ConflictException(
+      `${V2_COURSE_LEGACY_GENERATION_DISABLED}: este curso usa la estructura dinámica (V2) y solo se genera desde «Revisar y generar», ` +
+        'con el diseño verificado. No se creó ningún job ni se generó contenido.',
+    );
+  }
+}
