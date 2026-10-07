@@ -30,46 +30,48 @@ async function keepTeacherDesign(api, courseId, label, opts = {}) {
     if (r.status !== 200 && r.status !== 201) throw new Error(`${label}: «Cursia recomienda» → ${r.status} ${r.error}`);
     return r.data;
   };
-  const first = await rec();
-  if (approvable(first, opts.allowCritical)) return { kept: false, pinned: 0, targetHours: null };
-  // 1. El docente conserva el video y la Actividad de Aplicación de cada capítulo (los fija en el editor).
-  const st = await api('GET', `/courses/${courseId}/modules`);
-  if (st.status !== 200) throw new Error(`${label}: GET modules → ${st.status} ${st.error}`);
-  let counter = st.data.structureVersionCounter;
+  const saveProfile = async (data) => {
+    const cur = await api('GET', `/courses/${courseId}/profiles/pedagogy`);
+    const version = cur.status === 200 && cur.data && !cur.data.isDefault ? Number(cur.data.version) : 0;
+    const sv = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data, expectedVersion: version });
+    if (sv.status !== 201 && sv.status !== 200) throw new Error(`${label}: guardar el perfil → ${sv.status} ${sv.error}`);
+  };
+  let card = await rec();
+  if (approvable(card, opts.allowCritical)) return { kept: false, pinned: 0, targetHours: null };
+  // Mismo orden que la interfaz, hasta que el diseño quede estable y aprobable (máx. 6 pasos):
+  //   1. fijar el video y la Actividad de Aplicación de cada capítulo (editor V2);
+  //   2. «Usar este diseño»: guardar el perfil de la tarjeta (enfoque/audiovisual que propone Cursia);
+  //   3. «Ajustar» → horas: las que su estructura ya suma (hacia arriba; +1 h si aun así no alcanza el mínimo).
   let pinned = 0;
-  for (const m of st.data.modules) {
-    for (const c of m.chapters) {
-      const body = { videoEnabled: !!c.videoEnabled, pinVideo: true, expectedCounter: counter };
-      if (c.applicationMinutes !== undefined) Object.assign(body, { applicationMinutes: c.applicationMinutes ?? null, pinApplication: true });
-      const r = await api('PATCH', `/courses/${courseId}/modules/${m.id}/chapters/${c.id}`, body);
-      if (r.status !== 200) throw new Error(`${label}: fijar el capítulo ${c.id} → ${r.status} ${r.error}`);
-      counter = r.data.structureVersionCounter;
-      pinned++;
-    }
-  }
-  // 2. Las horas que su estructura ya tiene (sin capítulos ni actividades que agregue Cursia).
-  const pinnedCard = await rec();
   let targetHours = null;
-  if (!approvable(pinnedCard, opts.allowCritical)) {
-    targetHours = halfStepUp(pinnedCard.design.baseHours);
-    const cur = await api('GET', `/courses/${courseId}/profiles/pedagogy`);
-    const base = cur.status === 200 && cur.data && cur.data.profile ? cur.data.profile : {};
-    const version = cur.status === 200 && cur.data && !cur.data.isDefault ? Number(cur.data.version) : 0;
-    const sv = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: { ...base, targetHours }, expectedVersion: version });
-    if (sv.status !== 201 && sv.status !== 200) throw new Error(`${label}: guardar las horas del docente → ${sv.status} ${sv.error}`);
+  for (let step = 0; step < 6 && !approvable(card, opts.allowCritical); step++) {
+    if (!pinned) {
+      const st = await api('GET', `/courses/${courseId}/modules`);
+      if (st.status !== 200) throw new Error(`${label}: GET modules → ${st.status} ${st.error}`);
+      let counter = st.data.structureVersionCounter;
+      for (const m of st.data.modules) {
+        for (const c of m.chapters) {
+          const body = { videoEnabled: !!c.videoEnabled, pinVideo: true, expectedCounter: counter };
+          if (c.applicationMinutes !== undefined) Object.assign(body, { applicationMinutes: c.applicationMinutes ?? null, pinApplication: true });
+          const r = await api('PATCH', `/courses/${courseId}/modules/${m.id}/chapters/${c.id}`, body);
+          if (r.status !== 200) throw new Error(`${label}: fijar el capítulo ${c.id} → ${r.status} ${r.error}`);
+          counter = r.data.structureVersionCounter;
+          pinned++;
+        }
+      }
+    } else if (card.profileChanged === true) {
+      await saveProfile(card.profile);
+    } else {
+      const d = card.design;
+      const need = Math.max(Number(d.baseHours) || 0, Number(d.estimatedHours) || 0);
+      targetHours = halfStepUp(targetHours !== null && targetHours >= need ? targetHours + 1 : need);
+      await saveProfile({ ...card.profile, targetHours });
+    }
+    card = await rec();
   }
-  let last = await rec();
-  // 3. Como «Usar este diseño»: guardar el perfil de la tarjeta (enfoque/audiovisual que propone Cursia) si no estaba guardado.
-  if (last.profileChanged === true) {
-    const cur = await api('GET', `/courses/${courseId}/profiles/pedagogy`);
-    const version = cur.status === 200 && cur.data && !cur.data.isDefault ? Number(cur.data.version) : 0;
-    const sv = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: last.profile, expectedVersion: version });
-    if (sv.status !== 201 && sv.status !== 200) throw new Error(`${label}: guardar el perfil de la tarjeta → ${sv.status} ${sv.error}`);
-    last = await rec();
-  }
-  if (!approvable(last, opts.allowCritical)) {
-    const crit = (last.verification && last.verification.checks || []).filter((c) => c.severity === 'critical').map((c) => c.title);
-    throw new Error(`${label}: el diseño del docente no queda aprobable (cambios ${pendingOf(last)}, aplicable ${last.design && last.design.applicable}, críticos ${JSON.stringify(crit)}, cambios ${JSON.stringify((last.design && last.design.changes || []).slice(0, 5))})`);
+  if (!approvable(card, opts.allowCritical)) {
+    const crit = (card.verification && card.verification.checks || []).filter((c) => c.severity === 'critical').map((c) => c.title);
+    throw new Error(`${label}: el diseño del docente no queda aprobable (cambios ${pendingOf(card)}, aplicable ${card.design && card.design.applicable}, perfil sin guardar ${card.profileChanged}, críticos ${JSON.stringify(crit)}, cambios ${JSON.stringify((card.design && card.design.changes || []).slice(0, 5))})`);
   }
   return { kept: true, pinned, targetHours };
 }
