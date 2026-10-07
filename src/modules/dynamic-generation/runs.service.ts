@@ -846,9 +846,8 @@ export class RunsService {
     if (isFromRunRequest(courseContext)) {
       return this.startRunFromPrevious(courseId, ownerId, blueprintNumber, manifest, courseContext.fromRun);
     }
-    const context = await this.contextAlignedWithFacts(courseId, manifest, courseContext);
-    this.assertRequiredContext(context);
-    const contextHash = canonicalContextHash(context);
+    const rawContext = normalizeCourseContext(courseContext);
+    this.assertRequiredContext(rawContext);
     const videoMode = this.normalizeVideoMode((courseContext as any)?.videoMode);
     // 5B.2.A: la estrategia de entrega se lee (y valida, fail-fast) en cada
     // uso y se congela SOLO en runs nuevos; un run existente/reabierto
@@ -868,6 +867,9 @@ export class RunsService {
     // los chequeos bajo advisory lock en insertRun/reopenRun/retryItem.
     const other = await this.findActiveRunOnOtherManifest(this.dataSource, courseId, manifest.id);
     if (other) throw this.otherActiveRunConflict(other, manifest);
+    // LOOP 8.1: alineado con el estudiante del Blueprint, DESPUÉS de los gates previos (mismos errores y mismo orden).
+    const context = await this.contextAlignedWithFacts(courseId, manifest, rawContext);
+    const contextHash = canonicalContextHash(context);
     return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, true, videoDelivery, providerModes, opts);
   }
 
@@ -877,8 +879,13 @@ export class RunsService {
    * prompts nunca reciben dos estudiantes distintos). Sin documento ni perfil → el contexto de siempre (mismo hash).
    * La regeneración parcial (`fromRun`) no pasa por acá: reutiliza el contexto congelado del run anterior.
    */
-  private async contextAlignedWithFacts(courseId: number, manifest: { id: number; blueprintId: number }, courseContext: unknown): Promise<Record<string, any>> {
-    const context = normalizeCourseContext(courseContext);
+  private async contextAlignedWithFacts(
+    courseId: number,
+    manifest: { id: number; blueprintId: number; rulesVersion: number },
+    context: Record<string, any>,
+  ): Promise<Record<string, any>> {
+    // Solo runs v3 (estructura dinámica con perfiles): v1/v2 congelan exactamente lo de siempre, sin consultar perfiles.
+    if (manifest.rulesVersion !== 3) return context;
     // Review L81 I3: se alinea con el estudiante que congeló el Blueprint de ESTE Manifest (no con datos vivos): el
     // mismo Manifest da siempre el mismo contexto, así reanudar o reintentar nunca cambia el hash.
     const learner = await loadFrozenLearner(this.dataSource, courseId, manifest.blueprintId);
@@ -917,9 +924,8 @@ export class RunsService {
     assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
     await assertAssessmentProfileResolvableForRun(this.dataSource, courseId, manifest);
-    const context = await this.contextAlignedWithFacts(courseId, manifest, courseContext);
-    this.assertRequiredContext(context);
-    const contextHash = canonicalContextHash(context);
+    const rawContext = normalizeCourseContext(courseContext);
+    this.assertRequiredContext(rawContext);
     const videoMode = this.normalizeVideoMode((courseContext as any)?.videoMode);
     const providerModes = this.providerModesForNewRun(manifest.rulesVersion, (courseContext as any)?.providerModes);
     if (providerModes) {
@@ -936,6 +942,9 @@ export class RunsService {
     // Mismos 409/403 que startRun daría para un run nuevo, ANTES de ofrecer autorizar.
     const other = await this.findActiveRunOnOtherManifest(this.dataSource, courseId, manifest.id);
     if (other) throw this.otherActiveRunConflict(other, manifest);
+    // LOOP 8.1: el mismo contexto (y hash) que congelaría startRun.
+    const context = await this.contextAlignedWithFacts(courseId, manifest, rawContext);
+    const contextHash = canonicalContextHash(context);
     // Fix round 1 (I1): la elegibilidad de video real solo aplica si la estructura confirmada tiene videos.
     if (videoMode === 'real' && this.videoCountOf(manifest) > 0) assertRealVideoAllowed(ownerId);
     const modes = runSpendModes(videoMode, providerModes ?? null);
