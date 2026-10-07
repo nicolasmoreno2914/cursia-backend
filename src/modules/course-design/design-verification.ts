@@ -83,7 +83,7 @@ export interface VerificationInput {
   /** Instrumentos de evaluación que pide el microcurrículo. */
   requiredEvaluations: string[];
   /** Instrumentos del microcurrículo cuyos resultados el diseño no evalúa con el mismo tipo de evidencia (review L84-2 N6). */
-  uncoveredEvaluations: { instrument: string; outcomes: string[]; kind: 'performance' | 'exam' }[];
+  uncoveredEvaluations: { instrument: string; outcomes: string[]; kind: 'performance' | 'exam'; chapterIds?: string[] }[];
 }
 
 /** Máximo de horas de un curso (la meta válida va de 1 a 500). */
@@ -208,7 +208,11 @@ export function verifyDesign(input: VerificationInput): DesignVerification {
   if (perf.length) {
     add({ id: 'evaluation_performance', area: 'evaluations', severity: 'warning', title: 'El microcurrículo evalúa con trabajos que el diseño no tiene',
       detail: `${evText(perf)}: ningún capítulo que trabaje ese resultado tiene Actividad de Aplicación.`,
-      fix: input.preferences.applicationActivities !== 'auto' ? { kind: 'adjust', action: 'applicationActivities', value: 'auto', label: 'Actividades donde el diseño las necesite' } : { kind: 'editor', action: 'outcome_links', label: 'Vincular el resultado en el editor' } });
+      // Review L84-3 Mn5: lo que resuelve es una Actividad de Aplicación en un capítulo que trabaje ese resultado; vincular,
+      // solo si ningún capítulo lo trabaja.
+      fix: input.preferences.applicationActivities !== 'auto' ? { kind: 'adjust', action: 'applicationActivities', value: 'auto', label: 'Actividades donde el diseño las necesite' }
+        : perf.some((e) => (e.chapterIds || []).length) ? { kind: 'editor', action: 'application', label: 'Agregar la Actividad de Aplicación', targets: { chapterIds: perf.flatMap((e) => e.chapterIds || []).slice(0, 1) } }
+          : { kind: 'editor', action: 'outcome_links', label: 'Vincular el resultado en el editor' } });
   }
   if (exams.length && k.evaluations > 0) {
     add({ id: 'evaluation_exams', area: 'evaluations', severity: 'warning', title: 'El microcurrículo evalúa con pruebas que el diseño no tiene',
