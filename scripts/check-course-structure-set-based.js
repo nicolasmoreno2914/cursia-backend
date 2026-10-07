@@ -404,6 +404,14 @@ async function main() {
       eq(uc.out, { structureVersionCounter: c + 1 }, 'updateChapter');
       eq(uc.rts, 4, 'updateChapter idas y vueltas');
       c++;
+      // LOOP 8.3 (gate L83B): fijar el video también va en el MISMO UPDATE del contador.
+      const up = await measure(() => S.updateChapter(cid, m0.id, ch0.id, OWNER, { videoEnabled: false, pinVideo: true, expectedCounter: c }));
+      eq([up.out, up.rts], [{ structureVersionCounter: c + 1, videoPinned: true }, 4], 'updateChapter fijando el video');
+      eq((await ds.query(`select metadata -> 'designPins' -> $2::text p from public.courses where id = $1`, [cid, ch0.id]))[0].p, { video: false }, 'valor fijado guardado');
+      c++;
+      const un = await measure(() => S.updateChapter(cid, m0.id, ch0.id, OWNER, { videoEnabled: true, expectedCounter: c }));
+      eq([un.rts, (await ds.query(`select metadata -> 'designPins' -> $2::text -> 'video' p from public.courses where id = $1`, [cid, ch0.id]))[0].p], [4, null], 'sin fijar: libera el valor fijado (4 idas y vueltas)');
+      c++;
       const e0 = await measure(() => S.updateChapter(cid, m0.id, ch0.id, OWNER, { expectedCounter: c }));
       eq(e0.out, { structureVersionCounter: c + 1 }, 'updateChapter sin campos: igual sube el counter (como antes)');
       c++;

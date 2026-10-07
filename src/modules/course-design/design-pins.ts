@@ -27,21 +27,35 @@ export async function loadDesignPins(q: Q, courseId: number): Promise<DesignPins
   return parseDesignPins(v);
 }
 
-/** Fija (boolean) o libera (null) el video de un capítulo, dentro de la transacción del llamador. */
-export async function setVideoPin(q: Q, courseId: number, chapterId: string, video: boolean | null): Promise<void> {
-  if (video === null) {
-    await q.query(
-      `update public.courses set metadata = coalesce(metadata, '{}'::jsonb) #- $2::text[] where id = $1`,
-      [courseId, [DESIGN_PINS_KEY, chapterId]],
-    );
-    return;
+/**
+ * Un cambio sobre el valor fijado de UN capítulo: `value` null lo libera. `unlessPractice`: si el capítulo es de práctica
+ * (que nunca lleva video) se libera en vez de fijarse.
+ */
+export interface PinOp { field: 'video'; value: boolean | null; unlessPractice?: boolean }
+
+/**
+ * Expresión SQL (jsonb) que aplica `ops` sobre la columna `col` de courses.metadata, con el id del capítulo en el
+ * parámetro `chapterParam` (p. ej. '$7'). Permite plegar el cambio en el MISMO UPDATE que sube el contador de la
+ * estructura (sin idas y vueltas extra). Los nombres de campo y los booleanos son constantes, nunca datos del cliente.
+ */
+export function pinsMetadataExpr(col: string, chapterParam: string, ops: PinOp[]): string {
+  const ch = `${chapterParam}::text`;
+  let e = `coalesce(${col}, '{}'::jsonb)`;
+  for (const op of ops) {
+    const clear = `(${e} #- array['${DESIGN_PINS_KEY}', ${ch}, '${op.field}'])`;
+    if (op.value === null) { e = clear; continue; }
+    const set = `jsonb_set(${e}, array['${DESIGN_PINS_KEY}'], coalesce(${e} -> '${DESIGN_PINS_KEY}', '{}'::jsonb) || ` +
+      `jsonb_build_object(${ch}, coalesce(${e} -> '${DESIGN_PINS_KEY}' -> ${ch}, '{}'::jsonb) || jsonb_build_object('${op.field}', ${op.value ? 'true' : 'false'})), true)`;
+    e = op.unlessPractice
+      ? `(case when exists (select 1 from public.course_chapters px where px.id::text = ${ch} and coalesce(to_jsonb(px) ->> 'chapter_kind', 'content') = 'practice') then ${clear} else ${set} end)`
+      : set;
   }
-  await q.query(
-    `update public.courses set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), $2::text[],
-            coalesce(metadata -> '${DESIGN_PINS_KEY}', '{}'::jsonb) || jsonb_build_object($3::text, jsonb_build_object('video', $4::boolean)), true)
-      where id = $1`,
-    [courseId, [DESIGN_PINS_KEY], chapterId, video],
-  );
+  return e;
+}
+
+/** Fija (boolean) o libera (null) el video de un capítulo, dentro de la transacción del llamador (una sentencia). */
+export async function setVideoPin(q: Q, courseId: number, chapterId: string, video: boolean | null): Promise<void> {
+  await q.query(`update public.courses set metadata = ${pinsMetadataExpr('metadata', '$2', [{ field: 'video', value: video }])} where id = $1`, [courseId, chapterId]);
 }
 
 /** «Liberar»: todos los valores fijados vuelven a decidirlos Cursia. Devuelve cuántos había. */
