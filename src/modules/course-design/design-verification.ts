@@ -82,6 +82,8 @@ export interface VerificationInput {
   uncoveredContents: string[];
   /** Instrumentos de evaluación que pide el microcurrículo. */
   requiredEvaluations: string[];
+  /** Instrumentos del microcurrículo cuyos resultados el diseño no evalúa con el mismo tipo de evidencia (review L84-2 N6). */
+  uncoveredEvaluations: { instrument: string; outcomes: string[]; kind: 'performance' | 'exam' }[];
 }
 
 /** Máximo de horas de un curso (la meta válida va de 1 a 500). */
@@ -139,8 +141,8 @@ export function verifyDesign(input: VerificationInput): DesignVerification {
     // Review L84 I4 + m: la tarjeta ya ofrece «Diseñar para N h»; aquí solo la salida que la tarjeta no tiene cuando N > 500.
     const need = Math.ceil(input.baseHours);
     add({ id: 'hours', area: 'hours', severity: 'critical', title: `Los contenidos ya suman ≈ ${h1(input.baseHours)} h, más que las ${h1(input.targetHours)} h pedidas`,
-      detail: need <= MAX_TARGET_HOURS ? `Cursia no recorta contenido por su cuenta: diseña para ${need} h o quita contenidos.` : `Cursia no recorta contenido por su cuenta, y un curso admite hasta ${MAX_TARGET_HOURS} h: quita contenidos o divide el curso.`,
-      fix: need <= MAX_TARGET_HOURS ? { kind: 'adjust', action: 'targetHours', value: need, label: `Diseñar para ${need} h` } : { kind: 'editor', action: 'structure', label: 'Quitar contenidos o dividir el curso' } });
+      detail: need <= MAX_TARGET_HOURS ? `Cursia no recorta contenido por su cuenta: usa «Diseñar para ${need} h» en la tarjeta o quita contenidos.` : `Cursia no recorta contenido por su cuenta, y un curso admite hasta ${MAX_TARGET_HOURS} h: quita contenidos o divide el curso.`,
+      ...(need <= MAX_TARGET_HOURS ? {} : { fix: { kind: 'editor' as const, action: 'structure', label: 'Quitar contenidos o dividir el curso' } }) });
   }
 
   // Resultados ↔ estructura (Coherence Engine).
@@ -199,6 +201,20 @@ export function verifyDesign(input: VerificationInput): DesignVerification {
       fix: { kind: 'editor', action: 'module_exams', label: 'Activar evaluaciones en el editor' } });
   }
   else add({ id: 'evaluations', area: 'evaluations', severity: 'ok', title: plural(k.evaluations, 'evaluación', 'evaluaciones') });
+  // Lo que pide el microcurrículo (review L84-2 N6): mismo tipo de evidencia para los mismos resultados.
+  const perf = input.uncoveredEvaluations.filter((e) => e.kind === 'performance');
+  const exams = input.uncoveredEvaluations.filter((e) => e.kind === 'exam');
+  const evText = (xs: typeof perf) => xs.slice(0, 3).map((e) => `«${e.instrument}»${e.outcomes.length ? ` (${e.outcomes.join(', ')})` : ''}`).join(', ') + (xs.length > 3 ? ` y ${xs.length - 3} más` : '');
+  if (perf.length) {
+    add({ id: 'evaluation_performance', area: 'evaluations', severity: 'warning', title: 'El microcurrículo evalúa con trabajos que el diseño no tiene',
+      detail: `${evText(perf)}: ningún capítulo que trabaje ese resultado tiene Actividad de Aplicación.`,
+      fix: input.preferences.applicationActivities !== 'auto' ? { kind: 'adjust', action: 'applicationActivities', value: 'auto', label: 'Actividades donde el diseño las necesite' } : { kind: 'editor', action: 'outcome_links', label: 'Vincular el resultado en el editor' } });
+  }
+  if (exams.length && k.evaluations > 0) {
+    add({ id: 'evaluation_exams', area: 'evaluations', severity: 'warning', title: 'El microcurrículo evalúa con pruebas que el diseño no tiene',
+      detail: `${evText(exams)}: ninguna evaluación de módulo trabaja ese resultado y no hay evaluación final.`,
+      fix: { kind: 'editor', action: 'module_exams', label: 'Activar evaluaciones en el editor' } });
+  }
   // Pedagogía.
   if (input.approach) add({ id: 'pedagogy', area: 'pedagogy', severity: 'ok', title: `Enfoque: ${input.approach.label}` });
   else add({ id: 'pedagogy', area: 'pedagogy', severity: 'warning', title: 'Sin enfoque pedagógico', detail: 'Cursia no encontró resultados para recomendar uno.', fix: { kind: 'adjust', action: 'approach', label: 'Elegir un enfoque' } });
