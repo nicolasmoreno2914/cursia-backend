@@ -63,8 +63,10 @@ async function keepTeacherDesign(api, courseId, label, opts = {}) {
       await saveProfile(card.profile);
     } else {
       const d = card.design;
-      const need = Math.max(Number(d.baseHours) || 0, Number(d.estimatedHours) || 0);
-      targetHours = halfStepUp(targetHours !== null && targetHours >= need ? targetHours + 1 : need);
+      // Cambios por aplicar (Cursia agregaría práctica para llegar a sus horas): las que el contenido vivo ya suma.
+      // Diseño no aplicable (el mínimo supera la meta): una hora más en cada paso.
+      if (d.applicable === true) targetHours = halfStepUp(Number(d.baseHours) || 1);
+      else targetHours = halfStepUp((targetHours !== null ? targetHours : Number(d.baseHours) || 1) + 1);
       await saveProfile({ ...card.profile, targetHours });
     }
     card = await rec();
