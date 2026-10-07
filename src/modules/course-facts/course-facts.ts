@@ -288,7 +288,9 @@ const FIELD_CONFLICT_MESSAGE: Readonly<Record<DerivedField, (docV: unknown, pedH
 /** Prefijos de título que no son el área («Tecnología en…», «Técnico profesional en…»…). */
 const DEGREE_PREFIX_RE = /^(?:(?:programa|carrera)\s+(?:(?:acad[eé]mico|de\s+formaci[oó]n)\s+)?(?:(?:de|en)\s+)?)?(?:(?:tecnolog[ií]a|t[eé]cnic[oa](?:\s+(?:profesional|laboral)(?:\s+por\s+competencias)?)?|tecn[oó]log[oa]|tecnol[oó]gico|licenciatura|especializaci[oó]n(?:\s+tecnol[oó]gica)?|maestr[ií]a|doctorado|pregrado|diplomado|profesional)\s+(?:en|de|del)\s+)/i;
 /** Valores de «programa» que no son un área (placeholders, códigos, unidades administrativas). */
-const NOT_A_SECTOR_RE = /^(?:n\/?a|no\s+aplica|ninguno|ninguna|todos|todas|varios|general|otro|otros|sin\s+programa)\b|c[oó]digo|snies|facultad|resoluci[oó]n|departamento\s+de|escuela\s+de/i;
+const NOT_A_SECTOR_RE = /^(?:n\/?a|no\s+aplica|ninguno|ninguna|todos|todas|varios|general|otro|otros|sin\s+programa|transversal|curso)\b|c[oó]digo|snies|facultad|resoluci[oó]n|departamento\s+de|escuela\s+de/i;
+/** Encabezados que preceden al nombre del programa («Programa académico de…», «Programa: …», «Ciclo propedéutico en…»). */
+const PROGRAM_LEAD_RE = /^(?:programa(?:\s+acad[eé]mico)?\s*(?::|de\s+|en\s+)|ciclo\s+proped[eé]utico\s*(?::|de\s+|en\s+)?)\s*/i;
 /** Lo que queda después de quitar el título no puede ser otro título sin área («Tecnología en» suelto). */
 const BARE_DEGREE_RE = /^(?:programa|carrera|tecnolog[ií]a|t[eé]cnic[oa]|tecn[oó]log[oa]|licenciatura|especializaci[oó]n|maestr[ií]a|doctorado|pregrado|diplomado|profesional)(?:\s+(?:profesional|laboral|por|competencias|en|de|del))*$/i;
 
@@ -302,7 +304,7 @@ export function sectorFromAcademicContext(ctx: AcademicContextV1 | null | undefi
   if (!p || p.status !== 'found' || typeof p.value !== 'string' || !p.sources.length) return null;
   const raw = p.value.replace(/\s+/g, ' ').trim();
   if (NOT_A_SECTOR_RE.test(raw)) return null;
-  const rest = raw.replace(DEGREE_PREFIX_RE, '').replace(/^[\s:–—-]+/, '').trim();
+  const rest = raw.replace(PROGRAM_LEAD_RE, '').replace(DEGREE_PREFIX_RE, '').replace(/^[\s:–—-]+/, '').trim();
   if (!rest || BARE_DEGREE_RE.test(rest) || NOT_A_SECTOR_RE.test(rest)) return null;
   // Un «programa» que es una frase larga no es un área: mejor sin dato que un sector inventado.
   if (rest.length < 3 || rest.length > 80 || rest.split(' ').length > 10) return null;

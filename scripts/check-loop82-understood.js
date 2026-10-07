@@ -185,7 +185,10 @@ const BRIEF = { briefVersion: 1, fields: { obj: 'Quiero un curso de Excel básic
       ['Código SNIES 12345', 'found', src, null], ['Facultad de Ciencias Económicas', 'found', src, null], ['Tecnología en', 'found', src, null],
       ['Técnico Laboral por Competencias en Auxiliar de Enfermería', 'found', src, 'Auxiliar de Enfermería'],
       ['Programa Técnico Profesional en Logística', 'found', src, 'Logística'],
-      ['Curso de Excel básico', 'found', src, 'Curso de Excel básico'],
+      ['Curso de Excel básico', 'found', src, null], ['Transversal', 'found', src, null],
+      // Review L821-2 M1r: encabezados antes del nombre del programa.
+      ['Programa de Contaduría Pública', 'found', src, 'Contaduría Pública'], ['Programa académico de Ingeniería Industrial', 'found', src, 'Ingeniería Industrial'],
+      ['Programa: Tecnología en Gestión Logística', 'found', src, 'Gestión Logística'], ['Ciclo propedéutico en Administración Financiera', 'found', src, 'Administración Financiera'],
       ['Administración de Empresas', 'found', src, 'Administración de Empresas'],
     ];
     for (const [v, st, s, want] of cases) eq(CF.sectorFromAcademicContext(withProgram(v, st, s)), want, `«${v}» (${st})`);
