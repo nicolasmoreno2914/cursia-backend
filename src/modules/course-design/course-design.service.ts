@@ -17,7 +17,8 @@ import { LINK_CONTAINMENT_MIN, suggestOutcomeLinks } from '../academic-context/c
 import type { AcademicContextV1 } from '../academic-context/academic-context';
 import { tokenSet } from '../coherence/normalize';
 import { proposedChapterUuid } from '../pedagogy/dry-run';
-import { advanceStructureOriginIfUntouched } from '../course-structure/structure-authority';
+import { advanceStructureOriginIfUntouched, readStructureOrigin } from '../course-structure/structure-authority';
+import { buildRequirementsView, compareRequirements, loadRequirementsState, RequirementCheck } from '../academic-context/requirements/document-requirements';
 import { ConflictException } from '@nestjs/common';
 import { DesignAdjustDto, RecommendDesignDto } from './dto/recommend.dto';
 
@@ -146,6 +147,30 @@ export class CourseDesignService {
         uncoveredEvaluations: academic ? uncoveredEvaluations(academic.context, dist, chapterOutcomes) : [],
       })
       : null;
+    // LOOP 8.6B · Requisitos del documento frente a ESTE diseño: solo se informan (nunca cambian el diseño ni bloquean).
+    const reqState = await loadRequirementsState(this.dataSource, courseId);
+    const reqView = buildRequirementsView(reqState.entries, reqState.selection, academic ? academic.context.documents : []);
+    let reqChecks: RequirementCheck[] = [];
+    if (reqView.state === 'current' && dist) {
+      const origin = await readStructureOrigin(this.dataSource, courseId);
+      const [cnt] = await this.dataSource.query(`select structure_version_counter c from public.courses where id = $1`, [courseId]);
+      const savedPrefs: any = (saved && (saved.profile as any).designPreferences) || {};
+      reqChecks = compareRequirements(reqView.items.filter((i) => i.applies), {
+        modules: dist.modules.map((m) => ({
+          examEnabled: m.examEnabled,
+          chapters: m.chapters.map((c) => ({
+            kind: c.kind, proposed: c.proposed, videoEnabled: c.videoEnabled, videoPinned: c.videoPinned, activityEnabled: c.activityEnabled,
+            applicationMinutes: c.applicationMinutes ?? null, applicationPinned: c.applicationPinned, hours: Math.round((c.targetMinutes / 60) * 10) / 10,
+          })),
+        })),
+        evaluations: dist.counts.evaluations,
+        targetHours: profile.targetHours ?? null,
+        hoursSource,
+        structureByTeacher: !origin || origin.counter !== Number(cnt.c),
+        audiovisualByTeacher: adjust.audiovisual !== undefined || (!!savedPrefs.audiovisual && savedPrefs.audiovisual !== DEFAULT_AUDIOVISUAL),
+        applicationByTeacher: adjust.applicationActivities !== undefined || (!!savedPrefs.applicationActivities && savedPrefs.applicationActivities !== 'auto'),
+      });
+    }
     return {
       designVersion: 1,
       providersCalled: 0,
@@ -187,6 +212,7 @@ export class CourseDesignService {
         : null,
       cost: providers && providers.estimateUsd ? { min: providers.estimateUsd.min, expected: providers.estimateUsd.expected, max: providers.estimateUsd.max, note: providers.estimateNote } : null,
       outcomes: academic ? academic.context.outcomes.map((o) => ({ id: o.id, text: o.text })) : [],
+      requirements: { ...reqView, checks: reqChecks },
     };
   }
 

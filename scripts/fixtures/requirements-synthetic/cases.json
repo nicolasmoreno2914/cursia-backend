@@ -1,0 +1,2336 @@
+[
+ {
+  "id": "S01",
+  "title": "3 módulos",
+  "synthetic": true,
+  "text": "El curso tendrá 3 módulos.",
+  "must": [
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 3,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [],
+  "groups": []
+ },
+ {
+  "id": "S02",
+  "title": "4 módulos × 5 capítulos por módulo",
+  "synthetic": true,
+  "text": "La estructura del curso será de 4 módulos × 5 capítulos por módulo.",
+  "must": [
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 4,
+    "obligation": "required"
+   },
+   {
+    "kind": "chapters",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 5,
+    "obligation": "required"
+   },
+   {
+    "kind": "structure",
+    "scope": {
+     "level": "structure"
+    },
+    "mode": "exact",
+    "value": null,
+    "obligation": "required",
+    "shape": [
+     5,
+     5,
+     5,
+     5
+    ]
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "chapters",
+    "why": "5 es POR MÓDULO, no el total del curso.",
+    "value": 5,
+    "scope": {
+     "level": "course"
+    }
+   }
+  ],
+  "groups": [
+   {
+    "relation": "all",
+    "kinds": [
+     "modules",
+     "chapters",
+     "structure"
+    ],
+    "total": 20
+   }
+  ]
+ },
+ {
+  "id": "S03",
+  "title": "4 módulos, con 5 capítulos en cada módulo",
+  "synthetic": true,
+  "text": "El curso tendrá 4 módulos, con 5 capítulos en cada módulo.",
+  "must": [
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 4,
+    "obligation": "required"
+   },
+   {
+    "kind": "chapters",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 5,
+    "obligation": "required"
+   },
+   {
+    "kind": "structure",
+    "scope": {
+     "level": "structure"
+    },
+    "mode": "exact",
+    "value": null,
+    "obligation": "required",
+    "shape": [
+     5,
+     5,
+     5,
+     5
+    ]
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "chapters",
+    "why": "5 es por módulo.",
+    "value": 5,
+    "scope": {
+     "level": "course"
+    }
+   }
+  ],
+  "groups": [
+   {
+    "relation": "all",
+    "kinds": [
+     "modules",
+     "chapters",
+     "structure"
+    ],
+    "total": 20
+   }
+  ]
+ },
+ {
+  "id": "S04",
+  "title": "4 módulos y 20 capítulos en total",
+  "synthetic": true,
+  "text": "El curso tendrá 4 módulos y 20 capítulos en total.",
+  "must": [
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 4,
+    "obligation": "required"
+   },
+   {
+    "kind": "chapters",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 20,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "chapters",
+    "why": "20 es el total del curso, no por módulo.",
+    "value": 20,
+    "scope": {
+     "level": "module",
+     "each": true
+    }
+   },
+   {
+    "kind": "structure",
+    "why": "«20 en total» no fija la forma (cuántos en cada módulo).",
+    "anyValue": true
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S05",
+  "title": "64 horas",
+  "synthetic": true,
+  "text": "El curso tendrá una duración de 64 horas.",
+  "must": [
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 64,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [],
+  "groups": []
+ },
+ {
+  "id": "S06",
+  "title": "mínimo 64 horas",
+  "synthetic": true,
+  "text": "El curso deberá tener mínimo 64 horas.",
+  "must": [
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "min",
+    "value": 64,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [],
+  "groups": []
+ },
+ {
+  "id": "S07",
+  "title": "máximo 64 horas",
+  "synthetic": true,
+  "text": "La duración del curso será como máximo de 64 horas.",
+  "must": [
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "max",
+    "value": 64,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [],
+  "groups": []
+ },
+ {
+  "id": "S08",
+  "title": "aproximadamente 64 horas",
+  "synthetic": true,
+  "text": "El curso tendrá aproximadamente 64 horas.",
+  "must": [
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "approx",
+    "value": 64,
+    "obligation": "recommended"
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "target_hours",
+    "why": "«aproximadamente» nunca es exacto obligatorio.",
+    "value": 64,
+    "mode": "exact",
+    "obligation": "required"
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S09",
+  "title": "entre 60 y 64 horas",
+  "synthetic": true,
+  "text": "El curso deberá tener entre 60 y 64 horas.",
+  "must": [
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "range",
+    "value": 60,
+    "obligation": "required",
+    "valueMax": 64
+   }
+  ],
+  "optional": [],
+  "must_not": [],
+  "groups": []
+ },
+ {
+  "id": "S10",
+  "title": "10 videos en el curso",
+  "synthetic": true,
+  "text": "El curso deberá tener 10 videos.",
+  "must": [
+   {
+    "kind": "videos",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 10,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [],
+  "groups": []
+ },
+ {
+  "id": "S11",
+  "title": "mínimo 2 videos por módulo",
+  "synthetic": true,
+  "text": "Cada módulo deberá incluir mínimo 2 videos.",
+  "must": [
+   {
+    "kind": "videos",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "min",
+    "value": 2,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "videos",
+    "why": "2 es por módulo, no del curso.",
+    "value": 2,
+    "scope": {
+     "level": "course"
+    }
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S12",
+  "title": "2 videos por capítulo",
+  "synthetic": true,
+  "text": "Se deben producir 2 videos por capítulo.",
+  "must": [
+   {
+    "kind": "videos",
+    "scope": {
+     "level": "chapter",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 2,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "videos",
+    "why": "2 es por capítulo.",
+    "value": 2,
+    "scope": {
+     "level": "course"
+    }
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S13",
+  "title": "máximo 12 videos",
+  "synthetic": true,
+  "text": "El curso tendrá como máximo 12 videos.",
+  "must": [
+   {
+    "kind": "videos",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "max",
+    "value": 12,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [],
+  "groups": []
+ },
+ {
+  "id": "S14",
+  "title": "8 Actividades de Aplicación",
+  "synthetic": true,
+  "text": "Se deben desarrollar 8 Actividades de Aplicación.",
+  "must": [
+   {
+    "kind": "application_activities",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 8,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [],
+  "groups": []
+ },
+ {
+  "id": "S15",
+  "title": "mínimo 1 Actividad de Aplicación por módulo",
+  "synthetic": true,
+  "text": "Cada módulo deberá contar con mínimo 1 Actividad de Aplicación.",
+  "must": [
+   {
+    "kind": "application_activities",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "min",
+    "value": 1,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [],
+  "groups": []
+ },
+ {
+  "id": "S16",
+  "title": "una Actividad de Aplicación en cada capítulo de práctica",
+  "synthetic": true,
+  "text": "Se desarrollará una Actividad de Aplicación en cada capítulo de práctica.",
+  "must": [
+   {
+    "kind": "application_activities",
+    "scope": {
+     "level": "chapter",
+     "each": true,
+     "chapterKind": "practice"
+    },
+    "mode": "exact",
+    "value": 1,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "chapters",
+    "why": "«capítulo de práctica» no es una cantidad de capítulos.",
+    "anyValue": true
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S17",
+  "title": "3 evaluaciones",
+  "synthetic": true,
+  "text": "Se realizarán 3 evaluaciones.",
+  "must": [
+   {
+    "kind": "evaluations",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 3,
+    "obligation": "required",
+    "evaluationType": "any"
+   }
+  ],
+  "optional": [],
+  "must_not": [],
+  "groups": []
+ },
+ {
+  "id": "S18",
+  "title": "3 parciales + 1 final",
+  "synthetic": true,
+  "text": "Se realizarán 3 evaluaciones parciales + 1 evaluación final.",
+  "must": [
+   {
+    "kind": "evaluations",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 3,
+    "obligation": "required",
+    "evaluationType": "partial"
+   },
+   {
+    "kind": "evaluations",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 1,
+    "obligation": "required",
+    "evaluationType": "final"
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "evaluations",
+    "why": "La final no se mezcla con los parciales.",
+    "value": 4
+   },
+   {
+    "kind": "evaluations",
+    "why": "«3» no es «cualquier evaluación»: son parciales.",
+    "value": 3,
+    "evaluationType": "any"
+   }
+  ],
+  "groups": [
+   {
+    "relation": "all",
+    "kinds": [
+     "evaluations",
+     "evaluations"
+    ]
+   }
+  ]
+ },
+ {
+  "id": "S19",
+  "title": "capítulo 6 del libro",
+  "synthetic": true,
+  "text": "Consultar el capítulo 6 del libro.",
+  "must": [],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "chapters",
+    "why": "Referencia a un capítulo del libro.",
+    "anyValue": true
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S20",
+  "title": "el ejemplo 3",
+  "synthetic": true,
+  "text": "El ejemplo 3 muestra cómo calcular el costo unitario.",
+  "must": [],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "evaluations",
+    "why": "Número de ejemplo.",
+    "anyValue": true
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S21",
+  "title": "página 64",
+  "synthetic": true,
+  "text": "Ver página 64.",
+  "must": [],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "target_hours",
+    "why": "Número de página.",
+    "anyValue": true
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S22",
+  "title": "pago por 64 horas",
+  "synthetic": true,
+  "text": "El experto recibirá pago por 64 horas.",
+  "must": [],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "target_hours",
+    "why": "Son horas pagadas al experto.",
+    "anyValue": true
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S23",
+  "title": "ejemplo 4 × 4",
+  "synthetic": true,
+  "text": "Como ejemplo, Cursia recomienda 4 módulos × 4 capítulos.",
+  "must": [],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "modules",
+    "why": "Es un ejemplo.",
+    "anyValue": true
+   },
+   {
+    "kind": "chapters",
+    "why": "Es un ejemplo.",
+    "anyValue": true
+   },
+   {
+    "kind": "structure",
+    "why": "Es un ejemplo.",
+    "anyValue": true
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S24",
+  "title": "se recomienda aprox. 64 horas",
+  "synthetic": true,
+  "text": "Se recomienda trabajar aproximadamente 64 horas.",
+  "must": [
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "approx",
+    "value": 64,
+    "obligation": "recommended"
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "target_hours",
+    "why": "No es obligatorio exacto.",
+    "value": 64,
+    "obligation": "required"
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S25",
+  "title": "podrán incorporarse hasta 10 videos",
+  "synthetic": true,
+  "text": "Podrán incorporarse hasta 10 videos.",
+  "must": [
+   {
+    "kind": "videos",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "max",
+    "value": 10,
+    "obligation": "permitted"
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "videos",
+    "why": "Es un tope permitido, no una cantidad exigida.",
+    "value": 10,
+    "mode": "exact"
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S26",
+  "title": "deberá tener 4 módulos",
+  "synthetic": true,
+  "text": "El curso deberá tener 4 módulos.",
+  "must": [
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 4,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [],
+  "groups": []
+ },
+ {
+  "id": "S27",
+  "title": "se recomienda 4 módulos",
+  "synthetic": true,
+  "text": "Se recomienda estructurar el curso en 4 módulos.",
+  "must": [
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 4,
+    "obligation": "recommended"
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "modules",
+    "why": "Recomendación.",
+    "value": 4,
+    "obligation": "required"
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S28",
+  "title": "podrá organizarse en 4 módulos",
+  "synthetic": true,
+  "text": "El curso podrá organizarse en 4 módulos.",
+  "must": [
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 4,
+    "obligation": "permitted"
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "modules",
+    "why": "Permiso.",
+    "value": 4,
+    "obligation": "required"
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S29",
+  "title": "se propone 4 módulos",
+  "synthetic": true,
+  "text": "Se propone una estructura de 4 módulos.",
+  "must": [
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 4,
+    "obligation": "recommended",
+    "confidence": "medium"
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "modules",
+    "why": "Propuesta.",
+    "value": 4,
+    "obligation": "required"
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S30",
+  "title": "S/M/L de estructura",
+  "synthetic": true,
+  "text": "Tamaños disponibles para el curso:\nS: 3 módulos × 4 capítulos\nM: 4 módulos × 5 capítulos\nL: 5 módulos × 6 capítulos",
+  "must": [
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 3,
+    "obligation": "required",
+    "option": "S"
+   },
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 4,
+    "obligation": "required",
+    "option": "M"
+   },
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 5,
+    "obligation": "required",
+    "option": "L"
+   },
+   {
+    "kind": "chapters",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 4,
+    "obligation": "required",
+    "option": "S"
+   },
+   {
+    "kind": "chapters",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 5,
+    "obligation": "required",
+    "option": "M"
+   },
+   {
+    "kind": "chapters",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 6,
+    "obligation": "required",
+    "option": "L"
+   },
+   {
+    "kind": "structure",
+    "scope": {
+     "level": "structure"
+    },
+    "mode": "exact",
+    "value": null,
+    "obligation": "required",
+    "option": "S",
+    "shape": [
+     4,
+     4,
+     4
+    ]
+   },
+   {
+    "kind": "structure",
+    "scope": {
+     "level": "structure"
+    },
+    "mode": "exact",
+    "value": null,
+    "obligation": "required",
+    "option": "M",
+    "shape": [
+     5,
+     5,
+     5,
+     5
+    ]
+   },
+   {
+    "kind": "structure",
+    "scope": {
+     "level": "structure"
+    },
+    "mode": "exact",
+    "value": null,
+    "obligation": "required",
+    "option": "L",
+    "shape": [
+     6,
+     6,
+     6,
+     6,
+     6
+    ]
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "modules",
+    "why": "Nunca la suma de alternativas.",
+    "value": 12
+   },
+   {
+    "kind": "chapters",
+    "why": "Nunca la suma de alternativas.",
+    "value": 62
+   }
+  ],
+  "groups": [
+   {
+    "relation": "oneOf",
+    "options": [
+     "S",
+     "M",
+     "L"
+    ]
+   }
+  ],
+  "expectActive": 0
+ },
+ {
+  "id": "S31",
+  "title": "S/M/L de horas",
+  "synthetic": true,
+  "text": "Opción S: 32 h\nOpción M: 64 h\nOpción L: 96 h",
+  "must": [
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 32,
+    "obligation": "required",
+    "option": "S"
+   },
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 64,
+    "obligation": "required",
+    "option": "M"
+   },
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 96,
+    "obligation": "required",
+    "option": "L"
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "target_hours",
+    "why": "Nunca la suma.",
+    "value": 192
+   }
+  ],
+  "groups": [
+   {
+    "relation": "oneOf",
+    "options": [
+     "S",
+     "M",
+     "L"
+    ]
+   }
+  ],
+  "select": {
+   "options": {
+    "*": "M"
+   },
+   "expectActiveValues": {
+    "target_hours": [
+     64
+    ]
+   }
+  },
+  "expectActive": 0
+ },
+ {
+  "id": "S32",
+  "title": "12 videos en el curso",
+  "synthetic": true,
+  "text": "El curso debe tener 12 videos.",
+  "must": [
+   {
+    "kind": "videos",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 12,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [],
+  "groups": []
+ },
+ {
+  "id": "S33",
+  "title": "2 videos por módulo",
+  "synthetic": true,
+  "text": "Cada módulo debe incluir 2 videos.",
+  "must": [
+   {
+    "kind": "videos",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 2,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "videos",
+    "why": "Por módulo.",
+    "value": 2,
+    "scope": {
+     "level": "course"
+    }
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S34",
+  "title": "una actividad por capítulo",
+  "synthetic": true,
+  "text": "Cada capítulo deberá incluir una actividad.",
+  "must": [
+   {
+    "kind": "activities",
+    "scope": {
+     "level": "chapter",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 1,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "application_activities",
+    "why": "«actividad» sin «de Aplicación» es la actividad interactiva.",
+    "anyValue": true
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S35",
+  "title": "si 3 créditos → 96 h",
+  "synthetic": true,
+  "text": "Si la asignatura tiene 3 créditos, deberá contar con 96 horas.",
+  "must": [
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 96,
+    "obligation": "required",
+    "condition": {
+     "field": "credits",
+     "op": "=",
+     "value": 3
+    }
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "target_hours",
+    "why": "No aplica sin la condición.",
+    "value": 96,
+    "active": true
+   }
+  ],
+  "groups": [],
+  "select": {
+   "facts": {
+    "credits": 3
+   },
+   "expectActiveValues": {
+    "target_hours": [
+     96
+    ]
+   }
+  },
+  "expectActive": 0
+ },
+ {
+  "id": "S36",
+  "title": "para 2 créditos → 64 h",
+  "synthetic": true,
+  "text": "Para cursos de 2 créditos, se contemplarán 64 horas.",
+  "must": [
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 64,
+    "obligation": "required",
+    "condition": {
+     "field": "credits",
+     "op": "=",
+     "value": 2
+    }
+   }
+  ],
+  "optional": [],
+  "must_not": [],
+  "groups": [],
+  "select": {
+   "facts": {
+    "credits": 3
+   },
+   "expectActiveValues": {
+    "target_hours": []
+   }
+  },
+  "expectActive": 0
+ },
+ {
+  "id": "S37",
+  "title": "condición no modelada",
+  "synthetic": true,
+  "text": "Si el grupo supera 40 estudiantes, deberá incluir 2 evaluaciones adicionales.",
+  "must": [],
+  "optional": [
+   {
+    "kind": "evaluations",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 2,
+    "obligation": "required",
+    "condition": {
+     "modeled": false
+    }
+   }
+  ],
+  "must_not": [
+   {
+    "kind": "evaluations",
+    "why": "Condición no modelada: nunca activa.",
+    "anyValue": true,
+    "active": true
+   }
+  ],
+  "groups": [],
+  "expectActive": 0
+ },
+ {
+  "id": "S38",
+  "title": "varias asignaturas",
+  "synthetic": true,
+  "text": "Horas por asignatura:\nMatemáticas — 64 horas\nEstadística — 96 horas\nComunicación — 64 horas",
+  "must": [
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "subject",
+     "subject": "Matemáticas"
+    },
+    "mode": "exact",
+    "value": 64,
+    "obligation": "required"
+   },
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "subject",
+     "subject": "Estadística"
+    },
+    "mode": "exact",
+    "value": 96,
+    "obligation": "required"
+   },
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "subject",
+     "subject": "Comunicación"
+    },
+    "mode": "exact",
+    "value": 64,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "target_hours",
+    "why": "No se suman asignaturas.",
+    "value": 224
+   },
+   {
+    "kind": "target_hours",
+    "why": "Nada a nivel del curso sin elegir asignatura.",
+    "anyValue": true,
+    "scope": {
+     "level": "course"
+    },
+    "active": true
+   }
+  ],
+  "groups": [],
+  "select": {
+   "subject": "Estadística",
+   "expectActiveValues": {
+    "target_hours": [
+     96
+    ]
+   }
+  },
+  "expectActive": 0
+ },
+ {
+  "id": "S39",
+  "title": "campos de ficha",
+  "synthetic": true,
+  "text": "Número de módulos: 4\nCapítulos por módulo: 5\nIntensidad horaria total: 64 horas",
+  "must": [
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 4,
+    "obligation": "required"
+   },
+   {
+    "kind": "chapters",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 5,
+    "obligation": "required"
+   },
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 64,
+    "obligation": "required"
+   },
+   {
+    "kind": "structure",
+    "scope": {
+     "level": "structure"
+    },
+    "mode": "exact",
+    "value": null,
+    "obligation": "required",
+    "shape": [
+     5,
+     5,
+     5,
+     5
+    ]
+   }
+  ],
+  "optional": [],
+  "must_not": [],
+  "groups": [
+   {
+    "relation": "all",
+    "kinds": [
+     "modules",
+     "chapters",
+     "structure"
+    ],
+    "total": 20
+   }
+  ],
+  "expectActive": 4
+ },
+ {
+  "id": "S40",
+  "title": "números en palabras",
+  "synthetic": true,
+  "text": "El curso tendrá cuatro (4) módulos y deberá incluir doce videos.",
+  "must": [
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 4,
+    "obligation": "required"
+   },
+   {
+    "kind": "videos",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 12,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [],
+  "groups": []
+ },
+ {
+  "id": "S41",
+  "title": "negación",
+  "synthetic": true,
+  "text": "No se requieren videos en este curso.",
+  "must": [
+   {
+    "kind": "videos",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "max",
+    "value": 0,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [],
+  "groups": []
+ },
+ {
+  "id": "S42",
+  "title": "«una» como artículo",
+  "synthetic": true,
+  "origin": "patrón observado en un documento real (regresión)",
+  "text": "Las notas son una evaluación del grado de avance del trabajo propio.",
+  "must": [],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "evaluations",
+    "why": "Artículo, no cantidad.",
+    "anyValue": true
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S43",
+  "title": "rótulo que no es de ficha",
+  "synthetic": true,
+  "origin": "patrón observado en un documento real (regresión)",
+  "text": "Artículo Primero: Adicionar un capítulo al Acuerdo N°18 del Estatuto.",
+  "must": [],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "chapters",
+    "why": "Capítulo de un estatuto.",
+    "anyValue": true
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S44",
+  "title": "celda anterior a «Horas Totales»",
+  "synthetic": true,
+  "origin": "patrón observado en un documento real (regresión)",
+  "text": "Horas de acompañamiento directo (HAD) (HT+HP) 48 Horas Totales",
+  "must": [],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "target_hours",
+    "why": "48 es la celda de acompañamiento.",
+    "value": 48
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S45",
+  "title": "negación que no es del objeto",
+  "synthetic": true,
+  "origin": "patrón observado en un documento real (regresión)",
+  "text": "El foro no debe tener restricciones de acceso ni fecha de finalización de la actividad.",
+  "must": [],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "activities",
+    "why": "La negación es de las restricciones, no de la actividad.",
+    "anyValue": true
+   }
+  ],
+  "groups": []
+ },
+ {
+  "id": "S46",
+  "title": "escenario completo en prosa (4×5, 2 videos/cap., 1 AA/mód., 3+1 eval., 64 h)",
+  "synthetic": true,
+  "text": "El curso deberá tener 4 módulos con 5 capítulos por módulo. Cada capítulo tendrá 2 videos. Cada módulo tendrá una Actividad de Aplicación. Se realizarán 3 evaluaciones parciales y 1 evaluación final. La intensidad horaria total será de 64 horas.",
+  "must": [
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 4,
+    "obligation": "required"
+   },
+   {
+    "kind": "chapters",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 5,
+    "obligation": "required"
+   },
+   {
+    "kind": "structure",
+    "scope": {
+     "level": "structure"
+    },
+    "mode": "exact",
+    "value": null,
+    "obligation": "required",
+    "shape": [
+     5,
+     5,
+     5,
+     5
+    ]
+   },
+   {
+    "kind": "videos",
+    "scope": {
+     "level": "chapter",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 2,
+    "obligation": "required"
+   },
+   {
+    "kind": "application_activities",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 1,
+    "obligation": "required"
+   },
+   {
+    "kind": "evaluations",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 3,
+    "obligation": "required",
+    "evaluationType": "partial"
+   },
+   {
+    "kind": "evaluations",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 1,
+    "obligation": "required",
+    "evaluationType": "final"
+   },
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 64,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "chapters",
+    "why": "4 × 5 = 20 capítulos por estructura, nunca 5 en todo el curso.",
+    "value": 5,
+    "scope": {
+     "level": "course"
+    }
+   },
+   {
+    "kind": "evaluations",
+    "why": "Parciales y final no se suman.",
+    "value": 4
+   },
+   {
+    "kind": "videos",
+    "why": "2 por capítulo no son 2 en el curso.",
+    "value": 2,
+    "scope": {
+     "level": "course"
+    }
+   },
+   {
+    "kind": "application_activities",
+    "why": "1 por módulo no es 1 en el curso.",
+    "value": 1,
+    "scope": {
+     "level": "course"
+    }
+   }
+  ],
+  "groups": [
+   {
+    "relation": "all",
+    "kinds": [
+     "modules",
+     "chapters",
+     "structure"
+    ],
+    "total": 20
+   },
+   {
+    "relation": "all",
+    "kinds": [
+     "evaluations",
+     "evaluations"
+    ]
+   }
+  ],
+  "expectActive": 8
+ },
+ {
+  "id": "S47",
+  "title": "escenario completo como ficha (campos separados)",
+  "synthetic": true,
+  "text": "Ficha del curso\nNúmero de módulos: 4\nCapítulos por módulo: 5\nVideos por capítulo: 2\nActividades de Aplicación por módulo: 1\nEvaluaciones parciales: 3\nEvaluación final: 1\nIntensidad horaria total: 64 horas",
+  "must": [
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 4,
+    "obligation": "required"
+   },
+   {
+    "kind": "chapters",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 5,
+    "obligation": "required"
+   },
+   {
+    "kind": "structure",
+    "scope": {
+     "level": "structure"
+    },
+    "mode": "exact",
+    "value": null,
+    "obligation": "required",
+    "shape": [
+     5,
+     5,
+     5,
+     5
+    ]
+   },
+   {
+    "kind": "videos",
+    "scope": {
+     "level": "chapter",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 2,
+    "obligation": "required"
+   },
+   {
+    "kind": "application_activities",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 1,
+    "obligation": "required"
+   },
+   {
+    "kind": "evaluations",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 3,
+    "obligation": "required",
+    "evaluationType": "partial"
+   },
+   {
+    "kind": "evaluations",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 1,
+    "obligation": "required",
+    "evaluationType": "final"
+   },
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 64,
+    "obligation": "required"
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "chapters",
+    "why": "4 × 5 = 20 capítulos por estructura, nunca 5 en todo el curso.",
+    "value": 5,
+    "scope": {
+     "level": "course"
+    }
+   },
+   {
+    "kind": "evaluations",
+    "why": "Parciales y final no se suman.",
+    "value": 4
+   },
+   {
+    "kind": "videos",
+    "why": "2 por capítulo no son 2 en el curso.",
+    "value": 2,
+    "scope": {
+     "level": "course"
+    }
+   },
+   {
+    "kind": "application_activities",
+    "why": "1 por módulo no es 1 en el curso.",
+    "value": 1,
+    "scope": {
+     "level": "course"
+    }
+   }
+  ],
+  "groups": [
+   {
+    "relation": "all",
+    "kinds": [
+     "modules",
+     "chapters",
+     "structure"
+    ],
+    "total": 20
+   }
+  ],
+  "expectActive": 8
+ },
+ {
+  "id": "S48",
+  "title": "S/M/L en tabla con precios por fila (3×4 32 h · 4×5 64 h · 5×6 96 h)",
+  "synthetic": true,
+  "text": "TAMAÑO ESTRUCTURA HORAS VALOR\nS 3 módulos × 4 capítulos 32 h $900.000\nM 4 módulos × 5 capítulos 64 h $1.400.000\nL 5 módulos × 6 capítulos 96 h $1.900.000",
+  "must": [
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 3,
+    "obligation": "required",
+    "option": "S"
+   },
+   {
+    "kind": "chapters",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 4,
+    "obligation": "required",
+    "option": "S"
+   },
+   {
+    "kind": "structure",
+    "scope": {
+     "level": "structure"
+    },
+    "mode": "exact",
+    "value": null,
+    "obligation": "required",
+    "shape": [
+     4,
+     4,
+     4
+    ],
+    "option": "S"
+   },
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 32,
+    "obligation": "required",
+    "option": "S"
+   },
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 4,
+    "obligation": "required",
+    "option": "M"
+   },
+   {
+    "kind": "chapters",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 5,
+    "obligation": "required",
+    "option": "M"
+   },
+   {
+    "kind": "structure",
+    "scope": {
+     "level": "structure"
+    },
+    "mode": "exact",
+    "value": null,
+    "obligation": "required",
+    "shape": [
+     5,
+     5,
+     5,
+     5
+    ],
+    "option": "M"
+   },
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 64,
+    "obligation": "required",
+    "option": "M"
+   },
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 5,
+    "obligation": "required",
+    "option": "L"
+   },
+   {
+    "kind": "chapters",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 6,
+    "obligation": "required",
+    "option": "L"
+   },
+   {
+    "kind": "structure",
+    "scope": {
+     "level": "structure"
+    },
+    "mode": "exact",
+    "value": null,
+    "obligation": "required",
+    "shape": [
+     6,
+     6,
+     6,
+     6,
+     6
+    ],
+    "option": "L"
+   },
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 96,
+    "obligation": "required",
+    "option": "L"
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "target_hours",
+    "why": "Nunca la suma de alternativas (32+64+96).",
+    "value": 192
+   },
+   {
+    "kind": "modules",
+    "why": "Suma 3+4+5.",
+    "value": 12
+   },
+   {
+    "kind": "chapters",
+    "why": "Suma 12+20+30.",
+    "value": 62
+   },
+   {
+    "kind": "structure",
+    "why": "Ninguna estructura aplica sin elegir.",
+    "anyValue": true,
+    "active": true
+   },
+   {
+    "kind": "target_hours",
+    "why": "Ninguna hora aplica sin elegir.",
+    "anyValue": true,
+    "active": true
+   },
+   {
+    "kind": "target_hours",
+    "why": "El precio no es horas.",
+    "value": 900
+   }
+  ],
+  "groups": [
+   {
+    "relation": "oneOf",
+    "options": [
+     "S",
+     "M",
+     "L"
+    ]
+   }
+  ],
+  "selects": [
+   {
+    "options": {
+     "*": "S"
+    },
+    "expectActiveValues": {
+     "modules": [
+      3
+     ],
+     "chapters": [
+      4
+     ],
+     "target_hours": [
+      32
+     ]
+    },
+    "expectStructureTotal": 12
+   },
+   {
+    "options": {
+     "*": "M"
+    },
+    "expectActiveValues": {
+     "modules": [
+      4
+     ],
+     "chapters": [
+      5
+     ],
+     "target_hours": [
+      64
+     ]
+    },
+    "expectStructureTotal": 20
+   },
+   {
+    "options": {
+     "*": "L"
+    },
+    "expectActiveValues": {
+     "modules": [
+      5
+     ],
+     "chapters": [
+      6
+     ],
+     "target_hours": [
+      96
+     ]
+    },
+    "expectStructureTotal": 30
+   }
+  ],
+  "expectActive": 0
+ },
+ {
+  "id": "S49",
+  "title": "S/M/L con la etiqueta sola y la celda partida en líneas (como un PDF)",
+  "synthetic": true,
+  "text": "TAMAÑO HORAS ESTRUCTURA\nS\n2 h/sem\n32 h 3 módulos\n× 4 capítulos\nM\n4 h/sem\n64 h 4 módulos\n× 5 capítulos\nL\n6 h/sem\n96 h 5 módulos\n× 6 capítulos\nLa institución elegirá un tamaño para cada asignatura.",
+  "must": [
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 3,
+    "obligation": "required",
+    "option": "S"
+   },
+   {
+    "kind": "chapters",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 4,
+    "obligation": "required",
+    "option": "S"
+   },
+   {
+    "kind": "structure",
+    "scope": {
+     "level": "structure"
+    },
+    "mode": "exact",
+    "value": null,
+    "obligation": "required",
+    "shape": [
+     4,
+     4,
+     4
+    ],
+    "option": "S"
+   },
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 32,
+    "obligation": "required",
+    "option": "S"
+   },
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 4,
+    "obligation": "required",
+    "option": "M"
+   },
+   {
+    "kind": "chapters",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 5,
+    "obligation": "required",
+    "option": "M"
+   },
+   {
+    "kind": "structure",
+    "scope": {
+     "level": "structure"
+    },
+    "mode": "exact",
+    "value": null,
+    "obligation": "required",
+    "shape": [
+     5,
+     5,
+     5,
+     5
+    ],
+    "option": "M"
+   },
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 64,
+    "obligation": "required",
+    "option": "M"
+   },
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 5,
+    "obligation": "required",
+    "option": "L"
+   },
+   {
+    "kind": "chapters",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 6,
+    "obligation": "required",
+    "option": "L"
+   },
+   {
+    "kind": "structure",
+    "scope": {
+     "level": "structure"
+    },
+    "mode": "exact",
+    "value": null,
+    "obligation": "required",
+    "shape": [
+     6,
+     6,
+     6,
+     6,
+     6
+    ],
+    "option": "L"
+   },
+   {
+    "kind": "target_hours",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 96,
+    "obligation": "required",
+    "option": "L"
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "target_hours",
+    "why": "Nunca la suma de alternativas (32+64+96).",
+    "value": 192
+   },
+   {
+    "kind": "modules",
+    "why": "Suma 3+4+5.",
+    "value": 12
+   },
+   {
+    "kind": "chapters",
+    "why": "Suma 12+20+30.",
+    "value": 62
+   },
+   {
+    "kind": "structure",
+    "why": "Ninguna estructura aplica sin elegir.",
+    "anyValue": true,
+    "active": true
+   },
+   {
+    "kind": "target_hours",
+    "why": "Ninguna hora aplica sin elegir.",
+    "anyValue": true,
+    "active": true
+   },
+   {
+    "kind": "target_hours",
+    "why": "Horas semanales.",
+    "value": 2
+   },
+   {
+    "kind": "target_hours",
+    "why": "Horas semanales.",
+    "value": 6
+   }
+  ],
+  "groups": [
+   {
+    "relation": "oneOf",
+    "options": [
+     "S",
+     "M",
+     "L"
+    ]
+   }
+  ],
+  "selects": [
+   {
+    "options": {
+     "*": "S"
+    },
+    "expectActiveValues": {
+     "modules": [
+      3
+     ],
+     "chapters": [
+      4
+     ],
+     "target_hours": [
+      32
+     ]
+    },
+    "expectStructureTotal": 12
+   },
+   {
+    "options": {
+     "*": "M"
+    },
+    "expectActiveValues": {
+     "modules": [
+      4
+     ],
+     "chapters": [
+      5
+     ],
+     "target_hours": [
+      64
+     ]
+    },
+    "expectStructureTotal": 20
+   },
+   {
+    "options": {
+     "*": "L"
+    },
+    "expectActiveValues": {
+     "modules": [
+      5
+     ],
+     "chapters": [
+      6
+     ],
+     "target_hours": [
+      96
+     ]
+    },
+    "expectStructureTotal": 30
+   }
+  ],
+  "expectActive": 0
+ },
+ {
+  "id": "S50",
+  "title": "trampa: «nuestro curso estándar es de 3 módulos por 3 capítulos»",
+  "synthetic": true,
+  "text": "Nuestro curso estándar es un curso de 3 módulos por 3 capítulos: 9 capítulos en total. Ese es el curso que llamamos S.",
+  "must": [],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "modules",
+    "why": "Describe el producto, no exige nada.",
+    "value": 3
+   },
+   {
+    "kind": "chapters",
+    "why": "Idem.",
+    "value": 9
+   },
+   {
+    "kind": "chapters",
+    "why": "Idem.",
+    "value": 3
+   }
+  ],
+  "groups": [],
+  "expectActive": 0
+ },
+ {
+  "id": "S51",
+  "title": "«4 módulos de 5 capítulos» es un compuesto",
+  "synthetic": true,
+  "text": "El curso tendrá 4 módulos de 5 capítulos.",
+  "must": [
+   {
+    "kind": "modules",
+    "scope": {
+     "level": "course"
+    },
+    "mode": "exact",
+    "value": 4,
+    "obligation": "required"
+   },
+   {
+    "kind": "chapters",
+    "scope": {
+     "level": "module",
+     "each": true
+    },
+    "mode": "exact",
+    "value": 5,
+    "obligation": "required"
+   },
+   {
+    "kind": "structure",
+    "scope": {
+     "level": "structure"
+    },
+    "mode": "exact",
+    "value": null,
+    "obligation": "required",
+    "shape": [
+     5,
+     5,
+     5,
+     5
+    ]
+   }
+  ],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "chapters",
+    "why": "Son 5 por módulo.",
+    "value": 5,
+    "scope": {
+     "level": "course"
+    }
+   }
+  ],
+  "groups": [
+   {
+    "relation": "all",
+    "kinds": [
+     "modules",
+     "chapters",
+     "structure"
+    ],
+    "total": 20
+   }
+  ],
+  "expectActive": 3
+ },
+ {
+  "id": "S52",
+  "title": "trampa: «por lo general, nuestros cursos tienen 3 módulos»",
+  "synthetic": true,
+  "text": "Por lo general, nuestros cursos tienen 3 módulos.",
+  "must": [],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "modules",
+    "why": "Descripción genérica: no es requisito de este curso.",
+    "value": 3
+   }
+  ],
+  "groups": [],
+  "expectActive": 0
+ },
+ {
+  "id": "S53",
+  "title": "trampa: una sola etiqueta «S» no forma alternativas",
+  "synthetic": true,
+  "text": "Resumen de entregas\nS\n3 módulos\nGracias por su atención.",
+  "must": [],
+  "optional": [],
+  "must_not": [
+   {
+    "kind": "modules",
+    "why": "Sin disparador ni tabla de tamaños: no es requisito.",
+    "value": 3
+   }
+  ],
+  "groups": [],
+  "expectActive": 0
+ }
+]

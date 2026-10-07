@@ -25,6 +25,8 @@ import {
   estimateAdvancedExtraction,
 } from './advanced-extraction';
 import { FinopsLedgerService } from '../finops/finops-ledger.service';
+import { buildRequirementsView, currentEntry, loadRequirementsState, storeDocumentRequirements, storedEntry, writeSelection } from './requirements/document-requirements';
+import type { ExtractionResult } from './extract/extractor';
 
 /** Token de inyección del transcriptor (las pruebas inyectan uno falso). */
 export const DOCUMENT_TRANSCRIBER = 'DOCUMENT_TRANSCRIBER';
@@ -64,11 +66,13 @@ export class AcademicContextService {
     const inputs = dto.files.map((f) => ({ name: f.name, data: Buffer.from(f.dataBase64, 'base64') }));
     try {
       const r = await extractAcademicContext(inputs);
+      const requirements = await this.keepRequirements(courseId, r);
       // LOOP 8.1: cargador único — se informa si la lectura gratuita alcanzó y si la avanzada puede ayudar.
       const quality = extractionQuality(r.context);
       return {
         draft: r.context, validation: validateAcademicContext(r.context), notes: r.notes, stats: r.stats, saved: false,
         quality: { ...quality, advancedAvailable: quality.advancedMayHelp && advancedExtractionEnabled() },
+        requirements,
       };
     } catch (err) {
       if (err instanceof DocumentReadError) throw new BadRequestException({ code: err.code, message: `${err.code}: ${err.message}` });
@@ -80,7 +84,8 @@ export class AcademicContextService {
   /**
    * LOOP 8.1 · Lectura avanzada (respaldo del cargador único). 'estimate' no llama a ningún proveedor; 'run' exige
    * haber aceptado el costo máximo estimado, transcribe el PDF con IA y lo pasa por el MISMO extractor determinista.
-   * El gasto se registra en FinOps aunque la lectura falle después. Nada se guarda: igual que /extract.
+   * El gasto se registra en FinOps aunque la lectura falle después. Igual que /extract: el contexto no se guarda; solo los
+   * requisitos explícitos leídos (LOOP 8.6B), atados a la huella del documento.
    */
   async extractAdvanced(courseId: number, ownerId: string, dto: ExtractAdvancedDto) {
     assertDynamicOwnerAllowed(ownerId);
@@ -128,12 +133,74 @@ export class AcademicContextService {
     }
     const base = f.name.replace(/\.pdf$/i, '');
     const r = await extractAcademicContext([{ name: `${base} (lectura avanzada).md`, data: Buffer.from(t.text, 'utf8') }]);
+    const requirements = await this.keepRequirements(courseId, r);
     const quality = extractionQuality(r.context);
     return {
       draft: r.context, validation: validateAcademicContext(r.context), notes: r.notes, stats: r.stats, saved: false,
       quality: { ...quality, advancedAvailable: false },
+      requirements,
       advanced: { pages, model: t.model, usage: t.usage, estimateUsd: estimate.estimateUsd },
     };
+  }
+
+  /**
+   * LOOP 8.6B · Los requisitos explícitos de esta lectura quedan en courses.metadata, atados a la huella de los
+   * documentos: valen cuando el docente guarda el contexto de ESOS documentos. No cambian el diseño ni el contexto.
+   * Un fallo al guardarlos no rompe la lectura (se registra y la interfaz dirá que no hay requisitos leídos).
+   */
+  private async keepRequirements(courseId: number, r: ExtractionResult): Promise<{ found: number; alternatives: number; multiCourse: boolean; stored: boolean }> {
+    const x = r.requirements;
+    const summary = { found: x.requirements.length, alternatives: x.groups.filter((g) => g.relation === 'oneOf').length, multiCourse: x.multiCourse };
+    try {
+      const entry = storedEntry(r.context.documents.map((d) => ({ id: d.id, name: d.name, sha256: d.sha256 })), x);
+      await this.dataSource.transaction((m) => storeDocumentRequirements(m, courseId, entry));
+      return { ...summary, stored: true };
+    } catch (err) {
+      this.logger.warn(`[requirements] curso ${courseId}: no se guardaron los requisitos leídos (${err instanceof Error ? err.message : String(err)})`);
+      return { ...summary, stored: false };
+    }
+  }
+
+  /** LOOP 8.6B · GET /courses/:id/academic-context/requirements — requisitos del documento (solo lectura). */
+  async requirements(courseId: number, ownerId: string) {
+    assertDynamicOwnerAllowed(ownerId);
+    await this.loadCourse(courseId, ownerId);
+    const academic = await loadCurrentAcademicContext(this.dataSource, courseId).catch((err) => {
+      if (err && (err as { code?: string }).code === '42P01') return null;
+      throw err;
+    });
+    const st = await loadRequirementsState(this.dataSource, courseId);
+    return buildRequirementsView(st.entries, st.selection, academic ? academic.context.documents : []);
+  }
+
+  /**
+   * LOOP 8.6B · PUT /courses/:id/academic-context/requirements/selection { groupId, optionId | null } — la alternativa
+   * (S/M/L, «Opción A»…) que el docente elige para leer sus requisitos. Solo cambia qué requisitos se muestran como
+   * activos: no toca la estructura, el diseño ni la generación. Cursia nunca la elige sola.
+   */
+  async setRequirementSelection(courseId: number, ownerId: string, groupId: string, optionId: string | null) {
+    assertDynamicOwnerAllowed(ownerId);
+    await this.loadCourse(courseId, ownerId);
+    const academic = await loadCurrentAcademicContext(this.dataSource, courseId).catch((err) => {
+      if (err && (err as { code?: string }).code === '42P01') return null;
+      throw err;
+    });
+    const docs = academic ? academic.context.documents : [];
+    await this.dataSource.transaction(async (m) => {
+      await m.query(`select id from public.courses where id = $1 for update`, [courseId]);
+      const st = await loadRequirementsState(m, courseId);
+      const entry = currentEntry(st.entries, docs);
+      if (!entry) throw new BadRequestException({ code: 'NO_DOCUMENT_REQUIREMENTS', message: 'NO_DOCUMENT_REQUIREMENTS: el contexto académico guardado no tiene requisitos leídos del documento.' });
+      const g = entry.extraction.groups.find((x) => x.id === groupId && x.relation === 'oneOf');
+      if (!g) throw new BadRequestException({ code: 'UNKNOWN_ALTERNATIVE_GROUP', message: `UNKNOWN_ALTERNATIVE_GROUP: el documento no tiene el grupo de alternativas ${JSON.stringify(groupId)}.` });
+      if (optionId !== null && !(g.options || []).some((o) => o.id === optionId)) {
+        throw new BadRequestException({ code: 'UNKNOWN_ALTERNATIVE', message: `UNKNOWN_ALTERNATIVE: ${JSON.stringify(optionId)} no es una de las alternativas del documento.` });
+      }
+      const options = st.selection && st.selection.key === entry.key ? { ...st.selection.options } : {};
+      if (optionId === null) delete options[groupId]; else options[groupId] = optionId;
+      await writeSelection(m, courseId, { key: entry.key, options });
+    });
+    return this.requirements(courseId, ownerId);
   }
 
   private async recordAdvancedCharge(courseId: number, ownerId: string, pages: number, t: { model: string; messageId: string; usage: { input_tokens: number; output_tokens: number } }) {

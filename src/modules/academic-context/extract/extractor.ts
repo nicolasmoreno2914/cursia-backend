@@ -1,4 +1,7 @@
 import { createHash } from 'crypto';
+import { extractRequirements } from '../requirements/requirements-extractor';
+import { mergeRequirementExtractions } from '../requirements/document-requirements';
+import type { RequirementsExtraction } from '../requirements/requirements';
 import type { EducationLevel } from '../../pedagogy/vocabulary';
 import {
   ACADEMIC_LIMITS,
@@ -52,6 +55,8 @@ export interface ExtractionInput {
 
 export interface ExtractionResult {
   context: AcademicContextV1;
+  /** LOOP 8.6 · requisitos explícitos (cantidades, estructura, alternativas) de los mismos documentos. Solo lectura. */
+  requirements: RequirementsExtraction;
   notes: ExtractionNote[];
   stats: { documents: number; lines: number; sectionsFound: string[]; providersCalled: 0 };
 }
@@ -744,6 +749,7 @@ export async function extractAcademicContext(inputs: ExtractionInput[]): Promise
   if (inputs.length > ACADEMIC_LIMITS.documents) throw new Error(`ACADEMIC_EXTRACT_TOO_MANY: como máximo ${ACADEMIC_LIMITS.documents} documentos`);
   const notes: ExtractionNote[] = [];
   const parts: { doc: AcademicDocument; ex: DocExtraction }[] = [];
+  const reqParts: { documentId: string; x: RequirementsExtraction }[] = [];
   let totalLines = 0;
   const sections = new Set<string>();
   for (const [i, input] of inputs.entries()) {
@@ -773,6 +779,15 @@ export async function extractAcademicContext(inputs: ExtractionInput[]): Promise
     if (dangling.length) ex.note('UNKNOWN_OUTCOME_REF_IN_DOCUMENT', `«${doc.name}» vincula ${dangling.join(', ')}, que no aparecen entre sus resultados de aprendizaje o competencias: esos vínculos no se guardaron.`);
     notes.push(...ex.notes);
     parts.push({ doc, ex });
+    // LOOP 8.6B (review I2): un fallo del lector de requisitos nunca impide leer el documento; se dice en una nota.
+    try {
+      reqParts.push({ documentId: docId, x: extractRequirements(read.lines, docId) });
+    } catch (err) {
+      notes.push({ code: 'REQUIREMENTS_NOT_READ', documentId: docId, message: `«${doc.name}»: no pudimos leer sus requisitos explícitos (cantidades de módulos, capítulos, horas…); el resto del documento sí se leyó.` });
+      // eslint-disable-next-line no-console
+      console.warn(`[requirements] ${docId}: ${err instanceof Error ? err.message : String(err)}`);
+      reqParts.push({ documentId: docId, x: { requirementsVersion: 1, requirements: [], groups: [], conflicts: [], ignored: [], multiCourse: false, subjects: [] } });
+    }
   }
   const merged = mergeExtractions(parts.map((p) => p.ex.ctx), parts.map((p) => p.doc));
   // Vínculos que, ya fusionados, no apuntan a ningún resultado ni competencia: se quitan con una nota (nunca se guarda
@@ -787,6 +802,7 @@ export async function extractAcademicContext(inputs: ExtractionInput[]): Promise
   }
   return {
     context: normalizeAcademicContext(merged),
+    requirements: mergeRequirementExtractions(reqParts),
     notes,
     stats: { documents: inputs.length, lines: totalLines, sectionsFound: [...sections].sort(), providersCalled: 0 },
   };
