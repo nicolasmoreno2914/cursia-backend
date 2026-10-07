@@ -122,7 +122,7 @@ export class CourseDesignService {
     const savedComparable = saved ? JSON.stringify(normalizePedagogicalProfile(Object.fromEntries(Object.entries(saved.profile as any).filter(([k]) => k !== 'designRules')))) : null;
     const approachDef = profile.primaryApproach ? registry.get(profile.primaryApproach) : null;
     const providers = dist && dist.materialized ? dist.materialized.providers : null;
-    const pinnedChapters = dist ? dist.modules.reduce((n, m) => n + m.chapters.filter((c) => c.videoPinned && c.kind === 'content' && !c.proposed).length, 0) : 0;
+    const pinnedChapters = dist ? dist.modules.reduce((n, m) => n + m.chapters.filter((c) => !c.proposed && ((c.videoPinned && c.kind === 'content') || c.applicationPinned)).length, 0) : 0;
     // LOOP 8.4: la verificación del MISMO diseño (alineación del Coherence Engine incluida).
     const verification = dist
       ? verifyDesign({
@@ -176,7 +176,7 @@ export class CourseDesignService {
           modules: dist.modules.map((m) => ({
             id: m.id, title: m.title, examEnabled: m.examEnabled,
             chapters: m.chapters.map((c) => ({
-              id: c.id, proposed: c.proposed, kind: c.kind, title: c.title, role: c.role, videoEnabled: c.videoEnabled, videoPinned: c.videoPinned,
+              id: c.id, proposed: c.proposed, kind: c.kind, title: c.title, role: c.role, videoEnabled: c.videoEnabled, videoPinned: c.videoPinned, applicationPinned: c.applicationPinned,
               activityEnabled: c.activityEnabled, review: c.review, applicationMinutes: c.applicationMinutes, hours: Math.round((c.targetMinutes / 60) * 10) / 10,
               outcomeIds: chapterOutcomes.get(c.id) || [],
             })),
@@ -323,10 +323,20 @@ export function uncoveredUnitContents(ctx: AcademicContextV1, chapters: { title:
   return out;
 }
 
-/** Instrumentos de prueba (se evidencian con una evaluación): se miran primero (review L84-3 Mn6: «Examen de casos»). */
+/**
+ * Clasificación de un instrumento del microcurrículo (review L84-3 Mn6 / L84-4): lo que es desempeño sin duda (práctico,
+ * proyecto, taller…) pide una Actividad de Aplicación aunque diga «examen» («Examen práctico»); si no, lo que es prueba
+ * (parcial, examen, quiz…) pide una evaluación («Examen de casos clínicos»); el resto de desempeño (caso, informe…), una
+ * Actividad.
+ */
+const STRONG_PERFORMANCE_RE = /pr[aá]ctic|proyect|taller|laborator|portafolio|exposici|simulaci/i;
 const EXAM_INSTRUMENT_RE = /parcial|examen|prueba|quiz|test\b|cuestionario|evaluaci[oó]n escrita/i;
-/** Instrumentos de desempeño (se evidencian con una Actividad de Aplicación, no con un examen). */
-const PERFORMANCE_INSTRUMENT_RE = /proyect|taller|caso|pr[aá]ctic|informe|trabajo|ejercicio|laborator|portafolio|exposici|simulaci|estudio de/i;
+const PERFORMANCE_INSTRUMENT_RE = /caso|informe|trabajo|ejercicio|estudio de/i;
+export function instrumentKind(instrument: string): 'performance' | 'exam' {
+  if (STRONG_PERFORMANCE_RE.test(instrument)) return 'performance';
+  if (EXAM_INSTRUMENT_RE.test(instrument)) return 'exam';
+  return PERFORMANCE_INSTRUMENT_RE.test(instrument) ? 'performance' : 'exam';
+}
 
 /**
  * Review L84-2 N6 · Lo que el microcurrículo evalúa y el diseño no: por cada instrumento del documento, sus resultados
@@ -349,7 +359,7 @@ export function uncoveredEvaluations(
   for (const ev of ctx.evaluation) {
     if (!ev.instrument) continue;
     const outs = ev.outcomeIds || [];
-    if (!EXAM_INSTRUMENT_RE.test(ev.instrument) && PERFORMANCE_INSTRUMENT_RE.test(ev.instrument)) {
+    if (instrumentKind(ev.instrument) === 'performance') {
       const ok = dist.modules.some((m) => m.chapters.some((c) => (c.applicationMinutes || 0) > 0 && hits(outsOf(m, c), outs)));
       if (!ok) out.push({ instrument: ev.instrument, outcomes: outs, kind: 'performance', chapterIds: workingOn(outs) });
     } else {

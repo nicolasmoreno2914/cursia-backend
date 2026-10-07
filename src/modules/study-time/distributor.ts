@@ -76,6 +76,8 @@ export interface ProposedChapter {
   applicationMinutes: number | null;
   /** LOOP 8.3: el video de este capítulo lo fijó el docente (el diseño lo respeta). */
   videoPinned: boolean;
+  /** Review L84-4: la Actividad de Aplicación la fijó el docente. */
+  applicationPinned: boolean;
   /** Tiempo objetivo del capítulo (modelo de tiempo, exacto) y lo que se puede generar hoy (sin la Actividad). */
   targetMinutes: number;
   generableMinutes: number;
@@ -156,7 +158,8 @@ export type DesignEmphasis = 'application' | 'balanced' | 'depth';
 export type AudiovisualPriority = 'less' | 'recommended' | 'more';
 export const AUDIOVISUAL_PRIORITIES: readonly AudiovisualPriority[] = ['less', 'recommended', 'more'];
 /** Valores que el docente fijó a mano en el editor (por id de capítulo). El distribuidor los respeta siempre. */
-export type DesignPins = Readonly<Record<string, { video?: boolean }>>;
+/** LOOP 8.3: video fijado a mano · review L84-4: Actividad de Aplicación fijada a mano (minutos; 0 = sin actividad). */
+export type DesignPins = Readonly<Record<string, { video?: boolean; application?: number }>>;
 export type ApplicationActivitiesMode = 'auto' | 'practice_only' | 'none';
 export const DESIGN_EMPHASES: readonly DesignEmphasis[] = ['application', 'balanced', 'depth'];
 export const APPLICATION_ACTIVITIES_MODES: readonly ApplicationActivitiesMode[] = ['auto', 'practice_only', 'none'];
@@ -252,6 +255,11 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   const av: AudiovisualPriority | null = prefs.audiovisual ?? null;
   const pins: DesignPins = input.pins ?? {};
   const pinnedVideo = (id: string): boolean | undefined => (pins[id] && typeof pins[id].video === 'boolean' ? pins[id].video : undefined);
+  /** Minutos fijados por el docente (null = fijada SIN actividad); undefined = la decide Cursia. */
+  const pinnedApp = (id: string): number | null | undefined => {
+    const a = pins[id] && pins[id].application;
+    return typeof a === 'number' && Number.isFinite(a) ? (a > 0 ? a : null) : undefined;
+  };
   const basePolicy = distributorPolicyFor(rules);
   const policy: DistributionResult['policy'] = prefs.emphasis === 'application'
     ? { ...basePolicy, kind: 'application_first', ...DISTRIBUTOR_RULES.applicationFirst }
@@ -282,6 +290,8 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
       })),
     }));
   if (design.some((m) => m.chapters.length === 0)) throw new DistributorError('cada módulo necesita al menos un capítulo');
+  // Review L84-4: una Actividad de Aplicación fijada a mano por el docente se respeta siempre (como el video fijado).
+  for (const m of design) for (const c of m.chapters) { const p = pinnedApp(c.id); if (p !== undefined) c.applicationMinutes = p; }
 
   // LOOP 8.3 · prioridad audiovisual sobre los capítulos de contenido existentes (antes de crecer: el video cambia las
   // horas y el resto del diseño compensa). Lo fijado por el docente manda; la práctica nunca lleva video.
@@ -379,6 +389,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
         role: roleOf(m, c),
         videoEnabled: c.kind === 'content' && c.videoEnabled,
         videoPinned: pinnedVideo(c.id) !== undefined,
+        applicationPinned: pinnedApp(c.id) !== undefined,
         activityEnabled: c.activityEnabled,
         review,
         applicationMinutes: c.applicationMinutes,
@@ -440,7 +451,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
     ]);
   }
   if (hasExisting) {
-    for (const m of design) for (const c of m.chapters) c.applicationMinutes = null;
+    for (const m of design) for (const c of m.chapters) if (pinnedApp(c.id) === undefined) c.applicationMinutes = null;
     reEval();
   }
 
@@ -471,6 +482,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
    * SUBIR un nivel ya asignado (alargar actividades) también la proporción máxima de aplicación del enfoque.
    */
   const trySetTier = (m: WorkModule, c: WorkChapter, tier: number | null): boolean => {
+    if (pinnedApp(c.id) !== undefined) return false; // fijada por el docente
     if (tier !== null && tier > capOf(m, c)) return false;
     // «Ajustar»: sin Actividades de Aplicación, o solo en los capítulos de práctica.
     if (tier !== null && (appMode === 'none' || (appMode === 'practice_only' && c.kind !== 'practice'))) return false;
@@ -488,7 +500,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   /** Tras insertar un capítulo los roles se recalculan por posición: ningún nivel queda por encima del tope de su rol nuevo. */
   const clampToRoleCaps = () => {
     for (const m of design) for (const c of m.chapters) {
-      if (c.applicationMinutes === null || c.applicationMinutes <= capOf(m, c)) continue;
+      if (c.applicationMinutes === null || c.applicationMinutes <= capOf(m, c) || pinnedApp(c.id) !== undefined) continue;
       c.applicationMinutes = [...tiers].reverse().find((t) => t <= capOf(m, c)) ?? null;
     }
     reEval();
