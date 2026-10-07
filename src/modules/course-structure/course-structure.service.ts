@@ -1361,6 +1361,10 @@ export class CourseStructureService implements OnModuleInit {
       // LOOP 8.4 (review L84 I2 / L84-2 N5): QUITAR todos los vínculos a mano es una decisión del docente (la vinculación
       // automática no lo vuelve a vincular); vincular algo la borra.
       if (outcomeIds !== undefined) pinOps.push(outcomeIds === null ? { field: 'noLinks', value: true, onlyIfLinked: true } : { field: 'noLinks', value: null });
+      // Review L84-4: Actividad de Aplicación cambiada a mano (V2) → fijada (0 = sin actividad); sin fijar, el último valor
+      // elegido por alguien ya no está fijado (igual que el video).
+      const appPinned = dto.pinApplication === true && appMinutes !== undefined;
+      if (appMinutes !== undefined) pinOps.push(appPinned ? { field: 'application', value: appMinutes ?? 0 } : { field: 'application', value: null });
       const found = await this.updateRowAndBump(
         queryRunner, 'course_chapters', sets, params, i, { id: chapterId, module_id: moduleId, course_id: courseId }, courseId,
         guardPracticeVideo ? `coalesce(to_jsonb(t) ->> 'chapter_kind', 'content') <> 'practice'` : undefined,
@@ -1384,6 +1388,7 @@ export class CourseStructureService implements OnModuleInit {
       return {
         structureVersionCounter: newCounter,
         ...(pinRequested && (dto.kind === 'content' || found.kind !== 'practice') ? { videoPinned: true } : {}),
+        ...(appPinned ? { applicationPinned: true } : {}),
         ...(nt ? { title: nt.title, titleNormalized: nt.changed } : {}),
         ...(description !== undefined ? { description } : {}),
         ...(outcomeIds !== undefined ? { outcomeIds } : {}),

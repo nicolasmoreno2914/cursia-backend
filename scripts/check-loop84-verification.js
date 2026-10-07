@@ -16,6 +16,7 @@
 //   VF9 aplicar: los capítulos de contenido que propone el diseño heredan los resultados de su módulo (sin A4 después)
 //   VF10 «sin vínculos» solo al QUITARLOS; las sugerencias del panel académico no tocan prácticas ni desvinculados;
 //        «Liberar» limpia las marcas de capítulos borrados
+//   VF11 Actividad de Aplicación fijada a mano: el rediseño la respeta; «Liberar» la devuelve
 //   VF5 «Corregir» automático: vincula solo los capítulos de CONTENIDO SIN vínculos (los del docente y las prácticas
 //       intactos), con vista previa en la verificación; un capítulo desvinculado a propósito no se re-vincula; sube el
 //       contador; ya vinculado → la verificación no ofrece «automático»; contador viejo → 409; acción desconocida → 400; ajeno 404
@@ -153,6 +154,9 @@ const vids = (d) => d.modules.map((m) => m.chapters.filter((c) => c.kind === 'co
     const ev = (instrument, outcomeIds) => ({ ...ctx, evaluation: [{ id: 'EV', instrument, weightPct: 25, outcomeIds }] });
     eq(SVC.uncoveredEvaluations(ev('Proyecto de costeo por órdenes', ['RA3']), dist, links), [{ instrument: 'Proyecto de costeo por órdenes', outcomes: ['RA3'], kind: 'performance', chapterIds: ['c3'] }], 'proyecto de RA3 sin Actividad de Aplicación donde se trabaja RA3 (destino: el capítulo de RA3)');
     eq(SVC.uncoveredEvaluations(ev('Examen de casos clínicos', ['RA3']), dist, links), [], 'L84-3 Mn6: «Examen de casos» es una prueba (la evaluación del módulo 2 la cubre)');
+    eq(['Evaluación de desempeño', 'Demostración en el taller', 'Examen escrito'].map(SVC.instrumentKind), ['performance', 'performance', 'exam'], 'L84-5: desempeño y demostración');
+    eq(['Examen práctico', 'Examen de casos clínicos', 'Prueba escrita sobre trabajo seguro en alturas', 'Proyecto final', 'Informe de caso', 'Parcial 1', 'Quiz'].map(SVC.instrumentKind),
+      ['performance', 'exam', 'exam', 'performance', 'performance', 'exam', 'exam'], 'L84-4: clasificación de instrumentos');
     eq(SVC.uncoveredUnitContents({ units: [{ contents: [{ text: 'Clasificación de los costos' }, { text: 'Control de materiales' }] }] }, [{ title: 'Cómo clasificar los costos' }, { title: 'Controlar los materiales' }]), [], 'L84-3 Mn4: paráfrasis verbales cubren');
     eq(SVC.uncoveredEvaluations(ev('Taller práctico', ['RA1']), dist, links), [], 'la práctica del módulo (hereda RA1) lo evidencia');
     eq(SVC.uncoveredEvaluations(ev('Examen parcial', ['RA3']), dist, links), [], 'la evaluación del módulo 2 trabaja RA3');
@@ -371,6 +375,35 @@ async function dbChecks() {
       await structure.deleteChapter(c.id, m.id, ids[1], OWNER, await counter(c.id));
       await design.clearPins(c.id, OWNER);
       eq((await pins())[ids[1]], undefined, '«Liberar» limpia la marca de un capítulo borrado');
+    });
+
+    await check('VF11 una Actividad de Aplicación elegida a mano (V2) queda fijada: el rediseño la respeta; «Liberar» la devuelve', async () => {
+      const cid = await docCourse('AA fijada');
+      const st = await structure.getStructure(cid, OWNER);
+      const mod = st.modules[0];
+      const ch = mod.chapters.find((c) => c.kind !== 'practice');
+      const up = await structure.updateChapter(cid, mod.id, ch.id, OWNER, { applicationMinutes: 60, pinApplication: true, expectedCounter: await counter(cid) });
+      eq(up.applicationPinned, true, 'respuesta: fijada');
+      for (const adjust of [{ targetHours: 96 }, { targetHours: 40 }, { applicationActivities: 'none' }, { emphasis: 'depth', targetHours: 80 }]) {
+        const r = await design.recommend(cid, OWNER, { adjust });
+        const c = r.design.modules.flatMap((m) => m.chapters).find((x) => x.id === ch.id);
+        eq([c.applicationMinutes, c.applicationPinned], [60, true], `rediseño ${JSON.stringify(adjust)}: la Actividad fijada se respeta`);
+      }
+      const none = await design.recommend(cid, OWNER, { adjust: { applicationActivities: 'none' } });
+      const pinCheck = none.verification.checks.find((x) => x.id === 'application_pinned');
+      assert(pinCheck && pinCheck.severity === 'info' && pinCheck.fix.targets.chapterIds[0] === ch.id, 'L84-5: con «Ninguna», se avisa que la fijada se mantiene');
+      const r0 = await design.recommend(cid, OWNER, {});
+      assert(!r0.verification.checks.some((x) => x.id === 'application_pinned'), 'con «Donde el diseño las necesite» no hay aviso');
+      assert(r0.pinnedChapters >= 1, 'cuenta como fijado: ' + r0.pinnedChapters);
+      const cl = await design.clearPins(cid, OWNER);
+      assert(cl.released >= 1, 'Liberar la cuenta: ' + JSON.stringify(cl));
+      const pins = (await ds.query(`select metadata -> 'designPins' p from public.courses where id = $1`, [cid]))[0].p || {};
+      eq(pins[ch.id], undefined, 'liberada');
+      // Sin fijar (editor anterior): un cambio de Actividad no la fija y libera una anterior.
+      await structure.updateChapter(cid, mod.id, ch.id, OWNER, { applicationMinutes: 90, pinApplication: true, expectedCounter: await counter(cid) });
+      await structure.updateChapter(cid, mod.id, ch.id, OWNER, { applicationMinutes: 30, expectedCounter: await counter(cid) });
+      const pins2 = (await ds.query(`select metadata -> 'designPins' p from public.courses where id = $1`, [cid]))[0].p || {};
+      eq(pins2[ch.id] && pins2[ch.id].application, undefined, 'un cambio sin fijar libera la Actividad fijada');
     });
 
   } finally {

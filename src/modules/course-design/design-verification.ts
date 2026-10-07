@@ -84,6 +84,8 @@ export interface VerificationInput {
   requiredEvaluations: string[];
   /** Instrumentos del microcurrículo cuyos resultados el diseño no evalúa con el mismo tipo de evidencia (review L84-2 N6). */
   uncoveredEvaluations: { instrument: string; outcomes: string[]; kind: 'performance' | 'exam'; chapterIds?: string[] }[];
+  /** Review L84-5: capítulos con una Actividad de Aplicación fijada por el docente que la preferencia actual no pondría. */
+  pinnedApplicationsOutsideMode?: string[];
 }
 
 /** Máximo de horas de un curso (la meta válida va de 1 a 500). */
@@ -189,6 +191,11 @@ export function verifyDesign(input: VerificationInput): DesignVerification {
     add({ id: 'practice', area: 'practice', severity: 'info', title: 'Sin capítulos de práctica', detail: 'El enfoque prioriza la aplicación: la práctica está en las Actividades de Aplicación de los capítulos.' });
   } else add({ id: 'practice', area: 'practice', severity: 'ok', title: k.practiceChapters ? plural(k.practiceChapters, 'capítulo de práctica', 'capítulos de práctica') : 'Sin capítulos de práctica (no hacen falta para estas horas)' });
   add({ id: 'application', area: 'activities', severity: 'ok', title: plural(k.applicationActivities, 'Actividad de Aplicación', 'Actividades de Aplicación') });
+  const outside = input.pinnedApplicationsOutsideMode || [];
+  if (outside.length) {
+    add({ id: 'application_pinned', area: 'activities', severity: 'info', title: `${plural(outside.length, 'Actividad de Aplicación fijada por ti se mantiene', 'Actividades de Aplicación fijadas por ti se mantienen')} aunque la preferencia no las pondría`,
+      detail: 'Cursia respeta lo que elegiste a mano. Si quieres quitarlas, hazlo en el editor.', fix: { kind: 'editor', action: 'application', label: 'Revisar en el editor', targets: { chapterIds: outside.slice(0, 1) } } });
+  }
   // Audiovisual.
   // Sin ningún video siendo «recomendado» o «más» solo puede venir de capítulos fijados sin video: se informa.
   const noVideo = k.videoChapters === 0 && k.contentChapters > 0 && input.audiovisual !== 'less';
