@@ -613,6 +613,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   // Ajuste fino: si se pasó, bajar niveles de a uno (empezando por las aperturas) SOLO mientras el total siga
   // dentro de la tolerancia por abajo (nunca descarta un diseño válido).
   for (const { c } of [...applicationOrder()].reverse()) {
+    if (pinnedApp(c.id) !== undefined) continue; // review L84-5: lo fijado por el docente no se ajusta
     while (c.applicationMinutes !== null && minutes() > target + tol / 2) {
       const i = tiers.indexOf(c.applicationMinutes);
       const lower = i > 0 ? tiers[i - 1] : null;
