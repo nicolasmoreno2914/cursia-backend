@@ -158,6 +158,57 @@ const BRIEF = { briefVersion: 1, fields: { obj: 'Quiero un curso de Excel básic
     eq([f4.document.proposed, f4.outcomes.source, f4.outcomes.value.every((o) => o.origin === 'document')], [false, 'document', true], 'review L82 I2: inferidos del documento siguen siendo del documento');
   });
 
+  await check('PC10 (8.2.1) horas del documento = «del documento»; las que decide el docente = «elegidas por ti» con la diferencia', () => {
+    const sugg = A.suggestProfileFromContext(doc, null).profile;
+    const m = CF.mergeDerivedProfile({ ...sugg, targetHours: undefined }, sugg, CF.pedagogyFieldOwners(null, null, sugg), 1);
+    const f1 = CF.resolveCourseFacts({ courseTitle: null, institutionId: null, brief: BRIEF, academic: { version: 1, context: doc }, pedagogy: { version: 1, profile: m.profile }, derivation: m.record, suggested: sugg });
+    eq([f1.targetHours.value, f1.targetHours.source, f1.conflicts.filter((c) => c.field === 'pedagogy.targetHours').length], [64, 'document', 0], '64 h del documento');
+    const mine = { ...m.profile, targetHours: 40 };
+    const f2 = CF.resolveCourseFacts({ courseTitle: null, institutionId: null, brief: BRIEF, academic: { version: 1, context: doc }, pedagogy: { version: 2, profile: mine }, derivation: m.record, suggested: sugg });
+    eq([f2.targetHours.value, f2.targetHours.source], [40, 'profile'], '40 h elegidas por el docente');
+    const c = f2.conflicts.find((x) => x.field === 'pedagogy.targetHours');
+    assert(c && /64 h y elegiste 40 h/.test(c.message), 'la diferencia con el documento se conserva: ' + (c && c.message));
+  });
+
+  await check('PC11 (8.2.1) sector solo con evidencia del documento (programa encontrado, con cita); si no, sin dato', () => {
+    const src = [{ documentId: 'D1', section: 'Programa', page: null, line: 3, excerpt: 'Programa | x' }];
+    const withProgram = (v, st = 'found', sources = src) => ({ ...JSON.parse(JSON.stringify(doc)), identity: { ...doc.identity, program: { status: st, value: v, sources } } });
+    const cases = [
+      ['Tecnología en Gestión Contable y Financiera', 'found', src, 'Gestión Contable y Financiera'],
+      ['Técnico profesional en Enfermería', 'found', src, 'Enfermería'],
+      ['Ingeniería de Sistemas', 'found', src, 'Ingeniería de Sistemas'],
+      ['Licenciatura en Educación Infantil', 'found', src, 'Educación Infantil'],
+      ['Tecnología en Gestión Contable y Financiera', 'inferred', src, null],
+      ['Programa de formación complementaria orientado a fortalecer las competencias laborales de los trabajadores del sector', 'found', src, null],
+      // Review L821 M1: placeholders, códigos y títulos sin área no son un sector; títulos SENA y «Programa técnico…» se limpian.
+      ['N/A', 'found', src, null], ['No aplica', 'found', src, null], ['Todos los programas', 'found', src, null],
+      ['Código SNIES 12345', 'found', src, null], ['Facultad de Ciencias Económicas', 'found', src, null], ['Tecnología en', 'found', src, null],
+      ['Técnico Laboral por Competencias en Auxiliar de Enfermería', 'found', src, 'Auxiliar de Enfermería'],
+      ['Programa Técnico Profesional en Logística', 'found', src, 'Logística'],
+      ['Curso de Excel básico', 'found', src, null], ['Transversal', 'found', src, null],
+      // Review L821-2 M1r: encabezados antes del nombre del programa.
+      ['Programa de Contaduría Pública', 'found', src, 'Contaduría Pública'], ['Programa académico de Ingeniería Industrial', 'found', src, 'Ingeniería Industrial'],
+      ['Programa: Tecnología en Gestión Logística', 'found', src, 'Gestión Logística'], ['Ciclo propedéutico en Administración Financiera', 'found', src, 'Administración Financiera'],
+      ['Administración de Empresas', 'found', src, 'Administración de Empresas'],
+    ];
+    for (const [v, st, s, want] of cases) eq(CF.sectorFromAcademicContext(withProgram(v, st, s)), want, `«${v}» (${st})`);
+    eq(CF.sectorFromAcademicContext({ ...doc, identity: { ...doc.identity, program: { status: 'missing', value: null, sources: [] } } }), null, 'sin programa: sin dato');
+    const noBrief = { briefVersion: 1, fields: { obj: 'x' }, updatedAt: 't' };
+    const f = CF.resolveCourseFacts({ courseTitle: null, institutionId: null, brief: noBrief, academic: { version: 1, context: doc }, pedagogy: null, derivation: null, suggested: null });
+    eq([f.sector.value, f.sector.source, f.documentSector], ['Gestión Contable y Financiera', 'inferred', 'Gestión Contable y Financiera'], 'microcurrículo de prueba: inferido del programa');
+    // Review L821 M3: «del documento» solo con un documento (un contexto escrito a mano no es un documento).
+    const handCtx = A.rewriteOutcomes(null, [{ text: 'Aplica fórmulas' }]);
+    handCtx.hours.total = { status: 'provided', value: 30, sources: [] };
+    const sh = A.suggestProfileFromContext(handCtx, null).profile;
+    const mh = CF.mergeDerivedProfile(sh, sh, CF.pedagogyFieldOwners(null, null, sh), 1);
+    const fh = CF.resolveCourseFacts({ courseTitle: null, institutionId: null, brief: noBrief, academic: { version: 1, context: handCtx }, pedagogy: { version: 1, profile: { ...mh.profile, targetHours: 30 } }, derivation: mh.record, suggested: sh });
+    assert(fh.targetHours.source !== 'document', 'sin documento las horas no dicen «del documento»: ' + fh.targetHours.source);
+    const fb = CF.resolveCourseFacts({ courseTitle: null, institutionId: null, brief: { ...noBrief, fields: { obj: 'x', sector: 'Contabilidad' } }, academic: { version: 1, context: doc }, pedagogy: null, derivation: null, suggested: null });
+    eq([fb.sector.value, fb.sector.source], ['Contabilidad', 'user'], 'lo que dijo el usuario manda');
+    const fp = CF.resolveCourseFacts({ courseTitle: null, institutionId: null, brief: noBrief, academic: { version: 1, context: A.buildProposedContext(null, PROPOSAL) }, pedagogy: null, derivation: null, suggested: null });
+    eq(fp.sector.value, null, 'sin documento no se deduce sector del contexto');
+  });
+
   if (PURE_ONLY) console.log('\n⚠️  --pure-only: se SALTÓ la parte DB (no cuenta como probada).');
   else await dbChecks(doc);
   console.log(`\n${passed} OK, ${failed} fallidas`);

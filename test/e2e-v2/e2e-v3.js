@@ -1872,6 +1872,40 @@ function reservationBookkeeping(ev) {
       results.courses.E14 = { courseId };
     }, { fatal: false });
 
+    // ═══ LOOP 8.2.1 · E14b — PUT desde un NAVEGADOR real contra el backend completo (dist/main.js, su CORS real).
+    // Node no aplica CORS: sin este paso, PUT /brief y PUT /outcomes «pasaban» aunque en Chrome fallaban.
+    if (RUN_E5) await step('v3-E14b-navegador-put', async () => {
+      const { launchChrome } = require(path.join(REPO, 'scripts/lib/v21-cdp.js'));
+      const http = require('http');
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: '[E2E E14b] PUT desde el navegador' });
+      ok(cr.status === 201, 'E14b: curso dinámico creado', { s: cr.status });
+      const courseId = Number(cr.data.id);
+      const sp = await api('POST', `/courses/${courseId}/academic-context/proposal`, { expectedVersion: 0, subjectName: 'Excel básico', outcomes: ['Organiza datos en tablas', 'Calcula indicadores con funciones'] });
+      ok(sp.status === 200, 'E14b: propuesta guardada (POST)', { s: sp.status, e: sp.error });
+      const srv = await new Promise((r) => { const s = http.createServer((q, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<!doctype html><title>front</title>'); }); s.listen(0, '127.0.0.1', () => r(s)); });
+      let chrome = null;
+      try {
+        chrome = await launchChrome();
+        await chrome.navigate(`http://127.0.0.1:${srv.address().port}/`);
+        const r = await chrome.evaluate(`(async () => {
+          const h = { 'Content-Type': 'application/json', 'Authorization': 'Bearer ${TOKEN}' };
+          const call = async (m, p, b) => { try { const x = await fetch(${JSON.stringify(BASE)} + p, { method: m, headers: h, body: JSON.stringify(b) }); return x.status; } catch (e) { return 'ERR:' + e.message; } };
+          return {
+            brief: await call('PUT', '/courses/${courseId}/brief', { obj: 'Excel básico', sector: 'Administración', pais: 'Colombia', inferidos: 'pais' }),
+            outcomes: await call('PUT', '/courses/${courseId}/academic-context/outcomes', { expectedVersion: 1, accept: true, outcomes: [{ id: 'RA1', text: 'Organiza datos en tablas' }, { id: 'RA2', text: 'Calcula indicadores con funciones' }] }),
+          };
+        })()`);
+        ok(r.brief === 200, 'E14b: PUT /brief desde Chrome (otro origen) responde 200', r);
+        ok(r.outcomes === 200, 'E14b: PUT /academic-context/outcomes desde Chrome (otro origen) responde 200', r);
+      } finally {
+        if (chrome) chrome.close();
+        srv.close();
+      }
+      const f = await api('GET', `/courses/${courseId}/facts`);
+      ok(f.data.sector.value === 'Administración' && f.data.country.source === 'inferred' && f.data.document.proposed === false && f.data.outcomes.value.every((o) => o.origin === 'user'),
+        'E14b: lo guardado desde el navegador está en «Lo que sabemos»', { d: f.data && { s: f.data.sector, c: f.data.country, p: f.data.document } });
+    }, { fatal: false });
+
     // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══
     const MOODLE_JOBS = ONLY_REAL_PROVIDERS ? [] : [['E1', 'E1'], ['E1-repack', 'E1repack'], ['E2', 'E2'], ['E3', 'E3']];
     // EV6 H5P v2: E5 entra al mismo restore + inspección (con los «Repaso» del paquete).

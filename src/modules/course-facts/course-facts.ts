@@ -226,6 +226,8 @@ export interface CourseFacts {
   competencies: Fact<string[]>;
   targetHours: Fact<number>;
   units: Fact<number>;
+  /** LOOP 8.2.1 (review M2): sector deducido del documento vigente (programa encontrado), aunque el pedido tenga otro. */
+  documentSector: string | null;
   sector: Fact<string>;
   country: Fact<string>;
   /** present: hay un documento leído. proposed (LOOP 8.2): sin documento, con resultados que propuso Cursia sin confirmar. */
@@ -283,6 +285,32 @@ const FIELD_CONFLICT_MESSAGE: Readonly<Record<DerivedField, (docV: unknown, pedH
   assessmentMethods: () => 'Cambiaste los métodos de evaluación: el diseño usa los tuyos.',
 });
 
+/** Prefijos de título que no son el área («Tecnología en…», «Técnico profesional en…»…). */
+const DEGREE_PREFIX_RE = /^(?:(?:programa|carrera)\s+(?:(?:acad[eé]mico|de\s+formaci[oó]n)\s+)?(?:(?:de|en)\s+)?)?(?:(?:tecnolog[ií]a|t[eé]cnic[oa](?:\s+(?:profesional|laboral)(?:\s+por\s+competencias)?)?|tecn[oó]log[oa]|tecnol[oó]gico|licenciatura|especializaci[oó]n(?:\s+tecnol[oó]gica)?|maestr[ií]a|doctorado|pregrado|diplomado|profesional)\s+(?:en|de|del)\s+)/i;
+/** Valores de «programa» que no son un área (placeholders, códigos, unidades administrativas). */
+const NOT_A_SECTOR_RE = /^(?:n\/?a|no\s+aplica|ninguno|ninguna|todos|todas|varios|general|otro|otros|sin\s+programa|transversal|curso)\b|c[oó]digo|snies|facultad|resoluci[oó]n|departamento\s+de|escuela\s+de/i;
+/** Encabezados que preceden al nombre del programa («Programa académico de…», «Programa: …», «Ciclo propedéutico en…»). */
+const PROGRAM_LEAD_RE = /^(?:programa(?:\s+acad[eé]mico)?\s*(?::|de\s+|en\s+)|ciclo\s+proped[eé]utico\s*(?::|de\s+|en\s+)?)\s*/i;
+/** Lo que queda después de quitar el título no puede ser otro título sin área («Tecnología en» suelto). */
+const BARE_DEGREE_RE = /^(?:programa|carrera|tecnolog[ií]a|t[eé]cnic[oa]|tecn[oó]log[oa]|licenciatura|especializaci[oó]n|maestr[ií]a|doctorado|pregrado|diplomado|profesional)(?:\s+(?:profesional|laboral|por|competencias|en|de|del))*$/i;
+
+/**
+ * LOOP 8.2.1 · Sector a partir del documento, SOLO con evidencia: el programa académico ENCONTRADO en el documento
+ * (con su cita), sin el prefijo del título. «Tecnología en Gestión Contable y Financiera» → «Gestión Contable y
+ * Financiera». Sin programa encontrado (o si queda vacío o es demasiado largo para ser un sector) → null: nunca se inventa.
+ */
+export function sectorFromAcademicContext(ctx: AcademicContextV1 | null | undefined): string | null {
+  const p = ctx && ctx.identity ? ctx.identity.program : null;
+  if (!p || p.status !== 'found' || typeof p.value !== 'string' || !p.sources.length) return null;
+  const raw = p.value.replace(/\s+/g, ' ').trim();
+  if (NOT_A_SECTOR_RE.test(raw)) return null;
+  const rest = raw.replace(PROGRAM_LEAD_RE, '').replace(DEGREE_PREFIX_RE, '').replace(/^[\s:–—-]+/, '').trim();
+  if (!rest || BARE_DEGREE_RE.test(rest) || NOT_A_SECTOR_RE.test(rest)) return null;
+  // Un «programa» que es una frase larga no es un área: mejor sin dato que un sector inventado.
+  if (rest.length < 3 || rest.length > 80 || rest.split(' ').length > 10) return null;
+  return rest.charAt(0).toUpperCase() + rest.slice(1);
+}
+
 export function resolveCourseFacts(input: FactsInput): CourseFacts {
   const b = input.brief ? input.brief.fields : {};
   const inferredKeys = new Set(String(b.inferidos || '').split(',').map((s) => s.trim()).filter(Boolean));
@@ -292,6 +320,7 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
   const found = <T>(f: { status: string; value: T | null } | undefined): T | null => (f && f.status !== 'missing' ? f.value : null);
   const owners = pedagogyFieldOwners(ped, input.derivation, input.suggested);
   const withDocs = !!ctx && Array.isArray(ctx.documents) && ctx.documents.length > 0;
+  const docSector = ctx && withDocs ? sectorFromAcademicContext(ctx) : null;
   const ctxFact = <T>(f: { status: string; value: T | null } | undefined): Fact<T> =>
     f && f.status !== 'missing' ? fact<T>(f.value, ctxSource(f as any)) : { value: null, source: null };
   const conflicts: FactConflict[] = [];
@@ -311,7 +340,9 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
 
   const docHours = ctx ? found(ctx.hours.total) : null;
   const pedHours = ped && typeof ped.targetHours === 'number' ? ped.targetHours : null;
-  const targetHours = first<number>(fact(pedHours, 'profile'), fact(docHours, 'document'));
+  // LOOP 8.2.1: horas que el perfil tiene porque las derivó del documento (dueño = documento) se muestran «del
+  // documento»; solo las que decidió el docente son «elegidas por ti» (y si difieren del documento, hay conflicto).
+  const targetHours = first<number>(fact(pedHours, withDocs && owners.targetHours === 'document' ? 'document' : 'profile'), fact(docHours, 'document'));
 
   // Datos del perfil que decidió el docente y difieren de lo que propone el documento: se respetan y se informan.
   const differing: DerivedField[] = [];
@@ -355,7 +386,9 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
     competencies: first<string[]>(fact(ctx ? ctx.competencies.map((c) => c.text) : null, ctx && ctx.competencies.length ? ctxSource(ctx.competencies[0]) : 'document'), fact(ped && ped.learningOutcomes ? ped.learningOutcomes.competencies : null, 'profile')),
     targetHours,
     units: fact(withDocs && ctx ? ctx.units.length : null, 'document'),
-    sector: fact(b.sector, briefSource('sector')),
+    // LOOP 8.2.1: sin sector en el pedido, solo con evidencia del documento (el programa encontrado en él); si no, sin dato.
+    sector: first<string>(fact(b.sector, briefSource('sector')), fact(docSector, 'inferred')),
+    documentSector: docSector,
     country: fact(b.pais, briefSource('pais')),
     document: { present: withDocs, proposed: !withDocs && !!ctx && ctx.outcomes.some((o) => isProposed(o)), contextVersion: input.academic ? input.academic.version : null, names: ctx ? ctx.documents.map((d) => d.name) : [] },
     pedagogy: {
