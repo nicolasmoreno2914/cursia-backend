@@ -75,7 +75,7 @@ export interface PedagogicalProfile {
    * Fase 2 · «Ajustar»: preferencias del diseño (énfasis y Actividades de Aplicación). Opcional: la clave existe SOLO
    * si alguna difiere del valor por defecto (perfiles anteriores conservan su sha).
    */
-  designPreferences?: { emphasis?: 'application' | 'depth'; applicationActivities?: 'practice_only' | 'none' };
+  designPreferences?: { emphasis?: 'application' | 'depth'; applicationActivities?: 'practice_only' | 'none'; audiovisual?: 'less' | 'recommended' | 'more' };
 }
 
 export interface PedagogyValidationError {
@@ -123,9 +123,11 @@ const TOLERATED_KEYS = ['designRules'];
 const OPTIONAL_KEYS = ['targetHours', 'designPreferences'];
 const DESIGN_EMPHASES_ALLOWED = ['application', 'balanced', 'depth'];
 const APPLICATION_MODES_ALLOWED = ['auto', 'practice_only', 'none'];
+/** LOOP 8.3: prioridad audiovisual (sin valor por defecto: ausente = comportamiento anterior, por eso se guarda tal cual). */
+const AUDIOVISUAL_ALLOWED = ['less', 'recommended', 'more'];
 
 /** Fase 2 · «Ajustar»: preferencias del diseño del perfil (vacío = las de siempre). Lanza si son inválidas. */
-export function profileDesignPreferences(p: unknown): { emphasis?: 'application' | 'balanced' | 'depth'; applicationActivities?: 'auto' | 'practice_only' | 'none' } {
+export function profileDesignPreferences(p: unknown): { emphasis?: 'application' | 'balanced' | 'depth'; applicationActivities?: 'auto' | 'practice_only' | 'none'; audiovisual?: 'less' | 'recommended' | 'more' } {
   if (!isPlainObject(p) || p.designPreferences === undefined || p.designPreferences === null) return {};
   const errs: PedagogyValidationError[] = [];
   checkDesignPreferences(p.designPreferences, errs);
@@ -139,10 +141,13 @@ function checkDesignPreferences(v: unknown, errors: PedagogyValidationError[]): 
     return;
   }
   for (const k of Object.keys(v)) {
-    if (k !== 'emphasis' && k !== 'applicationActivities') errors.push({ path: `designPreferences.${k}`, code: 'UNKNOWN_FIELD', message: `Campo desconocido "designPreferences.${k}"` });
+    if (k !== 'emphasis' && k !== 'applicationActivities' && k !== 'audiovisual') errors.push({ path: `designPreferences.${k}`, code: 'UNKNOWN_FIELD', message: `Campo desconocido "designPreferences.${k}"` });
   }
   if (v.emphasis !== undefined && !DESIGN_EMPHASES_ALLOWED.includes(v.emphasis as string)) {
     errors.push({ path: 'designPreferences.emphasis', code: 'INVALID_OPTION', message: `emphasis inválido (permitidos: ${DESIGN_EMPHASES_ALLOWED.join(', ')})` });
+  }
+  if (v.audiovisual !== undefined && !AUDIOVISUAL_ALLOWED.includes(v.audiovisual as string)) {
+    errors.push({ path: 'designPreferences.audiovisual', code: 'INVALID_OPTION', message: `audiovisual inválido (permitidos: ${AUDIOVISUAL_ALLOWED.join(', ')})` });
   }
   if (v.applicationActivities !== undefined && !APPLICATION_MODES_ALLOWED.includes(v.applicationActivities as string)) {
     errors.push({ path: 'designPreferences.applicationActivities', code: 'INVALID_OPTION', message: `applicationActivities inválido (permitidos: ${APPLICATION_MODES_ALLOWED.join(', ')})` });
@@ -334,6 +339,7 @@ export function normalizePedagogicalProfile(
       const out: Record<string, string> = {};
       if (dp.emphasis && dp.emphasis !== 'balanced') out.emphasis = dp.emphasis;
       if (dp.applicationActivities && dp.applicationActivities !== 'auto') out.applicationActivities = dp.applicationActivities;
+      if (dp.audiovisual) out.audiovisual = dp.audiovisual;
       return Object.keys(out).length ? { designPreferences: out as PedagogicalProfile['designPreferences'] } : {};
     })(),
   };

@@ -1,3 +1,4 @@
+import { parseProposedHours } from '../course-design/design-pins';
 import { returningRows } from '../../common/db/returning-rows';
 import { DERIVED_FIELDS, DerivedField, FieldOwner, PEDAGOGY_DERIVATION_KEY, mergeDerivedProfile, parsePedagogyDerivation, pedagogyFieldOwners } from '../course-facts/course-facts';
 import { loadCurrentAcademicContext } from '../academic-context/academic-db';
@@ -207,12 +208,13 @@ export class CourseProfilesService {
     const dto = this.toDto(row, finalExam);
     if (kind === 'pedagogy') {
       // LOOP 8.1: ¿los campos del documento (estudiante, resultados, horas) siguen como Cursia los derivó?
-      const [c] = await this.dataSource.query(`select metadata -> 'pedagogyDerivation' as d from public.courses where id = $1`, [courseId]);
+      const [c] = await this.dataSource.query(`select metadata -> 'pedagogyDerivation' as d, metadata -> 'designHours' as h from public.courses where id = $1`, [courseId]);
       const record = parsePedagogyDerivation(c ? (typeof c.d === 'string' ? JSON.parse(c.d) : c.d) : null);
+      const proposedHours = parseProposedHours(c ? (typeof c.h === 'string' ? JSON.parse(c.h) : c.h) : null);
       const academic = record ? await loadCurrentAcademicContext(this.dataSource, courseId).catch(() => null) : null;
       if (record && academic) {
         const suggested = suggestProfileFromContext(academic.context, null).profile;
-        const owners = pedagogyFieldOwners(dto.profile as PedagogicalProfile, record, suggested);
+        const owners = pedagogyFieldOwners(dto.profile as PedagogicalProfile, record, suggested, proposedHours);
         return { ...dto, derivedFromAcademic: { academicVersion: record.academicVersion, untouched: !DERIVED_FIELDS.some((f) => owners[f] === 'user'), owners } };
       }
     }
@@ -341,13 +343,15 @@ export class CourseProfilesService {
     const current = latest
       ? (normalizeProfile('pedagogy', typeof latest.data === 'string' ? JSON.parse(latest.data) : latest.data) as PedagogicalProfile)
       : (normalizeProfile('pedagogy', emptyPedagogicalProfile()) as PedagogicalProfile);
-    const [c] = await qr.query(`select metadata -> 'pedagogyDerivation' as d from public.courses where id = $1`, [courseId]);
+    const [c] = await qr.query(`select metadata -> 'pedagogyDerivation' as d, metadata -> 'designHours' as h from public.courses where id = $1`, [courseId]);
     const record = parsePedagogyDerivation(c ? (typeof c.d === 'string' ? JSON.parse(c.d) : c.d) : null);
+    // LOOP 8.3 (review L83 I-3): horas que propuso Cursia: el documento las reemplaza (no son una decisión del docente).
+    const proposedHours = parseProposedHours(c ? (typeof c.h === 'string' ? JSON.parse(c.h) : c.h) : null);
     // Review L81 I1: dueño POR CAMPO. Los vacíos y los que siguen como Cursia los dejó toman el valor del documento; los
     // que decidió el docente se respetan (salvo que pida explícitamente usar los del documento: `force`).
     const suggested = suggestProfileFromContext(ctx, null).profile;
     const previousSuggested = previousContext ? suggestProfileFromContext(previousContext, null).profile : null;
-    const owners = pedagogyFieldOwners(latest ? current : null, record, [suggested, previousSuggested]);
+    const owners = pedagogyFieldOwners(latest ? current : null, record, [suggested, previousSuggested], proposedHours);
     const merged = mergeDerivedProfile(current, suggested, owners, academicVersion, force);
     const writeRecord = () =>
       qr.query(

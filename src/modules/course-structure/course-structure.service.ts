@@ -1,3 +1,4 @@
+import { PinOp, loadDesignPins, pinsMetadataExpr } from '../course-design/design-pins';
 import { Injectable, BadRequestException, NotFoundException, ConflictException, Logger, OnModuleInit, ServiceUnavailableException } from '@nestjs/common';
 import { lockPedagogyInput } from '../pedagogy/pedagogical-blueprint';
 import { loadCurrentPedagogicalProfile, parseStoredPedagogicalProfile } from '../pedagogy/pedagogy-db';
@@ -306,7 +307,8 @@ export class CourseStructureService implements OnModuleInit {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException(`Configuración inválida de reglas de actividad: ${(err as Error).message}`);
       }
-      const dr = await asBad(() => runPedagogyDryRun({ structure: buildBlueprintSnapshotV2(courseRef, modules, chapters), profile: saved.profile, activityTypeRules: atr }));
+      const designPins = await loadDesignPins(queryRunner, courseId);
+      const dr = await asBad(() => runPedagogyDryRun({ structure: buildBlueprintSnapshotV2(courseRef, modules, chapters), profile: saved.profile, activityTypeRules: atr, designPins }));
       const dist = dr.distribution;
       if (!dist) {
         await queryRunner.rollbackTransaction();
@@ -341,8 +343,10 @@ export class CourseStructureService implements OnModuleInit {
             added++;
           } else {
             await queryRunner.query(
-              `update public.course_chapters set position = $1, application_minutes = $2, updated_at = now() where id = $3 and module_id = $4 and course_id = $5`,
-              [ci, c.applicationMinutes, c.id, m.id, courseId],
+              // LOOP 8.3: también el video que decidió el diseño (prioridad audiovisual; lo fijado por el docente ya viene respetado).
+              `update public.course_chapters set position = $1, application_minutes = $2, video_enabled = case when $6::boolean is null then video_enabled else $6::boolean end, updated_at = now()
+                where id = $3 and module_id = $4 and course_id = $5`,
+              [ci, c.applicationMinutes, c.id, m.id, courseId, c.kind === 'content' ? c.videoEnabled : null],
             );
           }
         }
@@ -1343,9 +1347,19 @@ export class CourseStructureService implements OnModuleInit {
         params.push(outcomeIds === null ? null : JSON.stringify(outcomeIds));
       }
 
+      // LOOP 8.3: video cambiado a mano → fijado por el docente; pasar a práctica lo libera (la práctica nunca lleva video).
+      // Review L83 M-2: un cambio de video SIN fijar (editor anterior, panel pedagógico) es el último valor que eligió
+      // alguien: un valor fijado antes ya no manda. Gate L83B: plegado en el MISMO UPDATE del contador (4 idas y vueltas).
+      const pinOps: PinOp[] = [];
+      const pinRequested = dto.pinVideo === true && dto.videoEnabled !== undefined && dto.kind !== 'practice';
+      if (dto.kind === 'practice') pinOps.push({ field: 'video', value: null });
+      // Review L83-2 m5: un capítulo de práctica nunca lleva video: no se fija nada (y se libera lo que hubiera).
+      else if (pinRequested) pinOps.push({ field: 'video', value: dto.videoEnabled as boolean, unlessPractice: dto.kind !== 'content' });
+      else if (dto.videoEnabled !== undefined) pinOps.push({ field: 'video', value: null });
       const found = await this.updateRowAndBump(
         queryRunner, 'course_chapters', sets, params, i, { id: chapterId, module_id: moduleId, course_id: courseId }, courseId,
         guardPracticeVideo ? `coalesce(to_jsonb(t) ->> 'chapter_kind', 'content') <> 'practice'` : undefined,
+        pinOps.length ? { chapterId, ops: pinOps } : undefined,
       );
       if (!found.found) {
         if (guardPracticeVideo) {
@@ -1364,6 +1378,7 @@ export class CourseStructureService implements OnModuleInit {
       await queryRunner.commitTransaction();
       return {
         structureVersionCounter: newCounter,
+        ...(pinRequested && (dto.kind === 'content' || found.kind !== 'practice') ? { videoPinned: true } : {}),
         ...(nt ? { title: nt.title, titleNormalized: nt.changed } : {}),
         ...(description !== undefined ? { description } : {}),
         ...(outcomeIds !== undefined ? { outcomeIds } : {}),
@@ -1710,7 +1725,9 @@ export class CourseStructureService implements OnModuleInit {
     where: Record<'id' | 'course_id', string | number> & { module_id?: string },
     courseId: number,
     extraCond?: string,
-  ): Promise<{ found: boolean; counter: number }> {
+    /** LOOP 8.3: cambios de valores fijados del capítulo, en el mismo UPDATE de courses (y su tipo antes del cambio). */
+    pins?: { chapterId: string; ops: PinOp[] },
+  ): Promise<{ found: boolean; counter: number; kind?: string }> {
     const p = params.slice();
     let i = nextIdx;
     const conds: string[] = extraCond ? [extraCond] : [];
@@ -1721,6 +1738,14 @@ export class CourseStructureService implements OnModuleInit {
     }
     const courseIdx = i++;
     p.push(courseId);
+    let pinSet = '';
+    let kindSel = '';
+    if (pins && pins.ops.length) {
+      const chIdx = i++;
+      p.push(pins.chapterId);
+      pinSet = `, metadata = ${pinsMetadataExpr('co.metadata', `$${chIdx}`, pins.ops)}`;
+      kindSel = `, (select coalesce(to_jsonb(kx) ->> 'chapter_kind', 'content') from public.course_chapters kx where kx.id::text = $${chIdx}::text) as kind`;
+    }
     const target = sets.length > 0
       ? `update public.${table} t set ${sets.join(', ')}, updated_at = now() where ${conds.join(' and ')} returning t.id`
       : `select t.id from public.${table} t where ${conds.join(' and ')}`;
@@ -1728,16 +1753,16 @@ export class CourseStructureService implements OnModuleInit {
       `with u as (${target}),
        c as (
          update public.courses co
-            set structure_version_counter = co.structure_version_counter + 1
+            set structure_version_counter = co.structure_version_counter + 1${pinSet}
           where co.id = $${courseIdx} and exists (select 1 from u)
          returning co.structure_version_counter
        )
-       select (select count(*)::int from u) as n, (select structure_version_counter from c) as counter`,
+       select (select count(*)::int from u) as n, (select structure_version_counter from c) as counter${kindSel}`,
       p,
     );
     const r = rows[0];
     if (!r || Number(r.n) === 0) return { found: false, counter: NaN };
-    return { found: true, counter: this.counterOrThrow(r.counter, courseId) };
+    return { found: true, counter: this.counterOrThrow(r.counter, courseId), ...(r.kind !== undefined ? { kind: r.kind } : {}) };
   }
 
   /** json_build_object del driver: objeto ya parseado o string. */

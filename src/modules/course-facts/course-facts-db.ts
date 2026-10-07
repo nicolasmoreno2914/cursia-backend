@@ -2,6 +2,7 @@ import { loadCurrentAcademicContext } from '../academic-context/academic-db';
 import { loadCurrentPedagogicalProfile } from '../pedagogy/pedagogy-db';
 import { BRIEF_KEY, CourseFacts, PEDAGOGY_DERIVATION_KEY, parseBrief, parsePedagogyDerivation, resolveCourseFacts } from './course-facts';
 import { suggestProfileFromContext } from '../academic-context/context-design';
+import { DESIGN_HOURS_KEY, parseProposedHours } from '../course-design/design-pins';
 
 type Q = { query(sql: string, params?: any[]): Promise<any> };
 
@@ -20,6 +21,7 @@ export async function loadCourseFacts(q: Q, courseId: number, courseRow?: any): 
     pedagogy: pedagogy ? { version: pedagogy.version, profile: pedagogy.profile } : null,
     derivation: parsePedagogyDerivation(meta[PEDAGOGY_DERIVATION_KEY]),
     suggested: academic ? suggestProfileFromContext(academic.context, null).profile : null,
+    proposedHours: parseProposedHours(meta[DESIGN_HOURS_KEY]),
   });
 }
 

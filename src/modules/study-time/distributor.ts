@@ -74,6 +74,8 @@ export interface ProposedChapter {
   review: boolean;
   /** Nivel de la Actividad de Aplicación (minutos; null = sin actividad). Se genera con el curso (Fase 2). */
   applicationMinutes: number | null;
+  /** LOOP 8.3: el video de este capítulo lo fijó el docente (el diseño lo respeta). */
+  videoPinned: boolean;
   /** Tiempo objetivo del capítulo (modelo de tiempo, exacto) y lo que se puede generar hoy (sin la Actividad). */
   targetMinutes: number;
   generableMinutes: number;
@@ -87,7 +89,7 @@ export interface ProposedModule {
 }
 
 export interface DistributionChange {
-  type: 'add_practice_chapter' | 'add_content_chapter' | 'set_application_activity' | 'remove_application_activity' | 'role_changed';
+  type: 'add_practice_chapter' | 'add_content_chapter' | 'set_application_activity' | 'remove_application_activity' | 'role_changed' | 'set_video';
   moduleId: string;
   chapterId: string;
   /** Texto para el docente. */
@@ -111,8 +113,8 @@ export interface DistributionResult {
   /** Proporción del diseño en Actividades de aplicación (0–1), incluidos los capítulos de práctica. */
   applicationShare: number;
   policy: { kind: 'application_first' | 'depth_first'; weights: { application: number; depth: number } | null } & DistributorPolicy;
-  /** Fase 2 · «Ajustar»: preferencias efectivas con las que se armó el diseño. */
-  preferences: Required<DesignPreferences>;
+  /** Fase 2 · «Ajustar»: preferencias efectivas con las que se armó el diseño (audiovisual null = comportamiento anterior). */
+  preferences: { emphasis: DesignEmphasis; applicationActivities: ApplicationActivitiesMode; audiovisual?: AudiovisualPriority };
   modules: ProposedModule[];
   changes: DistributionChange[];
   recommendations: string[];
@@ -143,18 +145,33 @@ export interface DistributionResult {
  *     de práctica) o 'none' (ninguna: el curso crece solo con capítulos).
  */
 export type DesignEmphasis = 'application' | 'balanced' | 'depth';
+/**
+ * LOOP 8.3 · Prioridad audiovisual (preferencia del diseño, no una estructura fija). Ausente = comportamiento anterior
+ * (el video de cada capítulo es el que tiene la estructura; la profundización hereda el del módulo).
+ *   - less: video solo en el capítulo de contenido que abre cada módulo;
+ *   - recommended: en los que abren o desarrollan el módulo (no en el que lo cierra ni en la profundización agregada);
+ *   - more: en todos los capítulos de contenido (también la profundización).
+ * Los capítulos de práctica nunca llevan video; un capítulo FIJADO por el docente conserva su valor.
+ */
+export type AudiovisualPriority = 'less' | 'recommended' | 'more';
+export const AUDIOVISUAL_PRIORITIES: readonly AudiovisualPriority[] = ['less', 'recommended', 'more'];
+/** Valores que el docente fijó a mano en el editor (por id de capítulo). El distribuidor los respeta siempre. */
+export type DesignPins = Readonly<Record<string, { video?: boolean }>>;
 export type ApplicationActivitiesMode = 'auto' | 'practice_only' | 'none';
 export const DESIGN_EMPHASES: readonly DesignEmphasis[] = ['application', 'balanced', 'depth'];
 export const APPLICATION_ACTIVITIES_MODES: readonly ApplicationActivitiesMode[] = ['auto', 'practice_only', 'none'];
 export interface DesignPreferences {
   emphasis?: DesignEmphasis;
   applicationActivities?: ApplicationActivitiesMode;
+  audiovisual?: AudiovisualPriority;
 }
 
 export interface DistributorInput {
   snapshot: BlueprintSnapshotV2;
   /** Fase 2 · «Ajustar»: preferencias del docente (ausentes = las de siempre). */
   preferences?: DesignPreferences | null;
+  /** LOOP 8.3: valores fijados por el docente (video por capítulo). */
+  pins?: DesignPins | null;
   /** Reglas del motor pedagógico (null = sin enfoque: política neutra). */
   rules: DesignRules | null;
   targetHours: number;
@@ -230,7 +247,11 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   if (prefs.applicationActivities !== undefined && !APPLICATION_ACTIVITIES_MODES.includes(prefs.applicationActivities)) {
     throw new DistributorError(`applicationActivities inválido (${JSON.stringify(prefs.applicationActivities)})`);
   }
+  if (prefs.audiovisual !== undefined && !AUDIOVISUAL_PRIORITIES.includes(prefs.audiovisual)) throw new DistributorError(`audiovisual inválido (${JSON.stringify(prefs.audiovisual)})`);
   const appMode: ApplicationActivitiesMode = prefs.applicationActivities ?? 'auto';
+  const av: AudiovisualPriority | null = prefs.audiovisual ?? null;
+  const pins: DesignPins = input.pins ?? {};
+  const pinnedVideo = (id: string): boolean | undefined => (pins[id] && typeof pins[id].video === 'boolean' ? pins[id].video : undefined);
   const basePolicy = distributorPolicyFor(rules);
   const policy: DistributionResult['policy'] = prefs.emphasis === 'application'
     ? { ...basePolicy, kind: 'application_first', ...DISTRIBUTOR_RULES.applicationFirst }
@@ -261,6 +282,28 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
       })),
     }));
   if (design.some((m) => m.chapters.length === 0)) throw new DistributorError('cada módulo necesita al menos un capítulo');
+
+  // LOOP 8.3 · prioridad audiovisual sobre los capítulos de contenido existentes (antes de crecer: el video cambia las
+  // horas y el resto del diseño compensa). Lo fijado por el docente manda; la práctica nunca lleva video.
+  const initialVideo = new Map(design.flatMap((m) => m.chapters.map((c) => [c.id, c.videoEnabled] as const)));
+  const avFor = (contentIndex: number, contentCount: number, proposedDeepening: boolean): boolean => {
+    if (av === 'more') return true;
+    if (proposedDeepening) return false;
+    if (av === 'less') return contentIndex === 0;
+    return contentCount === 1 || contentIndex < contentCount - 1; // recommended: abre o desarrolla, no el cierre
+  };
+  if (av) {
+    for (const m of design) {
+      const content = m.chapters.filter((c) => c.kind === 'content');
+      content.forEach((c, i) => {
+        const pin = pinnedVideo(c.id);
+        c.videoEnabled = pin !== undefined ? pin : avFor(i, content.length, false);
+      });
+      for (const c of m.chapters) if (c.kind === 'practice') c.videoEnabled = false;
+    }
+  } else {
+    for (const m of design) for (const c of m.chapters) { const pin = pinnedVideo(c.id); if (pin !== undefined && c.kind === 'content') c.videoEnabled = pin; }
+  }
 
   const toInput = (withApplication: boolean): StudyTimeCourseInput => ({
     frame: true,
@@ -304,8 +347,16 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   };
   const baseHours = r1(estimateCourseStudyTime(toInput(false)).courseEstimatedMinutes / 60);
 
+  const pushVideoChanges = () => {
+    for (const m of design) for (const c of m.chapters) {
+      if (c.proposed || c.kind !== 'content' || initialVideo.get(c.id) === c.videoEnabled) continue;
+      if (changes.some((x) => x.type === 'set_video' && x.chapterId === c.id)) continue;
+      changes.push({ type: 'set_video', moduleId: m.id, chapterId: c.id, detail: c.videoEnabled ? `«${c.title}» lleva video.` : `«${c.title}» queda sin video.` });
+    }
+  };
   const result = (status: DistributionStatus, recs: string[]): DistributionResult => {
     pushRemovals();
+    pushVideoChanges();
     const generable = est; // Fase 2: las Actividades de Aplicación se generan
     // Re-revisión L3: los capítulos de práctica no tienen tope de aplicación; si el diseño queda por encima de la
     // proporción del enfoque, se dice explícitamente.
@@ -327,6 +378,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
         objective: c.objective,
         role: roleOf(m, c),
         videoEnabled: c.kind === 'content' && c.videoEnabled,
+        videoPinned: pinnedVideo(c.id) !== undefined,
         activityEnabled: c.activityEnabled,
         review,
         applicationMinutes: c.applicationMinutes,
@@ -349,7 +401,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
       deltaHours: r1(est.courseEstimatedHours - input.targetHours),
       applicationShare: Math.round((est.byComponent.application / est.courseEstimatedMinutes) * 100) / 100,
       policy,
-      preferences: { emphasis: prefs.emphasis ?? 'balanced', applicationActivities: appMode },
+      preferences: { emphasis: prefs.emphasis ?? 'balanced', applicationActivities: appMode, ...(av ? { audiovisual: av } : {}) },
       modules,
       changes,
       recommendations,
@@ -497,7 +549,8 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
         const content = m.chapters.filter((c) => c.kind === 'content');
         if (content.length >= DISTRIBUTOR_RULES.maxContentChaptersPerModule) continue;
         const n = content.filter((c) => c.proposed).length + 1;
-        const usesVideo = content.some((c) => c.videoEnabled);
+        // Sin preferencia: como siempre (hereda el video del módulo). Con preferencia: solo «Más» pone video en la profundización.
+        const usesVideo = av ? avFor(content.length, content.length + 1, true) : content.some((c) => c.videoEnabled);
         const cc: WorkChapter = {
           id: `proposed:content:${m.id}:${n}`,
           proposed: true,

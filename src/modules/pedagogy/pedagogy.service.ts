@@ -1,3 +1,4 @@
+import { loadDesignPins } from '../course-design/design-pins';
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { academicBlueprintContext, loadCurrentAcademicContext } from '../academic-context/academic-db';
 import { DataSource } from 'typeorm';
@@ -140,6 +141,7 @@ export class PedagogyService {
     } catch (err) {
       throw new BadRequestException(`Configuración inválida de reglas de actividad: ${(err as Error).message}`);
     }
+    const designPins = await loadDesignPins(this.dataSource, courseId);
     const result = asBadRequest(() =>
       runPedagogyDryRun({
         structure: snapshot,
@@ -148,6 +150,8 @@ export class PedagogyService {
         applyStructureAdjustments: body.applyStructureAdjustments,
         // Fase 4: dato del contexto que no vive en el Blueprint (sugerencia P2 del Coherence Engine).
         alignment: { priorKnowledgeDeclared: academic ? academic.context.learner.priorKnowledge.status !== 'missing' : null },
+        // LOOP 8.3: lo que el docente fijó a mano (el mismo mapa que usa «Aplicar diseño»: misma propuesta, misma huella).
+        designPins,
       }),
     );
     return {
