@@ -5,12 +5,15 @@
 // Parte pura:
 //   VF1 diseño sano: todo ok, sin bloqueo; costo, audiovisual, práctica y evaluaciones en la lista
 //   VF2 horas: por encima → advertencia con «Usar N h»; no alcanza → editor; contenidos > horas → CRÍTICO con «Diseñar para N h»
-//   VF3 alineación: A1 con capítulos sin vínculos → «Corregir» automático; sin capítulos libres → editor; A3 → «Más
-//       aplicación»; A7 / P2 → «Lo que entendimos»; sin resultados → advertencia; errores del Manifest → crítico
+//   VF3 alineación: A1/A4 → «Corregir» automático SOLO si la vinculación lo resuelve (si no, editor con destino); A3/A5/A6
+//       → «Ajustar» solo si cambia algo (si no, editor); A4 de un capítulo PROPUESTO se omite; el resumen no suma;
+//       A7 / P2 → «Lo que entendimos»; sin resultados → advertencia; errores del Manifest → crítico sin códigos internos
+//   VF6 contenidos del microcurrículo sin capítulo; evaluaciones que pide el documento; costo con coma decimal; > 500 h
 // Parte DB (Postgres 16 desechable; --pure-only la salta y lo dice):
 //   VF4 la recomendación trae la verificación del MISMO diseño (alineación real del Coherence Engine)
-//   VF5 «Corregir» automático: vincula solo los capítulos SIN vínculos (los del docente intactos), sube el contador,
-//       la verificación queda limpia; contador viejo → 409; acción desconocida → 400; ajeno 404
+//   VF5 «Corregir» automático: vincula solo los capítulos de CONTENIDO SIN vínculos (los del docente y las prácticas
+//       intactos), con vista previa en la verificación; un capítulo desvinculado a propósito no se re-vincula; sube el
+//       contador; ya vinculado → la verificación no ofrece «automático»; contador viejo → 409; acción desconocida → 400; ajeno 404
 //
 // Uso: node scripts/check-loop84-verification.js [--pure-only] [path/to/dist]
 'use strict';
@@ -66,7 +69,8 @@ const vids = (d) => d.modules.map((m) => m.chapters.filter((c) => c.kind === 'co
 (async () => {
   console.log('Parte pura');
   const base = { status: 'within_tolerance', targetHours: 64, estimatedHours: 63.5, toleranceHours: 3.2, baseHours: 30, counts: { modules: 4, chapters: 16, contentChapters: 12, practiceChapters: 4, videoChapters: 8, activities: 16, applicationActivities: 10, evaluations: 5 },
-    manifestErrors: [], alignment: { available: true, coverage: { outcomes: 6, covered: 6, partial: 0, uncovered: 0 }, findings: [] }, approach: { id: 'competencias', label: 'Competencias' }, policyKind: 'application_first', audiovisual: 'recommended', pinnedChapters: 0, cost: { min: '18', expected: '24', max: '33' }, unlinkedChapters: 0 };
+    manifestErrors: [], alignment: { available: true, coverage: { outcomes: 6, covered: 6, partial: 0, uncovered: 0 }, findings: [] }, approach: { id: 'competencias', label: 'Competencias' }, policyKind: 'application_first', audiovisual: 'recommended', pinnedChapters: 0, cost: { min: '18', expected: '24', max: '33' },
+    preferences: { emphasis: 'balanced', applicationActivities: 'auto' }, autoLink: { chapterIds: [], outcomeIds: [], preview: [] }, proposedChapterIds: [], uncoveredContents: [], requiredEvaluations: [] };
   const byId = (v) => Object.fromEntries(v.checks.map((c) => [c.id, c]));
   await check('VF1 diseño sano: todo ok y sin bloqueo; la lista cubre las 10 áreas', () => {
     const v = V.verifyDesign(base);
@@ -85,23 +89,47 @@ const vids = (d) => d.modules.map((m) => m.chapters.filter((c) => c.kind === 'co
     const v = V.verifyDesign({ ...base, status: 'minimum_exceeds_target', targetHours: 16, baseHours: 30.2 });
     eq([byId(v).hours.severity, byId(v).hours.fix.value, v.blocking], ['critical', 31, true], 'contenidos > horas: bloquea');
   });
-  await check('VF3 alineación → «Corregir»: automático, Ajustar, editor o «Lo que entendimos»; sin resultados; Manifest con errores', () => {
-    const f = (rule, severity) => ({ id: rule + ':x', rule, severity, outcomeIds: ['RA1'], chapterIds: [], message: 'm ' + rule, suggestion: 's' });
-    const al = { available: true, outcomes: [{ id: 'RA1', status: 'uncovered', domain: 'do' }, { id: 'RA2', status: 'covered', domain: 'know' }, { id: 'CO1', status: 'partial', domain: 'competency' }], findings: [f('A1', 'critical'), f('A3', 'warning'), f('A7', 'suggestion'), f('P2', 'suggestion'), f('A2', 'warning')] };
-    const v = byId(V.verifyDesign({ ...base, alignment: al, unlinkedChapters: 2 }));
-    eq([v['alignment:A1:x'].fix.kind, v['alignment:A1:x'].fix.action, v.outcomes.severity, v.outcomes.title], ['auto', 'link_outcomes', 'critical', '1 de 2 resultados de aprendizaje con evidencia · 0 de 1 competencias'], 'A1 con capítulos libres: automático');
+  await check('VF3 alineación → «Corregir» que de verdad resuelve: automático, Ajustar, editor o «Lo que entendimos»', () => {
+    const f = (rule, severity, extra = {}) => ({ id: rule + ':x', rule, severity, outcomeIds: ['RA1'], chapterIds: [], moduleIds: [], message: 'm ' + rule, suggestion: 's', ...extra });
+    const al = { available: true, outcomes: [{ id: 'RA1', status: 'uncovered', domain: 'do' }, { id: 'RA2', status: 'covered', domain: 'know' }, { id: 'CO1', status: 'partial', domain: 'competency' }], findings: [f('A1', 'critical'), f('A3', 'warning'), f('A6', 'warning'), f('A7', 'suggestion'), f('P2', 'suggestion'), f('A2', 'warning')] };
+    const link = { chapterIds: [uuid(1)], outcomeIds: ['RA1'], preview: [{ chapter: 'Cap 1', outcomes: ['RA1'] }] };
+    const vr = V.verifyDesign({ ...base, alignment: al, autoLink: link });
+    const v = byId(vr);
+    eq([v['alignment:A1:x'].fix.kind, v['alignment:A1:x'].fix.action, v.outcomes.severity, v.outcomes.title], ['auto', 'link_outcomes', 'critical', '1 de 2 resultados de aprendizaje con evidencia · 0 de 1 competencias'], 'A1 que la vinculación resuelve: automático');
+    eq([v.outcome_links.severity, v.outcome_links.fix.kind, v.outcome_links.detail], ['info', 'auto', '«Cap 1» → RA1'], 'vista previa de lo que vincula Cursia');
+    eq(vr.counts.critical, 1, 'el resumen de resultados no suma (solo el hallazgo A1)');
+    // C1: la vinculación no alcanza a ESTE resultado → al editor (nunca un «automático» que no cambia nada).
+    const other = byId(V.verifyDesign({ ...base, alignment: al, autoLink: { chapterIds: [uuid(1)], outcomeIds: ['RA9'], preview: [{ chapter: 'Cap 1', outcomes: ['RA9'] }] } }));
+    eq([other['alignment:A1:x'].fix.kind, other['alignment:A1:x'].fix.action], ['editor', 'outcome_links'], 'A1 que la vinculación no resuelve: editor');
+    eq(byId(V.verifyDesign({ ...base, alignment: al }))['alignment:A1:x'].fix.kind, 'editor', 'sin nada que vincular: editor');
     const onlyCo = byId(V.verifyDesign({ ...base, alignment: { available: true, outcomes: [{ id: 'RA1', status: 'covered', domain: 'do' }, { id: 'CO1', status: 'uncovered', domain: 'competency' }], findings: [f('A1c', 'warning')] } })).outcomes;
     eq(onlyCo.severity, 'warning', 'una competencia sin vincular es advertencia (no bloquea)');
     eq([v['alignment:A3:x'].fix.kind, v['alignment:A3:x'].fix.action, v['alignment:A3:x'].fix.value], ['adjust', 'emphasis', 'application'], 'A3: Más aplicación');
+    eq(v['alignment:A6:x'].fix.kind, 'editor', 'A6 con actividades ya «donde el diseño las necesite»: editor (Ajustar no cambiaría nada)');
+    const appl = byId(V.verifyDesign({ ...base, alignment: al, preferences: { emphasis: 'application', applicationActivities: 'none' } }));
+    eq([appl['alignment:A3:x'].fix.kind, appl['alignment:A3:x'].fix.action, appl['alignment:A6:x'].fix.kind, appl['alignment:A6:x'].fix.value], ['editor', 'add_practice', 'adjust', 'auto'], 'I6: Ajustar solo si cambia algo');
     eq([v['alignment:A7:x'].fix.kind, v['alignment:P2:x'].fix.kind, v['alignment:A7:x'].severity], ['understood', 'understood', 'info'], 'A7/P2');
     eq(v['alignment:A2:x'].fix.action, 'module_exams', 'A2: evaluación del módulo');
-    eq(byId(V.verifyDesign({ ...base, alignment: al, unlinkedChapters: 0 }))['alignment:A1:x'].fix.kind, 'editor', 'sin capítulos libres: al editor');
+    // I3: A4 de un capítulo que el diseño propone (todavía no existe) se omite; el de uno existente sin sugerencia va al editor con destino.
+    const a4 = (ch) => f('A4', 'warning', { id: 'A4:' + ch, outcomeIds: [], chapterIds: [ch], moduleIds: [uuid(100)] });
+    const p = byId(V.verifyDesign({ ...base, alignment: { available: true, outcomes: [{ id: 'RA1', status: 'covered', domain: 'do' }], findings: [a4(uuid(7)), a4(uuid(8))] }, proposedChapterIds: [uuid(7)] }));
+    eq([!!p['alignment:A4:' + uuid(7)], p['alignment:A4:' + uuid(8)].fix.kind, p['alignment:A4:' + uuid(8)].fix.targets.chapterIds], [false, 'editor', [uuid(8)]], 'A4 propuesto omitido; existente al editor con destino');
     const none = byId(V.verifyDesign({ ...base, alignment: { available: false } })).outcomes;
     eq([none.severity, none.fix.kind], ['warning', 'understood'], 'sin resultados');
     const bad = V.verifyDesign({ ...base, manifestErrors: [{ code: 'DISTRIBUTION_MODEL_MISMATCH' }] });
-    eq([byId(bad).consistency.severity, bad.blocking], ['critical', true], 'errores del Manifest bloquean');
+    eq([byId(bad).consistency.severity, bad.blocking, /DISTRIBUTION/.test(byId(bad).consistency.detail)], ['critical', true, false], 'errores del Manifest bloquean, sin códigos internos');
     eq(byId(V.verifyDesign({ ...base, approach: null })).pedagogy.severity, 'warning', 'sin enfoque');
     eq(byId(V.verifyDesign({ ...base, counts: { ...base.counts, evaluations: 0 } })).evaluations.fix.action, 'module_exams', 'sin evaluaciones');
+  });
+  await check('VF6 contenidos sin capítulo; evaluaciones del documento; costo con coma; más de 500 h → dividir el curso', () => {
+    const v = byId(V.verifyDesign({ ...base, uncoveredContents: ['Costeo ABC', 'Presupuesto maestro', 'Punto de equilibrio', 'Costeo variable'], counts: { ...base.counts, evaluations: 0 }, requiredEvaluations: ['Parcial', 'Proyecto final'], cost: { min: '18.5', expected: '24.75', max: '33.1' } }));
+    eq([v.contents.severity, v.contents.fix.action, v.contents.detail], ['warning', 'add_chapter', '«Costeo ABC», «Presupuesto maestro», «Punto de equilibrio» y 1 más'], 'contenidos sin capítulo');
+    eq(v.evaluations.detail, 'El microcurrículo pide evaluar con «Parcial», «Proyecto final».', 'evaluaciones del documento');
+    eq(v.cost.title, 'Costo estimado de generar ≈ USD 24,75 (entre 18,5 y 33,1)', 'coma decimal');
+    const big = byId(V.verifyDesign({ ...base, status: 'minimum_exceeds_target', targetHours: 400, baseHours: 612.3 })).hours;
+    eq([big.severity, big.fix.kind, /500 h/.test(big.detail)], ['critical', 'editor', true], 'contenidos > 500 h: dividir');
+    const above = byId(V.verifyDesign({ ...base, status: 'above_tolerance', targetHours: 480, estimatedHours: 500.4 })).hours;
+    eq(above.fix.kind, 'editor', 'pasarse de 500 h no se ofrece como meta');
   });
 
   if (PURE_ONLY) console.log('\n⚠️  --pure-only: se SALTÓ la parte DB (no cuenta como probada).');
@@ -216,31 +244,53 @@ async function dbChecks() {
       eq(ids.hours.severity, 'ok', 'horas');
       eq(ids.outcomes.title, '6 de 6 resultados de aprendizaje con evidencia · 0 de 2 competencias', 'cobertura de resultados y competencias');
       assert(r.verification.checks.some((x) => /competencia CO1/.test(x.title) && x.fix && x.fix.kind), 'la competencia sin vincular trae su «Corregir»');
+      eq(ids.contents, undefined, 'la estructura armada desde el documento cubre sus contenidos (sin falsos positivos)');
       eq(r.verification.blocking, false, 'sin bloqueo: ' + JSON.stringify(r.verification.checks.filter((x) => x.severity === 'critical' || x.severity === 'warning').map((x) => [x.id, x.title])));
     });
 
-    await check('VF5 «Corregir» automático: vincula solo capítulos SIN vínculos; los del docente intactos; 409 / 400 / 404', async () => {
+    await check('VF5 «Corregir» automático: solo contenido sin vínculos; docente, prácticas y desvinculados intactos; vista previa; 409 / 400 / 404', async () => {
       const [c] = await ds.query(`insert into public.courses (owner_id, title, structure_version, final_exam_enabled, activity_engine) values ($1, 'Vínculos', 'dynamic', true, 'h5p') returning id`, [OWNER]);
       const [m] = await ds.query(`insert into public.course_modules (course_id, position, title) values ($1, 0, 'Costos') returning id`, [c.id]);
-      const titles = ['Elementos del costo y su clasificación', 'Costo de materiales y mano de obra', 'Sistema de costeo por órdenes de producción'];
+      const titles = ['Elementos del costo y su clasificación', 'Costo de materiales y mano de obra', 'Sistema de costeo por órdenes de producción', 'Práctica: costo de materiales y mano de obra', 'Elementos del costo en la empresa'];
       const ids = [];
       for (const [i, title] of titles.entries()) ids.push((await ds.query(`insert into public.course_chapters (course_id, module_id, position, title, objective) values ($1, $2, $3, $4, $4) returning id`, [c.id, m.id, i, title]))[0].id);
       await ds.query(`update public.course_chapters set outcome_ids = '["RA6"]'::jsonb where id = $1`, [ids[2]]);
+      await ds.query(`update public.course_chapters set chapter_kind = 'practice', video_enabled = false where id = $1`, [ids[3]]);
       await profiles.append(c.id, OWNER, 'academic', doc);
+      // El docente desvincula A PROPÓSITO el último capítulo (vincula y luego quita todo): Cursia no lo vuelve a vincular.
+      await structure.updateChapter(c.id, m.id, ids[4], OWNER, { outcomeIds: ['RA1'], expectedCounter: await counter(c.id) });
+      await structure.updateChapter(c.id, m.id, ids[4], OWNER, { outcomeIds: null, expectedCounter: await counter(c.id) });
       const r = await design.recommend(c.id, OWNER, {});
-      const auto = r.verification.checks.find((x) => x.fix && x.fix.kind === 'auto');
-      assert(auto && auto.fix.action === 'link_outcomes', 'hay un «Corregir» automático: ' + JSON.stringify(r.verification.checks.filter((x) => x.severity !== 'ok').map((x) => x.title)));
+      const preview = r.verification.checks.find((x) => x.id === 'outcome_links');
+      assert(preview && preview.fix.kind === 'auto' && preview.fix.action === 'link_outcomes', 'vista previa con «Vincular ahora»: ' + JSON.stringify(r.verification.checks.filter((x) => x.severity !== 'ok').map((x) => x.title)));
+      assert(/Elementos del costo y su clasificación/.test(preview.detail) && /Costo de materiales y mano de obra/.test(preview.detail), 'la vista previa nombra los capítulos: ' + preview.detail);
+      assert(!/Práctica:|en la empresa/.test(preview.detail), 'ni la práctica ni el desvinculado entran: ' + preview.detail);
       await rejectsRe(design.fix(c.id, OWNER, 'link_outcomes', (await counter(c.id)) + 5), /STRUCTURE_CHANGED/, 'contador viejo', 409);
       await rejectsRe(design.fix(c.id, OWNER, 'borrar_todo', await counter(c.id)), /Acción desconocida/, 'acción desconocida', 400);
       await rejectsRe(design.fix(c.id, OTHER, 'link_outcomes', await counter(c.id)), /not found/, 'ajeno', 404);
       const before = await counter(c.id);
       const fx = await design.fix(c.id, OWNER, 'link_outcomes', before);
-      assert(fx.linkedChapters >= 1 && fx.structureVersionCounter === before + 1, 'vinculó y subió el contador: ' + JSON.stringify(fx));
-      const rows = await ds.query(`select id, outcome_ids from public.course_chapters where course_id = $1`, [c.id]);
-      eq(rows.find((x) => x.id === ids[2]).outcome_ids, ['RA6'], 'los vínculos del docente no se tocan');
-      assert(rows.filter((x) => x.id !== ids[2]).every((x) => Array.isArray(x.outcome_ids) && x.outcome_ids.length), 'los demás quedaron vinculados');
+      eq([fx.linkedChapters, fx.structureVersionCounter, fx.applied.map((a) => a.chapter)], [2, before + 1, titles.slice(0, 2)], 'vinculó lo de la vista previa y subió el contador');
+      const rows = Object.fromEntries((await ds.query(`select id, outcome_ids from public.course_chapters where course_id = $1`, [c.id])).map((x) => [x.id, x.outcome_ids]));
+      eq(rows[ids[2]], ['RA6'], 'los vínculos del docente no se tocan');
+      eq([rows[ids[3]], rows[ids[4]]], [null, null], 'la práctica y el desvinculado a propósito siguen sin vínculos');
+      assert([ids[0], ids[1]].every((id) => Array.isArray(rows[id]) && rows[id].length), 'los de contenido quedaron vinculados');
+      const after = await design.recommend(c.id, OWNER, {});
+      assert(!after.verification.checks.some((x) => x.fix && x.fix.kind === 'auto'), 'ya no queda nada que vincular: ningún «automático» (C1): ' + JSON.stringify(after.verification.checks.filter((x) => x.fix && x.fix.kind === 'auto').map((x) => x.title)));
       const again = await design.fix(c.id, OWNER, 'link_outcomes', fx.structureVersionCounter);
       eq([again.linkedChapters, again.structureVersionCounter], [0, fx.structureVersionCounter], 'idempotente: sin cambios no sube el contador');
+      // Vincular a mano borra la marca: desvincular de nuevo la vuelve a poner (la marca sigue la última decisión).
+      await structure.updateChapter(c.id, m.id, ids[4], OWNER, { outcomeIds: ['RA1'], expectedCounter: await counter(c.id) });
+      const pins = (await ds.query(`select metadata -> 'designPins' p from public.courses where id = $1`, [c.id]))[0].p || {};
+      assert(!(pins[ids[4]] && pins[ids[4]].noLinks), 'vincular borra la marca de desvinculado');
+    });
+
+    await check('VF7 un video fijado en un capítulo de práctica no se informa como fijado', async () => {
+      const [c] = await ds.query(`insert into public.courses (owner_id, title, structure_version, final_exam_enabled, activity_engine) values ($1, 'Práctica', 'dynamic', true, 'h5p') returning id`, [OWNER]);
+      const [m] = await ds.query(`insert into public.course_modules (course_id, position, title) values ($1, 0, 'M') returning id`, [c.id]);
+      const [ch] = await ds.query(`insert into public.course_chapters (course_id, module_id, position, title, chapter_kind, video_enabled) values ($1, $2, 0, 'Práctica', 'practice', false) returning id`, [c.id, m.id]);
+      const up = await structure.updateChapter(c.id, m.id, ch.id, OWNER, { videoEnabled: false, pinVideo: true, expectedCounter: await counter(c.id) });
+      eq(up.videoPinned, undefined, 'sin videoPinned');
     });
 
   } finally {

@@ -1,4 +1,4 @@
-import { loadDesignPins, setVideoPin } from '../course-design/design-pins';
+import { loadDesignPins, setNoLinksDecision, setVideoPin } from '../course-design/design-pins';
 import { Injectable, BadRequestException, NotFoundException, ConflictException, Logger, OnModuleInit, ServiceUnavailableException } from '@nestjs/common';
 import { lockPedagogyInput } from '../pedagogy/pedagogical-blueprint';
 import { loadCurrentPedagogicalProfile, parseStoredPedagogicalProfile } from '../pedagogy/pedagogy-db';
@@ -1365,20 +1365,24 @@ export class CourseStructureService implements OnModuleInit {
         throw notFound();
       }
       const newCounter = found.counter;
+      let pinnedPractice = false;
       // LOOP 8.3: video cambiado a mano → fijado por el docente; pasar a práctica lo libera (la práctica nunca lleva video).
       if (dto.kind === 'practice') await setVideoPin(queryRunner, courseId, chapterId, null);
       else if (dto.pinVideo === true && dto.videoEnabled !== undefined) {
         // Review L83-2 m5: un capítulo de práctica nunca lleva video: no se fija nada (y se libera lo que hubiera).
         const [k] = await queryRunner.query(`select to_jsonb(ch) ->> 'chapter_kind' as kind from public.course_chapters ch where id = $1`, [chapterId]);
-        await setVideoPin(queryRunner, courseId, chapterId, k && k.kind === 'practice' ? null : dto.videoEnabled);
+        pinnedPractice = !!(k && k.kind === 'practice');
+        await setVideoPin(queryRunner, courseId, chapterId, pinnedPractice ? null : dto.videoEnabled);
       }
       // Review L83 M-2: un cambio de video SIN fijar (editor anterior, panel pedagógico) es el último valor que eligió
       // alguien: un valor fijado antes ya no manda.
       else if (dto.videoEnabled !== undefined) await setVideoPin(queryRunner, courseId, chapterId, null);
+      // LOOP 8.4 (review L84 I2): quitar todos los vínculos a mano es una decisión del docente (no se re-vincula solo).
+      if (dto.outcomeIds !== undefined) await setNoLinksDecision(queryRunner, courseId, chapterId, outcomeIds === null);
       await queryRunner.commitTransaction();
       return {
         structureVersionCounter: newCounter,
-        ...(dto.pinVideo === true && dto.videoEnabled !== undefined && dto.kind !== 'practice' ? { videoPinned: true } : {}),
+        ...(dto.pinVideo === true && dto.videoEnabled !== undefined && dto.kind !== 'practice' && !pinnedPractice ? { videoPinned: true } : {}),
         ...(nt ? { title: nt.title, titleNormalized: nt.changed } : {}),
         ...(description !== undefined ? { description } : {}),
         ...(outcomeIds !== undefined ? { outcomeIds } : {}),

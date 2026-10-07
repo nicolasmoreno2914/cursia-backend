@@ -9,11 +9,14 @@ import { loadCurrentAcademicContext } from '../academic-context/academic-db';
 import { loadCourseFacts } from '../course-facts/course-facts-db';
 import { isValidTargetHours } from '../study-time/target-hours';
 import { defaultApproachRegistry } from '../pedagogy/builtin-approaches';
-import { clearDesignPins, loadProposedHours, setProposedHours } from './design-pins';
+import { clearDesignPins, loadDesignPins, loadProposedHours, setProposedHours } from './design-pins';
 import { ApproachSuggestion, proposeTargetHours, recommendApproachFromFacts } from './design-recommendation';
 import { verifyDesign } from './design-verification';
 import { returningRows } from '../../common/db/returning-rows';
-import { suggestOutcomeLinks } from '../academic-context/context-design';
+import { LINK_CONTAINMENT_MIN, suggestOutcomeLinks } from '../academic-context/context-design';
+import type { AcademicContextV1 } from '../academic-context/academic-context';
+import { tokenContainment } from '../coherence/normalize';
+import { proposedChapterUuid } from '../pedagogy/dry-run';
 import { advanceStructureOriginIfUntouched } from '../course-structure/structure-authority';
 import { ConflictException } from '@nestjs/common';
 import { DesignAdjustDto, RecommendDesignDto } from './dto/recommend.dto';
@@ -114,6 +117,7 @@ export class CourseDesignService {
     const dr = await this.pedagogy.dryRunCourse(courseId, ownerId, { profile });
     const dist = dr.distribution;
     const chapterOutcomes = await this.chapterOutcomes(courseId);
+    const linkPlan = academic && dist ? await autoLinkPlan(this.dataSource, courseId, academic.context) : [];
     const savedComparable = saved ? JSON.stringify(normalizePedagogicalProfile(Object.fromEntries(Object.entries(saved.profile as any).filter(([k]) => k !== 'designRules')))) : null;
     const approachDef = profile.primaryApproach ? registry.get(profile.primaryApproach) : null;
     const providers = dist && dist.materialized ? dist.materialized.providers : null;
@@ -127,7 +131,15 @@ export class CourseDesignService {
         approach: profile.primaryApproach ? { id: profile.primaryApproach, label: approachDef ? approachDef.label : profile.primaryApproach } : null,
         policyKind: dist.policy ? dist.policy.kind : null, audiovisual: prefs.audiovisual || null, pinnedChapters,
         cost: providers && providers.estimateUsd ? providers.estimateUsd : null,
-        unlinkedChapters: dist.modules.reduce((n, m) => n + m.chapters.filter((c) => !c.proposed && !(chapterOutcomes.get(c.id) || []).length).length, 0),
+        preferences: { emphasis: prefs.emphasis || 'balanced', applicationActivities: prefs.applicationActivities || 'auto' },
+        autoLink: {
+          chapterIds: linkPlan.map((p) => p.chapterId),
+          outcomeIds: [...new Set(linkPlan.flatMap((p) => p.suggested))],
+          preview: linkPlan.map((p) => ({ chapter: p.title, outcomes: p.suggested })),
+        },
+        proposedChapterIds: dist.modules.flatMap((m) => m.chapters.filter((c) => c.proposed).map((c) => proposedChapterUuid(c.id))),
+        uncoveredContents: academic ? uncoveredUnitContents(academic.context, dist.modules) : [],
+        requiredEvaluations: academic ? academic.context.evaluation.map((e) => e.instrument).filter(Boolean) : [],
       })
       : null;
     return {
@@ -213,19 +225,16 @@ export class CourseDesignService {
         await qr.rollbackTransaction();
         throw new ConflictException({ code: 'STRUCTURE_CHANGED', message: 'STRUCTURE_CHANGED: la estructura cambió; vuelve a verla antes de corregir.' });
       }
-      const rows: { id: string; module_id: string; title: string; objective: string | null; description: string | null; outcome_ids: unknown }[] = await qr.query(
-        `select id, module_id, title, objective, description, to_jsonb(ch) -> 'outcome_ids' as outcome_ids from public.course_chapters ch where course_id = $1`,
-        [courseId],
-      );
-      const suggestions = suggestOutcomeLinks(academic.context, rows.map((r) => ({ id: r.id, moduleId: r.module_id, title: r.title, objective: r.objective, description: r.description, outcomeIds: Array.isArray(r.outcome_ids) && (r.outcome_ids as string[]).length ? (r.outcome_ids as string[]) : null })));
+      // La misma lista que mostró la verificación (dentro de la transacción: nada cambió desde el contador).
+      const plan = await autoLinkPlan(qr, courseId, academic.context);
       let linked = 0;
-      for (const s of suggestions) {
-        if (s.status !== 'inferred' || !s.suggested.length) continue;
+      const applied: { chapter: string; outcomes: string[] }[] = [];
+      for (const s of plan) {
         const res = await qr.query(
           `update public.course_chapters set outcome_ids = $1::jsonb, updated_at = now() where id = $2 and course_id = $3 and (outcome_ids is null or jsonb_array_length(outcome_ids) = 0) returning id`,
           [JSON.stringify(s.suggested), s.chapterId, courseId],
         );
-        if (returningRows(res).length) linked++;
+        if (returningRows(res).length) { linked++; applied.push({ chapter: s.title, outcomes: s.suggested }); }
       }
       let counter = expectedCounter;
       if (linked) {
@@ -234,7 +243,7 @@ export class CourseDesignService {
         await advanceStructureOriginIfUntouched(qr, courseId, expectedCounter, counter);
       }
       await qr.commitTransaction();
-      return { action, linkedChapters: linked, structureVersionCounter: counter };
+      return { action, linkedChapters: linked, applied, structureVersionCounter: counter };
     } catch (err) {
       if (qr.isTransactionActive) await qr.rollbackTransaction();
       throw err;
@@ -258,4 +267,39 @@ export class CourseDesignService {
     );
     return new Map(rows.map((r) => [r.id, Array.isArray(r.outcome_ids) ? (r.outcome_ids as string[]) : []]));
   }
+}
+
+type Q = { query: (sql: string, params?: unknown[]) => Promise<any> };
+
+/**
+ * LOOP 8.4 (review L84 C1/I1/I2) · Lo que la vinculación automática haría: capítulos de CONTENIDO existentes, sin
+ * vínculos propios, que el docente no desvinculó a propósito, y para los que hay una sugerencia. Lo usan la verificación
+ * (para ofrecer «Corregir» solo si resuelve algo, con vista previa) y la corrección (dentro de su transacción).
+ */
+export async function autoLinkPlan(q: Q, courseId: number, ctx: AcademicContextV1): Promise<{ chapterId: string; title: string; suggested: string[] }[]> {
+  const rows: { id: string; module_id: string; title: string; objective: string | null; description: string | null; outcome_ids: unknown; kind: string | null }[] = await q.query(
+    `select id, module_id, title, objective, description, to_jsonb(ch) -> 'outcome_ids' as outcome_ids, to_jsonb(ch) ->> 'chapter_kind' as kind
+       from public.course_chapters ch where course_id = $1`,
+    [courseId],
+  );
+  const pins = await loadDesignPins(q, courseId);
+  const candidates = rows.filter((r) => r.kind !== 'practice' && !(Array.isArray(r.outcome_ids) && r.outcome_ids.length) && !(pins[r.id] && pins[r.id].noLinks));
+  const byId = new Map(candidates.map((r) => [r.id, r]));
+  return suggestOutcomeLinks(ctx, candidates.map((r) => ({ id: r.id, moduleId: r.module_id, title: r.title, objective: r.objective, description: r.description, outcomeIds: null })))
+    .filter((s) => s.status === 'inferred' && s.suggested.length)
+    .map((s) => ({ chapterId: s.chapterId, title: byId.get(s.chapterId)!.title, suggested: s.suggested }));
+}
+
+/** Contenidos de las unidades del microcurrículo que ningún capítulo (ni su módulo) trabaja. Review L84 I5. */
+export function uncoveredUnitContents(ctx: AcademicContextV1, modules: { title: string; chapters: { title: string; objective?: string | null }[] }[]): string[] {
+  const chapterTexts = modules.flatMap((m) => m.chapters.map((c) => `${c.title} ${c.objective || ''}`));
+  const moduleTexts = modules.map((m) => [m.title, ...m.chapters.map((c) => `${c.title} ${c.objective || ''}`)].join(' '));
+  const out: string[] = [];
+  for (const u of ctx.units) {
+    for (const c of u.contents) {
+      const hit = chapterTexts.some((t) => tokenContainment(c.text, t) >= LINK_CONTAINMENT_MIN) || moduleTexts.some((t) => tokenContainment(c.text, t) >= LINK_CONTAINMENT_MIN);
+      if (!hit) out.push(c.text);
+    }
+  }
+  return out;
 }

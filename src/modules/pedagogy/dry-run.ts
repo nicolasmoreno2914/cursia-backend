@@ -391,7 +391,7 @@ export function distributionProposalSha256(dist: DistributionResult): string {
 }
 
 /** UUID v4 determinista para un capítulo propuesto (solo en el dry-run). */
-function proposedChapterUuid(id: string): string {
+export function proposedChapterUuid(id: string): string {
   const h = createHash('sha256').update(id, 'utf8').digest('hex');
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
 }

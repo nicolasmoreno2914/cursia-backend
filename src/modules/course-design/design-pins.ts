@@ -7,7 +7,7 @@
 type Q = { query(sql: string, params?: any[]): Promise<any> };
 
 export const DESIGN_PINS_KEY = 'designPins';
-export type DesignPinsMap = Record<string, { video?: boolean }>;
+export type DesignPinsMap = Record<string, { video?: boolean; noLinks?: boolean }>;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function parseDesignPins(v: unknown): DesignPinsMap {
@@ -16,7 +16,8 @@ export function parseDesignPins(v: unknown): DesignPinsMap {
   for (const [id, pin] of Object.entries(v as Record<string, unknown>)) {
     if (!UUID_RE.test(id) || !pin || typeof pin !== 'object') continue;
     const video = (pin as { video?: unknown }).video;
-    if (typeof video === 'boolean') out[id] = { video };
+    const noLinks = (pin as { noLinks?: unknown }).noLinks === true;
+    if (typeof video === 'boolean' || noLinks) out[id] = { ...(typeof video === 'boolean' ? { video } : {}), ...(noLinks ? { noLinks: true } : {}) };
   }
   return out;
 }
@@ -27,33 +28,50 @@ export async function loadDesignPins(q: Q, courseId: number): Promise<DesignPins
   return parseDesignPins(v);
 }
 
+async function writePin(q: Q, courseId: number, chapterId: string, mutate: (pin: { video?: boolean; noLinks?: boolean }) => void): Promise<void> {
+  const pins = await loadDesignPins(q, courseId);
+  const pin = { ...(pins[chapterId] || {}) };
+  mutate(pin);
+  if (pin.video === undefined) delete pin.video;
+  if (!pin.noLinks) delete pin.noLinks;
+  if (Object.keys(pin).length) {
+    await q.query(
+      `update public.courses set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), $2::text[],
+              coalesce(metadata -> '${DESIGN_PINS_KEY}', '{}'::jsonb) || jsonb_build_object($3::text, $4::jsonb), true)
+        where id = $1`,
+      [courseId, [DESIGN_PINS_KEY], chapterId, JSON.stringify(pin)],
+    );
+  } else {
+    await q.query(`update public.courses set metadata = coalesce(metadata, '{}'::jsonb) #- $2::text[] where id = $1`, [courseId, [DESIGN_PINS_KEY, chapterId]]);
+  }
+}
+
 /** Fija (boolean) o libera (null) el video de un capítulo, dentro de la transacción del llamador. */
 export async function setVideoPin(q: Q, courseId: number, chapterId: string, video: boolean | null): Promise<void> {
-  if (video === null) {
-    await q.query(
-      `update public.courses set metadata = coalesce(metadata, '{}'::jsonb) #- $2::text[] where id = $1`,
-      [courseId, [DESIGN_PINS_KEY, chapterId]],
-    );
-    return;
-  }
-  await q.query(
-    `update public.courses set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), $2::text[],
-            coalesce(metadata -> '${DESIGN_PINS_KEY}', '{}'::jsonb) || jsonb_build_object($3::text, jsonb_build_object('video', $4::boolean)), true)
-      where id = $1`,
-    [courseId, [DESIGN_PINS_KEY], chapterId, video],
-  );
+  await writePin(q, courseId, chapterId, (p) => { if (video === null) delete p.video; else p.video = video; });
+}
+
+/**
+ * LOOP 8.4 (review L84 I2) · El docente quitó A PROPÓSITO todos los vínculos de un capítulo: queda registrado y la
+ * vinculación automática de Cursia no lo vuelve a vincular. Vincular algo después borra la marca.
+ */
+export async function setNoLinksDecision(q: Q, courseId: number, chapterId: string, cleared: boolean): Promise<void> {
+  await writePin(q, courseId, chapterId, (p) => { if (cleared) p.noLinks = true; else delete p.noLinks; });
 }
 
 /** «Liberar»: todos los valores fijados vuelven a decidirlos Cursia. Devuelve cuántos había. */
 export async function clearDesignPins(q: Q, courseId: number): Promise<number> {
   const before = await loadDesignPins(q, courseId);
-  const ids = Object.keys(before);
+  const ids = Object.keys(before).filter((id) => typeof before[id].video === 'boolean');
   // Review L83-2 m5: se informan solo los que el diseño usaba (capítulos de contenido que existen); los huérfanos se
   // limpian igual.
   const live: { n: number }[] = ids.length
     ? await q.query(`select count(*)::int n from public.course_chapters ch where course_id = $1 and id = any($2::uuid[]) and coalesce(to_jsonb(ch) ->> 'chapter_kind', 'content') <> 'practice'`, [courseId, ids])
     : [{ n: 0 }];
-  await q.query(`update public.courses set metadata = coalesce(metadata, '{}'::jsonb) - '${DESIGN_PINS_KEY}' where id = $1`, [courseId]);
+  // «Liberar» devuelve el VIDEO a Cursia; las decisiones de vínculos del docente se conservan.
+  const keep: DesignPinsMap = {};
+  for (const [id, p] of Object.entries(before)) if (p.noLinks) keep[id] = { noLinks: true };
+  await q.query(`update public.courses set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), $2::text[], $3::jsonb, true) where id = $1`, [courseId, [DESIGN_PINS_KEY], JSON.stringify(keep)]);
   return live[0] ? Number(live[0].n) : 0;
 }
 

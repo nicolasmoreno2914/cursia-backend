@@ -10,6 +10,9 @@
  *   - auto: Cursia lo corrige sin tocar ninguna decisión del docente (p. ej. vincular resultados a capítulos SIN vínculos);
  *   - adjust: lleva a «Ajustar» con el control preciso; editor: al editor de estructura; understood: a «Lo que entendimos».
  * `blocking` = hay algo crítico: no se debe generar así (el paso 4 lo usa).
+ *
+ * Requisitos institucionales (plantillas, pesos mínimos de evaluación por institución): pendiente — Cuenta todavía no
+ * guarda requisitos de la institución; cuando existan, entran como otra área aquí.
  */
 
 export type CheckSeverity = 'ok' | 'info' | 'warning' | 'critical';
@@ -23,6 +26,8 @@ export interface CheckFix {
   label: string;
   /** adjust: valor sugerido para el control (p. ej. horas que dan los contenidos). */
   value?: unknown;
+  /** editor: dónde se resuelve (el editor abre ahí). */
+  targets?: { chapterIds?: string[]; moduleIds?: string[] };
 }
 
 export interface DesignCheck {
@@ -32,6 +37,8 @@ export interface DesignCheck {
   title: string;
   detail?: string;
   fix?: CheckFix;
+  /** Resumen de un área cuyos problemas ya se listan uno por uno: no suma en los contadores. */
+  summary?: true;
 }
 
 export interface DesignVerification {
@@ -44,7 +51,7 @@ export interface DesignVerification {
 interface AlignmentLike {
   available: boolean;
   outcomes?: { id: string; status: string; domain?: string }[];
-  findings?: { id: string; rule: string; severity: string; outcomeIds: string[]; chapterIds: string[]; message: string; suggestion: string }[];
+  findings?: { id: string; rule: string; severity: string; outcomeIds: string[]; chapterIds: string[]; moduleIds?: string[]; message: string; suggestion: string }[];
   coverage?: { outcomes: number; covered: number; partial: number; uncovered: number };
 }
 
@@ -62,25 +69,50 @@ export interface VerificationInput {
   audiovisual: 'less' | 'recommended' | 'more' | null;
   pinnedChapters: number;
   cost: { min: string; expected: string; max: string } | null;
-  /** Capítulos existentes sin vínculos propios (la corrección automática de vínculos solo toca esos). */
-  unlinkedChapters: number;
+  /** Preferencias vigentes (una corrección «Ajustar» solo se ofrece si cambia algo). */
+  preferences: { emphasis: string; applicationActivities: string };
+  /**
+   * Lo que la vinculación automática PUEDE hacer: capítulos de contenido existentes, sin vínculos, que el docente no
+   * desvinculó a propósito, y para los que hay una sugerencia (review L84 C1/I1/I2).
+   */
+  autoLink: { chapterIds: string[]; outcomeIds: string[]; preview: { chapter: string; outcomes: string[] }[] };
+  /** Ids (del Manifest) de los capítulos que propone el diseño y todavía no existen (review L84 I3). */
+  proposedChapterIds: string[];
+  /** Contenidos del microcurrículo que ningún capítulo trabaja (review L84 I5). */
+  uncoveredContents: string[];
+  /** Instrumentos de evaluación que pide el microcurrículo. */
+  requiredEvaluations: string[];
 }
 
+/** Máximo de horas de un curso (la meta válida va de 1 a 500). */
+const MAX_TARGET_HOURS = 500;
+
 const h1 = (n: number) => String(Math.round(n * 10) / 10).replace('.', ',');
+const usd = (s: string) => String(s).replace('.', ',');
+const list = (xs: string[], max = 3) => xs.slice(0, max).map((x) => `«${x}»`).join(', ') + (xs.length > max ? ` y ${xs.length - max} más` : '');
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 const AV_TEXT: Record<string, string> = { less: 'menos video', recommended: 'recomendado', more: 'más video' };
 
-/** Corrección de un hallazgo de la alineación (por regla). */
-function fixForRule(rule: string, unlinked: number): CheckFix | undefined {
-  // La vinculación automática solo une resultados de aprendizaje con capítulos sin vínculos; las competencias (A1c) se
-  // vinculan a mano (son transversales: el docente decide dónde se ponen en juego).
-  if ((rule === 'A1' || rule === 'A4') && unlinked > 0) return { kind: 'auto', action: 'link_outcomes', label: 'Vincular resultados y capítulos' };
-  if (rule === 'A1' || rule === 'A1c' || rule === 'A4') return { kind: 'editor', action: 'outcome_links', label: 'Vincular en el editor' };
-  if (rule === 'A2') return { kind: 'editor', action: 'module_exams', label: 'Activar la evaluación del módulo' };
-  if (rule === 'A3' || rule === 'A5') return { kind: 'adjust', action: 'emphasis', value: 'application', label: 'Más aplicación' };
-  if (rule === 'A6') return { kind: 'adjust', action: 'applicationActivities', value: 'auto', label: 'Actividades donde el diseño las necesite' };
-  if (rule === 'A7') return { kind: 'understood', action: 'outcomes', label: 'Redactar el resultado' };
-  if (rule === 'P2') return { kind: 'understood', action: 'learner', label: 'Indicar lo que ya sabe el estudiante' };
+type Finding = NonNullable<AlignmentLike['findings']>[number];
+
+/** Corrección de un hallazgo de la alineación: solo se ofrece la que de verdad lo resuelve. */
+function fixForFinding(f: Finding, input: VerificationInput): CheckFix | undefined {
+  const al = input.autoLink;
+  const editorAt = (label: string, action = 'outcome_links'): CheckFix => ({ kind: 'editor', action, label, targets: { chapterIds: f.chapterIds, moduleIds: f.moduleIds || [] } });
+  // La vinculación automática une resultados de aprendizaje con capítulos de contenido sin vínculos; las competencias
+  // (A1c) se vinculan a mano (son transversales: el docente decide dónde se ponen en juego).
+  if (f.rule === 'A1') return f.outcomeIds.some((id) => al.outcomeIds.includes(id)) ? { kind: 'auto', action: 'link_outcomes', label: 'Vincular automáticamente' } : editorAt('Vincular en el editor');
+  if (f.rule === 'A4') return f.chapterIds.some((id) => al.chapterIds.includes(id)) ? { kind: 'auto', action: 'link_outcomes', label: 'Vincular automáticamente' } : editorAt('Vincular en el editor');
+  if (f.rule === 'A1c') return editorAt('Vincular en el editor');
+  if (f.rule === 'A2') return editorAt('Activar la evaluación del módulo', 'module_exams');
+  if (f.rule === 'A3' || f.rule === 'A5') {
+    return input.preferences.emphasis !== 'application' ? { kind: 'adjust', action: 'emphasis', value: 'application', label: 'Más aplicación' } : editorAt('Agregar práctica en el editor', 'add_practice');
+  }
+  if (f.rule === 'A6') {
+    return input.preferences.applicationActivities !== 'auto' ? { kind: 'adjust', action: 'applicationActivities', value: 'auto', label: 'Actividades donde el diseño las necesite' } : editorAt('Agregar práctica en el editor', 'add_practice');
+  }
+  if (f.rule === 'A7') return { kind: 'understood', action: 'outcomes', label: 'Redactar el resultado' };
+  if (f.rule === 'P2') return { kind: 'understood', action: 'learner', label: 'Indicar lo que ya sabe el estudiante' };
   return undefined;
 }
 
@@ -91,15 +123,25 @@ export function verifyDesign(input: VerificationInput): DesignVerification {
 
   // Consistencia: el diseño se puede congelar tal cual (la tarjeta = el Manifest).
   if (input.manifestErrors.length) {
-    add({ id: 'consistency', area: 'consistency', severity: 'critical', title: 'El diseño no se puede preparar para generar', detail: input.manifestErrors.map((e) => e.code).join(', '), fix: { kind: 'editor', action: 'structure', label: 'Revisar la estructura' } });
+    add({ id: 'consistency', area: 'consistency', severity: 'critical', title: 'El diseño no se puede preparar para generar', detail: 'Hay algo en la estructura que impide armar el plan de generación: revísala en el editor.', fix: { kind: 'editor', action: 'structure', label: 'Revisar la estructura' } });
   }
 
   // Horas de trabajo del estudiante.
   const hoursTitle = `Carga horaria: ${h1(input.estimatedHours)} de ${h1(input.targetHours)} h de trabajo del estudiante`;
   if (input.status === 'within_tolerance') add({ id: 'hours', area: 'hours', severity: 'ok', title: hoursTitle });
-  else if (input.status === 'above_tolerance') add({ id: 'hours', area: 'hours', severity: 'warning', title: hoursTitle, detail: `Queda ${h1(input.estimatedHours - input.targetHours)} h por encima (tolerancia ±${h1(input.toleranceHours)} h).`, fix: { kind: 'adjust', action: 'targetHours', value: Math.ceil(input.estimatedHours), label: `Usar ${Math.ceil(input.estimatedHours)} h` } });
+  else if (input.status === 'above_tolerance') {
+    const up = Math.ceil(input.estimatedHours);
+    add({ id: 'hours', area: 'hours', severity: 'warning', title: hoursTitle, detail: `Queda ${h1(input.estimatedHours - input.targetHours)} h por encima (tolerancia ±${h1(input.toleranceHours)} h).`,
+      fix: up <= MAX_TARGET_HOURS ? { kind: 'adjust', action: 'targetHours', value: up, label: `Usar ${up} h` } : { kind: 'editor', action: 'structure', label: 'Quitar contenidos o dividir el curso' } });
+  }
   else if (input.status === 'cannot_reach_target') add({ id: 'hours', area: 'hours', severity: 'warning', title: hoursTitle, detail: 'Con los contenidos actuales no se llega sin rellenar: hacen falta más módulos o capítulos.', fix: { kind: 'editor', action: 'add_modules', label: 'Agregar módulos en el editor' } });
-  else add({ id: 'hours', area: 'hours', severity: 'critical', title: `Los contenidos ya suman ≈ ${h1(input.baseHours)} h, más que las ${h1(input.targetHours)} h pedidas`, detail: 'Cursia no recorta contenido por su cuenta.', fix: { kind: 'adjust', action: 'targetHours', value: Math.ceil(input.baseHours), label: `Diseñar para ${Math.ceil(input.baseHours)} h` } });
+  else {
+    // Review L84 I4 + m: la tarjeta ya ofrece «Diseñar para N h»; aquí solo la salida que la tarjeta no tiene cuando N > 500.
+    const need = Math.ceil(input.baseHours);
+    add({ id: 'hours', area: 'hours', severity: 'critical', title: `Los contenidos ya suman ≈ ${h1(input.baseHours)} h, más que las ${h1(input.targetHours)} h pedidas`,
+      detail: need <= MAX_TARGET_HOURS ? `Cursia no recorta contenido por su cuenta: diseña para ${need} h o quita contenidos.` : `Cursia no recorta contenido por su cuenta, y un curso admite hasta ${MAX_TARGET_HOURS} h: quita contenidos o divide el curso.`,
+      fix: need <= MAX_TARGET_HOURS ? { kind: 'adjust', action: 'targetHours', value: need, label: `Diseñar para ${need} h` } : { kind: 'editor', action: 'structure', label: 'Quitar contenidos o dividir el curso' } });
+  }
 
   // Resultados ↔ estructura (Coherence Engine).
   const al = input.alignment;
@@ -112,18 +154,31 @@ export function verifyDesign(input: VerificationInput): DesignVerification {
     const ra = outs.filter((o) => o.domain !== 'competency');
     const co = outs.filter((o) => o.domain === 'competency');
     const covered = (xs: typeof outs) => xs.filter((o) => o.status === 'covered').length;
-    const findings = al.findings || [];
+    // Review L84 I3: un capítulo que el diseño PROPONE todavía no existe: no se le puede pedir vínculos (se vinculan al aplicarlo).
+    const proposed = new Set(input.proposedChapterIds);
+    const findings = (al.findings || []).filter((f) => !(f.rule === 'A4' && f.chapterIds.length && f.chapterIds.every((id) => proposed.has(id))));
     const worst: CheckSeverity = findings.some((f) => f.severity === 'critical') ? 'critical' : findings.some((f) => f.severity === 'warning') ? 'warning' : 'ok';
     add({ id: 'outcomes', area: 'outcomes', severity: worst,
-      title: `${covered(ra)} de ${ra.length} resultados de aprendizaje con evidencia${co.length ? ` · ${covered(co)} de ${co.length} competencias` : ''}` });
-    for (const f of al.findings || []) {
+      title: `${covered(ra)} de ${ra.length} resultados de aprendizaje con evidencia${co.length ? ` · ${covered(co)} de ${co.length} competencias` : ''}`, ...(findings.length ? { summary: true as const } : {}) });
+    if (input.autoLink.preview.length) {
+      // Review L84 I2: lo que Cursia vincula, a la vista (y se aplica solo al usar el diseño).
+      add({ id: 'outcome_links', area: 'outcomes', severity: 'info', title: `Cursia vinculará ${plural(input.autoLink.preview.length, 'capítulo', 'capítulos')} con sus resultados al usar este diseño`,
+        detail: input.autoLink.preview.slice(0, 4).map((p) => `«${p.chapter}» → ${p.outcomes.join(', ')}`).join(' · ') + (input.autoLink.preview.length > 4 ? ` y ${input.autoLink.preview.length - 4} más` : ''),
+        fix: { kind: 'auto', action: 'link_outcomes', label: 'Vincular ahora' } });
+    }
+    for (const f of findings) {
       const severity: CheckSeverity = f.severity === 'critical' ? 'critical' : f.severity === 'warning' ? 'warning' : 'info';
-      add({ id: `alignment:${f.id}`, area: 'outcomes', severity, title: f.message, detail: f.suggestion, fix: fixForRule(f.rule, input.unlinkedChapters) });
+      add({ id: `alignment:${f.id}`, area: 'outcomes', severity, title: f.message, detail: f.suggestion, fix: fixForFinding(f, input) });
     }
   }
 
-  // Estructura.
-  add({ id: 'structure', area: 'structure', severity: k.modules > 0 && k.chapters > 0 ? 'ok' : 'critical', title: `${plural(k.modules, 'módulo', 'módulos')} y ${plural(k.chapters, 'capítulo', 'capítulos')}` });
+  // Estructura: hay módulos y capítulos, y cubre los contenidos del microcurrículo (review L84 I5).
+  if (!(k.modules > 0 && k.chapters > 0)) add({ id: 'structure', area: 'structure', severity: 'critical', title: 'El curso no tiene módulos con capítulos', fix: { kind: 'editor', action: 'structure', label: 'Armar la estructura' } });
+  else add({ id: 'structure', area: 'structure', severity: 'ok', title: `${plural(k.modules, 'módulo', 'módulos')} y ${plural(k.chapters, 'capítulo', 'capítulos')}` });
+  if (input.uncoveredContents.length) {
+    add({ id: 'contents', area: 'structure', severity: 'warning', title: `${plural(input.uncoveredContents.length, 'contenido del microcurrículo no aparece', 'contenidos del microcurrículo no aparecen')} en ningún capítulo`,
+      detail: list(input.uncoveredContents), fix: { kind: 'editor', action: 'add_chapter', label: 'Agregar en el editor' } });
+  }
   // Actividades interactivas.
   const noActivity = k.chapters - k.activities;
   add({ id: 'activities', area: 'activities', severity: noActivity > 0 ? 'info' : 'ok', title: noActivity > 0 ? `${plural(noActivity, 'capítulo sin actividad interactiva', 'capítulos sin actividad interactiva')}` : 'Todos los capítulos tienen actividad interactiva' });
@@ -133,19 +188,25 @@ export function verifyDesign(input: VerificationInput): DesignVerification {
   } else add({ id: 'practice', area: 'practice', severity: 'ok', title: k.practiceChapters ? plural(k.practiceChapters, 'capítulo de práctica', 'capítulos de práctica') : 'Sin capítulos de práctica (no hacen falta para estas horas)' });
   add({ id: 'application', area: 'activities', severity: 'ok', title: plural(k.applicationActivities, 'Actividad de Aplicación', 'Actividades de Aplicación') });
   // Audiovisual.
-  add({ id: 'audiovisual', area: 'audiovisual', severity: 'ok', title: `${plural(k.videoChapters, 'capítulo con video', 'capítulos con video')}${input.audiovisual ? ` (${AV_TEXT[input.audiovisual]})` : ''}`,
-    detail: input.pinnedChapters ? `${plural(input.pinnedChapters, 'capítulo fijado', 'capítulos fijados')} por ti: Cursia los respeta.` : undefined });
+  // Sin ningún video siendo «recomendado» o «más» solo puede venir de capítulos fijados sin video: se informa.
+  const noVideo = k.videoChapters === 0 && k.contentChapters > 0 && input.audiovisual !== 'less';
+  add({ id: 'audiovisual', area: 'audiovisual', severity: noVideo ? 'info' : 'ok', title: `${plural(k.videoChapters, 'capítulo con video', 'capítulos con video')}${input.audiovisual ? ` (${AV_TEXT[input.audiovisual]})` : ''}`,
+    detail: input.pinnedChapters ? `${plural(input.pinnedChapters, 'capítulo fijado', 'capítulos fijados')} por ti: Cursia los respeta.${noVideo ? ' Así, el curso queda sin video.' : ''}` : undefined });
   // Evaluaciones.
-  if (k.evaluations === 0) add({ id: 'evaluations', area: 'evaluations', severity: 'warning', title: 'El curso no tiene evaluaciones', detail: 'Sin evaluaciones no hay nota ni certificado de logro.', fix: { kind: 'editor', action: 'module_exams', label: 'Activar evaluaciones en el editor' } });
+  if (k.evaluations === 0) {
+    add({ id: 'evaluations', area: 'evaluations', severity: 'warning', title: 'El curso no tiene evaluaciones',
+      detail: input.requiredEvaluations.length ? `El microcurrículo pide evaluar con ${list(input.requiredEvaluations)}.` : 'Sin evaluaciones no hay nota ni certificado de logro.',
+      fix: { kind: 'editor', action: 'module_exams', label: 'Activar evaluaciones en el editor' } });
+  }
   else add({ id: 'evaluations', area: 'evaluations', severity: 'ok', title: plural(k.evaluations, 'evaluación', 'evaluaciones') });
   // Pedagogía.
   if (input.approach) add({ id: 'pedagogy', area: 'pedagogy', severity: 'ok', title: `Enfoque: ${input.approach.label}` });
   else add({ id: 'pedagogy', area: 'pedagogy', severity: 'warning', title: 'Sin enfoque pedagógico', detail: 'Cursia no encontró resultados para recomendar uno.', fix: { kind: 'adjust', action: 'approach', label: 'Elegir un enfoque' } });
   // Costo.
-  if (input.cost) add({ id: 'cost', area: 'cost', severity: 'ok', title: `Costo estimado de generar ≈ USD ${input.cost.expected} (entre ${input.cost.min} y ${input.cost.max})` });
+  if (input.cost) add({ id: 'cost', area: 'cost', severity: 'ok', title: `Costo estimado de generar ≈ USD ${usd(input.cost.expected)} (entre ${usd(input.cost.min)} y ${usd(input.cost.max)})` });
   else add({ id: 'cost', area: 'cost', severity: 'warning', title: 'No pudimos estimar el costo de generar este diseño', fix: { kind: 'editor', action: 'structure', label: 'Revisar la estructura' } });
 
   const counts: Record<CheckSeverity, number> = { ok: 0, info: 0, warning: 0, critical: 0 };
-  for (const c of checks) counts[c.severity]++;
+  for (const c of checks) if (!c.summary) counts[c.severity]++;
   return { verificationVersion: 1, checks, counts, blocking: counts.critical > 0 };
 }
