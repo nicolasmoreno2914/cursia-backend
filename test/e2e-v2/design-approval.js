@@ -14,7 +14,8 @@ function pendingOf(card) {
   return Math.max((d.changes || []).length, proposed);
 }
 const approvable = (card, allowCritical) => !!(card && card.design && card.verification && card.design.applicable === true && (allowCritical || !card.verification.blocking) && pendingOf(card) === 0);
-const halfStep = (n) => Math.min(500, Math.max(1, Math.round(Number(n) * 2) / 2));
+// Hacia ARRIBA: unas horas por debajo de lo que ya suman los contenidos serían un crítico («ya suman más de lo pedido»).
+const halfStepUp = (n) => Math.min(500, Math.max(1, Math.ceil(Number(n) * 2) / 2));
 
 /**
  * @param api  (method, path, body) → { status, data, error } (el cliente HTTP del escenario)
@@ -48,7 +49,7 @@ async function keepTeacherDesign(api, courseId, label, opts = {}) {
   const pinnedCard = await rec();
   let targetHours = null;
   if (!approvable(pinnedCard, opts.allowCritical)) {
-    targetHours = halfStep(pinnedCard.design.baseHours);
+    targetHours = halfStepUp(pinnedCard.design.baseHours);
     const cur = await api('GET', `/courses/${courseId}/profiles/pedagogy`);
     const base = cur.status === 200 && cur.data && cur.data.profile ? cur.data.profile : {};
     const version = cur.status === 200 && cur.data && !cur.data.isDefault ? Number(cur.data.version) : 0;

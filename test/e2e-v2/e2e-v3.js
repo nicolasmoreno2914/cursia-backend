@@ -1020,7 +1020,10 @@ function reservationBookkeeping(ev) {
       ok(snap && snap.modules.every((m) => m.design && m.chapters.every((x) => x.design && x.design.sequence.length > 5)), 'E6: design en cada módulo y capítulo del Blueprint');
       const M = c.manifest.manifest;
       ok(M.features.pedagogy && M.features.pedagogy.engineVersion === 1, 'E6: Manifest con features.pedagogy', M.features);
-      eq(MB.validateGenerationManifestV3(M, PED.applyPedagogyToSnapshot(snap, PED.deriveDesignRules(pedagogy)), M.source), [], 'E6: el Manifest guardado valida contra el diseño recalculado del perfil');
+      // R68: el perfil congelado es el del escenario + las horas que eligió el docente para conservar su estructura.
+      const savedPed = (await api('GET', `/courses/${c.courseId}/profiles/pedagogy`)).data.profile;
+      const frozenPed = typeof savedPed.targetHours === 'number' ? { ...pedagogy, targetHours: savedPed.targetHours } : pedagogy;
+      eq(MB.validateGenerationManifestV3(M, PED.applyPedagogyToSnapshot(snap, PED.deriveDesignRules(frozenPed)), M.source), [], 'E6: el Manifest guardado valida contra el diseño recalculado del perfil');
       eq(bp && bp.sha256, M.source.blueprintSha256, 'E6: el Manifest apunta al Blueprint con diseño');
       const acts = M.items.filter((i) => i.type === 'activity');
       // significativo (0,6) + experiencial (0,4): tipos preferidos [arrastrar, preguntas, …]; «Explicar…» (objetivo) elige preguntas dentro del top-2.
@@ -1729,6 +1732,9 @@ function reservationBookkeeping(ev) {
       ok([200, 201].includes(ap.status), 'E11: «Aplicar diseño» → estructura con práctica y Actividades de Aplicación', { s: ap.status, e: ap.error });
 
       // 7. Blueprint + Manifest congelados = lo que mostró la vista previa (preview = generación).
+      // R68: E11 usa los endpoints de diseño de siempre (la vista previa con «Ajustar» no guarda el perfil): el docente
+      // conserva el diseño aplicado antes de aprobarlo (sin cambios si ya coincide).
+      await keepTeacherDesign(api, courseId, 'E11');
       st = await readStructure(courseId);
       const lock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st.structureVersionCounter });
       ok(lock.status === 201, 'E11: lock → Blueprint', { s: lock.status, e: lock.error });
@@ -2016,7 +2022,7 @@ function reservationBookkeeping(ev) {
 
     // ═══ R68 (piloto) · E18 — el SERVIDOR no genera un diseño sin verificación aprobable (API directa, sin la interfaz) ═══
     if (RUN_E5) await step('v3-E18-r68-bloqueo-servidor', async () => {
-      const mkCourse = async (title, docText) => {
+      const mkCourse = async (title, docText, videos = true) => {
         const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title });
         const courseId = Number(cr.data.id);
         let counter = 0;
@@ -2027,7 +2033,7 @@ function reservationBookkeeping(ev) {
           const mid = m.data.module.id;
           const auto = m.data.module.chapters || [];
           for (let ci = 0; ci < 2; ci++) {
-            const body = { title: `Tema ${mi + 1}.${ci + 1} del bloqueo de energía`, objective: `Aplicar el paso ${ci + 1} del bloqueo y etiquetado`, videoEnabled: ci === 0, expectedCounter: counter };
+            const body = { title: `Tema ${mi + 1}.${ci + 1} del bloqueo de energía`, objective: `Aplicar el paso ${ci + 1} del bloqueo y etiquetado`, videoEnabled: videos && ci === 0, expectedCounter: counter };
             const c = ci === 0 && auto.length === 1
               ? await api('PATCH', `/courses/${courseId}/modules/${mid}/chapters/${auto[0].id}`, body)
               : await api('POST', `/courses/${courseId}/modules/${mid}/chapters`, body);
@@ -2063,25 +2069,27 @@ function reservationBookkeeping(ev) {
       };
       const runsBase = (id, n) => `/courses/${id}/blueprints/${n}/manifest/runs`;
 
-      // A · Verificación con un crítico (el documento pide 3 módulos; la estructura tiene 2 y Cursia no agrega módulos).
-      const cA = await mkCourse('[E2E R68 E18-A] Crítico', 'El curso tendrá 3 módulos.');
+      // A · Verificación con un crítico que el docente no puede resolver con su estructura: el documento pide dos videos por
+      // capítulo (Cursia produce uno). (Una estructura del docente distinta de la del documento es SU excepción, no un crítico.)
+      const cA = await mkCourse('[E2E R68 E18-A] Crítico', 'Cada capítulo tendrá 2 videos.');
       await keepTeacherDesign(api, cA, 'E18-A', { allowCritical: true });
       const recA = await api('POST', `/courses/${cA}/design/recommendation`, {});
-      ok(recA.data.verification.blocking === true, 'E18-A: Verificación tiene un crítico (3 módulos pedidos, 2 en el diseño)', recA.data.verification.checks.filter((c) => c.severity === 'critical').map((c) => c.title));
+      ok(recA.data.verification.blocking === true, 'E18-A: Verificación tiene un crítico (2 videos por capítulo)', recA.data.verification.checks.filter((c) => c.severity === 'critical').map((c) => c.title));
       const nA = await lockAndManifest(cA);
       const rA = await api('POST', runsBase(cA, nA), ctx);
       expect409(rA, 'critical', 'POST runs (API directa) con un crítico');
-      ok(Array.isArray(rA.raw && rA.raw.criticals) && rA.raw.criticals.some((c) => /módulos/i.test(c.title)), 'E18-A: la respuesta lista el crítico', rA.raw && rA.raw.criticals);
+      ok(Array.isArray(rA.raw && rA.raw.criticals) && rA.raw.criticals.some((c) => /video/i.test(c.title)), 'E18-A: la respuesta lista el crítico', rA.raw && rA.raw.criticals);
       expect409(await api('POST', `${runsBase(cA, nA)}/estimate-preview`, ctx), 'critical', 'estimate-preview con un crítico');
       expect409(await api('POST', `${runsBase(cA, nA)}/approve-and-start`, { ...ctx, estimateHash: 'a'.repeat(64) }), 'critical', 'approve-and-start con un crítico');
 
       // B · Cambios recomendados sin aplicar (la estructura armada a mano, sin «Usar este diseño» ni decisiones del docente).
-      const cB = await mkCourse('[E2E R68 E18-B] Sin aplicar', null);
+      const cB = await mkCourse('[E2E R68 E18-B] Sin aplicar', null, false);
       const nB = await lockAndManifest(cB);
       expect409(await api('POST', runsBase(cB, nB), ctx), 'pending_changes', 'POST runs con cambios sin aplicar');
 
       // C · Diseño verificado → pasa; después: estructura cambiada, Blueprint viejo.
-      const cC = await mkCourse('[E2E R68 E18-C] Verificado', null);
+      // Sin videos: el gate pasa y la generación (mock) no necesita la entrega por YouTube de los cursos con video.
+      const cC = await mkCourse('[E2E R68 E18-C] Verificado', null, false);
       await keepTeacherDesign(api, cC, 'E18-C');
       const nC = await lockAndManifest(cC);
       const pv = await api('POST', `${runsBase(cC, nC)}/estimate-preview`, ctx);
