@@ -134,6 +134,7 @@ const DYNAMIC_CONTROLLER_CLASS_NAMES = new Set([
   'AdminDynamicRunsController', // EV6 DoD BE-B: GET /admin/dynamic-runs/needs-attention (SUPER_ADMIN)
   'AcademicContextController', // Fase 3: /courses/:id/academic-context/{extract,design}
   'ChangeImpactController', // Fase 5: POST /courses/:id/change-impact
+  'CourseFactsController', // LOOP 8.1: /courses/:id/brief y /courses/:id/facts (fuente única)
 ]);
 /**
  * Todo lo demás: legacy sin ninguna ruta dynamic, EXCEPTO CoursesController

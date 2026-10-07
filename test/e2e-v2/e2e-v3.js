@@ -253,6 +253,12 @@ async function waitItemsDone(runId, timeoutMs = 10 * 60 * 1000) {
 }
 
 /** Crea el curso por HTTP (estructura, toggles v3, perfiles), bloquea el Blueprint y crea el Manifest v3. */
+/** LOOP 8.1: versión vigente del perfil pedagógico (guardar el contexto académico lo deriva y sube la versión). */
+async function pedagogyVersion(courseId) {
+  const r = await api('GET', `/courses/${courseId}/profiles/pedagogy`);
+  return r.status === 200 && r.data ? Number(r.data.version) : 0;
+}
+
 async function createCourse(C, llm) {
   const fc = crypto.randomUUID();
   const c = await api('POST', '/courses/dynamic', { frontendCourseId: fc, title: C.title });
@@ -322,7 +328,8 @@ async function createCourse(C, llm) {
   ok(pp.status === 201, `${C.key}: POST profiles/presentation (${C.theme.themeFamily}/${C.theme.mode}) → 201`, { s: pp.status, e: pp.error });
   // Motor pedagógico V1 (E6): perfil pedagógico ANTES del lock (el lock lo congela en el Blueprint).
   if (C.pedagogy) {
-    const pg = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: C.pedagogy, expectedVersion: 0 });
+    // LOOP 8.1: con contexto académico guardado, el perfil ya se derivó (versión 1): se guarda sobre la vigente, como el panel.
+    const pg = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: C.pedagogy, expectedVersion: await pedagogyVersion(courseId) });
     ok(pg.status === 201 && pg.data.profile.designRules && pg.data.profile.designRules.engineVersion === 1, `${C.key}: POST profiles/pedagogy (${C.pedagogy.primaryApproach}) → 201 con reglas del servidor`, { s: pg.status, e: pg.error });
   }
   const lock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st.structureVersionCounter });
@@ -1292,7 +1299,10 @@ function reservationBookkeeping(ev) {
       eq([prop.counts.modules, prop.counts.chapters, prop.counts.outcomesCovered], [5, 18, 6], 'E8: estructura propuesta 5 × 18 con los 6 RA vinculados');
       // 4. Perfil pedagógico desde el contexto (+ el enfoque que elige el docente)
       const profile = { ...sug.profile, primaryApproach: 'problemas', secondaryApproaches: [] };
-      const pg = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: profile, expectedVersion: 0 });
+      // LOOP 8.1: guardar el contexto ya derivó el perfil (64 h y resultados); el docente elige el enfoque sobre la versión vigente.
+      const pv = await api('GET', `/courses/${courseId}/profiles/pedagogy`);
+      ok(pv.status === 200 && pv.data.version === 1 && pv.data.profile.targetHours === 64 && pv.data.derivedFromAcademic && pv.data.derivedFromAcademic.untouched === true, 'E8: guardar el contexto derivó el perfil (64 h y resultados del documento)', { s: pv.status, v: pv.data && pv.data.version });
+      const pg = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: profile, expectedVersion: pv.data.version });
       ok(pg.status === 201 && pg.data.profile.profile.targetHours === 64, 'E8: perfil pedagógico guardado con las 64 h y los resultados del documento', { s: pg.status, e: pg.error });
       // 5. Estructura desde el microcurrículo (lo que hace el panel con la vía de 48), con descripción y vínculos
       st = await readStructure(courseId);
@@ -1580,7 +1590,7 @@ function reservationBookkeeping(ev) {
 
       // 3. Enfoque (el docente lo elige sobre la sugerencia del contexto) + 64 h.
       const profile1 = { ...dz.profileSuggestion.profile, primaryApproach: 'competencias', secondaryApproaches: [], targetHours: 64 };
-      const pg1 = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: profile1, expectedVersion: 0 });
+      const pg1 = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: profile1, expectedVersion: await pedagogyVersion(courseId) });
       ok(pg1.status === 201, 'E11: enfoque competencias + 64 h guardados', { s: pg1.status, e: pg1.error });
 
       // 4. «Cursia recomienda»: cada número sale del diseño materializado (Manifest), nunca de otra cuenta.
@@ -1601,7 +1611,7 @@ function reservationBookkeeping(ev) {
 
       // 5. Ajustar (énfasis en profundidad) → nuevo diseño, distinto, con la misma garantía.
       const profile2 = { ...profile1, designPreferences: { emphasis: 'depth' } };
-      const pg2 = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: profile2, expectedVersion: 1 });
+      const pg2 = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: profile2, expectedVersion: pg1.data.profile.version });
       ok(pg2.status === 201, 'E11: «Ajustar» guardado (énfasis profundidad)', { s: pg2.status, e: pg2.error });
       const dr2 = await api('POST', `/courses/${courseId}/pedagogy/dry-run`, {});
       const d2 = card(dr2.data);
@@ -1784,6 +1794,43 @@ function reservationBookkeeping(ev) {
       st = await readStructure(courseId);
       ok(pm.status === 200 && st.structureAuthority.source === 'academic_context' && st.structureAuthority.untouched === true, 'E12: un PATCH del curso no cambia el origen de la estructura', { s: pm.status, a: st.structureAuthority });
       results.courses.E12 = { courseId, modules: prop.counts.modules, chapters: prop.counts.chapters };
+    }, { fatal: false });
+
+    // ═══ LOOP 8.1 · E13 — una sola fuente de verdad + cargador único, por HTTP real (USD 0, sin proveedores).
+    if (RUN_E5) await step('v3-E13-fuente-unica', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: '[E2E E13] Contabilidad de Costos' });
+      ok(cr.status === 201, 'E13: curso dinámico creado', { s: cr.status, e: cr.error });
+      const courseId = Number(cr.data.id);
+      const brief = { nombre: 'Contabilidad de Costos', obj: 'Calcular y controlar los costos de producción', sector: 'Contabilidad', pais: 'Colombia', contexto: 'Técnico / Tecnólogo — formación técnica', nivel: 'Básico — sin conocimientos previos' };
+      const bad = await api('PUT', `/courses/${courseId}/brief`, { ...brief, obj: 'x'.repeat(601) });
+      ok(bad.status === 400, 'E13: pedido inválido → 400 (DTO)', { s: bad.status });
+      const pb = await api('PUT', `/courses/${courseId}/brief`, brief);
+      ok(pb.status === 200 && pb.data.changed === true && pb.data.brief.fields.sector === 'Contabilidad', 'E13: PUT brief guarda lo que dijo el usuario', { s: pb.status, e: pb.error });
+      const gb = await api('GET', `/courses/${courseId}/brief`);
+      ok(gb.status === 200 && gb.data.brief.fields.obj === brief.obj, 'E13: GET brief', { s: gb.status });
+      let f = await api('GET', `/courses/${courseId}/facts`);
+      ok(f.status === 200 && f.data.topic.source === 'user' && f.data.educationLevel.value === 'technical' && f.data.document.present === false, 'E13: «Lo que sabemos» desde el pedido', { s: f.status, d: f.data && f.data.topic });
+      // Cargador único: extracción gratuita con calidad; lectura avanzada apagada en el gate (USD 0).
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo.docx', dataBase64: (await AF.fixture('consistent', 'docx')).toString('base64') }] });
+      ok(ex.status === 200 && ex.data.quality && ex.data.quality.sufficient === true && ex.data.quality.advancedAvailable === false, 'E13: la extracción gratuita informa su calidad', { s: ex.status, q: ex.data && ex.data.quality });
+      const pdf = (await AF.fixture('consistent', 'pdf')).toString('base64');
+      const est = await api('POST', `/courses/${courseId}/academic-context/extract-advanced`, { files: [{ name: 'micro.pdf', dataBase64: pdf }], mode: 'estimate' });
+      ok(est.status === 200 && est.data.available === false && est.data.providersCalled === 0 && est.data.estimateUsd.max > 0, 'E13: lectura avanzada: estimación sin proveedor (apagada en este entorno)', { s: est.status, e: est.error });
+      const run = await api('POST', `/courses/${courseId}/academic-context/extract-advanced`, { files: [{ name: 'micro.pdf', dataBase64: pdf }], mode: 'run', acceptedMaxUsd: 99 });
+      ok(run.status === 409 && /^ADVANCED_DISABLED/.test(String(run.error)), 'E13: apagada → 409 ADVANCED_DISABLED (nunca llama al proveedor)', { s: run.status, e: run.error });
+      // Guardar el contexto deriva el perfil pedagógico solo (sin «Usar en el perfil»).
+      const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 });
+      ok(sv.status === 201 && sv.data.derivedPedagogy && sv.data.derivedPedagogy.applied === true, 'E13: guardar el contexto deriva el perfil pedagógico', { s: sv.status, d: sv.data && sv.data.derivedPedagogy });
+      const pg = await api('GET', `/courses/${courseId}/profiles/pedagogy`);
+      ok(pg.status === 200 && pg.data.profile.targetHours === 64 && pg.data.derivedFromAcademic && pg.data.derivedFromAcademic.untouched === true, 'E13: perfil con las 64 h del documento, marcado como derivado', { s: pg.status, d: pg.data && pg.data.derivedFromAcademic });
+      f = await api('GET', `/courses/${courseId}/facts`);
+      ok(f.status === 200 && f.data.outcomes.source === 'document' && f.data.targetHours.value === 64 && f.data.pedagogy.derivedFromDocument === true, 'E13: «Lo que sabemos» con el documento como dueño', { d: f.data && { o: f.data.outcomes.source, h: f.data.targetHours } });
+      // Las claves de la fuente única no se pisan con un PATCH del curso.
+      const pm = await api('PATCH', `/courses/${courseId}`, { metadata: { brief: { briefVersion: 1, fields: { obj: 'pisado' } } } });
+      const gb2 = await api('GET', `/courses/${courseId}/brief`);
+      ok(pm.status === 200 && gb2.data.brief.fields.obj === brief.obj, 'E13: un PATCH del curso no pisa el pedido', { s: pm.status });
+      results.courses.E13 = { courseId };
     }, { fatal: false });
 
     // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══

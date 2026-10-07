@@ -1,4 +1,5 @@
 import { STRUCTURE_ORIGIN_KEY } from '../course-structure/structure-authority';
+import { BRIEF_KEY, PEDAGOGY_DERIVATION_KEY } from '../course-facts/course-facts';
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -8,6 +9,9 @@ import { UpdateCourseDto } from './dto/update-course.dto';
 import { AdminDashboardService } from '../../admin/services/admin-dashboard.service';
 import { assertDynamicCreationAllowed, assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import { readActivityTypeRulesConfig } from '../generation-manifests/manifest-rules-config';
+
+/** LOOP 8.0/8.1: claves de courses.metadata que solo escriben sus servicios. */
+const PROTECTED_METADATA_KEYS = [STRUCTURE_ORIGIN_KEY, BRIEF_KEY, PEDAGOGY_DERIVATION_KEY];
 
 /**
  * EV6 H5P v2 (H2 fix round 1, I-2): «Repaso» (Dialog Cards) arranca ENCENDIDO solo en cursos
@@ -199,17 +203,24 @@ export class CoursesService {
   ): Promise<Course> {
     // findOne ya valida ownership → 404 si no es del usuario
     const course = await this.findOne(id, ownerId);
-    // LOOP 8.0 (review L80 M1): el origen de la estructura (metadata.structureOrigin) lo escribe solo el backend de la
-    // estructura; un PATCH del curso nunca lo cambia ni lo borra.
-    if (dto.metadata !== undefined) {
-      const keep = course.metadata ? course.metadata[STRUCTURE_ORIGIN_KEY] : undefined;
-      const next: Record<string, any> = { ...(dto.metadata || {}) };
-      delete next[STRUCTURE_ORIGIN_KEY];
-      if (keep !== undefined) next[STRUCTURE_ORIGIN_KEY] = keep;
-      dto = { ...dto, metadata: next };
+    // LOOP 8.0 (review L80 M1) + LOOP 8.1: las claves de la fuente única (origen de la estructura, pedido del curso,
+    // derivación del perfil) las escriben solo sus servicios; un PATCH del curso nunca las cambia ni las borra.
+    // Review L81 M2: la mezcla se hace en SQL, en una sola sentencia, con las claves protegidas leídas AL ESCRIBIR (un
+    // PUT /brief o una derivación que se confirma entre la lectura y la escritura nunca se revierte).
+    const { metadata, ...rest } = dto as UpdateCourseDto & { metadata?: Record<string, any> };
+    // update() parcial: solo las columnas enviadas (save() reescribiría el metadata leído antes, ya viejo).
+    if (Object.keys(rest).length) await this.courseRepo.update({ id: course.id }, rest as any);
+    if (metadata !== undefined) {
+      const next: Record<string, any> = { ...(metadata || {}) };
+      for (const key of PROTECTED_METADATA_KEYS) delete next[key];
+      await this.courseRepo.query(
+        `update public.courses
+            set metadata = $2::jsonb || coalesce((select jsonb_object_agg(k, v) from jsonb_each(coalesce(metadata, '{}'::jsonb)) as e(k, v) where k = any($3::text[])), '{}'::jsonb)
+          where id = $1`,
+        [id, JSON.stringify(next), PROTECTED_METADATA_KEYS],
+      );
     }
-    Object.assign(course, dto);
-    return this.courseRepo.save(course);
+    return this.findOne(id, ownerId);
   }
 
   // ── REMOVE ────────────────────────────────────────────────────────────────

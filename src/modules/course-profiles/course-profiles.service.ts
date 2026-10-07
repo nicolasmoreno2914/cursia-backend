@@ -1,4 +1,8 @@
 import { returningRows } from '../../common/db/returning-rows';
+import { DERIVED_FIELDS, DerivedField, FieldOwner, PEDAGOGY_DERIVATION_KEY, mergeDerivedProfile, parsePedagogyDerivation, pedagogyFieldOwners } from '../course-facts/course-facts';
+import { loadCurrentAcademicContext } from '../academic-context/academic-db';
+import { suggestProfileFromContext } from '../academic-context/context-design';
+import type { PedagogicalProfile } from '../pedagogy/pedagogy-profile';
 import { advanceStructureOriginIfUntouched } from '../course-structure/structure-authority';
 import {
   BadRequestException,
@@ -29,6 +33,16 @@ import { emptyPedagogicalProfile } from '../pedagogy/pedagogy-profile';
 import { AcademicContextV1, emptyAcademicContext } from '../academic-context/academic-context';
 import { AcademicValidation, validateAcademicContext } from '../academic-context/validate';
 
+export interface PedagogyDerivationResult {
+  applied: boolean;
+  reason: 'derived' | 'no_changes' | 'invalid';
+  version?: number;
+  /** Datos del perfil que se actualizaron con el documento. */
+  changes?: DerivedField[];
+  /** Datos que decidió el docente, distintos del documento: se respetaron. */
+  kept?: DerivedField[];
+}
+
 export interface CourseProfileDto {
   courseId: number;
   kind: ProfileKind;
@@ -51,6 +65,8 @@ export interface CourseProfileDto {
    * es aula-clara/light. `null` en un perfil guardado o de evaluación.
    */
   defaultSource: PresentationDefaultSource | null;
+  /** LOOP 8.1 — solo `pedagogy`: de qué versión del contexto salieron estudiante/resultados/horas y si siguen intactos. */
+  derivedFromAcademic?: { academicVersion: number; untouched: boolean; owners: Record<DerivedField, FieldOwner> };
   /**
    * Motor pedagógico V1 — solo `pedagogy`: reglas de diseño derivadas del perfil (recalculadas en
    * cada lectura con el motor vigente; null si el perfil está vacío). `rulesStale` = la versión
@@ -188,7 +204,19 @@ export class CourseProfilesService {
         createdAt: null, createdBy: null, warnings: [], defaultSource: null,
       };
     }
-    return this.toDto(row, finalExam);
+    const dto = this.toDto(row, finalExam);
+    if (kind === 'pedagogy') {
+      // LOOP 8.1: ¿los campos del documento (estudiante, resultados, horas) siguen como Cursia los derivó?
+      const [c] = await this.dataSource.query(`select metadata -> 'pedagogyDerivation' as d from public.courses where id = $1`, [courseId]);
+      const record = parsePedagogyDerivation(c ? (typeof c.d === 'string' ? JSON.parse(c.d) : c.d) : null);
+      const academic = record ? await loadCurrentAcademicContext(this.dataSource, courseId).catch(() => null) : null;
+      if (record && academic) {
+        const suggested = suggestProfileFromContext(academic.context, null).profile;
+        const owners = pedagogyFieldOwners(dto.profile as PedagogicalProfile, record, suggested);
+        return { ...dto, derivedFromAcademic: { academicVersion: record.academicVersion, untouched: !DERIVED_FIELDS.some((f) => owners[f] === 'user'), owners } };
+      }
+    }
+    return dto;
   }
 
   async append(
@@ -197,7 +225,7 @@ export class CourseProfilesService {
     kind: string,
     data: unknown,
     expectedVersion?: number,
-  ): Promise<{ created: boolean; profile: CourseProfileDto; prunedOutcomeLinks?: { chapterId: string; removed: string[] }[] }> {
+  ): Promise<{ created: boolean; profile: CourseProfileDto; prunedOutcomeLinks?: { chapterId: string; removed: string[] }[]; derivedPedagogy?: PedagogyDerivationResult }> {
     assertDynamicOwnerAllowed(ownerId); // allow-list V2 en toda escritura
     this.assertKind(kind);
     await this.loadCourse(courseId, ownerId);
@@ -257,8 +285,23 @@ export class CourseProfilesService {
       // roto (y el lock fallaría). En la MISMA transacción se quitan de los capítulos los ids que la versión nueva no
       // define; si cambió alguno, sube el counter de la estructura (las pestañas abiertas releen).
       const pruned = kind === 'academic' ? await this.pruneStaleOutcomeLinks(qr, courseId, profile as AcademicContextV1) : [];
+      // LOOP 8.1: el documento es dueño del estudiante, los resultados y las horas del perfil pedagógico. Se derivan
+      // EN LA MISMA transacción (sin botón «Usar en el perfil»), salvo que el docente los haya cambiado a mano.
+      // Review L81 I1c: un dato igual a lo que proponía la versión ANTERIOR del documento también es del documento
+      // (perfiles anteriores a 8.1 que usaron «Usar en el perfil»).
+      const previousContext = kind === 'academic' && latest
+        ? (normalizeProfile('academic', typeof latest.data === 'string' ? JSON.parse(latest.data) : latest.data) as AcademicContextV1)
+        : null;
+      const derivedPedagogy = kind === 'academic'
+        ? await this.derivePedagogyFromAcademic(qr, courseId, ownerId, profile as AcademicContextV1, currentVersion + 1, finalExam, [], previousContext)
+        : undefined;
       await qr.commitTransaction();
-      return { created: true, profile: this.toDto(row, finalExam), ...(pruned.length ? { prunedOutcomeLinks: pruned } : {}) };
+      return {
+        created: true,
+        profile: this.toDto(row, finalExam),
+        ...(pruned.length ? { prunedOutcomeLinks: pruned } : {}),
+        ...(derivedPedagogy ? { derivedPedagogy } : {}),
+      };
     } catch (err) {
       if (qr.isTransactionActive) await qr.rollbackTransaction();
       if (isVersionConflict(err)) {
@@ -270,6 +313,96 @@ export class CourseProfilesService {
           `Este entorno todavía no admite perfiles "${kind}" (falta la migración ${KIND_MIGRATION[kind] ?? 'de perfiles'}).`,
         );
       }
+      throw err;
+    } finally {
+      await qr.release();
+    }
+  }
+
+  /**
+   * LOOP 8.1 · Perfil pedagógico derivado del contexto académico (antes: botón «Usar en el perfil»). Conserva enfoque,
+   * preferencias y todo lo que no viene del documento. Solo reescribe los campos del documento si siguen como Cursia
+   * los dejó (o vacíos); si el docente los cambió a mano, no se tocan y «Lo que sabemos del curso» informa el conflicto.
+   */
+  private async derivePedagogyFromAcademic(
+    qr: QueryRunner,
+    courseId: number,
+    ownerId: string,
+    ctx: AcademicContextV1,
+    academicVersion: number,
+    finalExam: boolean,
+    force: readonly DerivedField[] = [],
+    previousContext: AcademicContextV1 | null = null,
+  ): Promise<PedagogyDerivationResult> {
+    const [latest] = await qr.query(
+      `select * from public.course_profiles where course_id = $1 and kind = 'pedagogy' order by version desc limit 1`,
+      [courseId],
+    );
+    const current = latest
+      ? (normalizeProfile('pedagogy', typeof latest.data === 'string' ? JSON.parse(latest.data) : latest.data) as PedagogicalProfile)
+      : (normalizeProfile('pedagogy', emptyPedagogicalProfile()) as PedagogicalProfile);
+    const [c] = await qr.query(`select metadata -> 'pedagogyDerivation' as d from public.courses where id = $1`, [courseId]);
+    const record = parsePedagogyDerivation(c ? (typeof c.d === 'string' ? JSON.parse(c.d) : c.d) : null);
+    // Review L81 I1: dueño POR CAMPO. Los vacíos y los que siguen como Cursia los dejó toman el valor del documento; los
+    // que decidió el docente se respetan (salvo que pida explícitamente usar los del documento: `force`).
+    const suggested = suggestProfileFromContext(ctx, null).profile;
+    const previousSuggested = previousContext ? suggestProfileFromContext(previousContext, null).profile : null;
+    const owners = pedagogyFieldOwners(latest ? current : null, record, [suggested, previousSuggested]);
+    const merged = mergeDerivedProfile(current, suggested, owners, academicVersion, force);
+    const writeRecord = () =>
+      qr.query(
+        `update public.courses set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), $2::text[], $3::jsonb, true) where id = $1`,
+        [courseId, [PEDAGOGY_DERIVATION_KEY], JSON.stringify(merged.record)],
+      );
+    if (!merged.changed.length) {
+      await writeRecord();
+      return { applied: false, reason: 'no_changes', kept: merged.kept };
+    }
+    if (validateProfile('pedagogy', merged.profile, { finalExam }).length) return { applied: false, reason: 'invalid', kept: merged.kept };
+    const next = normalizeProfile('pedagogy', merged.profile) as PedagogicalProfile;
+    const version = latest ? Number(latest.version) + 1 : 1;
+    await qr.query(
+      `insert into public.course_profiles (course_id, kind, version, data, sha256, created_by)
+       values ($1, 'pedagogy', $2, $3::jsonb, $4, $5)`,
+      [courseId, version, JSON.stringify({ ...next, designRules: pedagogyRulesRecord(next) }), profileSha256(next), ownerId],
+    );
+    await writeRecord();
+    return { applied: true, reason: 'derived', version, changes: merged.changed, kept: merged.kept };
+  }
+
+  /**
+   * LOOP 8.1 (review L81 I1e) · «Usar los datos del documento»: decisión explícita del docente de reemplazar en el perfil
+   * los datos que había cambiado (`fields`, o todos los que difieren) por los del contexto académico vigente.
+   */
+  async useDocumentInPedagogy(courseId: number, ownerId: string, fields?: string[], expectedVersion?: number): Promise<PedagogyDerivationResult> {
+    assertDynamicOwnerAllowed(ownerId);
+    await this.loadCourse(courseId, ownerId);
+    const force = (fields && fields.length ? fields : DERIVED_FIELDS).filter((f): f is DerivedField => (DERIVED_FIELDS as readonly string[]).includes(f));
+    if (!force.length) throw new BadRequestException({ code: 'INVALID_FIELDS', message: 'INVALID_FIELDS: indica qué datos del perfil reemplazar con el documento.' });
+    const qr = this.dataSource.createQueryRunner();
+    try {
+      await qr.connect();
+      await qr.startTransaction();
+      await qr.query(`select id from public.courses where id = $1 for update`, [courseId]);
+      const academic = await loadCurrentAcademicContext(qr, courseId);
+      if (!academic) {
+        await qr.rollbackTransaction();
+        throw new BadRequestException({ code: 'NO_ACADEMIC_CONTEXT', message: 'NO_ACADEMIC_CONTEXT: el curso no tiene contexto académico guardado.' });
+      }
+      if (expectedVersion !== undefined) {
+        const [p] = await qr.query(`select version from public.course_profiles where course_id = $1 and kind = 'pedagogy' order by version desc limit 1`, [courseId]);
+        const current = p ? Number(p.version) : 0;
+        if (current !== expectedVersion) {
+          await qr.rollbackTransaction();
+          throw new ConflictException(`El perfil "pedagogy" del curso #${courseId} cambió: expectedVersion=${expectedVersion}, actual=${current}. Vuelve a leerlo (GET) antes de usar los datos del documento.`);
+        }
+      }
+      const finalExam = await this.readFinalExam(qr, courseId);
+      const r = await this.derivePedagogyFromAcademic(qr, courseId, ownerId, academic.context, academic.version, finalExam, force);
+      await qr.commitTransaction();
+      return r;
+    } catch (err) {
+      if (qr.isTransactionActive) await qr.rollbackTransaction();
       throw err;
     } finally {
       await qr.release();
