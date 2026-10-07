@@ -1540,13 +1540,9 @@ function reservationBookkeeping(ev) {
       results.courses.E10 = { courseId, unchanged: d0.impact.totals, oneChapter: { toRun: d1.impact.toRun.length, usd: d1.impact.cost.toRun.estimateUsd.expected }, approachPreview: { toRun: d2.impact.toRun.length } };
     }, { fatal: false });
 
-    // ═══ LOOP 7 · E11 — FLUJO COMPLETO en un solo curso (solo mocks, USD 0): microcurrículo → contexto académico →
-    // enfoque → 64 h → «Cursia recomienda» → Ver diseño → Ajustar → nuevo diseño → Aplicar → Blueprint → Manifest →
-    // Actividades de Aplicación → coherencia → costo simulado → generación → empaque → impacto de un cambio →
-    // regeneración parcial (= el impacto previsto) → re-empaque → restauración en Moodle (abajo, con estudiante real).
     // LOOP 8.5 · Generación con proveedores FALSOS → empaque → impacto de un cambio → regeneración parcial → re-empaque.
     // Compartido por E11 (endpoints de diseño de siempre) y E17 (flujo V2); deja results.courses[tag] y [tag + 'regen'].
-    const fullGenerationFlow = async (tag, { courseId, title, n, st, M, apps, assessment, hoursFrozen, net0, extra = {} }) => {
+    const fullGenerationFlow = async (tag, { courseId, title, n, st, M, apps, assessment, hoursFrozen, net0, extra = {}, courseCtx = CTX }) => {
       const DRY = D('modules/pedagogy/dry-run.js');
       const usd = (plan) => (plan && plan.estimateUsd ? Number(plan.estimateUsd.expected) : null);
       // 11. Generación completa con proveedores FALSOS (Videogen local, Gamma/TTS mock, LLM falso).
@@ -1554,7 +1550,7 @@ function reservationBookkeeping(ev) {
       llm.st.courseId = courseId;
       llm.st.chapterByTitle.clear(); llm.st.moduleByTitle.clear(); llm.st.moduleOfChapter.clear();
       for (const m of mods) { llm.st.moduleByTitle.set(m.title, m.id); for (const x of m.chapters) { llm.st.chapterByTitle.set(x.title, x.id); llm.st.moduleOfChapter.set(x.id, m.id); } }
-      const ctx = { nombre: title, ...CTX, scormTemplateIds: S.templates };
+      const ctx = { nombre: title, ...courseCtx, scormTemplateIds: S.templates };
       const body = { ...ctx, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
       let start = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest/runs`, body);
       const estM = /estimateId=([0-9a-f-]{36})/.exec(String(start.error || ''));
@@ -1642,6 +1638,10 @@ function reservationBookkeeping(ev) {
       return { runA, itemsA, M2: man2.data.manifest.manifest, regen, I };
     };
 
+    // ═══ LOOP 7 · E11 — FLUJO COMPLETO en un solo curso (solo mocks, USD 0): microcurrículo → contexto académico →
+    // enfoque → 64 h → «Cursia recomienda» → Ver diseño → Ajustar → nuevo diseño → Aplicar → Blueprint → Manifest →
+    // Actividades de Aplicación → coherencia → costo simulado → generación → empaque → impacto de un cambio →
+    // regeneración parcial (= el impacto previsto) → re-empaque → restauración en Moodle (abajo, con estudiante real).
     if (RUN_E5) await step('v3-E11-flujo-completo', async () => {
       const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
       const DRY = D('modules/pedagogy/dry-run.js');
@@ -2041,6 +2041,12 @@ function reservationBookkeeping(ev) {
       const aa = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: st.structureVersionCounter, contextVersion: sv.data.profile.version });
       ok([200, 201].includes(aa.status), 'E17: «Diseñar el curso» → estructura del microcurrículo', { s: aa.status, e: aa.error });
 
+      // Configuración del curso (evaluación y presentación) antes de diseñar: la revisión no cambia después.
+      const A = D('modules/course-profiles/course-profiles.js');
+      const assessment = { ...A.defaultAssessmentProfile({ finalExam: true }), passingGrade: 70 };
+      ok((await api('POST', `/courses/${courseId}/profiles/assessment`, { data: assessment })).status === 201, 'E17: perfil de evaluación');
+      ok((await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 } })).status === 201, 'E17: perfil de presentación');
+
       // Paso 3 · «Cursia recomienda»: el docente no decide módulos, capítulos, práctica, audiovisual ni cómo llegar a las horas.
       const r1 = await api('POST', `/courses/${courseId}/design/recommendation`, {});
       ok(r1.status === 200 && r1.data.providersCalled === 0 && r1.data.hours.target === 64 && r1.data.hours.source === 'document' && r1.data.approach && r1.data.approach.source === 'recommended'
@@ -2075,17 +2081,17 @@ function reservationBookkeeping(ev) {
       const chs = st.modules.flatMap((m) => m.chapters);
       eq([chs.length, chs.filter((c) => c.kind === 'practice').length, chs.filter((c) => c.videoEnabled).length, chs.filter((c) => c.applicationMinutes).length],
         [card.design.counts.chapters, card.design.counts.practiceChapters, card.design.counts.videoChapters, card.design.counts.applicationActivities], 'E17: estructura aplicada = tarjeta (capítulos, práctica, video, Actividades de Aplicación)');
+      // Capítulo por capítulo (review L85-1 M6): título, tipo, video y minutos de Actividad en el mismo orden; evaluaciones por módulo.
+      const shape = (mods) => mods.map((m) => ({ exam: !!m.examEnabled, chapters: m.chapters.map((c) => [c.title, c.kind === 'practice' ? 'practice' : 'content', !!c.videoEnabled, c.applicationMinutes || null]) }));
+      const cardShape = shape(card.design.modules);
+      eq(shape(st.modules), cardShape, 'E17: estructura aplicada = tarjeta, capítulo por capítulo');
       const r4 = await api('POST', `/courses/${courseId}/design/recommendation`, {});
+      eq(shape(r4.data.design.modules), cardShape, 'E17: «Revisar y generar» muestra la estructura aplicada, capítulo por capítulo');
       ok(r4.data.verification && r4.data.verification.blocking === false && !r4.data.verification.checks.some((c) => c.fix && c.fix.kind === 'auto') && r4.data.design.changes.length === 0,
         'E17: revisión: verificación sin bloqueos, sin correcciones automáticas pendientes y sin cambios por aplicar', r4.data.verification && r4.data.verification.checks.filter((c) => c.severity !== 'ok' && c.severity !== 'info').map((c) => c.title));
       eq([r4.data.design.counts.chapters, r4.data.design.counts.videoChapters, r4.data.design.counts.applicationActivities, r4.data.design.counts.evaluations, r4.data.design.estimatedHours],
         [card.design.counts.chapters, card.design.counts.videoChapters, card.design.counts.applicationActivities, card.design.counts.evaluations, card.design.estimatedHours], 'E17: lo que muestra «Revisar y generar» = la tarjeta usada');
-      const A = D('modules/course-profiles/course-profiles.js');
-      const assessment = { ...A.defaultAssessmentProfile({ finalExam: true }), passingGrade: 70 };
-      ok((await api('POST', `/courses/${courseId}/profiles/assessment`, { data: assessment })).status === 201, 'E17: perfil de evaluación');
-      ok((await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 } })).status === 201, 'E17: perfil de presentación');
-
-      // «Aprobar y generar»: Blueprint + Manifest = la tarjeta (capítulos, videos, actividades, evaluaciones, horas, costo).
+      // «Aprobar y continuar»: Blueprint + Manifest = la tarjeta (capítulos, videos, actividades, evaluaciones, horas, costo).
       st = await readStructure(courseId);
       const lock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st.structureVersionCounter });
       ok(lock.status === 201, 'E17: aprobado → Blueprint', { s: lock.status, e: lock.error });
@@ -2096,6 +2102,8 @@ function reservationBookkeeping(ev) {
       const M = man.data.manifest.manifest;
       const hoursFrozen = STI.estimateCourseStudyTime(MIN.studyTimeInputFromManifest(M, snap)).courseEstimatedHours;
       const c = card.design.counts;
+      const bySnapPos = (xs) => [...xs].sort((a, b) => a.position - b.position);
+      eq(shape(bySnapPos(snap.modules).map((m) => ({ ...m, chapters: bySnapPos(m.chapters) }))), cardShape, 'E17: Blueprint congelado = tarjeta, capítulo por capítulo');
       eq([M.totals.experienceCount, M.totals.videoCount, M.totals.applicationActivityCount, M.totals.examCount + M.totals.finalExamCount, hoursFrozen],
         [c.chapters, c.videoChapters, c.applicationActivities, c.evaluations, card.design.estimatedHours], 'E17: Manifest congelado = tarjeta «Cursia recomienda» (capítulos, videos, actividades, evaluaciones, horas)');
       ok(Math.abs(usd(DRY.providerPlanFor(M)) - Number(card.cost.expected)) < 0.005, 'E17: costo del Manifest = costo de la tarjeta', { frozen: usd(DRY.providerPlanFor(M)), shown: card.cost.expected });
@@ -2103,7 +2111,9 @@ function reservationBookkeeping(ev) {
       ok(apps.length === c.applicationActivities && apps.length > 0, `E17: ${apps.length} Actividades de Aplicación en el Manifest`);
 
       // Generación (mock) → empaque → impacto → regeneración parcial → re-empaque; Moodle después (restore, permisos, notas).
-      await fullGenerationFlow('E17', { courseId, title, n, st, M, apps, assessment, hoursFrozen, net0, extra: { v2: true } });
+      // Contexto del propio curso (el pedido), no el del curso de otros escenarios.
+      const courseCtx = { sector: brief.sector, pais: brief.pais, contexto: brief.contexto, nivel: brief.nivel, obj: brief.obj, comp: 'Calcula y controla los costos de producción', tono: 'cercano y claro', ciudad: '' };
+      await fullGenerationFlow('E17', { courseId, title, n, st, M, apps, assessment, hoursFrozen, net0, extra: { v2: true }, courseCtx });
     }, { fatal: false });
 
     // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══
