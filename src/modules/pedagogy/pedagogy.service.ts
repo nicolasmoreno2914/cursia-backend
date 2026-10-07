@@ -1,4 +1,5 @@
 import { loadDesignPins } from '../course-design/design-pins';
+import { DecisionOverrides, requirementConstraintsForCourse } from '../academic-context/requirements/requirement-authority';
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { academicBlueprintContext, loadCurrentAcademicContext } from '../academic-context/academic-db';
 import { DataSource } from 'typeorm';
@@ -97,7 +98,7 @@ export class PedagogyService {
   async dryRunCourse(
     courseId: number,
     ownerId: string,
-    body: { profile?: unknown; activityTypeRules?: ActivityTypeRulesVersion; applyStructureAdjustments?: boolean },
+    body: { profile?: unknown; activityTypeRules?: ActivityTypeRulesVersion; applyStructureAdjustments?: boolean; requirementDecisions?: DecisionOverrides; ignorePins?: boolean },
   ): Promise<DryRunResult & { profileSource: 'request' | 'saved' | 'none'; savedProfileVersion: number }> {
     const course = await this.coursesService.findOne(courseId, ownerId); // 404 si no es suyo
     if (course.structureVersion !== 'dynamic') {
@@ -141,7 +142,11 @@ export class PedagogyService {
     } catch (err) {
       throw new BadRequestException(`Configuración inválida de reglas de actividad: ${(err as Error).message}`);
     }
-    const designPins = await loadDesignPins(this.dataSource, courseId);
+    // Re-review final L86C: `ignorePins` solo lo usa «Cursia recomienda» para averiguar la causa de un choque de horas.
+    const designPins = body.ignorePins ? {} : await loadDesignPins(this.dataSource, courseId);
+    // LOOP 8.6C: los requisitos obligatorios del documento (alternativa elegida, excepciones) restringen el diseño.
+    const requirementConstraints = await requirementConstraintsForCourse(this.dataSource, courseId, academic ? academic.context.documents : [],
+      saved ? ((saved.profile as any).designPreferences || null) : null, body.requirementDecisions);
     const result = asBadRequest(() =>
       runPedagogyDryRun({
         structure: snapshot,
@@ -152,6 +157,7 @@ export class PedagogyService {
         alignment: { priorKnowledgeDeclared: academic ? academic.context.learner.priorKnowledge.status !== 'missing' : null },
         // LOOP 8.3: lo que el docente fijó a mano (el mismo mapa que usa «Aplicar diseño»: misma propuesta, misma huella).
         designPins,
+        requirementConstraints,
       }),
     );
     return {

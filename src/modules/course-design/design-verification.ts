@@ -16,7 +16,7 @@
  */
 
 export type CheckSeverity = 'ok' | 'info' | 'warning' | 'critical';
-export type CheckArea = 'hours' | 'outcomes' | 'structure' | 'activities' | 'practice' | 'audiovisual' | 'evaluations' | 'pedagogy' | 'cost' | 'consistency';
+export type CheckArea = 'hours' | 'outcomes' | 'structure' | 'activities' | 'practice' | 'audiovisual' | 'evaluations' | 'pedagogy' | 'cost' | 'consistency' | 'requirements';
 export type FixKind = 'auto' | 'adjust' | 'editor' | 'understood';
 
 export interface CheckFix {
@@ -86,6 +86,11 @@ export interface VerificationInput {
   uncoveredEvaluations: { instrument: string; outcomes: string[]; kind: 'performance' | 'exam'; chapterIds?: string[] }[];
   /** Review L84-5: capítulos con una Actividad de Aplicación fijada por el docente que la preferencia actual no pondría. */
   pinnedApplicationsOutsideMode?: string[];
+  /**
+   * LOOP 8.6C · requisitos del documento frente al diseño (requirement-authority): conflictos críticos (Cursia no los
+   * resuelve sola), excepciones del docente (advertencia) y requisitos cumplidos. Van primero en la lista.
+   */
+  requirementChecks?: DesignCheck[];
 }
 
 /** Máximo de horas de un curso (la meta válida va de 1 a 500). */
@@ -129,6 +134,9 @@ export function verifyDesign(input: VerificationInput): DesignVerification {
   if (input.manifestErrors.length) {
     add({ id: 'consistency', area: 'consistency', severity: 'critical', title: 'El diseño no se puede preparar para generar', detail: 'Hay algo en la estructura que impide armar el plan de generación: revísala en el editor.', fix: { kind: 'editor', action: 'structure', label: 'Revisar la estructura' } });
   }
+
+  // LOOP 8.6C · Requisitos del documento (primero lo que no se cumple).
+  for (const c of input.requirementChecks || []) add(c);
 
   // Horas de trabajo del estudiante.
   const hoursTitle = `Carga horaria: ${h1(input.estimatedHours)} de ${h1(input.targetHours)} h de trabajo del estudiante`;

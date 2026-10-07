@@ -1,4 +1,5 @@
 import { PinOp, loadDesignPins, pinsMetadataExpr } from '../course-design/design-pins';
+import { requirementConstraintsForCourse } from '../academic-context/requirements/requirement-authority';
 import { Injectable, BadRequestException, NotFoundException, ConflictException, Logger, OnModuleInit, ServiceUnavailableException } from '@nestjs/common';
 import { lockPedagogyInput } from '../pedagogy/pedagogical-blueprint';
 import { loadCurrentPedagogicalProfile, parseStoredPedagogicalProfile } from '../pedagogy/pedagogy-db';
@@ -308,7 +309,9 @@ export class CourseStructureService implements OnModuleInit {
         throw new BadRequestException(`Configuración inválida de reglas de actividad: ${(err as Error).message}`);
       }
       const designPins = await loadDesignPins(queryRunner, courseId);
-      const dr = await asBad(() => runPedagogyDryRun({ structure: buildBlueprintSnapshotV2(courseRef, modules, chapters), profile: saved.profile, activityTypeRules: atr, designPins }));
+      // LOOP 8.6C: mismas restricciones del documento que «Cursia recomienda» (misma propuesta, misma huella).
+      const requirementConstraints = await requirementConstraintsForCourse(queryRunner, courseId, academic ? academic.context.documents : [], (saved.profile as any).designPreferences || null);
+      const dr = await asBad(() => runPedagogyDryRun({ structure: buildBlueprintSnapshotV2(courseRef, modules, chapters), profile: saved.profile, activityTypeRules: atr, designPins, requirementConstraints }));
       const dist = dr.distribution;
       if (!dist) {
         await queryRunner.rollbackTransaction();

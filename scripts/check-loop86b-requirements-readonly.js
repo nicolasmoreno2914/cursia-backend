@@ -22,8 +22,9 @@
 //   RB9  /extract guarda los requisitos atados a la huella de los documentos; la vista vale cuando el contexto
 //        guardado es de ESOS documentos (antes: none; contexto de otro documento: stale)
 //   RB10 elegir alternativa: grupo u opción desconocidos → 400; ajeno → 404; quitar la elección; nunca automática
-//   RB11 «Cursia recomienda» trae los requisitos con su comparación y SOLO LECTURA: elegir S/M/L no cambia la huella del
-//        diseño, ni la estructura, ni el perfil; «Usar este diseño» sigue disponible aunque el diseño se aparte
+//   RB11 «Cursia recomienda» trae los requisitos con su comparación; elegir S/M/L NO escribe nada en el curso (ni
+//        estructura, ni perfil, ni contador). Desde 8.6C la alternativa elegida sí restringe el diseño RECOMENDADO (una
+//        propuesta: solo se aplica con «Usar este diseño»)
 //   RB13 (review I1/M8) un PATCH del curso con metadata no borra ni falsifica los requisitos ni la elección; el listado
 //        de cursos no arrastra las lecturas guardadas
 //
@@ -467,9 +468,7 @@ async function dbChecks() {
       const prof0 = await ds.query(`select count(*)::int n from public.course_profiles where course_id = $1`, [cid]).catch(() => [{ n: -1 }]);
       await acx.setRequirementSelection(cid, OWNER, gidDb, 'M');
       const after = await design.recommend(cid, OWNER, {});
-      eq(after.design.proposalSha256, before.design.proposalSha256, 'misma huella del diseño');
-      eq(after.design.counts, before.design.counts, 'mismos conteos');
-      eq(after.profile, before.profile, 'mismo perfil recomendado');
+      // 8.6C: la alternativa elegida restringe la propuesta (la huella puede cambiar), pero elegir no escribe nada.
       eq(await counter(cid), cnt0, 'contador de estructura intacto');
       eq(await ds.query(`select id, position, title from public.course_chapters where course_id = $1 order by id`, [cid]), struct0, 'capítulos intactos');
       eq(await ds.query(`select count(*)::int n from public.course_profiles where course_id = $1`, [cid]).catch(() => [{ n: -1 }]), prof0, 'sin perfiles nuevos');
@@ -483,9 +482,7 @@ async function dbChecks() {
       const hrs = ch.find((c) => c.requirementId === item('target_hours').id);
       eq(hrs.actual.value, after.hours.target, 'horas: la meta del diseño');
       // No bloquea: el diseño sigue aplicable aunque se aparte.
-      eq(after.design.applicable, before.design.applicable, '«Usar este diseño» igual que antes');
-      eq(after.verification.blocking, before.verification.blocking, 'la verificación no cambia');
-      eq(JSON.stringify(after.verification.checks), JSON.stringify(before.verification.checks), 'mismos checks de verificación');
+      assert(typeof after.design.applicable === 'boolean', 'la propuesta sigue siendo aplicable o no por sus propias razones');
       // Horas del docente en «Ajustar» → «Te estás apartando».
       const adj = await design.recommend(cid, OWNER, { adjust: { targetHours: 30 } });
       const h2 = adj.requirements.checks.find((c) => c.requirementId === item('target_hours').id);

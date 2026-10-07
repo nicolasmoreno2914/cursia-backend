@@ -1,4 +1,5 @@
 import { bloomLevelOf, isPerformanceLevel } from '../academic-context/bloom';
+import { MAX_LIST_ITEMS } from '../pedagogy/pedagogy-profile';
 import { PedagogyRecommendation, recommendApproaches } from '../pedagogy/recommendation';
 import { TARGET_HOURS_MAX } from '../study-time/target-hours';
 
@@ -40,7 +41,10 @@ export function inferWizardAnswers(input: InferenceInput): InferredAnswers {
       ...(learner.educationLevel ? { educationLevel: learner.educationLevel } : {}),
       ...(learner.priorKnowledge ? { priorKnowledge: learner.priorKnowledge } : {}),
     },
-    q2: { know, do: doo, competencies: input.competencies.slice(0, 20) },
+    // Review 8.6C (documentos reales): el asistente admite como mucho MAX_LIST_ITEMS por lista; un documento con más
+    // resultados (p. ej. una propuesta de varios cursos) hacía fallar «Cursia recomienda». La proporción saber/hacer
+    // se calcula con TODOS los resultados (arriba); a las respuestas van los primeros de cada lista.
+    q2: { know: know.slice(0, MAX_LIST_ITEMS), do: doo.slice(0, MAX_LIST_ITEMS), competencies: input.competencies.slice(0, MAX_LIST_ITEMS) },
   };
   if (doShare === null) return { answers, basis, doShare };
   if (doShare >= 0.6) {

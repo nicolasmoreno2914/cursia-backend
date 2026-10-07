@@ -30,6 +30,9 @@ import type {
  *      hasta elegir una.
  */
 
+/** «1.200» (miles) → 1200; «12,5» / «12.5» / «12,50» → 12,5. */
+const numberOf = (t: string): number => (/^\d{1,3}(?:\.\d{3})+$/.test(t) ? Number(t.replace(/\./g, '')) : Number(t.replace(',', '.')));
+
 export const REQUIREMENTS_EXTRACTOR_VERSION = 1;
 
 // ── Normalización ────────────────────────────────────────────────────────────────────────────────────────────────
@@ -442,13 +445,13 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
       const cross = /(\d{1,3})\s*modulos?\s*(?:x|×|\*|por|de)\s*(\d{1,3})\s*capitulos?/.exec(m);
       if (cross) for (const x of mentions) if (x.kind === 'chapters' && x.value === Number(cross[2]) && x.scope.level === 'course') x.scope = { level: 'module', each: true };
 
-      // Total de horas por rótulo («Total Horas de Trabajo Académico del Estudiante (HAD+HTI) 192», «160 horas totales»).
-      const tl = /(intensidad horaria total|horas totales|total de horas|total horas|numero total de horas|duracion total|trabajo academico del estudiante)([^0-9]{0,90}?)(\d{1,4})\b/.exec(m);
-      const tb = /\b(\d{1,4})\s*horas totales\b/.exec(m);
+      // Total de horas por rótulo (re-review final L86C: con decimales, «12,5 horas» → 12,5 y no 12) («Total Horas de Trabajo Académico del Estudiante (HAD+HTI) 192», «160 horas totales»).
+      const tl = /(intensidad horaria total|horas totales|total de horas|total horas|numero total de horas|duracion total|trabajo academico del estudiante)([^0-9]{0,90}?)(\d{1,3}(?:\.\d{3})+(?!\d)|\d{1,4}(?:[,.]\d{1,2}(?!\d))?)(?![\d.,])/.exec(m);
+      const tb = /\b(\d{1,3}(?:\.\d{3})+(?!\d)|\d{1,4}(?:[,.]\d{1,2}(?!\d))?)\s*horas totales\b/.exec(m);
       let totalHours: number | null = null;
       // «… (HT+HP) 48 Horas Totales»: en una tabla el 48 es de la celda anterior (acompañamiento), no el total.
-      if (tb && !RE_COMPONENT_HOURS.test(m.slice(Math.max(0, tb.index - 60), tb.index).replace(/\((had|hti|ht|hp)\s*\+\s*(had|hti|ht|hp)\)/g, ''))) totalHours = Number(tb[1]);
-      else if (tl && !RE_COMPONENT_HOURS.test(tl[2].replace(/\((had|hti|ht|hp)\s*\+\s*(had|hti|ht|hp)\)/g, ''))) totalHours = Number(tl[3]);
+      if (tb && !RE_COMPONENT_HOURS.test(m.slice(Math.max(0, tb.index - 60), tb.index).replace(/\((had|hti|ht|hp)\s*\+\s*(had|hti|ht|hp)\)/g, ''))) totalHours = numberOf(tb[1]);
+      else if (tl && !RE_COMPONENT_HOURS.test(tl[2].replace(/\((had|hti|ht|hp)\s*\+\s*(had|hti|ht|hp)\)/g, ''))) totalHours = numberOf(tl[3]);
       if (totalHours !== null) {
         mentions = mentions.filter((x) => x.kind !== 'target_hours');
         mentions.push({ kind: 'target_hours', value: totalHours, mode: 'exact', scope: { level: 'course' }, index: 0, end: 0, raw: 'total' });

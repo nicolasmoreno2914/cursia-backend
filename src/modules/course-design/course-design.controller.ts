@@ -3,7 +3,7 @@ import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
 import { CourseDesignService } from './course-design.service';
-import { DesignFixDto, HoursOriginDto, RecommendDesignDto } from './dto/recommend.dto';
+import { DesignFixDto, HoursOriginDto, RecommendDesignDto, RequirementDecisionsDto } from './dto/recommend.dto';
 
 /** LOOP 8.3 · «Cursia recomienda» (controller V2: listado en features/dynamic-routes.ts). */
 @Controller('courses/:courseId/design')
@@ -23,6 +23,14 @@ export class CourseDesignController {
   @HttpCode(200)
   hoursOrigin(@Param('courseId', ParseIntPipe) courseId: number, @Body() dto: HoursOriginDto, @CurrentUser() user: AuthUser) {
     return this.service.recordHoursOrigin(courseId, user.id, dto.proposed ?? null);
+  }
+
+  // POST /api/v1/courses/:courseId/design/requirement-decisions  body { audiovisual?, applicationActivities? } (null = quitar)
+  // LOOP 8.6C: decisiones del docente que pueden apartarse del documento («Excepción al requisito del documento»).
+  @Post('requirement-decisions')
+  @HttpCode(200)
+  requirementDecisions(@Param('courseId', ParseIntPipe) courseId: number, @Body() dto: RequirementDecisionsDto, @CurrentUser() user: AuthUser) {
+    return this.service.saveRequirementDecisions(courseId, user.id, dto || {});
   }
 
   // POST /api/v1/courses/:courseId/design/fix  body { action: 'link_outcomes', expectedCounter } → «Corregir» automático (LOOP 8.4)

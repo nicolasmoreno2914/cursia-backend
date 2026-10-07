@@ -223,7 +223,9 @@ class DocExtraction {
     const existing = this.ctx.conflicts.find((c) => c.path === path);
     if (existing) {
       for (const v of values) {
-        if (!existing.values.some((x) => normKey(x.value) === normKey(v.value)) && existing.values.length < ACADEMIC_LIMITS.sourcesPerItem) existing.values.push(v);
+        // Review 8.6C (documentos reales): todo valor de un conflicto respeta el largo máximo, no solo los dos primeros
+        // (si no, guardar el contexto fallaba con TEXT_TOO_LONG y el documento no se podía usar).
+        if (!existing.values.some((x) => normKey(x.value) === normKey(v.value)) && existing.values.length < ACADEMIC_LIMITS.sourcesPerItem) existing.values.push({ value: v.value.slice(0, ACADEMIC_LIMITS.title), source: v.source });
       }
     } else if (this.ctx.conflicts.length < ACADEMIC_LIMITS.conflicts) {
       this.ctx.conflicts.push({ path, values: values.map((v) => ({ value: v.value.slice(0, ACADEMIC_LIMITS.title), source: v.source })) });
