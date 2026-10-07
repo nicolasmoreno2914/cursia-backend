@@ -1367,7 +1367,11 @@ export class CourseStructureService implements OnModuleInit {
       const newCounter = found.counter;
       // LOOP 8.3: video cambiado a mano → fijado por el docente; pasar a práctica lo libera (la práctica nunca lleva video).
       if (dto.kind === 'practice') await setVideoPin(queryRunner, courseId, chapterId, null);
-      else if (dto.pinVideo === true && dto.videoEnabled !== undefined) await setVideoPin(queryRunner, courseId, chapterId, dto.videoEnabled);
+      else if (dto.pinVideo === true && dto.videoEnabled !== undefined) {
+        // Review L83-2 m5: un capítulo de práctica nunca lleva video: no se fija nada (y se libera lo que hubiera).
+        const [k] = await queryRunner.query(`select to_jsonb(ch) ->> 'chapter_kind' as kind from public.course_chapters ch where id = $1`, [chapterId]);
+        await setVideoPin(queryRunner, courseId, chapterId, k && k.kind === 'practice' ? null : dto.videoEnabled);
+      }
       // Review L83 M-2: un cambio de video SIN fijar (editor anterior, panel pedagógico) es el último valor que eligió
       // alguien: un valor fijado antes ya no manda.
       else if (dto.videoEnabled !== undefined) await setVideoPin(queryRunner, courseId, chapterId, null);

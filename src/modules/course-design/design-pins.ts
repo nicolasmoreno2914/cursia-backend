@@ -47,8 +47,14 @@ export async function setVideoPin(q: Q, courseId: number, chapterId: string, vid
 /** «Liberar»: todos los valores fijados vuelven a decidirlos Cursia. Devuelve cuántos había. */
 export async function clearDesignPins(q: Q, courseId: number): Promise<number> {
   const before = await loadDesignPins(q, courseId);
+  const ids = Object.keys(before);
+  // Review L83-2 m5: se informan solo los que el diseño usaba (capítulos de contenido que existen); los huérfanos se
+  // limpian igual.
+  const live: { n: number }[] = ids.length
+    ? await q.query(`select count(*)::int n from public.course_chapters ch where course_id = $1 and id = any($2::uuid[]) and coalesce(to_jsonb(ch) ->> 'chapter_kind', 'content') <> 'practice'`, [courseId, ids])
+    : [{ n: 0 }];
   await q.query(`update public.courses set metadata = coalesce(metadata, '{}'::jsonb) - '${DESIGN_PINS_KEY}' where id = $1`, [courseId]);
-  return Object.keys(before).length;
+  return live[0] ? Number(live[0].n) : 0;
 }
 
 /**

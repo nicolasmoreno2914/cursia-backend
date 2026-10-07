@@ -11,6 +11,11 @@ import { isValidTargetHours } from '../study-time/target-hours';
 import { defaultApproachRegistry } from '../pedagogy/builtin-approaches';
 import { clearDesignPins, loadProposedHours, setProposedHours } from './design-pins';
 import { ApproachSuggestion, proposeTargetHours, recommendApproachFromFacts } from './design-recommendation';
+import { verifyDesign } from './design-verification';
+import { returningRows } from '../../common/db/returning-rows';
+import { suggestOutcomeLinks } from '../academic-context/context-design';
+import { advanceStructureOriginIfUntouched } from '../course-structure/structure-authority';
+import { ConflictException } from '@nestjs/common';
 import { DesignAdjustDto, RecommendDesignDto } from './dto/recommend.dto';
 
 /** Prioridad audiovisual por defecto de V2 (sin preferencia guardada). */
@@ -94,7 +99,8 @@ export class CourseDesignService {
         : facts.targetHours.source === 'document' ? 'document' : 'user';
     let proposal: ReturnType<typeof proposeTargetHours> | null = null;
     if (typeof adjust.targetHours === 'number') {
-      if (adjust.targetHours !== base.targetHours) hoursSource = 'adjusted';
+      // Review L83-2 m1: horas escritas en «Ajustar» son del docente aunque coincidan con las que propuso Cursia.
+      hoursSource = 'adjusted';
       base.targetHours = adjust.targetHours;
     } else if (adjust.targetHours === 'auto' || typeof base.targetHours !== 'number') {
       const probe = await this.pedagogy.dryRunCourse(courseId, ownerId, { profile: normalizePedagogicalProfile({ ...base, targetHours: PROBE_TARGET_HOURS }) });
@@ -111,6 +117,19 @@ export class CourseDesignService {
     const savedComparable = saved ? JSON.stringify(normalizePedagogicalProfile(Object.fromEntries(Object.entries(saved.profile as any).filter(([k]) => k !== 'designRules')))) : null;
     const approachDef = profile.primaryApproach ? registry.get(profile.primaryApproach) : null;
     const providers = dist && dist.materialized ? dist.materialized.providers : null;
+    const pinnedChapters = dist ? dist.modules.reduce((n, m) => n + m.chapters.filter((c) => c.videoPinned && c.kind === 'content' && !c.proposed).length, 0) : 0;
+    // LOOP 8.4: la verificación del MISMO diseño (alineación del Coherence Engine incluida).
+    const verification = dist
+      ? verifyDesign({
+        status: dist.status, targetHours: dist.targetHours, estimatedHours: dist.estimatedHours, toleranceHours: dist.toleranceHours, baseHours: dist.baseHours,
+        counts: dist.counts, manifestErrors: dist.materialized ? dist.materialized.manifestErrors : [{ code: 'NOT_MATERIALIZED' }],
+        alignment: dist.materialized ? (dist.materialized as any).alignment : null,
+        approach: profile.primaryApproach ? { id: profile.primaryApproach, label: approachDef ? approachDef.label : profile.primaryApproach } : null,
+        policyKind: dist.policy ? dist.policy.kind : null, audiovisual: prefs.audiovisual || null, pinnedChapters,
+        cost: providers && providers.estimateUsd ? providers.estimateUsd : null,
+        unlinkedChapters: dist.modules.reduce((n, m) => n + m.chapters.filter((c) => !c.proposed && !(chapterOutcomes.get(c.id) || []).length).length, 0),
+      })
+      : null;
     return {
       designVersion: 1,
       providersCalled: 0,
@@ -125,7 +144,8 @@ export class CourseDesignService {
       hours: { target: profile.targetHours ?? null, source: hoursSource, ...(proposal ? { proposedFrom: proposal.base, reason: proposal.reason } : hoursSource === 'proposed' ? { reason: `Cursia propuso ${profile.targetHours} h para este curso.` } : {}) },
       preferences: { emphasis: prefs.emphasis || 'balanced', applicationActivities: prefs.applicationActivities || 'auto', audiovisual: prefs.audiovisual },
       // Review L83 M-1: solo los fijados que el diseño usa (capítulos de contenido que existen).
-      pinnedChapters: dist ? dist.modules.reduce((n, m) => n + m.chapters.filter((c) => c.videoPinned && c.kind === 'content' && !c.proposed).length, 0) : 0,
+      pinnedChapters,
+      verification,
       design: dist
         ? {
           status: dist.status,
@@ -171,6 +191,56 @@ export class CourseDesignService {
     }
     await setProposedHours(this.dataSource, courseId, proposed);
     return { proposed };
+  }
+
+  /**
+   * LOOP 8.4 · «Corregir» automático. Solo lo que no toca ninguna decisión del docente:
+   *   link_outcomes — vincula a sus resultados los capítulos que NO tienen vínculos propios (la misma sugerencia del
+   *   contexto académico; un capítulo con vínculos se conserva siempre). Una transacción, con el contador de la estructura.
+   */
+  async fix(courseId: number, ownerId: string, action: string, expectedCounter: number) {
+    assertDynamicOwnerAllowed(ownerId);
+    await this.loadCourse(courseId, ownerId);
+    if (action !== 'link_outcomes') throw new BadRequestException(`Acción desconocida: ${JSON.stringify(action)}`);
+    const academic = await loadCurrentAcademicContext(this.dataSource, courseId);
+    if (!academic) throw new BadRequestException('NO_ACADEMIC_CONTEXT: el curso no tiene resultados de aprendizaje para vincular.');
+    const qr = this.dataSource.createQueryRunner();
+    try {
+      await qr.connect();
+      await qr.startTransaction();
+      const [course] = await qr.query(`select structure_version_counter c from public.courses where id = $1 for update`, [courseId]);
+      if (Number(course.c) !== expectedCounter) {
+        await qr.rollbackTransaction();
+        throw new ConflictException({ code: 'STRUCTURE_CHANGED', message: 'STRUCTURE_CHANGED: la estructura cambió; vuelve a verla antes de corregir.' });
+      }
+      const rows: { id: string; module_id: string; title: string; objective: string | null; description: string | null; outcome_ids: unknown }[] = await qr.query(
+        `select id, module_id, title, objective, description, to_jsonb(ch) -> 'outcome_ids' as outcome_ids from public.course_chapters ch where course_id = $1`,
+        [courseId],
+      );
+      const suggestions = suggestOutcomeLinks(academic.context, rows.map((r) => ({ id: r.id, moduleId: r.module_id, title: r.title, objective: r.objective, description: r.description, outcomeIds: Array.isArray(r.outcome_ids) && (r.outcome_ids as string[]).length ? (r.outcome_ids as string[]) : null })));
+      let linked = 0;
+      for (const s of suggestions) {
+        if (s.status !== 'inferred' || !s.suggested.length) continue;
+        const res = await qr.query(
+          `update public.course_chapters set outcome_ids = $1::jsonb, updated_at = now() where id = $2 and course_id = $3 and (outcome_ids is null or jsonb_array_length(outcome_ids) = 0) returning id`,
+          [JSON.stringify(s.suggested), s.chapterId, courseId],
+        );
+        if (returningRows(res).length) linked++;
+      }
+      let counter = expectedCounter;
+      if (linked) {
+        const n = await qr.query(`update public.courses set structure_version_counter = structure_version_counter + 1 where id = $1 returning structure_version_counter c`, [courseId]);
+        counter = Number(returningRows(n)[0].c);
+        await advanceStructureOriginIfUntouched(qr, courseId, expectedCounter, counter);
+      }
+      await qr.commitTransaction();
+      return { action, linkedChapters: linked, structureVersionCounter: counter };
+    } catch (err) {
+      if (qr.isTransactionActive) await qr.rollbackTransaction();
+      throw err;
+    } finally {
+      await qr.release();
+    }
   }
 
   /** «Liberar»: los valores fijados vuelven a decidirlos Cursia. */
