@@ -1,3 +1,4 @@
+import { lqaIsLanguageCourse } from '../language-qa/language-qa';
 import { APPLICATION_ACTIVITY_SCHEMA_VERSION } from '../course-shell/application-activity';
 import {
   BadRequestException,
@@ -69,6 +70,7 @@ import {
   v3ValidatedArtifactTypes,
   v3ValidationErrorMessage,
   validateV3ItemArtifact,
+  v3LanguageErrors,
   videoClaimFacts,
 } from '../course-shell';
 import { V3_ARTIFACT_TEXT_READER, V3ArtifactTextReader } from './v3-artifact-reader';
@@ -1146,6 +1148,34 @@ export class SchedulerService {
    *   la dependencia, p.ej. la duración del video → no reintentable).
    * - 'valid': ok; la transacción re-verifica que el artifact no cambió.
    */
+  /** Language QA: el run es de un curso de idiomas o de lengua/literatura (contexto congelado del run). */
+  private async isLanguageCourseRun(jobId: string): Promise<boolean> {
+    const [row] = await this.dataSource.query(`select context from public.generation_run_contexts where job_id = $1`, [jobId]);
+    const ctx = row ? (typeof row.context === 'string' ? JSON.parse(row.context) : row.context) : null;
+    return lqaIsLanguageCourse(ctx);
+  }
+
+  /** Language QA del capítulo: el dynamic_content_md subido en este complete (si hay exactamente uno). */
+  private async contentLanguageErrors(g: any, artifactIds: string[]): Promise<{ path: string; code: string; message: string }[]> {
+    const artifactCourse = g.frontend_course_id ?? String(g.job_course_id);
+    const rows = await this.dataSource.query(
+      `select id, type, storage_bucket, storage_path from public.artifacts
+        where id = any($1::uuid[]) and type = 'dynamic_content_md' and owner_id = $2 and course_id = $3 and item_run_id is null`,
+      [artifactIds, g.owner_id, artifactCourse],
+    );
+    if (rows.length !== 1) return [];
+    let text: string;
+    try {
+      text = await (this.v3Reader as V3ArtifactTextReader).readText({
+        id: rows[0].id, ownerId: g.owner_id, itemKey: g.item_key, itemRunId: g.id, type: rows[0].type,
+        storageBucket: rows[0].storage_bucket, storagePath: rows[0].storage_path,
+      });
+    } catch (err) {
+      throw new ServiceUnavailableException(`v3_artifact_unreadable: no se pudo leer dynamic_content_md (${rows[0].id}) de ${g.item_key} para validar el idioma: ` + (err instanceof Error ? err.message : String(err)));
+    }
+    return v3LanguageErrors(text);
+  }
+
   private async prevalidateV3(
     itemRunId: string,
     executorId: string,
@@ -1181,6 +1211,14 @@ export class SchedulerService {
     if (!mItem) {
       // M5 (fail closed): un item v3 running sin su entrada del Manifest es integridad rota.
       throw new InternalServerErrorException(`v3_validation_context: el item ${g.item_key} no está en su Manifest congelado; no se completa sin validar`);
+    }
+    const languageCourse = await this.isLanguageCourseRun(g.job_id);
+    // Language QA (piloto): el capítulo (Markdown) no tiene otra validación de contenido en el servidor, pero su idioma sí.
+    if (g.type === 'content' && !languageCourse && this.v3Reader) {
+      const lang = await this.contentLanguageErrors(g, artifactIds);
+      if (lang.length) {
+        return { kind: 'invalid', message: v3ValidationErrorMessage({ itemKey: g.item_key, type: g.type }, lang), codes: ['LANGUAGE_NOT_NEUTRAL'], retryable: true };
+      }
     }
     const validatedTypes = v3ValidatedArtifactTypes(g.type, mItem.variant ?? null);
     if (validatedTypes.length === 0) return { kind: 'skip' };
@@ -1222,6 +1260,7 @@ export class SchedulerService {
       chapterNumber: mItem.chapterNumber ?? null,
       promptVersion,
       artifactType,
+      languageCourse,
     };
     if (g.type === 'exam' || g.type === 'final_exam') {
       // EV6 P2: el plan del banco sale de los capítulos del Manifest congelado.

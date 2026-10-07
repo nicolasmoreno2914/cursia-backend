@@ -5,6 +5,7 @@
 // ejecutor REAL del navegador (24/44/45/46 + 04-api.js) en un vm, LLM falso
 // determinístico, Moodle 4.5 local. Ver run-e2e.sh.
 'use strict';
+const { keepTeacherDesign } = require('./design-approval');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -396,6 +397,8 @@ async function packageRun(label, courseId, n, runId, fakes) {
       }
       const stale = await api('POST', `/courses/${S.courseId}/modules`, { title: 'x', expectedCounter: counter - 1 });
       ok(stale.status === 409, 'expectedCounter viejo → 409 (concurrencia optimista real)', stale.status);
+      // R68: el docente conserva su estructura (video/Actividad fijados y sus horas) antes de aprobarla.
+      await keepTeacherDesign(api, S.courseId, 'curso A');
       st = await readStructure(S.courseId);
       S.modsA = modsFromStructure(st);
       eq(S.modsA.map((m) => m.chapters.length), [2, 5, 1, 3], 'estructura viva: 4 módulos {2,5,1,3}');
@@ -612,6 +615,7 @@ async function packageRun(label, courseId, n, runId, fakes) {
       ok(ed.status === 200, 'cambio: editar título del capítulo 3', { s: ed.status, e: ed.error }); counter = ed.data.structureVersionCounter;
       const ro = await api('PATCH', `/courses/${S.courseId}/modules/${m1.id}/chapters/reorder`, { order: [m1.chapters[1].id, m1.chapters[0].id], expectedCounter: counter });
       ok(ro.status === 200, 'cambio: reordenar capítulos 1↔2 de M1', { s: ro.status, e: ro.error }); counter = ro.data.structureVersionCounter;
+      await keepTeacherDesign(api, S.courseId, 'curso A (versión B)'); // R68
       const st = await readStructure(S.courseId);
       S.modsB = modsFromStructure(st);
       eq(S.modsB.map((m) => m.chapters.length), [2, 6, 1, 3], 'estructura nueva {2,6,1,3}');
@@ -795,6 +799,7 @@ async function packageRun(label, courseId, n, runId, fakes) {
           : await api('POST', `/courses/${cY}/modules/${mid}/chapters`, { title: cs.title, objective: cs.objective, videoEnabled: cs.video, expectedCounter: counter });
         counter = r.data.structureVersionCounter;
       }
+      await keepTeacherDesign(api, cY, 'curso Y'); // R68
       st = await readStructure(cY);
       const modsY = modsFromStructure(st);
       eq(modsY.map((m) => m.chapters.map((x) => x.video)), [[true, false]], 'curso Y: 1 módulo, video solo en el capítulo 1');

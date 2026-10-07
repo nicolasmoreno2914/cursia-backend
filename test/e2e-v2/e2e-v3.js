@@ -30,6 +30,7 @@
 // Moodle 4.5 → inspección. Necesita el frontend de H3 (fixtures/h5p2/fake-llm-h5p2.json); con un
 // frontend sin H5P v2, E2E_H5P2=auto (default) omite E5 (queda registrado) y E2E_H5P2=require falla.
 'use strict';
+const { keepTeacherDesign } = require('./design-approval');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -332,6 +333,9 @@ async function createCourse(C, llm) {
     const pg = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: C.pedagogy, expectedVersion: await pedagogyVersion(courseId) });
     ok(pg.status === 201 && pg.data.profile.designRules && pg.data.profile.designRules.engineVersion === 1, `${C.key}: POST profiles/pedagogy (${C.pedagogy.primaryApproach}) → 201 con reglas del servidor`, { s: pg.status, e: pg.error });
   }
+  // R68: el docente conserva su estructura (video/Actividad fijados y sus horas) antes de aprobarla.
+  await keepTeacherDesign(api, courseId, C.key);
+  st = await readStructure(courseId);
   const lock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st.structureVersionCounter });
   ok(lock.status === 201 && lock.data.blueprint.snapshot && lock.data.blueprint.snapshot.schemaVersion === 2, `${C.key}: lock → Blueprint schemaVersion 2`, { s: lock.status, e: lock.error, sv: lock.data && lock.data.blueprint && lock.data.blueprint.snapshot && lock.data.blueprint.snapshot.schemaVersion });
   const n = lock.data.blueprint.blueprintNumber;
@@ -1382,6 +1386,7 @@ function reservationBookkeeping(ev) {
       const sv2 = await api('POST', `/courses/${courseId}/profiles/academic`, { data: v2 });
       ok(sv2.status === 201 && (sv2.data.prunedOutcomeLinks || []).length === 2 && sv2.data.prunedOutcomeLinks.every((p) => p.removed.join() === 'RA6'),
         'E8: guardar una versión sin RA6 quita RA6 de los 2 capítulos que lo vinculaban', sv2.data && sv2.data.prunedOutcomeLinks);
+      await keepTeacherDesign(api, courseId, 'E8 relock'); // R68
       const st3 = await readStructure(courseId);
       ok(!st3.modules.flatMap((m) => m.chapters).some((c) => (c.outcomeIds || []).includes('RA6')) && st3.liveMatchesCurrentBlueprint === false, 'E8: sin vínculos rotos; el Blueprint confirmado ya no coincide (hay que reconfirmar)');
       const relock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st3.structureVersionCounter });
@@ -1595,6 +1600,7 @@ function reservationBookkeeping(ev) {
       const changedCh = I ? I.chapters.filter((c) => !c.untouched).map((c) => c.chapterId) : [];
       ok(imp.status === 200 && imp.data.fromRunId === runA && changedCh.includes(ch.id) && changedCh.every((id) => id === ch.id || practiceOfM0.has(id)) && I.toRun.some((k) => k === `content:${ch.id}`) && Number(I.estimatedChangeCostUsd) > 0,
         `${tag}: impacto: cambian ese capítulo y las prácticas de su módulo (dependen de él); nada más; costo estimado > 0`, I && { changed: changedCh.length, practiceInModule: practiceOfM0.size, toRun: I.toRun.length, usd: I.estimatedChangeCostUsd });
+      await keepTeacherDesign(api, courseId, `${tag} relock`); // R68
       st2 = await readStructure(courseId);
       const lock2 = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st2.structureVersionCounter });
       const n2 = lock2.data.blueprint.blueprintNumber;
@@ -2007,6 +2013,99 @@ function reservationBookkeeping(ev) {
       ok(!v2.data.verification.checks.some((c) => c.fix && c.fix.kind === 'auto'), 'E16: después de corregir no queda nada automático pendiente', v2.data.verification.checks.filter((c) => c.severity !== 'ok').map((c) => c.title));
       results.courses.E16 = { courseId };
     }, { fatal: false });
+
+    // ═══ R68 (piloto) · E18 — el SERVIDOR no genera un diseño sin verificación aprobable (API directa, sin la interfaz) ═══
+    if (RUN_E5) await step('v3-E18-r68-bloqueo-servidor', async () => {
+      const mkCourse = async (title, docText) => {
+        const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title });
+        const courseId = Number(cr.data.id);
+        let counter = 0;
+        for (let mi = 0; mi < 2; mi++) {
+          const m = await api('POST', `/courses/${courseId}/modules`, { title: `Módulo ${mi + 1} de seguridad eléctrica`, objective: 'Aplicar el procedimiento seguro', examEnabled: true, expectedCounter: counter });
+          if (m.status !== 201) throw new Error(`E18 módulo: ${m.status} ${m.error}`);
+          counter = m.data.structureVersionCounter;
+          const mid = m.data.module.id;
+          const auto = m.data.module.chapters || [];
+          for (let ci = 0; ci < 2; ci++) {
+            const body = { title: `Tema ${mi + 1}.${ci + 1} del bloqueo de energía`, objective: `Aplicar el paso ${ci + 1} del bloqueo y etiquetado`, videoEnabled: ci === 0, expectedCounter: counter };
+            const c = ci === 0 && auto.length === 1
+              ? await api('PATCH', `/courses/${courseId}/modules/${mid}/chapters/${auto[0].id}`, body)
+              : await api('POST', `/courses/${courseId}/modules/${mid}/chapters`, body);
+            if (![200, 201].includes(c.status)) throw new Error(`E18 capítulo: ${c.status} ${c.error}`);
+            counter = c.data.structureVersionCounter;
+          }
+        }
+        // Configuración del curso (como cualquier curso v3): evaluación y presentación.
+        const AP = D('modules/course-profiles/course-profiles.js');
+        ok((await api('POST', `/courses/${courseId}/profiles/assessment`, { data: { ...AP.defaultAssessmentProfile({ finalExam: true }), passingGrade: 70 } })).status === 201, `E18: perfil de evaluación (${title})`);
+        ok((await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 } })).status === 201, `E18: perfil de presentación (${title})`);
+        if (docText) {
+          const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'requisitos (sintético).txt', dataBase64: Buffer.from(docText, 'utf8').toString('base64') }] });
+          ok(ex.status === 200, `E18: documento leído (${title})`, { s: ex.status, e: ex.error });
+          const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 });
+          ok(sv.status === 201, `E18: contexto guardado (${title})`, { s: sv.status, e: sv.error });
+        }
+        return courseId;
+      };
+      const lockAndManifest = async (courseId) => {
+        const st = await readStructure(courseId);
+        const lock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st.structureVersionCounter });
+        const n = lock.data.blueprint.blueprintNumber;
+        const man = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest`);
+        ok(man.status === 201, `E18: Manifest del Blueprint ${n}`, { s: man.status, e: man.error });
+        return n;
+      };
+      const ctx = { nombre: '[E2E R68 E18] Bloqueo de generación', ...CTX, scormTemplateIds: S.templates, videoMode: 'mock', providerModes: { presentation: 'mock', audio: 'mock' } };
+      const expect409 = (r, reason, label) => {
+        const raw = r.raw || {};
+        ok(r.status === 409 && /GENERATION_NOT_VERIFIED/.test(String(r.error)) && (raw.reason === reason || JSON.stringify(raw).includes(`"reason":"${reason}"`)),
+          `E18: ${label} → 409 GENERATION_NOT_VERIFIED (${reason})`, { s: r.status, e: r.error, reason: raw.reason });
+      };
+      const runsBase = (id, n) => `/courses/${id}/blueprints/${n}/manifest/runs`;
+
+      // A · Verificación con un crítico (el documento pide 3 módulos; la estructura tiene 2 y Cursia no agrega módulos).
+      const cA = await mkCourse('[E2E R68 E18-A] Crítico', 'El curso tendrá 3 módulos.');
+      await keepTeacherDesign(api, cA, 'E18-A', { allowCritical: true });
+      const recA = await api('POST', `/courses/${cA}/design/recommendation`, {});
+      ok(recA.data.verification.blocking === true, 'E18-A: Verificación tiene un crítico (3 módulos pedidos, 2 en el diseño)', recA.data.verification.checks.filter((c) => c.severity === 'critical').map((c) => c.title));
+      const nA = await lockAndManifest(cA);
+      const rA = await api('POST', runsBase(cA, nA), ctx);
+      expect409(rA, 'critical', 'POST runs (API directa) con un crítico');
+      ok(Array.isArray(rA.raw && rA.raw.criticals) && rA.raw.criticals.some((c) => /módulos/i.test(c.title)), 'E18-A: la respuesta lista el crítico', rA.raw && rA.raw.criticals);
+      expect409(await api('POST', `${runsBase(cA, nA)}/estimate-preview`, ctx), 'critical', 'estimate-preview con un crítico');
+      expect409(await api('POST', `${runsBase(cA, nA)}/approve-and-start`, { ...ctx, estimateHash: 'a'.repeat(64) }), 'critical', 'approve-and-start con un crítico');
+
+      // B · Cambios recomendados sin aplicar (la estructura armada a mano, sin «Usar este diseño» ni decisiones del docente).
+      const cB = await mkCourse('[E2E R68 E18-B] Sin aplicar', null);
+      const nB = await lockAndManifest(cB);
+      expect409(await api('POST', runsBase(cB, nB), ctx), 'pending_changes', 'POST runs con cambios sin aplicar');
+
+      // C · Diseño verificado → pasa; después: estructura cambiada, Blueprint viejo.
+      const cC = await mkCourse('[E2E R68 E18-C] Verificado', null);
+      await keepTeacherDesign(api, cC, 'E18-C');
+      const nC = await lockAndManifest(cC);
+      const pv = await api('POST', `${runsBase(cC, nC)}/estimate-preview`, ctx);
+      ok(pv.status === 200, 'E18-C: diseño verificado → el estimado de la generación pasa el gate (200)', { s: pv.status, e: pv.error });
+      let st = await readStructure(cC);
+      const ch = st.modules[0].chapters[0];
+      const ed = await api('PATCH', `/courses/${cC}/modules/${st.modules[0].id}/chapters/${ch.id}`, { title: 'Tema 1.1 editado después de aprobar', expectedCounter: st.structureVersionCounter });
+      ok(ed.status === 200, 'E18-C: el docente edita la estructura después de aprobarla', { s: ed.status, e: ed.error });
+      expect409(await api('POST', runsBase(cC, nC), ctx), 'structure_changed', 'POST runs con la estructura cambiada');
+      const nC2 = await lockAndManifest(cC);
+      expect409(await api('POST', runsBase(cC, nC), ctx), 'blueprint_not_current', 'POST runs con el Blueprint anterior');
+      const pv2 = await api('POST', `${runsBase(cC, nC2)}/estimate-preview`, ctx);
+      ok(pv2.status === 200, 'E18-C: re-aprobado → pasa de nuevo', { s: pv2.status, e: pv2.error });
+
+      // D · Frontend antiguo / jobs legacy: un curso V2 nunca se genera por fuera del flujo verificado.
+      for (const [p, body] of [['/jobs/content', { courseId: String(cA) }], ['/jobs/full', { courseId: String(cA), options: { generateAudio: false } }], ['/jobs/videos', { courseId: String(cC) }]]) {
+        const r = await api('POST', p, body);
+        ok(r.status === 409 && /v2_course_legacy_generation_disabled/.test(String(r.error)), `E18-D: ${p} con un curso V2 → 409 v2_course_legacy_generation_disabled`, { s: r.status, e: r.error });
+      }
+
+      // Nada se creó: ni runs ni jobs para estos cursos.
+      const made = await q(`select count(*)::int n from public.production_jobs where course_id = any($1::bigint[]) or frontend_course_id = any($2::text[])`, [[cA, cB, cC], [String(cA), String(cB), String(cC)]]);
+      ok(made[0].n === 0, 'E18: no se creó ninguna generación ni job para cursos sin verificación aprobable', made[0]);
+    });
 
     // ═══ LOOP 8.5 · E17 — flujo DEFINITIVO de Cursia V2 por HTTP real, en el orden de la pantalla: pedido → microcurrículo →
     // «Lo que entendimos» (facts) → «Cursia recomienda» → Ajustar → «Usar este diseño» (perfil, horas, vínculos, aplicar) →

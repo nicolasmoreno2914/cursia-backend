@@ -1,3 +1,4 @@
+import { lqaFindings, lqaHitLabel, LQA_SKIP_KEYS } from '../language-qa/language-qa';
 import { APPLICATION_ARTIFACT_TYPE, applicationActivitySummary, validateApplicationActivityDoc } from './application-activity';
 /**
  * R11a — validación SERVER-SIDE (pura) de los artifacts LLM de rulesVersion 3
@@ -100,6 +101,8 @@ export interface V3ItemValidationContext {
   examChapterMd?: ReadonlyMap<string, string>;
   /** Fase 2: minutos de la Actividad de Aplicación (item del Manifest congelado). */
   applicationMinutes?: number | null;
+  /** Language QA: curso de idiomas o de lengua/literatura (cita «vosotros», voseo o inglés a propósito) → sin chequeo de idioma. */
+  languageCourse?: boolean;
 }
 
 /**
@@ -159,7 +162,45 @@ function h5pErrors(err: unknown): ShellValidationError[] {
  * Nunca lanza por contenido inválido: devuelve TODOS los errores. Lanza solo
  * si el contexto del item es inconsistente (bug de integración).
  */
+/**
+ * Language QA (piloto, 2026-10-07): todo texto generado va en español latinoamericano neutro. Además de la validación de
+ * cada tipo, ningún string del artifact puede traer voseo, «vosotros» ni regionalismos (misma tabla que el ejecutor, que
+ * ya corrigió lo seguro y pidió el reintento dirigido). Se omite en cursos de idiomas o de lengua/literatura
+ * (`ctx.languageCourse`), que citan a propósito, y en la bibliografía.
+ */
+export function v3LanguageErrors(text: string): ShellValidationError[] {
+  const errors: ShellValidationError[] = [];
+  const push = (path: string, s: string) => {
+    for (const h of lqaFindings(s, 4)) {
+      if (errors.length >= 8) return;
+      errors.push({ path, code: 'LANGUAGE_NOT_NEUTRAL', message: `${lqaHitLabel(h)}: "${String(h.text).slice(0, 120)}"` });
+    }
+  };
+  let doc: unknown;
+  try { doc = JSON.parse(text); } catch { push('$', text); return errors; }
+  (function walk(v: unknown, path: string, key: string | null) {
+    if (errors.length >= 8) return;
+    if (typeof v === 'string') { if (!key || !(LQA_SKIP_KEYS as Record<string, number>)[key]) push(path, v); return; }
+    if (Array.isArray(v)) { v.forEach((x, i) => walk(x, `${path}[${i}]`, key)); return; }
+    if (v && typeof v === 'object') {
+      for (const k of Object.keys(v)) {
+        if (k === 'bibliography' || k === 'references' || k === 'referencias') continue;
+        walk((v as Record<string, unknown>)[k], `${path}.${k}`, k);
+      }
+    }
+  })(doc, '$', null);
+  return errors;
+}
+
 export function validateV3ItemArtifact(ctx: V3ItemValidationContext, text: string): V3ItemValidationResult {
+  const r = validateV3ItemArtifactByType(ctx, text);
+  if (ctx.languageCourse) return r;
+  const lang = v3LanguageErrors(text);
+  if (!lang.length) return r;
+  return { ...r, ok: false, errors: [...r.errors, ...lang] };
+}
+
+function validateV3ItemArtifactByType(ctx: V3ItemValidationContext, text: string): V3ItemValidationResult {
   const expected = v3ValidatedArtifactType(ctx.type, ctx.variant);
   if (!expected) throw new Error(`V3_VALIDATION_CONTEXT: el item ${ctx.itemKey} (${ctx.type}) no tiene validación de contenido`);
 
