@@ -2094,6 +2094,17 @@ function reservationBookkeeping(ev) {
       const nC = await lockAndManifest(cC);
       const pv = await api('POST', `${runsBase(cC, nC)}/estimate-preview`, ctx);
       ok(pv.status === 200, 'E18-C: diseño verificado → el estimado de la generación pasa el gate (200)', { s: pv.status, e: pv.error });
+      // Review piloto C1: cambiar el perfil (horas) DESPUÉS de aprobar no avanza el contador de estructura, pero el Blueprint
+      // congeló otro diseño → 409 design_changed. Volver al perfil aprobado lo destraba (misma huella).
+      const curP = (await api('GET', `/courses/${cC}/profiles/pedagogy`)).data;
+      const verP = () => api('GET', `/courses/${cC}/profiles/pedagogy`).then((r) => (r.data && !r.data.isDefault ? Number(r.data.version) : 0));
+      const chg = await api('POST', `/courses/${cC}/profiles/pedagogy`, { data: { ...curP.profile, targetHours: (curP.profile.targetHours || 10) + 8 }, expectedVersion: await verP() });
+      ok(chg.status === 201, 'E18-C: el docente cambia las horas después de aprobar', { s: chg.status, e: chg.error });
+      expect409(await api('POST', runsBase(cC, nC), ctx), 'design_changed', 'POST runs con el perfil cambiado tras aprobar');
+      const back = await api('POST', `/courses/${cC}/profiles/pedagogy`, { data: curP.profile, expectedVersion: await verP() });
+      ok(back.status === 201, 'E18-C: vuelve a las horas aprobadas', { s: back.status, e: back.error });
+      const pvBack = await api('POST', `${runsBase(cC, nC)}/estimate-preview`, ctx);
+      ok(pvBack.status === 200, 'E18-C: con el diseño aprobado de nuevo, el gate pasa', { s: pvBack.status, e: pvBack.error });
       let st = await readStructure(cC);
       const ch = st.modules[0].chapters[0];
       const ed = await api('PATCH', `/courses/${cC}/modules/${st.modules[0].id}/chapters/${ch.id}`, { title: 'Tema 1.1 editado después de aprobar', expectedCounter: st.structureVersionCounter });

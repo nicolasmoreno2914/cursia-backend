@@ -20,7 +20,7 @@ import { proposedChapterUuid } from '../pedagogy/dry-run';
 import { advanceStructureOriginIfUntouched, readStructureOrigin } from '../course-structure/structure-authority';
 import { compareRequirements, DesignForRequirements, RequirementCheck } from '../academic-context/requirements/document-requirements';
 import {
-  DECISION_DEFAULTS, DecisionOverrides, constraintsFor, EXCEPTION_FIELDS, EXCEPTION_VALUES, ExceptionField, hoursFromRequirements, loadExceptions, loadRequirementAuthority,
+  DECISION_DEFAULTS, DecisionOverrides, constraintsFor, EXCEPTION_FIELDS, structureEditedByTeacher, EXCEPTION_VALUES, ExceptionField, hoursFromRequirements, loadExceptions, loadRequirementAuthority,
   requirementText, requirementVerificationChecks, teacherDecisions, writeExceptions,
 } from '../academic-context/requirements/requirement-authority';
 import { DistributionResult } from '../study-time/distributor';
@@ -218,7 +218,8 @@ export class CourseDesignService {
     if (auth.view.state === 'current' && dist) {
       const origin = await readStructureOrigin(this.dataSource, courseId);
       const [cnt] = await this.dataSource.query(`select structure_version_counter c from public.courses where id = $1`, [courseId]);
-      const structureByTeacher = !origin || origin.counter !== Number(cnt.c);
+      // Review piloto I5: misma regla que las restricciones (la forma de la estructura, no cualquier edición).
+      const structureByTeacher = await structureEditedByTeacher(this.dataSource, courseId);
       reqChecks = compareRequirements(auth.applicable, designForRequirements(dist, profile.targetHours ?? null, hoursSource === 'requirement' ? 'proposed' : hoursSource,
         structureByTeacher, !!decisions.audiovisual, !!decisions.applicationActivities));
       const teacherPins = dist.modules.some((m) => m.chapters.some((c) => !c.proposed && (c.videoPinned || c.applicationPinned)));

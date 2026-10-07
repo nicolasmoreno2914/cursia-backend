@@ -1,6 +1,6 @@
 import { buildRequirementsView, currentEntry, loadRequirementsState, RequirementCheck, RequirementsView } from './document-requirements';
 import type { DocumentRequirement } from './requirements';
-import { readStructureOrigin } from '../../course-structure/structure-authority';
+import { liveStructureShape, readStructureOrigin } from '../../course-structure/structure-authority';
 
 /**
  * LOOP 8.6C · Autoridad de los requisitos del documento sobre «Cursia recomienda».
@@ -223,10 +223,17 @@ export async function requirementConstraintsForCourse(
   return constraintsFor(a.required, teacherDecisions(a, savedPrefs, decisions), { structureByTeacher: await structureEditedByTeacher(q, courseId) });
 }
 
-/** El docente armó la estructura (sin origen de Cursia) o la cambió después (el contador avanzó desde el origen). */
+/**
+ * El docente armó la estructura (sin origen de Cursia) o cambió su FORMA después (agregó o quitó módulos o capítulos;
+ * review piloto I5: corregir un título o fijar un video no cuenta). Orígenes anteriores sin forma: por el contador.
+ */
 export async function structureEditedByTeacher(q: Q, courseId: number): Promise<boolean> {
   const origin = await readStructureOrigin(q as any, courseId);
   if (!origin) return true;
+  if (origin.shape) {
+    const live = await liveStructureShape(q as any, courseId);
+    return live.length !== origin.shape.length || live.some((n, i) => n !== origin.shape![i]);
+  }
   const res = await q.query(`select structure_version_counter c from public.courses where id = $1`, [courseId]);
   const rows: any[] = Array.isArray(res) ? res : (res as any).rows;
   return !rows[0] || Number(rows[0].c) !== origin.counter;

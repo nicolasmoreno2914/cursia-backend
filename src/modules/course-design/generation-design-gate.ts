@@ -1,6 +1,8 @@
-import { ConflictException, Injectable } from '@nestjs/common';
+import { ConflictException, HttpException, Injectable, ServiceUnavailableException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { CourseDesignService } from './course-design.service';
+import { assembleLockSnapshotV2, loadLockRows } from '../course-blueprints/lock-snapshot';
+import { snapshotSha256V2 } from '../course-blueprints/blueprint-snapshot';
 
 /**
  * R68 · Bloqueo REAL de generación en el servidor (piloto, 2026-10-07).
@@ -16,12 +18,13 @@ import { CourseDesignService } from './course-design.service';
  */
 export const GENERATION_NOT_VERIFIED = 'GENERATION_NOT_VERIFIED';
 
-export type GenerationGateReason = 'blueprint_missing' | 'blueprint_not_current' | 'structure_changed' | 'unverified' | 'not_applicable' | 'pending_changes' | 'critical';
+export type GenerationGateReason = 'blueprint_missing' | 'blueprint_not_current' | 'structure_changed' | 'design_changed' | 'unverified' | 'not_applicable' | 'pending_changes' | 'critical';
 
 const MESSAGES: Record<GenerationGateReason, string> = {
   blueprint_missing: 'el curso no tiene una estructura aprobada para generar.',
   blueprint_not_current: 'la estructura aprobada que se quiere generar no es la vigente del curso.',
   structure_changed: 'la estructura cambió después de aprobarla; vuelve a revisarla y aprobarla en «Revisar y generar».',
+  design_changed: 'el diseño cambió después de aprobarlo (horas, enfoque, contexto o configuración del curso); vuelve a revisarlo y aprobarlo en «Revisar y generar».',
   unverified: 'no se pudo verificar el diseño del curso.',
   not_applicable: 'el diseño del curso no se puede preparar para generar (revísalo en «Diseño»).',
   pending_changes: 'la estructura no tiene el diseño verificado: hay cambios recomendados sin aplicar (revísalo en «Diseño»).',
@@ -45,6 +48,19 @@ export class GenerationDesignGate {
     throw new ConflictException({ code: GENERATION_NOT_VERIFIED, reason, message: `${GENERATION_NOT_VERIFIED}: ${MESSAGES[reason]} No se generó nada.`, ...extra });
   }
 
+  private async assertBlueprintMatchesLiveDesign(courseId: number, frozenSha: string): Promise<void> {
+    const [course] = await this.dataSource.query(
+      `select id, title, structure_version, structure_version_counter, current_blueprint_id, final_exam_enabled, activity_engine,
+              (to_jsonb(courses) ->> 'review_cards_enabled')::boolean as review_cards_enabled
+         from public.courses where id = $1`,
+      [courseId],
+    );
+    const rows = await loadLockRows(this.dataSource as any, courseId);
+    const assembled = await assembleLockSnapshotV2(this.dataSource as any, course, rows);
+    if (assembled.errors.length > 0 || !assembled.snapshot) this.reject('design_changed');
+    if (snapshotSha256V2(assembled.snapshot as any) !== frozenSha) this.reject('design_changed');
+  }
+
   async assertVerified(courseId: number, ownerId: string, blueprintNumber: number): Promise<GenerationGateResult> {
     const [course] = await this.dataSource.query(
       `select id, structure_version_counter, current_blueprint_id from public.courses where id = $1 and owner_id = $2`,
@@ -52,19 +68,25 @@ export class GenerationDesignGate {
     );
     if (!course) this.reject('blueprint_missing');
     const [bp] = await this.dataSource.query(
-      `select id, structure_counter_at_lock from public.course_blueprints where course_id = $1 and blueprint_number = $2`,
+      `select id, schema_version, snapshot_sha256, structure_counter_at_lock from public.course_blueprints where course_id = $1 and blueprint_number = $2`,
       [courseId, blueprintNumber],
     );
     if (!bp) this.reject('blueprint_missing');
     if (course.current_blueprint_id === null || Number(course.current_blueprint_id) !== Number(bp.id)) this.reject('blueprint_not_current');
     if (Number(bp.structure_counter_at_lock) !== Number(course.structure_version_counter)) this.reject('structure_changed');
+    // Review piloto C1: el Blueprint v2 congela también el perfil pedagógico (horas, enfoque), el contexto académico y la
+    // configuración del curso, que NO avanzan el contador. Lo que se verifica abajo es lo vigente: debe ser exactamente lo
+    // que se congeló (misma huella del snapshot recompuesto), o se verificaría una cosa y se generaría otra.
+    if (Number(bp.schema_version) === 2) await this.assertBlueprintMatchesLiveDesign(courseId, String(bp.snapshot_sha256));
 
     let card: any;
     try {
       card = await this.design.recommend(courseId, ownerId, {} as any);
     } catch (err) {
-      // Sin verificación no hay generación (falla cerrada); el detalle técnico queda en el log del servidor.
-      this.reject('unverified', { detail: String((err as Error)?.message || err).slice(0, 300) });
+      // Sin verificación no hay generación (falla cerrada). Review piloto M4: un error de negocio (4xx) es «no verificado»;
+      // uno transitorio (base de datos, red) es 503: reintentar luego, sin decir que el diseño está mal.
+      if (err instanceof HttpException && err.getStatus() < 500) this.reject('unverified', { detail: String((err as Error)?.message || err).slice(0, 300) });
+      throw new ServiceUnavailableException({ code: 'GENERATION_VERIFICATION_UNAVAILABLE', message: 'GENERATION_VERIFICATION_UNAVAILABLE: no se pudo verificar el diseño en este momento; vuelve a intentarlo en unos segundos. No se generó nada.' });
     }
     if (!card || !card.design || !card.verification) this.reject('unverified');
     // Nada cambió mientras se verificaba (misma estructura que el Blueprint).

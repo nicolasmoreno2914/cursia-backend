@@ -27,6 +27,12 @@ export interface StructureOrigin {
   /** Versión del contexto académico aplicado (solo source = academic_context). */
   contextVersion: number | null;
   at: string;
+  /**
+   * Review piloto I5: capítulos por módulo (en orden) con los que Cursia dejó la estructura. «El docente cambió la
+   * estructura» = cambió esta forma (agregó o quitó módulos o capítulos), no un título o un objetivo. Orígenes anteriores
+   * (sin forma) se comparan por el contador, como antes.
+   */
+  shape?: number[];
 }
 
 export type StructureReplaceReason = 'user_edits' | 'confirmed_blueprint';
@@ -56,7 +62,8 @@ export function parseStructureOrigin(v: unknown): StructureOrigin | null {
   if (typeof o.counter !== 'number' || !Number.isInteger(o.counter) || o.counter < 0) return null;
   const cv = o.contextVersion;
   const contextVersion = typeof cv === 'number' && Number.isInteger(cv) && cv >= 1 ? cv : null;
-  return { source: o.source as StructureOriginSource, counter: o.counter, contextVersion, at: typeof o.at === 'string' ? o.at : '' };
+  const shape = Array.isArray(o.shape) && o.shape.length > 0 && o.shape.every((n) => typeof n === 'number' && Number.isInteger(n) && n >= 0) ? (o.shape as number[]) : null;
+  return { source: o.source as StructureOriginSource, counter: o.counter, contextVersion, at: typeof o.at === 'string' ? o.at : '', ...(shape ? { shape } : {}) };
 }
 
 const blank = (v: unknown) => v === null || v === undefined || !String(v).trim();
@@ -120,7 +127,20 @@ export async function readStructureOrigin(q: Q, courseId: number): Promise<Struc
   return parseStructureOrigin(typeof raw === 'string' ? JSON.parse(raw) : raw);
 }
 
+/** Capítulos por módulo de la estructura viva, en orden. */
+export async function liveStructureShape(q: Q, courseId: number): Promise<number[]> {
+  const res = await q.query(
+    `select m.id, count(c.id)::int as n from public.course_modules m left join public.course_chapters c on c.module_id = m.id
+      where m.course_id = $1 group by m.id, m.position order by m.position`,
+    [courseId],
+  );
+  const rows: any[] = Array.isArray(res) ? res : res.rows;
+  return rows.map((r) => Number(r.n));
+}
+
 export async function writeStructureOrigin(q: Q, courseId: number, origin: StructureOrigin): Promise<void> {
+  // Review piloto I5: el origen guarda la forma con la que Cursia deja la estructura (dentro de la misma transacción).
+  if (!origin.shape) origin = { ...origin, shape: await liveStructureShape(q, courseId) };
   await q.query(
     `update public.courses set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), $2::text[], $3::jsonb, true) where id = $1`,
     [courseId, [STRUCTURE_ORIGIN_KEY], JSON.stringify(origin)],
@@ -130,5 +150,5 @@ export async function writeStructureOrigin(q: Q, courseId: number, origin: Struc
 /** Un cambio que hace Cursia (diseño de horas, poda de vínculos de un contexto nuevo) no convierte la estructura en «editada». */
 export async function advanceStructureOriginIfUntouched(q: Q, courseId: number, counterBefore: number, counterAfter: number): Promise<void> {
   const next = originAfterCursiaDesign(await readStructureOrigin(q, courseId), counterBefore, counterAfter);
-  if (next) await writeStructureOrigin(q, courseId, next);
+  if (next) await writeStructureOrigin(q, courseId, { ...next, shape: undefined });
 }

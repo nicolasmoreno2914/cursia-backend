@@ -66,7 +66,7 @@ export const LQA_VOSEO_FIX = {
   'elaborá': 'elabora', 'redactá': 'redacta', 'seleccioná': 'selecciona', 'marcá': 'marca', 'arrastrá': 'arrastra',
   'relacioná': 'relaciona', 'ordená': 'ordena', 'clasificá': 'clasifica', 'resolvé': 'resuelve', 'entregá': 'entrega',
   'pensalo': 'piénsalo', 'hacelo': 'hazlo', 'decime': 'dime', 'contame': 'cuéntame', 'avisame': 'avísame', 'ponete': 'ponte',
-  'acordate': 'acuérdate', 'sentate': 'siéntate', 'animate': 'anímate', 'preguntate': 'pregúntate', 'tenelo': 'tenlo',
+  'acordate': 'acuérdate', 'sentate': 'siéntate', 'preguntate': 'pregúntate', 'tenelo': 'tenlo', // «animate» no: «Adobe Animate», element.animate()
   'revisalo': 'revísalo', 'anotalo': 'anótalo', 'escribilo': 'escríbelo', 'probalo': 'pruébalo', 'aplicalo': 'aplícalo',
   // subjuntivo voseante
   'tengás': 'tengas', 'puedás': 'puedas', 'querás': 'quieras', 'hagás': 'hagas', 'sepás': 'sepas', 'digás': 'digas', 'vayás': 'vayas',
@@ -81,7 +81,8 @@ export const LQA_VOS_PREPS = ['para', 'a', 'de', 'por', 'sin', 'hacia', 'sobre',
  */
 export const LQA_REGIONAL = [
   // Argentina / Uruguay
-  { re: /(?:^|[¡¿,;:.\s"«(])che(?=[,!])/i, term: 'che', region: 'Argentina/Uruguay', hint: 'omítelo' },
+  // Solo como vocativo al inicio de la oración («Che, …»): «la figura del Che, …» no.
+  { re: /(?:^|[.!?]\s+|[¡¿"«(]\s*)[Cc]he,/u, term: 'che', region: 'Argentina/Uruguay', hint: 'omítelo' },
   { re: /(?:^|[^\p{L}])(labur(?:o|os|ar|ás|a|an|ando|ante|antes))(?=$|[^\p{L}])/iu, term: 'laburo', region: 'Argentina/Uruguay', hint: 'trabajo / trabajar' },
   { re: /(?:^|[^\p{L}])(boludo|boluda|boludos|boludas|boludez)(?=$|[^\p{L}])/iu, term: 'boludo', region: 'Argentina/Uruguay', hint: 'omítelo' },
   { re: /(?:^|[^\p{L}])(pibe|piba|pibes|pibas)(?=$|[^\p{L}])/iu, term: 'pibe', region: 'Argentina/Uruguay', hint: 'joven' },
@@ -93,12 +94,13 @@ export const LQA_REGIONAL = [
   { re: /(?:^|[^\p{L}])(heladera|heladeras)(?=$|[^\p{L}])/iu, term: 'heladera', region: 'Argentina/Uruguay', hint: 'refrigerador' },
   { re: /(?:^|[^\p{L}])(remera|remeras)(?=$|[^\p{L}])/iu, term: 'remera', region: 'Argentina/Uruguay', hint: 'camiseta' },
   // España
-  { re: /(?:^|[^\p{L}])(ordenador|ordenadores)(?=$|[^\p{L}])/iu, term: 'ordenador', region: 'España', hint: 'computadora' },
-  { re: /(?:^|[^\p{L}])(cog(?:er|e|es|en|emos|ió|ieron|ido|ida|iendo|iste))(?=$|[^\p{L}])/iu, term: 'coger', region: 'España', hint: 'tomar' },
+  // «ordenador del gasto / de pagos» es un cargo formal (contratación pública): no.
+  { re: /(?:^|[^\p{L}])(ordenador|ordenadores)(?=$|[^\p{L}])(?!\s+(?:del?\s+(?:gasto|pagos?|giro)))/iu, term: 'ordenador', region: 'España', hint: 'computadora' },
   { re: /(?:^|[¡¿"«(]\s*)vale\s*[,.!]|[¿]\s*vale\s*\?|,\s*vale\s*[.?!]/i, term: 'vale (de acuerdo)', region: 'España', hint: 'de acuerdo' },
   { re: /(?:^|[^\p{L}])(guay|guays)(?=$|[^\p{L}])/iu, term: 'guay', region: 'España', hint: 'excelente' },
   { re: /(?:^|[^\p{L}])(curr(?:ar|o|os|as|a|an|ando|ante|antes))(?=$|[^\p{L}])/iu, term: 'currar', region: 'España', hint: 'trabajar / trabajo' },
-  { re: /(?:^|[^\p{L}])(mola|molan|molar|mola mucho)(?=$|[^\p{L}])/iu, term: 'molar', region: 'España', hint: 'gustar' },
+  // «molar» (masa molar, el tercer molar) y «mola» (mola hidatiforme) tienen lectura técnica: solo «molan» / «mola mucho».
+  { re: /(?:^|[^\p{L}])(molan|mola mucho)(?=$|[^\p{L}])/u, term: 'molar (gustar)', region: 'España', hint: 'gustar' },
   { re: /(?:^|[^\p{L}])(chaval|chavala|chavales|chavalas)(?=$|[^\p{L}])/iu, term: 'chaval', region: 'España', hint: 'joven' },
   { re: /(?:^|[^\p{L}])(zumo|zumos)(?=$|[^\p{L}])/iu, term: 'zumo', region: 'España', hint: 'jugo' },
   { re: /(?:^|[^\p{L}])(aparc(?:ar|a|as|an|ado|ada|amiento|amientos)|aparque|aparquen)(?=$|[^\p{L}])/iu, term: 'aparcar', region: 'España', hint: 'estacionar' },
@@ -129,11 +131,12 @@ export const LQA_REGIONAL = [
   { re: /(?:^|[^\p{L}])(chamo|chamos)(?=$|[^\p{L}])/iu, term: 'chamo', region: 'Venezuela', hint: 'joven' },
   // Chile / Perú
   { re: /(?:^|[^\p{L}])(cachai|cachái|cachar|cachaste)(?=$|[^\p{L}])/iu, term: 'cachai', region: 'Chile', hint: '¿entiendes?' },
-  { re: /(?:^|[^\p{L}])((?:sí|no|ya)\s+po)(?=$|[^\p{L}])/iu, term: 'po', region: 'Chile', hint: 'omítelo' },
+  { re: /(?:^|[^\p{L}])((?:[Ss]í|[Nn]o|[Yy]a)\s+po)(?=\s*[,.!?]|$)/u, term: 'po', region: 'Chile', hint: 'omítelo' },
   { re: /(?:^|[^\p{L}])(fome|fomes)(?=$|[^\p{L}])/iu, term: 'fome', region: 'Chile', hint: 'aburrido' },
   { re: /(?:^|[^\p{L}])(pololo|polola|pololos|pololear)(?=$|[^\p{L}])/iu, term: 'pololo', region: 'Chile', hint: 'novio' },
   { re: /(?:^|[^\p{L}])(huevón|weón|weon|huevones)(?=$|[^\p{L}])/iu, term: 'huevón', region: 'Chile', hint: 'omítelo' },
-  { re: /(?:^|[^\p{L}])(al tiro)(?=$|[^\p{L}])/iu, term: 'al tiro', region: 'Chile', hint: 'de inmediato' },
+  // Solo cerrando la frase («Responde al tiro.»): «al tiro de esquina», «el tiro de la chimenea» no.
+  { re: /(?:^|[^\p{L}])(al tiro)(?=\s*[,.;!?)]|\s*$)/iu, term: 'al tiro', region: 'Chile', hint: 'de inmediato' },
   { re: /(?:^|[^\p{L}])(bacán|bacanes)(?=$|[^\p{L}])/iu, term: 'bacán', region: 'Chile/Perú', hint: 'excelente' },
   { re: /(?:^|[^\p{L}])(flaite|flaites|cuático|cuática)(?=$|[^\p{L}])/iu, term: 'expresión coloquial de Chile', region: 'Chile', hint: 'usa un término neutro' },
   { re: /(?:^|[^\p{L}])(pituco|pituca|pitucos|jato)(?=$|[^\p{L}])/iu, term: 'expresión coloquial de Perú', region: 'Perú', hint: 'usa un término neutro' },
@@ -156,11 +159,40 @@ export const LQA_VOSEO_WORD_RE = new RegExp('(^|[^\\p{L}])(' + Object.keys(LQA_V
 export const LQA_VOS_NOUN_BEFORE_RE = /(?:^|[^\p{L}])(?:el|del|un|al)\s+$/iu;
 export const LQA_VOS_RE = /(^|[^\p{L}])(?:(con)\s+vos|(para|a|de|por|sin|hacia|sobre|contra|ante|desde|hasta)\s+vos|(vos))(?=$|[^\p{L}])/giu;
 
+/**
+ * Review piloto I2: lo que no es prosa nunca se toca ni se marca — bloques e inline de código, URLs, destinos de enlaces
+ * Markdown y atributos HTML. Se enmascaran (misma longitud) y se restauran después.
+ */
+export const LQA_NON_PROSE_RE = /```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`|\]\([^)\s]*\)|https?:\/\/[^\s<>"')]+|www\.[^\s<>"')]+|[\w-]+\s*=\s*"[^"]*"|[\w-]+\s*=\s*'[^']*'|\b[\w.-]+\.(?:com|org|net|edu|gov|co|io|js|ts|py|html|css|json)\b(?:\/[^\s]*)?/g;
+function _lqaMask(text) {
+  var saved = [];
+  // El relleno usa \u0002 (nunca espacios): al restaurar no se come ningún espacio real. Los saltos de línea del bloque se
+  // conservan para que la división por líneas siga igual.
+  var masked = String(text).replace(LQA_NON_PROSE_RE, function (m) { saved.push(m); return '\u0000' + (saved.length - 1) + '\u0001' + m.replace(/[^\n]/g, '\u0002').slice(String(saved.length - 1).length + 2); });
+  return { masked: masked, saved: saved };
+}
+/** Restaura cada marcador consumiendo EXACTAMENTE su relleno (nunca un salto de línea o espacio del texto real). */
+function _lqaUnmask(masked, saved) {
+  var out = '';
+  var i = 0;
+  while (i < masked.length) {
+    var p = masked.indexOf('\u0000', i);
+    if (p < 0) { out += masked.slice(i); break; }
+    var q = masked.indexOf('\u0001', p);
+    if (q < 0) { out += masked.slice(i); break; }
+    var idx = Number(masked.slice(p + 1, q));
+    out += masked.slice(i, p) + saved[idx];
+    i = q + 1 + Math.max(0, saved[idx].length - (q + 1 - p));
+  }
+  return out;
+}
+
 /** Corrige el voseo (formas sin ambigüedad). Devuelve {text, fixes:[{from,to}]}. «SOS» (en mayúsculas) nunca. */
 export function lqaFixText(text) {
   var fixes = [];
   if (typeof text !== 'string' || !text) return { text: text, fixes: fixes };
-  var out = text.split('\n').map(function (line) {
+  var mk = _lqaMask(text);
+  var out = mk.masked.split('\n').map(function (line) {
     if (LQA_REFERENCE_RE.test(line)) return line;
     var l = line.replace(LQA_VOSEO_WORD_RE, function (m, pre, w) {
       if (w === w.toUpperCase() && w.length > 1) return m; // siglas («SOS»)
@@ -183,7 +215,7 @@ export function lqaFixText(text) {
     });
     return l;
   }).join('\n');
-  return { text: out, fixes: fixes };
+  return { text: _lqaUnmask(out, mk.saved), fixes: fixes };
 }
 
 /** Claves que nunca son texto para el estudiante (ids, URLs, tipos). */
@@ -208,7 +240,7 @@ export function lqaFixDeep(obj) {
 
 /** Hallazgos de idioma en UNA oración: [{code: 'VOSEO'|'VOSOTROS'|'REGIONAL', term, region, hint}]. */
 export function lqaSentenceFindings(sentence) {
-  var s = String(sentence || '');
+  var s = _lqaMask(String(sentence || '')).masked;
   var out = [];
   if (!s.trim() || LQA_REFERENCE_RE.test(s)) return out;
   LQA_VOSEO_WORD_RE.lastIndex = 0;
@@ -229,34 +261,54 @@ export function lqaSentenceFindings(sentence) {
       break;
     }
   }
+  // Review piloto I1: una sigla en MAYÚSCULAS («LEED», «PO», «CHE») nunca es «vosotros» ni un regionalismo.
+  var upper = function (m) { var w = String(m || '').replace(/[^\p{L}]/gu, ''); return w.length > 1 && w === w.toUpperCase(); };
   var vo = LQA_VOSOTROS_RE.exec(s);
-  if (vo) out.push({ code: 'VOSOTROS', term: vo[1], region: 'España', hint: 'tú (o ustedes)' });
+  if (vo && !upper(vo[1])) out.push({ code: 'VOSOTROS', term: vo[1], region: 'España', hint: 'tú (o ustedes)' });
   for (var i = 0; i < LQA_REGIONAL.length; i++) {
     var r = LQA_REGIONAL[i];
-    if (r.re.test(s)) out.push({ code: 'REGIONAL', term: r.term, region: r.region, hint: r.hint });
+    var mm = r.re.exec(s);
+    if (mm && !upper(mm[1] || mm[0])) out.push({ code: 'REGIONAL', term: r.term, region: r.region, hint: r.hint });
   }
   return out;
 }
 
-/** Hallazgos en un texto completo (por oración; máx. `max`). */
-export function lqaFindings(text, max) {
+/** Referencia institucional APA («Organización Mundial de la Salud. (2020).»). */
+export const LQA_REFERENCE_INST_RE = /^\s*(?:[-*•]|\d{1,3}[.)])?\s*[A-ZÁÉÍÓÚÑ][^().\n]{2,160}\.\s*\(\s*(?:1[5-9]|20)\d{2}[a-z]?\s*\)\s*\./u;
+/** Título de sección (markdown #, negrita sola o numerado) y si ese título ES la bibliografía. */
+export const LQA_HEADING_LINE_RE = /^\s*(?:#{1,6}\s*|\*\*[^*\n]{1,80}\*\*\s*$|\d{1,2}[.)]\s+[A-ZÁÉÍÓÚÑ][^.,:;()\n]{0,50}$)/;
+export const LQA_BIB_HEADING_RE = /^(?:\d{1,2}[.)]\s*)?(?:evaluaci[oó]n\s+y\s+)?(?:bibliograf[íi]a|referencias(?:\s+bibliogr[áa]ficas)?|fuentes(?:\s+consultadas|\s+bibliogr[áa]ficas)?|lecturas\s+recomendadas|para\s+profundizar)(?:\s+y\s+(?:fuentes|referencias|bibliograf[íi]a|recursos))?\s*[:.]?$/i;
+
+/**
+ * Hallazgos en un texto completo (Markdown o texto plano; por oración; máx. `max`). Review piloto I4: es LA función que
+ * usan el ejecutor (45) y el servidor: omite las secciones de bibliografía y las referencias (las dos formas), revisa
+ * las filas de tabla como cualquier texto.
+ */
+export function lqaMarkdownFindings(text, max) {
   var lim = max || 12;
   var out = [];
-  String(text || '').split(/\n+/).forEach(function (line) {
-    if (out.length >= lim || LQA_REFERENCE_RE.test(line)) return;
+  var inBib = false;
+  var mk = _lqaMask(String(text || ''));
+  mk.masked.split(/\n+/).forEach(function (line) {
+    if (LQA_HEADING_LINE_RE.test(line)) inBib = LQA_BIB_HEADING_RE.test(line.replace(/^\s*#{1,6}\s*/, '').replace(/\*\*/g, '').trim());
+    if (out.length >= lim || inBib || LQA_REFERENCE_RE.test(line) || LQA_REFERENCE_INST_RE.test(line)) return;
     line.split(/(?<=[.!?])\s+/).forEach(function (sent) {
       if (out.length >= lim) return;
-      lqaSentenceFindings(sent).forEach(function (h) { if (out.length < lim) out.push(Object.assign({ text: sent.trim().slice(0, 200) }, h)); });
+      lqaSentenceFindings(sent).forEach(function (h) { if (out.length < lim) out.push(Object.assign({ text: _lqaUnmask(sent, mk.saved).trim().slice(0, 200) }, h)); });
     });
   });
   return out;
 }
+/** Alias histórico. */
+export function lqaFindings(text, max) { return lqaMarkdownFindings(text, max); }
 
 /** Cursos de idiomas o de lengua/literatura: citan inglés, «vosotros» o voseo a propósito (sin Language QA). */
-export const LQA_LANGUAGE_COURSE_RE = /ingl[eé]s|english|idioma|lengua|literatura|castellano|biling|traduc/i;
+// Review piloto I3: solo el NOMBRE y el SECTOR del curso, con palabras completas («lenguaje» SQL, «manuales en inglés» del
+// contexto no eximen).
+export const LQA_LANGUAGE_COURSE_RE = /(?:^|[^\p{L}])(?:ingl[eé]s|english|idiomas?|lenguas?|literatura|castellano|biling[üu]es?|traducci[oó]n|interpretaci[oó]n|franc[eé]s|portugu[eé]s|alem[aá]n|italiano|japon[eé]s|chino|mandar[ií]n|coreano|ruso|ling[üu][íi]stica|gram[aá]tica|redacci[oó]n|ortograf[íi]a)(?=$|[^\p{L}])/iu;
 export function lqaIsLanguageCourse(courseContext) {
   var c = courseContext || {};
-  return LQA_LANGUAGE_COURSE_RE.test([c.nombre, c.sector, c.contexto, c.obj, c.comp].filter(function (x) { return typeof x === 'string'; }).join(' '));
+  return LQA_LANGUAGE_COURSE_RE.test([c.nombre, c.sector].filter(function (x) { return typeof x === 'string'; }).join(' '));
 }
 
 /** Etiqueta para el reintento dirigido. */
