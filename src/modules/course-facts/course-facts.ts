@@ -223,6 +223,8 @@ export interface CourseFacts {
   topic: Fact<string>;
   educationLevel: Fact<string>;
   priorKnowledge: Fact<string>;
+  /** LOOP 9: conocimientos previos que lista el documento (temas), tal cual; vacío si no hay documento o no los trae. */
+  documentPrerequisites: string[];
   learnerDescription: Fact<string>;
   /** origin (LOOP 8.2): de dónde salió CADA resultado — documento, propuesto por Cursia sin documento o escrito por el docente. */
   outcomes: Fact<{ id: string | null; text: string; domain: string | null; origin: OutcomeOrigin }[]>;
@@ -337,8 +339,10 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
   const pedLevel = ped && ped.learner ? ped.learner.educationLevel : null;
   const educationLevel = owners.educationLevel === 'user'
     ? fact<string>(pedLevel, 'profile')
-    : first<string>(fact(docLevel && docLevel.level, 'document'), fact(pedLevel, 'profile'), fact(briefLevel, 'user'));
-  if (owners.educationLevel !== 'user' && docLevel && docLevel.level && briefLevel && docLevel.level !== briefLevel) {
+    : first<string>(fact(docLevel && docLevel.level, 'document'), fact(pedLevel, 'profile'), fact(briefLevel, briefSource('contexto')));
+  // LOOP 9 (P1-4): un nivel que el usuario no eligió (el valor de partida de «Crear», marcado como inferido) no choca con el
+  // documento: el documento manda sin preguntar.
+  if (owners.educationLevel !== 'user' && briefSource('contexto') === 'user' && docLevel && docLevel.level && briefLevel && docLevel.level !== briefLevel) {
     conflicts.push({ field: 'educationLevel', values: [{ source: 'document', value: docLevel.level }, { source: 'user', value: briefLevel }],
       message: 'El documento indica un nivel educativo distinto del que elegiste en Datos: se usa el del documento.' });
   }
@@ -384,7 +388,9 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
     title,
     topic: first<string>(fact(b.obj, 'user'), ctx ? ctxFact(ctx.identity.generalObjective) : fact<string>(null, null)),
     educationLevel,
-    priorKnowledge: first<string>(fact(ped && ped.learner ? ped.learner.priorKnowledge : null, 'profile'), fact(priorKnowledgeFromBrief(b.nivel), 'user')),
+    // LOOP 9 (P1-2): el nivel de partida de «Crear» que nadie eligió es de Cursia («inferido»), no «tu pedido».
+    priorKnowledge: first<string>(fact(ped && ped.learner ? ped.learner.priorKnowledge : null, 'profile'), fact(priorKnowledgeFromBrief(b.nivel), briefSource('nivel'))),
+    documentPrerequisites: ctx ? (found(ctx.learner.priorKnowledge) || []) : [],
     learnerDescription: owners.description === 'user'
       ? fact<string>(ped!.learner.description, 'profile')
       : first<string>(ctx ? ctxFact(ctx.learner.profile) : fact<string>(null, null), fact(ped && ped.learner ? ped.learner.description : null, 'profile')),

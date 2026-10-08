@@ -15,7 +15,7 @@
 //       por módulo; sin restricciones el resultado es IDÉNTICO al de antes
 //   RC4 Verificación: cumple → ok; decisión del docente → «Excepción al requisito del documento» (advertencia); lo que
 //       Cursia no puede resolver → conflicto CRÍTICO con su causa (parciales vs módulos, horas vs estructura, dos requisitos
-//       del documento que chocan, dos videos por capítulo); por revisar (unidades) → info
+//       del documento que chocan); lo que Cursia no puede producir (dos videos por capítulo) → excepción (LOOP 9); por revisar (unidades) → info
 //   RC10 documentos reales (bugs anteriores que destapó 8.6C): un documento con tres o más valores largos distintos del
 //        mismo dato (metodología, descripción) se lee sin TEXT_TOO_LONG; un documento con más de 12 resultados de
 //        aprendizaje no rompe «Cursia recomienda» (el asistente admite 12 por lista)
@@ -181,8 +181,10 @@ const aaPerModule = (d) => d.modules.map((m) => m.chapters.filter((c) => c.appli
     const v = RA.requirementVerificationChecks(reqs, checks, { status: 'within_tolerance', baseHours: 50, estimatedHours: 64, modules: 4, moduleExams: 4, exceptionFields: {} });
     const by = (k, et) => v.find((c) => c.id === `requirement:${reqs.find((r) => r.kind === k && (!et || r.evaluationType === et)).id}`);
     eq(by('modules').severity, 'ok', 'módulos');
-    eq(by('videos').severity, 'critical', '2 videos por capítulo: Cursia no puede');
-    assert(/un video por capítulo/.test(by('videos').detail), 'con la razón');
+    // LOOP 9 (P0-2): lo que Cursia no puede producir es una excepción explícita (con motivo en la propuesta), no un crítico sin salida.
+    eq(by('videos').severity, 'warning', '2 videos por capítulo: Cursia no puede → excepción');
+    assert(/^Excepción al requisito del documento/.test(by('videos').title), by('videos').title);
+    assert(/un video por capítulo/.test(by('videos').detail) && /motivo/.test(by('videos').detail), 'con la razón y el motivo pendiente');
     const partial = by('evaluations', 'partial');
     eq(partial.severity, 'critical', '3 parciales con 4 módulos');
     assert(/Entra en conflicto con «4 módulos»/.test(partial.detail) && /El documento pide 3 evaluaciones parciales; el diseño tiene 4 evaluaciones parciales/.test(partial.detail), partial.detail);
@@ -634,14 +636,32 @@ async function dbChecks() {
     });
 
     await check('RG4 R68: un crítico de Verificación → critical con la lista de críticos', async () => {
-      const cid = await courseWith('Gate 4', [3, 3], 'El curso tendrá 3 capítulos por módulo. Cada capítulo tendrá 2 videos.');
+      // LOOP 9: el crítico es un documento que se contradice (Cursia no elige); «2 videos por capítulo» ya es una excepción.
+      const cid = await courseWith('Gate 4', [3, 3], 'El curso tendrá 3 capítulos por módulo. El curso tendrá 2 evaluaciones parciales. Se realizarán 3 evaluaciones parciales.');
       await useDesign(cid);
       const n = await lockNow(cid);
       let resp = null;
       try { await gate.assertVerified(cid, OWNER, n); } catch (e) { resp = e.getResponse(); }
       eq(resp && resp.reason, 'critical', 'crítico');
-      assert(resp.criticals.some((c) => /video/i.test(c.title)), JSON.stringify(resp.criticals));
+      assert(resp.criticals.some((c) => /evaluaci/i.test(c.title)), JSON.stringify(resp.criticals));
       assert(/GENERATION_NOT_VERIFIED/.test(resp.message), resp.message);
+    });
+
+    await check('RG4b R68 (LOOP 9 review BE-L9 I2): lo que Cursia no puede producir (2 videos por capítulo) no es un crítico, pero bloquea la generación hasta que la institución registre el motivo (también fuera del flujo de propuesta)', async () => {
+      const cid = await courseWith('Gate 4b', [3, 3], 'El curso tendrá 3 capítulos por módulo. Cada capítulo debe incluir 2 videos.');
+      await useDesign(cid);
+      const card = await design.recommend(cid, OWNER, {});
+      const vchk = card.verification.checks.find((c) => c.capability);
+      assert(vchk && vchk.severity === 'warning' && !card.verification.blocking, 'excepción, no crítico');
+      const n = await lockNow(cid);
+      let resp = null;
+      try { await gate.assertVerified(cid, OWNER, n); } catch (e) { resp = e.getResponse(); }
+      eq(resp && resp.reason, 'critical', 'sin motivo: R68 bloquea');
+      assert(resp.criticals.some((c) => /falta el motivo/.test(c.title)), JSON.stringify(resp.criticals));
+      const key = vchk.capability.requirementKey;
+      await ds.query(`update public.courses set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), '{requirementExceptionReasons}', $2::jsonb, true) where id = $1`,
+        [cid, JSON.stringify({ [key]: { reason: 'La institución acepta un video por capítulo.', requirementText: vchk.capability.requirementText, by: 'test', at: new Date().toISOString() } })]);
+      eq(await gateReason(cid, n), 'ok', 'con el motivo registrado: pasa');
     });
 
     await check('RC7 conflictos que Cursia no resuelve sola: críticos con su causa; Verificación los muestra (el bloqueo real de la generación es R68, en runs; aplicar el diseño no se bloquea)', async () => {
@@ -653,7 +673,7 @@ async function dbChecks() {
       const part = card.verification.checks.find((c) => c.area === 'requirements' && /parciales/.test(c.title));
       eq(part.severity, 'critical', 'parciales');
       assert(/Entra en conflicto con «3 módulos»/.test(part.detail) || /4 evaluaciones parciales/.test(part.detail), part.detail);
-      eq(reqCheck(card, 'videos').severity, 'critical', 'dos videos por capítulo');
+      eq(reqCheck(card, 'videos').severity, 'warning', 'dos videos por capítulo → excepción (LOOP 9)');
       eq(card.verification.blocking, true, 'Verificación: hay críticos (el paso 4 lo muestra)');
       eq(card.design.modules.length, 4, 'Cursia no quitó ningún módulo');
       const { applied } = await useDesign(cid);
@@ -681,7 +701,7 @@ async function dbChecks() {
       eq(reqCheck(card, 'modules').severity, 'ok', '4 módulos');
       eq(reqCheck(card, 'chapters').severity, 'ok', '5 por módulo');
       eq(reqCheck(card, 'application_activities').severity, 'ok', 'AA');
-      eq(reqCheck(card, 'videos').severity, 'critical', '2 videos por capítulo: no se puede (explicado)');
+      eq(reqCheck(card, 'videos').severity, 'warning', '2 videos por capítulo: no se puede → excepción explicada (LOOP 9)');
       const part = card.verification.checks.find((c) => c.area === 'requirements' && /parciales/.test(c.title));
       eq(part.severity, 'critical', '3 parciales con 4 módulos evaluados');
       assert(/Entra en conflicto con «4 módulos»/.test(part.detail), part.detail);

@@ -90,8 +90,10 @@ function fixture(o = {}) {
   const facts = {
     factsVersion: 1,
     title: { value: o.longName ? 'Gestión Logística y Operaciones para Organizaciones Productivas y de Servicios en Contextos Regionales de Latinoamérica' : 'Gestión Logística y Operaciones', source: 'user' },
-    educationLevel: { value: 'Técnico / tecnológico', source: 'user' },
-    priorKnowledge: { value: 'Conoce lo esencial del tema', source: 'user' },
+    // Códigos reales del servicio de facts (LOOP 9: el modelo los convierte en rótulos para personas).
+    educationLevel: { value: 'technical', source: o.doc4x5 ? 'document' : 'user' },
+    priorKnowledge: { value: 'basic', source: 'inferred' },
+    documentPrerequisites: o.doc4x5 ? ['Contabilidad básica', 'Manejo de hoja de cálculo'] : [],
     learnerDescription: { value: 'Técnicos y tecnólogos que trabajan o quieren trabajar en áreas de logística, bodegas y operaciones.', source: o.doc4x5 ? 'document' : 'user' },
     outcomes: { value: o.noOutcomes ? [] : outcomes, source: 'document' },
     competencies: { value: ['Gestiona procesos logísticos con criterios de eficiencia y servicio.'], source: 'document' },

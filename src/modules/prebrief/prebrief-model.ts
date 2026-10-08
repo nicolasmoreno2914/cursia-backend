@@ -95,6 +95,8 @@ export interface PrebriefModel {
   learner: {
     description: OriginValue<string> | null;
     priorKnowledge: OriginValue<string> | null;
+    /** LOOP 9: conocimientos previos que pide el documento (temas), tal cual. */
+    prerequisites?: OriginValue<string> | null;
   };
   goals: {
     generalObjective: (OriginValue<string> & { label: string }) | null;
@@ -192,6 +194,35 @@ export interface PrebriefInputs {
 const clean = (s: unknown): string => String(s == null ? '' : s).normalize('NFC').replace(/\s+/g, ' ').trim();
 const round1 = (n: number) => Math.round(Number(n) * 10) / 10;
 
+/**
+ * LOOP 9 (review FE-L9): textos que vienen TAL CUAL del documento de la institución (resultados, competencias, perfil,
+ * objetivo, evaluaciones, requisitos y sus citas). Language QA de la propuesta no los bloquea: la institución no puede
+ * editarlos en Cursia (una cita con «coger» o voseo dejaría la propuesta trabada). Lo que Cursia redacta sí se revisa.
+ */
+export function documentVerbatimTexts(m: PrebriefModel): string[] {
+  const out: string[] = [];
+  const add = (v: unknown) => { const t = typeof v === 'string' ? v.trim() : ''; if (t) out.push(t); };
+  const doc = (o: string) => o === 'document';
+  for (const o of m.goals.outcomes) { if (doc(o.origin)) add(o.text); if (o.evidence) add(o.evidence.quote); }
+  for (const c of m.goals.competencies) if (doc(c.origin)) add(c.text);
+  if (m.goals.generalObjective && doc(m.goals.generalObjective.origin)) add(m.goals.generalObjective.value);
+  if (m.learner.description && doc(m.learner.description.origin)) add(m.learner.description.value);
+  if (m.learner.prerequisites) for (const x of m.learner.prerequisites.value.split('; ')) add(x);
+  for (const e of m.evaluation.fromDocument) if (doc(e.origin)) add(e.text);
+  for (const r of m.requirements.items) { add(r.text); if (r.evidence) add(r.evidence.quote); }
+  for (const e of m.exceptions) add(e.requirementText);
+  return out;
+}
+/** ¿El texto del documento de la propuesta es (o contiene) una cita literal del documento de la institución? */
+export function isDocumentVerbatim(text: string, verbatim: string[]): boolean {
+  const t = String(text || '').trim();
+  return !!t && verbatim.some((v) => t === v || (v.length >= 12 && t.includes(v)));
+}
+
+/** LOOP 9 (P1-9): rótulos para personas (el modelo nunca muestra un código interno). */
+const EDUCATION_LEVEL_LABEL: Readonly<Record<string, string>> = { basic: 'Educación básica', secondary: 'Bachillerato', technical: 'Técnico / tecnológico', university: 'Universitario', professional: 'Corporativo (profesionales en ejercicio)' };
+const PRIOR_KNOWLEDGE_LABEL: Readonly<Record<string, string>> = { none: 'Sin conocimientos previos del tema', basic: 'Conoce lo esencial del tema', intermediate: 'Conoce los conceptos fundamentales', advanced: 'Ya trabaja en el área' };
+
 export function factOrigin(src: FactSource | null | undefined): PrebriefOrigin {
   switch (src) {
     case 'document': return 'document';
@@ -275,14 +306,19 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
   const program = academic && academic.identity.program && academic.identity.program.status !== 'missing' && clean(academic.identity.program.value)
     ? { value: clean(academic.identity.program.value), origin: academic.identity.program.status === 'provided' ? 'institution' as const : 'document' as const, evidence: evidenceOf(academic.identity.program.sources) }
     : null;
-  const declaredLevel = clean(brief.contexto);
-  const level: OriginValue<string> | null = declaredLevel
-    ? { value: declaredLevel, origin: 'institution' }
-    : facts.educationLevel.value ? { value: clean(facts.educationLevel.value), origin: factOrigin(facts.educationLevel.source) } : null;
+  // LOOP 9 (P1-9): el nivel sale de la misma jerarquía que el resto (perfil del docente > documento > «Crear»), con su
+  // origen real y un rótulo para personas: nunca el texto interno del prompt ni un valor de partida como «decisión».
+  const lv = facts.educationLevel.value ? String(facts.educationLevel.value) : null;
+  const customLevel = clean(String(brief.contexto || '').split(' — ')[0]);
+  const level: OriginValue<string> | null = lv
+    ? { value: EDUCATION_LEVEL_LABEL[lv] || clean(lv), origin: factOrigin(facts.educationLevel.source) }
+    : customLevel ? { value: customLevel, origin: factOrigin(String(brief.inferidos || '').split(',').map((x) => x.trim()).includes('contexto') ? 'inferred' : 'user') } : null;
 
   // Estudiante.
   const description = facts.learnerDescription.value ? { value: clean(facts.learnerDescription.value), origin: factOrigin(facts.learnerDescription.source) } : null;
-  const prior = facts.priorKnowledge.value ? { value: clean(facts.priorKnowledge.value), origin: factOrigin(facts.priorKnowledge.source) } : null;
+  const prior = facts.priorKnowledge.value ? { value: PRIOR_KNOWLEDGE_LABEL[String(facts.priorKnowledge.value)] || clean(facts.priorKnowledge.value), origin: factOrigin(facts.priorKnowledge.source) } : null;
+  const docPrereq = ((facts as any).documentPrerequisites || []).map((x: unknown) => clean(String(x))).filter(Boolean);
+  const prerequisites = docPrereq.length ? { value: docPrereq.join('; '), origin: 'document' as const } : null;
 
   // Objetivo: el general del documento; si no hay, el propósito que escribió la institución (nunca uno inventado).
   const go = academic && academic.identity.generalObjective;
@@ -361,7 +397,8 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
     const vt = texts.get(r.id);
     const text = requirementTextOf(r);
     const sev = c ? c.severity : null;
-    const ex = vt && vt.text && EXCEPTION_TITLE_RE.test(String(((card.verification || {}).checks || []).find((x: any) => x.id === `requirement:${r.id}`)?.title || ''));
+    const vcheck: any = ((card.verification || {}).checks || []).find((x: any) => x.id === `requirement:${r.id}`);
+    const ex = vt && vt.text && EXCEPTION_TITLE_RE.test(String(vcheck?.title || ''));
     let status: PrebriefRequirement['status'];
     if (ex) status = 'exception';
     else if (sev === 'critical') status = 'conflict';
@@ -375,7 +412,8 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
       const saved = inp.exceptionReasons[String(r.key)];
       const valid = saved && saved.requirementText === text && clean(saved.reason).length > 0;
       exceptions.push({
-        requirementKey: String(r.key), requirementText: text, appliedText: actual || '—',
+        // LOOP 9 (P0-2): un requisito que Cursia no puede producir muestra lo que SÍ produce (campo explícito del check).
+        requirementKey: String(r.key), requirementText: text, appliedText: actual || (vcheck && vcheck.capability ? clean(vcheck.capability.produces) : '—'),
         reason: valid ? clean(saved.reason) : null, by: valid ? saved.by : null, at: valid ? saved.at : null,
       });
     }
@@ -473,7 +511,7 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
       level,
       language: 'Español',
     },
-    learner: { description, priorKnowledge: prior },
+    learner: { description, priorKnowledge: prior, prerequisites },
     goals: { generalObjective, outcomes, competencies },
     pedagogy: { approach, cycle: inp.approachInfo ? inp.approachInfo.cycle : [], methodologyFromDocument },
     duration: {

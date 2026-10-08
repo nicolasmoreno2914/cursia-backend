@@ -90,7 +90,14 @@ function numerize(n: string): string {
 const RE_EXAMPLE = /\b(ejemplo|por ejemplo|p\. ?ej|supongamos|a modo de ejemplo|ilustrativ\w*|hipotetic\w*)\b/;
 const RE_PAYMENT = /(\bpago\b|\bpagar\w*|remunera\w*|honorario\w*|reconocer\w*|\breconocimiento\b|\$|\bcop\b|\bprecio\b|\btarifa\b|\binversion\b|\bvalor del\b)/;
 const RE_REQUIRED = /\b(debera|deberan|debe|deben|tendra|tendran|contara con|contaran con|constara de|constaran de|estara (?:compuest|conformad|dividid|organizad)\w*|se realizara|se realizaran|seran realizad\w*|sera realizad\w*|se desarrollara|se desarrollaran|se deben|se debe|se requiere|se requieren|es obligatori\w*|obligatoriamente|se exige|se exigen|incluira|incluiran|sera|seran|se contemplara|se contemplaran|se producira|se produciran|se aplicaran|se aplicara)\b/;
+// LOOP 9 (P1-3): el presente descriptivo «incluye / contiene / contempla» también fija el curso («Cada módulo incluye 1 Actividad
+// de Aplicación»), con número + sustantivo modelado, igual que «tiene».
 const RE_PRESENT = /\b(tiene|tienen|consta de|constan de|esta dividid\w*|esta compuest\w*|esta organizad\w*|esta conformad\w*|se divide|se organiza|comprende|comprenden|cuenta con)\b/;
+// …solo cuando el sujeto es el curso o una de sus partes: «la bibliografía incluye 3 capítulos del libro» no exige nada.
+// El sujeto abre la oración (review BE-L9 m1: «La bibliografía de cada módulo incluye 3 capítulos del libro» no exige nada).
+/** Conector corto al inicio de la oración («Además, cada módulo…»). */
+const LEAD = '(?:(?:ademas|asimismo|tambien|por otra parte|en total|en este curso),?\\s+)?';
+const RE_PRESENT_INCLUDE = /^\s*(?:(?:ademas|asimismo|tambien|por otra parte|en total|en este curso),?\s+)?(?:en\s+)?(el curso|este curso|la asignatura|el programa|el diplomado|el modulo|cada modulo|los modulos|el capitulo|cada capitulo|los capitulos|cada unidad|las unidades)\b[^.;:]{0,40}?\b(incluye|incluyen|contiene|contienen|contempla|contemplan)\b/;
 const RE_RECOMMENDED = /\b(se recomienda|se recomiendan|se sugiere|se sugieren|recomendable|idealmente|preferiblemente|sugerid\w*|se propone|se proponen)\b/;
 const RE_PROPOSE = /\b(se propone|se proponen)\b/;
 const RE_PERMITTED = /\b(podra|podran|puede|pueden|opcional\w*|es posible)\b/;
@@ -334,6 +341,20 @@ function conditionOf(c: string): RequirementCondition {
   return { text: c, modeled: false };
 }
 
+/** LOOP 9 (P1-10): de qué habla un choque, en palabras (antes se mostraba la clave interna «target_hours@course»). */
+const CONFLICT_SUBJECT: Readonly<Record<string, string>> = {
+  target_hours: 'las horas de trabajo del estudiante', modules: 'la cantidad de módulos', units: 'las unidades', chapters: 'los capítulos', structure: 'la estructura',
+  videos: 'los videos', application_activities: 'las Actividades de Aplicación', activities: 'las actividades interactivas', evaluations: 'las evaluaciones',
+};
+function conflictSubject(r: DocumentRequirement): string {
+  const base = r.kind === 'evaluations' && r.evaluationType === 'partial' ? 'las evaluaciones parciales'
+    : r.kind === 'evaluations' && r.evaluationType === 'final' ? 'la evaluación final' : CONFLICT_SUBJECT[r.kind] || 'un mismo dato';
+  const sc = r.scope as any;
+  const scope = sc && sc.each ? (sc.level === 'module' ? ' por módulo' : sc.level === 'chapter' ? ' por capítulo' : sc.level === 'unit' ? ' por unidad' : '')
+    : sc && sc.index ? (sc.level === 'module' ? ` del módulo ${sc.index}` : sc.level === 'unit' ? ` de la unidad ${sc.index}` : '') : '';
+  return base + scope;
+}
+
 export function extractRequirements(lines: SourceLine[], documentId = 'doc'): RequirementsExtraction {
   const segs = segmentsOf(lines);
   const requirements: DocumentRequirement[] = [];
@@ -412,17 +433,17 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
         if (RE_PROPOSE.test(m)) medium = true;
       } else if (RE_PERMITTED.test(m)) obligation = 'permitted';
       else if (RE_REQUIRED.test(m)) obligation = 'required';
-      else if (RE_PRESENT.test(m)) {
+      else if (RE_PRESENT.test(m) || RE_PRESENT_INCLUDE.test(m)) {
         obligation = 'required';
         medium = true;
       } else if (seg.option || (field && /\d/.test(field[2]) && RE_MODELED_LABEL.test(field[1]))) obligation = 'required'; // dato de ficha u opción rotulada
 
       // Alcance de la oración («Cada módulo deberá…», «Cada capítulo de práctica…»).
       let sentenceScope: RequirementScope | null = null;
-      if (/^\s*(en )?cada modulo\b/.test(m)) sentenceScope = { level: 'module', each: true };
-      else if (/^\s*(en )?cada capitulo de practica\b/.test(m)) sentenceScope = { level: 'chapter', each: true, chapterKind: 'practice' };
-      else if (/^\s*(en )?cada capitulo\b/.test(m)) sentenceScope = { level: 'chapter', each: true };
-      else if (/^\s*(en )?cada unidad\b/.test(m)) sentenceScope = { level: 'unit', each: true };
+      if (new RegExp(`^\\s*${LEAD}(en )?cada modulo\\b`).test(m)) sentenceScope = { level: 'module', each: true };
+      else if (new RegExp(`^\\s*${LEAD}(en )?cada capitulo de practica\\b`).test(m)) sentenceScope = { level: 'chapter', each: true, chapterKind: 'practice' };
+      else if (new RegExp(`^\\s*${LEAD}(en )?cada capitulo\\b`).test(m)) sentenceScope = { level: 'chapter', each: true };
+      else if (new RegExp(`^\\s*${LEAD}(en )?cada unidad\\b`).test(m)) sentenceScope = { level: 'unit', each: true };
 
       // Campo de ficha con número suelto: el tipo sale del rótulo («Número de módulos: 4», «Capítulos por módulo: 5»).
       let mentions: Mention[] = [];
@@ -595,7 +616,7 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
       continue;
     }
     if (prev && prev.active && r.active && prev.obligation === 'required' && r.obligation === 'required') {
-      conflicts.push({ key: r.key, requirementIds: [prev.id, r.id], message: `El documento dice dos cosas distintas para ${r.key}: «${prev.source.quote.slice(0, 80)}» y «${r.source.quote.slice(0, 80)}».` });
+      conflicts.push({ key: r.key, requirementIds: [prev.id, r.id], message: `El documento dice dos cosas distintas sobre ${conflictSubject(r)}: «${prev.source.quote.slice(0, 80)}» y «${r.source.quote.slice(0, 80)}».` });
     }
     if (!prev) seen.set(k, r);
     kept.push(r);

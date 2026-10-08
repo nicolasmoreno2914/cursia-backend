@@ -245,6 +245,12 @@ class DocExtraction {
   private segment(lines: SourceLine[]): Section[] {
     const out: Section[] = [];
     let cur: Section | null = null;
+    // LOOP 9 (P1-1): una sección que Cursia no modela («5. Estructura del curso») cierra la anterior: si no, su texto se
+    // sumaba a la lista de arriba (p. ej. un «RA6» con la estructura). Cuenta como encabezado solo si sigue la numeración
+    // de los encabezados del documento (4 → 5), es corto, sin punto final, y la sección actual no numera sus propios ítems.
+    let lastHeadingNum: number | null = null;
+    let curNumbered = false;
+    const headingNum = (t: string) => { const m = /^\s*(\d{1,2})[.)]\s+\S/.exec(t); return m ? Number(m[1]) : null; };
     for (const l of lines) {
       if (l.cells) {
         const pairs = this.cellPairs(l);
@@ -262,8 +268,20 @@ class DocExtraction {
       if (h) {
         cur = { key: h.key, heading: h.heading, headingLine: l, inline: h.value, lines: [] };
         out.push(cur);
+        const hn = headingNum(l.text);
+        if (hn !== null) lastHeadingNum = hn;
+        curNumbered = false;
         if (SINGLE_VALUE.has(h.key) && h.value) cur = null;
         continue;
+      }
+      const n = headingNum(l.text);
+      if (cur && n !== null) {
+        const title = l.text.replace(/^\s*\d{1,2}[.)]\s+/, '').trim();
+        const unknownHeading = !curNumbered && lastHeadingNum !== null && n === lastHeadingNum + 1 && title.split(/\s+/).length <= 8 && !/[.;:]$/.test(title);
+        // (Solo la numeración: un encabezado con estilo —Markdown «#», «Título N» de Word— puede ser una unidad dentro de
+        // «Contenidos»; no cierra la sección. Review BE-L9 I1.)
+        if (unknownHeading) { cur = null; lastHeadingNum = n; continue; }
+        curNumbered = true;
       }
       if (cur) {
         cur.lines.push(l);
