@@ -494,8 +494,11 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
 
   // Contexto de generación: el pedido guardado, alineado con el estudiante que congela el Blueprint.
   const ctx: Record<string, string> = {};
+  // LOOP 9 QA (P1-11): sin sector/país en el pedido, el que muestra «Lo que entendimos» (inferido del documento o de
+  // partida). Antes la pantalla mostraba «Sector: … inferido» y la propuesta lo pedía como dato faltante.
+  const fromFacts: Record<string, string | null> = { sector: facts.sector && facts.sector.value ? String(facts.sector.value) : null, pais: facts.country && facts.country.value ? String(facts.country.value) : null };
   for (const k of PREBRIEF_CONTEXT_FIELDS) {
-    const v = clean(k === 'nombre' ? brief.nombre || inp.course.title : brief[k]);
+    const v = clean(k === 'nombre' ? brief.nombre || inp.course.title : brief[k] || fromFacts[k] || '');
     if (v) ctx[k] = v;
   }
   const generationContext = inp.alignContext(ctx);
