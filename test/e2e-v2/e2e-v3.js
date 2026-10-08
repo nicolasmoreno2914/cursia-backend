@@ -2524,7 +2524,20 @@ function reservationBookkeeping(ev) {
       const pedNow = async () => (await api('GET', `/courses/${courseId}/profiles/pedagogy`)).data;
       const acNow = async () => (await api('GET', `/courses/${courseId}/profiles/academic`)).data;
       const firstChapter = async () => { const st = await readStructure(courseId); const m = st.modules[0]; return { st, m, c: m.chapters.find((x) => x.kind !== 'practice') }; };
+      // LOOP 9.1 (F): también el nombre del curso y el enfoque pedagógico (además de los 14 de LOOP 9).
+      let ped0 = null;
+      const must2xx = (r, what) => { if (!r || r.status < 200 || r.status >= 300) throw new Error(`E20 ${what}: ${r && r.status} ${r && r.error}`); return r; };
       const MUT = [
+        ['nombre', async () => { must2xx(await api('PUT', `/courses/${courseId}/brief`, { ...brief, nombre: `${brief.nombre} (versión corta)` }), 'cambiar el nombre'); },
+          async () => { must2xx(await api('PUT', `/courses/${courseId}/brief`, brief), 'restaurar el nombre'); }],
+        ['enfoque', async () => {
+          const p = await pedNow(); ped0 = { primaryApproach: p.profile.primaryApproach || null, secondaryApproaches: p.profile.secondaryApproaches || [] };
+          const next = ped0.primaryApproach === 'problemas' ? 'experiencial' : 'problemas';
+          must2xx(await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: { ...p.profile, primaryApproach: next, secondaryApproaches: ped0.secondaryApproaches.filter((x) => x !== next) }, expectedVersion: Number(p.version) }), 'cambiar el enfoque');
+        }, async () => {
+          const p = await pedNow();
+          must2xx(await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: { ...p.profile, ...ped0 }, expectedVersion: Number(p.version) }), 'restaurar el enfoque');
+        }],
         ['tono', async () => { await api('PUT', `/courses/${courseId}/brief`, { ...brief, tono: 'formal y técnico' }); }, async () => { await api('PUT', `/courses/${courseId}/brief`, brief); }],
         ['horas', async () => { const p = await pedNow(); await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: { ...p.profile, targetHours: 40 }, expectedVersion: Number(p.version) }); },
           async () => { const p = await pedNow(); await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: { ...p.profile, targetHours: 42 }, expectedVersion: Number(p.version) }); }],

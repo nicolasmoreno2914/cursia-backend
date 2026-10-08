@@ -57,6 +57,14 @@ const n1 = (n: number) => String(Math.round(Number(n) * 10) / 10).replace('.', '
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 const hoursText = (n: number) => `${n1(n)} ${Number(n) === 1 ? 'hora' : 'horas'}`;
 const join = (xs: string[]) => (xs.length <= 1 ? xs.join('') : `${xs.slice(0, -1).join(', ')} y ${xs[xs.length - 1]}`);
+/** LOOP 9.1 (A2): «estructura 4 × 5 (20 capítulos)» → «Estructura de 4 módulos × 5 capítulos (20 capítulos)» (solo al mostrar). */
+const reqDisplay = (t: string) => {
+  const x = /^estructura (\d+) × (\d+) \((\d+) capítulos\)$/i.exec(t);
+  const y = /^estructura ((?:\d+, )+\d+) \((\d+) capítulos\)$/i.exec(t);
+  const out = x ? `estructura de ${x[1]} ${x[1] === '1' ? 'módulo' : 'módulos'} × ${x[2]} ${x[2] === '1' ? 'capítulo' : 'capítulos'} (${x[3]} capítulos)`
+    : y ? `estructura de ${y[1].split(', ').length} módulos con ${y[1].replace(/, (\d+)$/, ' y $1')} capítulos (${y[2]} capítulos)` : t;
+  return out.charAt(0).toUpperCase() + out.slice(1);
+};
 const chaptersText = (ns: number[]) => (ns.length === 1 ? `capítulo ${ns[0]}` : `capítulos ${join(ns.map(String))}`);
 
 export const ORIGIN_LEGEND: { key: PrebriefOrigin; text: string }[] = [
@@ -73,19 +81,32 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
   const S = m.structure;
   const R = m.resources;
   const reqC = m.requirements.counts;
+  // LOOP 9.1 (A2): el N×M que lee el cliente es de capítulos de contenido; la práctica se nombra aparte (como en el formato).
+  const contentPer = S.modules.map((md) => md.chapters.filter((c) => c.kind !== 'practice').length);
+  const sameContent = contentPer.length > 0 && contentPer.every((n) => n === contentPer[0]);
+  // Misma redacción que la excepción («…, más 1 capítulo de práctica por módulo»).
+  const practicePer = S.modules.map((md) => md.chapters.filter((c) => c.kind === 'practice').length);
+  const practiceText = !S.totals.practiceChapters ? ''
+    : practicePer.every((n) => n === practicePer[0]) ? `, más ${plural(practicePer[0], 'capítulo de práctica', 'capítulos de práctica')} por módulo`
+      : `, más ${plural(S.totals.practiceChapters, 'capítulo de práctica', 'capítulos de práctica')}`;
+  const organization = sameContent
+    ? `${plural(S.totals.modules, 'módulo', 'módulos')} × ${plural(contentPer[0], 'capítulo de contenido', 'capítulos de contenido')}${practiceText}`
+    : `${plural(S.totals.modules, 'módulo', 'módulos')} · ${plural(S.totals.contentChapters, 'capítulo de contenido', 'capítulos de contenido')}${practiceText}`;
 
   // ── El curso en una mirada ──
   const figures: { value: string; label: string }[] = [];
   // Las horas DEL DISEÑO (lo que se produce); el formato o la meta, como referencia en la etiqueta.
   figures.push({ value: `${n1(S.totals.hours)} h`, label: m.duration.format ? `de trabajo del estudiante · ${m.duration.format.value} (${m.duration.format.hoursMin}–${m.duration.format.hoursMax} h)` : 'de trabajo del estudiante' });
-  figures.push({ value: `${S.totals.modules} · ${S.totals.chapters}`, label: 'módulos · capítulos' });
+  figures.push(sameContent
+    ? { value: `${S.totals.modules} × ${contentPer[0]}`, label: 'módulos × capítulos de contenido' }
+    : { value: `${S.totals.modules} · ${S.totals.contentChapters}`, label: 'módulos · capítulos de contenido' });
   figures.push({ value: String(m.goals.outcomes.length), label: m.goals.outcomes.length === 1 ? 'resultado de aprendizaje' : 'resultados de aprendizaje' });
   if (reqC.total) figures.push({ value: `${reqC.met} de ${reqC.total}`, label: 'requisitos del documento cumplidos' });
   else figures.push({ value: String(R.moduleExams + (R.finalExam ? 1 : 0)), label: 'evaluaciones' });
   const glance: DocBlock[] = [{ t: 'figures', items: figures }];
   const who = m.learner.description ? m.learner.description.value : null;
   const summaryParts: string[] = [];
-  summaryParts.push(`Curso virtual de ${hoursText(S.totals.hours)} de trabajo del estudiante, organizado en ${plural(S.totals.modules, 'módulo', 'módulos')} y ${plural(S.totals.chapters, 'capítulo', 'capítulos')}${S.totals.practiceChapters ? ` (${plural(S.totals.practiceChapters, 'de práctica', 'de práctica')})` : ''}.`);
+  summaryParts.push(`Curso virtual de ${hoursText(S.totals.hours)} de trabajo del estudiante, organizado en ${organization}.`);
   if (who) summaryParts.push(`Está dirigido a: ${who.replace(/\.$/, '')}.`);
   if (m.pedagogy.approach) summaryParts.push(`Enfoque pedagógico: ${m.pedagogy.approach.value.toLowerCase()}.`);
   glance.push({ t: 'paragraph', text: summaryParts.join(' ') });
@@ -99,7 +120,7 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
   if (m.course.institution) info.push({ label: 'Institución', value: m.course.institution });
   info.push({ label: 'Modalidad', value: m.course.modality.value, origin: o(m.course.modality.origin) });
   if (m.duration.targetHours) info.push({ label: 'Duración', value: `${hoursText(m.duration.targetHours.value)} de trabajo del estudiante (meta del diseño)`, origin: o(m.duration.targetHours.origin) });
-  if (m.duration.format) info.push({ label: 'Formato', value: `${m.duration.format.value}: ${m.duration.format.modules} módulos · ${m.duration.format.modules * m.duration.format.chaptersPerModule} capítulos · ${m.duration.format.hoursMin}–${m.duration.format.hoursMax} horas`, origin: o('format') });
+  if (m.duration.format) info.push({ label: 'Formato', value: `${m.duration.format.value}: ${m.duration.format.modules} módulos × ${m.duration.format.chaptersPerModule} capítulos de contenido · ${m.duration.format.hoursMin}–${m.duration.format.hoursMax} horas`, origin: o('format') });
   if (m.duration.credits) info.push({ label: 'Créditos', value: n1(m.duration.credits.value), origin: o(m.duration.credits.origin) });
   info.push({ label: 'Idioma', value: 'Español' });
   sections.push({ id: 'general', n: '1', title: 'Información general', blocks: [{ t: 'kv', rows: info }] });
@@ -156,7 +177,7 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
   const durRows: { label: string; value: string; origin?: DocOrigin }[] = [];
   if (m.duration.targetHours) durRows.push({ label: 'Meta de horas', value: hoursText(m.duration.targetHours.value), origin: o(m.duration.targetHours.origin) });
   durRows.push({ label: 'Horas del diseño', value: `${hoursText(S.totals.hours)} de trabajo del estudiante (estimadas)` });
-  durRows.push({ label: 'Organización', value: `${plural(S.totals.modules, 'módulo', 'módulos')} · ${plural(S.totals.contentChapters, 'capítulo de contenido', 'capítulos de contenido')}${S.totals.practiceChapters ? ` · ${plural(S.totals.practiceChapters, 'capítulo de práctica', 'capítulos de práctica')}` : ''}`, origin: o(S.origin) });
+  durRows.push({ label: 'Organización', value: organization, origin: o(S.origin) });
   st.push({ t: 'kv', rows: durRows });
   st.push({ t: 'modules', origin: o(S.origin), footnote: m.duration.format ? `Las prácticas y las Actividades de Aplicación no cuentan dentro del ${m.duration.format.value} (${m.duration.format.modules} × ${m.duration.format.chaptersPerModule}).` : 'Horas de trabajo del estudiante estimadas por Cursia para cada capítulo.',
     modules: S.modules.map((md) => ({
@@ -191,25 +212,31 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
 
   // ── 9. Recursos previstos ──
   const res: { text: string; note?: string }[] = [];
-  if (R.presentations) res.push({ text: plural(R.presentations, 'presentación', 'presentaciones'), note: 'Una por capítulo de contenido, para introducir el tema.' });
-  if (R.videos) res.push({ text: plural(R.videos, 'video', 'videos'), note: 'Con preguntas integradas para comprobar la comprensión.' });
-  if (R.interactiveActivities) res.push({ text: plural(R.interactiveActivities, 'actividad interactiva', 'actividades interactivas'), note: 'Práctica con retroalimentación inmediata.' });
-  if (R.applicationActivities) res.push({ text: plural(R.applicationActivities, 'Actividad de Aplicación', 'Actividades de Aplicación'), note: 'Casos o talleres con solucionario solo para docentes.' });
-  if (R.audiobookChapters) res.push({ text: `Audiolibro (${plural(R.audiobookChapters, 'capítulo', 'capítulos')})`, note: 'Versión en audio de los contenidos.' });
+  // LOOP 9.1 (A3): todo lo de esta sección está PREVISTO por el diseño; nada se produjo todavía (se produce después de aprobar).
+  if (R.presentations) res.push({ text: plural(R.presentations, 'presentación prevista', 'presentaciones previstas'), note: 'Una por capítulo de contenido, para introducir el tema.' });
+  if (R.videos) res.push({ text: plural(R.videos, 'video educativo previsto', 'videos educativos previstos'), note: 'Con preguntas integradas para comprobar la comprensión.' });
+  if (R.interactiveActivities) res.push({ text: plural(R.interactiveActivities, 'actividad interactiva prevista', 'actividades interactivas previstas'), note: 'Práctica con retroalimentación inmediata.' });
+  if (R.applicationActivities) res.push({ text: plural(R.applicationActivities, 'Actividad de Aplicación prevista', 'Actividades de Aplicación previstas'), note: 'Casos o talleres con solucionario solo para docentes.' });
+  if (R.audiobookChapters) res.push({ text: `Audiolibro previsto (${plural(R.audiobookChapters, 'capítulo', 'capítulos')})`, note: 'Versión en audio de los contenidos.' });
   if (R.welcomeAudio) res.push({ text: 'Mensaje de bienvenida en audio' });
   if (R.guideBook) res.push({ text: 'Libro Guía del curso', note: 'Documento descargable con todos los contenidos.' });
-  sections.push({ id: 'resources', n: '9', title: 'Recursos previstos', blocks: [res.length ? { t: 'list', items: res } : { t: 'paragraph', text: 'Sin recursos previstos.', muted: true }] });
+  sections.push({ id: 'resources', n: '9', title: 'Recursos previstos', blocks: res.length
+    ? [{ t: 'paragraph', text: 'Estos son los recursos que el diseño prevé para el curso. Todavía no existen: se elaboran en la etapa de producción, después de aprobar esta propuesta.' }, { t: 'list', items: res }]
+    : [{ t: 'paragraph', text: 'Sin recursos previstos.', muted: true }] });
 
   // ── 10. Requisitos institucionales ──
   const STATUS: Record<string, string> = { met: 'Cumple', exception: 'Excepción', not_verifiable: 'No verificable', conflict: 'Conflicto' };
+  const statusLabelOf = (i: { status: string; doubtful?: true }) => (i.doubtful ? 'Por confirmar' : STATUS[i.status]);
+  const toConfirm = m.requirements.items.filter((i) => i.doubtful).length;
+  const notVerif = reqC.notVerifiable - toConfirm;
   const rq: DocBlock[] = [];
   if (!m.requirements.hasDocument) rq.push({ t: 'paragraph', text: 'Este curso no tiene un documento institucional de referencia.', muted: true });
   else if (!m.requirements.items.length) rq.push({ t: 'paragraph', text: `El documento (${m.requirements.documentNames.join(', ')}) no establece requisitos de diseño que Cursia deba cumplir.`, muted: true });
   else {
-    rq.push({ t: 'paragraph', text: `${reqC.met} de ${reqC.total} requisitos del documento se cumplen${reqC.exceptions ? `; ${plural(reqC.exceptions, 'tiene', 'tienen')} una excepción decidida por la institución` : ''}${reqC.notVerifiable ? `; ${reqC.notVerifiable} no ${reqC.notVerifiable === 1 ? 'es verificable' : 'son verificables'} automáticamente` : ''}.` });
+    rq.push({ t: 'paragraph', text: `${reqC.met} de ${reqC.total} requisitos del documento se cumplen${reqC.exceptions ? `; ${plural(reqC.exceptions, 'tiene', 'tienen')} una excepción decidida por la institución` : ''}${notVerif ? `; ${notVerif} no ${notVerif === 1 ? 'es verificable' : 'son verificables'} automáticamente` : ''}${toConfirm ? `; ${toConfirm} ${toConfirm === 1 ? 'queda' : 'quedan'} por confirmar` : ''}.` });
     rq.push({ t: 'requirements', items: m.requirements.items.map((i) => ({
-      status: i.status, statusLabel: STATUS[i.status], text: i.text.charAt(0).toUpperCase() + i.text.slice(1),
-      note: i.status === 'exception' ? `Decisión aplicada: ${i.actual || '—'} (ver sección 12).` : i.status === 'not_verifiable' ? 'Cursia no puede comprobarlo automáticamente; se incorpora como orientación del diseño.' : i.status === 'conflict' ? `El diseño tiene ${i.actual || '—'}.` : undefined,
+      status: i.status, statusLabel: statusLabelOf(i), text: reqDisplay(i.text),
+      note: i.status === 'exception' ? `Decisión aplicada: ${i.actual || '—'} (ver sección 12).` : i.status === 'not_verifiable' ? (i.doubtful && i.detail ? i.detail : 'Cursia no puede comprobarlo automáticamente; se incorpora como orientación del diseño.') : i.status === 'conflict' ? `El diseño tiene ${i.actual || '—'}.` : undefined,
       evidence: i.evidence || undefined,
     })) });
   }
@@ -224,7 +251,7 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
   // ── 12. Excepciones ──
   sections.push({ id: 'exceptions', n: '12', title: 'Excepciones al documento', blocks: [m.exceptions.length
     ? { t: 'exceptions', items: m.exceptions.map((e) => ({ rows: [
-      { label: 'Requisito original', value: e.requirementText.charAt(0).toUpperCase() + e.requirementText.slice(1) },
+      { label: 'Requisito original', value: reqDisplay(e.requirementText) },
       { label: 'Decisión aplicada', value: e.appliedText },
       { label: 'Tipo', value: 'Excepción al requisito del documento' },
       { label: 'Motivo', value: e.reason || 'Motivo pendiente', strong: true },
@@ -249,7 +276,7 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
   if (m.requirements.documentNames.length) ann.push({ label: 'Documentos de referencia', value: m.requirements.documentNames.join(', ') });
   const evid: { text: string; note?: string }[] = [];
   for (const x of m.goals.outcomes) if (x.evidence) evid.push({ text: `${x.id}: «${x.evidence.quote}»`, note: x.evidence.page ? `Página ${x.evidence.page}` : undefined });
-  for (const i of m.requirements.items) if (i.evidence) evid.push({ text: `${i.text.charAt(0).toUpperCase() + i.text.slice(1)}: «${i.evidence.quote}»`, note: i.evidence.page ? `Página ${i.evidence.page}` : undefined });
+  for (const i of m.requirements.items) if (i.evidence) evid.push({ text: `${reqDisplay(i.text)}: «${i.evidence.quote}»`, note: i.evidence.page ? `Página ${i.evidence.page}` : undefined });
   const annex: DocBlock[] = [];
   if (ann.length) annex.push({ t: 'kv', rows: ann });
   annex.push(evid.length ? { t: 'list', items: evid } : { t: 'paragraph', text: 'Sin citas del documento.', muted: true });

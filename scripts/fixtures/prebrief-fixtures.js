@@ -55,8 +55,10 @@ function fixture(o = {}) {
   if (o.doc4x5) {
     const r = { id: 'req-structure', key: 'structure|course', kind: 'structure', scope: { level: 'course' }, mode: 'exact', value: null, shape: [5, 5, 5, 5], obligation: 'required', applies: true, active: true, status: 'found', confidence: 'high', source: { documentId: 'doc-1', line: 12, page: 2, quote: 'El curso tendrá 4 módulos con 5 capítulos cada uno.' } };
     reqItems.push(r);
-    const met = sh.length === 4 && sh.every((n) => n === 5);
-    reqChecks.push({ requirementId: r.id, status: met ? 'met' : 'unmet', actual: { shape: sh }, chosenBy: 'teacher', severity: met ? 'ok' : 'warning' });
+    // Como compareRequirements: la forma cuenta todos los capítulos; «practice» dice cuántos son de práctica (LOOP 9.1).
+    const total = modules.map((m) => m.chapters.length);
+    const met = total.length === 4 && total.every((n) => n === 5);
+    reqChecks.push({ requirementId: r.id, status: met ? 'met' : 'unmet', actual: { shape: total, practice: modules.map((m) => m.chapters.length - m.chapters.filter((c) => c.kind === 'content').length) }, chosenBy: 'teacher', severity: met ? 'ok' : 'warning' });
     vchecks.push(met ? { id: 'requirement:req-structure', area: 'requirements', severity: 'ok', title: 'Requisito del documento: estructura 4 × 5 (20 capítulos)' }
       : { id: 'requirement:req-structure', area: 'requirements', severity: 'warning', title: 'Excepción al requisito del documento: estructura 4 × 5 (20 capítulos)', detail: 'Te estás apartando de un requisito del documento.' });
     const ev = { id: 'req-evals', key: 'evaluations|course|partial', kind: 'evaluations', scope: { level: 'course' }, mode: 'exact', value: shape.length, evaluationType: 'partial', obligation: 'required', applies: true, active: true, status: 'found', confidence: 'high', source: { documentId: 'doc-1', line: 20, page: 4, quote: `Se realizarán ${shape.length} evaluaciones parciales, una al cierre de cada módulo.` } };
