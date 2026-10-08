@@ -2127,6 +2127,241 @@ function reservationBookkeeping(ev) {
       ok(made[0].n === 0, 'E18: no se creó ninguna generación ni job para cursos sin verificación aprobable', made[0]);
     });
 
+    // ═══ Prebrief pedagógico · E19 — propuesta versionada, PDF, aprobación, barrera del servidor y generación MOCK sobre lo
+    // aprobado. Formato M (3 × 4, 40–44 h) frente a un documento que exige 4 × 5 y 64 h: excepciones con motivo. USD 0. ═══
+    if (RUN_E5) await step('v3-E19-prebrief', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const { PDFParse } = require('pdf-parse');
+      const pdfTextOf = async (buf) => { const p = new PDFParse({ data: new Uint8Array(buf) }); try { return (await p.getText()).text.replace(/\s+/g, ' '); } finally { await p.destroy().catch(() => {}); } };
+      const getPdf = async (p) => { const r = await fetch(BASE + p, { headers: { authorization: `Bearer ${TOKEN}` } }); return { status: r.status, type: r.headers.get('content-type'), disp: r.headers.get('content-disposition'), buf: Buffer.from(await r.arrayBuffer()) }; };
+      const title = '[E2E Prebrief E19] Contabilidad de Costos';
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title });
+      ok(cr.status === 201, 'E19: curso dinámico creado', { s: cr.status, e: cr.error });
+      const courseId = Number(cr.data.id);
+      // Pedido del curso (el contexto de generación que se aprueba).
+      const brief = { nombre: 'Contabilidad de Costos', obj: 'Calcular y controlar los costos de producción', sector: 'Contabilidad', pais: 'Colombia', contexto: 'Técnico / Tecnólogo — formación técnica', nivel: 'Básico — sin conocimientos previos', tono: 'cercano y claro' };
+      ok((await api('PUT', `/courses/${courseId}/brief`, brief)).status === 200, 'E19: pedido guardado');
+      // Microcurrículo sintético + requisito «4 módulos × 5 capítulos».
+      const docText = AF.toText('consistent').toString('utf8') + '\nEl curso tendrá 4 módulos con 5 capítulos cada uno.\n';
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo-sintetico.txt', dataBase64: Buffer.from(docText, 'utf8').toString('base64') }] });
+      ok(ex.status === 200 && ex.data.stats.providersCalled === 0, 'E19: documento leído (0 proveedores)', { s: ex.status, e: ex.error });
+      ok((await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 })).status === 201, 'E19: contexto académico guardado');
+      // Estructura 3 × 4 con capítulos vinculados a los resultados (la arma el docente, como en «Avanzado»).
+      const TITLES = [
+        ['Fundamentos y elementos del costo', [['Elementos del costo y su clasificación', ['RA1']], ['Estado de costo de productos vendidos', ['RA1']], ['Valoración de inventarios de materiales', ['RA2']], ['Liquidación de nómina y mano de obra', ['RA2']]]],
+        ['Costeo por órdenes y por procesos', [['Costos indirectos de fabricación', ['RA3']], ['Hoja de costos por orden de producción', ['RA3']], ['Producción equivalente en costeo por procesos', ['RA4']], ['Informe de cantidades y costos por procesos', ['RA4']]]],
+        ['Análisis de costos para decidir', [['Margen de contribución', ['RA5']], ['Punto de equilibrio y relación costo-volumen-utilidad', ['RA5']], ['Toma de decisiones con información de costos', ['RA6']], ['Informe de costos para una decisión gerencial', ['RA6']]]],
+      ];
+      let counter = 0;
+      for (const [mt, chs] of TITLES) {
+        const m = await api('POST', `/courses/${courseId}/modules`, { title: mt, objective: `Aplicar ${mt.toLowerCase()}`, examEnabled: true, expectedCounter: counter });
+        if (m.status !== 201) throw new Error(`E19 módulo: ${m.status} ${m.error}`);
+        counter = m.data.structureVersionCounter;
+        const auto = m.data.module.chapters || [];
+        for (let ci = 0; ci < chs.length; ci++) {
+          const body = { title: chs[ci][0], objective: `Aplicar ${chs[ci][0].toLowerCase()} en una empresa`, videoEnabled: ci === 0, outcomeIds: chs[ci][1], expectedCounter: counter };
+          const c = ci === 0 && auto.length === 1 ? await api('PATCH', `/courses/${courseId}/modules/${m.data.module.id}/chapters/${auto[0].id}`, body) : await api('POST', `/courses/${courseId}/modules/${m.data.module.id}/chapters`, body);
+          if (![200, 201].includes(c.status)) throw new Error(`E19 capítulo: ${c.status} ${c.error}`);
+          counter = c.data.structureVersionCounter;
+        }
+      }
+      const AP = D('modules/course-profiles/course-profiles.js');
+      ok((await api('POST', `/courses/${courseId}/profiles/assessment`, { data: { ...AP.defaultAssessmentProfile({ finalExam: true }), passingGrade: 70 } })).status === 201, 'E19: perfil de evaluación');
+      ok((await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 } })).status === 201, 'E19: perfil de presentación');
+
+      // Formato M: alternativa (S y L no aplican), meta 42 h (punto medio), decisión de la institución.
+      const fm = await api('PUT', `/courses/${courseId}/format`, { code: 'M' });
+      ok(fm.status === 200 && fm.data.format.code === 'M', 'E19: formato M seleccionado', { s: fm.status, e: fm.error });
+      ok((await api('PUT', `/courses/${courseId}/format`, { code: 'XL' })).status === 400, 'E19: formato inexistente → 400');
+      ok((await api('PUT', `/courses/${courseId}/format`, { code: ['S', 'M'] })).status === 400, 'E19: nunca dos formatos a la vez → 400');
+      // «Usar este diseño» (lo que hace la interfaz): perfil, vínculos y cambios recomendados, hasta que quede estable.
+      const useDesign = async (label) => {
+        for (let i = 0; i < 8; i++) {
+          const card = (await api('POST', `/courses/${courseId}/design/recommendation`, {})).data;
+          const pending = Math.max((card.design.changes || []).length, card.design.modules.reduce((n, m) => n + m.chapters.filter((c) => c.proposed).length, 0));
+          const auto = card.verification.checks.some((c) => c.id === 'outcome_links');
+          if (!card.profileChanged && !pending && !auto) return card;
+          const st = await readStructure(courseId);
+          if (card.profileChanged) {
+            const pv = (await api('GET', `/courses/${courseId}/profiles/pedagogy`)).data;
+            const r = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: card.profile, expectedVersion: pv && !pv.isDefault ? Number(pv.version) : 0 });
+            if (r.status !== 201) throw new Error(`${label}: perfil ${r.status} ${r.error}`);
+          } else if (auto) {
+            const r = await api('POST', `/courses/${courseId}/design/fix`, { action: 'link_outcomes', expectedCounter: st.structureVersionCounter });
+            if (r.status !== 200) throw new Error(`${label}: vínculos ${r.status} ${r.error}`);
+          } else {
+            const r = await api('POST', `/courses/${courseId}/modules/apply-distribution`, { expectedCounter: st.structureVersionCounter, proposalSha256: card.design.proposalSha256 });
+            if (![200, 201].includes(r.status)) throw new Error(`${label}: aplicar ${r.status} ${r.error}`);
+          }
+        }
+        throw new Error(`${label}: el diseño no quedó estable`);
+      };
+      const card = await useDesign('E19');
+      ok(card.hours.target === 42, 'E19: meta de horas = punto medio del formato M (42 h)', card.hours);
+      const fmtCheck = card.verification.checks.find((c) => c.id === 'format');
+      ok(fmtCheck && fmtCheck.severity === 'ok', 'E19: Verificación: la estructura respeta el formato M (prácticas fuera del N×M)', fmtCheck);
+      ok(!card.verification.blocking, 'E19: verificación sin críticos', card.verification.checks.filter((c) => c.severity === 'critical').map((c) => c.title));
+
+      // Prebrief (borrador): excepciones visibles y sin motivo → no se puede preparar.
+      let S0 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      ok(S0.status === 'draft' && S0.draft.readiness.ready === false, 'E19: borrador no preparable todavía', S0.draft.readiness);
+      const exKeys = S0.draft.model.exceptions.map((e) => e.requirementKey);
+      ok(exKeys.length >= 1 && S0.draft.model.exceptions.some((e) => /4 × 5/.test(e.requirementText)), 'E19: excepción «4 × 5» del documento frente al formato M', S0.draft.model.exceptions);
+      ok(S0.draft.readiness.blockers.filter((b) => b.code === 'exception_reason').length === exKeys.length, 'E19: cada excepción pide su motivo');
+      ok(S0.draft.model.duration.format && S0.draft.model.duration.format.code === 'M' && S0.draft.model.structure.origin === 'format', 'E19: «Formato M · Configuración seleccionada»');
+      const prep0 = await api('POST', `/courses/${courseId}/prebrief/versions`, { expectedModelSha: S0.draft.modelSha256 });
+      ok(prep0.status === 409 && prep0.raw && prep0.raw.code === 'PREBRIEF_NOT_READY', 'E19: preparar sin motivos → 409 PREBRIEF_NOT_READY', { s: prep0.status, e: prep0.error });
+      ok((await api('PUT', `/courses/${courseId}/prebrief/exception-reasons`, { requirementKey: exKeys[0], reason: 'corto' })).status === 400, 'E19: motivo demasiado corto → 400');
+      for (const k of exKeys) {
+        const r = await api('PUT', `/courses/${courseId}/prebrief/exception-reasons`, { requirementKey: k, reason: 'La institución prioriza una duración menor para el piloto.' });
+        ok(r.status === 200, `E19: motivo de la excepción ${k}`, { s: r.status, e: r.error });
+      }
+      S0 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      // Datos dudosos (si los hubiera) se confirman explícitamente.
+      for (const b of S0.draft.readiness.blockers.filter((x) => x.code === 'doubtful_data')) await api('POST', `/courses/${courseId}/prebrief/confirmations`, { confirmKey: b.ref });
+      S0 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      ok(S0.draft.readiness.ready === true, 'E19: con los motivos, la propuesta se puede preparar', S0.draft.readiness.blockers);
+      const docTxt = JSON.stringify(S0.draft.document);
+      ok(!/USD|costo estimado|Gamma|Videogen|OpenAI/i.test(docTxt), 'E19: el documento no tiene costos ni proveedores');
+      const dpdf = await getPdf(`/courses/${courseId}/prebrief/draft.pdf`);
+      ok(dpdf.status === 200 && /application\/pdf/.test(dpdf.type) && /BORRADOR/i.test(await pdfTextOf(dpdf.buf)), 'E19: PDF del borrador (marca BORRADOR)', { s: dpdf.status });
+
+      // Antes de aprobar: la barrera no deja ni estimar ni generar (API directa, approve-and-start).
+      const prep = await api('POST', `/courses/${courseId}/prebrief/versions`, { expectedModelSha: S0.draft.modelSha256 });
+      ok(prep.status === 201 && prep.data.version.version === 1 && prep.data.version.status === 'ready', 'E19: v1 preparada (Listo para aprobación)', { s: prep.status, e: prep.error });
+      const again = await api('POST', `/courses/${courseId}/prebrief/versions`, { expectedModelSha: S0.draft.modelSha256 });
+      ok(again.status === 200 && again.data.version.version === 1, 'E19: preparar de nuevo la misma huella es idempotente (sigue v1)');
+      const n1 = prep.data.version.blueprintNumber;
+      ok((await api('POST', `/courses/${courseId}/blueprints/${n1}/manifest`)).status === 201, 'E19: Manifest del Blueprint congelado por la v1');
+      const runsBase = `/courses/${courseId}/blueprints/${n1}/manifest/runs`;
+      const ctxLie = { nombre: 'OTRO NOMBRE', ...CTX, sector: 'Sector inventado', tono: 'SUSURRADO', scormTemplateIds: S.templates, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
+      const expect409 = (r, reason, label) => ok(r.status === 409 && r.raw && r.raw.reason === reason, `E19: ${label} → 409 ${reason}`, { s: r.status, e: r.error, reason: r.raw && r.raw.reason });
+      expect409(await api('POST', runsBase, ctxLie), 'prebrief_not_approved', 'POST runs sin aprobar');
+      expect409(await api('POST', `${runsBase}/estimate-preview`, ctxLie), 'prebrief_not_approved', 'costo (estimate-preview) sin aprobar');
+      expect409(await api('POST', `${runsBase}/approve-and-start`, { ...ctxLie, estimateHash: 'a'.repeat(64) }), 'prebrief_not_approved', 'approve-and-start sin aprobar');
+      const rpdf = await getPdf(`/courses/${courseId}/prebrief/versions/1/pdf?variant=ready`);
+      const rtxt = await pdfTextOf(rpdf.buf);
+      ok(rpdf.status === 200 && /PENDIENTE DE APROBACIÓN/i.test(rtxt) && /Versión 1/.test(rtxt) && /v1_para-aprobacion\.pdf/.test(rpdf.disp || ''), 'E19: PDF v1 «para aprobación»', { s: rpdf.status, d: rpdf.disp });
+
+      // Aprobación: huella equivocada, sin confirmar, sin nombre → rechazadas; la buena se registra.
+      const v1sha = prep.data.version.modelSha256;
+      ok((await api('POST', `/courses/${courseId}/prebrief/versions/1/approve`, { expectedModelSha: 'f'.repeat(64), name: 'María Gómez', role: 'Coordinadora académica', confirm: true })).status === 409, 'E19: aprobar con otra huella → 409');
+      ok((await api('POST', `/courses/${courseId}/prebrief/versions/1/approve`, { expectedModelSha: v1sha, name: 'María Gómez', role: 'Coordinadora académica', confirm: false })).status === 400, 'E19: aprobar sin confirmar → 400');
+      ok((await api('POST', `/courses/${courseId}/prebrief/versions/1/approve`, { expectedModelSha: v1sha, name: '', role: 'Coordinadora académica', confirm: true })).status === 400, 'E19: aprobar sin nombre → 400');
+      const apv = await api('POST', `/courses/${courseId}/prebrief/versions/1/approve`, { expectedModelSha: v1sha, name: 'María Gómez', role: 'Coordinadora académica', confirm: true });
+      ok(apv.status === 200 && apv.data.version.status === 'approved' && apv.data.version.approval.name === 'María Gómez', 'E19: v1 APROBADA (nombre, cargo, usuario, fecha, huella)', { s: apv.status, e: apv.error });
+      const [arow] = await q(`select approval, model_sha256 from public.course_prebrief_versions where course_id = $1 and version = 1`, [courseId]);
+      ok(arow.approval.userId === OWNER && arow.approval.role === 'Coordinadora académica' && arow.approval.modelSha256 === arow.model_sha256 && !!arow.approval.at, 'E19: la aprobación guarda usuario, cargo, fecha y huella', arow.approval);
+      const apdf = await getPdf(`/courses/${courseId}/prebrief/versions/1/pdf?variant=approved`);
+      const atxt = await pdfTextOf(apdf.buf);
+      ok(apdf.status === 200 && /Aprobado por: María Gómez/.test(atxt) && /Cargo: Coordinadora académica/.test(atxt), 'E19: PDF v1 APROBADO (quién y cargo)');
+      let immut = null; try { await q(`update public.course_prebrief_versions set model_json = '{}'::jsonb where course_id = $1`, [courseId]); } catch (e) { immut = e; }
+      ok(immut && /PREBRIEF_VERSION_IMMUTABLE/.test(immut.message), 'E19: la versión aprobada es inmutable en la base (trigger)');
+
+      // Costo DESPUÉS de aprobar; el contexto del run es el APROBADO aunque el navegador mande otro.
+      const pv = await api('POST', `${runsBase}/estimate-preview`, ctxLie);
+      ok(pv.status === 200, 'E19: con la propuesta aprobada, se muestra el costo (estimate-preview 200)', { s: pv.status, e: pv.error });
+      const mods = (await readStructure(courseId)).modules;
+      llm.st.courseId = courseId;
+      llm.st.chapterByTitle.clear(); llm.st.moduleByTitle.clear(); llm.st.moduleOfChapter.clear();
+      for (const m of mods) { llm.st.moduleByTitle.set(m.title, m.id); for (const x of m.chapters) { llm.st.chapterByTitle.set(x.title, x.id); llm.st.moduleOfChapter.set(x.id, m.id); } }
+      let start = await api('POST', runsBase, ctxLie);
+      const estM = /estimateId=([0-9a-f-]{36})/.exec(String(start.error || ''));
+      if (start.status === 409 && estM) {
+        // Autorización del gasto (FinOps): el administrador autoriza el run (proveedores FALSOS locales, USD 0).
+        await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+                 values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e E19: autorización de producción (proveedores FALSOS locales)')`, [courseId, estM[1]]);
+        start = await api('POST', runsBase, ctxLie);
+      }
+      ok(start.status === 201, 'E19: run MOCK creado sobre la v1 aprobada', { s: start.status, e: start.error });
+      if (start.status !== 201) throw new Error(`E19: run no creado: ${start.status} ${start.error}`);
+      const runA = start.data.run.id;
+      const [ctxRow] = await q(`select context from public.generation_run_contexts where job_id = $1`, [runA]);
+      const approvedCtx = S0.draft.model.generationContext;
+      eq(['nombre', 'sector', 'pais', 'tono', 'obj'].map((k) => ctxRow.context[k]), ['nombre', 'sector', 'pais', 'tono', 'obj'].map((k) => approvedCtx[k]), 'E19: el run congeló EXACTAMENTE el contexto aprobado (no el del navegador)');
+      ok(ctxRow.context.tono !== 'SUSURRADO' && ctxRow.context.sector !== 'Sector inventado', 'E19: el contexto inventado por el navegador se ignoró');
+      const ev = await api('GET', `/courses/${courseId}/prebrief/events`);
+      ok(ev.data.some((e) => e.type === 'generation_started' && e.version === 1 && e.payload.runId === runA), 'E19: historial: generación iniciada con la v1');
+      // Review BE-2 I1: durante la producción sobre la propuesta aprobada, el tema y la evaluación no cambian.
+      const presNow = (await api('GET', `/courses/${courseId}/profiles/presentation`)).data;
+      const lockTry = await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'tecnico', mode: 'dark', brandSeed: null, themeVersion: 1 }, expectedVersion: presNow && !presNow.isDefault ? Number(presNow.version) : 0 });
+      ok(lockTry.status === 409 && lockTry.raw && lockTry.raw.code === 'PROFILE_LOCKED_DURING_PRODUCTION', 'E19: cambiar el tema durante la producción → 409 (bloqueado)', { s: lockTry.status, e: lockTry.error });
+      llm.st.tag = 'E19';
+      S.front.DYN_EXAM_BANK_MODE_ENABLED = false;
+      const stt = await waitRunTerminal(S.front.dynExecutorStart({ courseId, blueprintNumber: n1, runId: runA }), 'E19 run', undefined, runA);
+      const itemsA = await waitItemsDone(runA);
+      ok(stt.failed === 0 && !stt.fatalError && itemsA.every((i) => i.status === 'completed'), `E19: generación MOCK completa (${itemsA.length} items, proveedores falsos)`, itemsA.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error_message || '').slice(0, 160)]));
+      const [manRow] = await q(`select m.blueprint_id, b.snapshot_sha256 from public.course_generation_manifests m join public.course_blueprints b on b.id = m.blueprint_id
+         join public.production_jobs j on (j.input_payload->>'manifestId')::int = m.id where j.id = $1`, [runA]);
+      const [vRow] = await q(`select blueprint_id, blueprint_sha256 from public.course_prebrief_versions where course_id = $1 and version = 1`, [courseId]);
+      ok(manRow && Number(manRow.blueprint_id) === Number(vRow.blueprint_id) && manRow.snapshot_sha256 === vRow.blueprint_sha256, 'E19: lo generado usa el Blueprint EXACTO de la versión aprobada', { manRow, vRow });
+
+      // Review BE-1 C1: un PATCH del curso no puede borrar el flujo de propuesta ni falsificar motivos o confirmaciones.
+      const pm = await api('PATCH', `/courses/${courseId}`, { metadata: { approvalFlow: null, requirementExceptionReasons: {}, courseFormat: null, otra: 1 } });
+      ok(pm.status === 200, 'E19: PATCH del curso con metadata', { s: pm.status, e: pm.error });
+      const [meta1] = await q(`select metadata from public.courses where id = $1`, [courseId]);
+      ok(meta1.metadata.approvalFlow === 'prebrief' && meta1.metadata.courseFormat && meta1.metadata.courseFormat.code === 'M' && Object.keys(meta1.metadata.requirementExceptionReasons || {}).length >= 1,
+        'E19: el PATCH no borra el flujo de propuesta, el formato ni los motivos (claves protegidas)', meta1.metadata);
+      // Cambios después de aprobar → la aprobación se invalida y el servidor bloquea (datos de producción, motivo, horas…).
+      const nb = await api('PUT', `/courses/${courseId}/brief`, { ...brief, tono: 'formal y académico' });
+      ok(nb.status === 200, 'E19: el docente cambia el tono después de aprobar');
+      const S1 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      const v1 = S1.versions.find((v) => v.version === 1);
+      ok(v1.status === 'invalidated' && v1.invalidationDiff.some((l) => /tono/.test(l)), 'E19: v1 INVALIDADA con la diferencia («Datos del curso para producir: tono»)', v1);
+      expect409(await api('POST', runsBase, ctxLie), 'prebrief_stale', 'POST runs con la propuesta obsoleta');
+      // Review BE-1 I2: regenerar un item (gasto nuevo) con la aprobación obsoleta → bloqueado; el estimado de video también.
+      const itemKey0 = itemsA.find((i) => /^content:/.test(i.item_key)).item_key;
+      expect409(await api('POST', `${runsBase}/${runA}/items/${encodeURIComponent(itemKey0)}/regenerate`, { confirmPaid: true }), 'prebrief_stale', 'regenerar un item con la propuesta obsoleta');
+      expect409(await api('GET', `${runsBase}/estimate`), 'prebrief_stale', 'estimado de video con la propuesta obsoleta');
+      ok((await api('POST', `/courses/${courseId}/prebrief/versions/1/approve`, { expectedModelSha: v1sha, name: 'María Gómez', role: 'Coordinadora académica', confirm: true })).status === 409, 'E19: volver a aprobar la v1 invalidada → 409');
+      // v2 con el tono nuevo; la v1 no se puede aprobar (no es la última); la regeneración hereda el contexto viejo → bloqueada.
+      const S2 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      const p2 = await api('POST', `/courses/${courseId}/prebrief/versions`, { expectedModelSha: S2.draft.modelSha256 });
+      ok(p2.status === 201 && p2.data.version.version === 2, 'E19: v2 preparada', { s: p2.status, e: p2.error });
+      const ap2 = await api('POST', `/courses/${courseId}/prebrief/versions/2/approve`, { expectedModelSha: p2.data.version.modelSha256, name: 'María Gómez', role: 'Coordinadora académica', confirm: true });
+      ok(ap2.status === 200, 'E19: v2 aprobada', { s: ap2.status, e: ap2.error });
+      const n2 = p2.data.version.blueprintNumber;
+      if (n2 !== n1) await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest`);
+      const regen = await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest/runs`, { fromRun: runA });
+      ok(regen.status === 409 && regen.raw && ['context_mismatch', 'prebrief_stale'].includes(regen.raw.reason), 'E19: regeneración fromRun con el contexto de la v1 → 409 (no se genera sobre otro contexto)', { s: regen.status, e: regen.error, r: regen.raw && regen.raw.reason });
+      // Motivo de excepción cambiado → la v2 queda obsoleta.
+      await api('PUT', `/courses/${courseId}/prebrief/exception-reasons`, { requirementKey: exKeys[0], reason: 'La institución decidió otra duración por calendario académico.' });
+      expect409(await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest/runs`, ctxLie), 'prebrief_stale', 'POST runs tras cambiar un motivo de excepción');
+      // Estructura cambiada → el gate de diseño ya lo bloquea antes (R68) y la v2 queda invalidada.
+      const st2 = await readStructure(courseId);
+      await api('PATCH', `/courses/${courseId}/modules/${st2.modules[0].id}/chapters/${st2.modules[0].chapters[0].id}`, { title: 'Elementos del costo (revisado)', expectedCounter: st2.structureVersionCounter });
+      const r3 = await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest/runs`, ctxLie);
+      ok(r3.status === 409 && /GENERATION_NOT_VERIFIED/.test(String(r3.error)), 'E19: estructura cambiada tras aprobar → 409', { s: r3.status, r: r3.raw && r3.raw.reason });
+      const S3 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      ok(S3.versions.find((v) => v.version === 2).status === 'invalidated', 'E19: v2 invalidada por los cambios');
+      // Legacy: nunca por fuera del flujo.
+      const lg = await api('POST', '/jobs/content', { courseId: String(courseId) });
+      ok(lg.status === 409 && /v2_course_legacy_generation_disabled/.test(String(lg.error)), 'E19: endpoint legacy → 409', { s: lg.status });
+      // Historial completo y de solo inserción.
+      const ev2 = (await api('GET', `/courses/${courseId}/prebrief/events`)).data.map((e) => e.type);
+      for (const t of ['format_selected', 'exception_reason', 'prepared', 'pdf_generated', 'approved', 'generation_started', 'invalidated']) ok(ev2.includes(t), `E19: historial registra «${t}»`);
+      let del = null; try { await q(`delete from public.course_prebrief_events where course_id = $1`, [courseId]); } catch (e) { del = e; }
+      ok(del && /PREBRIEF_APPEND_ONLY/.test(del.message), 'E19: el historial no se puede borrar');
+      // Review BE-1 I1: el empaque usa los perfiles APROBADOS: cambiar el tema después de aprobar bloquea el paquete del run.
+      const pres = (await api('GET', `/courses/${courseId}/profiles/presentation`)).data;
+      const verPres = pres && !pres.isDefault ? Number(pres.version) : 0;
+      ok((await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'oscuro-premium', mode: 'dark', brandSeed: null, themeVersion: 1 }, expectedVersion: verPres })).status === 201, 'E19: el docente cambia el tema después de aprobar');
+      const pk = await api('POST', `/courses/${courseId}/blueprints/${n1}/manifest/runs/${runA}/package`, {});
+      ok(pk.status === 409 && pk.raw && pk.raw.code === 'PREBRIEF_PROFILES_CHANGED', 'E19: empaque con el tema cambiado → 409 PREBRIEF_PROFILES_CHANGED', { s: pk.status, e: pk.error });
+      // Review BE-1 I4: un curso con historial de propuesta se puede borrar (la cascada borra su historial).
+      const cdel = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: '[E2E Prebrief E19] Curso para borrar' });
+      const cdelId = Number(cdel.data.id);
+      const fs0 = await api('PUT', `/courses/${cdelId}/format`, { code: 'S' });
+      ok(fs0.status === 200 && fs0.data.format.code === 'S', 'E19: elegir formato en un curso nuevo (sin perfil pedagógico) funciona', { s: fs0.status, e: fs0.error });
+      const pf = (await api('GET', `/courses/${cdelId}/profiles/pedagogy`)).data;
+      ok(pf && pf.profile && pf.profile.targetHours === 21, 'E19: el formato S fija la meta en 21 h (punto medio)', pf && pf.profile && pf.profile.targetHours);
+      const [evN] = await q(`select count(*)::int n from public.course_prebrief_events where course_id = $1`, [cdelId]);
+      const dl = await api('DELETE', `/courses/${cdelId}`);
+      const [evN2] = await q(`select count(*)::int n from public.course_prebrief_events where course_id = $1`, [cdelId]);
+      ok(evN.n >= 1 && [200, 204].includes(dl.status) && evN2.n === 0, 'E19: borrar un curso con historial de propuesta funciona (cascada)', { before: evN.n, s: dl.status, e: dl.error, after: evN2.n });
+      results.courses.E19 = { courseId, runId: runA };
+    }, { fatal: false });
+
     // ═══ LOOP 8.5 · E17 — flujo DEFINITIVO de Cursia V2 por HTTP real, en el orden de la pantalla: pedido → microcurrículo →
     // «Lo que entendimos» (facts) → «Cursia recomienda» → Ajustar → «Usar este diseño» (perfil, horas, vínculos, aplicar) →
     // verificación → «Aprobar» (Blueprint) → Manifest = tarjeta → generación con proveedores FALSOS → Actividades de

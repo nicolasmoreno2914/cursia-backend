@@ -136,6 +136,7 @@ const DYNAMIC_CONTROLLER_CLASS_NAMES = new Set([
   'ChangeImpactController', // Fase 5: POST /courses/:id/change-impact
   'CourseFactsController', // LOOP 8.1: /courses/:id/brief y /courses/:id/facts (fuente única)
   'CourseDesignController', // LOOP 8.3: /courses/:id/design/{recommendation,pins/clear}
+  'PrebriefController', // Prebrief pedagógico: /courses/:id/prebrief… y /courses/:id/format
 ]);
 /**
  * Todo lo demás: legacy sin ninguna ruta dynamic, EXCEPTO CoursesController

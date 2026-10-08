@@ -31,6 +31,7 @@ import { PedagogyModule } from './modules/pedagogy/pedagogy.module';
 import { AcademicContextModule } from './modules/academic-context/academic-context.module';
 import { CourseFactsModule } from './modules/course-facts/course-facts.module';
 import { CourseDesignModule } from './modules/course-design/course-design.module';
+import { PrebriefModule } from './modules/prebrief/prebrief.module';
 import { FinopsModule } from './modules/finops/finops.module';
 
 @Module({
@@ -67,6 +68,7 @@ import { FinopsModule } from './modules/finops/finops.module';
     PedagogyModule, // Motor pedagógico V1: catálogo, «No estoy seguro», dry-run (sin escrituras ni proveedores)
     CourseFactsModule, // LOOP 8.1: pedido del curso + «Lo que sabemos del curso» (fuente única)
     CourseDesignModule, // LOOP 8.3: «Cursia recomienda»
+    PrebriefModule, // Prebrief pedagógico: propuesta versionada, aprobación y PDF
     AcademicContextModule, // Fase 3: contexto académico (extracción determinista + diseño desde el contexto; sin proveedores)
     FinopsModule,
   ],

@@ -30,6 +30,11 @@ if (v3) {
   // proveedores FALSOS → empaque). Corre junto con E5.
   if (!(v3.h5p2 && v3.h5p2.skipped)) add('E2E v3: motor pedagógico (E6: perfil → Manifest con diseño → prompts y proveedores falsos → empaque)', by(/^v3-E6-pedagogia-/));
   add('Moodle 4.5: restore + inspección + notas simuladas', by(/^moodle-/));
+  // Prebrief pedagógico (E19): propuesta, PDF, aprobación, barrera del servidor y generación MOCK sobre lo aprobado.
+  add('E2E v3: Prebrief pedagógico (E19: propuesta → PDF → aprobación → bypass → generación mock = lo aprobado)', by(/^v3-E19-/));
+  // Todo lo demás (E7–E18: flujo V2, R68, regeneración…): ninguna aserción queda fuera de la tabla (antes no se contaban).
+  const grouped = [/^v3-(0|1|2)-/, /^v3-E\d-generacion$/, /^v3-E\d-(empaquetado|reempaque)/, /^v3-finops$|^v3-red-final$/, /^v3-E5-h5p2-/, /^v3-E6-pedagogia-/, /^moodle-/, /^v3-E19-/];
+  add('E2E v3: resto de escenarios (E7–E18: flujo V2, R68, regeneración, perfiles…)', v3.assertions.filter((a) => !grouped.some((re) => re.test(a.step))));
   if (v3.aborted) rows.push(['E2E v3', 0, 1, `ABORT: ${v3.aborted}`]);
 } else rows.push(['E2E v3', 0, 1, 'sin results-v3.json']);
 if (qa) {

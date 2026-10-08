@@ -80,7 +80,7 @@ export function runStructuralRules(bp: BlueprintSnapshotV1): CoherenceFindingDra
         chapterIds: [],
         evidence: { moduleId: m.id, chapterCount: 1 },
         message: `El módulo "${m.title}" tiene un solo capítulo y examen activado (examen trivial).`,
-        suggestion: 'Considerá desactivar el examen del módulo o sumarle capítulos.',
+        suggestion: 'Considera desactivar el examen del módulo o sumarle capítulos.',
         suggestedAction: 'review',
       });
     }

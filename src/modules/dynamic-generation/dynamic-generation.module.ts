@@ -1,4 +1,5 @@
 import { CourseDesignModule } from '../course-design/course-design.module';
+import { PrebriefModule } from '../prebrief/prebrief.module';
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { GenerationItemRun } from './entities/generation-item-run.entity';
@@ -36,6 +37,7 @@ import { VideogenReconciliationService } from './videogen-reconciliation.service
     ArtifactsModule,           // V2.1 R11a: lector de artifacts para validar items LLM v3 al completar
     FinopsModule,              // V2.1 RF-b: estimado + gates de presupuesto (FinopsBudgetService)
     CourseDesignModule,        // R68: GenerationDesignGate (sin diseño verificado no hay generación)
+    PrebriefModule,            // Prebrief: sin la versión aprobada y vigente no hay generación (ni estimado)
   ],
   controllers: [RunsController, ExecutorController, DynamicYoutubeController, AdminDynamicRunsController],
   providers: [

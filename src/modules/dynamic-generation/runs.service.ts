@@ -1,4 +1,5 @@
-import { GenerationDesignGate } from '../course-design/generation-design-gate';
+import { GenerationDesignGate, GenerationGateResult } from '../course-design/generation-design-gate';
+import { PrebriefService } from '../prebrief/prebrief.service';
 import { alignCourseContextWithSnapshot } from '../course-facts/course-facts';
 import { loadFrozenLearner } from '../course-facts/course-facts-db';
 import {
@@ -22,7 +23,7 @@ import { itemTypesForRulesVersion } from '../generation-manifests/generation-man
 import type { ManifestItemType } from '../generation-manifests/generation-manifest-builder';
 import { CostRatesService } from '../../admin/services/cost-rates.service';
 import { CourseContextDto, RUN_VIDEO_MODES, RunVideoMode } from './dto/course-context.dto';
-import { REQUIRED_CONTEXT_FIELDS, canonicalContextHash, itemIdempotencyKey, normalizeCourseContext } from './run-hash';
+import { REQUIRED_CONTEXT_FIELDS, canonicalContextHash, itemIdempotencyKey, normalizeCourseContext, CONTEXT_STRING_FIELDS } from './run-hash';
 import {
   VideoDeliveryGateResult,
   VideoDeliveryStrategy,
@@ -803,6 +804,11 @@ export class RunsService {
      * servicio a mano; en la app lo inyecta Nest siempre (lo comprueba check-r68-generation-gate.js).
      */
     @Optional() private readonly designGate?: GenerationDesignGate,
+    /**
+     * Prebrief pedagógico: un curso que lo exige solo genera sobre la ÚLTIMA versión aprobada y vigente, y el contexto
+     * del run sale de ella (no del navegador). @Optional por los harnesses que construyen el servicio a mano.
+     */
+    @Optional() private readonly prebrief?: PrebriefService,
   ) {
     // M6 (review-it2): NO se valida DYNAMIC_VIDEO_DELIVERY acá. RunsService
     // vive en AppModule, que arranca la API y todos los workers legacy — un
@@ -851,10 +857,16 @@ export class RunsService {
     // invalidación (mismo entry point → mismos gates G3 de arriba).
     // R68: una generación nueva (también la regeneración `fromRun` o reabrir un run cancelado/fallido) exige el diseño
     // verificado; retomar la que ya está activa en este Manifest no.
-    await this.assertDesignVerifiedForNewRun(courseId, ownerId, blueprintNumber, manifest.id);
+    const verified = await this.assertDesignVerifiedForNewRun(courseId, ownerId, blueprintNumber, manifest.id);
+    // Prebrief: la versión aprobada y vigente (o 409). Con ella, el contexto del run es el aprobado.
+    const pb = await this.prebriefForNewRun(courseId, ownerId, blueprintNumber, manifest.id, verified);
     if (isFromRunRequest(courseContext)) {
-      return this.startRunFromPrevious(courseId, ownerId, blueprintNumber, manifest, courseContext.fromRun);
+      if (pb) await this.assertFromRunMatchesPrebrief(courseContext.fromRun, pb);
+      const r = await this.startRunFromPrevious(courseId, ownerId, blueprintNumber, manifest, courseContext.fromRun);
+      if (pb && r.created) await this.prebrief!.recordGenerationStarted(courseId, pb.versionId, r.run.id, ownerId, 'fromRun');
+      return r;
     }
+    if (pb) courseContext = this.contextFromPrebrief(courseContext, pb);
     const rawContext = normalizeCourseContext(courseContext);
     this.assertRequiredContext(rawContext);
     const videoMode = this.normalizeVideoMode((courseContext as any)?.videoMode);
@@ -879,7 +891,56 @@ export class RunsService {
     // LOOP 8.1: alineado con el estudiante del Blueprint, DESPUÉS de los gates previos (mismos errores y mismo orden).
     const context = await this.contextAlignedWithFacts(courseId, manifest, rawContext);
     const contextHash = canonicalContextHash(context);
-    return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, true, videoDelivery, providerModes, opts);
+    const result = await this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, true, videoDelivery, providerModes, opts);
+    if (pb && (result.created || result.reopened)) await this.prebrief!.recordGenerationStarted(courseId, pb.versionId, result.run.id, ownerId, contextHash);
+    return result;
+  }
+
+  /** Prebrief: null si el curso no lo exige o si se retoma el run activo de este Manifest; si no, la versión aprobada (o 409). */
+  private async prebriefForNewRun(courseId: number, ownerId: string, blueprintNumber: number, manifestId: number, verified: GenerationGateResult | null) {
+    if (!this.prebrief) return null;
+    if (await this.findActiveRunRow(manifestId)) return null;
+    return this.prebrief.assertApprovedForGeneration(courseId, ownerId, blueprintNumber, verified ? verified.card : undefined);
+  }
+
+  /**
+   * Prebrief: el contexto de texto del run es EXACTAMENTE el aprobado (nombre, sector, país, ciudad, contexto, nivel,
+   * tono, objetivo, competencias). Del navegador solo se toman los modos de producción (video, proveedores), que decide
+   * la autorización de gasto; `prevCourse` y `scormTemplateIds` no se aprueban en el Prebrief y no se toman.
+   */
+  private contextFromPrebrief<T>(courseContext: T, pb: { generationContext: Record<string, string> }): T {
+    const c: Record<string, unknown> = { ...(courseContext as any) };
+    for (const k of CONTEXT_STRING_FIELDS) delete c[k];
+    delete c.prevCourse;
+    delete c.scormTemplateIds;
+    return { ...c, ...pb.generationContext } as T;
+  }
+
+  /**
+   * Prebrief (review BE-2 I2): gasto NUEVO sobre un run existente (regenerar un item, videos reales, reintento manual de un
+   * run anterior al flujo): exige la aprobación vigente de este Blueprint Y que el run se haya congelado con el contexto
+   * aprobado (un run de antes del flujo, con el contexto del navegador, no gasta más sin una aprobación que lo cubra).
+   * `onlyPreFlow`: solo si el run no nació de una versión aprobada (reintentos que completan un gasto ya autorizado).
+   */
+  private async assertRunCoveredByApproval(courseId: number, ownerId: string, blueprintNumber: number, runId: string, onlyPreFlow = false): Promise<void> {
+    if (!this.prebrief) return;
+    if (onlyPreFlow && (await this.prebrief.runStartedFromVersion(courseId, runId))) return;
+    const pb = await this.prebrief.assertApprovedForGeneration(courseId, ownerId, blueprintNumber);
+    if (!pb) return;
+    await this.assertFromRunMatchesPrebrief(runId, pb);
+  }
+
+  /** Prebrief: una regeneración `fromRun` hereda el contexto del run A: debe ser el que aprobó la versión vigente. */
+  private async assertFromRunMatchesPrebrief(fromRunId: string, pb: { generationContext: Record<string, string> }): Promise<void> {
+    const prev = await this.loadContextRow(fromRunId).catch(() => null);
+    const n = (v: unknown) => String(v ?? '').replace(/\s+/g, ' ').trim();
+    const differs = !prev || CONTEXT_STRING_FIELDS.some((k) => n(prev.context[k]) !== n(pb.generationContext[k]));
+    if (differs) {
+      throw new ConflictException({
+        code: 'GENERATION_NOT_VERIFIED', reason: 'context_mismatch',
+        message: 'GENERATION_NOT_VERIFIED: la regeneración heredaría datos del curso distintos de los que aprobó la propuesta vigente (nombre, sector, país, tono…): genera el curso completo sobre la versión aprobada. No se generó nada.',
+      });
+    }
   }
 
   /**
@@ -934,7 +995,10 @@ export class RunsService {
     const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
     await assertAssessmentProfileResolvableForRun(this.dataSource, courseId, manifest);
     // R68: el estimado de una generación nueva también exige el diseño verificado (mismo gate que startRun).
-    await this.assertDesignVerifiedForNewRun(courseId, ownerId, blueprintNumber, manifest.id);
+    const verified = await this.assertDesignVerifiedForNewRun(courseId, ownerId, blueprintNumber, manifest.id);
+    // Prebrief: sin la versión aprobada no hay ni estimado (el costo viene DESPUÉS de aprobar); el contexto es el aprobado.
+    const pb = await this.prebriefForNewRun(courseId, ownerId, blueprintNumber, manifest.id, verified);
+    if (pb) courseContext = this.contextFromPrebrief(courseContext, pb);
     const rawContext = normalizeCourseContext(courseContext);
     this.assertRequiredContext(rawContext);
     const videoMode = this.normalizeVideoMode((courseContext as any)?.videoMode);
@@ -1651,6 +1715,8 @@ export class RunsService {
    * decidir si autorizar el modo 'real' (condición 7).
    */
   async estimateRun(courseId: number, ownerId: string, blueprintNumber: number): Promise<RunVideoEstimate> {
+    // Review BE-1 m: el costo aparece DESPUÉS de aprobar la propuesta (también este estimado de video).
+    if (this.prebrief) await this.prebrief.assertApprovedForGeneration(courseId, ownerId, blueprintNumber);
     // I1 (review-rv2): el Manifest del run actual del Blueprint (cualquier
     // rulesVersion); sin runs, el configurado (mismos 404/400 de siempre).
     const current = await this.findCurrentRunOfBlueprint(courseId, ownerId, blueprintNumber);
@@ -1788,6 +1854,9 @@ export class RunsService {
     // otro — requiere la allow-list de V2, antes de tocar manifest o run.
     assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
+    // Review BE-2 I2: un reintento MANUAL de un run anterior al flujo de propuesta (puede reabrirlo) necesita una aprobación
+    // que lo cubra; los reintentos de un run nacido de una versión aprobada completan un gasto ya autorizado.
+    if (!auto) await this.assertRunCoveredByApproval(courseId, ownerId, blueprintNumber, runId, true);
     let job = await this.loadRunRow(courseId, manifest, runId);
     job = await this.reconcileCancellation(job);
     if (isCancelledLike(job)) {
@@ -2965,6 +3034,8 @@ export class RunsService {
     if (actor) ownerId = await this.ownerForActor(courseId, ownerId, actor);
     assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
+    // Review BE-1/BE-2 I2: regenerar es gasto NUEVO: aprobación vigente de este Blueprint y run con el contexto aprobado.
+    if (!o.dryRun) await this.assertRunCoveredByApproval(courseId, ownerId, blueprintNumber, runId);
     let job = await this.loadRunRow(courseId, manifest, runId);
     const mItem = manifest.manifest.items.find((it) => it.key === itemKey);
     if (!mItem) {
@@ -3018,7 +3089,7 @@ export class RunsService {
       throw new BadRequestException({
         message:
           `confirm_paid_required: regenerar "${itemKey}" tiene costo (${costKind === 'videogen' ? 'video real en Videogen' : costKind === 'gamma' ? 'presentación en Gamma' : costKind === 'tts' ? 'audio TTS' : 'créditos de IA'}); ` +
-          'reenviá con {"confirmPaid": true} para confirmarlo explícitamente',
+          'reenvía con {"confirmPaid": true} para confirmarlo explícitamente',
         code: 'confirm_paid_required',
         costKind,
       });
@@ -3063,7 +3134,7 @@ export class RunsService {
         throw new BadRequestException({
           message:
             `confirm_paid_required: regenerar "${itemKey}" regenera también "${paidCascade.key}" (${paidCascade.costKind}); ` +
-            'reenviá con {"confirmPaid": true} para confirmarlo explícitamente',
+            'reenvía con {"confirmPaid": true} para confirmarlo explícitamente',
           code: 'confirm_paid_required',
           costKind: paidCascade.costKind,
         });
@@ -3482,6 +3553,8 @@ export class RunsService {
     assertDynamicOwnerAllowed(ownerId);
     const acting = { id: ownerId, email: user.email };
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
+    // Review BE-1/BE-2 I2: los videos reales son gasto NUEVO: aprobación vigente y run con el contexto aprobado.
+    await this.assertRunCoveredByApproval(courseId, ownerId, blueprintNumber, runId);
     const job = await this.reconcileCancellation(await this.loadRunRow(courseId, manifest, runId));
     const already = await this.existingUpgradeFor(this.dataSource, job, estimateHash);
     if (already) return { created: false, upgrade: already, run: await this.buildRunDto(job, manifest) };
@@ -4761,10 +4834,10 @@ export class RunsService {
    * R68: toda generación NUEVA exige el diseño verificado (GenerationDesignGate). Retomar el run que ya está activo en
    * este Manifest no es una generación nueva (lo devuelve get-or-create tal cual).
    */
-  private async assertDesignVerifiedForNewRun(courseId: number, ownerId: string, blueprintNumber: number, manifestId: number): Promise<void> {
-    if (!this.designGate) return;
-    if (await this.findActiveRunRow(manifestId)) return;
-    await this.designGate.assertVerified(courseId, ownerId, blueprintNumber);
+  private async assertDesignVerifiedForNewRun(courseId: number, ownerId: string, blueprintNumber: number, manifestId: number): Promise<GenerationGateResult | null> {
+    if (!this.designGate) return null;
+    if (await this.findActiveRunRow(manifestId)) return null;
+    return this.designGate.assertVerified(courseId, ownerId, blueprintNumber);
   }
 
   private async findActiveRunRow(manifestId: number): Promise<any | null> {

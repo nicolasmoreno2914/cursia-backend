@@ -11,8 +11,11 @@ export async function loadCourseFacts(q: Q, courseId: number, courseRow?: any): 
   const course = courseRow || (await q.query(`select id, title, institution_id, metadata from public.courses where id = $1`, [courseId]))[0];
   const meta = (course && course.metadata) || {};
   // Bases sin las migraciones de perfiles (entornos viejos): sin contexto ni perfil, como siempre.
-  const academic = await loadCurrentAcademicContext(q, courseId).catch(() => null);
-  const pedagogy = await loadCurrentPedagogicalProfile(q, courseId).catch(() => null);
+  // Prebrief (review BE-2 I3): solo una base SIN las tablas cuenta como «sin datos»; cualquier otro error se propaga (un
+  // error transitorio no puede cambiar lo que «sabemos del curso» ni invalidar una aprobación).
+  const missingTable = (err: any) => { if (err && err.code === '42P01') return null; throw err; };
+  const academic = await loadCurrentAcademicContext(q, courseId).catch(missingTable);
+  const pedagogy = await loadCurrentPedagogicalProfile(q, courseId).catch(missingTable);
   return resolveCourseFacts({
     courseTitle: course ? course.title : null,
     institutionId: course ? course.institution_id ?? null : null,

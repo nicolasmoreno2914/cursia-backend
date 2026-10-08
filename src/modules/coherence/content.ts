@@ -134,7 +134,7 @@ export function runContentRules(input: ContentCoherenceInput): CoherenceFindingD
       chapterIds,
       evidence: { concept: k, chapterIds, basis },
       message: `El concepto "${label(k)}" se introduce en ${chapterIds.length} capítulos: ${chapterIds.map(chTitle).join(', ')}.`,
-      suggestion: 'Dejá la introducción en un solo capítulo y que los demás lo retomen como concepto asumido.',
+      suggestion: 'Deja la introducción en un solo capítulo y que los demás lo retomen como concepto asumido.',
       suggestedAction: 'review',
     });
   }
@@ -172,7 +172,7 @@ export function runContentRules(input: ContentCoherenceInput): CoherenceFindingD
           chapterIds: [ch.id],
           evidence: { concept: k, chapterId: ch.id },
           message: `"${ch.title}" asume "${label(k)}", que no se introduce en ningún capítulo ni en el contexto previo declarado.`,
-          suggestion: 'Decláralo como conocimiento previo del curso o agregá su introducción en un capítulo anterior.',
+          suggestion: 'Decláralo como conocimiento previo del curso o agrega su introducción en un capítulo anterior.',
           suggestedAction: 'review',
         });
       }

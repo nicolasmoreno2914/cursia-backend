@@ -26,6 +26,7 @@ import {
 import { DistributionResult } from '../study-time/distributor';
 import { ConflictException } from '@nestjs/common';
 import { DesignAdjustDto, RecommendDesignDto, RequirementDecisionsDto } from './dto/recommend.dto';
+import { formatDef, formatFit, readCourseFormat } from '../prebrief/course-formats';
 
 /** Prioridad audiovisual por defecto de V2 (sin preferencia guardada). */
 export const DEFAULT_AUDIOVISUAL = 'recommended' as const;
@@ -283,6 +284,9 @@ export class CourseDesignService {
         return v ? { ...c, severity: v.severity, ...(v.detail ? { detail: v.detail } : {}) } : c;
       });
     }
+    // Prebrief · formato S/M/L elegido: ¿el diseño lo respeta? (advertencia en Verificación si no).
+    const fmt = formatDef((await readCourseFormat(this.dataSource, courseId))?.code ?? null);
+    const fmtFit = fmt && dist ? formatFit(fmt, dist.modules.map((m) => ({ chapters: m.chapters.map((c) => ({ kind: c.kind })) })), profile.targetHours ?? null) : null;
     // LOOP 8.4: la verificación del MISMO diseño (alineación del Coherence Engine incluida).
     const verification = dist
       ? verifyDesign({
@@ -305,6 +309,7 @@ export class CourseDesignService {
           && ((prefs.applicationActivities || 'auto') === 'none' || ((prefs.applicationActivities || 'auto') === 'practice_only' && c.kind !== 'practice'))).map((c) => c.id)),
         uncoveredEvaluations: academic ? uncoveredEvaluations(academic.context, dist, chapterOutcomes) : [],
         requirementChecks,
+        format: fmt && fmtFit ? { label: fmt.label, modules: fmt.modules, chaptersPerModule: fmt.chaptersPerModule, hoursMin: fmt.hoursMin, hoursMax: fmt.hoursMax, ...fmtFit } : null,
       })
       : null;
     return {
@@ -347,6 +352,11 @@ export class CourseDesignService {
           })),
         }
         : null,
+      // Prebrief: lo que recomendaría Cursia (aunque el enfoque guardado sea otro), lo que materializa el Manifest y la
+      // huella del Blueprint que congelaría hoy la estructura viva.
+      suggestedApproach: suggestion ? suggestion.approach : null,
+      manifestTotals: dist && dist.materialized ? dist.materialized.totals : null,
+      blueprintSha256: dist && dist.materialized ? dist.materialized.blueprintSha256 : null,
       cost: providers && providers.estimateUsd ? { min: providers.estimateUsd.min, expected: providers.estimateUsd.expected, max: providers.estimateUsd.max, note: providers.estimateNote } : null,
       outcomes: academic ? academic.context.outcomes.map((o) => ({ id: o.id, text: o.text })) : [],
       requirements: {

@@ -11,7 +11,7 @@ import { GenerationDesignGate } from './generation-design-gate';
   imports: [CoursesModule, AuthModule, PedagogyModule],
   controllers: [CourseDesignController],
   providers: [CourseDesignService, GenerationDesignGate],
-  // R68: la generación (dynamic-generation) usa el gate de verificación del diseño.
-  exports: [GenerationDesignGate],
+  // R68: la generación (dynamic-generation) usa el gate de verificación del diseño; el Prebrief, la recomendación.
+  exports: [GenerationDesignGate, CourseDesignService],
 })
 export class CourseDesignModule {}

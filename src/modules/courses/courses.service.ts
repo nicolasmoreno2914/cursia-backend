@@ -12,11 +12,14 @@ import { UpdateCourseDto } from './dto/update-course.dto';
 import { AdminDashboardService } from '../../admin/services/admin-dashboard.service';
 import { assertDynamicCreationAllowed, assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import { readActivityTypeRulesConfig } from '../generation-manifests/manifest-rules-config';
+import { PREBRIEF_METADATA_KEYS } from '../prebrief/prebrief-keys';
 
 /** LOOP 8.0/8.1: claves de courses.metadata que solo escriben sus servicios. */
 const PROTECTED_METADATA_KEYS = [STRUCTURE_ORIGIN_KEY, BRIEF_KEY, PEDAGOGY_DERIVATION_KEY, DESIGN_PINS_KEY, DESIGN_HOURS_KEY,
   // LOOP 8.6B (review I1): requisitos leídos del documento y la alternativa elegida (solo los escribe academic-context).
-  DOCUMENT_REQUIREMENTS_KEY, REQUIREMENTS_SELECTION_KEY, REQUIREMENT_EXCEPTIONS_KEY];
+  DOCUMENT_REQUIREMENTS_KEY, REQUIREMENTS_SELECTION_KEY, REQUIREMENT_EXCEPTIONS_KEY,
+  // Prebrief (review BE-1 C1): flujo de aprobación, formato S/M/L, motivos de excepción y confirmaciones.
+  ...PREBRIEF_METADATA_KEYS];
 
 /**
  * EV6 H5P v2 (H2 fix round 1, I-2): «Repaso» (Dialog Cards) arranca ENCENDIDO solo en cursos

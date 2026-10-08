@@ -23,7 +23,7 @@ export function assertGammaThemesConfigured(): void {
   if (missing.length > 0) {
     throw new Error(
       `Faltan env vars de themeId de Gamma para: ${missing.join(', ')} — ` +
-        `configurá GAMMA_THEME_${missing.map((id) => id.toUpperCase().replace(/-/g, '_')).join('/GAMMA_THEME_')}`,
+        `configura GAMMA_THEME_${missing.map((id) => id.toUpperCase().replace(/-/g, '_')).join('/GAMMA_THEME_')}`,
     );
   }
 }

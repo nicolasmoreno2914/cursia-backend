@@ -1,6 +1,7 @@
 import { buildRequirementsView, currentEntry, loadRequirementsState, RequirementCheck, RequirementsView } from './document-requirements';
 import type { DocumentRequirement } from './requirements';
 import { liveStructureShape, readStructureOrigin } from '../../course-structure/structure-authority';
+import { readCourseFormat } from '../../prebrief/course-formats';
 
 /**
  * LOOP 8.6C · Autoridad de los requisitos del documento sobre «Cursia recomienda».
@@ -15,7 +16,8 @@ import { liveStructureShape, readStructureOrigin } from '../../course-structure/
  *     crítico, diciendo qué requisito choca con cuál;
  *   - lo que el docente decidió en contra del documento no se borra ni se revierte: queda como «Excepción al requisito
  *     del documento» (advertencia en Verificación).
- * Las alternativas (S/M/L) solo restringen cuando el docente eligió una. Todavía no se bloquea nada en el servidor.
+ * Las alternativas (S/M/L) solo restringen cuando el docente eligió una. Los críticos bloquean la generación en el
+ * servidor (R68, GenerationDesignGate).
  *
  * Las restricciones dependen SOLO de lo guardado (requisitos, alternativa elegida, excepciones registradas): «Usar este
  * diseño» recalcula la misma propuesta y la misma huella.
@@ -228,6 +230,10 @@ export async function requirementConstraintsForCourse(
  * review piloto I5: corregir un título o fijar un video no cuenta). Orígenes anteriores sin forma: por el contador.
  */
 export async function structureEditedByTeacher(q: Q, courseId: number): Promise<boolean> {
+  // Prebrief · un formato S/M/L elegido es una decisión de la institución sobre la estructura: manda sobre el documento
+  // (si lo contradice, queda como «Excepción al requisito del documento») y Cursia no rellena hasta el mínimo del documento.
+  const fmt = await readCourseFormat(q, courseId);
+  if (fmt) return true;
   const origin = await readStructureOrigin(q as any, courseId);
   if (!origin) return true;
   if (origin.shape) {
