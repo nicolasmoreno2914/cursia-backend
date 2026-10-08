@@ -100,8 +100,11 @@ export class PrebriefService {
   }
 
   private async metadata(q: Q, courseId: number): Promise<Record<string, any>> {
-    const [row] = await q.query(`select metadata, created_at from public.courses where id = $1`, [courseId]);
-    return { ...(row && row.metadata ? parse(row.metadata) : {}), __createdAt: row ? row.created_at : null };
+    // El instante se calcula en Postgres: courses.created_at es `timestamp` sin zona (lo escribe now() en la zona de la
+    // sesión de la base) y el driver lo leería en la zona horaria del proceso Node (en staging corría 2 h y un curso
+    // nuevo parecía anterior al corte). ::timestamptz lo interpreta con la MISMA zona de sesión que lo escribió.
+    const [row] = await q.query(`select metadata, (extract(epoch from created_at::timestamptz) * 1000)::float8 as created_ms from public.courses where id = $1`, [courseId]);
+    return { ...(row && row.metadata ? parse(row.metadata) : {}), __createdAtMs: row && row.created_ms !== null ? Number(row.created_ms) : null };
   }
 
   // ── Borrador ────────────────────────────────────────────────────────────────────────────────────────────────
@@ -522,7 +525,7 @@ export class PrebriefService {
     if (!since) return false;
     const t = Date.parse(since);
     if (isNaN(t)) throw new ServiceUnavailableException({ code: 'PREBRIEF_CONFIG_INVALID', message: `${PREBRIEF_REQUIRED_SINCE_ENV} no es una fecha válida.` });
-    return !!m.__createdAt && new Date(m.__createdAt).getTime() >= t;
+    return typeof m.__createdAtMs === 'number' && Number.isFinite(m.__createdAtMs) && m.__createdAtMs >= t;
   }
 
   /**
