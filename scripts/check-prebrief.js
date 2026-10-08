@@ -15,6 +15,7 @@
 //   PB11 textos del backend (mensajes, sugerencias, errores) en español neutro: Language QA = 0 en src/.
 //   PB12 CONSISTENCIA interfaz/PDF: el renderizador REAL del frontend (56-v2-prebrief.js) muestra exactamente los textos
 //        del documento (los mismos que PB8 encuentra en el PDF). Requiere CURSIA_FRONTEND_REPO.
+//   PB15 el corte por fecha de creación usa el instante de Postgres (zona horaria del proceso irrelevante).
 //   PB14 sin tablas del Prebrief, guardar tema/evaluación no aborta la transacción (to_regclass).
 //   PB13 la barrera está CABLEADA: RunsService y PackagingService reciben PrebriefService (inyección de Nest); un PATCH
 //        del curso no puede tocar las claves del Prebrief; la huella no depende de la redacción del código.
@@ -232,7 +233,7 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
   await check('PB9 barrera: requiresPrebrief por flujo del curso o por DYNAMIC_PREBRIEF_REQUIRED_SINCE; fecha inválida → 503', async () => {
     const { PrebriefService } = D('modules/prebrief/prebrief.service.js');
     const svc = Object.create(PrebriefService.prototype);
-    const q = (meta, createdAt, hasVersion = false) => ({ query: async (sql) => (/course_prebrief_versions/.test(sql) ? (hasVersion ? [{ x: 1 }] : []) : [{ metadata: meta, created_at: createdAt }]) });
+    const q = (meta, createdAt, hasVersion = false) => ({ query: async (sql) => (/course_prebrief_versions/.test(sql) ? (hasVersion ? [{ x: 1 }] : []) : [{ metadata: meta, created_ms: createdAt ? new Date(createdAt).getTime() : null }]) });
     const prev = process.env.DYNAMIC_PREBRIEF_REQUIRED_SINCE;
     try {
       delete process.env.DYNAMIC_PREBRIEF_REQUIRED_SINCE;
@@ -342,6 +343,15 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
     assert(/to_regclass\('public\.course_prebrief_events'\)/.test(before), 'falta la comprobación to_regclass antes de la consulta');
     assert(/if \(prebriefTables\?\.present\)/.test(before), 'la consulta no depende de to_regclass');
     assert(!/42P01/.test(src.slice(i, i + 600)), 'la consulta del bloqueo no debe atrapar 42P01 dentro de la transacción');
+  });
+
+  await check('PB15 el corte DYNAMIC_PREBRIEF_REQUIRED_SINCE compara el instante real (Postgres), no la lectura del driver en la zona de Node', () => {
+    // courses.created_at es `timestamp` sin zona: el driver lo lee en la zona horaria del proceso (en staging, 2 h antes)
+    // y un curso nuevo parecía anterior al corte. El instante sale de Postgres con la zona de la sesión que lo escribió.
+    const src = require('fs').readFileSync(path.join(REPO, 'src/modules/prebrief/prebrief.service.ts'), 'utf8');
+    assert(/extract\(epoch from created_at::timestamptz\)/.test(src), 'metadata() debe calcular el instante con created_at::timestamptz');
+    assert(/m\.__createdAtMs >= t/.test(src), 'requiresPrebrief debe comparar el instante en milisegundos');
+    assert(!/new Date\(m\.__createdAt\)/.test(src), 'no se debe convertir created_at en Node');
   });
 
   console.log(`\n${ok} OK · ${fail} fallas`);
