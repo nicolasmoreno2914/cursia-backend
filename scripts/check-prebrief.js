@@ -512,6 +512,18 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
     eq(d.sections.find((x) => x.id === 'requirements').blocks.find((b) => b.t === 'requirements').items.find((i) => /videos/.test(i.text)).statusLabel, 'No verificable', 'videos');
   });
 
+  await check('PB26 la decisión aplicada de una excepción es la misma en «Requisitos» y en «Excepciones» (nunca «—»)', () => {
+    const inp = fixture({ doc4x5: true, shape: [5, 5, 5, 5] });
+    const vc = inp.card.verification.checks.find((x) => x.id === 'requirement:req-videos');
+    Object.assign(vc, { severity: 'warning', title: 'Excepción al requisito del documento: al menos 2 videos por capítulo', capability: { requirementKey: 'videos|chapter|each', requirementText: 'al menos 2 videos por capítulo', produces: 'Cursia produce un video por capítulo' } });
+    inp.exceptionReasons['videos|chapter|each'] = { reason: 'Un video por capítulo en el piloto.', requirementText: 'al menos 2 videos por capítulo', by: 'docente@demo.test', at: '2026-10-08T12:00:00.000Z' };
+    const d = DOC.buildPrebriefDocument(build(inp));
+    const row = d.sections.find((x) => x.id === 'requirements').blocks.find((b) => b.t === 'requirements').items.find((i) => /videos/.test(i.text));
+    eq([row.statusLabel, row.note], ['Excepción', 'Decisión aplicada: Cursia produce un video por capítulo (ver sección 12).'], 'requisitos');
+    const ex = d.sections.find((x) => x.id === 'exceptions').blocks[0].items.map((e) => e.rows.find((r) => r.label === 'Decisión aplicada').value);
+    assert(ex.includes('Cursia produce un video por capítulo'), JSON.stringify(ex));
+  });
+
   console.log(`\n${ok} OK · ${fail} fallas`);
   process.exit(fail ? 1 : 0);
 })();
