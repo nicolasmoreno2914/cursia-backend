@@ -2609,7 +2609,7 @@ function reservationBookkeeping(ev) {
       const stt = await waitRunTerminal(S.front.dynExecutorStart({ courseId, blueprintNumber: n, runId }), 'E20 run', undefined, runId);
       const items = await waitItemsDone(runId);
       ok(stt.failed === 0 && !stt.fatalError && items.every((i) => i.status === 'completed'), T(`generación MOCK completa (${items.length} items, proveedores falsos, USD 0)`), items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error_message || '').slice(0, 160)]));
-      const [manRow] = await q(`select m.id, m.blueprint_id, m.manifest, b.snapshot_sha256 from public.course_generation_manifests m join public.course_blueprints b on b.id = m.blueprint_id
+      const [manRow] = await q(`select m.id, m.blueprint_id, m.manifest_json as manifest, b.snapshot_sha256 from public.course_generation_manifests m join public.course_blueprints b on b.id = m.blueprint_id
          join public.production_jobs j on (j.input_payload->>'manifestId')::int = m.id where j.id = $1`, [runId]);
       const [vRow] = await q(`select blueprint_id, blueprint_sha256 from public.course_prebrief_versions where course_id = $1 and version = $2`, [courseId, ver.version]);
       ok(manRow && Number(manRow.blueprint_id) === Number(vRow.blueprint_id) && manRow.snapshot_sha256 === vRow.blueprint_sha256, T('Blueprint generado = Blueprint de la propuesta aprobada'), { manRow: manRow && { b: manRow.blueprint_id, s: manRow.snapshot_sha256 }, vRow });
