@@ -191,6 +191,8 @@ export const VALIDATION_INNER_CODES: readonly string[] = Object.freeze([
   'VIDEO_TOO_SHORT_FOR_INTERACTIONS', 'VIDEO_PLAN_INVARIANT', 'VIDEO_DURATION_INVALID', 'EXAM_ARTIFACT_AMBIGUOUS',
   'GIFT_EMPTY', 'GIFT_EMPTY_QUESTION', 'GIFT_NO_QUESTIONS', 'GIFT_QUESTION_COUNT', 'GIFT_UNPARSEABLE_BLOCK',
   'EXAM_NEUROMYTH', 'PRESENTATION_CARD_SLIDE_COUNT', 'SLIDE_COUNT',
+  // Language QA (piloto): el contenido no está en español neutro (voseo / «vosotros» / regionalismo) — se regenera.
+  'LANGUAGE_NOT_NEUTRAL',
 ]);
 /** Familias de códigos internos de validación (clase B). */
 export const VALIDATION_INNER_FAMILIES: readonly RegExp[] = Object.freeze([

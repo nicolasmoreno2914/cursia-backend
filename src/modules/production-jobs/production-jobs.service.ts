@@ -21,7 +21,7 @@ import { CreateFullCourseJobDto } from './dto/create-full-course-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
 import { UpdateStepDto } from './dto/update-step.dto';
 import { EventsService } from '../../events/events.service';
-import { assertLegacyAudioAllowed } from './legacy-audio-guard';
+import { assertLegacyAudioAllowed, assertLegacyGenerationAllowed } from './legacy-audio-guard';
 
 /** Pasos estándar del pipeline (matching CP_STEP_DEFS en 31-course-production.js) */
 const STANDARD_STEPS = [
@@ -518,6 +518,7 @@ export class ProductionJobsService implements OnModuleInit {
     if (!dto.courseId) {
       throw new BadRequestException('courseId is required');
     }
+    await assertLegacyGenerationAllowed((sql, params) => this.dataSource.query(sql, params), ownerId, dto.courseId); // R68
 
     const sanitizedPayload = this.sanitizePayload({
       courseId: dto.courseId,
@@ -618,6 +619,7 @@ export class ProductionJobsService implements OnModuleInit {
     if (!dto.courseId) {
       throw new BadRequestException('courseId is required');
     }
+    await assertLegacyGenerationAllowed((sql, params) => this.dataSource.query(sql, params), ownerId, dto.courseId); // R68
 
     const sanitizedPayload = this.sanitizePayload({
       courseId: dto.courseId,
@@ -1157,6 +1159,7 @@ export class ProductionJobsService implements OnModuleInit {
     if (job.ownerId !== userId) return { ok: false, reason: 'forbidden' };
     if (job.executionMode !== 'backend_videos') return { ok: false, reason: 'not_a_video_job' };
     if (this.isCancelledLike(job)) return { ok: false, reason: 'job_cancelled' };
+    await assertLegacyGenerationAllowed((sql, params) => this.dataSource.query(sql, params), userId, job.frontendCourseId ?? job.courseId); // R68
 
     const allowedStatuses = ['failed_recoverable', 'failed'];
     if (!allowedStatuses.includes(job.status)) {
@@ -1552,6 +1555,7 @@ export class ProductionJobsService implements OnModuleInit {
     dto: CreateH5PJobDto,
   ): Promise<H5PJobCreatedResponse> {
     if (!dto.courseId) throw new BadRequestException('courseId is required');
+    await assertLegacyGenerationAllowed((sql, params) => this.dataSource.query(sql, params), ownerId, dto.courseId); // R68
     if (!dto.contentSnapshotArtifactId) {
       throw new BadRequestException('contentSnapshotArtifactId is required');
     }
@@ -1858,6 +1862,7 @@ export class ProductionJobsService implements OnModuleInit {
     dto: CreateGammaJobDto,
   ): Promise<GammaJobCreatedResponse> {
     if (!dto.courseId) throw new BadRequestException('courseId is required');
+    await assertLegacyGenerationAllowed((sql, params) => this.dataSource.query(sql, params), ownerId, dto.courseId); // R68
     if (!dto.contentSnapshotArtifactId) {
       throw new BadRequestException('contentSnapshotArtifactId is required');
     }
@@ -2153,6 +2158,7 @@ export class ProductionJobsService implements OnModuleInit {
     dto: CreatePackageJobDto,
   ): Promise<PackageJobCreatedResponse> {
     if (!dto.courseId) throw new BadRequestException('courseId is required');
+    await assertLegacyGenerationAllowed((sql, params) => this.dataSource.query(sql, params), ownerId, dto.courseId); // R68
     if (!dto.contentSnapshotArtifactId) throw new BadRequestException('contentSnapshotArtifactId is required');
 
     const rawCourseId    = dto.courseId;
@@ -2798,6 +2804,7 @@ export class ProductionJobsService implements OnModuleInit {
     if ((dto.options as Record<string, any> | undefined)?.generateAudio !== false) {
       await this.assertLegacyAudioAllowedForCourse(ownerId, dto.courseId);
     }
+    await assertLegacyGenerationAllowed((sql, params) => this.dataSource.query(sql, params), ownerId, dto.courseId); // R68
 
     const rawCourseId    = dto.courseId;
     const numericCourseId = rawCourseId ? parseInt(rawCourseId, 10) : NaN;
@@ -3039,6 +3046,8 @@ export class ProductionJobsService implements OnModuleInit {
     if ((job.inputPayload?.options as Record<string, any> | undefined)?.generateAudio !== false) {
       await this.assertLegacyAudioAllowedForCourse(userId, job.frontendCourseId ?? job.courseId);
     }
+    // R68: reencolar un job legacy de un curso V2 también es generar fuera del flujo verificado.
+    await assertLegacyGenerationAllowed((sql, params) => this.dataSource.query(sql, params), userId, job.frontendCourseId ?? job.courseId);
 
     const retryableStatuses = ['failed_retryable', 'failed', 'needs_reconnect', 'blocked_quota', 'failed_recoverable'];
     if (!retryableStatuses.includes(job.status)) {

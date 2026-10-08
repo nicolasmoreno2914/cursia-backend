@@ -369,7 +369,7 @@ function gammaGenerationBodyBase(input: { chapterTitle: string; contentMarkdown:
     numCards: GAMMA_NUM_CARDS,
     additionalInstructions:
       'La diapositiva 1 es la portada del capítulo y debe mostrar su título. ' +
-      'El resto desarrolla el contenido en bloques temáticos coherentes, en español latinoamericano con tuteo (tú), nunca voseo. ' +
+      'El resto desarrolla el contenido en bloques temáticos coherentes, en español latinoamericano NEUTRO con tuteo (tú): nunca voseo, «vosotros» ni regionalismos de ningún país. ' +
       // R14: con textMode 'generate' Gamma completa el texto; no debe inventar cifras ni fuentes.
       'No agregues cifras, porcentajes, estadísticas, estudios, encuestas, instituciones ni citas que no estén literalmente en el texto; si el texto no trae un dato, no lo inventes. ' +
       // R14-12: Gamma rotuló casos ilustrativos como "Caso real"/"Ejemplo real" y convirtió una mención de

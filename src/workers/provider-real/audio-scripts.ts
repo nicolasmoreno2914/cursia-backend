@@ -1,3 +1,4 @@
+import { lqaFindings, lqaFixText, lqaHitLabel, lqaLanguageRule } from '../../modules/language-qa/language-qa';
 // ─────────────────────────────────────────────────────────────────────────────
 // Cursia V2.1 F2 — guiones de audio de un run rulesVersion 3.
 //
@@ -121,12 +122,12 @@ export interface ChapterScriptInput {
   contentMarkdown: string;
 }
 
-const AUDIO_VOSEO_COUNTRIES = ['argentina', 'uruguay', 'paraguay'];
-/** R14: el guion del audiolibro derivaba al voseo en un curso para Colombia. */
-export function audioLocaleRule(pais?: string | null): string {
-  const p = String(pais ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
-  if (AUDIO_VOSEO_COUNTRIES.includes(p)) return '- Español con el trato habitual del país.\n';
-  return '- Español latinoamericano con tuteo (tú: «usas», «puedes», «quieres»); nunca voseo («vos», «usás», «podés», «querés»).\n';
+/**
+ * R14 + Language QA (piloto, 2026-10-07): español latinoamericano NEUTRO para cualquier país (antes Argentina, Uruguay y
+ * Paraguay tenían voseo): misma regla que el resto de los prompts (lqaLanguageRule).
+ */
+export function audioLocaleRule(_pais?: string | null): string {
+  return '- ' + lqaLanguageRule() + '\n';
 }
 
 /**
@@ -164,6 +165,10 @@ export interface ScriptPrompt {
  * que no son etiquetas HTML reales y el texto entre `|` de una tabla mal formada.
  */
 export function cleanNarrationText(raw: string): string {
+  // Language QA: el voseo que no tiene otra lectura se corrige al tuteo antes de narrar.
+  return lqaFixText(cleanNarrationMarkdown(raw)).text;
+}
+function cleanNarrationMarkdown(raw: string): string {
   return (raw || '')
     .replace(/^\s*(```|~~~)[^\n]*$/gm, ' ')
     .replace(/^#{1,6}\s+/gm, '')
@@ -585,6 +590,11 @@ export async function generateSectionScript(
       `el guion del bloque ${section.idx + 1} del capítulo ${input.chapterNumber} quedó con ${words} palabras para ${section.words} de fuente (máximo ${max}) tras ${after}: no se narra relleno`,
       true,
     );
+  }
+  // Language QA: lo que no se corrige solo (regionalismos, «vosotros») no se narra (reintentable).
+  const lang = lqaFindings(text, 3);
+  if (lang.length) {
+    throw new AudioScriptError('AUDIOBOOK_LANGUAGE_NOT_NEUTRAL', `el guion del bloque ${section.idx + 1} del capítulo ${input.chapterNumber} no está en español neutro: ${lang.map((h) => lqaHitLabel(h)).join('; ')}`, true);
   }
   return { idx: section.idx, sourceSha: section.sha256, sourceWords: section.words, text, words, ratio: ratioOf(words, section.words), continued, condensed, messageIds };
 }

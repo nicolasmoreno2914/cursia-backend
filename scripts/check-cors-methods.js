@@ -113,6 +113,10 @@ const BROWSER_PROBE = (api) => `(async () => {
     } else console.log('   (sin CURSIA_FRONTEND_REPO: no se cruzan las cabeceras del cliente)');
     const main = fs.readFileSync(path.join(REPO, 'src/main.ts'), 'utf8');
     assert(/app\.enableCors\(corsOptions\(process\.env\)\)/.test(main), 'main.ts usa corsOptions (una sola definición)');
+    // Piloto: CORS antes de los parsers del cuerpo (un 413/400 del parser también lleva la cabecera y el navegador lee el mensaje).
+    const iCors = main.indexOf('app.enableCors(');
+    const iJson = main.indexOf('express.json(');
+    assert(iCors > 0 && iJson > 0 && iCors < iJson, 'main.ts: enableCors va ANTES de express.json (si no, un cuerpo demasiado grande llega al navegador como «Failed to fetch»)');
   });
 
   const { launchChrome } = require(path.join(REPO, 'scripts/lib/v21-cdp.js'));

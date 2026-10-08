@@ -27,6 +27,12 @@ export interface StructureOrigin {
   /** Versión del contexto académico aplicado (solo source = academic_context). */
   contextVersion: number | null;
   at: string;
+  /**
+   * Review piloto I5: capítulos por módulo (en orden) con los que Cursia dejó la estructura. «El docente cambió la
+   * estructura» = cambió esta forma (agregó o quitó módulos o capítulos), no un título o un objetivo. Orígenes anteriores
+   * (sin forma) se comparan por el contador, como antes.
+   */
+  shape?: number[];
 }
 
 export type StructureReplaceReason = 'user_edits' | 'confirmed_blueprint';
@@ -56,7 +62,8 @@ export function parseStructureOrigin(v: unknown): StructureOrigin | null {
   if (typeof o.counter !== 'number' || !Number.isInteger(o.counter) || o.counter < 0) return null;
   const cv = o.contextVersion;
   const contextVersion = typeof cv === 'number' && Number.isInteger(cv) && cv >= 1 ? cv : null;
-  return { source: o.source as StructureOriginSource, counter: o.counter, contextVersion, at: typeof o.at === 'string' ? o.at : '' };
+  const shape = Array.isArray(o.shape) && o.shape.length > 0 && o.shape.every((n) => typeof n === 'number' && Number.isInteger(n) && n >= 0) ? (o.shape as number[]) : null;
+  return { source: o.source as StructureOriginSource, counter: o.counter, contextVersion, at: typeof o.at === 'string' ? o.at : '', ...(shape ? { shape } : {}) };
 }
 
 const blank = (v: unknown) => v === null || v === undefined || !String(v).trim();
@@ -105,8 +112,12 @@ export function structureAuthority(
  * seguía como la dejó Cursia, el diseño también es de Cursia y el origen avanza al nuevo contador. Si el docente ya la
  * había editado, el origen queda como estaba (sigue contando como editada).
  */
-export function originAfterCursiaDesign(origin: StructureOrigin | null, counterBefore: number, counterAfter: number): StructureOrigin | null {
-  if (!origin || origin.counter !== counterBefore) return null;
+export function originAfterCursiaDesign(origin: StructureOrigin | null, counterBefore: number, counterAfter: number, shapeBefore?: number[] | null): StructureOrigin | null {
+  if (!origin) return null;
+  // Re-review piloto P2: con forma registrada, la estructura sigue siendo de Cursia si su FORMA antes de este cambio era la
+  // del origen (un título corregido entremedio no la vuelve del docente).
+  const sameShape = !!origin.shape && !!shapeBefore && origin.shape.length === shapeBefore.length && origin.shape.every((n, i) => n === shapeBefore[i]);
+  if (origin.counter !== counterBefore && !sameShape) return null;
   return { ...origin, counter: counterAfter };
 }
 
@@ -120,7 +131,20 @@ export async function readStructureOrigin(q: Q, courseId: number): Promise<Struc
   return parseStructureOrigin(typeof raw === 'string' ? JSON.parse(raw) : raw);
 }
 
+/** Capítulos por módulo de la estructura viva, en orden. */
+export async function liveStructureShape(q: Q, courseId: number): Promise<number[]> {
+  const res = await q.query(
+    `select m.id, count(c.id)::int as n from public.course_modules m left join public.course_chapters c on c.module_id = m.id
+      where m.course_id = $1 group by m.id, m.position order by m.position`,
+    [courseId],
+  );
+  const rows: any[] = Array.isArray(res) ? res : res.rows;
+  return rows.map((r) => Number(r.n));
+}
+
 export async function writeStructureOrigin(q: Q, courseId: number, origin: StructureOrigin): Promise<void> {
+  // Review piloto I5: el origen guarda la forma con la que Cursia deja la estructura (dentro de la misma transacción).
+  if (!origin.shape) origin = { ...origin, shape: await liveStructureShape(q, courseId) };
   await q.query(
     `update public.courses set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), $2::text[], $3::jsonb, true) where id = $1`,
     [courseId, [STRUCTURE_ORIGIN_KEY], JSON.stringify(origin)],
@@ -128,7 +152,22 @@ export async function writeStructureOrigin(q: Q, courseId: number, origin: Struc
 }
 
 /** Un cambio que hace Cursia (diseño de horas, poda de vínculos de un contexto nuevo) no convierte la estructura en «editada». */
-export async function advanceStructureOriginIfUntouched(q: Q, courseId: number, counterBefore: number, counterAfter: number): Promise<void> {
-  const next = originAfterCursiaDesign(await readStructureOrigin(q, courseId), counterBefore, counterAfter);
-  if (next) await writeStructureOrigin(q, courseId, next);
+/**
+ * `shapeBefore`: la forma ANTES del cambio de Cursia (quien cambia la forma, como «Usar este diseño», la lee antes de
+ * mutar). Sin ella se usa la forma viva (los cambios que no tocan la forma: vínculos, videos).
+ */
+export async function advanceStructureOriginIfUntouched(q: Q, courseId: number, counterBefore: number, counterAfter: number, shapeBefore?: number[]): Promise<void> {
+  const origin = await readStructureOrigin(q, courseId);
+  if (!origin) return;
+  if (origin.counter === counterBefore) {
+    // Nadie la tocó: el cambio de Cursia la deja intacta (contador y forma nuevos).
+    await writeStructureOrigin(q, courseId, { ...origin, counter: counterAfter, shape: undefined });
+    return;
+  }
+  // Re-review piloto R1: hubo ediciones del docente que NO cambiaron la forma (títulos, videos). La estructura sigue siendo
+  // de Cursia para los requisitos (se actualiza solo la FORMA), pero el contador del origen NO avanza: es la protección
+  // contra reemplazar la estructura sin confirmar («Se pierden los cambios hechos después…», confirmReplace).
+  if (originAfterCursiaDesign(origin, counterBefore, counterAfter, shapeBefore ?? (await liveStructureShape(q, courseId)))) {
+    await writeStructureOrigin(q, courseId, { ...origin, shape: await liveStructureShape(q, courseId) });
+  }
 }

@@ -546,7 +546,105 @@ async function dbChecks() {
       eq((await design.recommend(cid3, OWNER, {})).hours.target, 12.5, '«12,50 horas» → 12,5 h');
     });
 
-    await check('RC7 conflictos que Cursia no resuelve sola: críticos con su causa; la generación no se bloquea en el servidor', async () => {
+    await check('RC21 piloto (review I5): corregir un título no cambia nada; si el docente cambia la FORMA de la estructura, Cursia no vuelve a proponer capítulos: es su excepción y se puede aprobar', async () => {
+      const cid = await courseWith('Estructura del docente', [3, 3], 'El curso tendrá 4 capítulos por módulo.');
+      const first = await design.recommend(cid, OWNER, {});
+      eq(first.design.modules.map((m) => m.chapters.length), [4, 4], 'Cursia completa el mínimo en su estructura');
+      // El docente corrige un título en «Avanzado»: la forma sigue igual → Cursia sigue completando el mínimo.
+      const [ch] = await ds.query(`select id, module_id from public.course_chapters where course_id = $1 order by position limit 1`, [cid]);
+      await structure.updateChapter(cid, ch.module_id, ch.id, OWNER, { title: 'Tema renombrado por el docente', expectedCounter: await counter(cid) });
+      const renamed = await design.recommend(cid, OWNER, {});
+      eq(renamed.design.modules.map((m) => m.chapters.length), [4, 4], 'un título corregido no cambia la propuesta');
+      // El docente agrega un capítulo a mano al módulo 1 (forma 4 · 3): su estructura manda.
+      await structure.createChapter(cid, ch.module_id, OWNER, { title: 'Capítulo agregado por el docente', objective: 'Aplicar lo visto', expectedCounter: await counter(cid) });
+      const card = await design.recommend(cid, OWNER, {});
+      eq(card.design.modules.map((m) => m.chapters.length), [4, 3], 'su estructura se respeta (sin capítulos propuestos)');
+      eq(card.design.modules.flatMap((m) => m.chapters).filter((c) => c.proposed).length, 0, 'sin cambios pendientes de capítulos');
+      const cc = reqCheck(card, 'chapters');
+      eq(cc.severity, 'warning', 'excepción del docente');
+      assert(/Excepción al requisito del documento/.test(cc.title), cc.title);
+      eq(card.verification.blocking, false, 'no bloquea');
+    });
+
+    // ═══ R68 (piloto) · el gate de generación con el lock, «Cursia recomienda» y Postgres reales ═══
+    const { GenerationDesignGate } = loadDist('modules/course-design/generation-design-gate.js');
+    const gate = new GenerationDesignGate(ds, design);
+    const lockNow = async (cid) => (await blueprints.lock(cid, OWNER, await counter(cid))).blueprint.blueprintNumber;
+    const gateReason = async (cid, n) => { try { await gate.assertVerified(cid, OWNER, n); return 'ok'; } catch (e) { const r = e.getResponse ? e.getResponse() : {}; return r.reason || r.code || String(e.message); } };
+
+    await check('RG1 R68: estructura sin el diseño aplicado → pending_changes; con el diseño aplicado → ok', async () => {
+      const cid = await courseWith('Gate 1', [3, 3], 'El curso tendrá 4 capítulos por módulo.');
+      eq(await gateReason(cid, await lockNow(cid)), 'pending_changes', 'Cursia propone capítulos que no se aplicaron');
+      await useDesign(cid);
+      eq(await gateReason(cid, await lockNow(cid)), 'ok', 'diseño aplicado y aprobado');
+    });
+
+    await check('RG2 R68 (review C1): cambiar el perfil (horas) DESPUÉS de aprobar → design_changed (lo verificado = lo congelado)', async () => {
+      const cid = await courseWith('Gate 2', [3, 3], 'El curso tendrá 3 capítulos por módulo.');
+      await useDesign(cid);
+      const n = await lockNow(cid);
+      eq(await gateReason(cid, n), 'ok', 'aprobado');
+      const cur = await profiles.getCurrent(cid, OWNER, 'pedagogy');
+      await profiles.append(cid, OWNER, 'pedagogy', { ...cur.profile, targetHours: (cur.profile.targetHours || 10) + 8 }, cur.version);
+      eq(await gateReason(cid, n), 'design_changed', 'el Blueprint congeló otras horas');
+    });
+
+    await check('RG3 R68: estructura editada tras aprobar → structure_changed; Blueprint anterior → blueprint_not_current', async () => {
+      const cid = await courseWith('Gate 3', [3, 3], 'El curso tendrá 3 capítulos por módulo.');
+      await useDesign(cid);
+      const n1 = await lockNow(cid);
+      const [ch] = await ds.query(`select id, module_id from public.course_chapters where course_id = $1 order by position limit 1`, [cid]);
+      await structure.updateChapter(cid, ch.module_id, ch.id, OWNER, { title: 'Editado después de aprobar', expectedCounter: await counter(cid) });
+      eq(await gateReason(cid, n1), 'structure_changed', 'editado');
+      const n2 = await lockNow(cid);
+      eq(await gateReason(cid, n1), 'blueprint_not_current', 'el Blueprint anterior ya no es el vigente');
+      eq(await gateReason(cid, n2), 'ok', 're-aprobado');
+    });
+
+    await check('RG5 R68 (re-review P1): sin cambios por aplicar pero con el perfil de la tarjeta SIN guardar → exactamente design_not_saved', async () => {
+      const cid = await courseWith('Gate 5', [3, 3], 'El curso tendrá 3 capítulos por módulo.');
+      // El docente conserva su estructura (fija videos y Actividades) y elige horas, pero nunca usa «Usar este diseño»:
+      // el enfoque y el audiovisual que propone Cursia no se guardan.
+      for (const ch of await ds.query(`select id, module_id, video_enabled from public.course_chapters where course_id = $1`, [cid])) {
+        await structure.updateChapter(cid, ch.module_id, ch.id, OWNER, { videoEnabled: ch.video_enabled, pinVideo: true, applicationMinutes: null, pinApplication: true, expectedCounter: await counter(cid) });
+      }
+      const pre = await design.recommend(cid, OWNER, {});
+      const cur = await profiles.getCurrent(cid, OWNER, 'pedagogy');
+      await profiles.append(cid, OWNER, 'pedagogy', { ...cur.profile, targetHours: Math.ceil(pre.design.baseHours * 2) / 2 }, cur.isDefault ? undefined : cur.version);
+      const card = await design.recommend(cid, OWNER, {});
+      eq([card.design.changes.length, card.verification.blocking, card.profileChanged], [0, false, true], 'sin cambios ni críticos, pero el perfil de la tarjeta no es el guardado');
+      eq(await gateReason(cid, await lockNow(cid)), 'design_not_saved', 'motivo exacto');
+      await useDesign(cid);
+      eq(await gateReason(cid, await lockNow(cid)), 'ok', 'con «Usar este diseño» el perfil queda guardado');
+    });
+
+    await check('RG6 re-review P2: corregir un título y DESPUÉS «Usar este diseño» → la estructura sigue siendo de Cursia (el origen avanza con la nueva forma)', async () => {
+      const cid = await courseWith('Gate 6', [3, 3], 'El curso tendrá 4 capítulos por módulo.');
+      const [ch] = await ds.query(`select id, module_id from public.course_chapters where course_id = $1 order by position limit 1`, [cid]);
+      await structure.updateChapter(cid, ch.module_id, ch.id, OWNER, { title: 'Título corregido', expectedCounter: await counter(cid) });
+      await useDesign(cid);
+      const [{ o }] = await ds.query(`select metadata -> 'structureOrigin' o from public.courses where id = $1`, [cid]);
+      eq(o.shape, [4, 4], 'el origen tiene la forma nueva');
+      assert(o.counter < await counter(cid), 're-review R1: el contador del origen NO avanza (el título corregido sigue protegido contra un reemplazo sin confirmar)');
+      const SAuth = loadDist('modules/course-structure/structure-authority.js');
+      eq(SAuth.originAfterCursiaDesign({ source: 'ai_proposal', counter: 1, contextVersion: null, at: '', shape: [3, 3] }, 5, 6, [3, 3]) !== null, true, 'misma forma → la estructura sigue siendo de Cursia');
+      const card = await design.recommend(cid, OWNER, {});
+      eq(reqCheck(card, 'chapters').severity, 'ok', 'el requisito se cumple con el diseño de Cursia (no es una excepción del docente)');
+      eq(await gateReason(cid, await lockNow(cid)), 'ok', 'aprobable');
+    });
+
+    await check('RG4 R68: un crítico de Verificación → critical con la lista de críticos', async () => {
+      const cid = await courseWith('Gate 4', [3, 3], 'El curso tendrá 3 capítulos por módulo. Cada capítulo tendrá 2 videos.');
+      await useDesign(cid);
+      const n = await lockNow(cid);
+      let resp = null;
+      try { await gate.assertVerified(cid, OWNER, n); } catch (e) { resp = e.getResponse(); }
+      eq(resp && resp.reason, 'critical', 'crítico');
+      assert(resp.criticals.some((c) => /video/i.test(c.title)), JSON.stringify(resp.criticals));
+      assert(/GENERATION_NOT_VERIFIED/.test(resp.message), resp.message);
+    });
+
+    await check('RC7 conflictos que Cursia no resuelve sola: críticos con su causa; Verificación los muestra (el bloqueo real de la generación es R68, en runs; aplicar el diseño no se bloquea)', async () => {
       const cid = await courseWith('Conflictos', [4, 4, 4, 4], 'El curso tendrá 3 módulos. Se realizarán 3 evaluaciones parciales y 1 evaluación final. Cada capítulo tendrá 2 videos.');
       const card = await design.recommend(cid, OWNER, {});
       const mods = reqCheck(card, 'modules');
@@ -559,7 +657,7 @@ async function dbChecks() {
       eq(card.verification.blocking, true, 'Verificación: hay críticos (el paso 4 lo muestra)');
       eq(card.design.modules.length, 4, 'Cursia no quitó ningún módulo');
       const { applied } = await useDesign(cid);
-      assert(applied, 'el servidor NO bloquea aplicar (fase posterior)');
+      assert(applied, 'aplicar el diseño no se bloquea (lo que se bloquea es GENERAR: R68, check-r68-generation-gate.js / E18)');
     });
 
     await check('RC8 horas del docente contra el documento: se respetan y quedan como excepción', async () => {
