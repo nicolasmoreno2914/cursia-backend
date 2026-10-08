@@ -511,6 +511,10 @@ jobs:
                # se escribe si falta, queda congelado en los deploys siguientes. Los anteriores conservan el
                # tema de su paleta. Sin la variable el default claro está APAGADO.
                ensure_env_default_if_absent PRESENTATION_LIGHT_DEFAULT_SINCE "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+               # Prebrief pedagógico (2026-10-08): los cursos dinámicos creados DESDE el primer deploy de este cambio
+               # solo generan sobre una propuesta aprobada (los anteriores no cambian; entran al flujo si preparan una
+               # versión). Mismo patrón que arriba: se escribe solo si falta, así el instante queda congelado.
+               ensure_env_default_if_absent DYNAMIC_PREBRIEF_REQUIRED_SINCE "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
                if grep -q "^DYNAMIC_COHERENCE_LLM=" .env; then
                  echo "⚠️  DYNAMIC_COHERENCE_LLM está en el .env de staging — no se toca (la decisión de pre-aceptación es dejarlo OFF)"
                else
@@ -618,6 +622,12 @@ jobs:
 
                echo "━━━ [4h5d] Contexto académico: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-academic-context-schema.js
+
+               echo "━━━ [4h5e] Prebrief pedagógico: course_prebrief_versions/events/pdfs — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-prebrief.js
+
+               echo "━━━ [4h5f] Prebrief pedagógico: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-prebrief-schema.js
 
                echo "━━━ [4h6] V2.1 RF: ledger FinOps (tablas append-only + seed de precios) (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-v21-finops.js

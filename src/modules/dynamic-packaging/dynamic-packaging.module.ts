@@ -1,3 +1,4 @@
+import { PrebriefModule } from '../prebrief/prebrief.module';
 import { Module } from '@nestjs/common';
 import { PackagingController } from './packaging.controller';
 import { PackagingService } from './packaging.service';
@@ -20,6 +21,7 @@ import { AutoPackageService } from './auto-package.service';
     ArtifactsModule,           // expone ArtifactsService.getDownloadUrl (signed URL de descarga)
     AuthModule,                // expone SupabaseJwtGuard para el controlador
     DynamicGenerationModule,   // EV6 DoD BE-B: RunsService (aviso «run completed» → empaque automático)
+    PrebriefModule,            // Prebrief: el empaque usa los perfiles aprobados
   ],
   controllers: [PackagingController],
   providers: [PackagingService, AutoPackageService],

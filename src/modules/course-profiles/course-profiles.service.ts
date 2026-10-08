@@ -1,3 +1,4 @@
+import { ACTIVE_RUN_WORKER_STATUSES } from '../dynamic-generation/item-transitions';
 import { parseProposedHours } from '../course-design/design-pins';
 import { returningRows } from '../../common/db/returning-rows';
 import { DERIVED_FIELDS, DerivedField, FieldOwner, PEDAGOGY_DERIVATION_KEY, mergeDerivedProfile, parsePedagogyDerivation, pedagogyFieldOwners } from '../course-facts/course-facts';
@@ -239,6 +240,25 @@ export class CourseProfilesService {
       // Serializa las escrituras de perfiles del curso (y congela finalExam
       // mientras se valida contra él).
       await qr.query(`select id from public.courses where id = $1 for update`, [courseId]);
+      // Prebrief (review BE-2 I1): mientras se produce un curso desde una propuesta aprobada, la evaluación y el tema no
+      // cambian (Gamma y el empaque los leen en vivo: un cambio a mitad mezclaría lo aprobado con lo no aprobado).
+      // to_regclass nunca falla: sin las tablas del Prebrief (producción) no se consulta nada y la transacción sigue sana
+      // (un 42P01 dentro de la transacción la abortaría y la siguiente consulta respondería 25P02).
+      const [prebriefTables] = kind === 'assessment' || kind === 'presentation'
+        ? await qr.query(`select to_regclass('public.course_prebrief_events') is not null as present`)
+        : [{ present: false }];
+      if (prebriefTables?.present) {
+        const [busy] = await qr.query(
+          `select 1 as x from public.production_jobs j
+             join public.course_prebrief_events e on e.course_id = j.course_id and e.type = 'generation_started' and e.payload ->> 'runId' = j.id::text
+            where j.course_id = $1 and j.execution_mode = 'dynamic_generation' and j.worker_status = any($2::text[]) limit 1`,
+          [courseId, ACTIVE_RUN_WORKER_STATUSES],
+        );
+        if (busy) {
+          await qr.rollbackTransaction();
+          throw new ConflictException({ code: 'PROFILE_LOCKED_DURING_PRODUCTION', message: 'PROFILE_LOCKED_DURING_PRODUCTION: el curso se está produciendo sobre la propuesta aprobada; la evaluación y el tema se pueden cambiar cuando termine.' });
+        }
+      }
       const finalExam = await this.readFinalExam(qr, courseId);
 
       const errors = validateProfile(kind, data, { finalExam });

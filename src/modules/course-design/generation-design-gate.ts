@@ -36,6 +36,8 @@ export interface GenerationGateResult {
   ok: true;
   structureCounter: number;
   blueprintId: number;
+  /** La recomendación verificada (la reutiliza el gate del Prebrief: misma verificación, sin recalcular). */
+  card: any;
 }
 
 @Injectable()
@@ -127,6 +129,6 @@ export class GenerationDesignGate {
     // Re-review piloto P1: Verificación evaluó el perfil que muestra la tarjeta; debe ser el GUARDADO (el que congeló el
     // Blueprint). Si Cursia propone horas/enfoque/audiovisual sin guardar, se verificó otra cosa que la que se generaría.
     if (card.profileChanged === true) this.reject('design_not_saved');
-    return { ok: true, structureCounter: Number(course.structure_version_counter), blueprintId: Number(bp.id) };
+    return { ok: true, structureCounter: Number(course.structure_version_counter), blueprintId: Number(bp.id), card };
   }
 }

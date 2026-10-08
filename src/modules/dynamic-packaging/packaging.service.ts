@@ -1,4 +1,5 @@
-import { BadRequestException, ConflictException, Injectable, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, InternalServerErrorException, Logger, NotFoundException, Optional } from '@nestjs/common';
+import { PrebriefService } from '../prebrief/prebrief.service';
 import { effectiveOutputRowsSql } from '../dynamic-generation/item-generations';
 import { DataSource } from 'typeorm';
 import { GenerationManifestsService, ManifestDto } from '../generation-manifests/generation-manifests.service';
@@ -147,6 +148,8 @@ export class PackagingService {
     private readonly dataSource: DataSource,
     private readonly manifests: GenerationManifestsService,
     private readonly artifacts: ArtifactsService,
+    /** Prebrief: el empaque usa los perfiles de evaluación y presentación APROBADOS (review BE-1 I1). @Optional por harnesses. */
+    @Optional() private readonly prebrief?: PrebriefService,
   ) {}
 
   /**
@@ -180,6 +183,7 @@ export class PackagingService {
     assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     const run = await this.loadRunRow(courseId, manifest, runId);
+    if (this.prebrief) await this.prebrief.assertPackagingMatchesApproval(courseId, runId);
     const packageKind = await this.assertRunReady(run, manifest, actor);
     const deliverable = isDeliverableKind(packageKind);
     if (opts.auto && packageKind !== 'final') {

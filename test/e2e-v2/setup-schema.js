@@ -65,6 +65,7 @@ const req = (p) => require(path.join(BUILD, p));
     'supabase-migration-practice-chapters.sql', // Motor de carga horaria: course_chapters.chapter_kind (capítulo de práctica)
     'supabase-migration-application-activities.sql', // Fase 2: course_chapters.application_minutes (Actividades de Aplicación)
     'supabase-migration-academic-context.sql', // Fase 3: course_profiles.kind 'academic' + course_chapters.outcome_ids
+    'supabase-migration-prebrief.sql', // Prebrief pedagógico: versiones, historial y PDF (inmutables)
   ]) {
     await ds.query(fs.readFileSync(path.join(REPO, f), 'utf8'));
     console.log('applied', f);

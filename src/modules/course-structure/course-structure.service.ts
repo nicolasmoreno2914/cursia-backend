@@ -944,7 +944,7 @@ export class CourseStructureService implements OnModuleInit {
     assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
     await assertV21StructureSchema(this.dataSource); // V2.1 fix round 1 (I5): 503 si falta la migración R3
     if (dto.finalExam === undefined && dto.activityEngine === undefined && dto.reviewCardsEnabled === undefined) {
-      throw new BadRequestException('Nada para actualizar: enviá "finalExam", "activityEngine" y/o "reviewCardsEnabled".');
+      throw new BadRequestException('Nada para actualizar: envía "finalExam", "activityEngine" y/o "reviewCardsEnabled".');
     }
     if (dto.reviewCardsEnabled !== undefined) {
       // EV6 H5P v2: la columna la agrega supabase-migration-ev6-h5p2.sql; sin ella → 503 explícito.

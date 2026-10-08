@@ -56,6 +56,11 @@ interface AlignmentLike {
 }
 
 export interface VerificationInput {
+  /**
+   * Prebrief · formato S/M/L elegido (decisión de la institución): la forma de contenidos y el rango de horas. Apartarse
+   * del propio formato es una advertencia (las excepciones son solo frente al documento). Ausente = sin formato.
+   */
+  format?: { label: string; modules: number; chaptersPerModule: number; hoursMin: number; hoursMax: number; structureOk: boolean; hoursOk: boolean; contentShape: number[] } | null;
   status: 'within_tolerance' | 'above_tolerance' | 'minimum_exceeds_target' | 'cannot_reach_target';
   targetHours: number;
   estimatedHours: number;
@@ -233,6 +238,15 @@ export function verifyDesign(input: VerificationInput): DesignVerification {
     add({ id: 'evaluation_exams', area: 'evaluations', severity: 'warning', title: 'El microcurrículo evalúa con pruebas que el diseño no tiene',
       detail: `${evText(exams)}: ninguna evaluación de módulo trabaja ese resultado y no hay evaluación final.`,
       fix: { kind: 'editor', action: 'module_exams', label: 'Activar evaluaciones en el editor' } });
+  }
+  // Formato S/M/L (Prebrief): la estructura de contenidos y las horas dentro del formato elegido.
+  if (input.format) {
+    const f = input.format;
+    if (f.structureOk && f.hoursOk) add({ id: 'format', area: 'structure', severity: 'ok', title: `${f.label}: ${f.modules} módulos × ${f.chaptersPerModule} capítulos, ${f.hoursMin}–${f.hoursMax} horas` });
+    else add({ id: 'format', area: 'structure', severity: 'warning',
+      title: !f.structureOk ? `La estructura no coincide con el ${f.label} (${f.modules} módulos × ${f.chaptersPerModule} capítulos de contenido)` : `Las horas están fuera del ${f.label} (${f.hoursMin}–${f.hoursMax} horas)`,
+      detail: !f.structureOk ? `Capítulos de contenido por módulo: ${f.contentShape.join(', ') || 'ninguno'}. Las prácticas y las Actividades de Aplicación no cuentan.` : undefined,
+      fix: !f.structureOk ? { kind: 'editor', action: 'structure', label: 'Ajustar la estructura' } : { kind: 'adjust', action: 'targetHours', label: 'Revisar las horas' } });
   }
   // Pedagogía.
   if (input.approach) add({ id: 'pedagogy', area: 'pedagogy', severity: 'ok', title: `Enfoque: ${input.approach.label}` });

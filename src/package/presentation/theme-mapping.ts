@@ -68,7 +68,7 @@ export function gammaThemeFor(familyId: ThemeFamilyId, mode: ThemeMode): string 
 
   throw new Error(
     `GAMMA_THEME_CONFIG: no hay themeId de Gamma configurado para "${familyId}" (${mode}) — ` +
-      `configurá ${envKeyFor(familyId, mode)} o ${fallbackEnvKey}`,
+      `configura ${envKeyFor(familyId, mode)} o ${fallbackEnvKey}`,
   );
 }
 
