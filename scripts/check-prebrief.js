@@ -99,7 +99,7 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
     eq([m.duration.format.code, m.duration.format.value, m.duration.targetHours.value, m.duration.targetHours.origin], ['M', 'Formato M', 42, 'format'], 'formato y horas');
     eq(m.structure.origin, 'format', 'estructura: configuración seleccionada');
     eq([m.structure.totals.modules, m.structure.totals.contentChapters, m.structure.totals.practiceChapters], [3, 12, 0], 'totales');
-    eq(m.exceptions.map((e) => [e.requirementKey, e.requirementText, e.appliedText, e.reason]), [['structure|course', 'estructura 4 × 5 (20 capítulos)', '3 × 4 (12 capítulos)', 'La institución prioriza una duración menor para el piloto.']], 'excepción');
+    eq(m.exceptions.map((e) => [e.requirementKey, e.requirementText, e.appliedText, e.reason]), [['structure|course', 'estructura 4 × 5 (20 capítulos)', '3 módulos × 4 capítulos de contenido', 'La institución prioriza una duración menor para el piloto.']], 'excepción');
     eq(m.requirements.items.map((i) => [i.key, i.status]).sort(), [['evaluations|course|partial', 'met'], ['structure|course', 'exception'], ['videos|chapter|each', 'not_verifiable']].sort(), 'requisitos');
     eq(m.goals.outcomes.map((o) => o.origin), ['document', 'document', 'document', 'document'], 'resultados del documento');
     eq(m.pedagogy.approach.origin, 'cursia', 'enfoque recomendado');
@@ -111,7 +111,8 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
   await check('PB4 cobertura de la huella: cada entrada que cambia el curso generado cambia la huella (y el costo no)', () => {
     const s0 = shaOf(base);
     const mut = [];
-    for (const k of RH.CONTEXT_STRING_FIELDS) mut.push([`contexto.${k}`, (x) => { x.brief[k] = (x.brief[k] || '') + ' X'; }]);
+    // LOOP 9.1 (A1): el nombre sale de «Lo que sabemos del curso», que se arma con el pedido (como en el servicio).
+    for (const k of RH.CONTEXT_STRING_FIELDS) mut.push([`contexto.${k}`, (x) => { x.brief[k] = (x.brief[k] || '') + ' X'; if (k === 'nombre') x.facts.title.value = x.brief.nombre; }]);
     mut.push(['horas', (x) => { x.card.hours.target = 43; }]);
     mut.push(['título de un capítulo', (x) => { x.card.design.modules[0].chapters[0].title += ' (rev.)'; }]);
     mut.push(['video de un capítulo', (x) => { x.card.design.modules[1].chapters[2].videoEnabled = true; }]);
@@ -205,7 +206,7 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
       }
     }
     const ex = DOC.documentTexts(DOC.buildPrebriefDocument(build(fixture(CASES.excepcion)))).join('\n');
-    for (const s of ['Formato M', 'Configuración seleccionada', 'Requisito del documento', 'Excepción al requisito del documento', 'La institución prioriza una duración menor para el piloto.', 'Estructura 4 × 5 (20 capítulos)', '3 × 4 (12 capítulos)', 'No verificable']) assert(ex.includes(s), `excepción: «${s}»`);
+    for (const s of ['Formato M', 'Configuración seleccionada', 'Requisito del documento', 'Excepción al requisito del documento', 'La institución prioriza una duración menor para el piloto.', 'Estructura de 4 módulos × 5 capítulos (20 capítulos)', '3 módulos × 4 capítulos de contenido', 'No verificable']) assert(ex.includes(s), `excepción: «${s}»`);
     for (const t of Object.values(DOC.approvalStateTexts(META('approved', 'a'.repeat(64))))) assert(LQA.lqaFindings(t).length === 0, t);
   });
 
@@ -302,7 +303,7 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
       eq(missingUi.slice(0, 5), [], `${name}: textos del documento ausentes de la interfaz`);
       // Las mismas cifras clave en la interfaz y en el PDF (formato, módulos·capítulos, horas).
       const pdf = norm(await pdfText((await PDF.renderPrebriefPdf(d, META('ready', sha))).pdf)).replace(/\s+/g, '');
-      for (const key of [`${m.structure.totals.modules}·${m.structure.totals.chapters}`, ...(m.duration.format ? [norm(`Formato ${m.duration.format.code}`).replace(/\s+/g, '')] : []), ...(m.duration.targetHours ? [norm(`${String(m.duration.targetHours.value).replace('.', ',')} horas`).replace(/\s+/g, '')] : [])]) {
+      for (const key of [norm(d.sections[0].blocks[0].items[1].value).replace(/\s+/g, ''), ...(m.duration.format ? [norm(`Formato ${m.duration.format.code}`).replace(/\s+/g, '')] : []), ...(m.duration.targetHours ? [norm(`${String(m.duration.targetHours.value).replace('.', ',')} horas`).replace(/\s+/g, '')] : [])]) {
         assert(ui.includes(key) && pdf.includes(key), `${name}: «${key}» en interfaz y PDF`);
       }
       // Bloque de estado: los textos que da el servidor (approvalStateTexts) se pintan tal cual en la interfaz.
@@ -423,6 +424,92 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
     const inp2 = fixture({ doc4x5: true });
     inp2.facts.sector = { value: 'Otro sector inferido', source: 'inferred' };
     eq(build(inp2).generationContext.sector, inp2.brief.sector, 'el pedido manda');
+  });
+
+  // ── LOOP 9.1 (cierre pre-piloto) ──
+  await check('PB21 nombre del curso: nunca el título de relleno; del pedido, si no del documento; sin nombre → pendiente y bloquea', () => {
+    const PLACEHOLDERS = ['Curso sin título', 'Curso Virtual', 'Tu curso', 'Nuevo curso'];
+    // El pedido manda (aunque el título del curso en la base sea el de relleno).
+    const a = fixture({ doc4x5: true });
+    a.course.title = 'Curso sin título';
+    const ma = build(a);
+    eq([ma.course.title, ma.generationContext.nombre], ['Gestión Logística y Operaciones', 'Gestión Logística y Operaciones'], 'del pedido');
+    eq(DOC.buildPrebriefDocument(ma).cover.title, 'Gestión Logística y Operaciones', 'portada');
+    // Sin nombre en el pedido: el de «Lo que sabemos del curso» (documento), nunca «Curso sin título».
+    const b = fixture({ doc4x5: true });
+    b.course.title = 'Curso sin título'; delete b.brief.nombre; b.facts.title = { value: 'Seguridad y Salud en el Trabajo', source: 'document' };
+    const mb = build(b);
+    eq([mb.course.title, mb.generationContext.nombre], ['Seguridad y Salud en el Trabajo', 'Seguridad y Salud en el Trabajo'], 'del documento');
+    // Sin ningún nombre: la propuesta no inventa uno ni usa el de relleno, y no se puede preparar.
+    const c = fixture({});
+    c.course.title = 'Curso sin título'; delete c.brief.nombre; c.facts.title = { value: null, source: null };
+    const mc = build(c);
+    assert(!PLACEHOLDERS.includes(mc.course.title) && !mc.generationContext.nombre, JSON.stringify([mc.course.title, mc.generationContext.nombre]));
+    assert(M.missingContextFields(mc).includes('nombre'), 'falta el nombre');
+    const rd = RD.prebriefReadiness(mc, c.card, [], []);
+    assert(!rd.ready && rd.blockers.some((x) => x.code === 'context_incomplete'), JSON.stringify(rd.blockers));
+    for (const o of Object.values(CASES)) for (const t of DOC.documentTexts(DOC.buildPrebriefDocument(build(fixture(o))))) assert(!PLACEHOLDERS.includes(t), `texto de relleno: ${t}`);
+  });
+
+  await check('PB22 estructura N×M para el cliente: solo capítulos de contenido; la práctica se nombra aparte (también en la excepción)', () => {
+    eq(RA.structureActualText([5, 5, 5], [1, 1, 1]), '3 módulos × 4 capítulos de contenido, más 1 capítulo de práctica por módulo', 'uniforme');
+    eq(RA.structureActualText([4, 4, 4]), '3 módulos × 4 capítulos de contenido', 'sin práctica');
+    eq(RA.structureActualText([5, 3, 4], [1, 0, 0]), '3 módulos con 4, 3, 4 capítulos de contenido, más 1 capítulo de práctica', 'desigual');
+    // Caso LOOP 9: Formato M (3 × 4) con 1 práctica por módulo contra un documento 4 × 5 → «3 × 4», nunca «3 × 5».
+    const m = build(fixture({ format: 'M', doc4x5: true, practice: true, reason: 'La institución prioriza una duración menor para el piloto.' }));
+    eq(m.exceptions.map((e) => e.appliedText), ['3 módulos × 4 capítulos de contenido, más 1 capítulo de práctica por módulo'], 'excepción');
+    const d = DOC.buildPrebriefDocument(m);
+    const all = DOC.documentTexts(d).join('\n');
+    assert(!/3 × 5|3 · 15|15 capítulos/.test(all), 'el N×M no cuenta la práctica');
+    eq(d.sections[0].blocks[0].items[1], { value: '3 × 4', label: 'módulos × capítulos de contenido' }, 'en una mirada');
+    assert(all.includes('organizado en 3 módulos × 4 capítulos de contenido, más 1 capítulo de práctica por módulo.'), 'resumen');
+    assert(all.includes('Formato M: 3 módulos × 4 capítulos de contenido · 40–44 horas'), 'formato');
+  });
+
+  await check('PB23 recursos: los videos y demás recursos figuran como PREVISTOS (se producen después de aprobar)', () => {
+    const d = DOC.buildPrebriefDocument(build(fixture({ format: 'M' })));
+    const sec = d.sections.find((x) => x.id === 'resources');
+    const texts = DOC.documentTexts({ ...d, cover: { kicker: '', title: '', subtitle: [] }, sections: [sec] });
+    assert(texts.some((t) => /^\d+ videos educativos previstos$/.test(t)), JSON.stringify(texts));
+    assert(texts.some((t) => /Todavía no existen: se elaboran en la etapa de producción, después de aprobar esta propuesta/.test(t)), 'aclaración');
+    assert(!texts.some((t) => /^\d+ videos?$/.test(t)), 'nunca «20 videos» a secas');
+  });
+
+  await check('PB24 documento para el cliente: sin términos internos, códigos, ids ni huellas en ningún caso', () => {
+    const BAD = /\bnone\b|\bnull\b|\bundefined\b|\bNaN\b|\bprompt\b|\binternal\b|Cursia decision|\bfingerprint\b|\bendpoint\b|https?:\/\/|\/api\/|requirement:|structure\|course|\|course|\b[a-f0-9]{16,}\b|\b(ch|pr|m)-\d+\b|\btrue\b|\bfalse\b|\b(technical|university|basic|intermediate|advanced|recommended|adjusted)\b|[a-z]+_[a-z]+|\{|\}|\[object/i;
+    for (const [name, o] of Object.entries({ ...CASES, practica_m: { format: 'M', doc4x5: true, practice: true, reason: 'Motivo.' } })) {
+      const m = build(fixture(o));
+      const d = DOC.buildPrebriefDocument(m);
+      const sha = M.prebriefModelSha(m);
+      const texts = [...DOC.documentTexts(d), ...DOC.approvalStateTexts(META('approved', sha)), ...DOC.approvalStateTexts(META('ready', sha))];
+      const hits = texts.filter((t) => BAD.test(t));
+      eq(hits, [], `${name}: términos internos`);
+    }
+  });
+
+  await check('PB25 lectura con dudas (presente sin el curso como sujeto): «Por confirmar» con lo que tiene el diseño, nunca «No verificable» a secas', () => {
+    const inp = fixture({ doc4x5: true, shape: [5, 5, 5, 5] });
+    const r = { id: 'req-aa', key: 'application_activities|module|each', kind: 'application_activities', scope: { level: 'module', each: true }, mode: 'exact', value: 1, obligation: 'required', applies: true, active: true, status: 'found', confidence: 'medium', source: { documentId: 'doc-1', line: 30, page: 5, quote: 'La formación tiene 1 Actividad de Aplicación por módulo.' } };
+    inp.card.requirements.items.push(r);
+    inp.card.requirements.checks.push({ requirementId: 'req-aa', status: 'unmet', actual: { each: [5, 5, 5, 5] }, chosenBy: 'cursia', severity: 'info' });
+    inp.card.verification.checks.push({ id: 'requirement:req-aa', area: 'requirements', severity: 'info', title: 'Requisito del documento por revisar: 1 Actividad de Aplicación por módulo' });
+    // Un requisito antiguo sin «confidence» NO se trata como lectura con dudas (review LOOP 9.1 M4).
+    const legacy = { ...r, id: 'req-legacy', key: 'modules|course', kind: 'modules', scope: { level: 'course' }, value: 9 }; delete legacy.confidence;
+    inp.card.requirements.items.push(legacy); inp.card.requirements.checks.push({ requirementId: 'req-legacy', status: 'unmet', actual: { value: 4 }, chosenBy: 'cursia', severity: 'info' });
+    const m = build(inp);
+    const it = m.requirements.items.find((i) => i.key === 'application_activities|module|each');
+    eq([it.status, it.doubtful], ['not_verifiable', true], 'no cuenta como cumplido; marcado «por confirmar»');
+    assert(!m.requirements.items.find((i) => i.key === 'modules|course').doubtful, 'sin confianza no es «con dudas»');
+    // Sin el campo, la huella de los modelos sin lecturas con dudas no cambia (aprobaciones existentes siguen valiendo).
+    assert(!('doubtful' in build(fixture({ doc4x5: true, shape: [5, 5, 5, 5] })).requirements.items[0]), 'sin campo cuando no aplica');
+    const d = DOC.buildPrebriefDocument(m);
+    const row = d.sections.find((x) => x.id === 'requirements').blocks.find((b) => b.t === 'requirements').items.find((i) => /Actividad de Aplicación/.test(i.text));
+    eq(row.statusLabel, 'Por confirmar', 'rótulo');
+    const summary = d.sections.find((x) => x.id === 'requirements').blocks[0].text;
+    assert(/1 queda por confirmar\.$/.test(summary) && /; 2 no son verificables automáticamente/.test(summary), summary);
+    assert(/el diseño tiene 5 Actividades de Aplicación por módulo\. Revise esta diferencia antes de aprobar\./.test(row.note), row.note);
+    // Lo que de verdad no se puede medir sigue como «No verificable».
+    eq(d.sections.find((x) => x.id === 'requirements').blocks.find((b) => b.t === 'requirements').items.find((i) => /videos/.test(i.text)).statusLabel, 'No verificable', 'videos');
   });
 
   console.log(`\n${ok} OK · ${fail} fallas`);

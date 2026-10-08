@@ -363,12 +363,27 @@ export function requirementText(r: DocumentRequirement): string {
   const q = r.mode === 'range' ? `${n1(v)}–${n1(r.valueMax ?? v)} ${noun}` : r.mode === 'min' ? `al menos ${n1(v)} ${noun}` : r.mode === 'max' ? `hasta ${n1(v)} ${noun}` : r.mode === 'approx' ? `aproximadamente ${n1(v)} ${noun}` : `${n1(v)} ${noun}`;
   return q + scopeText(r);
 }
+/**
+ * LOOP 9.1 (A2): el N×M que lee un cliente cuenta solo los capítulos de contenido; la práctica se nombra aparte.
+ * «3 módulos × 4 capítulos de contenido, más 1 capítulo de práctica por módulo».
+ */
+export function structureActualText(shape: number[], practice?: number[]): string {
+  const pr = shape.map((_, i) => (practice && typeof practice[i] === 'number' ? practice[i] : 0));
+  const content = shape.map((n, i) => n - pr[i]);
+  const mods = `${shape.length} ${shape.length === 1 ? 'módulo' : 'módulos'}`;
+  const sameC = content.length && content.every((n) => n === content[0]);
+  const head = !shape.length ? '0 módulos'
+    : sameC ? `${mods} × ${content[0]} ${content[0] === 1 ? 'capítulo' : 'capítulos'} de contenido`
+      : `${mods} con ${content.join(', ')} capítulos de contenido`;
+  const totalP = pr.reduce((x, y) => x + y, 0);
+  if (!totalP) return head;
+  const sameP = pr.every((n) => n === pr[0]);
+  return sameP ? `${head}, más ${pr[0]} ${pr[0] === 1 ? 'capítulo' : 'capítulos'} de práctica por módulo` : `${head}, más ${totalP} ${totalP === 1 ? 'capítulo' : 'capítulos'} de práctica`;
+}
 export function actualText(r: DocumentRequirement, c: RequirementCheck): string {
   const a = c.actual || {};
   if (r.kind === 'structure') {
-    const sh = a.shape || [];
-    const same = sh.length && sh.every((n) => n === sh[0]);
-    return `${same ? `${sh.length} × ${sh[0]}` : sh.join(', ')} (${sh.reduce((x, y) => x + y, 0)} capítulos)`;
+    return structureActualText(a.shape || [], a.practice);
   }
   if (a.each) {
     const e = a.each;

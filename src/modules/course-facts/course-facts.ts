@@ -264,7 +264,7 @@ export interface FactsInput {
   proposedHours?: number | null;
 }
 
-const PLACEHOLDER_TITLES = ['Curso Virtual', 'Curso sin título', 'Tu curso'];
+const PLACEHOLDER_TITLES = ['Curso Virtual', 'Curso sin título', 'Tu curso', 'Nuevo curso'];
 const fact = <T>(value: T | null | undefined, source: FactSource | null): Fact<T> =>
   value === null || value === undefined || (typeof value === 'string' && !value.trim()) || (Array.isArray(value) && !value.length)
     ? { value: null, source: null }
@@ -378,7 +378,7 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
     ? [...ped.learningOutcomes.know.map((t) => ({ id: null, text: t, domain: 'know' as string | null, origin: 'profile' as OutcomeOrigin })), ...ped.learningOutcomes.do.map((t) => ({ id: null, text: t, domain: 'do' as string | null, origin: 'profile' as OutcomeOrigin }))]
     : [];
   const title = first<string>(
-    fact(b.nombre, briefSource('nombre')),
+    fact(b.nombre && !PLACEHOLDER_TITLES.includes(String(b.nombre).trim()) ? b.nombre : null, briefSource('nombre')), // LOOP 9.1: nunca un nombre de relleno
     ctx ? ctxFact(ctx.identity.subjectName) : fact<string>(null, null),
     fact(input.courseTitle && !PLACEHOLDER_TITLES.includes(input.courseTitle.trim()) ? input.courseTitle : null, 'user'),
   );

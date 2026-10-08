@@ -61,6 +61,8 @@ export interface PrebriefRequirement {
   actual: string | null;
   detail: string | null;
   evidence: { quote: string; page: number | null } | null;
+  /** LOOP 9.1: leído con dudas (confianza media) y el diseño no lo cumple → «Por confirmar» (solo presente si es true). */
+  doubtful?: true;
 }
 
 export interface PrebriefException {
@@ -407,7 +409,13 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
     else status = 'not_verifiable';
     const actual = c && c.status !== 'not_verifiable' ? actualTextOf(r, c) : null;
     const quote = r.source && clean(r.source.quote) ? { quote: clean(r.source.quote).slice(0, 160), page: typeof r.source.page === 'number' ? r.source.page : null } : null;
-    items.push({ key: String(r.key), text, status, raw: { mode: String(r.mode), value: typeof r.value === 'number' ? r.value : null, valueMax: typeof r.valueMax === 'number' ? r.valueMax : null, shape: Array.isArray(r.shape) ? r.shape.map(Number) : null, obligation: String(r.obligation) }, actual, detail: status === 'not_verifiable' && c && c.note ? clean(c.note) : null, evidence: quote });
+    // LOOP 9.1 (D): una lectura con dudas del documento no es «no verificable»: se dice que se usó como orientación y qué
+    // tiene el diseño (así la institución ve la diferencia antes de aprobar).
+    const doubtful = status === 'not_verifiable' && r.confidence === 'medium' && !!c && c.status !== 'not_verifiable';
+    const detail = doubtful
+      ? `Cursia leyó este dato con dudas en el documento y lo usó como orientación; el diseño tiene ${actual || '—'}. Revise esta diferencia antes de aprobar.`
+      : status === 'not_verifiable' && c && c.note ? clean(c.note) : null;
+    items.push({ key: String(r.key), text, status, raw: { mode: String(r.mode), value: typeof r.value === 'number' ? r.value : null, valueMax: typeof r.valueMax === 'number' ? r.valueMax : null, shape: Array.isArray(r.shape) ? r.shape.map(Number) : null, obligation: String(r.obligation) }, actual, detail, evidence: quote, ...(doubtful ? { doubtful: true as const } : {}) });
     if (status === 'exception') {
       const saved = inp.exceptionReasons[String(r.key)];
       const valid = saved && saved.requirementText === text && clean(saved.reason).length > 0;
@@ -469,7 +477,7 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
 
   // Decisiones de la institución.
   const decisions: PrebriefDecision[] = [];
-  if (fdef) decisions.push({ field: 'format', label: 'Formato del curso', value: `${fdef.label}: ${fdef.modules} módulos × ${fdef.chaptersPerModule} capítulos, ${fdef.hoursMin}–${fdef.hoursMax} horas`, code: fdef.code, origin: 'format' });
+  if (fdef) decisions.push({ field: 'format', label: 'Formato del curso', value: `${fdef.label}: ${fdef.modules} módulos × ${fdef.chaptersPerModule} capítulos de contenido, ${fdef.hoursMin}–${fdef.hoursMax} horas`, code: fdef.code, origin: 'format' });
   if (hs && (hs.source === 'user' || hs.source === 'adjusted') && typeof hs.target === 'number' && !(fdef && hs.target === fdef.targetHours)) {
     decisions.push({ field: 'hours', label: 'Horas de trabajo del estudiante', value: `${String(hs.target).replace('.', ',')} horas`, code: String(hs.target), origin: 'institution' });
   }
@@ -494,11 +502,14 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
 
   // Contexto de generación: el pedido guardado, alineado con el estudiante que congela el Blueprint.
   const ctx: Record<string, string> = {};
+  // LOOP 9.1 (A1): el nombre es el de «Lo que sabemos del curso» (pedido → documento → título real), nunca el título de
+  // relleno con que se crea el curso («Curso sin título»). Sin nombre, la propuesta no se puede preparar (faltan datos).
+  const courseName = clean(facts.title && facts.title.value ? String(facts.title.value) : '');
   // LOOP 9 QA (P1-11): sin sector/país en el pedido, el que muestra «Lo que entendimos» (inferido del documento o de
   // partida). Antes la pantalla mostraba «Sector: … inferido» y la propuesta lo pedía como dato faltante.
   const fromFacts: Record<string, string | null> = { sector: facts.sector && facts.sector.value ? String(facts.sector.value) : null, pais: facts.country && facts.country.value ? String(facts.country.value) : null };
   for (const k of PREBRIEF_CONTEXT_FIELDS) {
-    const v = clean(k === 'nombre' ? brief.nombre || inp.course.title : brief[k] || fromFacts[k] || '');
+    const v = clean(k === 'nombre' ? courseName : brief[k] || fromFacts[k] || '');
     if (v) ctx[k] = v;
   }
   const generationContext = inp.alignContext(ctx);
@@ -507,7 +518,7 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
     prebriefModelVersion: PREBRIEF_MODEL_VERSION,
     course: {
       id: inp.course.id,
-      title: clean(brief.nombre || inp.course.title),
+      title: courseName || 'Nombre del curso pendiente',
       program,
       institution: inp.course.institutionName ? clean(inp.course.institutionName) : null,
       modality: { value: 'Virtual (aula Moodle)', origin: 'cursia' },

@@ -239,7 +239,8 @@ export interface RequirementCheck {
   requirementId: string;
   status: RequirementCheckStatus;
   /** Lo que tiene el diseño: un valor, una forma (estructura) o uno por módulo/capítulo (alcance «cada»). */
-  actual: { value?: number | null; shape?: number[]; each?: number[] };
+  /** practice: capítulos de práctica por módulo (incluidos en shape). Solo para mostrar el N×M de contenido. */
+  actual: { value?: number | null; shape?: number[]; practice?: number[]; each?: number[] };
   /** Quién decidió el valor del diseño: el docente («Te estás apartando…»), el documento o Cursia. */
   chosenBy: RequirementChooser;
   /** Por qué no se puede verificar (o una aclaración). */
@@ -307,7 +308,9 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
     if (r.kind === 'structure') {
       const shape = mods.map((m) => m.chapters.length);
       const ok = !!r.shape && r.shape.length === shape.length && r.shape.every((n, i) => n === shape[i]);
-      out.push({ requirementId: r.id, status: ok ? 'met' : 'unmet', actual: { shape }, chosenBy: structureBy });
+      // LOOP 9.1 (A2): la comparación no cambia; se informa aparte cuántos son de práctica para mostrar el N×M de contenido.
+      const practice = mods.map((m) => m.chapters.filter((c) => c.kind === 'practice').length);
+      out.push({ requirementId: r.id, status: ok ? 'met' : 'unmet', actual: { shape, practice }, chosenBy: structureBy });
       continue;
     }
     if (r.value === null || r.value === undefined) { nv(r, 'Sin cantidad.'); continue; }
