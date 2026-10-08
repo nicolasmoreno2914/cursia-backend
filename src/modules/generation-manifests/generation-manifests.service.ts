@@ -249,7 +249,7 @@ export class GenerationManifestsService {
     if (!row) {
       throw new NotFoundException(
         `El Blueprint v${bp.blueprintNumber} del curso #${courseId} no tiene Generation Manifest ` +
-          `(rulesVersion ${rulesVersion}); crealo con POST`,
+          `(rulesVersion ${rulesVersion}); créalo con POST`,
       );
     }
     return this.toDto(row, bp);

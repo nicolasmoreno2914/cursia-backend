@@ -111,6 +111,9 @@ const BROWSER_PROBE = (api) => `(async () => {
       const sent = [...m[1].matchAll(/'([A-Za-z-]+)'\s*:/g)].map((x) => x[1]);
       for (const h of sent) assert(C.CORS_ALLOWED_HEADERS.map((x) => x.toLowerCase()).includes(h.toLowerCase()), `cabecera «${h}» del cliente no permitida por CORS`);
     } else console.log('   (sin CURSIA_FRONTEND_REPO: no se cruzan las cabeceras del cliente)');
+    // QA staging (Prebrief): el nombre del PDF viaja en Content-Disposition; el navegador solo la deja leer si se expone.
+    eq(C.corsOptions({}).exposedHeaders, ['Content-Disposition'], 'corsOptions expone Content-Disposition (nombre del PDF)');
+    if (fe && fs.existsSync(fe)) assert(/headers\.get\('Content-Disposition'\)|headers\.get\("Content-Disposition"\)|content-disposition/i.test(fs.readFileSync(fe, 'utf8')), 'el cliente lee Content-Disposition');
     const main = fs.readFileSync(path.join(REPO, 'src/main.ts'), 'utf8');
     assert(/app\.enableCors\(corsOptions\(process\.env\)\)/.test(main), 'main.ts usa corsOptions (una sola definición)');
     // Piloto: CORS antes de los parsers del cuerpo (un 413/400 del parser también lleva la cabecera y el navegador lee el mensaje).

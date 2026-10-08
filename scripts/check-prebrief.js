@@ -15,6 +15,7 @@
 //   PB11 textos del backend (mensajes, sugerencias, errores) en español neutro: Language QA = 0 en src/.
 //   PB12 CONSISTENCIA interfaz/PDF: el renderizador REAL del frontend (56-v2-prebrief.js) muestra exactamente los textos
 //        del documento (los mismos que PB8 encuentra en el PDF). Requiere CURSIA_FRONTEND_REPO.
+//   PB16 todo UPDATE … RETURNING de versiones usa returningRows ([filas, cantidad] con TypeORM).
 //   PB15 el corte por fecha de creación usa el instante de Postgres (zona horaria del proceso irrelevante).
 //   PB14 sin tablas del Prebrief, guardar tema/evaluación no aborta la transacción (to_regclass).
 //   PB13 la barrera está CABLEADA: RunsService y PackagingService reciben PrebriefService (inyección de Nest); un PATCH
@@ -352,6 +353,16 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
     assert(/extract\(epoch from created_at::timestamptz\)/.test(src), 'metadata() debe calcular el instante con created_at::timestamptz');
     assert(/m\.__createdAtMs >= t/.test(src), 'requiresPrebrief debe comparar el instante en milisegundos');
     assert(!/new Date\(m\.__createdAt\)/.test(src), 'no se debe convertir created_at en Node');
+  });
+
+  await check('PB16 UPDATE … RETURNING de las versiones pasa por returningRows (TypeORM devuelve [filas, cantidad])', () => {
+    const src = require('fs').readFileSync(path.join(REPO, 'src/modules/prebrief/prebrief.service.ts'), 'utf8');
+    const ups = [...src.matchAll(/update public\.course_prebrief_versions[\s\S]*?returning/g)];
+    assert(ups.length >= 5, 'se esperaban los UPDATE … RETURNING de las versiones');
+    for (const m of ups) {
+      const before = src.slice(Math.max(0, m.index - 120), m.index);
+      assert(/returningRows\(await (this\.dataSource|qr)\.query\(\s*`?$/.test(before.trimEnd().replace(/`$/, '') + '`') || /returningRows\(await (this\.dataSource|qr)\.query\(/.test(before), `UPDATE sin returningRows: …${before.slice(-80)}`);
+    }
   });
 
   console.log(`\n${ok} OK · ${fail} fallas`);
