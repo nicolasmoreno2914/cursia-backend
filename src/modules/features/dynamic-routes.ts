@@ -16,6 +16,7 @@ import { AcademicContextController } from '../academic-context/academic-context.
 import { ChangeImpactController } from '../invalidation/change-impact.controller';
 import { CourseFactsController } from '../course-facts/course-facts.controller';
 import { CourseDesignController } from '../course-design/course-design.controller';
+import { PrebriefController } from '../prebrief/prebrief.controller';
 
 /**
  * Rutas de la estructura dinámica de cursos (V2) que DynamicFeatureGuard
@@ -46,6 +47,7 @@ export const DYNAMIC_CONTROLLERS: ReadonlySet<Function> = new Set<Function>([
   ChangeImpactController,            // Fase 5: POST /courses/:id/change-impact (vista previa, sin escrituras)
   CourseFactsController,             // LOOP 8.1: /courses/:id/brief y /courses/:id/facts (fuente única)
   CourseDesignController,            // LOOP 8.3: /courses/:id/design/{recommendation,pins/clear}
+  PrebriefController,                // Prebrief: /courses/:id/prebrief/* y /courses/:id/format
 ]);
 
 export const DYNAMIC_HANDLERS: ReadonlySet<Function> = new Set<Function>([
