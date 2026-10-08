@@ -228,6 +228,8 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
   const STATUS: Record<string, string> = { met: 'Cumple', exception: 'Excepción', not_verifiable: 'No verificable', conflict: 'Conflicto' };
   const statusLabelOf = (i: { status: string; doubtful?: true }) => (i.doubtful ? 'Por confirmar' : STATUS[i.status]);
   const toConfirm = m.requirements.items.filter((i) => i.doubtful).length;
+  // LOOP 9.1 QA: la decisión aplicada es la MISMA que en la sección 12 (p. ej. «Cursia produce un video por capítulo»).
+  const appliedOf = new Map(m.exceptions.map((e) => [e.requirementKey, e.appliedText] as [string, string]));
   const notVerif = reqC.notVerifiable - toConfirm;
   const rq: DocBlock[] = [];
   if (!m.requirements.hasDocument) rq.push({ t: 'paragraph', text: 'Este curso no tiene un documento institucional de referencia.', muted: true });
@@ -236,7 +238,7 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
     rq.push({ t: 'paragraph', text: `${reqC.met} de ${reqC.total} requisitos del documento se cumplen${reqC.exceptions ? `; ${plural(reqC.exceptions, 'tiene', 'tienen')} una excepción decidida por la institución` : ''}${notVerif ? `; ${notVerif} no ${notVerif === 1 ? 'es verificable' : 'son verificables'} automáticamente` : ''}${toConfirm ? `; ${toConfirm} ${toConfirm === 1 ? 'queda' : 'quedan'} por confirmar` : ''}.` });
     rq.push({ t: 'requirements', items: m.requirements.items.map((i) => ({
       status: i.status, statusLabel: statusLabelOf(i), text: reqDisplay(i.text),
-      note: i.status === 'exception' ? `Decisión aplicada: ${i.actual || '—'} (ver sección 12).` : i.status === 'not_verifiable' ? (i.doubtful && i.detail ? i.detail : 'Cursia no puede comprobarlo automáticamente; se incorpora como orientación del diseño.') : i.status === 'conflict' ? `El diseño tiene ${i.actual || '—'}.` : undefined,
+      note: i.status === 'exception' ? `Decisión aplicada: ${appliedOf.get(i.key) || i.actual || '—'} (ver sección 12).` : i.status === 'not_verifiable' ? (i.doubtful && i.detail ? i.detail : 'Cursia no puede comprobarlo automáticamente; se incorpora como orientación del diseño.') : i.status === 'conflict' ? `El diseño tiene ${i.actual || '—'}.` : undefined,
       evidence: i.evidence || undefined,
     })) });
   }
