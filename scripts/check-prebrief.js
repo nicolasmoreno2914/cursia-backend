@@ -411,6 +411,20 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
     assert(doc.documentTexts(doc.buildPrebriefDocument(m)).length > 0);
   });
 
+  await check('PB20 contexto aprobado = lo que muestra «Lo que entendimos»: sin sector/país en el pedido, se usa el inferido (no «Faltan datos del curso»)', () => {
+    const inp = fixture({ doc4x5: true });
+    delete inp.brief.sector; delete inp.brief.pais;
+    inp.facts.sector = { value: 'Gestión de la Seguridad y Salud en el Trabajo', source: 'inferred' };
+    inp.facts.country = { value: 'Colombia', source: 'inferred' };
+    const m = build(inp);
+    eq([m.generationContext.sector, m.generationContext.pais], ['Gestión de la Seguridad y Salud en el Trabajo', 'Colombia'], 'contexto');
+    eq(M.missingContextFields(m).filter((k) => k === 'sector' || k === 'pais'), [], 'sin faltantes');
+    // Lo que el pedido trae manda sobre lo inferido.
+    const inp2 = fixture({ doc4x5: true });
+    inp2.facts.sector = { value: 'Otro sector inferido', source: 'inferred' };
+    eq(build(inp2).generationContext.sector, inp2.brief.sector, 'el pedido manda');
+  });
+
   console.log(`\n${ok} OK · ${fail} fallas`);
   process.exit(fail ? 1 : 0);
 })();
