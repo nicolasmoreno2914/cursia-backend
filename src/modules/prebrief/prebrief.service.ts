@@ -1,3 +1,4 @@
+import { returningRows } from '../../common/db/returning-rows';
 import { BadRequestException, ConflictException, HttpException, Injectable, Logger, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import { createHash } from 'crypto';
 import { DataSource } from 'typeorm';
@@ -196,20 +197,22 @@ export class PrebriefService {
     for (const v of vs) {
       if ((v.status === 'ready' || v.status === 'approved' || v.status === 'changes_requested') && v.model_sha256 !== draft.modelSha256) {
         const diff = diffModels(v.model_json, draft.model);
-        const res = await this.dataSource.query(
+        const res = returningRows(await this.dataSource.query(
           `update public.course_prebrief_versions set status = 'invalidated', invalidated_at = now(), invalidation_reason = $2, invalidation_diff = $3::jsonb
             where id = $1 and status in ('ready', 'approved', 'changes_requested') returning id`,
           [v.id, 'design_changed', JSON.stringify(diff)],
-        );
+        ));
         if (res.length) await this.event(this.dataSource, courseId, v.id, 'invalidated', actor, { reason: 'design_changed', diff, fromStatus: v.status });
       }
     }
   }
 
   /** GET: estado completo (borrador + versiones + flujo). */
-  async state(courseId: number, ownerId: string) {
+  async state(courseId: number, ownerId: string, card?: any) {
     await this.assertTablesReady();
-    const draft = await this.draft(courseId, ownerId);
+    // `card`: «Cursia recomienda» ya calculado en este mismo pedido (motivos y confirmaciones no lo cambian; es lo
+    // más caro del borrador). Sin él se calcula.
+    const draft = card ? await this.draftFrom(courseId, await this.loadCourse(courseId, ownerId), card) : await this.draft(courseId, ownerId);
     await this.invalidateIfStale(courseId, draft, ownerId);
     const vs = await this.versions(this.dataSource, courseId);
     const meta = await this.metadata(this.dataSource, courseId);
@@ -297,8 +300,8 @@ export class PrebriefService {
       const [mx] = await qr.query(`select coalesce(max(version), 0) as v from public.course_prebrief_versions where course_id = $1`, [courseId]);
       const n = Number(mx.v) + 1;
       // Versiones anteriores sin aprobar (lista o con cambios solicitados): reemplazadas.
-      const sup = await qr.query(`update public.course_prebrief_versions set status = 'invalidated', invalidated_at = now(), invalidation_reason = 'superseded'
-        where course_id = $1 and status in ('ready', 'changes_requested') returning id, version`, [courseId]);
+      const sup = returningRows(await qr.query(`update public.course_prebrief_versions set status = 'invalidated', invalidated_at = now(), invalidation_reason = 'superseded'
+        where course_id = $1 and status in ('ready', 'changes_requested') returning id, version`, [courseId]));
       for (const s of sup) await this.event(qr, courseId, s.id, 'superseded', user.id, { byVersion: n });
       const [ins] = await qr.query(
         `insert into public.course_prebrief_versions (course_id, version, status, model_version, model_json, model_sha256, document_json, document_sha256,
@@ -343,10 +346,10 @@ export class PrebriefService {
     if (draft.verification.criticals > 0) throw new ConflictException({ code: PREBRIEF_NOT_APPROVABLE, reason: 'critical', message: `${PREBRIEF_NOT_APPROVABLE}: la verificación tiene problemas críticos.` });
     if (!draft.readiness.ready) throw new ConflictException({ code: PREBRIEF_NOT_APPROVABLE, reason: 'not_ready', message: `${PREBRIEF_NOT_APPROVABLE}: la propuesta ya no cumple las condiciones para aprobarse.`, blockers: draft.readiness.blockers });
     const approval = { userId: user.id, email: user.email || null, name, role, at: new Date().toISOString(), modelSha256: v.model_sha256, documentSha256: v.document_sha256, blueprintNumber: v.blueprint_number, channel: 'in_app' };
-    const res = await this.dataSource.query(
+    const res = returningRows(await this.dataSource.query(
       `update public.course_prebrief_versions set status = 'approved', approval = $2::jsonb where id = $1 and status = 'ready' and model_sha256 = $3 returning *`,
       [v.id, JSON.stringify(approval), body.expectedModelSha],
-    );
+        ));
     if (!res.length) throw new ConflictException({ code: PREBRIEF_NOT_APPROVABLE, reason: 'race', message: `${PREBRIEF_NOT_APPROVABLE}: la versión cambió de estado mientras se aprobaba.` });
     await this.event(this.dataSource, courseId, v.id, 'approved', user.id, { name, role, modelSha256: v.model_sha256 });
     const row = { ...v, status: 'approved' as const, approval };
@@ -359,11 +362,11 @@ export class PrebriefService {
     await this.loadCourse(courseId, ownerId);
     const text = String(note || '').replace(/\s+/g, ' ').trim();
     if (text.length < 3 || text.length > 1500) throw new BadRequestException('Describe los ajustes que solicitas (3 a 1500 caracteres).');
-    const res = await this.dataSource.query(
+    const res = returningRows(await this.dataSource.query(
       `update public.course_prebrief_versions set status = 'changes_requested', changes_request = $3::jsonb
         where course_id = $1 and version = $2 and status = 'ready' returning id`,
       [courseId, n, JSON.stringify({ userId: user.id, email: user.email || null, note: text, at: new Date().toISOString() })],
-    );
+        ));
     if (!res.length) throw new ConflictException({ code: PREBRIEF_NOT_APPROVABLE, reason: 'not_ready', message: `${PREBRIEF_NOT_APPROVABLE}: solo se pueden solicitar ajustes sobre una versión lista para aprobación.` });
     await this.event(this.dataSource, courseId, res[0].id, 'changes_requested', user.id, { note: text });
     return this.state(courseId, ownerId);
@@ -372,11 +375,11 @@ export class PrebriefService {
   async withdraw(courseId: number, ownerId: string, user: { id: string }, n: number) {
     assertDynamicOwnerAllowed(ownerId);
     await this.loadCourse(courseId, ownerId);
-    const res = await this.dataSource.query(
+    const res = returningRows(await this.dataSource.query(
       `update public.course_prebrief_versions set status = 'invalidated', invalidated_at = now(), invalidation_reason = 'withdrawn'
         where course_id = $1 and version = $2 and status in ('ready', 'changes_requested') returning id`,
       [courseId, n],
-    );
+        ));
     if (!res.length) throw new ConflictException({ code: PREBRIEF_NOT_APPROVABLE, reason: 'not_withdrawable', message: `${PREBRIEF_NOT_APPROVABLE}: solo se retira una versión lista o con cambios solicitados (una aprobada se reemplaza preparando otra).` });
     await this.event(this.dataSource, courseId, res[0].id, 'withdrawn', user.id);
     return this.state(courseId, ownerId);
@@ -487,7 +490,7 @@ export class PrebriefService {
       [courseId, requirementKey, JSON.stringify(entry)],
     );
     await this.event(this.dataSource, courseId, null, 'exception_reason', user.id, { requirementKey, reason: text });
-    return this.state(courseId, ownerId);
+    return this.state(courseId, ownerId, d.card); // el motivo no cambia «Cursia recomienda»: no se recalcula
   }
 
   /** Confirmar un dato del documento marcado como dudoso (queda registrado quién y cuándo; si el texto cambia, vuelve a pedirse). */
@@ -503,7 +506,7 @@ export class PrebriefService {
       [courseId, confirmKey, JSON.stringify({ by: user.email || user.id, at: new Date().toISOString(), kind: item.kind, text: item.text })],
     );
     await this.event(this.dataSource, courseId, null, 'data_confirmed', user.id, { kind: item.kind, id: item.id, text: item.text });
-    return this.state(courseId, ownerId);
+    return this.state(courseId, ownerId, d.card); // la confirmación no cambia «Cursia recomienda»: no se recalcula
   }
 
   // ── Barrera de generación (R68 + Prebrief) ──────────────────────────────────────────────────────────────────

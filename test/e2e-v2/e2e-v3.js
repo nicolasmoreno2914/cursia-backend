@@ -2338,8 +2338,15 @@ function reservationBookkeeping(ev) {
       const lg = await api('POST', '/jobs/content', { courseId: String(courseId) });
       ok(lg.status === 409 && /v2_course_legacy_generation_disabled/.test(String(lg.error)), 'E19: endpoint legacy → 409', { s: lg.status });
       // Historial completo y de solo inserción.
-      const ev2 = (await api('GET', `/courses/${courseId}/prebrief/events`)).data.map((e) => e.type);
+      const evAll = (await api('GET', `/courses/${courseId}/prebrief/events`)).data;
+      const ev2 = evAll.map((e) => e.type);
       for (const t of ['format_selected', 'exception_reason', 'prepared', 'pdf_generated', 'approved', 'generation_started', 'invalidated']) ok(ev2.includes(t), `E19: historial registra «${t}»`);
+      // QA staging: UPDATE … RETURNING devuelve [filas, cantidad] con TypeORM; sin returningRows aparecían eventos «superseded»
+      // falsos (sin versión) en cada preparación y los de una versión perdían su id.
+      const versionEvents = ['superseded', 'prepared', 'approved', 'invalidated', 'changes_requested', 'withdrawn'];
+      const orphan = evAll.filter((e) => versionEvents.includes(e.type) && (e.version === null || e.version === undefined));
+      ok(orphan.length === 0, 'E19: todo evento de una versión lleva su versión (sin «superseded» falsos)', orphan.map((e) => e.type));
+      ok(ev2.filter((t) => t === 'superseded').length <= ev2.filter((t) => t === 'prepared').length, 'E19: «superseded» solo cuando una versión se reemplaza', ev2);
       let del = null; try { await q(`delete from public.course_prebrief_events where course_id = $1`, [courseId]); } catch (e) { del = e; }
       ok(del && /PREBRIEF_APPEND_ONLY/.test(del.message), 'E19: el historial no se puede borrar');
       // Review BE-1 I1: el empaque usa los perfiles APROBADOS: cambiar el tema después de aprobar bloquea el paquete del run.

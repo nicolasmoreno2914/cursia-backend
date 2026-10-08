@@ -11,12 +11,16 @@ import type { CorsOptions } from '@nestjs/common/interfaces/external/cors-option
 export const CORS_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'] as const;
 /** Cabeceras que manda el cliente (24-backend-client.js: backendApiRequest). */
 export const CORS_ALLOWED_HEADERS = ['Content-Type', 'Authorization'] as const;
+/** Cabeceras de respuesta que el navegador deja leer: el nombre del PDF de la propuesta viaja en Content-Disposition
+ *  (sin exponerla, el frontend caía en un nombre genérico). */
+export const CORS_EXPOSED_HEADERS = ['Content-Disposition'] as const;
 
 export function corsOptions(env: NodeJS.ProcessEnv = process.env): CorsOptions {
   return {
     origin: env.CORS_ORIGIN ? env.CORS_ORIGIN.split(',') : '*',
     methods: [...CORS_METHODS],
     allowedHeaders: [...CORS_ALLOWED_HEADERS],
+    exposedHeaders: [...CORS_EXPOSED_HEADERS],
     credentials: false,
     // Task 4 (rendimiento): cada request con Authorization lleva un preflight OPTIONS (~200 ms de
     // ida y vuelta desde LatAm). Cachearlo 10 min en el navegador (Chrome topa en 2 h).
